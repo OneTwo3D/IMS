@@ -6,8 +6,8 @@
 import { PRODUCER_CUTOFF_ENV, PRODUCER_HOLD_ENFORCED_ENV } from '@/lib/security/producer-disposition-constants'
 import { OUTBOUND_GRANT_ENV } from '@/lib/security/outbound-write-hold-constants'
 import { accountAllowed, buildVatDiffEnv } from '@/lib/tax/vat-difference-cli'
-import { DELETE_REASONS, WOO_TAX_BLOCKER_CODES, WOO_TAX_FINDING_CODES, type WooTaxChange, type WooTaxPlan } from './tax-rate-plan'
-import { WOO_TAX_REFUSALS, type WooTaxApplyResult, type WooTaxHold, type WooTaxPreview } from './tax-rate-writer'
+import { ADOPTION_REASONS, DELETE_REASONS, WOO_TAX_BLOCKER_CODES, WOO_TAX_FINDING_CODES, type AdoptionPlan, type WooTaxChange, type WooTaxPlan } from './tax-rate-plan'
+import { WOO_TAX_REFUSALS, type WooAdoptionPreview, type WooAdoptionResult, type WooTaxApplyResult, type WooTaxHold, type WooTaxPreview } from './tax-rate-writer'
 
 export const WOO_TAX_PLAN_COMMAND = 'npm run woo:tax-plan'
 export { accountAllowed }
@@ -20,7 +20,7 @@ export const WOO_TAX_PLAN_EXIT_CODES = [
 ] as const
 
 export const WOO_TAX_PLAN_CLI_CODES = {
-  BAD_ARGUMENTS: 'the arguments are not exactly "--apply --confirm <64-hex digest>", "--json" and/or "--help" (--confirm needs --apply and --apply needs --confirm)',
+  BAD_ARGUMENTS: 'the arguments are not exactly "--apply --confirm <64-hex digest>", "--adopt", "--json" and/or "--help" (--confirm needs --apply and --apply needs --confirm)',
   CREDENTIAL_ARGUMENT: 'an argument looks like it carries a credential; no credential is ever taken from the command line',
   ACCOUNT_NOT_ALLOWED: 'the account running the command is neither root nor the owner of the checkout',
   DATABASE_URL_MISSING: 'DATABASE_URL is not set',
@@ -30,7 +30,7 @@ export type WooTaxPlanCliCode = keyof typeof WOO_TAX_PLAN_CLI_CODES
 
 const CREDENTIAL_SHAPE = /[a-z][a-z0-9+.-]*:\/\/|[?&=](?:password|passwd|pwd|secret|token|key)|(?:password|passwd|pwd|secret|token|apikey|api_key)\s*[=:]/i
 
-export type WooTaxPlanArgs = { apply: boolean; confirm: string | null; json: boolean; help: boolean }
+export type WooTaxPlanArgs = { apply: boolean; confirm: string | null; adopt: boolean; json: boolean; help: boolean }
 
 export function parseWooTaxPlanArgs(argv: readonly string[]): WooTaxPlanArgs | { code: WooTaxPlanCliCode } {
   const flags = new Set<string>()
@@ -44,13 +44,13 @@ export function parseWooTaxPlanArgs(argv: readonly string[]): WooTaxPlanArgs | {
       i += 1
       continue
     }
-    if (arg !== '--apply' && arg !== '--json' && arg !== '--help') return { code: CREDENTIAL_SHAPE.test(arg) ? 'CREDENTIAL_ARGUMENT' : 'BAD_ARGUMENTS' }
+    if (arg !== '--apply' && arg !== '--adopt' && arg !== '--json' && arg !== '--help') return { code: CREDENTIAL_SHAPE.test(arg) ? 'CREDENTIAL_ARGUMENT' : 'BAD_ARGUMENTS' }
     if (flags.has(arg)) return { code: 'BAD_ARGUMENTS' }
     flags.add(arg)
   }
   const apply = flags.has('--apply')
   if (apply !== (confirm !== null)) return { code: 'BAD_ARGUMENTS' }
-  return { apply, confirm, json: flags.has('--json'), help: flags.has('--help') }
+  return { apply, confirm, adopt: flags.has('--adopt'), json: flags.has('--json'), help: flags.has('--help') }
 }
 
 /** The variables the producer hold is read from. The run replaces the rest of its environment, so these are handed over explicitly, and ONLY these. */
@@ -70,14 +70,22 @@ export function buildWooTaxPlanEnv(parent: Readonly<Record<string, string | unde
   return { ...buildVatDiffEnv(parent, home), ...pickWooHoldEnv(parent) }
 }
 
-export type WooTaxPlanRun = { args: WooTaxPlanArgs; preview: WooTaxPreview | null; applied: WooTaxApplyResult | null }
+export type WooTaxPlanRun = {
+  args: WooTaxPlanArgs
+  preview: WooTaxPreview | null
+  applied: WooTaxApplyResult | null
+  adoptionPreview?: WooAdoptionPreview | null
+  adopted?: WooAdoptionResult | null
+}
 
 export function wooTaxPlanExitCode(run: WooTaxPlanRun): 0 | 1 | 2 {
+  if (run.adopted != null) return run.adopted.outcome === 'REFUSED' ? 2 : 0
+  if (run.adoptionPreview != null) return run.adoptionPreview.plan === null ? 2 : run.adoptionPreview.plan.rows.length === 0 ? 0 : 1
   if (run.applied !== null) {
     const result = run.applied
     if (result.outcome === 'REFUSED') return 2
     if (result.outcome === 'NOTHING_TO_DO') return 0
-    return result.failed !== null || result.sentButUnrecorded !== null ? 2 : 0
+    return result.failed !== null || result.unrecorded !== null ? 2 : 0
   }
   const preview = run.preview
   if (preview === null || preview.plan === null) return 2
@@ -87,9 +95,11 @@ export function wooTaxPlanExitCode(run: WooTaxPlanRun): 0 | 1 | 2 {
 
 export function renderWooTaxPlanUsage(): string {
   return [
-    `Usage: ${WOO_TAX_PLAN_COMMAND} -- [--apply --confirm <digest>] [--json]`,
+    `Usage: ${WOO_TAX_PLAN_COMMAND} -- [--adopt] [--apply --confirm <digest>] [--json]`,
     'Plans (and, on request, applies) the changes WooCommerce needs so that its tax rates are the same set as the IMS sales rates (R13, the VAT set-identity check): create a missing rate,',
     'update one whose name, percent, country, region, class, compound or shipping differs, delete one mapped to an inactive, purchase-only or reverse-charge IMS rate (or a second counterpart).',
+    'Ownership is tied to the store: a mapping row counts only when it is stamped with the identity (normalised URL) of the store configured now, and a rate is only changed while it still matches the snapshot IMS holds for it (name, country, percent, class). Rows that are not stamped, or whose rate no longer matches, are findings until the adoption step.',
+    '--adopt is that adoption step: without --apply it previews the mapping rows it would stamp (snapshot and live rate side by side) and prints a digest; with --apply --confirm <digest> it stamps them and rewrites their snapshot from the live rate. It sends nothing to WooCommerce.',
     'Shipping carries the goods\' VAT rate: always on for a positive rate. A WooCommerce rate that IMS does not own (not mapped in the tax-rate mapping and not created by this command) is never touched.',
     '',
     'Without --apply it is a read-only PREVIEW: it prints the plan and its digest, reads IMS and WooCommerce (GET only) and writes nothing. With --apply --confirm <digest> (the digest the preview',
@@ -115,15 +125,13 @@ function describeChange(change: WooTaxChange): string {
       const b = change.before
       return `  DELETE  ${rate} (store rate ${change.wooId}: ${b.name} ${b.rate}% ${b.country || '(any)'}): ${DELETE_REASONS[change.reason]}`
     }
-    case 'REFRESH_MAPPING':
-      return `  REFRESH_MAPPING  ${rate} (store rate ${change.wooId}): the stored mapping row is stale; IMS bookkeeping only, nothing is sent`
   }
 }
 
 function renderPlan(plan: WooTaxPlan): string[] {
   const lines = [
     `IMS: ${plan.inScopeRates} in-scope sales rate(s). WooCommerce: ${plan.wooRates} rate(s) read, ${plan.unownedLeftAlone} not owned (never touched).`,
-    `Changes: ${(['CREATE', 'UPDATE', 'DELETE', 'REFRESH_MAPPING'] as const).map((kind) => `${kind}=${plan.counts[kind]}`).join(' ')}`,
+    `Changes: ${(['CREATE', 'UPDATE', 'DELETE'] as const).map((kind) => `${kind}=${plan.counts[kind]}`).join(' ')}`,
   ]
   if (plan.changes.length > 0) lines.push('', ...plan.changes.map(describeChange))
   for (const blocker of plan.blockers) lines.push('', `BLOCKER ${blocker.code}: IMS rate ${blocker.imsRateId}, store rate ${blocker.wooId}: ${WOO_TAX_BLOCKER_CODES[blocker.code]}`)
@@ -146,12 +154,35 @@ export function renderWooTaxPlanText(run: WooTaxPlanRun, hold: WooTaxHold): stri
     if (applied.shadowed.length > 0) lines.push(`SHADOW: ${applied.shadowed.length} change(s) recorded as outbound shadows; NOTHING was sent to WooCommerce and no rate or mapping row was written.${applied.shadowUnrecorded > 0 ? ` ${applied.shadowUnrecorded} shadow record(s) could not be written.` : ''}`)
     if (applied.applied.length > 0) lines.push(`Applied: ${applied.applied.length} change(s) sent and recorded.`)
     if (applied.failed !== null) lines.push(`STOPPED at ${applied.failed.key}: WooCommerce refused it (${applied.failed.error}). Earlier changes stay applied; preview again for the rest.`)
-    if (applied.sentButUnrecorded !== null) lines.push(`STOPPED at ${applied.sentButUnrecorded}: the change was sent but could not be recorded. Preview again: a rate created this way shows as an UNMAPPED_TWIN blocker until it is mapped.`)
+    if (applied.unrecorded !== null) lines.push(`STOPPED at ${applied.unrecorded.key}: the change WAS SENT but could not be recorded (${applied.unrecorded.reason}). Preview again: a rate created this way shows as an UNMAPPED_TWIN blocker until it is mapped.`)
     if (applied.applied.length > 0) lines.push('Run npm run vat:diff to confirm the differences are gone.')
   }
   return lines.join('\n')
 }
 
 export function wooTaxPlanJson(run: WooTaxPlanRun, hold: WooTaxHold): unknown {
-  return { hold, preview: run.preview, applied: run.applied }
+  return { hold, preview: run.preview, applied: run.applied, adoptionPreview: run.adoptionPreview ?? null, adopted: run.adopted ?? null }
+}
+
+function renderAdoptionPlan(plan: AdoptionPlan): string[] {
+  const lines = [`Store: ${plan.storeIdentity}`, `Adoption: ${plan.rows.length} mapping row(s) would be stamped with this store and re-snapshotted from the live rate.`]
+  for (const row of plan.rows) {
+    const f = (x: { name: string; country: string; rate: string; class: string }) => `${x.name} ${x.rate}% ${x.country || '(any)'} class ${x.class || 'standard'}`
+    lines.push(`  ${row.reason}  "${row.imsRateName}" (store rate ${row.wooId}): snapshot [${f(row.snapshot)}] live [${f(row.live)}]  - ${ADOPTION_REASONS[row.reason]}`)
+  }
+  lines.push('', `Adoption digest: ${plan.digest}`)
+  return lines
+}
+
+export function renderWooAdoptionText(run: WooTaxPlanRun): string {
+  const lines: string[] = []
+  const preview = run.adoptionPreview ?? null
+  const adopted = run.adopted ?? null
+  if (preview !== null && preview.refused !== null) lines.push(`REFUSED: ${preview.refused}`, WOO_TAX_REFUSALS[preview.refused], 'Nothing was compared.')
+  if (adopted !== null && adopted.outcome === 'REFUSED') lines.push(`REFUSED: ${adopted.code}`, WOO_TAX_REFUSALS[adopted.code], 'Nothing was stamped.')
+  const plan = adopted !== null ? adopted.plan : preview?.plan ?? null
+  if (plan !== null) lines.push(...(lines.length > 0 ? [''] : []), ...renderAdoptionPlan(plan))
+  if (adopted !== null && adopted.outcome === 'NOTHING_TO_DO') lines.push('', 'Adopted: nothing to stamp (a re-run changes nothing).')
+  if (adopted !== null && adopted.outcome === 'ADOPTED') lines.push('', `Adopted: ${adopted.adopted} mapping row(s) stamped. Nothing was sent to WooCommerce. Run the preview again.`)
+  return lines.join('\n')
 }

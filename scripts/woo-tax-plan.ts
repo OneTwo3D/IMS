@@ -14,17 +14,23 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import {
-  WOO_TAX_PLAN_CLI_CODES, accountAllowed, buildWooTaxPlanEnv, parseWooTaxPlanArgs, pickWooHoldEnv, renderWooTaxPlanText, renderWooTaxPlanUsage, wooTaxPlanExitCode, wooTaxPlanJson,
+  WOO_TAX_PLAN_CLI_CODES, accountAllowed, buildWooTaxPlanEnv, parseWooTaxPlanArgs, pickWooHoldEnv, renderWooTaxPlanText, renderWooTaxPlanUsage, wooTaxPlanExitCode, wooTaxPlanJson, renderWooAdoptionText,
   type WooTaxPlanCliCode, type WooTaxPlanRun,
 } from '../lib/connectors/woocommerce/tax-rate-writer-cli.ts'
-import type { WooTaxApplyResult, WooTaxHold, WooTaxPreview } from '../lib/connectors/woocommerce/tax-rate-writer.ts'
+import type { WooAdoptionPreview, WooAdoptionResult, WooTaxApplyResult, WooTaxHold, WooTaxPreview } from '../lib/connectors/woocommerce/tax-rate-writer.ts'
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
 const DISCONNECT_TIMEOUT_MS = 5_000
 
 export type WooTaxPlanDeps = {
   /** Previews, and applies when `confirm` is given, with the application's modules loaded AFTER the environment was replaced. */
-  run: (input: { confirm: string | null; holdEnv: Record<string, string> }) => Promise<{ preview: WooTaxPreview | null; applied: WooTaxApplyResult | null; hold: WooTaxHold }>
+  run: (input: { confirm: string | null; adopt?: boolean; holdEnv: Record<string, string> }) => Promise<{
+    preview: WooTaxPreview | null
+    applied: WooTaxApplyResult | null
+    adoptionPreview?: WooAdoptionPreview | null
+    adopted?: WooAdoptionResult | null
+    hold: WooTaxHold
+  }>
   disconnect: () => Promise<void>
 }
 export type WooTaxPlanCliOptions = {
@@ -46,22 +52,31 @@ function replaceProcessEnv(env: Record<string, string>): void {
 }
 
 async function defaultDeps(): Promise<WooTaxPlanDeps> {
-  const [writer, port, source, run, { db }] = await Promise.all([
+  const [writer, port, source, run, plan, api, { db }] = await Promise.all([
     import('../lib/connectors/woocommerce/tax-rate-writer.ts'),
     import('../lib/connectors/woocommerce/tax-rate-port.ts'),
     import('../lib/reconciliation-pack/woo-source.ts'),
     import('../lib/tax/vat-difference-run.ts'),
+    import('../lib/connectors/woocommerce/tax-rate-plan.ts'),
+    import('../lib/connectors/woocommerce/api.ts'),
     import('../lib/db/index.ts'),
   ])
   return {
-    run: async ({ confirm, holdEnv }) => {
+    run: async ({ confirm, adopt, holdEnv }) => {
       const wooPort = run.createStoredWooPort()
       const deps = {
         readWoo: async () => { const read = await source.readWooTaxRateDetails(wooPort); return read.ok ? { ok: true as const, rates: read.value.rates } : { ok: false as const } },
+        // The store the writes go to: the same stored credentials wcPost and wcPut send with.
+        storeIdentity: async () => { const creds = await api.getWcCredentials(); return creds === null ? null : plan.normaliseStoreIdentity(creds.url) },
         port: port.createWooTaxRateWritePort(),
         context: { env: holdEnv },
       }
       const hold = writer.wooTaxHold(deps.context)
+      if (adopt === true) {
+        return confirm === null
+          ? { preview: null, applied: null, adoptionPreview: await writer.readWooAdoptionPlan(deps), hold }
+          : { preview: null, applied: null, adopted: await writer.applyWooAdoption(deps, { confirm }), hold }
+      }
       if (confirm === null) return { preview: await writer.readWooTaxPlan(deps), applied: null, hold }
       return { preview: null, applied: await writer.applyWooTaxPlan(deps, { confirm }), hold }
     },
@@ -100,9 +115,9 @@ export async function runWooTaxPlanCli(options: WooTaxPlanCliOptions): Promise<n
     const given = options.deps
     const deps: WooTaxPlanDeps = given?.run !== undefined && given.disconnect !== undefined ? { run: given.run, disconnect: given.disconnect } : await defaultDeps()
     disconnect = deps.disconnect
-    const done = await deps.run({ confirm: args.confirm, holdEnv })
-    const run: WooTaxPlanRun = { args, preview: done.preview, applied: done.applied }
-    out(args.json ? JSON.stringify(wooTaxPlanJson(run, done.hold), null, 2) : renderWooTaxPlanText(run, done.hold))
+    const done = await deps.run({ confirm: args.confirm, ...(args.adopt ? { adopt: true } : {}), holdEnv })
+    const run: WooTaxPlanRun = { args, preview: done.preview, applied: done.applied, adoptionPreview: done.adoptionPreview ?? null, adopted: done.adopted ?? null }
+    out(args.json ? JSON.stringify(wooTaxPlanJson(run, done.hold), null, 2) : args.adopt ? renderWooAdoptionText(run) : renderWooTaxPlanText(run, done.hold))
     return wooTaxPlanExitCode(run)
   } catch {
     err('The WooCommerce tax-rate plan failed before it reached an outcome: INTERNAL. Run the preview again to see what state the rates are in.')

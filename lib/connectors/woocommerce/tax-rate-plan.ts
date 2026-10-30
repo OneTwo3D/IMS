@@ -8,16 +8,29 @@
  * SCOPE, as R13: an IMS rate is in scope when it is ACTIVE, used for SALES or BOTH, and not a reverse-charge rate. Anything else is out of scope.
  *
  * THE OWNERSHIP RULE (what this writer may touch). A WooCommerce rate is OWNED when
- *   (a) it is mapped in ShoppingTaxRateMapping (connector `woocommerce`, keyed by the store's rate id), or
- *   (b) this writer created it and recorded that (a row of `woo_tax_rate_writes`, APPLIED, not later deleted).
+ *   (a) it is mapped in ShoppingTaxRateMapping (connector `woocommerce`, keyed by the store's rate id) AND that mapping row is stamped with the identity of the store configured now, or
+ *   (b) this writer created it and recorded that (a row of `woo_tax_rate_writes`, APPLIED, stamped with the identity of the store configured now, not later deleted).
  * Every other rate is the owner's (or a plugin's) and is NEVER touched: it appears in the plan only as a count. Ownership says WHETHER the writer may act; WHAT it does needs an IMS
  * counterpart, which only a mapping gives. So an owned rate with no mapping (case b after the mapping was removed) is a FINDING, never a change.
+ *
+ * STORE IDENTITY. A WooCommerce rate id means something only inside one store. Every ownership source carries the NORMALISED STORE URL it was made against (`normaliseStoreIdentity`: scheme,
+ * host and path; no trailing slash, no credentials, no query). A mapping with no identity (a row from before this rule: every row the order import or the mapper wrote) or with another store's
+ * identity is NOT owned: the rate it names is a finding (MAPPING_NOT_ADOPTED), never a change, and no CREATE is planned for its IMS rate, until the operator runs the explicit ADOPTION step
+ * (`planAdoption`, `npm run woo:tax-plan -- --adopt`), which stamps it. (The WP site URL or a site id from /wp-json would be steadier than the configured URL, but the GET-only port reads only
+ * the three collections of the reconciliation pack and adding a path to its allow-list is out of scope here: disclosed limit.)
+ *
+ * RATE IDENTITY. Before an UPDATE or DELETE the live rate must still be the rate IMS owns: the mapping's stored snapshot must equal the live rate in the four fields EVERY mapping row stores,
+ * whether the order import, the mapper or this writer wrote it: NAME (R13's comparison), COUNTRY (normalised), PERCENT (exact decimal) and CLASS (R13's, empty is standard). A reused id, a
+ * store restored from another backup or a rate the owner re-purposed by hand differs in at least one of them. Why these four and no more: they are what makes a tax rate the same rate, they are
+ * the only fields a legacy row has, and a different rate would have to agree in all four to pass. State, postcode, compound and shipping are excluded on purpose: legacy rows do not store
+ * them, and they are exactly what the writer corrects, so they cannot also be what proves identity. A rate whose snapshot differs is RE_ADOPTION_REQUIRED (a finding): it is never updated or
+ * deleted, and its IMS rate gets no CREATE, until the adoption step re-stamps it from the live rate. The writer keeps the snapshot current itself: each applied change rewrites it in the same
+ * transaction as the change record.
  *
  * THE CHANGES (a closed set, each with before and after values)
  *   CREATE           an in-scope IMS rate has no counterpart in the store (no mapping, or only mappings to rates the store no longer has).
  *   UPDATE           the counterpart differs in name, percent, country, state (region), class, compound or shipping. Only the fields that differ are sent.
  *   DELETE           an owned rate maps to an IMS rate that is out of scope (inactive, purchase-only, reverse charge), or is an extra counterpart of an in-scope rate (R13: one Woo rate each).
- *   REFRESH_MAPPING  the store already matches, but the stored mapping row (name, country, percent, class) is stale. IMS bookkeeping only; nothing is sent to WooCommerce.
  *
  * FIELD RULES
  *   name       the IMS name (compared as R13 does: trimmed, whitespace collapsed, case ignored).
@@ -70,7 +83,7 @@ export type WooTaxRateFields = {
 
 export type FieldChange = { field: WooTaxField; before: string | boolean; after: string | boolean }
 
-export const WOO_TAX_CHANGE_KINDS = ['DELETE', 'UPDATE', 'REFRESH_MAPPING', 'CREATE'] as const
+export const WOO_TAX_CHANGE_KINDS = ['DELETE', 'UPDATE', 'CREATE'] as const
 export type WooTaxChangeKind = (typeof WOO_TAX_CHANGE_KINDS)[number]
 
 export const DELETE_REASONS = {
@@ -109,15 +122,7 @@ export type DeleteChange = {
   reason: DeleteReason
   before: WooTaxRateFields
 }
-export type RefreshMappingChange = {
-  kind: 'REFRESH_MAPPING'
-  key: string
-  wooId: string
-  imsRateId: string
-  imsRateName: string
-  after: WooTaxRateFields
-}
-export type WooTaxChange = CreateChange | UpdateChange | DeleteChange | RefreshMappingChange
+export type WooTaxChange = CreateChange | UpdateChange | DeleteChange
 
 export const WOO_TAX_BLOCKER_CODES = {
   UNMAPPED_TWIN: 'an unmapped store rate has the name, country, class and region a CREATE would give the IMS rate: map it to the IMS rate (adopt it) instead of creating a second one',
@@ -131,6 +136,8 @@ export const WOO_TAX_FINDING_CODES = {
   REGION_NOT_RECORDED: 'the store rate has a state that the IMS rate name does not state; the writer never clears a state (clearing it would widen the rate), so the difference stays until the owner settles it',
   COUNTRY_NOT_RECORDED: 'the store rate has a country and the IMS rate has none; the writer never clears a country, so the difference stays until the owner settles it',
   REGION_NAME_UNREADABLE: 'the IMS rate name may state a region in a form the name parser does not read: the store rate state is left as it is',
+  MAPPING_NOT_ADOPTED: 'the mapping of this store rate carries no identity of the store configured now (a legacy row, or one made against another store), so the rate is not owned: it is left as it is until the adoption step stamps it',
+  RE_ADOPTION_REQUIRED: 'the live store rate no longer matches the snapshot IMS holds for it (name, country, percent or class) in a way IMS did not cause, so it may be a different rate: it is never updated or deleted until the adoption step re-stamps it',
   OWNED_BUT_UNMAPPED: 'the writer created this store rate but it is no longer mapped to an IMS rate, so nothing can be decided for it: left as it is',
 } as const
 export type WooTaxFindingCode = keyof typeof WOO_TAX_FINDING_CODES
@@ -145,6 +152,8 @@ export type WooTaxMappingRow = {
   /** Percent text as stored. */
   externalRatePct: string
   externalClass: string | null
+  /** The normalised URL of the store the row was made against; null for a row from before this rule. */
+  storeIdentity: string | null
 }
 
 export type WooTaxPlanInput = {
@@ -153,8 +162,10 @@ export type WooTaxPlanInput = {
   /** Mappings of the storefront connector only. */
   mappings: readonly WooTaxMappingRow[]
   componentRates: readonly TaxComponentRateRow[]
-  /** Store rate ids this writer created or changed and recorded, and has not deleted. */
+  /** Store rate ids this writer created or changed and recorded against the store configured now, and has not deleted. */
   recordedOwnedWooIds: ReadonlySet<string>
+  /** The normalised URL of the store configured now (`normaliseStoreIdentity`). */
+  storeIdentity: string
 }
 
 export type WooTaxPlan = {
@@ -173,15 +184,25 @@ export type WooTaxPlan = {
 }
 
 /** One row of the writer's own record, as the ownership rule reads it. */
-export type WooTaxWriteRecord = { kind: string; status: string; wooTaxRateId: string | null }
+export type WooTaxWriteRecord = { kind: string; status: string; wooTaxRateId: string | null; storeIdentity?: string | null }
+
+/** The normal form of a store URL, the identity ownership is bound to; null when it is not an http(s) URL. Scheme, host (lower case, default port dropped) and path, nothing else. */
+export function normaliseStoreIdentity(url: string): string | null {
+  try {
+    const parsed = new URL(url.trim())
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null
+    return `${parsed.protocol}//${parsed.host.toLowerCase()}${parsed.pathname.replace(/\/+$/, '')}`
+  } catch { return null }
+}
 
 /**
  * The store rates the writer owns BY RECORD: created or changed by an APPLIED CREATE or UPDATE and not since deleted by an APPLIED DELETE, in the order the records were made. A FAILED record
- * owns nothing (the store refused it); a REFRESH_MAPPING touched no store rate.
+ * owns nothing (the store refused it); an ADOPT stamps a mapping and owns nothing by record. Only records made against `storeIdentity` count.
  */
-export function ownedWooIdsFromRecords(records: readonly WooTaxWriteRecord[]): Set<string> {
+export function ownedWooIdsFromRecords(records: readonly WooTaxWriteRecord[], storeIdentity: string): Set<string> {
   const owned = new Set<string>()
   for (const record of records) {
+    if (record.storeIdentity !== storeIdentity) continue
     if (record.status !== 'APPLIED' || record.wooTaxRateId === null) continue
     if (record.kind === 'DELETE') owned.delete(record.wooTaxRateId)
     else if (record.kind === 'CREATE' || record.kind === 'UPDATE') owned.add(record.wooTaxRateId)
@@ -276,14 +297,20 @@ function compareToDesired(woo: WooTaxRateDetail, rate: TaxRateRow, desired: Desi
   return { fields, after, findings }
 }
 
-/** Whether the stored mapping row still describes the store rate as it will stand (R13 reads the class; the display fields follow). */
-function mappingIsCurrent(mapping: WooTaxMappingRow, after: WooTaxRateFields): boolean {
-  const storedPct = exact(mapping.externalRatePct)
-  const afterPct = exact(after.rate)
-  return normaliseClass(mapping.externalClass) === normaliseClass(after.class)
-    && comparableName(mapping.externalName) === comparableName(after.name)
-    && normaliseCountryCode(mapping.externalCountry ?? '') === normaliseCountryCode(after.country)
-    && storedPct !== null && afterPct !== null && storedPct.eq(afterPct)
+/** The four fields that identify a rate (see the header): what a mapping row stores and what the live rate states. */
+export type RateIdentityFields = { name: string; country: string; rate: string; class: string }
+
+export const identityOfMapping = (m: WooTaxMappingRow): RateIdentityFields => ({ name: m.externalName, country: m.externalCountry ?? '', rate: m.externalRatePct, class: m.externalClass ?? '' })
+export const identityOfWoo = (w: WooTaxRateDetail): RateIdentityFields => ({ name: w.name, country: w.country, rate: w.rate, class: w.class })
+
+/** Whether the snapshot IMS holds for a rate is still the live rate: R13's comparisons of name and class, normalised country, exact percent. */
+export function sameRateIdentity(snapshot: RateIdentityFields, live: RateIdentityFields): boolean {
+  const a = exact(snapshot.rate)
+  const b = exact(live.rate)
+  return comparableName(snapshot.name) === comparableName(live.name)
+    && normaliseCountryCode(snapshot.country) === normaliseCountryCode(live.country)
+    && normaliseClass(snapshot.class) === normaliseClass(live.class)
+    && a !== null && b !== null && a.eq(b)
 }
 
 function outOfScopeReason(rate: TaxRateRow): DeleteReason {
@@ -294,8 +321,8 @@ function outOfScopeReason(rate: TaxRateRow): DeleteReason {
 
 const KIND_ORDER = new Map(WOO_TAX_CHANGE_KINDS.map((kind, index) => [kind, index] as const))
 
-export function digestWooTaxPlan(plan: Pick<WooTaxPlan, 'changes' | 'blockers' | 'findings'>): string {
-  const canonical = { v: WOO_TAX_PLAN_VERSION, changes: plan.changes, blockers: plan.blockers, findings: plan.findings }
+export function digestWooTaxPlan(plan: Pick<WooTaxPlan, 'changes' | 'blockers' | 'findings'>, storeIdentity = ''): string {
+  const canonical = { v: WOO_TAX_PLAN_VERSION, store: storeIdentity, changes: plan.changes, blockers: plan.blockers, findings: plan.findings }
   return createHash('sha256').update(JSON.stringify(canonical)).digest('hex')
 }
 
@@ -306,23 +333,39 @@ export function planWooTaxRates(input: WooTaxPlanInput): WooTaxPlan {
   const inScope = input.rates.filter((rate) => rate.active && isSales(rate.usedFor) && !rate.reverseCharge)
   const inScopeIds = new Set(inScope.map((rate) => rate.id))
 
-  // Store rates by the IMS rate they are mapped to. Only rates the store has count as a counterpart.
+  // Store rates by the IMS rate they are mapped to. A VERIFIED counterpart is a rate the store has whose mapping is stamped with this store's identity and whose snapshot is still the live rate.
+  // A present rate whose mapping is not stamped for this store is not owned (MAPPING_NOT_ADOPTED); one whose snapshot differs needs re-adoption (RE_ADOPTION_REQUIRED). Both are frozen: no change
+  // is planned for them and none is planned for their IMS rate either (no CREATE next to a rate that may be its counterpart).
   const countersByIms = new Map<string, WooTaxRateDetail[]>()
   const staleByIms = new Map<string, string[]>()
+  const frozenIms = new Set<string>()
+  const verifiedWoo = new Set<string>()
+  const findings: WooTaxFinding[] = []
   for (const mapping of input.mappings) {
     const woo = wooById.get(mapping.externalTaxRateId)
     if (woo === undefined) { staleByIms.set(mapping.taxRateId, [...(staleByIms.get(mapping.taxRateId) ?? []), mapping.externalTaxRateId]); continue }
+    if (mapping.storeIdentity !== input.storeIdentity) {
+      frozenIms.add(mapping.taxRateId)
+      findings.push({ code: 'MAPPING_NOT_ADOPTED', wooId: woo.id, imsRateId: mapping.taxRateId })
+      continue
+    }
+    if (!sameRateIdentity(identityOfMapping(mapping), identityOfWoo(woo))) {
+      frozenIms.add(mapping.taxRateId)
+      findings.push({ code: 'RE_ADOPTION_REQUIRED', wooId: woo.id, imsRateId: mapping.taxRateId })
+      continue
+    }
+    verifiedWoo.add(woo.id)
     countersByIms.set(mapping.taxRateId, [...(countersByIms.get(mapping.taxRateId) ?? []), woo])
   }
 
   const changes: WooTaxChange[] = []
   const blockers: WooTaxBlocker[] = []
-  const findings: WooTaxFinding[] = []
 
   for (const rate of [...inScope].sort((a, b) => (a.id < b.id ? -1 : 1))) {
     const desired = desiredOf(rate, input.componentRates)
     if (desired === null) { findings.push({ code: 'IMS_PERCENT_UNREADABLE', imsRateId: rate.id }); continue }
     const counters = [...(countersByIms.get(rate.id) ?? [])].sort((a, b) => idOrder(a.id, b.id))
+    if (counters.length === 0 && frozenIms.has(rate.id)) continue
     if (counters.length === 0) {
       // The twin check: an UNMAPPED store rate (the owner's, or one this writer created and lost the mapping of) of the identity this CREATE would give.
       for (const woo of input.woo) {
@@ -349,18 +392,15 @@ export function planWooTaxRates(input: WooTaxPlanInput): WooTaxPlan {
       }
     }
     findings.push(...keeper.findings)
-    const mapping = mappingByWoo.get(keeper.woo.id)!
     if (keeper.fields.length > 0) {
       changes.push({ kind: 'UPDATE', key: `update:${keeper.woo.id}`, wooId: keeper.woo.id, imsRateId: rate.id, imsRateName: rate.name, fields: keeper.fields, after: keeper.after })
-    } else if (!mappingIsCurrent(mapping, keeper.after)) {
-      changes.push({ kind: 'REFRESH_MAPPING', key: `refresh:${keeper.woo.id}`, wooId: keeper.woo.id, imsRateId: rate.id, imsRateName: rate.name, after: keeper.after })
     }
   }
 
   // Owned store rates mapped to an IMS rate that is out of scope.
   for (const woo of input.woo) {
     const mapping = mappingByWoo.get(woo.id)
-    if (mapping === undefined) continue
+    if (mapping === undefined || !verifiedWoo.has(woo.id)) continue
     const rate = ratesById.get(mapping.taxRateId)
     if (rate === undefined || inScopeIds.has(rate.id)) continue
     changes.push({ kind: 'DELETE', key: `delete:${woo.id}`, wooId: woo.id, imsRateId: rate.id, imsRateName: rate.name, reason: outOfScopeReason(rate), before: fieldsOfWoo(woo) })
@@ -368,18 +408,55 @@ export function planWooTaxRates(input: WooTaxPlanInput): WooTaxPlan {
 
   let unowned = 0
   for (const woo of input.woo) {
-    if (mappingByWoo.has(woo.id)) continue
+    if (mappingByWoo.has(woo.id)) { if (!verifiedWoo.has(woo.id) && mappingByWoo.get(woo.id)!.storeIdentity !== input.storeIdentity) unowned += 1; continue }
     if (input.recordedOwnedWooIds.has(woo.id)) findings.push({ code: 'OWNED_BUT_UNMAPPED', wooId: woo.id })
     else unowned += 1
   }
 
   changes.sort((a, b) => (KIND_ORDER.get(a.kind)! - KIND_ORDER.get(b.kind)!) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
   findings.sort((a, b) => (a.code < b.code ? -1 : a.code > b.code ? 1 : 0) || ((a.wooId ?? a.imsRateId ?? '') < (b.wooId ?? b.imsRateId ?? '') ? -1 : 1))
-  const counts = { DELETE: 0, UPDATE: 0, REFRESH_MAPPING: 0, CREATE: 0 } satisfies Record<WooTaxChangeKind, number>
+  const counts = { DELETE: 0, UPDATE: 0, CREATE: 0 } satisfies Record<WooTaxChangeKind, number>
   for (const change of changes) counts[change.kind] += 1
   const plan: WooTaxPlan = {
     v: WOO_TAX_PLAN_VERSION, inScopeRates: inScope.length, wooRates: input.woo.length, unownedLeftAlone: unowned, counts, changes, blockers, findings, digest: '',
   }
-  plan.digest = digestWooTaxPlan(plan)
+  plan.digest = digestWooTaxPlan(plan, input.storeIdentity)
+  return plan
+}
+
+// ---------------------------------------------------------------------------
+// The adoption step
+// ---------------------------------------------------------------------------
+
+export const ADOPTION_REASONS = {
+  UNSTAMPED: 'the mapping row carries no store identity (a row from before the identity rule)',
+  OTHER_STORE: 'the mapping row was made against another store',
+  SNAPSHOT_DIFFERS: 'the mapping row is stamped for this store but the live rate no longer matches its snapshot',
+} as const
+export type AdoptionReason = keyof typeof ADOPTION_REASONS
+export type AdoptionRow = { wooId: string; imsRateId: string; imsRateName: string; reason: AdoptionReason; snapshot: RateIdentityFields; live: RateIdentityFields }
+export type AdoptionPlan = { v: 1; storeIdentity: string; rows: AdoptionRow[]; digest: string }
+
+/**
+ * THE ADOPTION STEP, planned. Every mapping row of the storefront connector whose store rate EXISTS in the store now and that is not (stamped for this store AND matching its live rate) is a
+ * candidate. Applying it stamps the row with this store's identity and rewrites its snapshot from the live rate: the operator, by confirming the digest, vouches that the live rate is the rate
+ * IMS means. Nothing is sent to WooCommerce. Rows whose store rate is absent are not candidates (nothing to vouch for).
+ */
+export function planAdoption(input: { woo: readonly WooTaxRateDetail[]; rates: readonly TaxRateRow[]; mappings: readonly WooTaxMappingRow[]; storeIdentity: string }): AdoptionPlan {
+  const wooById = new Map(input.woo.map((w) => [w.id, w]))
+  const ratesById = new Map(input.rates.map((r) => [r.id, r]))
+  const rows: AdoptionRow[] = []
+  for (const mapping of input.mappings) {
+    const woo = wooById.get(mapping.externalTaxRateId)
+    if (woo === undefined) continue
+    const reason: AdoptionReason | null = mapping.storeIdentity === null ? 'UNSTAMPED'
+      : mapping.storeIdentity !== input.storeIdentity ? 'OTHER_STORE'
+        : !sameRateIdentity(identityOfMapping(mapping), identityOfWoo(woo)) ? 'SNAPSHOT_DIFFERS' : null
+    if (reason === null) continue
+    rows.push({ wooId: woo.id, imsRateId: mapping.taxRateId, imsRateName: ratesById.get(mapping.taxRateId)?.name ?? '', reason, snapshot: identityOfMapping(mapping), live: identityOfWoo(woo) })
+  }
+  rows.sort((a, b) => idOrder(a.wooId, b.wooId))
+  const plan: AdoptionPlan = { v: 1, storeIdentity: input.storeIdentity, rows, digest: '' }
+  plan.digest = createHash('sha256').update(JSON.stringify({ v: 1, adopt: true, store: plan.storeIdentity, rows })).digest('hex')
   return plan
 }

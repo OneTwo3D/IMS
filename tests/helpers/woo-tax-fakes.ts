@@ -7,9 +7,13 @@ import type { WooTaxPortResult, WooTaxRateWritePort } from '../../lib/connectors
 
 export const woo = (id: string, over: Partial<WooTaxRateDetail> = {}): WooTaxRateDetail => ({ id, name: 'GB VAT', rate: '20.0000', country: 'GB', state: '', postcode: '', city: '', class: 'standard', shipping: true, compound: false, ...over })
 export const ims = (id: string, over: Partial<TaxRateRow> = {}): TaxRateRow => ({ id, name: 'GB VAT', rate: '0.2000', usedFor: 'SALES', reverseCharge: false, active: true, accountingTaxType: null, countryCode: 'GB', reportingCategory: 'DOMESTIC', isCompound: false, taxCategory: 'STANDARD', ...over })
+/** The store the fixtures stand in (the normalised URL ownership is bound to). */
+export const STORE = 'https://store.example'
+export const OTHER_STORE = 'https://other-store.example'
+
 /** A mapping row that describes `w` exactly as the store states it. */
 export const mapOf = (w: WooTaxRateDetail, taxRateId: string, over: Partial<WooTaxMappingRow> = {}): WooTaxMappingRow => ({
-  externalTaxRateId: w.id, taxRateId, externalName: w.name, externalCountry: w.country === '' ? null : w.country, externalRatePct: w.rate, externalClass: w.class, ...over,
+  externalTaxRateId: w.id, taxRateId, externalName: w.name, externalCountry: w.country === '' ? null : w.country, externalRatePct: w.rate, externalClass: w.class, storeIdentity: STORE, ...over,
 })
 
 /** A consistent set: UK 20, German 19, Canary Islands 0 (Spain, region CN), Madeira 22 (Portugal, PT-30). */

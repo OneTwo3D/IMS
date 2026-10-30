@@ -1,6 +1,6 @@
 import type test from 'node:test'
 
-import { FakeWooStore, woo } from './woo-tax-fakes.ts'
+import { FakeWooStore, STORE, woo } from './woo-tax-fakes.ts'
 
 /**
  * The shared world of the WooCommerce tax-rate writer's database and concurrency tests (IMS rows in the scratch database, an in-memory store that counts every send). The caller loads the
@@ -43,7 +43,7 @@ export async function buildWorld(t: test.TestContext, modules: () => Promise<Mod
   const w4 = woo(id(4), { name: 'XX Old VAT', country: 'XX', rate: '10.0000' })
   const w5 = woo(id(5), { name: 'Hand made', country: 'IE', rate: '99.0000', class: 'weird', shipping: false, compound: true })
   const store = new FakeWooStore([w1, w2, w3, w4, w5], base + 100)
-  for (const [w, r] of [[w1, gb], [w2, de], [w3, pt30], [w4, old]] as const) await db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: w.id, taxRateId: r.id, externalName: w.name, externalCountry: w.country, externalRatePct: w.rate, externalClass: w.class } })
+  for (const [w, r] of [[w1, gb], [w2, de], [w3, pt30], [w4, old]] as const) await db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: w.id, taxRateId: r.id, externalName: w.name, externalCountry: w.country, externalRatePct: w.rate, externalClass: w.class, storeIdentity: STORE } })
   const mine = [gb.id, de.id, pt30.id, old.id, fr.id]
   t.after(async () => {
     await db.wooTaxRateWrite.deleteMany({ where: { imsTaxRateId: { in: mine } } })
@@ -61,7 +61,7 @@ export async function buildWorld(t: test.TestContext, modules: () => Promise<Mod
   await body({
     m, store, ids: { gb: gb.id, de: de.id, pt30: pt30.id, old: old.id, fr: fr.id },
     woo: { w1: w1.id, w2: w2.id, w3: w3.id, w4: w4.id, w5: w5.id },
-    deps: (env) => ({ readWoo: store.readWoo, port: store, context: ctx(env) }),
+    deps: (env) => ({ readWoo: store.readWoo, storeIdentity: async () => STORE, port: store, context: ctx(env) }),
     counts,
     mappingRows: () => db.shoppingTaxRateMapping.findMany({ where: { taxRateId: { in: mine } }, orderBy: { externalTaxRateId: 'asc' } }),
   })

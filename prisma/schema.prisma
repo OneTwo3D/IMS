@@ -3565,6 +3565,9 @@ model ShoppingTaxRateMapping {
   externalCountry String?
   externalRatePct   Decimal  @db.Decimal(7, 4)
   externalClass     String?
+  /// The normalised URL of the store the row was made against (lib/connectors/woocommerce/tax-rate-plan.ts normaliseStoreIdentity). NULL on every row from before the identity rule:
+  /// such a row does not count as ownership for the tax-rate writer until the operator's adoption step stamps it.
+  storeIdentity     String?  @map("store_identity")
   taxRateId         String
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
@@ -3583,7 +3586,7 @@ model WooTaxRateWrite {
   id           String   @id @default(cuid())
   /// The plan digest the operator confirmed.
   planDigest   String   @map("plan_digest") @db.Char(64)
-  /// CREATE | UPDATE | DELETE | REFRESH_MAPPING (lib/connectors/woocommerce/tax-rate-plan.ts).
+  /// CREATE | UPDATE | DELETE | ADOPT (lib/connectors/woocommerce/tax-rate-plan.ts).
   kind         String
   /// The plan's key for the change, for example `update:12`.
   changeKey    String   @map("change_key")
@@ -3595,6 +3598,8 @@ model WooTaxRateWrite {
   /// The planned change with its before and after values.
   change       Json
   error        String?
+/// The normalised URL of the store the change was made against; ownership by record counts only against the store configured now.
+  storeIdentity String? @map("store_identity")
   createdAt    DateTime @default(now()) @map("created_at")
 
   @@index([wooTaxRateId], map: "woo_tax_rate_writes_woo_idx")

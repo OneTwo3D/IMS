@@ -91,3 +91,31 @@ test('two applies at once while held: both finish, nothing is sent, nothing but 
     assert.deepEqual((await w.m.db.outboundShadowWrite.findMany({ where: { destination: 'woocommerce', operation: 'tax-rate' } })).map((s) => s.occurrences), [2, 2, 2, 2])
   })
 })
+
+test('two ADOPTIONS at once: the second waits on the same lock and then has nothing to stamp; each row is stamped and recorded exactly once', SKIP, async (t) => {
+  await buildWorld(t, modules, async (w) => {
+    await w.m.db.shoppingTaxRateMapping.updateMany({ where: { externalTaxRateId: { in: [w.woo.w1, w.woo.w2, w.woo.w3, w.woo.w4] } }, data: { storeIdentity: null } })
+    const plan = (await w.m.writer.readWooAdoptionPlan(w.deps(LIVE))).plan!
+    assert.equal(plan.rows.length, 4, 'PRECONDITION: four legacy rows')
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    // The first adoption is held inside its store read, which happens under the lock.
+    const slowDeps = { ...w.deps(LIVE), readWoo: async () => { await gate; return w.store.readWoo() } }
+    let first: ReturnType<typeof w.m.writer.applyWooAdoption> | null = null
+    let second: ReturnType<typeof w.m.writer.applyWooAdoption> | null = null
+    try {
+      first = w.m.writer.applyWooAdoption(slowDeps, { confirm: plan.digest })
+      assert.equal(await until(w.m.db, true, 1), 1, 'PRECONDITION: the first adoption holds the single-runner lock')
+      second = w.m.writer.applyWooAdoption(w.deps(LIVE), { confirm: plan.digest })
+      assert.equal(await until(w.m.db, false, 1), 1, 'PRECONDITION: the second adoption waits on the lock')
+      release()
+      const [a, b] = await Promise.all([first, second])
+      assert.equal(a.outcome, 'ADOPTED')
+      assert.equal(b.outcome, 'NOTHING_TO_DO')
+      assert.equal(await w.m.db.wooTaxRateWrite.count({ where: { kind: 'ADOPT' } }), 4, 'one ADOPT record per row, not two')
+    } finally {
+      release()
+      await Promise.allSettled([first, second])
+    }
+  })
+})

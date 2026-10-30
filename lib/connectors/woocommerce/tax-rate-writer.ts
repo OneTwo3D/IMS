@@ -36,7 +36,7 @@ import type { ProducerDecisionContext } from '@/lib/security/producer-dispositio
 import { producerSeamVerdict } from '@/lib/security/producer-seam'
 import type { TaxComponentRateRow, TaxRateRow } from '@/lib/reconciliation-pack/ims-readers'
 import type { WooTaxRateDetail } from '@/lib/reconciliation-pack/woo-source'
-import { planWooTaxRates, ownedWooIdsFromRecords, type FieldChange, type WooTaxChange, type WooTaxMappingRow, type WooTaxPlan, type WooTaxRateFields } from './tax-rate-plan'
+import { planAdoption, planWooTaxRates, ownedWooIdsFromRecords, type AdoptionPlan, type FieldChange, type WooTaxChange, type WooTaxMappingRow, type WooTaxPlan, type WooTaxRateFields } from './tax-rate-plan'
 import { wooProducerSeam } from './producer-seam'
 
 const DIGEST_RE = /^[0-9a-f]{64}$/
@@ -57,6 +57,8 @@ export type WooTaxReadResult = { ok: true; rates: WooTaxRateDetail[] } | { ok: f
 export type WooTaxWriterDeps = {
   /** The proven, GET-only read of the store's tax rates. */
   readWoo: () => Promise<WooTaxReadResult>
+  /** The normalised URL of the store configured now (`normaliseStoreIdentity`), or null when none is usable. Every ownership source is bound to it. */
+  storeIdentity: () => Promise<string | null>
   /** Required by an apply. */
   port?: WooTaxRateWritePort
   /** Test seam: the environment and clock the producer decision reads (default: the process). */
@@ -82,6 +84,8 @@ export const WOO_TAX_REFUSALS = {
   HOLD_NOT_ENFORCED: 'the producer-side hold is not enforced for WooCommerce, so this writer does not run (it has no earlier behaviour to preserve)',
   BUSY: 'another apply of the WooCommerce tax rates is running and did not finish in time',
   IMS_UNREADABLE: 'the IMS tax rates, mappings or the writer record could not be read',
+  STORE_UNIDENTIFIED: 'the store configured now has no usable URL, so ownership cannot be tied to a store',
+  ADOPTION_FAILED: 'the adoption could not stamp every row (a mapping row changed or went away meanwhile); nothing was stamped',
   WOO_UNREADABLE: 'the WooCommerce tax rates could not be read and proven (no credentials, a refused or failed request, or pages that disagree)',
   DIGEST_MISMATCH: 'the plan changed since it was previewed (or this is not its digest); preview again. Nothing was written',
   BLOCKED: 'the plan has a blocker (see it in the preview); resolve it and preview again. Nothing was written',
@@ -106,7 +110,8 @@ export type WooTaxApplyResult =
       shadowUnrecorded: number
       /** A change the store refused (the run stopped there), or one that was sent but could not be recorded. */
       failed: FailedChange | null
-      sentButUnrecorded: string | null
+      /** A change that WAS sent but could not be recorded (the mapping row it rests on is not the one planned, or the commit failed): the run stopped there. */
+      unrecorded: { key: string; reason: string } | null
     }
 
 type ReadClient = Pick<Prisma.TransactionClient, 'taxRate' | 'taxRateComponent' | 'shoppingTaxRateMapping' | 'wooTaxRateWrite'>
@@ -118,7 +123,10 @@ type ImsState = {
   recordedOwnedWooIds: Set<string>
 }
 
-async function readImsState(client: ReadClient): Promise<ImsState> {
+/** The mapping row a send rests on is not the planned one, or the commit failed after the send. */
+class UnrecordedSendError extends Error {}
+
+async function readImsState(client: ReadClient, storeIdentity: string): Promise<ImsState> {
   const rates = await client.taxRate.findMany({
     select: { id: true, name: true, rate: true, usedFor: true, reverseCharge: true, active: true, accountingTaxType: true, countryCode: true, reportingCategory: true, isCompound: true, taxCategory: true },
     orderBy: { id: 'asc' },
@@ -126,14 +134,14 @@ async function readImsState(client: ReadClient): Promise<ImsState> {
   const components = await client.taxRateComponent.findMany({ select: { taxRateId: true, rate: true, compoundOnPrevious: true, active: true, sortOrder: true }, orderBy: [{ taxRateId: 'asc' }, { sortOrder: 'asc' }, { id: 'asc' }] })
   const mappings = await client.shoppingTaxRateMapping.findMany({
     where: { connector: 'woocommerce' },
-    select: { externalTaxRateId: true, taxRateId: true, externalName: true, externalCountry: true, externalRatePct: true, externalClass: true },
+    select: { externalTaxRateId: true, taxRateId: true, externalName: true, externalCountry: true, externalRatePct: true, externalClass: true, storeIdentity: true },
     orderBy: { externalTaxRateId: 'asc' },
   })
   const writes = await client.wooTaxRateWrite.findMany({
-    select: { kind: true, status: true, wooTaxRateId: true },
+    select: { kind: true, status: true, wooTaxRateId: true, storeIdentity: true },
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
   })
-  const owned = ownedWooIdsFromRecords(writes)
+  const owned = ownedWooIdsFromRecords(writes, storeIdentity)
   return {
     rates: rates.map((row) => ({
       id: row.id, name: row.name, rate: row.rate.toFixed(4), usedFor: row.usedFor, reverseCharge: row.reverseCharge, active: row.active, accountingTaxType: row.accountingTaxType,
@@ -145,25 +153,34 @@ async function readImsState(client: ReadClient): Promise<ImsState> {
   }
 }
 
-type PlanRead = { ok: true; plan: WooTaxPlan } | { ok: false; code: 'IMS_UNREADABLE' | 'WOO_UNREADABLE' }
+type PlanRead = { ok: true; plan: WooTaxPlan; storeIdentity: string } | { ok: false; code: 'IMS_UNREADABLE' | 'WOO_UNREADABLE' | 'STORE_UNIDENTIFIED' }
 
 /** IMS in one repeatable-read read-only transaction, then the store (a paced walk must not hold a transaction open), then the pure plan. Writes nothing. */
-async function readPlan(deps: WooTaxWriterDeps): Promise<PlanRead> {
+async function readState(deps: WooTaxWriterDeps): Promise<{ ok: true; ims: ImsState; woo: WooTaxRateDetail[]; storeIdentity: string } | { ok: false; code: 'IMS_UNREADABLE' | 'WOO_UNREADABLE' | 'STORE_UNIDENTIFIED' }> {
+  const storeIdentity = await deps.storeIdentity().catch(() => null)
+  if (storeIdentity === null) return { ok: false, code: 'STORE_UNIDENTIFIED' }
   let ims: ImsState
   try {
     ims = await db.$transaction(async (tx) => {
       await tx.$executeRaw`SET TRANSACTION READ ONLY`
-      return readImsState(tx)
+      return readImsState(tx, storeIdentity)
     }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, timeout: 60_000, maxWait: 20_000 })
   } catch {
     return { ok: false, code: 'IMS_UNREADABLE' }
   }
   const woo = await deps.readWoo()
   if (!woo.ok) return { ok: false, code: 'WOO_UNREADABLE' }
-  return { ok: true, plan: planWooTaxRates({ woo: woo.rates, rates: ims.rates, mappings: ims.mappings, componentRates: ims.componentRates, recordedOwnedWooIds: ims.recordedOwnedWooIds }) }
+  return { ok: true, ims, woo: woo.rates, storeIdentity }
 }
 
-export type WooTaxPreview = { hold: WooTaxHold } & ({ refused: null; plan: WooTaxPlan } | { refused: 'IMS_UNREADABLE' | 'WOO_UNREADABLE'; plan: null })
+async function readPlan(deps: WooTaxWriterDeps): Promise<PlanRead> {
+  const state = await readState(deps)
+  if (!state.ok) return state
+  const { ims, woo, storeIdentity } = state
+  return { ok: true, storeIdentity, plan: planWooTaxRates({ woo, rates: ims.rates, mappings: ims.mappings, componentRates: ims.componentRates, recordedOwnedWooIds: ims.recordedOwnedWooIds, storeIdentity }) }
+}
+
+export type WooTaxPreview = { hold: WooTaxHold } & ({ refused: null; plan: WooTaxPlan } | { refused: 'IMS_UNREADABLE' | 'WOO_UNREADABLE' | 'STORE_UNIDENTIFIED'; plan: null })
 
 /** The dry run. Reads IMS and the store; writes nothing and sends nothing. */
 export async function readWooTaxPlan(deps: WooTaxWriterDeps): Promise<WooTaxPreview> {
@@ -193,31 +210,36 @@ async function send(port: WooTaxRateWritePort, change: WooTaxChange): Promise<Wo
     case 'CREATE': return port.create(change.after)
     case 'UPDATE': return port.update(change.wooId, changedFields(change.fields))
     case 'DELETE': return port.remove(change.wooId)
-    case 'REFRESH_MAPPING': return { ok: true, id: change.wooId }
   }
 }
 
-async function recordApplied(digest: string, change: WooTaxChange, newId: string | null): Promise<void> {
+async function recordApplied(digest: string, change: WooTaxChange, newId: string | null, storeIdentity: string): Promise<void> {
   await db.$transaction(async (tx) => {
     const wooId = change.kind === 'CREATE' ? newId : change.wooId
     await tx.wooTaxRateWrite.create({
       data: {
-        planDigest: digest, kind: change.kind, changeKey: change.key, wooTaxRateId: wooId, imsTaxRateId: change.imsRateId, status: 'APPLIED',
+        planDigest: digest, kind: change.kind, changeKey: change.key, wooTaxRateId: wooId, imsTaxRateId: change.imsRateId, status: 'APPLIED', storeIdentity,
         change: JSON.parse(JSON.stringify(change)) as Prisma.InputJsonValue,
       },
     })
     if (change.kind === 'CREATE') {
-      await tx.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: newId!, taxRateId: change.imsRateId, ...mappingFields(change.after) } })
-    } else if (change.kind === 'UPDATE' || change.kind === 'REFRESH_MAPPING') {
-      await tx.shoppingTaxRateMapping.updateMany({ where: { connector: 'woocommerce', externalTaxRateId: change.wooId }, data: mappingFields(change.after) })
+      await tx.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: newId!, taxRateId: change.imsRateId, storeIdentity, ...mappingFields(change.after) } })
+      return
     }
+    // The mapping row the change rests on must still be EXACTLY the planned one (this rate id, this IMS rate, this store) and must be hit exactly once: a row that went away or was re-pointed
+    // between the plan and now leaves the store changed with nothing to show for it, so the record is rolled back and the run says so.
+    const target = { connector: 'woocommerce', externalTaxRateId: change.wooId, taxRateId: change.imsRateId, storeIdentity }
+    const hit = change.kind === 'UPDATE'
+      ? (await tx.shoppingTaxRateMapping.updateMany({ where: target, data: mappingFields(change.after) })).count
+      : await tx.shoppingTaxRateMapping.count({ where: target })
+    if (hit !== 1) throw new UnrecordedSendError(`the mapping row of store rate ${change.wooId} is not the planned one any more (${hit} row(s) matched its id, IMS rate and store)`)
   })
 }
 
-async function recordFailed(digest: string, change: WooTaxChange, error: string): Promise<void> {
+async function recordFailed(digest: string, change: WooTaxChange, error: string, storeIdentity: string): Promise<void> {
   await db.wooTaxRateWrite.create({
     data: {
-      planDigest: digest, kind: change.kind, changeKey: change.key, wooTaxRateId: 'wooId' in change ? change.wooId : null, imsTaxRateId: change.imsRateId, status: 'FAILED',
+      planDigest: digest, kind: change.kind, changeKey: change.key, wooTaxRateId: 'wooId' in change ? change.wooId : null, imsTaxRateId: change.imsRateId, status: 'FAILED', storeIdentity,
       change: JSON.parse(JSON.stringify(change)) as Prisma.InputJsonValue, error: error.slice(0, 500),
     },
   })
@@ -245,7 +267,7 @@ export async function applyWooTaxPlan(deps: WooTaxWriterDeps, options: { confirm
     if (plan.digest !== options.confirm) return refuse('DIGEST_MISMATCH', plan)
     if (plan.blockers.length > 0) return refuse('BLOCKED', plan)
 
-    const result: Extract<WooTaxApplyResult, { outcome: 'DONE' }> = { outcome: 'DONE', plan, applied: [], shadowed: [], shadowUnrecorded: 0, failed: null, sentButUnrecorded: null }
+    const result: Extract<WooTaxApplyResult, { outcome: 'DONE' }> = { outcome: 'DONE', plan, applied: [], shadowed: [], shadowUnrecorded: 0, failed: null, unrecorded: null }
     for (const change of plan.changes) {
       lock.assertHeld(`sending ${change.key}`)
       // THE SEAM, before the first effect of the change. A shadow records what would have been sent and answers; nothing else happens for this change.
@@ -260,23 +282,93 @@ export async function applyWooTaxPlan(deps: WooTaxWriterDeps, options: { confirm
       const sent = await send(deps.port, change)
       if (!sent.ok) {
         result.failed = { key: change.key, kind: change.kind, error: sent.error }
-        await recordFailed(plan.digest, change, sent.error).catch(() => undefined)
+        await recordFailed(plan.digest, change, sent.error, read.storeIdentity).catch(() => undefined)
         break
       }
       const newId = change.kind === 'CREATE' ? (sent.id ?? null) : null
       if (change.kind === 'CREATE' && (newId === null || !/^[1-9][0-9]{0,17}$/.test(newId))) {
-        result.sentButUnrecorded = change.key
+        result.unrecorded = { key: change.key, reason: 'the store answered a created rate without a usable id' }
         break
       }
       try {
-        await recordApplied(plan.digest, change, newId)
-      } catch {
-        result.sentButUnrecorded = change.key
+        await recordApplied(plan.digest, change, newId, read.storeIdentity)
+      } catch (error) {
+        result.unrecorded = { key: change.key, reason: error instanceof UnrecordedSendError ? error.message : 'the change record could not be committed' }
         break
       }
       result.applied.push({ key: change.key, kind: change.kind, wooId: change.kind === 'CREATE' ? newId : change.wooId })
     }
     return result
+  } catch (error) {
+    if (error instanceof AdvisoryLockLostError) return refuse('LOCK_LOST')
+    throw error
+  } finally {
+    await lock.release().catch(() => undefined)
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// The adoption step (stamps mapping rows with the store identity; sends nothing to WooCommerce)
+// ---------------------------------------------------------------------------
+
+export type WooAdoptionPreview = { refused: null; plan: AdoptionPlan } | { refused: 'IMS_UNREADABLE' | 'WOO_UNREADABLE' | 'STORE_UNIDENTIFIED'; plan: null }
+
+async function readAdoptionPlan(deps: WooTaxWriterDeps): Promise<WooAdoptionPreview> {
+  const state = await readState(deps)
+  if (!state.ok) return { refused: state.code, plan: null }
+  return { refused: null, plan: planAdoption({ woo: state.woo, rates: state.ims.rates, mappings: state.ims.mappings, storeIdentity: state.storeIdentity }) }
+}
+
+/** The dry run of the adoption: which mapping rows would be stamped, with the snapshot and the live rate side by side. Writes nothing. */
+export const readWooAdoptionPlan = readAdoptionPlan
+
+export type WooAdoptionResult =
+  | { outcome: 'REFUSED'; code: WooTaxRefusalCode; plan: AdoptionPlan | null }
+  | { outcome: 'NOTHING_TO_DO'; plan: AdoptionPlan }
+  | { outcome: 'ADOPTED'; plan: AdoptionPlan; adopted: number }
+
+/**
+ * Stamps the rows of an adoption plan the operator confirmed by its digest: store identity and a snapshot rewritten from the live rate, one ADOPT record each, all in ONE transaction under the
+ * same single-runner lock (a row that is not hit exactly once rolls everything back). It is IMS bookkeeping: nothing is sent to WooCommerce, so the producer hold does not govern it.
+ */
+export async function applyWooAdoption(deps: WooTaxWriterDeps, options: { confirm: string | undefined }): Promise<WooAdoptionResult> {
+  const refuse = (code: WooTaxRefusalCode, plan: AdoptionPlan | null = null): WooAdoptionResult => ({ outcome: 'REFUSED', code, plan })
+  if (options.confirm === undefined || !DIGEST_RE.test(options.confirm)) return refuse('CONFIRM_REQUIRED')
+  let lock
+  try {
+    lock = await acquirePinnedAdvisoryLockWaiting(WOO_TAX_RATE_WRITE_LOCK_KEY, { timeoutMs: APPLY_WAIT_MS })
+  } catch (error) {
+    if (error instanceof AdvisoryLockWaitTimeoutError) return refuse('BUSY')
+    throw error
+  }
+  try {
+    const read = await readAdoptionPlan(deps)
+    if (read.plan === null) return refuse(read.refused)
+    const plan = read.plan
+    if (plan.rows.length === 0) return { outcome: 'NOTHING_TO_DO', plan }
+    if (plan.digest !== options.confirm) return refuse('DIGEST_MISMATCH', plan)
+    try {
+      await db.$transaction(async (tx) => {
+        for (const row of plan.rows) {
+          const hit = await tx.shoppingTaxRateMapping.updateMany({
+            where: { connector: 'woocommerce', externalTaxRateId: row.wooId, taxRateId: row.imsRateId },
+            data: { storeIdentity: plan.storeIdentity, externalName: row.live.name, externalCountry: row.live.country === '' ? null : row.live.country, externalRatePct: row.live.rate, externalClass: row.live.class },
+          })
+          if (hit.count !== 1) throw new UnrecordedSendError(row.wooId)
+          await tx.wooTaxRateWrite.create({
+            data: {
+              planDigest: plan.digest, kind: 'ADOPT', changeKey: `adopt:${row.wooId}`, wooTaxRateId: row.wooId, imsTaxRateId: row.imsRateId, status: 'APPLIED', storeIdentity: plan.storeIdentity,
+              change: JSON.parse(JSON.stringify(row)) as Prisma.InputJsonValue,
+            },
+          })
+        }
+      }, { timeout: 60_000, maxWait: 20_000 })
+    } catch (error) {
+      if (error instanceof UnrecordedSendError) return refuse('ADOPTION_FAILED', plan)
+      throw error
+    }
+    return { outcome: 'ADOPTED', plan, adopted: plan.rows.length }
   } catch (error) {
     if (error instanceof AdvisoryLockLostError) return refuse('LOCK_LOST')
     throw error

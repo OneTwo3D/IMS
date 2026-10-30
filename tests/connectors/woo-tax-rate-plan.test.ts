@@ -2,12 +2,12 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
-  DELETE_REASONS, WOO_TAX_BLOCKER_CODES, WOO_TAX_FINDING_CODES, ownedWooIdsFromRecords, planWooTaxRates,
+  ADOPTION_REASONS, DELETE_REASONS, WOO_TAX_BLOCKER_CODES, WOO_TAX_FINDING_CODES, identityOfMapping, identityOfWoo, normaliseStoreIdentity, ownedWooIdsFromRecords, planAdoption, planWooTaxRates, sameRateIdentity,
   type WooTaxChange, type WooTaxMappingRow, type WooTaxPlan, type WooTaxPlanInput,
 } from '../../lib/connectors/woocommerce/tax-rate-plan.ts'
 import { compareVatSetIdentity } from '../../lib/reconciliation-pack/vat-set-identity.ts'
 import type { WooTaxRateDetail } from '../../lib/reconciliation-pack/woo-source.ts'
-import { consistent, ims, mapOf, woo } from '../helpers/woo-tax-fakes.ts'
+import { OTHER_STORE, STORE, consistent, ims, mapOf, woo } from '../helpers/woo-tax-fakes.ts'
 
 /**
  * THE WOOCOMMERCE TAX-RATE PLAN, pure. One arm per change kind and per field, the ownership rule, the shipping rule, regional rates, and the property the plan exists for: applied to
@@ -16,7 +16,7 @@ import { consistent, ims, mapOf, woo } from '../helpers/woo-tax-fakes.ts'
 
 type Input = { woo: WooTaxRateDetail[]; rates: ReturnType<typeof consistent>['rates']; mappings: WooTaxMappingRow[]; recorded?: string[] }
 const plan = (input: Input): WooTaxPlan =>
-  planWooTaxRates({ woo: input.woo, rates: input.rates, mappings: input.mappings, componentRates: [], recordedOwnedWooIds: new Set(input.recorded ?? []) } satisfies WooTaxPlanInput)
+  planWooTaxRates({ woo: input.woo, rates: input.rates, mappings: input.mappings, componentRates: [], recordedOwnedWooIds: new Set(input.recorded ?? []), storeIdentity: STORE } satisfies WooTaxPlanInput)
 const kinds = (p: WooTaxPlan): string[] => p.changes.map((c) => `${c.kind}:${c.key}`)
 const only = (p: WooTaxPlan): WooTaxChange => { assert.equal(p.changes.length, 1, `expected one change, got ${kinds(p).join(', ')}`); return p.changes[0]! }
 
@@ -38,9 +38,6 @@ function applyToWorld(input: Input, p: WooTaxPlan): { world: Input; woo: string[
       mappings = mappings.map((m) => (m.externalTaxRateId === change.wooId ? mapOf(w, m.taxRateId) : m))
     } else if (change.kind === 'DELETE') {
       wooRates.splice(wooRates.findIndex((x) => x.id === change.wooId), 1)
-    } else {
-      const w = wooRates.find((x) => x.id === change.wooId)!
-      mappings = mappings.map((m) => (m.externalTaxRateId === change.wooId ? mapOf(w, m.taxRateId) : m))
     }
   }
   const world = { ...input, woo: wooRates, mappings }
@@ -146,7 +143,7 @@ test('UPDATE: several differences in one rate are one UPDATE listing every field
 test('the percent is the one IMS computes tax at: the active components\' effective rate when it has any, not the rate column', () => {
   const input = consistent()
   const p = planWooTaxRates({
-    woo: input.woo, rates: input.rates, mappings: input.mappings, recordedOwnedWooIds: new Set(),
+    woo: input.woo, rates: input.rates, mappings: input.mappings, recordedOwnedWooIds: new Set(), storeIdentity: STORE,
     componentRates: [
       { taxRateId: 'rGB', rate: '0.1000', compoundOnPrevious: false, active: true, sortOrder: 0 },
       { taxRateId: 'rGB', rate: '0.0500', compoundOnPrevious: false, active: true, sortOrder: 1 },
@@ -309,20 +306,6 @@ test('BLOCKER: an unmapped store rate that already has the identity a CREATE wou
   assert.deepEqual(plan(input).blockers, [])
 })
 
-test('REFRESH_MAPPING: the store already matches but the stored mapping row is stale (class, name, country or percent): bookkeeping only', () => {
-  for (const over of [{ externalClass: 'zero-rate' }, { externalName: 'Old name' }, { externalCountry: 'IE' }, { externalRatePct: '15.0000' }]) {
-    const input = consistent()
-    input.mappings = input.mappings.map((m) => (m.externalTaxRateId === '1' ? { ...m, ...over } : m))
-    const change = only(plan(input))
-    assert.equal(change.kind, 'REFRESH_MAPPING')
-    assert.equal(change.kind === 'REFRESH_MAPPING' ? change.wooId : null, '1')
-  }
-  // An empty class and "standard" are the same class (R13): not stale.
-  const input = consistent()
-  input.mappings = input.mappings.map((m) => (m.externalTaxRateId === '1' ? { ...m, externalClass: null } : m))
-  assert.deepEqual(plan(input).changes, [])
-})
-
 test('an IMS rate with an unreadable percentage is a finding and is not planned', () => {
   const input = consistent()
   input.rates = input.rates.map((r) => (r.id === 'rGB' ? { ...r, rate: 'abc' } : r))
@@ -338,7 +321,8 @@ test('DIGEST: stable for equal input, different for any change of the plan, inde
   assert.equal(plan(build()).digest, a.digest)
   const reversed = build(); reversed.woo.reverse()
   assert.equal(plan(reversed).digest, a.digest)
-  const other = build(); other.woo = other.woo.map((w) => (w.id === '1' ? { ...w, rate: '14.0000' } : w))
+  const other = build(); other.woo = other.woo.map((w) => (w.id === '1' ? { ...w, rate: '14.0000' } : w)); other.mappings = other.mappings.map((m) => (m.externalTaxRateId === '1' ? mapOf(other.woo.find((w) => w.id === '1')!, 'rGB') : m))
+  assert.deepEqual(plan(other).changes.map((c) => c.kind), ['UPDATE'], 'PRECONDITION: the other store state is an UPDATE of its own (rate 14 against IMS 20)')
   assert.notEqual(plan(other).digest, a.digest)
   assert.notEqual(plan(consistent()).digest, a.digest)
   // The blockers and the findings are bound too: the same changes with another blocker or finding is another plan.
@@ -409,19 +393,131 @@ test('BLOCKER: a rate this writer created, since unmapped, that looks like the r
   assert.deepEqual(p.findings, [{ code: 'OWNED_BUT_UNMAPPED', wooId: '60' }])
 })
 
-test('OWNERSHIP BY RECORD: only APPLIED creates and updates own a store rate; a delete, a failure and a mapping refresh do not', () => {
+test('OWNERSHIP BY RECORD: only APPLIED creates and updates own a store rate; a delete, a failure, an adoption and a record of another store do not', () => {
   const rows = [
     { kind: 'CREATE', status: 'APPLIED', wooTaxRateId: '10' },
     { kind: 'CREATE', status: 'APPLIED', wooTaxRateId: '11' },
     { kind: 'DELETE', status: 'APPLIED', wooTaxRateId: '11' },
     { kind: 'UPDATE', status: 'FAILED', wooTaxRateId: '12' },
     { kind: 'CREATE', status: 'FAILED', wooTaxRateId: null },
-    { kind: 'REFRESH_MAPPING', status: 'APPLIED', wooTaxRateId: '13' },
+    { kind: 'ADOPT', status: 'APPLIED', wooTaxRateId: '13' },
     { kind: 'UPDATE', status: 'APPLIED', wooTaxRateId: '14' },
     { kind: 'DELETE', status: 'FAILED', wooTaxRateId: '14' },
   ]
-  assert.deepEqual([...ownedWooIdsFromRecords(rows)].sort(), ['10', '14'])
+  assert.deepEqual([...ownedWooIdsFromRecords(rows.map((r) => ({ ...r, storeIdentity: STORE })), STORE)].sort(), ['10', '14'])
   // In order: a delete before a create of the same id leaves it owned; after, not.
-  assert.deepEqual([...ownedWooIdsFromRecords([{ kind: 'DELETE', status: 'APPLIED', wooTaxRateId: '5' }, { kind: 'CREATE', status: 'APPLIED', wooTaxRateId: '5' }])], ['5'])
-  assert.deepEqual([...ownedWooIdsFromRecords([])], [])
+  assert.deepEqual([...ownedWooIdsFromRecords([{ kind: 'DELETE', status: 'APPLIED', wooTaxRateId: '5', storeIdentity: STORE }, { kind: 'CREATE', status: 'APPLIED', wooTaxRateId: '5', storeIdentity: STORE }], STORE)], ['5'])
+  assert.deepEqual([...ownedWooIdsFromRecords([], STORE)], [])
+})
+
+// ───────────────────────────── store identity and rate identity ─────────────────────────────
+
+test('STORE IDENTITY: the normal form is scheme, host and path, with nothing else, and a non-http URL has none', () => {
+  assert.equal(normaliseStoreIdentity('https://Shop.Example.com/'), 'https://shop.example.com')
+  assert.equal(normaliseStoreIdentity(' https://shop.example.com:443/ '), 'https://shop.example.com')
+  assert.equal(normaliseStoreIdentity('https://shop.example.com/store/?a=1#x'), 'https://shop.example.com/store')
+  assert.equal(normaliseStoreIdentity('https://shop.example.com:8443'), 'https://shop.example.com:8443')
+  assert.equal(normaliseStoreIdentity('http://shop.example.com'), 'http://shop.example.com')
+  assert.notEqual(normaliseStoreIdentity('https://a.example'), normaliseStoreIdentity('https://b.example'))
+  for (const bad of ['', 'ftp://x.example', 'not a url', 'javascript:alert(1)']) assert.equal(normaliseStoreIdentity(bad), null, bad)
+})
+
+test('STORE URL CHANGE: mappings stamped for another store, or not stamped at all, are not owned: findings only, no change of any kind, even where the ids overlap', () => {
+  for (const identity of [OTHER_STORE, null]) {
+    const input = consistent()
+    input.mappings = input.mappings.map((m) => ({ ...m, storeIdentity: identity }))
+    input.rates = input.rates.map((r) => (r.id === 'rDE' ? { ...r, active: false } : r)) // would be a DELETE if owned
+    input.woo = input.woo.map((w) => (w.id === '1' ? { ...w, rate: '15.0000' } : w)) // would be an UPDATE if owned
+    const p = plan(input)
+    assert.deepEqual(p.changes, [], String(identity))
+    assert.deepEqual(p.findings.map((f) => `${f.code}:${f.wooId}`), ['MAPPING_NOT_ADOPTED:1', 'MAPPING_NOT_ADOPTED:2', 'MAPPING_NOT_ADOPTED:3', 'MAPPING_NOT_ADOPTED:4'])
+    assert.equal(p.unownedLeftAlone, 4, 'none of them is owned')
+  }
+})
+
+test('STORE URL CHANGE: the digest is bound to the store, and an IMS rate whose mapping names a present rate of another store gets no CREATE', () => {
+  const input = consistent()
+  const a = plan(input).digest
+  const moved = consistent()
+  moved.mappings = moved.mappings.map((m) => ({ ...m, storeIdentity: OTHER_STORE }))
+  const p = plan(moved)
+  assert.equal(p.changes.some((c) => c.kind === 'CREATE'), false, 'no duplicate of a rate that may be the counterpart')
+  assert.notEqual(p.digest, a)
+  const ownedElsewhere = planWooTaxRates({ woo: input.woo, rates: input.rates, mappings: input.mappings, componentRates: [], recordedOwnedWooIds: new Set(), storeIdentity: OTHER_STORE })
+  assert.notEqual(ownedElsewhere.digest, plan(input).digest)
+})
+
+test('RATE IDENTITY: a store rate whose id was reused or replaced (any of name, country, percent, class differs from the snapshot) is RE_ADOPTION_REQUIRED: never updated, deleted or duplicated', () => {
+  const replacements: Array<[string, Partial<WooTaxRateDetail>]> = [
+    ['name', { name: 'Something else' }], ['country', { country: 'IE' }], ['percent', { rate: '99.0000' }], ['class', { class: 'reduced-rate' }],
+  ]
+  for (const [label, over] of replacements) {
+    const input = consistent()
+    input.woo = input.woo.map((w) => (w.id === '2' ? { ...w, ...over } : w)) // the snapshot (mapping) is NOT realigned
+    const p = plan(input)
+    assert.deepEqual(p.changes, [], label)
+    assert.deepEqual(p.findings, [{ code: 'RE_ADOPTION_REQUIRED', wooId: '2', imsRateId: 'rDE' }], label)
+    // Even when IMS wants it gone, a replaced rate is not deleted.
+    input.rates = input.rates.map((r) => (r.id === 'rDE' ? { ...r, active: false } : r))
+    assert.deepEqual(plan(input).changes, [], `${label}: out of scope`)
+  }
+  // A duplicate counterpart that no longer matches its snapshot is not deleted either, and the matching one is still the keeper.
+  const input = consistent()
+  const twin = woo('5', { name: 'Unrelated', rate: '3.0000' })
+  input.woo.push(twin)
+  input.mappings.push(mapOf({ ...twin, name: 'GB VAT', rate: '20.0000' }, 'rGB'))
+  const p = plan(input)
+  assert.deepEqual(p.changes, [])
+  assert.deepEqual(p.findings, [{ code: 'RE_ADOPTION_REQUIRED', wooId: '5', imsRateId: 'rGB' }])
+})
+
+test('RATE IDENTITY: the four identity fields are compared as R13 compares them (name case and spacing, country alias, exact percent, empty class is standard)', () => {
+  const snap = { name: 'GB VAT', country: 'GB', rate: '20.0000', class: 'standard' }
+  assert.equal(sameRateIdentity(snap, { name: '  gb   vat', country: 'uk', rate: '20', class: '' }), true)
+  for (const over of [{ name: 'GB V' }, { country: 'IE' }, { rate: '20.0001' }, { rate: 'x' }, { class: 'zero-rate' }]) assert.equal(sameRateIdentity(snap, { ...snap, ...over }), false, JSON.stringify(over))
+  const w = woo('9', { class: '' })
+  assert.deepEqual(identityOfWoo(w), { name: 'GB VAT', country: 'GB', rate: '20.0000', class: '' })
+  assert.deepEqual(identityOfMapping(mapOf(woo('9'), 'rGB', { externalCountry: null, externalClass: null })), { name: 'GB VAT', country: '', rate: '20.0000', class: '' })
+})
+
+test('RATE IDENTITY: state, compound and shipping are not identity: a store rate that differs only there is still the rate IMS owns and is corrected', () => {
+  const input = consistent()
+  input.woo = input.woo.map((w) => (w.id === '4' ? { ...w, state: '', compound: true, shipping: false } : w))
+  const p = plan(input)
+  assert.deepEqual(p.findings, [])
+  const change = only(p)
+  assert.deepEqual(change.kind === 'UPDATE' ? change.fields.map((f) => f.field) : null, ['state', 'compound', 'shipping'])
+})
+
+test('ADOPTION PLAN: unstamped, other-store and drifted rows are candidates with snapshot and live side by side; rows whose rate is absent and rows already right are not', () => {
+  const input = consistent()
+  input.mappings = input.mappings.map((m) => (m.externalTaxRateId === '1' ? { ...m, storeIdentity: null } : m.externalTaxRateId === '2' ? { ...m, storeIdentity: OTHER_STORE } : m))
+  input.woo = input.woo.map((w) => (w.id === '3' ? { ...w, rate: '1.0000' } : w))
+  input.woo = input.woo.filter((w) => w.id !== '4')
+  const a = planAdoption({ woo: input.woo, rates: input.rates, mappings: input.mappings, storeIdentity: STORE })
+  assert.deepEqual(a.rows.map((r) => `${r.wooId}:${r.reason}`), ['1:UNSTAMPED', '2:OTHER_STORE', '3:SNAPSHOT_DIFFERS'])
+  assert.equal(a.rows[2]!.snapshot.rate, '0.0000')
+  assert.equal(a.rows[2]!.live.rate, '1.0000')
+  assert.equal(a.rows[0]!.imsRateName, 'GB VAT')
+  assert.match(a.digest, /^[0-9a-f]{64}$/)
+  assert.equal(planAdoption({ woo: [...input.woo].reverse(), rates: input.rates, mappings: [...input.mappings].reverse(), storeIdentity: STORE }).digest, a.digest)
+  assert.notEqual(planAdoption({ woo: input.woo, rates: input.rates, mappings: input.mappings, storeIdentity: OTHER_STORE }).digest, a.digest)
+  assert.deepEqual(planAdoption({ ...consistent(), storeIdentity: STORE }).rows, [])
+  assert.equal(Object.keys(ADOPTION_REASONS).length, 3)
+})
+
+test('OWNERSHIP BY RECORD: a record made against another store (or with no store) owns nothing', () => {
+  const rows = [
+    { kind: 'CREATE', status: 'APPLIED', wooTaxRateId: '1', storeIdentity: OTHER_STORE },
+    { kind: 'CREATE', status: 'APPLIED', wooTaxRateId: '2', storeIdentity: null },
+    { kind: 'CREATE', status: 'APPLIED', wooTaxRateId: '3' },
+    { kind: 'CREATE', status: 'APPLIED', wooTaxRateId: '4', storeIdentity: STORE },
+  ]
+  assert.deepEqual([...ownedWooIdsFromRecords(rows, STORE)], ['4'])
+})
+
+test('STORE IDENTITY: the digest names the store: the same (here empty) plan against another store is another plan', () => {
+  const empty = (storeIdentity: string) => planWooTaxRates({ woo: [], rates: [], mappings: [], componentRates: [], recordedOwnedWooIds: new Set(), storeIdentity })
+  assert.equal(empty(STORE).digest, empty(STORE).digest)
+  assert.notEqual(empty(STORE).digest, empty(OTHER_STORE).digest)
 })
