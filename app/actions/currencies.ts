@@ -476,8 +476,9 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
   // HOW LONG THE LOCK IS HELD. The read is bounded by AELIA_CUTOVER_READ_BOUND_MS (20 s, a hard race around the 15 s transport timeout, so a stalled body read cannot hold it either); the ingest is local
   // database work on a handful of rows; the transaction itself is capped at AELIA_CUTOVER_TX_TIMEOUT_MS (45 s), after which it is rolled back and the lock released. So the exclusive lock is held at most about
   // 45 s, normally under 1 s for an answering store, and rate pushes, CSV imports and refreshes wait that long at worst (their own waits are 30 s / 60 s).
-  const switchedAt = new Date()
+  let switchedAt = new Date()
   let changed: boolean
+  let aeliaResult: Awaited<ReturnType<typeof import('@/lib/currencies/aelia-ingest').ingestAeliaRatesInTx>> | null = null
   try {
     changed = await withFxTableWriteLock(async (tx) => {
       if ((await getFxRateSourceInTx(tx)) === source) return false
@@ -487,6 +488,7 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
           import('@/lib/currencies/aelia-ingest'),
         ])
         const read = await readWithin(AELIA_CUTOVER_READ_BOUND_MS, () => readAeliaRatesFromWc())
+        switchedAt = new Date() // the cutover instant is taken AFTER the read (which may have taken seconds), so an Aelia update that landed meanwhile is not 'in the future'
         if (!read.ok) throw new FxCutoverRefusedError(`Aelia's rates could not be read, so the source was not changed (it is still ECB): ${read.message}`)
         let result: Awaited<ReturnType<typeof ingestAeliaRatesInTx>>
         try {
@@ -502,11 +504,29 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
           })
           throw new FxCutoverRefusedError(`Aelia did not give a usable rate for ${result.missing.join(', ')}, so the source was not changed (it is still ECB and nothing was stored): ${why.join(', ')}. Add the currency in the store's currency switcher, or switch the currency off in IMS, then try again.`)
         }
-        await tx.setting.upsert({ where: { key: 'fx_aelia_last_update_at' }, create: { key: 'fx_aelia_last_update_at', value: result.updatedAt.toISOString() }, update: { value: result.updatedAt.toISOString() } })
-        await tx.setting.upsert({ where: { key: 'fx_aelia_last_read_at' }, create: { key: 'fx_aelia_last_read_at', value: switchedAt.toISOString() }, update: { value: switchedAt.toISOString() } })
+        // A store clock AHEAD of IMS's: the rows would be dated after the cutover instant, and every lookup at that instant excludes them. Refused outright.
+        if (result.updatedAt.getTime() > switchedAt.getTime()) {
+          const ahead = Math.ceil((result.updatedAt.getTime() - switchedAt.getTime()) / 1000)
+          throw new FxCutoverRefusedError(`Aelia's last-update time (${result.updatedAt.toISOString()}) is later than now, so the store clock is ahead by ${ahead} s; the source was not changed (it is still ECB and nothing was stored). Correct the store's clock, or wait until Aelia's next update is in the past, then try again.`)
+        }
+        aeliaResult = result
       }
       await tx.setting.upsert({ where: { key: FX_RATE_SOURCE_SETTING }, create: { key: FX_RATE_SOURCE_SETTING, value: source }, update: { value: source } })
       await tx.setting.upsert({ where: { key: FX_RATE_SOURCE_SINCE_SETTING }, create: { key: FX_RATE_SOURCE_SINCE_SETTING, value: switchedAt.toISOString() }, update: { value: switchedAt.toISOString() } })
+      if (source === 'aelia' && aeliaResult) {
+        // THE AUTHORITY: with the new source and instant written in this transaction, run the ACTUAL lookup (the one every document and report uses, under the new regime) for every active foreign
+        // currency AT the cutover instant. Each must resolve to an Aelia row or a manual override, else the whole transaction rolls back. This is the real rule, not a model of it.
+        const [{ resolveFxRatesToBase }, { getBaseCurrencyCode }] = await Promise.all([import('@/lib/currencies/fx-lookup'), import('@/lib/base-currency')])
+        const baseCode = await getBaseCurrencyCode()
+        const activeForeign = (await tx.currency.findMany({ where: { active: true }, select: { code: true } })).map((c) => c.code).filter((code) => code !== baseCode)
+        const outcomes = await resolveFxRatesToBase(tx, { currencies: activeForeign, asOf: switchedAt, baseCurrency: baseCode })
+        const failures = [...outcomes].flatMap(([code, o]) => (o.ok ? [] : [`${code} (${o.error.reason})`]))
+        if (failures.length) {
+          throw new FxCutoverRefusedError(`After the switch these currencies would not resolve to an Aelia rate or a manual override: ${failures.join(', ')}; the source was not changed (it is still ECB and nothing was stored).`)
+        }
+        await tx.setting.upsert({ where: { key: 'fx_aelia_last_update_at' }, create: { key: 'fx_aelia_last_update_at', value: aeliaResult.updatedAt.toISOString() }, update: { value: aeliaResult.updatedAt.toISOString() } })
+        await tx.setting.upsert({ where: { key: 'fx_aelia_last_read_at' }, create: { key: 'fx_aelia_last_read_at', value: switchedAt.toISOString() }, update: { value: switchedAt.toISOString() } })
+      }
       return true
     }, { timeout: AELIA_CUTOVER_TX_TIMEOUT_MS })
   } catch (e) {

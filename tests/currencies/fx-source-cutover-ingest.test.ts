@@ -121,6 +121,73 @@ test('an INCOMPLETE read (one active currency missing) is refused, names it, and
   assert.deepEqual(await setFxRateSource('aelia'), { success: true })
 })
 
+// ------------------------------------------------------------------ "complete" = resolvable NOW under the real lookup rule
+
+const resolveNow = async (asOf: Date) => {
+  const { resolveFxRatesToBase } = await import('@/lib/currencies/fx-lookup')
+  return resolveFxRatesToBase(fake.db as never, { currencies: ['EUR', 'USD', 'NOK'], asOf, baseCurrency: 'GBP' })
+}
+
+test('STORE CLOCK AHEAD: Aelia last_update 2 minutes in the future is refused and rolled back; the message says by how much', async () => {
+  reset()
+  const ahead = new Date(Date.now() + 120_000).toISOString()
+  readImpl = async () => ({ ok: true, body: aeliaAnswer({ last_update: ahead }) })
+  const { setFxRateSource } = await import('@/app/actions/currencies')
+  const result = await setFxRateSource('aelia')
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /store clock is ahead by (11[89]|12\d) s/)
+  assert.match(result.error ?? '', /still ECB/)
+  assert.equal(fake.settings.has('fx_rate_source'), false)
+  assert.equal(fake.settings.has('fx_rate_source_since'), false)
+  assert.equal(aeliaRows().length, 0, 'the rows were ingested inside the transaction and rolled back with it')
+  assert.ok(fake.events.includes('fxRate.create(in lock tx)'), 'PRECONDITION: the ingest accepted the future time (it tolerates 5 minutes) and wrote before the refusal')
+  assert.ok(fake.events.includes('tx.rollback'))
+})
+
+test('Aelia last_update EQUAL TO the cutover instant switches, and every lookup at that instant resolves to the Aelia row (the real lookup)', async () => {
+  reset()
+  const at = new Date('2026-10-29T12:00:00.000Z')
+  mock.timers.enable({ apis: ['Date'], now: at })
+  try {
+    readImpl = async () => ({ ok: true, body: aeliaAnswer({ last_update: at.toISOString() }) })
+    const { setFxRateSource } = await import('@/app/actions/currencies')
+    assert.deepEqual(await setFxRateSource('aelia'), { success: true })
+    assert.equal(fake.settings.get('fx_rate_source_since'), at.toISOString())
+    const outcomes = await resolveNow(at)
+    for (const code of ['EUR', 'USD', 'NOK']) {
+      const o = outcomes.get(code)
+      assert.ok(o?.ok && o.source === 'aelia', code)
+    }
+  } finally {
+    mock.timers.reset()
+  }
+})
+
+test('Aelia last_update BEFORE the cutover instant switches and the lookups resolve now', async () => {
+  reset()
+  const { setFxRateSource } = await import('@/app/actions/currencies')
+  assert.deepEqual(await setFxRateSource('aelia'), { success: true })
+  const outcomes = await resolveNow(new Date())
+  assert.deepEqual([...outcomes.values()].map((o) => o.ok), [true, true, true])
+})
+
+test('THE REAL LOOKUP IS THE AUTHORITY: a pinned currency resolves through its override; a pin the lookup refuses (rate 0) refuses the switch even though the ingest called it covered', async () => {
+  const { setFxRateSource } = await import('@/app/actions/currencies')
+  reset([...ECB_ROWS(), ecbRow('USD', '1.40', '2026-10-26T00:00:00Z', { manualOverride: true })])
+  assert.deepEqual(await setFxRateSource('aelia'), { success: true })
+  const ok = (await resolveNow(new Date())).get('USD')
+  assert.ok(ok?.ok && ok.manualOverride && ok.rate.toString() === '1.4', 'USD resolves through its pin')
+
+  reset([...ECB_ROWS(), ecbRow('USD', '0', '2026-10-26T00:00:00Z', { manualOverride: true })])
+  const refused = await setFxRateSource('aelia')
+  assert.equal(refused.success, false)
+  assert.match(refused.error ?? '', /would not resolve/)
+  assert.match(refused.error ?? '', /USD/)
+  assert.equal(fake.settings.has('fx_rate_source'), false)
+  assert.equal(aeliaRows().length, 0, 'EUR and NOK were stored inside the transaction and rolled back')
+  assert.ok(fake.events.includes('tx.rollback'))
+})
+
 test('a wholly refused answer (Aelia base differs from IMS) refuses the switch', async () => {
   reset()
   readImpl = async () => ({ ok: true, body: aeliaAnswer({ base: 'EUR' }) })
@@ -190,6 +257,10 @@ test('wiring: the read sits inside the exclusive lock, is bounded, and the trans
   assert.match(sw, /readWithin\(AELIA_CUTOVER_READ_BOUND_MS/)
   assert.match(sw, /timeout: AELIA_CUTOVER_TX_TIMEOUT_MS/)
   assert.match(sw, /if \(result\.missing\.length\)/)
+  assert.ok(sw.indexOf('FX_RATE_SOURCE_SINCE_SETTING }') < sw.indexOf('resolveFxRatesToBase(tx'), 'the lookup runs after the source and instant are written in the transaction')
+  assert.ok(sw.indexOf('resolveFxRatesToBase(tx') < sw.indexOf("'fx_aelia_last_update_at'"), 'and before anything is finished')
+  assert.match(sw, /result\.updatedAt\.getTime\(\) > switchedAt\.getTime\(\)/)
+  assert.match(sw, /resolveFxRatesToBase\(tx, \{ currencies: activeForeign, asOf: switchedAt, baseCurrency: baseCode \}\)/, 'the lookup is asked AT the cutover instant, where the regime starts (an earlier instant would not apply it)')
   assert.equal((sw.match(/\bdb\./g) ?? []).length, 0, 'nothing of the cutover touches the database outside the lock transaction')
   assert.match(readFileSync('lib/currencies/aelia-cutover.ts', 'utf8'), /AELIA_CUTOVER_TX_TIMEOUT_MS = 45_000/)
   const card = readFileSync('components/settings/fx-rates-table.tsx', 'utf8')
