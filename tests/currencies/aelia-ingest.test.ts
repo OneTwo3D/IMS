@@ -333,10 +333,10 @@ test('REGRESSION: an update time earlier than the newest stored Aelia row of a c
 
 test('SOURCE RE-CHECK: the regular ingest writes nothing once the source is no longer Aelia (switched back, or never switched); the cutover entry point is not gated', async () => {
   const { ingestAeliaRates, ingestAeliaRatesInTx } = await load()
-  for (const settings of [{ fx_rate_source: 'ecb' }, {}]) {
-    reset({ settings })
-    // `reset` gives defaults first; override explicitly
-    if ('fx_rate_source' in settings) fake.settings.set('fx_rate_source', 'ecb')
+  for (const source of ['ecb', null]) {
+    reset()
+    // `reset` gives the Aelia default; override explicitly
+    if (source) fake.settings.set('fx_rate_source', source)
     else fake.settings.delete('fx_rate_source')
     await assert.rejects(ingestAeliaRates(aeliaAnswer(), { now: NOW }), (e: Error & { reason?: string }) => e.reason === 'source_changed')
     assert.equal(fake.rates.length, 0, 'nothing written')

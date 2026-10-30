@@ -36,7 +36,7 @@ async function installLookup() {
       resolveFxRatesToBase: async (...args: Parameters<typeof realLookup.resolveFxRatesToBase>) => {
         const real = await realLookup.resolveFxRatesToBase(...args)
         if (!tamper) return real
-        return new Map([...real].map(([code, o]) => [code, o.ok ? (tamper!(code, o) as typeof o) : o]))
+        return new Map([...real].map(([code, o]): [string, typeof o] => [code, o.ok ? (tamper!(code, o) as typeof o) : o]))
       },
     },
   })
@@ -76,10 +76,12 @@ test('a cutover whose resolved rate or time differs from THIS read is refused an
 
 test('cutoverReadMismatches: equal rate (any trailing zeros) and time agree; a currency not in the read, a different rate or a different time is reported; pinned and failed outcomes are skipped', () => {
   const at = new Date('2026-10-23T23:36:05Z')
-  const ok = (rate: string, fetchedAt = at) => ({ ok: true as const, rate: new Prisma.Decimal(rate), fetchedAt })
+  type Outcome = { ok: true; rate: Prisma.Decimal; fetchedAt: Date } | { ok: false }
+  const ok = (rate: string, fetchedAt = at): Outcome => ({ ok: true, rate: new Prisma.Decimal(rate), fetchedAt })
+  const failed: Outcome = { ok: false }
   const read = { updatedAt: at, readRates: { EUR: '1.1900', NOK: '12.5' }, pinned: ['USD'] }
-  assert.deepEqual(cutoverReadMismatches(new Map([['EUR', ok('1.19')], ['NOK', ok('12.5')], ['USD', ok('9')], ['SEK', { ok: false as const }]]), read), [])
-  const bad = cutoverReadMismatches(new Map([['EUR', ok('1.2')], ['NOK', ok('12.5', new Date('2026-10-23T23:36:06Z'))], ['CHF', ok('1')]]), read)
+  assert.deepEqual(cutoverReadMismatches(new Map<string, Outcome>([['EUR', ok('1.19')], ['NOK', ok('12.5')], ['USD', ok('9')], ['SEK', failed]]), read), [])
+  const bad = cutoverReadMismatches(new Map<string, Outcome>([['EUR', ok('1.2')], ['NOK', ok('12.5', new Date('2026-10-23T23:36:06Z'))], ['CHF', ok('1')]]), read)
   assert.equal(bad.length, 3)
   assert.match(bad[0], /^EUR/)
   assert.match(bad[1], /^NOK/)
