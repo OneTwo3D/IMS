@@ -8,6 +8,10 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### WooCommerce tax-rate writer (IMS to WooCommerce), held at P1
+
+- **New: `npm run woo:tax-plan`.** Plans the WooCommerce tax-rate changes (create, update, delete) that make the store's rates the same set as the IMS sales rates, as the reconciliation pack's VAT set-identity check (R13) defines it, and prints a plan digest. `-- --apply --confirm <digest>` applies exactly that plan, behind the WooCommerce producer hold: while held it records outbound shadows and sends nothing; it is refused if the hold is not enforced. Only rates mapped in the tax-rate mapping and stamped with the current store's address, or created and recorded by the writer against it, are ever touched, and only while they still match what IMS last recorded for them; `-- --adopt` stamps legacy mapping rows after an operator-confirmed digest. Every other writer of the mapping table (tax-rate import, mapper re-map, tax re-key, rate copy script) clears that stamp in the same write when it changes the row's IMS rate or identity snapshot. Shipping is always on for a positive rate. New table `woo_tax_rate_writes` records live changes; new nullable `store_identity` columns on it and on `shopping_tax_rate_mappings`. Nothing sends while the hold stands, and nothing is turned on by this change.
+
 ### Aelia as the exchange-rate master (behind a flag, default OFF)
 
 - **New: FX source setting `fx_rate_source` (Settings > Accounting > FX Rates > Exchange-rate source).** `ECB (frankfurter)` is the default and changes nothing. `Aelia` makes the scheduled refresh read the store's currency switcher through the helper plugin, stores Aelia's rate BEFORE markup (never rate + markup) as `source = aelia` dated by Aelia's own update time, checks Aelia's freshness in health, and disables the IMS to WooCommerce rate push. A missing, non-positive, non-finite or over-precise rate, a base-currency mismatch and an unknown currency are refused; nothing is substituted. Manual overrides keep working. Every write takes the FX table lock.

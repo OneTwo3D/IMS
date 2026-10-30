@@ -137,6 +137,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   wms_sync_jobs: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
   wms_sync_logs: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
   wms_webhook_events: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
+  woo_tax_rate_writes: { kind: 'MUST_BE_EMPTY', reason: 'record of the WooCommerce tax-rate writer\'s changes: written only by a live apply' },
   xero_tax_rate_lists: { kind: 'CONFIG_ALLOWED', reason: 'header (read time, row count, digest) of the stored copy of Xero\'s tax-rate list: a read-only copy of the accounting system, refreshed by the tax-rate cron, not business data' },
   xero_tax_rates: { kind: 'CONFIG_ALLOWED', reason: 'the stored copy of Xero\'s tax-rate list (Xero is the master), refreshed by the tax-rate cron, not business data' },
 }

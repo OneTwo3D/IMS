@@ -52,7 +52,6 @@ export const NO_PRODUCER: Readonly<Record<string, string>> = {
   'woocommerce.order.withdrawal-outcome': 'Owner answer 6: the endpoint stays in the WooCommerce withdrawal plugin; IMS only RECEIVES the outcome through an authenticated API, so IMS has no outbound producer for it.',
   'woocommerce.order.trackship-reconcile': 'Owner answer 6: the endpoint stays in the TrackShip plugin; IMS only receives TrackShip events through an authenticated API, so IMS has no outbound producer for it.',
   'woocommerce.order.invoice-document': 'Owner answer 4: IMS will put the invoice into the customer\'s My Account at P2, but that producer is not written yet; there is no call site in this repo.',
-  'woocommerce.tax-rate': 'Owner ruling 2026-10-25: at P1 the owner corrects WooCommerce tax rates by hand from the read-only VAT difference report; IMS writes them from P2, but that producer is a later build and has no call site in this repo.',
 }
 
 export const DECLARATIONS: readonly Declaration[] = [
@@ -348,6 +347,12 @@ export const DECLARATIONS: readonly Declaration[] = [
     'PUTs tracking metadata onto the WooCommerce order.'),
   d('lib/connectors/woocommerce/sync/wms-status.ts::pushWmsOrderStatusToWc::wcPut#1', 'woocommerce', 'order.wms-status-meta', 'direct-write', 'not-applicable',
     'PUTs the _oti_wms_* meta onto the WooCommerce order.'),
+  d('lib/connectors/woocommerce/tax-rate-port.ts::createWooTaxRateWritePort::wcPost#1', 'woocommerce', 'tax-rate', 'direct-write', 'not-applicable',
+    'Creates a tax rate in WooCommerce (POST /taxes). Reached only from applyWooTaxPlan, which asks wooProducerSeam for each change first; wcPost\'s own last barrier stands behind it.'),
+  d('lib/connectors/woocommerce/tax-rate-port.ts::createWooTaxRateWritePort::wcPut#1', 'woocommerce', 'tax-rate', 'direct-write', 'not-applicable',
+    'Updates the changed fields of a tax rate in WooCommerce (PUT /taxes/{id}). Reached only from applyWooTaxPlan, behind its seam.'),
+  d('lib/connectors/woocommerce/tax-rate-port.ts::createWooTaxRateWritePort::wcPost#2', 'woocommerce', 'tax-rate', 'direct-write', 'not-applicable',
+    'Deletes a tax rate in WooCommerce (POST /taxes/batch with a delete list). Reached only from applyWooTaxPlan, behind its seam.'),
   d('lib/connectors/woocommerce/webhooks.ts::handleProductWebhook::enqueueAndProcessImmediateWcStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Corrects WooCommerce stock after an inbound product webhook disagrees with IMS.'),
   d('lib/connectors/xero/bills.ts::pushPurchaseBill::xeroPut#1', 'xero', 'purchase.bill', 'drain', 'required',

@@ -236,7 +236,7 @@ export const WRITER_OWNERSHIP_MAP = [
   }),
   row('woocommerce', 'tax-rate', { P1: 'operator-manual', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
-    note: 'Owner ruling 2026-10-25: WooCommerce, IMS and Xero use the SAME set of VAT rates and Xero is the master. P1: the owner corrects WooCommerce tax rates by hand, guided by the read-only VAT difference report (`npm run vat:diff`); IMS writes nothing. P2: IMS writes them. This row only declares ownership: no producer exists yet.',
+    note: 'Owner ruling 2026-10-25: WooCommerce, IMS and Xero use the SAME set of VAT rates and Xero is the master. P1: the owner maintains WooCommerce tax rates by hand, guided by the read-only VAT difference report (`npm run vat:diff`); the IMS writer (`npm run woo:tax-plan`, lib/connectors/woocommerce/tax-rate-writer.ts) is built but held: it records shadows and sends nothing. P2: IMS owns them and the writer sends. It only ever touches rates mapped in ShoppingTaxRateMapping or recorded as created by it; rates IMS does not own are never touched.',
   }),
   // ---- Customer e-mail: mapped only (decision D7); enforcement stays the existing settings ---------------------
   row('customer-email', 'despatch', { P1: 'woocommerce-native', P2: 'IMS' }, {

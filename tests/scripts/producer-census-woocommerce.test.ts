@@ -208,3 +208,57 @@ test('WOO-5 reads the registry as SYNTAX: the real registry yields every entry w
   const unreadable = wooCensusFindings(input({ readSource: () => undefined }))
   assert.ok(red(unreadable, 'WOO-5', 'could not be read').length >= 1)
 })
+
+// ───────────────────────────── the tax-rate writer (woocommerce `tax-rate`) ─────────────────────────────
+
+test('TAX-RATE WRITER: the census governs woocommerce.tax-rate through applyWooTaxPlan, and the operation is no longer an unproduced one', () => {
+  const report = wooCensusFindings(input())
+  assert.deepEqual(report.failures, [])
+  const entry = WOO_SEAM_FUNCTIONS.find((f) => f.decl === 'applyWooTaxPlan')
+  assert.ok(entry, 'applyWooTaxPlan is a designated seam function')
+  assert.deepEqual(entry.operations, ['tax-rate'])
+  assert.equal(NO_PRODUCER['woocommerce.tax-rate'], undefined, 'the operation has a producer now')
+  const keys = DECLARATIONS.filter((d) => d.destination === 'woocommerce' && d.operation === 'tax-rate').map((d) => d.key)
+  assert.deepEqual(keys, [
+    'lib/connectors/woocommerce/tax-rate-port.ts::createWooTaxRateWritePort::wcPost#1',
+    'lib/connectors/woocommerce/tax-rate-port.ts::createWooTaxRateWritePort::wcPut#1',
+    'lib/connectors/woocommerce/tax-rate-port.ts::createWooTaxRateWritePort::wcPost#2',
+  ])
+  for (const key of keys) assert.ok(siteKeys.has(key), `the census sees ${key}`)
+  const row = (WRITER_OWNERSHIP_MAP as readonly OwnershipRow[]).find((r) => r.destination === 'woocommerce' && r.operation === 'tax-rate')!
+  assert.deepEqual([row.owners.P1, row.owners.P2], ['operator-manual', 'IMS'])
+})
+
+test('MUTATION WOO-1 (the tax-rate writer stops asking the seam): red, naming applyWooTaxPlan', () => {
+  const report = wooCensusFindings(input({}, { 'lib/connectors/woocommerce/tax-rate-writer.ts': (text) => text.replace('await wooProducerSeam(', 'await Promise.resolve(') }))
+  assert.equal(red(report, 'WOO-1', 'tax-rate-writer.ts::applyWooTaxPlan').length, 1, JSON.stringify(report.failures))
+})
+
+test('MUTATION WOO-1 (the tax-rate writer sends BEFORE it asks): red', () => {
+  const report = wooCensusFindings(input({}, {
+    'lib/connectors/woocommerce/tax-rate-writer.ts': (text) => {
+      const marker = '      lock.assertHeld(`sending ${change.key}`)\n'
+      assert.ok(text.includes(marker), 'precondition: the loop head was found')
+      return text.replace(marker, marker + '      await send(deps.port, change)\n')
+    },
+  }))
+  assert.equal(red(report, 'WOO-1', 'tax-rate-writer.ts::applyWooTaxPlan').length, 1, JSON.stringify(report.failures))
+  assert.match(red(report, 'WOO-1', 'tax-rate-writer.ts::applyWooTaxPlan')[0]!, /AFTER its first effect/)
+})
+
+test('MUTATION WOO-4 (the tax-rate writer is no longer a designated seam function): the operation is ungoverned and red; its direct-write declarations alone do not govern it', () => {
+  const withoutSeam = WOO_SEAM_FUNCTIONS.filter((f) => f.decl !== 'applyWooTaxPlan')
+  const red4 = red(wooCensusFindings(input({ seamFunctions: withoutSeam })), 'WOO-4', 'woocommerce.tax-rate')
+  assert.equal(red4.length, 1, JSON.stringify(red4))
+  const withoutDeclarations = DECLARATIONS.filter((d) => !(d.destination === 'woocommerce' && d.operation === 'tax-rate'))
+  assert.deepEqual(red(wooCensusFindings(input({ declarations: withoutDeclarations })), 'WOO-4', 'woocommerce.tax-rate'), [], 'the designated function governs it')
+})
+
+test('MUTATION WOO-3 (the tax-rate port grows a raw POST of its own): red; the port as written has no raw transport', () => {
+  const text = realText('lib/connectors/woocommerce/tax-rate-port.ts')
+  assert.deepEqual(scanWooTransportSource(text, 'lib/connectors/woocommerce/tax-rate-port.ts'), [], 'the real port reaches the store only through wcPost and wcPut')
+  const sneaky = text + "\nimport { connectorFetch } from '@/lib/security/connector-fetch'\nexport async function rawDelete(base: string) {\n  return connectorFetch(`${base}/wp-json/wc/v3/taxes/1`, { method: 'DELETE' }, { connectorName: 'WooCommerce' })\n}\n"
+  const sites = scanWooTransportSource(sneaky, 'lib/connectors/woocommerce/tax-rate-port.ts')
+  const report = wooCensusFindings(input({ transport: [...transport.sites, ...sites] }))
+  assert.equal(red(report, 'WOO-3', 'tax-rate-port.ts').length, 1, JSON.stringify(report.failures))
+})

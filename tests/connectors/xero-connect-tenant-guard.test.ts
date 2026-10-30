@@ -310,6 +310,9 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
     // binding deletes, which no lock takes part in.
     $executeRaw: async () => 0,
     $queryRaw: async () => [],
+    // The full reset deletes the storefront mappings and the tax-rate writer's records in a transaction of their own (under the shared apply lock).
+    shoppingTaxRateMapping: inertModel,
+    wooTaxRateWrite: inertModel,
     setting: {
       findUnique: async ({ where }: { where: { key: string } }): Promise<SettingRow | null> => {
         if (settingReadGate) await settingReadGate(where.key)

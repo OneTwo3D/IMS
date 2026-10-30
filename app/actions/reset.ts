@@ -2,6 +2,7 @@
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
+import { lockStorefrontMappingWrites } from '@/lib/tax/storefront-mapping-write'
 import { logActivity } from '@/lib/activity-log'
 import { lockPackScheduleSettings } from '@/lib/reconciliation-pack/schedule-lock'
 import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selection-lock'
@@ -252,7 +253,13 @@ async function clearFullScope() {
 
   // Connector / integration configuration and mappings
   await db.shoppingStatusMapping.deleteMany({})
-  await db.shoppingTaxRateMapping.deleteMany({})
+  // The mappings and the tax-rate writer's change records go together, under the shared apply lock: a reset that deleted the mappings under a running WooCommerce tax-rate apply would take away
+  // the ownership its next send rests on (the apply re-reads it before each send, but only a coordinated delete leaves no gap between that read and the send).
+  await db.$transaction(async (tx) => {
+    await lockStorefrontMappingWrites(tx)
+    await tx.shoppingTaxRateMapping.deleteMany({})
+    await tx.wooTaxRateWrite.deleteMany({})
+  })
   await db.externalWmsBinding.deleteMany({})
   await db.wmsConnection.deleteMany({})
   await db.accountingAccount.deleteMany({})

@@ -3565,6 +3565,9 @@ model ShoppingTaxRateMapping {
   externalCountry String?
   externalRatePct   Decimal  @db.Decimal(7, 4)
   externalClass     String?
+  /// The normalised URL of the store the row was made against (lib/connectors/woocommerce/tax-rate-plan.ts normaliseStoreIdentity). NULL on every row from before the identity rule:
+  /// such a row does not count as ownership for the tax-rate writer until the operator's adoption step stamps it.
+  storeIdentity     String?  @map("store_identity")
   taxRateId         String
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
@@ -3574,6 +3577,34 @@ model ShoppingTaxRateMapping {
   @@unique([connector, externalTaxRateId])
   @@index([connector, externalName])
   @@map("shopping_tax_rate_mappings")
+}
+
+/// One WooCommerce tax-rate change the IMS writer made, or tried and failed (lib/connectors/woocommerce/tax-rate-writer.ts). It is the writer's own record: a store rate the writer
+/// created or changed and has not deleted is OWNED by it (with the rates that are mapped in ShoppingTaxRateMapping). Written only by a LIVE apply (a held one records outbound shadows
+/// instead), in the same transaction as the mapping row it creates or updates. No foreign keys: a record outlives a deleted rate.
+model WooTaxRateWrite {
+  id           String   @id @default(cuid())
+  /// The plan digest the operator confirmed.
+  planDigest   String   @map("plan_digest") @db.Char(64)
+  /// CREATE | UPDATE | DELETE | ADOPT (lib/connectors/woocommerce/tax-rate-plan.ts).
+  kind         String
+  /// The plan's key for the change, for example `update:12`.
+  changeKey    String   @map("change_key")
+  /// The store's rate id the change is about; for a CREATE, the id the store gave it.
+  wooTaxRateId String?  @map("woo_tax_rate_id")
+  imsTaxRateId String   @map("ims_tax_rate_id")
+  /// APPLIED | FAILED. A FAILED row records that the store refused the change (nothing was changed there).
+  status       String
+  /// The planned change with its before and after values.
+  change       Json
+  error        String?
+/// The normalised URL of the store the change was made against; ownership by record counts only against the store configured now.
+  storeIdentity String? @map("store_identity")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([wooTaxRateId], map: "woo_tax_rate_writes_woo_idx")
+  @@index([planDigest], map: "woo_tax_rate_writes_digest_idx")
+  @@map("woo_tax_rate_writes")
 }
 
 /// Maps WC order statuses to IMS SalesOrderStatus values

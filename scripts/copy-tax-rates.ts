@@ -23,6 +23,7 @@
  */
 import { Client } from 'pg'
 import { randomUUID } from 'node:crypto'
+import { WOO_TAX_RATE_WRITE_LOCK_KEY } from '../lib/db/advisory-locks.ts'
 import { XERO_BUILT_IN_TAX_TYPES } from '../lib/tax/xero-built-in-tax-types.ts'
 
 const DRY_RUN = process.argv.includes('--dry-run')
@@ -199,6 +200,10 @@ async function main() {
         continue
       }
       if (!DRY_RUN) {
+        // In a transaction under the SHARED apply lock (lib/tax/storefront-mapping-write.ts lockStorefrontMappingWrites): a WooCommerce tax-rate apply running on the target waits for this write.
+        await dst.query('begin')
+        await dst.query('select pg_advisory_xact_lock_shared($1::bigint)', [WOO_TAX_RATE_WRITE_LOCK_KEY])
+        try {
         await dst.query(
           `insert into shopping_tax_rate_mappings
              (id, connector, "externalTaxRateId", "externalName", "externalCountry",
@@ -210,10 +215,22 @@ async function main() {
                            "externalCountry" = excluded."externalCountry",
                            "externalRatePct" = excluded."externalRatePct",
                            "externalClass"   = excluded."externalClass",
+                           -- the ownership stamp survives only a copy that changes nothing of what it was stamped for (lib/tax/storefront-mapping-write.ts)
+                           store_identity    = case when shopping_tax_rate_mappings."taxRateId" = excluded."taxRateId"
+                                                     and shopping_tax_rate_mappings."externalName" = excluded."externalName"
+                                                     and shopping_tax_rate_mappings."externalCountry" is not distinct from excluded."externalCountry"
+                                                     and shopping_tax_rate_mappings."externalRatePct" = excluded."externalRatePct"
+                                                     and shopping_tax_rate_mappings."externalClass" is not distinct from excluded."externalClass"
+                                                then shopping_tax_rate_mappings.store_identity else null end,
                            "updatedAt"       = now()`,
           [randomUUID(), m.connector, m.externalTaxRateId, m.externalName, m.externalCountry,
            m.externalRatePct, m.externalClass, taxRateId],
         )
+        await dst.query('commit')
+        } catch (error) {
+          await dst.query('rollback').catch(() => undefined)
+          throw error
+        }
       }
       mapped++
     }
