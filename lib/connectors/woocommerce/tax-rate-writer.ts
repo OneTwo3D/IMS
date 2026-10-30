@@ -36,7 +36,7 @@ import type { ProducerDecisionContext } from '@/lib/security/producer-dispositio
 import { producerSeamVerdict } from '@/lib/security/producer-seam'
 import type { TaxComponentRateRow, TaxRateRow } from '@/lib/reconciliation-pack/ims-readers'
 import type { WooTaxRateDetail } from '@/lib/reconciliation-pack/woo-source'
-import { planAdoption, planWooTaxRates, ownedWooIdsFromRecords, revalidateWooTaxChange, REVALIDATION_FAILURES, type AdoptionPlan, type FieldChange, type WooTaxChange, type WooTaxMappingRow, type WooTaxPlan, type WooTaxRateFields } from './tax-rate-plan'
+import { planAdoption, planWooTaxRates, ownedWooIdsFromRecords, identityOfMapping, identityOfWoo, revalidateWooTaxChange, REVALIDATION_FAILURES, sameRateIdentity, type AdoptionPlan, type FieldChange, type WooTaxChange, type WooTaxMappingRow, type WooTaxPlan, type WooTaxRateFields } from './tax-rate-plan'
 import { wooProducerSeam } from './producer-seam'
 
 const DIGEST_RE = /^[0-9a-f]{64}$/
@@ -246,7 +246,18 @@ async function recheckBeforeSend(deps: WooTaxWriterDeps, change: WooTaxChange, s
     live = read.rate
   }
   const failure = revalidateWooTaxChange({ change, storeIdentity, rate: ims.rates.find((r) => r.id === change.imsRateId), componentRates: ims.componentRates, mappings: ims.mappings, live })
-  return failure === null ? null : `${failure}: ${REVALIDATION_FAILURES[failure]}`
+  if (failure !== null) return `${failure}: ${REVALIDATION_FAILURES[failure]}`
+  // A duplicate DELETE is only safe while another counterpart of the IMS rate is still in the store: a mapping that is still stamped says nothing about a store rate removed since the plan. So the other
+  // counterparts are read again (GET only), and one of them must exist and still be the rate its mapping snapshot describes; otherwise the delete would remove the last live counterpart.
+  if (change.kind === 'DELETE' && change.reason === 'DUPLICATE_COUNTERPART') {
+    const keepers = ims.mappings.filter((m) => m.taxRateId === change.imsRateId && m.externalTaxRateId !== change.wooId && m.storeIdentity === storeIdentity)
+    for (const mapping of keepers) {
+      const read = await deps.readWooRate!(mapping.externalTaxRateId).catch(() => ({ ok: false as const }))
+      if (read.ok && sameRateIdentity(identityOfMapping(mapping), identityOfWoo(read.rate))) return null
+    }
+    return 'KEEPER_GONE: no other counterpart of the IMS rate is still in the store as its mapping describes it, so this delete would remove the last one'
+  }
+  return null
 }
 
 async function recordApplied(digest: string, change: WooTaxChange, newId: string | null, storeIdentity: string): Promise<void> {

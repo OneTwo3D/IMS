@@ -263,3 +263,42 @@ test('the IMS rows cannot be read again just before a send: nothing is sent; a c
     assert.deepEqual(ops(w), [])
   })
 })
+
+/**
+ * A duplicate DELETE needs a live keeper: the GB rate gets a second, identical store rate (w6); the plan keeps w1 and deletes w6. A mapping that is still stamped says nothing about a store rate
+ * that was removed or replaced since the plan.
+ */
+async function withDuplicate(w: World, body: (w6: string) => Promise<void>) {
+  const w6 = String(Number(w.woo.w5) + 60)
+  w.store.rates.set(w6, { ...w.store.rates.get(w.woo.w1)!, id: w6 })
+  await w.m.db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: w6, taxRateId: w.ids.gb, externalName: 'GB VAT', externalCountry: 'GB', externalRatePct: '20.0000', externalClass: '', storeIdentity: STORE } })
+  await body(w6)
+}
+
+async function applyDuplicate(w: World, w6: string, afterPlan: () => void) {
+  const plan = (await w.m.writer.readWooTaxPlan(w.deps(LIVE))).plan!
+  assert.ok(plan.changes.some((c) => c.key === `delete:${w6}`), 'PRECONDITION: the duplicate is planned for deletion')
+  const done = await w.m.writer.applyWooTaxPlan(depsWith(w, async () => afterPlan()), { confirm: plan.digest })
+  assert.equal(done.outcome, 'DONE')
+  return done.outcome === 'DONE' ? done : (() => { throw new Error('unreachable') })()
+}
+
+test('a duplicate DELETE: the keeper removed from the store after the plan means no delete and the run stops (KEEPER_GONE); changed means the same; intact means the delete goes', SKIP, async (t) => {
+  await buildWorld(t, modules, (w) => withDuplicate(w, async (w6) => {
+    const done = await applyDuplicate(w, w6, () => { w.store.rates.delete(w.woo.w1) })
+    assert.ok(!w.store.calls.some((c) => c.op === 'remove' && c.id === w6), 'the duplicate was not deleted')
+    assert.equal(done.stopped?.key, `delete:${w6}`)
+    assert.match(done.stopped?.reason ?? '', /^KEEPER_GONE/)
+  }))
+  await buildWorld(t, modules, (w) => withDuplicate(w, async (w6) => {
+    const done = await applyDuplicate(w, w6, () => { w.store.rates.set(w.woo.w1, { ...w.store.rates.get(w.woo.w1)!, rate: '17.0000' }) })
+    assert.ok(!w.store.calls.some((c) => c.op === 'remove' && c.id === w6), 'the duplicate was not deleted')
+    assert.match(done.stopped?.reason ?? '', /^KEEPER_GONE/)
+  }))
+  await buildWorld(t, modules, (w) => withDuplicate(w, async (w6) => {
+    const done = await applyDuplicate(w, w6, () => undefined)
+    assert.ok(w.store.calls.some((c) => c.op === 'remove' && c.id === w6), 'the duplicate was deleted')
+    assert.equal(done.stopped ?? null, null)
+    assert.ok(w.store.rates.has(w.woo.w1), 'the keeper is still there')
+  }))
+})
