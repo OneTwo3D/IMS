@@ -25,10 +25,13 @@ const LIVE = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce', WC_WRITEBACK_
 
 async function modules() {
   loadEnv()
-  const [{ db }, writer, helper] = await Promise.all([import('@/lib/db'), import('@/lib/connectors/woocommerce/tax-rate-writer'), import('@/lib/tax/storefront-mapping-write')])
-  return { db, writer, helper }
+  const [{ db }, writer] = await Promise.all([import('@/lib/db'), import('@/lib/connectors/woocommerce/tax-rate-writer')])
+  return { db, writer }
 }
 type Mods = Awaited<ReturnType<typeof modules>>
+const helperModule = () => import('@/lib/tax/storefront-mapping-write')
+/** The ops sent to the store so far (read through a function so that an earlier assertion on the list does not narrow its type). */
+const ops = (w: World): string[] => w.store.calls.map((c) => c.op)
 const KEY = 918_274_501
 
 async function lockWaiters(db: Mods['db']): Promise<number> {
@@ -95,7 +98,7 @@ test('the live store rate changed after the plan (the re-GET sees it): that chan
     // The DELETE (first) goes through; the store rate of the first UPDATE is changed by the owner while the re-GET of it is in flight.
     w.store.onRateRead = (id) => { if (id === w.woo.w2) w.store.rates.set(id, { ...w.store.rates.get(id)!, rate: '17.0000' }) }
     const done = await applyWith(w, async () => undefined)
-    assert.deepEqual(w.store.calls.map((c) => c.op), ['remove'], 'only the DELETE was sent')
+    assert.deepEqual(ops(w), ['remove'], 'only the DELETE was sent')
     assert.deepEqual(done.applied.map((a) => a.kind), ['DELETE'])
     assert.equal(done.stopped?.key, `update:${w.woo.w2}`)
     assert.match(done.stopped?.reason ?? '', /^LIVE_CHANGED/)
@@ -129,7 +132,7 @@ test('a CREATE is re-checked too: the IMS rate deactivated after the plan, or a 
     const done = await w.m.writer.applyWooTaxPlan(depsWith(w, async () => { await w.m.db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: String(Number(w.woo.w5) + 50), taxRateId: w.ids.fr, externalName: 'FR VAT', externalCountry: 'FR', externalRatePct: '20', externalClass: 'standard', storeIdentity: null } }) }), { confirm: plan.digest })
     assert.equal(done.outcome === 'DONE' ? done.stopped?.key : null, `create:${w.ids.fr}`)
     assert.match((done.outcome === 'DONE' ? done.stopped?.reason : '') ?? '', /^MAPPING_APPEARED/)
-    assert.deepEqual(w.store.calls.map((c) => c.op), ['remove', 'update', 'update'], 'the three earlier changes were sent; the create was not')
+    assert.deepEqual(ops(w), ['remove', 'update', 'update'], 'the three earlier changes were sent; the create was not')
     await w.m.db.shoppingTaxRateMapping.deleteMany({ where: { taxRateId: w.ids.fr } })
   })
 })
@@ -150,7 +153,7 @@ test('the configured store changed BEFORE the apply: refused, nothing sent; chan
     const base = w.deps(LIVE)
     const deps = { ...base, port: { create: w.store.create.bind(w.store), update: w.store.update.bind(w.store), remove: async (...a: Parameters<typeof w.store.remove>) => { const r = await w.store.remove(...a); w.configured.value = OTHER_STORE; return r } } }
     const done = await w.m.writer.applyWooTaxPlan(deps, { confirm: plan.digest })
-    assert.deepEqual(w.store.calls.map((c) => c.op), ['remove'], 'only the change sent before the URL moved')
+    assert.deepEqual(ops(w), ['remove'], 'only the change sent before the URL moved')
     assert.equal(done.outcome === 'DONE' ? done.stopped?.key : null, `update:${w.woo.w2}`)
     assert.match((done.outcome === 'DONE' ? done.stopped?.reason : '') ?? '', /^STORE_CHANGED/)
   })
@@ -167,7 +170,7 @@ test('a mapping writer BLOCKS while the apply holds the lock, and proceeds when 
       update: async (...a: Parameters<typeof store.update>) => { await gate; return store.update(...a) },
       remove: async (...a: Parameters<typeof store.remove>) => { await gate; return store.remove(...a) },
     }
-    const { upsertStorefrontTaxMapping, repointStorefrontTaxMapping, lockStorefrontMappingWrites } = w.m.helper
+    const { upsertStorefrontTaxMapping, repointStorefrontTaxMapping, lockStorefrontMappingWrites } = await helperModule()
     const current = await mappingOf(w, w.woo.w1)
     const fields = { externalName: current.externalName, externalCountry: current.externalCountry, externalRatePct: current.externalRatePct.toFixed(4), externalClass: current.externalClass, taxRateId: current.taxRateId }
     let apply: ReturnType<typeof w.m.writer.applyWooTaxPlan> | null = null
@@ -198,7 +201,7 @@ test('a mapping writer BLOCKS while the apply holds the lock, and proceeds when 
 
 test('shared writers do not block one another: a second writer takes the lock while the first still holds it', SKIP, async (t) => {
   await buildWorld(t, modules, async (w) => {
-    const { lockStorefrontMappingWrites } = w.m.helper
+    const { lockStorefrontMappingWrites } = await helperModule()
     let release!: () => void
     const hold = new Promise<void>((resolve) => { release = resolve })
     let firstHasLock!: () => void
