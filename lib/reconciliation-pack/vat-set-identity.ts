@@ -97,7 +97,7 @@ function exact(text: string | null): Decimal | null {
 }
 
 /** The percentage IMS computes tax at: the active components' effective rate when it has any, else the rate column. */
-function imsPercent(rate: TaxRateRow, components: readonly TaxComponentRateRow[]): Decimal | null {
+export function imsPercent(rate: TaxRateRow, components: readonly TaxComponentRateRow[]): Decimal | null {
   const column = exact(rate.rate)
   if (column === null) return null
   const active = components.filter((component) => component.taxRateId === rate.id && component.active).sort((a, b) => a.sortOrder - b.sortOrder)
@@ -108,10 +108,10 @@ function imsPercent(rate: TaxRateRow, components: readonly TaxComponentRateRow[]
 
 const xeroPercent = (row: NormalisedXeroTaxRate): Decimal | null => exact(row.effectiveRate ?? row.displayTaxRate)
 /** The tax class as Woo states it: empty is the standard class; case and surrounding spaces do not count. */
-const normaliseClass = (value: string | null): string => { const slug = (value ?? '').trim().toLowerCase(); return slug === '' ? 'standard' : slug }
+export const normaliseClass = (value: string | null): string => { const slug = (value ?? '').trim().toLowerCase(); return slug === '' ? 'standard' : slug }
 
 /** A region token as one comparable string: upper case, letters and digits only, the leading country code dropped ("PT-30" and "30" are both "30"). */
-function regionToken(text: string, country: string): string {
+export function regionToken(text: string, country: string): string {
   const token = text.toUpperCase().replace(/[^A-Z0-9]/g, '')
   return country !== '' && token.startsWith(country) && token.length > country.length ? token.slice(country.length) : token
 }
@@ -122,8 +122,8 @@ const GENERIC_NAME_WORDS: ReadonlySet<string> = new Set(['VAT', 'TAX', 'GST', 'Z
  *   wide      the prefix is followed by a generic word or nothing ("PT VAT", "GB VAT (Income)", "UK Standard Rate (20%)"), or there is no country prefix: no region is stated
  *   unreadable  the prefix is followed by a word that is not generic ("ES Canary VAT", "PT Madeira VAT"): a region may be stated in a convention this parser does not read
  */
-type NameRegion = { kind: 'region'; token: string } | { kind: 'wide' } | { kind: 'unreadable' }
-function nameRegion(name: string, country: string): NameRegion {
+export type NameRegion = { kind: 'region'; token: string } | { kind: 'wide' } | { kind: 'unreadable' }
+export function nameRegion(name: string, country: string): NameRegion {
   const text = name.trim()
   const hyphen = /^[A-Za-z]{2}-([A-Za-z0-9]+)/.exec(text)
   if (hyphen !== null && !GENERIC_NAME_WORDS.has(hyphen[1]!.toUpperCase())) return { kind: 'region', token: regionToken(hyphen[1]!, country) }
@@ -132,7 +132,7 @@ function nameRegion(name: string, country: string): NameRegion {
   return { kind: 'wide' }
 }
 /** A rate name as the re-key compares it: trimmed, whitespace runs collapsed, case ignored. */
-const comparableName = (name: string): string => name.trim().replace(/\s+/g, ' ').toLowerCase()
+export const comparableName = (name: string): string => name.trim().replace(/\s+/g, ' ').toLowerCase()
 
 /** The region an IMS rate records in its name; null when it states none. IMS has no region field. */
 function imsRegion(name: string, country: string): string | null {

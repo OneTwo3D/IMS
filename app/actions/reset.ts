@@ -253,6 +253,7 @@ async function clearFullScope() {
   // Connector / integration configuration and mappings
   await db.shoppingStatusMapping.deleteMany({})
   await db.shoppingTaxRateMapping.deleteMany({})
+  await db.wooTaxRateWrite.deleteMany({})
   await db.externalWmsBinding.deleteMany({})
   await db.wmsConnection.deleteMany({})
   await db.accountingAccount.deleteMany({})

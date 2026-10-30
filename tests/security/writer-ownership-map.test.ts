@@ -168,3 +168,14 @@ test('every outbox registry operation is mapped or explicitly excluded; the excl
   for (const row of rows) for (const name of row.outboxOperations ?? []) assert.ok(names.includes(name), `${row.destination}.${row.operation} names ${name}, which is not in the registry`)
   assert.ok(excluded.length <= OUTBOX_EXCLUSION_CEILING, 'the outbox exclusions may only shrink')
 })
+
+test('woocommerce.tax-rate: the owner maintains the store by hand at P1 and IMS owns it at P2; the note says the writer is held and never touches rates IMS does not own', () => {
+  const row = rows.find((candidate) => candidate.destination === 'woocommerce' && candidate.operation === 'tax-rate')
+  assert.ok(row, 'woocommerce.tax-rate is mapped')
+  assert.equal(row.owners.P1, 'operator-manual')
+  assert.equal(row.owners.P2, 'IMS')
+  assert.equal(row.obligationTime, 'not-applicable')
+  assert.match(row.note, /held/)
+  assert.match(row.note, /never touched/)
+  assert.match(row.note, /ShoppingTaxRateMapping/)
+})

@@ -1,0 +1,286 @@
+/**
+ * THE IMS TO WOOCOMMERCE TAX-RATE WRITER, HELD AT P1. Operator-confirmed; reads the store with GET only and writes it only when the producer hold says LIVE.
+ *
+ * WHAT IT DOES. `readWooTaxPlan` computes the plan (lib/connectors/woocommerce/tax-rate-plan.ts: the changes that would make the WooCommerce side of the R13 VAT set identity hold) and its
+ * digest; it writes nothing, anywhere. `applyWooTaxPlan` sends a plan the operator confirmed by its digest.
+ *
+ * THE HOLD (ownership map: woocommerce `tax-rate`, P1 owner operator-manual, P2 owner IMS)
+ *   - Hold NOT enforced for WooCommerce: the apply is REFUSED (HOLD_NOT_ENFORCED). This writer is new: there is no earlier behaviour to preserve, so "unenforced" is never a licence to send.
+ *   - Hold enforced and the decision SHADOW (P1: the owner corrects the store by hand): each change is recorded as an outbound shadow (`outbound_shadow_writes`) and NOTHING is sent and NOTHING
+ *     else is written: no change record, no mapping row. A re-run only adds to the shadow's occurrence count.
+ *   - Hold enforced and the decision LIVE (P2 for the destination, and IMS the owner of the operation): the changes are sent through the injected port, one at a time, in plan order. The apply
+ *     asks wooProducerSeam for EACH change before it sends it, and the transport (wcPost, wcPut) has its own last barrier behind that.
+ *
+ * THE APPLY
+ *   1. `confirm` must be the exact 64-hex digest of the plan the operator saw. Checked before anything is read.
+ *   2. The single-runner lock (WOO_TAX_RATE_WRITE_LOCK_KEY) is taken and held to the end. A second apply waits for it, then reads the store as the first left it: usually nothing to do.
+ *   3. Under the lock the plan is REBUILT from the IMS database and the store. No changes: nothing to do (a re-run after success writes nothing and sends nothing). Another digest: refused
+ *      (DIGEST_MISMATCH), nothing written. A blocker: refused (BLOCKED).
+ *   4. Per change: seam, then send, then ONE transaction that writes the change record (`woo_tax_rate_writes`) and creates or updates the mapping row. A store refusal stops the run, records
+ *      a FAILED row and leaves what was already done done: preview again for the rest.
+ *
+ * LIMITS (disclosed, not hidden)
+ *   - The IMS rates are not locked across the sends (network calls cannot sit in a transaction): an IMS edit between the plan and the send is not seen until the next preview. The digest binds
+ *     what the operator confirmed, and the sends follow it immediately.
+ *   - A store write that succeeded but whose record could not be committed leaves a store rate without a record and (for a CREATE) without a mapping row. The apply stops and says so; the next
+ *     plan then reports that rate as an UNMAPPED_TWIN blocker until the owner maps it. Nothing is created twice.
+ *   - Store tax classes must exist in the store: the store refuses a rate of a class it does not have, and the apply stops with its answer.
+ *   - A mapping row is kept when its store rate is deleted (historic orders still resolve their tax lines through it); it is simply no longer a counterpart.
+ */
+
+import { Prisma } from '@/app/generated/prisma/client'
+import { db } from '@/lib/db'
+import { WOO_TAX_RATE_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
+import { acquirePinnedAdvisoryLockWaiting, AdvisoryLockLostError, AdvisoryLockWaitTimeoutError } from '@/lib/db/pinned-advisory-lock'
+import type { ProducerDecisionContext } from '@/lib/security/producer-disposition'
+import { producerSeamVerdict } from '@/lib/security/producer-seam'
+import type { TaxComponentRateRow, TaxRateRow } from '@/lib/reconciliation-pack/ims-readers'
+import type { WooTaxRateDetail } from '@/lib/reconciliation-pack/woo-source'
+import { planWooTaxRates, ownedWooIdsFromRecords, type FieldChange, type WooTaxChange, type WooTaxMappingRow, type WooTaxPlan, type WooTaxRateFields } from './tax-rate-plan'
+import { wooProducerSeam } from './producer-seam'
+
+const DIGEST_RE = /^[0-9a-f]{64}$/
+const APPLY_WAIT_MS = 120_000
+
+/** What the store answered to one write. `held` means the transport's last barrier refused it before it left IMS. */
+export type WooTaxPortResult = { ok: true; id?: string } | { ok: false; error: string; held?: true }
+
+/** The write side of the store, as the writer needs it. The real one is lib/connectors/woocommerce/tax-rate-port.ts; tests inject a fake. */
+export interface WooTaxRateWritePort {
+  create(fields: WooTaxRateFields): Promise<WooTaxPortResult>
+  update(wooId: string, changed: Readonly<Partial<WooTaxRateFields>>): Promise<WooTaxPortResult>
+  remove(wooId: string): Promise<WooTaxPortResult>
+}
+
+export type WooTaxReadResult = { ok: true; rates: WooTaxRateDetail[] } | { ok: false }
+
+export type WooTaxWriterDeps = {
+  /** The proven, GET-only read of the store's tax rates. */
+  readWoo: () => Promise<WooTaxReadResult>
+  /** Required by an apply. */
+  port?: WooTaxRateWritePort
+  /** Test seam: the environment and clock the producer decision reads (default: the process). */
+  context?: ProducerDecisionContext
+}
+
+export type WooTaxHold = {
+  mode: 'held' | 'live' | 'not-enforced'
+  detail: string
+}
+
+/** Where the hold stands for the tax-rate operation, in words. Pure over the environment. */
+export function wooTaxHold(context?: ProducerDecisionContext): WooTaxHold {
+  const verdict = producerSeamVerdict('woocommerce', 'tax-rate', undefined, context)
+  if (verdict.kind === 'legacy') return { mode: 'not-enforced', detail: 'PRODUCER_HOLD_ENFORCED_DESTINATIONS does not name woocommerce, so the producer-side hold is not enforced: an apply is refused' }
+  if (verdict.kind === 'shadow') return { mode: 'held', detail: `held (${verdict.decision.reason}, owner ${verdict.decision.owner}): an apply records shadows and sends nothing` }
+  return { mode: 'live', detail: 'LIVE: an apply sends the planned changes to WooCommerce' }
+}
+
+export const WOO_TAX_REFUSALS = {
+  CONFIRM_REQUIRED: 'an apply needs the exact 64-character plan digest the operator saw in the preview',
+  PORT_MISSING: 'no WooCommerce write port was given to the apply',
+  HOLD_NOT_ENFORCED: 'the producer-side hold is not enforced for WooCommerce, so this writer does not run (it has no earlier behaviour to preserve)',
+  BUSY: 'another apply of the WooCommerce tax rates is running and did not finish in time',
+  IMS_UNREADABLE: 'the IMS tax rates, mappings or the writer record could not be read',
+  WOO_UNREADABLE: 'the WooCommerce tax rates could not be read and proven (no credentials, a refused or failed request, or pages that disagree)',
+  DIGEST_MISMATCH: 'the plan changed since it was previewed (or this is not its digest); preview again. Nothing was written',
+  BLOCKED: 'the plan has a blocker (see it in the preview); resolve it and preview again. Nothing was written',
+  LOCK_LOST: 'the single-runner lock was lost while the apply was running; it stopped',
+} as const
+export type WooTaxRefusalCode = keyof typeof WOO_TAX_REFUSALS
+
+export type AppliedChange = { key: string; kind: WooTaxChange['kind']; wooId: string | null }
+export type FailedChange = { key: string; kind: WooTaxChange['kind']; error: string }
+
+export type WooTaxApplyResult =
+  | { outcome: 'REFUSED'; code: WooTaxRefusalCode; plan: WooTaxPlan | null }
+  | { outcome: 'NOTHING_TO_DO'; plan: WooTaxPlan }
+  | {
+      outcome: 'DONE'
+      plan: WooTaxPlan
+      /** Changes sent and recorded. */
+      applied: AppliedChange[]
+      /** Changes the hold kept as shadows: nothing sent, nothing else written. */
+      shadowed: string[]
+      /** Shadow records that could not be written (lost evidence, not lost work). */
+      shadowUnrecorded: number
+      /** A change the store refused (the run stopped there), or one that was sent but could not be recorded. */
+      failed: FailedChange | null
+      sentButUnrecorded: string | null
+    }
+
+type ReadClient = Pick<Prisma.TransactionClient, 'taxRate' | 'taxRateComponent' | 'shoppingTaxRateMapping' | 'wooTaxRateWrite'>
+
+type ImsState = {
+  rates: TaxRateRow[]
+  componentRates: TaxComponentRateRow[]
+  mappings: WooTaxMappingRow[]
+  recordedOwnedWooIds: Set<string>
+}
+
+async function readImsState(client: ReadClient): Promise<ImsState> {
+  const rates = await client.taxRate.findMany({
+    select: { id: true, name: true, rate: true, usedFor: true, reverseCharge: true, active: true, accountingTaxType: true, countryCode: true, reportingCategory: true, isCompound: true, taxCategory: true },
+    orderBy: { id: 'asc' },
+  })
+  const components = await client.taxRateComponent.findMany({ select: { taxRateId: true, rate: true, compoundOnPrevious: true, active: true, sortOrder: true }, orderBy: [{ taxRateId: 'asc' }, { sortOrder: 'asc' }, { id: 'asc' }] })
+  const mappings = await client.shoppingTaxRateMapping.findMany({
+    where: { connector: 'woocommerce' },
+    select: { externalTaxRateId: true, taxRateId: true, externalName: true, externalCountry: true, externalRatePct: true, externalClass: true },
+    orderBy: { externalTaxRateId: 'asc' },
+  })
+  const writes = await client.wooTaxRateWrite.findMany({
+    select: { kind: true, status: true, wooTaxRateId: true },
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+  })
+  const owned = ownedWooIdsFromRecords(writes)
+  return {
+    rates: rates.map((row) => ({
+      id: row.id, name: row.name, rate: row.rate.toFixed(4), usedFor: row.usedFor, reverseCharge: row.reverseCharge, active: row.active, accountingTaxType: row.accountingTaxType,
+      countryCode: row.countryCode, reportingCategory: row.reportingCategory, isCompound: row.isCompound, taxCategory: row.taxCategory,
+    })),
+    componentRates: components.map((row) => ({ taxRateId: row.taxRateId, rate: row.rate.toFixed(4), compoundOnPrevious: row.compoundOnPrevious, active: row.active, sortOrder: row.sortOrder })),
+    mappings: mappings.map((row) => ({ ...row, externalRatePct: row.externalRatePct.toFixed(4) })),
+    recordedOwnedWooIds: owned,
+  }
+}
+
+type PlanRead = { ok: true; plan: WooTaxPlan } | { ok: false; code: 'IMS_UNREADABLE' | 'WOO_UNREADABLE' }
+
+/** IMS in one repeatable-read read-only transaction, then the store (a paced walk must not hold a transaction open), then the pure plan. Writes nothing. */
+async function readPlan(deps: WooTaxWriterDeps): Promise<PlanRead> {
+  let ims: ImsState
+  try {
+    ims = await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SET TRANSACTION READ ONLY`
+      return readImsState(tx)
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, timeout: 60_000, maxWait: 20_000 })
+  } catch {
+    return { ok: false, code: 'IMS_UNREADABLE' }
+  }
+  const woo = await deps.readWoo()
+  if (!woo.ok) return { ok: false, code: 'WOO_UNREADABLE' }
+  return { ok: true, plan: planWooTaxRates({ woo: woo.rates, rates: ims.rates, mappings: ims.mappings, componentRates: ims.componentRates, recordedOwnedWooIds: ims.recordedOwnedWooIds }) }
+}
+
+export type WooTaxPreview = { hold: WooTaxHold } & ({ refused: null; plan: WooTaxPlan } | { refused: 'IMS_UNREADABLE' | 'WOO_UNREADABLE'; plan: null })
+
+/** The dry run. Reads IMS and the store; writes nothing and sends nothing. */
+export async function readWooTaxPlan(deps: WooTaxWriterDeps): Promise<WooTaxPreview> {
+  const hold = wooTaxHold(deps.context)
+  const read = await readPlan(deps)
+  return read.ok ? { hold, refused: null, plan: read.plan } : { hold, refused: read.code, plan: null }
+}
+
+function changedFields(fields: readonly FieldChange[]): Partial<WooTaxRateFields> {
+  const out: Record<string, string | boolean> = {}
+  for (const change of fields) out[change.field] = change.after
+  return out as Partial<WooTaxRateFields>
+}
+
+function summaryOf(change: WooTaxChange): Record<string, string | number | boolean | null> {
+  return { kind: change.kind, imsRate: change.imsRateName.slice(0, 120), wooId: 'wooId' in change ? change.wooId : null }
+}
+
+/** The mapping row fields the store rate will carry. The class is stored as the store states it. */
+function mappingFields(after: WooTaxRateFields): { externalName: string; externalCountry: string | null; externalRatePct: string; externalClass: string } {
+  return { externalName: after.name, externalCountry: after.country === '' ? null : after.country, externalRatePct: after.rate, externalClass: after.class }
+}
+
+/** Sends one change. The fakes and the real port answer in the same closed shape. */
+async function send(port: WooTaxRateWritePort, change: WooTaxChange): Promise<WooTaxPortResult> {
+  switch (change.kind) {
+    case 'CREATE': return port.create(change.after)
+    case 'UPDATE': return port.update(change.wooId, changedFields(change.fields))
+    case 'DELETE': return port.remove(change.wooId)
+    case 'REFRESH_MAPPING': return { ok: true, id: change.wooId }
+  }
+}
+
+async function recordApplied(digest: string, change: WooTaxChange, newId: string | null): Promise<void> {
+  await db.$transaction(async (tx) => {
+    const wooId = change.kind === 'CREATE' ? newId : change.wooId
+    await tx.wooTaxRateWrite.create({
+      data: {
+        planDigest: digest, kind: change.kind, changeKey: change.key, wooTaxRateId: wooId, imsTaxRateId: change.imsRateId, status: 'APPLIED',
+        change: JSON.parse(JSON.stringify(change)) as Prisma.InputJsonValue,
+      },
+    })
+    if (change.kind === 'CREATE') {
+      await tx.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: newId!, taxRateId: change.imsRateId, ...mappingFields(change.after) } })
+    } else if (change.kind === 'UPDATE' || change.kind === 'REFRESH_MAPPING') {
+      await tx.shoppingTaxRateMapping.updateMany({ where: { connector: 'woocommerce', externalTaxRateId: change.wooId }, data: mappingFields(change.after) })
+    }
+  })
+}
+
+async function recordFailed(digest: string, change: WooTaxChange, error: string): Promise<void> {
+  await db.wooTaxRateWrite.create({
+    data: {
+      planDigest: digest, kind: change.kind, changeKey: change.key, wooTaxRateId: 'wooId' in change ? change.wooId : null, imsTaxRateId: change.imsRateId, status: 'FAILED',
+      change: JSON.parse(JSON.stringify(change)) as Prisma.InputJsonValue, error: error.slice(0, 500),
+    },
+  })
+}
+
+export async function applyWooTaxPlan(deps: WooTaxWriterDeps, options: { confirm: string | undefined }): Promise<WooTaxApplyResult> {
+  const refuse = (code: WooTaxRefusalCode, plan: WooTaxPlan | null = null): WooTaxApplyResult => ({ outcome: 'REFUSED', code, plan })
+  // Before the database is touched: an apply with no digest never reads anything.
+  if (options.confirm === undefined || !DIGEST_RE.test(options.confirm)) return refuse('CONFIRM_REQUIRED')
+  if (deps.port === undefined) return refuse('PORT_MISSING')
+  if (wooTaxHold(deps.context).mode === 'not-enforced') return refuse('HOLD_NOT_ENFORCED')
+
+  let lock
+  try {
+    lock = await acquirePinnedAdvisoryLockWaiting(WOO_TAX_RATE_WRITE_LOCK_KEY, { timeoutMs: APPLY_WAIT_MS })
+  } catch (error) {
+    if (error instanceof AdvisoryLockWaitTimeoutError) return refuse('BUSY')
+    throw error
+  }
+  try {
+    const read = await readPlan(deps)
+    if (!read.ok) return refuse(read.code)
+    const plan = read.plan
+    if (plan.changes.length === 0) return { outcome: 'NOTHING_TO_DO', plan }
+    if (plan.digest !== options.confirm) return refuse('DIGEST_MISMATCH', plan)
+    if (plan.blockers.length > 0) return refuse('BLOCKED', plan)
+
+    const result: Extract<WooTaxApplyResult, { outcome: 'DONE' }> = { outcome: 'DONE', plan, applied: [], shadowed: [], shadowUnrecorded: 0, failed: null, sentButUnrecorded: null }
+    for (const change of plan.changes) {
+      lock.assertHeld(`sending ${change.key}`)
+      // THE SEAM, before the first effect of the change. A shadow records what would have been sent and answers; nothing else happens for this change.
+      const answer = await wooProducerSeam({
+        operation: 'tax-rate', subjectType: 'WooTaxRate', subjectId: change.key, payload: change, summary: summaryOf(change), context: deps.context,
+      })
+      if (!answer.proceed) {
+        result.shadowed.push(change.key)
+        if (!answer.recorded) result.shadowUnrecorded += 1
+        continue
+      }
+      const sent = await send(deps.port, change)
+      if (!sent.ok) {
+        result.failed = { key: change.key, kind: change.kind, error: sent.error }
+        await recordFailed(plan.digest, change, sent.error).catch(() => undefined)
+        break
+      }
+      const newId = change.kind === 'CREATE' ? (sent.id ?? null) : null
+      if (change.kind === 'CREATE' && (newId === null || !/^[1-9][0-9]{0,17}$/.test(newId))) {
+        result.sentButUnrecorded = change.key
+        break
+      }
+      try {
+        await recordApplied(plan.digest, change, newId)
+      } catch {
+        result.sentButUnrecorded = change.key
+        break
+      }
+      result.applied.push({ key: change.key, kind: change.kind, wooId: change.kind === 'CREATE' ? newId : change.wooId })
+    }
+    return result
+  } catch (error) {
+    if (error instanceof AdvisoryLockLostError) return refuse('LOCK_LOST')
+    throw error
+  } finally {
+    await lock.release().catch(() => undefined)
+  }
+}

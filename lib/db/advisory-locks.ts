@@ -159,6 +159,15 @@ export const RECONCILIATION_PACK_SCHEDULE_SETTINGS_LOCK_KEY = 918_274_302
  */
 
 /**
+ * THE WOOCOMMERCE TAX-RATE WRITER'S SINGLE-RUNNER LOCK (lib/connectors/woocommerce/tax-rate-writer.ts).
+ *
+ * Held (session-scoped, waiting, on a pinned connection) for the whole of an apply: it reads the store, rebuilds the plan, checks the digest and sends the changes one at a time. A second
+ * apply started meanwhile waits, then rebuilds its plan from the store as the first left it (usually nothing to do) instead of sending the same changes twice. A transaction cannot hold
+ * it: the sends are network calls and each change commits its own record and mapping row. Its own domain, shared with nothing.
+ */
+export const WOO_TAX_RATE_WRITE_LOCK_KEY = 918_274_501
+
+/**
  * Every single-bigint domain above, for the uniqueness test. A new lock MUST be
  * declared here — the test fails on any module that writes its own key literal.
  */
@@ -172,6 +181,7 @@ export const SINGLE_KEY_ADVISORY_LOCKS = {
   RECONCILIATION_PACK_SCHEDULE_LOCK_KEY,
   RECONCILIATION_PACK_SCHEDULE_SETTINGS_LOCK_KEY,
   FX_TABLE_LOCK_KEY,
+  WOO_TAX_RATE_WRITE_LOCK_KEY,
 } as const
 
 /**
