@@ -3,6 +3,7 @@ import test, { mock } from 'node:test'
 import { config } from 'dotenv'
 
 import { FakeWooStore, woo } from '../helpers/woo-tax-fakes.ts'
+import { withWooTaxWorldLock } from '../helpers/woo-tax-db-lock.ts'
 
 /**
  * AN OWNERSHIP STAMP ENDS WHEN ITS ROW STOPS MEANING WHAT IT WAS STAMPED FOR (lib/tax/storefront-mapping-write.ts), against a real database.
@@ -42,17 +43,25 @@ async function modules() {
 /** A run-unique name prefix, the ids of the mapping rows used, and cleanup of everything the import created. */
 async function withRun(t: test.TestContext, body: (r: Awaited<ReturnType<typeof modules>> & { tag: string; ids: string[] }) => Promise<void>) {
   const m = await modules()
+  await withWooTaxWorldLock(() => runLocked(m, body))
+}
+
+async function runLocked(m: Awaited<ReturnType<typeof modules>>, body: (r: Awaited<ReturnType<typeof modules>> & { tag: string; ids: string[] }) => Promise<void>) {
   const tag = `ZZ${Math.random().toString(36).slice(2, 8)}`
   const base = 6_000_000 + Math.floor(Math.random() * 90_000) * 10
   const ids = [String(base + 10), String(base + 11)]
   const others = (await m.db.taxRate.findMany({ where: { active: true }, select: { id: true } })).map((x) => x.id)
   await m.db.taxRate.updateMany({ where: { id: { in: others } }, data: { active: false } })
-  t.after(async () => {
+  const cleanup = async () => {
     await m.db.shoppingTaxRateMapping.deleteMany({ where: { externalTaxRateId: { in: ids } } })
     await m.db.taxRate.deleteMany({ where: { name: { startsWith: tag } } })
     await m.db.taxRate.updateMany({ where: { id: { in: others } }, data: { active: true } })
-  })
-  await body({ ...m, tag, ids })
+  }
+  try {
+    await body({ ...m, tag, ids })
+  } finally {
+    await cleanup()
+  }
 }
 const rowOf = (m: { db: Awaited<ReturnType<typeof modules>>['db'] }, id: string) => m.db.shoppingTaxRateMapping.findUnique({ where: { connector_externalTaxRateId: { connector: 'woocommerce', externalTaxRateId: id } } })
 const stamp = (m: { db: Awaited<ReturnType<typeof modules>>['db'] }, id: string) => m.db.shoppingTaxRateMapping.update({ where: { connector_externalTaxRateId: { connector: 'woocommerce', externalTaxRateId: id } }, data: { storeIdentity: STORE } })
