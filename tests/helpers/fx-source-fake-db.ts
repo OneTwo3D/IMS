@@ -72,6 +72,7 @@ export function createFxSourceFakeDb(seed: { currencies?: Array<{ code: string; 
 
   const tx = {
     $executeRaw: async () => { events.push('lock'); return 1 },
+    currency: { findMany: async () => currencies.map((c) => ({ ...c })) },
     fxRate,
     setting,
   }
@@ -94,10 +95,21 @@ export function createFxSourceFakeDb(seed: { currencies?: Array<{ code: string; 
       }
       return [...latest.values()].map((r) => ({ toCurrency: r.toCurrency, manualOverride: r.manualOverride }))
     },
-    $transaction: async <T,>(work: (t: typeof tx) => Promise<T>) => {
+    $transaction: async <T,>(work: (t: typeof tx) => Promise<T>, _options?: unknown) => {
       events.push('tx.begin')
       inTx = true
-      try { return await work(tx) } finally { inTx = false; events.push('tx.end') }
+      // A throw rolls the transaction back, as the real one does: rows and settings return to what they were at the start.
+      const ratesBefore = [...rates]
+      const settingsBefore = new Map(settings)
+      try {
+        return await work(tx)
+      } catch (error) {
+        rates.splice(0, rates.length, ...ratesBefore)
+        settings.clear()
+        for (const [k, v] of settingsBefore) settings.set(k, v)
+        events.push('tx.rollback')
+        throw error
+      } finally { inTx = false; events.push('tx.end') }
     },
   }
 

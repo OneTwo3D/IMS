@@ -119,7 +119,7 @@ test('refused: a base currency that is not IMS\'s base; the whole read, nothing 
   const { ingestAeliaRates } = await load()
   await assert.rejects(ingestAeliaRates(aeliaAnswer({ base: 'EUR' }), { now: NOW }), (e: Error & { reason?: string }) => e.reason === 'base_mismatch')
   assert.equal(fake.rates.length, 0)
-  assert.equal(fake.events.includes('lock'), false, 'refused before the table lock was even taken')
+  assert.equal(fake.events.some((e) => e.startsWith('fxRate.create')), false, 'refused before any write')
 })
 
 test('refused: an unknown currency (not in IMS) stores nothing for it; a currency IMS has switched off is simply not wanted', async () => {

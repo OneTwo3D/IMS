@@ -273,7 +273,7 @@ test('CUTOVER BARRIER, wiring: setFxRateSource writes source and instant togethe
   const sw = src.slice(src.indexOf('export async function setFxRateSource'))
   assert.match(sw, /withFxTableWriteLock\(async \(tx\) => \{[\s\S]*?FX_RATE_SOURCE_SETTING[\s\S]*?FX_RATE_SOURCE_SINCE_SETTING[\s\S]*?\}\)/)
   const swBody = sw.slice(0, sw.indexOf('revalidatePath'))
-  assert.equal((swBody.match(/\btx\.setting\.upsert\(/g) ?? []).length, 2, 'the source and its instant are BOTH written through the lock transaction')
+  assert.equal((swBody.match(/\btx\.setting\.upsert\(/g) ?? []).length, 4, 'the source, its instant and Aelia\'s two freshness stamps are ALL written through the lock transaction')
   assert.equal((swBody.match(/\bdb\.setting\./g) ?? []).length, 0, 'nothing of the switch is written outside the lock transaction')
   const single = src.slice(src.indexOf('async function fetchSingleFxRate'), src.indexOf('/** Fetch FX rates for all active currencies'))
   assert.ok(single.indexOf('withFxTableWriteLock') < single.indexOf("getFxRateSourceInTx(tx)") && single.indexOf("getFxRateSourceInTx(tx)") < single.indexOf('tx.fxRate.create'))

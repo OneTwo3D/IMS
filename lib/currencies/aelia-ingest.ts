@@ -1,7 +1,8 @@
 import { Prisma } from '@/app/generated/prisma/client'
-import { db } from '@/lib/db'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
+
+type FxTx = Parameters<Parameters<typeof withFxTableWriteLock>[0]>[0]
 
 /**
  * INGEST OF AELIA'S EXCHANGE RATES INTO fx_rates (FX source 'aelia'; lib/currencies/fx-source.ts).
@@ -170,6 +171,11 @@ export type AeliaIngestResult = {
   refused: AeliaRefusal[]
   /** Aelia's markup per currency, as returned. For verification only: it is stored nowhere. */
   markups: Record<string, string | null>
+  /**
+   * The IMS-enabled foreign currencies for which this read gave NO usable rate (neither written, already stored, nor pinned by a manual override). Empty = the set is COMPLETE.
+   * A currency Aelia lists that IMS does not know is not in here: it does not make IMS's set incomplete.
+   */
+  missing: string[]
 }
 
 /**
@@ -177,6 +183,14 @@ export type AeliaIngestResult = {
  * Everything else is reported per currency in the result.
  */
 export async function ingestAeliaRates(body: unknown, options: { now?: Date } = {}): Promise<AeliaIngestResult> {
+  return withFxTableWriteLock((tx) => ingestAeliaRatesInTx(tx, body, options))
+}
+
+/**
+ * The same, inside a transaction that ALREADY holds the exclusive FX table lock (withFxTableWriteLock): the cutover to Aelia (setFxRateSource) reads and ingests under the very lock that
+ * commits the switch. The lock is an advisory transaction lock, so this must not take it again on another connection. Every read and write here goes through `tx`.
+ */
+export async function ingestAeliaRatesInTx(tx: FxTx, body: unknown, options: { now?: Date } = {}): Promise<AeliaIngestResult> {
   const now = options.now ?? new Date()
   const parsed = parseAeliaRatesPayload(body, now)
   const baseCurrency = await getBaseCurrencyCode()
@@ -184,7 +198,7 @@ export async function ingestAeliaRates(body: unknown, options: { now?: Date } = 
     throw new AeliaRefusedError('base_mismatch', `Aelia's base currency is ${parsed.base} but IMS's is ${baseCurrency}; nothing was stored`)
   }
 
-  const known = await db.currency.findMany({ select: { code: true, active: true } })
+  const known = await tx.currency.findMany({ select: { code: true, active: true } })
   const knownByCode = new Map(known.map((c) => [c.code, c.active]))
   const refused: AeliaRefusal[] = [...parsed.refused]
   const markups: Record<string, string | null> = {}
@@ -211,7 +225,7 @@ export async function ingestAeliaRates(body: unknown, options: { now?: Date } = 
   const unchanged: string[] = []
   const skippedManualOverrides: string[] = []
 
-  await withFxTableWriteLock(async (tx) => {
+  {
     const latest = await tx.fxRate.findMany({
       where: { fromCurrency: baseCurrency, toCurrency: { in: usable.map((u) => u.currency) } },
       orderBy: [{ toCurrency: 'asc' }, { fetchedAt: 'desc' }],
@@ -236,9 +250,11 @@ export async function ingestAeliaRates(body: unknown, options: { now?: Date } = 
       })
       written.push(entry.currency)
     }
-  })
+  }
 
-  return { updatedAt: parsed.updatedAt, written, unchanged, skippedManualOverrides, refused, markups }
+  const have = new Set([...written, ...unchanged, ...skippedManualOverrides])
+  const missing = [...knownByCode].filter(([code, active]) => active && code !== baseCurrency && !have.has(code)).map(([code]) => code).sort()
+  return { updatedAt: parsed.updatedAt, written, unchanged, skippedManualOverrides, refused, markups, missing }
 }
 
 /**

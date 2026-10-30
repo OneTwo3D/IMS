@@ -67,24 +67,38 @@ test('a switch to Aelia during a rate push waits for the push; after it commits 
     },
   })
   const { db } = await import('@/lib/db')
+  // The cutover now READS Aelia first (under the exclusive lock): answer for every active currency of the scratch database, no network.
+  mock.module('@/lib/connectors/woocommerce/aelia-rates', {
+    namedExports: {
+      readAeliaRatesFromWc: async () => {
+        const active = await db.currency.findMany({ where: { active: true, code: { not: 'GBP' } }, select: { code: true } })
+        const listed = active.filter((c) => c.code !== omitCode)
+        return { ok: true, body: { ok: true, base: 'GBP', last_update: (omitCode ? aeliaStamp2 : aeliaStamp).toISOString(), rates: listed.map((c) => ({ currency: c.code, rate: '1.500000', markup: null })) } }
+      },
+    },
+  })
   const { getBaseCurrencyCode } = await import('@/lib/base-currency')
   const { pushFxRatesToWc } = await import('@/lib/connectors/woocommerce/fx-rates')
   const { setFxRateSource } = await import('@/app/actions/currencies')
   const { fetchAllFxRatesInternal } = await import('@/lib/currencies/fx-refresh')
 
   assert.equal(await getBaseCurrencyCode(), 'GBP', 'PRECONDITION: the scratch base currency is GBP')
-  const keys = ['fx_rate_source', 'fx_rate_source_since']
+  const keys = ['fx_rate_source', 'fx_rate_source_since', 'fx_aelia_last_update_at', 'fx_aelia_last_read_at']
   const saved = await db.setting.findMany({ where: { key: { in: keys } } })
   const eurExisted = (await db.currency.findUnique({ where: { code: 'EUR' }, select: { code: true } })) !== null
   await db.currency.upsert({ where: { code: 'EUR' }, update: { active: true }, create: { code: 'EUR', name: 'EUR', symbol: 'EUR', active: true } })
   const realGlobalFetch = globalThis.fetch
   const startedAt = new Date()
+  const aeliaStamp = new Date(startedAt.getTime() - 60_000)
+  const aeliaStamp2 = new Date(startedAt.getTime() - 120_000)
+  let omitCode: string | null = null
   t.after(async () => {
     releasePost() // an assertion that fails while the push is parked in its POST must not leave the test (and its connections) hanging
     globalThis.fetch = realGlobalFetch
     await db.setting.deleteMany({ where: { key: { in: keys } } })
     for (const s of saved) await db.setting.create({ data: { key: s.key, value: s.value } })
     await db.fxRate.deleteMany({ where: { toCurrency: 'EUR', source: 'frankfurter', fetchedAt: { gte: startedAt } } })
+    await db.fxRate.deleteMany({ where: { source: 'aelia', fetchedAt: { in: [aeliaStamp, aeliaStamp2] } } })
     if (!eurExisted) await db.currency.deleteMany({ where: { code: 'EUR' } })
   })
   const reset = async () => { await db.setting.deleteMany({ where: { key: { in: keys } } }) }
@@ -137,4 +151,18 @@ test('a switch to Aelia during a rate push waits for the push; after it commits 
   const control = await fetchAllFxRatesInternal()
   assert.equal(control.success, true)
   assert.equal(await db.fxRate.count({ where: { toCurrency: 'EUR', source: 'frankfurter', fetchedAt: { gte: startedAt } } }), 1, 'CONTROL: the refresh stores its ECB row when the source is ecb')
+
+  // ---- arm 3: an INCOMPLETE read (EUR is active in IMS and Aelia leaves it out) is refused and rolled back on the real database: source untouched, no Aelia row stored
+  await reset()
+  omitCode = 'EUR'
+  const refused = await setFxRateSource('aelia')
+  omitCode = null
+  assert.equal(refused.success, false)
+  assert.match(refused.error ?? '', /EUR/)
+  assert.equal(await source(), null, 'the source did not change')
+  assert.equal(await db.setting.findUnique({ where: { key: 'fx_rate_source_since' } }), null)
+  assert.equal(await db.fxRate.count({ where: { source: 'aelia', fetchedAt: aeliaStamp2 } }), 0, 'the rows of the refused read were rolled back with the transaction')
+  // and the lock was released: a writer can take it at once
+  const { withFxTableWriteLock } = await import('@/lib/currencies/fx-table-lock')
+  assert.equal(await withFxTableWriteLock(async () => 'free'), 'free')
 })
