@@ -6,6 +6,7 @@ import type { NormalisedXeroTaxRate } from '../../lib/connectors/xero/tax-rate-l
 import type { TaxComponentRateRow, TaxMappingRow, TaxRateRow } from '../../lib/reconciliation-pack/ims-readers.ts'
 import { VAT_SET_REASON_LIST, compareVatSetIdentity, summariseVatSet, type VatSetInput, type VatSetRow } from '../../lib/reconciliation-pack/vat-set-identity.ts'
 import type { WooTaxRateDetail } from '../../lib/reconciliation-pack/woo-source.ts'
+import { comparableName, nameRegion, regionToken } from '../../lib/tax/tax-country.ts'
 
 /**
  * R13 SET IDENTITY, pure. One arm per closed reason, an identity swap, the regional rates (Canary Islands, PT-30), the scope boundaries
@@ -398,6 +399,32 @@ test('REGION_DIFFERS / REGION_UNVERIFIED: a swapped pair of regional rates canno
   assert.deepEqual(reasonsOf(compareVatSetIdentity(outOfScope), 'woo', '1'), [])
 })
 
+// [mutation: IOSS or VOEC dropped from the helper's decidable set -> the pass arms fail; mutation: they are decidable whatever the helper says -> the UNKNOWN arms fail]
+test('REPORT_TYPE_UNKNOWN: an IOSS or VOEC rate is recognised where the helper that creates the Xero rate files it (MOSSSALES), and stays unknown where the helper would only guess', () => {
+  const withCategory = (id: string, reportingCategory: string, edit: (input: VatSetInput) => void = () => {}): VatSetRow[] => {
+    const input = base(); input.rates = input.rates.map((r) => (r.id === id ? { ...r, reportingCategory } : r)); edit(input)
+    return compareVatSetIdentity(input)
+  }
+  assert.deepEqual(reasonsOf(withCategory('rDE', 'IOSS'), 'ims', 'rDE'), [], 'an EU sales rate marked IOSS passes when everything else matches')
+  assert.deepEqual(reasonsOf(withCategory('rDE', ' ioss '), 'ims', 'rDE'), [], 'the category is normalised like the helper does')
+  assert.deepEqual(reasonsOf(withCategory('rDE', 'VOEC'), 'ims', 'rDE'), [], 'a VOEC marker on an EU-named sales rate is filed under MOSSSALES too')
+  const norway = (reportingCategory: string, reportTaxType: string | null): VatSetRow[] => {
+    const input = base()
+    input.rates = [...input.rates, ims('rNO', 'TAX006', { name: 'NO VOEC VAT', rate: '0.2500', countryCode: 'NO', reportingCategory })]
+    input.xero = [...input.xero, xero('TAX006', { name: 'NO VOEC VAT', reportTaxType, effectiveRate: '25.000000', displayTaxRate: '25.000000' })]
+    input.woo = [...input.woo, woo('9', { name: 'NO VOEC VAT', country: 'NO', rate: '25.0000' })]
+    input.mappings = [...input.mappings, map('9', 'rNO')]
+    return compareVatSetIdentity(input)
+  }
+  assert.deepEqual(reasonsOf(norway('VOEC', 'MOSSSALES'), 'ims', 'rNO'), [], 'a Norway VOEC rate passes')
+  assert.deepEqual(reasonsOf(norway('VOEC', 'OUTPUT'), 'ims', 'rNO'), ['REPORT_TYPE_DIFFERS'], 'and is a real comparison: another box is a difference, not unknown')
+  assert.deepEqual(reasonsOf(norway('VOEC', null), 'ims', 'rNO'), ['REPORT_TYPE_UNKNOWN'], 'a live type with no report type is still unknown')
+  // Undecidable: the helper has no case for the marker and the name states no EU / VOEC country, so it would fall to OUTPUT, a guess.
+  assert.deepEqual(reasonsOf(withCategory('rGB', 'IOSS'), 'ims', 'rGB'), ['REPORT_TYPE_UNKNOWN'], 'IOSS on a GB-named rate')
+  assert.deepEqual(reasonsOf(withCategory('rGB', 'VOEC'), 'ims', 'rGB'), ['REPORT_TYPE_UNKNOWN'], 'VOEC on a GB-named rate')
+  assert.deepEqual(reasonsOf(withCategory('rDE', 'IOSSX'), 'ims', 'rDE'), ['REPORT_TYPE_UNKNOWN'], 'a near-miss token is not recognised')
+})
+
 test('XERO_REGION_DIFFERS / XERO_REGION_UNVERIFIED: the IMS name and the Xero name must state the same region, read by one parser; an unreadable name is a finding, never a pass', () => {
   const xeroName = (id: string, name: string, edit: (input: VatSetInput) => void = () => {}): VatSetRow[] => {
     const input = base(); input.xero = input.xero.map((x) => (x.taxType === id ? { ...x, name } : x)); edit(input)
@@ -499,4 +526,13 @@ test('the closed list is the one the report prints, every reason is reachable, a
   assert.equal(summary.byReason.XERO_NOT_IN_IMS, 1)
   assert.deepEqual(Object.keys(summary.byReason), VAT_SET_REASON_LIST)
   assert.deepEqual(VAT_SET_REASON_LIST, ['WOO_UNMAPPED', 'DUPLICATE_MAPPING', 'IMS_RATE_NOT_ACTIVE_SALES', 'IMS_NOT_IN_XERO', 'XERO_NOT_SALES_TYPE', 'PERCENT_DIFFERS', 'COUNTRY_DIFFERS', 'REPORT_TYPE_DIFFERS', 'REPORT_TYPE_UNKNOWN', 'CLASS_DIFFERS', 'CATEGORY_DIFFERS', 'CATEGORY_UNVERIFIED', 'COMPOUND_DIFFERS', 'COMPONENTS_DIFFER', 'SHIPPING_NOT_TAXED', 'REGION_DIFFERS', 'REGION_UNVERIFIED', 'WOO_NAME_DIFFERS', 'XERO_NAME_DIFFERS', 'XERO_REGION_DIFFERS', 'XERO_REGION_UNVERIFIED', 'MISSING_IN_WOO', 'XERO_NOT_IN_IMS'])
+})
+
+test('the region and name parsers are the shared ones of lib/tax/tax-country (R13 and the re-key read a name the same way)', () => {
+  assert.deepEqual(nameRegion('PT-30 VAT', 'PT'), { kind: 'region', token: '30' })
+  assert.deepEqual(nameRegion('PT-30 IOSS VAT', 'PT'), { kind: 'region', token: '30' })
+  assert.deepEqual(nameRegion('PT VAT', 'PT'), { kind: 'wide' })
+  assert.deepEqual(nameRegion('PT Madeira VAT', 'PT'), { kind: 'unreadable' })
+  assert.equal(regionToken('PT-30', 'PT'), '30')
+  assert.equal(comparableName('  AT  IOSS\tVAT '), 'at ioss vat')
 })

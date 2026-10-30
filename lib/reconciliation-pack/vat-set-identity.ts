@@ -27,11 +27,11 @@
 import { Prisma } from '@/app/generated/prisma/client'
 
 import type { NormalisedXeroTaxRate } from '@/lib/connectors/xero/tax-rate-list'
-import { xeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
+import { reportTaxTypeDecidable, xeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
 import type { TaxComponentRateRow, TaxMappingRow, TaxRateRow } from '@/lib/reconciliation-pack/ims-readers'
 import { knownWcTaxClassCategory } from '@/lib/connectors/woocommerce/sync/tax-class-category'
 import type { WooTaxRateDetail } from '@/lib/reconciliation-pack/woo-source'
-import { normaliseCountryCode, xeroNameCountry } from '@/lib/tax/tax-country'
+import { comparableName, nameRegion, normaliseCountryCode, regionToken, xeroNameCountry } from '@/lib/tax/tax-country'
 import { componentMeaningDifference } from '@/lib/tax/tax-rekey'
 import { effectiveTaxRateFromComponents } from '@/lib/tax/tax-rate-components'
 import { XERO_BUILT_IN_TAX_TYPES } from '@/lib/tax/xero-built-in-tax-types'
@@ -48,7 +48,7 @@ export const VAT_SET_REASONS = {
   PERCENT_DIFFERS: 'the percentages of the systems are not equal as exact decimals (IMS: the active components\' effective rate, else the rate column; Xero: EffectiveRate, else DisplayTaxRate; neither stated is a difference)',
   COUNTRY_DIFFERS: 'the country of the WooCommerce rate, the IMS country code, the IMS name prefix and the Xero name prefix do not all agree',
   REPORT_TYPE_DIFFERS: 'the Xero ReportTaxType is not the one IMS files the rate under (xeroReportTaxType of the IMS rate)',
-  REPORT_TYPE_UNKNOWN: 'the IMS reporting category is not one IMS maps to a VAT-return box, or the Xero type states no ReportTaxType, so the report type cannot be confirmed',
+  REPORT_TYPE_UNKNOWN: 'the IMS reporting category is not one IMS maps to a VAT-return box (IOSS and VOEC count only where the rate generator files the rate under MOSSSALES: an EU or Norway sales rate), or the Xero type states no ReportTaxType, so the report type cannot be confirmed',
   CLASS_DIFFERS: 'the tax class of the WooCommerce rate is not the class its IMS mapping recorded (empty and "standard" are the same class; case and surrounding spaces are ignored)',
   CATEGORY_DIFFERS: 'the IMS tax category the tax class of the WooCommerce rate means (the order import\'s own class-to-category table: standard or empty is STANDARD, zero-rate ZERO, reduced-rate REDUCED, second-reduced-rate SECOND_REDUCED, exempt EXEMPT) is not the tax category of the IMS rate it maps to, and IMS picks the order tax rate by tax category',
   CATEGORY_UNVERIFIED: 'the tax class of the WooCommerce rate is not one the order import maps to an IMS tax category, so its category cannot be compared (a finding, never a pass)',
@@ -85,7 +85,6 @@ export type VatSetInput = {
   xero: readonly NormalisedXeroTaxRate[]
 }
 
-const KNOWN_CATEGORIES: ReadonlySet<string> = new Set(['DOMESTIC', 'REVERSE_CHARGE', 'EC_SALES', 'OSS'])
 const isSales = (usedFor: string): boolean => usedFor === 'SALES' || usedFor === 'BOTH'
 
 function exact(text: string | null): Decimal | null {
@@ -109,30 +108,6 @@ export function imsPercent(rate: TaxRateRow, components: readonly TaxComponentRa
 const xeroPercent = (row: NormalisedXeroTaxRate): Decimal | null => exact(row.effectiveRate ?? row.displayTaxRate)
 /** The tax class as Woo states it: empty is the standard class; case and surrounding spaces do not count. */
 export const normaliseClass = (value: string | null): string => { const slug = (value ?? '').trim().toLowerCase(); return slug === '' ? 'standard' : slug }
-
-/** A region token as one comparable string: upper case, letters and digits only, the leading country code dropped ("PT-30" and "30" are both "30"). */
-export function regionToken(text: string, country: string): string {
-  const token = text.toUpperCase().replace(/[^A-Z0-9]/g, '')
-  return country !== '' && token.startsWith(country) && token.length > country.length ? token.slice(country.length) : token
-}
-const GENERIC_NAME_WORDS: ReadonlySet<string> = new Set(['VAT', 'TAX', 'GST', 'ZERO', 'STANDARD', 'REDUCED', 'RATE', 'OSS', 'IOSS', 'VOEC', 'EXEMPT'])
-/**
- * The region a rate NAME states, one parser for IMS and Xero names: the token after a two-letter country prefix joined by a hyphen ("PT-30 VAT" is "30").
- *   region    a hyphenated region token ("PT-30 VAT")
- *   wide      the prefix is followed by a generic word or nothing ("PT VAT", "GB VAT (Income)", "UK Standard Rate (20%)"), or there is no country prefix: no region is stated
- *   unreadable  the prefix is followed by a word that is not generic ("ES Canary VAT", "PT Madeira VAT"): a region may be stated in a convention this parser does not read
- */
-export type NameRegion = { kind: 'region'; token: string } | { kind: 'wide' } | { kind: 'unreadable' }
-export function nameRegion(name: string, country: string): NameRegion {
-  const text = name.trim()
-  const hyphen = /^[A-Za-z]{2}-([A-Za-z0-9]+)/.exec(text)
-  if (hyphen !== null && !GENERIC_NAME_WORDS.has(hyphen[1]!.toUpperCase())) return { kind: 'region', token: regionToken(hyphen[1]!, country) }
-  const word = /^[A-Za-z]{2}[\s-]+([A-Za-z]+)/.exec(text)
-  if (word !== null && !GENERIC_NAME_WORDS.has(word[1]!.toUpperCase())) return { kind: 'unreadable' }
-  return { kind: 'wide' }
-}
-/** A rate name as the re-key compares it: trimmed, whitespace runs collapsed, case ignored. */
-export const comparableName = (name: string): string => name.trim().replace(/\s+/g, ' ').toLowerCase()
 
 /** The region an IMS rate records in its name; null when it states none. IMS has no region field. */
 function imsRegion(name: string, country: string): string | null {
@@ -197,10 +172,10 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
     const liveNameRegion = nameRegion(live.name, country)
     if (imsNameRegion.kind === 'unreadable' || liveNameRegion.kind === 'unreadable') reasons.add('XERO_REGION_UNVERIFIED')
     else if ((imsNameRegion.kind === 'region' ? imsNameRegion.token : null) !== (liveNameRegion.kind === 'region' ? liveNameRegion.token : null)) reasons.add('XERO_REGION_DIFFERS')
-    const category = (rate.reportingCategory ?? '').trim().toUpperCase().replace(/[\s-]+/g, '_')
+    const reportInput = { reportingCategory: rate.reportingCategory, usedFor: rate.usedFor, name: rate.name, rate: Number(rate.rate) }
     const liveReport = live.reportTaxType === null ? null : live.reportTaxType.trim().toUpperCase()
-    if ((category !== '' && !KNOWN_CATEGORIES.has(category)) || liveReport === null) reasons.add('REPORT_TYPE_UNKNOWN')
-    else if (liveReport !== xeroReportTaxType({ reportingCategory: rate.reportingCategory, usedFor: rate.usedFor, name: rate.name, rate: Number(rate.rate) })) reasons.add('REPORT_TYPE_DIFFERS')
+    if (!reportTaxTypeDecidable(reportInput) || liveReport === null) reasons.add('REPORT_TYPE_UNKNOWN')
+    else if (liveReport !== xeroReportTaxType(reportInput)) reasons.add('REPORT_TYPE_DIFFERS')
   }
 
   for (const woo of input.woo) {

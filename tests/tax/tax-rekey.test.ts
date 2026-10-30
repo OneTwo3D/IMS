@@ -4,7 +4,7 @@ import test from 'node:test'
 import { digestTaxRateList, type NormalisedXeroTaxRate } from '@/lib/connectors/xero/tax-rate-list'
 import { DRIFT_MAX_STALENESS_MS } from '@/lib/domain/accounting/tax-rate-drift-status'
 import {
-  REKEY_OUTCOMES, applyRefusal, digestRekeyPlan, imsMeaningDifference, pickXeroHoldEnv, xeroHoldState, matchRekeyRates, projectRatesAfterRekey, readRekeyPlan, runTaxRekey, xeroNameCountry,
+  REKEY_OUTCOMES, applyRefusal, digestRekeyPlan, imsMeaningDifference, pickXeroHoldEnv, xeroHoldState, matchRekeyRates, projectRatesAfterRekey, readRekeyPlan, rekeyRegionDifference, runTaxRekey, xeroNameCountry,
   type RekeyImsRate, type RekeyPlan, type RekeyReferences,
 } from '@/lib/tax/tax-rekey'
 import { TAX_REKEY_EXIT_CODES, parseTaxRekeyArgs, renderTaxRekeyText, taxRekeyExitCode } from '@/lib/tax/tax-rekey-cli'
@@ -264,6 +264,70 @@ test('REPORT TYPE: the live type must file to the VAT-return box IMS assigns the
   // The digest binds it.
   const base = planOf()
   assert.notEqual(digestRekeyPlan({ ...base, rows: base.rows.map((r) => r.imsRateId === 'cy' ? { ...r, reportType: { expected: 'MOSSSALES', live: 'OUTPUT' } } : r) }), base.digest)
+})
+
+// [mutation: IOSS or VOEC dropped from the helper's decidable set -> the REKEY arms fail; mutation: decidable whatever the helper says -> the UNKNOWN arms fail; the same set serves R13]
+test('REPORT TYPE: an IOSS or VOEC rate re-keys where the helper files it under MOSSSALES (an EU or Norway sales rate), is REPORT_TYPE_DIFFERS against another box, and stays UNKNOWN where the helper would only guess', () => {
+  const at = (rate: RekeyImsRate, live: NormalisedXeroTaxRate) => outcomeOf([rate], [live], rate.id)
+  const ioss = ims('x', 'AT IOSS VAT', 'TAX005', '0.2000', { reportingCategory: 'IOSS' })
+  assert.deepEqual([at(ioss, xeroRow('TAX126', 'AT IOSS VAT', '20')).outcome, at(ioss, xeroRow('TAX126', 'AT IOSS VAT', '20')).reportType], ['REKEY', { expected: 'MOSSSALES', live: 'MOSSSALES' }])
+  assert.equal(at({ ...ioss, reportingCategory: ' ioss ' }, xeroRow('TAX126', 'AT IOSS VAT', '20')).outcome, 'REKEY', 'normalised like the helper does')
+  const wrong = at(ioss, xeroRow('TAX126', 'AT IOSS VAT', '20', { reportTaxType: 'OUTPUT' }))
+  assert.deepEqual([wrong.outcome, wrong.reportType], ['REPORT_TYPE_DIFFERS', { expected: 'MOSSSALES', live: 'OUTPUT' }])
+  assert.equal(at(ioss, xeroRow('TAX126', 'AT IOSS VAT', '20', { reportTaxType: null })).outcome, 'REPORT_TYPE_UNKNOWN', 'a live type with no report type is still unknown')
+  const voec = ims('x', 'NO VOEC VAT', 'TAX005', '0.2500', { reportingCategory: 'VOEC', countryCode: 'NO' })
+  assert.equal(at(voec, xeroRow('TAX127', 'NO VOEC VAT', '25')).outcome, 'REKEY')
+  // Undecidable: no EU / Norway name prefix (the helper would give OUTPUT), or a purchase-only marker (INPUT).
+  const guess = at(ims('x', 'GB IOSS VAT', 'TAX005', '0.2000', { reportingCategory: 'IOSS', countryCode: 'GB' }), xeroRow('TAX126', 'GB IOSS VAT', '20'))
+  assert.deepEqual([guess.outcome, guess.reportType.expected], ['REPORT_TYPE_UNKNOWN', 'OUTPUT'])
+  assert.equal(at({ ...voec, name: 'GB VOEC VAT', countryCode: 'GB' }, xeroRow('TAX127', 'GB VOEC VAT', '25')).outcome, 'REPORT_TYPE_UNKNOWN')
+  assert.equal(at({ ...ioss, usedFor: 'PURCHASE' }, xeroRow('TAX126', 'AT IOSS VAT', '20', { canApply: { assets: false, equity: false, expenses: true, liabilities: false, revenue: false } })).outcome, 'REPORT_TYPE_UNKNOWN')
+  assert.equal(at({ ...ioss, reportingCategory: 'IOSSX' }, xeroRow('TAX126', 'AT IOSS VAT', '20')).outcome, 'REPORT_TYPE_UNKNOWN', 'a near-miss token is not recognised')
+})
+
+// [mutation: the region check removed from the candidate filter -> the unreadable arm fails; mutation: an unreadable region treated as no region -> the same arm fails; mutation: regions compared by country only -> the direct PT-30 / PT-20 arm fails]
+test('REGION: the region the two names state must agree (PT-30 against PT-20 refuses, PT-30 against PT-30 re-keys); an unreadable region is refused; a name with no region suffix is unchanged', () => {
+  // The decision itself, on every pair (the name tiers make a differing readable region unreachable through the matcher today).
+  assert.equal(rekeyRegionDifference('PT-30 VAT', 'PT-30 VAT', 'PT'), null)
+  assert.equal(rekeyRegionDifference('PT-30 VAT', 'pt-30 vat', 'PT'), null, 'case does not count')
+  assert.match(rekeyRegionDifference('PT-30 VAT', 'PT-20 VAT', 'PT')!, /regions differ.*30.*20/)
+  assert.match(rekeyRegionDifference('PT-30 VAT', 'PT VAT', 'PT')!, /regions differ/, 'regional against country-wide')
+  assert.match(rekeyRegionDifference('PT VAT', 'PT-30 VAT', 'PT')!, /regions differ/, 'country-wide against regional')
+  assert.match(rekeyRegionDifference('PT Madeira VAT', 'PT Madeira VAT', 'PT')!, /cannot be read/)
+  assert.match(rekeyRegionDifference('PT VAT', 'PT Madeira VAT', 'PT')!, /cannot be read/, 'unreadable on the live side only')
+  assert.match(rekeyRegionDifference('PT Madeira VAT', 'PT VAT', 'PT')!, /cannot be read/, 'unreadable on the IMS side only')
+  for (const plain of ['CY VAT', 'GB VAT (Income)', 'UK Standard Rate (20%)', '20% (VAT on Income)', 'Standard']) assert.equal(rekeyRegionDifference(plain, plain, 'CY'), null, plain)
+  // Through the matcher.
+  const regional = (name: string, liveName: string, countryCode: string | null = 'PT') => outcomeOf([ims('x', name, 'TAX005', '0.2200', { countryCode })], [xeroRow('TAX130', liveName, '22')], 'x')
+  assert.deepEqual([regional('PT-30 VAT', 'PT-30 VAT').outcome, regional('PT-30 VAT', 'PT-30 VAT').target?.taxType], ['REKEY', 'TAX130'])
+  assert.equal(regional('PT-30 VAT', 'PT-30 VAT', null).outcome, 'REKEY', 'no IMS country code: the name prefix is the country')
+  assert.equal(regional('PT-30 VAT', 'PT-20 VAT').outcome, 'NO_MATCH', 'the name tier never offers a candidate of another region')
+  const both = outcomeOf([ims('x', 'PT-30 VAT', 'TAX005', '0.2200', { countryCode: 'PT' })], [xeroRow('TAX131', 'PT-20 VAT', '22'), xeroRow('TAX130', 'PT-30 VAT', '22')], 'x')
+  assert.deepEqual([both.outcome, both.target?.taxType], ['REKEY', 'TAX130'])
+  const unreadable = regional('PT Madeira VAT', 'PT Madeira VAT')
+  assert.deepEqual([unreadable.outcome, unreadable.target?.taxType], ['COUNTRY_DIFFERS', 'TAX130'])
+  assert.match(unreadable.reason, /region.*cannot be read/)
+  // Unchanged without a region suffix.
+  assert.equal(regional('PT VAT', 'PT VAT').outcome, 'REKEY')
+  assert.equal(outcomeOf(DEMO, LIVE, 'cy').outcome, 'REKEY')
+  // A country disagreement still reads as one.
+  assert.match(outcomeOf([ims('x', 'CY VAT', 'TAX005', '0.1900', { countryCode: 'BG' })], [xeroRow('TAX008', 'CY VAT', '19')], 'x').reason, /country statements disagree/)
+})
+
+// [mutation: the tiers trim only (no whitespace collapse) -> the double-space arm fails; mutation: the case-insensitive tier does not collapse -> the folded arm fails; mutation: the exact tier made case-insensitive -> the exact-first arm fails]
+test('the name tiers collapse internal whitespace like R13: IMS "AT IOSS VAT" matches the live "AT IOSS  VAT"; the case-sensitive tier still comes first', () => {
+  const rate = ims('at', 'AT IOSS VAT', 'TAX005', '0.2000')
+  const double = outcomeOf([rate], [xeroRow('TAX126', 'AT IOSS  VAT', '20')], 'at')
+  assert.deepEqual([double.outcome, double.matchedBy, double.target?.taxType, double.target?.name], ['REKEY', 'EXACT', 'TAX126', 'AT IOSS  VAT'], 'the plan names the live name as it is')
+  assert.equal(outcomeOf([ims('at', 'AT  IOSS VAT', 'TAX005', '0.2000')], [xeroRow('TAX126', 'AT IOSS VAT', '20')], 'at').matchedBy, 'EXACT', 'the IMS side too')
+  assert.equal(outcomeOf([rate], [xeroRow('TAX126', ' AT\tIOSS \u00a0 VAT ', '20')], 'at').matchedBy, 'EXACT', 'tabs and non-breaking spaces are whitespace')
+  const folded = outcomeOf([rate], [xeroRow('TAX126', 'at ioss   VAT', '20')], 'at')
+  assert.deepEqual([folded.outcome, folded.matchedBy], ['REKEY', 'CASE_INSENSITIVE'])
+  const exactFirst = outcomeOf([rate], [xeroRow('TAX126', 'AT IOSS  VAT', '20'), xeroRow('TAX127', 'at ioss vat', '20')], 'at')
+  assert.deepEqual([exactFirst.outcome, exactFirst.matchedBy, exactFirst.target?.taxType], ['REKEY', 'EXACT', 'TAX126'])
+  const two = outcomeOf([rate], [xeroRow('TAX126', 'AT IOSS  VAT', '20'), xeroRow('TAX127', 'AT  IOSS VAT', '20')], 'at')
+  assert.deepEqual([two.outcome, two.matchedBy], ['AMBIGUOUS', 'EXACT'])
+  assert.equal(outcomeOf([rate], [xeroRow('TAX126', 'ATIOSS VAT', '20')], 'at').outcome, 'NO_MATCH', 'a removed space is not a collapse')
 })
 
 // ---- the digest and the refusals to apply ---------------------------------------------------------------
