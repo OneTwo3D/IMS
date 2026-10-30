@@ -146,7 +146,7 @@ function FxSourceCard({ source }: { source: 'ecb' | 'aelia' }) {
         <Button variant={source === 'aelia' ? 'default' : 'outline'} size="sm" disabled={isPending} onClick={() => choose('aelia')}>Aelia</Button>
         {isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
       </div>
-      {error && <p className="text-xs text-destructive">{error}</p>}
+      {error && <p role="alert" className="text-xs text-destructive whitespace-pre-line">{error}</p>}
     </div>
   )
 }

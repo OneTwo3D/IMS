@@ -1,5 +1,6 @@
 'use server'
 
+import { AELIA_CUTOVER_READ_BOUND_MS, AELIA_CUTOVER_TX_TIMEOUT_MS, FxCutoverRefusedError, readWithin } from '@/lib/currencies/aelia-cutover'
 import { withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
@@ -451,8 +452,8 @@ export async function getFxRateSourceSetting(): Promise<FxRateSource> {
 }
 
 /**
- * Choose the source of the exchange rates. 'aelia' needs the WooCommerce store configured (its address and the shared secret) AND the onetwoInventory Helper plugin 1.3.0 or later deployed on it:
- * the plugin is deployed by the owner, and nothing here installs it. If it is not there the first scheduled read fails visibly (health warning, admin notification) and the existing rates stay in use.
+ * Choose the source of the exchange rates. 'aelia' needs the WooCommerce store configured (its address and the shared secret) AND the onetwoInventory Helper plugin 1.3.0 or later deployed on it
+ * (deployed by the owner; nothing here installs it). The switch READS Aelia first and commits only on a complete rate set, otherwise it is refused with the reason and the source stays ECB.
  */
 export async function setFxRateSource(source: string): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
@@ -466,13 +467,72 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
   }
   // THE CUTOVER BARRIER. The source and the instant of the change are written together under the EXCLUSIVE FX table lock: a rate push (which holds the lock shared from its source check through its POST) and a
   // CSV import finish first, and every ECB refresh write re-reads the source inside this same lock. So once this commits no ECB row and no rate POST can follow it.
-  const switchedAt = new Date()
-  const changed = await withFxTableWriteLock(async (tx) => {
-    if ((await getFxRateSourceInTx(tx)) === source) return false
-    await tx.setting.upsert({ where: { key: FX_RATE_SOURCE_SETTING }, create: { key: FX_RATE_SOURCE_SETTING, value: source }, update: { value: source } })
-    await tx.setting.upsert({ where: { key: FX_RATE_SOURCE_SINCE_SETTING }, create: { key: FX_RATE_SOURCE_SINCE_SETTING, value: switchedAt.toISOString() }, update: { value: switchedAt.toISOString() } })
-    return true
-  })
+  //
+  // SWITCHING TO AELIA READS FIRST. Inside that same lock (so there is no window between the read and the switch) the helper plugin is read ONCE and the answer is ingested into fx_rates; the switch commits
+  // only if the set is COMPLETE: every IMS-enabled foreign currency has a valid pre-markup rate from this read (stored now, already stored, or pinned by a manual override). Otherwise the transaction is
+  // rolled back (no row, no setting: the source stays as it was) and the refusal names what is missing. Without this a first cutover, with no Aelia rows yet, would refuse every foreign-currency lookup
+  // until a scheduled read succeeded. Switching back to ECB needs no read.
+  //
+  // HOW LONG THE LOCK IS HELD. The read is bounded by AELIA_CUTOVER_READ_BOUND_MS (20 s, a hard race around the 15 s transport timeout, so a stalled body read cannot hold it either); the ingest is local
+  // database work on a handful of rows; the transaction itself is capped at AELIA_CUTOVER_TX_TIMEOUT_MS (45 s), after which it is rolled back and the lock released. So the exclusive lock is held at most about
+  // 45 s, normally under 1 s for an answering store, and rate pushes, CSV imports and refreshes wait that long at worst (their own waits are 30 s / 60 s).
+  let switchedAt = new Date()
+  let changed: boolean
+  let aeliaResult: Awaited<ReturnType<typeof import('@/lib/currencies/aelia-ingest').ingestAeliaRatesInTx>> | null = null
+  try {
+    changed = await withFxTableWriteLock(async (tx) => {
+      if ((await getFxRateSourceInTx(tx)) === source) return false
+      if (source === 'aelia') {
+        const [{ readAeliaRatesFromWc }, { ingestAeliaRatesInTx, AeliaRefusedError }] = await Promise.all([
+          import('@/lib/connectors/woocommerce/aelia-rates'),
+          import('@/lib/currencies/aelia-ingest'),
+        ])
+        const read = await readWithin(AELIA_CUTOVER_READ_BOUND_MS, () => readAeliaRatesFromWc())
+        switchedAt = new Date() // the cutover instant is taken AFTER the read (which may have taken seconds), so an Aelia update that landed meanwhile is not 'in the future'
+        if (!read.ok) throw new FxCutoverRefusedError(`Aelia's rates could not be read, so the source was not changed (it is still ECB): ${read.message}`)
+        let result: Awaited<ReturnType<typeof ingestAeliaRatesInTx>>
+        try {
+          result = await ingestAeliaRatesInTx(tx, read.body, { now: switchedAt })
+        } catch (e) {
+          if (e instanceof AeliaRefusedError) throw new FxCutoverRefusedError(`Aelia's answer was refused (${e.reason}), so the source was not changed (it is still ECB): ${e.message}`)
+          throw e
+        }
+        if (result.missing.length) {
+          const why = result.missing.map((code) => {
+            const r = result.refused.find((x) => x.currency === code)
+            return r ? `${code} (${r.reason})` : code
+          })
+          throw new FxCutoverRefusedError(`Aelia did not give a usable rate for ${result.missing.join(', ')}, so the source was not changed (it is still ECB and nothing was stored): ${why.join(', ')}. Add the currency in the store's currency switcher, or switch the currency off in IMS, then try again.`)
+        }
+        // A store clock AHEAD of IMS's: the rows would be dated after the cutover instant, and every lookup at that instant excludes them. Refused outright.
+        if (result.updatedAt.getTime() > switchedAt.getTime()) {
+          const ahead = Math.ceil((result.updatedAt.getTime() - switchedAt.getTime()) / 1000)
+          throw new FxCutoverRefusedError(`Aelia's last-update time (${result.updatedAt.toISOString()}) is later than now, so the store clock is ahead by ${ahead} s; the source was not changed (it is still ECB and nothing was stored). Correct the store's clock, or wait until Aelia's next update is in the past, then try again.`)
+        }
+        aeliaResult = result
+      }
+      await tx.setting.upsert({ where: { key: FX_RATE_SOURCE_SETTING }, create: { key: FX_RATE_SOURCE_SETTING, value: source }, update: { value: source } })
+      await tx.setting.upsert({ where: { key: FX_RATE_SOURCE_SINCE_SETTING }, create: { key: FX_RATE_SOURCE_SINCE_SETTING, value: switchedAt.toISOString() }, update: { value: switchedAt.toISOString() } })
+      if (source === 'aelia' && aeliaResult) {
+        // THE AUTHORITY: with the new source and instant written in this transaction, run the ACTUAL lookup (the one every document and report uses, under the new regime) for every active foreign
+        // currency AT the cutover instant. Each must resolve to an Aelia row or a manual override, else the whole transaction rolls back. This is the real rule, not a model of it.
+        const [{ resolveFxRatesToBase }, { getBaseCurrencyCode }] = await Promise.all([import('@/lib/currencies/fx-lookup'), import('@/lib/base-currency')])
+        const baseCode = await getBaseCurrencyCode()
+        const activeForeign = (await tx.currency.findMany({ where: { active: true }, select: { code: true } })).map((c) => c.code).filter((code) => code !== baseCode)
+        const outcomes = await resolveFxRatesToBase(tx, { currencies: activeForeign, asOf: switchedAt, baseCurrency: baseCode })
+        const failures = [...outcomes].flatMap(([code, o]) => (o.ok ? [] : [`${code} (${o.error.reason})`]))
+        if (failures.length) {
+          throw new FxCutoverRefusedError(`After the switch these currencies would not resolve to an Aelia rate or a manual override: ${failures.join(', ')}; the source was not changed (it is still ECB and nothing was stored).`)
+        }
+        await tx.setting.upsert({ where: { key: 'fx_aelia_last_update_at' }, create: { key: 'fx_aelia_last_update_at', value: aeliaResult.updatedAt.toISOString() }, update: { value: aeliaResult.updatedAt.toISOString() } })
+        await tx.setting.upsert({ where: { key: 'fx_aelia_last_read_at' }, create: { key: 'fx_aelia_last_read_at', value: switchedAt.toISOString() }, update: { value: switchedAt.toISOString() } })
+      }
+      return true
+    }, { timeout: AELIA_CUTOVER_TX_TIMEOUT_MS })
+  } catch (e) {
+    if (e instanceof FxCutoverRefusedError) return { success: false, error: e.message }
+    throw e
+  }
   if (!changed) return { success: true }
   await logActivity({
     entityType: 'SETTING',

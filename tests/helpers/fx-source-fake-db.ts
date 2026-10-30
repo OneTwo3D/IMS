@@ -21,13 +21,17 @@ export function createFxSourceFakeDb(seed: { currencies?: Array<{ code: string; 
   const matchRate = (row: FakeFxRateRow, where: Record<string, unknown> | undefined): boolean => {
     if (!where) return true
     for (const [key, cond] of Object.entries(where)) {
+      if (key === 'AND') { if (!(cond as Array<Record<string, unknown>>).every((w) => matchRate(row, w))) return false; continue }
+      if (key === 'OR') { if (!(cond as Array<Record<string, unknown>>).some((w) => matchRate(row, w))) return false; continue }
       const value = (row as Record<string, unknown>)[key]
-      if (cond && typeof cond === 'object' && !(cond instanceof Date)) {
-        const c = cond as { in?: unknown[]; not?: unknown }
+      if (cond instanceof Date) {
+        if (!(value instanceof Date) || value.getTime() !== cond.getTime()) return false
+      } else if (cond && typeof cond === 'object') {
+        const c = cond as { in?: unknown[]; not?: unknown; lte?: Date; gte?: Date }
         if (c.in && !c.in.includes(value)) return false
         if ('not' in c && value === c.not) return false
-      } else if (cond instanceof Date) {
-        if (!(value instanceof Date) || value.getTime() !== cond.getTime()) return false
+        if (c.lte && !((value as Date).getTime() <= c.lte.getTime())) return false
+        if (c.gte && !((value as Date).getTime() >= c.gte.getTime())) return false
       } else if (value !== cond) return false
     }
     return true
@@ -40,6 +44,15 @@ export function createFxSourceFakeDb(seed: { currencies?: Array<{ code: string; 
       if (!args.distinct) return matched
       const seen = new Set<string>()
       return matched.filter((r) => (seen.has(r.toCurrency) ? false : (seen.add(r.toCurrency), true)))
+    },
+    groupBy: async (args: { by: string[]; where?: Record<string, unknown> }) => {
+      events.push('fxRate.groupBy')
+      const groups = new Map<string, Date>()
+      for (const r of rates.filter((x) => matchRate(x, args.where))) {
+        const cur = groups.get(r.toCurrency)
+        if (!cur || r.fetchedAt.getTime() > cur.getTime()) groups.set(r.toCurrency, r.fetchedAt)
+      }
+      return [...groups].map(([toCurrency, fetchedAt]) => ({ toCurrency, _max: { fetchedAt } }))
     },
     findFirst: async (args: { where?: Record<string, unknown> } = {}) => {
       events.push('fxRate.findFirst')
@@ -72,6 +85,7 @@ export function createFxSourceFakeDb(seed: { currencies?: Array<{ code: string; 
 
   const tx = {
     $executeRaw: async () => { events.push('lock'); return 1 },
+    currency: { findMany: async (args: { where?: { active?: boolean } } = {}) => currencies.filter((c) => args.where?.active === undefined || c.active === args.where.active).map((c) => ({ ...c })) },
     fxRate,
     setting,
   }
@@ -94,10 +108,21 @@ export function createFxSourceFakeDb(seed: { currencies?: Array<{ code: string; 
       }
       return [...latest.values()].map((r) => ({ toCurrency: r.toCurrency, manualOverride: r.manualOverride }))
     },
-    $transaction: async <T,>(work: (t: typeof tx) => Promise<T>) => {
+    $transaction: async <T,>(work: (t: typeof tx) => Promise<T>, _options?: unknown) => {
       events.push('tx.begin')
       inTx = true
-      try { return await work(tx) } finally { inTx = false; events.push('tx.end') }
+      // A throw rolls the transaction back, as the real one does: rows and settings return to what they were at the start.
+      const ratesBefore = [...rates]
+      const settingsBefore = new Map(settings)
+      try {
+        return await work(tx)
+      } catch (error) {
+        rates.splice(0, rates.length, ...ratesBefore)
+        settings.clear()
+        for (const [k, v] of settingsBefore) settings.set(k, v)
+        events.push('tx.rollback')
+        throw error
+      } finally { inTx = false; events.push('tx.end') }
     },
   }
 
