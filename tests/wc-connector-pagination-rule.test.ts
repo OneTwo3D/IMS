@@ -69,6 +69,8 @@ const mockDb = {
   },
   // The mapping write is one INSERT ... ON CONFLICT statement (lib/tax/storefront-mapping-write.ts); it answers whether it created the row.
   $queryRaw: async () => [{ created: true }] as Row[],
+  // ...after taking the shared apply lock (lockStorefrontMappingWrites).
+  $executeRaw: async () => 0,
   $transaction: async <T,>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(mockDb),
 }
 

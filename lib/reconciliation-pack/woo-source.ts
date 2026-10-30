@@ -45,8 +45,7 @@ export type WooPage =
   | { ok: false }
 
 export interface WooGetPort {
-  /** `resourceId` reads ONE row of the `taxes` collection (GET taxes/{id}); the transport refuses it for any other collection and for anything but a whole-number id. */
-  get(collection: WooCollection, params: Readonly<Record<string, string>>, resourceId?: string): Promise<WooPage>
+  get(collection: WooCollection, params: Readonly<Record<string, string>>): Promise<WooPage>
 }
 
 export type WooOrderRow = { id: string; status: string; currency: string; total: string; createdAt: string | null }
@@ -385,22 +384,6 @@ export async function readWooTaxRateDetails(port: WooGetPort, options: WooSource
     return { ok: true, value: { rates: walk.rows, total: walk.total } }
   } catch (error) {
     return { ok: false, reason: reasonOf(error) }
-  }
-}
-
-/**
- * ONE tax rate, read again by its id (GET taxes/{id}) through the same GET-only port, with the same field validation as the walk. A store that answers "no such rate" is not distinguished from
- * any other failure: any non-200 answer, and any body that is not that one rate, is `ok: false` (the caller stops rather than guesses).
- */
-export async function readWooTaxRateById(port: WooGetPort, id: string): Promise<{ ok: true; rate: WooTaxRateDetail } | { ok: false }> {
-  try {
-    if (!ID_RE.test(id)) return { ok: false }
-    const response = await port.get('taxes', { _fields: TAX_DETAIL_FIELDS }, id)
-    if (typeof response !== 'object' || response === null || response.ok !== true || response.status !== 200) return { ok: false }
-    const rate = parseTaxRateDetail(response.body)
-    return rate.id === id ? { ok: true, rate } : { ok: false }
-  } catch {
-    return { ok: false }
   }
 }
 

@@ -226,24 +226,3 @@ test('the storefront credentials: three settings rows in a READ ONLY transaction
     if (previous === undefined) delete process.env.SETTINGS_ENCRYPTION_KEY; else process.env.SETTINGS_ENCRYPTION_KEY = previous
   }
 })
-
-test('ONE tax rate by id: GET taxes/{id} only, for a whole-number id, never for another collection; anything else is refused before a request', async () => {
-  const sent: string[] = []
-  const rate = { id: 7, name: 'GB VAT', rate: '20.0000', country: 'GB', state: '', postcode: '', city: '', class: 'standard', shipping: true, compound: false }
-  const fetchImpl = (async (url: URL) => { sent.push(url.href); return new Response(JSON.stringify(rate), { status: 200, headers: { 'content-type': 'application/json' } }) }) as never
-  const port = createWooGetPort({ readCredentials: async () => ({ baseUrl: 'http://127.0.0.1:1', key: KEY, secret: SECRET }), env: E2E, fetchImpl })
-  const { readWooTaxRateById } = await import('../../lib/reconciliation-pack/woo-source.ts')
-  assert.deepEqual(await readWooTaxRateById(port, '7'), { ok: true, rate: { ...rate, id: '7' } })
-  assert.deepEqual(sent.map((u) => new URL(u).pathname), ['/wp-json/wc/v3/taxes/7'])
-  // another id in the body, or a malformed id, is not that rate
-  assert.deepEqual(await readWooTaxRateById(port, '8'), { ok: false })
-  for (const id of ['', '0', '07', '7/../orders', '7?x=1', '-1', 'abc']) assert.deepEqual(await readWooTaxRateById(port, id), { ok: false }, id)
-  assert.equal((await port.get('orders', {}, '7')).ok, false, 'a by-id read of another collection is refused')
-  assert.equal((await port.get('taxes', {}, '7/x')).ok, false)
-  assert.equal(sent.length, 2, 'only the two well-formed by-id reads of taxes reached the fetch seam')
-  // the hop gate: taxes/{id} passes, nothing else under it does
-  const base = new URL('http://s.example')
-  const hop = (path: string) => wooHopRefusal(base, { method: 'GET', url: new URL(`http://s.example${path}`), redirectCount: 0 })
-  assert.equal(hop('/wp-json/wc/v3/taxes/12'), null)
-  for (const path of ['/wp-json/wc/v3/taxes/012', '/wp-json/wc/v3/taxes/12/x', '/wp-json/wc/v3/orders/12', '/wp-json/wc/v3/taxes/batch', '/wp-json/wc/v3/taxes/-1']) assert.equal(hop(path), 'path', path)
-})

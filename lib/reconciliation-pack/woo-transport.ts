@@ -42,10 +42,7 @@ export function wooHopRefusal(base: URL, hop: { method: string; url: URL; redire
   if (hop.url.origin !== base.origin || hop.url.username || hop.url.password || hop.url.hash) return 'origin'
   const prefix = `${base.pathname.replace(/\/+$/, '')}/wp-json/wc/v3/`
   if (!hop.url.pathname.startsWith(prefix)) return 'path'
-  const rest = hop.url.pathname.slice(prefix.length)
-  // `taxes/{id}` reads one rate; no other collection has a by-id read here.
-  const byId = /^taxes\/[1-9][0-9]{0,17}$/.test(rest)
-  const collection = byId ? 'taxes' : rest
+  const collection = hop.url.pathname.slice(prefix.length)
   if (!(WOO_READ_COLLECTIONS as readonly string[]).includes(collection)) return 'path'
   const seen = new Set<string>()
   for (const [name, value] of hop.url.searchParams) {
@@ -59,15 +56,14 @@ export function createWooGetPort(deps: WooTransportDeps): WooGetPort {
   const send = deps.fetchImpl ?? connectorFetch
   let credentials: Promise<WooCredentials | null> | null = null
   return {
-    async get(collection: WooCollection, params: Readonly<Record<string, string>>, resourceId?: string): Promise<WooPage> {
+    async get(collection: WooCollection, params: Readonly<Record<string, string>>): Promise<WooPage> {
       try {
         if (!(WOO_READ_COLLECTIONS as readonly string[]).includes(collection)) return { ok: false }
-        if (resourceId !== undefined && (collection !== 'taxes' || !/^[1-9][0-9]{0,17}$/.test(resourceId))) return { ok: false }
         credentials ??= deps.readCredentials().catch(() => null)
         const creds = await credentials
         if (creds === null) return { ok: false }
         const base = new URL(creds.baseUrl)
-        const url = new URL(`${creds.baseUrl.replace(/\/+$/, '')}/wp-json/wc/v3/${collection}${resourceId === undefined ? '' : `/${resourceId}`}`)
+        const url = new URL(`${creds.baseUrl.replace(/\/+$/, '')}/wp-json/wc/v3/${collection}`)
         for (const [name, value] of Object.entries(params)) url.searchParams.set(name, value)
         const auth = Buffer.from(`${creds.key}:${creds.secret}`).toString('base64')
         const response = await send(url, {

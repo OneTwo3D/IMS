@@ -8,7 +8,7 @@
  */
 
 import { createWooGetPort, type WooTransportDeps } from '@/lib/reconciliation-pack/woo-transport'
-import { readWooTaxRateById, readWooTaxRateDetails } from '@/lib/reconciliation-pack/woo-source'
+import { readWooTaxRateDetails } from '@/lib/reconciliation-pack/woo-source'
 import type { ConnectorCredentials } from '../types'
 import { normaliseStoreIdentity } from './tax-rate-plan'
 import { createWooTaxRateWritePort } from './tax-rate-port'
@@ -31,7 +31,12 @@ export function createWooTaxWriterDeps(input: WooTaxSessionInput): WooTaxWriterD
   const port = createWooGetPort({ ...input.transport, readCredentials: async () => (pinned === null ? null : { baseUrl: pinned.url, key: pinned.key, secret: pinned.secret }) })
   return {
     readWoo: async () => { const read = await readWooTaxRateDetails(port); return read.ok ? { ok: true as const, rates: read.value.rates } : { ok: false as const } },
-    readWooRate: (wooId) => readWooTaxRateById(port, wooId),
+    // One rate, re-read through the same proven GET-only walk (the transport has no by-id read, on purpose: its guard allows the three collections and nothing under them).
+    readWooRate: async (wooId) => {
+      const read = await readWooTaxRateDetails(port)
+      const rate = read.ok ? read.value.rates.find((r) => r.id === wooId) : undefined
+      return rate === undefined ? { ok: false as const } : { ok: true as const, rate }
+    },
     storeIdentity: async () => identityOf(pinned),
     configuredStoreIdentity: async () => identityOf(await input.configured()),
     // `null` is passed through as given: a run with no usable credentials sends nothing, it does not fall back to reloading them.

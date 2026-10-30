@@ -64,7 +64,7 @@ export type WooTaxWriterDeps = {
   storeIdentity: () => Promise<string | null>
   /** Required by an apply: the normalised URL of the store configured RIGHT NOW (the settings read again). Differing from `storeIdentity` refuses the apply and stops a running one. */
   configuredStoreIdentity?: () => Promise<string | null>
-  /** Required by an apply: ONE store rate read again (GET only, the pinned credentials), checked immediately before each UPDATE or DELETE is sent. */
+  /** Required by an apply: ONE store rate read again (GET only, the pinned credentials: the proven walk, then that rate), checked immediately before each UPDATE or DELETE is sent. */
   readWooRate?: (wooId: string) => Promise<{ ok: true; rate: WooTaxRateDetail } | { ok: false }>
   /** Required by an apply. */
   port?: WooTaxRateWritePort

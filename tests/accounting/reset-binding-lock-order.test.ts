@@ -83,15 +83,21 @@ const model = (name: string) => ({
   upsert: async () => ({}),
 })
 
+/** Nested transactions (the mapping delete takes the shared apply lock in one of its own) must not end the outer one: only the outermost sets the flag. */
+let depth = 0
 const client: Record<string, unknown> = new Proxy({}, {
   get(_target, prop: string) {
+    // The shared lock of the WooCommerce tax-rate apply (lockStorefrontMappingWrites): a statement, not a row acquisition.
+    if (prop === '$executeRaw') return async () => 0
     if (prop === '$transaction') {
       return async (fn: (tx: unknown) => Promise<unknown>) => {
+        depth += 1
         state.inTransaction = true
         try {
           return await fn(client)
         } finally {
-          state.inTransaction = false
+          depth -= 1
+          if (depth === 0) state.inTransaction = false
         }
       }
     }

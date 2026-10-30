@@ -26,7 +26,7 @@ function fetchSpy(seen: Fetched[]) {
   return (async (url: URL | string, init?: RequestInit) => {
     const u = new URL(String(url))
     seen.push({ url: u.href, method: init?.method, authorization: (init?.headers as Record<string, string> | undefined)?.Authorization })
-    const body = /\/taxes\/5$/.test(u.pathname) ? RATE : Number(u.searchParams.get('page')) === 1 ? [RATE] : []
+    const body = Number(u.searchParams.get('page')) === 1 ? [RATE] : []
     return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json', 'x-wp-total': '1', 'x-wp-totalpages': '1' } })
   }) as never
 }
@@ -55,7 +55,8 @@ test('the GET reads and the write port use the pinned credentials, whatever the 
     assert.ok(s.url.startsWith('https://store-a.example/'), s.url)
     assert.equal(s.authorization, authA)
   }
-  assert.ok(seen.some((s) => /\/wp-json\/wc\/v3\/taxes\/5\?/.test(s.url)), 'the single-rate re-read is GET taxes/5')
+  assert.ok(seen.every((s) => /\/wp-json\/wc\/v3\/taxes\?/.test(s.url)), 'every read, the single-rate re-read included, is a GET of the taxes collection (the guard allows nothing under it)')
+  assert.deepEqual(await deps.readWooRate!('6'), { ok: false }, 'a rate the walk does not list is not a rate')
   assert.equal(writes.length, 3)
   for (const w of writes) assert.strictEqual(w.creds, A, `${w.fn} ${w.path} was handed the pinned credential object`)
   assert.equal(await deps.configuredStoreIdentity!(), 'https://store-b.example', 'the live settings are read only for the comparison')
