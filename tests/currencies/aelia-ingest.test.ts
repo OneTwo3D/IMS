@@ -25,7 +25,8 @@ const AELIA_TIME = new Date('2026-10-23T23:36:05Z')
 const NOW = new Date('2026-10-24T08:00:00Z')
 
 function reset(seed: Parameters<typeof createFxSourceFakeDb>[0] = {}) {
-  fake = createFxSourceFakeDb({ currencies: ACTIVE, ...seed })
+  // The regular ingest writes only while the source is Aelia (it re-checks inside the lock), so the default state of these tests is the Aelia source.
+  fake = createFxSourceFakeDb({ currencies: ACTIVE, ...seed, settings: { fx_rate_source: 'aelia', fx_rate_source_since: '2026-10-20T00:00:00.000Z', ...(seed.settings ?? {}) } })
 }
 const rowOf = (code: string) => fake.rates.filter((r) => r.toCurrency === code)
 const withRates = (rates: unknown[], more: Record<string, unknown> = {}) => aeliaAnswer({ rates, ...more })
@@ -276,4 +277,103 @@ test('MARKUP RULE: a non-base currency with no markup is stored at its rate with
   reset()
   const again = await ingestAeliaRates(noKey, { now: new Date('2026-10-29T12:00:00Z') })
   assert.deepEqual(again.markups, { EUR: null, USD: null, NOK: null })
+})
+
+// ------------------------------------------------------------------ cutover hardening: pins, regression, the source re-check
+
+const aeliaRow = (to: string, rate: string, at: string): FakeFxRateRow => ({ fromCurrency: 'GBP', toCurrency: to, rate, fetchedAt: new Date(at), source: 'aelia', manualOverride: false })
+const pinRow = (to: string, rate: string, at = '2026-10-24T01:00:00Z'): FakeFxRateRow => ({ fromCurrency: 'GBP', toCurrency: to, rate, fetchedAt: new Date(at), source: 'manual', manualOverride: true })
+const answerWithout = (code: string) => aeliaAnswer({ rates: (aeliaAnswer().rates as Array<{ currency: string }>).filter((r) => r.currency !== code) })
+
+test('COVERAGE: a pinned currency is covered whether Aelia lists it, omits it or refuses it; an unpinned omission is missing', async () => {
+  const { ingestAeliaRates } = await load()
+  reset({ rates: [pinRow('USD', '1.4')] })
+  const omitted = await ingestAeliaRates(answerWithout('USD'), { now: NOW })
+  assert.deepEqual(omitted.missing, [])
+  assert.deepEqual(omitted.pinned, ['USD'])
+  assert.deepEqual(omitted.skippedManualOverrides, [], 'it was not in the read, so it was not skipped from it')
+  assert.deepEqual(omitted.written.sort(), ['EUR', 'NOK'])
+  assert.equal(rowOf('USD').length, 1, 'nothing stored for the pinned currency')
+
+  reset({ rates: [pinRow('USD', '1.4')] })
+  const refused = await ingestAeliaRates(withRates([{ currency: 'EUR', rate: '1.19' }, { currency: 'USD', rate: '0' }, { currency: 'NOK', rate: '12.5' }]), { now: NOW })
+  assert.deepEqual(refused.missing, [])
+  assert.deepEqual(refused.refused.map((r) => [r.currency, r.reason]), [['USD', 'non_positive_rate']])
+
+  reset({ rates: [pinRow('USD', '1.4')] })
+  const listed = await ingestAeliaRates(aeliaAnswer(), { now: NOW })
+  assert.deepEqual(listed.missing, [])
+  assert.deepEqual(listed.pinned, ['USD'])
+  assert.deepEqual(listed.skippedManualOverrides, ['USD'])
+
+  // CONTROL: without the pin the same omission is missing; an OLD pin superseded by a newer ordinary row is no pin
+  reset()
+  assert.deepEqual((await ingestAeliaRates(answerWithout('USD'), { now: NOW })).missing, ['USD'])
+  reset({ rates: [pinRow('USD', '1.4', '2026-10-01T00:00:00Z'), aeliaRow('USD', '1.3', '2026-10-10T00:00:00Z')] })
+  const superseded = await ingestAeliaRates(answerWithout('USD'), { now: NOW })
+  assert.deepEqual(superseded.pinned, [])
+  assert.deepEqual(superseded.missing, ['USD'])
+})
+
+test('REGRESSION: an update time earlier than the newest stored Aelia row of a currency is refused for it (aelia_update_regressed), nothing stored, and it is missing; equal is idempotent, later is written', async () => {
+  const { ingestAeliaRates } = await load()
+  reset({ rates: [aeliaRow('EUR', '1.1', '2026-10-01T00:00:00Z'), aeliaRow('EUR', '1.2', '2026-10-24T10:00:00Z'), aeliaRow('NOK', '12.500597', '2026-10-23T23:36:05Z'), aeliaRow('USD', '1.33', '2026-10-20T00:00:00Z')] })
+  const result = await ingestAeliaRates(aeliaAnswer(), { now: NOW }) // Aelia time 2026-10-23T23:36:05Z
+  assert.deepEqual(result.refused.map((r) => [r.currency, r.reason]), [['EUR', 'aelia_update_regressed']])
+  assert.match(result.refused[0].message, /2026-10-24T10:00:00\.000Z/)
+  assert.deepEqual(result.written, ['USD'], 'older stored row: a new rate')
+  assert.deepEqual(result.unchanged, ['NOK'], 'the same time and rate: the idempotent re-read')
+  assert.deepEqual(result.missing, ['EUR'])
+  assert.equal(rowOf('EUR').length, 2, 'nothing stored for the regressed currency (its history of two rows is untouched)')
+  // a later time than every stored row is written
+  const later = await ingestAeliaRates(aeliaAnswer({ last_update: '2026-10-24T11:00:00Z' }), { now: new Date('2026-10-24T12:00:00Z') })
+  assert.deepEqual(later.written.sort(), ['EUR', 'NOK', 'USD'])
+  assert.deepEqual(later.missing, [])
+})
+
+test('SOURCE RE-CHECK: the regular ingest writes nothing once the source is no longer Aelia (switched back, or never switched); the cutover entry point is not gated', async () => {
+  const { ingestAeliaRates, ingestAeliaRatesInTx } = await load()
+  for (const source of ['ecb', null]) {
+    reset()
+    // `reset` gives the Aelia default; override explicitly
+    if (source) fake.settings.set('fx_rate_source', source)
+    else fake.settings.delete('fx_rate_source')
+    await assert.rejects(ingestAeliaRates(aeliaAnswer(), { now: NOW }), (e: Error & { reason?: string }) => e.reason === 'source_changed')
+    assert.equal(fake.rates.length, 0, 'nothing written')
+    assert.equal(fake.events.filter((e) => e.startsWith('fxRate.create')).length, 0)
+  }
+  // the in-transaction entry point (the cutover runs it while the source is still ECB) is not gated
+  reset()
+  fake.settings.set('fx_rate_source', 'ecb')
+  const result = await fake.db.$transaction((tx) => ingestAeliaRatesInTx(tx as never, aeliaAnswer(), { now: NOW }))
+  assert.deepEqual(result.written.sort(), ['EUR', 'NOK', 'USD'])
+})
+
+test('SOURCE RE-CHECK: clearOverrideFromAelia after the switch back to ECB is refused and stores nothing', async () => {
+  const { clearOverrideFromAelia } = await load()
+  reset({ rates: [pinRow('EUR', '1.3')] })
+  fake.settings.set('fx_rate_source', 'ecb')
+  await assert.rejects(clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW }), (e: Error & { reason?: string }) => e.reason === 'source_changed')
+  assert.equal(fake.rates.length, 1, 'the pin is the only row')
+  // CONTROL: under the Aelia source the same call stores the row
+  fake.settings.set('fx_rate_source', 'aelia')
+  assert.deepEqual(await clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW }), { rate: '1.194344', markup: '0.02' })
+  assert.equal(fake.rates.length, 2)
+})
+
+test('PINS ARE JUDGED AT THE READ\'S INSTANT: a manual row dated after `now` is no pin (omitted: missing; listed: Aelia\'s row is written); a row dated at or before it is', async () => {
+  const { ingestAeliaRates } = await load()
+  const future = pinRow('USD', '1.4', '2026-10-30T00:00:00Z') // NOW is 2026-10-24T08:00
+  reset({ rates: [aeliaRow('USD', '1.2', '2026-10-01T00:00:00Z'), future] })
+  const omitted = await ingestAeliaRates(answerWithout('USD'), { now: NOW })
+  assert.deepEqual(omitted.pinned, [])
+  assert.deepEqual(omitted.missing, ['USD'])
+  reset({ rates: [aeliaRow('USD', '1.2', '2026-10-01T00:00:00Z'), future] })
+  const listed = await ingestAeliaRates(aeliaAnswer(), { now: NOW })
+  assert.deepEqual(listed.pinned, [])
+  assert.deepEqual(listed.skippedManualOverrides, [])
+  assert.ok(listed.written.includes('USD'), 'the refresh stores Aelia\'s rate for it: the future row is not in force')
+  // in force exactly at `now`
+  reset({ rates: [pinRow('USD', '1.4', NOW.toISOString())] })
+  assert.deepEqual((await ingestAeliaRates(answerWithout('USD'), { now: NOW })).pinned, ['USD'])
 })

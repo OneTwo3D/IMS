@@ -36,7 +36,12 @@ test('the Aelia ingest waits for a running import (shared lock) and then writes 
   const eurExisted = (await db.currency.findUnique({ where: { code: 'EUR' }, select: { code: true } })) !== null
   await db.currency.upsert({ where: { code: 'EUR' }, update: { active: true }, create: { code: 'EUR', name: 'EUR', symbol: 'EUR', active: true } })
   // any other active currency of the scratch database would be reported as "not listed by Aelia"; that does not matter here, only EUR is asserted
+  // the regular ingest writes only while the source is Aelia (it re-checks inside the lock)
+  const sourceBefore = await db.setting.findUnique({ where: { key: 'fx_rate_source' } })
+  await db.setting.upsert({ where: { key: 'fx_rate_source' }, create: { key: 'fx_rate_source', value: 'aelia' }, update: { value: 'aelia' } })
   t.after(async () => {
+    if (sourceBefore) await db.setting.update({ where: { key: 'fx_rate_source' }, data: { value: sourceBefore.value } })
+    else await db.setting.deleteMany({ where: { key: 'fx_rate_source' } })
     await db.fxRate.deleteMany({ where: { toCurrency: 'EUR', source: 'aelia' } })
     if (!eurExisted) await db.currency.deleteMany({ where: { code: 'EUR' } })
   })

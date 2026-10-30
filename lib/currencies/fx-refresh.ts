@@ -228,6 +228,11 @@ async function refreshFromAelia(): Promise<FxRefreshResult> {
   try {
     result = await ingestAeliaRates(read.body)
   } catch (e) {
+    if (e instanceof AeliaRefusedError && e.reason === 'source_changed') {
+      // THE OTHER HALF OF THE CUTOVER BARRIER: the source was switched back while this read was in flight; the ingest wrote nothing. Not a failure of the store, so no alert.
+      await logActivity({ entityType: 'SYNC', tag: 'sync', action: 'fx_rates_fetched', level: 'WARNING', description: `Aelia FX refresh discarded: ${e.message}` })
+      return { success: false, updated: [], failed: [], error: e.message, retryCount: 1 }
+    }
     if (e instanceof AeliaRefusedError) return fail(`${e.reason}: ${e.message}`)
     throw e
   }

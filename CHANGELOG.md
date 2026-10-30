@@ -8,6 +8,12 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Aelia cutover hardening
+
+- **Fixed: a pinned currency is covered even when Aelia omits or refuses it.** The switch to Aelia (and the coverage the ingest reports) now checks the latest manual override of every active foreign currency, not only those with a usable entry in Aelia's answer. A pinned USD that Aelia leaves out no longer rolls the switch back; the real lookup still has the final say.
+- **New: an Aelia update time earlier than the newest stored Aelia row of a currency is refused for that currency** (`aelia_update_regressed`), in the cutover and in the regular refresh, and nothing is stored for it. At the cutover that currency counts as missing. The cutover also compares what each unpinned currency resolves to (rate and time) with this read and refuses on any difference.
+- **Fixed: the Aelia ingest and the override clear re-check the source inside the write lock.** A refresh or clear that was in flight when the source went back to ECB now writes no Aelia row (a discarded refresh is logged as a warning, not reported as a failed read).
+
 ### VAT switchover fixes: IOSS and VOEC in R13 and the re-key, region and whitespace in the re-key
 
 - **Fixed: R13 and the tax re-key recognise the `IOSS` and `VOEC` reporting categories.** They were refused as `REPORT_TYPE_UNKNOWN`, so an active IOSS or VOEC sales rate always failed R13. They are now decided by the Xero rate generator (`xeroReportTaxType`): a sales rate named for an EU member state or Norway is filed under `MOSSSALES` and compared with the live type; on any other name the box would only be a guess and stays `REPORT_TYPE_UNKNOWN`. One shared check serves both.
