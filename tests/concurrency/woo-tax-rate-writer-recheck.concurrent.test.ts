@@ -242,3 +242,24 @@ test('an ADOPTION is bound to the pinned store too: if the configured store diff
     assert.equal(await w.m.db.shoppingTaxRateMapping.count({ where: { externalTaxRateId: { in: [w.woo.w1, w.woo.w2] }, storeIdentity: { not: null } } }), 0)
   })
 })
+
+test('the IMS rows cannot be read again just before a send: nothing is sent; a configured store that cannot be read at the start is a refusal', SKIP, async (t) => {
+  await buildWorld(t, modules, async (w) => {
+    const plan = (await w.m.writer.readWooTaxPlan(w.deps(LIVE))).plan!
+    // The second database transaction of the apply is the re-check's read (the first is the plan's).
+    const db = w.m.db as unknown as { $transaction: (...a: unknown[]) => Promise<unknown> }
+    const original = db.$transaction.bind(db)
+    let calls = 0
+    db.$transaction = (...a: unknown[]) => { calls += 1; if (calls === 2) return Promise.reject(new Error('the database went away')); return original(...a) }
+    try {
+      const done = await w.m.writer.applyWooTaxPlan(w.deps(LIVE), { confirm: plan.digest })
+      assert.match((done.outcome === 'DONE' ? done.stopped?.reason : '') ?? '', /^IMS_UNREADABLE/)
+      assert.deepEqual(ops(w), [])
+    } finally {
+      db.$transaction = original
+    }
+    const refused = await w.m.writer.applyWooTaxPlan({ ...w.deps(LIVE), configuredStoreIdentity: async () => { throw new Error('the settings could not be read') } }, { confirm: plan.digest })
+    assert.deepEqual(refused.outcome === 'REFUSED' ? refused.code : refused.outcome, 'STORE_CHANGED')
+    assert.deepEqual(ops(w), [])
+  })
+})

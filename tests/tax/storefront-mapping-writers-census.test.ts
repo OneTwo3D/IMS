@@ -19,7 +19,7 @@ import test from 'node:test'
  *
  * AND EVERY WRITER TAKES THE APPLY LOCK. The WooCommerce tax-rate apply holds WOO_TAX_RATE_WRITE_LOCK_KEY exclusively for its whole run and re-reads the ownership it rests on just before each
  * send; a mapping writer that does not take the same key SHARED (lockStorefrontMappingWrites, pg_advisory_xact_lock_shared) can change a row between that re-read and the send. So: a file that
- * writes the table directly must call lockStorefrontMappingWrites( (or take the shared lock in SQL, as the copy script does); a file that writes only through the helper gets it from the helper,
+ * writes the table directly must call lockStorefrontMappingWrites( (or take the shared lock in SQL, as the copy script does) at least once per place it writes; a file that writes only through the helper gets it from the helper,
  * and the helper's two entry points must call it; the stamping writer must take the lock exclusively. Reset (the factory reset deletes every row) takes it too: a row that vanishes under a
  * running apply is exactly the ownership change the re-read is there to catch, and only a coordinated delete leaves no gap between the re-read and the send.
  */
@@ -69,6 +69,16 @@ export function writesOf(text: string): Set<'create' | 'update' | 'delete'> {
   return ops
 }
 
+/** How many places in the text write the table: Prisma delegate calls and raw statements. */
+export function writeSites(text: string): number {
+  return [...text.matchAll(DELEGATE)].length + [...text.matchAll(SQL)].length
+}
+
+/** How many times the text takes the shared apply lock. */
+export function lockSites(text: string): number {
+  return [...text.matchAll(/\blockStorefrontMappingWrites\s*\(|pg_advisory_xact_lock_shared/g)].length
+}
+
 export function censusFindings(files: ReadonlyMap<string, string>, declared: Readonly<Record<string, Declaration>> = WRITERS): string[] {
   const failures: string[] = []
   const seen = new Set<string>()
@@ -80,7 +90,7 @@ export function censusFindings(files: ReadonlyMap<string, string>, declared: Rea
     const decl = declared[file]
     if (decl === undefined) { failures.push(`UNDECLARED ${file} writes shopping_tax_rate_mappings (${[...ops].join(', ') || 'through the helper'}): declare it in WRITERS with its rule, and clear the ownership stamp when it changes a row's IMS rate or identity snapshot`); continue }
     const changes = ops.has('update')
-    if (decl.rule !== 'stamps' && decl.rule !== 'impl' && ops.size > 0 && !/\blockStorefrontMappingWrites\s*\(|pg_advisory_xact_lock_shared/.test(text)) failures.push(`LOCK ${file} writes the table directly but never takes the shared apply lock (lockStorefrontMappingWrites)`)
+    if (decl.rule !== 'stamps' && decl.rule !== 'impl' && ops.size > 0 && lockSites(text) < writeSites(text)) failures.push(`LOCK ${file} writes the table directly in ${writeSites(text)} place(s) but takes the shared apply lock (lockStorefrontMappingWrites) ${lockSites(text)} time(s): every writing transaction takes it`)
     if (decl.rule === 'stamps' && !/acquirePinnedAdvisoryLockWaiting\(\s*WOO_TAX_RATE_WRITE_LOCK_KEY/.test(text)) failures.push(`LOCK ${file} stamps rows but does not take the apply lock exclusively`)
     switch (decl.rule) {
       case 'helper':
@@ -158,6 +168,8 @@ test('MUTATION: a writer that stops taking the apply lock is red, each one, and 
   for (const file of ['app/actions/wc-sync.ts', 'lib/tax/tax-rekey.ts', 'scripts/copy-tax-rates.ts', 'scripts/commerce-accounting-e2e-fixture.ts', 'app/actions/reset.ts']) {
     assert.ok(mutate(file, strip).some((f) => f.startsWith(`LOCK ${file}`)), file)
   }
+  // one of a file's two writes loses its lock while the other keeps it
+  assert.ok(mutate('scripts/commerce-accounting-e2e-fixture.ts', (t) => t.replace('    await lockStorefrontMappingWrites(tx)\n    await tx.shoppingTaxRateMapping.createMany(', '    await tx.shoppingTaxRateMapping.createMany(')).some((f) => f.startsWith('LOCK scripts/commerce-accounting-e2e-fixture.ts')))
   assert.ok(mutate('lib/tax/storefront-mapping-write.ts', (t) => t.replace('await lockStorefrontMappingWrites(tx)\n  const rows = await tx.$queryRaw<Array<{ created', 'const rows = await tx.$queryRaw<Array<{ created')).some((f) => f.includes('upsertStorefrontTaxMapping does not take')))
   assert.ok(mutate('lib/tax/storefront-mapping-write.ts', (t) => t.replace('await lockStorefrontMappingWrites(tx)\n  const rows = await tx.$queryRaw<Array<{ id', 'const rows = await tx.$queryRaw<Array<{ id')).some((f) => f.includes('repointStorefrontTaxMapping does not take')))
   assert.ok(mutate('lib/tax/storefront-mapping-write.ts', (t) => t.replace('pg_advisory_xact_lock_shared', 'pg_something_else')).some((f) => f.startsWith('LOCK the helper')))

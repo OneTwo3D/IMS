@@ -581,6 +581,15 @@ test('RECHECK DELETE of a duplicate counterpart needs the other counterpart stil
   assert.equal(recheck(input, 'delete:9', (w) => { w.mappings = w.mappings.filter((m) => m.externalTaxRateId !== '1') }), 'IMS_RATE_CHANGED')
 })
 
+test('RECHECK DELETE for an out-of-scope reason: the IMS rate back in scope refuses it even where another stamped counterpart exists', () => {
+  const input = deleteWorld()
+  const extra = woo('9', { name: 'DE VAT', country: 'DE', rate: '19.0000' })
+  input.woo = [...input.woo, extra]
+  input.mappings = [...input.mappings, mapOf(extra, 'rDE')]
+  assert.equal(recheck(input, 'delete:2'), null)
+  assert.equal(recheck(input, 'delete:2', (w) => { w.rates = w.rates.map((r) => (r.id === 'rDE' ? { ...r, active: true } : r)) }), 'IMS_RATE_CHANGED')
+})
+
 test('RECHECK CREATE: the IMS rate must still be in scope with the same desired rate, and no mapping may have appeared for it', () => {
   assert.equal(recheck(createWorld(), 'create:rFR', (w) => { w.rates = w.rates.map((r) => (r.id === 'rFR' ? { ...r, active: false } : r)) }), 'IMS_RATE_CHANGED')
   assert.equal(recheck(createWorld(), 'create:rFR', (w) => { w.rates = w.rates.map((r) => (r.id === 'rFR' ? { ...r, usedFor: 'PURCHASE' } : r)) }), 'IMS_RATE_CHANGED')

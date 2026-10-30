@@ -364,7 +364,7 @@ export function revalidateWooTaxChange(input: RevalidationInput): RevalidationFa
     if (desired === null || !sameFields({ ...desired.fields, shipping: desired.percent.gt(0) }, change.after)) return 'IMS_RATE_CHANGED'
     const now = input.mappings.filter((m) => m.taxRateId === change.imsRateId).map((m) => m.externalTaxRateId).sort(idOrder)
     const planned = [...change.staleWooIds].sort(idOrder)
-    return now.length === planned.length && now.every((id, index) => id === planned[index]) ? null : 'MAPPING_APPEARED'
+    return now.join(',') === planned.join(',') ? null : 'MAPPING_APPEARED'
   }
   const mapping = input.mappings.find((m) => m.externalTaxRateId === change.wooId)
   if (mapping === undefined) return 'MAPPING_GONE'
