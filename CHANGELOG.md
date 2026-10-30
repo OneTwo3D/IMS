@@ -8,6 +8,12 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### VAT switchover fixes: IOSS and VOEC in R13 and the re-key, region and whitespace in the re-key
+
+- **Fixed: R13 and the tax re-key recognise the `IOSS` and `VOEC` reporting categories.** They were refused as `REPORT_TYPE_UNKNOWN`, so an active IOSS or VOEC sales rate always failed R13. They are now decided by the Xero rate generator (`xeroReportTaxType`): a sales rate named for an EU member state or Norway is filed under `MOSSSALES` and compared with the live type; on any other name the box would only be a guess and stays `REPORT_TYPE_UNKNOWN`. One shared check serves both.
+- **Changed: the re-key compares the region of the names, not only the country.** `PT-30 VAT` is read by the parser R13 uses (now in `lib/tax/tax-country.ts`); a candidate whose region differs, or cannot be read (`PT Madeira VAT`), is refused as `COUNTRY_DIFFERS` with the reason. Names with no region suffix behave as before.
+- **Fixed: the re-key name tiers collapse runs of whitespace**, as R13 does: a live `AT IOSS  VAT` now matches the IMS `AT IOSS VAT`. The case-sensitive tier still comes first.
+
 ### WooCommerce tax-rate writer (IMS to WooCommerce), held at P1
 
 - **New: `npm run woo:tax-plan`.** Plans the WooCommerce tax-rate changes (create, update, delete) that make the store's rates the same set as the IMS sales rates, as the reconciliation pack's VAT set-identity check (R13) defines it, and prints a plan digest. `-- --apply --confirm <digest>` applies exactly that plan, behind the WooCommerce producer hold: while held it records outbound shadows and sends nothing; it is refused if the hold is not enforced. Only rates mapped in the tax-rate mapping and stamped with the current store's address, or created and recorded by the writer against it, are ever touched, and only while they still match what IMS last recorded for them; `-- --adopt` stamps legacy mapping rows after an operator-confirmed digest. Every other writer of the mapping table (tax-rate import, mapper re-map, tax re-key, rate copy script) clears that stamp in the same write when it changes the row's IMS rate or identity snapshot. Shipping is always on for a positive rate. New table `woo_tax_rate_writes` records live changes; new nullable `store_identity` columns on it and on `shopping_tax_rate_mappings`. Nothing sends while the hold stands, and nothing is turned on by this change.

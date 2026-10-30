@@ -58,7 +58,8 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { knownWcTaxClassCategory } from '@/lib/connectors/woocommerce/sync/tax-class-category'
 import type { TaxComponentRateRow, TaxRateRow } from '@/lib/reconciliation-pack/ims-readers'
 import type { WooTaxRateDetail } from '@/lib/reconciliation-pack/woo-source'
-import { comparableName, imsPercent, nameRegion, normaliseClass, regionToken } from '@/lib/reconciliation-pack/vat-set-identity'
+import { imsPercent, normaliseClass } from '@/lib/reconciliation-pack/vat-set-identity'
+import { comparableName, nameRegion, regionToken } from '@/lib/tax/tax-country'
 import { normaliseCountryCode } from '@/lib/tax/tax-country'
 
 const Decimal = Prisma.Decimal

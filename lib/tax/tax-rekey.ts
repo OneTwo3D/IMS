@@ -6,7 +6,7 @@
  * is "CY VAT"). IMS posts a line's accountingTaxType, so a sale on IMS "CY VAT" would post as BG VAT. The code is therefore never trusted: a rate is tied to the live type by NAME.
  *
  * THE PLAN (read only). For every ACTIVE IMS rate whose code is not a Xero built-in (lib/tax/xero-built-in-tax-types.ts), find the live type it should carry:
- *   NAME       the live type whose name equals the IMS rate's name, trimmed, case-sensitive FIRST; only if that finds none, case-insensitive. The plan says which matched.
+ *   NAME       the live type whose name equals the IMS rate's name, trimmed and with whitespace runs collapsed ("AT IOSS  VAT" is "AT IOSS VAT"), case-sensitive FIRST; only if that finds none, case-insensitive. The plan says which matched.
  *   STATUS     the live type must be ACTIVE in the trusted stored list (readStoredXeroList: the proof #797's import uses).
  *   PERCENTAGE exactly the same percentage: Xero's EffectiveRate, else DisplayTaxRate, against the rate column AND the percentage tax is computed at (the active components'). Never rounded.
  *   SIDE       the live type must be allowed on every side the IMS rate is used for (stored canApply.revenue for sales, canApply.expenses for purchases).
@@ -14,7 +14,7 @@
  *   REPORT     the live type's ReportTaxType must equal the VAT-return box IMS assigns the rate: lib/connectors/xero/tax-rate-report-type.ts xeroReportTaxType (reportingCategory, side, the name's
  *              EU/VOEC country, zero rate) - the helper that creates Xero rates, so EU sales are MOSSSALES. A different box is REPORT_TYPE_DIFFERS (both values shown); a live type that states none, or a
  *              reporting category IMS does not map, is REPORT_TYPE_UNKNOWN (refused, not guessed). Checked for ALREADY_CORRECT too, and bound by the digest.
- *   COUNTRY    where the IMS rate has a countryCode and the Xero name starts with a two-letter country prefix ("CY VAT"), they must agree.
+ *   COUNTRY    where the IMS rate has a countryCode and the Xero name starts with a two-letter country prefix ("CY VAT"), they must agree; so must the REGION the two names state ("PT-30 VAT"; rekeyRegionDifference), and an unreadable one is refused.
  * It NEVER matches by code. Each rate gets ONE outcome (REKEY_OUTCOMES). Two further conditions are BLOCKERS that refuse the apply: two rates re-keying to one live type, and a live
  * type already carried by another active IMS rate that stays (a code on two active rates is ambiguous).
  *
@@ -83,8 +83,8 @@ import { digestTaxRateList, type NormalisedXeroTaxRate } from '@/lib/connectors/
 import { readStoredXeroList, type PurchaseTaxImportRefusalCode } from '@/lib/tax/purchase-tax-import'
 import { imsEffectivePercent, type ImsComponentRow } from '@/lib/tax/vat-difference-report'
 import { isOrganisationSpecificTaxType } from '@/lib/tax/xero-built-in-tax-types'
-import { normaliseCountryCode, xeroNameCountry } from '@/lib/tax/tax-country'
-import { xeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
+import { collapseName, comparableName, nameRegion, normaliseCountryCode, xeroNameCountry } from '@/lib/tax/tax-country'
+import { reportTaxTypeDecidable, xeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
 import { taxCodesInPayload } from '@/lib/tax/tax-code-fields'
 import { CLEARED_RATES_SETTING, RETIRED_CODES_SETTING, parseClearedRates, parseRetiredCodes, type RetiredCodes } from '@/lib/tax/retired-tax-code-guard'
 import { lockStorefrontMappingWrites } from '@/lib/tax/storefront-mapping-write'
@@ -210,7 +210,6 @@ export type RekeyPlanRead = { ok: true; plan: RekeyPlan } | { ok: false; refusal
 const normaliseCountry = normaliseCountryCode
 export { xeroNameCountry }
 
-const KNOWN_REPORTING_CATEGORIES: ReadonlySet<string> = new Set(['DOMESTIC', 'REVERSE_CHARGE', 'EC_SALES', 'OSS'])
 const sides = (usedFor: string): readonly string[] => (usedFor === 'BOTH' ? ['SALES', 'PURCHASE'] : [usedFor])
 const overlap = (a: string, b: string): boolean => sides(a).some((side) => sides(b).includes(side))
 const statedPercent = (row: NormalisedXeroTaxRate): Dec | null => {
@@ -259,6 +258,20 @@ export function imsMeaningDifference(a: RekeyImsRate, b: RekeyImsRate): string |
   if ((a.reportingCategory ?? null) !== (b.reportingCategory ?? null)) return 'reportingCategory'
   return null
 }
+/**
+ * The REGION statement of an IMS name against a live candidate's (the same parser as R13: nameRegion, "PT-30 VAT" is region 30). Why the region is part of the country check: a region is
+ * a narrower geography ("PT-30" is Madeira, "PT-20" the Azores) with its own rate set, and a country prefix alone cannot tell them apart. Returns why they differ, or null when they state the same region
+ * or neither states one (names with no region suffix are unaffected). A name whose region cannot be read ("PT Madeira VAT") on either side is refused too: it may state a region this parser does not read.
+ * The name tiers already require equal names, so a readable region cannot differ between a candidate and its IMS rate today; this keeps that true if the name match is ever loosened.
+ */
+export function rekeyRegionDifference(imsName: string, candidateName: string, country: string): string | null {
+  const mine = nameRegion(imsName, country)
+  const theirs = nameRegion(candidateName, country)
+  if (mine.kind === 'unreadable' || theirs.kind === 'unreadable') return 'the region of the IMS name or of the live name cannot be read (a word after the country prefix that is not a hyphenated region), so the regions cannot be compared'
+  const a = mine.kind === 'region' ? mine.token : null
+  const b = theirs.kind === 'region' ? theirs.token : null
+  return a === b ? null : `the regions differ: IMS name region ${a ?? '(none)'}, live name region ${b ?? '(none)'}`
+}
 const candidateOf = (row: NormalisedXeroTaxRate): RekeyCandidate => ({ taxType: row.taxType, name: row.name, status: row.status, percent: statedPercent(row)?.toFixed() ?? null })
 
 /**
@@ -271,15 +284,15 @@ export function matchRekeyRates(input: { rates: readonly RekeyImsRate[]; xero: r
   const rows: RekeyRow[] = []
   for (const rate of [...scoped].sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))) {
     const currentCode = rate.accountingTaxType!
-    const name = rate.name.trim()
+    const name = collapseName(rate.name)
     const column = new Dec(rate.rate).mul(100)
     const effective = imsEffectivePercent(rate)
     const base = {
       imsRateId: rate.id, name: rate.name, usedFor: rate.usedFor, countryCode: rate.countryCode, currentCode,
       imsPercent: column.toFixed(), imsEffectivePercent: effective.eq(column) ? null : effective.toFixed(),
     }
-    const exact = xero.filter((row) => row.name.trim() === name)
-    const tier = exact.length > 0 ? exact : xero.filter((row) => row.name.trim().toLowerCase() === name.toLowerCase())
+    const exact = xero.filter((row) => collapseName(row.name) === name)
+    const tier = exact.length > 0 ? exact : xero.filter((row) => comparableName(row.name) === comparableName(name))
     const matchedBy = exact.length > 0 ? 'EXACT' as const : tier.length > 0 ? 'CASE_INSENSITIVE' as const : null
     const candidates = tier.map(candidateOf)
     let reportType: { expected: string | null; live: string | null } = { expected: null, live: null }
@@ -303,10 +316,14 @@ export function matchRekeyRates(input: { rates: readonly RekeyImsRate[]; xero: r
     // refused too, not re-keyed). Prefixes are parsed case-insensitively and normalised (UK = GB, EL = GR).
     const imsNamePrefix = xeroNameCountry(rate.name)
     const statements = (row: NormalisedXeroTaxRate): string[] => [xeroNameCountry(row.name), imsNamePrefix, imsCountry].filter((x): x is string => x !== null)
-    const compatible = active.filter((row) => { const said = statements(row); return said.every((x) => x === said[0]) })
+    const compatible = active.filter((row) => { const said = statements(row); return said.every((x) => x === said[0]) && rekeyRegionDifference(rate.name, row.name, imsCountry ?? imsNamePrefix ?? '') === null })
     if (compatible.length === 0) {
       const row = active[0]!
-      done('COUNTRY_DIFFERS', row, `the country statements disagree: live name prefix ${xeroNameCountry(row.name) ?? '(none)'}, IMS name prefix ${imsNamePrefix ?? '(none)'}, IMS country ${imsCountry ?? '(none)'}`)
+      const region = rekeyRegionDifference(rate.name, row.name, imsCountry ?? imsNamePrefix ?? '')
+      const said = statements(row)
+      done('COUNTRY_DIFFERS', row, said.every((x) => x === said[0]) && region !== null
+        ? region
+        : `the country statements disagree: live name prefix ${xeroNameCountry(row.name) ?? '(none)'}, IMS name prefix ${imsNamePrefix ?? '(none)'}, IMS country ${imsCountry ?? '(none)'}`)
       continue
     }
     if (compatible.length > 1) { done('AMBIGUOUS', null, `${compatible.length} active live types have this name: ${compatible.map((row) => row.taxType).sort().join(', ')}`); continue }
@@ -325,11 +342,11 @@ export function matchRekeyRates(input: { rates: readonly RekeyImsRate[]; xero: r
     if (meaning !== null) { done('MEANING_DIFFERS', live, meaning); continue }
     // VAT-return treatment (Xero ReportTaxType): the live type must file to the box IMS assigns this rate - the helper that creates Xero rates decides (reportingCategory, side, name's country, zero rate).
     // A category the helper does not know would silently fall to its default, which is a guess: refused.
-    const category = (rate.reportingCategory ?? '').trim().toUpperCase().replace(/[\s-]+/g, '_')
-    const expectedReport = xeroReportTaxType({ reportingCategory: rate.reportingCategory, usedFor: rate.usedFor, name: rate.name, rate: Number(rate.rate) })
+    const reportInput = { reportingCategory: rate.reportingCategory, usedFor: rate.usedFor, name: rate.name, rate: Number(rate.rate) }
+    const expectedReport = xeroReportTaxType(reportInput)
     const liveReport = live.reportTaxType === null ? null : live.reportTaxType.trim().toUpperCase()
     reportType = { expected: expectedReport, live: liveReport }
-    if (category !== '' && !KNOWN_REPORTING_CATEGORIES.has(category)) { done('REPORT_TYPE_UNKNOWN', live, `the reporting category "${rate.reportingCategory}" is not one IMS maps to a VAT-return box`); continue }
+    if (!reportTaxTypeDecidable(reportInput)) { done('REPORT_TYPE_UNKNOWN', live, `the reporting category "${rate.reportingCategory}" is not one IMS maps to a VAT-return box for this rate`); continue }
     if (liveReport === null) { done('REPORT_TYPE_UNKNOWN', live, `the live type states no ReportTaxType, so ${expectedReport} cannot be confirmed`); continue }
     if (liveReport !== expectedReport) { done('REPORT_TYPE_DIFFERS', live, `IMS files this rate under ${expectedReport}, the live type under ${liveReport}`); continue }
     done(live.taxType === currentCode ? 'ALREADY_CORRECT' : 'REKEY', live, live.taxType === currentCode ? 'the code is already the live type of this name' : `live type ${live.taxType} has this name; ${currentCode} does not`)

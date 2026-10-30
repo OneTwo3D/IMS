@@ -144,3 +144,21 @@ export function xeroReportTaxType(input: {
       return purchase ? 'INPUT' : 'OUTPUT'
   }
 }
+
+/** The reporting categories IMS maps to a VAT-return box on their own: the helper below decides them from the category (and side, name, rate). */
+const CATEGORY_DECIDED_BY_HELPER: ReadonlySet<string> = new Set(['DOMESTIC', 'REVERSE_CHARGE', 'EC_SALES', 'OSS'])
+/** The scheme markers (the VAT scheme classifier accepts them): the helper has no case for them, so it can state their box only through the EU / VOEC name override. */
+const SCHEME_MARKER_CATEGORIES: ReadonlySet<string> = new Set(['IOSS', 'VOEC'])
+
+/**
+ * Can xeroReportTaxType state the box of this rate, rather than fall to its default (a guess)? Used by the re-key and by R13 to tell REPORT_TYPE_UNKNOWN from a real comparison.
+ *   no category, or DOMESTIC / REVERSE_CHARGE / EC_SALES / OSS   yes
+ *   IOSS or VOEC                                                 yes only where the helper files the rate under MOSSSALES (a sales rate named for an EU member state or Norway);
+ *                                                                a purchase-only marker, or a name with no such prefix, would take the helper's OUTPUT / INPUT default: not decided
+ *   any other category                                           no
+ */
+export function reportTaxTypeDecidable(input: Parameters<typeof xeroReportTaxType>[0]): boolean {
+  const category = normalizeCategory(input.reportingCategory)
+  if (category === null || CATEGORY_DECIDED_BY_HELPER.has(category)) return true
+  return SCHEME_MARKER_CATEGORIES.has(category) && xeroReportTaxType(input) === 'MOSSSALES'
+}
