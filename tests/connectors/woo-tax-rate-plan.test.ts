@@ -590,6 +590,15 @@ test('RECHECK DELETE for an out-of-scope reason: the IMS rate back in scope refu
   assert.equal(recheck(input, 'delete:2', (w) => { w.rates = w.rates.map((r) => (r.id === 'rDE' ? { ...r, active: true } : r)) }), 'IMS_RATE_CHANGED')
 })
 
+test('RECHECK CREATE with a stale mapping row already known to the plan: a second mapping that appears is still a refusal', () => {
+  const input = createWorld()
+  input.mappings = [...input.mappings, { externalTaxRateId: '50', taxRateId: 'rFR', externalName: 'FR VAT', externalCountry: 'FR', externalRatePct: '20.0000', externalClass: 'standard', storeIdentity: STORE }]
+  assert.deepEqual((plan(input).changes.find((c) => c.key === 'create:rFR') as { staleWooIds: string[] }).staleWooIds, ['50'], 'PRECONDITION: the plan knows the stale row')
+  assert.equal(recheck(input, 'create:rFR'), null)
+  assert.equal(recheck(input, 'create:rFR', (w) => { w.mappings = [...w.mappings, { externalTaxRateId: '60', taxRateId: 'rFR', externalName: 'FR VAT', externalCountry: 'FR', externalRatePct: '20.0000', externalClass: 'standard', storeIdentity: null }] }), 'MAPPING_APPEARED')
+  assert.equal(recheck(input, 'create:rFR', (w) => { w.mappings = w.mappings.map((m) => (m.externalTaxRateId === '50' ? { ...m, externalTaxRateId: '4' } : m)) }), 'MAPPING_APPEARED', 'a different row is a different set')
+})
+
 test('RECHECK CREATE: the IMS rate must still be in scope with the same desired rate, and no mapping may have appeared for it', () => {
   assert.equal(recheck(createWorld(), 'create:rFR', (w) => { w.rates = w.rates.map((r) => (r.id === 'rFR' ? { ...r, active: false } : r)) }), 'IMS_RATE_CHANGED')
   assert.equal(recheck(createWorld(), 'create:rFR', (w) => { w.rates = w.rates.map((r) => (r.id === 'rFR' ? { ...r, usedFor: 'PURCHASE' } : r)) }), 'IMS_RATE_CHANGED')
