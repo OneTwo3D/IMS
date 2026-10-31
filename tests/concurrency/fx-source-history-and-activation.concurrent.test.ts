@@ -208,6 +208,9 @@ test('switch history keeps the Aelia period on Aelia rows after a switch back; a
   assert.equal((await getFxRateToBase(db, { currency: 'EUR', asOf: new Date() })).isBase, false, 'CONTROL: repaired (absent), the lookup answers again')
 
   // ---- arm 5: a change of the BASE currency under Aelia is refused, and takes the FX lock
+  // the base currency counts as "locked" once ANY master data exists, which the rest of this tier leaves behind: the lock marker is not what is under test, so it reads as unlocked here
+  const realBaseCurrency = await import('@/lib/base-currency')
+  mock.module('@/lib/base-currency', { namedExports: { ...realBaseCurrency, isBaseCurrencyLocked: async () => false } })
   const { updateOrganisation } = await import('@/app/actions/company')
   const orgExisted = await db.organisation.findFirst({ select: { id: true, baseCurrency: true } })
   const orgBefore = orgExisted ?? await db.organisation.create({ data: { name: 'FX test org', baseCurrency: 'GBP' }, select: { id: true, baseCurrency: true } })
