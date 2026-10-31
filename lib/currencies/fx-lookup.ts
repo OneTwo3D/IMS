@@ -79,6 +79,10 @@ export async function resolveFxRatesToBase(
   if (toQuery.length === 0) return out
 
   const regime = await getFxSourceRegime(client)
+  if (regime?.unreadable) {
+    for (const currency of toQuery) out.set(currency, { ok: false, error: refuse('fx_source_history_unreadable', base, currency, asOf) })
+    return out
+  }
   const restricted = fxRegimeRestrictsAt(regime, asOf)
   const eligible = { OR: [{ source: 'aelia' }, { manualOverride: true }] }
   const latest = await client.fxRate.groupBy({

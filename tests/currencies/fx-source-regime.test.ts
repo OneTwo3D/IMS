@@ -139,13 +139,15 @@ test('history: a second Aelia period after the switch back is a second interval;
   assert.equal(fxRegimeRestrictsAt(r, at('2026-11-11T00:00:00Z')), true)
 })
 
-test('history: the current pair is always honoured and an unreadable history is not trusted', () => {
+test('history: the current pair is always honoured and an unreadable history is a closed fault, not an absence', () => {
   // the pair says Aelia since X but the history never recorded it: still restricted (strict reading)
   assert.equal(fxRegimeRestrictsAt(fxSourceRegimeFromSettings('aelia', SINCE, JSON.stringify([{ source: 'ecb', since: '2026-01-01T00:00:00Z' }])), AFTER), true)
   assert.equal(parseFxSourceHistory('not json'), null)
   assert.equal(parseFxSourceHistory('[{"source":"x","since":"2026-01-01T00:00:00Z"}]'), null)
   assert.equal(parseFxSourceHistory('[{"source":"ecb","since":"nope"}]'), null)
-  assert.equal(fxSourceRegimeFromSettings('ecb', BACK, 'not json'), null)
+  assert.deepEqual(fxSourceRegimeFromSettings('ecb', BACK, 'not json'), { aelia: [], unreadable: true })
+  assert.equal(fxSourceRegimeFromSettings('ecb', BACK, null), null)
+  assert.equal(fxSourceRegimeFromSettings('ecb', BACK, undefined), null)
 })
 
 test('history: appendFxSourceSwitch appends one entry, and seeds a pre-history Aelia pair so the first switch back keeps its interval', () => {
@@ -166,4 +168,29 @@ test('history: entries stored out of order are read oldest first', () => {
   const r = fxSourceRegimeFromSettings('ecb', BACK, shuffled)
   assert.equal(fxRegimeRestrictsAt(r, IN_AELIA_PERIOD), true)
   assert.equal(fxRegimeRestrictsAt(r, AFTER_BACK), false)
+})
+
+test('an UNREADABLE history refuses every lookup (fx_source_history_unreadable), whatever the current source; an absent one keeps today\'s behaviour', async () => {
+  const bad = ['{not json', '{"a":1}', '[{"source":"gold","since":"2026-10-01T00:00:00Z"}]', '[{"source":"ecb","since":"nope"}]', '']
+  for (const history of bad) {
+    for (const source of ['ecb', 'aelia']) {
+      const settingsBad = { fx_rate_source: source, fx_rate_source_since: SINCE, fx_rate_source_history: history }
+      assert.deepEqual(fxSourceRegimeFromSettings(source, SINCE, history), { aelia: [], unreadable: true })
+      const client = fakeFxClient(rows, 'GBP', settingsBad)
+      for (const asOf of [AFTER, BEFORE]) {
+        await assert.rejects(getFxRateToBase(client, { currency: 'EUR', asOf }), (e: Error & { reason?: string }) => e.reason === 'fx_source_history_unreadable', `${source} ${JSON.stringify(history)}`)
+        const many = await resolveFxRatesToBase(client, { currencies: ['EUR', 'USD'], asOf })
+        for (const c of ['EUR', 'USD']) {
+          const o = many.get(c)
+          assert.ok(o && !o.ok && o.error.reason === 'fx_source_history_unreadable')
+        }
+      }
+    }
+    assert.throws(() => selectFxRateFromRows(rows, { baseCurrency: 'GBP', currency: 'EUR', asOf: AFTER, regime: fxSourceRegimeFromSettings('ecb', SINCE, history) }), (e: Error & { reason?: string }) => e.reason === 'fx_source_history_unreadable')
+  }
+  // the base currency needs no rate and is not a lookup of the table
+  assert.equal((await getFxRateToBase(fakeFxClient(rows, 'GBP', { fx_rate_source_history: '{bad' }), { currency: 'GBP', asOf: AFTER })).isBase, true)
+  // CONTROL: an absent history, and a readable empty one, behave as before
+  assert.equal((await getFxRateToBase(fakeFxClient(rows, 'GBP', { fx_rate_source: 'ecb' }), { currency: 'EUR', asOf: AFTER })).rate.toString(), '1.25')
+  assert.equal((await getFxRateToBase(fakeFxClient(rows, 'GBP', { fx_rate_source: 'ecb', fx_rate_source_history: '[]' }), { currency: 'EUR', asOf: AFTER })).rate.toString(), '1.25')
 })

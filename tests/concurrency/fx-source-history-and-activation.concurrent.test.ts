@@ -9,6 +9,9 @@ import { loadEnv } from './po-landed-fixtures'
  *          (the later ECB row is not eligible), while a lookup after the switch back is the plain latest row
  *   arm 2  activating a currency (toggleCurrency, createCurrency) takes the FX table lock: it waits for a switch in flight, then sees the source that switch committed and, under Aelia, refuses a
  *          currency Aelia has not covered; a pin (manual override) in force now covers it
+ *   arm 3  the boundary of a switch is taken inside the lock after the wait, so a payment priced during the wait lies before it
+ *   arm 4  an unreadable history refuses every lookup (fx_source_history_unreadable)
+ *   arm 5  a base-currency change takes the FX lock and is refused under Aelia
  * Real Postgres. Mutations: stop appending the history -> arm 1 reads the ECB row; take toggleCurrency / createCurrency out of the lock -> arm 2 activates while the lock is held.
  */
 
@@ -173,6 +176,92 @@ test('switch history keeps the Aelia period on Aelia rows after a switch back; a
   await holder2
   assert.equal((await creating).success, false)
   assert.equal(await db.currency.count({ where: { code: 'NZD' } }), 0)
+
+  // ---- arm 3: the boundary of a switch is taken INSIDE the lock, after the wait. An ECB switch waits behind a lock holder; an Aelia-period payment lookup is made while it waits; the boundary
+  // the switch records falls AFTER that payment's instant, and the payment's rate still comes from Aelia afterwards.
+  await reset()
+  assert.deepEqual(await setFxRateSource('aelia'), { success: true })
+  let releaseWait: () => void = () => {}
+  const waitGate = new Promise<void>((r) => { releaseWait = r })
+  let waitIn: () => void = () => {}
+  const waitHolderIn = new Promise<void>((r) => { waitIn = r })
+  const waitHolder = withFxTableWriteLock(async () => { waitIn(); await waitGate })
+  await waitHolderIn
+  const switching = setFxRateSource('ecb')
+  assert.ok((await waitingOnAdvisoryLock(db)) >= 1, 'PRECONDITION: the ECB switch waits on the FX table lock')
+  await new Promise((r) => setTimeout(r, 40))
+  const paymentAt = new Date() // an Aelia-period payment recorded while the switch waits (the source is still Aelia)
+  assert.equal((await getFxRateToBase(db, { currency: 'EUR', asOf: paymentAt })).source, 'aelia', 'PRECONDITION: during the wait the payment is priced from Aelia')
+  await new Promise((r) => setTimeout(r, 40))
+  releaseWait()
+  await waitHolder
+  assert.deepEqual(await switching, { success: true })
+  const boundary = new Date((await setting('fx_rate_source_since'))!)
+  assert.ok(boundary.getTime() > paymentAt.getTime(), `the recorded boundary (${boundary.toISOString()}) falls after the payment made during the wait (${paymentAt.toISOString()})`)
+  assert.equal((await getFxRateToBase(db, { currency: 'EUR', asOf: paymentAt })).source, 'aelia', 'the payment still reads as Aelia after the switch')
+
+  // ---- arm 4: an unreadable history refuses every lookup, whatever the current source
+  await db.setting.upsert({ where: { key: 'fx_rate_source_history' }, create: { key: 'fx_rate_source_history', value: '{not json' }, update: { value: '{not json' } })
+  await assert.rejects(getFxRateToBase(db, { currency: 'EUR', asOf: new Date() }), (e: Error & { reason?: string }) => e.reason === 'fx_source_history_unreadable')
+  await assert.rejects(getFxRateToBase(db, { currency: 'EUR', asOf: new Date(Date.now() - 86_400_000) }), (e: Error & { reason?: string }) => e.reason === 'fx_source_history_unreadable')
+  await db.setting.deleteMany({ where: { key: 'fx_rate_source_history' } })
+  assert.equal((await getFxRateToBase(db, { currency: 'EUR', asOf: new Date() })).isBase, false, 'CONTROL: repaired (absent), the lookup answers again')
+
+  // ---- arm 5: a change of the BASE currency under Aelia is refused, and takes the FX lock
+  const { updateOrganisation } = await import('@/app/actions/company')
+  const orgExisted = await db.organisation.findFirst({ select: { id: true, baseCurrency: true } })
+  const orgBefore = orgExisted ?? await db.organisation.create({ data: { name: 'FX test org', baseCurrency: 'GBP' }, select: { id: true, baseCurrency: true } })
+  const lockedSetting = await db.setting.findUnique({ where: { key: 'base_currency_locked' } })
+  t.after(async () => {
+    if (orgExisted) await db.organisation.update({ where: { id: orgBefore.id }, data: { baseCurrency: orgBefore.baseCurrency } })
+    else await db.organisation.deleteMany({ where: { id: orgBefore.id } })
+    await db.setting.deleteMany({ where: { key: 'base_currency_locked' } })
+    if (lockedSetting) await db.setting.create({ data: { key: lockedSetting.key, value: lockedSetting.value } })
+    await db.currency.updateMany({ where: { code: 'AUD' }, data: { active: existed.get('AUD') === true } })
+  })
+  await db.setting.deleteMany({ where: { key: 'base_currency_locked' } })
+  await db.currency.update({ where: { code: 'AUD' }, data: { active: false } })
+  await reset()
+  assert.deepEqual(await setFxRateSource('aelia'), { success: true })
+  const refusedBase = await updateOrganisation({ baseCurrency: 'AUD' })
+  assert.equal(refusedBase.success, false)
+  assert.match(refusedBase.error ?? '', /Aelia/)
+  assert.equal((await db.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency, orgBefore.baseCurrency, 'the base currency was not changed')
+  assert.equal((await db.currency.findUnique({ where: { code: 'AUD' } }))?.active, false, 'the would-be base currency was not activated')
+  assert.equal((await updateOrganisation({ baseCurrency: orgBefore.baseCurrency })).success, true, 'setting the base to what it already is is not a change')
+  // it is serialised with the source switch: a switch to Aelia holds the lock, the base change waits, then sees Aelia and refuses
+  await reset()
+  await db.setting.deleteMany({ where: { key: 'base_currency_locked' } }) // a base change writes the lock marker; the next arms need the base unlocked
+  let releaseBase: () => void = () => {}
+  const baseGate = new Promise<void>((r) => { releaseBase = r })
+  let baseIn: () => void = () => {}
+  const baseHolderIn = new Promise<void>((r) => { baseIn = r })
+  const baseHolder = withFxTableWriteLock(async (tx) => {
+    baseIn()
+    await baseGate
+    const at = new Date(Date.now() - 1000).toISOString()
+    await tx.setting.upsert({ where: { key: 'fx_rate_source' }, create: { key: 'fx_rate_source', value: 'aelia' }, update: { value: 'aelia' } })
+    await tx.setting.upsert({ where: { key: 'fx_rate_source_since' }, create: { key: 'fx_rate_source_since', value: at }, update: { value: at } })
+  })
+  await baseHolderIn
+  let baseDone = false
+  const baseChange = updateOrganisation({ baseCurrency: 'AUD' }).then((r) => { baseDone = true; return r })
+  assert.ok((await waitingOnAdvisoryLock(db)) >= 1, 'PRECONDITION: the base change waits on the FX table lock')
+  assert.equal(baseDone, false)
+  assert.equal((await db.currency.findUnique({ where: { code: 'AUD' } }))?.active, false)
+  releaseBase()
+  await baseHolder
+  assert.equal((await baseChange).success, false, 'the base change saw the committed Aelia source and refused')
+  assert.equal((await db.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency, orgBefore.baseCurrency)
+  // CONTROL: under ECB the change goes through (so the refusals above can fail for the right reason only)
+  await reset()
+  await db.setting.deleteMany({ where: { key: 'base_currency_locked' } })
+  assert.deepEqual(await updateOrganisation({ baseCurrency: 'AUD' }), { success: true })
+  assert.equal((await db.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency, 'AUD')
+  assert.equal((await db.currency.findUnique({ where: { code: 'AUD' } }))?.active, true)
+  await db.organisation.update({ where: { id: orgBefore.id }, data: { baseCurrency: orgBefore.baseCurrency } })
+  await db.currency.update({ where: { code: 'AUD' }, data: { active: false } })
+  await db.setting.deleteMany({ where: { key: 'base_currency_locked' } })
 
   // CONTROL: under ECB the same activation and creation succeed (the arms above can fail for the right reason only)
   await reset()

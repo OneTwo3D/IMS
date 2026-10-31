@@ -534,6 +534,9 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
         }
         aeliaResult = result
       }
+      // THE BOUNDARY IS TAKEN HERE, inside the lock-holding transaction and after every check, immediately before the writes that commit it: a switch that waited behind an import must not record an
+      // instant from before its wait, or a document recorded during the wait (under the old regime) would later read as the new one. For the Aelia path this is later than the read instant used to date the ingested rows, which is harmless (rows dated earlier are eligible).
+      switchedAt = new Date()
       // THE SWITCH HISTORY: one interval boundary per switch, appended in this same transaction (read under the exclusive lock, so two switches cannot interleave). A lookup selects the regime in effect at its
       // asOf from this list, so a switch back to ECB does not turn an Aelia-period document into an ECB lookup.
       const before = await tx.setting.findMany({ where: { key: { in: [FX_RATE_SOURCE_SETTING, FX_RATE_SOURCE_SINCE_SETTING, FX_RATE_SOURCE_HISTORY_SETTING] } }, select: { key: true, value: true } })

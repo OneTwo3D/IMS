@@ -16,6 +16,7 @@ export const FX_MISSING_REASONS = [
   'non_finite_rate',
   'ambiguous_rate',
   'no_rate_from_selected_source',
+  'fx_source_history_unreadable',
 ] as const
 export type FxMissingReason = (typeof FX_MISSING_REASONS)[number]
 
@@ -102,6 +103,7 @@ export function refuse(reason: FxMissingReason, base: string, currency: string, 
     non_positive_rate: `Invalid stored ${base} FX rate for ${currency}`,
     non_finite_rate: `Invalid stored ${base} FX rate for ${currency}`,
     ambiguous_rate: `Ambiguous ${base} FX rate for ${currency} on or before ${when}`,
+    fx_source_history_unreadable: 'The stored FX source switch history is unreadable, so no exchange rate can be chosen safely; every FX lookup is refused until the history is repaired (switching the FX source rewrites it)',
     no_rate_from_selected_source: `The FX source is Aelia and it has given no ${base} rate for ${currency} on or before ${when}; no other source is used`,
   }
   return new MissingFxRateError(message ?? defaults[reason], currency, isValidDate(asOf) ? asOf : undefined, reason, base)
@@ -126,6 +128,7 @@ export function selectFxRateFromRows(
   params: { baseCurrency: string; currency: string; asOf: Date; regime?: FxSourceRegime },
 ): FxRateToBase {
   const { baseCurrency, currency, asOf, regime } = params
+  if (regime?.unreadable) throw refuse('fx_source_history_unreadable', baseCurrency, currency, asOf)
   const inPair = rows.filter(
     (r) => r.fromCurrency === baseCurrency && r.toCurrency === currency && isValidDate(r.fetchedAt) && r.fetchedAt.getTime() <= asOf.getTime(),
   )

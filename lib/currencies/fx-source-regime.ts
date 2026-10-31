@@ -27,11 +27,11 @@ export type FxSourceSwitch = { source: FxRateSource; since: string }
 /** A span during which Aelia was the source: [since, until), `until` null while it still is. */
 export type FxAeliaInterval = { since: Date; until: Date | null }
 /** The lookup's regime: null (no Aelia interval ever) or the list of Aelia intervals. */
-export type FxSourceRegime = { aelia: FxAeliaInterval[] } | null
+export type FxSourceRegime = { aelia: FxAeliaInterval[]; unreadable?: true } | null
 
 const EPOCH_ISO = new Date(0).toISOString()
 
-/** The recorded switches, oldest first; null when absent or unreadable (an unreadable history is not trusted, the current pair still applies). */
+/** The recorded switches, oldest first; null when absent or unreadable. The CALLER tells them apart: an unreadable history that is present is a closed fault (fxSourceRegimeFromSettings), not an absence. */
 export function parseFxSourceHistory(value: string | null | undefined): FxSourceSwitch[] | null {
   if (!value) return null
   let parsed: unknown
@@ -75,9 +75,12 @@ export function appendFxSourceSwitch(
  * the pair together, so a half-written pair is a fault, and the safe reading of a fault is the strict one.
  */
 export function fxSourceRegimeFromSettings(source: string | null | undefined, since: string | null | undefined, history?: string | null): FxSourceRegime {
+  // A history setting that is PRESENT but cannot be read is a fault, not an absence: the regime cannot be known, so every lookup refuses (fx_source_history_unreadable) whatever the current source.
+  const parsedHistory = parseFxSourceHistory(history)
+  if (history !== undefined && history !== null && parsedHistory === null) return { aelia: [], unreadable: true }
   const aelia: FxAeliaInterval[] = []
   let open: Date | null = null
-  for (const entry of parseFxSourceHistory(history) ?? []) {
+  for (const entry of parsedHistory ?? []) {
     const at = new Date(entry.since)
     if (entry.source === 'aelia') {
       if (!open) open = at

@@ -1,6 +1,7 @@
 'use server'
 
 import { withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
+import { getFxRateSourceInTx } from '@/lib/currencies/fx-source'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -110,28 +111,34 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
       if (locked && code !== (existingOrg?.baseCurrency ?? DEFAULT_BASE_CURRENCY)) {
         return { success: false, error: 'Base currency is locked after setup. Reset the database to change it.' }
       }
-      const existing = await db.currency.findUnique({ where: { code } })
-      if (!existing) {
-        const fallback = getFallbackCurrencyMeta(code)
-        await db.currency.create({
-          data: {
-            code,
-            name: fallback.name,
-            symbol: fallback.symbol,
-            symbolPosition: fallback.symbolPosition,
-            active: true,
-          },
-        })
-      } else if (!existing.active) {
-        await db.currency.update({ where: { code }, data: { active: true } })
-      }
       updateData.baseCurrency = code
     }
 
     await ensureOrganisationExists()
-    // A change of the BASE currency is a write the rate table depends on: it takes the same exclusive lock as the rate writers (a CSV import holds the table still).
-    if (updateData.baseCurrency) await withFxTableWriteLock((tx) => tx.organisation.updateMany({ data: updateData }))
-    else await db.organisation.updateMany({ data: updateData })
+    // A change of the BASE currency is a write the rate table depends on: it, and the activation of the new base currency it implies, take the same exclusive lock as the rate writers and the FX source
+    // switch (a CSV import holds the table still). While the FX source is Aelia a change of base is REFUSED outright: Aelia's rates are quoted against a fixed base, the new base would be activated and the
+    // old base would become an active foreign currency, neither of them checked for Aelia coverage. Switch the source to ECB first.
+    if (updateData.baseCurrency) {
+      const code = updateData.baseCurrency
+      const currentBase = existingOrg?.baseCurrency ?? DEFAULT_BASE_CURRENCY
+      const refusal = await withFxTableWriteLock(async (tx) => {
+        if (code !== currentBase && (await getFxRateSourceInTx(tx)) === 'aelia') {
+          return `The base currency cannot be changed while the FX source is Aelia: Aelia's rates are quoted against ${currentBase}. Switch the FX source to ECB first.`
+        }
+        const existing = await tx.currency.findUnique({ where: { code } })
+        if (!existing) {
+          const fallback = getFallbackCurrencyMeta(code)
+          await tx.currency.create({
+            data: { code, name: fallback.name, symbol: fallback.symbol, symbolPosition: fallback.symbolPosition, active: true },
+          })
+        } else if (!existing.active) {
+          await tx.currency.update({ where: { code }, data: { active: true } })
+        }
+        await tx.organisation.updateMany({ data: updateData })
+        return null
+      })
+      if (refusal) return { success: false, error: refusal }
+    } else await db.organisation.updateMany({ data: updateData })
     if (updateData.baseCurrency) {
       await db.setting.upsert({
         where: { key: 'base_currency_locked' },
