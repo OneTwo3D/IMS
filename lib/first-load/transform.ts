@@ -123,16 +123,18 @@ export interface OutputFile {
 }
 
 /**
- * THE EVIDENCE OF ONE FOREIGN-CURRENCY LOT, carried into the prepared report so the apply step can prove the base cost against the live `fx_rates` before opening stock is written.
- * The opening-stock importer file holds only the collapsed weighted-average base cost, so without this the file alone could not say which rate it was priced at. Decimals are
- * exact plain strings; `unitCostBase` is `unitCostForeign / fxRateToBase` unrounded, exactly as the lot was converted.
+ * THE EVIDENCE OF ONE LOT behind an opening-stock row (EVERY lot, base-currency ones too), carried into the prepared report so the apply step can prove the base cost against the
+ * live `fx_rates` before opening stock is written. The opening-stock importer file holds only the collapsed weighted-average base cost, so the file alone cannot say which rate it
+ * was priced at. Carrying every lot is what makes the list checkable against the hashed opening-stock file: the lots of a SKU and warehouse must collapse to exactly that row's
+ * quantity and average cost, so a lot removed, added or altered in the report no longer reproduces the file and is refused. Decimals are exact plain strings; `unitCostBase` is
+ * `unitCostForeign / fxRateToBase` unrounded, exactly as the lot was converted. A base-currency lot has rate 1 and no required received day.
  */
-export interface ForeignLotEvidence {
+export interface LotEvidence {
   sku: string
   warehouseCode: string
   lotRef: string
   currency: string
-  /** YYYY-MM-DD: the rate is the fx_rates rate at the end of this day. */
+  /** YYYY-MM-DD: for a foreign lot the rate is the fx_rates rate at the end of this day. May be blank for a base-currency lot. */
   receivedDate: string
   qty: string
   unitCostForeign: string
@@ -193,8 +195,8 @@ export interface PrepareReport {
   stock: {
     groups: StockGroupReport[]
     totals: { lotQty: string; lotTotalBase: string; collapsedTotalBase: string; roundingResidualBase: string; openingQty: string; openingValueBase: string }
-    /** Every foreign-currency lot that is in an emitted opening row, with the rate and dates it was priced at (see ForeignLotEvidence). */
-    foreignLots: ForeignLotEvidence[]
+    /** Every lot that is in an emitted opening row, with the currency, rate and day it was priced at (see LotEvidence). */
+    lots: LotEvidence[]
     zeroOnHand: string[]
     missingFromExtract: Array<{ sku: string; holdsStockElsewhere: boolean | null; wmsQty: string | null }>
   }
@@ -316,7 +318,7 @@ interface StockGroup {
   residual: Dec
   inTransit: Dec
   openingQty: Dec
-  foreignLots: ForeignLotEvidence[]
+  evidence: LotEvidence[]
 }
 
 interface TransferLine {
@@ -1038,7 +1040,7 @@ export function collapseLots(lots: Array<{ qty: Dec; unitCostBase: Dec }>): { qt
 }
 
 function loadStock(run: Run): void {
-  type Lot = { row: CanonRow; sku: string; key: string; warehouse: string; qty: Dec; unitCostBase: Dec; lotRef: string; date: string; foreign: ForeignLotEvidence | null }
+  type Lot = { row: CanonRow; sku: string; key: string; warehouse: string; qty: Dec; unitCostBase: Dec; lotRef: string; date: string; evidence: LotEvidence }
   const lots: Lot[] = []
   const excludedHolding = new Map<string, Dec>()
   for (const row of run.rows('stock-lots')) {
@@ -1121,10 +1123,8 @@ function loadStock(run: Run): void {
       reject('BAD_UNIT_COST', `unit cost ${v.unitCost} ${currency} / rate ${fx.text} = ${fmt(converted)} in the base currency, which has more than ${NUMERIC_LIMITS.unitCost.maxIntDigits} integer digits (the cost column or the importer's number type cannot hold it exactly)`)
       continue
     }
-    const foreign: ForeignLotEvidence | null = receivedDay === null
-      ? null
-      : { sku: res.sku, warehouseCode: warehouse.code, lotRef: v.lotRef.trim(), currency, receivedDate: receivedDay, qty: fmt(qty.value), unitCostForeign: fmt(cost.value), fxRateToBase: fmt(fx.fx), unitCostBase: fmt(converted) }
-    lots.push({ row, sku: res.sku, key: sku.key, warehouse: warehouse.code, qty: qty.value, unitCostBase: converted, lotRef: v.lotRef, date: v.receivedDate, foreign })
+    const evidence: LotEvidence = { sku: res.sku, warehouseCode: warehouse.code, lotRef: v.lotRef.trim(), currency, receivedDate: receivedDay ?? v.receivedDate.trim(), qty: fmt(qty.value), unitCostForeign: fmt(cost.value), fxRateToBase: fmt(fx.fx), unitCostBase: fmt(converted) }
+    lots.push({ row, sku: res.sku, key: sku.key, warehouse: warehouse.code, qty: qty.value, unitCostBase: converted, lotRef: v.lotRef, date: v.receivedDate, evidence })
   }
 
   // The same lot twice (same reference) is a duplicated export row, not two lots: refuse it.
@@ -1201,7 +1201,7 @@ function loadStock(run: Run): void {
       residual: collapsed.residual,
       inTransit: new D(0),
       openingQty: collapsed.qty,
-      foreignLots: list.flatMap((l) => (l.foreign ? [l.foreign] : [])),
+      evidence: list.map((l) => l.evidence),
     })
   }
   const zeroCost = [...run.stockGroups.values()].filter((g) => g.average.isZero()).map((g) => `${g.sku} in ${g.warehouseCode}`)
@@ -2057,7 +2057,7 @@ export function prepare(input: PrepareInput): PrepareResult {
         openingQty: fmt(totals.openingQty),
         openingValueBase: fmt(totals.openingValue),
       },
-      foreignLots: stockGroups.flatMap((g) => g.foreignLots),
+      lots: stockGroups.flatMap((g) => g.evidence).sort((a, b) => cmp(a.sku, b.sku) || cmp(a.warehouseCode, b.warehouseCode) || cmp(a.lotRef, b.lotRef) || cmp(a.receivedDate, b.receivedDate) || cmp(a.currency, b.currency) || cmp(a.qty, b.qty) || cmp(a.unitCostForeign, b.unitCostForeign)),
       zeroOnHand: split?.zero ?? [],
       missingFromExtract: split?.missing ?? [],
     },

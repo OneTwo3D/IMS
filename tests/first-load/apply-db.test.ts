@@ -2211,7 +2211,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       // [mutation: do not run the fx rail for the opening-stock step; skip the rate comparison; skip the base-cost comparison; read the rate at the start of the day instead of its end; ignore a missing live rate]
       it('opening stock: each foreign lot\'s rate and base cost must be EXACTLY the live fx_rates rate at the end of its received day; any difference, or no live rate, refuses before opening stock is written', async () => {
         const evidence = (over: Record<string, string> = {}) => ({ sku: 'ZQSENT-OAK-BOARD', warehouseCode: 'ZQSENT-MAIN', lotRef: 'L1', currency: 'EUR', receivedDate: '2026-09-12', qty: '10', unitCostForeign: '5', fxRateToBase: '1.25', unitCostBase: '4', ...over })
-        const withLots = (lots: Array<ReturnType<typeof evidence>>) => ({ ...prepared, report: { ...prepared.report, stock: { ...prepared.report.stock, foreignLots: lots } } }) as unknown as PreparedRun
+        const withLots = (lots: Array<ReturnType<typeof evidence>>) => ({ ...prepared, report: { ...prepared.report, stock: { ...prepared.report.stock, lots: lots } } }) as unknown as PreparedRun
         const check = (run: PreparedRun) => evaluateRails(run, { phase: 'recheck', resuming: true, step: 'opening-stock' })
         assert.deepEqual(await check(prepared), [], 'control: a run with no foreign lots has nothing to compare')
         assert.deepEqual(await check(withLots([evidence()])), [], 'control: the lot was priced at the live table rate and its base cost is the foreign cost over it')

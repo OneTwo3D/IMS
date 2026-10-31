@@ -293,19 +293,18 @@ async function fxRates(prepared: PreparedRun, problems: string[]): Promise<void>
 /**
  * OPENING-STOCK FX RAIL. A foreign-currency lot's base cost is its foreign cost over the fx_rates rate at the END of its received day (one rate, owner ruling 2026-10-25). The prepare step
  * read that rate from the supplied ims-fx-rates rows and carried, per foreign lot, its currency, received day, foreign cost, selected rate and derived base cost (the report's
- * stock.foreignLots, whose consistency the file-side load already proved). The opening-stock file holds only the collapsed weighted average, so an opening-stock-only run with a wrong
+ * stock.lots, which the file-side load proved reproduces the hashed opening-stock rows). The opening-stock file holds only the collapsed weighted average, so an opening-stock-only run with a wrong
  * dataset rate would otherwise write a wrong base cost. Here each lot's rate and derived base cost are compared, decimal-exact, with the LIVE central lookup, and ANY difference (or a
  * missing/unusable live rate) refuses the run before opening stock is written. The runner never writes a rate.
  */
 async function openingStockFxRates(prepared: PreparedRun, problems: string[]): Promise<void> {
   const base = prepared.manifest.baseCurrency.toUpperCase()
-  const lots = prepared.report.stock.foreignLots
+  const lots = prepared.report.stock.lots.filter((lot) => lot.currency.toUpperCase() !== base)
   const live = new Map<string, Dec | string>()
   let index = 0
   for (const lot of lots) {
     index += 1
     const at = `foreign lot ${index} of the opening-stock evidence (${lot.currency}, received ${lot.receivedDate})`
-    if (lot.currency.toUpperCase() === base) { problems.push(`OPENING_FX_LOT_IN_BASE_CURRENCY: ${at}: a base-currency lot has no rate to check`); continue }
     const memo = `${lot.currency}|${lot.receivedDate}`
     let expected = live.get(memo)
     if (expected === undefined) {
