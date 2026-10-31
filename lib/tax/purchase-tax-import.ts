@@ -500,7 +500,7 @@ export interface PurchaseTaxImportWrite {
  * then RE-READ it: a row whose name, percentage, sides, active flag or components changed since the plan (an editor that held the row while this waited) is not written (the plan named it
  * under its old identity). With `recount`, the documents depending on it are re-counted under its CURRENT name; whatever came to depend on it since the plan stops the write, which rolls back
  * as a whole.
- * The re-count of the orders that NAME the rate (taxRateName) is made under this FOR UPDATE and is complete because every writer of SalesOrder.taxRateName takes FOR KEY SHARE on the active rate
+ * The re-count of the orders that NAME the rate (taxRateName) is made under this FOR UPDATE and is complete because every writer of SalesOrder.taxRateName takes FOR SHARE on the active rate
  * it names, in the transaction that writes the order (lockOrderNamedTaxRate in lib/tax/writable-tax-rate.ts; the census in tests/tax/sales-order-tax-rate-name-writers-census.test.ts pins the
  * writers): an order that locked first is committed before this lock is granted and is counted; one that arrives later waits for this transaction and finds the rate inactive. No intake pause needed.
  */
@@ -520,6 +520,10 @@ export async function writePurchaseTaxImport(tx: Client, plan: PurchaseTaxImport
   const result: PurchaseTaxImportWrite = { created: [], suppliersRepointed: 0, mappingsRepointed: 0 }
   // A mapping write takes the shared storefront-mapping lock FIRST, before any row lock (the WooCommerce tax-rate apply holds it exclusively while it re-reads ownership and sends).
   if (plan.creates.some((c) => c.replaces !== null)) await lockStorefrontMappingWrites(tx)
+  // Every existing row this write will replace, narrow or deactivate is locked HERE, in ONE statement in ascending id (the lock order of lib/tax/writable-tax-rate.ts), so an order writer that holds
+  // several rate rows can never wait on this transaction while this one waits on it. The per-row lock and re-read in lockAndRecheck then finds them already held.
+  const touched = [...new Set([...plan.creates.flatMap((c) => (c.replaces === null ? [] : [c.replaces])), ...plan.narrow.map((r) => r.id), ...plan.notInXero.filter((r) => r.deactivate).map((r) => r.id)])]
+  if (touched.length > 0 && typeof (tx as { $queryRaw?: unknown }).$queryRaw === 'function') await tx.$queryRaw(Prisma.sql`SELECT id FROM tax_rates WHERE id = ANY(${touched}::text[]) ORDER BY id FOR UPDATE`)
   for (const create of plan.creates) {
     if (create.replaces !== null) {
       const planned = plan.differs.find((d) => d.id === create.replaces)

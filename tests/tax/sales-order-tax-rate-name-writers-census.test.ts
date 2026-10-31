@@ -4,7 +4,7 @@ import path from 'node:path'
 import test from 'node:test'
 
 import { balancedFrom, blankNonCode, productionSources, ROOT, SHORTHAND, topLevelProperty, walk, WRITE_OPS } from '../accounting/paid-provenance-scan'
-import { lockOrderNamedTaxRate } from '../../lib/tax/writable-tax-rate'
+import { lockOrderNamedTaxRate, NamedTaxRateGoneError } from '../../lib/tax/writable-tax-rate'
 
 /**
  * EVERY WRITER OF `SalesOrder.taxRateName` LOCKS THE ACTIVE RATE IT NAMES, IN THE TRANSACTION THAT WRITES THE ORDER.
@@ -47,9 +47,11 @@ export function salesOrderNameSites(file: string, source: string): Site[] {
       // The lock must sit in the SAME transaction callback, before the write, on the value the write persists.
       const txStart = code.lastIndexOf('$transaction(', m.index)
       const segment = txStart === -1 ? '' : code.slice(txStart, m.index)
-      const lock = segment.match(/lockOrderNamedTaxRate\s*\(\s*(tx)\s*,\s*([^)]*)\)/)
+      const lock = segment.match(/lockOrderNamedTaxRate\s*\(\s*(tx)\s*,\s*([^,)]*)/)
+      // The call also locks the order's LINE rates in the same statement (lock order: one statement, ascending id).
+      const lockArgs = lock === null ? '' : balancedFrom(segment, segment.indexOf('(', lock.index!))
       const written = name === SHORTHAND ? 'taxRateName' : (name ?? '')
-      const locked = lock !== null && m[1] === 'tx' && written !== '' && written.includes(lock[2]!.trim())
+      const locked = lock !== null && m[1] === 'tx' && written !== '' && written.includes(lock[2]!.trim()) && /\blineRateIds\s*:/.test(lockArgs)
       sites.push({ file, line, op: m[2]!, receiver: m[1]!, data, name, locked })
     }
   }
@@ -117,20 +119,25 @@ test('the raw-SQL writers of the column are exactly the exempt rate-editor refre
   assert.ok(lockAt !== -1 && refreshAt !== -1 && lockAt < refreshAt, 'the editor locks the edited rate before it refreshes the headers')
 })
 
-test('lockOrderNamedTaxRate locks the ACTIVE rate of the name FOR KEY SHARE (the mode a FOR UPDATE deactivation conflicts with) and reports how many rows it locked', async () => {
+test('lockOrderNamedTaxRate locks the line rates and the ACTIVE named rate in ONE statement, in id order, FOR SHARE, and a missing active rate is an error unless allowed', async () => {
   const source = readFileSync(path.join(ROOT, 'lib/tax/writable-tax-rate.ts'), 'utf8')
   const body = source.slice(source.indexOf('export async function lockOrderNamedTaxRate'))
-  assert.match(body, /WHERE active AND name = \$\{name\}/)
-  assert.match(body, /ORDER BY id\s+FOR KEY SHARE/, 'rows are locked in id order, like every other rate lock')
+  assert.match(body, /id = ANY\(\$\{ids\}::text\[\]\) OR \(active AND name = ANY\(\$\{names\}::text\[\]\)\) ORDER BY id FOR SHARE/)
   const seen: string[] = []
-  const tx = { $queryRaw: async (query: { sql?: string; values?: unknown[] }) => { seen.push(`${query.sql} <- ${JSON.stringify(query.values)}`); return [{ id: 'a' }, { id: 'b' }] } }
-  assert.equal(await lockOrderNamedTaxRate(tx, 'UK VAT'), 2)
+  const answer = (rows: unknown[]) => ({ $queryRaw: async (query: { sql?: string; values?: unknown[] }) => { seen.push(`${query.sql} <- ${JSON.stringify(query.values)}`); return rows } })
+  const rows = [{ id: 'a', name: 'UK VAT', active: true }, { id: 'b', name: 'Line rate', active: true }]
+  assert.equal(await lockOrderNamedTaxRate(answer(rows), 'UK VAT', { lineRateIds: ['b', 'b', null] }), 2)
   assert.equal(seen.length, 1)
-  assert.match(seen[0]!, /FOR KEY SHARE/)
-  assert.match(seen[0]!, /\["UK VAT"\]/)
-  assert.equal(await lockOrderNamedTaxRate({ $queryRaw: async () => [] }, 'Gone VAT'), 0, 'no active rate of that name: the count is 0')
-  for (const empty of [null, undefined, '']) assert.equal(await lockOrderNamedTaxRate(tx, empty), null, 'no name, nothing to lock')
-  assert.equal(seen.length, 1, 'no query for an empty name')
+  assert.match(seen[0]!, /FOR SHARE/)
+  assert.match(seen[0]!, /\[\["b"\],\["UK VAT"\]\]/, 'line ids de-duplicated, the name bound')
+  // Zero active rows of the name: refused (the deactivation won), unless the caller said the name never matched.
+  await assert.rejects(() => lockOrderNamedTaxRate(answer([{ id: 'b', name: 'Line rate', active: true }]), 'UK VAT', { lineRateIds: ['b'] }), NamedTaxRateGoneError)
+  await assert.rejects(() => lockOrderNamedTaxRate(answer([]), 'Gone VAT'), NamedTaxRateGoneError)
+  await assert.rejects(() => lockOrderNamedTaxRate(answer([{ id: 'a', name: 'UK VAT', active: false }]), 'UK VAT'), NamedTaxRateGoneError, 'an inactive row of the name is not the active rate')
+  assert.equal(await lockOrderNamedTaxRate(answer([]), 'Free text', { allowMissing: true }), 0)
+  // No name: only the lines are locked and nothing is required.
+  assert.equal(await lockOrderNamedTaxRate(answer([{ id: 'b', name: 'x', active: true }]), null, { lineRateIds: ['b'] }), 1)
+  for (const empty of [null, undefined, '']) assert.equal(await lockOrderNamedTaxRate(answer(rows), empty), null, 'no name and no lines: nothing to lock')
   assert.equal(await lockOrderNamedTaxRate({}, 'UK VAT'), null, 'a client with no raw access is not locked')
 })
 
@@ -142,13 +149,14 @@ const wrap = (inner: string): string => `async function f(db, input) {\n  return
 const sitesOf = (src: string): Site[] => salesOrderNameSites('fixture.ts', src).filter((s) => s.name !== null)
 
 test('the detector accepts a locked writer and reports each unlocked shape', () => {
-  const good = sitesOf(wrap(`    await lockOrderNamedTaxRate(tx, input.taxRateName)\n    return tx.salesOrder.create({ data: { orderNumber: 'x', taxRateName: input.taxRateName || null } })`))
+  const good = sitesOf(wrap(`    await lockOrderNamedTaxRate(tx, input.taxRateName, { lineRateIds: [] })\n    return tx.salesOrder.create({ data: { orderNumber: 'x', taxRateName: input.taxRateName || null } })`))
   assert.deepEqual(good.map((s) => s.locked), [true])
-  const shorthand = sitesOf(wrap(`    await lockOrderNamedTaxRate(tx, taxRateName)\n    return tx.salesOrder.create({ data: { orderNumber: 'x', taxRateName } })`))
+  const shorthand = sitesOf(wrap(`    await lockOrderNamedTaxRate(tx, taxRateName, { lineRateIds: [] })\n    return tx.salesOrder.create({ data: { orderNumber: 'x', taxRateName } })`))
   assert.deepEqual(shorthand.map((s) => s.locked), [true], 'shorthand is a write too')
   const offenders: Array<[string, string]> = [
     ['no lock at all', wrap(`    return tx.salesOrder.create({ data: { orderNumber: 'x', taxRateName: input.taxRateName } })`)],
     ['the lock comes after the write', wrap(`    const o = await tx.salesOrder.create({ data: { orderNumber: 'x', taxRateName: input.taxRateName } })\n    await lockOrderNamedTaxRate(tx, input.taxRateName)\n    return o`)],
+    ['the lock leaves the line rates out (a second, later statement would take them)', wrap(`    await lockOrderNamedTaxRate(tx, input.taxRateName)\n    return tx.salesOrder.create({ data: { orderNumber: 'x', taxRateName: input.taxRateName } })`)],
     ['the lock is on another name', wrap(`    await lockOrderNamedTaxRate(tx, other.name)\n    return tx.salesOrder.create({ data: { orderNumber: 'x', taxRateName: input.taxRateName } })`)],
     ['the lock is on the pooled client, not the transaction', wrap(`    await lockOrderNamedTaxRate(db, input.taxRateName)\n    return tx.salesOrder.create({ data: { orderNumber: 'x', taxRateName: input.taxRateName } })`)],
     ['the write is outside a transaction', `async function f(db, input) {\n  await lockOrderNamedTaxRate(db, input.taxRateName)\n  return db.salesOrder.create({ data: { orderNumber: 'x', taxRateName: input.taxRateName } })\n}`],

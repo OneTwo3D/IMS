@@ -1199,12 +1199,12 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
         if (existing) throw new Error(`Order ${externalOrderNumber} already exists`)
       }
 
+      // The rates this order rests on are locked FIRST, in one statement in id order (the lock order of lib/tax/writable-tax-rate.ts): the lines' rates and the ACTIVE rate the header names (the tax
+      // import's deactivateAbsent re-counts the orders naming a rate under FOR UPDATE). A rate that was found active above and is gone now was deactivated in between: this throws, and the order is
+      // not written naming it. A name that matched no active rate when it was resolved (free text) is allowed to match none.
+      await lockOrderNamedTaxRate(tx, input.taxRateName, { lineRateIds: lineData.map((l) => l.taxRateId), allowMissing: orderDefaultRate === null })
       // A supplied rate id that a tax re-key retired is resolved to its replacement; a plainly inactive one is refused (lib/tax/writable-tax-rate.ts), under the row share lock the apply waits on.
       await resolveLinesTaxRates(tx, lineData)
-      // The order-level named rate is locked to this commit (the tax import's deactivateAbsent re-counts the orders naming a rate under FOR UPDATE). A rate that was found active above and is
-      // gone now was deactivated in between: the order is not written naming it.
-      const lockedNamedRates = await lockOrderNamedTaxRate(tx, input.taxRateName)
-      if (orderDefaultRate !== null && lockedNamedRates === 0) throw new Error(`Tax rate "${input.taxRateName}" was deactivated while the order was being created. Choose an active tax rate.`)
       return tx.salesOrder.create({
         data: {
           externalOrderNumber,
@@ -3286,11 +3286,13 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     // recomputed from the foreign amounts at that rate with the same rounding the draft re-pricing uses (nothing is copied from the source's base fields). A currency with no rate
     // refuses (the central lookup's "Missing <base> FX rate ..."); the base currency is 1.
     const fxRate = await resolveFxRateToBase(db, so.currency, await getBaseCurrencyCode(), new Date())
+    const cloneNameWasActive = so.taxRateName ? (await db.taxRate.findFirst({ where: { name: so.taxRateName, active: true }, select: { id: true } })) !== null : false
     const clone = await db.$transaction(async (tx) => {
     // A cloned line's rate that a tax re-key retired follows its replacement; a plainly inactive one is refused (lib/tax/writable-tax-rate.ts).
+    // The clone names the source order's rate (the header name is copied): the line rates and the active named rate are locked together, in id order, BEFORE the lines are resolved. A name that had
+    // an active rate when the clone started and has none now was deactivated in between: the clone is refused (NamedTaxRateGoneError), never saved naming it.
+    await lockOrderNamedTaxRate(tx, so.taxRateName, { lineRateIds: so.lines.map((l) => l.taxRateId), allowMissing: !cloneNameWasActive })
     const cloneRates = await resolveWritableTaxRateIds(tx, so.lines.map((l) => l.taxRateId))
-    // The clone names the source order's rate (the header name is copied): locked to this commit like any order-level named rate.
-    await lockOrderNamedTaxRate(tx, so.taxRateName)
     return tx.salesOrder.create({
       data: {
         orderNumber: ref,

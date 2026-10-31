@@ -219,7 +219,7 @@ test('a deactivation waits for a writer that holds the rate, then sees that writ
 //  the lock taken on another mode (FOR NO KEY UPDATE) -> the writer is not made to wait for the deactivation: the second half is red]
 test('the order writers\' own lock (lockOrderNamedTaxRate) makes deactivateAbsent wait for an order that locked the named rate first, and a writer that arrives after the deactivation finds the rate inactive', { skip: !RUN }, async () => {
   const deps = await loadDeps()
-  const { lockOrderNamedTaxRate } = await import('../../lib/tax/writable-tax-rate.ts')
+  const { lockOrderNamedTaxRate, NamedTaxRateGoneError } = await import('../../lib/tax/writable-tax-rate.ts')
   const foreign = await clearForeignPurchaseRates(deps)
   const { db } = deps
   try {
@@ -265,12 +265,14 @@ test('the order writers\' own lock (lockOrderNamedTaxRate) makes deactivateAbsen
     try {
       await holdingFirst
       let settled = false
-      const writing = db.$transaction(async (tx) => lockOrderNamedTaxRate(tx, freed.name)).finally(() => { settled = true })
+      const writing = db.$transaction(async (tx) => lockOrderNamedTaxRate(tx, freed.name)).then((n) => ({ n }), (e: unknown) => ({ e })).finally(() => { settled = true })
       await new Promise((resolve) => setTimeout(resolve, 1000))
       assert.equal(settled, false, 'the writer waits for the deactivation that holds the rate')
       hold()
       await deactivator
-      assert.equal(await writing, 0, 'after the deactivation committed there is no active rate of the name to lock')
+      const outcome = await writing
+      assert.ok('e' in outcome && outcome.e instanceof NamedTaxRateGoneError, 'after the deactivation committed there is no active rate of the name: the writer is told, not silently let through')
+      assert.equal(await db.$transaction(async (tx) => lockOrderNamedTaxRate(tx, freed.name, { allowMissing: true })), 0, 'unless the caller allows a missing rate')
     } finally { hold(); await deactivator.catch(() => undefined) }
   } finally { await restoreForeign(deps, foreign) }
 })

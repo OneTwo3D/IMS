@@ -2624,14 +2624,17 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // analysis would narrow a `let` to `null` at the read site below.
     const importedReceiptRef = { id: null as string | null }
 
+    const headerRateWasActive = taxRateName ? (await db.taxRate.findFirst({ where: { name: taxRateName, active: true }, select: { id: true } })) !== null : false
     // Create the sales order
     let so
     try {
       so = await db.$transaction(async (tx) => {
+        // The rates this order rests on are locked FIRST, in one statement in id order (lib/tax/writable-tax-rate.ts): the lines' rates and the ACTIVE rate the header names (the tax import's
+        // deactivateAbsent re-counts the orders naming a rate under FOR UPDATE). A header rate that was active when it was resolved and is gone now throws NamedTaxRateGoneError: nothing is saved and the
+        // delivery fails like any other import error, to be retried (the next attempt resolves the header again). A name with no active rate at resolution (an operator-deactivated rate) is still imported.
+        await lockOrderNamedTaxRate(tx, taxRateName, { lineRateIds: lineData.map((l) => l.taxRateId), allowMissing: !headerRateWasActive })
         // A mapped rate that a tax re-key retired follows its replacement (lenient: an inbound order is never lost over an operator-deactivated rate); under the row share lock the apply waits on.
         await resolveLinesTaxRates(tx, lineData, { lenient: true })
-        // The order-level named rate is locked to this commit (the tax import's deactivateAbsent re-counts the orders naming a rate under FOR UPDATE); lenient like the lines: an inbound order is never lost over a rate.
-        await lockOrderNamedTaxRate(tx, taxRateName)
         const created = await tx.salesOrder.create({
         data: {
           externalOrderNumber: wcOrder.number,
