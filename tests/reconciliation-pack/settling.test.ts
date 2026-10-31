@@ -407,3 +407,62 @@ test('THE COMMAND: store lacks an order IMS holds - run 1 unsettled, run 2 unset
   assert.equal(await off, 5)
   assert.deepEqual((({ code, line }) => [code, line])(await command(dir, L4)), [5, 'R9 inconclusive UNSETTLED_PENDING,SETTLING_STATE_UNUSABLE'])
 })
+
+// ---- a carried stamp is verified against the prior reports of the chain ---------------------------------------------------------------
+
+type OkChain = Extract<ChainResult, { ok: true }>
+/** A copy of the chain with one report edited in memory (what a forged, hash-valid report would look like to the carry reader). */
+function forge(chain: OkChain, sequence: number, edit: (entry: OkChain['reports'][number]) => void): OkChain {
+  const copy = structuredClone(chain)
+  edit(copy.reports[sequence - 1]!)
+  return { ...copy, head: copy.reports[copy.reports.length - 1]! }
+}
+async function chainOf(stamps: string[]): Promise<OkChain> {
+  const dir = scratchDir(bases)
+  for (const stamp of stamps) await publishRun(dir, lacking(), stamp)
+  const chain = readPackChain(dir)
+  assert.equal(chain.ok, true)
+  return chain as OkChain
+}
+const carriedLater = (chain: OkChain) => [...(carriedStateFromChain(chain, 'R9', WHERE).carried.get('12')?.later ?? [])]
+
+// [mutation: carriedMatchesChain removed / any one of its checks removed]
+test('A CARRIED STAMP IS TAKEN ONLY IF THE PRIOR REPORTS BEAR IT OUT: the honest chain is used, every forgery gives no carried state', async () => {
+  const two = await chainOf([S1, S2])
+  const three = await chainOf([S1, S2, S3])
+  assert.deepEqual(carriedLater(two), [S2])
+  assert.deepEqual(carriedLater(three), [S2, S3], 'a persisted failure is carried too')
+  const unusable = (chain: OkChain, why: string) => assert.deepEqual(carriedStateFromChain(chain, 'R9', WHERE), unusableCarriedState(), why)
+  const line = (entry: OkChain['reports'][number]) => entry.settling[0]!
+
+  // the reviewed attack: a sequence-2 report that claims two later stamps (one run counted twice over)
+  unusable(forge(two, 2, (e) => { line(e).entry.settling = { sequence: 1, first: S1, later: [S2, S3], count: 2 } }), 'two stamps added by one report')
+  // the claimed stamp is not the one the report's own stream bracket read
+  unusable(forge(two, 2, (e) => { e.record.streams = e.record.streams.map((b) => (b.stream === 'woocommerce-order-sweep' ? { ...b, start: S4, end: S4 } : b)) }), 'a later stamp the report did not read')
+  unusable(forge(two, 2, (e) => { line(e).entry.settling = { sequence: 1, first: S1, later: [S4], count: 1 } }), 'a later stamp that is not the bracket start')
+  // the stream bracket of the adding report is not stable
+  unusable(forge(two, 2, (e) => { e.record.streams = e.record.streams.map((b) => (b.stream === 'woocommerce-order-sweep' ? { ...b, end: S4 } : b)) }), 'an unstable bracket')
+  // the first-seen report does not list the identity, or lists it with another first stamp, kind or values
+  unusable(forge(two, 1, (e) => { e.settling = [] }), 'the first-seen report does not list it')
+  unusable(forge(two, 1, (e) => { line(e).entry.settling = { sequence: 1, first: S3, later: [], count: 0 } }), 'another first stamp')
+  unusable(forge(two, 1, (e) => { line(e).entry.ims = '99' }), 'another value (a new difference, not a continuation)')
+  unusable(forge(two, 1, (e) => { line(e).entry.imsPresent = false; line(e).entry.vendorPresent = true }), 'another kind')
+  unusable(forge(two, 1, (e) => { e.record.streams = e.record.streams.map((b) => (b.stream === 'woocommerce-order-sweep' ? { ...b, start: S4, end: S4 } : b)) }), 'the first stamp is not the first-seen report\'s own bracket')
+  // a first-seen report that already counted a later stamp
+  unusable(forge(two, 1, (e) => { line(e).entry.settling = { sequence: 1, first: S1, later: [S2], count: 1 } }), 'later stamps in the first-seen report')
+  // the claimed first-seen sequence is wrong
+  unusable(forge(two, 2, (e) => { line(e).entry.settling = { sequence: 2, first: S1, later: [S2], count: 1 } }), 'claims the newest report as the first sight but counts a later stamp')
+  unusable(forge(two, 2, (e) => { line(e).entry.settling = { sequence: 3, first: S1, later: [], count: 0 } }), 'a first-seen report that does not exist yet')
+  // a report in between: not the same installation phase, not compared, shrinking list, a stamp that is not its own
+  unusable(forge(three, 2, (e) => { e.record.phase = 'P2' }), 'a report of another phase in between')
+  unusable(forge(three, 2, (e) => { e.record.items.find((i) => i.id === 'R9')!.reasons = ['CAP_EXCEEDED'] }), 'a report in between that did not compare the item to the end')
+  unusable(forge(three, 2, (e) => { e.settling = [] }), 'a report in between that lacks the identity')
+  unusable(forge(three, 2, (e) => { line(e).entry.settling = { sequence: 1, first: S1, later: [], count: 0 } }), 'a later list that shrinks and grows')
+  unusable(forge(three, 2, (e) => { line(e).entry.settling = { sequence: 1, first: S1, later: [S4], count: 1 } }), 'a list that is not a prefix of the next')
+  unusable(forge(three, 3, (e) => { line(e).entry.settling = { sequence: 1, first: S1, later: [S3, S2], count: 2 } }), 'a list that is not a prefix extension')
+  unusable(forge(three, 2, (e) => { e.record.systemIdentifier = '7000000000000000002' }), 'a report of another installation in between')
+  unusable(forge(three, 2, (e) => { e.record.items.find((i) => i.id === 'R9')!.applicability = 'not-applicable' }), 'a report in between where the item did not apply')
+  unusable(forge(three, 2, (e) => { e.settling = [e.settling[0]!, e.settling[0]!] }), 'listed twice in a report in between')
+  // two copies of the identity in one report
+  unusable(forge(two, 2, (e) => { e.settling = [e.settling[0]!, e.settling[0]!] }), 'listed twice')
+})

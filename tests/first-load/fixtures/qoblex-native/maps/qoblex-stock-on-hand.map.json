@@ -72,10 +72,14 @@
       "valueMaps": {
         "type": {
           "simple": "SIMPLE",
-          "variable": "VARIANT"
+          "variable": "VARIANT",
+          "kit": "KIT",
+          "bom": "BOM",
+          "non-inventory": "NON_INVENTORY"
         },
         "active": {
-          "Active": "TRUE"
+          "Active": "TRUE",
+          "Inactive": "FALSE"
         }
       }
     },
@@ -150,7 +154,12 @@
         "column": "Product Type",
         "keep": [
           "simple",
-          "variable"
+          "variable",
+          "bom"
+        ],
+        "skip": [
+          "kit",
+          "non-inventory"
         ]
       },
       "wide": {

@@ -324,8 +324,11 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
     const url = new URL(req.url ?? '/', 'http://x')
     const first = url.searchParams.get('page') === '1'
     const json = (body: unknown, total: number) => { res.writeHead(200, { 'content-type': 'application/json', 'x-wp-total': String(total), 'x-wp-totalpages': String(total ? 1 : 0) }); res.end(JSON.stringify(body)) }
-    if (url.pathname === '/wp-json/wc/v3/orders') return url.searchParams.get('status') === 'processing' ? json(first ? [row(9001), row(9002)] : [], 2) : json([], 0)
-    if (url.pathname === '/wp-json/wc/v3/taxes') return json(first ? [{ id: 7001, name: 'x', rate: '20.0000', country: '', state: '', postcode: '', city: '', class: '', shipping: true, compound: false }] : [], 1)
+    // The store honours `_fields` (only the listed top-level fields of a row are sent), as WordPress does; the transport refuses a store that does not.
+    const wanted = (url.searchParams.get('_fields') ?? '').split(',')
+    const only = (r: Record<string, unknown>) => Object.fromEntries(Object.entries(r).filter(([name]) => wanted.includes(name)))
+    if (url.pathname === '/wp-json/wc/v3/orders') return url.searchParams.get('status') === 'processing' ? json(first ? [row(9001), row(9002)].map(only) : [], 2) : json([], 0)
+    if (url.pathname === '/wp-json/wc/v3/taxes') return json(first ? [only({ id: 7001, name: 'x', rate: '20.0000', country: '', state: '', postcode: '', city: '', class: '', shipping: true, compound: false })] : [], 1)
     res.writeHead(404); res.end('{}')
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))

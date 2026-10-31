@@ -52,6 +52,40 @@ export function wooHopRefusal(base: URL, hop: { method: string; url: URL; redire
   return null
 }
 
+const REFUSED = Symbol('refused')
+
+/**
+ * The top-level fields one request asked for (`_fields=a,b.c` asks for `a` and `b`), or null when it asked for none: a request with no
+ * field list would let the store answer with everything it holds about an order, so it is not sent. Exported so a test drives it.
+ */
+export function requestedFields(params: Readonly<Record<string, string>>): ReadonlySet<string> | null {
+  const raw = params._fields
+  if (typeof raw !== 'string' || raw.length === 0) return null
+  const names = raw.split(',').map((name) => name.split('.')[0]!).filter((name) => name.length > 0)
+  return names.length === 0 ? null : new Set(names)
+}
+
+/**
+ * The answer reduced to the requested projection, or REFUSED when any object in it carries a key that was not requested. Refusing (not
+ * quietly dropping) is deliberate: a store that ignores `_fields` is one whose other answers cannot be trusted to stay inside the
+ * boundary either, and the walk then reports the source as unreadable. Only the objects of the answer are judged here; their values
+ * are the parsers' (woo-source.ts) to validate.
+ */
+export function projectToRequested(body: unknown, requested: ReadonlySet<string>): unknown | typeof REFUSED {
+  const rows: unknown[] = Array.isArray(body) ? body : [body]
+  const out: unknown[] = []
+  for (const row of rows) {
+    if (typeof row !== 'object' || row === null || Array.isArray(row)) { out.push(row); continue }
+    const projected: Record<string, unknown> = {}
+    for (const [name, value] of Object.entries(row)) {
+      if (!requested.has(name)) return REFUSED
+      projected[name] = value
+    }
+    out.push(projected)
+  }
+  return Array.isArray(body) ? out : out[0]
+}
+
 export function createWooGetPort(deps: WooTransportDeps): WooGetPort {
   const send = deps.fetchImpl ?? connectorFetch
   let credentials: Promise<WooCredentials | null> | null = null
@@ -62,6 +96,8 @@ export function createWooGetPort(deps: WooTransportDeps): WooGetPort {
         credentials ??= deps.readCredentials().catch(() => null)
         const creds = await credentials
         if (creds === null) return { ok: false }
+        const requested = requestedFields(params)
+        if (requested === null) return { ok: false }
         const base = new URL(creds.baseUrl)
         const url = new URL(`${creds.baseUrl.replace(/\/+$/, '')}/wp-json/wc/v3/${collection}`)
         for (const [name, value] of Object.entries(params)) url.searchParams.set(name, value)
@@ -79,7 +115,11 @@ export function createWooGetPort(deps: WooTransportDeps): WooGetPort {
         })
         if (response.status < 200 || response.status > 299) return { ok: false }
         if (!(response.headers.get('content-type') ?? '').includes('application/json')) return { ok: false }
-        const body: unknown = await response.json()
+        const parsed: unknown = await response.json()
+        // THE CUSTOMER-DATA BOUNDARY: only what this request asked for (`_fields`) is ever handed on. A store that ignores `_fields` and
+        // answers with whole orders (billing, shipping, customer, notes) is refused; nothing of that body leaves this function.
+        const body = projectToRequested(parsed, requested)
+        if (body === REFUSED) return { ok: false }
         return { ok: true, status: response.status, total: response.headers.get('x-wp-total'), totalPages: response.headers.get('x-wp-totalpages'), body }
       } catch {
         return { ok: false }
