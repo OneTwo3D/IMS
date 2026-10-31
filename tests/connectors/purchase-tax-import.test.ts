@@ -482,3 +482,18 @@ test('sales mirroring covers a Xero type usable on BOTH revenue and expenses: on
   // A dual type already in the purchase types is the purchase side's (not duplicated into the sales targets).
   assert.deepEqual((await plan({ rates: [], list: [...XERO_LIST, DUAL('DUALNEW')] }, { mirrorSales: true, types: ['DUALNEW'] })).salesTypes.includes('DUALNEW'), false)
 })
+
+// [mutation: the requested dual-side type kept as a PURCHASE target (the BOTH conversion removed) -> the BOTH arm is red; the dual-side exemption removed from the sales-target filter -> the purchase-row arm is red]
+test('a dual-side type named among the requested purchase types gets ONE BOTH row when no IMS rate carries it, and a separate SALES target when only a purchase row does', async () => {
+  const list = [...XERO_LIST, DUAL('DUALREQ')]
+  const none = await plan({ rates: [], list }, { mirrorSales: true, types: ['DUALREQ'] })
+  assert.deepEqual(none.refusals, [])
+  assert.deepEqual(none.creates.filter((c) => c.taxType === 'DUALREQ').map((c) => [c.side, c.rate]), [['BOTH', '0.2000']], 'one row, usable for both sides')
+  assert.deepEqual(none.rateSet.filter((e) => e.taxType === 'DUALREQ').map((e) => [e.side, e.status]), [['BOTH', 'created']])
+  assert.equal(none.salesTypes.includes('DUALREQ'), false)
+  const sales = await plan({ rates: [], list }, { types: ['DUALREQ'] })
+  assert.deepEqual(sales.creates.map((c) => [c.taxType, c.side]), [['DUALREQ', 'PURCHASE']], 'without sales mirroring the request stays a purchase row')
+  const purchaseRow = await plan({ rates: [ims('p', 'Old purchase', 'PURCHASE', 'DUALREQ')], list }, { mirrorSales: true, types: ['DUALREQ'] })
+  assert.deepEqual(purchaseRow.creates.filter((c) => c.taxType === 'DUALREQ').map((c) => c.side), ['SALES'], 'a separate sales row is planned and validated')
+  assert.deepEqual(purchaseRow.rateSet.filter((e) => e.taxType === 'DUALREQ').map((e) => e.side).sort(), ['PURCHASE', 'SALES'])
+})

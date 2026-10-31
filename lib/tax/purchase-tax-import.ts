@@ -296,6 +296,8 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
   // The sales side (opt-in): the defaults, EVERY active Xero type that applies to revenue (revenue-only, and dual-side types that also apply to expenses), and the types of the active
   // sales-capable IMS rates that Xero lists as revenue types. A dual-side type that no active IMS row carries is ONE row usable for both sides ('BOTH'); one that an IMS row carries
   // for the purchase side only gets a SALES target (refused by name, e.g. a name collision, when it cannot be represented), so no active type is silently left out.
+  const dualActive = (type: string): boolean => { const x = xeroByType.get(type); return x !== undefined && x.status === 'ACTIVE' && x.canApply.revenue === true && x.canApply.expenses === true }
+  const bothRequested = new Set<string>(options.mirrorSales ? types.filter((type) => dualActive(type) && !existing.some((r) => r.active && r.accountingTaxType === type)) : [])
   const sideOfType = new Map<string, Side>()
   if (options.mirrorSales) {
     const wanted = new Map<string, Side>(SALES_TAX_IMPORT_TYPES.map((t) => [t, 'SALES' as Side]))
@@ -305,10 +307,12 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
       wanted.set(row.taxType, existing.some((r) => r.active && r.accountingTaxType === row.taxType) ? 'SALES' : 'BOTH')
     }
     for (const row of existing) if (row.active && row.accountingTaxType !== null && usable(row, 'SALES') && xeroByType.get(row.accountingTaxType)?.canApply.revenue === true && !wanted.has(row.accountingTaxType)) wanted.set(row.accountingTaxType, 'SALES')
-    for (const [type, side] of wanted) if (!types.includes(type)) sideOfType.set(type, side)
+    // A purchase type that is also usable on revenue: with no active IMS row it is planned below as ONE row usable for both sides, so it has no sales target of its own; with a row that is not
+    // usable for sales it keeps a separate SALES target (planned and validated like any other).
+    for (const [type, side] of wanted) if (!types.includes(type) || (dualActive(type) && !bothRequested.has(type))) sideOfType.set(type, side)
     plan.salesTypes = [...sideOfType.keys()].sort()
   }
-  const targets: Array<{ type: string; side: Side }> = [...types.map((type) => ({ type, side: 'PURCHASE' as Side })), ...plan.salesTypes.map((type) => ({ type, side: sideOfType.get(type)! }))]
+  const targets: Array<{ type: string; side: Side }> = [...types.map((type) => ({ type, side: (bothRequested.has(type) ? 'BOTH' : 'PURCHASE') as Side })), ...plan.salesTypes.map((type) => ({ type, side: sideOfType.get(type)! }))]
   const sideWord = (side: Side): string => (side === 'PURCHASE' ? 'purchases' : side === 'SALES' ? 'sales' : 'purchases and sales')
 
   for (const { type, side } of targets) {
@@ -462,6 +466,8 @@ export interface PurchaseTaxImportWrite {
 /**
  * Lock a row that is about to be deactivated (FOR UPDATE: a writer holding the share lock of writable-tax-rate.ts finishes first, a later one waits for this transaction and then reads it
  * inactive) and re-count what depends on it. Whatever came to depend on it since the plan stops the write, which rolls back as a whole.
+ * STATED LIMIT: sales-order creation does not lock the rate it names (taxRateName), so an order can name the rate between this re-count and the deactivation's commit. Run deactivateAbsent only
+ * while sales intake is paused (first load, setup).
  */
 async function lockAndRecheck(tx: Client, row: { id: string; name: string }): Promise<void> {
   // A Prisma.Sql object (not a tagged template) so a structural test double without raw access is simply not locked.

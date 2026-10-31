@@ -11,7 +11,7 @@
 import { db } from '@/lib/db'
 import { normalizeProductCategoryName } from '@/lib/products/category-name'
 import { normaliseCategory } from '../normal-form'
-import { loadFacts, setFactOnce } from './journal'
+import { loadFacts, setFactOnceIn } from './journal'
 import type { PreparedRun } from '../prepared'
 import type { ApplyStepId } from '../constants'
 
@@ -82,18 +82,27 @@ interface ImportedTax { rates: Map<string, string>; components: Map<string, stri
 
 const isDigest = (x: unknown): x is string => typeof x === 'string' && /^[0-9a-f]{32}$/.test(x)
 
-async function readTaxRows(): Promise<{ rates: Array<{ id: string; d: string }>; components: Array<{ id: string; d: string }> }> {
-  const [rates, components] = await Promise.all([
-    db.$queryRaw<Array<{ id: string; d: string }>>`SELECT id, md5(r::text) AS d FROM tax_rates r`,
-    db.$queryRaw<Array<{ id: string; d: string }>>`SELECT id, md5(c::text) AS d FROM tax_rate_components c`,
-  ])
+type TaxRows = { rates: Array<{ id: string; d: string }>; components: Array<{ id: string; d: string }> }
+type RawClient = { $queryRaw<T>(query: TemplateStringsArray): Promise<T> }
+
+async function readTaxRows(client: RawClient = db, between?: () => Promise<void>): Promise<TaxRows> {
+  const rates = await client.$queryRaw<TaxRows['rates']>`SELECT id, md5(r::text) AS d FROM tax_rates r`
+  if (between) await between()
+  const components = await client.$queryRaw<TaxRows['components']>`SELECT id, md5(c::text) AS d FROM tax_rate_components c`
   return { rates, components }
 }
 
-/** Record the content of both tax tables once (the first recording wins). */
-export async function captureTaxBaseline(): Promise<boolean> {
-  const { rates, components } = await readTaxRows()
-  return setFactOnce(TAX_BASELINE_FACT, { rates: rates.map((r) => r.d).sort(), components: components.map((r) => r.d).sort() } satisfies TaxContent)
+/**
+ * Record the content of both tax tables once (the first recording wins). BOTH tables are read, and the fact written, inside ONE REPEATABLE READ transaction, so the starting point is a single
+ * point-in-time view: a rate or component edited while the capture runs is either entirely in the baseline (committed before the snapshot) or entirely outside it (and then counted as foreign),
+ * never half absorbed. There is no shared write barrier for the tax tables (their editors take only row locks), so the snapshot alone makes the view consistent. `between` is a test seam run
+ * between the two reads.
+ */
+export async function captureTaxBaseline(between?: () => Promise<void>): Promise<boolean> {
+  return db.$transaction(async (tx) => {
+    const { rates, components } = await readTaxRows(tx as unknown as RawClient, between)
+    return setFactOnceIn(tx, TAX_BASELINE_FACT, { rates: rates.map((r) => r.d).sort(), components: components.map((r) => r.d).sort() } satisfies TaxContent)
+  }, { isolationLevel: 'RepeatableRead' })
 }
 
 function parseTaxBaseline(raw: unknown): TaxContent | null {
