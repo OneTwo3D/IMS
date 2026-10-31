@@ -26,6 +26,7 @@ import { importSupplierTaxRates } from './tax-import'
 import type { PreloadReaders } from './preload-rails'
 import { DATABASE_READ_FAILED } from './observe'
 import { ObservationError } from '../residual'
+import { captureTaxBaseline } from './attribution'
 import { captureBaseline, createVerifier, type VerifyDeps } from './verify'
 
 /** The run-record fact that names the restore point taken before the first write (recorded once). */
@@ -90,18 +91,18 @@ export function createDbPorts(prepared: PreparedRun, options: DbPortsOptions): A
       // The census starting point: once, after the rails passed at the start of a step and before any importer call of it. The first step of the first attempt records it; later calls change nothing.
       if (problems.length === 0 && phase === 'step-start' && (options.verification || options.restorePoint)) {
         try {
-          if (options.verification) await captureBaseline()
+          // The tax content first (before any import of this run), then the census baseline: a baseline on the record always has its tax content beside it.
+          if (options.verification) { await captureTaxBaseline(); await captureBaseline() }
           if (options.restorePoint) await setFactOnce(RESTORE_POINT_FACT, options.restorePoint)
         } catch {
           throw new ObservationError(DATABASE_READ_FAILED)
         }
       }
-      // Just before the first SUPPLIER write, with every rail holding: a purchase tax type with no IMS rate is imported from the stored Xero list (tax-import.ts), then the supplier tax rail is
-      // evaluated again WITHOUT the import allowance - the rates must now exist and be unique. The step lock is held and the run record exists; tax_rates is a table the runner may write.
+      // Just before the first SUPPLIER write, with every rail holding: a purchase tax type with no IMS rate is imported from the stored Xero list (tax-import.ts; the rates and the run fact
+      // `purchaseTaxImport` commit in ONE transaction), then the supplier tax rail is evaluated again WITHOUT the import allowance - the rates must now exist and be unique. The step lock is held and the run record exists; tax_rates is a table the runner may write.
       if (problems.length === 0 && step === 'suppliers' && phase === 'before-first-write') {
         const imported = await importSupplierTaxRates(prepared)
         if (imported.problems.length > 0) return note([{ id: 'tax-rates', problems: imported.problems, detail: '' }])
-        if (imported.summary !== null) await setFactOnce('purchaseTaxImport', imported.summary)
         return note(await evaluateRailResults(prepared, { phase: 'recheck', resuming: true, step, strictSupplierTax: true }, options.preload))
       }
       // Just before the first purchase-order write, with every rail holding: record which accounting profile each tax lookup of the file resolves to. Only the first recording counts.

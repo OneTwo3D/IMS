@@ -11,6 +11,7 @@
 import { db } from '@/lib/db'
 import { normalizeProductCategoryName } from '@/lib/products/category-name'
 import { normaliseCategory } from '../normal-form'
+import { loadFacts, setFactOnceIn } from './journal'
 import type { PreparedRun } from '../prepared'
 import type { ApplyStepId } from '../constants'
 
@@ -64,14 +65,105 @@ function factsOf(prepared: PreparedRun): FileFacts {
   return f
 }
 
+// ---------------------------------------------------------------------------
+// The tax tables. tax_rates / tax_rate_components are the target's own configuration plus the purchase rates the suppliers step imports from the stored Xero list. The runner has no
+// business with any other row, so a rate added, edited or removed by anyone else during the load must show here: the content of both tables is recorded once before the first importer
+// call (TAX_BASELINE_FACT: a digest of every row), the rows the import wrote are recorded with their committed digests (the run fact purchaseTaxImport, written in the transaction that
+// wrote them), and a table's unattributed count is
+//   - a row the import recorded whose id is unknown or whose content is no longer the committed one,
+//   - plus every other row whose digest the baseline does not hold, plus every baseline row (by digest, as a multiset) no other row accounts for.
+// Without a recorded tax baseline there is nothing to compare with (no verification was asked for, so the load cannot end VERIFIED either): no count is made.
+// ---------------------------------------------------------------------------
+
+export const TAX_BASELINE_FACT = 'taxBaseline'
+
+interface TaxContent { rates: string[]; components: string[] }
+interface ImportedTax { rates: Map<string, string>; components: Map<string, string> }
+
+const isDigest = (x: unknown): x is string => typeof x === 'string' && /^[0-9a-f]{32}$/.test(x)
+
+type TaxRows = { rates: Array<{ id: string; d: string }>; components: Array<{ id: string; d: string }> }
+type RawClient = { $queryRaw<T>(query: TemplateStringsArray): Promise<T> }
+
+async function readTaxRows(client: RawClient = db, between?: () => Promise<void>): Promise<TaxRows> {
+  const rates = await client.$queryRaw<TaxRows['rates']>`SELECT id, md5(r::text) AS d FROM tax_rates r`
+  if (between) await between()
+  const components = await client.$queryRaw<TaxRows['components']>`SELECT id, md5(c::text) AS d FROM tax_rate_components c`
+  return { rates, components }
+}
+
+/**
+ * Record the content of both tax tables once (the first recording wins). BOTH tables are read, and the fact written, inside ONE REPEATABLE READ transaction, so the starting point is a single
+ * point-in-time view: a rate or component edited while the capture runs is either entirely in the baseline (committed before the snapshot) or entirely outside it (and then counted as foreign),
+ * never half absorbed. There is no shared write barrier for the tax tables (their editors take only row locks), so the snapshot alone makes the view consistent. `between` is a test seam run
+ * between the two reads.
+ */
+export async function captureTaxBaseline(between?: () => Promise<void>): Promise<boolean> {
+  return db.$transaction(async (tx) => {
+    const { rates, components } = await readTaxRows(tx as unknown as RawClient, between)
+    return setFactOnceIn(tx, TAX_BASELINE_FACT, { rates: rates.map((r) => r.d).sort(), components: components.map((r) => r.d).sort() } satisfies TaxContent)
+  }, { isolationLevel: 'RepeatableRead' })
+}
+
+function parseTaxBaseline(raw: unknown): TaxContent | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null
+  const r = raw as Record<string, unknown>
+  if (!Array.isArray(r.rates) || !Array.isArray(r.components) || !r.rates.every(isDigest) || !r.components.every(isDigest)) return null
+  return { rates: r.rates as string[], components: r.components as string[] }
+}
+
+/** The rows the import recorded (id -> committed digest). A fact in any other shape records nothing: its rows are then unattributed. */
+function parseImportedTax(raw: unknown): ImportedTax {
+  const out: ImportedTax = { rates: new Map(), components: new Map() }
+  const created = typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>).created : null
+  if (!Array.isArray(created)) return out
+  for (const entry of created) {
+    if (typeof entry !== 'object' || entry === null) continue
+    const e = entry as Record<string, unknown>
+    if (typeof e.id !== 'string' || !isDigest(e.digest)) continue
+    out.rates.set(e.id, e.digest)
+    if (Array.isArray(e.components)) for (const c of e.components) {
+      if (typeof c === 'object' && c !== null && typeof (c as Record<string, unknown>).id === 'string' && isDigest((c as Record<string, unknown>).digest)) out.components.set((c as { id: string }).id, (c as { digest: string }).digest)
+    }
+  }
+  return out
+}
+
+/** Rows (id, digest) the import does not account for, then the multiset difference with the baseline both ways. */
+export function unattributedTaxRows(rows: ReadonlyArray<{ id: string; d: string }>, imported: ReadonlyMap<string, string>, baseline: readonly string[]): number {
+  let count = 0
+  const rest = new Map<string, number>()
+  const present = new Set(rows.map((r) => r.id))
+  // A row the import recorded that is gone now is a foreign change too (it is in no baseline, so the digest comparison below cannot see it).
+  for (const id of imported.keys()) if (!present.has(id)) count += 1
+  for (const row of rows) {
+    if (imported.has(row.id)) { if (imported.get(row.id) !== row.d) count += 1; continue }
+    rest.set(row.d, (rest.get(row.d) ?? 0) + 1)
+  }
+  const held = new Map<string, number>()
+  for (const d of baseline) held.set(d, (held.get(d) ?? 0) + 1)
+  for (const d of new Set([...rest.keys(), ...held.keys()])) count += Math.abs((rest.get(d) ?? 0) - (held.get(d) ?? 0))
+  return count
+}
+
+async function unattributedTax(table: 'rates' | 'components'): Promise<number> {
+  const facts = await loadFacts()
+  const baseline = parseTaxBaseline(facts[TAX_BASELINE_FACT])
+  if (baseline === null) return 0
+  const imported = parseImportedTax(facts['purchaseTaxImport'])
+  const rows = await readTaxRows()
+  return table === 'rates' ? unattributedTaxRows(rows.rates, imported.rates, baseline.rates) : unattributedTaxRows(rows.components, imported.components, baseline.components)
+}
+
 const unattributed = <T>(rows: T[], attributed: (row: T) => boolean): number => rows.filter((row) => !attributed(row)).length
 
 export const ATTRIBUTION_RULES: Readonly<Record<string, Rule>> = {
   activity_logs: async () => 0,
   first_load_apply_runs: async () => 0,
-  // The target's own tax configuration, judged by the tax rails; the only rows the runner adds are the purchase rates imported from the stored Xero list (recorded as the run's fact purchaseTaxImport).
-  tax_rates: async () => 0,
-  tax_rate_components: async () => 0,
+  // The target's own tax configuration (recorded as the run's fact taxBaseline) plus the purchase rates imported from the stored Xero list (recorded, with their committed digests, as the run's
+  // fact purchaseTaxImport): any other rate added, changed or removed during the load is unattributed.
+  tax_rates: async () => unattributedTax('rates'),
+  tax_rate_components: async () => unattributedTax('components'),
   suppliers: async (p) => {
     const f = factsOf(p)
     return unattributed(await db.supplier.findMany({ select: { name: true } }), (r) => f.suppliers.has(r.name.trim().toLowerCase()))

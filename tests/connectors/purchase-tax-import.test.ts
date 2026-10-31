@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
-  checkRatesAgainstXero, describeRefusals, planPurchaseTaxImport, readStoredXeroList, writePurchaseTaxImport,
+  checkRatesAgainstXero, describeRefusals, planPurchaseTaxImport, PurchaseTaxImportRaceError, readStoredXeroList, writePurchaseTaxImport,
   type PurchaseTaxImportPlan,
 } from '@/lib/tax/purchase-tax-import'
 import { digestTaxRateList, type NormalisedXeroTaxRate } from '@/lib/connectors/xero/tax-rate-list'
@@ -34,8 +34,10 @@ const XERO_LIST = [
   xeroRow('ZERORATEDOUTPUT', { name: 'Zero Rated Income', effectiveRate: '0.000000', displayTaxRate: '0.000000', components: [{ name: 'Zero', rate: '0.000000', compound: false, nonRecoverable: false }], expenses: false, revenue: true }),
 ]
 
-type ImsRow = { countryCode?: string | null; id: string; name: string; rate: string; usedFor: string; active: boolean; accountingTaxType: string | null; isDefault: boolean; refs?: number }
-type State = { rates: ImsRow[]; list: NormalisedXeroTaxRate[] | null; tenant?: string; fetchedAt?: Date; stamp?: string | null; headerDigest?: string; settings?: Record<string, string>; rowCount?: number }
+type ImsRow = { countryCode?: string | null; id: string; name: string; rate: string; usedFor: string; active: boolean; accountingTaxType: string | null; isDefault: boolean; refs?: number; /** non-cancelled sales order lines on it */ live?: number; /** non-cancelled purchase order lines on it */ livePo?: number; /** non-cancelled sales orders naming it */ named?: number }
+type SupplierRow = { id: string; taxRateId: string | null }
+type Mapping = { id: string; taxRateId: string; storeIdentity: string | null }
+type State = { suppliers?: SupplierRow[]; mappings?: Mapping[]; rates: ImsRow[]; list: NormalisedXeroTaxRate[] | null; tenant?: string; fetchedAt?: Date; stamp?: string | null; headerDigest?: string; settings?: Record<string, string>; rowCount?: number }
 
 const decimal = (s: string) => ({ toFixed: (dp?: number) => (dp === undefined ? s : Number(s).toFixed(dp)) })
 
@@ -66,9 +68,12 @@ function client(state: State) {
         return v === undefined ? null : { value: v }
       },
     },
+    salesOrderLine: { count: async ({ where }: { where: { taxRateId: string } }) => state.rates.find((r) => r.id === where.taxRateId)?.live ?? 0 },
+    purchaseOrderLine: { count: async ({ where }: { where: { taxRateId: string } }) => state.rates.find((r) => r.id === where.taxRateId)?.livePo ?? 0 },
+    salesOrder: { count: async ({ where }: { where: { taxRateName: string } }) => state.rates.filter((r) => r.name === where.taxRateName).reduce((n, r) => n + (r.named ?? 0), 0) },
     taxRate: {
       findMany: async () => state.rates.map((r) => ({
-        id: r.id, name: r.name, rate: decimal(r.rate), usedFor: r.usedFor, active: r.active, accountingTaxType: r.accountingTaxType, isDefault: r.isDefault, countryCode: r.countryCode ?? null,
+        id: r.id, name: r.name, rate: decimal(r.rate), usedFor: r.usedFor, active: r.active, accountingTaxType: r.accountingTaxType, isDefault: r.isDefault, countryCode: r.countryCode ?? null, components: [],
         _count: { supplierTaxRate: r.refs ?? 0, poLines: r.refs ?? 0, orderLines: 0, shoppingTaxRateMappings: 0 },
       })),
     },
@@ -91,15 +96,39 @@ const codes = (p: PurchaseTaxImportPlan) => p.refusals.map((r) => `${r.code}${r.
 async function applyTo(state: State, p: PurchaseTaxImportPlan): Promise<{ calls: Array<{ op: string; data?: Record<string, unknown>; where?: Record<string, unknown> }> }> {
   const calls: Array<{ op: string; data?: Record<string, unknown>; where?: Record<string, unknown> }> = []
   const tx = {
+    ...(client(state) as object),
+    $executeRaw: async () => { calls.push({ op: 'lock' }); return 0 },
+    supplier: {
+      updateMany: async ({ where, data }: { where: { taxRateId: string }; data: { taxRateId: string } }) => {
+        calls.push({ op: 'supplier.updateMany', where, data })
+        const hit = (state.suppliers ?? []).filter((x) => x.taxRateId === where.taxRateId)
+        for (const x of hit) x.taxRateId = data.taxRateId
+        return { count: hit.length }
+      },
+    },
+    shoppingTaxRateMapping: {
+      updateMany: async ({ where, data }: { where: { taxRateId: string }; data: { taxRateId: string; storeIdentity: null } }) => {
+        calls.push({ op: 'mapping.updateMany', where, data })
+        const hit = (state.mappings ?? []).filter((x) => x.taxRateId === where.taxRateId)
+        for (const x of hit) { x.taxRateId = data.taxRateId; x.storeIdentity = data.storeIdentity }
+        return { count: hit.length }
+      },
+    },
     taxRate: {
+      findUnique: async ({ where }: { where: { id: string } }) => {
+        const r = state.rates.find((x) => x.id === where.id)
+        return r === undefined ? null : { name: r.name, rate: decimal(r.rate), usedFor: r.usedFor, active: r.active, components: [] }
+      },
       create: async ({ data }: { data: Record<string, unknown> }) => {
         calls.push({ op: 'create', data })
-        state.rates.push(ims(`new-${state.rates.length}`, data.name as string, data.usedFor as string, data.accountingTaxType as string, { rate: data.rate as string }))
-        return {}
+        const id = `new-${state.rates.length}`
+        state.rates.push(ims(id, data.name as string, data.usedFor as string, data.accountingTaxType as string, { rate: data.rate as string }))
+        return { id }
       },
       updateMany: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
         calls.push({ op: 'updateMany', where, data })
         const row = state.rates.find((r) => r.id === where.id)!
+        if ((where as { isDefault?: boolean }).isDefault === false && row.isDefault) return { count: 0 }
         if ('usedFor' in data) row.usedFor = data.usedFor as string
         if ('active' in data) row.active = data.active as boolean
         return { count: 1 }
@@ -355,4 +384,170 @@ test('checkRatesAgainstXero holds the rate column AND the effective rate to Xero
     const r = await check(bad, [{ taxType: 'INPUT2', rate: '0.2000', effective: '0.2000' }], tenant)
     assert.equal(r.ok, false, label)
   }
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Live documents, supplier defaults and dual-side types.
+
+const activeOf = (state: State, id: string): boolean => state.rates.find((r) => r.id === id)!.active
+
+// [mutation: the live-document count removed from the deactivation guard -> every arm is red; each of its three terms (sales lines, purchase lines, orders naming the rate) dropped -> its arm is red;
+//  the re-count at the write removed -> the race arm is red; the lock-and-recheck skipped for a deactivation -> the race arm is red]
+test('deactivateAbsent keeps a rate that a live document still resolves its tax identity through (sales lines, purchase lines, or an order naming it), reports why, and deactivates the rest', async () => {
+  const rates = (): ImsRow[] => [
+    ims('uk', 'UK VAT', 'BOTH', 'OUTPUT2', { isDefault: true }),
+    ims('free', 'Demo free', 'BOTH', 'TAX001'),
+    ims('lines', 'Demo sales lines', 'BOTH', 'TAX002', { live: 2 }),
+    ims('po', 'Demo purchase lines', 'BOTH', 'TAX003', { livePo: 1 }),
+    ims('named', 'Demo named', 'BOTH', 'TAX004', { named: 3 }),
+  ]
+  const state: State = { rates: rates(), list: XERO_LIST }
+  const p = await plan(state, { deactivateAbsent: true })
+  assert.deepEqual(p.notInXero.map((r) => [r.id, r.deactivate, r.keptBecause, r.liveDocuments]), [
+    ['free', true, null, 0], ['lines', false, 'LIVE_DOCUMENTS', 2], ['po', false, 'LIVE_DOCUMENTS', 1], ['named', false, 'LIVE_DOCUMENTS', 3],
+  ])
+  await applyTo(state, p)
+  assert.deepEqual(state.rates.filter((r) => !r.id.startsWith('new-')).map((r) => [r.id, r.active]), [['uk', true], ['free', false], ['lines', true], ['po', true], ['named', true]], 'only the free rate is deactivated')
+  // Without the opt-in nothing is checked and nothing deactivated.
+  assert.deepEqual((await plan({ rates: rates(), list: XERO_LIST })).notInXero.map((r) => [r.id, r.deactivate, r.liveDocuments]), [['free', false, null], ['lines', false, null], ['po', false, null], ['named', false, null]])
+  // A document that appears between the plan and the write stops the write: the row is not deactivated.
+  const racing: State = { rates: rates(), list: XERO_LIST }
+  const planned = await plan(racing, { deactivateAbsent: true })
+  racing.rates.find((r) => r.id === 'free')!.live = 1
+  await assert.rejects(() => applyTo(racing, planned), PurchaseTaxImportRaceError)
+  assert.equal(activeOf(racing, 'free'), true)
+})
+
+// [mutation: the supplier re-point removed -> the supplier arm is red; the mapping re-point removed -> the mapping arm is red; the re-point runs for a row that was not deactivated -> the default arm is red;
+//  the live-document check removed from the replace branch -> the blocked arm is red; the re-check at the write removed -> the race arm is red]
+test('replaceDiffering moves the supplier defaults and storefront mappings of the old rate to the new one in the same write, and does not replace a rate that live documents depend on', async () => {
+  const state: State = {
+    rates: [ims('old', 'Old UK VAT', 'BOTH', 'OUTPUT2', { rate: '0.1500' }), ims('busy', 'Old input', 'PURCHASE', 'INPUT2', { rate: '0.1500', live: 1 })],
+    list: XERO_LIST,
+    suppliers: [{ id: 's1', taxRateId: 'old' }, { id: 's2', taxRateId: 'old' }, { id: 's3', taxRateId: 'busy' }, { id: 's4', taxRateId: null }],
+    mappings: [{ id: 'm1', taxRateId: 'old', storeIdentity: 'store-a' }, { id: 'm2', taxRateId: 'busy', storeIdentity: 'store-a' }],
+  }
+  const p = await plan(state, { mirrorSales: true, replaceDiffering: true })
+  assert.deepEqual(p.differs.map((d) => [d.taxType, d.replaced, d.keptBecause, d.liveDocuments]).sort(), [['INPUT2', false, 'LIVE_DOCUMENTS', 1], ['OUTPUT2', true, null, 0]])
+  assert.equal(p.creates.some((c) => c.taxType === 'INPUT2'), false, 'the busy rate gets no replacement')
+  assert.deepEqual(p.rateSet.filter((e) => e.taxType === 'INPUT2').map((e) => e.status), ['differs'])
+  await applyTo(state, p)
+  const fresh = state.rates.find((r) => r.accountingTaxType === 'OUTPUT2' && r.id.startsWith('new-'))!
+  assert.deepEqual(state.suppliers!.map((x) => [x.id, x.taxRateId]), [['s1', fresh.id], ['s2', fresh.id], ['s3', 'busy'], ['s4', null]], 'the old rate\'s supplier defaults follow it; the busy rate\'s do not move')
+  assert.deepEqual(state.mappings!.map((x) => [x.id, x.taxRateId, x.storeIdentity]), [['m1', fresh.id, null], ['m2', 'busy', 'store-a']], 'the mapping follows and its store stamp is cleared')
+  assert.equal(activeOf(state, 'old'), false)
+  assert.equal(activeOf(state, 'busy'), true, 'a rate live documents depend on is not deactivated')
+  // The default rate is not replaced, so its suppliers stay.
+  const dflt: State = { rates: [ims('d', 'Default VAT', 'BOTH', 'OUTPUT2', { rate: '0.1500', isDefault: true })], list: XERO_LIST, suppliers: [{ id: 's1', taxRateId: 'd' }] }
+  await applyTo(dflt, await plan(dflt, { mirrorSales: true, replaceDiffering: true, types: [] }))
+  assert.equal(dflt.suppliers![0]!.taxRateId, 'd')
+  // A document that appears between the plan and the write stops the replacement before anything moves.
+  const racing: State = { rates: [ims('old', 'Old UK VAT', 'BOTH', 'OUTPUT2', { rate: '0.1500' })], list: XERO_LIST, suppliers: [{ id: 's1', taxRateId: 'old' }] }
+  const planned = await plan(racing, { mirrorSales: true, replaceDiffering: true, types: [] })
+  racing.rates[0]!.livePo = 1
+  await assert.rejects(() => applyTo(racing, planned), PurchaseTaxImportRaceError)
+  assert.deepEqual([racing.suppliers![0]!.taxRateId, activeOf(racing, 'old')], ['old', true])
+  // A row that became the default rate since the plan is not replaced: the write stops, nothing is repointed.
+  const turned: State = { rates: [ims('old', 'Old UK VAT', 'BOTH', 'OUTPUT2', { rate: '0.1500' })], list: XERO_LIST, suppliers: [{ id: 's1', taxRateId: 'old' }] }
+  const forDefault = await plan(turned, { mirrorSales: true, replaceDiffering: true, types: [] })
+  turned.rates[0]!.isDefault = true
+  await assert.rejects(() => applyTo(turned, forDefault), PurchaseTaxImportRaceError)
+  assert.deepEqual([turned.suppliers![0]!.taxRateId, activeOf(turned, 'old')], ['old', true])
+})
+
+const DUAL = (taxType: string, over: Partial<NormalisedXeroTaxRate> = {}): NormalisedXeroTaxRate => xeroRow(taxType, { name: `Dual ${taxType}`, expenses: true, revenue: true, ...over })
+
+// [mutation: dual-side types left out of the sales targets -> the BOTH arm is red; the side of the new row taken as SALES / PURCHASE -> the usedFor arm is red; the dual type not added to the rate set -> the rate-set arm is red;
+//  the existing-row test (`some(active && type)`) removed -> the purchase-row arm is red]
+test('sales mirroring covers a Xero type usable on BOTH revenue and expenses: one BOTH row when no IMS row carries it, the SALES side when only a purchase row does, every type in the rate set', async () => {
+  const state: State = { rates: stageRates(), list: [...XERO_LIST, DUAL('DUALNEW'), DUAL('DUALARCH', { status: 'ARCHIVED' })] }
+  assert.deepEqual((await plan(state)).salesTypes, [], 'default: no sales side')
+  const p = await plan(state, { mirrorSales: true })
+  assert.deepEqual(p.salesTypes, ['DUALNEW', 'OUTPUT2', 'ZERORATEDOUTPUT'], 'an archived dual type is out of scope')
+  assert.deepEqual(p.refusals, [])
+  assert.deepEqual(p.creates.filter((c) => c.taxType === 'DUALNEW').map((c) => [c.side, c.name, c.rate]), [['BOTH', 'Dual DUALNEW', '0.2000']])
+  assert.deepEqual(p.rateSet.filter((e) => e.taxType === 'DUALNEW').map((e) => [e.side, e.status, e.percentage]), [['BOTH', 'created', '20.000000']])
+  const { calls } = await applyTo(state, p)
+  assert.equal(calls.find((c) => c.op === 'create' && c.data!.accountingTaxType === 'DUALNEW')!.data!.usedFor, 'BOTH')
+  // A re-run is a no-op: the BOTH row serves both sides.
+  const again = await plan(state, { mirrorSales: true })
+  assert.deepEqual([again.creates.length, again.refusals.length], [0, 0])
+  assert.deepEqual(again.rateSet.filter((e) => e.taxType === 'DUALNEW').map((e) => e.status), ['present'])
+  // An IMS row that carries the type for the purchase side only: the sales side is a target of its own (refused by name when it cannot be a second row), never silently absent.
+  const purchaseOnly: State = { rates: [ims('p', 'Dual DUALP', 'PURCHASE', 'DUALP')], list: [DUAL('DUALP')] }
+  const q = await plan(purchaseOnly, { mirrorSales: true, types: [] })
+  assert.equal(q.creates.length, 0)
+  assert.deepEqual(q.rateSet.filter((e) => e.taxType === 'DUALP').map((e) => e.side), ['SALES'])
+  assert.ok(codes(q).includes('NAME_COLLISION:DUALP'))
+  // A dual type whose rate cannot be taken is refused by name and appears in the rate set as missing.
+  const unstated = await plan({ rates: stageRates(), list: [...XERO_LIST, DUAL('DUALBAD', { effectiveRate: null, displayTaxRate: null })] }, { mirrorSales: true })
+  assert.ok(codes(unstated).includes('RATE_NOT_STATED:DUALBAD'))
+  assert.deepEqual(unstated.rateSet.filter((e) => e.taxType === 'DUALBAD').map((e) => [e.side, e.status]), [['BOTH', 'missing']])
+  // A dual type already in the purchase types is the purchase side's (not duplicated into the sales targets).
+  assert.deepEqual((await plan({ rates: [], list: [...XERO_LIST, DUAL('DUALNEW')] }, { mirrorSales: true, types: ['DUALNEW'] })).salesTypes.includes('DUALNEW'), false)
+})
+
+// [mutation: the requested dual-side type kept as a PURCHASE target (the BOTH conversion removed) -> the BOTH arm is red; the dual-side exemption removed from the sales-target filter -> the purchase-row arm is red]
+test('a dual-side type named among the requested purchase types gets ONE BOTH row when no IMS rate carries it, and a separate SALES target when only a purchase row does', async () => {
+  const list = [...XERO_LIST, DUAL('DUALREQ')]
+  const none = await plan({ rates: [], list }, { mirrorSales: true, types: ['DUALREQ'] })
+  assert.deepEqual(none.refusals, [])
+  assert.deepEqual(none.creates.filter((c) => c.taxType === 'DUALREQ').map((c) => [c.side, c.rate]), [['BOTH', '0.2000']], 'one row, usable for both sides')
+  assert.deepEqual(none.rateSet.filter((e) => e.taxType === 'DUALREQ').map((e) => [e.side, e.status]), [['BOTH', 'created']])
+  assert.equal(none.salesTypes.includes('DUALREQ'), false)
+  const sales = await plan({ rates: [], list }, { types: ['DUALREQ'] })
+  assert.deepEqual(sales.creates.map((c) => [c.taxType, c.side]), [['DUALREQ', 'PURCHASE']], 'without sales mirroring the request stays a purchase row')
+  const purchaseRow = await plan({ rates: [ims('p', 'Old purchase', 'PURCHASE', 'DUALREQ')], list }, { mirrorSales: true, types: ['DUALREQ'] })
+  assert.deepEqual(purchaseRow.creates.filter((c) => c.taxType === 'DUALREQ').map((c) => c.side), ['SALES'], 'a separate sales row is planned and validated')
+  assert.deepEqual(purchaseRow.rateSet.filter((e) => e.taxType === 'DUALREQ').map((e) => e.side).sort(), ['PURCHASE', 'SALES'])
+})
+
+// [mutation: the re-read of the locked row removed (identity not compared) -> the rename arms are red; the recount using the PLANNED name instead of the row's current one -> the rename-plus-order arm is red;
+//  the narrowing's lock-and-compare removed -> the narrow arm is red; the replaced row's compare removed -> the replace arm is red]
+test('a row renamed (or otherwise changed) between the plan and the lock is not written: deactivation, replacement and narrowing each stop, and the recount uses the row\'s CURRENT name', async () => {
+  // Deactivation: renamed to a name that a live order uses.
+  const rates = (): ImsRow[] => [ims('free', 'Demo free', 'BOTH', 'TAX001'), ims('other', 'Demo other', 'BOTH', 'TAX002', { named: 2 })]
+  const state: State = { rates: rates(), list: XERO_LIST }
+  const p = await plan(state, { deactivateAbsent: true })
+  assert.equal(p.notInXero.find((r) => r.id === 'free')!.deactivate, true)
+  state.rates.find((r) => r.id === 'free')!.name = 'Demo other'
+  await assert.rejects(() => applyTo(state, p), PurchaseTaxImportRaceError)
+  assert.equal(activeOf(state, 'free'), true, 'renamed since the plan: not deactivated')
+  // Each other identity field.
+  for (const [label, change] of [['percentage', (r: ImsRow) => { r.rate = '0.1000' }], ['sides', (r: ImsRow) => { r.usedFor = 'SALES' }], ['active', (r: ImsRow) => { r.active = false }]] as const) {
+    const s2: State = { rates: rates(), list: XERO_LIST }
+    const planned = await plan(s2, { deactivateAbsent: true })
+    change(s2.rates.find((r) => r.id === 'free')!)
+    await assert.rejects(() => applyTo(s2, planned), PurchaseTaxImportRaceError, label)
+  }
+  // The recount uses the CURRENT name: the plan saw no order for 'Demo free'; after the rename the order names the new name.
+  const s3: State = { rates: [ims('free', 'Demo free', 'BOTH', 'TAX001'), ims('o', 'Elsewhere', 'BOTH', 'TAX002')], list: XERO_LIST }
+  const planned3 = await plan(s3, { deactivateAbsent: true })
+  s3.rates[0]!.name = 'Renamed'
+  s3.rates[1]!.named = 0
+  s3.rates.push(ims('x', 'Renamed', 'BOTH', 'TAX009', { named: 1 }))
+  planned3.notInXero[0]!.identity = JSON.stringify(['Renamed', '0.2000', 'BOTH', true, []])
+  await assert.rejects(() => applyTo(s3, planned3), PurchaseTaxImportRaceError, 'the order naming the CURRENT name stops it')
+  // Replacement.
+  const rep: State = { rates: [ims('old', 'Old UK VAT', 'BOTH', 'OUTPUT2', { rate: '0.1500' })], list: XERO_LIST, suppliers: [{ id: 's1', taxRateId: 'old' }] }
+  const planRep = await plan(rep, { mirrorSales: true, replaceDiffering: true, types: [] })
+  rep.rates[0]!.name = 'Renamed old'
+  await assert.rejects(() => applyTo(rep, planRep), PurchaseTaxImportRaceError)
+  assert.deepEqual([rep.suppliers![0]!.taxRateId, activeOf(rep, 'old')], ['old', true])
+  // Narrowing.
+  const nar: State = { rates: stageRates(), list: XERO_LIST }
+  const planNar = await plan(nar, { narrowSalesTypes: true })
+  nar.rates.find((r) => r.id === 'uk')!.name = 'Renamed UK'
+  await assert.rejects(() => applyTo(nar, planNar), PurchaseTaxImportRaceError)
+  assert.equal(nar.rates.find((r) => r.id === 'uk')!.usedFor, 'BOTH')
+})
+
+// [mutation: the seeded SALES defaults taken as SALES without the dual-side classification -> red]
+test('a seeded sales default (OUTPUT2, ZERORATEDOUTPUT) that Xero lists as active on BOTH sides, with no IMS row, is ONE BOTH row', async () => {
+  const list = XERO_LIST.map((r) => (r.taxType === 'OUTPUT2' ? { ...r, canApply: { ...r.canApply, expenses: true, revenue: true } } : r))
+  const p = await plan({ rates: [], list }, { mirrorSales: true, types: [] })
+  assert.deepEqual(p.creates.filter((c) => c.taxType === 'OUTPUT2').map((c) => c.side), ['BOTH'])
+  assert.deepEqual(p.creates.filter((c) => c.taxType === 'ZERORATEDOUTPUT').map((c) => c.side), ['SALES'], 'a revenue-only default stays SALES')
+  const withRow = await plan({ rates: [ims('o', 'Old out', 'PURCHASE', 'OUTPUT2')], list }, { mirrorSales: true, types: [] })
+  assert.deepEqual(withRow.rateSet.filter((e) => e.taxType === 'OUTPUT2').map((e) => e.side), ['SALES'], 'with a purchase-only row it is a SALES target')
 })

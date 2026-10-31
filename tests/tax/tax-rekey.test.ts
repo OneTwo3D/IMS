@@ -261,6 +261,13 @@ test('REPORT TYPE: the live type must file to the VAT-return box IMS assigns the
   assert.deepEqual([unknownLive.outcome, unknownLive.reportType.live], ['REPORT_TYPE_UNKNOWN', null])
   assert.equal(at(ims('x', 'CY VAT', 'TAX005', '0.1900', { reportingCategory: 'SOMETHING_NEW' }), xeroRow('TAX008', 'CY VAT', '19')).outcome, 'REPORT_TYPE_UNKNOWN')
   assert.equal(at(ims('x', 'CY VAT', 'TAX005', '0.1900', { reportingCategory: 'oss' }), xeroRow('TAX008', 'CY VAT', '19')).outcome, 'REKEY', 'the category is normalised like the helper does')
+  // [mutation: the empty-after-trim check removed from normalizeCategory -> red] A category of only whitespace is unset, exactly like no category: decidable, not REPORT_TYPE_UNKNOWN.
+  const unsetOutcome = at(ims('x', 'CY VAT', 'TAX005', '0.1900', { reportingCategory: null }), xeroRow('TAX008', 'CY VAT', '19'))
+  assert.equal(unsetOutcome.outcome, 'REKEY')
+  for (const blank of ['', ' ', '   ', '\t', ' \n ']) {
+    const blankRow = at(ims('x', 'CY VAT', 'TAX005', '0.1900', { reportingCategory: blank }), xeroRow('TAX008', 'CY VAT', '19'))
+    assert.deepEqual([blankRow.outcome, blankRow.reportType], [unsetOutcome.outcome, unsetOutcome.reportType], `${JSON.stringify(blank)} counts as unset`)
+  }
   // The digest binds it.
   const base = planOf()
   assert.notEqual(digestRekeyPlan({ ...base, rows: base.rows.map((r) => r.imsRateId === 'cy' ? { ...r, reportType: { expected: 'MOSSSALES', live: 'OUTPUT' } } : r) }), base.digest)

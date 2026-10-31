@@ -1627,6 +1627,57 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         } finally { await cleanup() }
       })
 
+      // Mutations named (made, red, reverted): tax-import.ts: record the fact after the import (outside the transaction: the old order) -> the rollback arms are red (the rates stay);
+      // setFactOnceIn given `db` instead of `tx` -> the rollback arms are red; the `!(await setFactOnceIn(...))` throw dropped -> the no-record arm is red (rates committed with no fact).
+      it('the imported rates and the run fact commit together: a fact that cannot be recorded rolls the rates back, and a retry imports and records exactly what it committed', async (t) => {
+        await fresh()
+        const dropTrigger = async () => { await sql('drop trigger if exists zq_refuse_tax_fact on first_load_apply_runs'); await sql('drop function if exists zq_refuse_tax_fact()') }
+        try {
+          await seedXero(LIST())
+          const stub = suppliersStub(['INPUT2', 'ZERORATEDINPUT'])
+          const { importSupplierTaxRates } = await import('../../lib/first-load/apply/db/tax-import')
+          const factOf = async () => (await sql<{ facts: { purchaseTaxImport?: { created: Array<{ taxType: string; id: string; digest: string }> } } }>('select facts from first_load_apply_runs'))[0]?.facts.purchaseTaxImport
+          // No run record at all: the fact cannot be recorded, so nothing is imported.
+          await assert.rejects(() => importSupplierTaxRates(stub), /the run record could not be written/)
+          assert.deepEqual(await taxRows(), [], 'no run record: no rate committed')
+          // A run record whose update of the fact fails.
+          await m.journal.createJournal().save({ version: 1, manifestDigest: 'f'.repeat(64), runId: 'atomic-run', status: 'RUNNING', currentStep: null, steps: {} }, null)
+          await sql(`create or replace function zq_refuse_tax_fact() returns trigger language plpgsql as $$ begin if new.facts ? 'purchaseTaxImport' then raise exception 'zq refused'; end if; return new; end $$`)
+          await sql('create trigger zq_refuse_tax_fact before update on first_load_apply_runs for each row execute function zq_refuse_tax_fact()')
+          const before = { rates: await count('tax_rates'), comps: await count('tax_rate_components') }
+          await assert.rejects(() => importSupplierTaxRates(stub), /the run record could not be written/)
+          assert.deepEqual({ rates: await count('tax_rates'), comps: await count('tax_rate_components') }, before, 'the fact failed: the rates rolled back with it')
+          assert.equal(await factOf(), undefined)
+          // The retry (the failure gone) finds the same types missing, imports them and records them in the same commit.
+          await dropTrigger()
+          const retry = await importSupplierTaxRates(stub)
+          assert.deepEqual(retry.problems, [])
+          const rows = await sql<{ id: string; accounting_tax_type: string; digest: string }>(`select id, accounting_tax_type, md5(r::text) as digest from tax_rates r where name like 'ZQXI %' order by accounting_tax_type`)
+          assert.deepEqual(rows.map((r) => r.accounting_tax_type), ['INPUT2', 'ZERORATEDINPUT'])
+          const fact = (await factOf())!
+          const comps = await sql<{ rate: string; id: string; digest: string }>(`select tax_rate_id as rate, id, md5(c::text) as digest from tax_rate_components c where tax_rate_id = any($1::text[]) order by id`, [rows.map((r) => r.id)])
+          assert.ok(comps.length > 0, 'control: the imported INPUT2 rate has a component')
+          assert.deepEqual(fact.created.flatMap((c) => (c as unknown as { components: Array<{ id: string; digest: string }> }).components.map((x) => [x.id, x.digest])).sort(), comps.map((c) => [c.id, c.digest]).sort(), 'and so does the fact')
+          assert.deepEqual(fact.created.map((c) => [c.taxType, c.id, c.digest]).sort(), rows.map((r) => [r.accounting_tax_type, r.id, r.digest]).sort(), 'the fact names exactly the committed rows, with their committed digests')
+          // A commit that fails AFTER the fact was written takes the fact with it: both live in the one transaction (a deferred constraint trigger raises at commit).
+          await sql('delete from tax_rate_components where tax_rate_id in (select id from tax_rates where name like \'ZQXI %\')')
+          await sql('delete from tax_rates where name like \'ZQXI %\'')
+          await sql(`update first_load_apply_runs set facts = facts - 'purchaseTaxImport'`)
+          await sql(`create or replace function zq_fail_at_commit() returns trigger language plpgsql as $$ begin raise exception 'zq commit refused'; end $$`)
+          await sql(`create constraint trigger zq_fail_at_commit after insert on tax_rates deferrable initially deferred for each row when (new.name like 'ZQXI %') execute function zq_fail_at_commit()`)
+          try {
+            await assert.rejects(() => importSupplierTaxRates(stub), /zq commit refused/)
+          } finally { await sql('drop trigger if exists zq_fail_at_commit on tax_rates'); await sql('drop function if exists zq_fail_at_commit()') }
+          assert.deepEqual(await taxRows(), [], 'the commit failed: no rate')
+          assert.equal(await factOf(), undefined, 'and no fact either (it was written in the same transaction)')
+          const again = await importSupplierTaxRates(stub)
+          assert.deepEqual([again.problems, again.summary!.created.length, (await factOf())!.created.length], [[], 2, 2])
+          // A third call has nothing to import and records nothing more.
+          assert.deepEqual([(await importSupplierTaxRates(stub)).summary, (await factOf())!.created.length], [null, 2])
+          precondition(t, 'atomic arms', 8)
+        } finally { await dropTrigger(); await sql('delete from first_load_apply_runs'); await cleanup() }
+      })
+
       it('an import that wrote nothing is caught by the strict re-check at the run level: the step refuses, no supplier is loaded', async () => {
         await fresh()
         await sql(`create or replace function zq_skip_tax_insert() returns trigger language plpgsql as $$ begin delete from tax_rates where id = new.id; return null; end $$`)
@@ -1801,6 +1852,74 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       it('CONTROL: an empty target passes every rule', async () => {
         await resetData()
         assert.deepEqual((await resume()).filter((p) => p.startsWith('foreign data:')), [])
+      })
+
+      // Mutations named (made, red, reverted): the tax rules back to `async () => 0` -> every arm after the control is red; the imported-row exemption widened to all new rows -> the unrelated-rate arm is red;
+      // the imported digest comparison dropped (id only) -> the edited-import arm is red; the baseline-missing half (`base - cur`) dropped -> the removed-rate arm is red; the baseline-extra half dropped -> the added-rate arm is red;
+      // the components rule left at 0 -> the component arms are red; captureTaxBaseline not called by the ports -> tests/first-load/apply-ports-census (below) is red.
+      it('an unrelated tax rate or component added, edited or removed during a load is refused on a resume; the rows the tax import recorded are accounted for, and are refused once edited', async (t) => {
+        await resetData()
+        const { captureTaxBaseline } = await import('../../lib/first-load/apply/db/attribution')
+        const taxHolds = async (table: 'tax_rates' | 'tax_rate_components') => {
+          const found = (await rows(table)).map((p) => /holds (\d+) row/.exec(p)![1]!)
+          return found.length === 0 ? 0 : Number(found[0])
+        }
+        const digestOf = async (table: string, id: string) => (await sql<{ d: string }>(`select md5(r::text) as d from ${table} r where id = $1`, [id]))[0]!.d
+        const cleanupTax = async () => { await sql(`delete from tax_rate_components where tax_rate_id in (select id from tax_rates where name like 'ZQTAX%')`); await sql(`delete from tax_rates where name like 'ZQTAX%'`); await sql('delete from first_load_apply_runs') }
+        try {
+          await cleanupTax()
+          const own = await m.db.taxRate.create({ data: { name: 'ZQTAXA', rate: '0.2', usedFor: 'BOTH', accountingTaxType: 'ZQTAXA', active: true } })
+          assert.deepEqual([await taxHolds('tax_rates'), await taxHolds('tax_rate_components')], [0, 0], 'no run record and no tax baseline: nothing to compare with, nothing counted')
+          await m.journal.createJournal().save({ version: 1, manifestDigest: 'f'.repeat(64), runId: 'tax-census', status: 'RUNNING', currentStep: null, steps: {} }, null)
+          assert.equal(await captureTaxBaseline(), true)
+          assert.equal(await captureTaxBaseline(), false, 'recorded once')
+          assert.deepEqual([await taxHolds('tax_rates'), await taxHolds('tax_rate_components')], [0, 0], 'control: nothing changed since the baseline')
+          // An unrelated rate added during the load.
+          const stray = await m.db.taxRate.create({ data: { name: 'ZQTAXB', rate: '0.05', usedFor: 'SALES', accountingTaxType: 'ZQTAXB', active: true } })
+          assert.equal(await taxHolds('tax_rates'), 1, 'an added rate')
+          await sql('delete from tax_rates where id = $1', [stray.id])
+          assert.equal(await taxHolds('tax_rates'), 0, 'control: removed again')
+          // A baseline rate edited in place (raw SQL: the digest is of the row as stored) counts as the new content AND the missing old content.
+          await sql(`update tax_rates set rate = 0.19 where id = $1`, [own.id])
+          assert.equal(await taxHolds('tax_rates'), 2, 'an edited rate')
+          await sql(`update tax_rates set rate = 0.2 where id = $1`, [own.id])
+          assert.equal(await taxHolds('tax_rates'), 0, 'control: restored')
+          // A baseline rate removed.
+          const doomed = await sql<{ id: string }>(`select id from tax_rates where id = $1`, [own.id])
+          await sql('delete from tax_rates where id = $1', [doomed[0]!.id])
+          assert.equal(await taxHolds('tax_rates'), 1, 'a removed rate')
+          await m.db.taxRate.create({ data: { id: own.id, name: 'ZQTAXA', rate: '0.2', usedFor: 'BOTH', accountingTaxType: 'ZQTAXA', active: true, createdAt: own.createdAt, updatedAt: own.updatedAt } })
+          assert.equal(await taxHolds('tax_rates'), 0, 'control: put back as it was')
+          // Components of the tax rates are held to the same baseline.
+          const comp = await m.db.taxRateComponent.create({ data: { taxRateId: own.id, name: 'VAT', rate: '0.2', sortOrder: 0 } })
+          assert.deepEqual([await taxHolds('tax_rates'), await taxHolds('tax_rate_components')], [0, 1], 'an unrelated component added')
+          await sql('delete from tax_rate_components where id = $1', [comp.id])
+          assert.equal(await taxHolds('tax_rate_components'), 0)
+          // The rows the import recorded (with the digest it committed): accounted for, together with their components.
+          const imported = await m.db.taxRate.create({ data: { name: 'ZQTAXI', rate: '0.2', usedFor: 'PURCHASE', accountingTaxType: 'ZQTAXI', active: true, components: { create: [{ name: 'VAT', rate: '0.2', sortOrder: 0 }] } }, include: { components: true } })
+          assert.deepEqual([await taxHolds('tax_rates'), await taxHolds('tax_rate_components')], [1, 1], 'not recorded yet: unrelated')
+          const importedComp = imported.components[0]!
+          await m.journal.setFactOnce('purchaseTaxImport', { created: [{ taxType: 'ZQTAXI', name: 'ZQTAXI', rate: '0.2000', id: imported.id, digest: await digestOf('tax_rates', imported.id), components: [{ id: importedComp.id, digest: await digestOf('tax_rate_components', importedComp.id) }] }], list: null })
+          assert.deepEqual([await taxHolds('tax_rates'), await taxHolds('tax_rate_components')], [0, 0], 'recorded by the import: attributed')
+          // Edited after the import: no longer what it committed.
+          await sql(`update tax_rates set rate = 0.25 where id = $1`, [imported.id])
+          assert.equal(await taxHolds('tax_rates'), 1, 'an imported rate edited afterwards')
+          await sql(`update tax_rates set rate = 0.2 where id = $1`, [imported.id])
+          await sql(`update tax_rate_components set rate = 0.25 where id = $1`, [importedComp.id])
+          assert.deepEqual([await taxHolds('tax_rates'), await taxHolds('tax_rate_components')], [0, 1], 'an imported component edited afterwards')
+          // A second, unrecorded component on an imported rate.
+          await sql(`update tax_rate_components set rate = 0.2 where id = $1`, [importedComp.id])
+          await m.db.taxRateComponent.create({ data: { taxRateId: imported.id, name: 'Extra', rate: '0.01', sortOrder: 1 } })
+          assert.equal(await taxHolds('tax_rate_components'), 1, 'an extra component on an imported rate')
+          // Deleted after the import committed: an imported component, then the imported rate itself (its components go with it): each is counted, in its own table.
+          await sql('delete from tax_rate_components where id = $1', [importedComp.id])
+          assert.deepEqual([await taxHolds('tax_rates'), await taxHolds('tax_rate_components')], [0, 2], 'an imported component deleted (and the unrecorded extra is still counted)')
+          await sql('delete from tax_rate_components where tax_rate_id = $1', [imported.id])
+          await sql('delete from tax_rates where id = $1', [imported.id])
+          assert.deepEqual([await taxHolds('tax_rates'), await taxHolds('tax_rate_components')], [1, 1], 'an imported rate deleted')
+          assert.ok(!(await resume()).join(';').includes('ZQTAX'), 'no key in any message')
+          precondition(t, 'tax attribution arms', 12)
+        } finally { await cleanupTax() }
       })
 
       it('a category nothing in the file names, and a price-cache row no file line explains, are refused on a resume (counts only)', async () => {
