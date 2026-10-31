@@ -2,7 +2,7 @@
  * WooCommerce → IMS order import.
  */
 
-import { currentTaxRates, resolveLinesTaxRates } from '@/lib/tax/writable-tax-rate'
+import { currentTaxRates, lockOrderNamedTaxRate, resolveLinesTaxRates } from '@/lib/tax/writable-tax-rate'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
 import { resolveWcReceiptSettlementRate, parseWcGmtInstant } from './receipt-settlement-rate'
@@ -2630,6 +2630,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       so = await db.$transaction(async (tx) => {
         // A mapped rate that a tax re-key retired follows its replacement (lenient: an inbound order is never lost over an operator-deactivated rate); under the row share lock the apply waits on.
         await resolveLinesTaxRates(tx, lineData, { lenient: true })
+        // The order-level named rate is locked to this commit (the tax import's deactivateAbsent re-counts the orders naming a rate under FOR UPDATE); lenient like the lines: an inbound order is never lost over a rate.
+        await lockOrderNamedTaxRate(tx, taxRateName)
         const created = await tx.salesOrder.create({
         data: {
           externalOrderNumber: wcOrder.number,

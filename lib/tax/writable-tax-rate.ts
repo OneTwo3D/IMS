@@ -118,6 +118,23 @@ export async function shareLockOrderTaxRates(tx: unknown, orderId: string): Prom
     FOR SHARE`)
 }
 
+/**
+ * Lock (FOR KEY SHARE, to the caller's commit) the ACTIVE rate row(s) an order's header names (`SalesOrder.taxRateName`), BEFORE the order is written. Sales posting and the refund paths resolve an
+ * order's default tax identity by "the ACTIVE rate with this name", so a rate named by a live order must stay active; the opt-in `deactivateAbsent` of the tax import (lib/tax/purchase-tax-import.ts)
+ * takes FOR UPDATE on the rate and then re-counts the orders naming it. FOR UPDATE conflicts with FOR KEY SHARE, so with every writer of the header name calling this inside the transaction that
+ * writes it: a writer that locked first makes the deactivation wait for its commit (the re-count then sees the order and the write stops); a deactivation that committed first leaves this lookup
+ * with no active row (the count returned is 0), so a caller that resolved the rate earlier can refuse instead of persisting the name of a rate that was switched off. FOR KEY SHARE rather than FOR
+ * SHARE: it does not stop a rate editor's own row update (name, percentage), only a deactivation's FOR UPDATE.
+ * Returns the number of rows locked, or null when the client has no raw access (a structural test double): not locked.
+ */
+export async function lockOrderNamedTaxRate(tx: unknown, name: string | null | undefined): Promise<number | null> {
+  if (typeof name !== 'string' || name.length === 0) return null
+  const c = tx as { $queryRaw?: (query: unknown) => Promise<unknown> }
+  if (typeof c.$queryRaw !== 'function') return null
+  const rows = await c.$queryRaw(Prisma.sql`SELECT id FROM tax_rates WHERE active AND name = ${name} ORDER BY id FOR KEY SHARE`)
+  return Array.isArray(rows) ? rows.length : null
+}
+
 export type CurrentTaxRate = { id: string; accountingTaxType: string | null; reverseCharge: boolean }
 
 /**

@@ -215,6 +215,66 @@ test('a deactivation waits for a writer that holds the rate, then sees that writ
   } finally { await restoreForeign(deps, foreign) }
 })
 
+// [mutation: lockOrderNamedTaxRate's lock removed (the query returns without FOR KEY SHARE) -> the import does not wait for the order writer and deactivates the rate its order names: red;
+//  the lock taken on another mode (FOR NO KEY UPDATE) -> the writer is not made to wait for the deactivation: the second half is red]
+test('the order writers\' own lock (lockOrderNamedTaxRate) makes deactivateAbsent wait for an order that locked the named rate first, and a writer that arrives after the deactivation finds the rate inactive', { skip: !RUN }, async () => {
+  const deps = await loadDeps()
+  const { lockOrderNamedTaxRate } = await import('../../lib/tax/writable-tax-rate.ts')
+  const foreign = await clearForeignPurchaseRates(deps)
+  const { db } = deps
+  try {
+    await cleanRates(deps)
+    await seed(deps, LIST())
+    // (1) The writer locks first and commits an order naming the rate: the deactivation waits, re-counts, finds the order, and writes nothing.
+    const held = await db.taxRate.create({ data: { name: `${TAG}Demo writer first`, rate: '0.2', usedFor: 'BOTH', accountingTaxType: 'ZQPTI006', active: true } })
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let locked!: () => void
+    const lockedFirst = new Promise<void>((resolve) => { locked = resolve })
+    const writer = db.$transaction(async (tx) => {
+      assert.equal(await lockOrderNamedTaxRate(tx, held.name), 1, 'the active named rate is locked')
+      await tx.salesOrder.create({ data: { externalOrderNumber: `${TAG}writer-first`, status: 'PROCESSING', taxRateName: held.name, subtotalForeign: 0, totalForeign: 0, subtotalBase: 0, totalBase: 0 } })
+      locked()
+      await gate
+    })
+    try {
+      await lockedFirst
+      let settled = false
+      const importing = deps.imp.runPurchaseTaxImport({ apply: true, deactivateAbsent: true }).then((r) => ({ r }), (e: unknown) => ({ e })).finally(() => { settled = true })
+      await new Promise((resolve) => setTimeout(resolve, 1500))
+      assert.equal(settled, false, 'the deactivation is waiting for the writer\'s lock')
+      release()
+      await writer
+      const outcome = await importing
+      assert.ok('e' in outcome && outcome.e instanceof deps.imp.PurchaseTaxImportRaceError, 'the committed order stops the deactivation')
+      assert.equal((await db.taxRate.findUniqueOrThrow({ where: { id: held.id } })).active, true)
+    } finally { release(); await writer.catch(() => undefined); await db.salesOrder.deleteMany({ where: { externalOrderNumber: { startsWith: TAG } } }) }
+
+    // (2) The deactivation holds the rate first: the writer waits for it, and when it commits finds NO active rate of the name (0), so a writer that resolved the rate earlier can refuse.
+    const freed = await db.taxRate.create({ data: { name: `${TAG}Demo import first`, rate: '0.2', usedFor: 'BOTH', accountingTaxType: 'ZQPTI007', active: true } })
+    let hold!: () => void
+    const holdGate = new Promise<void>((resolve) => { hold = resolve })
+    let holding!: () => void
+    const holdingFirst = new Promise<void>((resolve) => { holding = resolve })
+    const deactivator = db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM tax_rates WHERE id = ${freed.id} FOR UPDATE`
+      await tx.taxRate.update({ where: { id: freed.id }, data: { active: false } })
+      holding()
+      await holdGate
+    })
+    try {
+      await holdingFirst
+      let settled = false
+      const writing = db.$transaction(async (tx) => lockOrderNamedTaxRate(tx, freed.name)).finally(() => { settled = true })
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+      assert.equal(settled, false, 'the writer waits for the deactivation that holds the rate')
+      hold()
+      await deactivator
+      assert.equal(await writing, 0, 'after the deactivation committed there is no active rate of the name to lock')
+    } finally { hold(); await deactivator.catch(() => undefined) }
+  } finally { await restoreForeign(deps, foreign) }
+})
+
 // [mutation: the re-read and identity compare removed from lockAndRecheck -> the renamed rate is deactivated: red]
 test('a rate renamed, with an order naming the new name, between the plan and the row lock is not deactivated', { skip: !RUN }, async () => {
   const deps = await loadDeps()
@@ -298,5 +358,26 @@ test('sales mirroring and replacement are committed: a differing referenced rate
     const rate = replaced.plan.rateSet.find((e) => e.taxType === 'ZQPTIOUT5')!
     assert.deepEqual([rate.percentage, rate.side, rate.status], ['5.000000', 'SALES', 'created'])
     assert.equal((await deps.imp.runPurchaseTaxImport({ apply: true, types: [], mirrorSales: true, replaceDiffering: true })).wrote, false)
+  } finally { await cleanRates(deps) }
+})
+
+// [mutation: the shared-BOTH-row conversion removed from planPurchaseTaxImport -> a purchase and a sales replacement from the one old row: the second is refused by name after the first deactivated the old row, leaving no sales-capable row: red]
+test('replaceDiffering with mirrorSales, committed: one differing BOTH row serving a requested dual-side type is replaced by ONE BOTH row, and the old row is deactivated with it', { skip: !RUN }, async () => {
+  const deps = await loadDeps()
+  const { db } = deps
+  try {
+    await cleanRates(deps)
+    await seed(deps, [xero('ZQPTIDUAL', 'Dual', '5.000000', { expenses: true, revenue: true })])
+    const old = await db.taxRate.create({ data: { name: `${TAG}Old dual`, rate: '0.04', usedFor: 'BOTH', accountingTaxType: 'ZQPTIDUAL', active: true } })
+    const supplier = await db.supplier.create({ data: { name: `${TAG}Supplier dual`, taxRateId: old.id } })
+    const done = await deps.imp.runPurchaseTaxImport({ apply: true, types: ['ZQPTIDUAL'], mirrorSales: true, replaceDiffering: true })
+    assert.equal(done.wrote, true)
+    assert.deepEqual(done.plan.refusals.filter((r) => r.taxType === 'ZQPTIDUAL'), [], 'no name collision between two replacements')
+    const oldNow = await db.taxRate.findUniqueOrThrow({ where: { id: old.id } })
+    assert.deepEqual([oldNow.rate.toFixed(4), oldNow.accountingTaxType, oldNow.active], ['0.0400', 'ZQPTIDUAL', false])
+    const fresh = await db.taxRate.findMany({ where: { accountingTaxType: 'ZQPTIDUAL', active: true } })
+    assert.deepEqual(fresh.map((r) => [r.rate.toFixed(4), r.usedFor]), [['0.0500', 'BOTH']], 'one active row, usable for sales and purchases')
+    assert.equal((await db.supplier.findUniqueOrThrow({ where: { id: supplier.id } })).taxRateId, fresh[0]!.id)
+    assert.equal((await deps.imp.runPurchaseTaxImport({ apply: true, types: ['ZQPTIDUAL'], mirrorSales: true, replaceDiffering: true })).wrote, false, 'a re-run writes nothing')
   } finally { await cleanRates(deps) }
 })

@@ -502,6 +502,44 @@ test('a dual-side type named among the requested purchase types gets ONE BOTH ro
   assert.deepEqual(purchaseRow.rateSet.filter((e) => e.taxType === 'DUALREQ').map((e) => e.side).sort(), ['PURCHASE', 'SALES'])
 })
 
+// [mutation: the shared-BOTH-row conversion removed (sharedBothRow left empty) -> two replacements from one old row: the one-create arm and the applied arm are red; the SALES skip removed -> a second create / NAME_COLLISION: red;
+//  the BOTH row test (`usedFor === 'BOTH'`) dropped -> a purchase-only row is replaced as BOTH: the purchase-only arm is red]
+test('replaceDiffering with mirrorSales: ONE differing BOTH row serving a requested dual-side type gets ONE BOTH replacement, applied, and the old row is deactivated only with it', async () => {
+  const list = [...XERO_LIST, DUAL('DUALREQ', { effectiveRate: '25.000000', displayTaxRate: '25.000000', components: [{ name: 'VAT', rate: '25.000000', compound: false, nonRecoverable: false }] })]
+  const old = (): State => ({ rates: [ims('b', 'Old dual', 'BOTH', 'DUALREQ', { rate: '0.1500' })], list, suppliers: [{ id: 's1', taxRateId: 'b' }] })
+  const options = { mirrorSales: true, replaceDiffering: true, types: ['DUALREQ'] }
+  const state = old()
+  const p = await plan(state, options)
+  assert.deepEqual(p.refusals.filter((r) => r.taxType === 'DUALREQ'), [], 'no collision between two replacements')
+  assert.deepEqual(p.creates.filter((c) => c.taxType === 'DUALREQ').map((c) => [c.side, c.replaces, c.rate]), [['BOTH', 'b', '0.2500']], 'one replacement covering both sides')
+  assert.deepEqual(p.differs.filter((d) => d.taxType === 'DUALREQ').map((d) => [d.id, d.replaced]), [['b', true]], 'the old row is reported once')
+  assert.deepEqual(p.rateSet.filter((e) => e.taxType === 'DUALREQ').map((e) => e.side).sort(), ['PURCHASE', 'SALES'], 'both sides stay in the rate set')
+  // APPLIED (the case the report is about: requireAll is off, so whatever the plan holds is written).
+  const { calls } = await applyTo(state, p)
+  assert.equal(calls.filter((c) => c.op === 'create' && c.data!.accountingTaxType === 'DUALREQ').length, 1, 'one create from the one old row')
+  assert.deepEqual(state.rates.filter((r) => r.accountingTaxType === 'DUALREQ' && r.active).map((r) => [r.usedFor, r.rate]), [['BOTH', '0.2500']], 'an active row usable for sales (and purchases) remains')
+  assert.equal(state.rates.find((r) => r.id === 'b')!.active, false)
+  assert.equal(state.suppliers![0]!.taxRateId, state.rates.find((r) => r.accountingTaxType === 'DUALREQ' && r.active)!.id, 'the supplier default follows the replacement')
+  const again = await plan(state, options)
+  assert.deepEqual([again.creates.filter((c) => c.taxType === 'DUALREQ').length, again.differs.filter((d) => d.taxType === 'DUALREQ').length], [0, 0], 'a re-run has nothing to do for the type')
+  // A purchase-only row (not a BOTH row) is not one row for both targets: the purchase target replaces it and the sales target stays its own (refused by name here, as before).
+  const purchaseOnly = await plan({ rates: [ims('p', 'Old purchase', 'PURCHASE', 'DUALREQ', { rate: '0.1500' })], list }, options)
+  assert.deepEqual(purchaseOnly.creates.filter((c) => c.taxType === 'DUALREQ').map((c) => c.side), ['PURCHASE'], 'not converted to BOTH')
+  // Two DIFFERENT rows for the type (one purchase-only, one sales-only) are not one row serving both targets: no BOTH replacement.
+  const split = await plan({ rates: [ims('p', 'Old purchase', 'PURCHASE', 'DUALREQ', { rate: '0.1500' }), ims('sl', 'Old sales', 'SALES', 'DUALREQ', { rate: '0.1500' })], list }, options)
+  assert.ok(split.creates.filter((c) => c.taxType === 'DUALREQ').every((c) => c.side !== 'BOTH'), 'separate rows stay separate')
+  // The BOTH row is kept (not replaced) while live documents depend on it: no create, no deactivation, no half-replacement.
+  const held: State = { rates: [ims('b', 'Old dual', 'BOTH', 'DUALREQ', { rate: '0.1500', live: 2 })], list }
+  const kept = await plan(held, options)
+  assert.deepEqual(kept.creates.filter((c) => c.taxType === 'DUALREQ'), [])
+  assert.ok(kept.differs.filter((d) => d.taxType === 'DUALREQ').every((d) => !d.replaced && d.keptBecause === 'LIVE_DOCUMENTS'))
+  await applyTo(held, kept)
+  assert.equal(held.rates.find((r) => r.id === 'b')!.active, true)
+  // A BOTH row at Xero's percentage needs nothing.
+  const same = await plan({ rates: [ims('b', 'Old dual', 'BOTH', 'DUALREQ', { rate: '0.2500' })], list }, options)
+  assert.deepEqual(same.creates.filter((c) => c.taxType === 'DUALREQ'), [])
+})
+
 // [mutation: the re-read of the locked row removed (identity not compared) -> the rename arms are red; the recount using the PLANNED name instead of the row's current one -> the rename-plus-order arm is red;
 //  the narrowing's lock-and-compare removed -> the narrow arm is red; the replaced row's compare removed -> the replace arm is red]
 test('a row renamed (or otherwise changed) between the plan and the lock is not written: deactivation, replacement and narrowing each stop, and the recount uses the row\'s CURRENT name', async () => {

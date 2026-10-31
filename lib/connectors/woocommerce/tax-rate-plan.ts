@@ -31,6 +31,8 @@
  *   CREATE           an in-scope IMS rate has no counterpart in the store (no mapping, or only mappings to rates the store no longer has).
  *   UPDATE           the counterpart differs in name, percent, country, state (region), class, compound or shipping. Only the fields that differ are sent.
  *   DELETE           an owned rate maps to an IMS rate that is out of scope (inactive, purchase-only, reverse charge), or is an extra counterpart of an in-scope rate (R13: one Woo rate each).
+ *                    A duplicate DELETE names its KEEPER (the counterpart that stays) and records the keeper's full live fields (state, postcode, city, compound, shipping, class, name, percent,
+ *                    country); both are in the digest, and the writer compares them again immediately before the send (KEEPER_CHANGED).
  *
  * FIELD RULES
  *   name       the IMS name (compared as R13 does: trimmed, whitespace collapsed, case ignored).
@@ -65,7 +67,7 @@ import { normaliseCountryCode } from '@/lib/tax/tax-country'
 const Decimal = Prisma.Decimal
 type Decimal = InstanceType<typeof Prisma.Decimal>
 
-export const WOO_TAX_PLAN_VERSION = 1
+export const WOO_TAX_PLAN_VERSION = 2
 
 /** The fields the writer manages. Postcode and city are not among them (see the header). */
 export const WOO_TAX_FIELDS = ['name', 'rate', 'country', 'state', 'class', 'compound', 'shipping'] as const
@@ -81,6 +83,12 @@ export type WooTaxRateFields = {
   compound: boolean
   shipping: boolean
 }
+
+/** What the writer binds about the duplicate KEEPER of a DUPLICATE_COUNTERPART delete: every field of the live keeper that makes it the rate the delete leaves behind. Postcode and city are not managed, but a keeper that gained one is a different (narrower) rate. */
+export const WOO_TAX_KEEPER_FIELDS = ['state', 'postcode', 'city', 'compound', 'shipping', 'class', 'name', 'rate', 'country'] as const
+export type WooTaxKeeperField = (typeof WOO_TAX_KEEPER_FIELDS)[number]
+export type WooTaxKeeperFields = WooTaxRateFields & { postcode: string; city: string }
+export type WooTaxKeeper = { wooId: string; fields: WooTaxKeeperFields }
 
 export type FieldChange = { field: WooTaxField; before: string | boolean; after: string | boolean }
 
@@ -122,6 +130,8 @@ export type DeleteChange = {
   imsRateName: string
   reason: DeleteReason
   before: WooTaxRateFields
+  /** DUPLICATE_COUNTERPART only (null for every other reason): the intended keeper, the counterpart that stays, and its full live fields as the plan read them. The writer reads the keeper again immediately before the delete and stops (KEEPER_CHANGED) if any differ. Part of the digest. */
+  keeper: WooTaxKeeper | null
 }
 export type WooTaxChange = CreateChange | UpdateChange | DeleteChange
 
@@ -235,6 +245,14 @@ function namedRegion(name: string, country: string): { state: string; unreadable
   const region = nameRegion(name, country)
   if (region.kind === 'region') return { state: region.token, unreadable: false }
   return { state: '', unreadable: region.kind === 'unreadable' }
+}
+
+const keeperFieldsOfWoo = (woo: WooTaxRateDetail): WooTaxKeeperFields => ({ ...fieldsOfWoo(woo), postcode: woo.postcode, city: woo.city })
+
+/** The keeper fields that differ between two reads of a store rate (empty when equal). */
+export function keeperFieldDifferences(live: WooTaxRateDetail, planned: WooTaxKeeperFields): WooTaxKeeperField[] {
+  const now = keeperFieldsOfWoo(live)
+  return WOO_TAX_KEEPER_FIELDS.filter((field) => now[field] !== planned[field])
 }
 
 const fieldsOfWoo = (woo: WooTaxRateDetail): WooTaxRateFields => ({
@@ -384,7 +402,10 @@ export function revalidateWooTaxChange(input: RevalidationInput): RevalidationFa
   }
   if (!inScope) return outOfScopeReason(rate) === change.reason ? null : 'IMS_RATE_CHANGED'
   if (change.reason !== 'DUPLICATE_COUNTERPART') return 'IMS_RATE_CHANGED'
-  return input.mappings.some((m) => m.taxRateId === rate.id && m.externalTaxRateId !== change.wooId && m.storeIdentity === input.storeIdentity) ? null : 'IMS_RATE_CHANGED'
+  // The intended keeper (recorded in the plan) must still be a stamped counterpart of this IMS rate. Its live fields are compared by the writer right before the send (KEEPER_CHANGED).
+  const keeper = change.keeper
+  if (keeper === null || keeper.wooId === change.wooId) return 'IMS_RATE_CHANGED'
+  return input.mappings.some((m) => m.taxRateId === rate.id && m.externalTaxRateId === keeper.wooId && m.storeIdentity === input.storeIdentity) ? null : 'IMS_RATE_CHANGED'
 }
 
 const KIND_ORDER = new Map(WOO_TAX_CHANGE_KINDS.map((kind, index) => [kind, index] as const))
@@ -456,7 +477,7 @@ export function planWooTaxRates(input: WooTaxPlanInput): WooTaxPlan {
     const keeper = [...compared].sort((a, b) => a.fields.length - b.fields.length || idOrder(a.woo.id, b.woo.id))[0]!
     for (const entry of compared) {
       if (entry.woo.id !== keeper.woo.id) {
-        changes.push({ kind: 'DELETE', key: `delete:${entry.woo.id}`, wooId: entry.woo.id, imsRateId: rate.id, imsRateName: rate.name, reason: 'DUPLICATE_COUNTERPART', before: fieldsOfWoo(entry.woo) })
+        changes.push({ kind: 'DELETE', key: `delete:${entry.woo.id}`, wooId: entry.woo.id, imsRateId: rate.id, imsRateName: rate.name, reason: 'DUPLICATE_COUNTERPART', before: fieldsOfWoo(entry.woo), keeper: { wooId: keeper.woo.id, fields: keeperFieldsOfWoo(keeper.woo) } })
       }
     }
     findings.push(...keeper.findings)
@@ -471,7 +492,7 @@ export function planWooTaxRates(input: WooTaxPlanInput): WooTaxPlan {
     if (mapping === undefined || !verifiedWoo.has(woo.id)) continue
     const rate = ratesById.get(mapping.taxRateId)
     if (rate === undefined || inScopeIds.has(rate.id)) continue
-    changes.push({ kind: 'DELETE', key: `delete:${woo.id}`, wooId: woo.id, imsRateId: rate.id, imsRateName: rate.name, reason: outOfScopeReason(rate), before: fieldsOfWoo(woo) })
+    changes.push({ kind: 'DELETE', key: `delete:${woo.id}`, wooId: woo.id, imsRateId: rate.id, imsRateName: rate.name, reason: outOfScopeReason(rate), before: fieldsOfWoo(woo), keeper: null })
   }
 
   let unowned = 0

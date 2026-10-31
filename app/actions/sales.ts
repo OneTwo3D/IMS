@@ -1,6 +1,6 @@
 'use server'
 
-import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
+import { lockOrderNamedTaxRate, resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { revalidatePath } from 'next/cache'
@@ -1201,6 +1201,10 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
 
       // A supplied rate id that a tax re-key retired is resolved to its replacement; a plainly inactive one is refused (lib/tax/writable-tax-rate.ts), under the row share lock the apply waits on.
       await resolveLinesTaxRates(tx, lineData)
+      // The order-level named rate is locked to this commit (the tax import's deactivateAbsent re-counts the orders naming a rate under FOR UPDATE). A rate that was found active above and is
+      // gone now was deactivated in between: the order is not written naming it.
+      const lockedNamedRates = await lockOrderNamedTaxRate(tx, input.taxRateName)
+      if (orderDefaultRate !== null && lockedNamedRates === 0) throw new Error(`Tax rate "${input.taxRateName}" was deactivated while the order was being created. Choose an active tax rate.`)
       return tx.salesOrder.create({
         data: {
           externalOrderNumber,
@@ -3285,6 +3289,8 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     const clone = await db.$transaction(async (tx) => {
     // A cloned line's rate that a tax re-key retired follows its replacement; a plainly inactive one is refused (lib/tax/writable-tax-rate.ts).
     const cloneRates = await resolveWritableTaxRateIds(tx, so.lines.map((l) => l.taxRateId))
+    // The clone names the source order's rate (the header name is copied): locked to this commit like any order-level named rate.
+    await lockOrderNamedTaxRate(tx, so.taxRateName)
     return tx.salesOrder.create({
       data: {
         orderNumber: ref,

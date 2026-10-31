@@ -364,6 +364,39 @@ test('the digest is stable, changes with any decision-bearing fact, and ignores 
   assert.notEqual(digestRekeyPlan({ ...base, list: { ...base.list, digest: digestTaxRateList(TENANT, LIVE.slice(1)) } }), base.digest, 'a different list')
 })
 
+// [mutation: `copied` left out of the plan row (matchRekeyRates) -> every arm below fails; mutation: one copied field left out of it (reverseCharge / isCompound / taxCategory / type / a component field) -> that arm fails]
+test('the digest binds every copied, posting-relevant rate and component field: a toggle between the preview and the apply changes it', () => {
+  const comp = (over: Partial<NonNullable<RekeyImsRate['components']>[number]> = {}) => ({ name: 'VAT', rate: '0.1900', compoundOnPrevious: false, accountingTaxType: 'TAX005', active: true, sortOrder: 0, ...over })
+  const digestWith = (over: Partial<RekeyImsRate>, components = [comp()]): string => {
+    const rates = DEMO.map((r) => (r.id === 'cy' ? { ...r, reverseCharge: false, isCompound: false, taxCategory: 'STANDARD', type: 'VAT', reportingCategory: null, components, ...over } : r))
+    const matched = match(rates, LIVE)
+    const references = Object.fromEntries(matched.rows.filter((r) => r.outcome === 'REKEY').map((r) => [r.imsRateId, refs()]))
+    return digestRekeyPlan({ list: { tenantId: TENANT, fetchedAt: FETCHED.toISOString(), rowCount: LIVE.length, digest: digestTaxRateList(TENANT, LIVE) }, ...matched, references, clearUnresolved: false })
+  }
+  const base = digestWith({})
+  assert.equal(digestWith({}), base, 'control: the same rate gives the same digest')
+  assert.notEqual(digestWith({ reverseCharge: true }), base, 'reverseCharge')
+  assert.notEqual(digestWith({ isCompound: true }), base, 'isCompound')
+  assert.notEqual(digestWith({ taxCategory: 'ZERO' }), base, 'taxCategory')
+  assert.notEqual(digestWith({ type: 'GST' }), base, 'type')
+  assert.notEqual(digestWith({}, [comp({ name: 'Other' })]), base, 'component name')
+  assert.notEqual(digestWith({}, [comp({ accountingTaxType: 'TAX004' })]), base, 'component code (a live one, so no cleared-component entry carries the change)')
+  assert.notEqual(digestWith({}, [comp({ accountingTaxType: null })]), base, 'component code cleared')
+  assert.notEqual(digestWith({}, [comp({ sortOrder: 3 })]), base, 'component order')
+  assert.notEqual(digestWith({}, [comp({ active: false })]), base, 'component active flag')
+  // An INACTIVE component does not change what the rate means (the matcher ignores it), so only the copied snapshot can see a change to it.
+  const inactive = (over: Partial<NonNullable<RekeyImsRate['components']>[number]> = {}) => comp({ sortOrder: 1, rate: '0.0500', active: false, ...over })
+  const withInactive = digestWith({}, [comp(), inactive()])
+  assert.deepEqual(match(DEMO.map((r) => (r.id === 'cy' ? { ...r, components: [comp(), inactive()] } : r)), LIVE).rows.find((r) => r.imsRateId === 'cy')!.outcome, 'REKEY', 'precondition: an inactive component leaves the outcome alone')
+  assert.notEqual(withInactive, base, 'an added (inactive) component')
+  assert.notEqual(digestWith({}, [comp(), inactive({ compoundOnPrevious: true })]), withInactive, 'component compounding')
+  assert.notEqual(digestWith({}, [comp(), inactive({ rate: '0.0600' })]), withInactive, 'a later component\'s rate')
+  assert.notEqual(digestWith({}, [comp(), inactive({ name: 'Renamed' })]), withInactive, 'a later component\'s name')
+  assert.notEqual(digestWith({}, [comp({ rate: '0.2000' })]), base, 'component rate')
+  const row = match(DEMO.map((r) => (r.id === 'cy' ? { ...r, reverseCharge: true, isCompound: true, taxCategory: 'ZERO', reportingCategory: 'EC_SALES', components: [comp()] } : r)), LIVE).rows.find((r) => r.imsRateId === 'cy')!
+  assert.deepEqual(row.copied, { type: null, taxCategory: 'ZERO', isCompound: true, reverseCharge: true, reportingCategory: 'EC_SALES', components: [{ sortOrder: 0, name: 'VAT', rate: '0.1900', compoundOnPrevious: false, accountingTaxType: 'TAX005', active: true }] })
+})
+
 // [mutation: any one check dropped from applyRefusal -> that arm fails]
 test('applyRefusal: blockers and queued payloads always refuse; unposted orders refuse unless the explicit flag is passed', () => {
   assert.equal(applyRefusal(planOf(), false), null)
