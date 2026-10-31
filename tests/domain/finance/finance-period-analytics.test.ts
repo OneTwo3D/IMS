@@ -638,6 +638,12 @@ test('FX gain/loss: a paid BILL with an unusable (zero) rate is also listed as n
   assert.match(String(report.rows[0]?.notComputableReason), /not a positive number/)
 })
 
+test('FX gain/loss: an error that is not an FX-rate refusal still aborts the report (only MissingFxRateError becomes a row)', async () => {
+  const poisoned = { fromCurrency: 'GBP', toCurrency: 'USD', fetchedAt: new Date('2026-06-09T00:00:00.000Z'), get rate(): never { throw new Error('rate store exploded') } }
+  const client: FinanceAnalyticsClient = { ...fxGainLossClient([]), fxRate: { findMany: async () => [poisoned] as never } }
+  await assert.rejects(getFxGainLossReport(fxWindow, fxOpts(client)), /rate store exploded/)
+})
+
 test('FX gain/loss: no stored rate on or before the payment lists the item as NOT COMPUTABLE with the reason, never at the booked rate or 1', async () => {
   const client = fxGainLossClient([{ rate: '1.1', at: '2026-06-11T00:00:00.000Z' }]) // after paidAt
   const report = await getFxGainLossReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, fxOpts(client))

@@ -451,6 +451,15 @@ test('paid payload in a different currency than the order IMS holds: no Payment,
   assert.equal(registrations.length, 1)
 })
 
+test('an order stored with a lower-case or padded currency code still matches the same Woo currency (both sides are read as the importer reads them)', async () => {
+  const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder({ currency: 'GBP' })
+  await s.sql(`update sales_orders set currency = ' gbp ' where id = $1`, [o.id])
+  await updateExistingWcOrderFromPayload(o.id, { ...(payload(Number(o.wcId), '2026-10-01T10:00:00') as object), currency: 'GBP' } as never)
+  assert.equal((await s.db.activityLog.count({ where: { entityId: o.id, action: 'wc_paid_currency_differs' } })), 0, 'no false mismatch from the stored spelling')
+  assert.ok((await s.db.salesOrder.findUniqueOrThrow({ where: { id: o.id } })).paidAt)
+})
+
 test('paid payload that states no currency: not recorded, a review notice naming the missing currency', async () => {
   const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
   const o = await heldOrder()
