@@ -126,7 +126,7 @@ guarantee.
 
 IMS reports unhandled errors to the self-hosted GlitchTip (Sentry-compatible) through
 `@sentry/nextjs`. The SDK is **disabled unless a DSN is set**, so CI, tests, local dev and any
-unit without the variables behave exactly as before. Errors only (5% trace sampling; `dataCollection` in `lib/observability/data-collection.ts` turns off user info, cookies, bodies and client-IP headers, the v11 form of `sendDefaultPii: false`); no session
+unit without the variables behave exactly as before. Errors only (5% trace sampling; `dataCollection` in `lib/observability/data-collection.ts` turns off user info, cookies, bodies and all but an allowlist of harmless headers, the v11 form of `sendDefaultPii: false`); no session
 replay, profiling or feedback widget.
 
 | Variable | Used by | Notes |
@@ -139,7 +139,7 @@ replay, profiling or feedback widget.
 The DSN is copied from the GlitchTip project settings (onetwo3D org, project `ims`) into the
 unit's environment file; it never goes in the repository. Use one environment name per deployment
 (`stage`, `production`) so events can be filtered. Because the browser DSN is a build-time value,
-set `NEXT_PUBLIC_SENTRY_DSN` before `next build` and rebuild after changing it.
+set `NEXT_PUBLIC_SENTRY_DSN` before `next build` and rebuild after changing it. The container image takes the three `NEXT_PUBLIC_SENTRY_*` values as build args (`docker build --build-arg NEXT_PUBLIC_SENTRY_DSN=... --build-arg NEXT_PUBLIC_SENTRY_ENVIRONMENT=...`); an image built without them has the browser SDK off, whatever the runtime env says. Server-side `SENTRY_*` stay runtime env.
 
 Every event, breadcrumb and transaction passes through `lib/observability/scrub.ts` first: values
 under keys like password/secret/token/auth/api-key/cookie/dsn/session/credential become

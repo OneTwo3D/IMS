@@ -17,7 +17,9 @@ export const FILTERED = '[Filtered]'
 export const EMAIL_PLACEHOLDER = '[email]'
 export const SCRUB_FAILED = '[scrub failed]'
 
-const SENSITIVE_KEY = /pass(word)?|secret|token|auth|api[-_]?key|cookie|dsn|session|credential/i
+// `sig` is matched only as a whole word (x-sig, sig_v2) so "design"/"assigned" are not caught.
+const SENSITIVE_KEY =
+  /pass(word)?|secret|token|auth|api[-_]?key|cookie|dsn|session|credential|signature|hmac|nonce|(^|[-_.])sig($|[-_.])/i
 
 // Keys whose value is a raw query string / query part: dropped wholesale.
 const QUERY_KEY = /^(query[-_]?string|url\.query|http\.query|http\.query_string)$/i

@@ -205,3 +205,40 @@ test('plain text containing a question mark is left alone', () => {
   const msg = 'why did order 173814 SKU ABC-1 fail? see /orders/173814'
   assert.equal(scrubEvent({ message: msg })?.message, msg)
 })
+
+const SIG_HEADERS = {
+  'x-mintsoft-signature': 'SIGSENTINEL1',
+  'x-oti-signature': 'SIGSENTINEL2',
+  'x-wc-webhook-signature': 'SIGSENTINEL3',
+  'X-Hub-Signature-256': 'SIGSENTINEL4',
+  'x-shopify-hmac-sha256': 'SIGSENTINEL5',
+  'x-request-nonce': 'SIGSENTINEL6',
+  'x-sig': 'SIGSENTINEL7',
+  'user-agent': 'curl/8',
+}
+
+function assertNoSigSentinels(value: unknown): void {
+  const s = json(value)
+  for (let i = 1; i <= 7; i++) assert.ok(!s.includes(`SIGSENTINEL${i}`), `leaked SIGSENTINEL${i}`)
+}
+
+test('webhook signature headers do not survive an event, a streamed span or a breadcrumb', () => {
+  const ev = scrubEvent({ request: { headers: { ...SIG_HEADERS } }, extra: { headers: { ...SIG_HEADERS } } })
+  assert.ok(ev)
+  assertNoSigSentinels(ev)
+  assert.equal(ev.request?.headers?.['user-agent'], 'curl/8')
+
+  const attrs: Record<string, string> = {}
+  for (const [k, v] of Object.entries(SIG_HEADERS)) attrs[`http.request.header.${k}`] = v
+  const span = scrubSpan({ name: 'POST /api/webhooks', attributes: { ...attrs, 'http.request.header.user-agent': 'curl/8' } })
+  assertNoSigSentinels(span)
+  assert.equal(span.attributes['http.request.header.user-agent'], 'curl/8')
+
+  const bc = scrubBreadcrumb({ category: 'http', data: { request_headers: { ...SIG_HEADERS } } })
+  assertNoSigSentinels(bc)
+})
+
+test('signature key rule has no false positives on ordinary fields', () => {
+  const out = scrubEvent({ extra: { sku: 'ABC-1', designation: 'x', assignedTo: 'y', significance: 'z', orderId: '173814' } })
+  assert.deepEqual(out?.extra, { sku: 'ABC-1', designation: 'x', assignedTo: 'y', significance: 'z', orderId: '173814' })
+})
