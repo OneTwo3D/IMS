@@ -6,9 +6,9 @@ import test, { mock } from 'node:test'
  * GL reconciliation, COGS and transit reconciliations, the inventory valuation report) resolves the code to the one active chart
  * account, reads by that account's id under the connected organisation, and WITHHOLDS when that is unproven.
  */
-type Row = { id: string; connector: string; externalAccountId: string; accountCode: string; accountName: string; balanceDate: Date; currency: string; amountForeign: string; amountBase: string; sourcePayloadRef: null; tenantId: string | null; financialYearEnd: null; parserVersion: number | null; syncRunId: null; fetchedAt: Date }
+type Row = { id: string; connector: string; externalAccountId: string; accountCode: string; accountName: string; balanceDate: Date; currency: string; amountForeign: string; amountBase: string; sourcePayloadRef: string | null; tenantId: string | null; financialYearEnd: null; parserVersion: number | null; syncRunId: null; fetchedAt: Date }
 const day = (iso: string) => new Date(`${iso}T00:00:00.000Z`)
-const row = (id: string, accountId: string, code: string, iso: string, amount: string, tenantId: string | null = 't1'): Row => ({ id, connector: 'xero', externalAccountId: accountId, accountCode: code, accountName: code, balanceDate: day(iso), currency: 'GBP', amountForeign: amount, amountBase: amount, sourcePayloadRef: null, tenantId, financialYearEnd: null, parserVersion: 2, syncRunId: null, fetchedAt: day(iso) })
+const row = (id: string, accountId: string, code: string, iso: string, amount: string, tenantId: string | null = 't1'): Row => ({ id, connector: 'xero', externalAccountId: accountId, accountCode: code, accountName: code, balanceDate: day(iso), currency: 'GBP', amountForeign: amount, amountBase: amount, sourcePayloadRef: `xero:trial-balance:${iso}`, tenantId, financialYearEnd: null, parserVersion: 2, syncRunId: null, fetchedAt: day(iso) })
 
 let rows: Row[] = []
 let chart: Array<{ code: string; externalAccountId: string; type: string }> = []
@@ -94,4 +94,46 @@ test('PARSER VERSION: a balance written by an earlier parser is absent to every 
   assert.deepEqual(await transit(), { available: false, reason: 'no_gl_snapshot' })
   good(); rows = rows.map((r) => ({ ...r, parserVersion: 1 }))
   assert.deepEqual(await inv(), { available: false, reason: 'no_gl_snapshot' })
+})
+
+const REF = (iso: string, suffix = '') => `xero:trial-balance:${iso}${suffix}`
+const refOf = (id: string, ref: string | null, amount?: string) => { rows = rows.map((r) => (r.id === id ? { ...r, sourcePayloadRef: ref, ...(amount === undefined ? {} : { amountBase: amount, amountForeign: amount }) } : r)) }
+
+test('PROVENANCE: a legacy unproven absent-from-tb zero, an unknown ref, no ref or another date\'s ref is no balance: inconclusive by name, never compared', async () => {
+  const bad: Array<[string, string | null]> = [
+    ['legacy unproven absent zero', REF('2026-10-19', ':absent-from-tb')],
+    ['unknown suffix', REF('2026-10-19', ':absent-from-something')],
+    ['no ref at all', null],
+    ['the reference of another date', REF('2026-10-18')],
+    ['a proven ref of another date', REF('2026-10-18', ':absent-from-complete-tb')],
+  ]
+  for (const [name, ref] of bad) {
+    for (const id of ['1', '2']) { good(); refOf(id, ref, '0'); assert.deepEqual(await inv(), { available: false, reason: 'gl_balance_unproven' }, `inventory leg ${id}: ${name}`) }
+    good(); refOf('3', ref, '0'); assert.deepEqual(await cogs(), { available: false, reason: 'gl_balance_unproven' }, `cogs: ${name}`)
+    good(); refOf('4', ref, '0'); assert.deepEqual(await transit(), { available: false, reason: 'gl_balance_unproven' }, `transit: ${name}`)
+  }
+})
+
+test('PROVENANCE: a proven-absent zero is a real zero, compared and LABELLED; a proven label over a non-zero amount is no balance', async () => {
+  good(); refOf('2', REF('2026-10-19', ':absent-from-complete-tb'), '0')
+  const ok = await inv()
+  assert.ok(ok.available)
+  if (ok.available) assert.deepEqual(ok.glProvenance, { inventory: 'reported', allocated: 'proven-absent' })
+  good()
+  const reported = await inv()
+  assert.ok(reported.available)
+  if (reported.available) assert.deepEqual(reported.glProvenance, { inventory: 'reported', allocated: 'reported' })
+  good(); refOf('2', REF('2026-10-19', ':absent-from-complete-tb'), '3')
+  assert.deepEqual(await inv(), { available: false, reason: 'gl_balance_unproven' })
+})
+
+test('PROVENANCE: a legacy zero is also refused as the OPENING leg of a movement; a proven-absent opening is accepted', async () => {
+  good()
+  rows = [...rows, row('5', 'a-500', '500', '2026-10-18', '0'), row('6', 'a-632', '632', '2026-10-18', '0')]
+  refOf('5', REF('2026-10-18', ':absent-from-tb')); refOf('6', REF('2026-10-18', ':absent-from-tb'))
+  assert.deepEqual(await cogs(), { available: false, reason: 'gl_balance_unproven' })
+  assert.deepEqual(await transit(), { available: false, reason: 'gl_balance_unproven' })
+  refOf('5', REF('2026-10-18', ':absent-from-complete-tb')); refOf('6', REF('2026-10-18', ':absent-from-complete-tb'))
+  const c = await cogs().catch((e) => e)
+  assert.ok(!(c && typeof c === 'object' && 'reason' in c && c.reason === 'gl_balance_unproven'), 'a proven-absent opening is not refused for provenance')
 })

@@ -91,3 +91,19 @@ test('the docs carry every outcome, reason code, refusal code, item and audit ro
   assert.ok(find('settling').includes(`${PENDING_PERSISTENCE_RUNS} LATER successful runs`))
   assert.ok(find('chain').includes(`${MAX_REPORTS_READ} reports`))
 })
+
+// [mutation: the stale claim that every omitted-account zero is GL_LEG_ABSENT restored in the ledger or the failure-class text]
+test('the docs say a zero stored under the completeness proof is compared, and only the unproven zero is GL_LEG_ABSENT (absence of the old claim, presence of the new)', () => {
+  const ledger = PACK_DOC_BLOCKS.ledger
+  const audit = PACK_DOC_BLOCKS.audit
+  for (const [name, text] of [['ledger', ledger], ['audit', audit]] as const) {
+    assert.ok(!/a synthesised zero is GL_LEG_ABSENT;/.test(text), `${name}: the old transit claim`)
+    assert.ok(!/a balance that is the zero the pull synthesised withholds its leg/.test(text), `${name}: the old failure-class claim`)
+    assert.ok(!/omitted, the comparison is withheld, not made against a zero: GL_LEG_ABSENT\./.test(text), `${name}: the old R6 claim`)
+  }
+  assert.ok(/WITHOUT the completeness proof \(the legacy absent-from-tb zero\), the comparison is withheld/.test(ledger))
+  assert.ok(/gl_balance_unproven/.test(ledger))
+  assert.ok(/a zero stored under the completeness proof/.test(audit))
+  assert.ok(/a synthesised zero without the completeness proof is GL_LEG_ABSENT/.test(audit))
+  assert.ok(/When the Xero list is unproven the Woo-IMS identity checks still run/.test(PACK_DOC_BLOCKS.vendor))
+})

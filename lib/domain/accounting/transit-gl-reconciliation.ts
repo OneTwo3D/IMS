@@ -8,6 +8,7 @@ import {
   AccountBalanceMovementWithheldError,
   MissingAccountBalanceSnapshotError,
   findLatestConfiguredAccountBalanceSnapshot,
+  glLegProvenance,
 } from './account-balance-snapshots'
 import { isTransitLedgerCoverageSatisfied } from './transit-ledger-coverage'
 import {
@@ -55,6 +56,7 @@ export type TransitGlReconciliationUnavailableReason =
   | 'no_opening_snapshot'
   | 'financial_year_boundary'
   | 'account_identity_unproven'
+  | 'gl_balance_unproven'
   | 'ledger_not_covering_window'
 
 export type TransitGlReconciliationResult = AccountGlReconciliationResult<TransitGlReconciliationUnavailableReason>
@@ -111,7 +113,7 @@ export async function loadTransitGlReconciliation(options?: {
       currency,
     })
   } catch (error) {
-    if (error instanceof AccountBalanceMovementWithheldError) return { available: false, reason: 'account_identity_unproven' }
+    if (error instanceof AccountBalanceMovementWithheldError) return { available: false, reason: error.reason === 'balance_provenance_unproven' ? 'gl_balance_unproven' : 'account_identity_unproven' }
     throw error
   }
   if (!closing) return { available: false, reason: 'no_gl_snapshot' }
@@ -133,7 +135,7 @@ export async function loadTransitGlReconciliation(options?: {
     // Stock in Transit is a balance-sheet account, so this does not happen for a correctly typed chart; if the chart says
     // otherwise, or does not know the account, the movement is withheld rather than guessed.
     if (error instanceof AccountBalanceMovementWithheldError) {
-      return { available: false, reason: 'financial_year_boundary' }
+      return { available: false, reason: error.reason === 'balance_provenance_unproven' ? 'gl_balance_unproven' : 'financial_year_boundary' }
     }
     throw error
   }
@@ -159,6 +161,7 @@ export async function loadTransitGlReconciliation(options?: {
   return {
     available: true,
     balanceDate: balanceDateString(closingDate),
+    glProvenance: { opening: glLegProvenance(movement.opening), closing: glLegProvenance(movement.closing) },
     ...evaluateAccountGlReconciliation({
       subledgerValue,
       glBalance,

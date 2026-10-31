@@ -20,7 +20,8 @@
  *     A missing or unreadable record is `unknown`, never "in". A recorded instant bounds a population here and nowhere
  *     else; two runs are never ordered by a timestamp.
  *   - NOT STOCK-TRACKED PRODUCTS ARE EXCLUDED AND LISTED: stock rows of a product type that does not carry stock are
- *     returned under `untracked`, so nothing is hidden and nothing is compared.
+ *     returned under `untracked`, so nothing is hidden and nothing is compared. A product type outside the schema's ProductType
+ *     enum is NOT classed untracked: it makes the stock section unreadable, because a new stock-bearing type would otherwise drop out silently.
  *
  * Nothing read here reaches text except through lib/reconciliation-pack/identity.ts. The module has no clock and no
  * environment: the caller passes the connection, the date and the limits.
@@ -46,7 +47,7 @@ import {
 } from '@/lib/reconciliation-pack/constants'
 import { normaliseWcOrderStatus, WC_DEFAULT_SYNC_ORDER_STATUSES } from '@/lib/connectors/woocommerce/order-status-filter'
 import { STOCK_TRACKED_PRODUCT_TYPES } from '@/lib/domain/inventory/backorder-policy'
-import { AccountingSyncStatus, AccountingSyncType, PurchaseOrderStatus, SalesOrderStatus } from '@/app/generated/prisma/enums'
+import { AccountingSyncStatus, AccountingSyncType, ProductType, PurchaseOrderStatus, SalesOrderStatus } from '@/app/generated/prisma/enums'
 import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { QOBLEX_BASE_CURRENCY, TRANSIT_COVERAGE_SETTING_KEY } from '@/lib/reconciliation-pack/constants'
 
@@ -386,7 +387,7 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
 
   async stock(tx) {
     const rows = await readCapped(tx, `SELECT sl.id, sl."productId" AS product_id, p.sku, p.type::text AS product_type, sl."warehouseId" AS warehouse_id, w.code AS warehouse_code, sl.quantity::text AS quantity, sl."reservedQty"::text AS reserved FROM stock_levels sl JOIN products p ON p.id = sl."productId" JOIN warehouses w ON w.id = sl."warehouseId" ORDER BY sl.id`)
-    const pairs = rows.map((row): StockPair => ({ stockLevelId: text(row.id), productId: text(row.product_id), sku: text(row.sku), productType: text(row.product_type, 'SOURCE_UNREADABLE'), warehouseId: text(row.warehouse_id), warehouseCode: text(row.warehouse_code), quantity: decimal(row.quantity), reservedQty: decimal(row.reserved) }))
+    const pairs = rows.map((row): StockPair => ({ stockLevelId: text(row.id), productId: text(row.product_id), sku: text(row.sku), productType: oneOf(row.product_type, Object.values(ProductType)), warehouseId: text(row.warehouse_id), warehouseCode: text(row.warehouse_code), quantity: decimal(row.quantity), reservedQty: decimal(row.reserved) }))
     unique(pairs, (pair) => pair.stockLevelId)
     unique(pairs, (pair) => `${pair.productId}\u0001${pair.warehouseId}`)
     const tracked = (type: string) => (STOCK_TRACKED_PRODUCT_TYPES as ReadonlySet<string>).has(type)

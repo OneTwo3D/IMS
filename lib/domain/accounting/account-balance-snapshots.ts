@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { balanceDateString, normalizeBalanceDate } from '@/lib/domain/accounting/balance-date'
 import { XERO_TRIAL_BALANCE_PARSER_VERSION } from '@/lib/domain/accounting/snapshot-provenance'
+import { parseXeroTrialBalanceRef } from '@/lib/connectors/xero/account-balance-refs'
 import {
   isLifetimeBalanceAccountType,
   parseFinancialYearEnd,
@@ -87,6 +88,7 @@ export type AccountBalanceMovementWithheldReason =
   | 'account_identity_unproven'
   | 'account_identity_changed'
   | 'organisation_unproven'
+  | 'balance_provenance_unproven'
 
 /**
  * A closing-minus-opening movement that would not be a movement: the account is a profit-and-loss account (its Trial Balance
@@ -105,6 +107,8 @@ export class AccountBalanceMovementWithheldError extends Error {
         ? `The chart does not name exactly one active account for code ${account}, so a movement between ${window} cannot be tied to an account; it is withheld.`
         : input.reason === 'organisation_unproven'
           ? `No connected Xero organisation is recorded, so a stored balance for code ${account} cannot be shown to be the connected organisation's; it is withheld.`
+        : input.reason === 'balance_provenance_unproven'
+          ? `The stored balance for code ${account} (${window}) is not one Xero reported and not a zero from a Trial Balance that proved itself complete (a legacy unproven absent-from-tb zero, or an unlabelled or inconsistent row); it is not read as a balance and the figure is withheld until the date is pulled again.`
         : input.reason === 'account_identity_changed'
           ? `The stored balances for code ${account} between ${window} are not both the configured account's own, from the same organisation (the code was reassigned or the organisation changed); the movement is withheld.`
           : `Account ${account} is a profit-and-loss account and its two balances do not prove the same financial-year end for the same organisation, so a movement between ${window} is withheld.`)
@@ -233,6 +237,30 @@ export async function persistAccountingAccountBalanceSnapshots(
   return { attempted: inputs.length, persisted: snapshots.length, snapshots }
 }
 
+/**
+ * What a stored balance's reference proves, for a reader that takes only the amount:
+ * - `reported`: Xero returned the account in the Trial Balance (the plain reference for the row's own date).
+ * - `proven-absent`: a zero the pull synthesised for a configured account that a Trial Balance which PROVED ITSELF COMPLETE omitted
+ *   (the `absent-from-complete-tb` reference for the row's own date, parser version 2, an amount of exactly zero): a real zero, but
+ *   one Xero never reported, so a result resting on it says so.
+ * - `unproven`: everything else: the legacy `absent-from-tb` zero (an incomplete pull may have missed a real balance), a reference
+ *   for another date, no reference or an unknown one, a proven label over a non-zero amount, any other parser version. Never a value.
+ */
+export type StoredBalanceProvenance = 'reported' | 'proven-absent' | 'unproven'
+
+export function storedBalanceProvenance(row: { balanceDate: Date; amountBase: DecimalInput; sourcePayloadRef: string | null; parserVersion: number | null }): StoredBalanceProvenance {
+  if (row.parserVersion !== XERO_TRIAL_BALANCE_PARSER_VERSION) return 'unproven'
+  const kind = parseXeroTrialBalanceRef(balanceDateString(row.balanceDate), row.sourcePayloadRef)
+  if (kind === 'reported') return 'reported'
+  if (kind === 'proven-absent') return toDecimal(row.amountBase).isZero() ? 'proven-absent' : 'unproven'
+  return 'unproven'
+}
+
+/** The label a result carries for a balance that already passed the provenance check (an unproven one never reaches a result). */
+export function glLegProvenance(row: Parameters<typeof storedBalanceProvenance>[0]): 'reported' | 'proven-absent' {
+  return storedBalanceProvenance(row) === 'proven-absent' ? 'proven-absent' : 'reported'
+}
+
 export async function findLatestAccountBalanceSnapshot(
   lookup: AccountBalanceSnapshotLookup,
   client: SnapshotClient = db,
@@ -285,7 +313,7 @@ export async function findLatestConfiguredAccountBalanceSnapshot(
   const token = await client.accountingToken.findUnique({ where: { connector: lookup.connector }, select: { tenantId: true } })
   const tenantId = typeof token?.tenantId === 'string' ? token.tenantId.trim() : ''
   if (!tenantId) throw withheld('organisation_unproven')
-  return client.accountingAccountBalanceSnapshot.findFirst({
+  const found = await client.accountingAccountBalanceSnapshot.findFirst({
     where: {
       connector: lookup.connector,
       externalAccountId: chartRows[0]!.externalAccountId,
@@ -296,6 +324,9 @@ export async function findLatestConfiguredAccountBalanceSnapshot(
     },
     orderBy: [{ balanceDate: 'desc' }, { fetchedAt: 'desc' }, { id: 'desc' }],
   })
+  // This reader hands back an amount, so only a balance that proves itself counts (see storedBalanceProvenance).
+  if (found && storedBalanceProvenance(found) === 'unproven') throw withheld('balance_provenance_unproven')
+  return found
 }
 
 export async function getAccountBalancePeriodMovement(
@@ -350,6 +381,8 @@ export async function getAccountBalancePeriodMovement(
       foundBalanceDate: closing?.balanceDate ?? null,
     })
   }
+  // Both amounts must be balances that prove themselves; a legacy unproven zero in either leg is no balance.
+  if (storedBalanceProvenance(opening) === 'unproven' || storedBalanceProvenance(closing) === 'unproven') throw withheldFor('balance_provenance_unproven')
   // Defence in depth over the id-keyed read above: both rows are the intended account's, from one organisation.
   if (opening.externalAccountId !== intended.externalAccountId || closing.externalAccountId !== intended.externalAccountId || opening.tenantId !== closing.tenantId) {
     throw withheldFor('account_identity_changed')

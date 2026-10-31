@@ -22,7 +22,7 @@
  *        recorded as covering every open order (NO_POPULATION_RECORD otherwise). The non-open orders with a non-zero residue are LISTED by identity
  *        with that residue under outOfPopulation (a finding detail, never judged; their value is in the total).
  *
- * A leg that rests on an account the trial balance omitted is WITHHELD (GL_LEG_ABSENT), never compared as a zero. The postings
+ * A leg that rests on an account the trial balance omitted without the completeness proof is WITHHELD (GL_LEG_ABSENT), never compared as a zero. The postings
  * leg needs a recorded, VERIFIED first load (NO_POPULATION_RECORD otherwise); a row older than that load's start is listed as out
  * of the population and is never a finding. No bounded scan: the postings are read in full or CAP_EXCEEDED. The module is total:
  * whatever it is handed, it returns an item and never throws.
@@ -214,8 +214,8 @@ async function runR11(basis: AsOfBasis, context: LedgerItemContext): Promise<Ite
   const transit = b.gl.filter((balance) => balance !== null && typeof balance === 'object' && balance.kind === 'transit')
   if (transit.length !== 1) return inconclusive('R11', 'SOURCE_UNREADABLE')
   const balance = transit[0]!
-  // An account the trial balance omitted is not a reported zero.
-  if (balance.provenance !== 'trial-balance-row') return inconclusive('R11', 'GL_LEG_ABSENT')
+  // An account the trial balance omitted without the completeness proof is not a reported zero; a zero a complete trial balance proved is.
+  if (balance.provenance !== 'trial-balance-row' && balance.provenance !== 'trial-balance-proven-absent') return inconclusive('R11', 'GL_LEG_ABSENT')
   const gl = dec(balance.amountBase)
   if (gl === null) return inconclusive('R11', 'BAD_VALUE')
   if (context.ims === undefined) return inconclusive('R11', 'SOURCE_UNREADABLE')

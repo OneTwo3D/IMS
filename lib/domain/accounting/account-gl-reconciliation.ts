@@ -61,9 +61,11 @@ export function evaluateAccountGlReconciliation(input: {
   return { subledgerValue, glBalance, delta, sweepLimit, action }
 }
 
+export type GlLegProvenance = 'reported' | 'proven-absent'
+
 export type AccountGlReconciliationResult<Reason extends string = string> =
   | { available: false; reason: Reason }
-  | ({ available: true; balanceDate: string } & AccountGlReconciliation)
+  | ({ available: true; balanceDate: string; /** Where each stored balance the figure rests on came from; a `proven-absent` leg is a zero Xero never reported (an omitted account of a Trial Balance that proved itself complete), compared as the real zero it is and labelled so. */ glProvenance?: Record<string, GlLegProvenance> } & AccountGlReconciliation)
 
 export type AccountReconciliationSweepJournal = {
   date: string

@@ -14,7 +14,7 @@ let closingDate = '2027-01-02'
 
 const snap = (id: string, date: string, amount: string) => ({
   id, connector: 'xero', externalAccountId: 'a-310', accountCode: '310', accountName: 'COGS', balanceDate: new Date(`${date}T00:00:00.000Z`),
-  currency: 'GBP', amountForeign: amount, amountBase: amount, sourcePayloadRef: null, tenantId: 't1', financialYearEnd: openingYearEnd, syncRunId: null, fetchedAt: new Date(),
+  currency: 'GBP', amountForeign: amount, amountBase: amount, sourcePayloadRef: `xero:trial-balance:${date}`, parserVersion: 2, tenantId: 't1', financialYearEnd: openingYearEnd, syncRunId: null, fetchedAt: new Date(),
 })
 mock.module('@/lib/db', {
   namedExports: {
