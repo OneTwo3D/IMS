@@ -97,6 +97,7 @@ async function applyTo(state: State, p: PurchaseTaxImportPlan): Promise<{ calls:
   const calls: Array<{ op: string; data?: Record<string, unknown>; where?: Record<string, unknown> }> = []
   const tx = {
     ...(client(state) as object),
+    $executeRaw: async () => { calls.push({ op: 'lock' }); return 0 },
     supplier: {
       updateMany: async ({ where, data }: { where: { taxRateId: string }; data: { taxRateId: string } }) => {
         calls.push({ op: 'supplier.updateMany', where, data })

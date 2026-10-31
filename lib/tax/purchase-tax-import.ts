@@ -25,6 +25,7 @@
  * cron writes in the same transaction (a rebind clears it), the connected organisation equal to the list's, and a read no older than the drift reader's own staleness limit.
  */
 import { Prisma } from '@/app/generated/prisma/client'
+import { lockStorefrontMappingWrites } from '@/lib/tax/storefront-mapping-write'
 import { effectiveTaxRateFromComponents } from '@/lib/tax/tax-rate-components'
 import { DRIFT_MAX_STALENESS_MS } from '@/lib/domain/accounting/tax-rate-drift-status'
 import { TAX_RATE_DRIFT_LAST_CHECKED_SETTING } from '@/lib/connectors/xero/tax-rate-drift-sweeper'
@@ -475,6 +476,8 @@ async function lockAndRecheck(tx: Client, row: { id: string; name: string }): Pr
 export async function writePurchaseTaxImport(tx: Client, plan: PurchaseTaxImportPlan): Promise<PurchaseTaxImportWrite> {
   const result: PurchaseTaxImportWrite = { created: [], suppliersRepointed: 0, mappingsRepointed: 0 }
   const nameOf = (id: string): string => plan.differs.find((d) => d.id === id)?.name ?? ''
+  // A mapping write takes the shared storefront-mapping lock FIRST, before any row lock (the WooCommerce tax-rate apply holds it exclusively while it re-reads ownership and sends).
+  if (plan.creates.some((c) => c.replaces !== null)) await lockStorefrontMappingWrites(tx)
   for (const create of plan.creates) {
     if (create.replaces !== null) await lockAndRecheck(tx, { id: create.replaces, name: nameOf(create.replaces) })
     const made = await tx.taxRate.create({
@@ -503,6 +506,7 @@ export async function writePurchaseTaxImport(tx: Client, plan: PurchaseTaxImport
     const deactivated = await tx.taxRate.updateMany({ where: { id: create.replaces, isDefault: false }, data: { active: false } })
     if (deactivated.count !== 1) throw new PurchaseTaxImportRaceError(create.replaces)
     result.suppliersRepointed += (await tx.supplier.updateMany({ where: { taxRateId: create.replaces }, data: { taxRateId: id } })).count
+    // The shared storefront-mapping lock was taken first (above); the ownership stamp is cleared in the same statement.
     result.mappingsRepointed += (await tx.shoppingTaxRateMapping.updateMany({ where: { taxRateId: create.replaces }, data: { taxRateId: id, storeIdentity: null } })).count
   }
   for (const row of plan.narrow) await tx.taxRate.updateMany({ where: { id: row.id, usedFor: 'BOTH' }, data: { usedFor: 'SALES' } })

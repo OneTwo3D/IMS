@@ -31,6 +31,7 @@ export const WRITERS: Readonly<Record<string, Declaration>> = {
   'lib/connectors/woocommerce/sync/taxes.ts': { rule: 'helper', why: 'the tax-rate import (upsert of the rate behind each WooCommerce id)' },
   'app/actions/wc-sync.ts': { rule: 'helper', why: 'the mapper\'s re-map (taxRateId) through the helper; the unlink deletes the row' },
   'lib/tax/tax-rekey.ts': { rule: 'clears-inline', token: 'storeIdentity: null', why: 'the re-key re-points every mapping of a retired IMS rate to its replacement' },
+  'lib/tax/purchase-tax-import.ts': { rule: 'clears-inline', token: 'storeIdentity: null', why: 'a replaced rate\'s mappings move to its replacement in the same write' },
   'scripts/lib/woo-import-driver.ts': { rule: 'helper', why: 'the rehearsal fixture seeds two mappings' },
   'scripts/copy-tax-rates.ts': { rule: 'clears-inline', token: 'store_identity', why: 'copies mappings between databases with ON CONFLICT DO UPDATE' },
   'scripts/commerce-accounting-e2e-fixture.ts': { rule: 'creates-only', why: 'e2e fixtures create mappings' },
@@ -154,6 +155,7 @@ test('MUTATION: each writer that loses its rule is red', () => {
   assert.ok(mutate('scripts/lib/woo-import-driver.ts', (t) => t.replace('upsertStorefrontTaxMapping(tx,', 'tx.shoppingTaxRateMapping.update(')).some((f) => f.startsWith('HELPER scripts/lib/woo-import-driver.ts')))
   // the re-key stops clearing; the copy script's ON CONFLICT DO UPDATE stops clearing
   assert.ok(mutate('lib/tax/tax-rekey.ts', (t) => t.replace('data: { taxRateId: fresh.id, storeIdentity: null }', 'data: { taxRateId: fresh.id }')).some((f) => f.startsWith('CLEARS lib/tax/tax-rekey.ts')))
+  assert.ok(mutate('lib/tax/purchase-tax-import.ts', (t) => t.replace('data: { taxRateId: id, storeIdentity: null }', 'data: { taxRateId: id }')).some((f) => f.startsWith('CLEARS lib/tax/purchase-tax-import.ts')))
   assert.ok(mutate('scripts/copy-tax-rates.ts', (t) => t.replaceAll('store_identity', 'something_else')).some((f) => f.startsWith('CLEARS scripts/copy-tax-rates.ts')))
   // a creates-only writer starts updating; a removes-only writer starts creating
   assert.ok(mutate('scripts/commerce-accounting-e2e-fixture.ts', (t) => `${t}\nawait db.shoppingTaxRateMapping.update({ where: {} as never, data: {} })`).some((f) => f.startsWith('CREATES-ONLY')))
@@ -165,7 +167,7 @@ test('MUTATION: each writer that loses its rule is red', () => {
 test('MUTATION: a writer that stops taking the apply lock is red, each one, and so is a helper that stops taking it', () => {
   const mutate = (file: string, edit: (text: string) => string) => { const files = new Map(real); files.set(file, edit(real.get(file)!)); return censusFindings(files) }
   const strip = (t: string) => t.replaceAll('lockStorefrontMappingWrites(', 'somethingElse(').replaceAll('pg_advisory_xact_lock_shared', 'pg_something_else')
-  for (const file of ['app/actions/wc-sync.ts', 'lib/tax/tax-rekey.ts', 'scripts/copy-tax-rates.ts', 'scripts/commerce-accounting-e2e-fixture.ts', 'app/actions/reset.ts']) {
+  for (const file of ['app/actions/wc-sync.ts', 'lib/tax/tax-rekey.ts', 'lib/tax/purchase-tax-import.ts', 'scripts/copy-tax-rates.ts', 'scripts/commerce-accounting-e2e-fixture.ts', 'app/actions/reset.ts']) {
     assert.ok(mutate(file, strip).some((f) => f.startsWith(`LOCK ${file}`)), file)
   }
   // one of a file's two writes loses its lock while the other keeps it
