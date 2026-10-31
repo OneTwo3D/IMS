@@ -273,7 +273,13 @@ test('an order whose lines carry one rate and whose header names another never d
   // DETERMINISTIC: a transaction holds the LOWER-id rate A FOR UPDATE; the order (lines on the higher-id rate B, header naming A) and the multi-rate deactivation queue behind it, in each order. A locker that
   // takes B first and then waits for A (the old writer: lines, then header; the old import: name order) deadlocks with the other one here, whichever queued first; ordered lockers never do.
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+  const clearOrders = async () => {
+    const orders = (await db.salesOrder.findMany({ where: { externalOrderNumber: { startsWith: `NRD${tag}` } }, select: { id: true } })).map((r) => r.id)
+    await db.salesOrderLine.deleteMany({ where: { orderId: { in: orders } } })
+    await db.salesOrder.deleteMany({ where: { id: { in: orders } } })
+  }
   for (const first of ['writer', 'import'] as const) {
+    await clearOrders() // an earlier order naming a rate would keep it (LIVE_DOCUMENTS) and the deactivation would not lock it
     await db.taxRate.updateMany({ where: { id: { in: [rateA.id, rateB.id] } }, data: { active: true } })
     let release!: () => void
     const gate = new Promise<void>((resolve) => { release = resolve })
@@ -284,9 +290,14 @@ test('an order whose lines carry one rate and whose header names another never d
     const startWriter = () => createSalesOrder({ externalOrderNumber: `NRD${tag}-det-${first}`, customerName: 'Lock order customer', currency: 'GBP', taxRateName: rateA.name, taxRateValue: 0.2, isDraft: true, lines: [{ productId: product.id, sku: product.sku, description: 'x', qty: 1, unitPriceForeign: 10, taxRateId: rateB.id }] } as never).then((r) => ({ r }), (e: unknown) => ({ e }))
     const startImport = () => imp.runPurchaseTaxImport({ apply: true, types: [], deactivateAbsent: true }).then((r) => ({ r }), (e: unknown) => ({ e }))
     const started: Record<string, Promise<{ r?: unknown; e?: unknown }>> = {}
+    const waiters = async (): Promise<number> => Number((await db.$queryRaw<Array<{ n: bigint }>>`SELECT count(*) AS n FROM pg_locks WHERE NOT granted AND locktype IN ('transactionid', 'tuple')`)[0]!.n)
     for (const who of first === 'writer' ? (['writer', 'import'] as const) : (['import', 'writer'] as const)) {
+      const before = await waiters()
       started[who] = who === 'writer' ? startWriter() : startImport()
-      await sleep(1500)
+      // Wait until this locker is really queued behind the holder (not a fixed sleep: the import's planning time varies under load).
+      const deadline = Date.now() + 60_000
+      while ((await waiters()) <= before && Date.now() < deadline) await sleep(100)
+      assert.ok((await waiters()) > before, `${who} is waiting on the held rate`)
     }
     release()
     await holder
