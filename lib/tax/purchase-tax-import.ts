@@ -72,7 +72,7 @@ export interface StoredXeroList {
 export type StoredListRead = { ok: true; list: StoredXeroList } | { ok: false; refusal: PurchaseTaxImportRefusal }
 
 /** What the import reads: the client is a transaction inside the fence (or the plain client for a read-only plan). */
-type Client = Prisma.TransactionClient
+export type Client = Prisma.TransactionClient
 
 const listRefusal = (code: PurchaseTaxImportRefusalCode, detail: string): StoredListRead => ({ ok: false, refusal: { code, taxType: null, detail } })
 
@@ -125,8 +125,8 @@ export async function readStoredXeroList(client: Client, now: Date, connectedTen
 export interface PlannedComponent { name: string; rate: string; compoundOnPrevious: boolean; sortOrder: number }
 export interface PlannedCreate {
   taxType: string
-  /** Which documents may pick the new row: PURCHASE (usedFor PURCHASE) or SALES (usedFor SALES). */
-  side: 'PURCHASE' | 'SALES'
+  /** Which documents may pick the new row: PURCHASE (usedFor PURCHASE), SALES (usedFor SALES) or BOTH (a Xero type that applies to revenue AND expenses and that no IMS row carries yet: ONE row, usedFor BOTH). */
+  side: 'PURCHASE' | 'SALES' | 'BOTH'
   /** The id of the active row this one REPLACES (same type, different percentage): it is deactivated in the same write, never edited. Null for a plain create. */
   replaces: string | null
   name: string
@@ -145,13 +145,17 @@ export interface NotInXeroRow {
   taxType: string
   reason: 'ABSENT_FROM_XERO' | 'NOT_ACTIVE_IN_XERO'
   references: RowReferences
-  /** True when the run deactivates it (opt-in and not the default rate). */
+  /** True when the run deactivates it (opt-in, not the default rate, and nothing live still depends on it). */
   deactivate: boolean
-  keptBecause: 'IS_DEFAULT_RATE' | null
+  /** Why an opt-in deactivation was NOT made: the default rate; or a non-cancelled sales or purchase order (open, or posted and so refundable) that still resolves its tax identity through the rate. */
+  keptBecause: KeptBecause | null
+  /** Non-cancelled documents depending on the rate (checked only for a row the run would deactivate; null = not checked). */
+  liveDocuments: number | null
 }
+export type KeptBecause = 'IS_DEFAULT_RATE' | 'LIVE_DOCUMENTS'
 export interface PresentRate { taxType: string; id: string; name: string; rate: string; xeroRate: string | null }
 /** An existing row that is the one rate for its type and side but whose percentage is not Xero's. Reported; corrected only by `replaceDiffering` (a new row + the old one deactivated). */
-export interface DifferingRate { taxType: string; side: 'PURCHASE' | 'SALES'; id: string; name: string; imsRate: string; xeroRate: string; references: RowReferences; replaced: boolean; keptBecause: 'IS_DEFAULT_RATE' | null }
+export interface DifferingRate { taxType: string; side: 'PURCHASE' | 'SALES'; id: string; name: string; imsRate: string; xeroRate: string; references: RowReferences; replaced: boolean; keptBecause: KeptBecause | null; liveDocuments: number | null }
 /** An active row with no Xero tax type at all (for example a per-country storefront rate): it has no Xero counterpart, so the single rate set cannot contain it. */
 export interface UnmappedRow { id: string; name: string; usedFor: string; countryCode: string | null; rate: string }
 /**
@@ -159,7 +163,7 @@ export interface UnmappedRow { id: string; name: string; usedFor: string; countr
  * (Xero EffectiveRate), else `display_tax_rate` (DisplayTaxRate), as percent text. `status`: present = an IMS row has exactly this percentage; created = the run creates it;
  * differs = an IMS row exists with another percentage; missing = no IMS row and none can be created (see refusals).
  */
-export interface RateSetEntry { taxType: string; name: string; percentage: string | null; side: 'PURCHASE' | 'SALES'; countryCode: string | null; imsId: string | null; status: 'present' | 'created' | 'differs' | 'missing' }
+export interface RateSetEntry { taxType: string; name: string; percentage: string | null; side: 'PURCHASE' | 'SALES' | 'BOTH'; countryCode: string | null; imsId: string | null; status: 'present' | 'created' | 'differs' | 'missing' }
 
 export interface PurchaseTaxImportPlan {
   list: { tenantId: string; fetchedAt: string; rowCount: number } | null
@@ -184,9 +188,9 @@ export interface PlanOptions {
   connectedTenantId: string | null
   /** The purchase types to satisfy. Default PURCHASE_TAX_IMPORT_TYPES. */
   types?: readonly string[]
-  /** true: also mirror the SALES side (OUTPUT2, ZERORATEDOUTPUT and every ACTIVE Xero type that applies to revenue and not to expenses, reduced-rate / EC / OSS included) under the same rules. */
+  /** true: also mirror the SALES side (OUTPUT2, ZERORATEDOUTPUT and every ACTIVE Xero type that applies to revenue, reduced-rate / EC / OSS included) under the same rules. A type that applies to revenue AND expenses and that no IMS row carries gets ONE row usable for both. */
   mirrorSales?: boolean
-  /** true: a row whose percentage differs from Xero's is REPLACED (new row + old deactivated). Never an edit. */
+  /** true: a row whose percentage differs from Xero's is REPLACED (new row + old deactivated, its supplier defaults and storefront mappings re-pointed in the same write). Never an edit. A row that live documents still depend on is not replaced. */
   replaceDiffering?: boolean
   narrowSalesTypes?: boolean
   deactivateAbsent?: boolean
@@ -236,9 +240,24 @@ export async function checkRatesAgainstXero(client: Client, now: Date, connected
   return { ok: true, disagreements }
 }
 
+/**
+ * The not-cancelled documents that still resolve their tax identity through a rate: sales order lines on it, purchase order lines on it, and sales orders that name it (sales posting and the refund
+ * paths look an order's identity up by the ACTIVE rate with the order's tax-rate name, so deactivating the rate strands an open or refundable order). Cancelled documents never post again.
+ */
+export async function liveDocumentCount(client: Client, row: { id: string; name: string }): Promise<number> {
+  const [salesLines, purchaseLines, namedOrders] = await Promise.all([
+    client.salesOrderLine.count({ where: { taxRateId: row.id, order: { status: { not: 'CANCELLED' } } } }),
+    client.purchaseOrderLine.count({ where: { taxRateId: row.id, po: { status: { not: 'CANCELLED' } } } }),
+    client.salesOrder.count({ where: { taxRateName: row.name, status: { not: 'CANCELLED' } } }),
+  ])
+  return salesLines + purchaseLines + namedOrders
+}
+
 function sameName(a: string, b: string): boolean {
   return a.trim().toLowerCase() === b.trim().toLowerCase()
 }
+
+type Side = 'PURCHASE' | 'SALES' | 'BOTH'
 
 export async function planPurchaseTaxImport(client: Client, options: PlanOptions): Promise<PurchaseTaxImportPlan> {
   const Dec = Prisma.Decimal
@@ -258,7 +277,6 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
 
   const read = await readStoredXeroList(client, options.now, options.connectedTenantId)
   const usable = (row: (typeof existing)[number], side: Side): boolean => row.active && (row.usedFor === 'BOTH' || row.usedFor === side)
-  type Side = 'PURCHASE' | 'SALES'
   if (!read.ok) {
     plan.refusals.push(read.refusal)
     // Types that are already satisfied are still reported as present: a type with its rate needs no list.
@@ -274,15 +292,23 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
   const replacing = new Set<string>()
   const activeNames = (): string[] => existing.filter((row) => row.active && !replacing.has(row.id)).map((row) => row.name)
 
-  // The sales side (opt-in): the defaults, every ACTIVE revenue-only Xero type, and the types of the active sales-capable IMS rates that Xero lists as revenue types.
+  // The sales side (opt-in): the defaults, EVERY active Xero type that applies to revenue (revenue-only, and dual-side types that also apply to expenses), and the types of the active
+  // sales-capable IMS rates that Xero lists as revenue types. A dual-side type that no active IMS row carries is ONE row usable for both sides ('BOTH'); one that an IMS row carries
+  // for the purchase side only gets a SALES target (refused by name, e.g. a name collision, when it cannot be represented), so no active type is silently left out.
+  const sideOfType = new Map<string, Side>()
   if (options.mirrorSales) {
-    const wanted = new Set<string>(SALES_TAX_IMPORT_TYPES)
-    for (const row of list.rows) if (row.status === 'ACTIVE' && row.canApply.revenue === true && row.canApply.expenses === false) wanted.add(row.taxType)
-    for (const row of existing) if (row.active && row.accountingTaxType !== null && usable(row, 'SALES') && xeroByType.get(row.accountingTaxType)?.canApply.revenue === true) wanted.add(row.accountingTaxType)
-    plan.salesTypes = [...wanted].filter((t) => !types.includes(t)).sort()
+    const wanted = new Map<string, Side>(SALES_TAX_IMPORT_TYPES.map((t) => [t, 'SALES' as Side]))
+    for (const row of list.rows) {
+      if (row.status !== 'ACTIVE' || row.canApply.revenue !== true || wanted.has(row.taxType)) continue
+      if (row.canApply.expenses !== true) { wanted.set(row.taxType, 'SALES'); continue }
+      wanted.set(row.taxType, existing.some((r) => r.active && r.accountingTaxType === row.taxType) ? 'SALES' : 'BOTH')
+    }
+    for (const row of existing) if (row.active && row.accountingTaxType !== null && usable(row, 'SALES') && xeroByType.get(row.accountingTaxType)?.canApply.revenue === true && !wanted.has(row.accountingTaxType)) wanted.set(row.accountingTaxType, 'SALES')
+    for (const [type, side] of wanted) if (!types.includes(type)) sideOfType.set(type, side)
+    plan.salesTypes = [...sideOfType.keys()].sort()
   }
-  const targets: Array<{ type: string; side: Side }> = [...types.map((type) => ({ type, side: 'PURCHASE' as Side })), ...plan.salesTypes.map((type) => ({ type, side: 'SALES' as Side }))]
-  const sideWord = (side: Side): string => (side === 'PURCHASE' ? 'purchases' : 'sales')
+  const targets: Array<{ type: string; side: Side }> = [...types.map((type) => ({ type, side: 'PURCHASE' as Side })), ...plan.salesTypes.map((type) => ({ type, side: sideOfType.get(type)! }))]
+  const sideWord = (side: Side): string => (side === 'PURCHASE' ? 'purchases' : side === 'SALES' ? 'sales' : 'purchases and sales')
 
   for (const { type, side } of targets) {
     const refuse = (code: PurchaseTaxImportRefusalCode, detail: string): void => { plan.refusals.push({ code, taxType: type, detail }) }
@@ -295,8 +321,8 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
     const eligible = (): PurchaseTaxImportRefusalCode | null => {
       if (xero === null) return 'TYPE_NOT_IN_XERO'
       if (xero.status !== 'ACTIVE') return 'TYPE_NOT_ACTIVE_IN_XERO'
-      if (side === 'PURCHASE' && xero.canApply.expenses !== true) return 'TYPE_NOT_USABLE_ON_EXPENSES'
-      if (side === 'SALES' && xero.canApply.revenue !== true) return 'TYPE_NOT_USABLE_ON_REVENUE'
+      if ((side === 'PURCHASE' || side === 'BOTH') && xero.canApply.expenses !== true) return 'TYPE_NOT_USABLE_ON_EXPENSES'
+      if ((side === 'SALES' || side === 'BOTH') && xero.canApply.revenue !== true) return 'TYPE_NOT_USABLE_ON_REVENUE'
       return null
     }
     let replaces: string | null = null
@@ -305,9 +331,15 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
       const xeroFraction = xero?.effectiveRate != null ? toFraction(xero.effectiveRate) : xero?.displayTaxRate != null ? toFraction(xero.displayTaxRate) : null
       if (side === 'PURCHASE') plan.present.push({ taxType: type, id: row.id, name: row.name, rate: row.rate.toFixed(4), xeroRate: xeroFraction })
       if (xeroFraction === null || row.rate.toFixed(4) === xeroFraction) { entry('present', row); continue }
-      const keptBecause = row.isDefault ? 'IS_DEFAULT_RATE' as const : null
+      let keptBecause: KeptBecause | null = row.isDefault ? 'IS_DEFAULT_RATE' : null
+      let liveDocuments: number | null = null
+      if (options.replaceDiffering === true && keptBecause === null && eligible() === null) {
+        // The old row is deactivated, so a document that still resolves its tax identity through it would be stranded: not replaced while any live document depends on it.
+        liveDocuments = await liveDocumentCount(client, row)
+        if (liveDocuments > 0) keptBecause = 'LIVE_DOCUMENTS'
+      }
       const canReplace = options.replaceDiffering === true && keptBecause === null && eligible() === null
-      plan.differs.push({ taxType: type, side, id: row.id, name: row.name, imsRate: row.rate.toFixed(4), xeroRate: xeroFraction, references: refs(row), replaced: canReplace, keptBecause })
+      plan.differs.push({ taxType: type, side, id: row.id, name: row.name, imsRate: row.rate.toFixed(4), xeroRate: xeroFraction, references: refs(row), replaced: canReplace, keptBecause, liveDocuments })
       if (!canReplace) { entry('differs', row); continue }
       replaces = row.id
       replacing.add(row.id)
@@ -377,13 +409,20 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
     if (!row.active || row.accountingTaxType === null) continue
     const xero = xeroByType.get(row.accountingTaxType)
     if (xero && xero.status === 'ACTIVE') continue
-    const keptBecause = row.isDefault ? 'IS_DEFAULT_RATE' as const : null
+    let keptBecause: KeptBecause | null = row.isDefault ? 'IS_DEFAULT_RATE' : null
+    let liveDocuments: number | null = null
+    if (options.deactivateAbsent === true && keptBecause === null) {
+      // Deactivating strands what still resolves through the rate (an open or refundable order's tax identity): it stays active and is reported instead.
+      liveDocuments = await liveDocumentCount(client, row)
+      if (liveDocuments > 0) keptBecause = 'LIVE_DOCUMENTS'
+    }
     plan.notInXero.push({
       id: row.id, name: row.name, taxType: row.accountingTaxType,
       reason: xero ? 'NOT_ACTIVE_IN_XERO' : 'ABSENT_FROM_XERO',
       references: refs(row),
       deactivate: options.deactivateAbsent === true && keptBecause === null,
       keptBecause,
+      liveDocuments,
     })
   }
 
@@ -402,10 +441,43 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
 // The write
 // ---------------------------------------------------------------------------
 
-/** Write what the plan says. Runs INSIDE the caller's transaction; touches only tax_rates and tax_rate_components, by create, a usedFor narrowing and an active flag. */
-export async function writePurchaseTaxImport(tx: Client, plan: PurchaseTaxImportPlan): Promise<void> {
+/** A document came to depend on a rate (or a rate became the default) between the plan and the write: nothing was written, plan again. */
+export class PurchaseTaxImportRaceError extends Error {
+  constructor(rateId: string) {
+    super(`a live document came to depend on tax rate ${rateId} while the import was applying; nothing was written, run the plan again`)
+    this.name = 'PurchaseTaxImportRaceError'
+  }
+}
+
+export interface PurchaseTaxImportWrite {
+  /** The rows created, in plan order (the id the database gave each). */
+  created: Array<{ id: string; create: PlannedCreate }>
+  /** Supplier defaults moved from a replaced row to its replacement. */
+  suppliersRepointed: number
+  /** Storefront rate mappings moved from a replaced row to its replacement. */
+  mappingsRepointed: number
+}
+
+/**
+ * Lock a row that is about to be deactivated (FOR UPDATE: a writer holding the share lock of writable-tax-rate.ts finishes first, a later one waits for this transaction and then reads it
+ * inactive) and re-count what depends on it. Whatever came to depend on it since the plan stops the write, which rolls back as a whole.
+ */
+async function lockAndRecheck(tx: Client, row: { id: string; name: string }): Promise<void> {
+  // A Prisma.Sql object (not a tagged template) so a structural test double without raw access is simply not locked.
+  if (typeof (tx as { $queryRaw?: unknown }).$queryRaw === 'function') await tx.$queryRaw(Prisma.sql`SELECT id FROM tax_rates WHERE id = ${row.id} FOR UPDATE`)
+  if ((await liveDocumentCount(tx, row)) > 0) throw new PurchaseTaxImportRaceError(row.id)
+}
+
+/**
+ * Write what the plan says. Runs INSIDE the caller's transaction; touches only tax_rates and tax_rate_components, by create, a usedFor narrowing and an active flag, and (for a REPLACED row only)
+ * the taxRateId of the suppliers and storefront mappings that pointed at the old row, which move to the new one in this same write so nothing resolves the retired percentage afterwards.
+ */
+export async function writePurchaseTaxImport(tx: Client, plan: PurchaseTaxImportPlan): Promise<PurchaseTaxImportWrite> {
+  const result: PurchaseTaxImportWrite = { created: [], suppliersRepointed: 0, mappingsRepointed: 0 }
+  const nameOf = (id: string): string => plan.differs.find((d) => d.id === id)?.name ?? ''
   for (const create of plan.creates) {
-    await tx.taxRate.create({
+    if (create.replaces !== null) await lockAndRecheck(tx, { id: create.replaces, name: nameOf(create.replaces) })
+    const made = await tx.taxRate.create({
       data: {
         name: create.name,
         rate: create.rate,
@@ -421,11 +493,25 @@ export async function writePurchaseTaxImport(tx: Client, plan: PurchaseTaxImport
           create: create.components.map((c) => ({ name: c.name, rate: c.rate, compoundOnPrevious: c.compoundOnPrevious, accountingTaxType: null, sortOrder: c.sortOrder, active: true })),
         },
       },
+      select: { id: true },
     })
+    result.created.push({ id: made.id, create })
   }
-  for (const create of plan.creates) if (create.replaces !== null) await tx.taxRate.updateMany({ where: { id: create.replaces, isDefault: false }, data: { active: false } })
+  for (const { id, create } of result.created) {
+    if (create.replaces === null) continue
+    // A row that became the default rate since the plan is not replaced (the whole write stops, as for a document that appeared).
+    const deactivated = await tx.taxRate.updateMany({ where: { id: create.replaces, isDefault: false }, data: { active: false } })
+    if (deactivated.count !== 1) throw new PurchaseTaxImportRaceError(create.replaces)
+    result.suppliersRepointed += (await tx.supplier.updateMany({ where: { taxRateId: create.replaces }, data: { taxRateId: id } })).count
+    result.mappingsRepointed += (await tx.shoppingTaxRateMapping.updateMany({ where: { taxRateId: create.replaces }, data: { taxRateId: id, storeIdentity: null } })).count
+  }
   for (const row of plan.narrow) await tx.taxRate.updateMany({ where: { id: row.id, usedFor: 'BOTH' }, data: { usedFor: 'SALES' } })
-  for (const row of plan.notInXero) if (row.deactivate) await tx.taxRate.updateMany({ where: { id: row.id, isDefault: false }, data: { active: false } })
+  for (const row of plan.notInXero) {
+    if (!row.deactivate) continue
+    await lockAndRecheck(tx, row)
+    await tx.taxRate.updateMany({ where: { id: row.id, isDefault: false }, data: { active: false } })
+  }
+  return result
 }
 
 /** The Xero organisation connected now (null = none). The one place the first load's rails ask, so lib/first-load never imports the connector layer. */
@@ -445,6 +531,11 @@ export interface RunOptions {
   /** true: write nothing at all unless the plan has no refusal (the first load's all-or-nothing). Default false: the operator action writes what is allowed and reports the rest. */
   requireAll?: boolean
   now?: Date
+  /**
+   * Runs INSIDE the transaction that wrote the rates, after the write and only when something was written, with what was written: whatever it records commits with the rates or not at
+   * all (the first load records its run fact here). A throw rolls the write back.
+   */
+  inTransaction?: (tx: Client, plan: PurchaseTaxImportPlan, written: PurchaseTaxImportWrite) => Promise<void>
 }
 
 export interface PurchaseTaxImportResult {
@@ -471,7 +562,10 @@ export async function runPurchaseTaxImport(options: RunOptions): Promise<Purchas
   if (!options.apply || connection === null || !hasWrites(first, options.requireAll)) return { applied: options.apply, wrote: false, plan: first }
   const fenced = await withXeroConnectionFence(connection, async (tx) => {
     const locked = await planPurchaseTaxImport(tx, { ...planOptions, connectedTenantId: connection.tenantId })
-    if (hasWrites(locked, options.requireAll)) await writePurchaseTaxImport(tx, locked)
+    if (hasWrites(locked, options.requireAll)) {
+      const written = await writePurchaseTaxImport(tx, locked)
+      if (options.inTransaction) await options.inTransaction(tx, locked, written)
+    }
     return locked
   })
   if (!fenced.ok) {

@@ -88,7 +88,10 @@ export const VOEC_ISO_CODES = new Set(['NO'])
 /** Normalise reportingCategory to the canonical uppercase token, or null. */
 function normalizeCategory(category: string | null | undefined): string | null {
   if (!category) return null
-  return category.trim().toUpperCase().replace(/[\s-]+/g, '_')
+  // A category of only whitespace (or only separators that trim away) is no category: it counts as unset, not as an unknown one.
+  const trimmed = category.trim()
+  if (trimmed === '') return null
+  return trimmed.toUpperCase().replace(/[\s-]+/g, '_')
 }
 
 /** True when the rate is used on purchases only (bills), not sales. */

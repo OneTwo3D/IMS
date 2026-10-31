@@ -425,6 +425,18 @@ test('REPORT_TYPE_UNKNOWN: an IOSS or VOEC rate is recognised where the helper t
   assert.deepEqual(reasonsOf(withCategory('rDE', 'IOSSX'), 'ims', 'rDE'), ['REPORT_TYPE_UNKNOWN'], 'a near-miss token is not recognised')
 })
 
+// [mutation: the empty-after-trim check removed from normalizeCategory -> the whitespace arms are red]
+test('REPORT_TYPE_UNKNOWN: a reporting category of only whitespace is unset (decidable, like null), not an unknown category', () => {
+  const withCategory = (reportingCategory: string | null): VatSetRow[] => {
+    const input = base(); input.rates = input.rates.map((r) => (r.id === 'rGB' ? { ...r, reportingCategory } : r))
+    return compareVatSetIdentity(input)
+  }
+  const unset = reasonsOf(withCategory(null), 'ims', 'rGB')
+  assert.deepEqual(unset, [], 'a null category is decidable')
+  for (const blank of ['', ' ', '   ', '\t', ' \n ']) assert.deepEqual(reasonsOf(withCategory(blank), 'ims', 'rGB'), unset, `${JSON.stringify(blank)} counts as unset`)
+  assert.deepEqual(reasonsOf(withCategory('WEIRD'), 'ims', 'rGB'), ['REPORT_TYPE_UNKNOWN'], 'a real unknown category is still unknown')
+})
+
 test('XERO_REGION_DIFFERS / XERO_REGION_UNVERIFIED: the IMS name and the Xero name must state the same region, read by one parser; an unreadable name is a finding, never a pass', () => {
   const xeroName = (id: string, name: string, edit: (input: VatSetInput) => void = () => {}): VatSetRow[] => {
     const input = base(); input.xero = input.xero.map((x) => (x.taxType === id ? { ...x, name } : x)); edit(input)

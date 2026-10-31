@@ -40,11 +40,11 @@ export function PurchaseTaxImportPanel() {
       </label>
       <label className="flex items-center gap-2 text-xs">
         <input type="checkbox" checked={deactivate} onChange={(e) => setDeactivate(e.target.checked)} />
-        Also deactivate rates whose tax type Xero does not list as active (for example leftover demo-organisation rates)
+        Also deactivate rates whose tax type Xero does not list as active (for example leftover demo-organisation rates; a rate that a live order still depends on is kept and reported)
       </label>
       <label className="flex items-center gap-2 text-xs">
         <input type="checkbox" checked={replace} onChange={(e) => setReplace(e.target.checked)} />
-        Also replace rates whose percentage differs from Xero&apos;s (a new rate is created and the old one deactivated; the old one is never edited)
+        Also replace rates whose percentage differs from Xero&apos;s (a new rate is created and the old one deactivated, with its supplier defaults and storefront mappings moved to the new one; the old one is never edited, and a rate a live order depends on is kept)
       </label>
       <div className="flex items-center gap-2">
         <Button variant="outline" size="sm" onClick={() => run('preview')} disabled={busy !== null}>
@@ -63,12 +63,12 @@ export function PurchaseTaxImportPanel() {
           <p>{result.plan.present.length} already present: {result.plan.present.map((p) => p.taxType).join(', ') || 'none'}</p>
           {result.plan.narrow.length > 0 && <p>Narrowed to Sales: {result.plan.narrow.map((n) => `${n.name} (${n.taxType})`).join('; ')}</p>}
           {result.plan.notInXero.length > 0 && (
-            <p>Not active in Xero ({result.plan.notInXero.filter((r) => r.deactivate).length} deactivated, others only reported): {result.plan.notInXero.map((r) => `${r.name} (${r.taxType})`).join('; ')}</p>
+            <p>Not active in Xero ({result.plan.notInXero.filter((r) => r.deactivate).length} deactivated, others only reported): {result.plan.notInXero.map((r) => `${r.name} (${r.taxType})${r.keptBecause === 'LIVE_DOCUMENTS' ? ' - kept: live orders depend on it' : ''}`).join('; ')}</p>
           )}
           {result.plan.refusals.length > 0 && (
             <p className="text-destructive">Refused: {result.plan.refusals.map((r) => `${r.code}${r.taxType ? ` (${r.taxType})` : ''}: ${r.detail}`).join('; ')}</p>
           )}
-          {result.plan.differs.length > 0 && <p>Percentage differs from Xero: {result.plan.differs.map((d) => `${d.name} (${d.taxType}) IMS ${d.imsRate} vs Xero ${d.xeroRate}${d.replaced ? ' - replaced' : ''}`).join('; ')}</p>}
+          {result.plan.differs.length > 0 && <p>Percentage differs from Xero: {result.plan.differs.map((d) => `${d.name} (${d.taxType}) IMS ${d.imsRate} vs Xero ${d.xeroRate}${d.replaced ? ' - replaced' : d.keptBecause === 'LIVE_DOCUMENTS' ? ' - kept: live orders depend on it' : ''}`).join('; ')}</p>}
           {result.plan.unmapped.length > 0 && <p>No Xero tax type (no counterpart in the single rate set): {result.plan.unmapped.map((u) => `${u.name}${u.countryCode ? ` [${u.countryCode}]` : ''}`).join('; ')}</p>}
           <p className="text-muted-foreground">Rate set: {result.plan.rateSet.length} entr{result.plan.rateSet.length === 1 ? 'y' : 'ies'} (in the action result for the storefront sync).</p>
           {result.plan.notes.map((n) => <p key={n} className="text-muted-foreground">{n}</p>)}

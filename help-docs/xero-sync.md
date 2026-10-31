@@ -1499,16 +1499,16 @@ run that records tax-rate drift).
   - **One set of rates (Xero master).** Each IMS tax rate corresponds to exactly one **active** Xero tax type with the **same percentage**: Xero's
     `EffectiveRate` (stored as `effective_rate`), else `DisplayTaxRate` (`display_tax_rate`). The action mirrors the **sales** side under the same
     rules: it creates the missing **Sales** rate for `OUTPUT2`, `ZERORATEDOUTPUT` and every other active Xero type that applies to revenue and not to
-    expenses (reduced-rate, EC and OSS types included); a type Xero does not allow on revenue is refused (`TYPE_NOT_USABLE_ON_REVENUE`). A rate whose
+    expenses (reduced-rate, EC and OSS types included). A type that applies to **both** revenue and expenses and that no active IMS rate carries gets ONE row usable for both sides (`usedFor` BOTH, rate-set side `BOTH`); one that only a purchase-side rate carries gets a Sales target of its own (refused by name, for example `NAME_COLLISION`, when it cannot be represented), so no active type is left out of the set. A type Xero does not allow on revenue is refused (`TYPE_NOT_USABLE_ON_REVENUE`). A rate whose
     percentage differs from Xero's is **reported** and is corrected only with *replace* ticked, by creating a **new** rate and deactivating the old one
-    (never by editing a referenced rate; the default rate is never replaced). The result carries a machine-readable **rate set**
+    (never by editing a referenced rate; the default rate is never replaced). The supplier defaults and storefront rate mappings that pointed at the old rate move to the new one in the same write (the result counts them), and a rate that a live document still depends on (see *deactivate* below) is **not** replaced (reported with `LIVE_DOCUMENTS`). The result carries a machine-readable **rate set**
     (type, name, Xero percentage, side, country, IMS id, status) for a later storefront sync (no WooCommerce write happens here) and lists the
     active rates that have **no Xero tax type** (for example per-country storefront rates): no single set can contain them.
   - **Sales-side rates on purchases (opt-in).** With *narrow* ticked, an active **Both** rate whose Xero tax type is sales-only (can apply to
     revenue, not to expenses) becomes **Sales** only, so it can no longer be picked on a purchase; each change is reported with the number of
     suppliers and purchase lines that reference it. Refused (`NARROW_REQUIRES_PURCHASE_ROWS`) unless every purchase type is satisfied.
   - **Types not in the live list (opt-in).** An active rate whose tax type Xero does not list as active (for example leftover demo-organisation
-    rates `TAX001`...) is **reported**; it is deactivated only with *deactivate* ticked, and never when it is the default rate. The default is report-only.
+    rates `TAX001`...) is **reported**; it is deactivated only with *deactivate* ticked, and never when it is the default rate or when a not-cancelled document still resolves its tax identity through it (a sales or purchase order line on it, or a sales order naming it: sales posting and the refund paths look the identity up by the ACTIVE rate with that name), which is reported as `LIVE_DOCUMENTS`. The documents are re-counted under a row lock at the write; one that appeared since the plan stops the whole write. The default is report-only.
   - **The first load checks existing rates against this list.** A supplier's existing default rate that differs from Xero's stored row is refused by the first load (`SUPPLIER_TAX_RATE_DISAGREES_WITH_XERO`); run this action with *replace differing* to correct it.
   - **Never.** Nothing is deleted; an existing row's rate, type, name and components are never changed (documents reference rows: a different rate is a new row);
     a re-run changes nothing. The `accounting_reverse_charge_purchase_tax_type` setting is checked against the list and reported; no row is created for it.

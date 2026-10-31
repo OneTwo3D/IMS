@@ -100,6 +100,10 @@ describe('the first-load post-run verification, database side', { timeout: 30 * 
     assert.equal(baseline.tables.products, 0)
     assert.equal(baseline.tables.cost_layers, 0)
     assert.equal(baseline.tables.first_load_apply_runs, 1)
+    // The tax content is recorded beside it (a digest of every row of both tax tables), before the first importer call, so the census can tell the import's rows from any other.
+    const taxBaseline = facts['taxBaseline'] as { rates: string[]; components: string[] }
+    assert.equal(taxBaseline.rates.length, Number((await s.sql<{ n: string }>('select count(*)::text as n from tax_rates'))[0]!.n), 'a digest per rate (the import added none in this synthetic load)')
+    assert.ok(taxBaseline.rates.every((d) => /^[0-9a-f]{32}$/.test(d)) && Array.isArray(taxBaseline.components))
     // Every table the runner does not write has a content digest; the runner's own tables have none (they are compared record by record).
     const written = new Set(tablesOfKind('RUNNER_WRITES'))
     assert.deepEqual(Object.keys(baseline.digests).sort(), tables.filter((n) => !written.has(n)).sort())
@@ -218,6 +222,28 @@ describe('the first-load post-run verification, database side', { timeout: 30 * 
       )
       assert.ok(failing(created).includes('write-census'))
       assert.match(byId(created)['write-census'].actual, /zq_stray_table/)
+    })
+
+    // Mutations named (made, red, reverted): ports.ts not recording the tax baseline -> the baseline test and every arm here are red (no baseline, nothing counted); the tax rules back to `async () => 0` -> the arms are red.
+    it('an unrelated tax rate added, edited or removed during the load fails the rails-after-load item (the tax tables are runner-written, but only the rows the import recorded are the runner\'s)', async () => {
+      const rails = (items: VerificationItem[]) => failing(items).filter((id) => id === 'rails-after-load')
+      assert.deepEqual(rails(await m.verify.createVerifier(deps())(prepared, steps)), [], 'CONTROL: untouched')
+      const added = await withTamper(
+        () => s.sql(`insert into tax_rates (id, name, rate, "updatedAt") values ('zq-stray-rate', 'ZQ Stray Rate', 0.0500, now())`).then(() => undefined),
+        () => s.sql(`delete from tax_rates where id = 'zq-stray-rate'`).then(() => undefined),
+      )
+      assert.deepEqual(rails(added), ['rails-after-load'], 'an added rate')
+      const edited = await withTamper(
+        () => s.sql(`update tax_rates set rate = rate + 0.0001 where id = (select id from tax_rates order by id limit 1)`).then(() => undefined),
+        () => s.sql(`update tax_rates set rate = rate - 0.0001 where id = (select id from tax_rates order by id limit 1)`).then(() => undefined),
+      )
+      assert.deepEqual(rails(edited), ['rails-after-load'], 'an edited rate')
+      const component = await withTamper(
+        () => s.sql(`insert into tax_rate_components (id, tax_rate_id, name, rate, "updated_at") values ('zq-stray-comp', (select id from tax_rates order by id limit 1), 'ZQ', 0.0100, now())`).then(() => undefined),
+        () => s.sql(`delete from tax_rate_components where id = 'zq-stray-comp'`).then(() => undefined),
+      )
+      assert.deepEqual(rails(component), ['rails-after-load'], 'an added component')
+      assert.deepEqual(rails(await m.verify.createVerifier(deps())(prepared, steps)), [], 'CONTROL: undone, passes again')
     })
 
     it('a grant in the installation environment fails the held check, and an unreadable one does too', async () => {

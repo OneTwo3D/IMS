@@ -34,14 +34,25 @@ export async function loadFacts(): Promise<Record<string, unknown>> {
   }
 }
 
-/** Record a fact only if it is not recorded yet: the first value is the one the orders were created under. Returns true when this call recorded it. */
-export async function setFactOnce(key: string, value: unknown): Promise<boolean> {
+/** The statement client setFactOnceIn needs: the pooled client or a transaction. */
+type RawClient = { $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<number> }
+
+/**
+ * Record a fact only if it is not recorded yet, through `client` - a transaction, so the fact commits (or rolls back) WITH the writes of that transaction. Returns true when this call
+ * recorded it. A failure of the statement is JOURNAL_WRITE_FAILED (the driver's text is dropped).
+ */
+export async function setFactOnceIn(client: RawClient, key: string, value: unknown): Promise<boolean> {
   try {
-    const changed = await db.$executeRaw`UPDATE first_load_apply_runs SET facts = facts || jsonb_build_object(${key}::text, ${JSON.stringify(value)}::jsonb) WHERE singleton AND NOT jsonb_exists(facts, ${key}::text)`
+    const changed = await client.$executeRaw`UPDATE first_load_apply_runs SET facts = facts || jsonb_build_object(${key}::text, ${JSON.stringify(value)}::jsonb) WHERE singleton AND NOT jsonb_exists(facts, ${key}::text)`
     return changed === 1
   } catch {
     throw new Error(JOURNAL_WRITE_FAILED)
   }
+}
+
+/** Record a fact only if it is not recorded yet: the first value is the one the orders were created under. Returns true when this call recorded it. */
+export function setFactOnce(key: string, value: unknown): Promise<boolean> {
+  return setFactOnceIn(db, key, value)
 }
 
 export function createJournal(): ApplyPorts['journal'] {
