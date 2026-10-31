@@ -56,6 +56,7 @@ function itemOf(id: PackItemId, result: CompareResult): ItemInput {
 }
 
 for (const mode of ['values', 'presence'] as const) {
+  // Neither item opts into settling, so the comparator's unsettled combinations (it is item-agnostic) must be REFUSED by the report.
   const id: PackItemId = mode === 'values' ? 'R4' : 'R13'
   test(`TABLE ${mode}: every combination of equal, differ, onlyIms, onlyVendor, excluded, out of population, settling and empty proof`, () => {
     let combos = 0
@@ -75,6 +76,10 @@ for (const mode of ['values', 'presence'] as const) {
       combos += 1
 
       // Through the report and back.
+      if (!getPackItem(id).settles && result.status === 'compared' && result.buckets.unsettled.length > 0) {
+        assert.throws(() => buildReport(input(put(defaultItems('P1'), itemOf(id, result))), 1, null), ReportInvalid, `${mode} ${label}: an item that does not settle cannot list unsettled entries`)
+        continue
+      }
       const built = buildReport(input(put(defaultItems('P1'), itemOf(id, result))), 1, null)
       const parsed = parseReport(built.jsonText)
       verifyEvidence(built.evidenceText, parsed)

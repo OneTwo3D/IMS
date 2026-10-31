@@ -251,6 +251,8 @@ export function checkEntry(id: PackItemId, bucket: ComparisonBucket, entry: Clea
   const spec = getPackItem(id)
   // Settling state belongs to the unsettled entries, and to the failing entries of an item that settles (it is how the next run knows a
   // difference has already persisted); nowhere else. An unsettled entry has not yet seen its later runs; a failing one has seen them all.
+  // An item that does not opt into settling (catalogue `settles`) has no unsettled bucket at all: its differences fail at once.
+  if (bucket === 'unsettled' && !spec.settles) fail('is unsettled but the item does not settle')
   const carriesSettling = bucket === 'unsettled' || ((FINDING_BUCKETS as readonly string[]).includes(bucket) && spec.settles)
   if ((entry.settling !== undefined) !== carriesSettling) fail('settling data belongs to unsettled entries and to the failing entries of an item that settles, and to nothing else')
   if (entry.settling !== undefined) {
@@ -399,6 +401,7 @@ export function checkItemConsistency(input: ItemRecordView, applicability: PackA
 
   // Reason/count coupling that holds for every outcome.
   if (has('PHASE_NOT_APPLICABLE') !== (input.outcome === 'not-applicable')) fail('PHASE_NOT_APPLICABLE belongs to not-applicable and nothing else')
+  if (counts.unsettled > 0 && !spec.settles) fail('an item that does not settle cannot carry unsettled entries')
   if (has('UNSETTLED_PENDING') !== (counts.unsettled > 0)) fail('UNSETTLED_PENDING and the unsettled count must agree')
   if (has('SETTLING_STATE_UNUSABLE') && (input.outcome === 'pass' || counts.unsettled === 0 || !spec.settles)) fail('SETTLING_STATE_UNUSABLE belongs to an item that settles and has something unsettled')
   if (has('NO_RUNNER') && (input.outcome !== 'inconclusive' || everything !== 0)) fail('NO_RUNNER is an inconclusive item with nothing listed')

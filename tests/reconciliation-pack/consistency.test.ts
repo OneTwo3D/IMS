@@ -97,7 +97,11 @@ test('fail, inconclusive and not-applicable have invariants of their own', () =>
   // UNSETTLED_PENDING and the unsettled count agree, in both directions
   rejects(put(base(), R('inconclusive', ['UNSETTLED_PENDING'])))
   rejects(put(base(), R('inconclusive', ['READ_INCOMPLETE'], { entries: { unsettled: [{ ...solo('A|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }] } })))
-  accepts(put(base(), R('inconclusive', ['UNSETTLED_PENDING'], { entries: { unsettled: [{ ...solo('A|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }] } })))
+  const pendingEntries = { unsettled: [{ ...solo('A|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }] }
+  accepts(put(base(), { ...R('inconclusive', ['UNSETTLED_PENDING'], { entries: pendingEntries }), id: 'R1' }))
+  // An item that does not opt into settling (R3, R13: catalogue settles false) cannot carry unsettled entries, whatever its reasons say.
+  rejects(put(base(), R('inconclusive', ['UNSETTLED_PENDING'], { entries: pendingEntries })))
+  rejects(put(base(), { ...R('inconclusive', ['UNSETTLED_PENDING'], { entries: pendingEntries }), id: 'R13' }))
   // NO_RUNNER is an inconclusive item with nothing listed
   rejects(put(base(), R('fail', ['NO_RUNNER', 'DIFFERENCES'])))
   rejects(put(base(), R('inconclusive', ['NO_RUNNER'], { entries: { excluded: [solo('A|MAIN')] } })))
@@ -219,9 +223,9 @@ test('the builder refuses every malformed input shape with ReportInvalid (never 
     ['an entry key missing', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ ims: '1', vendor: '1', delta: '0' }] } } as never))],
     ...['NaN', '', '1e3', ' 1', '-0', '1.50', '01', '+1', 5, undefined].map((value): [string, () => ReportInput] => [`an entry value ${String(value)}`, () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ ...solo('A|MAIN'), ims: value }] } } as never))]),
     ['an entry delta undefined', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ key: 'A|MAIN', ims: null, vendor: null }] } } as never))],
-    ['a settling stamp bad', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...solo('A|MAIN'), settling: { sequence: 1, first: 'soon', later: [] } }] } } as never))],
-    ['settling not an object', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...solo('A|MAIN'), settling: 'x' }] } } as never))],
-    ['settling later not a list', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...solo('A|MAIN'), settling: { sequence: 1, first: STAMP, later: 'x' } }] } } as never))],
+    ['a settling stamp bad', () => input(put(good(), { id: 'R1', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...solo('A|MAIN'), settling: { sequence: 1, first: 'soon', later: [] } }] } } as never))],
+    ['settling not an object', () => input(put(good(), { id: 'R1', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...solo('A|MAIN'), settling: 'x' }] } } as never))],
+    ['settling later not a list', () => input(put(good(), { id: 'R1', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...solo('A|MAIN'), settling: { sequence: 1, first: STAMP, later: 'x' } }] } } as never))],
   ]
   for (const [name, make] of bad) assert.throws(() => buildReport(make(), 1, null), ReportInvalid, name)
   assert.doesNotThrow(() => buildReport(input(base()), 1, null))
@@ -277,4 +281,40 @@ test('THE ONE SOURCE EXCEPTION: a pass on the proof alignment-confirmed names th
   rejects(put(base(), { ...retired({ id: 'R3' }), sources: ['invariant-report'] }))
   // The stream still has to be bracketed and stable for the pass (the stock sync is the item's stream).
   rejects(put(base(), retired()), allBrackets().map((b) => (b.stream === 'mintsoft-stock-sync' ? { ...b, end: '2026-10-19T00:00:01.000Z' } : b)))
+})
+
+// [mutation: the settles check removed from checkEntry / from the item consistency / the evidence reader]
+test('UNSETTLED ENTRIES ARE REFUSED ON AN ITEM THAT DOES NOT SETTLE: in the builder, in the report reader and in the evidence reader', () => {
+  const entry = { key: 'A|MAIN', ims: '2', vendor: null, delta: null, imsCurrency: null, vendorCurrency: null, imsPresent: true, vendorPresent: false, settling: { sequence: 1, first: STAMP, later: [], count: 0 } }
+  // the evidence reader: a hand-made evidence file for a report whose R3 (settles: false) or R1 (settles: true) claims one unsettled entry
+  const evidenceFor = (id: 'R1' | 'R3') => {
+    const built = buildReport(input(base()), 1, null)
+    const record = parseReport(built.jsonText)
+    const text = `${JSON.stringify({ item: id, bucket: 'unsettled', ...entry })}\n`
+    const item = record.items.find((candidate) => candidate.id === id)!
+    item.counts.unsettled = 1
+    item.evidenceLines = 1
+    item.outcome = 'inconclusive'
+    item.reasons = ['UNSETTLED_PENDING']
+    return { record: { ...record, evidence: { ...record.evidence, sha256: sha256Hex(text), lines: 1 } }, text }
+  }
+  const settles = evidenceFor('R1')
+  assert.doesNotThrow(() => verifyEvidence(settles.text, settles.record), 'the same line on an item that settles is accepted (the guard is not vacuous)')
+  const refused = evidenceFor('R3')
+  assert.throws(() => verifyEvidence(refused.text, refused.record), /does not settle/)
+  // the builder, for every catalogue item that does not settle
+  for (const id of PACK_ITEM_IDS) {
+    const spec = getPackItem(id)
+    const values = spec.mode === 'values'
+    const unsettled = { key: 'A|MAIN', ims: values ? '2' : null, vendor: null, delta: null, imsCurrency: values && spec.measure?.rule === 'minor-unit' ? 'GBP' : null, ...(values ? {} : { imsPresent: true, vendorPresent: false }), settling: { sequence: 1, first: STAMP, later: [] } }
+    const attempt = () => buildReport(input(put(base(), { id, outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [unsettled as never] } })), 1, null)
+    if (!spec.settles) assert.throws(attempt, /does not settle/, id)
+  }
+  // the report reader: counts alone (no evidence) already say it
+  const forged = JSON.parse(buildReport(input(base()), 1, null).jsonText)
+  const r3 = forged.items.find((candidate: { id: string }) => candidate.id === 'R3')
+  Object.assign(r3, { outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], proof: null, sources: [] })
+  r3.counts.unsettled = 1
+  r3.evidenceLines = 1
+  assert.throws(() => parseReport(JSON.stringify(forged)), /cannot carry unsettled/)
 })

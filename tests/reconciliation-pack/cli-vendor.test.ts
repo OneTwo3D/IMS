@@ -32,7 +32,13 @@ const SECRET = 'cs_cli_consumer_secret_value'
 const EMAIL = 'victim.customer@example.com'
 
 type Seen = { method: string; url: string }
-async function store(): Promise<{ base: string; seen: Seen[] }> {
+/** What WordPress does with `_fields`: only the listed top-level fields of each row are sent. `ignoreFields` is a store that does not (a plugin, a cache, an older version). */
+function honour(rows: Array<Record<string, unknown>>, url: URL, ignoreFields: boolean): Array<Record<string, unknown>> {
+  const wanted = (url.searchParams.get('_fields') ?? '').split(',').filter((name) => name.length > 0)
+  return ignoreFields || wanted.length === 0 ? rows : rows.map((row) => Object.fromEntries(Object.entries(row).filter(([name]) => wanted.includes(name))))
+}
+
+async function store(ignoreFields = false): Promise<{ base: string; seen: Seen[] }> {
   const seen: Seen[] = []
   const server = http.createServer((req, res) => {
     seen.push({ method: req.method ?? '', url: req.url ?? '' })
@@ -42,9 +48,9 @@ async function store(): Promise<{ base: string; seen: Seen[] }> {
     // Rows carry fields the pack never asked for (a customer's e-mail, a note): they must not reach any output.
     if (url.pathname === '/wp-json/wc/v3/orders') {
       const rows = url.searchParams.get('status') === 'processing' ? [order(11, 'processing', { billing: { email: EMAIL }, customer_note: `call ${SECRET}` }), order(12)] : []
-      res.writeHead(200, { ...headers, 'x-wp-total': String(rows.length), 'x-wp-totalpages': String(rows.length ? 1 : 0) }); res.end(JSON.stringify(page === 1 ? rows : [])); return
+      res.writeHead(200, { ...headers, 'x-wp-total': String(rows.length), 'x-wp-totalpages': String(rows.length ? 1 : 0) }); res.end(JSON.stringify(page === 1 ? honour(rows, url, ignoreFields) : [])); return
     }
-    if (url.pathname === '/wp-json/wc/v3/taxes') { res.writeHead(200, { ...headers, 'x-wp-total': '1', 'x-wp-totalpages': '1' }); res.end(JSON.stringify(page === 1 ? [{ id: 5, name: 'GB VAT', rate: '20.0000', country: 'GB', state: '', postcode: '', city: '', class: '', shipping: true, compound: false }] : [])); return }
+    if (url.pathname === '/wp-json/wc/v3/taxes') { res.writeHead(200, { ...headers, 'x-wp-total': '1', 'x-wp-totalpages': '1' }); res.end(JSON.stringify(page === 1 ? honour([{ id: 5, name: 'GB VAT', rate: '20.0000', country: 'GB', state: '', postcode: '', city: '', class: '', shipping: true, compound: false }], url, ignoreFields) : [])); return }
     res.writeHead(404, headers); res.end('{}')
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -129,6 +135,20 @@ test('WITH --vendor-reads-only: GET requests to the store only, R9 compares the 
   for (const secret of [KEY, SECRET, EMAIL, double.base, '127.0.0.1', 'Basic ', 'Authorization']) assert.ok(!everything.includes(secret), `output contains ${secret}`)
   const item = chain.head!.record.items.find((i) => i.id === 'R9')!
   assert.deepEqual([item.outcome, [...item.sources].sort()], ['pass', ['ims-database', 'woocommerce-api']])
+})
+
+// [mutation: the transport hands on a body with fields that were not requested]
+test('A STORE THAT IGNORES _fields and answers with whole orders (billing, notes) is refused: R9 is inconclusive SOURCE_UNREADABLE and no customer data reaches any output', async () => {
+  process.env.E2E_TEST_MODE = '1'
+  const double = await store(true)
+  const r = rig(double.base)
+  const dir = scratchDir(bases)
+  assert.equal(await run(r, argv(dir, '--vendor-reads-only')), 5)
+  assert.equal(line(r, 'R9'), 'R9 inconclusive SOURCE_UNREADABLE')
+  assert.deepEqual([...new Set(double.seen.map((s) => s.method))], ['GET'])
+  const published = allFiles(dir).map((f) => readFileSync(f, 'utf8')).join('\n')
+  const everything = `${r.out.join('\n')}\n${r.err.join('\n')}\n${published}`
+  for (const secret of [KEY, SECRET, EMAIL, `call ${SECRET}`]) assert.ok(!everything.includes(secret), `output contains ${secret}`)
 })
 
 test('a store that cannot be read makes the vendor items inconclusive, never a pass, and the run still publishes', async () => {

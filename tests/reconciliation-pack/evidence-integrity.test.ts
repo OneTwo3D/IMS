@@ -45,9 +45,16 @@ test('a value-mode item cannot pass on entries that carry no values (the empty c
 test('each bucket demands its own value shape, delta and verdict', () => {
   const base = defaultItems('P1')
   const reasonsFor = (entries: ItemInput['entries']) => (entries?.unsettled?.length ? (['DIFFERENCES', 'UNSETTLED_PENDING'] as const) : (['DIFFERENCES'] as const))
-  const fail = (entries: ItemInput['entries'], label: string) => rejects(put(base, { id: 'R4', outcome: 'fail', reasons: [...reasonsFor(entries)], entries }), label)
-  const ok = (entries: ItemInput['entries'], label: string) => assert.doesNotThrow(() => buildReport(input(put(base, { id: 'R4', outcome: 'fail', reasons: [...reasonsFor(entries)], entries })), 1, null), label)
-  ok({ unsettled: [{ ...soloI('U|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }], onlyIms: [soloI('V|MAIN')] }, 'an unsettled one-sided difference')
+  // An unsettled bucket exists only for an item that settles (R1); its failing entries then carry the persisted state.
+  const idFor = (entries: ItemInput['entries']): PackItemId => (entries?.unsettled?.length ? 'R1' : 'R4')
+  const itemFor = (entries: ItemInput['entries']): ItemInput => {
+    const findings = (['onlyIms', 'onlyVendor', 'bothDiffer'] as const).some((bucket) => (entries?.[bucket]?.length ?? 0) > 0)
+    return idFor(entries) === 'R1' && !findings ? { id: 'R1', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries } : { id: idFor(entries), outcome: 'fail', reasons: [...reasonsFor(entries)], entries }
+  }
+  const fail = (entries: ItemInput['entries'], label: string) => rejects(put(base, itemFor(entries)), label)
+  const ok = (entries: ItemInput['entries'], label: string) => assert.doesNotThrow(() => buildReport(input(put(base, itemFor(entries))), 1, null), label)
+  ok({ unsettled: [{ ...soloI('U|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }], bothEqual: [pair('V|MAIN')] }, 'an unsettled one-sided difference')
+  rejects(put(base, { id: 'R4', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...soloI('U|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }] } }), 'an item that does not settle has no unsettled bucket')
   ok({ unsettled: [{ ...pair('U|MAIN', '1', '5', '-4'), settling: { sequence: 1, first: STAMP, later: [] } }] }, 'an unsettled pair that differs')
   fail({ unsettled: [{ ...pair('U|MAIN', '1', '5', '-3'), settling: { sequence: 1, first: STAMP, later: [] } }] }, 'an unsettled pair with a wrong delta')
   ok({ bothDiffer: [pair('A|MAIN', '1', '5', '-4')] }, 'a real difference')
@@ -148,12 +155,19 @@ test('the count the reader trusts is the evidence\'s: a report that claims more 
 
 // ---- (3) nothing the caller owns is serialised: a marker in EVERY nested property ---------------------------------
 
+/** R1 opts into settling (it has an unsettled bucket); R4 does not (its entries carry no state, and it has no unsettled bucket). */
 function richInput(): ReportInput {
-  const items = put(put(defaultItems('P1'), {
-    id: 'R4', outcome: 'fail', reasons: ['DIFFERENCES', 'UNSETTLED_PENDING'], sources: ['invariant-report'],
+  const items = put(put(put(defaultItems('P1'), {
+    id: 'R4', outcome: 'fail', reasons: ['DIFFERENCES'], sources: ['invariant-report'],
     entries: {
       onlyIms: [soloI('A|MAIN')], onlyVendor: [soloV('B|MAIN')], bothDiffer: [pair('C|MAIN', '1', '5', '-4')], bothEqual: [pair('D|MAIN')],
-      unsettled: [{ ...soloI('E|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }], excluded: [soloI('F|MAIN')], outOfPopulation: [soloV('G|MAIN')],
+      excluded: [soloI('F|MAIN')], outOfPopulation: [soloV('G|MAIN')],
+    },
+  }), {
+    id: 'R1', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], sources: [...getPackItem('R1').sources],
+    entries: {
+      bothEqual: [pair('D|MAIN')],
+      unsettled: [{ ...soloI('E|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }],
     },
   }), { ...passItem('R3'), proof: { kind: 'proven-empty', source: 'invariant-report-clean' } })
   return input(items)
@@ -173,7 +187,8 @@ const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T
 
 test('the rich input builds; its evidence and JSON hold only the whitelisted fields', () => {
   const built = buildReport(richInput(), 1, null)
-  assert.equal(built.record.items.find((i) => i.id === 'R4')!.counts.unsettled, 1)
+  assert.equal(built.record.items.find((i) => i.id === 'R1')!.counts.unsettled, 1)
+  assert.equal(built.record.items.find((i) => i.id === 'R4')!.counts.unsettled, 0)
   const keys = new Set<string>()
   for (const l of built.evidenceText.trim().split('\n')) for (const k of Object.keys(JSON.parse(l))) keys.add(k)
   assert.deepEqual([...keys].sort(), ['bucket', 'delta', 'ims', 'imsCurrency', 'imsPresent', 'item', 'key', 'settling', 'vendor', 'vendorCurrency', 'vendorPresent'])
@@ -242,7 +257,7 @@ test('prototype and object tricks never reach the output: every one is refused',
     ['an enormous list', () => { const c = clean(); c.items[3]!.entries!.onlyIms = new Array(5_000_000).fill(null) as never; return c }],
     ['an enormous sparse list', () => { const c = clean(); c.items[3]!.entries!.onlyIms = new Array(2 ** 31) as never; return c }],
     ['deep nesting in an unknown field', (i) => { let deep: Record<string, unknown> = {}; for (let n = 0; n < 20000; n += 1) deep = { d: deep }; return { ...i, extra: deep } as never }],
-    ['deep nesting in a settling field', () => { let deep: unknown = []; for (let n = 0; n < 20000; n += 1) deep = [deep]; const c = clean(); (c.items[3]!.entries!.unsettled![0] as { settling: { later: unknown } }).settling.later = deep; return c }],
+    ['deep nesting in a settling field', () => { let deep: unknown = []; for (let n = 0; n < 20000; n += 1) deep = [deep]; const c = clean(); (c.items[0]!.entries!.unsettled![0] as { settling: { later: unknown } }).settling.later = deep; return c }],
     ['a function as a value', (i) => ({ ...i, asOf: () => '2026-10-19' }) as never],
     ['a bigint as a count-like value', () => { const c = clean(); (c.items[3]!.entries!.onlyIms![0] as { ims: unknown }).ims = BigInt(2); return c }],
   ]

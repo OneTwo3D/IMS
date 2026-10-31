@@ -132,7 +132,7 @@ test('UNIVERSAL: every key in the JSON, the evidence and the lock has a row in t
   const rows = compareItem('R4', { imsComplete: true, vendorComplete: true, ims: [{ key: [{ kind: 'sku', raw: 'A1' }], value: '5' }, { key: [{ kind: 'sku', raw: CANARY }], value: '2' }, { key: [{ kind: 'sku', raw: 'E1' }], value: '1' }], vendor: [{ key: [{ kind: 'sku', raw: 'E1' }], value: '1' }, { key: [{ kind: 'sku', raw: 'V1' }], value: '3' }] })
   const r9 = compareItem('R9', { imsComplete: true, vendorComplete: true, ims: [{ key: [{ kind: 'vendor-id', raw: 1001 }], value: '10', currency: 'GBP' }], vendor: [{ key: [{ kind: 'vendor-id', raw: 1001 }], value: '10.01', currency: 'GBP' }] })
   const r13 = compareItem('R13', { imsComplete: true, vendorComplete: true, ims: [{ key: [{ kind: 'sku', raw: 'TAX1' }] }, { key: [{ kind: 'sku', raw: 'TAX2' }] }], vendor: [{ key: [{ kind: 'sku', raw: 'TAX1' }] }] })
-  const unsettled = compareItem('R12', { imsComplete: true, vendorComplete: true, ims: [{ key: [{ kind: 'sku', raw: 'U1' }], value: '4' }], vendor: [], settling: { carried: new Map(), stamp: STAMP, usable: true } })
+  const unsettled = compareItem('R1', { imsComplete: true, vendorComplete: true, ims: [{ key: [{ kind: 'sku', raw: 'U1' }], value: '4' }], vendor: [], settling: { carried: new Map(), stamp: STAMP, usable: true } })
   assert.ok([rows, r9, r13, unsettled].every((r) => r.status === 'compared'))
   const entries = (r: typeof rows) => (r.status === 'compared' ? r.buckets : undefined)
   const held: { lock?: string } = {}
@@ -142,7 +142,7 @@ test('UNIVERSAL: every key in the JSON, the evidence and the lock has a row in t
       R4: { id: 'R4', outcome: 'fail', reasons: ['DIFFERENCES'], entries: entries(rows) },
       R9: { id: 'R9', outcome: 'pass', reasons: [], sources: ['ims-database', 'woocommerce-api'], proof: { kind: 'compared' }, entries: entries(r9) },
       R13: { id: 'R13', outcome: 'fail', reasons: ['DIFFERENCES'], entries: entries(r13) },
-      R12: { id: 'R12', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: entries(unsettled) },
+      R1: { id: 'R1', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: entries(unsettled) },
       R3: passItem('R3'),
     },
     hooks: { beforeCommit: () => { held.lock = readFileSync(path.join(dir, PACK_LOCK_FILE), 'utf8') } },

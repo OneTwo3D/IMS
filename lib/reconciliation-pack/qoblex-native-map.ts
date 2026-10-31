@@ -10,17 +10,28 @@
  * EVERY TRANSFORM IN IT, and why none can change a compared value:
  *   products  rowsAboveHeader 1                 the report's label row above the header: structure, no data.
  *             columns sku/name/type/barcode/active  header renames only.
- *             valueMaps.type simple->SIMPLE, variable->VARIANT  the product type is used only to set a variation aside from the storefront
- *                                               walk (R14); the map is fixed, so the set-aside is fixed. Any other type is refused by the ingest.
- *             valueMaps.active Active->TRUE      not read by the pack.
+ *             valueMaps.type simple->SIMPLE, variable->VARIANT, kit->KIT, bom->BOM, non-inventory->NON_INVENTORY
+ *                                               the product type is used only to set a variation aside from the storefront walk (R14); the map is
+ *                                               fixed, so the set-aside is fixed, and every other type is PRESENCE-compared like a simple product.
+ *                                               A type not listed here (the export's own "Unknown", or a label nobody has seen) is a closed list
+ *                                               miss: the ingest rejects the row and the source is refused, never guessed at.
+ *             valueMaps.active Active->TRUE, Inactive->FALSE  not read by the pack; an inactive product is still a product R14 compares. Any other
+ *                                               state is a closed list miss, refused the same way.
  *   stock-lots rowsAboveHeader 1                the same label row.
  *             columns sku, unitCost             header renames only (unit cost is the report's Moving Average Cost).
  *             constants.currency GBP            the report has no currency column; the manifest declares GBP and R5 refuses anything else. It cannot
  *                                               change a quantity, SKU or location. LIMIT: the currency is a declaration, not read from the file.
- *             rowSelect keep simple/variable    NO skip list: a row of any other kind is refused by the ingest (UNLISTED_ROW_KIND), never dropped.
+ *             rowSelect keep simple/variable/bom  the kinds that hold stock of their own (IMS stock-bearing types: SIMPLE, VARIANT, BOM).
+ *                                               skip kit/non-inventory  the two kinds that never hold stock in IMS (a kit's stock is its components', a
+ *                                               non-inventory item has none; the first-load tool refuses opening stock for both). Those rows are counted
+ *                                               by the ingest (rowsSkipped), not read as lots. A row of ANY other kind is refused by the ingest
+ *                                               (UNLISTED_ROW_KIND), never dropped.
  *             wide (blocks, label -> warehouse code, totals, uniqueBy sku)  the warehouse labels map to the fixed codes MIL1, CAMBRIDGE, RESTOCK,
  *                                               QUARANTINE-CAMBRIDGE, RXT2; the quantity of each block must add up to the report's all-warehouses
  *                                               total or the row is refused, and a repeated SKU refuses every row carrying it.
+ * LIMIT: the labels kit, bom and non-inventory are the ones R14 needs but NO real export read so far carries them (the real stock-on-hand report
+ * has only simple, variable and Unknown types and only the Active state): they are mapped so that the day an export carries them R14 classifies them, and
+ * any spelling not listed here stays refused until the map is changed in the repository.
  * LIMIT: the location labels are fixed here; a Qoblex installation whose labels differ needs this map changed in the repository, not in an export.
  */
 
@@ -98,10 +109,14 @@ export const QOBLEX_NATIVE_COLUMN_MAP = `{
       "valueMaps": {
         "type": {
           "simple": "SIMPLE",
-          "variable": "VARIANT"
+          "variable": "VARIANT",
+          "kit": "KIT",
+          "bom": "BOM",
+          "non-inventory": "NON_INVENTORY"
         },
         "active": {
-          "Active": "TRUE"
+          "Active": "TRUE",
+          "Inactive": "FALSE"
         }
       }
     },
@@ -176,7 +191,12 @@ export const QOBLEX_NATIVE_COLUMN_MAP = `{
         "column": "Product Type",
         "keep": [
           "simple",
-          "variable"
+          "variable",
+          "bom"
+        ],
+        "skip": [
+          "kit",
+          "non-inventory"
         ]
       },
       "wide": {

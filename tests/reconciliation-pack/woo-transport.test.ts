@@ -7,7 +7,7 @@ import { WOO_READ_COLLECTIONS } from '../../lib/reconciliation-pack/constants.ts
 import type { ImsQueryClient } from '../../lib/reconciliation-pack/ims-readers.ts'
 import { readWooCredentials } from '../../lib/reconciliation-pack/woo-credentials.ts'
 import { readWooOrders, readWooTaxRates } from '../../lib/reconciliation-pack/woo-source.ts'
-import { createWooGetPort, wooHopRefusal } from '../../lib/reconciliation-pack/woo-transport.ts'
+import { createWooGetPort, projectToRequested, requestedFields, wooHopRefusal } from '../../lib/reconciliation-pack/woo-transport.ts'
 import { encryptSettingValue } from '../../lib/security/encrypted-settings.ts'
 import { noSleep, order } from './woo-fixtures.ts'
 
@@ -110,7 +110,7 @@ test('the seam is handed the gate and refuses redirects: a POST hop is refused t
     readCredentials: async () => ({ baseUrl: 'https://shop.example', key: KEY, secret: SECRET }),
     fetchImpl: async (_input, init, options) => { seamOptions = options; assert.equal(init?.method, 'GET'); return new Response('[]', { status: 200, headers: { 'content-type': 'application/json', 'x-wp-total': '0', 'x-wp-totalpages': '0' } }) },
   })
-  const page = await port.get('orders', { page: '1' })
+  const page = await port.get('orders', { page: '1', _fields: 'id' })
   assert.ok(page.ok)
   assert.equal(seamOptions?.refuseRedirects, true)
   assert.equal(seamOptions?.connectorName, 'WooCommerce')
@@ -124,8 +124,8 @@ test('a collection or parameter the transport does not know is never sent: nothi
   const rig = await double(storeHandler)
   const port = portFor(rig)
   assert.deepEqual(await port.get('customers' as never, { page: '1' }), { ok: false })
-  assert.deepEqual(await port.get('orders', { page: '1', context: 'edit' }), { ok: false })
-  assert.deepEqual(await port.get('orders', { page: '1 2' }), { ok: false })
+  assert.deepEqual(await port.get('orders', { page: '1', context: 'edit', _fields: 'id' }), { ok: false })
+  assert.deepEqual(await port.get('orders', { page: '1 2', _fields: 'id' }), { ok: false })
   assert.equal(rig.seen.length, 0)
 })
 
@@ -134,7 +134,7 @@ test('a redirect is an error and its target is never requested', async () => {
     if (req.url?.startsWith('/wp-json/wc/v3/orders')) { res.writeHead(302, { location: '/wp-json/wc/v3/customers' }); res.end(); return }
     json(res, [], { 'X-WP-Total': '0', 'X-WP-TotalPages': '0' })
   })
-  const page = await portFor(rig).get('orders', { page: '1' })
+  const page = await portFor(rig).get('orders', { page: '1', _fields: 'id' })
   assert.deepEqual(page, { ok: false })
   assert.deepEqual(rig.seen.map((s) => s.url.split('?')[0]), ['/wp-json/wc/v3/orders'], 'the Location was not followed')
 })
@@ -149,7 +149,7 @@ test('a non-2xx answer, a non-JSON answer and malformed JSON are failures that c
     (res: http.ServerResponse) => { res.writeHead(200, { 'content-type': 'application/json', 'content-length': '999999999' }); res.end('[') },
   ]) {
     const rig = await double((_req, res) => respond(res))
-    const page = await portFor(rig).get('orders', { page: '1' })
+    const page = await portFor(rig).get('orders', { page: '1', _fields: 'id' })
     assert.deepEqual(page, { ok: false })
     assert.ok(!JSON.stringify(page).includes(SECRET))
   }
@@ -166,11 +166,11 @@ test('credentials are read on the first request only, once, and never when no re
   let reads = 0
   const port = createWooGetPort({ readCredentials: async () => { reads += 1; return { baseUrl: rig.base, key: KEY, secret: SECRET } }, env: E2E })
   assert.equal(reads, 0, 'building the port reads nothing')
-  await port.get('taxes', { page: '1' }); await port.get('taxes', { page: '2' })
+  await port.get('taxes', { page: '1', _fields: 'id' }); await port.get('taxes', { page: '2', _fields: 'id' })
   assert.equal(reads, 1)
   for (const readCredentials of [async () => null, async () => { throw new Error(SECRET) }]) {
     const fresh = await double(storeHandler)
-    assert.deepEqual(await createWooGetPort({ readCredentials, env: E2E }).get('orders', { page: '1' }), { ok: false })
+    assert.deepEqual(await createWooGetPort({ readCredentials, env: E2E }).get('orders', { page: '1', _fields: 'id' }), { ok: false })
     assert.equal(fresh.seen.length, 0)
   }
 })
@@ -178,7 +178,7 @@ test('credentials are read on the first request only, once, and never when no re
 test('a store URL that is not https (outside the loopback allowance) is refused by the seam before any connection', async () => {
   const rig = await double(storeHandler)
   // No E2E environment: the loopback http URL is exactly what production would refuse.
-  const page = await createWooGetPort({ readCredentials: async () => ({ baseUrl: rig.base, key: KEY, secret: SECRET }), env: { NODE_ENV: 'production' } }).get('orders', { page: '1' })
+  const page = await createWooGetPort({ readCredentials: async () => ({ baseUrl: rig.base, key: KEY, secret: SECRET }), env: { NODE_ENV: 'production' } }).get('orders', { page: '1', _fields: 'id' })
   assert.deepEqual(page, { ok: false })
   assert.equal(rig.seen.length, 0)
 })
@@ -225,4 +225,61 @@ test('the storefront credentials: three settings rows in a READ ONLY transaction
   } finally {
     if (previous === undefined) delete process.env.SETTINGS_ENCRYPTION_KEY; else process.env.SETTINGS_ENCRYPTION_KEY = previous
   }
+})
+
+// ---- THE CUSTOMER-DATA BOUNDARY: only requested fields cross the transport -----------------------------------------------------------
+
+const WHOLE_ORDER = { id: 11, status: 'processing', currency: 'GBP', total: '12.50', date_created_gmt: '2026-10-10T09:30:00', billing: { first_name: 'A', email: 'a@example.test', phone: '0' }, shipping: { address_1: '1 Road' }, customer_note: 'note' }
+
+// [mutation: the transport returns the parsed body unfiltered / the extra-key refusal removed]
+test('a store that ignores _fields and returns whole orders is refused: nothing of the body is handed on', async () => {
+  const rig = await double((req, res) => json(res, [WHOLE_ORDER], { 'X-WP-Total': '1', 'X-WP-TotalPages': '1' }))
+  const port = portFor(rig)
+  assert.deepEqual(await port.get('orders', { page: '1', _fields: 'id,status,currency,total,date_created_gmt' }), { ok: false })
+  assert.deepEqual(await port.get('products', { page: '1', _fields: 'id,sku' }), { ok: false })
+  assert.deepEqual(await port.get('taxes', { page: '1', _fields: 'id' }), { ok: false })
+  assert.equal(rig.seen.length, 3, 'the requests were made (and refused on the way back)')
+  const read = await readWooOrders(port, ['processing'], { sleep: noSleep })
+  assert.deepEqual(read.ok ? null : read.reason, 'SOURCE_UNREADABLE')
+})
+
+// [mutation: only the first row of a page is judged / a nested object is waved through]
+test('ONE row with an unrequested key among honest rows refuses the whole page, on any page of the walk', async () => {
+  const honest = { id: 12, status: 'processing', currency: 'GBP', total: '1.00', date_created_gmt: '2026-10-10T09:30:00' }
+  const rig = await double((req, res) => json(res, [honest, honest, { ...honest, id: 13, meta_data: [] }], { 'X-WP-Total': '3', 'X-WP-TotalPages': '1' }))
+  assert.deepEqual(await portFor(rig).get('orders', { page: '1', _fields: 'id,status,currency,total,date_created_gmt' }), { ok: false })
+})
+
+// [mutation: a request with no _fields is sent / the allow-list is not per request]
+test('a request that names no fields is not sent at all, and the allow-list is the request\'s own', async () => {
+  const rig = await double((req, res) => json(res, [{ id: 1, status: 'x' }], { 'X-WP-Total': '1', 'X-WP-TotalPages': '1' }))
+  const port = portFor(rig)
+  assert.deepEqual(await port.get('orders', { page: '1' }), { ok: false })
+  assert.deepEqual(await port.get('orders', { page: '1', _fields: '' }), { ok: false })
+  assert.equal(rig.seen.length, 0)
+  const ok = await port.get('orders', { page: '1', _fields: 'id,status' })
+  assert.ok(ok.ok && JSON.stringify(ok.body) === '[{"id":1,"status":"x"}]')
+  // another request asking for fewer fields does not inherit the wider list
+  assert.deepEqual(await port.get('orders', { page: '1', _fields: 'id' }), { ok: false })
+})
+
+test('a store that omits requested fields is fine (a subset), and a dotted field is allowed by its top-level name', async () => {
+  const rig = await double((req, res) => json(res, [{ id: 1, tax_lines: [] }], { 'X-WP-Total': '1', 'X-WP-TotalPages': '1' }))
+  const page = await portFor(rig).get('orders', { page: '1', _fields: 'id,status,tax_lines.rate_code' })
+  assert.ok(page.ok)
+})
+
+test('requestedFields and projectToRequested, directly', () => {
+  assert.equal(requestedFields({}), null)
+  assert.equal(requestedFields({ _fields: '' }), null)
+  assert.equal(requestedFields({ _fields: ',' }), null)
+  assert.deepEqual([...requestedFields({ _fields: 'id,tax_lines.rate_code,status' })!].sort(), ['id', 'status', 'tax_lines'])
+  const want = new Set(['id', 'status'])
+  assert.deepEqual(projectToRequested([{ id: 1 }, { id: 2, status: 'a' }], want), [{ id: 1 }, { id: 2, status: 'a' }])
+  assert.deepEqual(projectToRequested({ id: 1 }, want), { id: 1 })
+  assert.deepEqual(projectToRequested([], want), [])
+  assert.equal(typeof projectToRequested([{ id: 1, billing: {} }], want), 'symbol')
+  assert.equal(typeof projectToRequested({ id: 1, billing: {} }, want), 'symbol')
+  // a non-object row is not this function's to judge (the parsers refuse it)
+  assert.deepEqual(projectToRequested([1, 'x', null], want), [1, 'x', null])
 })

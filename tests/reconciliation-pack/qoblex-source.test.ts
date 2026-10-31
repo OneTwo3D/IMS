@@ -4,6 +4,7 @@ import path from 'node:path'
 import test, { afterEach } from 'node:test'
 
 import { PACK_CADENCE_MAX_AGE_MS } from '../../lib/reconciliation-pack/constants.ts'
+import { ingestDataset, parseColumnMap } from '../../lib/first-load/ingest.ts'
 import { QOBLEX_NATIVE_COLUMN_MAP } from '../../lib/reconciliation-pack/qoblex-native-map.ts'
 import { createQoblexSource, parseQoblexManifest, qoblexStaleness, readQoblexExport } from '../../lib/reconciliation-pack/qoblex-source.ts'
 import { ASOF, DEFAULT_PRODUCTS, DEFAULT_STOCK, EXPORTED_AT, LOCATIONS, productsCsv, sha256, stockCsv, writeExport } from './qoblex-fixtures.ts'
@@ -232,6 +233,53 @@ test('the native column map is read once and parsed by the first-load ingest; a 
   assert.notEqual(wrong, map)
   const bad = writeExport(bases, { stock: clean, products: null, locations: ['MIL1', 'CAMBRIDGE', 'RESTOCK', 'QUARANTINE-CAMBRIDGE', 'RXT2'].map((code) => ({ code, company: 'ACME', threePl: false })), extra: { 'map.json': wrong, 'stock.csv': clean }, patch: (m) => { m.stock = { file: 'stock.csv', sha256: sha256(clean), columnMap: { file: 'map.json', sha256: sha256(wrong) } } } })
   assert.equal(partReason(read(bad), 'stock'), 'COLUMN_MAP_NOT_NATIVE')
+})
+
+// [mutation: any one of the kit / bom / non-inventory / Inactive entries removed from the native map, or its skip list emptied]
+test('THE NATIVE MAP COVERS THE TYPES AND STATES R14 NEEDS: kit, bom, non-inventory and inactive read through the full source; every other type or state is a closed refusal', () => {
+  const nativeDir = path.join(process.cwd(), 'tests/first-load/fixtures/qoblex-native')
+  const lines = readFileSync(path.join(nativeDir, 'stock-on-hand.csv'), 'utf8').split('\r\n')
+  const clean = lines.filter((line) => !/^"[^"]*","[^"]*","SYN-[0-9A-Z-]*","[^"]*","[Uu]nknown"/.test(line))
+  const template = clean.find((line) => line.includes('"SYN-1001"'))!
+  const map = readFileSync(path.join(nativeDir, 'maps/qoblex-stock-on-hand.map.json'), 'utf8')
+  const row = (sku: string, type: string, state: string) => template.replace('"SYN-1001"', `"${sku}"`).replace('"simple","Active"', `"${type}","${state}"`)
+  const locations = ['MIL1', 'CAMBRIDGE', 'RESTOCK', 'QUARANTINE-CAMBRIDGE', 'RXT2'].map((code) => ({ code, company: 'ACME', threePl: code === 'RXT2' }))
+  const exportOf = (extra: string[]) => {
+    const csv = [...clean.filter((line) => line !== ''), ...extra, ''].join('\r\n')
+    return read(writeExport(bases, {
+      stock: csv, products: null, locations, extra: { 'map.json': map, 'stock.csv': csv },
+      patch: (m) => { const ref = { file: 'stock.csv', sha256: sha256(csv), columnMap: { file: 'map.json', sha256: sha256(map) } }; m.stock = ref; m.products = ref },
+    }))
+  }
+  const covered = exportOf([row('COV-KIT', 'kit', 'Active'), row('COV-BOM', 'bom', 'Active'), row('COV-NONINV', 'non-inventory', 'Active'), row('COV-OFF', 'simple', 'Inactive'), row('COV-OFFVAR', 'variable', 'Inactive')])
+  assert.ok(covered.ok)
+  assert.ok(covered.value.products.ok, JSON.stringify(covered.value.products))
+  const types = new Map((covered.value.products.ok ? covered.value.products.value : []).map((p) => [p.sku, p.type]))
+  assert.deepEqual([types.get('COV-KIT'), types.get('COV-BOM'), types.get('COV-NONINV'), types.get('COV-OFF'), types.get('COV-OFFVAR')], ['KIT', 'BOM', 'NON_INVENTORY', 'SIMPLE', 'VARIANT'])
+  // the state the map gives each product (the pack does not read it; the first-load tool does, so it is pinned here through the same ingest)
+  const rows = ingestDataset('products', Buffer.from([...clean.filter((line) => line !== ''), row('COV-ON', 'simple', 'Active'), row('COV-OFF', 'simple', 'Inactive'), ''].join('\r\n')), 'stock.csv', parseColumnMap(QOBLEX_NATIVE_COLUMN_MAP, 'native').datasets.products!).rows
+  assert.deepEqual([rows.find((r) => r.values.sku === 'COV-ON')?.values.active, rows.find((r) => r.values.sku === 'COV-OFF')?.values.active], ['TRUE', 'FALSE'])
+  assert.ok(covered.value.stock.ok, JSON.stringify(covered.value.stock))
+  const lotSkus = new Set((covered.value.stock.ok ? covered.value.stock.value : []).map((lot) => lot.sku))
+  assert.ok(lotSkus.has('COV-BOM') && lotSkus.has('COV-OFF') && lotSkus.has('COV-OFFVAR'), 'a bom and an inactive product keep their stock lots')
+  assert.ok(!lotSkus.has('COV-KIT') && !lotSkus.has('COV-NONINV'), 'a kit and a non-inventory product hold no stock of their own: no lot is read for them')
+  // every type or state not listed is a closed refusal of the products part (and, for a type, of the stock part) (the ingest rejects the row; nothing is guessed or dropped)
+  for (const [label, extra] of [
+    ['the export\'s own Unknown type', row('COV-X1', 'Unknown', 'Active')],
+    ['a type nobody has seen', row('COV-X2', 'bundle', 'Active')],
+    ['a listed type in another case', row('COV-X3', 'Kit', 'Active')],
+    ['a state nobody has seen', row('COV-X4', 'simple', 'Archived')],
+    ['a state in another case', row('COV-X5', 'simple', 'active')],
+    ['an empty state', row('COV-X6', 'simple', '')],
+    ['an empty type', row('COV-X7', '', 'Active')],
+  ] as const) {
+    const r = exportOf([extra])
+    assert.notEqual(partReason(r, 'products'), 'ok', `${label}: products`)
+    // the state is a column of the products dataset only (stock lots do not read it); the type is read by both
+    if (!/state/.test(label)) assert.notEqual(partReason(r, 'stock'), 'ok', `${label}: stock`)
+  }
+  // a kit or non-inventory row whose state is unknown is still refused (the skip is for the listed type, not for a row that is otherwise unreadable)
+  assert.notEqual(partReason(exportOf([row('COV-X8', 'kit', 'Archived')]), 'products'), 'ok')
 })
 
 // [mutation: the native-map digest check removed from ingest()]

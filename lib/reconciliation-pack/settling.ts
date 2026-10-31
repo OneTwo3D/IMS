@@ -21,9 +21,9 @@
  */
 
 import { bracketStable, differenceSignature, type CarriedDifference, type DifferenceKind } from '@/lib/reconciliation-pack/compare'
-import { FINDING_BUCKETS, getPackItem, type PackItemId, type PackReasonCode } from '@/lib/reconciliation-pack/constants'
+import { FINDING_BUCKETS, getPackItem, type ComparisonBucket, type PackItemId, type PackReasonCode } from '@/lib/reconciliation-pack/constants'
 import type { ReadinessPhase } from '@/lib/ops/readiness-gate-constants'
-import type { ChainResult } from '@/lib/reconciliation-pack/trend'
+import type { ChainEntry, ChainResult } from '@/lib/reconciliation-pack/trend'
 
 export type CarriedState = { usable: boolean; carried: Map<string, CarriedDifference> }
 
@@ -63,9 +63,70 @@ export function carriedStateFromChain(chain: ChainResult, id: PackItemId, where:
       ? (entry.imsPresent && !entry.vendorPresent ? 'onlyIms' : !entry.imsPresent && entry.vendorPresent ? 'onlyVendor' : entry.imsPresent && entry.vendorPresent ? 'bothDiffer' : null)
       : (bucket === 'onlyIms' || bucket === 'onlyVendor' || bucket === 'bothDiffer') ? bucket : null
     if (kind === null) return unusableCarriedState()
+    if (!carriedMatchesChain(chain.reports, id, where, entry.key, kind, differenceSignature(kind, entry), settling, head)) return unusableCarriedState()
     carried.set(entry.key, { kind, signature: differenceSignature(kind, entry), sequence: settling.sequence, first: settling.first, later: [...settling.later] })
   }
   // Every difference the item lists has its state, and every state belongs to a listed difference.
   if (carried.size !== item.counts.unsettled + findings) return unusableCarriedState()
   return { usable: true, carried }
+}
+
+/** The difference an evidence line records, as the carry reader classifies it (null: it is not a difference at all). */
+function kindOfLine(bucket: ComparisonBucket, entry: { imsPresent: boolean; vendorPresent: boolean }): DifferenceKind | null {
+  if (bucket === 'unsettled') return entry.imsPresent && !entry.vendorPresent ? 'onlyIms' : !entry.imsPresent && entry.vendorPresent ? 'onlyVendor' : entry.imsPresent && entry.vendorPresent ? 'bothDiffer' : null
+  return bucket === 'onlyIms' || bucket === 'onlyVendor' || bucket === 'bothDiffer' ? bucket : null
+}
+
+/**
+ * A carried stamp is taken only if the chain itself bears it out. The newest report claims "first seen in report S, with these later
+ * stamps"; that claim is checked against every report from S to the newest, so a forged (hash-valid) report cannot bring a failure
+ * forward by asserting stamps no earlier report saw:
+ *
+ *   - report S lists the same identity, of the same kind and signature (values and currencies), with the same first stamp, no later
+ *     stamp, and that first stamp is the report's own stable bracket start for the item's stream;
+ *   - every report after S lists it again, with the same sequence, first stamp, kind and signature, and a later-stamp list that
+ *     extends the one before it by at most ONE stamp (a run counts once);
+ *   - a stamp added by a report is that report's own stable bracket start for the stream, never one it did not read;
+ *   - every one of those reports is the same phase and installation, and has the item compared to the end (reasons this reader knows).
+ *
+ * Anything else: no carried state (every difference starts over), which delays a failure and can never bring one forward.
+ */
+function carriedMatchesChain(
+  reports: readonly ChainEntry[],
+  id: PackItemId,
+  where: { phase: ReadinessPhase; systemIdentifier: string },
+  key: string,
+  kind: DifferenceKind,
+  signature: string,
+  claimed: { sequence: number; first: string; later: readonly string[] },
+  head: ChainEntry,
+): boolean {
+  const [stream] = getPackItem(id).streams
+  if (stream === undefined) return false
+  const from = claimed.sequence
+  if (!Number.isSafeInteger(from) || from < 1 || from > head.sequence) return false
+  let previousLater: readonly string[] = []
+  for (let sequence = from; sequence <= head.sequence; sequence += 1) {
+    const report = reports[sequence - 1]
+    if (report === undefined || report.sequence !== sequence) return false
+    const { record } = report
+    if (record.systemIdentifier !== where.systemIdentifier || record.phase !== where.phase) return false
+    const item = record.items.find((candidate) => candidate.id === id)
+    if (item === undefined || item.applicability !== 'applicable' || !item.reasons.every((reason) => KNOWN_REASONS.includes(reason))) return false
+    const bracket = record.streams.find((candidate) => candidate.stream === stream)
+    if (bracket === undefined || !bracketStable(bracket.start, bracket.end) || bracket.start === null) return false
+    const lines = report.settling.filter((line) => line.item === id && line.entry.key === key)
+    if (lines.length !== 1) return false
+    const line = lines[0]!
+    const state = line.entry.settling
+    if (state === undefined || kindOfLine(line.bucket, line.entry) !== kind || differenceSignature(kind, line.entry) !== signature) return false
+    if (state.sequence !== from || state.first !== claimed.first) return false
+    if (state.later.length < previousLater.length || state.later.length > previousLater.length + 1) return false
+    if (!previousLater.every((stamp, index) => state.later[index] === stamp)) return false
+    if (sequence === from) {
+      if (state.later.length !== 0 || state.first !== bracket.start) return false
+    } else if (state.later.length === previousLater.length + 1 && state.later[state.later.length - 1] !== bracket.start) return false
+    previousLater = state.later
+  }
+  return previousLater.length === claimed.later.length && previousLater.every((stamp, index) => claimed.later[index] === stamp)
 }
