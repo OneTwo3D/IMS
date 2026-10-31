@@ -8,7 +8,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
  *
  * WRITERS (every one in this tree takes the exclusive side through `withFxTableWriteLock`; tests/currencies/fx-table-writers-census.test.ts fails on any new writer that does not):
  *   - lib/currencies/fx-refresh.ts             the scheduled ECB fetch and "Update now" (one transaction for the whole fetch)
- *   - app/actions/currencies.ts                add-currency fetch, setManualFxRate (admin pin), clearManualFxRate
+ *   - app/actions/currencies.ts                add-currency fetch, setManualFxRate (admin pin), clearManualFxRate; currency create/activate (not a rate writer: it takes the lock to serialise with the source switch)
  *   - app/actions/reset.ts                     NOT a writer in this sense: the factory reset empties every table, with the app stopped, behind a fresh-admin code
  *   - app/actions/company.ts                   a change of the BASE currency (the rates are measured against it)
  *   The Aelia plugin on the WooCommerce store owns its own copy of the rates in P1 and writes nothing here; an ingest of Aelia's rates into fx_rates is a writer and MUST use this helper.

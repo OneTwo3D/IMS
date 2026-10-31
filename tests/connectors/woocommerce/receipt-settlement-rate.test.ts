@@ -94,5 +94,21 @@ test('the Xero follow-up takes the declared payment rate and does not fall back 
   const { settlementRateFromPayload } = await import('@/lib/connectors/xero/sync-processor')
   assert.deepEqual(settlementRateFromPayload({ currencyRateToBase: 1.25, _paymentSettlementRateToBase: 1.31 }), { settlementRateToBase: 1.31 })
   assert.deepEqual(settlementRateFromPayload({ currencyRateToBase: 1.25, _paymentSettlementRateToBase: null }), {})
-  assert.deepEqual(settlementRateFromPayload({ currencyRateToBase: 1.25 }), { settlementRateToBase: 1.25 }) // queued before the key existed
+  // queued before the key existed: no rate at all (the order's rate is the order day's, never a later payment's); the central guard refuses a foreign payment without one
+  assert.deepEqual(settlementRateFromPayload({ currencyRateToBase: 1.25 }), {})
+  assert.deepEqual(settlementRateFromPayload({}), {})
+  assert.deepEqual(settlementRateFromPayload({ currencyRateToBase: 1.25, _paymentSettlementRateToBase: 0 }), {}, 'a declared but unusable value carries nothing')
+  assert.deepEqual(settlementRateFromPayload({ currencyRateToBase: 1.25, _paymentSettlementRateToBase: '' }), {})
+  assert.deepEqual(settlementRateFromPayload({ currencyRateToBase: 1.25, _paymentSettlementRateToBase: '1.31' }), { settlementRateToBase: 1.31 }, 'a declared usable key still wins')
+})
+
+test('a legacy foreign payload (no declared payment rate) is refused by the central guard, a base-currency one is not', async () => {
+  const { settlementRateFromPayload } = await import('@/lib/connectors/xero/sync-processor')
+  const { foreignCurrencyRateRefusal } = await import('@/lib/domain/accounting/foreign-currency-rate-guard')
+  const legacy = { currencyRateToBase: 1.25 }
+  const refusal = foreignCurrencyRateRefusal({ type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: 'so1', payload: { currency: 'EUR', ...settlementRateFromPayload(legacy) }, baseCurrency: 'GBP' })
+  assert.equal(refusal?.reason, 'foreign_payment_missing_rate')
+  assert.equal(foreignCurrencyRateRefusal({ type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: 'so1', payload: { currency: 'GBP', ...settlementRateFromPayload(legacy) }, baseCurrency: 'GBP' }), null)
+  // and a declared rate is carried
+  assert.equal(foreignCurrencyRateRefusal({ type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: 'so1', payload: { currency: 'EUR', ...settlementRateFromPayload({ ...legacy, _paymentSettlementRateToBase: 1.31 }) }, baseCurrency: 'GBP' }), null)
 })

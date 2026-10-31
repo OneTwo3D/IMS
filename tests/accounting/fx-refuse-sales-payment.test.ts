@@ -174,3 +174,16 @@ test('[q0x56.16] a real timestamp stays an instant: a rate fetched AFTER it is n
   const late = await addPayment(receipt({ paidAt: '2026-08-20T10:00:00.000Z' }))
   assert.equal(late.success, true, JSON.stringify(late))
 })
+
+test('the stored receipt records whether paidAt was a date-only input or an explicit instant (an exact 00:00:00Z instant is told apart)', async () => {
+  state.rates = [usd('1.25', '2026-08-19T09:00:00.000Z'), usd('1.60', '2026-08-20T09:00:00.000Z')]
+  const dateOnly = await addPayment(receipt({ paidAt: '2026-08-20' }))
+  assert.equal(dateOnly.success, true, JSON.stringify(dateOnly))
+  assert.equal((state.created[0] as { paidAtExplicitInstant?: Date | null }).paidAtExplicitInstant, null, 'date-only: no explicit instant')
+  const explicit = await addPayment(receipt({ paidAt: '2026-08-20T00:00:00.000Z' }))
+  assert.equal(explicit.success, true, JSON.stringify(explicit))
+  const stored = state.created[1] as { paidAt: Date; paidAtExplicitInstant?: Date | null }
+  assert.equal(stored.paidAt.toISOString(), '2026-08-20T00:00:00.000Z')
+  assert.equal(stored.paidAtExplicitInstant?.toISOString(), '2026-08-20T00:00:00.000Z', 'an explicit midnight instant is kept as one')
+  assert.equal(state.asOfs[1].toISOString(), '2026-08-20T00:00:00.000Z', 'and its journal rate was looked up AT that instant, which is what the report must read')
+})

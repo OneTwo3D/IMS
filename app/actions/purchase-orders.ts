@@ -120,6 +120,7 @@ import {
   getRealisedFxAccounts,
   describeFxRefusal,
   resolveSettlementFxRateToBase,
+  explicitSettlementInstant,
   settlementAsOfFromInput,
 } from '@/lib/accounting-fx'
 import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
@@ -4117,6 +4118,7 @@ export async function markBillPaid(
         const result = await markBillPaidSupersedingStaleRegistrations(tx, {
           invoiceId,
           paidAt: paymentDate,
+          paidAtExplicitInstant: explicitSettlementInstant(input.paymentDate, paymentDate),
           paymentAccountId: input.bankAccountId,
           paymentAccountName: account.name,
           paymentReference: input.reference || null,

@@ -1518,6 +1518,8 @@ model PurchaseInvoice {
   // refuses and still names a manual action. This makes the refusal INFORMATIVE, not automatic.
   accountingInvoiceIdSource AccountingLinkSource? @map("accounting_invoice_id_source")
   paidAt          DateTime?
+  /// Provenance of `paidAt`, as on Payment: the value of `paidAt` when it was an explicit instant, NULL when date-only or unknown; honoured only while it equals `paidAt`.
+  paidAtExplicitInstant DateTime? @map("paid_at_explicit_instant")
   paymentAccountId   String?   // connector account id (e.g. Xero bank AccountID) used to pay this bill
   paymentAccountName String?   // snapshot of the bank account name at payment time
   paymentReference   String?   // optional user-entered payment reference
@@ -2336,6 +2338,10 @@ model Payment {
   /// The settlement rate IMS resolved when this receipt was recorded (1 base = X receipt currency). Every enqueue of the receipt carries THIS
   /// value, never a fresh lookup. NULL = base-currency receipt, refund payment, or recorded before the column existed (a foreign NULL is refused).
   settlementRateToBase Decimal? @db.Decimal(18, 8) @map("settlement_rate_to_base")
+  /// PROVENANCE OF `paidAt`: set to the value of `paidAt` when it was an explicit INSTANT (the operator or API sent a time, not just a date), NULL when it was a date-only input or is unknown. A stored
+  /// `paidAt` of exactly 00:00:00.000Z is otherwise ambiguous (a date-only input is stored as that midnight); the FX gain/loss report reads an explicit instant as the instant, so it looks up the rate
+  /// the receipt's journal used. It is honoured only while it still equals `paidAt`, so a later change of `paidAt` that did not touch it cannot leave a stale claim.
+  paidAtExplicitInstant DateTime? @map("paid_at_explicit_instant")
 
   order           SalesOrder       @relation(fields: [orderId], references: [id])
   refund          SalesOrderRefund? @relation(fields: [refundId], references: [id])

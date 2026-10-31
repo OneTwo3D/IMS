@@ -100,6 +100,7 @@ import {
   getRealisedFxAccounts,
   describeFxRefusal,
   resolveSettlementFxRateToBase,
+  explicitSettlementInstant,
   settlementAsOfFromInput,
 } from '@/lib/accounting-fx'
 import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
@@ -3829,6 +3830,8 @@ export async function addPayment(input: {
           reference: input.reference || null,
           notes: input.notes || null,
           paidAt,
+          // whether `paidAt` was an explicit instant or a date-only input (the FX gain/loss report reads a stored midnight by it)
+          paidAtExplicitInstant: explicitSettlementInstant(input.paidAt, paidAt),
           // o3d-q0x56.2: stored WITH the receipt; every enqueue of it carries this value and none recalculates. Null for a base-currency
           // receipt and for a refund payment.
           settlementRateToBase,

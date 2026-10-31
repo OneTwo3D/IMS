@@ -257,6 +257,7 @@ type SalesPaymentFxRow = {
   amount: DecimalInput
   currency: string
   paidAt: Date
+  paidAtExplicitInstant?: Date | null
   refundId: string | null
   order: {
     id: string
@@ -276,6 +277,7 @@ type PurchaseInvoiceFxRow = {
   invoiceNumber: string | null
   invoiceDate: Date
   paidAt: Date | null
+  paidAtExplicitInstant?: Date | null
   totalForeign: DecimalInput
   totalBase: DecimalInput
   fxRateToBase: DecimalInput
@@ -450,10 +452,11 @@ function settlementRateToBase(
   currency: string,
   paidAt: Date,
   regime: FxSourceRegime,
+  explicitInstant?: Date | null,
 ): { rate: Prisma.Decimal; reason: null } | { rate: null; reason: string } {
   if (currency === baseCurrency) return { rate: new Prisma.Decimal(1), reason: null }
   try {
-    return { rate: selectFxRateFromRows(rates, { baseCurrency, currency, asOf: settlementAsOfFromStored(paidAt), regime }).rate, reason: null }
+    return { rate: selectFxRateFromRows(rates, { baseCurrency, currency, asOf: settlementAsOfFromStored(paidAt, explicitInstant), regime }).rate, reason: null }
   } catch (error) {
     if (!isMissingFxRateError(error)) throw error
     return { rate: null, reason: describeFxRefusal(error) }
@@ -1056,6 +1059,7 @@ export async function getFxGainLossReport(
         amount: true,
         currency: true,
         paidAt: true,
+        paidAtExplicitInstant: true,
         refundId: true,
         order: {
           select: {
@@ -1083,6 +1087,7 @@ export async function getFxGainLossReport(
         invoiceNumber: true,
         invoiceDate: true,
         paidAt: true,
+        paidAtExplicitInstant: true,
         totalForeign: true,
         totalBase: true,
         fxRateToBase: true,
@@ -1097,7 +1102,7 @@ export async function getFxGainLossReport(
 
   const rows: FxGainLossReportRow[] = []
   for (const payment of payments) {
-    const settlement = settlementRateToBase(fxRates, baseCurrency, payment.currency, payment.paidAt, fxRegime)
+    const settlement = settlementRateToBase(fxRates, baseCurrency, payment.currency, payment.paidAt, fxRegime, payment.paidAtExplicitInstant)
     const paymentForeign = toDecimal(payment.amount).abs()
     const orderTotalForeign = toDecimal(payment.order.totalForeign)
     if (settlement.rate === null) {
@@ -1156,7 +1161,7 @@ export async function getFxGainLossReport(
   }
   for (const invoice of purchaseInvoices) {
     if (!invoice.paidAt) continue
-    const settlement = settlementRateToBase(fxRates, baseCurrency, invoice.po.currency, invoice.paidAt, fxRegime)
+    const settlement = settlementRateToBase(fxRates, baseCurrency, invoice.po.currency, invoice.paidAt, fxRegime, invoice.paidAtExplicitInstant)
     if (settlement.rate === null) {
       rows.push({
         side: 'payable',

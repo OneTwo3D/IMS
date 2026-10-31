@@ -3,7 +3,7 @@ import test from 'node:test'
 
 import { getFxRateToBase, resolveFxRatesToBase } from '@/lib/currencies/fx-lookup'
 import { selectFxRateFromRows, type FxRateRow } from '@/lib/currencies/fx-select'
-import { fxSourceRegimeFromSettings } from '@/lib/currencies/fx-source-regime'
+import { appendFxSourceSwitch, fxRegimeRestrictsAt, fxSourceRegimeFromSettings, parseFxSourceHistory } from '@/lib/currencies/fx-source-regime'
 import { fakeFxClient, type FakeFxRow } from '@/tests/helpers/fx-fake-client'
 
 /**
@@ -32,9 +32,9 @@ test('regime parse: only exactly aelia is a regime; a missing or unreadable inst
   assert.equal(fxSourceRegimeFromSettings(undefined, SINCE), null)
   assert.equal(fxSourceRegimeFromSettings('ecb', SINCE), null)
   assert.equal(fxSourceRegimeFromSettings('Aelia', SINCE), null)
-  assert.deepEqual(fxSourceRegimeFromSettings('aelia', SINCE), { source: 'aelia', since: at(SINCE) })
-  assert.equal(fxSourceRegimeFromSettings('aelia', null)?.since.getTime(), 0)
-  assert.equal(fxSourceRegimeFromSettings('aelia', 'garbage')?.since.getTime(), 0)
+  assert.deepEqual(fxSourceRegimeFromSettings('aelia', SINCE), { aelia: [{ since: at(SINCE), until: null }] })
+  assert.equal(fxSourceRegimeFromSettings('aelia', null)?.aelia[0]?.since.getTime(), 0)
+  assert.equal(fxSourceRegimeFromSettings('aelia', 'garbage')?.aelia[0]?.since.getTime(), 0)
 })
 
 test('pure selection: after the cutover a NEWER ECB row is ignored; the Aelia row is the rate', () => {
@@ -90,4 +90,80 @@ test('database lookup: flag OFF (no setting, or ecb) is exactly today\'s plain l
     assert.equal((await getFxRateToBase(client, { currency: 'EUR', asOf: AFTER })).rate.toString(), '1.25')
     assert.equal((await getFxRateToBase(client, { currency: 'USD', asOf: AFTER })).rate.toString(), '1.3')
   }
+})
+
+// ---- THE SWITCH HISTORY: the regime in effect at the lookup's asOf, after later switches ----
+
+const BACK = '2026-11-02T00:00:00Z'
+const history = JSON.stringify([{ source: 'aelia', since: SINCE }, { source: 'ecb', since: BACK }])
+const afterBack = { fx_rate_source: 'ecb', fx_rate_source_since: BACK, fx_rate_source_history: history }
+const historyRows = [
+  ...rows,
+  row('EUR', '1.40', '2026-11-03T06:00:00Z'), // an ECB row after the switch back
+]
+const IN_AELIA_PERIOD = at('2026-10-30T12:00:00Z')
+const AFTER_BACK = at('2026-11-04T12:00:00Z')
+
+test('history: after a switch back to ECB, a lookup dated in the Aelia period still uses Aelia rows', async () => {
+  const client = fakeFxClient(historyRows, 'GBP', afterBack)
+  const eur = await getFxRateToBase(client, { currency: 'EUR', asOf: IN_AELIA_PERIOD })
+  assert.equal(eur.source, 'aelia')
+  assert.equal(eur.rate.toString(), '1.19', 'the ECB rows of 25 Oct (and the later 3 Nov one) are not eligible for an Aelia-period document')
+  await assert.rejects(getFxRateToBase(client, { currency: 'USD', asOf: IN_AELIA_PERIOD }), (e: Error & { reason?: string }) => e.reason === 'no_rate_from_selected_source')
+  // pure selection agrees
+  const regimeNow = fxSourceRegimeFromSettings('ecb', BACK, history)
+  assert.equal(selectFxRateFromRows(historyRows, { baseCurrency: 'GBP', currency: 'EUR', asOf: IN_AELIA_PERIOD, regime: regimeNow }).source, 'aelia')
+  // CONTROL: the current-only reading (no history) is the plain latest row, which is the defect
+  assert.equal(selectFxRateFromRows(historyRows, { baseCurrency: 'GBP', currency: 'EUR', asOf: IN_AELIA_PERIOD, regime: fxSourceRegimeFromSettings('ecb', BACK) }).rate.toString(), '1.25')
+})
+
+test('history: before the first switch and after the switch back are the plain latest row', async () => {
+  const client = fakeFxClient(historyRows, 'GBP', afterBack)
+  assert.equal((await getFxRateToBase(client, { currency: 'EUR', asOf: BEFORE })).rate.toString(), '1.1', 'before any recorded switch: today\'s behaviour')
+  assert.equal((await getFxRateToBase(client, { currency: 'EUR', asOf: AFTER_BACK })).rate.toString(), '1.4', 'after the switch back the plain latest row (the ECB one) answers')
+  assert.equal((await getFxRateToBase(client, { currency: 'USD', asOf: AFTER_BACK })).rate.toString(), '1.3')
+  // the boundaries: the Aelia interval is [since, until)
+  const r = fxSourceRegimeFromSettings('ecb', BACK, history)
+  assert.equal(fxRegimeRestrictsAt(r, at(SINCE)), true)
+  assert.equal(fxRegimeRestrictsAt(r, at('2026-11-01T23:59:59.999Z')), true)
+  assert.equal(fxRegimeRestrictsAt(r, at(BACK)), false)
+  assert.equal(fxRegimeRestrictsAt(r, at('2026-10-23T23:59:59.999Z')), false)
+})
+
+test('history: a second Aelia period after the switch back is a second interval; the earlier gap stays unrestricted', () => {
+  const h = JSON.stringify([{ source: 'aelia', since: SINCE }, { source: 'ecb', since: BACK }, { source: 'aelia', since: '2026-11-10T00:00:00Z' }])
+  const r = fxSourceRegimeFromSettings('aelia', '2026-11-10T00:00:00Z', h)
+  assert.equal(r?.aelia.length, 2)
+  assert.equal(fxRegimeRestrictsAt(r, at('2026-10-30T00:00:00Z')), true)
+  assert.equal(fxRegimeRestrictsAt(r, at('2026-11-05T00:00:00Z')), false)
+  assert.equal(fxRegimeRestrictsAt(r, at('2026-11-11T00:00:00Z')), true)
+})
+
+test('history: the current pair is always honoured and an unreadable history is not trusted', () => {
+  // the pair says Aelia since X but the history never recorded it: still restricted (strict reading)
+  assert.equal(fxRegimeRestrictsAt(fxSourceRegimeFromSettings('aelia', SINCE, JSON.stringify([{ source: 'ecb', since: '2026-01-01T00:00:00Z' }])), AFTER), true)
+  assert.equal(parseFxSourceHistory('not json'), null)
+  assert.equal(parseFxSourceHistory('[{"source":"x","since":"2026-01-01T00:00:00Z"}]'), null)
+  assert.equal(parseFxSourceHistory('[{"source":"ecb","since":"nope"}]'), null)
+  assert.equal(fxSourceRegimeFromSettings('ecb', BACK, 'not json'), null)
+})
+
+test('history: appendFxSourceSwitch appends one entry, and seeds a pre-history Aelia pair so the first switch back keeps its interval', () => {
+  const first = JSON.parse(appendFxSourceSwitch(undefined, 'ecb', undefined, 'aelia', at(SINCE))) as Array<{ source: string; since: string }>
+  assert.deepEqual(first, [{ source: 'aelia', since: SINCE.replace('Z', '.000Z') }])
+  const second = JSON.parse(appendFxSourceSwitch(JSON.stringify(first), 'aelia', SINCE, 'ecb', at(BACK))) as Array<{ source: string }>
+  assert.deepEqual(second.map((x) => x.source), ['aelia', 'ecb'])
+  const seeded = JSON.parse(appendFxSourceSwitch(undefined, 'aelia', SINCE, 'ecb', at(BACK))) as Array<{ source: string; since: string }>
+  assert.deepEqual(seeded.map((x) => x.source), ['aelia', 'ecb'])
+  assert.equal(seeded[0]?.since, SINCE.replace('Z', '.000Z'))
+  const r = fxSourceRegimeFromSettings('ecb', BACK, JSON.stringify(seeded))
+  assert.equal(fxRegimeRestrictsAt(r, IN_AELIA_PERIOD), true)
+})
+
+test('history: entries stored out of order are read oldest first', () => {
+  const shuffled = JSON.stringify([{ source: 'ecb', since: BACK }, { source: 'aelia', since: SINCE }])
+  assert.deepEqual(parseFxSourceHistory(shuffled)?.map((h) => h.source), ['aelia', 'ecb'])
+  const r = fxSourceRegimeFromSettings('ecb', BACK, shuffled)
+  assert.equal(fxRegimeRestrictsAt(r, IN_AELIA_PERIOD), true)
+  assert.equal(fxRegimeRestrictsAt(r, AFTER_BACK), false)
 })

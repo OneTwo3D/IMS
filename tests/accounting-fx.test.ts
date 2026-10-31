@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { fakeFxClient } from './helpers/fx-fake-client.ts'
-import { buildRealisedFxJournal, computeRealisedFx, describeFxRefusal, resolveSettlementFxRateToBase, reverseJournalLines, settlementAsOfFromInput, settlementAsOfFromStored } from '../lib/accounting-fx.ts'
+import { buildRealisedFxJournal, computeRealisedFx, describeFxRefusal, resolveSettlementFxRateToBase, explicitSettlementInstant, reverseJournalLines, settlementAsOfFromInput, settlementAsOfFromStored } from '../lib/accounting-fx.ts'
 
 test('computes realised FX loss on customer payment when settlement base is below booked AR', () => {
   const result = computeRealisedFx({
@@ -205,6 +205,26 @@ test('settlementAsOfFromStored: exactly-midnight is the stored form of a date-on
   assert.equal(settlementAsOfFromStored(new Date('2026-06-10T00:00:00.000Z')).toISOString(), '2026-06-10T23:59:59.999Z')
   assert.equal(settlementAsOfFromStored(new Date('2026-06-10T00:00:00.001Z')).toISOString(), '2026-06-10T00:00:00.001Z')
   assert.equal(settlementAsOfFromStored(new Date('2026-06-10T09:00:00.000Z')).toISOString(), '2026-06-10T09:00:00.000Z')
+})
+
+test('explicitSettlementInstant: a YYYY-MM-DD input is date-only (null); an explicit instant, midnight included, is kept', () => {
+  const midnight = new Date('2026-06-10T00:00:00.000Z')
+  assert.equal(explicitSettlementInstant('2026-06-10', midnight), null)
+  assert.equal(explicitSettlementInstant('2026-06-10T00:00:00.000Z', midnight)?.getTime(), midnight.getTime())
+  assert.equal(explicitSettlementInstant('2026-06-10T00:00:00Z', midnight)?.getTime(), midnight.getTime())
+  assert.equal(explicitSettlementInstant(midnight, midnight)?.getTime(), midnight.getTime())
+  const now = new Date('2026-06-10T09:30:00.000Z')
+  assert.equal(explicitSettlementInstant(undefined, now)?.getTime(), now.getTime(), 'no input means now, an instant')
+})
+
+test('settlementAsOfFromStored: an explicit instant at exactly midnight is the instant; stale or absent provenance keeps the date-only reading', () => {
+  const midnight = new Date('2026-06-10T00:00:00.000Z')
+  assert.equal(settlementAsOfFromStored(midnight, midnight).toISOString(), '2026-06-10T00:00:00.000Z', 'explicit instant: not the end of day')
+  assert.equal(settlementAsOfFromStored(midnight, null).toISOString(), '2026-06-10T23:59:59.999Z')
+  assert.equal(settlementAsOfFromStored(midnight, undefined).toISOString(), '2026-06-10T23:59:59.999Z')
+  assert.equal(settlementAsOfFromStored(midnight, new Date('2026-06-09T00:00:00.000Z')).toISOString(), '2026-06-10T23:59:59.999Z', 'provenance of another instant is no evidence (paidAt changed since)')
+  const nine = new Date('2026-06-10T09:00:00.000Z')
+  assert.equal(settlementAsOfFromStored(nine, nine).toISOString(), '2026-06-10T09:00:00.000Z')
 })
 
 test('describeFxRefusal tells the operator what to do for each kind of refusal', async () => {

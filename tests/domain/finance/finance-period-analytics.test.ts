@@ -720,3 +720,35 @@ test('[q0x56.16] FX gain/loss: a real timestamp stays an instant (the 09:00 rate
   const report = await getFxGainLossReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, fxOpts(client))
   assert.equal(report.rows[0]?.settlementRateToBase, '1.5')
 })
+
+test('FX gain/loss: a payment at an EXPLICIT 00:00:00Z instant reads the midnight rate (as its journal did), a date-only one reads the end of day', async () => {
+  const rates = [{ rate: '1.5', at: '2026-06-09T00:00:00.000Z' }, { rate: '1.6', at: '2026-06-10T09:00:00.000Z' }]
+  const midnight = new Date('2026-06-10T00:00:00.000Z')
+  const row = (extra: Record<string, unknown>) => ({ id: 'payment-1', amount: decimal('120'), currency: 'USD', paidAt: midnight, ...extra, refundId: null, order: { id: 'so-1', orderNumber: 'SO-1', invoiceNumber: 'INV-1', currency: 'USD', fxRateToBase: decimal('1.2'), customerName: 'A', customerEmail: null } })
+  const selects: Array<Record<string, unknown>> = []
+  const clientWith = (extra: Record<string, unknown>): FinanceAnalyticsClient => ({ ...fxGainLossClient(rates), payment: { findMany: async (args: { select: Record<string, unknown> }) => { selects.push(args.select); return [row(extra)] } } })
+  const explicit = await getFxGainLossReport(fxWindow, fxOpts(clientWith({ paidAtExplicitInstant: midnight })))
+  assert.equal(explicit.rows[0]?.settlementRateToBase, '1.5', 'explicit midnight instant: the 09:00 rate is not yet visible')
+  const dateOnly = await getFxGainLossReport(fxWindow, fxOpts(clientWith({ paidAtExplicitInstant: null })))
+  assert.equal(dateOnly.rows[0]?.settlementRateToBase, '1.6', 'date-only: the end of the business day')
+  const unknown = await getFxGainLossReport(fxWindow, fxOpts(clientWith({})))
+  assert.equal(unknown.rows[0]?.settlementRateToBase, '1.6', 'no provenance (older row): today\'s reading')
+  const stale = await getFxGainLossReport(fxWindow, fxOpts(clientWith({ paidAtExplicitInstant: new Date('2026-06-09T00:00:00.000Z') })))
+  assert.equal(stale.rows[0]?.settlementRateToBase, '1.6', 'provenance of another instant is not evidence')
+  assert.ok(selects.length > 0 && selects.every((sel) => sel.paidAtExplicitInstant === true), 'the report reads the provenance column')
+})
+
+test('FX gain/loss: a bill paid at an EXPLICIT 00:00:00Z instant reads the midnight rate', async () => {
+  const rates = [{ rate: '1.5', at: '2026-06-09T00:00:00.000Z' }, { rate: '1.6', at: '2026-06-10T09:00:00.000Z' }]
+  const midnight = new Date('2026-06-10T00:00:00.000Z')
+  const bill = (extra: Record<string, unknown>) => ({
+    id: 'inv-1', invoiceNumber: 'BILL-1', paidAt: midnight, ...extra, totalForeign: decimal('100'), totalBase: decimal('80'), fxRateToBase: decimal('1.25'), po: { reference: 'PO-1', currency: 'USD', supplier: { name: 'S' } },
+  })
+  const billSelects: Array<Record<string, unknown>> = []
+  const clientWith = (extra: Record<string, unknown>): FinanceAnalyticsClient => ({
+    ...fxGainLossClient(rates), payment: { findMany: async () => [] }, purchaseInvoice: { findMany: async (args: { select: Record<string, unknown> }) => { billSelects.push(args.select); return [bill(extra)] } },
+  } as FinanceAnalyticsClient)
+  assert.equal((await getFxGainLossReport(fxWindow, fxOpts(clientWith({ paidAtExplicitInstant: midnight })))).rows[0]?.settlementRateToBase, '1.5')
+  assert.equal((await getFxGainLossReport(fxWindow, fxOpts(clientWith({ paidAtExplicitInstant: null })))).rows[0]?.settlementRateToBase, '1.6')
+  assert.ok(billSelects.length > 0 && billSelects.every((sel) => sel.paidAtExplicitInstant === true), 'the report reads the provenance column')
+})
