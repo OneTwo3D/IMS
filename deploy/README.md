@@ -122,6 +122,34 @@ guarantee.
 - Do **not** add `MemoryDenyWriteExecute=true` — it breaks the V8 JIT and the
   process will crash on start.
 
+## Error tracking (GlitchTip)
+
+IMS reports unhandled errors to the self-hosted GlitchTip (Sentry-compatible) through
+`@sentry/nextjs`. The SDK is **disabled unless a DSN is set**, so CI, tests, local dev and any
+unit without the variables behave exactly as before. Errors only (5% trace sampling); no session
+replay, profiling or feedback widget.
+
+| Variable | Used by | Notes |
+|----------|---------|-------|
+| `SENTRY_DSN` | server + edge runtime | read at runtime from the unit's environment |
+| `NEXT_PUBLIC_SENTRY_DSN` | browser | inlined at **build** time; its https origin is added to the CSP `connect-src` |
+| `SENTRY_ENVIRONMENT` / `NEXT_PUBLIC_SENTRY_ENVIRONMENT` | server / browser | `stage` or `production`; defaults to `dev` |
+| `SENTRY_RELEASE` / `NEXT_PUBLIC_SENTRY_RELEASE` | server / browser | optional; unset means no release |
+
+The DSN is copied from the GlitchTip project settings (onetwo3D org, project `ims`) into the
+unit's environment file; it never goes in the repository. Use one environment name per deployment
+(`stage`, `production`) so events can be filtered. Because the browser DSN is a build-time value,
+set `NEXT_PUBLIC_SENTRY_DSN` before `next build` and rebuild after changing it.
+
+Every event, breadcrumb and transaction passes through `lib/observability/scrub.ts` first: values
+under keys like password/secret/token/auth/api-key/cookie/dsn/session/credential become
+`[Filtered]`, inline credentials (`auth=`, `Bearer`, `user:pw@host`) are removed, emails become
+`[email]`, and request cookies, `user.email` and `user.ip_address` are dropped.
+
+To verify on stage: set the variables, restart, trigger a test error (for example throw from a
+temporary server action or route), and confirm it appears in GlitchTip under the right environment
+with no secrets, cookies or email addresses in the payload.
+
 ## Container image
 
 A CI-built, production-shaped image of IMS. It is built by `.github/workflows/image.yml`

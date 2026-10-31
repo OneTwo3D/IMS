@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { auth } from '@/lib/auth'
 import { sessionInvalidLoginReason, type SessionInvalidReason } from '@/lib/auth/session-state'
-import { buildCsp, cspHeaderName, generateNonce, getCspMode } from '@/lib/security/csp'
+import { buildCsp, cspHeaderName, errorTrackingOriginFromDsn, generateNonce, getCspMode } from '@/lib/security/csp'
 import { API_PATH_PREFIX, evaluateProxyAuthz, isPublicProxyPath, type ProxySession } from '@/lib/security/proxy-authz'
 import { isTurnstileEnabled } from '@/lib/turnstile'
 
@@ -29,7 +29,10 @@ export async function handleProxy(
   const nonce = generateNonce()
   const csp = cspMode === 'off' || isApiRoute
     ? null
-    : buildCsp(nonce, process.env.NODE_ENV !== 'production', { turnstileEnabled: isTurnstileEnabled() })
+    : buildCsp(nonce, process.env.NODE_ENV !== 'production', {
+        turnstileEnabled: isTurnstileEnabled(),
+        errorTrackingOrigin: errorTrackingOriginFromDsn(process.env.NEXT_PUBLIC_SENTRY_DSN),
+      })
 
   // Attach the CSP response header (report-only or enforce) to any response.
   const withCsp = <T extends NextResponse>(response: T): T => {

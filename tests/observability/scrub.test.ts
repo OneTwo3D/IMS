@@ -1,0 +1,124 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+
+import type { Breadcrumb, Event } from '@sentry/nextjs'
+
+import { scrubBreadcrumb, scrubEvent } from '@/lib/observability/scrub'
+
+const json = (v: unknown) => JSON.stringify(v)
+
+test('strips auth query param', () => {
+  const out = scrubEvent({ message: 'redis down tcp://10.0.3.11:6379?auth=hunter2' })
+  assert.ok(out)
+  assert.doesNotMatch(json(out), /hunter2/)
+  assert.match(out.message ?? '', /10\.0\.3\.11:6379/)
+})
+
+test('strips Authorization header', () => {
+  const out = scrubEvent({
+    request: {
+      url: 'https://ims.example/api/x',
+      headers: { Authorization: 'Bearer abc.def.ghi', 'x-api-key': 'k-12345', accept: 'text/html' },
+      cookies: { session: 'cookie-secret-1' },
+      query_string: 'token=qs-secret-2&page=2',
+      data: { password: 'pw-secret-3', name: 'Widget' },
+    },
+    message: 'Authorization: Basic dXNlcjpwYXNz failed',
+  })
+  assert.ok(out)
+  const s = json(out)
+  for (const leaked of ['abc.def.ghi', 'k-12345', 'cookie-secret-1', 'qs-secret-2', 'pw-secret-3', 'dXNlcjpwYXNz']) {
+    assert.ok(!s.includes(leaked), `leaked ${leaked}`)
+  }
+  assert.equal(out.request?.cookies, undefined)
+  assert.equal(out.request?.headers?.accept, 'text/html')
+  assert.equal((out.request?.data as { name: string }).name, 'Widget')
+})
+
+test('strips Bearer token in a message', () => {
+  const out = scrubEvent({ message: 'upstream said: Bearer eyJhbGciOi.payload.sig rejected' })
+  assert.ok(out)
+  assert.doesNotMatch(json(out), /eyJhbGciOi/)
+})
+
+test('strips nested token keys', () => {
+  const out = scrubEvent({
+    extra: { a: { b: [{ c: { accessToken: 'deep-1', refresh_token: 'deep-2', apiKey: 'deep-3', ok: 'fine' } }] } },
+    contexts: { conn: { dsn: 'https://k@host/1', sessionId: 'deep-4' } },
+    tags: { client_secret: 'deep-5', route: '/orders' },
+  })
+  assert.ok(out)
+  const s = json(out)
+  for (const n of ['deep-1', 'deep-2', 'deep-3', 'deep-4', 'deep-5', 'https://k@host/1']) assert.ok(!s.includes(n), n)
+  assert.match(s, /\[Filtered\]/)
+  assert.match(s, /fine/)
+  assert.match(s, /\/orders/)
+})
+
+test('strips password in a postgres URL', () => {
+  const out = scrubEvent({
+    exception: { values: [{ type: 'Error', value: 'connect failed postgres://ims:s3cr3tpw@10.0.0.5:5432/ims?password=other1' }] },
+  })
+  assert.ok(out)
+  const s = json(out)
+  assert.ok(!s.includes('s3cr3tpw'))
+  assert.ok(!s.includes('other1'))
+  assert.match(s, /10\.0\.0\.5:5432\/ims/)
+})
+
+test('strips emails', () => {
+  const out = scrubEvent({
+    message: 'send to jane.doe+x@example.co.uk failed',
+    user: { id: '7', email: 'jane@example.com', ip_address: '1.2.3.4', username: 'bob@example.com' },
+  })
+  assert.ok(out)
+  const s = json(out)
+  assert.ok(!s.includes('example.co.uk'))
+  assert.ok(!s.includes('example.com'))
+  assert.ok(!s.includes('1.2.3.4'))
+  assert.equal(out.user?.email, undefined)
+  assert.equal(out.user?.ip_address, undefined)
+  assert.equal(out.user?.id, '7')
+  assert.match(out.message ?? '', /\[email\]/)
+})
+
+test('keeps order ids and SKUs', () => {
+  const msg = 'order 173814 SKU ABC-1'
+  const out = scrubEvent({ message: msg, extra: { note: msg }, tags: { sku: 'ABC-1', order: '173814' } })
+  assert.ok(out)
+  assert.equal(out.message, msg)
+  assert.equal((out.extra as { note: string }).note, msg)
+  assert.deepEqual(out.tags, { sku: 'ABC-1', order: '173814' })
+})
+
+test('scrubs breadcrumbs', () => {
+  const b: Breadcrumb = {
+    category: 'fetch',
+    message: 'GET https://api.example/x?api_key=bc-secret-1',
+    data: { url: 'https://u:bc-pw@host/p', headers: { cookie: 'bc-cookie' }, status: 200 },
+  }
+  const out = scrubBreadcrumb(b)
+  assert.ok(out)
+  const s = json(out)
+  for (const n of ['bc-secret-1', 'bc-pw', 'bc-cookie']) assert.ok(!s.includes(n), n)
+  assert.equal((out.data as { status: number }).status, 200)
+})
+
+test('never throws on cyclic/odd input', () => {
+  const cyc: Record<string, unknown> = { token: 'cyc-1', name: 'x' }
+  cyc.self = cyc
+  const evil = {
+    get message(): string {
+      throw new Error('boom')
+    },
+  }
+  assert.doesNotThrow(() => scrubEvent({ extra: cyc } as Event))
+  const out = scrubEvent({ extra: cyc } as Event)
+  assert.ok(out)
+  assert.ok(!json({ ...out, extra: undefined }).includes('cyc-1'))
+  const bad = scrubEvent(evil as unknown as Event)
+  assert.ok(bad)
+  assert.equal(bad.message, '[scrub failed]')
+  assert.doesNotThrow(() => scrubEvent(null as unknown as Event))
+  assert.doesNotThrow(() => scrubBreadcrumb(undefined as unknown as Breadcrumb))
+})

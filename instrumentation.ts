@@ -1,3 +1,5 @@
+import * as Sentry from '@sentry/nextjs'
+
 export async function register() {
   const { assertProductionCronSecretConfigured } = await import('./lib/cron-secret-validation')
   assertProductionCronSecretConfigured()
@@ -17,4 +19,14 @@ export async function register() {
   if (nonAsciiStartupOptionCharacters(process.env.DATABASE_URL) !== '') {
     await establishStartupOptionByteSafety(process.env.DATABASE_URL)
   }
+
+  // Error tracking (GlitchTip). Each init is a no-op unless SENTRY_DSN is set.
+  if (process.env.NEXT_RUNTIME === 'nodejs') {
+    await import('./sentry.server.config')
+  }
+  if (process.env.NEXT_RUNTIME === 'edge') {
+    await import('./sentry.edge.config')
+  }
 }
+
+export const onRequestError = Sentry.captureRequestError

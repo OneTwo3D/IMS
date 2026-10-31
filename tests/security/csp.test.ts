@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { buildCsp, cspHeaderName, generateNonce, getCspMode } from '@/lib/security/csp'
+import { buildCsp, cspHeaderName, errorTrackingOriginFromDsn, generateNonce, getCspMode } from '@/lib/security/csp'
 
 test('getCspMode defaults to report-only and parses explicit modes', () => {
   assert.equal(getCspMode({}), 'report-only')
@@ -63,4 +63,26 @@ test('buildCsp gates Turnstile origin behind the enabled flag (frame-src + conne
   // still nonce-based scripts (strict-dynamic), no external script host
   assert.match(on, /script-src [^;]*'strict-dynamic'/)
   assert.doesNotMatch(on, /script-src [^;]*challenges\.cloudflare\.com/)
+})
+
+test('errorTrackingOriginFromDsn derives an https origin only', () => {
+  assert.equal(errorTrackingOriginFromDsn('https://pubkey@errors.example.test/4'), 'https://errors.example.test')
+  assert.equal(errorTrackingOriginFromDsn('https://pubkey@errors.example.test:8443/4'), 'https://errors.example.test:8443')
+  assert.equal(errorTrackingOriginFromDsn(undefined), null)
+  assert.equal(errorTrackingOriginFromDsn('  '), null)
+  assert.equal(errorTrackingOriginFromDsn('http://pubkey@errors.example.test/4'), null)
+  assert.equal(errorTrackingOriginFromDsn('not a url'), null)
+})
+
+test('buildCsp adds the error-tracking origin to connect-src only when provided', () => {
+  const baseline = buildCsp('n', false)
+  // Unset (or invalid DSN -> null): the policy is byte-for-byte unchanged
+  assert.equal(buildCsp('n', false, { errorTrackingOrigin: errorTrackingOriginFromDsn(undefined) }), baseline)
+  assert.equal(buildCsp('n', false, { errorTrackingOrigin: errorTrackingOriginFromDsn('http://k@h.test/1') }), baseline)
+
+  const on = buildCsp('n', false, { errorTrackingOrigin: errorTrackingOriginFromDsn('https://k@errors.example.test/4') })
+  assert.match(on, /connect-src [^;]*https:\/\/errors\.example\.test(;|\s|$)/)
+  // only connect-src gains it
+  assert.doesNotMatch(on, /script-src [^;]*errors\.example\.test/)
+  assert.doesNotMatch(on, /frame-src [^;]*errors\.example\.test/)
 })
