@@ -85,7 +85,7 @@ export function wooTaxPlanExitCode(run: WooTaxPlanRun): 0 | 1 | 2 {
     const result = run.applied
     if (result.outcome === 'REFUSED') return 2
     if (result.outcome === 'NOTHING_TO_DO') return 0
-    return result.failed !== null || result.unrecorded !== null || (result.stopped ?? null) !== null ? 2 : 0
+    return result.failed !== null || result.unrecorded !== null || (result.stopped ?? null) !== null || (result.keeperLost ?? null) !== null ? 2 : 0
   }
   const preview = run.preview
   if (preview === null || preview.plan === null) return 2
@@ -155,6 +155,7 @@ export function renderWooTaxPlanText(run: WooTaxPlanRun, hold: WooTaxHold): stri
     if (applied.applied.length > 0) lines.push(`Applied: ${applied.applied.length} change(s) sent and recorded.`)
     if (applied.failed !== null) lines.push(`STOPPED at ${applied.failed.key}: WooCommerce refused it (${applied.failed.error}). Earlier changes stay applied; preview again for the rest.`)
     if ((applied.stopped ?? null) !== null) lines.push(`STOPPED at ${applied.stopped!.key} BEFORE SENDING IT: ${applied.stopped!.reason}. Nothing from this change on was sent. Preview again.`)
+    if ((applied.keeperLost ?? null) !== null) lines.push(`STOPPED AFTER ${applied.keeperLost!.key}: ${applied.keeperLost!.reason}. The duplicate delete WAS sent and recorded; the IMS rate may now have NO counterpart in the store and nothing was recreated. Nothing later was sent. Preview again: the plan lists a CREATE for it.`)
     if (applied.unrecorded !== null) lines.push(`STOPPED at ${applied.unrecorded.key}: the change WAS SENT but could not be recorded (${applied.unrecorded.reason}). Preview again: a rate created this way shows as an UNMAPPED_TWIN blocker until it is mapped.`)
     if (applied.applied.length > 0) lines.push('Run npm run vat:diff to confirm the differences are gone.')
   }

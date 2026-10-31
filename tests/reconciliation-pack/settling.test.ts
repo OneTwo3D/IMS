@@ -8,7 +8,7 @@ import { defaultItems, newRunId } from '../../lib/reconciliation-pack/harness.ts
 import { publishPackReport } from '../../lib/reconciliation-pack/publish.ts'
 import { ReportInvalid, buildReport, type ItemInput, type ReportInput } from '../../lib/reconciliation-pack/report.ts'
 import { carriedStateFromChain, unusableCarriedState } from '../../lib/reconciliation-pack/settling.ts'
-import { readPackChain, type ChainResult } from '../../lib/reconciliation-pack/trend.ts'
+import { readPackChain, type ChainEntry, type ChainResult } from '../../lib/reconciliation-pack/trend.ts'
 import { runVendorItem } from '../../lib/reconciliation-pack/vendor-items.ts'
 import { parseAcceptanceFile } from '../../lib/ops/readiness-gate.ts'
 import { memoisedInvariant, runItems, type LivenessPort, type RunPlan } from '../../lib/reconciliation-pack/run.ts'
@@ -465,4 +465,43 @@ test('A CARRIED STAMP IS TAKEN ONLY IF THE PRIOR REPORTS BEAR IT OUT: the honest
   unusable(forge(three, 2, (e) => { e.settling = [e.settling[0]!, e.settling[0]!] }), 'listed twice in a report in between')
   // two copies of the identity in one report
   unusable(forge(two, 2, (e) => { e.settling = [e.settling[0]!, e.settling[0]!] }), 'listed twice')
+})
+
+// ---- a large history is verified in linear time ---------------------------------------------------------------------------------------
+
+// [mutation: the carried-state check scans a report's whole settling list for each carried difference / the index keeps only a line per identity so a duplicate goes unnoticed]
+test('LARGE HISTORY: 20,000 carried differences over three reports are verified in linear time (indexed once per report, not scanned per difference)', () => {
+  const COUNT = 20_000
+  const stamps = [S1, S2, S3]
+  const fakeReport = (sequence: number): ChainEntry => {
+    const failing = sequence === 3
+    const lines = Array.from({ length: COUNT }, (_, index) => ({
+      item: 'R9' as const,
+      bucket: failing ? ('onlyIms' as const) : ('unsettled' as const),
+      entry: { key: String(index + 1), ims: '10.00', vendor: null, delta: null, imsCurrency: 'GBP', vendorCurrency: null, imsPresent: true, vendorPresent: false, settling: { sequence: 1, first: S1, later: stamps.slice(1, sequence), count: sequence - 1 } },
+    }))
+    // another item's line under the same identity key must not count against R9 (the index is per item)
+    lines.push({ item: 'R1' as never, bucket: 'unsettled' as const, entry: { ...lines[0]!.entry, key: '1', settling: { sequence: 1, first: S1, later: [], count: 0 } } })
+    const counts = { unsettled: failing ? 0 : COUNT, onlyIms: failing ? COUNT : 0, onlyVendor: 0, bothDiffer: 0 }
+    const record = {
+      sequence, systemIdentifier: SID, phase: 'P1', streams: allBrackets(stamps[sequence - 1]!),
+      items: [{ id: 'R9', applicability: 'applicable', outcome: failing ? 'fail' : 'inconclusive', reasons: [failing ? 'DIFFERENCES' : 'UNSETTLED_PENDING'], counts }],
+    }
+    return { sequence, runId: `run-${sequence}`, sha256: 'x', record, settling: lines } as unknown as ChainEntry
+  }
+  const reports = [1, 2, 3].map(fakeReport)
+  const chain: ChainResult = { ok: true, reports, head: reports[2]!, unpublishedRuns: 0 }
+  const began = process.hrtime.bigint()
+  const state = carriedStateFromChain(chain, 'R9', WHERE)
+  const elapsedMs = Number(process.hrtime.bigint() - began) / 1e6
+  assert.equal(state.usable, true)
+  assert.equal(state.carried.size, COUNT)
+  assert.deepEqual(state.carried.get('20000')?.later, [S2, S3])
+  assert.ok(elapsedMs < 3000, `verifying ${COUNT} differences over 3 reports took ${elapsedMs.toFixed(0)} ms (quadratic scans took minutes)`)
+
+  // and a duplicate identity in an earlier report still voids the state (the index must not hide it)
+  const dup = fakeReport(2)
+  dup.settling.push({ ...dup.settling[0]! })
+  const dupReports = [reports[0]!, dup, reports[2]!]
+  assert.deepEqual(carriedStateFromChain({ ok: true, reports: dupReports, head: dupReports[2]!, unpublishedRuns: 0 }, 'R9', WHERE), unusableCarriedState())
 })

@@ -323,3 +323,36 @@ test('a duplicate DELETE: the keeper removed from the store after the plan means
     assert.ok(w.store.rates.has(w.woo.w1), 'the keeper is still there')
   }))
 })
+
+// [mutation: no re-read of the keeper after a duplicate DELETE / the re-read result ignored / the run carries on after a lost keeper / the run recreates the keeper]
+test('a duplicate DELETE whose keeper is removed by someone else in the gap: the run stops after the delete, reports keeperLost, sends nothing more and recreates nothing, and the next plan reports the IMS rate as uncovered', SKIP, async (t) => {
+  await buildWorld(t, modules, (w) => withDuplicate(w, async (w6) => {
+    const plan = (await w.m.writer.readWooTaxPlan(w.deps(LIVE))).plan!
+    assert.ok(plan.changes.length > 1, 'PRECONDITION: the plan has changes after the duplicate delete')
+    const base = w.deps(LIVE)
+    // The keeper check passes (the keeper is there when the writer reads it); the external writer removes it at the moment of the DELETE.
+    const racing = { ...base, port: { ...base.port!, remove: async (id: string) => { const sent = await base.port!.remove(id); if (id === w6) w.store.rates.delete(w.woo.w1); return sent } } }
+    const done = await w.m.writer.applyWooTaxPlan(racing, { confirm: plan.digest })
+    assert.equal(done.outcome, 'DONE')
+    if (done.outcome !== 'DONE') return
+    assert.equal(done.keeperLost?.key, `delete:${w6}`)
+    assert.equal(done.keeperLost?.keeperWooId, w.woo.w1)
+    assert.match(done.keeperLost?.reason ?? '', /gone from the store/)
+    assert.ok(done.applied.some((a) => a.key === `delete:${w6}`), 'the duplicate delete WAS sent and recorded')
+    assert.equal(done.failed, null)
+    assert.equal(done.stopped ?? null, null)
+    const sentAfter = w.store.calls.slice(w.store.calls.findIndex((c) => c.op === 'remove' && c.id === w6) + 1)
+    assert.deepEqual(sentAfter, [], 'nothing was sent after the delete')
+    assert.ok(!w.store.calls.some((c) => c.op === 'create'), 'the keeper was not recreated')
+    // The next plan reports it: the IMS rate has no counterpart now, so the plan carries a CREATE for it that names the vanished store ids.
+    const next = (await w.m.writer.readWooTaxPlan(w.deps(LIVE))).plan!
+    const create = next.changes.find((c) => c.kind === 'CREATE' && c.imsRateId === w.ids.gb)
+    assert.ok(create && create.kind === 'CREATE', 'the next plan creates the lost counterpart')
+    assert.ok(create.staleWooIds.includes(w.woo.w1), 'and names the vanished keeper')
+  }))
+  // An intact keeper after the delete: nothing reported.
+  await buildWorld(t, modules, (w) => withDuplicate(w, async (w6) => {
+    const done = await applyDuplicate(w, w6, () => undefined)
+    assert.equal(done.keeperLost ?? null, null)
+  }))
+})

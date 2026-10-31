@@ -22,12 +22,17 @@ import { config } from 'dotenv'
 const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const TAG = `RCPKNW${process.pid}`
 
-async function withClient<T>(fn: (client: import('pg').Client) => Promise<T>): Promise<T> {
+async function connectClient(): Promise<import('pg').Client> {
   config({ path: '.env.local', quiet: true })
   config({ quiet: true })
   const { default: pg } = await import('pg')
   const client = new pg.Client({ connectionString: process.env.DATABASE_URL })
   await client.connect()
+  return client
+}
+
+async function withClient<T>(fn: (client: import('pg').Client) => Promise<T>): Promise<T> {
+  const client = await connectClient()
   try { return await fn(client) } finally { await client.end() }
 }
 
@@ -52,8 +57,11 @@ async function census(): Promise<Census> {
 // connections, so a hold must be COMMITTED. A committed hold that nothing can undo strands foreign rows if the test fails or the process is killed,
 // so every hold is SELF-DESCRIBING AND DURABLE: in the SAME transaction as the rename or delete, the row's full original goes into the test-owned
 // table `_test_held_rows` (run_id, kind, table_name, row_id, payload jsonb, held_at). There is never a committed change without its recovery record.
-// Restore reads that table, not a value held in memory, and every hold first sweeps the entries of any EARLIER run (run_id other than its own), so
-// a killed run heals on the next. The table is created only here, only after scratch-database-setup has refused a non-scratch database, so it only
+// Restore reads that table, not a value held in memory, and every hold first sweeps the entries of any EARLIER run (run_id other than its own) whose
+// owner is DEAD, so a killed run heals on the next. A live run is never swept: each hold takes a LEASE, a session-level advisory lock on a connection
+// of its own, before it records anything and keeps it until its restore has run; a sweep restores only the runs whose lease it can take (the owner's
+// process, and with it the connection and the lock, is gone). Every restore must actually put its row back (exactly one row inserted or updated) or the
+// sweep fails with the entry still recorded, rather than deleting the only copy of a row it did not restore. The table is created only here, only after scratch-database-setup has refused a non-scratch database, so it only
 // ever exists in scratch/CI databases.
 type Held = string
 const NOTHING_HELD: Held = ''
@@ -61,20 +69,47 @@ let holdCounter = 0
 const HELD_DDL = `CREATE TABLE IF NOT EXISTS _test_held_rows (run_id text NOT NULL, kind text NOT NULL, table_name text NOT NULL, row_id text NOT NULL, payload jsonb NOT NULL, held_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (run_id, table_name, row_id))`
 
 type Q = import('pg').Client
-/** Put back every entry matching `where` (a run id filter), delete the entries, all in one transaction; returns how many entries were restored. */
-async function restoreHeld(client: Q, runFilter: { run: string } | { notRun: string }): Promise<number> {
-  const [clause, value] = 'run' in runFilter ? ['run_id = $1', runFilter.run] : ['run_id <> $1', runFilter.notRun]
+
+// THE LEASE. One connection per live hold, holding a session-level advisory lock keyed by the run id until the run's restore is done.
+const leases = new Map<string, Q>()
+const leaseKey = (runId: string) => `rcpk-hold:${runId}`
+async function openLease(runId: string): Promise<void> {
+  const client = await connectClient()
+  await client.query('SELECT pg_advisory_lock(hashtextextended($1, 0))', [leaseKey(runId)])
+  leases.set(runId, client)
+}
+/** Release a lease (what the end of the owning process does by itself). */
+async function closeLease(runId: string): Promise<void> {
+  const client = leases.get(runId)
+  if (client === undefined) return
+  leases.delete(runId)
+  await client.end()
+}
+/** True when nobody holds the run's lease, i.e. its owner is gone or finished. */
+async function leaseIsFree(runId: string): Promise<boolean> {
+  return withClient(async (client) => {
+    const got = (await client.query('SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS got', [leaseKey(runId)])).rows[0].got as boolean
+    if (got) await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [leaseKey(runId)])
+    return got
+  })
+}
+
+/** Put back every entry of the given runs, delete the entries, all in one transaction; returns how many entries were restored. Each restore must change exactly one row. */
+async function restoreHeld(client: Q, runFilter: { run: string } | { runs: string[] }): Promise<number> {
+  const runs = 'run' in runFilter ? [runFilter.run] : runFilter.runs
   await client.query('BEGIN')
   try {
     await client.query(HELD_DDL)
-    const entries = (await client.query(`SELECT run_id, kind, table_name, row_id, payload FROM _test_held_rows WHERE ${clause} ORDER BY held_at, row_id FOR UPDATE`, [value])).rows as Array<{ run_id: string; kind: string; table_name: string; row_id: string; payload: Record<string, unknown> }>
+    const entries = (await client.query(`SELECT run_id, kind, table_name, row_id, payload FROM _test_held_rows WHERE run_id = ANY($1) ORDER BY held_at, row_id FOR UPDATE`, [runs])).rows as Array<{ run_id: string; kind: string; table_name: string; row_id: string; payload: Record<string, unknown> }>
     for (const e of entries) {
-      if (e.kind === 'token') await client.query(`UPDATE accounting_tokens SET connector = $2 WHERE id = $1 AND connector = 'held-' || id`, [e.row_id, e.payload.connector])
-      else if (e.kind === 'sync_row') await client.query(`UPDATE accounting_sync_logs SET connector = $2 WHERE id = $1 AND connector = 'held-xero'`, [e.row_id, e.payload.connector])
-      else if (e.kind === 'first_load') await client.query(`INSERT INTO first_load_apply_runs SELECT * FROM jsonb_populate_record(NULL::first_load_apply_runs, $1::jsonb) ON CONFLICT DO NOTHING`, [JSON.stringify(e.payload)])
+      let result: { rowCount: number | null }
+      if (e.kind === 'token') result = await client.query(`UPDATE accounting_tokens SET connector = $2 WHERE id = $1 AND connector = 'held-' || id`, [e.row_id, e.payload.connector])
+      else if (e.kind === 'sync_row') result = await client.query(`UPDATE accounting_sync_logs SET connector = $2 WHERE id = $1 AND connector = 'held-xero'`, [e.row_id, e.payload.connector])
+      else if (e.kind === 'first_load') result = await client.query(`INSERT INTO first_load_apply_runs SELECT * FROM jsonb_populate_record(NULL::first_load_apply_runs, $1::jsonb) ON CONFLICT DO NOTHING`, [JSON.stringify(e.payload)])
       else throw new Error(`unknown held kind ${e.kind}`)
+      if (result.rowCount !== 1) throw new Error(`restoring held ${e.kind} ${e.row_id} touched ${result.rowCount} rows (expected 1): the entry is kept`)
     }
-    await client.query(`DELETE FROM _test_held_rows WHERE ${clause}`, [value])
+    await client.query(`DELETE FROM _test_held_rows WHERE run_id = ANY($1)`, [runs])
     await client.query('COMMIT')
     return entries.length
   } catch (error) {
@@ -83,9 +118,21 @@ async function restoreHeld(client: Q, runFilter: { run: string } | { notRun: str
   }
 }
 
-/** Heal whatever an earlier (failed or killed) run left held. Called at the start of every hold. */
+/** Heal whatever an earlier (failed or killed) run left held, for the runs whose lease is free (their owner is gone). Called at the start of every hold. */
 async function sweepEarlierHolds(except: string): Promise<number> {
-  return withClient((client) => restoreHeld(client, { notRun: except }))
+  return withClient(async (client) => {
+    await client.query(HELD_DDL)
+    const owners = (await client.query(`SELECT DISTINCT run_id FROM _test_held_rows WHERE run_id <> $1 ORDER BY 1`, [except])).rows.map((r) => r.run_id as string)
+    const free: string[] = []
+    try {
+      for (const owner of owners) {
+        if ((await client.query('SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS got', [leaseKey(owner)])).rows[0].got as boolean) free.push(owner)
+      }
+      return await restoreHeld(client, { runs: free })
+    } finally {
+      for (const owner of free) await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [leaseKey(owner)])
+    }
+  })
 }
 
 /**
@@ -94,50 +141,60 @@ async function sweepEarlierHolds(except: string): Promise<number> {
  */
 async function holdForeignEstate(injectFailureAfter?: number): Promise<Held> {
   const runId = `${process.pid}-${++holdCounter}-${Date.now()}`
-  await sweepEarlierHolds(runId)
-  await withClient(async (client) => {
-    await client.query('BEGIN')
-    try {
-      await client.query(HELD_DDL)
-      let held = 0
-      const step = () => { held += 1; if (injectFailureAfter !== undefined && held >= injectFailureAfter) throw new Error('injected failure after hold') }
-      const record = (kind: string, table: string, id: string, payload: unknown) => client.query(`INSERT INTO _test_held_rows (run_id, kind, table_name, row_id, payload) VALUES ($1, $2, $3, $4, $5::jsonb)`, [runId, kind, table, id, JSON.stringify(payload)])
-      for (const row of (await client.query(`SELECT id, to_jsonb(t) AS j FROM accounting_tokens t WHERE connector = 'xero' ORDER BY id FOR UPDATE`)).rows as Array<{ id: string; j: unknown }>) {
-        await record('token', 'accounting_tokens', row.id, row.j)
-        await client.query(`UPDATE accounting_tokens SET connector = 'held-' || id WHERE id = $1 AND connector = 'xero'`, [row.id])
-        step()
+  await openLease(runId) // BEFORE the sweep and before any entry exists: an entry of this run is never visible without its lease
+  try {
+    await sweepEarlierHolds(runId)
+    await withClient(async (client) => {
+      await client.query('BEGIN')
+      try {
+        await client.query(HELD_DDL)
+        let held = 0
+        const step = () => { held += 1; if (injectFailureAfter !== undefined && held >= injectFailureAfter) throw new Error('injected failure after hold') }
+        const record = (kind: string, table: string, id: string, payload: unknown) => client.query(`INSERT INTO _test_held_rows (run_id, kind, table_name, row_id, payload) VALUES ($1, $2, $3, $4, $5::jsonb)`, [runId, kind, table, id, JSON.stringify(payload)])
+        for (const row of (await client.query(`SELECT id, to_jsonb(t) AS j FROM accounting_tokens t WHERE connector = 'xero' ORDER BY id FOR UPDATE`)).rows as Array<{ id: string; j: unknown }>) {
+          await record('token', 'accounting_tokens', row.id, row.j)
+          await client.query(`UPDATE accounting_tokens SET connector = 'held-' || id WHERE id = $1 AND connector = 'xero'`, [row.id])
+          step()
+        }
+        for (const row of (await client.query(`SELECT id, to_jsonb(t) AS j FROM accounting_sync_logs t WHERE connector = 'xero' AND (status::text IN ('SYNCED', 'PROCESSING') OR "externalTransactionId" IS NOT NULL) ORDER BY id FOR UPDATE`)).rows as Array<{ id: string; j: unknown }>) {
+          await record('sync_row', 'accounting_sync_logs', row.id, row.j)
+          await client.query(`UPDATE accounting_sync_logs SET connector = 'held-xero' WHERE id = $1 AND connector = 'xero'`, [row.id])
+          step()
+        }
+        for (const row of (await client.query(`SELECT id, to_jsonb(t) AS j FROM first_load_apply_runs t ORDER BY id FOR UPDATE`)).rows as Array<{ id: string; j: unknown }>) {
+          await record('first_load', 'first_load_apply_runs', row.id, row.j)
+          await client.query(`DELETE FROM first_load_apply_runs WHERE id = $1`, [row.id])
+          step()
+        }
+        await client.query('COMMIT')
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
       }
-      for (const row of (await client.query(`SELECT id, to_jsonb(t) AS j FROM accounting_sync_logs t WHERE connector = 'xero' AND (status::text IN ('SYNCED', 'PROCESSING') OR "externalTransactionId" IS NOT NULL) ORDER BY id FOR UPDATE`)).rows as Array<{ id: string; j: unknown }>) {
-        await record('sync_row', 'accounting_sync_logs', row.id, row.j)
-        await client.query(`UPDATE accounting_sync_logs SET connector = 'held-xero' WHERE id = $1 AND connector = 'xero'`, [row.id])
-        step()
-      }
-      for (const row of (await client.query(`SELECT id, to_jsonb(t) AS j FROM first_load_apply_runs t ORDER BY id FOR UPDATE`)).rows as Array<{ id: string; j: unknown }>) {
-        await record('first_load', 'first_load_apply_runs', row.id, row.j)
-        await client.query(`DELETE FROM first_load_apply_runs WHERE id = $1`, [row.id])
-        step()
-      }
-      await client.query('COMMIT')
-    } catch (error) {
-      await client.query('ROLLBACK')
-      throw error
-    }
-  })
-  const visible = (await withClient((c) => c.query(`SELECT (SELECT count(*) FROM accounting_tokens WHERE connector = 'xero')::int AS t, (SELECT count(*) FROM first_load_apply_runs)::int AS f`))).rows[0]
-  assert.deepEqual([visible.t, visible.f], [0, 0], 'precondition: no foreign Xero token or first-load record is visible to the run')
-  return runId
+    })
+    const visible = (await withClient((c) => c.query(`SELECT (SELECT count(*) FROM accounting_tokens WHERE connector = 'xero')::int AS t, (SELECT count(*) FROM first_load_apply_runs)::int AS f`))).rows[0]
+    assert.deepEqual([visible.t, visible.f], [0, 0], 'precondition: no foreign Xero token or first-load record is visible to the run')
+    return runId
+  } catch (error) {
+    await closeLease(runId)
+    throw error
+  }
 }
 
 /** Put this run's holds back from the table (never from memory) and assert every one was. */
 async function restoreForeignEstate(runId: Held): Promise<void> {
   if (runId === NOTHING_HELD) return
-  const { restored, expected } = await withClient(async (client) => {
-    await client.query(HELD_DDL)
-    const expected = (await client.query(`SELECT count(*)::int AS n FROM _test_held_rows WHERE run_id = $1`, [runId])).rows[0].n as number
-    return { restored: await restoreHeld(client, { run: runId }), expected }
-  })
-  assert.equal(restored, expected, 'every foreign Xero token, first-load record and write-shaped sync row was put back')
-  assert.equal((await withClient((c) => c.query(`SELECT count(*)::int AS n FROM _test_held_rows WHERE run_id = $1`, [runId]))).rows[0].n, 0, 'no entry of this run is left')
+  try {
+    const { restored, expected } = await withClient(async (client) => {
+      await client.query(HELD_DDL)
+      const expected = (await client.query(`SELECT count(*)::int AS n FROM _test_held_rows WHERE run_id = $1`, [runId])).rows[0].n as number
+      return { restored: await restoreHeld(client, { run: runId }), expected }
+    })
+    assert.equal(restored, expected, 'every foreign Xero token, first-load record and write-shaped sync row was put back')
+    assert.equal((await withClient((c) => c.query(`SELECT count(*)::int AS n FROM _test_held_rows WHERE run_id = $1`, [runId]))).rows[0].n, 0, 'no entry of this run is left')
+  } finally {
+    await closeLease(runId)
+  }
 }
 
 /** A digest of every row a hold touches, as stored, for before/after comparison in the arms below. */
@@ -834,6 +891,74 @@ test('[reconciliation pack] R16 with --vendor-reads-only: the stored (never refr
 const MTAG = `RCMS${process.pid}`
 const MINTSOFT_SETTINGS = ['mintsoft_auth_mode', 'mintsoft_static_api_key', 'mintsoft_client_id']
 
+type MintsoftHeld = { connections: string[]; bindings: string[]; links: string[] }
+type SqlFn = (text: string, values?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount: number | null }>
+const MINTSOFT_TABLES = [['connections', 'wms_connections'], ['bindings', 'external_wms_bindings'], ['links', 'wms_product_links']] as const
+/**
+ * Hold every Mintsoft connection, binding and product link aside (renamed, never deleted, so no cascade fires), in three COMMITTED statements. The ids
+ * go into `held` right after EACH update, so a failure in the second or third leaves the first's ids recorded and the restore puts them back.
+ * `injectFailureAfter` (tests of this helper only) throws after that many updates.
+ */
+async function holdMintsoftRows(sql: SqlFn, held: MintsoftHeld, injectFailureAfter?: number): Promise<void> {
+  let done = 0
+  for (const [field, table] of MINTSOFT_TABLES) {
+    held[field] = (await sql(`UPDATE ${table} SET connector = 'held-' || connector WHERE connector = 'mintsoft' RETURNING id`)).rows.map((r) => r.id as string)
+    done += 1
+    if (injectFailureAfter !== undefined && done >= injectFailureAfter) throw new Error('injected failure after Mintsoft hold')
+  }
+}
+/** Put the held rows back and assert each table took back exactly the rows recorded for it. */
+async function restoreMintsoftRows(sql: SqlFn, held: MintsoftHeld): Promise<void> {
+  const restored = {
+    connections: (await sql(`UPDATE wms_connections SET connector = 'mintsoft' WHERE id = ANY($1) AND connector = 'held-mintsoft'`, [held.connections])).rowCount,
+    bindings: (await sql(`UPDATE external_wms_bindings SET connector = 'mintsoft' WHERE id = ANY($1) AND connector = 'held-mintsoft'`, [held.bindings])).rowCount,
+    links: (await sql(`UPDATE wms_product_links SET connector = 'mintsoft' WHERE id = ANY($1) AND connector = 'held-mintsoft'`, [held.links])).rowCount,
+  }
+  assert.deepEqual(restored, { connections: held.connections.length, bindings: held.bindings.length, links: held.links.length }, 'every held Mintsoft row was restored')
+}
+
+// [mutation: the ids recorded only after all three updates / the restore not asserting its row counts]
+test('[reconciliation pack] the Mintsoft hold records ids after EACH update: a failure in the second update still restores the first, and the restore is counted', { skip: !RUN }, async () => {
+  const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
+  const tag = `RCMH${process.pid}`
+  const outer: MintsoftHeld = { connections: [], bindings: [], links: [] }
+  try {
+    await holdMintsoftRows(sql, outer) // foreign rows other files left: out of the way, put back at the end
+    await sql(`INSERT INTO wms_connections (id, connector, label, "baseUrl", "updatedAt") VALUES ($1, 'mintsoft', $2, 'http://127.0.0.1:1', now())`, [`${tag}-c`, tag])
+    await sql(`INSERT INTO warehouses (id, code, name, "updatedAt") VALUES ($1, $2, 'x', now())`, [`${tag}-w`, `${tag}W`])
+    await sql(`INSERT INTO external_wms_bindings (id, "connectionId", "warehouseId", connector, "externalWarehouseId", "stockSyncMode", "updatedAt") VALUES ($1, $2, $3, 'mintsoft', '5', 'NOTIFICATION_ONLY', now())`, [`${tag}-b`, `${tag}-c`, `${tag}-w`])
+    await sql(`INSERT INTO products (id, sku, name, "updatedAt") VALUES ($1, $2, 'x', now())`, [`${tag}-p`, `${tag}-sku`])
+    await sql(`INSERT INTO wms_product_links (id, "productId", connector, "externalProductId", "updatedAt") VALUES ($1, $2, 'mintsoft', '9', now())`, [`${tag}-l`, `${tag}-p`])
+    const connectorOf = async (table: string, id: string) => (await sql(`SELECT connector FROM ${table} WHERE id = $1`, [id])).rows[0]!.connector as string
+
+    const partial: MintsoftHeld = { connections: [], bindings: [], links: [] }
+    await assert.rejects(holdMintsoftRows(sql, partial, 2), /injected failure after Mintsoft hold/)
+    assert.deepEqual(partial, { connections: [`${tag}-c`], bindings: [`${tag}-b`], links: [] }, 'the two committed updates are recorded, the third never ran')
+    assert.equal(await connectorOf('wms_connections', `${tag}-c`), 'held-mintsoft')
+    assert.equal(await connectorOf('external_wms_bindings', `${tag}-b`), 'held-mintsoft')
+    assert.equal(await connectorOf('wms_product_links', `${tag}-l`), 'mintsoft', 'the third table was not reached')
+    await restoreMintsoftRows(sql, partial)
+    assert.equal(await connectorOf('wms_connections', `${tag}-c`), 'mintsoft')
+    assert.equal(await connectorOf('external_wms_bindings', `${tag}-b`), 'mintsoft')
+
+    // a failure in the FIRST update records nothing and a restore of that is a no-op
+    const first: MintsoftHeld = { connections: [], bindings: [], links: [] }
+    await assert.rejects(holdMintsoftRows(sql, first, 1), /injected failure/)
+    assert.deepEqual(first, { connections: [`${tag}-c`], bindings: [], links: [] })
+    await restoreMintsoftRows(sql, first)
+
+    // a restore that cannot put a recorded row back is reported, not skipped
+    await assert.rejects(restoreMintsoftRows(sql, { connections: [`${tag}-c`], bindings: [], links: [] }), /every held Mintsoft row was restored/)
+  } finally {
+    await sql(`DELETE FROM wms_product_links WHERE id LIKE '${tag}%'`)
+    await sql(`DELETE FROM products WHERE id LIKE '${tag}%'`)
+    await sql(`DELETE FROM external_wms_bindings WHERE id LIKE '${tag}%'`)
+    await sql(`DELETE FROM warehouses WHERE id LIKE '${tag}%'`)
+    await sql(`DELETE FROM wms_connections WHERE id LIKE '${tag}%'`)
+    await restoreMintsoftRows(sql, outer)
+  }
+})
+
 test('[reconciliation pack] R1 with --vendor-reads-only: the stored fixed key, GET requests to the loopback Mintsoft only (never /api/Auth), the IMS stock compared, a refused auth mode makes no request, and not one row is written', { skip: !RUN }, async () => {
   const http = await import('node:http')
   const { runPackCli } = await import('../../scripts/reconciliation-pack.ts')
@@ -873,17 +998,12 @@ test('[reconciliation pack] R1 with --vendor-reads-only: the stored fixed key, G
   const previousMode = process.env.E2E_TEST_MODE
   const previousKeys = { SETTINGS_ENCRYPTION_KEY: process.env.SETTINGS_ENCRYPTION_KEY, ENCRYPTION_KEY: process.env.ENCRYPTION_KEY }
   let stockStamp: string | null = null
-  let heldRows: { connections: string[]; bindings: string[]; links: string[] } | null = null
+  const heldRows: MintsoftHeld = { connections: [], bindings: [], links: [] }
   try {
     // R1 reads EVERY Mintsoft binding and link, and the tier shares one database across files, so rows other files left behind would be part
     // of this estate. Hold them aside for the duration (their connector name is changed, nothing is deleted, so no cascade can fire) and put
     // them back exactly in the finally block. This is setup and teardown: the no-write census below is taken around the COMMAND only.
-    const held = {
-      connections: (await sql(`UPDATE wms_connections SET connector = 'held-' || connector WHERE connector = 'mintsoft' RETURNING id`)).rows.map((r) => r.id as string),
-      bindings: (await sql(`UPDATE external_wms_bindings SET connector = 'held-' || connector WHERE connector = 'mintsoft' RETURNING id`)).rows.map((r) => r.id as string),
-      links: (await sql(`UPDATE wms_product_links SET connector = 'held-' || connector WHERE connector = 'mintsoft' RETURNING id`)).rows.map((r) => r.id as string),
-    }
-    heldRows = held
+    await holdMintsoftRows(sql, heldRows)
     const remaining = await sql(`SELECT (SELECT count(*) FROM wms_connections WHERE connector = 'mintsoft')::int AS connections, (SELECT count(*) FROM external_wms_bindings WHERE connector = 'mintsoft')::int AS bindings, (SELECT count(*) FROM wms_product_links WHERE connector = 'mintsoft')::int AS links`)
     assert.deepEqual([remaining.rows[0].connections, remaining.rows[0].bindings, remaining.rows[0].links], [0, 0, 0], 'precondition: no foreign Mintsoft row is visible to the run')
     process.env.E2E_TEST_MODE = '1'
@@ -982,11 +1102,7 @@ test('[reconciliation pack] R1 with --vendor-reads-only: the stored fixed key, G
     await sql(`DELETE FROM external_wms_bindings WHERE id LIKE '${MTAG}%'`)
     await sql(`DELETE FROM warehouses WHERE id LIKE '${MTAG}%'`)
     await sql(`DELETE FROM wms_connections WHERE id LIKE '${MTAG}%'`)
-    if (heldRows !== null) {
-      await sql(`UPDATE wms_connections SET connector = 'mintsoft' WHERE id = ANY($1) AND connector = 'held-mintsoft'`, [heldRows.connections])
-      await sql(`UPDATE external_wms_bindings SET connector = 'mintsoft' WHERE id = ANY($1) AND connector = 'held-mintsoft'`, [heldRows.bindings])
-      await sql(`UPDATE wms_product_links SET connector = 'mintsoft' WHERE id = ANY($1) AND connector = 'held-mintsoft'`, [heldRows.links])
-    }
+    await restoreMintsoftRows(sql, heldRows)
     await sql(`DELETE FROM settings WHERE key = ANY($1)`, [MINTSOFT_SETTINGS])
     for (const prior of saved) await setting(prior.key, prior.value)
     rmSync(dir, { recursive: true, force: true })
@@ -996,7 +1112,46 @@ test('[reconciliation pack] R1 with --vendor-reads-only: the stored fixed key, G
 // ---- R2, R5 and R14 end to end: a real export directory, the real IMS reads, doubles for the storefront and Mintsoft (no network) -------
 
 const QTAG = `RCQX${process.pid}`
-const QD = '2026-03-07'
+const QD0 = '2026-03-07' // where the search for this test's cycle date starts
+const QF = `RCQF${process.pid}` // this test's stand-in for another file's leftovers
+
+const addDays = (date: string, days: number) => new Date(Date.parse(`${date}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10)
+/**
+ * The first date from `from` on that no snapshot run and no snapshot row uses. The test takes THAT date as its cycle date, so it never has to move
+ * a foreign snapshot out of the way (a fixed hold date can itself be taken, and the move is a committed write to rows that are not the test's).
+ */
+async function unusedSnapshotDate(sql: SqlFn, from: string): Promise<string> {
+  for (let day = 0; day < 3650; day += 1) {
+    const date = addDays(from, day)
+    const used = (await sql(`SELECT (SELECT count(*) FROM inventory_snapshot_runs WHERE "snapshotDate" = $1)::int + (SELECT count(*) FROM inventory_snapshots WHERE "snapshotDate" = $1)::int AS n`, [date])).rows[0]!.n as number
+    if (used === 0) return date
+  }
+  throw new Error('no unused snapshot date')
+}
+/** A digest of every warehouse, snapshot run and snapshot row that is not this test's own (`tag`), as stored. */
+async function foreignEstateDigest(sql: SqlFn, tag: string): Promise<string> {
+  return (await sql(`SELECT md5(coalesce(string_agg(x, '|' ORDER BY x), '')) AS d FROM (
+    SELECT 'w:' || to_jsonb(t)::text AS x FROM warehouses t WHERE id NOT LIKE $1
+    UNION ALL SELECT 'r:' || to_jsonb(t)::text FROM inventory_snapshot_runs t WHERE id NOT LIKE $1
+    UNION ALL SELECT 's:' || to_jsonb(t)::text FROM inventory_snapshots t WHERE id NOT LIKE $1) q`, [`${tag}%`])).rows[0]!.d as string
+}
+
+// [mutation: the search ignores the dates in use and always answers the start date]
+test('[reconciliation pack] the cycle date of the Qoblex test is an UNUSED date: an occupied date is skipped, and nothing foreign is moved', { skip: !RUN }, async () => {
+  const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
+  const tag = `RCQD${process.pid}`
+  const start = '2031-05-01'
+  try {
+    assert.equal(await unusedSnapshotDate(sql, start), start, 'a free date is used as it is')
+    await sql(`INSERT INTO inventory_snapshot_runs (id, "snapshotDate", "stockLevelCount", "snapshotCount", "updatedAt") VALUES ($1, $2, 0, 0, now()), ($3, $4, 0, 0, now())`, [`${tag}-r1`, start, `${tag}-r2`, addDays(start, 1)])
+    const before = await sql(`SELECT id, "snapshotDate"::text AS d FROM inventory_snapshot_runs WHERE id LIKE $1 ORDER BY id`, [`${tag}%`])
+    assert.equal(await unusedSnapshotDate(sql, start), addDays(start, 2), 'occupied dates are skipped')
+    assert.deepEqual((await sql(`SELECT id, "snapshotDate"::text AS d FROM inventory_snapshot_runs WHERE id LIKE $1 ORDER BY id`, [`${tag}%`])).rows, before.rows, 'the occupant was not moved')
+    assert.equal(addDays('2026-02-28', 1), '2026-03-01')
+  } finally {
+    await sql(`DELETE FROM inventory_snapshot_runs WHERE id LIKE '${tag}%'`)
+  }
+})
 
 test('[reconciliation pack] R2, R5 and R14 with --qoblex-export: the export compared with the real snapshot, nothing read without the flag, no connection but the database, and not one row written', { skip: !RUN }, async () => {
   const { createHash } = await import('node:crypto')
@@ -1013,6 +1168,8 @@ test('[reconciliation pack] R2, R5 and R14 with --qoblex-export: the export comp
   chmodSync(exportDir, 0o700)
   const skus = [`${QTAG}-A`, `${QTAG}-B`]
   const codes = [`${QTAG}W1`, `${QTAG}W2`]
+  let QD = QD0 // the cycle date, chosen below as one nothing uses
+  let locationCodes: string[] = [...codes] // every eligible warehouse is a declared location; set below
   const sha = (text: string) => createHash('sha256').update(text).digest('hex')
   const writeExport = (qtyA: string) => {
     const stock = stockCsv([{ sku: skus[0]!, location: codes[0]!, qty: qtyA, unitCost: '2.5' }, { sku: skus[1]!, location: codes[1]!, qty: '4', unitCost: '10' }])
@@ -1020,27 +1177,34 @@ test('[reconciliation pack] R2, R5 and R14 with --qoblex-export: the export comp
     writeFileSync(`${exportDir}/stock.csv`, stock, { mode: 0o644 })
     writeFileSync(`${exportDir}/products.csv`, products, { mode: 0o644 })
     writeFileSync(`${exportDir}/manifest.json`, JSON.stringify({
-      formatVersion: 1, exportedAt: '2026-03-08T08:00:00Z', asOf: QD, baseCurrency: 'GBP',
-      locations: codes.map((code) => ({ code, company: 'ACME', threePl: false })),
+      formatVersion: 1, exportedAt: `${addDays(QD, 1)}T08:00:00Z`, asOf: QD, baseCurrency: 'GBP',
+      locations: locationCodes.map((code) => ({ code, company: 'ACME', threePl: false })),
       stock: { file: 'stock.csv', sha256: sha(stock) }, products: { file: 'products.csv', sha256: sha(products) },
     }), { mode: 0o644 })
   }
   const targets: string[] = []
   const original = net.Socket.prototype.connect
   // THE TIER SHARES ONE DATABASE: warehouses, products and snapshot rows left by other files are visible to a run, and the population is IMS's.
-  // Foreign rows are held aside by RECORDED ids with reversible updates (no delete) and restored exactly in finally; the ids are recorded after
-  // EACH update so a partial setup is restored too. Foreign PRODUCTS cannot be held aside (R14 reads every product), so the export, the storefront
-  // and the warehouse-system list carry them too.
-  const held = { warehouses: [] as string[], runs: [] as string[], snapshots: [] as string[] }
+  // Nothing foreign is written: the cycle date is one nothing uses, and foreign warehouses and products (which the pack reads whole) are carried by
+  // the export, the storefront and the warehouse-system list. The foreign estate is digested before and after to prove it.
+  let foreignBefore = ''
   let catalogue: string[] = [...skus]
   try {
-    held.warehouses = (await sql(`UPDATE warehouses SET active = false WHERE active = true RETURNING id`)).rows.map((r: { id: string }) => r.id)
-    held.runs = (await sql(`UPDATE inventory_snapshot_runs SET "snapshotDate" = '2020-01-01' WHERE "snapshotDate" = $1 RETURNING id`, [QD])).rows.map((r: { id: string }) => r.id)
-    held.snapshots = (await sql(`UPDATE inventory_snapshots SET "snapshotDate" = '2020-01-01' WHERE "snapshotDate" = $1 RETURNING id`, [QD])).rows.map((r: { id: string }) => r.id)
-    const visible = await sql(`SELECT (SELECT count(*) FROM warehouses WHERE active)::int AS w, (SELECT count(*) FROM inventory_snapshots WHERE "snapshotDate" = $1)::int AS s, (SELECT count(*) FROM inventory_snapshot_runs WHERE "snapshotDate" = $1)::int AS r`, [QD])
-    assert.deepEqual([visible.rows[0].w, visible.rows[0].s, visible.rows[0].r], [0, 0, 0], 'precondition: no foreign warehouse or snapshot row is visible to the run')
+    // ISOLATION WITHOUT WRITING TO ROWS THAT ARE NOT THIS TEST'S: the cycle date is one no snapshot run or snapshot uses (a foreign run on the start date
+    // makes the search move on), and the warehouses other files left are not deactivated: every eligible one is DECLARED in the export, as the pack
+    // requires, and (like the foreign products) simply has no stock.
+    // FOREIGN FIXTURES (another file's leftovers, as far as the pack can tell): an ACTIVE unbound warehouse with no stock and a snapshot run on the start date.
+    await sql(`INSERT INTO warehouses (id, code, name, "updatedAt") VALUES ($1, $2, 'x', now())`, [`${QF}-w`, `${QF}W`])
+    await sql(`INSERT INTO inventory_snapshot_runs (id, "snapshotDate", "stockLevelCount", "snapshotCount", "updatedAt") VALUES ($1, $2, 0, 0, now())`, [`${QF}-r`, QD0])
+    foreignBefore = await foreignEstateDigest(sql, QTAG)
+    QD = await unusedSnapshotDate(sql, QD0)
+    assert.notEqual(QD, QD0, 'the start date is taken by the foreign run: the search moved on')
+    const visible = await sql(`SELECT (SELECT count(*) FROM inventory_snapshots WHERE "snapshotDate" = $1)::int AS s, (SELECT count(*) FROM inventory_snapshot_runs WHERE "snapshotDate" = $1)::int AS r`, [QD])
+    assert.deepEqual([visible.rows[0].s, visible.rows[0].r], [0, 0], 'precondition: no foreign snapshot row exists on the cycle date')
     await sql(`INSERT INTO products (id, sku, name, "updatedAt") VALUES ($1, $2, 'x', now()), ($3, $4, 'x', now())`, [`${QTAG}-p1`, skus[0], `${QTAG}-p2`, skus[1]])
     await sql(`INSERT INTO warehouses (id, code, name, "updatedAt") VALUES ($1, $2, 'x', now()), ($3, $4, 'x', now())`, [`${QTAG}-w1`, codes[0], `${QTAG}-w2`, codes[1]])
+    locationCodes = (await sql(`SELECT code FROM warehouses w WHERE active AND NOT EXISTS (SELECT 1 FROM external_wms_bindings b WHERE b."warehouseId" = w.id) ORDER BY code`)).rows.map((r: { code: string }) => r.code)
+    assert.ok(locationCodes.includes(`${QF}W`) && codes.every((code) => locationCodes.includes(code)), 'the foreign warehouse, which holds no stock, is declared too (and stays active)')
     await sql(`INSERT INTO inventory_snapshot_runs (id, "snapshotDate", "stockLevelCount", "snapshotCount", "updatedAt") VALUES ($1, $2, 2, 2, now())`, [`${QTAG}-run`, QD])
     await sql(`INSERT INTO inventory_snapshots (id, "snapshotDate", "productId", "warehouseId", qty, "valueBase", "unitCostBase") VALUES ($1, $2, $3, $4, 10, 25, 2.5), ($5, $2, $6, $7, 4, 40, 10)`, [`${QTAG}-s1`, QD, `${QTAG}-p1`, `${QTAG}-w1`, `${QTAG}-s2`, `${QTAG}-p2`, `${QTAG}-w2`])
     const everySku = (await sql(`SELECT sku FROM products ORDER BY sku`)).rows.map((r: { sku: string }) => r.sku)
@@ -1061,7 +1225,7 @@ test('[reconciliation pack] R2, R5 and R14 with --qoblex-export: the export comp
       const store = fakeStore({ products: everySku.map((sku: string, i: number) => ({ id: i + 1, sku, status: 'publish', type: 'simple' })) })
       const code = await runPackCli({
         argv: ['--phase', 'P1', '--as-of', QD, '--items', 'R2,R5,R14', '--report-dir', dir, ...extra], env: { DATABASE_URL: process.env.DATABASE_URL }, keepProcessEnv: true, uid: 0, checkoutOwnerUid: 0, repoRoot: process.cwd(),
-        deps: { liveness: healthyLiveness(), now: () => new Date('2026-03-08T12:00:00Z'), woo: store, wmsSkus: async () => ({ ok: true, skus: everySku }) },
+        deps: { liveness: healthyLiveness(), now: () => new Date(`${addDays(QD, 1)}T12:00:00Z`), woo: store, wmsSkus: async () => ({ ok: true, skus: everySku }) },
         stdout: (t) => out.push(t), stderr: (t) => out.push(t),
       })
       net.Socket.prototype.connect = original
@@ -1090,7 +1254,7 @@ test('[reconciliation pack] R2, R5 and R14 with --qoblex-export: the export comp
     // 11 x 2.5 = 27.5 against 25: 2.5 apart on a total of 67.5, beyond max(GBP 1, 0.05%): R5 fails too.
     assert.ok(differs.out.includes('R5 fail DIFFERENCES'), differs.out.join('\n'))
     // A stale export (another cycle date) is inconclusive and the snapshot is not read.
-    writeFileSync(`${exportDir}/manifest.json`, (await import('node:fs')).readFileSync(`${exportDir}/manifest.json`, 'utf8').replace(`"asOf":"${QD}"`, '"asOf":"2026-03-06"'), { mode: 0o644 })
+    writeFileSync(`${exportDir}/manifest.json`, (await import('node:fs')).readFileSync(`${exportDir}/manifest.json`, 'utf8').replace(`"asOf":"${QD}"`, `"asOf":"${addDays(QD, -1)}"`), { mode: 0o644 })
     const stale = await run(['--vendor-reads-only', '--qoblex-export', exportDir])
     assert.ok(stale.out.includes('R2 inconclusive QOBLEX_EXPORT_STALE'), stale.out.join('\n'))
   } finally {
@@ -1099,15 +1263,12 @@ test('[reconciliation pack] R2, R5 and R14 with --qoblex-export: the export comp
     await sql(`DELETE FROM inventory_snapshot_runs WHERE id LIKE '${QTAG}%'`)
     await sql(`DELETE FROM products WHERE id LIKE '${QTAG}%'`)
     await sql(`DELETE FROM warehouses WHERE id LIKE '${QTAG}%'`)
-    // Put every held row back exactly as it was, and say so if one cannot be.
-    const restored = {
-      warehouses: (await sql(`UPDATE warehouses SET active = true WHERE id = ANY($1) AND active = false`, [held.warehouses])).rowCount,
-      runs: (await sql(`UPDATE inventory_snapshot_runs SET "snapshotDate" = $2 WHERE id = ANY($1) AND "snapshotDate" = '2020-01-01'`, [held.runs, QD])).rowCount,
-      snapshots: (await sql(`UPDATE inventory_snapshots SET "snapshotDate" = $2 WHERE id = ANY($1) AND "snapshotDate" = '2020-01-01'`, [held.snapshots, QD])).rowCount,
-    }
     rmSync(dir, { recursive: true, force: true })
     rmSync(exportDir, { recursive: true, force: true })
-    assert.deepEqual(restored, { warehouses: held.warehouses.length, runs: held.runs.length, snapshots: held.snapshots.length }, 'every held foreign row was restored')
+    const foreignAfter = await foreignEstateDigest(sql, QTAG)
+    await sql(`DELETE FROM inventory_snapshot_runs WHERE id LIKE '${QF}%'`)
+    await sql(`DELETE FROM warehouses WHERE id LIKE '${QF}%'`)
+    assert.equal(foreignAfter, foreignBefore, 'no foreign warehouse, snapshot run or snapshot was changed')
   }
 })
 
@@ -1304,6 +1465,7 @@ test('[reconciliation pack] the holds are durable: a failure after the first hol
 
     // (a) a failure injected after the FIRST hold: the single transaction rolls everything back; nothing is stranded and no entry is committed.
     await assert.rejects(holdForeignEstate(1), /injected failure after hold/)
+    assert.equal(leases.size, 0, 'a failed hold released its lease')
     assert.equal(await heldKindsDigest(), before, 'a failed hold changed nothing')
     assert.equal((await tables()).h, 0); assert.equal(await visibleMine(), baseVisible)
     // (a2) a failure AFTER the commit (the test body throws): the finally restores from the table.
@@ -1315,17 +1477,36 @@ test('[reconciliation pack] the holds are durable: a failure after the first hol
     // (b) a KILLED run: holds committed, restore never reached, the run id is gone. The next hold sweeps it BEFORE holding, so the rows are back and held again under the new run.
     const killed = await holdForeignEstate()
     assert.deepEqual(await tables(), { t: 0, f: 0, h: entries })
-    void killed // the id is forgotten, as a killed process forgets it
+    // (b0) ...but while its owner is ALIVE (its lease is held) another run's sweep leaves its entries alone and restores nothing.
+    assert.equal(await leaseIsFree(killed), false, 'a live hold keeps its lease')
+    assert.equal(await sweepEarlierHolds('some-other-run'), 0, 'a live run\'s entries are not swept')
+    assert.deepEqual(await tables(), { t: 0, f: 0, h: entries }, 'the live run\'s rows are still held and its entries still recorded')
+    await closeLease(killed) // the owner dies: its connection, and with it the lease, goes; the id is forgotten, as a killed process forgets it
+    assert.equal(await leaseIsFree(killed), true)
     assert.equal(await sweepEarlierHolds('some-other-run'), entries, 'the sweep restored the dead run\'s entries')
     assert.equal(await heldKindsDigest(), before, 'the dead run\'s rows are back exactly')
     assert.equal((await tables()).h, 0); assert.equal(await visibleMine(), baseVisible)
     const dead = await holdForeignEstate() // killed again
+    await closeLease(dead)
     const next = await holdForeignEstate() // the next run: its own sweep heals `dead` first, then holds
     assert.notEqual(next, dead)
     assert.deepEqual(await tables(), { t: 0, f: 0, h: entries })
     assert.equal((await sql(`SELECT count(*)::int AS n FROM _test_held_rows WHERE run_id = $1`, [dead])).rows[0].n, 0, 'nothing of the dead run is left')
     await restoreForeignEstate(next)
     assert.equal(await heldKindsDigest(), before, 'foreign rows identical after the next run restored')
+    assert.equal(await leaseIsFree(next), true, 'a finished run released its lease')
+
+    // (c) A restore that cannot put its row back fails and KEEPS the entry (the original is not lost): a dead run's first-load entry, with a record
+    // already in its place (the ON CONFLICT DO NOTHING insert would skip), is not swept away; once the place is free the next sweep restores it.
+    const stuck = await holdForeignEstate()
+    await closeLease(stuck)
+    await sql(`INSERT INTO first_load_apply_runs (id, singleton, version, manifest_digest, run_id, status, steps, facts, created_at, updated_at) VALUES ($1, true, 1, 'd', 'r', 'APPLIED', '{}', '{}', '2026-01-01 09:00:00', '2026-01-02 09:00:00')`, [`${tag}-fx`])
+    await assert.rejects(sweepEarlierHolds('some-other-run'), /touched 0 rows/)
+    assert.equal((await tables()).h, entries, 'every entry of the stuck run is still recorded')
+    await sql(`DELETE FROM first_load_apply_runs WHERE id = $1`, [`${tag}-fx`])
+    assert.equal(await sweepEarlierHolds('some-other-run'), entries, 'with the place free the sweep restores them')
+    assert.equal(await heldKindsDigest(), before, 'foreign rows identical after the stuck run was healed')
+    assert.equal((await tables()).h, 0); assert.equal(await visibleMine(), baseVisible)
   } finally {
     await sql(`DELETE FROM accounting_sync_logs WHERE id LIKE '${tag}%'`)
     await sql(`DELETE FROM accounting_tokens WHERE id LIKE '${tag}%'`)
