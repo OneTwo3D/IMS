@@ -54,6 +54,7 @@ export function carriedStateFromChain(chain: ChainResult, id: PackItemId, where:
   if (!compared) return unusableCarriedState()
 
   const carried = new Map<string, CarriedDifference>()
+  const views = new Map<number, ReportView | null>() // each report is read ONCE for this item, however many differences are carried
   for (const line of head.settling) {
     if (line.item !== id) continue
     const { entry, bucket } = line
@@ -63,7 +64,7 @@ export function carriedStateFromChain(chain: ChainResult, id: PackItemId, where:
       ? (entry.imsPresent && !entry.vendorPresent ? 'onlyIms' : !entry.imsPresent && entry.vendorPresent ? 'onlyVendor' : entry.imsPresent && entry.vendorPresent ? 'bothDiffer' : null)
       : (bucket === 'onlyIms' || bucket === 'onlyVendor' || bucket === 'bothDiffer') ? bucket : null
     if (kind === null) return unusableCarriedState()
-    if (!carriedMatchesChain(chain.reports, id, where, entry.key, kind, differenceSignature(kind, entry), settling, head)) return unusableCarriedState()
+    if (!carriedMatchesChain(chain.reports, views, id, where, entry.key, kind, differenceSignature(kind, entry), settling, head)) return unusableCarriedState()
     carried.set(entry.key, { kind, signature: differenceSignature(kind, entry), sequence: settling.sequence, first: settling.first, later: [...settling.later] })
   }
   // Every difference the item lists has its state, and every state belongs to a listed difference.
@@ -93,6 +94,7 @@ function kindOfLine(bucket: ComparisonBucket, entry: { imsPresent: boolean; vend
  */
 function carriedMatchesChain(
   reports: readonly ChainEntry[],
+  views: Map<number, ReportView | null>,
   id: PackItemId,
   where: { phase: ReadinessPhase; systemIdentifier: string },
   key: string,
@@ -109,24 +111,49 @@ function carriedMatchesChain(
   for (let sequence = from; sequence <= head.sequence; sequence += 1) {
     const report = reports[sequence - 1]
     if (report === undefined || report.sequence !== sequence) return false
-    const { record } = report
-    if (record.systemIdentifier !== where.systemIdentifier || record.phase !== where.phase) return false
-    const item = record.items.find((candidate) => candidate.id === id)
-    if (item === undefined || item.applicability !== 'applicable' || !item.reasons.every((reason) => KNOWN_REASONS.includes(reason))) return false
-    const bracket = record.streams.find((candidate) => candidate.stream === stream)
-    if (bracket === undefined || !bracketStable(bracket.start, bracket.end) || bracket.start === null) return false
-    const lines = report.settling.filter((line) => line.item === id && line.entry.key === key)
-    if (lines.length !== 1) return false
+    let view = views.get(sequence)
+    if (view === undefined) {
+      view = viewOfReport(report, id, where, stream)
+      views.set(sequence, view)
+    }
+    if (view === null) return false
+    const lines = view.lines.get(key)
+    if (lines === undefined || lines.length !== 1) return false
     const line = lines[0]!
+    const bracketStart = view.bracketStart
     const state = line.entry.settling
     if (state === undefined || kindOfLine(line.bucket, line.entry) !== kind || differenceSignature(kind, line.entry) !== signature) return false
     if (state.sequence !== from || state.first !== claimed.first) return false
     if (state.later.length < previousLater.length || state.later.length > previousLater.length + 1) return false
     if (!previousLater.every((stamp, index) => state.later[index] === stamp)) return false
     if (sequence === from) {
-      if (state.later.length !== 0 || state.first !== bracket.start) return false
-    } else if (state.later.length === previousLater.length + 1 && state.later[state.later.length - 1] !== bracket.start) return false
+      if (state.later.length !== 0 || state.first !== bracketStart) return false
+    } else if (state.later.length === previousLater.length + 1 && state.later[state.later.length - 1] !== bracketStart) return false
     previousLater = state.later
   }
   return previousLater.length === claimed.later.length && previousLater.every((stamp, index) => claimed.later[index] === stamp)
+}
+
+type ReportView = { bracketStart: string; lines: Map<string, Array<ChainEntry['settling'][number]>> }
+
+/**
+ * What one report offers the stamp check for one item: null if the report cannot be relied on for it (another phase or installation, the
+ * item not compared to the end, an unstable or unread bracket), else its stable bracket start and its settling lines for the item indexed
+ * by identity key. Built once per report, so verifying a carried difference is a direct lookup, not a scan of the whole listing.
+ */
+function viewOfReport(report: ChainEntry, id: PackItemId, where: { phase: ReadinessPhase; systemIdentifier: string }, stream: string): ReportView | null {
+  const { record } = report
+  if (record.systemIdentifier !== where.systemIdentifier || record.phase !== where.phase) return null
+  const item = record.items.find((candidate) => candidate.id === id)
+  if (item === undefined || item.applicability !== 'applicable' || !item.reasons.every((reason) => KNOWN_REASONS.includes(reason))) return null
+  const bracket = record.streams.find((candidate) => candidate.stream === stream)
+  if (bracket === undefined || !bracketStable(bracket.start, bracket.end) || bracket.start === null) return null
+  const lines = new Map<string, Array<ChainEntry['settling'][number]>>()
+  for (const line of report.settling) {
+    if (line.item !== id) continue
+    const list = lines.get(line.entry.key)
+    if (list === undefined) lines.set(line.entry.key, [line])
+    else list.push(line)
+  }
+  return { bracketStart: bracket.start, lines }
 }

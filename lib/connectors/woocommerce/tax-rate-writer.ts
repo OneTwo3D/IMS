@@ -25,6 +25,11 @@
  *   - A store write that succeeded but whose record could not be committed leaves a store rate without a record and (for a CREATE) without a mapping row. The apply stops and says so; the next
  *     plan then reports that rate as an UNMAPPED_TWIN blocker until the owner maps it. Nothing is created twice.
  *   - Store tax classes must exist in the store: the store refuses a rate of a class it does not have, and the apply stops with its answer.
+ *   - A duplicate DELETE re-reads the keeper just before it is sent, but WooCommerce has no compare-and-delete, so a store admin or plugin can still remove the keeper in the gap. AFTER the delete the
+ *     keeper is therefore read once more; if it is gone (or unreadable) the run stops, sends nothing further and reports `keeperLost`. The writer does NOT recreate the keeper: the plan holds only the
+ *     fields the store port can create (name, percent, country, state, class, compound, shipping), not the keeper's postcode, city, priority and order, and a created rate gets a NEW store id that the
+ *     mapping row would have to be moved to, so a recreation would not be the rate that was lost. The next plan reports the loss by itself: the stamped mapping of the vanished keeper no longer
+ *     matches a store rate, so the IMS rate has no counterpart and the plan carries a CREATE for it that lists the vanished store ids (staleWooIds), for the operator to confirm.
  *   - A mapping row is kept when its store rate is deleted (historic orders still resolve their tax lines through it); it is simply no longer a counterpart.
  */
 
@@ -122,6 +127,11 @@ export type WooTaxApplyResult =
       unrecorded: { key: string; reason: string } | null
       /** A change NOT sent because what it rested on changed after the plan (checked immediately before the send): the run stopped there and nothing later was sent. */
       stopped?: { key: string; reason: string } | null
+      /**
+       * A duplicate DELETE WAS sent and recorded, and the intended keeper was then found gone from the store (or could not be read): something outside IMS removed it between the
+       * keeper check and the delete, so the IMS rate may now have NO counterpart. The run stopped there and sent nothing more. Nothing is recreated (see LIMITS).
+       */
+      keeperLost?: { key: string; keeperWooId: string; reason: string } | null
     }
 
 type ReadClient = Pick<Prisma.TransactionClient, 'taxRate' | 'taxRateComponent' | 'shoppingTaxRateMapping' | 'wooTaxRateWrite'>
@@ -355,6 +365,14 @@ export async function applyWooTaxPlan(deps: WooTaxWriterDeps, options: { confirm
         break
       }
       result.applied.push({ key: change.key, kind: change.kind, wooId: change.kind === 'CREATE' ? newId : change.wooId })
+      // THE BACKSTOP for the race the keeper check cannot close (no compare-and-delete in the store): the keeper is read once more now that the duplicate is gone.
+      if (change.kind === 'DELETE' && change.reason === 'DUPLICATE_COUNTERPART' && change.keeper !== null) {
+        const keeperNow = await deps.readWooRate(change.keeper.wooId).catch(() => ({ ok: false as const }))
+        if (!keeperNow.ok) {
+          result.keeperLost = { key: change.key, keeperWooId: change.keeper.wooId, reason: `the intended keeper (store rate ${change.keeper.wooId}) is gone from the store, or could not be read, after the duplicate ${change.wooId} was deleted` }
+          break
+        }
+      }
     }
     return result
   } catch (error) {
