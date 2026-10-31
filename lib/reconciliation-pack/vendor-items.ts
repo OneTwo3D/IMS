@@ -261,7 +261,7 @@ async function runR13(context: VendorItemContext): Promise<ItemInput> {
     const vendorLeg = [...vendorWoo]
     const legPopulation = new Set<string>()
     for (const row of [...imsWoo, ...vendorWoo]) legPopulation.add(canonicalKey(row.key))
-    for (const row of compareVatSetIdentity({ woo: walked.value.rates, rates, mappings, componentRates: section.value.componentRates, xero: null })) {
+    for (const row of compareVatSetIdentity({ woo: walked.value.rates, rates, mappings, componentRates: section.value.componentRates, xero: [], xeroProven: false })) {
       // With the Xero leg skipped there is no Xero row, and the only IMS-row reason left is MISSING_IN_WOO.
       const keys = row.reasons.length === 0 ? [setKey(row.system, row.id, null)] : row.reasons.map((reason) => setKey(row.system, row.id, reason))
       for (const key of keys) {
