@@ -454,6 +454,7 @@ test('A CARRIED STAMP IS TAKEN ONLY IF THE PRIOR REPORTS BEAR IT OUT: the honest
   unusable(forge(two, 2, (e) => { line(e).entry.settling = { sequence: 2, first: S1, later: [S2], count: 1 } }), 'claims the newest report as the first sight but counts a later stamp')
   unusable(forge(two, 2, (e) => { line(e).entry.settling = { sequence: 3, first: S1, later: [], count: 0 } }), 'a first-seen report that does not exist yet')
   // a report in between: not the same installation phase, not compared, shrinking list, a stamp that is not its own
+  unusable(forge(three, 2, (e) => { e.record.streams = e.record.streams.map((b) => (b.stream === 'woocommerce-order-sweep' ? { ...b, end: S4 } : b)) }), 'an unstable bracket in a report in between')
   unusable(forge(three, 2, (e) => { e.record.phase = 'P2' }), 'a report of another phase in between')
   unusable(forge(three, 2, (e) => { e.record.items.find((i) => i.id === 'R9')!.reasons = ['CAP_EXCEEDED'] }), 'a report in between that did not compare the item to the end')
   unusable(forge(three, 2, (e) => { e.settling = [] }), 'a report in between that lacks the identity')
