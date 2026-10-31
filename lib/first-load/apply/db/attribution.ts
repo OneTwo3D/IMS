@@ -124,6 +124,9 @@ function parseImportedTax(raw: unknown): ImportedTax {
 export function unattributedTaxRows(rows: ReadonlyArray<{ id: string; d: string }>, imported: ReadonlyMap<string, string>, baseline: readonly string[]): number {
   let count = 0
   const rest = new Map<string, number>()
+  const present = new Set(rows.map((r) => r.id))
+  // A row the import recorded that is gone now is a foreign change too (it is in no baseline, so the digest comparison below cannot see it).
+  for (const id of imported.keys()) if (!present.has(id)) count += 1
   for (const row of rows) {
     if (imported.has(row.id)) { if (imported.get(row.id) !== row.d) count += 1; continue }
     rest.set(row.d, (rest.get(row.d) ?? 0) + 1)

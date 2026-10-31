@@ -1910,6 +1910,12 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           await sql(`update tax_rate_components set rate = 0.2 where id = $1`, [importedComp.id])
           await m.db.taxRateComponent.create({ data: { taxRateId: imported.id, name: 'Extra', rate: '0.01', sortOrder: 1 } })
           assert.equal(await taxHolds('tax_rate_components'), 1, 'an extra component on an imported rate')
+          // Deleted after the import committed: an imported component, then the imported rate itself (its components go with it): each is counted, in its own table.
+          await sql('delete from tax_rate_components where id = $1', [importedComp.id])
+          assert.deepEqual([await taxHolds('tax_rates'), await taxHolds('tax_rate_components')], [0, 2], 'an imported component deleted (and the unrecorded extra is still counted)')
+          await sql('delete from tax_rate_components where tax_rate_id = $1', [imported.id])
+          await sql('delete from tax_rates where id = $1', [imported.id])
+          assert.deepEqual([await taxHolds('tax_rates'), await taxHolds('tax_rate_components')], [1, 1], 'an imported rate deleted')
           assert.ok(!(await resume()).join(';').includes('ZQTAX'), 'no key in any message')
           precondition(t, 'tax attribution arms', 12)
         } finally { await cleanupTax() }
