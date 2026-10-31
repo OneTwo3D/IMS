@@ -3,7 +3,7 @@ import test from 'node:test'
 
 import type { Breadcrumb, Event } from '@sentry/nextjs'
 
-import { scrubBreadcrumb, scrubEvent } from '@/lib/observability/scrub'
+import { scrubBreadcrumb, scrubEvent, scrubSpan } from '@/lib/observability/scrub'
 
 const json = (v: unknown) => JSON.stringify(v)
 
@@ -121,4 +121,87 @@ test('never throws on cyclic/odd input', () => {
   assert.equal(bad.message, '[scrub failed]')
   assert.doesNotThrow(() => scrubEvent(null as unknown as Event))
   assert.doesNotThrow(() => scrubBreadcrumb(undefined as unknown as Breadcrumb))
+})
+
+const CALLBACK = '/api/accounting/callback?code=SENTINELCODE123&state=SENTINELSTATE456'
+const SENTINELS = ['SENTINELCODE123', 'SENTINELSTATE456', 'SENTINELTOKEN']
+
+function assertNoSentinels(value: unknown): void {
+  const s = json(value)
+  for (const n of SENTINELS) assert.ok(!s.includes(n), `leaked ${n}`)
+}
+
+test('OAuth callback code/state do not survive an error event', () => {
+  const out = scrubEvent({
+    message: `GET ${CALLBACK} failed`,
+    request: {
+      url: `https://ims.example.test${CALLBACK}`,
+      query_string: 'code=SENTINELCODE123&state=SENTINELSTATE456',
+      headers: { 'x-upstream': 'Bearer SENTINELTOKEN' },
+    },
+    exception: { values: [{ type: 'Error', value: `callback https://ims.example.test${CALLBACK}` }] },
+    breadcrumbs: [{ category: 'navigation', data: { from: '/', to: CALLBACK, url: `https://ims.example.test${CALLBACK}` } }],
+    extra: { note: 'order 173814 SKU ABC-1' },
+  })
+  assert.ok(out)
+  assertNoSentinels(out)
+  assert.match(json(out), /\/api\/accounting\/callback/)
+  assert.equal((out.extra as { note: string }).note, 'order 173814 SKU ABC-1')
+})
+
+test('OAuth callback code/state do not survive a streamed span', () => {
+  const span = {
+    trace_id: 't1',
+    span_id: 's1',
+    name: `GET ${CALLBACK}`,
+    start_timestamp: 1,
+    status: 'ok' as const,
+    is_segment: true,
+    attributes: {
+      'url.full': { type: 'string', value: `https://ims.example.test${CALLBACK}` },
+      'http.url': `https://ims.example.test${CALLBACK}`,
+      'http.target': CALLBACK,
+      'url.query': '?code=SENTINELCODE123&state=SENTINELSTATE456',
+      'http.request.header.x-upstream': 'Bearer SENTINELTOKEN',
+      'http.request.header.authorization': 'Bearer SENTINELTOKEN',
+      'user.email': 'a@b.example',
+      'client.address': '9.9.9.9',
+      'sentry.note': 'order 173814 SKU ABC-1',
+    },
+  }
+  const out = scrubSpan(span)
+  assertNoSentinels(out)
+  assert.ok(!json(out).includes('a@b.example'))
+  assert.ok(!json(out).includes('9.9.9.9'))
+  assert.match(out.name, /\/api\/accounting\/callback/)
+  assert.equal(out.attributes['sentry.note'], 'order 173814 SKU ABC-1')
+  assert.equal(out.span_id, 's1')
+})
+
+test('OAuth callback code/state do not survive a transaction or breadcrumb', () => {
+  const tx = scrubEvent({ type: 'transaction', transaction: CALLBACK, request: { url: `https://x.test${CALLBACK}` } } as Event)
+  assertNoSentinels(tx)
+  const bc = scrubBreadcrumb({ category: 'fetch', data: { url: `https://x.test${CALLBACK}`, headers: { a: 'Bearer SENTINELTOKEN' } } })
+  assertNoSentinels(bc)
+})
+
+test('scrubSpan never throws and does not leak on odd input', () => {
+  const cyc: Record<string, unknown> = { name: 'x', attributes: {} }
+  cyc.self = cyc
+  assert.doesNotThrow(() => scrubSpan(cyc))
+  const evil = {
+    span_id: 's2',
+    get attributes(): never {
+      throw new Error('boom')
+    },
+  }
+  const out = scrubSpan(evil) as { name: string; span_id: string }
+  assert.equal(out.name, '[scrub failed]')
+  assert.equal(out.span_id, 's2')
+  assert.doesNotThrow(() => scrubSpan(null as unknown as object))
+})
+
+test('plain text containing a question mark is left alone', () => {
+  const msg = 'why did order 173814 SKU ABC-1 fail? see /orders/173814'
+  assert.equal(scrubEvent({ message: msg })?.message, msg)
 })

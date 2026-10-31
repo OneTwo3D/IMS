@@ -7,6 +7,8 @@
 export const dataCollection = {
   userInfo: false,
   cookies: false,
+  // OAuth callbacks carry code/state in the query string; never collect it (scrub strips it as well).
+  urlQueryParams: false,
   httpBodies: [] as Array<'incomingRequest' | 'outgoingRequest' | 'incomingResponse' | 'outgoingResponse'>,
   httpHeaders: {
     request: { deny: ['x-forwarded-for', 'x-real-ip', 'cf-connecting-ip', 'true-client-ip', 'forwarded'] },

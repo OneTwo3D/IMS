@@ -1,7 +1,7 @@
 import * as Sentry from '@sentry/nextjs'
 
 import { dataCollection } from '@/lib/observability/data-collection'
-import { scrubBreadcrumb, scrubEvent } from '@/lib/observability/scrub'
+import { scrubBreadcrumb, scrubEvent, scrubSpan } from '@/lib/observability/scrub'
 
 // Browser error tracking (GlitchTip). Off unless NEXT_PUBLIC_SENTRY_DSN is set at build time.
 // No Replay, no profiling, no feedback widget.
@@ -16,6 +16,8 @@ Sentry.init({
   dataCollection,
   beforeSend: scrubEvent,
   beforeSendTransaction: scrubEvent,
+  // Streamed spans (default) bypass beforeSendTransaction; this is their scrubber.
+  beforeSendSpan: scrubSpan,
   beforeBreadcrumb: scrubBreadcrumb,
 })
 

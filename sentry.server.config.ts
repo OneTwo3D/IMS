@@ -1,7 +1,7 @@
 import * as Sentry from '@sentry/nextjs'
 
 import { dataCollection } from '@/lib/observability/data-collection'
-import { scrubBreadcrumb, scrubEvent } from '@/lib/observability/scrub'
+import { scrubBreadcrumb, scrubEvent, scrubSpan } from '@/lib/observability/scrub'
 
 // Error tracking (GlitchTip, Sentry-compatible). Entirely off unless SENTRY_DSN is set, so CI,
 // tests, local dev and any deployment without a DSN behave exactly as before.
@@ -16,5 +16,7 @@ Sentry.init({
   dataCollection,
   beforeSend: scrubEvent,
   beforeSendTransaction: scrubEvent,
+  // Streamed spans (default) bypass beforeSendTransaction; this is their scrubber.
+  beforeSendSpan: scrubSpan,
   beforeBreadcrumb: scrubBreadcrumb,
 })
