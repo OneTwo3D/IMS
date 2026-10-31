@@ -111,6 +111,7 @@ async function restoreHeld(client: Q, runFilter: { run: string } | { runs: strin
       if (e.kind === 'token') result = await client.query(`UPDATE accounting_tokens SET connector = $2 WHERE id = $1 AND connector = 'held-' || id`, [e.row_id, e.payload.connector])
       else if (e.kind === 'sync_row') result = await client.query(`UPDATE accounting_sync_logs SET connector = $2 WHERE id = $1 AND connector = 'held-xero'`, [e.row_id, e.payload.connector])
       else if (e.kind === 'first_load') result = await client.query(`INSERT INTO first_load_apply_runs SELECT * FROM jsonb_populate_record(NULL::first_load_apply_runs, $1::jsonb) ON CONFLICT DO NOTHING`, [JSON.stringify(e.payload)])
+      else if (e.kind === 'warehouse') result = await client.query(`UPDATE warehouses SET active = true WHERE id = $1 AND NOT active`, [e.row_id])
       else throw new Error(`unknown held kind ${e.kind}`)
       assertRestoredOneRow(e.kind, e.row_id, result.rowCount)
     }
@@ -142,9 +143,10 @@ async function sweepEarlierHolds(except: string): Promise<number> {
 
 /**
  * Hold every foreign Xero token, first-load record and write-shaped Xero sync row aside, recording each original in `_test_held_rows` in the SAME
- * single transaction. `injectFailureAfter` (tests of this helper only) throws inside the transaction after that many holds, which rolls ALL of it back.
+ * single transaction. With `withWarehouses` the ACTIVE warehouses without a WMS binding are held too (made inactive; the export of the Qoblex test must declare
+ * every one of them and carries at most QOBLEX_MAX_LOCATIONS, which the warehouses other files left exceed). `injectFailureAfter` (tests of this helper only) throws inside the transaction after that many holds, which rolls ALL of it back.
  */
-async function holdForeignEstate(injectFailureAfter?: number): Promise<Held> {
+async function holdForeignEstate(injectFailureAfter?: number, withWarehouses = false): Promise<Held> {
   const runId = `${process.pid}-${++holdCounter}-${Date.now()}`
   await openLease(runId) // BEFORE the sweep and before any entry exists: an entry of this run is never visible without its lease
   try {
@@ -170,6 +172,13 @@ async function holdForeignEstate(injectFailureAfter?: number): Promise<Held> {
           await record('first_load', 'first_load_apply_runs', row.id, row.j)
           await client.query(`DELETE FROM first_load_apply_runs WHERE id = $1`, [row.id])
           step()
+        }
+        if (withWarehouses) {
+          for (const row of (await client.query(`SELECT id, to_jsonb(t) AS j FROM warehouses t WHERE active AND NOT EXISTS (SELECT 1 FROM external_wms_bindings b WHERE b."warehouseId" = t.id) ORDER BY id FOR UPDATE`)).rows as Array<{ id: string; j: unknown }>) {
+            await record('warehouse', 'warehouses', row.id, row.j)
+            await client.query(`UPDATE warehouses SET active = false WHERE id = $1 AND active`, [row.id])
+            step()
+          }
         }
         await client.query('COMMIT')
       } catch (error) {
@@ -1197,18 +1206,28 @@ test('[reconciliation pack] R2, R5 and R14 with --qoblex-export: the export comp
   const targets: string[] = []
   const original = net.Socket.prototype.connect
   // THE TIER SHARES ONE DATABASE: warehouses, products and snapshot rows left by other files are visible to a run, and the population is IMS's.
-  // Nothing foreign is written: the cycle date is one nothing uses, and foreign warehouses and products (which the pack reads whole) are carried by
-  // the export, the storefront and the warehouse-system list. The foreign estate is digested before and after to prove it.
+  // The cycle date is one nothing uses (no hold date), and foreign products (which the pack reads whole) are carried by the export, the storefront
+  // and the warehouse-system list. Foreign ELIGIBLE warehouses cannot be declared (an export carries at most QOBLEX_MAX_LOCATIONS, and the tier leaves more),
+  // so they are held aside by recorded ids in the durable, leased hold and put back exactly; the foreign estate is digested before and after to prove it.
+  let estate: Held = NOTHING_HELD
   let foreignBefore = ''
   let catalogue: string[] = [...skus]
   try {
-    // ISOLATION WITHOUT WRITING TO ROWS THAT ARE NOT THIS TEST'S: the cycle date is one no snapshot run or snapshot uses (a foreign run on the start date
-    // makes the search move on), and the warehouses other files left are not deactivated: every eligible one is DECLARED in the export, as the pack
-    // requires, and (like the foreign products) simply has no stock.
+    // ISOLATION: the cycle date is one no snapshot run or snapshot uses (a foreign run on the start date makes the search move on); the eligible foreign warehouses
+    // are held by recorded ids and restored with each row counted (never a blanket deactivation).
     // FOREIGN FIXTURES (another file's leftovers, as far as the pack can tell): an ACTIVE unbound warehouse with no stock and a snapshot run on the start date.
-    await sql(`INSERT INTO warehouses (id, code, name, "updatedAt") VALUES ($1, $2, 'x', now())`, [`${QF}-w`, `${QF}W`])
+    // MORE eligible foreign warehouses than an export may declare (QOBLEX_MAX_LOCATIONS), as the shared tier leaves: the run cannot be isolated by declaring them.
+    await sql(`INSERT INTO warehouses (id, code, name, "updatedAt") SELECT $1 || '-w' || n, $2 || 'W' || n, 'x', now() FROM generate_series(1, 70) n`, [QF, QF])
     await sql(`INSERT INTO inventory_snapshot_runs (id, "snapshotDate", "stockLevelCount", "snapshotCount", "updatedAt") VALUES ($1, $2, 0, 0, now())`, [`${QF}-r`, QD0])
     foreignBefore = await foreignEstateDigest(sql, QTAG)
+    // A foreign warehouse that is BOUND to a WMS is a 3PL's, not eligible: it is not held and stays active.
+    await sql(`INSERT INTO wms_connections (id, connector, label, "baseUrl", "updatedAt") VALUES ($1, 'mintsoft', $2, 'http://127.0.0.1:1', now())`, [`${QF}-c`, QF])
+    await sql(`INSERT INTO external_wms_bindings (id, "connectionId", "warehouseId", connector, "externalWarehouseId", "stockSyncMode", "updatedAt") VALUES ($1, $2, $3, 'mintsoft', $4, 'NOTIFICATION_ONLY', now())`, [`${QF}-b`, `${QF}-c`, `${QF}-w1`, `${QF}-ext`])
+    foreignBefore = await foreignEstateDigest(sql, QTAG)
+    // The eligible foreign warehouses are held aside by RECORDED ids (a durable, leased hold restored below with every row counted), not deactivated blindly.
+    estate = await holdForeignEstate(undefined, true)
+    assert.equal((await sql(`SELECT active FROM warehouses WHERE id = $1`, [`${QF}-w1`])).rows[0]!.active, true, 'a bound foreign warehouse is not held')
+    assert.equal((await sql(`SELECT count(*)::int AS n FROM warehouses WHERE id LIKE $1 AND active`, [`${QF}-w%`])).rows[0]!.n, 1, 'and it is the only foreign fixture warehouse still active')
     QD = await unusedSnapshotDate(sql, QD0)
     assert.notEqual(QD, QD0, 'the start date is taken by the foreign run: the search moved on')
     const visible = await sql(`SELECT (SELECT count(*) FROM inventory_snapshots WHERE "snapshotDate" = $1)::int AS s, (SELECT count(*) FROM inventory_snapshot_runs WHERE "snapshotDate" = $1)::int AS r`, [QD])
@@ -1216,7 +1235,7 @@ test('[reconciliation pack] R2, R5 and R14 with --qoblex-export: the export comp
     await sql(`INSERT INTO products (id, sku, name, "updatedAt") VALUES ($1, $2, 'x', now()), ($3, $4, 'x', now())`, [`${QTAG}-p1`, skus[0], `${QTAG}-p2`, skus[1]])
     await sql(`INSERT INTO warehouses (id, code, name, "updatedAt") VALUES ($1, $2, 'x', now()), ($3, $4, 'x', now())`, [`${QTAG}-w1`, codes[0], `${QTAG}-w2`, codes[1]])
     locationCodes = (await sql(`SELECT code FROM warehouses w WHERE active AND NOT EXISTS (SELECT 1 FROM external_wms_bindings b WHERE b."warehouseId" = w.id) ORDER BY code`)).rows.map((r: { code: string }) => r.code)
-    assert.ok(locationCodes.includes(`${QF}W`) && codes.every((code) => locationCodes.includes(code)), 'the foreign warehouse, which holds no stock, is declared too (and stays active)')
+    assert.deepEqual(locationCodes, [...codes].sort(), 'only this test\'s own warehouses are eligible while the foreign ones are held')
     await sql(`INSERT INTO inventory_snapshot_runs (id, "snapshotDate", "stockLevelCount", "snapshotCount", "updatedAt") VALUES ($1, $2, 2, 2, now())`, [`${QTAG}-run`, QD])
     await sql(`INSERT INTO inventory_snapshots (id, "snapshotDate", "productId", "warehouseId", qty, "valueBase", "unitCostBase") VALUES ($1, $2, $3, $4, 10, 25, 2.5), ($5, $2, $6, $7, 4, 40, 10)`, [`${QTAG}-s1`, QD, `${QTAG}-p1`, `${QTAG}-w1`, `${QTAG}-s2`, `${QTAG}-p2`, `${QTAG}-w2`])
     const everySku = (await sql(`SELECT sku FROM products ORDER BY sku`)).rows.map((r: { sku: string }) => r.sku)
@@ -1277,8 +1296,11 @@ test('[reconciliation pack] R2, R5 and R14 with --qoblex-export: the export comp
     await sql(`DELETE FROM warehouses WHERE id LIKE '${QTAG}%'`)
     rmSync(dir, { recursive: true, force: true })
     rmSync(exportDir, { recursive: true, force: true })
+    await restoreForeignEstate(estate)
     const foreignAfter = await foreignEstateDigest(sql, QTAG)
     await sql(`DELETE FROM inventory_snapshot_runs WHERE id LIKE '${QF}%'`)
+    await sql(`DELETE FROM external_wms_bindings WHERE id LIKE '${QF}%'`)
+    await sql(`DELETE FROM wms_connections WHERE id LIKE '${QF}%'`)
     await sql(`DELETE FROM warehouses WHERE id LIKE '${QF}%'`)
     assert.equal(foreignAfter, foreignBefore, 'no foreign warehouse, snapshot run or snapshot was changed')
   }
