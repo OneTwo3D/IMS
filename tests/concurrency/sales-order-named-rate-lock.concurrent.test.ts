@@ -255,7 +255,7 @@ test('an order whose lines carry one rate and whose header names another never d
     // Alternate which rate the header names and which the line carries, so both opposite orders are exercised.
     const [header, line] = round % 2 === 0 ? [rateB, rateA] : [rateA, rateB]
     const [order, run] = await Promise.all([
-      createSalesOrder({ externalOrderNumber: `NRD${tag}-${round}`, customerName: 'Deadlock', currency: 'GBP', taxRateName: header.name, taxRateValue: 0.2, isDraft: true, lines: [{ productId: product.id, sku: product.sku, description: 'x', qty: 1, unitPriceForeign: 10, taxRateId: line.id }] } as never),
+      createSalesOrder({ externalOrderNumber: `NRD${tag}-${round}`, customerName: 'Lock order customer', currency: 'GBP', taxRateName: header.name, taxRateValue: 0.2, isDraft: true, lines: [{ productId: product.id, sku: product.sku, description: 'x', qty: 1, unitPriceForeign: 10, taxRateId: line.id }] } as never),
       imp.runPurchaseTaxImport({ apply: true, types: [], deactivateAbsent: true }).then((r) => ({ r }), (e: unknown) => ({ e })),
     ])
     const text = `${String(order.error ?? '')} ${'e' in run ? String(run.e) : JSON.stringify(run.r, (_k, x) => (typeof x === 'bigint' ? String(x) : x))}`
@@ -281,7 +281,7 @@ test('an order whose lines carry one rate and whose header names another never d
     const heldFirst = new Promise<void>((resolve) => { held = resolve })
     const holder = db.$transaction(async (tx) => { await tx.$queryRaw`SELECT id FROM tax_rates WHERE id = ${rateA.id} FOR UPDATE`; held(); await gate })
     await heldFirst
-    const startWriter = () => createSalesOrder({ externalOrderNumber: `NRD${tag}-det-${first}`, customerName: 'Deadlock', currency: 'GBP', taxRateName: rateA.name, taxRateValue: 0.2, isDraft: true, lines: [{ productId: product.id, sku: product.sku, description: 'x', qty: 1, unitPriceForeign: 10, taxRateId: rateB.id }] } as never).then((r) => ({ r }), (e: unknown) => ({ e }))
+    const startWriter = () => createSalesOrder({ externalOrderNumber: `NRD${tag}-det-${first}`, customerName: 'Lock order customer', currency: 'GBP', taxRateName: rateA.name, taxRateValue: 0.2, isDraft: true, lines: [{ productId: product.id, sku: product.sku, description: 'x', qty: 1, unitPriceForeign: 10, taxRateId: rateB.id }] } as never).then((r) => ({ r }), (e: unknown) => ({ e }))
     const startImport = () => imp.runPurchaseTaxImport({ apply: true, types: [], deactivateAbsent: true }).then((r) => ({ r }), (e: unknown) => ({ e }))
     const started: Record<string, Promise<{ r?: unknown; e?: unknown }>> = {}
     for (const who of first === 'writer' ? (['writer', 'import'] as const) : (['import', 'writer'] as const)) {
