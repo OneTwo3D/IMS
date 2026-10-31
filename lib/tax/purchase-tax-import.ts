@@ -155,7 +155,7 @@ export interface NotInXeroRow {
 export type KeptBecause = 'IS_DEFAULT_RATE' | 'LIVE_DOCUMENTS'
 export interface PresentRate { taxType: string; id: string; name: string; rate: string; xeroRate: string | null }
 /** An existing row that is the one rate for its type and side but whose percentage is not Xero's. Reported; corrected only by `replaceDiffering` (a new row + the old one deactivated). */
-export interface DifferingRate { taxType: string; side: 'PURCHASE' | 'SALES'; id: string; name: string; imsRate: string; xeroRate: string; references: RowReferences; replaced: boolean; keptBecause: KeptBecause | null; liveDocuments: number | null }
+export interface DifferingRate { taxType: string; side: 'PURCHASE' | 'SALES' | 'BOTH'; id: string; name: string; imsRate: string; xeroRate: string; references: RowReferences; replaced: boolean; keptBecause: KeptBecause | null; liveDocuments: number | null }
 /** An active row with no Xero tax type at all (for example a per-country storefront rate): it has no Xero counterpart, so the single rate set cannot contain it. */
 export interface UnmappedRow { id: string; name: string; usedFor: string; countryCode: string | null; rate: string }
 /**
