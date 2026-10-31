@@ -258,7 +258,7 @@ test('an order whose lines carry one rate and whose header names another never d
       createSalesOrder({ externalOrderNumber: `NRD${tag}-${round}`, customerName: 'Deadlock', currency: 'GBP', taxRateName: header.name, taxRateValue: 0.2, isDraft: true, lines: [{ productId: product.id, sku: product.sku, description: 'x', qty: 1, unitPriceForeign: 10, taxRateId: line.id }] } as never),
       imp.runPurchaseTaxImport({ apply: true, types: [], deactivateAbsent: true }).then((r) => ({ r }), (e: unknown) => ({ e })),
     ])
-    const text = `${String(order.error ?? '')} ${'e' in run ? String(run.e) : ''}`
+    const text = `${String(order.error ?? '')} ${'e' in run ? String(run.e) : JSON.stringify(run.r, (_k, x) => (typeof x === 'bigint' ? String(x) : x))}`
     assert.ok(!/deadlock/i.test(text), `round ${round}: deadlock: ${text}`)
     // Either the order won (saved; the deactivation refused the rate it names) or the deactivation won (the order refused): never an order saved naming an inactive rate.
     const saved = await db.salesOrder.findFirst({ where: { externalOrderNumber: `NRD${tag}-${round}` }, select: { taxRateName: true } })
@@ -291,7 +291,8 @@ test('an order whose lines carry one rate and whose header names another never d
     release()
     await holder
     const [w, i] = await Promise.all([started.writer!, started.import!])
-    const text = `${JSON.stringify((w.r as { error?: string } | undefined)?.error ?? '')} ${String(w.e ?? '')} ${String(i.e ?? '')}`
+    const show = (v: unknown): string => JSON.stringify(v ?? null, (_k, x) => (typeof x === 'bigint' ? String(x) : x instanceof Error ? String(x) : x))
+    const text = `${show(w.r)} ${String(w.e ?? '')} ${show(i.r)} ${String(i.e ?? '')}`
     assert.ok(!/deadlock|40P01/i.test(text), `${first} queued first: deadlock: ${text}`)
   }
 })

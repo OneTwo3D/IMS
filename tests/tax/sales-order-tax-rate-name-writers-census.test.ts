@@ -51,7 +51,7 @@ export function salesOrderNameSites(file: string, source: string): Site[] {
       // The call also locks the order's LINE rates in the same statement (lock order: one statement, ascending id).
       const lockArgs = lock === null ? '' : balancedFrom(segment, segment.indexOf('(', lock.index!))
       const written = name === SHORTHAND ? 'taxRateName' : (name ?? '')
-      const locked = lock !== null && m[1] === 'tx' && written !== '' && written.includes(lock[2]!.trim()) && /\blineRateIds\s*:/.test(lockArgs)
+      const locked = lock !== null && m[1] === 'tx' && written !== '' && written.includes(lock[2]!.trim()) && /\blineRateIds\s*:[^,}]*taxRateId/.test(lockArgs)
       sites.push({ file, line, op: m[2]!, receiver: m[1]!, data, name, locked })
     }
   }
@@ -149,9 +149,9 @@ const wrap = (inner: string): string => `async function f(db, input) {\n  return
 const sitesOf = (src: string): Site[] => salesOrderNameSites('fixture.ts', src).filter((s) => s.name !== null)
 
 test('the detector accepts a locked writer and reports each unlocked shape', () => {
-  const good = sitesOf(wrap(`    await lockOrderNamedTaxRate(tx, input.taxRateName, { lineRateIds: [] })\n    return tx.salesOrder.create({ data: { orderNumber: 'x', taxRateName: input.taxRateName || null } })`))
+  const good = sitesOf(wrap(`    await lockOrderNamedTaxRate(tx, input.taxRateName, { lineRateIds: lines.map((l) => l.taxRateId) })\n    return tx.salesOrder.create({ data: { orderNumber: 'x', taxRateName: input.taxRateName || null } })`))
   assert.deepEqual(good.map((s) => s.locked), [true])
-  const shorthand = sitesOf(wrap(`    await lockOrderNamedTaxRate(tx, taxRateName, { lineRateIds: [] })\n    return tx.salesOrder.create({ data: { orderNumber: 'x', taxRateName } })`))
+  const shorthand = sitesOf(wrap(`    await lockOrderNamedTaxRate(tx, taxRateName, { lineRateIds: lines.map((l) => l.taxRateId) })\n    return tx.salesOrder.create({ data: { orderNumber: 'x', taxRateName } })`))
   assert.deepEqual(shorthand.map((s) => s.locked), [true], 'shorthand is a write too')
   const offenders: Array<[string, string]> = [
     ['no lock at all', wrap(`    return tx.salesOrder.create({ data: { orderNumber: 'x', taxRateName: input.taxRateName } })`)],
