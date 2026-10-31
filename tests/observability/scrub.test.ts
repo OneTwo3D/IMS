@@ -195,7 +195,7 @@ test('scrubSpan never throws and does not leak on odd input', () => {
       throw new Error('boom')
     },
   }
-  const out = scrubSpan(evil) as { name: string; span_id: string }
+  const out = scrubSpan(evil) as unknown as { name: string; span_id: string }
   assert.equal(out.name, '[scrub failed]')
   assert.equal(out.span_id, 's2')
   assert.doesNotThrow(() => scrubSpan(null as unknown as object))
