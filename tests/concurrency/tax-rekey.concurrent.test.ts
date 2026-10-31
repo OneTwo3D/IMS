@@ -323,6 +323,37 @@ test('an apply is refused without the previewed digest, while unposted orders re
   assert.equal((await d.rekey.runTaxRekey({ apply: false })).plan!.references[w.ids.cy]!.queuedEvents, 1)
 })
 
+// [mutation: a copied field (reverseCharge / isCompound / taxCategory / component name / code / order) left out of the plan row -> that arm applies instead of DIGEST_MISMATCH]
+test('a copied posting field changed between the preview and the apply is a DIGEST_MISMATCH and writes nothing', { skip }, async () => {
+  const d = await loadDeps()
+  await precondition(d)
+  const w = await seedWorld(d)
+  const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  created.digests.push(preview.digest)
+  const cy = w.ids.cy
+  // The components of CY VAT carry a retired demo code (already in the plan as a cleared component); GR VAT's carries a built-in one, so only the new `copied` block can see a change to them.
+  const gr = w.ids.gr
+  const arms: Array<[string, () => Promise<unknown>, () => Promise<unknown>]> = [
+    ['reverseCharge', () => d.db.taxRate.update({ where: { id: cy }, data: { reverseCharge: true } }), () => d.db.taxRate.update({ where: { id: cy }, data: { reverseCharge: false } })],
+    ['isCompound', () => d.db.taxRate.update({ where: { id: cy }, data: { isCompound: true } }), () => d.db.taxRate.update({ where: { id: cy }, data: { isCompound: false } })],
+    ['taxCategory', () => d.db.taxRate.update({ where: { id: cy }, data: { taxCategory: 'ZERO' } }), () => d.db.taxRate.update({ where: { id: cy }, data: { taxCategory: 'STANDARD' } })],
+    ['component name', () => d.db.taxRateComponent.updateMany({ where: { taxRateId: gr }, data: { name: 'Changed' } }), () => d.db.taxRateComponent.updateMany({ where: { taxRateId: gr }, data: { name: 'VAT' } })],
+    ['component code', () => d.db.taxRateComponent.updateMany({ where: { taxRateId: gr }, data: { accountingTaxType: null } }), () => d.db.taxRateComponent.updateMany({ where: { taxRateId: gr }, data: { accountingTaxType: 'OUTPUT2' } })],
+    ['component order', () => d.db.taxRateComponent.updateMany({ where: { taxRateId: gr }, data: { sortOrder: 4 } }), () => d.db.taxRateComponent.updateMany({ where: { taxRateId: gr }, data: { sortOrder: 0 } })],
+  ]
+  for (const [label, change, restore] of arms) {
+    await change()
+    const before = await ownedDigest(d, w)
+    const r = await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true })
+    assert.equal(r.wrote, false, `${label}: nothing applied`)
+    assert.equal(r.refusal?.code, 'DIGEST_MISMATCH', label)
+    assert.equal(await ownedDigest(d, w), before, `${label}: nothing written`)
+    await restore()
+  }
+  const again = await d.rekey.runTaxRekey({ apply: false })
+  assert.equal(again.plan!.digest, preview.digest, 'control: with every field restored the original digest applies')
+})
+
 // [mutation: the old row's code edited in place instead of a new row -> the never-edited arm fails]
 test('the apply creates new rows, deactivates the old and never edits a referenced row; defaults, storefront mappings and unposted lines move; posted lines stay; a re-run is a no-op', { skip }, async () => {
   const d = await loadDeps()

@@ -283,7 +283,7 @@ async function applyDuplicate(w: World, w6: string, afterPlan: () => void) {
   return done.outcome === 'DONE' ? done : (() => { throw new Error('unreachable') })()
 }
 
-test('a duplicate DELETE: the keeper removed from the store after the plan means no delete and the run stops (KEEPER_GONE); changed means the same; intact means the delete goes', SKIP, async (t) => {
+test('a duplicate DELETE: the keeper removed from the store after the plan means no delete and the run stops (KEEPER_GONE); changed in ANY bound field means no delete (KEEPER_CHANGED); intact means the delete goes', SKIP, async (t) => {
   await buildWorld(t, modules, (w) => withDuplicate(w, async (w6) => {
     const done = await applyDuplicate(w, w6, () => { w.store.rates.delete(w.woo.w1) })
     assert.ok(!w.store.calls.some((c) => c.op === 'remove' && c.id === w6), 'the duplicate was not deleted')
@@ -293,8 +293,22 @@ test('a duplicate DELETE: the keeper removed from the store after the plan means
   await buildWorld(t, modules, (w) => withDuplicate(w, async (w6) => {
     const done = await applyDuplicate(w, w6, () => { w.store.rates.set(w.woo.w1, { ...w.store.rates.get(w.woo.w1)!, rate: '17.0000' }) })
     assert.ok(!w.store.calls.some((c) => c.op === 'remove' && c.id === w6), 'the duplicate was not deleted')
-    assert.match(done.stopped?.reason ?? '', /^KEEPER_GONE/)
+    assert.match(done.stopped?.reason ?? '', /^KEEPER_CHANGED/)
+    assert.match(done.stopped?.reason ?? '', /rate/)
   }))
+  // EVERY bound field of the keeper: an external edit between the plan and the delete stops the delete before it is sent (state, postcode, city, compound, shipping, class, name, country).
+  const edits: Array<[string, Record<string, unknown>]> = [
+    ['state', { state: 'XX' }], ['postcode', { postcode: 'AB1' }], ['city', { city: 'Leeds' }], ['compound', { compound: true }], ['shipping', { shipping: false }],
+    ['class', { class: 'reduced-rate' }], ['name', { name: 'GB VAT (edited)' }], ['country', { country: 'FR' }],
+  ]
+  for (const [field, patch] of edits) {
+    await buildWorld(t, modules, (w) => withDuplicate(w, async (w6) => {
+      const done = await applyDuplicate(w, w6, () => { w.store.rates.set(w.woo.w1, { ...w.store.rates.get(w.woo.w1)!, ...patch }) })
+      assert.ok(!w.store.calls.some((c) => c.op === 'remove' && c.id === w6), `${field}: the duplicate was not deleted`)
+      assert.equal(done.stopped?.key, `delete:${w6}`, field)
+      assert.match(done.stopped?.reason ?? '', new RegExp(`^KEEPER_CHANGED.*${field}`), field)
+    }))
+  }
   await buildWorld(t, modules, (w) => withDuplicate(w, async (w6) => {
     // the keeper is intact in the store but its mapping is no longer stamped for this store: it is not a counterpart this writer owns
     const plan = (await w.m.writer.readWooTaxPlan(w.deps(LIVE))).plan!

@@ -126,7 +126,7 @@ export async function readStoredXeroList(client: Client, now: Date, connectedTen
 export interface PlannedComponent { name: string; rate: string; compoundOnPrevious: boolean; sortOrder: number }
 export interface PlannedCreate {
   taxType: string
-  /** Which documents may pick the new row: PURCHASE (usedFor PURCHASE), SALES (usedFor SALES) or BOTH (a Xero type that applies to revenue AND expenses and that no IMS row carries yet: ONE row, usedFor BOTH). */
+  /** Which documents may pick the new row: PURCHASE (usedFor PURCHASE), SALES (usedFor SALES) or BOTH (a Xero type that applies to revenue AND expenses and that no IMS row carries yet, or whose single active IMS row is usable for both sides and differs: ONE row, usedFor BOTH). */
   side: 'PURCHASE' | 'SALES' | 'BOTH'
   /** The id of the active row this one REPLACES (same type, different percentage): it is deactivated in the same write, never edited. Null for a plain create. */
   replaces: string | null
@@ -325,10 +325,27 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
     plan.salesTypes = [...sideOfType.keys()].sort()
   }
   const targets: Array<{ type: string; side: Side }> = [...types.map((type) => ({ type, side: (bothRequested.has(type) ? 'BOTH' : 'PURCHASE') as Side })), ...plan.salesTypes.map((type) => ({ type, side: sideOfType.get(type)! }))]
+  // ONE ROW SERVING BOTH TARGETS. A dual-side Xero type that was asked for (purchase target) and is also a sales target, whose single active IMS row is usable for BOTH sides, is one row for two
+  // targets. When that row's percentage differs, a replacement per target would be two creates from the same old row (the second refused by name, leaving the old row deactivated by the first with no
+  // active sales-capable row for the type): so the PURCHASE target plans ONE replacement for BOTH sides and the SALES target of the type adds nothing.
+  const sharedBothRow = new Map<string, string>()
+  for (const type of plan.salesTypes) {
+    if (!types.includes(type)) continue
+    const forPurchase = existing.filter((row) => usable(row, 'PURCHASE') && row.accountingTaxType === type)
+    const forSales = existing.filter((row) => usable(row, 'SALES') && row.accountingTaxType === type)
+    if (forPurchase.length === 1 && forSales.length === 1 && forPurchase[0]!.id === forSales[0]!.id) sharedBothRow.set(type, forPurchase[0]!.id)
+  }
+  const replacedAsBoth = new Set<string>()
   const sideWord = (side: Side): string => (side === 'PURCHASE' ? 'purchases' : side === 'SALES' ? 'sales' : 'purchases and sales')
 
   for (const { type, side } of targets) {
     const refuse = (code: PurchaseTaxImportRefusalCode, detail: string): void => { plan.refusals.push({ code, taxType: type, detail }) }
+    let createSide: Side = side
+    if (side === 'SALES' && replacedAsBoth.has(type)) {
+      // The one BOTH replacement planned for this type's purchase target already serves the sales side.
+      plan.rateSet.push({ taxType: type, name: xeroByType.get(type)?.name ?? '', percentage: xeroByType.get(type)?.effectiveRate ?? xeroByType.get(type)?.displayTaxRate ?? null, side, countryCode: null, imsId: null, status: 'created' })
+      continue
+    }
     if (!XERO_TAX_TYPE_RE.test(type)) { refuse('TYPE_NOT_VALID', 'not a Xero tax type'); continue }
     const mine = existing.filter((row) => usable(row, side) && row.accountingTaxType === type)
     const xero = xeroByType.get(type) ?? null
@@ -360,6 +377,7 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
       if (!canReplace) { entry('differs', row); continue }
       replaces = row.id
       replacing.add(row.id)
+      if (side === 'PURCHASE' && sharedBothRow.get(type) === row.id) createSide = 'BOTH'
     } else if (mine.length > 1) { refuse('AMBIGUOUS_EXISTING_RATES', `${mine.length} active IMS rates usable for ${sideWord(side)} already carry this type; which one is the default would be a guess`); entry('missing', null); continue }
     const ineligible = eligible()
     if (ineligible !== null || xero === null) {
@@ -389,9 +407,10 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
       if (replaces !== null) { replacing.delete(replaces); const d = plan.differs.find((x) => x.id === replaces); if (d) d.replaced = false }
       entry(replaces !== null ? 'differs' : 'missing', null); continue
     }
+    if (createSide === 'BOTH') replacedAsBoth.add(type)
     plan.creates.push({
       taxType: type,
-      side,
+      side: createSide,
       replaces,
       name: xero.name.trim(),
       rate,
@@ -481,8 +500,9 @@ export interface PurchaseTaxImportWrite {
  * then RE-READ it: a row whose name, percentage, sides, active flag or components changed since the plan (an editor that held the row while this waited) is not written (the plan named it
  * under its old identity). With `recount`, the documents depending on it are re-counted under its CURRENT name; whatever came to depend on it since the plan stops the write, which rolls back
  * as a whole.
- * STATED LIMIT: sales-order creation does not lock the rate it names (taxRateName), so an order can name the rate between this re-count and the deactivation's commit. Run deactivateAbsent only
- * while sales intake is paused (first load, setup).
+ * The re-count of the orders that NAME the rate (taxRateName) is made under this FOR UPDATE and is complete because every writer of SalesOrder.taxRateName takes FOR SHARE on the active rate
+ * it names, in the transaction that writes the order (lockOrderNamedTaxRate in lib/tax/writable-tax-rate.ts; the census in tests/tax/sales-order-tax-rate-name-writers-census.test.ts pins the
+ * writers): an order that locked first is committed before this lock is granted and is counted; one that arrives later waits for this transaction and finds the rate inactive. No intake pause needed.
  */
 async function lockAndRecheck(tx: Client, row: { id: string; identity: string }, options: { recount: boolean }): Promise<void> {
   // A Prisma.Sql object (not a tagged template) so a structural test double without raw access is simply not locked.
@@ -500,6 +520,10 @@ export async function writePurchaseTaxImport(tx: Client, plan: PurchaseTaxImport
   const result: PurchaseTaxImportWrite = { created: [], suppliersRepointed: 0, mappingsRepointed: 0 }
   // A mapping write takes the shared storefront-mapping lock FIRST, before any row lock (the WooCommerce tax-rate apply holds it exclusively while it re-reads ownership and sends).
   if (plan.creates.some((c) => c.replaces !== null)) await lockStorefrontMappingWrites(tx)
+  // Every existing row this write will replace, narrow or deactivate is locked HERE, in ONE statement in ascending id (the lock order of lib/tax/writable-tax-rate.ts), so an order writer that holds
+  // several rate rows can never wait on this transaction while this one waits on it. The per-row lock and re-read in lockAndRecheck then finds them already held.
+  const touched = [...new Set([...plan.creates.flatMap((c) => (c.replaces === null ? [] : [c.replaces])), ...plan.narrow.map((r) => r.id), ...plan.notInXero.filter((r) => r.deactivate).map((r) => r.id)])]
+  if (touched.length > 0 && typeof (tx as { $queryRaw?: unknown }).$queryRaw === 'function') await tx.$queryRaw(Prisma.sql`SELECT id FROM tax_rates WHERE id = ANY(${touched}::text[]) ORDER BY id FOR UPDATE`)
   for (const create of plan.creates) {
     if (create.replaces !== null) {
       const planned = plan.differs.find((d) => d.id === create.replaces)

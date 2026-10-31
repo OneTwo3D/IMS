@@ -27,9 +27,9 @@
  * digest) turns each into a CLEAR row: retired like a re-key, but its replacement carries NO tax code and the old code joins the retired set. The connectors send NONE for a line with no tax type and
  * the invoice falls back to the order default's code, so the enqueue guard refuses a payload bound to a cleared rate (missing_tax_code) until someone maps it.
  *
- * WHAT THE DIGEST DOES NOT BIND: it binds the plan (rows, outcomes, targets, report types, cleared components, counts, the clear choice, the list digest), not every field copied to the new row
- * (reverseCharge, isCompound, taxCategory, component details beyond count / rate / compound / active). Those are protected by the row locks held from before the plan is built and by the
- * comparison of the old row after its deactivation - a known limit, tracked separately.
+ * WHAT THE DIGEST BINDS: the plan (rows, outcomes, targets, report types, cleared components, counts, the clear choice, the list digest) AND every posting-relevant field copied to the new row
+ * (each row's `copied`: type, taxCategory, isCompound, reverseCharge, reportingCategory and the full snapshot of every component - name, rate, compounding, code, active flag, order). A toggle of
+ * any of them between the preview and the apply is a DIGEST_MISMATCH. The row locks held from before the plan is built and the comparison of the old row after its deactivation stay as belt and braces.
  *
  * THE APPLY (explicit). `confirm` must be the digest of the plan the operator saw. In ONE transaction inside the Xero connection fence (the lock #797's import takes, so a rebind or a second
  * run cannot interleave) the plan is rebuilt from the locked state; a different digest writes NOTHING. For each REKEY it then:
@@ -120,7 +120,21 @@ export interface RekeyImsRate {
   isCompound?: boolean
   reverseCharge?: boolean
   reportingCategory?: string | null
+  /** Copied to the replacement (writeTaxRekey) and so bound by the plan digest. Optional so a fixture may omit them. */
+  type?: string | null
+  taxCategory?: string | null
   components: Array<ImsComponentRow & { name?: string; accountingTaxType?: string | null }>
+}
+
+/** Every posting-relevant field the apply copies from the old rate to its replacement (the old row is never edited). Part of the plan row, so of the digest: a change between the preview and the apply is a DIGEST_MISMATCH. */
+export interface RekeyCopiedFields {
+  type: string | null
+  taxCategory: string | null
+  isCompound: boolean
+  reverseCharge: boolean
+  reportingCategory: string | null
+  /** In copy order (sortOrder, id): the FULL snapshot of each component, not just count / rate / compound / active. */
+  components: Array<{ sortOrder: number; name: string; rate: string; compoundOnPrevious: boolean; accountingTaxType: string | null; active: boolean }>
 }
 
 export interface RekeyClearedComponent { sortOrder: number; name: string; taxType: string }
@@ -144,6 +158,8 @@ export interface RekeyRow {
   candidates: RekeyCandidate[]
   /** Percent text. */
   imsPercent: string
+  /** What the apply copies to the replacement besides name / percentage / sides / country (bound by the digest). */
+  copied: RekeyCopiedFields
   /** The percentage tax is computed at (active components), when it differs from the column. */
   imsEffectivePercent: string | null
   reason: string
@@ -290,6 +306,10 @@ export function matchRekeyRates(input: { rates: readonly RekeyImsRate[]; xero: r
     const base = {
       imsRateId: rate.id, name: rate.name, usedFor: rate.usedFor, countryCode: rate.countryCode, currentCode,
       imsPercent: column.toFixed(), imsEffectivePercent: effective.eq(column) ? null : effective.toFixed(),
+      copied: {
+        type: rate.type ?? null, taxCategory: rate.taxCategory ?? null, isCompound: rate.isCompound ?? false, reverseCharge: rate.reverseCharge ?? false, reportingCategory: rate.reportingCategory ?? null,
+        components: rate.components.map((c, index) => ({ sortOrder: c.sortOrder ?? index, name: c.name ?? '', rate: new Dec(c.rate).toFixed(4), compoundOnPrevious: c.compoundOnPrevious, accountingTaxType: c.accountingTaxType ?? null, active: c.active })),
+      },
     }
     const exact = xero.filter((row) => collapseName(row.name) === name)
     const tier = exact.length > 0 ? exact : xero.filter((row) => comparableName(row.name) === comparableName(name))
@@ -378,7 +398,7 @@ export function digestRekeyPlan(plan: Pick<RekeyPlan, 'list' | 'rows' | 'blocker
   const refs = Object.keys(plan.references).sort().map((id) => {
     return [id, plan.references[id]!] as const
   })
-  const canonical = { v: 2, clearUnresolved: plan.clearUnresolved, tenantId: plan.list.tenantId, list: plan.list.digest, rows: plan.rows, blockers: plan.blockers, references: refs }
+  const canonical = { v: 3, clearUnresolved: plan.clearUnresolved, tenantId: plan.list.tenantId, list: plan.list.digest, rows: plan.rows, blockers: plan.blockers, references: refs }
   return createHash('sha256').update(JSON.stringify(canonical)).digest('hex')
 }
 
@@ -512,12 +532,12 @@ export async function readRekeyPlan(client: Client, options: { now: Date; connec
   }
   const stored = await client.taxRate.findMany({
     where: { active: true },
-    select: { id: true, name: true, rate: true, usedFor: true, countryCode: true, accountingTaxType: true, isDefault: true, isCompound: true, reverseCharge: true, reportingCategory: true, components: { select: { name: true, rate: true, compoundOnPrevious: true, accountingTaxType: true, active: true, sortOrder: true }, orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } },
+    select: { id: true, name: true, rate: true, type: true, taxCategory: true, usedFor: true, countryCode: true, accountingTaxType: true, isDefault: true, isCompound: true, reverseCharge: true, reportingCategory: true, components: { select: { name: true, rate: true, compoundOnPrevious: true, accountingTaxType: true, active: true, sortOrder: true }, orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } },
     orderBy: [{ name: 'asc' }, { id: 'asc' }],
   })
   const rates: RekeyImsRate[] = stored.map((r) => ({
     id: r.id, name: r.name, rate: r.rate.toFixed(4), usedFor: r.usedFor, countryCode: r.countryCode, accountingTaxType: r.accountingTaxType, isDefault: r.isDefault,
-    isCompound: r.isCompound, reverseCharge: r.reverseCharge, reportingCategory: r.reportingCategory,
+    isCompound: r.isCompound, reverseCharge: r.reverseCharge, reportingCategory: r.reportingCategory, type: r.type, taxCategory: r.taxCategory,
     components: r.components.map((c) => ({ name: c.name, rate: c.rate.toFixed(4), compoundOnPrevious: c.compoundOnPrevious, accountingTaxType: c.accountingTaxType, active: c.active, sortOrder: c.sortOrder })),
   }))
   const matched = matchRekeyRates({ rates, xero: read.list.rows })

@@ -204,6 +204,64 @@ test('DELETE: of two store rates mapped to one IMS rate, the one nearer the desi
   assert.deepEqual(applyToWorld(input, p).woo, [])
 })
 
+// [mutation: keeper left out of the DELETE (set to null) -> the recorded-keeper arm fails; mutation: one keeper field dropped from keeperFieldsOfWoo -> its digest arm fails; mutation: the keeper not required by revalidation -> the revalidation arm fails]
+test('DELETE (duplicate): the plan names the intended keeper and binds its full live fields into the delete and the digest', () => {
+  const build = (keeperOver: Partial<WooTaxRateDetail> = {}) => {
+    const input = consistent()
+    input.woo = input.woo.map((w) => (w.id === '1' ? { ...w, ...keeperOver } : w))
+    input.mappings = input.mappings.map((m) => (m.externalTaxRateId === '1' ? mapOf(input.woo.find((w) => w.id === '1')!, 'rGB') : m))
+    const twin = woo('5', { name: 'GB VAT', rate: '17.5000' })
+    input.woo.push(twin)
+    input.mappings.push(mapOf(twin, 'rGB'))
+    return { input, plan: plan(input) }
+  }
+  const { input, plan: p } = build()
+  const change = only(p)
+  assert.equal(change.kind, 'DELETE')
+  if (change.kind !== 'DELETE') return
+  const keeperLive = input.woo.find((w) => w.id === '1')!
+  assert.deepEqual(change.keeper, {
+    wooId: '1',
+    fields: { name: keeperLive.name, rate: keeperLive.rate, country: keeperLive.country, state: keeperLive.state, postcode: keeperLive.postcode, city: keeperLive.city, class: keeperLive.class, shipping: keeperLive.shipping, compound: keeperLive.compound },
+  })
+  // A keeper with a postcode and a city (the plan reports them as a finding and leaves them alone): both are recorded.
+  const located = build({ postcode: 'AB1 2CD', city: 'Leeds' })
+  const locatedChange = only(located.plan)
+  assert.deepEqual(locatedChange.kind === 'DELETE' ? [locatedChange.keeper?.fields.postcode, locatedChange.keeper?.fields.city] : null, ['AB1 2CD', 'Leeds'])
+  // Differences the plan's own comparisons treat as equal (so no UPDATE, no finding) still move the digest, because the keeper's live fields are bound.
+  const base = p.digest
+  assert.equal(build().plan.digest, base, 'control: same state, same digest')
+  const variants: Array<[string, Partial<WooTaxRateDetail>]> = [
+    ['name spelling', { name: 'gb  vat' }],
+    ['rate text', { rate: '20' }],
+    ['class spelling', { class: '' }],
+    ['country spelling', { country: 'UK' }],
+  ]
+  for (const [label, over] of variants) {
+    const other = build(over).plan
+    assert.deepEqual(other.changes.filter((c) => c.kind !== 'DELETE'), [], `${label}: precondition, the keeper still needs no update`)
+    assert.notEqual(other.digest, base, `${label}: the keeper's live field is in the digest`)
+  }
+  // An out-of-scope delete has no keeper.
+  const gone = consistent()
+  gone.rates = gone.rates.map((r) => (r.id === 'rDE' ? { ...r, active: false } : r))
+  const out = only(plan(gone))
+  assert.equal(out.kind === 'DELETE' ? out.keeper : undefined, null)
+  // Revalidation: the keeper must still be a stamped counterpart of the IMS rate.
+  const mappings = input.mappings
+  const base2 = { change, storeIdentity: STORE, rate: input.rates.find((r) => r.id === 'rGB'), componentRates: [], live: input.woo.find((w) => w.id === '5') }
+  assert.equal(revalidateWooTaxChange({ ...base2, mappings }), null)
+  assert.equal(revalidateWooTaxChange({ ...base2, mappings: mappings.filter((m) => m.externalTaxRateId !== '1') }), 'IMS_RATE_CHANGED', 'the keeper mapping is gone')
+  assert.equal(revalidateWooTaxChange({ ...base2, mappings: mappings.map((m) => (m.externalTaxRateId === '1' ? { ...m, storeIdentity: null } : m)) }), 'IMS_RATE_CHANGED', 'the keeper is no longer stamped')
+  assert.equal(revalidateWooTaxChange({ ...base2, change: { ...change, keeper: null }, mappings }), 'IMS_RATE_CHANGED', 'a duplicate delete with no keeper is not sent')
+  // Another stamped counterpart of the IMS rate does not stand in for the intended keeper, and a keeper that is the deleted rate itself is no keeper.
+  const third = woo('9', { name: 'GB VAT' })
+  assert.equal(revalidateWooTaxChange({ ...base2, mappings: [...mappings.filter((m) => m.externalTaxRateId !== '1'), mapOf(third, 'rGB')] }), 'IMS_RATE_CHANGED', 'the intended keeper is gone, another counterpart exists')
+  assert.equal(revalidateWooTaxChange({ ...base2, change: { ...change, keeper: { ...change.keeper!, wooId: '5' } }, mappings }), 'IMS_RATE_CHANGED', 'the keeper is the rate being deleted')
+  // Another counterpart does not stand in for the intended keeper.
+  assert.equal(revalidateWooTaxChange({ ...base2, mappings: mappings.map((m) => (m.externalTaxRateId === '1' ? { ...m, taxRateId: 'rDE' } : m)) }), 'IMS_RATE_CHANGED', 'the keeper mapping now points elsewhere')
+})
+
 test('OWNERSHIP: a store rate that is not mapped and not recorded is never touched, however wrong it is, and is only counted', () => {
   const input = consistent()
   input.woo.push(woo('77', { name: 'Hand made', rate: '99.0000', country: 'FR', class: 'weird', shipping: false, compound: true }))
