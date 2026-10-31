@@ -17,6 +17,7 @@ import type { PreparedRun } from '../../lib/first-load/apply/prepared'
 import { CLEAN_PRELOAD, CLEAN_SNAPSHOT } from './apply-preload'
 import { loadOk, NO_LOCK, prepareSynthetic, preparedFiles, WAREHOUSES } from './apply-helpers'
 import { precondition } from './helpers'
+import { D } from '../../lib/first-load/money'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-keys'
 import { digestTaxRateList, type NormalisedXeroTaxRate } from '../../lib/connectors/xero/tax-rate-list'
 import { seedXeroList as seedTrustedList } from './apply-xero-list'
@@ -2205,6 +2206,35 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         const pin = await m.db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.31', fetchedAt: new Date('2026-09-15T08:00:00Z'), source: 'manual', manualOverride: true } })
         try { assert.match((await rails('purchase-orders')).join(';'), /the rate is not the fx_rates rate/, 'a manual override on the created day is the latest row at that instant, so it is the table rate') } finally { await m.db.fxRate.delete({ where: { id: pin.id } }) }
         assert.deepEqual(await rails('purchase-orders'), [])
+      })
+
+      // [mutation: do not run the fx rail for the opening-stock step; skip the rate comparison; skip the base-cost comparison; read the rate at the start of the day instead of its end; ignore a missing live rate]
+      it('opening stock: each foreign lot\'s rate and base cost must be EXACTLY the live fx_rates rate at the end of its received day; any difference, or no live rate, refuses before opening stock is written', async () => {
+        const evidence = (over: Record<string, string> = {}) => ({ sku: 'ZQSENT-OAK-BOARD', warehouseCode: 'ZQSENT-MAIN', lotRef: 'L1', currency: 'EUR', receivedDate: '2026-09-12', qty: '10', unitCostForeign: '5', fxRateToBase: '1.25', unitCostBase: '4', ...over })
+        const withLots = (lots: Array<ReturnType<typeof evidence>>) => ({ ...prepared, report: { ...prepared.report, stock: { ...prepared.report.stock, lots: lots } } }) as unknown as PreparedRun
+        const check = (run: PreparedRun) => evaluateRails(run, { phase: 'recheck', resuming: true, step: 'opening-stock' })
+        assert.deepEqual(await check(prepared), [], 'control: a run with no foreign lots has nothing to compare')
+        assert.deepEqual(await check(withLots([evidence()])), [], 'control: the lot was priced at the live table rate and its base cost is the foreign cost over it')
+        // a dataset rate that is not the live rate (0.8% off: no tolerance), and its consistent-looking base cost
+        const wrongRate = await check(withLots([evidence({ fxRateToBase: '1.26', unitCostBase: new D('5').div('1.26').toFixed() })]))
+        assert.match(wrongRate.join(';'), /OPENING_FX_RATE_NOT_TABLE_RATE/)
+        // the live rate right, the derived base cost not (a cost edited by hand)
+        assert.match((await check(withLots([evidence({ unitCostBase: '4.01' })]))).join(';'), /OPENING_FX_BASE_COST_NOT_TABLE_COST/)
+        // the live rate changed after prepare
+        const atDay = await m.db.fxRate.findFirstOrThrow({ where: { toCurrency: 'EUR', fetchedAt: new Date('2026-09-10T06:00:00Z') } })
+        await m.db.fxRate.update({ where: { id: atDay.id }, data: { rate: '1.26' } })
+        try { assert.match((await check(withLots([evidence()]))).join(';'), /OPENING_FX_RATE_NOT_TABLE_RATE/) } finally { await m.db.fxRate.update({ where: { id: atDay.id }, data: { rate: '1.25' } }) }
+        // the END of the received day is the instant: a row fetched later that same day is the table rate, and the older one is refused
+        const sameDay = await m.db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.30', fetchedAt: new Date('2026-09-12T20:00:00Z') } })
+        try { assert.match((await check(withLots([evidence()]))).join(';'), /OPENING_FX_RATE_NOT_TABLE_RATE/) } finally { await m.db.fxRate.delete({ where: { id: sameDay.id } }) }
+        // no row on or before that day
+        await m.db.fxRate.update({ where: { id: atDay.id }, data: { fetchedAt: new Date('2026-09-16T06:00:00Z') } })
+        try { assert.match((await check(withLots([evidence()]))).join(';'), /OPENING_FX_RATE_MISSING/) } finally { await m.db.fxRate.update({ where: { id: atDay.id }, data: { fetchedAt: new Date('2026-09-10T06:00:00Z') } }) }
+        // a currency IMS holds no rate for at all
+        assert.match((await check(withLots([evidence({ currency: 'SEK' })]))).join(';'), /OPENING_FX_RATE_MISSING/)
+        // the rail is the step's: it also runs in the plan and preflight evaluations (no step), and a purchase-orders-only evaluation does not read the lots
+        assert.match((await evaluateRails(withLots([evidence({ fxRateToBase: '1.26', unitCostBase: new D('5').div('1.26').toFixed() })]), { phase: 'recheck', resuming: true, step: null })).join(';'), /OPENING_FX_RATE_NOT_TABLE_RATE/)
+        assert.deepEqual(await evaluateRails(withLots([evidence({ fxRateToBase: '1.26' })]), { phase: 'recheck', resuming: true, step: 'purchase-orders' }), [], 'only the opening-stock step reads the lots')
       })
 
       it('purchase orders: a tax that matches no active purchase rate, and an order-level name spelt differently, are refused', async () => {

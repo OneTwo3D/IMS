@@ -337,3 +337,26 @@ test('a REALISED_FX_JOURNAL queued before this change is retired with a named re
   assert.match(REALISED_FX_JOURNAL_RETIRED_REASON, /Xero books the realised FX/)
   assert.ok(state.activities.some((a) => a.action === 'xero_realised_fx_journal_retired'))
 })
+
+// A payment of zero or less is never sent. [mutation: remove the guard from one case; test `< 0` (zero passes); test the absolute value (negative passes); report failure instead of retiring (a retry loop); skip the notice]
+for (const type of ['BILL_PAYMENT', 'INVOICE_PAYMENT'] as const) {
+  for (const [label, amount] of [['zero', 0], ['negative', -25], ['NaN', Number.NaN], ['a non-numeric string', 'abc']] as const) {
+    test(`a queued ${type} with ${label} amount makes NO remote call and is retired terminally with a named reason`, async () => {
+      const { result, payments, row } = await post({ ...BILL, amount, currency: 'GBP' }, type)
+      assert.deepEqual(state.posts, [], 'nothing reached Xero')
+      assert.deepEqual(payments, [])
+      assert.equal(result.succeeded, 0)
+      assert.equal(result.failed, 0, 'a refusal is not a failure that retries')
+      assert.equal(row.status, 'CANCELLED', 'terminal')
+      assert.equal(row.retryCount, 0)
+      assert.match(row.errorMessage ?? '', new RegExp(`${type} not sent: its amount .* is not a positive number`))
+      assert.equal(row.externalTransactionId, null)
+      assert.ok(state.activities.some((a) => a.action === 'xero_payment_refused_non_positive_amount'), 'and the operator is told')
+    })
+  }
+  test(`a queued ${type} with a positive amount still posts exactly once`, async () => {
+    const { result, payments } = await post({ ...BILL, amount: 0.01, currency: 'GBP' }, type)
+    assert.equal(result.succeeded, 1, state.rows[0]!.errorMessage ?? '')
+    assert.equal(payments.length, 1)
+  })
+}

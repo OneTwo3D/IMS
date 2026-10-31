@@ -568,14 +568,80 @@ function fxGainLossClient(rates: Array<{ rate: string; at: string }>): FinanceAn
 }
 const fxOpts = (client: FinanceAnalyticsClient) => ({ deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z'), accountingSettings: settings } })
 
-test('FX gain/loss: two different rates at the latest instant refuse instead of picking one', async () => {
-  const client = fxGainLossClient([{ rate: '1.5', at: '2026-06-09T00:00:00.000Z' }, { rate: '1.6', at: '2026-06-09T00:00:00.000Z' }])
-  await assert.rejects(getFxGainLossReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, fxOpts(client)), /Ambiguous GBP FX rate for USD/)
+const fxWindow = { dateFrom: '2026-06-01', dateTo: '2026-06-30' }
+
+async function assertUnusableRateRow(rates: Array<{ rate: string; at: string }>, reason: RegExp) {
+  const report = await getFxGainLossReport(fxWindow, fxOpts(fxGainLossClient(rates)))
+  const row = report.rows[0]
+  assert.equal(report.rows.length, 1, 'the report continues instead of aborting')
+  assert.equal(row?.outcome, 'not_computable')
+  assert.match(String(row?.notComputableReason), reason)
+  assert.equal(row?.settlementRateToBase, '', 'no rate shown')
+  assert.equal(row?.gainLossBase, '', 'no value computed at the booked rate or at 1')
+  assert.equal(report.totals.unconvertedCount, '1')
+}
+
+test('FX gain/loss: two different rates at the latest instant list the row as not computable (ambiguous) and the report continues', async () => {
+  await assertUnusableRateRow([{ rate: '1.5', at: '2026-06-09T00:00:00.000Z' }, { rate: '1.6', at: '2026-06-09T00:00:00.000Z' }], /Ambiguous GBP FX rate for USD/)
 })
 
-test('FX gain/loss: a stored zero rate refuses (it used to become 1)', async () => {
-  const client = fxGainLossClient([{ rate: '0', at: '2026-06-09T00:00:00.000Z' }])
-  await assert.rejects(getFxGainLossReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, fxOpts(client)), /Invalid stored GBP FX rate for USD/)
+test('FX gain/loss: a stored zero rate lists the row as not computable with its reason (it used to abort the report)', async () => {
+  await assertUnusableRateRow([{ rate: '0', at: '2026-06-09T00:00:00.000Z' }], /Invalid stored GBP FX rate for USD.*not a positive number/)
+})
+
+test('FX gain/loss: a stored negative rate lists the row as not computable with its reason', async () => {
+  await assertUnusableRateRow([{ rate: '-1.5', at: '2026-06-09T00:00:00.000Z' }], /Invalid stored GBP FX rate for USD.*not a positive number/)
+})
+
+test('FX gain/loss: a non-finite stored rate lists the row as not computable with its reason', async () => {
+  await assertUnusableRateRow([{ rate: 'Infinity', at: '2026-06-09T00:00:00.000Z' }], /not a positive number/)
+})
+
+test('FX gain/loss: an unusable rate on one currency does not blank the other rows or the totals', async () => {
+  const base = fxGainLossClient([{ rate: '1.5', at: '2026-06-09T00:00:00.000Z' }])
+  const rates = [
+    { fromCurrency: 'GBP', toCurrency: 'USD', rate: decimal('1.5'), fetchedAt: new Date('2026-06-09T00:00:00.000Z') },
+    { fromCurrency: 'GBP', toCurrency: 'CHF', rate: decimal('0'), fetchedAt: new Date('2026-06-09T00:00:00.000Z') },
+  ]
+  const client: FinanceAnalyticsClient = {
+    ...base,
+    fxRate: { findMany: async () => rates },
+    payment: {
+      findMany: async () => [
+        { id: 'payment-1', amount: decimal('120'), currency: 'USD', paidAt: new Date('2026-06-10T00:00:00.000Z'), refundId: null, order: { id: 'so-1', orderNumber: 'SO-1', invoiceNumber: 'INV-1', currency: 'USD', fxRateToBase: decimal('1.2'), customerName: 'A', customerEmail: null } },
+        { id: 'payment-2', amount: decimal('50'), currency: 'CHF', paidAt: new Date('2026-06-12T00:00:00.000Z'), refundId: null, order: { id: 'so-2', orderNumber: 'SO-2', invoiceNumber: 'INV-2', currency: 'CHF', fxRateToBase: decimal('1.1'), customerName: 'B', customerEmail: null } },
+      ],
+    },
+  }
+  const report = await getFxGainLossReport(fxWindow, fxOpts(client))
+  assert.deepEqual(report.rows.map((r) => [r.settlementId, r.outcome]), [['payment-1', 'loss'], ['payment-2', 'not_computable']])
+  assert.match(String(report.rows[1]?.notComputableReason), /not a positive number/)
+  assert.equal(report.totals.lossesBase, '20')
+  assert.equal(report.totals.unconvertedCount, '1')
+})
+
+test('FX gain/loss: a paid BILL with an unusable (zero) rate is also listed as not computable (the payable path)', async () => {
+  const client: FinanceAnalyticsClient = {
+    ...fxGainLossClient([]),
+    fxRate: { findMany: async () => [{ fromCurrency: 'GBP', toCurrency: 'CHF', rate: decimal('0'), fetchedAt: new Date('2026-06-09T00:00:00.000Z') }] },
+    payment: { findMany: async () => [] },
+    purchaseInvoice: {
+      findMany: async () => [{
+        id: 'inv-1', invoiceNumber: 'BILL-1', paidAt: new Date('2026-06-10T00:00:00.000Z'), totalForeign: decimal('100'), totalBase: decimal('80'),
+        fxRateToBase: decimal('1.25'), po: { reference: 'PO-1', currency: 'CHF', supplier: { name: 'Supplier' } },
+      }],
+    },
+  } as unknown as FinanceAnalyticsClient
+  const report = await getFxGainLossReport(fxWindow, fxOpts(client))
+  assert.equal(report.rows[0]?.side, 'payable')
+  assert.equal(report.rows[0]?.outcome, 'not_computable')
+  assert.match(String(report.rows[0]?.notComputableReason), /not a positive number/)
+})
+
+test('FX gain/loss: an error that is not an FX-rate refusal still aborts the report (only MissingFxRateError becomes a row)', async () => {
+  const poisoned = { fromCurrency: 'GBP', toCurrency: 'USD', fetchedAt: new Date('2026-06-09T00:00:00.000Z'), get rate(): never { throw new Error('rate store exploded') } }
+  const client: FinanceAnalyticsClient = { ...fxGainLossClient([]), fxRate: { findMany: async () => [poisoned] as never } }
+  await assert.rejects(getFxGainLossReport(fxWindow, fxOpts(client)), /rate store exploded/)
 })
 
 test('FX gain/loss: no stored rate on or before the payment lists the item as NOT COMPUTABLE with the reason, never at the booked rate or 1', async () => {

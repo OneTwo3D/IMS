@@ -1226,6 +1226,23 @@ export function invoicePaymentAmountNotRepresentableDescription(params: {
 }
 
 /**
+ * A RECEIPT OF ZERO OR LESS IS NOT MONEY RECEIVED, so it is never registered as a payment. A legacy zero or negative non-refund
+ * row on a posted invoice would otherwise reach the capacity arithmetic, which tests only the upper bound. States the fact and
+ * nothing else; the remedy is `invoicePaymentRemedyNote`'s to decide.
+ */
+export function invoicePaymentAmountNotPositiveDescription(params: {
+  orderReference: string
+  amount: string
+  currency: string
+  redrive: InvoicePaymentRedrive
+}): string {
+  return `Recorded ${params.currency} ${params.amount} against ${params.orderReference}, but a payment of zero or less is not `
+    + `money received, so NOTHING was sent and no registration was queued. This is terminal for this figure: recording the `
+    + `same amount again is refused again for the same reason. `
+    + invoicePaymentRemedyNote(params.redrive)
+}
+
+/**
  * THE DEFERRED WRAPPER'S OWN THREE MESSAGES (o3d-0bfh r13, Codex HIGH).
  *
  * Every one of these is written from inside `registerDeferredOrderReceipts`, i.e. always under a
@@ -1387,6 +1404,20 @@ export async function registerInvoicePaymentWithLedger(params: {
      * receipt this large is not a rounding problem to be absorbed — it is money IMS would have to
      * misstate to move, and the operator has to split it or register it in the ledger by hand.
      */
+    // A RECEIPT OF ZERO OR LESS IS REFUSED BEFORE ANYTHING IS QUEUED, for the same reason (a fact about the receipt alone) and in the same place: the sweep query also
+    // excludes such rows, but this is the rail every caller (inline, deferred, operator re-drive) goes through.
+    if (!params.amount.gt(0)) {
+      await warn('invoice_payment_not_registered',
+        invoicePaymentAmountNotPositiveDescription({
+          orderReference: params.orderReference,
+          amount: params.amount.toFixed(),
+          currency: params.currency,
+          redrive: await redriveFor(null),
+        }),
+        { amount: params.amount.toFixed(), currency: params.currency, refusal: 'AMOUNT_NOT_POSITIVE' })
+      return registeredFor.connector
+    }
+
     if (!invoicePaymentAmountRoundTrips(params.amount)) {
       await warn('invoice_payment_not_registered',
         invoicePaymentAmountNotRepresentableDescription({

@@ -211,9 +211,10 @@ test('chain to the tool: opening-stock quantity and value must equal the prepare
   const text = problemsOf(marked).join('\n')
   assert.match(text, /TOTAL_QUANTITY_MISMATCH/)
   for (const figure of ['918273', '564738', '61', '443.83', '76']) assert.ok(!new RegExp(`(^|[^0-9])${figure.replace('.', '\\.')}([^0-9]|$)`).test(text), `the figure ${figure} is not printed`)
-  // The same edit with the totals ALSO fixed in the report is the tool's problem, not a tampering: it is accepted at this layer.
+  // The same edit with the totals ALSO fixed in the report no longer passes the totals, but the lot evidence in the report still describes the ORIGINAL lots: the edited row (61, not 60)
+  // is not reproduced by them, so it is refused as a lot mismatch and nothing else.
   const fixed = withReport(changed, (r) => { r.stock.totals.openingQty = '77'; r.stock.totals.openingValueBase = '443.833313' })
-  assert.deepEqual(problemsOf(fixed), [])
+  assert.deepEqual(problemsOf(fixed).map((p) => p.replace(/chunk \d+ line \d+/, 'ROW')), ['opening-stock ROW: the lots in the prepared report do not reproduce this row\'s quantity and weighted-average cost (a lot is missing, added or altered)'])
 })
 
 // ---------------------------------------------------------------------------------------------------------------------------------

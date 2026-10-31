@@ -77,7 +77,12 @@ export async function evaluateRailResults(prepared: PreparedRun, scope: RailScop
     await rail('forbidden-skus', (p) => forbiddenSkus(prepared, p))
     if (scope.phase === 'preflight' && !scope.resuming) await rail('currency-lock', baseCurrencyNotLocked)
     if ((relevant('opening-stock') || relevant('purchase-orders')) && Object.keys(prepared.manifest.expectWarehouses).length > 0) await rail('warehouses', (p) => warehouses(prepared, p))
-    if (relevant('purchase-orders')) await rail('fx-rates', async (p) => { await fxRates(prepared, p); await poSupplierCurrencies(prepared, p) })
+    if (relevant('purchase-orders') || relevant('opening-stock')) {
+      await rail('fx-rates', async (p) => {
+        if (relevant('purchase-orders')) { await fxRates(prepared, p); await poSupplierCurrencies(prepared, p) }
+        if (relevant('opening-stock')) await openingStockFxRates(prepared, p)
+      })
+    }
     if (relevant('suppliers') || relevant('purchase-orders')) {
       await rail('tax-rates', async (p, note) => {
         if (relevant('suppliers')) await supplierTaxRates(prepared, p, { allowImport: scope.strictSupplierTax !== true, note })
@@ -282,6 +287,38 @@ async function fxRates(prepared: PreparedRun, problems: string[]): Promise<void>
       }
     }
     if (!rate.eq(new D(expected))) problems.push(`PO_FX_RATE_NOT_TABLE_RATE: ${at}: the rate is not the fx_rates rate for that currency at the end of that day (it must be exactly the table rate; a rate is only ever read from fx_rates)`)
+  }
+}
+
+/**
+ * OPENING-STOCK FX RAIL. A foreign-currency lot's base cost is its foreign cost over the fx_rates rate at the END of its received day (one rate, owner ruling 2026-10-25). The prepare step
+ * read that rate from the supplied ims-fx-rates rows and carried, per foreign lot, its currency, received day, foreign cost, selected rate and derived base cost (the report's
+ * stock.lots, which the file-side load proved reproduces the hashed opening-stock rows). The opening-stock file holds only the collapsed weighted average, so an opening-stock-only run with a wrong
+ * dataset rate would otherwise write a wrong base cost. Here each lot's rate and derived base cost are compared, decimal-exact, with the LIVE central lookup, and ANY difference (or a
+ * missing/unusable live rate) refuses the run before opening stock is written. The runner never writes a rate.
+ */
+async function openingStockFxRates(prepared: PreparedRun, problems: string[]): Promise<void> {
+  const base = prepared.manifest.baseCurrency.toUpperCase()
+  const lots = prepared.report.stock.lots.filter((lot) => lot.currency.toUpperCase() !== base)
+  const live = new Map<string, Dec | string>()
+  let index = 0
+  for (const lot of lots) {
+    index += 1
+    const at = `foreign lot ${index} of the opening-stock evidence (${lot.currency}, received ${lot.receivedDate})`
+    const memo = `${lot.currency}|${lot.receivedDate}`
+    let expected = live.get(memo)
+    if (expected === undefined) {
+      try {
+        expected = new D((await getFxRateToBase(db, { currency: lot.currency, asOf: endOfBusinessDateUtc(lot.receivedDate), baseCurrency: base })).rate.toFixed())
+      } catch (error) {
+        if (!isMissingFxRateError(error)) throw error
+        expected = 'missing'
+      }
+      live.set(memo, expected)
+    }
+    if (typeof expected === 'string') { problems.push(`OPENING_FX_RATE_MISSING: ${at}: the database holds no usable rate for it on or before the end of that day`); continue }
+    if (!new D(lot.fxRateToBase).eq(expected)) { problems.push(`OPENING_FX_RATE_NOT_TABLE_RATE: ${at}: the rate the prepare step used is not the fx_rates rate for that currency at the end of that day (it must be exactly the table rate; a rate is only ever read from fx_rates)`); continue }
+    if (!new D(lot.unitCostBase).eq(new D(lot.unitCostForeign).div(expected))) problems.push(`OPENING_FX_BASE_COST_NOT_TABLE_COST: ${at}: the base cost the prepare step derived is not the foreign cost divided by the fx_rates rate`)
   }
 }
 

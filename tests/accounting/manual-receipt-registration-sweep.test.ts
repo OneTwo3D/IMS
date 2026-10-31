@@ -167,6 +167,35 @@ test('selection: refunds, young receipts, unposted invoices, registered receipts
   assert.deepEqual(order, [older!.id, newer!.id, failedBefore!.id], 'oldest first, the recently failed one behind the others')
 })
 
+// [mutation: remove `p.amount > 0` from the sweep query; make it `>= 0` (zero rows are selected); drop it only for negatives]
+test('selection: a zero or negative non-refund receipt on a posted invoice is not a candidate; the positive one beside it is', async () => {
+  const { sweepUnregisteredReceipts, receiptRegistrationSeams } = await import('@/lib/domain/accounting/receipt-registration-sweep')
+  const seen: string[] = []
+  const mk = async (amount: number) => {
+    const o = await postedOrder()
+    const p = await s.db.payment.create({ data: { orderId: o.id, amount, currency: 'GBP', method: 'Hand' } })
+    await age(p.id, 60)
+    return p
+  }
+  const zero = await mk(0)
+  const negative = await mk(-5)
+  const positive = await mk(5)
+  receiptRegistrationSeams.registrationsAreOwed = async () => true
+  receiptRegistrationSeams.obligationIsOnRecord = async () => false
+  receiptRegistrationSeams.beforeSweepRegisters = async (pid) => { seen.push(pid) }
+  mode = 'fail'
+  calls.length = 0
+  try { await sweepUnregisteredReceipts(250) } finally {
+    receiptRegistrationSeams.beforeSweepRegisters = undefined
+    receiptRegistrationSeams.registrationsAreOwed = undefined
+    receiptRegistrationSeams.obligationIsOnRecord = (await import('@/lib/domain/accounting/receipt-registration-sweep')).receiptObligationIsOnRecord
+  }
+  assert.ok(seen.includes(positive.id), 'PRECONDITION: the positive receipt is a candidate')
+  assert.ok(!seen.includes(zero.id), 'a zero receipt is never swept')
+  assert.ok(!seen.includes(negative.id), 'a negative receipt is never swept')
+  assert.ok(!calls.some((c) => c.paymentId === zero.id || c.paymentId === negative.id), 'and registration is never attempted for either')
+})
+
 // [mutation: restore the standalone null-document-id clause (an unrecorded id counts as current) -> the older-null-id arm goes red; remove the current-invoice scoping of the follow-up exclusion (any marker row on the order excludes it) -> the stale-marker arm goes red; make the scoping too loose (ignore the marker entirely) -> the pending arms go red]
 test('a follow-up marker left on a SUPERSEDED invoice does not hide a later receipt; one on the CURRENT invoice still does', async () => {
   const { sweepUnregisteredReceipts, receiptRegistrationSeams } = await import('@/lib/domain/accounting/receipt-registration-sweep')

@@ -5972,6 +5972,36 @@ async function isFirstPurchaseCreditNoteAttempt(
 }
 
 /**
+ * A PAYMENT OF ZERO OR LESS IS NEVER SENT TO XERO. Money received or paid is a positive amount; the enqueue refuses a non-positive receipt, but a row queued before that rule,
+ * a retry, or a row written by any path outside the enqueue reaches this processor with whatever amount it carries, and the capacity check below it is an upper bound only.
+ * So the rule is held HERE, at the one boundary every INVOICE_PAYMENT and BILL_PAYMENT passes before any claim, fence or request: the row is retired as CANCELLED (terminal,
+ * claim-fenced, nothing was sent, so it is not a failure that retries) with the reason on it and an operator notice.
+ */
+async function refuseNonPositivePayment(params: {
+  type: 'INVOICE_PAYMENT' | 'BILL_PAYMENT'
+  entryId: string
+  lease: HeldClaim
+  referenceType: string
+  referenceId: string
+  amount: unknown
+}): Promise<{ success: true; skipped: true } | null> {
+  const numeric = typeof params.amount === 'number' || typeof params.amount === 'string' ? Number(params.amount) : Number.NaN
+  if (Number.isFinite(numeric) && numeric > 0) return null
+  const reason = `${params.type} not sent: its amount (${String(params.amount)}) is not a positive number, and a payment of zero or less is not money moved. The row was retired and nothing was sent to Xero.`
+  const retired = await db.$transaction((tx) => retireOverSettlingInvoicePayment(tx, { entryId: params.entryId, claim: params.lease, reason }))
+  await logActivity({
+    entityType: params.referenceType === 'SalesOrder' ? 'SALES_ORDER' : 'SYSTEM',
+    ...(params.referenceType === 'SalesOrder' ? { entityId: params.referenceId } : {}),
+    action: 'xero_payment_refused_non_positive_amount',
+    tag: 'accounting',
+    level: 'ERROR',
+    description: `${reason} (sync row ${params.entryId}, ${params.referenceType} ${params.referenceId}).`,
+    metadata: { syncLogId: params.entryId, type: params.type, referenceType: params.referenceType, referenceId: params.referenceId, amount: String(params.amount), retired },
+  }).catch(() => { /* logging must never turn a safe refusal into a failure */ })
+  return { success: true, skipped: true }
+}
+
+/**
  * o3d-19gy / o3d-s36z / o3d-gfh: every remote call this entry makes is attributed to this entry's row.
  *
  * WHERE THE PERMISSION IS ACTUALLY GRANTED. Not here. This establishes the INTENT — which row is being
@@ -6225,6 +6255,8 @@ export async function processClaimedEntry(
       if (!accountingInvoiceId || !bankAccountId || amount == null) {
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for INVOICE_PAYMENT' }
       }
+      const nonPositive = await refuseNonPositivePayment({ type: 'INVOICE_PAYMENT', entryId, lease, referenceType, referenceId, amount })
+      if (nonPositive) return nonPositive
       // A store-credit order's invoice is never posted by IMS, so a payment against it is refused at the same
       // boundary, whatever enqueued or revived it.
       const creditRefusal = referenceType === 'SalesOrder'
@@ -6485,6 +6517,8 @@ export async function processClaimedEntry(
       if (!accountingInvoiceId || !bankAccountId || amount == null) {
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for BILL_PAYMENT' }
       }
+      const nonPositive = await refuseNonPositivePayment({ type: 'BILL_PAYMENT', entryId, lease, referenceType, referenceId, amount })
+      if (nonPositive) return nonPositive
       // o3d-0m56 round 6, finding 1: the date is not computed here. The probe that decides whether
       // this document is already settled has to look for the settlement THIS call will create, and
       // the only way that can never drift is for both to ask one function. See moneyPostDate.

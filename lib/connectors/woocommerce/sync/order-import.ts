@@ -917,6 +917,14 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
     // THE PAID TOTAL MUST BE THE TOTAL IMS HOLDS. An update delivery refreshes addresses and notes but NOT the lines or the total (updateExistingWcOrderCore), so an order edited in
     // WooCommerce between the import and the payment still carries the old total here. Compared to the minor unit of the order currency, under the lock: if they differ nothing is
     // recorded (no paidAt, no Payment) and a review notice is written; a later delivery after the totals agree records it.
+    // THE PAID CURRENCY MUST BE THE CURRENCY IMS HOLDS. A total of "100" means nothing across currencies: an unpaid EUR 100 order changed in WooCommerce to USD 100 before payment would
+    // otherwise record an EUR receipt for a USD payment. Compared (trimmed, upper-cased, as the importer reads it) under the same lock, BEFORE the total; a mismatch, or a currency
+    // WooCommerce does not state, records nothing and writes a review notice.
+    const wcCurrency = readWcOrderCurrency(wcOrder)
+    const storedCurrency = order.currency.trim().toUpperCase()
+    if (wcCurrency === null || wcCurrency !== storedCurrency) {
+      return { currencyMismatch: { stored: storedCurrency, paid: wcCurrency ?? '', reference: order.externalOrderNumber ?? order.orderNumber ?? orderId } } as const
+    }
     const dp = currencyMinorUnits(order.currency)
     let paidTotalText: string | null = null
     try { paidTotalText = toDecimal(wcOrder.total).toFixed(dp) } catch { paidTotalText = null }
@@ -965,6 +973,23 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
     return { receipt, reference, ambiguous: false, existingCount: existing.length, obligationRowId, ownsObligationRow: !retryLogId }
   })
   if (!claimed) return
+  if ('currencyMismatch' in claimed && claimed.currencyMismatch) {
+    const m = claimed.currencyMismatch
+    // idempotent per order and currency pair: the same disagreement is written once however often it is delivered
+    const already = await db.activityLog.count({ where: { entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_paid_currency_differs', AND: [{ metadata: { path: ['imsCurrency'], equals: m.stored } }, { metadata: { path: ['paidCurrency'], equals: m.paid } }] } })
+    if (already === 0) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'wc_paid_currency_differs',
+        tag: 'sync',
+        level: 'ERROR',
+        description: `WooCommerce reports order ${m.reference} paid in ${m.paid || '(no currency)'}, but IMS holds it in ${m.stored}. The payment was NOT recorded and the order is not marked paid. Bring the order's currency into line with WooCommerce; the payment is recorded on the next delivery once the currencies agree.`,
+        metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), imsCurrency: m.stored, paidCurrency: m.paid },
+      })
+    }
+    return
+  }
   if ('mismatch' in claimed && claimed.mismatch) {
     const m = claimed.mismatch
     // idempotent per order and total pair: the same disagreement is written once however often it is delivered

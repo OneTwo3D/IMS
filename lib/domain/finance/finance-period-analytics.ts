@@ -439,9 +439,9 @@ function bucketAmount(age: number, amount: Prisma.Decimal, buckets: [number, num
  * The settlement rate for one document: the central rule (lib/currencies/fx-lookup.ts `selectFxRateFromRows`) over the
  * rows `loadFxRates` pre-read, because each payment/invoice has its own `asOf` (a batch at one instant does not fit).
  *
- * A MISSING rate (`no_rate`, `invalid_currency`) is reported as `{ rate: null, reason }` so the row can say it is not
- * computable; it is never replaced by the document's booked rate or by 1 (o3d-q0x56.4). A row that exists but is
- * unusable (zero, negative, an ambiguous tie) still refuses the whole report. `asOf` is the stored settlement date
+ * EVERY `MissingFxRateError` reason (no rate, invalid currency, a zero/negative/non-finite latest rate, an ambiguous tie,
+ * no rate from the selected source) is reported as `{ rate: null, reason }` so that one row says it is not computable and
+ * the report continues; it is never replaced by the document's booked rate or by 1. Only a non-FX error aborts. `asOf` is the stored settlement date
  * read the way the payment read it (`settlementAsOfFromStored`).
  */
 function settlementRateToBase(
@@ -455,7 +455,7 @@ function settlementRateToBase(
   try {
     return { rate: selectFxRateFromRows(rates, { baseCurrency, currency, asOf: settlementAsOfFromStored(paidAt), regime }).rate, reason: null }
   } catch (error) {
-    if (!(isMissingFxRateError(error) && (error.reason === 'no_rate' || error.reason === 'no_rate_from_selected_source' || error.reason === 'invalid_currency'))) throw error
+    if (!isMissingFxRateError(error)) throw error
     return { rate: null, reason: describeFxRefusal(error) }
   }
 }

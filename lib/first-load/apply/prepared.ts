@@ -98,6 +98,67 @@ function outputEntries(report: Record<string, unknown>, problems: string[]): Out
   return out
 }
 
+/**
+ * THE LOT EVIDENCE, CHECKED AGAINST THE HASHED OPENING-STOCK FILE. The file holds only each SKU and warehouse's quantity and weighted-average base cost; the report's `stock.lots`
+ * says which currency, received day, foreign cost and rate EVERY lot behind a row was priced at, so the database rail can compare the foreign ones with the live fx_rates. The
+ * report is not trusted for coverage: the list must REPRODUCE THE FILE. For every row of the (hash-verified) opening-stock file the lots named for that SKU and warehouse must be
+ * present, and their quantities and costs must collapse to exactly the row's quantity (plus the in-transit quantity the report states, when the row includes it) and average cost
+ * (the rounding the prepare step applies). A list that was emptied, lost a lot, gained a fake one or had a cost edited no longer reproduces any row, and is refused; so is a lot that
+ * belongs to no row. Each entry is also checked on its own (well formed; base cost is exactly foreign cost over its rate; a base-currency lot has rate 1). Nothing the report says is
+ * quoted: it is untrusted text until this returns.
+ */
+function lotEvidenceProblems(
+  report: PrepareReport,
+  baseCurrency: string,
+  fileRows: ReadonlyArray<{ pair: string; qty: string; cost: string; location: string }>,
+): string[] {
+  const problems: string[] = []
+  const lots = report.stock?.lots
+  if (!Array.isArray(lots)) return ['opening-stock: the prepared report has no stock.lots list, so the rates behind the lots cannot be checked against fx_rates (prepare the run again)']
+  const base = baseCurrency.toUpperCase()
+  const byPair = new Map<string, Array<{ qty: InstanceType<typeof D>; base: InstanceType<typeof D> }>>()
+  let bad = 0
+  lots.forEach((raw, index) => {
+    const at = `opening-stock: lot ${index + 1} of the prepared report`
+    const e = raw as unknown as Record<string, unknown>
+    const text = (k: string): string | null => (isRecord(e) && typeof e[k] === 'string' ? (e[k] as string) : null)
+    const [sku, warehouse, currency, day] = [text('sku'), text('warehouseCode'), text('currency'), text('receivedDate')]
+    if (sku === null || warehouse === null || currency === null || day === null || text('lotRef') === null || !/^[A-Z]{3}$/.test(currency)) { bad++; problems.push(`${at}: its SKU, warehouse, currency or received day is missing or malformed`); return }
+    const isBase = currency === base
+    if (!isBase && (!/^\d{4}-\d{2}-\d{2}$/.test(day) || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day)) { bad++; problems.push(`${at}: a foreign lot's received day is missing or malformed`); return }
+    let qty: InstanceType<typeof D>, foreign: InstanceType<typeof D>, rate: InstanceType<typeof D>, baseCost: InstanceType<typeof D>
+    try {
+      qty = new D(text('qty') ?? ''); foreign = new D(text('unitCostForeign') ?? ''); rate = new D(text('fxRateToBase') ?? ''); baseCost = new D(text('unitCostBase') ?? '')
+    } catch { bad++; problems.push(`${at}: a quantity, cost or rate is not a number`); return }
+    if (!qty.gt(0) || foreign.lt(0) || !rate.gt(0) || baseCost.lt(0)) { bad++; problems.push(`${at}: a quantity or rate is not positive, or a cost is negative`); return }
+    if (isBase && !rate.eq(1)) { bad++; problems.push(`${at}: a base-currency lot states a rate other than 1`); return }
+    if (!baseCost.eq(foreign.div(rate))) { bad++; problems.push(`${at}: the base cost is not the foreign cost divided by the stated rate`); return }
+    const pair = `${sku.toUpperCase()}@${warehouse.toUpperCase()}`
+    byPair.set(pair, [...(byPair.get(pair) ?? []), { qty, base: baseCost }])
+  })
+  if (bad > 0) return problems
+  const stated = new Map<string, InstanceType<typeof D>>()
+  for (const g of Array.isArray(report.stock?.groups) ? report.stock.groups : []) {
+    try { stated.set(`${String(g.sku).toUpperCase()}@${String(g.warehouseCode).toUpperCase()}`, new D(g.inTransitQty)) } catch { /* an unreadable in-transit figure is read as none: the row then has to match without it */ }
+  }
+  const covered = new Set<string>()
+  for (const row of fileRows) {
+    covered.add(row.pair)
+    const mine = byPair.get(row.pair)
+    if (mine === undefined) { problems.push(`${row.location}: no lot evidence in the prepared report reproduces this row (the list is missing the lots behind it)`); continue }
+    let fileQty: InstanceType<typeof D>, fileCost: InstanceType<typeof D>
+    try { fileQty = new D(row.qty); fileCost = new D(row.cost) } catch { continue } // an unreadable cell is refused by the row checks
+    const qty = mine.reduce((acc, l) => acc.add(l.qty), new D(0))
+    const total = mine.reduce((acc, l) => acc.add(l.qty.mul(l.base)), new D(0))
+    const average = total.div(qty).toDecimalPlaces(6, D.ROUND_HALF_UP)
+    const transit = stated.get(row.pair) ?? new D(0)
+    const extra = fileQty.sub(qty)
+    if (!(extra.isZero() || (!transit.isZero() && extra.eq(transit))) || !average.eq(fileCost)) problems.push(`${row.location}: the lots in the prepared report do not reproduce this row's quantity and weighted-average cost (a lot is missing, added or altered)`)
+  }
+  for (const pair of byPair.keys()) if (!covered.has(pair)) { problems.push('opening-stock: the prepared report names lots for a SKU and warehouse that has no row in the opening-stock file'); break }
+  return problems
+}
+
 export function loadPreparedRun(input: PreparedInput): PreparedLoad {
   const { manifest, files } = input
   const problems: string[] = []
@@ -289,6 +350,7 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
       if (!sameDecimal(totalQty, stats.openingQty)) problems.push('opening-stock: the total quantity of the file differs from the prepared report (TOTAL_QUANTITY_MISMATCH; the figures are in the two files, not here)')
       if (!sameDecimal(totalValue, stats.openingValueBase)) problems.push('opening-stock: the total value of the file differs from the prepared report (TOTAL_VALUE_MISMATCH; the figures are in the two files, not here)')
     }
+    problems.push(...lotEvidenceProblems(report, manifest.baseCurrency, stock.data.rows.map((row) => ({ pair: `${cell(stock, row, 'sku').trim().toUpperCase()}@${cell(stock, row, 'warehouseCode').trim().toUpperCase()}`, qty: cell(stock, row, 'qty'), cost: cell(stock, row, 'unitCostBase'), location: `opening-stock ${rowLocation(row)}` }))))
     const zeroFinding = (report.findings ?? []).find((f) => f.code === 'ZERO_COST_OPENING_STOCK')
     if ((zeroFinding?.keys?.length ?? 0) !== zeroCostPairs.length) problems.push(`opening-stock: ${zeroCostPairs.length} zero-cost row(s) in the file, ${zeroFinding?.keys?.length ?? 0} in the prepared report`)
     const accepted = manifest.acceptZeroCost

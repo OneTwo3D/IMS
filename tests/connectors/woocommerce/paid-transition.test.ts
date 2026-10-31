@@ -424,6 +424,51 @@ test('paid payload whose total differs from the total IMS holds: no Payment, not
 })
 
 
+// The paid payload's currency must be the stored order currency. [mutation: remove the currency comparison; compare without normalising; skip the notice; skip the dedupe]
+test('paid payload in a different currency than the order IMS holds: no Payment, not paid, ONE review notice; once the currencies agree the amount is recorded', async () => {
+  const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder()
+  registrations.length = 0
+  const usd = { ...(payload(Number(o.wcId), '2026-10-01T10:00:00') as object), currency: 'USD' } as never // total 100.00 equals the stored 100: only the currency differs
+  await updateExistingWcOrderFromPayload(o.id, usd)
+  await updateExistingWcOrderFromPayload(o.id, usd)
+  assert.equal((await payments(o.id)).length, 0)
+  assert.equal(registrations.length, 0)
+  assert.equal((await s.db.salesOrder.findUniqueOrThrow({ where: { id: o.id } })).paidAt, null)
+  const notices = await s.db.activityLog.findMany({ where: { entityId: o.id, action: 'wc_paid_currency_differs' } })
+  assert.equal(notices.length, 1, 'idempotent per order and currency pair')
+  assert.deepEqual([(notices[0]!.metadata as { imsCurrency: string }).imsCurrency, (notices[0]!.metadata as { paidCurrency: string }).paidCurrency], ['EUR', 'USD'])
+  assert.equal((await s.db.activityLog.count({ where: { entityId: o.id, action: 'wc_paid_total_differs' } })), 0, 'it is the currency notice, not the total one')
+  // a different mismatching currency is a different disagreement and is written once too
+  await updateExistingWcOrderFromPayload(o.id, { ...(usd as object), currency: 'CHF' } as never)
+  assert.equal((await s.db.activityLog.count({ where: { entityId: o.id, action: 'wc_paid_currency_differs' } })), 2)
+  // WooCommerce is back to the stored currency (a lower-case, padded code reads the same): recorded
+  await updateExistingWcOrderFromPayload(o.id, { ...(usd as object), currency: ' eur ' } as never)
+  const pays = await payments(o.id)
+  assert.equal(pays.length, 1)
+  assert.equal(pays[0]!.currency, 'EUR')
+  assert.ok((await s.db.salesOrder.findUniqueOrThrow({ where: { id: o.id } })).paidAt)
+  assert.equal(registrations.length, 1)
+})
+
+test('an order stored with a lower-case or padded currency code still matches the same Woo currency (both sides are read as the importer reads them)', async () => {
+  const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder({ currency: 'GBP' })
+  await s.sql(`update sales_orders set currency = ' gbp ' where id = $1`, [o.id])
+  await updateExistingWcOrderFromPayload(o.id, { ...(payload(Number(o.wcId), '2026-10-01T10:00:00') as object), currency: 'GBP' } as never)
+  assert.equal((await s.db.activityLog.count({ where: { entityId: o.id, action: 'wc_paid_currency_differs' } })), 0, 'no false mismatch from the stored spelling')
+  assert.ok((await s.db.salesOrder.findUniqueOrThrow({ where: { id: o.id } })).paidAt)
+})
+
+test('paid payload that states no currency: not recorded, a review notice naming the missing currency', async () => {
+  const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder()
+  await updateExistingWcOrderFromPayload(o.id, { ...(payload(Number(o.wcId), '2026-10-01T10:00:00') as object), currency: '' } as never)
+  assert.equal((await payments(o.id)).length, 0)
+  assert.equal((await s.db.salesOrder.findUniqueOrThrow({ where: { id: o.id } })).paidAt, null)
+  assert.equal((await s.db.activityLog.count({ where: { entityId: o.id, action: 'wc_paid_currency_differs' } })), 1)
+})
+
 // The same-day test uses the order date the IMPORT persisted (externalCreatedAt), never IMS's createdAt. [mutation: fall back to the IMS createdAt / assume same-day when unknown]
 test('order created Oct 1 (no creation instant in the paid payload), imported unpaid and paid Oct 3: the payment-date central rate, not the booked rate; a real same-day payment keeps the order rate', async () => {
   const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
