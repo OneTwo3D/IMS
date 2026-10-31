@@ -73,6 +73,13 @@ test('a lot whose cost is edited consistently (cost and rate) but no longer repr
   expectRefused(edited((l) => { const e = l.find((x) => x.lotRef === 'E1')!; e.unitCostForeign = '6'; e.unitCostBase = '4.8' }), /do not reproduce this row/)
 })
 
+// A lot of a single-lot row whose quantity changes while its cost (so the average) does not: only the quantity reproduction can see it. [mutation: ignore the quantity; accept any surplus file quantity as in-transit]
+test('a lot whose quantity differs from the file row (same cost) is refused, whether it is larger or smaller than the row', () => {
+  const single = (l: Evidence[]) => l.find((x) => x.sku === 'ZQSENT-OAK-BOARD' && x.warehouseCode === 'ZQSENT-OVER')!
+  expectRefused(edited((l) => { single(l).qty = '6' }), /do not reproduce this row's quantity/)
+  expectRefused(edited((l) => { single(l).qty = '4' }), /do not reproduce this row's quantity/)
+})
+
 // [mutation: drop the cost-over-rate comparison]
 test('an entry whose base cost is not its foreign cost over its rate is refused (a hand-edited rate or cost)', () => {
   expectRefused(edited((l) => { l[0]!.fxRateToBase = '1.26' }), /base cost is not the foreign cost divided by the stated rate|states a rate other than 1/)
