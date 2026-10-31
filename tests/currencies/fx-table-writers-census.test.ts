@@ -39,7 +39,7 @@ test('every fx_rates writer in app/ and lib/ writes through the exclusive lock',
   assert.ok(sites.length >= 5, 'PRECONDITION: the census found the known writers')
   assert.deepEqual(bad, [])
   // the base currency the rates are measured against
-  assert.match(readFileSync('app/actions/company.ts', 'utf8'), /withFxTableWriteLock\(\(tx\) => tx\.organisation\.updateMany/)
+  assert.match(readFileSync('app/actions/company.ts', 'utf8'), /withFxTableWriteLock\(async \(tx\) => \{[\s\S]*?tx\.organisation\.updateMany/)
   // both importers hold the table still
   const imp = readFileSync('app/actions/import.ts', 'utf8')
   assert.equal((imp.match(/withFxTableHeldStill\(\(guard\) => import(Sales|Purchase)OrdersCsvLocked\(formData, guard/g) ?? []).length, 2)
