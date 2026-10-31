@@ -215,9 +215,11 @@ test('switch history keeps the Aelia period on Aelia rows after a switch back; a
   const orgExisted = await db.organisation.findFirst({ select: { id: true, baseCurrency: true } })
   const orgBefore = orgExisted ?? await db.organisation.create({ data: { name: 'FX test org', baseCurrency: 'GBP' }, select: { id: true, baseCurrency: true } })
   const lockedSetting = await db.setting.findUnique({ where: { key: 'base_currency_locked' } })
+  const gbpExisted = (await db.currency.count({ where: { code: 'GBP' } })) > 0 // a base change (even to the current base) creates the base currency row when it is missing
   t.after(async () => {
     if (orgExisted) await db.organisation.update({ where: { id: orgBefore.id }, data: { baseCurrency: orgBefore.baseCurrency } })
     else await db.organisation.deleteMany({ where: { id: orgBefore.id } })
+    if (!gbpExisted) await db.currency.deleteMany({ where: { code: 'GBP' } })
     await db.setting.deleteMany({ where: { key: 'base_currency_locked' } })
     if (lockedSetting) await db.setting.create({ data: { key: lockedSetting.key, value: lockedSetting.value } })
     await db.currency.updateMany({ where: { code: 'AUD' }, data: { active: existed.get('AUD') === true } })
