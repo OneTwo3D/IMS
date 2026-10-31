@@ -215,6 +215,42 @@ test('a deactivation waits for a writer that holds the rate, then sees that writ
   } finally { await restoreForeign(deps, foreign) }
 })
 
+// [mutation: the re-read and identity compare removed from lockAndRecheck -> the renamed rate is deactivated: red]
+test('a rate renamed, with an order naming the new name, between the plan and the row lock is not deactivated', { skip: !RUN }, async () => {
+  const deps = await loadDeps()
+  const foreign = await clearForeignPurchaseRates(deps)
+  const { db } = deps
+  try {
+    await cleanRates(deps)
+    await seed(deps, LIST())
+    const held = await db.taxRate.create({ data: { name: `${TAG}Demo renamed`, rate: '0.2', usedFor: 'BOTH', accountingTaxType: 'ZQPTI005', active: true } })
+    const newName = `${TAG}Demo renamed B`
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let locked!: () => void
+    const lockedFirst = new Promise<void>((resolve) => { locked = resolve })
+    const editor = db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM tax_rates WHERE id = ${held.id} FOR SHARE`
+      await tx.$executeRaw`UPDATE tax_rates SET name = ${newName} WHERE id = ${held.id}`
+      await tx.salesOrder.create({ data: { externalOrderNumber: `${TAG}renamed`, status: 'PROCESSING', taxRateName: newName, subtotalForeign: 0, totalForeign: 0, subtotalBase: 0, totalBase: 0 } })
+      locked()
+      await gate
+    })
+    try {
+      await lockedFirst
+      let settled = false
+      const importing = deps.imp.runPurchaseTaxImport({ apply: true, deactivateAbsent: true }).then((r) => ({ r }), (e: unknown) => ({ e })).finally(() => { settled = true })
+      await new Promise((resolve) => setTimeout(resolve, 1500))
+      assert.equal(settled, false, 'the import is waiting for the editor\'s row lock')
+      release()
+      await editor
+      const outcome = await importing
+      assert.ok('e' in outcome && outcome.e instanceof deps.imp.PurchaseTaxImportRaceError, 'the changed identity stops the deactivation')
+      assert.deepEqual((await db.taxRate.findUniqueOrThrow({ where: { id: held.id } })).active, true)
+    } finally { release(); await editor.catch(() => undefined); await db.salesOrder.deleteMany({ where: { externalOrderNumber: { startsWith: TAG } } }) }
+  } finally { await restoreForeign(deps, foreign) }
+})
+
 test('a connection that changes between the plan and the write discards the write', { skip: !RUN }, async () => {
   const deps = await loadDeps()
   const foreign = await clearForeignPurchaseRates(deps)

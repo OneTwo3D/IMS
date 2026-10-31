@@ -139,7 +139,7 @@ export interface PlannedCreate {
   components: PlannedComponent[]
 }
 export interface RowReferences { suppliers: number; purchaseOrderLines: number; salesOrderLines: number; storefrontMappings: number }
-export interface PlannedNarrow { id: string; name: string; taxType: string; references: RowReferences }
+export interface PlannedNarrow { id: string; name: string; taxType: string; references: RowReferences; /** The row as planned (see identityOf): the write refuses a row that changed since. */ identity: string }
 export interface NotInXeroRow {
   id: string
   name: string
@@ -150,13 +150,15 @@ export interface NotInXeroRow {
   deactivate: boolean
   /** Why an opt-in deactivation was NOT made: the default rate; or a non-cancelled sales or purchase order (open, or posted and so refundable) that still resolves its tax identity through the rate. */
   keptBecause: KeptBecause | null
+  /** The row as planned (see identityOf): the write refuses a row that changed since. */
+  identity: string
   /** Non-cancelled documents depending on the rate (checked only for a row the run would deactivate; null = not checked). */
   liveDocuments: number | null
 }
 export type KeptBecause = 'IS_DEFAULT_RATE' | 'LIVE_DOCUMENTS'
 export interface PresentRate { taxType: string; id: string; name: string; rate: string; xeroRate: string | null }
 /** An existing row that is the one rate for its type and side but whose percentage is not Xero's. Reported; corrected only by `replaceDiffering` (a new row + the old one deactivated). */
-export interface DifferingRate { taxType: string; side: 'PURCHASE' | 'SALES' | 'BOTH'; id: string; name: string; imsRate: string; xeroRate: string; references: RowReferences; replaced: boolean; keptBecause: KeptBecause | null; liveDocuments: number | null }
+export interface DifferingRate { taxType: string; side: 'PURCHASE' | 'SALES' | 'BOTH'; id: string; name: string; imsRate: string; xeroRate: string; references: RowReferences; replaced: boolean; keptBecause: KeptBecause | null; liveDocuments: number | null; identity: string }
 /** An active row with no Xero tax type at all (for example a per-country storefront rate): it has no Xero counterpart, so the single rate set cannot contain it. */
 export interface UnmappedRow { id: string; name: string; usedFor: string; countryCode: string | null; rate: string }
 /**
@@ -241,6 +243,14 @@ export async function checkRatesAgainstXero(client: Client, now: Date, connected
   return { ok: true, disagreements }
 }
 
+type IdentitySource = { name: string; rate: { toFixed(dp: number): string }; usedFor: string; active: boolean; components?: ReadonlyArray<{ name: string; rate: { toFixed(dp: number): string }; compoundOnPrevious: boolean; active: boolean; sortOrder: number }> }
+
+/** What a planned write rests on: the name (documents resolve their identity by it), the percentage, the sides, the active flag and the components. Compared again under the row lock. */
+export function identityOf(row: IdentitySource): string {
+  const components = [...(row.components ?? [])].map((c) => [c.sortOrder, c.name, c.rate.toFixed(4), c.compoundOnPrevious, c.active]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
+  return JSON.stringify([row.name, row.rate.toFixed(4), row.usedFor, row.active, components])
+}
+
 /**
  * The not-cancelled documents that still resolve their tax identity through a rate: sales order lines on it, purchase order lines on it, and sales orders that name it (sales posting and the refund
  * paths look an order's identity up by the ACTIVE rate with the order's tax-rate name, so deactivating the rate strands an open or refundable order). Cancelled documents never post again.
@@ -270,6 +280,7 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
   const existing = await client.taxRate.findMany({
     select: {
       id: true, name: true, rate: true, usedFor: true, active: true, accountingTaxType: true, isDefault: true, countryCode: true,
+      components: { select: { name: true, rate: true, compoundOnPrevious: true, active: true, sortOrder: true } },
       _count: { select: { supplierTaxRate: true, poLines: true, orderLines: true, shoppingTaxRateMappings: true } },
     },
     orderBy: [{ name: 'asc' }, { id: 'asc' }],
@@ -300,7 +311,8 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
   const bothRequested = new Set<string>(options.mirrorSales ? types.filter((type) => dualActive(type) && !existing.some((r) => r.active && r.accountingTaxType === type)) : [])
   const sideOfType = new Map<string, Side>()
   if (options.mirrorSales) {
-    const wanted = new Map<string, Side>(SALES_TAX_IMPORT_TYPES.map((t) => [t, 'SALES' as Side]))
+    // The seeded defaults are classified like any other type (a default that Xero lists as active on both sides, with no IMS row, is ONE row for both sides).
+    const wanted = new Map<string, Side>(SALES_TAX_IMPORT_TYPES.map((t) => [t, dualActive(t) && !existing.some((r) => r.active && r.accountingTaxType === t) ? 'BOTH' as Side : 'SALES' as Side]))
     for (const row of list.rows) {
       if (row.status !== 'ACTIVE' || row.canApply.revenue !== true || wanted.has(row.taxType)) continue
       if (row.canApply.expenses !== true) { wanted.set(row.taxType, 'SALES'); continue }
@@ -344,7 +356,7 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
         if (liveDocuments > 0) keptBecause = 'LIVE_DOCUMENTS'
       }
       const canReplace = options.replaceDiffering === true && keptBecause === null && eligible() === null
-      plan.differs.push({ taxType: type, side, id: row.id, name: row.name, imsRate: row.rate.toFixed(4), xeroRate: xeroFraction, references: refs(row), replaced: canReplace, keptBecause, liveDocuments })
+      plan.differs.push({ taxType: type, side, id: row.id, name: row.name, imsRate: row.rate.toFixed(4), xeroRate: xeroFraction, references: refs(row), replaced: canReplace, keptBecause, liveDocuments, identity: identityOf(row) })
       if (!canReplace) { entry('differs', row); continue }
       replaces = row.id
       replacing.add(row.id)
@@ -404,7 +416,7 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
         if (!row.active || row.usedFor !== 'BOTH' || row.accountingTaxType === null) continue
         const xero = xeroByType.get(row.accountingTaxType)
         if (xero && xero.status === 'ACTIVE' && xero.canApply.revenue === true && xero.canApply.expenses === false) {
-          plan.narrow.push({ id: row.id, name: row.name, taxType: row.accountingTaxType, references: refs(row) })
+          plan.narrow.push({ id: row.id, name: row.name, taxType: row.accountingTaxType, references: refs(row), identity: identityOf(row) })
         }
       }
     }
@@ -428,6 +440,7 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
       deactivate: options.deactivateAbsent === true && keptBecause === null,
       keptBecause,
       liveDocuments,
+      identity: identityOf(row),
     })
   }
 
@@ -448,8 +461,8 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
 
 /** A document came to depend on a rate (or a rate became the default) between the plan and the write: nothing was written, plan again. */
 export class PurchaseTaxImportRaceError extends Error {
-  constructor(rateId: string) {
-    super(`a live document came to depend on tax rate ${rateId} while the import was applying; nothing was written, run the plan again`)
+  constructor(rateId: string, reason = 'a live document came to depend on the rate, or it became the default,') {
+    super(`tax rate ${rateId}: ${reason} while the import was applying; nothing was written, run the plan again`)
     this.name = 'PurchaseTaxImportRaceError'
   }
 }
@@ -464,15 +477,19 @@ export interface PurchaseTaxImportWrite {
 }
 
 /**
- * Lock a row that is about to be deactivated (FOR UPDATE: a writer holding the share lock of writable-tax-rate.ts finishes first, a later one waits for this transaction and then reads it
- * inactive) and re-count what depends on it. Whatever came to depend on it since the plan stops the write, which rolls back as a whole.
+ * Lock a row a planned write rests on (FOR UPDATE: a writer holding the share lock of writable-tax-rate.ts finishes first, a later one waits for this transaction and then reads it inactive),
+ * then RE-READ it: a row whose name, percentage, sides, active flag or components changed since the plan (an editor that held the row while this waited) is not written (the plan named it
+ * under its old identity). With `recount`, the documents depending on it are re-counted under its CURRENT name; whatever came to depend on it since the plan stops the write, which rolls back
+ * as a whole.
  * STATED LIMIT: sales-order creation does not lock the rate it names (taxRateName), so an order can name the rate between this re-count and the deactivation's commit. Run deactivateAbsent only
  * while sales intake is paused (first load, setup).
  */
-async function lockAndRecheck(tx: Client, row: { id: string; name: string }): Promise<void> {
+async function lockAndRecheck(tx: Client, row: { id: string; identity: string }, options: { recount: boolean }): Promise<void> {
   // A Prisma.Sql object (not a tagged template) so a structural test double without raw access is simply not locked.
   if (typeof (tx as { $queryRaw?: unknown }).$queryRaw === 'function') await tx.$queryRaw(Prisma.sql`SELECT id FROM tax_rates WHERE id = ${row.id} FOR UPDATE`)
-  if ((await liveDocumentCount(tx, row)) > 0) throw new PurchaseTaxImportRaceError(row.id)
+  const current = await tx.taxRate.findUnique({ where: { id: row.id }, select: { name: true, rate: true, usedFor: true, active: true, components: { select: { name: true, rate: true, compoundOnPrevious: true, active: true, sortOrder: true } } } })
+  if (current === null || identityOf(current) !== row.identity) throw new PurchaseTaxImportRaceError(row.id, 'the rate was changed (name, percentage, sides, active flag or components) after the plan')
+  if (options.recount && (await liveDocumentCount(tx, { id: row.id, name: current.name })) > 0) throw new PurchaseTaxImportRaceError(row.id, 'a live document came to depend on the rate after the plan')
 }
 
 /**
@@ -481,11 +498,14 @@ async function lockAndRecheck(tx: Client, row: { id: string; name: string }): Pr
  */
 export async function writePurchaseTaxImport(tx: Client, plan: PurchaseTaxImportPlan): Promise<PurchaseTaxImportWrite> {
   const result: PurchaseTaxImportWrite = { created: [], suppliersRepointed: 0, mappingsRepointed: 0 }
-  const nameOf = (id: string): string => plan.differs.find((d) => d.id === id)?.name ?? ''
   // A mapping write takes the shared storefront-mapping lock FIRST, before any row lock (the WooCommerce tax-rate apply holds it exclusively while it re-reads ownership and sends).
   if (plan.creates.some((c) => c.replaces !== null)) await lockStorefrontMappingWrites(tx)
   for (const create of plan.creates) {
-    if (create.replaces !== null) await lockAndRecheck(tx, { id: create.replaces, name: nameOf(create.replaces) })
+    if (create.replaces !== null) {
+      const planned = plan.differs.find((d) => d.id === create.replaces)
+      if (planned === undefined) throw new PurchaseTaxImportRaceError(create.replaces, 'the replaced rate is not in the plan')
+      await lockAndRecheck(tx, planned, { recount: true })
+    }
     const made = await tx.taxRate.create({
       data: {
         name: create.name,
@@ -515,10 +535,13 @@ export async function writePurchaseTaxImport(tx: Client, plan: PurchaseTaxImport
     // The shared storefront-mapping lock was taken first (above); the ownership stamp is cleared in the same statement.
     result.mappingsRepointed += (await tx.shoppingTaxRateMapping.updateMany({ where: { taxRateId: create.replaces }, data: { taxRateId: id, storeIdentity: null } })).count
   }
-  for (const row of plan.narrow) await tx.taxRate.updateMany({ where: { id: row.id, usedFor: 'BOTH' }, data: { usedFor: 'SALES' } })
+  for (const row of plan.narrow) {
+    await lockAndRecheck(tx, row, { recount: false })
+    await tx.taxRate.updateMany({ where: { id: row.id, usedFor: 'BOTH' }, data: { usedFor: 'SALES' } })
+  }
   for (const row of plan.notInXero) {
     if (!row.deactivate) continue
-    await lockAndRecheck(tx, row)
+    await lockAndRecheck(tx, row, { recount: true })
     await tx.taxRate.updateMany({ where: { id: row.id, isDefault: false }, data: { active: false } })
   }
   return result

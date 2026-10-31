@@ -73,7 +73,7 @@ function client(state: State) {
     salesOrder: { count: async ({ where }: { where: { taxRateName: string } }) => state.rates.filter((r) => r.name === where.taxRateName).reduce((n, r) => n + (r.named ?? 0), 0) },
     taxRate: {
       findMany: async () => state.rates.map((r) => ({
-        id: r.id, name: r.name, rate: decimal(r.rate), usedFor: r.usedFor, active: r.active, accountingTaxType: r.accountingTaxType, isDefault: r.isDefault, countryCode: r.countryCode ?? null,
+        id: r.id, name: r.name, rate: decimal(r.rate), usedFor: r.usedFor, active: r.active, accountingTaxType: r.accountingTaxType, isDefault: r.isDefault, countryCode: r.countryCode ?? null, components: [],
         _count: { supplierTaxRate: r.refs ?? 0, poLines: r.refs ?? 0, orderLines: 0, shoppingTaxRateMappings: 0 },
       })),
     },
@@ -115,6 +115,10 @@ async function applyTo(state: State, p: PurchaseTaxImportPlan): Promise<{ calls:
       },
     },
     taxRate: {
+      findUnique: async ({ where }: { where: { id: string } }) => {
+        const r = state.rates.find((x) => x.id === where.id)
+        return r === undefined ? null : { name: r.name, rate: decimal(r.rate), usedFor: r.usedFor, active: r.active, components: [] }
+      },
       create: async ({ data }: { data: Record<string, unknown> }) => {
         calls.push({ op: 'create', data })
         const id = `new-${state.rates.length}`
@@ -496,4 +500,54 @@ test('a dual-side type named among the requested purchase types gets ONE BOTH ro
   const purchaseRow = await plan({ rates: [ims('p', 'Old purchase', 'PURCHASE', 'DUALREQ')], list }, { mirrorSales: true, types: ['DUALREQ'] })
   assert.deepEqual(purchaseRow.creates.filter((c) => c.taxType === 'DUALREQ').map((c) => c.side), ['SALES'], 'a separate sales row is planned and validated')
   assert.deepEqual(purchaseRow.rateSet.filter((e) => e.taxType === 'DUALREQ').map((e) => e.side).sort(), ['PURCHASE', 'SALES'])
+})
+
+// [mutation: the re-read of the locked row removed (identity not compared) -> the rename arms are red; the recount using the PLANNED name instead of the row's current one -> the rename-plus-order arm is red;
+//  the narrowing's lock-and-compare removed -> the narrow arm is red; the replaced row's compare removed -> the replace arm is red]
+test('a row renamed (or otherwise changed) between the plan and the lock is not written: deactivation, replacement and narrowing each stop, and the recount uses the row\'s CURRENT name', async () => {
+  // Deactivation: renamed to a name that a live order uses.
+  const rates = (): ImsRow[] => [ims('free', 'Demo free', 'BOTH', 'TAX001'), ims('other', 'Demo other', 'BOTH', 'TAX002', { named: 2 })]
+  const state: State = { rates: rates(), list: XERO_LIST }
+  const p = await plan(state, { deactivateAbsent: true })
+  assert.equal(p.notInXero.find((r) => r.id === 'free')!.deactivate, true)
+  state.rates.find((r) => r.id === 'free')!.name = 'Demo other'
+  await assert.rejects(() => applyTo(state, p), PurchaseTaxImportRaceError)
+  assert.equal(activeOf(state, 'free'), true, 'renamed since the plan: not deactivated')
+  // Each other identity field.
+  for (const [label, change] of [['percentage', (r: ImsRow) => { r.rate = '0.1000' }], ['sides', (r: ImsRow) => { r.usedFor = 'SALES' }], ['active', (r: ImsRow) => { r.active = false }]] as const) {
+    const s2: State = { rates: rates(), list: XERO_LIST }
+    const planned = await plan(s2, { deactivateAbsent: true })
+    change(s2.rates.find((r) => r.id === 'free')!)
+    await assert.rejects(() => applyTo(s2, planned), PurchaseTaxImportRaceError, label)
+  }
+  // The recount uses the CURRENT name: the plan saw no order for 'Demo free'; after the rename the order names the new name.
+  const s3: State = { rates: [ims('free', 'Demo free', 'BOTH', 'TAX001'), ims('o', 'Elsewhere', 'BOTH', 'TAX002')], list: XERO_LIST }
+  const planned3 = await plan(s3, { deactivateAbsent: true })
+  s3.rates[0]!.name = 'Renamed'
+  s3.rates[1]!.named = 0
+  s3.rates.push(ims('x', 'Renamed', 'BOTH', 'TAX009', { named: 1 }))
+  planned3.notInXero[0]!.identity = JSON.stringify(['Renamed', '0.2000', 'BOTH', true, []])
+  await assert.rejects(() => applyTo(s3, planned3), PurchaseTaxImportRaceError, 'the order naming the CURRENT name stops it')
+  // Replacement.
+  const rep: State = { rates: [ims('old', 'Old UK VAT', 'BOTH', 'OUTPUT2', { rate: '0.1500' })], list: XERO_LIST, suppliers: [{ id: 's1', taxRateId: 'old' }] }
+  const planRep = await plan(rep, { mirrorSales: true, replaceDiffering: true, types: [] })
+  rep.rates[0]!.name = 'Renamed old'
+  await assert.rejects(() => applyTo(rep, planRep), PurchaseTaxImportRaceError)
+  assert.deepEqual([rep.suppliers![0]!.taxRateId, activeOf(rep, 'old')], ['old', true])
+  // Narrowing.
+  const nar: State = { rates: stageRates(), list: XERO_LIST }
+  const planNar = await plan(nar, { narrowSalesTypes: true })
+  nar.rates.find((r) => r.id === 'uk')!.name = 'Renamed UK'
+  await assert.rejects(() => applyTo(nar, planNar), PurchaseTaxImportRaceError)
+  assert.equal(nar.rates.find((r) => r.id === 'uk')!.usedFor, 'BOTH')
+})
+
+// [mutation: the seeded SALES defaults taken as SALES without the dual-side classification -> red]
+test('a seeded sales default (OUTPUT2, ZERORATEDOUTPUT) that Xero lists as active on BOTH sides, with no IMS row, is ONE BOTH row', async () => {
+  const list = XERO_LIST.map((r) => (r.taxType === 'OUTPUT2' ? { ...r, canApply: { ...r.canApply, expenses: true, revenue: true } } : r))
+  const p = await plan({ rates: [], list }, { mirrorSales: true, types: [] })
+  assert.deepEqual(p.creates.filter((c) => c.taxType === 'OUTPUT2').map((c) => c.side), ['BOTH'])
+  assert.deepEqual(p.creates.filter((c) => c.taxType === 'ZERORATEDOUTPUT').map((c) => c.side), ['SALES'], 'a revenue-only default stays SALES')
+  const withRow = await plan({ rates: [ims('o', 'Old out', 'PURCHASE', 'OUTPUT2')], list }, { mirrorSales: true, types: [] })
+  assert.deepEqual(withRow.rateSet.filter((e) => e.taxType === 'OUTPUT2').map((e) => e.side), ['SALES'], 'with a purchase-only row it is a SALES target')
 })
