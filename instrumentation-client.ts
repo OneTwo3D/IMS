@@ -1,5 +1,6 @@
 import * as Sentry from '@sentry/nextjs'
 
+import { dataCollection } from '@/lib/observability/data-collection'
 import { scrubBreadcrumb, scrubEvent } from '@/lib/observability/scrub'
 
 // Browser error tracking (GlitchTip). Off unless NEXT_PUBLIC_SENTRY_DSN is set at build time.
@@ -12,7 +13,7 @@ Sentry.init({
   environment: process.env.NEXT_PUBLIC_SENTRY_ENVIRONMENT?.trim() || 'dev',
   release: process.env.NEXT_PUBLIC_SENTRY_RELEASE?.trim() || undefined,
   tracesSampleRate: 0.05,
-  sendDefaultPii: false,
+  dataCollection,
   beforeSend: scrubEvent,
   beforeSendTransaction: scrubEvent,
   beforeBreadcrumb: scrubBreadcrumb,

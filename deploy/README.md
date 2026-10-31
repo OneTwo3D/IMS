@@ -126,7 +126,7 @@ guarantee.
 
 IMS reports unhandled errors to the self-hosted GlitchTip (Sentry-compatible) through
 `@sentry/nextjs`. The SDK is **disabled unless a DSN is set**, so CI, tests, local dev and any
-unit without the variables behave exactly as before. Errors only (5% trace sampling); no session
+unit without the variables behave exactly as before. Errors only (5% trace sampling; `dataCollection` in `lib/observability/data-collection.ts` turns off user info, cookies, bodies and client-IP headers, the v11 form of `sendDefaultPii: false`); no session
 replay, profiling or feedback widget.
 
 | Variable | Used by | Notes |

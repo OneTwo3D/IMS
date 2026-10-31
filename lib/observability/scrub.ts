@@ -90,9 +90,10 @@ function failedShell(event: unknown): Event {
   return shell
 }
 
-export function scrubEvent(event: Event): Event | null {
+// Generic so it fits both `beforeSend` (ErrorEvent) and `beforeSendTransaction` (TransactionEvent).
+export function scrubEvent<T extends Event>(event: T): T | null {
   try {
-    if (!isRecord(event)) return failedShell(event)
+    if (!isRecord(event)) return failedShell(event) as T
     const scrubbed = scrubValue(event, 0, new WeakSet()) as Record<string, unknown>
 
     const user = scrubbed.user
@@ -103,9 +104,9 @@ export function scrubEvent(event: Event): Event | null {
     const request = scrubbed.request
     if (isRecord(request)) delete request.cookies
 
-    return scrubbed as Event
+    return scrubbed as T
   } catch {
-    return failedShell(event)
+    return failedShell(event) as T
   }
 }
 

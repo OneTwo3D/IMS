@@ -1,5 +1,6 @@
 import * as Sentry from '@sentry/nextjs'
 
+import { dataCollection } from '@/lib/observability/data-collection'
 import { scrubBreadcrumb, scrubEvent } from '@/lib/observability/scrub'
 
 // Error tracking (GlitchTip, Sentry-compatible). Entirely off unless SENTRY_DSN is set, so CI,
@@ -12,7 +13,7 @@ Sentry.init({
   environment: process.env.SENTRY_ENVIRONMENT?.trim() || 'dev',
   release: process.env.SENTRY_RELEASE?.trim() || undefined,
   tracesSampleRate: 0.05,
-  sendDefaultPii: false,
+  dataCollection,
   beforeSend: scrubEvent,
   beforeSendTransaction: scrubEvent,
   beforeBreadcrumb: scrubBreadcrumb,

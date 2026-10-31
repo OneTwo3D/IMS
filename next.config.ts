@@ -1,5 +1,5 @@
 import type { NextConfig } from "next";
-import { withSentryConfig } from "@sentry/nextjs";
+import { withSentryConfig } from "@sentry/nextjs/config";
 
 // Baseline security response headers applied to every route (framing,
 // MIME-sniffing, referrer leakage, transport security). The full Content-Security-Policy
