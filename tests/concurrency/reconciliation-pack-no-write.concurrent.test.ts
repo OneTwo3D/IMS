@@ -94,6 +94,11 @@ async function leaseIsFree(runId: string): Promise<boolean> {
   })
 }
 
+/** A restore must change exactly one row: none means the place is taken or the row is gone, more means the match was too wide; either way the entry is kept. */
+function assertRestoredOneRow(kind: string, rowId: string, rowCount: number | null): void {
+  if (rowCount !== 1) throw new Error(`restoring held ${kind} ${rowId} touched ${rowCount} rows (expected 1): the entry is kept`)
+}
+
 /** Put back every entry of the given runs, delete the entries, all in one transaction; returns how many entries were restored. Each restore must change exactly one row. */
 async function restoreHeld(client: Q, runFilter: { run: string } | { runs: string[] }): Promise<number> {
   const runs = 'run' in runFilter ? [runFilter.run] : runFilter.runs
@@ -107,7 +112,7 @@ async function restoreHeld(client: Q, runFilter: { run: string } | { runs: strin
       else if (e.kind === 'sync_row') result = await client.query(`UPDATE accounting_sync_logs SET connector = $2 WHERE id = $1 AND connector = 'held-xero'`, [e.row_id, e.payload.connector])
       else if (e.kind === 'first_load') result = await client.query(`INSERT INTO first_load_apply_runs SELECT * FROM jsonb_populate_record(NULL::first_load_apply_runs, $1::jsonb) ON CONFLICT DO NOTHING`, [JSON.stringify(e.payload)])
       else throw new Error(`unknown held kind ${e.kind}`)
-      if (result.rowCount !== 1) throw new Error(`restoring held ${e.kind} ${e.row_id} touched ${result.rowCount} rows (expected 1): the entry is kept`)
+      assertRestoredOneRow(e.kind, e.row_id, result.rowCount)
     }
     await client.query(`DELETE FROM _test_held_rows WHERE run_id = ANY($1)`, [runs])
     await client.query('COMMIT')
@@ -1148,7 +1153,14 @@ test('[reconciliation pack] the cycle date of the Qoblex test is an UNUSED date:
     assert.equal(await unusedSnapshotDate(sql, start), addDays(start, 2), 'occupied dates are skipped')
     assert.deepEqual((await sql(`SELECT id, "snapshotDate"::text AS d FROM inventory_snapshot_runs WHERE id LIKE $1 ORDER BY id`, [`${tag}%`])).rows, before.rows, 'the occupant was not moved')
     assert.equal(addDays('2026-02-28', 1), '2026-03-01')
+    // the digest that proves nothing foreign moved sees a foreign warehouse change (the row is included here: its id does not carry the excluded prefix)
+    await sql(`INSERT INTO warehouses (id, code, name, "updatedAt") VALUES ($1, $2, 'x', now())`, [`${tag}-w`, `${tag}W`])
+    const seen = await foreignEstateDigest(sql, 'NOT-A-PREFIX')
+    await sql(`UPDATE warehouses SET active = false WHERE id = $1`, [`${tag}-w`])
+    assert.notEqual(await foreignEstateDigest(sql, 'NOT-A-PREFIX'), seen, 'a deactivated foreign warehouse changes the digest')
+    assert.equal(await foreignEstateDigest(sql, tag), await foreignEstateDigest(sql, tag), 'stable when nothing changes')
   } finally {
+    await sql(`DELETE FROM warehouses WHERE id LIKE '${tag}%'`)
     await sql(`DELETE FROM inventory_snapshot_runs WHERE id LIKE '${tag}%'`)
   }
 })
@@ -1495,6 +1507,10 @@ test('[reconciliation pack] the holds are durable: a failure after the first hol
     await restoreForeignEstate(next)
     assert.equal(await heldKindsDigest(), before, 'foreign rows identical after the next run restored')
     assert.equal(await leaseIsFree(next), true, 'a finished run released its lease')
+
+    // (b1) the guard itself: exactly one row changed passes; none, many or an unknown count refuse.
+    assert.doesNotThrow(() => assertRestoredOneRow('token', 'x', 1))
+    for (const bad of [0, 2, 3, null]) assert.throws(() => assertRestoredOneRow('token', 'x', bad), /expected 1/)
 
     // (c) A restore that cannot put its row back fails and KEEPS the entry (the original is not lost): a dead run's first-load entry, with a record
     // already in its place (the ON CONFLICT DO NOTHING insert would skip), is not swept away; once the place is free the next sweep restores it.
