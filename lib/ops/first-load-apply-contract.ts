@@ -65,6 +65,7 @@ export const APPLY_PRECONDITION_IDS = [
   'check:base-currency',
   'check:lookup-keys-unique-in-ims',
   'check:opening-stock-empty',
+  'check:opening-stock-fx-rate',
   'check:po-fx-rate',
   'check:po-product-lifecycle',
   'check:po-reference-free',

@@ -108,7 +108,7 @@ async function selectUnresolvedReceiptIds(floor: Date, excluded: string[], take:
   return db.$queryRaw<Array<{ id: string }>>`
     SELECT p.id FROM "payments" p
     JOIN "sales_orders" o ON o.id = p."orderId"
-    WHERE p."refundId" IS NULL AND p."createdAt" < ${floor} AND o.accounting_invoice_id IS NOT NULL
+    WHERE p."refundId" IS NULL AND p.amount > 0 AND p."createdAt" < ${floor} AND o.accounting_invoice_id IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM "accounting_sync_logs" l WHERE l.type = 'INVOICE_PAYMENT' AND l."referenceType" = 'SalesOrder' AND l."referenceId" = p."orderId" AND l.payload->>'paymentId' = p.id)
       AND NOT EXISTS (SELECT 1 FROM "activity_logs" a WHERE a.action = 'invoice_payment_not_registered' AND a."entityType" = 'SALES_ORDER' AND a."entityId" = p."orderId" AND a.metadata->>'paymentId' = p.id)
       AND o.id <> ALL(${excluded}::text[])

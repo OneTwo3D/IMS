@@ -98,6 +98,51 @@ function outputEntries(report: Record<string, unknown>, problems: string[]): Out
   return out
 }
 
+/**
+ * THE FOREIGN-LOT EVIDENCE, CHECKED FROM BYTES. The opening-stock file holds only the collapsed base cost; the report's `stock.foreignLots` says which currency, received day, foreign cost and
+ * rate each foreign lot behind it was priced at, so the database rail can compare them with the live fx_rates. Here, with no database: the list is present (a report without it cannot be
+ * checked, so it is refused, never read as "no foreign lots"), every entry is well formed, its base cost is exactly the foreign cost over its rate, it belongs to a stock group of the report
+ * that has a row in the file, and a group priced ONLY from foreign lots has exactly their total as its lot total (so the evidence cannot be swapped for lots the file was not built from).
+ * Nothing the report says is quoted: it is untrusted text until this returns.
+ */
+function foreignLotEvidenceProblems(report: PrepareReport, stock: PreparedStep, rowKey: (row: StepRows['rows'][number]) => string): string[] {
+  const problems: string[] = []
+  const lots = report.stock?.foreignLots
+  if (!Array.isArray(lots)) return ['opening-stock: the prepared report has no stock.foreignLots list, so the rates behind the foreign-currency lots cannot be checked against fx_rates (prepare the run again)']
+  const filePairs = new Set(stock.data.rows.map(rowKey))
+  const groups = new Map<string, { lotQty: InstanceType<typeof D>; lotTotal: InstanceType<typeof D> }>()
+  for (const g of Array.isArray(report.stock?.groups) ? report.stock.groups : []) {
+    try { groups.set(`${String(g.sku).toUpperCase()}@${String(g.warehouseCode).toUpperCase()}`, { lotQty: new D(g.lotQty), lotTotal: new D(g.lotTotalBase) }) } catch { /* a group the report states unreadably is caught by the totals checks */ }
+  }
+  const sums = new Map<string, { qty: InstanceType<typeof D>; total: InstanceType<typeof D> }>()
+  let bad = 0
+  lots.forEach((raw, index) => {
+    const at = `opening-stock: foreign lot ${index + 1} of the prepared report`
+    const e = raw as unknown as Record<string, unknown>
+    const text = (k: string): string | null => (isRecord(e) && typeof e[k] === 'string' ? (e[k] as string) : null)
+    const [sku, warehouse, currency, day] = [text('sku'), text('warehouseCode'), text('currency'), text('receivedDate')]
+    if (sku === null || warehouse === null || currency === null || day === null || text('lotRef') === null || !/^[A-Z]{3}$/.test(currency) || !/^\d{4}-\d{2}-\d{2}$/.test(day) || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day) { bad++; problems.push(`${at}: its SKU, warehouse, currency or received day is missing or malformed`); return }
+    let qty: InstanceType<typeof D>, foreign: InstanceType<typeof D>, rate: InstanceType<typeof D>, base: InstanceType<typeof D>
+    try {
+      qty = new D(text('qty') ?? ''); foreign = new D(text('unitCostForeign') ?? ''); rate = new D(text('fxRateToBase') ?? ''); base = new D(text('unitCostBase') ?? '')
+    } catch { bad++; problems.push(`${at}: a quantity, cost or rate is not a number`); return }
+    if (!qty.gt(0) || foreign.lt(0) || !rate.gt(0) || base.lt(0)) { bad++; problems.push(`${at}: a quantity or rate is not positive, or a cost is negative`); return }
+    if (!base.eq(foreign.div(rate))) { bad++; problems.push(`${at}: the base cost is not the foreign cost divided by the stated rate`); return }
+    const pair = `${sku.toUpperCase()}@${warehouse.toUpperCase()}`
+    if (!filePairs.has(pair) || !groups.has(pair)) { bad++; problems.push(`${at}: it belongs to no stock group of the report that has a row in the opening-stock file`); return }
+    const sum = sums.get(pair) ?? { qty: new D(0), total: new D(0) }
+    sums.set(pair, { qty: sum.qty.add(qty), total: sum.total.add(qty.mul(base)) })
+  })
+  if (bad === 0) {
+    for (const [pair, sum] of sums) {
+      const group = groups.get(pair)!
+      if (sum.qty.gt(group.lotQty) || sum.total.gt(group.lotTotal)) problems.push(`opening-stock: the foreign lots of one stock group of the prepared report exceed the group's own lot quantity or value (the evidence is not what the file was built from)`)
+      else if (sum.qty.eq(group.lotQty) && !sum.total.eq(group.lotTotal)) problems.push(`opening-stock: a stock group priced only from foreign lots has a lot total that is not the sum of those lots' costs (the evidence is not what the file was built from)`)
+    }
+  }
+  return problems
+}
+
 export function loadPreparedRun(input: PreparedInput): PreparedLoad {
   const { manifest, files } = input
   const problems: string[] = []
@@ -289,6 +334,7 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
       if (!sameDecimal(totalQty, stats.openingQty)) problems.push('opening-stock: the total quantity of the file differs from the prepared report (TOTAL_QUANTITY_MISMATCH; the figures are in the two files, not here)')
       if (!sameDecimal(totalValue, stats.openingValueBase)) problems.push('opening-stock: the total value of the file differs from the prepared report (TOTAL_VALUE_MISMATCH; the figures are in the two files, not here)')
     }
+    problems.push(...foreignLotEvidenceProblems(report, stock, (row) => `${cell(stock, row, 'sku').trim().toUpperCase()}@${cell(stock, row, 'warehouseCode').trim().toUpperCase()}`))
     const zeroFinding = (report.findings ?? []).find((f) => f.code === 'ZERO_COST_OPENING_STOCK')
     if ((zeroFinding?.keys?.length ?? 0) !== zeroCostPairs.length) problems.push(`opening-stock: ${zeroCostPairs.length} zero-cost row(s) in the file, ${zeroFinding?.keys?.length ?? 0} in the prepared report`)
     const accepted = manifest.acceptZeroCost

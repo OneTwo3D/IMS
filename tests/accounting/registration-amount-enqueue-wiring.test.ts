@@ -242,3 +242,31 @@ test('[o3d-1xq8] the refusal is terminal for that receipt and does not block the
   assert.ok(state.activity.some((a) => a.metadata.refusal === 'AMOUNT_NOT_REPRESENTABLE'
     && a.metadata.paymentId === 'pay-bad'), 'and the other receipt was refused by name')
 })
+
+// A receipt of zero or less is not money received. [mutation: remove the `amount > 0` refusal in registerInvoicePaymentWithLedger; make it `>= 0` (zero passes); make it test the absolute value (negative passes)]
+for (const [label, amount] of [['zero', '0.0000'], ['negative', '-25.0000']] as const) {
+  test(`a ${label} non-refund receipt is REFUSED before anything is queued, reported by name, and does not block the others`, async () => {
+    state.payments = [receipt(amount, 'pay-bad'), receipt('40.0000', 'pay-good')]
+
+    const result = await redrive()
+
+    assert.equal(state.queued.length, 1, 'only the positive receipt was queued')
+    assert.equal(state.queued[0]!.payload.paymentId, 'pay-good')
+    const refusal = state.activity.find((a) => a.metadata.refusal === 'AMOUNT_NOT_POSITIVE')
+    assert.ok(refusal, 'and the refusal is REPORTED, never silent')
+    assert.equal(refusal.metadata.paymentId, 'pay-bad')
+    assert.equal(refusal.action, 'invoice_payment_not_registered')
+    assert.equal(refusal.level, 'WARNING')
+    assert.equal(refusal.metadata.amount, new Prisma.Decimal(amount).toFixed())
+    assert.match(refusal.description, /zero or less is not money received/)
+    assert.match(refusal.description, /NOTHING was sent/)
+    assert.equal(result.settled, false, 'a refused receipt is not a settled one')
+  })
+
+  test(`a ${label} receipt alone queues nothing at all`, async () => {
+    state.payments = [receipt(amount, 'pay-bad')]
+    await redrive()
+    assert.equal(state.queued.length, 0)
+    assert.ok(state.activity.some((a) => a.metadata.refusal === 'AMOUNT_NOT_POSITIVE'))
+  })
+}
