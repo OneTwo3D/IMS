@@ -418,6 +418,8 @@ export type WmsDispatchSweepDeps = {
   applyDispatch(
     orderId: string,
     tracking: Array<{ trackingNumber: string; shippingService?: string | null }>,
+    /** Every despatched part was verified against the earlier writer's storefront record: complete IMS only, write nothing to the storefront. */
+    options?: { storefrontAlreadyCompleted?: boolean },
   ): Promise<{ success: boolean; error?: string }>
   // Whether the active connector supports per-part reconciliation (fetchOrderParts). When
   // false, a split order is surfaced as a clear "unsupported" pending rather than silently
@@ -670,6 +672,10 @@ async function reconcileSplitOrder(
   // line items can't become a partial shipment — don't let it count toward completion
   // (that would ship the IMS order with a part never recorded).
   let allRecorded = true
+  // Parts whose storefront record was VERIFIED (pre-cutover) rather than written by this sweep.
+  let verifiedPreCutoverParts = 0
+  // The instant a verifying record must postdate: the LATEST despatch among ALL despatched parts, not the part being asked about.
+  const latestPartDespatch = latestDespatchTime(dispatchedParts.flatMap((entry) => entry.tracking))
   if (recordPartials) {
     for (const part of dispatchedParts) {
       const items = await deps.fetchPartItems(part.externalId)
@@ -694,11 +700,11 @@ async function reconcileSplitOrder(
           // part is VERIFIED against the storefront record IMS holds locally and, if it holds up, counted as recorded WITHOUT
           // a new storefront write. A part that cannot be verified stays pending, as before.
           if (push.shadowReason === PRE_CUTOVER_SHADOW_REASON) {
-            const despatchedAt = latestDespatchTime(part.tracking)
+            const despatchedAt = latestPartDespatch
             const verdict = deps.verifyIncumbentPartialShipment
               ? await deps.verifyIncumbentPartialShipment(candidate.orderId, { part: part.partNumber, totalParts, despatchedAt })
               : { verified: false, detail: 'this sweep has no way to verify the earlier writer\'s storefront record' }
-            if (verdict.verified) continue
+            if (verdict.verified) { verifiedPreCutoverParts += 1; continue }
             return {
               action: 'pending',
               reason: `Part ${part.partNumber} was despatched before the storefront went live and the earlier writer's record could not be verified: ${verdict.detail}`,
@@ -739,7 +745,10 @@ async function reconcileSplitOrder(
   const aggregated = trackingNumbers.length > 0
     ? [{ trackingNumber: trackingNumbers.join(', '), shippingService: allTracking.find((e) => e.carrier)?.carrier ?? null }]
     : []
-  const result = await deps.applyDispatch(candidate.orderId, aggregated)
+  // Every despatched part was VERIFIED against the earlier writer's record (none was pushed by this sweep): the storefront is
+  // already complete, so IMS completes its own side only. A mixed order (some part pushed live) keeps the normal completion.
+  const storefrontAlreadyCompleted = recordPartials && dispatchedParts.length > 0 && verifiedPreCutoverParts === dispatchedParts.length
+  const result = await deps.applyDispatch(candidate.orderId, aggregated, storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true } : undefined)
   if (!result.success) {
     return { action: 'error', reason: result.error ?? 'Dispatch apply failed after all parts despatched' }
   }
@@ -2342,7 +2351,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           },
         }
       : {}),
-    async applyDispatch(orderId, tracking) {
+    async applyDispatch(orderId, tracking, options) {
       // q66in.4.6 audit timeline: capture the order status pre-image so the
       // dispatch event carries a real before/after, not just the target state.
       const orderBefore = await db.salesOrder.findUnique({ where: { id: orderId }, select: { status: true, orderNumber: true } }).catch(() => null)
@@ -2351,6 +2360,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         lookup: { orderId },
         targetShipmentStatus: 'SHIPPED',
         tracking,
+        ...(options?.storefrontAlreadyCompleted === true ? { storefrontAlreadyCompleted: true } : {}),
       })
       if (result.success) {
         await recordWmsMutationEvent({

@@ -45,8 +45,8 @@ async function verify(despatchedAt: Date | null = DESPATCH) {
 
 test.beforeEach(() => { link = { externalOrderId: '555' }; deliveries = []; queries.length = 0; transport.length = 0 })
 
-test('a stored delivery received after the despatch with a partial-shipped or completed status VERIFIES', async () => {
-  for (const status of ['partial-shipped', 'wc-partial-shipped', 'completed', 'wc-completed', 'Completed']) {
+test('a stored delivery received after the despatch with a COMPLETED status VERIFIES (and only completed)', async () => {
+  for (const status of ['completed', 'wc-completed', 'Completed']) {
     deliveries = [delivery(status, after)]
     const verdict = await verify()
     assert.equal(verdict.verified, true, `${status}: ${verdict.detail}`)
@@ -60,6 +60,8 @@ test('FAILS CLOSED: every other shape is not verified', async () => {
     ['no delivery at all', () => { deliveries = [] }],
     ['a delivery for ANOTHER order', () => { deliveries = [delivery('completed', after, 556)] }],
     ['a delivery received BEFORE the part despatched', () => { deliveries = [delivery('completed', before)] }],
+    ['partial-shipped (some part, not necessarily every part)', () => { deliveries = [delivery('partial-shipped', after)] }],
+    ['wc-partial-shipped', () => { deliveries = [delivery('wc-partial-shipped', after)] }],
     ['processing', () => { deliveries = [delivery('processing', after)] }],
     ['on-hold', () => { deliveries = [delivery('on-hold', after)] }],
     ['cancelled', () => { deliveries = [delivery('cancelled', after)] }],
@@ -100,5 +102,6 @@ test('the pure classifier alone refuses a delivery received before the despatch,
   assert.equal(classifyStoredWcOrderDelivery({ receivedAt: after, status: 'completed' }, DESPATCH).verified, true)
   assert.equal(classifyStoredWcOrderDelivery(null, DESPATCH).verified, false)
   // no despatch time known: any delivery with a recording status counts (the query had no lower bound either)
-  assert.equal(classifyStoredWcOrderDelivery({ receivedAt: before, status: 'partial-shipped' }, null).verified, true)
+  assert.equal(classifyStoredWcOrderDelivery({ receivedAt: before, status: 'completed' }, null).verified, true)
+  assert.equal(classifyStoredWcOrderDelivery({ receivedAt: after, status: 'partial-shipped' }, DESPATCH).verified, false)
 })

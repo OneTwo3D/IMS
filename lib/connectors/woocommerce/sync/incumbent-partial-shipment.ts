@@ -13,24 +13,24 @@
  *
  * WHAT COUNTS AS VERIFIED, deliberately narrow and failing closed:
  *   - the order's link names a WooCommerce order id;
- *   - a stored, processed order delivery for THAT id exists that was received at or after the part's despatch time (an older
- *     delivery cannot say anything about a shipment made after it);
- *   - its status is one the shipment writeback produces: `partial-shipped` (the incumbent recorded at least one part) or
- *     `completed` (it recorded the shipment in full). Any other status - `processing`, `on-hold`, `cancelled`, a withdrawal
- *     status, an unreadable one - is NOT evidence that a part was recorded.
+ *   - a stored, processed order delivery for THAT id exists that was received at or after the LATEST despatch among the order's
+ *     despatched parts (the caller passes that instant; an older delivery cannot say anything about a part despatched after it);
+ *   - its status is `completed`, and nothing else. The earlier writer completing the order means every part is on the
+ *     storefront. `partial-shipped` is NOT accepted: it only says SOME part was recorded, and a delivery could reflect the first
+ *     part and not the second, so IMS would mark the order SHIPPED and consume stock for a part the storefront never recorded.
+ *     `processing`, `on-hold`, `cancelled`, a withdrawal status and an unreadable one are not evidence either.
  * Anything else is `verified: false`, and the sweep keeps the order pending exactly as it did before this module existed.
  *
- * The evidence is order-level, not part-level: a stored delivery does not carry the incumbent's per-part table. That limit is
- * named in the PR as a decision for the owner (whether to require more than the status).
+ * The evidence is order-level, not part-level: a stored delivery does not carry the incumbent's per-part table. Per-part proof
+ * would need the plugin's per-part meta in the payload, or an operator verification; neither exists and neither is built here.
  */
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { normaliseWcOrderStatus } from '../order-status-filter'
-import { WC_PARTIAL_SHIPPED_STATUS } from './partial-shipment'
 import { WC_WEBHOOK_EVENT_STATUS, WOOCOMMERCE_CONNECTOR } from '@/lib/connectors/shopping-webhook-inbox'
 
-/** The storefront statuses that mean the shipment writeback has recorded a part (or all of them). */
-export const INCUMBENT_PART_RECORDED_STATUSES: ReadonlySet<string> = new Set([WC_PARTIAL_SHIPPED_STATUS, 'completed'])
+/** The only storefront status that shows EVERY part recorded: the earlier writer completed the order. */
+export const INCUMBENT_PART_RECORDED_STATUSES: ReadonlySet<string> = new Set(['completed'])
 
 export type IncumbentPartialShipmentVerdict = { verified: boolean; detail: string }
 
@@ -41,13 +41,13 @@ export function classifyStoredWcOrderDelivery(
 ): IncumbentPartialShipmentVerdict {
   if (delivery === null) return { verified: false, detail: 'no stored WooCommerce order delivery for this order' }
   if (despatchedAt !== null && delivery.receivedAt.getTime() < despatchedAt.getTime()) {
-    return { verified: false, detail: 'the latest stored WooCommerce order delivery predates the part\'s despatch' }
+    return { verified: false, detail: 'the latest stored WooCommerce order delivery predates the latest part\'s despatch' }
   }
   const slug = normaliseWcOrderStatus(delivery.status)
   if (!INCUMBENT_PART_RECORDED_STATUSES.has(slug)) {
-    return { verified: false, detail: `the stored WooCommerce status is "${slug || 'unreadable'}", which does not show a recorded shipment` }
+    return { verified: false, detail: `the stored WooCommerce status is "${slug || 'unreadable'}", which does not show every part recorded (only completed does)` }
   }
-  return { verified: true, detail: `the stored WooCommerce order delivery shows status "${slug}" after the part's despatch` }
+  return { verified: true, detail: `the stored WooCommerce order delivery shows status "${slug}" after the latest part's despatch` }
 }
 
 /** The stored deliveries that can speak for one WooCommerce order since a part's despatch. Exported so the DB tier runs the real statement. */

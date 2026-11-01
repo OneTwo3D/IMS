@@ -115,6 +115,8 @@ const writes = () => transport.filter((entry) => !entry.startsWith('GET '))
 
 const CUTOFF = '2026-06-01T00:00:00Z'
 const PRE = '2026-05-20T10:00:00Z' // before the cutoff
+const PRE2 = '2026-05-22T10:00:00Z' // also before the cutoff, later than PRE
+const PRE2_ISO = new Date(PRE2).toISOString()
 const POST = '2026-07-01T10:00:00Z' // after the cutoff (and before now)
 
 type Part = { externalId: string; partNumber: number; status: string; dispatched: boolean; tracking: Array<{ trackingNumber: string; carrier: string; despatchedAt: string }> }
@@ -126,6 +128,7 @@ async function sweep(parts: Part[], verify: unknown) {
   const verified: Array<{ part: number; despatchedAt: string | null }> = []
   const pushes: number[] = []
   let applied = 0
+  const applyOptions: Array<Record<string, unknown> | undefined> = []
   const recorded: string[] = []
   const out = await runWmsDispatchSweepCore({
     listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
@@ -139,7 +142,7 @@ async function sweep(parts: Part[], verify: unknown) {
     repointLink: async () => {},
     clearDispatchFailures: async () => {},
     countLinksByOrderNumber: async (numbers: string[]) => new Map(numbers.map((n) => [n, 1])),
-    applyDispatch: async () => { applied += 1; return { success: true } },
+    applyDispatch: async (_orderId: string, _tracking: unknown, options?: Record<string, unknown>) => { applied += 1; applyOptions.push(options); return { success: true } },
     pushPartialShipment: async (orderId: string, input: { part: number; totalParts: number; items: Array<{ sku: string; qty: number }>; despatchedAt?: Date | null }) => {
       pushes.push(input.part)
       const result = await pushPartialShipmentToShopping(orderId, input as never)
@@ -151,7 +154,7 @@ async function sweep(parts: Part[], verify: unknown) {
       return (verify as (n: number) => { verified: boolean; detail: string })(input.part)
     } } : {}),
   } as never)
-  return { out, applied, pushes, verified, recorded }
+  return { out, applied, applyOptions, pushes, verified, recorded }
 }
 
 const LIVE_AT_CUTOFF = { ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: CUTOFF }
@@ -161,12 +164,13 @@ const no = () => ({ verified: false, detail: 'no stored WooCommerce order delive
 test('AFTER the cutoff: an all-pre-cutover split order whose incumbent record verifies COMPLETES in IMS with NO storefront write', async () => {
   reset()
   await withEnv(LIVE_AT_CUTOFF, async () => {
-    const run = await sweep([part(1, PRE), part(2, PRE)], yes)
+    const run = await sweep([part(1, PRE), part(2, PRE2)], yes)
     console.log(`# pre-cutover verified: counters=${JSON.stringify(run.out.counters)} verified=${JSON.stringify(run.verified)} applied=${run.applied} writes=${JSON.stringify(writes())} shadows=${shadows.length}`)
     assert.equal(run.applied, 1, 'THE FINDING: applyDispatch never ran for a pre-cutover split order')
     assert.equal(run.out.counters.dispatched, 1)
     assert.deepEqual(run.verified.map((v) => v.part), [1, 2])
-    assert.equal(run.verified[0]!.despatchedAt, new Date(PRE).toISOString())
+    assert.deepEqual(run.verified.map((v) => v.despatchedAt), [PRE2_ISO, PRE2_ISO], 'every part is asked against the LATEST despatch among the order\'s parts, not its own')
+    assert.deepEqual(run.applyOptions, [{ storefrontAlreadyCompleted: true }], 'and the dispatch is applied as "the storefront already holds this": no completion job, no storefront push')
     assert.deepEqual(writes(), [], 'and no write reached the storefront: the incumbent already recorded these parts')
     assert.deepEqual(run.recorded, [])
   })
@@ -198,6 +202,7 @@ test('AFTER the cutoff: a split order with one PRE-cutover part (verified, not w
     assert.equal(writes().length, 1, 'CONTROL: the live part DOES reach the transport (the rig can see a write)')
     assert.match(writes()[0]!, /partial-shipment/)
     assert.equal(shadows.filter((s) => s.operation === 'order.partial-shipment').length, 1, 'one shadow: the pre-cutover part')
+    assert.deepEqual(run.applyOptions.filter((o) => o?.storefrontAlreadyCompleted === true), [], 'a part pushed live means the normal storefront completion stays')
   })
 })
 
@@ -233,4 +238,66 @@ test('a seam with the switch OFF is untouched: the push reaches the storefront a
     assert.deepEqual(run.verified, [])
     assert.equal(writes().length, 1)
   })
+})
+
+// ───────────────────────── the evidence rule, end to end through the sweep ─────────────────────────
+
+test('EVIDENCE: partial-shipped never vouches; completed must be received after the LATEST part\'s despatch; completed after the last part verifies', async () => {
+  const { classifyStoredWcOrderDelivery } = await import('@/lib/connectors/woocommerce/sync/incumbent-partial-shipment')
+  const run = async (delivery: { status: string; receivedAt: Date }) => {
+    reset()
+    return withEnv(LIVE_AT_CUTOFF, async () => {
+      const seen: Array<Date | null> = []
+      // drive the same sweep with the real classifier as the verifier
+      const { runWmsDispatchSweepCore } = await import('@/lib/domain/wms/dispatch-sweep')
+      const { pushPartialShipmentToShopping } = await import('@/lib/shopping')
+      let applied = 0
+      const result = await runWmsDispatchSweepCore({
+        listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+        fetchOrderStatus: async () => ({ externalOrderId: 'M-1', externalOrderNumber: 'WC-1001', status: 'DESPATCHED', statusLabel: 'Despatched', isSplit: true, partCount: 2, isMerged: false, mergedOrderNumbers: [], deepLinkUrl: null, tracking: [], dispatched: true, raw: null }),
+        partsSupported: true,
+        fetchOrderParts: async () => [part(1, PRE), part(2, PRE2)],
+        fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+        repointLink: async () => {}, clearDispatchFailures: async () => {},
+        countLinksByOrderNumber: async (numbers: string[]) => new Map(numbers.map((n) => [n, 1])),
+        applyDispatch: async () => { applied += 1; return { success: true } },
+        pushPartialShipment: async (orderId: string, input: never) => {
+          const r = await pushPartialShipmentToShopping(orderId, input)
+          return { ok: r.success, error: r.error, ...(r.shadowed === true ? { shadowed: true } : {}), ...(r.shadowReason ? { shadowReason: r.shadowReason } : {}) }
+        },
+        recordDispatchError: async () => ({ deadLettered: false }),
+        verifyIncumbentPartialShipment: async (_o: string, input: { despatchedAt: Date | null }) => { seen.push(input.despatchedAt); return classifyStoredWcOrderDelivery(delivery, input.despatchedAt) },
+      } as never)
+      return { applied, seen, counters: result.counters }
+    })
+  }
+  const partial = await run({ status: 'partial-shipped', receivedAt: new Date('2026-05-25T00:00:00Z') })
+  assert.equal(partial.applied, 0, 'partial-shipped reflects at most the first part: the order stays pending')
+  assert.equal(partial.counters.pending, 1)
+  assert.ok(partial.seen.length > 0, 'PRECONDITION: the verifier was reached')
+  const early = await run({ status: 'completed', receivedAt: new Date('2026-05-21T00:00:00Z') }) // after part 1, BEFORE part 2 (05-22)
+  assert.equal(early.applied, 0, 'a completed delivery received before the second part despatched cannot vouch for it')
+  assert.deepEqual(early.seen.map((d) => d?.toISOString()), [PRE2_ISO])
+  const full = await run({ status: 'completed', receivedAt: new Date('2026-05-23T00:00:00Z') })
+  assert.equal(full.applied, 1, 'completed after the last part verifies')
+})
+
+test('MIXED order (one part verified pre-cutover, one pushed live and accepted): applied WITHOUT the "storefront already holds it" flag, so the normal completion stays', async () => {
+  const { runWmsDispatchSweepCore } = await import('@/lib/domain/wms/dispatch-sweep')
+  const optionsSeen: Array<Record<string, unknown> | undefined> = []
+  const out = await runWmsDispatchSweepCore({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+    fetchOrderStatus: async () => ({ externalOrderId: 'M-1', externalOrderNumber: 'WC-1001', status: 'DESPATCHED', statusLabel: 'Despatched', isSplit: true, partCount: 2, isMerged: false, mergedOrderNumbers: [], deepLinkUrl: null, tracking: [], dispatched: true, raw: null }),
+    partsSupported: true,
+    fetchOrderParts: async () => [part(1, PRE), part(2, POST)],
+    fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+    repointLink: async () => {}, clearDispatchFailures: async () => {},
+    countLinksByOrderNumber: async (numbers: string[]) => new Map(numbers.map((n) => [n, 1])),
+    applyDispatch: async (_o: string, _t: unknown, options?: Record<string, unknown>) => { optionsSeen.push(options); return { success: true } },
+    pushPartialShipment: async (_o: string, input: { part: number }) => (input.part === 1 ? { ok: false, shadowed: true, shadowReason: 'obligation_before_cutoff', error: 'held' } : { ok: true }),
+    recordDispatchError: async () => ({ deadLettered: false }),
+    verifyIncumbentPartialShipment: async () => ({ verified: true, detail: 'ok' }),
+  } as never)
+  assert.equal(out.counters.dispatched, 1, 'PRECONDITION: the order completed')
+  assert.deepEqual(optionsSeen, [undefined])
 })
