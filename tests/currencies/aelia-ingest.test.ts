@@ -395,6 +395,8 @@ test('a clear names the EXACT pin it set out to clear (id and write order): a ne
   assert.equal(fake.rates.length, 2, 'nothing was stored')
   // the right id with the wrong write order is not the same row either
   await assert.rejects(clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW, expectedPin: { id: 'newer', seq: 1 } }), (e: Error & { reason?: string }) => e.reason === 'pin_changed')
+  // the right write order with another id is not the same row either
+  await assert.rejects(clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW, expectedPin: { id: 'other', seq: 99 } }), (e: Error & { reason?: string }) => e.reason === 'pin_changed')
   // CONTROL: naming the row that is the latest clears it
   assert.deepEqual(await clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW, expectedPin: { id: 'newer', seq: 99 } }), { rate: '1.194344', markup: '0.02' })
 })

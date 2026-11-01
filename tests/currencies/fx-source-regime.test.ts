@@ -263,6 +263,9 @@ test('switch boundaries are STRICTLY increasing: a switch in the same millisecon
   assert.equal(strictlyAfterLastSwitch(at(T), undefined, T).toISOString(), '2026-10-22T12:00:00.001Z')
   // later than the last: unchanged
   assert.equal(strictlyAfterLastSwitch(at('2026-10-22T12:00:01.000Z'), hist, T).toISOString(), '2026-10-22T12:00:01.000Z')
+  // the HISTORY counts on its own: a last entry later than the pair's instant decides
+  const laterHist = JSON.stringify([{ source: 'aelia', since: '2026-10-22T12:00:05.000Z' }])
+  assert.equal(strictlyAfterLastSwitch(at(T), laterHist, T).toISOString(), '2026-10-22T12:00:05.001Z')
   // no record at all: unchanged
   assert.equal(strictlyAfterLastSwitch(at(T), undefined, undefined).toISOString(), T)
   // the effect: an Aelia switch then an ECB switch at one millisecond leave a one-millisecond Aelia interval holding the instant between them
