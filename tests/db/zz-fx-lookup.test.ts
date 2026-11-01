@@ -78,7 +78,7 @@ test('db: a tie with different rates at the latest instant refuses; equal rates 
     const asOf = D('2026-02-01T00:00:00Z')
     await assert.rejects(getFxRateToBase(tx, { currency: 'EUR', asOf, baseCurrency: 'GBP' }), (e: unknown) => e instanceof MissingFxRateError && e.reason === 'ambiguous_rate')
     const usd = await getFxRateToBase(tx, { currency: 'USD', asOf, baseCurrency: 'GBP' })
-    assert.equal(usd.rate.toString(), '1.3'); assert.equal(usd.manualOverride, true); assert.equal(usd.source, 'frankfurter,manual')
+    assert.equal(usd.rate.toString(), '1.3'); assert.equal(usd.manualOverride, true); assert.equal(usd.source, 'manual', 'equal instants: the later write (the pin, seeded second) is the row, and its rate is the same')
     assert.equal((await getFxRateToBase(tx, { currency: 'JPY', asOf, baseCurrency: 'GBP' })).rate.toString(), '152')
   })
 })
