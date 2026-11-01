@@ -19,7 +19,6 @@ import { Prisma } from '@/app/generated/prisma/client'
 let enabledPlugins: string[] = ['xero']
 let pluginReads = 0
 let flipAfterReads: { reads: number; to: string[] } | null = null
-let qboSyncEnabled = 'true'
 
 mock.module('@/lib/integration-plugins', {
   namedExports: {
@@ -150,11 +149,10 @@ mock.module('@/lib/db', {
   },
 })
 
-function reset(flip: { reads: number; to: string[] } | null, qboSync = 'true') {
+function reset(flip: { reads: number; to: string[] } | null) {
   enabledPlugins = ['xero']
   pluginReads = 0
   flipAfterReads = flip
-  qboSyncEnabled = qboSync
   committed.posted = 0
   committed.syncRows = []
   activity.length = 0

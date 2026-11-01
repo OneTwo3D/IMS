@@ -93,3 +93,12 @@ test('the query asks for ORDER deliveries of THIS WooCommerce id, PROCESSED, rec
   assert.deepEqual(where.payloadJson, { path: ['id'], equals: 555 })
   assert.deepEqual(where.receivedAt, { gte: DESPATCH })
 })
+
+test('the pure classifier alone refuses a delivery received before the despatch, whatever the query returned', async () => {
+  const { classifyStoredWcOrderDelivery } = await import('@/lib/connectors/woocommerce/sync/incumbent-partial-shipment')
+  assert.equal(classifyStoredWcOrderDelivery({ receivedAt: before, status: 'completed' }, DESPATCH).verified, false)
+  assert.equal(classifyStoredWcOrderDelivery({ receivedAt: after, status: 'completed' }, DESPATCH).verified, true)
+  assert.equal(classifyStoredWcOrderDelivery(null, DESPATCH).verified, false)
+  // no despatch time known: any delivery with a recording status counts (the query had no lower bound either)
+  assert.equal(classifyStoredWcOrderDelivery({ receivedAt: before, status: 'partial-shipped' }, null).verified, true)
+})
