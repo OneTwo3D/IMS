@@ -1,5 +1,5 @@
 import { Prisma } from '@/app/generated/prisma/client'
-import { eligibleRowsUnderAeliaRegime, fxRegimeRestrictsAt, type FxSourceRegime } from './fx-source-regime'
+import { compareFxRowOrder, eligibleRowsUnderAeliaRegime, fxRegimeRestrictsAt, type FxSourceRegime } from './fx-source-regime'
 
 /**
  * The PURE half of the one exchange-rate lookup (no database, no base-currency module): the closed refusal reasons, the date rule and the row
@@ -54,6 +54,8 @@ export type FxRateRow = {
   fetchedAt: Date
   source?: string
   manualOverride?: boolean
+  /** Write order (fx_rates.seq): breaks a fetchedAt tie, the later write is the later row. Absent on rows from a source that does not know it. */
+  seq?: bigint | number | null
 }
 
 const CURRENCY_CODE = /^[A-Z]{3}$/
@@ -137,7 +139,17 @@ export function selectFxRateFromRows(
   const candidates = restricted ? eligibleRowsUnderAeliaRegime(inPair) : inPair
   if (candidates.length === 0) throw refuse(inPair.length > 0 ? 'no_rate_from_selected_source' : 'no_rate', baseCurrency, currency, asOf)
   const latest = candidates.reduce((max, r) => Math.max(max, r.fetchedAt.getTime()), -Infinity)
-  const tied = candidates.filter((r) => r.fetchedAt.getTime() === latest)
+  let tied = candidates.filter((r) => r.fetchedAt.getTime() === latest)
+  // A TIE ON fetchedAt between a manual override and a non-override row goes to the LATER WRITE (seq): a pin set after a refresh won, and a clear (an ECB or Aelia row) written after a pin cleared it. Rows of one
+  // kind that disagree stay ambiguous, as before; so do rows without a seq.
+  const pins = tied.filter((r) => r.manualOverride === true)
+  const others = tied.filter((r) => r.manualOverride !== true)
+  if (pins.length > 0 && others.length > 0) {
+    const later = (x: FxRateRow, y: FxRateRow) => (compareFxRowOrder(x, y) >= 0 ? x : y)
+    const c = compareFxRowOrder(pins.reduce(later), others.reduce(later))
+    if (c > 0) tied = pins
+    else if (c < 0) tied = others
+  }
   const rates: Prisma.Decimal[] = []
   for (const r of tied) {
     const rate = toRate(r.rate)

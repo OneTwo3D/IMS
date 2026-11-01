@@ -31,6 +31,16 @@ export async function withFxTableWriteLock<T>(work: (tx: Prisma.TransactionClien
   }, { maxWait: 60_000, timeout: options.timeout ?? 10 * 60_000 })
 }
 
+/**
+ * The `fetchedAt` of a row an FX writer inserts: call it INSIDE the work passed to withFxTableWriteLock, so the instant is taken after the lock is held. A stamp taken before the wait (or the
+ * transaction's start) can be EARLIER than a row another writer committed while this one waited, and the earlier-dated row would lose to it though it was written later. The one exception is the
+ * Aelia ingest, whose rows carry Aelia's own update time (a data time, not a write time): its ordering rests on the update time never being later than the lock-held `now` it is checked against.
+ * A tie of two stamps is broken by the write order, `seq`.
+ */
+export function fxWriteStamp(): Date {
+  return new Date()
+}
+
 export class FxTableBusyError extends Error {
   constructor() {
     super('FX_TABLE_BUSY: the exchange rates are being updated; the import was not started. Try again in a moment.')

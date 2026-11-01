@@ -521,6 +521,9 @@ model FxRate {
   /// row forever; "clearing" the override means inserting a newer, non-
   /// override row that becomes the latest.
   manualOverride Boolean  @default(false)
+  /// Write order. fetchedAt can tie (two writers within one clock tick, or a stamp from another clock); the row written LATER, which takes a higher seq because every writer holds the exclusive FX
+  /// table lock while it inserts, is the later one. The lookup orders by (fetchedAt, seq).
+  seq            BigInt   @default(autoincrement())
 
   currency       Currency @relation(fields: [toCurrency], references: [code])
 

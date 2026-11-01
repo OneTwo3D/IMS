@@ -99,7 +99,7 @@ export async function resolveFxRatesToBase(
   })
   const rows = pairs.length === 0 ? [] : await client.fxRate.findMany({
     where: { fromCurrency: base, OR: pairs.map((p) => ({ toCurrency: p.toCurrency, fetchedAt: p.fetchedAt })) },
-    select: { fromCurrency: true, toCurrency: true, rate: true, fetchedAt: true, source: true, manualOverride: true },
+    select: { fromCurrency: true, toCurrency: true, rate: true, fetchedAt: true, source: true, manualOverride: true, seq: true },
   })
   for (const currency of toQuery) {
     try {

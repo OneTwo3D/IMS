@@ -235,7 +235,7 @@ export async function pushCurrentFxRatesToWc(): Promise<FxRatePushResult> {
   // by toCurrency and take the newest fetchedAt.
   const all = await db.fxRate.findMany({
     where: { fromCurrency: base },
-    orderBy: { fetchedAt: 'desc' },
+    orderBy: [{ fetchedAt: 'desc' }, { seq: 'desc' }],
     select: { toCurrency: true, rate: true, fetchedAt: true },
   })
   const seen = new Set<string>()

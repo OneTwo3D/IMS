@@ -49,3 +49,26 @@ test('every fx_rates writer in app/ and lib/ writes through the exclusive lock',
     assert.equal((imp.match(new RegExp(`fxGuard\\.assertHeld\\('finishing the ${kind} import'\\)`, 'g')) ?? []).length, 1, `${kind}: guard after the last write`)
   }
 })
+
+test('every fx_rates row is stamped INSIDE the lock-holding transaction (fxWriteStamp), except the Aelia ingest, whose rows carry Aelia\'s own update time', () => {
+  const files: string[] = []
+  walk('app', files)
+  walk('lib', files)
+  const create = /\.fxRate\.create\(/g
+  const found: string[] = []
+  const bad: string[] = []
+  for (const f of files) {
+    if (f.endsWith('fx-table-lock.ts')) continue
+    const text = readFileSync(f, 'utf8')
+    for (const m of text.matchAll(create)) {
+      const at = m.index ?? 0
+      const body = text.slice(at, text.indexOf('})', at) + 2)
+      if (/fetchedAt: parsed\.updatedAt/.test(body)) { found.push(`${f}: Aelia's own update time`); continue }
+      found.push(f)
+      if (!/fetchedAt: (fxWriteStamp\(\)|clearedAt)/.test(body)) bad.push(`${f}: ${body.slice(0, 120)}`)
+    }
+  }
+  assert.ok(found.length >= 6, `PRECONDITION: the census found the known writers (${found.length}: ${found.join(', ')})`)
+  assert.deepEqual(bad, [])
+  assert.match(readFileSync('lib/currencies/aelia-ingest.ts', 'utf8'), /const clearedAt = options\.now \?\? fxWriteStamp\(\)/)
+})

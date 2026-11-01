@@ -1,7 +1,7 @@
 'use server'
 
 import { AELIA_CUTOVER_READ_BOUND_MS, AELIA_CUTOVER_TX_TIMEOUT_MS, FxCutoverRefusedError, cutoverReadMismatches, readWithin } from '@/lib/currencies/aelia-cutover'
-import { withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
+import { fxWriteStamp, withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
 import { revalidatePath } from 'next/cache'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
@@ -40,7 +40,7 @@ export async function getCurrencies(activeOnly = true): Promise<CurrencyRow[]> {
     include: {
       fxRates: {
         where: { fromCurrency: baseCurrency },
-        orderBy: { fetchedAt: 'desc' },
+        orderBy: [{ fetchedAt: 'desc' }, { seq: 'desc' }],
         take: 1,
       },
     },
@@ -193,7 +193,7 @@ async function fetchSingleFxRate(code: string): Promise<number | null> {
     // Re-read the source inside the lock: a switch to Aelia that committed while frankfurter was being asked wins, and the ECB row is not stored.
     const stored = await withFxTableWriteLock(async (tx) => {
       if ((await getFxRateSourceInTx(tx)) === 'aelia') return false
-      await tx.fxRate.create({ data: { fromCurrency: baseCurrency, toCurrency: code, rate } })
+      await tx.fxRate.create({ data: { fromCurrency: baseCurrency, toCurrency: code, rate, fetchedAt: fxWriteStamp() } })
       return true
     })
     if (!stored) return null
@@ -230,7 +230,7 @@ export async function getLatestFxRates(): Promise<FxRateRow[]> {
       "toCurrency", "rate", "fetchedAt", "source", "manualOverride"
     FROM "fx_rates"
     WHERE "fromCurrency" = ${baseCurrency}
-    ORDER BY "toCurrency", "fetchedAt" DESC
+    ORDER BY "toCurrency", "fetchedAt" DESC, "seq" DESC
   `
   return rows.map((r) => ({
     toCurrency: r.toCurrency,
@@ -260,6 +260,7 @@ export async function setManualFxRate(toCurrency: string, rate: number): Promise
       fromCurrency: baseCurrency,
       toCurrency: code,
       rate,
+      fetchedAt: fxWriteStamp(),
       source: 'manual',
       manualOverride: true,
     },
@@ -291,10 +292,16 @@ export async function clearManualFxRate(toCurrency: string): Promise<{ success: 
       import('@/lib/connectors/woocommerce/aelia-rates'),
       import('@/lib/currencies/aelia-ingest'),
     ])
+    // The pin being cleared is read BEFORE the (slow) store read; the clear re-checks inside the lock that it is still the latest row.
+    const pin = await db.fxRate.findFirst({
+      where: { fromCurrency: baseCurrency, toCurrency: code, fetchedAt: { lte: new Date() } },
+      orderBy: [{ fetchedAt: 'desc' }, { seq: 'desc' }],
+      select: { id: true, manualOverride: true },
+    })
     const read = await readAeliaRatesFromWc()
     if (!read.ok) return { success: false, error: read.message }
     try {
-      const cleared = await clearOverrideFromAelia(read.body, code)
+      const cleared = await clearOverrideFromAelia(read.body, code, pin?.manualOverride ? { expectedPinId: pin.id } : {})
       await logActivity({
         entityType: 'SETTING',
         tag: 'settings',
@@ -326,7 +333,7 @@ export async function clearManualFxRate(toCurrency: string): Promise<{ success: 
   }
   const stored = await withFxTableWriteLock(async (tx) => {
     if ((await getFxRateSourceInTx(tx)) === 'aelia') return false
-    await tx.fxRate.create({ data: { fromCurrency: baseCurrency, toCurrency: code, rate: fresh, source: 'frankfurter', manualOverride: false } })
+    await tx.fxRate.create({ data: { fromCurrency: baseCurrency, toCurrency: code, rate: fresh, fetchedAt: fxWriteStamp(), source: 'frankfurter', manualOverride: false } })
     return true
   })
   if (!stored) return { success: false, error: 'The FX source changed to Aelia while this ran; nothing was stored.' }
@@ -411,7 +418,7 @@ export async function getFxHealth(): Promise<FxHealth> {
         SELECT DISTINCT ON ("toCurrency") "toCurrency", "manualOverride"
         FROM "fx_rates"
         WHERE "fromCurrency" = ${baseCurrency}
-        ORDER BY "toCurrency", "fetchedAt" DESC
+        ORDER BY "toCurrency", "fetchedAt" DESC, "seq" DESC
       ) latest
       WHERE latest."manualOverride" = true
     `,

@@ -238,7 +238,7 @@ test('the other frankfurter callers stand aside under the Aelia source: a new cu
   const clear = src.slice(src.indexOf('export async function clearManualFxRate'), src.indexOf('export type FxPushLogRow'))
   const guard = clear.indexOf("getFxRateSource()) === 'aelia'")
   assert.ok(guard > 0 && guard < clear.indexOf('await fetch('), 'checked before frankfurter is asked')
-  assert.ok(clear.indexOf('clearOverrideFromAelia(read.body, code)') > guard && clear.indexOf('clearOverrideFromAelia(read.body, code)') < clear.indexOf('await fetch('))
+  assert.ok(clear.indexOf('clearOverrideFromAelia(read.body, code, ') > guard && clear.indexOf('clearOverrideFromAelia(read.body, code, ') < clear.indexOf('await fetch('))
   assert.match(clear.slice(guard, clear.indexOf('await fetch(')), /return \{ success: true \}/, 'the Aelia branch returns before the frankfurter code')
 })
 

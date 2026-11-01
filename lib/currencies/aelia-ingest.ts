@@ -1,7 +1,7 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { getFxRateSourceInTx } from '@/lib/currencies/fx-source'
-import { withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
+import { fxWriteStamp, withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
 
 type FxTx = Parameters<Parameters<typeof withFxTableWriteLock>[0]>[0]
 
@@ -59,6 +59,7 @@ export const AELIA_REFUSALS = [
   'changed_without_update',
   'aelia_update_regressed',
   'source_changed',
+  'pin_changed',
 ] as const
 export type AeliaRefusalReason = (typeof AELIA_REFUSALS)[number]
 
@@ -254,7 +255,7 @@ export async function ingestAeliaRatesInTx(tx: FxTx, body: unknown, options: { n
   const activeForeign = [...knownByCode].filter(([code, active]) => active && code !== baseCurrency).map(([code]) => code)
   const latest = await tx.fxRate.findMany({
     where: { fromCurrency: baseCurrency, toCurrency: { in: activeForeign }, fetchedAt: { lte: now } },
-    orderBy: [{ toCurrency: 'asc' }, { fetchedAt: 'desc' }],
+    orderBy: [{ toCurrency: 'asc' }, { fetchedAt: 'desc' }, { seq: 'desc' }],
     distinct: ['toCurrency'],
     select: { toCurrency: true, manualOverride: true },
   })
@@ -302,9 +303,8 @@ export async function ingestAeliaRatesInTx(tx: FxTx, body: unknown, options: { n
  * Clear a manual override from Aelia's rate. The pin is the latest row and stays in force until a NEWER non-override row exists, so this row carries the time of the admin's action
  * (`clearedAt`), not Aelia's update time (an Aelia time older than the pin could never replace it). It is the one Aelia row not dated by Aelia, and it is a deliberate admin action.
  */
-export async function clearOverrideFromAelia(body: unknown, currency: string, options: { now?: Date } = {}): Promise<{ rate: string; markup: string | null }> {
-  const clearedAt = options.now ?? new Date()
-  const parsed = parseAeliaRatesPayload(body, clearedAt)
+export async function clearOverrideFromAelia(body: unknown, currency: string, options: { now?: Date; expectedPinId?: string } = {}): Promise<{ rate: string; markup: string | null }> {
+  const parsed = parseAeliaRatesPayload(body, options.now ?? new Date())
   const baseCurrency = await getBaseCurrencyCode()
   if (parsed.base !== baseCurrency) throw new AeliaRefusedError('base_mismatch', `Aelia's base currency is ${parsed.base} but IMS's is ${baseCurrency}; nothing was stored`)
   const entry = parsed.entries.find((e) => e.currency === currency)
@@ -315,6 +315,21 @@ export async function clearOverrideFromAelia(body: unknown, currency: string, op
   await withFxTableWriteLock(async (tx) => {
     // The source is re-read inside the lock: a switch back to ECB that committed while the store was being read leaves no Aelia row behind.
     await requireAeliaSourceInTx(tx)
+    // The row is stamped NOW, inside the lock: a pin another admin set while this waited has an earlier-or-later stamp than a time taken before the wait, and only a stamp taken here is later than every row
+    // already committed.
+    const clearedAt = options.now ?? fxWriteStamp()
+    // THE PIN THIS SET OUT TO CLEAR must still be the latest row. If a newer row of any kind appeared meanwhile (a new pin, a rate update) the admin asked to clear a rate that is no longer the one in force;
+    // refuse rather than report a success that did not happen (or silently replace a pin the admin never looked at).
+    if (options.expectedPinId !== undefined) {
+      const latest = await tx.fxRate.findFirst({
+        where: { fromCurrency: baseCurrency, toCurrency: currency, fetchedAt: { lte: clearedAt } },
+        orderBy: [{ fetchedAt: 'desc' }, { seq: 'desc' }],
+        select: { id: true },
+      })
+      if (!latest || latest.id !== options.expectedPinId) {
+        throw new AeliaRefusedError('pin_changed', `The rate for ${currency} changed while the override was being cleared (a newer rate or pin was stored); nothing was changed. Check the current rate and clear it again if you still want to.`)
+      }
+    }
     await tx.fxRate.create({
       data: { fromCurrency: baseCurrency, toCurrency: currency, rate: entry.rate, source: AELIA_SOURCE, fetchedAt: clearedAt, manualOverride: false },
     })

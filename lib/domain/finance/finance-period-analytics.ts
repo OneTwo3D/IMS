@@ -295,6 +295,7 @@ type FxRateRow = {
   fetchedAt: Date
   source?: string
   manualOverride?: boolean
+  seq?: bigint | number | null
 }
 
 function clientFromDeps(deps?: FinanceAnalyticsDeps): FinanceAnalyticsClient {
@@ -1032,8 +1033,8 @@ async function loadFxRates(client: FinanceAnalyticsClient, baseCurrency: string,
     // window, so a row at or after that end can never be the latest on or before one. Over the cap is a refusal
     // (assertSourceLimit), never a silently truncated history.
     where: { fromCurrency: baseCurrency, fetchedAt: { lt: window.dateToExclusive } },
-    select: { fromCurrency: true, toCurrency: true, rate: true, fetchedAt: true, source: true, manualOverride: true },
-    orderBy: { fetchedAt: 'desc' },
+    select: { fromCurrency: true, toCurrency: true, rate: true, fetchedAt: true, source: true, manualOverride: true, seq: true },
+    orderBy: [{ fetchedAt: 'desc' }, { seq: 'desc' }],
     take: SOURCE_ROW_LIMIT + 1,
   }) as Promise<FxRateRow[]>
 }

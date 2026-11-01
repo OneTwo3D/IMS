@@ -228,3 +228,26 @@ test('a manual override is a PIN only while it is the latest row across ALL sour
   // CONTROL: outside the regime the plain latest row (the cleared ECB rate) answers
   assert.equal(selectFxRateFromRows(both, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER }).rate.toString(), '1.31')
 })
+
+test('a fetchedAt TIE goes to the later write (seq), also over a pin; rows without a seq stay ambiguous as before', async () => {
+  const T = '2026-10-22T12:00:00Z'
+  const pinFirst = [{ ...row('USD', '1.50', T, 'manual', true), seq: 1n }, { ...row('USD', '1.31', T), seq: 2n }]
+  const pinLast = [{ ...row('USD', '1.31', T), seq: 1n }, { ...row('USD', '1.50', T, 'manual', true), seq: 2n }]
+  const noSeq = [row('USD', '1.50', T, 'manual', true), row('USD', '1.31', T)]
+  // outside the regime
+  assert.equal(selectFxRateFromRows(pinFirst, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER }).rate.toString(), '1.31', 'a clear written after the pin wins')
+  assert.equal(selectFxRateFromRows(pinLast, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER }).rate.toString(), '1.5', 'a pin written after the refresh wins')
+  assert.throws(() => selectFxRateFromRows(noSeq, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER }), (e: Error & { reason?: string }) => e.reason === 'ambiguous_rate')
+  // under the regime: a pin written first is superseded, a pin written last is in force
+  assert.throws(() => selectFxRateFromRows(pinFirst, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER, regime }), (e: Error & { reason?: string }) => e.reason === 'no_rate_from_selected_source')
+  assert.equal(selectFxRateFromRows(pinLast, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER, regime }).rate.toString(), '1.5')
+  // the database lookup, through the fake client that returns the rows as given
+  await assert.rejects(getFxRateToBase(fakeFxClient(pinFirst, 'GBP', settings), { currency: 'USD', asOf: AFTER }), (e: Error & { reason?: string }) => e.reason === 'no_rate_from_selected_source')
+  assert.equal((await getFxRateToBase(fakeFxClient(pinLast, 'GBP', settings), { currency: 'USD', asOf: AFTER })).rate.toString(), '1.5')
+  assert.equal((await getFxRateToBase(fakeFxClient(pinFirst, 'GBP', {}), { currency: 'USD', asOf: AFTER })).rate.toString(), '1.31')
+  // a later Aelia write over a pin at the same instant also supersedes the pin; an earlier one does not
+  const aeliaLast = [{ ...row('USD', '1.50', T, 'manual', true), seq: 1n }, { ...row('USD', '1.40', T, 'aelia'), seq: 2n }]
+  assert.equal(selectFxRateFromRows(aeliaLast, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER, regime }).rate.toString(), '1.4')
+  const aeliaFirst = [{ ...row('USD', '1.40', T, 'aelia'), seq: 1n }, { ...row('USD', '1.50', T, 'manual', true), seq: 2n }]
+  assert.equal(selectFxRateFromRows(aeliaFirst, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER, regime }).rate.toString(), '1.5')
+})

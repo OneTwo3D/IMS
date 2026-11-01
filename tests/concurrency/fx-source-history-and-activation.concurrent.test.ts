@@ -14,6 +14,7 @@ import { loadEnv } from './po-landed-fixtures'
  *   arm 5  a base-currency change takes the FX lock and is refused under Aelia; it compares against the base and lock marker left by a lock holder, not the ones seen before its wait
  *   arm 6  an unreadable history refuses a source switch and is not rewritten
  *   arm 7  a cleared pin (a newer ECB row over an old manual one) is no pin under Aelia: neither activation nor a lookup uses it; a pin in force still does
+ *   arm 8  a clear held up behind a concurrent pin is refused and the lookup agrees; arm 9 a pin is stamped inside the lock; arm 10 a fetchedAt tie goes to the later write
  * Real Postgres. Mutations: stop appending the history -> arm 1 reads the ECB row; take toggleCurrency / createCurrency out of the lock -> arm 2 activates while the lock is held.
  */
 
@@ -63,7 +64,7 @@ test('switch history keeps the Aelia period on Aelia rows after a switch back; a
     },
   })
   const { getBaseCurrencyCode } = await import('@/lib/base-currency')
-  const { setFxRateSource, toggleCurrency, createCurrency } = await import('@/app/actions/currencies')
+  const { setFxRateSource, toggleCurrency, createCurrency, setManualFxRate, clearManualFxRate } = await import('@/app/actions/currencies')
   const { getFxRateToBase } = await import('@/lib/currencies/fx-lookup')
   const { withFxTableWriteLock } = await import('@/lib/currencies/fx-table-lock')
   assert.equal(await getBaseCurrencyCode(), 'GBP', 'PRECONDITION: the scratch base currency is GBP')
@@ -352,6 +353,89 @@ test('switch history keeps the Aelia period on Aelia rows after a switch back; a
   assert.deepEqual(await toggleCurrency('AUD', true), { success: true }, 'a pin in force covers the activation')
   assert.equal((await getFxRateToBase(db, { currency: 'AUD', asOf: new Date() })).rate.toString(), '1.7')
   await db.currency.update({ where: { code: 'AUD' }, data: { active: false } })
+  await db.fxRate.deleteMany({ where: { toCurrency: 'AUD' } })
+
+  // ---- arm 8: a clear that was held up behind a concurrent pin is REFUSED (the pin it set out to clear is no longer the latest row), and the lookup agrees with the message
+  await reset()
+  await db.fxRate.deleteMany({ where: { toCurrency: 'AUD' } })
+  await db.currency.update({ where: { code: 'AUD' }, data: { active: false } })
+  assert.deepEqual(await setFxRateSource('aelia'), { success: true })
+  const tPin = Date.now()
+  await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'AUD', rate: '1.7', source: 'manual', manualOverride: true, fetchedAt: new Date(tPin - 3000) } })
+  assert.deepEqual(await toggleCurrency('AUD', true), { success: true })
+  let releaseClear: () => void = () => {}
+  const clearGate = new Promise<void>((r) => { releaseClear = r })
+  let clearIn: () => void = () => {}
+  const clearHolderIn = new Promise<void>((r) => { clearIn = r })
+  const { fxWriteStamp } = await import('@/lib/currencies/fx-table-lock')
+  const clearHolder = withFxTableWriteLock(async (tx) => {
+    clearIn()
+    await clearGate
+    await tx.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'AUD', rate: '1.8', source: 'manual', manualOverride: true, fetchedAt: fxWriteStamp() } })
+  })
+  await clearHolderIn
+  const clearing = clearManualFxRate('AUD')
+  assert.ok((await waitingOnAdvisoryLock(db)) >= 1, 'PRECONDITION: the clear waits on the FX table lock')
+  await new Promise((r) => setTimeout(r, 60))
+  releaseClear()
+  await clearHolder
+  const clearResult = await clearing
+  assert.equal(clearResult.success, false, 'the clear did not report a success that did not happen')
+  assert.match(clearResult.error ?? '', /pin_changed/)
+  const afterRefusedClear = await getFxRateToBase(db, { currency: 'AUD', asOf: new Date() })
+  assert.equal(afterRefusedClear.rate.toString(), '1.8', 'the lookup uses the newer pin, as the refusal says')
+  assert.equal(afterRefusedClear.manualOverride, true)
+  assert.equal(await db.fxRate.count({ where: { toCurrency: 'AUD', source: 'aelia' } }), 0, 'no Aelia row was stored by the refused clear')
+  // CONTROL: with nothing in the way the same clear goes through and its row, stamped inside the lock, is the latest
+  assert.deepEqual(await clearManualFxRate('AUD'), { success: true })
+  const clearedRate = await getFxRateToBase(db, { currency: 'AUD', asOf: new Date() })
+  assert.equal(clearedRate.source, 'aelia')
+  assert.equal(clearedRate.rate.toString(), '1.5')
+
+  // ---- arm 9: a pin is stamped INSIDE the lock, after the wait: its stamp is later than the moment the writer was seen waiting
+  await db.fxRate.deleteMany({ where: { toCurrency: 'AUD' } })
+  await reset()
+  assert.deepEqual(await toggleCurrency('AUD', false), { success: true })
+  let releasePin: () => void = () => {}
+  const pinGate = new Promise<void>((r) => { releasePin = r })
+  let pinIn: () => void = () => {}
+  const pinHolderIn = new Promise<void>((r) => { pinIn = r })
+  const pinHolder = withFxTableWriteLock(async () => { pinIn(); await pinGate })
+  await pinHolderIn
+  const pinning = setManualFxRate('AUD', 1.6)
+  assert.ok((await waitingOnAdvisoryLock(db)) >= 1, 'PRECONDITION: the pin waits on the FX table lock')
+  await new Promise((r) => setTimeout(r, 60))
+  const waitedAt = new Date()
+  await new Promise((r) => setTimeout(r, 60))
+  releasePin()
+  await pinHolder
+  assert.deepEqual(await pinning, { success: true })
+  const pinRow = await db.fxRate.findFirst({ where: { toCurrency: 'AUD', manualOverride: true }, orderBy: { seq: 'desc' } })
+  assert.ok(pinRow && pinRow.fetchedAt.getTime() > waitedAt.getTime(), 'the pin was stamped after the lock was acquired, not before the wait')
+
+  // ---- arm 10: a fetchedAt TIE goes to the later write (seq). Under ECB the later of pin and ECB row wins; under Aelia a later pin is in force and a later ECB row supersedes the pin.
+  await db.fxRate.deleteMany({ where: { toCurrency: 'AUD' } })
+  const tie = new Date(Date.now() - 5000)
+  const insertTie = async (order: Array<'manual' | 'ecb'>) => {
+    await db.fxRate.deleteMany({ where: { toCurrency: 'AUD' } })
+    for (const kind of order) {
+      await db.fxRate.create({ data: kind === 'manual'
+        ? { fromCurrency: 'GBP', toCurrency: 'AUD', rate: '1.9', source: 'manual', manualOverride: true, fetchedAt: tie }
+        : { fromCurrency: 'GBP', toCurrency: 'AUD', rate: '1.95', source: 'frankfurter', manualOverride: false, fetchedAt: tie } })
+    }
+  }
+  await reset() // source ECB
+  await insertTie(['manual', 'ecb'])
+  assert.equal((await getFxRateToBase(db, { currency: 'AUD', asOf: new Date() })).rate.toString(), '1.95', 'ECB: the clear written after the pin wins the tie')
+  await insertTie(['ecb', 'manual'])
+  assert.equal((await getFxRateToBase(db, { currency: 'AUD', asOf: new Date() })).rate.toString(), '1.9', 'ECB: the pin written after the refresh wins the tie')
+  await db.fxRate.deleteMany({ where: { toCurrency: 'AUD' } })
+  await db.currency.update({ where: { code: 'AUD' }, data: { active: false } })
+  assert.deepEqual(await setFxRateSource('aelia'), { success: true })
+  await insertTie(['manual', 'ecb'])
+  await assert.rejects(getFxRateToBase(db, { currency: 'AUD', asOf: new Date() }), (e: Error & { reason?: string }) => e.reason === 'no_rate_from_selected_source', 'Aelia: a clear written after the pin supersedes it')
+  await insertTie(['ecb', 'manual'])
+  assert.equal((await getFxRateToBase(db, { currency: 'AUD', asOf: new Date() })).rate.toString(), '1.9', 'Aelia: a pin written after the ECB row is in force')
   await db.fxRate.deleteMany({ where: { toCurrency: 'AUD' } })
 
   // CONTROL: under ECB the change goes through (so the refusals above can fail for the right reason only)
