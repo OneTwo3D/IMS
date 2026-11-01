@@ -1,5 +1,5 @@
 import { Prisma } from '@/app/generated/prisma/client'
-import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { getBaseCurrencyCode, resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { getFxRateSourceInTx } from '@/lib/currencies/fx-source'
 import { fxWriteStamp, withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
 
@@ -217,7 +217,7 @@ async function requireAeliaSourceInTx(tx: FxTx): Promise<void> {
 export async function ingestAeliaRatesInTx(tx: FxTx, body: unknown, options: { now?: Date } = {}): Promise<AeliaIngestResult> {
   const now = options.now ?? new Date()
   const parsed = parseAeliaRatesPayload(body, now)
-  const baseCurrency = await getBaseCurrencyCode()
+  const baseCurrency = await resolveBaseCurrencyCode(tx) // through the lock transaction: the global client would need a second pooled connection
   if (parsed.base !== baseCurrency) {
     throw new AeliaRefusedError('base_mismatch', `Aelia's base currency is ${parsed.base} but IMS's is ${baseCurrency}; nothing was stored`)
   }

@@ -128,7 +128,7 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
           if ((await getFxRateSourceInTx(tx)) === 'aelia') {
             return `The base currency cannot be changed while the FX source is Aelia: Aelia's rates are quoted against ${currentBase}. Switch the FX source to ECB first.`
           }
-          if (await isBaseCurrencyLocked()) return 'Base currency is locked after setup. Reset the database to change it.'
+          if (await isBaseCurrencyLocked(tx)) return 'Base currency is locked after setup. Reset the database to change it.'
         }
         const existing = await tx.currency.findUnique({ where: { code } })
         if (!existing) {

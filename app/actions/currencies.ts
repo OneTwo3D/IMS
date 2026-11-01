@@ -7,7 +7,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
-import { getBaseCurrencyCode, getFallbackCurrencyMeta } from '@/lib/base-currency'
+import { getBaseCurrencyCode, getFallbackCurrencyMeta, resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { fetchAllFxRatesInternal } from '@/lib/currencies/fx-refresh'
 import { appendFxSourceSwitch, FxSourceHistoryUnreadableError } from '@/lib/currencies/fx-source-regime'
 import { FX_RATE_SOURCE_HISTORY_SETTING, FX_RATE_SOURCE_SETTING, FX_RATE_SOURCE_SINCE_SETTING, FX_RATE_SOURCES, getFxRateSource, getFxRateSourceInTx, type FxRateSource } from '@/lib/currencies/fx-source'
@@ -94,7 +94,7 @@ export async function getCurrencyRateMap(): Promise<Record<string, number>> {
  */
 async function aeliaActivationRefusal(tx: Prisma.TransactionClient, code: string): Promise<string | null> {
   if ((await getFxRateSourceInTx(tx)) !== 'aelia') return null
-  const baseCurrency = await getBaseCurrencyCode()
+  const baseCurrency = await resolveBaseCurrencyCode(tx)
   if (code === baseCurrency) return null
   const { resolveFxRatesToBase } = await import('@/lib/currencies/fx-lookup')
   const outcome = (await resolveFxRatesToBase(tx, { currencies: [code], asOf: new Date(), baseCurrency })).get(code)
@@ -488,9 +488,12 @@ export async function getFxRateSourceSetting(): Promise<FxRateSource> {
 export async function setFxRateSource(source: string): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
   if (!(FX_RATE_SOURCES as readonly string[]).includes(source)) return { success: false, error: 'Unknown FX source' }
+  // The store's address and secret are read BEFORE the lock and handed to the read: inside the lock transaction nothing may go through the global client (it would need a second pooled connection).
+  let wcSettings: { url: string; secret: string } | undefined
   if (source === 'aelia') {
     const { getSettingValues } = await import('@/lib/settings-store')
     const config = await getSettingValues(['wc_url', 'wc_webhook_secret'])
+    wcSettings = { url: config.get('wc_url') ?? '', secret: config.get('wc_webhook_secret') ?? '' }
     if (!config.get('wc_url') || !config.get('wc_webhook_secret')) {
       return { success: false, error: 'Set the WooCommerce store address and the shared secret first: Aelia is read through the onetwoInventory Helper plugin (1.3.0 or later) on the store.' }
     }
@@ -517,7 +520,7 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
           import('@/lib/connectors/woocommerce/aelia-rates'),
           import('@/lib/currencies/aelia-ingest'),
         ])
-        const read = await readWithin(AELIA_CUTOVER_READ_BOUND_MS, () => readAeliaRatesFromWc())
+        const read = await readWithin(AELIA_CUTOVER_READ_BOUND_MS, () => readAeliaRatesFromWc({ settings: wcSettings }))
         switchedAt = new Date() // the cutover instant is taken AFTER the read (which may have taken seconds), so an Aelia update that landed meanwhile is not 'in the future'
         if (!read.ok) throw new FxCutoverRefusedError(`Aelia's rates could not be read, so the source was not changed (it is still ECB): ${read.message}`)
         let result: Awaited<ReturnType<typeof ingestAeliaRatesInTx>>
@@ -555,8 +558,8 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
       if (source === 'aelia' && aeliaResult) {
         // THE AUTHORITY: with the new source and instant written in this transaction, run the ACTUAL lookup (the one every document and report uses, under the new regime) for every active foreign
         // currency AT the cutover instant. Each must resolve to an Aelia row or a manual override, else the whole transaction rolls back. This is the real rule, not a model of it.
-        const [{ resolveFxRatesToBase }, { getBaseCurrencyCode }] = await Promise.all([import('@/lib/currencies/fx-lookup'), import('@/lib/base-currency')])
-        const baseCode = await getBaseCurrencyCode()
+        const { resolveFxRatesToBase } = await import('@/lib/currencies/fx-lookup')
+        const baseCode = await resolveBaseCurrencyCode(tx)
         const activeForeign = (await tx.currency.findMany({ where: { active: true }, select: { code: true } })).map((c) => c.code).filter((code) => code !== baseCode)
         const outcomes = await resolveFxRatesToBase(tx, { currencies: activeForeign, asOf: switchedAt, baseCurrency: baseCode })
         const failures = [...outcomes].flatMap(([code, o]) => (o.ok ? [] : [`${code} (${o.error.reason})`]))

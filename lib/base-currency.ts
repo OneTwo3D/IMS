@@ -56,7 +56,23 @@ export async function getBaseCurrencyDisplay(): Promise<BaseCurrencyDisplay> {
   return { code, symbol: fallback.symbol, symbolPosition: fallback.symbolPosition }
 }
 
-export async function isBaseCurrencyLocked(): Promise<boolean> {
+/** The client `isBaseCurrencyLocked` reads through: the global one, or a transaction. */
+export type BaseCurrencyLockClient = Pick<PrismaClient, 'setting' | 'product' | 'supplier' | 'customer' | 'purchaseOrder' | 'salesOrder' | 'stockMovement'>
+
+/**
+ * Whether the base currency can no longer be changed. A caller that is INSIDE a transaction (the FX table lock's) MUST pass that transaction: the global client would need a second pooled
+ * connection while the first is held, and with the pool full of waiters for the same lock the holder never gets one (a deadlock until the pool's acquisition timeout).
+ */
+export async function isBaseCurrencyLocked(client?: BaseCurrencyLockClient): Promise<boolean> {
+  if (client) {
+    // One transaction runs one query at a time.
+    const setting = await client.setting.findUnique({ where: { key: 'base_currency_locked' }, select: { value: true } })
+    if (setting?.value === 'true') return true
+    for (const count of [() => client.product.count(), () => client.supplier.count(), () => client.customer.count(), () => client.purchaseOrder.count(), () => client.salesOrder.count(), () => client.stockMovement.count()]) {
+      if ((await count()) > 0) return true
+    }
+    return false
+  }
   const [setting, counts] = await Promise.all([
     db.setting.findUnique({ where: { key: 'base_currency_locked' }, select: { value: true } }),
     Promise.all([

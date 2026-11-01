@@ -18,7 +18,7 @@ let fake = createFxSourceFakeDb()
 let tamper: ((code: string, outcome: Record<string, unknown>) => Record<string, unknown>) | null = null
 
 mock.module('@/lib/db', { namedExports: { db: new Proxy({}, { get: (_t, k) => (fake.db as never)[k] }) } })
-mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP' } })
+mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP', resolveBaseCurrencyCode: async () => 'GBP' } })
 mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {} } })
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} } })
 mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })

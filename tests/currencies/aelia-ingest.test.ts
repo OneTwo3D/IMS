@@ -10,7 +10,7 @@ import { aeliaAnswer, createFxSourceFakeDb, liveShapedAeliaAnswer, type FakeFxRa
 
 let fake = createFxSourceFakeDb()
 mock.module('@/lib/db', { namedExports: { db: new Proxy({}, { get: (_t, k) => (fake.db as never)[k] }) } })
-mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP' } })
+mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP', resolveBaseCurrencyCode: async () => 'GBP' } })
 
 const load = async () => import('@/lib/currencies/aelia-ingest')
 const sel = async () => import('@/lib/currencies/fx-select')

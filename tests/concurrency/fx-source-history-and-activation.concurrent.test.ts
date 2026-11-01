@@ -14,6 +14,7 @@ import { loadEnv } from './po-landed-fixtures'
  *   arm 5  a base-currency change takes the FX lock and is refused under Aelia; it compares against the base and lock marker left by a lock holder, not the ones seen before its wait
  *   arm 6  an unreadable history refuses a source switch and is not rewritten
  *   arm 7  a cleared pin (a newer ECB row over an old manual one) is no pin under Aelia: neither activation nor a lookup uses it; a pin in force still does
+ *   arm 11 pool size + 2 concurrent base changes finish without a pool timeout (nothing inside the lock asks the pool for a second connection)
  *   arm 8  a clear held up behind a concurrent pin is refused and the lookup agrees; arm 9 a pin is stamped inside the lock; arm 10 a fetchedAt tie goes to the later write
  * Real Postgres. Mutations: stop appending the history -> arm 1 reads the ECB row; take toggleCurrency / createCurrency out of the lock -> arm 2 activates while the lock is held.
  */
@@ -213,7 +214,7 @@ test('switch history keeps the Aelia period on Aelia rows after a switch back; a
   // ---- arm 5: a change of the BASE currency under Aelia is refused, and takes the FX lock
   // the base currency counts as "locked" once ANY master data exists, which the rest of this tier leaves behind: the lock marker is not what is under test, so it is read from the marker alone here
   const realBaseCurrency = await import('@/lib/base-currency')
-  mock.module('@/lib/base-currency', { namedExports: { ...realBaseCurrency, isBaseCurrencyLocked: async () => (await db.setting.findUnique({ where: { key: 'base_currency_locked' } }))?.value === 'true' } })
+  mock.module('@/lib/base-currency', { namedExports: { ...realBaseCurrency, isBaseCurrencyLocked: async (client?: typeof db) => (await (client ?? db).setting.findUnique({ where: { key: 'base_currency_locked' } }))?.value === 'true' } })
   const { updateOrganisation } = await import('@/app/actions/company')
   const orgExisted = await db.organisation.findFirst({ select: { id: true, baseCurrency: true } })
   const orgBefore = orgExisted ?? await db.organisation.create({ data: { name: 'FX test org', baseCurrency: 'GBP' }, select: { id: true, baseCurrency: true } })
@@ -437,6 +438,24 @@ test('switch history keeps the Aelia period on Aelia rows after a switch back; a
   await insertTie(['ecb', 'manual'])
   assert.equal((await getFxRateToBase(db, { currency: 'AUD', asOf: new Date() })).rate.toString(), '1.9', 'Aelia: a pin written after the ECB row is in force')
   await db.fxRate.deleteMany({ where: { toCurrency: 'AUD' } })
+
+  // ---- arm 11: N concurrent base-currency changes, N = the pool size + 2, all finish: nothing inside the lock transaction asks the pool for a SECOND connection (the holder would wait for one that
+  // the waiters, each holding its own, never give back, until the pool's acquisition timeout).
+  const { dbPoolConfig, DB_POOL_ACQUISITION_TIMEOUT_MS } = await import('@/lib/db')
+  const poolSize = dbPoolConfig().max
+  await reset()
+  await db.organisation.updateMany({ data: { baseCurrency: orgBefore.baseCurrency } })
+  await db.setting.deleteMany({ where: { key: 'base_currency_locked' } })
+  const many = poolSize + 2
+  const startedMany = Date.now()
+  const manyResults = await Promise.all(Array.from({ length: many }, () => updateOrganisation({ baseCurrency: 'AUD' })))
+  const elapsedMany = Date.now() - startedMany
+  assert.deepEqual(manyResults.filter((r) => !r.success), [], `all ${many} concurrent base changes succeed (pool size ${poolSize})`)
+  assert.ok(elapsedMany < DB_POOL_ACQUISITION_TIMEOUT_MS, `and finish without waiting out the pool's acquisition timeout (${elapsedMany} ms)`)
+  assert.equal((await db.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency, 'AUD')
+  await db.organisation.updateMany({ data: { baseCurrency: orgBefore.baseCurrency } })
+  await db.setting.deleteMany({ where: { key: 'base_currency_locked' } })
+  await db.currency.update({ where: { code: 'AUD' }, data: { active: false } })
 
   // CONTROL: under ECB the change goes through (so the refusals above can fail for the right reason only)
   await reset()
