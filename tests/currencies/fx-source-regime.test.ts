@@ -3,7 +3,7 @@ import test from 'node:test'
 
 import { getFxRateToBase, resolveFxRatesToBase } from '@/lib/currencies/fx-lookup'
 import { selectFxRateFromRows, type FxRateRow } from '@/lib/currencies/fx-select'
-import { FxSourceHistoryUnreadableError, appendFxSourceSwitch, strictlyAfterLastSwitch, fxRegimeRestrictsAt, fxSourceRegimeFromSettings, parseFxSourceHistory } from '@/lib/currencies/fx-source-regime'
+import { FxSourceHistoryUnreadableError, FxSwitchClockNotPastError, appendFxSourceSwitch, switchInstantAfterLast, fxRegimeRestrictsAt, fxSourceRegimeFromSettings, parseFxSourceHistory } from '@/lib/currencies/fx-source-regime'
 import { fakeFxClient, type FakeFxRow } from '@/tests/helpers/fx-fake-client'
 
 /**
@@ -252,29 +252,22 @@ test('a fetchedAt TIE goes to the later write (seq), also over a pin; rows witho
   assert.equal(selectFxRateFromRows(aeliaFirst, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER, regime }).rate.toString(), '1.5')
 })
 
-test('switch boundaries are STRICTLY increasing: a switch in the same millisecond as the last is moved one millisecond on, so the interval between them is never empty', () => {
+test('a switch is REFUSED unless the clock is strictly past the last recorded switch; its instant is never shifted', () => {
   const T = '2026-10-22T12:00:00.000Z'
   const hist = JSON.stringify([{ source: 'aelia', since: T }])
-  // same instant as the last entry (and as the pair): last + 1 ms
-  assert.equal(strictlyAfterLastSwitch(at(T), hist, T).toISOString(), '2026-10-22T12:00:00.001Z')
-  // earlier than the last (a clock step back): still after it
-  assert.equal(strictlyAfterLastSwitch(at('2026-10-22T11:59:59.000Z'), hist, T).toISOString(), '2026-10-22T12:00:00.001Z')
-  // the pair's instant counts even when the history is absent
-  assert.equal(strictlyAfterLastSwitch(at(T), undefined, T).toISOString(), '2026-10-22T12:00:00.001Z')
-  // later than the last: unchanged
-  assert.equal(strictlyAfterLastSwitch(at('2026-10-22T12:00:01.000Z'), hist, T).toISOString(), '2026-10-22T12:00:01.000Z')
-  // the HISTORY counts on its own: a last entry later than the pair's instant decides
-  const laterHist = JSON.stringify([{ source: 'aelia', since: '2026-10-22T12:00:05.000Z' }])
-  assert.equal(strictlyAfterLastSwitch(at(T), laterHist, T).toISOString(), '2026-10-22T12:00:05.001Z')
+  const refused = (now: string, history: string | undefined, since: string | undefined) => assert.throws(() => switchInstantAfterLast(at(now), history, since), (e: unknown) => e instanceof FxSwitchClockNotPastError && e.reason === 'fx_switch_clock_not_past_last_switch' && /Try again/.test(e.message) && e.message.includes(T))
+  refused(T, hist, T) // the same millisecond
+  refused('2026-10-22T11:59:59.000Z', hist, T) // the clock went backwards
+  refused(T, undefined, T) // the pair's instant counts when there is no history
+  refused(T, hist, undefined) // and the history counts without the pair
+  // the history counts on its own: a last entry later than the pair's instant decides
+  assert.throws(() => switchInstantAfterLast(at('2026-10-22T12:00:03.000Z'), JSON.stringify([{ source: 'aelia', since: '2026-10-22T12:00:05.000Z' }]), T), FxSwitchClockNotPastError)
+  // a clock past the last boundary commits at the CURRENT instant (not shifted)
+  assert.equal(switchInstantAfterLast(at('2026-10-22T12:00:00.001Z'), hist, T).toISOString(), '2026-10-22T12:00:00.001Z')
+  assert.equal(switchInstantAfterLast(at('2026-10-22T12:00:01.000Z'), hist, T).toISOString(), '2026-10-22T12:00:01.000Z')
   // no record at all: unchanged
-  assert.equal(strictlyAfterLastSwitch(at(T), undefined, undefined).toISOString(), T)
-  // the effect: an Aelia switch then an ECB switch at one millisecond leave a one-millisecond Aelia interval holding the instant between them
-  const aeliaAt = at(T)
-  const ecbAt = strictlyAfterLastSwitch(at(T), hist, T)
-  const regimeBack = fxSourceRegimeFromSettings('ecb', ecbAt.toISOString(), appendFxSourceSwitch(hist, 'aelia', T, 'ecb', ecbAt))
-  assert.equal(fxRegimeRestrictsAt(regimeBack, aeliaAt), true, 'a payment at the Aelia switch instant is still an Aelia-period payment')
-  assert.equal(fxRegimeRestrictsAt(regimeBack, ecbAt), false)
-  // CONTROL: with the same instant twice the interval is empty
+  assert.equal(switchInstantAfterLast(at(T), undefined, undefined).toISOString(), T)
+  // the effect of accepting an equal instant, which is why it is refused: the interval between the two switches is empty and an Aelia-period payment reads as ECB
   const empty = fxSourceRegimeFromSettings('ecb', T, appendFxSourceSwitch(hist, 'aelia', T, 'ecb', at(T)))
-  assert.equal(fxRegimeRestrictsAt(empty, aeliaAt), false)
+  assert.equal(fxRegimeRestrictsAt(empty, at(T)), false)
 })

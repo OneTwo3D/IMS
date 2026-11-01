@@ -15,7 +15,7 @@ import { loadEnv } from './po-landed-fixtures'
  *   arm 6  an unreadable history refuses a source switch and is not rewritten
  *   arm 7  a cleared pin (a newer ECB row over an old manual one) is no pin under Aelia: neither activation nor a lookup uses it; a pin in force still does
  *   arm 11 pool size + 2 concurrent base changes finish without a pool timeout (nothing inside the lock asks the pool for a second connection)
- *   arm 12 a clear needs a pin in force and names the exact row; arm 13 switch boundaries are strictly increasing
+ *   arm 12 a clear needs a pin in force and names the exact row; arm 13 a switch whose clock is not past the last boundary is refused, nothing shifted
  *   arm 8  a clear held up behind a concurrent pin is refused and the lookup agrees; arm 9 a pin is stamped inside the lock; arm 10 a fetchedAt tie goes to the later write
  * Real Postgres. Mutations: stop appending the history -> arm 1 reads the ECB row; take toggleCurrency / createCurrency out of the lock -> arm 2 activates while the lock is held.
  */
@@ -487,23 +487,26 @@ test('switch history keeps the Aelia period on Aelia rows after a switch back; a
   await db.fxRate.deleteMany({ where: { toCurrency: 'AUD' } })
   await db.currency.update({ where: { code: 'AUD' }, data: { active: false } })
 
-  // ---- arm 13: switch boundaries are strictly increasing. The last recorded switch is an Aelia one at F (in the future of the clock here, which stands for "the same millisecond"); the ECB switch
-  // records F + 1 ms, so a payment at F is still an Aelia-period payment.
+  // ---- arm 13: a switch is refused unless the clock is strictly past the last recorded switch, and nothing is shifted. The last recorded switch is an Aelia one at F, in the future of the clock here (which
+  // stands for "the same millisecond" or "the clock went backwards"): the ECB switch is refused, the source and the history are untouched; a retry once the clock is past F commits at the current instant.
   await reset()
-  const F = new Date(Date.now() + 5000)
+  const F = new Date(Date.now() + 1500)
+  const histF = JSON.stringify([{ source: 'aelia', since: F.toISOString() }])
   await db.setting.upsert({ where: { key: 'fx_rate_source' }, create: { key: 'fx_rate_source', value: 'aelia' }, update: { value: 'aelia' } })
   await db.setting.upsert({ where: { key: 'fx_rate_source_since' }, create: { key: 'fx_rate_source_since', value: F.toISOString() }, update: { value: F.toISOString() } })
-  await db.setting.upsert({ where: { key: 'fx_rate_source_history' }, create: { key: 'fx_rate_source_history', value: JSON.stringify([{ source: 'aelia', since: F.toISOString() }]) }, update: { value: JSON.stringify([{ source: 'aelia', since: F.toISOString() }]) } })
-  await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.77', source: 'frankfurter', manualOverride: false, fetchedAt: new Date(F.getTime() - 1000) } })
-  assert.deepEqual(await setFxRateSource('ecb'), { success: true })
-  const strict = new Date((await setting('fx_rate_source_since'))!)
-  assert.equal(strict.getTime(), F.getTime() + 1, 'the boundary is one millisecond after the last one')
-  const strictHistory = JSON.parse((await setting('fx_rate_source_history'))!) as Array<{ source: string; since: string }>
-  assert.deepEqual(strictHistory.map((h) => h.source), ['aelia', 'ecb'])
-  assert.equal(strictHistory[1]!.since, strict.toISOString())
-  assert.equal((await getFxRateToBase(db, { currency: 'EUR', asOf: F })).source, 'aelia', 'a payment at the Aelia switch instant is still Aelia-priced')
-  assert.equal((await getFxRateToBase(db, { currency: 'EUR', asOf: strict })).rate.toString(), '1.77', 'from the ECB boundary on, the plain latest row')
-  await db.fxRate.deleteMany({ where: { toCurrency: 'EUR', source: 'frankfurter', fetchedAt: new Date(F.getTime() - 1000) } })
+  await db.setting.upsert({ where: { key: 'fx_rate_source_history' }, create: { key: 'fx_rate_source_history', value: histF }, update: { value: histF } })
+  const refusedBehind = await setFxRateSource('ecb')
+  assert.equal(refusedBehind.success, false)
+  assert.match(refusedBehind.error ?? '', /fx_switch_clock_not_past_last_switch/)
+  assert.equal(await setting('fx_rate_source'), 'aelia', 'the source is unchanged')
+  assert.equal(await setting('fx_rate_source_since'), F.toISOString(), 'the pair is unchanged')
+  assert.equal(await setting('fx_rate_source_history'), histF, 'the history is unchanged')
+  await new Promise((r) => setTimeout(r, Math.max(0, F.getTime() - Date.now()) + 20))
+  const beforeRetry = Date.now()
+  assert.deepEqual(await setFxRateSource('ecb'), { success: true }, 'a retry once the clock is past the last boundary commits')
+  const committed = new Date((await setting('fx_rate_source_since'))!)
+  assert.ok(committed.getTime() > F.getTime() && committed.getTime() >= beforeRetry, 'at the current instant, not a shifted one')
+  assert.deepEqual((JSON.parse((await setting('fx_rate_source_history'))!) as Array<{ source: string }>).map((h) => h.source), ['aelia', 'ecb'])
 
   // CONTROL: under ECB the change goes through (so the refusals above can fail for the right reason only)
   await reset()

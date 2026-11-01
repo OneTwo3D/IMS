@@ -9,7 +9,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { getBaseCurrencyCode, getFallbackCurrencyMeta, resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { fetchAllFxRatesInternal } from '@/lib/currencies/fx-refresh'
-import { appendFxSourceSwitch, FxSourceHistoryUnreadableError, strictlyAfterLastSwitch } from '@/lib/currencies/fx-source-regime'
+import { appendFxSourceSwitch, FxSourceHistoryUnreadableError, FxSwitchClockNotPastError, switchInstantAfterLast } from '@/lib/currencies/fx-source-regime'
 import { FX_RATE_SOURCE_HISTORY_SETTING, FX_RATE_SOURCE_SETTING, FX_RATE_SOURCE_SINCE_SETTING, FX_RATE_SOURCES, getFxRateSource, getFxRateSourceInTx, type FxRateSource } from '@/lib/currencies/fx-source'
 
 // ---------------------------------------------------------------------------
@@ -548,10 +548,10 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
       }
       // THE BOUNDARY IS TAKEN HERE, inside the lock-holding transaction and after every check, immediately before the writes that commit it: a switch that waited behind an import must not record an
       // instant from before its wait, or a document recorded during the wait (under the old regime) would later read as the new one. For the Aelia path this is later than the read instant used to date the ingested rows, which is harmless (rows dated earlier are eligible).
-      // The history and the pair are read FIRST: the boundary must be strictly later than the last one recorded (two switches in one millisecond would leave an empty interval between them).
+      // The history and the pair are read FIRST: the clock must be strictly past the last boundary recorded, else the switch is refused (see switchInstantAfterLast); a boundary is never moved.
       const before = await tx.setting.findMany({ where: { key: { in: [FX_RATE_SOURCE_SETTING, FX_RATE_SOURCE_SINCE_SETTING, FX_RATE_SOURCE_HISTORY_SETTING] } }, select: { key: true, value: true } })
       const prior = (k: string) => before.find((x) => x.key === k)?.value
-      switchedAt = strictlyAfterLastSwitch(new Date(), prior(FX_RATE_SOURCE_HISTORY_SETTING), prior(FX_RATE_SOURCE_SINCE_SETTING))
+      switchedAt = switchInstantAfterLast(new Date(), prior(FX_RATE_SOURCE_HISTORY_SETTING), prior(FX_RATE_SOURCE_SINCE_SETTING))
       // THE SWITCH HISTORY: one interval boundary per switch, appended in this same transaction (read under the exclusive lock, so two switches cannot interleave). A lookup selects the regime in effect at its
       // asOf from this list, so a switch back to ECB does not turn an Aelia-period document into an ECB lookup.
       const history = appendFxSourceSwitch(prior(FX_RATE_SOURCE_HISTORY_SETTING), prior(FX_RATE_SOURCE_SETTING), prior(FX_RATE_SOURCE_SINCE_SETTING), source as FxRateSource, switchedAt)
@@ -580,7 +580,7 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
       return true
     }, { timeout: AELIA_CUTOVER_TX_TIMEOUT_MS })
   } catch (e) {
-    if (e instanceof FxCutoverRefusedError || e instanceof FxSourceHistoryUnreadableError) return { success: false, error: e.message }
+    if (e instanceof FxCutoverRefusedError || e instanceof FxSourceHistoryUnreadableError || e instanceof FxSwitchClockNotPastError) return { success: false, error: e.message }
     throw e
   }
   if (!changed) return { success: true }

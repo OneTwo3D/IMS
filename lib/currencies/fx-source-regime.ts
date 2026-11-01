@@ -66,18 +66,28 @@ export function parseFxSourceHistory(value: string | null | undefined): FxSource
   return out.sort((x, y) => new Date(x.since).getTime() - new Date(y.since).getTime())
 }
 
+/** The clock is not past the last recorded switch: the switch is refused, nothing is written, and a retry a moment later succeeds (or the clock needs looking at). */
+export class FxSwitchClockNotPastError extends Error {
+  readonly reason = 'fx_switch_clock_not_past_last_switch'
+  constructor(readonly last: Date, readonly now: Date) {
+    super(`fx_switch_clock_not_past_last_switch: the clock (${now.toISOString()}) is not past the last FX source switch (${last.toISOString()}), so the source was not changed. Try again in a moment; if it keeps happening, check the server clock.`)
+    this.name = 'FxSwitchClockNotPastError'
+  }
+}
+
 /**
- * The instant a switch takes effect: `now`, but STRICTLY LATER than the last recorded switch (the last history entry and the current pair's instant). Two switches in one millisecond would otherwise
- * record the same boundary twice and the interval between them [since, until) would be EMPTY, so a payment dated inside it would read as the wrong regime. Chosen over a separate switch-order value
- * because the instants are what every reader compares (one number, no second ordering to keep in step), and a millisecond moved forward is within the clock's own resolution; the stored instant is
- * the one the pair, the history and the activity log all carry.
+ * The instant a switch takes effect: `now`, and only when it is STRICTLY LATER than the last recorded switch (the last history entry and the current pair's instant). Two switches in one millisecond
+ * would record the same boundary twice and the interval between them [since, until) would be EMPTY; a clock that went backwards would record a boundary BEFORE the last one. Neither is repaired by
+ * moving the instant (a boundary shifted past the real time reads as Aelia from now while lookups dated before it are unrestricted): the switch is REFUSED, FxSwitchClockNotPastError, and a retry once
+ * the clock is past the last boundary commits at the current instant.
  */
-export function strictlyAfterLastSwitch(now: Date, historyValue: string | null | undefined, currentSince: string | null | undefined): Date {
+export function switchInstantAfterLast(now: Date, historyValue: string | null | undefined, currentSince: string | null | undefined): Date {
   let last = -Infinity
   for (const entry of parseFxSourceHistory(historyValue) ?? []) last = Math.max(last, new Date(entry.since).getTime())
   const since = currentSince ? new Date(currentSince).getTime() : NaN
   if (Number.isFinite(since)) last = Math.max(last, since)
-  return now.getTime() > last ? now : new Date(last + 1)
+  if (now.getTime() <= last) throw new FxSwitchClockNotPastError(new Date(last), now)
+  return now
 }
 
 /**
