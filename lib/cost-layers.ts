@@ -428,7 +428,7 @@ async function queueShipmentCogsRevaluationSync(
   })
   if (!queued) {
     console.warn(
-      `queueShipmentCogsRevaluationSync: the accounting queue DECLINED the COGS_REVERSAL for shipment `
+      `queueShipmentCogsRevaluationSync: the accounting queue DID NOT QUEUE (declined, or the producer-side hold recorded a shadow) the COGS_REVERSAL for shipment `
       + `${input.shipmentId} (cost layer ${input.costLayerId}), so no COGS subledger row was recorded and `
       + 'the revaluation delta stays in the caller\'s retrospective COGS journal (o3d-j625 r3).',
     )

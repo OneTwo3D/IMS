@@ -137,7 +137,8 @@ export async function openRefundAccountingObligationLedger(
         )
         return
       }
-      if (outcome.queued) return
+      // Queued, or recorded as a shadow the hold keeps instead (IMS owes the ledger nothing for it).
+      if (outcome.queued || outcome.reason === 'shadowed') return
       // THE ONLY NO-OP THAT SETTLES AN OBLIGATION: the pinned configuration already said this
       // posting will never exist, so there is nothing left outstanding for it to leave behind.
       if (outcome.reason === 'not-configured' && willPost.get(obligation.type) === false) {
@@ -170,7 +171,8 @@ export async function openRefundAccountingObligationLedger(
         )
         return
       }
-      if (outcome.queued) return
+      // Queued, or recorded as a shadow the hold keeps instead (IMS owes the ledger nothing for it).
+      if (outcome.queued || outcome.reason === 'shadowed') return
       // THE ONLY NO-OP THAT SETTLES AN OBLIGATION, exactly as in `account`: the pinned configuration
       // already said this posting will never exist, so nothing is left outstanding for it.
       if (outcome.reason === 'not-configured' && willPost.get(obligation.type) === false) {
