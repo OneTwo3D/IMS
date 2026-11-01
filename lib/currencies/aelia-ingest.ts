@@ -303,7 +303,7 @@ export async function ingestAeliaRatesInTx(tx: FxTx, body: unknown, options: { n
  * Clear a manual override from Aelia's rate. The pin is the latest row and stays in force until a NEWER non-override row exists, so this row carries the time of the admin's action
  * (`clearedAt`), not Aelia's update time (an Aelia time older than the pin could never replace it). It is the one Aelia row not dated by Aelia, and it is a deliberate admin action.
  */
-export async function clearOverrideFromAelia(body: unknown, currency: string, options: { now?: Date; expectedPinId?: string } = {}): Promise<{ rate: string; markup: string | null }> {
+export async function clearOverrideFromAelia(body: unknown, currency: string, options: { now?: Date; expectedPin: { id: string; seq: bigint | number } }): Promise<{ rate: string; markup: string | null }> {
   const parsed = parseAeliaRatesPayload(body, options.now ?? new Date())
   const baseCurrency = await getBaseCurrencyCode()
   if (parsed.base !== baseCurrency) throw new AeliaRefusedError('base_mismatch', `Aelia's base currency is ${parsed.base} but IMS's is ${baseCurrency}; nothing was stored`)
@@ -318,17 +318,15 @@ export async function clearOverrideFromAelia(body: unknown, currency: string, op
     // The row is stamped NOW, inside the lock: a pin another admin set while this waited has an earlier-or-later stamp than a time taken before the wait, and only a stamp taken here is later than every row
     // already committed.
     const clearedAt = options.now ?? fxWriteStamp()
-    // THE PIN THIS SET OUT TO CLEAR must still be the latest row. If a newer row of any kind appeared meanwhile (a new pin, a rate update) the admin asked to clear a rate that is no longer the one in force;
-    // refuse rather than report a success that did not happen (or silently replace a pin the admin never looked at).
-    if (options.expectedPinId !== undefined) {
-      const latest = await tx.fxRate.findFirst({
-        where: { fromCurrency: baseCurrency, toCurrency: currency, fetchedAt: { lte: clearedAt } },
-        orderBy: [{ fetchedAt: 'desc' }, { seq: 'desc' }],
-        select: { id: true },
-      })
-      if (!latest || latest.id !== options.expectedPinId) {
-        throw new AeliaRefusedError('pin_changed', `The rate for ${currency} changed while the override was being cleared (a newer rate or pin was stored); nothing was changed. Check the current rate and clear it again if you still want to.`)
-      }
+    // THE PIN THIS SET OUT TO CLEAR must still be the latest row, by identity (id and write order). The caller names the exact row it saw in force; if a newer row of any kind appeared meanwhile (a new
+    // pin, a rate update) the admin asked to clear a rate that is no longer the one in force: refuse rather than report a success that did not happen or silently replace a pin never looked at.
+    const latest = await tx.fxRate.findFirst({
+      where: { fromCurrency: baseCurrency, toCurrency: currency, fetchedAt: { lte: clearedAt } },
+      orderBy: [{ fetchedAt: 'desc' }, { seq: 'desc' }],
+      select: { id: true, seq: true },
+    })
+    if (!latest || latest.id !== options.expectedPin.id || BigInt(latest.seq) !== BigInt(options.expectedPin.seq)) {
+      throw new AeliaRefusedError('pin_changed', `The rate for ${currency} changed while the override was being cleared (a newer rate or pin was stored); nothing was changed. Check the current rate and clear it again if you still want to.`)
     }
     await tx.fxRate.create({
       data: { fromCurrency: baseCurrency, toCurrency: currency, rate: entry.rate, source: AELIA_SOURCE, fetchedAt: clearedAt, manualOverride: false },

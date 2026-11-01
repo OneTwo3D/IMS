@@ -3,7 +3,7 @@ import test from 'node:test'
 
 import { getFxRateToBase, resolveFxRatesToBase } from '@/lib/currencies/fx-lookup'
 import { selectFxRateFromRows, type FxRateRow } from '@/lib/currencies/fx-select'
-import { FxSourceHistoryUnreadableError, appendFxSourceSwitch, fxRegimeRestrictsAt, fxSourceRegimeFromSettings, parseFxSourceHistory } from '@/lib/currencies/fx-source-regime'
+import { FxSourceHistoryUnreadableError, appendFxSourceSwitch, strictlyAfterLastSwitch, fxRegimeRestrictsAt, fxSourceRegimeFromSettings, parseFxSourceHistory } from '@/lib/currencies/fx-source-regime'
 import { fakeFxClient, type FakeFxRow } from '@/tests/helpers/fx-fake-client'
 
 /**
@@ -250,4 +250,28 @@ test('a fetchedAt TIE goes to the later write (seq), also over a pin; rows witho
   assert.equal(selectFxRateFromRows(aeliaLast, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER, regime }).rate.toString(), '1.4')
   const aeliaFirst = [{ ...row('USD', '1.40', T, 'aelia'), seq: 1 }, { ...row('USD', '1.50', T, 'manual', true), seq: 2 }]
   assert.equal(selectFxRateFromRows(aeliaFirst, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER, regime }).rate.toString(), '1.5')
+})
+
+test('switch boundaries are STRICTLY increasing: a switch in the same millisecond as the last is moved one millisecond on, so the interval between them is never empty', () => {
+  const T = '2026-10-22T12:00:00.000Z'
+  const hist = JSON.stringify([{ source: 'aelia', since: T }])
+  // same instant as the last entry (and as the pair): last + 1 ms
+  assert.equal(strictlyAfterLastSwitch(at(T), hist, T).toISOString(), '2026-10-22T12:00:00.001Z')
+  // earlier than the last (a clock step back): still after it
+  assert.equal(strictlyAfterLastSwitch(at('2026-10-22T11:59:59.000Z'), hist, T).toISOString(), '2026-10-22T12:00:00.001Z')
+  // the pair's instant counts even when the history is absent
+  assert.equal(strictlyAfterLastSwitch(at(T), undefined, T).toISOString(), '2026-10-22T12:00:00.001Z')
+  // later than the last: unchanged
+  assert.equal(strictlyAfterLastSwitch(at('2026-10-22T12:00:01.000Z'), hist, T).toISOString(), '2026-10-22T12:00:01.000Z')
+  // no record at all: unchanged
+  assert.equal(strictlyAfterLastSwitch(at(T), undefined, undefined).toISOString(), T)
+  // the effect: an Aelia switch then an ECB switch at one millisecond leave a one-millisecond Aelia interval holding the instant between them
+  const aeliaAt = at(T)
+  const ecbAt = strictlyAfterLastSwitch(at(T), hist, T)
+  const regimeBack = fxSourceRegimeFromSettings('ecb', ecbAt.toISOString(), appendFxSourceSwitch(hist, 'aelia', T, 'ecb', ecbAt))
+  assert.equal(fxRegimeRestrictsAt(regimeBack, aeliaAt), true, 'a payment at the Aelia switch instant is still an Aelia-period payment')
+  assert.equal(fxRegimeRestrictsAt(regimeBack, ecbAt), false)
+  // CONTROL: with the same instant twice the interval is empty
+  const empty = fxSourceRegimeFromSettings('ecb', T, appendFxSourceSwitch(hist, 'aelia', T, 'ecb', at(T)))
+  assert.equal(fxRegimeRestrictsAt(empty, aeliaAt), false)
 })

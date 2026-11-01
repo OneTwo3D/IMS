@@ -9,6 +9,8 @@ export type FakeFxRateRow = {
   fetchedAt: Date
   source: string
   manualOverride: boolean
+  id?: string
+  seq?: number
 }
 
 export function createFxSourceFakeDb(seed: { currencies?: Array<{ code: string; active: boolean }>; rates?: FakeFxRateRow[]; settings?: Record<string, string> } = {}) {
@@ -57,9 +59,12 @@ export function createFxSourceFakeDb(seed: { currencies?: Array<{ code: string; 
       }
       return [...groups].map(([toCurrency, fetchedAt]) => ({ toCurrency, _max: { fetchedAt } }))
     },
-    findFirst: async (args: { where?: Record<string, unknown> } = {}) => {
+    findFirst: async (args: { where?: Record<string, unknown>; orderBy?: unknown } = {}) => {
       events.push('fxRate.findFirst')
-      return rates.find((r) => matchRate(r, args.where)) ?? null
+      rates.forEach((r, i) => { r.id ??= `seed-${i}`; r.seq ??= i + 1 }) // seeded rows take their write order from their position
+      const matched = rates.filter((r) => matchRate(r, args.where))
+      if (Array.isArray(args.orderBy) && args.orderBy.length > 0) matched.sort((a, b) => b.fetchedAt.getTime() - a.fetchedAt.getTime() || (b.seq ?? 0) - (a.seq ?? 0))
+      return matched[0] ?? null
     },
     create: async (args: { data: Record<string, unknown> }) => {
       events.push(inTx ? 'fxRate.create(in lock tx)' : 'fxRate.create(OUTSIDE lock tx)')
@@ -71,6 +76,8 @@ export function createFxSourceFakeDb(seed: { currencies?: Array<{ code: string; 
         fetchedAt: (d.fetchedAt as Date | undefined) ?? new Date(),
         source: String(d.source ?? 'frankfurter'),
         manualOverride: d.manualOverride === true,
+        id: `created-${rates.length}`,
+        seq: rates.length + 1,
       }
       rates.push(row)
       return row

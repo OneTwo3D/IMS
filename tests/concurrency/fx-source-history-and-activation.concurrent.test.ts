@@ -15,6 +15,7 @@ import { loadEnv } from './po-landed-fixtures'
  *   arm 6  an unreadable history refuses a source switch and is not rewritten
  *   arm 7  a cleared pin (a newer ECB row over an old manual one) is no pin under Aelia: neither activation nor a lookup uses it; a pin in force still does
  *   arm 11 pool size + 2 concurrent base changes finish without a pool timeout (nothing inside the lock asks the pool for a second connection)
+ *   arm 12 a clear needs a pin in force and names the exact row; arm 13 switch boundaries are strictly increasing
  *   arm 8  a clear held up behind a concurrent pin is refused and the lookup agrees; arm 9 a pin is stamped inside the lock; arm 10 a fetchedAt tie goes to the later write
  * Real Postgres. Mutations: stop appending the history -> arm 1 reads the ECB row; take toggleCurrency / createCurrency out of the lock -> arm 2 activates while the lock is held.
  */
@@ -54,11 +55,13 @@ test('switch history keeps the Aelia period on Aelia rows after a switch back; a
       getSettingValues: async () => new Map([['wc_url', 'https://shop.example.com'], ['wc_webhook_secret', 'sekret'], ['wc_fx_push_enabled', 'true']]),
     },
   })
+  const readHook: { fn: (() => Promise<void>) | null } = { fn: null } // runs while the store is being read (the slow part of a clear or a cutover)
   const { db } = await import('@/lib/db')
   const stamp = new Date(Date.now() - 60_000)
   mock.module('@/lib/connectors/woocommerce/aelia-rates', {
     namedExports: {
       readAeliaRatesFromWc: async () => {
+        await readHook.fn?.()
         const active = await db.currency.findMany({ where: { active: true, code: { not: 'GBP' } }, select: { code: true } })
         return { ok: true, body: { ok: true, base: 'GBP', last_update: stamp.toISOString(), rates: active.map((c) => ({ currency: c.code, rate: '1.500000', markup: null })) } }
       },
@@ -456,6 +459,51 @@ test('switch history keeps the Aelia period on Aelia rows after a switch back; a
   await db.organisation.updateMany({ data: { baseCurrency: orgBefore.baseCurrency } })
   await db.setting.deleteMany({ where: { key: 'base_currency_locked' } })
   await db.currency.update({ where: { code: 'AUD' }, data: { active: false } })
+
+  // ---- arm 12: a clear needs a pin IN FORCE before it starts, and names the exact row it saw. (a) no pin: refused before the store is even read, nothing stored. (b) a pin set while the store is read
+  // is not cleared by a request that never saw it: refused, and that pin survives.
+  await reset()
+  await db.fxRate.deleteMany({ where: { toCurrency: 'AUD' } })
+  assert.deepEqual(await setFxRateSource('aelia'), { success: true })
+  await db.currency.update({ where: { code: 'AUD' }, data: { active: true } }) // listed by the (mocked) store read, which answers for the active currencies
+  await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'AUD', rate: '2.1', source: 'aelia', manualOverride: false, fetchedAt: new Date(Date.now() - 2000) } })
+  let hookRan = 0
+  readHook.fn = async () => { hookRan++ }
+  const noPin = await clearManualFxRate('AUD')
+  assert.equal(noPin.success, false)
+  assert.match(noPin.error ?? '', /nothing to clear/)
+  assert.equal(hookRan, 0, 'refused before the store was read')
+  assert.equal(await db.fxRate.count({ where: { toCurrency: 'AUD' } }), 1, 'nothing was stored')
+  await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'AUD', rate: '1.7', source: 'manual', manualOverride: true, fetchedAt: new Date(Date.now() - 1000) } })
+  readHook.fn = async () => { hookRan++; assert.deepEqual(await setManualFxRate('AUD', 1.9), { success: true }) } // a second admin pins a new rate while the store is read
+  const raced = await clearManualFxRate('AUD')
+  readHook.fn = null
+  assert.equal(hookRan, 1)
+  assert.equal(raced.success, false)
+  assert.match(raced.error ?? '', /pin_changed/)
+  const survivor = await getFxRateToBase(db, { currency: 'AUD', asOf: new Date() })
+  assert.equal(survivor.rate.toString(), '1.9', 'the pin set during the read survives')
+  assert.equal(survivor.manualOverride, true)
+  await db.fxRate.deleteMany({ where: { toCurrency: 'AUD' } })
+  await db.currency.update({ where: { code: 'AUD' }, data: { active: false } })
+
+  // ---- arm 13: switch boundaries are strictly increasing. The last recorded switch is an Aelia one at F (in the future of the clock here, which stands for "the same millisecond"); the ECB switch
+  // records F + 1 ms, so a payment at F is still an Aelia-period payment.
+  await reset()
+  const F = new Date(Date.now() + 5000)
+  await db.setting.upsert({ where: { key: 'fx_rate_source' }, create: { key: 'fx_rate_source', value: 'aelia' }, update: { value: 'aelia' } })
+  await db.setting.upsert({ where: { key: 'fx_rate_source_since' }, create: { key: 'fx_rate_source_since', value: F.toISOString() }, update: { value: F.toISOString() } })
+  await db.setting.upsert({ where: { key: 'fx_rate_source_history' }, create: { key: 'fx_rate_source_history', value: JSON.stringify([{ source: 'aelia', since: F.toISOString() }]) }, update: { value: JSON.stringify([{ source: 'aelia', since: F.toISOString() }]) } })
+  await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.77', source: 'frankfurter', manualOverride: false, fetchedAt: new Date(F.getTime() - 1000) } })
+  assert.deepEqual(await setFxRateSource('ecb'), { success: true })
+  const strict = new Date((await setting('fx_rate_source_since'))!)
+  assert.equal(strict.getTime(), F.getTime() + 1, 'the boundary is one millisecond after the last one')
+  const strictHistory = JSON.parse((await setting('fx_rate_source_history'))!) as Array<{ source: string; since: string }>
+  assert.deepEqual(strictHistory.map((h) => h.source), ['aelia', 'ecb'])
+  assert.equal(strictHistory[1]!.since, strict.toISOString())
+  assert.equal((await getFxRateToBase(db, { currency: 'EUR', asOf: F })).source, 'aelia', 'a payment at the Aelia switch instant is still Aelia-priced')
+  assert.equal((await getFxRateToBase(db, { currency: 'EUR', asOf: strict })).rate.toString(), '1.77', 'from the ECB boundary on, the plain latest row')
+  await db.fxRate.deleteMany({ where: { toCurrency: 'EUR', source: 'frankfurter', fetchedAt: new Date(F.getTime() - 1000) } })
 
   // CONTROL: under ECB the change goes through (so the refusals above can fail for the right reason only)
   await reset()

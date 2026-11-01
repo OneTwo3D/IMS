@@ -9,7 +9,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { getBaseCurrencyCode, getFallbackCurrencyMeta, resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { fetchAllFxRatesInternal } from '@/lib/currencies/fx-refresh'
-import { appendFxSourceSwitch, FxSourceHistoryUnreadableError } from '@/lib/currencies/fx-source-regime'
+import { appendFxSourceSwitch, FxSourceHistoryUnreadableError, strictlyAfterLastSwitch } from '@/lib/currencies/fx-source-regime'
 import { FX_RATE_SOURCE_HISTORY_SETTING, FX_RATE_SOURCE_SETTING, FX_RATE_SOURCE_SINCE_SETTING, FX_RATE_SOURCES, getFxRateSource, getFxRateSourceInTx, type FxRateSource } from '@/lib/currencies/fx-source'
 
 // ---------------------------------------------------------------------------
@@ -296,12 +296,14 @@ export async function clearManualFxRate(toCurrency: string): Promise<{ success: 
     const pin = await db.fxRate.findFirst({
       where: { fromCurrency: baseCurrency, toCurrency: code, fetchedAt: { lte: new Date() } },
       orderBy: [{ fetchedAt: 'desc' }, { seq: 'desc' }],
-      select: { id: true, manualOverride: true },
+      select: { id: true, seq: true, manualOverride: true },
     })
+    // A clear needs a pin in force to clear. With none there is nothing to do, and a pin set while the store is read below must not be cleared by a request that never saw it.
+    if (!pin || !pin.manualOverride) return { success: false, error: `There is no manual override in force for ${code}; nothing to clear.` }
     const read = await readAeliaRatesFromWc()
     if (!read.ok) return { success: false, error: read.message }
     try {
-      const cleared = await clearOverrideFromAelia(read.body, code, pin?.manualOverride ? { expectedPinId: pin.id } : {})
+      const cleared = await clearOverrideFromAelia(read.body, code, { expectedPin: { id: pin.id, seq: pin.seq } })
       await logActivity({
         entityType: 'SETTING',
         tag: 'settings',
@@ -546,11 +548,12 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
       }
       // THE BOUNDARY IS TAKEN HERE, inside the lock-holding transaction and after every check, immediately before the writes that commit it: a switch that waited behind an import must not record an
       // instant from before its wait, or a document recorded during the wait (under the old regime) would later read as the new one. For the Aelia path this is later than the read instant used to date the ingested rows, which is harmless (rows dated earlier are eligible).
-      switchedAt = new Date()
-      // THE SWITCH HISTORY: one interval boundary per switch, appended in this same transaction (read under the exclusive lock, so two switches cannot interleave). A lookup selects the regime in effect at its
-      // asOf from this list, so a switch back to ECB does not turn an Aelia-period document into an ECB lookup.
+      // The history and the pair are read FIRST: the boundary must be strictly later than the last one recorded (two switches in one millisecond would leave an empty interval between them).
       const before = await tx.setting.findMany({ where: { key: { in: [FX_RATE_SOURCE_SETTING, FX_RATE_SOURCE_SINCE_SETTING, FX_RATE_SOURCE_HISTORY_SETTING] } }, select: { key: true, value: true } })
       const prior = (k: string) => before.find((x) => x.key === k)?.value
+      switchedAt = strictlyAfterLastSwitch(new Date(), prior(FX_RATE_SOURCE_HISTORY_SETTING), prior(FX_RATE_SOURCE_SINCE_SETTING))
+      // THE SWITCH HISTORY: one interval boundary per switch, appended in this same transaction (read under the exclusive lock, so two switches cannot interleave). A lookup selects the regime in effect at its
+      // asOf from this list, so a switch back to ECB does not turn an Aelia-period document into an ECB lookup.
       const history = appendFxSourceSwitch(prior(FX_RATE_SOURCE_HISTORY_SETTING), prior(FX_RATE_SOURCE_SETTING), prior(FX_RATE_SOURCE_SINCE_SETTING), source as FxRateSource, switchedAt)
       await tx.setting.upsert({ where: { key: FX_RATE_SOURCE_HISTORY_SETTING }, create: { key: FX_RATE_SOURCE_HISTORY_SETTING, value: history }, update: { value: history } })
       await tx.setting.upsert({ where: { key: FX_RATE_SOURCE_SETTING }, create: { key: FX_RATE_SOURCE_SETTING, value: source }, update: { value: source } })

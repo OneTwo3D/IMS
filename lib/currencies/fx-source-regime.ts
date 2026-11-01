@@ -67,6 +67,20 @@ export function parseFxSourceHistory(value: string | null | undefined): FxSource
 }
 
 /**
+ * The instant a switch takes effect: `now`, but STRICTLY LATER than the last recorded switch (the last history entry and the current pair's instant). Two switches in one millisecond would otherwise
+ * record the same boundary twice and the interval between them [since, until) would be EMPTY, so a payment dated inside it would read as the wrong regime. Chosen over a separate switch-order value
+ * because the instants are what every reader compares (one number, no second ordering to keep in step), and a millisecond moved forward is within the clock's own resolution; the stored instant is
+ * the one the pair, the history and the activity log all carry.
+ */
+export function strictlyAfterLastSwitch(now: Date, historyValue: string | null | undefined, currentSince: string | null | undefined): Date {
+  let last = -Infinity
+  for (const entry of parseFxSourceHistory(historyValue) ?? []) last = Math.max(last, new Date(entry.since).getTime())
+  const since = currentSince ? new Date(currentSince).getTime() : NaN
+  if (Number.isFinite(since)) last = Math.max(last, since)
+  return now.getTime() > last ? now : new Date(last + 1)
+}
+
+/**
  * The history string to store when the source switches to `source` at `at`. A database from before the history seeds it from the current pair (an Aelia source with its instant), so the interval that
  * was already running is not lost by the first switch back.
  */

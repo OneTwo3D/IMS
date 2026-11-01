@@ -176,3 +176,21 @@ test('nothing inside a lock-holding transaction uses the global client (db), or 
   for (const name of ['aeliaActivationRefusal', 'ingestAeliaRatesInTx', 'requireAeliaSourceInTx']) assert.ok(followed.has(name), `PRECONDITION: the helper ${name} was followed`)
   assert.deepEqual(bad, [])
 })
+
+test('every Payment writer stores paidAtExplicitInstant beside paidAt (the FX report reads a stored midnight by it)', () => {
+  const files: string[] = []
+  walk('app', files)
+  walk('lib', files)
+  const found: string[] = []
+  const bad: string[] = []
+  for (const f of files) {
+    const src = blank(readFileSync(f, 'utf8'))
+    for (const m of src.matchAll(/\.payment\.create\(/g)) {
+      const body = balanced(src, (m.index ?? 0) + m[0].length - 1)
+      found.push(f)
+      if (!/\bpaidAtExplicitInstant:/.test(body)) bad.push(`${f}: ${body.slice(0, 80).replace(/\s+/g, ' ')}`)
+    }
+  }
+  assert.ok(found.length >= 3, `PRECONDITION: the census found the Payment writers (${found.join(', ')})`)
+  assert.deepEqual(bad, [])
+})
