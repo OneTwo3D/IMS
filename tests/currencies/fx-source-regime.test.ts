@@ -231,8 +231,8 @@ test('a manual override is a PIN only while it is the latest row across ALL sour
 
 test('a fetchedAt TIE goes to the later write (seq), also over a pin; rows without a seq stay ambiguous as before', async () => {
   const T = '2026-10-22T12:00:00Z'
-  const pinFirst = [{ ...row('USD', '1.50', T, 'manual', true), seq: 1n }, { ...row('USD', '1.31', T), seq: 2n }]
-  const pinLast = [{ ...row('USD', '1.31', T), seq: 1n }, { ...row('USD', '1.50', T, 'manual', true), seq: 2n }]
+  const pinFirst = [{ ...row('USD', '1.50', T, 'manual', true), seq: 1 }, { ...row('USD', '1.31', T), seq: 2 }]
+  const pinLast = [{ ...row('USD', '1.31', T), seq: 1 }, { ...row('USD', '1.50', T, 'manual', true), seq: 2 }]
   const noSeq = [row('USD', '1.50', T, 'manual', true), row('USD', '1.31', T)]
   // outside the regime
   assert.equal(selectFxRateFromRows(pinFirst, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER }).rate.toString(), '1.31', 'a clear written after the pin wins')
@@ -246,8 +246,8 @@ test('a fetchedAt TIE goes to the later write (seq), also over a pin; rows witho
   assert.equal((await getFxRateToBase(fakeFxClient(pinLast, 'GBP', settings), { currency: 'USD', asOf: AFTER })).rate.toString(), '1.5')
   assert.equal((await getFxRateToBase(fakeFxClient(pinFirst, 'GBP', {}), { currency: 'USD', asOf: AFTER })).rate.toString(), '1.31')
   // a later Aelia write over a pin at the same instant also supersedes the pin; an earlier one does not
-  const aeliaLast = [{ ...row('USD', '1.50', T, 'manual', true), seq: 1n }, { ...row('USD', '1.40', T, 'aelia'), seq: 2n }]
+  const aeliaLast = [{ ...row('USD', '1.50', T, 'manual', true), seq: 1 }, { ...row('USD', '1.40', T, 'aelia'), seq: 2 }]
   assert.equal(selectFxRateFromRows(aeliaLast, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER, regime }).rate.toString(), '1.4')
-  const aeliaFirst = [{ ...row('USD', '1.40', T, 'aelia'), seq: 1n }, { ...row('USD', '1.50', T, 'manual', true), seq: 2n }]
+  const aeliaFirst = [{ ...row('USD', '1.40', T, 'aelia'), seq: 1 }, { ...row('USD', '1.50', T, 'manual', true), seq: 2 }]
   assert.equal(selectFxRateFromRows(aeliaFirst, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER, regime }).rate.toString(), '1.5')
 })
