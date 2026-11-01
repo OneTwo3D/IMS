@@ -15,7 +15,12 @@ Sentry.init({
   release: process.env.NEXT_PUBLIC_SENTRY_RELEASE?.trim() || undefined,
   tracesSampleRate: 0.05,
   dataCollection,
-  integrations: dropContentCapturingIntegrations,
+  // Breadcrumbs: navigation + fetch/xhr only. No DOM breadcrumbs (they record clicked elements' alt/title/
+  // aria-label text, which holds user and product names); scrubBreadcrumb is an allowlist on top of this.
+  integrations: (defaults) => [
+    ...dropContentCapturingIntegrations(defaults).filter((i) => i.name !== 'Breadcrumbs'),
+    Sentry.breadcrumbsIntegration({ dom: false, fetch: true, history: true, xhr: true, sentry: false }),
+  ],
   beforeSend: scrubEvent,
   beforeSendTransaction: scrubEvent,
   // Streamed spans (default) bypass beforeSendTransaction; this is their scrubber.

@@ -164,10 +164,37 @@ export function scrubSpan<T extends object>(span: T): T {
   }
 }
 
+// Breadcrumbs are an ALLOWLIST by category: only navigation and HTTP breadcrumbs are kept, and of
+// those only scalar metadata. Everything else (ui.click/ui.input with element alt/title text, console,
+// sentry.*, and any category a later SDK adds) is dropped, so a new default capture source cannot leak.
+const BREADCRUMB_CATEGORIES = new Set(['navigation', 'http', 'fetch', 'xhr'])
+const BREADCRUMB_DATA_KEYS = ['method', 'status_code', 'url', 'from', 'to'] as const
+
 export function scrubBreadcrumb(breadcrumb: Breadcrumb): Breadcrumb | null {
   try {
     if (!isRecord(breadcrumb)) return null
-    return scrubValue(breadcrumb, 0, new WeakSet()) as Breadcrumb
+    const category = breadcrumb.category
+    if (typeof category !== 'string' || !BREADCRUMB_CATEGORIES.has(category)) return null
+
+    const kept: Breadcrumb = { category }
+    for (const k of ['type', 'level'] as const) {
+      const v = breadcrumb[k]
+      if (typeof v === 'string') kept[k] = v as never
+    }
+    if (typeof breadcrumb.timestamp === 'number') kept.timestamp = breadcrumb.timestamp
+
+    const data: Record<string, string | number> = {}
+    const src = breadcrumb.data
+    if (isRecord(src)) {
+      for (const k of BREADCRUMB_DATA_KEYS) {
+        const v = src[k]
+        if (typeof v === 'string') data[k] = scrubString(v)
+        else if (typeof v === 'number') data[k] = v
+      }
+    }
+    if (Object.keys(data).length > 0) kept.data = data
+    // free-text `message` is never kept
+    return kept
   } catch {
     // Drop a breadcrumb we cannot scrub; losing one breadcrumb is safe, leaking one is not.
     return null

@@ -95,13 +95,13 @@ test('scrubs breadcrumbs', () => {
   const b: Breadcrumb = {
     category: 'fetch',
     message: 'GET https://api.example/x?api_key=bc-secret-1',
-    data: { url: 'https://u:bc-pw@host/p', headers: { cookie: 'bc-cookie' }, status: 200 },
+    data: { url: 'https://u:bc-pw@host/p', headers: { cookie: 'bc-cookie' }, status_code: 200 },
   }
   const out = scrubBreadcrumb(b)
   assert.ok(out)
   const s = json(out)
   for (const n of ['bc-secret-1', 'bc-pw', 'bc-cookie']) assert.ok(!s.includes(n), n)
-  assert.equal((out.data as { status: number }).status, 200)
+  assert.equal((out.data as { status_code: number }).status_code, 200)
 })
 
 test('never throws on cyclic/odd input', () => {
@@ -282,4 +282,46 @@ test('AI / MCP payload attributes do not survive a streamed span', () => {
   assert.ok(!json(out).includes('SENTINELPROMPT'))
   assert.equal(out.attributes['gen_ai.request.model'], 'some-model')
   assert.equal(out.attributes['sentry.note'], 'order 173814 SKU ABC-1')
+})
+
+test('breadcrumbs are an allowlist: ui, console, sentry and unknown categories are dropped', () => {
+  const ui = scrubBreadcrumb({
+    category: 'ui.click',
+    message: 'body > img[alt="SENTINELNAME"]',
+    data: { target: 'img[alt="SENTINELNAME"]' },
+  })
+  assert.equal(ui, null)
+  assert.equal(scrubBreadcrumb({ category: 'ui.input', message: 'input[aria-label="SENTINELNAME"]' }), null)
+  assert.equal(scrubBreadcrumb({ category: 'console', message: 'SENTINELNAME logged in' }), null)
+  assert.equal(scrubBreadcrumb({ category: 'sentry.event', message: 'SENTINELNAME' }), null)
+  assert.equal(scrubBreadcrumb({ category: 'brand-new-category', message: 'SENTINELNAME' }), null)
+  assert.equal(scrubBreadcrumb({ message: 'no category SENTINELNAME' }), null)
+})
+
+test('fetch/navigation breadcrumbs keep only scalar metadata with scrubbed URLs', () => {
+  const f = scrubBreadcrumb({
+    category: 'fetch',
+    type: 'http',
+    level: 'info',
+    message: 'free text SENTINELNAME',
+    data: {
+      method: 'POST',
+      status_code: 500,
+      url: 'https://ims.example.test/api/orders/173814?code=SENTINELQ1#access_token=SENTINELF1',
+      request_body: 'SENTINELNAME',
+      response_headers: { 'x-name': 'SENTINELNAME' },
+    },
+  })
+  assert.ok(f)
+  assert.equal(f.data?.method, 'POST')
+  assert.equal(f.data?.status_code, 500)
+  assert.match(String(f.data?.url), /\/api\/orders\/173814/)
+  const s = json(f)
+  for (const n of ['SENTINELNAME', 'SENTINELQ1', 'SENTINELF1']) assert.ok(!s.includes(n), n)
+  assert.equal(f.message, undefined)
+
+  const nav = scrubBreadcrumb({ category: 'navigation', data: { from: '/a?x=SENTINELQ1', to: '/orders/173814#SENTINELF1' } })
+  assert.ok(nav)
+  assert.ok(!json(nav).includes('SENTINELQ1') && !json(nav).includes('SENTINELF1'))
+  assert.match(String(nav.data?.to), /\/orders\/173814/)
 })
