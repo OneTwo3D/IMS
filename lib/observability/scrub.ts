@@ -49,22 +49,27 @@ const AUTH_HEADER = /\b((?:proxy-)?authorization)(["']?\s*[:=]\s*)[^\r\n]*/gi
 // Bearer <token> / Basic <base64>
 const BEARER = /\b(Bearer)\s+[A-Za-z0-9._~+/=-]{6,}/g
 const BASIC = /\b(Basic)\s+[A-Za-z0-9+/]{8,}={0,2}/g
-// name=value / name: value / "name":"value" where name looks like a credential
+// name=value / name: value / "name": "value" / name='value' where name looks like a credential.
+// The value is matched as a WHOLE token: a double-, single- or backtick-quoted string (escaped quotes
+// inside are part of it; so is JSON text embedded in a string, where the quotes are themselves
+// backslash-escaped) or, unquoted, everything up to whitespace, `&`, `;`, `,` or a closing bracket.
+// The separator group never consumes an opening quote, so a quoted value is never cut at its first space.
 const KEY_VALUE =
-  /\b([\w.-]*?(?:password|passwd|pass|token|secret|api[-_]?key|apikey|auth|dsn|credentials?|session(?:[-_]?id)?))(["']?\s*[=:]\s*["']?)("[^"]*"|'[^']*'|[^\s&;,"'}\]]+)/gi
+  /\b([\w.-]*?(?:password|passwd|pass|token|secret|api[-_]?key|apikey|auth|dsn|credentials?|session(?:[-_]?id)?))(\\?["'`]?\s*[=:]\s*)(?:\\"(?:(?!\\").)*\\"|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|[^\s&;,"'`}\]]+)/gi
 const EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g
 
 export function scrubString(input: string): string {
   return input
+    // First: credentials containing spaces (quoted values, header text) must go before a URL's query is cut at the space.
+    .replace(AUTH_HEADER, `$1$2${FILTERED}`)
+    .replace(BEARER, `$1 ${FILTERED}`)
+    .replace(BASIC, `$1 ${FILTERED}`)
+    .replace(KEY_VALUE, `$1$2${FILTERED}`)
     .replace(ABSOLUTE_URL, stripQueryAndFragment)
     .replace(RELATIVE_URL, (m, lead: string, path: string, q?: string, f?: string) =>
       q || f ? `${lead}${stripQueryAndFragment(m, path, q, f)}` : m,
     )
     .replace(URL_USERINFO, '$1[Filtered]@')
-    .replace(AUTH_HEADER, `$1$2${FILTERED}`)
-    .replace(BEARER, `$1 ${FILTERED}`)
-    .replace(BASIC, `$1 ${FILTERED}`)
-    .replace(KEY_VALUE, `$1$2${FILTERED}`)
     .replace(EMAIL, EMAIL_PLACEHOLDER)
 }
 

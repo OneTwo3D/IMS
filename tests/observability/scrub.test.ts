@@ -325,3 +325,34 @@ test('fetch/navigation breadcrumbs keep only scalar metadata with scrubbed URLs'
   assert.ok(!json(nav).includes('SENTINELQ1') && !json(nav).includes('SENTINELF1'))
   assert.match(String(nav.data?.to), /\/orders\/173814/)
 })
+
+test('quoted credential values are removed whole, including text after spaces', () => {
+  const cases = [
+    'password="SENTA SENTB SENTC"',
+    'password: "SENTA SENTB"',
+    '{"password": "SENTA SENTB", "orderId": 173814}',
+    "token='SENTA SENTB'",
+    'secret = "SENTA \\"SENTB\\" SENTC"',
+    'password=`SENTA SENTB`',
+    'log {\\"password\\":\\"SENTA SENTB\\",\\"orderId\\":173814}',
+    'Authorization: Bearer SENTA',
+    'api_key=SENTA&page=2',
+  ]
+  const noSentinels = (v: unknown, label: string) => {
+    const s = json(v)
+    for (const n of ['SENTA', 'SENTB', 'SENTC']) assert.ok(!s.includes(n), `${label} leaked ${n}`)
+  }
+  for (const c of cases) {
+    noSentinels(scrubEvent({ message: `login failed ${c} end` }), `message ${c}`)
+    noSentinels(scrubEvent({ exception: { values: [{ type: 'Error', value: `bad ${c}` }] } }), `exception ${c}`)
+    noSentinels(scrubEvent({ extra: { detail: c } }), `extra ${c}`)
+    noSentinels(scrubSpan({ name: `GET ${c}`, attributes: { 'db.statement': c } }), `span ${c}`)
+    noSentinels(scrubBreadcrumb({ category: 'fetch', data: { url: `https://x.test/p?${c}` } }), `breadcrumb ${c}`)
+  }
+  // text around the value survives, non-secret quoted keys are untouched
+  assert.equal(scrubEvent({ message: 'name="Widget Pro" qty=2' })?.message, 'name="Widget Pro" qty=2')
+  const json1 = scrubEvent({ message: '{"password": "SENTA SENTB", "orderId": 173814}' })?.message ?? ''
+  assert.match(json1, /"orderId": 173814/)
+  assert.match(scrubEvent({ message: 'password="SENTA SENTB" then order 173814' })?.message ?? '', /then order 173814$/)
+  assert.match(scrubEvent({ message: 'api_key=SENTA&page=2' })?.message ?? '', /&page=2$/)
+})
