@@ -45,13 +45,32 @@ export function cspHeaderName(mode: Exclude<CspMode, 'off'>): string {
 /** Cloudflare Turnstile origin — its challenge iframe (frame-src) and telemetry (connect-src) when the widget is enabled. */
 export const TURNSTILE_ORIGIN = 'https://challenges.cloudflare.com'
 
+/**
+ * Origin of the error-tracking (GlitchTip/Sentry) ingest host, derived from the browser DSN. Returns
+ * null unless the DSN is set and parses as an https URL, so nothing is allowed by default and no host
+ * is hard-coded.
+ */
+export function errorTrackingOriginFromDsn(dsn: string | undefined): string | null {
+  const raw = dsn?.trim()
+  if (!raw) return null
+  try {
+    const url = new URL(raw)
+    return url.protocol === 'https:' ? url.origin : null
+  } catch {
+    return null
+  }
+}
+
 export type BuildCspOptions = {
+  /** Origin the browser SDK reports errors to (see `errorTrackingOriginFromDsn`) — added to connect-src. */
+  errorTrackingOrigin?: string | null
+
   /** Cloudflare Turnstile is configured (login widget) — allow its iframe + telemetry origin. */
   turnstileEnabled?: boolean
 }
 
 export function buildCsp(nonce: string, isDev: boolean, options: BuildCspOptions = {}): string {
-  const { turnstileEnabled = false } = options
+  const { turnstileEnabled = false, errorTrackingOrigin = null } = options
 
   // script-src uses nonce + strict-dynamic: a CSP3 browser IGNORES host
   // allowlists here, so the nonce'd next/script loader (e.g. Turnstile api.js)
@@ -62,6 +81,7 @@ export function buildCsp(nonce: string, isDev: boolean, options: BuildCspOptions
   const connectSrc = ["'self'"]
   if (isDev) connectSrc.push('ws:', 'wss:')
   if (turnstileEnabled) connectSrc.push(TURNSTILE_ORIGIN)
+  if (errorTrackingOrigin) connectSrc.push(errorTrackingOrigin)
 
   // Turnstile renders its challenge in an iframe from its origin; otherwise no
   // framing is allowed.

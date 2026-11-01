@@ -66,6 +66,9 @@ export const READ_SCAN_DIRS = ['app', 'components', 'lib', 'prisma', 'scripts', 
 
 export const READ_SCAN_ROOT_FILES = [
   'instrumentation.ts',
+  'instrumentation-client.ts',
+  'sentry.server.config.ts',
+  'sentry.edge.config.ts',
   'next.config.ts',
   'prisma.config.ts',
   'proxy.ts',

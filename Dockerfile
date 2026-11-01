@@ -35,6 +35,14 @@ RUN --mount=type=cache,target=/root/.npm npm ci
 FROM base AS build
 WORKDIR /app
 ENV NEXT_OUTPUT=standalone
+# Browser error-tracking settings are inlined into the client bundle at build time. Empty (the default)
+# leaves the browser SDK off; pass --build-arg to enable it (server-side SENTRY_* stay runtime env).
+ARG NEXT_PUBLIC_SENTRY_DSN=
+ARG NEXT_PUBLIC_SENTRY_ENVIRONMENT=
+ARG NEXT_PUBLIC_SENTRY_RELEASE=
+ENV NEXT_PUBLIC_SENTRY_DSN=$NEXT_PUBLIC_SENTRY_DSN \
+    NEXT_PUBLIC_SENTRY_ENVIRONMENT=$NEXT_PUBLIC_SENTRY_ENVIRONMENT \
+    NEXT_PUBLIC_SENTRY_RELEASE=$NEXT_PUBLIC_SENTRY_RELEASE
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npx prisma generate --schema prisma/schema.prisma

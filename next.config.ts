@@ -1,4 +1,5 @@
 import type { NextConfig } from "next";
+import { withSentryConfig } from "@sentry/nextjs/config";
 
 // Baseline security response headers applied to every route (framing,
 // MIME-sniffing, referrer leakage, transport security). The full Content-Security-Policy
@@ -46,4 +47,11 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default nextConfig;
+// Error tracking (GlitchTip). The wrapper only wires the SDK into the build; it reports nothing
+// without a DSN. Build-time services are all switched off: no telemetry (it would call sentry.io),
+// no auth token, no source-map upload, no tunnel route, quiet output.
+export default withSentryConfig(nextConfig, {
+  telemetry: false,
+  silent: true,
+  sourcemaps: { disable: true },
+});
