@@ -8,7 +8,7 @@ import type { Breadcrumb, Event } from '@sentry/nextjs'
  *  - KEY rule: any object key matching SENSITIVE_KEY has its whole value replaced by "[Filtered]";
  *  - STRING rule: credentials embedded in free text (URL userinfo, `key=value` pairs, Authorization /
  *    Bearer / Basic header text) are removed and e-mail addresses become "[email]".
- * URLs lose their WHOLE query string (kept as `?[Filtered]`): OAuth callbacks put `code`/`state` there,
+ * URLs lose their WHOLE query string and fragment (kept as `?[Filtered]` / `#[Filtered]`): OAuth callbacks put `code`/`state` there,
  * and no list of parameter names is safe enough. Order ids, SKUs and ordinary prose are left alone. The functions never throw: on an internal
  * failure the event is reduced to a minimal "[scrub failed]" shell instead of leaking or vanishing.
  */
@@ -21,14 +21,21 @@ export const SCRUB_FAILED = '[scrub failed]'
 const SENSITIVE_KEY =
   /pass(word)?|secret|token|auth|api[-_]?key|cookie|dsn|session|credential|signature|hmac|nonce|(^|[-_.])sig($|[-_.])/i
 
-// Keys whose value is a raw query string / query part: dropped wholesale.
-const QUERY_KEY = /^(query[-_]?string|url\.query|http\.query|http\.query_string)$/i
+// Keys whose value is a raw query string / fragment: dropped wholesale.
+const QUERY_KEY = /^(query[-_]?string|url\.query|http\.query|http\.query_string|url\.fragment|http\.fragment|url[-_]fragment|fragment)$/i
 
 const MAX_DEPTH = 25
 
 // scheme://host/path?query and /relative/path?query -> the query string is replaced (path kept).
-const ABSOLUTE_URL_QUERY = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s?#"'<>]*)\?[^\s#"'<>]+/gi
-const RELATIVE_URL_QUERY = /(^|[\s"'(=])(\/[^\s?#"'<>]*)\?[^\s#"'<>]+/g
+const ABSOLUTE_URL = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s?#"'<>]*)(\?[^\s#"'<>]+)?(#[^\s"'<>]+)?/gi
+const RELATIVE_URL = /(^|[\s"'(=])(\/[^\s?#"'<>]*)(\?[^\s#"'<>]+)?(#[^\s"'<>]+)?/g
+
+/** Keep scheme/host/path; replace `?query` and `#fragment` (either, or both) with a placeholder. */
+function stripQueryAndFragment(match: string, base: string, query?: string, fragment?: string): string {
+  if (!query && !fragment) return match
+  return `${base}${query ? `?${FILTERED}` : ''}${fragment ? `#${FILTERED}` : ''}`
+}
+
 // scheme://user:password@host -> scheme://[Filtered]@host
 const URL_USERINFO = /(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/?#@]*:[^\s/?#@]*@/gi
 // Authorization: <anything to end of line>
@@ -43,8 +50,10 @@ const EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}
 
 export function scrubString(input: string): string {
   return input
-    .replace(ABSOLUTE_URL_QUERY, '$1?[Filtered]')
-    .replace(RELATIVE_URL_QUERY, '$1$2?[Filtered]')
+    .replace(ABSOLUTE_URL, stripQueryAndFragment)
+    .replace(RELATIVE_URL, (m, lead: string, path: string, q?: string, f?: string) =>
+      q || f ? `${lead}${stripQueryAndFragment(m, path, q, f)}` : m,
+    )
     .replace(URL_USERINFO, '$1[Filtered]@')
     .replace(AUTH_HEADER, `$1$2${FILTERED}`)
     .replace(BEARER, `$1 ${FILTERED}`)

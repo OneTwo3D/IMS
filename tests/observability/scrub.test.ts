@@ -242,3 +242,26 @@ test('signature key rule has no false positives on ordinary fields', () => {
   const out = scrubEvent({ extra: { sku: 'ABC-1', designation: 'x', assignedTo: 'y', significance: 'z', orderId: '173814' } })
   assert.deepEqual(out?.extra, { sku: 'ABC-1', designation: 'x', assignedTo: 'y', significance: 'z', orderId: '173814' })
 })
+
+test('URL fragments do not survive any carrier; path is kept; "#" in prose is untouched', () => {
+  const frag1 = '/api/accounting/callback#code=SENTINELFRAG1&state=SENTINELFRAG2'
+  const frag2 = '/api/accounting/callback?x=1#access_token=SENTINELFRAG3'
+  const all = [frag1, frag2, `https://ims.example.test${frag1}`, `https://ims.example.test${frag2}`]
+  const noFrag = (v: unknown) => {
+    const s = json(v)
+    for (const n of ['SENTINELFRAG1', 'SENTINELFRAG2', 'SENTINELFRAG3']) assert.ok(!s.includes(n), `leaked ${n}`)
+    assert.match(s, /\/api\/accounting\/callback/)
+  }
+  for (const u of all) {
+    noFrag(scrubEvent({ message: `GET ${u} failed`, request: { url: u }, transaction: u }))
+    noFrag(scrubBreadcrumb({ category: 'navigation', message: u, data: { to: u, url: u } }))
+    noFrag(
+      scrubSpan({
+        name: `GET ${u}`,
+        attributes: { 'url.full': u, 'http.url': u, 'http.target': u, 'url.fragment': 'code=SENTINELFRAG1&state=SENTINELFRAG2' },
+      }),
+    )
+  }
+  assert.equal(scrubEvent({ message: 'order #173814 SKU ABC-1' })?.message, 'order #173814 SKU ABC-1')
+  assert.equal(scrubEvent({ message: 'see /orders/173814 and #5' })?.message, 'see /orders/173814 and #5')
+})
