@@ -29,6 +29,7 @@ import {
 import { ancestorProblem, capturePostmaster, inheritedEnv, verifyPublishedReport, writeExclusive, postmasterIsStillOurs, processStartEpochSeconds, parseArgs, processIsAlive, processesNaming, runRehearsal, shredFile, type RehearsalHooks } from '@/scripts/rehearse-first-install'
 
 const REPO = process.cwd()
+// Deliberately a fixed disk-backed /var/tmp, not scratchRoot(): the rehearsal tool refuses a RAM-backed parent, and these tests exercise that.
 const SCRATCH_PARENT = '/var/tmp'
 const TIMEOUT = 15 * 60 * 1000
 

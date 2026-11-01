@@ -327,6 +327,15 @@ npm run db:unstamp-scratch -- ims_scratch_<suffix>      # if you keep the databa
 dropdb ims_scratch_<suffix>
 ```
 
+**Scratch clusters and temp trees on a RAM disk (`IMS_SCRATCH_ROOT`).** Tests that start a throwaway Postgres
+cluster or need a trusted report directory create it under `scratchRoot()` (`tests/helpers/scratch-root.ts`):
+`/var/tmp` by default, or the directory named by `IMS_SCRATCH_ROOT` when that is an existing writable directory.
+Point it at a RAM-backed directory to keep those short-lived, write-heavy clusters off the SSD. The directory must be
+root-owned with the sticky bit (`1777`, as `/var/tmp` is): the report-directory trust checks refuse an ancestor that
+another account could modify unless it is a root-owned sticky directory. Keep the path short, because a Postgres
+unix-socket path is limited to about 107 bytes. The rehearsal tests (`tests/scripts/rehearse-*.test.ts`) stay on a
+fixed `/var/tmp` on purpose: the rehearsal tool refuses a RAM-backed parent.
+
 RESIDUALS, so nobody has to discover them:
 
 * **the data check runs when the stamp is ISSUED, not every time it is used.** A database stamped while

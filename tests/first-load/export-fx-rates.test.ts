@@ -11,6 +11,7 @@ import { FX_EXPORT_STATEMENTS, parseFxExportArgs, readFxRates, renderFxRatesCsv,
 import { ingestDataset } from '../../lib/first-load/ingest.ts'
 import { runCli } from '../../scripts/first-load-export-fx-rates.ts'
 import { dispositionCodes, ds, precondition, product, rowsOf, run, runBare } from './helpers.ts'
+import { scratchRoot } from '../helpers/scratch-root'
 
 type Row = { fromCurrency: string; toCurrency: string; rate: string; fetchedAt: string }
 const TABLE: Row[] = [
@@ -94,7 +95,7 @@ async function cli(args: string[], port: FxExportPort, env = process.env) {
 
 // [mutation: skip the --expect-db / --expect-system-id confirmation, write with a wider mode, overwrite an existing file, drop the digest]
 test('the command writes the CSV and its record mode 600 in a mode-700 directory, with the digest; the target must be confirmed; nothing is overwritten', async (t) => {
-  const root = mkdtempSync('/var/tmp/first-load-export-')
+  const root = mkdtempSync(path.join(scratchRoot(), 'first-load-export-'))
   try {
     const env = envFile(root)
     const out = path.join(root, 'out')
