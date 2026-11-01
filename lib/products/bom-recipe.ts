@@ -289,6 +289,10 @@ export async function syncBomRecipeFromProductComponents(
   const existing = await client.bom.findUnique({ where: { productId }, select: { id: true, active: true } })
   let bomId = existing?.id ?? null
   let claimKind: 'created' | 'adopted' | 'already' = 'already'
+  // True when this call made an existing Bom ACTIVE (reactivated or adopted it). A Bom can hold items for
+  // several parents, and activating it exposes ALL of their edges to the planning walks, not just this
+  // product's, so the cycle check below must start from every one of those parents too.
+  let madeActive = false
 
   if (bomId) {
     // A CLAIMED Bom that is INACTIVE is a recipe planning cannot see:
@@ -298,6 +302,7 @@ export async function syncBomRecipeFromProductComponents(
     // from BOM and back again would leave it silently unplannable (round 2).
     if (existing && !existing.active) {
       await client.bom.update({ where: { id: bomId }, data: { active: true } })
+      madeActive = true
     }
   } else {
     const adoptable = await client.bom.findFirst({
@@ -321,6 +326,7 @@ export async function syncBomRecipeFromProductComponents(
       if (claimed.count !== 1) return { kind: 'claim-contended', bomId: adoptable.id }
       bomId = adoptable.id
       claimKind = 'adopted'
+      madeActive = true
     }
   }
 
@@ -389,9 +395,20 @@ export async function syncBomRecipeFromProductComponents(
     where: PLANNING_REACHABLE_BOM_EDGES,
     select: { parentProductId: true, componentProductId: true },
   })
-  // Scoped to the closure reachable from the product just written: a cycle that closure cannot reach is not this
-  // write's business and must not refuse it; one it can reach would never terminate when exploded.
-  const cycle = detectBomItemCycleInEdges(edges, [productId])
+  // Scoped to the closure reachable from the product just written (plus, when this call made a Bom active,
+  // from every parent whose items that activation just exposed): a cycle those closures cannot reach is not
+  // this write's business and must not refuse it; one they can reach would never terminate when exploded.
+  // Same transaction, same graph lock as the writes above.
+  const seeds = [productId]
+  if (madeActive) {
+    const exposed = await client.bomItem.findMany({
+      where: { bomId },
+      select: { parentProductId: true },
+      distinct: ['parentProductId'],
+    })
+    for (const { parentProductId } of exposed) if (!seeds.includes(parentProductId)) seeds.push(parentProductId)
+  }
+  const cycle = detectBomItemCycleInEdges(edges, seeds)
   if (cycle) return { kind: 'cycle', path: cycle }
 
   return { kind: 'written', bomId, claimed: claimKind }

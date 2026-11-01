@@ -2093,6 +2093,61 @@ test(
   },
 )
 
+/**
+ * A retired Bom that ALSO holds an item for another parent (X -> Y), which re-importing P adopts and makes
+ * active. P's own closure is clean, but the activation exposes X -> Y to planning.
+ */
+async function retiredMultiParentBom(deps: Deps, pId: string, xId: string, yId: string): Promise<{ bomId: string; extraItemId: string }> {
+  const bom = await deps.db.bom.findUniqueOrThrow({ where: { productId: pId }, select: { id: true } })
+  await deps.db.$executeRaw`UPDATE boms SET active = false, "productId" = NULL WHERE id = ${bom.id}`
+  const extra = await deps.db.bomItem.create({
+    data: { bomId: bom.id, parentProductId: xId, componentProductId: yId, qty: 1, sortOrder: 98 },
+    select: { id: true },
+  })
+  return { bomId: bom.id, extraItemId: extra.id }
+}
+
+test(
+  'adopting an inactive multi-parent Bom is refused when the edges it exposes form a cycle outside the written product\'s closure',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'S5'
+    const ids = await seedBomProducts(deps, NS, ['X', 'Y', 'P'])
+    const edges = [await legacyEdge(deps, ids.Y, ids.X)]
+    const { bomId, extraItemId } = await retiredMultiParentBom(deps, ids.P, ids.X, ids.Y)
+    edges.push(extraItemId)
+    try {
+      const refused = errorsOf(await importRecipe(deps, NS, 'P', ['RAW']))
+      const text = refused.join('\n')
+      assert.ok(/circular/i.test(text), `expected a cycle refusal, got ${JSON.stringify(refused)}`)
+      assert.ok(text.includes(ids.X) && text.includes(ids.Y), `the refusal must name the exposed cycle: ${text}`)
+      const after = await deps.db.bom.findUniqueOrThrow({ where: { id: bomId }, select: { active: true, productId: true } })
+      assert.deepEqual(after, { active: false, productId: null }, 'the refused activation must have been rolled back')
+    } finally {
+      await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+    }
+  },
+)
+
+test(
+  'adopting an inactive multi-parent Bom that exposes only acyclic edges is allowed',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'S6'
+    const ids = await seedBomProducts(deps, NS, ['X', 'Y', 'P'])
+    const { bomId, extraItemId } = await retiredMultiParentBom(deps, ids.P, ids.X, ids.Y)
+    try {
+      assert.deepEqual(errorsOf(await importRecipe(deps, NS, 'P', ['RAW'])), [])
+      const after = await deps.db.bom.findUniqueOrThrow({ where: { id: bomId }, select: { active: true, productId: true } })
+      assert.deepEqual(after, { active: true, productId: ids.P })
+    } finally {
+      await deps.db.bomItem.deleteMany({ where: { id: extraItemId } })
+    }
+  },
+)
+
 test(
   'a cycle that closes through a deeper descendant is refused, naming every product on it',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },

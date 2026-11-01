@@ -192,7 +192,7 @@ test('[o3d-zjsb5.9] the dry-run cycle check asks about the graph AFTER the paren
 // The write path
 // ---------------------------------------------------------------------------
 
-type FakeBom = { id: string; name: string; productId: string | null; updatedAt: number }
+type FakeBom = { id: string; name: string; productId: string | null; updatedAt: number; active?: boolean }
 type FakeItem = { bomId: string; parentProductId: string; componentProductId: string; qty: number; sortOrder: number }
 
 function fakeSyncClient(seed?: { boms?: FakeBom[]; items?: FakeItem[] }) {
@@ -206,7 +206,7 @@ function fakeSyncClient(seed?: { boms?: FakeBom[]; items?: FakeItem[] }) {
       findUnique: async ({ where }: { where: { productId: string } }) => {
         calls.push('bom.findUnique')
         const bom = boms.find((entry) => entry.productId === where.productId)
-        return bom ? { ...bom, active: (bom as { active?: boolean }).active ?? true } : null
+        return bom ? { ...bom, active: bom.active ?? true } : null
       },
       // No ACTIVE duplicate Boms (round 8): these cases are about the claimed recipe, and an empty
       // result is the "nothing else is active for this parent" state they all assume. The refusal that
@@ -264,9 +264,14 @@ function fakeSyncClient(seed?: { boms?: FakeBom[]; items?: FakeItem[] }) {
         items.push(...data)
         return { count: data.length }
       },
-      findMany: async () => {
+      // Honours the two predicates the sync's reads use: `bomId` (the parents a Bom exposes) and the
+      // planning filter `bom.active` (an item in an INACTIVE Bom is not part of the walked graph).
+      findMany: async ({ where }: { where?: { bomId?: string; bom?: { active: boolean } } } = {}) => {
         calls.push('bomItem.findMany')
-        return items.map((item) => ({ ...item }))
+        return items
+          .filter((item) => where?.bomId === undefined || item.bomId === where.bomId)
+          .filter((item) => !where?.bom?.active || (boms.find((bom) => bom.id === item.bomId)?.active ?? true))
+          .map((item) => ({ ...item }))
       },
     },
   }
@@ -397,6 +402,63 @@ test('an unrelated cyclic pair in bom_items does not refuse a recipe write; the 
   })
   assert.equal(refused.kind, 'cycle')
   assert.deepEqual(refused.kind === 'cycle' ? refused.path : null, ['leg', 'table', 'leg'])
+})
+
+test('activating a multi-parent Bom checks the cycle through EVERY parent it exposes, not just the written product', async () => {
+  // P adopts an unclaimed, inactive Bom that also holds X -> Y. Another active Bom holds Y -> X. P's own
+  // closure is acyclic (P -> raw), but the activation makes X -> Y visible to planning, and X -> Y -> X loops.
+  const fake = fakeSyncClient({
+    boms: [
+      { id: 'bom-hist', name: 'old', productId: null, updatedAt: 1, active: false },
+      { id: 'bom-y', name: 'Y BOM', productId: 'y', updatedAt: 1, active: true },
+    ],
+    items: [
+      { bomId: 'bom-hist', parentProductId: 'p', componentProductId: 'raw', qty: 1, sortOrder: 0 },
+      { bomId: 'bom-hist', parentProductId: 'x', componentProductId: 'y', qty: 1, sortOrder: 0 },
+      { bomId: 'bom-y', parentProductId: 'y', componentProductId: 'x', qty: 1, sortOrder: 0 },
+    ],
+  })
+  const outcome = await syncBomRecipeFromProductComponents(fake.client, {
+    productId: 'p', sku: 'P-01', components: [{ componentProductId: 'raw', qty: 1 }],
+  })
+  assert.equal(outcome.kind, 'cycle')
+  assert.deepEqual(outcome.kind === 'cycle' ? outcome.path : null, ['x', 'y', 'x'])
+})
+
+test('reactivating a CLAIMED multi-parent Bom checks the cycle through every parent it exposes', async () => {
+  const fake = fakeSyncClient({
+    boms: [
+      { id: 'bom-p', name: 'P BOM', productId: 'p', updatedAt: 1, active: false },
+      { id: 'bom-y', name: 'Y BOM', productId: 'y', updatedAt: 1, active: true },
+    ],
+    items: [
+      { bomId: 'bom-p', parentProductId: 'x', componentProductId: 'y', qty: 1, sortOrder: 0 },
+      { bomId: 'bom-y', parentProductId: 'y', componentProductId: 'x', qty: 1, sortOrder: 0 },
+    ],
+  })
+  const outcome = await syncBomRecipeFromProductComponents(fake.client, {
+    productId: 'p', sku: 'P-01', components: [{ componentProductId: 'raw', qty: 1 }],
+  })
+  assert.equal(outcome.kind, 'cycle')
+  assert.deepEqual(outcome.kind === 'cycle' ? outcome.path : null, ['x', 'y', 'x'])
+})
+
+test('activating a multi-parent Bom that exposes only acyclic edges is allowed', async () => {
+  const fake = fakeSyncClient({
+    boms: [
+      { id: 'bom-hist', name: 'old', productId: null, updatedAt: 1, active: false },
+      { id: 'bom-y', name: 'Y BOM', productId: 'y', updatedAt: 1, active: true },
+    ],
+    items: [
+      { bomId: 'bom-hist', parentProductId: 'p', componentProductId: 'raw', qty: 1, sortOrder: 0 },
+      { bomId: 'bom-hist', parentProductId: 'x', componentProductId: 'y', qty: 1, sortOrder: 0 },
+      { bomId: 'bom-y', parentProductId: 'y', componentProductId: 'raw', qty: 1, sortOrder: 0 },
+    ],
+  })
+  const outcome = await syncBomRecipeFromProductComponents(fake.client, {
+    productId: 'p', sku: 'P-01', components: [{ componentProductId: 'raw', qty: 1 }],
+  })
+  assert.equal(outcome.kind, 'written')
 })
 
 test('[o3d-zjsb5.9] the cycle question is asked AFTER the write, on the graph being committed', async () => {
