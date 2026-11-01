@@ -202,31 +202,20 @@ test('saveProductComponents verifies the sku its lock set was chosen for (o3d-t0
   assert.match(source, /renamed while saving/, 'a lost lock set must be reported, not silently written through')
 })
 
-test('delete-only writers deliberately do NOT take the graph lock (o3d-t0zq)', async () => {
-  // Not an oversight: removing edges cannot create a cycle, and taking the graph lock AFTER
-  // their per-SKU lock would invert the order and create a deadlock against the writers above.
-  // Pinned so a later "consistency" change cannot quietly introduce that inversion.
-  const [products, importActions] = await Promise.all([
-    readFile(PRODUCTS_ACTIONS, 'utf8'),
-    readFile(IMPORT_ACTIONS, 'utf8'),
-  ])
-
-  // The editor's clearComponents, inside the per-SKU-locked update transaction.
+test('the editor takes the graph lock FIRST, before its per-SKU lock (type conversions reconcile the BOM recipe)', async () => {
+  // The editor's type change makes a Bom active or retires it, and the cycle check in the reconcile is
+  // authoritative only under the graph lock. The order must stay graph first, per-SKU second, the same as
+  // every other writer, or two paths deadlock. The census test in bom-graph-writer-lock-census.test.ts
+  // checks every caller; this pins the editor's position precisely.
+  const products = await readFile(PRODUCTS_ACTIONS, 'utf8')
   const editorAt = products.indexOf('updatedCategoryChange = await db.$transaction')
   const editorBody = products.slice(editorAt, products.indexOf('await logActivity', editorAt))
   assert.match(editorBody, /tx\.productComponent\.deleteMany/, 'the editor must still clear components')
-  assert.ok(
-    !editorBody.includes('COMPONENT_GRAPH_WRITE_LOCK_KEY'),
-    'the editor must NOT take the graph lock after its per-SKU lock — that inverts the order',
-  )
-
-  // The CSV rename branch's clearComponents.
-  const renameAt = importActions.indexOf('lockProductSkusForWrite(tx, [sku, existingProduct.sku])')
-  const renameBody = importActions.slice(renameAt, renameAt + 3400)
-  assert.ok(
-    !renameBody.includes('COMPONENT_GRAPH_WRITE_LOCK_KEY'),
-    'the CSV rename must NOT take the graph lock after its per-SKU lock',
-  )
+  const graphAt = editorBody.indexOf('pg_advisory_xact_lock(${COMPONENT_GRAPH_WRITE_LOCK_KEY})')
+  const skuAt = editorBody.indexOf('lockProductSkusForWrite(tx')
+  assert.ok(graphAt !== -1, 'the editor must take the graph lock')
+  assert.ok(graphAt < skuAt, 'and take it BEFORE the per-SKU lock')
+  assert.ok(graphAt < editorBody.indexOf('tx.product.'), 'and before it reads or writes any product')
 })
 
 test('an empty-string component id is a vertex, not something to filter away (o3d-quia)', async () => {

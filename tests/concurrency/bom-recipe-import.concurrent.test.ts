@@ -2200,3 +2200,51 @@ test(
     }
   },
 )
+
+test(
+  'an editor KIT -> BOM conversion and a CSV import that together close a BOM cycle serialise: exactly one is refused',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const { updateProduct } = await import('../../app/actions/products')
+    const NS = 'S7'
+    // A is a KIT over B; B and C are BOMs. C -> A lives in bom_items only (the legacy state). The editor turning A
+    // into a BOM exposes A -> B; the import writes B -> C. Each is acyclic alone; together they close A -> B -> C -> A.
+    const ids = await seedBomProducts(deps, NS, ['B', 'C'])
+    assert.deepEqual(errorsOf(await deps.importProductsCsv(csv([
+      'sku,name,type,components,stockUnit',
+      `${sku(NS, 'A')},A,KIT,${sku(NS, 'B')}:1,each`,
+    ]))), [])
+    const a = (await deps.db.product.findUniqueOrThrow({ where: { sku: sku(NS, 'A') }, select: { id: true } })).id
+    const edges = [await legacyEdge(deps, ids.C, a)]
+    const form = new FormData()
+    form.set('sku', sku(NS, 'A'))
+    form.set('name', 'A')
+    form.set('type', 'BOM')
+    form.set('stockUnit', 'each')
+    form.set('lifecycleStatus', 'ACTIVE')
+    try {
+      const outcome = await whileHoldingGraphLock(deps, async () => {
+        // A successful save ends in redirect(), which throws NEXT_REDIRECT: that is a commit, not a failure.
+        const editor = updateProduct(a, {}, form).then((result) => result, (error: unknown) => error)
+        const importer = importRecipe(deps, NS, 'B', ['C'])
+        importer.catch(() => {})
+        // BOTH writers must be queued on the graph lock. An editor that does not take it never queues, and this
+        // wait fails with the message below instead of letting the race be decided by timing.
+        await awaitAdvisoryLockWaiter(deps, 2)
+        return { deferred: { editor, importer } }
+      })
+      await outcome.deferred.editor
+      await outcome.deferred.importer
+
+      const editorCommitted = (await deps.db.product.findUniqueOrThrow({ where: { id: a }, select: { type: true } })).type === 'BOM'
+      const importCommitted = (await deps.db.bomItem.count({ where: { parentProductId: ids.B, componentProductId: ids.C } })) > 0
+      assert.notEqual(editorCommitted, importCommitted, `exactly one writer may commit (editor ${editorCommitted}, import ${importCommitted})`)
+      // And no cycle is committed to the graph planning walks.
+      const cycle = (await deps.findBomRecipeDrift(deps.db)).filter((row) => row.kind === 'bom-item-cycle' && row.sku.startsWith(`${TAG}${NS}-`))
+      assert.deepEqual(cycle, [], 'no BOM cycle may be committed')
+    } finally {
+      await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+    }
+  },
+)
