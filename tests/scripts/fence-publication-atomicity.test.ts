@@ -29,7 +29,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 
 import {
@@ -60,6 +60,33 @@ function scratch(t: TestContext): Scratch {
     recovery,
     app: (name: string) => join(base, name),
   }
+}
+
+/**
+ * A BOUNDED WAIT for another run's marker. The rig's runs hand off through marker files; an unbounded
+ * `while [[ ! -e marker ]]` turns a refusal in the OTHER run (which never writes its marker) into a hang
+ * that eats the whole suite timeout. This gives up when the marker has not appeared after RIG_WAIT_TICKS
+ * polls, or sooner when the other run is B and its process has already exited without writing it (the
+ * driver records B's pid in `b.pid`: a run that REFUSED is dead long before any time limit). Giving up
+ * records the reason and the tail of the other run's log in RIG_WAIT_FILE, because the wait is often inside
+ * a `$(...)` whose output and `exit` do not reach the run's log; `run()` fails the test from that file.
+ * The limit is generous because publication on a loaded box legitimately takes minutes (a full `sync`).
+ */
+const RIG_WAIT_TICKS = 6000
+const RIG_WAIT_FILE = 'rig-wait-timeout.txt'
+
+function waitFor(dirs: Scratch, marker: string, other: 'a' | 'b'): string {
+  const log = JSON.stringify(join(dirs.base, `${other}.log`))
+  const pidFile = JSON.stringify(join(dirs.base, 'b.pid'))
+  const gone = other === 'b'
+    ? `[[ -s ${pidFile} ]] && { _rig_s="$(awk '/^State:/{print $2}' /proc/$(<${pidFile})/status 2>/dev/null)"; [[ -z "\${_rig_s}" || "\${_rig_s}" == Z ]]; } && [[ ! -e ${JSON.stringify(marker)} ]]`
+    : 'false'
+  return [
+    `_rig_i=0; while [[ ! -e ${JSON.stringify(marker)} ]]; do`,
+    `_rig_i=$((_rig_i+1)); if (( _rig_i > ${RIG_WAIT_TICKS} )) || { ${gone}; }; then`,
+    `{ echo "RIG-WAIT-TIMEOUT: gave up waiting for ${marker.split('/').pop()} (other run: ${other.toUpperCase()}, polls: \${_rig_i}); its log tail follows:";`,
+    `tail -n 20 ${log} 2>&1; } 2>&1 | tee -a ${JSON.stringify(join(dirs.base, RIG_WAIT_FILE))}; exit 97; fi; sleep 0.05; done`,
+  ].join(' ')
 }
 
 /** A fake checkout at `<base>/<name>/app`, with the shipped layout the library vendors from. */
@@ -98,6 +125,9 @@ function script(dirs: Scratch, name: string, text: string): string {
 
 function run(path: string): { status: number; output: string } {
   const out = spawnSync('bash', [path], { encoding: 'utf8' })
+  // A bounded wait that gave up is a rig failure, not a result: fail here, with what it recorded.
+  const gaveUp = join(dirname(path), RIG_WAIT_FILE)
+  if (existsSync(gaveUp)) assert.fail(`the rig gave up waiting on the other run:\n${readFileSync(gaveUp, 'utf8')}`)
   return { status: out.status ?? -1, output: `${out.stdout ?? ''}${out.stderr ?? ''}` }
 }
 
@@ -124,13 +154,13 @@ function treeDigest(recovery: string): string {
  * and everything either side of it is the shipped code. `declare -f` + `sed` on the first line is the
  * only part of this that is not the library's own text.
  */
-function pauseAfter(fn: string, signal: string, until: string): string[] {
+function pauseAfter(dirs: Scratch, fn: string, signal: string, until: string): string[] {
   return [
     `eval "$(declare -f ${fn} | sed '1s/${fn}/_rig_wrapped/')"`,
     `${fn}() {`,
     '  _rig_wrapped "$@"; local rc=$?',
     `  : > ${JSON.stringify(signal)}`,
-    `  while [[ ! -e ${JSON.stringify(until)} ]]; do sleep 0.05; done`,
+    `  ${waitFor(dirs, until, 'b')}`,
     '  return $rc',
     '}',
   ]
@@ -157,11 +187,11 @@ test('[o3d-xi3w] a second privileged run cannot reach the staging tree the first
   assert.match(pin, /^[0-9a-f]{64}$/, 'precondition: the entry file A authenticates has a digest')
 
   const aScript = script(dirs, 'a.sh', program(dirs, a, [
-    ...pauseAfter('_fence_vendor_into', aAssembled, bAssembled),
+    ...pauseAfter(dirs, '_fence_vendor_into', aAssembled, bAssembled),
     '_fence_stage_and_publish; echo "RC=$?"',
   ], [`export IMS_FENCE_SCRIPT_SHA256=${JSON.stringify(pin)}`]))
   const bScript = script(dirs, 'b.sh', program(dirs, b, [
-    `while [[ ! -e ${JSON.stringify(aAssembled)} ]]; do sleep 0.05; done`,
+    `${waitFor(dirs, aAssembled, 'a')}`,
     `eval "$(declare -f _fence_vendor_into | sed '1s/_fence_vendor_into/_rig_wrapped/')"`,
     '_fence_vendor_into() {',
     '  _rig_wrapped "$@"; local rc=$?',
@@ -174,6 +204,7 @@ test('[o3d-xi3w] a second privileged run cannot reach the staging tree the first
     'set -uo pipefail',
     `bash ${JSON.stringify(bScript)} > ${JSON.stringify(join(dirs.base, 'b.log'))} 2>&1 &`,
     'bpid=$!',
+    `echo "\${bpid}" > ${JSON.stringify(join(dirs.base, 'b.pid'))}`,
     `bash ${JSON.stringify(aScript)} > ${JSON.stringify(join(dirs.base, 'a.log'))} 2>&1`,
     'wait "${bpid}" 2>/dev/null || true',
   ].join('\n'))
@@ -228,14 +259,14 @@ test('[o3d-xi3w] the documented name is never absent, and no publication can nes
     'mv() {',
     `  if [[ "\${@: -1}" == "\${DB_FENCE_PROTECTED_APP_DIR}" ]]; then`,
     `    : > ${JSON.stringify(atCommit)}`,
-    `    while [[ ! -e ${JSON.stringify(bDone)} ]]; do sleep 0.05; done`,
+    `    ${waitFor(dirs, bDone, 'b')}`,
     '  fi',
     '  command mv "$@"',
     '}',
     '_fence_stage_and_publish; echo "RC=$?"',
   ]))
   const bScript = script(dirs, 'b.sh', program(dirs, b, [
-    `while [[ ! -e ${JSON.stringify(atCommit)} ]]; do sleep 0.05; done`,
+    `${waitFor(dirs, atCommit, 'a')}`,
     `if [[ -e "\${DB_FENCE_PROTECTED_APP_DIR}" ]]; then echo "B_SEES=present"; else echo "B_SEES=ABSENT"; fi`,
     '_fence_stage_and_publish; echo "RC=$?"',
     `: > ${JSON.stringify(bDone)}`,
@@ -257,6 +288,7 @@ test('[o3d-xi3w] the documented name is never absent, and no publication can nes
     'ppid_=$!',
     `bash ${JSON.stringify(bScript)} > ${JSON.stringify(join(dirs.base, 'b.log'))} 2>&1 &`,
     'bpid=$!',
+    `echo "\${bpid}" > ${JSON.stringify(join(dirs.base, 'b.pid'))}`,
     `bash ${JSON.stringify(aScript)} > ${JSON.stringify(join(dirs.base, 'a.log'))} 2>&1`,
     'wait "${bpid}" 2>/dev/null || true',
     `: > ${JSON.stringify(join(dirs.base, 'all-done'))}`,
@@ -348,7 +380,7 @@ test('[o3d-xi3w] the run that loses the race reports NOTHING published, and name
     `  if [[ "\${@: -1}" == "\${DB_FENCE_PROTECTED_APP_DIR}" ]]; then`,
     '    command mv "$@"; local rc=$?',
     `    : > ${JSON.stringify(committed)}`,
-    `    while [[ ! -e ${JSON.stringify(bDone)} ]]; do sleep 0.05; done`,
+    `    ${waitFor(dirs, bDone, 'b')}`,
     '    return $rc',
     '  fi',
     '  command mv "$@"',
@@ -357,7 +389,7 @@ test('[o3d-xi3w] the run that loses the race reports NOTHING published, and name
     'echo "NOTE=${DB_FENCE_ROTATION_NOTE}"',
   ]))
   const bScript = script(dirs, 'b.sh', program(dirs, b, [
-    `while [[ ! -e ${JSON.stringify(committed)} ]]; do sleep 0.05; done`,
+    `${waitFor(dirs, committed, 'a')}`,
     '_fence_stage_and_publish; echo "RC=$?"',
     `: > ${JSON.stringify(bDone)}`,
   ]))
@@ -365,6 +397,7 @@ test('[o3d-xi3w] the run that loses the race reports NOTHING published, and name
     'set -uo pipefail',
     `bash ${JSON.stringify(bScript)} > ${JSON.stringify(join(dirs.base, 'b.log'))} 2>&1 &`,
     'bpid=$!',
+    `echo "\${bpid}" > ${JSON.stringify(join(dirs.base, 'b.pid'))}`,
     `bash ${JSON.stringify(aScript)} > ${JSON.stringify(join(dirs.base, 'a.log'))} 2>&1`,
     'wait "${bpid}" 2>/dev/null || true',
   ].join('\n'))
@@ -557,11 +590,11 @@ test('[o3d-xi3w] a publication landing between the resolution and the exec canno
     'script="$(db_fence_script_in_use)" || { echo "RESOLVE_RC=$?"; exit 0; }',
     'echo "RESOLVED=${script}"',
     `: > ${JSON.stringify(resolved)}`,
-    `while [[ ! -e ${JSON.stringify(published)} ]]; do sleep 0.05; done`,
+    `${waitFor(dirs, published, 'b')}`,
     'echo "RAN=$(node "${script}" 2>&1)"',
   ], [`export IMS_FENCE_ARTEFACT_SHA256=${JSON.stringify(pin)}`]))
   const bScript = script(dirs, 'b.sh', program(dirs, b, [
-    `while [[ ! -e ${JSON.stringify(resolved)} ]]; do sleep 0.05; done`,
+    `${waitFor(dirs, resolved, 'a')}`,
     '_fence_stage_and_publish; echo "B_RC=$?"',
     `bash ${JSON.stringify(third)}`,
     `: > ${JSON.stringify(published)}`,
@@ -570,6 +603,7 @@ test('[o3d-xi3w] a publication landing between the resolution and the exec canno
     'set -uo pipefail',
     `bash ${JSON.stringify(bScript)} > ${JSON.stringify(join(dirs.base, 'b.log'))} 2>&1 &`,
     'bpid=$!',
+    `echo "\${bpid}" > ${JSON.stringify(join(dirs.base, 'b.pid'))}`,
     `bash ${JSON.stringify(aScript)} > ${JSON.stringify(join(dirs.base, 'a.log'))} 2>&1`,
     'wait "${bpid}" 2>/dev/null || true',
   ].join('\n'))
@@ -616,11 +650,11 @@ test('[o3d-xi3w] CONTROL: without the pin, that same sweep does reclaim the vers
     // The one line that differs from the test above.
     `rm -f "\${DB_FENCE_RECOVERY_DIR}"/.inuse-fence.*`,
     `: > ${JSON.stringify(resolved)}`,
-    `while [[ ! -e ${JSON.stringify(published)} ]]; do sleep 0.05; done`,
+    `${waitFor(dirs, published, 'b')}`,
     'echo "RAN=$(node "${script}" 2>&1)"',
   ]))
   const bScript = script(dirs, 'b.sh', program(dirs, b, [
-    `while [[ ! -e ${JSON.stringify(resolved)} ]]; do sleep 0.05; done`,
+    `${waitFor(dirs, resolved, 'a')}`,
     '_fence_stage_and_publish; echo "B_RC=$?"',
     `bash ${JSON.stringify(third)}`,
     `: > ${JSON.stringify(published)}`,
@@ -629,6 +663,7 @@ test('[o3d-xi3w] CONTROL: without the pin, that same sweep does reclaim the vers
     'set -uo pipefail',
     `bash ${JSON.stringify(bScript)} > ${JSON.stringify(join(dirs.base, 'b.log'))} 2>&1 &`,
     'bpid=$!',
+    `echo "\${bpid}" > ${JSON.stringify(join(dirs.base, 'b.pid'))}`,
     `bash ${JSON.stringify(aScript)} > ${JSON.stringify(join(dirs.base, 'a.log'))} 2>&1`,
     'wait "${bpid}" 2>/dev/null || true',
   ].join('\n'))
@@ -668,13 +703,13 @@ test('[o3d-xi3w] every helper invocation of ONE fence operation resolves to the 
     'echo "PATH1=${s1}"',
     'echo "RUN1=$(node "${s1}" 2>&1)"',
     `: > ${JSON.stringify(first)}`,
-    `while [[ ! -e ${JSON.stringify(published)} ]]; do sleep 0.05; done`,
+    `${waitFor(dirs, published, 'b')}`,
     's2="$(db_fence_script_in_use)"; echo "RC2=$?"',
     'echo "PATH2=${s2}"',
     'echo "RUN2=$(node "${s2}" 2>&1)"',
   ]))
   const bScript = script(dirs, 'b.sh', program(dirs, b, [
-    `while [[ ! -e ${JSON.stringify(first)} ]]; do sleep 0.05; done`,
+    `${waitFor(dirs, first, 'a')}`,
     '_fence_stage_and_publish; echo "B_RC=$?"',
     `: > ${JSON.stringify(published)}`,
   ]))
@@ -682,6 +717,7 @@ test('[o3d-xi3w] every helper invocation of ONE fence operation resolves to the 
     'set -uo pipefail',
     `bash ${JSON.stringify(bScript)} > ${JSON.stringify(join(dirs.base, 'b.log'))} 2>&1 &`,
     'bpid=$!',
+    `echo "\${bpid}" > ${JSON.stringify(join(dirs.base, 'b.pid'))}`,
     `bash ${JSON.stringify(aScript)} > ${JSON.stringify(join(dirs.base, 'a.log'))} 2>&1`,
     'wait "${bpid}" 2>/dev/null || true',
   ].join('\n'))
@@ -835,7 +871,7 @@ test('[o3d-xi3w] a publisher outraced between its pointer flip and its record wr
     '  _rig_recorded "$@"; local rc=$?',
     `  if [[ -e ${JSON.stringify(flipped)} ]] && [[ ! -e ${JSON.stringify(paused)} ]]; then`,
     `    : > ${JSON.stringify(paused)}`,
-    `    while [[ ! -e ${JSON.stringify(bFlipped)} ]]; do sleep 0.05; done`,
+    `    ${waitFor(dirs, bFlipped, 'b')}`,
     '  fi',
     '  return $rc',
     '}',
@@ -843,7 +879,7 @@ test('[o3d-xi3w] a publisher outraced between its pointer flip and its record wr
     'echo "NOTE=${DB_FENCE_ROTATION_NOTE}"',
   ], [`export IMS_FENCE_SCRIPT_SHA256=${JSON.stringify(sha256Of(checkoutHelper(a)))}`]))
   const bScript = script(dirs, 'b.sh', program(dirs, b, [
-    `while [[ ! -e ${JSON.stringify(paused)} ]]; do sleep 0.05; done`,
+    `${waitFor(dirs, paused, 'a')}`,
     // r4: B SIGNALS AT ITS FLIP, not at the end of its publication. A is held inside the round-4 critical
     // section, which holds ${DB_FENCE_RECORD_LOCK} — and B's own record write takes that same lock, so
     // waiting for B to FINISH would be waiting for a lock A has not let go of. The flip needs no lock (a
@@ -862,6 +898,7 @@ test('[o3d-xi3w] a publisher outraced between its pointer flip and its record wr
     'set -uo pipefail',
     `bash ${JSON.stringify(bScript)} > ${JSON.stringify(join(dirs.base, 'b.log'))} 2>&1 &`,
     'bpid=$!',
+    `echo "\${bpid}" > ${JSON.stringify(join(dirs.base, 'b.pid'))}`,
     `bash ${JSON.stringify(aScript)} > ${JSON.stringify(join(dirs.base, 'a.log'))} 2>&1`,
     'wait "${bpid}" 2>/dev/null || true',
   ].join('\n')))
@@ -941,7 +978,7 @@ test('[o3d-xi3w] the record write is a compare-and-swap: a write that loses the 
     '  _rig_resolve "$@"; local rc=$?',
     `  if [[ -e ${JSON.stringify(flipped)} ]] && [[ ! -e ${JSON.stringify(paused)} ]]; then`,
     `    : > ${JSON.stringify(paused)}`,
-    `    while [[ ! -e ${JSON.stringify(bFlipped)} ]]; do sleep 0.05; done`,
+    `    ${waitFor(dirs, bFlipped, 'b')}`,
     '  fi',
     '  return $rc',
     '}',
@@ -953,7 +990,7 @@ test('[o3d-xi3w] the record write is a compare-and-swap: a write that loses the 
     'publish_fence_script_copy; echo "RC=$?"',
   ], [`export IMS_FENCE_SCRIPT_SHA256=${JSON.stringify(sha256Of(checkoutHelper(a)))}`]))
   const bScript = script(dirs, 'b.sh', program(dirs, b, [
-    `while [[ ! -e ${JSON.stringify(paused)} ]]; do sleep 0.05; done`,
+    `${waitFor(dirs, paused, 'a')}`,
     // r4: B SIGNALS AT ITS FLIP, not at the end of its publication. A is held inside the round-4 critical
     // section, which holds ${DB_FENCE_RECORD_LOCK} — and B's own record write takes that same lock, so
     // waiting for B to FINISH would be waiting for a lock A has not let go of. The flip needs no lock (a
@@ -972,6 +1009,7 @@ test('[o3d-xi3w] the record write is a compare-and-swap: a write that loses the 
     'set -uo pipefail',
     `bash ${JSON.stringify(bScript)} > ${JSON.stringify(join(dirs.base, 'b.log'))} 2>&1 &`,
     'bpid=$!',
+    `echo "\${bpid}" > ${JSON.stringify(join(dirs.base, 'b.pid'))}`,
     `bash ${JSON.stringify(aScript)} > ${JSON.stringify(join(dirs.base, 'a.log'))} 2>&1`,
     'wait "${bpid}" 2>/dev/null || true',
   ].join('\n')))
@@ -1540,13 +1578,13 @@ test('[o3d-xi3w] a pre-pointer installation is adopted, so a concurrent migratio
     'echo "AUTHENTICATED=$(file_sha256 "${script}")"',
     // The authentication is complete above this line; the execution is below it.
     `: > ${JSON.stringify(resolved)}`,
-    `i=0; while [[ ! -e ${JSON.stringify(published)} ]]; do i=$((i+1)); (( i > 400 )) && break; sleep 0.05; done`,
+    `${waitFor(dirs, published, 'b')}`,
     'echo "EXECUTED=$(node "${script}" 2>&1)"',
     'echo "EXEC_DIGEST=$(file_sha256 "${script}")"',
     'again="$(db_fence_script_in_use 2>/dev/null)" && echo "AGAIN=${again}" || echo "AGAIN_RC=1"',
   ]))
   const bScript = script(dirs, 'b.sh', program(dirs, other, [
-    `i=0; while [[ ! -e ${JSON.stringify(resolved)} ]]; do i=$((i+1)); (( i > 400 )) && break; sleep 0.05; done`,
+    `${waitFor(dirs, resolved, 'a')}`,
     '_fence_stage_and_publish; echo "B_RC=$?"',
     `: > ${JSON.stringify(published)}`,
   ]))
@@ -1554,6 +1592,7 @@ test('[o3d-xi3w] a pre-pointer installation is adopted, so a concurrent migratio
     'set -uo pipefail',
     `bash ${JSON.stringify(bScript)} > ${JSON.stringify(join(dirs.base, 'b.log'))} 2>&1 &`,
     'bpid=$!',
+    `echo "\${bpid}" > ${JSON.stringify(join(dirs.base, 'b.pid'))}`,
     `bash ${JSON.stringify(aScript)} > ${JSON.stringify(join(dirs.base, 'a.log'))} 2>&1`,
     'wait "${bpid}" 2>/dev/null || true',
   ].join('\n')))

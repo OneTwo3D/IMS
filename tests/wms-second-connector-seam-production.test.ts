@@ -81,6 +81,17 @@ const productSyncLog: string[] = []
  * whatever `getWmsConnector` returns, which is the seam under test.
  */
 const deltaLog: AcmeDeltaLog = { calls: [] }
+/**
+ * THE CLOCK IS PINNED. These tests build watermarks "an hour ago" and "70 minutes ago" and then compare
+ * a wall clock in Acme's zone (America/Los_Angeles) with `>=`. On a real clock that depends on when the
+ * suite runs: across the US fall-back hour the wall clock repeats, so "70 minutes ago" can read LATER
+ * than "an hour ago", and a run that straddles a day boundary in the connector's zone changes the date
+ * half of the cursor mid-test. Only `Date` is faked (timers and I/O stay real), for this file's process.
+ * 20:00 UTC is 13:00 in Los Angeles in June: nowhere near a day boundary or a DST transition, and an
+ * edit here (to 06:59:59Z, say, which is 23:59:59 in Los Angeles) is how the boundary is exercised.
+ */
+const FAKE_NOW_MS = Date.parse('2026-06-15T20:00:00.000Z')
+mock.timers.enable({ apis: ['Date'], now: FAKE_NOW_MS })
 /** Acme's own watermark, and a backlog row that changed 70 minutes ago — inside its real window. */
 const ACME_WATERMARK_AT = new Date(Date.now() - 60 * 60 * 1000)
 const ACME_BACKLOG_CHANGED_AT = new Date(Date.now() - 70 * 60 * 1000)
