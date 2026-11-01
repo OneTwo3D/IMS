@@ -25,7 +25,7 @@
  * cron writes in the same transaction (a rebind clears it), the connected organisation equal to the list's, and a read no older than the drift reader's own staleness limit.
  */
 import { Prisma } from '@/app/generated/prisma/client'
-import { releaseClearedRateMarkers } from '@/lib/tax/retired-tax-code-guard'
+import { lockTaxCodeWrites } from '@/lib/tax/retired-tax-code-guard'
 import { lockStorefrontMappingWrites } from '@/lib/tax/storefront-mapping-write'
 import { effectiveTaxRateFromComponents } from '@/lib/tax/tax-rate-components'
 import { DRIFT_MAX_STALENESS_MS } from '@/lib/domain/accounting/tax-rate-drift-status'
@@ -519,6 +519,8 @@ async function lockAndRecheck(tx: Client, row: { id: string; identity: string },
  */
 export async function writePurchaseTaxImport(tx: Client, plan: PurchaseTaxImportPlan): Promise<PurchaseTaxImportWrite> {
   const result: PurchaseTaxImportWrite = { created: [], suppliersRepointed: 0, mappingsRepointed: 0 }
+  // The selection lock FIRST (the caller's connection fence already holds it; this keeps the order if a caller does not): the enqueue guard reads rate codes under it (lib/tax/retired-tax-code-guard.ts).
+  await lockTaxCodeWrites(tx)
   // A mapping write takes the shared storefront-mapping lock FIRST, before any row lock (the WooCommerce tax-rate apply holds it exclusively while it re-reads ownership and sends).
   if (plan.creates.some((c) => c.replaces !== null)) await lockStorefrontMappingWrites(tx)
   // Every existing row this write will replace, narrow or deactivate is locked HERE, in ONE statement in ascending id (the lock order of lib/tax/writable-tax-rate.ts), so an order writer that holds
@@ -551,8 +553,6 @@ export async function writePurchaseTaxImport(tx: Client, plan: PurchaseTaxImport
     })
     result.created.push({ id: made.id, create })
   }
-  // A rate that now carries a live code is no longer one a re-key cleared (the marker is dropped in this same transaction, under the selection lock the caller's fence took).
-  await releaseClearedRateMarkers(tx, result.created.map((c) => c.id))
   for (const { id, create } of result.created) {
     if (create.replaces === null) continue
     // A row that became the default rate since the plan is not replaced (the whole write stops, as for a document that appeared).
