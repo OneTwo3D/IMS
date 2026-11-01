@@ -24,6 +24,12 @@ const SENSITIVE_KEY =
 // Keys whose value is a raw query string / fragment: dropped wholesale.
 const QUERY_KEY = /^(query[-_]?string|url\.query|http\.query|http\.query_string|url\.fragment|http\.fragment|url[-_]fragment|fragment)$/i
 
+// Prompt / response / tool payload attributes of AI and MCP spans (gen_ai.request.messages,
+// gen_ai.response.text, ai.prompt, mcp.tool.result.content ...): IMS sends product text to an LLM, and
+// ordinary prose would survive every other rule. Matched wholesale, as belt and braces to dataCollection.
+const AI_PAYLOAD_KEY =
+  /^(gen_ai|ai|mcp|llm)\.([a-z0-9_.-]*[._-])?(messages?|prompts?|input|inputs|output|outputs|text|object|completions?|content|arguments|result|results|instructions|system_instructions)([._-][a-z0-9_.-]*)?$/i
+
 const MAX_DEPTH = 25
 
 // scheme://host/path?query and /relative/path?query -> the query string is replaced (path kept).
@@ -79,7 +85,7 @@ function scrubValue(value: unknown, depth: number, seen: WeakSet<object>): unkno
     if (Array.isArray(value)) return value.map((v) => scrubValue(v, depth + 1, seen))
     const out: Record<string, unknown> = {}
     for (const key of Object.keys(value)) {
-      out[key] = SENSITIVE_KEY.test(key) || QUERY_KEY.test(key)
+      out[key] = SENSITIVE_KEY.test(key) || QUERY_KEY.test(key) || AI_PAYLOAD_KEY.test(key)
         ? FILTERED
         : scrubValue((value as Record<string, unknown>)[key], depth + 1, seen)
     }

@@ -1,6 +1,7 @@
 import * as Sentry from '@sentry/nextjs'
 
 import { dataCollection } from '@/lib/observability/data-collection'
+import { dropContentCapturingIntegrations } from '@/lib/observability/integrations'
 import { scrubBreadcrumb, scrubEvent, scrubSpan } from '@/lib/observability/scrub'
 
 // Browser error tracking (GlitchTip). Off unless NEXT_PUBLIC_SENTRY_DSN is set at build time.
@@ -14,6 +15,7 @@ Sentry.init({
   release: process.env.NEXT_PUBLIC_SENTRY_RELEASE?.trim() || undefined,
   tracesSampleRate: 0.05,
   dataCollection,
+  integrations: dropContentCapturingIntegrations,
   beforeSend: scrubEvent,
   beforeSendTransaction: scrubEvent,
   // Streamed spans (default) bypass beforeSendTransaction; this is their scrubber.

@@ -265,3 +265,21 @@ test('URL fragments do not survive any carrier; path is kept; "#" in prose is un
   assert.equal(scrubEvent({ message: 'order #173814 SKU ABC-1' })?.message, 'order #173814 SKU ABC-1')
   assert.equal(scrubEvent({ message: 'see /orders/173814 and #5' })?.message, 'see /orders/173814 and #5')
 })
+
+test('AI / MCP payload attributes do not survive a streamed span', () => {
+  const out = scrubSpan({
+    name: 'chat claude',
+    attributes: {
+      'gen_ai.request.messages': '[{"role":"user","content":"Describe SENTINELPROMPT widget"}]',
+      'gen_ai.response.text': 'SENTINELPROMPT is a fine widget',
+      'gen_ai.system_instructions': 'SENTINELPROMPT system',
+      'gen_ai.request.model': 'some-model',
+      'ai.prompt': 'SENTINELPROMPT',
+      'mcp.tool.result.content': 'SENTINELPROMPT',
+      'sentry.note': 'order 173814 SKU ABC-1',
+    },
+  })
+  assert.ok(!json(out).includes('SENTINELPROMPT'))
+  assert.equal(out.attributes['gen_ai.request.model'], 'some-model')
+  assert.equal(out.attributes['sentry.note'], 'order 173814 SKU ABC-1')
+})
