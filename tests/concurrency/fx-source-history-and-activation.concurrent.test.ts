@@ -11,7 +11,8 @@ import { loadEnv } from './po-landed-fixtures'
  *          currency Aelia has not covered; a pin (manual override) in force now covers it
  *   arm 3  the boundary of a switch is taken inside the lock after the wait, so a payment priced during the wait lies before it
  *   arm 4  an unreadable history refuses every lookup (fx_source_history_unreadable)
- *   arm 5  a base-currency change takes the FX lock and is refused under Aelia
+ *   arm 5  a base-currency change takes the FX lock and is refused under Aelia; it compares against the base and lock marker left by a lock holder, not the ones seen before its wait
+ *   arm 6  an unreadable history refuses a source switch and is not rewritten
  * Real Postgres. Mutations: stop appending the history -> arm 1 reads the ECB row; take toggleCurrency / createCurrency out of the lock -> arm 2 activates while the lock is held.
  */
 
@@ -208,9 +209,9 @@ test('switch history keeps the Aelia period on Aelia rows after a switch back; a
   assert.equal((await getFxRateToBase(db, { currency: 'EUR', asOf: new Date() })).isBase, false, 'CONTROL: repaired (absent), the lookup answers again')
 
   // ---- arm 5: a change of the BASE currency under Aelia is refused, and takes the FX lock
-  // the base currency counts as "locked" once ANY master data exists, which the rest of this tier leaves behind: the lock marker is not what is under test, so it reads as unlocked here
+  // the base currency counts as "locked" once ANY master data exists, which the rest of this tier leaves behind: the lock marker is not what is under test, so it is read from the marker alone here
   const realBaseCurrency = await import('@/lib/base-currency')
-  mock.module('@/lib/base-currency', { namedExports: { ...realBaseCurrency, isBaseCurrencyLocked: async () => false } })
+  mock.module('@/lib/base-currency', { namedExports: { ...realBaseCurrency, isBaseCurrencyLocked: async () => (await db.setting.findUnique({ where: { key: 'base_currency_locked' } }))?.value === 'true' } })
   const { updateOrganisation } = await import('@/app/actions/company')
   const orgExisted = await db.organisation.findFirst({ select: { id: true, baseCurrency: true } })
   const orgBefore = orgExisted ?? await db.organisation.create({ data: { name: 'FX test org', baseCurrency: 'GBP' }, select: { id: true, baseCurrency: true } })
@@ -258,6 +259,76 @@ test('switch history keeps the Aelia period on Aelia rows after a switch back; a
   await baseHolder
   assert.equal((await baseChange).success, false, 'the base change saw the committed Aelia source and refused')
   assert.equal((await db.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency, orgBefore.baseCurrency)
+  // the decision is made on what the lock holder left, not on what the request saw before it waited. (a) the holder moves the base to AUD and switches to Aelia; a request to put the base back to GBP
+  // looked like "no change" before the wait, and must be refused after it. The base stays AUD.
+  await reset()
+  await db.setting.deleteMany({ where: { key: 'base_currency_locked' } })
+  let releaseStale: () => void = () => {}
+  const staleGate = new Promise<void>((r) => { releaseStale = r })
+  let staleIn: () => void = () => {}
+  const staleHolderIn = new Promise<void>((r) => { staleIn = r })
+  const staleHolder = withFxTableWriteLock(async (tx) => {
+    staleIn()
+    await staleGate
+    const at = new Date(Date.now() - 1000).toISOString()
+    await tx.organisation.updateMany({ data: { baseCurrency: 'AUD' } })
+    await tx.setting.upsert({ where: { key: 'fx_rate_source' }, create: { key: 'fx_rate_source', value: 'aelia' }, update: { value: 'aelia' } })
+    await tx.setting.upsert({ where: { key: 'fx_rate_source_since' }, create: { key: 'fx_rate_source_since', value: at }, update: { value: at } })
+  })
+  await staleHolderIn
+  const stale = updateOrganisation({ baseCurrency: orgBefore.baseCurrency })
+  assert.ok((await waitingOnAdvisoryLock(db)) >= 1, 'PRECONDITION: the base change waits on the FX table lock')
+  await new Promise((r) => setTimeout(r, 100))
+  releaseStale()
+  await staleHolder
+  const staleResult = await stale
+  assert.equal(staleResult.success, false, 'refused: the base the request compared against was stale')
+  assert.match(staleResult.error ?? '', /Aelia/)
+  assert.equal((await db.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency, 'AUD', 'the base the holder set is untouched')
+  // (b) the holder moves the base and sets the lock marker (source ECB); the request is refused as locked
+  await reset()
+  await db.organisation.updateMany({ data: { baseCurrency: orgBefore.baseCurrency } })
+  await db.setting.deleteMany({ where: { key: 'base_currency_locked' } })
+  let releaseLk: () => void = () => {}
+  const lkGate = new Promise<void>((r) => { releaseLk = r })
+  let lkIn: () => void = () => {}
+  const lkHolderIn = new Promise<void>((r) => { lkIn = r })
+  const lkHolder = withFxTableWriteLock(async (tx) => {
+    lkIn()
+    await lkGate
+    await tx.organisation.updateMany({ data: { baseCurrency: 'AUD' } })
+    await tx.setting.upsert({ where: { key: 'base_currency_locked' }, create: { key: 'base_currency_locked', value: 'true' }, update: { value: 'true' } })
+  })
+  await lkHolderIn
+  const lkReq = updateOrganisation({ baseCurrency: 'EUR' })
+  assert.ok((await waitingOnAdvisoryLock(db)) >= 1, 'PRECONDITION: the base change waits on the FX table lock')
+  await new Promise((r) => setTimeout(r, 100))
+  releaseLk()
+  await lkHolder
+  const lkResult = await lkReq
+  assert.equal(lkResult.success, false)
+  assert.match(lkResult.error ?? '', /locked/)
+  assert.equal((await db.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency, 'AUD')
+  await db.organisation.updateMany({ data: { baseCurrency: orgBefore.baseCurrency } })
+  await db.setting.deleteMany({ where: { key: 'base_currency_locked' } })
+
+  // ---- arm 6: an unreadable history refuses every SOURCE SWITCH and leaves the history untouched
+  await reset()
+  assert.deepEqual(await setFxRateSource('aelia'), { success: true })
+  const goodHistory = (await setting('fx_rate_source_history'))!
+  const badHistories = ['{not json', '[{"source":"gold","since":"2026-10-01T00:00:00Z"}]']
+  for (const bad of badHistories) {
+    await db.setting.update({ where: { key: 'fx_rate_source_history' }, data: { value: bad } })
+    const refusedSwitch = await setFxRateSource('ecb')
+    assert.equal(refusedSwitch.success, false)
+    assert.match(refusedSwitch.error ?? '', /fx_source_history_unreadable/)
+    assert.equal(await setting('fx_rate_source_history'), bad, 'the unreadable history was not rewritten')
+    assert.equal(await setting('fx_rate_source'), 'aelia', 'the source did not change')
+  }
+  await db.setting.update({ where: { key: 'fx_rate_source_history' }, data: { value: goodHistory } })
+  assert.deepEqual(await setFxRateSource('ecb'), { success: true }, 'CONTROL: repaired, the switch goes through')
+  assert.deepEqual(JSON.parse((await setting('fx_rate_source_history'))!).map((h: { source: string }) => h.source), ['aelia', 'ecb'])
+
   // CONTROL: under ECB the change goes through (so the refusals above can fail for the right reason only)
   await reset()
   await db.setting.deleteMany({ where: { key: 'base_currency_locked' } })

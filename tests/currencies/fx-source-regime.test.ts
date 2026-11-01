@@ -3,7 +3,7 @@ import test from 'node:test'
 
 import { getFxRateToBase, resolveFxRatesToBase } from '@/lib/currencies/fx-lookup'
 import { selectFxRateFromRows, type FxRateRow } from '@/lib/currencies/fx-select'
-import { appendFxSourceSwitch, fxRegimeRestrictsAt, fxSourceRegimeFromSettings, parseFxSourceHistory } from '@/lib/currencies/fx-source-regime'
+import { FxSourceHistoryUnreadableError, appendFxSourceSwitch, fxRegimeRestrictsAt, fxSourceRegimeFromSettings, parseFxSourceHistory } from '@/lib/currencies/fx-source-regime'
 import { fakeFxClient, type FakeFxRow } from '@/tests/helpers/fx-fake-client'
 
 /**
@@ -193,4 +193,12 @@ test('an UNREADABLE history refuses every lookup (fx_source_history_unreadable),
   // CONTROL: an absent history, and a readable empty one, behave as before
   assert.equal((await getFxRateToBase(fakeFxClient(rows, 'GBP', { fx_rate_source: 'ecb' }), { currency: 'EUR', asOf: AFTER })).rate.toString(), '1.25')
   assert.equal((await getFxRateToBase(fakeFxClient(rows, 'GBP', { fx_rate_source: 'ecb', fx_rate_source_history: '[]' }), { currency: 'EUR', asOf: AFTER })).rate.toString(), '1.25')
+})
+
+test('history: a switch is REFUSED while a present history is unreadable, and an absent or empty-array one is fine', () => {
+  for (const bad of ['{not json', '{"a":1}', '[{"source":"gold","since":"2026-10-01T00:00:00Z"}]', '[{"source":"ecb","since":"nope"}]', '']) {
+    assert.throws(() => appendFxSourceSwitch(bad, 'aelia', SINCE, 'ecb', at(BACK)), (e: unknown) => e instanceof FxSourceHistoryUnreadableError && e.reason === 'fx_source_history_unreadable' && /fx_source_history_unreadable/.test(e.message), JSON.stringify(bad))
+  }
+  // CONTROL: absent, null and a readable empty history are not faults
+  for (const ok of [undefined, null, '[]']) assert.doesNotThrow(() => appendFxSourceSwitch(ok, 'aelia', SINCE, 'ecb', at(BACK)))
 })

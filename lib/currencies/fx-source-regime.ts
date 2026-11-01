@@ -22,6 +22,20 @@ export function parseFxRateSource(value: string | null | undefined): FxRateSourc
 
 export const FX_RATE_SOURCE_HISTORY_SETTING = 'fx_rate_source_history'
 
+/**
+ * The switch history is present but unreadable (reason fx_source_history_unreadable): every lookup refuses (fxSourceRegimeFromSettings) and every source switch is refused, so the earlier intervals are
+ * never rewritten from a guess. REPAIR IS A MANUAL OPERATOR ACTION (no admin action exists for it): either write a valid JSON array of {"source":"ecb"|"aelia","since":"<ISO instant>"} entries, oldest
+ * first, into the settings row `fx_rate_source_history`, or delete that row to accept "no recorded history" (the regime is then the current source and instant alone, and the next switch seeds the history
+ * from them; earlier Aelia intervals are lost, so only do this when they are known to be none).
+ */
+export class FxSourceHistoryUnreadableError extends Error {
+  readonly reason = 'fx_source_history_unreadable'
+  constructor() {
+    super('fx_source_history_unreadable: the stored FX source switch history is unreadable, so the source was not changed. Repair the settings row fx_rate_source_history (write a valid JSON array of {source, since} entries, oldest first, or delete the row if no Aelia period needs keeping), then try again.')
+    this.name = 'FxSourceHistoryUnreadableError'
+  }
+}
+
 /** One switch of the source: the new source and the instant (ISO) it took effect. */
 export type FxSourceSwitch = { source: FxRateSource; since: string }
 /** A span during which Aelia was the source: [since, until), `until` null while it still is. */
@@ -64,6 +78,8 @@ export function appendFxSourceSwitch(
   at: Date,
 ): string {
   const existing = parseFxSourceHistory(historyValue)
+  // A history that is PRESENT but unreadable is never rewritten: seeding from the current pair would silently drop the earlier Aelia intervals. Every switch is refused until an operator repairs it.
+  if (existing === null && historyValue !== undefined && historyValue !== null) throw new FxSourceHistoryUnreadableError()
   const seeded: FxSourceSwitch[] = existing ?? (parseFxRateSource(currentSource) === 'aelia'
     ? [{ source: 'aelia', since: currentSince && Number.isFinite(new Date(currentSince).getTime()) ? new Date(currentSince).toISOString() : EPOCH_ISO }]
     : [])

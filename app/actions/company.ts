@@ -120,10 +120,15 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
     // old base would become an active foreign currency, neither of them checked for Aelia coverage. Switch the source to ECB first.
     if (updateData.baseCurrency) {
       const code = updateData.baseCurrency
-      const currentBase = existingOrg?.baseCurrency ?? DEFAULT_BASE_CURRENCY
       const refusal = await withFxTableWriteLock(async (tx) => {
-        if (code !== currentBase && (await getFxRateSourceInTx(tx)) === 'aelia') {
-          return `The base currency cannot be changed while the FX source is Aelia: Aelia's rates are quoted against ${currentBase}. Switch the FX source to ECB first.`
+        // EVERYTHING THAT DECIDES IS READ HERE, under the lock: a request that waited for it (behind a source switch or another base change) must not compare against the base or the lock marker it saw
+        // before the wait.
+        const currentBase = (await tx.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency ?? DEFAULT_BASE_CURRENCY
+        if (code !== currentBase) {
+          if ((await getFxRateSourceInTx(tx)) === 'aelia') {
+            return `The base currency cannot be changed while the FX source is Aelia: Aelia's rates are quoted against ${currentBase}. Switch the FX source to ECB first.`
+          }
+          if (await isBaseCurrencyLocked()) return 'Base currency is locked after setup. Reset the database to change it.'
         }
         const existing = await tx.currency.findUnique({ where: { code } })
         if (!existing) {

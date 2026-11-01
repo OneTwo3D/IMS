@@ -9,7 +9,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { getBaseCurrencyCode, getFallbackCurrencyMeta } from '@/lib/base-currency'
 import { fetchAllFxRatesInternal } from '@/lib/currencies/fx-refresh'
-import { appendFxSourceSwitch } from '@/lib/currencies/fx-source-regime'
+import { appendFxSourceSwitch, FxSourceHistoryUnreadableError } from '@/lib/currencies/fx-source-regime'
 import { FX_RATE_SOURCE_HISTORY_SETTING, FX_RATE_SOURCE_SETTING, FX_RATE_SOURCE_SINCE_SETTING, FX_RATE_SOURCES, getFxRateSource, getFxRateSourceInTx, type FxRateSource } from '@/lib/currencies/fx-source'
 
 // ---------------------------------------------------------------------------
@@ -567,7 +567,7 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
       return true
     }, { timeout: AELIA_CUTOVER_TX_TIMEOUT_MS })
   } catch (e) {
-    if (e instanceof FxCutoverRefusedError) return { success: false, error: e.message }
+    if (e instanceof FxCutoverRefusedError || e instanceof FxSourceHistoryUnreadableError) return { success: false, error: e.message }
     throw e
   }
   if (!changed) return { success: true }
