@@ -43,6 +43,10 @@ const DAY = 86_400_000
 const CUTOFF = new Date(Date.now() - DAY)
 const BEFORE = new Date(Date.now() - 3 * DAY)
 const AFTER = new Date(Date.now() - 60_000)
+// A batch's business-event time is its payload DATE at 00:00Z, and a row is live only if that is not before the cut-off. The date must therefore be derived from
+// the same pinned instant as CUTOFF (the UTC date of the moment this file loaded), never from "now" or from AFTER at the moment a test runs: in the first minute after
+// 00:00Z AFTER (60 s ago) is still YESTERDAY, whose midnight precedes the cut-off, and the 'fresh' row was refused as pre-cut-off.
+const BATCH_DATE = new Date(CUTOFF.getTime() + DAY).toISOString().slice(0, 10)
 const xeroLive = (cutoff = CUTOFF) => ({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero', XERO_WRITE_ALLOWED_TENANT: TENANT, XERO_WRITES_LIVE_FROM: cutoff.toISOString().replace(/\.\d+Z$/, 'Z') })
 const wcLive = (cutoff = CUTOFF) => ({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', WC_WRITES_LIVE_FROM: cutoff.toISOString().replace(/\.\d+Z$/, 'Z') })
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -194,7 +198,7 @@ test('DAILY-BATCH RESET: the every-run reset of FAILED batch rows skips a row cr
   t.after(() => cleanupSync(d, tag))
   const make = async (name: string, createdAt: Date) => seedSyncLog(d, `${tag}-${name}`, {
     type: 'DAILY_BATCH_GROUP_B', referenceType: 'DailyBatch', status: 'FAILED', createdAt, retryCount: 3, errorMessage: 'old failure',
-    payload: { date: AFTER.toISOString().slice(0, 10), narration: name, lines: [] },
+    payload: { date: BATCH_DATE, narration: name, lines: [] },
   })
   const old = await make('old', BEFORE)
   const fresh = await make('new', AFTER)

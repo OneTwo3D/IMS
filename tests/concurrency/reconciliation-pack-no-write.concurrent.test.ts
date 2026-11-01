@@ -66,6 +66,8 @@ async function census(): Promise<Census> {
 type Held = string
 const NOTHING_HELD: Held = ''
 let holdCounter = 0
+/** Entries the most recent failed hold's catch put back (tests of the holds read it, to show the failure arrived AFTER the commit). */
+let recoveredByCatch = 0
 const HELD_DDL = `CREATE TABLE IF NOT EXISTS _test_held_rows (run_id text NOT NULL, kind text NOT NULL, table_name text NOT NULL, row_id text NOT NULL, payload jsonb NOT NULL, held_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (run_id, table_name, row_id))`
 
 type Q = import('pg').Client
@@ -111,6 +113,9 @@ async function restoreHeld(client: Q, runFilter: { run: string } | { runs: strin
       if (e.kind === 'token') result = await client.query(`UPDATE accounting_tokens SET connector = $2 WHERE id = $1 AND connector = 'held-' || id`, [e.row_id, e.payload.connector])
       else if (e.kind === 'sync_row') result = await client.query(`UPDATE accounting_sync_logs SET connector = $2 WHERE id = $1 AND connector = 'held-xero'`, [e.row_id, e.payload.connector])
       else if (e.kind === 'first_load') result = await client.query(`INSERT INTO first_load_apply_runs SELECT * FROM jsonb_populate_record(NULL::first_load_apply_runs, $1::jsonb) ON CONFLICT DO NOTHING`, [JSON.stringify(e.payload)])
+      else if (e.kind === 'mintsoft_connection') result = await client.query(`UPDATE wms_connections SET connector = $2 WHERE id = $1 AND connector = 'held-mintsoft'`, [e.row_id, e.payload.connector])
+      else if (e.kind === 'mintsoft_binding') result = await client.query(`UPDATE external_wms_bindings SET connector = $2 WHERE id = $1 AND connector = 'held-mintsoft'`, [e.row_id, e.payload.connector])
+      else if (e.kind === 'mintsoft_link') result = await client.query(`UPDATE wms_product_links SET connector = $2 WHERE id = $1 AND connector = 'held-mintsoft'`, [e.row_id, e.payload.connector])
       else if (e.kind === 'warehouse') result = await client.query(`UPDATE warehouses SET active = true WHERE id = $1 AND NOT active`, [e.row_id])
       else throw new Error(`unknown held kind ${e.kind}`)
       assertRestoredOneRow(e.kind, e.row_id, result.rowCount)
@@ -145,8 +150,11 @@ async function sweepEarlierHolds(except: string): Promise<number> {
  * Hold every foreign Xero token, first-load record and write-shaped Xero sync row aside, recording each original in `_test_held_rows` in the SAME
  * single transaction. With `withWarehouses` the ACTIVE warehouses without a WMS binding are held too (made inactive; the export of the Qoblex test must declare
  * every one of them and carries at most QOBLEX_MAX_LOCATIONS, which the warehouses other files left exceed). `injectFailureAfter` (tests of this helper only) throws inside the transaction after that many holds, which rolls ALL of it back.
+ * `injectFailureAfterCommit` (tests of this helper only) throws right after the hold COMMITS, before the caller has the run id: the catch restores from
+ * the table by the run id this function minted, so the window between the commit and the caller's `try` strands nothing. (The same path covers a COMMIT
+ * whose response is lost: the entries of the run are restored if they were committed and there are none if they were not.)
  */
-async function holdForeignEstate(injectFailureAfter?: number, withWarehouses = false): Promise<Held> {
+async function holdForeignEstate(injectFailureAfter?: number, withWarehouses = false, injectFailureAfterCommit = false): Promise<Held> {
   const runId = `${process.pid}-${++holdCounter}-${Date.now()}`
   await openLease(runId) // BEFORE the sweep and before any entry exists: an entry of this run is never visible without its lease
   try {
@@ -185,12 +193,21 @@ async function holdForeignEstate(injectFailureAfter?: number, withWarehouses = f
         await client.query('ROLLBACK')
         throw error
       }
+      if (injectFailureAfterCommit) throw new Error('injected failure after hold commit')
     })
     const visible = (await withClient((c) => c.query(`SELECT (SELECT count(*) FROM accounting_tokens WHERE connector = 'xero')::int AS t, (SELECT count(*) FROM first_load_apply_runs)::int AS f`))).rows[0]
     assert.deepEqual([visible.t, visible.f], [0, 0], 'precondition: no foreign Xero token or first-load record is visible to the run')
     return runId
   } catch (error) {
-    await closeLease(runId)
+    // The run id is the committed hold's handle and the caller never got it: put back what the table says is held under it (nothing, if the hold
+    // rolled back), and only then give up the lease. A failed restore is reported alongside the original failure, with the entries kept.
+    try {
+      recoveredByCatch = await withClient((client) => restoreHeld(client, { run: runId }))
+    } catch (restoreError) {
+      throw new AggregateError([error, restoreError], `the hold failed and its restore failed too (entries kept for the next sweep): ${String(error)}; ${String(restoreError)}`)
+    } finally {
+      await closeLease(runId)
+    }
     throw error
   }
 }
@@ -204,7 +221,7 @@ async function restoreForeignEstate(runId: Held): Promise<void> {
       const expected = (await client.query(`SELECT count(*)::int AS n FROM _test_held_rows WHERE run_id = $1`, [runId])).rows[0].n as number
       return { restored: await restoreHeld(client, { run: runId }), expected }
     })
-    assert.equal(restored, expected, 'every foreign Xero token, first-load record and write-shaped sync row was put back')
+    assert.equal(restored, expected, 'every held row (Xero tokens, first-load records, write-shaped sync rows, warehouses, Mintsoft rows) was put back')
     assert.equal((await withClient((c) => c.query(`SELECT count(*)::int AS n FROM _test_held_rows WHERE run_id = $1`, [runId]))).rows[0].n, 0, 'no entry of this run is left')
   } finally {
     await closeLease(runId)
@@ -905,71 +922,115 @@ test('[reconciliation pack] R16 with --vendor-reads-only: the stored (never refr
 const MTAG = `RCMS${process.pid}`
 const MINTSOFT_SETTINGS = ['mintsoft_auth_mode', 'mintsoft_static_api_key', 'mintsoft_client_id']
 
-type MintsoftHeld = { connections: string[]; bindings: string[]; links: string[] }
+const MINTSOFT_TABLES = [['mintsoft_connection', 'wms_connections'], ['mintsoft_binding', 'external_wms_bindings'], ['mintsoft_link', 'wms_product_links']] as const
 type SqlFn = (text: string, values?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount: number | null }>
-const MINTSOFT_TABLES = [['connections', 'wms_connections'], ['bindings', 'external_wms_bindings'], ['links', 'wms_product_links']] as const
 /**
- * Hold every Mintsoft connection, binding and product link aside (renamed, never deleted, so no cascade fires), in three COMMITTED statements. The ids
- * go into `held` right after EACH update, so a failure in the second or third leaves the first's ids recorded and the restore puts them back.
- * `injectFailureAfter` (tests of this helper only) throws after that many updates.
+ * Hold every Mintsoft connection, binding and product link aside (renamed, never deleted, so no cascade fires), one COMMITTED transaction per table.
+ * The original row (id and value) goes into the durable, leased `_test_held_rows` in the SAME transaction as each UPDATE, so there is never a committed
+ * rename without its recovery record: a crash, a failure, or an UPDATE whose response is lost leaves a record the restore (or the next hold's sweep)
+ * works from, never a value held in memory. Returns the run id to pass to `restoreForeignEstate`.
+ * `injectFailureAfter` throws after that many tables are held; `loseResponseOfTable` (1-based) commits that table's hold and then throws as if the
+ * response had never arrived. Both are for tests of this helper only.
  */
-async function holdMintsoftRows(sql: SqlFn, held: MintsoftHeld, injectFailureAfter?: number): Promise<void> {
-  let done = 0
-  for (const [field, table] of MINTSOFT_TABLES) {
-    held[field] = (await sql(`UPDATE ${table} SET connector = 'held-' || connector WHERE connector = 'mintsoft' RETURNING id`)).rows.map((r) => r.id as string)
-    done += 1
-    if (injectFailureAfter !== undefined && done >= injectFailureAfter) throw new Error('injected failure after Mintsoft hold')
+async function holdMintsoftRows(injectFailureAfter?: number, loseResponseOfTable?: number): Promise<Held> {
+  const runId = `${process.pid}-${++holdCounter}-${Date.now()}`
+  await openLease(runId)
+  try {
+    await sweepEarlierHolds(runId)
+    let done = 0
+    for (const [kind, table] of MINTSOFT_TABLES) {
+      await withClient(async (client) => {
+        await client.query('BEGIN')
+        try {
+          await client.query(HELD_DDL)
+          for (const row of (await client.query(`SELECT id, to_jsonb(t) AS j FROM ${table} t WHERE connector = 'mintsoft' ORDER BY id FOR UPDATE`)).rows as Array<{ id: string; j: unknown }>) {
+            await client.query(`INSERT INTO _test_held_rows (run_id, kind, table_name, row_id, payload) VALUES ($1, $2, $3, $4, $5::jsonb)`, [runId, kind, table, row.id, JSON.stringify(row.j)])
+            await client.query(`UPDATE ${table} SET connector = 'held-' || connector WHERE id = $1 AND connector = 'mintsoft'`, [row.id])
+          }
+          await client.query('COMMIT')
+        } catch (error) {
+          await client.query('ROLLBACK')
+          throw error
+        }
+      })
+      done += 1
+      if (loseResponseOfTable === done) throw new Error('lost the response of the Mintsoft hold update')
+      if (injectFailureAfter !== undefined && done >= injectFailureAfter) throw new Error('injected failure after Mintsoft hold')
+    }
+    return runId
+  } catch (error) {
+    try {
+      recoveredByCatch = await withClient((client) => restoreHeld(client, { run: runId }))
+    } finally {
+      await closeLease(runId)
+    }
+    throw error
   }
-}
-/** Put the held rows back and assert each table took back exactly the rows recorded for it. */
-async function restoreMintsoftRows(sql: SqlFn, held: MintsoftHeld): Promise<void> {
-  const restored = {
-    connections: (await sql(`UPDATE wms_connections SET connector = 'mintsoft' WHERE id = ANY($1) AND connector = 'held-mintsoft'`, [held.connections])).rowCount,
-    bindings: (await sql(`UPDATE external_wms_bindings SET connector = 'mintsoft' WHERE id = ANY($1) AND connector = 'held-mintsoft'`, [held.bindings])).rowCount,
-    links: (await sql(`UPDATE wms_product_links SET connector = 'mintsoft' WHERE id = ANY($1) AND connector = 'held-mintsoft'`, [held.links])).rowCount,
-  }
-  assert.deepEqual(restored, { connections: held.connections.length, bindings: held.bindings.length, links: held.links.length }, 'every held Mintsoft row was restored')
 }
 
-// [mutation: the ids recorded only after all three updates / the restore not asserting its row counts]
-test('[reconciliation pack] the Mintsoft hold records ids after EACH update: a failure in the second update still restores the first, and the restore is counted', { skip: !RUN }, async () => {
+// [mutation: the recovery record written outside the update's transaction / the catch not restoring / the record kept in memory]
+test('[reconciliation pack] the Mintsoft hold is durable: a failure after a committed update, and an UPDATE whose response is lost, both leave nothing held', { skip: !RUN }, async () => {
   const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
   const tag = `RCMH${process.pid}`
-  const outer: MintsoftHeld = { connections: [], bindings: [], links: [] }
+  let outer: Held = NOTHING_HELD
   try {
-    await holdMintsoftRows(sql, outer) // foreign rows other files left: out of the way, put back at the end
+    outer = await holdMintsoftRows() // foreign rows other files left: out of the way, put back at the end (a live lease, so the holds below do not sweep it)
     await sql(`INSERT INTO wms_connections (id, connector, label, "baseUrl", "updatedAt") VALUES ($1, 'mintsoft', $2, 'http://127.0.0.1:1', now())`, [`${tag}-c`, tag])
     await sql(`INSERT INTO warehouses (id, code, name, "updatedAt") VALUES ($1, $2, 'x', now())`, [`${tag}-w`, `${tag}W`])
     await sql(`INSERT INTO external_wms_bindings (id, "connectionId", "warehouseId", connector, "externalWarehouseId", "stockSyncMode", "updatedAt") VALUES ($1, $2, $3, 'mintsoft', '5', 'NOTIFICATION_ONLY', now())`, [`${tag}-b`, `${tag}-c`, `${tag}-w`])
     await sql(`INSERT INTO products (id, sku, name, "updatedAt") VALUES ($1, $2, 'x', now())`, [`${tag}-p`, `${tag}-sku`])
     await sql(`INSERT INTO wms_product_links (id, "productId", connector, "externalProductId", "updatedAt") VALUES ($1, $2, 'mintsoft', '9', now())`, [`${tag}-l`, `${tag}-p`])
-    const connectorOf = async (table: string, id: string) => (await sql(`SELECT connector FROM ${table} WHERE id = $1`, [id])).rows[0]!.connector as string
+    const connectors = async () => ({
+      connection: (await sql(`SELECT connector FROM wms_connections WHERE id = $1`, [`${tag}-c`])).rows[0]!.connector as string,
+      binding: (await sql(`SELECT connector FROM external_wms_bindings WHERE id = $1`, [`${tag}-b`])).rows[0]!.connector as string,
+      link: (await sql(`SELECT connector FROM wms_product_links WHERE id = $1`, [`${tag}-l`])).rows[0]!.connector as string,
+    })
+    const allBack = { connection: 'mintsoft', binding: 'mintsoft', link: 'mintsoft' }
+    const entriesOfOthers = async () => (await sql(`SELECT count(*)::int AS n FROM _test_held_rows WHERE run_id <> $1`, [outer])).rows[0].n as number
+    const leasesBefore = leases.size
 
-    const partial: MintsoftHeld = { connections: [], bindings: [], links: [] }
-    await assert.rejects(holdMintsoftRows(sql, partial, 2), /injected failure after Mintsoft hold/)
-    assert.deepEqual(partial, { connections: [`${tag}-c`], bindings: [`${tag}-b`], links: [] }, 'the two committed updates are recorded, the third never ran')
-    assert.equal(await connectorOf('wms_connections', `${tag}-c`), 'held-mintsoft')
-    assert.equal(await connectorOf('external_wms_bindings', `${tag}-b`), 'held-mintsoft')
-    assert.equal(await connectorOf('wms_product_links', `${tag}-l`), 'mintsoft', 'the third table was not reached')
-    await restoreMintsoftRows(sql, partial)
-    assert.equal(await connectorOf('wms_connections', `${tag}-c`), 'mintsoft')
-    assert.equal(await connectorOf('external_wms_bindings', `${tag}-b`), 'mintsoft')
+    // (a) a failure AFTER two tables' updates committed: their records were written in the same transactions, so the catch restores both from the table.
+    recoveredByCatch = -1
+    await assert.rejects(holdMintsoftRows(2), /injected failure after Mintsoft hold/)
+    assert.equal(recoveredByCatch, 2, 'precondition: two committed updates (the connection and the binding) were held when the failure arrived, and the catch restored them from the table')
+    assert.deepEqual(await connectors(), allBack, 'nothing is left held')
+    assert.equal(await entriesOfOthers(), 0, 'and no recovery record is left')
+    assert.equal(leases.size, leasesBefore, 'and the failed hold released its lease')
 
-    // a failure in the FIRST update records nothing and a restore of that is a no-op
-    const first: MintsoftHeld = { connections: [], bindings: [], links: [] }
-    await assert.rejects(holdMintsoftRows(sql, first, 1), /injected failure/)
-    assert.deepEqual(first, { connections: [`${tag}-c`], bindings: [], links: [] })
-    await restoreMintsoftRows(sql, first)
+    // (b) an UPDATE whose response is lost: the server committed it, the caller never heard. Nothing was recorded in memory, and nothing needs to be.
+    recoveredByCatch = -1
+    await assert.rejects(holdMintsoftRows(undefined, 1), /lost the response/)
+    assert.equal(recoveredByCatch, 1, 'precondition: the update was committed (and recorded) when its response was lost')
+    assert.deepEqual(await connectors(), allBack, 'nothing is left held')
+    assert.equal(await entriesOfOthers(), 0)
+    assert.equal(leases.size, leasesBefore)
 
-    // a restore that cannot put a recorded row back is reported, not skipped
-    await assert.rejects(restoreMintsoftRows(sql, { connections: [`${tag}-c`], bindings: [], links: [] }), /every held Mintsoft row was restored/)
+    // (c) a KILLED run: committed holds, no restore, the lease gone with the process. The next hold's sweep puts them back from the table alone.
+    const killed = await holdMintsoftRows()
+    assert.deepEqual(await connectors(), { connection: 'held-mintsoft', binding: 'held-mintsoft', link: 'held-mintsoft' })
+    assert.equal(await sweepEarlierHolds('some-other-run'), 0, 'while its owner is alive its entries are left alone')
+    await closeLease(killed)
+    assert.equal(await sweepEarlierHolds('some-other-run'), 3, 'the sweep restored the dead run\'s three rows, with their original values, from the table')
+    assert.deepEqual(await connectors(), allBack)
+    assert.equal(await entriesOfOthers(), 0)
+
+    // (d) a restore that cannot put a recorded row back is reported and keeps its entry, not skipped.
+    const stuck = await holdMintsoftRows()
+    await sql(`UPDATE wms_connections SET connector = 'elsewhere' WHERE id = $1`, [`${tag}-c`])
+    await closeLease(stuck)
+    await assert.rejects(sweepEarlierHolds('some-other-run'), /touched 0 rows/)
+    assert.equal(await entriesOfOthers(), 3, 'the entries of the stuck run are all still recorded')
+    await sql(`UPDATE wms_connections SET connector = 'held-mintsoft' WHERE id = $1`, [`${tag}-c`])
+    assert.equal(await sweepEarlierHolds('some-other-run'), 3)
+    assert.deepEqual(await connectors(), allBack)
+    assert.equal(await entriesOfOthers(), 0)
   } finally {
     await sql(`DELETE FROM wms_product_links WHERE id LIKE '${tag}%'`)
     await sql(`DELETE FROM products WHERE id LIKE '${tag}%'`)
     await sql(`DELETE FROM external_wms_bindings WHERE id LIKE '${tag}%'`)
     await sql(`DELETE FROM warehouses WHERE id LIKE '${tag}%'`)
     await sql(`DELETE FROM wms_connections WHERE id LIKE '${tag}%'`)
-    await restoreMintsoftRows(sql, outer)
+    await restoreForeignEstate(outer)
   }
 })
 
@@ -1012,12 +1073,12 @@ test('[reconciliation pack] R1 with --vendor-reads-only: the stored fixed key, G
   const previousMode = process.env.E2E_TEST_MODE
   const previousKeys = { SETTINGS_ENCRYPTION_KEY: process.env.SETTINGS_ENCRYPTION_KEY, ENCRYPTION_KEY: process.env.ENCRYPTION_KEY }
   let stockStamp: string | null = null
-  const heldRows: MintsoftHeld = { connections: [], bindings: [], links: [] }
+  let mintsoftHold: Held = NOTHING_HELD
   try {
     // R1 reads EVERY Mintsoft binding and link, and the tier shares one database across files, so rows other files left behind would be part
     // of this estate. Hold them aside for the duration (their connector name is changed, nothing is deleted, so no cascade can fire) and put
     // them back exactly in the finally block. This is setup and teardown: the no-write census below is taken around the COMMAND only.
-    await holdMintsoftRows(sql, heldRows)
+    mintsoftHold = await holdMintsoftRows()
     const remaining = await sql(`SELECT (SELECT count(*) FROM wms_connections WHERE connector = 'mintsoft')::int AS connections, (SELECT count(*) FROM external_wms_bindings WHERE connector = 'mintsoft')::int AS bindings, (SELECT count(*) FROM wms_product_links WHERE connector = 'mintsoft')::int AS links`)
     assert.deepEqual([remaining.rows[0].connections, remaining.rows[0].bindings, remaining.rows[0].links], [0, 0, 0], 'precondition: no foreign Mintsoft row is visible to the run')
     process.env.E2E_TEST_MODE = '1'
@@ -1116,7 +1177,7 @@ test('[reconciliation pack] R1 with --vendor-reads-only: the stored fixed key, G
     await sql(`DELETE FROM external_wms_bindings WHERE id LIKE '${MTAG}%'`)
     await sql(`DELETE FROM warehouses WHERE id LIKE '${MTAG}%'`)
     await sql(`DELETE FROM wms_connections WHERE id LIKE '${MTAG}%'`)
-    await restoreMintsoftRows(sql, heldRows)
+    await restoreForeignEstate(mintsoftHold)
     await sql(`DELETE FROM settings WHERE key = ANY($1)`, [MINTSOFT_SETTINGS])
     for (const prior of saved) await setting(prior.key, prior.value)
     rmSync(dir, { recursive: true, force: true })
@@ -1501,6 +1562,14 @@ test('[reconciliation pack] the holds are durable: a failure after the first hol
     await assert.rejects(holdForeignEstate(1), /injected failure after hold/)
     assert.equal(leases.size, 0, 'a failed hold released its lease')
     assert.equal(await heldKindsDigest(), before, 'a failed hold changed nothing')
+    assert.equal((await tables()).h, 0); assert.equal(await visibleMine(), baseVisible)
+    // (a1) a failure right AFTER the hold commits and before the caller has the run id (the visibility check, a lost COMMIT response): the hold's own
+    // catch restores by the run id it minted. Without it the rows stayed held with the lease closed and nobody to put them back.
+    recoveredByCatch = -1
+    await assert.rejects(holdForeignEstate(undefined, false, true), /injected failure after hold commit/)
+    assert.equal(recoveredByCatch, entries, 'precondition: every hold had COMMITTED when the failure arrived, and the catch put each back from the table')
+    assert.equal(leases.size, 0, 'a hold that failed after its commit released its lease')
+    assert.equal(await heldKindsDigest(), before, 'nothing is left held')
     assert.equal((await tables()).h, 0); assert.equal(await visibleMine(), baseVisible)
     // (a2) a failure AFTER the commit (the test body throws): the finally restores from the table.
     let held: Held = NOTHING_HELD
