@@ -1859,13 +1859,8 @@ test(
       `a LIVE cycle must still be reported as drift, got: ${JSON.stringify(cycleDrift)}`,
     )
 
-    // CLEAN UP THE CYCLE, and this is load-bearing rather than tidiness.
-    // `detectBomItemCycleInEdges` walks every parent and returns the FIRST cycle it finds ANYWHERE in
-    // the graph -- it is not scoped to the product being written. So this test's deliberate cycle makes
-    // every later BOM import and every later build order fail, in this file and in any sibling sharing
-    // this tier's database, with a message naming two unrelated product ids. Test 7 failed exactly that
-    // way before this cleanup existed. Filed as its own issue, because the same property means one
-    // pre-existing cyclic legacy pair in a real database blocks ALL BOM imports (o3d-zjsb5.9 round 6).
+    // Clean up the cycle so the drift assertions of later tests start from a clean graph. (Writers no
+    // longer depend on this: the cycle walk is scoped to the product being written.)
     await deps.db.bom.update({ where: { id: legacyBom.id }, data: { active: false, productId: null } })
     await deps.db.product.update({ where: { id: legId }, data: { type: 'SIMPLE' } })
     assert.deepEqual(
@@ -2005,5 +2000,125 @@ test(
       where: { id: bom.id }, select: { productId: true },
     })
     assert.equal(stillTheirs.productId, other.id, 'and the other writer keeps its claim')
+  },
+)
+
+/**
+ * THE BOM CYCLE CHECK IS ABOUT THE PRODUCT BEING WRITTEN.
+ *
+ * `detectBomItemCycleInEdges` used to return the first cycle ANYWHERE in the graph, so one unrelated
+ * cyclic pair refused every import and every build order and named two products nobody touched. The
+ * writers now ask only about cycles that pass through the product they wrote. These four tests drive
+ * the real importer against `bom_items`-only edges (the legacy state the old walk tripped over; the
+ * `product_components` check cannot see them).
+ */
+async function seedBomProducts(deps: Deps, ns: string, names: string[]): Promise<Record<string, string>> {
+  const rows = ['sku,name,type,components,stockUnit', `${sku(ns, 'RAW')},Raw,SIMPLE,,each`]
+  for (const name of names) rows.push(`${sku(ns, name)},${name},BOM,${sku(ns, 'RAW')}:1,each`)
+  assert.deepEqual(errorsOf(await deps.importProductsCsv(csv(rows))), [], 'the catalogue must import cleanly')
+  const ids: Record<string, string> = {}
+  for (const name of ['RAW', ...names]) {
+    ids[name] = (await deps.db.product.findUniqueOrThrow({ where: { sku: sku(ns, name) }, select: { id: true } })).id
+  }
+  return ids
+}
+
+/** A bom_items-only edge (no product_components row), on the parent's claimed Bom. Returns its id. */
+async function legacyEdge(deps: Deps, parentId: string, componentId: string): Promise<string> {
+  const bom = await deps.db.bom.findUniqueOrThrow({ where: { productId: parentId }, select: { id: true } })
+  const item = await deps.db.bomItem.create({
+    data: { bomId: bom.id, parentProductId: parentId, componentProductId: componentId, qty: 1, sortOrder: 99 },
+    select: { id: true },
+  })
+  return item.id
+}
+
+const importRecipe = (deps: Deps, ns: string, parent: string, components: string[]) =>
+  deps.importProductsCsv(csv([
+    'sku,name,type,components,stockUnit',
+    `${sku(ns, parent)},${parent},BOM,${components.map((c) => `${sku(ns, c)}:1`).join(';')},each`,
+  ]))
+
+test(
+  'an unrelated pre-existing BOM cycle does not refuse a BOM import; a cycle through the written product still does',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'S1'
+    const ids = await seedBomProducts(deps, NS, ['X', 'Y', 'P', 'Q'])
+    const edges = [await legacyEdge(deps, ids.X, ids.Y), await legacyEdge(deps, ids.Y, ids.X)]
+    try {
+      // The unrelated cyclic pair X <-> Y exists. Writing P (which has nothing to do with it) works.
+      assert.deepEqual(errorsOf(await importRecipe(deps, NS, 'P', ['RAW', 'Q'])), [],
+        'an unrelated cyclic pair must not block this import')
+
+      // Closing a loop through Q -> P is refused, and the message names THAT loop only.
+      edges.push(await legacyEdge(deps, ids.Q, ids.P))
+      const refused = errorsOf(await importRecipe(deps, NS, 'P', ['Q']))
+      assert.ok(refused.length > 0 && refused.some((line) => /circular/i.test(line)), `expected a cycle refusal, got ${JSON.stringify(refused)}`)
+      const text = refused.join('\n')
+      assert.ok(text.includes(ids.P) && text.includes(ids.Q), `the refusal must name the real cycle: ${text}`)
+      assert.ok(!text.includes(ids.X) && !text.includes(ids.Y), `and not the unrelated pair: ${text}`)
+      // Rolled back: P keeps the recipe it had (RAW and Q), not the refused one (Q alone).
+      assert.equal(
+        await deps.db.bomItem.count({ where: { parentProductId: ids.P, componentProductId: ids.RAW } }), 1,
+        'the refused recipe must not have been written',
+      )
+    } finally {
+      await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+    }
+  },
+)
+
+test(
+  'a cycle that closes through a deeper descendant is refused, naming every product on it',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'S2'
+    const ids = await seedBomProducts(deps, NS, ['A', 'B', 'C', 'D'])
+    assert.deepEqual(errorsOf(await importRecipe(deps, NS, 'A', ['B'])), [])
+    const edges = [await legacyEdge(deps, ids.B, ids.C), await legacyEdge(deps, ids.C, ids.D)]
+    try {
+      const refused = errorsOf(await importRecipe(deps, NS, 'D', ['A']))
+      const text = refused.join('\n')
+      assert.ok(/circular/i.test(text), `expected a cycle refusal, got ${JSON.stringify(refused)}`)
+      for (const name of ['A', 'B', 'C', 'D']) assert.ok(text.includes(ids[name]), `the cycle must name ${name}: ${text}`)
+      assert.equal(await deps.db.bomItem.count({ where: { parentProductId: ids.D, componentProductId: ids.A } }), 0)
+    } finally {
+      await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+    }
+  },
+)
+
+test(
+  'two concurrent writers that form a BOM cycle TOGETHER: exactly one is refused',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'S3'
+    const ids = await seedBomProducts(deps, NS, ['A', 'B', 'C'])
+    // C -> A lives in bom_items only. Alone, A -> B and B -> C are each fine; together they close
+    // A -> B -> C -> A. Only the in-transaction check, under the graph lock, can see the second write
+    // against the first -- and now it must still do so while scoped to the product it wrote.
+    const edges = [await legacyEdge(deps, ids.C, ids.A)]
+    try {
+      const [first, second] = await Promise.all([
+        importRecipe(deps, NS, 'A', ['B']),
+        importRecipe(deps, NS, 'B', ['C']),
+      ])
+      const refusals = [errorsOf(first), errorsOf(second)].filter((errors) => errors.length > 0)
+      assert.equal(refusals.length, 1, `exactly one writer must be refused, got ${JSON.stringify([errorsOf(first), errorsOf(second)])}`)
+      assert.ok(refusals[0].some((line) => /circular/i.test(line)), JSON.stringify(refusals[0]))
+      const survivors = await deps.db.bomItem.count({
+        where: { OR: [
+          { parentProductId: ids.A, componentProductId: ids.B },
+          { parentProductId: ids.B, componentProductId: ids.C },
+        ] },
+      })
+      assert.equal(survivors, 1, 'only one of the two edges may have committed')
+    } finally {
+      await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+    }
   },
 )

@@ -115,6 +115,52 @@ test('[o3d-zjsb5.9] detectBomItemCycleInEdges terminates on a graph that ALREADY
   )
 })
 
+test('a scoped cycle walk ignores a cycle that does not pass through the written product', () => {
+  const unrelated = [
+    { parentProductId: 'x', componentProductId: 'y' },
+    { parentProductId: 'y', componentProductId: 'x' },
+  ]
+  // The global walk still sees it (drift report, first-load validator)...
+  assert.deepEqual(detectBomItemCycleInEdges(unrelated), ['x', 'y', 'x'])
+  // ...but a write to an unrelated product is not refused because of it.
+  assert.equal(detectBomItemCycleInEdges([...unrelated, { parentProductId: 'a', componentProductId: 'b' }], ['a']), null)
+  assert.equal(detectBomItemCycleAfterReplacement(unrelated, 'a', ['b']), null)
+  // A product that merely points INTO an unrelated cycle does not participate in it, and the walk
+  // must terminate rather than spin in the cycle it reaches.
+  assert.equal(detectBomItemCycleAfterReplacement(unrelated, 'a', ['x']), null)
+})
+
+test('a scoped cycle walk refuses a loop through the written product and names that loop', () => {
+  const unrelated = [
+    { parentProductId: 'x', componentProductId: 'y' },
+    { parentProductId: 'y', componentProductId: 'x' },
+  ]
+  // Direct: a -> b, b -> a.
+  assert.deepEqual(
+    detectBomItemCycleInEdges([...unrelated, { parentProductId: 'a', componentProductId: 'b' }, { parentProductId: 'b', componentProductId: 'a' }], ['a']),
+    ['a', 'b', 'a'],
+  )
+  // Self-loop.
+  assert.deepEqual(detectBomItemCycleAfterReplacement(unrelated, 'a', ['a']), ['a', 'a'])
+})
+
+test('a scoped cycle walk refuses a loop that closes through a deeper descendant', () => {
+  // a -> b -> c -> d already exist; writing d -> a closes a four-product loop, and so does writing
+  // a -> b when the chain below it already leads back to a.
+  const chain = [
+    { parentProductId: 'b', componentProductId: 'c' },
+    { parentProductId: 'c', componentProductId: 'd' },
+    { parentProductId: 'd', componentProductId: 'a' },
+    { parentProductId: 'x', componentProductId: 'x' },
+  ]
+  assert.deepEqual(detectBomItemCycleAfterReplacement(chain, 'a', ['b']), ['a', 'b', 'c', 'd', 'a'])
+  // A branch that dead-ends before it returns must not hide the branch that does.
+  assert.deepEqual(
+    detectBomItemCycleAfterReplacement([...chain, { parentProductId: 'b', componentProductId: 'dead' }], 'a', ['dead', 'b']),
+    ['a', 'b', 'c', 'd', 'a'],
+  )
+})
+
 test('[o3d-zjsb5.9] the dry-run cycle check asks about the graph AFTER the parent is replaced', () => {
   const edges = [
     { parentProductId: 'table', componentProductId: 'leg' },
@@ -126,7 +172,7 @@ test('[o3d-zjsb5.9] the dry-run cycle check asks about the graph AFTER the paren
   assert.equal(detectBomItemCycleAfterReplacement(edges, 'table', ['raw']), null)
   // Making leg require table closes leg -> table -> leg. The old edges for `leg` are gone, so this
   // cycle can only be seen by considering the PROPOSED ones.
-  assert.deepEqual(detectBomItemCycleAfterReplacement(edges, 'leg', ['table']), ['table', 'leg', 'table'])
+  assert.deepEqual(detectBomItemCycleAfterReplacement(edges, 'leg', ['table']), ['leg', 'table', 'leg'])
 })
 
 // ---------------------------------------------------------------------------
@@ -318,7 +364,26 @@ test('[o3d-zjsb5.9] a recipe that closes a bom_items cycle is REFUSED', async ()
   })
 
   assert.equal(outcome.kind, 'cycle')
-  assert.deepEqual(outcome.kind === 'cycle' ? outcome.path : null, ['table', 'leg', 'table'])
+  assert.deepEqual(outcome.kind === 'cycle' ? outcome.path : null, ['leg', 'table', 'leg'])
+})
+
+test('an unrelated cyclic pair in bom_items does not refuse a recipe write; the write itself is judged', async () => {
+  const unrelated: FakeItem[] = [
+    { bomId: 'bom-x', parentProductId: 'x', componentProductId: 'y', qty: 1, sortOrder: 0 },
+    { bomId: 'bom-y', parentProductId: 'y', componentProductId: 'x', qty: 1, sortOrder: 0 },
+  ]
+  const fake = fakeSyncClient({ items: unrelated })
+  const ok = await syncBomRecipeFromProductComponents(fake.client, {
+    productId: 'table', sku: 'TABLE-01', components: [{ componentProductId: 'leg', qty: 1 }],
+  })
+  assert.equal(ok.kind, 'written')
+
+  // And a write that DOES close a loop is still refused, naming its own loop and not the unrelated one.
+  const refused = await syncBomRecipeFromProductComponents(fake.client, {
+    productId: 'leg', sku: 'LEG-01', components: [{ componentProductId: 'table', qty: 1 }],
+  })
+  assert.equal(refused.kind, 'cycle')
+  assert.deepEqual(refused.kind === 'cycle' ? refused.path : null, ['leg', 'table', 'leg'])
 })
 
 test('[o3d-zjsb5.9] the cycle question is asked AFTER the write, on the graph being committed', async () => {

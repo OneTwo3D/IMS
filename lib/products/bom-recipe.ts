@@ -125,9 +125,19 @@ export function compareRecipes(
  * hang/blow-up risk in a reader that has no cycle check of its own.
  *
  * Returns the cycle as a product-id path (first id repeated at the end), or `null`.
+ *
+ * SCOPE. Without `throughProductIds` the walk is GLOBAL: it returns the first cycle anywhere in the graph,
+ * which is the right question for an operator report ({@link findBomRecipeDrift}) and for the first-load
+ * validator. A WRITER must not ask it: one unrelated cyclic pair would refuse every BOM import and build
+ * order for every product and name two products nobody touched. With `throughProductIds` only cycles that
+ * PASS THROUGH one of those products are reported -- the walk starts at each of them and looks for a path
+ * back to it, so a write that closes a loop through the product (directly or via any depth of
+ * descendants) is refused, naming that loop, while a cycle elsewhere in the graph is none of its business.
+ * Callers pass the products whose edges they just wrote or are about to write.
  */
 export function detectBomItemCycleInEdges(
   edges: Array<{ parentProductId: string; componentProductId: string }>,
+  throughProductIds?: readonly string[],
 ): string[] | null {
   const adjacency = new Map<string, string[]>()
   for (const edge of edges) {
@@ -156,6 +166,30 @@ export function detectBomItemCycleInEdges(
     return null
   }
 
+  if (throughProductIds) {
+    // Scoped: a path from `start` back to `start`. `seen` is per start and dedupes the frontier, so the
+    // walk terminates even when the reachable closure holds a cycle that does not include `start`.
+    for (const start of throughProductIds) {
+      const seen = new Set<string>()
+      const path: string[] = [start]
+      const back = (node: string): string[] | null => {
+        for (const next of adjacency.get(node) ?? []) {
+          if (next === start) return [...path, start]
+          if (seen.has(next)) continue
+          seen.add(next)
+          path.push(next)
+          const found = back(next)
+          if (found) return found
+          path.pop()
+        }
+        return null
+      }
+      const found = back(start)
+      if (found) return found
+    }
+    return null
+  }
+
   for (const parent of adjacency.keys()) {
     const found = walk(parent)
     if (found) return found
@@ -179,7 +213,7 @@ export function detectBomItemCycleAfterReplacement(
 ): string[] | null {
   const kept = edges.filter((edge) => edge.parentProductId !== parentProductId)
   const proposed = componentProductIds.map((componentProductId) => ({ parentProductId, componentProductId }))
-  return detectBomItemCycleInEdges([...kept, ...proposed])
+  return detectBomItemCycleInEdges([...kept, ...proposed], [parentProductId])
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +401,9 @@ export async function syncBomRecipeFromProductComponents(
     where: PLANNING_REACHABLE_BOM_EDGES,
     select: { parentProductId: true, componentProductId: true },
   })
-  const cycle = detectBomItemCycleInEdges(edges)
+  // Scoped to the product just written: a cycle elsewhere in the graph is not this write's doing and
+  // must not refuse it.
+  const cycle = detectBomItemCycleInEdges(edges, [productId])
   if (cycle) return { kind: 'cycle', path: cycle }
 
   return { kind: 'written', bomId, claimed: claimKind }

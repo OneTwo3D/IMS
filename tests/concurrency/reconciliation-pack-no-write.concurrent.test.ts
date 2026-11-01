@@ -96,6 +96,35 @@ async function leaseIsFree(runId: string): Promise<boolean> {
   })
 }
 
+// A Mintsoft hold renames the row's connector, which FREES its unique slot ((connector, label) on connections, (connector, warehouseId) and
+// (connector, externalWarehouseId) on bindings, (connector, productId) and (connector, externalProductId) on links), and the slot cannot be reserved
+// while the row is hidden from the command's reads. Another writer can take the freed slot before the restore; the restore's UPDATE would then fail
+// with a unique violation and, because the entry is kept, fail again on every later sweep. So the restore cannot be left to conflict: when the
+// original's slot has been taken it moves the row that took it ASIDE (to its own connector `displaced-mintsoft-<id>`, which collides with nothing and
+// is never deleted), then puts the original back with exactly the values it had.
+const MINTSOFT_SLOT_RIVALS: Record<string, { table: string; rivals: string }> = {
+  mintsoft_connection: { table: 'wms_connections', rivals: `label = $3` },
+  mintsoft_binding: { table: 'external_wms_bindings', rivals: `("warehouseId" = $3 OR "externalWarehouseId" = $4)` },
+  mintsoft_link: { table: 'wms_product_links', rivals: `("productId" = $3 OR "externalProductId" = $4)` },
+}
+/** Put one held Mintsoft row back; if another writer has taken its unique slot meanwhile, displace that writer's row first. Returns the restore's result. */
+async function restoreMintsoftRow(client: Q, e: { kind: string; row_id: string; payload: Record<string, unknown> }): Promise<{ rowCount: number | null }> {
+  const { table, rivals } = MINTSOFT_SLOT_RIVALS[e.kind]!
+  const put = () => client.query(`UPDATE ${table} SET connector = $2 WHERE id = $1 AND connector = 'held-mintsoft'`, [e.row_id, e.payload.connector])
+  await client.query('SAVEPOINT restore_mintsoft_row')
+  try {
+    const result = await put()
+    await client.query('RELEASE SAVEPOINT restore_mintsoft_row')
+    return result
+  } catch (error) {
+    if ((error as { code?: string }).code !== '23505') throw error
+    await client.query('ROLLBACK TO SAVEPOINT restore_mintsoft_row')
+  }
+  const slot = e.kind === 'mintsoft_connection' ? [e.payload.label] : e.kind === 'mintsoft_binding' ? [e.payload.warehouseId, e.payload.externalWarehouseId] : [e.payload.productId, e.payload.externalProductId]
+  await client.query(`UPDATE ${table} SET connector = 'displaced-' || connector || '-' || id WHERE connector = $2 AND id <> $1 AND ${rivals}`, [e.row_id, e.payload.connector, ...slot])
+  return put()
+}
+
 /** A restore must change exactly one row: none means the place is taken or the row is gone, more means the match was too wide; either way the entry is kept. */
 function assertRestoredOneRow(kind: string, rowId: string, rowCount: number | null): void {
   if (rowCount !== 1) throw new Error(`restoring held ${kind} ${rowId} touched ${rowCount} rows (expected 1): the entry is kept`)
@@ -113,9 +142,7 @@ async function restoreHeld(client: Q, runFilter: { run: string } | { runs: strin
       if (e.kind === 'token') result = await client.query(`UPDATE accounting_tokens SET connector = $2 WHERE id = $1 AND connector = 'held-' || id`, [e.row_id, e.payload.connector])
       else if (e.kind === 'sync_row') result = await client.query(`UPDATE accounting_sync_logs SET connector = $2 WHERE id = $1 AND connector = 'held-xero'`, [e.row_id, e.payload.connector])
       else if (e.kind === 'first_load') result = await client.query(`INSERT INTO first_load_apply_runs SELECT * FROM jsonb_populate_record(NULL::first_load_apply_runs, $1::jsonb) ON CONFLICT DO NOTHING`, [JSON.stringify(e.payload)])
-      else if (e.kind === 'mintsoft_connection') result = await client.query(`UPDATE wms_connections SET connector = $2 WHERE id = $1 AND connector = 'held-mintsoft'`, [e.row_id, e.payload.connector])
-      else if (e.kind === 'mintsoft_binding') result = await client.query(`UPDATE external_wms_bindings SET connector = $2 WHERE id = $1 AND connector = 'held-mintsoft'`, [e.row_id, e.payload.connector])
-      else if (e.kind === 'mintsoft_link') result = await client.query(`UPDATE wms_product_links SET connector = $2 WHERE id = $1 AND connector = 'held-mintsoft'`, [e.row_id, e.payload.connector])
+      else if (e.kind === 'mintsoft_connection' || e.kind === 'mintsoft_binding' || e.kind === 'mintsoft_link') result = await restoreMintsoftRow(client, e)
       else if (e.kind === 'warehouse') result = await client.query(`UPDATE warehouses SET active = true WHERE id = $1 AND NOT active`, [e.row_id])
       else throw new Error(`unknown held kind ${e.kind}`)
       assertRestoredOneRow(e.kind, e.row_id, result.rowCount)
@@ -1028,6 +1055,47 @@ test('[reconciliation pack] the Mintsoft hold is durable: a failure after a comm
     await sql(`DELETE FROM wms_product_links WHERE id LIKE '${tag}%'`)
     await sql(`DELETE FROM products WHERE id LIKE '${tag}%'`)
     await sql(`DELETE FROM external_wms_bindings WHERE id LIKE '${tag}%'`)
+    await sql(`DELETE FROM warehouses WHERE id LIKE '${tag}%'`)
+    await sql(`DELETE FROM wms_connections WHERE id LIKE '${tag}%'`)
+    await restoreForeignEstate(outer)
+  }
+})
+
+test('[reconciliation pack] a Mintsoft row another writer put into a held row\'s freed unique slot does not block the restore: it is displaced, nothing is deleted, and the original comes back', { skip: !RUN }, async () => {
+  const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
+  const tag = `RCMX${process.pid}`
+  let outer: Held = NOTHING_HELD
+  let inner: Held = NOTHING_HELD
+  try {
+    outer = await holdMintsoftRows() // foreign rows out of the way (a live lease, so the hold below does not sweep it)
+    await sql(`INSERT INTO wms_connections (id, connector, label, "baseUrl", "updatedAt") VALUES ($1, 'mintsoft', $2, 'http://127.0.0.1:1', now())`, [`${tag}-c`, tag])
+    await sql(`INSERT INTO warehouses (id, code, name, "updatedAt") VALUES ($1, $2, 'x', now())`, [`${tag}-w`, `${tag}W`])
+    await sql(`INSERT INTO external_wms_bindings (id, "connectionId", "warehouseId", connector, "externalWarehouseId", "stockSyncMode", "updatedAt") VALUES ($1, $2, $3, 'mintsoft', '5', 'NOTIFICATION_ONLY', now())`, [`${tag}-b`, `${tag}-c`, `${tag}-w`])
+    await sql(`INSERT INTO products (id, sku, name, "updatedAt") VALUES ($1, $2, 'x', now())`, [`${tag}-p`, `${tag}-sku`])
+    await sql(`INSERT INTO wms_product_links (id, "productId", connector, "externalProductId", "updatedAt") VALUES ($1, $2, 'mintsoft', '9', now())`, [`${tag}-l`, `${tag}-p`])
+
+    inner = await holdMintsoftRows()
+    const held = (await sql(`SELECT (SELECT connector FROM wms_connections WHERE id = $1) AS c, (SELECT connector FROM external_wms_bindings WHERE id = $2) AS b, (SELECT connector FROM wms_product_links WHERE id = $3) AS l`, [`${tag}-c`, `${tag}-b`, `${tag}-l`])).rows[0]
+    assert.deepEqual(held, { c: 'held-mintsoft', b: 'held-mintsoft', l: 'held-mintsoft' }, 'precondition: the three rows are held, so their unique slots are free')
+
+    // Another writer takes each freed slot before the restore: same label, same warehouse, same product.
+    await sql(`INSERT INTO wms_connections (id, connector, label, "baseUrl", "updatedAt") VALUES ($1, 'mintsoft', $2, 'http://127.0.0.1:2', now())`, [`${tag}-c2`, tag])
+    await sql(`INSERT INTO external_wms_bindings (id, "connectionId", "warehouseId", connector, "externalWarehouseId", "stockSyncMode", "updatedAt") VALUES ($1, $2, $3, 'mintsoft', '6', 'NOTIFICATION_ONLY', now())`, [`${tag}-b2`, `${tag}-c2`, `${tag}-w`])
+    await sql(`INSERT INTO wms_product_links (id, "productId", connector, "externalProductId", "updatedAt") VALUES ($1, $2, 'mintsoft', '10', now())`, [`${tag}-l2`, `${tag}-p`])
+
+    await restoreForeignEstate(inner) // used to throw "touched 0 rows"/unique violation, and keep the entries for ever
+    inner = NOTHING_HELD
+
+    const back = (await sql(`SELECT (SELECT connector FROM wms_connections WHERE id = $1) AS c, (SELECT connector FROM external_wms_bindings WHERE id = $2) AS b, (SELECT connector FROM wms_product_links WHERE id = $3) AS l`, [`${tag}-c`, `${tag}-b`, `${tag}-l`])).rows[0]
+    assert.deepEqual(back, { c: 'mintsoft', b: 'mintsoft', l: 'mintsoft' }, 'the originals are back with their own connector')
+    const rivals = (await sql(`SELECT (SELECT connector FROM wms_connections WHERE id = $1) AS c, (SELECT connector FROM external_wms_bindings WHERE id = $2) AS b, (SELECT connector FROM wms_product_links WHERE id = $3) AS l`, [`${tag}-c2`, `${tag}-b2`, `${tag}-l2`])).rows[0]
+    assert.deepEqual(rivals, { c: `displaced-mintsoft-${tag}-c2`, b: `displaced-mintsoft-${tag}-b2`, l: `displaced-mintsoft-${tag}-l2` }, 'the rows that took the slots still exist, displaced rather than deleted')
+    assert.equal((await sql(`SELECT count(*)::int AS n FROM _test_held_rows WHERE run_id <> $1`, [outer])).rows[0].n, 0, 'and no recovery record is left')
+  } finally {
+    if (inner !== NOTHING_HELD) await restoreForeignEstate(inner)
+    await sql(`DELETE FROM wms_product_links WHERE id LIKE '${tag}%'`)
+    await sql(`DELETE FROM external_wms_bindings WHERE id LIKE '${tag}%'`)
+    await sql(`DELETE FROM products WHERE id LIKE '${tag}%'`)
     await sql(`DELETE FROM warehouses WHERE id LIKE '${tag}%'`)
     await sql(`DELETE FROM wms_connections WHERE id LIKE '${tag}%'`)
     await restoreForeignEstate(outer)
