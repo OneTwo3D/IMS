@@ -115,7 +115,7 @@ test('[o3d-zjsb5.9] detectBomItemCycleInEdges terminates on a graph that ALREADY
   )
 })
 
-test('a scoped cycle walk ignores a cycle that does not pass through the written product', () => {
+test('a scoped cycle walk ignores a cycle the written product cannot reach', () => {
   const unrelated = [
     { parentProductId: 'x', componentProductId: 'y' },
     { parentProductId: 'y', componentProductId: 'x' },
@@ -125,9 +125,22 @@ test('a scoped cycle walk ignores a cycle that does not pass through the written
   // ...but a write to an unrelated product is not refused because of it.
   assert.equal(detectBomItemCycleInEdges([...unrelated, { parentProductId: 'a', componentProductId: 'b' }], ['a']), null)
   assert.equal(detectBomItemCycleAfterReplacement(unrelated, 'a', ['b']), null)
-  // A product that merely points INTO an unrelated cycle does not participate in it, and the walk
-  // must terminate rather than spin in the cycle it reaches.
-  assert.equal(detectBomItemCycleAfterReplacement(unrelated, 'a', ['x']), null)
+})
+
+test('a scoped cycle walk refuses a product that only POINTS INTO an existing cycle, and terminates', () => {
+  const existing = [
+    { parentProductId: 'x', componentProductId: 'y' },
+    { parentProductId: 'y', componentProductId: 'x' },
+  ]
+  // a is not on the cycle, but exploding a's BOM would reach it and never finish.
+  assert.deepEqual(detectBomItemCycleAfterReplacement(existing, 'a', ['x']), ['x', 'y', 'x'])
+  // Reached through a deeper descendant, the path still starts at the first node of the cycle.
+  assert.deepEqual(
+    detectBomItemCycleAfterReplacement([...existing, { parentProductId: 'b', componentProductId: 'x' }], 'a', ['b']),
+    ['x', 'y', 'x'],
+  )
+  // Pointing at a clean sibling is fine even though the cycle exists.
+  assert.equal(detectBomItemCycleAfterReplacement(existing, 'a', ['c']), null)
 })
 
 test('a scoped cycle walk refuses a loop through the written product and names that loop', () => {

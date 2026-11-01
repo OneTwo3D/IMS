@@ -126,18 +126,18 @@ export function compareRecipes(
  *
  * Returns the cycle as a product-id path (first id repeated at the end), or `null`.
  *
- * SCOPE. Without `throughProductIds` the walk is GLOBAL: it returns the first cycle anywhere in the graph,
+ * SCOPE. Without `fromProductIds` the walk is GLOBAL: it returns the first cycle anywhere in the graph,
  * which is the right question for an operator report ({@link findBomRecipeDrift}) and for the first-load
  * validator. A WRITER must not ask it: one unrelated cyclic pair would refuse every BOM import and build
- * order for every product and name two products nobody touched. With `throughProductIds` only cycles that
- * PASS THROUGH one of those products are reported -- the walk starts at each of them and looks for a path
- * back to it, so a write that closes a loop through the product (directly or via any depth of
- * descendants) is refused, naming that loop, while a cycle elsewhere in the graph is none of its business.
- * Callers pass the products whose edges they just wrote or are about to write.
+ * order for every product and name two products nobody touched. With `fromProductIds` only the component
+ * CLOSURE reachable from those products is walked: any cycle in it is reported (a loop through the product,
+ * or one it merely points into -- exploding its BOM would never terminate either way), while a cycle the
+ * closure cannot reach is none of the write's business. Callers pass the products whose edges they just
+ * wrote or are about to write.
  */
 export function detectBomItemCycleInEdges(
   edges: Array<{ parentProductId: string; componentProductId: string }>,
-  throughProductIds?: readonly string[],
+  fromProductIds?: readonly string[],
 ): string[] | null {
   const adjacency = new Map<string, string[]>()
   for (const edge of edges) {
@@ -166,25 +166,13 @@ export function detectBomItemCycleInEdges(
     return null
   }
 
-  if (throughProductIds) {
-    // Scoped: a path from `start` back to `start`. `seen` is per start and dedupes the frontier, so the
-    // walk terminates even when the reachable closure holds a cycle that does not include `start`.
-    for (const start of throughProductIds) {
-      const seen = new Set<string>()
-      const path: string[] = [start]
-      const back = (node: string): string[] | null => {
-        for (const next of adjacency.get(node) ?? []) {
-          if (next === start) return [...path, start]
-          if (seen.has(next)) continue
-          seen.add(next)
-          path.push(next)
-          const found = back(next)
-          if (found) return found
-          path.pop()
-        }
-        return null
-      }
-      const found = back(start)
+  if (fromProductIds) {
+    // Scoped: only the closure reachable from the written products is walked, so a cycle anywhere else is
+    // never visited. Any cycle IN that closure is returned, including one the written product only points
+    // into: exploding its BOM would never terminate. The path starts at the first node of the cycle the
+    // walk met (the written product itself when it is on the cycle).
+    for (const start of fromProductIds) {
+      const found = walk(start)
       if (found) return found
     }
     return null
@@ -401,8 +389,8 @@ export async function syncBomRecipeFromProductComponents(
     where: PLANNING_REACHABLE_BOM_EDGES,
     select: { parentProductId: true, componentProductId: true },
   })
-  // Scoped to the product just written: a cycle elsewhere in the graph is not this write's doing and
-  // must not refuse it.
+  // Scoped to the closure reachable from the product just written: a cycle that closure cannot reach is not this
+  // write's business and must not refuse it; one it can reach would never terminate when exploded.
   const cycle = detectBomItemCycleInEdges(edges, [productId])
   if (cycle) return { kind: 'cycle', path: cycle }
 

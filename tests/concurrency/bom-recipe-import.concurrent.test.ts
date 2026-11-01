@@ -2008,7 +2008,7 @@ test(
  *
  * `detectBomItemCycleInEdges` used to return the first cycle ANYWHERE in the graph, so one unrelated
  * cyclic pair refused every import and every build order and named two products nobody touched. The
- * writers now ask only about cycles that pass through the product they wrote. These four tests drive
+ * writers now ask only about the closure reachable from the product they wrote (any cycle in it refuses; a cycle it cannot reach does not). These four tests drive
  * the real importer against `bom_items`-only edges (the legacy state the old walk tripped over; the
  * `product_components` check cannot see them).
  */
@@ -2064,6 +2064,29 @@ test(
         await deps.db.bomItem.count({ where: { parentProductId: ids.P, componentProductId: ids.RAW } }), 1,
         'the refused recipe must not have been written',
       )
+    } finally {
+      await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+    }
+  },
+)
+
+test(
+  'a product that only points INTO an existing BOM cycle is refused, naming that cycle',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'S4'
+    const ids = await seedBomProducts(deps, NS, ['X', 'Y', 'P'])
+    const edges = [await legacyEdge(deps, ids.X, ids.Y), await legacyEdge(deps, ids.Y, ids.X)]
+    try {
+      // P is not on the X <-> Y cycle but would reach it: exploding P's BOM would never terminate.
+      const refused = errorsOf(await importRecipe(deps, NS, 'P', ['X']))
+      const text = refused.join('\n')
+      assert.ok(/circular/i.test(text), `expected a cycle refusal, got ${JSON.stringify(refused)}`)
+      assert.ok(text.includes(ids.X) && text.includes(ids.Y), `the refusal must name the cycle it found: ${text}`)
+      assert.equal(await deps.db.bomItem.count({ where: { parentProductId: ids.P, componentProductId: ids.X } }), 0)
+      // A write whose closure is clean is still allowed while the cycle exists.
+      assert.deepEqual(errorsOf(await importRecipe(deps, NS, 'P', ['RAW'])), [])
     } finally {
       await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
     }
