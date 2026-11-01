@@ -10,7 +10,7 @@ import { aeliaAnswer, createFxSourceFakeDb, liveShapedAeliaAnswer, type FakeFxRa
 
 let fake = createFxSourceFakeDb()
 mock.module('@/lib/db', { namedExports: { db: new Proxy({}, { get: (_t, k) => (fake.db as never)[k] }) } })
-mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP' } })
+mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP', resolveBaseCurrencyCode: async () => 'GBP' } })
 
 const load = async () => import('@/lib/currencies/aelia-ingest')
 const sel = async () => import('@/lib/currencies/fx-select')
@@ -23,6 +23,13 @@ const ACTIVE = [
 ]
 const AELIA_TIME = new Date('2026-10-23T23:36:05Z')
 const NOW = new Date('2026-10-24T08:00:00Z')
+
+/** The identity (id and write order) of the latest EUR row: the pin a clear names as the one it set out to clear. */
+function pinOf(): { id: string; seq: number } {
+  fake.rates.forEach((r, i) => { r.id ??= `seed-${i}`; r.seq ??= i + 1 })
+  const latest = fake.rates.filter((r) => r.toCurrency === 'EUR').sort((a, b) => b.fetchedAt.getTime() - a.fetchedAt.getTime() || (b.seq ?? 0) - (a.seq ?? 0))[0]!
+  return { id: latest.id!, seq: latest.seq! }
+}
 
 function reset(seed: Parameters<typeof createFxSourceFakeDb>[0] = {}) {
   // The regular ingest writes only while the source is Aelia (it re-checks inside the lock), so the default state of these tests is the Aelia source.
@@ -41,7 +48,7 @@ test('the stored row is the rate BEFORE markup, exactly; the markup is returned 
   assert.equal(rowOf('USD')[0].rate, '1.336829')
   assert.equal(rowOf('NOK')[0].rate, '12.500597')
   for (const r of fake.rates) {
-    assert.deepEqual(Object.keys(r).sort(), ['fetchedAt', 'fromCurrency', 'manualOverride', 'rate', 'source', 'toCurrency'], 'a stored row has no markup field')
+    assert.deepEqual(Object.keys(r).sort(), ['fetchedAt', 'fromCurrency', 'id', 'manualOverride', 'rate', 'seq', 'source', 'toCurrency'], 'a stored row has no markup field (the id and write order are the fake database\'s)')
     assert.notEqual(r.rate, '1.214344')
     assert.notEqual(r.rate, '1.356829')
     assert.notEqual(r.rate, '12.520597')
@@ -206,22 +213,22 @@ test('clearing an override takes Aelia\'s rate before markup (never frankfurter)
   const pin: FakeFxRateRow = { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.3', fetchedAt: new Date('2026-10-24T01:00:00Z'), source: 'manual', manualOverride: true }
   reset({ rates: [pin] })
   const { clearOverrideFromAelia } = await load()
-  const cleared = await clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW })
+  const cleared = await clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW, expectedPin: pinOf() })
   assert.deepEqual(cleared, { rate: '1.194344', markup: '0.02' })
   const { selectFxRateFromRows } = await sel()
   const picked = selectFxRateFromRows(fake.rates, { baseCurrency: 'GBP', currency: 'EUR', asOf: new Date('2026-10-26T00:00:00Z') })
   assert.equal(picked.rate.toString(), '1.194344')
   assert.equal(picked.manualOverride, false)
   assert.equal(picked.source, 'aelia')
-  await assert.rejects(clearOverrideFromAelia(withRates([{ currency: 'EUR', rate: '0' }]), 'EUR', { now: NOW }), (e: Error & { reason?: string }) => e.reason === 'non_positive_rate')
-  await assert.rejects(clearOverrideFromAelia(withRates([{ currency: 'USD', rate: '1.3' }]), 'EUR', { now: NOW }), (e: Error & { reason?: string }) => e.reason === 'not_listed_by_aelia')
+  await assert.rejects(clearOverrideFromAelia(withRates([{ currency: 'EUR', rate: '0' }]), 'EUR', { now: NOW, expectedPin: pinOf() }), (e: Error & { reason?: string }) => e.reason === 'non_positive_rate')
+  await assert.rejects(clearOverrideFromAelia(withRates([{ currency: 'USD', rate: '1.3' }]), 'EUR', { now: NOW, expectedPin: pinOf() }), (e: Error & { reason?: string }) => e.reason === 'not_listed_by_aelia')
 })
 
 test('every fx_rates write of the ingest happens inside the exclusive lock transaction, after the lock statement', async () => {
   reset({ rates: [{ fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.3', fetchedAt: new Date('2026-10-20T00:00:00Z'), source: 'manual', manualOverride: true }] })
   const { ingestAeliaRates, clearOverrideFromAelia } = await load()
   await ingestAeliaRates(aeliaAnswer(), { now: NOW })
-  await clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW })
+  await clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW, expectedPin: pinOf() })
   const creates = fake.events.filter((e) => e.startsWith('fxRate.create'))
   assert.ok(creates.length >= 3, 'PRECONDITION: rows were written')
   assert.ok(creates.every((e) => e === 'fxRate.create(in lock tx)'), `no write outside the lock: ${creates.join(',')}`)
@@ -353,11 +360,11 @@ test('SOURCE RE-CHECK: clearOverrideFromAelia after the switch back to ECB is re
   const { clearOverrideFromAelia } = await load()
   reset({ rates: [pinRow('EUR', '1.3')] })
   fake.settings.set('fx_rate_source', 'ecb')
-  await assert.rejects(clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW }), (e: Error & { reason?: string }) => e.reason === 'source_changed')
+  await assert.rejects(clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW, expectedPin: pinOf() }), (e: Error & { reason?: string }) => e.reason === 'source_changed')
   assert.equal(fake.rates.length, 1, 'the pin is the only row')
   // CONTROL: under the Aelia source the same call stores the row
   fake.settings.set('fx_rate_source', 'aelia')
-  assert.deepEqual(await clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW }), { rate: '1.194344', markup: '0.02' })
+  assert.deepEqual(await clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW, expectedPin: pinOf() }), { rate: '1.194344', markup: '0.02' })
   assert.equal(fake.rates.length, 2)
 })
 
@@ -376,4 +383,20 @@ test('PINS ARE JUDGED AT THE READ\'S INSTANT: a manual row dated after `now` is 
   // in force exactly at `now`
   reset({ rates: [pinRow('USD', '1.4', NOW.toISOString())] })
   assert.deepEqual((await ingestAeliaRates(answerWithout('USD'), { now: NOW })).pinned, ['USD'])
+})
+
+test('a clear names the EXACT pin it set out to clear (id and write order): a newer row, or a different row, refuses and stores nothing', async () => {
+  const { clearOverrideFromAelia } = await load()
+  reset({ rates: [pinRow('EUR', '1.3')] })
+  const named = pinOf()
+  // a newer pin appears before the clear takes the lock
+  fake.rates.push({ ...pinRow('EUR', '1.8', '2026-10-24T02:00:00Z'), id: 'newer', seq: 99 })
+  await assert.rejects(clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW, expectedPin: named }), (e: Error & { reason?: string }) => e.reason === 'pin_changed')
+  assert.equal(fake.rates.length, 2, 'nothing was stored')
+  // the right id with the wrong write order is not the same row either
+  await assert.rejects(clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW, expectedPin: { id: 'newer', seq: 1 } }), (e: Error & { reason?: string }) => e.reason === 'pin_changed')
+  // the right write order with another id is not the same row either
+  await assert.rejects(clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW, expectedPin: { id: 'other', seq: 99 } }), (e: Error & { reason?: string }) => e.reason === 'pin_changed')
+  // CONTROL: naming the row that is the latest clears it
+  assert.deepEqual(await clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW, expectedPin: { id: 'newer', seq: 99 } }), { rate: '1.194344', markup: '0.02' })
 })

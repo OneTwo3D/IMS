@@ -174,3 +174,18 @@ test('[q0x56.16] a rate fetched the NEXT day never leaks into a date-only paymen
   assert.equal(result.success, true, JSON.stringify(result))
   assert.equal(state.fxJournals[0].payload.settlementRateToBase, 1.3)
 })
+
+test('the paid write records whether paymentDate was a date-only input or an explicit instant (an exact 00:00:00Z instant is told apart)', async () => {
+  state.rates = [usd('1.25', '2026-08-19T09:00:00.000Z'), usd('1.60', '2026-08-20T09:00:00.000Z')]
+  assert.equal((await pay('2026-08-20')).success, true)
+  assert.equal((state.committedPaid[0] as { paidAtExplicitInstant?: Date | null }).paidAtExplicitInstant, null, 'date-only: no explicit instant')
+  state.committedPaid = []
+  state.fxJournals = []
+  state.enqueuedTx = []
+  const explicit = await pay('2026-08-20T00:00:00.000Z')
+  assert.equal(explicit.success, true, JSON.stringify(explicit))
+  const data = state.committedPaid[0] as { paidAt: Date; paidAtExplicitInstant?: Date | null }
+  assert.equal(data.paidAt.toISOString(), '2026-08-20T00:00:00.000Z')
+  assert.equal(data.paidAtExplicitInstant?.toISOString(), '2026-08-20T00:00:00.000Z')
+  assert.equal((state.enqueuedTx[0] as { payload: Record<string, unknown> }).payload.settlementRateToBase, 1.25, 'the payment used the midnight rate, as the report now will')
+})

@@ -1156,3 +1156,13 @@ test('markBillPaid queues the replacement INSIDE the transaction that marks the 
     'the post-transaction, own-transaction enqueue must be gone — that is the gap being closed',
   )
 })
+
+test('the paid write carries the provenance of paidAt (explicit instant, or null for a date-only input)', async () => {
+  const { tx, calls } = mockTx([])
+  const midnight = new Date('2026-06-10T00:00:00.000Z')
+  await markBillPaidSupersedingStaleRegistrations(tx as never, { ...PARAMS, paidAt: midnight, paidAtExplicitInstant: midnight })
+  assert.equal((calls.invoiceUpdateMany[0] as { data: { paidAtExplicitInstant?: Date | null } }).data.paidAtExplicitInstant?.getTime(), midnight.getTime())
+  const second = mockTx([])
+  await markBillPaidSupersedingStaleRegistrations(second.tx as never, { ...PARAMS, paidAt: midnight })
+  assert.equal((second.calls.invoiceUpdateMany[0] as { data: { paidAtExplicitInstant?: Date | null } }).data.paidAtExplicitInstant, null)
+})

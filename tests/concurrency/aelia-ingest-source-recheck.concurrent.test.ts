@@ -108,6 +108,9 @@ test('a switch back to ECB during an in-flight Aelia refresh or override clear w
 
   // ---- arm 3: an override clear in flight when the source goes back to ECB, and one started after it
   await selectAelia()
+  const pinStartedAt = new Date()
+  await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.3', source: 'manual', manualOverride: true, fetchedAt: pinStartedAt } }) // a clear needs a pin in force
+  const pinNow = async () => ({ expectedPin: (await db.fxRate.findFirst({ where: { fromCurrency: 'GBP', toCurrency: 'EUR' }, orderBy: [{ fetchedAt: 'desc' }, { seq: 'desc' }], select: { id: true, seq: true } }))! })
   stamp = stampClear
   arm()
   const clearing = clearManualFxRate('EUR')
@@ -120,14 +123,15 @@ test('a switch back to ECB during an in-flight Aelia refresh or override clear w
   assert.match(cleared.error ?? '', /source_changed/)
   assert.equal(await aeliaRows(stampClear), 0, 'arm 3: the in-flight clear stored no Aelia row')
   await assert.rejects(
-    clearOverrideFromAelia({ ok: true, base: 'GBP', last_update: stampClear.toISOString(), rates: [{ currency: 'EUR', rate: '1.5' }] }, 'EUR'),
+    clearOverrideFromAelia({ ok: true, base: 'GBP', last_update: stampClear.toISOString(), rates: [{ currency: 'EUR', rate: '1.5' }] }, 'EUR', await pinNow()),
     (e: Error & { reason?: string }) => e.reason === 'source_changed',
   )
   assert.equal(await aeliaRows(stampClear), 0, 'arm 3: a clear after the switch back stores nothing either')
   // CONTROL: under the Aelia source the same clear stores its row (dated by the admin action, so not at the stamp: count the newest row instead)
   await selectAelia()
   const before = await db.fxRate.count({ where: { source: 'aelia', toCurrency: 'EUR' } })
-  await clearOverrideFromAelia({ ok: true, base: 'GBP', last_update: stampClear.toISOString(), rates: [{ currency: 'EUR', rate: '1.5' }] }, 'EUR')
+  await clearOverrideFromAelia({ ok: true, base: 'GBP', last_update: stampClear.toISOString(), rates: [{ currency: 'EUR', rate: '1.5' }] }, 'EUR', await pinNow())
   assert.equal(await db.fxRate.count({ where: { source: 'aelia', toCurrency: 'EUR' } }), before + 1, 'CONTROL: the clear stores its row while the source is aelia')
   await db.fxRate.deleteMany({ where: { source: 'aelia', toCurrency: 'EUR', fetchedAt: { gte: startedAt } } })
+  await db.fxRate.deleteMany({ where: { source: 'manual', toCurrency: 'EUR', fetchedAt: pinStartedAt } })
 })

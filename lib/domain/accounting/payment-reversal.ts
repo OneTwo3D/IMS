@@ -963,6 +963,8 @@ export async function markBillPaidSupersedingStaleRegistrations(
   params: {
     invoiceId: string
     paidAt: Date
+    /** `paidAt` itself when it was an explicit instant, null when date-only (the FX gain/loss report reads a stored midnight by it). */
+    paidAtExplicitInstant?: Date | null
     paymentAccountId: string
     paymentAccountName: string
     paymentReference: string | null
@@ -994,6 +996,7 @@ export async function markBillPaidSupersedingStaleRegistrations(
     where: { id: params.invoiceId, paidAt: null },
     data: {
       paidAt: params.paidAt,
+      paidAtExplicitInstant: params.paidAtExplicitInstant ?? null,
       paymentAccountId: params.paymentAccountId,
       paymentAccountName: params.paymentAccountName,
       paymentReference: params.paymentReference,

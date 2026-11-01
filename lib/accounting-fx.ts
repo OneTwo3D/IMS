@@ -185,11 +185,23 @@ export function settlementAsOfFromInput(input: string | Date | null | undefined,
 }
 
 /**
- * A stored settlement date that is EXACTLY midnight UTC is a date-only input that was stored as `new Date('YYYY-MM-DD')`
- * (the payment form and the bill-payment form do this). Reports re-deriving the settlement rate must read it the way the
- * payment did, i.e. as that business day; any other stored value is a real instant.
+ * What to persist beside `paidAt` so a report can tell an explicit instant from a date-only input: the stored instant itself when the input was an explicit instant (anything but a `YYYY-MM-DD`
+ * string), null when it was date-only. A stored `paidAt` of exactly midnight UTC is ambiguous on its own (a date-only input is stored as that midnight, an explicit 00:00:00Z instant is the same value).
  */
-export function settlementAsOfFromStored(paidAt: Date): Date {
+export function explicitSettlementInstant(input: string | Date | null | undefined, stored: Date): Date | null {
+  if (typeof input === 'string' && DATE_ONLY.test(input)) return null
+  return stored
+}
+
+/**
+ * The `asOf` a report must use to re-derive a payment's settlement rate from its stored `paidAt`.
+ *
+ * A stored `paidAt` that is EXACTLY midnight UTC is, absent other evidence, a date-only input that was stored as `new Date('YYYY-MM-DD')` (the payment form and the bill-payment form do this), and
+ * reads as that business day. The evidence is `explicitInstant` (`paidAtExplicitInstant`, see explicitSettlementInstant): when it equals `paidAt` the input WAS an explicit instant, midnight included,
+ * and it is used as the instant, as the payment's own journal did. A value that no longer equals `paidAt` (paidAt changed since) is no evidence. Any other stored value is a real instant.
+ */
+export function settlementAsOfFromStored(paidAt: Date, explicitInstant?: Date | null): Date {
+  if (explicitInstant && explicitInstant.getTime() === paidAt.getTime()) return paidAt
   if (
     paidAt.getUTCHours() === 0 && paidAt.getUTCMinutes() === 0 && paidAt.getUTCSeconds() === 0 && paidAt.getUTCMilliseconds() === 0
   ) return endOfBusinessDateUtc(paidAt)

@@ -21,7 +21,7 @@ type ReadResult = { ok: true; body: unknown } | { ok: false; reason: string; mes
 let readImpl: () => Promise<ReadResult> = async () => ({ ok: true, body: aeliaAnswer() })
 
 mock.module('@/lib/db', { namedExports: { db: new Proxy({}, { get: (_t, k) => (fake.db as never)[k] }) } })
-mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP' } })
+mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP', resolveBaseCurrencyCode: async () => 'GBP' } })
 mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {} } })
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} } })
 mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
@@ -253,7 +253,7 @@ test('wiring: the read sits inside the exclusive lock, is bounded, and the trans
   const src = readFileSync('app/actions/currencies.ts', 'utf8')
   const sw = src.slice(src.indexOf('export async function setFxRateSource'), src.indexOf("  if (!changed) return { success: true }"))
   const lock = sw.indexOf('withFxTableWriteLock(async (tx)')
-  assert.ok(lock > 0 && lock < sw.indexOf('readAeliaRatesFromWc()') && sw.indexOf('readAeliaRatesFromWc()') < sw.indexOf('ingestAeliaRatesInTx(tx') && sw.indexOf('ingestAeliaRatesInTx(tx') < sw.indexOf('FX_RATE_SOURCE_SETTING }'))
+  assert.ok(lock > 0 && lock < sw.indexOf('readAeliaRatesFromWc({ settings') && sw.indexOf('readAeliaRatesFromWc({ settings') < sw.indexOf('ingestAeliaRatesInTx(tx') && sw.indexOf('ingestAeliaRatesInTx(tx') < sw.indexOf('FX_RATE_SOURCE_SETTING }'))
   assert.match(sw, /readWithin\(AELIA_CUTOVER_READ_BOUND_MS/)
   assert.match(sw, /timeout: AELIA_CUTOVER_TX_TIMEOUT_MS/)
   assert.match(sw, /if \(result\.missing\.length\)/)

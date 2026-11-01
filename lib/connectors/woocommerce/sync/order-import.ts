@@ -953,6 +953,7 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
           ? 'Recorded from WooCommerce (paid later than the import): the part of the order total not already covered by earlier receipts'
           : 'Recorded from WooCommerce (the order was imported unpaid and paid later)',
         paidAt,
+        paidAtExplicitInstant: paidAt, // WooCommerce's GMT paid instant is an explicit instant, midnight included (the FX report reads a stored midnight by this)
         settlementRateToBase: settlementRate,
       },
       select: { id: true, amount: true, currency: true, method: true, reference: true, paidAt: true },
@@ -2732,6 +2733,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
               reference: wcOrder.transaction_id || null,
               notes: 'Imported from WooCommerce (paid when the order was imported)',
               paidAt: parseWcGmtInstant(wcOrder.date_paid_gmt as string),
+              paidAtExplicitInstant: parseWcGmtInstant(wcOrder.date_paid_gmt as string), // an explicit instant, midnight included
               settlementRateToBase: importedReceiptSettlementRate === null ? null : Math.round(importedReceiptSettlementRate * 1e8) / 1e8,
             },
             select: { id: true },

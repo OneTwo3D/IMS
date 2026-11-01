@@ -7871,8 +7871,8 @@ async function decideInvoicePaymentFollowUp(
         // was just posted could not have been sent without it - and the INVOICE_PAYMENT poster refuses a foreign payment that lacks one.
         // o3d-q0x56.19: the importer stamps THIS payment's own rate (`_paymentSettlementRateToBase`: the payment date's central rate, or the
         // order's on the same day). When the key is declared it is the only source: an unusable value carries nothing and the central
-        // guard refuses it (foreign_payment_missing_rate), it does NOT fall back to the order's rate. Only a payload queued before the key
-        // existed (no key at all) still reads the order's stored rate.
+        // guard refuses it (foreign_payment_missing_rate), it does NOT fall back to the order's rate. A payload queued before the key
+        // existed (no key at all) is the same: it carries no rate and a foreign payment is refused, never settled at the order's rate.
         ...settlementRateFromPayload(payload),
         method,
         ...(receiptId ? { paymentId: receiptId } : {}),
@@ -7883,9 +7883,9 @@ async function decideInvoicePaymentFollowUp(
 }
 
 export function settlementRateFromPayload(payload: Record<string, unknown>): { settlementRateToBase?: number } {
-  const source = Object.prototype.hasOwnProperty.call(payload, '_paymentSettlementRateToBase')
-    ? payload._paymentSettlementRateToBase
-    : payload.currencyRateToBase
+  // ONLY THE PAYMENT'S OWN RATE. A payload without `_paymentSettlementRateToBase` (queued before the importer stamped it) carries NO settlement rate: the order's rate is the rate of the order's day, and
+  // a later-day payment settled at it would book the wrong gain/loss. The central guard then refuses a foreign payment lacking a rate (foreign_payment_missing_rate); a base-currency payment needs none.
+  const source = payload._paymentSettlementRateToBase
   return isUsableImsRate(source) ? { settlementRateToBase: Number(source) } : {}
 }
 

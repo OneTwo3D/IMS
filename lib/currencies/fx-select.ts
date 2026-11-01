@@ -1,5 +1,5 @@
 import { Prisma } from '@/app/generated/prisma/client'
-import { eligibleUnderAeliaRegime, type FxSourceRegime } from './fx-source-regime'
+import { compareFxRowOrder, eligibleRowsUnderAeliaRegime, fxRegimeRestrictsAt, type FxSourceRegime } from './fx-source-regime'
 
 /**
  * The PURE half of the one exchange-rate lookup (no database, no base-currency module): the closed refusal reasons, the date rule and the row
@@ -16,6 +16,7 @@ export const FX_MISSING_REASONS = [
   'non_finite_rate',
   'ambiguous_rate',
   'no_rate_from_selected_source',
+  'fx_source_history_unreadable',
 ] as const
 export type FxMissingReason = (typeof FX_MISSING_REASONS)[number]
 
@@ -53,6 +54,8 @@ export type FxRateRow = {
   fetchedAt: Date
   source?: string
   manualOverride?: boolean
+  /** Write order (fx_rates.seq): breaks a fetchedAt tie, the later write is the later row. Absent on rows from a source that does not know it. */
+  seq?: bigint | number | null
 }
 
 const CURRENCY_CODE = /^[A-Z]{3}$/
@@ -102,6 +105,7 @@ export function refuse(reason: FxMissingReason, base: string, currency: string, 
     non_positive_rate: `Invalid stored ${base} FX rate for ${currency}`,
     non_finite_rate: `Invalid stored ${base} FX rate for ${currency}`,
     ambiguous_rate: `Ambiguous ${base} FX rate for ${currency} on or before ${when}`,
+    fx_source_history_unreadable: 'The stored FX source switch history is unreadable, so no exchange rate can be chosen safely; every FX lookup is refused until the history is repaired (switching the FX source rewrites it)',
     no_rate_from_selected_source: `The FX source is Aelia and it has given no ${base} rate for ${currency} on or before ${when}; no other source is used`,
   }
   return new MissingFxRateError(message ?? defaults[reason], currency, isValidDate(asOf) ? asOf : undefined, reason, base)
@@ -126,15 +130,26 @@ export function selectFxRateFromRows(
   params: { baseCurrency: string; currency: string; asOf: Date; regime?: FxSourceRegime },
 ): FxRateToBase {
   const { baseCurrency, currency, asOf, regime } = params
+  if (regime?.unreadable) throw refuse('fx_source_history_unreadable', baseCurrency, currency, asOf)
   const inPair = rows.filter(
     (r) => r.fromCurrency === baseCurrency && r.toCurrency === currency && isValidDate(r.fetchedAt) && r.fetchedAt.getTime() <= asOf.getTime(),
   )
-  // THE SOURCE REGIME (fx-source-regime.ts): at or after the Aelia cutover only Aelia rows and manual overrides are eligible; before it, nothing changes.
-  const restricted = regime?.source === 'aelia' && asOf.getTime() >= regime.since.getTime()
-  const candidates = restricted ? inPair.filter(eligibleUnderAeliaRegime) : inPair
+  // THE SOURCE REGIME (fx-source-regime.ts): inside an Aelia interval only Aelia rows and manual overrides IN FORCE (the latest row of the pair across all sources) are eligible; outside every interval, nothing changes.
+  const restricted = fxRegimeRestrictsAt(regime ?? null, asOf)
+  const candidates = restricted ? eligibleRowsUnderAeliaRegime(inPair) : inPair
   if (candidates.length === 0) throw refuse(inPair.length > 0 ? 'no_rate_from_selected_source' : 'no_rate', baseCurrency, currency, asOf)
   const latest = candidates.reduce((max, r) => Math.max(max, r.fetchedAt.getTime()), -Infinity)
-  const tied = candidates.filter((r) => r.fetchedAt.getTime() === latest)
+  let tied = candidates.filter((r) => r.fetchedAt.getTime() === latest)
+  // A TIE ON fetchedAt between a manual override and a non-override row goes to the LATER WRITE (seq): a pin set after a refresh won, and a clear (an ECB or Aelia row) written after a pin cleared it. Rows of one
+  // kind that disagree stay ambiguous, as before; so do rows without a seq.
+  const pins = tied.filter((r) => r.manualOverride === true)
+  const others = tied.filter((r) => r.manualOverride !== true)
+  if (pins.length > 0 && others.length > 0) {
+    const later = (x: FxRateRow, y: FxRateRow) => (compareFxRowOrder(x, y) >= 0 ? x : y)
+    const c = compareFxRowOrder(pins.reduce(later), others.reduce(later))
+    if (c > 0) tied = pins
+    else if (c < 0) tied = others
+  }
   const rates: Prisma.Decimal[] = []
   for (const r of tied) {
     const rate = toRate(r.rate)

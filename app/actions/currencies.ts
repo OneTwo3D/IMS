@@ -1,14 +1,16 @@
 'use server'
 
 import { AELIA_CUTOVER_READ_BOUND_MS, AELIA_CUTOVER_TX_TIMEOUT_MS, FxCutoverRefusedError, cutoverReadMismatches, readWithin } from '@/lib/currencies/aelia-cutover'
-import { withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
+import { fxWriteStamp, withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
 import { revalidatePath } from 'next/cache'
+import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
-import { getBaseCurrencyCode, getFallbackCurrencyMeta } from '@/lib/base-currency'
+import { getBaseCurrencyCode, getFallbackCurrencyMeta, resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { fetchAllFxRatesInternal } from '@/lib/currencies/fx-refresh'
-import { FX_RATE_SOURCE_SETTING, FX_RATE_SOURCE_SINCE_SETTING, FX_RATE_SOURCES, getFxRateSource, getFxRateSourceInTx, type FxRateSource } from '@/lib/currencies/fx-source'
+import { appendFxSourceSwitch, FxSourceHistoryUnreadableError, FxSwitchClockNotPastError, switchInstantAfterLast } from '@/lib/currencies/fx-source-regime'
+import { FX_RATE_SOURCE_HISTORY_SETTING, FX_RATE_SOURCE_SETTING, FX_RATE_SOURCE_SINCE_SETTING, FX_RATE_SOURCES, getFxRateSource, getFxRateSourceInTx, type FxRateSource } from '@/lib/currencies/fx-source'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -38,7 +40,7 @@ export async function getCurrencies(activeOnly = true): Promise<CurrencyRow[]> {
     include: {
       fxRates: {
         where: { fromCurrency: baseCurrency },
-        orderBy: { fetchedAt: 'desc' },
+        orderBy: [{ fetchedAt: 'desc' }, { seq: 'desc' }],
         take: 1,
       },
     },
@@ -85,6 +87,22 @@ export async function getCurrencyRateMap(): Promise<Record<string, number>> {
 // Mutations
 // ---------------------------------------------------------------------------
 
+/**
+ * ACTIVATING A CURRENCY IS SERIALISED WITH THE FX SOURCE SWITCH. The cutover to Aelia checks every ACTIVE foreign currency for Aelia coverage under the exclusive FX table lock; a currency activated
+ * outside that lock between the check and the commit would slip past it and then refuse every lookup. So create and activate take the same lock (withFxTableWriteLock), and while the source is Aelia an
+ * activation needs coverage NOW: the real lookup, under the real regime, must answer with an Aelia row or a manual override (a pin), otherwise it refuses and nothing is written.
+ */
+async function aeliaActivationRefusal(tx: Prisma.TransactionClient, code: string): Promise<string | null> {
+  if ((await getFxRateSourceInTx(tx)) !== 'aelia') return null
+  const baseCurrency = await resolveBaseCurrencyCode(tx)
+  if (code === baseCurrency) return null
+  const { resolveFxRatesToBase } = await import('@/lib/currencies/fx-lookup')
+  const outcome = (await resolveFxRatesToBase(tx, { currencies: [code], asOf: new Date(), baseCurrency })).get(code)
+  if (outcome?.ok) return null
+  const why = outcome && !outcome.ok ? outcome.error.reason : 'no_rate'
+  return `Currency ${code} was not activated: the FX source is Aelia and Aelia has not given a usable rate for ${code} (${why}). Add ${code} in the store's currency switcher so Aelia gives a rate, or pin a manual rate for it first, then activate it.`
+}
+
 export async function createCurrency(input: {
   code: string
   name: string
@@ -95,24 +113,23 @@ export async function createCurrency(input: {
     const code = input.code.toUpperCase().trim()
     if (code.length !== 3) return { success: false, error: 'Currency code must be 3 characters' }
 
-    const exists = await db.currency.findUnique({ where: { code } })
-    if (exists) {
-      // Reactivate if inactive
-      if (!exists.active) {
-        await db.currency.update({ where: { code }, data: { active: true, name: input.name, symbol: input.symbol } })
-        await logActivity({ entityType: 'CURRENCY', entityId: code, tag: 'settings', action: 'created', description: `Added currency: ${code}` })
-        revalidatePath('/settings')
-        return { success: true }
+    const outcome = await withFxTableWriteLock(async (tx): Promise<{ error: string } | { created: boolean }> => {
+      const exists = await tx.currency.findUnique({ where: { code } })
+      if (exists && exists.active) return { error: 'Currency already exists' }
+      const refusal = await aeliaActivationRefusal(tx, code)
+      if (refusal) return { error: refusal }
+      if (exists) {
+        // Reactivate if inactive
+        await tx.currency.update({ where: { code }, data: { active: true, name: input.name, symbol: input.symbol } })
+        return { created: false }
       }
-      return { success: false, error: 'Currency already exists' }
-    }
-
-    await db.currency.create({
-      data: { code, name: input.name, symbol: input.symbol, active: true },
+      await tx.currency.create({ data: { code, name: input.name, symbol: input.symbol, active: true } })
+      return { created: true }
     })
+    if ('error' in outcome) return { success: false, error: outcome.error }
 
-    // Immediately fetch FX rate for this currency
-    await fetchSingleFxRate(code)
+    // Immediately fetch FX rate for a new currency (its own FX lock transaction: it runs after the one above has committed)
+    if (outcome.created) await fetchSingleFxRate(code)
 
     await logActivity({ entityType: 'CURRENCY', entityId: code, tag: 'settings', action: 'created', description: `Added currency: ${code}` })
     revalidatePath('/settings')
@@ -128,7 +145,13 @@ export async function toggleCurrency(code: string, active: boolean): Promise<{ s
   try {
     const baseCurrency = await getBaseCurrencyCode()
     if (code === baseCurrency) return { success: false, error: 'Cannot deactivate base currency' }
-    await db.currency.update({ where: { code }, data: { active } })
+    const refusal = await withFxTableWriteLock(async (tx) => {
+      const found = active ? await aeliaActivationRefusal(tx, code) : null // only an activation needs coverage; switching a currency off never does
+      if (found) return found
+      await tx.currency.update({ where: { code }, data: { active } })
+      return null
+    })
+    if (refusal) return { success: false, error: refusal }
     await logActivity({ entityType: 'CURRENCY', entityId: code, tag: 'settings', action: 'updated', description: `Toggled currency ${code} ${active ? 'on' : 'off'}` })
     revalidatePath('/settings')
     return { success: true }
@@ -170,7 +193,7 @@ async function fetchSingleFxRate(code: string): Promise<number | null> {
     // Re-read the source inside the lock: a switch to Aelia that committed while frankfurter was being asked wins, and the ECB row is not stored.
     const stored = await withFxTableWriteLock(async (tx) => {
       if ((await getFxRateSourceInTx(tx)) === 'aelia') return false
-      await tx.fxRate.create({ data: { fromCurrency: baseCurrency, toCurrency: code, rate } })
+      await tx.fxRate.create({ data: { fromCurrency: baseCurrency, toCurrency: code, rate, fetchedAt: fxWriteStamp() } })
       return true
     })
     if (!stored) return null
@@ -207,7 +230,7 @@ export async function getLatestFxRates(): Promise<FxRateRow[]> {
       "toCurrency", "rate", "fetchedAt", "source", "manualOverride"
     FROM "fx_rates"
     WHERE "fromCurrency" = ${baseCurrency}
-    ORDER BY "toCurrency", "fetchedAt" DESC
+    ORDER BY "toCurrency", "fetchedAt" DESC, "seq" DESC
   `
   return rows.map((r) => ({
     toCurrency: r.toCurrency,
@@ -237,6 +260,7 @@ export async function setManualFxRate(toCurrency: string, rate: number): Promise
       fromCurrency: baseCurrency,
       toCurrency: code,
       rate,
+      fetchedAt: fxWriteStamp(),
       source: 'manual',
       manualOverride: true,
     },
@@ -268,10 +292,18 @@ export async function clearManualFxRate(toCurrency: string): Promise<{ success: 
       import('@/lib/connectors/woocommerce/aelia-rates'),
       import('@/lib/currencies/aelia-ingest'),
     ])
+    // The pin being cleared is read BEFORE the (slow) store read; the clear re-checks inside the lock that it is still the latest row.
+    const pin = await db.fxRate.findFirst({
+      where: { fromCurrency: baseCurrency, toCurrency: code, fetchedAt: { lte: new Date() } },
+      orderBy: [{ fetchedAt: 'desc' }, { seq: 'desc' }],
+      select: { id: true, seq: true, manualOverride: true },
+    })
+    // A clear needs a pin in force to clear. With none there is nothing to do, and a pin set while the store is read below must not be cleared by a request that never saw it.
+    if (!pin || !pin.manualOverride) return { success: false, error: `There is no manual override in force for ${code}; nothing to clear.` }
     const read = await readAeliaRatesFromWc()
     if (!read.ok) return { success: false, error: read.message }
     try {
-      const cleared = await clearOverrideFromAelia(read.body, code)
+      const cleared = await clearOverrideFromAelia(read.body, code, { expectedPin: { id: pin.id, seq: pin.seq } })
       await logActivity({
         entityType: 'SETTING',
         tag: 'settings',
@@ -303,7 +335,7 @@ export async function clearManualFxRate(toCurrency: string): Promise<{ success: 
   }
   const stored = await withFxTableWriteLock(async (tx) => {
     if ((await getFxRateSourceInTx(tx)) === 'aelia') return false
-    await tx.fxRate.create({ data: { fromCurrency: baseCurrency, toCurrency: code, rate: fresh, source: 'frankfurter', manualOverride: false } })
+    await tx.fxRate.create({ data: { fromCurrency: baseCurrency, toCurrency: code, rate: fresh, fetchedAt: fxWriteStamp(), source: 'frankfurter', manualOverride: false } })
     return true
   })
   if (!stored) return { success: false, error: 'The FX source changed to Aelia while this ran; nothing was stored.' }
@@ -388,7 +420,7 @@ export async function getFxHealth(): Promise<FxHealth> {
         SELECT DISTINCT ON ("toCurrency") "toCurrency", "manualOverride"
         FROM "fx_rates"
         WHERE "fromCurrency" = ${baseCurrency}
-        ORDER BY "toCurrency", "fetchedAt" DESC
+        ORDER BY "toCurrency", "fetchedAt" DESC, "seq" DESC
       ) latest
       WHERE latest."manualOverride" = true
     `,
@@ -458,9 +490,12 @@ export async function getFxRateSourceSetting(): Promise<FxRateSource> {
 export async function setFxRateSource(source: string): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
   if (!(FX_RATE_SOURCES as readonly string[]).includes(source)) return { success: false, error: 'Unknown FX source' }
+  // The store's address and secret are read BEFORE the lock and handed to the read: inside the lock transaction nothing may go through the global client (it would need a second pooled connection).
+  let wcSettings: { url: string; secret: string } | undefined
   if (source === 'aelia') {
     const { getSettingValues } = await import('@/lib/settings-store')
     const config = await getSettingValues(['wc_url', 'wc_webhook_secret'])
+    wcSettings = { url: config.get('wc_url') ?? '', secret: config.get('wc_webhook_secret') ?? '' }
     if (!config.get('wc_url') || !config.get('wc_webhook_secret')) {
       return { success: false, error: 'Set the WooCommerce store address and the shared secret first: Aelia is read through the onetwoInventory Helper plugin (1.3.0 or later) on the store.' }
     }
@@ -487,7 +522,7 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
           import('@/lib/connectors/woocommerce/aelia-rates'),
           import('@/lib/currencies/aelia-ingest'),
         ])
-        const read = await readWithin(AELIA_CUTOVER_READ_BOUND_MS, () => readAeliaRatesFromWc())
+        const read = await readWithin(AELIA_CUTOVER_READ_BOUND_MS, () => readAeliaRatesFromWc({ settings: wcSettings }))
         switchedAt = new Date() // the cutover instant is taken AFTER the read (which may have taken seconds), so an Aelia update that landed meanwhile is not 'in the future'
         if (!read.ok) throw new FxCutoverRefusedError(`Aelia's rates could not be read, so the source was not changed (it is still ECB): ${read.message}`)
         let result: Awaited<ReturnType<typeof ingestAeliaRatesInTx>>
@@ -511,13 +546,23 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
         }
         aeliaResult = result
       }
+      // THE BOUNDARY IS TAKEN HERE, inside the lock-holding transaction and after every check, immediately before the writes that commit it: a switch that waited behind an import must not record an
+      // instant from before its wait, or a document recorded during the wait (under the old regime) would later read as the new one. For the Aelia path this is later than the read instant used to date the ingested rows, which is harmless (rows dated earlier are eligible).
+      // The history and the pair are read FIRST: the clock must be strictly past the last boundary recorded, else the switch is refused (see switchInstantAfterLast); a boundary is never moved.
+      const before = await tx.setting.findMany({ where: { key: { in: [FX_RATE_SOURCE_SETTING, FX_RATE_SOURCE_SINCE_SETTING, FX_RATE_SOURCE_HISTORY_SETTING] } }, select: { key: true, value: true } })
+      const prior = (k: string) => before.find((x) => x.key === k)?.value
+      switchedAt = switchInstantAfterLast(new Date(), prior(FX_RATE_SOURCE_HISTORY_SETTING), prior(FX_RATE_SOURCE_SINCE_SETTING))
+      // THE SWITCH HISTORY: one interval boundary per switch, appended in this same transaction (read under the exclusive lock, so two switches cannot interleave). A lookup selects the regime in effect at its
+      // asOf from this list, so a switch back to ECB does not turn an Aelia-period document into an ECB lookup.
+      const history = appendFxSourceSwitch(prior(FX_RATE_SOURCE_HISTORY_SETTING), prior(FX_RATE_SOURCE_SETTING), prior(FX_RATE_SOURCE_SINCE_SETTING), source as FxRateSource, switchedAt)
+      await tx.setting.upsert({ where: { key: FX_RATE_SOURCE_HISTORY_SETTING }, create: { key: FX_RATE_SOURCE_HISTORY_SETTING, value: history }, update: { value: history } })
       await tx.setting.upsert({ where: { key: FX_RATE_SOURCE_SETTING }, create: { key: FX_RATE_SOURCE_SETTING, value: source }, update: { value: source } })
       await tx.setting.upsert({ where: { key: FX_RATE_SOURCE_SINCE_SETTING }, create: { key: FX_RATE_SOURCE_SINCE_SETTING, value: switchedAt.toISOString() }, update: { value: switchedAt.toISOString() } })
       if (source === 'aelia' && aeliaResult) {
         // THE AUTHORITY: with the new source and instant written in this transaction, run the ACTUAL lookup (the one every document and report uses, under the new regime) for every active foreign
         // currency AT the cutover instant. Each must resolve to an Aelia row or a manual override, else the whole transaction rolls back. This is the real rule, not a model of it.
-        const [{ resolveFxRatesToBase }, { getBaseCurrencyCode }] = await Promise.all([import('@/lib/currencies/fx-lookup'), import('@/lib/base-currency')])
-        const baseCode = await getBaseCurrencyCode()
+        const { resolveFxRatesToBase } = await import('@/lib/currencies/fx-lookup')
+        const baseCode = await resolveBaseCurrencyCode(tx)
         const activeForeign = (await tx.currency.findMany({ where: { active: true }, select: { code: true } })).map((c) => c.code).filter((code) => code !== baseCode)
         const outcomes = await resolveFxRatesToBase(tx, { currencies: activeForeign, asOf: switchedAt, baseCurrency: baseCode })
         const failures = [...outcomes].flatMap(([code, o]) => (o.ok ? [] : [`${code} (${o.error.reason})`]))
@@ -535,7 +580,7 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
       return true
     }, { timeout: AELIA_CUTOVER_TX_TIMEOUT_MS })
   } catch (e) {
-    if (e instanceof FxCutoverRefusedError) return { success: false, error: e.message }
+    if (e instanceof FxCutoverRefusedError || e instanceof FxSourceHistoryUnreadableError || e instanceof FxSwitchClockNotPastError) return { success: false, error: e.message }
     throw e
   }
   if (!changed) return { success: true }

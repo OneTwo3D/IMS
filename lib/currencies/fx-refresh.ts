@@ -1,5 +1,5 @@
 import { revalidatePath } from 'next/cache'
-import { withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
+import { fxWriteStamp, withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
@@ -112,7 +112,7 @@ export async function fetchAllFxRatesInternal(): Promise<{
         const rate = rates[code]
         if (typeof rate === 'number' && rate > 0) {
           await tx.fxRate.create({
-            data: { fromCurrency: baseCurrency, toCurrency: code, rate, source: 'frankfurter' },
+            data: { fromCurrency: baseCurrency, toCurrency: code, rate, source: 'frankfurter', fetchedAt: fxWriteStamp() },
           })
           updated.push(code)
         } else {
@@ -285,7 +285,7 @@ async function getActiveOverrideCurrencies(codes: string[]): Promise<Set<string>
     SELECT DISTINCT ON ("toCurrency") "toCurrency", "manualOverride"
     FROM "fx_rates"
     WHERE "toCurrency" = ANY(${codes}::text[])
-    ORDER BY "toCurrency", "fetchedAt" DESC
+    ORDER BY "toCurrency", "fetchedAt" DESC, "seq" DESC
   `
   return new Set(rows.filter((r) => r.manualOverride).map((r) => r.toCurrency))
 }
