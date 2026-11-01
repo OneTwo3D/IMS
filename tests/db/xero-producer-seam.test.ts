@@ -278,16 +278,16 @@ test('THE BOOLEAN ENQUEUE (what every `if (queued)` subledger guard reads): a sh
   const { postingIsOwed } = await import('../../lib/domain/accounting/enqueue-outcome.ts')
   const ids = { shadow: `PSEAM-bool-s-${randomUUID()}`, live: `PSEAM-bool-l-${randomUUID()}` }
   t.after(() => cleanup(d.db, Object.values(ids)))
+  type Reported = { queued: boolean; reason?: 'shadowed' | 'refused' | 'not-configured' | 'already-queued' | 'handled-by-hand' | 'hand-post-deferred' }
   const run = async (referenceId: string) => {
-    let reported: { queued: boolean; reason?: string } | null = null
-    let boolean: boolean | null = null
+    const holder: { reported?: Reported; boolean?: boolean } = {}
     await d.db.$transaction(async (tx: Tx) => {
-      boolean = await d.accounting.queueAccountingSyncTx(tx, {
+      holder.boolean = await d.accounting.queueAccountingSyncTx(tx, {
         type: 'UNEARNED_REV_REVERSAL', connector: 'xero', referenceType: 'CogsEntry', referenceId, payload: payload(referenceId), chartConnector: 'xero',
-        reportOutcome: (outcome: { queued: boolean; reason?: string }) => { reported = outcome },
+        reportOutcome: (outcome: Reported) => { holder.reported = outcome },
       })
     }, { timeout: 60_000, maxWait: 30_000 })
-    return { boolean, reported: reported! as { queued: boolean; reason?: string } }
+    return { boolean: holder.boolean, reported: holder.reported! }
   }
   await withSettings(d.db, async () => {
     const shadow = await withEnv({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' }, () => run(ids.shadow))

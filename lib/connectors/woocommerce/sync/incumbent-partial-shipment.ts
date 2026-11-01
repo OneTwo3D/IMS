@@ -2,7 +2,7 @@
  * THE PRE-CUTOVER RECONCILIATION OF A SPLIT ORDER'S PART: DID THE INCUMBENT WRITER ALREADY RECORD IT AT THE STOREFRONT?
  *
  * A part the WMS despatched BEFORE the WooCommerce live-from instant belongs to the writer that owned the store then (the
- * WooCommerce-Mintsoft plugin): the producer-side hold shadows IMS's partial-shipment push for it for ever, by design
+ * earlier warehouse-sync plugin): the producer-side hold shadows IMS's partial-shipment push for it for ever, by design
  * ("the business event happened before the live-from instant"). Left there, the dispatch sweep read that shadow as a part it
  * could not finish and held the whole order pending for ever, so the IMS shipment never completed.
  *

@@ -111,7 +111,7 @@ test('REFUND OBLIGATIONS: a shadowed enqueue still accounts for the obligation (
     // CONTROL: an enqueue that wrote nothing is still unmet.
     const unmet = await openRefundAccountingObligationLedger([obligation], { activeConnector: async () => 'xero', isTypeEnabledFor: async () => true })
     unmet[arm](obligation, { queued: false, reason: 'refused', connector: 'xero' })
-    assert.throws(() => unmet.settle(), undefined, arm)
+    assert.throws(() => unmet.settle(), /./, arm)
   }
 })
 
