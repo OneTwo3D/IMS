@@ -13,6 +13,7 @@ import { loadEnv } from './po-landed-fixtures'
  *   arm 4  an unreadable history refuses every lookup (fx_source_history_unreadable)
  *   arm 5  a base-currency change takes the FX lock and is refused under Aelia; it compares against the base and lock marker left by a lock holder, not the ones seen before its wait
  *   arm 6  an unreadable history refuses a source switch and is not rewritten
+ *   arm 7  a cleared pin (a newer ECB row over an old manual one) is no pin under Aelia: neither activation nor a lookup uses it; a pin in force still does
  * Real Postgres. Mutations: stop appending the history -> arm 1 reads the ECB row; take toggleCurrency / createCurrency out of the lock -> arm 2 activates while the lock is held.
  */
 
@@ -328,6 +329,30 @@ test('switch history keeps the Aelia period on Aelia rows after a switch back; a
   await db.setting.update({ where: { key: 'fx_rate_source_history' }, data: { value: goodHistory } })
   assert.deepEqual(await setFxRateSource('ecb'), { success: true }, 'CONTROL: repaired, the switch goes through')
   assert.deepEqual(JSON.parse((await setting('fx_rate_source_history'))!).map((h: { source: string }) => h.source), ['aelia', 'ecb'])
+
+  // ---- arm 7: a cleared pin is no pin. Under ECB an operator pins AUD and clears it (a newer ECB row, the old manual row stays); after the switch to Aelia neither activation nor a lookup may use it.
+  await reset()
+  await db.currency.update({ where: { code: 'AUD' }, data: { active: false } })
+  await db.fxRate.deleteMany({ where: { toCurrency: 'AUD' } })
+  const now0 = Date.now()
+  await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'AUD', rate: '1.9', source: 'manual', manualOverride: true, fetchedAt: new Date(now0 - 3000) } })
+  await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'AUD', rate: '1.95', source: 'frankfurter', manualOverride: false, fetchedAt: new Date(now0 - 2000) } })
+  assert.deepEqual(await setFxRateSource('aelia'), { success: true })
+  const clearedActivation = await toggleCurrency('AUD', true)
+  assert.equal(clearedActivation.success, false, 'the cleared pin does not cover the activation')
+  assert.match(clearedActivation.error ?? '', /Aelia/)
+  assert.equal((await db.currency.findUnique({ where: { code: 'AUD' } }))?.active, false)
+  await assert.rejects(getFxRateToBase(db, { currency: 'AUD', asOf: new Date() }), (e: Error & { reason?: string }) => e.reason === 'no_rate_from_selected_source', 'the lookup does not use the old pin either')
+  // an Aelia row, when there is one, answers instead
+  await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'AUD', rate: '2.1', source: 'aelia', manualOverride: false, fetchedAt: new Date(now0 - 500) } })
+  assert.equal((await getFxRateToBase(db, { currency: 'AUD', asOf: new Date() })).rate.toString(), '2.1')
+  await db.fxRate.deleteMany({ where: { toCurrency: 'AUD', source: 'aelia' } })
+  // a pin newer than everything is in force: activation passes and the lookup uses it
+  await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'AUD', rate: '1.7', source: 'manual', manualOverride: true, fetchedAt: new Date(now0 - 100) } })
+  assert.deepEqual(await toggleCurrency('AUD', true), { success: true }, 'a pin in force covers the activation')
+  assert.equal((await getFxRateToBase(db, { currency: 'AUD', asOf: new Date() })).rate.toString(), '1.7')
+  await db.currency.update({ where: { code: 'AUD' }, data: { active: false } })
+  await db.fxRate.deleteMany({ where: { toCurrency: 'AUD' } })
 
   // CONTROL: under ECB the change goes through (so the refusals above can fail for the right reason only)
   await reset()

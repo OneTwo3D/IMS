@@ -121,9 +121,14 @@ export function fxRegimeRestrictsAt(regime: FxSourceRegime, asOf: Date): boolean
   return regime.aelia.some((i) => t >= i.since.getTime() && (i.until === null || t < i.until.getTime()))
 }
 
-/** The one eligibility rule under the Aelia regime. */
-export function eligibleUnderAeliaRegime(row: { source?: string; manualOverride?: boolean }): boolean {
-  return row.source === 'aelia' || row.manualOverride === true
+/**
+ * THE ONE ELIGIBILITY RULE under the Aelia regime, over the rows of ONE pair dated at or before the lookup's asOf. An Aelia row is eligible. A manual override is a PIN only while it is IN FORCE: the LATEST
+ * row of that pair at asOf across ALL sources. A later row of any source, an ECB row included (clearing a pin inserts one), supersedes it, and a superseded pin is as ineligible as any other ECB row. The
+ * lookup (fx-select.ts, fx-lookup.ts), the activation coverage check and the cutover's pin check all go through the lookup, so there is no second definition to drift.
+ */
+export function eligibleRowsUnderAeliaRegime<T extends { fetchedAt: Date; source?: string; manualOverride?: boolean }>(inPair: readonly T[]): T[] {
+  const latestAny = inPair.reduce((max, r) => Math.max(max, r.fetchedAt.getTime()), -Infinity)
+  return inPair.filter((r) => r.source === 'aelia' || (r.manualOverride === true && r.fetchedAt.getTime() === latestAny))
 }
 
 /** Read the regime through any client that can read settings (a Prisma client or transaction; the lookup passes its own, so one snapshot answers both). */

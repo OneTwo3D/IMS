@@ -84,15 +84,21 @@ export async function resolveFxRatesToBase(
     return out
   }
   const restricted = fxRegimeRestrictsAt(regime, asOf)
-  const eligible = { OR: [{ source: 'aelia' }, { manualOverride: true }] }
-  const latest = await client.fxRate.groupBy({
-    by: ['toCurrency'],
-    where: { fromCurrency: base, toCurrency: { in: toQuery }, fetchedAt: { lte: asOf }, ...(restricted ? eligible : {}) },
-    _max: { fetchedAt: true },
+  // Every row the rule can need is read WITHOUT a source filter: the latest row of each currency across all sources (a manual override is in force only if it is this one) and, under the regime, the
+  // latest Aelia row. The eligibility itself is the pure rule (eligibleRowsUnderAeliaRegime), applied by selectFxRateFromRows below.
+  const where = { fromCurrency: base, toCurrency: { in: toQuery }, fetchedAt: { lte: asOf } }
+  const latestAny = await client.fxRate.groupBy({ by: ['toCurrency'], where, _max: { fetchedAt: true } })
+  const latestAelia = restricted ? await client.fxRate.groupBy({ by: ['toCurrency'], where: { ...where, source: 'aelia' }, _max: { fetchedAt: true } }) : []
+  const seen = new Set<string>()
+  const pairs = [...latestAny, ...latestAelia].flatMap((g) => {
+    if (!g._max.fetchedAt) return []
+    const key = `${g.toCurrency}|${g._max.fetchedAt.getTime()}`
+    if (seen.has(key)) return []
+    seen.add(key)
+    return [{ toCurrency: g.toCurrency, fetchedAt: g._max.fetchedAt }]
   })
-  const pairs = latest.flatMap((g) => (g._max.fetchedAt ? [{ toCurrency: g.toCurrency, fetchedAt: g._max.fetchedAt }] : []))
   const rows = pairs.length === 0 ? [] : await client.fxRate.findMany({
-    where: { fromCurrency: base, AND: [{ OR: pairs.map((p) => ({ toCurrency: p.toCurrency, fetchedAt: p.fetchedAt })) }, ...(restricted ? [eligible] : [])] },
+    where: { fromCurrency: base, OR: pairs.map((p) => ({ toCurrency: p.toCurrency, fetchedAt: p.fetchedAt })) },
     select: { fromCurrency: true, toCurrency: true, rate: true, fetchedAt: true, source: true, manualOverride: true },
   })
   for (const currency of toQuery) {
@@ -100,7 +106,7 @@ export async function resolveFxRatesToBase(
       out.set(currency, { ok: true, ...selectFxRateFromRows(rows, { baseCurrency: base, currency, asOf, regime }) })
     } catch (error) {
       if (!isMissingFxRateError(error)) throw error
-      // Under the Aelia regime the query only fetched eligible rows, so "no row" means the selected source has not given this currency.
+      // Under the Aelia regime a pair with no eligible row (only ECB rows, or a superseded pin) is the selected source not having given this currency.
       out.set(currency, { ok: false, error: restricted && error.reason === 'no_rate' ? refuse('no_rate_from_selected_source', base, currency, asOf) : error })
     }
   }

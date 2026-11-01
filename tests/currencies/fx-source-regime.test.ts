@@ -202,3 +202,29 @@ test('history: a switch is REFUSED while a present history is unreadable, and an
   // CONTROL: absent, null and a readable empty history are not faults
   for (const ok of [undefined, null, '[]']) assert.doesNotThrow(() => appendFxSourceSwitch(ok, 'aelia', SINCE, 'ecb', at(BACK)))
 })
+
+test('a manual override is a PIN only while it is the latest row across ALL sources: a later row of any source supersedes it (pin, then clear, then Aelia)', async () => {
+  const pin = row('USD', '1.50', '2026-10-21T12:00:00Z', 'manual', true)
+  const cleared = row('USD', '1.31', '2026-10-22T12:00:00Z') // clearing a pin inserts a newer non-manual (ECB) row and leaves the old manual row
+  const both = [...rows.filter((r) => r.toCurrency !== 'USD'), pin, cleared]
+  // pure selection: the superseded pin is not eligible, and the cleared rate (ECB) is not either, so USD is refused after the cutover
+  assert.throws(() => selectFxRateFromRows(both, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER, regime }), (e: Error & { reason?: string }) => e.reason === 'no_rate_from_selected_source')
+  // database lookup, the same
+  const client = fakeFxClient(both, 'GBP', settings)
+  await assert.rejects(getFxRateToBase(client, { currency: 'USD', asOf: AFTER }), (e: Error & { reason?: string }) => e.reason === 'no_rate_from_selected_source')
+  const many = await resolveFxRatesToBase(client, { currencies: ['USD'], asOf: AFTER })
+  const usd = many.get('USD')
+  assert.ok(usd && !usd.ok && usd.error.reason === 'no_rate_from_selected_source')
+  // an Aelia row, when there is one, answers instead of the old pin
+  const withAelia = [...both, row('USD', '1.40', '2026-10-24T06:00:00Z', 'aelia')]
+  assert.equal((await getFxRateToBase(fakeFxClient(withAelia, 'GBP', settings), { currency: 'USD', asOf: AFTER })).rate.toString(), '1.4')
+  assert.equal(selectFxRateFromRows(withAelia, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER, regime }).rate.toString(), '1.4')
+  // a pin newer than everything is IN FORCE and is used, also over an older Aelia row
+  const pinnedNow = [...withAelia, row('USD', '1.60', '2026-10-25T12:00:00Z', 'manual', true)]
+  assert.equal(selectFxRateFromRows(pinnedNow, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER, regime }).rate.toString(), '1.6')
+  assert.equal((await getFxRateToBase(fakeFxClient(pinnedNow, 'GBP', settings), { currency: 'USD', asOf: AFTER })).manualOverride, true)
+  // a pin superseded by a later ECB row BEFORE the lookup's asOf only: looked up earlier, it was still in force
+  assert.equal(selectFxRateFromRows(both, { baseCurrency: 'GBP', currency: 'USD', asOf: at('2026-10-21T18:00:00Z'), regime: fxSourceRegimeFromSettings('aelia', '2026-10-21T00:00:00Z') }).rate.toString(), '1.5')
+  // CONTROL: outside the regime the plain latest row (the cleared ECB rate) answers
+  assert.equal(selectFxRateFromRows(both, { baseCurrency: 'GBP', currency: 'USD', asOf: AFTER }).rate.toString(), '1.31')
+})

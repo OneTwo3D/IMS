@@ -1,5 +1,5 @@
 import { Prisma } from '@/app/generated/prisma/client'
-import { eligibleUnderAeliaRegime, fxRegimeRestrictsAt, type FxSourceRegime } from './fx-source-regime'
+import { eligibleRowsUnderAeliaRegime, fxRegimeRestrictsAt, type FxSourceRegime } from './fx-source-regime'
 
 /**
  * The PURE half of the one exchange-rate lookup (no database, no base-currency module): the closed refusal reasons, the date rule and the row
@@ -132,9 +132,9 @@ export function selectFxRateFromRows(
   const inPair = rows.filter(
     (r) => r.fromCurrency === baseCurrency && r.toCurrency === currency && isValidDate(r.fetchedAt) && r.fetchedAt.getTime() <= asOf.getTime(),
   )
-  // THE SOURCE REGIME (fx-source-regime.ts): inside an Aelia interval only Aelia rows and manual overrides are eligible; outside every interval, nothing changes.
+  // THE SOURCE REGIME (fx-source-regime.ts): inside an Aelia interval only Aelia rows and manual overrides IN FORCE (the latest row of the pair across all sources) are eligible; outside every interval, nothing changes.
   const restricted = fxRegimeRestrictsAt(regime ?? null, asOf)
-  const candidates = restricted ? inPair.filter(eligibleUnderAeliaRegime) : inPair
+  const candidates = restricted ? eligibleRowsUnderAeliaRegime(inPair) : inPair
   if (candidates.length === 0) throw refuse(inPair.length > 0 ? 'no_rate_from_selected_source' : 'no_rate', baseCurrency, currency, asOf)
   const latest = candidates.reduce((max, r) => Math.max(max, r.fetchedAt.getTime()), -Infinity)
   const tied = candidates.filter((r) => r.fetchedAt.getTime() === latest)
