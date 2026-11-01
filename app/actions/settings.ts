@@ -1,6 +1,7 @@
 'use server'
 
 import { lockTaxRateForEdit } from '@/lib/tax/tax-rate-replaced'
+import { releaseClearedRateMarkers } from '@/lib/tax/retired-tax-code-guard'
 import { revalidatePath } from 'next/cache'
 import { unstable_rethrow } from 'next/navigation'
 import { z } from 'zod'
@@ -419,6 +420,8 @@ export async function updateTaxRate(id: string, input: {
         },
         select: { id: true, name: true, rate: true },
       })
+      // A code assigned here ends a re-key's CLEAR for this rate: its cleared marker is dropped in this same transaction (the fence above took the selection lock before the row lock; lib/tax/retired-tax-code-guard.ts).
+      if (input.accountingTaxType) await releaseClearedRateMarkers(tx, [id])
       if (components !== undefined) {
         await tx.taxRateComponent.deleteMany({ where: { taxRateId: id } })
         if (components.length > 0) {
@@ -568,6 +571,8 @@ export async function autoLinkXeroTaxRates(): Promise<{
         // updateMany with replacedById: null: a rate a tax re-key replaced is never given a code again (lib/tax/tax-rate-replaced.ts).
         await tx.taxRate.updateMany({ where: { id: entry.id, replacedById: null }, data: { accountingTaxType: entry.taxType } })
       }
+      // The mapping ends a re-key's CLEAR for a linked rate: the marker goes in this same transaction (under the selection lock the fence took).
+      await releaseClearedRateMarkers(tx, plan.map((entry) => entry.id))
     })
     linked = plan.length
 
@@ -858,6 +863,7 @@ export async function generateMissingXeroTaxRates(
         await db.$transaction(async (tx) => {
           await assertXeroConnectionUnchanged(tx as never, connection)
           await tx.taxRate.updateMany({ where: { id: rate.id, replacedById: null }, data: { accountingTaxType: res.taxType } })
+          await releaseClearedRateMarkers(tx, [rate.id])
         })
         created++
       } catch (e) {

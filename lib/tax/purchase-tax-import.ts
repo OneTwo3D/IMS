@@ -25,6 +25,7 @@
  * cron writes in the same transaction (a rebind clears it), the connected organisation equal to the list's, and a read no older than the drift reader's own staleness limit.
  */
 import { Prisma } from '@/app/generated/prisma/client'
+import { releaseClearedRateMarkers } from '@/lib/tax/retired-tax-code-guard'
 import { lockStorefrontMappingWrites } from '@/lib/tax/storefront-mapping-write'
 import { effectiveTaxRateFromComponents } from '@/lib/tax/tax-rate-components'
 import { DRIFT_MAX_STALENESS_MS } from '@/lib/domain/accounting/tax-rate-drift-status'
@@ -550,6 +551,8 @@ export async function writePurchaseTaxImport(tx: Client, plan: PurchaseTaxImport
     })
     result.created.push({ id: made.id, create })
   }
+  // A rate that now carries a live code is no longer one a re-key cleared (the marker is dropped in this same transaction, under the selection lock the caller's fence took).
+  await releaseClearedRateMarkers(tx, result.created.map((c) => c.id))
   for (const { id, create } of result.created) {
     if (create.replaces === null) continue
     // A row that became the default rate since the plan is not replaced (the whole write stops, as for a document that appeared).

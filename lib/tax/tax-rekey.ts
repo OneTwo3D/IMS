@@ -86,7 +86,7 @@ import { isOrganisationSpecificTaxType } from '@/lib/tax/xero-built-in-tax-types
 import { collapseName, comparableName, nameRegion, normaliseCountryCode, xeroNameCountry } from '@/lib/tax/tax-country'
 import { reportTaxTypeDecidable, xeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
 import { taxCodesInPayload } from '@/lib/tax/tax-code-fields'
-import { CLEARED_RATES_SETTING, RETIRED_CODES_SETTING, parseClearedRates, parseRetiredCodes, type RetiredCodes } from '@/lib/tax/retired-tax-code-guard'
+import { CLEARED_RATES_SETTING, RETIRED_CODES_SETTING, parseClearedRates, releaseClearedRateMarkers, parseRetiredCodes, type RetiredCodes } from '@/lib/tax/retired-tax-code-guard'
 import { lockStorefrontMappingWrites } from '@/lib/tax/storefront-mapping-write'
 import { REKEY_OUTCOMES, type RekeyOutcome } from '@/lib/tax/tax-rekey-outcomes'
 
@@ -670,6 +670,8 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
       const clearedValue = JSON.stringify(prior)
       await tx.setting.upsert({ where: { key: CLEARED_RATES_SETTING }, create: { key: CLEARED_RATES_SETTING, value: clearedValue }, update: { value: clearedValue } })
     }
+    // A replacement that carries a code needs no cleared marker (and drops one, should it ever have one): the same lock, the same transaction.
+    await releaseClearedRateMarkers(tx, result.created.filter((c) => c.toCode !== null).map((c) => c.newId))
     // A code that is both retired (from one rate) and a target (of another: the swap) STAYS in the set: it changed meaning, and the guard admits it only for occurrences bound to a rate that carries it now.
     const value = JSON.stringify(retired)
     await tx.setting.upsert({ where: { key: RETIRED_CODES_SETTING }, create: { key: RETIRED_CODES_SETTING, value }, update: { value } })

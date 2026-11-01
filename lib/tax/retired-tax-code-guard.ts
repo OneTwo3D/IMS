@@ -18,6 +18,15 @@
  * to the producer's commit and re-entrant when the enqueue already took it. Either the producer's row commits first (the apply then finds it queued and refuses), or the apply commits
  * first and this check, run after the lock, reads the committed rates.
  *
+ * A CLEARED RATE IS REFUSED ONLY WHILE IT STILL LACKS A VALID LIVE CODE. The re-key records each CLEAR replacement in CLEARED_RATES_SETTING; the marker says "look at this rate", not "refuse it for ever". Under the
+ * lock the guard reads the bound rate as it is NOW (taxRateHasValidLiveCode: a code, a Xero built-in or ACTIVE in the stored list of the organisation connected now) and refuses only when it has none. A rate
+ * an operator remapped (the tax-rate editor, link-by-name, generate-missing) is therefore admitted at once, whether or not the marker has been dropped; every writer that can give a rate a code also drops
+ * its marker in the same transaction (releaseClearedRateMarkers), so the setting does not keep a list of rates that are no longer cleared.
+ *
+ * LOCK ORDER (one, for everyone): the connector-selection advisory lock FIRST (the Xero connection fence of every writer takes it, as does this guard), then the WooCommerce mapping lock (shared), then tax_rates
+ * rows (lib/tax/writable-tax-rate.ts, TAX RATE ROW LOCK ORDER). The guard and releaseClearedRateMarkers take only the first and read or write the setting and the rate rows without locking them (the selection lock
+ * already excludes every writer of a code), so they add no edge to the order; releaseClearedRateMarkers must therefore be called in a transaction that took the selection lock before any rate row lock.
+ *
  * The refusal is a thrown RetiredTaxCodeInPayloadError after a best-effort row in the posting-refusal inbox on the pooled client; the producer's ordinary retry rebuilds the payload from
  * the current rates (the apply re-pointed the documents that could still post).
  */
@@ -25,8 +34,10 @@ import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks
 import { taxCodeOccurrences, taxRateBindings } from '@/lib/tax/tax-code-fields'
 import { isOrganisationSpecificTaxType } from '@/lib/tax/xero-built-in-tax-types'
 
+const XERO_TAX_TYPE_FORMAT = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
+
 export const RETIRED_CODES_SETTING = 'tax_rekey_retired_codes'
-/** The replacements of rates a re-key CLEARED (no tax code): { [rateId]: { at } }. A payload bound to one is refused (missing_tax_code): the connectors would send NONE (or the order default's code) for a missing tax type. */
+/** The replacements of rates a re-key CLEARED (no tax code): { [rateId]: { at } }. A payload bound to one is refused (missing_tax_code) while the rate still has no valid live code: the connectors would send NONE (or the order default's code) for a missing tax type. */
 export const CLEARED_RATES_SETTING = 'tax_rekey_cleared_rates'
 /** A payload line is bound to a rate a re-key cleared, which has no tax code until someone maps it. */
 export const MISSING_TAX_CODE_REASON = 'missing_tax_code'
@@ -57,6 +68,61 @@ type GuardClient = {
   $executeRaw?: (query: TemplateStringsArray, ...values: unknown[]) => Promise<number>
   taxRate?: { findMany(args: { where: { id: { in: string[] } }; select: { id: true; active: true; replacedById: true; accountingTaxType: true } }): Promise<RateRow[]> }
   setting?: { findUnique(args: { where: { key: string }; select: { value: true } }): Promise<{ value: string } | null> }
+  accountingToken?: { findUnique(args: { where: { connector: string }; select: { tenantId: true } }): Promise<{ tenantId: string } | null> }
+  xeroTaxRate?: { findMany(args: { where: { connector: string; tenantId: string; status: string; taxType: { in: string[] } }; select: { taxType: true } }): Promise<Array<{ taxType: string }>> }
+}
+
+/**
+ * Which of `codes` are VALID LIVE accounting codes right now: well formed, and either a Xero built-in or ACTIVE in the stored list of the organisation connected now. A code a re-key retired and the live
+ * list does not carry (a stale Demo code) is therefore not valid; one that is live (a swap) is. A client that cannot answer (a structural double without the Xero store) is judged on the format alone.
+ * Reads only; the caller holds the selection lock.
+ */
+async function validLiveCodes(c: GuardClient, codes: readonly string[]): Promise<Set<string>> {
+  const wellFormed = [...new Set(codes)].filter((code) => XERO_TAX_TYPE_FORMAT.test(code))
+  const valid = new Set(wellFormed.filter((code) => !isOrganisationSpecificTaxType(code)))
+  const custom = wellFormed.filter((code) => isOrganisationSpecificTaxType(code))
+  if (custom.length === 0) return valid
+  if (c.accountingToken === undefined || c.xeroTaxRate === undefined) { for (const code of custom) valid.add(code); return valid }
+  const tenant = await c.accountingToken.findUnique({ where: { connector: 'xero' }, select: { tenantId: true } })
+  if (tenant === null) return valid
+  for (const row of await c.xeroTaxRate.findMany({ where: { connector: 'xero', tenantId: tenant.tenantId, status: 'ACTIVE', taxType: { in: custom } }, select: { taxType: true } })) valid.add(row.taxType)
+  return valid
+}
+
+/** The ids among `rateIds` whose rate row has NO valid live code now (an unknown id counts as lacking one). Reads the rows as they are under the caller's lock. */
+async function ratesLackingValidCode(c: GuardClient, rateIds: readonly string[]): Promise<Set<string>> {
+  if (rateIds.length === 0 || c.taxRate === undefined) return new Set(rateIds)
+  const rows = await c.taxRate.findMany({ where: { id: { in: [...rateIds] } }, select: { id: true, active: true, replacedById: true, accountingTaxType: true } })
+  const valid = await validLiveCodes(c, rows.map((r) => r.accountingTaxType).filter((t): t is string => typeof t === 'string'))
+  const have = new Set(rows.filter((r) => typeof r.accountingTaxType === 'string' && valid.has(r.accountingTaxType)).map((r) => r.id))
+  return new Set(rateIds.filter((id) => !have.has(id)))
+}
+
+type MarkerClient = GuardClient & {
+  setting?: GuardClient['setting'] & { upsert?(args: { where: { key: string }; create: { key: string; value: string }; update: { value: string } }): Promise<unknown>; delete?(args: { where: { key: string } }): Promise<unknown> }
+}
+
+/**
+ * Drop the cleared marker of every rate in `rateIds` that now has a valid live code. EVERY writer that can give a rate a code calls this IN THE SAME TRANSACTION as its write (the tax-rate editor,
+ * link-by-name, generate-missing, the tax import, the re-key), so the marker leaves with the code or not at all. It takes the connector-selection lock itself (the lock the re-key holds when it writes the
+ * setting, and the guard holds when it reads it), so a writer that forgot to take it first still cannot interleave with a re-key's read-modify-write of the setting; but it must be called before the
+ * transaction takes any tax_rates row lock, or in a transaction that already holds the selection lock (all of them do: the fence), to keep the lock order above. Returns the ids dropped.
+ */
+export async function releaseClearedRateMarkers(tx: unknown, rateIds: readonly string[]): Promise<string[]> {
+  const c = tx as MarkerClient
+  const ids = [...new Set(rateIds)]
+  if (ids.length === 0 || typeof c.$executeRaw !== 'function' || c.setting === undefined || c.setting.upsert === undefined) return []
+  await c.$executeRaw`SELECT pg_advisory_xact_lock(${ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY})`
+  const cleared = parseClearedRates((await c.setting.findUnique({ where: { key: CLEARED_RATES_SETTING }, select: { value: true } }))?.value)
+  const marked = ids.filter((id) => Object.prototype.hasOwnProperty.call(cleared, id))
+  if (marked.length === 0) return []
+  const lacking = await ratesLackingValidCode(c, marked)
+  const drop = marked.filter((id) => !lacking.has(id))
+  if (drop.length === 0) return []
+  for (const id of drop) delete cleared[id]
+  const value = JSON.stringify(cleared)
+  await c.setting.upsert({ where: { key: CLEARED_RATES_SETTING }, create: { key: CLEARED_RATES_SETTING, value }, update: { value } })
+  return drop
 }
 
 export type RetiredCodes = Record<string, { rateId: string; newCode: string; at: string }>
@@ -92,7 +158,9 @@ export async function retiredTaxCodesInPayload(client: unknown, input: { type: s
   const out = new Map<string, Reason>()
   // A line bound to a rate a re-key CLEARED has no tax code: the connectors would send NONE (or the order default's code) for it. Refused, whatever code the payload happens to carry.
   const cleared = parseClearedRates((await c.setting.findUnique({ where: { key: CLEARED_RATES_SETTING }, select: { value: true } }))?.value)
-  for (const id of bound) if (Object.prototype.hasOwnProperty.call(cleared, id)) out.set(`rate:${id}`, MISSING_TAX_CODE_REASON)
+  // ... but only while the rate STILL has none: a rate remapped since the re-key is judged on the code it carries now, read here under the lock (the marker is a hint, not a verdict).
+  const markedBound = bound.filter((id) => Object.prototype.hasOwnProperty.call(cleared, id))
+  for (const id of await ratesLackingValidCode(c, markedBound)) out.set(`rate:${id}`, MISSING_TAX_CODE_REASON)
   const retired = parseRetiredCodes((await c.setting.findUnique({ where: { key: RETIRED_CODES_SETTING }, select: { value: true } }))?.value)
   const suspect = occurrences.filter((o) => Object.prototype.hasOwnProperty.call(retired, o.code))
   if (suspect.length > 0) {
