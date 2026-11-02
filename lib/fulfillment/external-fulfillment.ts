@@ -34,8 +34,11 @@ export type ExternalFulfillmentUpdate = {
   tracking?: Array<{ trackingNumber: string; shippingService?: string | null }>
   /**
    * The storefront ALREADY holds this fulfilment (the writer that owned it before the live-from instant completed it, verified
-   * against the locally stored record). IMS then completes its own side only: no storefront completion job and no storefront
-   * tracking/status push, because either would be a write to a storefront that is already complete.
+   * against the locally stored record). THE CONTRACT: this path writes NO ORDER-LEVEL storefront data - no completion job, no
+   * tracking, no order note, no status - because each would be a write to an order that is already complete. Its ONLY storefront
+   * effect is IMS's ordinary stock-level sync for the stock the shipment consumed: after cutover IMS is the stock master and
+   * that push sets an absolute level, so it duplicates nothing the earlier writer did. Enforced by
+   * tests/fulfillment-pre-cutover-woo-footprint.test.ts, which counts every Woo job and request this path produces.
    */
   storefrontAlreadyCompleted?: boolean
 }

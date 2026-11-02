@@ -1563,7 +1563,8 @@ export async function updateShipmentStatus(
     storefrontCompletion?: boolean
     /**
      * The storefront already holds this fulfilment (verified pre-cutover record): skip the post-commit storefront tracking and
-     * completion push as well, not only the durable completion job. Never set by an in-app dispatch.
+     * completion push as well, not only the durable completion job. The stock-level sync below is NOT skipped (IMS is the stock
+     * master after cutover; it sets an absolute level). Never set by an in-app dispatch.
      */
     skipStorefrontPush?: boolean
   },
