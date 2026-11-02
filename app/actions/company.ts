@@ -103,16 +103,10 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
       }
       updateData.timezone = tz
     }
-    const existingOrg = await db.organisation.findFirst({ select: { baseCurrency: true } })
 
-    if (updateData.baseCurrency) {
-      const code = updateData.baseCurrency.toUpperCase().trim()
-      const locked = await isBaseCurrencyLocked()
-      if (locked && code !== (existingOrg?.baseCurrency ?? DEFAULT_BASE_CURRENCY)) {
-        return { success: false, error: 'Base currency is locked after setup. Reset the database to change it.' }
-      }
-      updateData.baseCurrency = code
-    }
+    // Only the code is normalised here. Whether the base may change (the current base, the lock marker, the FX source) is decided ONCE, inside the FX table lock below: a check made before the lock
+    // reads state a request queued for the lock can find out of date by the time it gets the lock.
+    if (updateData.baseCurrency) updateData.baseCurrency = updateData.baseCurrency.toUpperCase().trim()
 
     await ensureOrganisationExists()
     // A change of the BASE currency is a write the rate table depends on: it, and the activation of the new base currency it implies, take the same exclusive lock as the rate writers and the FX source
