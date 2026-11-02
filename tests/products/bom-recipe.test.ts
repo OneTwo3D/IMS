@@ -115,6 +115,65 @@ test('[o3d-zjsb5.9] detectBomItemCycleInEdges terminates on a graph that ALREADY
   )
 })
 
+test('a scoped cycle walk ignores a cycle the written product cannot reach', () => {
+  const unrelated = [
+    { parentProductId: 'x', componentProductId: 'y' },
+    { parentProductId: 'y', componentProductId: 'x' },
+  ]
+  // The global walk still sees it (drift report, first-load validator)...
+  assert.deepEqual(detectBomItemCycleInEdges(unrelated), ['x', 'y', 'x'])
+  // ...but a write to an unrelated product is not refused because of it.
+  assert.equal(detectBomItemCycleInEdges([...unrelated, { parentProductId: 'a', componentProductId: 'b' }], ['a']), null)
+  assert.equal(detectBomItemCycleAfterReplacement(unrelated, 'a', ['b']), null)
+})
+
+test('a scoped cycle walk refuses a product that only POINTS INTO an existing cycle, and terminates', () => {
+  const existing = [
+    { parentProductId: 'x', componentProductId: 'y' },
+    { parentProductId: 'y', componentProductId: 'x' },
+  ]
+  // a is not on the cycle, but exploding a's BOM would reach it and never finish.
+  assert.deepEqual(detectBomItemCycleAfterReplacement(existing, 'a', ['x']), ['x', 'y', 'x'])
+  // Reached through a deeper descendant, the path still starts at the first node of the cycle.
+  assert.deepEqual(
+    detectBomItemCycleAfterReplacement([...existing, { parentProductId: 'b', componentProductId: 'x' }], 'a', ['b']),
+    ['x', 'y', 'x'],
+  )
+  // Pointing at a clean sibling is fine even though the cycle exists.
+  assert.equal(detectBomItemCycleAfterReplacement(existing, 'a', ['c']), null)
+})
+
+test('a scoped cycle walk refuses a loop through the written product and names that loop', () => {
+  const unrelated = [
+    { parentProductId: 'x', componentProductId: 'y' },
+    { parentProductId: 'y', componentProductId: 'x' },
+  ]
+  // Direct: a -> b, b -> a.
+  assert.deepEqual(
+    detectBomItemCycleInEdges([...unrelated, { parentProductId: 'a', componentProductId: 'b' }, { parentProductId: 'b', componentProductId: 'a' }], ['a']),
+    ['a', 'b', 'a'],
+  )
+  // Self-loop.
+  assert.deepEqual(detectBomItemCycleAfterReplacement(unrelated, 'a', ['a']), ['a', 'a'])
+})
+
+test('a scoped cycle walk refuses a loop that closes through a deeper descendant', () => {
+  // a -> b -> c -> d already exist; writing d -> a closes a four-product loop, and so does writing
+  // a -> b when the chain below it already leads back to a.
+  const chain = [
+    { parentProductId: 'b', componentProductId: 'c' },
+    { parentProductId: 'c', componentProductId: 'd' },
+    { parentProductId: 'd', componentProductId: 'a' },
+    { parentProductId: 'x', componentProductId: 'x' },
+  ]
+  assert.deepEqual(detectBomItemCycleAfterReplacement(chain, 'a', ['b']), ['a', 'b', 'c', 'd', 'a'])
+  // A branch that dead-ends before it returns must not hide the branch that does.
+  assert.deepEqual(
+    detectBomItemCycleAfterReplacement([...chain, { parentProductId: 'b', componentProductId: 'dead' }], 'a', ['dead', 'b']),
+    ['a', 'b', 'c', 'd', 'a'],
+  )
+})
+
 test('[o3d-zjsb5.9] the dry-run cycle check asks about the graph AFTER the parent is replaced', () => {
   const edges = [
     { parentProductId: 'table', componentProductId: 'leg' },
@@ -126,14 +185,14 @@ test('[o3d-zjsb5.9] the dry-run cycle check asks about the graph AFTER the paren
   assert.equal(detectBomItemCycleAfterReplacement(edges, 'table', ['raw']), null)
   // Making leg require table closes leg -> table -> leg. The old edges for `leg` are gone, so this
   // cycle can only be seen by considering the PROPOSED ones.
-  assert.deepEqual(detectBomItemCycleAfterReplacement(edges, 'leg', ['table']), ['table', 'leg', 'table'])
+  assert.deepEqual(detectBomItemCycleAfterReplacement(edges, 'leg', ['table']), ['leg', 'table', 'leg'])
 })
 
 // ---------------------------------------------------------------------------
 // The write path
 // ---------------------------------------------------------------------------
 
-type FakeBom = { id: string; name: string; productId: string | null; updatedAt: number }
+type FakeBom = { id: string; name: string; productId: string | null; updatedAt: number; active?: boolean }
 type FakeItem = { bomId: string; parentProductId: string; componentProductId: string; qty: number; sortOrder: number }
 
 function fakeSyncClient(seed?: { boms?: FakeBom[]; items?: FakeItem[] }) {
@@ -147,7 +206,7 @@ function fakeSyncClient(seed?: { boms?: FakeBom[]; items?: FakeItem[] }) {
       findUnique: async ({ where }: { where: { productId: string } }) => {
         calls.push('bom.findUnique')
         const bom = boms.find((entry) => entry.productId === where.productId)
-        return bom ? { ...bom, active: (bom as { active?: boolean }).active ?? true } : null
+        return bom ? { ...bom, active: bom.active ?? true } : null
       },
       // No ACTIVE duplicate Boms (round 8): these cases are about the claimed recipe, and an empty
       // result is the "nothing else is active for this parent" state they all assume. The refusal that
@@ -205,9 +264,14 @@ function fakeSyncClient(seed?: { boms?: FakeBom[]; items?: FakeItem[] }) {
         items.push(...data)
         return { count: data.length }
       },
-      findMany: async () => {
+      // Honours the two predicates the sync's reads use: `bomId` (the parents a Bom exposes) and the
+      // planning filter `bom.active` (an item in an INACTIVE Bom is not part of the walked graph).
+      findMany: async ({ where }: { where?: { bomId?: string; bom?: { active: boolean } } } = {}) => {
         calls.push('bomItem.findMany')
-        return items.map((item) => ({ ...item }))
+        return items
+          .filter((item) => where?.bomId === undefined || item.bomId === where.bomId)
+          .filter((item) => !where?.bom?.active || (boms.find((bom) => bom.id === item.bomId)?.active ?? true))
+          .map((item) => ({ ...item }))
       },
     },
   }
@@ -318,7 +382,83 @@ test('[o3d-zjsb5.9] a recipe that closes a bom_items cycle is REFUSED', async ()
   })
 
   assert.equal(outcome.kind, 'cycle')
-  assert.deepEqual(outcome.kind === 'cycle' ? outcome.path : null, ['table', 'leg', 'table'])
+  assert.deepEqual(outcome.kind === 'cycle' ? outcome.path : null, ['leg', 'table', 'leg'])
+})
+
+test('an unrelated cyclic pair in bom_items does not refuse a recipe write; the write itself is judged', async () => {
+  const unrelated: FakeItem[] = [
+    { bomId: 'bom-x', parentProductId: 'x', componentProductId: 'y', qty: 1, sortOrder: 0 },
+    { bomId: 'bom-y', parentProductId: 'y', componentProductId: 'x', qty: 1, sortOrder: 0 },
+  ]
+  const fake = fakeSyncClient({ items: unrelated })
+  const ok = await syncBomRecipeFromProductComponents(fake.client, {
+    productId: 'table', sku: 'TABLE-01', components: [{ componentProductId: 'leg', qty: 1 }],
+  })
+  assert.equal(ok.kind, 'written')
+
+  // And a write that DOES close a loop is still refused, naming its own loop and not the unrelated one.
+  const refused = await syncBomRecipeFromProductComponents(fake.client, {
+    productId: 'leg', sku: 'LEG-01', components: [{ componentProductId: 'table', qty: 1 }],
+  })
+  assert.equal(refused.kind, 'cycle')
+  assert.deepEqual(refused.kind === 'cycle' ? refused.path : null, ['leg', 'table', 'leg'])
+})
+
+test('activating a multi-parent Bom checks the cycle through EVERY parent it exposes, not just the written product', async () => {
+  // P adopts an unclaimed, inactive Bom that also holds X -> Y. Another active Bom holds Y -> X. P's own
+  // closure is acyclic (P -> raw), but the activation makes X -> Y visible to planning, and X -> Y -> X loops.
+  const fake = fakeSyncClient({
+    boms: [
+      { id: 'bom-hist', name: 'old', productId: null, updatedAt: 1, active: false },
+      { id: 'bom-y', name: 'Y BOM', productId: 'y', updatedAt: 1, active: true },
+    ],
+    items: [
+      { bomId: 'bom-hist', parentProductId: 'p', componentProductId: 'raw', qty: 1, sortOrder: 0 },
+      { bomId: 'bom-hist', parentProductId: 'x', componentProductId: 'y', qty: 1, sortOrder: 0 },
+      { bomId: 'bom-y', parentProductId: 'y', componentProductId: 'x', qty: 1, sortOrder: 0 },
+    ],
+  })
+  const outcome = await syncBomRecipeFromProductComponents(fake.client, {
+    productId: 'p', sku: 'P-01', components: [{ componentProductId: 'raw', qty: 1 }],
+  })
+  assert.equal(outcome.kind, 'cycle')
+  assert.deepEqual(outcome.kind === 'cycle' ? outcome.path : null, ['x', 'y', 'x'])
+})
+
+test('reactivating a CLAIMED multi-parent Bom checks the cycle through every parent it exposes', async () => {
+  const fake = fakeSyncClient({
+    boms: [
+      { id: 'bom-p', name: 'P BOM', productId: 'p', updatedAt: 1, active: false },
+      { id: 'bom-y', name: 'Y BOM', productId: 'y', updatedAt: 1, active: true },
+    ],
+    items: [
+      { bomId: 'bom-p', parentProductId: 'x', componentProductId: 'y', qty: 1, sortOrder: 0 },
+      { bomId: 'bom-y', parentProductId: 'y', componentProductId: 'x', qty: 1, sortOrder: 0 },
+    ],
+  })
+  const outcome = await syncBomRecipeFromProductComponents(fake.client, {
+    productId: 'p', sku: 'P-01', components: [{ componentProductId: 'raw', qty: 1 }],
+  })
+  assert.equal(outcome.kind, 'cycle')
+  assert.deepEqual(outcome.kind === 'cycle' ? outcome.path : null, ['x', 'y', 'x'])
+})
+
+test('activating a multi-parent Bom that exposes only acyclic edges is allowed', async () => {
+  const fake = fakeSyncClient({
+    boms: [
+      { id: 'bom-hist', name: 'old', productId: null, updatedAt: 1, active: false },
+      { id: 'bom-y', name: 'Y BOM', productId: 'y', updatedAt: 1, active: true },
+    ],
+    items: [
+      { bomId: 'bom-hist', parentProductId: 'p', componentProductId: 'raw', qty: 1, sortOrder: 0 },
+      { bomId: 'bom-hist', parentProductId: 'x', componentProductId: 'y', qty: 1, sortOrder: 0 },
+      { bomId: 'bom-y', parentProductId: 'y', componentProductId: 'raw', qty: 1, sortOrder: 0 },
+    ],
+  })
+  const outcome = await syncBomRecipeFromProductComponents(fake.client, {
+    productId: 'p', sku: 'P-01', components: [{ componentProductId: 'raw', qty: 1 }],
+  })
+  assert.equal(outcome.kind, 'written')
 })
 
 test('[o3d-zjsb5.9] the cycle question is asked AFTER the write, on the graph being committed', async () => {

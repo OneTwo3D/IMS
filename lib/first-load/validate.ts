@@ -188,8 +188,9 @@ export function dispositionAnomalies(dispositions: RowDisposition[]): string[] {
 }
 
 /**
- * A spreadsheet treats a cell that starts with `=`, `@`, a tab or a carriage return, or with `+` / `-` followed by anything but a digit or a point,
- * as a formula. Data files are never altered for that reason; the risk is reported, and an escaped inspection copy is offered where a file is meant
- * to be looked at by a person.
+ * A spreadsheet treats a cell that starts with `=`, `@`, `+`, `-`, a tab or a carriage return as a formula. That includes `+` / `-` followed by a
+ * digit or a point: `-1+1` and `+1+cmd|...` are formulas to a spreadsheet, and a leading sign cannot be told apart from a formula by the first
+ * character alone, so every leading sign counts. Data files are never altered for that reason; the risk is reported, and an escaped inspection copy
+ * is offered where a file is meant to be looked at by a person.
  */
-export const FORMULA_LEADING = /^(?:[=@\t\r]|[+-](?![0-9.]))/
+export const FORMULA_LEADING = /^[=@+\-\t\r]/

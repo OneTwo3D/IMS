@@ -699,10 +699,10 @@ test('arm (u): formula-leading WooCommerce text: the data file keeps it exactly,
     const inspect = readFileSync(path.join(r.out, SNAPSHOT_FILE_NAMES.variantParentsInspection), 'utf8')
     const provenance = JSON.parse(readFileSync(path.join(r.out, SNAPSHOT_FILE_NAMES.provenance), 'utf8'))
     precondition(t, 'formula-leading cells counted', provenance.formulaLeadingCells)
-    assert.equal(provenance.formulaLeadingCells, 4, 'three WIDGET rows carry the = title and the one GADGET row with a SKU carries -Spacer; the BIG rows with -5V are not formulas')
+    assert.equal(provenance.formulaLeadingCells, 9, 'three WIDGET rows carry the = title, the GADGET row with a SKU carries -Spacer, and the five BIG rows with -5V count too: a leading sign is formula-capable whatever follows it')
     assert.ok(data.includes('=HYPERLINK') && !data.includes("'=HYPERLINK"), 'the data file is untouched')
     assert.ok(inspect.includes("'=HYPERLINK") && inspect.includes("'-Spacer kit"), 'the inspection copy is neutralised')
-    assert.ok(inspect.includes(',-5V cable,') && !inspect.includes("'-5V"), 'a name that merely starts with "-5" is not a formula')
+    assert.ok(inspect.includes(",'-5V cable,") && !inspect.includes(",-5V cable,"), 'a leading sign followed by a digit is formula-capable and is neutralised too')
   } finally { await r.server.close() }
 })
 
