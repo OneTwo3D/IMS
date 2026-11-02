@@ -25,7 +25,7 @@
  * tax_code_not_current, so the producer rebuilds the payload from the rate as it is now (a payload built before a remap carried the order default's code, or none, and must not be admitted after it).
  * Because the marker is never dropped, a rate remapped and then cleared again (or whose code is later made invalid) is guarded again with no further step.
  *
- * EVERY WRITE THAT CHANGES A RATE'S accountingTaxType TAKES THE SELECTION LOCK FIRST (the tax-rate editor, link-by-name, generate-missing, the tax import, the re-key, the Xero rebind), held to its
+ * EVERY WRITE THAT CHANGES A FIELD THE GUARD READS (accountingTaxType, reverseCharge, active, replacedById) TAKES THE SELECTION LOCK FIRST (the tax-rate editor, for any edit, unconditionally; link-by-name, generate-missing, the tax import, the re-key, the Xero rebind), held to its
  * commit, so the verdict the guard reaches under the same lock stands until the producer's commit: either the writer committed first and the guard reads its code, or the guard's transaction
  * commits first and the writer then changes the rate (the document was valid when it was queued).
  *

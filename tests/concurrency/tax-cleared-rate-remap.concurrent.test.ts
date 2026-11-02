@@ -65,6 +65,7 @@ const createdRates: string[] = []
 const createdLogs: string[] = []
 const retiredCodesWritten: string[] = []
 const DEFAULT_CODE = 'OUTPUT2'
+const RC_SALES_SETTING = 'accounting_reverse_charge_sales_tax_type'
 
 async function wipeXero(db: Deps['db']) {
   await db.setting.deleteMany({ where: { key: PLUGIN_KEY } })
@@ -93,6 +94,7 @@ after(async () => {
   const { db } = await loadDeps()
   await db.accountingSyncLog.deleteMany({ where: { id: { in: createdLogs } } })
   await wipeXero(db)
+  await db.setting.deleteMany({ where: { key: RC_SALES_SETTING } })
   await removeOwnMarkers(db)
   if (createdRates.length) {
     await db.taxRateComponent.deleteMany({ where: { taxRateId: { in: createdRates } } })
@@ -407,4 +409,49 @@ test('a remap RACING an enqueue: the verdict follows the commit order, and an en
   assert.equal(await aborted, 'rollback')
   assert.equal(await enq3, 'missing_tax_code', 'the uncommitted code was never visible')
   assert.equal(await codeOf(deps.db, third), null)
+})
+
+// [mutation: the editor takes the selection lock only for a code change -> a reverseCharge edit does not park behind the producer (order A) and is not ordered ahead of it (order B)]
+test('a reverseCharge true->false EDIT racing an enqueue that carries the reverse-charge type: in both commit orders nothing is admitted with a type that is wrong at the commit', { skip: !RUN }, async () => {
+  const deps = await loadDeps()
+  const run = randomUUID().slice(0, 8)
+  const live = `LIVE-${run}`
+  const rcType = `RCSALES-${run}`
+  await seedXero(deps.db, `tenant-${run}`, run, [live])
+  await deps.db.setting.upsert({ where: { key: RC_SALES_SETTING }, create: { key: RC_SALES_SETTING, value: rcType }, update: { value: rcType } })
+  const lockWait = /pg_advisory_xact_lock/
+  const seedRc = async (name: string) => {
+    const id = await seedClearedRate(deps.db, run, name)
+    await deps.db.taxRate.update({ where: { id }, data: { accountingTaxType: live, reverseCharge: true } })
+    return id
+  }
+
+  // CONTROL: while the rate is reverse-charge the swapped type is admitted.
+  const control = await seedRc(`cleared-rc-ctl-${run}`)
+  assert.equal(await enqueue(deps, control, rcType, run), 'admitted')
+
+  // ORDER A: the producer passed the guard on the reverse-charge type and has not committed. The edit cannot change the flag until it does.
+  const a = await seedRc(`cleared-rc-a-${run}`)
+  const producer = await heldEnqueue(deps, a, rcType, run)
+  const editA = deps.settingsActions.updateTaxRate(a, { reverseCharge: false })
+  await waitUntilParkedBehind(deps.db as never, { holderPid: producer.pid, waitingOn: lockWait, describe: 'the reverseCharge edit (order A)' })
+  assert.equal((await deps.db.taxRate.findUniqueOrThrow({ where: { id: a } })).reverseCharge, true, 'still reverse-charge while the producer has not committed')
+  producer.release()
+  assert.equal(await producer.done, 'admitted', 'order A: the type was right at the producer\'s commit')
+  const doneA = await editA
+  assert.equal(doneA.success, true, JSON.stringify(doneA))
+  assert.equal((await deps.db.taxRate.findUniqueOrThrow({ where: { id: a } })).reverseCharge, false)
+
+  // ORDER B: the edit holds the lock first; the producer then reads the rate with the flag off and the reverse-charge type is refused.
+  const b = await seedRc(`cleared-rc-b-${run}`)
+  const gate = await holdSelectionLock(deps)
+  const editB = deps.settingsActions.updateTaxRate(b, { reverseCharge: false })
+  await waitUntilParkedBehind(deps.db as never, { holderPid: gate.pid, waitingOn: lockWait, describe: 'the reverseCharge edit (order B)' })
+  const enqB = enqueue(deps, b, rcType, run)
+  await waitUntilTwoParked(deps, gate.pid, 'the reverseCharge edit and the enqueue (order B)')
+  gate.release()
+  await gate.done
+  const doneB = await editB
+  assert.equal(doneB.success, true, JSON.stringify(doneB))
+  assert.equal(await enqB, 'tax_code_not_current', 'order B: the flag was off at the commit; the swapped type is refused')
 })
