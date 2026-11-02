@@ -595,7 +595,7 @@ test('o3d-4kfh r6 (finding 1): all six graph-mutation sites bump the version aft
       label: 'updateProduct (KIT-ness)',
       source: productsSource,
       anchor: 'let updatedCategoryChange',
-      length: 8000,
+      length: 9500,
       write: 'await tx.product.update(',
     },
     {

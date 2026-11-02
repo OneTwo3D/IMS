@@ -77,13 +77,12 @@ export const SWEEP_CURSOR_LOCK_KEY = 918_273_912
  * definition changes when a human edits it or a CSV import carries a components column, not on
  * any hot path. Held for one row's transaction, not a whole import.
  *
- * SCOPE, precisely. Taken by the writers that CREATE edges — saveProductComponents and the CSV
- * component pass — because only those can form a cycle. The delete-only writers (the editor's
- * and the CSV rename's clearComponents, and the admin reset) deliberately do NOT take it:
- * removing edges cannot create a cycle, and adding it AFTER their per-SKU lock would invert the
- * order and create a deadlock. The cost of that omission is that a concurrent delete can make
- * the walk below transiently reject a write that would have been fine — a false rejection, not
- * a false acceptance.
+ * SCOPE, precisely. Taken FIRST (before any per-SKU lock) by every writer that can ADD an edge to the
+ * ProductComponent or BomItem graph or make existing edges visible to a walk: saveProductComponents, the
+ * CSV rename transaction and component pass, the product editor (a type change reconciles the BOM recipe),
+ * and the manufacturing actions that sync a recipe. A census test (tests/products/bom-graph-writer-lock-census.test.ts)
+ * fails when a caller of the recipe sync lacks it. The delete-only writers (the CSV rename's clearComponents
+ * runs inside the lock-holding rename transaction; the admin reset) cannot create a cycle.
  */
 export const COMPONENT_GRAPH_WRITE_LOCK_KEY = 918_274_101
 

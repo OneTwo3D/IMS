@@ -340,13 +340,13 @@ test('arm (r): a VARIABLE parent the products file carries takes WooCommerce\'s 
 
 test('arm (s): formula-looking cells in an import file are reported and the file is not altered', (t) => {
   const result = run({
-    products: ds('products', [product('F-1', 'SIMPLE', { name: '=1+1' }), product('F-2', 'SIMPLE', { name: '- Spacer' }), product('F-3', 'SIMPLE', { name: '-5V cable' }), product('F-4', 'SIMPLE', { name: '@home' })]),
+    products: ds('products', [product('F-1', 'SIMPLE', { name: '=1+1' }), product('F-2', 'SIMPLE', { name: '- Spacer' }), product('F-3', 'SIMPLE', { name: '-5V cable' }), product('F-4', 'SIMPLE', { name: '@home' }), product('F-5', 'SIMPLE', { name: '+1+1' }), product('F-6', 'SIMPLE', { name: '+.5' }), product('F-7', 'SIMPLE', { name: 'safe -5' })]),
   })
   const finding = result.report.findings.find((f) => f.code === 'FORMULA_LEADING_CELL')
   precondition(t, 'formula-looking cells', finding?.keys?.length ?? 0)
-  assert.deepEqual(finding?.keys, ['products:name:F-1', 'products:name:F-2', 'products:name:F-4'])
+  assert.deepEqual(finding?.keys, ['products:name:F-1', 'products:name:F-2', 'products:name:F-3', 'products:name:F-4', 'products:name:F-5', 'products:name:F-6'])
   assert.equal(finding?.severity, 'WARNING')
   assert.equal(result.blocking, false)
   const names = rowsOf(result, 'products').map((r) => r.name)
-  assert.deepEqual(names, ['=1+1', '- Spacer', '-5V cable', '@home'], 'the importer reads exactly what the source said')
+  assert.deepEqual(names, ['=1+1', '- Spacer', '-5V cable', '@home', '+1+1', '+.5', 'safe -5'], 'the importer reads exactly what the source said')
 })

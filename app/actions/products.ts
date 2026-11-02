@@ -960,6 +960,14 @@ export async function updateProduct(
   let updatedCategoryChange
   try {
     updatedCategoryChange = await db.$transaction(async (tx) => {
+    // THE GRAPH LOCK FIRST, before the per-SKU locks and before anything is read or written. This edit
+    // can change the product's type (KIT -> BOM, SIMPLE -> BOM, BOM -> SIMPLE ...), which makes a Bom
+    // active or retires it and so adds or removes edges that planning walks, and the cycle check inside
+    // `reconcileBomRecipeForProductType` is only authoritative if no other graph writer can commit
+    // between that check and this commit. Same lock, same order (graph, then per-SKU) as
+    // `saveProductComponents`, the CSV passes and the manufacturing actions, which is what keeps the two
+    // lock families deadlock-free. Held for this one transaction.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${COMPONENT_GRAPH_WRITE_LOCK_KEY})`
     // o3d-42hw. BOTH skus: a rename frees the old one and claims the new one, so a writer
     // racing on either must serialize with this.
     //
@@ -1028,9 +1036,8 @@ export async function updateProduct(
       nextType: data.type,
     }
     if (componentGraphMutationAffectsFulfillment(kitnessMutation)) {
-      // Best-effort and NOT atomic — this path deliberately holds only its per-SKU lock, not the
-      // coarse component-graph advisory one (taking it here would invert the lock order; see
-      // lib/db/advisory-locks.ts), and the allocation/commitment writers take neither. See the guard
+      // Best-effort and NOT atomic — this path holds the component-graph and per-SKU locks, but the
+      // allocation/commitment writers take neither. See the guard
       // module docstring: `validateCommittedShipmentCoverage` at every shipment transition including
       // dispatch is the atomic backstop, and the CAS is filed as o3d-57b0.
       const blockers = await findComponentGraphEditBlockers(tx, id, kitnessMutation)
@@ -1105,12 +1112,9 @@ export async function updateProduct(
     // cannot: it is FALSE for KIT -> BOM, where the components are kept and the product now needs a
     // claimed Bom or planning has no recipe for it at all.
     //
-    // LOCKING, STATED HONESTLY: this transaction deliberately holds only its PER-SKU lock and not
-    // the coarse component-graph one — taking it here would invert the documented lock order (see
-    // the kitness guard above and lib/db/advisory-locks.ts). So the cycle check inside the reconcile
-    // is best-effort here, exactly like the in-flight-sales guard it sits next to. What is NOT
-    // best-effort is the claim: `syncBomRecipeFromProductComponents` adopts with a compare-and-set
-    // and refuses rather than overwriting, which is what makes an unlocked path safe to claim from.
+    // LOCKING: this transaction took the component-graph lock before anything else (top of the
+    // transaction), so the cycle check inside the reconcile runs on a graph no other writer can change
+    // until this commit. The claim is additionally a compare-and-set.
     const bomReconcile = await reconcileBomRecipeForProductType(tx, {
       productId: id,
       sku: data.sku,
