@@ -244,7 +244,7 @@ test('a seam with the switch OFF is untouched: the push reaches the storefront a
 
 test('EVIDENCE: partial-shipped never vouches; completed must be received after the LATEST part\'s despatch; completed after the last part verifies', async () => {
   const { classifyStoredWcOrderDelivery } = await import('@/lib/connectors/woocommerce/sync/incumbent-partial-shipment')
-  const run = async (delivery: { status: string; receivedAt: Date }) => {
+  const run = async (delivery: { status: string; receivedAt: Date; dateCompletedGmt?: string }) => {
     reset()
     return withEnv(LIVE_AT_CUTOFF, async () => {
       const seen: Array<Date | null> = []
@@ -271,15 +271,20 @@ test('EVIDENCE: partial-shipped never vouches; completed must be received after 
       return { applied, seen, counters: result.counters }
     })
   }
-  const partial = await run({ status: 'partial-shipped', receivedAt: new Date('2026-05-25T00:00:00Z') })
+  const partial = await run({ status: 'partial-shipped', receivedAt: new Date('2026-05-25T00:00:00Z'), dateCompletedGmt: '2026-05-25T00:00:00' })
   assert.equal(partial.applied, 0, 'partial-shipped reflects at most the first part: the order stays pending')
   assert.equal(partial.counters.pending, 1)
   assert.ok(partial.seen.length > 0, 'PRECONDITION: the verifier was reached')
-  const early = await run({ status: 'completed', receivedAt: new Date('2026-05-21T00:00:00Z') }) // after part 1, BEFORE part 2 (05-22)
+  const early = await run({ status: 'completed', receivedAt: new Date('2026-05-21T00:00:00Z'), dateCompletedGmt: '2026-05-21T00:00:00' }) // after part 1, BEFORE part 2 (05-22)
   assert.equal(early.applied, 0, 'a completed delivery received before the second part despatched cannot vouch for it')
   assert.deepEqual(early.seen.map((d) => d?.toISOString()), [PRE2_ISO])
-  const full = await run({ status: 'completed', receivedAt: new Date('2026-05-23T00:00:00Z') })
+  const full = await run({ status: 'completed', receivedAt: new Date('2026-05-23T00:00:00Z'), dateCompletedGmt: '2026-05-23T00:00:00' })
   assert.equal(full.applied, 1, 'completed after the last part verifies')
+  // received late, but WooCommerce completed it before part 2 was despatched (05-22): the receipt time must not vouch for it
+  const delayed = await run({ status: 'completed', receivedAt: new Date('2026-05-23T00:00:00Z'), dateCompletedGmt: '2026-05-21T00:00:00' })
+  assert.equal(delayed.applied, 0, 'a delayed delivery carrying an earlier completion stays pending')
+  const undated = await run({ status: 'completed', receivedAt: new Date('2026-05-23T00:00:00Z') })
+  assert.equal(undated.applied, 0, 'no completion date stays pending')
 })
 
 test('MIXED order (one part verified pre-cutover, one pushed live and accepted): applied WITHOUT the "storefront already holds it" flag, so the normal completion stays', async () => {
