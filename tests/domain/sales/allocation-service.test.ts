@@ -24,7 +24,15 @@ type QueuedAccountingSync = {
 }
 
 /** The row as the enqueue WROTE it, carrying the connector it was actually written under. */
-type WrittenAccountingSync = QueuedAccountingSync & { connector: string }
+type WrittenAccountingSync = QueuedAccountingSync & {
+  connector: string
+  // The ledger-standing columns the verification reads with the row: a real queue writes PENDING; the producer-side hold writes a
+  // CANCELLED / HELD_SHADOW row carrying the same token.
+  status: string
+  externalTransactionId: string | null
+  abandonedBeforeRemoteCall: boolean | null
+  settlementBasis: string | null
+}
 
 /** Every enqueue ATTEMPT, whether or not it ended up writing a row. */
 const queuedAccountingSyncs: QueuedAccountingSync[] = []
@@ -45,7 +53,7 @@ const accountingSyncRows: WrittenAccountingSync[] = []
  * shape production takes with no connector configured — the call returns, nothing is written, and
  * nothing is thrown.
  */
-let accountingEnqueueOutcome: 'writes' | 'silent-no-op' = 'writes'
+let accountingEnqueueOutcome: 'writes' | 'silent-no-op' | 'shadowed' | 'asserted-only' = 'writes'
 
 /**
  * o3d-i0o6: the connector the ALLOCATION_REVERSAL would be raised on, as `@/lib/accounting` reports
@@ -79,7 +87,7 @@ const ACCOUNTING_ACCOUNTS: Record<string, { inventoryAccount: string; allocatedI
   quickbooks: { inventoryAccount: '730', allocatedInventoryAccount: '731' },
 }
 
-function resetAccountingQueue(outcome: 'writes' | 'silent-no-op' = 'writes'): void {
+function resetAccountingQueue(outcome: 'writes' | 'silent-no-op' | 'shadowed' | 'asserted-only' = 'writes'): void {
   queuedAccountingSyncs.length = 0
   accountingSyncRows.length = 0
   accountingEnqueueOutcome = outcome
@@ -131,7 +139,18 @@ mock.module('@/lib/accounting', {
       // wrong — the whole of HIGH 1 was invisible to this file.
       if (params.connector && params.connector !== activeAccountingConnector?.id) return false
       if (!accountingConnectorsThatPost.has(connector)) return false
-      accountingSyncRows.push({ ...params, connector })
+      // THE PRODUCER-SIDE HOLD: a shadow is a CANCELLED / HELD_SHADOW row carrying the SAME token, and the enqueue answers "not queued".
+      if (accountingEnqueueOutcome === 'shadowed') {
+        accountingSyncRows.push({ ...params, connector, status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true, settlementBasis: 'HELD_SHADOW' })
+        ;(params as { reportOutcome?: (o: unknown) => void }).reportOutcome?.({ queued: false, reason: 'shadowed', connector })
+        return false
+      }
+      // An operator-asserted row: the work slot is occupied, but on a typed id, not on the connector's word.
+      if (accountingEnqueueOutcome === 'asserted-only') {
+        accountingSyncRows.push({ ...params, connector, status: 'SYNCED', externalTransactionId: 'typed-id', abandonedBeforeRemoteCall: null, settlementBasis: 'OPERATOR_ASSERTION' })
+        return true
+      }
+      accountingSyncRows.push({ ...params, connector, status: 'PENDING', externalTransactionId: null, abandonedBeforeRemoteCall: null, settlementBasis: null })
       return true
     },
     isAccountingSyncTypeEnabled: async () => true,
@@ -888,6 +907,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
       //     wire. `state.syncPostingClaim` is what it finds, and the default of "nothing in flight"
       //     is what every pre-existing cancellation test assumes.
       findFirst: async (args?: {
+        select?: Record<string, boolean>
         where?: {
           connector?: string
           type?: string
@@ -898,7 +918,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
       }) => {
         const where = args?.where ?? {}
         if (where.payload == null) return state.syncPostingClaim ?? null
-        return accountingSyncRows.find((row) => {
+        const found = accountingSyncRows.find((row) => {
           // o3d-i0o6: the connector is part of the predicate when the caller asks for it. A double
           // that ignored it would answer "yes, queued" for a row written under another ledger, which
           // is precisely the relief-claiming defect the caller's new predicate closes.
@@ -912,6 +932,11 @@ function createClient(state: MemoryState): AllocationServiceClient {
           )
           return value === where.payload!.equals
         }) ?? null
+        // Honour `select`, as the database does: a caller that does not SELECT the standing columns gets none, and reads the row as not live.
+        if (found && args?.select) {
+          return Object.fromEntries(Object.keys(args.select).filter((key) => args.select![key]).map((key) => [key, (found as Record<string, unknown>)[key]]))
+        }
+        return found
       },
       // o3d-o97 r4: the A2 journal probed by its own id. A missing row is NOT "no journal" —
       // retention deletes terminal rows — so the un-stage keeps the stamp for it.
@@ -5647,4 +5672,43 @@ test('o3d-i0o6: a shrink on a fully-reversed order credits nothing at all', asyn
   assert.deepEqual(queuedAccountingSyncs.map((sync) => sync.type), [])
   assert.match(String(reversalRefusals()[0]?.description), /already been credited back/)
   assert.equal(state.order.allocationReversalAmount, 40, 'the running total does not move')
+})
+
+// ---------------------------------------------------------------------------------------------
+// A SHADOWED REVERSAL IS NOT RELIEF. Under the producer-side hold the enqueue writes a CANCELLED / HELD_SHADOW row carrying the
+// reversal token and answers "not queued". The verification used to find that row and say "queued", so the order recorded
+// `allocationReversalAmount` for a credit nobody will send; a later refund treated it as relief and left a real Allocated
+// Inventory balance unreversed with no record at all.
+// ---------------------------------------------------------------------------------------------
+
+test('a SHADOWED reversal records NO relief and IS reported with its amount; the same reallocation under a live queue records the relief', async () => {
+  // THE FINDING
+  const shadowed = deallocatedState(POSTED_TEN_AT_FOUR)
+  resetAccountingQueue('shadowed')
+  await releaseOrderAllocationsForDeallocationInTx(createClient(shadowed) as never, 'order-1')
+  assert.equal(accountingSyncRows.length, 1, 'PRECONDITION: the hold DID write a row carrying the token, so existence alone would have said "queued"')
+  assert.equal(accountingSyncRows[0].settlementBasis, 'HELD_SHADOW')
+  assert.equal(shadowed.order.allocationReversalAmount ?? null, null, 'no relief is claimed for a credit that will never be sent')
+  const reported = activityLogWrites.filter((row) => (row as { action: string }).action === 'allocation_reversal_unqueued') as Array<{ level: string; description: string; metadata: Record<string, unknown> }>
+  assert.equal(reported.length, 1, 'the unreversed amount is recorded for a human, as the non-queued path always did')
+  assert.equal(reported[0].level, 'ERROR')
+  assert.match(reported[0].description, /Allocation reversal of £40\.00 on order order-1 was NOT queued/)
+  assert.match(reported[0].description, /SHADOW/)
+  assert.equal(reported[0].metadata.rowSettlementBasis, 'HELD_SHADOW')
+
+  // THE SAME REALLOCATION ONCE THE POSTING GOES LIVE: the balance is reversed and recorded correctly
+  const live = deallocatedState(POSTED_TEN_AT_FOUR)
+  resetAccountingQueue()
+  await releaseOrderAllocationsForDeallocationInTx(createClient(live) as never, 'order-1')
+  assert.equal(Number(live.order.allocationReversalAmount), 40, 'a LIVE reversal records its relief')
+  assert.deepEqual(activityLogWrites.filter((row) => (row as { action: string }).action === 'allocation_reversal_unqueued'), [])
+})
+
+test('an OPERATOR-ASSERTED row (the work slot occupied on a typed id) is not relief either', async () => {
+  const state = deallocatedState(POSTED_TEN_AT_FOUR)
+  resetAccountingQueue('asserted-only')
+  await releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1')
+  assert.equal(accountingSyncRows.length, 1, 'PRECONDITION: a row carrying the token exists')
+  assert.equal(state.order.allocationReversalAmount ?? null, null)
+  assert.equal(activityLogWrites.filter((row) => (row as { action: string }).action === 'allocation_reversal_unqueued').length, 1)
 })
