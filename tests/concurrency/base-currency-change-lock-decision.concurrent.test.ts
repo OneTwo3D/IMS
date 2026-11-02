@@ -123,7 +123,9 @@ test('under the lock a change to a DIFFERENT base is still refused once the lock
   const sourceKeys = ['fx_rate_source', 'fx_rate_source_since', 'fx_rate_source_history']
   const savedSource = await db.setting.findMany({ where: { key: { in: sourceKeys } } })
   const nzdExisted = (await db.currency.count({ where: { code: 'NZD' } })) > 0
+  const gbpExisted = (await db.currency.count({ where: { code: 'GBP' } })) > 0 // a base change (even to the current base) creates the base currency row when it is missing
   t.after(async () => {
+    if (!gbpExisted) await db.currency.deleteMany({ where: { code: 'GBP' } })
     if (orgExisted) await db.organisation.update({ where: { id: org.id }, data: { baseCurrency: org.baseCurrency } })
     else await db.organisation.deleteMany({ where: { id: org.id } })
     if (!nzdExisted) await db.currency.deleteMany({ where: { code: 'NZD' } })
