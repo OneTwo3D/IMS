@@ -1,6 +1,7 @@
 'use server'
 
 import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
+import { taxTypeForBasis } from '@/lib/accounting/reverse-charge'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
@@ -4718,8 +4719,13 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
             amountForeign: Number(cn.amountForeign),
             transitAccount: settings.transitAccount,
             taxType: creditNoteTaxType,
-            // The rate that code was read from (the enqueue guard binds the code to it); none for a swapped / NONE type.
+            // The rate that code was read from and how (lib/accounting/reverse-charge.ts): bound only when the type IS that rate's derivation (a purchase goods line, else its own code); a NONE or mixed-bill type that is neither stays unbound.
             taxRateId: baseRate?.id,
+            taxRateBasis: baseRate?.id
+              ? (creditNoteTaxType === taxTypeForBasis('purchase_line', { baseTaxType: baseTaxType, reverseCharge: baseRate.reverseCharge, reverseChargePurchaseTaxType: settings.reverseChargePurchaseTaxType })
+                ? 'purchase_line'
+                : (baseTaxType == null || creditNoteTaxType === baseTaxType) ? 'plain' : undefined)
+              : undefined,
             // Reverse-charge credits carry a NET amount → post EXCLUSIVE so Xero
             // adds the notional VAT (mirroring the net/exclusive RC bill); all
             // others carry a GROSS amount → INCLUSIVE.

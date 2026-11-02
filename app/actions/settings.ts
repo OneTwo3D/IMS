@@ -1,6 +1,7 @@
 'use server'
 
 import { lockTaxRateForEdit } from '@/lib/tax/tax-rate-replaced'
+import { lockTaxCodeWrites } from '@/lib/tax/retired-tax-code-guard'
 import { revalidatePath } from 'next/cache'
 import { unstable_rethrow } from 'next/navigation'
 import { z } from 'zod'
@@ -391,6 +392,10 @@ export async function updateTaxRate(id: string, input: {
       if (!check.ok) return { success: false, error: check.error }
     }
     const summary = await db.$transaction(async (tx) => {
+      // EVERY edit takes the selection lock FIRST, unconditionally, before the fence and before the row lock, and holds it to the commit. The enqueue guard reads the rate's code, reverseCharge,
+      // active and replaced state under the same lock (lib/tax/retired-tax-code-guard.ts), so a verdict it reached stands until the producer commits whichever of those fields this edit changes.
+      // Order for everyone: selection lock, then the WooCommerce mapping lock, then rows.
+      await lockTaxCodeWrites(tx)
       if (input.accountingTaxType) {
         await (await import('@/lib/connectors/xero/connection-fence')).assertXeroConnectionUnchanged(tx as never, connection)
       }
