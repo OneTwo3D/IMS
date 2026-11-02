@@ -100,6 +100,7 @@ import {
   redactSecrets,
   renderMarkdown,
 } from '../lib/ops/first-install-rehearsal.ts'
+import { testScratchParentOptIn } from '../lib/ops/rehearsal-test-scratch.ts'
 import { type Cluster, currentUser, freePort, pgBinDir, startCluster, toolEnv } from '../tests/scripts/real-postgres-cluster.ts'
 
 // The publication helpers live in lib/ops/published-report.ts (the readiness gate publishes its report the same way).
@@ -596,7 +597,10 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
     return refuse(`cannot determine the file-system type of ${parentDir}: ${error instanceof Error ? error.message : String(error)}`)
   }
   if (RAM_BACKED.has(parentType)) {
-    return refuse(`${parentDir} is on ${parentType}: a cluster there is held in RAM. Use a disk-backed directory such as /var/tmp.`)
+    // The tests' own opt-in (lib/ops/rehearsal-test-scratch.ts) is the only way past this; with it unset the refusal is exactly what it always was.
+    const optIn = testScratchParentOptIn(parentDir)
+    if (!optIn.requested) return refuse(`${parentDir} is on ${parentType}: a cluster there is held in RAM. Use a disk-backed directory such as /var/tmp.`)
+    if (!optIn.accepted) return refuse(`${parentDir} is on ${parentType}: a cluster there is held in RAM. ${optIn.reason}`)
   }
   let reportDirId: FileIdentity | null = null
   // The report directory is checked BEFORE the cluster exists: a run that cannot write its report

@@ -333,8 +333,13 @@ cluster or need a trusted report directory create it under `scratchRoot()` (`tes
 Point it at a RAM-backed directory to keep those short-lived, write-heavy clusters off the SSD. The directory must be
 root-owned with the sticky bit (`1777`, as `/var/tmp` is): the report-directory trust checks refuse an ancestor that
 another account could modify unless it is a root-owned sticky directory. Keep the path short, because a Postgres
-unix-socket path is limited to about 107 bytes. The rehearsal tests (`tests/scripts/rehearse-*.test.ts`) stay on a
-fixed `/var/tmp` on purpose: the rehearsal tool refuses a RAM-backed parent.
+unix-socket path is limited to about 107 bytes. The rehearsal tests (`tests/scripts/rehearse-*.test.ts`) use
+`scratchRoot()` too. A real rehearsal still refuses a RAM-backed parent, exactly as before; the tests get past that
+refusal only through a test-only opt-in, `IMS_REHEARSAL_TEST_SCRATCH_PARENT=<dir>` (parsed in
+`lib/ops/rehearsal-test-scratch.ts`, set by those test files, never by anything in `app/`, `lib/`, `scripts/` or
+`deploy/`; a census test enforces that). It is honoured only for a directory that is root-owned and sticky, inside
+`IMS_SCRATCH_ROOT`, with every ancestor passing the rehearsal's own trust rules, and only for a rehearsal `--root` inside
+that directory; anything else is refused with the reason. Unset, it changes nothing.
 
 RESIDUALS, so nobody has to discover them:
 
