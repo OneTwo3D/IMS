@@ -21,6 +21,7 @@ import { D } from '../../lib/first-load/money'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-keys'
 import { digestTaxRateList, type NormalisedXeroTaxRate } from '../../lib/connectors/xero/tax-rate-list'
 import { seedXeroList as seedTrustedList } from './apply-xero-list'
+import { scratchRoot } from '../helpers/scratch-root'
 
 /**
  * THE DATABASE SIDE OF THE FIRST-LOAD APPLY RUNNER, on a real throwaway PostgreSQL cluster with the migrations applied.
@@ -160,7 +161,7 @@ const ports = (p: PreparedRun = prepared, overrides: Partial<ApplyPorts> = {}): 
 
 describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000 }, () => {
   before(async () => {
-    root = mkdtempSync('/var/tmp/ims-apply-db-')
+    root = mkdtempSync(join(scratchRoot(), 'ims-apply-db-'))
     for (const dir of ['home', 'npm-cache', 'tmp']) mkdirSync(join(root, dir))
     writeFileSync(join(root, 'empty.env'), '')
     const port = await freePort()

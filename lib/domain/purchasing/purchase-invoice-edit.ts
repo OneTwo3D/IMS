@@ -1,4 +1,5 @@
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
+import { rateBinding, resolvePurchaseLineTaxType } from '@/lib/accounting/reverse-charge'
 import { usableStoredFxRate } from '@/lib/currencies/stored-document-rate'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
@@ -73,9 +74,6 @@ export type PurchaseInvoiceLineDraft = {
   totalBase: number
 }
 
-/** `{ taxRateId }` only when there is one (no explicit undefined key on the line). */
-const optionalRateId = (id: string | undefined): { taxRateId?: string } => (id ? { taxRateId: id } : {})
-
 export type PurchaseInvoiceAccountingLine = {
   description: string
   quantity: number
@@ -84,6 +82,8 @@ export type PurchaseInvoiceAccountingLine = {
   taxType?: string
   /** The rate `taxType` was read from; never sent (the enqueue guard binds the code to it, lib/tax/retired-tax-code-guard.ts). */
   taxRateId?: string
+  /** How `taxType` was derived from that rate (lib/accounting/reverse-charge.ts TaxBindingBasis); never sent. */
+  taxRateBasis?: string
 }
 
 export type PurchaseInvoiceCalculation = {
@@ -213,17 +213,19 @@ export function calculatePurchaseInvoice(params: {
         totalBase,
       })
       const baseTaxType = poLine.taxRate?.accountingTaxType ?? params.fallbackTaxType
-      const productTaxType = poLine.taxRate?.reverseCharge && params.reverseChargeTaxType
-        ? params.reverseChargeTaxType
-        : baseTaxType
+      const productTaxType = resolvePurchaseLineTaxType({
+        baseTaxType,
+        reverseCharge: poLine.taxRate?.reverseCharge,
+        reverseChargePurchaseTaxType: params.reverseChargeTaxType,
+      })
       accountingLines.push({
         description: `PO ${params.poReference} line`,
         quantity: line.qtyBilled,
         unitAmount: rounded4(line.unitCostForeign),
         accountCode: params.transitAccount,
         taxType: productTaxType,
-        // The rate that code was read from (never sent): the line's own rate, else the supplier's default; absent for a swapped reverse-charge code.
-        ...optionalRateId(poLine.taxRate?.id ?? params.fallbackTaxRateId),
+        // The rate that code was read from (never sent), with the basis it was derived on: the line's own rate is a purchase goods line (reverse-charge swap), the supplier default is plain.
+        ...(poLine.taxRate?.id ? rateBinding(poLine.taxRate.id, 'purchase_line') : rateBinding(params.fallbackTaxRateId, 'plain')),
       })
       continue
     }
@@ -257,7 +259,7 @@ export function calculatePurchaseInvoice(params: {
       unitAmount: totalForeign,
       accountCode: params.transitAccount,
       taxType: costLine.vatable ? params.fallbackTaxType : undefined,
-      ...optionalRateId(costLine.vatable ? params.fallbackTaxRateId : undefined),
+      ...rateBinding(costLine.vatable ? params.fallbackTaxRateId : undefined, 'plain'),
     })
   }
 

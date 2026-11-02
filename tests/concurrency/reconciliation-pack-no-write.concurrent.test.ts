@@ -4,6 +4,7 @@ import { chmodSync, mkdtempSync, rmSync } from 'node:fs'
 import net from 'node:net'
 import test from 'node:test'
 import { config } from 'dotenv'
+import { scratchRoot } from '../helpers/scratch-root'
 
 /**
  * NO-WRITE AND NO-NETWORK PROOF for `npm run reconcile:pack`, against a real, migrated PostgreSQL.
@@ -248,7 +249,7 @@ test('[reconciliation pack] the rig can fail: a control write moves the row coun
 test('[reconciliation pack] a whole run of the command writes nothing and connects only to the database', { skip: !RUN }, async () => {
   const { runPackCli } = await import('../../scripts/reconciliation-pack.ts')
   const { healthyLiveness } = await import('../reconciliation-pack/basis-fixtures.ts')
-  const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
+  const dir = mkdtempSync(`${scratchRoot()}/recon-pack-nw-`)
   chmodSync(dir, 0o700)
   const url = new URL(process.env.DATABASE_URL!)
   const targets: string[] = []
@@ -288,7 +289,7 @@ test('[reconciliation pack] a whole run of the command writes nothing and connec
 
 test('[reconciliation pack] the REAL liveness reader (the status command as a child) on a scratch estate is never healthy: nothing passes, and nothing is written', { skip: !RUN }, async () => {
   const { runPackCli } = await import('../../scripts/reconciliation-pack.ts')
-  const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
+  const dir = mkdtempSync(`${scratchRoot()}/recon-pack-nw-`)
   chmodSync(dir, 0o700)
   try {
     const out: string[] = []
@@ -319,7 +320,7 @@ test('[reconciliation pack] R6 and R10 on a seeded estate: decided from stored s
   const { INTEGRATION_PLUGIN_SETTING_KEYS } = await import('../../lib/integration-plugin-keys.ts')
   const keys = { xero: INTEGRATION_PLUGIN_SETTING_KEYS.xero }
   const codes = { inventory: `${LTAG}1`, allocated: `${LTAG}2`, transit: `${LTAG}3`, cogs: `${LTAG}4`, unearned: `${LTAG}5` }
-  const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
+  const dir = mkdtempSync(`${scratchRoot()}/recon-pack-nw-`)
   chmodSync(dir, 0o700)
   const saved = await withClient(async (client) => (await client.query(`SELECT key, value FROM settings WHERE key = ANY($1)`, [[...SETTINGS, keys.xero]])).rows as Array<{ key: string; value: string }>)
   const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
@@ -421,7 +422,7 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   const storePort = (server.address() as import('node:net').AddressInfo).port
-  const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
+  const dir = mkdtempSync(`${scratchRoot()}/recon-pack-nw-`)
   chmodSync(dir, 0o700)
   const saved = await withClient(async (client) => (await client.query(`SELECT key, value FROM settings WHERE key = ANY($1)`, [VENDOR_SETTINGS])).rows as Array<{ key: string; value: string }>)
   const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
@@ -620,7 +621,7 @@ test('[reconciliation pack] R12 with --vendor-reads-only: the stored (never refr
   await Promise.all([xeroServer, wooServer].map((server) => new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))))
   const xeroPort = (xeroServer.address() as import('node:net').AddressInfo).port
   const wooPort = (wooServer.address() as import('node:net').AddressInfo).port
-  const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
+  const dir = mkdtempSync(`${scratchRoot()}/recon-pack-nw-`)
   chmodSync(dir, 0o700)
   const saved = await withClient(async (client) => (await client.query(`SELECT key, value FROM settings WHERE key = ANY($1)`, [X_SETTINGS])).rows as Array<{ key: string; value: string }>)
   let estate: Held = NOTHING_HELD
@@ -795,7 +796,7 @@ test('[reconciliation pack] R16 with --vendor-reads-only: the stored (never refr
   })
   await new Promise<void>((resolve) => xeroServer.listen(0, '127.0.0.1', resolve))
   const xeroPort = (xeroServer.address() as import('node:net').AddressInfo).port
-  const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
+  const dir = mkdtempSync(`${scratchRoot()}/recon-pack-nw-`)
   chmodSync(dir, 0o700)
   let estate: Held = NOTHING_HELD
   const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
@@ -1063,7 +1064,7 @@ test('[reconciliation pack] R1 with --vendor-reads-only: the stored fixed key, G
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   const port = (server.address() as import('node:net').AddressInfo).port
-  const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
+  const dir = mkdtempSync(`${scratchRoot()}/recon-pack-nw-`)
   chmodSync(dir, 0o700)
   const saved = await withClient(async (client) => (await client.query(`SELECT key, value FROM settings WHERE key = ANY($1)`, [MINTSOFT_SETTINGS])).rows as Array<{ key: string; value: string }>)
   const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
@@ -1244,8 +1245,8 @@ test('[reconciliation pack] R2, R5 and R14 with --qoblex-export: the export comp
   const { stockCsv, productsCsv } = await import('../reconciliation-pack/qoblex-fixtures.ts')
   void noSleep
   const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
-  const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
-  const exportDir = mkdtempSync('/var/tmp/recon-pack-qx-')
+  const dir = mkdtempSync(`${scratchRoot()}/recon-pack-nw-`)
+  const exportDir = mkdtempSync(`${scratchRoot()}/recon-pack-qx-`)
   chmodSync(dir, 0o700)
   chmodSync(exportDir, 0o700)
   const skus = [`${QTAG}-A`, `${QTAG}-B`]
@@ -1383,8 +1384,8 @@ test('[reconciliation pack] R7, R8 and R11 at P2: nothing read at P1, nothing of
   const { INTEGRATION_PLUGIN_SETTING_KEYS } = await import('../../lib/integration-plugin-keys.ts')
   const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
   const sha = (text: string) => createHash('sha256').update(text).digest('hex')
-  const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
-  const exportDir = mkdtempSync('/var/tmp/recon-pack-po-')
+  const dir = mkdtempSync(`${scratchRoot()}/recon-pack-nw-`)
+  const exportDir = mkdtempSync(`${scratchRoot()}/recon-pack-po-`)
   chmodSync(dir, 0o700)
   chmodSync(exportDir, 0o700)
   const codes = { inventory: `${OTAG}1`, allocated: `${OTAG}2`, transit: `${OTAG}3`, cogs: `${OTAG}4`, unearned: `${OTAG}5` }

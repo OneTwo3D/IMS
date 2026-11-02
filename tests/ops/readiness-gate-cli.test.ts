@@ -9,6 +9,7 @@ import { READINESS_GATE_EXIT_CODES } from '../../lib/ops/readiness-gate-constant
 import type { GateDeps } from '../../lib/ops/readiness-gate-collect.ts'
 import { parseGateArgs, runReadinessGate } from '../../scripts/readiness-gate.ts'
 import { ALL_CONSTRAINTS, GATE_BUILD, NOW, acceptanceText, cleanInvariant, cleanOutbound, greenRehearsal, validAcceptance, APPLY_RUN, APPLY_SYSTEM_ID, greenApplyReport, packRecord } from '../helpers/readiness-gate-fixtures.ts'
+import { scratchRoot } from '../helpers/scratch-root'
 
 const ROOT = process.cwd()
 
@@ -17,7 +18,7 @@ const ROOT = process.cwd()
 // (a root-owned sticky directory, on disk) and are removed when the file finishes.
 const bases: string[] = []
 function scratchBase(prefix: string): string {
-  const dir = mkdtempSync(path.join('/var/tmp', prefix))
+  const dir = mkdtempSync(path.join(scratchRoot(), prefix))
   bases.push(dir)
   return dir
 }

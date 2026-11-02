@@ -11,6 +11,7 @@ import { PACK_CADENCE_MAX_AGE_MS, PACK_ITEM_IDS, getPackItem, itemApplicability,
 import { publishSyntheticRun } from '../../lib/reconciliation-pack/harness.ts'
 import type { ItemInput } from '../../lib/reconciliation-pack/report.ts'
 import { APPLY_RUN, APPLY_SYSTEM_ID, ALL_CONSTRAINTS, DAY, GATE_BUILD, NOW, NO_ACCEPTANCES, cleanInvariant, cleanOutbound, greenApplyReport, greenRehearsal, packPass, packRecord, packStreams } from '../helpers/readiness-gate-fixtures.ts'
+import { scratchRoot } from '../helpers/scratch-root'
 
 /**
  * THE GATE READS THE PACK'S NEWEST REPORT (lib/ops/readiness-gate-pack.ts): the mapping, every trust rule, and the two-way
@@ -19,7 +20,7 @@ import { APPLY_RUN, APPLY_SYSTEM_ID, ALL_CONSTRAINTS, DAY, GATE_BUILD, NOW, NO_A
 
 const bases: string[] = []
 function scratch(): string {
-  const dir = mkdtempSync(path.join('/var/tmp', 'ims-gate-pack-'))
+  const dir = mkdtempSync(path.join(scratchRoot(), 'ims-gate-pack-'))
   chmodSync(dir, 0o700)
   bases.push(dir)
   return dir
