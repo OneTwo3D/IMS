@@ -134,17 +134,17 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
           await tx.currency.update({ where: { code }, data: { active: true } })
         }
         await tx.organisation.updateMany({ data: updateData })
+        // The marker is written in THIS transaction, so the base and the fact that it is locked commit together before the FX lock is released: a different-base request queued behind this one gets the lock
+        // and finds the marker, instead of an empty install it may change again.
+        await tx.setting.upsert({
+          where: { key: 'base_currency_locked' },
+          create: { key: 'base_currency_locked', value: 'true' },
+          update: { value: 'true' },
+        })
         return null
       })
       if (refusal) return { success: false, error: refusal }
     } else await db.organisation.updateMany({ data: updateData })
-    if (updateData.baseCurrency) {
-      await db.setting.upsert({
-        where: { key: 'base_currency_locked' },
-        create: { key: 'base_currency_locked', value: 'true' },
-        update: { value: 'true' },
-      })
-    }
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated company details' })
     revalidatePath('/settings')
     revalidatePath('/settings/company')

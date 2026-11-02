@@ -8,7 +8,7 @@ import { loadEnv } from './po-landed-fixtures'
  * Two requests change the base to the same code. The second one is held up (a pooled connection that is slow to arrive, a queue for the lock) AFTER it has read the base currency and BEFORE it
  * reads the lock marker. The first one commits in that gap and sets the marker. A check made outside the lock then finds "marker set, and the base I saw is not the target" and refuses a request
  * that, under the lock, is no change at all. The gap is forced here (the pre-lock read of the marker is parked until the first request has finished), so the failure does not depend on timing.
- * Real Postgres. Mutation: put a base / marker check back before the lock -> the second request is refused; read the in-lock state off the global client -> the lock holder asks the pool for a second
+ * Real Postgres. Mutation: write the lock marker after the lock transaction, or not at all -> a queued different-base change is applied as well; put a base / marker check back before the lock -> the second request is refused; read the in-lock state off the global client -> the lock holder asks the pool for a second
  * connection; drop the in-lock marker check -> the lock test refuses nothing.
  */
 
@@ -143,7 +143,78 @@ test('under the lock a change to a DIFFERENT base is still refused once the lock
   assert.deepEqual(await updateOrganisation({ baseCurrency: 'GBP' }), { success: true }, 'the current base is no change, so the lock does not refuse it')
 })
 
-test('pool size + 2 concurrent changes to DIFFERENT bases each reach the in-lock marker check without asking the pool for a second connection', SKIP, async (t) => {
+test('two queued changes to DIFFERENT bases on an empty install: the first commits the base and the lock marker together, the second is refused in the lock', SKIP, async (t) => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const { withFxTableWriteLock } = await import('@/lib/currencies/fx-table-lock')
+  const { updateOrganisation } = await import('@/app/actions/company')
+  const orgExisted = await db.organisation.findFirst({ select: { id: true, baseCurrency: true } })
+  const org = orgExisted ?? await db.organisation.create({ data: { name: 'Base lock test org', baseCurrency: 'GBP' }, select: { id: true, baseCurrency: true } })
+  const lockedSetting = await db.setting.findUnique({ where: { key: 'base_currency_locked' } })
+  const sourceKeys = ['fx_rate_source', 'fx_rate_source_since', 'fx_rate_source_history']
+  const savedSource = await db.setting.findMany({ where: { key: { in: sourceKeys } } })
+  const existing = new Set((await db.currency.findMany({ where: { code: { in: ['AUD', 'NZD', 'GBP'] } }, select: { code: true } })).map((c) => c.code))
+  let releaseMarkerHold: () => void = () => {}
+  t.after(async () => {
+    releaseMarkerHold()
+    if (orgExisted) await db.organisation.update({ where: { id: org.id }, data: { baseCurrency: org.baseCurrency } })
+    else await db.organisation.deleteMany({ where: { id: org.id } })
+    await db.currency.deleteMany({ where: { code: { in: ['AUD', 'NZD', 'GBP'].filter((c) => !existing.has(c)) } } })
+    await db.setting.deleteMany({ where: { key: { in: ['base_currency_locked', ...sourceKeys] } } })
+    for (const s of [...savedSource, ...(lockedSetting ? [lockedSetting] : [])]) await db.setting.create({ data: { key: s.key, value: s.value } })
+  })
+  await db.setting.deleteMany({ where: { key: { in: ['base_currency_locked', ...sourceKeys] } } })
+  await db.organisation.updateMany({ data: { baseCurrency: 'GBP' } })
+
+  // Another session has the marker row inserted and uncommitted (value false: not locked). Whoever writes the marker waits for it. A marker written INSIDE the lock transaction makes the lock holder wait here
+  // with the FX lock still held, so the second request cannot get in; a marker written AFTER the lock is released leaves the second request free to take the lock and find no marker.
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+  const markerHeld = new Promise<void>((r) => { releaseMarkerHold = r })
+  let markerIn: () => void = () => {}
+  const markerInserted = new Promise<void>((r) => { markerIn = r })
+  const markerSession = db.$transaction(async (tx) => {
+    await tx.setting.create({ data: { key: 'base_currency_locked', value: 'false' } })
+    markerIn()
+    await markerHeld
+    throw new Error('rollback the held marker row')
+  }, { timeout: 60_000 }).catch(() => {})
+  await markerInserted
+
+  let releaseHolder: () => void = () => {}
+  const holderGate = new Promise<void>((r) => { releaseHolder = r })
+  let holderIn: () => void = () => {}
+  const holderEntered = new Promise<void>((r) => { holderIn = r })
+  const holder = withFxTableWriteLock(async () => { holderIn(); await holderGate })
+  await holderEntered
+  const a = updateOrganisation({ baseCurrency: 'AUD' })
+  const b = updateOrganisation({ baseCurrency: 'NZD' })
+  let queued = 0
+  for (let i = 0; i < 100 && queued < 2; i++) {
+    queued = Number((await db.$queryRaw<Array<{ n: bigint }>>`SELECT count(*)::bigint AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`)[0]?.n ?? 0)
+    if (queued < 2) await sleep(50)
+  }
+  assert.equal(queued, 2, 'PRECONDITION: both changes wait on the FX table lock')
+  releaseHolder()
+  await holder
+  let blocked = 0
+  for (let i = 0; i < 100 && blocked === 0; i++) {
+    blocked = Number((await db.$queryRaw<Array<{ n: bigint }>>`SELECT count(*)::bigint AS n FROM pg_locks WHERE locktype = 'transactionid' AND NOT granted`)[0]?.n ?? 0)
+    if (blocked === 0) await sleep(50)
+  }
+  assert.ok(blocked >= 1, 'PRECONDITION: a marker write is waiting on the held marker row')
+  await sleep(500) // time for a second request to take the lock, if the lock was released
+  releaseMarkerHold()
+  await markerSession
+  const results = await Promise.all([a, b])
+  assert.equal(results.filter((r) => r.success).length, 1, 'exactly one of the two different-base changes is applied')
+  const refused = results.find((r) => !r.success)
+  assert.match(refused?.error ?? '', /locked after setup/, 'the other was refused in the lock')
+  const winner = results[0].success ? 'AUD' : 'NZD'
+  assert.equal((await db.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency, winner)
+  assert.equal((await db.setting.findUnique({ where: { key: 'base_currency_locked' } }))?.value, 'true', 'the marker committed with the base')
+})
+
+test('pool size + 2 concurrent changes to DIFFERENT bases: exactly one is applied, the rest are refused in the lock, and none asks the pool for a second connection', SKIP, async (t) => {
   loadEnv()
   const { db, dbPoolConfig, DB_POOL_ACQUISITION_TIMEOUT_MS } = await import('@/lib/db')
   const { updateOrganisation } = await import('@/app/actions/company')
@@ -173,7 +244,7 @@ test('pool size + 2 concurrent changes to DIFFERENT bases each reach the in-lock
   const started = Date.now()
   const results = await Promise.all(codes.map((code) => updateOrganisation({ baseCurrency: code })))
   const elapsed = Date.now() - started
-  assert.deepEqual(results.filter((r) => !r.success && !/locked after setup/.test(r.error ?? '')), [], 'a request is either applied or refused by the lock marker; none fails for want of a connection')
-  assert.ok(results.some((r) => r.success), 'the first request is applied')
+  assert.equal(results.filter((r) => r.success).length, 1, 'exactly one change is applied: the marker commits with the base, so every request behind it is refused in the lock')
+  assert.deepEqual(results.filter((r) => !r.success && !/locked after setup/.test(r.error ?? '')), [], 'the rest are refused by the lock marker; none fails for want of a connection')
   assert.ok(elapsed < DB_POOL_ACQUISITION_TIMEOUT_MS, `and the lot finishes without waiting out the pool's acquisition timeout (${elapsed} ms)`)
 })
