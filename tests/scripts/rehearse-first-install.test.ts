@@ -4,7 +4,6 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, 
 import { join } from 'node:path'
 import { type TestContext, test } from 'node:test'
 import { pgBinDir, startCluster } from './real-postgres-cluster.ts'
-import { TEST_SCRATCH_PARENT_ENV } from '@/lib/ops/rehearsal-test-scratch'
 import { scratchRoot } from '../helpers/scratch-root'
 
 import {
@@ -31,10 +30,9 @@ import {
 import { ancestorProblem, capturePostmaster, inheritedEnv, verifyPublishedReport, writeExclusive, postmasterIsStillOurs, processStartEpochSeconds, parseArgs, processIsAlive, processesNaming, runRehearsal, shredFile, type RehearsalHooks } from '@/scripts/rehearse-first-install'
 
 const REPO = process.cwd()
-// IMS_SCRATCH_ROOT, when set, moves the throwaway clusters off the SSD (unset: /var/tmp, as always). The opt-in below is the tests' own: it only matters when that root is
-// RAM-backed (a real rehearsal refuses one) and it is honoured only for a root-owned sticky directory inside IMS_SCRATCH_ROOT. The RAM-refusal tests below remove it.
+// IMS_SCRATCH_ROOT, when set, moves the throwaway clusters off the SSD (unset: /var/tmp, as always). A real rehearsal refuses a RAM-backed (tmpfs/ramfs) parent, so on a genuinely
+// tmpfs scratch root these tests cannot run; a disk-backed RAM disk (ext4 on zram) is fine.
 const SCRATCH_PARENT = scratchRoot()
-if (SCRATCH_PARENT !== '/var/tmp') process.env[TEST_SCRATCH_PARENT_ENV] = SCRATCH_PARENT
 const TIMEOUT = 15 * 60 * 1000
 
 // ---------------------------------------------------------------------------------------------
@@ -297,12 +295,8 @@ test('shredFile refuses a symlink, a different regular file and a FIFO at the na
 test('a RAM-backed --root is refused before anything is created', () => {
   const type = execFileSync('stat', ['-f', '-c', '%T', '/dev/shm'], { encoding: 'utf8' }).trim()
   assert.equal(type, 'tmpfs', 'precondition: /dev/shm is tmpfs on this host')
-  const optIn = process.env[TEST_SCRATCH_PARENT_ENV]
-  delete process.env[TEST_SCRATCH_PARENT_ENV] // the production refusal, with no test opt-in in play
   const before = readdirSync('/dev/shm').filter((name) => name.startsWith('ims-rehearsal-'))
-  return runRehearsal({ parentDir: '/dev/shm', log: () => undefined }).finally(() => {
-    if (optIn !== undefined) process.env[TEST_SCRATCH_PARENT_ENV] = optIn
-  }).then((outcome) => {
+  return runRehearsal({ parentDir: '/dev/shm', log: () => undefined }).then((outcome) => {
     assert.equal(outcome.exitCode, REHEARSAL_EXIT.REFUSED)
     assert.equal(outcome.report, null)
     assert.match(outcome.refusal ?? '', /tmpfs/)

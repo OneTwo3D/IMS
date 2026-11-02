@@ -132,7 +132,6 @@ import {
   withClient,
   writeExclusive,
 } from './rehearse-first-install.ts'
-import { testScratchParentOptIn } from '../lib/ops/rehearsal-test-scratch.ts'
 import { startFakeWooCommerce, type FakeWooCommerce } from '../tests/helpers/fake-woocommerce.ts'
 import { SKU_STOCKED, SKU_UNSTOCKED, SKU_PLENTY, wooFixtureOrders, type FixtureOrder } from '../tests/fixtures/woo-import/orders.ts'
 import { freePort, pgBinDir, startCluster } from '../tests/scripts/real-postgres-cluster.ts'
@@ -252,12 +251,7 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
   if (rootAncestors !== null) return refuse(rootAncestors)
   try {
     const parentType = filesystemType(parentDir)
-    if (RAM_BACKED.has(parentType)) {
-      // The tests' own opt-in (lib/ops/rehearsal-test-scratch.ts) is the only way past this; with it unset the refusal is exactly what it always was.
-      const optIn = testScratchParentOptIn(parentDir)
-      if (!optIn.requested) return refuse(`${parentDir} is on ${parentType}: a cluster there is held in RAM. Use a disk-backed directory such as /var/tmp.`)
-      if (!optIn.accepted) return refuse(`${parentDir} is on ${parentType}: a cluster there is held in RAM. ${optIn.reason}`)
-    }
+    if (RAM_BACKED.has(parentType)) return refuse(`${parentDir} is on ${parentType}: a cluster there is held in RAM. Use a disk-backed directory such as /var/tmp.`)
   } catch (error) {
     return refuse(`cannot determine the file-system type of ${parentDir}: ${error instanceof Error ? error.message : String(error)}`)
   }
