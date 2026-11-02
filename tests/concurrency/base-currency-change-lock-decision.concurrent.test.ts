@@ -142,3 +142,38 @@ test('under the lock a change to a DIFFERENT base is still refused once the lock
   assert.equal(await db.currency.count({ where: { code: 'NZD' } }), nzdExisted ? 1 : 0, 'the would-be base currency was not created')
   assert.deepEqual(await updateOrganisation({ baseCurrency: 'GBP' }), { success: true }, 'the current base is no change, so the lock does not refuse it')
 })
+
+test('pool size + 2 concurrent changes to DIFFERENT bases each reach the in-lock marker check without asking the pool for a second connection', SKIP, async (t) => {
+  loadEnv()
+  const { db, dbPoolConfig, DB_POOL_ACQUISITION_TIMEOUT_MS } = await import('@/lib/db')
+  const { updateOrganisation } = await import('@/app/actions/company')
+  const poolSize = dbPoolConfig().max
+  const many = poolSize + 2
+  const codes = Array.from({ length: many }, (_, i) => `Z${String.fromCharCode(65 + Math.floor(i / 26))}${String.fromCharCode(65 + (i % 26))}`)
+  const existingCodes = new Set((await db.currency.findMany({ where: { code: { in: codes } }, select: { code: true } })).map((c) => c.code))
+  const orgExisted = await db.organisation.findFirst({ select: { id: true, baseCurrency: true } })
+  const org = orgExisted ?? await db.organisation.create({ data: { name: 'Base lock test org', baseCurrency: 'GBP' }, select: { id: true, baseCurrency: true } })
+  const lockedSetting = await db.setting.findUnique({ where: { key: 'base_currency_locked' } })
+  const sourceKeys = ['fx_rate_source', 'fx_rate_source_since', 'fx_rate_source_history']
+  const savedSource = await db.setting.findMany({ where: { key: { in: sourceKeys } } })
+  const gbpExisted = (await db.currency.count({ where: { code: 'GBP' } })) > 0
+  t.after(async () => {
+    if (orgExisted) await db.organisation.update({ where: { id: org.id }, data: { baseCurrency: org.baseCurrency } })
+    else await db.organisation.deleteMany({ where: { id: org.id } })
+    await db.currency.deleteMany({ where: { code: { in: codes.filter((c) => !existingCodes.has(c)) } } })
+    if (!gbpExisted) await db.currency.deleteMany({ where: { code: 'GBP' } })
+    await db.setting.deleteMany({ where: { key: { in: ['base_currency_locked', ...sourceKeys] } } })
+    for (const s of [...savedSource, ...(lockedSetting ? [lockedSetting] : [])]) await db.setting.create({ data: { key: s.key, value: s.value } })
+  })
+  await db.setting.deleteMany({ where: { key: { in: ['base_currency_locked', ...sourceKeys] } } })
+  await db.organisation.updateMany({ data: { baseCurrency: 'GBP' } })
+
+  // every request has a target other than the base it will find, so every one of them reaches the lock marker read inside the lock; a request that reads it on the global client needs a second connection
+  // from a pool the waiters have used up
+  const started = Date.now()
+  const results = await Promise.all(codes.map((code) => updateOrganisation({ baseCurrency: code })))
+  const elapsed = Date.now() - started
+  assert.deepEqual(results.filter((r) => !r.success && !/locked after setup/.test(r.error ?? '')), [], 'a request is either applied or refused by the lock marker; none fails for want of a connection')
+  assert.ok(results.some((r) => r.success), 'the first request is applied')
+  assert.ok(elapsed < DB_POOL_ACQUISITION_TIMEOUT_MS, `and the lot finishes without waiting out the pool's acquisition timeout (${elapsed} ms)`)
+})
