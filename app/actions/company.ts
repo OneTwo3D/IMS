@@ -8,7 +8,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { getSettingValue, getSettingValues, serializeSettingValue } from '@/lib/settings-store'
-import { isValidCurrencyCode } from '@/lib/currencies/fx-select'
+import { isKnownCurrency } from '@/lib/reconciliation-pack/constants'
 import { DEFAULT_BASE_CURRENCY, getFallbackCurrencyMeta, isBaseCurrencyLocked } from '@/lib/base-currency'
 import { toIsoCountryCode } from '@/lib/countries'
 import { DEFAULT_TIMEZONE, isValidTimeZone } from '@/lib/format-datetime'
@@ -110,7 +110,7 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
     // EVERY supplied value (even '' or spaces) is normalised and then checked, and takes the locked path below: only a request that supplies no base at all may skip the lock.
     if (updateData.baseCurrency !== undefined) {
       const normalizedBase = typeof updateData.baseCurrency === 'string' ? updateData.baseCurrency.toUpperCase().trim() : ''
-      if (!isValidCurrencyCode(normalizedBase)) return { success: false, error: 'Select a valid base currency.' }
+      if (!isKnownCurrency(normalizedBase)) return { success: false, error: 'Select a valid base currency.' }
       updateData.baseCurrency = normalizedBase
     }
 

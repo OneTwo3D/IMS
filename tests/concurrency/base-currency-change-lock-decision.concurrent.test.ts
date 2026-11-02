@@ -266,14 +266,55 @@ test('a base value that is empty, blank, malformed or in lower case is normalise
   assert.equal((await db.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency, 'GBP')
 })
 
+test('on an unlocked install an unsupported three-letter code is refused with nothing written, and a supported but inactive ISO code still becomes the base', SKIP, async (t) => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const { updateOrganisation } = await import('@/app/actions/company')
+  const orgExisted = await db.organisation.findFirst({ select: { id: true, baseCurrency: true } })
+  const org = orgExisted ?? await db.organisation.create({ data: { name: 'Base lock test org', baseCurrency: 'GBP' }, select: { id: true, baseCurrency: true } })
+  const lockedSetting = await db.setting.findUnique({ where: { key: 'base_currency_locked' } })
+  const sourceKeys = ['fx_rate_source', 'fx_rate_source_since', 'fx_rate_source_history']
+  const savedSource = await db.setting.findMany({ where: { key: { in: sourceKeys } } })
+  const codes = ['ZZZ', 'XYZ', 'NOK', 'GBP']
+  const existing = new Map((await db.currency.findMany({ where: { code: { in: codes } }, select: { code: true, active: true } })).map((c) => [c.code, c.active]))
+  t.after(async () => {
+    if (orgExisted) await db.organisation.update({ where: { id: org.id }, data: { baseCurrency: org.baseCurrency } })
+    else await db.organisation.deleteMany({ where: { id: org.id } })
+    await db.currency.deleteMany({ where: { code: { in: codes.filter((c) => !existing.has(c)) } } })
+    for (const [code, active] of existing) await db.currency.update({ where: { code }, data: { active } })
+    await db.setting.deleteMany({ where: { key: { in: ['base_currency_locked', ...sourceKeys] } } })
+    for (const s of [...savedSource, ...(lockedSetting ? [lockedSetting] : [])]) await db.setting.create({ data: { key: s.key, value: s.value } })
+  })
+  await db.setting.deleteMany({ where: { key: { in: ['base_currency_locked', ...sourceKeys] } } })
+  await db.currency.upsert({ where: { code: 'GBP' }, update: {}, create: { code: 'GBP', name: 'GBP', symbol: 'GBP', active: true } })
+  await db.currency.upsert({ where: { code: 'NOK' }, update: { active: false }, create: { code: 'NOK', name: 'NOK', symbol: 'kr', active: false } })
+  await db.organisation.updateMany({ data: { baseCurrency: 'GBP' } })
+  const currencyCount = await db.currency.count()
+
+  for (const bad of ['ZZZ', ' xyz ']) {
+    const result = await updateOrganisation({ baseCurrency: bad })
+    assert.equal(result.success, false, `${JSON.stringify(bad)} is refused`)
+    assert.match(result.error ?? '', /valid base currency/)
+    assert.equal(await db.currency.count(), currencyCount, `${JSON.stringify(bad)} created no currency`)
+    assert.equal((await db.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency, 'GBP')
+    assert.equal(await db.setting.findUnique({ where: { key: 'base_currency_locked' } }), null, `${JSON.stringify(bad)} did not lock the base currency`)
+  }
+  assert.deepEqual(await updateOrganisation({ baseCurrency: ' nok ' }), { success: true }, 'a supported ISO code that is inactive becomes the base')
+  assert.equal((await db.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency, 'NOK')
+  assert.equal((await db.currency.findUnique({ where: { code: 'NOK' } }))?.active, true, 'and is activated')
+  assert.equal((await db.setting.findUnique({ where: { key: 'base_currency_locked' } }))?.value, 'true')
+})
+
 test('pool size + 2 concurrent changes to DIFFERENT bases: exactly one is applied, the rest are refused in the lock, and none asks the pool for a second connection', SKIP, async (t) => {
   loadEnv()
   const { db, dbPoolConfig, DB_POOL_ACQUISITION_TIMEOUT_MS } = await import('@/lib/db')
   const { updateOrganisation } = await import('@/app/actions/company')
   const poolSize = dbPoolConfig().max
   const many = poolSize + 2
-  const codes = Array.from({ length: many }, (_, i) => `Z${String.fromCharCode(65 + Math.floor(i / 26))}${String.fromCharCode(65 + (i % 26))}`)
-  const existingCodes = new Set((await db.currency.findMany({ where: { code: { in: codes } }, select: { code: true } })).map((c) => c.code))
+  const { PACK_KNOWN_CURRENCIES } = await import('@/lib/reconciliation-pack/constants')
+  const codes = [...PACK_KNOWN_CURRENCIES].filter((c) => c !== 'GBP').slice(0, many) // real ISO codes: an unknown one is refused before the lock
+  const existingRows = await db.currency.findMany({ where: { code: { in: codes } }, select: { code: true, active: true } })
+  const existingCodes = new Set(existingRows.map((c) => c.code))
   const orgExisted = await db.organisation.findFirst({ select: { id: true, baseCurrency: true } })
   const org = orgExisted ?? await db.organisation.create({ data: { name: 'Base lock test org', baseCurrency: 'GBP' }, select: { id: true, baseCurrency: true } })
   const lockedSetting = await db.setting.findUnique({ where: { key: 'base_currency_locked' } })
@@ -284,6 +325,7 @@ test('pool size + 2 concurrent changes to DIFFERENT bases: exactly one is applie
     if (orgExisted) await db.organisation.update({ where: { id: org.id }, data: { baseCurrency: org.baseCurrency } })
     else await db.organisation.deleteMany({ where: { id: org.id } })
     await db.currency.deleteMany({ where: { code: { in: codes.filter((c) => !existingCodes.has(c)) } } })
+    for (const row of existingRows) await db.currency.update({ where: { code: row.code }, data: { active: row.active } })
     if (!gbpExisted) await db.currency.deleteMany({ where: { code: 'GBP' } })
     await db.setting.deleteMany({ where: { key: { in: ['base_currency_locked', ...sourceKeys] } } })
     for (const s of [...savedSource, ...(lockedSetting ? [lockedSetting] : [])]) await db.setting.create({ data: { key: s.key, value: s.value } })
