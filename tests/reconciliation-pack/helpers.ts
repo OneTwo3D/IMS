@@ -6,11 +6,12 @@ import { PACK_ITEM_IDS, getPackItem, type PackItemId } from '../../lib/reconcili
 import { outcomeOfComparison } from '../../lib/reconciliation-pack/compare.ts'
 import type { ItemInput } from '../../lib/reconciliation-pack/report.ts'
 import type { KeyPart } from '../../lib/reconciliation-pack/identity.ts'
+import { scratchRoot } from '../helpers/scratch-root'
 
 // Report directories must sit under ancestors only root or this account can modify; the unit runner's private
 // TMPDIR is group/other-writable, so these live under /var/tmp (a root-owned sticky directory).
 export function scratchDir(bases: string[], prefix = 'recon-pack-'): string {
-  const dir = mkdtempSync(path.join('/var/tmp', prefix))
+  const dir = mkdtempSync(path.join(scratchRoot(), prefix))
   chmodSync(dir, 0o700)
   bases.push(dir)
   return dir

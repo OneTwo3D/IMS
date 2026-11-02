@@ -18,6 +18,7 @@ import type { FakeWooCommerce } from '@/tests/helpers/fake-woocommerce'
  * comment above it; the change was made, the arm went red, and the change was reverted (md5-verified).
  */
 
+// Deliberately a fixed disk-backed /var/tmp, not scratchRoot(): the rehearsal tool refuses a RAM-backed parent, and these tests exercise that.
 const SCRATCH_PARENT = '/var/tmp'
 const REPO_CWD = process.cwd()
 const TIMEOUT = 15 * 60 * 1000

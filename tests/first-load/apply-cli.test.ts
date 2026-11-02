@@ -13,6 +13,7 @@ import { prepareReportDir, publishReportPair, readEnvFile, sha256OfFile } from '
 import { sameCounts } from '../../scripts/lib/first-load-rehearse.ts'
 import { FakeDatabase, loadOk, prepareSynthetic, preparedFiles } from './apply-helpers.ts'
 import { precondition } from './helpers.ts'
+import { scratchRoot } from '../helpers/scratch-root'
 
 /**
  * THE COMMAND LINE, WITHOUT A DATABASE: arguments, the environment a run gets, the rehearsal record, the env file and the report directory. (The command against a real database,
@@ -262,7 +263,7 @@ test('the target is proved unchanged by exact counts of every table: one row, on
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 // Under /var/tmp, not os.tmpdir(): the unit tier points TMPDIR at a private directory that other accounts could write to, and the report directory's ancestor check (rightly) refuses that.
-const scratch = mkdtempSync('/var/tmp/first-load-apply-cli-unit-')
+const scratch = mkdtempSync(path.join(scratchRoot(), 'first-load-apply-cli-unit-'))
 after(() => rmSync(scratch, { recursive: true, force: true }))
 let counter = 0
 const fresh = (label: string) => path.join(scratch, `${label}-${++counter}`)

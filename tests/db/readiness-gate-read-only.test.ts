@@ -3,6 +3,7 @@ import test from 'node:test'
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { config } from 'dotenv'
+import { scratchRoot } from '../helpers/scratch-root'
 
 /**
  * THE READINESS GATE WRITES NOTHING TO THE DATABASE IT IS POINTED AT.
@@ -84,7 +85,7 @@ test('[readiness gate] DB: the default collectors complete over a READ-ONLY conn
   const before = snapshotCheckout(process.cwd())
   console.log(`precondition: ${before.size} checkout files snapshotted (generated client, schema, lib, scripts, manifests)`)
   assert.ok(before.size > 500,  'precondition: the snapshot saw the checkout')
-  const reportDir = mkdtempSync(path.join('/var/tmp', 'ims-gate-ro-'))
+  const reportDir = mkdtempSync(path.join(scratchRoot(), 'ims-gate-ro-'))
   try {
     const out: string[] = []
     const code = await runReadinessGate({

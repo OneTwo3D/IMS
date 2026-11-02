@@ -5,6 +5,7 @@ import { after, before, describe, it, mock } from 'node:test'
 
 import { freePort, startCluster, type Cluster } from '../scripts/real-postgres-cluster'
 import { databaseUrl, ident, inheritedEnv, randomHex, runChild, socketPsql, tail, withClient } from '../../scripts/rehearse-first-install'
+import { scratchRoot } from '../helpers/scratch-root'
 
 /**
  * THE FIRST-LOAD IMPORTERS RUN OUTSIDE NEXT, AS A SYSTEM ACTOR (spike + seam).
@@ -110,7 +111,7 @@ let controlRows = 0
 
 describe('the first-load importers as a system actor', { timeout: 20 * 60 * 1000 }, () => {
   before(async () => {
-    root = mkdtempSync('/var/tmp/ims-system-import-')
+    root = mkdtempSync(join(scratchRoot(), 'ims-system-import-'))
     for (const dir of ['home', 'npm-cache', 'tmp']) mkdirSync(join(root, dir))
     writeFileSync(join(root, 'empty.env'), '')
     const port = await freePort()

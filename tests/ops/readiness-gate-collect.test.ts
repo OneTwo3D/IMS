@@ -24,6 +24,7 @@ import { normaliseConstraintDefinition, READ_SYNC_STATUS_SCRIPT, REQUIRED_CHECK_
 import { decideVerdict } from '../../lib/ops/readiness-gate.ts'
 import type { AccountingReconciliationReadiness } from '../../lib/ops/rollout-readiness.ts'
 import { ALL_CONSTRAINTS, DAY, PG_RENDERED, constraintRows, GATE_BUILD, NOW, NO_ACCEPTANCES, cleanInvariant, cleanOutbound, greenRehearsal, APPLY_RUN, APPLY_SYSTEM_ID, greenApplyReport, packRecord } from '../helpers/readiness-gate-fixtures.ts'
+import { scratchRoot } from '../helpers/scratch-root'
 
 /**
  * COLLECTION: every dependency failing is `unreadable`, never silence; the child environment is a
@@ -36,7 +37,7 @@ const ROOT = process.cwd()
 // group/other-writable, so these live under /var/tmp (root-owned, sticky, on disk) and are removed afterwards.
 const bases: string[] = []
 function scratchBase(prefix: string): string {
-  const dir = mkdtempSync(path.join('/var/tmp', prefix))
+  const dir = mkdtempSync(path.join(scratchRoot(), prefix))
   bases.push(dir)
   return dir
 }
