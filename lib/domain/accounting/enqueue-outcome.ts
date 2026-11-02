@@ -76,10 +76,12 @@ export type EnqueueOutcomeLike = {
  * Is this posting STILL OWED?
  *
  * `queued: true`                 no — a sync row is durable (this call wrote it, or found one standing).
- * `queued: true, shadowed`      no — the producer-side hold said SHADOW: IMS recorded a shadow and created no outbox
- *                                job and no accounting event. IMS owes the ledger nothing for it in the current phase
+ * `queued: false, shadowed`    no - the producer-side hold said SHADOW: IMS recorded a shadow and created no outbox job
+ *                                and no accounting event. IMS owes the ledger nothing for it in the current phase
  *                                (another writer owns the operation, or none does). NOT a statement that the document
- *                                is in the ledger.
+ *                                is in the ledger, and NOT a queued posting either: it is its own state, so `queued`
+ *                                is false and a site that mirrors a queued posting (a subledger row) or claims
+ *                                "posted" must test `queued`, never `postingIsOwed`.
  * `queued: false, not-configured` no — there is no connector, or it does not post this type, so no GL
  *                                counterpart will ever exist and nothing is outstanding.
  * `queued: false, refused`       YES.
@@ -95,7 +97,25 @@ export type EnqueueOutcomeLike = {
  */
 export function postingIsOwed(outcome: EnqueueOutcomeLike): boolean {
   if (outcome.queued) return false
-  return outcome.reason !== 'not-configured'
+  return outcome.reason !== 'not-configured' && outcome.reason !== 'shadowed'
+}
+
+/**
+ * Did the producer-side hold record this posting as a SHADOW (nothing queued, nothing sent, nothing owed)?
+ *
+ * The one name for the third state, so a site that must tell "queued" from "shadowed" from "owed" does not compare
+ * the reason string itself.
+ */
+export function isShadowedOutcome(outcome: { queued: boolean; reason?: string | null }): boolean {
+  return !outcome.queued && outcome.reason === 'shadowed'
+}
+
+/**
+ * Is the posting accounted for: either durably queued, or recorded as a shadow that IMS owes nothing for? True for the
+ * outcomes that need no refusal debt and no rollback; it is NOT "a posting will be sent" (that is `queued`).
+ */
+export function enqueueNeedsNoFurtherAction(outcome: EnqueueOutcomeLike): boolean {
+  return outcome.queued || isShadowedOutcome(outcome)
 }
 
 /**
@@ -257,7 +277,8 @@ export async function settleQueuedEnqueueAgainstHandPostClaim<T extends { queued
   client: PostingRefusalClient,
   options?: { withSavepoint?: <R>(fn: () => Promise<R>) => Promise<R> },
 ): Promise<T> {
-  if (!outcome.queued) return outcome
+  // A shadow is settled like a queue: IMS owes the ledger nothing for it, and the hand-post claim is read the same way.
+  if (!outcome.queued && outcome.reason !== 'shadowed') return outcome
   const cleared = await clearAccountingPostingRefusal(client, posting, options)
   switch (cleared.outcome) {
     case 'cleared':

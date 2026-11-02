@@ -1119,8 +1119,11 @@ test('markBillPaid rolls back when the accounting queue DECLINES the enqueue (ro
   const block = src.slice(start, src.indexOf("action: 'bill_paid'", start))
 
   const queueAt = block.indexOf('queueAccountingSyncTx(tx,')
-  const throwAt = block.indexOf('if (!queued) throw new BillPaymentEnqueueDeclined(')
+  // The guard is `!queued` AND not a shadow: a shadow is its own state (nothing queued, nothing owed), so it does not roll back.
+  const guardAt = block.indexOf('if (!queued && !(billPaymentOutcome.outcome && isShadowedOutcome(billPaymentOutcome.outcome))) {')
+  const throwAt = block.indexOf('throw new BillPaymentEnqueueDeclined(')
   const txEndAt = block.indexOf('}, STOCK_TX_OPTIONS)')
+  assert.ok(guardAt > queueAt && guardAt < throwAt, 'the rollback is guarded by the falsy result, carving out only a shadow')
   assert.ok(queueAt > 0, 'the enqueue must still be inside the transaction')
   assert.ok(throwAt > queueAt && throwAt < txEndAt, 'a falsy enqueue result must roll the transaction back')
   // The escape valve stays open: a bill the ledger never received has nothing to keep in step with.

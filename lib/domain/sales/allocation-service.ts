@@ -1449,7 +1449,9 @@ async function assertAllocationReversalQueued(
             + 'connector selection back does not undo the debit — post the journal by hand.'
           : enqueueOutcome?.reason === 'not-configured'
             ? 'The connector does not post this journal type, so nothing will ever queue for it.'
-            : 'The enqueue reported no reason.')),
+            : enqueueOutcome?.reason === 'shadowed'
+              ? 'The producer-side hold recorded the journal as a shadow: IMS did not send it, so the ledger does not hold it from IMS.'
+              : 'The enqueue reported no reason.')),
       metadata: {
         reversalToken,
         amount,

@@ -32,6 +32,12 @@ export type ExternalFulfillmentUpdate = {
   lookup: ExternalFulfillmentLookup
   targetShipmentStatus: ExternalShipmentStatus
   tracking?: Array<{ trackingNumber: string; shippingService?: string | null }>
+  /**
+   * The storefront ALREADY holds this fulfilment (the writer that owned it before the live-from instant completed it, verified
+   * against the locally stored record). IMS then completes its own side only: no storefront completion job and no storefront
+   * tracking/status push, because either would be a write to a storefront that is already complete.
+   */
+  storefrontAlreadyCompleted?: boolean
 }
 
 /**
@@ -729,7 +735,8 @@ export async function applyExternalFulfillmentUpdate(
           // durable completion job is enqueued WITH the flip (tracking first, then the status; retried
           // by the cron; held for orders WooCommerce no longer has in flight). A storefront-sourced
           // completion must never push back, as it would only echo.
-          storefrontCompletion: isWmsConnectorId(update.source),
+          storefrontCompletion: isWmsConnectorId(update.source) && update.storefrontAlreadyCompleted !== true,
+          skipStorefrontPush: update.storefrontAlreadyCompleted === true,
         },
       )
 

@@ -16,7 +16,7 @@ import {
   lockPurchaseOrdersWithCostRows,
 } from '@/lib/domain/wms/transfer-asn-lock-order'
 import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getAccountingSettingsFor, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor, listAccountingBankAccounts, listAccountingBankAccountsWithChart, asRoutableAccountingConnector, accountingPostingVerdictForChart, type AccountingBankAccount } from '@/lib/accounting'
-import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
+import { isShadowedOutcome, postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
@@ -4204,7 +4204,12 @@ export async function markBillPaid(
             // which for a refusal names a remedy that cannot work.
             reportOutcome: (outcome) => { billPaymentOutcome.outcome = outcome },
           })
-          if (!queued) throw new BillPaymentEnqueueDeclined(invoice.accountingInvoiceId, billPaymentOutcome.outcome?.reason ?? null)
+          // A SHADOW IS NEITHER A QUEUE NOR A DECLINE: the hold recorded the payment registration as a shadow, so no
+          // BILL_PAYMENT is on the queue (`queued` is false and `paymentQueued` below says so) and nothing is owed, so
+          // the paid status is not rolled back. It commits as a local fact, and the activity log says the ledger was not told.
+          if (!queued && !(billPaymentOutcome.outcome && isShadowedOutcome(billPaymentOutcome.outcome))) {
+            throw new BillPaymentEnqueueDeclined(invoice.accountingInvoiceId, billPaymentOutcome.outcome?.reason ?? null)
+          }
         }
         return { requestedIds: result.requestedIds, retiredCount: result.retiredCount, queued }
       }, STOCK_TX_OPTIONS)
@@ -4289,13 +4294,17 @@ export async function markBillPaid(
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${invoice.poId}`)
 
+    const billPaymentShadowed = billPaymentOutcome.outcome !== undefined && isShadowedOutcome(billPaymentOutcome.outcome)
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: invoice.poId,
       action: 'bill_paid',
       tag: 'purchase',
       level: 'INFO',
-      description: `Marked bill ${invoice.invoiceNumber ?? '(no number)'} as paid from ${account.name}`,
+      description: billPaymentShadowed
+        ? `Marked bill ${invoice.invoiceNumber ?? '(no number)'} as paid from ${account.name} in IMS ONLY: the producer-side hold `
+          + 'recorded the payment registration as a shadow, so NO payment was queued or sent to the accounting connector.'
+        : `Marked bill ${invoice.invoiceNumber ?? '(no number)'} as paid from ${account.name}`,
       metadata: {
         reference: invoice.po.reference,
         invoiceId: invoice.id,
@@ -4306,6 +4315,7 @@ export async function markBillPaid(
         supersededSyncLogIds: settlement.requestedIds,
         supersededSyncLogCount: settlement.retiredCount,
         paymentQueued: settlement.queued,
+        paymentShadowed: billPaymentShadowed,
       },
     })
 
@@ -4781,7 +4791,14 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         // DRAFT — which is the retryable state — and tell the operator. It costs nothing that the
         // `shouldQueueXero` escape valve above does not already cover: a tenant with no Xero connector
         // never reaches this branch and still posts credit notes locally.
-        if (!queued) throw new SupplierCreditNoteEnqueueDeclined(cn.id, creditNoteOutcome.outcome?.reason ?? null)
+        //
+        // A SHADOW IS NEITHER: the producer-side hold recorded the ACCPAYCREDIT as a shadow, so nothing is queued (the
+        // `queued` above is false and the transit row was correctly NOT written) and nothing is owed, so the
+        // credit note is not rolled back to DRAFT either - it stands POSTED in IMS and the activity log below says
+        // the ledger was not told. Anything else that is not queued is a decline.
+        if (!queued && !(creditNoteOutcome.outcome && isShadowedOutcome(creditNoteOutcome.outcome))) {
+          throw new SupplierCreditNoteEnqueueDeclined(cn.id, creditNoteOutcome.outcome?.reason ?? null)
+        }
       }
       return true
     }, STOCK_TX_OPTIONS)
@@ -4811,6 +4828,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       return { success: false, error: declined.operatorMessage }
     }
     if (!posted) return { success: false, error: 'Credit note is already posted' }
+    const creditNoteShadowed = creditNoteOutcome.outcome !== undefined && isShadowedOutcome(creditNoteOutcome.outcome)
 
     revalidatePath(`/purchase-orders/${cn.poId}`)
     await logActivity({
@@ -4819,8 +4837,12 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       action: 'supplier_credit_note_posted',
       tag: 'purchase',
       level: 'INFO',
-      description: `Posted supplier credit note of ${cn.currency} ${Number(cn.amountForeign).toFixed(2)} for ${cn.po.reference}`,
-      metadata: { creditNoteId: cn.id, amountForeign: Number(cn.amountForeign), currency: cn.currency },
+      description: creditNoteShadowed
+        ? `Posted supplier credit note of ${cn.currency} ${Number(cn.amountForeign).toFixed(2)} for ${cn.po.reference} in IMS ONLY: `
+          + 'the producer-side hold recorded the accounting credit as a shadow, so it was NOT queued or sent and no transit '
+          + 'subledger row was written. The ledger does not hold it from IMS.'
+        : `Posted supplier credit note of ${cn.currency} ${Number(cn.amountForeign).toFixed(2)} for ${cn.po.reference}`,
+      metadata: { creditNoteId: cn.id, amountForeign: Number(cn.amountForeign), currency: cn.currency, accountingShadowed: creditNoteShadowed },
     })
     return { success: true }
   } catch (e) {

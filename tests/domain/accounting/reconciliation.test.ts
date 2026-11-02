@@ -2538,3 +2538,66 @@ test('[shadow readers] a document whose posting was recorded as a SHADOW is not 
   assert.equal(shadowed.includes('source_order_revenue_deferral_without_event'), false)
   assert.equal(shadowed.includes('source_order_inventory_allocation_without_event'), false)
 })
+
+// ───────────────────────── a SHADOW is not covering evidence: it is HELD and UNVERIFIED ─────────────────────────
+
+function refundedOrderRows(syncRows: Array<Record<string, unknown>>, opts: { cancelled?: boolean } = {}) {
+  const rows = cleanRows()
+  rows.salesOrders = [{ ...rows.salesOrders[0], status: opts.cancelled ? 'CANCELLED' : 'REFUNDED', refundStatus: 'FULL' }]
+  rows.refunds = [{ ...rows.refunds[0], accountingCreditNoteId: null, accountingRetrySyncs: null }]
+  rows.syncLogs = rows.syncLogs.filter((log) => log.referenceType !== 'SalesOrderRefund')
+  rows.accountingEvents = rows.accountingEvents.filter((event) => event.sourceEntityType !== 'SalesOrderRefund')
+  for (const row of syncRows) rows.syncLogs.push(row as AccountingReconciliationRows['syncLogs'][number])
+  return rows
+}
+const refundRow = (type: string, over: Record<string, unknown>) => ({
+  id: `sync-${type}-${String(over.status)}-${String(over.settlementBasis)}`, connector: 'xero', type, referenceType: 'SalesOrderRefund', referenceId: 'refund-1',
+  payload: { _idempotencyKey: `sales-order-refund:refund-1:${type}` }, ...over,
+})
+const SHADOW_ROW = { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'HELD_SHADOW', abandonedBeforeRemoteCall: true }
+const LIVE_ROW = { status: 'SYNCED', externalTransactionId: 'doc-1', settlementBasis: null }
+
+test('[shadow evidence] a refund whose ONLY credit-note / reversal rows are shadows is reported HELD (warning), not covered and not missing', () => {
+  const findings = evaluateAccountingReconciliationRows(refundedOrderRows([refundRow('CREDIT_NOTE', SHADOW_ROW), refundRow('COGS_REVERSAL', SHADOW_ROW)]))
+  const byCode = (code: string) => findings.filter((finding) => finding.code === code)
+  console.log(`# shadow-only refund findings: ${findings.map((f) => `${f.code}:${f.severity}`).join(', ')}`)
+  assert.equal(byCode('terminal_refunded_order_credit_note_held_shadow').length, 1)
+  assert.equal(byCode('terminal_refunded_order_credit_note_held_shadow')[0]!.severity, 'warning')
+  assert.equal(byCode('terminal_refunded_order_reversal_held_shadow').length, 1)
+  assert.equal(byCode('terminal_refunded_order_missing_credit_note_evidence').length, 0, 'it is not MISSING: IMS saw the obligation and deliberately did not produce it')
+  assert.equal(byCode('terminal_refunded_order_missing_reversal_evidence').length, 0)
+  assert.match(byCode('terminal_refunded_order_credit_note_held_shadow')[0]!.message, /HELD as a shadow/)
+})
+
+test('[shadow evidence] CONTROLS: no row at all is MISSING (critical); a live row is covered (no finding of either kind)', () => {
+  const none = evaluateAccountingReconciliationRows(refundedOrderRows([])).map((f) => f.code)
+  assert.ok(none.includes('terminal_refunded_order_missing_credit_note_evidence'))
+  assert.ok(none.includes('terminal_refunded_order_missing_reversal_evidence'))
+  assert.ok(!none.some((code) => code.endsWith('_held_shadow')))
+  const live = evaluateAccountingReconciliationRows(refundedOrderRows([refundRow('CREDIT_NOTE', LIVE_ROW), refundRow('COGS_REVERSAL', LIVE_ROW)])).map((f) => f.code)
+  assert.deepEqual(live.filter((code) => code.startsWith('terminal_refunded_order')), [])
+})
+
+test('[shadow evidence] a live row BESIDE a shadow covers the obligation; a shadow does not hide a missing leg', () => {
+  const both = evaluateAccountingReconciliationRows(refundedOrderRows([
+    refundRow('CREDIT_NOTE', SHADOW_ROW), refundRow('CREDIT_NOTE', { ...LIVE_ROW, id: 'live-cn' }), refundRow('COGS_REVERSAL', LIVE_ROW),
+  ])).map((f) => f.code)
+  assert.deepEqual(both.filter((code) => code.startsWith('terminal_refunded_order')), [], 'the live row wins over the shadow')
+  // credit note shadowed, reversal missing: the credit note is held, the reversal is still MISSING
+  const mixed = evaluateAccountingReconciliationRows(refundedOrderRows([refundRow('CREDIT_NOTE', SHADOW_ROW)])).map((f) => f.code)
+  assert.ok(mixed.includes('terminal_refunded_order_credit_note_held_shadow'))
+  assert.ok(mixed.includes('terminal_refunded_order_missing_reversal_evidence'))
+})
+
+test('[shadow evidence] a cancelled order whose reversal is only a shadow is HELD, not covered; with no row it is still critical', () => {
+  const shadowed = evaluateAccountingReconciliationRows(refundedOrderRows([refundRow('COGS_REVERSAL', SHADOW_ROW)], { cancelled: true }))
+  assert.deepEqual(shadowed.filter((f) => f.code.startsWith('terminal_cancelled_order')).map((f) => [f.code, f.severity]), [['terminal_cancelled_order_reversal_held_shadow', 'warning']])
+  const none = evaluateAccountingReconciliationRows(refundedOrderRows([], { cancelled: true }))
+  assert.deepEqual(none.filter((f) => f.code.startsWith('terminal_cancelled_order')).map((f) => [f.code, f.severity]), [['terminal_cancelled_order_missing_reversal_evidence', 'critical']])
+})
+
+test('[shadow evidence] an orphan-sweep row (CANCELLED, no HELD_SHADOW basis) is NOT a shadow: still missing', () => {
+  const codes = evaluateAccountingReconciliationRows(refundedOrderRows([refundRow('CREDIT_NOTE', { ...SHADOW_ROW, settlementBasis: null })])).map((f) => f.code)
+  assert.ok(codes.includes('terminal_refunded_order_missing_credit_note_evidence'))
+  assert.ok(!codes.includes('terminal_refunded_order_credit_note_held_shadow'))
+})

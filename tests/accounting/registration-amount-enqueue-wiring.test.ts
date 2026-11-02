@@ -31,6 +31,8 @@ import { Prisma } from '@/app/generated/prisma/client'
 type QueuedRow = { type: string; payload: Record<string, unknown>; idempotencyKey?: string }
 
 const state = {
+  /** What the enqueue double answers; the default is a real queue. A producer-side shadow answers `queued: false, reason: 'shadowed'`. */
+  enqueueAnswer: { queued: true, connector: 'xero' } as { queued: boolean; reason?: 'shadowed'; connector: string },
   syncRows: [] as Array<{ id: string; status: string; externalTransactionId: null; errorMessage: null; retryCount: number; payload: Record<string, unknown> }>,
   queued: [] as QueuedRow[],
   activity: [] as Array<{ action: string; level: string; description: string; metadata: Record<string, unknown> }>,
@@ -113,6 +115,7 @@ mock.module('@/lib/accounting', {
       params: { type: string; payload: Record<string, unknown>; idempotencyKey?: string },
     ) => {
       state.queued.push({ type: params.type, payload: params.payload, idempotencyKey: params.idempotencyKey })
+      if (!state.enqueueAnswer.queued) return state.enqueueAnswer
       state.syncRows.unshift({
         id: `log-${state.queued.length}`,
         status: 'PENDING',
@@ -148,6 +151,7 @@ function receipt(amount: string, id = 'pay-1') {
 }
 
 test.beforeEach(() => {
+  state.enqueueAnswer = { queued: true, connector: 'xero' }
   state.syncRows = []
   state.queued = []
   state.activity = []
@@ -270,3 +274,14 @@ for (const [label, amount] of [['zero', '0.0000'], ['negative', '-25.0000']] as 
     assert.ok(state.activity.some((a) => a.metadata.refusal === 'AMOUNT_NOT_POSITIVE'))
   })
 }
+
+test('a SHADOWED registration is not a "posting context changed" refusal: no warning, no refusal record, nothing queued by IMS', async () => {
+  state.payments = [receipt('100.0000')]
+  state.enqueueAnswer = { queued: false, reason: 'shadowed', connector: 'xero' }
+  const result = await redrive()
+  assert.equal(state.queued.length, 1, 'PRECONDITION: the enqueue was reached and answered shadowed')
+  assert.equal(state.activity.some((a) => a.metadata.refusal === 'POSTING_CONTEXT_CHANGED'), false,
+    'a shadow used to fall into `context-changed` once the answer stopped being queued:true, and warned that the posting context moved')
+  assert.equal(state.activity.some((a) => a.action === 'invoice_payment_not_registered'), false)
+  void result
+})

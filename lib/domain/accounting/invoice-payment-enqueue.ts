@@ -50,6 +50,7 @@ import { probeLedgerSettlement } from '@/lib/connectors/accounting-settlement-pr
 import { invoicePaymentReceiptId } from '@/lib/domain/accounting/operator-ledger-check'
 import { loadLiveReceipts } from '@/lib/domain/accounting/payment-identity'
 import { loadOperatorLedgerChecks } from '@/lib/domain/accounting/operator-ledger-check-store'
+import { isShadowedOutcome } from '@/lib/domain/accounting/enqueue-outcome'
 import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import {
   REGISTERED_AMOUNT_DECIMAL_FIELD,
@@ -1879,6 +1880,8 @@ export async function registerInvoicePaymentWithLedger(params: {
       if (pinned && enqueued.queued && enqueued.connector !== pinned.connector) {
         throw new PinnedConnectorMoved(enqueued.connector, enqueued.reason === 'already-queued' || enqueued.reason === 'handled-by-hand')
       }
+      // A SHADOW is not a changed posting context: the hold recorded it, nothing is queued and nothing is owed.
+      if (isShadowedOutcome(enqueued)) return 'shadowed' as const
       return enqueued.queued ? ('queued' as const) : ('context-changed' as const)
     }, STOCK_TX_OPTIONS)
 

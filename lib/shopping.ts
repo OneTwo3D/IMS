@@ -36,7 +36,14 @@ import { getShoppingConnector, SHOPPING_CONNECTORS, type ShoppingConnectorId } f
  * "pushed" on `success` is therefore never told a shadow was pushed, and a caller that logs failures can tell a shadow from one.
  */
 export type PushProductMetadataResult = { success: boolean; skipped?: boolean; error?: string; shadowed?: boolean }
-export type PushOrderDeliveryMetadataResult = { success: boolean; skipped?: boolean; error?: string; shadowed?: boolean }
+export type PushOrderDeliveryMetadataResult = {
+  success: boolean
+  skipped?: boolean
+  error?: string
+  shadowed?: boolean
+  /** Why the producer-side hold shadowed it (a `ProducerReason`), when it did and the caller needs to tell the reasons apart. */
+  shadowReason?: string
+}
 export type PushOrderStatusResult = {
   success: boolean
   skipped?: boolean
@@ -291,7 +298,7 @@ export async function pushPartialShipmentToShopping(
           resolveObligationAt: async () => new Date(),
         })
         if (!seam.proceed) {
-          return { connector, result: { supported: true, ok: false, shadowed: true, skipped: false, allDone: undefined, duplicate: undefined, error: seam.notice } }
+          return { connector, result: { supported: true, ok: false, shadowed: true, shadowReason: seam.reason, skipped: false, allDone: undefined, duplicate: undefined, error: seam.notice } }
         }
         const { pushPartialShipmentToWc } = await import('@/lib/connectors/woocommerce/sync/partial-shipment')
         return { connector, result: await pushPartialShipmentToWc(orderId, input) }
@@ -300,7 +307,14 @@ export async function pushPartialShipmentToShopping(
   }))
 
   const shadowedPart = results.find((entry) => entry.result.shadowed === true)
-  if (shadowedPart) return { success: false, shadowed: true, error: shadowedPart.result.error }
+  if (shadowedPart) {
+    return {
+      success: false,
+      shadowed: true,
+      ...('shadowReason' in shadowedPart.result && typeof shadowedPart.result.shadowReason === 'string' ? { shadowReason: shadowedPart.result.shadowReason } : {}),
+      error: shadowedPart.result.error,
+    }
+  }
   const failures = results.filter((entry) => entry.result.supported && !entry.result.ok && !entry.result.skipped)
   if (failures.length > 0) {
     return {
@@ -313,6 +327,30 @@ export async function pushPartialShipmentToShopping(
     skipped: results.every((entry) => !!entry.result.skipped),
     allDone: results.some((entry) => entry.result.allDone),
   }
+}
+
+/**
+ * PRE-CUTOVER RECONCILIATION: did the writer that owned the storefront BEFORE the live-from instant already record this
+ * despatched part? Answered from the storefront record IMS already holds locally - NO network, NO write - so the dispatch
+ * sweep can complete the IMS side of a part despatched before the cutoff without writing it to the storefront again.
+ * Every runnable storefront must verify it; none runnable, or any that cannot, is "not verified" (the order stays pending).
+ */
+export async function verifyIncumbentPartialShipmentViaShopping(
+  orderId: string,
+  input: { despatchedAt?: Date | null },
+): Promise<{ verified: boolean; detail: string }> {
+  const connectors = await listRunnableShoppingConnectorIds()
+  if (connectors.length === 0) return { verified: false, detail: 'No runnable shopping connector configured' }
+  const verdicts = await Promise.all(connectors.map(async (connector) => {
+    switch (connector) {
+      case 'woocommerce': {
+        const { verifyIncumbentPartialShipment } = await import('@/lib/connectors/woocommerce/sync/incumbent-partial-shipment')
+        return verifyIncumbentPartialShipment(orderId, input)
+      }
+    }
+  }))
+  const unverified = verdicts.find((verdict) => !verdict.verified)
+  return unverified ?? verdicts[0] ?? { verified: false, detail: 'No storefront could be asked' }
 }
 
 /**

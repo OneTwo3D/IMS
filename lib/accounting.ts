@@ -336,12 +336,14 @@ export type ConnectorEnqueueOutcome = {
    * (posting-suppression.ts). A counterpart exists in the ledger; it is not owed; it was not IMS's.
    */
   /*
-   * `shadowed` (producer-side hold) — `queued: true` WITHOUT A QUEUED POSTING: the producer-side hold said SHADOW for this
-   * posting (lib/security/producer-disposition.ts), so IMS recorded a shadow and created no outbox job and no accounting
-   * event. `queued: true` is the answer the business flows need - the purchase is received, the payment is registered,
-   * the batch ran - and `postingIsOwed` is false: IMS owes the ledger nothing here, because in the current phase another
-   * writer owns the operation (or none does). It is NOT a statement that the document exists in the ledger, and no caller
-   * may read it as one; the ledger standing of the shadow row is SHADOW_NOT_SENT_BY_IMS: IMS did not send it, and that is not proof of absence.
+   * `shadowed` (producer-side hold) — `queued: FALSE`, and `postingIsOwed` is ALSO false. It is its own state, neither
+   * queued nor owed: the producer-side hold said SHADOW for this posting (lib/security/producer-disposition.ts), so IMS
+   * recorded a shadow and created no outbox job and no accounting event. Nothing is on the queue, so a caller must not
+   * write anything that mirrors a queued posting (a transit or COGS subledger row), must not claim the document is posted,
+   * and must not log "queued"; and nothing is owed, so it must not roll its own change back or record a refusal debt
+   * either. Read it through `isShadowedOutcome`. It is NOT a statement that the document exists in the ledger; the ledger
+   * standing of the shadow row is SHADOW_NOT_SENT_BY_IMS: IMS did not send it, and that is not proof of absence.
+   * (An earlier shape answered `queued: true`, which every `if (queued)` site read as a posting that would be sent.)
    */
   /*
    * `hand-post-deferred` (o3d-j625 r18, Codex round 17 HIGH 1) — `queued: FALSE`, and the difference from
@@ -1006,7 +1008,7 @@ export async function queueAccountingSync(params: {
   // operator ticking it off: this is the only event that means the debt is gone. `already-queued` counts —
   // a row for this posting is durable either way, which is what the debt was about. It is AFTER the
   // switch, not inside a case, so a connector wired in later cannot forget it.
-  if (routed.queued) {
+  if (routed.queued || routed.reason === 'shadowed') {
     const { db } = await import('@/lib/db')
     // o3d-j625 r28 (Codex round 27, HIGH 1) — A CLEAR THAT DECLINED MEANS THIS ENQUEUE DID NOT STICK.
     //
@@ -1392,7 +1394,8 @@ export async function queueAccountingSyncTx(
     // o3d-j625 r4 — A POSTING THAT IS NOW QUEUED IS NO LONGER OUTSTANDING, cleared inside the CALLER'S
     // transaction so the clear and the sync row share one fate. A clear that survived a rolled-back
     // enqueue would mark a debt paid over a posting that was never written.
-    if (outcome.queued) {
+    if (outcome.queued || outcome.reason === 'shadowed') {
+      // A SHADOW clears the debt as it always did: IMS owes the ledger nothing for it in this phase.
       // review M-14: under a savepoint. A failed statement aborts a Postgres transaction whatever the
       // client does with the error, so without this an inbox tidy-up could roll back a goods receipt.
       await clearAccountingPostingRefusal(
@@ -1740,9 +1743,11 @@ export async function queueAccountingSyncTx(
       return answer({ queued: false, reason: 'hand-post-deferred' }, context.connector)
     }
     // THE PRODUCER-SIDE HOLD SAID SHADOW: the posting is recorded as a shadow and nothing is queued - no outbox job and no
-    // accounting event (a shadow must not count as an IMS ledger fact). `queued: true`, with its own reason, because the
-    // posting is recorded and nothing is owed to IMS's queue; see 'shadowed' on ConnectorEnqueueOutcome.
-    if (created.shadowed) return answer({ queued: true, reason: 'shadowed' }, context.connector)
+    // accounting event (a shadow must not count as an IMS ledger fact). `queued: false` with its own reason: nothing is
+    // on the queue, so the boolean every caller gates a ledger-mirroring write on (a transit or COGS subledger row, a
+    // "posted" claim) is false, while `postingIsOwed` is also false because IMS owes the ledger nothing in this phase;
+    // see 'shadowed' on ConnectorEnqueueOutcome.
+    if (created.shadowed) return answer({ queued: false, reason: 'shadowed' }, context.connector)
     const log = created.row
     if (context.connector === 'xero') {
       const { scheduleXeroAccountingOutbox } = await import('@/lib/connectors/xero/outbox')

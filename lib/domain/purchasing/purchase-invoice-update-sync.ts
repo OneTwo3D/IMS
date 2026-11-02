@@ -105,6 +105,7 @@ export type PurchaseInvoiceUpdateSyncDeps<Tx extends PurchaseInvoiceUpdateSyncTx
  * made a connector switch read as a setting.
  *
  *   queued                     the update row is durable.
+ *   shadowed                   the producer-side hold recorded the update as a shadow: nothing is queued and nothing is owed.
  *   refused                    the enqueue itself declined (its chart/document guard, or a posting
  *                              context that changed under the write).
  *   refused-chart-retired      the chart's connector is no longer active — detected before enqueueing.
@@ -114,6 +115,7 @@ export type PurchaseInvoiceUpdateSyncDeps<Tx extends PurchaseInvoiceUpdateSyncTx
  */
 export type PurchaseInvoiceUpdateOutcome =
   | 'queued'
+  | 'shadowed'
   | 'refused'
   | 'refused-chart-retired'
   | 'skipped-disabled'
@@ -294,5 +296,8 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
   // the write, or the chart/document provenance was refused — because the caller's action is the same
   // for both: say so, loudly, and leave the bill edit standing (rolling a local edit back because the
   // connector selection moved would make a retired chart block bill editing entirely).
+  // A SHADOW is neither: `queued` is false (no subledger row was written above, correctly) and nothing is owed, so it is
+  // not reported as a refusal either.
+  if (!queued && enqueued.reason === 'shadowed') return 'shadowed'
   return queued ? 'queued' : 'refused'
 }
