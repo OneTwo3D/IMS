@@ -14,6 +14,7 @@ import {
 import { VERIFICATION_IDS } from '../../lib/first-load/apply/verify-core.ts'
 import { APPLY_RUN, APPLY_SYSTEM_ID, DAY, NOW, NO_ACCEPTANCES, allPassing, applyEvidence, greenApplyReport } from '../helpers/readiness-gate-fixtures.ts'
 import { precondition } from '../first-load/helpers.ts'
+import { scratchRoot } from '../helpers/scratch-root'
 
 /**
  * THE FIRST-LOAD CHECK OF THE READINESS GATE. A report speaks for a database only by IDENTITY (the database's run record names the run and digest; the report names the same ones and
@@ -165,7 +166,7 @@ test('the catalogue: required at P0, listed only at P1 and P2, and a failure blo
 
 const bases: string[] = []
 function scratchBase(prefix: string): string {
-  const dir = mkdtempSync(path.join('/var/tmp', prefix))
+  const dir = mkdtempSync(path.join(scratchRoot(), prefix))
   bases.push(dir)
   return dir
 }
