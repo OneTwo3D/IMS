@@ -41,7 +41,7 @@ import {
 } from './held-sales-invoice'
 import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
-import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
+import { rateBinding, resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { directCreateMarker, isFulfilmentStatus, resolveDirectCreateMarker } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
@@ -2970,6 +2970,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       const lineRateNow = (idx: number) => (lineData[idx]?.taxRateId ? ratesNow.get(lineData[idx]!.taxRateId!) : undefined)
       const shippingRateNow = shippingTax.taxRateId ? ratesNow.get(shippingTax.taxRateId) : undefined
       const defaultRateNow = orderDefaultTaxRateId ? ratesNow.get(orderDefaultTaxRateId) : undefined
+      const shippingTypeNow = shippingRateNow ? (shippingRateNow.accountingTaxType ?? undefined) : (shippingTax.taxType ?? accountingTaxType ?? undefined)
       const accountingPayload: Record<string, unknown> = {
           contactName: customerName,
           contactEmail: wcOrder.billing.email || undefined,
@@ -3000,8 +3001,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             // the standard code. Every resolution path (resolver-derived, mapped
             // WC rate, forceNoTax) now carries a real reverseCharge flag.
             taxType: lineTaxType,
-            // The rate that code was read from (never sent): the guard checks it is still that rate's code. Absent for a swapped reverse-charge code.
-            taxRateId: rateNow?.id,
+            // The rate that code was read from (never sent), with the basis the code was derived on (a sales goods line, lib/accounting/reverse-charge.ts): the guard recomputes the type from the rate as
+            // it is now. A forced no-tax fee line has no rate-derived code and is not bound.
+            ...(mappedLines[idx]?.isFeeLine === true && mappedLines[idx]?.forceNoTax ? {} : rateBinding(rateNow?.id, 'sales_line')),
             discountAmount: l.discountAmount > 0 ? roundDecimalNumber(l.discountAmount, 4) : undefined,
             }
           }),
@@ -3016,15 +3018,16 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // picks the tax type that reproduces the tax Woo actually charged on shipping, falling back
           // to the order default when that is the one that does — so a single-rate order is unchanged
           // and a zero-rated-postage order stops being taxed at the goods' rate.
-          shippingTaxType: shippingRateNow ? (shippingRateNow.accountingTaxType ?? undefined) : (shippingTax.taxType ?? accountingTaxType ?? undefined),
-          shippingTaxRateId: (shippingRateNow ?? defaultRateNow)?.id,
+          shippingTaxType: shippingTypeNow,
+          // Bound (plain: shipping is never reverse-charge swapped) only to the rate whose own code is the one sent.
+          ...(((shippingRateNow ?? defaultRateNow)?.accountingTaxType ?? undefined) === shippingTypeNow ? rateBinding((shippingRateNow ?? defaultRateNow)?.id, 'plain', 'shipping') : {}),
           // Only the residual — the coupon itself is already on the lines above as a per-line
           // discountAmount, which the connector sends as a Xero DiscountRate / QuickBooks
           // discount line. Sending both deducted it twice (o3d-y14).
           discountAmount: orderLevelDiscountAmount,
           discountAccountCode: settings.discountAccount || undefined,
           discountTaxType: defaultRateNow ? (defaultRateNow.accountingTaxType ?? undefined) : (accountingTaxType ?? undefined),
-          discountTaxRateId: defaultRateNow?.id,
+          ...rateBinding(defaultRateNow?.id, 'plain', 'discount'),
           lineAmountsIncludeTax,
           _postingMode: 'submitted',
           _paymentMethod: wcOrder.payment_method || undefined,

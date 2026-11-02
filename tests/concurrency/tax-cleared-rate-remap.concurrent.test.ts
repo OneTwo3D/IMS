@@ -66,6 +66,7 @@ const createdLogs: string[] = []
 const retiredCodesWritten: string[] = []
 const DEFAULT_CODE = 'OUTPUT2'
 const RC_SALES_SETTING = 'accounting_reverse_charge_sales_tax_type'
+const RC_PURCHASE_SETTING = 'accounting_reverse_charge_purchase_tax_type'
 
 async function wipeXero(db: Deps['db']) {
   await db.setting.deleteMany({ where: { key: PLUGIN_KEY } })
@@ -94,7 +95,7 @@ after(async () => {
   const { db } = await loadDeps()
   await db.accountingSyncLog.deleteMany({ where: { id: { in: createdLogs } } })
   await wipeXero(db)
-  await db.setting.deleteMany({ where: { key: RC_SALES_SETTING } })
+  await db.setting.deleteMany({ where: { key: { in: [RC_SALES_SETTING, RC_PURCHASE_SETTING] } } })
   await removeOwnMarkers(db)
   if (createdRates.length) {
     await db.taxRateComponent.deleteMany({ where: { taxRateId: { in: createdRates } } })
@@ -127,10 +128,10 @@ const codeOf = async (db: Deps['db'], id: string) => (await db.taxRate.findUniqu
 
 let n = 0
 /** The producer's enqueue, in a transaction (as the producers do): 'admitted' or the guard's refusal reason. */
-async function enqueue(deps: Deps, rateId: string, code: string | null, run: string): Promise<string> {
-  const payload = { lines: [{ description: 'x', ...(code === null ? {} : { taxType: code }), taxRateId: rateId }] }
+async function enqueue(deps: Deps, rateId: string, code: string | null, run: string, opts: { type?: string; basis?: string } = {}): Promise<string> {
+  const payload = { lines: [{ description: 'x', ...(code === null ? {} : { taxType: code }), taxRateId: rateId, taxRateBasis: opts.basis ?? 'sales_line' }] }
   try {
-    const made = await deps.db.$transaction((tx) => deps.row.createAccountingSyncLogRow(tx as never, { connector: 'xero', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: `cleared-${run}-${n++}`, payload: payload as never }), TX)
+    const made = await deps.db.$transaction((tx) => deps.row.createAccountingSyncLogRow(tx as never, { connector: 'xero', type: (opts.type ?? 'SALES_INVOICE') as never, referenceType: 'SalesOrder', referenceId: `cleared-${run}-${n++}`, payload: payload as never }), TX)
     if (made.row) createdLogs.push(made.row.id)
     return made.row ? 'admitted' : 'no-row'
   } catch (e) {
@@ -298,7 +299,7 @@ async function heldEnqueue(deps: Deps, rateId: string, code: string, run: string
   let pid = 0
   const done = deps.db.$transaction(async (tx) => {
     pid = await backendPid(tx as never)
-    const made = await deps.row.createAccountingSyncLogRow(tx as never, { connector: 'xero', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: `cleared-${run}-${n++}`, payload: { lines: [{ description: 'x', taxType: code, taxRateId: rateId }] } as never })
+    const made = await deps.row.createAccountingSyncLogRow(tx as never, { connector: 'xero', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: `cleared-${run}-${n++}`, payload: { lines: [{ description: 'x', taxType: code, taxRateId: rateId, taxRateBasis: 'sales_line' }] } as never })
     if (made.row) createdLogs.push(made.row.id)
     held()
     await gate
@@ -454,4 +455,39 @@ test('a reverseCharge true->false EDIT racing an enqueue that carries the revers
   const doneB = await editB
   assert.equal(doneB.success, true, JSON.stringify(doneB))
   assert.equal(await enqB, 'tax_code_not_current', 'order B: the flag was off at the commit; the swapped type is refused')
+})
+
+// [mutation: the guard accepts either the rate's code or the swapped type -> the stale line is admitted; mutation: the guard ignores direction -> the purchase arm admits the sales type]
+test('a reverseCharge false->true edit between the BUILD and the ENQUEUE of a line refuses the stale line (sales and purchase); the rebuild is admitted', { skip: !RUN }, async () => {
+  const deps = await loadDeps()
+  const run = randomUUID().slice(0, 8)
+  const live = `LIVE-${run}`
+  const rcSales = `RCSALES-${run}`
+  const rcPurchase = `RCPURCH-${run}`
+  await seedXero(deps.db, `tenant-${run}`, run, [live])
+  for (const [key, value] of [[RC_SALES_SETTING, rcSales], [RC_PURCHASE_SETTING, rcPurchase]] as const) await deps.db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+
+  for (const side of [{ type: 'SALES_INVOICE', basis: 'sales_line', rc: rcSales, wrong: rcPurchase }, { type: 'PURCHASE_INVOICE', basis: 'purchase_line', rc: rcPurchase, wrong: rcSales }] as const) {
+    const id = await seedClearedRate(deps.db, run, `cleared-flip-${side.type}-${run}`)
+    await deps.db.taxRate.update({ where: { id }, data: { accountingTaxType: live, reverseCharge: false } })
+    // The producer reads the rate (plain) and builds the line, then PAUSES while an operator flips the flag.
+    let resume!: () => void
+    const paused = new Promise<void>((resolve) => { resume = resolve })
+    let built!: () => void
+    const builtP = new Promise<void>((resolve) => { built = resolve })
+    const producer = (async () => {
+      const row = await deps.db.taxRate.findUniqueOrThrow({ where: { id }, select: { accountingTaxType: true, reverseCharge: true } })
+      const sent = row.reverseCharge ? side.rc : row.accountingTaxType
+      built()
+      await paused
+      return enqueue(deps, id, sent, run, { type: side.type, basis: side.basis })
+    })()
+    await builtP
+    const edit = await deps.settingsActions.updateTaxRate(id, { reverseCharge: true })
+    assert.equal(edit.success, true, JSON.stringify(edit))
+    resume()
+    assert.equal(await producer, 'tax_code_not_current', `${side.type}: the line built while the rate was plain is stale`)
+    assert.equal(await enqueue(deps, id, side.wrong, run, { type: side.type, basis: side.basis }), 'tax_code_not_current', `${side.type}: the OTHER side's swap type is not the expected one`)
+    assert.equal(await enqueue(deps, id, side.rc, run, { type: side.type, basis: side.basis }), 'admitted', `${side.type}: the rebuild carries the reverse-charge type`)
+  }
 })

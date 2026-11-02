@@ -74,7 +74,7 @@ import {
 } from '@/lib/domain/sales/refund-accounting-obligations'
 import { dischargeRefundAccountingObligation } from '@/lib/domain/sales/refund-accounting-discharge'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
-import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
+import { rateBinding, resolveSalesLineTaxType, taxTypeForBasis } from '@/lib/accounting/reverse-charge'
 import { creditNoteLineTaxTypeResolver } from '@/lib/domain/sales/refund-posted-tax-identity'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
@@ -1478,9 +1478,9 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
         unitAmount: Number(l.unitPriceForeign),
         accountCode: settings.salesAccount,
         taxType,
-        // The rate this line's code was read from (never sent), bound whenever the line has one: the enqueue guard checks a retired code is still that rate's code and refuses a rate a re-key cleared
-        // (it has no code; the connector would send NONE). lib/tax/retired-tax-code-guard.ts.
-        taxRateId: l.taxRateId ?? undefined,
+        // The rate this line's code was read from (never sent), bound whenever the line has one, with the basis the code was derived on (a sales goods line): the enqueue guard checks a retired code is
+        // still that rate's code and, for a rate a re-key cleared, that the type sent is the one this same derivation gives now. lib/tax/retired-tax-code-guard.ts.
+        ...rateBinding(l.taxRateId, 'sales_line'),
         discountAmount: discForeign > 0 ? discForeign : undefined,
       }
     }),
@@ -1488,11 +1488,11 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
     shippingDescription: 'Shipping',
     shippingAccountCode: settings.shippingAccount || undefined,
     shippingTaxType: orderDefaultTaxType ?? undefined,
-    shippingTaxRateId: orderDefaultRate?.id,
+    ...rateBinding(orderDefaultRate?.id, 'plain', 'shipping'),
     discountAmount: discountForeign > 0 ? discountForeign : undefined,
     discountAccountCode: settings.discountAccount || undefined,
     discountTaxType: orderDefaultTaxType ?? undefined,
-    discountTaxRateId: orderDefaultRate?.id,
+    ...rateBinding(orderDefaultRate?.id, 'plain', 'discount'),
     lineAmountsIncludeTax,
   }
 
@@ -2141,11 +2141,12 @@ async function queueRefundAccountingActions(input: {
         taxType: creditNoteTaxTypeOf(line) ?? undefined,
         // The rate this code can be traced to (never sent): the order line's own rate when the code is its code, else the order-default rate when it is that code's. Checked by the enqueue guard
         // (lib/tax/retired-tax-code-guard.ts); absent for a swapped or snapshot-only code, which the guard refuses only if a re-key retired it.
-        taxRateId: ((): string | undefined => {
+        ...((): Record<string, string> => {
           const code = creditNoteTaxTypeOf(line) ?? undefined
           const own = orderForCN?.lines.find((ol) => ol.id === line.lineId)
-          if (own?.taxRateId && (code === undefined || own.taxRate?.accountingTaxType === code || own.taxRate?.accountingTaxType == null)) return own.taxRateId
-          return cnTaxRate?.id
+          // The order line's own rate when the code is its derivation (a sales goods line), else the order-default rate when the code is that rate's own code (plain); never a rate the code cannot be traced to.
+          if (own?.taxRateId && (code === undefined || own.taxRate?.accountingTaxType == null || code === taxTypeForBasis('sales_line', { baseTaxType: own.taxRate.accountingTaxType, reverseCharge: own.taxRate.reverseCharge, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }))) return rateBinding(own.taxRateId, 'sales_line')
+          return code === undefined || code === cnTaxRate?.accountingTaxType ? rateBinding(cnTaxRate?.id, 'plain') : {}
         })(),
       })),
       // Every stored refund line is NET (o3d-w00): the WooCommerce monetary-only refund — the one caller

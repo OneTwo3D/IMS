@@ -6,6 +6,8 @@
  * (lib/domain/accounting/accounting-document-event-builder.ts ~87-158: lines[].taxType, the shipping and discount lines). A key counts when it is `taxType` or ends in `TaxType`,
  * except `reportTaxType` (a REPORT category such as OUTPUT, not a tax code). The TAX_RATE_SYNC payload defines rates rather than using them and is excluded by the callers.
  */
+import { basisKeyFor } from '@/lib/accounting/reverse-charge'
+
 const TAX_CODE_KEY = /^(?:taxType|[A-Za-z]+TaxType)$/
 const NOT_A_CODE_KEY = new Set(['reportTaxType', 'xeroReportTaxType'])
 const MAX_DEPTH = 8
@@ -73,7 +75,7 @@ export function taxRateBindings(payload: unknown): string[] {
   return [...out]
 }
 
-export type TaxRateBindingLine = { taxRateId: string; /** The tax type sent beside the binding (`taxType` for `taxRateId`, `shippingTaxType` for `shippingTaxRateId`), trimmed; null when the object carries none. */ code: string | null }
+export type TaxRateBindingLine = { taxRateId: string; /** The basis string sent beside the binding (lib/accounting/reverse-charge.ts TaxBindingBasis), or null when there is none. */ basis: string | null; /** The tax type sent beside the binding (`taxType` for `taxRateId`, `shippingTaxType` for `shippingTaxRateId`), trimmed; null when the object carries none. */ code: string | null }
 
 /** Every rate binding of `payload` with the tax type sent beside it, one entry per occurrence (a binding with no tax type beside it has code null). */
 export function taxRateBindingLines(payload: unknown): TaxRateBindingLine[] {
@@ -87,7 +89,8 @@ export function taxRateBindingLines(payload: unknown): TaxRateBindingLine[] {
         if ((key === 'taxRateId' || /^[a-z]+TaxRateId$/.test(key)) && child !== '') {
           const typeKey = key === 'taxRateId' ? 'taxType' : key.replace(/TaxRateId$/, 'TaxType')
           const sent = record[typeKey]
-          out.push({ taxRateId: child, code: typeof sent === 'string' && sent.trim() !== '' ? sent.trim() : null })
+          const basis = record[basisKeyFor(key)]
+          out.push({ taxRateId: child, basis: typeof basis === 'string' && basis !== '' ? basis : null, code: typeof sent === 'string' && sent.trim() !== '' ? sent.trim() : null })
         }
       } else walk(child, depth + 1)
     }

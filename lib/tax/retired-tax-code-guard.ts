@@ -20,8 +20,8 @@
  *
  * A CLEARED RATE'S MARKER IS ITS PERSISTENT IDENTITY AND IS NEVER REMOVED. The re-key records each CLEAR replacement in CLEARED_RATES_SETTING; nothing deletes the entry (the set grows by one
  * id per cleared rate and is not reaped). Under the lock the guard reads the bound rate as it is NOW and admits a binding to a marked rate ONLY when (1) the rate's current code is valid and live
- * (taxRateHasValidLiveCode: a Xero built-in or ACTIVE in the stored list of the organisation connected now) AND (2) the tax type the payload sent beside the binding IS that code exactly (for a
- * reverse-charge rate, or the configured reverse-charge type the senders swap it to). A rate with no valid code is refused as missing_tax_code; a missing, stale or different type is refused as
+ * (taxRateHasValidLiveCode: a Xero built-in or ACTIVE in the stored list of the organisation connected now) AND (2) the tax type the payload sent beside the binding IS EXACTLY the ONE type the producer would send now: the same shared function the producers call (taxTypeForBasis,
+ * lib/accounting/reverse-charge.ts) over the rate as it is now, the binding's basis (sales line, purchase line, plain) and the reverse-charge settings. A binding with no basis is refused. A rate with no valid code is refused as missing_tax_code; a missing, stale or different type is refused as
  * tax_code_not_current, so the producer rebuilds the payload from the rate as it is now (a payload built before a remap carried the order default's code, or none, and must not be admitted after it).
  * Because the marker is never dropped, a rate remapped and then cleared again (or whose code is later made invalid) is guarded again with no further step.
  *
@@ -37,10 +37,13 @@
  */
 import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { taxCodeOccurrences, taxRateBindingLines, taxRateBindings } from '@/lib/tax/tax-code-fields'
+import { TAX_BINDING_BASES, taxTypeForBasis } from '@/lib/accounting/reverse-charge'
 import { isOrganisationSpecificTaxType } from '@/lib/tax/xero-built-in-tax-types'
 
 const REVERSE_CHARGE_SALES_SETTING = 'accounting_reverse_charge_sales_tax_type'
 const REVERSE_CHARGE_PURCHASE_SETTING = 'accounting_reverse_charge_purchase_tax_type'
+const SALES_SYNC_TYPES: ReadonlySet<string> = new Set(['SALES_INVOICE', 'SALES_INVOICE_UPDATE', 'CREDIT_NOTE'])
+const PURCHASE_SYNC_TYPES: ReadonlySet<string> = new Set(['PURCHASE_INVOICE', 'PURCHASE_INVOICE_UPDATE', 'PURCHASE_CREDIT_NOTE'])
 const XERO_TAX_TYPE_FORMAT = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
 
 export const RETIRED_CODES_SETTING = 'tax_rekey_retired_codes'
@@ -143,19 +146,21 @@ export async function retiredTaxCodesInPayload(client: unknown, input: { type: s
   if (markedLines.length > 0) {
     const markedRows = new Map((await c.taxRate.findMany({ where: { id: { in: [...new Set(markedLines.map((b) => b.taxRateId))] } }, select: { id: true, active: true, replacedById: true, accountingTaxType: true, reverseCharge: true } })).map((r) => [r.id, r] as const))
     const valid = await validLiveCodes(c, [...markedRows.values()].map((r) => r.accountingTaxType).filter((t): t is string => typeof t === 'string'))
-    const reverseChargeTypes = new Set<string>()
-    if (markedLines.some((b) => markedRows.get(b.taxRateId)?.reverseCharge === true)) {
-      for (const key of [REVERSE_CHARGE_SALES_SETTING, REVERSE_CHARGE_PURCHASE_SETTING]) {
-        const value = (await c.setting.findUnique({ where: { key }, select: { value: true } }))?.value?.trim()
-        if (value) reverseChargeTypes.add(value)
-      }
-    }
+    const rcSales = (await c.setting.findUnique({ where: { key: REVERSE_CHARGE_SALES_SETTING }, select: { value: true } }))?.value?.trim() ?? ''
+    const rcPurchase = (await c.setting.findUnique({ where: { key: REVERSE_CHARGE_PURCHASE_SETTING }, select: { value: true } }))?.value?.trim() ?? ''
+    const documentDirection = SALES_SYNC_TYPES.has(input.type) ? 'sales' : PURCHASE_SYNC_TYPES.has(input.type) ? 'purchase' : null
     for (const b of markedLines) {
       const row = markedRows.get(b.taxRateId)
       const current = row?.accountingTaxType
       if (row === undefined || typeof current !== 'string' || !valid.has(current)) { out.set(`rate:${b.taxRateId}`, MISSING_TAX_CODE_REASON); continue }
-      const sentIsCurrent = b.code === current || (row.reverseCharge === true && b.code !== null && reverseChargeTypes.has(b.code))
-      if (!sentIsCurrent) out.set(`stale:${b.taxRateId}`, TAX_CODE_NOT_CURRENT_REASON)
+      // The ONE type the producer would send for this binding NOW: the same function the producers call (lib/accounting/reverse-charge.ts), from the rate as it is under the lock. A binding that does
+      // not say how its type was derived, or says a direction the document cannot have, is refused.
+      const basis = TAX_BINDING_BASES.find((x) => x === b.basis)
+      const directionOk = basis === 'plain' || (basis === 'sales_line' && documentDirection === 'sales') || (basis === 'purchase_line' && documentDirection === 'purchase')
+      const expected = basis !== undefined && directionOk
+        ? taxTypeForBasis(basis, { baseTaxType: current, reverseCharge: row.reverseCharge === true, reverseChargeSalesTaxType: rcSales, reverseChargePurchaseTaxType: rcPurchase })
+        : undefined
+      if (expected === undefined || b.code !== expected) out.set(`stale:${b.taxRateId}`, TAX_CODE_NOT_CURRENT_REASON)
     }
   }
   const retired = parseRetiredCodes((await c.setting.findUnique({ where: { key: RETIRED_CODES_SETTING }, select: { value: true } }))?.value)
