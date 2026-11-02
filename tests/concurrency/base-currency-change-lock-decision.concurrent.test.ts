@@ -196,15 +196,23 @@ test('two queued changes to DIFFERENT bases on an empty install: the first commi
   assert.equal(queued, 2, 'PRECONDITION: both changes wait on the FX table lock')
   releaseHolder()
   await holder
-  let blocked = 0
-  for (let i = 0; i < 100 && blocked === 0; i++) {
-    blocked = Number((await db.$queryRaw<Array<{ n: bigint }>>`SELECT count(*)::bigint AS n FROM pg_locks WHERE locktype = 'transactionid' AND NOT granted`)[0]?.n ?? 0)
-    if (blocked === 0) await sleep(50)
+  // Release the marker row only when the database shows where each request is: one is blocked on the marker row (a transaction id it waits for), and the other is either still waiting on the FX lock (the lock
+  // was kept) or has already finished (the lock was let go and it took it).
+  let settled = 0
+  const aWatched = a.finally(() => { settled++ })
+  const bWatched = b.finally(() => { settled++ })
+  let observed = false
+  for (let i = 0; i < 200 && !observed; i++) {
+    const [row] = await db.$queryRaw<Array<{ blocked: bigint; queued: bigint }>>`SELECT
+      count(*) FILTER (WHERE locktype = 'transactionid' AND NOT granted)::bigint AS blocked,
+      count(*) FILTER (WHERE locktype = 'advisory' AND NOT granted)::bigint AS queued FROM pg_locks`
+    observed = Number(row?.blocked ?? 0) >= 1 && (Number(row?.queued ?? 0) >= 1 || settled >= 1)
+    if (!observed) await sleep(50)
   }
-  assert.ok(blocked >= 1, 'PRECONDITION: a marker write is waiting on the held marker row')
-  await sleep(500) // time for a second request to take the lock, if the lock was released
+  assert.ok(observed, 'PRECONDITION: a marker write is blocked on the held marker row, and the other change is queued on the FX lock or finished')
   releaseMarkerHold()
   await markerSession
+  await Promise.all([aWatched, bWatched])
   const results = await Promise.all([a, b])
   assert.equal(results.filter((r) => r.success).length, 1, 'exactly one of the two different-base changes is applied')
   const refused = results.find((r) => !r.success)
@@ -212,6 +220,50 @@ test('two queued changes to DIFFERENT bases on an empty install: the first commi
   const winner = results[0].success ? 'AUD' : 'NZD'
   assert.equal((await db.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency, winner)
   assert.equal((await db.setting.findUnique({ where: { key: 'base_currency_locked' } }))?.value, 'true', 'the marker committed with the base')
+})
+
+test('a base value that is empty, blank, malformed or in lower case is normalised and checked, and never skips the lock', SKIP, async (t) => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const { updateOrganisation } = await import('@/app/actions/company')
+  const orgExisted = await db.organisation.findFirst({ select: { id: true, baseCurrency: true, name: true } })
+  const org = orgExisted ?? await db.organisation.create({ data: { name: 'Base lock test org', baseCurrency: 'GBP' }, select: { id: true, baseCurrency: true, name: true } })
+  const lockedSetting = await db.setting.findUnique({ where: { key: 'base_currency_locked' } })
+  const sourceKeys = ['fx_rate_source', 'fx_rate_source_since', 'fx_rate_source_history']
+  const savedSource = await db.setting.findMany({ where: { key: { in: sourceKeys } } })
+  const codes = ['', 'NZD', 'GBP']
+  const existing = new Set((await db.currency.findMany({ where: { code: { in: codes } }, select: { code: true } })).map((c) => c.code))
+  t.after(async () => {
+    if (orgExisted) await db.organisation.update({ where: { id: org.id }, data: { baseCurrency: org.baseCurrency, name: org.name } })
+    else await db.organisation.deleteMany({ where: { id: org.id } })
+    await db.currency.deleteMany({ where: { code: { in: codes.filter((c) => !existing.has(c)) } } })
+    await db.setting.deleteMany({ where: { key: { in: ['base_currency_locked', ...sourceKeys] } } })
+    for (const s of [...savedSource, ...(lockedSetting ? [lockedSetting] : [])]) await db.setting.create({ data: { key: s.key, value: s.value } })
+  })
+  await db.setting.deleteMany({ where: { key: { in: sourceKeys } } })
+  await db.currency.upsert({ where: { code: 'GBP' }, update: {}, create: { code: 'GBP', name: 'GBP', symbol: 'GBP', active: true } })
+  await db.organisation.updateMany({ data: { baseCurrency: 'GBP' } })
+  await db.setting.upsert({ where: { key: 'base_currency_locked' }, create: { key: 'base_currency_locked', value: 'true' }, update: { value: 'true' } })
+  const currencyCount = await db.currency.count()
+
+  for (const bad of ['   ', '', 'ab', 'EURO', 'E1R', ' e r ', '\t']) {
+    const result = await updateOrganisation({ baseCurrency: bad })
+    assert.equal(result.success, false, `${JSON.stringify(bad)} is refused`)
+    assert.match(result.error ?? '', /valid base currency/, `${JSON.stringify(bad)} is refused as not a currency code`)
+    assert.equal((await db.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency, 'GBP', `${JSON.stringify(bad)} wrote nothing`)
+    assert.equal(await db.currency.count(), currencyCount, `${JSON.stringify(bad)} created no currency`)
+  }
+  const nullBase = await updateOrganisation({ baseCurrency: null as unknown as string })
+  assert.equal(nullBase.success, false, 'null is refused')
+  const differentLower = await updateOrganisation({ baseCurrency: ' nzd ' })
+  assert.equal(differentLower.success, false)
+  assert.match(differentLower.error ?? '', /locked after setup/, 'a lower-case padded code is normalised and reaches the lock')
+  assert.equal((await db.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency, 'GBP')
+  assert.equal(await db.currency.count({ where: { code: 'NZD' } }), existing.has('NZD') ? 1 : 0, 'the refused code was not created')
+  assert.deepEqual(await updateOrganisation({ baseCurrency: ' gbp ' }), { success: true }, 'the same base, lower case and padded, is normalised and is no change')
+  assert.equal((await db.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency, 'GBP')
+  assert.deepEqual(await updateOrganisation({ name: 'Renamed' }), { success: true }, 'a request with no base at all does not touch it')
+  assert.equal((await db.organisation.findFirst({ select: { baseCurrency: true } }))?.baseCurrency, 'GBP')
 })
 
 test('pool size + 2 concurrent changes to DIFFERENT bases: exactly one is applied, the rest are refused in the lock, and none asks the pool for a second connection', SKIP, async (t) => {
