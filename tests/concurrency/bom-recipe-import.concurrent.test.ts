@@ -2012,6 +2012,32 @@ test(
  * the real importer against `bom_items`-only edges (the legacy state the old walk tripped over; the
  * `product_components` check cannot see them).
  */
+/**
+ * THE SIX TABLES THE BASE-CURRENCY LOCK READS (`isBaseCurrencyLocked`: product, supplier, customer, purchase order, sales order,
+ * stock movement). Every test below that seeds a catalogue records them first and, when it finishes, deletes exactly the rows it
+ * created and asserts they are back to the starting counts, so it leaves nothing behind for a later file in the tier to trip over.
+ */
+async function baseLockCounts(deps: Deps): Promise<number[]> {
+  return await Promise.all([
+    deps.db.product.count(), deps.db.supplier.count(), deps.db.customer.count(),
+    deps.db.purchaseOrder.count(), deps.db.salesOrder.count(), deps.db.stockMovement.count(),
+  ])
+}
+
+/** Delete everything a namespace's catalogue created (recipes, boms, components, products), then assert the six counts are back. */
+async function finishNs(deps: Deps, ns: string, before: number[]): Promise<void> {
+  const products = await deps.db.product.findMany({ where: { sku: { startsWith: `${TAG}${ns}-` } }, select: { id: true } })
+  const ids = products.map((product) => product.id)
+  const items = await deps.db.bomItem.findMany({
+    where: { OR: [{ parentProductId: { in: ids } }, { componentProductId: { in: ids } }] }, select: { id: true, bomId: true },
+  })
+  await deps.db.bomItem.deleteMany({ where: { id: { in: items.map((item) => item.id) } } })
+  await deps.db.bom.deleteMany({ where: { OR: [{ productId: { in: ids } }, { id: { in: items.map((item) => item.bomId) } }] } })
+  await deps.db.productComponent.deleteMany({ where: { OR: [{ productId: { in: ids } }, { componentId: { in: ids } }] } })
+  await deps.db.product.deleteMany({ where: { id: { in: ids } } })
+  assert.deepEqual(await baseLockCounts(deps), before, `namespace ${ns} must leave the six base-currency-lock tables at their starting counts`)
+}
+
 async function seedBomProducts(deps: Deps, ns: string, names: string[]): Promise<Record<string, string>> {
   const rows = ['sku,name,type,components,stockUnit', `${sku(ns, 'RAW')},Raw,SIMPLE,,each`]
   for (const name of names) rows.push(`${sku(ns, name)},${name},BOM,${sku(ns, 'RAW')}:1,each`)
@@ -2045,6 +2071,7 @@ test(
   async () => {
     const deps = await loadDeps()
     const NS = 'S1'
+    const before = await baseLockCounts(deps)
     const ids = await seedBomProducts(deps, NS, ['X', 'Y', 'P', 'Q'])
     const edges = [await legacyEdge(deps, ids.X, ids.Y), await legacyEdge(deps, ids.Y, ids.X)]
     try {
@@ -2066,6 +2093,7 @@ test(
       )
     } finally {
       await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+      await finishNs(deps, NS, before)
     }
   },
 )
@@ -2076,6 +2104,7 @@ test(
   async () => {
     const deps = await loadDeps()
     const NS = 'S4'
+    const before = await baseLockCounts(deps)
     const ids = await seedBomProducts(deps, NS, ['X', 'Y', 'P'])
     const edges = [await legacyEdge(deps, ids.X, ids.Y), await legacyEdge(deps, ids.Y, ids.X)]
     try {
@@ -2089,6 +2118,7 @@ test(
       assert.deepEqual(errorsOf(await importRecipe(deps, NS, 'P', ['RAW'])), [])
     } finally {
       await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+      await finishNs(deps, NS, before)
     }
   },
 )
@@ -2113,6 +2143,7 @@ test(
   async () => {
     const deps = await loadDeps()
     const NS = 'S5'
+    const before = await baseLockCounts(deps)
     const ids = await seedBomProducts(deps, NS, ['X', 'Y', 'P'])
     const edges = [await legacyEdge(deps, ids.Y, ids.X)]
     const { bomId, extraItemId } = await retiredMultiParentBom(deps, ids.P, ids.X, ids.Y)
@@ -2126,6 +2157,7 @@ test(
       assert.deepEqual(after, { active: false, productId: null }, 'the refused activation must have been rolled back')
     } finally {
       await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+      await finishNs(deps, NS, before)
     }
   },
 )
@@ -2136,6 +2168,7 @@ test(
   async () => {
     const deps = await loadDeps()
     const NS = 'S6'
+    const before = await baseLockCounts(deps)
     const ids = await seedBomProducts(deps, NS, ['X', 'Y', 'P'])
     const { bomId, extraItemId } = await retiredMultiParentBom(deps, ids.P, ids.X, ids.Y)
     try {
@@ -2144,6 +2177,7 @@ test(
       assert.deepEqual(after, { active: true, productId: ids.P })
     } finally {
       await deps.db.bomItem.deleteMany({ where: { id: extraItemId } })
+      await finishNs(deps, NS, before)
     }
   },
 )
@@ -2154,6 +2188,7 @@ test(
   async () => {
     const deps = await loadDeps()
     const NS = 'S2'
+    const before = await baseLockCounts(deps)
     const ids = await seedBomProducts(deps, NS, ['A', 'B', 'C', 'D'])
     assert.deepEqual(errorsOf(await importRecipe(deps, NS, 'A', ['B'])), [])
     const edges = [await legacyEdge(deps, ids.B, ids.C), await legacyEdge(deps, ids.C, ids.D)]
@@ -2165,6 +2200,7 @@ test(
       assert.equal(await deps.db.bomItem.count({ where: { parentProductId: ids.D, componentProductId: ids.A } }), 0)
     } finally {
       await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+      await finishNs(deps, NS, before)
     }
   },
 )
@@ -2175,6 +2211,7 @@ test(
   async () => {
     const deps = await loadDeps()
     const NS = 'S3'
+    const before = await baseLockCounts(deps)
     const ids = await seedBomProducts(deps, NS, ['A', 'B', 'C'])
     // C -> A lives in bom_items only. Alone, A -> B and B -> C are each fine; together they close
     // A -> B -> C -> A. Only the in-transaction check, under the graph lock, can see the second write
@@ -2197,6 +2234,7 @@ test(
       assert.equal(survivors, 1, 'only one of the two edges may have committed')
     } finally {
       await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+      await finishNs(deps, NS, before)
     }
   },
 )
@@ -2208,6 +2246,7 @@ test(
     const deps = await loadDeps()
     const { updateProduct } = await import('../../app/actions/products')
     const NS = 'S7'
+    const before = await baseLockCounts(deps)
     // A is a KIT over B; B and C are BOMs. C -> A lives in bom_items only (the legacy state). The editor turning A
     // into a BOM exposes A -> B; the import writes B -> C. Each is acyclic alone; together they close A -> B -> C -> A.
     const ids = await seedBomProducts(deps, NS, ['B', 'C'])
@@ -2245,6 +2284,21 @@ test(
       assert.deepEqual(cycle, [], 'no BOM cycle may be committed')
     } finally {
       await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+      await finishNs(deps, NS, before)
+    }
+  },
+)
+
+test(
+  'the BOM cycle tests above left no catalogue behind',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    for (const ns of ['S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'S7']) {
+      assert.equal(
+        await deps.db.product.count({ where: { sku: { startsWith: `${TAG}${ns}-` } } }), 0,
+        `namespace ${ns} must have been cleaned up by its own test`,
+      )
     }
   },
 )
