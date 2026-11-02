@@ -1,5 +1,5 @@
 /**
- * A scratch PostgreSQL cluster of its own (loopback, private port, under /var/tmp), migrated and seeded, with the target configuration a first load needs: the warehouses the synthetic
+ * A scratch PostgreSQL cluster of its own (loopback, private port, under the scratch root, /var/tmp unless IMS_SCRATCH_ROOT names a RAM disk), migrated and seeded, with the target configuration a first load needs: the warehouses the synthetic
  * manifest declares, a purchase tax rate, a stored EUR rate, and WooCommerce configured and enabled (so an effect the system actor fails to suppress would leave an outbox row).
  *
  * Shared by the verification and command-line tests. Not a `.test.ts` file. It touches no other cluster and no role of one.
@@ -13,6 +13,7 @@ import { databaseUrl, ident, inheritedEnv, randomHex, runChild, socketPsql, tail
 import { RUNNER_APPLICATION_NAME } from '../../lib/first-load/apply/constants'
 import { WAREHOUSES } from './apply-helpers'
 import { seedXeroList } from './apply-xero-list'
+import { scratchRoot } from '../helpers/scratch-root'
 
 export const SETTINGS_KEY = 'prod_readiness_ci_settings_key__'
 export const VAT_NAME = 'ZQSCR VAT 20'
@@ -38,7 +39,7 @@ export async function startScratch(prefix: string, database = 'ims_scratch'): Pr
   // Every connection of the runner carries this application_name; the quiesce rail tells them from anybody else's by it. The command sets it before its first connection.
   process.env.PGAPPNAME = RUNNER_APPLICATION_NAME
   const repo = process.cwd()
-  const root = mkdtempSync(`/var/tmp/${prefix}-`)
+  const root = mkdtempSync(join(scratchRoot(), `${prefix}-`))
   for (const dir of ['home', 'npm-cache', 'tmp']) mkdirSync(join(root, dir))
   writeFileSync(join(root, 'empty.env'), '')
   const port = await freePort()

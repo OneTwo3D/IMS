@@ -131,6 +131,7 @@ test('the native Qoblex fixture prepares over the real export shape: supplier cu
 })
 
 // Local smoke over the owner's real export. Counts and reasons only; never committed data. Skipped (and said so) when the files are not on this machine.
+// Fixed /var/tmp on purpose: these are the owner's real export files, left at that path by hand, not scratch.
 test('local smoke: the real Incoming export with the real supplier file (counts and reasons only)', { skip: !(existsSync('/var/tmp/qoblex-incoming-2026-10-25.csv') && existsSync('/var/tmp/fl-sup-real-contacts.csv')) && 'the owner\'s real export is not on this machine' }, (t) => {
   // The PINNED map as shipped (Approved/PartiallyReceived -> OPEN, Closed -> CLOSED), unmodified.
   const map = parseColumnMap(readFileSync(path.join(NATIVE, 'maps', 'qoblex-incoming-stock.map.json'), 'utf8'), 'm.json').datasets['purchase-order-lines']!

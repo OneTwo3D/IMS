@@ -1,3 +1,4 @@
+import { rateBinding, type TaxBindingBasis } from '@/lib/accounting/reverse-charge'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 // ---------------------------------------------------------------------------
 // Supplier credit-note domain logic (audit-g5u2)
@@ -235,6 +236,8 @@ export function buildSupplierCreditNoteSyncPayload(params: {
   taxType: string
   /** The rate `taxType` was read from; never sent (lib/tax/retired-tax-code-guard.ts binds the code to it). */
   taxRateId?: string
+  /** How `taxType` was derived from that rate (lib/accounting/reverse-charge.ts TaxBindingBasis); required with `taxRateId`. */
+  taxRateBasis?: TaxBindingBasis
   date: string
   // audit-v08m: the offset bill's external (Xero) id + the amount to apply, so the
   // post-credit follow-up can allocate the ACCPAYCREDIT to the bill. Omitted (and
@@ -260,7 +263,7 @@ export function buildSupplierCreditNoteSyncPayload(params: {
         unitAmount: params.amountForeign,
         accountCode: params.transitAccount,
         taxType: params.taxType,
-        taxRateId: params.taxRateId,
+        ...(params.taxRateBasis ? rateBinding(params.taxRateId, params.taxRateBasis) : {}),
       },
     ],
     // Standard/freight: the amount is GROSS (the over-credit cap is the bill's
