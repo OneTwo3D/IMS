@@ -72,3 +72,26 @@ export function taxRateBindings(payload: unknown): string[] {
   walk(payload, 0)
   return [...out]
 }
+
+export type TaxRateBindingLine = { taxRateId: string; /** The tax type sent beside the binding (`taxType` for `taxRateId`, `shippingTaxType` for `shippingTaxRateId`), trimmed; null when the object carries none. */ code: string | null }
+
+/** Every rate binding of `payload` with the tax type sent beside it, one entry per occurrence (a binding with no tax type beside it has code null). */
+export function taxRateBindingLines(payload: unknown): TaxRateBindingLine[] {
+  const out: TaxRateBindingLine[] = []
+  const walk = (value: unknown, depth: number): void => {
+    if (depth > MAX_DEPTH || value === null || typeof value !== 'object') return
+    if (Array.isArray(value)) { for (const item of value) walk(item, depth + 1); return }
+    const record = value as Record<string, unknown>
+    for (const [key, child] of Object.entries(record)) {
+      if (typeof child === 'string') {
+        if ((key === 'taxRateId' || /^[a-z]+TaxRateId$/.test(key)) && child !== '') {
+          const typeKey = key === 'taxRateId' ? 'taxType' : key.replace(/TaxRateId$/, 'TaxType')
+          const sent = record[typeKey]
+          out.push({ taxRateId: child, code: typeof sent === 'string' && sent.trim() !== '' ? sent.trim() : null })
+        }
+      } else walk(child, depth + 1)
+    }
+  }
+  walk(payload, 0)
+  return out
+}

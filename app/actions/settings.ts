@@ -1,6 +1,7 @@
 'use server'
 
 import { lockTaxRateForEdit } from '@/lib/tax/tax-rate-replaced'
+import { lockTaxCodeWrites } from '@/lib/tax/retired-tax-code-guard'
 import { revalidatePath } from 'next/cache'
 import { unstable_rethrow } from 'next/navigation'
 import { z } from 'zod'
@@ -391,6 +392,9 @@ export async function updateTaxRate(id: string, input: {
       if (!check.ok) return { success: false, error: check.error }
     }
     const summary = await db.$transaction(async (tx) => {
+      // ANY edit of the code (setting it, or clearing it with '') takes the selection lock FIRST, before the fence and before the row lock, and holds it to the commit: the enqueue guard reads the
+      // rate under the same lock, so its verdict stands until the producer commits (lib/tax/retired-tax-code-guard.ts).
+      if (input.accountingTaxType !== undefined) await lockTaxCodeWrites(tx)
       if (input.accountingTaxType) {
         await (await import('@/lib/connectors/xero/connection-fence')).assertXeroConnectionUnchanged(tx as never, connection)
       }
