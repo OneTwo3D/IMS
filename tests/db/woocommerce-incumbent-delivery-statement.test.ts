@@ -36,7 +36,7 @@ test('the statement selects the latest PROCESSED ORDER delivery of THIS id recei
   await db.$transaction([
     row('old', { receivedAt: at('2026-05-10T00:00:00Z'), payload: { id: wcId, status: 'processing' } }),
     row('partial', { receivedAt: at('2026-05-21T00:00:00Z'), payload: { id: wcId, status: 'partial-shipped' } }),
-    row('latest', { receivedAt: at('2026-05-25T00:00:00Z'), payload: { id: wcId, status: 'completed' } }),
+    row('latest', { receivedAt: at('2026-05-25T00:00:00Z'), payload: { id: wcId, status: 'completed', date_completed_gmt: '2026-05-25T00:00:00' } }),
     row('other-order', { receivedAt: at('2026-05-26T00:00:00Z'), payload: { id: wcId + 1, status: 'cancelled' } }),
     row('product', { resource: 'products', receivedAt: at('2026-05-27T00:00:00Z'), payload: { id: wcId, status: 'draft' } }),
     row('pending', { status: 'PENDING', receivedAt: at('2026-05-28T00:00:00Z'), payload: { id: wcId, status: 'cancelled' } }),
@@ -46,7 +46,9 @@ test('the statement selects the latest PROCESSED ORDER delivery of THIS id recei
   console.log(`# incumbent statement: latest=${JSON.stringify(latest)}`)
   assert.ok(latest, 'PRECONDITION: the statement finds the seeded delivery, so the exclusions below are not vacuous')
   assert.equal((latest.payloadJson as { status: string }).status, 'completed', 'the LATEST order delivery for this id; not the other order, not a product, not an unprocessed one')
-  assert.equal(classifyStoredWcOrderDelivery({ receivedAt: latest.receivedAt, status: (latest.payloadJson as { status: string }).status }, despatch).verified, true)
+  assert.equal(classifyStoredWcOrderDelivery({ receivedAt: latest.receivedAt, status: (latest.payloadJson as { status: string }).status, dateCompletedGmt: (latest.payloadJson as { date_completed_gmt?: string }).date_completed_gmt }, despatch).verified, true)
+  // the same stored payload with a completion BEFORE the despatch (a delayed delivery) does not verify
+  assert.equal(classifyStoredWcOrderDelivery({ receivedAt: latest.receivedAt, status: 'completed', dateCompletedGmt: '2026-05-19T00:00:00' }, despatch).verified, false)
   // received since the despatch: a despatch after every stored delivery finds none
   assert.equal(await db.shoppingWebhookEvent.findFirst({ where: incumbentDeliveryWhere(wcId, at('2026-06-01T00:00:00Z')) }), null)
   // an id nobody stored
