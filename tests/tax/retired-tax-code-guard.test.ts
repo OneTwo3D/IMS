@@ -173,6 +173,9 @@ test('a reverse-charge rate may carry the configured reverse-charge type the sen
   assert.deepEqual(await reasons(w().c, { lines: [{ taxType: 'TAX031', taxRateId: 'c-1' }] }), [])
   assert.deepEqual(await reasons(w().c, { lines: [{ taxType: 'TAX099', taxRateId: 'c-1' }] }), NOT_CURRENT)
   assert.deepEqual(await reasons(world({ cleared: MARK, rates: [rate('c-1', 'TAX031', false)], live: [{ taxType: 'TAX031' }], rc: { sales: 'REVERSECHARGES' } }).c, { lines: [{ taxType: 'REVERSECHARGES', taxRateId: 'c-1' }] }), NOT_CURRENT, 'not a reverse-charge rate: the swap does not apply')
+  // [mutation: the swap allowed for a rate that is not reverse-charge, in a payload that also binds a reverse-charge rate (the type set is then loaded)]
+  const mixed = world({ cleared: { ...MARK, 'c-2': { at: 'x' } }, rates: [rate('c-1', 'TAX031', false), rate('c-2', 'TAX032', true)], live: [{ taxType: 'TAX031' }, { taxType: 'TAX032' }], rc: { sales: 'REVERSECHARGES' } })
+  assert.deepEqual(await reasons(mixed.c, { lines: [{ taxType: 'REVERSECHARGES', taxRateId: 'c-2' }, { taxType: 'REVERSECHARGES', taxRateId: 'c-1' }] }), NOT_CURRENT, 'the swap is for the reverse-charge rate only')
 })
 
 test('a cleared rate still WITHOUT a valid live code is refused: no code, a blank code, an unknown rate, a code the live list does not carry, a malformed code', async () => {
