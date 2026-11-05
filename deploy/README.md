@@ -306,8 +306,10 @@ a longer name ends in a hash so two long names never collide).
 
 | Where | How to enable |
 |-------|---------------|
-| Production (`render-managed-crontab.mjs`) | add `--heartbeats` (prefix `ims-`; `--heartbeat-prefix <p->` overrides). Re-render and install as usual. **Also** set `IMS_CRON_HEARTBEATS=1` (and `IMS_CRON_HEARTBEATS_PREFIX` if you overrode the prefix) in the IMS container's environment: the status reader compares the installed file with what the generator would write, and with the variable unset it would read the wrapped lines as drift. |
+| Production | set `IMS_CRON_HEARTBEATS=1` (and optionally `IMS_CRON_HEARTBEATS_PREFIX=<p->`, default `ims-`) in the host's `/etc/ims/ims.env`. That file is the single switch: `install_host_cron` (deploy, rollback and the 5-minute `ims-cron-render` timer) adds `--heartbeats` / `--heartbeat-prefix` to the renderer when it says so, and the app containers read the same file through `--env-file`, so the renderer and the status reader cannot disagree. A manual `render-managed-crontab.mjs --heartbeats` render is only for one-off inspection; the next timer run would replace it with what ims.env says. |
 | Stage (in-app crontab writer on the host) | set `IMS_CRON_HEARTBEATS=1` in the app's environment (prefix `ims-stage-`, or `IMS_CRON_HEARTBEATS_PREFIX`), restart, then Save & Apply on the Scheduler page. |
+
+A wrapped job that is refused because `CRON_SECRET` is missing or unusable exits 1, so the check reports a failure (the unwrapped line keeps its documented exit 0).
 
 `/usr/local/bin/o3d-hc` and `HC_PING_BASE` (environment or `/etc/o3d/hc.env`) must exist on the host. Without a ping base the job still
 runs and the wrapper writes a warning to stderr.

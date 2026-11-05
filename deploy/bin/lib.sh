@@ -441,8 +441,16 @@ install_host_cron() {
   fi
   live="${IMS_CROND_DIR}/${IMS_CROND_NAME}"
   ( umask 077; printf 'DATABASE_URL=%s\n' "$(env_value DATABASE_URL)" > "${work}/db.env" ) || { rm -rf "$work"; return 1; }
+  # Heartbeats: the ONE switch is IMS_CRON_HEARTBEATS(=1) / IMS_CRON_HEARTBEATS_PREFIX in the host env file, which the app containers also
+  # read (--env-file), so the renderer and the status reader cannot disagree.
+  local hb=() hb_prefix
+  if [ "$(env_value IMS_CRON_HEARTBEATS)" = 1 ]; then
+    hb=(--heartbeats)
+    hb_prefix="$(env_value IMS_CRON_HEARTBEATS_PREFIX)"
+    [ -z "$hb_prefix" ] || hb+=(--heartbeat-prefix "$hb_prefix")
+  fi
   if ! docker run --rm --network host --env-file "${work}/db.env" --entrypoint node "$(runtime_image "$sha")" \
-        /app/dist-scripts/render-managed-crontab.mjs --format cron.d --cron-user root \
+        /app/dist-scripts/render-managed-crontab.mjs --format cron.d --cron-user root ${hb[@]+"${hb[@]}"} \
         --base-url "$IMS_FRONT_URL" --secret-file "$IMS_CRON_ENV_FILE" --log-path "${IMS_CRON_LOG_DIR}/cron.log" > "$rendered"; then
     log "the crontab renderer failed; the installed cron file is unchanged"
     rm -rf "$work"; return 1

@@ -654,6 +654,27 @@ t_cron_render_passes_only_database_url_to_the_renderer() {
   log_lacks "env-file $IMS_ENV_FILE .*--entrypoint node"
 }
 
+t_cron_render_adds_heartbeat_flags_only_when_the_env_file_asks() {
+  seed_active blue "$A"
+  : > "$STUB/calls.log"
+  rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
+  eq "$rc" 0 "render, heartbeats unset"
+  log_lacks 'render-managed-crontab.mjs.*--heartbeat'
+  : > "$STUB/calls.log"; printf 'IMS_CRON_HEARTBEATS=0\n' >> "$IMS_ENV_FILE"
+  rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
+  eq "$rc" 0 "render, heartbeats 0"
+  log_lacks 'render-managed-crontab.mjs.*--heartbeat'
+  : > "$STUB/calls.log"; printf 'IMS_CRON_HEARTBEATS=1\n' >> "$IMS_ENV_FILE"
+  rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
+  eq "$rc" 0 "render, heartbeats 1"
+  log_has 'render-managed-crontab.mjs --format cron.d --cron-user root --heartbeats --base-url'
+  log_lacks '--heartbeat-prefix'
+  : > "$STUB/calls.log"; printf 'IMS_CRON_HEARTBEATS_PREFIX=ims-x-\n' >> "$IMS_ENV_FILE"
+  rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
+  eq "$rc" 0 "render, heartbeats 1 with a prefix"
+  log_has 'render-managed-crontab.mjs --format cron.d --cron-user root --heartbeats --heartbeat-prefix ims-x- --base-url'
+}
+
 t_cron_render_with_nothing_deployed_is_a_noop() {
   rc=0; "$BIN/cron-render.sh" --only-if-changed > "$T/out" 2>&1 || rc=$?
   eq "$rc" 0 "nothing deployed"

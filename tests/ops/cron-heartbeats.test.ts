@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { test } from 'node:test'
 
 import { buildOtiCrontabBlock, parseOtiCrontabStatus, spliceOtiBlock, type CrontabJobDef } from '../../lib/crontab-sync.ts'
@@ -62,7 +64,7 @@ test('ON wraps every job line, the command is carried unchanged and the secret s
 })
 
 test('ON, runtime-secret form: the wrapped line still executes the original shell command (stdin reaches curl) via a real sh', () => {
-  const wrapped = wrapJobCommand("echo 'it s' | cat | tr a-z A-Z", 'ims-x')
+  const wrapped = wrapJobCommand("case x in nope) echo \"a was not run\" ;; *) echo 'it s' | cat | tr a-z A-Z ;; esac", 'ims-x')
   const shell = wrapped.replace('/usr/local/bin/o3d-hc ims-x -- ', '')
   assert.equal(execFileSync('sh', ['-c', shell], { encoding: 'utf8' }).trim(), "IT S")
 })
@@ -169,4 +171,26 @@ test('the checks list: enabled jobs only, effective schedules, slug and tz; save
   ] })
   const bad = renderHeartbeatChecks({ jobs, settings: new Map([['cron_alpha_schedule', '99 * * * *']]), defaultsOnly: false, heartbeats: ON, tz: 'UTC' })
   assert.equal(bad.ok, false)
+})
+
+test('a wrapped job refused for want of a secret reports FAILURE to the wrapper; the unwrapped line still exits 0', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'hb-'))
+  try {
+    const bin = path.join(dir, 'bin')
+    mkdirSync(bin)
+    // A stub o3d-hc with the real contract: ping start, run, ping the exit code, exit with it.
+    writeFileSync(path.join(bin, 'o3d-hc'), `#!/bin/sh\nslug=$1; shift 2\necho "start $slug" >> "${dir}/pings"\n"$@"\nrc=$?\necho "end $slug $rc" >> "${dir}/pings"\nexit $rc\n`, { mode: 0o755 })
+    const block = (hb: typeof ON | null) => {
+      const out = buildOtiCrontabBlock({ jobs: [JOBS[0]!], settings: new Map(), secretRef: { kind: 'env-file', envFilePath: path.join(dir, 'missing.env') }, baseUrl: 'http://x', logPath: path.join(dir, 'cron.log'), heartbeats: hb })
+      assert.ok(out.ok)
+      return out.lines.find((l) => l.startsWith('25 * * * *'))!.replace(/^25 \* \* \* \* {2}/, '').replace('/usr/local/bin/o3d-hc', path.join(bin, 'o3d-hc'))
+    }
+    const run = (command: string) => spawnSync('sh', ['-c', command], { env: { ...process.env, BASE_URL: 'http://x/api/cron' }, encoding: 'utf8' }).status
+    assert.equal(run(block(STAGE)), 1, 'wrapped: non-zero')
+    assert.match(readFileSync(path.join(dir, 'pings'), 'utf8'), /start ims-stage-alpha\nend ims-stage-alpha 1\n/, 'a failure ping, not a success ping')
+    assert.equal(run(block(null)), 0, 'unwrapped: documented exit 0, unchanged')
+    assert.match(readFileSync(path.join(dir, 'cron.log'), 'utf8'), /CRON_SECRET is missing or unusable/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

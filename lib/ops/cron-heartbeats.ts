@@ -73,9 +73,17 @@ export function resolveHeartbeatsFromEnv(env: Readonly<Record<string, string | u
   return { slugPrefix: containerMode ? PRODUCTION_HEARTBEAT_PREFIX : STAGE_HEARTBEAT_PREFIX }
 }
 
-/** Pure. The command wrapped for `o3d-hc`: the existing command as ONE single-quoted `sh -c` argument. */
+/**
+ * The text the unwrapped command prints in its refuse branch (empty or unusable secret): it `echo`s and the job exits 0 (documented
+ * behaviour). Inside the wrapper that would ping SUCCESS for a job that never ran, so the wrapped form makes that branch exit 1.
+ */
+const REFUSE_BRANCH_END = ' was not run" ;; *)'
+
+/** Pure. The command wrapped for `o3d-hc`: the existing command as ONE single-quoted `sh -c` argument, its refuse branch ending in a failure exit. */
 export function wrapJobCommand(command: string, checkSlug: string): string {
-  return `${HEARTBEAT_WRAPPER_PATH} ${checkSlug} -- sh -c '${command.replaceAll("'", "'\\''")}'`
+  if (!command.includes(REFUSE_BRANCH_END)) throw new Error('wrapJobCommand: the job command has no refuse branch to make fail')
+  const failing = command.replace(REFUSE_BRANCH_END, ' was not run"; exit 1 ;; *)')
+  return `${HEARTBEAT_WRAPPER_PATH} ${checkSlug} -- sh -c '${failing.replaceAll("'", "'\\''")}'`
 }
 
 const WRAPPED_LINE_RE = /^(\s*\S+(?:\s+\S+){4}\s+)\/usr\/local\/bin\/o3d-hc ([a-z0-9-]+) -- sh -c '(.*)'$/
@@ -84,7 +92,7 @@ const WRAPPED_LINE_RE = /^(\s*\S+(?:\s+\S+){4}\s+)\/usr\/local\/bin\/o3d-hc ([a-
 export function unwrapJobLine(line: string): { line: string; checkSlug: string } | null {
   const match = WRAPPED_LINE_RE.exec(line)
   if (!match) return null
-  return { line: `${match[1]}${match[3]!.replaceAll("'\\''", "'")}`, checkSlug: match[2]! }
+  return { line: `${match[1]}${match[3]!.replaceAll("'\\''", "'").replace(' was not run"; exit 1 ;; *)', REFUSE_BRANCH_END)}`, checkSlug: match[2]! }
 }
 
 export type HeartbeatCheck = { slug: string; schedule: string; tz: string; job: string }
