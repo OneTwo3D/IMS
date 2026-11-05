@@ -1,6 +1,8 @@
 import { lstatSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 
+import { SCHEDULER_CRONTAB_FILE_ENV, SCHEDULER_CRONTAB_FORMAT_ENV } from './scheduler-crontab-env'
+
 import { OTI_CRON_END_MARKER, OTI_CRON_START_MARKER, validateCronSchedule } from '@/lib/crontab-sync'
 
 /**
@@ -20,8 +22,7 @@ import { OTI_CRON_END_MARKER, OTI_CRON_START_MARKER, validateCronSchedule } from
  * missing or unreadable file, a directory, an oversized file, an unknown format) is an UNRESOLVED read, never an empty crontab: "no
  * scheduler information" must not read as healthy.
  */
-export const SCHEDULER_CRONTAB_FILE_ENV = 'IMS_SCHEDULER_CRONTAB_FILE'
-export const SCHEDULER_CRONTAB_FORMAT_ENV = 'IMS_SCHEDULER_CRONTAB_FORMAT'
+export { SCHEDULER_CRONTAB_FILE_ENV, SCHEDULER_CRONTAB_FORMAT_ENV }
 export const SCHEDULER_CRONTAB_MAX_BYTES = 1024 * 1024
 
 export type SchedulerCrontabRead = { resolved: true; text: string } | { resolved: false; reason: string }

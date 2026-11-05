@@ -17,6 +17,8 @@
  * Pure, and imports nothing from lib/crontab-sync.ts (which imports this).
  */
 
+import { SCHEDULER_CRONTAB_FILE_ENV, SCHEDULER_CRONTAB_FORMAT_ENV } from './scheduler-crontab-env'
+
 export const HEARTBEAT_WRAPPER_PATH = '/usr/local/bin/o3d-hc'
 export const HEARTBEATS_ENV = 'IMS_CRON_HEARTBEATS'
 export const HEARTBEATS_PREFIX_ENV = 'IMS_CRON_HEARTBEATS_PREFIX'
@@ -67,7 +69,7 @@ export function resolveHeartbeatsFromEnv(env: Readonly<Record<string, string | u
   if (flag !== '1' && flag !== 'true') return null
   const explicit = env[HEARTBEATS_PREFIX_ENV]?.trim()
   if (explicit) return validHeartbeatPrefix(explicit) ? { slugPrefix: explicit } : null
-  const containerMode = Boolean(env.IMS_SCHEDULER_CRONTAB_FILE?.trim()) && env.IMS_SCHEDULER_CRONTAB_FORMAT?.trim() === 'cron.d'
+  const containerMode = Boolean(env[SCHEDULER_CRONTAB_FILE_ENV]?.trim()) && env[SCHEDULER_CRONTAB_FORMAT_ENV]?.trim() === 'cron.d'
   return { slugPrefix: containerMode ? PRODUCTION_HEARTBEAT_PREFIX : STAGE_HEARTBEAT_PREFIX }
 }
 
