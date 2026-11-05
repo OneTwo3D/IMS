@@ -1035,6 +1035,94 @@ t_normal_deploy_never_enters_maintenance() {
   log_lacks 'maintenance'
 }
 
+# --- host-bootstrap.sh: the Docker CLI ---------------------------------------------------------------------------------------------
+# These run the package step (dpkg, apt-cache, apt-get, systemctl and docker are stubs) which is otherwise skipped under IMS_BOOTSTRAP_ROOT.
+bootstrap_packages() { export IMS_BOOTSTRAP_PACKAGES=1; : > "$STUB/dpkg_installed"; bootstrap_prepare; bootstrap; }
+
+t_bootstrap_installs_docker_cli_beside_docker_io_and_checks_docker_info() {
+  bootstrap_packages
+  eq "$rc" 0 "bootstrap: $(tail -n 3 "$T/out")"
+  log_has '^apt-get install .*docker\.io'
+  log_has '^apt-get install .*docker-cli'
+  before '^apt-get install' '^docker info'
+  # a re-run installs nothing more
+  : > "$STUB/calls.log"; bootstrap
+  eq "$rc" 0 "re-run"
+  log_lacks '^apt-get'
+  log_has '^docker info'
+}
+
+t_bootstrap_without_a_separate_docker_cli_package_still_works() {
+  touch "$STUB/no_pkg_docker-cli"
+  bootstrap_packages
+  eq "$rc" 0 "bootstrap: $(tail -n 3 "$T/out")"
+  log_has '^apt-get install .*docker\.io'
+  log_lacks '^apt-get .*docker-cli'
+  log_has '^docker info'
+}
+
+t_bootstrap_fails_loudly_when_docker_info_fails() {
+  touch "$STUB/docker_info_fail"
+  bootstrap_packages
+  [ "$rc" != 0 ] || fail "bootstrap succeeded although 'docker info' fails"
+  grep -q "'docker info' fails" "$T/out" || fail "no clear message: $(tail -n 3 "$T/out")"
+  [ ! -e "$R/srv/ims/state" ] || fail "bootstrap carried on past the docker check"
+}
+
+# --- deploy.sh: first install vs a serving release ---------------------------------------------------------------------------------
+
+t_first_install_with_part_of_the_history_applied_and_no_release_needs_no_flags() {
+  # An earlier first-install attempt migrated, then failed before any slot served: history non-empty, nothing serving or recorded.
+  migs "$B" m1:other m2:other m3:other; applied m1
+  printf 'upstream ims_active {\n    server 127.0.0.1:3100;\n}\n' > "$IMS_UPSTREAM_FILE"; cp "$IMS_UPSTREAM_FILE" "$STUB/loaded"
+  deploy "$B"
+  eq "$rc" 0 "first install without flags: $(tail -n 3 "$T/out")"
+  log_has '^MIGRATE'
+  log_lacks '^docker stop'
+  log_lacks 'maintenance'
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$B blue"
+  [ ! -e "$IMS_DEPLOY_DIR/previous" ] || fail "a first install has no previous"
+}
+
+t_pending_contract_migration_with_a_serving_release_still_refuses() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand m2:other; applied m1
+  deploy "$B"
+  eq "$rc" 3 "must refuse"
+  grep -q 'refusing to migrate while the active release is serving' "$T/out" || fail "wrong refusal: $(tail -n 3 "$T/out")"
+  log_lacks '^MIGRATE'
+  eq "$(container_running ims-blue)" 1 "the serving slot must be untouched"
+}
+
+t_pending_contract_migration_with_a_recorded_release_and_nothing_running_refuses() {
+  # nothing serves and nothing runs, but deploy/current names a release (a maintenance deploy that stopped midway): not a first install
+  seed_stopped blue "$A"; echo "$A blue" > "$IMS_DEPLOY_DIR/current"
+  migs "$A" m1:expand; migs "$B" m1:expand m2:other; applied m1
+  printf 'upstream ims_active {\n    server 127.0.0.1:3100;\n}\n' > "$IMS_UPSTREAM_FILE"; cp "$IMS_UPSTREAM_FILE" "$STUB/loaded"
+  deploy "$B"
+  eq "$rc" 3 "must refuse"
+  log_lacks '^MIGRATE'
+}
+
+t_pending_contract_migration_with_an_unreadable_current_record_refuses() {
+  # deploy/current exists but cannot be read as a regular file (a directory stands in, so this also fails as root)
+  migs "$B" m1:other m2:other; applied m1
+  printf 'upstream ims_active {\n    server 127.0.0.1:3100;\n}\n' > "$IMS_UPSTREAM_FILE"; cp "$IMS_UPSTREAM_FILE" "$STUB/loaded"
+  mkdir "$IMS_DEPLOY_DIR/current"
+  deploy "$B"
+  eq "$rc" 3 "an ambiguous host must refuse"
+  grep -q 'cannot tell whether a release is recorded' "$T/out" || fail "no ambiguity message: $(tail -n 4 "$T/out")"
+  log_lacks '^MIGRATE'
+  log_lacks '^RUN-SLOT'
+}
+
+t_empty_history_with_an_unreadable_upstream_file_refuses() {
+  migs "$B" m1:other; : > "$STUB/applied"
+  mkdir "$IMS_UPSTREAM_FILE"
+  deploy "$B"
+  eq "$rc" 3 "an ambiguous host must refuse even with an empty history"
+  log_lacks '^MIGRATE'
+}
+
 # ---------------------------------------------------------------------------------------------------------------------------------
 tests=("$@")
 if [ "${#tests[@]}" = 0 ]; then mapfile -t tests < <(declare -F | awk '{print $3}' | grep '^t_'); fi

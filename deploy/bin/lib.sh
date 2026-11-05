@@ -207,6 +207,30 @@ served_release_sha() {
 }
 slot_running() { [ "$(docker inspect --format '{{.State.Running}}' "$(slot_name "$1")" 2>/dev/null)" = true ]; }
 
+# Is this host a genuine first install, i.e. is there NO release to protect? Prints nothing; the status says:
+#   0  no release is serving, running or recorded (deploy/current absent), and the upstream file is absent or readable
+#   1  a release is serving, running or recorded
+#   2  cannot tell: the upstream file or deploy/current exists but is not a readable regular file (or deploy/current is empty), or a
+#      slot container cannot be inspected. Callers treat this like 1 (refuse); it is never taken for "empty".
+# The argument is the slot the running nginx serves (serving_slot).
+host_has_no_release() { # <serving slot>
+  local f state
+  [ "$1" = none ] || return 1
+  for f in "$IMS_UPSTREAM_FILE" "${IMS_DEPLOY_DIR}/current"; do
+    if [ -e "$f" ] || [ -L "$f" ]; then
+      { [ -f "$f" ] && [ -r "$f" ]; } || return 2
+    fi
+  done
+  if [ -e "${IMS_DEPLOY_DIR}/current" ]; then
+    state="$(head -n1 "${IMS_DEPLOY_DIR}/current" 2>/dev/null)" || return 2
+    [ -n "${state//[[:space:]]/}" ] || return 2
+    return 1
+  fi
+  slot_running blue && return 1
+  slot_running green && return 1
+  return 0
+}
+
 # --- images / containers --------------------------------------------------------------------------------------------------------
 runtime_image() { echo "${IMS_REGISTRY}/ims:$1"; }
 migrate_image() { echo "${IMS_REGISTRY}/ims-migrate:$1"; }

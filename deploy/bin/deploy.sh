@@ -103,8 +103,13 @@ while IFS=$'\t' read -r name marker; do
   pending+="${name}"$'\n'
   [ "$marker" = expand ] || bad+="${name}"$'\n'
 done <<< "$shipped"
+# A genuine first install has no release to protect: nothing serving, nothing running, nothing recorded as current. That holds whether
+# the migration history is empty or an earlier first-install attempt already applied part of it (it migrated, then failed before a
+# slot ever served), so the exemption is keyed on the HOST, not on the history. Anything unclear is not a first install.
+no_release_rc=0; host_has_no_release "$old_slot" || no_release_rc=$?
+if [ "$no_release_rc" = 2 ]; then log "cannot tell whether a release is recorded (${IMS_UPSTREAM_FILE} or ${IMS_DEPLOY_DIR}/current exists but is unreadable or empty); treating the host as serving"; fi
 if [ -z "$applied" ]; then
-  if [ "$old_slot" = none ] && ! slot_running blue && ! slot_running green; then
+  if [ "$old_slot" = none ] && ! slot_running blue && ! slot_running green && [ "$no_release_rc" != 2 ]; then
     log "the database has no applied migrations and nothing is serving (first install): the expand-only rule has no running release to protect"
     bad=""
   elif [ "$allow_contract" = 1 ]; then
@@ -113,6 +118,9 @@ if [ -z "$applied" ]; then
   else
     DIE_RC=3 die "the database has no applied migrations, but a release is serving or running (nginx: ${old_slot}). That means DATABASE_URL points at the wrong database or the history was lost. Refusing to migrate (override: --allow-contract-migration --maintenance)."
   fi
+elif [ "$no_release_rc" = 0 ] && [ -n "$bad" ]; then
+  log "no release is serving, running or recorded (first install, resumed after an earlier attempt applied part of the history): the expand-only rule has no running release to protect"
+  bad=""
 fi
 log "pending migrations: $(printf '%s' "$pending" | grep -c . || true)"
 [ -z "$pending" ] || sed 's/^/  /' <<< "$pending" >&2

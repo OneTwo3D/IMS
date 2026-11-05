@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Test stub for `apt-get install -y --no-install-recommends <pkg>...`: records the call and marks the packages installed.
+# The docker CLI comes with docker-cli, or with docker.io on a release where that bundles it ($STUB/docker_io_bundles_cli).
+echo "apt-get $*" >> "$STUB/calls.log"
+for a in "$@"; do
+  case "$a" in -*|install) ;; *) echo "$a" >> "$STUB/dpkg_installed"; echo "$a" >> "$STUB/apt_installed" ;; esac
+done
+exit 0

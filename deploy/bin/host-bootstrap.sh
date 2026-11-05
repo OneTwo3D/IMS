@@ -4,7 +4,7 @@
 #   host-bootstrap.sh            run as root, from a checkout of this repository
 #
 # Does, in order, skipping whatever is already in place:
-#   1. installs Docker from Debian's own packages (docker.io), nginx, cron, curl, util-linux; enables docker, cron and nginx
+#   1. installs Docker from Debian's own packages (docker.io, plus docker-cli where it is a separate package), nginx, cron, curl, util-linux; enables docker, cron and nginx
 #   2. creates /srv/ims/state (1001:1001, 0750: the bind mount shared by both app slots), /srv/ims/deploy, /etc/ims (root, 0700),
 #      /srv/ims/holding with a holding page, and /etc/ims/ims.env.template (a template; ims.env and cron.env are NEVER created or
 #      changed here: they hold secrets and are rendered from the password manager by a separate task)
@@ -47,9 +47,13 @@ put() { # <src> <dest> <mode>
 }
 
 # --- 1. packages ----------------------------------------------------------------------------------------------------------------
-if [ -z "$R" ]; then
+if [ -z "$R" ] || [ -n "${IMS_BOOTSTRAP_PACKAGES:-}" ]; then
+  # docker.io carries the CLI on older Debian and on Ubuntu; on Debian 13 the CLI is the separate docker-cli package. It is added
+  # whenever the package exists, so it works either way (a pure `command -v docker` guard would be fooled by a stray binary).
+  want=(docker.io nginx cron curl ca-certificates util-linux)
+  if apt-cache show docker-cli >/dev/null 2>&1; then want+=(docker-cli); fi
   missing=()
-  for pkg in docker.io nginx cron curl ca-certificates util-linux; do
+  for pkg in "${want[@]}"; do
     dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
   done
   if [ "${#missing[@]}" -gt 0 ]; then
@@ -57,6 +61,7 @@ if [ -z "$R" ]; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
   fi
   systemctl enable --now docker cron nginx
+  command -v docker >/dev/null 2>&1 || die "no 'docker' command after installing ${want[*]}: the Docker CLI package is missing (Debian 13: docker-cli)"
   docker info >/dev/null 2>&1 || die "docker is installed but 'docker info' fails; see deploy/README.md \"Docker in the LXC container\""
 fi
 
