@@ -729,12 +729,20 @@ async function recordPendingFxOrder(
   error: { message: string; currency: string; asOf?: Date; paymentId?: string },
   retryLogId?: string,
 ): Promise<void> {
+  // THE ROW THIS REWRITES, FOUND FIRST: a row that already carries a paid-block marker (a paid order IMS still disagrees with) keeps its stored payload, marker and snapshot whole.
+  // This is the ONLY place that rewrites a pending row's payload besides the paid-block writer and the receipt writer (which retire the marker on purpose), and a rewrite from an
+  // unrelated failure (the receipt re-drive, a missing rate) must never drop the marker: the scheduled run selects marked rows by it, so a dropped marker strands the receipt. The stored
+  // snapshot is at least as new as this caller's (the paid-block writer stored the caller's own, or a newer delivery stored a newer one).
+  const targetId = retryLogId ?? (await db.shoppingSyncLog.findFirst({ where: pendingFxQueueWhere(String(wcOrder.id)), orderBy: { createdAt: 'desc' }, select: { id: true } }))?.id
+  const stored = targetId ? await db.shoppingSyncLog.findUnique({ where: { id: targetId }, select: { payload: true, status: true } }) : null
+  const keepsMarker = isQueuedWcOrderPayload(stored?.payload) && stored.payload.paidBlock !== undefined
   const payload = buildPendingFxOrderPayload(wcOrder, error)
-  const jsonPayload = JSON.parse(JSON.stringify(payload)) as Prisma.InputJsonValue
+  const jsonPayload = (keepsMarker ? stored!.payload : JSON.parse(JSON.stringify(payload))) as Prisma.InputJsonValue
   const data = {
     connector: 'woocommerce',
     direction: 'FROM_CONNECTOR' as const,
-    status: 'PENDING' as const,
+    // a marked row that gave up (FAILED) is not resurrected by an unrelated failure
+    status: (keepsMarker && stored!.status === 'FAILED' ? 'FAILED' : 'PENDING') as 'PENDING' | 'FAILED',
     entityType: 'SalesOrder',
     externalId: String(wcOrder.id),
     payload: jsonPayload,
@@ -743,22 +751,10 @@ async function recordPendingFxOrder(
     syncedAt: new Date(),
   }
 
-  if (retryLogId) {
-    await db.shoppingSyncLog.update({
-      where: { id: retryLogId },
-      data,
-    })
+  if (targetId) {
+    await db.shoppingSyncLog.update({ where: { id: targetId }, data })
   } else {
-    const existing = await db.shoppingSyncLog.findFirst({
-      where: pendingFxQueueWhere(String(wcOrder.id)),
-      orderBy: { createdAt: 'desc' },
-      select: { id: true },
-    })
-    if (existing) {
-      await db.shoppingSyncLog.update({ where: { id: existing.id }, data })
-    } else {
-      await db.shoppingSyncLog.create({ data })
-    }
+    await db.shoppingSyncLog.create({ data })
   }
 
   await logActivity({
@@ -807,6 +803,15 @@ async function markPendingFxRetryLogSynced(logId: string, orderId: string): Prom
 }
 
 async function markPendingFxRetryLogFailed(logId: string, error: unknown): Promise<void> {
+  // A ROW THAT HOLDS A PAID ORDER'S RECEIPT OBLIGATION IS NOT FAILED BY AN UNRELATED EXCEPTION (a transient database or registration error): it stays PENDING, the attempt is counted, and it
+  // is retired FAILED only when the same bound the mismatch retry has is spent. Every other row is failed as before.
+  const current = await db.shoppingSyncLog.findUnique({ where: { id: logId }, select: { payload: true, status: true } })
+  const block = isQueuedWcOrderPayload(current?.payload) ? current.payload.paidBlock : undefined
+  if (block && current?.status === 'PENDING' && block.attempts + 1 < WC_PAID_BLOCK_MAX_ATTEMPTS) {
+    const payload = JSON.parse(JSON.stringify({ ...(current.payload as object), paidBlock: { ...block, attempts: block.attempts + 1 } })) as Prisma.InputJsonValue
+    await db.shoppingSyncLog.update({ where: { id: logId }, data: { payload, errorMessage: String(error), syncedAt: new Date() } })
+    return
+  }
   await db.shoppingSyncLog.update({
     where: { id: logId },
     data: {
@@ -875,6 +880,7 @@ export { WcReceiptRegistrationNotRecorded, wcReceiptRegistrationSeams }
 async function redriveUnregisteredWcReceipts(orderId: string, receiptPaymentId?: string): Promise<void> {
   let receipts
   try {
+    await wcReceiptRegistrationSeams.beforeRedrive?.(orderId)
     receipts = await redriveCandidates(orderId, receiptPaymentId)
   } catch (error) {
     throw new WcReceiptRegistrationNotRecorded(orderId, receiptPaymentId ?? null, 'n/a', error instanceof Error ? error.message : String(error))

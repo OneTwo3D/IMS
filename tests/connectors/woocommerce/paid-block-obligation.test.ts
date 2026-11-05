@@ -171,3 +171,54 @@ test('RACE: the retry selects the row, a NEWER paid delivery rewrites it, the re
   assert.equal(Number(pays[0]!.amount), 130)
   assert.equal((await rows(o.wcId))[0]!.status, 'SYNCED')
 })
+
+// [mutation: rewrite the row in the registration-failure catch from the caller's snapshot alone (marker dropped) / resurrect a FAILED marked row]
+test('an UNRELATED failure straight after the mismatch commits (the receipt re-drive throws) leaves the paid-block marker: the scheduled run still replays the row and records the receipt', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const seams = (await import('@/lib/domain/accounting/receipt-registration-sweep')).receiptRegistrationSeams
+  const o = await heldOrder()
+  registrations.length = 0
+  let armed = true
+  seams.beforeRedrive = async () => { if (armed) { armed = false; throw new Error('transient read failure after the mismatch committed') } }
+  try {
+    const first = await oi.importWcOrder(payload(o.wcId, '160.00'), {})
+    assert.equal(first.success, false, 'the re-drive failure is reported')
+  } finally { seams.beforeRedrive = undefined }
+  const row = (await rows(o.wcId))[0]!
+  assert.equal(row.status, 'PENDING')
+  assert.equal(paidBlock(row)?.kind, 'total', 'the marker survived the rewrite')
+  assert.equal((row.payload as { order: { total: string } }).order.total, '160.00')
+  assert.equal((await rows(o.wcId)).length, 1)
+  await s.db.salesOrder.update({ where: { id: o.id }, data: { subtotalForeign: '160', totalForeign: '160' } })
+  const run = await oi.retryPendingWcOrdersWaitingForFx(50, { receiptsOnly: true })
+  assert.ok(run.imported >= 1)
+  const pays = await payments(o.id)
+  assert.equal(pays.length, 1)
+  assert.equal(Number(pays[0]!.amount), 160)
+  assert.equal((await rows(o.wcId))[0]!.status, 'SYNCED')
+})
+
+// [mutation: fail the row on any exception / drop the attempt count]
+test('an exception while replaying a marked row keeps it PENDING and counts the attempt; it is failed only when the bound is spent', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const seams = (await import('@/lib/domain/accounting/receipt-registration-sweep')).receiptRegistrationSeams
+  const o = await heldOrder()
+  await oi.importWcOrder(payload(o.wcId, '170.00'), {})
+  const failOnce = async () => { let armed = true; seams.afterPlan = async (orderId: string) => { if (armed && orderId === o.id) { armed = false; throw new Error('boom') } } }
+  try {
+    await failOnce()
+    await oi.retryPendingWcOrdersWaitingForFx(50, { receiptsOnly: true })
+  } finally { seams.afterPlan = undefined }
+  let row = (await rows(o.wcId))[0]!
+  assert.equal(row.status, 'PENDING', 'an unrelated exception does not fail a receipt obligation')
+  assert.equal(paidBlock(row)?.attempts, 1)
+  assert.match(row.errorMessage ?? '', /boom/)
+  // at the last permitted attempt the same exception retires it
+  await s.db.shoppingSyncLog.update({ where: { id: row.id }, data: { payload: { ...(row.payload as object), paidBlock: { kind: 'total', attempts: oi.WC_PAID_BLOCK_MAX_ATTEMPTS - 1, firstAt: '2026-10-01T00:00:00.000Z' } } } })
+  try {
+    await failOnce()
+    await oi.retryPendingWcOrdersWaitingForFx(50, { receiptsOnly: true })
+  } finally { seams.afterPlan = undefined }
+  row = (await rows(o.wcId))[0]!
+  assert.equal(row.status, 'FAILED')
+})
