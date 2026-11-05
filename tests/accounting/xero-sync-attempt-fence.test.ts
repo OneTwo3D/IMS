@@ -19,7 +19,7 @@ process.env.XERO_ACCOUNTING_OUTBOX_ENABLED = 'false'
 let store: SyncLogStore = createSyncLogStore([])
 /** Runs once, on the next db.$transaction — i.e. between the claim and the writeback. */
 let interleave: (() => void) | null = null
-/** Transactions to let pass before `interleave` fires (a follow-up's store-credit guard now reads under the order lock in its own). */
+/** Transactions to let pass before `interleave` fires (a follow-up's store-credit and cancelled-order guards each read under the order lock in their own). */
 let interleaveSkip = 0
 const activity: Array<{ action: string; level?: string; description: string; metadata?: Record<string, unknown> }> = []
 
@@ -408,7 +408,7 @@ test('o3d-e2mz r4: a fence loss on a type that creates NO document says so, and 
     status: 'PENDING',
     attemptRevision: 3,
   })])
-  fenceOutOnWriteback(1)
+  fenceOutOnWriteback(2) // the store-credit guard and the cancelled-order guard each read under the order lock in a transaction of their own
 
   await (await loadProcessor())()
 

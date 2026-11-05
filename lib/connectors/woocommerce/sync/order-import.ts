@@ -1085,10 +1085,10 @@ async function announcePaidBlockGaveUp(orderId: string, wcOrder: WcFullOrder, re
     action: 'wc_paid_block_retry_gave_up',
     tag: 'sync',
     level: 'ERROR',
-    description: `WooCommerce order ${reference} is paid, but IMS still disagrees with its total or currency after ${WC_PAID_BLOCK_MAX_ATTEMPTS} retries, so no receipt was recorded and the automatic retry has stopped. Bring the order into line with WooCommerce and record the payment by hand.`,
+    description: `WooCommerce order ${reference} is paid, but IMS still disagrees with its total or currency after ${WC_PAID_BLOCK_MAX_ATTEMPTS} retries, so no receipt was recorded and the automatic retry has stopped. Bring the order into line with WooCommerce and record the payment on the order.`,
     metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) },
   })
-  await notifyActiveAdmins({ type: 'error', title: 'WooCommerce paid order has no receipt', message: `Order ${reference} is paid in WooCommerce but IMS could not record the receipt and stopped retrying. Record the payment by hand.`, actionUrl: `/sales/${orderId}` }).catch(() => undefined)
+  await notifyActiveAdmins({ type: 'error', title: 'WooCommerce paid order has no receipt', message: `Order ${reference} is paid in WooCommerce but IMS could not record the receipt and stopped retrying. Record the payment on the order.`, actionUrl: `/sales/${orderId}` }).catch(() => undefined)
 }
 
 /** The three mirrored wclc duty/tax/handling components as SalesOrder columns (null = the order carries none). */
