@@ -52,6 +52,7 @@ mock.module('@/lib/security/connector-fetch', {
 })
 const wcOrder = (over: Record<string, unknown> = {}) => () => new Response(JSON.stringify({
   id: 555, number: '1001', status: 'completed', date_completed: '2026-05-23T10:00:00', date_completed_gmt: '2026-05-23T09:00:00',
+  date_modified_gmt: '2026-05-23T09:00:20', refunds: [], line_items: [{ id: 11, quantity: 1, sku: 'SKU-1' }],
   _links: { self: [{ href: 'https://shop.example.com/wp-json/wc/v3/orders/555' }] }, ...over,
 }), { status: 200, headers: { 'content-type': 'application/json' } })
 // The WooCommerce connector modules the facade reaches, as recorders (one per KIND of Woo effect).
@@ -76,9 +77,9 @@ mock.module('@/lib/domain/sales/allocation-service', {
 
 // One in-memory database for the external-fulfilment boundary AND the real order reconcile.
 const models: Record<string, unknown> = {
-  shoppingOrderLink: { findFirst: async () => ({ externalOrderId: '555', externalOrderNumber: '1001' }) },
+  shoppingOrderLink: { findFirst: async () => ({ externalOrderId: '555', externalOrderNumber: '1001', createdAt: new Date('2026-04-01T00:00:00Z') }) },
   salesOrder: {
-    findUnique: async () => ({ ...state.order, orderNumber: 'SO-1', externalOrderNumber: 'WC-1' }),
+    findUnique: async () => ({ ...state.order, orderNumber: 'SO-1', externalOrderNumber: 'WC-1', createdAt: new Date('2026-04-01T00:00:00Z'), lines: [{ sku: 'SKU-1', qty: 1, wclcFeeKind: null, productId: 'prod-1', externalLineItemId: 11 }] }),
     update: async ({ data }: { data: Partial<Order> }) => { Object.assign(state.order, data); return state.order },
   },
   orderAllocation: { count: async () => 1 },

@@ -19,9 +19,23 @@
  *   - the order has a WooCommerce link, and the credentials resolve to a usable store;
  *   - the read succeeded and returned the order the link names (same id, and the same number when both state one);
  *   - the order's own `_links.self` names the store IMS is bound to NOW (a rebound or foreign store is refused);
+ *   - the store binding has NOT changed since the order's link was created (see {@link bindingChangedSince});
  *   - the CURRENT status is `completed`;
  *   - `date_completed_gmt` (UTC; never the offset-less local `date_completed`) parses and is at or after the LATEST despatch among
  *     all the order's despatched parts.
+ *
+ * "COMPLETED" IS NOT ENOUGH ON ITS OWN: an order completed after the despatch can still be edited (lines, quantities, refunds)
+ * and stay `completed`. So, from the same single GET, the order must also be UNCHANGED since it was completed:
+ *   - `date_modified_gmt` is no later than `date_completed_gmt` plus {@link MODIFIED_AFTER_COMPLETION_TOLERANCE_MS} (WooCommerce
+ *     stamps a few follow-up writes of its own, such as a note or meta, within moments of the status change);
+ *   - it has no refunds (`refunds` must be an array and empty);
+ *   - its line items (id and quantity) are exactly the IMS order's goods lines.
+ * Anything missing, unreadable or different is pending.
+ *
+ * STORE BINDING. An order link records no store identity, so after a rebind an old link could name the NEW store's order that
+ * happens to have the same id and number. The binding's own record is the `wc_settings_version` setting, bumped by every rebind
+ * or cache reset (a key rotation included: it is stricter than a store change, which is the safe direction). When that row was
+ * last written AFTER the order or its link was created, the binding may have changed since, and the order stays pending.
  *
  * The outcome of every verification is written to the activity log without any customer data.
  */
@@ -30,6 +44,8 @@ import { logActivity } from '@/lib/activity-log'
 import { judgeWebhookOrigin, attestWebhookOrigin } from '@/lib/connectors/webhook-origin'
 import { getWcCredentials, wcFetch } from '../api'
 import { normaliseWcOrderStatus } from '../order-status-filter'
+import { WC_SETTINGS_VERSION_KEY } from '../sync-lock'
+import { isMirroredFeeLine } from '@/lib/domain/wms/mirrored-fee-line'
 
 export type PreCutoverReadCode =
   | 'verified'
@@ -43,8 +59,18 @@ export type PreCutoverReadCode =
   | 'not_completed'
   | 'no_completion_date'
   | 'completed_before_despatch'
+  | 'binding_changed'
+  | 'edited_after_completion'
+  | 'refunded'
+  | 'lines_differ'
 
 export type PreCutoverReadVerdict = { verified: boolean; code: PreCutoverReadCode; detail: string }
+
+/**
+ * How much later than `date_completed_gmt` the order's `date_modified_gmt` may be before the order counts as edited since it was
+ * completed. WooCommerce saves the order a moment after the status change (notes, meta); a minute covers that and no human edit.
+ */
+export const MODIFIED_AFTER_COMPLETION_TOLERANCE_MS = 60_000
 
 const REST_ROOT_MARKER = '/wp-json/'
 
@@ -82,6 +108,31 @@ function orderStoreAttestation(order: Record<string, unknown>): string | null {
   return null
 }
 
+/** Null when the storefront's line items are exactly the IMS order's goods lines (same WooCommerce line id, same quantity); otherwise why not. */
+function compareLines(wooItems: unknown, imsLines: ReadonlyArray<{ sku: string | null; qty: unknown; wclcFeeKind: string | null; productId: string | null; externalLineItemId: number | null }>): string | null {
+  if (!Array.isArray(wooItems)) return 'the storefront order has no readable line items'
+  const woo = new Map<number, number>()
+  for (const item of wooItems) {
+    if (typeof item !== 'object' || item === null) return 'the storefront order has an unreadable line item'
+    const { id, quantity } = item as { id?: unknown; quantity?: unknown }
+    if (typeof id !== 'number' || !Number.isInteger(id) || typeof quantity !== 'number' || !Number.isFinite(quantity)) return 'the storefront order has an unreadable line item'
+    woo.set(id, (woo.get(id) ?? 0) + quantity)
+  }
+  const ims = new Map<number, number>()
+  for (const line of imsLines) {
+    if (isMirroredFeeLine(line)) continue
+    if (line.externalLineItemId === null || line.externalLineItemId === undefined) return 'an IMS goods line has no storefront line id to compare'
+    const qty = Number(line.qty)
+    if (!Number.isFinite(qty)) return 'an IMS line quantity is unreadable'
+    ims.set(line.externalLineItemId, (ims.get(line.externalLineItemId) ?? 0) + qty)
+  }
+  if (woo.size !== ims.size) return 'the storefront order and the IMS order have different lines'
+  for (const [id, qty] of ims) {
+    if (woo.get(id) !== qty) return 'the storefront order and the IMS order have different lines or quantities'
+  }
+  return null
+}
+
 async function decide(orderId: string, latestDespatchAt: Date | null): Promise<PreCutoverReadVerdict> {
   const no = (code: PreCutoverReadCode, detail: string): PreCutoverReadVerdict => ({ verified: false, code, detail })
   if (latestDespatchAt === null || Number.isNaN(latestDespatchAt.getTime())) {
@@ -89,9 +140,26 @@ async function decide(orderId: string, latestDespatchAt: Date | null): Promise<P
   }
   const link = await db.shoppingOrderLink.findFirst({
     where: { connector: 'woocommerce', orderId },
-    select: { externalOrderId: true, externalOrderNumber: true },
+    select: { externalOrderId: true, externalOrderNumber: true, createdAt: true },
   })
   if (!link?.externalOrderId) return no('no_link', 'the order has no WooCommerce link to read')
+
+  // The store binding must not have changed since the order or its link came into being (the earlier of the two).
+  const imsOrder = await db.salesOrder.findUnique({
+    where: { id: orderId },
+    select: { createdAt: true, lines: { select: { sku: true, qty: true, wclcFeeKind: true, productId: true, externalLineItemId: true } } },
+  })
+  if (!imsOrder) return no('no_link', 'the IMS order could not be found')
+  const boundSince = await db.setting.findUnique({ where: { key: WC_SETTINGS_VERSION_KEY }, select: { updatedAt: true } })
+  const origin = [link.createdAt, imsOrder.createdAt].filter((d): d is Date => d instanceof Date && !Number.isNaN(d.getTime()))
+  if (origin.length === 0) return no('binding_changed', 'when the order was linked is unknown, so the store binding cannot be shown unchanged')
+  if (boundSince?.updatedAt) {
+    const changedAt = boundSince.updatedAt instanceof Date ? boundSince.updatedAt.getTime() : Number.NaN
+    if (Number.isNaN(changedAt)) return no('binding_changed', 'when the store binding last changed is unreadable')
+    if (changedAt > Math.min(...origin.map((d) => d.getTime()))) {
+      return no('binding_changed', 'the store binding changed after the order was linked, so the linked order id may now name a different store\'s order')
+    }
+  }
 
   let creds: Awaited<ReturnType<typeof getWcCredentials>>
   try {
@@ -134,7 +202,19 @@ async function decide(orderId: string, latestDespatchAt: Date | null): Promise<P
   if (completedAt.getTime() < latestDespatchAt.getTime()) {
     return no('completed_before_despatch', 'the storefront order was completed before the latest part was despatched')
   }
-  return { verified: true, code: 'verified', detail: 'the storefront order is completed now, after the latest part was despatched' }
+
+  // Unchanged since completion: not edited, not refunded, same lines.
+  const modifiedAt = parseWcGmtInstant(order.date_modified_gmt)
+  if (modifiedAt === null) return no('edited_after_completion', 'the storefront order has no readable modification time in GMT')
+  if (modifiedAt.getTime() > completedAt.getTime() + MODIFIED_AFTER_COMPLETION_TOLERANCE_MS) {
+    return no('edited_after_completion', 'the storefront order was modified after it was completed')
+  }
+  if (!Array.isArray(order.refunds)) return no('refunded', 'the storefront order does not say whether it has refunds')
+  if (order.refunds.length > 0) return no('refunded', 'the storefront order has refunds')
+  const lineVerdict = compareLines(order.line_items, imsOrder.lines)
+  if (lineVerdict !== null) return no('lines_differ', lineVerdict)
+
+  return { verified: true, code: 'verified', detail: 'the storefront order is completed now, after the latest part was despatched, and unchanged since' }
 }
 
 /** Verify, fail closed, and log the outcome. Never throws. */

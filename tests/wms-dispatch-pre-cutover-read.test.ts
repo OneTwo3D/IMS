@@ -39,15 +39,23 @@ const calls: string[] = []
 const settings = new Map<string, string>()
 const transport: string[] = []
 const activity: Array<{ action: string; entityId?: string; description: string; metadata?: Record<string, unknown> }> = []
-let link: { externalOrderId: string; externalOrderNumber: string | null } | null = { externalOrderId: '555', externalOrderNumber: '1001' }
+const T0 = new Date('2026-04-01T00:00:00Z')
+let link: { externalOrderId: string; externalOrderNumber: string | null; createdAt: Date } | null = { externalOrderId: '555', externalOrderNumber: '1001', createdAt: T0 }
+type ImsLine = { sku: string | null; qty: number; wclcFeeKind: string | null; productId: string | null; externalLineItemId: number | null }
+const GOODS: ImsLine = { sku: 'A', qty: 1, wclcFeeKind: null, productId: 'p1', externalLineItemId: 11 }
+let imsLines: ImsLine[] = [GOODS]
+let orderCreatedAt = T0
+let bindingChangedAt: Date | null = null // when the wc_settings_version row was last written
 let orderRead: () => Response = () => new Response('{}', { status: 500 })
 
 function modelProxy(name: string) {
   return new Proxy({}, {
     get: (_target, method: string) => async (args?: { where?: { key?: string }; data?: Record<string, unknown> }) => {
       calls.push(`${name}.${method}`)
+      if (name === 'salesOrder' && method === 'findUnique') return { createdAt: orderCreatedAt, lines: imsLines }
       if (name === 'setting' && (method === 'findUnique' || method === 'findFirst')) {
         const key = args?.where?.key ?? ''
+        if (key === 'wc_settings_version') return bindingChangedAt ? { key, value: '2', updatedAt: bindingChangedAt } : null
         return settings.has(key) ? { key, value: settings.get(key) } : null
       }
       switch (method) {
@@ -110,6 +118,7 @@ mock.module('@/lib/security/connector-fetch', {
 const ORDER_READ = `GET ${ORIGIN}/wp-json/wc/v3/orders/555`
 const wcOrder = (over: Record<string, unknown> = {}) => () => new Response(JSON.stringify({
   id: 555, number: '1001', status: 'completed', date_completed: '2026-05-23T10:00:00', date_completed_gmt: '2026-05-23T09:00:00',
+  date_modified_gmt: '2026-05-23T09:00:20', refunds: [], line_items: [{ id: 11, quantity: 1, sku: 'A' }],
   _links: { self: [{ href: `${ORIGIN}/wp-json/wc/v3/orders/555` }] }, ...over,
 }), { status: 200, headers: { 'content-type': 'application/json' } })
 
@@ -118,7 +127,10 @@ function reset() {
   transport.length = 0
   activity.length = 0
   settings.clear()
-  link = { externalOrderId: '555', externalOrderNumber: '1001' }
+  link = { externalOrderId: '555', externalOrderNumber: '1001', createdAt: T0 }
+  imsLines = [GOODS]
+  orderCreatedAt = T0
+  bindingChangedAt = null
   orderRead = wcOrder()
   for (const [key, value] of Object.entries({
     wc_url: ORIGIN, wc_consumer_key: 'ck_x', wc_consumer_secret: 'cs_x', wc_webhook_secret: 's',
@@ -190,7 +202,7 @@ test('VERIFIED: completed now, completion at or after the LATEST despatch: the I
 
 test('the completion instant at EXACTLY the latest despatch verifies (at or after)', async () => {
   reset()
-  orderRead = wcOrder({ date_completed_gmt: '2026-05-22T10:00:00' })
+  orderRead = wcOrder({ date_completed_gmt: '2026-05-22T10:00:00', date_modified_gmt: '2026-05-22T10:00:05' })
   await withEnv(LIVE_AT_CUTOFF, async () => {
     assert.equal((await sweep([part(1, PRE), part(2, PRE2)])).out.counters.dispatched, 1)
   })
@@ -380,7 +392,7 @@ test('a seam with the switch OFF is untouched: the push reaches the storefront a
 test('MIXED order (one part verified pre-cutover, one pushed live): completes NORMALLY, without the "already completed" flag', async () => {
   reset()
   // the storefront completed the order after the LATEST despatch (the post-cutover part), so the pre-cutover part verifies
-  orderRead = wcOrder({ date_completed_gmt: '2026-07-02T09:00:00' })
+  orderRead = wcOrder({ date_completed_gmt: '2026-07-02T09:00:00', date_modified_gmt: '2026-07-02T09:00:10' })
   await withEnv(LIVE_AT_CUTOFF, async () => {
     const run = await sweep([part(1, PRE), part(2, POST)])
     assert.equal(run.out.counters.dispatched, 1)
@@ -434,6 +446,81 @@ test('no customer data reaches the activity log: only the order id, the outcome 
   await withEnv(LIVE_AT_CUTOFF, async () => { await sweep([part(1, PRE)]) })
   const text = JSON.stringify(activity)
   assert.doesNotMatch(text, /jane|example\.com|High St|1001|555/i)
+})
+
+// ───────────────────────── completed is not enough: edited, refunded, different lines; and a changed store binding ─────────────────────────
+
+const codeOf = () => activity.find((a) => a.action === 'pre_cutover_part_pending')?.metadata?.code
+
+async function expectPending(code: string, setup: () => void) {
+  reset()
+  setup()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const run = await sweep([part(1, PRE)])
+    assert.equal(run.out.counters.dispatched, 0)
+    assert.equal(run.out.counters.pending, 1)
+    assert.deepEqual(run.applyOptions, [])
+    assert.deepEqual(writes(), [])
+    assert.equal(codeOf(), code)
+  })
+}
+
+test('(a) EDITED after completion: date_modified_gmt later than date_completed_gmt beyond the tolerance is pending; within it, verified', async () => {
+  await expectPending('edited_after_completion', () => { orderRead = wcOrder({ date_modified_gmt: '2026-05-23T09:02:00' }) })
+  await expectPending('edited_after_completion', () => { orderRead = wcOrder({ date_modified_gmt: '2026-06-30T00:00:00' }) })
+  for (const bad of [undefined, null, '', 'soon']) {
+    await expectPending('edited_after_completion', () => { orderRead = wcOrder({ date_modified_gmt: bad }) })
+  }
+  const { MODIFIED_AFTER_COMPLETION_TOLERANCE_MS } = await import('@/lib/connectors/woocommerce/sync/pre-cutover-order-read')
+  assert.equal(MODIFIED_AFTER_COMPLETION_TOLERANCE_MS, 60_000)
+  reset()
+  orderRead = wcOrder({ date_modified_gmt: '2026-05-23T09:01:00' }) // exactly at the tolerance
+  await withEnv(LIVE_AT_CUTOFF, async () => { assert.equal((await sweep([part(1, PRE)])).out.counters.dispatched, 1) })
+  reset()
+  orderRead = wcOrder({ date_modified_gmt: '2026-05-23T08:59:00' }) // modified before completion: fine
+  await withEnv(LIVE_AT_CUTOFF, async () => { assert.equal((await sweep([part(1, PRE)])).out.counters.dispatched, 1) })
+})
+
+test('(b) REFUNDED: any refund, or no statement about refunds at all, is pending', async () => {
+  await expectPending('refunded', () => { orderRead = wcOrder({ refunds: [{ id: 9, reason: '', total: '-5.00' }] }) })
+  await expectPending('refunded', () => { orderRead = wcOrder({ refunds: undefined }) })
+  await expectPending('refunded', () => { orderRead = wcOrder({ refunds: null }) })
+})
+
+test('(c) LINES: the storefront line items must be exactly the IMS goods lines (id and quantity); a mirrored fee line is ignored', async () => {
+  const lines = 'lines_differ'
+  await expectPending(lines, () => { orderRead = wcOrder({ line_items: [{ id: 11, quantity: 2, sku: 'A' }] }) }) // quantity edited
+  await expectPending(lines, () => { orderRead = wcOrder({ line_items: [{ id: 11, quantity: 1 }, { id: 12, quantity: 1 }] }) }) // line added
+  await expectPending(lines, () => { orderRead = wcOrder({ line_items: [] }) }) // line removed
+  await expectPending(lines, () => { orderRead = wcOrder({ line_items: [{ id: 99, quantity: 1 }] }) }) // line replaced
+  await expectPending(lines, () => { orderRead = wcOrder({ line_items: undefined }) })
+  await expectPending(lines, () => { orderRead = wcOrder({ line_items: [{ id: 'x', quantity: 1 }] }) })
+  await expectPending(lines, () => { imsLines = [GOODS, { ...GOODS, externalLineItemId: 12 }] }) // IMS has a line the storefront lacks
+  await expectPending(lines, () => { imsLines = [GOODS, { ...GOODS, externalLineItemId: null }] }) // an IMS goods line with no storefront id
+  await expectPending(lines, () => { imsLines = [{ ...GOODS, qty: 3 }] })
+  reset()
+  imsLines = [GOODS, { sku: '', qty: 1, wclcFeeKind: null, productId: null, externalLineItemId: null }] // a mirrored fee line
+  await withEnv(LIVE_AT_CUTOFF, async () => { assert.equal((await sweep([part(1, PRE)])).out.counters.dispatched, 1) })
+})
+
+test('STORE BINDING: a rebind after the order/link was created refuses, even when the NEW store has an order with the same id and number', async () => {
+  // the new store answers perfectly: same id, same number, completed, unchanged, correct self-link for the CURRENT store
+  await expectPending('binding_changed', () => { bindingChangedAt = new Date('2026-06-10T00:00:00Z') })
+  // the order is older than the link: the older of the two is what counts
+  await expectPending('binding_changed', () => { orderCreatedAt = new Date('2026-03-01T00:00:00Z'); link = { ...link!, createdAt: new Date('2026-06-20T00:00:00Z') }; bindingChangedAt = new Date('2026-03-15T00:00:00Z') })
+  // a binding written BEFORE the order and link existed is the binding they were made under
+  reset()
+  bindingChangedAt = new Date('2026-03-01T00:00:00Z')
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    assert.equal((await sweep([part(1, PRE)])).out.counters.dispatched, 1)
+  })
+  // a refusal makes NO request: the binding is checked before the read
+  reset()
+  bindingChangedAt = new Date('2026-06-10T00:00:00Z')
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    await sweep([part(1, PRE)])
+    assert.deepEqual(transport, [])
+  })
 })
 
 // ───────────────────────── the read under the outbound-write hold ─────────────────────────
