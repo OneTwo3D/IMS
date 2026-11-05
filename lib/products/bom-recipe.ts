@@ -125,9 +125,19 @@ export function compareRecipes(
  * hang/blow-up risk in a reader that has no cycle check of its own.
  *
  * Returns the cycle as a product-id path (first id repeated at the end), or `null`.
+ *
+ * SCOPE. Without `fromProductIds` the walk is GLOBAL: it returns the first cycle anywhere in the graph,
+ * which is the right question for an operator report ({@link findBomRecipeDrift}) and for the first-load
+ * validator. A WRITER must not ask it: one unrelated cyclic pair would refuse every BOM import and build
+ * order for every product and name two products nobody touched. With `fromProductIds` only the component
+ * CLOSURE reachable from those products is walked: any cycle in it is reported (a loop through the product,
+ * or one it merely points into -- exploding its BOM would never terminate either way), while a cycle the
+ * closure cannot reach is none of the write's business. Callers pass the products whose edges they just
+ * wrote or are about to write.
  */
 export function detectBomItemCycleInEdges(
   edges: Array<{ parentProductId: string; componentProductId: string }>,
+  fromProductIds?: readonly string[],
 ): string[] | null {
   const adjacency = new Map<string, string[]>()
   for (const edge of edges) {
@@ -156,6 +166,18 @@ export function detectBomItemCycleInEdges(
     return null
   }
 
+  if (fromProductIds) {
+    // Scoped: only the closure reachable from the written products is walked, so a cycle anywhere else is
+    // never visited. Any cycle IN that closure is returned, including one the written product only points
+    // into: exploding its BOM would never terminate. The path starts at the first node of the cycle the
+    // walk met (the written product itself when it is on the cycle).
+    for (const start of fromProductIds) {
+      const found = walk(start)
+      if (found) return found
+    }
+    return null
+  }
+
   for (const parent of adjacency.keys()) {
     const found = walk(parent)
     if (found) return found
@@ -179,7 +201,7 @@ export function detectBomItemCycleAfterReplacement(
 ): string[] | null {
   const kept = edges.filter((edge) => edge.parentProductId !== parentProductId)
   const proposed = componentProductIds.map((componentProductId) => ({ parentProductId, componentProductId }))
-  return detectBomItemCycleInEdges([...kept, ...proposed])
+  return detectBomItemCycleInEdges([...kept, ...proposed], [parentProductId])
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +289,10 @@ export async function syncBomRecipeFromProductComponents(
   const existing = await client.bom.findUnique({ where: { productId }, select: { id: true, active: true } })
   let bomId = existing?.id ?? null
   let claimKind: 'created' | 'adopted' | 'already' = 'already'
+  // True when this call made an existing Bom ACTIVE (reactivated or adopted it). A Bom can hold items for
+  // several parents, and activating it exposes ALL of their edges to the planning walks, not just this
+  // product's, so the cycle check below must start from every one of those parents too.
+  let madeActive = false
 
   if (bomId) {
     // A CLAIMED Bom that is INACTIVE is a recipe planning cannot see:
@@ -276,6 +302,7 @@ export async function syncBomRecipeFromProductComponents(
     // from BOM and back again would leave it silently unplannable (round 2).
     if (existing && !existing.active) {
       await client.bom.update({ where: { id: bomId }, data: { active: true } })
+      madeActive = true
     }
   } else {
     const adoptable = await client.bom.findFirst({
@@ -299,6 +326,7 @@ export async function syncBomRecipeFromProductComponents(
       if (claimed.count !== 1) return { kind: 'claim-contended', bomId: adoptable.id }
       bomId = adoptable.id
       claimKind = 'adopted'
+      madeActive = true
     }
   }
 
@@ -367,7 +395,20 @@ export async function syncBomRecipeFromProductComponents(
     where: PLANNING_REACHABLE_BOM_EDGES,
     select: { parentProductId: true, componentProductId: true },
   })
-  const cycle = detectBomItemCycleInEdges(edges)
+  // Scoped to the closure reachable from the product just written (plus, when this call made a Bom active,
+  // from every parent whose items that activation just exposed): a cycle those closures cannot reach is not
+  // this write's business and must not refuse it; one they can reach would never terminate when exploded.
+  // Same transaction, same graph lock as the writes above.
+  const seeds = [productId]
+  if (madeActive) {
+    const exposed = await client.bomItem.findMany({
+      where: { bomId },
+      select: { parentProductId: true },
+      distinct: ['parentProductId'],
+    })
+    for (const { parentProductId } of exposed) if (!seeds.includes(parentProductId)) seeds.push(parentProductId)
+  }
+  const cycle = detectBomItemCycleInEdges(edges, seeds)
   if (cycle) return { kind: 'cycle', path: cycle }
 
   return { kind: 'written', bomId, claimed: claimKind }

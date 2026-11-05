@@ -1859,13 +1859,8 @@ test(
       `a LIVE cycle must still be reported as drift, got: ${JSON.stringify(cycleDrift)}`,
     )
 
-    // CLEAN UP THE CYCLE, and this is load-bearing rather than tidiness.
-    // `detectBomItemCycleInEdges` walks every parent and returns the FIRST cycle it finds ANYWHERE in
-    // the graph -- it is not scoped to the product being written. So this test's deliberate cycle makes
-    // every later BOM import and every later build order fail, in this file and in any sibling sharing
-    // this tier's database, with a message naming two unrelated product ids. Test 7 failed exactly that
-    // way before this cleanup existed. Filed as its own issue, because the same property means one
-    // pre-existing cyclic legacy pair in a real database blocks ALL BOM imports (o3d-zjsb5.9 round 6).
+    // Clean up the cycle so the drift assertions of later tests start from a clean graph. (Writers no
+    // longer depend on this: the cycle walk is scoped to the product being written.)
     await deps.db.bom.update({ where: { id: legacyBom.id }, data: { active: false, productId: null } })
     await deps.db.product.update({ where: { id: legId }, data: { type: 'SIMPLE' } })
     assert.deepEqual(
@@ -2005,5 +2000,305 @@ test(
       where: { id: bom.id }, select: { productId: true },
     })
     assert.equal(stillTheirs.productId, other.id, 'and the other writer keeps its claim')
+  },
+)
+
+/**
+ * THE BOM CYCLE CHECK IS ABOUT THE PRODUCT BEING WRITTEN.
+ *
+ * `detectBomItemCycleInEdges` used to return the first cycle ANYWHERE in the graph, so one unrelated
+ * cyclic pair refused every import and every build order and named two products nobody touched. The
+ * writers now ask only about the closure reachable from the product they wrote (any cycle in it refuses; a cycle it cannot reach does not). These four tests drive
+ * the real importer against `bom_items`-only edges (the legacy state the old walk tripped over; the
+ * `product_components` check cannot see them).
+ */
+/**
+ * THE SIX TABLES THE BASE-CURRENCY LOCK READS (`isBaseCurrencyLocked`: product, supplier, customer, purchase order, sales order,
+ * stock movement). Every test below that seeds a catalogue records them first and, when it finishes, deletes exactly the rows it
+ * created and asserts they are back to the starting counts, so it leaves nothing behind for a later file in the tier to trip over.
+ */
+async function baseLockCounts(deps: Deps): Promise<number[]> {
+  return await Promise.all([
+    deps.db.product.count(), deps.db.supplier.count(), deps.db.customer.count(),
+    deps.db.purchaseOrder.count(), deps.db.salesOrder.count(), deps.db.stockMovement.count(),
+  ])
+}
+
+/** Delete everything a namespace's catalogue created (recipes, boms, components, products), then assert the six counts are back. */
+async function finishNs(deps: Deps, ns: string, before: number[]): Promise<void> {
+  const products = await deps.db.product.findMany({ where: { sku: { startsWith: `${TAG}${ns}-` } }, select: { id: true } })
+  const ids = products.map((product) => product.id)
+  const items = await deps.db.bomItem.findMany({
+    where: { OR: [{ parentProductId: { in: ids } }, { componentProductId: { in: ids } }] }, select: { id: true, bomId: true },
+  })
+  await deps.db.bomItem.deleteMany({ where: { id: { in: items.map((item) => item.id) } } })
+  await deps.db.bom.deleteMany({ where: { OR: [{ productId: { in: ids } }, { id: { in: items.map((item) => item.bomId) } }] } })
+  await deps.db.productComponent.deleteMany({ where: { OR: [{ productId: { in: ids } }, { componentId: { in: ids } }] } })
+  await deps.db.product.deleteMany({ where: { id: { in: ids } } })
+  assert.deepEqual(await baseLockCounts(deps), before, `namespace ${ns} must leave the six base-currency-lock tables at their starting counts`)
+}
+
+async function seedBomProducts(deps: Deps, ns: string, names: string[]): Promise<Record<string, string>> {
+  const rows = ['sku,name,type,components,stockUnit', `${sku(ns, 'RAW')},Raw,SIMPLE,,each`]
+  for (const name of names) rows.push(`${sku(ns, name)},${name},BOM,${sku(ns, 'RAW')}:1,each`)
+  assert.deepEqual(errorsOf(await deps.importProductsCsv(csv(rows))), [], 'the catalogue must import cleanly')
+  const ids: Record<string, string> = {}
+  for (const name of ['RAW', ...names]) {
+    ids[name] = (await deps.db.product.findUniqueOrThrow({ where: { sku: sku(ns, name) }, select: { id: true } })).id
+  }
+  return ids
+}
+
+/** A bom_items-only edge (no product_components row), on the parent's claimed Bom. Returns its id. */
+async function legacyEdge(deps: Deps, parentId: string, componentId: string): Promise<string> {
+  const bom = await deps.db.bom.findUniqueOrThrow({ where: { productId: parentId }, select: { id: true } })
+  const item = await deps.db.bomItem.create({
+    data: { bomId: bom.id, parentProductId: parentId, componentProductId: componentId, qty: 1, sortOrder: 99 },
+    select: { id: true },
+  })
+  return item.id
+}
+
+const importRecipe = (deps: Deps, ns: string, parent: string, components: string[]) =>
+  deps.importProductsCsv(csv([
+    'sku,name,type,components,stockUnit',
+    `${sku(ns, parent)},${parent},BOM,${components.map((c) => `${sku(ns, c)}:1`).join(';')},each`,
+  ]))
+
+test(
+  'an unrelated pre-existing BOM cycle does not refuse a BOM import; a cycle through the written product still does',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'S1'
+    const before = await baseLockCounts(deps)
+    const ids = await seedBomProducts(deps, NS, ['X', 'Y', 'P', 'Q'])
+    const edges = [await legacyEdge(deps, ids.X, ids.Y), await legacyEdge(deps, ids.Y, ids.X)]
+    try {
+      // The unrelated cyclic pair X <-> Y exists. Writing P (which has nothing to do with it) works.
+      assert.deepEqual(errorsOf(await importRecipe(deps, NS, 'P', ['RAW', 'Q'])), [],
+        'an unrelated cyclic pair must not block this import')
+
+      // Closing a loop through Q -> P is refused, and the message names THAT loop only.
+      edges.push(await legacyEdge(deps, ids.Q, ids.P))
+      const refused = errorsOf(await importRecipe(deps, NS, 'P', ['Q']))
+      assert.ok(refused.length > 0 && refused.some((line) => /circular/i.test(line)), `expected a cycle refusal, got ${JSON.stringify(refused)}`)
+      const text = refused.join('\n')
+      assert.ok(text.includes(ids.P) && text.includes(ids.Q), `the refusal must name the real cycle: ${text}`)
+      assert.ok(!text.includes(ids.X) && !text.includes(ids.Y), `and not the unrelated pair: ${text}`)
+      // Rolled back: P keeps the recipe it had (RAW and Q), not the refused one (Q alone).
+      assert.equal(
+        await deps.db.bomItem.count({ where: { parentProductId: ids.P, componentProductId: ids.RAW } }), 1,
+        'the refused recipe must not have been written',
+      )
+    } finally {
+      await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+      await finishNs(deps, NS, before)
+    }
+  },
+)
+
+test(
+  'a product that only points INTO an existing BOM cycle is refused, naming that cycle',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'S4'
+    const before = await baseLockCounts(deps)
+    const ids = await seedBomProducts(deps, NS, ['X', 'Y', 'P'])
+    const edges = [await legacyEdge(deps, ids.X, ids.Y), await legacyEdge(deps, ids.Y, ids.X)]
+    try {
+      // P is not on the X <-> Y cycle but would reach it: exploding P's BOM would never terminate.
+      const refused = errorsOf(await importRecipe(deps, NS, 'P', ['X']))
+      const text = refused.join('\n')
+      assert.ok(/circular/i.test(text), `expected a cycle refusal, got ${JSON.stringify(refused)}`)
+      assert.ok(text.includes(ids.X) && text.includes(ids.Y), `the refusal must name the cycle it found: ${text}`)
+      assert.equal(await deps.db.bomItem.count({ where: { parentProductId: ids.P, componentProductId: ids.X } }), 0)
+      // A write whose closure is clean is still allowed while the cycle exists.
+      assert.deepEqual(errorsOf(await importRecipe(deps, NS, 'P', ['RAW'])), [])
+    } finally {
+      await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+      await finishNs(deps, NS, before)
+    }
+  },
+)
+
+/**
+ * A retired Bom that ALSO holds an item for another parent (X -> Y), which re-importing P adopts and makes
+ * active. P's own closure is clean, but the activation exposes X -> Y to planning.
+ */
+async function retiredMultiParentBom(deps: Deps, pId: string, xId: string, yId: string): Promise<{ bomId: string; extraItemId: string }> {
+  const bom = await deps.db.bom.findUniqueOrThrow({ where: { productId: pId }, select: { id: true } })
+  await deps.db.$executeRaw`UPDATE boms SET active = false, "productId" = NULL WHERE id = ${bom.id}`
+  const extra = await deps.db.bomItem.create({
+    data: { bomId: bom.id, parentProductId: xId, componentProductId: yId, qty: 1, sortOrder: 98 },
+    select: { id: true },
+  })
+  return { bomId: bom.id, extraItemId: extra.id }
+}
+
+test(
+  'adopting an inactive multi-parent Bom is refused when the edges it exposes form a cycle outside the written product\'s closure',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'S5'
+    const before = await baseLockCounts(deps)
+    const ids = await seedBomProducts(deps, NS, ['X', 'Y', 'P'])
+    const edges = [await legacyEdge(deps, ids.Y, ids.X)]
+    const { bomId, extraItemId } = await retiredMultiParentBom(deps, ids.P, ids.X, ids.Y)
+    edges.push(extraItemId)
+    try {
+      const refused = errorsOf(await importRecipe(deps, NS, 'P', ['RAW']))
+      const text = refused.join('\n')
+      assert.ok(/circular/i.test(text), `expected a cycle refusal, got ${JSON.stringify(refused)}`)
+      assert.ok(text.includes(ids.X) && text.includes(ids.Y), `the refusal must name the exposed cycle: ${text}`)
+      const after = await deps.db.bom.findUniqueOrThrow({ where: { id: bomId }, select: { active: true, productId: true } })
+      assert.deepEqual(after, { active: false, productId: null }, 'the refused activation must have been rolled back')
+    } finally {
+      await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+      await finishNs(deps, NS, before)
+    }
+  },
+)
+
+test(
+  'adopting an inactive multi-parent Bom that exposes only acyclic edges is allowed',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'S6'
+    const before = await baseLockCounts(deps)
+    const ids = await seedBomProducts(deps, NS, ['X', 'Y', 'P'])
+    const { bomId, extraItemId } = await retiredMultiParentBom(deps, ids.P, ids.X, ids.Y)
+    try {
+      assert.deepEqual(errorsOf(await importRecipe(deps, NS, 'P', ['RAW'])), [])
+      const after = await deps.db.bom.findUniqueOrThrow({ where: { id: bomId }, select: { active: true, productId: true } })
+      assert.deepEqual(after, { active: true, productId: ids.P })
+    } finally {
+      await deps.db.bomItem.deleteMany({ where: { id: extraItemId } })
+      await finishNs(deps, NS, before)
+    }
+  },
+)
+
+test(
+  'a cycle that closes through a deeper descendant is refused, naming every product on it',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'S2'
+    const before = await baseLockCounts(deps)
+    const ids = await seedBomProducts(deps, NS, ['A', 'B', 'C', 'D'])
+    assert.deepEqual(errorsOf(await importRecipe(deps, NS, 'A', ['B'])), [])
+    const edges = [await legacyEdge(deps, ids.B, ids.C), await legacyEdge(deps, ids.C, ids.D)]
+    try {
+      const refused = errorsOf(await importRecipe(deps, NS, 'D', ['A']))
+      const text = refused.join('\n')
+      assert.ok(/circular/i.test(text), `expected a cycle refusal, got ${JSON.stringify(refused)}`)
+      for (const name of ['A', 'B', 'C', 'D']) assert.ok(text.includes(ids[name]), `the cycle must name ${name}: ${text}`)
+      assert.equal(await deps.db.bomItem.count({ where: { parentProductId: ids.D, componentProductId: ids.A } }), 0)
+    } finally {
+      await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+      await finishNs(deps, NS, before)
+    }
+  },
+)
+
+test(
+  'two concurrent writers that form a BOM cycle TOGETHER: exactly one is refused',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'S3'
+    const before = await baseLockCounts(deps)
+    const ids = await seedBomProducts(deps, NS, ['A', 'B', 'C'])
+    // C -> A lives in bom_items only. Alone, A -> B and B -> C are each fine; together they close
+    // A -> B -> C -> A. Only the in-transaction check, under the graph lock, can see the second write
+    // against the first -- and now it must still do so while scoped to the product it wrote.
+    const edges = [await legacyEdge(deps, ids.C, ids.A)]
+    try {
+      const [first, second] = await Promise.all([
+        importRecipe(deps, NS, 'A', ['B']),
+        importRecipe(deps, NS, 'B', ['C']),
+      ])
+      const refusals = [errorsOf(first), errorsOf(second)].filter((errors) => errors.length > 0)
+      assert.equal(refusals.length, 1, `exactly one writer must be refused, got ${JSON.stringify([errorsOf(first), errorsOf(second)])}`)
+      assert.ok(refusals[0].some((line) => /circular/i.test(line)), JSON.stringify(refusals[0]))
+      const survivors = await deps.db.bomItem.count({
+        where: { OR: [
+          { parentProductId: ids.A, componentProductId: ids.B },
+          { parentProductId: ids.B, componentProductId: ids.C },
+        ] },
+      })
+      assert.equal(survivors, 1, 'only one of the two edges may have committed')
+    } finally {
+      await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+      await finishNs(deps, NS, before)
+    }
+  },
+)
+
+test(
+  'an editor KIT -> BOM conversion and a CSV import that together close a BOM cycle serialise: exactly one is refused',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const { updateProduct } = await import('../../app/actions/products')
+    const NS = 'S7'
+    const before = await baseLockCounts(deps)
+    // A is a KIT over B; B and C are BOMs. C -> A lives in bom_items only (the legacy state). The editor turning A
+    // into a BOM exposes A -> B; the import writes B -> C. Each is acyclic alone; together they close A -> B -> C -> A.
+    const ids = await seedBomProducts(deps, NS, ['B', 'C'])
+    assert.deepEqual(errorsOf(await deps.importProductsCsv(csv([
+      'sku,name,type,components,stockUnit',
+      `${sku(NS, 'A')},A,KIT,${sku(NS, 'B')}:1,each`,
+    ]))), [])
+    const a = (await deps.db.product.findUniqueOrThrow({ where: { sku: sku(NS, 'A') }, select: { id: true } })).id
+    const edges = [await legacyEdge(deps, ids.C, a)]
+    const form = new FormData()
+    form.set('sku', sku(NS, 'A'))
+    form.set('name', 'A')
+    form.set('type', 'BOM')
+    form.set('stockUnit', 'each')
+    form.set('lifecycleStatus', 'ACTIVE')
+    try {
+      const outcome = await whileHoldingGraphLock(deps, async () => {
+        // A successful save ends in redirect(), which throws NEXT_REDIRECT: that is a commit, not a failure.
+        const editor = updateProduct(a, {}, form).then((result) => result, (error: unknown) => error)
+        const importer = importRecipe(deps, NS, 'B', ['C'])
+        importer.catch(() => {})
+        // BOTH writers must be queued on the graph lock. An editor that does not take it never queues, and this
+        // wait fails with the message below instead of letting the race be decided by timing.
+        await awaitAdvisoryLockWaiter(deps, 2)
+        return { deferred: { editor, importer } }
+      })
+      await outcome.deferred.editor
+      await outcome.deferred.importer
+
+      const editorCommitted = (await deps.db.product.findUniqueOrThrow({ where: { id: a }, select: { type: true } })).type === 'BOM'
+      const importCommitted = (await deps.db.bomItem.count({ where: { parentProductId: ids.B, componentProductId: ids.C } })) > 0
+      assert.notEqual(editorCommitted, importCommitted, `exactly one writer may commit (editor ${editorCommitted}, import ${importCommitted})`)
+      // And no cycle is committed to the graph planning walks.
+      const cycle = (await deps.findBomRecipeDrift(deps.db)).filter((row) => row.kind === 'bom-item-cycle' && row.sku.startsWith(`${TAG}${NS}-`))
+      assert.deepEqual(cycle, [], 'no BOM cycle may be committed')
+    } finally {
+      await deps.db.bomItem.deleteMany({ where: { id: { in: edges } } })
+      await finishNs(deps, NS, before)
+    }
+  },
+)
+
+test(
+  'the BOM cycle tests above left no catalogue behind',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    for (const ns of ['S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'S7']) {
+      assert.equal(
+        await deps.db.product.count({ where: { sku: { startsWith: `${TAG}${ns}-` } } }), 0,
+        `namespace ${ns} must have been cleaned up by its own test`,
+      )
+    }
   },
 )

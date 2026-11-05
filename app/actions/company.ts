@@ -8,6 +8,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { getSettingValue, getSettingValues, serializeSettingValue } from '@/lib/settings-store'
+import { isKnownCurrency } from '@/lib/reconciliation-pack/constants'
 import { DEFAULT_BASE_CURRENCY, getFallbackCurrencyMeta, isBaseCurrencyLocked } from '@/lib/base-currency'
 import { toIsoCountryCode } from '@/lib/countries'
 import { DEFAULT_TIMEZONE, isValidTimeZone } from '@/lib/format-datetime'
@@ -103,22 +104,21 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
       }
       updateData.timezone = tz
     }
-    const existingOrg = await db.organisation.findFirst({ select: { baseCurrency: true } })
 
-    if (updateData.baseCurrency) {
-      const code = updateData.baseCurrency.toUpperCase().trim()
-      const locked = await isBaseCurrencyLocked()
-      if (locked && code !== (existingOrg?.baseCurrency ?? DEFAULT_BASE_CURRENCY)) {
-        return { success: false, error: 'Base currency is locked after setup. Reset the database to change it.' }
-      }
-      updateData.baseCurrency = code
+    // Only the code is normalised here. Whether the base may change (the current base, the lock marker, the FX source) is decided ONCE, inside the FX table lock below: a check made before the lock
+    // reads state a request queued for the lock can find out of date by the time it gets the lock.
+    // EVERY supplied value (even '' or spaces) is normalised and then checked, and takes the locked path below: only a request that supplies no base at all may skip the lock.
+    if (updateData.baseCurrency !== undefined) {
+      const normalizedBase = typeof updateData.baseCurrency === 'string' ? updateData.baseCurrency.toUpperCase().trim() : ''
+      if (!isKnownCurrency(normalizedBase)) return { success: false, error: 'Select a valid base currency.' }
+      updateData.baseCurrency = normalizedBase
     }
 
     await ensureOrganisationExists()
     // A change of the BASE currency is a write the rate table depends on: it, and the activation of the new base currency it implies, take the same exclusive lock as the rate writers and the FX source
     // switch (a CSV import holds the table still). While the FX source is Aelia a change of base is REFUSED outright: Aelia's rates are quoted against a fixed base, the new base would be activated and the
     // old base would become an active foreign currency, neither of them checked for Aelia coverage. Switch the source to ECB first.
-    if (updateData.baseCurrency) {
+    if (updateData.baseCurrency !== undefined) {
       const code = updateData.baseCurrency
       const refusal = await withFxTableWriteLock(async (tx) => {
         // EVERYTHING THAT DECIDES IS READ HERE, under the lock: a request that waited for it (behind a source switch or another base change) must not compare against the base or the lock marker it saw
@@ -140,17 +140,17 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
           await tx.currency.update({ where: { code }, data: { active: true } })
         }
         await tx.organisation.updateMany({ data: updateData })
+        // The marker is written in THIS transaction, so the base and the fact that it is locked commit together before the FX lock is released: a different-base request queued behind this one gets the lock
+        // and finds the marker, instead of an empty install it may change again.
+        await tx.setting.upsert({
+          where: { key: 'base_currency_locked' },
+          create: { key: 'base_currency_locked', value: 'true' },
+          update: { value: 'true' },
+        })
         return null
       })
       if (refusal) return { success: false, error: refusal }
     } else await db.organisation.updateMany({ data: updateData })
-    if (updateData.baseCurrency) {
-      await db.setting.upsert({
-        where: { key: 'base_currency_locked' },
-        create: { key: 'base_currency_locked', value: 'true' },
-        update: { value: 'true' },
-      })
-    }
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated company details' })
     revalidatePath('/settings')
     revalidatePath('/settings/company')
