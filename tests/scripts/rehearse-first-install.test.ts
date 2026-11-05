@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, 
 import { join } from 'node:path'
 import { type TestContext, test } from 'node:test'
 import { pgBinDir, startCluster } from './real-postgres-cluster.ts'
+import { scratchRoot } from '../helpers/scratch-root'
 
 import {
   REHEARSAL_EXIT,
@@ -29,8 +30,9 @@ import {
 import { ancestorProblem, capturePostmaster, inheritedEnv, verifyPublishedReport, writeExclusive, postmasterIsStillOurs, processStartEpochSeconds, parseArgs, processIsAlive, processesNaming, runRehearsal, shredFile, type RehearsalHooks } from '@/scripts/rehearse-first-install'
 
 const REPO = process.cwd()
-// Deliberately a fixed disk-backed /var/tmp, not scratchRoot(): the rehearsal tool refuses a RAM-backed parent, and these tests exercise that.
-const SCRATCH_PARENT = '/var/tmp'
+// IMS_SCRATCH_ROOT, when set, moves the throwaway clusters off the SSD (unset: /var/tmp, as always). A real rehearsal refuses a RAM-backed (tmpfs/ramfs) parent, so on a genuinely
+// tmpfs scratch root these tests cannot run; a disk-backed RAM disk (ext4 on zram) is fine.
+const SCRATCH_PARENT = scratchRoot()
 const TIMEOUT = 15 * 60 * 1000
 
 // ---------------------------------------------------------------------------------------------

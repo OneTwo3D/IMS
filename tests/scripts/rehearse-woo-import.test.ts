@@ -3,6 +3,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { freePort, startCluster } from './real-postgres-cluster'
+import { scratchRoot } from '../helpers/scratch-root'
 import { type TestContext, test } from 'node:test'
 
 import { WOO_IMPORT_EXIT, WOO_STEP_CATALOGUE, type WooStepId } from '@/lib/ops/woo-import-rehearsal'
@@ -18,8 +19,9 @@ import type { FakeWooCommerce } from '@/tests/helpers/fake-woocommerce'
  * comment above it; the change was made, the arm went red, and the change was reverted (md5-verified).
  */
 
-// Deliberately a fixed disk-backed /var/tmp, not scratchRoot(): the rehearsal tool refuses a RAM-backed parent, and these tests exercise that.
-const SCRATCH_PARENT = '/var/tmp'
+// IMS_SCRATCH_ROOT, when set, moves the throwaway clusters off the SSD (unset: /var/tmp, as always). A real rehearsal refuses a RAM-backed (tmpfs/ramfs) parent, so on a genuinely
+// tmpfs scratch root these tests cannot run; a disk-backed RAM disk (ext4 on zram) is fine.
+const SCRATCH_PARENT = scratchRoot()
 const REPO_CWD = process.cwd()
 const TIMEOUT = 15 * 60 * 1000
 const PREREQS: WooStepId[] = ['migrate-deploy', 'seed', 'prepare']
