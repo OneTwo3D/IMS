@@ -16,8 +16,14 @@ mock.module('@/lib/domain/accounting/invoice-payment-enqueue', { namedExports: {
 
 let s: Scratch
 let seq = 0
+/** Runs once, between the retry's SELECT of the row and its replay of the snapshot: where a newer delivery can land. */
+let betweenSelectAndReplay: { wcId: number; run: () => Promise<void> } | null = null
 before(async () => {
   s = await startScratch('ims-wc-paid-block')
+  const actualWithdrawal = await import('@/lib/connectors/woocommerce/sync/withdrawal')
+  mock.module('@/lib/connectors/woocommerce/sync/withdrawal', {
+    namedExports: { ...actualWithdrawal, importWcOrderGuarded: async (...a: Parameters<typeof actualWithdrawal.importWcOrderGuarded>) => { const hook = betweenSelectAndReplay; if (hook && (a[0] as { id: number }).id === hook.wcId) { betweenSelectAndReplay = null; await hook.run() } return actualWithdrawal.importWcOrderGuarded(...a) } },
+  })
   await s.sql('truncate fx_rates')
 })
 after(async () => { await s?.stop() })
@@ -137,4 +143,31 @@ test('CONCURRENT deliveries of the same mismatched paid order leave exactly one 
   const all = await rows(o.wcId)
   assert.equal(all.length, 1)
   assert.equal(all[0]!.status, 'PENDING')
+})
+
+// [mutation: drop the snapshot-version comparison under the lock / compare only the status / compute the version from the row id]
+test('RACE: the retry selects the row, a NEWER paid delivery rewrites it, the retry resumes: it records NO receipt for the old total; the next run uses the new total', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder()
+  registrations.length = 0
+  await oi.importWcOrder(payload(o.wcId, '120.00'), {})
+  // IMS is corrected to the first delivery's total, so replaying THAT snapshot would now record
+  await s.db.salesOrder.update({ where: { id: o.id }, data: { subtotalForeign: '120', totalForeign: '120' } })
+  betweenSelectAndReplay = { wcId: o.wcId, run: async () => { await oi.importWcOrder(payload(o.wcId, '130.00'), {}) } } // the newer webhook, after the retry's select
+  const first = await oi.retryPendingWcOrdersWaitingForFx(50, { receiptsOnly: true })
+  assert.equal(first.imported, 0)
+  assert.equal((await payments(o.id)).length, 0, 'no receipt for the old total')
+  assert.equal(registrations.length, 0)
+  assert.equal((await s.db.salesOrder.findUniqueOrThrow({ where: { id: o.id } })).paidAt, null)
+  const row = (await rows(o.wcId))[0]!
+  assert.equal(row.status, 'PENDING', 'the row is left for the next run')
+  assert.equal((row.payload as { order: { total: string } }).order.total, '130.00', 'and it holds the newer snapshot')
+  // IMS is corrected to the new total: the next run records THAT
+  await s.db.salesOrder.update({ where: { id: o.id }, data: { subtotalForeign: '130', totalForeign: '130' } })
+  const next = await oi.retryPendingWcOrdersWaitingForFx(50, { receiptsOnly: true })
+  assert.equal(next.imported, 1)
+  const pays = await payments(o.id)
+  assert.equal(pays.length, 1)
+  assert.equal(Number(pays[0]!.amount), 130)
+  assert.equal((await rows(o.wcId))[0]!.status, 'SYNCED')
 })

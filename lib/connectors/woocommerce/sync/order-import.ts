@@ -2,6 +2,7 @@
  * WooCommerce → IMS order import.
  */
 
+import { createHash } from 'node:crypto'
 import { currentTaxRates, lockOrderNamedTaxRate, resolveLinesTaxRates } from '@/lib/tax/writable-tax-rate'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
@@ -74,6 +75,8 @@ export type ImportWcOrderOptions = {
   skipAccounting?: boolean
   useWcDateAsCreatedAt?: boolean
   pendingFxRetryLogId?: string
+  /** The version (`pendingFxSnapshotVersion`) of the retry row's snapshot AS THE RETRY SELECTED IT; the receipt is recorded only while the row still holds exactly that snapshot. */
+  pendingFxSnapshotVersion?: string
   /** The stored receipt a pending-FX retry row is waiting to register (its payload's `receiptPaymentId`). */
   receiptPaymentId?: string
   /**
@@ -131,6 +134,11 @@ export type PendingFxOrderPayload = {
    * this snapshot, so the receipt is recorded as soon as IMS agrees, with no further WooCommerce delivery. `attempts` bounds it.
    */
   paidBlock?: { kind: 'total' | 'currency'; attempts: number; firstAt: string }
+}
+
+/** The version of a pending row's stored snapshot: a digest of the payload as the database returns it. A newer delivery that rewrites the row changes it. */
+export function pendingFxSnapshotVersion(payload: unknown): string {
+  return createHash('sha256').update(JSON.stringify(payload ?? null)).digest('hex')
 }
 
 /** How many retries a blocked paid order gets before the row is retired FAILED with an operator-visible finding (the scheduled run retries on every pass). */
@@ -946,10 +954,17 @@ async function writePaidBlockObligation(tx: Prisma.TransactionClient, orderId: s
   return { gaveUp }
 }
 
-async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, settlementRate: number | null, retryLogId?: string): Promise<PaidBlockOutcome> {
+async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, settlementRate: number | null, retryLogId?: string, snapshotVersion?: string): Promise<PaidBlockOutcome> {
   const paidAt = parseWcGmtInstant(wcOrder.date_paid_gmt as string)
   const claimed = await db.$transaction(async (tx) => {
     await lockSalesOrder(tx, orderId)
+    // THE SNAPSHOT THE RETRY REPLAYS MUST STILL BE THE ROW'S SNAPSHOT. The retry read the row before the import; a newer delivery may have rewritten it since (a newer total), and recording
+    // from the old snapshot would book a receipt for the old total and retire the row. Re-read under the lock; if the row changed (or is no longer pending) nothing is recorded and the
+    // row is left for the next run, which replays the new snapshot.
+    if (retryLogId && snapshotVersion) {
+      const current = await tx.shoppingSyncLog.findUnique({ where: { id: retryLogId }, select: { status: true, payload: true } })
+      if (!current || current.status !== 'PENDING' || pendingFxSnapshotVersion(current.payload) !== snapshotVersion) return { stale: true } as const
+    }
     // THE CLAIM: only one delivery moves paidAt from NULL; a duplicate or retry finds it set and does nothing.
     // The episode marker is minted EXACTLY as the update path always did, in the same write as paidAt, whatever receipts exist (the value is the DATABASE's clock, whatever is
     // written: trigger of migration 20260901090000). A new paid episode starts here; only addPayment clears the marker, and only for a receipt it records (o3d-psrx r6/r8). The registration
@@ -1018,6 +1033,7 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
     return { receipt, reference, ambiguous: false, existingCount: existing.length, obligationRowId, ownsObligationRow: !retryLogId }
   })
   if (!claimed) return { blocked: false }
+  if ('stale' in claimed) return { blocked: true, gaveUp: false }
   if ('currencyMismatch' in claimed && claimed.currencyMismatch) {
     const m = claimed.currencyMismatch
     // idempotent per order and currency pair: the same disagreement is written once however often it is delivered
@@ -1101,12 +1117,12 @@ export function wclcComponentColumns(wcOrder: WcFullOrder): {
   return { wclcDutyComponent: c.dutyComponent, wclcTaxComponent: c.taxComponent, wclcHandlingComponent: c.handlingComponent }
 }
 
-export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder: WcFullOrder, receiptPaymentId?: string, retryLogId?: string): Promise<PaidBlockOutcome> {
+export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder: WcFullOrder, receiptPaymentId?: string, retryLogId?: string, snapshotVersion?: string): Promise<PaidBlockOutcome> {
   const transition = await planWcPaidTransition(orderId, wcOrder)
   await wcReceiptRegistrationSeams.afterPlan?.(orderId)
   await updateExistingWcOrderCore(orderId, wcOrder, transition.kind !== 'none')
   let outcome: PaidBlockOutcome = { blocked: false }
-  if (transition.kind === 'record') outcome = await recordWcPaidTransition(orderId, wcOrder, transition.settlementRate, retryLogId)
+  if (transition.kind === 'record') outcome = await recordWcPaidTransition(orderId, wcOrder, transition.settlementRate, retryLogId, snapshotVersion)
   if (transition.kind === 'blocked') throw transition.error
   // WHICHEVER BRANCH RAN (including a 'record' whose locked claim was lost to a concurrent delivery that committed the Payment but whose registration failed): every receipt this
   // path recorded for the order is proven registered before this returns, so a caller can never retire its pending row on a receipt with no obligation on record. Idempotent.
@@ -2183,7 +2199,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       },
     })
     if (existing) {
-      const updated = await updateExistingWcOrderFromPayload(existing.id, wcOrder, options.receiptPaymentId, options.pendingFxRetryLogId)
+      const updated = await updateExistingWcOrderFromPayload(existing.id, wcOrder, options.receiptPaymentId, options.pendingFxRetryLogId, options.pendingFxSnapshotVersion)
       // A PAID ORDER WHOSE RECEIPT COULD NOT BE RECORDED keeps its obligation row: never retired as done, the scheduled run replays it.
       if (updated.blocked) {
         // a delivery is acknowledged (its obligation row is durable); only the retry row's own replay reports the block back to the retry loop
@@ -2841,7 +2857,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         },
       })
       if (concurrent) {
-        const updated = await updateExistingWcOrderFromPayload(concurrent.id, wcOrder, undefined, options.pendingFxRetryLogId)
+        const updated = await updateExistingWcOrderFromPayload(concurrent.id, wcOrder, undefined, options.pendingFxRetryLogId, options.pendingFxSnapshotVersion)
         if (updated.blocked) {
           // a delivery is acknowledged (its obligation row is durable); only the retry row's own replay reports the block back to the retry loop
           if (!options.pendingFxRetryLogId) return { success: true, orderId: concurrent.id }
@@ -3341,7 +3357,7 @@ export async function retryPendingWcOrdersWaitingForFx(
       const { importWcOrderGuarded } = await import('./withdrawal')
       const guarded = await importWcOrderGuarded(
         queuedOrder,
-        () => importWcOrder(queuedOrder, { pendingFxRetryLogId: row.id, ...(queuedPayload.receiptPaymentId ? { receiptPaymentId: queuedPayload.receiptPaymentId } : {}) }),
+        () => importWcOrder(queuedOrder, { pendingFxRetryLogId: row.id, pendingFxSnapshotVersion: pendingFxSnapshotVersion(row.payload), ...(queuedPayload.receiptPaymentId ? { receiptPaymentId: queuedPayload.receiptPaymentId } : {}) }),
       )
       if (guarded.outcome === 'skipped-withdrawal') {
         // TERMINAL, not pending. This queue selects the oldest fixed prefix, so a
