@@ -333,7 +333,7 @@ The output is `{"checks": [{"slug", "schedule", "tz", "job"}, ...]}`. Use `--for
 Production runs on one Proxmox container (CT 115, Debian 13) with PostgreSQL 17 installed natively (127.0.0.1:5432). Releases are the
 CI-built images above, deployed by full commit SHA with the scripts in `deploy/bin`:
 
-- `host-bootstrap.sh`: one-time, re-runnable host setup (Docker from Debian's `docker.io`, `/srv/ims/state`, `/etc/ims`, the nginx
+- `host-bootstrap.sh`: one-time, re-runnable host setup (Docker from Debian's `docker.io` plus the separate `docker-cli` package where it exists (Debian 13 ships the CLI separately), checked with `docker info`, `/srv/ims/state`, `/etc/ims`, the nginx
   site on :3000 replacing the `ims-holding` page, the scripts under `/usr/local/lib/ims-deploy`, the cron-render timer). It never
   touches PostgreSQL, OpenLiteSpeed, `ims.env` or `cron.env`. The images are public: no `docker login` and no token.
 - `deploy.sh [--allow-contract-migration --maintenance] <full-sha>`, `rollback.sh [--force-schema-mismatch]`, `cron-render.sh`.
@@ -389,8 +389,11 @@ verified through nginx; the nginx workers still proxying to the running slot are
 running by an earlier failed switch-back cannot serve the old code against the new schema. The ordinary verified switch to the new slot
 leaves maintenance. After any failure in this mode nginx stays in maintenance and the log prints how to resume (rerun the same
 command) or abort (`deploy.sh <previous sha>`; `rollback.sh` cannot be used while nginx serves no slot) (if the new release then fails its health check the old slot is NOT restarted, because the schema may no longer
-fit it). `--allow-contract-migration` without `--maintenance` is a usage error. A database with no applied migrations is exempt ONLY
-when nothing is serving (nginx reports no slot and neither slot container is running): the first install. An empty history while a
+fit it). `--allow-contract-migration` without `--maintenance` is a usage error. A genuine first install is exempt: nginx reports no slot, NO slot container exists in any state (`docker ps -a`; a stopped one
+with a restart policy may come back) and `/srv/ims/deploy/current` does not exist. Then pending migrations run without the expand-only
+rule, whether the migration history is empty or an earlier first-install attempt already applied part of it. If the upstream file or
+`deploy/current` exists but is unreadable (or `deploy/current` is empty), or docker cannot list the containers, the host state is unknown
+and the deploy exits 3 at once, even with the override flags. The refusal names which condition blocked it. An empty history while a
 release is serving or running means `DATABASE_URL` points at the wrong database, and the deploy refuses (status 3) unless the
 maintenance flags are given. `rollback.sh` refuses when any migration applied since `previous` lacks the marker; `--force-schema-mismatch`
 overrides. `deploy.sh` applies the same rule to an OLDER target image: any already-applied migration the target does not ship must be
