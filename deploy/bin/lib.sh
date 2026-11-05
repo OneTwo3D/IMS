@@ -21,6 +21,9 @@ IMS_BLUE_PORT="${IMS_BLUE_PORT:-3101}"
 IMS_GREEN_PORT="${IMS_GREEN_PORT:-3102}"
 IMS_FRONT_URL="${IMS_FRONT_URL:-http://127.0.0.1:3000}"
 IMS_HC_BIN="${IMS_HC_BIN:-/usr/local/bin/o3d-hc}"
+# The wrapper path the RENDERED cron lines run: it must equal HEARTBEAT_WRAPPER_PATH in lib/ops/cron-heartbeats.ts (a test greps both). Not
+# overridable, unlike IMS_HC_BIN (which only wraps this script's own run). IMS_WRAPPER_TEST_ROOT prefixes it for the tests alone.
+IMS_RENDERED_WRAPPER=/usr/local/bin/o3d-hc
 IMS_HEALTH_TIMEOUT_S="${IMS_HEALTH_TIMEOUT_S:-120}"
 IMS_HEALTH_INTERVAL_S="${IMS_HEALTH_INTERVAL_S:-2}"
 IMS_FRONT_TIMEOUT_S="${IMS_FRONT_TIMEOUT_S:-30}"
@@ -485,8 +488,8 @@ install_host_cron() {
   # read (--env-file), so the renderer and the status reader cannot disagree.
   local hb=() hb_prefix
   if [ "$(env_value IMS_CRON_HEARTBEATS)" = 1 ]; then
-    if [ ! -x "$IMS_HC_BIN" ]; then
-      log "heartbeats enabled but ${IMS_HC_BIN} is missing or not executable; crontab NOT replaced"
+    if [ ! -x "${IMS_WRAPPER_TEST_ROOT:-}${IMS_RENDERED_WRAPPER}" ]; then
+      log "heartbeats enabled but ${IMS_RENDERED_WRAPPER} is missing or not executable; crontab NOT replaced"
       rm -rf "$work"; return 1
     fi
     hb=(--heartbeats)
