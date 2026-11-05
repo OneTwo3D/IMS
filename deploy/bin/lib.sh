@@ -207,6 +207,46 @@ served_release_sha() {
 }
 slot_running() { [ "$(docker inspect --format '{{.State.Running}}' "$(slot_name "$1")" 2>/dev/null)" = true ]; }
 
+# The slot containers that EXIST, in any run state (`docker ps -a`): a container made with a restart policy can be between an exit and
+# its automatic restart, so "not running" is not "absent". Prints their names; rc 0 answered (empty output = none exist), rc 1 docker
+# could not be asked. Three outcomes, never a failed query read as "none".
+existing_slot_containers() {
+  local out
+  # No docker --filter: its name filter matches the name WITH docker's leading slash, so an anchored pattern silently matches nothing.
+  # List every container and compare the names exactly here.
+  out="$(docker ps -a --no-trunc --format '{{.Names}}' 2>/dev/null)" || return 1
+  printf '%s\n' "$out" | grep -Fx -e "$(slot_name blue)" -e "$(slot_name green)" || true
+}
+
+# Is this host a genuine first install, i.e. is there NO release to protect? The status says, and HOST_RELEASE_WHY names the reason:
+#   0  nginx serves no slot, no slot container exists in any state, deploy/current does not exist, and the upstream file is absent or
+#      readable. The ONLY status that grants the first-install exemption.
+#   1  a release is protected: nginx serves a slot, a slot container exists (running, stopped, or between a restart), or deploy/current
+#      records a release
+#   2  cannot tell: the upstream file or deploy/current exists but is not a readable regular file (or deploy/current is empty), or docker
+#      cannot be asked. Never taken for "empty"; deploy.sh refuses at once.
+# The argument is the slot the running nginx serves (serving_slot).
+HOST_RELEASE_WHY=""  # read by deploy.sh
+# shellcheck disable=SC2034
+host_has_no_release() { # <serving slot>
+  local f state names
+  if [ "$1" != none ]; then HOST_RELEASE_WHY="nginx is serving the $1 slot"; return 1; fi
+  for f in "$IMS_UPSTREAM_FILE" "${IMS_DEPLOY_DIR}/current"; do
+    if [ -e "$f" ] || [ -L "$f" ]; then
+      { [ -f "$f" ] && [ -r "$f" ]; } || { HOST_RELEASE_WHY="$f exists but is not a readable file"; return 2; }
+    fi
+  done
+  if [ -e "${IMS_DEPLOY_DIR}/current" ]; then
+    state="$(head -n1 "${IMS_DEPLOY_DIR}/current" 2>/dev/null)" || { HOST_RELEASE_WHY="${IMS_DEPLOY_DIR}/current cannot be read"; return 2; }
+    [ -n "${state//[[:space:]]/}" ] || { HOST_RELEASE_WHY="${IMS_DEPLOY_DIR}/current is empty"; return 2; }
+    HOST_RELEASE_WHY="${IMS_DEPLOY_DIR}/current records a release (${state})"; return 1
+  fi
+  names="$(existing_slot_containers)" || { HOST_RELEASE_WHY="docker could not list the slot containers"; return 2; }
+  if [ -n "$names" ]; then HOST_RELEASE_WHY="slot container(s) exist: $(tr '\n' ' ' <<< "$names")"; return 1; fi
+  HOST_RELEASE_WHY="no slot is served, no slot container exists and no release is recorded"
+  return 0
+}
+
 # --- images / containers --------------------------------------------------------------------------------------------------------
 runtime_image() { echo "${IMS_REGISTRY}/ims:$1"; }
 migrate_image() { echo "${IMS_REGISTRY}/ims-migrate:$1"; }

@@ -103,15 +103,24 @@ while IFS=$'\t' read -r name marker; do
   pending+="${name}"$'\n'
   [ "$marker" = expand ] || bad+="${name}"$'\n'
 done <<< "$shipped"
-if [ -z "$applied" ]; then
-  if [ "$old_slot" = none ] && ! slot_running blue && ! slot_running green; then
-    log "the database has no applied migrations and nothing is serving (first install): the expand-only rule has no running release to protect"
-    bad=""
-  elif [ "$allow_contract" = 1 ]; then
-    log "the database has NO applied migrations, but a release is serving or running (is DATABASE_URL pointing at the right database?); continuing because --allow-contract-migration --maintenance was given"
+# A genuine first install has no release to protect: nginx serves no slot, no slot container exists in ANY state, and nothing is
+# recorded as current (host_has_no_release returns exactly 0). That holds whether the migration history is empty or an earlier
+# first-install attempt already applied part of it, so the exemption is keyed on the HOST. Only status 0 grants it, in both history
+# states. Status 2 (cannot tell) refuses at once, before the history branches and before any override.
+no_release_rc=0; host_has_no_release "$old_slot" || no_release_rc=$?
+if [ "$no_release_rc" = 2 ]; then
+  DIE_RC=3 die "cannot tell whether a release exists (${HOST_RELEASE_WHY}); refusing to migrate. Nothing was changed. Fix that and retry; the override flags do not apply to an unknown host state."
+fi
+if [ "$no_release_rc" = 0 ]; then
+  if [ -z "$applied" ]; then log "the database has no applied migrations and ${HOST_RELEASE_WHY} (first install): the expand-only rule has no release to protect"
+  else log "${HOST_RELEASE_WHY} (first install, resumed after an earlier attempt applied part of the history): the expand-only rule has no release to protect"; fi
+  bad=""
+elif [ -z "$applied" ]; then
+  if [ "$allow_contract" = 1 ]; then
+    log "the database has NO applied migrations, but a release is protected (${HOST_RELEASE_WHY}; is DATABASE_URL pointing at the right database?); continuing because --allow-contract-migration --maintenance was given"
     bad="${bad:-<empty migration history>}"
   else
-    DIE_RC=3 die "the database has no applied migrations, but a release is serving or running (nginx: ${old_slot}). That means DATABASE_URL points at the wrong database or the history was lost. Refusing to migrate (override: --allow-contract-migration --maintenance)."
+    DIE_RC=3 die "the database has no applied migrations, but a release is protected (${HOST_RELEASE_WHY}). That means DATABASE_URL points at the wrong database or the history was lost. Refusing to migrate (override: --allow-contract-migration --maintenance)."
   fi
 fi
 log "pending migrations: $(printf '%s' "$pending" | grep -c . || true)"
@@ -123,7 +132,7 @@ if [ -n "$bad" ]; then
   if [ "$allow_contract" = 1 ]; then
     contract=1
   else
-    DIE_RC=3 die "refusing to migrate while the active release is serving. A contract (destructive) migration ships in its own maintenance deploy: --allow-contract-migration --maintenance."
+    DIE_RC=3 die "refusing to migrate: a release is protected (${HOST_RELEASE_WHY}), so every pending migration must be expand-only. A contract (destructive) migration ships in its own maintenance deploy: --allow-contract-migration --maintenance."
   fi
 fi
 
