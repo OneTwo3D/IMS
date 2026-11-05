@@ -9,6 +9,8 @@ case "${1:-}" in
   pull) [ ! -e "$STUB/pull_fail" ] || exit 1; rm -f "$STUB/missing_image_$(image_key "${*: -1}")" ;;
   image) [ ! -e "$STUB/missing_image_$(image_key "${*: -1}")" ] ;;
   logs) exit 0 ;;
+  ps) [ ! -e "$STUB/ps_fail" ] || exit 1
+      for f in "$cdir"/ims-*; do [ -f "$f" ] && basename "$f"; done; exit 0 ;;
   info) [ ! -e "$STUB/docker_info_fail" ] ;;
   inspect)
     name="${*: -1}"

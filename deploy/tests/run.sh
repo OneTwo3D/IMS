@@ -1088,7 +1088,7 @@ t_pending_contract_migration_with_a_serving_release_still_refuses() {
   seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand m2:other; applied m1
   deploy "$B"
   eq "$rc" 3 "must refuse"
-  grep -q 'refusing to migrate while the active release is serving' "$T/out" || fail "wrong refusal: $(tail -n 3 "$T/out")"
+  grep -q 'refusing to migrate: a release is protected (nginx is serving the blue slot)' "$T/out" || fail "wrong refusal: $(tail -n 3 "$T/out")"
   log_lacks '^MIGRATE'
   eq "$(container_running ims-blue)" 1 "the serving slot must be untouched"
 }
@@ -1110,7 +1110,7 @@ t_pending_contract_migration_with_an_unreadable_current_record_refuses() {
   mkdir "$IMS_DEPLOY_DIR/current"
   deploy "$B"
   eq "$rc" 3 "an ambiguous host must refuse"
-  grep -q 'cannot tell whether a release is recorded' "$T/out" || fail "no ambiguity message: $(tail -n 4 "$T/out")"
+  grep -q 'cannot tell whether a release exists' "$T/out" || fail "no ambiguity message: $(tail -n 4 "$T/out")"
   log_lacks '^MIGRATE'
   log_lacks '^RUN-SLOT'
 }
@@ -1120,6 +1120,61 @@ t_empty_history_with_an_unreadable_upstream_file_refuses() {
   mkdir "$IMS_UPSTREAM_FILE"
   deploy "$B"
   eq "$rc" 3 "an ambiguous host must refuse even with an empty history"
+  log_lacks '^MIGRATE'
+}
+
+t_first_install_on_a_host_with_no_containers_passes_with_an_empty_or_partial_history() {
+  migs "$B" m1:other m2:other
+  deploy "$B"
+  eq "$rc" 0 "empty history, no containers: $(tail -n 3 "$T/out")"
+  log_has '^docker ps -a'
+  log_has '^MIGRATE'
+}
+
+t_a_stopped_slot_container_with_a_restart_policy_is_a_release_to_protect() {
+  # exited, and `--restart unless-stopped` may bring it back during the migration: it must count as existing
+  printf 'image=ghcr.io/onetwo3d/ims:%s\nrunning=0\nport=3101\nrestart=unless-stopped\n' "$A" > "$STUB/containers/ims-blue"
+  migs "$A" m1:expand; migs "$B" m1:expand m2:other; applied m1
+  deploy "$B"
+  eq "$rc" 3 "partial history"
+  grep -q 'slot container(s) exist: ims-blue' "$T/out" || fail "wrong refusal: $(tail -n 3 "$T/out")"
+  log_lacks '^MIGRATE'
+  migs "$B" m1:other; : > "$STUB/applied"; : > "$STUB/calls.log"
+  deploy "$B"
+  eq "$rc" 3 "empty history"
+  log_lacks '^MIGRATE'
+}
+
+t_a_docker_query_error_is_unknown_and_refuses_even_with_the_override_flags() {
+  touch "$STUB/ps_fail"
+  migs "$B" m1:other m2:other; applied m1
+  deploy "$B"
+  eq "$rc" 3 "partial history"
+  grep -q 'cannot tell whether a release exists (docker could not list the slot containers)' "$T/out" || fail "wrong refusal: $(tail -n 3 "$T/out")"
+  log_lacks '^MIGRATE'
+  : > "$STUB/applied"
+  deploy --allow-contract-migration --maintenance "$B"
+  eq "$rc" 3 "empty history with the override flags"
+  log_lacks '^MIGRATE'
+  log_lacks '^docker stop'
+}
+
+t_an_unreadable_record_refuses_even_with_the_override_flags() {
+  migs "$B" m1:other m2:other; applied m1
+  mkdir "$IMS_DEPLOY_DIR/current"
+  deploy --allow-contract-migration --maintenance "$B"
+  eq "$rc" 3 "override flags must not apply to an unknown host"
+  log_lacks '^MIGRATE'
+  log_lacks '^RUN-SLOT'
+}
+
+t_an_empty_history_with_a_recorded_stopped_release_refuses() {
+  # nothing serves and nothing exists, but deploy/current records a release: not a first install (the empty-history branch must not clear it)
+  echo "$A blue" > "$IMS_DEPLOY_DIR/current"
+  migs "$B" m1:other; : > "$STUB/applied"
+  deploy "$B"
+  eq "$rc" 3 "must refuse"
+  grep -q 'records a release' "$T/out" || fail "wrong refusal: $(tail -n 3 "$T/out")"
   log_lacks '^MIGRATE'
 }
 
