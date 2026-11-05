@@ -126,7 +126,15 @@ export type PendingFxOrderPayload = {
   order: WcFullOrder
   /** Set when the row holds a stored receipt's registration obligation: the retry re-registers THIS receipt (by id). */
   receiptPaymentId?: string
+  /**
+   * Set when the row holds the obligation of a PAID order whose receipt could not be recorded because the payload and IMS disagree (the total or the currency): the retry replays
+   * this snapshot, so the receipt is recorded as soon as IMS agrees, with no further WooCommerce delivery. `attempts` bounds it.
+   */
+  paidBlock?: { kind: 'total' | 'currency'; attempts: number; firstAt: string }
 }
+
+/** How many retries a blocked paid order gets before the row is retired FAILED with an operator-visible finding (the scheduled run retries on every pass). */
+export const WC_PAID_BLOCK_MAX_ATTEMPTS = 60
 
 export function shouldBlockWcTaxRateFallback(lines: WcTaxRateFallbackLine[]): boolean {
   return lines.some((line) => {
@@ -904,7 +912,41 @@ async function planWcPaidTransition(orderId: string, wcOrder: WcFullOrder): Prom
   }
 }
 
-async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, settlementRate: number | null, retryLogId?: string): Promise<void> {
+type PaidBlockOutcome = { blocked: false } | { blocked: true; gaveUp: boolean }
+
+/**
+ * THE DURABLE OBLIGATION OF A PAID ORDER THAT CANNOT BE RECORDED YET (the payload's total or currency differs from what IMS holds). Written in the SAME transaction, under the order
+ * lock, that decided to record nothing, so the decision and the record that it must be retried commit together. The order poll is a modified-after cursor: correcting IMS later causes
+ * no new delivery, so without this row the receipt would stay missing for good. The row is the pending-FX queue row (the scheduled run retries it and replays the stored snapshot);
+ * it is retired only when the receipt is recorded or the order is paid by another route, and after WC_PAID_BLOCK_MAX_ATTEMPTS retries it is retired FAILED (`gaveUp`), when the
+ * ERROR finding is the operator's record.
+ */
+async function writePaidBlockObligation(tx: Prisma.TransactionClient, orderId: string, wcOrder: WcFullOrder, currency: string, kind: 'total' | 'currency', retryLogId: string | undefined, message: string): Promise<{ gaveUp: boolean }> {
+  const existing = retryLogId
+    ? await tx.shoppingSyncLog.findUnique({ where: { id: retryLogId }, select: { id: true, payload: true } })
+    : await tx.shoppingSyncLog.findFirst({ where: pendingFxQueueWhere(String(wcOrder.id)), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
+  const priorPayload = existing?.payload
+  const prior = isQueuedWcOrderPayload(priorPayload) ? priorPayload.paidBlock : undefined
+  // a retry of the row is an attempt; a fresh delivery re-states the snapshot but does not reset the bound
+  const attempts = (prior?.attempts ?? 0) + (retryLogId ? 1 : 0)
+  const gaveUp = attempts >= WC_PAID_BLOCK_MAX_ATTEMPTS
+  const payload = JSON.parse(JSON.stringify({ ...buildPendingFxOrderPayload(wcOrder, { currency }), paidBlock: { kind, attempts, firstAt: prior?.firstAt ?? new Date().toISOString() } })) as Prisma.InputJsonValue
+  const data = {
+    connector: 'woocommerce',
+    direction: 'FROM_CONNECTOR' as const,
+    status: gaveUp ? ('FAILED' as const) : ('PENDING' as const),
+    entityType: 'SalesOrder',
+    externalId: String(wcOrder.id),
+    payload,
+    errorMessage: gaveUp ? `${message}; gave up after ${attempts} retries` : message,
+    syncedAt: new Date(),
+  }
+  if (existing) await tx.shoppingSyncLog.update({ where: { id: existing.id }, data })
+  else await tx.shoppingSyncLog.create({ data })
+  return { gaveUp }
+}
+
+async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, settlementRate: number | null, retryLogId?: string): Promise<PaidBlockOutcome> {
   const paidAt = parseWcGmtInstant(wcOrder.date_paid_gmt as string)
   const claimed = await db.$transaction(async (tx) => {
     await lockSalesOrder(tx, orderId)
@@ -923,14 +965,16 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
     const wcCurrency = readWcOrderCurrency(wcOrder)
     const storedCurrency = order.currency.trim().toUpperCase()
     if (wcCurrency === null || wcCurrency !== storedCurrency) {
-      return { currencyMismatch: { stored: storedCurrency, paid: wcCurrency ?? '', reference: order.externalOrderNumber ?? order.orderNumber ?? orderId } } as const
+      const { gaveUp } = await writePaidBlockObligation(tx, orderId, wcOrder, order.currency, 'currency', retryLogId, `The paid order's currency (${wcCurrency ?? 'none'}) differs from the one IMS holds (${storedCurrency}); the receipt is retried once they agree`)
+      return { currencyMismatch: { stored: storedCurrency, paid: wcCurrency ?? '', reference: order.externalOrderNumber ?? order.orderNumber ?? orderId }, gaveUp } as const
     }
     const dp = currencyMinorUnits(order.currency)
     let paidTotalText: string | null = null
     try { paidTotalText = toDecimal(wcOrder.total).toFixed(dp) } catch { paidTotalText = null }
     const storedTotalText = toDecimal(order.totalForeign).toFixed(dp)
     if (paidTotalText === null || paidTotalText !== storedTotalText) {
-      return { mismatch: { stored: storedTotalText, paid: paidTotalText ?? String(wcOrder.total ?? ''), currency: order.currency, reference: order.externalOrderNumber ?? order.orderNumber ?? orderId } } as const
+      const { gaveUp } = await writePaidBlockObligation(tx, orderId, wcOrder, order.currency, 'total', retryLogId, `The paid order's total (${paidTotalText ?? String(wcOrder.total ?? '')}) differs from the total IMS holds (${storedTotalText}); the receipt is retried once they agree`)
+      return { mismatch: { stored: storedTotalText, paid: paidTotalText ?? String(wcOrder.total ?? ''), currency: order.currency, reference: order.externalOrderNumber ?? order.orderNumber ?? orderId }, gaveUp } as const
     }
     // WooCommerce paid the order TOTAL, so what is recorded is the part of it NOT already covered. Read and summed UNDER THE LOCK, so a receipt added after the plan was made is counted.
     const existing = await tx.payment.findMany({ where: { orderId, refundId: null }, select: { amount: true, currency: true } })
@@ -973,7 +1017,7 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
     await wcReceiptRegistrationSeams.insideReceiptTransaction?.()
     return { receipt, reference, ambiguous: false, existingCount: existing.length, obligationRowId, ownsObligationRow: !retryLogId }
   })
-  if (!claimed) return
+  if (!claimed) return { blocked: false }
   if ('currencyMismatch' in claimed && claimed.currencyMismatch) {
     const m = claimed.currencyMismatch
     // idempotent per order and currency pair: the same disagreement is written once however often it is delivered
@@ -989,7 +1033,8 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
         metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), imsCurrency: m.stored, paidCurrency: m.paid },
       })
     }
-    return
+    await announcePaidBlockGaveUp(orderId, wcOrder, m.reference, claimed.gaveUp)
+    return { blocked: true, gaveUp: claimed.gaveUp }
   }
   if ('mismatch' in claimed && claimed.mismatch) {
     const m = claimed.mismatch
@@ -1006,7 +1051,8 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
         metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), imsTotal: m.stored, paidTotal: m.paid, currency: m.currency },
       })
     }
-    return
+    await announcePaidBlockGaveUp(orderId, wcOrder, m.reference, claimed.gaveUp)
+    return { blocked: true, gaveUp: claimed.gaveUp }
   }
   if (claimed.ambiguous) {
     await logActivity({
@@ -1018,15 +1064,31 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
       description: `WooCommerce order ${claimed.reference} is paid, but the receipts IMS already holds for it are in another currency than the order, so the uncovered amount cannot be computed. The order is marked paid and IMS added no payment for it. Record the payment on the order.`,
       metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), reason: 'receipt_currency_differs_from_order' },
     })
-    return
+    return { blocked: false }
   }
-  if (!claimed.receipt) return
+  if (!claimed.receipt) return { blocked: false }
   await wcReceiptRegistrationSeams.afterReceiptCommit?.(orderId)
   await registerReceiptAndProveObligation(orderId, claimed.reference, { ...claimed.receipt, settlementRateToBase: settlementRate })
   // PROVEN: retire the obligation row this transaction wrote (a caller's retry row is retired by the caller after ITS proof).
   if (claimed.ownsObligationRow) {
     await db.shoppingSyncLog.updateMany({ where: { id: claimed.obligationRowId, status: 'PENDING' }, data: { status: 'SYNCED', entityId: orderId, errorMessage: null, syncedAt: new Date() } })
   }
+  return { blocked: false }
+}
+
+/** The bound is reached: the row is retired FAILED, so the operator is told once, loudly, that nothing will retry it any more. */
+async function announcePaidBlockGaveUp(orderId: string, wcOrder: WcFullOrder, reference: string, gaveUp: boolean): Promise<void> {
+  if (!gaveUp) return
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: orderId,
+    action: 'wc_paid_block_retry_gave_up',
+    tag: 'sync',
+    level: 'ERROR',
+    description: `WooCommerce order ${reference} is paid, but IMS still disagrees with its total or currency after ${WC_PAID_BLOCK_MAX_ATTEMPTS} retries, so no receipt was recorded and the automatic retry has stopped. Bring the order into line with WooCommerce and record the payment by hand.`,
+    metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) },
+  })
+  await notifyActiveAdmins({ type: 'error', title: 'WooCommerce paid order has no receipt', message: `Order ${reference} is paid in WooCommerce but IMS could not record the receipt and stopped retrying. Record the payment by hand.`, actionUrl: `/sales/${orderId}` }).catch(() => undefined)
 }
 
 /** The three mirrored wclc duty/tax/handling components as SalesOrder columns (null = the order carries none). */
@@ -1039,15 +1101,17 @@ export function wclcComponentColumns(wcOrder: WcFullOrder): {
   return { wclcDutyComponent: c.dutyComponent, wclcTaxComponent: c.taxComponent, wclcHandlingComponent: c.handlingComponent }
 }
 
-export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder: WcFullOrder, receiptPaymentId?: string, retryLogId?: string): Promise<void> {
+export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder: WcFullOrder, receiptPaymentId?: string, retryLogId?: string): Promise<PaidBlockOutcome> {
   const transition = await planWcPaidTransition(orderId, wcOrder)
   await wcReceiptRegistrationSeams.afterPlan?.(orderId)
   await updateExistingWcOrderCore(orderId, wcOrder, transition.kind !== 'none')
-  if (transition.kind === 'record') await recordWcPaidTransition(orderId, wcOrder, transition.settlementRate, retryLogId)
+  let outcome: PaidBlockOutcome = { blocked: false }
+  if (transition.kind === 'record') outcome = await recordWcPaidTransition(orderId, wcOrder, transition.settlementRate, retryLogId)
   if (transition.kind === 'blocked') throw transition.error
   // WHICHEVER BRANCH RAN (including a 'record' whose locked claim was lost to a concurrent delivery that committed the Payment but whose registration failed): every receipt this
   // path recorded for the order is proven registered before this returns, so a caller can never retire its pending row on a receipt with no obligation on record. Idempotent.
   if (transition.kind === 'record' || wcOrder.date_paid_gmt || receiptPaymentId) await redriveUnregisteredWcReceipts(orderId, receiptPaymentId)
+  return outcome
 }
 
 async function updateExistingWcOrderCore(
@@ -2119,7 +2183,13 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       },
     })
     if (existing) {
-      await updateExistingWcOrderFromPayload(existing.id, wcOrder, options.receiptPaymentId, options.pendingFxRetryLogId)
+      const updated = await updateExistingWcOrderFromPayload(existing.id, wcOrder, options.receiptPaymentId, options.pendingFxRetryLogId)
+      // A PAID ORDER WHOSE RECEIPT COULD NOT BE RECORDED keeps its obligation row: never retired as done, the scheduled run replays it.
+      if (updated.blocked) {
+        // a delivery is acknowledged (its obligation row is durable); only the retry row's own replay reports the block back to the retry loop
+        if (!options.pendingFxRetryLogId) return { success: true, orderId: existing.id }
+        return { success: false, error: updated.gaveUp ? 'The paid order still disagrees with IMS; the automatic retry has stopped' : 'The paid order disagrees with IMS; kept in the retry queue until it agrees' }
+      }
       if (options.pendingFxRetryLogId) await markPendingFxRetryLogSynced(options.pendingFxRetryLogId, existing.id)
       // o3d-z82a: deliberately NO marker resolution here. A redelivery can arrive while the
       // import that created the order is still between its create transaction and its
@@ -2771,7 +2841,12 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         },
       })
       if (concurrent) {
-        await updateExistingWcOrderFromPayload(concurrent.id, wcOrder)
+        const updated = await updateExistingWcOrderFromPayload(concurrent.id, wcOrder, undefined, options.pendingFxRetryLogId)
+        if (updated.blocked) {
+          // a delivery is acknowledged (its obligation row is durable); only the retry row's own replay reports the block back to the retry loop
+          if (!options.pendingFxRetryLogId) return { success: true, orderId: concurrent.id }
+          return { success: false, error: updated.gaveUp ? 'The paid order still disagrees with IMS; the automatic retry has stopped' : 'The paid order disagrees with IMS; kept in the retry queue until it agrees' }
+        }
         if (options.pendingFxRetryLogId) await markPendingFxRetryLogSynced(options.pendingFxRetryLogId, concurrent.id)
         return { success: true, orderId: concurrent.id }
       }
@@ -3241,7 +3316,7 @@ export async function retryPendingWcOrdersWaitingForFx(
   // after every attempt (recordPendingFxOrder, and the stamp below) and moves behind the others, so it cannot starve the ones behind it. The bound is unchanged.
   const rows = await db.shoppingSyncLog.findMany({
     where: options.receiptsOnly
-      ? { AND: [pendingFxQueueWhere(), { payload: { path: ['receiptPaymentId'], string_starts_with: '' } }] }
+      ? { AND: [pendingFxQueueWhere(), { OR: [{ payload: { path: ['receiptPaymentId'], string_starts_with: '' } }, { payload: { path: ['paidBlock', 'kind'], string_starts_with: '' } }] }] }
       : pendingFxQueueWhere(),
     orderBy: [{ syncedAt: { sort: 'asc', nulls: 'first' } }, { createdAt: 'asc' }],
     take: Math.min(Math.max(limit, 1), 250),

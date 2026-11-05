@@ -1197,6 +1197,20 @@ immediately before posting, finds it cancelled, and retires its own row instead 
 paths take the same lock on the order, so exactly one of them wins and neither can act on a stale
 view.
 
+### Follow-ups of an invoice for a cancelled order
+
+The invoice's follow-ups are not all treated alike once the order is cancelled:
+
+| Follow-up | For a cancelled order |
+| --- | --- |
+| Invoice email | Not queued when the invoice posts. A row queued before the cancellation is retired as **Cancelled** with the reason when it comes to run (Activity log: `invoice_followup_refused_cancelled_order`). Nothing is sent to the customer. |
+| WooCommerce invoice note | The same: not queued, or retired with the reason. |
+| Invoice PDF | Still saved: it is a copy of a document Xero holds and sends nothing anywhere. |
+| Payment | Decided by when the money arrived, not by the order status. A receipt dated **after** the cancellation is held (Xero books that as an overpayment, which IMS does not create yet); a receipt that predates the cancellation registers as it always did. |
+
+The check runs under the same order lock cancellation takes, so a cancellation and a send cannot
+both win. If the invoice email or note is genuinely wanted, reinstate the order and queue it again.
+
 ### Rejected Update Sync Alerts
 
 When Xero rejects a `SALES_INVOICE_UPDATE` or `PURCHASE_INVOICE_UPDATE` (e.g. the external invoice

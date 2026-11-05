@@ -8,6 +8,11 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Paid-order retry and cancelled-order follow-ups
+
+- **Fixed: a paid WooCommerce order whose total or currency differs from what IMS holds is no longer acknowledged and forgotten.** The delivery still records no receipt and writes its finding (`wc_paid_total_differs` / `wc_paid_currency_differs`), but it now also leaves a durable retry row in the pending queue (written in the same transaction, under the order lock). The scheduled `fx-rates` run replays the stored snapshot on every pass, so correcting the IMS order records the receipt without another WooCommerce delivery. The row is retired only when the receipt is recorded or the order is paid by another route, a retry of a still-mismatched order never marks it done, and after 60 retries it is retired FAILED with an ERROR finding (`wc_paid_block_retry_gave_up`) and a notification to the administrators.
+- **Fixed: the invoice email and the WooCommerce invoice note are not sent for a cancelled order.** They are not queued when the invoice posts for a cancelled order (`invoice_followup_not_queued_cancelled_order`), and a row queued before the cancellation is retired CANCELLED with the reason when it drains (`invoice_followup_refused_cancelled_order`), checked under the order lock cancellation takes. The invoice PDF copy is still saved. A payment is decided by when the money arrived against the database-stamped cancellation time, as before: dated after the cancellation it is held (the overpayment path is not built), otherwise it registers.
+
 ### Aelia cutover hardening
 
 - **Fixed: a pinned currency is covered even when Aelia omits or refuses it.** The switch to Aelia (and the coverage the ingest reports) now checks the latest manual override of every active foreign currency, not only those with a usable entry in Aelia's answer. A pinned USD that Aelia leaves out no longer rolls the switch back; the real lookup still has the final say.
