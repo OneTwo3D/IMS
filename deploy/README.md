@@ -293,6 +293,39 @@ completed it.
 
 Not available inside the container: the in-app Scheduler's `crontab` reconciliation (see above).
 
+#### Healthchecks heartbeats for the cron jobs (opt-in)
+
+Every managed job line can be wrapped with `/usr/local/bin/o3d-hc` (the host heartbeat wrapper, which pings Healthchecks at start and
+with the exit code, never fails the job, and passes stdin through) so a job that stops firing or fails is noticed. **Default off: the
+rendered text is byte-identical to the unwrapped form unless you enable it.** The app never calls Healthchecks; you create the checks.
+
+A wrapped line is `<schedule>  [user  ]/usr/local/bin/o3d-hc <check-slug> -- sh -c '<the unchanged job command>'`. The command inside
+is exactly the one rendered without heartbeats, so `echo "header = ..." | curl -K -` and the `CRON_SECRET` handling are as before.
+The check slug is `ims-<job slug>` on production and `ims-stage-<job slug>` on stage (lowercase, `[a-z0-9-]`, at most 50 characters;
+a longer name ends in a hash so two long names never collide).
+
+| Where | How to enable |
+|-------|---------------|
+| Production (`render-managed-crontab.mjs`) | add `--heartbeats` (prefix `ims-`; `--heartbeat-prefix <p->` overrides). Re-render and install as usual. **Also** set `IMS_CRON_HEARTBEATS=1` (and `IMS_CRON_HEARTBEATS_PREFIX` if you overrode the prefix) in the IMS container's environment: the status reader compares the installed file with what the generator would write, and with the variable unset it would read the wrapped lines as drift. |
+| Stage (in-app crontab writer on the host) | set `IMS_CRON_HEARTBEATS=1` in the app's environment (prefix `ims-stage-`, or `IMS_CRON_HEARTBEATS_PREFIX`), restart, then Save & Apply on the Scheduler page. |
+
+`/usr/local/bin/o3d-hc` and `HC_PING_BASE` (environment or `/etc/o3d/hc.env`) must exist on the host. Without a ping base the job still
+runs and the wrapper writes a warning to stderr.
+
+**Drift.** A job counts as scheduled only in the form the current settings produce: a wrapped line with heartbeats off, an unwrapped
+line with heartbeats on, or a different check slug all read as drift (the job shows as unscheduled). After switching the setting,
+re-render and reinstall (production) or Save & Apply (stage); in between, the half-applied state reads as drift, as intended.
+
+**Create the checks.** List `(slug, schedule, tz)` for the enabled jobs and create matching Healthchecks checks from it (tz is the
+zone the host's cron uses; the default is `UTC`):
+
+```bash
+docker run --rm --network <db-network> -e DATABASE_URL --entrypoint node ghcr.io/onetwo3d/ims:<sha> \
+  /app/dist-scripts/render-managed-crontab.mjs --print-heartbeat-checks --format cron.d [--heartbeat-tz Europe/London] [--defaults-only]
+```
+
+The output is `{"checks": [{"slug", "schedule", "tz", "job"}, ...]}`. Use `--format user` (the default) for stage's `ims-stage-` slugs.
+
 ### Production host: blue/green deploy
 
 Production runs on one Proxmox container (CT 115, Debian 13) with PostgreSQL 17 installed natively (127.0.0.1:5432). Releases are the

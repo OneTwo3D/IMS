@@ -1,4 +1,5 @@
-import { buildOtiCrontabBlock, type CrontabJobDef } from '@/lib/crontab-sync'
+import { buildOtiCrontabBlock, listHeartbeatChecks, type CrontabJobDef } from '@/lib/crontab-sync'
+import { PRODUCTION_HEARTBEAT_PREFIX, STAGE_HEARTBEAT_PREFIX, validHeartbeatPrefix, type HeartbeatCheck, type HeartbeatOptions } from '@/lib/ops/cron-heartbeats'
 
 /**
  * THE MANAGED CRONTAB, RENDERED OUTSIDE THE APP (container deployments: cron runs on the host).
@@ -22,6 +23,25 @@ export type RenderManagedCrontabInput = {
   format?: 'user' | 'cron.d'
   /** The account the jobs run as, for `cron.d`. */
   cronUser?: string
+  /**
+   * Wrap every job line with the Healthchecks wrapper (lib/ops/cron-heartbeats.ts). Off unless given: this renderer never reads the
+   * environment, so the CLI flag is the only switch and the default output is byte-identical to the unwrapped text.
+   */
+  heartbeats?: HeartbeatOptions | null
+}
+
+/** The check-slug prefix a renderer run uses when `--heartbeat-prefix` is not given: `ims-` for the production cron.d layout, `ims-stage-` for the user layout (stage). */
+export function defaultHeartbeatPrefix(format: 'user' | 'cron.d'): string {
+  return format === 'cron.d' ? PRODUCTION_HEARTBEAT_PREFIX : STAGE_HEARTBEAT_PREFIX
+}
+
+export { validHeartbeatPrefix }
+
+/** The Healthchecks checks to create for the enabled jobs (same enablement and schedules as the rendered block), as `(slug, schedule, tz)`. */
+export function renderHeartbeatChecks(input: Pick<RenderManagedCrontabInput, 'jobs' | 'settings' | 'defaultsOnly'> & { heartbeats: HeartbeatOptions; tz: string }):
+  | { ok: true; checks: HeartbeatCheck[] }
+  | { ok: false; error: string } {
+  return listHeartbeatChecks({ jobs: [...input.jobs] as CrontabJobDef[], settings: input.defaultsOnly ? new Map<string, string>() : input.settings, heartbeats: input.heartbeats, tz: input.tz })
 }
 
 export function renderManagedCrontab(input: RenderManagedCrontabInput): { ok: true; text: string } | { ok: false; error: string } {
@@ -32,6 +52,7 @@ export function renderManagedCrontab(input: RenderManagedCrontabInput): { ok: tr
     secretRef: { kind: 'env-file', envFilePath: input.secretFile },
     baseUrl: input.baseUrl.replace(/\/+$/, ''),
     logPath: input.logPath,
+    heartbeats: input.heartbeats ?? null,
   })
   if (!block.ok) return block
   const format = input.format ?? 'user'
