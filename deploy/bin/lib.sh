@@ -212,8 +212,10 @@ slot_running() { [ "$(docker inspect --format '{{.State.Running}}' "$(slot_name 
 # could not be asked. Three outcomes, never a failed query read as "none".
 existing_slot_containers() {
   local out
-  out="$(docker ps -a --filter "name=^$(slot_name blue)\$" --filter "name=^$(slot_name green)\$" --format '{{.Names}}' 2>/dev/null)" || return 1
-  printf '%s\n' "$out" | grep -E "^($(slot_name blue)|$(slot_name green))\$" || true
+  # No docker --filter: its name filter matches the name WITH docker's leading slash, so an anchored pattern silently matches nothing.
+  # List every container and compare the names exactly here.
+  out="$(docker ps -a --no-trunc --format '{{.Names}}' 2>/dev/null)" || return 1
+  printf '%s\n' "$out" | grep -Fx -e "$(slot_name blue)" -e "$(slot_name green)" || true
 }
 
 # Is this host a genuine first install, i.e. is there NO release to protect? The status says, and HOST_RELEASE_WHY names the reason:

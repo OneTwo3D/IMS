@@ -1178,6 +1178,24 @@ t_an_empty_history_with_a_recorded_stopped_release_refuses() {
   log_lacks '^MIGRATE'
 }
 
+t_a_stopped_slot_container_among_decoys_refuses() {
+  printf 'ims-blue-old\nxims-blue\n/ims-blue\nims-green-2\nims\n' > "$STUB/decoys"
+  printf 'image=ghcr.io/onetwo3d/ims:%s\nrunning=0\nport=3101\n' "$A" > "$STUB/containers/ims-blue"
+  migs "$A" m1:expand; migs "$B" m1:expand m2:other; applied m1
+  deploy "$B"
+  eq "$rc" 3 "partial history"
+  grep -q 'slot container(s) exist: ims-blue' "$T/out" || fail "wrong refusal: $(tail -n 3 "$T/out")"
+  log_lacks '^MIGRATE'
+}
+
+t_decoy_containers_only_means_an_empty_host() {
+  printf 'ims-blue-old\nxims-blue\n/ims-blue\nims-green-2\nims\npostgres\n' > "$STUB/decoys"
+  migs "$B" m1:other m2:other; applied m1
+  deploy "$B"
+  eq "$rc" 0 "decoys are not slot containers: $(tail -n 3 "$T/out")"
+  log_has '^MIGRATE'
+}
+
 # ---------------------------------------------------------------------------------------------------------------------------------
 tests=("$@")
 if [ "${#tests[@]}" = 0 ]; then mapfile -t tests < <(declare -F | awk '{print $3}' | grep '^t_'); fi
