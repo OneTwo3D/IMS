@@ -18,6 +18,7 @@
  * Problem text names a rail, a closed connector label and a count: never a value of the environment, a setting, a credential or a crontab line.
  */
 import { renderCronJobCommand, runtimeSecretPrefix } from '@/lib/crontab-sync'
+import { wrapJobCommand } from '@/lib/ops/cron-heartbeats'
 import { INTEGRATION_PLUGIN_EXCLUSIVITY_GROUPS, INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugin-keys'
 import type { IntegrationPluginId } from '@/lib/integration-plugin-keys'
 import { OUTBOUND_CONNECTORS, OUTBOUND_CONNECTOR_LABEL, OUTBOUND_GRANT_ENV } from '@/lib/security/outbound-write-hold-constants'
@@ -186,9 +187,15 @@ const LOG_SENTINEL = 'ZZLOGPATHZZ'
 const escapeRegex = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 /** One anchored pattern per (read-only slug, secret mode), built from the application's own renderer so that the two cannot drift. */
-export const ALLOWED_JOB_COMMANDS: readonly RegExp[] = READ_ONLY_CRON_SLUGS.flatMap((slug) => [runtimeSecretPrefix(ENV_SENTINEL), ''].map((prefix) => {
+const SLUG_SENTINEL = 'ZZSLUGZZ'
+const toPattern = (command: string): RegExp => new RegExp(`^${escapeRegex(command).replace(escapeRegex(ENV_SENTINEL), PATH_CLASS).replace(escapeRegex(LOG_SENTINEL), PATH_CLASS).replace(escapeRegex(SLUG_SENTINEL), '[a-z0-9-]{1,50}')}$`)
+/**
+ * Each read-only job in both forms: plain, and wrapped for Healthchecks heartbeats (the same command inside `/usr/local/bin/o3d-hc <check> -- sh -c '...'`, built by
+ * the application's own wrapper). Heartbeats are opt-in; a wrapped read-only job is still that read-only job.
+ */
+export const ALLOWED_JOB_COMMANDS: readonly RegExp[] = READ_ONLY_CRON_SLUGS.flatMap((slug) => [runtimeSecretPrefix(ENV_SENTINEL), ''].flatMap((prefix) => {
   const command = renderCronJobCommand({ prefix, slug, logPath: LOG_SENTINEL })
-  return new RegExp(`^${escapeRegex(command).replace(escapeRegex(ENV_SENTINEL), PATH_CLASS).replace(escapeRegex(LOG_SENTINEL), PATH_CLASS)}$`)
+  return [toPattern(command), toPattern(wrapJobCommand(command, SLUG_SENTINEL))]
 }))
 const JOB_LINE = new RegExp(`^(${SCHEDULE})[ \\t]+(\\S[\\s\\S]*)$`)
 const ENV_LINE = /^[A-Za-z_][A-Za-z0-9_]*[ \t]*=/

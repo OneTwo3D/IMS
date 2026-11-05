@@ -21,6 +21,9 @@ IMS_BLUE_PORT="${IMS_BLUE_PORT:-3101}"
 IMS_GREEN_PORT="${IMS_GREEN_PORT:-3102}"
 IMS_FRONT_URL="${IMS_FRONT_URL:-http://127.0.0.1:3000}"
 IMS_HC_BIN="${IMS_HC_BIN:-/usr/local/bin/o3d-hc}"
+# The wrapper path the RENDERED cron lines run: it must equal HEARTBEAT_WRAPPER_PATH in lib/ops/cron-heartbeats.ts (a test greps both). Not
+# overridable, unlike IMS_HC_BIN (which only wraps this script's own run). IMS_WRAPPER_TEST_ROOT prefixes it for the tests alone.
+IMS_RENDERED_WRAPPER=/usr/local/bin/o3d-hc
 IMS_HEALTH_TIMEOUT_S="${IMS_HEALTH_TIMEOUT_S:-120}"
 IMS_HEALTH_INTERVAL_S="${IMS_HEALTH_INTERVAL_S:-2}"
 IMS_FRONT_TIMEOUT_S="${IMS_FRONT_TIMEOUT_S:-30}"
@@ -481,8 +484,20 @@ install_host_cron() {
   fi
   live="${IMS_CROND_DIR}/${IMS_CROND_NAME}"
   ( umask 077; printf 'DATABASE_URL=%s\n' "$(env_value DATABASE_URL)" > "${work}/db.env" ) || { rm -rf "$work"; return 1; }
+  # Heartbeats: the ONE switch is IMS_CRON_HEARTBEATS(=1) / IMS_CRON_HEARTBEATS_PREFIX in the host env file, which the app containers also
+  # read (--env-file), so the renderer and the status reader cannot disagree.
+  local hb=() hb_prefix
+  if [ "$(env_value IMS_CRON_HEARTBEATS)" = 1 ]; then
+    if [ ! -x "${IMS_WRAPPER_TEST_ROOT:-}${IMS_RENDERED_WRAPPER}" ]; then
+      log "heartbeats enabled but ${IMS_RENDERED_WRAPPER} is missing or not executable; crontab NOT replaced"
+      rm -rf "$work"; return 1
+    fi
+    hb=(--heartbeats)
+    hb_prefix="$(env_value IMS_CRON_HEARTBEATS_PREFIX)"
+    [ -z "$hb_prefix" ] || hb+=(--heartbeat-prefix "$hb_prefix")
+  fi
   if ! docker run --rm --network host --env-file "${work}/db.env" --entrypoint node "$(runtime_image "$sha")" \
-        /app/dist-scripts/render-managed-crontab.mjs --format cron.d --cron-user root \
+        /app/dist-scripts/render-managed-crontab.mjs --format cron.d --cron-user root ${hb[@]+"${hb[@]}"} \
         --base-url "$IMS_FRONT_URL" --secret-file "$IMS_CRON_ENV_FILE" --log-path "${IMS_CRON_LOG_DIR}/cron.log" > "$rendered"; then
     log "the crontab renderer failed; the installed cron file is unchanged"
     rm -rf "$work"; return 1

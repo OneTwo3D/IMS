@@ -293,6 +293,43 @@ completed it.
 
 Not available inside the container: the in-app Scheduler's `crontab` reconciliation (see above).
 
+#### Healthchecks heartbeats for the cron jobs (opt-in)
+
+Every managed job line can be wrapped with `/usr/local/bin/o3d-hc` (the host heartbeat wrapper, which pings Healthchecks at start and
+with the exit code, never fails the job, and passes stdin through) so a job that stops firing or fails is noticed. **Default off: the
+rendered text is byte-identical to the unwrapped form unless you enable it.** The app never calls Healthchecks; you create the checks.
+
+A wrapped line is `<schedule>  [user  ]/usr/local/bin/o3d-hc <check-slug> -- sh -c '<the unchanged job command>'`. The command inside
+is exactly the one rendered without heartbeats, so `echo "header = ..." | curl -K -` and the `CRON_SECRET` handling are as before.
+The check slug is `ims-<job slug>` on production and `ims-stage-<job slug>` on stage (lowercase, `[a-z0-9-]`, at most 50 characters;
+a longer name ends in a hash so two long names never collide).
+
+| Where | How to enable |
+|-------|---------------|
+| Production | set `IMS_CRON_HEARTBEATS=1` (and optionally `IMS_CRON_HEARTBEATS_PREFIX=<p->`, default `ims-`) in the host's `/etc/ims/ims.env`. That file is the single switch: `install_host_cron` (deploy, rollback and the 5-minute `ims-cron-render` timer) adds `--heartbeats` / `--heartbeat-prefix` to the renderer when it says so, and the app containers read the same file through `--env-file`, so the renderer and the status reader cannot disagree. A manual `render-managed-crontab.mjs --heartbeats` render is only for one-off inspection; the next timer run would replace it with what ims.env says. |
+| Stage (in-app crontab writer on the host) | set `IMS_CRON_HEARTBEATS=1` in the app's environment (prefix `ims-stage-`, or `IMS_CRON_HEARTBEATS_PREFIX`), restart, then Save & Apply on the Scheduler page. |
+
+With heartbeats on, `install_host_cron` refuses to replace the live crontab (deploy exits 4, the timer retries); the in-app stage writer refuses the same way and shows the error on the Scheduler page while `/usr/local/bin/o3d-hc` is missing or not executable, because every wrapped job would otherwise stop.
+
+A wrapped job that is refused because `CRON_SECRET` is missing or unusable exits 1, so the check reports a failure (the unwrapped line keeps its documented exit 0).
+
+`/usr/local/bin/o3d-hc` and `HC_PING_BASE` (environment or `/etc/o3d/hc.env`) must exist on the host. Without a ping base the job still
+runs and the wrapper writes a warning to stderr.
+
+**Drift.** A job counts as scheduled only in the form the current settings produce: a wrapped line with heartbeats off, an unwrapped
+line with heartbeats on, or a different check slug all read as drift (the job shows as unscheduled). After switching the setting,
+re-render and reinstall (production) or Save & Apply (stage); in between, the half-applied state reads as drift, as intended.
+
+**Create the checks.** List `(slug, schedule, tz)` for the enabled jobs and create matching Healthchecks checks from it (tz is the
+zone the host's cron uses; the default is `UTC`):
+
+```bash
+docker run --rm --network <db-network> -e DATABASE_URL --entrypoint node ghcr.io/onetwo3d/ims:<sha> \
+  /app/dist-scripts/render-managed-crontab.mjs --print-heartbeat-checks --format cron.d [--heartbeat-tz Europe/London] [--defaults-only]
+```
+
+The output is `{"checks": [{"slug", "schedule", "tz", "job"}, ...]}`. Use `--format user` (the default) for stage's `ims-stage-` slugs.
+
 ### Production host: blue/green deploy
 
 Production runs on one Proxmox container (CT 115, Debian 13) with PostgreSQL 17 installed natively (127.0.0.1:5432). Releases are the
