@@ -485,6 +485,10 @@ install_host_cron() {
   # read (--env-file), so the renderer and the status reader cannot disagree.
   local hb=() hb_prefix
   if [ "$(env_value IMS_CRON_HEARTBEATS)" = 1 ]; then
+    if [ ! -x "$IMS_HC_BIN" ]; then
+      log "heartbeats enabled but ${IMS_HC_BIN} is missing or not executable; crontab NOT replaced"
+      rm -rf "$work"; return 1
+    fi
     hb=(--heartbeats)
     hb_prefix="$(env_value IMS_CRON_HEARTBEATS_PREFIX)"
     [ -z "$hb_prefix" ] || hb+=(--heartbeat-prefix "$hb_prefix")

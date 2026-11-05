@@ -665,9 +665,22 @@ t_cron_render_adds_heartbeat_flags_only_when_the_env_file_asks() {
   eq "$rc" 0 "render, heartbeats 0"
   log_lacks 'render-managed-crontab.mjs.*--heartbeat'
   : > "$STUB/calls.log"; printf 'IMS_CRON_HEARTBEATS=1\n' >> "$IMS_ENV_FILE"
+  # The wrapper is absent, then present but not executable: the live crontab stays as it was and the run fails (deploy exit 4).
+  printf 'old\n' > "$IMS_CROND_DIR/onetwo3d-ims"
+  export IMS_HC_BIN="$T/o3d-hc-absent"
+  rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
+  [ "$rc" != 0 ] || fail "heartbeats on with no wrapper must fail"
+  grep -q 'o3d-hc-absent is missing or not executable; crontab NOT replaced' "$T/out" || fail "the missing wrapper was not reported"
+  eq "$(cat "$IMS_CROND_DIR/onetwo3d-ims")" old "the live crontab must be untouched (absent wrapper)"
+  log_lacks 'render-managed-crontab'
+  printf '#!/bin/sh\nshift 2\nexec "$@"\n' > "$T/o3d-hc-plain"; chmod 0644 "$T/o3d-hc-plain"; export IMS_HC_BIN="$T/o3d-hc-plain"
+  rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
+  [ "$rc" != 0 ] || fail "a non-executable wrapper must fail"
+  eq "$(cat "$IMS_CROND_DIR/onetwo3d-ims")" old "the live crontab must be untouched (non-executable wrapper)"
+  chmod 0755 "$T/o3d-hc-plain"
   rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
   eq "$rc" 0 "render, heartbeats 1"
-  log_has 'render-managed-crontab.mjs --format cron.d --cron-user root --heartbeats --base-url'
+    log_has 'render-managed-crontab.mjs --format cron.d --cron-user root --heartbeats --base-url'
   log_lacks '--heartbeat-prefix'
   : > "$STUB/calls.log"; printf 'IMS_CRON_HEARTBEATS_PREFIX=ims-x-\n' >> "$IMS_ENV_FILE"
   rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
