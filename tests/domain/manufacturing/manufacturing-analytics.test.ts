@@ -15,8 +15,19 @@ function manufacturingClient(input: {
   productionOrderArgs?: unknown[]
   stockMovementArgs?: unknown[]
   costLayerArgs?: unknown[]
+  products?: unknown[]
+  productArgs?: unknown[]
 }): ManufacturingAnalyticsClient {
   return {
+    product: {
+      async findMany(args?: unknown) {
+        input.productArgs?.push(args)
+        return input.products ?? [
+          { id: 'component-a', sku: 'COMP-A', name: 'Component A', stockUnit: 'pcs' },
+          { id: 'component-b', sku: 'COMP-B', name: 'Component B', stockUnit: 'pcs' },
+        ]
+      },
+    },
     productionOrder: {
       async findMany(args?: unknown) {
         input.productionOrderArgs?.push(args)
@@ -36,6 +47,17 @@ function manufacturingClient(input: {
       },
     },
   }
+}
+
+/** The recipe frozen at IN_PROGRESS: per output unit, component-a x2 and component-b x1. */
+const FROZEN_SNAPSHOT = [
+  { componentId: 'component-a', qty: 2 },
+  { componentId: 'component-b', qty: 1 },
+]
+
+/** A started order, which carries a frozen snapshot (variance is computed from it and only it). */
+function frozenOrder(overrides: Record<string, unknown> = {}) {
+  return assemblyOrder({ componentSnapshot: FROZEN_SNAPSHOT, ...overrides })
 }
 
 function assemblyOrder(overrides: Record<string, unknown> = {}) {
@@ -62,20 +84,6 @@ function assemblyOrder(overrides: Record<string, unknown> = {}) {
       ],
     },
     warehouse: { code: 'MAIN', name: 'Main warehouse' },
-    bom: {
-      items: [
-        {
-          componentProductId: 'component-a',
-          qty: '2',
-          component: { id: 'component-a', sku: 'COMP-A', name: 'Component A', stockUnit: 'pcs' },
-        },
-        {
-          componentProductId: 'component-b',
-          qty: '1',
-          component: { id: 'component-b', sku: 'COMP-B', name: 'Component B', stockUnit: 'pcs' },
-        },
-      ],
-    },
     ...overrides,
   }
 }
@@ -88,7 +96,7 @@ test('production variance compares BOM planned quantities with PRODUCTION_OUT co
     {},
     {
       client: manufacturingClient({
-        orders: [assemblyOrder()],
+        orders: [frozenOrder()],
         movements: [
           { referenceId: 'po-1', productId: 'component-a', qty: '22', totalValueBase: '110' },
           { referenceId: 'po-1', productId: 'component-b', qty: '7', totalValueBase: '35' },
@@ -149,18 +157,7 @@ test('production variance compares BOM planned quantities with PRODUCTION_OUT co
         createdAt: true,
         outputProduct: { select: { sku: true, name: true } },
         warehouse: { select: { code: true, name: true } },
-        bom: {
-          select: {
-            items: {
-              orderBy: { sortOrder: 'asc' },
-              select: {
-                componentProductId: true,
-                qty: true,
-                component: { select: { id: true, sku: true, name: true, stockUnit: true } },
-              },
-            },
-          },
-        },
+        componentSnapshot: true,
       },
     },
   )
@@ -385,7 +382,6 @@ test('WIP values an in-progress disassembly from the output product, not its BOM
             outputProductId: 'fg-disasm',
             manufacturingCostLines: [],
             // BOM components are recovered at completion, not reserved -> must be ignored.
-            bom: { items: [{ componentProductId: 'component-a', qty: '5', component: { id: 'component-a', sku: 'COMP-A', name: 'A', stockUnit: 'pcs' } }] },
           }),
         ],
         movements: [],
@@ -461,13 +457,13 @@ test('production variance scopes by completedAt and consumption-capable statuses
     {
       client: manufacturingClient({
         orders: [
-          assemblyOrder({
+          frozenOrder({
             id: 'po-completed',
             reference: 'MO-COMP',
             createdAt: new Date('2026-01-15T00:00:00Z'),
             completedAt: new Date('2026-03-05T00:00:00Z'),
           }),
-          assemblyOrder({
+          frozenOrder({
             id: 'po-draft',
             reference: 'MO-DRAFT',
             status: 'DRAFT',
@@ -559,7 +555,7 @@ test('production variance handles no BOM items and no consumption movements expl
     {},
     {
       client: manufacturingClient({
-        orders: [assemblyOrder({ bom: { items: [] } })],
+        orders: [frozenOrder({ componentSnapshot: [] })],
         movements: [],
       }),
       now: () => new Date('2026-06-01T00:00:00Z'),
@@ -573,7 +569,7 @@ test('production variance handles no BOM items and no consumption movements expl
     {},
     {
       client: manufacturingClient({
-        orders: [assemblyOrder()],
+        orders: [frozenOrder()],
         movements: [],
       }),
       now: () => new Date('2026-06-01T00:00:00Z'),
@@ -637,7 +633,7 @@ test('manufacturing analytics pagination can be disabled for CSV exports', async
     { paginate: false },
     {
       client: manufacturingClient({
-        orders: [assemblyOrder()],
+        orders: [frozenOrder()],
         movements: [],
       }),
       now: () => new Date('2026-06-01T00:00:00Z'),
@@ -649,4 +645,63 @@ test('manufacturing analytics pagination can be disabled for CSV exports', async
   assert.equal(report.pageInfo.totalPages, 1)
   assert.equal(report.pageInfo.hasNextPage, false)
   assert.equal(report.pageInfo.hasPreviousPage, false)
+})
+
+// ---------------------------------------------------------------------------
+// Frozen recipe (variance never reads the live Bom). The completed-order-then-re-import scenario runs
+// against a real database in tests/db/bom-claimed-recipe-readers.test.ts; these pin the rule itself.
+// ---------------------------------------------------------------------------
+
+test('production variance asks for the frozen snapshot and never selects the live Bom', async () => {
+  const productionOrderArgs: unknown[] = []
+  await getProductionVarianceReport({}, {}, {
+    client: manufacturingClient({ orders: [frozenOrder()], movements: [], productionOrderArgs }),
+    now: () => new Date('2026-06-01T00:00:00Z'),
+  })
+  const select = (productionOrderArgs[0] as { select: Record<string, unknown> }).select
+  assert.equal(select.componentSnapshot, true)
+  assert.equal('bom' in select, false, 'the live Bom must not be read for historical variance')
+})
+
+test('production variance plans from the snapshot even when the order row carries a different live recipe', async () => {
+  const report = await getProductionVarianceReport({}, {}, {
+    client: manufacturingClient({
+      // A stale live recipe riding on the row (as a re-import would have left it) must be ignored.
+      orders: [frozenOrder({ bom: { items: [{ componentProductId: 'component-a', qty: '99', component: { id: 'component-a', sku: 'COMP-A', name: 'x', stockUnit: 'pcs' } }] } })],
+      movements: [{ referenceId: 'po-1', productId: 'component-a', qty: '20', totalValueBase: '100' }],
+    }),
+    now: () => new Date('2026-06-01T00:00:00Z'),
+  })
+  assert.equal(report.rows.find((row) => row.componentSku === 'COMP-A')?.plannedQty, '20')
+})
+
+test('production variance excludes an order with no frozen recipe and names it, instead of using the live one', async () => {
+  for (const componentSnapshot of [null, 'garbage', [{ componentId: 'component-a', qty: -1 }], [{ qty: 1 }]]) {
+    const report = await getProductionVarianceReport({}, {}, {
+      client: manufacturingClient({
+        orders: [
+          assemblyOrder({ id: 'po-legacy', reference: 'MO-LEGACY', componentSnapshot }),
+          frozenOrder({ id: 'po-1', reference: 'MO-001' }),
+        ],
+        movements: [{ referenceId: 'po-1', productId: 'component-a', qty: '20', totalValueBase: '100' }],
+      }),
+      now: () => new Date('2026-06-01T00:00:00Z'),
+    })
+    assert.equal(report.rows.every((row) => row.productionOrderId === 'po-1'), true, `snapshot ${JSON.stringify(componentSnapshot)}`)
+    assert.equal(report.rows.length, 2)
+    const notice = report.notices.find((n) => /no frozen recipe/.test(n))
+    assert.ok(notice, 'the exclusion must be surfaced')
+    assert.match(notice, /1 order\(s\)/)
+    assert.match(notice, /MO-LEGACY/)
+    assert.doesNotMatch(notice, /MO-001/)
+  }
+})
+
+test('production variance has no no-frozen-recipe notice when every order is frozen, and an empty snapshot is a real zero-component recipe', async () => {
+  const report = await getProductionVarianceReport({}, {}, {
+    client: manufacturingClient({ orders: [frozenOrder({ componentSnapshot: [] })], movements: [] }),
+    now: () => new Date('2026-06-01T00:00:00Z'),
+  })
+  assert.equal(report.rows.length, 0)
+  assert.equal(report.notices.some((n) => /no frozen recipe/.test(n)), false)
 })

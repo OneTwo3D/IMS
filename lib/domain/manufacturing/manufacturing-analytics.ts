@@ -20,6 +20,8 @@ export type ManufacturingAnalyticsClient = {
   productionOrder: FindManyDelegate
   stockMovement: FindManyDelegate
   costLayer: FindManyDelegate
+  /** Names the components of a frozen componentSnapshot (the snapshot stores ids and quantities only). */
+  product: FindManyDelegate
 }
 
 export type ManufacturingAnalyticsDeps = {
@@ -90,15 +92,11 @@ export type WipReportRow = {
   costLineCount: number
 }
 
-type BomItemRow = {
-  componentProductId: string
-  qty: DecimalInput
-  component: {
-    id: string
-    sku: string
-    name: string
-    stockUnit: string
-  }
+type SnapshotComponentRow = {
+  id: string
+  sku: string
+  name: string
+  stockUnit: string
 }
 
 type ProductionOrderBaseRow = {
@@ -117,7 +115,8 @@ type ProductionOrderBaseRow = {
 }
 
 type ProductionVarianceOrderRow = ProductionOrderBaseRow & {
-  bom: { items: BomItemRow[] }
+  /** Requirements frozen onto the order when it started; the ONLY recipe variance is computed from. */
+  componentSnapshot: unknown
 }
 
 type WipProductionOrderRow = ProductionOrderBaseRow & {
@@ -439,29 +438,47 @@ export async function getProductionVarianceReport(
       createdAt: true,
       outputProduct: { select: { sku: true, name: true } },
       warehouse: { select: { code: true, name: true } },
-      bom: {
-        select: {
-          items: {
-            orderBy: { sortOrder: 'asc' },
-            select: {
-              componentProductId: true,
-              qty: true,
-              component: { select: { id: true, sku: true, name: true, stockUnit: true } },
-            },
-          },
-        },
-      },
+      // THE FROZEN RECIPE, never the live Bom. A recipe re-import deletes and recreates the Bom's items,
+      // so a plan derived from `bom.items` would rewrite the variance of every order already completed.
+      componentSnapshot: true,
     },
   }) as ProductionVarianceOrderRow[]
   if (orders.length > SOURCE_ROW_LIMIT) {
     throw new ManufacturingAnalyticsSourceLimitError(`Production variance source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
   }
 
-  const varianceOrders = orders.filter((order) => (
+  const candidateOrders = orders.filter((order) => (
     order.status === ProductionOrderStatus.IN_PROGRESS ||
     order.status === ProductionOrderStatus.COMPLETED
   ))
-  const movements = await loadProductionOutMovements(client, varianceOrders.map((order) => order.id))
+  // WHICH ORDERS HAVE A FROZEN RECIPE. `updateManufacturingOrderStatus` persists componentSnapshot when
+  // an order starts, and consumption and costing read it, so an IN_PROGRESS or COMPLETED order has one
+  // unless it predates snapshots (legacy rows) or the stored JSON is not a clean list. Such an order is
+  // EXCLUDED and named in a notice rather than planned from the live recipe: its live Bom may have been
+  // re-imported since it ran, and a figure that silently moves with the recipe is worse than a gap.
+  // (An empty snapshot is a real frozen recipe of zero components and yields no rows.)
+  const varianceOrders: Array<{ order: ProductionVarianceOrderRow; components: Array<{ componentId: string; qty: DecimalInput }> }> = []
+  const unfrozenReferences: string[] = []
+  for (const order of candidateOrders) {
+    const raw = order.componentSnapshot
+    const frozen = Array.isArray(raw) && raw.length === 0 ? [] : parseProductionOrderComponentSnapshot(raw)
+    if (frozen === null) {
+      unfrozenReferences.push(order.reference)
+      continue
+    }
+    varianceOrders.push({ order, components: frozen })
+  }
+  const componentIds = new Set<string>()
+  for (const { components } of varianceOrders) for (const comp of components) componentIds.add(comp.componentId)
+  const componentById = new Map<string, SnapshotComponentRow>()
+  if (componentIds.size > 0) {
+    const componentRows = await client.product.findMany({
+      where: { id: { in: [...componentIds] } },
+      select: { id: true, sku: true, name: true, stockUnit: true },
+    }) as SnapshotComponentRow[]
+    for (const row of componentRows) componentById.set(row.id, row)
+  }
+  const movements = await loadProductionOutMovements(client, varianceOrders.map(({ order }) => order.id))
   const actualByOrderAndProduct = movementTotalsByOrderAndProduct(movements)
   const rows: ProductionVarianceReportRow[] = []
   let plannedTotal = new Prisma.Decimal(0)
@@ -469,13 +486,14 @@ export async function getProductionVarianceReport(
   let overConsumedTotal = new Prisma.Decimal(0)
   let overConsumedValueTotal = new Prisma.Decimal(0)
 
-  for (const order of varianceOrders) {
+  for (const { order, components } of varianceOrders) {
     const plannedOutputQty = toDecimal(order.qtyPlanned)
     const producedQty = toDecimal(order.qtyProduced)
     const orderYieldPct = plannedOutputQty.gt(0) ? producedQty.div(plannedOutputQty).mul(100) : null
-    for (const item of order.bom.items) {
+    for (const item of components) {
+      const component = componentById.get(item.componentId) ?? { id: item.componentId, sku: item.componentId, name: item.componentId, stockUnit: '' }
       const plannedQty = toDecimal(item.qty).mul(plannedOutputQty)
-      const actual = actualByOrderAndProduct.get(movementKey(order.id, item.componentProductId)) ?? {
+      const actual = actualByOrderAndProduct.get(movementKey(order.id, item.componentId)) ?? {
         qty: new Prisma.Decimal(0),
         valueBase: new Prisma.Decimal(0),
       }
@@ -500,10 +518,10 @@ export async function getProductionVarianceReport(
         warehouseCode: order.warehouse.code,
         outputSku: order.outputProduct.sku,
         outputProductName: order.outputProduct.name,
-        componentProductId: item.component.id,
-        componentSku: item.component.sku,
-        componentName: item.component.name,
-        stockUnit: item.component.stockUnit,
+        componentProductId: component.id,
+        componentSku: component.sku,
+        componentName: component.name,
+        stockUnit: component.stockUnit,
         plannedQty: quantity(plannedQty),
         actualQty: quantity(actual.qty),
         varianceQty: quantity(varianceQty),
@@ -530,6 +548,10 @@ export async function getProductionVarianceReport(
     overConsumedValueBase: amount(overConsumedValueTotal),
   }, [
     'Production variance includes assembly orders only; disassembly consumption is excluded from BOM variance rows.',
+    'Planned consumption comes from the recipe frozen onto each order when it started, so re-importing or editing a recipe does not change the variance of orders already run.',
+    ...(unfrozenReferences.length > 0
+      ? [`${unfrozenReferences.length} order(s) have no frozen recipe (started before recipes were frozen, or the stored snapshot is unreadable) and are excluded rather than planned from the live recipe: ${unfrozenReferences.slice(0, 20).join(', ')}${unfrozenReferences.length > 20 ? ', ...' : ''}.`]
+      : []),
     'Date filters apply to completion date; in-progress orders without a completion date are shown only when no date window is selected.',
     'Over-consumed value is averaged across the consumed movement value; drill into FIFO cost entries for layer-exact costing.',
   ], options.paginate !== false)

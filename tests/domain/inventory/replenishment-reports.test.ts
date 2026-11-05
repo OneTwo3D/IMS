@@ -461,7 +461,7 @@ test('reorder report propagates the BOM parent order-up-to quantity into compone
       createdAt: new Date('2026-05-15T00:00:00.000Z'),
       product: { sku: 'BOM-TABLE', name: 'Oak table', category, supplierProducts: [] },
     }] },
-    bomItem: { findMany: async () => [{ parentProductId: 'bom-table', componentProductId: 'raw-oak', qty: decimal(2) }] },
+    bomItem: { findMany: async () => [{ parentProductId: 'bom-table', componentProductId: 'raw-oak', qty: decimal(2), bom: { productId: 'bom-table' } }] },
   }
   const report = await getReorderReport({ thresholdDays: 90 }, { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } })
   assert.equal(report.rows.find((r) => r.sku === 'BOM-TABLE')?.suggestedReorderQty, '61')
@@ -509,8 +509,8 @@ test('reorder report cascades demand through NESTED (multi-level) BOMs', async (
       product: { sku: 'BOM-TABLE', name: 'Oak table', category, supplierProducts: [] },
     }] },
     bomItem: { findMany: async () => [
-      { parentProductId: 'bom-table', componentProductId: 'bom-leg', qty: decimal(4) },
-      { parentProductId: 'bom-leg', componentProductId: 'raw-oak', qty: decimal(2) },
+      { parentProductId: 'bom-table', componentProductId: 'bom-leg', qty: decimal(4), bom: { productId: 'bom-table' } },
+      { parentProductId: 'bom-leg', componentProductId: 'raw-oak', qty: decimal(2), bom: { productId: 'bom-leg' } },
     ] },
   }
   const report = await getReorderReport({ thresholdDays: 90 }, { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } })
@@ -1028,15 +1028,21 @@ test('component shortage report includes draft and in-progress production demand
           qtyPlanned: decimal('10'),
           qtyProduced: decimal('2'),
           scheduledAt: new Date('2026-06-15T00:00:00.000Z'),
-          outputProduct: { sku: 'BOM-1', name: 'Assembly' },
-          warehouse: { code: 'WH1', name: 'Main warehouse' },
-          bom: {
-            items: [{
-              componentProductId: 'component-1',
-              qty: decimal('2'),
-              component: { id: 'component-1', sku: 'COMP-1', name: 'Component', type: ProductType.SIMPLE, stockUnit: 'pcs', category, supplierProducts: [{ supplier }] },
-            }],
+          outputProductId: 'bom-1',
+          componentSnapshot: null,
+          outputProduct: {
+            sku: 'BOM-1',
+            name: 'Assembly',
+            manufacturingBom: {
+              items: [{
+                parentProductId: 'bom-1',
+                componentProductId: 'component-1',
+                qty: decimal('2'),
+                component: { id: 'component-1', sku: 'COMP-1', name: 'Component', type: ProductType.SIMPLE, stockUnit: 'pcs', category, supplierProducts: [{ supplier }] },
+              }],
+            },
           },
+          warehouse: { code: 'WH1', name: 'Main warehouse' },
         },
         {
           id: 'prod-2',
@@ -1046,15 +1052,21 @@ test('component shortage report includes draft and in-progress production demand
           qtyPlanned: decimal('3'),
           qtyProduced: decimal('0'),
           scheduledAt: new Date('2026-06-10T00:00:00.000Z'),
-          outputProduct: { sku: 'BOM-2', name: 'Second assembly' },
-          warehouse: { code: 'WH1', name: 'Main warehouse' },
-          bom: {
-            items: [{
-              componentProductId: 'component-1',
-              qty: decimal('1'),
-              component: { id: 'component-1', sku: 'COMP-1', name: 'Component', type: ProductType.SIMPLE, stockUnit: 'pcs', category, supplierProducts: [{ supplier }] },
-            }],
+          outputProductId: 'bom-2',
+          componentSnapshot: null,
+          outputProduct: {
+            sku: 'BOM-2',
+            name: 'Second assembly',
+            manufacturingBom: {
+              items: [{
+                parentProductId: 'bom-2',
+                componentProductId: 'component-1',
+                qty: decimal('1'),
+                component: { id: 'component-1', sku: 'COMP-1', name: 'Component', type: ProductType.SIMPLE, stockUnit: 'pcs', category, supplierProducts: [{ supplier }] },
+              }],
+            },
           },
+          warehouse: { code: 'WH1', name: 'Main warehouse' },
         },
       ],
     },
@@ -1206,7 +1218,7 @@ test('reorder report folds BOM component demand into the component reorder math'
     },
     bomItem: {
       findMany: async () => [
-        { parentProductId: 'bom-table', componentProductId: 'raw-oak', qty: decimal(2) },
+        { parentProductId: 'bom-table', componentProductId: 'raw-oak', qty: decimal(2), bom: { productId: 'bom-table' } },
       ],
     },
   }
@@ -1214,6 +1226,64 @@ test('reorder report folds BOM component demand into the component reorder math'
   const rawRow = report.rows.find((r) => r.sku === 'RAW-OAK')
   assert.ok(rawRow, 'raw material row present')
   assert.equal(rawRow?.reorderPoint, '16')
+  assert.equal(rawRow?.suggestedReorderQty, '16')
+  assert.deepEqual(rawRow?.neededFor, ['BOM BOM-TABLE'])
+})
+
+test('reorder report counts only the CLAIMED recipe when other active Boms list the same parent', async () => {
+  // Oak board (RAW) is a component of Oak table (BOM). The BOM needs 8 units
+  // produced (gap = 5 reorder point - 0 available - 0 inbound, max with
+  // configured reorderQty 8). Each BOM unit consumes 2 oak boards. So the
+  // raw material picks up 16 units of extra demand on top of its own gap.
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [
+        {
+          id: 'raw-oak',
+          sku: 'RAW-OAK',
+          name: 'Oak board',
+          type: ProductType.SIMPLE,
+          stockUnit: 'each',
+          reorderPoint: decimal(0),
+          reorderQty: decimal(0),
+          safetyStockQty: decimal(0),
+          category,
+          preferredSupplierId: null,
+          preferredSupplier: null,
+          supplierProducts: [
+            { supplierId: 'sup-timber', supplierSku: 'OAK-1', lastUnitCost: decimal(5), leadTimeDays: 7, supplier: { name: 'Timber Co' } },
+          ],
+        },
+        {
+          id: 'bom-table',
+          sku: 'BOM-TABLE',
+          name: 'Oak table',
+          type: ProductType.BOM,
+          stockUnit: 'each',
+          reorderPoint: decimal(5),
+          reorderQty: decimal(8),
+          safetyStockQty: decimal(0),
+          category,
+          preferredSupplierId: null,
+          preferredSupplier: null,
+          supplierProducts: [],
+        },
+      ],
+    },
+    bomItem: {
+      findMany: async () => [
+        { parentProductId: 'bom-table', componentProductId: 'raw-oak', qty: decimal(2), bom: { productId: 'bom-table' } },
+        // Stray duplicates: an unclaimed legacy Bom, and a Bom claimed for some OTHER product.
+        { parentProductId: 'bom-table', componentProductId: 'raw-oak', qty: decimal(3), bom: { productId: null } },
+        { parentProductId: 'bom-table', componentProductId: 'raw-oak', qty: decimal(5), bom: { productId: 'bom-other' } },
+      ],
+    },
+  }
+  const report = await getReorderReport({}, { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } })
+  const rawRow = report.rows.find((r) => r.sku === 'RAW-OAK')
+  assert.ok(rawRow, 'raw material row present')
+  assert.equal(rawRow?.reorderPoint, '16', 'duplicates must not add 8 x 3 + 8 x 5 to demand')
   assert.equal(rawRow?.suggestedReorderQty, '16')
   assert.deepEqual(rawRow?.neededFor, ['BOM BOM-TABLE'])
 })
@@ -1271,8 +1341,8 @@ test('reorder report aggregates raw-material demand across multiple parent BOMs'
     },
     bomItem: {
       findMany: async () => [
-        { parentProductId: 'bom-table', componentProductId: 'raw-oak', qty: decimal(2) },
-        { parentProductId: 'bom-shelf', componentProductId: 'raw-oak', qty: decimal(1) },
+        { parentProductId: 'bom-table', componentProductId: 'raw-oak', qty: decimal(2), bom: { productId: 'bom-table' } },
+        { parentProductId: 'bom-shelf', componentProductId: 'raw-oak', qty: decimal(1), bom: { productId: 'bom-shelf' } },
       ],
     },
   }
@@ -1352,4 +1422,69 @@ test('backorder report counts KIT coverage in kits, not in component units (o3d-
   assert.equal(report.rows[0]?.committedQty, '5', 'five KITS committed, not fifteen component units')
   assert.equal(report.rows[0]?.allocatedQty, '0', 'the retained rows cover only what is already committed')
   assert.equal(report.rows[0]?.backorderQty, '5')
+})
+
+function shortageComponent() {
+  return { id: 'component-1', sku: 'COMP-1', name: 'Component', type: ProductType.SIMPLE, stockUnit: 'pcs', category, supplierProducts: [{ supplier }] }
+}
+
+function shortageOrder(overrides: Record<string, unknown>) {
+  return {
+    id: 'prod-1',
+    reference: 'MO-1',
+    status: 'IN_PROGRESS',
+    warehouseId: 'warehouse-1',
+    outputProductId: 'bom-1',
+    qtyPlanned: decimal('10'),
+    qtyProduced: decimal('0'),
+    scheduledAt: null,
+    componentSnapshot: null,
+    outputProduct: {
+      sku: 'BOM-1',
+      name: 'Assembly',
+      manufacturingBom: { items: [{ parentProductId: 'bom-1', componentProductId: 'component-1', qty: decimal('7'), component: shortageComponent() }] },
+    },
+    warehouse: { code: 'WH1', name: 'Main warehouse' },
+    ...overrides,
+  }
+}
+
+test('component shortage plans a started order from its frozen snapshot, not the current recipe', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    productionOrder: { findMany: async () => [shortageOrder({ componentSnapshot: [{ componentId: 'component-1', qty: 2 }] })] },
+    product: { findMany: async () => [shortageComponent()] },
+  }
+  const report = await getComponentShortageReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
+  assert.equal(report.rows[0]?.requiredQty, '20', 'snapshot 2 x 10, not the re-imported 7 x 10')
+})
+
+test('component shortage plans a DRAFT order from the claimed recipe and ignores items of other parents', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    productionOrder: {
+      findMany: async () => [shortageOrder({
+        status: 'DRAFT',
+        outputProduct: {
+          sku: 'BOM-1',
+          name: 'Assembly',
+          manufacturingBom: { items: [
+            { parentProductId: 'bom-1', componentProductId: 'component-1', qty: decimal('7'), component: shortageComponent() },
+            { parentProductId: 'bom-other', componentProductId: 'component-1', qty: decimal('100'), component: shortageComponent() },
+          ] },
+        },
+      })],
+    },
+  }
+  const report = await getComponentShortageReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
+  assert.equal(report.rows[0]?.requiredQty, '70')
+})
+
+test('component shortage treats an empty snapshot as a real zero-component recipe', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    productionOrder: { findMany: async () => [shortageOrder({ componentSnapshot: [] })] },
+  }
+  const report = await getComponentShortageReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
+  assert.equal(report.rows.length, 0)
 })

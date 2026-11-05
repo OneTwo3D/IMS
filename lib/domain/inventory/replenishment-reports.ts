@@ -6,6 +6,8 @@ import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay } from '@/lib/doma
 import { calculateDailyVelocity, saleMovementCogsBase, type VelocitySaleInput } from '@/lib/domain/inventory/velocity'
 import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
+import { CLAIMED_BOM_SELECT, CLAIMED_BOM_WHERE, claimedBomItems } from '@/lib/products/claimed-bom'
+import { parseProductionOrderComponentSnapshot } from '@/lib/domain/manufacturing/component-consumption'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 import {
   calculateDecimalCoverageByLine,
@@ -179,31 +181,41 @@ type ShipmentLineRow = {
   shipment: { status: string; warehouseId: string }
 }
 
+type ShortageComponent = {
+  id: string
+  sku: string
+  name: string
+  type: ProductType
+  stockUnit: string
+  category: { id: string; name: string } | null
+  supplierProducts: Array<{ supplier: { name: string } }>
+}
+
 type ProductionOrderRow = {
   id: string
   reference: string
   status: string
   warehouseId: string
+  outputProductId: string
   qtyPlanned: DecimalInput
   qtyProduced: DecimalInput
   scheduledAt: Date | null
-  outputProduct: { sku: string; name: string }
-  warehouse: { code: string; name: string }
-  bom: {
-    items: Array<{
-      componentProductId: string
-      qty: DecimalInput
-      component: {
-        id: string
-        sku: string
-        name: string
-        type: ProductType
-        stockUnit: string
-        category: { id: string; name: string } | null
-        supplierProducts: Array<{ supplier: { name: string } }>
-      }
-    }>
+  /** Requirements frozen when the order started (null on a DRAFT or legacy order). */
+  componentSnapshot: unknown
+  outputProduct: {
+    sku: string
+    name: string
+    /** The CLAIMED recipe for the output product (boms.productId = outputProductId). */
+    manufacturingBom: {
+      items: Array<{
+        parentProductId: string
+        componentProductId: string
+        qty: DecimalInput
+        component: ShortageComponent
+      }>
+    } | null
   }
+  warehouse: { code: string; name: string }
 }
 
 export type ReorderReportRow = {
@@ -768,21 +780,25 @@ export async function getReorderReport(
       outputProduct: { type: ProductType }
       createdAt: Date
     }>>,
-    // BOM-item rows for every active BOM whose parent is BOM-typed. The map
-    // built from these drives component-demand expansion: when a BOM parent
-    // needs N units, each of its components needs N × bomItem.qty more on
-    // top of its own direct (sales-driven) demand.
+    // BOM-item rows of every active CLAIMED recipe whose parent is BOM-typed.
+    // The map built from these drives component-demand expansion: when a BOM
+    // parent needs N units, each of its components needs N × bomItem.qty more
+    // on top of its own direct (sales-driven) demand. Only the recipe the
+    // product CLAIMS (boms.productId = parent) is counted: a second active Bom
+    // listing the same parent is a stray duplicate and must not double demand.
     client.bomItem.findMany({
-      where: { bom: { active: true }, parentProduct: { type: ProductType.BOM } },
+      where: { bom: { active: true, ...CLAIMED_BOM_WHERE }, parentProduct: { type: ProductType.BOM } },
       select: {
         parentProductId: true,
         componentProductId: true,
         qty: true,
+        bom: { select: CLAIMED_BOM_SELECT },
       },
     }) as Promise<Array<{
       parentProductId: string
       componentProductId: string
       qty: DecimalInput
+      bom: { productId: string | null }
     }>>,
   ])
   assertSourceLimit(products.length, SOURCE_ROW_LIMIT, 'Replenishment product source rows')
@@ -850,7 +866,7 @@ export async function getReorderReport(
   // BOM-item rows keyed by parent (the BOM-typed finished good). When that
   // parent needs replenishment we walk its items to add component demand.
   const bomItemsByParent = new Map<string, Array<{ componentProductId: string; qty: Prisma.Decimal }>>()
-  for (const item of bomItemRows) {
+  for (const item of claimedBomItems(bomItemRows)) {
     const list = bomItemsByParent.get(item.parentProductId) ?? []
     list.push({ componentProductId: item.componentProductId, qty: toDecimal(item.qty) })
     bomItemsByParent.set(item.parentProductId, list)
@@ -1341,6 +1357,50 @@ export async function getBackorderDemandReport(
   }
 }
 
+function shortageComponentSelect(filters: StockPositionFilters) {
+  return {
+    id: true,
+    sku: true,
+    name: true,
+    type: true,
+    stockUnit: true,
+    category: { select: { id: true, name: true } },
+    supplierProducts: {
+      ...(filters.supplierId ? { where: { supplierId: filters.supplierId } } : {}),
+      select: { supplier: { select: { name: true } } },
+    },
+  }
+}
+
+type ShortageRequirementLine = { componentProductId: string; qty: DecimalInput; component: ShortageComponent }
+
+/**
+ * The per-output-unit component requirements the shortage report plans for one open production order.
+ *   - a STARTED order (frozen componentSnapshot): the snapshot, because that is what its reservation
+ *     and its completion use, so a recipe re-import after the start cannot move the numbers;
+ *   - otherwise (DRAFT, or a legacy order started before snapshots existed): the CLAIMED recipe of the
+ *     output product. Never the Bom row the order points at, which can be an unclaimed duplicate.
+ * A snapshot of zero components is a real frozen recipe and plans nothing. A snapshot that is present
+ * but malformed is not trusted and falls through to the claimed recipe.
+ */
+function shortageRequirementLines(
+  order: ProductionOrderRow,
+  snapshotComponents: Map<string, ShortageComponent>,
+): ShortageRequirementLine[] {
+  if (Array.isArray(order.componentSnapshot) && order.componentSnapshot.length === 0) return []
+  const snapshot = parseProductionOrderComponentSnapshot(order.componentSnapshot)
+  if (snapshot) {
+    const lines: ShortageRequirementLine[] = []
+    for (const entry of snapshot) {
+      const component = snapshotComponents.get(entry.componentId)
+      if (component) lines.push({ componentProductId: entry.componentId, qty: entry.qty, component })
+    }
+    return lines
+  }
+  const claimed = order.outputProduct.manufacturingBom?.items ?? []
+  return claimed.filter((item) => item.parentProductId === order.outputProductId)
+}
+
 export async function getComponentShortageReport(
   filters: StockPositionFilters = {},
   options: { paginate?: boolean; deps?: ReplenishmentReportDeps } = {},
@@ -1358,35 +1418,33 @@ export async function getComponentShortageReport(
         reference: true,
         status: true,
         warehouseId: true,
+        outputProductId: true,
         qtyPlanned: true,
         qtyProduced: true,
         scheduledAt: true,
-        outputProduct: { select: { sku: true, name: true } },
-        warehouse: { select: { code: true, name: true } },
-        bom: {
+        componentSnapshot: true,
+        outputProduct: {
           select: {
-            items: {
+            sku: true,
+            name: true,
+            // The CLAIMED recipe of the product being built, never the Bom row the order happens to
+            // point at: an order raised against a since-superseded or duplicate Bom must not plan
+            // its components from it.
+            manufacturingBom: {
               select: {
-                componentProductId: true,
-                qty: true,
-                component: {
+                items: {
                   select: {
-                    id: true,
-                    sku: true,
-                    name: true,
-                    type: true,
-                    stockUnit: true,
-                    category: { select: { id: true, name: true } },
-                    supplierProducts: {
-                      ...(filters.supplierId ? { where: { supplierId: filters.supplierId } } : {}),
-                      select: { supplier: { select: { name: true } } },
-                    },
+                    parentProductId: true,
+                    componentProductId: true,
+                    qty: true,
+                    component: { select: shortageComponentSelect(filters) },
                   },
                 },
               },
             },
           },
         },
+        warehouse: { select: { code: true, name: true } },
       },
       orderBy: [{ scheduledAt: 'asc' }, { createdAt: 'asc' }],
       take: SOURCE_ROW_LIMIT + 1,
@@ -1395,6 +1453,18 @@ export async function getComponentShortageReport(
     loadOpenPoLines(client, filters),
   ])
   assertSourceLimit(orders.length, SOURCE_ROW_LIMIT, 'Component shortage production order source rows')
+  const snapshotComponentIds = new Set<string>()
+  for (const order of orders) {
+    for (const entry of parseProductionOrderComponentSnapshot(order.componentSnapshot) ?? []) snapshotComponentIds.add(entry.componentId)
+  }
+  const snapshotComponents = new Map<string, ShortageComponent>()
+  if (snapshotComponentIds.size > 0) {
+    const rows = await client.product.findMany({
+      where: { id: { in: [...snapshotComponentIds] } },
+      select: shortageComponentSelect(filters),
+    }) as ShortageComponent[]
+    for (const row of rows) snapshotComponents.set(row.id, row)
+  }
   const availableByStock = new Map<string, Prisma.Decimal>()
   for (const level of stockLevels) {
     addToMap(availableByStock, stockKey(level.productId, level.warehouseId), toDecimal(level.quantity).sub(toDecimal(level.reservedQty)))
@@ -1404,7 +1474,7 @@ export async function getComponentShortageReport(
   for (const order of orders) {
     const remainingOutput = Prisma.Decimal.max(new Prisma.Decimal(0), toDecimal(order.qtyPlanned).sub(toDecimal(order.qtyProduced)))
     if (remainingOutput.lte(0)) continue
-    for (const item of order.bom.items) {
+    for (const item of shortageRequirementLines(order, snapshotComponents)) {
       const component = item.component
       if (!componentMatchesFilters(component, filters)) continue
       const key = stockKey(item.componentProductId, order.warehouseId)

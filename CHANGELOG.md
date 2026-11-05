@@ -8,6 +8,13 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Manufacturing recipe readers: history is frozen, planning counts the claimed recipe
+
+- **Fixed: production variance no longer moves when a recipe is re-imported.** Planned consumption is now computed from the recipe frozen onto the order when it started (`componentSnapshot`), the same record consumption and costing use, instead of the live recipe. A started or completed order with no frozen recipe (started before recipes were frozen, or an unreadable snapshot) is left out of the report and named in a note under it; it is never measured against the live recipe.
+- **Fixed: planning counts only the claimed recipe.** The replenishment report's component-demand explosion no longer adds the items of every active recipe that lists a product as parent, so a stray duplicate recipe cannot double component demand. Automatic reorder build orders pick the product's claimed recipe instead of the most recently updated one, and a product with no claimed active recipe is skipped with the reason `no_active_bom`.
+- **Fixed: the component shortage report plans a started order from its frozen snapshot, and any other open order from the product's claimed recipe,** not from the recipe row the order happens to point at.
+- **New: a census test** (`tests/products/claimed-bom-reader-census.test.ts`) classifies every reader of the recipe tables and fails when a new planning reader is not scoped to the claimed recipe.
+
 ### Aelia cutover hardening
 
 - **Fixed: a pinned currency is covered even when Aelia omits or refuses it.** The switch to Aelia (and the coverage the ingest reports) now checks the latest manual override of every active foreign currency, not only those with a usable entry in Aelia's answer. A pinned USD that Aelia leaves out no longer rolls the switch back; the real lookup still has the final say.
