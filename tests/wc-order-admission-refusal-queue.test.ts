@@ -171,6 +171,7 @@ function txDelegates() {
       return row ?? {}
     },
     findFirst: async ({ where }: { where: Row }) => matchLogs(where)[0] ?? null,
+    findUnique: async ({ where }: { where: { id: string } }) => store.syncLogs.find((entry) => entry.id === where.id) ?? null,
     findMany: async ({ where }: { where: Row }) => matchLogs(where),
     count: async () => 0,
   },
