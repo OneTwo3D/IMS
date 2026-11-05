@@ -213,7 +213,7 @@ test(
   async () => {
     const deps = await loadDeps()
     const NS = 'R'
-    const { tableId, rawId } = await seedCatalogue(deps, NS)
+    const { tableId, legId, rawId } = await seedCatalogue(deps, NS)
     await deps.db.product.update({ where: { id: tableId }, data: { reorderPoint: 5, reorderQty: 8 } })
 
     const reorderQtys = async () => {
@@ -230,12 +230,21 @@ test(
     assert.equal(baseline.leg, String(Number(baseline.table) * 4))
 
     const strayId = await strayDuplicateBom(deps, NS, tableId, rawId, 50)
-    // PRECONDITION, using the reader's own predicate: two ACTIVE Boms really do list this parent.
+    // A second kind of stray: an active Bom CLAIMED FOR A DIFFERENT PRODUCT that nevertheless lists TABLE as a parent.
+    await deps.db.bom.create({
+      data: {
+        name: `${TAG}${NS} claimed elsewhere`,
+        active: true,
+        productId: legId,
+        items: { create: [{ parentProductId: tableId, componentProductId: rawId, qty: 7, sortOrder: 0 }] },
+      },
+    })
+    // PRECONDITION, using the reader's own predicate: three ACTIVE Boms really do list this parent.
     const active = await deps.db.bomItem.count({ where: { parentProductId: tableId, bom: { active: true } } })
-    assert.equal(active, 3, 'two claimed-recipe items plus the stray duplicate\'s item are all visible to an unscoped read')
+    assert.equal(active, 4, 'two claimed-recipe items plus both strays\' items are all visible to an unscoped read')
     assert.equal((await deps.db.bom.findUniqueOrThrow({ where: { id: strayId }, select: { productId: true } })).productId, null)
 
-    assert.deepEqual(await reorderQtys(), baseline, 'the stray duplicate must not add 50 x TABLE qty of RAW demand')
+    assert.deepEqual(await reorderQtys(), baseline, 'neither stray may add 50 or 7 x TABLE qty of RAW demand')
   },
 )
 
