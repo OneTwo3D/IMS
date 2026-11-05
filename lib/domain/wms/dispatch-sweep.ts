@@ -415,7 +415,21 @@ export type WmsDispatchSweepDeps = {
   applyDispatch(
     orderId: string,
     tracking: Array<{ trackingNumber: string; shippingService?: string | null }>,
+    /**
+     * `storefrontAlreadyCompleted`: every despatched part was VERIFIED against a fresh read of the storefront order (it is
+     * completed there, after the latest despatch), so IMS completes its own side only. THE CONTRACT: it writes NO ORDER-LEVEL
+     * storefront data - no completion job, no tracking, no order note, no status. The one storefront effect that remains is IMS's
+     * ordinary stock-level sync for the stock the shipment consumed (owner ruling: IMS is the stock master after cutover).
+     */
+    options?: { storefrontAlreadyCompleted?: boolean },
   ): Promise<{ success: boolean; error?: string }>
+  /**
+   * Fresh, READ-ONLY verification of a part despatched before the storefront went live. Asked only when the push for a part
+   * was shadowed with the reason `obligation_before_cutoff`. It reads the order from the store it is CURRENTLY linked to
+   * (never a stored delivery) and answers `verified` only when the order is `completed` there with a completion instant at or
+   * after `latestDespatchAt` (the LATEST despatch among the order's despatched parts). Absent: nothing is verifiable.
+   */
+  verifyPreCutoverCompletion?(orderId: string, latestDespatchAt: Date | null): Promise<{ verified: boolean; detail: string }>
   // Whether the active connector supports per-part reconciliation (fetchOrderParts). When
   // false, a split order is surfaced as a clear "unsupported" pending rather than silently
   // stalling as "no parts visible".
@@ -427,7 +441,7 @@ export type WmsDispatchSweepDeps = {
   pushPartialShipment(
     orderId: string,
     input: WmsDispatchPartialShipmentInput,
-  ): Promise<{ ok: boolean; error?: string; shadowed?: boolean }>
+  ): Promise<{ ok: boolean; error?: string; shadowed?: boolean; shadowReason?: string }>
   // Merge handling: repoint the push link to the surviving WMS order when this order was
   // merged into another (its own WMS order is destroyed).
   repointLink(linkId: string, to: { externalOrderId: string; externalOrderNumber: string }): Promise<void>
@@ -604,6 +618,9 @@ export type WmsDispatchSweepDeps = {
   countLinksByOrderNumber?(orderNumbers: string[]): Promise<Map<string, number>>
 }
 
+/** The shadow reason of a part despatched before the storefront's live-from instant (the earlier writer owned the store then). */
+const PRE_CUTOVER_SHADOW_REASON: import('@/lib/security/producer-disposition-constants').ProducerReason = 'obligation_before_cutoff'
+
 /** The latest despatch time among a part's tracking entries, or null when the WMS gave none that parses. */
 function latestDespatchTime(tracking: ReadonlyArray<{ despatchedAt?: string | null }>): Date | null {
   let latest: Date | null = null
@@ -657,6 +674,12 @@ async function reconcileSplitOrder(
   // line items can't become a partial shipment — don't let it count toward completion
   // (that would ship the IMS order with a part never recorded).
   let allRecorded = true
+  // Parts whose storefront record was VERIFIED by a fresh read (pre-cutover) rather than written by this sweep.
+  let verifiedPreCutoverParts = 0
+  // The fresh read happens at most once per order per sweep: the first shadowed pre-cutover part asks, the rest reuse the answer.
+  let preCutoverVerdict: { verified: boolean; detail: string } | null = null
+  // What a verifying completion must postdate: the LATEST despatch among ALL despatched parts, not the part being asked about.
+  const latestPartDespatch = latestDespatchTime(dispatchedParts.flatMap((entry) => entry.tracking))
   if (recordPartials) {
     for (const part of dispatchedParts) {
       const items = await deps.fetchPartItems(part.externalId)
@@ -676,6 +699,26 @@ async function reconcileSplitOrder(
         // dead-lettered for it, however long the hold lasts) and NOT a push (the part was not recorded at the storefront, so
         // the order is not completed off it). It is a part we could not finish, so it is unresolved and holds the watermark.
         if (push.shadowed === true) {
+          // A part despatched BEFORE the storefront went live stays shadowed for good (the earlier writer owned the store then),
+          // so it is never pushed. It is VERIFIED instead, by a fresh read-only look at the order's current storefront state.
+          // Any other shadow reason is unchanged: the order stays pending.
+          if (push.shadowReason === PRE_CUTOVER_SHADOW_REASON) {
+            if (preCutoverVerdict === null) {
+              try {
+                preCutoverVerdict = deps.verifyPreCutoverCompletion
+                  ? await deps.verifyPreCutoverCompletion(candidate.orderId, latestPartDespatch)
+                  : { verified: false, detail: 'this sweep has no way to read the storefront order' }
+              } catch {
+                preCutoverVerdict = { verified: false, detail: 'the storefront order could not be verified' }
+              }
+            }
+            if (preCutoverVerdict.verified) { verifiedPreCutoverParts += 1; continue }
+            return {
+              action: 'pending',
+              reason: `Part ${part.partNumber} was despatched before the storefront went live and the storefront order could not be verified as completed: ${preCutoverVerdict.detail}`,
+              unresolved: requireResolution,
+            }
+          }
           return { action: 'pending', reason: push.error ?? `Partial-shipment push for part ${part.partNumber} was kept as a shadow`, unresolved: requireResolution }
         }
         return { action: 'error', reason: push.error ?? `Partial-shipment push failed for part ${part.partNumber}` }
@@ -710,7 +753,10 @@ async function reconcileSplitOrder(
   const aggregated = trackingNumbers.length > 0
     ? [{ trackingNumber: trackingNumbers.join(', '), shippingService: allTracking.find((e) => e.carrier)?.carrier ?? null }]
     : []
-  const result = await deps.applyDispatch(candidate.orderId, aggregated)
+  // Every despatched part was VERIFIED by the fresh read (none was pushed by this sweep): the storefront order is already
+  // complete, so IMS completes its own side only. A mixed order (some part pushed live) keeps the normal completion.
+  const storefrontAlreadyCompleted = recordPartials && dispatchedParts.length > 0 && verifiedPreCutoverParts === dispatchedParts.length
+  const result = await deps.applyDispatch(candidate.orderId, aggregated, storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true } : undefined)
   if (!result.success) {
     return { action: 'error', reason: result.error ?? 'Dispatch apply failed after all parts despatched' }
   }
@@ -2313,7 +2359,11 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           },
         }
       : {}),
-    async applyDispatch(orderId, tracking) {
+    async verifyPreCutoverCompletion(orderId, latestDespatchAt) {
+      const { verifyPreCutoverCompletionByFreshRead } = await import('@/lib/connectors/woocommerce/sync/pre-cutover-order-read')
+      return verifyPreCutoverCompletionByFreshRead(orderId, latestDespatchAt)
+    },
+    async applyDispatch(orderId, tracking, options) {
       // q66in.4.6 audit timeline: capture the order status pre-image so the
       // dispatch event carries a real before/after, not just the target state.
       const orderBefore = await db.salesOrder.findUnique({ where: { id: orderId }, select: { status: true, orderNumber: true } }).catch(() => null)
@@ -2322,6 +2372,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         lookup: { orderId },
         targetShipmentStatus: 'SHIPPED',
         tracking,
+        ...(options?.storefrontAlreadyCompleted === true ? { storefrontAlreadyCompleted: true } : {}),
       })
       if (result.success) {
         await recordWmsMutationEvent({
@@ -2351,7 +2402,12 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         items: input.items,
         despatchedAt: input.despatchedAt ?? null,
       })
-      return { ok: result.success, error: result.error, ...(result.shadowed === true ? { shadowed: true } : {}) }
+      return {
+        ok: result.success,
+        error: result.error,
+        ...(result.shadowed === true ? { shadowed: true } : {}),
+        ...(result.shadowed === true && result.shadowReason ? { shadowReason: result.shadowReason } : {}),
+      }
     },
     async repointLink(linkId, to) {
       // Park as MERGED so the push-sweep's SYNCED-filtered passes skip it (no dual-sync
