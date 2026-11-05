@@ -280,6 +280,11 @@ test(
     assert.equal(skipped.moCount, 0)
     assert.deepEqual(skipped.skipped?.map((s) => s.reason), ['no_active_bom'])
     assert.equal(await deps.db.productionOrder.count({ where: { outputProductId: other.tableId } }), 0)
+
+    // And the replenishment report says so instead of silently dropping that product's component demand.
+    const report = await deps.getReorderReport({}, { paginate: false })
+    const notice = report.notices.find((n) => /No claimed recipe/.test(n))
+    assert.ok(notice?.includes(sku(NS2, 'TABLE')), `the report must name the product with no claimed recipe: ${notice}`)
   },
 )
 
@@ -315,5 +320,12 @@ test(
       data: { reference: `${TAG}${NS}-DRAFT`, orderType: 'ASSEMBLY', bomId: strayId, outputProductId: tableId, warehouseId: warehouse.id, qtyPlanned: 10, status: 'DRAFT' },
     })
     assert.equal((await rawRow())?.requiredQty, '38', 'started 4 x 2 (snapshot) + draft 10 x 3 (claimed recipe); the stray\'s x500 must not be used')
+
+    // A started order whose snapshot is gone (a legacy row) is NOT planned from the live recipe; it is named.
+    await deps.db.$executeRaw`UPDATE production_orders SET "componentSnapshot" = NULL WHERE id = ${started.id}`
+    const afterLoss = await deps.getComponentShortageReport({}, { paginate: false })
+    assert.equal(afterLoss.rows.find((row) => row.productId === rawId)?.requiredQty, '30', 'only the DRAFT (claimed recipe) remains')
+    const startedRef = (await deps.db.productionOrder.findUniqueOrThrow({ where: { id: started.id }, select: { reference: true } })).reference
+    assert.ok(afterLoss.notices.some((n) => /no usable frozen recipe/.test(n) && n.includes(startedRef)))
   },
 )

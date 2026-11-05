@@ -1053,7 +1053,7 @@ test('component shortage report includes draft and in-progress production demand
           qtyProduced: decimal('0'),
           scheduledAt: new Date('2026-06-10T00:00:00.000Z'),
           outputProductId: 'bom-2',
-          componentSnapshot: null,
+          componentSnapshot: [{ componentId: 'component-1', qty: 1 }],
           outputProduct: {
             sku: 'BOM-2',
             name: 'Second assembly',
@@ -1070,6 +1070,7 @@ test('component shortage report includes draft and in-progress production demand
         },
       ],
     },
+    product: { findMany: async () => [{ id: 'component-1', sku: 'COMP-1', name: 'Component', type: ProductType.SIMPLE, stockUnit: 'pcs', category, supplierProducts: [{ supplier }] }] },
     stockLevel: {
       findMany: async () => [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: decimal('8'), reservedQty: decimal('1') }],
     },
@@ -1487,4 +1488,50 @@ test('component shortage treats an empty snapshot as a real zero-component recip
   }
   const report = await getComponentShortageReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
   assert.equal(report.rows.length, 0)
+})
+
+test('component shortage does NOT plan a started order whose snapshot is null or malformed from the live recipe, and names it', async () => {
+  for (const componentSnapshot of [null, 'garbage', [{ componentId: 'component-1', qty: -1 }], [{ qty: 1 }]]) {
+    const client: ReplenishmentReportClient = {
+      ...unusedClient(),
+      productionOrder: { findMany: async () => [shortageOrder({ reference: 'MO-BROKEN', componentSnapshot })] },
+    }
+    const report = await getComponentShortageReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
+    assert.equal(report.rows.length, 0, `snapshot ${JSON.stringify(componentSnapshot)} must not fall back to the claimed recipe (7 x 10)`)
+    const notice = report.notices.find((n) => /no usable frozen recipe/.test(n))
+    assert.ok(notice, 'the exclusion must be surfaced')
+    assert.match(notice, /MO-BROKEN/)
+  }
+})
+
+test('component shortage has no unfrozen notice when every started order is frozen', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    productionOrder: { findMany: async () => [shortageOrder({ componentSnapshot: [] })] },
+  }
+  const report = await getComponentShortageReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
+  assert.equal(report.notices.some((n) => /no usable frozen recipe/.test(n)), false)
+})
+
+test('reorder report names a BOM product that needs building but has no claimed recipe, instead of silently dropping its component demand', async () => {
+  const bomProduct = {
+    id: 'bom-table', sku: 'BOM-TABLE', name: 'Oak table', type: ProductType.BOM, stockUnit: 'each',
+    reorderPoint: decimal(5), reorderQty: decimal(8), safetyStockQty: decimal(0), category,
+    preferredSupplierId: null, preferredSupplier: null, supplierProducts: [],
+  }
+  const baseClient = (bomItems: unknown[]): ReplenishmentReportClient => ({
+    ...unusedClient(),
+    product: { findMany: async () => [bomProduct] },
+    // Only an UNCLAIMED legacy Bom lists this parent: the claim filter leaves nothing for it.
+    bomItem: { findMany: async () => bomItems },
+  })
+  const unclaimedOnly = baseClient([{ parentProductId: 'bom-table', componentProductId: 'raw-oak', qty: decimal(2), bom: { productId: null } }])
+  const withoutRecipe = await getReorderReport({}, { deps: { client: unclaimedOnly, now: () => new Date('2026-06-30T00:00:00.000Z') } })
+  const notice = withoutRecipe.notices.find((n) => /No claimed recipe/.test(n))
+  assert.ok(notice, 'the missing recipe must be surfaced')
+  assert.match(notice, /BOM-TABLE/)
+
+  const claimed = baseClient([{ parentProductId: 'bom-table', componentProductId: 'raw-oak', qty: decimal(2), bom: { productId: 'bom-table' } }])
+  const withRecipe = await getReorderReport({}, { deps: { client: claimed, now: () => new Date('2026-06-30T00:00:00.000Z') } })
+  assert.equal(withRecipe.notices.some((n) => /No claimed recipe/.test(n)), false)
 })

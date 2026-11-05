@@ -962,6 +962,7 @@ export async function getReorderReport(
   // break by SKU for deterministic accumulation; any cycle remnant (BOMs should
   // be acyclic) is appended in SKU order so it's still processed once.
   const componentDemand = new Map<string, Prisma.Decimal>()
+  const unplannedBomSkus: string[] = []
   const componentNeededFor = new Map<string, string[]>()
   const orderedCandidates = [...candidatesByProductId.values()].sort((a, b) => a.product.sku.localeCompare(b.product.sku))
 
@@ -1023,6 +1024,9 @@ export async function getReorderReport(
     ))
     if (ownSuggested.lte(0)) continue
     const bomItems = bomItemsByParent.get(productId) ?? []
+    // A BOM product that needs building but has no CLAIMED active recipe (its only Bom may be a legacy
+    // unclaimed one) contributes no component demand. Say so instead of dropping it silently.
+    if (bomItems.length === 0) unplannedBomSkus.push(candidate.product.sku)
     for (const item of bomItems) {
       const extra = ownSuggested.mul(item.qty)
       const existing = componentDemand.get(item.componentProductId) ?? new Prisma.Decimal(0)
@@ -1163,6 +1167,7 @@ export async function getReorderReport(
       'Suggested reorder quantity only applies the configured reorder quantity when projected available stock is below the reorder point; a configured reorderQty of 0 opts the SKU out of auto-reorder suggestions.',
       'ABC class is computed by demand volume over the window above (Pareto: top 80% of units = A, next 15% = B, remainder including no-movement = C), not the stored product field.',
       'When a product has multiple supplier-product rows, Reorder Planning chooses the lowest lastUnitCost supplier row as the default suggestion source.',
+      ...(unplannedBomSkus.length > 0 ? [`No claimed recipe: component demand not planned for ${unplannedBomSkus.length} BOM product(s) that need building: ${unplannedBomSkus.slice(0, 10).join(', ')}${unplannedBomSkus.length > 10 ? ', ...' : ''}. Import or claim a recipe for them.`] : []),
       ...(derivedLeadTimeSkus.length > 0 ? [`Supplier/category median lead time used for ${derivedLeadTimeSkus.length} SKU(s) with no configured or observed lead time of their own: ${derivedLeadTimeSkus.slice(0, 10).join(', ')}${derivedLeadTimeSkus.length > 10 ? ', ...' : ''}.`] : []),
       ...(defaultLeadTimeSkus.length > 0 ? [`Default ${DEFAULT_LEAD_TIME_DAYS}-day lead time used for ${defaultLeadTimeSkus.length} SKU(s) with no configured/observed lead time and no supplier or category peers to derive one from: ${defaultLeadTimeSkus.slice(0, 10).join(', ')}${defaultLeadTimeSkus.length > 10 ? ', ...' : ''}.`] : []),
     ],
@@ -1376,29 +1381,32 @@ type ShortageRequirementLine = { componentProductId: string; qty: DecimalInput; 
 
 /**
  * The per-output-unit component requirements the shortage report plans for one open production order.
- *   - a STARTED order (frozen componentSnapshot): the snapshot, because that is what its reservation
- *     and its completion use, so a recipe re-import after the start cannot move the numbers;
- *   - otherwise (DRAFT, or a legacy order started before snapshots existed): the CLAIMED recipe of the
- *     output product. Never the Bom row the order points at, which can be an unclaimed duplicate.
- * A snapshot of zero components is a real frozen recipe and plans nothing. A snapshot that is present
- * but malformed is not trusted and falls through to the claimed recipe.
+ *   - a DRAFT order: the CLAIMED recipe of the output product. Never the Bom row the order points at,
+ *     which can be an unclaimed duplicate;
+ *   - a STARTED order: its frozen componentSnapshot, because that is what its reservation and its
+ *     completion use, so a recipe re-import after the start cannot move the numbers. A snapshot of zero
+ *     components is a real frozen recipe and plans nothing;
+ *   - a STARTED order with NO usable snapshot (NULL on a legacy row, or present but malformed) is
+ *     `unfrozen`: it is not planned from the live recipe and the caller names it in a notice. This is the
+ *     same rule the production variance report applies, so the two reports cannot disagree about it.
  */
 function shortageRequirementLines(
   order: ProductionOrderRow,
   snapshotComponents: Map<string, ShortageComponent>,
-): ShortageRequirementLine[] {
-  if (Array.isArray(order.componentSnapshot) && order.componentSnapshot.length === 0) return []
-  const snapshot = parseProductionOrderComponentSnapshot(order.componentSnapshot)
-  if (snapshot) {
-    const lines: ShortageRequirementLine[] = []
-    for (const entry of snapshot) {
-      const component = snapshotComponents.get(entry.componentId)
-      if (component) lines.push({ componentProductId: entry.componentId, qty: entry.qty, component })
-    }
-    return lines
+): { lines: ShortageRequirementLine[]; unfrozen: boolean } {
+  if (order.status === 'DRAFT') {
+    const claimed = order.outputProduct.manufacturingBom?.items ?? []
+    return { lines: claimed.filter((item) => item.parentProductId === order.outputProductId), unfrozen: false }
   }
-  const claimed = order.outputProduct.manufacturingBom?.items ?? []
-  return claimed.filter((item) => item.parentProductId === order.outputProductId)
+  if (Array.isArray(order.componentSnapshot) && order.componentSnapshot.length === 0) return { lines: [], unfrozen: false }
+  const snapshot = parseProductionOrderComponentSnapshot(order.componentSnapshot)
+  if (!snapshot) return { lines: [], unfrozen: true }
+  const lines: ShortageRequirementLine[] = []
+  for (const entry of snapshot) {
+    const component = snapshotComponents.get(entry.componentId)
+    if (component) lines.push({ componentProductId: entry.componentId, qty: entry.qty, component })
+  }
+  return { lines, unfrozen: false }
 }
 
 export async function getComponentShortageReport(
@@ -1471,10 +1479,16 @@ export async function getComponentShortageReport(
   }
   const inboundByStock = inboundOpenPoByStock(openPoLines)
   const requirements = new Map<string, ComponentShortageReportRow & { orderIds: Set<string>; outputSet: Set<string> }>()
+  const unfrozenReferences: string[] = []
   for (const order of orders) {
     const remainingOutput = Prisma.Decimal.max(new Prisma.Decimal(0), toDecimal(order.qtyPlanned).sub(toDecimal(order.qtyProduced)))
     if (remainingOutput.lte(0)) continue
-    for (const item of shortageRequirementLines(order, snapshotComponents)) {
+    const planned = shortageRequirementLines(order, snapshotComponents)
+    if (planned.unfrozen) {
+      unfrozenReferences.push(order.reference)
+      continue
+    }
+    for (const item of planned.lines) {
       const component = item.component
       if (!componentMatchesFilters(component, filters)) continue
       const key = stockKey(item.componentProductId, order.warehouseId)
@@ -1543,6 +1557,11 @@ export async function getComponentShortageReport(
       inboundOpenPoQty: quantityString(totals.inboundOpenPoQty),
       shortageQty: quantityString(totals.shortageQty),
     },
-    notices: ['Component shortages include draft and in-progress production orders and subtract current available stock plus inbound open PO quantity for the production warehouse. POs without a destination warehouse are not treated as warehouse-specific cover.'],
+    notices: [
+      'Component shortages include draft and in-progress production orders and subtract current available stock plus inbound open PO quantity for the production warehouse. POs without a destination warehouse are not treated as warehouse-specific cover.',
+      ...(unfrozenReferences.length > 0
+        ? [`${unfrozenReferences.length} started order(s) have no usable frozen recipe (started before recipes were frozen, or the stored snapshot is unreadable) and are NOT planned, rather than planned from the live recipe: ${unfrozenReferences.slice(0, 20).join(', ')}${unfrozenReferences.length > 20 ? ', ...' : ''}.`]
+        : []),
+    ],
   }
 }

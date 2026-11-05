@@ -23,6 +23,10 @@ Planning counts only the recipe a product **claims** (the one the product form, 
 build orders write). If a stray second recipe for the same product exists, it is ignored by the reorder
 report and by automatic reorder build orders; it is never added to the claimed recipe's demand.
 
+A BOM product that needs building but has no claimed recipe is named in a note under the reorder report
+(its component demand cannot be planned until a recipe is imported or claimed). The component shortage
+report likewise leaves out a started order that has no usable frozen recipe and names it in a note.
+
 Variance reporting works the other way round: it reads the recipe **frozen onto each build order when
 it was started**, so re-importing or editing a recipe later does not change the variance of orders that
 have already run. A started or completed order that has no frozen recipe (it started before recipes

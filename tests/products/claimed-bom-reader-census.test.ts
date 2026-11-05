@@ -22,8 +22,34 @@ import test from 'node:test'
 
 const ROOT = process.cwd()
 
-/** A read of bom / bom_items: a delegate query, a relation include/select, or raw SQL. */
-const READ = /\b(?:bomItem|bom)\s*\.\s*(?:findMany|findFirst|findUnique|findUniqueOrThrow|findFirstOrThrow|count|aggregate|groupBy)\b|\bbomItem\s*:\s*FindManyDelegate|\b(?:bom|manufacturingBom|bomAsParent|bomAsComponent)\s*:\s*\{|\b(?:FROM|JOIN)\s+"?(?:boms|bom_items)\b/g
+/**
+ * EVERY FORM A READ OF THE BOM TABLES CAN TAKE. Each is a named pattern so that a negative test below can
+ * prove the form is detected when it appears in an unlisted file.
+ *   delegate   any access to the `bom` / `bomItem` delegate or relation that is not a plain write
+ *              (`.findMany`, `.count`, a destructured alias, `order.bom.items`, `product.manufacturingBom`)
+ *   key        a relation or delegate named as a property: `{ bom: { ... } }`, `{ bom: true }`,
+ *              `{ manufacturingBom: SELECT }`, `bomItem: FindManyDelegate`
+ *   sql        raw SQL on the tables: FROM / JOIN / comma-join
+ */
+const WRITE = /^\s*\.\s*(?:create|createMany|update|updateMany|upsert|delete|deleteMany)\b/
+const NAMES = '(?:bomItem|bomItems|bom|manufacturingBom|bomAsParent|bomAsComponent)'
+const READ_FORMS: Array<{ name: string; regex: RegExp; skip?: (after: string) => boolean }> = [
+  { name: 'delegate', regex: new RegExp(`\\.\\s*${NAMES}\\b(?!\\s*:)`, 'g'), skip: (after) => WRITE.test(after) },
+  { name: 'key', regex: new RegExp(`\\b(?:bomItem|bomItems|manufacturingBom|bomAsParent|bomAsComponent)\\s*:\\s*[{A-Za-z_]|\\bbom\\s*:\\s*(?:\\{|true\\b)`, 'g') },
+  { name: 'sql', regex: /\b(?:FROM|JOIN)\s+(?:\w+\.)?"?(?:boms|bom_items)"?\b|,\s*(?:\w+\.)?"?(?:boms|bom_items)"?\s+(?:AS\s+)?\w+\b/gi },
+]
+
+/** Number of reads of the Bom tables in `text` (comments already stripped). */
+function countReads(text: string): number {
+  let count = 0
+  for (const form of READ_FORMS) {
+    for (const match of text.matchAll(form.regex)) {
+      if (form.skip?.(text.slice(match.index! + match[0].length))) continue
+      count += 1
+    }
+  }
+  return count
+}
 
 function walk(dir: string, out: string[] = []): string[] {
   for (const name of readdirSync(dir)) {
@@ -51,7 +77,7 @@ for (const dir of ['app', 'lib', 'scripts', 'components']) {
 }
 const readers = new Map<string, number>()
 for (const [rel, text] of sources) {
-  const count = [...text.matchAll(READ)].length
+  const count = countReads(text)
   if (count > 0) readers.set(rel, count)
 }
 
@@ -60,7 +86,7 @@ type Scoped = { reads: number; present: RegExp[]; absent: RegExp[]; why: string 
 /** PLANNING readers: scoped to the claimed recipe. `reads` pins how many reads the file has. */
 const PLANNING: Record<string, Scoped> = {
   'lib/domain/inventory/replenishment-reports.ts': {
-    reads: 7,
+    reads: 8,
     present: [/CLAIMED_BOM_WHERE/, /claimedBomItems\(/, /manufacturingBom:\s*\{/, /componentSnapshot/],
     absent: [/\bbom:\s*\{\s*active:\s*true\s*\}/, /order\.bom\b/],
     why: 'component-demand expansion reads the claimed recipe (claimedBomItems over a claimed-Bom filter); the shortage report plans a started order from its snapshot and any other order from the product\'s claimed Bom (manufacturingBom)',
@@ -153,8 +179,50 @@ test('HISTORY readers read the order\'s frozen recipe, never the live Bom', () =
   }
 })
 
-test('the census detector sees a new unscoped planning read (it is not vacuous)', () => {
-  const sample = code('const rows = await client.bomItem.findMany({ where: { bom: { active: true } } })')
-  assert.ok([...sample.matchAll(READ)].length >= 2, 'a delegate read and a relation filter are both detected')
-  assert.equal([...code('// client.bomItem.findMany() in a comment\nconst x = 1').matchAll(READ)].length, 0)
+/** Files that read the tables and are in none of the lists. */
+function unclassifiedIn(files: Map<string, string>, classified: Set<string>): string[] {
+  return [...files].filter(([rel, text]) => !classified.has(rel) && countReads(text) > 0).map(([rel]) => rel)
+}
+
+test('NEGATIVE: every read form fails the census when it appears in an unlisted file', () => {
+  const forms: Record<string, string> = {
+    'delegate findMany': 'await client.bomItem.findMany({ where: {} })',
+    'delegate findFirst on bom': 'await tx.bom.findFirst({})',
+    'delegate count': 'await db.bomItem.count()',
+    'delegate aggregate': 'await db.bomItem.aggregate({ _sum: { qty: true } })',
+    'delegate alias': 'const items = db.bomItem; await items.findMany()',
+    'delegate via property chain': 'for (const item of order.bom.items) use(item)',
+    'relation property access': 'const r = product.manufacturingBom?.items',
+    'include boolean': 'await db.product.findMany({ include: { bom: true } })',
+    'select boolean': 'await db.productionOrder.findMany({ select: { bom: true } })',
+    'relation boolean': 'await db.product.findMany({ select: { manufacturingBom: true } })',
+    'relation object': 'await db.product.findMany({ select: { manufacturingBom: { select: { id: true } } } })',
+    'relation as variable': 'await db.product.findMany({ select: { manufacturingBom: BOM_SELECT } })',
+    'bomAsParent boolean': 'await db.product.findMany({ include: { bomAsParent: true } })',
+    'where on relation': 'await db.productionOrder.count({ where: { bom: { active: true } } })',
+    'client type': 'type C = { bomItem: FindManyDelegate }',
+    'sql from': 'await db.$queryRaw`SELECT * FROM bom_items`',
+    'sql from quoted': 'await db.$queryRaw`SELECT id FROM "boms" WHERE active`',
+    'sql join': 'await db.$queryRaw`SELECT 1 FROM products p JOIN bom_items i ON i."parentProductId" = p.id`',
+    'sql comma join': 'await db.$queryRaw`SELECT 1 FROM products p, boms b WHERE b."productId" = p.id`',
+    'sql lowercase': 'await db.$queryRawUnsafe("select * from boms")',
+  }
+  for (const [name, sample] of Object.entries(forms)) {
+    const files = new Map([['lib/new-unlisted-reader.ts', code(sample)]])
+    assert.deepEqual(unclassifiedIn(files, new Set()), ['lib/new-unlisted-reader.ts'], `form "${name}" must be detected`)
+    assert.deepEqual(unclassifiedIn(files, new Set(['lib/new-unlisted-reader.ts'])), [], `and accepted once classified: "${name}"`)
+  }
+})
+
+test('NEGATIVE: writes, comments and unrelated words are not reads (the detector is not trigger-happy)', () => {
+  const quiet = [
+    'await db.bomItem.deleteMany({})',
+    'await tx.bom.create({ data: {} })',
+    'await tx.bomItem.createMany({ data: [] })',
+    '// client.bomItem.findMany() in a comment\nconst x = 1',
+    '/* FROM bom_items */ const y = 2',
+    'const tableClass = { bom_items: { kind: 1 } }',
+    'const bomIds = splitIds(rows)',
+  ]
+  for (const sample of quiet) assert.equal(countReads(code(sample)), 0, sample)
 })
