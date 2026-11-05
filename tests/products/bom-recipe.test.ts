@@ -934,14 +934,14 @@ test('[o3d-zjsb5.9 r6] every BomItem cycle walk uses the ONE shared graph defini
   // nobody reads any more.
   const reader = await readFile(path.join(process.cwd(), 'lib/domain/inventory/replenishment-reports.ts'), 'utf8')
   assert.match(
-    reader, /where: \{ bom: \{ active: true \}, parentProduct: \{ type: ProductType\.BOM \} \}/,
+    reader, /where: \{ bom: \{ active: true, \.\.\.CLAIMED_BOM_WHERE \}, parentProduct: \{ type: ProductType\.BOM \} \}/,
     'the planning explosion must still filter on active + BOM-typed parent; if it changed, '
     + 'PLANNING_REACHABLE_BOM_EDGES must change with it',
   )
   assert.deepEqual(
     PLANNING_REACHABLE_BOM_EDGES,
     { bom: { active: true }, parentProduct: { type: 'BOM' } },
-    'and the shared definition must be exactly that graph',
+    'and the shared definition must be exactly that graph (the wider superset of the claimed-recipe planning read)',
   )
 })
 
