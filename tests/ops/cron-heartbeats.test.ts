@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { accessSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
@@ -8,6 +8,8 @@ import { test } from 'node:test'
 import { buildOtiCrontabBlock, parseOtiCrontabStatus, spliceOtiBlock, type CrontabJobDef } from '../../lib/crontab-sync.ts'
 import {
   HEARTBEAT_SLUG_MAX,
+  HEARTBEAT_WRAPPER_PATH,
+  heartbeatWrapperProblem,
   heartbeatCheckSlug,
   resolveHeartbeatsFromEnv,
   unwrapJobLine,
@@ -193,4 +195,22 @@ test('a wrapped job refused for want of a secret reports FAILURE to the wrapper;
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('the wrapper guard: off needs nothing; on refuses a missing or non-executable wrapper and names the path the lines use', () => {
+  const calls: [string, number][] = []
+  assert.equal(heartbeatWrapperProblem(null, () => { throw new Error('must not be asked') }), null)
+  assert.equal(heartbeatWrapperProblem(STAGE, (file, mode) => { calls.push([file, mode]) }), null, 'present and executable: as today')
+  assert.deepEqual(calls, [[HEARTBEAT_WRAPPER_PATH, 1]], 'X_OK on the exact path the wrapped lines start with')
+  const expected = `heartbeats enabled but ${HEARTBEAT_WRAPPER_PATH} is missing or not executable; crontab NOT replaced`
+  assert.equal(heartbeatWrapperProblem(STAGE, () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }) }), expected)
+  assert.equal(heartbeatWrapperProblem(STAGE, () => { throw Object.assign(new Error('x'), { code: 'EACCES' }) }), expected)
+  const dir = mkdtempSync(path.join(tmpdir(), 'hbw-'))
+  try {
+    writeFileSync(path.join(dir, 'w'), '#!/bin/sh\n', { mode: 0o644 })
+    assert.ok(heartbeatWrapperProblem(STAGE, (_f, mode) => accessSync(path.join(dir, 'w'), mode)) !== null || process.getuid?.() === 0, 'a non-executable file is refused (root bypasses the mode bits)')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+  assert.match(readFileSync(new URL('../../lib/crontab-reconcile.ts', import.meta.url), 'utf8'), /heartbeatWrapperProblem\(heartbeats\)[\s\S]*?const read = await readOwnCrontabResult\(\)/, 'the guard runs before the crontab is read or written')
 })

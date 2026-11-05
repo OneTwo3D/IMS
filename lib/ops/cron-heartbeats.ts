@@ -17,6 +17,8 @@
  * Pure, and imports nothing from lib/crontab-sync.ts (which imports this).
  */
 
+import { accessSync, constants } from 'node:fs'
+
 import { SCHEDULER_CRONTAB_FILE_ENV, SCHEDULER_CRONTAB_FORMAT_ENV } from './scheduler-crontab-env'
 
 export const HEARTBEAT_WRAPPER_PATH = '/usr/local/bin/o3d-hc'
@@ -103,4 +105,21 @@ export type HeartbeatCheck = { slug: string; schedule: string; tz: string; job: 
  */
 export function heartbeatChecksFor(entries: readonly { jobSlug: string; schedule: string }[], options: HeartbeatOptions, tz: string): HeartbeatCheck[] {
   return entries.map((entry) => ({ slug: heartbeatCheckSlug(options.slugPrefix, entry.jobSlug), schedule: entry.schedule, tz, job: entry.jobSlug }))
+}
+
+/**
+ * The reason a heartbeat-wrapped crontab must NOT be written, or null. Every wrapped line starts with the wrapper, so with the wrapper
+ * missing or not executable every managed job would stop while the crontab still reads as scheduled. `access` is injectable for tests.
+ */
+export function heartbeatWrapperProblem(
+  heartbeats: HeartbeatOptions | null,
+  access: (file: string, mode: number) => void = accessSync,
+): string | null {
+  if (!heartbeats) return null
+  try {
+    access(HEARTBEAT_WRAPPER_PATH, constants.X_OK)
+    return null
+  } catch {
+    return `heartbeats enabled but ${HEARTBEAT_WRAPPER_PATH} is missing or not executable; crontab NOT replaced`
+  }
 }
