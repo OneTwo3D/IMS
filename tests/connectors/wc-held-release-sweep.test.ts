@@ -37,7 +37,7 @@ const state = {
   queued: [] as { referenceId: string; idempotencyKey: string; payload: Record<string, unknown> }[],
   /** The connector being off: queueAccountingSync returns silently and writes nothing. */
   enqueueNoOps: false,
-  /** The producer-side hold shadowed the posting: nothing is queued, and the facade says queued:true reason 'shadowed'. */
+  /** The producer-side hold shadowed the posting: nothing is queued, and the facade says queued:false reason 'shadowed'. */
   enqueueShadows: false,
   // o3d-j625 r5: the facade's own refusal — it records the row (specific reason, both connectors) and says so.
   enqueueRefusesAndRecords: false,
@@ -172,7 +172,7 @@ mock.module('@/lib/accounting', {
       // Returns void and returns EARLY — silently — when the connector is off. That is the state
       // the whole sweep exists for.
       if (state.enqueueNoOps) return
-      if (state.enqueueShadows) return { queued: true, reason: 'shadowed', connector: 'xero' }
+      if (state.enqueueShadows) return { queued: false, reason: 'shadowed', connector: 'xero' }
       if (state.enqueueRefusesAndRecords) {
         const posting = { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: params.referenceId, scope: '' }
         const existing = state.refusals.find((r) => r.referenceId === params.referenceId && r.resolvedAt === null)

@@ -131,7 +131,7 @@ test('DIFFERENTIAL through the in-transaction enqueue: OFF queues a PENDING row 
     assert.ok(a.events >= 1, 'PRECONDITION: the queued row was mirrored to an accounting event')
 
     // THE P0/P1 POSTURE: nothing is queued, nothing is mirrored, one shadow is recorded.
-    assert.equal(ungranted.queued, true)
+    assert.equal(ungranted.queued, false, 'a shadow is NOT a queued posting: it is its own state, so no caller can read it as one')
     assert.equal(ungranted.reason, 'shadowed')
     assert.deepEqual(b.rows.map((r) => [r.status, r.settlementBasis, r.abandonedBeforeRemoteCall, r.externalTransactionId]), [['CANCELLED', 'HELD_SHADOW', true, null]])
     assert.match(String(b.rows[0]!.errorMessage), /^Not sent by IMS: writes to Xero are held on this installation/)
@@ -198,7 +198,7 @@ test('the FACADE (queueAccountingSync -> the Xero queue) obeys the seam too: OFF
     assert.equal(off.queued, true)
     assert.deepEqual(a.rows.map((r) => r.status), ['PENDING'])
     assert.equal(a.outbox.length, 1, 'PRECONDITION: the OFF run produced an outbox job')
-    assert.equal(on.queued, true)
+    assert.equal(on.queued, false, 'a shadow is NOT a queued posting')
     assert.equal(on.reason, 'shadowed')
     assert.deepEqual(b.rows.map((r) => [r.status, r.settlementBasis]), [['CANCELLED', 'HELD_SHADOW']])
     assert.equal(b.outbox.length, 0)
@@ -271,4 +271,31 @@ test('the migration made what the code assumes: nothing but a record (no foreign
   assert.equal(fks[0]!.n, 0)
   assert.equal(triggers[0]!.n, 0)
   assert.ok(unique.some((u) => u.indexname === 'outbound_shadow_writes_work_key'))
+})
+
+test('THE BOOLEAN ENQUEUE (what every `if (queued)` subledger guard reads): a shadow answers FALSE and reports the third state; a live queue answers TRUE', { skip }, async (t) => {
+  const d = await deps()
+  const { postingIsOwed } = await import('../../lib/domain/accounting/enqueue-outcome.ts')
+  const ids = { shadow: `PSEAM-bool-s-${randomUUID()}`, live: `PSEAM-bool-l-${randomUUID()}` }
+  t.after(() => cleanup(d.db, Object.values(ids)))
+  type Reported = { queued: boolean; reason?: 'shadowed' | 'refused' | 'not-configured' | 'already-queued' | 'handled-by-hand' | 'hand-post-deferred' }
+  const run = async (referenceId: string) => {
+    const holder: { reported?: Reported; boolean?: boolean } = {}
+    await d.db.$transaction(async (tx: Tx) => {
+      holder.boolean = await d.accounting.queueAccountingSyncTx(tx, {
+        type: 'UNEARNED_REV_REVERSAL', connector: 'xero', referenceType: 'CogsEntry', referenceId, payload: payload(referenceId), chartConnector: 'xero',
+        reportOutcome: (outcome: Reported) => { holder.reported = outcome },
+      })
+    }, { timeout: 60_000, maxWait: 30_000 })
+    return { boolean: holder.boolean, reported: holder.reported! }
+  }
+  await withSettings(d.db, async () => {
+    const shadow = await withEnv({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' }, () => run(ids.shadow))
+    const live = await withEnv(LIVE_ENV, () => run(ids.live))
+    console.log(`# boolean enqueue: shadow=${JSON.stringify(shadow)} live=${JSON.stringify(live)}`)
+    assert.equal(live.boolean, true, 'PRECONDITION: a real queue answers true, so the shadow arm is not vacuous')
+    assert.equal(shadow.boolean, false, 'THE FINDING: a shadow answered true, and every guard that writes a subledger row on `queued` wrote one for a journal that was never queued')
+    assert.deepEqual([shadow.reported.queued, shadow.reported.reason], [false, 'shadowed'])
+    assert.equal(postingIsOwed(shadow.reported), false, 'and it owes nothing: no rollback, no refusal row')
+  })
 })

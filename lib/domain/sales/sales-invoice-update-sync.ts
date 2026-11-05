@@ -247,6 +247,28 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
     // used to mean here, and it stays silent for the same reason: nothing will ever post, nothing is owed.
     return
   }
+  if (enqueued.reason === 'shadowed') {
+    // THE PRODUCER-SIDE HOLD RECORDED THE UPDATE AS A SHADOW: nothing is queued (so this must not log
+    // "Queued sales invoice update") and nothing is owed (so it is not a refusal debt either).
+    await deps.logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: params.salesOrderId,
+      action: 'sales_invoice_update_shadowed',
+      tag: 'accounting',
+      level: 'INFO',
+      description: `Sales invoice update for ${params.orderNumber} against accounting invoice ${params.accountingInvoiceId} was NOT queued: `
+        + 'the producer-side hold recorded it as a shadow, so IMS did not send it and does not owe it in this phase',
+      metadata: {
+        accountingInvoiceId: params.accountingInvoiceId,
+        orderNumber: params.orderNumber,
+        idempotencyKey: params.idempotencyKey,
+        alreadyQueued: false,
+        handledByHand: false,
+        shadowed: true,
+      },
+    })
+    return
+  }
   if (!enqueued.queued) {
     /**
      * o3d-j625 r18 (Codex round 17, HIGH 1) — AND ONE OF THE WAYS IT CAN DECLINE IS NOT A REFUSAL AT ALL.
