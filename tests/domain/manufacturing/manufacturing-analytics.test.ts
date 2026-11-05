@@ -60,6 +60,16 @@ function frozenOrder(overrides: Record<string, unknown> = {}) {
   return assemblyOrder({ componentSnapshot: FROZEN_SNAPSHOT, ...overrides })
 }
 
+/** A started order for the WIP tests: its frozen snapshot mirrors the recipe given on the row unless one is supplied. */
+function wipOrder(overrides: Record<string, unknown> = {}) {
+  const order = assemblyOrder(overrides)
+  if (overrides.componentSnapshot === undefined) {
+    const recipe = (order.outputProduct as { productComponents?: Array<{ componentId: string; qty: unknown }> }).productComponents ?? []
+    order.componentSnapshot = recipe.map((c) => ({ componentId: c.componentId, qty: Number(c.qty) }))
+  }
+  return order
+}
+
 function assemblyOrder(overrides: Record<string, unknown> = {}) {
   return {
     id: 'po-1',
@@ -185,7 +195,7 @@ test('WIP value includes consumed component value and ManufacturingCostLine tota
     {
       client: manufacturingClient({
         orders: [
-          assemblyOrder({
+          wipOrder({
             id: 'po-wip',
             reference: 'MO-WIP',
             status: 'IN_PROGRESS',
@@ -227,7 +237,7 @@ test('WIP value includes consumed component value and ManufacturingCostLine tota
       warehouseId: true,
       outputProductId: true,
       componentSnapshot: true,
-      outputProduct: { select: { sku: true, name: true, productComponents: { select: { componentId: true, qty: true } } } },
+      outputProduct: { select: { sku: true, name: true } },
       warehouse: { select: { code: true, name: true } },
       manufacturingCostLines: { select: { amountBase: true } },
     },
@@ -251,7 +261,7 @@ test('WIP values reserved not-yet-consumed components at weighted-average curren
     {
       client: manufacturingClient({
         orders: [
-          assemblyOrder({
+          wipOrder({
             id: 'po-wip',
             reference: 'MO-WIP',
             status: 'IN_PROGRESS',
@@ -306,7 +316,7 @@ test('WIP reservation walks layers FIFO, not weighted-average (scjz.31)', async 
     {
       client: manufacturingClient({
         orders: [
-          assemblyOrder({
+          wipOrder({
             id: 'po-fifo',
             status: 'IN_PROGRESS',
             qtyPlanned: '1',
@@ -339,7 +349,7 @@ test('WIP reservation uses the frozen componentSnapshot over the live BOM (scjz.
     {
       client: manufacturingClient({
         orders: [
-          assemblyOrder({
+          wipOrder({
             id: 'po-snap',
             status: 'IN_PROGRESS',
             qtyPlanned: '2',
@@ -373,7 +383,7 @@ test('WIP values an in-progress disassembly from the output product, not its BOM
     {
       client: manufacturingClient({
         orders: [
-          assemblyOrder({
+          wipOrder({
             id: 'po-disasm',
             orderType: 'DISASSEMBLY',
             status: 'IN_PROGRESS',
@@ -409,7 +419,7 @@ test('WIP depletes shared FIFO layers across in-progress orders (scjz.31)', asyn
       client: manufacturingClient({
         // Two orders, each reserving 10 of component-a in wh-main, started in order.
         orders: [
-          assemblyOrder({
+          wipOrder({
             id: 'po-early',
             reference: 'MO-EARLY',
             status: 'IN_PROGRESS',
@@ -419,7 +429,7 @@ test('WIP depletes shared FIFO layers across in-progress orders (scjz.31)', asyn
             manufacturingCostLines: [],
             outputProduct: { sku: 'FG-1', name: 'Finished good', productComponents: [{ componentId: 'component-a', qty: '1' }] },
           }),
-          assemblyOrder({
+          wipOrder({
             id: 'po-late',
             reference: 'MO-LATE',
             status: 'IN_PROGRESS',
@@ -503,7 +513,7 @@ test('WIP report remains current-state and ignores date filters', async () => {
     {
       client: manufacturingClient({
         orders: [
-          assemblyOrder({
+          wipOrder({
             id: 'po-long-running',
             reference: 'MO-LONG',
             status: 'IN_PROGRESS',
@@ -531,7 +541,7 @@ test('WIP days since start uses decimal days for intraday work', async () => {
     {
       client: manufacturingClient({
         orders: [
-          assemblyOrder({
+          wipOrder({
             id: 'po-fast',
             reference: 'MO-FAST',
             status: 'IN_PROGRESS',
@@ -607,7 +617,7 @@ test('WIP cost-layer scan is bounded by the source-row cap', async () => {
       {
         client: manufacturingClient({
           orders: [
-            assemblyOrder({
+            wipOrder({
               id: 'po-wip',
               status: 'IN_PROGRESS',
               qtyPlanned: '1',
@@ -704,4 +714,36 @@ test('production variance has no no-frozen-recipe notice when every order is fro
   })
   assert.equal(report.rows.length, 0)
   assert.equal(report.notices.some((n) => /no frozen recipe/.test(n)), false)
+})
+
+test('WIP does not value a reservation from the live recipe when the snapshot is NULL or malformed, and names the order', async () => {
+  for (const componentSnapshot of [null, 'garbage', [{ componentId: 'component-a', qty: -1 }]]) {
+    const report = await getWipReport({}, {}, {
+      client: manufacturingClient({
+        orders: [assemblyOrder({
+          id: 'po-wip', reference: 'MO-NOSNAP', status: 'IN_PROGRESS', qtyPlanned: '10', qtyProduced: '0',
+          startedAt: new Date('2026-05-29T00:00:00Z'), componentSnapshot, manufacturingCostLines: [],
+          outputProduct: { sku: 'FG-1', name: 'Finished good', productComponents: [{ componentId: 'component-a', qty: '5' }] },
+        })],
+        movements: [],
+        costLayers: [{ productId: 'component-a', warehouseId: 'wh-main', remainingQty: '100', unitCostBase: '2' }],
+      }),
+      now: () => new Date('2026-06-03T00:00:00Z'),
+    })
+    assert.equal(report.rows[0].reservedComponentValueBase, '0', `snapshot ${JSON.stringify(componentSnapshot)} must not be valued from the live recipe (5 x 10 x 2)`)
+    const notice = report.notices.find((n) => /no usable frozen recipe/.test(n))
+    assert.ok(notice && notice.includes('MO-NOSNAP'))
+  }
+})
+
+test('WIP treats an empty snapshot as a real zero-component recipe (no reservation, no notice)', async () => {
+  const report = await getWipReport({}, {}, {
+    client: manufacturingClient({
+      orders: [assemblyOrder({ id: 'po-wip', status: 'IN_PROGRESS', qtyPlanned: '10', qtyProduced: '0', componentSnapshot: [], manufacturingCostLines: [] })],
+      movements: [],
+    }),
+    now: () => new Date('2026-06-03T00:00:00Z'),
+  })
+  assert.equal(report.rows[0].reservedComponentValueBase, '0')
+  assert.equal(report.notices.some((n) => /no usable frozen recipe/.test(n)), false)
 })

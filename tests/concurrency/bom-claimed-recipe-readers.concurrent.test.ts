@@ -45,13 +45,14 @@ config({ path: '.env.local', quiet: true })
 config({ quiet: true })
 
 async function loadDeps() {
-  const [dbMod, importMod, mfgMod, fcMod, analyticsMod, replMod] = await Promise.all([
+  const [dbMod, importMod, mfgMod, fcMod, analyticsMod, replMod, resMod] = await Promise.all([
     import('../../lib/db/index'),
     import('../../app/actions/import'),
     import('../../app/actions/manufacturing'),
     import('../../app/actions/forecasting'),
     import('../../lib/domain/manufacturing/manufacturing-analytics'),
     import('../../lib/domain/inventory/replenishment-reports'),
+    import('../../lib/domain/inventory/reservation-breakdown'),
   ])
   return {
     db: dbMod.db,
@@ -63,6 +64,8 @@ async function loadDeps() {
     getProductionVarianceReport: analyticsMod.getProductionVarianceReport,
     getReorderReport: replMod.getReorderReport,
     getComponentShortageReport: replMod.getComponentShortageReport,
+    getWipReport: analyticsMod.getWipReport,
+    loadReservationSourceRows: resMod.loadReservationSourceRows,
   }
 }
 type Deps = Awaited<ReturnType<typeof loadDeps>>
@@ -327,5 +330,51 @@ test(
     assert.equal(afterLoss.rows.find((row) => row.productId === rawId)?.requiredQty, '30', 'only the DRAFT (claimed recipe) remains')
     const startedRef = (await deps.db.productionOrder.findUniqueOrThrow({ where: { id: started.id }, select: { reference: true } })).reference
     assert.ok(afterLoss.notices.some((n) => /no usable frozen recipe/.test(n) && n.includes(startedRef)))
+  },
+)
+
+test(
+  'a DRAFT order whose only Bom is an unclaimed legacy row is named by the shortage report, not counted as covered',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'D'
+    const { tableId, claimedBomId } = await seedCatalogue(deps, NS)
+    const warehouse = await ownWarehouse(deps, NS)
+    await deps.db.$executeRaw`UPDATE boms SET "productId" = NULL WHERE id = ${claimedBomId}`
+    const draft = await deps.db.productionOrder.create({
+      data: { reference: `${TAG}${NS}-DRAFT`, orderType: 'ASSEMBLY', bomId: claimedBomId, outputProductId: tableId, warehouseId: warehouse.id, qtyPlanned: 10, status: 'DRAFT' },
+    })
+    const report = await deps.getComponentShortageReport({}, { paginate: false })
+    assert.ok(report.notices.some((n) => /no claimed recipe/.test(n) && n.includes(draft.reference)), 'the draft must be named')
+  },
+)
+
+test(
+  'reservation attribution and WIP use the snapshot of a started order across a recipe re-import, and name an order without one',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'W'
+    const { tableId, rawId } = await seedCatalogue(deps, NS)
+    const warehouse = await ownWarehouse(deps, NS)
+    await stockUp(deps, NS, warehouse.code, 100)
+    const started = await deps.createManufacturingOrder({ productId: tableId, warehouseId: warehouse.id, orderType: 'ASSEMBLY', qtyPlanned: 4 })
+    assert.ok(started.success && started.id)
+    assert.ok((await deps.updateManufacturingOrderStatus(started.id, 'IN_PROGRESS')).success)
+    const reservedFor = async (named?: string[]) => (await deps.loadReservationSourceRows(deps.db as never, { productId: rawId, warehouseId: warehouse.id, unfrozenOrderReferences: named }))
+      .filter((row) => row.referenceId === started.id).map((row) => row.qty)
+
+    assert.deepEqual(await reservedFor(), ['8'], 'RAW x2 per unit x 4')
+    await reimportRecipe(deps, NS, 1, 3)
+    assert.deepEqual(await reservedFor(), ['8'], 'a recipe edit after the start must not move the attribution (live would be 12)')
+
+    await deps.db.$executeRaw`UPDATE production_orders SET "componentSnapshot" = NULL WHERE id = ${started.id}`
+    const named: string[] = []
+    assert.deepEqual(await reservedFor(named), [], 'no snapshot: not attributed from the live recipe')
+    const ref = (await deps.db.productionOrder.findUniqueOrThrow({ where: { id: started.id }, select: { reference: true } })).reference
+    assert.deepEqual(named, [ref])
+    const wip = await deps.getWipReport({}, { paginate: false })
+    assert.ok(wip.notices.some((n) => /no usable frozen recipe/.test(n) && n.includes(ref)), 'WIP names the order')
   },
 )

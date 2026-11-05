@@ -29,6 +29,7 @@ const ROOT = process.cwd()
  *              (`.findMany`, `.count`, a destructured alias, `order.bom.items`, `product.manufacturingBom`)
  *   key        a relation or delegate named as a property: `{ bom: { ... } }`, `{ bom: true }`,
  *              `{ manufacturingBom: SELECT }`, `bomItem: FindManyDelegate`
+ *   destructure `const { bomItem } = db`, `const { bom: items } = tx`
  *   sql        raw SQL on the tables: FROM / JOIN / comma-join
  */
 const WRITE = /^\s*\.\s*(?:create|createMany|update|updateMany|upsert|delete|deleteMany)\b/
@@ -36,6 +37,7 @@ const NAMES = '(?:bomItem|bomItems|bom|manufacturingBom|bomAsParent|bomAsCompone
 const READ_FORMS: Array<{ name: string; regex: RegExp; skip?: (after: string) => boolean }> = [
   { name: 'delegate', regex: new RegExp(`\\.\\s*${NAMES}\\b(?!\\s*:)`, 'g'), skip: (after) => WRITE.test(after) },
   { name: 'key', regex: new RegExp(`\\b(?:bomItem|bomItems|manufacturingBom|bomAsParent|bomAsComponent)\\s*:\\s*[{A-Za-z_]|\\bbom\\s*:\\s*(?:\\{|true\\b)`, 'g') },
+  { name: 'destructure', regex: new RegExp(`\\{[^{}=]*\\b${NAMES}\\b[^{}=]*\\}\\s*=(?!=)`, 'g') },
   { name: 'sql', regex: /\b(?:FROM|JOIN)\s+(?:\w+\.)?"?(?:boms|bom_items)"?\b|,\s*(?:\w+\.)?"?(?:boms|bom_items)"?\s+(?:AS\s+)?\w+\b/gi },
 ]
 
@@ -140,6 +142,50 @@ test('every file that reads boms / bom_items is classified (a new reader fails u
   )
 })
 
+/**
+ * STARTED-ORDER readers read ProductComponent or the order's snapshot, not Bom, so the Bom census cannot see
+ * them. Each must take its recipe from the order's frozen componentSnapshot and must not read the live recipe
+ * (`productComponents`). A started order is attributed, planned or valued from what it was started with.
+ */
+const STARTED_ORDER_READERS: Record<string, { present: RegExp[]; absent: RegExp[]; why: string }> = {
+  'lib/domain/inventory/reservation-breakdown.ts': {
+    present: [/componentSnapshot:\s*true/, /parseProductionOrderComponentSnapshot\(/, /unfrozenOrderReferences/],
+    absent: [/productComponents/],
+    why: 'a reservation is attributed from the snapshot; null or malformed is named and not attributed',
+  },
+  'lib/domain/manufacturing/manufacturing-analytics.ts': {
+    present: [/componentSnapshot/, /parseProductionOrderComponentSnapshot\(/, /unfrozenWipReferences/],
+    absent: [/productComponents/],
+    why: 'WIP values the not-yet-consumed reservation from the snapshot; null or malformed is named and not valued',
+  },
+  'lib/domain/inventory/replenishment-reports.ts': {
+    present: [/componentSnapshot/, /unfrozenReferences/, /noClaimedRecipeReferences/],
+    absent: [/order\.outputProduct\.productComponents/],
+    why: 'the shortage report plans a started order from its snapshot and names unfrozen and unclaimed orders',
+  },
+}
+
+function startedOrderViolations(text: string, rule: { present: RegExp[]; absent: RegExp[] }): string[] {
+  return [
+    ...rule.present.filter((pattern) => !pattern.test(text)).map((pattern) => `missing ${pattern}`),
+    ...rule.absent.filter((pattern) => pattern.test(text)).map((pattern) => `contains ${pattern}`),
+  ]
+}
+
+test('STARTED-ORDER readers take their recipe from the frozen snapshot, never the live recipe', () => {
+  for (const [file, rule] of Object.entries(STARTED_ORDER_READERS)) {
+    assert.ok(sources.has(file), `${file} no longer exists; remove it from the census`)
+    assert.deepEqual(startedOrderViolations(sources.get(file)!, rule), [], `${file}: ${rule.why}`)
+  }
+})
+
+test('NEGATIVE: the started-order check fails on a live-recipe read and on a missing snapshot read', () => {
+  const rule = STARTED_ORDER_READERS['lib/domain/inventory/reservation-breakdown.ts']
+  const live = code('select: { outputProduct: { select: { productComponents: { select: { componentId: true } } } } }')
+  assert.ok(startedOrderViolations(live, rule).some((v) => v.startsWith('contains')))
+  assert.ok(startedOrderViolations(live, rule).some((v) => v.startsWith('missing')))
+})
+
 test('the census has no stale entries (every listed reader still reads, every file exists)', () => {
   for (const file of [...Object.keys(PLANNING), ...Object.keys(DELIBERATE_ALL)]) {
     assert.ok(sources.has(file), `${file} no longer exists; remove it from the census`)
@@ -201,6 +247,9 @@ test('NEGATIVE: every read form fails the census when it appears in an unlisted 
     'bomAsParent boolean': 'await db.product.findMany({ include: { bomAsParent: true } })',
     'where on relation': 'await db.productionOrder.count({ where: { bom: { active: true } } })',
     'client type': 'type C = { bomItem: FindManyDelegate }',
+    'destructured delegate': 'const { bomItem } = db; await bomItem.findMany()',
+    'destructured delegate, renamed': 'const { bomItem: items, bom } = tx; await items.count()',
+    'destructured relation': 'const { manufacturingBom } = product',
     'sql from': 'await db.$queryRaw`SELECT * FROM bom_items`',
     'sql from quoted': 'await db.$queryRaw`SELECT id FROM "boms" WHERE active`',
     'sql join': 'await db.$queryRaw`SELECT 1 FROM products p JOIN bom_items i ON i."parentProductId" = p.id`',

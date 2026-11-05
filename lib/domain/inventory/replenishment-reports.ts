@@ -1393,20 +1393,22 @@ type ShortageRequirementLine = { componentProductId: string; qty: DecimalInput; 
 function shortageRequirementLines(
   order: ProductionOrderRow,
   snapshotComponents: Map<string, ShortageComponent>,
-): { lines: ShortageRequirementLine[]; unfrozen: boolean } {
+): { lines: ShortageRequirementLine[]; unfrozen: boolean; noClaimedRecipe: boolean } {
   if (order.status === 'DRAFT') {
-    const claimed = order.outputProduct.manufacturingBom?.items ?? []
-    return { lines: claimed.filter((item) => item.parentProductId === order.outputProductId), unfrozen: false }
+    // A DRAFT order whose product has no claimed recipe (its only Bom may be an unclaimed legacy row)
+    // has nothing to plan from. That is NOT "no shortage": it is named, not silently counted as covered.
+    const claimed = (order.outputProduct.manufacturingBom?.items ?? []).filter((item) => item.parentProductId === order.outputProductId)
+    return { lines: claimed, unfrozen: false, noClaimedRecipe: claimed.length === 0 }
   }
-  if (Array.isArray(order.componentSnapshot) && order.componentSnapshot.length === 0) return { lines: [], unfrozen: false }
+  if (Array.isArray(order.componentSnapshot) && order.componentSnapshot.length === 0) return { lines: [], unfrozen: false, noClaimedRecipe: false }
   const snapshot = parseProductionOrderComponentSnapshot(order.componentSnapshot)
-  if (!snapshot) return { lines: [], unfrozen: true }
+  if (!snapshot) return { lines: [], unfrozen: true, noClaimedRecipe: false }
   const lines: ShortageRequirementLine[] = []
   for (const entry of snapshot) {
     const component = snapshotComponents.get(entry.componentId)
     if (component) lines.push({ componentProductId: entry.componentId, qty: entry.qty, component })
   }
-  return { lines, unfrozen: false }
+  return { lines, unfrozen: false, noClaimedRecipe: false }
 }
 
 export async function getComponentShortageReport(
@@ -1480,12 +1482,17 @@ export async function getComponentShortageReport(
   const inboundByStock = inboundOpenPoByStock(openPoLines)
   const requirements = new Map<string, ComponentShortageReportRow & { orderIds: Set<string>; outputSet: Set<string> }>()
   const unfrozenReferences: string[] = []
+  const noClaimedRecipeReferences: string[] = []
   for (const order of orders) {
     const remainingOutput = Prisma.Decimal.max(new Prisma.Decimal(0), toDecimal(order.qtyPlanned).sub(toDecimal(order.qtyProduced)))
     if (remainingOutput.lte(0)) continue
     const planned = shortageRequirementLines(order, snapshotComponents)
     if (planned.unfrozen) {
       unfrozenReferences.push(order.reference)
+      continue
+    }
+    if (planned.noClaimedRecipe) {
+      noClaimedRecipeReferences.push(order.reference)
       continue
     }
     for (const item of planned.lines) {
@@ -1561,6 +1568,9 @@ export async function getComponentShortageReport(
       'Component shortages include draft and in-progress production orders and subtract current available stock plus inbound open PO quantity for the production warehouse. POs without a destination warehouse are not treated as warehouse-specific cover.',
       ...(unfrozenReferences.length > 0
         ? [`${unfrozenReferences.length} started order(s) have no usable frozen recipe (started before recipes were frozen, or the stored snapshot is unreadable) and are NOT planned, rather than planned from the live recipe: ${unfrozenReferences.slice(0, 20).join(', ')}${unfrozenReferences.length > 20 ? ', ...' : ''}.`]
+        : []),
+      ...(noClaimedRecipeReferences.length > 0
+        ? [`${noClaimedRecipeReferences.length} draft order(s) have no claimed recipe for the product they build (its only recipe may be an unclaimed legacy one) and are NOT planned, so their shortages are not shown: ${noClaimedRecipeReferences.slice(0, 20).join(', ')}${noClaimedRecipeReferences.length > 20 ? ', ...' : ''}.`]
         : []),
     ],
   }

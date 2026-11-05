@@ -1,3 +1,4 @@
+import { parseProductionOrderComponentSnapshot } from '@/lib/domain/manufacturing/component-consumption'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
@@ -31,6 +32,8 @@ export type ReservationBreakdownResult = {
   unattributedQty: string
   driftQty: string
   rows: ReservationBreakdownRow[]
+  /** Started assembly orders with no usable frozen recipe: not attributed, so part of the unattributed balance. */
+  unfrozenOrderReferences: string[]
 }
 
 type AllocationRow = {
@@ -71,12 +74,8 @@ type ProductionOrderRow = {
   warehouseId: string
   qtyPlanned: DecimalInput
   scheduledAt: Date | null
-  outputProduct: {
-    productComponents: Array<{
-      componentId: string
-      qty: DecimalInput
-    }>
-  }
+  /** The recipe frozen when the order started: the only recipe a reservation is attributed from. */
+  componentSnapshot: unknown
 }
 
 type StockLevelReservationRow = {
@@ -101,6 +100,12 @@ export type ReservationBreakdownClient = {
 export type ReservationSourceLoadOptions = {
   productId?: string
   warehouseId?: string
+  /**
+   * OUT-PARAMETER. References of started assembly orders with no usable frozen recipe (NULL, or present
+   * but malformed). They are not attributed from the live recipe, so their reservation stays in the
+   * unattributed balance; the references are pushed here so a caller can name them.
+   */
+  unfrozenOrderReferences?: string[]
 }
 
 const ZERO = new Prisma.Decimal(0)
@@ -166,17 +171,12 @@ export async function loadReservationSourceRows(
   const productionWhere = {
     status: 'IN_PROGRESS',
     ...(options.warehouseId ? { warehouseId: options.warehouseId } : {}),
+    // An ASSEMBLY order's components live in its frozen snapshot (JSON), so the component filter is
+    // applied to the parsed snapshot below, not to the live recipe.
     ...(options.productId
       ? {
           OR: [
-            {
-              orderType: 'ASSEMBLY',
-              outputProduct: {
-                productComponents: {
-                  some: { componentId: options.productId },
-                },
-              },
-            },
+            { orderType: 'ASSEMBLY' },
             {
               orderType: 'DISASSEMBLY',
               outputProductId: options.productId,
@@ -238,16 +238,7 @@ export async function loadReservationSourceRows(
         warehouseId: true,
         qtyPlanned: true,
         scheduledAt: true,
-        outputProduct: {
-          select: {
-            productComponents: {
-              select: {
-                componentId: true,
-                qty: true,
-              },
-            },
-          },
-        },
+        componentSnapshot: true,
       },
       orderBy: [{ scheduledAt: 'asc' }, { id: 'asc' }],
     }),
@@ -341,7 +332,13 @@ export async function loadReservationSourceRows(
   for (const order of productionOrders) {
     if (options.warehouseId && order.warehouseId !== options.warehouseId) continue
     if (order.orderType === 'ASSEMBLY') {
-      for (const component of order.outputProduct.productComponents) {
+      const raw = order.componentSnapshot
+      const frozen = Array.isArray(raw) && raw.length === 0 ? [] : parseProductionOrderComponentSnapshot(raw)
+      if (frozen === null) {
+        options.unfrozenOrderReferences?.push(order.reference)
+        continue
+      }
+      for (const component of frozen) {
         if (options.productId && component.componentId !== options.productId) continue
         const qty = toDecimal(order.qtyPlanned).mul(toDecimal(component.qty))
         if (qty.lte(ZERO)) continue
@@ -409,6 +406,7 @@ export async function getReservationBreakdown(params: {
   client?: ReservationBreakdownClient
 }): Promise<ReservationBreakdownResult> {
   const client = params.client ?? (db as unknown as ReservationBreakdownClient)
+  const unfrozenOrderReferences: string[] = []
   const [stockLevel, knownRows] = await Promise.all([
     client.stockLevel.findUnique({
       where: {
@@ -424,6 +422,7 @@ export async function getReservationBreakdown(params: {
     loadReservationSourceRows(client, {
       productId: params.productId,
       warehouseId: params.warehouseId,
+      unfrozenOrderReferences,
     }),
   ])
 
@@ -456,5 +455,6 @@ export async function getReservationBreakdown(params: {
     unattributedQty: decimalString(unattributedQty),
     driftQty: decimalString(unattributedQty),
     rows,
+    unfrozenOrderReferences,
   }
 }

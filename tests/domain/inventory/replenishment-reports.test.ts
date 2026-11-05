@@ -1535,3 +1535,30 @@ test('reorder report names a BOM product that needs building but has no claimed 
   const withRecipe = await getReorderReport({}, { deps: { client: claimed, now: () => new Date('2026-06-30T00:00:00.000Z') } })
   assert.equal(withRecipe.notices.some((n) => /No claimed recipe/.test(n)), false)
 })
+
+test('component shortage names a DRAFT order whose product has no claimed recipe instead of counting it as covered', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    productionOrder: {
+      findMany: async () => [shortageOrder({
+        status: 'DRAFT',
+        reference: 'MO-DRAFT-NOCLAIM',
+        outputProduct: { sku: 'BOM-1', name: 'Assembly', manufacturingBom: null },
+      })],
+    },
+  }
+  const report = await getComponentShortageReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
+  assert.equal(report.rows.length, 0)
+  const notice = report.notices.find((n) => /no claimed recipe/.test(n))
+  assert.ok(notice, 'the unplanned draft must be surfaced')
+  assert.match(notice, /MO-DRAFT-NOCLAIM/)
+})
+
+test('component shortage has no no-claimed-recipe notice when every draft has a claimed recipe', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    productionOrder: { findMany: async () => [shortageOrder({ status: 'DRAFT' })] },
+  }
+  const report = await getComponentShortageReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
+  assert.equal(report.notices.some((n) => /no claimed recipe/.test(n)), false)
+})
