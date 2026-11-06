@@ -49,11 +49,10 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
     },
   },
   ShoppingCustomerLink: {
-    erased: ['metadata'],
+    // The ROW is deleted by the erasure (it names the live storefront account); both columns are erased with it.
+    erased: ['externalCustomerId', 'metadata'],
     notPersonal: ['id', 'customerId', 'connector'],
-    retained: {
-      externalCustomerId: 'storefront account id; the re-population guard needs it to refuse re-attachment (follow-up), and it names no one outside the storefront',
-    },
+    retained: {},
   },
   ShoppingOrderLink: {
     erased: ['metadata'],

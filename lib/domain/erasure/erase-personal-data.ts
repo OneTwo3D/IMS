@@ -329,7 +329,11 @@ export async function eraseCustomerPersonalData(
       const orderIds = orders.map((o) => o.id)
       for (const id of orderIds) await lockSalesOrder(tx, id)
       const orderCounts = await eraseOrdersPersonalDataInTx(tx, orderIds, erasedAt)
-      const links = await tx.shoppingCustomerLink.updateMany({ where: { customerId }, data: { metadata: Prisma.JsonNull } })
+      // THE STOREFRONT ACCOUNT LINK IS DELETED, not blanked: its externalCustomerId is the live storefront customer id and resolves to
+      // the account, and nothing financial references the row (it has no dependants; orders keep their own order link). With it gone
+      // a later order from the same storefront account finds no link, no email on the erased row to match, and so gets a FRESH
+      // customer; the new identity belongs to a new record.
+      const links = await tx.shoppingCustomerLink.deleteMany({ where: { customerId } })
       const tokens = collectIdentityTokens({
         customer: before as unknown as Record<string, unknown> | null,
         orders: orderRows as unknown as Array<Record<string, unknown>>,

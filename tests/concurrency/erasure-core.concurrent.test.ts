@@ -107,7 +107,7 @@ function payload(externalId: number, wcRateId: number) {
   }
 }
 
-type Fixture = { orderId: string; customerId: string; externalId: number; warehouseId: string; rateId: string; refundId: string; cleanup(): Promise<void> }
+type Fixture = { wooCustomerId: number; orderId: string; customerId: string; externalId: number; warehouseId: string; rateId: string; refundId: string; cleanup(): Promise<void> }
 
 async function importFixture(db: Awaited<ReturnType<typeof loadDb>>): Promise<Fixture> {
   await mockAccounting()
@@ -142,11 +142,13 @@ async function importFixture(db: Awaited<ReturnType<typeof loadDb>>): Promise<Fi
   await before(`pre-legacy-${orderId}`, 'CUSTOMER', customerId, 'gdpr_anonymised', `GDPR anonymised customer: ${FULL_NAME} (1 orders anonymised)`, {})
   await before(`pre-order-${orderId}`, 'SALES_ORDER', orderId, 'wc_note', `Customer ${EMAIL} rang from ${PHONE}`, { contact: { email: EMAIL, tracking: TRACKING } })
   await before(`pre-marker-${orderId}`, 'SALES_ORDER', orderId, 'wc_refund_park_recovered', 'Refund park recovered', { connector: 'woocommerce', externalOrderId: String(externalId) })
-  await db.shoppingCustomerLink.updateMany({ where: { customerId }, data: { metadata: { note: FULL_NAME } } })
-  await db.customer.update({ where: { id: customerId }, data: { notes: `Prefers ${FULL_NAME}` } })
+  // The storefront account this customer belongs to: the link row (raw storefront customer id + free metadata) and the integer on the customer.
+  const wooCustomerId = 600_000_000 + Math.floor(Math.random() * 90_000_000)
+  await db.shoppingCustomerLink.create({ data: { connector: 'woocommerce', customerId, externalCustomerId: String(wooCustomerId), metadata: { note: FULL_NAME } } })
+  await db.customer.update({ where: { id: customerId }, data: { notes: `Prefers ${FULL_NAME}`, externalCustomerId: wooCustomerId } })
 
   return {
-    orderId, customerId, externalId, warehouseId: warehouse.id, rateId: rate.id, refundId: refund.id,
+    wooCustomerId, orderId, customerId, externalId, warehouseId: warehouse.id, rateId: rate.id, refundId: refund.id,
     cleanup: async () => {
       await db.emailOutbox.deleteMany({ where: { referenceId: orderId } })
       await db.notification.deleteMany({ where: { OR: [{ actionUrl: { contains: orderId } }, { actionUrl: '/sales/someone-else' }] } })
@@ -221,7 +223,9 @@ test('[erasure] the core erases every personal column, keeps the decided retenti
   const snap = await db.wmsOrderStatusSnapshot.findUniqueOrThrow({ where: { orderId: fx.orderId } })
   assert.deepEqual([snap.trackingNumber, snap.carrier, snap.deepLinkUrl], [null, null, null])
   assert.equal((await db.shoppingOrderLink.findFirstOrThrow({ where: { orderId: fx.orderId } })).metadata, null)
-  for (const link of await db.shoppingCustomerLink.findMany({ where: { customerId: fx.customerId } })) assert.equal(link.metadata, null)
+  // NO RAW STOREFRONT CUSTOMER ID REMAINS: the link row is gone and the customer's integer is cleared.
+  assert.equal(await db.shoppingCustomerLink.count({ where: { OR: [{ customerId: fx.customerId }, { externalCustomerId: String(fx.wooCustomerId) }] } }), 0)
+  assert.equal(await db.customer.count({ where: { externalCustomerId: fx.wooCustomerId } }), 0)
 
   const outbox = Object.fromEntries((await db.emailOutbox.findMany({ where: { referenceId: fx.orderId } })).map((r) => [r.kind, r]))
   for (const kind of ['k-sent', 'k-failed', 'k-pending', 'k-parked']) assert.equal(outbox[kind]!.toEmail, ERASURE_PLACEHOLDER_EMAIL, kind)
@@ -282,13 +286,18 @@ test('[erasure] the core erases every personal column, keeps the decided retenti
   assert.equal(control.customerVatNumber, VAT, 'without the marker the update path writes the VAT number back')
   assert.match(JSON.stringify(control.billingAddress), new RegExp(STREET))
 
-  // A NEW ORDER from the storefront account that was erased is not re-attached to the anonymised customer.
+  // A LATER ORDER FROM THE SAME STOREFRONT ACCOUNT finds no link and no email to match on the erased row, so it gets a FRESH customer.
   const { upsertCustomer } = await import('@/lib/connectors/woocommerce/sync/field-mapping')
-  const externalCustomerId = 700_000_000 + Math.floor(Math.random() * 90_000_000)
-  await db.shoppingCustomerLink.create({ data: { connector: 'woocommerce', customerId: fx.customerId, externalCustomerId: String(externalCustomerId) } })
-  const returning = { ...payload(fx.externalId + 1, wcRateId), customer_id: externalCustomerId } as never
-  assert.equal(await upsertCustomer(returning), null, 'an anonymised customer is never matched for a new order')
-  assert.equal((await db.customer.findUniqueOrThrow({ where: { id: fx.customerId } })).firstName, 'GDPR')
+  const returning = { ...payload(fx.externalId + 1, wcRateId), customer_id: fx.wooCustomerId } as never
+  const freshId = await upsertCustomer(returning)
+  assert.ok(freshId, 'a customer was created for the returning account')
+  t.after(async () => { await db.shoppingCustomerLink.deleteMany({ where: { customerId: freshId! } }); await db.customer.deleteMany({ where: { id: freshId! } }) })
+  assert.notEqual(freshId, fx.customerId, 'it is NOT the erased record')
+  const fresh = await db.customer.findUniqueOrThrow({ where: { id: freshId! } })
+  assert.equal(fresh.gdprAnonymisedAt, null, 'the new record is a normal, unerased customer')
+  assert.equal(fresh.firstName, NAME.first, 'the new identity belongs to the new record')
+  assert.equal(await db.shoppingCustomerLink.count({ where: { externalCustomerId: String(fx.wooCustomerId), customerId: freshId! } }), 1)
+  assert.equal((await db.customer.findUniqueOrThrow({ where: { id: fx.customerId } })).firstName, 'GDPR', 'the erased record is untouched')
 
   assert.equal(net.calls(), 0, 'no fetch was made by the erasure or the importer')
 })
