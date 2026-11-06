@@ -345,7 +345,11 @@ test('Xero money-moving branches must NOT start reading the generic _idempotency
   const helper = moneyKeyHelperBody(source)
   const builderCalls = helper.match(/buildXeroIdempotencyKey\((?:[^()]|\([^()]*\))*\)/g) ?? []
   assert.equal(builderCalls.length, 1)
-  assert.doesNotMatch(builderCalls[0]!, /,\s*payload\s*\)/, 'the helper must not pass payload as the builder\'s third argument')
+  assert.match(
+    builderCalls[0]!,
+    /^buildXeroIdempotencyKey\(documentSource \?\? followUpIdempotencySource\(entryId, payload\), operation\)$/,
+    'the helper must not pass payload as the builder\'s third argument',
+  )
   for (const op of MONEY_MOVING_XERO_OPS) assert.equal(xeroKeyCalls(source, op).length, 0)
 })
 
