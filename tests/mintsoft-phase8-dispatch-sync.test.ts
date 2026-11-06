@@ -16,7 +16,7 @@ const mintsoftOrders = 'default' in mintsoftOrdersNs
 const { isMintsoftDispatched } = mintsoftOrders
 
 function tracking(partial: Partial<WmsOrderTracking>): WmsOrderTracking {
-  return { trackingNumber: null, carrier: null, despatchedAt: null, ...partial }
+  return { trackingNumber: null, carrier: null, despatchedAt: '2026-06-30T10:00:00Z', ...partial }
 }
 
 function status(partial: Partial<WmsOrderStatus>): WmsOrderStatus {
