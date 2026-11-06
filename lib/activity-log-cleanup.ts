@@ -3,6 +3,7 @@ import { expectedDisposableDatabaseMarker } from '@/lib/disposable-database-mark
 import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { UNRECORDED_POSTED_DOCUMENT_ACTIONS } from '@/lib/domain/accounting/unrecorded-posted-document'
 import { WC_REFUND_PARK_RECOVERED_ACTION } from '@/lib/domain/sales/refund-park-recovery'
+import { ERASURE_RETAINED_ACTIONS } from '@/lib/domain/erasure/erasure-record'
 import {
   WITHHELD_CLOSED_ACTIONS,
   WITHHELD_MARKER_ACTIONS,
@@ -99,6 +100,10 @@ const RETAINED_ACTIONS = [
   // `recoverParkedWcRefund` about a `shopping_sync_logs` row, never by an accounting post, so it
   // cannot collide with either unrecorded-document name.
   WC_REFUND_PARK_RECOVERED_ACTION,
+  // The erasure record — a fifth kind: an obligation to be able to DEMONSTRATE, for years, that a personal-data
+  // erasure happened. It carries no name, so retaining it keeps nothing that was erased. Spread from the one
+  // place the action is named, never retyped (see the factory-reset warning above).
+  ...ERASURE_RETAINED_ACTIONS,
 ]
 
 /**

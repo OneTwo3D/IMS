@@ -362,6 +362,8 @@ type OrderForPush = {
   customerName: string | null
   customerEmail: string | null
   customerVatNumber: string | null
+  /** Set once the order's personal data was erased. An erased order is never pushed or amended. */
+  erasedAt?: Date | null
   shippingAddress: unknown
   /** Fallback destination and contact details when the shipping address names no recipient. */
   billingAddress?: unknown
@@ -580,6 +582,7 @@ export const ORDER_PUSH_SELECT = {
   customerName: true,
   customerEmail: true,
   customerVatNumber: true,
+  erasedAt: true,
   shippingAddress: true,
   billingAddress: true,
   shippingService: true,
@@ -665,7 +668,17 @@ export function applyLinkCourierForm(
   return input
 }
 
+/**
+ * Why an erased order is not sent to the warehouse. An erasure must never become an outbound write: the
+ * identity fields are placeholders (or gone), the VAT number is cleared, and a warehouse order created from them
+ * would carry a placeholder recipient. Propagating an erasure to the warehouse is its own piece of work and runs
+ * through the producer seam; until then this refuses, locally, before any payload exists.
+ */
+export const ERASED_ORDER_PUSH_REASON =
+  'This order\'s personal data has been erased, so it is not sent to the warehouse. Nothing was sent.'
+
 export function buildPushInput(order: OrderForPush, externalWarehouseId: string): WmsOrderPushInput {
+  if (order.erasedAt) throw new Error(ERASED_ORDER_PUSH_REASON)
   const recipient = resolvePushRecipient(order)
   // Refuse BEFORE anything is claimed or sent: an empty street is not a destination (builds on local data only).
   if (!recipient.address.address1) throw new Error(NO_DELIVERY_STREET_REASON)
@@ -2412,6 +2425,12 @@ export async function runWmsOrderPushSweepCore(
       const ts = now()
       let update: Awaited<ReturnType<NonNullable<PushConnector['updateOrder']>>> | null = null
       try {
+        // An erased order is not amended: the pass settles it locally (no remote call, no retry loop) instead of
+        // building a payload from placeholders. Propagating an erasure to the warehouse is separate work.
+        if (link.order.erasedAt) {
+          await port.updateLink(link.id, { lastAttemptAt: ts, pushedAt: ts, lastError: ERASED_ORDER_PUSH_REASON })
+          continue
+        }
         // The amendment asks before anything is built: a shadow touches no link (not even its error note), because the order
         // is amended from the same unchanged link on the sweep that may write.
         //

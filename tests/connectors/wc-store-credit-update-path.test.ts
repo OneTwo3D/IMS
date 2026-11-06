@@ -18,6 +18,7 @@ const state = {
   statements: [] as string[],
   activity: [] as Array<Record<string, unknown>>,
   liveClaim: null as { id: string; connector: string; type: string; processingStartedAt: Date } | null,
+  erasedAt: null as Date | null,
 }
 
 const tx = {
@@ -26,7 +27,8 @@ const tx = {
   salesOrderRefund: { findMany: async () => [] },
   shoppingOrderLink: { updateMany: async () => ({ count: 1 }) },
   salesOrder: {
-    findUnique: async () => { state.reads += 1; return state.stored ? { ...state.stored } : null },
+    // The importer's erasure-marker read (select: { erasedAt }) is not the store-credit comparison this file counts.
+    findUnique: async (args?: { select?: Record<string, boolean> }) => { if (args?.select?.erasedAt) { state.statements.push('READ erasure marker'); return { erasedAt: state.erasedAt } } state.reads += 1; return state.stored ? { ...state.stored } : null },
     // Honours the OR on the current assessment, like the database: REVIEW_REQUIRED never matches again.
     updateMany: async ({ where, data }: { where: { OR: Array<{ storeCreditAssessment: string | null }> }; data: Record<string, unknown> }) => {
       state.statements.push('CONDITIONAL review write')
@@ -62,6 +64,7 @@ test.beforeEach(() => {
   state.statements = []
   state.activity = []
   state.liveClaim = null
+  state.erasedAt = null
 })
 
 async function run(wc: WcFullOrder) {
@@ -128,6 +131,20 @@ test('no credit and no conflict: nothing is read, nothing is written', async () 
   assert.equal(state.writes.length, 2, 'precondition: both order updates ran')
   assert.equal(state.reads, 0)
   assert.equal(state.stored!.storeCreditAssessment, null)
+})
+
+test('an ERASED order is updated without its identity columns, the marker being read after the order lock', async () => {
+  state.erasedAt = new Date('2026-11-06T00:00:00Z')
+  await run(order(percent))
+  const written = state.writes[0]!
+  for (const key of ['customerVatNumber', 'billingAddress', 'shippingAddress', 'notes']) assert.equal(key in written, false, `${key} must not be written back onto an erased order`)
+  assert.equal('externalOrderNumber' in written, true, 'the non-identity part of the update still runs')
+  const lock = state.statements.findIndex((s) => s.startsWith('LOCK'))
+  assert.ok(lock >= 0 && lock < state.statements.indexOf('READ erasure marker'), 'the marker is read only after the order row lock is held')
+  state.erasedAt = null
+  state.writes = []
+  await run(order(percent))
+  for (const key of ['customerVatNumber', 'billingAddress', 'shippingAddress', 'notes']) assert.equal(key in state.writes[0]!, true, `control: ${key} IS written for an order that is not erased`)
 })
 
 test('the credit is also found from the order-level contribution record', async () => {

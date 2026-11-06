@@ -143,6 +143,7 @@ export async function runWmsOrderStatusSweep(
     },
     select: {
       id: true,
+      erasedAt: true,
       shoppingLinks: {
         where: { connector: lookupConnector },
         select: { externalOrderNumber: true },
@@ -272,10 +273,13 @@ export async function runWmsOrderStatusSweep(
             lastError: notFoundReason,
           }
 
+      // An erased order keeps its status in the cache but never its tracking number, carrier or deep link: the
+      // warehouse still holds them, and writing them back would undo the erasure on the next sweep.
+      const storedFields = order.erasedAt ? { ...fields, trackingNumber: null, carrier: null, deepLinkUrl: null } : fields
       await db.wmsOrderStatusSnapshot.upsert({
         where: { orderId: order.id },
-        create: { orderId: order.id, ...fields },
-        update: { ...fields, fetchedAt: new Date() },
+        create: { orderId: order.id, ...storedFields },
+        update: { ...storedFields, fetchedAt: new Date() },
       })
       if (status) updated += 1
 
@@ -296,7 +300,7 @@ export async function runWmsOrderStatusSweep(
       // transient WC failure retries next tick instead of being permanently skipped.
       // Best-effort: a failed push must not fail the status sweep, but it is logged and
       // wcPushedStatus is left unchanged so it's re-attempted.
-      if (status && status.status && status.status !== order.wmsOrderStatus?.wcPushedStatus) {
+      if (status && status.status && !order.erasedAt && status.status !== order.wmsOrderStatus?.wcPushedStatus) {
         try {
           const { pushWmsOrderStatusToShopping } = await import('@/lib/shopping')
           const pushResult = await pushWmsOrderStatusToShopping(order.id, {

@@ -1202,6 +1202,14 @@ async function updateExistingWcOrderCore(
         reviewFlagged = flagged.count === 1
       }
     }
+    // ERASURE GUARD. Under the order row lock — the same lock the erasure takes before it writes — read whether
+    // this order's personal data was erased. An erased order must not have identity written back onto it by a
+    // routine redelivery: WooCommerce still holds the original (the erasure started elsewhere), so without this
+    // the very next order.updated would undo the erasure silently. Only the identity columns are withheld; the
+    // rest of the update (shipping, paid state, order number) proceeds exactly as before.
+    await lockSalesOrder(tx, orderId)
+    const erasure = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true } })
+    const erased = erasure?.erasedAt != null
     await tx.shoppingOrderLink.updateMany({
       where: {
         connector: 'woocommerce',
@@ -1209,16 +1217,15 @@ async function updateExistingWcOrderCore(
       },
       data: {
         externalOrderNumber: wcOrder.number,
-        metadata: {
-          externalOrderKey: wcOrder.order_key,
-        },
+        // The order key is the capability behind the storefront's invoice link, so an erased order does not get it back.
+        ...(erased ? {} : { metadata: { externalOrderKey: wcOrder.order_key } }),
       },
     })
     await tx.salesOrder.update({
       where: { id: orderId },
       data: {
         externalOrderNumber: wcOrder.number,
-        customerVatNumber: readWcCustomerVat(wcOrder),
+        ...(erased ? {} : { customerVatNumber: readWcCustomerVat(wcOrder) }),
         // The shipping label, method id and courier key are refreshed TOGETHER from the CURRENT first shipping line (the key
         // only while its stored label still matches the line's title, so an edited line clears it), and fill in orders imported
         // before they were kept. Stored values only: a WMS order already created is amended by the push sweep's amendment pass,
@@ -1229,9 +1236,13 @@ async function updateExistingWcOrderCore(
         // The wclc duty/tax/handling components are written ONLY when the order and its lines are created: they split
         // the fee lines stored with them (and the invoice posted from those lines), and this path rebuilds no lines.
         // Refreshing them from a later delivery would leave a split that disagrees with the lines it describes.
-        billingAddress: mapWcAddress(wcOrder.billing),
-        shippingAddress: mapWcAddress(wcOrder.shipping),
-        notes: wcOrder.customer_note || null,
+        ...(erased
+          ? {}
+          : {
+              billingAddress: mapWcAddress(wcOrder.billing),
+              shippingAddress: mapWcAddress(wcOrder.shipping),
+              notes: wcOrder.customer_note || null,
+            }),
         paidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? parseWcGmtInstant(wcOrder.date_paid_gmt) : undefined,
         // o3d-psrx r2 — THE PAID FLAG'S PROVENANCE, WRITTEN BY THE SAME STATEMENT THAT SETS IT.
         //

@@ -5,6 +5,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
 import { logActivity } from '@/lib/activity-log'
+import { eraseCustomerPersonalData } from '@/lib/domain/erasure/erase-personal-data'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { toIsoCountryCode } from '@/lib/countries'
 import {
@@ -479,69 +480,9 @@ export async function importContactsCsv(formData: FormData): Promise<CsvImportAc
 }
 
 export async function anonymiseCustomer(customerId: string): Promise<{ success: boolean; error?: string }> {
-  await requirePermission('sync')
-  try {
-    const customer = await db.customer.findUnique({
-      where: { id: customerId },
-      include: { salesOrders: { select: { id: true } } },
-    })
-    if (!customer) return { success: false, error: 'Customer not found' }
-    if (customer.gdprAnonymisedAt) return { success: false, error: 'Customer already anonymised' }
-
-    const customerName = [customer.firstName, customer.lastName].filter(Boolean).join(' ')
-
-    // Anonymise customer record
-    await db.customer.update({
-      where: { id: customerId },
-      data: {
-        firstName: 'GDPR',
-        lastName: 'Anonymised',
-        email: null,
-        phone: null,
-        company: null,
-        taxNumber: null,
-        billingAddress: Prisma.JsonNull,
-        shippingAddress: Prisma.JsonNull,
-        notes: null,
-        externalCustomerId: null,
-        active: false,
-        gdprAnonymisedAt: new Date(),
-      },
-    })
-
-    // Anonymise linked sales orders
-    if (customer.salesOrders.length > 0) {
-      await db.salesOrder.updateMany({
-        where: { customerId },
-        data: {
-          customerName: 'GDPR Anonymised',
-          customerEmail: null,
-          billingAddress: Prisma.JsonNull,
-          shippingAddress: Prisma.JsonNull,
-          notes: null,
-        },
-      })
-    }
-
-    await logActivity({
-      entityType: 'CUSTOMER',
-      entityId: customerId,
-      tag: 'sales',
-      action: 'gdpr_anonymised',
-      description: `GDPR anonymised customer: ${customerName} (${customer.salesOrders.length} orders anonymised)`,
-    })
-
-    revalidatePath('/sales/contacts')
-    return { success: true }
-  } catch (e) {
-    await logActivity({
-      entityType: 'CUSTOMER',
-      entityId: customerId,
-      tag: 'sales',
-      action: 'gdpr_anonymised',
-      level: 'ERROR',
-      description: `Failed to GDPR anonymise customer: ${String(e)}`,
-    })
-    return { success: false, error: String(e) }
-  }
+  const session = await requirePermission('sync')
+  // The erasure itself, and its name-free proof, live in one place: see lib/domain/erasure.
+  const result = await eraseCustomerPersonalData(customerId, { trigger: 'ON_REQUEST', userId: session.user.id ?? null })
+  if (result.success) revalidatePath('/sales/contacts')
+  return result.success ? { success: true } : { success: false, error: result.error }
 }
