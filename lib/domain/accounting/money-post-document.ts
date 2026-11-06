@@ -27,6 +27,9 @@
  * indexed predicate and preserves the contender an anchorless row in this scope has always been.
  */
 
+import { createHash } from 'node:crypto'
+import { toDecimal } from '@/lib/domain/math/decimal'
+
 function asRecord(payload: unknown): Record<string, unknown> {
   return typeof payload === 'object' && payload !== null && !Array.isArray(payload)
     ? (payload as Record<string, unknown>)
@@ -239,6 +242,86 @@ export function settlementDocumentKey(type: string, payload: unknown): string {
     str(type).toLowerCase(),
     ...documentAnchorFields(type).map((field) => documentIdentity(anchorValue(payload, field))),
   ])
+}
+
+/**
+ * THE IDEMPOTENCY IDENTITY OF A MONEY POST — what a connector may treat as "the same request again".
+ *
+ * THE GAP IT CLOSES. The lock excludes two workers from one document only while the lock holder's
+ * connection lives (a session advisory lock dies with its connection), and no lock can undo a request
+ * the remote system has already accepted. The remote system's own idempotency is the one mechanism that
+ * still works at that point — but the key was the SYNC ROW's token, so two DIFFERENT rows posting the SAME
+ * payment (the exact pair the document key exists to serialise) carried two different keys and the
+ * connector saw two requests.
+ *
+ * THE IDENTITY. The document (`settlementDocumentKey`) PLUS what makes this post one particular
+ * settlement of it, because a document is paid by several posts (a deposit and a balance share an
+ * invoice) and keying on the document alone would answer the second legitimate payment with the first
+ * one's result and lose it silently:
+ *
+ *   - INVOICE_PAYMENT: the local receipt (`payload.paymentId`, the same identity `payment-identity.ts`
+ *     judges rivals by) and the amount;
+ *   - BILL_PAYMENT: the amount. Marking a bill paid is one settlement of the whole bill, and a corrected
+ *     amount is a different request, which keeps the ledger fence's judgement as before;
+ *   - PURCHASE_CREDIT_NOTE_ALLOCATION: the document key already names the credit note and the bill; the
+ *     amount completes it.
+ *
+ * AND THE EPISODE. A settlement can be reversed in the ledger and made again (a bill paid, the payment deleted, the bill paid again for the same amount),
+ * and inside the connector's key window the repeat would otherwise be answered with the deleted payment's result and create nothing. `episode` is how many
+ * of this settlement's registrations IMS has PROVEN reversed (`countReversedEpisodes`): retries of one episode share it, a proven reversal starts the next.
+ *
+ * NULL WHEN THE IDENTITY CANNOT BE STATED, and the caller then keeps the row's own token exactly as
+ * before: no document anchor, an INVOICE_PAYMENT that names no receipt (an imported or pre-identity row),
+ * or an amount that is not a finite number. "Unknown" must never be read as "the same payment".
+ *
+ * The result is a digest, not the document key itself, so it is short and carries no ids into a header.
+ */
+export function moneyPostIdempotencySource(type: string, payload: unknown, episode = 0): string | null {
+  const kind = str(type).toUpperCase()
+  if (kind !== 'INVOICE_PAYMENT' && kind !== 'BILL_PAYMENT' && kind !== 'PURCHASE_CREDIT_NOTE_ALLOCATION') return null
+  const anchors = documentAnchorFields(type).map((field) => documentIdentity(anchorValue(payload, field)))
+  if (anchors.some((anchor) => anchor === '')) return null
+  const record = asRecord(payload)
+  let amount: string
+  try {
+    const raw = typeof record.amountDecimal === 'string' && record.amountDecimal.trim() !== '' ? record.amountDecimal : record.amount
+    if (raw === null || raw === undefined || raw === '') return null
+    const value = toDecimal(raw as string | number)
+    if (!value.isFinite()) return null
+    amount = value.toFixed()
+  } catch {
+    return null
+  }
+  const parts: string[] = [settlementDocumentKey(type, payload), amount, `episode:${Math.max(0, Math.trunc(episode))}`]
+  if (kind === 'INVOICE_PAYMENT') {
+    const receipt = typeof record.paymentId === 'string' ? record.paymentId.trim() : ''
+    if (receipt === '') return null
+    parts.push(receipt)
+  }
+  return `doc-${createHash('sha256').update(JSON.stringify(parts)).digest('hex')}`
+}
+
+/** The payload field that records the Idempotency-Key a money row used (or will use) for its remote call. Write-once. */
+export const MONEY_POST_KEY_FIELD = '_moneyPostIdempotencyKey'
+
+/**
+ * The reversal episode of a settlement: how many registrations of the same document (and, for an invoice payment, the same receipt) were CANCELLED
+ * with a ledger-verified reversal. The rows are passed in; the caller reads them.
+ */
+export function countReversedEpisodes(
+  type: string,
+  payload: unknown,
+  reversedRows: ReadonlyArray<{ payload: unknown }>,
+): number {
+  const key = settlementDocumentKey(type, payload)
+  const kind = str(type).toUpperCase()
+  const receipt = typeof asRecord(payload).paymentId === 'string' ? (asRecord(payload).paymentId as string).trim() : ''
+  return reversedRows.filter((row) => {
+    if (settlementDocumentKey(type, row.payload) !== key) return false
+    if (kind !== 'INVOICE_PAYMENT') return true
+    const other = asRecord(row.payload).paymentId
+    return typeof other === 'string' && other.trim() === receipt
+  }).length
 }
 
 export type MoneyPostDocument = {

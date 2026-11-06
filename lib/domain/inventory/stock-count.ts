@@ -72,6 +72,66 @@ export function computeStockCountPostings(
   return postings
 }
 
+export type StockCountLineForDrift = {
+  lineId: string
+  productId: string
+  sku: string
+  countedQty: number
+  /** On-hand this line was reconciled against; null = never reconciled (or the count changed since). */
+  reconciledQty: number | null
+}
+
+export type StockCountDrift = {
+  lineId: string
+  productId: string
+  sku: string
+  /** The on-hand the line was reconciled against; null when it was never reconciled. */
+  earlierOnHand: number | null
+  currentOnHand: number
+  countedQty: number
+  /** countedQty - currentOnHand: what the variance would be against the stock as it is NOW. */
+  revisedVariance: number
+}
+
+/**
+ * The counted lines whose live on-hand is no longer the figure they were reconciled against, or that
+ * were never reconciled. Authorising a count refuses while this is non-empty: the count and its variance
+ * were decided against a quantity that is no longer true (a receipt landed, an order shipped, the WMS
+ * stock sync ran), and the adjustment would flow straight into valuation.
+ *
+ * A line with no stamp counts as drifted, deliberately: "unknown" must not read as "unchanged".
+ * Compared at the 6dp scale of stock_levels, so a stamp read back from the database is equal to itself.
+ */
+export function detectStockCountDrift(
+  lines: StockCountLineForDrift[],
+  currentBookByProduct: Map<string, number>,
+): StockCountDrift[] {
+  const drift: StockCountDrift[] = []
+  for (const line of lines) {
+    const currentOnHand = round6(currentBookByProduct.get(line.productId) ?? 0)
+    if (line.reconciledQty != null && round6(line.reconciledQty) === currentOnHand) continue
+    drift.push({
+      lineId: line.lineId,
+      productId: line.productId,
+      sku: line.sku,
+      earlierOnHand: line.reconciledQty == null ? null : round6(line.reconciledQty),
+      currentOnHand,
+      countedQty: line.countedQty,
+      revisedVariance: round4(line.countedQty - currentOnHand),
+    })
+  }
+  return drift
+}
+
+/** The operator-facing refusal for a drifted count. Names every affected product. */
+export function describeStockCountDrift(drift: StockCountDrift[]): string {
+  const parts = drift.map((d) => d.earlierOnHand == null
+    ? `${d.sku}: not reconciled (on hand now ${d.currentOnHand}, counted ${d.countedQty}, variance ${d.revisedVariance})`
+    : `${d.sku}: was ${d.earlierOnHand}, now ${d.currentOnHand}, counted ${d.countedQty}, revised variance ${d.revisedVariance}`)
+  return `Nothing was posted: stock has moved since this count was reconciled (or it was never reconciled) for ${drift.length} product(s). `
+    + `${parts.join('; ')}. These lines need fresh figures before the count can be authorised, or the movement needs looking into first. Counts are preserved.`
+}
+
 /** Stock-count reference, e.g. SC-20260624-AB12. */
 export function makeStockCountReference(now: Date, rand: string): string {
   const ymd = now.toISOString().slice(0, 10).replace(/-/g, '')

@@ -1326,8 +1326,9 @@ Checks are kept permanently and cannot be edited, deleted or truncated. Each one
 the Xero payment ids, the Xero organisation and connection it was made under, who made it and when.
 #### Retrying is not protected by idempotency — check Xero first
 
-IMS derives every `Idempotency-Key` deterministically from the sync entry id, so a re-post sends the
-same key it sent the first time. That only prevents a duplicate while **Xero still remembers the
+IMS derives every `Idempotency-Key` deterministically from the sync entry id (or, for a payment, a bill
+payment and a purchase credit-note allocation, from the settlement itself: see below), so a re-post sends
+the same key it sent the first time. That only prevents a duplicate while **Xero still remembers the
 key**, and Xero keeps one for **6 minutes** from the first call
 ([Xero: Idempotent requests](https://developer.xero.com/documentation/guides/idempotent-requests/idempotency/)):
 
@@ -1338,6 +1339,16 @@ A row only becomes `FAILED` after its automatic retries are exhausted, so by the
 Retry control appears the key has already expired. **A manual retry is therefore a new request to
 Xero.** If the original attempt actually reached Xero — a timeout or a dropped response looks
 identical to a rejection from here — re-queueing creates a SECOND invoice, bill or payment.
+
+**Money posts are keyed on the settlement, not the row.** A payment's `Idempotency-Key` is derived from the
+document it settles (the invoice or bill id, plus the credit note for an allocation), the amount, and, for
+an invoice payment, the local receipt, never from the sync row. The per-document money-post lock is a
+PostgreSQL session lock and is freed the instant its connection dies (a dropped socket, a failover), so a
+second row for the same payment can take it while the first request is still in flight; both then carry
+the same key and, inside Xero's 6 minutes, Xero answers the second with the first's result instead of
+creating a second payment. A deposit and a balance (different receipts) carry different keys and both
+post. A row that records no receipt (an imported or older row) or no usable amount keeps its own
+token. Reference marks and the ledger fence are unchanged.
 
 The retry controls (the failed-sync banner, "Retry All Failed", and the per-row retry in the sync
 log) all state this. Before re-queueing an aged row, search Xero for the document. IMS deliberately

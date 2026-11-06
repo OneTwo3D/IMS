@@ -303,41 +303,58 @@ function xeroKeyCalls(source: string, op: string): string[] {
   return source.match(new RegExp(String.raw`buildXeroIdempotencyKey\(${arg}'${op}'${arg}\)`, 'g')) ?? []
 }
 
-test('every Xero money-moving key resolves its source through the follow-up token (o3d-h2wx)', async () => {
+/**
+ * The money-moving keys are built by `xeroMoneyPostIdempotencyKey`, which derives them from the settlement and FALLS BACK to the row's follow-up token
+ * (`followUpIdempotencySource`) whenever the settlement's identity cannot be stated. The fallback is the invariant this file has always pinned, so it is
+ * pinned on the helper, and every money-moving call site is held to go through the helper.
+ */
+const MONEY_MOVING_XERO_TYPES: Record<string, string> = {
+  'invoice-payment': 'INVOICE_PAYMENT',
+  'bill-payment': 'BILL_PAYMENT',
+  'purchase-credit-note-allocation': 'PURCHASE_CREDIT_NOTE_ALLOCATION',
+}
+
+function moneyKeyHelperBody(source: string): string {
+  const start = source.indexOf('export function xeroMoneyPostIdempotencyKey(')
+  assert.ok(start > 0, 'the money-post key helper exists')
+  return source.slice(start, source.indexOf('\n}\n', start))
+}
+
+test('every Xero money-moving key resolves its source through the settlement, falling back to the follow-up token (o3d-h2wx)', async () => {
   const source = await readFile(XERO_PROCESSOR, 'utf8')
 
   for (const op of MONEY_MOVING_XERO_OPS) {
-    const calls = xeroKeyCalls(source, op)
-    assert.ok(calls.length > 0, `expected a '${op}' idempotency key to be built`)
-    for (const call of calls) {
-      assert.match(
-        call,
-        /followUpIdempotencySource\(\s*entryId\s*,\s*payload\s*\)/,
-        `${call} must resolve its source via followUpIdempotencySource, or a regenerated `
-          + 'follow-up posts under a key Xero has never seen and duplicates the payment',
-      )
-    }
+    assert.ok(
+      source.includes(`resolveXeroMoneyPostIdempotencyKey(db, { entryId, type: '${MONEY_MOVING_XERO_TYPES[op]}', payload, operation: '${op}' })`),
+      `expected a '${op}' idempotency key to be resolved through the money-post key resolver`,
+    )
+    assert.equal(xeroKeyCalls(source, op).length, 0, `'${op}' must not be built from the row directly any more`)
   }
+  assert.ok(
+    source.includes('const legacy = buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), operation)'),
+    'the resolver\'s legacy derivation (a row not proven never to have attempted) is the follow-up token',
+  )
+  assert.match(
+    moneyKeyHelperBody(source),
+    /documentSource \?\? followUpIdempotencySource\(\s*entryId\s*,\s*payload\s*\)/,
+    'the fallback must resolve its source via followUpIdempotencySource, or a regenerated follow-up posts under a key Xero has never seen and duplicates the payment',
+  )
 })
 
 test('Xero money-moving branches must NOT start reading the generic _idempotencyKey (o3d-h2wx)', async () => {
   // The r1 blocker, pinned. buildXeroIdempotencyKey prefers payload._idempotencyKey when a
   // payload is passed, and addPayment already sets that field on in-flight INVOICE_PAYMENT
-  // rows. Passing `payload` to these branches would rotate their key at deploy time.
+  // rows. Passing `payload` to the builder from these branches would rotate their key at deploy time.
   const source = await readFile(XERO_PROCESSOR, 'utf8')
-
-  for (const op of MONEY_MOVING_XERO_OPS) {
-    const calls = xeroKeyCalls(source, op)
-    assert.ok(calls.length > 0, `expected a '${op}' idempotency key to be built`)
-    for (const call of calls) {
-      assert.doesNotMatch(
-        call,
-        /'\s*,\s*payload\s*\)/,
-        `${call} must not pass payload as the builder's third argument — that makes it prefer `
-          + 'the generic _idempotencyKey and changes the key of every payment already in flight',
-      )
-    }
-  }
+  const helper = moneyKeyHelperBody(source)
+  const builderCalls = helper.match(/buildXeroIdempotencyKey\((?:[^()]|\([^()]*\))*\)/g) ?? []
+  assert.equal(builderCalls.length, 1)
+  assert.match(
+    builderCalls[0]!,
+    /^buildXeroIdempotencyKey\(documentSource \?\? followUpIdempotencySource\(entryId, payload\), operation\)$/,
+    'the helper must not pass payload as the builder\'s third argument',
+  )
+  for (const op of MONEY_MOVING_XERO_OPS) assert.equal(xeroKeyCalls(source, op).length, 0)
 })
 
 /**
