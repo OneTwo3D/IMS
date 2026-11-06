@@ -112,48 +112,86 @@ export function xeroProducerSeamVerdict(input: {
 }
 
 /**
+ * THE WRITER-SIDE CUT-OFF FOR ACCOUNTING ROWS: EACH ROW IS FLOORED BY THE LIVE-FROM INSTANT OF THE DESTINATION IT WRITES TO.
+ *
+ * Every queued row is an AccountingSyncLog row, but not every type writes to Xero: a WC_INVOICE_NOTE writes to WooCommerce
+ * (ownership map `order.invoice-note`). WooCommerce and Xero go live at independent instants, so a note row is floored by the
+ * WooCommerce one and every other write type by the Xero one. A type that is no destination write at all (a PDF fetch, an e-mail)
+ * is floored by nothing. The sets are derived from the ownership map, not listed twice.
+ */
+export const WOO_SYNC_TYPES: readonly string[] = [...TYPE_INDEX].filter(([, entry]) => entry.destination === 'woocommerce').map(([type]) => type)
+export const NOT_A_XERO_WRITE: readonly string[] = [...Object.keys(ACCOUNTING_SYNC_TYPE_EXCLUSIONS), ...WOO_SYNC_TYPES]
+
+type FloorContext = { env?: Record<string, string | undefined>; now?: Date }
+
+/**
  * THE WRITER-SIDE CUT-OFF FOR XERO: the instant before which a QUEUED accounting row is never delivered by IMS, or null when no such
  * floor applies (the producer hold is not enforced for Xero, or Xero is not in its live phase: legacy behaviour, byte for byte).
  * Every claim, every oldest-first selection and every re-queue of an accounting sync row asks here, and asks again at the moment of its
- * own write: it reads the environment each time and caches nothing.
+ * own write: it reads the environment each time and caches nothing. Rows that write to WooCommerce use {@link wooAccountingCutoffFloor}.
  */
-export function xeroCutoffFloor(context?: { env?: Record<string, string | undefined>; now?: Date }): Date | null {
+export function xeroCutoffFloor(context?: FloorContext): Date | null {
   return producerCutoffFloor('xero', context ?? {})
+}
+
+/** The same cut-off for the accounting rows whose destination is WooCommerce (the invoice note), from the WooCommerce live-from instant. */
+export function wooAccountingCutoffFloor(context?: FloorContext): Date | null {
+  return producerCutoffFloor('woocommerce', context ?? {})
+}
+
+/** Whether ANY accounting-row floor is in force: the guard of the call sites that read a row's creation time only to compare it with a floor. */
+export function accountingCutoffInForce(context?: FloorContext): boolean {
+  return xeroCutoffFloor(context) !== null || wooAccountingCutoffFloor(context) !== null
 }
 
 /**
  * The operator sentence when a row may not be re-queued or delivered because it predates the cut-off, or null when it may (no floor,
- * created at or after it, or a type that is not a write to Xero at all: a PDF fetch and an e-mail are exactly as exempt as they are from
- * the producer decision). A row whose type is not given is treated as a write: fail closed. The one place a re-queue path words this.
+ * created at or after it, or a type that is not a write to a destination at all: a PDF fetch and an e-mail are exactly as exempt as they are from
+ * the producer decision). The floor is the one of the row's own destination. A row whose type is not given is treated as a write to
+ * either destination: fail closed. The one place a re-queue path words this.
  */
 export function xeroBeforeCutoffRefusal(
   row: { createdAt: Date | null | undefined; type?: string },
-  context?: { env?: Record<string, string | undefined>; now?: Date },
+  context?: FloorContext,
 ): string | null {
   if (row.type !== undefined && Object.prototype.hasOwnProperty.call(ACCOUNTING_SYNC_TYPE_EXCLUSIONS, row.type)) return null
-  const floor = xeroCutoffFloor(context)
-  if (floor === null || !createdBeforeCutoffFloor(row.createdAt, floor)) return null
-  return producerBeforeCutoffNotice({ connector: 'xero', cutoff: floor })
+  const connectors: OutboundConnector[] = row.type === undefined ? ['xero', 'woocommerce'] : WOO_SYNC_TYPES.includes(row.type) ? ['woocommerce'] : ['xero']
+  for (const connector of connectors) {
+    const floor = connector === 'xero' ? xeroCutoffFloor(context) : wooAccountingCutoffFloor(context)
+    if (floor !== null && createdBeforeCutoffFloor(row.createdAt, floor)) return producerBeforeCutoffNotice({ connector, cutoff: floor })
+  }
+  return null
+}
+
+/** The NOT clause for the rows created before their own destination's floor; none when neither floor is in force. */
+function beforeFloorsClause(
+  xeroFloor: Date | null,
+  wooFloor: Date | null,
+  extra: Record<string, unknown>,
+): { NOT?: Record<string, unknown> } {
+  const parts: Record<string, unknown>[] = []
+  if (xeroFloor !== null) parts.push({ ...extra, createdAt: { lt: xeroFloor }, type: { notIn: NOT_A_XERO_WRITE } })
+  if (wooFloor !== null) parts.push({ ...extra, createdAt: { lt: wooFloor }, type: { in: WOO_SYNC_TYPES } })
+  if (parts.length === 0) return {}
+  return { NOT: parts.length === 1 ? parts[0] : { OR: parts } }
 }
 
 /**
- * The same rule as a where-fragment, for a claim or a selection: "NOT (created before the floor AND a write type)". Empty with no floor,
- * so a query that spreads it is the legacy query exactly. The sync log's own statuses are untouched: a settled or cancelled row is not
- * delivered by any query that carries this, so it needs no exception here.
+ * The same rule as a where-fragment, for a claim or a selection: "NOT (created before its destination's floor AND a write type)". Empty with no
+ * floor, so a query that spreads it is the legacy query exactly. The sync log's own statuses are untouched: a settled or cancelled row is not
+ * delivered by any query that carries this, so it needs no exception here. `wooFloor` defaults to the WooCommerce floor of this moment.
  */
-export function xeroNotBeforeCutoffWhere(floor: Date | null): { NOT?: Record<string, unknown> } {
-  if (floor === null) return {}
-  return { NOT: { createdAt: { lt: floor }, type: { notIn: Object.keys(ACCOUNTING_SYNC_TYPE_EXCLUSIONS) } } }
+export function xeroNotBeforeCutoffWhere(floor: Date | null, wooFloor: Date | null = wooAccountingCutoffFloor()): { NOT?: Record<string, unknown> } {
+  return beforeFloorsClause(floor, wooFloor, {})
 }
 
 /**
  * The same cut-off for a read that asks "is there earlier LIVE work for this key that I must wait behind?". A queued (PENDING) row created
- * before the floor can never be claimed, so waiting behind it is waiting for work that will not run: every later payment or update for the
+ * before its floor can never be claimed, so waiting behind it is waiting for work that will not run: every later payment or update for the
  * document would be deferred for ever (a starvation behind a never-deliverable row). A PROCESSING row is NOT excluded: a claim taken before
  * the floor moved may still be in flight, and waiting behind an undetermined attempt is the money-safe answer. Empty with no floor, so a
  * query that spreads it is the legacy query exactly.
  */
-export function xeroNotNeverDeliverablePendingWhere(floor: Date | null): { NOT?: Record<string, unknown> } {
-  if (floor === null) return {}
-  return { NOT: { status: 'PENDING', createdAt: { lt: floor }, type: { notIn: Object.keys(ACCOUNTING_SYNC_TYPE_EXCLUSIONS) } } }
+export function xeroNotNeverDeliverablePendingWhere(floor: Date | null, wooFloor: Date | null = wooAccountingCutoffFloor()): { NOT?: Record<string, unknown> } {
+  return beforeFloorsClause(floor, wooFloor, { status: 'PENDING' })
 }

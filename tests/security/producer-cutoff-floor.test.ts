@@ -11,7 +11,7 @@ import {
   producerUnknownOutcomeNotice,
 } from '../../lib/security/producer-disposition-constants.ts'
 import { OUTBOUND_CONNECTORS, OUTBOUND_GRANT_ENV, outboundHeldMessage } from '../../lib/security/outbound-write-hold-constants.ts'
-import { xeroBeforeCutoffRefusal, xeroNotBeforeCutoffWhere } from '../../lib/domain/accounting/xero-producer-seam.ts'
+import { accountingCutoffInForce, wooAccountingCutoffFloor, xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroNotNeverDeliverablePendingWhere } from '../../lib/domain/accounting/xero-producer-seam.ts'
 import { outboxBeforeCutoffWhere, outboxRowBeforeCutoff } from '../../lib/domain/integrations/outbox.ts'
 import {
   classifyWmsPushLink,
@@ -95,7 +95,7 @@ test('Xero: the refusal sentence and the where-fragment agree, exempt a PDF fetc
   assert.deepEqual(xeroNotBeforeCutoffWhere(null), {}, 'no floor: the spread adds nothing')
   const fragment = xeroNotBeforeCutoffWhere(new Date(CUTOFF)) as { NOT: { createdAt: { lt: Date }; type: { notIn: string[] } } }
   assert.equal(fragment.NOT.createdAt.lt.toISOString(), '2026-12-01T00:00:00.000Z')
-  assert.deepEqual([...fragment.NOT.type.notIn].sort(), ['INVOICE_EMAIL', 'INVOICE_PDF'])
+  assert.deepEqual([...fragment.NOT.type.notIn].sort(), ['INVOICE_EMAIL', 'INVOICE_PDF', 'WC_INVOICE_NOTE'], 'the invoice note writes to WooCommerce, so the Xero floor does not govern it')
   const text = xeroBeforeCutoffRefusal({ createdAt: before, type: 'BILL_PAYMENT' }, { env, now: NOW })!
   assert.deepEqual(unconditionalMoneySentences(text), [], text)
   assert.match(text, /check Xero before acting/)
@@ -236,4 +236,77 @@ test('the recreate window is clamped to the cut-off: the later of the retention 
   const recent = new Date('2026-12-02T00:00:00Z')
   assert.deepEqual(clampRecreateWindowToCutoff({ cutoff: recent, dateFilter: { gte: recent } }, floor), { cutoff: recent, dateFilter: { gte: recent } }, 'a retention bound later than the floor wins')
   assert.deepEqual(clampRecreateWindowToCutoff({ cutoff: null, dateFilter: { not: null } }, floor), { cutoff: floor, dateFilter: { gte: floor } }, 'retention disabled: the floor still bounds it')
+})
+
+// ---- Each accounting row is floored by the live-from instant of the destination it writes to (the WooCommerce invoice note) ----------
+
+const SHOP = 'https://shop.example.test'
+const XERO_AT = new Date('2026-12-01T00:00:00Z')
+const WOO_AT = new Date('2026-12-10T00:00:00Z')
+const LATER = new Date('2026-12-11T00:00:00Z')
+const bothLive = (extra: Record<string, string> = {}) => ({
+  [PRODUCER_HOLD_ENFORCED_ENV]: 'xero,woocommerce',
+  [OUTBOUND_GRANT_ENV.xero]: TENANT,
+  [PRODUCER_CUTOFF_ENV.xero]: XERO_AT.toISOString(),
+  [OUTBOUND_GRANT_ENV.woocommerce]: SHOP,
+  [PRODUCER_CUTOFF_ENV.woocommerce]: WOO_AT.toISOString(),
+  ...extra,
+})
+const BETWEEN = new Date('2026-12-05T00:00:00Z') // after the Xero instant, before the WooCommerce one
+
+test('the invoice note is floored by the WooCommerce instant, a Xero write by the Xero instant, and neither by the other', () => {
+  const env = bothLive()
+  assert.equal(xeroCutoffFloor({ env, now: LATER })?.toISOString(), XERO_AT.toISOString())
+  assert.equal(wooAccountingCutoffFloor({ env, now: LATER })?.toISOString(), WOO_AT.toISOString())
+  // Created between the two instants: a note belongs to its former writer (refused); a Xero posting is past its own instant (not refused).
+  const note = xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'WC_INVOICE_NOTE' }, { env, now: LATER })
+  assert.match(String(note), /^Not sent by IMS: this was queued before writes to WooCommerce went live on this installation \(2026-12-10T00:00:00\.000Z\)/)
+  assert.equal(xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'BILL_PAYMENT' }, { env, now: LATER }), null)
+  assert.equal(xeroBeforeCutoffRefusal({ createdAt: LATER, type: 'WC_INVOICE_NOTE' }, { env, now: LATER }), null)
+  // Created before the Xero instant: a Xero posting is refused, with Xero's own sentence.
+  assert.match(String(xeroBeforeCutoffRefusal({ createdAt: new Date('2026-11-01T00:00:00Z'), type: 'BILL_PAYMENT' }, { env, now: LATER })), /writes to Xero went live/)
+})
+
+test('a note is not floored by the Xero instant alone, and a Xero posting is not floored by the WooCommerce instant alone', () => {
+  const xeroOnly = live()
+  assert.equal(xeroBeforeCutoffRefusal({ createdAt: new Date('2026-11-01T00:00:00Z'), type: 'WC_INVOICE_NOTE' }, { env: xeroOnly, now: NOW }), null, 'Xero is live, WooCommerce is not: the note has no floor')
+  const wooOnly = { [PRODUCER_HOLD_ENFORCED_ENV]: 'woocommerce', [OUTBOUND_GRANT_ENV.woocommerce]: SHOP, [PRODUCER_CUTOFF_ENV.woocommerce]: WOO_AT.toISOString() }
+  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'WC_INVOICE_NOTE' }, { env: wooOnly, now: LATER }), null)
+  assert.equal(xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'BILL_PAYMENT' }, { env: wooOnly, now: LATER }), null)
+  assert.equal(accountingCutoffInForce({ env: wooOnly, now: LATER }), true, 'a WooCommerce-only floor still counts, so the guards that skip a read when no floor applies do not skip')
+  assert.equal(accountingCutoffInForce({ env: {}, now: LATER }), false)
+  assert.equal(accountingCutoffInForce({ env: wooOnly, now: BETWEEN }), false, 'before the instant is reached there is no floor')
+})
+
+test('a row whose type is unknown is refused if EITHER destination would refuse it (fail closed)', () => {
+  const env = bothLive()
+  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: BETWEEN }, { env, now: LATER }), null)
+  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: new Date('2026-11-01T00:00:00Z') }, { env, now: LATER }), null)
+  assert.equal(xeroBeforeCutoffRefusal({ createdAt: LATER }, { env, now: LATER }), null)
+})
+
+test('the where-fragments: none without a floor (the legacy query), one clause for one floor, an OR of the two for both', () => {
+  assert.deepEqual(xeroNotBeforeCutoffWhere(null, null), {})
+  assert.deepEqual(xeroNotNeverDeliverablePendingWhere(null, null), {})
+  const wooOnly = xeroNotBeforeCutoffWhere(null, WOO_AT) as { NOT: { createdAt: { lt: Date }; type: { in: string[] } } }
+  assert.equal(wooOnly.NOT.createdAt.lt.toISOString(), WOO_AT.toISOString())
+  assert.deepEqual(wooOnly.NOT.type.in, ['WC_INVOICE_NOTE'])
+  const both = xeroNotBeforeCutoffWhere(XERO_AT, WOO_AT) as { NOT: { OR: Array<{ createdAt: { lt: Date }; type: Record<string, string[]> }> } }
+  assert.equal(both.NOT.OR.length, 2)
+  const [xeroPart, wooPart] = both.NOT.OR
+  assert.equal(xeroPart!.createdAt.lt.toISOString(), XERO_AT.toISOString())
+  assert.ok(xeroPart!.type.notIn!.includes('WC_INVOICE_NOTE') && xeroPart!.type.notIn!.includes('INVOICE_PDF'))
+  assert.equal(wooPart!.createdAt.lt.toISOString(), WOO_AT.toISOString())
+  const pending = xeroNotNeverDeliverablePendingWhere(XERO_AT, WOO_AT) as { NOT: { OR: Array<{ status: string }> } }
+  assert.deepEqual(pending.NOT.OR.map((part) => part.status), ['PENDING', 'PENDING'], 'a PROCESSING row is never excluded from the wait')
+  // The fragment keeps to the single NOT key: the claim predicates spread it next to their own OR.
+  assert.deepEqual(Object.keys(both), ['NOT'])
+})
+
+test('BOUNDARY: a row created at the instant the decision went live is not before the floor; one millisecond earlier is', () => {
+  const env = bothLive()
+  assert.equal(xeroBeforeCutoffRefusal({ createdAt: WOO_AT, type: 'WC_INVOICE_NOTE' }, { env, now: WOO_AT }), null, 'decided live at the instant, created at the instant: sendable')
+  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: new Date(WOO_AT.getTime() - 1), type: 'WC_INVOICE_NOTE' }, { env, now: WOO_AT }), null)
+  assert.equal(createdBeforeCutoffFloor(WOO_AT, WOO_AT), false)
+  assert.equal(createdBeforeCutoffFloor(new Date(WOO_AT.getTime() - 1), WOO_AT), true)
 })

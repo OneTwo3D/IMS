@@ -1,7 +1,7 @@
 import { OUTBOUND_CONNECTORS, OUTBOUND_CONNECTOR_LABEL, type OutboundConnector } from '@/lib/security/outbound-write-hold-constants'
 import { explainProducerDisposition, producerGrantCutoffAgreement } from '@/lib/security/producer-disposition'
 import { producerCutoffFloor, readProducerEnforcement } from '@/lib/security/producer-seam'
-import { ACCOUNTING_SYNC_TYPE_EXCLUSIONS, WRITER_OWNERSHIP_MAP, type OwnershipRow } from '@/lib/security/writer-ownership-map'
+import { WRITER_OWNERSHIP_MAP, type OwnershipRow } from '@/lib/security/writer-ownership-map'
 import { PRODUCER_CUTOFF_ENV, type ProducerAgreementState } from '@/lib/security/producer-disposition-constants'
 
 /**
@@ -177,11 +177,17 @@ export async function readProducerCountsFromDatabase(input: {
     sent.outbox = await db.integrationOutbox.count({ where: { ...ownOutbox, status: INTEGRATION_OUTBOX_STATUS.SUCCEEDED, updatedAt: { gte: since } } })
     if (floor) pre.outbox = await db.integrationOutbox.count({ where: { ...ownOutbox, status: { in: queuedStatuses }, createdAt: { lt: floor } } })
 
-    if (destination === 'xero') {
-      queued.syncLog = await db.accountingSyncLog.count({ where: { connector: 'xero', status: { in: ['PENDING', 'PROCESSING'] } } })
-      sent.syncLog = await db.accountingSyncLog.count({ where: { connector: 'xero', status: 'SYNCED', syncedAt: { gte: since } } })
-      // A PDF fetch and an e-mail are not writes to Xero: the cut-off does not govern them and the retirement leaves them, so they are not counted.
-      if (floor) pre.syncLog = await db.accountingSyncLog.count({ where: { connector: 'xero', status: { in: ['PENDING', 'PROCESSING'] }, createdAt: { lt: floor }, type: { notIn: Object.keys(ACCOUNTING_SYNC_TYPE_EXCLUSIONS) as never } } })
+    if (destination === 'xero' || destination === 'woocommerce') {
+      // An accounting row is counted under the destination it writes to: the WooCommerce invoice note under WooCommerce, with its own floor.
+      const { WOO_SYNC_TYPES, NOT_A_XERO_WRITE } = await import('@/lib/domain/accounting/xero-producer-seam')
+      const ofThisDestination = destination === 'xero' ? { notIn: [...WOO_SYNC_TYPES] } : { in: [...WOO_SYNC_TYPES] }
+      {
+        queued.syncLog = await db.accountingSyncLog.count({ where: { connector: 'xero', type: ofThisDestination as never, status: { in: ['PENDING', 'PROCESSING'] } } })
+        sent.syncLog = await db.accountingSyncLog.count({ where: { connector: 'xero', type: ofThisDestination as never, status: 'SYNCED', syncedAt: { gte: since } } })
+        // A PDF fetch and an e-mail are not writes to Xero: the cut-off does not govern them and the retirement leaves them, so they are not counted.
+        const governed = destination === 'xero' ? { notIn: [...NOT_A_XERO_WRITE] } : { in: [...WOO_SYNC_TYPES] }
+        if (floor) pre.syncLog = await db.accountingSyncLog.count({ where: { connector: 'xero', status: { in: ['PENDING', 'PROCESSING'] }, createdAt: { lt: floor }, type: governed as never } })
+      }
     }
     const wmsConnectorIds = wmsConnectorIdsFor(destination)
     if (wmsConnectorIds.length > 0) {

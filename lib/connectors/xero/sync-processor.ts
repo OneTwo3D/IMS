@@ -9,7 +9,7 @@ import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { isUsableImsRate } from '@/lib/domain/accounting/foreign-currency-rate-guard'
 import { isXeroForeignCurrencyRateError, xeroCurrencyRateOrRefuse } from './fx'
-import { xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroNotNeverDeliverablePendingWhere, xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
+import { accountingCutoffInForce, xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroNotNeverDeliverablePendingWhere, xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
 import { producerHeldNotice } from '@/lib/security/producer-disposition-constants'
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
@@ -1549,7 +1549,7 @@ export async function enqueueFollowUpSyncLog(
       // would refuse it and it would only cycle. The follow-up is not lost: the revival is declined exactly as a held one is, so the
       // create path below runs, and its primitive decides the NEW row on the follow-up's own business-event time (a pre-cut-off
       // obligation is a shadow there, a later one is a fresh row created after the instant). The floor is read here, inside the scope lock.
-      if (plan.action === 'reuse' && !revivalHeld && xeroCutoffFloor() !== null) {
+      if (plan.action === 'reuse' && !revivalHeld && accountingCutoffInForce()) {
         const born = await tx.accountingSyncLog.findUnique({ where: { id: plan.syncLogId }, select: { createdAt: true } })
         revivalHeld = xeroBeforeCutoffRefusal({ createdAt: born?.createdAt, type }) !== null
       }
@@ -2552,7 +2552,7 @@ export async function openRemoteWriteLease(
       if (!again) {
         // Refused because the row predates the live-from instant (the fence statement carries the floor of this moment)? Say so, truthfully,
         // rather than blaming another worker.
-        if (xeroCutoffFloor() !== null) {
+        if (accountingCutoffInForce()) {
           const born = await db.accountingSyncLog.findUnique({ where: { id: entryId }, select: { createdAt: true, type: true } })
           const refusal = born ? xeroBeforeCutoffRefusal({ createdAt: born.createdAt, type: born.type }) : null
           if (refusal !== null) {
@@ -6151,7 +6151,7 @@ export async function processClaimedEntry(
   // any other route (a claim taken when the floor was not yet in force, a caller that does not go through the claim) still sends nothing.
   // It is a read of the row's own creation time against the environment: no value read earlier in the run decides it. With the switch off
   // `xeroCutoffFloor()` is null and this is skipped entirely.
-  if (xeroCutoffFloor() !== null) {
+  if (accountingCutoffInForce()) {
     const born = await db.accountingSyncLog.findUnique({ where: { id: entryId }, select: { createdAt: true } })
     const refusal = xeroBeforeCutoffRefusal({ createdAt: born?.createdAt, type })
     if (refusal !== null) {

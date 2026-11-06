@@ -5805,6 +5805,8 @@ Retention and the shadow record: a shadow's sync-log row expires with the sync-l
 Each variable names one instant. A date without a time, a time without the Z, an offset such as +01:00, precision finer than a millisecond, surrounding whitespace, a list or any other shape is unreadable, and the decision for that destination is SHADOW. A destination needs its outbound-write grant as well as its live-from instant before the decision can be LIVE, and the ownership map decides which operations IMS may produce. A variable has an effect only for a destination named in `PRODUCER_HOLD_ENFORCED_DESTINATIONS`.
 <!-- /producer-disposition:cutoffs -->
 
+A queued row is floored by the live-from instant of the destination it writes to, not by the queue it sits in: the WooCommerce invoice note (an accounting sync-log type whose destination is WooCommerce) uses `WC_WRITES_LIVE_FROM`, every Xero write type uses `XERO_WRITES_LIVE_FROM`, and a PDF fetch or an e-mail has no floor.
+
 <!-- producer-disposition:enforcement -->
 | Variable | Value |
 |---|---|
