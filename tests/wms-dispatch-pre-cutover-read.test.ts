@@ -46,16 +46,25 @@ const GOODS: ImsLine = { sku: 'A', qty: 1, wclcFeeKind: null, productId: 'p1', e
 let imsLines: ImsLine[] = [GOODS]
 let orderCreatedAt = T0
 let bindingChangedAt: Date | null = null // when the wc_settings_version row was last written
+let bindingValue = '2'
+const fetchOptions: Array<Record<string, unknown> | undefined> = []
 let orderRead: () => Response = () => new Response('{}', { status: 500 })
 
 function modelProxy(name: string) {
   return new Proxy({}, {
     get: (_target, method: string) => async (args?: { where?: { key?: string }; data?: Record<string, unknown> }) => {
       calls.push(`${name}.${method}`)
+      if (name === 'setting' && method === 'findMany') {
+        const wanted = (args as { where?: { key?: { in?: string[] } } } | undefined)?.where?.key?.in ?? []
+        return wanted.flatMap((key) => {
+          if (key === 'wc_settings_version') return bindingChangedAt ? [{ key, value: bindingValue, updatedAt: bindingChangedAt }] : []
+          return settings.has(key) ? [{ key, value: settings.get(key)!, updatedAt: T0 }] : []
+        })
+      }
       if (name === 'salesOrder' && method === 'findUnique') return { createdAt: orderCreatedAt, lines: imsLines }
       if (name === 'setting' && (method === 'findUnique' || method === 'findFirst')) {
         const key = args?.where?.key ?? ''
-        if (key === 'wc_settings_version') return bindingChangedAt ? { key, value: '2', updatedAt: bindingChangedAt } : null
+        if (key === 'wc_settings_version') return bindingChangedAt ? { key, value: bindingValue, updatedAt: bindingChangedAt } : null
         return settings.has(key) ? { key, value: settings.get(key) } : null
       }
       switch (method) {
@@ -100,15 +109,21 @@ mock.module('@/lib/integration-plugins', {
 })
 const settingValues = async (keys: string[]) => new Map(keys.flatMap((key) => (settings.has(key) ? [[key, settings.get(key)!] as const] : [])))
 mock.module('@/lib/settings-store', {
-  namedExports: { getSettingValues: settingValues, getSettingValue: async (key: string) => settings.get(key) ?? null },
+  namedExports: { getSettingValues: settingValues, getSettingValue: async (key: string) => settings.get(key) ?? null, deserializeSettingValue: (_key: string, value: string) => value },
 })
 mock.module('@/lib/security/connector-fetch', {
   namedExports: {
     // The Woo transport double: EVERY request is recorded with its method; the order read is scripted; a live push is accepted.
-    connectorFetch: async (url: string | URL, init?: { method?: string }) => {
+    connectorFetch: async (url: string | URL, init?: { method?: string }, options?: Record<string, unknown>) => {
       const method = init?.method ?? 'GET'
       transport.push(`${method} ${String(url)}`)
-      if (method === 'GET' && /\/wp-json\/wc\/v3\/orders\/555$/.test(String(url))) return orderRead()
+      if (method === 'GET' && /\/wp-json\/wc\/v3\/orders\/555$/.test(String(url))) {
+        fetchOptions.push(options)
+        const answer = orderRead()
+        // The real transport throws on a redirect when the caller refuses redirects, and otherwise follows it.
+        if (answer.status >= 300 && answer.status < 400 && options?.refuseRedirects) throw new Error('WooCommerce answered with a redirect; redirects are refused for this request.')
+        return answer
+      }
       if (method === 'POST' && String(url).includes('/partial-shipment')) return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } })
       return new Response('{}', { status: 500, headers: { 'content-type': 'application/json' } })
     },
@@ -131,6 +146,8 @@ function reset() {
   imsLines = [GOODS]
   orderCreatedAt = T0
   bindingChangedAt = null
+  bindingValue = '2'
+  fetchOptions.length = 0
   orderRead = wcOrder()
   for (const [key, value] of Object.entries({
     wc_url: ORIGIN, wc_consumer_key: 'ck_x', wc_consumer_secret: 'cs_x', wc_webhook_secret: 's',
@@ -523,6 +540,66 @@ test('STORE BINDING: a rebind after the order/link was created refuses, even whe
   })
 })
 
+test('PIN: a rebind that lands WHILE the GET is in flight (after the credentials were pinned) makes the answer pending', async () => {
+  // the new store answers perfectly, but the binding moved between the pin and the answer
+  await expectPending('binding_changed', () => {
+    orderRead = () => { bindingChangedAt = new Date('2026-09-01T00:00:00Z'); return wcOrder()() }
+  })
+  // the version VALUE moving is enough, even with the same write time
+  reset()
+  bindingChangedAt = T0
+  orderRead = () => { bindingValue = '3'; return wcOrder()() }
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const run = await sweep([part(1, PRE)])
+    assert.equal(run.out.counters.dispatched, 0)
+    assert.equal(codeOf(), 'binding_changed')
+  })
+  // a binding that does not move during the read verifies
+  reset()
+  bindingChangedAt = T0
+  await withEnv(LIVE_AT_CUTOFF, async () => { assert.equal((await sweep([part(1, PRE)])).out.counters.dispatched, 1) })
+})
+
+test('REDIRECT: the read refuses redirects, and a redirected answer is pending (nothing followed, nothing written)', async () => {
+  reset()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    assert.equal((await sweep([part(1, PRE)])).out.counters.dispatched, 1)
+    assert.deepEqual(fetchOptions.map((o) => o?.refuseRedirects), [true], 'the single GET asks the transport to refuse redirects')
+  })
+  for (const status of [301, 302, 307, 308]) {
+    await expectPending('read_failed', () => { orderRead = () => new Response('', { status, headers: { location: 'https://elsewhere.example.net/wp-json/wc/v3/orders/555' } }) })
+    assert.deepEqual(reads(), [ORDER_READ], 'only the original request was made')
+  }
+})
+
+test('UNKNOWN DESPATCH TIME: a despatched part with ANY undated or invalid tracking entry stays pending - nothing pushed, nothing read, nothing written', async () => {
+  const tracked = (entries: Array<{ trackingNumber: string; carrier: string; despatchedAt?: string }>): Part => ({ ...part(1, PRE), tracking: entries as Part['tracking'] })
+  const dated = { trackingNumber: 'TN-1', carrier: 'DPD', despatchedAt: PRE }
+  for (const bad of [
+    [dated, { trackingNumber: 'TN-2', carrier: 'DPD' }], // an undated entry beside a dated one
+    [dated, { trackingNumber: 'TN-2', carrier: 'DPD', despatchedAt: 'not a date' }], // an invalid one
+    [{ trackingNumber: 'TN-2', carrier: 'DPD', despatchedAt: '' }],
+    [{ trackingNumber: 'TN-2', carrier: 'DPD' }],
+  ]) {
+    for (const env of [LIVE_AT_CUTOFF, SEAM_ON, {}]) {
+      reset()
+      await withEnv(env, async () => {
+        const run = await sweep([tracked(bad), part(2, PRE2)])
+        assert.equal(run.out.counters.dispatched, 0)
+        assert.equal(run.out.counters.pending, 1)
+        assert.deepEqual(run.applyOptions, [])
+        assert.deepEqual(run.asked, [], 'and the verifier is not asked off a guessed time')
+        assert.deepEqual(transport, [], 'no push (which would have been judged LIVE off "now") and no read')
+      })
+    }
+  }
+  // the control: the same order with every entry dated completes
+  reset()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    assert.equal((await sweep([tracked([dated, { trackingNumber: 'TN-2', carrier: 'DPD', despatchedAt: PRE2 }]), part(2, PRE2)])).out.counters.dispatched, 1)
+  })
+})
+
 // ───────────────────────── the read under the outbound-write hold ─────────────────────────
 
 test('HOLD: with no outbound grant at all the transport hold still lets the order GET through and refuses every write', async () => {
@@ -559,4 +636,13 @@ test('parseWcGmtInstant reads only an unambiguous UTC instant', async () => {
   for (const bad of [undefined, null, '', 'x', '2026-05-23', '2026-05-23 09:00:00', '2026-05-23T09:00:00+01:00', '2026-02-31T09:00:00', 5]) {
     assert.equal(parseWcGmtInstant(bad), null, String(bad))
   }
+})
+
+test('latestDespatchTime: any undated or invalid entry makes the time UNKNOWN (null); it never reports the dated ones', async () => {
+  const { latestDespatchTime } = await import('@/lib/domain/wms/dispatch-sweep')
+  assert.equal(latestDespatchTime([{ despatchedAt: PRE }, { despatchedAt: PRE2 }])?.toISOString(), new Date(PRE2).toISOString())
+  assert.equal(latestDespatchTime([{ despatchedAt: PRE }, {}]), null)
+  assert.equal(latestDespatchTime([{ despatchedAt: PRE }, { despatchedAt: 'x' }]), null)
+  assert.equal(latestDespatchTime([{ despatchedAt: PRE }, { despatchedAt: null }]), null)
+  assert.equal(latestDespatchTime([]), null)
 })

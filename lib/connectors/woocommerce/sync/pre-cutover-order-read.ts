@@ -42,7 +42,8 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { judgeWebhookOrigin, attestWebhookOrigin } from '@/lib/connectors/webhook-origin'
-import { getWcCredentials, wcFetch } from '../api'
+import { wcFetch } from '../api'
+import { WC_CREDENTIAL_SETTING_KEYS, resolveWcCredentialsFromRows } from '../credentials'
 import { normaliseWcOrderStatus } from '../order-status-filter'
 import { WC_SETTINGS_VERSION_KEY } from '../sync-lock'
 import { isMirroredFeeLine } from '@/lib/domain/wms/mirrored-fee-line'
@@ -108,6 +109,13 @@ function orderStoreAttestation(order: Record<string, unknown>): string | null {
   return null
 }
 
+/** The binding generation a settings-version row stands for: its value and when it was last written (null when unreadable). */
+function bindingStamp(row: { value?: string; updatedAt?: unknown } | null | undefined): { present: boolean; value: string | null; changedAt: number | null } {
+  if (!row) return { present: false, value: null, changedAt: null }
+  const at = row.updatedAt instanceof Date ? row.updatedAt.getTime() : Number.NaN
+  return { present: true, value: typeof row.value === 'string' ? row.value : null, changedAt: Number.isNaN(at) ? null : at }
+}
+
 /** Null when the storefront's line items are exactly the IMS order's goods lines (same WooCommerce line id, same quantity); otherwise why not. */
 function compareLines(wooItems: unknown, imsLines: ReadonlyArray<{ sku: string | null; qty: unknown; wclcFeeKind: string | null; productId: string | null; externalLineItemId: number | null }>): string | null {
   if (!Array.isArray(wooItems)) return 'the storefront order has no readable line items'
@@ -150,33 +158,39 @@ async function decide(orderId: string, latestDespatchAt: Date | null): Promise<P
     select: { createdAt: true, lines: { select: { sku: true, qty: true, wclcFeeKind: true, productId: true, externalLineItemId: true } } },
   })
   if (!imsOrder) return no('no_link', 'the IMS order could not be found')
-  const boundSince = await db.setting.findUnique({ where: { key: WC_SETTINGS_VERSION_KEY }, select: { updatedAt: true } })
+  // PIN THE BINDING GENERATION: the credentials and the settings version are read in ONE statement, so the request below goes to
+  // the store this version belongs to. (Reading them apart let a rebind land between the check and the credentials, and the GET
+  // then hit the NEW store.) The version is read again after the GET; if it moved, the answer may be the new store's.
+  const pinRows = await db.setting.findMany({
+    where: { key: { in: [...WC_CREDENTIAL_SETTING_KEYS, WC_SETTINGS_VERSION_KEY] } },
+    select: { key: true, value: true, updatedAt: true },
+  })
+  const pinned = bindingStamp(pinRows.find((row) => row.key === WC_SETTINGS_VERSION_KEY))
   const origin = [link.createdAt, imsOrder.createdAt].filter((d): d is Date => d instanceof Date && !Number.isNaN(d.getTime()))
   if (origin.length === 0) return no('binding_changed', 'when the order was linked is unknown, so the store binding cannot be shown unchanged')
-  if (boundSince?.updatedAt) {
-    const changedAt = boundSince.updatedAt instanceof Date ? boundSince.updatedAt.getTime() : Number.NaN
-    if (Number.isNaN(changedAt)) return no('binding_changed', 'when the store binding last changed is unreadable')
-    if (changedAt > Math.min(...origin.map((d) => d.getTime()))) {
+  if (pinned.present) {
+    if (pinned.changedAt === null) return no('binding_changed', 'when the store binding last changed is unreadable')
+    if (pinned.changedAt > Math.min(...origin.map((d) => d.getTime()))) {
       return no('binding_changed', 'the store binding changed after the order was linked, so the linked order id may now name a different store\'s order')
     }
   }
-
-  let creds: Awaited<ReturnType<typeof getWcCredentials>>
-  try {
-    creds = await getWcCredentials()
-  } catch {
-    creds = null
-  }
+  const creds = resolveWcCredentialsFromRows(pinRows)
   if (!creds) return no('not_configured', 'the WooCommerce store is not configured')
 
   // The one request: a GET of the order from the store the credentials (and so the current binding) point at.
   let read: Awaited<ReturnType<typeof wcFetch>>
   try {
-    read = await wcFetch(`/orders/${encodeURIComponent(link.externalOrderId)}`, {}, creds)
+    // A redirect is refused (it would send the credentials on to another origin): it reads as a failed read.
+    read = await wcFetch(`/orders/${encodeURIComponent(link.externalOrderId)}`, {}, creds, { refuseRedirects: true })
   } catch {
     return no('read_failed', 'the storefront order could not be read (request failed or timed out)')
   }
   if (read.error) return no('read_failed', 'the storefront order could not be read (the store refused or did not answer)')
+  // Recheck the binding generation AFTER the GET: a rebind that landed while the request was in flight makes its answer suspect.
+  const after = bindingStamp(await db.setting.findUnique({ where: { key: WC_SETTINGS_VERSION_KEY }, select: { key: true, value: true, updatedAt: true } }))
+  if (after.present !== pinned.present || after.value !== pinned.value || after.changedAt !== pinned.changedAt) {
+    return no('binding_changed', 'the store binding changed while the storefront order was being read, so the answer may come from a different store')
+  }
   if (typeof read.data !== 'object' || read.data === null || Array.isArray(read.data)) {
     return no('unreadable_order', 'the storefront answered with something that is not an order')
   }

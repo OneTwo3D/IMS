@@ -37,6 +37,7 @@ mock.module('@/lib/settings-store', {
   namedExports: {
     getSettingValues: async (keys: string[]) => new Map(keys.flatMap((k) => (settings.has(k) ? [[k, settings.get(k)!] as const] : []))),
     getSettingValue: async (key: string) => settings.get(key) ?? null,
+    deserializeSettingValue: (_key: string, value: string) => value,
   },
 })
 // The Woo transport double: a counter, and the scripted answer to the order read.
@@ -91,7 +92,7 @@ const models: Record<string, unknown> = {
   shipmentLine: { findMany: async () => [{ lineId: 'line-1', productId: 'prod-1', qty: 1 }] },
   salesOrderRefundLine: { findMany: async () => [] },
   product: { findMany: async () => [{ id: 'prod-1', type: 'SIMPLE', fulfillmentGraphVersion: 0, productComponents: [] }] },
-  setting: { findUnique: async (args?: { where?: { key?: string } }) => (settings.has(args?.where?.key ?? '') ? { key: args!.where!.key, value: settings.get(args!.where!.key!) } : null) },
+  setting: { findMany: async (args?: { where?: { key?: { in?: string[] } } }) => (args?.where?.key?.in ?? []).filter((k) => settings.has(k)).map((k) => ({ key: k, value: settings.get(k)!, updatedAt: new Date('2026-04-01T00:00:00Z') })), findUnique: async (args?: { where?: { key?: string } }) => (settings.has(args?.where?.key ?? '') ? { key: args!.where!.key, value: settings.get(args!.where!.key!) } : null) },
 }
 const db: Record<string, unknown> = new Proxy({
   $queryRaw: async () => [],

@@ -621,13 +621,26 @@ export type WmsDispatchSweepDeps = {
 /** The shadow reason of a part despatched before the storefront's live-from instant (the earlier writer owned the store then). */
 const PRE_CUTOVER_SHADOW_REASON: import('@/lib/security/producer-disposition-constants').ProducerReason = 'obligation_before_cutoff'
 
-/** The latest despatch time among a part's tracking entries, or null when the WMS gave none that parses. */
-function latestDespatchTime(tracking: ReadonlyArray<{ despatchedAt?: string | null }>): Date | null {
+/** Whether a tracking entry carries a usable despatch time. */
+function hasUsableDespatchTime(entry: { despatchedAt?: string | null }): boolean {
+  return Boolean(entry.despatchedAt) && !Number.isNaN(new Date(entry.despatchedAt as string).getTime())
+}
+
+/** True when ANY tracking entry is undated or its date does not parse: the part's despatch time is then UNKNOWN, not "the dated ones". */
+function hasUnknownDespatchTime(tracking: ReadonlyArray<{ despatchedAt?: string | null }>): boolean {
+  return tracking.some((entry) => !hasUsableDespatchTime(entry))
+}
+
+/**
+ * The latest despatch time among a part's tracking entries, or null when there is none OR any entry is undated or invalid. An
+ * undated entry is never skipped: skipping it let the dated ones stand for a time that was not known, and the cut-off decision
+ * (which side of the live-from instant a despatch fell) would be taken on it.
+ */
+export function latestDespatchTime(tracking: ReadonlyArray<{ despatchedAt?: string | null }>): Date | null {
+  if (hasUnknownDespatchTime(tracking)) return null
   let latest: Date | null = null
   for (const entry of tracking) {
-    if (!entry.despatchedAt) continue
-    const at = new Date(entry.despatchedAt)
-    if (Number.isNaN(at.getTime())) continue
+    const at = new Date(entry.despatchedAt as string)
     if (latest === null || at.getTime() > latest.getTime()) latest = at
   }
   return latest
@@ -673,6 +686,18 @@ async function reconcileSplitOrder(
   // Push every despatched part to the storefront. A despatched part with no recordable
   // line items can't become a partial shipment — don't let it count toward completion
   // (that would ship the IMS order with a part never recorded).
+  // A despatched part with an undated or invalid tracking entry has an UNKNOWN despatch time. The cut-off decision (live push or
+  // pre-cutover shadow) is taken on that time, so nothing is pushed or verified off a guess: the order stays pending.
+  if (recordPartials) {
+    const unknown = dispatchedParts.find((entry) => hasUnknownDespatchTime(entry.tracking))
+    if (unknown) {
+      return {
+        action: 'pending',
+        reason: `Part ${unknown.partNumber} has a tracking entry with no usable despatch time - holding off until the WMS dates it`,
+        unresolved: requireResolution,
+      }
+    }
+  }
   let allRecorded = true
   // Parts whose storefront record was VERIFIED by a fresh read (pre-cutover) rather than written by this sweep.
   let verifiedPreCutoverParts = 0
