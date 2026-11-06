@@ -32,6 +32,17 @@ Adjustment reasons are **configurable in Settings**. You can add, rename, or rem
 Each adjustment reason can be mapped to a Xero account. When adjustments are synced to Xero, the mapped account is used for the journal entry, ensuring your accounting records stay accurate.
 
 
+## Stock Counts (Stocktakes)
+
+A stock count snapshots the book quantity of each product in a warehouse, you enter what you physically counted, and posting books the differences as stock adjustments.
+
+Posting is a two-step check so a count is never booked against stock that has since moved:
+
+1. **Reconcile** stamps, for every counted line, the on-hand figure the count is being reconciled against and refreshes the line's book quantity and variance to it. Nothing is booked.
+2. **Authorise and post variances** re-reads on-hand under the stock lock. If any counted product's on-hand is no longer the figure it was reconciled against (a receipt landed, an order shipped, the warehouse stock sync ran), or the line was never reconciled, or its counted figure changed after the reconcile, nothing is posted. The message lists each affected product with its earlier on-hand, current on-hand, counted quantity and revised variance, and your counts are kept. Reconcile again to accept the current figures, then authorise again, or investigate first.
+
+Counts under a warehouse that mirrors the WMS in Align To WMS mode are still blocked, and notification-only warehouses still ask for confirmation.
+
 ## Warehouse Transfers
 
 Warehouse transfers move stock from one warehouse to another. A transfer goes through a defined lifecycle:

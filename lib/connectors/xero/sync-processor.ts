@@ -120,6 +120,7 @@ import {
 } from '@/lib/domain/accounting/sync-row-settlement'
 import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
+import { moneyPostIdempotencySource } from '@/lib/domain/accounting/money-post-document'
 import { marksOfOtherPayments } from '@/lib/domain/accounting/payment-identity-marks'
 import { loadOperatorLedgerChecks } from '@/lib/domain/accounting/operator-ledger-check-store'
 import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
@@ -335,6 +336,20 @@ export function buildXeroIdempotencyKey(entryId: string, operation: string, payl
   const key = `ims-${operation}-${entryId}`
   if (key.length <= XERO_IDEMPOTENCY_KEY_MAX_LENGTH) return key
   return `ims-${operation}-${createHash('sha256').update(entryId).digest('hex')}`
+}
+
+/**
+ * The Idempotency-Key of a money-moving post (payment, bill payment, credit-note allocation).
+ *
+ * Derived from the DOCUMENT and the settlement (`moneyPostIdempotencySource`), not from the sync row, so
+ * two rows posting the same payment (the pair the money-post lock exists to keep apart, and the pair a
+ * lost lock connection lets through together) carry ONE key and Xero answers the second with the first's
+ * result instead of creating a second payment. Falls back to the row's own follow-up token or id,
+ * unchanged, whenever the document's identity cannot be stated.
+ */
+export function xeroMoneyPostIdempotencyKey(entryId: string, type: string, payload: SyncPayload, operation: string): string {
+  const documentSource = moneyPostIdempotencySource(type, payload)
+  return buildXeroIdempotencyKey(documentSource ?? followUpIdempotencySource(entryId, payload), operation)
 }
 
 /**
@@ -6400,7 +6415,7 @@ export async function processClaimedEntry(
             // Idempotency-Key is built from, so every attempt of this settlement carries one mark.
             Reference: settlementMarkerFor(followUpIdempotencySource(entryId, payload)),
           }, {
-            idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'invoice-payment'),
+            idempotencyKey: xeroMoneyPostIdempotencyKey(entryId, 'INVOICE_PAYMENT', payload, 'invoice-payment'),
             // o3d-llyw: when the fence's authorisation rested on an operator ledger check, the POST must be
             // built from the connection that check was validated against, or it is not sent.
             ...(requireConnection ? { requireConnection } : {}),
@@ -6579,7 +6594,7 @@ export async function processClaimedEntry(
             // will look for on the bank reconciliation. See INVOICE_PAYMENT above for the mark.
             Reference: [payload.reference as string | undefined, settlementMarkerFor(followUpIdempotencySource(entryId, payload))]
               .filter(Boolean).join(' '),
-          }, { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'bill-payment') })
+          }, { idempotencyKey: xeroMoneyPostIdempotencyKey(entryId, 'BILL_PAYMENT', payload, 'bill-payment') })
           if (!paymentRes.ok) {
             return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
           }
@@ -6692,7 +6707,7 @@ export async function processClaimedEntry(
         if (!fence.ok) return fence.result
         const result = await allocatePurchaseCreditNote(
           { creditNoteId, invoiceId: accountingInvoiceId, amount, date: allocationDate },
-          { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'purchase-credit-note-allocation') },
+          { idempotencyKey: xeroMoneyPostIdempotencyKey(entryId, 'PURCHASE_CREDIT_NOTE_ALLOCATION', payload, 'purchase-credit-note-allocation') },
         )
         // No externalId to back-reference — the allocation is a sub-resource of the
         // credit note, not a standalone document.

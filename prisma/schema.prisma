@@ -2405,6 +2405,8 @@ model StockCount {
   notes       String?
   startedAt   DateTime?
   completedAt DateTime?
+  /// When the counted lines were last reconciled against live on-hand (the instant each line's reconciledQty was stamped). Null = never.
+  reconciledAt DateTime?
   createdAt   DateTime         @default(now())
   updatedAt   DateTime         @updatedAt
 
@@ -2423,6 +2425,8 @@ model StockCountLine {
   expectedQty     Decimal    @db.Decimal(12, 4)
   countedQty      Decimal?   @db.Decimal(12, 4) // null = not yet counted
   variance        Decimal?   @db.Decimal(12, 4) // countedQty - expectedQty
+  /// On-hand (stock_levels.quantity, same 6dp scale) this line was reconciled against. Authorising refuses when live on-hand no longer equals it. Null = not reconciled, or the count changed since.
+  reconciledQty   Decimal?   @db.Decimal(14, 6)
   notes           String?
 
   count           StockCount @relation(fields: [countId], references: [id])

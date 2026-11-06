@@ -12,6 +12,7 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import {
   createStockCount,
   saveStockCountCounts,
+  reconcileStockCount,
   postStockCount,
   cancelStockCount,
   type StockCountRow,
@@ -164,20 +165,26 @@ function StockCountRowView({
   const [reasonId, setReasonId] = useState('')
   const [pending, startTransition] = useTransition()
   const [localError, setLocalError] = useState<string | null>(null)
+  // Lines whose on-hand moved since they were reconciled (the authorise refusal, or what a re-reconcile just refreshed).
+  const [drift, setDrift] = useState<NonNullable<Awaited<ReturnType<typeof postStockCount>>['drift']>>([])
 
-  function run(fn: () => Promise<{ success?: boolean; message?: string }>, okMsg?: string) {
+  function run(fn: () => Promise<{ success?: boolean; message?: string; drift?: typeof drift }>, okMsg?: string) {
     setLocalError(null)
+    setDrift([])
     startTransition(async () => {
       const res = await fn()
-      if (res.success) onChanged(okMsg)
-      else setLocalError(res.message ?? 'Action failed.')
+      if (res.success) {
+        setDrift(res.drift ?? [])
+        onChanged(okMsg)
+      } else setLocalError(res.message ?? 'Action failed.')
     })
   }
 
   // 6oyu.3: posting against a WMS-synced (notification-only) warehouse returns
   // requiresWmsAcknowledgement — surface the warning and re-submit confirmed.
-  function runPost(build: (acknowledgeWmsWarning: boolean) => Promise<{ success?: boolean; message?: string; requiresWmsAcknowledgement?: boolean }>, okMsg: string) {
+  function runPost(build: (acknowledgeWmsWarning: boolean) => Promise<{ success?: boolean; message?: string; requiresWmsAcknowledgement?: boolean; drift?: typeof drift }>, okMsg: string) {
     setLocalError(null)
+    setDrift([])
     startTransition(async () => {
       let res = await build(false)
       if (res.requiresWmsAcknowledgement) {
@@ -185,7 +192,10 @@ function StockCountRowView({
         res = await build(true)
       }
       if (res.success) onChanged(okMsg)
-      else setLocalError(res.message ?? 'Action failed.')
+      else {
+        setLocalError(res.message ?? 'Action failed.')
+        setDrift(res.drift ?? [])
+      }
     })
   }
 
@@ -209,6 +219,32 @@ function StockCountRowView({
         <TableRow>
           <TableCell colSpan={5} className="bg-muted/10 p-4">
             {localError && <p className="text-sm text-destructive mb-2">{localError}</p>}
+            {drift.length > 0 && (
+              <div className="border border-border rounded-md overflow-x-auto mb-2">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="text-left text-muted-foreground">
+                      <th className="px-3 py-1">SKU</th>
+                      <th className="px-3 py-1 text-right">Earlier on hand</th>
+                      <th className="px-3 py-1 text-right">On hand now</th>
+                      <th className="px-3 py-1 text-right">Counted</th>
+                      <th className="px-3 py-1 text-right">Revised variance</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {drift.map((d) => (
+                      <tr key={d.lineId} className="border-t border-border/50 font-mono">
+                        <td className="px-3 py-1">{d.sku}</td>
+                        <td className="px-3 py-1 text-right">{d.earlierOnHand ?? 'not reconciled'}</td>
+                        <td className="px-3 py-1 text-right">{d.currentOnHand}</td>
+                        <td className="px-3 py-1 text-right">{d.countedQty}</td>
+                        <td className="px-3 py-1 text-right">{d.revisedVariance}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
             <div className="border border-border rounded-md overflow-x-auto max-h-[420px] overflow-y-auto">
               <table className="w-full text-sm">
                 <thead className="sticky top-0 bg-background">
@@ -254,6 +290,9 @@ function StockCountRowView({
                 <Button size="sm" variant="outline" disabled={pending} onClick={() => run(() => saveStockCountCounts({ countId: count.id, counts: buildCounts() }), 'Counts saved.')}>
                   {pending ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Save counts'}
                 </Button>
+                <Button size="sm" variant="outline" disabled={pending} onClick={() => run(() => reconcileStockCount({ countId: count.id, counts: buildCounts() }), 'Counts reconciled against current stock.')}>
+                  {count.reconciledAt ? 'Reconcile again' : 'Reconcile'}
+                </Button>
                 <Select value={reasonId} onChange={(e) => setReasonId(e.target.value)} className="h-8 text-xs w-48">
                   <option value="">Variance reason (optional)</option>
                   {reasons.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
@@ -267,7 +306,7 @@ function StockCountRowView({
                     runPost((acknowledgeWmsWarning) => postStockCount({ countId: count.id, reasonId: reasonId || undefined, counts: buildCounts(), acknowledgeWmsWarning }), 'Stock count posted.')
                   }}
                 >
-                  Post variances
+                  Authorise and post variances
                 </Button>
                 <Button
                   size="sm" variant="ghost" className="text-muted-foreground hover:text-destructive gap-1" disabled={pending}
