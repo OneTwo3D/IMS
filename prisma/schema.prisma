@@ -1763,6 +1763,10 @@ model SalesOrder {
   // Totals (in order currency)
   subtotalForeign   Decimal          @db.Decimal(18, 4)
   shippingService   String?          // e.g. "Royal Mail", "DPD Next Day"
+  /// Language-independent courier key the storefront stores on the order's first shipping line (meta `_o3d_courier_key`,
+  /// e.g. "calcurates:6384_7418(VAT & duty paid)"), mirrored verbatim. Sent to the warehouse as the courier service in
+  /// place of the (translated) shipping label. Null when the order carries none.
+  courierKey        String?          @map("courier_key")
   shippingForeign   Decimal          @db.Decimal(18, 4) @default(0)
   taxRateName       String?          // e.g. "UK Standard Rate"
   taxRatePercent    Decimal?         @db.Decimal(5, 4) // e.g. 0.2000

@@ -57,6 +57,21 @@ export function resolveMappedCourierId(courierService: string | null, mapJson: s
 }
 
 /**
+ * Resolve the order's courier through the configured map: the courier key (`courierService`) first, then the
+ * shipping label it replaced, so an override authored against the label keeps working once orders carry a key.
+ */
+export function resolveMappedCourierIdForInput(
+  input: Pick<WmsOrderPushInput, 'courierService' | 'courierServiceLabel'>,
+  mapJson: string,
+): number | null {
+  const byName = resolveMappedCourierId(input.courierService, mapJson)
+  if (byName != null) return byName
+  return input.courierServiceLabel && input.courierServiceLabel !== input.courierService
+    ? resolveMappedCourierId(input.courierServiceLabel, mapJson)
+    : null
+}
+
+/**
  * Strict parse for the configured default CourierServiceId: a plain positive
  * integer, else null. Plain-digit only so the saved value and this consumer
  * agree (avoids `parseInt`/`Number` divergence on `"1e3"`, `"0x10"`, decimals).
@@ -190,7 +205,7 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   // Courier selection: a configured shipping-service → CourierServiceId mapping
   // wins; else pass the name through for the WMS to resolve; else (no service on
   // the order at all) fall straight to the configured default id if one is set.
-  const mappedId = resolveMappedCourierId(input.courierService, settings.mintsoft_courier_service_map)
+  const mappedId = resolveMappedCourierIdForInput(input, settings.mintsoft_courier_service_map)
   const defaultId = parseDefaultCourierId(settings.mintsoft_default_courier_service_id)
   const initialCourier: CourierOption =
     mappedId != null ? { kind: 'mappedId', courierServiceId: mappedId }
@@ -248,6 +263,31 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   // used from the outset (order had no shipping service) is equally "pending" — the
   // warehouse should still confirm the courier before despatch (G6).
   let courierFallback = initialCourier.kind === 'defaultId'
+
+  // The language-independent courier key was sent and Mintsoft definitively refused it (a decoded
+  // `Success: false` answer naming the courier service: nothing was created) → retry ONCE with the legacy
+  // label form this order would have been pushed with before the key existed, ahead of any placeholder
+  // courier. Anything else (a transport fault, a timeout, a hold, a maybe-sent refusal, an answer that does
+  // not say `Success: false`) throws out of createOrReconcile or fails the test below, so it is never retried
+  // this way: only a rejection that provably created nothing earns a second PUT. It goes through the same
+  // createOrReconcile (outbound hold, maybe-sent reconciliation) as the first.
+  const legacyLabel = input.courierServiceLabel
+  if (
+    !created.ok && created.data?.Success === false && created.message
+    && /unable to find courier\s?service/i.test(created.message)
+    && legacyLabel && input.courierService && legacyLabel !== input.courierService
+  ) {
+    const legacyInput = { ...input, courierService: legacyLabel, courierServiceLabel: null }
+    const legacyMappedId = resolveMappedCourierId(legacyLabel, settings.mintsoft_courier_service_map)
+    created = await createOrReconcile(buildPushPayload(
+      legacyInput,
+      legacyMappedId != null ? { kind: 'mappedId', courierServiceId: legacyMappedId } : { kind: 'name' },
+    ))
+    if (created.ok) console.info('Mintsoft order create: courier key refused, the legacy shipping-label form succeeded')
+  } else if (created.ok && legacyLabel && input.courierService && legacyLabel !== input.courierService) {
+    console.info('Mintsoft order create: the courier key form succeeded')
+  }
+
   if (
     !created.ok && created.message && /courierservice/i.test(created.message)
     && defaultId != null && initialCourier.kind !== 'defaultId'

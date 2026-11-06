@@ -2787,6 +2787,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           shippingAddress: mapWcAddress(wcOrder.shipping),
           subtotalForeign,
           shippingService: shipping.shippingService,
+          courierKey: shipping.courierKey,
           shippingForeign,
           taxRateName,
           taxRatePercent: taxRateValue > 0 ? taxRateValue : null,

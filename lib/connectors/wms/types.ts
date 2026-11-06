@@ -406,6 +406,11 @@ export type WmsOrderPushInput = {
   comments: string | null
   /** Carrier/service name passed through for the WMS to resolve; null = WMS default. */
   courierService: string | null
+  /**
+   * The shipping label, when `courierService` is the language-independent courier key instead. A courier map is
+   * consulted against `courierService` first, then this. Absent/null: nothing further to try.
+   */
+  courierServiceLabel?: string | null
   totalVat: number
   shippingExVat: number
   shippingVat: number

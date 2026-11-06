@@ -40,6 +40,8 @@ export type WcShippingLine = {
   total: string
   total_tax: string
   taxes: { id: number; total: string }[]
+  /** Present on REST v3; carries the storefront's courier key (`_o3d_courier_key`). */
+  meta_data?: WcMeta[]
 }
 
 export type WcCouponLine = {

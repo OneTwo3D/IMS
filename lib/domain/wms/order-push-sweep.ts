@@ -365,6 +365,8 @@ type OrderForPush = {
   /** Fallback destination and contact details when the shipping address names no recipient. */
   billingAddress?: unknown
   shippingService: string | null
+  /** Language-independent courier key from the storefront; preferred over the label as the WMS courier service. */
+  courierKey?: string | null
   subtotalForeign: unknown
   shippingForeign: unknown
   taxForeign: unknown
@@ -567,7 +569,7 @@ export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, 
 }
 
 // Fields the push payload needs; shared by the create and update passes.
-const ORDER_PUSH_SELECT = {
+export const ORDER_PUSH_SELECT = {
   id: true,
   orderNumber: true,
   externalOrderNumber: true,
@@ -578,6 +580,7 @@ const ORDER_PUSH_SELECT = {
   shippingAddress: true,
   billingAddress: true,
   shippingService: true,
+  courierKey: true,
   subtotalForeign: true,
   shippingForeign: true,
   taxForeign: true,
@@ -623,7 +626,11 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string)
     phone: recipient.phone,
     vatNumber: order.customerVatNumber,
     comments: null,
-    courierService: order.shippingService,
+    // The storefront's language-independent key when the order carries one (the label is translated per
+    // shopper language); otherwise the label, exactly as before. The label stays on the input so an operator
+    // override authored against it still applies.
+    courierService: order.courierKey?.trim() || order.shippingService,
+    courierServiceLabel: order.shippingService,
     totalVat: num(order.taxForeign),
     shippingExVat: num(order.shippingForeign),
     shippingVat: 0,
