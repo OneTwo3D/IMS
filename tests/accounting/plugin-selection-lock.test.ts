@@ -1112,6 +1112,7 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // The read-sync alarm bounds its claim transaction with a constant `SET LOCAL statement_timeout`; it names no plugin key.
   'lib/ops/read-sync-liveness-alarm.ts': 'runtime-assembled-sql',
   'lib/db/savepoint.ts': 'runtime-assembled-sql',
+  'lib/domain/erasure/reconcile-free-text.ts': 'runtime-assembled-sql', // table and column names come from a constant list; it writes no plugin key
   // o3d-zjsb5.9 r13. The duplicate-recipe repair's logic, discovered here because `readServerIdentity`
   // issues raw SELECTs. Read to classify: it constructs NO client of its own -- every statement runs on
   // the transaction client the caller passes, which is the app's own pooled client. Its SQL is CONSTANT
