@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
 import { countReversedEpisodes, moneyPostIdempotencySource } from '@/lib/domain/accounting/money-post-document'
-import { buildXeroIdempotencyKey, xeroMoneyPostIdempotencyKey } from '@/lib/connectors/xero/sync-processor'
+import { buildXeroIdempotencyKey, resolveXeroMoneyPostIdempotencyKey, xeroMoneyPostIdempotencyKey } from '@/lib/connectors/xero/sync-processor'
 
 /**
  * THE CONNECTOR IDEMPOTENCY KEY OF A MONEY POST IS THE SETTLEMENT'S, NOT THE SYNC ROW'S.
@@ -111,6 +111,20 @@ test('countReversedEpisodes counts only reversed registrations of the SAME settl
   const pay = invoice()
   const rows = [{ payload: invoice({ paymentId: 'PAY-1' }) }, { payload: invoice({ paymentId: 'PAY-2' }) }, { payload: invoice({ accountingInvoiceId: 'INV-9' }) }]
   assert.equal(countReversedEpisodes('INVOICE_PAYMENT', pay, rows), 1, 'another receipt\'s reversal is not this settlement\'s episode')
+})
+
+test('a key already stored on the row is returned as it is: no derivation query, no write', async () => {
+  const calls: string[] = []
+  const client = {
+    accountingSyncLog: {
+      findUnique: async () => { calls.push('findUnique'); return { payload: { _moneyPostIdempotencyKey: 'ims-bill-payment-STORED' }, remoteAttemptedAt: null, attemptStampingCustodyAt: new Date() } },
+      findMany: async () => { calls.push('findMany'); return [] },
+    },
+    $executeRaw: async () => { calls.push('executeRaw'); return 0 },
+  }
+  const key = await resolveXeroMoneyPostIdempotencyKey(client as never, { entryId: 'r1', type: 'BILL_PAYMENT', payload: { accountingInvoiceId: 'B', amount: 5 }, operation: 'bill-payment' })
+  assert.equal(key, 'ims-bill-payment-STORED')
+  assert.deepEqual(calls, ['findUnique'])
 })
 
 test('WIRING: every Xero money post sends the stored/resolved key, and none builds it from the row at the call site', async () => {
