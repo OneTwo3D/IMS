@@ -64,6 +64,8 @@ export type ErasureCounts = {
   paymentNotesErased: number
   /** Rows hanging off these orders (warehouse links, discrepancies, returns inbox, stock movements) whose free text had the subject's values removed. */
   linkedFreeTextScrubbed: number
+  /** Email suppression rows for the subject's addresses (the address is the erased person's) that were deleted. */
+  bounceRecordsDeleted: number
   /** Existing activity-log rows whose description or metadata held the subject's identifying values. */
   activityRowsScrubbed: number
   notifications: number

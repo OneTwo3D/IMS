@@ -73,7 +73,7 @@ export async function eraseOrdersPersonalDataInTx(
   orderIds: string[],
   erasedAt: Date,
 ): Promise<Omit<ErasureCounts, 'customers' | 'shoppingCustomerLinks' | 'activityRowsScrubbed' | 'linkedFreeTextScrubbed'>> {
-  const counts = { salesOrders: 0, shipments: 0, shoppingOrderLinks: 0, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, notifications: 0 }
+  const counts = { salesOrders: 0, shipments: 0, shoppingOrderLinks: 0, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, notifications: 0 }
   for (const ids of chunks(orderIds)) {
     counts.salesOrders += (await tx.salesOrder.updateMany({
       where: { id: { in: ids } },
@@ -101,6 +101,15 @@ export async function eraseOrdersPersonalDataInTx(
     // undelivered-reference unique index, which only matters if the same (kind, order) is queued again, and
     // the email builders refuse an order with no address. A PROCESSING row is handled below.
     const outboxWhere = { referenceType: 'SalesOrder', referenceId: { in: ids } }
+    // SUPPRESSION ROWS FOR THESE ORDERS' ADDRESSES are the erased person's data (the address, and the mail server's raw text, which can echo it):
+    // the addresses are read from the outbox rows BEFORE they are replaced below and the matching suppression rows are deleted. The address
+    // is normalised the way the suppression writer normalises it (trimmed, lower-cased). If another live customer later uses the same address,
+    // a fresh bounce simply suppresses it again.
+    const queuedTo = await tx.emailOutbox.findMany({ where: outboxWhere, select: { toEmail: true }, distinct: ['toEmail'] })
+    const suppressAddresses = queuedTo.map((r) => r.toEmail.trim().toLowerCase()).filter((a) => a && a !== ERASURE_PLACEHOLDER_EMAIL)
+    if (suppressAddresses.length > 0) counts.bounceRecordsDeleted += (await tx.emailSuppression.deleteMany({ where: { email: { in: suppressAddresses } } })).count
+    // The raw mail-server text on these rows' lastError can echo the address, in any status: replaced, claim and status untouched.
+    await tx.emailOutbox.updateMany({ where: { ...outboxWhere, lastError: { not: null }, NOT: { lastError: ERASED_FREE_TEXT_MARKER } }, data: { lastError: ERASED_FREE_TEXT_MARKER } })
     counts.outboxRowsErased += (await tx.emailOutbox.updateMany({
       where: { ...outboxWhere, status: { in: ['SENT', 'FAILED'] }, NOT: { toEmail: ERASURE_PLACEHOLDER_EMAIL } },
       data: { toEmail: ERASURE_PLACEHOLDER_EMAIL },
@@ -419,6 +428,9 @@ export async function eraseCustomerPersonalData(
       })
       if (claimed.count === 0) return 'Customer already anonymised'
       const orderCounts = await eraseOrdersPersonalDataInTx(tx, orderIds, erasedAt)
+      // The addresses the person is known by (the customer's and each order's), read under the locks, also have their suppression rows deleted.
+      const knownAddresses = [...new Set([before?.email, ...orderRows.map((o) => o.customerEmail)].map((a) => a?.trim().toLowerCase()).filter((a): a is string => Boolean(a)))]
+      if (knownAddresses.length > 0) orderCounts.bounceRecordsDeleted += (await tx.emailSuppression.deleteMany({ where: { email: { in: knownAddresses } } })).count
       // THE STOREFRONT ACCOUNT LINK IS DELETED, not blanked: its externalCustomerId is the live storefront customer id and resolves to
       // the account, and nothing financial references the row (it has no dependants; orders keep their own order link). With it gone
       // a later order from the same storefront account finds no link, no email on the erased row to match, and so gets a FRESH

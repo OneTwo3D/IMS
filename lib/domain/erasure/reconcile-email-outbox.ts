@@ -1,6 +1,9 @@
 import { db } from '@/lib/db'
 import { EMAIL_RECIPIENT_ERASED_REASON, ERASED_RECIPIENT_PLACEHOLDER } from './email-recipient'
 
+/** The identity-free marker the erasure writes over free text (the same string as ERASED_FREE_TEXT_MARKER; restated here to keep this module free of the erasure core's imports). */
+const ERASED_FREE_TEXT_MARKER_TEXT = 'Text removed by GDPR erasure'
+
 /**
  * THE RECONCILE PASS for outbox rows the erasure could not finish in its own transaction.
  *
@@ -27,5 +30,12 @@ export async function reconcileErasedEmailOutbox(): Promise<{ addressesErased: n
      WHERE e."referenceType" = 'SalesOrder' AND e."referenceId" = o."id" AND o."erasedAt" IS NOT NULL
        AND e."toEmail" <> ${ERASED_RECIPIENT_PLACEHOLDER}
        AND e."status"::text IN ('PROCESSING', 'SENT', 'FAILED')`
-  return { addressesErased: Number(addressesErased) + Number(cancelled), cancelled: Number(cancelled) }
+  // A failure text written after the erasure (a worker whose claim straddled it) can echo the address: replaced the same way.
+  const errorsCleared = await db.$executeRaw`
+    UPDATE "email_outbox" e
+       SET "lastError" = ${ERASED_FREE_TEXT_MARKER_TEXT}
+      FROM "sales_orders" o
+     WHERE e."referenceType" = 'SalesOrder' AND e."referenceId" = o."id" AND o."erasedAt" IS NOT NULL
+       AND e."lastError" IS NOT NULL AND e."lastError" <> ${ERASED_FREE_TEXT_MARKER_TEXT} AND e."lastError" <> ${EMAIL_RECIPIENT_ERASED_REASON}`
+  return { addressesErased: Number(addressesErased) + Number(cancelled) + Number(errorsCleared), cancelled: Number(cancelled) }
 }

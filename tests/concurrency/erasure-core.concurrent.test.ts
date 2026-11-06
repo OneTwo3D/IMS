@@ -22,6 +22,8 @@ const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const skip = !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1'
 
 let accountingMocked = false
+// Scripts the mail transport double (see mockActionEnvironment).
+let mailerImpl: ((message: { to: string }) => Promise<Record<string, unknown>>) | null = null
 // When set, the Mintsoft connector double returns these records from pollReturns.
 let pollReturnsRecords: (() => Array<Record<string, unknown>>) | null = null
 // Runs after upsertCustomer has returned (inside importWcOrder), before the order is created.
@@ -63,6 +65,9 @@ async function mockActionEnvironment() {
   // records. No other behaviour changes and nothing here can reach the warehouse.
   const registry = await import('@/lib/connectors/wms/registry')
   mock.module('@/lib/connectors/wms/registry', { namedExports: { ...registry, getWmsConnector: (id: never) => (pollReturnsRecords && (id as string) === 'mintsoft' ? { pollReturns: async () => pollReturnsRecords!() } : registry.getWmsConnector(id)) } })
+  // The mail transport double: no SMTP is ever contacted. A test sets `mailerImpl` to script the answer.
+  const mailer = await import('@/lib/mailer')
+  mock.module('@/lib/mailer', { namedExports: { ...mailer, sendEmail: async (message: never) => (mailerImpl ? mailerImpl(message) : { success: true }) } })
   // A seam AFTER the importer's customer lookup/link step returned its customer and before the order create transaction starts.
   const fieldMapping = await import('@/lib/connectors/woocommerce/sync/field-mapping')
   mock.module('@/lib/connectors/woocommerce/sync/field-mapping', { namedExports: { ...fieldMapping, upsertCustomer: async (order: never) => { const id = await fieldMapping.upsertCustomer(order); await afterUpsertCustomer?.(); return id } } })
@@ -1266,4 +1271,76 @@ test('[erasure] the returns sync never reads the warehouse\'s free text back int
     assert.ok(!JSON.stringify(event).includes(NAME.last))
   }
   assert.ok(events.some((e) => (e.after as { reason?: string | null }).reason === 'Text removed by GDPR erasure'), 'an event that held a reason now holds the marker')
+})
+
+
+test('[erasure] suppression rows and mail-server text: erasure deletes the subject\'s suppression rows and clears lastError on the order\'s outbox rows, in any status', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { eraseCustomerPersonalData, ERASED_FREE_TEXT_MARKER } = await import('@/lib/domain/erasure/erase-personal-data')
+  const other = `unrelated+${randomUUID().slice(0, 8)}@example.test`
+  await db.emailSuppression.create({ data: { email: EMAIL, reason: `550 5.1.1 <${EMAIL}> user unknown`, source: 'smtp' } })
+  await db.emailSuppression.create({ data: { email: other, reason: `550 <${other}> user unknown`, source: 'smtp' } })
+  await db.emailOutbox.updateMany({ where: { referenceId: fx.orderId }, data: { lastError: `550 5.1.1 <${EMAIL}> user unknown` } })
+  t.after(async () => { await db.emailSuppression.deleteMany({ where: { email: { in: [EMAIL, other] } } }); await fx.cleanup() })
+
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  assert.equal(await db.emailSuppression.count({ where: { email: EMAIL } }), 0, 'the subject\'s suppression row (address and raw server text) is deleted')
+  assert.equal(await db.emailSuppression.count({ where: { email: other } }), 1, 'another address is untouched')
+  const rows = await db.emailOutbox.findMany({ where: { referenceId: fx.orderId } })
+  assert.ok(rows.length >= 4)
+  for (const row of rows) {
+    assert.ok(row.lastError === ERASED_FREE_TEXT_MARKER || row.lastError === 'Cancelled: the recipient\'s personal data was erased', `lastError on a ${row.status} row: ${row.lastError}`)
+    assert.ok(!JSON.stringify(row).includes(EMAIL))
+  }
+  assert.ok(rows.some((r) => r.status === 'PROCESSING' && r.lockedBy === 'claim-token'), 'a claimed row keeps its claim')
+})
+
+test('[erasure] an invalid-recipient answer completing while the erasure holds the order lock writes no suppression row and no address; the same answer for a live order does (control)', { skip }, async (t) => {
+  const db = await loadDb()
+  const { processPendingEmailOutbox } = await import('@/lib/email-outbox')
+  const fx = await importFixture(db)
+  const liveTo = `control+${randomUUID().slice(0, 8)}@example.test`
+  const erasedTo = `target+${randomUUID().slice(0, 8)}@example.test`
+  const mk = (orderId: string, toEmail: string) => db.emailOutbox.create({ data: { kind: 'UNKNOWN_KIND', toEmail, subject: 'x', html: 'queued', referenceType: 'SalesOrder', referenceId: orderId, status: 'PENDING' } })
+  t.after(async () => {
+    mailerImpl = null
+    await db.emailSuppression.deleteMany({ where: { email: { in: [liveTo, erasedTo] } } })
+    await fx.cleanup()
+  })
+  const invalid = async (message: { to: string }) => ({ success: false, permanent: true, invalidRecipient: true, error: `550 5.1.1 <${message.to}> user unknown` })
+
+  // CONTROL: a live order's invalid recipient is suppressed, with the server's text.
+  await db.emailOutbox.deleteMany({ where: { status: 'PENDING' } })
+  await mk(fx.orderId, liveTo)
+  mailerImpl = invalid
+  await processPendingEmailOutbox()
+  assert.equal(await db.emailSuppression.count({ where: { email: liveTo } }), 1, 'control: a live order\'s bounce is suppressed')
+  assert.match((await db.emailOutbox.findFirstOrThrow({ where: { toEmail: liveTo } })).lastError ?? '', /user unknown/)
+
+  // RACE: the erasure holds the order lock; the bounce completes meanwhile and must wait, then see the marker.
+  await db.emailOutbox.deleteMany({ where: { status: 'PENDING' } })
+  const row = await mk(fx.orderId, erasedTo)
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const { lockSalesOrder } = await import('@/lib/domain/sales/allocation-service')
+  const erasing = db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, fx.orderId)
+    await gate
+    await tx.salesOrder.update({ where: { id: fx.orderId }, data: { erasedAt: new Date() } })
+  }, { timeout: 30_000 })
+  await new Promise((r) => setTimeout(r, 300))
+  mailerImpl = invalid
+  let drained = false
+  const draining = processPendingEmailOutbox().then(() => { drained = true })
+  await new Promise((r) => setTimeout(r, 1500))
+  assert.equal(drained, false, 'PRECONDITION: the drain is waiting on the order lock to write the bounce outcome')
+  release()
+  await erasing
+  await draining
+  assert.equal(await db.emailSuppression.count({ where: { email: erasedTo } }), 0, 'no suppression row for an erased order\'s address')
+  const after = await db.emailOutbox.findUniqueOrThrow({ where: { id: row.id } })
+  assert.equal(after.status, 'FAILED')
+  assert.equal(after.toEmail, 'erased@erased.invalid')
+  assert.ok(!JSON.stringify(after).includes(erasedTo), 'no row holds the address or the server text that echoes it')
 })

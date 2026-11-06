@@ -133,6 +133,7 @@ import { logActivity } from '@/lib/activity-log'
 import { db } from '@/lib/db'
 import { uniqueConstraintFields } from '@/lib/db/prisma-unique-violation'
 import { sendEmail } from '@/lib/mailer'
+import { writeInvalidRecipientOutcome, type InvalidRecipientWriter } from '@/lib/email-outbox-invalid-recipient'
 import { prepareQueuedEmail } from '@/lib/order-email'
 import {
   EMAIL_RECIPIENT_ERASED_REASON,
@@ -1293,6 +1294,11 @@ export type ResolvedEmailOutboxDependencies = Omit<EmailOutboxHarness, 'client'>
    * it needs the answer.
    */
   inMemoryOutboxRows: (() => unknown) | null
+  /**
+   * PRODUCTION ONLY: writes the invalid-recipient outcome of a SALES-ORDER email under the order lock, honouring the erasure (see
+   * lib/email-outbox-invalid-recipient.ts). `null` for a harness or lane client, which has no order table and keeps the plain path.
+   */
+  invalidRecipientWriter: InvalidRecipientWriter | null
 }
 
 /**
@@ -1714,6 +1720,7 @@ export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOption
       // drain. The check below exists to stop a HARNESS sweeping those rows, not to second-guess
       // the production client.
       inMemoryOutboxRows: null,
+      invalidRecipientWriter: writeInvalidRecipientOutcome,
     }
   }
 
@@ -1826,6 +1833,7 @@ export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOption
     logActivity: validated.logActivity as EmailOutboxHarness['logActivity'],
     now: validated.now as EmailOutboxHarness['now'],
     inMemoryOutboxRows,
+    invalidRecipientWriter: null,
   }
 }
 
@@ -1996,6 +2004,7 @@ export async function processPendingEmailOutbox(
     // check below the sweep, and the field's own documentation for why those two are not the same
     // kind of absence.
     inMemoryOutboxRows,
+    invalidRecipientWriter,
   } = resolveEmailOutboxDependencies(options)
 
   const staleCutoff = new Date(now().getTime() - EMAIL_CLAIM_STALE_MS)
@@ -2560,30 +2569,41 @@ export async function processPendingEmailOutbox(
 
       const attempts = email.attempts + 1
       const permanentFailure = reportedPermanent || attempts >= EMAIL_MAX_ATTEMPTS
-      if (invalidRecipient) {
-        const suppressionReason = sendError ?? 'Invalid recipient rejected by SMTP provider'
-        await smtp.suppressionWrite(() => client.emailSuppression.upsert({
-          where: { email: normalizedRecipient },
-          create: {
-            email: normalizedRecipient,
-            reason: suppressionReason,
-            source: 'smtp',
-            lastHitAt: now(),
-          },
-          update: {
-            reason: suppressionReason,
-            source: 'smtp',
-            lastHitAt: now(),
-          },
-        }))
-      }
-      const settled = await smtp.settlementWrite(() => settleClaimedEmail(client, claim, {
+      const settleData = {
         status: permanentFailure ? 'FAILED' : 'PENDING',
         attempts,
         lastError: sendError ?? 'Unknown email error',
         availableAt: permanentFailure ? email.availableAt : new Date(now().getTime() + getBackoffMs(email.attempts)),
         processingStartedAt: null,
-      }))
+      }
+      let settled: boolean
+      if (invalidRecipient && invalidRecipientWriter && email.referenceType === 'SalesOrder' && email.referenceId) {
+        // A SALES-ORDER email on the production queue: the suppression row and the failure are written TOGETHER under the order lock, and
+        // nothing about the address is written if the person was erased (lib/email-outbox-invalid-recipient.ts).
+        const orderId = email.referenceId
+        settled = await smtp.settlementWrite(() => invalidRecipientWriter({
+          orderId, claim, normalizedRecipient, suppressionReason: sendError ?? 'Invalid recipient rejected by SMTP provider', now: now(), settleData,
+        }))
+      } else {
+        if (invalidRecipient) {
+          const suppressionReason = sendError ?? 'Invalid recipient rejected by SMTP provider'
+          await smtp.suppressionWrite(() => client.emailSuppression.upsert({
+            where: { email: normalizedRecipient },
+            create: {
+              email: normalizedRecipient,
+              reason: suppressionReason,
+              source: 'smtp',
+              lastHitAt: now(),
+            },
+            update: {
+              reason: suppressionReason,
+              source: 'smtp',
+              lastHitAt: now(),
+            },
+          }))
+        }
+        settled = await smtp.settlementWrite(() => settleClaimedEmail(client, claim, settleData))
+      }
       // This is the write the issue was raised for: unfenced, it re-armed a row another worker had
       // already settled to SENT, so further copies went out on ordinary drain ticks with no further
       // stale window needed. (The reclaim's OWN cost is bounded separately, by the reclaim cap —

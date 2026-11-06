@@ -71,8 +71,8 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
     },
   },
   EmailOutbox: {
-    erased: ['toEmail'],
-    notPersonal: ['id', 'kind', 'referenceType', 'referenceId', 'lastError', 'lockedBy'],
+    erased: ['toEmail', 'lastError'],
+    notPersonal: ['id', 'kind', 'referenceType', 'referenceId', 'lockedBy'],
     retained: {
       subject: 'carries the order reference only ("Order Confirmation <ref>"), never a name',
       html: 'a literal placeholder at enqueue; the body is rendered at send time from the live order',
@@ -140,6 +140,8 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
 }
 
 // Reached from an erased order's return by the inbox row id / the order id, not by a foreign key (named in the schema test).
+// The suppression table is keyed by ADDRESS: the erasure deletes the rows for the subject's addresses (the address and the mail server's raw text).
+ERASURE_CLASSIFICATION.EmailSuppression = { erased: ['email', 'reason'], notPersonal: ['id', 'source'], retained: {} }
 ERASURE_CLASSIFICATION.WmsMutationEvent = {
   erased: ['before', 'after'],
   notPersonal: ['connector', 'action', 'entityType', 'entityId', 'externalId', 'summary', 'error', 'jobId', 'triggeredBy'],

@@ -2017,9 +2017,9 @@ test('r22: `thrownPhase` enumerates the try, and every arm is distinct', () => {
   // disappearing or being added (r38 narrowed "every post-send write").
   assert.equal(
     [...source.matchAll(/smtp\.settlementWrite\(/g)].length,
-    4,
+    5,
     'the settlement writes inside the `try` are no longer all routed through the progress record '
-    + '(r30 brought the SUPPRESSED-recipient settlement inside the fenced region, which makes three; the erasure RECIPIENT REFUSAL is the fourth)',
+    + '(r30 brought the SUPPRESSED-recipient settlement inside the fenced region, which makes three; the erasure RECIPIENT REFUSAL is the fourth; the production invalid-recipient write under the order lock is the fifth)',
   )
   assert.equal(
     [...source.matchAll(/smtp\.suppressionWrite\(/g)].length,
