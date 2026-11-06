@@ -21,6 +21,7 @@ import {
   enforceCronRateLimit,
 } from '@/lib/cron-rate-limit'
 import { getAllCronJobs } from '@/lib/cron-registry'
+import { PACK_SCHEDULE_SLUG } from '@/lib/reconciliation-pack/schedule-constants'
 import { MemoryRateLimitBackend } from '@/lib/security/rate-limit-memory'
 
 test('cron rate-limit helper uses per-job keys and the limit derived from the registry schedule', async () => {
@@ -506,17 +507,19 @@ test('census: every registry job limit leaves headroom above its scheduled firin
   assert.ok(!(maxPriorFirings('0 */6 * * 1', 24 * HOUR) < 3), 'a daily allowance of 3 would refuse the 4th Monday run of a 6-hourly Monday job')
 
   // A route that passes its own max/windowMs bypasses the derivation; only unregistered routes may.
-  const registered = new Set(jobs.map((j) => j.slug))
+  // EVERY cron route must enforce the limiter under its own job name, and a registered one must not override it.
   const routesDir = join(process.cwd(), 'app/api/cron')
-  for (const dir of readdirSync(routesDir)) {
-    const file = join(routesDir, dir, 'route.ts')
-    if (!existsSync(file)) continue
-    const source = readFileSync(file, 'utf8')
-    const call = /enforceCronRateLimit\(\s*([^,]+),\s*\{([^}]*)\}/.exec(source)
-    if (!call || !/\b(max|windowMs)\s*:/.test(call[2])) continue
-    assert.ok(
-      !registered.has(dir) && !/PACK_SCHEDULE_SLUG/.test(call[1]),
-      `${dir}: registered cron job passes its own max/windowMs; let the registry schedule derive it`,
-    )
+  const registered = new Map(jobs.map((j) => [j.slug === PACK_SCHEDULE_SLUG ? 'reconciliation-pack' : j.slug, j.slug]))
+  const dirs = readdirSync(routesDir).filter((dir) => existsSync(join(routesDir, dir, 'route.ts')))
+  for (const slug of registered.keys()) assert.ok(dirs.includes(slug), `${slug}: registered job has no app/api/cron/${slug}/route.ts`)
+  for (const dir of dirs) {
+    const source = readFileSync(join(routesDir, dir, 'route.ts'), 'utf8')
+    const call = /enforceCronRateLimit\(\s*([^,)]+?)\s*(?:,\s*\{([^}]*)\})?\s*\)/.exec(source)
+    assert.ok(call, `${dir}: cron route does not call enforceCronRateLimit`)
+    const jobArg = call[1].trim()
+    const jobName = jobArg === 'PACK_SCHEDULE_SLUG' ? PACK_SCHEDULE_SLUG : jobArg.replace(/^'|'$/g, '')
+    if (!registered.has(dir)) continue // unregistered route (no schedule to derive from): may carry its own max
+    assert.equal(jobName, registered.get(dir), `${dir}: enforces the limiter under the wrong job name`)
+    assert.ok(!/\b(max|windowMs)\s*:/.test(call[2] ?? ''), `${dir}: registered cron job passes its own max/windowMs; let the registry schedule derive it`)
   }
 })

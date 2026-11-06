@@ -171,9 +171,10 @@ export function cronRateLimitFor(jobName: string, schedule?: string | null): Cro
 }
 
 /**
- * Cron jobs that make LIVE Xero API calls on a run (census of the registry's accounting module): each shares the one Xero
- * tenant, whose API allowance is ~1000 calls/day. Every one of them is held to an IP-independent rolling daily run budget in
- * production (see cronXeroDailyBudget), so a leaked CRON_SECRET used from many addresses cannot multiply the calls.
+ * Cron jobs that make LIVE Xero API calls on a run (census of the registry's accounting module). Every one of them is held
+ * to an IP-independent rolling daily RUN budget in production (see cronXeroDailyBudget), so a leaked CRON_SECRET used from
+ * many addresses cannot multiply cron runs (abuse and retry control). This bounds RUNS, not Xero calls: a run can make
+ * several calls, and the actual calls are bounded per process by the Xero transport's own daily counter.
  * accounting-fx-revaluation is deliberately absent: Xero does not post FX journals, so a run makes no Xero call.
  */
 export const XERO_LIVE_CRON_JOBS: ReadonlySet<string> = new Set([
@@ -185,14 +186,14 @@ export const XERO_LIVE_CRON_JOBS: ReadonlySet<string> = new Set([
   'account-balance-snapshot',
 ])
 
-/** Hard ceiling on one job's daily run budget, however fast its schedule is set: half the shared tenant allowance. */
+/** Hard ceiling on one job's daily run budget, however fast its schedule is set. */
 export const XERO_DAILY_BUDGET_CEILING = 500
 
 /**
  * Daily run budget for a Xero-live job: its scheduled runs per day plus a quarter (and two spare), never above the ceiling.
  * xero-tax-rate-drift (hourly) gets 32/day against 24 scheduled; accounting-sync (every 5 min) 362/day against 288; the daily
- * jobs 4/day. Summed across the six jobs that is ~530 runs/day, well under the 1000 calls/day tenant allowance, and the budget
- * is per-run, so it bounds calls from a leaked secret to the legitimate schedule plus 25%.
+ * jobs 4/day. A run budget, not a call budget: it limits how many cron runs a leaked secret can trigger, not how many Xero
+ * HTTP calls those runs make.
  */
 export function cronXeroDailyBudget(schedule: string): number {
   const perDay = cronScheduleProfile(schedule)?.maxPerDay ?? 24
@@ -404,7 +405,7 @@ export async function enforceCronRateLimit(
     result = await checker(cronRateLimitGlobalKey(jobName), globalCap, E2E_GLOBAL_CAP_WINDOW_MS)
   } else if (result.allowed && XERO_LIVE_CRON_JOBS.has(jobName) && max === baseMax && effectiveSchedule) {
     // PRODUCTION (no E2E raise in effect): a live-Xero job also spends an IP-independent rolling daily run budget, so
-    // rotating source addresses with a leaked secret cannot multiply the calls against the shared tenant allowance.
+    // rotating source addresses with a leaked secret cannot multiply cron runs (a run budget, not a Xero call budget).
     result = await checker(
       cronRateLimitDailyBudgetKey(jobName),
       cronXeroDailyBudget(effectiveSchedule),
