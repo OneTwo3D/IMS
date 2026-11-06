@@ -437,6 +437,8 @@ export type WmsDispatchSweepDeps = {
   zonelessDespatchReading?: ZonelessDespatchReading
   /** The storefront's live-from instant, or null when none is configured/readable. Used to tell whether an uncertain despatch time matters. */
   storefrontCutoff?(): Date | null
+  /** The clock used for the order-level cutoff decision; injected by tests. Defaults to the system clock. */
+  clock?(): Date
   // Whether the active connector supports per-part reconciliation (fetchOrderParts). When
   // false, a split order is surfaced as a clear "unsupported" pending rather than silently
   // stalling as "no parts visible".
@@ -772,49 +774,53 @@ export function dispositionDespatchTime(
   reading: ZonelessDespatchReading | undefined,
   cutoff: Date | null = null,
 ): { unknown: false; at: Date | null } | { unknown: true } {
-  if (reading === undefined) return { unknown: false, at: latestDespatchTime(tracking) }
+  // No reading, or no readable cutoff: nothing to judge against (the producer seam shadows or the legacy path applies).
+  if (reading === undefined || cutoff === null) return { unknown: false, at: latestDespatchTime(tracking) }
   let latest: Date | null = null
   for (const entry of tracking) {
     if (!entry.despatchedAt) continue
     const range = despatchInstantRange(entry.despatchedAt, reading)
     if (range === null) return { unknown: true }
     let judged = range.from
-    if (cutoff !== null) {
-      if (range.to.getTime() < cutoff.getTime()) judged = range.to
-      else if (range.from.getTime() < cutoff.getTime()) return { unknown: true }
-    }
+    if (range.to.getTime() < cutoff.getTime()) judged = range.to
+    else if (range.from.getTime() < cutoff.getTime()) return { unknown: true }
     if (latest === null || judged.getTime() > latest.getTime()) latest = judged
   }
   return { unknown: false, at: latest }
 }
 
 /**
- * The order-level completion gate for a WMS with a zone reading (Mintsoft): a reason to HOLD the order pending, or null to let the
- * completion go ahead as today. The producer seam judges an order-level completion by the time IMS shipped it, not by the despatch
- * time, so it cannot tell a pre-cutover despatch from a live one. Once the storefront is live (`now` at or after the cutoff), the
- * order is therefore held when any despatch time is unreadable, straddles the cutoff, or lies wholly before it: that completion
- * would write order-level storefront data for a pre-cutover despatch (a split part like that is verified by a read instead).
- * Before the cutoff the seam shadows every storefront write anyway, so the completion is not held; with no cutoff configured
- * nothing is held either. Entries with no value keep the old behaviour.
+ * The order-level completion decision for a WMS with a zone reading (Mintsoft), made ONCE from the despatch time's RANGE (never
+ * from a clock that can move between this check and the enqueue of the storefront job). The producer seam judges an order-level
+ * completion by the time IMS ships the order, not by the despatch time, so it cannot tell a pre-cutover despatch from a live one.
+ *
+ * With a readable storefront `cutoff` (none configured: nothing is held, the existing shadowed path applies):
+ *  - any value unreadable, or whose range STRADDLES the cutoff (it could be after it): HOLD pending, no write;
+ *  - every value wholly AFTER the cutoff: complete normally;
+ *  - any value wholly BEFORE the cutoff (a pre-cutover despatch; the incumbent writer owns its storefront side): if `now` is before the
+ *    cutoff, complete in IMS with `storefrontAlreadyCompleted`, which suppresses every order-level storefront write whatever the
+ *    clock says when the job is enqueued; if `now` is at or after the cutoff, HOLD pending (a follow-up will verify these by the
+ *    fresh read).
+ * Entries with no value keep the old behaviour.
  */
-export function orderLevelDespatchHold(
+export function orderLevelDespatchDecision(
   tracking: ReadonlyArray<{ despatchedAt?: string | null }>,
   reading: ZonelessDespatchReading | undefined,
   cutoff: Date | null,
   now: Date,
-): string | null {
-  if (reading === undefined || cutoff === null || now.getTime() < cutoff.getTime()) return null
+): { action: 'complete'; storefrontAlreadyCompleted: boolean } | { action: 'hold'; reason: string } {
+  if (reading === undefined || cutoff === null) return { action: 'complete', storefrontAlreadyCompleted: false }
+  let before = false
   for (const entry of tracking) {
     if (!entry.despatchedAt) continue
     const range = despatchInstantRange(entry.despatchedAt, reading)
-    if (range === null) return 'its despatch time cannot be read'
-    if (range.from.getTime() < cutoff.getTime()) {
-      return range.to.getTime() < cutoff.getTime()
-        ? 'it was despatched before the storefront went live and an order-level completion is not verifiable'
-        : 'its despatch time could fall either side of the storefront go-live instant'
-    }
+    if (range === null) return { action: 'hold', reason: 'its despatch time cannot be read' }
+    if (range.to.getTime() < cutoff.getTime()) before = true
+    else if (range.from.getTime() < cutoff.getTime()) return { action: 'hold', reason: 'its despatch time could fall either side of the storefront go-live instant' }
   }
-  return null
+  if (!before) return { action: 'complete', storefrontAlreadyCompleted: false }
+  if (now.getTime() < cutoff.getTime()) return { action: 'complete', storefrontAlreadyCompleted: true }
+  return { action: 'hold', reason: 'it was despatched before the storefront went live and an order-level completion is not verifiable' }
 }
 
 /**
@@ -955,14 +961,14 @@ async function reconcileSplitOrder(
     : []
   // Every despatched part was VERIFIED by the fresh read (none was pushed by this sweep): the storefront order is already
   // complete, so IMS completes its own side only. A mixed order (some part pushed live) keeps the normal completion.
+  let mergedAlreadyCompleted = false
   if (!recordPartials) {
-    // A merged survivor completes at ORDER level with no per-part judgement above, so judge every part's time here.
-    const hold = orderLevelDespatchHold(allTracking, deps.zonelessDespatchReading, deps.storefrontCutoff?.() ?? null, new Date())
-    if (hold !== null) {
-      return { action: 'pending', reason: `Merged order held: ${hold}`, unresolved: requireResolution }
-    }
+    // A merged survivor completes at ORDER level with no per-part judgement above, so judge every part's time here, once.
+    const decision = orderLevelDespatchDecision(allTracking, deps.zonelessDespatchReading, deps.storefrontCutoff?.() ?? null, (deps.clock ?? (() => new Date()))())
+    if (decision.action === 'hold') return { action: 'pending', reason: `Merged order held: ${decision.reason}`, unresolved: requireResolution }
+    mergedAlreadyCompleted = decision.storefrontAlreadyCompleted
   }
-  const storefrontAlreadyCompleted = recordPartials && dispatchedParts.length > 0 && verifiedPreCutoverParts === dispatchedParts.length
+  const storefrontAlreadyCompleted = mergedAlreadyCompleted || (recordPartials && dispatchedParts.length > 0 && verifiedPreCutoverParts === dispatchedParts.length)
   const result = await deps.applyDispatch(candidate.orderId, aggregated, storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true } : undefined)
   if (!result.success) {
     return { action: 'error', reason: result.error ?? 'Dispatch apply failed after all parts despatched' }
@@ -1102,11 +1108,9 @@ export async function reconcileOneOrder(
   }
 
   // An ordinary (non-split) order completes at ORDER level: judge its despatch time against the storefront cutoff first.
-  const orderHold = orderLevelDespatchHold(status.tracking, deps.zonelessDespatchReading, deps.storefrontCutoff?.() ?? null, new Date())
-  if (orderHold !== null) {
-    return { action: 'pending', reason: `Order held: ${orderHold}`, unresolved: requireResolution }
-  }
-  const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking))
+  const decision = orderLevelDespatchDecision(status.tracking, deps.zonelessDespatchReading, deps.storefrontCutoff?.() ?? null, (deps.clock ?? (() => new Date()))())
+  if (decision.action === 'hold') return { action: 'pending', reason: `Order held: ${decision.reason}`, unresolved: requireResolution }
+  const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking), decision.storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true } : undefined)
   if (!result.success) {
     return { action: 'error', reason: result.error ?? 'Dispatch apply failed' }
   }

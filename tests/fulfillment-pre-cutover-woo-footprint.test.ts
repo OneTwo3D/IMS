@@ -220,3 +220,37 @@ test('a transport that THROWS (a timeout) keeps the order pending and writes not
   assert.equal(state.order.status, 'PACKING')
   assert.deepEqual(state.jobs, [])
 })
+
+test('RACE: a pre-cutover NON-SPLIT despatch decided before the cutover creates no order-level Woo job even though the enqueue happens after it', async () => {
+  await install()
+  const { runWmsDispatchSweepCore, createPrismaDispatchDeps } = await import('@/lib/domain/wms/dispatch-sweep')
+  const { applyDispatch } = createPrismaDispatchDeps('mintsoft' as never, {} as never)
+  const cutoff = new Date('2026-06-01T00:00:00Z')
+  const run = async (despatchedAt: string) => runWmsDispatchSweepCore({
+    applyDispatch,
+    // the guard sees a clock BEFORE the cutover; the real clock (used when the completion is enqueued) is after it
+    zonelessDespatchReading: 'europe-london', storefrontCutoff: () => cutoff, clock: () => new Date('2026-05-31T23:59:59Z'),
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'so-1', externalOrderNumber: 'WC-1001' }],
+    fetchOrderStatus: async () => ({ externalOrderId: 'M-1', externalOrderNumber: 'WC-1001', status: 'DESPATCHED', statusLabel: 'Despatched', isSplit: false, partCount: 1, isMerged: false, mergedOrderNumbers: [], deepLinkUrl: null, tracking: [{ trackingNumber: 'TN-1', carrier: 'DPD', despatchedAt }], dispatched: true, raw: null }),
+    partsSupported: true, fetchOrderParts: async () => [], fetchPartItems: async () => [],
+    repointLink: async () => {}, clearDispatchFailures: async () => {},
+    countLinksByOrderNumber: async (numbers: string[]) => new Map(numbers.map((n) => [n, 1])),
+    recordDispatchError: async () => ({ deadLettered: false }),
+    screenWithdrawnOrders: async () => new Set<string>(),
+  } as never)
+  const out = await run('2026-05-20T10:00:00')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(out.counters.dispatched, 1)
+  assert.equal(state.order.status, 'SHIPPED')
+  assert.deepEqual(state.outbox, [], 'no order.complete job')
+  assert.ok(!state.jobs.includes('order-completion-attempt'))
+  assert.deepEqual(state.requests, [])
+  // control: a wholly-after despatch completes normally, with the order.complete job
+  state.order = { id: 'so-1', status: 'PACKING' }
+  state.shipments = [{ id: 'ship-1', orderId: 'so-1', status: 'PACKED', trackingNumber: 'T1' }]
+  state.outbox.length = 0; state.jobs.length = 0
+  const control = await run('2026-06-02T09:00:00')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(control.counters.dispatched, 1)
+  assert.deepEqual(state.outbox, ['woocommerce/order.complete'])
+})
