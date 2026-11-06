@@ -137,6 +137,35 @@ test('every path that links a customer to a sales order is in the census', () =>
   assert.deepEqual(found, Object.fromEntries(Object.entries(CUSTOMER_LINK_CENSUS).map(([f, v]) => [f, v.writers])))
 })
 
+/**
+ * CENSUS OF THE CODE THAT COPIES A CUSTOMER'S CONTACT NAME OR EMAIL INTO AN ACCOUNTING PAYLOAD (customer side only; the
+ * purchasing builders carry a supplier). Every one of them is covered by the CENTRAL gate in createAccountingSyncLogRow, which
+ * scrubs the contact block of a row for an erased order or customer at the one place the row is written, under the caller's
+ * order lock. The importer's invoice enqueue and hold park additionally take the lock and read the marker themselves.
+ */
+const CONTACT_COPY_CENSUS: Record<string, number> = {
+  'app/actions/sales.ts': 2, // the manual order's invoice payload, and the refund's credit note payload
+  'lib/connectors/woocommerce/sync/order-import.ts': 1, // the storefront order's invoice payload (also the hold's accountingPayload)
+}
+
+test('every customer-side accounting payload that copies a contact name or email is in the census', () => {
+  const cwd = new URL('..', import.meta.url).pathname
+  const out = execFileSync('git', ['grep', '-nE', 'contactName\\s*:', '--', 'app', 'lib', ':!app/generated', ':!*.test.ts'], { encoding: 'utf8', cwd }).trim().split('\n').filter(Boolean)
+  const found: Record<string, number> = {}
+  for (const line of out) {
+    const file = line.split(':')[0]!
+    if (/purchas|supplier|first-load|connectors\/xero\/|types\.ts|invoice-number-ownership|accounting-document-event-builder|settings\.ts|\.tsx$|stock\.ts|api\/|erasure\//.test(file)) continue
+    found[file] = (found[file] ?? 0) + 1
+  }
+  assert.deepEqual(found, CONTACT_COPY_CENSUS)
+})
+
+test('the central gate runs before the insert in the one primitive that writes accounting sync rows', () => {
+  const src = readFileSync(new URL('../lib/domain/accounting/sync-log-row.ts', import.meta.url), 'utf8')
+  const fn = src.slice(src.indexOf('export async function createAccountingSyncLogRow'))
+  assert.match(fn, /const data = await gateAccountingPayloadContact\(client, rawData\)[\s\S]*accountingSyncLog\.create/)
+})
+
 test('both manual order creators lock and re-read the customer inside the create transaction, before the create', () => {
   const src = readFileSync(new URL('../app/actions/sales.ts', import.meta.url), 'utf8')
   const start = src.indexOf('export async function createSalesOrder')

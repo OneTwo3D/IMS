@@ -22,6 +22,8 @@ const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const skip = !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1'
 
 let accountingMocked = false
+// Runs inside the importer's accounting step: between the order create and the invoice enqueue / hold.
+let settingsHook: (() => Promise<void>) | null = null
 // The accounting queue double: by default it records nothing; a test that needs the real row installs a writer.
 type QueueArgs = { type: string; referenceType: string; referenceId: string; payload: Record<string, unknown>; idempotencyKey?: string }
 let queueImpl: (tx: unknown, args: QueueArgs) => Promise<unknown> = async () => ({ queued: true, connector: 'xero' })
@@ -31,7 +33,7 @@ async function mockAccounting() {
   mock.module('@/lib/accounting', {
     namedExports: {
       ...actual,
-      getAccountingSettings: async () => ({ connector: 'xero', salesAccount: '200', shippingAccount: '260', discountAccount: '270', reverseChargeSalesTaxType: '' }),
+      getAccountingSettings: async () => { await settingsHook?.(); return { connector: 'xero', salesAccount: '200', shippingAccount: '260', discountAccount: '270', reverseChargeSalesTaxType: '' } },
       queueAccountingSync: async () => ({ queued: true }),
       // The held-invoice release enqueues inside its order-locked transaction.
       queueAccountingSyncTxWithOutcome: async (tx: unknown, args: QueueArgs) => queueImpl(tx, args),
@@ -398,6 +400,16 @@ test('[erasure] a customer erased between the importer\'s customer lookup and it
   const link = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(fx.externalId + 1) }, select: { orderId: true } })
   const created = await db.salesOrder.findUniqueOrThrow({ where: { id: link.orderId } })
   assert.equal(created.customerId, null, 'the new order is NOT attached to the erased customer')
+  // EVERY identity column on the new order: it was created ERASED, in the same transaction, with its money intact.
+  assert.deepEqual([created.customerName, created.customerEmail, created.customerVatNumber, created.billingAddress, created.shippingAddress, created.notes],
+    ['GDPR Anonymised', null, null, null, null, null])
+  assert.ok(created.erasedAt, 'the erasure marker is set')
+  assert.equal(created.totalForeign.toString(), '126', 'the order and its money stay in the books')
+  assert.equal(await db.salesOrderLine.count({ where: { orderId: link.orderId } }), 1)
+  assert.equal((await db.shoppingOrderLink.findFirstOrThrow({ where: { orderId: link.orderId } })).metadata, null, 'the storefront order key is not stored')
+  const proof = await db.activityLog.findFirst({ where: { entityId: link.orderId, action: 'gdpr_erasure_recorded' } })
+  assert.ok(proof, 'the name-free proof record was written as an erasure of this order')
+  assert.deepEqual((proof.metadata as { orderIds: string[] }).orderIds, [link.orderId])
   const recorded = await db.activityLog.findFirst({ where: { entityId: link.orderId, action: 'order_created_unlinked_customer_erased' } })
   assert.ok(recorded, 'and the decision is recorded')
   assert.ok(!JSON.stringify(recorded).includes(NAME.last) && !JSON.stringify(recorded).includes(EMAIL), 'the record names no one')
@@ -712,4 +724,95 @@ test('[erasure] a manual order cannot be created for, or cloned from, an erased 
   const late = await db.salesOrder.findUniqueOrThrow({ where: { id: newOrderId } })
   assert.deepEqual([late.customerName, late.customerEmail], ['GDPR Anonymised', null], 'the order that committed first was found and erased')
   assert.ok(late.erasedAt)
+})
+
+
+test('[erasure] erasure committing between the order create and the invoice enqueue / hold: the queued row and the hold contain no identity', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const queued: string[] = []
+  type Tx = { accountingSyncLog: { create(args: unknown): Promise<{ id: string }> } }
+  queueImpl = async (tx, args) => {
+    const row = await (tx as Tx).accountingSyncLog.create({ data: { type: 'SALES_INVOICE', status: 'PENDING', referenceType: args.referenceType, referenceId: args.referenceId, payload: { ...args.payload, _idempotencyKey: args.idempotencyKey } } })
+    queued.push(row.id)
+    return { queued: true, connector: 'xero' }
+  }
+  const extraOrders: string[] = []
+  t.after(async () => {
+    settingsHook = null
+    queueImpl = async () => ({ queued: true, connector: 'xero' })
+    for (const id of extraOrders) {
+      await db.accountingSyncLog.deleteMany({ where: { referenceId: id } })
+      await db.shoppingSyncLog.deleteMany({ where: { entityId: id } })
+      await db.activityLog.deleteMany({ where: { entityId: id } })
+      await db.salesOrderLine.deleteMany({ where: { orderId: id } })
+      await db.salesOrder.deleteMany({ where: { id } })
+      await db.shoppingOrderLink.deleteMany({ where: { orderId: id } })
+    }
+    await fx.cleanup()
+  })
+  const withNumber = (id: number, number: string | null) => {
+    const body = payload(id, wcRateId) as { meta_data: Array<{ id: number; key: string; value: unknown }> }
+    return number === null ? body : { ...body, meta_data: [...body.meta_data, { id: 77, key: '_wcpdf_invoice_number', value: number }] }
+  }
+  const erasedBy = async (customerId: string) => { assert.equal((await eraseCustomerPersonalData(customerId, { trigger: 'ON_REQUEST', userId: null })).success, true) }
+
+  // (A) a NUMBERED order: the invoice is enqueued. The erasure commits after the order exists and before the enqueue.
+  settingsHook = async () => { settingsHook = null; await erasedBy(fx.customerId) }
+  const numberedId = fx.externalId + 11
+  const first = await importWcOrder(withNumber(numberedId, 'INV-RACE-77') as never)
+  assert.equal(first.success, true, JSON.stringify(first))
+  const numbered = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(numberedId) }, select: { orderId: true } })
+  extraOrders.push(numbered.orderId)
+  assert.ok((await db.salesOrder.findUniqueOrThrow({ where: { id: numbered.orderId } })).erasedAt, 'PRECONDITION: the erasure really did reach the new order')
+  const row = await db.accountingSyncLog.findFirstOrThrow({ where: { id: { in: queued } } })
+  const text = JSON.stringify(row.payload)
+  for (const x of [NAME.first, NAME.last, EMAIL]) assert.ok(!text.includes(x), `the queued invoice carries ${x}`)
+  assert.equal((row.payload as { contactName: string }).contactName, 'GDPR Anonymised')
+  assert.equal((row.payload as { invoiceNumber: string }).invoiceNumber, 'INV-RACE-77')
+
+  // (B) an UNNUMBERED order: the invoice is parked. Same window, same answer. (A fresh customer: the first one is erased now.)
+  const fx2 = await importFixture(db)
+  t.after(async () => { await fx2.cleanup() })
+  settingsHook = async () => { settingsHook = null; await erasedBy(fx2.customerId) }
+  const heldId = fx2.externalId + 12
+  const second = await importWcOrder({ ...withNumber(heldId, null), billing: { ...WC_ADDRESS }, shipping: { ...WC_ADDRESS } } as never)
+  assert.equal(second.success, true, JSON.stringify(second))
+  const held = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(heldId) }, select: { orderId: true } })
+  extraOrders.push(held.orderId)
+  const hold = await db.shoppingSyncLog.findFirstOrThrow({ where: { entityId: held.orderId, recordKind: 'WC_HELD_SALES_INVOICE' } })
+  const holdText = JSON.stringify(hold.payload)
+  for (const x of [NAME.first, NAME.last, EMAIL]) assert.ok(!holdText.includes(x), `the parked hold carries ${x}: ${holdText.slice(Math.max(0, holdText.indexOf(x) - 80), holdText.indexOf(x) + 80)}`)
+  assert.equal((hold.payload as { accountingPayload: { contactName: string } }).accountingPayload.contactName, 'GDPR Anonymised')
+})
+
+
+test('[erasure] the central gate: any accounting sync row for an erased order or refund is written with the placeholder contact, whoever queues it; a live order keeps its contact', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { createAccountingSyncLogRow } = await import('@/lib/domain/accounting/sync-log-row')
+  const made: string[] = []
+  t.after(async () => { await db.accountingSyncLog.deleteMany({ where: { id: { in: made } } }); await fx.cleanup() })
+  const write = async (type: 'SALES_INVOICE' | 'CREDIT_NOTE', referenceType: string, referenceId: string) => {
+    const result = await db.$transaction(async (tx) => createAccountingSyncLogRow<{ id: string }>(tx as never, {
+      type, referenceType, referenceId, status: 'PENDING', payload: { contactName: FULL_NAME, contactEmail: EMAIL, date: '2026-11-02', lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200' }], _idempotencyKey: `gate-${randomUUID()}` },
+    } as never))
+    const row = result.row as { id: string } | null
+    assert.ok(row, 'the row was written')
+    made.push(row.id)
+    return (await db.accountingSyncLog.findUniqueOrThrow({ where: { id: row.id } })).payload as Record<string, unknown>
+  }
+  // CONTROL: a live order keeps its contact (the gate is not scrubbing everything).
+  assert.equal((await write('SALES_INVOICE', 'SalesOrder', fx.orderId)).contactName, FULL_NAME)
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  for (const [type, ref, id] of [['SALES_INVOICE', 'SalesOrder', fx.orderId], ['CREDIT_NOTE', 'SalesOrderRefund', fx.refundId]] as const) {
+    const payload = await write(type, ref, id)
+    assert.equal(payload.contactName, 'GDPR Anonymised', `${ref}`)
+    assert.equal('contactEmail' in payload, false)
+    assert.deepEqual(payload.lines, [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200' }], 'financial fields kept')
+  }
 })

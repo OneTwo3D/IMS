@@ -5,6 +5,7 @@ import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { HELD_SALES_INVOICE_RECORD_KIND } from '@/lib/domain/sales/wc-sync-row-families'
 import { EMAIL_RECIPIENT_ERASED_REASON } from './email-recipient'
+import { scrubContactBlock } from './contact-gate'
 import { ERASED_ACTIVITY_DESCRIPTION, IDENTITY_BEARING_ENTITY_TYPES, redactIdentityKeys } from './activity-identity'
 import {
   ERASURE_FAILURE_ACTION,
@@ -257,12 +258,18 @@ export async function scrubHeldInvoicePayloads(tx: Prisma.TransactionClient, ord
      WHERE "id" = ANY(${ids}::text[]) AND ("payload" #>> '{accountingPayload,contactName}') IS NOT NULL`)
 }
 
-/** The contact block of an accounting payload, replaced the way the erasure replaces it. */
-export function scrubContactInAccountingPayload<T extends Record<string, unknown>>(payload: T): T {
-  if (payload.contactName === undefined && payload.contactEmail === undefined) return payload
-  const { contactEmail: _email, ...rest } = payload
-  return { ...rest, ...(payload.contactName !== undefined ? { contactName: ERASURE_PLACEHOLDER_NAME } : {}) } as unknown as T
+/**
+ * Whether the order (or its customer) is erased, read INSIDE the caller's transaction and AFTER the caller has taken the order lock
+ * (`lockSalesOrder`). Every place that copies a contact name or email into an accounting row or a parked hold reads it this way,
+ * so the copy and the answer cannot be separated by an erasure.
+ */
+export async function orderIsErasedInTx(tx: Prisma.TransactionClient, orderId: string): Promise<boolean> {
+  const row = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, customer: { select: { gdprAnonymisedAt: true } } } })
+  return Boolean(row?.erasedAt || row?.customer?.gdprAnonymisedAt)
 }
+
+/** The contact block of an accounting payload, replaced the way the erasure replaces it (see contact-gate.ts). */
+export const scrubContactInAccountingPayload = scrubContactBlock
 
 export type EraseCustomerResult =
   | { success: true; requestId: string }

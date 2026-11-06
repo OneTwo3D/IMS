@@ -138,9 +138,9 @@ test('[o3d-j625] every facade accounting enqueue in app/ and lib/ names the char
   assert.ok(
     // o3d-j625 r6: 11 — the stock adjustment moved into the caller's transaction (review M3). The floor is the count.
     // o3d-q0x56.4: 9 - the AR/AP revaluation's two enqueues moved into one transaction per side (transactional census).
-    // 8: the held-invoice release enqueues inside its order-locked transaction (the in-transaction census below names its chart).
-    sites.length >= 8,
-    `expected to find the 8 facade enqueue call sites, found `
+    // 7: the held-invoice release AND the import's invoice enqueue run inside their order-locked transactions (the in-transaction census below names its chart).
+    sites.length >= 7,
+    `expected to find the 7 facade enqueue call sites, found `
     + `${sites.length}. The detector is not examining the source it claims to.`,
   )
 
@@ -173,7 +173,7 @@ test('[o3d-j625] the census names the sites it examined, so a shrinking sweep is
     'app/actions/purchase-orders.ts',
     'app/actions/sales.ts',
     'lib/accounting/tax-rate-sync-trigger.ts',
-    'lib/connectors/woocommerce/sync/order-import.ts',
+    // (lib/connectors/woocommerce/sync/order-import.ts moved to the transactional census: both its invoice enqueues run in order-locked transactions.)
     // (lib/domain/inventory/stock-adjustment-apply.ts moved to the transactional census in r6, review M3.)
   ]) {
     assert.ok(files.includes(expected), `the census no longer examines ${expected}. Files: ${files.join(', ')}`)

@@ -60,7 +60,8 @@ test('no number means NO accounting post — the importer must not invent one', 
   // The enqueue is reachable ONLY through the resolution's ok branch; the other branch parks the
   // payload (o3d-k26m.6) instead of sending it.
   const branch = body.indexOf('if (invoiceNumberResolution.ok) {')
-  const enqueue = body.indexOf('await queueAccountingSync({')
+  // The enqueue runs inside the order-locked transaction (erasure gate): the in-transaction variant, still inside the ok branch.
+  const enqueue = body.indexOf('queueAccountingSyncTxWithOutcome(tx, {')
   const hold = body.indexOf('await holdWcSalesInvoiceForMissingNumber({')
   assert.ok(branch > 0, 'the importer must branch on whether WooCommerce numbered the invoice')
   assert.ok(branch < enqueue, 'the enqueue must sit INSIDE the ok branch, not before it')
@@ -73,10 +74,11 @@ test('no number means NO accounting post — the importer must not invent one', 
     body.includes('return await finishWithoutAccounting(heldReason)'),
     'the refusal must return without queueing anything',
   )
+  // (`postable` is the accounting payload, or its contact-scrubbed copy for an erased order; the number is spread first and is the same.)
   // The regression this replaces: `invoiceNumber: <anything we made up>`. There is exactly one
   // expression that may reach the payload's invoice number on this path.
   assert.ok(
-    body.includes('payload: { invoiceNumber: invoiceNumberResolution.invoiceNumber, ...accountingPayload }'),
+    body.includes('payload: { invoiceNumber: invoiceNumberResolution.invoiceNumber, ...postable }'),
     'the only number the importer may post is the resolved one',
   )
 })

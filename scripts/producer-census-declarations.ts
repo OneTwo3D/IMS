@@ -319,7 +319,7 @@ export const DECLARATIONS: readonly Declaration[] = [
     'The completion job drain pushes the order-completed status.'),
   d('lib/connectors/woocommerce/sync/order-import.ts::releaseHeldWcSalesInvoice::queueAccountingSyncTxWithOutcome#1', 'xero', 'sales.invoice', 'queue-producer', 'required',
     'Queues SALES_INVOICE for an imported or released WooCommerce order; xeroom owns this operation, so IMS shadows it.'),
-  d('lib/connectors/woocommerce/sync/order-import.ts::importWcOrder::queueAccountingSync#1', 'xero', 'sales.invoice', 'queue-producer', 'required',
+  d('lib/connectors/woocommerce/sync/order-import.ts::importWcOrder::queueAccountingSyncTxWithOutcome#1', 'xero', 'sales.invoice', 'queue-producer', 'required',
     'Queues SALES_INVOICE for an imported or released WooCommerce order; xeroom owns this operation, so IMS shadows it.'),
   d('lib/connectors/woocommerce/sync/order-status-jobs.ts::scheduleWcOrderStatusPush::enqueueIntegrationOutbox#1', 'woocommerce', 'order.status', 'queue-producer', 'required',
     'Enqueues woocommerce/order.cancel or order.hold inside the status-change transaction.'),
