@@ -36,7 +36,8 @@ export const ERASURE_PLACEHOLDER_LAST_NAME = 'Anonymised'
 /** Written to a sent or failed email_outbox.toEmail: syntactically an address, deliverable nowhere (RFC 2606). */
 export const ERASURE_PLACEHOLDER_EMAIL = 'erased@erased.invalid'
 
-export const ERASURE_TRIGGERS = ['ON_REQUEST', 'MIRRORED_FROM_STOREFRONT', 'SCHEDULED'] as const
+export const ERASURE_TRIGGERS = ['ON_REQUEST', 'MIRRORED_FROM_STOREFRONT', 'SCHEDULED', 'IMPORT_AFTER_ERASURE'] as const
+/** IMPORT_AFTER_ERASURE: an order that arrived after its customer was erased, created already erased; the record carries the customer's ORIGINAL request id. */
 export type ErasureTrigger = (typeof ERASURE_TRIGGERS)[number]
 
 /** What happened to an external system's copy. `not-attempted` until the propagation work lands. */

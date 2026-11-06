@@ -2943,6 +2943,14 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           await tx.activityLog.create({ data: directCreateMarker(created.id, lifecycleStatus) })
         }
         if (erasedOnCreate) {
+          // The customer's ORIGINAL erasure request (its proof row, read under the customer lock held above): this order's record links to it.
+          const original = await tx.activityLog.findFirst({
+            where: { entityType: 'CUSTOMER', entityId: customerErasedDuringImport!, action: ERASURE_RECORD_ACTION },
+            orderBy: { createdAt: 'asc' },
+            select: { metadata: true },
+          })
+          const originalRequestId = (original?.metadata as { requestId?: unknown } | null)?.requestId
+          const originalErasureRequestId = typeof originalRequestId === 'string' ? originalRequestId : null
           // The name-free proof, as an erasure of this order: the request is the customer's earlier one; the scope is this order.
           await logActivityInTransaction(tx, {
             entityType: 'SALES_ORDER',
@@ -2951,7 +2959,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             action: ERASURE_RECORD_ACTION,
             description: ERASURE_RECORD_DESCRIPTION,
             metadata: buildErasureRecordMetadata({
-              requestId: randomUUID(), erasedAt, trigger: 'ON_REQUEST', customerId: customerErasedDuringImport!, orderIds: [created.id],
+              requestId: originalErasureRequestId ?? randomUUID(), erasedAt, trigger: 'IMPORT_AFTER_ERASURE', customerId: customerErasedDuringImport!, orderIds: [created.id],
               counts: { customers: 0, salesOrders: 1, shipments: 0, shoppingCustomerLinks: 0, shoppingOrderLinks: 1, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, linkedFreeTextScrubbed: 0, activityRowsScrubbed: 0, notifications: 0 },
             }),
             userId: null,

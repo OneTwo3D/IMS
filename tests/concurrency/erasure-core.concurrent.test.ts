@@ -415,6 +415,10 @@ test('[erasure] a customer erased between the importer\'s customer lookup and it
 
   // A SECOND order from the same person (matched by email). The importer's customer step returns the not-yet-erased customer; THEN
   // (from the seam) an erasure takes the customer row lock and has not committed, and the order create transaction blocks on it.
+  // The customer's ORIGINAL erasure proof (as an earlier erasure would have written it).
+  const ORIGINAL_REQUEST_ID = `orig-request-${randomUUID()}`
+  await db.activityLog.create({ data: { entityType: 'CUSTOMER', entityId: fx.customerId, action: 'gdpr_erasure_recorded', description: 'Personal data erased', tag: 'sales', level: 'INFO', metadata: { requestId: ORIGINAL_REQUEST_ID, trigger: 'ON_REQUEST' } } as never })
+  t.after(async () => { await db.activityLog.deleteMany({ where: { entityId: fx.customerId } }) })
   let release!: () => void
   const gate = new Promise<void>((resolve) => { release = resolve })
   let erasing: Promise<void> = Promise.resolve()
@@ -449,6 +453,8 @@ test('[erasure] a customer erased between the importer\'s customer lookup and it
   const proof = await db.activityLog.findFirst({ where: { entityId: link.orderId, action: 'gdpr_erasure_recorded' } })
   assert.ok(proof, 'the name-free proof record was written as an erasure of this order')
   assert.deepEqual((proof.metadata as { orderIds: string[] }).orderIds, [link.orderId])
+  assert.equal((proof.metadata as { requestId: string }).requestId, ORIGINAL_REQUEST_ID, 'the record carries the customer\'s ORIGINAL erasure request id')
+  assert.equal((proof.metadata as { trigger: string }).trigger, 'IMPORT_AFTER_ERASURE', 'and a distinct trigger')
   const recorded = await db.activityLog.findFirst({ where: { entityId: link.orderId, action: 'order_created_unlinked_customer_erased' } })
   assert.ok(recorded, 'and the decision is recorded')
   assert.ok(!JSON.stringify(recorded).includes(NAME.last) && !JSON.stringify(recorded).includes(EMAIL), 'the record names no one')
@@ -1437,4 +1443,30 @@ test('[erasure] the free-text guard DURING an erasure: a writer blocked on a row
   await writer
   const row = await db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })
   assert.equal(row.lastError, 'Text removed by GDPR erasure', 'the trigger was re-evaluated against the committed marker: nothing of the text survived')
+})
+
+
+test('[erasure] a refund-accounting retry that fails for an ERASED order logs a fixed description and the error class, never the exception text; a live order keeps its text', { skip }, async (t) => {
+  const db = await loadDb()
+  await mockAccounting()
+  const fx = await importFixture(db)
+  t.after(async () => { settingsHook = null; await fx.cleanup() })
+  const { retryRefundAccounting } = await import('@/app/actions/sales')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const RAW = `connector refused contact ${FULL_NAME} at ${STREET}`
+  settingsHook = async () => { throw new Error(RAW) }
+  const logsOf = async () => db.activityLog.findMany({ where: { entityId: fx.orderId, action: 'refund_accounting_retry_failed' } })
+
+  assert.equal((await retryRefundAccounting(fx.refundId)).success, false)
+  assert.ok((await logsOf()).some((l) => l.description.includes(NAME.last)), 'CONTROL: a live order keeps the exception text')
+  await db.activityLog.deleteMany({ where: { entityId: fx.orderId, action: 'refund_accounting_retry_failed' } })
+
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  await retryRefundAccounting(fx.refundId)
+  const rows = await logsOf()
+  assert.ok(rows.length >= 1)
+  for (const l of rows) {
+    assert.ok(!JSON.stringify(l).includes(NAME.last) && !JSON.stringify(l).includes(STREET), 'an erased order logs no identity')
+    assert.match(l.description, /Error.*withheld for an erased order/)
+  }
 })

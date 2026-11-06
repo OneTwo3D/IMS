@@ -2329,6 +2329,17 @@ async function loadRefundAccountingQueueInput(
   }
 }
 
+/** True when the order is erased, or cannot be determined: exception text is then never put in an activity description (it can echo the person). */
+async function refundOrderIsErasedOrUnknown(orderId: string | null): Promise<boolean> {
+  if (!orderId) return true
+  try {
+    const o = await db.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, customer: { select: { gdprAnonymisedAt: true } } } })
+    return !o || o.erasedAt != null || o.customer?.gdprAnonymisedAt != null
+  } catch {
+    return true
+  }
+}
+
 async function loadRefundAuditContext(
   refundId: string,
 ): Promise<{ orderId: string; refundOrderRef: string } | null> {
@@ -3166,7 +3177,7 @@ export async function retryRefundAccounting(
         action: 'refund_accounting_retry_failed',
         tag: 'accounting',
         level: 'WARNING',
-        description: result.error,
+        description: (await refundOrderIsErasedOrUnknown(auditContext?.orderId ?? null)) ? 'Failed to retry refund accounting; detail withheld for an erased order' : result.error,
         metadata: { refundId, orderNumber: auditContext?.refundOrderRef },
       })
       return result
@@ -3262,13 +3273,16 @@ export async function retryRefundAccounting(
         accountingWarning: String(e),
       },
     }).catch(() => undefined)
+    const erasedOrder = await refundOrderIsErasedOrUnknown(auditContext?.orderId ?? null)
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: auditContext?.orderId ?? refundId,
       action: 'refund_accounting_retry_failed',
       tag: 'accounting',
       level: 'ERROR',
-      description: `Failed to retry refund accounting: ${String(e)}`,
+      description: erasedOrder
+        ? `Failed to retry refund accounting (${e instanceof Error ? e.name : 'Error'}); detail withheld for an erased order`
+        : `Failed to retry refund accounting: ${String(e)}`,
       metadata: { refundId, orderNumber: auditContext?.refundOrderRef },
     })
     return { success: false, error: String(e) }
