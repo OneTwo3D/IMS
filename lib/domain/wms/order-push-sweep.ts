@@ -652,7 +652,9 @@ export function applyLinkCourierForm(
   // No recorded form (the create answered "already exists", or the link predates the form being recorded): the amendment
   // selects like a fresh create and reports the form that works.
   if (!link.courierForm) return { ...input, courierFormUnknown: true }
-  if ((link.courierFormName ?? null) !== input.courierService) return input
+  // The order's first courier name is not the one the recorded form was chosen for (the shipping line changed): a fresh
+  // selection, exactly as for an unknown form.
+  if ((link.courierFormName ?? null) !== input.courierService) return { ...input, courierFormUnknown: true }
   if (link.courierForm === 'LEGACY') return legacyCourierFormInput(input) ?? input
   if (link.courierForm === 'PLACEHOLDER') return { ...input, courierService: null, courierServiceAlternates: [], courierServiceLegacy: null, courierPlaceholder: true }
   return input
@@ -2412,6 +2414,7 @@ export async function runWmsOrderPushSweepCore(
         await port.updateLink(link.id, {
           pushedAt: ts, lastAttemptAt: ts, lastError: update.updated ? null : `Amendment not propagated (WMS status ${update.status})`,
           ...(update.updated && update.courierForm ? { courierForm: update.courierForm, courierFormName: update.courierFormName ?? null } : {}),
+          ...(update.updated && update.courierFallback ? { courierPending: true } : {}),
         })
         if (update.updated) result.updated += 1
         await audit({

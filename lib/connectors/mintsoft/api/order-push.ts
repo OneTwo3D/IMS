@@ -637,10 +637,6 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
       : 'Mintsoft order amendment not sent: the order has no courier service name and no default CourierServiceId is configured; refusing to amend without a courier')
   }
 
-  // Line items are amended via the /Items sub-resource (the order-update endpoint ignores
-  // them); this propagates refund-netted quantities to the still-NEW WMS order.
-  await reconcileMintsoftOrderItems(externalOrderId, input, clientId)
-
   const post = async (body: Record<string, unknown>) => {
     const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}`, {
       method: 'POST',
@@ -671,9 +667,19 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
     data = await post(buildPushPayload(input, { kind: 'defaultId', courierServiceId: defaultId }, false))
   }
   if (data?.Success === true || data?.OrderId != null) {
+    // Line items are amended via the /Items sub-resource (the order-update endpoint ignores them); this propagates
+    // refund-netted quantities to the still-NEW WMS order. They go AFTER the order post on purpose: the courier selection
+    // is the part of an amendment that can be refused (and retried), and deciding it first means a courier failure never
+    // leaves the items half-amended. A failure here leaves the courier already set and the items to be redone, which the
+    // sweep does on its next pass (the order is still due).
+    await reconcileMintsoftOrderItems(externalOrderId, input, clientId)
+    // The amendment ended on the configured default courier where the order was not already known to be on it: the same
+    // warehouse review flag a create fallback raises.
+    const movedToDefault = form === 'PLACEHOLDER' && (input.courierFormUnknown === true || !input.courierPlaceholder)
     return {
       updated: true,
       status: 'NEW',
+      ...(movedToDefault ? { courierFallback: true } : {}),
       ...(input.courierFormUnknown || retry || (form === 'PLACEHOLDER' && !input.courierPlaceholder) ? { courierForm: form, courierFormName } : {}),
     }
   }

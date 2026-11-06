@@ -507,6 +507,8 @@ export type WmsOrderUpdateResult = {
    */
   courierForm?: 'NAME' | 'LEGACY' | 'PLACEHOLDER'
   courierFormName?: string | null
+  /** True when the amendment ended on the configured default courier: the warehouse should confirm the courier. */
+  courierFallback?: boolean
 }
 
 /**

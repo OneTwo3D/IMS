@@ -328,3 +328,30 @@ test('an unknown-form amendment does not use the placeholder on an ambiguous ans
   await assert.rejects(() => amend(applyLinkCourierForm(INPUT, { courierForm: null }), [{ result: [{ Message: 'CourierService trouble' }] }]), /CourierService/)
   assert.equal(posts.length, 1)
 })
+
+test('a changed courier name with both the key and the legacy form refused reaches the default, flags it, and decides before any item write', async () => {
+  const { applyLinkCourierForm } = await import('@/lib/domain/wms/order-push-sweep')
+  defaultCourierId = '77'
+  const fresh = applyLinkCourierForm(INPUT, { courierForm: 'LEGACY', courierFormName: 'calcurates:OLD_KEY' })
+  assert.equal(fresh.courierFormUnknown, true)
+  const result = await amend(fresh, [{ result: [REFUSED] }, { result: [REFUSED] }, { result: [{ Success: true }] }])
+  assert.deepEqual(posts.map((p) => p.CourierService ?? null), [KEY, LABEL, null])
+  assert.equal(posts[2]!.CourierServiceId, 77)
+  assert.equal(result.courierFallback, true)
+  assert.equal(result.courierForm, 'PLACEHOLDER')
+})
+
+test('a courier failure leaves the items untouched: the order post is decided before the item reconcile', async () => {
+  defaultCourierId = ''
+  await assert.rejects(() => amend(INPUT, [{ result: [REFUSED] }, { result: [REFUSED] }]), /Unable to Find CourierService/)
+  assert.equal(itemWrites, 0)
+  await amend(INPUT, [{ result: [{ Success: true }] }])
+  assert.ok(itemWrites > 0, 'items are amended once the courier is settled')
+})
+
+test('an amendment of an order already known to be on the placeholder does not re-raise the review flag', async () => {
+  const { applyLinkCourierForm } = await import('@/lib/domain/wms/order-push-sweep')
+  defaultCourierId = '77'
+  const result = await amend(applyLinkCourierForm(INPUT, { courierForm: 'PLACEHOLDER', courierFormName: KEY }), [{ result: [{ Success: true }] }])
+  assert.equal(result.courierFallback, undefined)
+})
