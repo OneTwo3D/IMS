@@ -2,6 +2,7 @@
  * Push credit notes to Xero.
  */
 
+import type { ContactGate } from './invoices'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { createHash } from 'node:crypto'
 import { xeroGet, xeroPost, xeroPut } from './api'
@@ -67,7 +68,7 @@ export const XERO_SALES_CREDIT_NOTE_TYPE = 'ACCRECCREDIT'
 export async function pushCreditNote(
   data: CreditNoteData,
   status: string = 'AUTHORISED',
-  opts?: { idempotencyKey?: string; customerId?: string },
+  opts?: { idempotencyKey?: string; customerId?: string; contactGate?: ContactGate },
 ): Promise<{ success: boolean; creditNoteId?: string; error?: string }> {
   // o3d-q0x56.3: BEFORE the contact round trip, which creates a contact in Xero. A foreign credit note with no usable rate leaves no trace.
   const baseCurrency = await getBaseCurrencyCode()
@@ -77,7 +78,16 @@ export async function pushCreditNote(
   if (rateProblem) return { success: false, error: rateProblem }
 
   // Find or create the contact
-  const contactResult = await findOrCreateContact(data.contactName, data.contactEmail, false, { customerId: opts?.customerId })
+  let contactName = data.contactName
+  let contactEmail = data.contactEmail
+  if (opts?.contactGate) {
+    // The erasure gate, asked immediately before the contact is looked up or created (see ContactGate in invoices.ts).
+    const gated = await opts.contactGate()
+    if (!gated.ok) return { success: false, error: gated.error }
+    contactName = gated.contactName
+    contactEmail = gated.contactEmail
+  }
+  const contactResult = await findOrCreateContact(contactName, contactEmail, false, { customerId: opts?.customerId })
   if (!contactResult.success || !contactResult.contactId) {
     return { success: false, error: `Contact error: ${contactResult.error}` }
   }

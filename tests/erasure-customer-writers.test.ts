@@ -206,6 +206,8 @@ const existsAnonymised = true
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      // The edit and its activity row run in one transaction; the double hands the same client to the callback.
+      $transaction: async function (this: unknown, fn: (tx: unknown) => Promise<unknown>) { return fn(this) },
       customer: {
         updateMany: async ({ where }: { where: Record<string, unknown> }) => { calls.push({ op: 'updateMany', where }); return { count: 0 } },
         findUnique: async () => ({ gdprAnonymisedAt: existsAnonymised ? new Date() : null }),
@@ -216,7 +218,7 @@ mock.module('@/lib/db', {
   },
 })
 mock.module('@/lib/auth/server', { namedExports: { requirePermission: async () => ({ user: { id: 'u1' } }), requireInternalUser: async () => ({ user: { id: 'u1' } }) } })
-mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => undefined } })
+mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => undefined, logActivityInTransaction: async () => undefined } })
 mock.module('next/cache', { namedExports: { revalidatePath: () => undefined } })
 
 test('updateCustomer writes only where gdprAnonymisedAt is null, and refuses an anonymised customer', async () => {

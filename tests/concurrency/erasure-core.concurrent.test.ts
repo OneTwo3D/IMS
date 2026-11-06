@@ -22,6 +22,8 @@ const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const skip = !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1'
 
 let accountingMocked = false
+// Runs inside logActivityInTransaction, before the row is written (see mockActionEnvironment).
+let beforeActivityWrite: (() => Promise<void>) | null = null
 // Runs inside the importer's accounting step: between the order create and the invoice enqueue / hold.
 let settingsHook: (() => Promise<void>) | null = null
 // The accounting queue double: by default it records nothing; a test that needs the real row installs a writer.
@@ -47,10 +49,13 @@ async function mockActionEnvironment() {
   if (actionsMocked) return
   const actual = await import('@/lib/auth/server')
   // Every `require*` guard answers with an admin session; nothing else in the module changes.
-  const session = { user: { id: 'u1', role: 'ADMIN', name: 'Test Admin', email: 'admin@example.test' } }
+  const session = { user: { id: undefined as unknown as string, role: 'ADMIN', name: 'Test Admin', email: 'admin@example.test' } } // no user row exists in the scratch database: activity rows take a null user
   const guards = Object.fromEntries(Object.keys(actual).filter((k) => k.startsWith('require')).map((k) => [k, async () => session]))
   mock.module('@/lib/auth/server', { namedExports: { ...actual, ...guards } })
   mock.module('next/cache', { namedExports: { revalidatePath: () => undefined, revalidateTag: () => undefined } })
+  // A seam to pause an action between its write and its in-transaction activity row (and only there).
+  const activity = await import('@/lib/activity-log')
+  mock.module('@/lib/activity-log', { namedExports: { ...activity, logActivityInTransaction: async (tx: never, params: never) => { await beforeActivityWrite?.(); return activity.logActivityInTransaction(tx, params) } } })
   actionsMocked = true
 }
 
@@ -815,4 +820,42 @@ test('[erasure] the central gate: any accounting sync row for an erased order or
     assert.equal('contactEmail' in payload, false)
     assert.deepEqual(payload.lines, [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200' }], 'financial fields kept')
   }
+})
+
+
+test('[erasure] a customer edit and its name-bearing activity row commit together: an erasure started just before the activity write blocks on the customer lock, then finds and scrubs the row', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  t.after(async () => { beforeActivityWrite = null; await fx.cleanup() })
+  const { updateCustomer, createCustomer } = await import('@/app/actions/customers')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { ERASED_ACTIVITY_DESCRIPTION } = await import('@/lib/domain/erasure/activity-identity')
+  const NEWNAME = { first: 'Philomena', last: 'Ravenscroft' }
+  let erasure: Promise<{ success: boolean }> | null = null
+  let erasureDoneDuringPause = false
+  beforeActivityWrite = async () => {
+    beforeActivityWrite = null
+    // The update has run and holds the customer row lock; the activity row is NOT yet written. Start the erasure now.
+    erasure = eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null }).then((r) => { erasureDoneDuringPause = true; return r })
+    await new Promise((r) => setTimeout(r, 1000))
+    assert.equal(erasureDoneDuringPause, false, 'the erasure is blocked on the customer lock until the edit and its activity row commit')
+  }
+  const result = await updateCustomer(fx.customerId, { firstName: NEWNAME.first, lastName: NEWNAME.last })
+  assert.equal(result.success, true, JSON.stringify(result))
+  assert.equal((await erasure!).success, true)
+  const haystack = JSON.stringify(await db.activityLog.findMany())
+  for (const x of [NEWNAME.first, NEWNAME.last]) assert.ok(!haystack.includes(x), `the activity log still contains ${x}`)
+  const row = await db.activityLog.findFirstOrThrow({ where: { entityId: fx.customerId, action: 'updated' } })
+  assert.equal(row.description, ERASED_ACTIVITY_DESCRIPTION, 'the row existed when the erasure ran, and was scrubbed')
+
+  // The other order: the erasure commits first, the edit changes nothing and writes no row.
+  const after = await updateCustomer(fx.customerId, { firstName: 'Late', lastName: 'Edit' })
+  assert.equal(after.success, false)
+  assert.equal(await db.activityLog.count({ where: { entityId: fx.customerId, action: 'updated', description: { contains: 'Late' } } }), 0)
+
+  // Create: the row and its activity record are one transaction too.
+  const made = await createCustomer({ firstName: 'Cordelia', lastName: 'Thistlewood' } as never)
+  assert.equal(made.success, true, JSON.stringify(made))
+  t.after(async () => { await db.activityLog.deleteMany({ where: { entityId: made.customer!.id } }); await db.customer.deleteMany({ where: { id: made.customer!.id } }) })
+  assert.equal(await db.activityLog.count({ where: { entityId: made.customer!.id, action: 'created' } }), 1)
 })

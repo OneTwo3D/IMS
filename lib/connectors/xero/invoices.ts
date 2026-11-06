@@ -201,10 +201,17 @@ export function buildSalesInvoicePayload(
   return invoice
 }
 
+/**
+ * The erasure gate on the contact, asked IMMEDIATELY before the contact is looked up or created (the round trip that can create
+ * a contact in Xero): the processor passes a function that re-reads the erasure state, and what it returns REPLACES the name
+ * and email on the payload. A refusal (the state cannot be read) stops the post before anything is created.
+ */
+export type ContactGate = () => Promise<{ ok: true; contactName: string; contactEmail: string | undefined } | { ok: false; error: string }>
+
 async function prepareSalesInvoicePayload(
   data: InvoiceData,
   status: string,
-  opts?: { customerId?: string },
+  opts?: { customerId?: string; contactGate?: ContactGate },
 ): Promise<{ success: true; invoice: Record<string, unknown> } | { success: false; error: string }> {
   // o3d-q0x56.3: BEFORE the contact and item round trips, which create things in Xero. A foreign invoice with no usable rate leaves no trace.
   const baseCurrency = await getBaseCurrencyCode()
@@ -214,7 +221,15 @@ async function prepareSalesInvoicePayload(
   if (rateProblem) return { success: false, error: rateProblem }
 
   // Find or create the contact
-  const contactResult = await findOrCreateContact(data.contactName, data.contactEmail, false, { customerId: opts?.customerId })
+  let contactName = data.contactName
+  let contactEmail = data.contactEmail
+  if (opts?.contactGate) {
+    const gated = await opts.contactGate()
+    if (!gated.ok) return { success: false, error: gated.error }
+    contactName = gated.contactName
+    contactEmail = gated.contactEmail
+  }
+  const contactResult = await findOrCreateContact(contactName, contactEmail, false, { customerId: opts?.customerId })
   if (!contactResult.success || !contactResult.contactId) {
     return { success: false, error: `Contact error: ${contactResult.error}` }
   }
@@ -271,7 +286,7 @@ async function prepareSalesInvoicePayload(
 export async function pushSalesInvoice(
   data: InvoiceData,
   status: string = 'AUTHORISED',
-  opts?: { idempotencyKey?: string; customerId?: string; beforePost?: BeforeRemoteWrite },
+  opts?: { idempotencyKey?: string; customerId?: string; beforePost?: BeforeRemoteWrite; contactGate?: ContactGate },
 ): Promise<{ success: boolean; invoiceId?: string; invoiceNumber?: string; total?: number; externalRevisionAt?: Date | null; error?: string }> {
   const prepared = await prepareSalesInvoicePayload(data, status, opts)
   if (!prepared.success) return prepared
@@ -306,7 +321,7 @@ export async function updateSalesInvoice(
   accountingInvoiceId: string,
   data: InvoiceData,
   status: string = 'AUTHORISED',
-  opts?: { idempotencyKey?: string; customerId?: string; beforePost?: BeforeRemoteWrite },
+  opts?: { idempotencyKey?: string; customerId?: string; beforePost?: BeforeRemoteWrite; contactGate?: ContactGate },
 ): Promise<{ success: boolean; invoiceId?: string; invoiceNumber?: string; total?: number; externalRevisionAt?: Date | null; error?: string }> {
   const prepared = await prepareSalesInvoicePayload(data, status, opts)
   if (!prepared.success) return prepared

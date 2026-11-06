@@ -19,7 +19,7 @@ import { ERASED_ACTIVITY_DESCRIPTION, IDENTITY_BEARING_ENTITY_TYPES, redactIdent
 const cwd = new URL('..', import.meta.url).pathname
 
 const IDENTITY_MENTION: Record<string, { calls: number; verdict: string }> = {
-  'app/actions/customers.ts': { calls: 3, verdict: 'customer-row (created, updated, and their failure rows)' },
+  'app/actions/customers.ts': { calls: 2, verdict: 'customer-row (created and updated, written in the same transaction as the customer row; the failure rows carry no name)' },
   'app/actions/accounting-ledger-check.ts': { calls: 1, verdict: 'staff-actor' },
   'app/actions/sales.ts': { calls: 1, verdict: 'staff-actor (withdrawal hold released by)' },
   'lib/connectors/xero/sync-processor.ts': { calls: 1, verdict: 'no-write (follow-up plan reads the customer email)' },
