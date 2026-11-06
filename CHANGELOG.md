@@ -8,6 +8,10 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### WooCommerce invoice notes are floored by the WooCommerce live-from instant
+
+- **Fixed: a queued WooCommerce invoice note is judged against `WC_WRITES_LIVE_FROM`, not `XERO_WRITES_LIVE_FROM`.** The note is a WooCommerce write that rides the accounting queue. Its claim, selection, re-queue refusal and last check before sending now use the WooCommerce cut-off, and every Xero write keeps the Xero one. Before this, a note created after the Xero instant but before the WooCommerce one would have been sent while the former writer still owned that write. `npm run outbound:status` counts the note under WooCommerce, with its own floor. Nothing changes while the producer hold is not enforced.
+
 ### Paid-order retry and cancelled-order follow-ups
 
 - **Fixed: a paid WooCommerce order whose total or currency differs from what IMS holds is no longer acknowledged and forgotten.** The delivery still records no receipt and writes its finding (`wc_paid_total_differs` / `wc_paid_currency_differs`), but it now also leaves a durable retry row in the pending queue (written in the same transaction, under the order lock). The scheduled `fx-rates` run replays the stored snapshot on every pass, so correcting the IMS order records the receipt without another WooCommerce delivery. The row is retired only when the receipt is recorded or the order is paid by another route, a retry of a still-mismatched order never marks it done, and after 60 retries it is retired FAILED with an ERROR finding (`wc_paid_block_retry_gave_up`) and a notification to the administrators.
