@@ -633,18 +633,45 @@ export function latestDespatchTime(tracking: ReadonlyArray<{ despatchedAt?: stri
   return latest
 }
 
+/** A date AND time with an explicit zone (`Z` or a numeric offset). Anything less is not an instant. */
+const PRECISE_DESPATCH_INSTANT = /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?\s*(?:([Zz])|([+-])(\d{2}):?(\d{2}))$/
+
 /**
- * The latest despatch time, but null when ANY entry is undated or invalid (or there is none): the time is then UNKNOWN rather than
- * "the dated ones". Used ONLY by the pre-cutover verification, where the comparison "completed at or after the latest despatch" is
- * meaningless on a time that is not known. Every other push keeps the lenient {@link latestDespatchTime}, including its use of "now"
- * for a part with no usable date.
+ * A despatch value as an UNAMBIGUOUS instant, or null. Only a date AND time with an explicit offset or `Z` counts. A date-only value
+ * ("2026-05-20") reads as midnight UTC, which can sit hours before the real despatch, and a value with no zone ("2026-05-20T09:00:00")
+ * is the warehouse's local time of unknown zone: neither says which side of the live-from instant the despatch fell on.
+ */
+export function preciseDespatchInstant(value: string | null | undefined): Date | null {
+  if (!value) return null
+  const m = PRECISE_DESPATCH_INSTANT.exec(value.trim())
+  if (!m) return null
+  const [, y, mo, d, h, mi, sec, frac, , sign, oh, om] = m
+  const wall = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(sec ?? 0), Number((frac ?? '').slice(0, 3).padEnd(3, '0')))
+  const check = new Date(wall)
+  // A calendar or clock value that does not exist (31 February, 25:00) rolls over silently: refuse it.
+  if (check.getUTCFullYear() !== Number(y) || check.getUTCMonth() + 1 !== Number(mo) || check.getUTCDate() !== Number(d) || check.getUTCHours() !== Number(h) || check.getUTCMinutes() !== Number(mi)) return null
+  if (sign !== undefined) {
+    if (Number(oh) > 14 || Number(om) > 59) return null
+    return new Date(wall - (sign === '-' ? -1 : 1) * (Number(oh) * 60 + Number(om)) * 60_000)
+  }
+  return new Date(wall)
+}
+
+/**
+ * The latest despatch time, but null unless EVERY entry is an unambiguous instant ({@link preciseDespatchInstant}) and there is at
+ * least one. Used ONLY by the pre-cutover verification, where "completed at or after the latest despatch" is meaningless on a time
+ * that is not known precisely, and a part must never be treated as pre-cutover on an imprecise date. Every other push keeps the
+ * lenient {@link latestDespatchTime}, including its use of "now" for a part with no usable date.
  */
 export function strictLatestDespatchTime(tracking: ReadonlyArray<{ despatchedAt?: string | null }>): Date | null {
   if (tracking.length === 0) return null
+  let latest: Date | null = null
   for (const entry of tracking) {
-    if (!entry.despatchedAt || Number.isNaN(new Date(entry.despatchedAt).getTime())) return null
+    const at = preciseDespatchInstant(entry.despatchedAt)
+    if (at === null) return null
+    if (latest === null || at.getTime() > latest.getTime()) latest = at
   }
-  return latestDespatchTime(tracking)
+  return latest
 }
 
 /**

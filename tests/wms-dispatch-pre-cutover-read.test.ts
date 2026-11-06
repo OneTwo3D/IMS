@@ -616,6 +616,70 @@ test('UNKNOWN DESPATCH TIME, NORMAL: an undated entry on an ordinary split order
   }
 })
 
+test('IMPRECISE DESPATCH DATES, PRE-CUTOVER: a date-only value on the cutoff day, or a datetime with no zone, never classifies a part as pre-cutover for verification: pending, no read, no flag', async () => {
+  const MIDDAY_CUTOFF = { ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: '2026-06-01T12:00:00Z' }
+  const withDate = (n: number, at: string): Part => ({ ...part(n, at), tracking: [{ trackingNumber: `TN-${n}`, carrier: 'DPD', despatchedAt: at }] })
+  // a date-only value is midnight UTC, hours BEFORE a cutoff at noon the same day: the push is shadowed as pre-cutover
+  // (the real despatch may have been after the cutoff), and a completion earlier that day must not verify it
+  reset()
+  orderRead = wcOrder({ date_completed_gmt: '2026-06-01T06:00:00', date_modified_gmt: '2026-06-01T06:00:05' })
+  await withEnv(MIDDAY_CUTOFF, async () => {
+    const run = await sweep([withDate(1, '2026-06-01')])
+    assert.equal(run.out.counters.dispatched, 0)
+    assert.equal(run.out.counters.pending, 1)
+    assert.deepEqual(run.applyOptions, [], 'storefrontAlreadyCompleted is not set (nothing applied)')
+    assert.deepEqual(run.asked, [null], 'the verifier is asked with an UNKNOWN time')
+    assert.deepEqual(transport, [], 'and nothing is read or written')
+    assert.equal(activity.find((a) => a.action === 'pre_cutover_part_pending')?.metadata?.code, 'no_despatch_time')
+  })
+  for (const imprecise of ['2026-05-20', '2026-05-20T10:00:00', '2026-05-20 10:00:00', '2026-05-20T10:00', '2026-05-20T10:00:00.123']) {
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const run = await sweep([withDate(1, imprecise)])
+      assert.equal(run.out.counters.dispatched, 0, imprecise)
+      assert.deepEqual(run.applyOptions, [], imprecise)
+      assert.deepEqual(transport, [], imprecise)
+    })
+  }
+  // an unambiguous instant (Z, or an offset) verifies
+  for (const precise of ['2026-05-20T10:00:00Z', '2026-05-20T11:00:00+01:00', '2026-05-20T11:00:00+0100', '2026-05-20 10:00:00z', '2026-05-20T10:00:00.1234567Z']) {
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const run = await sweep([withDate(1, precise)])
+      assert.equal(run.out.counters.dispatched, 1, precise)
+      assert.deepEqual(run.applyOptions, [{ storefrontAlreadyCompleted: true }], precise)
+      assert.deepEqual(reads(), [ORDER_READ], precise)
+    })
+  }
+})
+
+test('IMPRECISE DESPATCH DATES, NORMAL: a date-only or zone-less value on an ordinary post-cutover split order pushes exactly as before', async () => {
+  for (const loose of ['2026-07-01', '2026-07-01T10:00:00']) {
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const run = await sweep([{ ...part(1, POST), tracking: [{ trackingNumber: 'TN-1', carrier: 'DPD', despatchedAt: loose }] }])
+      assert.equal(run.out.counters.dispatched, 1, loose)
+      assert.deepEqual(run.applyOptions, [undefined])
+      assert.equal(writes().length, 1)
+      assert.deepEqual(run.asked, [])
+    })
+  }
+})
+
+test('preciseDespatchInstant: only a date AND time with Z or an offset; impossible values refused; offsets applied', async () => {
+  const { preciseDespatchInstant, strictLatestDespatchTime } = await import('@/lib/domain/wms/dispatch-sweep')
+  assert.equal(preciseDespatchInstant('2026-05-20T10:00:00Z')?.toISOString(), '2026-05-20T10:00:00.000Z')
+  assert.equal(preciseDespatchInstant('2026-05-20T11:00:00+01:00')?.toISOString(), '2026-05-20T10:00:00.000Z')
+  assert.equal(preciseDespatchInstant('2026-05-20T05:00:00-0500')?.toISOString(), '2026-05-20T10:00:00.000Z')
+  assert.equal(preciseDespatchInstant('2026-05-20T10:00Z')?.toISOString(), '2026-05-20T10:00:00.000Z')
+  for (const bad of [null, undefined, '', 'x', '2026-05-20', '2026-05-20T10:00:00', '2026-05-20 10:00', '2026-02-31T10:00:00Z', '2026-05-20T25:00:00Z', '2026-05-20T10:00:00+15:00', '2026-05-20T10:00:00+01:99']) {
+    assert.equal(preciseDespatchInstant(bad), null, String(bad))
+  }
+  assert.equal(strictLatestDespatchTime([{ despatchedAt: PRE }, { despatchedAt: PRE2 }])?.toISOString(), new Date(PRE2).toISOString())
+  assert.equal(strictLatestDespatchTime([{ despatchedAt: PRE }, { despatchedAt: '2026-05-21' }]), null)
+  assert.equal(strictLatestDespatchTime([{ despatchedAt: PRE }, { despatchedAt: '2026-05-21T10:00:00' }]), null)
+})
+
 test('latestDespatchTime skips undated entries (as on development); strictLatestDespatchTime treats any as UNKNOWN', async () => {
   const { latestDespatchTime, strictLatestDespatchTime } = await import('@/lib/domain/wms/dispatch-sweep')
   assert.equal(latestDespatchTime([{ despatchedAt: PRE }, { despatchedAt: PRE2 }])?.toISOString(), new Date(PRE2).toISOString())
