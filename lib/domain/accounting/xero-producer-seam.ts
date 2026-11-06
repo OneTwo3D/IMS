@@ -1,6 +1,7 @@
 import { producerBeforeCutoffNotice, producerShadowNotice } from '@/lib/security/producer-disposition-constants'
 import type { ProducerDecision } from '@/lib/security/producer-disposition'
 import { createdBeforeCutoffFloor, producerCutoffFloor, producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
+import { AccountingSyncType } from '@/app/generated/prisma/client'
 import type { OutboundConnector } from '@/lib/security/outbound-write-hold-constants'
 import {
   ACCOUNTING_SYNC_TYPE_EXCLUSIONS,
@@ -121,6 +122,23 @@ export function xeroProducerSeamVerdict(input: {
  */
 export const WOO_SYNC_TYPES: readonly string[] = [...TYPE_INDEX].filter(([, entry]) => entry.destination === 'woocommerce').map(([type]) => type)
 export const NOT_A_XERO_WRITE: readonly string[] = [...Object.keys(ACCOUNTING_SYNC_TYPE_EXCLUSIONS), ...WOO_SYNC_TYPES]
+/**
+ * Types the ownership map does not name (and that are no PDF fetch or e-mail). Nobody has said which destination they write to, so they are
+ * floored by EVERY destination's cut-off: the stricter reading, never the laxer one.
+ */
+export const UNMAPPED_SYNC_TYPES: readonly string[] = Object.values(AccountingSyncType)
+  .filter((type) => !TYPE_INDEX.has(type) && !Object.prototype.hasOwnProperty.call(ACCOUNTING_SYNC_TYPE_EXCLUSIONS, type))
+/** The types the WooCommerce floor governs: its own and the unmapped ones. */
+export const WOO_FLOORED_TYPES: readonly string[] = [...WOO_SYNC_TYPES, ...UNMAPPED_SYNC_TYPES]
+
+/** Which destinations' floors judge a row of this type: its own, both for an unmapped or unknown type, none for a PDF fetch or an e-mail. */
+export function floorDestinationsForType(type: string | undefined): OutboundConnector[] {
+  if (type !== undefined && Object.prototype.hasOwnProperty.call(ACCOUNTING_SYNC_TYPE_EXCLUSIONS, type)) return []
+  if (type === undefined) return ['xero', 'woocommerce']
+  const target = TYPE_INDEX.get(type)
+  if (!target) return ['xero', 'woocommerce']
+  return [target.destination]
+}
 
 type FloorContext = { env?: Record<string, string | undefined>; now?: Date }
 
@@ -147,16 +165,16 @@ export function accountingCutoffInForce(context?: FloorContext): boolean {
 /**
  * The operator sentence when a row may not be re-queued or delivered because it predates the cut-off, or null when it may (no floor,
  * created at or after it, or a type that is not a write to a destination at all: a PDF fetch and an e-mail are exactly as exempt as they are from
- * the producer decision). The floor is the one of the row's own destination. A row whose type is not given is treated as a write to
- * either destination: fail closed. The one place a re-queue path words this.
+ * the producer decision). The floor is the one of the row's own destination. A row whose type is not given, or that the ownership map does not name,
+ * is judged by every destination's floor: fail closed. The one place a re-queue path words this.
  */
 export function xeroBeforeCutoffRefusal(
   row: { createdAt: Date | null | undefined; type?: string },
   context?: FloorContext,
 ): string | null {
   if (row.type !== undefined && Object.prototype.hasOwnProperty.call(ACCOUNTING_SYNC_TYPE_EXCLUSIONS, row.type)) return null
-  const connectors: OutboundConnector[] = row.type === undefined ? ['xero', 'woocommerce'] : WOO_SYNC_TYPES.includes(row.type) ? ['woocommerce'] : ['xero']
-  for (const connector of connectors) {
+  for (const connector of floorDestinationsForType(row.type)) {
+    if (connector !== 'xero' && connector !== 'woocommerce') continue
     const floor = connector === 'xero' ? xeroCutoffFloor(context) : wooAccountingCutoffFloor(context)
     if (floor !== null && createdBeforeCutoffFloor(row.createdAt, floor)) return producerBeforeCutoffNotice({ connector, cutoff: floor })
   }
@@ -171,7 +189,7 @@ function beforeFloorsClause(
 ): { NOT?: Record<string, unknown> } {
   const parts: Record<string, unknown>[] = []
   if (xeroFloor !== null) parts.push({ ...extra, createdAt: { lt: xeroFloor }, type: { notIn: NOT_A_XERO_WRITE } })
-  if (wooFloor !== null) parts.push({ ...extra, createdAt: { lt: wooFloor }, type: { in: WOO_SYNC_TYPES } })
+  if (wooFloor !== null) parts.push({ ...extra, createdAt: { lt: wooFloor }, type: { in: WOO_FLOORED_TYPES } })
   if (parts.length === 0) return {}
   return { NOT: parts.length === 1 ? parts[0] : { OR: parts } }
 }

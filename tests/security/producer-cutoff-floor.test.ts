@@ -11,7 +11,7 @@ import {
   producerUnknownOutcomeNotice,
 } from '../../lib/security/producer-disposition-constants.ts'
 import { OUTBOUND_CONNECTORS, OUTBOUND_GRANT_ENV, outboundHeldMessage } from '../../lib/security/outbound-write-hold-constants.ts'
-import { accountingCutoffInForce, wooAccountingCutoffFloor, xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroNotNeverDeliverablePendingWhere } from '../../lib/domain/accounting/xero-producer-seam.ts'
+import { UNMAPPED_SYNC_TYPES, WOO_FLOORED_TYPES, accountingCutoffInForce, wooAccountingCutoffFloor, xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroNotNeverDeliverablePendingWhere } from '../../lib/domain/accounting/xero-producer-seam.ts'
 import { outboxBeforeCutoffWhere, outboxRowBeforeCutoff } from '../../lib/domain/integrations/outbox.ts'
 import {
   classifyWmsPushLink,
@@ -309,4 +309,42 @@ test('BOUNDARY: a row created at the instant the decision went live is not befor
   assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: new Date(WOO_AT.getTime() - 1), type: 'WC_INVOICE_NOTE' }, { env, now: WOO_AT }), null)
   assert.equal(createdBeforeCutoffFloor(WOO_AT, WOO_AT), false)
   assert.equal(createdBeforeCutoffFloor(new Date(WOO_AT.getTime() - 1), WOO_AT), true)
+})
+
+test('an explicit type the ownership map does not name is judged by BOTH floors: refused under WooCommerce-only enforcement, and by the WooCommerce clause of the fragment', () => {
+  const wooOnly = { [PRODUCER_HOLD_ENFORCED_ENV]: 'woocommerce', [OUTBOUND_GRANT_ENV.woocommerce]: SHOP, [PRODUCER_CUTOFF_ENV.woocommerce]: WOO_AT.toISOString() }
+  const xeroOnly = live()
+  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'A_TYPE_NOBODY_MAPPED' }, { env: wooOnly, now: LATER }), null, 'WooCommerce-only: the unmapped type is refused by the WooCommerce floor')
+  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: new Date('2026-11-01T00:00:00Z'), type: 'A_TYPE_NOBODY_MAPPED' }, { env: xeroOnly, now: NOW }), null, 'Xero-only: refused by the Xero floor')
+  assert.equal(xeroBeforeCutoffRefusal({ createdAt: LATER, type: 'A_TYPE_NOBODY_MAPPED' }, { env: bothLive(), now: LATER }), null, 'created after both: sendable')
+  assert.equal(xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'INVOICE_PDF' }, { env: wooOnly, now: LATER }), null, 'a PDF fetch still has no floor')
+  // The fragment: every enum type the map does not name is in the WooCommerce clause as well as the Xero one.
+  for (const type of UNMAPPED_SYNC_TYPES) assert.ok(WOO_FLOORED_TYPES.includes(type), `${type} is floored by WooCommerce too`)
+  assert.ok(WOO_FLOORED_TYPES.includes('WC_INVOICE_NOTE'))
+  const both = xeroNotBeforeCutoffWhere(XERO_AT, WOO_AT) as { NOT: { OR: Array<{ type: Record<string, string[]> }> } }
+  assert.deepEqual([...both.NOT.OR[1]!.type.in!].sort(), [...WOO_FLOORED_TYPES].sort())
+  assert.ok(!both.NOT.OR[0]!.type.notIn!.some((type) => UNMAPPED_SYNC_TYPES.includes(type)), 'and the Xero clause still floors them')
+})
+
+test('the outbox fragment: a note delivery job is moved from the Xero clause to the WooCommerce clause by id; no ids leave the fragment as before', () => {
+  const saved = { ...process.env }
+  try {
+    process.env[PRODUCER_HOLD_ENFORCED_ENV] = 'xero,woocommerce'
+    process.env[OUTBOUND_GRANT_ENV.xero] = TENANT
+    process.env[PRODUCER_CUTOFF_ENV.xero] = XERO_AT.toISOString()
+    process.env[OUTBOUND_GRANT_ENV.woocommerce] = SHOP
+    process.env[PRODUCER_CUTOFF_ENV.woocommerce] = WOO_AT.toISOString()
+    const plain = outboxBeforeCutoffWhere({ now: LATER }) as { OR: Array<Record<string, unknown>> }
+    assert.equal(plain.OR.length, 2)
+    assert.ok(!plain.OR.some((clause) => 'id' in clause), 'no ids: the legacy fragment exactly')
+    const withIds = outboxBeforeCutoffWhere({ now: LATER, wooAccountingJobIds: ['job-1'] }) as { OR: Array<Record<string, unknown>> }
+    const xeroClause = withIds.OR.find((clause) => clause.connector === 'xero')!
+    assert.deepEqual(xeroClause.id, { notIn: ['job-1'] })
+    const wooIdClause = withIds.OR.find((clause) => !('connector' in clause))!
+    assert.deepEqual(wooIdClause.id, { in: ['job-1'] })
+    assert.equal((wooIdClause.createdAt as { lt: Date }).lt.toISOString(), WOO_AT.toISOString())
+  } finally {
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key]
+    Object.assign(process.env, saved)
+  }
 })

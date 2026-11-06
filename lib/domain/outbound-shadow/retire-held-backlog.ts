@@ -6,7 +6,7 @@ import { attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-pr
 import { MONEY_MOVING_SYNC_TYPES } from '@/lib/domain/accounting/followup-retry-guard'
 import { HELD_SHADOW_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
-import { destinationAndOperationForSyncType } from '@/lib/domain/accounting/xero-producer-seam'
+import { destinationAndOperationForSyncType, NOT_A_XERO_WRITE, WOO_SYNC_TYPES } from '@/lib/domain/accounting/xero-producer-seam'
 import { wmsConnectorIdsFor } from '@/lib/connectors/wms/producer-seam'
 import { ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS } from '@/lib/domain/integrations/outbox-admin'
 import { INTEGRATION_OUTBOX_STATUS } from '@/lib/domain/integrations/outbox'
@@ -262,6 +262,19 @@ export function classifyWmsPushLink(link: WmsLinkRetirementRow): RetirementClass
 
 type RetirementClient = typeof db | Prisma.TransactionClient
 
+const JOB_RETIREMENT_SELECT = { id: true, connector: true, operation: true, status: true, attempts: true, lastError: true, lockedAt: true, lockedBy: true, createdAt: true, updatedAt: true, attemptHistoryTracked: true, firstAttemptedAt: true } as const
+
+/** The queued `xero/accounting.post` jobs whose sync row writes to WooCommerce, by one SQL join on the row's type. */
+async function wooAccountingPostJobIdsFor(client: Pick<Prisma.TransactionClient, '$queryRaw'>): Promise<string[]> {
+  const rows = await client.$queryRaw<Array<{ id: string }>>`
+    SELECT o.id FROM integration_outbox o
+    JOIN accounting_sync_logs s ON s.id = o."payloadJson"->>'accountingSyncLogId'
+    WHERE o.connector = 'xero' AND o.operation = 'accounting.post'
+      AND o.status IN ('PENDING', 'RETRYABLE_FAILED', 'PROCESSING')
+      AND s.type::text = ANY(${[...WOO_SYNC_TYPES]})`
+  return rows.map((row) => row.id)
+}
+
 /**
  * THE CUT-OFF THAT ACTUALLY SELECTS ROWS for a destination: none when `allQueued` (every queued row is in scope, so a configured cut-off must
  * NOT narrow the plan or the apply and make a run look complete over a subset), otherwise the destination's own. The plan, the apply and the
@@ -306,10 +319,15 @@ export async function planHeldBacklogRetirement(
     }
     const before = selected.cutoff ? { createdAt: { lt: selected.cutoff } } : {}
 
-    if (destination === 'xero') {
+    if (destination === 'xero' || destination === 'woocommerce') {
+      // An accounting row belongs to the destination it writes to: the WooCommerce invoice note to WooCommerce (with its cut-off and its shadow
+      // attribution), every other write type to Xero. A PDF fetch and an e-mail are not writes to a destination, so neither does the retirement.
       const rows = await client.accountingSyncLog.findMany({
-        // A PDF fetch and an e-mail are not writes to Xero: the cut-off does not govern them, so neither does the retirement.
-        where: { connector: 'xero', status: { in: ['PENDING', 'PROCESSING'] }, type: { notIn: Object.keys(ACCOUNTING_SYNC_TYPE_EXCLUSIONS) as never }, ...before },
+        where: {
+          connector: 'xero', status: { in: ['PENDING', 'PROCESSING'] },
+          type: (destination === 'xero' ? { notIn: [...NOT_A_XERO_WRITE] } : { in: [...WOO_SYNC_TYPES] }) as never,
+          ...before,
+        },
         orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
         take,
         select: {
@@ -327,21 +345,36 @@ export async function planHeldBacklogRetirement(
       }
     }
 
-    // Outbox jobs of this destination's connector, except the operations whose effect is local.
+    // Outbox jobs of this destination's connector, except the operations whose effect is local. The delivery half of an invoice note is a
+    // `xero/accounting.post` job whose sync row writes to WooCommerce: it is WooCommerce's, not Xero's.
+    const wooJobIds = destination === 'xero' || destination === 'woocommerce' ? await wooAccountingPostJobIdsFor(client) : []
     const internal = outboxInternalOperationsOf(destination)
-    const jobs = await client.integrationOutbox.findMany({
+    const connectorJobs = await client.integrationOutbox.findMany({
       where: {
         connector: destination,
         ...(internal.length > 0 ? { operation: { notIn: internal } } : {}),
+        ...(destination === 'xero' && wooJobIds.length > 0 ? { id: { notIn: wooJobIds } } : {}),
         status: { in: [INTEGRATION_OUTBOX_STATUS.PENDING, INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED, INTEGRATION_OUTBOX_STATUS.PROCESSING] },
         ...before,
       },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       take,
-      select: { id: true, connector: true, operation: true, status: true, attempts: true, lastError: true, lockedAt: true, lockedBy: true, createdAt: true, updatedAt: true, attemptHistoryTracked: true, firstAttemptedAt: true },
+      select: JOB_RETIREMENT_SELECT,
     })
-    if (jobs.length === take) truncated.push({ destination, kind: 'outbox_job' })
-    for (const job of jobs.slice(0, take - 1)) {
+    const noteJobs = destination === 'woocommerce' && wooJobIds.length > 0
+      ? await client.integrationOutbox.findMany({
+        where: {
+          id: { in: wooJobIds },
+          status: { in: [INTEGRATION_OUTBOX_STATUS.PENDING, INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED, INTEGRATION_OUTBOX_STATUS.PROCESSING] },
+          ...before,
+        },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        take,
+        select: JOB_RETIREMENT_SELECT,
+      })
+      : []
+    if (connectorJobs.length === take || noteJobs.length === take) truncated.push({ destination, kind: 'outbox_job' })
+    for (const job of [...connectorJobs.slice(0, take - 1), ...noteJobs.slice(0, take - 1)]) {
       items.push({
         destination, kind: 'outbox_job', id: job.id, subject: `${job.connector}/${job.operation}`,
         createdAt: job.createdAt, status: job.status, classification: classifyOutboxJob(job, now),
@@ -412,15 +445,18 @@ async function retireXeroSyncLog(tx: Prisma.TransactionClient, item: RetirementI
       remoteAttemptedAt: true, attemptStampingCustodyAt: true, processingStartedAt: true,
     },
   })
-  const xeroCutoff = effectiveRetirementCutoff(scope, 'xero')
-  if (!row || row.connector !== 'xero' || (row.status !== 'PENDING' && row.status !== 'PROCESSING') || !stillBeforeCutoff(row.createdAt, xeroCutoff)) {
+  // The row's OWN destination decides the cut-off and the attribution: the invoice note is WooCommerce's, every other write type Xero's.
+  const destination = item.destination
+  const ownedHere = row ? (destination === 'xero' ? !NOT_A_XERO_WRITE.includes(row.type) : WOO_SYNC_TYPES.includes(row.type)) : false
+  const cutoff = effectiveRetirementCutoff(scope, destination)
+  if (!row || row.connector !== 'xero' || !ownedHere || (row.status !== 'PENDING' && row.status !== 'PROCESSING') || !stillBeforeCutoff(row.createdAt, cutoff)) {
     return { item, result: 'changed_since_plan', detail: CHANGED_SINCE_PLANNING }
   }
   const verdict = classifyXeroSyncRow(xeroRetirementRowOf(row), now)
   if (verdict.disposition === 'SKIP') return { item, result: 'left_alone', detail: verdict.reason }
   const notice = verdict.disposition === 'SHADOW'
-    ? producerRetiredShadowNotice({ connector: 'xero', proof: verdict.reason })
-    : producerUnknownOutcomeNotice({ connector: 'xero', why: `The record does not show it was never sent: ${verdict.reason}.` })
+    ? producerRetiredShadowNotice({ connector: destination, proof: verdict.reason })
+    : producerUnknownOutcomeNotice({ connector: destination, why: `The record does not show it was never sent: ${verdict.reason}.` })
 
   // The compare-and-set: exactly the state that was classified. A claim, a retry or a settlement since the read changes one of these.
   const guard: Prisma.AccountingSyncLogWhereInput = {
@@ -440,13 +476,13 @@ async function retireXeroSyncLog(tx: Prisma.TransactionClient, item: RetirementI
     const target = destinationAndOperationForSyncType(row.type)
     const operation = target?.operation ?? `unmapped:${row.type}`
     const recorded = await recordOutboundShadow(tx, {
-      destination: 'xero',
+      destination,
       operation,
       subjectType: row.referenceType,
       subjectId: row.referenceId,
       payload: { type: row.type, payload: row.payload },
       summary: { type: row.type, connector: 'xero', retired: true },
-      decision: retirementDecision('xero', operation, scope, now),
+      decision: retirementDecision(destination, operation, scope, now),
     })
     const updated = await tx.accountingSyncLog.updateMany({
       where: guard,
@@ -515,9 +551,13 @@ async function retireOutboxJob(tx: Prisma.TransactionClient, item: RetirementIte
   const job = await tx.integrationOutbox.findUnique({ where: { id: item.id } })
   // Re-derived under the row lock from the CURRENT row: same destination, not a local operation, still queued, and STILL created before the
   // effective cut-off. A product's stock job is re-dated and re-armed in place by a live producer; that row is new live work, never a backlog row.
+  const isAccountingPost = job?.connector === 'xero' && job.operation === 'accounting.post'
+  // The delivery half of an invoice note is a Xero-connector job that belongs to WooCommerce; resolved from its sync row's type.
+  const wooJob = isAccountingPost ? (await wooAccountingPostJobIdsFor(tx)).includes(job.id) : false
+  const ownedHere = item.destination === 'woocommerce' ? (wooJob || job?.connector === 'woocommerce') : (job?.connector === item.destination && !wooJob)
   if (
     !job
-    || job.connector !== item.destination
+    || !ownedHere
     || outboxInternalOperationsOf(item.destination).includes(job.operation)
     || ![INTEGRATION_OUTBOX_STATUS.PENDING, INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED, INTEGRATION_OUTBOX_STATUS.PROCESSING].includes(job.status as never)
     || !stillBeforeCutoff(job.createdAt, effectiveRetirementCutoff(scope, item.destination))
@@ -530,9 +570,9 @@ async function retireOutboxJob(tx: Prisma.TransactionClient, item: RetirementIte
   const cleared = { nextAttemptAt: null, lockedAt: null, lockedBy: null }
   const guard = { id: job.id, connector: job.connector, operation: job.operation, createdAt: job.createdAt, status: job.status, attempts: job.attempts, updatedAt: job.updatedAt, attemptHistoryTracked: job.attemptHistoryTracked, firstAttemptedAt: job.firstAttemptedAt }
   if (verdict.disposition === 'SHADOW') {
-    // The Xero job is the delivery half of a sync row, whose own retirement records the shadow; every other job is the work itself.
-    const target = destination === 'xero' ? null : ownershipTargetForOutboxOperation(`${job.connector}/${job.operation}`)
-    if (destination !== 'xero') {
+    // An accounting job is the delivery half of a sync row, whose own retirement records the shadow; every other job is the work itself.
+    const target = isAccountingPost ? null : ownershipTargetForOutboxOperation(`${job.connector}/${job.operation}`)
+    if (!isAccountingPost) {
       const operation = target?.operation ?? `unmapped:${job.connector}/${job.operation}`
       await recordOutboundShadow(tx, {
         destination,

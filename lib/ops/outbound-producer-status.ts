@@ -179,13 +179,13 @@ export async function readProducerCountsFromDatabase(input: {
 
     if (destination === 'xero' || destination === 'woocommerce') {
       // An accounting row is counted under the destination it writes to: the WooCommerce invoice note under WooCommerce, with its own floor.
-      const { WOO_SYNC_TYPES, NOT_A_XERO_WRITE } = await import('@/lib/domain/accounting/xero-producer-seam')
+      const { WOO_SYNC_TYPES, WOO_FLOORED_TYPES, NOT_A_XERO_WRITE } = await import('@/lib/domain/accounting/xero-producer-seam')
       const ofThisDestination = destination === 'xero' ? { notIn: [...WOO_SYNC_TYPES] } : { in: [...WOO_SYNC_TYPES] }
       {
         queued.syncLog = await db.accountingSyncLog.count({ where: { connector: 'xero', type: ofThisDestination as never, status: { in: ['PENDING', 'PROCESSING'] } } })
         sent.syncLog = await db.accountingSyncLog.count({ where: { connector: 'xero', type: ofThisDestination as never, status: 'SYNCED', syncedAt: { gte: since } } })
         // A PDF fetch and an e-mail are not writes to Xero: the cut-off does not govern them and the retirement leaves them, so they are not counted.
-        const governed = destination === 'xero' ? { notIn: [...NOT_A_XERO_WRITE] } : { in: [...WOO_SYNC_TYPES] }
+        const governed = destination === 'xero' ? { notIn: [...NOT_A_XERO_WRITE] } : { in: [...WOO_FLOORED_TYPES] }
         if (floor) pre.syncLog = await db.accountingSyncLog.count({ where: { connector: 'xero', status: { in: ['PENDING', 'PROCESSING'] }, createdAt: { lt: floor }, type: governed as never } })
       }
     }

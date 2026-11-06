@@ -109,3 +109,35 @@ test('[note floor] the re-queue racing the claimers: a FAILED pre-instant note s
     assert.ok(second.filter((result) => result.outcome === 'claimed').length <= 1, 'never claimed twice')
   })
 })
+
+test('[note floor] sixteen drains of the OUTBOX: a note delivery job created after WooCommerce went live but before Xero did is claimed by exactly one, once Xero is live too (and by nobody in the other order)', { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' }, async (t) => {
+  const d = await loadDeps()
+  const { claimIntegrationOutboxWork } = await import('../../lib/domain/integrations/outbox.ts')
+  const tag = `wc${randomUUID().slice(0, 8)}`
+  t.after(async () => {
+    await d.db.integrationOutbox.deleteMany({ where: { idempotencyKey: { startsWith: tag } } })
+    await d.db.accountingSyncLog.deleteMany({ where: { referenceId: { startsWith: tag } } })
+  })
+  const middle = new Date(Date.now() - 2 * DAY)
+  for (const [name, xero, woo, expected] of [
+    ['WooCommerce first', new Date(Date.now() - DAY), new Date(Date.now() - 3 * DAY), 1],
+    ['Xero first', new Date(Date.now() - 3 * DAY), new Date(Date.now() - DAY), 0],
+  ] as const) {
+    const row = await seed(d, `${tag}-${name.replace(/\W/g, '')}`, middle)
+    const job = await d.db.integrationOutbox.create({
+      data: {
+        connector: 'xero', operation: 'accounting.post', idempotencyKey: `${tag}-${name.replace(/\W/g, '')}`, payloadJson: { accountingSyncLogId: row.id },
+        status: 'PENDING', attempts: 0, createdAt: middle, attemptHistoryTracked: true,
+      } as never,
+      select: { id: true, idempotencyKey: true },
+    })
+    await withEnv({ ...BOTH, XERO_WRITES_LIVE_FROM: iso(xero), WC_WRITES_LIVE_FROM: iso(woo) }, async () => {
+      const results = await Promise.all(Array.from({ length: WORKERS }, (_, i) => claimIntegrationOutboxWork({
+        connector: 'xero', operation: 'accounting.post', idempotencyKeys: [job.idempotencyKey], workerId: `w${i}`, limit: 1,
+      })))
+      const winners = results.filter((claimed) => claimed.some((claimedJob: { id: string }) => claimedJob.id === job.id)).length
+      console.log(`# ${name}: winners=${winners}`)
+      assert.equal(winners, expected)
+    })
+  }
+})

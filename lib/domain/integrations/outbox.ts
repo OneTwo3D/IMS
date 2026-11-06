@@ -25,6 +25,7 @@ import { recordOutboundShadow } from '@/lib/domain/outbound-shadow/record'
 import { producerBeforeCutoffNotice, producerShadowNotice, type ProducerReason } from '@/lib/security/producer-disposition-constants'
 import type { ProducerDecision } from '@/lib/security/producer-disposition'
 import { createdBeforeCutoffFloor, producerCutoffFloor, producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
+import { floorDestinationsForType, WOO_SYNC_TYPES } from '@/lib/domain/accounting/xero-producer-seam'
 import { ownershipTargetForOutboxOperation, type MappedOperation } from '@/lib/security/writer-ownership-map'
 
 export const INTEGRATION_OUTBOX_STATUS = {
@@ -357,8 +358,12 @@ function isIdempotencyKeyConflict(error: unknown): boolean {
  * legacy predicate is exact. A registered operation whose effect is local (`internal`) is never matched. Read at the moment it is asked
  * for, from the environment, and cached nowhere.
  */
-export function outboxBeforeCutoffWhere(context: { now?: Date } = {}): Record<string, unknown> | null {
+export function outboxBeforeCutoffWhere(context: { now?: Date; wooAccountingJobIds?: readonly string[] } = {}): Record<string, unknown> | null {
   const clauses: Array<Record<string, unknown>> = []
+  // `xero/accounting.post` is the delivery half of an accounting sync row, and the row decides which destination it writes to. The ids of the
+  // jobs whose row writes to WooCommerce (the invoice note) are resolved in SQL by the claim ({@link wooAccountingPostJobIds}) and are judged
+  // by the WooCommerce floor instead of the Xero one; every other job keeps its connector's floor.
+  const wooJobIds = context.wooAccountingJobIds ?? []
   for (const connector of OUTBOX_CUTOFF_CONNECTORS) {
     const floor = producerCutoffFloor(connector, context.now ? { now: context.now } : {})
     if (floor === null) continue
@@ -367,9 +372,37 @@ export function outboxBeforeCutoffWhere(context: { now?: Date } = {}): Record<st
       connector,
       createdAt: { lt: floor },
       ...(internal.length > 0 ? { operation: { notIn: internal } } : {}),
+      ...(connector === 'xero' && wooJobIds.length > 0 ? { id: { notIn: [...wooJobIds] } } : {}),
     })
+    if (connector === 'woocommerce' && wooJobIds.length > 0) clauses.push({ id: { in: [...wooJobIds] }, createdAt: { lt: floor } })
   }
   return clauses.length > 0 ? { OR: clauses } : null
+}
+
+const ACCOUNTING_POST_JOB = { connector: 'xero', operation: 'accounting.post' } as const
+
+/** Can the scope of a claim include `xero/accounting.post` jobs? */
+function scopeMayIncludeAccountingPost(scope: { connector?: string; operation?: string }): boolean {
+  return (scope.connector === undefined || scope.connector === ACCOUNTING_POST_JOB.connector)
+    && (scope.operation === undefined || scope.operation === ACCOUNTING_POST_JOB.operation)
+}
+
+/**
+ * THE QUEUED `xero/accounting.post` JOBS WHOSE SYNC ROW WRITES TO WOOCOMMERCE, resolved by ONE SQL statement (a join on the sync row's type,
+ * never a lookup per job). Empty without a query when neither the Xero nor the WooCommerce floor is in force, so with the switch off nothing
+ * extra is read. Membership never changes (a row's type is fixed) and a job created after this read is newer than any floor in force, so the
+ * set read here is the set the claim's selection and its compare-and-set both need.
+ */
+export async function wooAccountingPostJobIds(now: Date): Promise<string[]> {
+  const context = { now }
+  if (producerCutoffFloor('xero', context) === null && producerCutoffFloor('woocommerce', context) === null) return []
+  const rows = await db.$queryRaw<Array<{ id: string }>>`
+    SELECT o.id FROM integration_outbox o
+    JOIN accounting_sync_logs s ON s.id = o."payloadJson"->>'accountingSyncLogId'
+    WHERE o.connector = ${ACCOUNTING_POST_JOB.connector} AND o.operation = ${ACCOUNTING_POST_JOB.operation}
+      AND o.status IN ('PENDING', 'RETRYABLE_FAILED', 'PROCESSING')
+      AND s.type::text = ANY(${[...WOO_SYNC_TYPES]})`
+  return rows.map((row) => row.id)
 }
 
 /** The floor that applies to ONE job (null when none), for a path that holds the row rather than a query. */
@@ -388,9 +421,23 @@ export async function currentOutboxRowBeforeCutoff(
   job: Pick<IntegrationOutboxRow, 'id' | 'connector' | 'operation' | 'createdAt'>,
   options: { client?: IntegrationOutboxClient; now?: Date } = {},
 ): Promise<Date | null> {
-  const floor = outboxRowCutoffFloor(job.connector, job.operation, options.now ? { now: options.now } : {})
-  if (floor === null) return null
+  const context = options.now ? { now: options.now } : {}
+  const floor = outboxRowCutoffFloor(job.connector, job.operation, context)
+  const isAccountingPost = job.connector === ACCOUNTING_POST_JOB.connector && job.operation === ACCOUNTING_POST_JOB.operation
+  // The delivery half of an accounting row is judged by the floor of the destination its row writes to, and no floor means no query at all.
+  if (floor === null && !(isAccountingPost && producerCutoffFloor('woocommerce', context) !== null)) return null
   const current = await getClient(options.client).integrationOutbox.findUnique({ where: { id: job.id } })
+  if (isAccountingPost) {
+    const syncLogId = (current?.payloadJson as { accountingSyncLogId?: unknown } | null | undefined)?.accountingSyncLogId
+    const row = typeof syncLogId === 'string' ? await db.accountingSyncLog.findUnique({ where: { id: syncLogId }, select: { type: true } }) : null
+    // A row that cannot be read keeps the connector's own floor (fail closed on the Xero one).
+    const destinations: OutboundConnector[] = row ? floorDestinationsForType(row.type) : ['xero']
+    for (const destination of destinations) {
+      const own = (OUTBOX_CUTOFF_CONNECTORS as readonly string[]).includes(destination) ? producerCutoffFloor(destination as (typeof OUTBOX_CUTOFF_CONNECTORS)[number], context) : null
+      if (own !== null && createdBeforeCutoffFloor(current?.createdAt, own)) return own
+    }
+    return null
+  }
   return createdBeforeCutoffFloor(current?.createdAt, floor) ? floor : null
 }
 
@@ -471,9 +518,10 @@ function claimableWhere(options: {
   maxAttempts: number
   /** {@link integrationOutboxStaleReclaimScope}: the extra predicate, or `null` for no arm at all. */
   staleReclaimScope: Record<string, unknown> | null
+  wooAccountingJobIds?: readonly string[]
 }): unknown {
   const staleLockedBefore = new Date(options.now.getTime() - options.staleLockMs)
-  const beforeCutoff = outboxBeforeCutoffWhere({ now: options.now })
+  const beforeCutoff = outboxBeforeCutoffWhere({ now: options.now, wooAccountingJobIds: options.wooAccountingJobIds })
   return {
     ...(options.connector ? { connector: options.connector } : {}),
     ...(options.operation ? { operation: options.operation } : {}),
@@ -501,10 +549,10 @@ function claimableWhere(options: {
   }
 }
 
-function claimUpdateWhere(row: IntegrationOutboxRow, now: Date, maxAttempts: number): unknown {
+function claimUpdateWhere(row: IntegrationOutboxRow, now: Date, maxAttempts: number, wooAccountingJobIds: readonly string[] = []): unknown {
   // The writer-side cut-off, re-derived INSIDE the claim statement: the candidate was selected by a query that carried it, but the claim
   // is the compare-and-set that takes the job, and what it decides must be the floor of that moment, not of the read before it.
-  const beforeCutoff = outboxBeforeCutoffWhere({ now })
+  const beforeCutoff = outboxBeforeCutoffWhere({ now, wooAccountingJobIds })
   if (row.status === INTEGRATION_OUTBOX_STATUS.PROCESSING) {
     return {
       ...(beforeCutoff ? { NOT: beforeCutoff } : {}),
@@ -685,7 +733,9 @@ export async function claimIntegrationOutboxWork(
   const now = options.now ?? new Date()
   const staleLockMs = options.staleLockMs ?? DEFAULT_STALE_LOCK_MS
   const maxAttempts = positiveMaxAttempts(options.maxAttempts)
+  const wooJobIds = scopeMayIncludeAccountingPost(options) ? await wooAccountingPostJobIds(now) : []
   const baseWhere = claimableWhere({
+    wooAccountingJobIds: wooJobIds,
     connector: options.connector,
     operation: options.operation,
     idempotencyKeys: options.idempotencyKeys,
@@ -715,7 +765,7 @@ export async function claimIntegrationOutboxWork(
         const txClient = tx as unknown as IntegrationOutboxClient
         if (key !== null && !(await gate.mayClaim(txClient, row, now))) return false
         const result = await txClient.integrationOutbox.updateMany({
-          where: claimUpdateWhere(row, now, maxAttempts),
+          where: claimUpdateWhere(row, now, maxAttempts, wooJobIds),
           data: {
             status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
             lockedAt: now,
@@ -734,7 +784,7 @@ export async function claimIntegrationOutboxWork(
   }
   for (const row of candidates) {
     const result = await client.integrationOutbox.updateMany({
-      where: claimUpdateWhere(row, now, maxAttempts),
+      where: claimUpdateWhere(row, now, maxAttempts, wooJobIds),
       data: {
         status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
         lockedAt: now,
