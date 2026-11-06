@@ -5,6 +5,7 @@ import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
+import { readProducerEnforcement } from '@/lib/security/producer-seam'
 import { parseProducerCutoff } from '@/lib/security/producer-disposition'
 import { PRODUCER_CUTOFF_ENV } from '@/lib/security/producer-disposition-constants'
 import type { ZonelessDespatchReading } from '@/lib/connectors/wms/connector-hooks'
@@ -437,6 +438,8 @@ export type WmsDispatchSweepDeps = {
   zonelessDespatchReading?: ZonelessDespatchReading
   /** The storefront's live-from instant, or null when none is configured/readable. Used to tell whether an uncertain despatch time matters. */
   storefrontCutoff?(): Date | null
+  /** The earliest the order's despatch can have been: when IMS sent it to the WMS or created it, whichever is later and known. Null when unknown. */
+  despatchLowerBound?(orderId: string): Promise<Date | null>
   /** The clock used for the order-level cutoff decision; injected by tests. Defaults to the system clock. */
   clock?(): Date
   // Whether the active connector supports per-part reconciliation (fetchOrderParts). When
@@ -725,6 +728,33 @@ export function strictLatestDespatchTime(
   return latest
 }
 
+/** True when a dispatched order or part has NO usable despatch time: no tracking entry at all, or an entry without one. */
+export function hasUndatedDespatch(tracking: ReadonlyArray<{ despatchedAt?: string | null }>): boolean {
+  return tracking.length === 0 || tracking.some((entry) => !entry.despatchedAt)
+}
+
+/**
+ * The WooCommerce live-from cutoff, but ONLY while WooCommerce producer enforcement is active (the same predicate the producer seam
+ * uses): with enforcement off the legacy path applies exactly as before, so no cutoff is read. Null when off, absent or unreadable.
+ */
+export function storefrontCutoffWhileEnforced(env: Record<string, string | undefined> = process.env): Date | null {
+  const enforcement = readProducerEnforcement(env)
+  if (!enforcement.enforced || !enforcement.destinations.has('woocommerce')) return null
+  const read = parseProducerCutoff(env[PRODUCER_CUTOFF_ENV.woocommerce])
+  return read.ok ? read.at : null
+}
+
+/** The lower bound of an undated order's despatch, only when one is needed (a cutoff, a reading, and an undated entry). */
+async function undatedLowerBound(
+  deps: WmsDispatchSweepDeps,
+  orderId: string,
+  tracking: ReadonlyArray<{ despatchedAt?: string | null }>,
+  cutoff: Date | null,
+): Promise<Date | null> {
+  if (cutoff === null || deps.zonelessDespatchReading === undefined || !hasUndatedDespatch(tracking) || !deps.despatchLowerBound) return null
+  try { return await deps.despatchLowerBound(orderId) } catch { return null }
+}
+
 const DATE_ONLY_DESPATCH = /^(\d{4})-(\d{2})-(\d{2})$/
 
 /**
@@ -773,10 +803,18 @@ export function dispositionDespatchTime(
   tracking: ReadonlyArray<{ despatchedAt?: string | null }>,
   reading: ZonelessDespatchReading | undefined,
   cutoff: Date | null = null,
+  /** The earliest the despatch can have been (see {@link hasUndatedDespatch}); null when unknown. */
+  lowerBound: Date | null = null,
 ): { unknown: false; at: Date | null } | { unknown: true } {
   // No reading, or no readable cutoff: nothing to judge against (the producer seam shadows or the legacy path applies).
   if (reading === undefined || cutoff === null) return { unknown: false, at: latestDespatchTime(tracking) }
   let latest: Date | null = null
+  // An undated part is NOT judged by the reconcile time. Its despatch is no earlier than the lower bound: at or after the cutoff
+  // that is live; otherwise the time is unknown and the part is held.
+  if (hasUndatedDespatch(tracking)) {
+    if (lowerBound === null || lowerBound.getTime() < cutoff.getTime()) return { unknown: true }
+    latest = lowerBound
+  }
   for (const entry of tracking) {
     if (!entry.despatchedAt) continue
     const range = despatchInstantRange(entry.despatchedAt, reading)
@@ -808,9 +846,16 @@ export function orderLevelDespatchDecision(
   reading: ZonelessDespatchReading | undefined,
   cutoff: Date | null,
   now: Date,
+  /** The earliest the despatch can have been when there is no usable despatch time; null when unknown. */
+  lowerBound: Date | null = null,
 ): { action: 'complete'; storefrontAlreadyCompleted: boolean } | { action: 'hold'; reason: string } {
   if (reading === undefined || cutoff === null) return { action: 'complete', storefrontAlreadyCompleted: false }
   let before = false
+  // No usable despatch time is never "wholly after" by default: it is live only when the order cannot have been despatched before
+  // the cutoff (IMS sent it to the WMS at or after it); otherwise the time is unknown and the order is held.
+  if (hasUndatedDespatch(tracking) && (lowerBound === null || lowerBound.getTime() < cutoff.getTime())) {
+    return { action: 'hold', reason: 'it has no despatch time and could have been despatched before the storefront went live' }
+  }
   for (const entry of tracking) {
     if (!entry.despatchedAt) continue
     const range = despatchInstantRange(entry.despatchedAt, reading)
@@ -875,7 +920,8 @@ async function reconcileSplitOrder(
   const partDespatch = new Map<object, Date | null>()
   if (recordPartials) {
     for (const part of dispatchedParts) {
-      const judged = dispositionDespatchTime(part.tracking, deps.zonelessDespatchReading, deps.storefrontCutoff?.() ?? null)
+      const cutoff = deps.storefrontCutoff?.() ?? null
+      const judged = dispositionDespatchTime(part.tracking, deps.zonelessDespatchReading, cutoff, await undatedLowerBound(deps, candidate.orderId, part.tracking, cutoff))
       if (judged.unknown) {
         return {
           action: 'pending',
@@ -964,7 +1010,8 @@ async function reconcileSplitOrder(
   let mergedAlreadyCompleted = false
   if (!recordPartials) {
     // A merged survivor completes at ORDER level with no per-part judgement above, so judge every part's time here, once.
-    const decision = orderLevelDespatchDecision(allTracking, deps.zonelessDespatchReading, deps.storefrontCutoff?.() ?? null, (deps.clock ?? (() => new Date()))())
+    const cutoff = deps.storefrontCutoff?.() ?? null
+    const decision = orderLevelDespatchDecision(allTracking, deps.zonelessDespatchReading, cutoff, (deps.clock ?? (() => new Date()))(), await undatedLowerBound(deps, candidate.orderId, allTracking, cutoff))
     if (decision.action === 'hold') return { action: 'pending', reason: `Merged order held: ${decision.reason}`, unresolved: requireResolution }
     mergedAlreadyCompleted = decision.storefrontAlreadyCompleted
   }
@@ -1108,7 +1155,8 @@ export async function reconcileOneOrder(
   }
 
   // An ordinary (non-split) order completes at ORDER level: judge its despatch time against the storefront cutoff first.
-  const decision = orderLevelDespatchDecision(status.tracking, deps.zonelessDespatchReading, deps.storefrontCutoff?.() ?? null, (deps.clock ?? (() => new Date()))())
+  const orderCutoff = deps.storefrontCutoff?.() ?? null
+  const decision = orderLevelDespatchDecision(status.tracking, deps.zonelessDespatchReading, orderCutoff, (deps.clock ?? (() => new Date()))(), await undatedLowerBound(deps, candidate.orderId, status.tracking, orderCutoff))
   if (decision.action === 'hold') return { action: 'pending', reason: `Order held: ${decision.reason}`, unresolved: requireResolution }
   const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking), decision.storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true } : undefined)
   if (!result.success) {
@@ -2416,9 +2464,11 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
     ?? defaultWmsDeltaScopeLock(wmsDeltaStateRowKeys(deltaKeys))
   return {
     zonelessDespatchReading: getWmsConnectorHooks(connectorId).zonelessDespatchReading,
-    storefrontCutoff() {
-      const read = parseProducerCutoff(process.env[PRODUCER_CUTOFF_ENV.woocommerce])
-      return read.ok ? read.at : null
+    storefrontCutoff: () => storefrontCutoffWhileEnforced(),
+    async despatchLowerBound(orderId) {
+      const link = await db.wmsOrderPushLink.findUnique({ where: { orderId }, select: { pushedAt: true, order: { select: { createdAt: true } } } })
+      const known = [link?.pushedAt, link?.order?.createdAt].filter((value): value is Date => value instanceof Date && Number.isFinite(value.getTime()))
+      return known.length === 0 ? null : new Date(Math.max(...known.map((value) => value.getTime())))
     },
     async listCandidates(limit) {
       const rows = await db.wmsOrderPushLink.findMany({

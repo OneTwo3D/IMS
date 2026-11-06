@@ -2,7 +2,6 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
 import { OUTBOUND_GRANT_ENV } from '@/lib/security/outbound-write-hold-constants'
-import { parseProducerCutoff } from '@/lib/security/producer-disposition'
 import { PRODUCER_CUTOFF_ENV, PRODUCER_HOLD_ENFORCED_ENV } from '@/lib/security/producer-disposition-constants'
 
 /**
@@ -167,8 +166,8 @@ const POST = '2026-07-01T10:00:00Z' // after the cutoff (and before now)
 type Part = { externalId: string; partNumber: number; status: string; dispatched: boolean; tracking: Array<{ trackingNumber: string; carrier: string; despatchedAt: string }> }
 const part = (n: number, at: string): Part => ({ externalId: `M-${n}`, partNumber: n, status: 'DESPATCHED', dispatched: true, tracking: [{ trackingNumber: `TN-${n}`, carrier: 'DPD', despatchedAt: at }] })
 
-async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'europe-london'; clock?: Date; shape?: 'split' | 'single' | 'merged' } = {}) {
-  const { runWmsDispatchSweepCore } = await import('@/lib/domain/wms/dispatch-sweep')
+async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'europe-london'; clock?: Date; lowerBound?: Date | null; shape?: 'split' | 'single' | 'merged' } = {}) {
+  const { runWmsDispatchSweepCore, storefrontCutoffWhileEnforced } = await import('@/lib/domain/wms/dispatch-sweep')
   const { pushPartialShipmentToShopping } = await import('@/lib/shopping')
   const { verifyPreCutoverCompletionByFreshRead } = await import('@/lib/connectors/woocommerce/sync/pre-cutover-order-read')
   const applyOptions: Array<Record<string, unknown> | undefined> = []
@@ -177,7 +176,8 @@ async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'e
     ...(options.zoneless ? {
       zonelessDespatchReading: options.zoneless,
       ...(options.clock ? { clock: () => options.clock! } : {}),
-      storefrontCutoff: () => { const read = parseProducerCutoff(process.env[PRODUCER_CUTOFF_ENV.woocommerce]); return read.ok ? read.at : null },
+      storefrontCutoff: () => storefrontCutoffWhileEnforced(),
+      despatchLowerBound: async () => options.lowerBound ?? null,
     } : {}),
     listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
     fetchOrderStatus: async () => ({
@@ -911,12 +911,7 @@ test('ORDER LEVEL: a non-split or merged-split Mintsoft order is judged by the s
       })
     }
   }
-  // no despatch value at all, or a source with no reading: as before
-  reset()
-  await withEnv(LIVE_AT_CUTOFF, async () => {
-    const run = await sweep([{ ...part(1, PRE), tracking: [{ trackingNumber: 'T', carrier: 'DPD', despatchedAt: '' }] }], { zoneless: 'europe-london', shape: 'single', verifier: false })
-    assert.equal(run.out.counters.dispatched, 1)
-  })
+  // a source with no reading: as before
   reset()
   await withEnv(LIVE_AT_CUTOFF, async () => {
     const run = await sweep([part(1, '2026-05-20T10:00:00')], { shape: 'single', verifier: false })
@@ -984,5 +979,58 @@ test('ORDER LEVEL, CUTOFF STATE: no cutoff holds nothing; a future cutoff holds 
   for (const at of ['2099-06-01', '2026-13-45']) {
     const held = await sweepAt(FUTURE, at)
     assert.deepEqual([held.out.counters.dispatched, held.applyOptions], [0, []], at)
+  }
+})
+
+test('ENFORCEMENT OFF: the legacy path is exactly as on development, with a future or past cutoff: no flag and no hold', async () => {
+  for (const cutoff of [CUTOFF, '2099-06-01T00:00:00Z']) {
+    for (const [at, shape] of [['2026-05-20T10:00:00', 'single'], ['2026-06-01', 'single'], ['2026-13-45', 'single'], ['2026-05-20T10:00:00', 'merged'], ['', 'single']] as const) {
+      reset()
+      await withEnv({ [PRODUCER_CUTOFF_ENV.woocommerce]: cutoff }, async () => {
+        const run = await sweep([part(1, at)], { zoneless: 'europe-london', shape, verifier: false })
+        assert.equal(run.out.counters.dispatched, 1, `${cutoff} ${shape} ${at}`)
+        assert.deepEqual(run.applyOptions, [undefined], `${cutoff} ${shape} ${at}`)
+      })
+    }
+  }
+  // enforcement for another destination only is also off for WooCommerce
+  reset()
+  await withEnv({ [PRODUCER_HOLD_ENFORCED_ENV]: 'xero', [PRODUCER_CUTOFF_ENV.woocommerce]: CUTOFF }, async () => {
+    const run = await sweep([part(1, '2026-05-20T10:00:00')], { zoneless: 'europe-london', shape: 'single', verifier: false })
+    assert.deepEqual(run.applyOptions, [undefined])
+  })
+})
+
+test('UNDATED: no usable despatch time is live only when IMS sent the order at or after the cutover; otherwise it is held (never judged by reconcile time)', async () => {
+  const AFTER_SENT = new Date('2026-06-02T00:00:00Z')
+  const BEFORE_SENT = new Date('2026-05-01T00:00:00Z')
+  const undated = (n: number): Part => ({ ...part(n, PRE), tracking: [{ trackingNumber: `TN-${n}`, carrier: 'DPD', despatchedAt: '' }] })
+  for (const shape of ['single', 'merged'] as const) {
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const live = await sweep([undated(1)], { zoneless: 'europe-london', shape, verifier: false, lowerBound: AFTER_SENT })
+      assert.deepEqual([live.out.counters.dispatched, live.applyOptions], [1, [undefined]], `${shape}: sent after the cutover goes live`)
+      for (const lowerBound of [BEFORE_SENT, null]) {
+        const held = await sweep([undated(1)], { zoneless: 'europe-london', shape, verifier: false, lowerBound })
+        assert.deepEqual([held.out.counters.dispatched, held.applyOptions], [0, []], `${shape}: sent before the cutover (or unknown) is held`)
+      }
+    })
+  }
+  // a SPLIT part: sent after the cutover is pushed live (one write); sent before is held with no write and no read
+  reset()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const live = await sweep([undated(1)], { zoneless: 'europe-london', verifier: false, lowerBound: AFTER_SENT })
+    assert.equal(live.out.counters.dispatched, 1)
+    assert.equal(writes().length, 1)
+  })
+  for (const lowerBound of [BEFORE_SENT, null]) {
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const held = await sweep([undated(1)], { zoneless: 'europe-london', lowerBound })
+      assert.equal(held.out.counters.dispatched, 0)
+      assert.deepEqual(writes(), [])
+      assert.deepEqual(reads(), [])
+      assert.deepEqual(held.asked, [])
+    })
   }
 })
