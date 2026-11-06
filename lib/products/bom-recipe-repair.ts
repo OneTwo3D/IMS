@@ -2,9 +2,9 @@
  * o3d-zjsb5.9 round 10: THE OPERATOR RECOVERY PATH for the duplicate-recipe refusal.
  *
  * Round 8 made `syncBomRecipeFromProductComponents` REFUSE while another ACTIVE `Bom` holds
- * `BomItem` rows for the same parent, because `replenishment-reports.ts` reads every active
- * `BomItem` whose parent is BOM-typed and has no "the claimed Bom wins" rule — two active recipes
- * for one product means planning ADDS both and over-orders. Refusing beats silently double-counting.
+ * `BomItem` rows for the same parent: two active recipes for one product is an ambiguous
+ * catalogue, and the cycle walk and the drift check still see both. (Planning readers now count only
+ * the claimed recipe, so a stray no longer inflates a plan, but the refusal stands.)
  *
  * But that refusal blocked the product's import, its component edit AND its build orders, and told
  * the operator to "deactivate the duplicate BOM" — which NOTHING in the application could do. There
@@ -15,8 +15,7 @@
  * WHY A COMMAND AND NOT A BUTTON. An authorized action would have to invent the surface to put it
  * on: a Bom has no page, so it would mean a new route, a new client component, permission wiring and
  * a route-auth policy entry, for something a first load needs ONCE per stray legacy row. The
- * switchover needs an executable path, not necessarily a button. This is that path, and the reader-
- * side fix that makes duplicates harmless rather than merely detectable stays in o3d-zjsb5.30.
+ * switchover needs an executable path, not necessarily a button. This is that path.
  *
  * WHAT IT REFUSES, because "deactivate this row" is not always safe:
  *   · a Bom CLAIMED by a product (`productId` set) is that product's live recipe — deactivating it

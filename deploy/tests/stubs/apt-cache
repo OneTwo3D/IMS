@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Test stub for `apt-cache show <pkg>`: the package exists unless $STUB/no_pkg_<pkg> is present.
+echo "apt-cache $*" >> "$STUB/calls.log"
+[ "${1:-}" = show ] && [ ! -e "$STUB/no_pkg_${2:-}" ]

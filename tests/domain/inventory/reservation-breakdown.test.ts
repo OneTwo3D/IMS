@@ -77,12 +77,10 @@ function createClient(): ReservationBreakdownClient {
           warehouseId: 'warehouse-1',
           qtyPlanned: '4',
           scheduledAt: new Date('2026-02-04T00:00:00.000Z'),
-          outputProduct: {
-            productComponents: [
-              { componentId: 'product-1', qty: '0.5' },
-              { componentId: 'other-product', qty: '1' },
-            ],
-          },
+          componentSnapshot: [
+            { componentId: 'product-1', qty: 0.5 },
+            { componentId: 'other-product', qty: 1 },
+          ],
         },
         {
           id: 'mo-2',
@@ -92,9 +90,7 @@ function createClient(): ReservationBreakdownClient {
           warehouseId: 'warehouse-1',
           qtyPlanned: '1.25',
           scheduledAt: null,
-          outputProduct: {
-            productComponents: [],
-          },
+          componentSnapshot: null,
         },
       ],
     },
@@ -310,4 +306,40 @@ test('o3d-4kfh: a PENDING draft shipment on a zero-demand order is NOT a commitm
 
   assert.equal(breakdown.knownReservedQty, '0')
   assert.equal(breakdown.unattributedQty, '10', 'the whole stranded reservation is still reported')
+})
+
+function assemblyClient(componentSnapshot: unknown): ReservationBreakdownClient {
+  const base = createClient()
+  return {
+    ...base,
+    orderAllocation: { findMany: async () => [] },
+    shipmentLine: { findMany: async () => [] },
+    productionOrder: {
+      findMany: async () => [{
+        id: 'mo-1', reference: 'MO-FROZEN', orderType: 'ASSEMBLY', outputProductId: 'finished-1', warehouseId: 'warehouse-1',
+        qtyPlanned: '4', scheduledAt: null, componentSnapshot,
+      }],
+    },
+  }
+}
+
+test('a started assembly is attributed from its frozen snapshot, and a snapshot of zero components attributes nothing', async () => {
+  const frozen = await loadReservationSourceRows(assemblyClient([{ componentId: 'product-1', qty: 3 }]), { productId: 'product-1', warehouseId: 'warehouse-1' })
+  assert.deepEqual(frozen.map((row) => [row.referenceId, row.qty]), [['mo-1', '12']])
+  const unrelated = await loadReservationSourceRows(assemblyClient([{ componentId: 'other', qty: 3 }]), { productId: 'product-1', warehouseId: 'warehouse-1' })
+  assert.deepEqual(unrelated, [])
+  const empty: string[] = []
+  assert.deepEqual(await loadReservationSourceRows(assemblyClient([]), { productId: 'product-1', warehouseId: 'warehouse-1', unfrozenOrderReferences: empty }), [])
+  assert.deepEqual(empty, [], 'an empty snapshot is a real frozen recipe, not an unfrozen order')
+})
+
+test('a started assembly with a NULL or malformed snapshot is named and not attributed from the live recipe', async () => {
+  for (const snapshot of [null, 'garbage', [{ componentId: 'product-1', qty: -2 }], [{ qty: 1 }]]) {
+    const named: string[] = []
+    const rows = await loadReservationSourceRows(assemblyClient(snapshot), { productId: 'product-1', warehouseId: 'warehouse-1', unfrozenOrderReferences: named })
+    assert.deepEqual(rows, [], `snapshot ${JSON.stringify(snapshot)}`)
+    assert.deepEqual(named, ['MO-FROZEN'])
+    const breakdown = await getReservationBreakdown({ productId: 'product-1', warehouseId: 'warehouse-1', client: assemblyClient(snapshot) })
+    assert.deepEqual(breakdown.unfrozenOrderReferences, ['MO-FROZEN'])
+  }
 })

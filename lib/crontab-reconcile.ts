@@ -19,6 +19,7 @@ import {
 } from '@/lib/crontab-sync'
 import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
 import { getPublicAppUrl } from '@/lib/public-app-url'
+import { heartbeatWrapperProblem, resolveHeartbeatsFromEnv } from '@/lib/ops/cron-heartbeats'
 import { HOST_CRON_PENDING_MESSAGE } from '@/lib/ops/host-cron-constants'
 import { isContainerSchedulerMode } from '@/lib/ops/host-cron'
 import { withCrontabReconcileLock, type HeldCrontabReconcileLock } from '@/lib/crontab-reconcile-lock'
@@ -188,7 +189,11 @@ async function applyCrontabFromSettings(
   const { jobs, settings } = await readCronJobsAndSettings()
 
   const logPath = process.env.OTI_CRON_LOG_PATH?.trim() || undefined
-  const block = buildOtiCrontabBlock({ jobs, settings, secretRef: resolveSecretRef(secret), baseUrl, logPath })
+  // HEARTBEATS ON AND NO WRAPPER: every wrapped line would fail to start. Refuse BEFORE touching the crontab (the current one stays intact).
+  const heartbeats = resolveHeartbeatsFromEnv()
+  const wrapperProblem = heartbeatWrapperProblem(heartbeats)
+  if (wrapperProblem) return { success: false, error: wrapperProblem }
+  const block = buildOtiCrontabBlock({ jobs, settings, secretRef: resolveSecretRef(secret), baseUrl, logPath, heartbeats })
   if (!block.ok) return { success: false, error: block.error }
 
   // REFUSE, DO NOT SPLICE INTO A GUESS (o3d-p9dq, Codex r29 HIGH #1). The only reading that lets

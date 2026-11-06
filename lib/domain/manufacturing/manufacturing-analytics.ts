@@ -20,6 +20,8 @@ export type ManufacturingAnalyticsClient = {
   productionOrder: FindManyDelegate
   stockMovement: FindManyDelegate
   costLayer: FindManyDelegate
+  /** Names the components of a frozen componentSnapshot (the snapshot stores ids and quantities only). */
+  product: FindManyDelegate
 }
 
 export type ManufacturingAnalyticsDeps = {
@@ -90,15 +92,11 @@ export type WipReportRow = {
   costLineCount: number
 }
 
-type BomItemRow = {
-  componentProductId: string
-  qty: DecimalInput
-  component: {
-    id: string
-    sku: string
-    name: string
-    stockUnit: string
-  }
+type SnapshotComponentRow = {
+  id: string
+  sku: string
+  name: string
+  stockUnit: string
 }
 
 type ProductionOrderBaseRow = {
@@ -117,17 +115,15 @@ type ProductionOrderBaseRow = {
 }
 
 type ProductionVarianceOrderRow = ProductionOrderBaseRow & {
-  bom: { items: BomItemRow[] }
+  /** Requirements frozen onto the order when it started; the ONLY recipe variance is computed from. */
+  componentSnapshot: unknown
 }
 
 type WipProductionOrderRow = ProductionOrderBaseRow & {
   warehouseId: string
   outputProductId: string
   componentSnapshot: unknown
-  // Live product components (the BOM completion actually falls back to when an
-  // order has no frozen snapshot). NOT the legacy `Bom` row, which component
-  // edits do not update.
-  outputProduct: { sku: string; name: string; productComponents: Array<{ componentId: string; qty: DecimalInput }> }
+  outputProduct: { sku: string; name: string }
   manufacturingCostLines: Array<{ amountBase: DecimalInput }>
 }
 
@@ -220,29 +216,31 @@ function consumeFifoReservation(layers: FifoCostLayer[] | undefined, qty: Prisma
 
 /**
  * Reserved (committed-but-not-yet-consumed) quantity per product for an
- * IN_PROGRESS order. ASSEMBLY reserves its BOM components — using the frozen
- * componentSnapshot so a mid-production component edit doesn't change the
- * valuation basis (matches completion), falling back to the live BOM only for
- * orders started before snapshots existed. DISASSEMBLY instead reserves the
- * finished good being broken down; its components are recovered at completion,
- * not reserved (scjz.31).
+ * IN_PROGRESS order. ASSEMBLY reserves its BOM components, read from the frozen
+ * componentSnapshot so a recipe edit after the start cannot change the
+ * valuation basis (matches completion). An empty snapshot is a real frozen
+ * recipe of zero components and reserves nothing. A NULL or malformed snapshot
+ * is `unfrozen`: it is never valued from the live recipe (the caller names the
+ * order in a notice), the same rule the variance and shortage reports apply.
+ * DISASSEMBLY instead reserves the finished good being broken down; its
+ * components are recovered at completion, not reserved (scjz.31).
  */
-function reservationRequirementsByProduct(order: WipProductionOrderRow): Map<string, Prisma.Decimal> {
+function reservationRequirementsByProduct(order: WipProductionOrderRow): { reserved: Map<string, Prisma.Decimal>; unfrozen: boolean } {
   const plannedQty = toDecimal(order.qtyPlanned)
   const reserved = new Map<string, Prisma.Decimal>()
   if (order.orderType === ProductionOrderType.DISASSEMBLY) {
     if (plannedQty.gt(0)) reserved.set(order.outputProductId, plannedQty)
-    return reserved
+    return { reserved, unfrozen: false }
   }
-  const components: Array<{ componentId: string; qty: DecimalInput }> =
-    parseProductionOrderComponentSnapshot(order.componentSnapshot)
-    ?? order.outputProduct.productComponents
+  const raw = order.componentSnapshot
+  const components = Array.isArray(raw) && raw.length === 0 ? [] : parseProductionOrderComponentSnapshot(raw)
+  if (components === null) return { reserved, unfrozen: true }
   for (const comp of components) {
     const requirementQty = toDecimal(comp.qty).mul(plannedQty)
     if (requirementQty.lte(0)) continue
     reserved.set(comp.componentId, (reserved.get(comp.componentId) ?? new Prisma.Decimal(0)).add(requirementQty))
   }
-  return reserved
+  return { reserved, unfrozen: false }
 }
 
 type ProductionOutMovementRow = {
@@ -439,29 +437,47 @@ export async function getProductionVarianceReport(
       createdAt: true,
       outputProduct: { select: { sku: true, name: true } },
       warehouse: { select: { code: true, name: true } },
-      bom: {
-        select: {
-          items: {
-            orderBy: { sortOrder: 'asc' },
-            select: {
-              componentProductId: true,
-              qty: true,
-              component: { select: { id: true, sku: true, name: true, stockUnit: true } },
-            },
-          },
-        },
-      },
+      // THE FROZEN RECIPE, never the live Bom. A recipe re-import deletes and recreates the Bom's items,
+      // so a plan derived from `bom.items` would rewrite the variance of every order already completed.
+      componentSnapshot: true,
     },
   }) as ProductionVarianceOrderRow[]
   if (orders.length > SOURCE_ROW_LIMIT) {
     throw new ManufacturingAnalyticsSourceLimitError(`Production variance source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
   }
 
-  const varianceOrders = orders.filter((order) => (
+  const candidateOrders = orders.filter((order) => (
     order.status === ProductionOrderStatus.IN_PROGRESS ||
     order.status === ProductionOrderStatus.COMPLETED
   ))
-  const movements = await loadProductionOutMovements(client, varianceOrders.map((order) => order.id))
+  // WHICH ORDERS HAVE A FROZEN RECIPE. `updateManufacturingOrderStatus` persists componentSnapshot when
+  // an order starts, and consumption and costing read it, so an IN_PROGRESS or COMPLETED order has one
+  // unless it predates snapshots (legacy rows) or the stored JSON is not a clean list. Such an order is
+  // EXCLUDED and named in a notice rather than planned from the live recipe: its live Bom may have been
+  // re-imported since it ran, and a figure that silently moves with the recipe is worse than a gap.
+  // (An empty snapshot is a real frozen recipe of zero components and yields no rows.)
+  const varianceOrders: Array<{ order: ProductionVarianceOrderRow; components: Array<{ componentId: string; qty: DecimalInput }> }> = []
+  const unfrozenReferences: string[] = []
+  for (const order of candidateOrders) {
+    const raw = order.componentSnapshot
+    const frozen = Array.isArray(raw) && raw.length === 0 ? [] : parseProductionOrderComponentSnapshot(raw)
+    if (frozen === null) {
+      unfrozenReferences.push(order.reference)
+      continue
+    }
+    varianceOrders.push({ order, components: frozen })
+  }
+  const componentIds = new Set<string>()
+  for (const { components } of varianceOrders) for (const comp of components) componentIds.add(comp.componentId)
+  const componentById = new Map<string, SnapshotComponentRow>()
+  if (componentIds.size > 0) {
+    const componentRows = await client.product.findMany({
+      where: { id: { in: [...componentIds] } },
+      select: { id: true, sku: true, name: true, stockUnit: true },
+    }) as SnapshotComponentRow[]
+    for (const row of componentRows) componentById.set(row.id, row)
+  }
+  const movements = await loadProductionOutMovements(client, varianceOrders.map(({ order }) => order.id))
   const actualByOrderAndProduct = movementTotalsByOrderAndProduct(movements)
   const rows: ProductionVarianceReportRow[] = []
   let plannedTotal = new Prisma.Decimal(0)
@@ -469,13 +485,14 @@ export async function getProductionVarianceReport(
   let overConsumedTotal = new Prisma.Decimal(0)
   let overConsumedValueTotal = new Prisma.Decimal(0)
 
-  for (const order of varianceOrders) {
+  for (const { order, components } of varianceOrders) {
     const plannedOutputQty = toDecimal(order.qtyPlanned)
     const producedQty = toDecimal(order.qtyProduced)
     const orderYieldPct = plannedOutputQty.gt(0) ? producedQty.div(plannedOutputQty).mul(100) : null
-    for (const item of order.bom.items) {
+    for (const item of components) {
+      const component = componentById.get(item.componentId) ?? { id: item.componentId, sku: item.componentId, name: item.componentId, stockUnit: '' }
       const plannedQty = toDecimal(item.qty).mul(plannedOutputQty)
-      const actual = actualByOrderAndProduct.get(movementKey(order.id, item.componentProductId)) ?? {
+      const actual = actualByOrderAndProduct.get(movementKey(order.id, item.componentId)) ?? {
         qty: new Prisma.Decimal(0),
         valueBase: new Prisma.Decimal(0),
       }
@@ -500,10 +517,10 @@ export async function getProductionVarianceReport(
         warehouseCode: order.warehouse.code,
         outputSku: order.outputProduct.sku,
         outputProductName: order.outputProduct.name,
-        componentProductId: item.component.id,
-        componentSku: item.component.sku,
-        componentName: item.component.name,
-        stockUnit: item.component.stockUnit,
+        componentProductId: component.id,
+        componentSku: component.sku,
+        componentName: component.name,
+        stockUnit: component.stockUnit,
         plannedQty: quantity(plannedQty),
         actualQty: quantity(actual.qty),
         varianceQty: quantity(varianceQty),
@@ -530,6 +547,10 @@ export async function getProductionVarianceReport(
     overConsumedValueBase: amount(overConsumedValueTotal),
   }, [
     'Production variance includes assembly orders only; disassembly consumption is excluded from BOM variance rows.',
+    'Planned consumption comes from the recipe frozen onto each order when it started, so re-importing or editing a recipe does not change the variance of orders already run.',
+    ...(unfrozenReferences.length > 0
+      ? [`${unfrozenReferences.length} order(s) have no frozen recipe (started before recipes were frozen, or the stored snapshot is unreadable) and are excluded rather than planned from the live recipe: ${unfrozenReferences.slice(0, 20).join(', ')}${unfrozenReferences.length > 20 ? ', ...' : ''}.`]
+      : []),
     'Date filters apply to completion date; in-progress orders without a completion date are shown only when no date window is selected.',
     'Over-consumed value is averaged across the consumed movement value; drill into FIFO cost entries for layer-exact costing.',
   ], options.paginate !== false)
@@ -562,7 +583,7 @@ export async function getWipReport(
       warehouseId: true,
       outputProductId: true,
       componentSnapshot: true,
-      outputProduct: { select: { sku: true, name: true, productComponents: { select: { componentId: true, qty: true } } } },
+      outputProduct: { select: { sku: true, name: true } },
       warehouse: { select: { code: true, name: true } },
       manufacturingCostLines: { select: { amountBase: true } },
     },
@@ -580,8 +601,10 @@ export async function getWipReport(
   // cost layers and to value each reservation FIFO below.
   const reservedByOrder = new Map<string, Map<string, Prisma.Decimal>>()
   const costPairs = new Map<string, { productId: string; warehouseId: string }>()
+  const unfrozenWipReferences: string[] = []
   for (const order of orders) {
-    const requirements = reservationRequirementsByProduct(order)
+    const { reserved: requirements, unfrozen } = reservationRequirementsByProduct(order)
+    if (unfrozen) unfrozenWipReferences.push(order.reference)
     reservedByOrder.set(order.id, requirements)
     for (const productId of requirements.keys()) {
       costPairs.set(costPairKey(productId, order.warehouseId), { productId, warehouseId: order.warehouseId })
@@ -659,5 +682,8 @@ export async function getWipReport(
   }, [
     'WIP is a current-state report of all IN_PROGRESS production orders; date filters are not applied.',
     'WIP value includes posted consumed component value, reserved not-yet-consumed component value at current cost, plus ManufacturingCostLine base totals.',
+    ...(unfrozenWipReferences.length > 0
+      ? [`${unfrozenWipReferences.length} in-progress order(s) have no usable frozen recipe (started before recipes were frozen, or the stored snapshot is unreadable); their not-yet-consumed component reservation is NOT valued, rather than valued from the live recipe: ${unfrozenWipReferences.slice(0, 20).join(', ')}${unfrozenWipReferences.length > 20 ? ', ...' : ''}.`]
+      : []),
   ], options.paginate !== false)
 }

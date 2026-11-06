@@ -820,26 +820,44 @@ function retrySyncTypes(value: unknown): Set<string> {
  * `aggregatePaymentSyncRows` already argues: a spurious "check this" costs a look, a spurious
  * silence costs a reconciliation nobody knows to do.
  */
-function syncLogHasLiveEvidence(
+/**
+ * THE STANDING A POSTING'S SYNC ROWS GIVE AN OBLIGATION - THREE STATES, NOT TWO.
+ *
+ *   'live'    a row the connector put there holds the work slot (or the ledger answered): the obligation is COVERED.
+ *   'shadow'  the only row is a SHADOW the producer-side hold recorded INSTEAD of producing the posting
+ *             (`HELD_SHADOW`, nothing sent). The obligation was seen and deliberately not produced because another writer
+ *             owns the operation in the current phase. It is not MISSING (nothing is owed to IMS's queue, so nothing
+ *             to re-enqueue) and it is not COVERED either: IMS did not send it, and nothing here says the owner wrote
+ *             it. It is HELD and UNVERIFIED, and the report says so (see `refundEvidenceStanding`).
+ *   'none'    no row for this posting at all.
+ *
+ * A live row beats a shadow: if the posting was later produced (or a shadow sits beside a queued row), it is covered.
+ * This used to be a boolean that answered `true` for a shadow, which silenced the "no evidence for this refund"
+ * finding for an obligation no one had verified.
+ */
+type SyncLogEvidence = 'live' | 'shadow' | 'none'
+
+function syncLogEvidence(
   syncLogs: AccountingSyncLogRow[],
   params: { type: string; referenceType: string; referenceId: string },
-): boolean {
-  return syncLogs.some((log) => {
+): SyncLogEvidence {
+  let shadow = false
+  for (const log of syncLogs) {
     if (
       log.type !== params.type ||
       log.referenceType !== params.referenceType ||
       log.referenceId !== params.referenceId
-    ) return false
-    // THE PRODUCER-SIDE HOLD: a shadow IMS recorded instead of queuing this posting is the record that the obligation was
-    // seen and deliberately not produced, because another writer owns the operation in the current phase. It is neither
-    // missing (nothing is owed to IMS's queue, so no "no evidence" finding and nothing to re-enqueue) nor posted (it is
-    // not a ledger fact and counts for no amount). Asked of the ledger-standing module, not re-derived from the basis.
+    ) continue
+    // Asked of the ledger-standing module, not re-derived from the basis.
     if (isShadowedObligation({
       status: log.status,
       externalTransactionId: log.externalTransactionId,
       settlementBasis: log.settlementBasis,
       abandonedBeforeRemoteCall: log.abandonedBeforeRemoteCall ?? null,
-    })) return true
+    })) {
+      shadow = true
+      continue
+    }
     // o3d-1e7sl (D6): ASKED OF THE LEDGER-STANDING MODULE. A row is evidence when it holds the work slot (PENDING /
     // PROCESSING / SYNCED) AND the claim is not an operator's: `asserted` is true exactly when the occupant's
     // standing rests on a typed id. The two halves used to be a hand-written status set beside a basis test.
@@ -849,8 +867,9 @@ function syncLogHasLiveEvidence(
       settlementBasis: log.settlementBasis,
       abandonedBeforeRemoteCall: log.abandonedBeforeRemoteCall ?? null,
     })
-    return slot.slot === 'OCCUPIED' && !slot.asserted
-  })
+    if (slot.slot === 'OCCUPIED' && !slot.asserted) return 'live'
+  }
+  return shadow ? 'shadow' : 'none'
 }
 
 function refundLabel(refund: SourceRefundRow): string {
@@ -946,39 +965,56 @@ function hasAccountingEvent(
   return accountingEventExistence(accountingEvents, params) !== 'missing'
 }
 
-function hasRefundCreditNoteEvidence(rows: AccountingReconciliationRows, refund: SourceRefundRow): boolean {
+/**
+ * What the evidence for a refund's posting amounts to: `covered` (a durable id, a live connector row, a mirrored event or a staged retry),
+ * `held` (nothing covers it, but the producer-side hold recorded a shadow for it - unverified, NOT covered), or `missing`.
+ */
+export type RefundEvidenceStanding = 'covered' | 'held' | 'missing'
+
+function hasRefundCreditNoteEvidence(rows: AccountingReconciliationRows, refund: SourceRefundRow): RefundEvidenceStanding {
   // Any non-empty connector credit-note id is durable evidence. Sync writers
   // must clear this field if a remote credit note is voided or invalidated.
-  if (refund.accountingCreditNoteId?.trim()) return true
-  if (syncLogHasLiveEvidence(rows.syncLogs, {
+  if (refund.accountingCreditNoteId?.trim()) return 'covered'
+  const syncLog = syncLogEvidence(rows.syncLogs, {
     type: 'CREDIT_NOTE',
     referenceType: 'SalesOrderRefund',
     referenceId: refund.id,
-  })) return true
+  })
+  if (syncLog === 'live') return 'covered'
   if (hasAccountingEvent(rows.accountingEvents, {
     type: 'CREDIT_NOTE',
     sourceEntityType: 'SalesOrderRefund',
     sourceEntityId: refund.id,
-  })) return true
-  return retrySyncTypes(refund.accountingRetrySyncs).has('CREDIT_NOTE')
+  })) return 'covered'
+  if (retrySyncTypes(refund.accountingRetrySyncs).has('CREDIT_NOTE')) return 'covered'
+  return syncLog === 'shadow' ? 'held' : 'missing'
 }
 
-function hasRefundReversalEvidence(rows: AccountingReconciliationRows, refund: SourceRefundRow): boolean {
+function hasRefundReversalEvidence(rows: AccountingReconciliationRows, refund: SourceRefundRow): RefundEvidenceStanding {
   const retryTypes = retrySyncTypes(refund.accountingRetrySyncs)
+  let held = false
   for (const type of REFUND_REVERSAL_TYPES) {
-    if (syncLogHasLiveEvidence(rows.syncLogs, {
+    const syncLog = syncLogEvidence(rows.syncLogs, {
       type,
       referenceType: 'SalesOrderRefund',
       referenceId: refund.id,
-    })) return true
+    })
+    if (syncLog === 'live') return 'covered'
     if (hasAccountingEvent(rows.accountingEvents, {
       type,
       sourceEntityType: 'SalesOrderRefund',
       sourceEntityId: refund.id,
-    })) return true
-    if (retryTypes.has(type)) return true
+    })) return 'covered'
+    if (retryTypes.has(type)) return 'covered'
+    if (syncLog === 'shadow') held = true
   }
-  return false
+  return held ? 'held' : 'missing'
+}
+
+/** Combine the standings of several refunds on one order: any covered refund covers it, else any held one holds it. */
+function bestRefundEvidence(standings: readonly RefundEvidenceStanding[]): RefundEvidenceStanding {
+  if (standings.includes('covered')) return 'covered'
+  return standings.includes('held') ? 'held' : 'missing'
 }
 
 function buildSummary(findings: AccountingReconciliationFinding[]): AccountingReconciliationReport['summary'] {
@@ -1204,8 +1240,20 @@ export function evaluateAccountingReconciliationRows(
     const orderRefunds = refundsByOrderId.get(order.id) ?? []
     const hasPostedAccountingState = Boolean(a1SourceEntityId || a2SourceEntityId || postedShipmentOrderIds.has(order.id))
     if (order.status === 'CANCELLED' && hasPostedAccountingState) {
-      const hasReversalEvidence = orderRefunds.some((refund) => hasRefundReversalEvidence(rows, refund))
-      if (!hasReversalEvidence) {
+      const reversalStanding = bestRefundEvidence(orderRefunds.map((refund) => hasRefundReversalEvidence(rows, refund)))
+      if (reversalStanding === 'held') {
+        findings.push({
+          severity: 'warning',
+          code: 'terminal_cancelled_order_reversal_held_shadow',
+          orderId: order.id,
+          message: `Cancelled sales order ${label} has posted accounting state and its reversal is HELD as a shadow: IMS did not send it, and nothing verifies that the owning writer did`,
+          details: {
+            status: order.status,
+            hasPostedShipment: postedShipmentOrderIds.has(order.id),
+            refundIds: orderRefunds.map((refund) => refund.id),
+          },
+        })
+      } else if (reversalStanding === 'missing') {
         findings.push({
           severity: 'critical',
           code: 'terminal_cancelled_order_missing_reversal_evidence',
@@ -1224,9 +1272,22 @@ export function evaluateAccountingReconciliationRows(
 
     if (order.refundStatus !== 'NONE') {
       for (const refund of orderRefunds) {
-        const hasCreditNoteEvidence = hasRefundCreditNoteEvidence(rows, refund)
-        const hasReversalEvidence = hasRefundReversalEvidence(rows, refund)
-        if (!hasCreditNoteEvidence) {
+        const creditNoteStanding = hasRefundCreditNoteEvidence(rows, refund)
+        const reversalStanding = hasRefundReversalEvidence(rows, refund)
+        if (creditNoteStanding === 'held') {
+          findings.push({
+            severity: 'warning',
+            code: 'terminal_refunded_order_credit_note_held_shadow',
+            orderId: order.id,
+            refundId: refund.id,
+            message: `Refunded sales order ${label} has refund ${refundLabel(refund)} whose credit note is HELD as a shadow: IMS did not send it, and nothing verifies that the owning writer did`,
+            details: {
+              status: order.status,
+              creditNoteNumber: refund.creditNoteNumber,
+              totalBase: decimalToNumber(refund.totalBase),
+            },
+          })
+        } else if (creditNoteStanding === 'missing') {
           findings.push({
             severity: 'critical',
             code: 'terminal_refunded_order_missing_credit_note_evidence',
@@ -1249,7 +1310,22 @@ export function evaluateAccountingReconciliationRows(
         // reversalStaged is a DURABLE per-refund flag set at staging time
         // (accountingRetrySyncs is cleared once syncs queue, so it can't carry this).
         const chargebackExemptReversal = Boolean(refund.chargeback) && !refund.reversalStaged
-        if (postedShipmentOrderIds.has(order.id) && decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence && !chargebackExemptReversal) {
+        if (postedShipmentOrderIds.has(order.id) && decimalToNumber(refund.totalBase) > 0 && reversalStanding === 'held' && !chargebackExemptReversal) {
+          findings.push({
+            severity: 'warning',
+            code: 'terminal_refunded_order_reversal_held_shadow',
+            orderId: order.id,
+            refundId: refund.id,
+            message: `Refunded sales order ${label} has refund ${refundLabel(refund)} whose reversal is HELD as a shadow: IMS did not send it, and nothing verifies that the owning writer did`,
+            details: {
+              status: order.status,
+              creditNoteNumber: refund.creditNoteNumber,
+              totalBase: decimalToNumber(refund.totalBase),
+              hasPostedShipment: true,
+            },
+          })
+        }
+        if (postedShipmentOrderIds.has(order.id) && decimalToNumber(refund.totalBase) > 0 && reversalStanding === 'missing' && !chargebackExemptReversal) {
           findings.push({
             severity: 'critical',
             code: 'terminal_refunded_order_missing_reversal_evidence',

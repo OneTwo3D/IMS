@@ -109,9 +109,17 @@ checked on a read-only query before anything writes.
 it reports every disagreement between `product_components` and `bom_items` and exits non-zero when
 it finds one. It is deliberately NOT in `check:all`, which must run with no database at all.
 
+Readers of the recipe tables are classified in `tests/products/claimed-bom-reader-census.test.ts`.
+A planning reader (replenishment demand, reorder build orders, the component shortage report) reads only
+the CLAIMED recipe, through `lib/products/claimed-bom.ts`; a history reader (production variance) reads
+the `componentSnapshot` frozen on the order; the few readers that deliberately see every row (cycle
+checks, drift, export, repair) are listed there with the reason. A new file that reads `boms` or
+`bom_items` fails that test until it is classified.
+
 `npm run repair:duplicate-bom` is the WRITE half, and the only supported way to clear a duplicate
 active recipe. IMS refuses to write a product's recipe while a second *active* `Bom` holds recipe
-lines for the same product, because planning sums every active recipe and would over-order — so
+lines for the same product, because a second active recipe is ambiguous (planning itself now counts only the claimed recipe, but
+the drift check and the cycle walk still see both) — so
 without this the refusal blocks that product's import, component edit and build orders with no
 in-application remedy, which is what round 9 of PR #714 caught.
 

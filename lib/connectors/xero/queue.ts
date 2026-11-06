@@ -383,8 +383,10 @@ export async function queueXeroSync(params: {
     if (handledByHand) return { queued: true, reason: 'handled-by-hand' }
     // OWED, not settled: nothing is in the ledger yet and IMS wrote no row. See the r18 note above.
     if (handPostDeferred) return { queued: false, reason: 'hand-post-deferred' }
-    // Recorded as a shadow, not queued: IMS owes the ledger nothing here (see 'shadowed' on ConnectorEnqueueOutcome).
-    if (shadowed) return { queued: true, reason: 'shadowed' }
+    // Recorded as a shadow, NOT queued: nothing is on the queue, and IMS owes the ledger nothing here (see 'shadowed'
+    // on ConnectorEnqueueOutcome). `queued: false` so that no caller can read it as a posting that will be sent, and
+    // `postingIsOwed` still answers false for it.
+    if (shadowed) return { queued: false, reason: 'shadowed' }
     return { queued: true }
   } catch (error) {
     // A concurrent insert already queued this posting, so the counterpart exists — already present.

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Test stub for dpkg -s <pkg>: installed only if listed in $STUB/dpkg_installed (one package per line).
+echo "dpkg $*" >> "$STUB/calls.log"
+[ "${1:-}" = -s ] && grep -Fxq -- "${2:-}" "$STUB/dpkg_installed" 2>/dev/null
