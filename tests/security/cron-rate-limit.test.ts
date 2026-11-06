@@ -36,7 +36,7 @@ test('cron rate-limit helper uses per-job keys and the limit derived from the re
     key: cronRateLimitKey('inventory-snapshot'),
     ...cronRateLimitFor('inventory-snapshot'),
   }])
-  assert.deepEqual(cronRateLimitFor('inventory-snapshot'), { max: 2, windowMs: 24 * 60 * 60_000 })
+  assert.deepEqual(cronRateLimitFor('inventory-snapshot'), { max: 3, windowMs: 24 * 60 * 60_000 })
   assert.deepEqual(cronRateLimitFor('not-a-registered-job'), { max: CRON_RATE_LIMIT_MAX, windowMs: CRON_RATE_LIMIT_WINDOW_MS })
 })
 
@@ -272,7 +272,7 @@ test('a capped E2E job cannot exceed its ceiling by rotating source IPs (tenant-
     )
   })
 
-  // Production (override disarmed): the per-IP slice (2/hour, the cadence-derived headroom) plus the always-on
+  // Production (override disarmed): the per-IP slice (3/hour, the cadence-derived headroom) plus the always-on
   // IP-independent daily run budget for a live-Xero job. The budget is above the 24 scheduled runs, so no
   // legitimate scheduled caller gains a denial path.
   await withEnvAsync({ E2E_TEST_MODE: undefined, E2E_CRON_RATE_LIMIT_MAX: '10000' }, async () => {
@@ -280,7 +280,7 @@ test('a capped E2E job cannot exceed its ceiling by rotating source IPs (tenant-
     assert.equal(
       allowed,
       cronXeroDailyBudget('0 * * * *'),
-      'production: the IP slices admit 2/IP/hour, but the IP-independent daily run budget for a live-Xero job still bounds the day',
+      'production: the IP slices admit 3/IP/hour, but the IP-independent daily run budget for a live-Xero job still bounds the day',
     )
   })
 })
@@ -332,12 +332,23 @@ function makeBackend() {
   return { backend: new MemoryRateLimitBackend(() => now), setNow: (t: number) => { now = t } }
 }
 
-test('hourly job: a run 500 ms early is admitted, a third run inside the window is refused', async () => {
+test('hourly job: a failed run, an operator retry, then the next scheduled run arriving early are all admitted', async () => {
+  for (const job of ['wms-watchdog', 'mintsoft-stock-sync', 'xero-tax-rate-drift']) {
+    const { backend, setNow } = makeBackend()
+    assert.equal(await admitAt(backend, setNow, job, START), true, `${job}: scheduled run (fails downstream)`)
+    assert.equal(await admitAt(backend, setNow, job, START + 5 * MINUTE), true, `${job}: operator retry`)
+    assert.equal(await admitAt(backend, setNow, job, START + HOUR - 500), true, `${job}: next scheduled run arriving early must not 429`)
+    assert.equal(await admitAt(backend, setNow, job, START + HOUR - 400), false, `${job}: a fourth run in the window is refused`)
+  }
+})
+
+test('hourly job: a run 500 ms early is admitted, a burst inside the window is refused', async () => {
   for (const job of ['mintsoft-stock-sync', 'xero-tax-rate-drift']) {
     const { backend, setNow } = makeBackend()
     assert.equal(await admitAt(backend, setNow, job, START), true)
     assert.equal(await admitAt(backend, setNow, job, START + HOUR - 500), true, `${job}: early next-hour run must be admitted`)
-    assert.equal(await admitAt(backend, setNow, job, START + HOUR - 400), false, `${job}: third run inside the window must be refused`)
+    assert.equal(await admitAt(backend, setNow, job, START + HOUR - 400), true)
+    assert.equal(await admitAt(backend, setNow, job, START + HOUR - 300), false, `${job}: fourth run inside the window must be refused`)
   }
 })
 
@@ -355,10 +366,11 @@ test('sub-hourly job: every jittered scheduled run in a day is admitted, an exce
   assert.equal(refused, true, 'a burst well past the cadence is still refused')
 })
 
-test('daily job: a run 500 ms early is admitted, a third run inside the window is refused', async () => {
+test('daily job: a retry and a run 500 ms early are admitted, a fourth run inside the window is refused', async () => {
   const { backend, setNow } = makeBackend()
   const DAY = 24 * HOUR
   assert.equal(await admitAt(backend, setNow, 'backup', START), true)
+  assert.equal(await admitAt(backend, setNow, 'backup', START + 5 * MINUTE), true, 'operator retry')
   assert.equal(await admitAt(backend, setNow, 'backup', START + DAY - 500), true)
   assert.equal(await admitAt(backend, setNow, 'backup', START + DAY - 400), false)
 })
@@ -391,13 +403,13 @@ test('the effective (saved) schedule drives the limit, not the registry default'
     return { allowed: true, retryAfterSec: 0, remaining: 0 }
   }
   const defaultLimit = cronRateLimitFor('read-sync-liveness')
-  assert.deepEqual(defaultLimit, { max: 2, windowMs: HOUR })
+  assert.deepEqual(defaultLimit, { max: 3, windowMs: HOUR })
   // Operator saved "every minute" for an hourly-by-default job: 60 scheduled runs an hour must fit.
   await enforceCronRateLimit('read-sync-liveness', { checker, scheduleReader: async () => '* * * * *' })
   assert.deepEqual(seen.pop(), { max: 75, windowMs: HOUR })
   // Slower saved schedule widens the window instead.
   await enforceCronRateLimit('read-sync-liveness', { checker, scheduleReader: async () => '0 */6 * * *' })
-  assert.deepEqual(seen.pop(), { max: 2, windowMs: 6 * HOUR })
+  assert.deepEqual(seen.pop(), { max: 3, windowMs: 6 * HOUR })
   // No saved row, or an unreadable one, falls back to the registry default.
   await enforceCronRateLimit('read-sync-liveness', { checker, scheduleReader: async () => null })
   assert.deepEqual(seen.pop(), defaultLimit)
@@ -497,14 +509,13 @@ test('census: every registry job limit leaves headroom above its scheduled firin
     const { max, windowMs } = cronRateLimitFor(slug, schedule)
     // On schedule, `prior` runs are already in the window; one more slot must remain for an early arrival.
     const prior = maxPriorFirings(schedule, windowMs)
-    assert.ok(prior < max, `${slug} (${schedule}): ${prior} scheduled runs already in a ${windowMs}ms window, max ${max} would refuse a scheduled run`)
-    assert.ok(max >= 2, `${slug}: needs room for at least one early run`)
+    assert.ok(prior + 2 <= max, `${slug} (${schedule}): ${prior} prior scheduled runs in a ${windowMs}ms window, max ${max} leaves less than 2 spare for a retry plus jitter`)
   }
   // The census itself must reject an allowance that is exactly the cadence.
   const hourlyPrior = maxPriorFirings('0 * * * *', HOUR)
   assert.equal(hourlyPrior, 1, 'an hourly job always has its previous run inside an hour window')
-  assert.ok(!(hourlyPrior < 1), 'a max of 1 for an hourly job fails the census predicate')
-  assert.ok(!(maxPriorFirings('0 */6 * * 1', 24 * HOUR) < 3), 'a daily allowance of 3 would refuse the 4th Monday run of a 6-hourly Monday job')
+  assert.ok(!(hourlyPrior + 2 <= 2), 'a max of 2 for an hourly job fails the census predicate')
+  assert.ok(!(maxPriorFirings('0 */6 * * 1', 24 * HOUR) + 2 <= 4), 'a daily allowance of 3 would refuse the 4th Monday run of a 6-hourly Monday job')
 
   // A route that passes its own max/windowMs bypasses the derivation; only unregistered routes may.
   // EVERY cron route must enforce the limiter under its own job name, and a registered one must not override it.

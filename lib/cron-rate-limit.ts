@@ -5,8 +5,8 @@ import { getAllCronJobs } from '@/lib/cron-registry'
 import { checkRateLimit, type RateLimitResult } from '@/lib/rate-limit'
 import { getClientIp } from '@/lib/request-ip'
 
-/** Fallback limit for a job that is not in the cron registry: two runs per hour, never exactly the cadence. */
-export const CRON_RATE_LIMIT_MAX = 2
+/** Fallback limit for a job that is not in the cron registry: one scheduled run per hour plus two spare. */
+export const CRON_RATE_LIMIT_MAX = 3
 export const CRON_RATE_LIMIT_WINDOW_MS = 60 * 60_000
 export const CRON_RATE_LIMIT_FIFTEEN_MINUTE_MAX = 6
 
@@ -149,12 +149,13 @@ export function cronCadenceMs(expression: string): number | null {
 /**
  * The rate limit that leaves headroom above a cadence, so a scheduled run is never refused for arriving a
  * little early (cron jitter, a burst of jobs at :00, retries):
- * - cadence of an hour or more: the window IS the cadence and two runs fit in it, so a run landing
- *   milliseconds before the previous one's anniversary is still admitted and only a third is refused;
+ * - cadence of an hour or more: the window IS the cadence and three runs fit in it (the scheduled run plus two spare),
+ *   so a failed run, an operator retry and the next scheduled run arriving milliseconds early are all admitted and
+ *   only a fourth is refused;
  * - sub-hourly: the usual hour window with the scheduled runs plus a quarter (at least two) spare.
  */
 export function cronRateLimitForCadence(cadenceMs: number): CronRateLimit {
-  if (cadenceMs >= HOUR_MS) return { max: 2, windowMs: cadenceMs }
+  if (cadenceMs >= HOUR_MS) return { max: 3, windowMs: cadenceMs }
   const runs = Math.ceil(HOUR_MS / cadenceMs)
   return { max: runs + Math.max(2, Math.ceil(runs / 4)), windowMs: HOUR_MS }
 }
@@ -249,7 +250,7 @@ export type CronRateLimitOptions = {
  *   an incident consumed the legitimate caller's quota.
  * - Every job's limit is derived from its registry schedule (cronRateLimitFor) and always leaves
  *   headroom above exact cadence: sub-hourly jobs get their runs per hour plus spare, hourly and
- *   N-hourly/daily jobs get two runs per cadence window. Do not pass a per-route `max`/`windowMs`
+ *   N-hourly/daily jobs get three runs per cadence window (scheduled run plus two for retries and jitter). Do not pass a per-route `max`/`windowMs`
  *   equal to the cadence (a 5-minute cron at exactly 12/hour, an hourly cron at exactly 1/hour);
  *   jitter, retries, and boundary timing will deny legitimate scheduled runs. Routes should not
  *   override at all; the census test in tests/security/cron-rate-limit.test.ts enforces that.
