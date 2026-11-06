@@ -666,7 +666,9 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
     form = 'PLACEHOLDER'
     data = await post(buildPushPayload(input, { kind: 'defaultId', courierServiceId: defaultId }, false))
   }
-  if (data?.Success === true || data?.OrderId != null) {
+  // A decoded Success: true on EVERY post of the chain, as the create requires: an answer that carries an OrderId but says
+  // Success: false (or does not say Success: true) is a failure, not an amendment.
+  if (data?.Success === true) {
     // Line items are amended via the /Items sub-resource (the order-update endpoint ignores them); this propagates
     // refund-netted quantities to the still-NEW WMS order. They go AFTER the order post on purpose: the courier selection
     // is the part of an amendment that can be refused (and retried), and deciding it first means a courier failure never

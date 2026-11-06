@@ -645,6 +645,11 @@ export function courierNamesForOrder(order: { courierKey?: string | null; shippi
  *   PLACEHOLDER -> no courier name at all (the create left the courier to the default; naming it again would re-send what
  *                  the WMS could not resolve).
  */
+/** The warehouse-visible note raised when an order's courier did not resolve and the default courier was used. */
+export function courierFallbackNote(shippingService: string | null | undefined): string {
+  return `IMS: shipping method '${shippingService ?? '—'}' did not map to a WMS courier, so a default courier was used. Please verify the courier before despatch.`
+}
+
 export function applyLinkCourierForm(
   input: WmsOrderPushInput,
   link: { courierForm?: string | null; courierFormName?: string | null },
@@ -1077,8 +1082,8 @@ export async function runWmsOrderPushSweepCore(
   // Best-effort warehouse-visible note when IMS can't propagate a hold/cancel
   // because the WMS order is already past NEW. Mirrors the refund-conflict comment
   // (onetwo3d-ims-ql59); never fail the sweep on a comment error.
-  const postConflictComment = async (externalOrderId: string, comment: string, orderId?: string) => {
-    if (!connector.addOrderComment) return
+  const postConflictComment = async (externalOrderId: string, comment: string, orderId?: string): Promise<'posted' | 'failed' | 'skipped'> => {
+    if (!connector.addOrderComment) return 'skipped'
     const commentSeam = await wmsProducerSeam(connectorId, {
       operation: 'order.comment',
       subjectType: 'SalesOrder',
@@ -1088,7 +1093,7 @@ export async function runWmsOrderPushSweepCore(
     })
     if (!commentSeam.proceed) {
       shadowedCount += 1
-      return
+      return 'skipped'
     }
     try {
       await connector.addOrderComment(externalOrderId, comment, commentSeam.clearance)
@@ -1096,12 +1101,14 @@ export async function runWmsOrderPushSweepCore(
         action: 'order_comment', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: orderId ?? null, externalId: externalOrderId,
         summary: 'Warehouse-visible note posted on WMS order', after: { comment },
       })
+      return 'posted'
     } catch (error) {
       console.error('[wms-order-push] failed to post conflict comment', error)
       await audit({
         action: 'order_comment', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: orderId ?? null, externalId: externalOrderId,
         summary: 'Failed to post warehouse-visible note on WMS order', after: { comment }, error: scrubWmsError(error, 'WMS comment failed'),
       })
+      return 'failed'
     }
   }
 
@@ -2090,7 +2097,7 @@ export async function runWmsOrderPushSweepCore(
         if (courierPending && createdState === 'SYNCED') {
           await postConflictComment(
             push.externalOrderId,
-            `IMS: shipping method '${order.shippingService ?? '—'}' did not map to a WMS courier, so a default courier was used. Please verify the courier before despatch.`,
+            courierFallbackNote(order.shippingService),
             order.id,
           )
         }
@@ -2307,7 +2314,7 @@ export async function runWmsOrderPushSweepCore(
         if (link.courierPending) {
           await postConflictComment(
             link.externalOrderId,
-            `IMS: shipping method '${link.shippingService ?? '—'}' did not map to a WMS courier, so a default courier was used. Please verify the courier before despatch.`,
+            courierFallbackNote(link.shippingService),
             link.orderId,
           )
         }
@@ -2409,11 +2416,20 @@ export async function runWmsOrderPushSweepCore(
         }
         const input = applyLinkCourierForm(buildPushInput(link.order, externalWarehouseId), link)
         update = await connector.updateOrder(link.externalOrderId, input, amendSeam.clearance)
+        // An amendment that NEWLY fell back to the default courier raises the same warehouse-visible warning a create
+        // fallback does. If posting it fails, the link is kept retryable: it is not marked pushed and does not record the
+        // new form, so the order stays due and the next pass finds the fallback again and posts the warning again.
+        const warning = update.updated && update.courierFallback
+          ? await postConflictComment(link.externalOrderId, courierFallbackNote(link.order.shippingService), link.order.id)
+          : null
+        const warningRetryable = warning === 'failed'
         // Bump pushedAt either way so we don't re-attempt until the next change;
         // a non-NEW WMS order can no longer be amended (inbound webhooks aside).
         await port.updateLink(link.id, {
-          pushedAt: ts, lastAttemptAt: ts, lastError: update.updated ? null : `Amendment not propagated (WMS status ${update.status})`,
-          ...(update.updated && update.courierForm ? { courierForm: update.courierForm, courierFormName: update.courierFormName ?? null } : {}),
+          lastAttemptAt: ts,
+          ...(warningRetryable ? {} : { pushedAt: ts }),
+          lastError: warningRetryable ? 'Courier warning not posted on the WMS order; will retry' : update.updated ? null : `Amendment not propagated (WMS status ${update.status})`,
+          ...(update.updated && update.courierForm && !warningRetryable ? { courierForm: update.courierForm, courierFormName: update.courierFormName ?? null } : {}),
           ...(update.updated && update.courierFallback ? { courierPending: true } : {}),
         })
         if (update.updated) result.updated += 1

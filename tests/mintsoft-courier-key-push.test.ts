@@ -355,3 +355,15 @@ test('an amendment of an order already known to be on the placeholder does not r
   const result = await amend(applyLinkCourierForm(INPUT, { courierForm: 'PLACEHOLDER', courierFormName: KEY }), [{ result: [{ Success: true }] }])
   assert.equal(result.courierFallback, undefined)
 })
+
+test('Success: false with an OrderId is a failure on every post of the chain: no item writes, no form reported', async () => {
+  // After a legacy retry.
+  await assert.rejects(() => amend(INPUT, [{ result: [REFUSED] }, { result: [{ Success: false, OrderId: 900, Message: 'Order not updated' }] }]), /Order not updated/)
+  assert.equal(itemWrites, 0)
+  // On the first post.
+  await assert.rejects(() => amend(INPUT, [{ result: [{ Success: false, OrderId: 900, Message: 'Order not updated' }] }]), /Order not updated/)
+  assert.equal(itemWrites, 0)
+  // An OrderId with no Success at all is not an amendment either.
+  await assert.rejects(() => amend(INPUT, [{ result: [{ OrderId: 900 }] }]))
+  assert.equal(itemWrites, 0)
+})
