@@ -305,7 +305,11 @@ async function writeReturnsErrorLog(jobId: string, record: WmsReturnRecord, erro
         sku: trimToNull(record.sku),
         productId: null,
         action: 'error',
-        reason: error instanceof Error ? error.message : 'Mintsoft returns sync error',
+        // For an erased OR undetermined effective order the reason is a fixed, identity-free line naming only the error CLASS: a parser or driver
+        // message can echo the rejected value, which is exactly the name or address that was erased.
+        reason: erased
+          ? `Return rejected: ${error instanceof Error ? error.name : 'UnknownError'}`
+          : error instanceof Error ? error.message : 'Mintsoft returns sync error',
         payload: (erased ? {} : (record.raw ?? {})) as Prisma.InputJsonValue,
       },
     })

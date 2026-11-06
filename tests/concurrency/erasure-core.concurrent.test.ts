@@ -1239,6 +1239,17 @@ test('[erasure] the returns sync never reads the warehouse\'s free text back int
   for (const row of logsAfter) {
     assert.ok(!JSON.stringify(row).includes(NAME.last) && !JSON.stringify(row).includes(STREET) && !JSON.stringify(row).includes(NAME.first), `a post-erasure sync log row carries the warehouse payload: ${row.action}`)
   }
+  // A MALFORMED quantity that contains the person's details makes the parser's message echo them: the error row's REASON must not.
+  const echoed = `RET-ECHO-${uid}`; returnIds.push(echoed)
+  const echoMark = new Date()
+  pollReturnsRecords = () => [record(echoed, { qty: `${FULL_NAME}, ${STREET}, ${POSTCODE}` })]
+  await runMintsoftReturnsSync('test')
+  const echoRows = await db.wmsSyncLog.findMany({ where: { createdAt: { gt: echoMark }, action: 'error' } })
+  assert.ok(echoRows.length >= 1, 'PRECONDITION: the malformed quantity produced an error row')
+  for (const row of echoRows) {
+    assert.match(String(row.reason), /^Return rejected: \w+$/, 'a fixed identity-free line naming only the error class')
+    assert.ok(!JSON.stringify(row).includes(NAME.last) && !JSON.stringify(row).includes(STREET) && !JSON.stringify(row).includes(POSTCODE), 'neither the reason nor the payload carries the value')
+  }
   // The racing delivery above (order lock held, erasure committing) wrote its log row under the lock too: no payload.
   const raceLogs = await db.wmsSyncLog.findMany({ where: { createdAt: { gt: raceMark, lt: erasedAtMark } } })
   assert.ok(raceLogs.length >= 1, 'PRECONDITION: the racing delivery wrote a log row')
