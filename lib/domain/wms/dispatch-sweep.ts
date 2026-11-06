@@ -621,29 +621,30 @@ export type WmsDispatchSweepDeps = {
 /** The shadow reason of a part despatched before the storefront's live-from instant (the earlier writer owned the store then). */
 const PRE_CUTOVER_SHADOW_REASON: import('@/lib/security/producer-disposition-constants').ProducerReason = 'obligation_before_cutoff'
 
-/** Whether a tracking entry carries a usable despatch time. */
-function hasUsableDespatchTime(entry: { despatchedAt?: string | null }): boolean {
-  return Boolean(entry.despatchedAt) && !Number.isNaN(new Date(entry.despatchedAt as string).getTime())
-}
-
-/** True when ANY tracking entry is undated or its date does not parse: the part's despatch time is then UNKNOWN, not "the dated ones". */
-function hasUnknownDespatchTime(tracking: ReadonlyArray<{ despatchedAt?: string | null }>): boolean {
-  return tracking.some((entry) => !hasUsableDespatchTime(entry))
-}
-
-/**
- * The latest despatch time among a part's tracking entries, or null when there is none OR any entry is undated or invalid. An
- * undated entry is never skipped: skipping it let the dated ones stand for a time that was not known, and the cut-off decision
- * (which side of the live-from instant a despatch fell) would be taken on it.
- */
+/** The latest despatch time among a part's tracking entries; undated or invalid entries are skipped. Null when none is usable. */
 export function latestDespatchTime(tracking: ReadonlyArray<{ despatchedAt?: string | null }>): Date | null {
-  if (hasUnknownDespatchTime(tracking)) return null
   let latest: Date | null = null
   for (const entry of tracking) {
-    const at = new Date(entry.despatchedAt as string)
+    if (!entry.despatchedAt) continue
+    const at = new Date(entry.despatchedAt)
+    if (Number.isNaN(at.getTime())) continue
     if (latest === null || at.getTime() > latest.getTime()) latest = at
   }
   return latest
+}
+
+/**
+ * The latest despatch time, but null when ANY entry is undated or invalid (or there is none): the time is then UNKNOWN rather than
+ * "the dated ones". Used ONLY by the pre-cutover verification, where the comparison "completed at or after the latest despatch" is
+ * meaningless on a time that is not known. Every other push keeps the lenient {@link latestDespatchTime}, including its use of "now"
+ * for a part with no usable date.
+ */
+export function strictLatestDespatchTime(tracking: ReadonlyArray<{ despatchedAt?: string | null }>): Date | null {
+  if (tracking.length === 0) return null
+  for (const entry of tracking) {
+    if (!entry.despatchedAt || Number.isNaN(new Date(entry.despatchedAt).getTime())) return null
+  }
+  return latestDespatchTime(tracking)
 }
 
 /**
@@ -686,25 +687,13 @@ async function reconcileSplitOrder(
   // Push every despatched part to the storefront. A despatched part with no recordable
   // line items can't become a partial shipment — don't let it count toward completion
   // (that would ship the IMS order with a part never recorded).
-  // A despatched part with an undated or invalid tracking entry has an UNKNOWN despatch time. The cut-off decision (live push or
-  // pre-cutover shadow) is taken on that time, so nothing is pushed or verified off a guess: the order stays pending.
-  if (recordPartials) {
-    const unknown = dispatchedParts.find((entry) => hasUnknownDespatchTime(entry.tracking))
-    if (unknown) {
-      return {
-        action: 'pending',
-        reason: `Part ${unknown.partNumber} has a tracking entry with no usable despatch time - holding off until the WMS dates it`,
-        unresolved: requireResolution,
-      }
-    }
-  }
   let allRecorded = true
   // Parts whose storefront record was VERIFIED by a fresh read (pre-cutover) rather than written by this sweep.
   let verifiedPreCutoverParts = 0
   // The fresh read happens at most once per order per sweep: the first shadowed pre-cutover part asks, the rest reuse the answer.
   let preCutoverVerdict: { verified: boolean; detail: string } | null = null
   // What a verifying completion must postdate: the LATEST despatch among ALL despatched parts, not the part being asked about.
-  const latestPartDespatch = latestDespatchTime(dispatchedParts.flatMap((entry) => entry.tracking))
+  const latestPartDespatch = strictLatestDespatchTime(dispatchedParts.flatMap((entry) => entry.tracking))
   if (recordPartials) {
     for (const part of dispatchedParts) {
       const items = await deps.fetchPartItems(part.externalId)

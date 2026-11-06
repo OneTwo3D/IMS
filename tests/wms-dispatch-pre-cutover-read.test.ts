@@ -572,32 +572,61 @@ test('REDIRECT: the read refuses redirects, and a redirected answer is pending (
   }
 })
 
-test('UNKNOWN DESPATCH TIME: a despatched part with ANY undated or invalid tracking entry stays pending - nothing pushed, nothing read, nothing written', async () => {
+test('UNKNOWN DESPATCH TIME, PRE-CUTOVER: a part shadowed as pre-cutover whose tracking has an undated or invalid entry stays pending - the verifier is asked with an UNKNOWN time and no read is made', async () => {
   const tracked = (entries: Array<{ trackingNumber: string; carrier: string; despatchedAt?: string }>): Part => ({ ...part(1, PRE), tracking: entries as Part['tracking'] })
   const dated = { trackingNumber: 'TN-1', carrier: 'DPD', despatchedAt: PRE }
   for (const bad of [
-    [dated, { trackingNumber: 'TN-2', carrier: 'DPD' }], // an undated entry beside a dated one
+    [dated, { trackingNumber: 'TN-2', carrier: 'DPD' }], // an undated entry beside a dated (pre-cutover) one
     [dated, { trackingNumber: 'TN-2', carrier: 'DPD', despatchedAt: 'not a date' }], // an invalid one
-    [{ trackingNumber: 'TN-2', carrier: 'DPD', despatchedAt: '' }],
-    [{ trackingNumber: 'TN-2', carrier: 'DPD' }],
+    [dated, { trackingNumber: 'TN-2', carrier: 'DPD', despatchedAt: '' }],
   ]) {
-    for (const env of [LIVE_AT_CUTOFF, SEAM_ON, {}]) {
-      reset()
-      await withEnv(env, async () => {
-        const run = await sweep([tracked(bad), part(2, PRE2)])
-        assert.equal(run.out.counters.dispatched, 0)
-        assert.equal(run.out.counters.pending, 1)
-        assert.deepEqual(run.applyOptions, [])
-        assert.deepEqual(run.asked, [], 'and the verifier is not asked off a guessed time')
-        assert.deepEqual(transport, [], 'no push (which would have been judged LIVE off "now") and no read')
-      })
-    }
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const run = await sweep([tracked(bad), part(2, PRE2)])
+      assert.equal(run.out.counters.dispatched, 0)
+      assert.equal(run.out.counters.pending, 1)
+      assert.deepEqual(run.applyOptions, [])
+      assert.deepEqual(run.asked, [null], 'the verifier was asked, with no usable time')
+      assert.deepEqual(transport, [], 'and nothing was read or written')
+      assert.equal(activity.find((a) => a.action === 'pre_cutover_part_pending')?.metadata?.code, 'no_despatch_time')
+    })
   }
-  // the control: the same order with every entry dated completes
+  // the control: the same order with every entry dated verifies
   reset()
   await withEnv(LIVE_AT_CUTOFF, async () => {
     assert.equal((await sweep([tracked([dated, { trackingNumber: 'TN-2', carrier: 'DPD', despatchedAt: PRE2 }]), part(2, PRE2)])).out.counters.dispatched, 1)
   })
+})
+
+test('UNKNOWN DESPATCH TIME, NORMAL: an undated entry on an ordinary split order pushes exactly as before (a dated post-cutover entry decides, an all-undated part uses "now"), and with the switch off', async () => {
+  const tracked = (n: number, entries: Array<{ trackingNumber: string; carrier: string; despatchedAt?: string }>): Part => ({ ...part(n, POST), tracking: entries as Part['tracking'] })
+  for (const env of [LIVE_AT_CUTOFF, {}]) {
+    reset()
+    await withEnv(env, async () => {
+      const run = await sweep([
+        tracked(1, [{ trackingNumber: 'TN-1', carrier: 'DPD', despatchedAt: POST }, { trackingNumber: 'TN-2', carrier: 'DPD' }]),
+        tracked(2, [{ trackingNumber: 'TN-3', carrier: 'DPD' }]),
+      ])
+      assert.equal(run.out.counters.dispatched, 1)
+      assert.deepEqual(run.applyOptions, [undefined])
+      assert.deepEqual(run.asked, [], 'no verification: nothing was shadowed as pre-cutover')
+      assert.equal(writes().length, 2, 'both parts were pushed live, as on development')
+      assert.deepEqual(reads(), [])
+    })
+  }
+})
+
+test('latestDespatchTime skips undated entries (as on development); strictLatestDespatchTime treats any as UNKNOWN', async () => {
+  const { latestDespatchTime, strictLatestDespatchTime } = await import('@/lib/domain/wms/dispatch-sweep')
+  assert.equal(latestDespatchTime([{ despatchedAt: PRE }, { despatchedAt: PRE2 }])?.toISOString(), new Date(PRE2).toISOString())
+  assert.equal(latestDespatchTime([{ despatchedAt: PRE }, {}])?.toISOString(), new Date(PRE).toISOString())
+  assert.equal(latestDespatchTime([{ despatchedAt: PRE }, { despatchedAt: 'x' }])?.toISOString(), new Date(PRE).toISOString())
+  assert.equal(latestDespatchTime([{}]), null)
+  assert.equal(latestDespatchTime([]), null)
+  assert.equal(strictLatestDespatchTime([{ despatchedAt: PRE }, { despatchedAt: PRE2 }])?.toISOString(), new Date(PRE2).toISOString())
+  for (const bad of [[{ despatchedAt: PRE }, {}], [{ despatchedAt: PRE }, { despatchedAt: 'x' }], [{ despatchedAt: PRE }, { despatchedAt: null }], [{}], []]) {
+    assert.equal(strictLatestDespatchTime(bad), null)
+  }
 })
 
 // ───────────────────────── the read under the outbound-write hold ─────────────────────────
@@ -636,13 +665,4 @@ test('parseWcGmtInstant reads only an unambiguous UTC instant', async () => {
   for (const bad of [undefined, null, '', 'x', '2026-05-23', '2026-05-23 09:00:00', '2026-05-23T09:00:00+01:00', '2026-02-31T09:00:00', 5]) {
     assert.equal(parseWcGmtInstant(bad), null, String(bad))
   }
-})
-
-test('latestDespatchTime: any undated or invalid entry makes the time UNKNOWN (null); it never reports the dated ones', async () => {
-  const { latestDespatchTime } = await import('@/lib/domain/wms/dispatch-sweep')
-  assert.equal(latestDespatchTime([{ despatchedAt: PRE }, { despatchedAt: PRE2 }])?.toISOString(), new Date(PRE2).toISOString())
-  assert.equal(latestDespatchTime([{ despatchedAt: PRE }, {}]), null)
-  assert.equal(latestDespatchTime([{ despatchedAt: PRE }, { despatchedAt: 'x' }]), null)
-  assert.equal(latestDespatchTime([{ despatchedAt: PRE }, { despatchedAt: null }]), null)
-  assert.equal(latestDespatchTime([]), null)
 })

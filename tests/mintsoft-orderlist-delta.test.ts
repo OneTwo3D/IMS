@@ -36,7 +36,7 @@ import type { WmsOrderStatus, WmsOrderTracking, WmsOrderPart } from '../lib/conn
 // --- Fixtures --------------------------------------------------------------
 
 function tracking(partial: Partial<WmsOrderTracking>): WmsOrderTracking {
-  return { trackingNumber: null, carrier: null, despatchedAt: '2026-06-30T10:00:00Z', ...partial }
+  return { trackingNumber: null, carrier: null, despatchedAt: null, ...partial }
 }
 
 function status(partial: Partial<WmsOrderStatus>): WmsOrderStatus {
