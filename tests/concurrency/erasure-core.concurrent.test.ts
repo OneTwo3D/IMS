@@ -22,6 +22,8 @@ const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const skip = !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1'
 
 let accountingMocked = false
+// When set, the Mintsoft connector double returns these records from pollReturns.
+let pollReturnsRecords: (() => Array<Record<string, unknown>>) | null = null
 // Runs after upsertCustomer has returned (inside importWcOrder), before the order is created.
 let afterUpsertCustomer: (() => Promise<void>) | null = null
 // Runs after an email action has read the order's address and before it enqueues.
@@ -57,6 +59,10 @@ async function mockActionEnvironment() {
   const guards = Object.fromEntries(Object.keys(actual).filter((k) => k.startsWith('require')).map((k) => [k, async () => session]))
   mock.module('@/lib/auth/server', { namedExports: { ...actual, ...guards } })
   mock.module('next/cache', { namedExports: { revalidatePath: () => undefined, revalidateTag: () => undefined } })
+  // The warehouse registry, with ONE seam: when a test sets `pollReturnsRecords` the Mintsoft connector is a double whose poll returns those
+  // records. No other behaviour changes and nothing here can reach the warehouse.
+  const registry = await import('@/lib/connectors/wms/registry')
+  mock.module('@/lib/connectors/wms/registry', { namedExports: { ...registry, getWmsConnector: (id: never) => (pollReturnsRecords && (id as string) === 'mintsoft' ? { pollReturns: async () => pollReturnsRecords!() } : registry.getWmsConnector(id)) } })
   // A seam AFTER the importer's customer lookup/link step returned its customer and before the order create transaction starts.
   const fieldMapping = await import('@/lib/connectors/woocommerce/sync/field-mapping')
   mock.module('@/lib/connectors/woocommerce/sync/field-mapping', { namedExports: { ...fieldMapping, upsertCustomer: async (order: never) => { const id = await fieldMapping.upsertCustomer(order); await afterUpsertCustomer?.(); return id } } })
@@ -1143,4 +1149,81 @@ test('[erasure] a large customer (300 orders, 2000 activity rows, payments, ware
   assert.ok(!links.includes(NAME.last) && !links.includes(STREET), 'warehouse link errors were scrubbed')
   assert.equal(await db.payment.count({ where: { orderId: { in: ids }, notes: { not: null } } }), 0)
   assert.equal(await db.payment.count({ where: { orderId: { in: ids }, reference: { startsWith: `REF-${tag}` } } }), ORDERS, 'every payment reference is kept')
+})
+
+
+test('[erasure] the returns sync never reads the warehouse\'s free text back into an erased order\'s return: racing the erasure, and on a redelivery with no order reference', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { runMintsoftReturnsSync } = await import('@/lib/connectors/mintsoft/sync/returns-sync')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const uid = randomUUID().slice(0, 8)
+  const connection = await db.wmsConnection.create({ data: { connector: 'mintsoft', label: `ret-${uid}`, active: true }, select: { id: true } })
+  const binding = await db.externalWmsBinding.create({ data: { connectionId: connection.id, warehouseId: fx.warehouseId, connector: 'mintsoft', externalWarehouseId: `ext-${uid}`, active: true, returnsMode: 'POLL' } as never, select: { id: true } })
+  const returnIds: string[] = []
+  const record = (externalReturnId: string, over: Record<string, unknown> = {}) => ({
+    externalReturnId, externalWarehouseId: `ext-${uid}`, sku: 'SKU-RET', qty: 1, orderReference: String(fx.externalId), reason: `${NAME.first} ${NAME.last} says it arrived broken`,
+    receivedAt: '2026-11-04T10:00:00.000Z', raw: { Customer: { Name: FULL_NAME }, Note: `Collect from ${STREET}`, Lines: [{ SKU: 'SKU-RET', Qty: 1 }] }, ...over,
+  })
+  t.after(async () => {
+    pollReturnsRecords = null
+    await db.wmsReturnsInbox.deleteMany({ where: { externalReturnId: { in: returnIds } } })
+    await db.externalWmsBinding.deleteMany({ where: { id: binding.id } })
+    await db.wmsConnection.deleteMany({ where: { id: connection.id } })
+    await fx.cleanup()
+  })
+  const inbox = (id: string) => db.wmsReturnsInbox.findUniqueOrThrow({ where: { connector_externalReturnId: { connector: 'mintsoft', externalReturnId: id } } })
+
+  // (c) CONTROL, not erased: the delivery resolves the order and stores the warehouse's text and payload; a redelivery with no reference
+  // keeps the established link (an unresolved delivery never clears it) and, the order not being erased, still writes the text.
+  const live = `RET-LIVE-${uid}`; returnIds.push(live)
+  pollReturnsRecords = () => [record(live)]
+  await runMintsoftReturnsSync('test')
+  const first = await inbox(live)
+  assert.equal(first.orderId, fx.orderId)
+  assert.ok(first.reason?.includes(NAME.last), 'not erased: the reason is stored')
+  assert.ok(JSON.stringify(first.rawPayload).includes(STREET), 'not erased: the raw payload is stored')
+  pollReturnsRecords = () => [record(live, { orderReference: null, reason: 'updated reason text' })]
+  await runMintsoftReturnsSync('test')
+  const again = await inbox(live)
+  assert.equal(again.orderId, fx.orderId, 'an unresolved redelivery keeps the established link')
+  assert.equal(again.reason, 'updated reason text')
+
+  // (a) RACE: an erasure is in progress and holds the order lock; the sync waits on it, then sees the marker and writes no free text.
+  const racing = `RET-RACE-${uid}`; returnIds.push(racing)
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const { lockSalesOrder } = await import('@/lib/domain/sales/allocation-service')
+  const erasing = db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, fx.orderId)
+    await gate
+    await tx.salesOrder.update({ where: { id: fx.orderId }, data: { erasedAt: new Date() } })
+  }, { timeout: 30_000 })
+  await new Promise((r) => setTimeout(r, 300))
+  pollReturnsRecords = () => [record(racing)]
+  let syncDone = false
+  const syncing = runMintsoftReturnsSync('test').then(() => { syncDone = true })
+  await new Promise((r) => setTimeout(r, 1200))
+  assert.equal(syncDone, false, 'PRECONDITION: the sync is waiting on the order lock')
+  release()
+  await erasing
+  await syncing
+  const raced = await inbox(racing)
+  assert.equal(raced.orderId, fx.orderId, 'the structured link is recorded')
+  assert.equal(raced.reason, null, 'no free text was read back')
+  assert.deepEqual(raced.rawPayload, {}, 'no raw payload was read back')
+
+  // The earlier row for this (now erased) order is cleared by the real erasure; undo the manual marker so the erasure can run.
+  await db.salesOrder.update({ where: { id: fx.orderId }, data: { erasedAt: null } })
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  assert.equal((await inbox(live)).reason, 'Text removed by GDPR erasure')
+
+  // (b) REDELIVERY with a missing order reference, for a return already linked to an ERASED order: the link is kept and no text is written.
+  pollReturnsRecords = () => [record(live, { orderReference: null, reason: `${NAME.last} wrote this later`, raw: { Customer: { Name: FULL_NAME } } })]
+  await runMintsoftReturnsSync('test')
+  const redelivered = await inbox(live)
+  assert.equal(redelivered.orderId, fx.orderId, 'the established link is preserved, never nulled')
+  assert.equal(redelivered.reason, null, 'and no reason is written over a row linked to an erased order')
+  assert.deepEqual(redelivered.rawPayload, {})
+  assert.ok(!JSON.stringify(redelivered).includes(NAME.last) && !JSON.stringify(redelivered).includes(STREET))
 })

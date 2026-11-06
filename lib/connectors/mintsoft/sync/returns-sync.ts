@@ -346,10 +346,7 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
         ])
         const binding = selectMintsoftReturnBinding(record, bindings)
         const reference = trimToNull(record.orderReference)
-        // A return for an ERASED order is recorded (its structured columns reconcile the warehouse), but the warehouse's free text and raw
-        // payload are NOT read back in: the warehouse still holds the person's details, and re-reading them would undo the erasure.
-        const orderErased = order?.id ? Boolean((await db.salesOrder.findUnique({ where: { id: order.id }, select: { erasedAt: true } }))?.erasedAt) : false
-        const reason = orderErased ? null : trimToNull(record.reason)
+        const reasonText = trimToNull(record.reason)
         const qty = record.qty == null ? null : new Prisma.Decimal(record.qty)
         const receivedAt = parseReceivedAt(record.receivedAt)
         const now = new Date()
@@ -357,13 +354,9 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
           maxReceivedAtSeen = receivedAt
         }
 
+        const inboxKey = { connector_externalReturnId: { connector: 'mintsoft', externalReturnId: record.externalReturnId } }
         const existing = await db.wmsReturnsInbox.findUnique({
-          where: {
-            connector_externalReturnId: {
-              connector: 'mintsoft',
-              externalReturnId: record.externalReturnId,
-            },
-          },
+          where: inboxKey,
           select: {
             id: true,
             status: true,
@@ -371,48 +364,62 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
           },
         })
 
-        const saved = await db.wmsReturnsInbox.upsert({
-          where: {
-            connector_externalReturnId: {
+        // ONE TRANSACTION: the order lock(s), the erasure marker and the inbox write. A return for an ERASED order is recorded (its structured
+        // columns reconcile the warehouse), but the warehouse's free text and raw payload are NOT read back in: the warehouse still holds the
+        // person's details, and re-reading them would undo the erasure. The decision is made on the EFFECTIVE order, locked first (order, then
+        // the inbox row: the erasure's own order, customer -> orders -> linked rows): the order this delivery resolves to, or, when it
+        // resolves to none (a redelivery with a missing order reference), the order the inbox row is ALREADY linked to. An established link is
+        // never cleared by an unresolved delivery.
+        const { saved, reason } = await db.$transaction(async (tx) => {
+          const current = await tx.wmsReturnsInbox.findUnique({ where: inboxKey, select: { orderId: true } })
+          const effectiveOrderId = order?.id ?? current?.orderId ?? null
+          const candidates = [...new Set([order?.id, current?.orderId].filter((id): id is string => Boolean(id)))].sort()
+          let orderErased = false
+          for (const candidate of candidates) {
+            await tx.$queryRaw`SELECT id FROM "sales_orders" WHERE id = ${candidate} FOR UPDATE`
+            if ((await tx.salesOrder.findUnique({ where: { id: candidate }, select: { erasedAt: true } }))?.erasedAt) orderErased = true
+          }
+          const reason = orderErased ? null : reasonText
+          const rawPayload = (orderErased ? {} : (record.raw ?? {})) as Prisma.InputJsonValue
+          const saved = await tx.wmsReturnsInbox.upsert({
+            where: inboxKey,
+            create: {
               connector: 'mintsoft',
               externalReturnId: record.externalReturnId,
+              orderId: effectiveOrderId,
+              productId: product?.id ?? null,
+              sku: trimToNull(record.sku),
+              qty,
+              reason,
+              reference,
+              warehouseId: binding?.warehouseId ?? null,
+              receivedAt,
+              rawPayload,
+              status: 'NEW',
             },
-          },
-          create: {
-            connector: 'mintsoft',
-            externalReturnId: record.externalReturnId,
-            orderId: order?.id ?? null,
-            productId: product?.id ?? null,
-            sku: trimToNull(record.sku),
-            qty,
-            reason,
-            reference,
-            warehouseId: binding?.warehouseId ?? null,
-            receivedAt,
-            rawPayload: (orderErased ? {} : (record.raw ?? {})) as Prisma.InputJsonValue,
-            status: 'NEW',
-          },
-          update: {
-            orderId: order?.id ?? null,
-            productId: product?.id ?? null,
-            sku: trimToNull(record.sku),
-            qty,
-            reason,
-            reference,
-            warehouseId: resolveMintsoftReturnWarehouseId({
-              existingStatus: existing?.status ?? null,
-              existingWarehouseId: existing?.warehouseId ?? null,
-              bindingWarehouseId: binding?.warehouseId ?? null,
-            }),
-            receivedAt,
-            rawPayload: (orderErased ? {} : (record.raw ?? {})) as Prisma.InputJsonValue,
-            updatedAt: now,
-          },
-          select: {
-            id: true,
-            productId: true,
-            sku: true,
-          },
+            update: {
+              orderId: effectiveOrderId,
+              productId: product?.id ?? null,
+              sku: trimToNull(record.sku),
+              qty,
+              reason,
+              reference,
+              warehouseId: resolveMintsoftReturnWarehouseId({
+                existingStatus: existing?.status ?? null,
+                existingWarehouseId: existing?.warehouseId ?? null,
+                bindingWarehouseId: binding?.warehouseId ?? null,
+              }),
+              receivedAt,
+              rawPayload,
+              updatedAt: now,
+            },
+            select: {
+              id: true,
+              productId: true,
+              sku: true,
+            },
+          })
+          return { saved, reason }
         })
 
         if (existing) {
