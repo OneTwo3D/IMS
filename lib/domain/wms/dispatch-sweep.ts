@@ -5,6 +5,10 @@ import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
+import { readProducerEnforcement } from '@/lib/security/producer-seam'
+import { parseProducerCutoff } from '@/lib/security/producer-disposition'
+import { PRODUCER_CUTOFF_ENV } from '@/lib/security/producer-disposition-constants'
+import type { ZonelessDespatchReading } from '@/lib/connectors/wms/connector-hooks'
 import {
   decodeWmsDeltaCursor,
   encodeWmsDeltaCursor,
@@ -430,6 +434,14 @@ export type WmsDispatchSweepDeps = {
    * after `latestDespatchAt` (the LATEST despatch among the order's despatched parts). Absent: nothing is verifiable.
    */
   verifyPreCutoverCompletion?(orderId: string, latestDespatchAt: Date | null): Promise<{ verified: boolean; detail: string }>
+  /** How this WMS's zone-less despatch datetimes are read in the pre-cutover verification only. Absent: they are UNKNOWN (strict). */
+  zonelessDespatchReading?: ZonelessDespatchReading
+  /** The storefront's live-from instant, or null when none is configured/readable. Used to tell whether an uncertain despatch time matters. */
+  storefrontCutoff?(): Date | null
+  /** The earliest the order's despatch can have been: when IMS sent it to the WMS or created it, whichever is later and known. Null when unknown. */
+  despatchLowerBound?(orderId: string): Promise<Date | null>
+  /** The clock used for the order-level cutoff decision; injected by tests. Defaults to the system clock. */
+  clock?(): Date
   // Whether the active connector supports per-part reconciliation (fetchOrderParts). When
   // false, a split order is surfaced as a clear "unsupported" pending rather than silently
   // stalling as "no parts visible".
@@ -635,26 +647,65 @@ export function latestDespatchTime(tracking: ReadonlyArray<{ despatchedAt?: stri
 
 /** A date AND time with an explicit zone (`Z` or a numeric offset). Anything less is not an instant. */
 const PRECISE_DESPATCH_INSTANT = /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?\s*(?:([Zz])|([+-])(\d{2}):?(\d{2}))$/
+/** A date AND time with NO zone at all. */
+const ZONELESS_DESPATCH_DATETIME = /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$/
+
+/** Zone-less values dated before this year are UNKNOWN: the UK's historical offsets (e.g. +2h in 1943) are not modelled. */
+const ZONELESS_MIN_YEAR = 1996
+
+const LONDON_PARTS = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Europe/London', hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+})
+
+/** The Europe/London wall clock at an instant, as a UTC-style millisecond count (whole seconds). Independent of the host timezone. */
+function londonWallMs(instantMs: number): number {
+  const p: Record<string, number> = {}
+  for (const part of LONDON_PARTS.formatToParts(new Date(instantMs))) if (part.type !== 'literal') p[part.type] = Number(part.value)
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second)
+}
+
+/**
+ * The UTC instant of a Europe/London wall-clock time (given as a UTC-style millisecond count), or null when that local time does
+ * not exist (spring-forward gap) or occurs twice (autumn fall-back hour): both are UNKNOWN. UK offsets are only ever 0 or +1 h, so
+ * the two candidates are checked against the zone's own clock.
+ */
+function londonLocalToInstant(wallMs: number): Date | null {
+  const wholeSecond = Math.floor(wallMs / 1000) * 1000
+  const matches = [0, 60 * 60_000].map((offset) => wallMs - offset).filter((instant) => londonWallMs(instant) === wholeSecond)
+  return matches.length === 1 ? new Date(matches[0]) : null
+}
 
 /**
  * A despatch value as an UNAMBIGUOUS instant, or null. Only a date AND time with an explicit offset or `Z` counts. A date-only value
  * ("2026-05-20") reads as midnight UTC, which can sit hours before the real despatch, and a value with no zone ("2026-05-20T09:00:00")
  * is the warehouse's local time of unknown zone: neither says which side of the live-from instant the despatch fell on.
+ *
+ * `options.zoneless = 'europe-london'` (Mintsoft values only) reads a date AND time with no zone as UK local time (BST or GMT by
+ * date). A local time that does not exist or occurs twice at a clock change is still null. Date-only values stay null.
  */
-export function preciseDespatchInstant(value: string | null | undefined): Date | null {
+export function preciseDespatchInstant(value: string | null | undefined, options?: { zoneless?: ZonelessDespatchReading }): Date | null {
   if (!value) return null
-  const m = PRECISE_DESPATCH_INSTANT.exec(value.trim())
-  if (!m) return null
-  const [, y, mo, d, h, mi, sec, frac, , sign, oh, om] = m
+  const trimmed = value.trim()
+  const m = PRECISE_DESPATCH_INSTANT.exec(trimmed)
+  const zoneless = m ? null : options?.zoneless === 'europe-london' ? ZONELESS_DESPATCH_DATETIME.exec(trimmed) : null
+  const g = m ?? zoneless
+  if (!g) return null
+  const [, y, mo, d, h, mi, sec, frac] = g
   const wall = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(sec ?? 0), Number((frac ?? '').slice(0, 3).padEnd(3, '0')))
   const check = new Date(wall)
   // A calendar or clock value that does not exist (31 February, 25:00) rolls over silently: refuse it.
   if (check.getUTCFullYear() !== Number(y) || check.getUTCMonth() + 1 !== Number(mo) || check.getUTCDate() !== Number(d) || check.getUTCHours() !== Number(h) || check.getUTCMinutes() !== Number(mi)) return null
-  if (sign !== undefined) {
-    if (Number(oh) > 14 || Number(om) > 59) return null
-    return new Date(wall - (sign === '-' ? -1 : 1) * (Number(oh) * 60 + Number(om)) * 60_000)
+  if (m) {
+    const sign = m[9]
+    if (sign !== undefined) {
+      if (Number(m[10]) > 14 || Number(m[11]) > 59) return null
+      return new Date(wall - (sign === '-' ? -1 : 1) * (Number(m[10]) * 60 + Number(m[11])) * 60_000)
+    }
+    return new Date(wall)
   }
-  return new Date(wall)
+  // Historical UK offsets (double summer time, 1968-71 British Standard Time) are not modelled: an old value is unknown.
+  if (Number(y) < ZONELESS_MIN_YEAR) return null
+  return londonLocalToInstant(wall)
 }
 
 /**
@@ -663,15 +714,172 @@ export function preciseDespatchInstant(value: string | null | undefined): Date |
  * that is not known precisely, and a part must never be treated as pre-cutover on an imprecise date. Every other push keeps the
  * lenient {@link latestDespatchTime}, including its use of "now" for a part with no usable date.
  */
-export function strictLatestDespatchTime(tracking: ReadonlyArray<{ despatchedAt?: string | null }>): Date | null {
+export function strictLatestDespatchTime(
+  tracking: ReadonlyArray<{ despatchedAt?: string | null }>,
+  options?: { zoneless?: ZonelessDespatchReading },
+): Date | null {
   if (tracking.length === 0) return null
   let latest: Date | null = null
   for (const entry of tracking) {
-    const at = preciseDespatchInstant(entry.despatchedAt)
+    const at = preciseDespatchInstant(entry.despatchedAt, options)
     if (at === null) return null
     if (latest === null || at.getTime() > latest.getTime()) latest = at
   }
   return latest
+}
+
+/** True when a dispatched order or part has NO usable despatch time: no tracking entry at all, or an entry without one. */
+export function hasUndatedDespatch(tracking: ReadonlyArray<{ despatchedAt?: string | null }>): boolean {
+  return tracking.length === 0 || tracking.some((entry) => !entry.despatchedAt)
+}
+
+/**
+ * The WooCommerce live-from cutoff, but ONLY while WooCommerce producer enforcement is active (the same predicate the producer seam
+ * uses): with enforcement off the legacy path applies exactly as before, so no cutoff is read. Null when off, absent or unreadable.
+ */
+export function storefrontCutoffWhileEnforced(env: Record<string, string | undefined> = process.env): Date | null {
+  const enforcement = readProducerEnforcement(env)
+  if (!enforcement.enforced || !enforcement.destinations.has('woocommerce')) return null
+  const read = parseProducerCutoff(env[PRODUCER_CUTOFF_ENV.woocommerce])
+  return read.ok ? read.at : null
+}
+
+/**
+ * The earliest an order's despatch can have been, from IMMUTABLE facts only: when IMS first claimed the create of the warehouse order
+ * (stamped once, never rewritten; only trusted on a link that tracks its claim history) and when the IMS order was created, whichever
+ * is later and known. Never the link's pushedAt: every amendment attempt moves that, which would push the bound past a cutover and
+ * make a pre-cutover despatch look live. Null when nothing is known.
+ */
+export function despatchLowerBoundOf(
+  link: { claimHistoryTracked?: boolean | null; firstClaimedAt?: Date | null; order?: { createdAt?: Date | null } | null } | null | undefined,
+): Date | null {
+  const known = [link?.claimHistoryTracked ? link.firstClaimedAt : null, link?.order?.createdAt]
+    .filter((value): value is Date => value instanceof Date && Number.isFinite(value.getTime()))
+  return known.length === 0 ? null : new Date(Math.max(...known.map((value) => value.getTime())))
+}
+
+/** The lower bound of an undated order's despatch, only when one is needed (a cutoff, a reading, and an undated entry). */
+async function undatedLowerBound(
+  deps: WmsDispatchSweepDeps,
+  orderId: string,
+  tracking: ReadonlyArray<{ despatchedAt?: string | null }>,
+  cutoff: Date | null,
+): Promise<Date | null> {
+  if (cutoff === null || deps.zonelessDespatchReading === undefined || !hasUndatedDespatch(tracking) || !deps.despatchLowerBound) return null
+  try { return await deps.despatchLowerBound(orderId) } catch { return null }
+}
+
+const DATE_ONLY_DESPATCH = /^(\d{4})-(\d{2})-(\d{2})$/
+
+/**
+ * Every instant a despatch value could mean under the zone reading, earliest to latest, or null when it cannot be read at all.
+ * An exact instant (Z or offset, or an unambiguous UK local time) is a single point. A date-only value spans that whole UK day. A
+ * UK local time that does not exist or occurs twice spans the two readings (an hour apart). Anything else is null.
+ */
+export function despatchInstantRange(value: string, reading: ZonelessDespatchReading): { from: Date; to: Date } | null {
+  const trimmed = value.trim()
+  const yearMatch = /^(\d{4})/.exec(trimmed)
+  if (yearMatch && Number(yearMatch[1]) < ZONELESS_MIN_YEAR) return null
+  const exact = preciseDespatchInstant(trimmed, { zoneless: reading })
+  if (exact !== null) return { from: exact, to: exact }
+  const dateOnly = DATE_ONLY_DESPATCH.exec(trimmed)
+  if (dateOnly) {
+    const [y, mo, d] = [Number(dateOnly[1]), Number(dateOnly[2]), Number(dateOnly[3])]
+    const day = new Date(Date.UTC(y, mo - 1, d))
+    if (day.getUTCFullYear() !== y || day.getUTCMonth() !== mo - 1 || day.getUTCDate() !== d) return null
+    // UK clock changes happen at 01:00 UTC, so local midnight always exists exactly once.
+    const start = londonLocalToInstant(day.getTime())
+    const next = londonLocalToInstant(day.getTime() + 24 * 60 * 60_000)
+    return start && next ? { from: start, to: new Date(next.getTime() - 1) } : null
+  }
+  const zoneless = ZONELESS_DESPATCH_DATETIME.exec(trimmed)
+  if (!zoneless) return null
+  const [, y, mo, d, h, mi, sec, frac] = zoneless
+  const wall = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(sec ?? 0), Number((frac ?? '').slice(0, 3).padEnd(3, '0')))
+  const check = new Date(wall)
+  if (check.getUTCFullYear() !== Number(y) || check.getUTCMonth() + 1 !== Number(mo) || check.getUTCDate() !== Number(d) || check.getUTCHours() !== Number(h) || check.getUTCMinutes() !== Number(mi)) return null
+  return { from: new Date(wall - 60 * 60_000), to: new Date(wall) }
+}
+
+/**
+ * The business-event time a part's storefront push is judged by (the live-from cutoff decision), for a WMS whose zone-less
+ * despatch datetimes have a known zone. Each value is read as the RANGE of instants it could mean; against the storefront cutoff
+ * (`cutoff`, null when none is configured, in which case the producer seam shadows everything anyway):
+ *  - the whole range is at or after the cutoff: live, judged by the range's earliest instant (the ordinary push);
+ *  - the whole range is before the cutoff: pre-cutover, judged by the range's latest instant (the seam shadows it and the
+ *    verification, which needs an exact instant, keeps it pending);
+ *  - the range STRADDLES the cutoff, or the value cannot be read at all: `{ unknown: true }`. The caller holds the part pending,
+ *    because an uncertain time must never lead to a storefront write.
+ * Entries with no value at all keep the lenient behaviour (skipped; none usable gives null, i.e. "now"). Without a reading the
+ * lenient host parse stays.
+ */
+export function dispositionDespatchTime(
+  tracking: ReadonlyArray<{ despatchedAt?: string | null }>,
+  reading: ZonelessDespatchReading | undefined,
+  cutoff: Date | null = null,
+  /** The earliest the despatch can have been (see {@link hasUndatedDespatch}); null when unknown. */
+  lowerBound: Date | null = null,
+): { unknown: false; at: Date | null } | { unknown: true } {
+  // No reading, or no readable cutoff: nothing to judge against (the producer seam shadows or the legacy path applies).
+  if (reading === undefined || cutoff === null) return { unknown: false, at: latestDespatchTime(tracking) }
+  let latest: Date | null = null
+  // An undated part is NOT judged by the reconcile time. Its despatch is no earlier than the lower bound: at or after the cutoff
+  // that is live; otherwise the time is unknown and the part is held.
+  if (hasUndatedDespatch(tracking)) {
+    if (lowerBound === null || lowerBound.getTime() < cutoff.getTime()) return { unknown: true }
+    latest = lowerBound
+  }
+  for (const entry of tracking) {
+    if (!entry.despatchedAt) continue
+    const range = despatchInstantRange(entry.despatchedAt, reading)
+    if (range === null) return { unknown: true }
+    let judged = range.from
+    if (range.to.getTime() < cutoff.getTime()) judged = range.to
+    else if (range.from.getTime() < cutoff.getTime()) return { unknown: true }
+    if (latest === null || judged.getTime() > latest.getTime()) latest = judged
+  }
+  return { unknown: false, at: latest }
+}
+
+/**
+ * The order-level completion decision for a WMS with a zone reading (Mintsoft), made ONCE from the despatch time's RANGE (never
+ * from a clock that can move between this check and the enqueue of the storefront job). The producer seam judges an order-level
+ * completion by the time IMS ships the order, not by the despatch time, so it cannot tell a pre-cutover despatch from a live one.
+ *
+ * With a readable storefront `cutoff` (none configured: nothing is held, the existing shadowed path applies):
+ *  - any value unreadable, or whose range STRADDLES the cutoff (it could be after it): HOLD pending, no write;
+ *  - every value wholly AFTER the cutoff: complete normally;
+ *  - any value wholly BEFORE the cutoff (a pre-cutover despatch; the incumbent writer owns its storefront side): if `now` is before the
+ *    cutoff, complete in IMS with `storefrontAlreadyCompleted`, which suppresses every order-level storefront write whatever the
+ *    clock says when the job is enqueued; if `now` is at or after the cutoff, HOLD pending (a follow-up will verify these by the
+ *    fresh read).
+ * Entries with no value keep the old behaviour.
+ */
+export function orderLevelDespatchDecision(
+  tracking: ReadonlyArray<{ despatchedAt?: string | null }>,
+  reading: ZonelessDespatchReading | undefined,
+  cutoff: Date | null,
+  now: Date,
+  /** The earliest the despatch can have been when there is no usable despatch time; null when unknown. */
+  lowerBound: Date | null = null,
+): { action: 'complete'; storefrontAlreadyCompleted: boolean } | { action: 'hold'; reason: string } {
+  if (reading === undefined || cutoff === null) return { action: 'complete', storefrontAlreadyCompleted: false }
+  let before = false
+  // No usable despatch time is never "wholly after" by default: it is live only when the order cannot have been despatched before
+  // the cutoff (IMS sent it to the WMS at or after it); otherwise the time is unknown and the order is held.
+  if (hasUndatedDespatch(tracking) && (lowerBound === null || lowerBound.getTime() < cutoff.getTime())) {
+    return { action: 'hold', reason: 'it has no despatch time and could have been despatched before the storefront went live' }
+  }
+  for (const entry of tracking) {
+    if (!entry.despatchedAt) continue
+    const range = despatchInstantRange(entry.despatchedAt, reading)
+    if (range === null) return { action: 'hold', reason: 'its despatch time cannot be read' }
+    if (range.to.getTime() < cutoff.getTime()) before = true
+    else if (range.from.getTime() < cutoff.getTime()) return { action: 'hold', reason: 'its despatch time could fall either side of the storefront go-live instant' }
+  }
+  if (!before) return { action: 'complete', storefrontAlreadyCompleted: false }
+  if (now.getTime() < cutoff.getTime()) return { action: 'complete', storefrontAlreadyCompleted: true }
+  return { action: 'hold', reason: 'it was despatched before the storefront went live and an order-level completion is not verifiable' }
 }
 
 /**
@@ -720,7 +928,24 @@ async function reconcileSplitOrder(
   // The fresh read happens at most once per order per sweep: the first shadowed pre-cutover part asks, the rest reuse the answer.
   let preCutoverVerdict: { verified: boolean; detail: string } | null = null
   // What a verifying completion must postdate: the LATEST despatch among ALL despatched parts, not the part being asked about.
-  const latestPartDespatch = strictLatestDespatchTime(dispatchedParts.flatMap((entry) => entry.tracking))
+  const latestPartDespatch = strictLatestDespatchTime(dispatchedParts.flatMap((entry) => entry.tracking), { zoneless: deps.zonelessDespatchReading })
+  // The cutoff disposition of a part is judged by its despatch time. For a WMS with a known zone for zone-less values that time must
+  // not straddle the cutover: any part whose time could fall either side is held pending BEFORE anything is pushed (never a storefront write).
+  const partDespatch = new Map<object, Date | null>()
+  if (recordPartials) {
+    for (const part of dispatchedParts) {
+      const cutoff = deps.storefrontCutoff?.() ?? null
+      const judged = dispositionDespatchTime(part.tracking, deps.zonelessDespatchReading, cutoff, await undatedLowerBound(deps, candidate.orderId, part.tracking, cutoff))
+      if (judged.unknown) {
+        return {
+          action: 'pending',
+          reason: `Part ${part.partNumber} has a despatch time that could fall either side of the storefront go-live instant (or cannot be read): holding it rather than risk a storefront write`,
+          unresolved: requireResolution,
+        }
+      }
+      partDespatch.set(part, judged.at)
+    }
+  }
   if (recordPartials) {
     for (const part of dispatchedParts) {
       const items = await deps.fetchPartItems(part.externalId)
@@ -733,7 +958,7 @@ async function reconcileSplitOrder(
         totalParts,
         trackingNumber: part.tracking.find((entry) => entry.trackingNumber)?.trackingNumber ?? null,
         items,
-        despatchedAt: latestDespatchTime(part.tracking),
+        despatchedAt: partDespatch.get(part) ?? null,
       })
       if (!push.ok) {
         // The producer-side hold kept this push as a shadow: NOT a failure (no failure is counted and the link is never
@@ -796,7 +1021,24 @@ async function reconcileSplitOrder(
     : []
   // Every despatched part was VERIFIED by the fresh read (none was pushed by this sweep): the storefront order is already
   // complete, so IMS completes its own side only. A mixed order (some part pushed live) keeps the normal completion.
-  const storefrontAlreadyCompleted = recordPartials && dispatchedParts.length > 0 && verifiedPreCutoverParts === dispatchedParts.length
+  let mergedAlreadyCompleted = false
+  if (!recordPartials) {
+    // A merged survivor completes at ORDER level with no per-part judgement above, so judge every part's time here, once.
+    const cutoff = deps.storefrontCutoff?.() ?? null
+    // Judge EVERY dispatched part on its own, BEFORE the tracking is flattened: a part from an older constituent order with empty or
+    // undated tracking would otherwise hide behind another part's date. The candidate's own lower bound says nothing about a
+    // constituent order, so it is never used for a merged part: such a part simply holds the order.
+    if (cutoff !== null && deps.zonelessDespatchReading !== undefined) {
+      const undatedPart = dispatchedParts.find((entry) => hasUndatedDespatch(entry.tracking))
+      if (undatedPart) {
+        return { action: 'pending', reason: `Merged order held: part ${undatedPart.partNumber} has no despatch time`, unresolved: requireResolution }
+      }
+    }
+    const decision = orderLevelDespatchDecision(allTracking, deps.zonelessDespatchReading, cutoff, (deps.clock ?? (() => new Date()))(), null)
+    if (decision.action === 'hold') return { action: 'pending', reason: `Merged order held: ${decision.reason}`, unresolved: requireResolution }
+    mergedAlreadyCompleted = decision.storefrontAlreadyCompleted
+  }
+  const storefrontAlreadyCompleted = mergedAlreadyCompleted || (recordPartials && dispatchedParts.length > 0 && verifiedPreCutoverParts === dispatchedParts.length)
   const result = await deps.applyDispatch(candidate.orderId, aggregated, storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true } : undefined)
   if (!result.success) {
     return { action: 'error', reason: result.error ?? 'Dispatch apply failed after all parts despatched' }
@@ -935,7 +1177,11 @@ export async function reconcileOneOrder(
     }
   }
 
-  const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking))
+  // An ordinary (non-split) order completes at ORDER level: judge its despatch time against the storefront cutoff first.
+  const orderCutoff = deps.storefrontCutoff?.() ?? null
+  const decision = orderLevelDespatchDecision(status.tracking, deps.zonelessDespatchReading, orderCutoff, (deps.clock ?? (() => new Date()))(), await undatedLowerBound(deps, candidate.orderId, status.tracking, orderCutoff))
+  if (decision.action === 'hold') return { action: 'pending', reason: `Order held: ${decision.reason}`, unresolved: requireResolution }
+  const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking), decision.storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true } : undefined)
   if (!result.success) {
     return { action: 'error', reason: result.error ?? 'Dispatch apply failed' }
   }
@@ -2240,6 +2486,17 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
   const deltaScopeLock = getWmsConnectorHooks(connectorId).deltaScopeLock
     ?? defaultWmsDeltaScopeLock(wmsDeltaStateRowKeys(deltaKeys))
   return {
+    zonelessDespatchReading: getWmsConnectorHooks(connectorId).zonelessDespatchReading?.(),
+    storefrontCutoff: () => storefrontCutoffWhileEnforced(),
+    async despatchLowerBound(orderId) {
+      // NOT pushedAt: every amendment attempt, even a rejected one, moves it. firstClaimedAt is stamped once, when the create is first
+      // claimed (before any request can leave), and never rewritten.
+      const link = await db.wmsOrderPushLink.findUnique({
+        where: { orderId },
+        select: { claimHistoryTracked: true, firstClaimedAt: true, order: { select: { createdAt: true } } },
+      })
+      return despatchLowerBoundOf(link)
+    },
     async listCandidates(limit) {
       const rows = await db.wmsOrderPushLink.findMany({
         where: dispatchCandidateWhere(connectorId),

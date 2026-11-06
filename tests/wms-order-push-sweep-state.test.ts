@@ -1126,6 +1126,7 @@ test('update: a changed order is amended; pushedAt bumped, error cleared', async
   assert.equal(r.updated, 1)
   assert.equal(updates[0].data.lastError, null)
   assert.equal((updates[0].data.pushedAt as Date).toISOString(), NOW().toISOString())
+  assert.deepEqual(Object.keys(updates[0].data).sort(), ['lastAttemptAt', 'lastError', 'pushedAt'], 'an amendment never rewrites the first-claim stamp')
 })
 
 test('update: a past-NEW order is not amended but pushedAt is bumped (no futile retries)', async () => {
@@ -1136,6 +1137,7 @@ test('update: a past-NEW order is not amended but pushedAt is bumped (no futile 
   assert.equal(r.updated, 0)
   assert.match(String(updates[0].data.lastError), /not propagated.*NOT_NEW/)
   assert.ok(updates[0].data.pushedAt) // still bumped
+  assert.equal('firstClaimedAt' in updates[0].data, false, 'a rejected amendment never rewrites the first-claim stamp')
 })
 
 test('hold: an ON_HOLD pushed order is cancelled in the WMS and parked HELD', async () => {

@@ -166,17 +166,25 @@ const POST = '2026-07-01T10:00:00Z' // after the cutoff (and before now)
 type Part = { externalId: string; partNumber: number; status: string; dispatched: boolean; tracking: Array<{ trackingNumber: string; carrier: string; despatchedAt: string }> }
 const part = (n: number, at: string): Part => ({ externalId: `M-${n}`, partNumber: n, status: 'DESPATCHED', dispatched: true, tracking: [{ trackingNumber: `TN-${n}`, carrier: 'DPD', despatchedAt: at }] })
 
-async function sweep(parts: Part[], options: { verifier?: boolean } = {}) {
-  const { runWmsDispatchSweepCore } = await import('@/lib/domain/wms/dispatch-sweep')
+async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'europe-london'; clock?: Date; lowerBound?: Date | null; shape?: 'split' | 'single' | 'merged' } = {}) {
+  const { runWmsDispatchSweepCore, storefrontCutoffWhileEnforced } = await import('@/lib/domain/wms/dispatch-sweep')
   const { pushPartialShipmentToShopping } = await import('@/lib/shopping')
   const { verifyPreCutoverCompletionByFreshRead } = await import('@/lib/connectors/woocommerce/sync/pre-cutover-order-read')
   const applyOptions: Array<Record<string, unknown> | undefined> = []
   const asked: Array<string | null> = []
   const out = await runWmsDispatchSweepCore({
+    ...(options.zoneless ? {
+      zonelessDespatchReading: options.zoneless,
+      ...(options.clock ? { clock: () => options.clock! } : {}),
+      storefrontCutoff: () => storefrontCutoffWhileEnforced(),
+      despatchLowerBound: async () => options.lowerBound ?? null,
+    } : {}),
     listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
     fetchOrderStatus: async () => ({
-      externalOrderId: 'M-1', externalOrderNumber: 'WC-1001', status: 'DESPATCHED', statusLabel: 'Despatched', isSplit: true, partCount: parts.length,
-      isMerged: false, mergedOrderNumbers: [], deepLinkUrl: null, tracking: [], dispatched: true, raw: null,
+      externalOrderId: 'M-1', externalOrderNumber: 'WC-1001', status: 'DESPATCHED', statusLabel: 'Despatched',
+      isSplit: options.shape !== 'single', partCount: parts.length,
+      isMerged: options.shape === 'merged', mergedOrderNumbers: options.shape === 'merged' ? ['WC-1001'] : [], deepLinkUrl: null,
+      tracking: options.shape === 'single' ? parts[0]!.tracking : [], dispatched: true, raw: null,
     }),
     partsSupported: true,
     fetchOrderParts: async () => parts,
@@ -729,4 +737,359 @@ test('parseWcGmtInstant reads only an unambiguous UTC instant', async () => {
   for (const bad of [undefined, null, '', 'x', '2026-05-23', '2026-05-23 09:00:00', '2026-05-23T09:00:00+01:00', '2026-02-31T09:00:00', 5]) {
     assert.equal(parseWcGmtInstant(bad), null, String(bad))
   }
+})
+
+// ───────────────────────── zone-less Mintsoft despatch times read as UK time ─────────────────────────
+
+test('UK TIME, END TO END: a pre-cutover part with a zone-less SUMMER value, after a Woo completion, verifies', async () => {
+  reset()
+  // 10:00 BST on 20 May is 09:00Z; the default order read completed at 2026-05-23T09:00Z, later, so it verifies
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const run = await sweep([part(1, '2026-05-20T10:00:00')], { zoneless: 'europe-london' })
+    assert.equal(run.out.counters.dispatched, 1)
+    assert.deepEqual(run.applyOptions, [{ storefrontAlreadyCompleted: true }])
+    assert.deepEqual(run.asked, ['2026-05-20T09:00:00.000Z'])
+    assert.deepEqual(reads(), [ORDER_READ])
+    assert.deepEqual(writes(), [])
+  })
+  // the same value with the reading off (any non-Mintsoft source) stays unknown: pending, no read
+  reset()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const run = await sweep([part(1, '2026-05-20T10:00:00')])
+    assert.equal(run.out.counters.dispatched, 0)
+    assert.deepEqual(run.asked, [null], 'asked with an UNKNOWN despatch time, which reads nothing')
+    assert.deepEqual(transport, [])
+  })
+})
+
+test('UK TIME, END TO END: a zone-less value in the clock-change hour stays pending with no read or write', async () => {
+  for (const at of ['2025-03-30T01:30:00', '2025-10-26T01:30:00', '2026-05-20']) {
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const run = await sweep([part(1, at)], { zoneless: 'europe-london' })
+      assert.equal(run.out.counters.dispatched, 0, at)
+      assert.deepEqual(run.asked, [null], at) // pre-cutover, but no exact instant to verify against: pending with no read
+      assert.deepEqual(transport, [], at)
+    })
+  }
+})
+
+test('UK TIME, ORDINARY PUSH: the reading never touches the lenient push time', async () => {
+  const { latestDespatchTime } = await import('@/lib/domain/wms/dispatch-sweep')
+  assert.equal(latestDespatchTime([{ despatchedAt: '2026-07-15T09:00:00' }])?.getTime(), new Date('2026-07-15T09:00:00').getTime())
+})
+
+// ───────────────────────── the cutoff DISPOSITION reads zone-less Mintsoft times as UK time too ─────────────────────────
+
+// Cutover 2026-06-01T00:00:00Z. London is on BST then: local 00:30 on 1 June is 23:30Z on 31 May (BEFORE), local 01:30 is 00:30Z (AFTER).
+// A host-timezone parse would put 00:30 at 00:30Z on a UTC host (AFTER, a storefront write): the verdict must not depend on the host.
+test('DISPOSITION: a zone-less Mintsoft time 30 minutes either side of the cutover is judged as UK time, whatever the host timezone', async () => {
+  reset()
+  orderRead = wcOrder({ date_completed_gmt: '2026-06-02T00:00:00', date_modified_gmt: '2026-06-02T00:00:05' })
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    // local 00:30 BST = 23:30Z on 31 May: before the cutover, so shadowed and VERIFIED by a read, never written
+    const before = await sweep([part(1, '2026-06-01T00:30:00')], { zoneless: 'europe-london' })
+    assert.equal(before.out.counters.dispatched, 1)
+    assert.deepEqual(before.applyOptions, [{ storefrontAlreadyCompleted: true }])
+    assert.deepEqual(before.asked, ['2026-05-31T23:30:00.000Z'])
+    assert.deepEqual(writes(), [])
+  })
+  reset()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    // local 01:30 BST = 00:30Z on 1 June: after the cutover, so pushed live as before, nothing read
+    const after = await sweep([part(1, '2026-06-01T01:30:00')], { zoneless: 'europe-london' })
+    assert.equal(after.out.counters.dispatched, 1)
+    assert.deepEqual(after.applyOptions, [undefined])
+    assert.equal(writes().length, 1)
+    assert.deepEqual(reads(), [])
+    assert.deepEqual(after.asked, [])
+  })
+})
+
+test('DISPOSITION: a gap, ambiguous or date-only time next to the cutover stays pending, with no write and no read', async () => {
+  const cases: Array<[string, string]> = [
+    ['2026-03-29T01:30:00', '2026-03-29T01:00:00Z'], // does not exist locally
+    ['2026-10-25T01:30:00', '2026-10-25T01:00:00Z'], // happens twice
+    ['2026-06-01', '2026-06-01T00:00:00Z'], // date only
+  ]
+  for (const [at, cutoff] of cases) {
+    reset()
+    await withEnv({ ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: cutoff }, async () => {
+      const run = await sweep([part(1, at)], { zoneless: 'europe-london' })
+      assert.equal(run.out.counters.dispatched, 0, at)
+      assert.equal(run.out.counters.pending, 1, at)
+      assert.deepEqual(writes(), [], at)
+      assert.deepEqual(reads(), [], at)
+      assert.deepEqual(run.asked, [], at)
+    })
+  }
+})
+
+test('DISPOSITION: without the reading (any non-Mintsoft source) the lenient time is used, as before', async () => {
+  const { dispositionDespatchTime } = await import('@/lib/domain/wms/dispatch-sweep')
+  assert.deepEqual(dispositionDespatchTime([{ despatchedAt: PRE }], undefined), { unknown: false, at: new Date(PRE) })
+  assert.deepEqual(dispositionDespatchTime([{}], undefined), { unknown: false, at: null })
+  assert.deepEqual(dispositionDespatchTime([{ despatchedAt: '2026-06-01' }], undefined), { unknown: false, at: new Date('2026-06-01') })
+  assert.deepEqual(dispositionDespatchTime([{ despatchedAt: PRE }, {}], 'europe-london'), { unknown: false, at: new Date(PRE) })
+  assert.deepEqual(dispositionDespatchTime([{}], 'europe-london'), { unknown: false, at: null })
+  assert.deepEqual(dispositionDespatchTime([{ despatchedAt: PRE }, { despatchedAt: '2026-06-01' }], 'europe-london', new Date(CUTOFF)), { unknown: true })
+  assert.deepEqual(dispositionDespatchTime([{ despatchedAt: PRE }, { despatchedAt: 'x' }], 'europe-london', new Date(CUTOFF)), { unknown: true })
+  // no readable cutoff: nothing to judge against, the lenient time is used and nothing is held
+  assert.deepEqual(dispositionDespatchTime([{ despatchedAt: 'x' }, { despatchedAt: '2026-06-01' }], 'europe-london', null), { unknown: false, at: new Date('2026-06-01') })
+})
+
+test('RANGE: a date-only or clock-change time is judged by every instant it could mean: clearly after is live, clearly before is pre-cutover, straddling is held', async () => {
+  const run = async (at: string, cutoff: string) => {
+    reset()
+    return withEnv({ ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: cutoff }, async () => {
+      const out = await sweep([part(1, at)], { zoneless: 'europe-london' })
+      return { out, writes: writes().length, reads: reads().length }
+    })
+  }
+  // clearly AFTER the cutover (the day after): the ordinary live push, nothing read
+  const after = await run('2026-06-02', CUTOFF)
+  assert.deepEqual([after.out.out.counters.dispatched, after.writes, after.reads, after.out.asked], [1, 1, 0, []])
+  assert.deepEqual(after.out.applyOptions, [undefined])
+  // clearly BEFORE (the day before): pre-cutover, so verification is asked, but it needs an exact instant: pending, nothing written
+  const before = await run('2026-05-31', CUTOFF)
+  assert.deepEqual([before.out.out.counters.dispatched, before.writes, before.reads, before.out.asked], [0, 0, 0, [null]])
+  // STRADDLES (the cutover day itself): pending, no write, no read, verification not even asked
+  const same = await run('2026-06-01', CUTOFF)
+  assert.deepEqual([same.out.out.counters.dispatched, same.writes, same.reads, same.out.asked], [0, 0, 0, []])
+  // clock-change times far from the cutover are normal: after is live, before is pre-cutover and pending verification
+  for (const at of ['2026-03-29T01:30:00', '2026-10-25T01:30:00']) {
+    const live = await run(at, '2026-01-01T00:00:00Z')
+    assert.deepEqual([live.out.out.counters.dispatched, live.writes, live.out.asked], [1, 1, []], at)
+    const pre = await run(at, '2026-11-01T00:00:00Z')
+    assert.deepEqual([pre.out.out.counters.dispatched, pre.writes, pre.reads, pre.out.asked], [0, 0, 0, [null]], at)
+  }
+  // next to the cutover they straddle: held
+  for (const [at, cutoff] of [['2026-03-29T01:30:00', '2026-03-29T01:00:00Z'], ['2026-10-25T01:30:00', '2026-10-25T01:00:00Z'], ['2026-03-29T01:30:00', '2026-03-29T01:30:00Z']]) {
+    const near = await run(at!, cutoff!)
+    assert.deepEqual([near.out.out.counters.dispatched, near.writes, near.reads, near.out.asked], [0, 0, 0, []], at)
+  }
+  // an unreadable value is held too
+  const bad = await run('2026-13-45', CUTOFF)
+  assert.deepEqual([bad.out.out.counters.dispatched, bad.writes], [0, 0])
+})
+
+test('RANGE: despatchInstantRange spans the day, the hour either side of a clock change, or a single instant', async () => {
+  const { despatchInstantRange } = await import('@/lib/domain/wms/dispatch-sweep')
+  const iso = (v: string) => { const r = despatchInstantRange(v, 'europe-london'); return r && [r.from.toISOString(), r.to.toISOString()] }
+  assert.deepEqual(iso('2026-07-15'), ['2026-07-14T23:00:00.000Z', '2026-07-15T22:59:59.999Z'])
+  assert.deepEqual(iso('2026-01-15'), ['2026-01-15T00:00:00.000Z', '2026-01-15T23:59:59.999Z'])
+  assert.deepEqual(iso('2026-03-29'), ['2026-03-29T00:00:00.000Z', '2026-03-29T22:59:59.999Z'])
+  assert.deepEqual(iso('2026-03-29T01:30:00'), ['2026-03-29T00:30:00.000Z', '2026-03-29T01:30:00.000Z'])
+  assert.deepEqual(iso('2026-10-25T01:30:00'), ['2026-10-25T00:30:00.000Z', '2026-10-25T01:30:00.000Z'])
+  assert.deepEqual(iso('2026-07-15T09:00:00'), ['2026-07-15T08:00:00.000Z', '2026-07-15T08:00:00.000Z'])
+  assert.deepEqual(iso('2026-07-15T09:00:00Z'), ['2026-07-15T09:00:00.000Z', '2026-07-15T09:00:00.000Z'])
+  for (const bad of ['x', '2026-02-31', '2026-07-15T25:00:00', '']) assert.equal(despatchInstantRange(bad, 'europe-london'), null, bad)
+})
+
+test('ORDER LEVEL: a non-split or merged-split Mintsoft order is judged by the same range rule before it completes', async () => {
+  const cases: Array<[string, string, string]> = [
+    // [label, despatch value, expectation]: cutover 2026-06-01T00:00:00Z
+    ['wholly after', '2026-06-02T09:00:00', 'completes'],
+    ['wholly after, date only', '2026-06-02', 'completes'],
+    ['straddling date-only', '2026-06-01', 'held'],
+    ['unreadable', '2026-13-45', 'held'],
+    ['wholly before', '2026-05-20T10:00:00', 'held'],
+    ['wholly before, date only', '2026-05-31', 'held'],
+    ['dated before 1996', '1943-06-01T09:00:00', 'held'],
+  ]
+  for (const shape of ['single', 'merged'] as const) {
+    for (const [label, at, expected] of cases) {
+      reset()
+      await withEnv(LIVE_AT_CUTOFF, async () => {
+        const run = await sweep([part(1, at)], { zoneless: 'europe-london', shape, verifier: false })
+        const id = `${shape} ${label}`
+        assert.equal(run.out.counters.dispatched, expected === 'completes' ? 1 : 0, id)
+        assert.equal(run.applyOptions.length, expected === 'completes' ? 1 : 0, id)
+        // never an order-level storefront write for a held order, and nothing is read
+        if (expected === 'held') assert.deepEqual(writes(), [], id)
+        assert.deepEqual(reads(), [], id)
+      })
+    }
+  }
+  // a source with no reading: as before
+  reset()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const run = await sweep([part(1, '2026-05-20T10:00:00')], { shape: 'single', verifier: false })
+    assert.equal(run.out.counters.dispatched, 1, 'a source with no reading is untouched')
+  })
+})
+
+test('HISTORICAL: a zone-less value dated before 1996 is unknown (UK historical offsets are not modelled)', async () => {
+  const { preciseDespatchInstant, despatchInstantRange, strictLatestDespatchTime } = await import('@/lib/domain/wms/dispatch-sweep')
+  const reading = { zoneless: 'europe-london' } as const
+  assert.equal(preciseDespatchInstant('1943-07-01T09:00:00', reading), null)
+  assert.equal(preciseDespatchInstant('1995-12-31T23:00:00', reading), null)
+  assert.equal(preciseDespatchInstant('1996-07-01T09:00:00', reading)?.toISOString(), '1996-07-01T08:00:00.000Z')
+  assert.equal(despatchInstantRange('1943-07-01', 'europe-london'), null)
+  assert.equal(despatchInstantRange('1943-07-01T09:00:00Z', 'europe-london'), null)
+  assert.equal(strictLatestDespatchTime([{ despatchedAt: '1943-07-01T09:00:00' }], reading), null)
+})
+
+test('ORDER LEVEL, RACE: the decision is made once from the despatch range and carried into applyDispatch, whatever the clock says at enqueue', async () => {
+  // The injected clock reads BEFORE the cutover at the guard, while the process clock (used when the job is enqueued) is long after it.
+  const BEFORE_CUTOVER = new Date('2026-05-31T23:59:59Z')
+  for (const shape of ['single', 'merged'] as const) {
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const wholly = await sweep([part(1, '2026-05-20T10:00:00')], { zoneless: 'europe-london', shape, verifier: false, clock: BEFORE_CUTOVER })
+      assert.equal(wholly.out.counters.dispatched, 1, shape)
+      assert.deepEqual(wholly.applyOptions, [{ storefrontAlreadyCompleted: true }], `${shape}: wholly-before before the cutover completes in IMS only`)
+      assert.deepEqual(writes(), [], shape)
+    })
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const after = await sweep([part(1, '2026-06-02T09:00:00')], { zoneless: 'europe-london', shape, verifier: false, clock: BEFORE_CUTOVER })
+      assert.deepEqual(after.applyOptions, [undefined], `${shape}: wholly-after completes normally`)
+      const straddle = await sweep([part(1, '2026-06-01')], { zoneless: 'europe-london', shape, verifier: false, clock: BEFORE_CUTOVER })
+      assert.equal(straddle.out.counters.dispatched, 0, `${shape}: a straddling value is held`)
+    })
+    // at or after the cutover the same wholly-before despatch is held
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const held = await sweep([part(1, '2026-05-20T10:00:00')], { zoneless: 'europe-london', shape, verifier: false, clock: new Date(CUTOFF) })
+      assert.equal(held.out.counters.dispatched, 0, shape)
+      assert.deepEqual(held.applyOptions, [], shape)
+    })
+  }
+})
+
+test('ORDER LEVEL, CUTOFF STATE: no cutoff holds nothing; a future cutoff holds only what could be after it; a past cutoff is covered above', async () => {
+  const sweepAt = async (cutoff: string | undefined, at: string) => {
+    reset()
+    return withEnv(cutoff === undefined ? SEAM_ON : { ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: cutoff }, () =>
+      sweep([part(1, at)], { zoneless: 'europe-london', shape: 'single', verifier: false }))
+  }
+  // no cutoff configured: the existing shadowed path, nothing is held, even for an unreadable or date-only value
+  for (const at of ['2026-06-01', '2026-13-45', '2026-05-20T10:00:00']) {
+    const run = await sweepAt(undefined, at)
+    assert.equal(run.out.counters.dispatched, 1, `no cutoff ${at}`)
+    assert.deepEqual(run.applyOptions, [undefined], `no cutoff ${at}`)
+  }
+  // a FUTURE cutoff: wholly before completes in IMS only, wholly after is normal, a straddling or unreadable value is held
+  const FUTURE = '2099-06-01T00:00:00Z'
+  const before = await sweepAt(FUTURE, '2026-05-20T10:00:00')
+  assert.deepEqual([before.out.counters.dispatched, before.applyOptions], [1, [{ storefrontAlreadyCompleted: true }]])
+  const after = await sweepAt(FUTURE, '2099-06-02T09:00:00')
+  assert.deepEqual([after.out.counters.dispatched, after.applyOptions], [1, [undefined]])
+  for (const at of ['2099-06-01', '2026-13-45']) {
+    const held = await sweepAt(FUTURE, at)
+    assert.deepEqual([held.out.counters.dispatched, held.applyOptions], [0, []], at)
+  }
+})
+
+test('ENFORCEMENT OFF: the legacy path is exactly as on development, with a future or past cutoff: no flag and no hold', async () => {
+  for (const cutoff of [CUTOFF, '2099-06-01T00:00:00Z']) {
+    for (const [at, shape] of [['2026-05-20T10:00:00', 'single'], ['2026-06-01', 'single'], ['2026-13-45', 'single'], ['2026-05-20T10:00:00', 'merged'], ['', 'single']] as const) {
+      reset()
+      await withEnv({ [PRODUCER_CUTOFF_ENV.woocommerce]: cutoff }, async () => {
+        const run = await sweep([part(1, at)], { zoneless: 'europe-london', shape, verifier: false })
+        assert.equal(run.out.counters.dispatched, 1, `${cutoff} ${shape} ${at}`)
+        assert.deepEqual(run.applyOptions, [undefined], `${cutoff} ${shape} ${at}`)
+      })
+    }
+  }
+  // enforcement for another destination only is also off for WooCommerce
+  reset()
+  await withEnv({ [PRODUCER_HOLD_ENFORCED_ENV]: 'xero', [PRODUCER_CUTOFF_ENV.woocommerce]: CUTOFF }, async () => {
+    const run = await sweep([part(1, '2026-05-20T10:00:00')], { zoneless: 'europe-london', shape: 'single', verifier: false })
+    assert.deepEqual(run.applyOptions, [undefined])
+  })
+})
+
+test('UNDATED: no usable despatch time is live only when IMS sent the order at or after the cutover; otherwise it is held (never judged by reconcile time)', async () => {
+  const AFTER_SENT = new Date('2026-06-02T00:00:00Z')
+  const BEFORE_SENT = new Date('2026-05-01T00:00:00Z')
+  const undated = (n: number): Part => ({ ...part(n, PRE), tracking: [{ trackingNumber: `TN-${n}`, carrier: 'DPD', despatchedAt: '' }] })
+  for (const shape of ['single'] as const) {
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const live = await sweep([undated(1)], { zoneless: 'europe-london', shape, verifier: false, lowerBound: AFTER_SENT })
+      assert.deepEqual([live.out.counters.dispatched, live.applyOptions], [1, [undefined]], `${shape}: sent after the cutover goes live`)
+      for (const lowerBound of [BEFORE_SENT, null]) {
+        const held = await sweep([undated(1)], { zoneless: 'europe-london', shape, verifier: false, lowerBound })
+        assert.deepEqual([held.out.counters.dispatched, held.applyOptions], [0, []], `${shape}: sent before the cutover (or unknown) is held`)
+      }
+    })
+  }
+  // a SPLIT part: sent after the cutover is pushed live (one write); sent before is held with no write and no read
+  reset()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const live = await sweep([undated(1)], { zoneless: 'europe-london', verifier: false, lowerBound: AFTER_SENT })
+    assert.equal(live.out.counters.dispatched, 1)
+    assert.equal(writes().length, 1)
+  })
+  for (const lowerBound of [BEFORE_SENT, null]) {
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const held = await sweep([undated(1)], { zoneless: 'europe-london', lowerBound })
+      assert.equal(held.out.counters.dispatched, 0)
+      assert.deepEqual(writes(), [])
+      assert.deepEqual(reads(), [])
+      assert.deepEqual(held.asked, [])
+    })
+  }
+})
+
+test('LOWER BOUND: built from the immutable first claim and the order creation, never pushedAt (an amendment attempt moves that)', async () => {
+  const { despatchLowerBoundOf } = await import('@/lib/domain/wms/dispatch-sweep')
+  const created = new Date('2026-04-01T00:00:00Z')
+  const firstClaimed = new Date('2026-04-02T00:00:00Z')
+  const amendedAfterCutover = new Date('2026-06-05T00:00:00Z')
+  // a link first created BEFORE the cutover, amended after it: the bound is the first claim, not the amendment
+  const amended = { claimHistoryTracked: true, firstClaimedAt: firstClaimed, pushedAt: amendedAfterCutover, order: { createdAt: created } }
+  assert.equal(despatchLowerBoundOf(amended as never)?.toISOString(), firstClaimed.toISOString())
+  // first created AFTER the cutover: the bound is after it
+  const late = new Date('2026-06-03T00:00:00Z')
+  assert.equal(despatchLowerBoundOf({ claimHistoryTracked: true, firstClaimedAt: late, order: { createdAt: created } })?.toISOString(), late.toISOString())
+  // an untracked link's firstClaimedAt is not trusted; the order's creation still bounds it
+  assert.equal(despatchLowerBoundOf({ claimHistoryTracked: false, firstClaimedAt: late, order: { createdAt: created } })?.toISOString(), created.toISOString())
+  assert.equal(despatchLowerBoundOf(null), null)
+  assert.equal(despatchLowerBoundOf({ order: null }), null)
+
+  // end to end through the sweep: pre-cutover undated despatch with a post-cutover amendment stays held; a link first created after is live
+  const undated: Part = { ...part(1, PRE), tracking: [{ trackingNumber: 'TN-1', carrier: 'DPD', despatchedAt: '' }] }
+  for (const shape of ['single', 'merged', 'split'] as const) {
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const held = await sweep([undated], { zoneless: 'europe-london', shape, verifier: false, lowerBound: despatchLowerBoundOf(amended as never) })
+      assert.equal(held.out.counters.dispatched, 0, shape)
+      assert.deepEqual(writes(), [], shape)
+    })
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const live = await sweep([undated], { zoneless: 'europe-london', shape, verifier: false, lowerBound: despatchLowerBoundOf({ claimHistoryTracked: true, firstClaimedAt: late, order: { createdAt: created } }) })
+      // a merged order never uses the candidate's bound: its parts come from constituent orders
+      assert.equal(live.out.counters.dispatched, shape === 'merged' ? 0 : 1, shape)
+    })
+  }
+})
+
+test('MERGED: every dispatched part is judged on its own; an empty or undated part holds the order whatever the candidate bound says', async () => {
+  const AFTER_SENT = new Date('2026-06-02T00:00:00Z')
+  const dated = (n: number, at: string): Part => part(n, at)
+  const empty = (n: number): Part => ({ ...part(n, PRE), tracking: [] })
+  const undated = (n: number): Part => ({ ...part(n, PRE), tracking: [{ trackingNumber: `TN-${n}`, carrier: 'DPD', despatchedAt: '' }] })
+  const run = async (parts: Part[]) => {
+    reset()
+    return withEnv(LIVE_AT_CUTOFF, () => sweep(parts, { zoneless: 'europe-london', shape: 'merged', verifier: false, lowerBound: AFTER_SENT }))
+  }
+  // an empty-tracking part next to a post-cutover dated part: held
+  const emptyNext = await run([dated(1, '2026-06-02T09:00:00'), empty(2)])
+  assert.deepEqual([emptyNext.out.counters.dispatched, emptyNext.applyOptions], [0, []])
+  // an undated part from an older constituent order next to a candidate first claimed after the cutover: held
+  const undatedNext = await run([dated(1, '2026-06-02T09:00:00'), undated(2)])
+  assert.deepEqual([undatedNext.out.counters.dispatched, undatedNext.applyOptions], [0, []])
+  const undatedFirst = await run([undated(1), dated(2, '2026-06-02T09:00:00')])
+  assert.equal(undatedFirst.out.counters.dispatched, 0)
+  // all parts dated after the cutover: completes normally
+  const allAfter = await run([dated(1, '2026-06-02T09:00:00'), dated(2, '2026-06-03T09:00:00')])
+  assert.deepEqual([allAfter.out.counters.dispatched, allAfter.applyOptions], [1, [undefined]])
+  // a straddling part still holds a merged order whose other parts are after
+  const straddle = await run([dated(1, '2026-06-02T09:00:00'), dated(2, '2026-06-01')])
+  assert.equal(straddle.out.counters.dispatched, 0)
 })
