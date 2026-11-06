@@ -143,6 +143,7 @@ test('after a placeholder create, an amendment names no courier again', () => {
 // --- importer side: the value read off the WooCommerce shipping line ---------------------------
 
 const line = (meta_data: unknown, method_title = EN) => ({ id: 1, method_id: 'calcurates', method_title, total: '0', total_tax: '0', taxes: [], meta_data })
+const metaEntry = (name: string, value: unknown) => ({ id: 9, key: name, value })
 const keyMeta = (value: unknown = KEY) => ({ id: 2, key: '_o3d_courier_key', value })
 const labelMeta = (value: unknown = EN) => ({ id: 3, key: '_o3d_courier_label', value })
 
@@ -173,7 +174,7 @@ test('a missing, non-string or non-matching label means no key', () => {
 
 test('absent, empty, blank, non-string and malformed meta read as no key', () => {
   for (const meta of [undefined, null, 'x', {}, [], [null, 'x', 5], [{ key: '_o3d_courier_key' }, labelMeta()], [keyMeta(''), labelMeta()],
-    [keyMeta('  '), labelMeta()], [keyMeta(5), labelMeta()], [keyMeta({ a: 1 }), labelMeta()], [{ key: '_o3d_calcurates_rate_id', value: '6384_7418' }, labelMeta()]]) {
+    [keyMeta('  '), labelMeta()], [keyMeta(5), labelMeta()], [keyMeta({ a: 1 }), labelMeta()], [metaEntry('_o3d_calcurates_rate_id', '6384_7418'), labelMeta()]]) {
     assert.equal(readWcShippingLineCourierKey(line(meta)), null, JSON.stringify(meta))
   }
   assert.equal(readWcShippingLineCourierKey(undefined), null)

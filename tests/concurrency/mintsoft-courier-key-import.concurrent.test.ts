@@ -38,6 +38,7 @@ async function loadDb() {
 }
 
 const ADDRESS = { first_name: 'A', last_name: 'B', company: '', address_1: '1 St', address_2: '', city: 'Leeds', state: '', postcode: 'LS1 1AA', country: 'GB', email: 'a@b.c', phone: '' }
+const metaEntry = (id: number, name: string, value: unknown) => ({ id, key: name, value })
 const KEY = 'calcurates:2579_1565(VAT & Duty paid)'
 const EN = 'GLS Euro Priority - 3 to 8 business days(VAT & Duty paid)'
 const DE = 'GLS Euro Priority - 3 bis 8 Werktage(VAT & Duty paid)'
@@ -66,7 +67,7 @@ test('[courier key] the shipping-line key is imported and pushed as the courier 
   const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
   const base = Math.floor(Math.random() * 1_000_000_000)
   const cases = [
-    { externalId: base + 1, title: EN, meta: [{ id: 1, key: 'delivery_date_from', value: '2026-11-09' }, { id: 2, key: '_o3d_courier_key', value: KEY }, { id: 4, key: '_o3d_courier_label', value: EN }, { id: 3, key: '_o3d_calcurates_rate_id', value: '2579_1565' }], storedKey: KEY, pushed: KEY },
+    { externalId: base + 1, title: EN, meta: [{ id: 1, key: 'delivery_date_from', value: '2026-11-09' }, { id: 2, key: '_o3d_courier_key', value: KEY }, { id: 4, key: '_o3d_courier_label', value: EN }, metaEntry(3, '_o3d_calcurates_rate_id', '2579_1565')], storedKey: KEY, pushed: KEY },
     { externalId: base + 2, title: DE, meta: [{ id: 2, key: '_o3d_courier_key', value: KEY }, { id: 4, key: '_o3d_courier_label', value: DE }], storedKey: KEY, pushed: KEY },
     { externalId: base + 3, title: EN, meta: [{ id: 1, key: 'delivery_date_from', value: '2026-11-09' }], storedKey: null, pushed: `calcurates:${EN}` },
     { externalId: base + 4, title: EN, meta: [{ id: 2, key: '_o3d_courier_key', value: '' }, { id: 4, key: '_o3d_courier_label', value: EN }], storedKey: null, pushed: `calcurates:${EN}` },
