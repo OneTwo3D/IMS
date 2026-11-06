@@ -22,3 +22,6 @@ f592b26a762a25caf541b7b0bc1706005c847225:tests/scripts/cron-bearer-rewrite-upgra
 # Test-only fake cron secret ('0123456789') for the crontab builder in the reconciliation-pack schedule tests;
 # replaced by 'sekrit' in the next commit. Not a credential.
 bb4e9ee6f7a56110612dc1402384317f821f3495:tests/ops/reconciliation-pack-schedule-cron.test.ts:generic-api-key:21
+# WooCommerce shipping-line meta fixtures (an informational rate id under a key-named property) in the first commit of the courier-key change, not secrets; later commits build them through a helper.
+2635012e0186d3d7f48dc25bc1b7d7f0e7f9508f:tests/mintsoft-courier-key.test.ts:generic-api-key:122
+2635012e0186d3d7f48dc25bc1b7d7f0e7f9508f:tests/concurrency/mintsoft-courier-key-import.concurrent.test.ts:generic-api-key:69
