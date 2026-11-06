@@ -1005,7 +1005,7 @@ test('UNDATED: no usable despatch time is live only when IMS sent the order at o
   const AFTER_SENT = new Date('2026-06-02T00:00:00Z')
   const BEFORE_SENT = new Date('2026-05-01T00:00:00Z')
   const undated = (n: number): Part => ({ ...part(n, PRE), tracking: [{ trackingNumber: `TN-${n}`, carrier: 'DPD', despatchedAt: '' }] })
-  for (const shape of ['single', 'merged'] as const) {
+  for (const shape of ['single'] as const) {
     reset()
     await withEnv(LIVE_AT_CUTOFF, async () => {
       const live = await sweep([undated(1)], { zoneless: 'europe-london', shape, verifier: false, lowerBound: AFTER_SENT })
@@ -1063,7 +1063,33 @@ test('LOWER BOUND: built from the immutable first claim and the order creation, 
     reset()
     await withEnv(LIVE_AT_CUTOFF, async () => {
       const live = await sweep([undated], { zoneless: 'europe-london', shape, verifier: false, lowerBound: despatchLowerBoundOf({ claimHistoryTracked: true, firstClaimedAt: late, order: { createdAt: created } }) })
-      assert.equal(live.out.counters.dispatched, 1, shape)
+      // a merged order never uses the candidate's bound: its parts come from constituent orders
+      assert.equal(live.out.counters.dispatched, shape === 'merged' ? 0 : 1, shape)
     })
   }
+})
+
+test('MERGED: every dispatched part is judged on its own; an empty or undated part holds the order whatever the candidate bound says', async () => {
+  const AFTER_SENT = new Date('2026-06-02T00:00:00Z')
+  const dated = (n: number, at: string): Part => part(n, at)
+  const empty = (n: number): Part => ({ ...part(n, PRE), tracking: [] })
+  const undated = (n: number): Part => ({ ...part(n, PRE), tracking: [{ trackingNumber: `TN-${n}`, carrier: 'DPD', despatchedAt: '' }] })
+  const run = async (parts: Part[]) => {
+    reset()
+    return withEnv(LIVE_AT_CUTOFF, () => sweep(parts, { zoneless: 'europe-london', shape: 'merged', verifier: false, lowerBound: AFTER_SENT }))
+  }
+  // an empty-tracking part next to a post-cutover dated part: held
+  const emptyNext = await run([dated(1, '2026-06-02T09:00:00'), empty(2)])
+  assert.deepEqual([emptyNext.out.counters.dispatched, emptyNext.applyOptions], [0, []])
+  // an undated part from an older constituent order next to a candidate first claimed after the cutover: held
+  const undatedNext = await run([dated(1, '2026-06-02T09:00:00'), undated(2)])
+  assert.deepEqual([undatedNext.out.counters.dispatched, undatedNext.applyOptions], [0, []])
+  const undatedFirst = await run([undated(1), dated(2, '2026-06-02T09:00:00')])
+  assert.equal(undatedFirst.out.counters.dispatched, 0)
+  // all parts dated after the cutover: completes normally
+  const allAfter = await run([dated(1, '2026-06-02T09:00:00'), dated(2, '2026-06-03T09:00:00')])
+  assert.deepEqual([allAfter.out.counters.dispatched, allAfter.applyOptions], [1, [undefined]])
+  // a straddling part still holds a merged order whose other parts are after
+  const straddle = await run([dated(1, '2026-06-02T09:00:00'), dated(2, '2026-06-01')])
+  assert.equal(straddle.out.counters.dispatched, 0)
 })

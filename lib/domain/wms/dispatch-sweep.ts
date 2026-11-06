@@ -1025,7 +1025,16 @@ async function reconcileSplitOrder(
   if (!recordPartials) {
     // A merged survivor completes at ORDER level with no per-part judgement above, so judge every part's time here, once.
     const cutoff = deps.storefrontCutoff?.() ?? null
-    const decision = orderLevelDespatchDecision(allTracking, deps.zonelessDespatchReading, cutoff, (deps.clock ?? (() => new Date()))(), await undatedLowerBound(deps, candidate.orderId, allTracking, cutoff))
+    // Judge EVERY dispatched part on its own, BEFORE the tracking is flattened: a part from an older constituent order with empty or
+    // undated tracking would otherwise hide behind another part's date. The candidate's own lower bound says nothing about a
+    // constituent order, so it is never used for a merged part: such a part simply holds the order.
+    if (cutoff !== null && deps.zonelessDespatchReading !== undefined) {
+      const undatedPart = dispatchedParts.find((entry) => hasUndatedDespatch(entry.tracking))
+      if (undatedPart) {
+        return { action: 'pending', reason: `Merged order held: part ${undatedPart.partNumber} has no despatch time`, unresolved: requireResolution }
+      }
+    }
+    const decision = orderLevelDespatchDecision(allTracking, deps.zonelessDespatchReading, cutoff, (deps.clock ?? (() => new Date()))(), null)
     if (decision.action === 'hold') return { action: 'pending', reason: `Merged order held: ${decision.reason}`, unresolved: requireResolution }
     mergedAlreadyCompleted = decision.storefrontAlreadyCompleted
   }
