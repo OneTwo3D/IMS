@@ -390,8 +390,43 @@ export function resolveWcOrderLevelDiscount(input: {
 // Shipping mapping
 // ---------------------------------------------------------------------------
 
+/** Meta keys on a WooCommerce shipping line: the language-independent courier key and the label it was written for. */
+export const WC_COURIER_KEY_META = '_o3d_courier_key'
+export const WC_COURIER_LABEL_META = '_o3d_courier_label'
+
+/**
+ * The language-independent courier key of a WooCommerce shipping line (`calcurates:<rateId>` plus an optional
+ * `(text)` suffix), or null when the line has none that can be trusted. WooCommerce REST v3 returns the
+ * underscore-prefixed item meta in `shipping_lines[].meta_data`.
+ *
+ * The producer stores the line's label beside the key (`_o3d_courier_label`) and clears both when the line is
+ * edited. The key is trusted ONLY when that stored label is a string equal to the line's CURRENT `method_title`
+ * exactly (a missing title reads as ""). Where a meta key repeats, the last entry wins. The key must be a non-blank
+ * string; it is trimmed and otherwise kept verbatim. Anything else reads as "no key".
+ */
+export function readWcShippingLineCourierKey(
+  line: { meta_data?: unknown; method_title?: unknown } | null | undefined,
+): string | null {
+  const meta = line?.meta_data
+  if (!Array.isArray(meta)) return null
+  let key: unknown = null
+  let snapshot: unknown = null
+  for (const entry of meta) {
+    if (!entry || typeof entry !== 'object') continue
+    const { key: name, value } = entry as { key?: unknown; value?: unknown }
+    if (name === WC_COURIER_KEY_META) key = value
+    else if (name === WC_COURIER_LABEL_META) snapshot = value
+  }
+  if (typeof key !== 'string' || !key.trim()) return null
+  const title = typeof line?.method_title === 'string' && line.method_title ? line.method_title : ''
+  if (typeof snapshot !== 'string' || snapshot !== title) return null
+  return key.trim()
+}
+
 export function mapWcShipping(order: WcFullOrder): {
   shippingService: string | null
+  courierKey: string | null
+  shippingMethodId: string | null
   shippingForeign: number
 } {
   const totalShipping = parseFloat(order.shipping_total) || 0
@@ -399,6 +434,9 @@ export function mapWcShipping(order: WcFullOrder): {
 
   return {
     shippingService: methodTitle,
+    // First shipping line only, like the label above.
+    courierKey: readWcShippingLineCourierKey(order.shipping_lines[0]),
+    shippingMethodId: order.shipping_lines[0]?.method_id || null,
     shippingForeign: roundDecimalNumber(totalShipping, 4),
   }
 }

@@ -1219,6 +1219,13 @@ async function updateExistingWcOrderCore(
       data: {
         externalOrderNumber: wcOrder.number,
         customerVatNumber: readWcCustomerVat(wcOrder),
+        // The shipping label, method id and courier key are refreshed TOGETHER from the CURRENT first shipping line (the key
+        // only while its stored label still matches the line's title, so an edited line clears it), and fill in orders imported
+        // before they were kept. Stored values only: a WMS order already created is amended by the push sweep's amendment pass,
+        // which decides what to send. A payload without shipping lines (empty or absent) leaves the last known values alone: an empty list is no evidence that the courier went away.
+        ...(Array.isArray(wcOrder.shipping_lines) && wcOrder.shipping_lines.length > 0
+          ? (({ shippingService, courierKey, shippingMethodId }) => ({ shippingService, courierKey, shippingMethodId }))(mapWcShipping(wcOrder))
+          : {}),
         // The wclc duty/tax/handling components are written ONLY when the order and its lines are created: they split
         // the fee lines stored with them (and the invoice posted from those lines), and this path rebuilds no lines.
         // Refreshing them from a later delivery would leave a split that disagrees with the lines it describes.
@@ -2787,6 +2794,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           shippingAddress: mapWcAddress(wcOrder.shipping),
           subtotalForeign,
           shippingService: shipping.shippingService,
+          courierKey: shipping.courierKey,
+          shippingMethodId: shipping.shippingMethodId,
           shippingForeign,
           taxRateName,
           taxRatePercent: taxRateValue > 0 ? taxRateValue : null,

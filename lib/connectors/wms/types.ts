@@ -406,6 +406,27 @@ export type WmsOrderPushInput = {
   comments: string | null
   /** Carrier/service name passed through for the WMS to resolve; null = WMS default. */
   courierService: string | null
+  /**
+   * Further names a courier map is consulted against, in order, after `courierService`
+   * (the combined "{method_id}:{method_title}", the bare title, the method id; empty entries are skipped).
+   */
+  courierServiceAlternates?: string[]
+  /**
+   * Set only when `courierService` is the language-independent courier key: the "{method_id}:{method_title}" form
+   * the order would be pushed with without it, for the single retry after the warehouse refuses the key.
+   */
+  courierServiceLegacy?: string | null
+  /**
+   * Set on an AMENDMENT of an order whose create fell back to the configured default courier: there is no courier name to
+   * send, the courier is the default CourierServiceId, and an amendment must not go out without one.
+   */
+  courierPlaceholder?: boolean
+  /**
+   * Set on an AMENDMENT whose link does not know which courier form the existing WMS order has (the create answered "already
+   * exists", or the link predates the form being recorded). The amendment then selects the courier like a fresh create,
+   * including its retry rules, and reports the form that succeeded.
+   */
+  courierFormUnknown?: boolean
   totalVat: number
   shippingExVat: number
   shippingVat: number
@@ -421,6 +442,13 @@ type WmsOrderPushResultBase = {
   /** True when the order's shipping service didn't resolve and the WMS fell back to a
    *  default courier — the warehouse should verify the courier before despatch. */
   courierFallback?: boolean
+  /**
+   * Which CourierService form the create ended with: NAME (the name sent first), LEGACY (the "{method_id}:{method_title}"
+   * form, after the courier key was refused) or PLACEHOLDER (the configured default courier). Persisted so a later
+   * amendment reuses it rather than re-sending a form the WMS refused. `courierFormName` is the first name tried.
+   */
+  courierForm?: 'NAME' | 'LEGACY' | 'PLACEHOLDER'
+  courierFormName?: string | null
 }
 
 /**
@@ -473,6 +501,14 @@ export type WmsOrderUpdateResult = {
   /** False when the WMS order is past NEW and can no longer be amended. */
   updated: boolean
   status: string
+  /**
+   * The courier form the amendment ended on, returned only when it is news for the link: the link's form was unknown, or a
+   * retry moved it. Persisted so later amendments reuse it. `courierFormName` is the first name tried.
+   */
+  courierForm?: 'NAME' | 'LEGACY' | 'PLACEHOLDER'
+  courierFormName?: string | null
+  /** True when the amendment ended on the configured default courier: the warehouse should confirm the courier. */
+  courierFallback?: boolean
 }
 
 /**

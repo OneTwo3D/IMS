@@ -8,6 +8,7 @@ import { MAX_ADVISORY_PENCE } from './push-total-mismatch-note'
 import { isMirroredFeeLine } from './mirrored-fee-line'
 import { reconcilePushTotals, withheldGoodsGross, withheldLineCount } from './push-total-guard'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
+import { WmsOrderUpdatePartialError, legacyCourierFormInput } from '@/lib/connectors/wms/courier-form'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { wmsCreateObligationFloor, wmsProducerHold, wmsProducerSeam } from '@/lib/connectors/wms/producer-seam'
 import type { ProducerDecisionContext } from '@/lib/security/producer-disposition'
@@ -365,6 +366,10 @@ type OrderForPush = {
   /** Fallback destination and contact details when the shipping address names no recipient. */
   billingAddress?: unknown
   shippingService: string | null
+  /** Language-independent courier key from the storefront; preferred over the label as the WMS courier service. */
+  courierKey?: string | null
+  /** The storefront shipping method id; with the label it forms the "{method_id}:{method_title}" courier name. */
+  shippingMethodId?: string | null
   subtotalForeign: unknown
   shippingForeign: unknown
   taxForeign: unknown
@@ -567,7 +572,7 @@ export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, 
 }
 
 // Fields the push payload needs; shared by the create and update passes.
-const ORDER_PUSH_SELECT = {
+export const ORDER_PUSH_SELECT = {
   id: true,
   orderNumber: true,
   externalOrderNumber: true,
@@ -578,6 +583,8 @@ const ORDER_PUSH_SELECT = {
   shippingAddress: true,
   billingAddress: true,
   shippingService: true,
+  courierKey: true,
+  shippingMethodId: true,
   subtotalForeign: true,
   shippingForeign: true,
   taxForeign: true,
@@ -607,6 +614,57 @@ export function wmsPushOrderReference(
   return order.orderNumber ?? order.externalOrderNumber ?? order.id
 }
 
+/**
+ * The courier names for an order, mirroring the storefront sync's `_map_courier`.
+ *
+ * The combined "{method_id}:{method_title}" (the title as it is when it already starts with "method_id:", the bare
+ * title when the order has no stored method id or no title, else the id) is what Mintsoft's channel mapping is keyed
+ * on. The storefront's language-independent courier key, when the order has one, is sent INSTEAD, verbatim.
+ * The courier map is consulted against: the key, then the combined form, then the bare title, then the method id.
+ */
+export function courierNamesForOrder(order: { courierKey?: string | null; shippingService: string | null; shippingMethodId?: string | null }): {
+  courierService: string | null
+  courierServiceAlternates: string[]
+  courierServiceLegacy: string | null
+} {
+  const title = order.shippingService ?? ''
+  const methodId = order.shippingMethodId ?? ''
+  const combined = methodId && title && !title.startsWith(`${methodId}:`) ? `${methodId}:${title}` : (title || methodId)
+  const key = order.courierKey?.trim() ?? ''
+  if (key) {
+    return { courierService: key, courierServiceAlternates: [combined, title, methodId].filter(Boolean), courierServiceLegacy: combined || null }
+  }
+  return { courierService: combined || null, courierServiceAlternates: [title, methodId].filter(Boolean), courierServiceLegacy: null }
+}
+
+/**
+ * Apply the courier form a link's create ended with to the input of an AMENDMENT, so it does not re-send a form the WMS
+ * refused. Only while the order still produces the same first name the create tried; a changed shipping line computes its
+ * form fresh (and the amendment applies the same one-retry rule).
+ *   LEGACY      -> the "{method_id}:{method_title}" form, not the refused key.
+ *   PLACEHOLDER -> no courier name at all (the create left the courier to the default; naming it again would re-send what
+ *                  the WMS could not resolve).
+ */
+/** The warehouse-visible note raised when an order's courier did not resolve and the default courier was used. */
+export function courierFallbackNote(shippingService: string | null | undefined): string {
+  return `IMS: shipping method '${shippingService ?? '—'}' did not map to a WMS courier, so a default courier was used. Please verify the courier before despatch.`
+}
+
+export function applyLinkCourierForm(
+  input: WmsOrderPushInput,
+  link: { courierForm?: string | null; courierFormName?: string | null },
+): WmsOrderPushInput {
+  // No recorded form (the create answered "already exists", or the link predates the form being recorded): the amendment
+  // selects like a fresh create and reports the form that works.
+  if (!link.courierForm) return { ...input, courierFormUnknown: true }
+  // The order's first courier name is not the one the recorded form was chosen for (the shipping line changed): a fresh
+  // selection, exactly as for an unknown form.
+  if ((link.courierFormName ?? null) !== input.courierService) return { ...input, courierFormUnknown: true }
+  if (link.courierForm === 'LEGACY') return legacyCourierFormInput(input) ?? input
+  if (link.courierForm === 'PLACEHOLDER') return { ...input, courierService: null, courierServiceAlternates: [], courierServiceLegacy: null, courierPlaceholder: true }
+  return input
+}
+
 export function buildPushInput(order: OrderForPush, externalWarehouseId: string): WmsOrderPushInput {
   const recipient = resolvePushRecipient(order)
   // Refuse BEFORE anything is claimed or sent: an empty street is not a destination (builds on local data only).
@@ -623,7 +681,7 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string)
     phone: recipient.phone,
     vatNumber: order.customerVatNumber,
     comments: null,
-    courierService: order.shippingService,
+    ...courierNamesForOrder(order),
     totalVat: num(order.taxForeign),
     shippingExVat: num(order.shippingForeign),
     shippingVat: 0,
@@ -662,6 +720,8 @@ type LinkWrite = {
   lastAttemptAt?: Date | null
   cancelledAt?: Date | null
   courierPending?: boolean
+  courierForm?: string | null
+  courierFormName?: string | null
   totalMismatchPence?: number | null
   dispatchFailureCount?: number
   dispatchLastError?: string | null
@@ -696,7 +756,7 @@ const RESET_DISPATCH_FAILURES = {
 export const HELD_CREATE_CURSOR_KEY = 'wms_order_push_held_create_cursor'
 
 export type WmsPushCandidate = OrderForPush & { shipFromWarehouseId: string | null; pushAttempts: number }
-export type WmsPushUpdateLink = { id: string; externalOrderId: string | null; order: OrderForPush & { shipFromWarehouseId: string | null } }
+export type WmsPushUpdateLink = { id: string; externalOrderId: string | null; courierForm?: string | null; courierFormName?: string | null; order: OrderForPush & { shipFromWarehouseId: string | null } }
 /**
  * o3d-92fu: a VALIDATION_FAILED link plus the order data the payload is rebuilt from.
  * `lastError` is carried so a re-run that fails for the SAME reason can re-stamp the
@@ -1022,8 +1082,8 @@ export async function runWmsOrderPushSweepCore(
   // Best-effort warehouse-visible note when IMS can't propagate a hold/cancel
   // because the WMS order is already past NEW. Mirrors the refund-conflict comment
   // (onetwo3d-ims-ql59); never fail the sweep on a comment error.
-  const postConflictComment = async (externalOrderId: string, comment: string, orderId?: string) => {
-    if (!connector.addOrderComment) return
+  const postConflictComment = async (externalOrderId: string, comment: string, orderId?: string): Promise<'posted' | 'failed' | 'skipped'> => {
+    if (!connector.addOrderComment) return 'skipped'
     const commentSeam = await wmsProducerSeam(connectorId, {
       operation: 'order.comment',
       subjectType: 'SalesOrder',
@@ -1033,7 +1093,7 @@ export async function runWmsOrderPushSweepCore(
     })
     if (!commentSeam.proceed) {
       shadowedCount += 1
-      return
+      return 'skipped'
     }
     try {
       await connector.addOrderComment(externalOrderId, comment, commentSeam.clearance)
@@ -1041,12 +1101,14 @@ export async function runWmsOrderPushSweepCore(
         action: 'order_comment', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: orderId ?? null, externalId: externalOrderId,
         summary: 'Warehouse-visible note posted on WMS order', after: { comment },
       })
+      return 'posted'
     } catch (error) {
       console.error('[wms-order-push] failed to post conflict comment', error)
       await audit({
         action: 'order_comment', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: orderId ?? null, externalId: externalOrderId,
         summary: 'Failed to post warehouse-visible note on WMS order', after: { comment }, error: scrubWmsError(error, 'WMS comment failed'),
       })
+      return 'failed'
     }
   }
 
@@ -1870,14 +1932,14 @@ export async function runWmsOrderPushSweepCore(
         }
         await port.upsertByOrder(
           order.id,
-          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, totalMismatchPence, ...(unverifiableError ? { lastError: unverifiableError } : {}) },
+          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...(unverifiableError ? { lastError: unverifiableError } : {}) },
           // attempts: 0 on BOTH sides (o3d-bjc.8). claimForCreate has usually
           // created the link already, so the update side is what runs — and the
           // verification budget reads this counter. Left carrying four failed
           // create attempts, a create that finally succeeded would be
           // quarantined on its FIRST transient unknown, putting a live WMS order
           // outside the update, cancel and dispatch passes.
-          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, totalMismatchPence, ...RESET_DISPATCH_FAILURES },
+          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...RESET_DISPATCH_FAILURES },
         )
         // o3d-6x66: the claim's withdrawal re-check committed BEFORE this
         // remote push, so a withdrawal landing in between still gets its order
@@ -2035,7 +2097,7 @@ export async function runWmsOrderPushSweepCore(
         if (courierPending && createdState === 'SYNCED') {
           await postConflictComment(
             push.externalOrderId,
-            `IMS: shipping method '${order.shippingService ?? '—'}' did not map to a WMS courier, so a default courier was used. Please verify the courier before despatch.`,
+            courierFallbackNote(order.shippingService),
             order.id,
           )
         }
@@ -2252,7 +2314,7 @@ export async function runWmsOrderPushSweepCore(
         if (link.courierPending) {
           await postConflictComment(
             link.externalOrderId,
-            `IMS: shipping method '${link.shippingService ?? '—'}' did not map to a WMS courier, so a default courier was used. Please verify the courier before despatch.`,
+            courierFallbackNote(link.shippingService),
             link.orderId,
           )
         }
@@ -2323,6 +2385,26 @@ export async function runWmsOrderPushSweepCore(
     // Once the destination is live, a change made before the live-from instant is shadowed by the seam on every tick without changing the
     // link, so it would sit at the head of this oldest-first bounded batch for ever. The query leaves it out (the same floor as the create
     // query). No floor (not enforced, or not live): the legacy call.
+    // An amendment that NEWLY fell back to the default courier raises the same warehouse-visible warning a create fallback
+    // does. If posting it fails, the link is kept retryable: it is not marked pushed and does not record the new form, so
+    // the order stays due and the next pass finds the fallback again and posts the warning again. Once posted, the form is
+    // recorded, so the next pass knows the order is already on the default courier and does not post it twice.
+    const settleAmendedCourier = async (
+      link: WmsPushUpdateLink,
+      applied: { courierForm?: 'NAME' | 'LEGACY' | 'PLACEHOLDER'; courierFormName?: string | null; courierFallback?: boolean },
+    ) => {
+      const warning = applied.courierFallback
+        ? await postConflictComment(link.externalOrderId!, courierFallbackNote(link.order.shippingService), link.order.id)
+        : null
+      const retryable = warning === 'failed'
+      return {
+        retryable,
+        linkFields: {
+          ...(applied.courierForm && !retryable ? { courierForm: applied.courierForm, courierFormName: applied.courierFormName ?? null } : {}),
+          ...(applied.courierFallback ? { courierPending: true } : {}),
+        } as LinkWrite,
+      }
+    }
     for (const link of await (createFloor ? port.updatableLinks(connectorId, batchSize, createFloor) : port.updatableLinks(connectorId, batchSize))) {
       const externalWarehouseId = link.order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(link.order.shipFromWarehouseId) : undefined
       if (!externalWarehouseId || !link.externalOrderId) continue
@@ -2352,11 +2434,19 @@ export async function runWmsOrderPushSweepCore(
           shadowedCount += 1
           continue
         }
-        const input = buildPushInput(link.order, externalWarehouseId)
+        const input = applyLinkCourierForm(buildPushInput(link.order, externalWarehouseId), link)
         update = await connector.updateOrder(link.externalOrderId, input, amendSeam.clearance)
+        // What the accepted order post did to the courier is settled here (form recorded, review flag, warehouse note); the same
+        // settlement runs when the item reconcile fails AFTER the post was accepted (see the catch below).
+        const settled = await settleAmendedCourier(link, update.updated ? update : {})
         // Bump pushedAt either way so we don't re-attempt until the next change;
         // a non-NEW WMS order can no longer be amended (inbound webhooks aside).
-        await port.updateLink(link.id, { pushedAt: ts, lastAttemptAt: ts, lastError: update.updated ? null : `Amendment not propagated (WMS status ${update.status})` })
+        await port.updateLink(link.id, {
+          lastAttemptAt: ts,
+          ...(settled.retryable ? {} : { pushedAt: ts }),
+          lastError: settled.retryable ? 'Courier warning not posted on the WMS order; will retry' : update.updated ? null : `Amendment not propagated (WMS status ${update.status})`,
+          ...settled.linkFields,
+        })
         if (update.updated) result.updated += 1
         await audit({
           action: 'order_update', outcome: update.updated ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,
@@ -2370,7 +2460,10 @@ export async function runWmsOrderPushSweepCore(
       } catch (error) {
         const message = scrubWmsError(error, 'WMS order update failed')
         result.failed += 1
-        await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts }).catch(() => {})
+        // The order post was accepted and the item reconcile failed: the courier on the WMS order has already changed, so its
+        // form and warning are settled now, and the link stays due (no pushedAt) for the items to be redone.
+        const partial = error instanceof WmsOrderUpdatePartialError ? await settleAmendedCourier(link, error.applied).catch(() => null) : null
+        await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts, ...(partial?.linkFields ?? {}) }).catch(() => {})
         await audit({
           action: 'order_update', outcome: update?.updated ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,
           summary: update
@@ -2914,7 +3007,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       if (!dueIds.length) return []
       return db.wmsOrderPushLink.findMany({
         where: { id: { in: dueIds } },
-        select: { id: true, externalOrderId: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, updatedAt: true } } },
+        select: { id: true, externalOrderId: true, courierForm: true, courierFormName: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, updatedAt: true } } },
       })
     },
     async revalidatableLinks(connector, boundWarehouseIds, limit, paidNotBefore) {
