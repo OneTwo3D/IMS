@@ -698,13 +698,11 @@ test(
     /**
      * ROUND 7, FINDING 2 -- a deferral reversed, because the adoption path CREATES the situation the
      * deferral assumed away. Adoption rewrites one Bom and leaves the others in place; while they are
-     * inactive that is harmless, but `replenishment-reports.ts` selects every ACTIVE BomItem whose parent
-     * is BOM-typed and has no "the claimed Bom wins" rule, so two active recipes for one product means
-     * component demand is the SUM of both. The import used to succeed and every plan double-counted,
-     * with the drift check reporting it afterwards -- observing a wrong number while it is used.
+     * inactive that is harmless, but two ACTIVE recipes for one product is an ambiguous catalogue that the
+     * cycle walk and the drift check still see. (Planning readers have since been scoped to the claimed
+     * recipe, so a stray no longer inflates a plan; the refusal stands.)
      *
-     * Refused at the import, not fixed in the readers: that keeps the reader-side change in
-     * o3d-zjsb5.30 and makes this fail closed, loudly, where a PREP phase can resolve it at source.
+     * Refused at the import: it fails closed, loudly, where a PREP phase can resolve it at source.
      */
     const deps = await loadDeps()
     const NS = 'K'
@@ -721,8 +719,8 @@ test(
       data: { bomId: duplicate.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
     })
 
-    // PRECONDITION: planning really does read BOTH, so the refusal is preventing a real wrong number and
-    // not guarding a hypothetical. This is the reader's own predicate.
+    // PRECONDITION: the cycle walk's graph (PLANNING_REACHABLE_BOM_EDGES' predicate) really does see BOTH,
+    // so the refusal is about a real ambiguity and not a hypothetical.
     const visibleToPlanning = await deps.db.bomItem.findMany({
       where: { bom: { active: true }, parentProduct: { id: tableId, type: 'BOM' } },
       select: { bomId: true },

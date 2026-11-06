@@ -225,6 +225,11 @@ type BomSyncClient = Pick<Prisma.TransactionClient, 'bom' | 'bomItem'>
  * them), so "every row in the table" is never the right graph. A walk that refuses states its reader
  * cannot reach is not being careful; it is being wrong in a direction that gets it switched off.
  *
+ * Planning now ALSO scopes to the claimed recipe (`claimed-bom.ts`). This definition deliberately
+ * stays the wider graph (any active Bom, BOM-typed parent): a cycle through a stray active duplicate
+ * is still a cycle worth refusing, and a conservative superset can only refuse more, never miss one.
+ * Retired Boms stay out of it, as before.
+ *
  * Exported so the divergence cannot come back: change the reader, change this, and all three walks
  * follow. `tests/products/bom-recipe.test.ts` asserts every walk uses it.
  */
@@ -236,11 +241,11 @@ export const PLANNING_REACHABLE_BOM_EDGES = {
 export type BomRecipeSyncOutcome =
   | { kind: 'written'; bomId: string; claimed: 'created' | 'adopted' | 'already' }
   /**
-   * Another ACTIVE Bom holds items for this same parent, so planning would read both (round 8).
-   * Refused rather than written: `replenishment-reports.ts` selects every active BomItem whose parent
-   * is BOM-typed, with no "the claimed one wins" rule, so two active recipes for one product means
-   * component demand is the SUM of both. The import succeeding there would produce a silently wrong
-   * plan, and the drift check reporting it afterwards does not stop the number being used.
+   * Another ACTIVE Bom holds items for this same parent (round 8). Refused rather than written: two
+   * active recipes for one product is an ambiguous catalogue. Planning readers now count only the
+   * CLAIMED recipe (`claimed-bom.ts`), so the stray no longer inflates a plan, but the cycle walk and
+   * the drift check still see it, and rewriting one recipe beside an unexplained second one is not a
+   * change to make silently. The operator deactivates the duplicate and retries.
    */
   | { kind: 'active-duplicates'; bomId: string; duplicateBomIds: string[] }
   | { kind: 'cycle'; path: string[] }
@@ -343,15 +348,15 @@ export async function syncBomRecipeFromProductComponents(
   //
   // Items for this parent living in some OTHER Bom are deliberately kept (a completed ProductionOrder
   // is valued through them), and while those Boms are INACTIVE that is harmless: no planning reader can
-  // traverse them, which is what PLANNING_REACHABLE_BOM_EDGES encodes. But an ACTIVE one is read
-  // alongside the claimed recipe and its quantities are ADDED, because the planning explosion has no
-  // "the claimed Bom wins" rule -- so the import would succeed while every plan for this product
-  // double-counted. Reporting that as drift afterwards does not prevent the wrong number being used.
+  // traverse them, which is what PLANNING_REACHABLE_BOM_EDGES encodes. But an ACTIVE one is walked
+  // by the cycle check alongside the claimed recipe, and is an ambiguity nobody resolved. Planning counts
+  // only the claimed recipe (claimed-bom.ts), so it would not inflate a plan, but the import still
+  // refuses rather than rewrite one recipe beside an unexplained second one.
   //
   // REFUSING, rather than deactivating them here: silently deactivating another Bom is a data change
   // nobody asked for and could be somebody's live recipe for a different parent -- these rows are
   // shared. A loud refusal naming the rows is resolvable at source, which is where catalogue problems
-  // belong. The reader-side fix (teach planning to prefer the claimed recipe) stays in o3d-zjsb5.30.
+  // belong.
   const activeDuplicates = await client.bom.findMany({
     where: {
       id: { not: bomId },
