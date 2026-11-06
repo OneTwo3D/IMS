@@ -724,38 +724,58 @@ async function notifyActiveAdmins(params: Omit<Parameters<typeof notify>[0], 'us
   await Promise.all(admins.map((admin) => notify({ ...params, userId: admin.id })))
 }
 
+const QUEUE_ROW_WRITE_ATTEMPTS = 4
+
+/** The order lock the paid-block writer holds, taken around a read-then-write of that order's queue row. An order IMS does not hold yet has no marker to lose and takes no lock. */
+async function withQueueRowLock<T>(externalOrderId: string, body: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+  return db.$transaction(async (tx) => {
+    const link = await tx.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId }, select: { orderId: true } })
+    if (link) await lockSalesOrder(tx, link.orderId)
+    return body(tx)
+  })
+}
+
+/** The conditional of a queue-row rewrite: the row still holds the payload that was read. */
+function unchangedQueueRow(id: string, readPayload: unknown): Prisma.ShoppingSyncLogWhereInput {
+  return readPayload === null || readPayload === undefined ? { id } : { id, payload: { equals: readPayload as Prisma.InputJsonValue } }
+}
+
 async function recordPendingFxOrder(
   wcOrder: WcFullOrder,
   error: { message: string; currency: string; asOf?: Date; paymentId?: string },
   retryLogId?: string,
 ): Promise<void> {
-  // THE ROW THIS REWRITES, FOUND FIRST: a row that already carries a paid-block marker (a paid order IMS still disagrees with) keeps its stored payload, marker and snapshot whole.
-  // This is the ONLY place that rewrites a pending row's payload besides the paid-block writer and the receipt writer (which retire the marker on purpose), and a rewrite from an
-  // unrelated failure (the receipt re-drive, a missing rate) must never drop the marker: the scheduled run selects marked rows by it, so a dropped marker strands the receipt. The stored
-  // snapshot is at least as new as this caller's (the paid-block writer stored the caller's own, or a newer delivery stored a newer one).
-  const targetId = retryLogId ?? (await db.shoppingSyncLog.findFirst({ where: pendingFxQueueWhere(String(wcOrder.id)), orderBy: { createdAt: 'desc' }, select: { id: true } }))?.id
-  const stored = targetId ? await db.shoppingSyncLog.findUnique({ where: { id: targetId }, select: { payload: true, status: true } }) : null
-  const keepsMarker = isQueuedWcOrderPayload(stored?.payload) && stored.payload.paidBlock !== undefined
+  // THE QUEUE ROW IS REWRITTEN UNDER THE ORDER LOCK, ON A CONDITIONAL UPDATE. The paid-block writer holds the same lock; without it this read-then-write could overwrite a marker a delivery wrote
+  // between the two (and any writer that takes no lock is caught by the conditional update: it only lands if the payload is still the one that was read, else it re-reads and merges again).
+  // A row that carries a paid-block marker keeps its stored payload, marker and snapshot whole (the stored snapshot is at least as new as this caller's), and a marked row that gave up (FAILED)
+  // is not resurrected by an unrelated failure. The scheduled run selects marked rows by the marker, so a dropped marker would strand the receipt.
   const payload = buildPendingFxOrderPayload(wcOrder, error)
-  const jsonPayload = (keepsMarker ? stored!.payload : JSON.parse(JSON.stringify(payload))) as Prisma.InputJsonValue
-  const data = {
-    connector: 'woocommerce',
-    direction: 'FROM_CONNECTOR' as const,
-    // a marked row that gave up (FAILED) is not resurrected by an unrelated failure
-    status: (keepsMarker && stored!.status === 'FAILED' ? 'FAILED' : 'PENDING') as 'PENDING' | 'FAILED',
-    entityType: 'SalesOrder',
-    externalId: String(wcOrder.id),
-    payload: jsonPayload,
-    errorMessage: error.message,
-    // for a PENDING row, syncedAt is its LAST ATTEMPT (rotation order in retryPendingWcOrdersWaitingForFx)
-    syncedAt: new Date(),
-  }
-
-  if (targetId) {
-    await db.shoppingSyncLog.update({ where: { id: targetId }, data })
-  } else {
-    await db.shoppingSyncLog.create({ data })
-  }
+  await withQueueRowLock(String(wcOrder.id), async (tx) => {
+    for (let attempt = 0; attempt < QUEUE_ROW_WRITE_ATTEMPTS; attempt++) {
+      const targetId = retryLogId ?? (await tx.shoppingSyncLog.findFirst({ where: pendingFxQueueWhere(String(wcOrder.id)), orderBy: { createdAt: 'desc' }, select: { id: true } }))?.id
+      const stored = targetId ? await tx.shoppingSyncLog.findUnique({ where: { id: targetId }, select: { payload: true, status: true } }) : null
+      const keepsMarker = isQueuedWcOrderPayload(stored?.payload) && stored.payload.paidBlock !== undefined
+      const data = {
+        connector: 'woocommerce',
+        direction: 'FROM_CONNECTOR' as const,
+        status: (keepsMarker && stored!.status === 'FAILED' ? 'FAILED' : 'PENDING') as 'PENDING' | 'FAILED',
+        entityType: 'SalesOrder',
+        externalId: String(wcOrder.id),
+        payload: (keepsMarker ? stored!.payload : JSON.parse(JSON.stringify(payload))) as Prisma.InputJsonValue,
+        errorMessage: error.message,
+        // for a PENDING row, syncedAt is its LAST ATTEMPT (rotation order in retryPendingWcOrdersWaitingForFx)
+        syncedAt: new Date(),
+      }
+      if (!targetId || !stored) {
+        await tx.shoppingSyncLog.create({ data })
+        return
+      }
+      await wcReceiptRegistrationSeams.betweenQueueReadAndWrite?.(tx)
+      const written = await tx.shoppingSyncLog.updateMany({ where: unchangedQueueRow(targetId, stored.payload), data })
+      if (written.count === 1) return
+    }
+    throw new Error(`The pending WooCommerce order row for ${wcOrder.id} kept changing while it was being rewritten`)
+  })
 
   await logActivity({
     entityType: 'SYNC',
@@ -804,22 +824,25 @@ async function markPendingFxRetryLogSynced(logId: string, orderId: string): Prom
 
 async function markPendingFxRetryLogFailed(logId: string, error: unknown): Promise<void> {
   // A ROW THAT HOLDS A PAID ORDER'S RECEIPT OBLIGATION IS NOT FAILED BY AN UNRELATED EXCEPTION (a transient database or registration error): it stays PENDING, the attempt is counted, and it
-  // is retired FAILED only when the same bound the mismatch retry has is spent. Every other row is failed as before.
-  const current = await db.shoppingSyncLog.findUnique({ where: { id: logId }, select: { payload: true, status: true } })
-  const block = isQueuedWcOrderPayload(current?.payload) ? current.payload.paidBlock : undefined
-  if (block && current?.status === 'PENDING' && block.attempts + 1 < WC_PAID_BLOCK_MAX_ATTEMPTS) {
-    const payload = JSON.parse(JSON.stringify({ ...(current.payload as object), paidBlock: { ...block, attempts: block.attempts + 1 } })) as Prisma.InputJsonValue
-    await db.shoppingSyncLog.update({ where: { id: logId }, data: { payload, errorMessage: String(error), syncedAt: new Date() } })
-    return
-  }
-  await db.shoppingSyncLog.update({
-    where: { id: logId },
-    data: {
-      status: 'FAILED',
-      errorMessage: String(error),
-      syncedAt: new Date(),
-    },
+  // is retired FAILED only when the same bound the mismatch retry has is spent, which goes through the same terminal announcement. Every other row is failed as before. The read and the
+  // write are under the order lock and conditional on the payload that was read, like every rewrite of this row.
+  const head = await db.shoppingSyncLog.findUnique({ where: { id: logId }, select: { externalId: true, payload: true } })
+  const exhausted = await withQueueRowLock(head?.externalId ?? '', async (tx) => {
+    for (let attempt = 0; attempt < QUEUE_ROW_WRITE_ATTEMPTS; attempt++) {
+      const current = await tx.shoppingSyncLog.findUnique({ where: { id: logId }, select: { payload: true, status: true } })
+      if (!current) return false
+      const block = isQueuedWcOrderPayload(current.payload) ? current.payload.paidBlock : undefined
+      const marked = block !== undefined && current.status === 'PENDING'
+      const spent = marked && block.attempts + 1 >= WC_PAID_BLOCK_MAX_ATTEMPTS
+      const data = marked && !spent
+        ? { payload: JSON.parse(JSON.stringify({ ...(current.payload as object), paidBlock: { ...block, attempts: block.attempts + 1 } })) as Prisma.InputJsonValue, errorMessage: String(error), syncedAt: new Date() }
+        : { status: 'FAILED' as const, errorMessage: spent ? `${String(error)}; gave up after ${block.attempts + 1} retries` : String(error), syncedAt: new Date() }
+      const written = await tx.shoppingSyncLog.updateMany({ where: unchangedQueueRow(logId, current.payload), data })
+      if (written.count === 1) return spent
+    }
+    throw new Error(`The pending WooCommerce order row ${logId} kept changing while it was being failed`)
   })
+  if (exhausted) await announcePaidBlockGaveUpForRow(head?.externalId ?? '', isQueuedWcOrderPayload(head?.payload) ? head.payload.externalOrderNumber : (head?.externalId ?? ''))
 }
 
 export async function isWcOrderWebhookPrimaryActive(): Promise<boolean> {
@@ -1055,7 +1078,7 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
         metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), imsCurrency: m.stored, paidCurrency: m.paid },
       })
     }
-    await announcePaidBlockGaveUp(orderId, wcOrder, m.reference, claimed.gaveUp)
+    await announcePaidBlockGaveUp(orderId, String(wcOrder.id), m.reference, claimed.gaveUp)
     return { blocked: true, gaveUp: claimed.gaveUp }
   }
   if ('mismatch' in claimed && claimed.mismatch) {
@@ -1073,7 +1096,7 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
         metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), imsTotal: m.stored, paidTotal: m.paid, currency: m.currency },
       })
     }
-    await announcePaidBlockGaveUp(orderId, wcOrder, m.reference, claimed.gaveUp)
+    await announcePaidBlockGaveUp(orderId, String(wcOrder.id), m.reference, claimed.gaveUp)
     return { blocked: true, gaveUp: claimed.gaveUp }
   }
   if (claimed.ambiguous) {
@@ -1098,8 +1121,8 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
   return { blocked: false }
 }
 
-/** The bound is reached: the row is retired FAILED, so the operator is told once, loudly, that nothing will retry it any more. */
-async function announcePaidBlockGaveUp(orderId: string, wcOrder: WcFullOrder, reference: string, gaveUp: boolean): Promise<void> {
+/** THE ONE TERMINAL PATH of a paid-block row that used up its retries, whether by mismatch retries or by exceptions: the row is retired FAILED, the operator is told once, loudly, that nothing will retry it any more. */
+async function announcePaidBlockGaveUp(orderId: string, externalOrderId: string, reference: string, gaveUp: boolean): Promise<void> {
   if (!gaveUp) return
   await logActivity({
     entityType: 'SALES_ORDER',
@@ -1107,10 +1130,16 @@ async function announcePaidBlockGaveUp(orderId: string, wcOrder: WcFullOrder, re
     action: 'wc_paid_block_retry_gave_up',
     tag: 'sync',
     level: 'ERROR',
-    description: `WooCommerce order ${reference} is paid, but IMS still disagrees with its total or currency after ${WC_PAID_BLOCK_MAX_ATTEMPTS} retries, so no receipt was recorded and the automatic retry has stopped. Bring the order into line with WooCommerce and record the payment on the order.`,
-    metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) },
+    description: `WooCommerce order ${reference} is paid, but IMS still disagrees with its total or currency (or the retry kept failing) after ${WC_PAID_BLOCK_MAX_ATTEMPTS} retries, so no receipt was recorded and the automatic retry has stopped. Bring the order into line with WooCommerce and record the payment on the order.`,
+    metadata: { connector: 'woocommerce', externalOrderId },
   })
   await notifyActiveAdmins({ type: 'error', title: 'WooCommerce paid order has no receipt', message: `Order ${reference} is paid in WooCommerce but IMS could not record the receipt and stopped retrying. Record the payment on the order.`, actionUrl: `/sales/${orderId}` }).catch(() => undefined)
+}
+
+/** The same announcement for a row that gave up on the exception path, where only the WooCommerce order id is in hand. */
+async function announcePaidBlockGaveUpForRow(externalOrderId: string, reference: string): Promise<void> {
+  const link = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId }, select: { orderId: true } })
+  if (link) await announcePaidBlockGaveUp(link.orderId, externalOrderId, reference, true)
 }
 
 /** The three mirrored wclc duty/tax/handling components as SalesOrder columns (null = the order carries none). */

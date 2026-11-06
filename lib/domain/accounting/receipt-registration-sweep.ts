@@ -55,6 +55,8 @@ export const receiptRegistrationSeams: {
   afterReceiptCommit?: (orderId: string) => Promise<void>
   /** Runs at the start of the receipt re-drive that closes every paid update (a test fails it to show the paid-block row survives). */
   beforeRedrive?: (orderId: string) => Promise<void>
+  /** Runs inside a pending-row rewrite, after it read the row and before it writes (a race test lands another writer here). `tx` is the rewrite's transaction. */
+  betweenQueueReadAndWrite?: (tx: unknown) => Promise<void>
   insideReceiptTransaction?: () => Promise<void>
 } = { obligationIsOnRecord: receiptObligationIsOnRecord }
 

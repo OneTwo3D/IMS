@@ -6,6 +6,7 @@
 import assert from 'node:assert/strict'
 import test, { after, before, mock } from 'node:test'
 import { startScratch, type Scratch } from '../../first-load/apply-scratch'
+import { backendPid, waitUntilParkedBehind } from '../../helpers/lock-wait-observer'
 
 mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {} } })
 mock.module('@/lib/shopping', { namedExports: { enqueueStockSync: async () => {} } })
@@ -221,4 +222,62 @@ test('an exception while replaying a marked row keeps it PENDING and counts the 
   } finally { seams.afterPlan = undefined }
   row = (await rows(o.wcId))[0]!
   assert.equal(row.status, 'FAILED')
+  // exhaustion on the exception path goes through the SAME terminal announcement as the mismatch path
+  const finding = await s.db.activityLog.findMany({ where: { entityId: o.id, action: 'wc_paid_block_retry_gave_up' } })
+  assert.equal(finding.length, 1, 'the operator is told')
+  assert.equal(finding[0]!.level, 'ERROR')
+  assert.match(row.errorMessage ?? '', /gave up/)
+})
+
+async function unmarkedQueueRow(o: { id: string; wcId: number }) {
+  const unpaid = { ...(payload(o.wcId, '100.00') as object), date_paid_gmt: null }
+  return s.db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', externalId: String(o.wcId), payload: { reason: 'missing_fx_rate', connector: 'woocommerce', externalOrderId: String(o.wcId), externalOrderNumber: String(o.wcId), currency: 'GBP', asOf: null, order: unpaid } } })
+}
+
+// [mutation: drop the order lock around the queue-row rewrite]
+test('RACE (lock): a rewrite of an UNMARKED queue row holds the order lock between its read and its write; a webhook writing the marker waits for it and the marker survives', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const seams = (await import('@/lib/domain/accounting/receipt-registration-sweep')).receiptRegistrationSeams
+  const o = await heldOrder()
+  const log = await unmarkedQueueRow(o)
+  let armed = true
+  let webhook: Promise<unknown> | undefined
+  seams.beforeRedrive = async () => { throw new Error('re-drive failed, so the row is rewritten') }
+  seams.betweenQueueReadAndWrite = async (tx) => {
+    if (!armed) return
+    armed = false
+    const holder = await backendPid(tx as never)
+    seams.beforeRedrive = undefined
+    webhook = oi.importWcOrder(payload(o.wcId, '120.00'), {}) // a paid delivery that disagrees: writes the marker under the order lock
+    await waitUntilParkedBehind(s.db, { holderPid: holder, waitingOn: /sales_orders/i, describe: 'paid-block writer behind the queue-row rewrite\'s order lock' })
+  }
+  try {
+    await oi.importWcOrder({ ...(payload(o.wcId, '100.00') as object), date_paid_gmt: null } as never, { pendingFxRetryLogId: log.id, receiptPaymentId: 'p-x' })
+    await webhook
+  } finally { seams.beforeRedrive = undefined; seams.betweenQueueReadAndWrite = undefined }
+  const all = await rows(o.wcId)
+  assert.equal(all.length, 1)
+  assert.equal(paidBlock(all[0]!)?.kind, 'total', 'the marker the webhook wrote survived the rewrite')
+})
+
+// [mutation: drop the conditional on the rewrite (WHERE the payload is still the one read)]
+test('RACE (conditional): a writer that takes NO lock lands the marker between the rewrite\'s read and write; the rewrite re-reads, merges and keeps it', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const seams = (await import('@/lib/domain/accounting/receipt-registration-sweep')).receiptRegistrationSeams
+  const o = await heldOrder()
+  const log = await unmarkedQueueRow(o)
+  let armed = true
+  seams.beforeRedrive = async () => { throw new Error('re-drive failed, so the row is rewritten') }
+  seams.betweenQueueReadAndWrite = async () => {
+    if (!armed) return
+    armed = false
+    const row = await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: log.id } })
+    await s.db.shoppingSyncLog.update({ where: { id: log.id }, data: { payload: { ...(row.payload as object), paidBlock: { kind: 'total', attempts: 0, firstAt: '2026-10-01T00:00:00.000Z' } } } })
+  }
+  try {
+    await oi.importWcOrder({ ...(payload(o.wcId, '100.00') as object), date_paid_gmt: null } as never, { pendingFxRetryLogId: log.id, receiptPaymentId: 'p-x' })
+  } finally { seams.beforeRedrive = undefined; seams.betweenQueueReadAndWrite = undefined }
+  const row = (await rows(o.wcId))[0]!
+  assert.equal(paidBlock(row)?.kind, 'total', 'the marker written meanwhile was not overwritten')
+  assert.equal(row.status, 'PENDING')
 })
