@@ -325,11 +325,15 @@ test('every Xero money-moving key resolves its source through the settlement, fa
 
   for (const op of MONEY_MOVING_XERO_OPS) {
     assert.ok(
-      source.includes(`xeroMoneyPostIdempotencyKey(entryId, '${MONEY_MOVING_XERO_TYPES[op]}', payload, '${op}')`),
-      `expected a '${op}' idempotency key to be built through the money-post key helper`,
+      source.includes(`resolveXeroMoneyPostIdempotencyKey(db, { entryId, type: '${MONEY_MOVING_XERO_TYPES[op]}', payload, operation: '${op}' })`),
+      `expected a '${op}' idempotency key to be resolved through the money-post key resolver`,
     )
     assert.equal(xeroKeyCalls(source, op).length, 0, `'${op}' must not be built from the row directly any more`)
   }
+  assert.ok(
+    source.includes('const legacy = buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), operation)'),
+    'the resolver\'s legacy derivation (a row not proven never to have attempted) is the follow-up token',
+  )
   assert.match(
     moneyKeyHelperBody(source),
     /documentSource \?\? followUpIdempotencySource\(\s*entryId\s*,\s*payload\s*\)/,

@@ -120,7 +120,9 @@ import {
 } from '@/lib/domain/accounting/sync-row-settlement'
 import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
-import { moneyPostIdempotencySource } from '@/lib/domain/accounting/money-post-document'
+import { MONEY_POST_KEY_FIELD, countReversedEpisodes, moneyPostIdempotencySource, settlementDocumentAnchorFilters } from '@/lib/domain/accounting/money-post-document'
+import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
+import { attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
 import { marksOfOtherPayments } from '@/lib/domain/accounting/payment-identity-marks'
 import { loadOperatorLedgerChecks } from '@/lib/domain/accounting/operator-ledger-check-store'
 import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
@@ -339,17 +341,73 @@ export function buildXeroIdempotencyKey(entryId: string, operation: string, payl
 }
 
 /**
- * The Idempotency-Key of a money-moving post (payment, bill payment, credit-note allocation).
- *
- * Derived from the DOCUMENT and the settlement (`moneyPostIdempotencySource`), not from the sync row, so
- * two rows posting the same payment (the pair the money-post lock exists to keep apart, and the pair a
- * lost lock connection lets through together) carry ONE key and Xero answers the second with the first's
- * result instead of creating a second payment. Falls back to the row's own follow-up token or id,
- * unchanged, whenever the document's identity cannot be stated.
+ * The Idempotency-Key a money-moving post would carry for a row that has never attempted, as a pure function: derived from the settlement
+ * (`moneyPostIdempotencySource`: document, amount, receipt, reversal episode), not from the sync row. Falls back to the row's own follow-up
+ * token or id whenever the settlement's identity cannot be stated.
  */
-export function xeroMoneyPostIdempotencyKey(entryId: string, type: string, payload: SyncPayload, operation: string): string {
-  const documentSource = moneyPostIdempotencySource(type, payload)
+export function xeroMoneyPostIdempotencyKey(entryId: string, type: string, payload: SyncPayload, operation: string, episode = 0): string {
+  const documentSource = moneyPostIdempotencySource(type, payload, episode)
   return buildXeroIdempotencyKey(documentSource ?? followUpIdempotencySource(entryId, payload), operation)
+}
+
+type MoneyKeyClient = Pick<Prisma.TransactionClient, 'accountingSyncLog' | '$executeRaw'>
+
+/**
+ * THE KEY A MONEY ROW USES, DECIDED ONCE AND WRITTEN DOWN BEFORE THE FIRST REMOTE ATTEMPT.
+ *
+ * Resolved BEFORE the fence that stamps the attempt, so the row still says whether anything left it:
+ *   - a key already stored on the row is returned unchanged, on every later attempt, whichever build wrote it;
+ *   - a row not PROVEN never to have attempted (an old build may have a payment in flight under the row-token key during a rolling deploy)
+ *     keeps the legacy row-token derivation, so the two builds send the same key;
+ *   - a row proven never to have attempted gets the settlement-derived key, with the reversal episode counted from the ledger-verified
+ *     reversals of the same settlement, so a repayment after a proven reversal is a new request.
+ * The decision is persisted with a write-once update; if another writer won, theirs is read back and used.
+ */
+export async function resolveXeroMoneyPostIdempotencyKey(
+  client: MoneyKeyClient,
+  params: { entryId: string; type: string; payload: SyncPayload; operation: string },
+): Promise<string> {
+  const { entryId, type, payload, operation } = params
+  const legacy = buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), operation)
+  const row = await client.accountingSyncLog.findUnique({
+    where: { id: entryId },
+    select: { payload: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true },
+  })
+  if (!row) return legacy
+  const storedOf = (value: unknown): string | null => {
+    const v = value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>)[MONEY_POST_KEY_FIELD] : undefined
+    return typeof v === 'string' && v.trim() !== '' ? v : null
+  }
+  const stored = storedOf(row.payload)
+  if (stored) return stored
+
+  let key = legacy
+  if (attemptProvenNeverMade(row)) {
+    const anchorFilters = settlementDocumentAnchorFilters(type, payload)
+    let episode = 0
+    if (anchorFilters.length > 0) {
+      const reversed = await client.accountingSyncLog.findMany({
+        where: {
+          connector: XERO_CONNECTOR,
+          type: type as AccountingSyncType,
+          status: 'CANCELLED',
+          settlementBasis: VERIFIED_REVERSAL_SETTLEMENT_BASIS,
+          OR: anchorFilters.map((filter) => ({ payload: filter })),
+        },
+        select: { payload: true },
+      })
+      episode = countReversedEpisodes(type, payload, reversed)
+    }
+    const documentSource = moneyPostIdempotencySource(type, payload, episode)
+    if (documentSource) key = buildXeroIdempotencyKey(documentSource, operation)
+  }
+
+  await client.$executeRaw`
+    UPDATE accounting_sync_logs
+       SET payload = jsonb_set(COALESCE(payload, '{}'::jsonb), ARRAY[${MONEY_POST_KEY_FIELD}]::text[], to_jsonb(${key}::text))
+     WHERE id = ${entryId} AND (payload ->> ${MONEY_POST_KEY_FIELD}) IS NULL`
+  const after = await client.accountingSyncLog.findUnique({ where: { id: entryId }, select: { payload: true } })
+  return storedOf(after?.payload) ?? key
 }
 
 /**
@@ -6367,6 +6425,7 @@ export async function processClaimedEntry(
       // itself depends on. Round 4: the read and the post are inside one per-document lock, so a
       // competing row cannot slip its own post between them — the post is the callback for
       // exactly that reason.
+      const moneyPostKey = await resolveXeroMoneyPostIdempotencyKey(db, { entryId, type: 'INVOICE_PAYMENT', payload, operation: 'invoice-payment' })
       return postMoneyUnderLedgerFence({
         connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
         // o3d-llyw: a receipt's post honours an operator ledger check recorded for a contender and THIS
@@ -6415,7 +6474,7 @@ export async function processClaimedEntry(
             // Idempotency-Key is built from, so every attempt of this settlement carries one mark.
             Reference: settlementMarkerFor(followUpIdempotencySource(entryId, payload)),
           }, {
-            idempotencyKey: xeroMoneyPostIdempotencyKey(entryId, 'INVOICE_PAYMENT', payload, 'invoice-payment'),
+            idempotencyKey: moneyPostKey,
             // o3d-llyw: when the fence's authorisation rested on an operator ledger check, the POST must be
             // built from the connection that check was validated against, or it is not sent.
             ...(requireConnection ? { requireConnection } : {}),
@@ -6563,6 +6622,7 @@ export async function processClaimedEntry(
       // itself depends on. Round 4: the read and the post are inside one per-document lock, so a
       // competing row cannot slip its own post between them — the post is the callback for
       // exactly that reason.
+      const moneyPostKey = await resolveXeroMoneyPostIdempotencyKey(db, { entryId, type: 'BILL_PAYMENT', payload, operation: 'bill-payment' })
       return postMoneyUnderLedgerFence({
         connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
         // The date this post is SENDING, carried rather than re-resolved (round 7, Codex HIGH #1):
@@ -6594,7 +6654,7 @@ export async function processClaimedEntry(
             // will look for on the bank reconciliation. See INVOICE_PAYMENT above for the mark.
             Reference: [payload.reference as string | undefined, settlementMarkerFor(followUpIdempotencySource(entryId, payload))]
               .filter(Boolean).join(' '),
-          }, { idempotencyKey: xeroMoneyPostIdempotencyKey(entryId, 'BILL_PAYMENT', payload, 'bill-payment') })
+          }, { idempotencyKey: moneyPostKey })
           if (!paymentRes.ok) {
             return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
           }
@@ -6692,6 +6752,7 @@ export async function processClaimedEntry(
       // itself depends on. Round 4: the read and the post are inside one per-document lock, so a
       // competing row cannot slip its own post between them — the post is the callback for
       // exactly that reason.
+      const moneyPostKey = await resolveXeroMoneyPostIdempotencyKey(db, { entryId, type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', payload, operation: 'purchase-credit-note-allocation' })
       return postMoneyUnderLedgerFence({
         connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
         // The date this post is SENDING, carried rather than re-resolved (round 7, Codex HIGH #1):
@@ -6707,7 +6768,7 @@ export async function processClaimedEntry(
         if (!fence.ok) return fence.result
         const result = await allocatePurchaseCreditNote(
           { creditNoteId, invoiceId: accountingInvoiceId, amount, date: allocationDate },
-          { idempotencyKey: xeroMoneyPostIdempotencyKey(entryId, 'PURCHASE_CREDIT_NOTE_ALLOCATION', payload, 'purchase-credit-note-allocation') },
+          { idempotencyKey: moneyPostKey },
         )
         // No externalId to back-reference — the allocation is a sub-resource of the
         // credit note, not a standalone document.

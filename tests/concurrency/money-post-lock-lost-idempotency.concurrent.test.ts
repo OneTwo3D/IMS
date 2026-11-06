@@ -67,7 +67,7 @@ async function deps() {
     db, postMoneyUnderLedgerFence: probe.postMoneyUnderLedgerFence, settlementMarkerFor: evidence.settlementMarkerFor,
     effectiveTokenFor: retry.effectiveTokenFor, moneyPostDocumentLockId: doc.moneyPostDocumentLockId, settlementDocumentKey: doc.settlementDocumentKey,
     namespace: lockIds.ACCOUNTING_MONEY_POST_LOCK_NAMESPACE, buildXeroIdempotencyKey: processor.buildXeroIdempotencyKey,
-    xeroMoneyPostIdempotencyKey: processor.xeroMoneyPostIdempotencyKey,
+    resolveXeroMoneyPostIdempotencyKey: processor.resolveXeroMoneyPostIdempotencyKey,
   }
 }
 type Deps = Awaited<ReturnType<typeof deps>>
@@ -106,28 +106,30 @@ async function queuedRow(d: Deps, s: Seed, paymentId: string, amount: number, ge
     _followUpIdempotencyKey: `followup:xero:INVOICE_PAYMENT:SalesOrder:${s.orderId}:${generation}`,
   }
   const row = await d.db.accountingSyncLog.create({
-    data: { connector: 'xero', type: 'INVOICE_PAYMENT', status: 'PENDING', referenceType: 'SalesOrder', referenceId, payload },
+    data: { connector: 'xero', type: 'INVOICE_PAYMENT', status: 'PENDING', referenceType: 'SalesOrder', referenceId, payload, attemptStampingCustodyAt: new Date() },
     select: { id: true },
   })
   return { id: row.id, referenceId, payload }
 }
 
-type KeyOf = (d: Deps, row: Row) => string
+type KeyOf = (d: Deps, row: Row) => string | Promise<string>
 
 /** The production post, minus the transport: the fence with the real lock, the request keyed by `keyOf`, answered by the remote double. */
-function attempt(d: Deps, s: Seed, row: Row, keyOf: KeyOf, inFlight?: { entered: () => void; gate: Promise<void> }) {
+async function attempt(d: Deps, s: Seed, row: Row, keyOf: KeyOf, inFlight?: { entered: () => void; gate: Promise<void> }) {
+  // resolved before the fence, as the processor does
+  const key = await keyOf(d, row)
   return d.postMoneyUnderLedgerFence({
     connector: 'xero', entryId: row.id, type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: row.referenceId,
     payload: row.payload, postingDate: String(row.payload.paymentDate), db: d.db as never,
   }, async () => {
     if (inFlight) { inFlight.entered(); await inFlight.gate }
     const mark = d.settlementMarkerFor(d.effectiveTokenFor('xero', { id: row.id, payload: row.payload }))
-    const res = remotePost(s.invoiceId, keyOf(d, row), Number(row.payload.amount), mark)
+    const res = remotePost(s.invoiceId, key, Number(row.payload.amount), mark)
     return { success: true, externalId: res.PaymentID }
   })
 }
 
-const documentKeyOf: KeyOf = (d, row) => d.xeroMoneyPostIdempotencyKey(row.id, 'INVOICE_PAYMENT', row.payload, 'invoice-payment')
+const documentKeyOf: KeyOf = (d, row) => d.resolveXeroMoneyPostIdempotencyKey(d.db as never, { entryId: row.id, type: 'INVOICE_PAYMENT', payload: row.payload, operation: 'invoice-payment' })
 const rowKeyOf: KeyOf = (d, row) => d.buildXeroIdempotencyKey(row.id, 'invoice-payment')
 
 /** Terminate the backend holding `row`'s document lock - exactly what a dropped connection does to a session advisory lock. */
@@ -174,7 +176,7 @@ test('a lost money-post lock does not make a second payment when the connector k
       const pay = await receipt(d, s.orderId, 100)
       const a = await queuedRow(d, s, pay, 100, `A${round}`)
       const b = await queuedRow(d, s, pay, 100, `B${round}`, `${s.orderId}-b`)
-      assert.equal(documentKeyOf(d, a), documentKeyOf(d, b), 'PRECONDITION: the two rows send one key')
+      assert.equal(await documentKeyOf(d, a), await documentKeyOf(d, b), 'PRECONDITION: the two rows send one key')
       const { outcomeA, outcomeB } = await lostLockInterleaving(d, s, a, b, documentKeyOf)
       assert.equal(outcomeB.success, true, `B posts: ${JSON.stringify(outcomeB)}`)
       assert.equal(ledger.get(s.invoiceId)!.length, 1, `round ${round}: the remote holds ONE payment (A: ${JSON.stringify(outcomeA).slice(0, 160)})`)
@@ -198,7 +200,7 @@ test('a lost money-post lock does not make a second payment when the connector k
     const bal = await receipt(d, s.orderId, 60)
     const a = await queuedRow(d, s, dep, 40, 'A')
     const b = await queuedRow(d, s, bal, 60, 'B', `${s.orderId}-b`)
-    assert.notEqual(documentKeyOf(d, a), documentKeyOf(d, b))
+    assert.notEqual(await documentKeyOf(d, a), await documentKeyOf(d, b))
     const { outcomeB } = await lostLockInterleaving(d, s, a, b, documentKeyOf)
     assert.equal(outcomeB.success, true, JSON.stringify(outcomeB))
     assert.equal(ledger.get(s.invoiceId)!.length, 2)

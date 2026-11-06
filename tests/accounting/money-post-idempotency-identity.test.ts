@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
-import { moneyPostIdempotencySource } from '@/lib/domain/accounting/money-post-document'
+import { countReversedEpisodes, moneyPostIdempotencySource } from '@/lib/domain/accounting/money-post-document'
 import { buildXeroIdempotencyKey, xeroMoneyPostIdempotencyKey } from '@/lib/connectors/xero/sync-processor'
 
 /**
@@ -91,16 +91,37 @@ test('a type, an operation and a document never share a key', () => {
   assert.equal(moneyPostIdempotencySource('SALES_INVOICE', same), null, 'a non-money type is never keyed by the document')
 })
 
-test('WIRING: every Xero money post sends the document-derived key, and none builds it from the row any more', async () => {
+test('the reversal episode is part of the identity: retries of one episode share a key, the next episode after a proven reversal does not', () => {
+  const bill = { accountingInvoiceId: 'BILL-1', bankAccountId: 'BANK', amount: 250 }
+  const first = xeroMoneyPostIdempotencyKey('r1', 'BILL_PAYMENT', bill, 'bill-payment', 0)
+  assert.equal(first, xeroMoneyPostIdempotencyKey('r2', 'BILL_PAYMENT', bill, 'bill-payment', 0), 'two rows of one episode')
+  assert.equal(first, xeroMoneyPostIdempotencyKey('r1', 'BILL_PAYMENT', bill, 'bill-payment'), 'episode defaults to the first')
+  const repaid = xeroMoneyPostIdempotencyKey('r3', 'BILL_PAYMENT', bill, 'bill-payment', 1)
+  assert.notEqual(first, repaid, 'the same bill, the same amount, after a proven reversal')
+  assert.notEqual(repaid, xeroMoneyPostIdempotencyKey('r3', 'BILL_PAYMENT', bill, 'bill-payment', 2))
+  for (const [type, payload] of [['INVOICE_PAYMENT', invoice()], ['PURCHASE_CREDIT_NOTE_ALLOCATION', { accountingInvoiceId: 'B', creditNoteId: 'C', amount: 3 }]] as const) {
+    assert.notEqual(moneyPostIdempotencySource(type, payload, 0), moneyPostIdempotencySource(type, payload, 1), type)
+  }
+})
+
+test('countReversedEpisodes counts only reversed registrations of the SAME settlement', () => {
+  const bill = { accountingInvoiceId: 'BILL-1', amount: 250 }
+  assert.equal(countReversedEpisodes('BILL_PAYMENT', bill, []), 0)
+  assert.equal(countReversedEpisodes('BILL_PAYMENT', bill, [{ payload: { accountingInvoiceId: 'bill-1', amount: 250 } }, { payload: { accountingInvoiceId: 'BILL-2' } }]), 1)
+  const pay = invoice()
+  const rows = [{ payload: invoice({ paymentId: 'PAY-1' }) }, { payload: invoice({ paymentId: 'PAY-2' }) }, { payload: invoice({ accountingInvoiceId: 'INV-9' }) }]
+  assert.equal(countReversedEpisodes('INVOICE_PAYMENT', pay, rows), 1, 'another receipt\'s reversal is not this settlement\'s episode')
+})
+
+test('WIRING: every Xero money post sends the stored/resolved key, and none builds it from the row at the call site', async () => {
   const source = await readFile(new URL('../../lib/connectors/xero/sync-processor.ts', import.meta.url), 'utf8')
   for (const [type, operation] of [['INVOICE_PAYMENT', 'invoice-payment'], ['BILL_PAYMENT', 'bill-payment'], ['PURCHASE_CREDIT_NOTE_ALLOCATION', 'purchase-credit-note-allocation']]) {
-    assert.ok(
-      source.includes(`xeroMoneyPostIdempotencyKey(entryId, '${type}', payload, '${operation}')`),
-      `the ${type} post sends the settlement's key`,
-    )
-    assert.ok(
-      !source.includes(`buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), '${operation}')`),
-      `the ${type} post does not key on the row`,
-    )
+    const resolve = `resolveXeroMoneyPostIdempotencyKey(db, { entryId, type: '${type}', payload, operation: '${operation}' })`
+    const at = source.indexOf(resolve)
+    assert.ok(at > 0, `the ${type} branch resolves its key`)
+    // resolved BEFORE the fence call, which is what stamps the attempt
+    assert.ok(source.indexOf('return postMoneyUnderLedgerFence({', at) > at && source.indexOf('return postMoneyUnderLedgerFence({', at) - at < 200, `${type}: resolved immediately before the fence`)
+    assert.ok(!source.includes(`buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), '${operation}')`), `the ${type} post does not key on the row`)
   }
+  assert.equal(source.split('idempotencyKey: moneyPostKey').length - 1, 3)
 })
