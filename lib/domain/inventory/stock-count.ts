@@ -129,7 +129,7 @@ export function describeStockCountDrift(drift: StockCountDrift[]): string {
     ? `${d.sku}: not reconciled (on hand now ${d.currentOnHand}, counted ${d.countedQty}, variance ${d.revisedVariance})`
     : `${d.sku}: was ${d.earlierOnHand}, now ${d.currentOnHand}, counted ${d.countedQty}, revised variance ${d.revisedVariance}`)
   return `Nothing was posted: stock has moved since this count was reconciled (or it was never reconciled) for ${drift.length} product(s). `
-    + `${parts.join('; ')}. Reconcile the count to refresh these lines to current figures and authorise again, or investigate first. Counts are preserved.`
+    + `${parts.join('; ')}. These lines need fresh figures before the count can be authorised, or the movement needs looking into first. Counts are preserved.`
 }
 
 /** Stock-count reference, e.g. SC-20260624-AB12. */

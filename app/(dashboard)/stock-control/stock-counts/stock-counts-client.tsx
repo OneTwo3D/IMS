@@ -291,7 +291,7 @@ function StockCountRowView({
                   {pending ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Save counts'}
                 </Button>
                 <Button size="sm" variant="outline" disabled={pending} onClick={() => run(() => reconcileStockCount({ countId: count.id, counts: buildCounts() }), 'Counts reconciled against current stock.')}>
-                  {count.reconciledAt ? 'Reconcile again' : 'Reconcile'}
+                  {count.reconciledAt ? 'Refresh reconciliation' : 'Reconcile'}
                 </Button>
                 <Select value={reasonId} onChange={(e) => setReasonId(e.target.value)} className="h-8 text-xs w-48">
                   <option value="">Variance reason (optional)</option>
