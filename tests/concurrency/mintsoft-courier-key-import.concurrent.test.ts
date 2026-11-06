@@ -148,6 +148,10 @@ test('[courier key] a later delivery refreshes label, method id and key together
   await updateExistingWcOrderFromPayload(orderId, payload(externalId, wcRateId, DE, [{ id: 2, key: '_o3d_courier_key', value: 'calcurates:1_1' }, { id: 4, key: '_o3d_courier_label', value: DE }]) as never)
   assert.deepEqual(await read(), { shippingService: DE, courierKey: 'calcurates:1_1', shippingMethodId: 'calcurates' })
 
+  // A delivery carrying NO shipping lines is no evidence the courier went away: the last known values stay.
+  await updateExistingWcOrderFromPayload(orderId, { ...payload(externalId, wcRateId, DE, []), shipping_lines: [] } as never)
+  assert.deepEqual(await read(), { shippingService: DE, courierKey: 'calcurates:1_1', shippingMethodId: 'calcurates' })
+
   // An order imported before the columns existed is populated by the next delivery.
   await db.salesOrder.update({ where: { id: orderId }, data: { courierKey: null, shippingMethodId: null } })
   await updateExistingWcOrderFromPayload(orderId, payload(externalId, wcRateId, EN, [{ id: 2, key: '_o3d_courier_key', value: KEY }, { id: 4, key: '_o3d_courier_label', value: EN }]) as never)

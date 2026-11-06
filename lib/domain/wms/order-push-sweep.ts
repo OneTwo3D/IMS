@@ -649,7 +649,10 @@ export function applyLinkCourierForm(
   input: WmsOrderPushInput,
   link: { courierForm?: string | null; courierFormName?: string | null },
 ): WmsOrderPushInput {
-  if (!link.courierForm || (link.courierFormName ?? null) !== input.courierService) return input
+  // No recorded form (the create answered "already exists", or the link predates the form being recorded): the amendment
+  // selects like a fresh create and reports the form that works.
+  if (!link.courierForm) return { ...input, courierFormUnknown: true }
+  if ((link.courierFormName ?? null) !== input.courierService) return input
   if (link.courierForm === 'LEGACY') return legacyCourierFormInput(input) ?? input
   if (link.courierForm === 'PLACEHOLDER') return { ...input, courierService: null, courierServiceAlternates: [], courierServiceLegacy: null, courierPlaceholder: true }
   return input
@@ -2406,7 +2409,10 @@ export async function runWmsOrderPushSweepCore(
         update = await connector.updateOrder(link.externalOrderId, input, amendSeam.clearance)
         // Bump pushedAt either way so we don't re-attempt until the next change;
         // a non-NEW WMS order can no longer be amended (inbound webhooks aside).
-        await port.updateLink(link.id, { pushedAt: ts, lastAttemptAt: ts, lastError: update.updated ? null : `Amendment not propagated (WMS status ${update.status})` })
+        await port.updateLink(link.id, {
+          pushedAt: ts, lastAttemptAt: ts, lastError: update.updated ? null : `Amendment not propagated (WMS status ${update.status})`,
+          ...(update.updated && update.courierForm ? { courierForm: update.courierForm, courierFormName: update.courierFormName ?? null } : {}),
+        })
         if (update.updated) result.updated += 1
         await audit({
           action: 'order_update', outcome: update.updated ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,

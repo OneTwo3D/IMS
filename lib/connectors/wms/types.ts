@@ -421,6 +421,12 @@ export type WmsOrderPushInput = {
    * send, the courier is the default CourierServiceId, and an amendment must not go out without one.
    */
   courierPlaceholder?: boolean
+  /**
+   * Set on an AMENDMENT whose link does not know which courier form the existing WMS order has (the create answered "already
+   * exists", or the link predates the form being recorded). The amendment then selects the courier like a fresh create,
+   * including its retry rules, and reports the form that succeeded.
+   */
+  courierFormUnknown?: boolean
   totalVat: number
   shippingExVat: number
   shippingVat: number
@@ -495,6 +501,12 @@ export type WmsOrderUpdateResult = {
   /** False when the WMS order is past NEW and can no longer be amended. */
   updated: boolean
   status: string
+  /**
+   * The courier form the amendment ended on, returned only when it is news for the link: the link's form was unknown, or a
+   * retry moved it. Persisted so later amendments reuse it. `courierFormName` is the first name tried.
+   */
+  courierForm?: 'NAME' | 'LEGACY' | 'PLACEHOLDER'
+  courierFormName?: string | null
 }
 
 /**

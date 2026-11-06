@@ -242,6 +242,9 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   // request (the courier-fallback PUT) after an earlier one was sent is not "nothing sent": the earlier
   // PUT may have created the order. Its text is converted so nothing downstream reads it as a hold.
   let anyCreateSent = false
+  // Set when the order bound is one that ALREADY existed (a reconciled maybe-sent create, or an "already exists" answer): which
+  // courier form it carries is then unknown, not the form this run attempted.
+  let boundExisting = false
   const createOrReconcile = async (payload: Record<string, unknown>) => {
     try {
       const result = await createOrder(payload)
@@ -274,6 +277,7 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
         : null
       if (!existing || !existingId) throw error
       // Bound as a MINTED-BUT-UNVERIFIED id (PENDING_VERIFY): the scoped verification read still runs.
+      boundExisting = true
       return { ok: true, data: { Success: true, OrderId: existingId, OrderNumber: toStr(existing.OrderNumber) } as RawOrder, message: null }
     }
   }
@@ -334,9 +338,8 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
         externalOrderId,
         externalOrderNumber: toStr(created.data.OrderNumber) ?? input.orderNumber,
         status: 'NEW',
-        courierFallback,
-        courierForm,
-        courierFormName,
+        courierFallback: courierFallback || boundExisting,
+        ...(boundExisting ? {} : { courierForm, courierFormName }),
         needsVerification: true,
       }
     }
@@ -358,9 +361,9 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
         externalOrderId,
         externalOrderNumber: toStr(existing.OrderNumber) ?? input.orderNumber,
         status: 'NEW',
-        courierFallback,
-        courierForm,
-        courierFormName,
+        // Which form the pre-existing order carries is unknown: record none, flag the courier for review, and let the first
+        // amendment pick it like a fresh create.
+        courierFallback: true,
         // Already proven: findExistingByReference asserts our ClientId on every
         // row it considers, so this id came from a read, not from trust.
         needsVerification: false,
@@ -613,14 +616,25 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
   if (!found) return { updated: false, status: 'NOT_FOUND' }
   if (!isNew) return { updated: false, status: 'NOT_NEW' }
 
-  // An order created on the placeholder courier is amended on the configured default CourierServiceId, never without a
-  // courier. If that default is gone, refuse BEFORE any write: sending the amendment with neither a name nor an id would
-  // blank or mis-set the courier on a live order.
   const settings = await getMintsoftSettings()
   const courierMap = settings.mintsoft_courier_service_map
-  const placeholderId = input.courierPlaceholder ? parseDefaultCourierId(settings.mintsoft_default_courier_service_id) : null
-  if (input.courierPlaceholder && placeholderId == null) {
-    throw new Error('Mintsoft order amendment not sent: the order was created on the placeholder courier but no default CourierServiceId is configured now; set one or choose the courier in Mintsoft')
+  const defaultId = parseDefaultCourierId(settings.mintsoft_default_courier_service_id)
+  // The courier for the FIRST post, chosen before any write. An order created on the placeholder courier is amended on the
+  // configured default CourierServiceId; every other order on the override id for its form or, failing that, its name; an
+  // order with no courier name falls to the default id, as a create does. If that leaves neither a name nor an id the
+  // amendment is refused BEFORE any write (items included): it must never go out without a courier, and a recorded failure on
+  // the link is what an operator sees.
+  const mappedId = resolveMappedCourierIdForInput(input, courierMap)
+  const firstCourier: CourierOption | null = input.courierPlaceholder
+    ? (defaultId != null ? { kind: 'defaultId', courierServiceId: defaultId } : null)
+    : mappedId != null ? { kind: 'mappedId', courierServiceId: mappedId }
+    : input.courierService ? { kind: 'name' }
+    : defaultId != null ? { kind: 'defaultId', courierServiceId: defaultId }
+    : null
+  if (!firstCourier) {
+    throw new Error(input.courierPlaceholder
+      ? 'Mintsoft order amendment not sent: the order was created on the placeholder courier but no default CourierServiceId is configured now; set one or choose the courier in Mintsoft'
+      : 'Mintsoft order amendment not sent: the order has no courier service name and no default CourierServiceId is configured; refusing to amend without a courier')
   }
 
   // Line items are amended via the /Items sub-resource (the order-update endpoint ignores
@@ -637,17 +651,32 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
     const raw = result.data
     return Array.isArray(raw) ? ((raw[0] as RawOrder) ?? null) : (extractMintsoftObjectPayload(raw) as RawOrder | null)
   }
-  // The configured override for the form being sent (key, or the legacy form an earlier create moved to), resolved with the
-  // same lookup order as the create, so the amendment pins the same CourierServiceId the create did.
-  const mappedId = resolveMappedCourierIdForInput(input, courierMap)
-  const firstCourier: CourierOption = placeholderId != null ? { kind: 'defaultId', courierServiceId: placeholderId }
-    : mappedId != null ? { kind: 'mappedId', courierServiceId: mappedId } : { kind: 'name' }
+  const courierFormName = input.courierService
+  let form: 'NAME' | 'LEGACY' | 'PLACEHOLDER' = input.courierPlaceholder || firstCourier.kind === 'defaultId' ? 'PLACEHOLDER' : 'NAME'
   let data = await post(buildPushPayload(input, firstCourier, false))
   // The same rule as the create (one shared helper). An order the create already moved to the legacy form arrives with no
   // key left, so there is nothing further to retry.
   const retry = data?.Success === false ? legacyCourierRetry(input, courierMap, data, toStr(data.Message)) : null
-  if (retry) data = await post(buildPushPayload(retry.input, retry.courier, false))
-  if (data?.Success === true || data?.OrderId != null) return { updated: true, status: 'NEW' }
+  if (retry) {
+    form = 'LEGACY'
+    data = await post(buildPushPayload(retry.input, retry.courier, false))
+  }
+  // A link that does not know its order's courier form selects like a fresh create, so after the key (and its one legacy
+  // retry) a definitive courier rejection falls to the configured default id, exactly as the create does.
+  if (
+    input.courierFormUnknown && defaultId != null && firstCourier.kind !== 'defaultId'
+    && data?.Success === false && /courierservice/i.test(toStr(data.Message) ?? '')
+  ) {
+    form = 'PLACEHOLDER'
+    data = await post(buildPushPayload(input, { kind: 'defaultId', courierServiceId: defaultId }, false))
+  }
+  if (data?.Success === true || data?.OrderId != null) {
+    return {
+      updated: true,
+      status: 'NEW',
+      ...(input.courierFormUnknown || retry || (form === 'PLACEHOLDER' && !input.courierPlaceholder) ? { courierForm: form, courierFormName } : {}),
+    }
+  }
   throw new Error(toStr(data?.Message) ?? 'Mintsoft order update failed')
 }
 

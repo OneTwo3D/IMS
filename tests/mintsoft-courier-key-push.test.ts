@@ -22,6 +22,8 @@ let puts: Array<Record<string, unknown>> = []
 let infos: string[] = []
 let postSequence: Array<{ error: string } | { result: unknown }> = []
 let posts: Array<Record<string, unknown>> = []
+let searchRows: unknown[] = []
+let itemWrites = 0
 
 mock.module('@/lib/connectors/mintsoft/settings/schema', {
   namedExports: {
@@ -52,9 +54,13 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
         if ('error' in next) return { data: null, error: next.error, status: 500 }
         return { data: next.result, status: 200 }
       }
-      if (pathname === '/api/Order/Search') return { data: [], status: 200 }
+      if (pathname === '/api/Order/Search') return { data: searchRows, status: 200 }
       if (pathname === '/api/Order/900' && (init?.method ?? 'GET') === 'GET') return { data: { ID: 900, OrderStatusId: 1, ClientId: 5 }, status: 200 }
-      if (pathname === '/api/Order/900/Items') return (init?.method ?? 'GET') === 'GET' ? { data: [], status: 200 } : { data: { Success: true }, status: 200 }
+      if (pathname === '/api/Order/900/Items') {
+        if ((init?.method ?? 'GET') === 'GET') return { data: [], status: 200 }
+        itemWrites += 1
+        return { data: { Success: true }, status: 200 }
+      }
       if (pathname === '/api/Order/900' && init?.method === 'POST') {
         posts.push(JSON.parse(init.body ?? '{}'))
         const next = postSequence.shift()
@@ -84,6 +90,7 @@ async function run(input: WmsOrderPushInput, steps: typeof sequence, opts: { def
   sequence = [...steps]
   puts = []
   infos = []
+  searchRows = []
   const { pushMintsoftOrder } = await import('@/lib/connectors/mintsoft/api/order-push')
   return pushMintsoftOrder(input)
 }
@@ -167,13 +174,14 @@ async function amend(input: WmsOrderPushInput, steps: typeof postSequence, map =
   courierMap = map
   postSequence = [...steps]
   posts = []
+  itemWrites = 0
   const { updateMintsoftOrder } = await import('@/lib/connectors/mintsoft/api/order-push')
   return updateMintsoftOrder('900', input)
 }
 
 test('an amendment sent with the key that Mintsoft refuses is retried ONCE with the combined form, and succeeds', async () => {
   const result = await amend(INPUT, [{ result: [REFUSED] }, { result: [{ Success: true, OrderId: 900 }] }])
-  assert.deepEqual(result, { updated: true, status: 'NEW' })
+  assert.deepEqual(result, { updated: true, status: 'NEW', courierForm: 'LEGACY', courierFormName: KEY })
   assert.deepEqual(posts.map((p) => p.CourierService), [KEY, LABEL])
 })
 
@@ -266,4 +274,57 @@ test('a placeholder order whose default id is no longer configured is refused be
     /no default CourierServiceId is configured/,
   )
   assert.equal(posts.length, 0)
+})
+
+// --- an amendment never goes out without a courier ------------------------------------------
+
+test('a synthetic empty courier (no name, no default id) fails the amendment BEFORE any write, with a clear reason', async () => {
+  defaultCourierId = ''
+  await assert.rejects(
+    () => amend({ ...INPUT, courierService: null, courierServiceAlternates: [], courierServiceLegacy: null }, [{ result: [{ Success: true }] }]),
+    /no courier service name and no default CourierServiceId/,
+  )
+  assert.equal(posts.length, 0)
+  assert.equal(itemWrites, 0)
+  // With a default configured the same order is amended on the default id, as a create would.
+  defaultCourierId = '77'
+  await amend({ ...INPUT, courierService: null, courierServiceAlternates: [], courierServiceLegacy: null }, [{ result: [{ Success: true }] }])
+  assert.equal(posts[0]!.CourierServiceId, 77)
+})
+
+// --- "already exists": the form of the existing order is unknown ------------------------------
+
+test('an "already exists" answer records NO courier form and flags the courier for review', async () => {
+  searchRows = [{ ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: 5 }]
+  defaultCourierId = '77'
+  sequence = [{ result: [{ Success: false, Message: 'Order already exists' }] }]
+  puts = []
+  const { pushMintsoftOrder } = await import('@/lib/connectors/mintsoft/api/order-push')
+  const result = await pushMintsoftOrder(INPUT)
+  assert.equal(result.externalOrderId, '900')
+  assert.equal(result.courierForm, undefined)
+  assert.equal(result.courierFallback, true)
+})
+
+test('an order bound by "already exists" that was created via the placeholder is amended through the create retry chain, and the form is reported', async () => {
+  const { applyLinkCourierForm } = await import('@/lib/domain/wms/order-push-sweep')
+  const unknown = applyLinkCourierForm(INPUT, { courierForm: null, courierFormName: null })
+  assert.equal(unknown.courierFormUnknown, true)
+  defaultCourierId = '77'
+  // The key and the legacy form are both refused; the existing order was on the placeholder, so the default id works.
+  const result = await amend(unknown, [{ result: [REFUSED] }, { result: [REFUSED] }, { result: [{ Success: true }] }])
+  assert.deepEqual(posts.map((p) => p.CourierService ?? null), [KEY, LABEL, null])
+  assert.equal(posts[2]!.CourierServiceId, 77)
+  assert.equal(result.courierForm, 'PLACEHOLDER')
+  assert.equal(result.courierFormName, KEY)
+  // And one that works on the key reports NAME so the link learns it.
+  const again = await amend(unknown, [{ result: [{ Success: true }] }])
+  assert.equal(again.courierForm, 'NAME')
+})
+
+test('an unknown-form amendment does not use the placeholder on an ambiguous answer', async () => {
+  const { applyLinkCourierForm } = await import('@/lib/domain/wms/order-push-sweep')
+  defaultCourierId = '77'
+  await assert.rejects(() => amend(applyLinkCourierForm(INPUT, { courierForm: null }), [{ result: [{ Message: 'CourierService trouble' }] }]), /CourierService/)
+  assert.equal(posts.length, 1)
 })
