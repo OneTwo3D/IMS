@@ -1561,6 +1561,12 @@ export async function updateShipmentStatus(
      * completion, which would only echo.
      */
     storefrontCompletion?: boolean
+    /**
+     * The storefront order is already completed (verified by a fresh read): skip the post-commit storefront tracking and
+     * completion push as well as the durable completion job. The stock-level sync below is NOT skipped (IMS is the stock master
+     * after cutover; it sets an absolute level). Never set by an in-app dispatch.
+     */
+    skipStorefrontPush?: boolean
   },
 ): Promise<{ success: boolean; error?: string }> {
   try {
@@ -1660,10 +1666,12 @@ export async function updateShipmentStatus(
       // is the immediate post-commit attempt — tracking first, then the status, never failing the shipment
       // (o3d-zvec.15). Without a key (partial shipment, EXTERNAL authority with no storefrontCompletion, an
       // unlinked order) only the tracking goes.
-      await pushShipmentCompletionToShopping({
-        orderId: result.shipment.orderId,
-        completionKey: storefrontCompletionKey,
-      })
+      if (options?.skipStorefrontPush !== true) {
+        await pushShipmentCompletionToShopping({
+          orderId: result.shipment.orderId,
+          completionKey: storefrontCompletionKey,
+        })
+      }
       try {
         await enqueueStockSync(
           result.stockSyncProductIds,

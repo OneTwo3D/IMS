@@ -61,6 +61,8 @@ export type PartialShipmentPushResult = {
   skipped?: boolean
   /** The producer-side hold kept this IMS did not send it: not a failure, not a success, not queued. */
   shadowed?: boolean
+  /** Why the hold kept it as a shadow, when it did. */
+  shadowReason?: import('@/lib/security/producer-disposition-constants').ProducerReason
   error?: string
 }
 
@@ -111,7 +113,7 @@ export async function pushPartialShipmentToWc(
 
   // The last barrier of the producer-side hold (see ../producer-egress): nothing leaves while the destination is held.
   const egressHold = wooEgressHold()
-  if (egressHold.held) return { supported: true, ok: false, shadowed: true, error: egressHold.notice }
+  if (egressHold.held) return { supported: true, ok: false, shadowed: true, shadowReason: egressHold.reason, error: egressHold.notice }
 
   const body = buildPartialShipmentBody(input)
   const signature = createHmac('sha256', secret).update(body).digest('hex')

@@ -32,6 +32,15 @@ export type ExternalFulfillmentUpdate = {
   lookup: ExternalFulfillmentLookup
   targetShipmentStatus: ExternalShipmentStatus
   tracking?: Array<{ trackingNumber: string; shippingService?: string | null }>
+  /**
+   * The storefront order is ALREADY completed (a fresh read-only look at it, at verification time, showed it `completed` after
+   * the latest despatch). THE CONTRACT: this path writes NO ORDER-LEVEL storefront data - no `order.complete` job, no tracking,
+   * no order note, no status - because each would be a write to an order that is already complete. Its ONLY storefront effect
+   * is IMS's ordinary stock-level sync for the stock the shipment consumed: after cutover IMS is the stock master and that push
+   * sets an absolute level, so it duplicates nothing the earlier writer did (owner ruling). Set only when EVERY despatched part
+   * was verified; a mixed order completes normally.
+   */
+  storefrontAlreadyCompleted?: boolean
 }
 
 /**
@@ -729,7 +738,8 @@ export async function applyExternalFulfillmentUpdate(
           // durable completion job is enqueued WITH the flip (tracking first, then the status; retried
           // by the cron; held for orders WooCommerce no longer has in flight). A storefront-sourced
           // completion must never push back, as it would only echo.
-          storefrontCompletion: isWmsConnectorId(update.source),
+          storefrontCompletion: isWmsConnectorId(update.source) && update.storefrontAlreadyCompleted !== true,
+          skipStorefrontPush: update.storefrontAlreadyCompleted === true,
         },
       )
 
