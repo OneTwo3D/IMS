@@ -744,6 +744,20 @@ export function storefrontCutoffWhileEnforced(env: Record<string, string | undef
   return read.ok ? read.at : null
 }
 
+/**
+ * The earliest an order's despatch can have been, from IMMUTABLE facts only: when IMS first claimed the create of the warehouse order
+ * (stamped once, never rewritten; only trusted on a link that tracks its claim history) and when the IMS order was created, whichever
+ * is later and known. Never the link's pushedAt: every amendment attempt moves that, which would push the bound past a cutover and
+ * make a pre-cutover despatch look live. Null when nothing is known.
+ */
+export function despatchLowerBoundOf(
+  link: { claimHistoryTracked?: boolean | null; firstClaimedAt?: Date | null; order?: { createdAt?: Date | null } | null } | null | undefined,
+): Date | null {
+  const known = [link?.claimHistoryTracked ? link.firstClaimedAt : null, link?.order?.createdAt]
+    .filter((value): value is Date => value instanceof Date && Number.isFinite(value.getTime()))
+  return known.length === 0 ? null : new Date(Math.max(...known.map((value) => value.getTime())))
+}
+
 /** The lower bound of an undated order's despatch, only when one is needed (a cutoff, a reading, and an undated entry). */
 async function undatedLowerBound(
   deps: WmsDispatchSweepDeps,
@@ -2466,9 +2480,13 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
     zonelessDespatchReading: getWmsConnectorHooks(connectorId).zonelessDespatchReading,
     storefrontCutoff: () => storefrontCutoffWhileEnforced(),
     async despatchLowerBound(orderId) {
-      const link = await db.wmsOrderPushLink.findUnique({ where: { orderId }, select: { pushedAt: true, order: { select: { createdAt: true } } } })
-      const known = [link?.pushedAt, link?.order?.createdAt].filter((value): value is Date => value instanceof Date && Number.isFinite(value.getTime()))
-      return known.length === 0 ? null : new Date(Math.max(...known.map((value) => value.getTime())))
+      // NOT pushedAt: every amendment attempt, even a rejected one, moves it. firstClaimedAt is stamped once, when the create is first
+      // claimed (before any request can leave), and never rewritten.
+      const link = await db.wmsOrderPushLink.findUnique({
+        where: { orderId },
+        select: { claimHistoryTracked: true, firstClaimedAt: true, order: { select: { createdAt: true } } },
+      })
+      return despatchLowerBoundOf(link)
     },
     async listCandidates(limit) {
       const rows = await db.wmsOrderPushLink.findMany({

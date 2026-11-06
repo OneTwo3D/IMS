@@ -1034,3 +1034,36 @@ test('UNDATED: no usable despatch time is live only when IMS sent the order at o
     })
   }
 })
+
+test('LOWER BOUND: built from the immutable first claim and the order creation, never pushedAt (an amendment attempt moves that)', async () => {
+  const { despatchLowerBoundOf } = await import('@/lib/domain/wms/dispatch-sweep')
+  const created = new Date('2026-04-01T00:00:00Z')
+  const firstClaimed = new Date('2026-04-02T00:00:00Z')
+  const amendedAfterCutover = new Date('2026-06-05T00:00:00Z')
+  // a link first created BEFORE the cutover, amended after it: the bound is the first claim, not the amendment
+  const amended = { claimHistoryTracked: true, firstClaimedAt: firstClaimed, pushedAt: amendedAfterCutover, order: { createdAt: created } }
+  assert.equal(despatchLowerBoundOf(amended as never)?.toISOString(), firstClaimed.toISOString())
+  // first created AFTER the cutover: the bound is after it
+  const late = new Date('2026-06-03T00:00:00Z')
+  assert.equal(despatchLowerBoundOf({ claimHistoryTracked: true, firstClaimedAt: late, order: { createdAt: created } })?.toISOString(), late.toISOString())
+  // an untracked link's firstClaimedAt is not trusted; the order's creation still bounds it
+  assert.equal(despatchLowerBoundOf({ claimHistoryTracked: false, firstClaimedAt: late, order: { createdAt: created } })?.toISOString(), created.toISOString())
+  assert.equal(despatchLowerBoundOf(null), null)
+  assert.equal(despatchLowerBoundOf({ order: null }), null)
+
+  // end to end through the sweep: pre-cutover undated despatch with a post-cutover amendment stays held; a link first created after is live
+  const undated: Part = { ...part(1, PRE), tracking: [{ trackingNumber: 'TN-1', carrier: 'DPD', despatchedAt: '' }] }
+  for (const shape of ['single', 'merged', 'split'] as const) {
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const held = await sweep([undated], { zoneless: 'europe-london', shape, verifier: false, lowerBound: despatchLowerBoundOf(amended as never) })
+      assert.equal(held.out.counters.dispatched, 0, shape)
+      assert.deepEqual(writes(), [], shape)
+    })
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const live = await sweep([undated], { zoneless: 'europe-london', shape, verifier: false, lowerBound: despatchLowerBoundOf({ claimHistoryTracked: true, firstClaimedAt: late, order: { createdAt: created } }) })
+      assert.equal(live.out.counters.dispatched, 1, shape)
+    })
+  }
+})
