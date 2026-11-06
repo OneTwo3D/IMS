@@ -10,7 +10,8 @@ import type { WmsOrderPushInput } from '@/lib/connectors/wms/types'
  */
 
 const KEY = 'calcurates:6384_7418(VAT & duty paid)'
-const LABEL = 'RM Int Tracked - 5 -10 business days(VAT & duty paid)'
+const TITLE = 'RM Int Tracked - 5 -10 business days(VAT & duty paid)'
+const LABEL = `calcurates:${TITLE}` // the combined {method_id}:{method_title} legacy form
 const REFUSED = { Success: false, Message: 'Unable to Find CourierService' }
 const CREATED = { Success: true, OrderId: 900, OrderNumber: 'WC-1001' }
 
@@ -19,6 +20,8 @@ let courierMap = ''
 let sequence: Array<{ error: string } | { result: unknown }> = []
 let puts: Array<Record<string, unknown>> = []
 let infos: string[] = []
+let postSequence: Array<{ error: string } | { result: unknown }> = []
+let posts: Array<Record<string, unknown>> = []
 
 mock.module('@/lib/connectors/mintsoft/settings/schema', {
   namedExports: {
@@ -50,6 +53,15 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
         return { data: next.result, status: 200 }
       }
       if (pathname === '/api/Order/Search') return { data: [], status: 200 }
+      if (pathname === '/api/Order/900' && (init?.method ?? 'GET') === 'GET') return { data: { ID: 900, OrderStatusId: 1, ClientId: 5 }, status: 200 }
+      if (pathname === '/api/Order/900/Items') return (init?.method ?? 'GET') === 'GET' ? { data: [], status: 200 } : { data: { Success: true }, status: 200 }
+      if (pathname === '/api/Order/900' && init?.method === 'POST') {
+        posts.push(JSON.parse(init.body ?? '{}'))
+        const next = postSequence.shift()
+        if (!next) throw new Error('unexpected extra order POST')
+        if ('error' in next) return { data: null, error: next.error, status: 500 }
+        return { data: next.result, status: 200 }
+      }
       throw new Error(`Unexpected Mintsoft path: ${path}`)
     },
   },
@@ -60,7 +72,7 @@ mock.method(console, 'info', (message: string) => { infos.push(String(message)) 
 const INPUT: WmsOrderPushInput = {
   orderNumber: 'WC-1001', externalReference: 'REF-1001', externalWarehouseId: '3', currency: 'GBP',
   email: 'a@example.com', phone: null, vatNumber: null, comments: null,
-  courierService: KEY, courierServiceLabel: LABEL,
+  courierService: KEY, courierServiceAlternates: [LABEL, TITLE, 'calcurates'], courierServiceLegacy: LABEL,
   totalVat: 0, shippingExVat: 0, shippingVat: 0, discountExVat: 0, discountVat: 0,
   lines: [{ sku: 'SKU-1', quantity: 1, unitPriceExVat: 10, unitPriceVat: 2, description: 'Widget' }],
   shippingAddress: { firstName: 'A', lastName: 'B', company: '', address1: '1 St', address2: '', town: 'T', county: '', postCode: 'PC1', country: 'GB' },
@@ -80,31 +92,38 @@ test('the key is sent first; one definitive CourierService refusal leads to ONE 
   const result = await run(INPUT, [{ result: [REFUSED] }, { result: [CREATED] }])
   assert.equal(result.externalOrderId, '900')
   assert.equal(result.courierFallback, false)
+  assert.equal(result.courierForm, 'LEGACY')
+  assert.equal(result.courierFormName, KEY)
   assert.deepEqual(puts.map((p) => p.CourierService), [KEY, LABEL])
-  assert.ok(infos.some((m) => /legacy shipping-label form succeeded/.test(m)))
+  assert.ok(infos.some((m) => /legacy \{method_id\}:\{method_title\} form succeeded/.test(m)))
 })
 
 test('the key succeeding first time is sent once and logged as the key form', async () => {
-  await run(INPUT, [{ result: [CREATED] }])
+  const result = await run(INPUT, [{ result: [CREATED] }])
+  assert.equal(result.courierForm, 'NAME')
   assert.deepEqual(puts.map((p) => p.CourierService), [KEY])
   assert.ok(infos.some((m) => /courier key form succeeded/.test(m)))
 })
 
-test('a label-mapped courier id is used on the legacy retry', async () => {
+test('the retry sends the combined form, and a map entry for it (or the bare title / method id) pins the id', async () => {
   await run(INPUT, [{ result: [REFUSED] }, { result: [CREATED] }], { map: JSON.stringify({ [LABEL]: 16 }) })
-  // The map is consulted against the key first and then the label, so the first PUT already pins 16 ...
+  // The map is consulted against the key first and then the combined form, so the first PUT already pins 16 ...
   assert.equal(puts[0]!.CourierServiceId, 16)
   // ... and the legacy retry pins it again, with the label as the name.
   assert.equal(puts[1]!.CourierServiceId, 16)
   assert.equal(puts[1]!.CourierService, LABEL)
+  await run(INPUT, [{ result: [REFUSED] }, { result: [CREATED] }], { map: JSON.stringify({ [TITLE]: 17 }) })
+  assert.equal(puts[1]!.CourierServiceId, 17)
+  await run(INPUT, [{ result: [REFUSED] }, { result: [CREATED] }], { map: JSON.stringify({ calcurates: 18 }) })
+  assert.equal(puts[1]!.CourierServiceId, 18)
 })
 
 test('a refusal of the legacy (label) form is not retried this way', async () => {
-  const legacyOnly = { ...INPUT, courierService: LABEL, courierServiceLabel: null }
+  const legacyOnly = { ...INPUT, courierService: LABEL, courierServiceAlternates: [TITLE, 'calcurates'], courierServiceLegacy: null }
   await assert.rejects(() => run(legacyOnly, [{ result: [REFUSED] }]), /Unable to Find CourierService/)
   assert.equal(puts.length, 1)
   // Same when the key equals the label (nothing different to retry with).
-  await assert.rejects(() => run({ ...INPUT, courierService: LABEL, courierServiceLabel: LABEL }, [{ result: [REFUSED] }]), /Unable to Find/)
+  await assert.rejects(() => run({ ...INPUT, courierService: LABEL, courierServiceLegacy: LABEL }, [{ result: [REFUSED] }]), /Unable to Find/)
   assert.equal(puts.length, 1)
 })
 
@@ -123,6 +142,7 @@ test('an ambiguous response (no Success: false) that mentions the courier is nev
 test('a second refusal goes to the existing placeholder courier fallback, and nothing is retried a third time', async () => {
   const result = await run(INPUT, [{ result: [REFUSED] }, { result: [REFUSED] }, { result: [CREATED] }], { defaultId: '77' })
   assert.equal(result.courierFallback, true)
+  assert.equal(result.courierForm, 'PLACEHOLDER')
   assert.equal(puts.length, 3)
   assert.equal(puts[2]!.CourierServiceId, 77)
   assert.equal(puts[2]!.CourierService, undefined)
@@ -131,4 +151,61 @@ test('a second refusal goes to the existing placeholder courier fallback, and no
 test('two refusals with no placeholder configured stop after exactly two creates', async () => {
   await assert.rejects(() => run(INPUT, [{ result: [REFUSED] }, { result: [REFUSED] }]), /Unable to Find CourierService/)
   assert.equal(puts.length, 2)
+})
+
+test('an ambiguous courier response (no Success: false) with a placeholder courier configured is NOT retried', async () => {
+  // Neither the key retry nor the placeholder retry may follow an answer that is not a decoded refusal.
+  await assert.rejects(() => run(INPUT, [{ result: [{ Message: 'Something about the CourierService' }] }], { defaultId: '77' }), /CourierService/)
+  assert.equal(puts.length, 1)
+  await assert.rejects(() => run({ ...INPUT, courierService: LABEL, courierServiceLegacy: null }, [{ result: [{ Success: undefined, Message: 'CourierService invalid' }] }], { defaultId: '77' }), /CourierService/)
+  assert.equal(puts.length, 1)
+})
+
+// --- the amendment shares the create's single legacy retry ---------------------------------
+
+async function amend(input: WmsOrderPushInput, steps: typeof postSequence, map = '') {
+  courierMap = map
+  postSequence = [...steps]
+  posts = []
+  const { updateMintsoftOrder } = await import('@/lib/connectors/mintsoft/api/order-push')
+  return updateMintsoftOrder('900', input)
+}
+
+test('an amendment sent with the key that Mintsoft refuses is retried ONCE with the combined form, and succeeds', async () => {
+  const result = await amend(INPUT, [{ result: [REFUSED] }, { result: [{ Success: true, OrderId: 900 }] }])
+  assert.deepEqual(result, { updated: true, status: 'NEW' })
+  assert.deepEqual(posts.map((p) => p.CourierService), [KEY, LABEL])
+})
+
+test('the amendment retry pins an override id keyed on the title', async () => {
+  await amend(INPUT, [{ result: [REFUSED] }, { result: [{ Success: true }] }], JSON.stringify({ [TITLE]: 17 }))
+  assert.equal(posts[1]!.CourierServiceId, 17)
+  assert.equal(posts[1]!.CourierService, LABEL)
+})
+
+test('a second amendment refusal is thrown after exactly two posts; a legacy-form refusal gets no retry; a timeout gets no retry', async () => {
+  await assert.rejects(() => amend(INPUT, [{ result: [REFUSED] }, { result: [REFUSED] }]), /Unable to Find CourierService/)
+  assert.equal(posts.length, 2)
+  await assert.rejects(() => amend({ ...INPUT, courierService: LABEL, courierServiceLegacy: null }, [{ result: [REFUSED] }]), /Unable to Find CourierService/)
+  assert.equal(posts.length, 1)
+  await assert.rejects(() => amend(INPUT, [{ error: 'The operation was aborted due to timeout' }]))
+  assert.equal(posts.length, 1)
+  await assert.rejects(() => amend(INPUT, [{ result: [{ Message: 'Unable to Find CourierService' }] }]), /Unable to Find CourierService/)
+  assert.equal(posts.length, 1)
+})
+
+test('create and amendment decide the retry through the same helper and agree on it', async () => {
+  const { legacyCourierRetry } = await import('@/lib/connectors/mintsoft/api/order-push')
+  const map = JSON.stringify({ [TITLE]: 17 })
+  const decided = legacyCourierRetry(INPUT, map, REFUSED, 'Unable to Find CourierService')
+  assert.equal(decided?.input.courierService, LABEL)
+  assert.deepEqual(decided?.courier, { kind: 'mappedId', courierServiceId: 17 })
+  // The same decision, observed through each path.
+  await run(INPUT, [{ result: [REFUSED] }, { result: [CREATED] }], { map })
+  await amend(INPUT, [{ result: [REFUSED] }, { result: [{ Success: true }] }], map)
+  assert.equal(puts[1]!.CourierService, posts[1]!.CourierService)
+  assert.equal(puts[1]!.CourierServiceId, posts[1]!.CourierServiceId)
+  // Not a definitive refusal, or no key sent: no decision to retry.
+  assert.equal(legacyCourierRetry(INPUT, map, { Message: 'x' }, 'Unable to Find CourierService'), null)
+  assert.equal(legacyCourierRetry({ ...INPUT, courierServiceLegacy: null }, map, REFUSED, 'Unable to Find CourierService'), null)
 })

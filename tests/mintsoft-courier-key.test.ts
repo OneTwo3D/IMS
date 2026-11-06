@@ -8,7 +8,7 @@
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildPushInput } from '../lib/domain/wms/order-push-sweep.ts'
+import { applyLinkCourierForm, buildPushInput, courierNamesForOrder } from '../lib/domain/wms/order-push-sweep.ts'
 import { buildPushPayload, resolveMappedCourierIdForInput } from '../lib/connectors/mintsoft/api/order-push.ts'
 import * as fieldMappingNs from '../lib/connectors/woocommerce/sync/field-mapping.ts'
 import type { WcFullOrder } from '../lib/connectors/woocommerce/sync/types.ts'
@@ -19,6 +19,7 @@ const { mapWcShipping, readWcShippingLineCourierKey } = ('default' in fieldMappi
 
 const goods = { id: 'g1', sku: 'SKU-A', qty: 1, taxForeign: 2, totalForeign: 10, description: 'Widget', productId: 'p1', externalLineItemId: 11, wclcFeeKind: null }
 const KEY = 'calcurates:6384_7418(VAT & duty paid)'
+const COMBINED_EN = 'calcurates:RM Int Tracked - 5 -10 business days(VAT & duty paid)'
 const EN = 'RM Int Tracked - 5 -10 business days(VAT & duty paid)'
 const DE = 'RM Int Tracked - 5 -10 Werktage(VAT & duty paid)'
 
@@ -27,7 +28,7 @@ function order(over: Record<string, unknown> = {}) {
     id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: '1001', currency: 'GBP',
     customerName: 'A B', customerEmail: null, customerVatNumber: null,
     shippingAddress: { address1: '1 St', firstName: 'A', lastName: 'B', country: 'GB' },
-    shippingService: EN, courierKey: null,
+    shippingService: EN, shippingMethodId: 'calcurates', courierKey: null,
     subtotalForeign: 10, shippingForeign: 0, taxForeign: 2, taxRatePercent: null,
     pricesIncludeVat: false, discountAmount: 0, totalForeign: 12,
     lines: [goods], refunds: [],
@@ -51,10 +52,22 @@ test('a key with a (suffix) is sent verbatim, suffix included', () => {
   assert.equal(sent(order({ courierKey: KEY })).courierService, KEY)
 })
 
-test('absent, empty or blank key falls back to the shipping label, exactly as before', () => {
+test('absent, empty or blank key falls back to {method_id}:{method_title}', () => {
   for (const courierKey of [null, undefined, '', '   ']) {
-    assert.equal(sent(order({ courierKey })).courierService, EN, JSON.stringify(courierKey))
+    assert.equal(sent(order({ courierKey })).courierService, COMBINED_EN, JSON.stringify(courierKey))
   }
+})
+
+test('the combined form is not double-prefixed when the title already starts with method_id:', () => {
+  assert.equal(sent(order({ shippingService: COMBINED_EN })).courierService, COMBINED_EN)
+  assert.equal(courierNamesForOrder({ shippingService: 'Flat rate', shippingMethodId: 'flat_rate' }).courierService, 'flat_rate:Flat rate')
+})
+
+test('an order with no stored method id (imported before it was kept) falls back to the bare title; no title falls back to the id', () => {
+  assert.equal(sent(order({ shippingMethodId: null })).courierService, EN)
+  assert.equal(sent(order({ shippingMethodId: undefined })).courierService, EN)
+  assert.equal(courierNamesForOrder({ shippingService: null, shippingMethodId: 'free_shipping' }).courierService, 'free_shipping')
+  assert.equal(courierNamesForOrder({ shippingService: null, shippingMethodId: null }).courierService, null)
 })
 
 test('a translated label with the same key sends the same CourierService as the English label', () => {
@@ -72,24 +85,59 @@ test('an override keyed by the courier key pins the courier id', () => {
   assert.equal(result.courierService, KEY)
 })
 
-test('the courier key is checked before the label when both are mapped', () => {
-  assert.equal(sent(order({ courierKey: KEY }), { [EN]: 99, [KEY]: 21 }).courierServiceId, 21)
+test('override lookup order with a key: key, then combined form, then bare title, then method id', () => {
+  const o = order({ courierKey: KEY })
+  const all = { [KEY]: 1, [COMBINED_EN]: 2, [EN]: 3, calcurates: 4 }
+  assert.equal(sent(o, all).courierServiceId, 1)
+  assert.equal(sent(o, { [COMBINED_EN]: 2, [EN]: 3, calcurates: 4 }).courierServiceId, 2)
+  assert.equal(sent(o, { [EN]: 3, calcurates: 4 }).courierServiceId, 3)
+  assert.equal(sent(o, { calcurates: 4 }).courierServiceId, 4)
+  assert.equal(sent(o, { other: 9 }).courierServiceId, undefined)
+  assert.equal(sent(o, { calcurates: 4 }).courierService, KEY)
 })
 
-test('an override keyed by the old label still applies when the order has a key that is not mapped', () => {
+test('override lookup order without a key: combined form, then bare title, then method id', () => {
+  assert.equal(sent(order(), { [COMBINED_EN]: 2, [EN]: 3, calcurates: 4 }).courierServiceId, 2)
+  assert.equal(sent(order(), { [EN]: 3, calcurates: 4 }).courierServiceId, 3)
+  assert.equal(sent(order(), { calcurates: 4 }).courierServiceId, 4)
+  assert.deepEqual(sent(order(), { other: 5 }), { courierService: COMBINED_EN, courierServiceId: undefined })
+})
+
+test('an override keyed by the old bare label still applies with a key that is not mapped', () => {
   const result = sent(order({ courierKey: KEY }), { [EN]: 16 })
   assert.equal(result.courierServiceId, 16)
   assert.equal(result.courierService, KEY)
 })
 
-test('an override keyed by the label applies when there is no key', () => {
-  const result = sent(order(), { [EN]: 16 })
-  assert.equal(result.courierServiceId, 16)
-  assert.equal(result.courierService, EN)
+test('the legacy form for the retry is the combined form, and only exists when a key is sent', () => {
+  assert.equal(courierNamesForOrder({ courierKey: KEY, shippingService: EN, shippingMethodId: 'calcurates' }).courierServiceLegacy, COMBINED_EN)
+  assert.equal(courierNamesForOrder({ courierKey: null, shippingService: EN, shippingMethodId: 'calcurates' }).courierServiceLegacy, null)
 })
 
-test('no key and no match: the name is passed through for the warehouse to resolve', () => {
-  assert.deepEqual(sent(order(), { other: 5 }), { courierService: EN, courierServiceId: undefined })
+// --- amendments reuse the form the create ended with -----------------------------------------
+
+test('a label-fallback create is followed by an amendment that uses the label form, not the refused key', () => {
+  const input = buildPushInput(order({ courierKey: KEY }), '301')
+  assert.equal(input.courierService, KEY)
+  const amended = applyLinkCourierForm(input, { courierForm: 'LEGACY', courierFormName: KEY })
+  assert.equal(amended.courierService, COMBINED_EN)
+  assert.equal(buildPushPayload(amended, { kind: 'name' }, false).CourierService, COMBINED_EN)
+})
+
+test('an amendment keeps the key when the create sent it, and recomputes fresh when the line changed since', () => {
+  const input = buildPushInput(order({ courierKey: KEY }), '301')
+  assert.equal(applyLinkCourierForm(input, { courierForm: 'NAME', courierFormName: KEY }).courierService, KEY)
+  assert.equal(applyLinkCourierForm(input, { courierForm: null, courierFormName: null }).courierService, KEY)
+  // The refused key was for another line: the new key is tried fresh.
+  const changed = buildPushInput(order({ courierKey: 'calcurates:1_1' }), '301')
+  assert.equal(applyLinkCourierForm(changed, { courierForm: 'LEGACY', courierFormName: KEY }).courierService, 'calcurates:1_1')
+})
+
+test('after a placeholder create, an amendment names no courier again', () => {
+  const input = buildPushInput(order({ courierKey: KEY }), '301')
+  const amended = applyLinkCourierForm(input, { courierForm: 'PLACEHOLDER', courierFormName: KEY })
+  assert.equal(amended.courierService, null)
+  assert.equal(buildPushPayload(amended, { kind: 'name' }, false).CourierService, undefined)
 })
 
 // --- importer side: the value read off the WooCommerce shipping line ---------------------------
@@ -111,7 +159,13 @@ test('the key is used only while the stored label equals the line CURRENT method
   assert.equal(readWcShippingLineCourierKey(line([keyMeta(), labelMeta(EN.toLowerCase())], EN)), null)
 })
 
-test('a missing, blank or non-string label means no key', () => {
+test('where a meta key repeats, the last entry wins (as the storefront sync reads it)', () => {
+  assert.equal(readWcShippingLineCourierKey(line([keyMeta('calcurates:1_1'), keyMeta(KEY), labelMeta()])), KEY)
+  assert.equal(readWcShippingLineCourierKey(line([keyMeta(), labelMeta('old'), labelMeta()])), KEY)
+  assert.equal(readWcShippingLineCourierKey(line([keyMeta(), keyMeta('')  , labelMeta()])), null)
+})
+
+test('a missing, non-string or non-matching label means no key', () => {
   for (const label of [[], [labelMeta('')], [labelMeta('  ')], [labelMeta(5)], [labelMeta(null)]]) {
     assert.equal(readWcShippingLineCourierKey(line([keyMeta(), ...label])), null, JSON.stringify(label))
   }
@@ -128,7 +182,7 @@ test('absent, empty, blank, non-string and malformed meta read as no key', () =>
 test('mapWcShipping takes the key from the FIRST shipping line only, beside the unchanged label', () => {
   const wc = (lines: unknown[]) => ({ shipping_total: '5.00', shipping_lines: lines }) as unknown as WcFullOrder
   const withKey = mapWcShipping(wc([line([keyMeta(), labelMeta()])]))
-  assert.deepEqual(withKey, { shippingService: EN, courierKey: KEY, shippingForeign: 5 })
+  assert.deepEqual(withKey, { shippingService: EN, courierKey: KEY, shippingMethodId: 'calcurates', shippingForeign: 5 })
   const second = mapWcShipping(wc([line([]), line([keyMeta(), labelMeta()])]))
   assert.equal(second.courierKey, null)
   assert.equal(mapWcShipping(wc([])).courierKey, null)

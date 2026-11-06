@@ -57,18 +57,18 @@ export function resolveMappedCourierId(courierService: string | null, mapJson: s
 }
 
 /**
- * Resolve the order's courier through the configured map: the courier key (`courierService`) first, then the
- * shipping label it replaced, so an override authored against the label keeps working once orders carry a key.
+ * Resolve the order's courier through the configured map: the name sent (the courier key when there is one), then
+ * the alternates in order (combined "{method_id}:{method_title}", bare title, method id).
  */
 export function resolveMappedCourierIdForInput(
-  input: Pick<WmsOrderPushInput, 'courierService' | 'courierServiceLabel'>,
+  input: Pick<WmsOrderPushInput, 'courierService' | 'courierServiceAlternates'>,
   mapJson: string,
 ): number | null {
-  const byName = resolveMappedCourierId(input.courierService, mapJson)
-  if (byName != null) return byName
-  return input.courierServiceLabel && input.courierServiceLabel !== input.courierService
-    ? resolveMappedCourierId(input.courierServiceLabel, mapJson)
-    : null
+  for (const name of [input.courierService, ...(input.courierServiceAlternates ?? [])]) {
+    const id = resolveMappedCourierId(name, mapJson)
+    if (id != null) return id
+  }
+  return null
 }
 
 /**
@@ -194,6 +194,32 @@ async function createOrder(payload: Record<string, unknown>): Promise<{ ok: bool
   return { ok, data, message: toStr(data?.Message) }
 }
 
+/**
+ * The ONE place that decides the single legacy retry after Mintsoft refuses a courier KEY, shared by the create and the
+ * amendment. Returns the input and courier to retry with, or null unless ALL hold: the name sent is the courier key (a
+ * legacy "{method_id}:{method_title}" form exists and differs), and the answer is a decoded `Success: false` carrying
+ * "Unable to Find CourierService" (the order was not created or changed). Anything vaguer returns null and the caller keeps its
+ * existing behaviour. The legacy lookup never sees the key: combined form, bare title, method id.
+ */
+export function legacyCourierRetry(
+  input: WmsOrderPushInput,
+  mapJson: string,
+  data: Record<string, unknown> | null,
+  message: string | null,
+): { input: WmsOrderPushInput; courier: CourierOption } | null {
+  const legacy = input.courierServiceLegacy
+  if (!legacy || !input.courierService || legacy === input.courierService) return null
+  if (data?.Success !== false || !message || !/unable to find courierservice/i.test(message)) return null
+  const legacyInput: WmsOrderPushInput = {
+    ...input,
+    courierService: legacy,
+    courierServiceAlternates: (input.courierServiceAlternates ?? []).filter((n) => n !== input.courierService && n !== legacy),
+    courierServiceLegacy: null,
+  }
+  const mappedId = resolveMappedCourierIdForInput(legacyInput, mapJson)
+  return { input: legacyInput, courier: mappedId != null ? { kind: 'mappedId', courierServiceId: mappedId } : { kind: 'name' } }
+}
+
 export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOrderPushResult> {
   // Fail closed BEFORE creating anything (o3d-bjc.6). Every later lifecycle step —
   // amend, hold/cancel, warehouse comment — requires the tenant scope, so creating
@@ -263,6 +289,8 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   // used from the outset (order had no shipping service) is equally "pending" — the
   // warehouse should still confirm the courier before despatch (G6).
   let courierFallback = initialCourier.kind === 'defaultId'
+  let courierForm: 'NAME' | 'LEGACY' | 'PLACEHOLDER' = initialCourier.kind === 'defaultId' ? 'PLACEHOLDER' : 'NAME'
+  const courierFormName = input.courierService
 
   // The language-independent courier key was sent and Mintsoft definitively refused it (a decoded
   // `Success: false` answer naming the courier service: nothing was created) → retry ONCE with the legacy
@@ -271,28 +299,25 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   // not say `Success: false`) throws out of createOrReconcile or fails the test below, so it is never retried
   // this way: only a rejection that provably created nothing earns a second PUT. It goes through the same
   // createOrReconcile (outbound hold, maybe-sent reconciliation) as the first.
-  const legacyLabel = input.courierServiceLabel
-  if (
-    !created.ok && created.data?.Success === false && created.message
-    && /unable to find courier\s?service/i.test(created.message)
-    && legacyLabel && input.courierService && legacyLabel !== input.courierService
-  ) {
-    const legacyInput = { ...input, courierService: legacyLabel, courierServiceLabel: null }
-    const legacyMappedId = resolveMappedCourierId(legacyLabel, settings.mintsoft_courier_service_map)
-    created = await createOrReconcile(buildPushPayload(
-      legacyInput,
-      legacyMappedId != null ? { kind: 'mappedId', courierServiceId: legacyMappedId } : { kind: 'name' },
-    ))
-    if (created.ok) console.info('Mintsoft order create: courier key refused, the legacy shipping-label form succeeded')
-  } else if (created.ok && legacyLabel && input.courierService && legacyLabel !== input.courierService) {
+  const keySent = input.courierServiceLegacy != null && input.courierService != null && input.courierServiceLegacy !== input.courierService
+  const legacyRetry = created.ok ? null : legacyCourierRetry(input, settings.mintsoft_courier_service_map, created.data, created.message)
+  if (legacyRetry) {
+    courierForm = 'LEGACY'
+    created = await createOrReconcile(buildPushPayload(legacyRetry.input, legacyRetry.courier))
+    if (created.ok) console.info('Mintsoft order create: courier key refused, the legacy {method_id}:{method_title} form succeeded')
+  } else if (created.ok && keySent) {
     console.info('Mintsoft order create: the courier key form succeeded')
   }
 
+  // Only an explicit decoded `Success: false` courier rejection earns the placeholder retry: anything vaguer
+  // (no Success field, a message that merely mentions the courier) may be an ambiguous create, and a second PUT
+  // after it could duplicate the order. It then falls through to the "already exists" / failure handling below.
   if (
-    !created.ok && created.message && /courierservice/i.test(created.message)
+    !created.ok && created.data?.Success === false && created.message && /courierservice/i.test(created.message)
     && defaultId != null && initialCourier.kind !== 'defaultId'
   ) {
     courierFallback = true
+    courierForm = 'PLACEHOLDER'
     created = await createOrReconcile(buildPushPayload(input, { kind: 'defaultId', courierServiceId: defaultId }))
   }
 
@@ -315,6 +340,8 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
         externalOrderNumber: toStr(created.data.OrderNumber) ?? input.orderNumber,
         status: 'NEW',
         courierFallback,
+        courierForm,
+        courierFormName,
         needsVerification: true,
       }
     }
@@ -337,6 +364,8 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
         externalOrderNumber: toStr(existing.OrderNumber) ?? input.orderNumber,
         status: 'NEW',
         courierFallback,
+        courierForm,
+        courierFormName,
         // Already proven: findExistingByReference asserts our ClientId on every
         // row it considers, so this id came from a read, not from trust.
         needsVerification: false,
@@ -593,14 +622,23 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
   // them); this propagates refund-netted quantities to the still-NEW WMS order.
   await reconcileMintsoftOrderItems(externalOrderId, input, clientId)
 
-  const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(buildPushPayload(input, { kind: 'name' }, false)),
-  })
-  if (result.error) throw new Error(result.error)
-  const raw = result.data
-  const data: RawOrder | null = Array.isArray(raw) ? ((raw[0] as RawOrder) ?? null) : (extractMintsoftObjectPayload(raw) as RawOrder | null)
+  const post = async (body: Record<string, unknown>) => {
+    const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (result.error) throw new Error(result.error)
+    const raw = result.data
+    return Array.isArray(raw) ? ((raw[0] as RawOrder) ?? null) : (extractMintsoftObjectPayload(raw) as RawOrder | null)
+  }
+  let data = await post(buildPushPayload(input, { kind: 'name' }, false))
+  // The same rule as the create (one shared helper). An order the create already moved to the legacy form arrives with no
+  // key left, so there is nothing further to retry.
+  const retry = data?.Success === false
+    ? legacyCourierRetry(input, (await getMintsoftSettings()).mintsoft_courier_service_map, data, toStr(data.Message))
+    : null
+  if (retry) data = await post(buildPushPayload(retry.input, retry.courier, false))
   if (data?.Success === true || data?.OrderId != null) return { updated: true, status: 'NEW' }
   throw new Error(toStr(data?.Message) ?? 'Mintsoft order update failed')
 }

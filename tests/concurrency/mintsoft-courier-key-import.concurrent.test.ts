@@ -68,11 +68,11 @@ test('[courier key] the shipping-line key is imported and pushed as the courier 
   const cases = [
     { externalId: base + 1, title: EN, meta: [{ id: 1, key: 'delivery_date_from', value: '2026-11-09' }, { id: 2, key: '_o3d_courier_key', value: KEY }, { id: 4, key: '_o3d_courier_label', value: EN }, { id: 3, key: '_o3d_calcurates_rate_id', value: '2579_1565' }], storedKey: KEY, pushed: KEY },
     { externalId: base + 2, title: DE, meta: [{ id: 2, key: '_o3d_courier_key', value: KEY }, { id: 4, key: '_o3d_courier_label', value: DE }], storedKey: KEY, pushed: KEY },
-    { externalId: base + 3, title: EN, meta: [{ id: 1, key: 'delivery_date_from', value: '2026-11-09' }], storedKey: null, pushed: EN },
-    { externalId: base + 4, title: EN, meta: [{ id: 2, key: '_o3d_courier_key', value: '' }, { id: 4, key: '_o3d_courier_label', value: EN }], storedKey: null, pushed: EN },
-    { externalId: base + 6, title: EN, meta: [{ id: 2, key: '_o3d_courier_key', value: KEY }], storedKey: null, pushed: EN }, // no label
-    { externalId: base + 7, title: EN, meta: [{ id: 2, key: '_o3d_courier_key', value: KEY }, { id: 4, key: '_o3d_courier_label', value: DE }], storedKey: null, pushed: EN }, // edited line
-    { externalId: base + 5, title: EN, meta: [{ id: 2, key: '_o3d_courier_key', value: 7 }, { id: 4, key: '_o3d_courier_label', value: EN }], storedKey: null, pushed: EN },
+    { externalId: base + 3, title: EN, meta: [{ id: 1, key: 'delivery_date_from', value: '2026-11-09' }], storedKey: null, pushed: `calcurates:${EN}` },
+    { externalId: base + 4, title: EN, meta: [{ id: 2, key: '_o3d_courier_key', value: '' }, { id: 4, key: '_o3d_courier_label', value: EN }], storedKey: null, pushed: `calcurates:${EN}` },
+    { externalId: base + 6, title: EN, meta: [{ id: 2, key: '_o3d_courier_key', value: KEY }], storedKey: null, pushed: `calcurates:${EN}` }, // no label
+    { externalId: base + 7, title: EN, meta: [{ id: 2, key: '_o3d_courier_key', value: KEY }, { id: 4, key: '_o3d_courier_label', value: DE }], storedKey: null, pushed: `calcurates:${EN}` }, // edited line
+    { externalId: base + 5, title: EN, meta: [{ id: 2, key: '_o3d_courier_key', value: 7 }, { id: 4, key: '_o3d_courier_label', value: EN }], storedKey: null, pushed: `calcurates:${EN}` },
   ]
   const rate = await db.taxRate.create({ data: { name: `GB Standard ${randomUUID()}`, rate: 0.2, usedFor: 'SALES', accountingTaxType: 'OUTPUT2', countryCode: 'GB', taxCategory: 'STANDARD' } })
   await db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: String(wcRateId), externalName: 'GB VAT', externalCountry: 'GB', externalRatePct: 20, taxRateId: rate.id } })
@@ -100,6 +100,56 @@ test('[courier key] the shipping-line key is imported and pushed as the courier 
     assert.equal(row.shippingService, c.title, 'the label is stored exactly as before')
     assert.equal(row.courierKey, c.storedKey, `stored key for ${c.externalId}`)
     const input = buildPushInput(row as never, '301')
+    assert.equal(row.shippingMethodId, 'calcurates', 'the method id is stored')
     assert.equal(input.courierService, c.pushed, `pushed courier service for ${c.externalId}`)
   }
+})
+
+test('[courier key] a later delivery refreshes label, method id and key together from the CURRENT shipping line', { skip }, async (t) => {
+  const db = await loadDb()
+  await mockAccounting()
+  const { importWcOrder, updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = 1_000_000_000 + Math.floor(Math.random() * 1_000_000_000)
+  const rate = await db.taxRate.create({ data: { name: `GB Standard ${randomUUID()}`, rate: 0.2, usedFor: 'SALES', accountingTaxType: 'OUTPUT2', countryCode: 'GB', taxCategory: 'STANDARD' } })
+  await db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: String(wcRateId), externalName: 'GB VAT', externalCountry: 'GB', externalRatePct: 20, taxRateId: rate.id } })
+  const warehouse = await db.warehouse.create({ data: { code: `WCK-${randomUUID().slice(0, 8)}`, name: 'Courier-key refresh warehouse', syncToStore: true, availableForSale: true } })
+  let orderId: string | undefined
+  t.after(async () => {
+    orderId ??= (await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } }))?.orderId
+    if (orderId) {
+      await db.accountingSyncLog.deleteMany({ where: { referenceId: orderId } })
+      await db.activityLog.deleteMany({ where: { entityId: orderId } })
+      await db.salesOrderLine.deleteMany({ where: { orderId } })
+      await db.salesOrder.deleteMany({ where: { id: orderId } })
+    }
+    await db.shoppingOrderLink.deleteMany({ where: { connector: 'woocommerce', externalOrderId: String(externalId) } })
+    await db.shoppingTaxRateMapping.deleteMany({ where: { taxRateId: rate.id } })
+    await db.warehouse.deleteMany({ where: { id: warehouse.id } })
+    await db.taxRate.deleteMany({ where: { id: rate.id } })
+  })
+  const read = async () => db.salesOrder.findUniqueOrThrow({ where: { id: orderId! }, select: { shippingService: true, courierKey: true, shippingMethodId: true } })
+
+  // Imported with a key.
+  const first = await importWcOrder(payload(externalId, wcRateId, EN, [{ id: 2, key: '_o3d_courier_key', value: KEY }, { id: 4, key: '_o3d_courier_label', value: EN }]) as never)
+  assert.equal(first.success, true)
+  orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  assert.deepEqual(await read(), { shippingService: EN, courierKey: KEY, shippingMethodId: 'calcurates' })
+
+  // The line is edited in WooCommerce: the producer clears the meta, the title moves on. The stored key is cleared.
+  await updateExistingWcOrderFromPayload(orderId, payload(externalId, wcRateId, 'Free shipping', []) as never)
+  assert.deepEqual(await read(), { shippingService: 'Free shipping', courierKey: null, shippingMethodId: 'calcurates' })
+
+  // A key whose stored label no longer matches the title is not trusted either.
+  await updateExistingWcOrderFromPayload(orderId, payload(externalId, wcRateId, 'Edited title', [{ id: 2, key: '_o3d_courier_key', value: KEY }, { id: 4, key: '_o3d_courier_label', value: EN }]) as never)
+  assert.equal((await read()).courierKey, null)
+
+  // A new key for a new line is picked up.
+  await updateExistingWcOrderFromPayload(orderId, payload(externalId, wcRateId, DE, [{ id: 2, key: '_o3d_courier_key', value: 'calcurates:1_1' }, { id: 4, key: '_o3d_courier_label', value: DE }]) as never)
+  assert.deepEqual(await read(), { shippingService: DE, courierKey: 'calcurates:1_1', shippingMethodId: 'calcurates' })
+
+  // An order imported before the columns existed is populated by the next delivery.
+  await db.salesOrder.update({ where: { id: orderId }, data: { courierKey: null, shippingMethodId: null } })
+  await updateExistingWcOrderFromPayload(orderId, payload(externalId, wcRateId, EN, [{ id: 2, key: '_o3d_courier_key', value: KEY }, { id: 4, key: '_o3d_courier_label', value: EN }]) as never)
+  assert.deepEqual(await read(), { shippingService: EN, courierKey: KEY, shippingMethodId: 'calcurates' })
 })

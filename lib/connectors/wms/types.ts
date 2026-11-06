@@ -407,10 +407,15 @@ export type WmsOrderPushInput = {
   /** Carrier/service name passed through for the WMS to resolve; null = WMS default. */
   courierService: string | null
   /**
-   * The shipping label, when `courierService` is the language-independent courier key instead. A courier map is
-   * consulted against `courierService` first, then this. Absent/null: nothing further to try.
+   * Further names a courier map is consulted against, in order, after `courierService`
+   * (the combined "{method_id}:{method_title}", the bare title, the method id; empty entries are skipped).
    */
-  courierServiceLabel?: string | null
+  courierServiceAlternates?: string[]
+  /**
+   * Set only when `courierService` is the language-independent courier key: the "{method_id}:{method_title}" form
+   * the order would be pushed with without it, for the single retry after the warehouse refuses the key.
+   */
+  courierServiceLegacy?: string | null
   totalVat: number
   shippingExVat: number
   shippingVat: number
@@ -426,6 +431,13 @@ type WmsOrderPushResultBase = {
   /** True when the order's shipping service didn't resolve and the WMS fell back to a
    *  default courier — the warehouse should verify the courier before despatch. */
   courierFallback?: boolean
+  /**
+   * Which CourierService form the create ended with: NAME (the name sent first), LEGACY (the "{method_id}:{method_title}"
+   * form, after the courier key was refused) or PLACEHOLDER (the configured default courier). Persisted so a later
+   * amendment reuses it rather than re-sending a form the WMS refused. `courierFormName` is the first name tried.
+   */
+  courierForm?: 'NAME' | 'LEGACY' | 'PLACEHOLDER'
+  courierFormName?: string | null
 }
 
 /**

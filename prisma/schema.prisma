@@ -1767,6 +1767,9 @@ model SalesOrder {
   /// e.g. "calcurates:6384_7418(VAT & duty paid)"), mirrored verbatim. Sent to the warehouse as the courier service in
   /// place of the (translated) shipping label. Null when the order carries none.
   courierKey        String?          @map("courier_key")
+  /// The storefront's shipping method id for the first shipping line (e.g. "calcurates", "flat_rate"), mirrored verbatim.
+  /// With the label it forms the "{method_id}:{method_title}" courier name. Null on orders imported before it was kept.
+  shippingMethodId  String?          @map("shipping_method_id")
   shippingForeign   Decimal          @db.Decimal(18, 4) @default(0)
   taxRateName       String?          // e.g. "UK Standard Rate"
   taxRatePercent    Decimal?         @db.Decimal(5, 4) // e.g. 0.2000
@@ -3782,6 +3785,12 @@ model WmsOrderPushLink {
   // order-status sweep reports a resolved courier name. totalMismatchPence: the order's own
   // totals did not reconcile to within a penny at push time (surfaced for review).
   courierPending      Boolean           @default(false)
+  /// Which CourierService form the create ended with, so amendments reuse it instead of re-sending a form the WMS refused:
+  /// NAME (the name sent first), LEGACY ("{method_id}:{method_title}" after the courier key was refused) or PLACEHOLDER
+  /// (the configured default courier). `courierFormName` is the first name the create tried (the key, when there was one):
+  /// a form is reused only while the order still produces that same name.
+  courierForm         String?
+  courierFormName     String?
   totalMismatchPence  Int?
   /// 6oyu.2: dispatch-reconciliation dead-letter. The dispatch sweep counts
   /// CONSECUTIVE per-order reconcile errors here (reset on success/pending);

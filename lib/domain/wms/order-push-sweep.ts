@@ -367,6 +367,8 @@ type OrderForPush = {
   shippingService: string | null
   /** Language-independent courier key from the storefront; preferred over the label as the WMS courier service. */
   courierKey?: string | null
+  /** The storefront shipping method id; with the label it forms the "{method_id}:{method_title}" courier name. */
+  shippingMethodId?: string | null
   subtotalForeign: unknown
   shippingForeign: unknown
   taxForeign: unknown
@@ -581,6 +583,7 @@ export const ORDER_PUSH_SELECT = {
   billingAddress: true,
   shippingService: true,
   courierKey: true,
+  shippingMethodId: true,
   subtotalForeign: true,
   shippingForeign: true,
   taxForeign: true,
@@ -610,6 +613,49 @@ export function wmsPushOrderReference(
   return order.orderNumber ?? order.externalOrderNumber ?? order.id
 }
 
+/**
+ * The courier names for an order, mirroring the storefront sync's `_map_courier`.
+ *
+ * The combined "{method_id}:{method_title}" (the title as it is when it already starts with "method_id:", the bare
+ * title when the order has no stored method id or no title, else the id) is what Mintsoft's channel mapping is keyed
+ * on. The storefront's language-independent courier key, when the order has one, is sent INSTEAD, verbatim.
+ * The courier map is consulted against: the key, then the combined form, then the bare title, then the method id.
+ */
+export function courierNamesForOrder(order: { courierKey?: string | null; shippingService: string | null; shippingMethodId?: string | null }): {
+  courierService: string | null
+  courierServiceAlternates: string[]
+  courierServiceLegacy: string | null
+} {
+  const title = order.shippingService ?? ''
+  const methodId = order.shippingMethodId ?? ''
+  const combined = methodId && title && !title.startsWith(`${methodId}:`) ? `${methodId}:${title}` : (title || methodId)
+  const key = order.courierKey?.trim() ?? ''
+  if (key) {
+    return { courierService: key, courierServiceAlternates: [combined, title, methodId].filter(Boolean), courierServiceLegacy: combined || null }
+  }
+  return { courierService: combined || null, courierServiceAlternates: [title, methodId].filter(Boolean), courierServiceLegacy: null }
+}
+
+/**
+ * Apply the courier form a link's create ended with to the input of an AMENDMENT, so it does not re-send a form the WMS
+ * refused. Only while the order still produces the same first name the create tried; a changed shipping line computes its
+ * form fresh (and the amendment applies the same one-retry rule).
+ *   LEGACY      -> the "{method_id}:{method_title}" form, not the refused key.
+ *   PLACEHOLDER -> no courier name at all (the create left the courier to the default; naming it again would re-send what
+ *                  the WMS could not resolve).
+ */
+export function applyLinkCourierForm(
+  input: WmsOrderPushInput,
+  link: { courierForm?: string | null; courierFormName?: string | null },
+): WmsOrderPushInput {
+  if (!link.courierForm || (link.courierFormName ?? null) !== input.courierService) return input
+  if (link.courierForm === 'LEGACY' && input.courierServiceLegacy) {
+    return { ...input, courierService: input.courierServiceLegacy, courierServiceAlternates: [], courierServiceLegacy: null }
+  }
+  if (link.courierForm === 'PLACEHOLDER') return { ...input, courierService: null, courierServiceAlternates: [], courierServiceLegacy: null }
+  return input
+}
+
 export function buildPushInput(order: OrderForPush, externalWarehouseId: string): WmsOrderPushInput {
   const recipient = resolvePushRecipient(order)
   // Refuse BEFORE anything is claimed or sent: an empty street is not a destination (builds on local data only).
@@ -626,11 +672,7 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string)
     phone: recipient.phone,
     vatNumber: order.customerVatNumber,
     comments: null,
-    // The storefront's language-independent key when the order carries one (the label is translated per
-    // shopper language); otherwise the label, exactly as before. The label stays on the input so an operator
-    // override authored against it still applies.
-    courierService: order.courierKey?.trim() || order.shippingService,
-    courierServiceLabel: order.shippingService,
+    ...courierNamesForOrder(order),
     totalVat: num(order.taxForeign),
     shippingExVat: num(order.shippingForeign),
     shippingVat: 0,
@@ -669,6 +711,8 @@ type LinkWrite = {
   lastAttemptAt?: Date | null
   cancelledAt?: Date | null
   courierPending?: boolean
+  courierForm?: string | null
+  courierFormName?: string | null
   totalMismatchPence?: number | null
   dispatchFailureCount?: number
   dispatchLastError?: string | null
@@ -703,7 +747,7 @@ const RESET_DISPATCH_FAILURES = {
 export const HELD_CREATE_CURSOR_KEY = 'wms_order_push_held_create_cursor'
 
 export type WmsPushCandidate = OrderForPush & { shipFromWarehouseId: string | null; pushAttempts: number }
-export type WmsPushUpdateLink = { id: string; externalOrderId: string | null; order: OrderForPush & { shipFromWarehouseId: string | null } }
+export type WmsPushUpdateLink = { id: string; externalOrderId: string | null; courierForm?: string | null; courierFormName?: string | null; order: OrderForPush & { shipFromWarehouseId: string | null } }
 /**
  * o3d-92fu: a VALIDATION_FAILED link plus the order data the payload is rebuilt from.
  * `lastError` is carried so a re-run that fails for the SAME reason can re-stamp the
@@ -1877,14 +1921,14 @@ export async function runWmsOrderPushSweepCore(
         }
         await port.upsertByOrder(
           order.id,
-          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, totalMismatchPence, ...(unverifiableError ? { lastError: unverifiableError } : {}) },
+          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...(unverifiableError ? { lastError: unverifiableError } : {}) },
           // attempts: 0 on BOTH sides (o3d-bjc.8). claimForCreate has usually
           // created the link already, so the update side is what runs — and the
           // verification budget reads this counter. Left carrying four failed
           // create attempts, a create that finally succeeded would be
           // quarantined on its FIRST transient unknown, putting a live WMS order
           // outside the update, cancel and dispatch passes.
-          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, totalMismatchPence, ...RESET_DISPATCH_FAILURES },
+          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...RESET_DISPATCH_FAILURES },
         )
         // o3d-6x66: the claim's withdrawal re-check committed BEFORE this
         // remote push, so a withdrawal landing in between still gets its order
@@ -2359,7 +2403,7 @@ export async function runWmsOrderPushSweepCore(
           shadowedCount += 1
           continue
         }
-        const input = buildPushInput(link.order, externalWarehouseId)
+        const input = applyLinkCourierForm(buildPushInput(link.order, externalWarehouseId), link)
         update = await connector.updateOrder(link.externalOrderId, input, amendSeam.clearance)
         // Bump pushedAt either way so we don't re-attempt until the next change;
         // a non-NEW WMS order can no longer be amended (inbound webhooks aside).
@@ -2921,7 +2965,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       if (!dueIds.length) return []
       return db.wmsOrderPushLink.findMany({
         where: { id: { in: dueIds } },
-        select: { id: true, externalOrderId: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, updatedAt: true } } },
+        select: { id: true, externalOrderId: true, courierForm: true, courierFormName: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, updatedAt: true } } },
       })
     },
     async revalidatableLinks(connector, boundWarehouseIds, limit, paidNotBefore) {
