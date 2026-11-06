@@ -6,7 +6,7 @@ import type {
   WmsOrderPushResult,
   WmsOrderUpdateResult,
 } from '@/lib/connectors/wms/types'
-import { legacyCourierFormInput } from '@/lib/connectors/wms/courier-form'
+import { WmsOrderUpdatePartialError, legacyCourierFormInput } from '@/lib/connectors/wms/courier-form'
 import { roundTransmittedMoney } from '@/lib/connectors/wms/transmitted-money'
 import { extractMintsoftArrayPayload, extractMintsoftArrayPayloadStrict, extractMintsoftObjectPayload } from './normalizers'
 import { mintsoftRequest } from './client'
@@ -669,21 +669,24 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
   // A decoded Success: true on EVERY post of the chain, as the create requires: an answer that carries an OrderId but says
   // Success: false (or does not say Success: true) is a failure, not an amendment.
   if (data?.Success === true) {
-    // Line items are amended via the /Items sub-resource (the order-update endpoint ignores them); this propagates
-    // refund-netted quantities to the still-NEW WMS order. They go AFTER the order post on purpose: the courier selection
-    // is the part of an amendment that can be refused (and retried), and deciding it first means a courier failure never
-    // leaves the items half-amended. A failure here leaves the courier already set and the items to be redone, which the
-    // sweep does on its next pass (the order is still due).
-    await reconcileMintsoftOrderItems(externalOrderId, input, clientId)
-    // The amendment ended on the configured default courier where the order was not already known to be on it: the same
-    // warehouse review flag a create fallback raises.
+    // The amendment as the caller needs to hear of it: the form the accepted post ended on, and whether that is the default
+    // courier where the order was not already known to be on it (the same warehouse review flag a create fallback raises).
     const movedToDefault = form === 'PLACEHOLDER' && (input.courierFormUnknown === true || !input.courierPlaceholder)
-    return {
-      updated: true,
-      status: 'NEW',
+    const applied = {
       ...(movedToDefault ? { courierFallback: true } : {}),
       ...(input.courierFormUnknown || retry || (form === 'PLACEHOLDER' && !input.courierPlaceholder) ? { courierForm: form, courierFormName } : {}),
     }
+    // Line items are amended via the /Items sub-resource (the order-update endpoint ignores them); this propagates
+    // refund-netted quantities to the still-NEW WMS order. They go AFTER the order post on purpose: the courier selection
+    // is the part of an amendment that can be refused (and retried), and deciding it first means a courier failure never
+    // leaves the items half-amended. If the items then fail, the courier is already changed on the WMS order, so the error
+    // carries what the accepted post did (see WmsOrderUpdatePartialError) and the order stays due for the items to be redone.
+    try {
+      await reconcileMintsoftOrderItems(externalOrderId, input, clientId)
+    } catch (error) {
+      throw new WmsOrderUpdatePartialError(error instanceof Error ? error.message : String(error), applied)
+    }
+    return { updated: true, status: 'NEW', ...applied }
   }
   throw new Error(toStr(data?.Message) ?? 'Mintsoft order update failed')
 }

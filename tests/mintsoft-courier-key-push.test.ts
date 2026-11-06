@@ -24,6 +24,7 @@ let postSequence: Array<{ error: string } | { result: unknown }> = []
 let posts: Array<Record<string, unknown>> = []
 let searchRows: unknown[] = []
 let itemWrites = 0
+let itemsFail = false
 
 mock.module('@/lib/connectors/mintsoft/settings/schema', {
   namedExports: {
@@ -57,7 +58,7 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
       if (pathname === '/api/Order/Search') return { data: searchRows, status: 200 }
       if (pathname === '/api/Order/900' && (init?.method ?? 'GET') === 'GET') return { data: { ID: 900, OrderStatusId: 1, ClientId: 5 }, status: 200 }
       if (pathname === '/api/Order/900/Items') {
-        if ((init?.method ?? 'GET') === 'GET') return { data: [], status: 200 }
+        if ((init?.method ?? 'GET') === 'GET') return itemsFail ? { data: null, error: 'Mintsoft items endpoint down', status: 500 } : { data: [], status: 200 }
         itemWrites += 1
         return { data: { Success: true }, status: 200 }
       }
@@ -175,6 +176,7 @@ async function amend(input: WmsOrderPushInput, steps: typeof postSequence, map =
   postSequence = [...steps]
   posts = []
   itemWrites = 0
+  itemsFail = false
   const { updateMintsoftOrder } = await import('@/lib/connectors/mintsoft/api/order-push')
   return updateMintsoftOrder('900', input)
 }
@@ -366,4 +368,24 @@ test('Success: false with an OrderId is a failure on every post of the chain: no
   // An OrderId with no Success at all is not an amendment either.
   await assert.rejects(() => amend(INPUT, [{ result: [{ OrderId: 900 }] }]))
   assert.equal(itemWrites, 0)
+})
+
+test('an accepted fallback post followed by an /Items failure throws a partial error that carries the accepted fallback', async () => {
+  const { WmsOrderUpdatePartialError } = await import('@/lib/connectors/wms/courier-form')
+  const { applyLinkCourierForm } = await import('@/lib/domain/wms/order-push-sweep')
+  defaultCourierId = '77'
+  const unknown = applyLinkCourierForm(INPUT, { courierForm: null })
+  const attempt = async () => {
+    courierMap = ''
+    postSequence = [{ result: [REFUSED] }, { result: [REFUSED] }, { result: [{ Success: true }] }]
+    posts = []
+    itemsFail = true
+    const { updateMintsoftOrder } = await import('@/lib/connectors/mintsoft/api/order-push')
+    return updateMintsoftOrder('900', unknown)
+  }
+  const error = await attempt().then(() => null, (e: unknown) => e)
+  assert.ok(error instanceof WmsOrderUpdatePartialError)
+  assert.match((error as Error).message, /items endpoint down/)
+  assert.deepEqual((error as InstanceType<typeof WmsOrderUpdatePartialError>).applied, { courierFallback: true, courierForm: 'PLACEHOLDER', courierFormName: KEY })
+  assert.equal(posts[2]!.CourierServiceId, 77, 'the fallback post itself was accepted')
 })

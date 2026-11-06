@@ -16,3 +16,18 @@ export function legacyCourierFormInput(input: WmsOrderPushInput): WmsOrderPushIn
     courierServiceLegacy: null,
   }
 }
+
+/**
+ * An amendment's order post was ACCEPTED (the courier on the WMS order has changed) but a later step, the line-item
+ * reconcile, failed. Carries what the accepted post did, so the caller can still record the courier form and raise the
+ * default-courier warning instead of losing them with the thrown error.
+ */
+export class WmsOrderUpdatePartialError extends Error {
+  constructor(
+    message: string,
+    readonly applied: { courierForm?: 'NAME' | 'LEGACY' | 'PLACEHOLDER'; courierFormName?: string | null; courierFallback?: boolean },
+  ) {
+    super(message)
+    this.name = 'WmsOrderUpdatePartialError'
+  }
+}

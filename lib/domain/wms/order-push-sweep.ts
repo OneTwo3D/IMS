@@ -8,7 +8,7 @@ import { MAX_ADVISORY_PENCE } from './push-total-mismatch-note'
 import { isMirroredFeeLine } from './mirrored-fee-line'
 import { reconcilePushTotals, withheldGoodsGross, withheldLineCount } from './push-total-guard'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
-import { legacyCourierFormInput } from '@/lib/connectors/wms/courier-form'
+import { WmsOrderUpdatePartialError, legacyCourierFormInput } from '@/lib/connectors/wms/courier-form'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { wmsCreateObligationFloor, wmsProducerHold, wmsProducerSeam } from '@/lib/connectors/wms/producer-seam'
 import type { ProducerDecisionContext } from '@/lib/security/producer-disposition'
@@ -2385,6 +2385,26 @@ export async function runWmsOrderPushSweepCore(
     // Once the destination is live, a change made before the live-from instant is shadowed by the seam on every tick without changing the
     // link, so it would sit at the head of this oldest-first bounded batch for ever. The query leaves it out (the same floor as the create
     // query). No floor (not enforced, or not live): the legacy call.
+    // An amendment that NEWLY fell back to the default courier raises the same warehouse-visible warning a create fallback
+    // does. If posting it fails, the link is kept retryable: it is not marked pushed and does not record the new form, so
+    // the order stays due and the next pass finds the fallback again and posts the warning again. Once posted, the form is
+    // recorded, so the next pass knows the order is already on the default courier and does not post it twice.
+    const settleAmendedCourier = async (
+      link: WmsPushUpdateLink,
+      applied: { courierForm?: 'NAME' | 'LEGACY' | 'PLACEHOLDER'; courierFormName?: string | null; courierFallback?: boolean },
+    ) => {
+      const warning = applied.courierFallback
+        ? await postConflictComment(link.externalOrderId!, courierFallbackNote(link.order.shippingService), link.order.id)
+        : null
+      const retryable = warning === 'failed'
+      return {
+        retryable,
+        linkFields: {
+          ...(applied.courierForm && !retryable ? { courierForm: applied.courierForm, courierFormName: applied.courierFormName ?? null } : {}),
+          ...(applied.courierFallback ? { courierPending: true } : {}),
+        } as LinkWrite,
+      }
+    }
     for (const link of await (createFloor ? port.updatableLinks(connectorId, batchSize, createFloor) : port.updatableLinks(connectorId, batchSize))) {
       const externalWarehouseId = link.order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(link.order.shipFromWarehouseId) : undefined
       if (!externalWarehouseId || !link.externalOrderId) continue
@@ -2416,21 +2436,16 @@ export async function runWmsOrderPushSweepCore(
         }
         const input = applyLinkCourierForm(buildPushInput(link.order, externalWarehouseId), link)
         update = await connector.updateOrder(link.externalOrderId, input, amendSeam.clearance)
-        // An amendment that NEWLY fell back to the default courier raises the same warehouse-visible warning a create
-        // fallback does. If posting it fails, the link is kept retryable: it is not marked pushed and does not record the
-        // new form, so the order stays due and the next pass finds the fallback again and posts the warning again.
-        const warning = update.updated && update.courierFallback
-          ? await postConflictComment(link.externalOrderId, courierFallbackNote(link.order.shippingService), link.order.id)
-          : null
-        const warningRetryable = warning === 'failed'
+        // What the accepted order post did to the courier is settled here (form recorded, review flag, warehouse note); the same
+        // settlement runs when the item reconcile fails AFTER the post was accepted (see the catch below).
+        const settled = await settleAmendedCourier(link, update.updated ? update : {})
         // Bump pushedAt either way so we don't re-attempt until the next change;
         // a non-NEW WMS order can no longer be amended (inbound webhooks aside).
         await port.updateLink(link.id, {
           lastAttemptAt: ts,
-          ...(warningRetryable ? {} : { pushedAt: ts }),
-          lastError: warningRetryable ? 'Courier warning not posted on the WMS order; will retry' : update.updated ? null : `Amendment not propagated (WMS status ${update.status})`,
-          ...(update.updated && update.courierForm && !warningRetryable ? { courierForm: update.courierForm, courierFormName: update.courierFormName ?? null } : {}),
-          ...(update.updated && update.courierFallback ? { courierPending: true } : {}),
+          ...(settled.retryable ? {} : { pushedAt: ts }),
+          lastError: settled.retryable ? 'Courier warning not posted on the WMS order; will retry' : update.updated ? null : `Amendment not propagated (WMS status ${update.status})`,
+          ...settled.linkFields,
         })
         if (update.updated) result.updated += 1
         await audit({
@@ -2445,7 +2460,10 @@ export async function runWmsOrderPushSweepCore(
       } catch (error) {
         const message = scrubWmsError(error, 'WMS order update failed')
         result.failed += 1
-        await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts }).catch(() => {})
+        // The order post was accepted and the item reconcile failed: the courier on the WMS order has already changed, so its
+        // form and warning are settled now, and the link stays due (no pushedAt) for the items to be redone.
+        const partial = error instanceof WmsOrderUpdatePartialError ? await settleAmendedCourier(link, error.applied).catch(() => null) : null
+        await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts, ...(partial?.linkFields ?? {}) }).catch(() => {})
         await audit({
           action: 'order_update', outcome: update?.updated ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,
           summary: update
