@@ -6,6 +6,8 @@ import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { HELD_SALES_INVOICE_RECORD_KIND } from '@/lib/domain/sales/wc-sync-row-families'
 import { EMAIL_RECIPIENT_ERASED_REASON } from './email-recipient'
 import { scrubContactBlock } from './contact-gate'
+import { SYSTEM_PAYMENT_NOTE_PREFIXES, orderIsErasedInTx } from './order-state'
+export { orderIsErasedInTx }
 import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import { ERASED_ACTIVITY_DESCRIPTION, IDENTITY_BEARING_ENTITY_TYPES, redactIdentityKeys } from './activity-identity'
 import {
@@ -63,8 +65,8 @@ export async function eraseOrdersPersonalDataInTx(
   tx: Prisma.TransactionClient,
   orderIds: string[],
   erasedAt: Date,
-): Promise<Omit<ErasureCounts, 'customers' | 'shoppingCustomerLinks' | 'activityRowsScrubbed'>> {
-  const counts = { salesOrders: 0, shipments: 0, shoppingOrderLinks: 0, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, notifications: 0 }
+): Promise<Omit<ErasureCounts, 'customers' | 'shoppingCustomerLinks' | 'activityRowsScrubbed' | 'linkedFreeTextScrubbed'>> {
+  const counts = { salesOrders: 0, shipments: 0, shoppingOrderLinks: 0, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, notifications: 0 }
   for (const ids of chunks(orderIds)) {
     counts.salesOrders += (await tx.salesOrder.updateMany({
       where: { id: { in: ids } },
@@ -111,6 +113,12 @@ export async function eraseOrdersPersonalDataInTx(
 
     counts.accountingPayloadsScrubbed += await scrubAccountingPayloadContacts(tx, ids)
     counts.heldInvoicePayloadsScrubbed += await scrubHeldInvoicePayloads(tx, ids)
+    // The free-text NOTE on the order's payments is erased; the payment, its amount and its REFERENCE are kept (they reconcile with the bank and the
+    // ledger). Notes the importer itself writes are fixed sentences with no identity that it recognises by prefix, so they stay.
+    counts.paymentNotesErased += (await tx.payment.updateMany({
+      where: { orderId: { in: ids }, notes: { not: null }, AND: SYSTEM_PAYMENT_NOTE_PREFIXES.map((prefix) => ({ NOT: { notes: { startsWith: prefix } } })) },
+      data: { notes: null },
+    })).count
 
     // Notifications are linked to an order only by the URL they point at.
     counts.notifications += (await tx.notification.updateMany({
@@ -271,18 +279,47 @@ export async function scrubHeldInvoicePayloads(tx: Prisma.TransactionClient, ord
      WHERE "id" = ANY(${ids}::text[]) AND ("payload" #>> '{accountingPayload,contactName}') IS NOT NULL`)
 }
 
-/**
- * Whether the order (or its customer) is erased, read INSIDE the caller's transaction and AFTER the caller has taken the order lock
- * (`lockSalesOrder`). Every place that copies a contact name or email into an accounting row or a parked hold reads it this way,
- * so the copy and the answer cannot be separated by an erasure.
- */
-export async function orderIsErasedInTx(tx: Prisma.TransactionClient, orderId: string): Promise<boolean> {
-  const row = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, customer: { select: { gdprAnonymisedAt: true } } } })
-  return Boolean(row?.erasedAt || row?.customer?.gdprAnonymisedAt)
-}
-
 /** The contact block of an accounting payload, replaced the way the erasure replaces it (see contact-gate.ts). */
 export const scrubContactInAccountingPayload = scrubContactBlock
+
+/**
+ * Free text on the rows that hang off an erased customer's orders but are written by other systems or people: the warehouse link's last
+ * errors, order discrepancies, the returns inbox (reason, notes, and the raw warehouse payload) and the stock movements of the orders'
+ * shipment lines. Those texts can echo the recipient (a warehouse error that names the address, a return reason that names the person),
+ * so the subject's identifying VALUES (read before they were overwritten) are removed from them in place, and identity-named keys of the
+ * raw payload are replaced. Rows, statuses, ids and references are kept. Returns the number of rows changed.
+ */
+export async function scrubLinkedFreeText(tx: Prisma.TransactionClient, orderIds: string[], tokens: string[]): Promise<number> {
+  let changed = 0
+  const text = (value: string | null) => (value == null ? value : scrubIdentityText(value, tokens))
+  for (const ids of chunks(orderIds)) {
+    for (const row of await tx.wmsOrderPushLink.findMany({ where: { orderId: { in: ids } }, select: { id: true, lastError: true, dispatchLastError: true, dispatchUnresolvedError: true } })) {
+      const data = { lastError: text(row.lastError), dispatchLastError: text(row.dispatchLastError), dispatchUnresolvedError: text(row.dispatchUnresolvedError) }
+      if (data.lastError !== row.lastError || data.dispatchLastError !== row.dispatchLastError || data.dispatchUnresolvedError !== row.dispatchUnresolvedError) {
+        await tx.wmsOrderPushLink.update({ where: { id: row.id }, data }); changed += 1
+      }
+    }
+    for (const row of await tx.wmsOrderDiscrepancy.findMany({ where: { orderId: { in: ids } }, select: { id: true, detail: true } })) {
+      const detail = text(row.detail)
+      if (detail !== row.detail) { await tx.wmsOrderDiscrepancy.update({ where: { id: row.id }, data: { detail } }); changed += 1 }
+    }
+    for (const row of await tx.wmsReturnsInbox.findMany({ where: { orderId: { in: ids } }, select: { id: true, reason: true, resolutionNote: true, rawPayload: true } })) {
+      const reason = text(row.reason)
+      const resolutionNote = text(row.resolutionNote)
+      const structural = row.rawPayload == null ? row.rawPayload : redactIdentityKeys(row.rawPayload)
+      const rawPayload = structural == null ? structural : scrubIdentityJson(structural, tokens)
+      const payloadChanged = JSON.stringify(rawPayload) !== JSON.stringify(row.rawPayload)
+      if (reason !== row.reason || resolutionNote !== row.resolutionNote || payloadChanged) {
+        await tx.wmsReturnsInbox.update({ where: { id: row.id }, data: { reason, resolutionNote, ...(payloadChanged ? { rawPayload: (rawPayload ?? Prisma.JsonNull) as Prisma.InputJsonValue } : {}) } }); changed += 1
+      }
+    }
+    for (const row of await tx.stockMovement.findMany({ where: { shipmentLine: { shipment: { orderId: { in: ids } } }, note: { not: null } }, select: { id: true, note: true } })) {
+      const note = text(row.note)
+      if (note !== row.note) { await tx.stockMovement.update({ where: { id: row.id }, data: { note } }); changed += 1 }
+    }
+  }
+  return changed
+}
 
 export type EraseCustomerResult =
   | { success: true; requestId: string }
@@ -340,7 +377,8 @@ export async function eraseCustomerPersonalData(
         shipmentTracking: shipmentRows.map((r) => r.trackingNumber),
       })
       const activityRowsScrubbed = await scrubActivityLogIdentity(tx, [customerId, ...orderIds], tokens)
-      const counts: ErasureCounts = { customers: 1, shoppingCustomerLinks: links.count, activityRowsScrubbed, ...orderCounts }
+      const linkedFreeTextScrubbed = await scrubLinkedFreeText(tx, orderIds, tokens)
+      const counts: ErasureCounts = { customers: 1, shoppingCustomerLinks: links.count, activityRowsScrubbed, linkedFreeTextScrubbed, ...orderCounts }
       await logActivityInTransaction(tx, {
         entityType: 'CUSTOMER',
         entityId: customerId,

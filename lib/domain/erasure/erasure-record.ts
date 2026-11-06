@@ -60,6 +60,10 @@ export type ErasureCounts = {
   accountingPayloadsScrubbed: number
   /** Held WooCommerce sales-invoice rows (shopping sync log) whose parked accounting payload had contact identity replaced. */
   heldInvoicePayloadsScrubbed: number
+  /** Payments of these orders whose free-text note was erased (the reference and the amount are kept). */
+  paymentNotesErased: number
+  /** Rows hanging off these orders (warehouse links, discrepancies, returns inbox, stock movements) whose free text had the subject's values removed. */
+  linkedFreeTextScrubbed: number
   /** Existing activity-log rows whose description or metadata held the subject's identifying values. */
   activityRowsScrubbed: number
   notifications: number

@@ -984,3 +984,53 @@ test('[erasure] the importer paused between the customer lookup and the link ins
   assert.equal(matched, live.id)
   assert.equal(await db.shoppingCustomerLink.count({ where: { customerId: live.id, externalCustomerId: String(wooId2) } }), 1)
 })
+
+
+test('[erasure] payments: existing free-text notes are erased and the reference is kept; a payment recorded after the erasure still posts, with no free text', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { addPayment } = await import('@/app/actions/sales')
+  const SYSTEM_NOTE = 'Recorded from WooCommerce (the order was imported unpaid and paid later)'
+  const mk = (data: Record<string, unknown>) => db.payment.create({ data: { orderId: fx.orderId, amount: 10, currency: 'GBP', paidAt: new Date('2026-11-02T10:00:00Z'), ...data } as never })
+  const operator = await mk({ reference: 'BANK-REF-1', method: 'Bank Transfer', notes: `${NAME.first} phoned to say the transfer was sent` })
+  const system = await mk({ reference: 'TXN-77', notes: SYSTEM_NOTE })
+  t.after(async () => { await db.payment.deleteMany({ where: { orderId: fx.orderId } }); await db.accountingSyncLog.deleteMany({ where: { referenceId: fx.orderId } }); await fx.cleanup() })
+
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const rows = Object.fromEntries((await db.payment.findMany({ where: { id: { in: [operator.id, system.id] } } })).map((p) => [p.id, p]))
+  assert.equal(rows[operator.id]!.notes, null, 'the operator\'s free-text note is erased')
+  assert.equal(rows[operator.id]!.reference, 'BANK-REF-1', 'the reference reconciles with the bank and is kept')
+  assert.equal(rows[operator.id]!.amount.toString(), '10', 'the payment itself is untouched')
+  assert.equal(rows[system.id]!.notes, SYSTEM_NOTE, 'the importer\'s own fixed sentence is kept: the importer recognises its earlier receipts by it')
+
+  // A payment recorded AFTER the erasure: it posts, with the reference and amount, and no free text.
+  const after = await addPayment({ orderId: fx.orderId, amount: 5, currency: 'GBP', method: 'Bank Transfer', reference: 'BANK-REF-2', notes: `${NAME.last} says this is for the second parcel`, paidAt: '2026-11-05' })
+  assert.equal(after.success, true, JSON.stringify(after))
+  const late = await db.payment.findFirstOrThrow({ where: { orderId: fx.orderId, reference: 'BANK-REF-2' } })
+  assert.equal(late.notes, null, 'the free-text note is dropped for an erased order')
+  assert.equal(late.amount.toString(), '5', 'the money recorded')
+})
+
+test('[erasure] free text on the rows hanging off the orders (warehouse link errors, discrepancies, returns inbox) loses the subject\'s values', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const link = await db.wmsOrderPushLink.create({ data: { orderId: fx.orderId, connector: 'mintsoft', externalOrderId: 'WMS-1', externalOrderNumber: 'WMS-NO-1', lastError: `Address ${STREET}, ${POSTCODE} rejected for ${FULL_NAME}`, dispatchLastError: `No courier for ${NAME.last}` } as never })
+  const disc = await db.wmsOrderDiscrepancy.create({ data: { orderId: fx.orderId, connector: 'mintsoft', category: 'ADDRESS', detail: `Warehouse has ${FULL_NAME} at ${STREET}`, externalOrderNumber: 'WMS-NO-1' } as never })
+  const ret = await db.wmsReturnsInbox.create({ data: { orderId: fx.orderId, connector: 'mintsoft', externalReturnId: `RET-${randomUUID().slice(0, 6)}`, reason: `${NAME.first} did not like it`, resolutionNote: `Refunded ${FULL_NAME}`, rawPayload: { returnId: 'R1', customer: { name: FULL_NAME, email: EMAIL }, note: `from ${NAME.last}`, items: [{ sku: 'SKU-1', qty: 1 }] } } as never })
+  t.after(async () => { await db.wmsReturnsInbox.deleteMany({ where: { id: ret.id } }); await db.wmsOrderDiscrepancy.deleteMany({ where: { id: disc.id } }); await db.wmsOrderPushLink.deleteMany({ where: { id: link.id } }); await fx.cleanup() })
+
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const everything = JSON.stringify([
+    await db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } }),
+    await db.wmsOrderDiscrepancy.findUniqueOrThrow({ where: { id: disc.id } }),
+    await db.wmsReturnsInbox.findUniqueOrThrow({ where: { id: ret.id } }),
+  ])
+  for (const x of [NAME.first, NAME.last, EMAIL, STREET, POSTCODE]) assert.ok(!everything.includes(x), `the rows still hold ${x}`)
+  // The references that reconcile the order with the warehouse, and the structure of the raw return, are kept.
+  const keptLink = await db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })
+  assert.deepEqual([keptLink.externalOrderId, keptLink.externalOrderNumber], ['WMS-1', 'WMS-NO-1'])
+  assert.equal((await db.wmsReturnsInbox.findUniqueOrThrow({ where: { id: ret.id } })).rawPayload !== null, true)
+  assert.deepEqual(((await db.wmsReturnsInbox.findUniqueOrThrow({ where: { id: ret.id } })).rawPayload as { items: unknown }).items, [{ sku: 'SKU-1', qty: 1 }])
+})

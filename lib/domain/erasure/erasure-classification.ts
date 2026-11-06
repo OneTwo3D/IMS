@@ -1,5 +1,7 @@
 /**
- * EVERY TEXT OR JSON COLUMN ON THE TABLES THAT HANG OFF A CUSTOMER OR AN ORDER, CLASSIFIED.
+ * EVERY TEXT OR JSON COLUMN ON EVERY TABLE WITH A RELATION PATH TO A CUSTOMER OR AN ORDER, CLASSIFIED. The tables are discovered from
+ * the Prisma schema's relations by tests/erasure-schema-classification.test.ts, not listed by hand; the two tables that point at an
+ * order only by reference id (the email outbox and notifications) are named in that test.
  *
  *   erased        the erasure core overwrites it (see erase-personal-data.ts)
  *   retained      kept on purpose; the reason is the value
@@ -91,6 +93,49 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
       reason: 'owner decision: the refund reason text is kept',
       accountingWarning: 'accounting diagnostic on the refund record',
     },
+  },
+  // Linked by a relation, with no text or JSON column of their own (only keys, amounts and dates).
+  CogsEntry: { erased: [], notPersonal: [], retained: {} },
+  CostLayer: { erased: [], notPersonal: [], retained: {} },
+  CostLayerRevaluation: { erased: [], notPersonal: ['reason'], retained: {} },
+  CostLayerSourceLine: { erased: [], notPersonal: ['sourceCostLayerId'], retained: {} },
+  OrderAllocation: { erased: [], notPersonal: ['costLayerSnapshot'], retained: {} },
+  Payment: {
+    erased: ['notes'],
+    notPersonal: ['currency', 'method'],
+    retained: { reference: 'the payment reference / transaction id reconciles the receipt with the bank and the ledger' },
+  },
+  ReturnExpectation: { erased: [], notPersonal: ['reference', 'transitJournalKey'], retained: {} },
+  ReturnExpectationLine: { erased: [], notPersonal: ['sku', 'costSnapshot'], retained: {} },
+  SalesOrderLine: {
+    erased: [],
+    notPersonal: ['wclcFeeKind', 'sku', 'discountStr', 'fulfillmentRequirements'],
+    retained: { description: 'the product or fee text on an invoiced line: part of the retained sale record' },
+  },
+  SalesOrderRefundLine: {
+    erased: [],
+    notPersonal: ['costLayerSnapshot', 'accountingTaxType', 'lineKind'],
+    retained: { description: 'the text on a refunded line: part of the retained credit-note record' },
+  },
+  ShipmentLine: { erased: [], notPersonal: ['costLayerSnapshot'], retained: {} },
+  StockMovement: { erased: ['note'], notPersonal: ['referenceType', 'referenceId', 'idempotencyKey'], retained: {} },
+  WmsOrderDiscrepancy: {
+    erased: ['detail'],
+    notPersonal: ['connector', 'category', 'status'],
+    retained: { externalOrderNumber: 'the warehouse order number reconciles the order with the warehouse' },
+  },
+  WmsOrderPushLink: {
+    erased: ['lastError', 'dispatchLastError', 'dispatchUnresolvedError'],
+    notPersonal: ['connector', 'courierForm', 'courierFormName'],
+    retained: {
+      externalOrderId: 'the warehouse order id reconciles the order with the warehouse',
+      externalOrderNumber: 'the warehouse order number reconciles the order with the warehouse',
+    },
+  },
+  WmsReturnsInbox: {
+    erased: ['reason', 'rawPayload', 'resolutionNote'],
+    notPersonal: ['connector', 'externalReturnId', 'sku', 'reference', 'resolvedBy'],
+    retained: {},
   },
 }
 

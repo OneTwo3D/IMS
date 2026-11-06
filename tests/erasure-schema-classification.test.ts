@@ -11,38 +11,78 @@ import { ERASURE_CLASSIFICATION, classifiedColumns } from '../lib/domain/erasure
 
 const SCHEMA = readFileSync(new URL('../prisma/schema.prisma', import.meta.url), 'utf8')
 
-function textColumns(model: string): string[] {
-  const m = new RegExp(`^model ${model} \\{([\\s\\S]*?)^\\}`, 'm').exec(SCHEMA)
-  assert.ok(m, `model ${model} must exist in the schema`)
-  const out: string[] = []
-  for (const raw of m[1].split('\n')) {
-    const line = raw.split('//')[0].trim()
-    const col = /^(\w+)\s+(String|Json)(\[\])?(\?)?(\s|$)/.exec(line)
-    if (col) out.push(col[1])
+type ParsedModel = { name: string; textColumns: string[]; fkColumns: Set<string>; fkTargets: Set<string> }
+
+function parseModels(): Map<string, ParsedModel> {
+  const out = new Map<string, ParsedModel>()
+  const bodies = new Map<string, string>()
+  for (const [, name, body] of SCHEMA.matchAll(/^model (\w+) \{([\s\S]*?)^\}/gm)) bodies.set(name!, body!)
+  for (const [name, body] of bodies) {
+    const textColumns: string[] = []
+    const fkColumns = new Set<string>()
+    const fkTargets = new Set<string>()
+    for (const raw of body.split('\n')) {
+      const line = raw.split('//')[0]!.trim()
+      const col = /^(\w+)\s+(String|Json)(\[\])?(\?)?(\s|$)/.exec(line)
+      if (col) textColumns.push(col[1]!)
+      const rel = /^(\w+)\s+(\w+)(\[\])?\??\s+.*@relation\(.*fields:\s*\[([^\]]*)\]/.exec(line)
+      if (rel && bodies.has(rel[2]!)) {
+        fkTargets.add(rel[2]!)
+        for (const c of rel[4]!.split(',')) fkColumns.add(c.trim())
+      }
+    }
+    out.set(name, { name, textColumns, fkColumns, fkTargets })
   }
   return out
 }
 
-test('every text or Json column on a customer- or order-linked table has an erasure verdict', () => {
+/** Every model with a relation path (a foreign key, transitively) to Customer or SalesOrder, discovered from the schema. */
+function modelsLinkedToCustomerOrOrder(): string[] {
+  const models = parseModels()
+  const linked = new Set(['Customer', 'SalesOrder'])
+  for (let changed = true; changed;) {
+    changed = false
+    for (const m of models.values()) {
+      if (!linked.has(m.name) && [...m.fkTargets].some((t) => linked.has(t))) { linked.add(m.name); changed = true }
+    }
+  }
+  return [...linked].sort()
+}
+
+/** The two tables that point at an order only by a reference id (referenceType / referenceId, an action url), so no relation finds them. */
+const LINKED_BY_REFERENCE_ID = ['EmailOutbox', 'Notification']
+
+test('every table with a relation path to Customer or SalesOrder is classified, column by column, and a new linked table fails here', () => {
+  const models = parseModels()
+  const linked = modelsLinkedToCustomerOrOrder()
+  assert.ok(linked.length >= 20, `PRECONDITION: the discovery found the linked tables (${linked.length})`)
+  const unclassifiedModels = linked.filter((m) => !ERASURE_CLASSIFICATION[m])
+  assert.deepEqual(unclassifiedModels, [], `classify these tables in lib/domain/erasure/erasure-classification.ts: ${unclassifiedModels.join(', ')}`)
   const missing: string[] = []
-  for (const model of Object.keys(ERASURE_CLASSIFICATION)) {
-    const classified = new Set(classifiedColumns(model))
-    for (const column of textColumns(model)) {
-      if (!classified.has(column)) missing.push(`${model}.${column}`)
+  for (const name of [...linked, ...LINKED_BY_REFERENCE_ID]) {
+    const parsed = models.get(name)!
+    const classified = new Set(classifiedColumns(name))
+    for (const column of parsed.textColumns) {
+      if (column === 'id' || parsed.fkColumns.has(column)) continue
+      if (!classified.has(column)) missing.push(`${name}.${column}`)
     }
   }
   assert.deepEqual(missing, [], `classify these columns in lib/domain/erasure/erasure-classification.ts: ${missing.join(', ')}`)
+  // Nothing is classified that the discovery does not account for, so a table dropped from the relation graph is noticed.
+  const extra = Object.keys(ERASURE_CLASSIFICATION).filter((m) => !linked.includes(m) && !LINKED_BY_REFERENCE_ID.includes(m))
+  assert.deepEqual(extra, [])
 })
 
 test('no classification entry names a column that no longer exists (a stale entry would mask a rename)', () => {
+  const models = parseModels()
   const stale: string[] = []
   for (const model of Object.keys(ERASURE_CLASSIFICATION)) {
-    const present = new Set(textColumns(model))
+    const present = new Set(models.get(model)?.textColumns ?? [])
     for (const column of classifiedColumns(model)) if (!present.has(column)) stale.push(`${model}.${column}`)
   }
+  assert.deepEqual(stale, [])
   const dupes = Object.keys(ERASURE_CLASSIFICATION).flatMap((m) => classifiedColumns(m).filter((c, i, a) => a.indexOf(c) !== i).map((c) => `${m}.${c}`))
   assert.deepEqual(dupes, [], 'a column has exactly one verdict')
-  assert.deepEqual(stale, [])
 })
 
 test('the classification is not vacuous: personal columns are classified erased, the decided retentions are retained', () => {

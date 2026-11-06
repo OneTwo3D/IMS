@@ -146,6 +146,7 @@ import { canTransitionSalesOrder } from '@/lib/domain/workflows/sales-order-stat
 import { readSingleXeroDocument } from '@/lib/connectors/xero/single-document'
 import { isPaymentStatusMismatch } from '@/lib/domain/sales/o2c-guards'
 import { CustomerAnonymisedError, lockCustomerForOrderLink } from '@/lib/domain/erasure/customer-link'
+import { paymentNotesForOrder } from '@/lib/domain/erasure/order-state'
 import {
   cancelSalesOrderFulfillmentState,
   lockSalesOrder,
@@ -3849,7 +3850,8 @@ export async function addPayment(input: {
           currency: input.currency,
           method: input.method || null,
           reference: input.reference || null,
-          notes: input.notes || null,
+          // Free text is dropped for an ERASED order (the payment itself still records; the reference is kept for reconciliation).
+          notes: await paymentNotesForOrder(tx, input.orderId, input.notes),
           paidAt,
           // whether `paidAt` was an explicit instant or a date-only input (the FX gain/loss report reads a stored midnight by it)
           paidAtExplicitInstant: explicitSettlementInstant(input.paidAt, paidAt),

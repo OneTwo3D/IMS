@@ -215,6 +215,31 @@ test('every writer of storefront customer links is in the census, and the lookup
   assert.match(fn, /FROM "customers" WHERE "id" = \$\{matchedId\} FOR UPDATE[\s\S]*gdprAnonymisedAt[\s\S]*tx\.shoppingCustomerLink\.create/)
 })
 
+/**
+ * CENSUS OF EVERY WRITER OF Payment ROWS and what keeps free text off an erased order's payments. The payment always records (money
+ * must post and reconcile); only the free-text note is dropped, and the reference is kept for reconciliation.
+ *
+ *   gated    addPayment: notes pass through paymentNotesForOrder under the order lock (blank for an erased order)
+ *   system   the storefront importer's receipts: fixed sentences with no identity, which the importer recognises by prefix
+ */
+const PAYMENT_WRITERS: Record<string, number> = {
+  'app/actions/sales.ts': 1,
+  'lib/connectors/woocommerce/sync/order-import.ts': 2,
+  'lib/domain/erasure/erase-personal-data.ts': 1, // the erasure's own erase of the free-text note
+}
+
+test('every writer of payments is in the census; the manual one blanks free text for an erased order', () => {
+  const cwd = new URL('..', import.meta.url).pathname
+  const out = execFileSync('git', ['grep', '-cE', 'payment\\.(create|createMany|update|updateMany|upsert)\\(', '--', 'app', 'lib', ':!app/generated', ':!*.test.ts'], { encoding: 'utf8', cwd }).trim().split('\n').filter(Boolean)
+  const found = Object.fromEntries(out.map((line) => { const i = line.lastIndexOf(':'); return [line.slice(0, i), Number(line.slice(i + 1))] }))
+  assert.deepEqual(found, PAYMENT_WRITERS)
+  const sales = readFileSync(new URL('../app/actions/sales.ts', import.meta.url), 'utf8')
+  assert.match(sales, /notes: await paymentNotesForOrder\(tx, input\.orderId, input\.notes\)/)
+  const importer = readFileSync(new URL('../lib/connectors/woocommerce/sync/order-import.ts', import.meta.url), 'utf8')
+  for (const match of importer.matchAll(/notes: (existing\.length > 0\s*\? )?'(Recorded|Imported) from WooCommerce/g)) assert.ok(match[0])
+  assert.match(importer, /Imported from WooCommerce \(paid when the order was imported\)/)
+})
+
 test('both manual order creators lock and re-read the customer inside the create transaction, before the create', () => {
   const src = readFileSync(new URL('../app/actions/sales.ts', import.meta.url), 'utf8')
   const start = src.indexOf('export async function createSalesOrder')
