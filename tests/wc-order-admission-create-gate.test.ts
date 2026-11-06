@@ -76,7 +76,7 @@ function txDelegates() {
     create: async () => { state.createdOrders++; return { id: 'so-new' } },
     update: async () => ({}),
   },
-  shoppingOrderLink: { updateMany: async () => ({ count: 1 }) },
+  shoppingOrderLink: { updateMany: async () => ({ count: 1 }), findFirst: async () => null },
   // Models the r5 lookup: canonical slug OR its `wc-` spelling, case-insensitively.
   shoppingStatusMapping: {
     findMany: async ({ where }: { where: { OR?: Array<{ externalStatus?: { equals?: string } }> } }) => {
@@ -105,6 +105,12 @@ function txDelegates() {
       return row ?? {}
     },
     findFirst: async ({ where }: { where: Row }) => matchRefusalRows(where)[0] ?? null,
+    findUnique: async ({ where }: { where: { id: string } }) => state.refusalQueue.find((entry) => entry.id === where.id) ?? null,
+    updateMany: async ({ where, data }: { where: { id: string }; data: Row }) => {
+      const row = state.refusalQueue.find((entry) => entry.id === where.id)
+      if (row) Object.assign(row, data)
+      return { count: row ? 1 : 0 }
+    },
     findMany: async ({ where }: { where: Row }) => matchRefusalRows(where),
     count: async () => 0,
   },

@@ -8,6 +8,11 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Paid-order retry and cancelled-order follow-ups
+
+- **Fixed: a paid WooCommerce order whose total or currency differs from what IMS holds is no longer acknowledged and forgotten.** The delivery still records no receipt and writes its finding (`wc_paid_total_differs` / `wc_paid_currency_differs`), but it now also leaves a durable retry row in the pending queue (written in the same transaction, under the order lock). The scheduled `fx-rates` run replays the stored snapshot on every pass, so correcting the IMS order records the receipt without another WooCommerce delivery. The row is retired only when the receipt is recorded or the order is paid by another route, a retry of a still-mismatched order never marks it done, and after 60 retries it is retired FAILED with an ERROR finding (`wc_paid_block_retry_gave_up`) and a notification to the administrators.
+- **Fixed: the invoice email and the WooCommerce invoice note are not sent for a cancelled order.** They are not queued when the invoice posts for a cancelled order (`invoice_followup_not_queued_cancelled_order`), and a row queued before the cancellation is retired CANCELLED with the reason when it drains (`invoice_followup_refused_cancelled_order`), checked under the order lock cancellation takes. The invoice PDF copy is still saved. A payment is decided by when the money arrived against the database-stamped cancellation time, as before: dated after the cancellation it is held (the overpayment path is not built), otherwise it registers.
+
 ### Manufacturing recipe readers: history is frozen, planning counts the claimed recipe
 
 - **Fixed: production variance no longer moves when a recipe is re-imported.** Planned consumption is now computed from the recipe frozen onto the order when it started (`componentSnapshot`), the same record consumption and costing use, instead of the live recipe. A started or completed order with no frozen recipe (started before recipes were frozen, or an unreadable snapshot) is left out of the report and named in a note under it; it is never measured against the live recipe.
