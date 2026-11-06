@@ -6,6 +6,7 @@ import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { HELD_SALES_INVOICE_RECORD_KIND } from '@/lib/domain/sales/wc-sync-row-families'
 import { EMAIL_RECIPIENT_ERASED_REASON } from './email-recipient'
 import { scrubContactBlock } from './contact-gate'
+import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import { ERASED_ACTIVITY_DESCRIPTION, IDENTITY_BEARING_ENTITY_TYPES, redactIdentityKeys } from './activity-identity'
 import {
   ERASURE_FAILURE_ACTION,
@@ -213,7 +214,7 @@ export async function scrubActivityLogIdentity(
  * THE CONTACT BLOCK IN THE ACCOUNTING SYNC PAYLOAD. A WooCommerce invoice job stores `contactName` and `contactEmail` in
  * `accounting_sync_logs.payload`, and the Xero processor reads them to find or create the ledger contact when it posts.
  *
- * NOT YET SENT (PENDING, FAILED): the contact name becomes the placeholder and the email is removed, so a later post can
+ * NOT YET SENT (PENDING, FAILED, or CANCELLED and PROVEN never posted: see `neverPosted`): the contact name becomes the placeholder and the email is removed, so a later post can
  * only ever name the placeholder. Every financial field of the payload (lines, amounts, dates, currency, references) is
  * untouched, and the idempotency key does not depend on the contact, so a retry still dedupes.
  * ALREADY IN THE LEDGER OR CLAIMED (SYNCED, CANCELLED, PROCESSING): the name is part of what the ledger holds for the
@@ -225,9 +226,20 @@ export async function scrubAccountingPayloadContacts(tx: Prisma.TransactionClien
   const refunds = await tx.salesOrderRefund.findMany({ where: { orderId: { in: orderIds } }, select: { id: true } })
   const refIds = [...orderIds, ...refunds.map((r) => r.id)]
   const scope = { referenceType: { in: ['SalesOrder', 'SalesOrderRefund'] }, referenceId: { in: refIds } }
-  const all = await tx.accountingSyncLog.findMany({ where: scope, select: { id: true, status: true } })
-  const unsentIds = all.filter((r) => r.status === 'PENDING' || r.status === 'FAILED').map((r) => r.id)
-  const keptIds = all.filter((r) => r.status !== 'PENDING' && r.status !== 'FAILED').map((r) => r.id)
+  const all = await tx.accountingSyncLog.findMany({
+    where: scope,
+    select: { id: true, status: true, externalTransactionId: true, abandonedBeforeRemoteCall: true, settlementBasis: true, remoteAttemptedAt: true, attemptRevision: true },
+  })
+  // A CANCELLED row PROVEN never posted is not a ledger record: the cancelling writer stamped abandonedBeforeRemoteCall on a
+  // row nobody ever claimed (the ledger standing says PROVEN_NOT_POSTED), and the row carries no document id, no remote
+  // attempt stamp and attempt revision 0. Its name is scrubbed like an unsent row's. A CANCELLED row with ANY posting
+  // evidence (an id, an attempt stamp, a claimed revision, an operator's word, no proof stamp) may have reached the ledger and
+  // keeps its name with the SYNCED rows.
+  const neverPosted = (r: (typeof all)[number]) =>
+    r.status === 'CANCELLED' && ledgerStanding(r) === 'PROVEN_NOT_POSTED' && !(r.externalTransactionId ?? '').trim() && r.remoteAttemptedAt === null && r.attemptRevision === 0
+  const isUnsent = (r: (typeof all)[number]) => r.status === 'PENDING' || r.status === 'FAILED' || neverPosted(r)
+  const unsentIds = all.filter(isUnsent).map((r) => r.id)
+  const keptIds = all.filter((r) => !isUnsent(r)).map((r) => r.id)
   const unsent = unsentIds.length === 0 ? 0 : await tx.$executeRaw`
     UPDATE "accounting_sync_logs"
        SET "payload" = ("payload" - 'contactEmail') || jsonb_build_object('contactName', ${ERASURE_PLACEHOLDER_NAME}::text)

@@ -891,3 +891,31 @@ test('[erasure] an email enqueue racing the erasure: paused after the address re
   assert.equal(await db.emailOutbox.count({ where: { referenceId: fx.orderId, kind: 'ACCOUNTING_INVOICE' } }), 0, 'nothing was written')
   assert.equal(await db.emailOutbox.count({ where: { toEmail: EMAIL } }), 0, 'no outbox row anywhere holds the address')
 })
+
+
+test('[erasure] a CANCELLED accounting row PROVEN never posted is scrubbed like an unsent one; a cancelled row with any posting evidence keeps its ledger name', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const body = () => ({ contactName: FULL_NAME, contactEmail: EMAIL, date: '2026-11-02', currency: 'GBP', lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200' }] })
+  const mk = (extra: Record<string, unknown>) => db.accountingSyncLog.create({ data: { type: 'SALES_INVOICE', status: 'CANCELLED', referenceType: 'SalesOrder', referenceId: fx.orderId, payload: body(), ...extra } as never })
+  // An unclaimed invoice cancelled before it was ever attempted, with the proof stamp the cancelling writers record.
+  const proven = await mk({ abandonedBeforeRemoteCall: true, attemptRevision: 0 })
+  // CONTROLS, each with one piece of posting evidence (or the absence of the proof):
+  const withId = await mk({ abandonedBeforeRemoteCall: true, externalTransactionId: 'XERO-INV-1' })
+  const attempted = await mk({ abandonedBeforeRemoteCall: true, remoteAttemptedAt: new Date('2026-11-02T10:00:00Z') })
+  const claimed = await mk({ abandonedBeforeRemoteCall: true, attemptRevision: 2 })
+  const unproven = await mk({ abandonedBeforeRemoteCall: null, attemptRevision: 0 })
+  const ids = [proven.id, withId.id, attempted.id, claimed.id, unproven.id]
+  t.after(async () => { await db.accountingSyncLog.deleteMany({ where: { id: { in: ids } } }); await fx.cleanup() })
+
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const rows = Object.fromEntries((await db.accountingSyncLog.findMany({ where: { id: { in: ids } } })).map((r) => [r.id, r.payload as Record<string, unknown>]))
+  assert.equal(rows[proven.id]!.contactName, 'GDPR Anonymised', 'a row proven never posted is not a ledger record: its name is scrubbed')
+  assert.equal('contactEmail' in rows[proven.id]!, false)
+  assert.deepEqual(rows[proven.id]!.lines, body().lines, 'financial fields are kept')
+  for (const row of [withId, attempted, claimed, unproven]) {
+    assert.equal(rows[row.id]!.contactName, FULL_NAME, `posting evidence keeps the ledger name (${JSON.stringify({ id: row.externalTransactionId, at: row.remoteAttemptedAt, rev: row.attemptRevision, ab: row.abandonedBeforeRemoteCall })})`)
+    assert.equal('contactEmail' in rows[row.id]!, false, 'but the email, which is not part of the posted document, is removed')
+  }
+})
