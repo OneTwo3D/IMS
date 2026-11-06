@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
-import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { HELD_SALES_INVOICE_RECORD_KIND } from '@/lib/domain/sales/wc-sync-row-families'
 import { EMAIL_RECIPIENT_ERASED_REASON } from './email-recipient'
 import { scrubContactBlock } from './contact-gate'
@@ -46,6 +45,14 @@ import {
  */
 
 const CHUNK = 500
+
+/**
+ * TRANSACTION OPTIONS SIZED FOR THE WORKLOAD. An erasure is ONE transaction (the customer, every order, the scrubs and the proof commit
+ * together or not at all), and a long-standing customer can have thousands of orders and tens of thousands of activity rows. Prisma's
+ * default interactive-transaction timeout is 5 seconds, which a large customer would exceed, rolling the whole erasure back every time. The
+ * work is also set-based (one locking query, bulk updates), so the timeout is a ceiling, not an expected duration.
+ */
+export const ERASURE_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 120_000 } as const
 
 function chunks<T>(items: T[], size = CHUNK): T[][] {
   const out: T[][] = []
@@ -171,19 +178,28 @@ export function collectIdentityTokens(source: IdentitySource): string[] {
   return [...tokens].sort((a, b) => b.length - a.length)
 }
 
+const compiledText = new WeakMap<string[], RegExp | null>()
+const compiledJson = new WeakMap<string[], RegExp | null>()
+const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+/** ONE alternation over every token, compiled once per token list (longest first): a customer with thousands of orders has thousands of tokens and tens of thousands of rows to test. */
+function combined(tokens: string[], cache: WeakMap<string[], RegExp | null>, form: (token: string) => string): RegExp | null {
+  if (cache.has(tokens)) return cache.get(tokens)!
+  const regex = tokens.length === 0 ? null : new RegExp(tokens.map((t) => escapeRegex(form(t))).join('|'), 'gi')
+  cache.set(tokens, regex)
+  return regex
+}
+
 export function scrubIdentityText(text: string, tokens: string[]): string {
-  let out = text
-  for (const token of tokens) out = out.replace(new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), ERASED_TEXT)
-  return out
+  const regex = combined(tokens, compiledText, (t) => t)
+  return regex ? text.replace(regex, ERASED_TEXT) : text
 }
 
 function scrubIdentityJson(value: unknown, tokens: string[]): unknown {
+  const regex = combined(tokens, compiledJson, (t) => JSON.stringify(t).slice(1, -1))
+  if (!regex) return value
   const text = JSON.stringify(value)
-  let out = text
-  for (const token of tokens) {
-    const escaped = JSON.stringify(token).slice(1, -1)
-    out = out.replace(new RegExp(escaped.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), ERASED_TEXT)
-  }
+  const out = text.replace(regex, ERASED_TEXT)
   return out === text ? value : JSON.parse(out)
 }
 
@@ -204,16 +220,35 @@ export async function scrubActivityLogIdentity(
       where: { entityId: { in: ids }, NOT: { action: ERASURE_RECORD_ACTION } },
       select: { id: true, description: true, metadata: true, entityType: true },
     })
+    const changedIds: string[] = []
+    const descriptions: string[] = []
+    const metadataJson: string[] = []
+    const setMetadata: boolean[] = []
     for (const row of rows) {
       // STRUCTURE FIRST (independent of any value), then the value match as a second net.
       const structuralDescription = IDENTITY_BEARING_ENTITY_TYPES.includes(row.entityType) ? ERASED_ACTIVITY_DESCRIPTION : row.description
       const structuralMetadata = row.metadata == null ? row.metadata : redactIdentityKeys(row.metadata)
       const description = structuralDescription === ERASED_ACTIVITY_DESCRIPTION ? structuralDescription : scrubIdentityText(structuralDescription, tokens)
       const metadata = structuralMetadata == null ? structuralMetadata : scrubIdentityJson(structuralMetadata, tokens)
-      if (description === row.description && JSON.stringify(metadata) === JSON.stringify(row.metadata)) continue
-      await tx.activityLog.update({ where: { id: row.id }, data: { description, ...(JSON.stringify(metadata) === JSON.stringify(row.metadata) ? {} : { metadata: (metadata ?? Prisma.JsonNull) as Prisma.InputJsonValue }) } })
-      scrubbed += 1
+      const metadataChanged = JSON.stringify(metadata) !== JSON.stringify(row.metadata)
+      if (description === row.description && !metadataChanged) continue
+      changedIds.push(row.id)
+      descriptions.push(description)
+      setMetadata.push(metadataChanged)
+      metadataJson.push(metadataChanged ? JSON.stringify(metadata ?? null) : 'null')
     }
+    // ONE statement per chunk, not one round trip per row: the values differ per row, so they are passed as parallel arrays.
+    for (const part of chunks(changedIds, 1000)) {
+      const from = changedIds.indexOf(part[0]!)
+      const to = from + part.length
+      await tx.$executeRaw`
+        UPDATE "activity_logs" a
+           SET "description" = v.d,
+               "metadata" = CASE WHEN v.setm THEN v.m::jsonb ELSE a."metadata" END
+          FROM unnest(${part}::text[], ${descriptions.slice(from, to)}::text[], ${metadataJson.slice(from, to)}::text[], ${setMetadata.slice(from, to)}::boolean[]) AS v(id, d, m, setm)
+         WHERE a."id" = v.id`
+    }
+    scrubbed += changedIds.length
   }
   return scrubbed
 }
@@ -362,9 +397,10 @@ export async function eraseCustomerPersonalData(
         const exists = await tx.customer.findUnique({ where: { id: customerId }, select: { id: true } })
         return exists ? 'Customer already anonymised' : 'Customer not found'
       }
-      const orders = await tx.salesOrder.findMany({ where: { customerId }, select: { id: true }, orderBy: { id: 'asc' } })
-      const orderIds = orders.map((o) => o.id)
-      for (const id of orderIds) await lockSalesOrder(tx, id)
+      // ALL OF THE CUSTOMER'S ORDERS ARE LOCKED IN ONE STATEMENT, in id order (the customer was claimed first: customer, then orders). One
+      // round trip instead of one per order; the rows come back locked, and are the set the rest of the erasure works on.
+      const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "sales_orders" WHERE "customerId" = ${customerId} ORDER BY id FOR UPDATE`
+      const orderIds = locked.map((o) => o.id)
       const orderCounts = await eraseOrdersPersonalDataInTx(tx, orderIds, erasedAt)
       // THE STOREFRONT ACCOUNT LINK IS DELETED, not blanked: its externalCustomerId is the live storefront customer id and resolves to
       // the account, and nothing financial references the row (it has no dependants; orders keep their own order link). With it gone
@@ -389,7 +425,7 @@ export async function eraseCustomerPersonalData(
         userId: options.userId,
       })
       return null
-    })
+    }, ERASURE_TRANSACTION_OPTIONS)
     if (refusal) return { success: false, error: refusal }
     return { success: true, requestId }
   } catch (e) {

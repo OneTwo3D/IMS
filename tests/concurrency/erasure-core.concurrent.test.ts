@@ -1050,3 +1050,60 @@ test('[erasure] free text on the rows hanging off the orders (warehouse link err
   assert.equal((await db.wmsReturnsInbox.findUniqueOrThrow({ where: { id: ret.id } })).rawPayload !== null, true)
   assert.deepEqual(((await db.wmsReturnsInbox.findUniqueOrThrow({ where: { id: ret.id } })).rawPayload as { items: unknown }).items, [{ sku: 'SKU-1', qty: 1 }])
 })
+
+
+test('[erasure] a large customer (300 orders, 2000 activity rows, payments, warehouse links) erases in one transaction well inside its timeout, and the proof commits', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { eraseCustomerPersonalData, ERASURE_TRANSACTION_OPTIONS } = await import('@/lib/domain/erasure/erase-personal-data')
+  const ORDERS = 300
+  const tag = randomUUID().slice(0, 8)
+  const orderRows = Array.from({ length: ORDERS }, (_, i) => ({
+    id: `big-${tag}-${i}`, orderNumber: `BIG-${tag}-${i}`, status: 'DRAFT' as const, currency: 'GBP', customerId: fx.customerId,
+    customerName: FULL_NAME, customerEmail: EMAIL, billingAddress: { line1: STREET, postcode: POSTCODE }, notes: `Leave with ${NAME.last} next door`,
+    subtotalForeign: 1, totalForeign: 1, subtotalBase: 1, totalBase: 1,
+  }))
+  await db.salesOrder.createMany({ data: orderRows as never })
+  const ids = orderRows.map((o) => o.id)
+  await db.payment.createMany({ data: ids.map((orderId, i) => ({ orderId, amount: 1, currency: 'GBP', paidAt: new Date('2026-11-02T10:00:00Z'), reference: `REF-${tag}-${i}`, notes: `${NAME.first} paid by phone` })) as never })
+  await db.wmsOrderPushLink.createMany({ data: ids.map((orderId, i) => ({ orderId, connector: 'mintsoft', externalOrderId: `W-${tag}-${i}`, lastError: `Rejected ${STREET} for ${FULL_NAME}` })) as never })
+  const entityIds = [fx.customerId, ...ids]
+  await db.activityLog.createMany({
+    data: Array.from({ length: 2000 }, (_, i) => ({
+      id: `bigal-${tag}-${i}`, entityType: i % 7 === 0 ? 'CUSTOMER' : 'SALES_ORDER', entityId: entityIds[i % entityIds.length]!, action: 'noted', tag: 'sales',
+      description: i % 2 === 0 ? `Phoned ${FULL_NAME} about ${STREET}` : `Operational note ${i}`,
+      metadata: i % 3 === 0 ? { contact: { email: EMAIL }, ref: `r${i}` } : { ref: `r${i}` },
+    })) as never,
+  })
+  t.after(async () => {
+    await db.activityLog.deleteMany({ where: { id: { startsWith: `bigal-${tag}` } } })
+    await db.activityLog.deleteMany({ where: { entityId: { in: ids } } })
+    await db.payment.deleteMany({ where: { orderId: { in: ids } } })
+    await db.wmsOrderPushLink.deleteMany({ where: { orderId: { in: ids } } })
+    await db.salesOrder.deleteMany({ where: { id: { in: ids } } })
+    await fx.cleanup()
+  })
+
+  const started = Date.now()
+  const result = await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })
+  const elapsed = Date.now() - started
+  assert.equal(result.success, true, JSON.stringify(result))
+  console.log(`# large erasure: ${ORDERS + 1} orders, 2000 activity rows, ${elapsed} ms (timeout ${ERASURE_TRANSACTION_OPTIONS.timeout} ms)`)
+  assert.ok(elapsed < 30_000, `the erasure took ${elapsed} ms; it must finish far inside its ${ERASURE_TRANSACTION_OPTIONS.timeout} ms timeout`)
+
+  // The proof committed with everything else, and names every order.
+  const proof = await db.activityLog.findFirstOrThrow({ where: { entityId: fx.customerId, action: 'gdpr_erasure_recorded' } })
+  const meta = proof.metadata as { orderIds: string[]; counts: Record<string, number> }
+  assert.equal(meta.orderIds.length, ORDERS + 1)
+  assert.equal(meta.counts.salesOrders, ORDERS + 1)
+  assert.ok(meta.counts.activityRowsScrubbed >= 1000, `activity rows scrubbed: ${meta.counts.activityRowsScrubbed}`)
+  assert.equal(meta.counts.paymentNotesErased >= ORDERS, true)
+  // Nothing personal remains on any of it.
+  assert.equal(await db.salesOrder.count({ where: { customerId: fx.customerId, erasedAt: null } }), 0)
+  const rows = JSON.stringify(await db.activityLog.findMany({ where: { OR: [{ id: { startsWith: `bigal-${tag}` } }, { entityId: { in: entityIds } }] } }))
+  for (const x of [NAME.first, NAME.last, EMAIL, STREET, POSTCODE]) assert.ok(!rows.includes(x), `activity rows still hold ${x}`)
+  const links = JSON.stringify(await db.wmsOrderPushLink.findMany({ where: { orderId: { in: ids } } }))
+  assert.ok(!links.includes(NAME.last) && !links.includes(STREET), 'warehouse link errors were scrubbed')
+  assert.equal(await db.payment.count({ where: { orderId: { in: ids }, notes: { not: null } } }), 0)
+  assert.equal(await db.payment.count({ where: { orderId: { in: ids }, reference: { startsWith: `REF-${tag}` } } }), ORDERS, 'every payment reference is kept')
+})
