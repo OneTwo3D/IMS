@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 import { NextResponse } from 'next/server'
 
 import '@/lib/cron-jobs'
@@ -90,12 +92,17 @@ function dayMatches(c: ParsedCron, date: Date): boolean {
   return domOk && dowOk
 }
 
-/** Firing times (epoch ms, UTC, ascending) of a cron expression over the leap year 2028, or null when unreadable. */
-export function* cronFiringTimes(expression: string): Generator<number> {
+/** First year of the 28-year cycle (every weekday x leap-year combination) the profile is taken over. */
+const CYCLE_START_YEAR = 2024
+const CYCLE_YEARS = 28
+
+/** Firing times (epoch ms, UTC, ascending) of a cron expression over `years` years from `fromYear` (default: leap year 2028). */
+export function* cronFiringTimes(expression: string, fromYear = 2028, years = 1): Generator<number> {
   const c = parseCron(expression)
   if (!c) return
-  const start = Date.UTC(2028, 0, 1)
-  for (let day = 0; day < 366; day += 1) {
+  const start = Date.UTC(fromYear, 0, 1)
+  const days = (Date.UTC(fromYear + years, 0, 1) - start) / DAY_MS
+  for (let day = 0; day < days; day += 1) {
     const dayStart = start + day * DAY_MS
     if (!dayMatches(c, new Date(dayStart))) continue
     for (const h of c.hours) for (const m of c.minutes) yield dayStart + h * HOUR_MS + m * MINUTE_MS
@@ -116,26 +123,26 @@ export function cronScheduleProfile(expression: string): CronScheduleProfile | n
   const cached = profileCache.get(expression)
   if (cached !== undefined) return cached
   let profile: CronScheduleProfile | null = null
-  if (parseCron(expression)) {
-    let last: number | null = null
-    let gap = Infinity
-    let perDay = 0
-    let maxPerDay = 0
-    let currentDay = -1
-    let any = false
-    for (const t of cronFiringTimes(expression)) {
-      any = true
-      if (last !== null) gap = Math.min(gap, t - last)
-      last = t
-      const day = Math.floor(t / DAY_MS)
-      if (day !== currentDay) {
-        currentDay = day
-        perDay = 0
+  const c = parseCron(expression)
+  if (c) {
+    // Every matching day fires the same minutes-of-day, so the gaps are: inside a day, and between consecutive matching days.
+    // Day-of-month/day-of-week OR matches shift with the year, so take them over a full 28-year weekday/leap cycle.
+    const minutesOfDay = c.hours.flatMap((h) => c.minutes.map((m) => h * 60 + m)).sort((a, b) => a - b)
+    let gapMin = Infinity
+    for (let i = 1; i < minutesOfDay.length; i += 1) gapMin = Math.min(gapMin, minutesOfDay[i] - minutesOfDay[i - 1])
+    const start = Date.UTC(CYCLE_START_YEAR, 0, 1)
+    const days = (Date.UTC(CYCLE_START_YEAR + CYCLE_YEARS, 0, 1) - start) / DAY_MS
+    let lastDay = -1
+    for (let day = 0; day < days; day += 1) {
+      if (!dayMatches(c, new Date(start + day * DAY_MS))) continue
+      if (lastDay >= 0) {
+        gapMin = Math.min(gapMin, (day - lastDay) * 1440 + minutesOfDay[0] - minutesOfDay[minutesOfDay.length - 1])
       }
-      perDay += 1
-      maxPerDay = Math.max(maxPerDay, perDay)
+      lastDay = day
     }
-    if (any) profile = { cadenceMs: Number.isFinite(gap) ? gap : 366 * DAY_MS, maxPerDay }
+    if (lastDay >= 0) {
+      profile = { cadenceMs: Number.isFinite(gapMin) ? gapMin * MINUTE_MS : 366 * DAY_MS, maxPerDay: minutesOfDay.length }
+    }
   }
   profileCache.set(expression, profile)
   return profile
@@ -273,9 +280,20 @@ export type CronRateLimitOptions = {
  *   The allowlisted job is still CRON_SECRET-gated; this limit is defence-in-
  *   depth. Production leaves both E2E vars unset.
  */
-export function cronRateLimitKey(jobName: string, sourceIp?: string | null): string {
-  if (sourceIp?.trim()) return `cron:${jobName}:${sourceIp.trim()}`
-  return `cron:${jobName}`
+export function cronRateLimitKey(jobName: string, sourceIp?: string | null, schedule?: string | null): string {
+  const base = schedule ? `cron:${jobName}:${cronScheduleHash(schedule)}` : `cron:${jobName}`
+  if (sourceIp?.trim()) return `${base}:${sourceIp.trim()}`
+  return base
+}
+
+/**
+ * Short stable hash of the whitespace-normalised effective schedule. It versions the bucket keys: a saved schedule edit
+ * starts FRESH buckets, so runs recorded under the old cadence never count against the new limit (a job moved from every
+ * 5 minutes to once a day would otherwise 429 its first daily run). Cost: a one-time reset of the job's counters, and of its
+ * Xero run budget, after each edit; edits are rare and admin-only.
+ */
+export function cronScheduleHash(schedule: string): string {
+  return createHash('sha256').update(schedule.trim().split(/\s+/).join(' ')).digest('hex').slice(0, 8)
 }
 
 /**
@@ -289,8 +307,8 @@ export function cronRateLimitKey(jobName: string, sourceIp?: string | null): str
  * The sentinel can never collide with a real source IP: getClientIp() returns only a normalized, verified
  * address (lib/request-ip.ts normalizeIp → isIP) or null, and `e2e-global` is neither.
  */
-export function cronRateLimitDailyBudgetKey(jobName: string): string {
-  return `cron:${jobName}:xero-daily-budget`
+export function cronRateLimitDailyBudgetKey(jobName: string, schedule?: string | null): string {
+  return schedule ? `cron:${jobName}:${cronScheduleHash(schedule)}:xero-daily-budget` : `cron:${jobName}:xero-daily-budget`
 }
 
 export function cronRateLimitGlobalKey(jobName: string): string {
@@ -391,7 +409,7 @@ export async function enforceCronRateLimit(
   const checker = options.checker ?? checkRateLimit
   const sourceIp = options.request ? getClientIp(options.request.headers) : null
   let result = await checker(
-    cronRateLimitKey(jobName, sourceIp),
+    cronRateLimitKey(jobName, sourceIp, effectiveSchedule),
     max,
     windowMs,
   )
@@ -408,7 +426,7 @@ export async function enforceCronRateLimit(
     // PRODUCTION (no E2E raise in effect): a live-Xero job also spends an IP-independent rolling daily run budget, so
     // rotating source addresses with a leaked secret cannot multiply cron runs (a run budget, not a Xero call budget).
     result = await checker(
-      cronRateLimitDailyBudgetKey(jobName),
+      cronRateLimitDailyBudgetKey(jobName, effectiveSchedule),
       cronXeroDailyBudget(effectiveSchedule),
       E2E_GLOBAL_CAP_WINDOW_MS,
     )

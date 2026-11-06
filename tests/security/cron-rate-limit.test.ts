@@ -12,6 +12,7 @@ import {
   cronCadenceMs,
   cronFiringTimes,
   cronRateLimitDailyBudgetKey,
+  cronScheduleHash,
   cronScheduleProfile,
   cronXeroDailyBudget,
   XERO_DAILY_BUDGET_CEILING,
@@ -24,6 +25,10 @@ import { getAllCronJobs } from '@/lib/cron-registry'
 import { PACK_SCHEDULE_SLUG } from '@/lib/reconciliation-pack/schedule-constants'
 import { MemoryRateLimitBackend } from '@/lib/security/rate-limit-memory'
 
+function defaultScheduleOf(job: string): string {
+  return getAllCronJobs().find((j) => j.slug === job)!.defaultSchedule
+}
+
 test('cron rate-limit helper uses per-job keys and the limit derived from the registry schedule', async () => {
   const calls: Array<{ key: string; max: number; windowMs: number }> = []
   const response = await enforceCronRateLimit('inventory-snapshot', async (key, max, windowMs) => {
@@ -33,7 +38,7 @@ test('cron rate-limit helper uses per-job keys and the limit derived from the re
 
   assert.equal(response, null)
   assert.deepEqual(calls, [{
-    key: cronRateLimitKey('inventory-snapshot'),
+    key: cronRateLimitKey('inventory-snapshot', null, defaultScheduleOf('inventory-snapshot')),
     ...cronRateLimitFor('inventory-snapshot'),
   }])
   assert.deepEqual(cronRateLimitFor('inventory-snapshot'), { max: 3, windowMs: 24 * 60 * 60_000 })
@@ -54,7 +59,7 @@ test('cron rate-limit helper scopes quotas by verified source IP when available'
   })
 
   assert.equal(response, null)
-  assert.equal(calls[0]?.key, cronRateLimitKey('backup', '203.0.113.9'))
+  assert.equal(calls[0]?.key, cronRateLimitKey('backup', '203.0.113.9', defaultScheduleOf('backup')))
 })
 
 test('cron rate-limit helper returns 429 with retry metadata when quota is consumed', async () => {
@@ -186,14 +191,14 @@ test('only a CAPPED job takes the second tenant-wide bucket check', async () => 
   await withEnvAsync({ E2E_TEST_MODE: '1', E2E_CRON_RATE_LIMIT_MAX: '10000' }, async () => {
     assert.deepEqual(
       await keysFor('xero-tax-rate-drift'),
-      [cronRateLimitKey('xero-tax-rate-drift', '203.0.113.9'), cronRateLimitGlobalKey('xero-tax-rate-drift')],
+      [cronRateLimitKey('xero-tax-rate-drift', '203.0.113.9', defaultScheduleOf('xero-tax-rate-drift')), cronRateLimitGlobalKey('xero-tax-rate-drift')],
       'capped job: IP bucket first, then the shared ceiling',
     )
     // accounting-daily-batch is internal (no external quota to exhaust) and X-01/X-02 drive it repeatedly in
     // one run — it has no ceiling, so it must keep exactly ONE bucket check.
     assert.deepEqual(
       await keysFor('accounting-daily-batch'),
-      [cronRateLimitKey('accounting-daily-batch', '203.0.113.9')],
+      [cronRateLimitKey('accounting-daily-batch', '203.0.113.9', defaultScheduleOf('accounting-daily-batch'))],
       'uncapped job: single IP-scoped check, unchanged',
     )
   })
@@ -201,7 +206,7 @@ test('only a CAPPED job takes the second tenant-wide bucket check', async () => 
   await withEnvAsync({ E2E_TEST_MODE: undefined, E2E_CRON_RATE_LIMIT_MAX: '10000' }, async () => {
     assert.deepEqual(
       await keysFor('xero-tax-rate-drift'),
-      [cronRateLimitKey('xero-tax-rate-drift', '203.0.113.9'), cronRateLimitDailyBudgetKey('xero-tax-rate-drift')],
+      [cronRateLimitKey('xero-tax-rate-drift', '203.0.113.9', defaultScheduleOf('xero-tax-rate-drift')), cronRateLimitDailyBudgetKey('xero-tax-rate-drift', defaultScheduleOf('xero-tax-rate-drift'))],
       'override disarmed: no E2E bucket, but the production daily run budget is always checked after the IP slice',
     )
   })
@@ -303,7 +308,7 @@ test('the tenant-wide ceiling is applied over 24h, not the job window (daily quo
 
   assert.deepEqual(seen, [
     {
-      key: cronRateLimitKey('xero-tax-rate-drift', '203.0.113.9'),
+      key: cronRateLimitKey('xero-tax-rate-drift', '203.0.113.9', defaultScheduleOf('xero-tax-rate-drift')),
       max: 20,
       windowMs: CRON_RATE_LIMIT_WINDOW_MS,
     },
@@ -392,6 +397,8 @@ test('cadence is the shortest real gap between firings, including restricted day
   assert.equal(cronCadenceMs('0 0 1,15 * *'), 14 * 24 * HOUR, 'shortest gap: Jan 1 to Jan 15')
   // Both day fields restricted: cron fires on EITHER (Mondays plus the 1st).
   assert.equal(cronCadenceMs('0 0 1 * 1'), 24 * HOUR)
+  // OR-matching of day-of-month and day-of-week shifts with the year: Feb 1 and a Monday on Feb 2 happen in 2026.
+  assert.equal(cronCadenceMs('0 0 1 2 1'), 24 * HOUR)
   assert.equal(cronCadenceMs('nonsense'), null)
   assert.equal(cronCadenceMs('61 * * * *'), null)
 })
@@ -428,6 +435,24 @@ test('the effective (saved) schedule drives the limit, not the registry default'
   }
 })
 
+test('a saved schedule edit starts fresh buckets: */5 to daily admits the first daily run', async () => {
+  const { backend, setNow } = makeBackend()
+  const check = (k: string, m: number, w: number) => backend.check(k, m, w)
+  const request = new Request('https://ims.example.com/x', { headers: { 'x-real-ip': '198.51.100.7' } })
+  // A day of 5-minute runs under the old schedule fills the old bucket (and the Xero budget).
+  for (let i = 0; i < 12; i += 1) {
+    setNow(START + i * 5 * MINUTE)
+    assert.equal(await enforceCronRateLimit('accounting-sync', { request, checker: check, scheduleReader: async () => '*/5 * * * *' }), null)
+  }
+  // Operator moves it to 02:00 daily; its first daily run, minutes later, must not inherit the old counts.
+  setNow(START + 61 * MINUTE)
+  const first = await enforceCronRateLimit('accounting-sync', { request, checker: check, scheduleReader: async () => '0 2 * * *' })
+  assert.equal(first, null, 'first run under the new schedule is admitted')
+  assert.notEqual(cronRateLimitKey('accounting-sync', '1.2.3.4', '*/5 * * * *'), cronRateLimitKey('accounting-sync', '1.2.3.4', '0 2 * * *'))
+  assert.notEqual(cronRateLimitDailyBudgetKey('accounting-sync', '*/5 * * * *'), cronRateLimitDailyBudgetKey('accounting-sync', '0 2 * * *'))
+  assert.equal(cronScheduleHash('0  2 * * *'), cronScheduleHash(' 0 2 * * * '), 'whitespace-normalised')
+})
+
 test('production: a live-Xero job has an IP-independent rolling daily budget; the census names every accounting-module job', async () => {
   const budget = cronXeroDailyBudget('0 * * * *')
   assert.equal(budget, 32)
@@ -450,7 +475,7 @@ test('production: a live-Xero job has an IP-independent rolling daily budget; th
     }
   })
   assert.equal(allowed, budget, 'many source IPs over a day spend one shared budget')
-  assert.equal(cronRateLimitDailyBudgetKey('xero-tax-rate-drift'), 'cron:xero-tax-rate-drift:xero-daily-budget')
+  assert.equal(cronRateLimitDailyBudgetKey('xero-tax-rate-drift', '0 * * * *'), `cron:xero-tax-rate-drift:${cronScheduleHash('0 * * * *')}:xero-daily-budget`)
 
   // Census: every registry job in the xero module is in the live-Xero set, every member is a real job, and each
   // job's budget exceeds its busiest day.
@@ -477,13 +502,13 @@ test('the daily budget does not apply to non-Xero jobs or when the E2E raise is 
   }
   await withEnvAsync({ E2E_TEST_MODE: undefined }, async () => {
     await enforceCronRateLimit('backup', { checker, scheduleReader: async () => null })
-    assert.deepEqual(seen.splice(0), [cronRateLimitKey('backup')])
+    assert.deepEqual(seen.splice(0), [cronRateLimitKey('backup', null, defaultScheduleOf('backup'))])
     await enforceCronRateLimit('xero-tax-rate-drift', { checker, scheduleReader: async () => null })
-    assert.deepEqual(seen.splice(0), [cronRateLimitKey('xero-tax-rate-drift'), cronRateLimitDailyBudgetKey('xero-tax-rate-drift')])
+    assert.deepEqual(seen.splice(0), [cronRateLimitKey('xero-tax-rate-drift', null, defaultScheduleOf('xero-tax-rate-drift')), cronRateLimitDailyBudgetKey('xero-tax-rate-drift', defaultScheduleOf('xero-tax-rate-drift'))])
   })
   await withEnvAsync({ E2E_TEST_MODE: '1', E2E_CRON_RATE_LIMIT_MAX: '10000' }, async () => {
     await enforceCronRateLimit('accounting-daily-batch', { checker, scheduleReader: async () => null })
-    assert.deepEqual(seen.splice(0), [cronRateLimitKey('accounting-daily-batch')])
+    assert.deepEqual(seen.splice(0), [cronRateLimitKey('accounting-daily-batch', null, defaultScheduleOf('accounting-daily-batch'))])
   })
 })
 
