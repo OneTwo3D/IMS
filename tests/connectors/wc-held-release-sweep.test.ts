@@ -103,6 +103,9 @@ const applyRefusalUpdate = (row: Record<string, unknown>, update: Record<string,
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      // The release reads the erasure marker under the order lock (an order that is not erased) before it copies the parked payload.
+      $transaction: async function (this: unknown, fn: (tx: unknown) => Promise<unknown>) { return fn(this) },
+      $queryRaw: async () => [],
       shoppingSyncLog: {
         findMany: async ({ where, take }: { where: Record<string, unknown>; take?: number }) =>
           state.held.filter((r) => matchesHeld(r, where)).slice(0, take ?? undefined),
@@ -117,6 +120,7 @@ mock.module('@/lib/db', {
         create: async () => { throw new Error('the sweep must not create hold rows') },
       },
       salesOrder: {
+        findUnique: async () => ({ erasedAt: null, customer: null }),
         findMany: async ({ where }: { where: { id: { in: string[] } } }) =>
           state.orders.filter((o) => where.id.in.includes(o.id)),
       },

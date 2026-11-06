@@ -22,6 +22,8 @@ const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const skip = !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1'
 
 let accountingMocked = false
+// The accounting queue double: by default it records nothing; a test that needs the real row installs a writer.
+let queueImpl: (args: { type: string; referenceType: string; referenceId: string; payload: Record<string, unknown>; idempotencyKey?: string }) => Promise<unknown> = async () => ({ queued: true })
 async function mockAccounting() {
   if (accountingMocked) return
   const actual = await import('@/lib/accounting')
@@ -29,7 +31,7 @@ async function mockAccounting() {
     namedExports: {
       ...actual,
       getAccountingSettings: async () => ({ connector: 'xero', salesAccount: '200', shippingAccount: '260', discountAccount: '270', reverseChargeSalesTaxType: '' }),
-      queueAccountingSync: async () => ({ queued: true }),
+      queueAccountingSync: async (args: never) => queueImpl(args),
     },
   })
   accountingMocked = true
@@ -459,4 +461,83 @@ test('[erasure] notes and shipment tracking edits on an erased order are refused
   assert.equal((await db.shipment.findUniqueOrThrow({ where: { id: shipment.id } })).trackingNumber, null)
   const leaked = JSON.stringify(await db.activityLog.findMany({ where: { entityId: fx.orderId } }))
   assert.ok(!leaked.includes('EDIT-AFTER-ERASURE') && !leaked.includes('EDIT-BEFORE'), 'no activity row carries a tracking number (the earlier one was scrubbed)')
+})
+
+
+test('[erasure] hold, erase, release: the held WooCommerce invoice payload is scrubbed, and a release of a stale unscrubbed hold copies no identity', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { retryHeldWcSalesInvoiceReleases } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { buildHeldSalesInvoicePayload, HELD_SALES_INVOICE_RECORD_KIND } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const queued: string[] = []
+  queueImpl = async (args) => {
+    const row = await db.accountingSyncLog.create({ data: { type: 'SALES_INVOICE', status: 'PENDING', referenceType: args.referenceType, referenceId: args.referenceId, payload: { ...args.payload, _idempotencyKey: args.idempotencyKey } as never } })
+    queued.push(row.id)
+    return { queued: true }
+  }
+  t.after(async () => {
+    queueImpl = async () => ({ queued: true })
+    await db.accountingSyncLog.deleteMany({ where: { referenceId: fx.orderId } })
+    await db.shoppingSyncLog.deleteMany({ where: { entityId: fx.orderId } })
+    await fx.cleanup()
+  })
+  const contact = { contactName: FULL_NAME, contactEmail: EMAIL }
+  const park = (accountingPayload: Record<string, unknown>) => buildHeldSalesInvoicePayload({
+    externalOrderId: String(fx.externalId), externalOrderNumber: String(fx.externalId), salesOrderId: fx.orderId, orderNumber: 'SO-HELD', metaKey: '_wcpdf_invoice_number',
+    accountingPayload: { ...contact, date: '2026-11-02', currency: 'GBP', lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200' }], ...accountingPayload }, chartConnector: 'xero',
+  })
+  const hold = await db.shoppingSyncLog.create({ data: {
+    connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', entityId: fx.orderId, externalId: String(fx.externalId),
+    recordKind: HELD_SALES_INVOICE_RECORD_KIND, payload: park({}) as never, errorMessage: 'waiting', syncedAt: null,
+  } })
+
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const scrubbed = (await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: hold.id } })).payload as { accountingPayload: Record<string, unknown>; reason: string }
+  assert.equal(scrubbed.accountingPayload.contactName, 'GDPR Anonymised')
+  assert.equal('contactEmail' in scrubbed.accountingPayload, false)
+  assert.deepEqual(scrubbed.accountingPayload.lines, [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200' }], 'financial fields are kept')
+  assert.equal(scrubbed.reason, (park({}) as { reason: string }).reason, 'the hold stays releasable: its discriminating reason is untouched')
+
+  // WooCommerce numbers the invoice: the release sweep copies the (scrubbed) hold into a new accounting row.
+  await db.salesOrder.update({ where: { id: fx.orderId }, data: { invoiceNumber: 'INV-ERASE-1' } })
+  const first = await retryHeldWcSalesInvoiceReleases()
+  assert.ok(first.released >= 1, JSON.stringify(first))
+  const row1 = await db.accountingSyncLog.findFirstOrThrow({ where: { id: { in: queued } } })
+  const text1 = JSON.stringify(row1.payload)
+  for (const s of [NAME.first, NAME.last, EMAIL]) assert.ok(!text1.includes(s), `the released row carries ${s}`)
+  assert.equal((row1.payload as { invoiceNumber: string }).invoiceNumber, 'INV-ERASE-1')
+
+  // A STALE hold: parked with identity AFTER the erasure's scrub (as a release that read it before the erasure would hold it).
+  await db.accountingSyncLog.deleteMany({ where: { id: { in: queued } } })
+  queued.length = 0
+  await db.shoppingSyncLog.update({ where: { id: hold.id }, data: { status: 'PENDING', payload: park({}) as never, errorMessage: 'waiting' } })
+  const second = await retryHeldWcSalesInvoiceReleases()
+  assert.ok(second.released >= 1, JSON.stringify(second))
+  const row2 = await db.accountingSyncLog.findFirstOrThrow({ where: { id: { in: queued } } })
+  const text2 = JSON.stringify(row2.payload)
+  for (const s of [NAME.first, NAME.last, EMAIL]) assert.ok(!text2.includes(s), `the release gate let ${s} through`)
+  assert.equal((row2.payload as { contactName: string }).contactName, 'GDPR Anonymised')
+})
+
+test('[erasure] a customer renamed before the erasure: names from BEFORE the rename are gone from the whole log too (structure, not only current values)', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  t.after(async () => { await fx.cleanup() })
+  const { updateCustomer } = await import('@/app/actions/customers')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { ERASED_ACTIVITY_DESCRIPTION } = await import('@/lib/domain/erasure/activity-identity')
+  const OLD = { first: 'Alicia', last: 'Zephyrine' }, NEW = { first: 'Bartholomew', last: 'Yarrowby' }
+  assert.equal((await updateCustomer(fx.customerId, { firstName: OLD.first, lastName: OLD.last })).success, true)
+  assert.equal((await updateCustomer(fx.customerId, { firstName: NEW.first, lastName: NEW.last })).success, true)
+  // PRECONDITION: the log really holds both names, or "gone" proves nothing.
+  const before = JSON.stringify(await db.activityLog.findMany({ where: { entityId: fx.customerId } }))
+  assert.ok(before.includes(OLD.first) && before.includes(NEW.first))
+
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const haystack = JSON.stringify(await db.activityLog.findMany())
+  for (const s of [OLD.first, OLD.last, NEW.first, NEW.last, NAME.first, NAME.last]) assert.ok(!haystack.includes(s), `the activity log still contains ${s}`)
+  const rows = await db.activityLog.findMany({ where: { entityId: fx.customerId, entityType: 'CUSTOMER', action: 'updated' } })
+  assert.equal(rows.length, 2, 'the rows are kept')
+  for (const r of rows) assert.equal(r.description, ERASED_ACTIVITY_DESCRIPTION)
 })

@@ -3,7 +3,9 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
+import { HELD_SALES_INVOICE_RECORD_KIND } from '@/lib/domain/sales/wc-sync-row-families'
 import { EMAIL_RECIPIENT_ERASED_REASON } from './email-recipient'
+import { ERASED_ACTIVITY_DESCRIPTION, IDENTITY_BEARING_ENTITY_TYPES, redactIdentityKeys } from './activity-identity'
 import {
   ERASURE_FAILURE_ACTION,
   ERASURE_FAILURE_DESCRIPTION,
@@ -60,7 +62,7 @@ export async function eraseOrdersPersonalDataInTx(
   orderIds: string[],
   erasedAt: Date,
 ): Promise<Omit<ErasureCounts, 'customers' | 'shoppingCustomerLinks' | 'activityRowsScrubbed'>> {
-  const counts = { salesOrders: 0, shipments: 0, shoppingOrderLinks: 0, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, notifications: 0 }
+  const counts = { salesOrders: 0, shipments: 0, shoppingOrderLinks: 0, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, notifications: 0 }
   for (const ids of chunks(orderIds)) {
     counts.salesOrders += (await tx.salesOrder.updateMany({
       where: { id: { in: ids } },
@@ -106,6 +108,7 @@ export async function eraseOrdersPersonalDataInTx(
     })).count
 
     counts.accountingPayloadsScrubbed += await scrubAccountingPayloadContacts(tx, ids)
+    counts.heldInvoicePayloadsScrubbed += await scrubHeldInvoicePayloads(tx, ids)
 
     // Notifications are linked to an order only by the URL they point at.
     counts.notifications += (await tx.notification.updateMany({
@@ -120,6 +123,7 @@ export const ERASED_TEXT = '[erased]'
 
 type IdentitySource = { customer: Record<string, unknown> | null; orders: Array<Record<string, unknown>>; shipmentTracking: Array<string | null> }
 
+const FREE_TEXT_KEYS = new Set(['notes', 'internalNotes'])
 const GENERIC_TOKENS = new Set(['gdpr', 'anonymised', 'gb', 'uk', 'null', 'none', 'n/a'])
 
 function collectStrings(value: unknown, into: string[], depth = 0): void {
@@ -135,14 +139,21 @@ function collectStrings(value: unknown, into: string[], depth = 0): void {
  * generic ones (a country code) are dropped so the scrub does not mangle ordinary words.
  */
 export function collectIdentityTokens(source: IdentitySource): string[] {
-  const raw: string[] = []
+  const whole: string[] = []
+  const words: string[] = []
   const rows = [...(source.customer ? [source.customer] : []), ...source.orders]
-  for (const row of rows) for (const value of Object.values(row)) collectStrings(value, raw)
-  for (const t of source.shipmentTracking) if (t) raw.push(t)
-  const extra: string[] = []
-  for (const value of raw) for (const part of value.split(/\s+/)) extra.push(part)
+  for (const row of rows) {
+    for (const [key, value] of Object.entries(row)) {
+      const found: string[] = []
+      collectStrings(value, found)
+      whole.push(...found)
+      // Free text is matched only as a whole string: splitting it into words would redact ordinary words everywhere.
+      if (!FREE_TEXT_KEYS.has(key)) for (const f of found) for (const part of f.split(/\s+/)) words.push(part)
+    }
+  }
+  for (const t of source.shipmentTracking) if (t) whole.push(t)
   const tokens = new Set<string>()
-  for (const candidate of [...raw, ...extra]) {
+  for (const candidate of [...whole, ...words]) {
     const t = candidate.trim()
     if (t.length < 3 || GENERIC_TOKENS.has(t.toLowerCase())) continue
     tokens.add(t)
@@ -177,18 +188,20 @@ export async function scrubActivityLogIdentity(
   entityIds: string[],
   tokens: string[],
 ): Promise<number> {
-  if (tokens.length === 0) return 0
   let scrubbed = 0
   for (const ids of chunks(entityIds)) {
     const rows = await tx.activityLog.findMany({
       where: { entityId: { in: ids }, NOT: { action: ERASURE_RECORD_ACTION } },
-      select: { id: true, description: true, metadata: true },
+      select: { id: true, description: true, metadata: true, entityType: true },
     })
     for (const row of rows) {
-      const description = scrubIdentityText(row.description, tokens)
-      const metadata = row.metadata == null ? row.metadata : scrubIdentityJson(row.metadata, tokens)
-      if (description === row.description && metadata === row.metadata) continue
-      await tx.activityLog.update({ where: { id: row.id }, data: { description, ...(metadata === row.metadata ? {} : { metadata: metadata as Prisma.InputJsonValue }) } })
+      // STRUCTURE FIRST (independent of any value), then the value match as a second net.
+      const structuralDescription = IDENTITY_BEARING_ENTITY_TYPES.includes(row.entityType) ? ERASED_ACTIVITY_DESCRIPTION : row.description
+      const structuralMetadata = row.metadata == null ? row.metadata : redactIdentityKeys(row.metadata)
+      const description = structuralDescription === ERASED_ACTIVITY_DESCRIPTION ? structuralDescription : scrubIdentityText(structuralDescription, tokens)
+      const metadata = structuralMetadata == null ? structuralMetadata : scrubIdentityJson(structuralMetadata, tokens)
+      if (description === row.description && JSON.stringify(metadata) === JSON.stringify(row.metadata)) continue
+      await tx.activityLog.update({ where: { id: row.id }, data: { description, ...(JSON.stringify(metadata) === JSON.stringify(row.metadata) ? {} : { metadata: (metadata ?? Prisma.JsonNull) as Prisma.InputJsonValue }) } })
       scrubbed += 1
     }
   }
@@ -207,7 +220,7 @@ export async function scrubActivityLogIdentity(
  * EMAIL, which is not part of the posted document, is removed. A claimed row's processor already holds its payload in memory.
  * The posting gate (resolveSalesPostContact) covers any post that happens after the erasure whatever the payload says.
  */
-async function scrubAccountingPayloadContacts(tx: Prisma.TransactionClient, orderIds: string[]): Promise<number> {
+export async function scrubAccountingPayloadContacts(tx: Prisma.TransactionClient, orderIds: string[]): Promise<number> {
   const refunds = await tx.salesOrderRefund.findMany({ where: { orderId: { in: orderIds } }, select: { id: true } })
   const refIds = [...orderIds, ...refunds.map((r) => r.id)]
   const scope = { referenceType: { in: ['SalesOrder', 'SalesOrderRefund'] }, referenceId: { in: refIds } }
@@ -223,6 +236,54 @@ async function scrubAccountingPayloadContacts(tx: Prisma.TransactionClient, orde
        SET "payload" = "payload" - 'contactEmail'
      WHERE "id" = ANY(${keptIds}::text[]) AND ("payload"->>'contactEmail') IS NOT NULL`
   return Number(unsent) + Number(kept)
+}
+
+/**
+ * A WooCommerce invoice HOLD (shopping_sync_logs, record kind held-sales-invoice) parks the whole accounting payload,
+ * contact block included, until WooCommerce numbers the invoice; the release later COPIES it into a new accounting row.
+ * The parked copy gets the same treatment as an unsent accounting row: placeholder name, no email, everything financial
+ * kept. (The release path also checks the marker itself, under the order lock, before it copies; see order-import.)
+ */
+export async function scrubHeldInvoicePayloads(tx: Prisma.TransactionClient, orderIds: string[]): Promise<number> {
+  const rows = await tx.shoppingSyncLog.findMany({
+    where: { connector: 'woocommerce', entityType: 'SalesOrder', recordKind: HELD_SALES_INVOICE_RECORD_KIND, entityId: { in: orderIds } },
+    select: { id: true },
+  })
+  const ids = rows.map((r) => r.id)
+  if (ids.length === 0) return 0
+  return Number(await tx.$executeRaw`
+    UPDATE "shopping_sync_logs"
+       SET "payload" = jsonb_set("payload" #- '{accountingPayload,contactEmail}', '{accountingPayload,contactName}', to_jsonb(${ERASURE_PLACEHOLDER_NAME}::text))
+     WHERE "id" = ANY(${ids}::text[]) AND ("payload" #>> '{accountingPayload,contactName}') IS NOT NULL`)
+}
+
+/** Whether the order (or its customer) is erased, read under the order lock so an erasure cannot interleave with the caller's next step. */
+export async function isOrderErasedUnderLock(orderId: string): Promise<boolean> {
+  return db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, orderId)
+    const row = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, customer: { select: { gdprAnonymisedAt: true } } } })
+    return Boolean(row?.erasedAt || row?.customer?.gdprAnonymisedAt)
+  })
+}
+
+/** The contact block of an accounting payload, replaced the way the erasure replaces it. */
+export function scrubContactInAccountingPayload<T extends Record<string, unknown>>(payload: T): T {
+  if (payload.contactName === undefined && payload.contactEmail === undefined) return payload
+  const { contactEmail: _email, ...rest } = payload
+  return { ...rest, ...(payload.contactName !== undefined ? { contactName: ERASURE_PLACEHOLDER_NAME } : {}) } as unknown as T
+}
+
+/**
+ * After a release has queued its accounting row: if the order was erased while the release was in flight (its payload was
+ * read before the erasure committed), scrub that new row too. Idempotent; takes the order lock.
+ */
+export async function scrubErasedOrderAccountingPayloads(orderId: string): Promise<number> {
+  return db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, orderId)
+    const row = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, customer: { select: { gdprAnonymisedAt: true } } } })
+    if (!row?.erasedAt && !row?.customer?.gdprAnonymisedAt) return 0
+    return (await scrubAccountingPayloadContacts(tx, [orderId])) + (await scrubHeldInvoicePayloads(tx, [orderId]))
+  })
 }
 
 export type EraseCustomerResult =

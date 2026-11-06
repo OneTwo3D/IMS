@@ -58,6 +58,8 @@ export type ErasureCounts = {
   outboxRowsClaimedFenced: number
   /** Accounting sync rows for these orders (and their refunds) whose stored payload copy had contact identity removed or replaced. */
   accountingPayloadsScrubbed: number
+  /** Held WooCommerce sales-invoice rows (shopping sync log) whose parked accounting payload had contact identity replaced. */
+  heldInvoicePayloadsScrubbed: number
   /** Existing activity-log rows whose description or metadata held the subject's identifying values. */
   activityRowsScrubbed: number
   notifications: number

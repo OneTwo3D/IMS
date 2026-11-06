@@ -75,6 +75,44 @@ test('every writer of order notes, internal notes and tracking numbers is in the
   assert.deepEqual(found, Object.fromEntries(Object.entries(ORDER_CENSUS).map(([f, v]) => [f, v.writers])))
 })
 
+/**
+ * CENSUS OF THE WRITERS OF shopping_sync_logs, the table whose `payload` stores raw WooCommerce entities and parked accounting
+ * payloads. A new writer fails here until it is classified.
+ *
+ *   scrubbed      the erasure scrubs this family (held sales-invoice parks: lib/domain/erasure `scrubHeldInvoicePayloads`) and the
+ *                 release path checks the erasure marker under the order lock before it copies
+ *   raw-woo       stores the raw WooCommerce order, refund or tracking payload: personal data that the erasure does NOT yet reach.
+ *                 This is the raw-payload scrub (scope of the payload-scrub work), reported as an unmet erasure obligation, listed
+ *                 in the PR description
+ *   no-identity   writes a status, a note or a payload with no customer data (product, stock and order-status pushes), or only
+ *                 updates the status of an existing row
+ */
+const SYNC_LOG_CENSUS: Record<string, { writers: number; verdict: string }> = {
+  'app/actions/sync-exceptions.ts': { writers: 5, verdict: 'no-identity (operator resolution: status updateMany)' },
+  'lib/connectors/woocommerce/sync/order-admission.ts': { writers: 4, verdict: 'raw-woo (the refusal queue parks the raw order)' },
+  'lib/connectors/woocommerce/sync/order-import.ts': { writers: 22, verdict: 'scrubbed (held sales invoice) / raw-woo (pending-FX queue and paid-block rows) / no-identity (status writes)' },
+  'lib/connectors/woocommerce/sync/order-status.ts': { writers: 1, verdict: 'no-identity (status push record)' },
+  'lib/connectors/woocommerce/sync/product-sync.ts': { writers: 4, verdict: 'no-identity (products)' },
+  'lib/connectors/woocommerce/sync/refund-sync.ts': { writers: 6, verdict: 'raw-woo (refund parks carry the raw refund and its free-text reason)' },
+  'lib/connectors/woocommerce/sync/stock-sync.ts': { writers: 2, verdict: 'no-identity (stock)' },
+  'lib/connectors/woocommerce/sync/tracking-sync.ts': { writers: 4, verdict: 'raw-woo (outbound tracking items carry tracking numbers)' },
+  'lib/domain/sales/refund-service.ts': { writers: 1, verdict: 'no-identity (status updateMany)' },
+}
+
+test('every writer of shopping_sync_logs is in the census', () => {
+  const cwd = new URL('..', import.meta.url).pathname
+  const out = execFileSync('git', ['grep', '-cE', 'shoppingSyncLog\\.(create|update|upsert|createMany|updateMany)\\(', '--', 'app', 'lib', ':!app/generated', ':!*.test.ts'], { encoding: 'utf8', cwd }).trim().split('\n').filter(Boolean)
+  const found = Object.fromEntries(out.map((line) => { const i = line.lastIndexOf(':'); return [line.slice(0, i), Number(line.slice(i + 1))] }))
+  assert.deepEqual(found, Object.fromEntries(Object.entries(SYNC_LOG_CENSUS).map(([f, v]) => [f, v.writers])))
+})
+
+test('the held-invoice release checks the erasure marker under the order lock before it copies the parked payload, and re-checks after the enqueue', () => {
+  const src = readFileSync(new URL('../lib/connectors/woocommerce/sync/order-import.ts', import.meta.url), 'utf8')
+  const release = src.slice(src.indexOf('async function releaseHeldWcSalesInvoice'))
+  assert.match(release, /isOrderErasedUnderLock\(orderId\)[\s\S]*scrubContactInAccountingPayload\(heldRaw\.accountingPayload\)[\s\S]*buildReleasedSalesInvoicePayload\(held, invoiceNumber\)/)
+  assert.match(release, /queueAccountingSync\(\{[\s\S]*scrubErasedOrderAccountingPayloads\(orderId\)/)
+})
+
 test('the two edit actions take the order lock and read erasedAt inside the transaction before writing', () => {
   const sales = readFileSync(new URL('../app/actions/sales.ts', import.meta.url), 'utf8')
   const notes = sales.slice(sales.indexOf('export async function updateSalesOrderNotes'))

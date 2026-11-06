@@ -2,6 +2,7 @@
  * WooCommerce → IMS order import.
  */
 
+import { isOrderErasedUnderLock, scrubContactInAccountingPayload, scrubErasedOrderAccountingPayloads } from '@/lib/domain/erasure/erase-personal-data'
 import { createHash } from 'node:crypto'
 import { currentTaxRates, lockOrderNamedTaxRate, resolveLinesTaxRates } from '@/lib/tax/writable-tax-rate'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
@@ -30,6 +31,7 @@ import { STORE_CREDIT_INVOICE_WITHHELD_ACTION, STORE_CREDIT_REVIEW_ACTION, store
 import { countSalesInvoiceRowsThatMayHavePosted, decideStoredInvoiceNumberUpdate, resolveWcAccountingInvoiceNumber } from './invoice-number'
 import {
   buildHeldSalesInvoicePayload,
+  type HeldSalesInvoicePayload,
   buildReleasedSalesInvoicePayload,
   heldSalesInvoiceChartConnector,
   HELD_SALES_INVOICE_RECORD_KIND,
@@ -1607,7 +1609,12 @@ async function releaseHeldWcSalesInvoice(
     return 'unreadable'
   }
 
-  const held = row.payload
+  // ERASURE GATE ON THE COPY. The release copies the parked payload (contact block included) into a new accounting row. The
+  // marker is read under the order lock; an erased order releases the SCRUBBED payload (placeholder name, no email). An erasure
+  // that commits after this read is covered by the re-check after the enqueue below.
+  const heldRaw: HeldSalesInvoicePayload = row.payload
+  const orderErased = await isOrderErasedUnderLock(orderId)
+  const held = orderErased ? { ...heldRaw, accountingPayload: scrubContactInAccountingPayload(heldRaw.accountingPayload) } : heldRaw
   const idempotencyKey = `wc-held-sales-invoice:${orderId}:${invoiceNumber}`
   // o3d-j625 r2 (Codex HIGH 1/HIGH 2) — A HOLD THAT CANNOT NAME ITS CHART IS NOT RELEASED.
   //
@@ -1699,6 +1706,11 @@ async function releaseHeldWcSalesInvoice(
     }
     return 'not-queued'
   }
+
+  // The order may have been erased between the marker read above and the enqueue: scrub the row the release just queued.
+  await scrubErasedOrderAccountingPayloads(orderId).catch((error) => {
+    console.error(`[wc-import] could not re-check the erasure marker after releasing the held invoice for ${orderId}:`, error)
+  })
 
   // THE PRODUCER-SIDE HOLD SHADOWED THE INVOICE. A shadow is the record the hold keeps INSTEAD of a queued posting (a CANCELLED row with no
   // document id, plus the durable shadow record): it is not "nothing was queued", and no later pass can turn it into a queued row. Reading
