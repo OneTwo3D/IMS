@@ -346,7 +346,10 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
         ])
         const binding = selectMintsoftReturnBinding(record, bindings)
         const reference = trimToNull(record.orderReference)
-        const reason = trimToNull(record.reason)
+        // A return for an ERASED order is recorded (its structured columns reconcile the warehouse), but the warehouse's free text and raw
+        // payload are NOT read back in: the warehouse still holds the person's details, and re-reading them would undo the erasure.
+        const orderErased = order?.id ? Boolean((await db.salesOrder.findUnique({ where: { id: order.id }, select: { erasedAt: true } }))?.erasedAt) : false
+        const reason = orderErased ? null : trimToNull(record.reason)
         const qty = record.qty == null ? null : new Prisma.Decimal(record.qty)
         const receivedAt = parseReceivedAt(record.receivedAt)
         const now = new Date()
@@ -386,7 +389,7 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
             reference,
             warehouseId: binding?.warehouseId ?? null,
             receivedAt,
-            rawPayload: (record.raw ?? {}) as Prisma.InputJsonValue,
+            rawPayload: (orderErased ? {} : (record.raw ?? {})) as Prisma.InputJsonValue,
             status: 'NEW',
           },
           update: {
@@ -402,7 +405,7 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
               bindingWarehouseId: binding?.warehouseId ?? null,
             }),
             receivedAt,
-            rawPayload: (record.raw ?? {}) as Prisma.InputJsonValue,
+            rawPayload: (orderErased ? {} : (record.raw ?? {})) as Prisma.InputJsonValue,
             updatedAt: now,
           },
           select: {

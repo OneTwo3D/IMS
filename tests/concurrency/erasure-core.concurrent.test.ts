@@ -1028,29 +1028,66 @@ test('[erasure] payments: existing free-text notes are erased and the reference 
   assert.equal(late.amount.toString(), '5', 'the money recorded')
 })
 
-test('[erasure] free text on the rows hanging off the orders (warehouse link errors, discrepancies, returns inbox) loses the subject\'s values', { skip }, async (t) => {
+test('[erasure] free text on the rows hanging off the orders is CLEARED, not matched: an OLD address that no longer matches the order goes too, structured columns stay', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { eraseCustomerPersonalData, ERASED_FREE_TEXT_MARKER } = await import('@/lib/domain/erasure/erase-personal-data')
+  // The delivery details these rows mention are NOT the order's current ones (the person moved and changed their name since).
+  const OLD = { name: 'Octavia Formerly', street: '9 Former Road', postcode: 'OLD1 1XX' }
+  const link = await db.wmsOrderPushLink.create({ data: { orderId: fx.orderId, connector: 'mintsoft', externalOrderId: 'WMS-1', externalOrderNumber: 'WMS-NO-1', lastError: `Address ${OLD.street}, ${OLD.postcode} rejected for ${OLD.name}`, dispatchLastError: `No courier for ${OLD.name}`, dispatchUnresolvedError: `Unresolved: ${OLD.street}` } as never })
+  const disc = await db.wmsOrderDiscrepancy.create({ data: { orderId: fx.orderId, connector: 'mintsoft', category: 'ADDRESS', detail: `Warehouse has ${OLD.name} at ${OLD.street}`, externalOrderNumber: 'WMS-NO-1' } as never })
+  const ret = await db.wmsReturnsInbox.create({ data: { orderId: fx.orderId, connector: 'mintsoft', externalReturnId: `RET-${randomUUID().slice(0, 6)}`, sku: 'SKU-1', reference: 'SO-REF-1', reason: `${OLD.name} did not like it`, resolutionNote: `Refunded ${OLD.name}`, rawPayload: { returnId: 'R1', customer: { name: OLD.name }, note: `from ${OLD.postcode}`, items: [{ sku: 'SKU-1', qty: 1 }] } } as never })
+  const emptyLink = await db.wmsOrderPushLink.create({ data: { orderId: (await db.salesOrder.create({ data: { orderNumber: `NOLINK-${randomUUID().slice(0, 6)}`, status: 'DRAFT', currency: 'GBP', customerId: fx.customerId, subtotalForeign: 1, totalForeign: 1, subtotalBase: 1, totalBase: 1 } })).id, connector: 'mintsoft' } as never })
+  t.after(async () => { await db.wmsReturnsInbox.deleteMany({ where: { id: ret.id } }); await db.wmsOrderDiscrepancy.deleteMany({ where: { id: disc.id } }); await db.wmsOrderPushLink.deleteMany({ where: { id: { in: [link.id, emptyLink.id] } } }); await db.salesOrder.deleteMany({ where: { id: emptyLink.orderId } }); await fx.cleanup() })
+
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const kept = await db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })
+  assert.deepEqual([kept.lastError, kept.dispatchLastError, kept.dispatchUnresolvedError], [ERASED_FREE_TEXT_MARKER, ERASED_FREE_TEXT_MARKER, ERASED_FREE_TEXT_MARKER], 'free text is cleared whatever it said')
+  assert.deepEqual([kept.externalOrderId, kept.externalOrderNumber], ['WMS-1', 'WMS-NO-1'], 'the references that reconcile with the warehouse are kept')
+  const keptDisc = await db.wmsOrderDiscrepancy.findUniqueOrThrow({ where: { id: disc.id } })
+  assert.deepEqual([keptDisc.detail, keptDisc.category, keptDisc.externalOrderNumber], [ERASED_FREE_TEXT_MARKER, 'ADDRESS', 'WMS-NO-1'])
+  const keptRet = await db.wmsReturnsInbox.findUniqueOrThrow({ where: { id: ret.id } })
+  assert.deepEqual([keptRet.reason, keptRet.resolutionNote, keptRet.rawPayload], [ERASED_FREE_TEXT_MARKER, ERASED_FREE_TEXT_MARKER, {}])
+  assert.deepEqual([keptRet.sku, keptRet.reference, keptRet.externalReturnId.startsWith('RET-')], ['SKU-1', 'SO-REF-1', true], 'structured columns are kept')
+  // A column that had no text stays empty (the marker is written only where there was a value).
+  const untouched = await db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: emptyLink.id } })
+  assert.deepEqual([untouched.lastError, untouched.dispatchLastError, untouched.dispatchUnresolvedError], [null, null, null])
+  const everything = JSON.stringify([kept, keptDisc, keptRet])
+  for (const x of [OLD.name, OLD.street, OLD.postcode]) assert.ok(!everything.includes(x), `the rows still hold ${x}`)
+})
+
+test('[erasure] an order edit racing the erasure: the identity sources are read AFTER the locks, so the edited value does not survive in any scrubbed field', { skip }, async (t) => {
   const db = await loadDb()
   const fx = await importFixture(db)
   const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
-  const link = await db.wmsOrderPushLink.create({ data: { orderId: fx.orderId, connector: 'mintsoft', externalOrderId: 'WMS-1', externalOrderNumber: 'WMS-NO-1', lastError: `Address ${STREET}, ${POSTCODE} rejected for ${FULL_NAME}`, dispatchLastError: `No courier for ${NAME.last}` } as never })
-  const disc = await db.wmsOrderDiscrepancy.create({ data: { orderId: fx.orderId, connector: 'mintsoft', category: 'ADDRESS', detail: `Warehouse has ${FULL_NAME} at ${STREET}`, externalOrderNumber: 'WMS-NO-1' } as never })
-  const ret = await db.wmsReturnsInbox.create({ data: { orderId: fx.orderId, connector: 'mintsoft', externalReturnId: `RET-${randomUUID().slice(0, 6)}`, reason: `${NAME.first} did not like it`, resolutionNote: `Refunded ${FULL_NAME}`, rawPayload: { returnId: 'R1', customer: { name: FULL_NAME, email: EMAIL }, note: `from ${NAME.last}`, items: [{ sku: 'SKU-1', qty: 1 }] } } as never })
-  t.after(async () => { await db.wmsReturnsInbox.deleteMany({ where: { id: ret.id } }); await db.wmsOrderDiscrepancy.deleteMany({ where: { id: disc.id } }); await db.wmsOrderPushLink.deleteMany({ where: { id: link.id } }); await fx.cleanup() })
+  const { lockSalesOrder } = await import('@/lib/domain/sales/allocation-service')
+  const EDITED = { name: 'Valentina Lastminute', street: '31 Eleventh Hour Close', postcode: 'ZZ9 9ZZ' }
+  t.after(async () => { await fx.cleanup() })
 
-  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
-  const everything = JSON.stringify([
-    await db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } }),
-    await db.wmsOrderDiscrepancy.findUniqueOrThrow({ where: { id: disc.id } }),
-    await db.wmsReturnsInbox.findUniqueOrThrow({ where: { id: ret.id } }),
-  ])
-  for (const x of [NAME.first, NAME.last, EMAIL, STREET, POSTCODE]) assert.ok(!everything.includes(x), `the rows still hold ${x}`)
-  // The references that reconcile the order with the warehouse, and the structure of the raw return, are kept.
-  const keptLink = await db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })
-  assert.deepEqual([keptLink.externalOrderId, keptLink.externalOrderNumber], ['WMS-1', 'WMS-NO-1'])
-  assert.equal((await db.wmsReturnsInbox.findUniqueOrThrow({ where: { id: ret.id } })).rawPayload !== null, true)
-  assert.deepEqual(((await db.wmsReturnsInbox.findUniqueOrThrow({ where: { id: ret.id } })).rawPayload as { items: unknown }).items, [{ sku: 'SKU-1', qty: 1 }])
+  // An edit is IN FLIGHT: it holds the order lock, has changed the order's delivery details, and has written an activity row that
+  // mentions the NEW details. The erasure starts now and must wait for it.
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const editing = db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, fx.orderId)
+    await tx.salesOrder.update({ where: { id: fx.orderId }, data: { customerName: EDITED.name, shippingAddress: { line1: EDITED.street, postcode: EDITED.postcode } } })
+    await tx.activityLog.create({ data: { entityType: 'SALES_ORDER', entityId: fx.orderId, action: 'noted', tag: 'sales', level: 'INFO', description: `Now delivering to ${EDITED.name}, ${EDITED.street} ${EDITED.postcode}`, metadata: { who: EDITED.name } } })
+    await gate
+  }, { timeout: 30_000 })
+  await new Promise((r) => setTimeout(r, 300))
+  let erased = false
+  const erasing = eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null }).then((r) => { erased = true; return r })
+  await new Promise((r) => setTimeout(r, 1000))
+  assert.equal(erased, false, 'PRECONDITION: the erasure is waiting on the edit\'s order lock')
+  release()
+  await editing
+  assert.equal((await erasing).success, true)
+
+  const log = JSON.stringify(await db.activityLog.findMany({ where: { entityId: { in: [fx.orderId, fx.customerId] } } }))
+  for (const x of [EDITED.name, EDITED.street, EDITED.postcode]) assert.ok(!log.includes(x), `the edited value ${x} survived in the activity rows`)
+  const order = await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+  assert.deepEqual([order.customerName, order.shippingAddress], ['GDPR Anonymised', null])
 })
-
 
 test('[erasure] a large customer (300 orders, 2000 activity rows, payments, warehouse links) erases in one transaction well inside its timeout, and the proof commits', { skip }, async (t) => {
   const db = await loadDb()

@@ -317,41 +317,40 @@ export async function scrubHeldInvoicePayloads(tx: Prisma.TransactionClient, ord
 /** The contact block of an accounting payload, replaced the way the erasure replaces it (see contact-gate.ts). */
 export const scrubContactInAccountingPayload = scrubContactBlock
 
+/** The one identity-free marker written where a free-text column HAD a value, so a column that is checked for presence still reads as present. */
+export const ERASED_FREE_TEXT_MARKER = 'Text removed by GDPR erasure'
+
+/**
+ * The only stock-movement note text kept: the historical storefront import's idempotency sentence, which carries nothing but an order number
+ * (the import finds its earlier movements by it). Matched in full; any other note on these rows is cleared.
+ */
+const SYSTEM_STOCK_MOVEMENT_NOTE = /^Historical WC import \u2014 Order #\S+$/
+
 /**
  * Free text on the rows that hang off an erased customer's orders but are written by other systems or people: the warehouse link's last
- * errors, order discrepancies, the returns inbox (reason, notes, and the raw warehouse payload) and the stock movements of the orders'
- * shipment lines. Those texts can echo the recipient (a warehouse error that names the address, a return reason that names the person),
- * so the subject's identifying VALUES (read before they were overwritten) are removed from them in place, and identity-named keys of the
- * raw payload are replaced. Rows, statuses, ids and references are kept. Returns the number of rows changed.
+ * errors, order discrepancies, the returns inbox (reason, resolution note, raw warehouse payload) and the notes of the stock movements of
+ * the orders' shipment lines. They can echo the recipient, and an OLD name or address (changed since) would not match the order's current
+ * fields, so they are CLEARED, not matched against values: where a column had a value it now holds one fixed identity-free marker (so a
+ * presence check still reads true), the raw return payload becomes an empty object, and every structured column (ids, references, quantities,
+ * statuses, codes, timestamps) is kept. Returns the number of rows changed. Operates on the orders the caller has locked.
  */
-export async function scrubLinkedFreeText(tx: Prisma.TransactionClient, orderIds: string[], tokens: string[]): Promise<number> {
+export async function scrubLinkedFreeText(tx: Prisma.TransactionClient, orderIds: string[]): Promise<number> {
   let changed = 0
-  const text = (value: string | null) => (value == null ? value : scrubIdentityText(value, tokens))
+  const marker = ERASED_FREE_TEXT_MARKER
   for (const ids of chunks(orderIds)) {
-    for (const row of await tx.wmsOrderPushLink.findMany({ where: { orderId: { in: ids } }, select: { id: true, lastError: true, dispatchLastError: true, dispatchUnresolvedError: true } })) {
-      const data = { lastError: text(row.lastError), dispatchLastError: text(row.dispatchLastError), dispatchUnresolvedError: text(row.dispatchUnresolvedError) }
-      if (data.lastError !== row.lastError || data.dispatchLastError !== row.dispatchLastError || data.dispatchUnresolvedError !== row.dispatchUnresolvedError) {
-        await tx.wmsOrderPushLink.update({ where: { id: row.id }, data }); changed += 1
-      }
+    for (const field of ['lastError', 'dispatchLastError', 'dispatchUnresolvedError'] as const) {
+      changed += (await tx.wmsOrderPushLink.updateMany({ where: { orderId: { in: ids }, [field]: { not: null }, NOT: { [field]: marker } }, data: { [field]: marker } })).count
     }
-    for (const row of await tx.wmsOrderDiscrepancy.findMany({ where: { orderId: { in: ids } }, select: { id: true, detail: true } })) {
-      const detail = text(row.detail)
-      if (detail !== row.detail) { await tx.wmsOrderDiscrepancy.update({ where: { id: row.id }, data: { detail } }); changed += 1 }
+    changed += (await tx.wmsOrderDiscrepancy.updateMany({ where: { orderId: { in: ids }, detail: { not: null }, NOT: { detail: marker } }, data: { detail: marker } })).count
+    for (const field of ['reason', 'resolutionNote'] as const) {
+      changed += (await tx.wmsReturnsInbox.updateMany({ where: { orderId: { in: ids }, [field]: { not: null }, NOT: { [field]: marker } }, data: { [field]: marker } })).count
     }
-    for (const row of await tx.wmsReturnsInbox.findMany({ where: { orderId: { in: ids } }, select: { id: true, reason: true, resolutionNote: true, rawPayload: true } })) {
-      const reason = text(row.reason)
-      const resolutionNote = text(row.resolutionNote)
-      const structural = row.rawPayload == null ? row.rawPayload : redactIdentityKeys(row.rawPayload)
-      const rawPayload = structural == null ? structural : scrubIdentityJson(structural, tokens)
-      const payloadChanged = JSON.stringify(rawPayload) !== JSON.stringify(row.rawPayload)
-      if (reason !== row.reason || resolutionNote !== row.resolutionNote || payloadChanged) {
-        await tx.wmsReturnsInbox.update({ where: { id: row.id }, data: { reason, resolutionNote, ...(payloadChanged ? { rawPayload: (rawPayload ?? Prisma.JsonNull) as Prisma.InputJsonValue } : {}) } }); changed += 1
-      }
-    }
-    for (const row of await tx.stockMovement.findMany({ where: { shipmentLine: { shipment: { orderId: { in: ids } } }, note: { not: null } }, select: { id: true, note: true } })) {
-      const note = text(row.note)
-      if (note !== row.note) { await tx.stockMovement.update({ where: { id: row.id }, data: { note } }); changed += 1 }
-    }
+    const returns = await tx.wmsReturnsInbox.findMany({ where: { orderId: { in: ids } }, select: { id: true, rawPayload: true } })
+    const rawIds = returns.filter((r) => r.rawPayload != null && JSON.stringify(r.rawPayload) !== '{}').map((r) => r.id)
+    if (rawIds.length > 0) changed += (await tx.wmsReturnsInbox.updateMany({ where: { id: { in: rawIds } }, data: { rawPayload: {} } })).count
+    const movements = await tx.stockMovement.findMany({ where: { shipmentLine: { shipment: { orderId: { in: ids } } }, note: { not: null } }, select: { id: true, note: true } })
+    const noteIds = movements.filter((m) => m.note !== marker && !SYSTEM_STOCK_MOVEMENT_NOTE.test(m.note!)).map((m) => m.id)
+    if (noteIds.length > 0) changed += (await tx.stockMovement.updateMany({ where: { id: { in: noteIds } }, data: { note: marker } })).count
   }
   return changed
 }
@@ -369,13 +368,22 @@ export async function eraseCustomerPersonalData(
   const erasedAt = new Date()
   try {
     const refusal = await db.$transaction(async (tx): Promise<string | null> => {
-      // Read the identifying values BEFORE anything is overwritten (see collectIdentityTokens).
+      // LOCKS FIRST, THEN THE IDENTITY SOURCES. The customer row is locked, then ALL of the customer's orders in one statement in id order
+      // (customer, then orders). Every value that identifies the subject (the tokens that remove it from activity rows) is read only AFTER
+      // those locks are held, so an edit that was in flight when the erasure began has either committed (and is read here) or is blocked
+      // until the erasure is done; no value can change between the read and the overwrite. New orders cannot appear under the customer
+      // meanwhile: creating one takes the same customer row lock.
+      const lockedCustomer = await tx.$queryRaw<Array<{ id: string; gdprAnonymisedAt: Date | null }>>`SELECT id, "gdprAnonymisedAt" FROM "customers" WHERE id = ${customerId} FOR UPDATE`
+      if (lockedCustomer.length === 0) return 'Customer not found'
+      if (lockedCustomer[0]!.gdprAnonymisedAt) return 'Customer already anonymised'
+      const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "sales_orders" WHERE "customerId" = ${customerId} ORDER BY id FOR UPDATE`
+      const orderIds = locked.map((o) => o.id)
       const before = await tx.customer.findUnique({ where: { id: customerId } })
-      const orderRows = before ? await tx.salesOrder.findMany({
+      const orderRows = await tx.salesOrder.findMany({
         where: { customerId },
         select: { customerName: true, customerEmail: true, customerVatNumber: true, billingAddress: true, shippingAddress: true, notes: true, internalNotes: true, trackingNumber: true },
-      }) : []
-      const shipmentRows = before ? await tx.shipment.findMany({ where: { order: { customerId } }, select: { trackingNumber: true } }) : []
+      })
+      const shipmentRows = await tx.shipment.findMany({ where: { order: { customerId } }, select: { trackingNumber: true } })
       const claimed = await tx.customer.updateMany({
         where: { id: customerId, gdprAnonymisedAt: null },
         data: {
@@ -393,14 +401,7 @@ export async function eraseCustomerPersonalData(
           gdprAnonymisedAt: erasedAt,
         },
       })
-      if (claimed.count === 0) {
-        const exists = await tx.customer.findUnique({ where: { id: customerId }, select: { id: true } })
-        return exists ? 'Customer already anonymised' : 'Customer not found'
-      }
-      // ALL OF THE CUSTOMER'S ORDERS ARE LOCKED IN ONE STATEMENT, in id order (the customer was claimed first: customer, then orders). One
-      // round trip instead of one per order; the rows come back locked, and are the set the rest of the erasure works on.
-      const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "sales_orders" WHERE "customerId" = ${customerId} ORDER BY id FOR UPDATE`
-      const orderIds = locked.map((o) => o.id)
+      if (claimed.count === 0) return 'Customer already anonymised'
       const orderCounts = await eraseOrdersPersonalDataInTx(tx, orderIds, erasedAt)
       // THE STOREFRONT ACCOUNT LINK IS DELETED, not blanked: its externalCustomerId is the live storefront customer id and resolves to
       // the account, and nothing financial references the row (it has no dependants; orders keep their own order link). With it gone
@@ -413,7 +414,7 @@ export async function eraseCustomerPersonalData(
         shipmentTracking: shipmentRows.map((r) => r.trackingNumber),
       })
       const activityRowsScrubbed = await scrubActivityLogIdentity(tx, [customerId, ...orderIds], tokens)
-      const linkedFreeTextScrubbed = await scrubLinkedFreeText(tx, orderIds, tokens)
+      const linkedFreeTextScrubbed = await scrubLinkedFreeText(tx, orderIds)
       const counts: ErasureCounts = { customers: 1, shoppingCustomerLinks: links.count, activityRowsScrubbed, linkedFreeTextScrubbed, ...orderCounts }
       await logActivityInTransaction(tx, {
         entityType: 'CUSTOMER',
