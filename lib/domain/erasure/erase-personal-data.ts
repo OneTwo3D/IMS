@@ -6,7 +6,7 @@ import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { HELD_SALES_INVOICE_RECORD_KIND } from '@/lib/domain/sales/wc-sync-row-families'
 import { EMAIL_RECIPIENT_ERASED_REASON } from './email-recipient'
 import { scrubContactBlock } from './contact-gate'
-import { SYSTEM_PAYMENT_NOTE_PREFIXES, orderIsErasedInTx } from './order-state'
+import { SYSTEM_PAYMENT_NOTES, orderIsErasedInTx } from './order-state'
 export { orderIsErasedInTx }
 import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import { ERASED_ACTIVITY_DESCRIPTION, IDENTITY_BEARING_ENTITY_TYPES, redactIdentityKeys } from './activity-identity'
@@ -114,9 +114,9 @@ export async function eraseOrdersPersonalDataInTx(
     counts.accountingPayloadsScrubbed += await scrubAccountingPayloadContacts(tx, ids)
     counts.heldInvoicePayloadsScrubbed += await scrubHeldInvoicePayloads(tx, ids)
     // The free-text NOTE on the order's payments is erased; the payment, its amount and its REFERENCE are kept (they reconcile with the bank and the
-    // ledger). Notes the importer itself writes are fixed sentences with no identity that it recognises by prefix, so they stay.
+    // ledger). The importer's own receipt sentences are kept ONLY when the note equals one of them in full (it recognises its receipts by them); a note that merely starts with one is free text and goes.
     counts.paymentNotesErased += (await tx.payment.updateMany({
-      where: { orderId: { in: ids }, notes: { not: null }, AND: SYSTEM_PAYMENT_NOTE_PREFIXES.map((prefix) => ({ NOT: { notes: { startsWith: prefix } } })) },
+      where: { orderId: { in: ids }, notes: { not: null }, AND: [{ notes: { notIn: [...SYSTEM_PAYMENT_NOTES] } }] },
       data: { notes: null },
     })).count
 

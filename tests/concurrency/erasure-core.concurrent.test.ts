@@ -991,24 +991,40 @@ test('[erasure] payments: existing free-text notes are erased and the reference 
   const fx = await importFixture(db)
   const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
   const { addPayment } = await import('@/app/actions/sales')
-  const SYSTEM_NOTE = 'Recorded from WooCommerce (the order was imported unpaid and paid later)'
+  const { WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_IMPORTED_PAID } = await import('@/lib/domain/erasure/order-state')
+  const SYSTEM_NOTE = WC_RECEIPT_NOTE_PAID_LATER
   const mk = (data: Record<string, unknown>) => db.payment.create({ data: { orderId: fx.orderId, amount: 10, currency: 'GBP', paidAt: new Date('2026-11-02T10:00:00Z'), ...data } as never })
   const operator = await mk({ reference: 'BANK-REF-1', method: 'Bank Transfer', notes: `${NAME.first} phoned to say the transfer was sent` })
   const system = await mk({ reference: 'TXN-77', notes: SYSTEM_NOTE })
+  // A person's note that merely STARTS with an importer sentence and then names the customer: free text, not the importer's.
+  const spoofed = await mk({ reference: 'BANK-REF-3', notes: `${WC_RECEIPT_NOTE_IMPORTED_PAID}: ${FULL_NAME}, ${STREET}` })
+  const spoofedLater = await mk({ reference: 'BANK-REF-4', notes: `Recorded from WooCommerce - ${NAME.last} rang` })
   t.after(async () => { await db.payment.deleteMany({ where: { orderId: fx.orderId } }); await db.accountingSyncLog.deleteMany({ where: { referenceId: fx.orderId } }); await fx.cleanup() })
 
   assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
-  const rows = Object.fromEntries((await db.payment.findMany({ where: { id: { in: [operator.id, system.id] } } })).map((p) => [p.id, p]))
+  const rows = Object.fromEntries((await db.payment.findMany({ where: { id: { in: [operator.id, system.id, spoofed.id, spoofedLater.id] } } })).map((p) => [p.id, p]))
   assert.equal(rows[operator.id]!.notes, null, 'the operator\'s free-text note is erased')
   assert.equal(rows[operator.id]!.reference, 'BANK-REF-1', 'the reference reconciles with the bank and is kept')
   assert.equal(rows[operator.id]!.amount.toString(), '10', 'the payment itself is untouched')
   assert.equal(rows[system.id]!.notes, SYSTEM_NOTE, 'the importer\'s own fixed sentence is kept: the importer recognises its earlier receipts by it')
+  assert.equal(rows[spoofed.id]!.notes, null, 'a note that only STARTS with an importer sentence is erased')
+  assert.equal(rows[spoofedLater.id]!.notes, null)
+  // The importer still recognises its own receipt: the predicate it dedups on (notes starting with the receipt prefix) finds the exact
+  // sentence that survived, and nothing else.
+  const dedup = await db.payment.findMany({ where: { orderId: fx.orderId, refundId: null, notes: { startsWith: 'Recorded from WooCommerce' } } })
+  assert.deepEqual(dedup.map((p) => p.id), [system.id])
 
   // A payment recorded AFTER the erasure: it posts, with the reference and amount, and no free text.
   const after = await addPayment({ orderId: fx.orderId, amount: 5, currency: 'GBP', method: 'Bank Transfer', reference: 'BANK-REF-2', notes: `${NAME.last} says this is for the second parcel`, paidAt: '2026-11-05' })
   assert.equal(after.success, true, JSON.stringify(after))
   const late = await db.payment.findFirstOrThrow({ where: { orderId: fx.orderId, reference: 'BANK-REF-2' } })
   assert.equal(late.notes, null, 'the free-text note is dropped for an erased order')
+  const lateSpoof = await addPayment({ orderId: fx.orderId, amount: 3, currency: 'GBP', reference: 'BANK-REF-5', notes: `${WC_RECEIPT_NOTE_IMPORTED_PAID} - ${FULL_NAME}, ${STREET}`, paidAt: '2026-11-05' })
+  assert.equal(lateSpoof.success, true, JSON.stringify(lateSpoof))
+  assert.equal((await db.payment.findFirstOrThrow({ where: { orderId: fx.orderId, reference: 'BANK-REF-5' } })).notes, null, 'prefix plus personal text is dropped too')
+  const exact = await addPayment({ orderId: fx.orderId, amount: 2, currency: 'GBP', reference: 'BANK-REF-6', notes: WC_RECEIPT_NOTE_IMPORTED_PAID, paidAt: '2026-11-05' })
+  assert.equal(exact.success, true, JSON.stringify(exact))
+  assert.equal((await db.payment.findFirstOrThrow({ where: { orderId: fx.orderId, reference: 'BANK-REF-6' } })).notes, WC_RECEIPT_NOTE_IMPORTED_PAID, 'an exact importer sentence is the only thing that passes')
   assert.equal(late.amount.toString(), '5', 'the money recorded')
 })
 

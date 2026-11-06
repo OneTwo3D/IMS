@@ -3,6 +3,7 @@
  */
 
 import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain/erasure/erase-personal-data'
+import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
 import { ERASURE_PLACEHOLDER_NAME, ERASURE_RECORD_ACTION, ERASURE_RECORD_DESCRIPTION, buildErasureRecordMetadata } from '@/lib/domain/erasure/erasure-record'
 import { randomUUID } from 'node:crypto'
 import { createHash } from 'node:crypto'
@@ -1043,8 +1044,8 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
         method: wcOrder.payment_method_title || wcOrder.payment_method || null,
         reference: wcOrder.transaction_id || null,
         notes: existing.length > 0
-          ? 'Recorded from WooCommerce (paid later than the import): the part of the order total not already covered by earlier receipts'
-          : 'Recorded from WooCommerce (the order was imported unpaid and paid later)',
+          ? WC_RECEIPT_NOTE_PAID_LATER_PARTIAL
+          : WC_RECEIPT_NOTE_PAID_LATER,
         paidAt,
         paidAtExplicitInstant: paidAt, // WooCommerce's GMT paid instant is an explicit instant, midnight included (the FX report reads a stored midnight by this)
         settlementRateToBase: settlementRate,
@@ -2921,7 +2922,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
               currency,
               method: wcOrder.payment_method_title || wcOrder.payment_method || null,
               reference: wcOrder.transaction_id || null,
-              notes: 'Imported from WooCommerce (paid when the order was imported)',
+              notes: WC_RECEIPT_NOTE_IMPORTED_PAID,
               paidAt: parseWcGmtInstant(wcOrder.date_paid_gmt as string),
               paidAtExplicitInstant: parseWcGmtInstant(wcOrder.date_paid_gmt as string), // an explicit instant, midnight included
               settlementRateToBase: importedReceiptSettlementRate === null ? null : Math.round(importedReceiptSettlementRate * 1e8) / 1e8,

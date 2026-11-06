@@ -236,8 +236,10 @@ test('every writer of payments is in the census; the manual one blanks free text
   const sales = readFileSync(new URL('../app/actions/sales.ts', import.meta.url), 'utf8')
   assert.match(sales, /notes: await paymentNotesForOrder\(tx, input\.orderId, input\.notes\)/)
   const importer = readFileSync(new URL('../lib/connectors/woocommerce/sync/order-import.ts', import.meta.url), 'utf8')
-  for (const match of importer.matchAll(/notes: (existing\.length > 0\s*\? )?'(Recorded|Imported) from WooCommerce/g)) assert.ok(match[0])
-  assert.match(importer, /Imported from WooCommerce \(paid when the order was imported\)/)
+  // The importer writes the exact sentences from the shared constants and no literal of its own.
+  assert.match(importer, /notes: existing\.length > 0\s*\? WC_RECEIPT_NOTE_PAID_LATER_PARTIAL\s*: WC_RECEIPT_NOTE_PAID_LATER/)
+  assert.match(importer, /notes: WC_RECEIPT_NOTE_IMPORTED_PAID/)
+  assert.ok(!/notes: '(Recorded|Imported) from WooCommerce/.test(importer))
 })
 
 test('both manual order creators lock and re-read the customer inside the create transaction, before the create', () => {

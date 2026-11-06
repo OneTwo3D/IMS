@@ -12,11 +12,19 @@ export async function orderIsErasedInTx(tx: Prisma.TransactionClient, orderId: s
 
 
 /**
- * Payment notes the SYSTEM writes (the storefront importer's receipts). They are fixed sentences with no identity, and the importer
- * RECOGNISES its own earlier receipts by the prefix (it must not raise a second receipt for the same payment), so the erasure keeps
- * them. Everything else on `Payment.notes` is free text typed by a person and is erased.
+ * THE EXACT SENTENCES THE STOREFRONT IMPORTER WRITES to `Payment.notes` (its receipts). They are fixed text with no identity, and the
+ * importer recognises its own earlier receipts by them, so the erasure keeps a note ONLY if it equals one of these in full. A note that
+ * merely STARTS with one (a person typed the prefix and then a name) is free text and is erased. These constants are the importer's
+ * single source: lib/connectors/woocommerce/sync/order-import.ts writes exactly these.
  */
-export const SYSTEM_PAYMENT_NOTE_PREFIXES = ['Recorded from WooCommerce', 'Imported from WooCommerce'] as const
+export const WC_RECEIPT_NOTE_PAID_LATER_PARTIAL = 'Recorded from WooCommerce (paid later than the import): the part of the order total not already covered by earlier receipts'
+export const WC_RECEIPT_NOTE_PAID_LATER = 'Recorded from WooCommerce (the order was imported unpaid and paid later)'
+export const WC_RECEIPT_NOTE_IMPORTED_PAID = 'Imported from WooCommerce (paid when the order was imported)'
+export const SYSTEM_PAYMENT_NOTES: readonly string[] = [WC_RECEIPT_NOTE_PAID_LATER_PARTIAL, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_IMPORTED_PAID]
+
+export function isSystemPaymentNote(notes: string | null | undefined): boolean {
+  return typeof notes === 'string' && SYSTEM_PAYMENT_NOTES.includes(notes)
+}
 
 /**
  * Free text on a payment: BLANKED for an erased order. The payment itself still records (money must post and reconcile); only the
@@ -25,6 +33,6 @@ export const SYSTEM_PAYMENT_NOTE_PREFIXES = ['Recorded from WooCommerce', 'Impor
  */
 export async function paymentNotesForOrder(tx: Prisma.TransactionClient, orderId: string, notes: string | null | undefined): Promise<string | null> {
   if (!notes) return null
-  if (SYSTEM_PAYMENT_NOTE_PREFIXES.some((prefix) => notes.startsWith(prefix))) return notes
+  if (isSystemPaymentNote(notes)) return notes
   return (await orderIsErasedInTx(tx, orderId)) ? null : notes
 }
