@@ -645,6 +645,9 @@ const PRECISE_DESPATCH_INSTANT = /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2})(?
 /** A date AND time with NO zone at all. */
 const ZONELESS_DESPATCH_DATETIME = /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$/
 
+/** Zone-less values dated before this year are UNKNOWN: the UK's historical offsets (e.g. +2h in 1943) are not modelled. */
+const ZONELESS_MIN_YEAR = 1996
+
 const LONDON_PARTS = new Intl.DateTimeFormat('en-GB', {
   timeZone: 'Europe/London', hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
 })
@@ -695,6 +698,8 @@ export function preciseDespatchInstant(value: string | null | undefined, options
     }
     return new Date(wall)
   }
+  // Historical UK offsets (double summer time, 1968-71 British Standard Time) are not modelled: an old value is unknown.
+  if (Number(y) < ZONELESS_MIN_YEAR) return null
   return londonLocalToInstant(wall)
 }
 
@@ -727,6 +732,8 @@ const DATE_ONLY_DESPATCH = /^(\d{4})-(\d{2})-(\d{2})$/
  */
 export function despatchInstantRange(value: string, reading: ZonelessDespatchReading): { from: Date; to: Date } | null {
   const trimmed = value.trim()
+  const yearMatch = /^(\d{4})/.exec(trimmed)
+  if (yearMatch && Number(yearMatch[1]) < ZONELESS_MIN_YEAR) return null
   const exact = preciseDespatchInstant(trimmed, { zoneless: reading })
   if (exact !== null) return { from: exact, to: exact }
   const dateOnly = DATE_ONLY_DESPATCH.exec(trimmed)
@@ -779,6 +786,35 @@ export function dispositionDespatchTime(
     if (latest === null || judged.getTime() > latest.getTime()) latest = judged
   }
   return { unknown: false, at: latest }
+}
+
+/**
+ * The order-level completion gate for a WMS with a zone reading (Mintsoft): a reason to HOLD the order pending, or null to let the
+ * completion go ahead as today. The producer seam judges an order-level completion by the time IMS shipped it, not by the despatch
+ * time, so it cannot tell a pre-cutover despatch from a live one. Once the storefront is live (`now` at or after the cutoff), the
+ * order is therefore held when any despatch time is unreadable, straddles the cutoff, or lies wholly before it: that completion
+ * would write order-level storefront data for a pre-cutover despatch (a split part like that is verified by a read instead).
+ * Before the cutoff the seam shadows every storefront write anyway, so the completion is not held; with no cutoff configured
+ * nothing is held either. Entries with no value keep the old behaviour.
+ */
+export function orderLevelDespatchHold(
+  tracking: ReadonlyArray<{ despatchedAt?: string | null }>,
+  reading: ZonelessDespatchReading | undefined,
+  cutoff: Date | null,
+  now: Date,
+): string | null {
+  if (reading === undefined || cutoff === null || now.getTime() < cutoff.getTime()) return null
+  for (const entry of tracking) {
+    if (!entry.despatchedAt) continue
+    const range = despatchInstantRange(entry.despatchedAt, reading)
+    if (range === null) return 'its despatch time cannot be read'
+    if (range.from.getTime() < cutoff.getTime()) {
+      return range.to.getTime() < cutoff.getTime()
+        ? 'it was despatched before the storefront went live and an order-level completion is not verifiable'
+        : 'its despatch time could fall either side of the storefront go-live instant'
+    }
+  }
+  return null
 }
 
 /**
@@ -919,6 +955,13 @@ async function reconcileSplitOrder(
     : []
   // Every despatched part was VERIFIED by the fresh read (none was pushed by this sweep): the storefront order is already
   // complete, so IMS completes its own side only. A mixed order (some part pushed live) keeps the normal completion.
+  if (!recordPartials) {
+    // A merged survivor completes at ORDER level with no per-part judgement above, so judge every part's time here.
+    const hold = orderLevelDespatchHold(allTracking, deps.zonelessDespatchReading, deps.storefrontCutoff?.() ?? null, new Date())
+    if (hold !== null) {
+      return { action: 'pending', reason: `Merged order held: ${hold}`, unresolved: requireResolution }
+    }
+  }
   const storefrontAlreadyCompleted = recordPartials && dispatchedParts.length > 0 && verifiedPreCutoverParts === dispatchedParts.length
   const result = await deps.applyDispatch(candidate.orderId, aggregated, storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true } : undefined)
   if (!result.success) {
@@ -1058,6 +1101,11 @@ export async function reconcileOneOrder(
     }
   }
 
+  // An ordinary (non-split) order completes at ORDER level: judge its despatch time against the storefront cutoff first.
+  const orderHold = orderLevelDespatchHold(status.tracking, deps.zonelessDespatchReading, deps.storefrontCutoff?.() ?? null, new Date())
+  if (orderHold !== null) {
+    return { action: 'pending', reason: `Order held: ${orderHold}`, unresolved: requireResolution }
+  }
   const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking))
   if (!result.success) {
     return { action: 'error', reason: result.error ?? 'Dispatch apply failed' }

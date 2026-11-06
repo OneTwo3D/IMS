@@ -167,7 +167,7 @@ const POST = '2026-07-01T10:00:00Z' // after the cutoff (and before now)
 type Part = { externalId: string; partNumber: number; status: string; dispatched: boolean; tracking: Array<{ trackingNumber: string; carrier: string; despatchedAt: string }> }
 const part = (n: number, at: string): Part => ({ externalId: `M-${n}`, partNumber: n, status: 'DESPATCHED', dispatched: true, tracking: [{ trackingNumber: `TN-${n}`, carrier: 'DPD', despatchedAt: at }] })
 
-async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'europe-london' } = {}) {
+async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'europe-london'; shape?: 'split' | 'single' | 'merged' } = {}) {
   const { runWmsDispatchSweepCore } = await import('@/lib/domain/wms/dispatch-sweep')
   const { pushPartialShipmentToShopping } = await import('@/lib/shopping')
   const { verifyPreCutoverCompletionByFreshRead } = await import('@/lib/connectors/woocommerce/sync/pre-cutover-order-read')
@@ -180,8 +180,10 @@ async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'e
     } : {}),
     listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
     fetchOrderStatus: async () => ({
-      externalOrderId: 'M-1', externalOrderNumber: 'WC-1001', status: 'DESPATCHED', statusLabel: 'Despatched', isSplit: true, partCount: parts.length,
-      isMerged: false, mergedOrderNumbers: [], deepLinkUrl: null, tracking: [], dispatched: true, raw: null,
+      externalOrderId: 'M-1', externalOrderNumber: 'WC-1001', status: 'DESPATCHED', statusLabel: 'Despatched',
+      isSplit: options.shape !== 'single', partCount: parts.length,
+      isMerged: options.shape === 'merged', mergedOrderNumbers: options.shape === 'merged' ? ['WC-1001'] : [], deepLinkUrl: null,
+      tracking: options.shape === 'single' ? parts[0]!.tracking : [], dispatched: true, raw: null,
     }),
     partsSupported: true,
     fetchOrderParts: async () => parts,
@@ -879,4 +881,59 @@ test('RANGE: despatchInstantRange spans the day, the hour either side of a clock
   assert.deepEqual(iso('2026-07-15T09:00:00'), ['2026-07-15T08:00:00.000Z', '2026-07-15T08:00:00.000Z'])
   assert.deepEqual(iso('2026-07-15T09:00:00Z'), ['2026-07-15T09:00:00.000Z', '2026-07-15T09:00:00.000Z'])
   for (const bad of ['x', '2026-02-31', '2026-07-15T25:00:00', '']) assert.equal(despatchInstantRange(bad, 'europe-london'), null, bad)
+})
+
+test('ORDER LEVEL: a non-split or merged-split Mintsoft order is judged by the same range rule before it completes', async () => {
+  const cases: Array<[string, string, string]> = [
+    // [label, despatch value, expectation]: cutover 2026-06-01T00:00:00Z
+    ['wholly after', '2026-06-02T09:00:00', 'completes'],
+    ['wholly after, date only', '2026-06-02', 'completes'],
+    ['straddling date-only', '2026-06-01', 'held'],
+    ['unreadable', '2026-13-45', 'held'],
+    ['wholly before', '2026-05-20T10:00:00', 'held'],
+    ['wholly before, date only', '2026-05-31', 'held'],
+    ['dated before 1996', '1943-06-01T09:00:00', 'held'],
+  ]
+  for (const shape of ['single', 'merged'] as const) {
+    for (const [label, at, expected] of cases) {
+      reset()
+      await withEnv(LIVE_AT_CUTOFF, async () => {
+        const run = await sweep([part(1, at)], { zoneless: 'europe-london', shape, verifier: false })
+        const id = `${shape} ${label}`
+        assert.equal(run.out.counters.dispatched, expected === 'completes' ? 1 : 0, id)
+        assert.equal(run.applyOptions.length, expected === 'completes' ? 1 : 0, id)
+        // never an order-level storefront write for a held order, and nothing is read
+        if (expected === 'held') assert.deepEqual(writes(), [], id)
+        assert.deepEqual(reads(), [], id)
+      })
+    }
+  }
+  // no despatch value at all, or a source with no reading: as before
+  reset()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const run = await sweep([{ ...part(1, PRE), tracking: [{ trackingNumber: 'T', carrier: 'DPD', despatchedAt: '' }] }], { zoneless: 'europe-london', shape: 'single', verifier: false })
+    assert.equal(run.out.counters.dispatched, 1)
+  })
+  reset()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const run = await sweep([part(1, '2026-05-20T10:00:00')], { shape: 'single', verifier: false })
+    assert.equal(run.out.counters.dispatched, 1, 'a source with no reading is untouched')
+  })
+  // before the cutoff the seam shadows every storefront write, so the completion is not held
+  reset()
+  await withEnv({ ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: '2099-01-01T00:00:00Z' }, async () => {
+    const run = await sweep([part(1, '2026-05-20T10:00:00')], { zoneless: 'europe-london', shape: 'single', verifier: false })
+    assert.equal(run.out.counters.dispatched, 1)
+  })
+})
+
+test('HISTORICAL: a zone-less value dated before 1996 is unknown (UK historical offsets are not modelled)', async () => {
+  const { preciseDespatchInstant, despatchInstantRange, strictLatestDespatchTime } = await import('@/lib/domain/wms/dispatch-sweep')
+  const reading = { zoneless: 'europe-london' } as const
+  assert.equal(preciseDespatchInstant('1943-07-01T09:00:00', reading), null)
+  assert.equal(preciseDespatchInstant('1995-12-31T23:00:00', reading), null)
+  assert.equal(preciseDespatchInstant('1996-07-01T09:00:00', reading)?.toISOString(), '1996-07-01T08:00:00.000Z')
+  assert.equal(despatchInstantRange('1943-07-01', 'europe-london'), null)
+  assert.equal(despatchInstantRange('1943-07-01T09:00:00Z', 'europe-london'), null)
+  assert.equal(strictLatestDespatchTime([{ despatchedAt: '1943-07-01T09:00:00' }], reading), null)
 })
