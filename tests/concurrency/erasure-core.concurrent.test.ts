@@ -44,7 +44,10 @@ let actionsMocked = false
 async function mockActionEnvironment() {
   if (actionsMocked) return
   const actual = await import('@/lib/auth/server')
-  mock.module('@/lib/auth/server', { namedExports: { ...actual, requirePermission: async () => ({ user: { id: 'u1', role: 'ADMIN' } }) } })
+  // Every `require*` guard answers with an admin session; nothing else in the module changes.
+  const session = { user: { id: 'u1', role: 'ADMIN', name: 'Test Admin', email: 'admin@example.test' } }
+  const guards = Object.fromEntries(Object.keys(actual).filter((k) => k.startsWith('require')).map((k) => [k, async () => session]))
+  mock.module('@/lib/auth/server', { namedExports: { ...actual, ...guards } })
   mock.module('next/cache', { namedExports: { revalidatePath: () => undefined, revalidateTag: () => undefined } })
   actionsMocked = true
 }
@@ -626,4 +629,87 @@ test('[erasure] the production push port re-reads the order under the lock: an e
   assert.ok(fresh?.erasedAt, 'the boundary read sees the erasure the earlier read did not')
   assert.equal(fresh?.customerEmail, null)
   assert.equal(fresh?.customerName, 'GDPR Anonymised')
+})
+
+
+const manualOrder = (customerId: string | undefined, name: string) => ({
+  customerId, customerName: name, customerEmail: 'new.person@example.test', currency: 'GBP', isDraft: true,
+  // A free-text line with no catalogue product, which the action accepts at runtime.
+  lines: [{ sku: `MAN-${randomUUID().slice(0, 8)}`, description: 'Manual widget', qty: 1, unitPriceForeign: 10 }] as never,
+})
+
+test('[erasure] a manual order cannot be created for, or cloned from, an erased customer; and a create racing the erasure ends consistent in BOTH commit orders', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const created: string[] = []
+  t.after(async () => {
+    for (const id of created) {
+      await db.activityLog.deleteMany({ where: { entityId: id } })
+      await db.salesOrderLine.deleteMany({ where: { orderId: id } })
+      await db.salesOrder.deleteMany({ where: { id } })
+    }
+    await fx.cleanup()
+  })
+  const { createSalesOrder, cloneSalesOrder } = await import('@/app/actions/sales')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { ANONYMISED_CUSTOMER_LINK_REFUSAL } = await import('@/lib/domain/erasure/customer-link')
+
+  // CONTROL: before the erasure the same call works, so the refusals below are the guard and not the fixture.
+  const ok = await createSalesOrder(manualOrder(fx.customerId, 'Control Person'))
+  assert.equal(ok.success, true, JSON.stringify(ok))
+  created.push(ok.order!.id)
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: ok.order!.id } })).customerId, fx.customerId)
+
+  // ORDER 1: the erasure commits first. The create waits on the customer row lock, then refuses.
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const erasing = db.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "customers" WHERE id = ${fx.customerId} FOR UPDATE`
+    await gate
+    await tx.customer.update({ where: { id: fx.customerId }, data: { gdprAnonymisedAt: new Date(), firstName: 'GDPR', lastName: 'Anonymised', email: null } })
+  }, { timeout: 30_000 })
+  await new Promise((r) => setTimeout(r, 200))
+  const before = await db.salesOrder.count({ where: { customerName: 'Raced Person' } })
+  let done = false
+  const racing = createSalesOrder(manualOrder(fx.customerId, 'Raced Person')).then((r) => { done = true; return r })
+  await new Promise((r) => setTimeout(r, 1000))
+  assert.equal(done, false, 'the create is waiting on the customer row lock')
+  release()
+  await erasing
+  const refused = await racing
+  assert.deepEqual(refused, { success: false, error: ANONYMISED_CUSTOMER_LINK_REFUSAL })
+  assert.equal(await db.salesOrder.count({ where: { customerName: 'Raced Person' } }), before, 'no order was created')
+
+  // A DIRECT create on the now-erased customer is refused the same way, and so is a clone of one of its orders.
+  assert.deepEqual(await createSalesOrder(manualOrder(fx.customerId, 'Direct Person')), { success: false, error: ANONYMISED_CUSTOMER_LINK_REFUSAL })
+  const cloned = await cloneSalesOrder(ok.order!.id)
+  assert.equal(cloned.success, false)
+  assert.equal(cloned.error, ANONYMISED_CUSTOMER_LINK_REFUSAL)
+  assert.equal(await db.salesOrder.count({ where: { customerName: 'Direct Person' } }), 0)
+
+  // ORDER 2: the create commits first. An order inserted under the customer lock (what the create does) is found and erased by the
+  // erasure that was queued behind it.
+  const fx2 = await importFixture(db)
+  t.after(async () => { await fx2.cleanup() })
+  let release2!: () => void
+  const gate2 = new Promise<void>((resolve) => { release2 = resolve })
+  let newOrderId = ''
+  const creating = db.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "customers" WHERE id = ${fx2.customerId} FOR UPDATE`
+    await gate2
+    const order = await tx.salesOrder.create({ data: { orderNumber: `RACE-${randomUUID().slice(0, 8)}`, status: 'DRAFT', currency: 'GBP', customerId: fx2.customerId, customerName: 'Late Person', customerEmail: 'late@example.test', subtotalForeign: 1, totalForeign: 1, subtotalBase: 1, totalBase: 1 } })
+    newOrderId = order.id
+    created.push(order.id)
+  }, { timeout: 30_000 })
+  await new Promise((r) => setTimeout(r, 200))
+  let erased = false
+  const erasure = eraseCustomerPersonalData(fx2.customerId, { trigger: 'ON_REQUEST', userId: null }).then((r) => { erased = true; return r })
+  await new Promise((r) => setTimeout(r, 1000))
+  assert.equal(erased, false, 'the erasure is queued behind the create\'s customer lock')
+  release2()
+  await creating
+  assert.equal((await erasure).success, true)
+  const late = await db.salesOrder.findUniqueOrThrow({ where: { id: newOrderId } })
+  assert.deepEqual([late.customerName, late.customerEmail], ['GDPR Anonymised', null], 'the order that committed first was found and erased')
+  assert.ok(late.erasedAt)
 })

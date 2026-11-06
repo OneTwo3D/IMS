@@ -138,8 +138,9 @@ test('[o3d-j625] every facade accounting enqueue in app/ and lib/ names the char
   assert.ok(
     // o3d-j625 r6: 11 — the stock adjustment moved into the caller's transaction (review M3). The floor is the count.
     // o3d-q0x56.4: 9 - the AR/AP revaluation's two enqueues moved into one transaction per side (transactional census).
-    sites.length >= 9,
-    `expected to find the 9 facade enqueue call sites, found `
+    // 8: the held-invoice release enqueues inside its order-locked transaction (the in-transaction census below names its chart).
+    sites.length >= 8,
+    `expected to find the 8 facade enqueue call sites, found `
     + `${sites.length}. The detector is not examining the source it claims to.`,
   )
 

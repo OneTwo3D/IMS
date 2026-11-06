@@ -106,6 +106,47 @@ test('every writer of shopping_sync_logs is in the census', () => {
   assert.deepEqual(found, Object.fromEntries(Object.entries(SYNC_LOG_CENSUS).map(([f, v]) => [f, v.writers])))
 })
 
+/**
+ * CENSUS OF EVERY PATH THAT LINKS A CUSTOMER TO A SALES ORDER (any salesOrder create/update whose data assigns `customerId`).
+ * An order linked to an anonymised customer carries fresh personal data under an erased identity and escapes the erasure.
+ *
+ *   refuses     locks the customer row and re-reads gdprAnonymisedAt inside the create transaction, and REFUSES (a manual path:
+ *               the operator chooses another customer)
+ *   unlinks     the storefront importer, which has no operator: creates the order unlinked and records it
+ *
+ * There is no quote, B2B, CSV order import or customer-changing order edit in this codebase: the only order creators are the
+ * three below, and no update assigns a customer.
+ */
+const CUSTOMER_LINK_CENSUS: Record<string, { writers: number; verdict: string }> = {
+  'app/actions/sales.ts': { writers: 2, verdict: 'refuses (createSalesOrder, cloneSalesOrder)' },
+  'lib/connectors/woocommerce/sync/order-import.ts': { writers: 1, verdict: 'unlinks (importWcOrder create transaction)' },
+}
+
+test('every path that links a customer to a sales order is in the census', () => {
+  const cwd = new URL('..', import.meta.url).pathname
+  const files = execFileSync('git', ['grep', '-lE', 'salesOrder\\.(create|createMany|upsert|update|updateMany)\\(', '--', 'app', 'lib', ':!app/generated', ':!*.test.ts'], { encoding: 'utf8', cwd }).trim().split('\n').filter(Boolean)
+  const found: Record<string, number> = {}
+  for (const file of files) {
+    const lines = readFileSync(`${cwd}${file}`, 'utf8').split('\n')
+    lines.forEach((line, i) => {
+      if (!/salesOrder\.(create|createMany|upsert|update|updateMany)\(/.test(line)) return
+      const window = lines.slice(i, i + 30).join('\n')
+      if (/\bcustomerId\s*:/.test(window) && !/where:\s*\{[^}]*customerId/.test(window.split('data')[0])) found[file] = (found[file] ?? 0) + 1
+    })
+  }
+  assert.deepEqual(found, Object.fromEntries(Object.entries(CUSTOMER_LINK_CENSUS).map(([f, v]) => [f, v.writers])))
+})
+
+test('both manual order creators lock and re-read the customer inside the create transaction, before the create', () => {
+  const src = readFileSync(new URL('../app/actions/sales.ts', import.meta.url), 'utf8')
+  const start = src.indexOf('export async function createSalesOrder')
+  const create = src.slice(start, start + 24000)
+  assert.match(create, /lockCustomerForOrderLink\(tx, input\.customerId\)\s*return tx\.salesOrder\.create\(/)
+  assert.match(create, /instanceof CustomerAnonymisedError\) return \{ success: false, error: e\.message \}/)
+  const clone = src.slice(src.indexOf('export async function cloneSalesOrder'))
+  assert.match(clone, /lockCustomerForOrderLink\(tx, so\.customerId\)\s*await lockSalesOrder\(tx, id\)[\s\S]*return tx\.salesOrder\.create\(/)
+})
+
 test('the held-invoice release reads the marker, builds the payload and inserts inside ONE order-locked transaction, with no after-the-fact scrub', () => {
   const src = readFileSync(new URL('../lib/connectors/woocommerce/sync/order-import.ts', import.meta.url), 'utf8')
   const release = src.slice(src.indexOf('async function releaseHeldWcSalesInvoice'))

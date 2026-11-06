@@ -1655,16 +1655,16 @@ async function releaseHeldWcSalesInvoice(
   // disconnected, its sync is switched off") for a REFUSAL. A refusal is a retired chart, and telling an
   // operator to check a toggle sends them somewhere the answer is not.
   const enqueueOutcome: { outcome?: EnqueueOutcomeLike } = {}
-  // o3d-j625 r6 (review M1): the release's enqueue identity, ONCE — the enqueue below and the refusal row's
-  // fallback key both read it, so the two cannot name different postings.
+  // The release's posting identity, ONCE: the in-transaction enqueue below and the refusal row's fallback key both read it, so
+  // the two cannot name different postings. (The payload actually queued is built inside the locked transaction.)
   const releaseIdentity = {
     type: 'SALES_INVOICE' as const,
     referenceType: 'SalesOrder',
     referenceId: orderId,
-    // Used for the posting KEY and the refusal row only; the payload actually queued is built inside the locked transaction below.
-    payload: buildReleasedSalesInvoicePayload({ ...held, accountingPayload: scrubContactInAccountingPayload(held.accountingPayload) }, invoiceNumber),
     idempotencyKey,
   }
+  // o3d-j625 r6 (review M1): the release's enqueue identity, ONCE — the enqueue below and the refusal row's
+  // fallback key both read it, so the two cannot name different postings.
   try {
     // ONE ORDER-LOCKED TRANSACTION: the erasure marker is read under the order lock, the payload is built from that answer (the
     // parked contact when the order is not erased, the placeholder when it is), and the accounting row is inserted, all
@@ -1678,14 +1678,16 @@ async function releaseHeldWcSalesInvoice(
       const erased = Boolean(subject?.erasedAt || subject?.customer?.gdprAnonymisedAt)
       const releasable = erased ? { ...held, accountingPayload: scrubContactInAccountingPayload(held.accountingPayload) } : held
       return queueAccountingSyncTxWithOutcome(tx, {
-        type: releaseIdentity.type,
-        referenceType: releaseIdentity.referenceType,
+        type: 'SALES_INVOICE',
+        referenceType: 'SalesOrder',
         referenceId: releaseIdentity.referenceId,
         payload: buildReleasedSalesInvoicePayload(releasable, invoiceNumber),
         idempotencyKey: releaseIdentity.idempotencyKey,
         // o3d-j625: route by the chart FROZEN with this payload, not by whatever is active at release
         // time. A hold that cannot name one never gets here — it is refused above.
         chartConnector: heldChartConnector,
+        // The facade recorded a refusal as outstanding work in the exception inbox; the in-transaction enqueue is asked to do the same.
+        recordRefusalAsOutstanding: true,
       })
     }, { maxWait: 5_000, timeout: 20_000 })
   } catch (error) {
