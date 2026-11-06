@@ -166,13 +166,14 @@ const POST = '2026-07-01T10:00:00Z' // after the cutoff (and before now)
 type Part = { externalId: string; partNumber: number; status: string; dispatched: boolean; tracking: Array<{ trackingNumber: string; carrier: string; despatchedAt: string }> }
 const part = (n: number, at: string): Part => ({ externalId: `M-${n}`, partNumber: n, status: 'DESPATCHED', dispatched: true, tracking: [{ trackingNumber: `TN-${n}`, carrier: 'DPD', despatchedAt: at }] })
 
-async function sweep(parts: Part[], options: { verifier?: boolean } = {}) {
+async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'europe-london' } = {}) {
   const { runWmsDispatchSweepCore } = await import('@/lib/domain/wms/dispatch-sweep')
   const { pushPartialShipmentToShopping } = await import('@/lib/shopping')
   const { verifyPreCutoverCompletionByFreshRead } = await import('@/lib/connectors/woocommerce/sync/pre-cutover-order-read')
   const applyOptions: Array<Record<string, unknown> | undefined> = []
   const asked: Array<string | null> = []
   const out = await runWmsDispatchSweepCore({
+    ...(options.zoneless ? { zonelessDespatchReading: options.zoneless } : {}),
     listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
     fetchOrderStatus: async () => ({
       externalOrderId: 'M-1', externalOrderNumber: 'WC-1001', status: 'DESPATCHED', statusLabel: 'Despatched', isSplit: true, partCount: parts.length,
@@ -729,4 +730,44 @@ test('parseWcGmtInstant reads only an unambiguous UTC instant', async () => {
   for (const bad of [undefined, null, '', 'x', '2026-05-23', '2026-05-23 09:00:00', '2026-05-23T09:00:00+01:00', '2026-02-31T09:00:00', 5]) {
     assert.equal(parseWcGmtInstant(bad), null, String(bad))
   }
+})
+
+// ───────────────────────── zone-less Mintsoft despatch times read as UK time ─────────────────────────
+
+test('UK TIME, END TO END: a pre-cutover part with a zone-less SUMMER value, after a Woo completion, verifies', async () => {
+  reset()
+  // 10:00 BST on 20 May is 09:00Z; the default order read completed at 2026-05-23T09:00Z, later, so it verifies
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const run = await sweep([part(1, '2026-05-20T10:00:00')], { zoneless: 'europe-london' })
+    assert.equal(run.out.counters.dispatched, 1)
+    assert.deepEqual(run.applyOptions, [{ storefrontAlreadyCompleted: true }])
+    assert.deepEqual(run.asked, ['2026-05-20T09:00:00.000Z'])
+    assert.deepEqual(reads(), [ORDER_READ])
+    assert.deepEqual(writes(), [])
+  })
+  // the same value with the reading off (any non-Mintsoft source) stays unknown: pending, no read
+  reset()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const run = await sweep([part(1, '2026-05-20T10:00:00')])
+    assert.equal(run.out.counters.dispatched, 0)
+    assert.deepEqual(run.asked, [null], 'asked with an UNKNOWN despatch time, which reads nothing')
+    assert.deepEqual(transport, [])
+  })
+})
+
+test('UK TIME, END TO END: a zone-less value in the clock-change hour keeps the part pending with no read', async () => {
+  for (const at of ['2025-03-30T01:30:00', '2025-10-26T01:30:00', '2026-05-20']) {
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const run = await sweep([part(1, at)], { zoneless: 'europe-london' })
+      assert.equal(run.out.counters.dispatched, 0, at)
+      assert.deepEqual(run.asked, [null], at)
+      assert.deepEqual(transport, [], at)
+    })
+  }
+})
+
+test('UK TIME, ORDINARY PUSH: the reading never touches the lenient push time', async () => {
+  const { latestDespatchTime } = await import('@/lib/domain/wms/dispatch-sweep')
+  assert.equal(latestDespatchTime([{ despatchedAt: '2026-07-15T09:00:00' }])?.getTime(), new Date('2026-07-15T09:00:00').getTime())
 })

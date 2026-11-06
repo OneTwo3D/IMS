@@ -5,6 +5,7 @@ import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
+import type { ZonelessDespatchReading } from '@/lib/connectors/wms/connector-hooks'
 import {
   decodeWmsDeltaCursor,
   encodeWmsDeltaCursor,
@@ -430,6 +431,8 @@ export type WmsDispatchSweepDeps = {
    * after `latestDespatchAt` (the LATEST despatch among the order's despatched parts). Absent: nothing is verifiable.
    */
   verifyPreCutoverCompletion?(orderId: string, latestDespatchAt: Date | null): Promise<{ verified: boolean; detail: string }>
+  /** How this WMS's zone-less despatch datetimes are read in the pre-cutover verification only. Absent: they are UNKNOWN (strict). */
+  zonelessDespatchReading?: ZonelessDespatchReading
   // Whether the active connector supports per-part reconciliation (fetchOrderParts). When
   // false, a split order is surfaced as a clear "unsupported" pending rather than silently
   // stalling as "no parts visible".
@@ -635,26 +638,60 @@ export function latestDespatchTime(tracking: ReadonlyArray<{ despatchedAt?: stri
 
 /** A date AND time with an explicit zone (`Z` or a numeric offset). Anything less is not an instant. */
 const PRECISE_DESPATCH_INSTANT = /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?\s*(?:([Zz])|([+-])(\d{2}):?(\d{2}))$/
+/** A date AND time with NO zone at all. */
+const ZONELESS_DESPATCH_DATETIME = /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$/
+
+const LONDON_PARTS = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Europe/London', hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+})
+
+/** The Europe/London wall clock at an instant, as a UTC-style millisecond count (whole seconds). Independent of the host timezone. */
+function londonWallMs(instantMs: number): number {
+  const p: Record<string, number> = {}
+  for (const part of LONDON_PARTS.formatToParts(new Date(instantMs))) if (part.type !== 'literal') p[part.type] = Number(part.value)
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second)
+}
+
+/**
+ * The UTC instant of a Europe/London wall-clock time (given as a UTC-style millisecond count), or null when that local time does
+ * not exist (spring-forward gap) or occurs twice (autumn fall-back hour): both are UNKNOWN. UK offsets are only ever 0 or +1 h, so
+ * the two candidates are checked against the zone's own clock.
+ */
+function londonLocalToInstant(wallMs: number): Date | null {
+  const wholeSecond = Math.floor(wallMs / 1000) * 1000
+  const matches = [0, 60 * 60_000].map((offset) => wallMs - offset).filter((instant) => londonWallMs(instant) === wholeSecond)
+  return matches.length === 1 ? new Date(matches[0]) : null
+}
 
 /**
  * A despatch value as an UNAMBIGUOUS instant, or null. Only a date AND time with an explicit offset or `Z` counts. A date-only value
  * ("2026-05-20") reads as midnight UTC, which can sit hours before the real despatch, and a value with no zone ("2026-05-20T09:00:00")
  * is the warehouse's local time of unknown zone: neither says which side of the live-from instant the despatch fell on.
+ *
+ * `options.zoneless = 'europe-london'` (Mintsoft values only) reads a date AND time with no zone as UK local time (BST or GMT by
+ * date). A local time that does not exist or occurs twice at a clock change is still null. Date-only values stay null.
  */
-export function preciseDespatchInstant(value: string | null | undefined): Date | null {
+export function preciseDespatchInstant(value: string | null | undefined, options?: { zoneless?: ZonelessDespatchReading }): Date | null {
   if (!value) return null
-  const m = PRECISE_DESPATCH_INSTANT.exec(value.trim())
-  if (!m) return null
-  const [, y, mo, d, h, mi, sec, frac, , sign, oh, om] = m
+  const trimmed = value.trim()
+  const m = PRECISE_DESPATCH_INSTANT.exec(trimmed)
+  const zoneless = m ? null : options?.zoneless === 'europe-london' ? ZONELESS_DESPATCH_DATETIME.exec(trimmed) : null
+  const g = m ?? zoneless
+  if (!g) return null
+  const [, y, mo, d, h, mi, sec, frac] = g
   const wall = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(sec ?? 0), Number((frac ?? '').slice(0, 3).padEnd(3, '0')))
   const check = new Date(wall)
   // A calendar or clock value that does not exist (31 February, 25:00) rolls over silently: refuse it.
   if (check.getUTCFullYear() !== Number(y) || check.getUTCMonth() + 1 !== Number(mo) || check.getUTCDate() !== Number(d) || check.getUTCHours() !== Number(h) || check.getUTCMinutes() !== Number(mi)) return null
-  if (sign !== undefined) {
-    if (Number(oh) > 14 || Number(om) > 59) return null
-    return new Date(wall - (sign === '-' ? -1 : 1) * (Number(oh) * 60 + Number(om)) * 60_000)
+  if (m) {
+    const sign = m[9]
+    if (sign !== undefined) {
+      if (Number(m[10]) > 14 || Number(m[11]) > 59) return null
+      return new Date(wall - (sign === '-' ? -1 : 1) * (Number(m[10]) * 60 + Number(m[11])) * 60_000)
+    }
+    return new Date(wall)
   }
-  return new Date(wall)
+  return londonLocalToInstant(wall)
 }
 
 /**
@@ -663,11 +700,14 @@ export function preciseDespatchInstant(value: string | null | undefined): Date |
  * that is not known precisely, and a part must never be treated as pre-cutover on an imprecise date. Every other push keeps the
  * lenient {@link latestDespatchTime}, including its use of "now" for a part with no usable date.
  */
-export function strictLatestDespatchTime(tracking: ReadonlyArray<{ despatchedAt?: string | null }>): Date | null {
+export function strictLatestDespatchTime(
+  tracking: ReadonlyArray<{ despatchedAt?: string | null }>,
+  options?: { zoneless?: ZonelessDespatchReading },
+): Date | null {
   if (tracking.length === 0) return null
   let latest: Date | null = null
   for (const entry of tracking) {
-    const at = preciseDespatchInstant(entry.despatchedAt)
+    const at = preciseDespatchInstant(entry.despatchedAt, options)
     if (at === null) return null
     if (latest === null || at.getTime() > latest.getTime()) latest = at
   }
@@ -720,7 +760,7 @@ async function reconcileSplitOrder(
   // The fresh read happens at most once per order per sweep: the first shadowed pre-cutover part asks, the rest reuse the answer.
   let preCutoverVerdict: { verified: boolean; detail: string } | null = null
   // What a verifying completion must postdate: the LATEST despatch among ALL despatched parts, not the part being asked about.
-  const latestPartDespatch = strictLatestDespatchTime(dispatchedParts.flatMap((entry) => entry.tracking))
+  const latestPartDespatch = strictLatestDespatchTime(dispatchedParts.flatMap((entry) => entry.tracking), { zoneless: deps.zonelessDespatchReading })
   if (recordPartials) {
     for (const part of dispatchedParts) {
       const items = await deps.fetchPartItems(part.externalId)
@@ -2240,6 +2280,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
   const deltaScopeLock = getWmsConnectorHooks(connectorId).deltaScopeLock
     ?? defaultWmsDeltaScopeLock(wmsDeltaStateRowKeys(deltaKeys))
   return {
+    zonelessDespatchReading: getWmsConnectorHooks(connectorId).zonelessDespatchReading,
     async listCandidates(limit) {
       const rows = await db.wmsOrderPushLink.findMany({
         where: dispatchCandidateWhere(connectorId),

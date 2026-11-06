@@ -382,6 +382,8 @@ export const BUILT_IN_WMS_CONNECTOR_REGISTRATIONS: WmsConnectorRegistrations<Wms
       // moving them invalidates every cursor. Other connectors get the default lock over their own
       // cursor rows — never these.
       deltaScopeLock: async (tx) => mintsoftDeltaScopeToken(await lockMintsoftDispatchSettings(tx)),
+      // Mintsoft sends despatch datetimes without a zone (the .NET form); the warehouse is in the UK (owner decision).
+      zonelessDespatchReading: 'europe-london',
     },
   },
 }

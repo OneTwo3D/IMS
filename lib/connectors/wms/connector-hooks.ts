@@ -127,6 +127,9 @@ export type WmsOnboardingActions = {
   getConnectionData(): Promise<WmsOnboardingConnection>
 }
 
+/** How a zone-less despatch datetime is read in the pre-cutover verification. */
+export type ZonelessDespatchReading = 'europe-london'
+
 export type WmsConnectorHooks = {
   asn?: () => Promise<WmsAsnActions>
   productSync?: () => Promise<WmsProductSyncActions>
@@ -143,4 +146,9 @@ export type WmsConnectorHooks = {
    * connector's.
    */
   deltaScopeLock?: WmsDeltaScopeLock
+  /**
+   * The zone a zone-less despatch datetime from this WMS is known to be in, for the pre-cutover verification ONLY. Omitted by a
+   * connector whose zone-less values have no known zone: they stay UNKNOWN there.
+   */
+  zonelessDespatchReading?: ZonelessDespatchReading
 }
