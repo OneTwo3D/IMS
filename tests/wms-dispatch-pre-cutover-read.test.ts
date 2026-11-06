@@ -755,13 +755,13 @@ test('UK TIME, END TO END: a pre-cutover part with a zone-less SUMMER value, aft
   })
 })
 
-test('UK TIME, END TO END: a zone-less value in the clock-change hour keeps the part pending with no read', async () => {
+test('UK TIME, END TO END: a zone-less value in the clock-change hour keeps the part pending with no read or write', async () => {
   for (const at of ['2025-03-30T01:30:00', '2025-10-26T01:30:00', '2026-05-20']) {
     reset()
     await withEnv(LIVE_AT_CUTOFF, async () => {
       const run = await sweep([part(1, at)], { zoneless: 'europe-london' })
       assert.equal(run.out.counters.dispatched, 0, at)
-      assert.deepEqual(run.asked, [null], at)
+      assert.deepEqual(run.asked, [], at)
       assert.deepEqual(transport, [], at)
     })
   }
@@ -770,4 +770,60 @@ test('UK TIME, END TO END: a zone-less value in the clock-change hour keeps the 
 test('UK TIME, ORDINARY PUSH: the reading never touches the lenient push time', async () => {
   const { latestDespatchTime } = await import('@/lib/domain/wms/dispatch-sweep')
   assert.equal(latestDespatchTime([{ despatchedAt: '2026-07-15T09:00:00' }])?.getTime(), new Date('2026-07-15T09:00:00').getTime())
+})
+
+// ───────────────────────── the cutoff DISPOSITION reads zone-less Mintsoft times as UK time too ─────────────────────────
+
+// Cutover 2026-06-01T00:00:00Z. London is on BST then: local 00:30 on 1 June is 23:30Z on 31 May (BEFORE), local 01:30 is 00:30Z (AFTER).
+// A host-timezone parse would put 00:30 at 00:30Z on a UTC host (AFTER, a storefront write): the verdict must not depend on the host.
+test('DISPOSITION: a zone-less Mintsoft time 30 minutes either side of the cutover is judged as UK time, whatever the host timezone', async () => {
+  reset()
+  orderRead = wcOrder({ date_completed_gmt: '2026-06-02T00:00:00', date_modified_gmt: '2026-06-02T00:00:05' })
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    // local 00:30 BST = 23:30Z on 31 May: before the cutover, so shadowed and VERIFIED by a read, never written
+    const before = await sweep([part(1, '2026-06-01T00:30:00')], { zoneless: 'europe-london' })
+    assert.equal(before.out.counters.dispatched, 1)
+    assert.deepEqual(before.applyOptions, [{ storefrontAlreadyCompleted: true }])
+    assert.deepEqual(before.asked, ['2026-05-31T23:30:00.000Z'])
+    assert.deepEqual(writes(), [])
+  })
+  reset()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    // local 01:30 BST = 00:30Z on 1 June: after the cutover, so pushed live as before, nothing read
+    const after = await sweep([part(1, '2026-06-01T01:30:00')], { zoneless: 'europe-london' })
+    assert.equal(after.out.counters.dispatched, 1)
+    assert.deepEqual(after.applyOptions, [undefined])
+    assert.equal(writes().length, 1)
+    assert.deepEqual(reads(), [])
+    assert.deepEqual(after.asked, [])
+  })
+})
+
+test('DISPOSITION: a gap, ambiguous or date-only time next to the cutover stays pending, with no write and no read', async () => {
+  const cases: Array<[string, string]> = [
+    ['2026-03-29T01:30:00', '2026-03-29T01:00:00Z'], // does not exist locally
+    ['2026-10-25T01:30:00', '2026-10-25T01:00:00Z'], // happens twice
+    ['2026-06-01', '2026-06-01T00:00:00Z'], // date only
+  ]
+  for (const [at, cutoff] of cases) {
+    reset()
+    await withEnv({ ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: cutoff }, async () => {
+      const run = await sweep([part(1, at)], { zoneless: 'europe-london' })
+      assert.equal(run.out.counters.dispatched, 0, at)
+      assert.equal(run.out.counters.pending, 1, at)
+      assert.deepEqual(writes(), [], at)
+      assert.deepEqual(reads(), [], at)
+      assert.deepEqual(run.asked, [], at)
+    })
+  }
+})
+
+test('DISPOSITION: without the reading (any non-Mintsoft source) the lenient time is used, as before', async () => {
+  const { dispositionDespatchTime } = await import('@/lib/domain/wms/dispatch-sweep')
+  assert.deepEqual(dispositionDespatchTime([{ despatchedAt: PRE }], undefined), { unknown: false, at: new Date(PRE) })
+  assert.deepEqual(dispositionDespatchTime([{}], undefined), { unknown: false, at: null })
+  assert.deepEqual(dispositionDespatchTime([{ despatchedAt: '2026-06-01' }], undefined), { unknown: false, at: new Date('2026-06-01') })
+  assert.deepEqual(dispositionDespatchTime([{ despatchedAt: PRE }, {}], 'europe-london'), { unknown: false, at: new Date(PRE) })
+  assert.deepEqual(dispositionDespatchTime([{}], 'europe-london'), { unknown: false, at: null })
+  assert.deepEqual(dispositionDespatchTime([{ despatchedAt: PRE }, { despatchedAt: '2026-06-01' }], 'europe-london'), { unknown: true })
 })

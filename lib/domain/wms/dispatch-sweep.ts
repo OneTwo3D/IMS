@@ -715,6 +715,28 @@ export function strictLatestDespatchTime(
 }
 
 /**
+ * The business-event time a part's storefront push is judged by (the live-from cutoff decision), for a WMS whose zone-less
+ * despatch datetimes have a known zone. Returns `{ unknown: true }` when any entry that CARRIES a value is not an unambiguous
+ * instant under that reading (a date-only value, a clock-change time that does not exist or occurs twice, an unparseable value):
+ * the caller must then hold the part pending, because an unknown time must never lead to a storefront write. Entries with no value
+ * at all keep the lenient behaviour (skipped; none usable gives null, i.e. "now"). Without a reading, the lenient host parse stays.
+ */
+export function dispositionDespatchTime(
+  tracking: ReadonlyArray<{ despatchedAt?: string | null }>,
+  reading: ZonelessDespatchReading | undefined,
+): { unknown: false; at: Date | null } | { unknown: true } {
+  if (reading === undefined) return { unknown: false, at: latestDespatchTime(tracking) }
+  let latest: Date | null = null
+  for (const entry of tracking) {
+    if (!entry.despatchedAt) continue
+    const at = preciseDespatchInstant(entry.despatchedAt, { zoneless: reading })
+    if (at === null) return { unknown: true }
+    if (latest === null || at.getTime() > latest.getTime()) latest = at
+  }
+  return { unknown: false, at: latest }
+}
+
+/**
  * Reconcile a SPLIT WMS order: push each despatched part to the storefront as a partial
  * shipment (idempotent per part), and only mark the IMS order SHIPPED once every part has
  * despatched — line-level at the storefront, atomic IMS-side. A partially-despatched order
@@ -761,6 +783,22 @@ async function reconcileSplitOrder(
   let preCutoverVerdict: { verified: boolean; detail: string } | null = null
   // What a verifying completion must postdate: the LATEST despatch among ALL despatched parts, not the part being asked about.
   const latestPartDespatch = strictLatestDespatchTime(dispatchedParts.flatMap((entry) => entry.tracking), { zoneless: deps.zonelessDespatchReading })
+  // The cutoff disposition of a part is judged by its despatch time. For a WMS with a known zone for zone-less values that time must
+  // be an unambiguous instant: any part whose time is unknown is held pending BEFORE anything is pushed (never a storefront write).
+  const partDespatch = new Map<object, Date | null>()
+  if (recordPartials) {
+    for (const part of dispatchedParts) {
+      const judged = dispositionDespatchTime(part.tracking, deps.zonelessDespatchReading)
+      if (judged.unknown) {
+        return {
+          action: 'pending',
+          reason: `Part ${part.partNumber} has a despatch time that cannot be read as an exact instant: holding it rather than risk a storefront write`,
+          unresolved: requireResolution,
+        }
+      }
+      partDespatch.set(part, judged.at)
+    }
+  }
   if (recordPartials) {
     for (const part of dispatchedParts) {
       const items = await deps.fetchPartItems(part.externalId)
@@ -773,7 +811,7 @@ async function reconcileSplitOrder(
         totalParts,
         trackingNumber: part.tracking.find((entry) => entry.trackingNumber)?.trackingNumber ?? null,
         items,
-        despatchedAt: latestDespatchTime(part.tracking),
+        despatchedAt: partDespatch.get(part) ?? null,
       })
       if (!push.ok) {
         // The producer-side hold kept this push as a shadow: NOT a failure (no failure is counted and the link is never
