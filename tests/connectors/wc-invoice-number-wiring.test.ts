@@ -152,7 +152,7 @@ test('the release enqueues BEFORE it marks the row, so a crash cannot strand the
   const start = src.indexOf('async function releaseHeldWcSalesInvoice(')
   assert.ok(start > 0, 'the release must exist')
   const body = src.slice(start, src.indexOf('\n}\n', start))
-  const enqueue = body.indexOf('await queueAccountingSync({')
+  const enqueue = body.indexOf('queueAccountingSyncTxWithOutcome(tx, {')
   const mark = body.indexOf("status: 'SYNCED',")
   assert.ok(enqueue > 0 && mark > enqueue, 'the queue row must be marked SYNCED only AFTER the enqueue succeeds')
   assert.ok(
@@ -160,8 +160,8 @@ test('the release enqueues BEFORE it marks the row, so a crash cannot strand the
     'the enqueue must be deduplicable, so a repeated release adds nothing',
   )
   assert.ok(
-    body.includes('buildReleasedSalesInvoicePayload(held, invoiceNumber)'),
-    'the release must post the parked payload plus the number, not a rebuilt one',
+    body.includes('buildReleasedSalesInvoicePayload(releasable, invoiceNumber)'),
+    'the release must post the parked payload (scrubbed of contact identity when the order is erased) plus the number, not a rebuilt one',
   )
 })
 

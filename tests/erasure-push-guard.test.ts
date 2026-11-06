@@ -46,6 +46,7 @@ function port(over: Record<string, unknown>) {
     cancellableLinks: async () => [], updatableLinks: async () => [],
     updateLink: async (_id: string, data: Record<string, unknown>) => { writes.push(data) },
     updateLinkByOrder: async () => undefined, updateLinkIfState: async () => true, upsertByOrder: async () => undefined,
+    claimForCreate: async () => 'CLAIMED',
     recordValidationFailure: async (_id: string, _c: string, message: string) => { failures.push(message); return true },
     screenLiveWithdrawals: async () => new Set<string>(), verifyWithdrawalFence: async () => true, recordEvent: async () => undefined,
   }
@@ -82,4 +83,61 @@ test('control: an un-erased order IS amended, so the tripwire connector is wired
   const { port: p } = port({ updatableLinks: async () => [link] })
   await runWmsOrderPushSweepCore(tripwireConnector(calls) as never, 'mintsoft', p, { now: NOW })
   assert.deepEqual(calls, ['updateOrder'])
+})
+
+
+// ---- The boundary re-read: the order is read AGAIN under its lock immediately before the send. -----------------------------
+
+test('create pass: an erasure after the sweep loaded the order and before the push sends nothing, and gives the claim back', async () => {
+  const calls: string[] = []
+  const given: Array<Record<string, unknown>> = []
+  // The candidate list (the earlier read) is NOT erased; the boundary re-read is.
+  const { port: p } = port({
+    createCandidates: async () => [{ ...baseOrder, erasedAt: null, pushAttempts: 0 } as unknown as WmsPushCandidate],
+    updateLinkIfCreateClaimOwned: async (_o: string, _s: Date, data: Record<string, unknown>) => { given.push(data); return true },
+    reloadOrderForPush: async () => ({ ...baseOrder, customerName: 'GDPR Anonymised', customerEmail: null, customerVatNumber: null, erasedAt: ERASED }),
+  })
+  await runWmsOrderPushSweepCore(tripwireConnector(calls) as never, 'mintsoft', p, { now: NOW })
+  assert.deepEqual(calls, [], 'no identity and no VAT number reached the warehouse double')
+  assert.ok(given.some((d) => d.lastError === ERASED_ORDER_PUSH_REASON), JSON.stringify(given))
+})
+
+test('create pass: the payload that IS sent is built from the boundary re-read, not from the earlier list read', async () => {
+  const sent: Array<Record<string, unknown>> = []
+  const connector = {
+    pushOrder: async (input: Record<string, unknown>) => { sent.push(input); return { externalOrderId: 'w1', status: 'NEW' } },
+    updateOrder: async () => { throw new Error('unexpected') }, addOrderComment: async () => undefined, cancelOrder: async () => undefined,
+  }
+  const { port: p } = port({
+    createCandidates: async () => [{ ...baseOrder, erasedAt: null, pushAttempts: 0 } as unknown as WmsPushCandidate],
+    reloadOrderForPush: async () => ({ ...baseOrder, customerVatNumber: 'GB-FRESH-1', erasedAt: null }),
+  })
+  await runWmsOrderPushSweepCore(connector as never, 'mintsoft', p, { now: NOW })
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0]!.vatNumber, 'GB-FRESH-1', 'the VAT number is the re-read one (the earlier read said ' + VAT + ')')
+})
+
+test('create pass: an order that cannot be re-read is not sent (fail closed)', async () => {
+  const calls: string[] = []
+  const { port: p } = port({
+    createCandidates: async () => [{ ...baseOrder, erasedAt: null, pushAttempts: 0 } as unknown as WmsPushCandidate],
+    reloadOrderForPush: async () => { throw new Error('db down') },
+  })
+  await runWmsOrderPushSweepCore(tripwireConnector(calls) as never, 'mintsoft', p, { now: NOW })
+  assert.deepEqual(calls, [])
+})
+
+test('amend pass: an erasure after the sweep loaded the link sends nothing and is settled locally; an unreadable order stays due', async () => {
+  const calls: string[] = []
+  const link = { id: 'link-1', externalOrderId: 'wms-1', courierForm: null, courierFormName: null, order: { ...baseOrder, erasedAt: null } } as unknown as WmsPushUpdateLink
+  const erased = port({ updatableLinks: async () => [link], reloadOrderForPush: async () => ({ ...baseOrder, erasedAt: ERASED }) })
+  await runWmsOrderPushSweepCore(tripwireConnector(calls) as never, 'mintsoft', erased.port, { now: NOW })
+  assert.deepEqual(calls, [])
+  assert.ok(erased.writes[0]!.pushedAt, 'settled: not selected again')
+  assert.equal(erased.writes[0]!.lastError, ERASED_ORDER_PUSH_REASON)
+
+  const unreadable = port({ updatableLinks: async () => [link], reloadOrderForPush: async () => { throw new Error('db down') } })
+  await runWmsOrderPushSweepCore(tripwireConnector(calls) as never, 'mintsoft', unreadable.port, { now: NOW })
+  assert.deepEqual(calls, [])
+  assert.equal('pushedAt' in unreadable.writes[0]!, false, 'left due, so the next pass tries again')
 })

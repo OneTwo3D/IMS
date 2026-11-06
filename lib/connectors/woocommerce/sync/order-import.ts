@@ -2,7 +2,7 @@
  * WooCommerce → IMS order import.
  */
 
-import { isOrderErasedUnderLock, scrubContactInAccountingPayload, scrubErasedOrderAccountingPayloads } from '@/lib/domain/erasure/erase-personal-data'
+import { scrubContactInAccountingPayload } from '@/lib/domain/erasure/erase-personal-data'
 import { createHash } from 'node:crypto'
 import { currentTaxRates, lockOrderNamedTaxRate, resolveLinesTaxRates } from '@/lib/tax/writable-tax-rate'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
@@ -1609,12 +1609,7 @@ async function releaseHeldWcSalesInvoice(
     return 'unreadable'
   }
 
-  // ERASURE GATE ON THE COPY. The release copies the parked payload (contact block included) into a new accounting row. The
-  // marker is read under the order lock; an erased order releases the SCRUBBED payload (placeholder name, no email). An erasure
-  // that commits after this read is covered by the re-check after the enqueue below.
-  const heldRaw: HeldSalesInvoicePayload = row.payload
-  const orderErased = await isOrderErasedUnderLock(orderId)
-  const held = orderErased ? { ...heldRaw, accountingPayload: scrubContactInAccountingPayload(heldRaw.accountingPayload) } : heldRaw
+  const held: HeldSalesInvoicePayload = row.payload
   const idempotencyKey = `wc-held-sales-invoice:${orderId}:${invoiceNumber}`
   // o3d-j625 r2 (Codex HIGH 1/HIGH 2) — A HOLD THAT CANNOT NAME ITS CHART IS NOT RELEASED.
   //
@@ -1666,17 +1661,33 @@ async function releaseHeldWcSalesInvoice(
     type: 'SALES_INVOICE' as const,
     referenceType: 'SalesOrder',
     referenceId: orderId,
-    payload: buildReleasedSalesInvoicePayload(held, invoiceNumber),
+    // Used for the posting KEY and the refusal row only; the payload actually queued is built inside the locked transaction below.
+    payload: buildReleasedSalesInvoicePayload({ ...held, accountingPayload: scrubContactInAccountingPayload(held.accountingPayload) }, invoiceNumber),
     idempotencyKey,
   }
   try {
-    const { queueAccountingSync } = await import('@/lib/accounting')
-    enqueueOutcome.outcome = await queueAccountingSync({
-      ...releaseIdentity,
-      // o3d-j625: route by the chart FROZEN with this payload, not by whatever is active at release
-      // time. A hold that cannot name one never gets here — it is refused above.
-      chartConnector: heldChartConnector,
-    })
+    // ONE ORDER-LOCKED TRANSACTION: the erasure marker is read under the order lock, the payload is built from that answer (the
+    // parked contact when the order is not erased, the placeholder when it is), and the accounting row is inserted, all
+    // inside it. The erasure takes the same lock, so there is no interleaving: it either committed first (and this sees it) or
+    // runs after this commits (and scrubs the row this queued). Any failure rolls the whole thing back: the hold stays PENDING
+    // and the sweep retries it. There is no after-the-fact scrub.
+    const { queueAccountingSyncTxWithOutcome } = await import('@/lib/accounting')
+    enqueueOutcome.outcome = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
+      const subject = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, customer: { select: { gdprAnonymisedAt: true } } } })
+      const erased = Boolean(subject?.erasedAt || subject?.customer?.gdprAnonymisedAt)
+      const releasable = erased ? { ...held, accountingPayload: scrubContactInAccountingPayload(held.accountingPayload) } : held
+      return queueAccountingSyncTxWithOutcome(tx, {
+        type: releaseIdentity.type,
+        referenceType: releaseIdentity.referenceType,
+        referenceId: releaseIdentity.referenceId,
+        payload: buildReleasedSalesInvoicePayload(releasable, invoiceNumber),
+        idempotencyKey: releaseIdentity.idempotencyKey,
+        // o3d-j625: route by the chart FROZEN with this payload, not by whatever is active at release
+        // time. A hold that cannot name one never gets here — it is refused above.
+        chartConnector: heldChartConnector,
+      })
+    }, { maxWait: 5_000, timeout: 20_000 })
   } catch (error) {
     // Left PENDING on purpose — the release sweep retries it (see retryHeldWcSalesInvoiceReleases).
     await noteHeldReleaseFailure(
@@ -1706,11 +1717,6 @@ async function releaseHeldWcSalesInvoice(
     }
     return 'not-queued'
   }
-
-  // The order may have been erased between the marker read above and the enqueue: scrub the row the release just queued.
-  await scrubErasedOrderAccountingPayloads(orderId).catch((error) => {
-    console.error(`[wc-import] could not re-check the erasure marker after releasing the held invoice for ${orderId}:`, error)
-  })
 
   // THE PRODUCER-SIDE HOLD SHADOWED THE INVOICE. A shadow is the record the hold keeps INSTEAD of a queued posting (a CANCELLED row with no
   // document id, plus the durable shadow record): it is not "nothing was queued", and no later pass can turn it into a queued row. Reading

@@ -106,11 +106,11 @@ test('every writer of shopping_sync_logs is in the census', () => {
   assert.deepEqual(found, Object.fromEntries(Object.entries(SYNC_LOG_CENSUS).map(([f, v]) => [f, v.writers])))
 })
 
-test('the held-invoice release checks the erasure marker under the order lock before it copies the parked payload, and re-checks after the enqueue', () => {
+test('the held-invoice release reads the marker, builds the payload and inserts inside ONE order-locked transaction, with no after-the-fact scrub', () => {
   const src = readFileSync(new URL('../lib/connectors/woocommerce/sync/order-import.ts', import.meta.url), 'utf8')
   const release = src.slice(src.indexOf('async function releaseHeldWcSalesInvoice'))
-  assert.match(release, /isOrderErasedUnderLock\(orderId\)[\s\S]*scrubContactInAccountingPayload\(heldRaw\.accountingPayload\)[\s\S]*buildReleasedSalesInvoicePayload\(held, invoiceNumber\)/)
-  assert.match(release, /queueAccountingSync\(\{[\s\S]*scrubErasedOrderAccountingPayloads\(orderId\)/)
+  assert.match(release, /db\.\$transaction\(async \(tx\) => \{\s*await lockSalesOrder\(tx, orderId\)[\s\S]*erasedAt[\s\S]*scrubContactInAccountingPayload\(held\.accountingPayload\)[\s\S]*queueAccountingSyncTxWithOutcome\(tx,/)
+  assert.ok(!/scrubErasedOrderAccountingPayloads|isOrderErasedUnderLock/.test(src), 'the read-then-scrub-afterwards shape is gone')
 })
 
 test('the two edit actions take the order lock and read erasedAt inside the transaction before writing', () => {

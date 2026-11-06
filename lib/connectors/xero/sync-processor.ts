@@ -6207,9 +6207,11 @@ export async function processClaimedEntry(
       if (!numberFence.post) return numberFence.result
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice', payload)
       // r5 #1: the claim is re-taken HERE, after the scope read and the cancelled-order guard, not once at the top of the entry.
+      // The erasure state is read BEFORE the claim is re-taken and fails closed: if it cannot be read, nothing is posted and the entry is retried.
+      const postContact = await resolveSalesPostContact(referenceType, referenceId, payload)
+      if (!postContact.ok) return { success: false, error: postContact.error }
       const fence = await lease.fenceBeforeRemoteWrite('sales-invoice')
       if (!fence.ok) return fence.result
-      const postContact = await resolveSalesPostContact(referenceType, referenceId, payload)
       const invoiceResult = await pushSalesInvoice({
         invoiceNumber: payload.invoiceNumber as string,
         contactName: postContact.contactName,
@@ -6250,9 +6252,11 @@ export async function processClaimedEntry(
       if (!guard.post) return guard.result
       const customerId = guard.customerId
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice-update', payload)
+      // The erasure state is read BEFORE the claim is re-taken and fails closed: if it cannot be read, nothing is posted and the entry is retried.
+      const postContact = await resolveSalesPostContact(referenceType, referenceId, payload)
+      if (!postContact.ok) return { success: false, error: postContact.error }
       const fence = await lease.fenceBeforeRemoteWrite('sales-invoice-update')
       if (!fence.ok) return fence.result
-      const postContact = await resolveSalesPostContact(referenceType, referenceId, payload)
       const invoiceResult = await updateSalesInvoice(accountingInvoiceId, {
         invoiceNumber: payload.invoiceNumber as string,
         contactName: postContact.contactName,
@@ -6678,9 +6682,11 @@ export async function processClaimedEntry(
             select: { order: { select: { customerId: true } } },
           }).catch(() => null))?.order.customerId ?? undefined
         : undefined
+      // The erasure state is read BEFORE the claim is re-taken and fails closed: if it cannot be read, nothing is posted and the entry is retried.
+      const creditContact = await resolveSalesPostContact(referenceType, referenceId, payload)
+      if (!creditContact.ok) return { success: false, error: creditContact.error }
       const fence = await lease.fenceBeforeRemoteWrite('credit-note')
       if (!fence.ok) return fence.result
-      const creditContact = await resolveSalesPostContact(referenceType, referenceId, payload)
       return pushCreditNote({
         creditNoteNumber: payload.creditNoteNumber as string,
         contactName: creditContact.contactName,

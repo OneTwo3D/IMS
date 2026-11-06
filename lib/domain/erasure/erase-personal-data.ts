@@ -257,33 +257,11 @@ export async function scrubHeldInvoicePayloads(tx: Prisma.TransactionClient, ord
      WHERE "id" = ANY(${ids}::text[]) AND ("payload" #>> '{accountingPayload,contactName}') IS NOT NULL`)
 }
 
-/** Whether the order (or its customer) is erased, read under the order lock so an erasure cannot interleave with the caller's next step. */
-export async function isOrderErasedUnderLock(orderId: string): Promise<boolean> {
-  return db.$transaction(async (tx) => {
-    await lockSalesOrder(tx, orderId)
-    const row = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, customer: { select: { gdprAnonymisedAt: true } } } })
-    return Boolean(row?.erasedAt || row?.customer?.gdprAnonymisedAt)
-  })
-}
-
 /** The contact block of an accounting payload, replaced the way the erasure replaces it. */
 export function scrubContactInAccountingPayload<T extends Record<string, unknown>>(payload: T): T {
   if (payload.contactName === undefined && payload.contactEmail === undefined) return payload
   const { contactEmail: _email, ...rest } = payload
   return { ...rest, ...(payload.contactName !== undefined ? { contactName: ERASURE_PLACEHOLDER_NAME } : {}) } as unknown as T
-}
-
-/**
- * After a release has queued its accounting row: if the order was erased while the release was in flight (its payload was
- * read before the erasure committed), scrub that new row too. Idempotent; takes the order lock.
- */
-export async function scrubErasedOrderAccountingPayloads(orderId: string): Promise<number> {
-  return db.$transaction(async (tx) => {
-    await lockSalesOrder(tx, orderId)
-    const row = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, customer: { select: { gdprAnonymisedAt: true } } } })
-    if (!row?.erasedAt && !row?.customer?.gdprAnonymisedAt) return 0
-    return (await scrubAccountingPayloadContacts(tx, [orderId])) + (await scrubHeldInvoicePayloads(tx, [orderId]))
-  })
 }
 
 export type EraseCustomerResult =

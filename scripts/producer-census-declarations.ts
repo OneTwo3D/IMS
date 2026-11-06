@@ -317,7 +317,7 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Pushes tracking metadata for an order through the shopping facade.'),
   d('lib/connectors/woocommerce/sync/order-completion-jobs.ts::processWcOrderCompletionJobs::pushSalesOrderStatus#1', 'woocommerce', 'order.status', 'drain', 'required',
     'The completion job drain pushes the order-completed status.'),
-  d('lib/connectors/woocommerce/sync/order-import.ts::releaseHeldWcSalesInvoice::queueAccountingSync#1', 'xero', 'sales.invoice', 'queue-producer', 'required',
+  d('lib/connectors/woocommerce/sync/order-import.ts::releaseHeldWcSalesInvoice::queueAccountingSyncTxWithOutcome#1', 'xero', 'sales.invoice', 'queue-producer', 'required',
     'Queues SALES_INVOICE for an imported or released WooCommerce order; xeroom owns this operation, so IMS shadows it.'),
   d('lib/connectors/woocommerce/sync/order-import.ts::importWcOrder::queueAccountingSync#1', 'xero', 'sales.invoice', 'queue-producer', 'required',
     'Queues SALES_INVOICE for an imported or released WooCommerce order; xeroom owns this operation, so IMS shadows it.'),

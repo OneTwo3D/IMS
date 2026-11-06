@@ -23,7 +23,8 @@ const skip = !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1'
 
 let accountingMocked = false
 // The accounting queue double: by default it records nothing; a test that needs the real row installs a writer.
-let queueImpl: (args: { type: string; referenceType: string; referenceId: string; payload: Record<string, unknown>; idempotencyKey?: string }) => Promise<unknown> = async () => ({ queued: true })
+type QueueArgs = { type: string; referenceType: string; referenceId: string; payload: Record<string, unknown>; idempotencyKey?: string }
+let queueImpl: (tx: unknown, args: QueueArgs) => Promise<unknown> = async () => ({ queued: true, connector: 'xero' })
 async function mockAccounting() {
   if (accountingMocked) return
   const actual = await import('@/lib/accounting')
@@ -31,7 +32,9 @@ async function mockAccounting() {
     namedExports: {
       ...actual,
       getAccountingSettings: async () => ({ connector: 'xero', salesAccount: '200', shippingAccount: '260', discountAccount: '270', reverseChargeSalesTaxType: '' }),
-      queueAccountingSync: async (args: never) => queueImpl(args),
+      queueAccountingSync: async () => ({ queued: true }),
+      // The held-invoice release enqueues inside its order-locked transaction.
+      queueAccountingSyncTxWithOutcome: async (tx: unknown, args: QueueArgs) => queueImpl(tx, args),
     },
   })
   accountingMocked = true
@@ -414,7 +417,7 @@ test('[erasure] the accounting payload copy: unsent rows get the placeholder, le
   const unrelated = await mk('PENDING', 'SALES_INVOICE', 'SalesOrder', 'not-this-order')
   t.after(async () => { await db.accountingSyncLog.deleteMany({ where: { id: { in: [pending.id, failed.id, synced.id, refundPending.id, unrelated.id] } } }) })
 
-  assert.deepEqual(await resolveSalesPostContact('SalesOrder', fx.orderId, body()), { contactName: FULL_NAME, contactEmail: EMAIL }, 'before the erasure the gate passes the stored contact')
+  assert.deepEqual(await resolveSalesPostContact('SalesOrder', fx.orderId, body()), { ok: true, contactName: FULL_NAME, contactEmail: EMAIL }, 'before the erasure the gate passes the stored contact')
   assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
 
   const rows = Object.fromEntries((await db.accountingSyncLog.findMany({ where: { id: { in: [pending.id, failed.id, synced.id, refundPending.id, unrelated.id] } } })).map((r) => [r.id, r.payload as Record<string, unknown>]))
@@ -429,9 +432,9 @@ test('[erasure] the accounting payload copy: unsent rows get the placeholder, le
   assert.deepEqual(rows[unrelated.id], body(), 'another order\'s row is untouched')
 
   // THE POST GATE, whatever the payload says.
-  assert.deepEqual(await resolveSalesPostContact('SalesOrder', fx.orderId, body()), { contactName: 'GDPR Anonymised', contactEmail: undefined })
-  assert.deepEqual(await resolveSalesPostContact('SalesOrderRefund', fx.refundId, body()), { contactName: 'GDPR Anonymised', contactEmail: undefined })
-  assert.deepEqual(await resolveSalesPostContact('SalesOrder', 'not-this-order', body()), { contactName: FULL_NAME, contactEmail: EMAIL }, 'an order that does not exist or is not erased passes its stored contact')
+  assert.deepEqual(await resolveSalesPostContact('SalesOrder', fx.orderId, body()), { ok: true, contactName: 'GDPR Anonymised', contactEmail: undefined })
+  assert.deepEqual(await resolveSalesPostContact('SalesOrderRefund', fx.refundId, body()), { ok: true, contactName: 'GDPR Anonymised', contactEmail: undefined })
+  assert.deepEqual(await resolveSalesPostContact('SalesOrder', 'not-this-order', body()), { ok: true, contactName: FULL_NAME, contactEmail: EMAIL }, 'an order that does not exist or is not erased passes its stored contact')
 })
 
 test('[erasure] notes and shipment tracking edits on an erased order are refused under the order lock and log nothing about the number', { skip }, async (t) => {
@@ -471,18 +474,19 @@ test('[erasure] hold, erase, release: the held WooCommerce invoice payload is sc
   const { retryHeldWcSalesInvoiceReleases } = await import('@/lib/connectors/woocommerce/sync/order-import')
   const { buildHeldSalesInvoicePayload, HELD_SALES_INVOICE_RECORD_KIND } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
   const queued: string[] = []
-  queueImpl = async (args) => {
-    const row = await db.accountingSyncLog.create({ data: { type: 'SALES_INVOICE', status: 'PENDING', referenceType: args.referenceType, referenceId: args.referenceId, payload: { ...args.payload, _idempotencyKey: args.idempotencyKey } as never } })
+  type Tx = { accountingSyncLog: { create(args: unknown): Promise<{ id: string }> } }
+  queueImpl = async (tx, args) => {
+    const row = await (tx as Tx).accountingSyncLog.create({ data: { type: 'SALES_INVOICE', status: 'PENDING', referenceType: args.referenceType, referenceId: args.referenceId, payload: { ...args.payload, _idempotencyKey: args.idempotencyKey } } })
     queued.push(row.id)
-    return { queued: true }
+    return { queued: true, connector: 'xero' }
   }
   t.after(async () => {
-    queueImpl = async () => ({ queued: true })
+    queueImpl = async () => ({ queued: true, connector: 'xero' })
     await db.accountingSyncLog.deleteMany({ where: { referenceId: fx.orderId } })
     await db.shoppingSyncLog.deleteMany({ where: { entityId: fx.orderId } })
     await fx.cleanup()
   })
-  const contact = { contactName: FULL_NAME, contactEmail: EMAIL }
+  const contact = { ok: true, contactName: FULL_NAME, contactEmail: EMAIL }
   const park = (accountingPayload: Record<string, unknown>) => buildHeldSalesInvoicePayload({
     externalOrderId: String(fx.externalId), externalOrderNumber: String(fx.externalId), salesOrderId: fx.orderId, orderNumber: 'SO-HELD', metaKey: '_wcpdf_invoice_number',
     accountingPayload: { ...contact, date: '2026-11-02', currency: 'GBP', lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200' }], ...accountingPayload }, chartConnector: 'xero',
@@ -540,4 +544,86 @@ test('[erasure] a customer renamed before the erasure: names from BEFORE the ren
   const rows = await db.activityLog.findMany({ where: { entityId: fx.customerId, entityType: 'CUSTOMER', action: 'updated' } })
   assert.equal(rows.length, 2, 'the rows are kept')
   for (const r of rows) assert.equal(r.description, ERASED_ACTIVITY_DESCRIPTION)
+})
+
+
+test('[erasure] release races: an erasure committing between the hold read and the release is seen under the order lock; a failure inside the release rolls everything back and the hold stays pending', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { retryHeldWcSalesInvoiceReleases } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { buildHeldSalesInvoicePayload, HELD_SALES_INVOICE_RECORD_KIND } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const { lockSalesOrder } = await import('@/lib/domain/sales/allocation-service')
+  const queued: string[] = []
+  let failAfterInsert = false
+  type Tx = { accountingSyncLog: { create(args: unknown): Promise<{ id: string }> } }
+  queueImpl = async (tx, args) => {
+    const row = await (tx as Tx).accountingSyncLog.create({ data: { type: 'SALES_INVOICE', status: 'PENDING', referenceType: args.referenceType, referenceId: args.referenceId, payload: { ...args.payload, _idempotencyKey: args.idempotencyKey } } })
+    queued.push(row.id)
+    if (failAfterInsert) throw new Error('injected failure after the insert')
+    return { queued: true, connector: 'xero' }
+  }
+  t.after(async () => {
+    queueImpl = async () => ({ queued: true, connector: 'xero' })
+    await db.accountingSyncLog.deleteMany({ where: { referenceId: fx.orderId } })
+    await db.shoppingSyncLog.deleteMany({ where: { entityId: fx.orderId } })
+    await fx.cleanup()
+  })
+  const held = buildHeldSalesInvoicePayload({
+    externalOrderId: String(fx.externalId), externalOrderNumber: String(fx.externalId), salesOrderId: fx.orderId, orderNumber: 'SO-RACE', metaKey: '_wcpdf_invoice_number',
+    accountingPayload: { contactName: FULL_NAME, contactEmail: EMAIL, date: '2026-11-02', currency: 'GBP', lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200' }] }, chartConnector: 'xero',
+  })
+  const hold = await db.shoppingSyncLog.create({ data: {
+    connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', entityId: fx.orderId, externalId: String(fx.externalId),
+    recordKind: HELD_SALES_INVOICE_RECORD_KIND, payload: held as never, errorMessage: 'waiting', syncedAt: null,
+  } })
+  await db.salesOrder.update({ where: { id: fx.orderId }, data: { invoiceNumber: 'INV-RACE-1' } })
+
+  // (1) FAILURE INJECTION: the insert succeeds and then the release throws. Nothing may remain, and the hold is still pending.
+  failAfterInsert = true
+  const failed = await retryHeldWcSalesInvoiceReleases()
+  assert.equal(failed.released, 0, JSON.stringify(failed))
+  assert.equal(await db.accountingSyncLog.count({ where: { referenceId: fx.orderId, type: 'SALES_INVOICE' } }), 0, 'the insert was rolled back with the rest of the release')
+  assert.equal((await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: hold.id } })).status, 'PENDING', 'the hold stays pending, to be retried')
+  failAfterInsert = false
+
+  // (2) THE RACE: the release has read the hold (identity intact) and is waiting on the order lock when an erasure commits.
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const erasing = db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, fx.orderId)
+    await gate
+    await tx.salesOrder.update({ where: { id: fx.orderId }, data: { erasedAt: new Date() } })
+  }, { timeout: 30_000 })
+  await new Promise((r) => setTimeout(r, 200))
+  queued.length = 0
+  let done = false
+  const releasing = retryHeldWcSalesInvoiceReleases().then((r) => { done = true; return r })
+  await new Promise((r) => setTimeout(r, 1000))
+  assert.equal(done, false, 'the release is waiting on the order lock')
+  release()
+  await erasing
+  const outcome = await releasing
+  assert.ok(outcome.released >= 1, JSON.stringify(outcome))
+  const row = await db.accountingSyncLog.findFirstOrThrow({ where: { id: { in: queued } } })
+  const text = JSON.stringify(row.payload)
+  for (const x of [NAME.first, NAME.last, EMAIL]) assert.ok(!text.includes(x), `the released row carries ${x}`)
+  assert.equal((row.payload as { contactName: string }).contactName, 'GDPR Anonymised')
+  assert.deepEqual((row.payload as { lines: unknown }).lines, held.accountingPayload.lines, 'financial fields are kept')
+})
+
+test('[erasure] the production push port re-reads the order under the lock: an erasure after the sweep loaded it is visible at the push boundary', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  t.after(async () => { await fx.cleanup() })
+  const { createPrismaWmsOrderPushPort, ORDER_PUSH_SELECT } = await import('@/lib/domain/wms/order-push-sweep')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const port = createPrismaWmsOrderPushPort()
+  const loaded = await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId }, select: ORDER_PUSH_SELECT })
+  assert.equal(loaded.erasedAt, null)
+  assert.equal(loaded.customerEmail, EMAIL)
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const fresh = await port.reloadOrderForPush!(fx.orderId)
+  assert.ok(fresh?.erasedAt, 'the boundary read sees the erasure the earlier read did not')
+  assert.equal(fresh?.customerEmail, null)
+  assert.equal(fresh?.customerName, 'GDPR Anonymised')
 })
