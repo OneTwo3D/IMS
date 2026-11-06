@@ -281,3 +281,24 @@ test('RACE (conditional): a writer that takes NO lock lands the marker between t
   assert.equal(paidBlock(row)?.kind, 'total', 'the marker written meanwhile was not overwritten')
   assert.equal(row.status, 'PENDING')
 })
+
+// [mutation: drop the conditional on the exception-path write]
+test('RACE (conditional, exception path): a write that lands between the failure\'s read and its write is not overwritten; the attempt is counted on top of it', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const seams = (await import('@/lib/domain/accounting/receipt-registration-sweep')).receiptRegistrationSeams
+  const o = await heldOrder()
+  await oi.importWcOrder(payload(o.wcId, '180.00'), {})
+  const row0 = (await rows(o.wcId))[0]!
+  let armedPlan = true
+  let armedWrite = true
+  seams.afterPlan = async (orderId: string) => { if (armedPlan && orderId === o.id) { armedPlan = false; throw new Error('boom') } }
+  seams.betweenQueueReadAndWrite = async () => {
+    if (!armedWrite) return
+    armedWrite = false
+    // another writer (no lock) moves the attempt count on after the failure read the row
+    await s.db.shoppingSyncLog.update({ where: { id: row0.id }, data: { payload: { ...(row0.payload as object), paidBlock: { kind: 'total', attempts: 10, firstAt: '2026-10-01T00:00:00.000Z' } } } })
+  }
+  try { await oi.retryPendingWcOrdersWaitingForFx(50, { receiptsOnly: true }) } finally { seams.afterPlan = undefined; seams.betweenQueueReadAndWrite = undefined }
+  const row = (await rows(o.wcId))[0]!
+  assert.equal(paidBlock(row)?.attempts, 11, 'the failure was applied to the row as it stood, not to the one it read')
+})

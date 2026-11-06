@@ -837,6 +837,7 @@ async function markPendingFxRetryLogFailed(logId: string, error: unknown): Promi
       const data = marked && !spent
         ? { payload: JSON.parse(JSON.stringify({ ...(current.payload as object), paidBlock: { ...block, attempts: block.attempts + 1 } })) as Prisma.InputJsonValue, errorMessage: String(error), syncedAt: new Date() }
         : { status: 'FAILED' as const, errorMessage: spent ? `${String(error)}; gave up after ${block.attempts + 1} retries` : String(error), syncedAt: new Date() }
+      await wcReceiptRegistrationSeams.betweenQueueReadAndWrite?.(tx)
       const written = await tx.shoppingSyncLog.updateMany({ where: unchangedQueueRow(logId, current.payload), data })
       if (written.count === 1) return spent
     }
