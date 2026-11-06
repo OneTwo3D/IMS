@@ -383,7 +383,7 @@ export const BUILT_IN_WMS_CONNECTOR_REGISTRATIONS: WmsConnectorRegistrations<Wms
       // cursor rows — never these.
       deltaScopeLock: async (tx) => mintsoftDeltaScopeToken(await lockMintsoftDispatchSettings(tx)),
       // Mintsoft sends despatch datetimes without a zone (the .NET form); the warehouse is in the UK (owner decision).
-      zonelessDespatchReading: 'europe-london',
+      zonelessDespatchReading: () => 'europe-london',
     },
   },
 }

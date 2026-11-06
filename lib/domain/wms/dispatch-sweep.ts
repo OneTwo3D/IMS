@@ -2486,7 +2486,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
   const deltaScopeLock = getWmsConnectorHooks(connectorId).deltaScopeLock
     ?? defaultWmsDeltaScopeLock(wmsDeltaStateRowKeys(deltaKeys))
   return {
-    zonelessDespatchReading: getWmsConnectorHooks(connectorId).zonelessDespatchReading,
+    zonelessDespatchReading: getWmsConnectorHooks(connectorId).zonelessDespatchReading?.(),
     storefrontCutoff: () => storefrontCutoffWhileEnforced(),
     async despatchLowerBound(orderId) {
       // NOT pushedAt: every amendment attempt, even a rejected one, moves it. firstClaimedAt is stamped once, when the create is first
