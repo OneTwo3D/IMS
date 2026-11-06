@@ -54,9 +54,13 @@ mock.module('@/lib/connectors/wms/registry', {
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      // The snapshot write runs in a transaction that takes the order lock and reads the erasure marker (an order that is not erased).
+      $transaction: async function (this: unknown, fn: (tx: unknown) => Promise<unknown>) { return fn(this) },
+      $queryRaw: async () => [],
       // The sweep stamps its read-sync last-success time when it finishes without a failed order.
       setting: { upsert: async () => ({}) },
       salesOrder: {
+        findUnique: async () => ({ erasedAt: null }),
         count: async () => 0,
         findMany: async () => [{
           id: 'order-1',

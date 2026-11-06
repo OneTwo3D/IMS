@@ -83,7 +83,9 @@ const dbDelegates = () => ({
           return {}
         },
       },
+      $queryRaw: async () => [],
       salesOrder: {
+        findUnique: async () => ({ erasedAt: null }),
         findFirst: async ({ where }: { where: Record<string, unknown> }) => {
           const some = (where as {
             shoppingLinks?: { some?: { connector?: string; externalOrderId?: string } }

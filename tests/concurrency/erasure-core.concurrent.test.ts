@@ -103,6 +103,14 @@ async function importFixture(db: Awaited<ReturnType<typeof loadDb>>): Promise<Fi
   await db.notification.create({ data: { type: 'info', title: `Payment for ${FULL_NAME}`, message: `${FULL_NAME} paid`, actionUrl: `/sales/${orderId}` } })
   await db.notification.create({ data: { type: 'info', title: 'Unrelated', message: 'about another order', actionUrl: '/sales/someone-else' } })
   const refund = await db.salesOrderRefund.create({ data: { orderId, reason: 'Item arrived damaged', totalForeign: 1, totalBase: 1 } as never })
+  await db.emailOutbox.updateMany({ where: { referenceId: orderId, kind: 'k-processing' }, data: { lockedBy: 'claim-token', processingStartedAt: new Date('2026-11-06T09:00:00Z') } })
+  // Activity rows written BEFORE the erasure, as the old actions wrote them: names in descriptions, an email in metadata.
+  const before = (id: string, entityType: 'CUSTOMER' | 'SALES_ORDER', entityId: string, action: string, description: string, metadata: object) =>
+    db.activityLog.create({ data: { id, entityType, entityId, action, tag: 'sales', level: 'INFO', description, metadata } })
+  await before(`pre-created-${orderId}`, 'CUSTOMER', customerId, 'created', `Created customer: ${FULL_NAME}`, { company: COMPANY })
+  await before(`pre-legacy-${orderId}`, 'CUSTOMER', customerId, 'gdpr_anonymised', `GDPR anonymised customer: ${FULL_NAME} (1 orders anonymised)`, {})
+  await before(`pre-order-${orderId}`, 'SALES_ORDER', orderId, 'wc_note', `Customer ${EMAIL} rang from ${PHONE}`, { contact: { email: EMAIL, tracking: TRACKING } })
+  await before(`pre-marker-${orderId}`, 'SALES_ORDER', orderId, 'wc_refund_park_recovered', 'Refund park recovered', { connector: 'woocommerce', externalOrderId: String(externalId) })
   await db.shoppingCustomerLink.updateMany({ where: { customerId }, data: { metadata: { note: FULL_NAME } } })
   await db.customer.update({ where: { id: customerId }, data: { notes: `Prefers ${FULL_NAME}` } })
 
@@ -189,11 +197,23 @@ test('[erasure] the core erases every personal column, keeps the decided retenti
   assert.equal(outbox['k-pending']!.status, 'FAILED', 'a waiting email is cancelled, not sent to an erased subject')
   assert.equal(outbox['k-parked']!.status, 'FAILED')
   assert.equal(outbox['k-sent']!.status, 'SENT')
-  assert.equal(outbox['k-processing']!.toEmail, EMAIL, 'a row mid-send under another worker is left, and reported as deferred')
+  assert.equal(outbox['k-processing']!.toEmail, ERASURE_PLACEHOLDER_EMAIL, 'a claimed row has its address replaced in place')
+  assert.equal(outbox['k-processing']!.status, 'PROCESSING', 'and keeps its status and claim, so the sender\'s own fenced terminal write still lands')
+  assert.equal(outbox['k-processing']!.lockedBy, 'claim-token')
 
   const notes = await db.notification.findMany({ where: { actionUrl: { in: [`/sales/${fx.orderId}`, '/sales/someone-else'] } } })
   assert.equal(notes.find((n) => n.actionUrl === `/sales/${fx.orderId}`)!.message.includes(NAME.last), false)
   assert.equal(notes.find((n) => n.actionUrl === '/sales/someone-else')!.title, 'Unrelated', 'only this order\'s notifications are redacted')
+
+  // EARLIER ACTIVITY ROWS are scrubbed in place (kept, not deleted), and a row with no identity is untouched.
+  const early = Object.fromEntries((await db.activityLog.findMany({ where: { id: { startsWith: 'pre-' }, entityId: { in: [fx.orderId, fx.customerId] } } })).map((r) => [r.id.split('-')[1], r]))
+  assert.equal(Object.keys(early).length, 4, 'no earlier row was deleted')
+  assert.equal(early.created!.description.includes(NAME.last), false)
+  assert.equal(early.legacy!.description.includes(NAME.last), false)
+  assert.equal(JSON.stringify(early.order!.metadata).includes(EMAIL), false)
+  assert.equal(early.order!.description.includes(PHONE), false)
+  assert.deepEqual(early.marker!.metadata, { connector: 'woocommerce', externalOrderId: String(fx.externalId) }, 'an accounting marker with no identity is unchanged')
+  assert.equal(early.marker!.description, 'Refund park recovered')
 
   // THE PROOF names no one: not in description, not in metadata, not anywhere in the activity log.
   const logs = await db.activityLog.findMany({ select: { description: true, metadata: true, action: true, entityId: true } })
@@ -204,7 +224,8 @@ test('[erasure] the core erases every personal column, keeps the decided retenti
   const meta = record.metadata as { requestId: string; orderIds: string[]; counts: Record<string, number>; systems: Record<string, string> }
   assert.deepEqual(meta.orderIds, [fx.orderId])
   assert.equal(meta.counts.salesOrders, 1)
-  assert.equal(meta.counts.outboxRowsDeferred, 1)
+  assert.equal(meta.counts.outboxRowsClaimedFenced, 1)
+  assert.ok(meta.counts.activityRowsScrubbed >= 3, 'earlier activity rows were scrubbed')
   assert.deepEqual(Object.values(meta.systems), ['not-attempted', 'not-attempted', 'not-attempted', 'not-attempted'])
 
   // IDEMPOTENT: a second request refuses and writes nothing more.
@@ -229,6 +250,14 @@ test('[erasure] the core erases every personal column, keeps the decided retenti
   const control = await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
   assert.equal(control.customerVatNumber, VAT, 'without the marker the update path writes the VAT number back')
   assert.match(JSON.stringify(control.billingAddress), new RegExp(STREET))
+
+  // A NEW ORDER from the storefront account that was erased is not re-attached to the anonymised customer.
+  const { upsertCustomer } = await import('@/lib/connectors/woocommerce/sync/field-mapping')
+  const externalCustomerId = 700_000_000 + Math.floor(Math.random() * 90_000_000)
+  await db.shoppingCustomerLink.create({ data: { connector: 'woocommerce', customerId: fx.customerId, externalCustomerId: String(externalCustomerId) } })
+  const returning = { ...payload(fx.externalId + 1, wcRateId), customer_id: externalCustomerId } as never
+  assert.equal(await upsertCustomer(returning), null, 'an anonymised customer is never matched for a new order')
+  assert.equal((await db.customer.findUniqueOrThrow({ where: { id: fx.customerId } })).firstName, 'GDPR')
 
   assert.equal(net.calls(), 0, 'no fetch was made by the erasure or the importer')
 })
@@ -265,6 +294,28 @@ test('[erasure] the importer takes the order lock BEFORE it reads the marker: an
   const row = await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
   assert.equal(row.customerVatNumber, 'STORED-VAT', 'the import read the marker AFTER the erasure committed and withheld the identity columns')
   assert.deepEqual(row.billingAddress, { line1: 'stored street' })
+})
+
+test('[erasure] the reconcile pass cancels unsent mail and erases the address on rows that appear for an erased order', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  t.after(async () => { await fx.cleanup() })
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { reconcileErasedEmailOutbox } = await import('@/lib/domain/erasure/reconcile-email-outbox')
+  const { ERASURE_PLACEHOLDER_EMAIL } = await import('@/lib/domain/erasure/erasure-record')
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  // A row queued from a stale read AFTER the erasure committed, and a claimed one that regained its address.
+  const late = await db.emailOutbox.create({ data: { kind: 'k-late', toEmail: EMAIL, subject: 's', html: 'queued', referenceType: 'SalesOrder', referenceId: fx.orderId, status: 'PENDING' } })
+  const claimed = await db.emailOutbox.create({ data: { kind: 'k-late-claimed', toEmail: EMAIL, subject: 's', html: 'queued', referenceType: 'SalesOrder', referenceId: fx.orderId, status: 'PROCESSING', lockedBy: 'tok', processingStartedAt: new Date() } })
+  const other = await db.emailOutbox.create({ data: { kind: 'k-other', toEmail: 'someone.else@example.test', subject: 's', html: 'queued', referenceType: 'SalesOrder', referenceId: 'not-erased-order', status: 'PENDING' } })
+  t.after(async () => { await db.emailOutbox.deleteMany({ where: { id: other.id } }) })
+  const result = await reconcileErasedEmailOutbox()
+  assert.ok(result.cancelled >= 1)
+  const rows = Object.fromEntries((await db.emailOutbox.findMany({ where: { id: { in: [late.id, claimed.id, other.id] } } })).map((r) => [r.id, r]))
+  assert.deepEqual([rows[late.id]!.toEmail, rows[late.id]!.status], [ERASURE_PLACEHOLDER_EMAIL, 'FAILED'])
+  assert.deepEqual([rows[claimed.id]!.toEmail, rows[claimed.id]!.status, rows[claimed.id]!.lockedBy], [ERASURE_PLACEHOLDER_EMAIL, 'PROCESSING', 'tok'])
+  assert.deepEqual([rows[other.id]!.toEmail, rows[other.id]!.status], ['someone.else@example.test', 'PENDING'], 'a row of an order that is not erased is untouched')
+  assert.equal((await reconcileErasedEmailOutbox()).addressesErased, 0, 'idempotent')
 })
 
 test('[erasure] the record survives the activity-log purge that deletes an ordinary INFO row of the same age', { skip }, async (t) => {

@@ -639,7 +639,7 @@ test('o3d-hpeg: successive reclaims are CAPPED — the third worker is refused, 
   assert.match(String(parkedEntries[0].description), /email-outbox-parked\.ts --row email-1/)
 
   // THE CLAIMS: one first claim that did not count, one reclaim that did, and C's reclaim REFUSED.
-  const reclaims = updateManyCalls.filter((call) => call.where.status === 'PROCESSING' && call.data.status === 'PROCESSING')
+  const reclaims = updateManyCalls.filter((call) => call.where.status === 'PROCESSING' && call.data.status === 'PROCESSING' && !('toEmail' in call.where))
   assert.deepEqual(reclaims.map((call) => call.count), [1, 0], 'B\'s reclaim matched; C\'s was refused by its WHERE')
   assert.deepEqual(reclaims.map((call) => (call.where as { staleReclaimCount?: unknown }).staleReclaimCount),
     [{ lt: 1 }, { lt: 1 }], 'and the cap is IN each reclaim statement')
@@ -1764,7 +1764,8 @@ test('r20: the injected sender has exactly one caller, and every conflict reads 
 
   // No call site declares the answer any more: every one passes the gate.
   const conflictCalls = [...source.matchAll(/recordConflict\(claim, (.+?), (\w+)\)/g)]
-  assert.equal(conflictCalls.length, 4, `expected the four settlement paths; found ${conflictCalls.length}`)
+  // Five: the four settlement paths, and the RECIPIENT REFUSAL (erasure), which is a fenced terminal write like the others.
+  assert.equal(conflictCalls.length, 5, `expected the five settlement paths; found ${conflictCalls.length}`)
   for (const call of conflictCalls) {
     assert.equal(
       call[2],
@@ -1776,6 +1777,8 @@ test('r20: the injected sender has exactly one caller, and every conflict reads 
     conflictCalls.map((call) => call[1]),
     [
       "'a suppression check'",
+      // The erasure's recipient refusal: a fenced terminal write made BEFORE the sender is entered.
+      "'a recipient refusal'",
       "'a successful send'",
       "'a failed send'",
       // The catch's PHRASE is derived from the same progress record, because this `try` covers the
@@ -2014,9 +2017,9 @@ test('r22: `thrownPhase` enumerates the try, and every arm is distinct', () => {
   // disappearing or being added (r38 narrowed "every post-send write").
   assert.equal(
     [...source.matchAll(/smtp\.settlementWrite\(/g)].length,
-    3,
+    4,
     'the settlement writes inside the `try` are no longer all routed through the progress record '
-    + '(r30 brought the SUPPRESSED-recipient settlement inside the fenced region, which makes three)',
+    + '(r30 brought the SUPPRESSED-recipient settlement inside the fenced region, which makes three; the erasure RECIPIENT REFUSAL is the fourth)',
   )
   assert.equal(
     [...source.matchAll(/smtp\.suppressionWrite\(/g)].length,
@@ -3422,4 +3425,70 @@ test('r30: a claim read-back that FAILS is an answer, not a thrown diagnostic', 
   assert.match(conflict, /is UNKNOWN/)
   assert.doesNotMatch(conflict, /was reclaimed by another worker/)
   assert.doesNotMatch(conflict, /A duplicate delivery is possible/)
+})
+
+
+// ---------------------------------------------------------------------------
+// ERASURE: a claimed row must not go to an address whose owner was erased.
+// ---------------------------------------------------------------------------
+
+const ERASED_PLACEHOLDER = 'erased@erased.invalid'
+
+test('ERASURE: the preparer refusing (order erased) cancels the claimed row, erases its address, and sends nothing', async () => {
+  const { EmailRecipientErasedError } = await import('@/lib/domain/erasure/email-recipient')
+  const deliveries: string[] = []
+  const { client, rows } = await makeClient([makeRow()])
+  const outcome = await drain({
+    client, now: () => T0, logActivity: noLog,
+    async prepareQueuedEmail() { throw new EmailRecipientErasedError('erased') },
+    async sendEmail(m) { deliveries.push(m.to); return { success: true } },
+  })
+  assert.deepEqual(deliveries, [])
+  assert.equal(outcome.failed, 1)
+  assert.equal(rows[0].status, 'FAILED')
+  assert.equal(rows[0].toEmail, ERASED_PLACEHOLDER)
+  assert.equal(rows[0].lockedBy, null)
+})
+
+test('ERASURE: the erasure replaces the address WHILE the row is claimed (during preparation): the confirm refuses it and nothing is sent', async () => {
+  const deliveries: string[] = []
+  const { client, rows } = await makeClient([makeRow()])
+  const outcome = await drain({
+    client, now: () => T0, logActivity: noLog,
+    async prepareQueuedEmail() {
+      // What the erasure transaction does to a claimed row: only the address, under only the status condition.
+      rows[0].toEmail = ERASED_PLACEHOLDER
+      return null
+    },
+    async sendEmail(m) { deliveries.push(m.to); return { success: true } },
+  })
+  assert.deepEqual(deliveries, [], 'the sender was never entered')
+  assert.equal(outcome.failed, 1)
+  assert.equal(rows[0].status, 'FAILED')
+  assert.equal(rows[0].toEmail, ERASED_PLACEHOLDER)
+})
+
+test('ERASURE: an address on the order that no longer matches the queued recipient is refused and erased from the row', async () => {
+  const deliveries: string[] = []
+  const { client, rows } = await makeClient([makeRow()])
+  await drain({
+    client, now: () => T0, logActivity: noLog,
+    async prepareQueuedEmail() { return { to: 'someone.else@example.test', subject: 's', html: 'h' } },
+    async sendEmail(m) { deliveries.push(m.to); return { success: true } },
+  })
+  assert.deepEqual(deliveries, [])
+  assert.equal(rows[0].status, 'FAILED')
+  assert.equal(rows[0].toEmail, ERASED_PLACEHOLDER)
+})
+
+test('ERASURE control: an unchanged recipient is sent normally, so the refusals above are the guard and not the harness', async () => {
+  const deliveries: string[] = []
+  const { client, rows } = await makeClient([makeRow()])
+  await drain({
+    client, now: () => T0, logActivity: noLog,
+    async prepareQueuedEmail() { return { to: 'customer@example.test', subject: 's', html: 'h' } },
+    async sendEmail(m) { deliveries.push(m.to); return { success: true } },
+  })
+  assert.deepEqual(deliveries, ['customer@example.test'])
+  assert.equal(rows[0].status, 'SENT')
 })

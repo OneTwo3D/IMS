@@ -134,6 +134,12 @@ import { db } from '@/lib/db'
 import { uniqueConstraintFields } from '@/lib/db/prisma-unique-violation'
 import { sendEmail } from '@/lib/mailer'
 import { prepareQueuedEmail } from '@/lib/order-email'
+import {
+  EMAIL_RECIPIENT_CHANGED_REASON,
+  EMAIL_RECIPIENT_ERASED_REASON,
+  ERASED_RECIPIENT_PLACEHOLDER,
+  EmailRecipientErasedError,
+} from '@/lib/domain/erasure/email-recipient'
 
 const EMAIL_MAX_ATTEMPTS = 5
 const EMAIL_CLAIM_STALE_MS = 15 * 60 * 1000
@@ -2457,12 +2463,52 @@ export async function processPendingEmailOutbox(
         continue
       }
 
-      const prepared = await prepare(email.kind, email.referenceType, email.referenceId)
+      // THE RECIPIENT CHECK, AFTER THE CLAIM AND BEFORE ANYTHING IS BUILT OR SENT. Three ways a claimed row must not go:
+      // the preparer refuses because the order or customer was erased; the address the order now carries is not the one
+      // queued; or the erasure replaced the stored address while this row was claimed (the confirm below). Each is a
+      // FENCED terminal write that also erases the address from the row, so the refusal itself keeps nothing.
+      const refuseRecipient = async (reason: string): Promise<void> => {
+        const settled = await smtp.settlementWrite(() => settleClaimedEmail(client, claim, {
+          status: 'FAILED',
+          toEmail: ERASED_RECIPIENT_PLACEHOLDER,
+          lastError: reason,
+          processingStartedAt: null,
+        }))
+        if (settled) result.failed++
+        else await recordConflict(claim, 'a recipient refusal', smtp)
+      }
+      let prepared: Awaited<ReturnType<typeof prepare>>
+      try {
+        prepared = await prepare(email.kind, email.referenceType, email.referenceId)
+      } catch (prepareError) {
+        if (prepareError instanceof EmailRecipientErasedError) {
+          await refuseRecipient(EMAIL_RECIPIENT_ERASED_REASON)
+          continue
+        }
+        throw prepareError
+      }
+      if (prepared && normalizeEmail(prepared.to) !== normalizedRecipient) {
+        await refuseRecipient(EMAIL_RECIPIENT_CHANGED_REASON)
+        continue
+      }
       const attachments = prepared?.attachments ?? ((email.attachments as QueuedAttachment[] | null) ?? []).map((attachment) => ({
         filename: attachment.filename,
         content: Buffer.from(attachment.contentBase64, 'base64'),
         contentType: attachment.contentType,
       }))
+
+      // CONFIRM THE STORED RECIPIENT IS STILL THE ONE THIS WORKER READ, immediately before the send: a conditional write
+      // that sets the status the row already has, and matches only while the claim is held AND the address is unchanged. An
+      // erasure that ran during the preparation replaced the address on this claimed row; the confirm then matches nothing
+      // and the row is refused.
+      const confirmed = await client.emailOutbox.updateMany({
+        where: { id: claim.id, status: 'PROCESSING', lockedBy: claim.token, processingStartedAt: claim.claimedAt, toEmail: email.toEmail },
+        data: { status: 'PROCESSING' },
+      })
+      if (confirmed.count === 0) {
+        await refuseRecipient(EMAIL_RECIPIENT_ERASED_REASON)
+        continue
+      }
 
       const sendResult = await smtp.send({
         to: prepared?.to ?? email.toEmail,

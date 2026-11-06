@@ -116,6 +116,10 @@ export async function upsertCustomer(order: WcFullOrder): Promise<string | null>
     existing = await db.customer.findFirst({ where: { email: cust.email } })
   }
 
+  // An ANONYMISED customer is never matched, linked to, or returned for a new order: the order imports without a
+  // customer link rather than re-attaching a new data subject to an erased record.
+  if (existing?.gdprAnonymisedAt) return null
+
   if (existing) {
     if (cust.externalCustomerId) {
       const existingLink = await db.shoppingCustomerLink.findFirst({

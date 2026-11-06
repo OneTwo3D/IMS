@@ -17,6 +17,7 @@ import {
   type CsvImportActionResult,
 } from '@/lib/csv-import'
 
+const ANONYMISED_CUSTOMER_REFUSAL = 'This customer has been anonymised and cannot be changed'
 const MAX_IMPORT_BYTES = 10 * 1024 * 1024
 const MAX_IMPORT_ROWS = 10_000
 
@@ -286,8 +287,10 @@ export async function createCustomer(input: CustomerInput): Promise<{ success: b
 export async function updateCustomer(id: string, input: Partial<CustomerInput> & { active?: boolean }): Promise<{ success: boolean; error?: string }> {
   await requirePermission('sales.create')
   try {
-    await db.customer.update({
-      where: { id },
+    // CONDITIONAL WRITE: an anonymised customer is never written to, and the condition is part of the statement, so a
+    // read that went stale between the page load and this save cannot slip through.
+    const written = await db.customer.updateMany({
+      where: { id, gdprAnonymisedAt: null },
       data: {
         ...(input.firstName !== undefined && { firstName: input.firstName }),
         ...(input.lastName !== undefined && { lastName: input.lastName || '' }),
@@ -301,6 +304,10 @@ export async function updateCustomer(id: string, input: Partial<CustomerInput> &
         ...(input.active !== undefined && { active: input.active }),
       },
     })
+    if (written.count === 0) {
+      const exists = await db.customer.findUnique({ where: { id }, select: { gdprAnonymisedAt: true } })
+      return { success: false, error: exists?.gdprAnonymisedAt ? ANONYMISED_CUSTOMER_REFUSAL : 'Customer not found' }
+    }
     revalidatePath('/sales/contacts')
     revalidatePath('/sales')
     await logActivity({ entityType: 'CUSTOMER', entityId: id, tag: 'sales', action: 'updated', description: `Updated customer: ${input.firstName ?? ''}${input.lastName ? ' ' + input.lastName : ''}`.trim() })
@@ -341,12 +348,15 @@ export async function importContactsCsv(formData: FormData): Promise<CsvImportAc
         company: true,
         billingAddress: true,
         shippingAddress: true,
+        gdprAnonymisedAt: true,
       },
     })
     const byId = new Map(customers.map((customer) => [customer.id, customer]))
     const byEmail = new Map<string, typeof customers>()
     const byIdentity = new Map<string, typeof customers>()
     for (const customer of customers) {
+      // An anonymised contact carries placeholders, never matches a row by email or name, and is never updated.
+      if (customer.gdprAnonymisedAt) continue
       if (customer.email) {
         const key = customer.email.trim().toLowerCase()
         byEmail.set(key, [...(byEmail.get(key) ?? []), customer])
@@ -401,12 +411,17 @@ export async function importContactsCsv(formData: FormData): Promise<CsvImportAc
       }
 
       try {
+        if (existing && existing.gdprAnonymisedAt) {
+          errors.push(`Row ${lineNum}: ${ANONYMISED_CUSTOMER_REFUSAL}`)
+          skipped++
+          continue
+        }
         if (existing) {
           const billingAddress = mergeImportedAddress(r, 'billing', existing.billingAddress as AddressData | null)
           const shippingAddress = mergeImportedAddress(r, 'shipping', existing.shippingAddress as AddressData | null)
           if (!preview) {
-            await db.customer.update({
-              where: { id: existing.id },
+            const written = await db.customer.updateMany({
+              where: { id: existing.id, gdprAnonymisedAt: null },
               data: {
                 ...(firstName ? { firstName } : {}),
                 ...(lastName ? { lastName } : {}),
@@ -419,6 +434,11 @@ export async function importContactsCsv(formData: FormData): Promise<CsvImportAc
                 ...(r.notes?.trim() ? { notes: r.notes.trim() } : {}),
               },
             })
+            if (written.count === 0) {
+              errors.push(`Row ${lineNum}: ${ANONYMISED_CUSTOMER_REFUSAL}`)
+              skipped++
+              continue
+            }
           }
           updated++
         } else {

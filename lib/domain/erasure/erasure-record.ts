@@ -54,8 +54,10 @@ export type ErasureCounts = {
   shoppingOrderLinks: number
   wmsStatusSnapshots: number
   outboxRowsErased: number
-  /** PROCESSING rows are mid-send: left as they are and reported, never silently skipped. */
-  outboxRowsDeferred: number
+  /** Rows claimed by a sender when the erasure ran: the address is replaced in place, the claim and status untouched, and the drain refuses at its recipient confirm. */
+  outboxRowsClaimedFenced: number
+  /** Existing activity-log rows whose description or metadata held the subject's identifying values. */
+  activityRowsScrubbed: number
   notifications: number
 }
 

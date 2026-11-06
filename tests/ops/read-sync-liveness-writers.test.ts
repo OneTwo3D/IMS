@@ -52,6 +52,7 @@ const orderDb: Record<string, unknown> = {
   setting: { findUnique: async ({ where }: { where: { key: string } }) => (settings.has(where.key) ? { key: where.key, value: settings.get(where.key) } : null), upsert },
   salesOrder: {
     findFirst: async () => ({ id: 'so-1' }),
+    findUnique: async () => ({ erasedAt: null }),
     findMany: async (args: unknown) => { findManyWheres.push(args); return statusOrders },
     // Orders in scope whose STORED snapshot is unresolved: counted from the fake snapshot store with the
     // sweep's own predicate, so the persisted state is what the stamp decision reads.
@@ -70,7 +71,10 @@ const orderDb: Record<string, unknown> = {
     update: async () => ({}),
   },
   wmsOrderPushLink: { updateMany: async () => ({ count: 0 }) },
-  $transaction: async (ops: Array<Promise<unknown>>) => {
+  $queryRaw: async () => [],
+  $transaction: async (ops: Array<Promise<unknown>> | ((tx: unknown) => Promise<unknown>)) => {
+    // The status sweep's snapshot write is an interactive transaction (order lock, erasure marker, upsert).
+    if (typeof ops === 'function') return ops(orderDb)
     // The statements are already built when $transaction receives them; what it was handed is what
     // they resolve to, so the batch is read from the results, not from a before/after slice.
     const done = (await Promise.all(ops)) as Array<{ key: string }>

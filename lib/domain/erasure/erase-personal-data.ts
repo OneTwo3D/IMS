@@ -3,6 +3,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
+import { EMAIL_RECIPIENT_ERASED_REASON } from './email-recipient'
 import {
   ERASURE_FAILURE_ACTION,
   ERASURE_FAILURE_DESCRIPTION,
@@ -48,7 +49,7 @@ function chunks<T>(items: T[], size = CHUNK): T[][] {
 
 export const NOTIFICATION_ERASED_TITLE = 'Notification redacted'
 export const NOTIFICATION_ERASED_MESSAGE = 'The text of this notification was removed by a personal-data erasure.'
-export const EMAIL_OUTBOX_ERASED_ERROR = 'Cancelled: the recipient\'s personal data was erased'
+export const EMAIL_OUTBOX_ERASED_ERROR = EMAIL_RECIPIENT_ERASED_REASON
 
 /**
  * Erase the personal data held on a set of sales orders and on the rows that hang off them. The caller owns
@@ -58,8 +59,8 @@ export async function eraseOrdersPersonalDataInTx(
   tx: Prisma.TransactionClient,
   orderIds: string[],
   erasedAt: Date,
-): Promise<Omit<ErasureCounts, 'customers' | 'shoppingCustomerLinks'>> {
-  const counts = { salesOrders: 0, shipments: 0, shoppingOrderLinks: 0, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsDeferred: 0, notifications: 0 }
+): Promise<Omit<ErasureCounts, 'customers' | 'shoppingCustomerLinks' | 'activityRowsScrubbed'>> {
+  const counts = { salesOrders: 0, shipments: 0, shoppingOrderLinks: 0, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, notifications: 0 }
   for (const ids of chunks(orderIds)) {
     counts.salesOrders += (await tx.salesOrder.updateMany({
       where: { id: { in: ids } },
@@ -85,8 +86,7 @@ export async function eraseOrdersPersonalDataInTx(
     // Outbox rows for these orders. A SENT or FAILED row keeps no address. A row still waiting to be sent is
     // CANCELLED (FAILED), because sending to an erased subject is the harm; that releases its slot in the
     // undelivered-reference unique index, which only matters if the same (kind, order) is queued again, and
-    // the email builders refuse an order with no address. A PROCESSING row is mid-send under another
-    // worker's claim fence: it is not touched, and is counted so the shortfall is visible.
+    // the email builders refuse an order with no address. A PROCESSING row is handled below.
     const outboxWhere = { referenceType: 'SalesOrder', referenceId: { in: ids } }
     counts.outboxRowsErased += (await tx.emailOutbox.updateMany({
       where: { ...outboxWhere, status: { in: ['SENT', 'FAILED'] }, NOT: { toEmail: ERASURE_PLACEHOLDER_EMAIL } },
@@ -96,7 +96,14 @@ export async function eraseOrdersPersonalDataInTx(
       where: { ...outboxWhere, status: { in: ['PENDING', 'PARKED_SEND_CAP'] } },
       data: { toEmail: ERASURE_PLACEHOLDER_EMAIL, status: 'FAILED', lastError: EMAIL_OUTBOX_ERASED_ERROR },
     })).count
-    counts.outboxRowsDeferred += await tx.emailOutbox.count({ where: { ...outboxWhere, status: 'PROCESSING' } })
+    // A CLAIMED row: the address is replaced under only the status condition, so the claim fence (lockedBy,
+    // processingStartedAt) is untouched and the sender's own terminal write still lands. The sender confirms the stored
+    // address immediately before it sends (lib/email-outbox.ts) and refuses a row whose address changed; a row already on
+    // the wire cannot be recalled. reconcileErasedEmailOutbox sweeps anything this missed.
+    counts.outboxRowsClaimedFenced += (await tx.emailOutbox.updateMany({
+      where: { ...outboxWhere, status: 'PROCESSING', NOT: { toEmail: ERASURE_PLACEHOLDER_EMAIL } },
+      data: { toEmail: ERASURE_PLACEHOLDER_EMAIL },
+    })).count
 
     // Notifications are linked to an order only by the URL they point at.
     counts.notifications += (await tx.notification.updateMany({
@@ -105,6 +112,85 @@ export async function eraseOrdersPersonalDataInTx(
     })).count
   }
   return counts
+}
+
+export const ERASED_TEXT = '[erased]'
+
+type IdentitySource = { customer: Record<string, unknown> | null; orders: Array<Record<string, unknown>>; shipmentTracking: Array<string | null> }
+
+const GENERIC_TOKENS = new Set(['gdpr', 'anonymised', 'gb', 'uk', 'null', 'none', 'n/a'])
+
+function collectStrings(value: unknown, into: string[], depth = 0): void {
+  if (depth > 6 || value == null) return
+  if (typeof value === 'string') into.push(value)
+  else if (Array.isArray(value)) for (const v of value) collectStrings(v, into, depth + 1)
+  else if (typeof value === 'object') for (const v of Object.values(value as Record<string, unknown>)) collectStrings(v, into, depth + 1)
+}
+
+/**
+ * Every value that identifies the subject, read BEFORE the columns are overwritten: the customer's and each order's
+ * name, email, phone, company, VAT, addresses (every string in them), notes and tracking numbers. Short tokens and
+ * generic ones (a country code) are dropped so the scrub does not mangle ordinary words.
+ */
+export function collectIdentityTokens(source: IdentitySource): string[] {
+  const raw: string[] = []
+  const rows = [...(source.customer ? [source.customer] : []), ...source.orders]
+  for (const row of rows) for (const value of Object.values(row)) collectStrings(value, raw)
+  for (const t of source.shipmentTracking) if (t) raw.push(t)
+  const extra: string[] = []
+  for (const value of raw) for (const part of value.split(/\s+/)) extra.push(part)
+  const tokens = new Set<string>()
+  for (const candidate of [...raw, ...extra]) {
+    const t = candidate.trim()
+    if (t.length < 3 || GENERIC_TOKENS.has(t.toLowerCase())) continue
+    tokens.add(t)
+  }
+  return [...tokens].sort((a, b) => b.length - a.length)
+}
+
+export function scrubIdentityText(text: string, tokens: string[]): string {
+  let out = text
+  for (const token of tokens) out = out.replace(new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), ERASED_TEXT)
+  return out
+}
+
+function scrubIdentityJson(value: unknown, tokens: string[]): unknown {
+  const text = JSON.stringify(value)
+  let out = text
+  for (const token of tokens) {
+    const escaped = JSON.stringify(token).slice(1, -1)
+    out = out.replace(new RegExp(escaped.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), ERASED_TEXT)
+  }
+  return out === text ? value : JSON.parse(out)
+}
+
+/**
+ * Redact the subject's identity from activity rows written BEFORE the erasure (the old action's description carried the
+ * name; a customer's created/updated rows do too). It replaces identifying VALUES in place and keeps the row, so
+ * operational history and the accounting markers (which carry no identity) are untouched. The new erasure record is
+ * excluded. Rows keyed to other entities that merely mention the subject cannot be found by key and are out of reach.
+ */
+export async function scrubActivityLogIdentity(
+  tx: Prisma.TransactionClient,
+  entityIds: string[],
+  tokens: string[],
+): Promise<number> {
+  if (tokens.length === 0) return 0
+  let scrubbed = 0
+  for (const ids of chunks(entityIds)) {
+    const rows = await tx.activityLog.findMany({
+      where: { entityId: { in: ids }, NOT: { action: ERASURE_RECORD_ACTION } },
+      select: { id: true, description: true, metadata: true },
+    })
+    for (const row of rows) {
+      const description = scrubIdentityText(row.description, tokens)
+      const metadata = row.metadata == null ? row.metadata : scrubIdentityJson(row.metadata, tokens)
+      if (description === row.description && metadata === row.metadata) continue
+      await tx.activityLog.update({ where: { id: row.id }, data: { description, ...(metadata === row.metadata ? {} : { metadata: metadata as Prisma.InputJsonValue }) } })
+      scrubbed += 1
+    }
+  }
+  return scrubbed
 }
 
 export type EraseCustomerResult =
@@ -120,6 +206,13 @@ export async function eraseCustomerPersonalData(
   const erasedAt = new Date()
   try {
     const refusal = await db.$transaction(async (tx): Promise<string | null> => {
+      // Read the identifying values BEFORE anything is overwritten (see collectIdentityTokens).
+      const before = await tx.customer.findUnique({ where: { id: customerId } })
+      const orderRows = before ? await tx.salesOrder.findMany({
+        where: { customerId },
+        select: { customerName: true, customerEmail: true, customerVatNumber: true, billingAddress: true, shippingAddress: true, notes: true, internalNotes: true, trackingNumber: true },
+      }) : []
+      const shipmentRows = before ? await tx.shipment.findMany({ where: { order: { customerId } }, select: { trackingNumber: true } }) : []
       const claimed = await tx.customer.updateMany({
         where: { id: customerId, gdprAnonymisedAt: null },
         data: {
@@ -146,7 +239,13 @@ export async function eraseCustomerPersonalData(
       for (const id of orderIds) await lockSalesOrder(tx, id)
       const orderCounts = await eraseOrdersPersonalDataInTx(tx, orderIds, erasedAt)
       const links = await tx.shoppingCustomerLink.updateMany({ where: { customerId }, data: { metadata: Prisma.JsonNull } })
-      const counts: ErasureCounts = { customers: 1, shoppingCustomerLinks: links.count, ...orderCounts }
+      const tokens = collectIdentityTokens({
+        customer: before as unknown as Record<string, unknown> | null,
+        orders: orderRows as unknown as Array<Record<string, unknown>>,
+        shipmentTracking: shipmentRows.map((r) => r.trackingNumber),
+      })
+      const activityRowsScrubbed = await scrubActivityLogIdentity(tx, [customerId, ...orderIds], tokens)
+      const counts: ErasureCounts = { customers: 1, shoppingCustomerLinks: links.count, activityRowsScrubbed, ...orderCounts }
       await logActivityInTransaction(tx, {
         entityType: 'CUSTOMER',
         entityId: customerId,
