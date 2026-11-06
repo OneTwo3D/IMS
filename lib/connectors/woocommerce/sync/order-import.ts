@@ -4,6 +4,7 @@
 
 import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain/erasure/erase-personal-data'
 import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
+import { isWcOrderAnonymised, wcPayloadCarriesIdentity } from './anonymisation'
 import { ERASURE_PLACEHOLDER_NAME, ERASURE_RECORD_ACTION, ERASURE_RECORD_DESCRIPTION, buildErasureRecordMetadata } from '@/lib/domain/erasure/erasure-record'
 import { randomUUID } from 'node:crypto'
 import { createHash } from 'node:crypto'
@@ -1171,6 +1172,31 @@ export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder:
   return outcome
 }
 
+/**
+ * An inbound delivery for an ERASED order still carried real identity (WooCommerce was not anonymised; the erasure started in IMS, or WooCommerce's
+ * own copy is stale). The identity columns were withheld; this is the line an operator can see. One WARNING per order per day, so a busy order's
+ * redeliveries do not flood the log; it names the order and the storefront order id only, never the withheld data.
+ *
+ * WHAT THIS DOES NOT GUARD (so nobody assumes coverage): the raw WooCommerce payload copies IMS keeps for retry (admission-refusal queue,
+ * pending-FX queue, refund parks, outbound tracking items) are not scrubbed here, and WooCommerce itself is never written to by an erasure. An
+ * order that IMS does not yet hold can still be created from a queued pre-anonymisation payload; the anonymised delivery that follows erases it.
+ */
+async function recordRepopulationRefused(orderId: string, wcOrder: WcFullOrder): Promise<void> {
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000)
+  const recent = await db.activityLog.findFirst({ where: { entityType: 'SALES_ORDER', entityId: orderId, action: 'inbound_repopulation_refused', createdAt: { gte: since } }, select: { id: true } })
+  if (recent) return
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: orderId,
+    action: 'inbound_repopulation_refused',
+    tag: 'sync',
+    level: 'WARNING',
+    description: 'A WooCommerce delivery for an erased order still carried personal data; the identity columns were not written back.',
+    metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) },
+    resolveUser: false,
+  })
+}
+
 async function updateExistingWcOrderCore(
   orderId: string,
   wcOrder: WcFullOrder,
@@ -1187,6 +1213,7 @@ async function updateExistingWcOrderCore(
   const payloadCredit = reclassified.creditGross
   const payloadHasCreditConflict = reclassified.signalProblems.length > 0
   let reviewFlagged = false
+  let repopulationRefused = false
   await db.$transaction(async (tx) => {
     // Only a payload that shows credit or any credit-evidence problem can need a review; the steady state reads nothing.
     if (payloadCredit.gt(0) || payloadHasCreditConflict) {
@@ -1215,6 +1242,9 @@ async function updateExistingWcOrderCore(
     await lockSalesOrder(tx, orderId)
     const erasure = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true } })
     const erased = erasure?.erasedAt != null
+    // Recorded after the transaction (below). Only a delivery that still carries real identity counts: an anonymised delivery, or one whose placeholders
+    // WooCommerce wrote, is the expected steady state and says nothing.
+    repopulationRefused = erased && !isWcOrderAnonymised(wcOrder) && wcPayloadCarriesIdentity(wcOrder)
     await tx.shoppingOrderLink.updateMany({
       where: {
         connector: 'woocommerce',
@@ -1266,6 +1296,8 @@ async function updateExistingWcOrderCore(
       },
     })
   })
+
+  if (repopulationRefused) await recordRepopulationRefused(orderId, wcOrder)
 
   if (reviewFlagged) {
     await logActivity({
@@ -2351,10 +2383,16 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     }
 
     // Customer
-    const customerId = await upsertCustomer(wcOrder)
-    const customerName = [wcOrder.billing.first_name, wcOrder.billing.last_name].filter(Boolean).join(' ')
-      || [wcOrder.shipping.first_name, wcOrder.shipping.last_name].filter(Boolean).join(' ')
-      || 'WooCommerce Customer'
+    // A payload WooCommerce has ANONYMISED (positive marker, never inferred from placeholders) is an order whose subject asked for erasure:
+    // it never touches the customer table (no upsertCustomer, so no customer is matched, linked or minted) and is created ALREADY ERASED
+    // below, exactly as an order for an erased customer is. Its money, lines and tax are imported as for any order.
+    const payloadAnonymised = isWcOrderAnonymised(wcOrder)
+    const customerId = payloadAnonymised ? null : await upsertCustomer(wcOrder)
+    const customerName = payloadAnonymised
+      ? ERASURE_PLACEHOLDER_NAME
+      : [wcOrder.billing.first_name, wcOrder.billing.last_name].filter(Boolean).join(' ')
+        || [wcOrder.shipping.first_name, wcOrder.shipping.last_name].filter(Boolean).join(' ')
+        || 'WooCommerce Customer'
 
     // FX, against the currency read above.
     // WooCommerce's GMT fields carry no zone suffix: ALWAYS read through parseWcGmtInstant (as UTC), never `new Date(<string>)`, which reads a suffix-less string in the SERVER's zone.
@@ -2820,7 +2858,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         }
         // The customer was erased between the lookup and this lock: the order is created ALREADY ERASED, in this same transaction.
         // Its money stays in the books (it is created, with its lines, totals and tax); the identity is never written.
-        const erasedOnCreate = customerErasedDuringImport !== null
+        const erasedOnCreate = customerErasedDuringImport !== null || payloadAnonymised
         const erasedAt = new Date()
         const created = await tx.salesOrder.create({
         data: {
@@ -2944,8 +2982,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         }
         if (erasedOnCreate) {
           // The customer's ORIGINAL erasure request (its proof row, read under the customer lock held above): this order's record links to it.
-          const original = await tx.activityLog.findFirst({
-            where: { entityType: 'CUSTOMER', entityId: customerErasedDuringImport!, action: ERASURE_RECORD_ACTION },
+          const original = customerErasedDuringImport === null ? null : await tx.activityLog.findFirst({
+            where: { entityType: 'CUSTOMER', entityId: customerErasedDuringImport, action: ERASURE_RECORD_ACTION },
             orderBy: { createdAt: 'asc' },
             select: { metadata: true },
           })
@@ -2959,7 +2997,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             action: ERASURE_RECORD_ACTION,
             description: ERASURE_RECORD_DESCRIPTION,
             metadata: buildErasureRecordMetadata({
-              requestId: originalErasureRequestId ?? randomUUID(), erasedAt, trigger: 'IMPORT_AFTER_ERASURE', customerId: customerErasedDuringImport!, orderIds: [created.id],
+              requestId: originalErasureRequestId ?? randomUUID(), erasedAt, trigger: customerErasedDuringImport === null ? 'MIRRORED_FROM_STOREFRONT' : 'IMPORT_AFTER_ERASURE', customerId: customerErasedDuringImport, orderIds: [created.id],
               counts: { customers: 0, salesOrders: 1, shipments: 0, shoppingCustomerLinks: 0, shoppingOrderLinks: 1, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, linkedFreeTextScrubbed: 0, activityRowsScrubbed: 0, notifications: 0 },
             }),
             userId: null,
@@ -3205,7 +3243,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       const shippingTypeNow = shippingRateNow ? (shippingRateNow.accountingTaxType ?? undefined) : (shippingTax.taxType ?? accountingTaxType ?? undefined)
       const accountingPayload: Record<string, unknown> = {
           contactName: customerName,
-          contactEmail: wcOrder.billing.email || undefined,
+          contactEmail: payloadAnonymised ? undefined : (wcOrder.billing.email || undefined),
           date: parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created).toISOString().slice(0, 10),
           currency,
           // Stamp IMS's FX rate so Xero doesn't apply its own daily rate on

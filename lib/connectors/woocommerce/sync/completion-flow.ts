@@ -64,7 +64,7 @@ export async function processWcCompletion(
     if (locked.length === 0) return null
     const so = await tx.salesOrder.findUnique({
       where: { id: orderId },
-      select: { withdrawalApprovedAt: true, status: true },
+      select: { withdrawalApprovedAt: true, status: true, erasedAt: true },
     })
     return so ?? null
   })
@@ -85,7 +85,11 @@ export async function processWcCompletion(
     return { kind: 'skipped_withdrawn' }
   }
 
-  const wcTracking = extractWcTracking(wcOrder)
+  // ERASED ORDER: WooCommerce keeps its tracking items on an anonymised order (the plugin meta is not touched), so the completion would
+  // write a tracking number back onto the erased order's shipment. The fulfilment itself still proceeds (the goods and the books are not
+  // personal data); only the tracking numbers are withheld. Read under the same row lock as the withdrawal check above. The window between
+  // that read and the shipment write is the despatch-writer race the erasure work records as accepted.
+  const wcTracking = approved?.erasedAt ? [] : extractWcTracking(wcOrder)
 
   const applied = await applyExternalFulfillmentUpdate({
     source: 'woocommerce',

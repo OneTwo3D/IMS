@@ -76,7 +76,8 @@ export type ErasureRecordMetadata = {
   requestId: string
   erasedAt: string
   trigger: ErasureTrigger
-  customerId: string
+  /** Null for an order erased on its own (a guest order, or an order whose customer keeps other live orders). */
+  customerId: string | null
   orderIds: string[]
   counts: ErasureCounts
   systems: Record<ErasureExternalSystem, ErasureSystemVerdict>
@@ -90,7 +91,8 @@ export function buildErasureRecordMetadata(input: {
   requestId: string
   erasedAt: Date
   trigger: ErasureTrigger
-  customerId: string
+  /** Null for an order erased on its own (a guest order, or an order whose customer keeps other live orders). */
+  customerId: string | null
   orderIds: string[]
   counts: ErasureCounts
 }): ErasureRecordMetadata {

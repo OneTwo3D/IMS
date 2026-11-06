@@ -27,6 +27,8 @@ let mailerImpl: ((message: { to: string }) => Promise<Record<string, unknown>>) 
 // When set, the Mintsoft connector double returns these records from pollReturns.
 let pollReturnsRecords: (() => Array<Record<string, unknown>>) | null = null
 // Runs after upsertCustomer has returned (inside importWcOrder), before the order is created.
+// The tracking each fulfilment update was asked to record (see the completion test). The real function still runs.
+const fulfilmentTracking: Array<unknown[]> = []
 let afterUpsertCustomer: (() => Promise<void>) | null = null
 // Runs after an email action has read the order's address and before it enqueues.
 let afterAddressRead: (() => Promise<void>) | null = null
@@ -77,6 +79,8 @@ async function mockActionEnvironment() {
   // A seam to pause an action between its write and its in-transaction activity row (and only there).
   const activity = await import('@/lib/activity-log')
   mock.module('@/lib/activity-log', { namedExports: { ...activity, logActivityInTransaction: async (tx: never, params: never) => { await beforeActivityWrite?.(); return activity.logActivityInTransaction(tx, params) } } })
+  const fulfilment = await import('@/lib/fulfillment/external-fulfillment')
+  mock.module('@/lib/fulfillment/external-fulfillment', { namedExports: { ...fulfilment, applyExternalFulfillmentUpdate: async (args: { tracking?: unknown[] }) => { fulfilmentTracking.push(args.tracking ?? []); return fulfilment.applyExternalFulfillmentUpdate(args as never) } } })
   actionsMocked = true
 }
 
@@ -1469,4 +1473,159 @@ test('[erasure] a refund-accounting retry that fails for an ERASED order logs a 
     assert.ok(!JSON.stringify(l).includes(NAME.last) && !JSON.stringify(l).includes(STREET), 'an erased order logs no identity')
     assert.match(l.description, /Error.*withheld for an erased order/)
   }
+})
+
+// ---------------------------------------------------------------------------------------------------------------------
+// WOOCOMMERCE ANONYMISATION GUARDS. A payload carrying WooCommerce's positive marker is created already erased and never
+// touches the customer table; the placeholders WooCommerce writes are never a match key, for any order.
+// ---------------------------------------------------------------------------------------------------------------------
+
+const WOO_PLACEHOLDER_EMAIL = 'deleted@site.invalid'
+const WOO_ANON_ADDRESS = { first_name: '[deleted]', last_name: '[deleted]', company: '', address_1: '[deleted]', address_2: '', city: '[deleted]', state: '', postcode: '[deleted]', country: '', email: WOO_PLACEHOLDER_EMAIL, phone: '+000000000000' }
+
+function anonymisedPayload(externalId: number, wcRateId: number) {
+  const base = payload(externalId, wcRateId)
+  return { ...base, customer_id: 0, billing: WOO_ANON_ADDRESS, shipping: WOO_ANON_ADDRESS, meta_data: [{ id: 5, key: '_anonymized', value: 'yes' }], customer_note: ORDER_NOTE }
+}
+
+async function cleanupImported(db: Awaited<ReturnType<typeof loadDb>>, externalIds: number[]) {
+  for (const id of externalIds) {
+    const link = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(id) }, select: { orderId: true } })
+    if (!link) continue
+    const orderId = link.orderId
+    const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { customerId: true } })
+    await db.accountingSyncLog.deleteMany({ where: { referenceId: orderId } })
+    await db.activityLog.deleteMany({ where: { entityId: orderId } })
+    await db.salesOrderLine.deleteMany({ where: { orderId } })
+    await db.salesOrder.deleteMany({ where: { id: orderId } })
+    await db.shoppingOrderLink.deleteMany({ where: { orderId } })
+    if (order?.customerId) {
+      await db.shoppingCustomerLink.deleteMany({ where: { customerId: order.customerId } })
+      await db.customer.deleteMany({ where: { id: order.customerId } })
+    }
+  }
+}
+
+test('[erasure] a payload WooCommerce has anonymised is created already erased: no customer is matched or minted, the proof is written, the money stays', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const ids = [fx.externalId + 11, fx.externalId + 12]
+  t.after(async () => { await cleanupImported(db, ids); await fx.cleanup() })
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  // A pre-existing customer that already holds the placeholder address: the collision the guard exists to prevent.
+  const squatter = await db.customer.create({ data: { firstName: 'Squat', lastName: 'Ter', email: WOO_PLACEHOLDER_EMAIL } })
+  t.after(async () => { await db.customer.deleteMany({ where: { id: squatter.id } }) })
+  const customersBefore = await db.customer.count()
+  const before = await db.shoppingCustomerLink.count()
+
+  for (const id of ids) {
+    const result = await importWcOrder(anonymisedPayload(id, wcRateId) as never)
+    assert.equal(result.success, true, JSON.stringify(result))
+  }
+  assert.equal(await db.customer.count(), customersBefore, 'no customer was minted')
+  assert.equal(await db.shoppingCustomerLink.count(), before, 'no storefront link was written')
+  const orders = await Promise.all(ids.map(async (id) => {
+    const link = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(id) }, select: { orderId: true, metadata: true } })
+    return { link, order: await db.salesOrder.findUniqueOrThrow({ where: { id: link.orderId } }) }
+  }))
+  for (const { link, order } of orders) {
+    assert.equal(order.customerId, null, 'not attached to the placeholder-address customer, nor to any other')
+    assert.deepEqual([order.customerName, order.customerEmail, order.customerVatNumber, order.billingAddress, order.shippingAddress, order.notes],
+      ['GDPR Anonymised', null, null, null, null, null], 'every identity column is erased, customer_note included (WooCommerce keeps it)')
+    assert.ok(order.erasedAt)
+    assert.equal(order.totalForeign.toString(), '126', 'the money stays')
+    assert.equal(link.metadata, null, 'no storefront order key')
+    const proof = await db.activityLog.findFirstOrThrow({ where: { entityId: order.id, action: 'gdpr_erasure_recorded' } })
+    assert.equal((proof.metadata as { trigger: string }).trigger, 'MIRRORED_FROM_STOREFRONT')
+    assert.equal((proof.metadata as { customerId: unknown }).customerId, null)
+    const accounting = await db.accountingSyncLog.findMany({ where: { referenceId: order.id } })
+    for (const row of accounting) assert.ok(!JSON.stringify(row.payload).includes(WOO_PLACEHOLDER_EMAIL), 'no placeholder address in an accounting payload')
+  }
+  assert.notEqual(orders[0]!.order.id, orders[1]!.order.id)
+  // A redelivery of the same anonymised payload (the update path) changes nothing.
+  assert.equal((await importWcOrder(anonymisedPayload(ids[0]!, wcRateId) as never)).success, true)
+  const again = await db.salesOrder.findUniqueOrThrow({ where: { id: orders[0]!.order.id } })
+  assert.deepEqual([again.customerName, again.notes, again.billingAddress], ['GDPR Anonymised', null, null])
+  assert.equal(await db.customer.count(), customersBefore)
+})
+
+test('[erasure] the placeholders are never a match key or a stored identity for ANY order, marked or not', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const ids = [fx.externalId + 21, fx.externalId + 22]
+  t.after(async () => { await cleanupImported(db, ids); await fx.cleanup() })
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const squatter = await db.customer.create({ data: { firstName: 'Squat', lastName: 'Ter', email: WOO_PLACEHOLDER_EMAIL } })
+  t.after(async () => { await db.customer.deleteMany({ where: { id: squatter.id } }) })
+
+  // NOT marked: two real, distinct people whose email was replaced by the placeholder some other way.
+  const named = (first: string) => ({ ...WC_ADDRESS, first_name: first, last_name: 'Distinctname', email: WOO_PLACEHOLDER_EMAIL })
+  for (const [i, id] of ids.entries()) {
+    const p = { ...payload(id, wcRateId), billing: named(`Person${i}`), shipping: named(`Person${i}`) }
+    assert.equal((await importWcOrder(p as never)).success, true)
+  }
+  const customers = await Promise.all(ids.map(async (id) => {
+    const link = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(id) }, select: { orderId: true } })
+    return (await db.salesOrder.findUniqueOrThrow({ where: { id: link.orderId }, select: { customerId: true } })).customerId
+  }))
+  assert.ok(customers[0] && customers[1] && customers[0] !== customers[1], 'two distinct customers, not one shared record')
+  assert.ok(!customers.includes(squatter.id), 'the customer already holding the placeholder address was not matched')
+  for (const c of customers) assert.equal((await db.customer.findUniqueOrThrow({ where: { id: c! } })).email, null, 'the placeholder was not stored as an address')
+  assert.equal(await db.customer.count({ where: { firstName: '[deleted]' } }), 0)
+
+  // An ANONYMISED customer row is never a match target: same email as a live one, flagged erased.
+  const mapped = await import('@/lib/connectors/woocommerce/sync/field-mapping')
+  const erasedRow = await db.customer.create({ data: { firstName: 'GDPR', lastName: 'Anonymised', email: `erased-${randomUUID()}@example.test`, gdprAnonymisedAt: new Date() } })
+  t.after(async () => { await db.customer.deleteMany({ where: { id: erasedRow.id } }) })
+  const matched = await mapped.upsertCustomer({ ...payload(ids[0]!, wcRateId), billing: { ...WC_ADDRESS, email: erasedRow.email! } } as never)
+  t.after(async () => { if (matched) await db.customer.deleteMany({ where: { id: matched } }) })
+  assert.notEqual(matched, erasedRow.id, 'an anonymised row is not matched')
+})
+
+test('[erasure] a delivery for an erased order that still carries real identity is refused AND logged once a day; an anonymised delivery logs nothing', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  t.after(async () => { await fx.cleanup() })
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const refusals = () => db.activityLog.findMany({ where: { entityId: fx.orderId, action: 'inbound_repopulation_refused' } })
+
+  assert.equal((await importWcOrder(anonymisedPayload(fx.externalId, wcRateId) as never)).success, true)
+  assert.equal((await refusals()).length, 0, 'an anonymised delivery is the steady state and logs nothing')
+
+  for (let i = 0; i < 2; i += 1) assert.equal((await importWcOrder(payload(fx.externalId, wcRateId) as never)).success, true)
+  const rows = await refusals()
+  assert.equal(rows.length, 1, 'two redeliveries, one line')
+  assert.equal(rows[0]!.level, 'WARNING')
+  const text = JSON.stringify(rows[0])
+  for (const s of PERSONAL_STRINGS) assert.ok(!text.includes(s), 'the line names no erased data')
+  const order = await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+  assert.deepEqual([order.customerName, order.customerEmail, order.notes, order.billingAddress], ['GDPR Anonymised', null, null, null], 'and the identity was still withheld')
+})
+
+test('[erasure] a WooCommerce completion for an erased order writes no tracking number (WooCommerce keeps its tracking items), and the same completion DOES for a live order', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  t.after(async () => { await fx.cleanup() })
+  const { processWcCompletion } = await import('@/lib/connectors/woocommerce/sync/completion-flow')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const NUMBER = `WOOTRK-${randomUUID().slice(0, 8)}`
+  const completed = { ...payload(fx.externalId, wcRateId), status: 'completed', meta_data: [{ id: 7, key: '_wc_shipment_tracking_items', value: [{ tracking_provider: 'Royal Mail', tracking_number: NUMBER }] }] }
+  fulfilmentTracking.length = 0
+
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  await processWcCompletion(fx.orderId, completed as never)
+  assert.deepEqual(fulfilmentTracking, [[]], 'the fulfilment update was asked to record no tracking number for the erased order')
+  assert.equal(await db.shipment.count({ where: { orderId: fx.orderId, trackingNumber: NUMBER } }), 0)
+  // CONTROL: the same completion on the same order once the marker is cleared is asked to record it, so the empty list above is the guard.
+  await db.salesOrder.update({ where: { id: fx.orderId }, data: { erasedAt: null } })
+  fulfilmentTracking.length = 0
+  await processWcCompletion(fx.orderId, completed as never)
+  assert.equal(fulfilmentTracking.length, 1)
+  assert.equal(fulfilmentTracking[0]!.length, 1, 'without the marker the completion carries the tracking number')
 })

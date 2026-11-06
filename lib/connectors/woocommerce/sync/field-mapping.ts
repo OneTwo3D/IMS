@@ -10,6 +10,7 @@ import type { TaxCategory } from '@/app/generated/prisma/client'
 import type { WcAddress, WcFullOrder, WcLineItem, WcCouponLine, WcFeeLine, WcMeta } from './types'
 import { classifyWcCouponLines } from './coupon-classification'
 import { knownWcTaxClassCategory } from './tax-class-category'
+import { isPlaceholderEmail, isPlaceholderName } from './anonymisation'
 
 function roundDecimalNumber(value: DecimalInput, precision: number): number {
   return roundQuantity(value, precision).toNumber()
@@ -85,13 +86,17 @@ export function readWcCustomerVat(order: WcFullOrder): string | null {
 
 export function mapWcCustomer(order: WcFullOrder) {
   const b = order.billing
+  // WooCommerce's anonymisation placeholders ("[deleted]", deleted@site.invalid) are not identity: they are dropped here so they can
+  // never become a customer's name or the email an existing customer is matched on (which would merge unrelated people). For ANY order.
+  const text = (value: string | undefined | null): string => (!value || isPlaceholderName(value) ? '' : value)
+  const email = b.email && !isPlaceholderEmail(b.email) ? b.email : null
   return {
     externalCustomerId: order.customer_id > 0 ? order.customer_id : null,
-    firstName: b.first_name || order.shipping.first_name || '',
-    lastName: b.last_name || order.shipping.last_name || '',
-    email: b.email || null,
+    firstName: text(b.first_name) || text(order.shipping.first_name),
+    lastName: text(b.last_name) || text(order.shipping.last_name),
+    email,
     phone: b.phone || order.shipping.phone || null,
-    company: b.company || order.shipping.company || null,
+    company: text(b.company) || text(order.shipping.company) || null,
   }
 }
 
@@ -113,7 +118,8 @@ export async function upsertCustomer(order: WcFullOrder): Promise<string | null>
       })
     : null
   if (!existing && cust.email) {
-    existing = await db.customer.findFirst({ where: { email: cust.email } })
+    // An anonymised row is never a match target (its email is already null; this keeps that true if a writer ever changes).
+    existing = await db.customer.findFirst({ where: { email: cust.email, gdprAnonymisedAt: null } })
   }
 
   // A customer matched here can be ERASED at any moment, and a link written to an erased row would put the raw storefront customer
