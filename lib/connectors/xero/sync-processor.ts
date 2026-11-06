@@ -71,6 +71,7 @@ import {
 import { followUpObligationRecoveryFor } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { stampSyncedAtFromDatabaseClock } from './synced-at-clock'
 import { claimHeldFrom, heldClaimWhere, releaseClaimForRetry, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
+import { CANCELLED_ORDER_REFUSED_FOLLOW_UP_TYPES, guardCancelledOrderFollowUp, planInvoiceCustomerFollowUps, type CancelledOrderRefusedType } from '@/lib/domain/accounting/cancelled-order-followup'
 import { isMoneyMovingSyncType } from '@/lib/domain/accounting/followup-retry-guard'
 import {
   FOLLOW_UPS_ENQUEUED,
@@ -6478,6 +6479,8 @@ export async function processClaimedEntry(
       if (!orderId) return { success: false, error: 'Missing referenceId for INVOICE_EMAIL' }
       const emailCreditRefusal = await guardStoreCreditFollowUp(orderId, 'invoice email')
       if (emailCreditRefusal) return emailCreditRefusal
+      const emailCancelled = await refuseFollowUpForCancelledOrder({ entryId, lease, type: 'INVOICE_EMAIL', orderId })
+      if (emailCancelled) return emailCancelled
       const { sendAccountingInvoiceEmailInternal } = await import('@/lib/accounting-email')
       // Not a Xero call, but an external side effect all the same — though a reclaiming worker here
       // does NOT by itself mail a further copy (Codex round 35, MEDIUM; this comment used to read
@@ -6501,6 +6504,8 @@ export async function processClaimedEntry(
       if (!orderId) return { success: false, error: 'Missing referenceId for WC_INVOICE_NOTE' }
       const noteCreditRefusal = await guardStoreCreditFollowUp(orderId, 'WooCommerce invoice note')
       if (noteCreditRefusal) return noteCreditRefusal
+      const noteCancelled = await refuseFollowUpForCancelledOrder({ entryId, lease, type: 'WC_INVOICE_NOTE', orderId })
+      if (noteCancelled) return noteCancelled
       const { pushInvoiceNoteToWc } = await import('@/lib/connectors/woocommerce/sync/invoice-note')
       const fence = await lease.fenceBeforeRemoteWrite('wc-invoice-note')
       if (!fence.ok) return fence.result
@@ -7882,6 +7887,36 @@ async function decideInvoicePaymentFollowUp(
   })
 }
 
+/**
+ * The drain-time guard for the follow-ups that must not reach a customer or the shop for a CANCELLED order (cancelled-order-followup.ts). Under the order row lock; retires the
+ * claimed row with the reason and writes the finding. A read failure is a failure of the entry (retryable), never permission to send.
+ */
+export async function refuseFollowUpForCancelledOrder(params: {
+  entryId: string
+  lease: HeldClaim
+  type: CancelledOrderRefusedType
+  orderId: string
+}): Promise<EntryResult | null> {
+  let decision
+  try {
+    decision = await guardCancelledOrderFollowUp({ entryId: params.entryId, claim: params.lease, type: params.type, orderId: params.orderId })
+  } catch (error) {
+    return { success: false, error: `Could not read sales order ${params.orderId} before its ${params.type}: ${String(error)}` }
+  }
+  if (!decision.refused) return null
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: params.orderId,
+    action: 'invoice_followup_refused_cancelled_order',
+    tag: 'accounting',
+    level: 'WARNING',
+    description: decision.reason,
+    metadata: { syncLogId: params.entryId, type: params.type, retired: decision.retired },
+  }).catch(() => { /* logging must never turn a safe refusal into a failure */ })
+  // Nothing was sent and nothing should be retried: handled, not a failure that burns retries.
+  return { success: true, skipped: true }
+}
+
 export function settlementRateFromPayload(payload: Record<string, unknown>): { settlementRateToBase?: number } {
   // ONLY THE PAYMENT'S OWN RATE. A payload without `_paymentSettlementRateToBase` (queued before the importer stamped it) carries NO settlement rate: the order's rate is the rate of the order's day, and
   // a later-day payment settled at it would book the wrong gain/loss. The central guard then refuses a foreign payment lacking a rate (foreign_payment_missing_rate); a base-currency payment needs none.
@@ -8147,17 +8182,30 @@ async function enqueueFollowUps(
       where: { id: referenceId },
       select: {
         customerEmail: true,
+        status: true,
         shoppingLinks: { where: { connector: 'woocommerce' }, select: { id: true }, take: 1 },
       },
     })
     const outcomes: FollowUpEnqueueOutcome[] = []
-    if (order?.customerEmail) {
+    const plan = planInvoiceCustomerFollowUps({ status: order?.status ?? 'PENDING', customerEmail: order?.customerEmail ?? null, hasWooCommerceLink: Boolean(order?.shoppingLinks.length) })
+    if (plan.suppressedForCancellation) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: referenceId,
+        action: 'invoice_followup_not_queued_cancelled_order',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: 'The invoice email and the WooCommerce invoice note were not queued: the order is cancelled, so neither the customer nor the shop is told about an invoice for it. Re-queue them by hand after reinstating the order if they are needed.',
+        metadata: { referenceId, sourceEntryId: entryId, types: CANCELLED_ORDER_REFUSED_FOLLOW_UP_TYPES },
+      }).catch(() => { /* logging must never turn a safe refusal into a failure */ })
+    }
+    if (plan.email) {
       outcomes.push(await enqueueFollowUpSyncLog(
         'INVOICE_EMAIL', referenceType, referenceId, { referenceId, sourceEntryId: entryId },
         { from: 'postedRow', record: origin },
       ))
     }
-    if (order?.shoppingLinks.length) {
+    if (plan.note) {
       outcomes.push(await enqueueFollowUpSyncLog(
         'WC_INVOICE_NOTE', referenceType, referenceId, { referenceId, sourceEntryId: entryId },
         { from: 'postedRow', record: origin },

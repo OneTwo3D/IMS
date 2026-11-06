@@ -149,7 +149,7 @@ function txDelegates() {
     },
     update: async () => ({}),
   },
-  shoppingOrderLink: { updateMany: async () => ({ count: 1 }) },
+  shoppingOrderLink: { updateMany: async () => ({ count: 1 }), findFirst: async () => null },
   shoppingStatusMapping: {
     findMany: async ({ where }: { where: { OR?: Array<{ externalStatus?: { equals?: string } }> } }) => {
       const wanted = (where.OR ?? [])
@@ -171,6 +171,12 @@ function txDelegates() {
       return row ?? {}
     },
     findFirst: async ({ where }: { where: Row }) => matchLogs(where)[0] ?? null,
+    findUnique: async ({ where }: { where: { id: string } }) => store.syncLogs.find((entry) => entry.id === where.id) ?? null,
+    updateMany: async ({ where, data }: { where: { id: string }; data: Row }) => {
+      const row = store.syncLogs.find((entry) => entry.id === where.id)
+      if (row) Object.assign(row, data)
+      return { count: row ? 1 : 0 }
+    },
     findMany: async ({ where }: { where: Row }) => matchLogs(where),
     count: async () => 0,
   },
