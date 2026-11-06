@@ -103,6 +103,9 @@ const applyRefusalUpdate = (row: Record<string, unknown>, update: Record<string,
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      // The release reads the erasure marker under the order lock (an order that is not erased) before it copies the parked payload.
+      $transaction: async function (this: unknown, fn: (tx: unknown) => Promise<unknown>) { return fn(this) },
+      $queryRaw: async () => [],
       shoppingSyncLog: {
         findMany: async ({ where, take }: { where: Record<string, unknown>; take?: number }) =>
           state.held.filter((r) => matchesHeld(r, where)).slice(0, take ?? undefined),
@@ -117,6 +120,7 @@ mock.module('@/lib/db', {
         create: async () => { throw new Error('the sweep must not create hold rows') },
       },
       salesOrder: {
+        findUnique: async () => ({ erasedAt: null, customer: null }),
         findMany: async ({ where }: { where: { id: { in: string[] } } }) =>
           state.orders.filter((o) => where.id.in.includes(o.id)),
       },
@@ -165,9 +169,16 @@ mock.module('@/lib/activity-log', {
     logActivityPersisted: async () => {},
   },
 })
+const queueDouble = async (params: { referenceId: string; idempotencyKey: string; payload: Record<string, unknown> }) => queueAccountingSyncDouble(params)
 mock.module('@/lib/accounting', {
   namedExports: {
-    queueAccountingSync: async (params: { referenceId: string; idempotencyKey: string; payload: Record<string, unknown> }) => {
+    // The release enqueues inside its order-locked transaction, through the in-transaction variant; the double is the same.
+    queueAccountingSyncTxWithOutcome: async (_tx: unknown, params: { referenceId: string; idempotencyKey: string; payload: Record<string, unknown> }) => queueDouble(params),
+    queueAccountingSync: async (params: { referenceId: string; idempotencyKey: string; payload: Record<string, unknown> }) => queueAccountingSyncDouble(params),
+  },
+})
+async function queueAccountingSyncDouble(params: { referenceId: string; idempotencyKey: string; payload: Record<string, unknown> }) {
+  {
       state.asked.push(params as unknown as Record<string, unknown>)
       // Returns void and returns EARLY — silently — when the connector is off. That is the state
       // the whole sweep exists for.
@@ -181,9 +192,8 @@ mock.module('@/lib/accounting', {
         return { queued: false, reason: 'refused', connector: 'xero', activeConnector: 'quickbooks', refusalRecorded: true, posting }
       }
       state.queued.push({ referenceId: params.referenceId, idempotencyKey: params.idempotencyKey, payload: params.payload })
-    },
-  },
-})
+  }
+}
 
 type Sweep = typeof import('@/lib/connectors/woocommerce/sync/order-import')['retryHeldWcSalesInvoiceReleases']
 

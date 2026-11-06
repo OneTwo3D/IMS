@@ -1,7 +1,7 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { recordWmsMutationEvents, type WmsMutationEventInput } from '@/lib/domain/wms/mutation-audit'
+import { toWmsMutationEventRow } from '@/lib/domain/wms/mutation-audit'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsReturnRecord } from '@/lib/connectors/wms/types'
 import { resolveOrderForExternalFulfillment } from '@/lib/fulfillment/external-fulfillment'
@@ -274,6 +274,48 @@ export function mapMintsoftReturnsInboxRow(row: {
   }
 }
 
+/**
+ * The sync-log row for a return that FAILED. Like the success row it carries the raw warehouse payload only when the return's effective order
+ * (the order its reference resolves to, or the one its inbox row is already linked to) is NOT erased, decided under that order's lock in the
+ * same transaction that writes the row. If the effective order cannot be determined (a lookup fails), the payload is left out: an error
+ * row must never be the way a name or address gets back in.
+ */
+async function writeReturnsErrorLog(jobId: string, record: WmsReturnRecord, error: unknown): Promise<void> {
+  let candidates: string[] = []
+  let determined = true
+  try {
+    const order = await resolveMintsoftReturnOrder(record.orderReference)
+    const row = await db.wmsReturnsInbox.findUnique({
+      where: { connector_externalReturnId: { connector: 'mintsoft', externalReturnId: record.externalReturnId } },
+      select: { orderId: true },
+    })
+    candidates = [...new Set([order?.id, row?.orderId].filter((id): id is string => Boolean(id)))].sort()
+  } catch {
+    determined = false
+  }
+  await db.$transaction(async (tx) => {
+    let erased = !determined
+    for (const candidate of candidates) {
+      await tx.$queryRaw`SELECT id FROM "sales_orders" WHERE id = ${candidate} FOR UPDATE`
+      if ((await tx.salesOrder.findUnique({ where: { id: candidate }, select: { erasedAt: true } }))?.erasedAt) erased = true
+    }
+    await tx.wmsSyncLog.create({
+      data: {
+        jobId,
+        sku: trimToNull(record.sku),
+        productId: null,
+        action: 'error',
+        // For an erased OR undetermined effective order the reason is a fixed, identity-free line naming only the error CLASS: a parser or driver
+        // message can echo the rejected value, which is exactly the name or address that was erased.
+        reason: erased
+          ? `Return rejected: ${error instanceof Error ? error.name : 'UnknownError'}`
+          : error instanceof Error ? error.message : 'Mintsoft returns sync error',
+        payload: (erased ? {} : (record.raw ?? {})) as Prisma.InputJsonValue,
+      },
+    })
+  })
+}
+
 export async function runMintsoftReturnsSync(triggeredBy: string): Promise<MintsoftReturnsSyncResult> {
   const bindings = await getReturnsBindings()
   if (bindings.length === 0) {
@@ -319,8 +361,6 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
     skipped: 0,
     errors: 0,
   }
-  const logRows: Prisma.WmsSyncLogCreateManyInput[] = []
-  const auditEvents: WmsMutationEventInput[] = []
   let createdCount = 0
   let updatedCount = 0
   let maxReceivedAtSeen: Date | null = null
@@ -346,7 +386,7 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
         ])
         const binding = selectMintsoftReturnBinding(record, bindings)
         const reference = trimToNull(record.orderReference)
-        const reason = trimToNull(record.reason)
+        const reasonText = trimToNull(record.reason)
         const qty = record.qty == null ? null : new Prisma.Decimal(record.qty)
         const receivedAt = parseReceivedAt(record.receivedAt)
         const now = new Date()
@@ -354,13 +394,9 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
           maxReceivedAtSeen = receivedAt
         }
 
+        const inboxKey = { connector_externalReturnId: { connector: 'mintsoft', externalReturnId: record.externalReturnId } }
         const existing = await db.wmsReturnsInbox.findUnique({
-          where: {
-            connector_externalReturnId: {
-              connector: 'mintsoft',
-              externalReturnId: record.externalReturnId,
-            },
-          },
+          where: inboxKey,
           select: {
             id: true,
             status: true,
@@ -368,48 +404,90 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
           },
         })
 
-        const saved = await db.wmsReturnsInbox.upsert({
-          where: {
-            connector_externalReturnId: {
+        // ONE TRANSACTION: the order lock(s), the erasure marker and the inbox write. A return for an ERASED order is recorded (its structured
+        // columns reconcile the warehouse), but the warehouse's free text and raw payload are NOT read back in: the warehouse still holds the
+        // person's details, and re-reading them would undo the erasure. The decision is made on the EFFECTIVE order, locked first (order, then
+        // the inbox row: the erasure's own order, customer -> orders -> linked rows): the order this delivery resolves to, or, when it
+        // resolves to none (a redelivery with a missing order reference), the order the inbox row is ALREADY linked to. An established link is
+        // never cleared by an unresolved delivery.
+        await db.$transaction(async (tx) => {
+          const current = await tx.wmsReturnsInbox.findUnique({ where: inboxKey, select: { orderId: true } })
+          const effectiveOrderId = order?.id ?? current?.orderId ?? null
+          const candidates = [...new Set([order?.id, current?.orderId].filter((id): id is string => Boolean(id)))].sort()
+          let orderErased = false
+          for (const candidate of candidates) {
+            await tx.$queryRaw`SELECT id FROM "sales_orders" WHERE id = ${candidate} FOR UPDATE`
+            if ((await tx.salesOrder.findUnique({ where: { id: candidate }, select: { erasedAt: true } }))?.erasedAt) orderErased = true
+          }
+          const reason = orderErased ? null : reasonText
+          const rawPayload = (orderErased ? {} : (record.raw ?? {})) as Prisma.InputJsonValue
+          const saved = await tx.wmsReturnsInbox.upsert({
+            where: inboxKey,
+            create: {
               connector: 'mintsoft',
               externalReturnId: record.externalReturnId,
+              orderId: effectiveOrderId,
+              productId: product?.id ?? null,
+              sku: trimToNull(record.sku),
+              qty,
+              reason,
+              reference,
+              warehouseId: binding?.warehouseId ?? null,
+              receivedAt,
+              rawPayload,
+              status: 'NEW',
             },
-          },
-          create: {
-            connector: 'mintsoft',
-            externalReturnId: record.externalReturnId,
-            orderId: order?.id ?? null,
-            productId: product?.id ?? null,
-            sku: trimToNull(record.sku),
-            qty,
-            reason,
-            reference,
-            warehouseId: binding?.warehouseId ?? null,
-            receivedAt,
-            rawPayload: (record.raw ?? {}) as Prisma.InputJsonValue,
-            status: 'NEW',
-          },
-          update: {
-            orderId: order?.id ?? null,
-            productId: product?.id ?? null,
-            sku: trimToNull(record.sku),
-            qty,
-            reason,
-            reference,
-            warehouseId: resolveMintsoftReturnWarehouseId({
-              existingStatus: existing?.status ?? null,
-              existingWarehouseId: existing?.warehouseId ?? null,
-              bindingWarehouseId: binding?.warehouseId ?? null,
+            update: {
+              orderId: effectiveOrderId,
+              productId: product?.id ?? null,
+              sku: trimToNull(record.sku),
+              qty,
+              reason,
+              reference,
+              warehouseId: resolveMintsoftReturnWarehouseId({
+                existingStatus: existing?.status ?? null,
+                existingWarehouseId: existing?.warehouseId ?? null,
+                bindingWarehouseId: binding?.warehouseId ?? null,
+              }),
+              receivedAt,
+              rawPayload,
+              updatedAt: now,
+            },
+            select: {
+              id: true,
+              productId: true,
+              sku: true,
+            },
+          })
+          // THE SYNC LOG ROW IS WRITTEN IN THIS SAME TRANSACTION, under the same order lock, with the same decision: a log row carries the raw
+          // warehouse payload only when the effective order is NOT erased. For an erased order it carries identity-free structured fields only.
+          await tx.wmsSyncLog.create({
+            data: {
+              jobId: job.id,
+              sku: saved.sku,
+              productId: saved.productId,
+              action: existing ? 'updated' : 'created',
+              reason: [
+                order ? null : 'ORDER_UNMATCHED',
+                product ? null : 'SKU_UNMATCHED',
+                binding ? null : 'WAREHOUSE_UNMATCHED',
+              ].filter(Boolean).join(',') || 'MATCHED',
+              payload: rawPayload,
+            },
+          })
+          // THE AUDIT EVENT TOO, in this transaction: it carries the reason, so it is written under the same lock and with the same decision.
+          await tx.wmsMutationEvent.create({
+            data: toWmsMutationEventRow({
+              connector: 'mintsoft', direction: 'INBOUND', action: 'return_inbox', outcome: 'SUCCEEDED',
+              entityType: 'RETURN', entityId: saved.id, externalId: record.externalReturnId, jobId: job.id,
+              summary: existing
+                ? `Mintsoft return ${record.externalReturnId} updated in the returns inbox`
+                : `Mintsoft return ${record.externalReturnId} staged in the returns inbox`,
+              before: existing ? { status: existing.status, warehouseId: existing.warehouseId } : null,
+              after: { sku: saved.sku, qty, reason, reference, orderMatched: Boolean(order), productMatched: Boolean(product) },
+              triggeredBy: 'returns-sync',
             }),
-            receivedAt,
-            rawPayload: (record.raw ?? {}) as Prisma.InputJsonValue,
-            updatedAt: now,
-          },
-          select: {
-            id: true,
-            productId: true,
-            sku: true,
-          },
+          })
         })
 
         if (existing) {
@@ -418,22 +496,6 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
           createdCount += 1
           counters.corrected += 1
         }
-        auditEvents.push({
-          connector: 'mintsoft', direction: 'INBOUND', action: 'return_inbox', outcome: 'SUCCEEDED',
-          entityType: 'RETURN', entityId: saved.id, externalId: record.externalReturnId, jobId: job.id,
-          summary: existing
-            ? `Mintsoft return ${record.externalReturnId} updated in the returns inbox`
-            : `Mintsoft return ${record.externalReturnId} staged in the returns inbox`,
-          before: existing ? { status: existing.status, warehouseId: existing.warehouseId } : null,
-          after: { sku: saved.sku, qty, reason, reference, orderMatched: Boolean(order), productMatched: Boolean(product) },
-          triggeredBy: 'returns-sync',
-        })
-        // Bound memory on a large backlog: flush a full batch as we go
-        // (Codex r2); the final flush after the loop catches the remainder.
-        if (auditEvents.length >= 200) {
-          await recordWmsMutationEvents(auditEvents.splice(0))
-        }
-
         const fullyMatched = isMintsoftReturnFullyMatched({
           orderId: order?.id ?? null,
           productId: product?.id ?? null,
@@ -444,19 +506,6 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
         } else {
           counters.mismatched += 1
         }
-
-        logRows.push({
-          jobId: job.id,
-          sku: saved.sku,
-          productId: saved.productId,
-          action: existing ? 'updated' : 'created',
-          reason: [
-            order ? null : 'ORDER_UNMATCHED',
-            product ? null : 'SKU_UNMATCHED',
-            binding ? null : 'WAREHOUSE_UNMATCHED',
-          ].filter(Boolean).join(',') || 'MATCHED',
-          payload: (record.raw ?? {}) as Prisma.InputJsonValue,
-        })
       } catch (error) {
         counters.errors += 1
         const failedReceivedAt = parseReceivedAt(record.receivedAt)
@@ -465,21 +514,10 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
         } else {
           replayFullWindow = true
         }
-        logRows.push({
-          jobId: job.id,
-          sku: trimToNull(record.sku),
-          productId: null,
-          action: 'error',
-          reason: error instanceof Error ? error.message : 'Mintsoft returns sync error',
-          payload: (record.raw ?? {}) as Prisma.InputJsonValue,
-        })
+        await writeReturnsErrorLog(job.id, record, error)
       }
     }
 
-    await recordWmsMutationEvents(auditEvents)
-    if (logRows.length > 0) {
-      await db.wmsSyncLog.createMany({ data: logRows })
-    }
 
     const status: 'SUCCEEDED' | 'PARTIAL' = counters.errors > 0 ? 'PARTIAL' : 'SUCCEEDED'
     const nextCursor = resolveMintsoftReturnsNextCursor({

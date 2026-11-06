@@ -145,6 +145,8 @@ import { PermanentStatusTransitionError, isPermanentStatusTransitionError } from
 import { canTransitionSalesOrder } from '@/lib/domain/workflows/sales-order-state'
 import { readSingleXeroDocument } from '@/lib/connectors/xero/single-document'
 import { isPaymentStatusMismatch } from '@/lib/domain/sales/o2c-guards'
+import { CustomerAnonymisedError, lockCustomerForOrderLink } from '@/lib/domain/erasure/customer-link'
+import { paymentNotesForOrder } from '@/lib/domain/erasure/order-state'
 import {
   cancelSalesOrderFulfillmentState,
   lockSalesOrder,
@@ -1206,6 +1208,8 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
       await lockOrderNamedTaxRate(tx, input.taxRateName, { lineRateIds: lineData.map((l) => l.taxRateId), allowMissing: orderDefaultRate === null })
       // A supplied rate id that a tax re-key retired is resolved to its replacement; a plainly inactive one is refused (lib/tax/writable-tax-rate.ts), under the row share lock the apply waits on.
       await resolveLinesTaxRates(tx, lineData)
+      // An erased customer is never linked to a new order (lock + re-read; see lib/domain/erasure/customer-link.ts).
+      await lockCustomerForOrderLink(tx, input.customerId)
       return tx.salesOrder.create({
         data: {
           externalOrderNumber,
@@ -1329,6 +1333,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
     })
     return postCommitWarnings.length > 0 ? { success: true, order: mapped, postCommitWarnings } : { success: true, order: mapped }
   } catch (e) {
+    if (e instanceof CustomerAnonymisedError) return { success: false, error: e.message }
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: null,
@@ -2324,6 +2329,17 @@ async function loadRefundAccountingQueueInput(
   }
 }
 
+/** True when the order is erased, or cannot be determined: exception text is then never put in an activity description (it can echo the person). */
+async function refundOrderIsErasedOrUnknown(orderId: string | null): Promise<boolean> {
+  if (!orderId) return true
+  try {
+    const o = await db.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, customer: { select: { gdprAnonymisedAt: true } } } })
+    return !o || o.erasedAt != null || o.customer?.gdprAnonymisedAt != null
+  } catch {
+    return true
+  }
+}
+
 async function loadRefundAuditContext(
   refundId: string,
 ): Promise<{ orderId: string; refundOrderRef: string } | null> {
@@ -3161,7 +3177,7 @@ export async function retryRefundAccounting(
         action: 'refund_accounting_retry_failed',
         tag: 'accounting',
         level: 'WARNING',
-        description: result.error,
+        description: (await refundOrderIsErasedOrUnknown(auditContext?.orderId ?? null)) ? 'Failed to retry refund accounting; detail withheld for an erased order' : result.error,
         metadata: { refundId, orderNumber: auditContext?.refundOrderRef },
       })
       return result
@@ -3257,13 +3273,16 @@ export async function retryRefundAccounting(
         accountingWarning: String(e),
       },
     }).catch(() => undefined)
+    const erasedOrder = await refundOrderIsErasedOrUnknown(auditContext?.orderId ?? null)
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: auditContext?.orderId ?? refundId,
       action: 'refund_accounting_retry_failed',
       tag: 'accounting',
       level: 'ERROR',
-      description: `Failed to retry refund accounting: ${String(e)}`,
+      description: erasedOrder
+        ? `Failed to retry refund accounting (${e instanceof Error ? e.name : 'Error'}); detail withheld for an erased order`
+        : `Failed to retry refund accounting: ${String(e)}`,
       metadata: { refundId, orderNumber: auditContext?.refundOrderRef },
     })
     return { success: false, error: String(e) }
@@ -3290,6 +3309,12 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     const fxRate = await resolveFxRateToBase(db, so.currency, await getBaseCurrencyCode(), new Date())
     const cloneNameWasActive = so.taxRateName ? (await db.taxRate.findFirst({ where: { name: so.taxRateName, active: true }, select: { id: true } })) !== null : false
     const clone = await db.$transaction(async (tx) => {
+    // A clone copies the source order's customer link AND its identity fields. Customer lock first (the erasure's order), then
+    // the source order's lock; an erased customer or an erased source order is refused, never copied.
+    await lockCustomerForOrderLink(tx, so.customerId)
+    await lockSalesOrder(tx, id)
+    const sourceNow = await tx.salesOrder.findUnique({ where: { id }, select: { erasedAt: true } })
+    if (sourceNow?.erasedAt) throw new CustomerAnonymisedError('This order\'s personal data was erased and it cannot be cloned; create a new order.')
     // A cloned line's rate that a tax re-key retired follows its replacement; a plainly inactive one is refused (lib/tax/writable-tax-rate.ts).
     // The clone names the source order's rate (the header name is copied): the line rates and the active named rate are locked together, in id order, BEFORE the lines are resolved. A name that had
     // an active rate when the clone started and has none now was deactivated in between: the clone is refused (NamedTaxRateGoneError), never saved naming it.
@@ -3360,6 +3385,7 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     })
     return { success: true, newId: clone.id }
   } catch (e) {
+    if (e instanceof CustomerAnonymisedError) return { success: false, error: e.message }
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: id,
@@ -3583,11 +3609,20 @@ export async function updateSalesOrderNotes(
 ): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('sales.create')
-    const so = await db.salesOrder.update({
-      where: { id },
-      data: { notes: notes || null, internalNotes: internalNotes || null },
-      select: { orderNumber: true, externalOrderNumber: true },
+    // Under the order lock, with the erasure marker read inside it: an erased order's notes are never written back, and an
+    // erasure that commits first is seen (it takes the same lock).
+    const written = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, id)
+      const current = await tx.salesOrder.findUnique({ where: { id }, select: { erasedAt: true } })
+      if (current?.erasedAt) return null
+      return tx.salesOrder.update({
+        where: { id },
+        data: { notes: notes || null, internalNotes: internalNotes || null },
+        select: { orderNumber: true, externalOrderNumber: true },
+      })
     })
+    if (!written) return { success: false, error: 'This order\'s personal data has been erased and it can no longer be edited' }
+    const so = written
     revalidatePath(`/sales/${id}`)
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -3829,7 +3864,8 @@ export async function addPayment(input: {
           currency: input.currency,
           method: input.method || null,
           reference: input.reference || null,
-          notes: input.notes || null,
+          // Free text is dropped for an ERASED order (the payment itself still records; the reference is kept for reconciliation).
+          notes: await paymentNotesForOrder(tx, input.orderId, input.notes),
           paidAt,
           // whether `paidAt` was an explicit instant or a date-only input (the FX gain/loss report reads a stored midnight by it)
           paidAtExplicitInstant: explicitSettlementInstant(input.paidAt, paidAt),

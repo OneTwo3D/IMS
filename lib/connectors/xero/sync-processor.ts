@@ -3,6 +3,7 @@
  * Each entry represents one IMS transaction → one Xero API call.
  */
 
+import { resolveSalesPostContact } from '@/lib/domain/erasure/accounting-contact'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { getRateLimitBackoffMs, isRateLimitError } from './deferral'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
@@ -6206,12 +6207,15 @@ export async function processClaimedEntry(
       if (!numberFence.post) return numberFence.result
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice', payload)
       // r5 #1: the claim is re-taken HERE, after the scope read and the cancelled-order guard, not once at the top of the entry.
+      // The erasure state is read BEFORE the claim is re-taken and fails closed: if it cannot be read, nothing is posted and the entry is retried.
+      const postContact = await resolveSalesPostContact(referenceType, referenceId, payload)
+      if (!postContact.ok) return { success: false, error: postContact.error }
       const fence = await lease.fenceBeforeRemoteWrite('sales-invoice')
       if (!fence.ok) return fence.result
       const invoiceResult = await pushSalesInvoice({
         invoiceNumber: payload.invoiceNumber as string,
-        contactName: payload.contactName as string,
-        contactEmail: payload.contactEmail as string | undefined,
+        contactName: postContact.contactName,
+        contactEmail: postContact.contactEmail,
         date: payload.date as string,
         dueDate: payload.dueDate as string | undefined,
         currency: payload.currency as string,
@@ -6229,7 +6233,7 @@ export async function processClaimedEntry(
         // o3d-k26m.5 round 5/6: the number fence's LAST word. Handed in here, scoped around the
         // create by pushSalesInvoice, and evaluated inside the HTTP client on every attempt as the
         // last statement before the socket. Nothing is sent if it refuses.
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId, beforePost: numberFence.beforePost })
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId, beforePost: numberFence.beforePost, contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) })
       return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, externalRevisionAt: invoiceResult.externalRevisionAt, error: invoiceResult.error }
     }
 
@@ -6248,12 +6252,15 @@ export async function processClaimedEntry(
       if (!guard.post) return guard.result
       const customerId = guard.customerId
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice-update', payload)
+      // The erasure state is read BEFORE the claim is re-taken and fails closed: if it cannot be read, nothing is posted and the entry is retried.
+      const postContact = await resolveSalesPostContact(referenceType, referenceId, payload)
+      if (!postContact.ok) return { success: false, error: postContact.error }
       const fence = await lease.fenceBeforeRemoteWrite('sales-invoice-update')
       if (!fence.ok) return fence.result
       const invoiceResult = await updateSalesInvoice(accountingInvoiceId, {
         invoiceNumber: payload.invoiceNumber as string,
-        contactName: payload.contactName as string,
-        contactEmail: payload.contactEmail as string | undefined,
+        contactName: postContact.contactName,
+        contactEmail: postContact.contactEmail,
         date: payload.date as string,
         dueDate: payload.dueDate as string | undefined,
         currency: payload.currency as string,
@@ -6268,7 +6275,7 @@ export async function processClaimedEntry(
         discountTaxType: payload.discountTaxType as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId })
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId, contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) })
       return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, externalRevisionAt: invoiceResult.externalRevisionAt, error: invoiceResult.error }
     }
 
@@ -6675,19 +6682,22 @@ export async function processClaimedEntry(
             select: { order: { select: { customerId: true } } },
           }).catch(() => null))?.order.customerId ?? undefined
         : undefined
+      // The erasure state is read BEFORE the claim is re-taken and fails closed: if it cannot be read, nothing is posted and the entry is retried.
+      const creditContact = await resolveSalesPostContact(referenceType, referenceId, payload)
+      if (!creditContact.ok) return { success: false, error: creditContact.error }
       const fence = await lease.fenceBeforeRemoteWrite('credit-note')
       if (!fence.ok) return fence.result
       return pushCreditNote({
         creditNoteNumber: payload.creditNoteNumber as string,
-        contactName: payload.contactName as string,
-        contactEmail: payload.contactEmail as string | undefined,
+        contactName: creditContact.contactName,
+        contactEmail: creditContact.contactEmail,
         date: payload.date as string,
         currency: payload.currency as string,
         currencyRateToBase: payload.currencyRateToBase as number | undefined,
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId, contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
     }
 
     case 'PURCHASE_CREDIT_NOTE': {

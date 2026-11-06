@@ -139,8 +139,11 @@ function txClient() {
   const base = txDelegates()
   return {
     ...base,
+    // The order row lock and the importer's erasure-marker read (an order that is not erased).
+    $queryRaw: async () => [],
     salesOrder: {
       ...base.salesOrder,
+      findUnique: async () => ({ erasedAt: null }),
       update: async ({ where }: { where: { id: string } }) => {
         state.updatedOrderIds.push(where.id)
         return {}

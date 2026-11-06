@@ -28,6 +28,7 @@ export async function sendSalesOrderEmail(orderId: string): Promise<{ success: b
       referenceType: 'SalesOrder',
       referenceId: orderId,
     })
+    if (!outcome.queued && outcome.reason === 'recipient_erased') return { success: false, error: 'This order\'s personal data was erased, so no email can be sent for it.' }
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,

@@ -66,12 +66,16 @@ export async function queueDispatchEmailIfEligible(orderId: string): Promise<{ q
         where: { id: orderId },
         select: {
           status: true,
+          erasedAt: true,
+          customer: { select: { gdprAnonymisedAt: true } },
           customerEmail: true,
           orderNumber: true,
           externalOrderNumber: true,
           _count: { select: { shoppingLinks: true } },
         },
       })
+      // Read under the order lock just taken: an erased order, or one whose customer is erased, gets no email.
+      if (order?.erasedAt || order?.customer?.gdprAnonymisedAt) return { queued: false as const, reason: 'recipient_erased' as const }
       const existing = await tx.emailOutbox.findFirst({
         where: { kind: DISPATCH_EMAIL_KIND, referenceType: 'SalesOrder', referenceId: orderId },
         select: { id: true },

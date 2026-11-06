@@ -133,7 +133,13 @@ import { logActivity } from '@/lib/activity-log'
 import { db } from '@/lib/db'
 import { uniqueConstraintFields } from '@/lib/db/prisma-unique-violation'
 import { sendEmail } from '@/lib/mailer'
+import { writeInvalidRecipientOutcome, type InvalidRecipientWriter } from '@/lib/email-outbox-invalid-recipient'
 import { prepareQueuedEmail } from '@/lib/order-email'
+import {
+  EMAIL_RECIPIENT_ERASED_REASON,
+  ERASED_RECIPIENT_PLACEHOLDER,
+  EmailRecipientErasedError,
+} from '@/lib/domain/erasure/email-recipient'
 
 const EMAIL_MAX_ATTEMPTS = 5
 const EMAIL_CLAIM_STALE_MS = 15 * 60 * 1000
@@ -195,7 +201,7 @@ type QueueEmailInput = {
  * removed from the enqueue contract too rather than left as the one place it still reads as a
  * guarantee.
  */
-export type QueueEmailOutcome = { queued: true } | { queued: false; reason: 'already_queued' }
+export type QueueEmailOutcome = { queued: true } | { queued: false; reason: 'already_queued' } | { queued: false; reason: 'recipient_erased' }
 
 export type EmailOutboxRow = {
   id: string
@@ -1288,6 +1294,11 @@ export type ResolvedEmailOutboxDependencies = Omit<EmailOutboxHarness, 'client'>
    * it needs the answer.
    */
   inMemoryOutboxRows: (() => unknown) | null
+  /**
+   * PRODUCTION ONLY: writes the invalid-recipient outcome of a SALES-ORDER email under the order lock, honouring the erasure (see
+   * lib/email-outbox-invalid-recipient.ts). `null` for a harness or lane client, which has no order table and keeps the plain path.
+   */
+  invalidRecipientWriter: InvalidRecipientWriter | null
 }
 
 /**
@@ -1458,18 +1469,35 @@ export async function queueEmail(
     contentType: attachment.contentType,
   }))
 
+  const data = {
+    kind: input.kind,
+    toEmail: normalizeEmail(input.to),
+    subject: input.subject,
+    html: input.html,
+    attachments: attachments as never,
+    referenceType: input.referenceType ?? null,
+    referenceId: input.referenceId ?? null,
+  }
+
   try {
-    await client.emailOutbox.create({
-      data: {
-        kind: input.kind,
-        toEmail: normalizeEmail(input.to),
-        subject: input.subject,
-        html: input.html,
-        attachments: attachments as never,
-        referenceType: input.referenceType ?? null,
-        referenceId: input.referenceId ?? null,
-      },
-    })
+    // EVERY SALES-ORDER EMAIL IS INSERTED UNDER THE ORDER LOCK, WITH THE ERASURE MARKERS READ INSIDE IT. The caller read the
+    // address earlier (from the order); an erasure can commit between that read and this insert, and a row inserted after it would
+    // hold the original address until the reconcile pass removed it. Here the order row is locked (the erasure takes the same
+    // lock), the order's marker and its customer's are read, and the row is inserted in the same transaction: either the erasure
+    // committed first and the enqueue is REFUSED with nothing written, or this commits first and the erasure finds the row and
+    // erases its address. Production only: an injected harness client (tests of the drain) has no order table and is unchanged.
+    if (!options.client && input.referenceType === 'SalesOrder' && input.referenceId) {
+      const orderId = input.referenceId
+      const refused = await db.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "sales_orders" WHERE id = ${orderId} FOR UPDATE`
+        const order = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, customer: { select: { gdprAnonymisedAt: true } } } })
+        if (order?.erasedAt || order?.customer?.gdprAnonymisedAt) return true
+        await tx.emailOutbox.create({ data })
+        return false
+      })
+      return refused ? { queued: false, reason: 'recipient_erased' } : { queued: true }
+    }
+    await client.emailOutbox.create({ data })
     return { queued: true }
   } catch (error) {
     if (isUndeliveredEmailCollision(error)) return { queued: false, reason: 'already_queued' }
@@ -1692,6 +1720,7 @@ export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOption
       // drain. The check below exists to stop a HARNESS sweeping those rows, not to second-guess
       // the production client.
       inMemoryOutboxRows: null,
+      invalidRecipientWriter: writeInvalidRecipientOutcome,
     }
   }
 
@@ -1804,6 +1833,7 @@ export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOption
     logActivity: validated.logActivity as EmailOutboxHarness['logActivity'],
     now: validated.now as EmailOutboxHarness['now'],
     inMemoryOutboxRows,
+    invalidRecipientWriter: null,
   }
 }
 
@@ -1974,6 +2004,7 @@ export async function processPendingEmailOutbox(
     // check below the sweep, and the field's own documentation for why those two are not the same
     // kind of absence.
     inMemoryOutboxRows,
+    invalidRecipientWriter,
   } = resolveEmailOutboxDependencies(options)
 
   const staleCutoff = new Date(now().getTime() - EMAIL_CLAIM_STALE_MS)
@@ -2457,12 +2488,55 @@ export async function processPendingEmailOutbox(
         continue
       }
 
-      const prepared = await prepare(email.kind, email.referenceType, email.referenceId)
+      // THE RECIPIENT CHECK, AFTER THE CLAIM AND BEFORE ANYTHING IS BUILT OR SENT. Three ways a claimed row must not go:
+      // the preparer refuses because the order or customer was erased; the address the order now carries is not the one
+      // queued; or the erasure replaced the stored address while this row was claimed (the confirm below). Each is a
+      // FENCED terminal write that also erases the address from the row, so the refusal itself keeps nothing.
+      const refuseRecipient = async (reason: string): Promise<void> => {
+        const settled = await smtp.settlementWrite(() => settleClaimedEmail(client, claim, {
+          status: 'FAILED',
+          toEmail: ERASED_RECIPIENT_PLACEHOLDER,
+          lastError: reason,
+          processingStartedAt: null,
+        }))
+        if (settled) result.failed++
+        else await recordConflict(claim, 'a recipient refusal', smtp)
+      }
+      let prepared: Awaited<ReturnType<typeof prepare>>
+      try {
+        prepared = await prepare(email.kind, email.referenceType, email.referenceId)
+      } catch (prepareError) {
+        if (prepareError instanceof EmailRecipientErasedError) {
+          await refuseRecipient(EMAIL_RECIPIENT_ERASED_REASON)
+          continue
+        }
+        throw prepareError
+      }
+      // ONLY an erased recipient is refused here. An address edited on a live order after the email was queued keeps the
+      // behaviour it always had (the email goes to `prepared.to`, the live address); the preparer has already refused an
+      // erased order or customer, so a prepared address that is the erasure placeholder is the one remaining signal.
+      if (prepared && normalizeEmail(prepared.to) === normalizeEmail(ERASED_RECIPIENT_PLACEHOLDER)) {
+        await refuseRecipient(EMAIL_RECIPIENT_ERASED_REASON)
+        continue
+      }
       const attachments = prepared?.attachments ?? ((email.attachments as QueuedAttachment[] | null) ?? []).map((attachment) => ({
         filename: attachment.filename,
         content: Buffer.from(attachment.contentBase64, 'base64'),
         contentType: attachment.contentType,
       }))
+
+      // CONFIRM THE STORED RECIPIENT IS STILL THE ONE THIS WORKER READ, immediately before the send: a conditional write
+      // that sets the status the row already has, and matches only while the claim is held AND the address is unchanged. An
+      // erasure that ran during the preparation replaced the address on this claimed row; the confirm then matches nothing
+      // and the row is refused.
+      const confirmed = await client.emailOutbox.updateMany({
+        where: { id: claim.id, status: 'PROCESSING', lockedBy: claim.token, processingStartedAt: claim.claimedAt, toEmail: email.toEmail },
+        data: { status: 'PROCESSING' },
+      })
+      if (confirmed.count === 0) {
+        await refuseRecipient(EMAIL_RECIPIENT_ERASED_REASON)
+        continue
+      }
 
       const sendResult = await smtp.send({
         to: prepared?.to ?? email.toEmail,
@@ -2495,30 +2569,41 @@ export async function processPendingEmailOutbox(
 
       const attempts = email.attempts + 1
       const permanentFailure = reportedPermanent || attempts >= EMAIL_MAX_ATTEMPTS
-      if (invalidRecipient) {
-        const suppressionReason = sendError ?? 'Invalid recipient rejected by SMTP provider'
-        await smtp.suppressionWrite(() => client.emailSuppression.upsert({
-          where: { email: normalizedRecipient },
-          create: {
-            email: normalizedRecipient,
-            reason: suppressionReason,
-            source: 'smtp',
-            lastHitAt: now(),
-          },
-          update: {
-            reason: suppressionReason,
-            source: 'smtp',
-            lastHitAt: now(),
-          },
-        }))
-      }
-      const settled = await smtp.settlementWrite(() => settleClaimedEmail(client, claim, {
+      const settleData = {
         status: permanentFailure ? 'FAILED' : 'PENDING',
         attempts,
         lastError: sendError ?? 'Unknown email error',
         availableAt: permanentFailure ? email.availableAt : new Date(now().getTime() + getBackoffMs(email.attempts)),
         processingStartedAt: null,
-      }))
+      }
+      let settled: boolean
+      if (invalidRecipient && invalidRecipientWriter && email.referenceType === 'SalesOrder' && email.referenceId) {
+        // A SALES-ORDER email on the production queue: the suppression row and the failure are written TOGETHER under the order lock, and
+        // nothing about the address is written if the person was erased (lib/email-outbox-invalid-recipient.ts).
+        const orderId = email.referenceId
+        settled = await smtp.settlementWrite(() => invalidRecipientWriter({
+          orderId, claim, normalizedRecipient, suppressionReason: sendError ?? 'Invalid recipient rejected by SMTP provider', now: now(), settleData,
+        }))
+      } else {
+        if (invalidRecipient) {
+          const suppressionReason = sendError ?? 'Invalid recipient rejected by SMTP provider'
+          await smtp.suppressionWrite(() => client.emailSuppression.upsert({
+            where: { email: normalizedRecipient },
+            create: {
+              email: normalizedRecipient,
+              reason: suppressionReason,
+              source: 'smtp',
+              lastHitAt: now(),
+            },
+            update: {
+              reason: suppressionReason,
+              source: 'smtp',
+              lastHitAt: now(),
+            },
+          }))
+        }
+        settled = await smtp.settlementWrite(() => settleClaimedEmail(client, claim, settleData))
+      }
       // This is the write the issue was raised for: unfenced, it re-armed a row another worker had
       // already settled to SENT, so further copies went out on ordinary drain ticks with no further
       // stale window needed. (The reclaim's OWN cost is bounded separately, by the reclaim cap —

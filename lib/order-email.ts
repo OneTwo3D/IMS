@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { EmailRecipientErasedError } from '@/lib/domain/erasure/email-recipient'
 import { assertNoStoreCreditInvoiceDocument } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import { renderEmailHtml } from '@/lib/email-template'
 import { loadInvoicePdf } from '@/lib/invoice-pdf'
@@ -472,6 +473,13 @@ export async function getAccountingInvoiceQueueData(orderId: string): Promise<Qu
 
 export async function prepareQueuedEmail(kind: string, referenceType: string | null, referenceId: string | null): Promise<PreparedEmail | null> {
   if (referenceType !== 'SalesOrder' || !referenceId) return null
+  // ERASURE GATE, before the kind is even looked at: a kind this function does not prepare returns null and the drain
+  // then sends to the STORED address, so the refusal cannot live inside the per-kind builders.
+  const subject = await db.salesOrder.findUnique({
+    where: { id: referenceId },
+    select: { erasedAt: true, customer: { select: { gdprAnonymisedAt: true } } },
+  })
+  if (subject?.erasedAt || subject?.customer?.gdprAnonymisedAt) throw new EmailRecipientErasedError('The order\'s personal data was erased')
   if (kind === 'SALES_ORDER_CONFIRMATION') return buildSalesOrderConfirmationEmail(referenceId)
   if (kind === 'INVOICE') return buildInvoiceEmail(referenceId)
   if (kind === 'ACCOUNTING_INVOICE') return buildInvoiceEmail(referenceId, { accountingPdf: true })

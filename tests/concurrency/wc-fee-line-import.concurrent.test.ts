@@ -19,7 +19,6 @@ const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const skip = !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1'
 
 // The accounting facade, partially mocked: the settings the import reads and a capture of what it enqueues. Nothing is sent anywhere.
-const queued: Array<{ type: string; referenceId: string; payload: Record<string, unknown> }> = []
 let accountingMocked = false
 async function mockAccounting() {
   if (accountingMocked) return
@@ -28,9 +27,11 @@ async function mockAccounting() {
     namedExports: {
       ...actual,
       getAccountingSettings: async () => ({ connector: 'xero', salesAccount: '200', shippingAccount: '260', discountAccount: '270', reverseChargeSalesTaxType: '' }),
-      queueAccountingSync: async (params: { type: string; referenceId: string; payload: Record<string, unknown> }) => {
-        queued.push({ type: params.type, referenceId: params.referenceId, payload: params.payload })
-        return { queued: true }
+      // The importer enqueues its invoice INSIDE the order-locked transaction. The queue double writes the real accounting_sync_logs row in that
+      // transaction (the connector registry is not configured here), and the test reads the payload back from the row.
+      queueAccountingSyncTxWithOutcome: async (tx: { accountingSyncLog: { create(args: unknown): Promise<unknown> } }, params: { type: string; referenceType: string; referenceId: string; payload: Record<string, unknown>; idempotencyKey?: string }) => {
+        await tx.accountingSyncLog.create({ data: { type: params.type, status: 'PENDING', referenceType: params.referenceType, referenceId: params.referenceId, payload: { ...params.payload, _idempotencyKey: params.idempotencyKey } } })
+        return { queued: true, connector: 'xero' }
       },
     },
   })
@@ -133,9 +134,9 @@ test('[wclc fees] a new import mirrors taxed and untaxed fee lines, persists kin
 
   // The invoice payload handed to accounting: untaxed fees on NONE, taxed fees and goods on the mapped code, and the document
   // (net + rate x net per line) totals what WooCommerce charged.
-  const invoice = queued.find((q) => q.type === 'SALES_INVOICE' && q.referenceId === orderId)
+  const invoice = await db.accountingSyncLog.findFirst({ where: { type: 'SALES_INVOICE', referenceId: orderId! } })
   assert.ok(invoice, 'the sales invoice was handed to accounting')
-  const lines = (invoice.payload.lines as Array<{ description: string; quantity: number; unitAmount: number; taxType?: string }>)
+  const lines = ((invoice.payload as { lines: unknown }).lines as Array<{ description: string; quantity: number; unitAmount: number; taxType?: string }>)
   assert.deepEqual(
     Object.fromEntries(lines.map((l) => [l.description, l.taxType])),
     { Widget: 'OUTPUT2', 'EU Import Duty': 'OUTPUT2', 'EU Customs Fee': 'OUTPUT2', 'Import Duty': 'NONE', 'EU Duty': 'NONE' },

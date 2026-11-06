@@ -116,23 +116,38 @@ export async function upsertCustomer(order: WcFullOrder): Promise<string | null>
     existing = await db.customer.findFirst({ where: { email: cust.email } })
   }
 
+  // A customer matched here can be ERASED at any moment, and a link written to an erased row would put the raw storefront customer
+  // id back on it. So the one write that follows the lookup, the link, runs in a transaction that LOCKS the customer row (the lock
+  // the erasure takes when it claims the row) and re-reads gdprAnonymisedAt immediately before the insert. An erased match
+  // (found erased, or erased since the lookup) is treated as a RETURNING customer: its stale links are removed and a FRESH customer
+  // is created below; the new identity belongs to a new record.
   if (existing) {
-    if (cust.externalCustomerId) {
-      const existingLink = await db.shoppingCustomerLink.findFirst({
-        where: { connector: 'woocommerce', customerId: existing.id },
-        select: { id: true },
-      })
-      if (!existingLink) {
-        await db.shoppingCustomerLink.create({
-          data: {
-            connector: 'woocommerce',
-            customerId: existing.id,
-            externalCustomerId: String(cust.externalCustomerId),
-          },
-        })
+    const matchedId = existing.id
+    const outcome = await db.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<Array<{ gdprAnonymisedAt: Date | null }>>`SELECT "gdprAnonymisedAt" FROM "customers" WHERE "id" = ${matchedId} FOR UPDATE`
+      if (locked[0]?.gdprAnonymisedAt) {
+        await tx.shoppingCustomerLink.deleteMany({ where: { customerId: matchedId } })
+        return 'erased' as const
       }
-    }
-    return existing.id
+      if (cust.externalCustomerId) {
+        const existingLink = await tx.shoppingCustomerLink.findFirst({
+          where: { connector: 'woocommerce', customerId: matchedId },
+          select: { id: true },
+        })
+        if (!existingLink) {
+          await tx.shoppingCustomerLink.create({
+            data: {
+              connector: 'woocommerce',
+              customerId: matchedId,
+              externalCustomerId: String(cust.externalCustomerId),
+            },
+          })
+        }
+      }
+      return 'live' as const
+    })
+    if (outcome === 'live') return matchedId
+    // erased: fall through to a fresh customer
   }
 
   // Create new customer

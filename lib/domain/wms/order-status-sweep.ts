@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
@@ -272,10 +273,24 @@ export async function runWmsOrderStatusSweep(
             lastError: notFoundReason,
           }
 
-      await db.wmsOrderStatusSnapshot.upsert({
-        where: { orderId: order.id },
-        create: { orderId: order.id, ...fields },
-        update: { ...fields, fetchedAt: new Date() },
+      // An erased order keeps its status in the cache but never its tracking number, carrier or deep link: the
+      // warehouse still holds them, and writing them back would undo the erasure on the next sweep.
+      //
+      // THE MARKER IS READ HERE, UNDER THE ORDER LOCK, IN THE SAME TRANSACTION AS THE WRITE. The lookup above is a remote
+      // call that can take seconds; `order.erasedAt` was read before it and an erasure can commit in between. The erasure
+      // takes the same lock, so this write is either wholly before it (and is then scrubbed by it) or wholly after it
+      // (and sees the marker).
+      const erasedNow = await db.$transaction(async (tx) => {
+        await lockSalesOrder(tx, order.id)
+        const current = await tx.salesOrder.findUnique({ where: { id: order.id }, select: { erasedAt: true } })
+        const erased = current?.erasedAt != null
+        const storedFields = erased ? { ...fields, trackingNumber: null, carrier: null, deepLinkUrl: null } : fields
+        await tx.wmsOrderStatusSnapshot.upsert({
+          where: { orderId: order.id },
+          create: { orderId: order.id, ...storedFields },
+          update: { ...storedFields, fetchedAt: new Date() },
+        })
+        return erased
       })
       if (status) updated += 1
 
@@ -296,8 +311,12 @@ export async function runWmsOrderStatusSweep(
       // transient WC failure retries next tick instead of being permanently skipped.
       // Best-effort: a failed push must not fail the status sweep, but it is logged and
       // wcPushedStatus is left unchanged so it's re-attempted.
-      if (status && status.status && status.status !== order.wmsOrderStatus?.wcPushedStatus) {
+      if (status && status.status && !erasedNow && status.status !== order.wmsOrderStatus?.wcPushedStatus) {
         try {
+          // Re-read the marker immediately before the storefront push: an erasure that committed after the snapshot write
+          // above must not be followed by a push built from the lookup.
+          const beforePush = await db.salesOrder.findUnique({ where: { id: order.id }, select: { erasedAt: true } })
+          if (beforePush?.erasedAt) continue
           const { pushWmsOrderStatusToShopping } = await import('@/lib/shopping')
           const pushResult = await pushWmsOrderStatusToShopping(order.id, {
             status: status.status,

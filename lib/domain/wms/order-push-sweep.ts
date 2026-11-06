@@ -2,6 +2,7 @@ import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-cons
 import { STORE_CREDIT_PUSH_WITHHELD_REASON, storeCreditPushMustBeWithheld } from '@/lib/domain/wms/store-credit-push-guard'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { currencyMinorUnits, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { MAX_ADVISORY_PENCE } from './push-total-mismatch-note'
@@ -362,6 +363,8 @@ type OrderForPush = {
   customerName: string | null
   customerEmail: string | null
   customerVatNumber: string | null
+  /** Set once the order's personal data was erased. An erased order is never pushed or amended. */
+  erasedAt?: Date | null
   shippingAddress: unknown
   /** Fallback destination and contact details when the shipping address names no recipient. */
   billingAddress?: unknown
@@ -580,6 +583,7 @@ export const ORDER_PUSH_SELECT = {
   customerName: true,
   customerEmail: true,
   customerVatNumber: true,
+  erasedAt: true,
   shippingAddress: true,
   billingAddress: true,
   shippingService: true,
@@ -665,7 +669,17 @@ export function applyLinkCourierForm(
   return input
 }
 
+/**
+ * Why an erased order is not sent to the warehouse. An erasure must never become an outbound write: the
+ * identity fields are placeholders (or gone), the VAT number is cleared, and a warehouse order created from them
+ * would carry a placeholder recipient. Propagating an erasure to the warehouse is its own piece of work and runs
+ * through the producer seam; until then this refuses, locally, before any payload exists.
+ */
+export const ERASED_ORDER_PUSH_REASON =
+  'This order\'s personal data has been erased, so it is not sent to the warehouse. Nothing was sent.'
+
 export function buildPushInput(order: OrderForPush, externalWarehouseId: string): WmsOrderPushInput {
+  if (order.erasedAt) throw new Error(ERASED_ORDER_PUSH_REASON)
   const recipient = resolvePushRecipient(order)
   // Refuse BEFORE anything is claimed or sent: an empty street is not a destination (builds on local data only).
   if (!recipient.address.address1) throw new Error(NO_DELIVERY_STREET_REASON)
@@ -989,6 +1003,12 @@ export interface WmsOrderPushPort {
   updateLinkIfCreateClaimOwned?(orderId: string, stamp: Date, data: LinkWrite): Promise<boolean>
   /** The order's CURRENT paid and creation times, read fresh (never the candidate snapshot). Absent: the caller falls back to its snapshot. */
   readOrderObligationTimes?(orderId: string): Promise<{ paidAt: Date | null; createdAt: Date | null } | null>
+  /**
+   * The order's CURRENT push fields (the same select the candidate list uses, plus the erasure marker), read under the order
+   * lock in a short transaction at the push boundary. The core builds the payload it sends from THIS, not from the earlier list
+   * read, and refuses an erased order. Absent: the caller uses its snapshot (test doubles). A rejection fails closed.
+   */
+  reloadOrderForPush?(orderId: string): Promise<Partial<OrderForPush> | null>
   /** q66in.4.6: audit-grade timeline row for a connector mutation — must never throw. */
   recordEvent(event: WmsMutationEventInput): Promise<void>
 }
@@ -1868,6 +1888,35 @@ export async function runWmsOrderPushSweepCore(
         continue
       }
 
+      // THE PAYLOAD IS BUILT FROM THE ORDER AS IT IS NOW. `order` is the candidate list's read, taken before the producer seam, the
+      // claim and the withdrawal fence. Immediately before the send the order is read again under its lock: an erased order is
+      // not sent (the claim is given back and the next pass records the refusal), an order that cannot be read is not sent, and
+      // otherwise `input` is rebuilt from the current fields. The gap between this read and the HTTP call is an inter-system race
+      // that cannot be closed from inside IMS.
+      if (port.reloadOrderForPush) {
+        let current: Partial<OrderForPush> | null = null
+        let readFailed = false
+        try { current = await port.reloadOrderForPush(order.id) } catch { readFailed = true }
+        if (readFailed || !current || current.erasedAt) {
+          await port.updateLinkIfCreateClaimOwned?.(order.id, ts, {
+            state: 'PENDING_CREATE', attempts: order.pushAttempts,
+            lastError: current?.erasedAt ? ERASED_ORDER_PUSH_REASON : 'Not sent by IMS: the order could not be re-read before the send.',
+            lastAttemptAt: null,
+          }).catch(() => false)
+          continue
+        }
+        try {
+          input = buildPushInput({ ...order, ...current } as typeof order, externalWarehouseId)
+        } catch {
+          await port.updateLinkIfCreateClaimOwned?.(order.id, ts, {
+            state: 'PENDING_CREATE', attempts: order.pushAttempts,
+            lastError: 'Not sent by IMS: the order, as it stands now, cannot be built into a warehouse payload.',
+            lastAttemptAt: null,
+          }).catch(() => false)
+          continue
+        }
+      }
+
       const beforeCreate = { state: order.pushAttempts > 0 ? 'PENDING_CREATE' : null, attempts: order.pushAttempts }
       // `push` is hoisted so the catch can tell "remote create failed" from "remote
       // create SUCCEEDED but recording the link failed" (Codex r1) — the audit
@@ -2412,6 +2461,12 @@ export async function runWmsOrderPushSweepCore(
       const ts = now()
       let update: Awaited<ReturnType<NonNullable<PushConnector['updateOrder']>>> | null = null
       try {
+        // An erased order is not amended: the pass settles it locally (no remote call, no retry loop) instead of
+        // building a payload from placeholders. Propagating an erasure to the warehouse is separate work.
+        if (link.order.erasedAt) {
+          await port.updateLink(link.id, { lastAttemptAt: ts, pushedAt: ts, lastError: ERASED_ORDER_PUSH_REASON })
+          continue
+        }
         // The amendment asks before anything is built: a shadow touches no link (not even its error note), because the order
         // is amended from the same unchanged link on the sweep that may write.
         //
@@ -2434,7 +2489,22 @@ export async function runWmsOrderPushSweepCore(
           shadowedCount += 1
           continue
         }
-        const input = applyLinkCourierForm(buildPushInput(link.order, externalWarehouseId), link)
+        // The same boundary read as the create: current fields under the order lock, an erased order settled locally, an order
+        // that cannot be read left due (no pushedAt) so the next pass tries again.
+        let amendOrder = link.order
+        if (port.reloadOrderForPush) {
+          const current = await port.reloadOrderForPush(link.order.id).catch(() => undefined)
+          if (current === undefined || current === null) {
+            await port.updateLink(link.id, { lastAttemptAt: ts, lastError: 'Not sent by IMS: the order could not be re-read before the amendment.' })
+            continue
+          }
+          if (current.erasedAt) {
+            await port.updateLink(link.id, { lastAttemptAt: ts, pushedAt: ts, lastError: ERASED_ORDER_PUSH_REASON })
+            continue
+          }
+          amendOrder = { ...link.order, ...current } as typeof link.order
+        }
+        const input = applyLinkCourierForm(buildPushInput(amendOrder, externalWarehouseId), link)
         update = await connector.updateOrder(link.externalOrderId, input, amendSeam.clearance)
         // What the accepted order post did to the courier is settled here (form recorded, review flag, warehouse note); the same
         // settlement runs when the item reconcile fails AFTER the post was accepted (see the catch below).
@@ -3153,6 +3223,12 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     },
     async readOrderObligationTimes(orderId) {
       return db.salesOrder.findUnique({ where: { id: orderId }, select: { paidAt: true, createdAt: true } })
+    },
+    async reloadOrderForPush(orderId) {
+      return db.$transaction(async (tx) => {
+        await lockSalesOrder(tx, orderId)
+        return tx.salesOrder.findUnique({ where: { id: orderId }, select: ORDER_PUSH_SELECT }) as Promise<Partial<OrderForPush> | null>
+      })
     },
     async updateLinkIfCreateClaimOwned(orderId, stamp, data) {
       const { count } = await db.wmsOrderPushLink.updateMany({

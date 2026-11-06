@@ -1,3 +1,4 @@
+import { gateAccountingPayloadContact } from '@/lib/domain/erasure/contact-gate'
 import { reportUnrecordedShadow } from '@/lib/domain/outbound-shadow/unrecorded'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
@@ -83,7 +84,7 @@ export type CreateAccountingSyncLogRowResult<T> =
 
 export async function createAccountingSyncLogRow<T extends { id: string }>(
   client: SyncLogRowClient,
-  data: Prisma.AccountingSyncLogUncheckedCreateInput,
+  rawData: Prisma.AccountingSyncLogUncheckedCreateInput,
   options?: {
     /**
      * Wrap the INSERT itself in a savepoint — for a caller that expects a unique-index collision and handles
@@ -92,6 +93,9 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
     createInSavepoint?: boolean
   },
 ): Promise<CreateAccountingSyncLogRowResult<T>> {
+  // THE ERASURE GATE ON THE CONTACT BLOCK, at the one place a sync row is written (see lib/domain/erasure/contact-gate.ts): an erased
+  // order's row never carries the contact name or email, whatever the caller read before it got here.
+  const data = await gateAccountingPayloadContact(client, rawData)
   const key = accountingPostingKeyForRow({
     type: String(data.type),
     referenceType: data.referenceType,

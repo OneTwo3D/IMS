@@ -2025,6 +2025,9 @@ model SalesOrder {
 
   notes             String?     // customer-visible notes
   internalNotes     String?     // private/staff notes
+  /// Set once, under the order row lock, when the order's personal data was erased. A non-null value is the POSITIVE marker the
+  /// inbound importers check before writing identity columns back, so a later sync cannot re-populate an erased order.
+  erasedAt          DateTime?
 
   externalCreatedAt DateTime?        // order date in shopping connector
   externalUpdatedAt DateTime?

@@ -2,6 +2,10 @@
  * WooCommerce → IMS order import.
  */
 
+import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain/erasure/erase-personal-data'
+import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
+import { ERASURE_PLACEHOLDER_NAME, ERASURE_RECORD_ACTION, ERASURE_RECORD_DESCRIPTION, buildErasureRecordMetadata } from '@/lib/domain/erasure/erasure-record'
+import { randomUUID } from 'node:crypto'
 import { createHash } from 'node:crypto'
 import { currentTaxRates, lockOrderNamedTaxRate, resolveLinesTaxRates } from '@/lib/tax/writable-tax-rate'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
@@ -13,7 +17,7 @@ import {
   registerReceiptAndProveObligation,
 } from '@/lib/domain/accounting/receipt-registration-sweep'
 import { usableStoredFxRate } from '@/lib/currencies/stored-document-rate'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { activeAccountingConnectorForReport, postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { accountingPostingKey } from '@/lib/accounting/posting-key'
@@ -30,6 +34,7 @@ import { STORE_CREDIT_INVOICE_WITHHELD_ACTION, STORE_CREDIT_REVIEW_ACTION, store
 import { countSalesInvoiceRowsThatMayHavePosted, decideStoredInvoiceNumberUpdate, resolveWcAccountingInvoiceNumber } from './invoice-number'
 import {
   buildHeldSalesInvoicePayload,
+  type HeldSalesInvoicePayload,
   buildReleasedSalesInvoicePayload,
   heldSalesInvoiceChartConnector,
   HELD_SALES_INVOICE_RECORD_KIND,
@@ -1039,8 +1044,8 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
         method: wcOrder.payment_method_title || wcOrder.payment_method || null,
         reference: wcOrder.transaction_id || null,
         notes: existing.length > 0
-          ? 'Recorded from WooCommerce (paid later than the import): the part of the order total not already covered by earlier receipts'
-          : 'Recorded from WooCommerce (the order was imported unpaid and paid later)',
+          ? WC_RECEIPT_NOTE_PAID_LATER_PARTIAL
+          : WC_RECEIPT_NOTE_PAID_LATER,
         paidAt,
         paidAtExplicitInstant: paidAt, // WooCommerce's GMT paid instant is an explicit instant, midnight included (the FX report reads a stored midnight by this)
         settlementRateToBase: settlementRate,
@@ -1202,6 +1207,14 @@ async function updateExistingWcOrderCore(
         reviewFlagged = flagged.count === 1
       }
     }
+    // ERASURE GUARD. Under the order row lock — the same lock the erasure takes before it writes — read whether
+    // this order's personal data was erased. An erased order must not have identity written back onto it by a
+    // routine redelivery: WooCommerce still holds the original (the erasure started elsewhere), so without this
+    // the very next order.updated would undo the erasure silently. Only the identity columns are withheld; the
+    // rest of the update (shipping, paid state, order number) proceeds exactly as before.
+    await lockSalesOrder(tx, orderId)
+    const erasure = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true } })
+    const erased = erasure?.erasedAt != null
     await tx.shoppingOrderLink.updateMany({
       where: {
         connector: 'woocommerce',
@@ -1209,16 +1222,15 @@ async function updateExistingWcOrderCore(
       },
       data: {
         externalOrderNumber: wcOrder.number,
-        metadata: {
-          externalOrderKey: wcOrder.order_key,
-        },
+        // The order key is the capability behind the storefront's invoice link, so an erased order does not get it back.
+        ...(erased ? {} : { metadata: { externalOrderKey: wcOrder.order_key } }),
       },
     })
     await tx.salesOrder.update({
       where: { id: orderId },
       data: {
         externalOrderNumber: wcOrder.number,
-        customerVatNumber: readWcCustomerVat(wcOrder),
+        ...(erased ? {} : { customerVatNumber: readWcCustomerVat(wcOrder) }),
         // The shipping label, method id and courier key are refreshed TOGETHER from the CURRENT first shipping line (the key
         // only while its stored label still matches the line's title, so an edited line clears it), and fill in orders imported
         // before they were kept. Stored values only: a WMS order already created is amended by the push sweep's amendment pass,
@@ -1229,9 +1241,13 @@ async function updateExistingWcOrderCore(
         // The wclc duty/tax/handling components are written ONLY when the order and its lines are created: they split
         // the fee lines stored with them (and the invoice posted from those lines), and this path rebuilds no lines.
         // Refreshing them from a later delivery would leave a split that disagrees with the lines it describes.
-        billingAddress: mapWcAddress(wcOrder.billing),
-        shippingAddress: mapWcAddress(wcOrder.shipping),
-        notes: wcOrder.customer_note || null,
+        ...(erased
+          ? {}
+          : {
+              billingAddress: mapWcAddress(wcOrder.billing),
+              shippingAddress: mapWcAddress(wcOrder.shipping),
+              notes: wcOrder.customer_note || null,
+            }),
         paidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? parseWcGmtInstant(wcOrder.date_paid_gmt) : undefined,
         // o3d-psrx r2 — THE PAID FLAG'S PROVENANCE, WRITTEN BY THE SAME STATEMENT THAT SETS IT.
         //
@@ -1455,41 +1471,46 @@ async function holdWcSalesInvoiceForMissingNumber(params: {
   /** o3d-j625: the chart the frozen account codes came from, parked with them. */
   chartConnector: AccountingConnectorId | null
 }): Promise<void> {
-  const held = buildHeldSalesInvoicePayload({
-    externalOrderId: String(params.wcOrder.id),
-    externalOrderNumber: params.wcOrder.number,
-    salesOrderId: params.salesOrderId,
-    orderNumber: params.orderNumber,
-    metaKey: params.metaKey,
-    accountingPayload: params.accountingPayload,
-    chartConnector: params.chartConnector,
-  })
-  const jsonPayload = JSON.parse(JSON.stringify(held)) as Prisma.InputJsonValue
-  const data = {
-    connector: 'woocommerce',
-    direction: 'FROM_CONNECTOR' as const,
-    status: 'PENDING' as const,
-    entityType: 'SalesOrder',
-    entityId: params.salesOrderId,
-    externalId: String(params.wcOrder.id),
-    // o3d-xnwu r8: the hold names its own family, so it is neither admitted by the refund-park
-    // predicate (which would offer refund recoveries on an invoice) nor able to select a park.
-    recordKind: HELD_SALES_INVOICE_RECORD_KIND,
-    payload: jsonPayload,
-    errorMessage: `Waiting for ${params.metaKey} on WooCommerce order ${params.wcOrder.number} before the sales invoice can be posted.`,
-    syncedAt: null,
-  }
-
-  const existing = await db.shoppingSyncLog.findFirst({
-    where: heldSalesInvoiceQueueWhere({ salesOrderId: params.salesOrderId }),
-    orderBy: { createdAt: 'desc' },
-    select: { id: true },
-  })
-  if (existing) {
-    await db.shoppingSyncLog.update({ where: { id: existing.id }, data })
-  } else {
-    await db.shoppingSyncLog.create({ data })
-  }
+  // One order-locked transaction: the marker is read under the lock and the parked contact block is the real one or the placeholder
+  // accordingly, so an erasure between the order create and this park cannot leave identity in the hold.
+  await db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, params.salesOrderId)
+    const erased = await orderIsErasedInTx(tx, params.salesOrderId)
+    const held = buildHeldSalesInvoicePayload({
+      externalOrderId: String(params.wcOrder.id),
+      externalOrderNumber: params.wcOrder.number,
+      salesOrderId: params.salesOrderId,
+      orderNumber: params.orderNumber,
+      metaKey: params.metaKey,
+      accountingPayload: erased ? scrubContactInAccountingPayload(params.accountingPayload) : params.accountingPayload,
+      chartConnector: params.chartConnector,
+    })
+    const jsonPayload = JSON.parse(JSON.stringify(held)) as Prisma.InputJsonValue
+    const data = {
+      connector: 'woocommerce',
+      direction: 'FROM_CONNECTOR' as const,
+      status: 'PENDING' as const,
+      entityType: 'SalesOrder',
+      entityId: params.salesOrderId,
+      externalId: String(params.wcOrder.id),
+      // o3d-xnwu r8: the hold names its own family, so it is neither admitted by the refund-park
+      // predicate (which would offer refund recoveries on an invoice) nor able to select a park.
+      recordKind: HELD_SALES_INVOICE_RECORD_KIND,
+      payload: jsonPayload,
+      errorMessage: `Waiting for ${params.metaKey} on WooCommerce order ${params.wcOrder.number} before the sales invoice can be posted.`,
+      syncedAt: null,
+    }
+    const existing = await tx.shoppingSyncLog.findFirst({
+      where: heldSalesInvoiceQueueWhere({ salesOrderId: params.salesOrderId }),
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+    })
+    if (existing) {
+      await tx.shoppingSyncLog.update({ where: { id: existing.id }, data })
+    } else {
+      await tx.shoppingSyncLog.create({ data })
+    }
+  }, { maxWait: 5_000, timeout: 20_000 })
 }
 
 /**
@@ -1596,7 +1617,7 @@ async function releaseHeldWcSalesInvoice(
     return 'unreadable'
   }
 
-  const held = row.payload
+  const held: HeldSalesInvoicePayload = row.payload
   const idempotencyKey = `wc-held-sales-invoice:${orderId}:${invoiceNumber}`
   // o3d-j625 r2 (Codex HIGH 1/HIGH 2) — A HOLD THAT CANNOT NAME ITS CHART IS NOT RELEASED.
   //
@@ -1642,23 +1663,41 @@ async function releaseHeldWcSalesInvoice(
   // disconnected, its sync is switched off") for a REFUSAL. A refusal is a retired chart, and telling an
   // operator to check a toggle sends them somewhere the answer is not.
   const enqueueOutcome: { outcome?: EnqueueOutcomeLike } = {}
-  // o3d-j625 r6 (review M1): the release's enqueue identity, ONCE — the enqueue below and the refusal row's
-  // fallback key both read it, so the two cannot name different postings.
+  // The release's posting identity, ONCE: the in-transaction enqueue below and the refusal row's fallback key both read it, so
+  // the two cannot name different postings. (The payload actually queued is built inside the locked transaction.)
   const releaseIdentity = {
     type: 'SALES_INVOICE' as const,
     referenceType: 'SalesOrder',
     referenceId: orderId,
-    payload: buildReleasedSalesInvoicePayload(held, invoiceNumber),
     idempotencyKey,
   }
+  // o3d-j625 r6 (review M1): the release's enqueue identity, ONCE — the enqueue below and the refusal row's
+  // fallback key both read it, so the two cannot name different postings.
   try {
-    const { queueAccountingSync } = await import('@/lib/accounting')
-    enqueueOutcome.outcome = await queueAccountingSync({
-      ...releaseIdentity,
-      // o3d-j625: route by the chart FROZEN with this payload, not by whatever is active at release
-      // time. A hold that cannot name one never gets here — it is refused above.
-      chartConnector: heldChartConnector,
-    })
+    // ONE ORDER-LOCKED TRANSACTION: the erasure marker is read under the order lock, the payload is built from that answer (the
+    // parked contact when the order is not erased, the placeholder when it is), and the accounting row is inserted, all
+    // inside it. The erasure takes the same lock, so there is no interleaving: it either committed first (and this sees it) or
+    // runs after this commits (and scrubs the row this queued). Any failure rolls the whole thing back: the hold stays PENDING
+    // and the sweep retries it. There is no after-the-fact scrub.
+    const { queueAccountingSyncTxWithOutcome } = await import('@/lib/accounting')
+    enqueueOutcome.outcome = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
+      const subject = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, customer: { select: { gdprAnonymisedAt: true } } } })
+      const erased = Boolean(subject?.erasedAt || subject?.customer?.gdprAnonymisedAt)
+      const releasable = erased ? { ...held, accountingPayload: scrubContactInAccountingPayload(held.accountingPayload) } : held
+      return queueAccountingSyncTxWithOutcome(tx, {
+        type: 'SALES_INVOICE',
+        referenceType: 'SalesOrder',
+        referenceId: releaseIdentity.referenceId,
+        payload: buildReleasedSalesInvoicePayload(releasable, invoiceNumber),
+        idempotencyKey: releaseIdentity.idempotencyKey,
+        // o3d-j625: route by the chart FROZEN with this payload, not by whatever is active at release
+        // time. A hold that cannot name one never gets here — it is refused above.
+        chartConnector: heldChartConnector,
+        // The facade recorded a refusal as outstanding work in the exception inbox; the in-transaction enqueue is asked to do the same.
+        recordRefusalAsOutstanding: true,
+      })
+    }, { maxWait: 5_000, timeout: 20_000 })
   } catch (error) {
     // Left PENDING on purpose — the release sweep retries it (see retryHeldWcSalesInvoiceReleases).
     await noteHeldReleaseFailure(
@@ -2757,6 +2796,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const headerRateWasActive = taxRateName ? (await db.taxRate.findFirst({ where: { name: taxRateName, active: true }, select: { id: true } })) !== null : false
     // Create the sales order
     let so
+    let linkCustomerId: string | null = customerId
+    let customerErasedDuringImport: string | null = null
     try {
       so = await db.$transaction(async (tx) => {
         // The rates this order rests on are locked FIRST, in one statement in id order (lib/tax/writable-tax-rate.ts): the lines' rates and the ACTIVE rate the header names (the tax import's
@@ -2765,6 +2806,22 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         await lockOrderNamedTaxRate(tx, taxRateName, { lineRateIds: lineData.map((l) => l.taxRateId), allowMissing: !headerRateWasActive })
         // A mapped rate that a tax re-key retired follows its replacement (lenient: an inbound order is never lost over an operator-deactivated rate); under the row share lock the apply waits on.
         await resolveLinesTaxRates(tx, lineData, { lenient: true })
+        // CUSTOMER ERASURE GUARD. `upsertCustomer` ran before this transaction, so the customer it returned can have been
+        // anonymised since. The row is locked here (the erasure claims it with an UPDATE, which takes the same lock) and
+        // re-read: an erased customer is never linked to a new order. The erasure either committed first, and this sees it,
+        // or is queued behind this lock and then finds the new order under the customer and erases it.
+        linkCustomerId = customerId
+        if (customerId) {
+          const locked = await tx.$queryRaw<Array<{ gdprAnonymisedAt: Date | null }>>`SELECT "gdprAnonymisedAt" FROM "customers" WHERE "id" = ${customerId} FOR UPDATE`
+          if (locked[0]?.gdprAnonymisedAt) {
+            linkCustomerId = null
+            customerErasedDuringImport = customerId
+          }
+        }
+        // The customer was erased between the lookup and this lock: the order is created ALREADY ERASED, in this same transaction.
+        // Its money stays in the books (it is created, with its lines, totals and tax); the identity is never written.
+        const erasedOnCreate = customerErasedDuringImport !== null
+        const erasedAt = new Date()
         const created = await tx.salesOrder.create({
         data: {
           externalOrderNumber: wcOrder.number,
@@ -2785,13 +2842,17 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           shipFromWarehouseId: wcDefaultWarehouseId,
           currency,
           fxRateToBase: fxRate,
-          customerId,
-          customerName,
-          customerEmail: wcOrder.billing.email || null,
-          customerVatNumber: readWcCustomerVat(wcOrder),
+          customerId: linkCustomerId,
+          ...(erasedOnCreate
+            ? { customerName: ERASURE_PLACEHOLDER_NAME, erasedAt }
+            : {
+                customerName,
+                customerEmail: wcOrder.billing.email || null,
+                customerVatNumber: readWcCustomerVat(wcOrder),
+                billingAddress: mapWcAddress(wcOrder.billing),
+                shippingAddress: mapWcAddress(wcOrder.shipping),
+              }),
           ...wclcComponentColumns(wcOrder),
-          billingAddress: mapWcAddress(wcOrder.billing),
-          shippingAddress: mapWcAddress(wcOrder.shipping),
           subtotalForeign,
           shippingService: shipping.shippingService,
           courierKey: shipping.courierKey,
@@ -2821,7 +2882,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // imported today looks, to any cutoff, like a pre-fix order. The corrective
           // backfill refuses to reinterpret an amount whose model it cannot establish.
           discountModel: 'LINE_ALLOCATED',
-          notes: wcOrder.customer_note || null,
+          notes: erasedOnCreate ? null : (wcOrder.customer_note || null),
           paidAt: wcOrder.date_paid_gmt ? parseWcGmtInstant(wcOrder.date_paid_gmt) : null,
           // o3d-psrx r2 — the initial import's half of the same fact, in the same CREATE.
           //
@@ -2838,9 +2899,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
               connector: 'woocommerce',
               externalOrderId: String(wcOrder.id),
               externalOrderNumber: wcOrder.number,
-              metadata: {
-                externalOrderKey: wcOrder.order_key,
-              },
+              // The order key is the capability behind the storefront's invoice link: an order created erased does not get it.
+              ...(erasedOnCreate ? {} : { metadata: { externalOrderKey: wcOrder.order_key } }),
             },
           },
           lines: { create: lineData },
@@ -2862,7 +2922,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
               currency,
               method: wcOrder.payment_method_title || wcOrder.payment_method || null,
               reference: wcOrder.transaction_id || null,
-              notes: 'Imported from WooCommerce (paid when the order was imported)',
+              notes: WC_RECEIPT_NOTE_IMPORTED_PAID,
               paidAt: parseWcGmtInstant(wcOrder.date_paid_gmt as string),
               paidAtExplicitInstant: parseWcGmtInstant(wcOrder.date_paid_gmt as string), // an explicit instant, midnight included
               settlementRateToBase: importedReceiptSettlementRate === null ? null : Math.round(importedReceiptSettlementRate * 1e8) / 1e8,
@@ -2881,6 +2941,29 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         // permanently (Codex review).
         if (isFulfilmentStatus(lifecycleStatus)) {
           await tx.activityLog.create({ data: directCreateMarker(created.id, lifecycleStatus) })
+        }
+        if (erasedOnCreate) {
+          // The customer's ORIGINAL erasure request (its proof row, read under the customer lock held above): this order's record links to it.
+          const original = await tx.activityLog.findFirst({
+            where: { entityType: 'CUSTOMER', entityId: customerErasedDuringImport!, action: ERASURE_RECORD_ACTION },
+            orderBy: { createdAt: 'asc' },
+            select: { metadata: true },
+          })
+          const originalRequestId = (original?.metadata as { requestId?: unknown } | null)?.requestId
+          const originalErasureRequestId = typeof originalRequestId === 'string' ? originalRequestId : null
+          // The name-free proof, as an erasure of this order: the request is the customer's earlier one; the scope is this order.
+          await logActivityInTransaction(tx, {
+            entityType: 'SALES_ORDER',
+            entityId: created.id,
+            tag: 'sales',
+            action: ERASURE_RECORD_ACTION,
+            description: ERASURE_RECORD_DESCRIPTION,
+            metadata: buildErasureRecordMetadata({
+              requestId: originalErasureRequestId ?? randomUUID(), erasedAt, trigger: 'IMPORT_AFTER_ERASURE', customerId: customerErasedDuringImport!, orderIds: [created.id],
+              counts: { customers: 0, salesOrders: 1, shipments: 0, shoppingCustomerLinks: 0, shoppingOrderLinks: 1, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, linkedFreeTextScrubbed: 0, activityRowsScrubbed: 0, notifications: 0 },
+            }),
+            userId: null,
+          })
         }
         return created
       }, { maxWait: 5_000, timeout: 20_000 })
@@ -2912,6 +2995,19 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         return { success: true, orderId: concurrent.id }
       }
       throw error
+    }
+
+    if (customerErasedDuringImport) {
+      // Recorded without any identity: the order id, the customer's surrogate id, and what was done.
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: so.id,
+        action: 'order_created_unlinked_customer_erased',
+        tag: 'sync',
+        level: 'WARNING',
+        description: 'The customer this WooCommerce order matched was erased while the order was being imported, so the order was created already erased and without a customer link.',
+        metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), erasedCustomerId: customerErasedDuringImport },
+      })
     }
 
     if (taxFallbackLines.length > 0) {
@@ -3018,7 +3114,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       : `Accounting sales invoice HELD — ${invoiceNumberResolution.reason}`
 
     try {
-      const { queueAccountingSync, getAccountingSettings } = await import('@/lib/accounting')
+      const { queueAccountingSyncTxWithOutcome, getAccountingSettings } = await import('@/lib/accounting')
       const settings = await getAccountingSettings()
       // o3d-cyn: EVERY component of this document is tax-EXCLUSIVE, on both WC price conventions,
       // and it is sent that way — see `resolveWcAccountingAmountConvention`.
@@ -3199,17 +3295,27 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       }
 
       if (invoiceNumberResolution.ok) {
-        const enqueued = await queueAccountingSync({
-          type: 'SALES_INVOICE',
-          referenceType: 'SalesOrder',
-          referenceId: so.id,
-          payload: { invoiceNumber: invoiceNumberResolution.invoiceNumber, ...accountingPayload },
-          // o3d-j625: every `accountCode` in `accountingPayload` is `settings.*` from the single read
-          // above, and the import does a great deal of work between the two — the amount-convention
-          // resolution, the per-line tax mapping, the invoice-number resolution. Routed by the chart's
-          // own connector so the row cannot be the other connector's.
-          chartConnector: settings.connector,
-        })
+        // ONE ORDER-LOCKED TRANSACTION (as the held release): the erasure marker is read under the order lock, the contact block is the
+        // real one or the placeholder accordingly, and the row is inserted, all inside it. An erasure that commits between the order
+        // create and this enqueue is therefore seen; one that runs after it finds the row and scrubs it. A failure rolls back and is
+        // reported by the enclosing catch exactly as a failed enqueue was.
+        const enqueued = await db.$transaction(async (tx) => {
+          await lockSalesOrder(tx, so.id)
+          const erased = await orderIsErasedInTx(tx, so.id)
+          const postable = erased ? scrubContactInAccountingPayload(accountingPayload) : accountingPayload
+          return queueAccountingSyncTxWithOutcome(tx, {
+            type: 'SALES_INVOICE',
+            referenceType: 'SalesOrder',
+            referenceId: so.id,
+            payload: { invoiceNumber: invoiceNumberResolution.invoiceNumber, ...postable },
+            // o3d-j625: every `accountCode` in `accountingPayload` is `settings.*` from the single read
+            // above, and the import does a great deal of work between the two — the amount-convention
+            // resolution, the per-line tax mapping, the invoice-number resolution. Routed by the chart's
+            // own connector so the row cannot be the other connector's.
+            chartConnector: settings.connector,
+            recordRefusalAsOutstanding: true,
+          })
+        }, { maxWait: 5_000, timeout: 20_000 })
         // o3d-j625 r3 (Codex HIGH 1 family) — THE ANSWER IS READ, which on this arm nothing did.
         //
         // The enclosing `catch` only sees THROWS. A refusal returned cleanly, and the import then wrote

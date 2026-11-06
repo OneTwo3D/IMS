@@ -4,7 +4,8 @@ import { revalidatePath } from 'next/cache'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
+import { eraseCustomerPersonalData } from '@/lib/domain/erasure/erase-personal-data'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { toIsoCountryCode } from '@/lib/countries'
 import {
@@ -16,6 +17,7 @@ import {
   type CsvImportActionResult,
 } from '@/lib/csv-import'
 
+const ANONYMISED_CUSTOMER_REFUSAL = 'This customer has been anonymised and cannot be changed'
 const MAX_IMPORT_BYTES = 10 * 1024 * 1024
 const MAX_IMPORT_ROWS = 10_000
 
@@ -255,10 +257,13 @@ export async function getCustomerDetail(id: string): Promise<CustomerDetail | nu
 }
 
 export async function createCustomer(input: CustomerInput): Promise<{ success: boolean; customer?: CustomerRow; error?: string }> {
-  await requirePermission('sales.create')
+  const session = await requirePermission('sales.create')
   try {
     if (!input.firstName?.trim()) return { success: false, error: 'First name is required' }
-    const c = await db.customer.create({
+    // THE ROW AND ITS NAME-BEARING ACTIVITY RECORD COMMIT TOGETHER: an erasure that follows either finds both, and one that is
+    // already running holds the customer lock this create has not yet been able to take (the row is new, so there is no race).
+    const c = await db.$transaction(async (tx) => {
+      const created = await tx.customer.create({
       data: {
         firstName: input.firstName,
         lastName: input.lastName || '',
@@ -271,10 +276,12 @@ export async function createCustomer(input: CustomerInput): Promise<{ success: b
         notes: input.notes || null,
       },
       include: { _count: { select: { salesOrders: true } } },
+      })
+      await logActivityInTransaction(tx, { entityType: 'CUSTOMER', entityId: created.id, tag: 'sales', action: 'created', description: `Created customer: ${[input.firstName, input.lastName].filter(Boolean).join(' ')}`, userId: session.user.id ?? null })
+      return created
     })
     revalidatePath('/sales/contacts')
     revalidatePath('/sales')
-    await logActivity({ entityType: 'CUSTOMER', entityId: c.id, tag: 'sales', action: 'created', description: `Created customer: ${[input.firstName, input.lastName].filter(Boolean).join(' ')}` })
     return { success: true, customer: mapCustomer(c) }
   } catch (e) {
     await logActivity({ entityType: 'CUSTOMER', tag: 'sales', action: 'created', level: 'ERROR', description: `Failed to create customer: ${String(e)}` })
@@ -283,10 +290,16 @@ export async function createCustomer(input: CustomerInput): Promise<{ success: b
 }
 
 export async function updateCustomer(id: string, input: Partial<CustomerInput> & { active?: boolean }): Promise<{ success: boolean; error?: string }> {
-  await requirePermission('sales.create')
+  const session = await requirePermission('sales.create')
   try {
-    await db.customer.update({
-      where: { id },
+    // CONDITIONAL WRITE: an anonymised customer is never written to, and the condition is part of the statement, so a
+    // read that went stale between the page load and this save cannot slip through.
+    // THE CONDITIONAL UPDATE AND THE NAME-BEARING ACTIVITY ROW COMMIT TOGETHER. The update takes the customer row lock and holds
+    // it until the row exists, so an erasure either runs first (this updates nothing and writes nothing) or blocks on that lock
+    // until the row is committed and then finds it, and scrubs it.
+    const written = await db.$transaction(async (tx) => {
+      const result = await tx.customer.updateMany({
+      where: { id, gdprAnonymisedAt: null },
       data: {
         ...(input.firstName !== undefined && { firstName: input.firstName }),
         ...(input.lastName !== undefined && { lastName: input.lastName || '' }),
@@ -299,10 +312,18 @@ export async function updateCustomer(id: string, input: Partial<CustomerInput> &
         ...(input.notes !== undefined && { notes: input.notes || null }),
         ...(input.active !== undefined && { active: input.active }),
       },
+      })
+      if (result.count > 0) {
+        await logActivityInTransaction(tx, { entityType: 'CUSTOMER', entityId: id, tag: 'sales', action: 'updated', description: `Updated customer: ${input.firstName ?? ''}${input.lastName ? ' ' + input.lastName : ''}`.trim(), userId: session.user.id ?? null })
+      }
+      return result
     })
+    if (written.count === 0) {
+      const exists = await db.customer.findUnique({ where: { id }, select: { gdprAnonymisedAt: true } })
+      return { success: false, error: exists?.gdprAnonymisedAt ? ANONYMISED_CUSTOMER_REFUSAL : 'Customer not found' }
+    }
     revalidatePath('/sales/contacts')
     revalidatePath('/sales')
-    await logActivity({ entityType: 'CUSTOMER', entityId: id, tag: 'sales', action: 'updated', description: `Updated customer: ${input.firstName ?? ''}${input.lastName ? ' ' + input.lastName : ''}`.trim() })
     return { success: true }
   } catch (e) {
     await logActivity({ entityType: 'CUSTOMER', entityId: id, tag: 'sales', action: 'updated', level: 'ERROR', description: `Failed to update customer: ${String(e)}` })
@@ -340,12 +361,15 @@ export async function importContactsCsv(formData: FormData): Promise<CsvImportAc
         company: true,
         billingAddress: true,
         shippingAddress: true,
+        gdprAnonymisedAt: true,
       },
     })
     const byId = new Map(customers.map((customer) => [customer.id, customer]))
     const byEmail = new Map<string, typeof customers>()
     const byIdentity = new Map<string, typeof customers>()
     for (const customer of customers) {
+      // An anonymised contact carries placeholders, never matches a row by email or name, and is never updated.
+      if (customer.gdprAnonymisedAt) continue
       if (customer.email) {
         const key = customer.email.trim().toLowerCase()
         byEmail.set(key, [...(byEmail.get(key) ?? []), customer])
@@ -400,12 +424,17 @@ export async function importContactsCsv(formData: FormData): Promise<CsvImportAc
       }
 
       try {
+        if (existing && existing.gdprAnonymisedAt) {
+          errors.push(`Row ${lineNum}: ${ANONYMISED_CUSTOMER_REFUSAL}`)
+          skipped++
+          continue
+        }
         if (existing) {
           const billingAddress = mergeImportedAddress(r, 'billing', existing.billingAddress as AddressData | null)
           const shippingAddress = mergeImportedAddress(r, 'shipping', existing.shippingAddress as AddressData | null)
           if (!preview) {
-            await db.customer.update({
-              where: { id: existing.id },
+            const written = await db.customer.updateMany({
+              where: { id: existing.id, gdprAnonymisedAt: null },
               data: {
                 ...(firstName ? { firstName } : {}),
                 ...(lastName ? { lastName } : {}),
@@ -418,6 +447,11 @@ export async function importContactsCsv(formData: FormData): Promise<CsvImportAc
                 ...(r.notes?.trim() ? { notes: r.notes.trim() } : {}),
               },
             })
+            if (written.count === 0) {
+              errors.push(`Row ${lineNum}: ${ANONYMISED_CUSTOMER_REFUSAL}`)
+              skipped++
+              continue
+            }
           }
           updated++
         } else {
@@ -479,69 +513,9 @@ export async function importContactsCsv(formData: FormData): Promise<CsvImportAc
 }
 
 export async function anonymiseCustomer(customerId: string): Promise<{ success: boolean; error?: string }> {
-  await requirePermission('sync')
-  try {
-    const customer = await db.customer.findUnique({
-      where: { id: customerId },
-      include: { salesOrders: { select: { id: true } } },
-    })
-    if (!customer) return { success: false, error: 'Customer not found' }
-    if (customer.gdprAnonymisedAt) return { success: false, error: 'Customer already anonymised' }
-
-    const customerName = [customer.firstName, customer.lastName].filter(Boolean).join(' ')
-
-    // Anonymise customer record
-    await db.customer.update({
-      where: { id: customerId },
-      data: {
-        firstName: 'GDPR',
-        lastName: 'Anonymised',
-        email: null,
-        phone: null,
-        company: null,
-        taxNumber: null,
-        billingAddress: Prisma.JsonNull,
-        shippingAddress: Prisma.JsonNull,
-        notes: null,
-        externalCustomerId: null,
-        active: false,
-        gdprAnonymisedAt: new Date(),
-      },
-    })
-
-    // Anonymise linked sales orders
-    if (customer.salesOrders.length > 0) {
-      await db.salesOrder.updateMany({
-        where: { customerId },
-        data: {
-          customerName: 'GDPR Anonymised',
-          customerEmail: null,
-          billingAddress: Prisma.JsonNull,
-          shippingAddress: Prisma.JsonNull,
-          notes: null,
-        },
-      })
-    }
-
-    await logActivity({
-      entityType: 'CUSTOMER',
-      entityId: customerId,
-      tag: 'sales',
-      action: 'gdpr_anonymised',
-      description: `GDPR anonymised customer: ${customerName} (${customer.salesOrders.length} orders anonymised)`,
-    })
-
-    revalidatePath('/sales/contacts')
-    return { success: true }
-  } catch (e) {
-    await logActivity({
-      entityType: 'CUSTOMER',
-      entityId: customerId,
-      tag: 'sales',
-      action: 'gdpr_anonymised',
-      level: 'ERROR',
-      description: `Failed to GDPR anonymise customer: ${String(e)}`,
-    })
-    return { success: false, error: String(e) }
-  }
+  const session = await requirePermission('sync')
+  // The erasure itself, and its name-free proof, live in one place: see lib/domain/erasure.
+  const result = await eraseCustomerPersonalData(customerId, { trigger: 'ON_REQUEST', userId: session.user.id ?? null })
+  if (result.success) revalidatePath('/sales/contacts')
+  return result.success ? { success: true } : { success: false, error: result.error }
 }
