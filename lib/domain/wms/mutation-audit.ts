@@ -92,10 +92,10 @@ function toJson(value: unknown): object | undefined {
 
 /** The row `recordWmsMutationEvent` writes, for a caller that must write it INSIDE its own transaction and fail with it. */
 export function buildWmsMutationEventRow(input: WmsMutationEventInput) {
-  return toRow(input)
+  return toWmsMutationEventRow(input)
 }
 
-function toRow(input: WmsMutationEventInput) {
+export function toWmsMutationEventRow(input: WmsMutationEventInput) {
   return {
     connector: input.connector,
     direction: input.direction,
@@ -117,7 +117,7 @@ function toRow(input: WmsMutationEventInput) {
 
 export async function recordWmsMutationEvent(input: WmsMutationEventInput): Promise<void> {
   try {
-    await db.wmsMutationEvent.create({ data: toRow(input) })
+    await db.wmsMutationEvent.create({ data: toWmsMutationEventRow(input) })
   } catch (error) {
     console.error(`[wms-mutation-audit] failed to record ${input.action} event:`, error)
   }
@@ -137,7 +137,7 @@ export async function recordWmsMutationEvents(inputs: WmsMutationEventInput[]): 
   for (let start = 0; start < inputs.length; start += WMS_MUTATION_EVENT_BATCH_SIZE) {
     const chunk = inputs.slice(start, start + WMS_MUTATION_EVENT_BATCH_SIZE)
     try {
-      await db.wmsMutationEvent.createMany({ data: chunk.map(toRow) })
+      await db.wmsMutationEvent.createMany({ data: chunk.map(toWmsMutationEventRow) })
     } catch (error) {
       console.error(`[wms-mutation-audit] failed to record ${chunk.length} events (chunk at ${start}):`, error)
     }

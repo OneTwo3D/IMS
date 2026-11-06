@@ -346,6 +346,22 @@ export async function scrubLinkedFreeText(tx: Prisma.TransactionClient, orderIds
       changed += (await tx.wmsReturnsInbox.updateMany({ where: { orderId: { in: ids }, [field]: { not: null }, NOT: { [field]: marker } }, data: { [field]: marker } })).count
     }
     const returns = await tx.wmsReturnsInbox.findMany({ where: { orderId: { in: ids } }, select: { id: true, rawPayload: true } })
+    // The return_inbox MUTATION EVENTS copy the free-text reason (and any resolution note) into their before / after JSON. They are found by
+    // the inbox row ids and their free-text keys are replaced with the marker, set-based; null stays null and other keys are untouched.
+    if (returns.length > 0) {
+      const inboxIds = returns.map((r) => r.id)
+      changed += Number(await tx.$executeRaw`
+        UPDATE "wms_mutation_events" e
+           SET "before" = CASE WHEN e."before" IS NULL THEN NULL ELSE
+                 e."before" || (CASE WHEN (e."before"->>'reason') IS NOT NULL THEN jsonb_build_object('reason', ${marker}::text) ELSE '{}'::jsonb END)
+                            || (CASE WHEN (e."before"->>'resolutionNote') IS NOT NULL THEN jsonb_build_object('resolutionNote', ${marker}::text) ELSE '{}'::jsonb END) END,
+               "after" = CASE WHEN e."after" IS NULL THEN NULL ELSE
+                 e."after" || (CASE WHEN (e."after"->>'reason') IS NOT NULL THEN jsonb_build_object('reason', ${marker}::text) ELSE '{}'::jsonb END)
+                           || (CASE WHEN (e."after"->>'resolutionNote') IS NOT NULL THEN jsonb_build_object('resolutionNote', ${marker}::text) ELSE '{}'::jsonb END) END
+         WHERE e."entityType" = 'RETURN' AND e."action" = 'return_inbox' AND e."entityId" = ANY(${inboxIds}::text[])
+           AND ((e."before"->>'reason') IS DISTINCT FROM ${marker}::text OR (e."after"->>'reason') IS DISTINCT FROM ${marker}::text)
+           AND ((e."before"->>'reason') IS NOT NULL OR (e."after"->>'reason') IS NOT NULL OR (e."before"->>'resolutionNote') IS NOT NULL OR (e."after"->>'resolutionNote') IS NOT NULL)`)
+    }
     const rawIds = returns.filter((r) => r.rawPayload != null && JSON.stringify(r.rawPayload) !== '{}').map((r) => r.id)
     if (rawIds.length > 0) changed += (await tx.wmsReturnsInbox.updateMany({ where: { id: { in: rawIds } }, data: { rawPayload: {} } })).count
     const movements = await tx.stockMovement.findMany({ where: { shipmentLine: { shipment: { orderId: { in: ids } } }, note: { not: null } }, select: { id: true, note: true } })

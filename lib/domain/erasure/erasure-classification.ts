@@ -139,6 +139,18 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   },
 }
 
+// Reached from an erased order's return by the inbox row id / the order id, not by a foreign key (named in the schema test).
+ERASURE_CLASSIFICATION.WmsMutationEvent = {
+  erased: ['before', 'after'],
+  notPersonal: ['connector', 'action', 'entityType', 'entityId', 'externalId', 'summary', 'error', 'jobId', 'triggeredBy'],
+  retained: {},
+}
+ERASURE_CLASSIFICATION.WmsSyncLog = {
+  erased: [],
+  notPersonal: ['jobId', 'sku', 'productId', 'reason'],
+  retained: { payload: 'NOT written for a return of an erased order (success and error rows alike). Rows written before an erasure are the raw-payload copies, a separate scope, and are not scrubbed here' },
+}
+
 export function classifiedColumns(model: string): string[] {
   const c = ERASURE_CLASSIFICATION[model]
   return c ? [...c.erased, ...c.notPersonal, ...Object.keys(c.retained)] : []

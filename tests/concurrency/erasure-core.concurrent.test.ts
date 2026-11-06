@@ -1200,6 +1200,7 @@ test('[erasure] the returns sync never reads the warehouse\'s free text back int
     await tx.salesOrder.update({ where: { id: fx.orderId }, data: { erasedAt: new Date() } })
   }, { timeout: 30_000 })
   await new Promise((r) => setTimeout(r, 300))
+  const raceMark = new Date()
   pollReturnsRecords = () => [record(racing)]
   let syncDone = false
   const syncing = runMintsoftReturnsSync('test').then(() => { syncDone = true })
@@ -1218,6 +1219,7 @@ test('[erasure] the returns sync never reads the warehouse\'s free text back int
   assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
   assert.equal((await inbox(live)).reason, 'Text removed by GDPR erasure')
 
+  const erasedAtMark = new Date()
   // (b) REDELIVERY with a missing order reference, for a return already linked to an ERASED order: the link is kept and no text is written.
   pollReturnsRecords = () => [record(live, { orderReference: null, reason: `${NAME.last} wrote this later`, raw: { Customer: { Name: FULL_NAME } } })]
   await runMintsoftReturnsSync('test')
@@ -1226,4 +1228,31 @@ test('[erasure] the returns sync never reads the warehouse\'s free text back int
   assert.equal(redelivered.reason, null, 'and no reason is written over a row linked to an erased order')
   assert.deepEqual(redelivered.rawPayload, {})
   assert.ok(!JSON.stringify(redelivered).includes(NAME.last) && !JSON.stringify(redelivered).includes(STREET))
+
+  // THE SYNC LOG: a row written for a return of the erased order carries no raw payload, on success and on error alike.
+  pollReturnsRecords = () => [record(live, { orderReference: null }), record(`RET-ERR-${uid}`, { qty: 'not-a-number' })]
+  returnIds.push(`RET-ERR-${uid}`)
+  await runMintsoftReturnsSync('test')
+  const logsAfter = await db.wmsSyncLog.findMany({ where: { createdAt: { gt: erasedAtMark } } })
+  assert.ok(logsAfter.length >= 2, 'PRECONDITION: the sync wrote log rows after the erasure (a success row and an error row)')
+  assert.ok(logsAfter.some((l) => l.action === 'error'), 'the error row was written')
+  for (const row of logsAfter) {
+    assert.ok(!JSON.stringify(row).includes(NAME.last) && !JSON.stringify(row).includes(STREET) && !JSON.stringify(row).includes(NAME.first), `a post-erasure sync log row carries the warehouse payload: ${row.action}`)
+  }
+  // The racing delivery above (order lock held, erasure committing) wrote its log row under the lock too: no payload.
+  const raceLogs = await db.wmsSyncLog.findMany({ where: { createdAt: { gt: raceMark, lt: erasedAtMark } } })
+  assert.ok(raceLogs.length >= 1, 'PRECONDITION: the racing delivery wrote a log row')
+  for (const row of raceLogs) assert.ok(!JSON.stringify(row).includes(STREET) && !JSON.stringify(row).includes(NAME.last), 'the racing row carries no payload')
+  // CONTROL: the rows written BEFORE the erasure, for the live order, did carry the payload (so the check above is not vacuous).
+  assert.ok((await db.wmsSyncLog.findMany({ where: { createdAt: { lt: erasedAtMark } } })).some((l) => JSON.stringify(l.payload).includes(STREET)), 'control: a pre-erasure log row carries the payload')
+
+  // THE MUTATION EVENTS of the return hold the marker, not the reason.
+  const events = await db.wmsMutationEvent.findMany({ where: { entityType: 'RETURN', action: 'return_inbox', entityId: redelivered.id } })
+  assert.ok(events.length >= 2)
+  for (const event of events) {
+    const after = event.after as { reason?: string | null } | null
+    assert.ok(after?.reason === null || after?.reason === 'Text removed by GDPR erasure', `event reason: ${JSON.stringify(after?.reason)}`)
+    assert.ok(!JSON.stringify(event).includes(NAME.last))
+  }
+  assert.ok(events.some((e) => (e.after as { reason?: string | null }).reason === 'Text removed by GDPR erasure'), 'an event that held a reason now holds the marker')
 })
