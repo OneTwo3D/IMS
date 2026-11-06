@@ -10,6 +10,12 @@ import {
   E2E_GLOBAL_CAP_WINDOW_MS,
   cronRateLimitGlobalKey,
   cronCadenceMs,
+  cronFiringTimes,
+  cronRateLimitDailyBudgetKey,
+  cronScheduleProfile,
+  cronXeroDailyBudget,
+  XERO_DAILY_BUDGET_CEILING,
+  XERO_LIVE_CRON_JOBS,
   cronRateLimitFor,
   cronRateLimitKey,
   enforceCronRateLimit,
@@ -194,8 +200,8 @@ test('only a CAPPED job takes the second tenant-wide bucket check', async () => 
   await withEnvAsync({ E2E_TEST_MODE: undefined, E2E_CRON_RATE_LIMIT_MAX: '10000' }, async () => {
     assert.deepEqual(
       await keysFor('xero-tax-rate-drift'),
-      [cronRateLimitKey('xero-tax-rate-drift', '203.0.113.9')],
-      'override disarmed: no tenant-wide bucket, production path unchanged',
+      [cronRateLimitKey('xero-tax-rate-drift', '203.0.113.9'), cronRateLimitDailyBudgetKey('xero-tax-rate-drift')],
+      'override disarmed: no E2E bucket, but the production daily run budget is always checked after the IP slice',
     )
   })
 })
@@ -265,14 +271,15 @@ test('a capped E2E job cannot exceed its ceiling by rotating source IPs (tenant-
     )
   })
 
-  // Production (override disarmed) takes no second bucket: only the per-IP slice applies (now 2 per hour, the
-  // cadence-derived headroom), so no legitimate scheduled caller gains a new denial path.
+  // Production (override disarmed): the per-IP slice (2/hour, the cadence-derived headroom) plus the always-on
+  // IP-independent daily run budget for a live-Xero job. The budget is above the 24 scheduled runs, so no
+  // legitimate scheduled caller gains a denial path.
   await withEnvAsync({ E2E_TEST_MODE: undefined, E2E_CRON_RATE_LIMIT_MAX: '10000' }, async () => {
     const allowed = await drive()
     assert.equal(
       allowed,
-      SOURCE_IPS.length * HOURS * 2,
-      'production keeps only the IP-scoped slice — two per IP per hour (one run plus early-arrival headroom)',
+      cronXeroDailyBudget('0 * * * *'),
+      'production: the IP slices admit 2/IP/hour, but the IP-independent daily run budget for a live-Xero job still bounds the day',
     )
   })
 })
@@ -355,27 +362,145 @@ test('daily job: a run 500 ms early is admitted, a third run inside the window i
   assert.equal(await admitAt(backend, setNow, 'backup', START + DAY - 400), false)
 })
 
-test('cadence parser reads the registry schedule shapes', () => {
+test('cadence is the shortest real gap between firings, including restricted days, lists and steps', () => {
   assert.equal(cronCadenceMs('*/5 * * * *'), 5 * MINUTE)
   assert.equal(cronCadenceMs('15 * * * *'), HOUR)
   assert.equal(cronCadenceMs('0 */6 * * *'), 6 * HOUR)
   assert.equal(cronCadenceMs('30 3 * * *'), 24 * HOUR)
   assert.equal(cronCadenceMs('0,30 * * * *'), 30 * MINUTE)
-  assert.equal(cronCadenceMs('0 3 * * 1'), 24 * HOUR)
+  // Restricted days must not floor the cadence at a day: this fires four times on each Monday.
+  assert.equal(cronCadenceMs('0 */6 * * 1'), 6 * HOUR)
+  assert.equal(cronScheduleProfile('0 */6 * * 1')?.maxPerDay, 4)
+  assert.equal(cronCadenceMs('*/15 9-17 * * 1-5'), 15 * MINUTE)
+  assert.equal(cronCadenceMs('0 9-17/2 * * 1,3'), 2 * HOUR)
+  assert.equal(cronCadenceMs('0,10 8 * * 0'), 10 * MINUTE)
+  assert.equal(cronCadenceMs('0 3 * * 1'), 7 * 24 * HOUR)
+  assert.equal(cronCadenceMs('0 3 * * 7'), 7 * 24 * HOUR, 'day-of-week 7 is Sunday')
+  assert.equal(cronCadenceMs('0 0 1,15 * *'), 14 * 24 * HOUR, 'shortest gap: Jan 1 to Jan 15')
+  // Both day fields restricted: cron fires on EITHER (Mondays plus the 1st).
+  assert.equal(cronCadenceMs('0 0 1 * 1'), 24 * HOUR)
   assert.equal(cronCadenceMs('nonsense'), null)
+  assert.equal(cronCadenceMs('61 * * * *'), null)
 })
 
-test('census: every registry job limit leaves headroom above its cadence, and no cron route overrides it', () => {
+test('the effective (saved) schedule drives the limit, not the registry default', async () => {
+  const seen: Array<{ max: number; windowMs: number }> = []
+  const checker = async (_key: string, max: number, windowMs: number) => {
+    seen.push({ max, windowMs })
+    return { allowed: true, retryAfterSec: 0, remaining: 0 }
+  }
+  const defaultLimit = cronRateLimitFor('read-sync-liveness')
+  assert.deepEqual(defaultLimit, { max: 2, windowMs: HOUR })
+  // Operator saved "every minute" for an hourly-by-default job: 60 scheduled runs an hour must fit.
+  await enforceCronRateLimit('read-sync-liveness', { checker, scheduleReader: async () => '* * * * *' })
+  assert.deepEqual(seen.pop(), { max: 75, windowMs: HOUR })
+  // Slower saved schedule widens the window instead.
+  await enforceCronRateLimit('read-sync-liveness', { checker, scheduleReader: async () => '0 */6 * * *' })
+  assert.deepEqual(seen.pop(), { max: 2, windowMs: 6 * HOUR })
+  // No saved row, or an unreadable one, falls back to the registry default.
+  await enforceCronRateLimit('read-sync-liveness', { checker, scheduleReader: async () => null })
+  assert.deepEqual(seen.pop(), defaultLimit)
+  await enforceCronRateLimit('read-sync-liveness', { checker, scheduleReader: async () => 'garbage' })
+  assert.deepEqual(seen.pop(), defaultLimit)
+  // A run per minute for an hour is never refused once the saved schedule is honoured.
+  const { backend, setNow } = makeBackend()
+  const reader = async () => '* * * * *'
+  for (let i = 0; i < 60; i += 1) {
+    setNow(START + i * MINUTE - (i % 2 === 0 ? 0 : 500))
+    const res = await enforceCronRateLimit('read-sync-liveness', {
+      scheduleReader: reader,
+      checker: (k, m, w) => backend.check(k, m, w),
+    })
+    assert.equal(res, null, `minute ${i}`)
+  }
+})
+
+test('production: a live-Xero job has an IP-independent rolling daily budget; the census names every Xero job', async () => {
+  const budget = cronXeroDailyBudget('0 * * * *')
+  assert.equal(budget, 32)
+  assert.ok(budget < 1000 && budget > 24, 'above the 24 scheduled runs, far below the tenant allowance')
+  assert.equal(cronXeroDailyBudget('* * * * *'), XERO_DAILY_BUDGET_CEILING, 'a fast saved schedule is capped')
+  const { backend, setNow } = makeBackend()
+  let allowed = 0
+  await withEnvAsync({ E2E_TEST_MODE: undefined, E2E_CRON_RATE_LIMIT_MAX: '10000' }, async () => {
+    for (let hour = 0; hour < 24; hour += 1) {
+      setNow(START + hour * HOUR + hour)
+      for (let ip = 1; ip <= 50; ip += 1) {
+        const request = new Request('https://ims.example.com/x', { headers: { 'x-real-ip': `198.51.100.${ip}` } })
+        const denial = await enforceCronRateLimit('xero-tax-rate-drift', {
+          request,
+          scheduleReader: async () => null,
+          checker: (k, m, w) => backend.check(k, m, w),
+        })
+        if (denial === null) allowed += 1
+      }
+    }
+  })
+  assert.equal(allowed, budget, 'many source IPs over a day spend one shared budget')
+  assert.equal(cronRateLimitDailyBudgetKey('xero-tax-rate-drift'), 'cron:xero-tax-rate-drift:xero-daily-budget')
+
+  // Census: every registry job in the xero module is in the live-Xero set, every member is a real job, and each
+  // job's budget exceeds its busiest day.
+  const registry = getAllCronJobs()
+  for (const job of registry.filter((j) => j.module === 'xero')) {
+    assert.ok(XERO_LIVE_CRON_JOBS.has(job.slug), `${job.slug} is a Xero-module job missing from XERO_LIVE_CRON_JOBS`)
+  }
+  for (const slug of XERO_LIVE_CRON_JOBS) {
+    const job = registry.find((j) => j.slug === slug)
+    assert.ok(job, `${slug} is not a registered job`)
+    const perDay = cronScheduleProfile(job.defaultSchedule)!.maxPerDay
+    assert.ok(cronXeroDailyBudget(job.defaultSchedule) > perDay, `${slug}: budget must exceed its scheduled runs per day`)
+  }
+})
+
+test('the daily budget does not apply to non-Xero jobs or when the E2E raise is in effect', async () => {
+  const seen: string[] = []
+  const checker = async (key: string) => {
+    seen.push(key)
+    return { allowed: true, retryAfterSec: 0, remaining: 0 }
+  }
+  await withEnvAsync({ E2E_TEST_MODE: undefined }, async () => {
+    await enforceCronRateLimit('backup', { checker, scheduleReader: async () => null })
+    assert.deepEqual(seen.splice(0), [cronRateLimitKey('backup')])
+    await enforceCronRateLimit('xero-tax-rate-drift', { checker, scheduleReader: async () => null })
+    assert.deepEqual(seen.splice(0), [cronRateLimitKey('xero-tax-rate-drift'), cronRateLimitDailyBudgetKey('xero-tax-rate-drift')])
+  })
+  await withEnvAsync({ E2E_TEST_MODE: '1', E2E_CRON_RATE_LIMIT_MAX: '10000' }, async () => {
+    await enforceCronRateLimit('accounting-daily-batch', { checker, scheduleReader: async () => null })
+    assert.deepEqual(seen.splice(0), [cronRateLimitKey('accounting-daily-batch')])
+  })
+})
+
+/** Most firings already inside the window when a run arrives (the backend counts entries newer than now - window). */
+function maxPriorFirings(expression: string, windowMs: number): number {
+  const times: number[] = []
+  for (const t of cronFiringTimes(expression)) times.push(t)
+  let lo = 0
+  let worst = 0
+  for (let i = 0; i < times.length; i += 1) {
+    while (times[i] - times[lo] > windowMs) lo += 1
+    worst = Math.max(worst, i - lo)
+  }
+  return worst
+}
+
+test('census: every registry job limit leaves headroom above its scheduled firings, and no cron route overrides it', () => {
   const jobs = getAllCronJobs()
   assert.ok(jobs.length >= 30, `expected the full registry, got ${jobs.length}`)
-  for (const job of jobs) {
-    const cadence = cronCadenceMs(job.defaultSchedule)
-    assert.ok(cadence != null, `${job.slug}: unreadable schedule ${job.defaultSchedule}`)
-    const { max, windowMs } = cronRateLimitFor(job.slug)
-    // Strictly more runs per window than the schedule fires: max > windowMs / cadence.
-    assert.ok(max * cadence > windowMs, `${job.slug}: ${max}/${windowMs}ms does not exceed cadence ${cadence}ms`)
-    assert.ok(max >= 2, `${job.slug}: needs room for at least one early run`)
+  const schedules = [...jobs.map((j) => [j.slug, j.defaultSchedule] as const), ['(restricted days)', '0 */6 * * 1'], ['(business hours)', '*/15 9-17 * * 1-5'], ['(two days)', '0 0 1,15 * *']]
+  for (const [slug, schedule] of schedules) {
+    assert.ok(cronCadenceMs(schedule) != null, `${slug}: unreadable schedule ${schedule}`)
+    const { max, windowMs } = cronRateLimitFor(slug, schedule)
+    // On schedule, `prior` runs are already in the window; one more slot must remain for an early arrival.
+    const prior = maxPriorFirings(schedule, windowMs)
+    assert.ok(prior < max, `${slug} (${schedule}): ${prior} scheduled runs already in a ${windowMs}ms window, max ${max} would refuse a scheduled run`)
+    assert.ok(max >= 2, `${slug}: needs room for at least one early run`)
   }
+  // The census itself must reject an allowance that is exactly the cadence.
+  const hourlyPrior = maxPriorFirings('0 * * * *', HOUR)
+  assert.equal(hourlyPrior, 1, 'an hourly job always has its previous run inside an hour window')
+  assert.ok(!(hourlyPrior < 1), 'a max of 1 for an hourly job fails the census predicate')
+  assert.ok(!(maxPriorFirings('0 */6 * * 1', 24 * HOUR) < 3), 'a daily allowance of 3 would refuse the 4th Monday run of a 6-hourly Monday job')
 
   // A route that passes its own max/windowMs bypasses the derivation; only unregistered routes may.
   const registered = new Set(jobs.map((j) => j.slug))
