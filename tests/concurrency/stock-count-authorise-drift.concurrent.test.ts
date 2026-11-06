@@ -151,9 +151,14 @@ test('authorising a stock count refuses when on-hand moved since the reconcile',
     const refused = await postStockCount({ countId: f.countId })
     assert.equal(refused.drift?.[0]?.earlierOnHand, null)
     assert.equal(await movements(f), 0)
+    // reconciled again at 9, then the authorise call itself carries a different figure: the stamp is valid for 9 and not for 7
+    assert.equal((await reconcileStockCount({ countId: f.countId })).success, true)
+    assert.equal(Number((await db.stockCountLine.findUniqueOrThrow({ where: { id: f.lineId } })).reconciledQty), 10)
     const inline = await postStockCount({ countId: f.countId, counts: [countedLine(f, 7)] })
     assert.equal(inline.drift?.length, 1, 'a figure changed inside the authorise call is refused too')
+    assert.equal(inline.drift?.[0]?.earlierOnHand, null)
     assert.equal(await movements(f), 0)
+    assert.equal(await onHand(f), 10)
   })
 
   await t.test('5. the race: a movement holding the stock-level lock commits before the waiting authorise reads on-hand', async (tt) => {
