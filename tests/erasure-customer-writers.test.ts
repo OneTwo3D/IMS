@@ -39,6 +39,59 @@ test('the edit writers in customers.ts are conditional updateMany calls, never a
   assert.equal(conditional.length, 2, 'both the single edit and the CSV update carry the condition')
 })
 
+/**
+ * CENSUS OF THE WRITERS OF THE THREE ORDER/SHIPMENT COLUMNS THE ERASURE CLEARS BY HAND (order notes, internal notes, tracking
+ * numbers), scanned as: any salesOrder/shipment create/update/upsert whose next 22 lines assign one of them, or an
+ * assignment to `data.trackingNumber`. A new writer fails here until it is classified.
+ *
+ *   refuses       reads erasedAt under the order lock and refuses
+ *   marker-guard  the storefront importer, which withholds identity columns on an erased order
+ *   erasure       the erasure itself
+ *   despatch      the fulfilment path of an OPEN order (shipping it writes the tracking number the carrier issued). Not guarded:
+ *                 an erased order is normally closed, and propagating an erasure to the warehouse and carrier for orders still
+ *                 open is its own piece of work. Stated limit.
+ */
+const ORDER_CENSUS: Record<string, { writers: number; verdict: string }> = {
+  'app/actions/allocation.ts': { writers: 2, verdict: 'refuses (updateShipmentTracking: shipment + order tracking, one transaction under the order lock)' },
+  'app/actions/sales.ts': { writers: 2, verdict: 'refuses (updateSalesOrderNotes) / despatch (status transition to SHIPPED with a tracking number)' },
+  'lib/connectors/woocommerce/sync/order-import.ts': { writers: 2, verdict: 'marker-guard (update path) / payment note row, not customer data' },
+  'lib/domain/erasure/erase-personal-data.ts': { writers: 2, verdict: 'erasure' },
+  'lib/domain/sales/shipment-service.ts': { writers: 3, verdict: 'despatch' },
+}
+
+test('every writer of order notes, internal notes and tracking numbers is in the census', () => {
+  const cwd = new URL('..', import.meta.url).pathname
+  const files = execFileSync('git', ['grep', '-lE', '(salesOrder|shipment)\\.(update|updateMany|create|createMany|upsert)\\(', '--', 'app', 'lib', ':!app/generated', ':!*.test.ts'], { encoding: 'utf8', cwd }).trim().split('\n').filter(Boolean)
+  const found: Record<string, number> = {}
+  for (const file of files) {
+    const lines = readFileSync(`${cwd}${file}`, 'utf8').split('\n')
+    lines.forEach((line, i) => {
+      const statement = /(salesOrder|shipment)\.(update|updateMany|create|createMany|upsert)\(/.test(line)
+        && /\b(trackingNumber|internalNotes|notes)\s*:/.test(lines.slice(i, i + 22).join('\n'))
+      const assignment = /\bdata\.trackingNumber\s*=/.test(line)
+      if (statement || assignment) found[file] = (found[file] ?? 0) + 1
+    })
+  }
+  assert.deepEqual(found, Object.fromEntries(Object.entries(ORDER_CENSUS).map(([f, v]) => [f, v.writers])))
+})
+
+test('the two edit actions take the order lock and read erasedAt inside the transaction before writing', () => {
+  const sales = readFileSync(new URL('../app/actions/sales.ts', import.meta.url), 'utf8')
+  const notes = sales.slice(sales.indexOf('export async function updateSalesOrderNotes'))
+  assert.match(notes.slice(0, 1200), /lockSalesOrder\(tx, id\)[\s\S]*erasedAt[\s\S]*tx\.salesOrder\.update/)
+  const allocation = readFileSync(new URL('../app/actions/allocation.ts', import.meta.url), 'utf8')
+  const tracking = allocation.slice(allocation.indexOf('export async function updateShipmentTracking'))
+  assert.match(tracking.slice(0, 2600), /lockSalesOrder\(tx, shipment\.orderId\)[\s\S]*erasedAt[\s\S]*tx\.shipment\.update[\s\S]*tx\.salesOrder\.update/)
+  assert.ok(!/db\.shipment\.update\(/.test(tracking.slice(0, 2600)), 'no unlocked shipment write remains in the edit')
+})
+
+test('the Xero processor posts sales invoices, invoice updates and credit notes through the erasure contact gate', () => {
+  const src = readFileSync(new URL('../lib/connectors/xero/sync-processor.ts', import.meta.url), 'utf8')
+  assert.match(src, /pushSalesInvoice\(\{\s*invoiceNumber: payload\.invoiceNumber as string,\s*contactName: postContact\.contactName,\s*contactEmail: postContact\.contactEmail/)
+  assert.match(src, /updateSalesInvoice\(accountingInvoiceId, \{\s*invoiceNumber: payload\.invoiceNumber as string,\s*contactName: postContact\.contactName,\s*contactEmail: postContact\.contactEmail/)
+  assert.match(src, /pushCreditNote\(\{\s*creditNoteNumber: payload\.creditNoteNumber as string,\s*contactName: creditContact\.contactName,\s*contactEmail: creditContact\.contactEmail/)
+})
+
 // ---------------------------------------------------------------- behaviour, with a recording database double.
 const calls: Array<{ op: string; where: Record<string, unknown> }> = []
 const existsAnonymised = true

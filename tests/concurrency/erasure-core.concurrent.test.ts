@@ -35,7 +35,18 @@ async function mockAccounting() {
   accountingMocked = true
 }
 
+let actionsMocked = false
+async function mockActionEnvironment() {
+  if (actionsMocked) return
+  const actual = await import('@/lib/auth/server')
+  mock.module('@/lib/auth/server', { namedExports: { ...actual, requirePermission: async () => ({ user: { id: 'u1', role: 'ADMIN' } }) } })
+  mock.module('next/cache', { namedExports: { revalidatePath: () => undefined, revalidateTag: () => undefined } })
+  actionsMocked = true
+}
+
 async function loadDb() {
+  // Installed by the first test, BEFORE it imports any module that captures `requirePermission`.
+  await mockActionEnvironment()
   config({ path: '.env.local', quiet: true })
   config({ quiet: true })
   const { db } = await import('@/lib/db')
@@ -337,4 +348,115 @@ test('[erasure] the record survives the activity-log purge that deletes an ordin
   const left = new Set((await db.activityLog.findMany({ where: { id: { in: Object.values(ids) } }, select: { id: true } })).map((r) => r.id))
   assert.ok(left.has(ids.record), 'the erasure record survives a purge 400 days on')
   assert.ok(!left.has(ids.control), 'an ordinary INFO row of the same age IS deleted by the same run, so the exemption is not the purge being inert')
+})
+
+
+test('[erasure] a customer erased between the importer\'s customer lookup and its order create: the order is created UNLINKED and the erasure is not undone', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  t.after(async () => {
+    const link = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(fx.externalId + 1) }, select: { orderId: true } })
+    if (link) {
+      await db.accountingSyncLog.deleteMany({ where: { referenceId: link.orderId } })
+      await db.activityLog.deleteMany({ where: { entityId: link.orderId } })
+      await db.salesOrderLine.deleteMany({ where: { orderId: link.orderId } })
+      await db.salesOrder.deleteMany({ where: { id: link.orderId } })
+      await db.shoppingOrderLink.deleteMany({ where: { orderId: link.orderId } })
+    }
+    await fx.cleanup()
+  })
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+
+  // The erasure holds the customer row lock but has not committed. A SECOND order from the same person (matched by email)
+  // is imported now: its customer lookup runs, finds the not-yet-erased row, and the create transaction blocks on the lock.
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const erasing = db.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "customers" WHERE id = ${fx.customerId} FOR UPDATE`
+    await gate
+    await tx.customer.update({ where: { id: fx.customerId }, data: { gdprAnonymisedAt: new Date(), firstName: 'GDPR', lastName: 'Anonymised', email: null } })
+  }, { timeout: 30_000 })
+  await new Promise((r) => setTimeout(r, 200))
+  let done = false
+  const importing = importWcOrder(payload(fx.externalId + 1, wcRateId) as never).then((r) => { done = true; return r })
+  await new Promise((r) => setTimeout(r, 1000))
+  assert.equal(done, false, 'the create transaction is waiting on the customer row lock')
+  release()
+  await erasing
+  const result = await importing
+  assert.equal(result.success, true, JSON.stringify(result))
+
+  const link = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(fx.externalId + 1) }, select: { orderId: true } })
+  const created = await db.salesOrder.findUniqueOrThrow({ where: { id: link.orderId } })
+  assert.equal(created.customerId, null, 'the new order is NOT attached to the erased customer')
+  const recorded = await db.activityLog.findFirst({ where: { entityId: link.orderId, action: 'order_created_unlinked_customer_erased' } })
+  assert.ok(recorded, 'and the decision is recorded')
+  assert.ok(!JSON.stringify(recorded).includes(NAME.last) && !JSON.stringify(recorded).includes(EMAIL), 'the record names no one')
+  assert.equal((await db.customer.findUniqueOrThrow({ where: { id: fx.customerId } })).firstName, 'GDPR')
+})
+
+test('[erasure] the accounting payload copy: unsent rows get the placeholder, ledger rows keep the name but lose the email, financial fields stay; the post gate sends the placeholder', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  t.after(async () => { await fx.cleanup() })
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { resolveSalesPostContact } = await import('@/lib/domain/erasure/accounting-contact')
+  const body = (extra: object = {}) => ({ contactName: FULL_NAME, contactEmail: EMAIL, date: '2026-11-02', currency: 'GBP', lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200' }], ...extra })
+  const mk = (status: 'PENDING' | 'FAILED' | 'SYNCED' | 'PROCESSING', type: 'SALES_INVOICE' | 'CREDIT_NOTE', referenceType: string, referenceId: string) =>
+    db.accountingSyncLog.create({ data: { type, status, referenceType, referenceId, payload: body() } })
+  const pending = await mk('PENDING', 'SALES_INVOICE', 'SalesOrder', fx.orderId)
+  const failed = await mk('FAILED', 'SALES_INVOICE', 'SalesOrder', fx.orderId)
+  const synced = await mk('SYNCED', 'SALES_INVOICE', 'SalesOrder', fx.orderId)
+  const refundPending = await mk('PENDING', 'CREDIT_NOTE', 'SalesOrderRefund', fx.refundId)
+  const unrelated = await mk('PENDING', 'SALES_INVOICE', 'SalesOrder', 'not-this-order')
+  t.after(async () => { await db.accountingSyncLog.deleteMany({ where: { id: { in: [pending.id, failed.id, synced.id, refundPending.id, unrelated.id] } } }) })
+
+  assert.deepEqual(await resolveSalesPostContact('SalesOrder', fx.orderId, body()), { contactName: FULL_NAME, contactEmail: EMAIL }, 'before the erasure the gate passes the stored contact')
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+
+  const rows = Object.fromEntries((await db.accountingSyncLog.findMany({ where: { id: { in: [pending.id, failed.id, synced.id, refundPending.id, unrelated.id] } } })).map((r) => [r.id, r.payload as Record<string, unknown>]))
+  for (const id of [pending.id, failed.id, refundPending.id]) {
+    assert.equal(rows[id]!.contactName, 'GDPR Anonymised', 'an unsent row names only the placeholder')
+    assert.equal('contactEmail' in rows[id]!, false)
+    assert.deepEqual(rows[id]!.lines, body().lines, 'financial fields are untouched')
+    assert.equal(rows[id]!.date, '2026-11-02')
+  }
+  assert.equal(rows[synced.id]!.contactName, FULL_NAME, 'a row already in the ledger keeps the contact name it was posted under')
+  assert.equal('contactEmail' in rows[synced.id]!, false, 'but not the email, which is not part of the posted document')
+  assert.deepEqual(rows[unrelated.id], body(), 'another order\'s row is untouched')
+
+  // THE POST GATE, whatever the payload says.
+  assert.deepEqual(await resolveSalesPostContact('SalesOrder', fx.orderId, body()), { contactName: 'GDPR Anonymised', contactEmail: undefined })
+  assert.deepEqual(await resolveSalesPostContact('SalesOrderRefund', fx.refundId, body()), { contactName: 'GDPR Anonymised', contactEmail: undefined })
+  assert.deepEqual(await resolveSalesPostContact('SalesOrder', 'not-this-order', body()), { contactName: FULL_NAME, contactEmail: EMAIL }, 'an order that does not exist or is not erased passes its stored contact')
+})
+
+test('[erasure] notes and shipment tracking edits on an erased order are refused under the order lock and log nothing about the number', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  t.after(async () => { await fx.cleanup() })
+  const { updateSalesOrderNotes } = await import('@/app/actions/sales')
+  const { updateShipmentTracking } = await import('@/app/actions/allocation')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const shipment = await db.shipment.findFirstOrThrow({ where: { orderId: fx.orderId } })
+  await db.shipment.update({ where: { id: shipment.id }, data: { status: 'SHIPPED' } })
+
+  // CONTROL: before the erasure both edits work, so the refusals below are the guard.
+  assert.deepEqual(await updateSalesOrderNotes(fx.orderId, 'a note', 'an internal note'), { success: true })
+  const editBefore = await updateShipmentTracking(shipment.id, { trackingNumber: 'EDIT-BEFORE' })
+  assert.equal(editBefore.success, true, JSON.stringify(editBefore))
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })).trackingNumber, 'EDIT-BEFORE')
+
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+
+  const notes = await updateSalesOrderNotes(fx.orderId, 'Mrs Quillfeather again', 'rang about it')
+  assert.equal(notes.success, false)
+  const tracking = await updateShipmentTracking(shipment.id, { trackingNumber: 'EDIT-AFTER-ERASURE' })
+  assert.equal(tracking.success, false)
+  const order = await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+  assert.deepEqual([order.notes, order.internalNotes, order.trackingNumber], [null, null, null])
+  assert.equal((await db.shipment.findUniqueOrThrow({ where: { id: shipment.id } })).trackingNumber, null)
+  const leaked = JSON.stringify(await db.activityLog.findMany({ where: { entityId: fx.orderId } }))
+  assert.ok(!leaked.includes('EDIT-AFTER-ERASURE') && !leaked.includes('EDIT-BEFORE'), 'no activity row carries a tracking number (the earlier one was scrubbed)')
 })

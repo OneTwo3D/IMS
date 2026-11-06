@@ -163,6 +163,13 @@ export const RETURNS_MIXED_BASIS_NOTICE =
  */
 export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   {
+    file: 'lib/domain/erasure/erasure-classification.ts',
+    figures: ['revenueDeferredBatchRef'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'A catalogue of column NAMES for the personal-data erasure (one entry is the ledger batch reference column, classified not-personal). It computes and displays no figure.',
+  },
+  {
     file: 'app/(dashboard)/analytics/_components/sales-analytics-page-utils.ts',
     figures: ['grossProfitBase', 'grossProfitBaseBound', 'loadMarginAnalyticsReportForPage', 'margin', 'marginPct', 'marginPctBound', 'netRevenue', 'netRevenueBase', 'netRevenueBaseBound', 'netRevenueBound', 'netRevenueExVatBase', 'revenue', 'revenueBase', 'revenueBaseBound'],
     treatment: 'basis-aware',

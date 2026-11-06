@@ -3583,11 +3583,20 @@ export async function updateSalesOrderNotes(
 ): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('sales.create')
-    const so = await db.salesOrder.update({
-      where: { id },
-      data: { notes: notes || null, internalNotes: internalNotes || null },
-      select: { orderNumber: true, externalOrderNumber: true },
+    // Under the order lock, with the erasure marker read inside it: an erased order's notes are never written back, and an
+    // erasure that commits first is seen (it takes the same lock).
+    const written = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, id)
+      const current = await tx.salesOrder.findUnique({ where: { id }, select: { erasedAt: true } })
+      if (current?.erasedAt) return null
+      return tx.salesOrder.update({
+        where: { id },
+        data: { notes: notes || null, internalNotes: internalNotes || null },
+        select: { orderNumber: true, externalOrderNumber: true },
+      })
     })
+    if (!written) return { success: false, error: 'This order\'s personal data has been erased and it can no longer be edited' }
+    const so = written
     revalidatePath(`/sales/${id}`)
     await logActivity({
       entityType: 'SALES_ORDER',

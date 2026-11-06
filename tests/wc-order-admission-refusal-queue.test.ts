@@ -202,8 +202,11 @@ function txClient() {
   const base = txDelegates()
   return {
     ...base,
+    // The order row lock, the customer row lock (FOR UPDATE; the customer is not erased) and the erasure-marker read.
+    $queryRaw: async () => [],
     salesOrder: {
       ...base.salesOrder,
+      findUnique: async () => ({ erasedAt: null }),
       update: async ({ where }: { where: { id: string } }) => {
         store.updatedOrderIds.push(where.id)
         return {}

@@ -2768,6 +2768,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const headerRateWasActive = taxRateName ? (await db.taxRate.findFirst({ where: { name: taxRateName, active: true }, select: { id: true } })) !== null : false
     // Create the sales order
     let so
+    let linkCustomerId: string | null = customerId
+    let customerErasedDuringImport: string | null = null
     try {
       so = await db.$transaction(async (tx) => {
         // The rates this order rests on are locked FIRST, in one statement in id order (lib/tax/writable-tax-rate.ts): the lines' rates and the ACTIVE rate the header names (the tax import's
@@ -2776,6 +2778,18 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         await lockOrderNamedTaxRate(tx, taxRateName, { lineRateIds: lineData.map((l) => l.taxRateId), allowMissing: !headerRateWasActive })
         // A mapped rate that a tax re-key retired follows its replacement (lenient: an inbound order is never lost over an operator-deactivated rate); under the row share lock the apply waits on.
         await resolveLinesTaxRates(tx, lineData, { lenient: true })
+        // CUSTOMER ERASURE GUARD. `upsertCustomer` ran before this transaction, so the customer it returned can have been
+        // anonymised since. The row is locked here (the erasure claims it with an UPDATE, which takes the same lock) and
+        // re-read: an erased customer is never linked to a new order. The erasure either committed first, and this sees it,
+        // or is queued behind this lock and then finds the new order under the customer and erases it.
+        linkCustomerId = customerId
+        if (customerId) {
+          const locked = await tx.$queryRaw<Array<{ gdprAnonymisedAt: Date | null }>>`SELECT "gdprAnonymisedAt" FROM "customers" WHERE "id" = ${customerId} FOR UPDATE`
+          if (locked[0]?.gdprAnonymisedAt) {
+            linkCustomerId = null
+            customerErasedDuringImport = customerId
+          }
+        }
         const created = await tx.salesOrder.create({
         data: {
           externalOrderNumber: wcOrder.number,
@@ -2796,7 +2810,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           shipFromWarehouseId: wcDefaultWarehouseId,
           currency,
           fxRateToBase: fxRate,
-          customerId,
+          customerId: linkCustomerId,
           customerName,
           customerEmail: wcOrder.billing.email || null,
           customerVatNumber: readWcCustomerVat(wcOrder),
@@ -2923,6 +2937,19 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         return { success: true, orderId: concurrent.id }
       }
       throw error
+    }
+
+    if (customerErasedDuringImport) {
+      // Recorded without any identity: the order id, the customer's surrogate id, and what was done.
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: so.id,
+        action: 'order_created_unlinked_customer_erased',
+        tag: 'sync',
+        level: 'WARNING',
+        description: 'The customer this WooCommerce order matched was erased while the order was being imported, so the order was created without a customer link.',
+        metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), erasedCustomerId: customerErasedDuringImport },
+      })
     }
 
     if (taxFallbackLines.length > 0) {

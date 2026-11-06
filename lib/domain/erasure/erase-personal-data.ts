@@ -60,7 +60,7 @@ export async function eraseOrdersPersonalDataInTx(
   orderIds: string[],
   erasedAt: Date,
 ): Promise<Omit<ErasureCounts, 'customers' | 'shoppingCustomerLinks' | 'activityRowsScrubbed'>> {
-  const counts = { salesOrders: 0, shipments: 0, shoppingOrderLinks: 0, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, notifications: 0 }
+  const counts = { salesOrders: 0, shipments: 0, shoppingOrderLinks: 0, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, notifications: 0 }
   for (const ids of chunks(orderIds)) {
     counts.salesOrders += (await tx.salesOrder.updateMany({
       where: { id: { in: ids } },
@@ -104,6 +104,8 @@ export async function eraseOrdersPersonalDataInTx(
       where: { ...outboxWhere, status: 'PROCESSING', NOT: { toEmail: ERASURE_PLACEHOLDER_EMAIL } },
       data: { toEmail: ERASURE_PLACEHOLDER_EMAIL },
     })).count
+
+    counts.accountingPayloadsScrubbed += await scrubAccountingPayloadContacts(tx, ids)
 
     // Notifications are linked to an order only by the URL they point at.
     counts.notifications += (await tx.notification.updateMany({
@@ -191,6 +193,36 @@ export async function scrubActivityLogIdentity(
     }
   }
   return scrubbed
+}
+
+/**
+ * THE CONTACT BLOCK IN THE ACCOUNTING SYNC PAYLOAD. A WooCommerce invoice job stores `contactName` and `contactEmail` in
+ * `accounting_sync_logs.payload`, and the Xero processor reads them to find or create the ledger contact when it posts.
+ *
+ * NOT YET SENT (PENDING, FAILED): the contact name becomes the placeholder and the email is removed, so a later post can
+ * only ever name the placeholder. Every financial field of the payload (lines, amounts, dates, currency, references) is
+ * untouched, and the idempotency key does not depend on the contact, so a retry still dedupes.
+ * ALREADY IN THE LEDGER OR CLAIMED (SYNCED, CANCELLED, PROCESSING): the name is part of what the ledger holds for the
+ * posted document, and the document is retained as a financial record, so it is KEPT in the stored copy; only the contact
+ * EMAIL, which is not part of the posted document, is removed. A claimed row's processor already holds its payload in memory.
+ * The posting gate (resolveSalesPostContact) covers any post that happens after the erasure whatever the payload says.
+ */
+async function scrubAccountingPayloadContacts(tx: Prisma.TransactionClient, orderIds: string[]): Promise<number> {
+  const refunds = await tx.salesOrderRefund.findMany({ where: { orderId: { in: orderIds } }, select: { id: true } })
+  const refIds = [...orderIds, ...refunds.map((r) => r.id)]
+  const scope = { referenceType: { in: ['SalesOrder', 'SalesOrderRefund'] }, referenceId: { in: refIds } }
+  const all = await tx.accountingSyncLog.findMany({ where: scope, select: { id: true, status: true } })
+  const unsentIds = all.filter((r) => r.status === 'PENDING' || r.status === 'FAILED').map((r) => r.id)
+  const keptIds = all.filter((r) => r.status !== 'PENDING' && r.status !== 'FAILED').map((r) => r.id)
+  const unsent = unsentIds.length === 0 ? 0 : await tx.$executeRaw`
+    UPDATE "accounting_sync_logs"
+       SET "payload" = ("payload" - 'contactEmail') || jsonb_build_object('contactName', ${ERASURE_PLACEHOLDER_NAME}::text)
+     WHERE "id" = ANY(${unsentIds}::text[]) AND ("payload"->>'contactName') IS NOT NULL`
+  const kept = keptIds.length === 0 ? 0 : await tx.$executeRaw`
+    UPDATE "accounting_sync_logs"
+       SET "payload" = "payload" - 'contactEmail'
+     WHERE "id" = ANY(${keptIds}::text[]) AND ("payload"->>'contactEmail') IS NOT NULL`
+  return Number(unsent) + Number(kept)
 }
 
 export type EraseCustomerResult =

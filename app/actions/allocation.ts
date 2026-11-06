@@ -1715,29 +1715,38 @@ export async function updateShipmentTracking(
     const trackingNumber = payload.trackingNumber?.trim() || null
     const shippingService = payload.shippingService?.trim() || null
 
-    await db.shipment.update({
-      where: { id: shipmentId },
-      data: {
-        trackingNumber,
-        shippingService,
-      },
-    })
+    // THE ORDER LOCK FIRST, AND THE ERASURE MARKER READ INSIDE IT: an erased order's tracking is never written back (the
+    // erasure takes the same lock), and nothing about the number is logged or pushed on the refusal path.
+    const refused = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, shipment.orderId)
+      const current = await tx.salesOrder.findUnique({ where: { id: shipment.orderId }, select: { erasedAt: true } })
+      if (current?.erasedAt) return true
+      await tx.shipment.update({
+        where: { id: shipmentId },
+        data: {
+          trackingNumber,
+          shippingService,
+        },
+      })
 
-    const shippedShipments = await db.shipment.findMany({
-      where: { orderId: shipment.orderId, status: 'SHIPPED' },
-      select: { trackingNumber: true },
-    })
-    const trackingNumbers = shippedShipments
-      .map((row) => row.trackingNumber)
-      .filter(Boolean)
-      .join(', ')
+      const shippedShipments = await tx.shipment.findMany({
+        where: { orderId: shipment.orderId, status: 'SHIPPED' },
+        select: { trackingNumber: true },
+      })
+      const trackingNumbers = shippedShipments
+        .map((row) => row.trackingNumber)
+        .filter(Boolean)
+        .join(', ')
 
-    await db.salesOrder.update({
-      where: { id: shipment.orderId },
-      data: {
-        trackingNumber: trackingNumbers || null,
-      },
+      await tx.salesOrder.update({
+        where: { id: shipment.orderId },
+        data: {
+          trackingNumber: trackingNumbers || null,
+        },
+      })
+      return false
     })
+    if (refused) return { success: false, error: 'This order\'s personal data has been erased and its tracking can no longer be edited' }
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${shipment.orderId}`)

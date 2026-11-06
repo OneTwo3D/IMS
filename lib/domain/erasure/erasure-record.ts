@@ -56,6 +56,8 @@ export type ErasureCounts = {
   outboxRowsErased: number
   /** Rows claimed by a sender when the erasure ran: the address is replaced in place, the claim and status untouched, and the drain refuses at its recipient confirm. */
   outboxRowsClaimedFenced: number
+  /** Accounting sync rows for these orders (and their refunds) whose stored payload copy had contact identity removed or replaced. */
+  accountingPayloadsScrubbed: number
   /** Existing activity-log rows whose description or metadata held the subject's identifying values. */
   activityRowsScrubbed: number
   notifications: number

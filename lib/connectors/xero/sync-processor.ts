@@ -3,6 +3,7 @@
  * Each entry represents one IMS transaction → one Xero API call.
  */
 
+import { resolveSalesPostContact } from '@/lib/domain/erasure/accounting-contact'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { getRateLimitBackoffMs, isRateLimitError } from './deferral'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
@@ -6208,10 +6209,11 @@ export async function processClaimedEntry(
       // r5 #1: the claim is re-taken HERE, after the scope read and the cancelled-order guard, not once at the top of the entry.
       const fence = await lease.fenceBeforeRemoteWrite('sales-invoice')
       if (!fence.ok) return fence.result
+      const postContact = await resolveSalesPostContact(referenceType, referenceId, payload)
       const invoiceResult = await pushSalesInvoice({
         invoiceNumber: payload.invoiceNumber as string,
-        contactName: payload.contactName as string,
-        contactEmail: payload.contactEmail as string | undefined,
+        contactName: postContact.contactName,
+        contactEmail: postContact.contactEmail,
         date: payload.date as string,
         dueDate: payload.dueDate as string | undefined,
         currency: payload.currency as string,
@@ -6250,10 +6252,11 @@ export async function processClaimedEntry(
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice-update', payload)
       const fence = await lease.fenceBeforeRemoteWrite('sales-invoice-update')
       if (!fence.ok) return fence.result
+      const postContact = await resolveSalesPostContact(referenceType, referenceId, payload)
       const invoiceResult = await updateSalesInvoice(accountingInvoiceId, {
         invoiceNumber: payload.invoiceNumber as string,
-        contactName: payload.contactName as string,
-        contactEmail: payload.contactEmail as string | undefined,
+        contactName: postContact.contactName,
+        contactEmail: postContact.contactEmail,
         date: payload.date as string,
         dueDate: payload.dueDate as string | undefined,
         currency: payload.currency as string,
@@ -6677,10 +6680,11 @@ export async function processClaimedEntry(
         : undefined
       const fence = await lease.fenceBeforeRemoteWrite('credit-note')
       if (!fence.ok) return fence.result
+      const creditContact = await resolveSalesPostContact(referenceType, referenceId, payload)
       return pushCreditNote({
         creditNoteNumber: payload.creditNoteNumber as string,
-        contactName: payload.contactName as string,
-        contactEmail: payload.contactEmail as string | undefined,
+        contactName: creditContact.contactName,
+        contactEmail: creditContact.contactEmail,
         date: payload.date as string,
         currency: payload.currency as string,
         currencyRateToBase: payload.currencyRateToBase as number | undefined,
