@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
-import { CRON_RATE_LIMIT_FIVE_MINUTE_MAX, enforceCronRateLimit } from '@/lib/cron-rate-limit'
+import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { db } from '@/lib/db'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
@@ -9,7 +9,7 @@ import { isAccountingConnectorConnected } from '@/lib/accounting'
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
-  const rateLimitErr = await enforceCronRateLimit('accounting-sync', { request, max: CRON_RATE_LIMIT_FIVE_MINUTE_MAX })
+  const rateLimitErr = await enforceCronRateLimit('accounting-sync', { request })
   if (rateLimitErr) return rateLimitErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance

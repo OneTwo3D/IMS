@@ -1,19 +1,23 @@
 import assert from 'node:assert/strict'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import test from 'node:test'
 
 import {
   applyE2eMaxOverride,
-  CRON_RATE_LIMIT_FIVE_MINUTE_MAX,
   CRON_RATE_LIMIT_MAX,
   CRON_RATE_LIMIT_WINDOW_MS,
   E2E_GLOBAL_CAP_WINDOW_MS,
   cronRateLimitGlobalKey,
+  cronCadenceMs,
+  cronRateLimitFor,
   cronRateLimitKey,
   enforceCronRateLimit,
 } from '@/lib/cron-rate-limit'
+import { getAllCronJobs } from '@/lib/cron-registry'
 import { MemoryRateLimitBackend } from '@/lib/security/rate-limit-memory'
 
-test('cron rate-limit helper uses per-job hourly keys', async () => {
+test('cron rate-limit helper uses per-job keys and the limit derived from the registry schedule', async () => {
   const calls: Array<{ key: string; max: number; windowMs: number }> = []
   const response = await enforceCronRateLimit('inventory-snapshot', async (key, max, windowMs) => {
     calls.push({ key, max, windowMs })
@@ -23,9 +27,10 @@ test('cron rate-limit helper uses per-job hourly keys', async () => {
   assert.equal(response, null)
   assert.deepEqual(calls, [{
     key: cronRateLimitKey('inventory-snapshot'),
-    max: CRON_RATE_LIMIT_MAX,
-    windowMs: CRON_RATE_LIMIT_WINDOW_MS,
+    ...cronRateLimitFor('inventory-snapshot'),
   }])
+  assert.deepEqual(cronRateLimitFor('inventory-snapshot'), { max: 2, windowMs: 24 * 60 * 60_000 })
+  assert.deepEqual(cronRateLimitFor('not-a-registered-job'), { max: CRON_RATE_LIMIT_MAX, windowMs: CRON_RATE_LIMIT_WINDOW_MS })
 })
 
 test('cron rate-limit helper scopes quotas by verified source IP when available', async () => {
@@ -260,14 +265,14 @@ test('a capped E2E job cannot exceed its ceiling by rotating source IPs (tenant-
     )
   })
 
-  // Production (override disarmed) must be BYTE-IDENTICAL to before: no second bucket, so the pre-existing
-  // per-IP 1/hour slice still applies and no legitimate scheduled caller gains a new denial path.
+  // Production (override disarmed) takes no second bucket: only the per-IP slice applies (now 2 per hour, the
+  // cadence-derived headroom), so no legitimate scheduled caller gains a new denial path.
   await withEnvAsync({ E2E_TEST_MODE: undefined, E2E_CRON_RATE_LIMIT_MAX: '10000' }, async () => {
     const allowed = await drive()
     assert.equal(
       allowed,
-      SOURCE_IPS.length * HOURS,
-      'production keeps the IP-scoped 1/hour slice — one per IP per hour, unchanged',
+      SOURCE_IPS.length * HOURS * 2,
+      'production keeps only the IP-scoped slice — two per IP per hour (one run plus early-arrival headroom)',
     )
   })
 })
@@ -303,24 +308,87 @@ test('the tenant-wide ceiling is applied over 24h, not the job window (daily quo
   assert.equal(E2E_GLOBAL_CAP_WINDOW_MS, 24 * 60 * 60_000, 'the tenant-wide budget window is a full day')
 })
 
-test('five-minute cron quota keeps jitter headroom beyond exact twelve-per-hour cadence', async () => {
-  let now = Date.UTC(2026, 5, 9, 12, 0, 0)
-  const backend = new MemoryRateLimitBackend(() => now)
+const MINUTE = 60_000
+const HOUR = 60 * MINUTE
+const START = Date.UTC(2026, 10, 6, 12, 0, 0)
+const IP = '203.0.113.10'
 
-  for (let index = 0; index < 12; index += 1) {
-    const result = await backend.check(
-      cronRateLimitKey('shopping-webhook-inbox', '203.0.113.10'),
-      CRON_RATE_LIMIT_FIVE_MINUTE_MAX,
-      CRON_RATE_LIMIT_WINDOW_MS,
-    )
-    assert.equal(result.allowed, true, `expected scheduled run ${index + 1} to be allowed`)
-    now += 5_000
+async function admitAt(backend: MemoryRateLimitBackend, setNow: (t: number) => void, job: string, t: number) {
+  setNow(t)
+  const { max, windowMs } = cronRateLimitFor(job)
+  return (await backend.check(cronRateLimitKey(job, IP), max, windowMs)).allowed
+}
+
+function makeBackend() {
+  let now = START
+  return { backend: new MemoryRateLimitBackend(() => now), setNow: (t: number) => { now = t } }
+}
+
+test('hourly job: a run 500 ms early is admitted, a third run inside the window is refused', async () => {
+  for (const job of ['mintsoft-stock-sync', 'xero-tax-rate-drift']) {
+    const { backend, setNow } = makeBackend()
+    assert.equal(await admitAt(backend, setNow, job, START), true)
+    assert.equal(await admitAt(backend, setNow, job, START + HOUR - 500), true, `${job}: early next-hour run must be admitted`)
+    assert.equal(await admitAt(backend, setNow, job, START + HOUR - 400), false, `${job}: third run inside the window must be refused`)
+  }
+})
+
+test('sub-hourly job: every jittered scheduled run in a day is admitted, an excess burst is refused', async () => {
+  const { backend, setNow } = makeBackend()
+  const cadence = 15 * MINUTE
+  for (let i = 0; i < 96; i += 1) {
+    const jitter = i % 2 === 0 ? 0 : -500
+    assert.equal(await admitAt(backend, setNow, 'delivery-status', START + i * cadence + jitter), true, `run ${i}`)
+  }
+  const last = START + 95 * cadence
+  const { max } = cronRateLimitFor('delivery-status')
+  let refused = false
+  for (let i = 0; i < max + 1; i += 1) refused = !(await admitAt(backend, setNow, 'delivery-status', last + 1_000 + i))
+  assert.equal(refused, true, 'a burst well past the cadence is still refused')
+})
+
+test('daily job: a run 500 ms early is admitted, a third run inside the window is refused', async () => {
+  const { backend, setNow } = makeBackend()
+  const DAY = 24 * HOUR
+  assert.equal(await admitAt(backend, setNow, 'backup', START), true)
+  assert.equal(await admitAt(backend, setNow, 'backup', START + DAY - 500), true)
+  assert.equal(await admitAt(backend, setNow, 'backup', START + DAY - 400), false)
+})
+
+test('cadence parser reads the registry schedule shapes', () => {
+  assert.equal(cronCadenceMs('*/5 * * * *'), 5 * MINUTE)
+  assert.equal(cronCadenceMs('15 * * * *'), HOUR)
+  assert.equal(cronCadenceMs('0 */6 * * *'), 6 * HOUR)
+  assert.equal(cronCadenceMs('30 3 * * *'), 24 * HOUR)
+  assert.equal(cronCadenceMs('0,30 * * * *'), 30 * MINUTE)
+  assert.equal(cronCadenceMs('0 3 * * 1'), 24 * HOUR)
+  assert.equal(cronCadenceMs('nonsense'), null)
+})
+
+test('census: every registry job limit leaves headroom above its cadence, and no cron route overrides it', () => {
+  const jobs = getAllCronJobs()
+  assert.ok(jobs.length >= 30, `expected the full registry, got ${jobs.length}`)
+  for (const job of jobs) {
+    const cadence = cronCadenceMs(job.defaultSchedule)
+    assert.ok(cadence != null, `${job.slug}: unreadable schedule ${job.defaultSchedule}`)
+    const { max, windowMs } = cronRateLimitFor(job.slug)
+    // Strictly more runs per window than the schedule fires: max > windowMs / cadence.
+    assert.ok(max * cadence > windowMs, `${job.slug}: ${max}/${windowMs}ms does not exceed cadence ${cadence}ms`)
+    assert.ok(max >= 2, `${job.slug}: needs room for at least one early run`)
   }
 
-  const jitteredFollowUp = await backend.check(
-    cronRateLimitKey('shopping-webhook-inbox', '203.0.113.10'),
-    CRON_RATE_LIMIT_FIVE_MINUTE_MAX,
-    CRON_RATE_LIMIT_WINDOW_MS,
-  )
-  assert.equal(jitteredFollowUp.allowed, true)
+  // A route that passes its own max/windowMs bypasses the derivation; only unregistered routes may.
+  const registered = new Set(jobs.map((j) => j.slug))
+  const routesDir = join(process.cwd(), 'app/api/cron')
+  for (const dir of readdirSync(routesDir)) {
+    const file = join(routesDir, dir, 'route.ts')
+    if (!existsSync(file)) continue
+    const source = readFileSync(file, 'utf8')
+    const call = /enforceCronRateLimit\(\s*([^,]+),\s*\{([^}]*)\}/.exec(source)
+    if (!call || !/\b(max|windowMs)\s*:/.test(call[2])) continue
+    assert.ok(
+      !registered.has(dir) && !/PACK_SCHEDULE_SLUG/.test(call[1]),
+      `${dir}: registered cron job passes its own max/windowMs; let the registry schedule derive it`,
+    )
+  }
 })

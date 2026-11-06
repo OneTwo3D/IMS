@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
-import { CRON_RATE_LIMIT_FIFTEEN_MINUTE_MAX, enforceCronRateLimit } from '@/lib/cron-rate-limit'
+import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { sweepUnallocatedProcessingOrders } from '@/lib/fulfillment/reallocation-sweep'
 import { sweepUnresolvedDirectCreateMarkers } from '@/lib/fulfillment/pre-fulfilment-reallocation'
@@ -24,10 +24,7 @@ const CRON_BUDGET_MS = 300_000
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
-  const rateLimitErr = await enforceCronRateLimit('reallocation-sweep', {
-    request,
-    max: CRON_RATE_LIMIT_FIFTEEN_MINUTE_MAX,
-  })
+  const rateLimitErr = await enforceCronRateLimit('reallocation-sweep', { request })
   if (rateLimitErr) return rateLimitErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance

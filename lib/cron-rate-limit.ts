@@ -1,12 +1,93 @@
 import { NextResponse } from 'next/server'
 
+import '@/lib/cron-jobs'
+import { getAllCronJobs } from '@/lib/cron-registry'
 import { checkRateLimit, type RateLimitResult } from '@/lib/rate-limit'
 import { getClientIp } from '@/lib/request-ip'
 
-export const CRON_RATE_LIMIT_MAX = 1
+/** Fallback limit for a job that is not in the cron registry: two runs per hour, never exactly the cadence. */
+export const CRON_RATE_LIMIT_MAX = 2
 export const CRON_RATE_LIMIT_WINDOW_MS = 60 * 60_000
-export const CRON_RATE_LIMIT_FIVE_MINUTE_MAX = 15
 export const CRON_RATE_LIMIT_FIFTEEN_MINUTE_MAX = 6
+
+const HOUR_MS = 60 * 60_000
+const DAY_MS = 24 * HOUR_MS
+
+export type CronRateLimit = { max: number; windowMs: number }
+
+/** Expand one cron field (`*`, `a`, `a-b`, lists, optional `/step`) to its sorted values, or null. */
+function expandCronField(field: string, min: number, max: number): number[] | null {
+  const out = new Set<number>()
+  for (const part of field.split(',')) {
+    const [range, stepRaw, extra] = part.split('/')
+    if (extra !== undefined) return null
+    const step = stepRaw === undefined ? 1 : Number(stepRaw)
+    if (!Number.isInteger(step) || step < 1) return null
+    let lo: number
+    let hi: number
+    if (range === '*') {
+      lo = min
+      hi = max
+    } else if (/^\d+$/.test(range)) {
+      lo = Number(range)
+      hi = stepRaw === undefined ? lo : max
+    } else if (/^\d+-\d+$/.test(range)) {
+      ;[lo, hi] = range.split('-').map(Number)
+    } else {
+      return null
+    }
+    if (lo < min || hi > max || lo > hi) return null
+    for (let v = lo; v <= hi; v += step) out.add(v)
+  }
+  return out.size > 0 ? [...out].sort((a, b) => a - b) : null
+}
+
+/** Smallest cyclic gap between consecutive values in a period (a single value gaps a whole period). */
+function minCyclicGap(values: number[], period: number): number {
+  let gap = period
+  for (let i = 1; i < values.length; i += 1) gap = Math.min(gap, values[i] - values[i - 1])
+  if (values.length > 1) gap = Math.min(gap, values[0] + period - values[values.length - 1])
+  return gap
+}
+
+/**
+ * Shortest interval between two firings of a 5-field cron expression, in ms, or null when it cannot be read.
+ * Day-of-month / month / day-of-week restrictions only ever lengthen the interval, so they floor it at a day.
+ */
+export function cronCadenceMs(expression: string): number | null {
+  const fields = expression.trim().split(/\s+/)
+  if (fields.length !== 5) return null
+  const minutes = expandCronField(fields[0], 0, 59)
+  const hours = expandCronField(fields[1], 0, 23)
+  if (!minutes || !hours) return null
+  let cadence: number
+  if (minutes.length > 1) cadence = minCyclicGap(minutes, 60) * 60_000
+  else if (hours.length === 24) cadence = HOUR_MS
+  else cadence = minCyclicGap(hours, 24) * HOUR_MS
+  if (fields[2] !== '*' || fields[3] !== '*' || fields[4] !== '*') cadence = Math.max(cadence, DAY_MS)
+  return cadence
+}
+
+/**
+ * The rate limit that leaves headroom above a cadence, so a scheduled run is never refused for arriving a
+ * little early (cron jitter, a burst of jobs at :00, retries):
+ * - cadence of an hour or more: the window IS the cadence and two runs fit in it, so a run landing
+ *   milliseconds before the previous one's anniversary is still admitted and only a third is refused;
+ * - sub-hourly: the usual hour window with the scheduled runs plus a quarter (at least two) spare.
+ */
+export function cronRateLimitForCadence(cadenceMs: number): CronRateLimit {
+  if (cadenceMs >= HOUR_MS) return { max: 2, windowMs: cadenceMs }
+  const runs = Math.ceil(HOUR_MS / cadenceMs)
+  return { max: runs + Math.max(2, Math.ceil(runs / 4)), windowMs: HOUR_MS }
+}
+
+/** Default limit for a job: derived from its registry schedule, or the generic fallback when unknown. */
+export function cronRateLimitFor(jobName: string): CronRateLimit {
+  const job = getAllCronJobs().find((j) => j.slug === jobName)
+  const cadence = job ? cronCadenceMs(job.defaultSchedule) : null
+  if (cadence == null) return { max: CRON_RATE_LIMIT_MAX, windowMs: CRON_RATE_LIMIT_WINDOW_MS }
+  return cronRateLimitForCadence(cadence)
+}
 
 export type CronRateLimitChecker = (
   key: string,
@@ -32,9 +113,12 @@ export type CronRateLimitOptions = {
  *   CRON_SECRET quota exhaustion to the caller's IP slice; rotating the secret
  *   should still be paired with clearing/restarting the rate-limit backend if
  *   an incident consumed the legitimate caller's quota.
- * - Sub-hourly jobs intentionally use headroom above exact cadence. Do not set
- *   a 5-minute cron to exactly 12/hour or a 15-minute cron to exactly 4/hour;
- *   jitter, retries, and boundary timing will deny legitimate scheduled runs.
+ * - Every job's limit is derived from its registry schedule (cronRateLimitFor) and always leaves
+ *   headroom above exact cadence: sub-hourly jobs get their runs per hour plus spare, hourly and
+ *   N-hourly/daily jobs get two runs per cadence window. Do not pass a per-route `max`/`windowMs`
+ *   equal to the cadence (a 5-minute cron at exactly 12/hour, an hourly cron at exactly 1/hour);
+ *   jitter, retries, and boundary timing will deny legitimate scheduled runs. Routes should not
+ *   override at all; the census test in tests/security/cron-rate-limit.test.ts enforces that.
  * - Fail-open on backend error is DELIBERATE here (checkRateLimit is called
  *   without `failClosed`): cron routes are already gated by CRON_SECRET, so a
  *   rate-limit backend outage must not block legitimate scheduled jobs. This is
@@ -157,9 +241,10 @@ export async function enforceCronRateLimit(
   const options = typeof optionsOrChecker === 'function'
     ? { checker: optionsOrChecker }
     : optionsOrChecker
-  const baseMax = options.max ?? CRON_RATE_LIMIT_MAX
+  const derived = cronRateLimitFor(jobName)
+  const baseMax = options.max ?? derived.max
   const max = applyE2eMaxOverride(jobName, baseMax)
-  const windowMs = options.windowMs ?? CRON_RATE_LIMIT_WINDOW_MS
+  const windowMs = options.windowMs ?? derived.windowMs
   const checker = options.checker ?? checkRateLimit
   const sourceIp = options.request ? getClientIp(options.request.headers) : null
   let result = await checker(

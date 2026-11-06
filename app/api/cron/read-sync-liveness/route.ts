@@ -14,7 +14,7 @@ export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
   // Headroom above the hourly cadence, as the WMS watchdog has: a failed run consumes a slot too.
-  const rateLimitErr = await enforceCronRateLimit('read-sync-liveness', { request, max: 3 })
+  const rateLimitErr = await enforceCronRateLimit('read-sync-liveness', { request })
   if (rateLimitErr) return rateLimitErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
