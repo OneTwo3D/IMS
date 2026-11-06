@@ -231,3 +231,39 @@ test('an amendment sending the key pins a key-keyed override id on its first pos
   await amend(INPUT, [{ result: [{ Success: true }] }], '')
   assert.equal(posts[0]!.CourierServiceId, undefined)
 })
+
+// --- the amendment POST for each form -----------------------------------------------------------
+
+test('amendment POST per form: key, legacy and placeholder each carry the right courier, never none', async () => {
+  const { applyLinkCourierForm } = await import('@/lib/domain/wms/order-push-sweep')
+  // key form (create sent the key and it was accepted)
+  await amend(applyLinkCourierForm(INPUT, { courierForm: 'NAME', courierFormName: KEY }), [{ result: [{ Success: true }] }])
+  assert.equal(posts[0]!.CourierService, KEY)
+  // legacy form
+  await amend(applyLinkCourierForm(INPUT, { courierForm: 'LEGACY', courierFormName: KEY }), [{ result: [{ Success: true }] }])
+  assert.equal(posts[0]!.CourierService, LABEL)
+  // placeholder form: the configured default id, no name
+  defaultCourierId = '77'
+  await amend(applyLinkCourierForm(INPUT, { courierForm: 'PLACEHOLDER', courierFormName: KEY }), [{ result: [{ Success: true }] }])
+  assert.equal(posts[0]!.CourierServiceId, 77)
+  assert.equal(posts[0]!.CourierService, undefined)
+})
+
+test('an order created through the default-id fallback is amended on the default id', async () => {
+  const { applyLinkCourierForm } = await import('@/lib/domain/wms/order-push-sweep')
+  const created = await run(INPUT, [{ result: [REFUSED] }, { result: [REFUSED] }, { result: [CREATED] }], { defaultId: '77' })
+  assert.equal(created.courierForm, 'PLACEHOLDER')
+  await amend(applyLinkCourierForm(INPUT, { courierForm: created.courierForm, courierFormName: created.courierFormName }), [{ result: [{ Success: true }] }])
+  assert.equal(posts.length, 1)
+  assert.equal(posts[0]!.CourierServiceId, 77)
+})
+
+test('a placeholder order whose default id is no longer configured is refused before any write', async () => {
+  const { applyLinkCourierForm } = await import('@/lib/domain/wms/order-push-sweep')
+  defaultCourierId = ''
+  await assert.rejects(
+    () => amend(applyLinkCourierForm(INPUT, { courierForm: 'PLACEHOLDER', courierFormName: KEY }), [{ result: [{ Success: true }] }]),
+    /no default CourierServiceId is configured/,
+  )
+  assert.equal(posts.length, 0)
+})

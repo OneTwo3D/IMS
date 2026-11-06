@@ -613,6 +613,16 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
   if (!found) return { updated: false, status: 'NOT_FOUND' }
   if (!isNew) return { updated: false, status: 'NOT_NEW' }
 
+  // An order created on the placeholder courier is amended on the configured default CourierServiceId, never without a
+  // courier. If that default is gone, refuse BEFORE any write: sending the amendment with neither a name nor an id would
+  // blank or mis-set the courier on a live order.
+  const settings = await getMintsoftSettings()
+  const courierMap = settings.mintsoft_courier_service_map
+  const placeholderId = input.courierPlaceholder ? parseDefaultCourierId(settings.mintsoft_default_courier_service_id) : null
+  if (input.courierPlaceholder && placeholderId == null) {
+    throw new Error('Mintsoft order amendment not sent: the order was created on the placeholder courier but no default CourierServiceId is configured now; set one or choose the courier in Mintsoft')
+  }
+
   // Line items are amended via the /Items sub-resource (the order-update endpoint ignores
   // them); this propagates refund-netted quantities to the still-NEW WMS order.
   await reconcileMintsoftOrderItems(externalOrderId, input, clientId)
@@ -629,9 +639,10 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
   }
   // The configured override for the form being sent (key, or the legacy form an earlier create moved to), resolved with the
   // same lookup order as the create, so the amendment pins the same CourierServiceId the create did.
-  const courierMap = (await getMintsoftSettings()).mintsoft_courier_service_map
   const mappedId = resolveMappedCourierIdForInput(input, courierMap)
-  let data = await post(buildPushPayload(input, mappedId != null ? { kind: 'mappedId', courierServiceId: mappedId } : { kind: 'name' }, false))
+  const firstCourier: CourierOption = placeholderId != null ? { kind: 'defaultId', courierServiceId: placeholderId }
+    : mappedId != null ? { kind: 'mappedId', courierServiceId: mappedId } : { kind: 'name' }
+  let data = await post(buildPushPayload(input, firstCourier, false))
   // The same rule as the create (one shared helper). An order the create already moved to the legacy form arrives with no
   // key left, so there is nothing further to retry.
   const retry = data?.Success === false ? legacyCourierRetry(input, courierMap, data, toStr(data.Message)) : null

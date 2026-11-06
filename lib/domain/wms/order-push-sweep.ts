@@ -651,7 +651,7 @@ export function applyLinkCourierForm(
 ): WmsOrderPushInput {
   if (!link.courierForm || (link.courierFormName ?? null) !== input.courierService) return input
   if (link.courierForm === 'LEGACY') return legacyCourierFormInput(input) ?? input
-  if (link.courierForm === 'PLACEHOLDER') return { ...input, courierService: null, courierServiceAlternates: [], courierServiceLegacy: null }
+  if (link.courierForm === 'PLACEHOLDER') return { ...input, courierService: null, courierServiceAlternates: [], courierServiceLegacy: null, courierPlaceholder: true }
   return input
 }
 

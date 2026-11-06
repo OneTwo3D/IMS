@@ -416,6 +416,11 @@ export type WmsOrderPushInput = {
    * the order would be pushed with without it, for the single retry after the warehouse refuses the key.
    */
   courierServiceLegacy?: string | null
+  /**
+   * Set on an AMENDMENT of an order whose create fell back to the configured default courier: there is no courier name to
+   * send, the courier is the default CourierServiceId, and an amendment must not go out without one.
+   */
+  courierPlaceholder?: boolean
   totalVat: number
   shippingExVat: number
   shippingVat: number
