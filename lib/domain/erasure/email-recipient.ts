@@ -13,5 +13,4 @@ export class EmailRecipientErasedError extends Error {
 }
 
 export const EMAIL_RECIPIENT_ERASED_REASON = 'Cancelled: the recipient\'s personal data was erased'
-export const EMAIL_RECIPIENT_CHANGED_REASON = 'Cancelled: the address on the order no longer matches the queued recipient'
 export const ERASED_RECIPIENT_PLACEHOLDER = ERASURE_PLACEHOLDER_EMAIL

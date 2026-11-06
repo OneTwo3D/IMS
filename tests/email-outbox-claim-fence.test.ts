@@ -3468,17 +3468,31 @@ test('ERASURE: the erasure replaces the address WHILE the row is claimed (during
   assert.equal(rows[0].toEmail, ERASED_PLACEHOLDER)
 })
 
-test('ERASURE: an address on the order that no longer matches the queued recipient is refused and erased from the row', async () => {
+test('ERASURE: a prepared address that is the erasure placeholder is refused and erased from the row', async () => {
   const deliveries: string[] = []
   const { client, rows } = await makeClient([makeRow()])
   await drain({
     client, now: () => T0, logActivity: noLog,
-    async prepareQueuedEmail() { return { to: 'someone.else@example.test', subject: 's', html: 'h' } },
+    async prepareQueuedEmail() { return { to: ERASED_PLACEHOLDER, subject: 's', html: 'h' } },
     async sendEmail(m) { deliveries.push(m.to); return { success: true } },
   })
   assert.deepEqual(deliveries, [])
   assert.equal(rows[0].status, 'FAILED')
   assert.equal(rows[0].toEmail, ERASED_PLACEHOLDER)
+})
+
+test('NOT erased: an address edited on the order after the email was queued is delivered to the live address, exactly as before', async () => {
+  const deliveries: string[] = []
+  const { client, rows } = await makeClient([makeRow()])
+  const outcome = await drain({
+    client, now: () => T0, logActivity: noLog,
+    async prepareQueuedEmail() { return { to: 'edited.address@example.test', subject: 's', html: 'h' } },
+    async sendEmail(m) { deliveries.push(m.to); return { success: true } },
+  })
+  assert.deepEqual(deliveries, ['edited.address@example.test'])
+  assert.equal(outcome.sent, 1)
+  assert.equal(rows[0].status, 'SENT')
+  assert.notEqual(rows[0].toEmail, ERASED_PLACEHOLDER, 'the row\'s address is not erased by an ordinary edit')
 })
 
 test('ERASURE control: an unchanged recipient is sent normally, so the refusals above are the guard and not the harness', async () => {

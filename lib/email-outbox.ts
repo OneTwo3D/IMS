@@ -135,7 +135,6 @@ import { uniqueConstraintFields } from '@/lib/db/prisma-unique-violation'
 import { sendEmail } from '@/lib/mailer'
 import { prepareQueuedEmail } from '@/lib/order-email'
 import {
-  EMAIL_RECIPIENT_CHANGED_REASON,
   EMAIL_RECIPIENT_ERASED_REASON,
   ERASED_RECIPIENT_PLACEHOLDER,
   EmailRecipientErasedError,
@@ -2487,8 +2486,11 @@ export async function processPendingEmailOutbox(
         }
         throw prepareError
       }
-      if (prepared && normalizeEmail(prepared.to) !== normalizedRecipient) {
-        await refuseRecipient(EMAIL_RECIPIENT_CHANGED_REASON)
+      // ONLY an erased recipient is refused here. An address edited on a live order after the email was queued keeps the
+      // behaviour it always had (the email goes to `prepared.to`, the live address); the preparer has already refused an
+      // erased order or customer, so a prepared address that is the erasure placeholder is the one remaining signal.
+      if (prepared && normalizeEmail(prepared.to) === normalizeEmail(ERASED_RECIPIENT_PLACEHOLDER)) {
+        await refuseRecipient(EMAIL_RECIPIENT_ERASED_REASON)
         continue
       }
       const attachments = prepared?.attachments ?? ((email.attachments as QueuedAttachment[] | null) ?? []).map((attachment) => ({
