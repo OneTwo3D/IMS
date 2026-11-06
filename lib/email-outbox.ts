@@ -200,7 +200,7 @@ type QueueEmailInput = {
  * removed from the enqueue contract too rather than left as the one place it still reads as a
  * guarantee.
  */
-export type QueueEmailOutcome = { queued: true } | { queued: false; reason: 'already_queued' }
+export type QueueEmailOutcome = { queued: true } | { queued: false; reason: 'already_queued' } | { queued: false; reason: 'recipient_erased' }
 
 export type EmailOutboxRow = {
   id: string
@@ -1463,18 +1463,35 @@ export async function queueEmail(
     contentType: attachment.contentType,
   }))
 
+  const data = {
+    kind: input.kind,
+    toEmail: normalizeEmail(input.to),
+    subject: input.subject,
+    html: input.html,
+    attachments: attachments as never,
+    referenceType: input.referenceType ?? null,
+    referenceId: input.referenceId ?? null,
+  }
+
   try {
-    await client.emailOutbox.create({
-      data: {
-        kind: input.kind,
-        toEmail: normalizeEmail(input.to),
-        subject: input.subject,
-        html: input.html,
-        attachments: attachments as never,
-        referenceType: input.referenceType ?? null,
-        referenceId: input.referenceId ?? null,
-      },
-    })
+    // EVERY SALES-ORDER EMAIL IS INSERTED UNDER THE ORDER LOCK, WITH THE ERASURE MARKERS READ INSIDE IT. The caller read the
+    // address earlier (from the order); an erasure can commit between that read and this insert, and a row inserted after it would
+    // hold the original address until the reconcile pass removed it. Here the order row is locked (the erasure takes the same
+    // lock), the order's marker and its customer's are read, and the row is inserted in the same transaction: either the erasure
+    // committed first and the enqueue is REFUSED with nothing written, or this commits first and the erasure finds the row and
+    // erases its address. Production only: an injected harness client (tests of the drain) has no order table and is unchanged.
+    if (!options.client && input.referenceType === 'SalesOrder' && input.referenceId) {
+      const orderId = input.referenceId
+      const refused = await db.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "sales_orders" WHERE id = ${orderId} FOR UPDATE`
+        const order = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, customer: { select: { gdprAnonymisedAt: true } } } })
+        if (order?.erasedAt || order?.customer?.gdprAnonymisedAt) return true
+        await tx.emailOutbox.create({ data })
+        return false
+      })
+      return refused ? { queued: false, reason: 'recipient_erased' } : { queued: true }
+    }
+    await client.emailOutbox.create({ data })
     return { queued: true }
   } catch (error) {
     if (isUndeliveredEmailCollision(error)) return { queued: false, reason: 'already_queued' }

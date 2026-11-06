@@ -31,6 +31,8 @@ export async function sendAccountingInvoiceEmailInternal(orderId: string): Promi
       referenceId: orderId,
     })
 
+    if (!outcome.queued && outcome.reason === 'recipient_erased') return { success: false, error: 'This order\'s personal data was erased, so no invoice email is sent for it.' }
+
     await logActivity({
       entityType: 'SALES_ORDER', entityId: orderId, action: 'invoice_email_queued', tag: 'sales', level: 'INFO',
       description: outcome.queued

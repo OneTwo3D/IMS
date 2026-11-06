@@ -22,6 +22,8 @@ const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const skip = !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1'
 
 let accountingMocked = false
+// Runs after an email action has read the order's address and before it enqueues.
+let afterAddressRead: (() => Promise<void>) | null = null
 // Runs inside logActivityInTransaction, before the row is written (see mockActionEnvironment).
 let beforeActivityWrite: (() => Promise<void>) | null = null
 // Runs inside the importer's accounting step: between the order create and the invoice enqueue / hold.
@@ -53,6 +55,9 @@ async function mockActionEnvironment() {
   const guards = Object.fromEntries(Object.keys(actual).filter((k) => k.startsWith('require')).map((k) => [k, async () => session]))
   mock.module('@/lib/auth/server', { namedExports: { ...actual, ...guards } })
   mock.module('next/cache', { namedExports: { revalidatePath: () => undefined, revalidateTag: () => undefined } })
+  // A seam between an email action's read of the order address and its enqueue (the read is real; the hook runs after it).
+  const orderEmail = await import('@/lib/order-email')
+  mock.module('@/lib/order-email', { namedExports: { ...orderEmail, getAccountingInvoiceQueueData: async (orderId: string) => { const data = await orderEmail.getAccountingInvoiceQueueData(orderId); await afterAddressRead?.(); return data } } })
   // A seam to pause an action between its write and its in-transaction activity row (and only there).
   const activity = await import('@/lib/activity-log')
   mock.module('@/lib/activity-log', { namedExports: { ...activity, logActivityInTransaction: async (tx: never, params: never) => { await beforeActivityWrite?.(); return activity.logActivityInTransaction(tx, params) } } })
@@ -858,4 +863,31 @@ test('[erasure] a customer edit and its name-bearing activity row commit togethe
   assert.equal(made.success, true, JSON.stringify(made))
   t.after(async () => { await db.activityLog.deleteMany({ where: { entityId: made.customer!.id } }); await db.customer.deleteMany({ where: { id: made.customer!.id } }) })
   assert.equal(await db.activityLog.count({ where: { entityId: made.customer!.id, action: 'created' } }), 1)
+})
+
+
+test('[erasure] an email enqueue racing the erasure: paused after the address read, the erasure completes, the insert resumes: refused, no row holds the address', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  t.after(async () => { afterAddressRead = null; await fx.cleanup() })
+  const { sendAccountingInvoiceEmailInternal } = await import('@/lib/accounting-email')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  await db.salesOrder.update({ where: { id: fx.orderId }, data: { invoicePdfPath: `uploads/invoices/${fx.orderId}.pdf`, invoiceNumber: 'INV-MAIL-1' } })
+  await db.emailOutbox.deleteMany({ where: { referenceId: fx.orderId, kind: 'ACCOUNTING_INVOICE' } })
+
+  // CONTROL: with no erasure in between, the same call queues a row addressed to the customer.
+  const control = await sendAccountingInvoiceEmailInternal(fx.orderId)
+  assert.equal(control.success, true, JSON.stringify(control))
+  assert.equal(await db.emailOutbox.count({ where: { referenceId: fx.orderId, kind: 'ACCOUNTING_INVOICE', toEmail: EMAIL } }), 1, 'the control queued a row with the address')
+  await db.emailOutbox.deleteMany({ where: { referenceId: fx.orderId, kind: 'ACCOUNTING_INVOICE' } })
+
+  // THE RACE: paused after the address read, the erasure runs to completion, then the insert resumes.
+  afterAddressRead = async () => {
+    afterAddressRead = null
+    assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  }
+  const result = await sendAccountingInvoiceEmailInternal(fx.orderId)
+  assert.equal(result.success, false, 'the enqueue was refused')
+  assert.equal(await db.emailOutbox.count({ where: { referenceId: fx.orderId, kind: 'ACCOUNTING_INVOICE' } }), 0, 'nothing was written')
+  assert.equal(await db.emailOutbox.count({ where: { toEmail: EMAIL } }), 0, 'no outbox row anywhere holds the address')
 })

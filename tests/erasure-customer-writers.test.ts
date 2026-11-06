@@ -166,6 +166,32 @@ test('the central gate runs before the insert in the one primitive that writes a
   assert.match(fn, /const data = await gateAccountingPayloadContact\(client, rawData\)[\s\S]*accountingSyncLog\.create/)
 })
 
+/**
+ * CENSUS OF EVERY WRITER OF AN email_outbox ROW, and what ties each to the erasure. A SalesOrder-linked email carries the
+ * order's address, read by the caller before it enqueues; the enqueue itself must therefore take the order lock, read the
+ * order's and the customer's erasure markers and insert, in one transaction, refusing when either is set.
+ *
+ *   queueEmail    the single enqueue function (order confirmation, invoice, accounting invoice): gated centrally
+ *   dispatch      the dispatch email, which has its own transaction: it already locks the order, and reads the markers there
+ */
+const OUTBOX_WRITERS: Record<string, { writers: number; verdict: string }> = {
+  'lib/dispatch-email.ts': { writers: 1, verdict: 'dispatch (own transaction: order lock + markers read before the insert)' },
+  'lib/email-outbox.ts': { writers: 2, verdict: 'queueEmail (gated: order-locked transaction for SalesOrder rows) / the harness-only client path' },
+}
+
+test('every writer of email_outbox rows is in the census, and the SalesOrder enqueue is gated under the order lock', () => {
+  const cwd = new URL('..', import.meta.url).pathname
+  const out = execFileSync('git', ['grep', '-cE', 'emailOutbox\\.create(Many)?\\(', '--', 'app', 'lib', ':!app/generated', ':!*.test.ts'], { encoding: 'utf8', cwd }).trim().split('\n').filter(Boolean)
+  const found = Object.fromEntries(out.map((line) => { const i = line.lastIndexOf(':'); return [line.slice(0, i), Number(line.slice(i + 1))] }))
+  assert.deepEqual(found, Object.fromEntries(Object.entries(OUTBOX_WRITERS).map(([f, v]) => [f, v.writers])))
+  const q = readFileSync(new URL('../lib/email-outbox.ts', import.meta.url), 'utf8')
+  const fn = q.slice(q.indexOf('export async function queueEmail'))
+  assert.match(fn, /FOR UPDATE[\s\S]*erasedAt[\s\S]*gdprAnonymisedAt[\s\S]*tx\.emailOutbox\.create\(\{ data \}\)/)
+  assert.match(fn, /reason: 'recipient_erased'/)
+  const d = readFileSync(new URL('../lib/dispatch-email.ts', import.meta.url), 'utf8')
+  assert.match(d, /lockSalesOrder\(tx, orderId\)[\s\S]*erasedAt[\s\S]*gdprAnonymisedAt[\s\S]*tx\.emailOutbox\.create/)
+})
+
 test('both manual order creators lock and re-read the customer inside the create transaction, before the create', () => {
   const src = readFileSync(new URL('../app/actions/sales.ts', import.meta.url), 'utf8')
   const start = src.indexOf('export async function createSalesOrder')
