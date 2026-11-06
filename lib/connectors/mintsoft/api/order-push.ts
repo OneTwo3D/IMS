@@ -6,6 +6,7 @@ import type {
   WmsOrderPushResult,
   WmsOrderUpdateResult,
 } from '@/lib/connectors/wms/types'
+import { legacyCourierFormInput } from '@/lib/connectors/wms/courier-form'
 import { roundTransmittedMoney } from '@/lib/connectors/wms/transmitted-money'
 import { extractMintsoftArrayPayload, extractMintsoftArrayPayloadStrict, extractMintsoftObjectPayload } from './normalizers'
 import { mintsoftRequest } from './client'
@@ -207,15 +208,9 @@ export function legacyCourierRetry(
   data: Record<string, unknown> | null,
   message: string | null,
 ): { input: WmsOrderPushInput; courier: CourierOption } | null {
-  const legacy = input.courierServiceLegacy
-  if (!legacy || !input.courierService || legacy === input.courierService) return null
   if (data?.Success !== false || !message || !/unable to find courierservice/i.test(message)) return null
-  const legacyInput: WmsOrderPushInput = {
-    ...input,
-    courierService: legacy,
-    courierServiceAlternates: (input.courierServiceAlternates ?? []).filter((n) => n !== input.courierService && n !== legacy),
-    courierServiceLegacy: null,
-  }
+  const legacyInput = legacyCourierFormInput(input)
+  if (!legacyInput) return null
   const mappedId = resolveMappedCourierIdForInput(legacyInput, mapJson)
   return { input: legacyInput, courier: mappedId != null ? { kind: 'mappedId', courierServiceId: mappedId } : { kind: 'name' } }
 }
@@ -632,12 +627,14 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
     const raw = result.data
     return Array.isArray(raw) ? ((raw[0] as RawOrder) ?? null) : (extractMintsoftObjectPayload(raw) as RawOrder | null)
   }
-  let data = await post(buildPushPayload(input, { kind: 'name' }, false))
+  // The configured override for the form being sent (key, or the legacy form an earlier create moved to), resolved with the
+  // same lookup order as the create, so the amendment pins the same CourierServiceId the create did.
+  const courierMap = (await getMintsoftSettings()).mintsoft_courier_service_map
+  const mappedId = resolveMappedCourierIdForInput(input, courierMap)
+  let data = await post(buildPushPayload(input, mappedId != null ? { kind: 'mappedId', courierServiceId: mappedId } : { kind: 'name' }, false))
   // The same rule as the create (one shared helper). An order the create already moved to the legacy form arrives with no
   // key left, so there is nothing further to retry.
-  const retry = data?.Success === false
-    ? legacyCourierRetry(input, (await getMintsoftSettings()).mintsoft_courier_service_map, data, toStr(data.Message))
-    : null
+  const retry = data?.Success === false ? legacyCourierRetry(input, courierMap, data, toStr(data.Message)) : null
   if (retry) data = await post(buildPushPayload(retry.input, retry.courier, false))
   if (data?.Success === true || data?.OrderId != null) return { updated: true, status: 'NEW' }
   throw new Error(toStr(data?.Message) ?? 'Mintsoft order update failed')

@@ -209,3 +209,25 @@ test('create and amendment decide the retry through the same helper and agree on
   assert.equal(legacyCourierRetry(INPUT, map, { Message: 'x' }, 'Unable to Find CourierService'), null)
   assert.equal(legacyCourierRetry({ ...INPUT, courierServiceLegacy: null }, map, REFUSED, 'Unable to Find CourierService'), null)
 })
+
+test('a create that succeeds through a title-keyed legacy override is followed by an amendment whose FIRST post pins that id', async () => {
+  const { applyLinkCourierForm } = await import('@/lib/domain/wms/order-push-sweep')
+  const map = JSON.stringify({ [TITLE]: 17 })
+  const created = await run(INPUT, [{ result: [REFUSED] }, { result: [CREATED] }], { map })
+  assert.equal(created.courierForm, 'LEGACY')
+  assert.equal(puts[1]!.CourierServiceId, 17)
+  // The amendment of that order: the link remembers LEGACY and the first name tried.
+  const amended = applyLinkCourierForm(INPUT, { courierForm: created.courierForm, courierFormName: created.courierFormName })
+  await amend(amended, [{ result: [{ Success: true }] }], map)
+  assert.equal(posts.length, 1)
+  assert.equal(posts[0]!.CourierService, LABEL)
+  assert.equal(posts[0]!.CourierServiceId, 17)
+})
+
+test('an amendment sending the key pins a key-keyed override id on its first post', async () => {
+  await amend(INPUT, [{ result: [{ Success: true }] }], JSON.stringify({ [KEY]: 21, [TITLE]: 17 }))
+  assert.equal(posts[0]!.CourierService, KEY)
+  assert.equal(posts[0]!.CourierServiceId, 21)
+  await amend(INPUT, [{ result: [{ Success: true }] }], '')
+  assert.equal(posts[0]!.CourierServiceId, undefined)
+})

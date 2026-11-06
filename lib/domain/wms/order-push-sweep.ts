@@ -8,6 +8,7 @@ import { MAX_ADVISORY_PENCE } from './push-total-mismatch-note'
 import { isMirroredFeeLine } from './mirrored-fee-line'
 import { reconcilePushTotals, withheldGoodsGross, withheldLineCount } from './push-total-guard'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
+import { legacyCourierFormInput } from '@/lib/connectors/wms/courier-form'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { wmsCreateObligationFloor, wmsProducerHold, wmsProducerSeam } from '@/lib/connectors/wms/producer-seam'
 import type { ProducerDecisionContext } from '@/lib/security/producer-disposition'
@@ -649,9 +650,7 @@ export function applyLinkCourierForm(
   link: { courierForm?: string | null; courierFormName?: string | null },
 ): WmsOrderPushInput {
   if (!link.courierForm || (link.courierFormName ?? null) !== input.courierService) return input
-  if (link.courierForm === 'LEGACY' && input.courierServiceLegacy) {
-    return { ...input, courierService: input.courierServiceLegacy, courierServiceAlternates: [], courierServiceLegacy: null }
-  }
+  if (link.courierForm === 'LEGACY') return legacyCourierFormInput(input) ?? input
   if (link.courierForm === 'PLACEHOLDER') return { ...input, courierService: null, courierServiceAlternates: [], courierServiceLegacy: null }
   return input
 }
