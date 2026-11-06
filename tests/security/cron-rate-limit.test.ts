@@ -415,7 +415,7 @@ test('the effective (saved) schedule drives the limit, not the registry default'
   }
 })
 
-test('production: a live-Xero job has an IP-independent rolling daily budget; the census names every Xero job', async () => {
+test('production: a live-Xero job has an IP-independent rolling daily budget; the census names every accounting-module job', async () => {
   const budget = cronXeroDailyBudget('0 * * * *')
   assert.equal(budget, 32)
   assert.ok(budget < 1000 && budget > 24, 'above the 24 scheduled runs, far below the tenant allowance')
@@ -442,9 +442,12 @@ test('production: a live-Xero job has an IP-independent rolling daily budget; th
   // Census: every registry job in the xero module is in the live-Xero set, every member is a real job, and each
   // job's budget exceeds its busiest day.
   const registry = getAllCronJobs()
-  for (const job of registry.filter((j) => j.module === 'xero')) {
-    assert.ok(XERO_LIVE_CRON_JOBS.has(job.slug), `${job.slug} is a Xero-module job missing from XERO_LIVE_CRON_JOBS`)
+  const accountingJobs = registry.filter((j) => j.module === 'accounting')
+  assert.equal(accountingJobs.length, 6, 'the accounting module registers the six Xero-calling jobs; a new one needs a census decision')
+  for (const job of accountingJobs) {
+    assert.ok(XERO_LIVE_CRON_JOBS.has(job.slug), `${job.slug} is an accounting-module job missing from XERO_LIVE_CRON_JOBS`)
   }
+  assert.deepEqual([...XERO_LIVE_CRON_JOBS].sort(), accountingJobs.map((j) => j.slug).sort())
   for (const slug of XERO_LIVE_CRON_JOBS) {
     const job = registry.find((j) => j.slug === slug)
     assert.ok(job, `${slug} is not a registered job`)
