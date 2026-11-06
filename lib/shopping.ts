@@ -36,7 +36,14 @@ import { getShoppingConnector, SHOPPING_CONNECTORS, type ShoppingConnectorId } f
  * "pushed" on `success` is therefore never told a shadow was pushed, and a caller that logs failures can tell a shadow from one.
  */
 export type PushProductMetadataResult = { success: boolean; skipped?: boolean; error?: string; shadowed?: boolean }
-export type PushOrderDeliveryMetadataResult = { success: boolean; skipped?: boolean; error?: string; shadowed?: boolean }
+export type PushOrderDeliveryMetadataResult = {
+  success: boolean
+  skipped?: boolean
+  error?: string
+  shadowed?: boolean
+  /** Why the hold kept the push as a shadow, when it did (only the partial-shipment push carries it). */
+  shadowReason?: import('@/lib/security/producer-disposition-constants').ProducerReason
+}
 export type PushOrderStatusResult = {
   success: boolean
   skipped?: boolean
@@ -291,7 +298,7 @@ export async function pushPartialShipmentToShopping(
           resolveObligationAt: async () => new Date(),
         })
         if (!seam.proceed) {
-          return { connector, result: { supported: true, ok: false, shadowed: true, skipped: false, allDone: undefined, duplicate: undefined, error: seam.notice } }
+          return { connector, result: { supported: true, ok: false, shadowed: true, shadowReason: seam.reason, skipped: false, allDone: undefined, duplicate: undefined, error: seam.notice } }
         }
         const { pushPartialShipmentToWc } = await import('@/lib/connectors/woocommerce/sync/partial-shipment')
         return { connector, result: await pushPartialShipmentToWc(orderId, input) }
@@ -300,7 +307,9 @@ export async function pushPartialShipmentToShopping(
   }))
 
   const shadowedPart = results.find((entry) => entry.result.shadowed === true)
-  if (shadowedPart) return { success: false, shadowed: true, error: shadowedPart.result.error }
+  if (shadowedPart) {
+    return { success: false, shadowed: true, error: shadowedPart.result.error, ...('shadowReason' in shadowedPart.result && shadowedPart.result.shadowReason ? { shadowReason: shadowedPart.result.shadowReason } : {}) }
+  }
   const failures = results.filter((entry) => entry.result.supported && !entry.result.ok && !entry.result.skipped)
   if (failures.length > 0) {
     return {
