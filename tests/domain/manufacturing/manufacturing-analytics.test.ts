@@ -62,9 +62,9 @@ function frozenOrder(overrides: Record<string, unknown> = {}) {
 
 /** A started order for the WIP tests: its frozen snapshot mirrors the recipe given on the row unless one is supplied. */
 function wipOrder(overrides: Record<string, unknown> = {}) {
-  const order = assemblyOrder(overrides)
+  const order: Record<string, unknown> = assemblyOrder(overrides)
   if (overrides.componentSnapshot === undefined) {
-    const recipe = (order.outputProduct as { productComponents?: Array<{ componentId: string; qty: unknown }> }).productComponents ?? []
+    const recipe = ((order.outputProduct as unknown) as { productComponents?: Array<{ componentId: string; qty: unknown }> }).productComponents ?? []
     order.componentSnapshot = recipe.map((c) => ({ componentId: c.componentId, qty: Number(c.qty) }))
   }
   return order
