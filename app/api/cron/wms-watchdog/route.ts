@@ -12,7 +12,7 @@ export async function GET(request: Request) {
   // slot too, and max=1 would 429 the retry (scheduler or operator) for up to
   // an hour while breaches sit unclaimed — plus rolling-window boundary jitter
   // can deny an ordinary on-schedule run.
-  const rateLimited = await enforceCronRateLimit('wms-watchdog', { request, max: 3 })
+  const rateLimited = await enforceCronRateLimit('wms-watchdog', { request })
   if (rateLimited) return rateLimited
 
   const maintenance = await getMaintenanceModeResponse('cron')

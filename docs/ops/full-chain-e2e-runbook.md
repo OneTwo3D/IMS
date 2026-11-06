@@ -97,9 +97,9 @@ e2e DB `settings` table (values are encrypted; the harness decrypts with
 
 ### Batch-cron rate limit — required for running >1 batch test per invocation (o3d-lgo.13)
 
-`accounting-daily-batch` is rate-limited to **1/hour/IP** (`lib/cron-rate-limit.ts`, defence-in-
-depth over `CRON_SECRET`). A single suite run that drives the daily batch more than once —
-**OC-08 and X-01 both do** — otherwise 429s on the second trigger (the spec detects it and
+`accounting-daily-batch` is rate-limited to **2 per 24h per IP** (derived from its daily schedule; `lib/cron-rate-limit.ts`, defence-in-
+depth over `CRON_SECRET`). A single suite run that drives the daily batch more than twice —
+**OC-08, X-01 and X-02 together do** — otherwise 429s on the third trigger (the spec detects it and
 **skips loudly**, never a false pass). To let one invocation cover both, the rig's `.env.local`
 sets **both** of:
 

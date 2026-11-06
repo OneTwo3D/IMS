@@ -1,12 +1,233 @@
+import { createHash } from 'node:crypto'
+
 import { NextResponse } from 'next/server'
 
+import '@/lib/cron-jobs'
+import { getAllCronJobs } from '@/lib/cron-registry'
 import { checkRateLimit, type RateLimitResult } from '@/lib/rate-limit'
 import { getClientIp } from '@/lib/request-ip'
 
-export const CRON_RATE_LIMIT_MAX = 1
+/** Fallback limit for a job that is not in the cron registry: one scheduled run per hour plus two spare. */
+export const CRON_RATE_LIMIT_MAX = 3
 export const CRON_RATE_LIMIT_WINDOW_MS = 60 * 60_000
-export const CRON_RATE_LIMIT_FIVE_MINUTE_MAX = 15
 export const CRON_RATE_LIMIT_FIFTEEN_MINUTE_MAX = 6
+
+const MINUTE_MS = 60_000
+const HOUR_MS = 60 * MINUTE_MS
+const DAY_MS = 24 * HOUR_MS
+
+export type CronRateLimit = { max: number; windowMs: number }
+
+type CronFieldSpec = { min: number; max: number }
+const MINUTE_FIELD: CronFieldSpec = { min: 0, max: 59 }
+const HOUR_FIELD: CronFieldSpec = { min: 0, max: 23 }
+const DOM_FIELD: CronFieldSpec = { min: 1, max: 31 }
+const MONTH_FIELD: CronFieldSpec = { min: 1, max: 12 }
+const DOW_FIELD: CronFieldSpec = { min: 0, max: 7 }
+
+/** Expand one cron field (`*`, `a`, `a-b`, lists, optional `/step`) to its values, or null when unreadable. */
+function expandCronField(field: string, spec: CronFieldSpec): Set<number> | null {
+  const out = new Set<number>()
+  for (const part of field.split(',')) {
+    const [range, stepRaw, extra] = part.split('/')
+    if (extra !== undefined) return null
+    const step = stepRaw === undefined ? 1 : Number(stepRaw)
+    if (!Number.isInteger(step) || step < 1) return null
+    let lo: number
+    let hi: number
+    if (range === '*') {
+      lo = spec.min
+      hi = spec.max
+    } else if (/^\d+$/.test(range)) {
+      lo = Number(range)
+      hi = stepRaw === undefined ? lo : spec.max
+    } else if (/^\d+-\d+$/.test(range)) {
+      ;[lo, hi] = range.split('-').map(Number)
+    } else {
+      return null
+    }
+    if (lo < spec.min || hi > spec.max || lo > hi) return null
+    for (let v = lo; v <= hi; v += step) out.add(v)
+  }
+  return out.size > 0 ? out : null
+}
+
+type ParsedCron = {
+  minutes: number[]
+  hours: number[]
+  doms: Set<number>
+  months: Set<number>
+  dows: Set<number>
+  domRestricted: boolean
+  dowRestricted: boolean
+}
+
+function parseCron(expression: string): ParsedCron | null {
+  const fields = expression.trim().split(/\s+/)
+  if (fields.length !== 5) return null
+  const minutes = expandCronField(fields[0], MINUTE_FIELD)
+  const hours = expandCronField(fields[1], HOUR_FIELD)
+  const doms = expandCronField(fields[2], DOM_FIELD)
+  const months = expandCronField(fields[3], MONTH_FIELD)
+  const dowRaw = expandCronField(fields[4], DOW_FIELD)
+  if (!minutes || !hours || !doms || !months || !dowRaw) return null
+  const dows = new Set([...dowRaw].map((d) => d % 7))
+  return {
+    minutes: [...minutes].sort((a, b) => a - b),
+    hours: [...hours].sort((a, b) => a - b),
+    doms,
+    months,
+    dows,
+    domRestricted: !fields[2].startsWith('*'),
+    dowRestricted: !fields[4].startsWith('*'),
+  }
+}
+
+/** Standard cron day matching: when both day-of-month and day-of-week are restricted, either one suffices. */
+function dayMatches(c: ParsedCron, date: Date): boolean {
+  if (!c.months.has(date.getUTCMonth() + 1)) return false
+  const domOk = c.doms.has(date.getUTCDate())
+  const dowOk = c.dows.has(date.getUTCDay())
+  if (c.domRestricted && c.dowRestricted) return domOk || dowOk
+  return domOk && dowOk
+}
+
+/** First year of the 28-year cycle (every weekday x leap-year combination) the profile is taken over. */
+const CYCLE_START_YEAR = 2024
+const CYCLE_YEARS = 28
+
+/** Firing times (epoch ms, UTC, ascending) of a cron expression over `years` years from `fromYear` (default: leap year 2028). */
+export function* cronFiringTimes(expression: string, fromYear = 2028, years = 1): Generator<number> {
+  const c = parseCron(expression)
+  if (!c) return
+  const start = Date.UTC(fromYear, 0, 1)
+  const days = (Date.UTC(fromYear + years, 0, 1) - start) / DAY_MS
+  for (let day = 0; day < days; day += 1) {
+    const dayStart = start + day * DAY_MS
+    if (!dayMatches(c, new Date(dayStart))) continue
+    for (const h of c.hours) for (const m of c.minutes) yield dayStart + h * HOUR_MS + m * MINUTE_MS
+  }
+}
+
+export type CronScheduleProfile = {
+  /** Shortest gap between two consecutive firings (a year when it fires fewer than twice). */
+  cadenceMs: number
+  /** Most firings in any one UTC day. */
+  maxPerDay: number
+}
+
+const profileCache = new Map<string, CronScheduleProfile | null>()
+
+/** Shortest real gap between firings and busiest day for a 5-field cron expression, or null when unreadable. */
+export function cronScheduleProfile(expression: string): CronScheduleProfile | null {
+  const cached = profileCache.get(expression)
+  if (cached !== undefined) return cached
+  let profile: CronScheduleProfile | null = null
+  const c = parseCron(expression)
+  if (c) {
+    // Every matching day fires the same minutes-of-day, so the gaps are: inside a day, and between consecutive matching days.
+    // Day-of-month/day-of-week OR matches shift with the year, so take them over a full 28-year weekday/leap cycle.
+    const minutesOfDay = c.hours.flatMap((h) => c.minutes.map((m) => h * 60 + m)).sort((a, b) => a - b)
+    let gapMin = Infinity
+    for (let i = 1; i < minutesOfDay.length; i += 1) gapMin = Math.min(gapMin, minutesOfDay[i] - minutesOfDay[i - 1])
+    const start = Date.UTC(CYCLE_START_YEAR, 0, 1)
+    const days = (Date.UTC(CYCLE_START_YEAR + CYCLE_YEARS, 0, 1) - start) / DAY_MS
+    let lastDay = -1
+    for (let day = 0; day < days; day += 1) {
+      if (!dayMatches(c, new Date(start + day * DAY_MS))) continue
+      if (lastDay >= 0) {
+        gapMin = Math.min(gapMin, (day - lastDay) * 1440 + minutesOfDay[0] - minutesOfDay[minutesOfDay.length - 1])
+      }
+      lastDay = day
+    }
+    if (lastDay >= 0) {
+      profile = { cadenceMs: Number.isFinite(gapMin) ? gapMin * MINUTE_MS : 366 * DAY_MS, maxPerDay: minutesOfDay.length }
+    }
+  }
+  profileCache.set(expression, profile)
+  return profile
+}
+
+/** Shortest interval between two firings of a 5-field cron expression, in ms, or null when it cannot be read. */
+export function cronCadenceMs(expression: string): number | null {
+  return cronScheduleProfile(expression)?.cadenceMs ?? null
+}
+
+/**
+ * The rate limit that leaves headroom above a cadence, so a scheduled run is never refused for arriving a
+ * little early (cron jitter, a burst of jobs at :00, retries):
+ * - cadence of an hour or more: the window IS the cadence and three runs fit in it (the scheduled run plus two spare),
+ *   so a failed run, an operator retry and the next scheduled run arriving milliseconds early are all admitted and
+ *   only a fourth is refused;
+ * - sub-hourly: the usual hour window with the scheduled runs plus a quarter (at least two) spare.
+ */
+export function cronRateLimitForCadence(cadenceMs: number): CronRateLimit {
+  if (cadenceMs >= HOUR_MS) return { max: 3, windowMs: cadenceMs }
+  const runs = Math.ceil(HOUR_MS / cadenceMs)
+  return { max: runs + Math.max(2, Math.ceil(runs / 4)), windowMs: HOUR_MS }
+}
+
+/**
+ * Default limit for a job. `schedule` is the EFFECTIVE schedule (the saved `cron_<job>_schedule`, else the registry default);
+ * an unreadable schedule falls back to the registry default, and a job that is not in the registry to the generic limit.
+ */
+export function cronRateLimitFor(jobName: string, schedule?: string | null): CronRateLimit {
+  const job = getAllCronJobs().find((j) => j.slug === jobName)
+  const cadence = (schedule ? cronCadenceMs(schedule) : null) ?? (job ? cronCadenceMs(job.defaultSchedule) : null)
+  if (cadence == null) return { max: CRON_RATE_LIMIT_MAX, windowMs: CRON_RATE_LIMIT_WINDOW_MS }
+  return cronRateLimitForCadence(cadence)
+}
+
+/**
+ * Cron jobs that make LIVE Xero API calls on a run (census of the registry's accounting module). Every one of them is held
+ * to an IP-independent rolling daily RUN budget in production (see cronXeroDailyBudget), so a leaked CRON_SECRET used from
+ * many addresses cannot multiply cron runs (abuse and retry control). This bounds RUNS, not Xero calls: a run can make
+ * several calls, and the actual calls are bounded per process by the Xero transport's own daily counter.
+ * accounting-fx-revaluation is deliberately absent: Xero does not post FX journals, so a run makes no Xero call.
+ */
+export const XERO_LIVE_CRON_JOBS: ReadonlySet<string> = new Set([
+  'accounting-sync',
+  'accounting-daily-batch',
+  'accounting-payment-reconcile',
+  'accounting-payment-poll',
+  'xero-tax-rate-drift',
+  'account-balance-snapshot',
+])
+
+/** Hard ceiling on one job's daily run budget, however fast its schedule is set. */
+export const XERO_DAILY_BUDGET_CEILING = 500
+
+/**
+ * Daily run budget for a Xero-live job: its scheduled runs per day plus a quarter (and two spare), never above the ceiling.
+ * xero-tax-rate-drift (hourly) gets 32/day against 24 scheduled; accounting-sync (every 5 min) 362/day against 288; the daily
+ * jobs 4/day. A run budget, not a call budget: it limits how many cron runs a leaked secret can trigger, not how many Xero
+ * HTTP calls those runs make.
+ */
+export function cronXeroDailyBudget(schedule: string): number {
+  const perDay = cronScheduleProfile(schedule)?.maxPerDay ?? 24
+  return Math.min(XERO_DAILY_BUDGET_CEILING, perDay + Math.ceil(perDay / 4) + 2)
+}
+
+/** Reads the saved `cron_<settingKey>_schedule` row (one primary-key read); null when absent or unreadable. */
+export type CronScheduleReader = (settingKey: string) => Promise<string | null>
+
+const SCHEDULE_READ_TIMEOUT_MS = 2_000
+
+const readSavedCronSchedule: CronScheduleReader = async (settingKey) => {
+  // No database configured (unit tests, tooling): nothing to read, use the registry default.
+  if (!process.env.DATABASE_URL) return null
+  try {
+    const { db } = await import('@/lib/db')
+    const read = db.setting.findUnique({ where: { key: `cron_${settingKey}_schedule` } }).then((row) => row?.value ?? null)
+    // A slow or unreachable database must not stall the cron request: fall back to the registry default.
+    return await Promise.race([
+      read,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), SCHEDULE_READ_TIMEOUT_MS).unref()),
+    ])
+  } catch {
+    return null
+  }
+}
 
 export type CronRateLimitChecker = (
   key: string,
@@ -16,6 +237,8 @@ export type CronRateLimitChecker = (
 
 export type CronRateLimitOptions = {
   max?: number
+  /** Effective-schedule reader (tests); defaults to the saved `cron_<job>_schedule` row. */
+  scheduleReader?: CronScheduleReader
   windowMs?: number
   request?: Request
   checker?: CronRateLimitChecker
@@ -32,9 +255,12 @@ export type CronRateLimitOptions = {
  *   CRON_SECRET quota exhaustion to the caller's IP slice; rotating the secret
  *   should still be paired with clearing/restarting the rate-limit backend if
  *   an incident consumed the legitimate caller's quota.
- * - Sub-hourly jobs intentionally use headroom above exact cadence. Do not set
- *   a 5-minute cron to exactly 12/hour or a 15-minute cron to exactly 4/hour;
- *   jitter, retries, and boundary timing will deny legitimate scheduled runs.
+ * - Every job's limit is derived from its registry schedule (cronRateLimitFor) and always leaves
+ *   headroom above exact cadence: sub-hourly jobs get their runs per hour plus spare, hourly and
+ *   N-hourly/daily jobs get three runs per cadence window (scheduled run plus two for retries and jitter). Do not pass a per-route `max`/`windowMs`
+ *   equal to the cadence (a 5-minute cron at exactly 12/hour, an hourly cron at exactly 1/hour);
+ *   jitter, retries, and boundary timing will deny legitimate scheduled runs. Routes should not
+ *   override at all; the census test in tests/security/cron-rate-limit.test.ts enforces that.
  * - Fail-open on backend error is DELIBERATE here (checkRateLimit is called
  *   without `failClosed`): cron routes are already gated by CRON_SECRET, so a
  *   rate-limit backend outage must not block legitimate scheduled jobs. This is
@@ -54,9 +280,20 @@ export type CronRateLimitOptions = {
  *   The allowlisted job is still CRON_SECRET-gated; this limit is defence-in-
  *   depth. Production leaves both E2E vars unset.
  */
-export function cronRateLimitKey(jobName: string, sourceIp?: string | null): string {
-  if (sourceIp?.trim()) return `cron:${jobName}:${sourceIp.trim()}`
-  return `cron:${jobName}`
+export function cronRateLimitKey(jobName: string, sourceIp?: string | null, schedule?: string | null): string {
+  const base = schedule ? `cron:${jobName}:${cronScheduleHash(schedule)}` : `cron:${jobName}`
+  if (sourceIp?.trim()) return `${base}:${sourceIp.trim()}`
+  return base
+}
+
+/**
+ * Short stable hash of the whitespace-normalised effective schedule. It versions the bucket keys: a saved schedule edit
+ * starts FRESH buckets, so runs recorded under the old cadence never count against the new limit (a job moved from every
+ * 5 minutes to once a day would otherwise 429 its first daily run). Cost: a one-time reset of the job's counters, and of its
+ * Xero run budget, after each edit; edits are rare and admin-only.
+ */
+export function cronScheduleHash(schedule: string): string {
+  return createHash('sha256').update(schedule.trim().split(/\s+/).join(' ')).digest('hex').slice(0, 8)
 }
 
 /**
@@ -70,6 +307,10 @@ export function cronRateLimitKey(jobName: string, sourceIp?: string | null): str
  * The sentinel can never collide with a real source IP: getClientIp() returns only a normalized, verified
  * address (lib/request-ip.ts normalizeIp → isIP) or null, and `e2e-global` is neither.
  */
+export function cronRateLimitDailyBudgetKey(jobName: string, schedule?: string | null): string {
+  return schedule ? `cron:${jobName}:${cronScheduleHash(schedule)}:xero-daily-budget` : `cron:${jobName}:xero-daily-budget`
+}
+
 export function cronRateLimitGlobalKey(jobName: string): string {
   return `cron:${jobName}:e2e-global`
 }
@@ -157,13 +398,18 @@ export async function enforceCronRateLimit(
   const options = typeof optionsOrChecker === 'function'
     ? { checker: optionsOrChecker }
     : optionsOrChecker
-  const baseMax = options.max ?? CRON_RATE_LIMIT_MAX
+  // The EFFECTIVE schedule, as the crontab generator sees it: the saved row, else the registry default.
+  const job = getAllCronJobs().find((j) => j.slug === jobName)
+  const saved = job ? await (options.scheduleReader ?? readSavedCronSchedule)(job.settingKey) : null
+  const effectiveSchedule = saved && cronScheduleProfile(saved) ? saved : (job?.defaultSchedule ?? null)
+  const derived = cronRateLimitFor(jobName, effectiveSchedule)
+  const baseMax = options.max ?? derived.max
   const max = applyE2eMaxOverride(jobName, baseMax)
-  const windowMs = options.windowMs ?? CRON_RATE_LIMIT_WINDOW_MS
+  const windowMs = options.windowMs ?? derived.windowMs
   const checker = options.checker ?? checkRateLimit
   const sourceIp = options.request ? getClientIp(options.request.headers) : null
   let result = await checker(
-    cronRateLimitKey(jobName, sourceIp),
+    cronRateLimitKey(jobName, sourceIp, effectiveSchedule),
     max,
     windowMs,
   )
@@ -176,6 +422,14 @@ export async function enforceCronRateLimit(
     // E2E_GLOBAL_CAP_WINDOW_MS, NOT the job's own window: the quota being protected is daily, so an hourly
     // ceiling would allow ~480 live calls a day and bound nothing that matters.
     result = await checker(cronRateLimitGlobalKey(jobName), globalCap, E2E_GLOBAL_CAP_WINDOW_MS)
+  } else if (result.allowed && XERO_LIVE_CRON_JOBS.has(jobName) && max === baseMax && effectiveSchedule) {
+    // PRODUCTION (no E2E raise in effect): a live-Xero job also spends an IP-independent rolling daily run budget, so
+    // rotating source addresses with a leaked secret cannot multiply cron runs (a run budget, not a Xero call budget).
+    result = await checker(
+      cronRateLimitDailyBudgetKey(jobName, effectiveSchedule),
+      cronXeroDailyBudget(effectiveSchedule),
+      E2E_GLOBAL_CAP_WINDOW_MS,
+    )
   }
 
   if (result.allowed) return null
