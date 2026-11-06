@@ -192,6 +192,29 @@ test('every writer of email_outbox rows is in the census, and the SalesOrder enq
   assert.match(d, /lockSalesOrder\(tx, orderId\)[\s\S]*erasedAt[\s\S]*gdprAnonymisedAt[\s\S]*tx\.emailOutbox\.create/)
 })
 
+/**
+ * CENSUS OF EVERY WRITER OF ShoppingCustomerLink (the row that holds a raw storefront customer id). A link must never land on an
+ * erased customer, so each writer that follows a lookup takes the customer row lock and re-reads gdprAnonymisedAt before the insert.
+ *
+ *   locked      field-mapping `upsertCustomer`, the existing-customer branch: FOR UPDATE + re-read, then the insert
+ *   new-row     the same function's nested create on a brand-new customer (no one else knows its id, so nothing can erase it first)
+ *   erasure     deleteMany inside the erasure (and the healing delete in `upsertCustomer` for a matched erased row)
+ *   reset       the factory reset
+ */
+test('every writer of storefront customer links is in the census, and the lookup-then-insert writer locks the customer first', () => {
+  const cwd = new URL('..', import.meta.url).pathname
+  const out = execFileSync('git', ['grep', '-nE', 'shoppingCustomerLink\\.(create|createMany|update|updateMany|upsert|delete|deleteMany)\\(|shoppingLinks:\\s*\\{\\s*create', '--', 'app', 'lib', ':!app/generated', ':!*.test.ts'], { encoding: 'utf8', cwd }).trim().split('\n').filter(Boolean)
+  const found: Record<string, number> = {}
+  for (const line of out) { const file = line.split(':')[0]!; found[file] = (found[file] ?? 0) + 1 }
+  // (the healing delete and the guarded create in upsertCustomer; the erasure's delete; the reset's delete)
+  assert.deepEqual(found, { 'lib/connectors/woocommerce/sync/field-mapping.ts': 2, 'lib/domain/erasure/erase-personal-data.ts': 1, 'app/actions/reset.ts': 1 })
+  const src = readFileSync(new URL('../lib/connectors/woocommerce/sync/field-mapping.ts', import.meta.url), 'utf8')
+  const fn = src.slice(src.indexOf('export async function upsertCustomer'))
+  // the one multi-line nested create, on a brand-new customer
+  assert.equal((fn.match(/shoppingLinks: \{\s*create: \{/g) ?? []).length, 1)
+  assert.match(fn, /FROM "customers" WHERE "id" = \$\{matchedId\} FOR UPDATE[\s\S]*gdprAnonymisedAt[\s\S]*tx\.shoppingCustomerLink\.create/)
+})
+
 test('both manual order creators lock and re-read the customer inside the create transaction, before the create', () => {
   const src = readFileSync(new URL('../app/actions/sales.ts', import.meta.url), 'utf8')
   const start = src.indexOf('export async function createSalesOrder')
