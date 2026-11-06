@@ -236,7 +236,8 @@ export async function scrubAccountingPayloadContacts(tx: Prisma.TransactionClien
   // evidence (an id, an attempt stamp, a claimed revision, an operator's word, no proof stamp) may have reached the ledger and
   // keeps its name with the SYNCED rows.
   const neverPosted = (r: (typeof all)[number]) =>
-    r.status === 'CANCELLED' && ledgerStanding(r) === 'PROVEN_NOT_POSTED' && !(r.externalTransactionId ?? '').trim() && r.remoteAttemptedAt === null && r.attemptRevision === 0
+    // (With no caller payload proof, PROVEN_NOT_POSTED can only be a cancelled row: the ledger standing is the one reading of that.)
+    ledgerStanding(r) === 'PROVEN_NOT_POSTED' && !(r.externalTransactionId ?? '').trim() && r.remoteAttemptedAt === null && r.attemptRevision === 0
   const isUnsent = (r: (typeof all)[number]) => r.status === 'PENDING' || r.status === 'FAILED' || neverPosted(r)
   const unsentIds = all.filter(isUnsent).map((r) => r.id)
   const keptIds = all.filter((r) => !isUnsent(r)).map((r) => r.id)
