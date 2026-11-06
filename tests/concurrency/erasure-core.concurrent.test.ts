@@ -1344,3 +1344,97 @@ test('[erasure] an invalid-recipient answer completing while the erasure holds t
   assert.equal(after.toEmail, 'erased@erased.invalid')
   assert.ok(!JSON.stringify(after).includes(erasedTo), 'no row holds the address or the server text that echoes it')
 })
+
+
+test('[erasure] the free-text guard: raw connector text is stored for a live order, cleared by the erasure, and can no longer be written back, whoever writes it, before, during and after', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { eraseCustomerPersonalData, ERASED_FREE_TEXT_MARKER } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { GUARDED_FREE_TEXT } = await import('@/lib/domain/erasure/free-text-guard')
+  const RAW = `Connector said: cannot deliver to ${FULL_NAME}, ${STREET}, ${POSTCODE}`
+  const retNo = `RET-GUARD-${randomUUID().slice(0, 6)}`
+  t.after(async () => {
+    await db.wmsReturnsInbox.deleteMany({ where: { orderId: fx.orderId } }); await db.wmsOrderDiscrepancy.deleteMany({ where: { orderId: fx.orderId } })
+    await db.wmsOrderPushLink.deleteMany({ where: { orderId: fx.orderId } }); await db.wmsOrderStatusSnapshot.deleteMany({ where: { orderId: fx.orderId } })
+    await db.payment.deleteMany({ where: { orderId: fx.orderId } }); await fx.cleanup()
+  })
+  const snapshot = await db.wmsOrderStatusSnapshot.update({ where: { orderId: fx.orderId }, data: { lastError: RAW } })
+  const link = await db.wmsOrderPushLink.create({ data: { orderId: fx.orderId, connector: 'mintsoft', lastError: RAW, dispatchLastError: RAW, dispatchUnresolvedError: RAW } as never })
+  const disc = await db.wmsOrderDiscrepancy.create({ data: { orderId: fx.orderId, connector: 'mintsoft', category: 'ADDRESS', detail: RAW } as never })
+  const inbox = await db.wmsReturnsInbox.create({ data: { orderId: fx.orderId, connector: 'mintsoft', externalReturnId: retNo, reason: RAW, resolutionNote: RAW, rawPayload: { who: FULL_NAME } } as never })
+  await db.salesOrderRefund.update({ where: { id: fx.refundId }, data: { accountingWarning: RAW } })
+  const note = await db.payment.create({ data: { orderId: fx.orderId, amount: 1, currency: 'GBP', paidAt: new Date('2026-11-02T10:00:00Z'), reference: 'GUARD-REF', notes: RAW } as never })
+  const read = async () => ({
+    snapshot: (await db.wmsOrderStatusSnapshot.findUniqueOrThrow({ where: { id: snapshot.id } })).lastError,
+    link: await db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id }, select: { lastError: true, dispatchLastError: true, dispatchUnresolvedError: true } }),
+    disc: (await db.wmsOrderDiscrepancy.findUniqueOrThrow({ where: { id: disc.id } })).detail,
+    inbox: await db.wmsReturnsInbox.findUniqueOrThrow({ where: { id: inbox.id }, select: { reason: true, resolutionNote: true, rawPayload: true } }),
+    refund: (await db.salesOrderRefund.findUniqueOrThrow({ where: { id: fx.refundId } })).accountingWarning,
+    payment: (await db.payment.findUniqueOrThrow({ where: { id: note.id } })).notes,
+  })
+
+  // BEFORE: a LIVE order stores the raw text (the guard does not touch it) ...
+  const before = await read()
+  assert.deepEqual([before.snapshot, before.link.lastError, before.disc, before.inbox.reason, before.refund, before.payment], [RAW, RAW, RAW, RAW, RAW, RAW], 'a live order keeps its connector text')
+  // ... and the erasure clears all of it.
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const cleared = await read()
+  assert.deepEqual([cleared.snapshot, cleared.link, cleared.disc, cleared.inbox, cleared.refund, cleared.payment], [
+    ERASED_FREE_TEXT_MARKER, { lastError: ERASED_FREE_TEXT_MARKER, dispatchLastError: ERASED_FREE_TEXT_MARKER, dispatchUnresolvedError: ERASED_FREE_TEXT_MARKER },
+    ERASED_FREE_TEXT_MARKER, { reason: ERASED_FREE_TEXT_MARKER, resolutionNote: ERASED_FREE_TEXT_MARKER, rawPayload: {} }, ERASED_FREE_TEXT_MARKER, null,
+  ])
+
+  // AFTER: every writer, with any text, writes the marker (updates AND inserts, through plain Prisma writes as the sweeps do).
+  await db.wmsOrderStatusSnapshot.update({ where: { id: snapshot.id }, data: { lastError: RAW } })
+  await db.wmsOrderPushLink.update({ where: { id: link.id }, data: { lastError: RAW, dispatchLastError: RAW, dispatchUnresolvedError: RAW } })
+  await db.wmsOrderDiscrepancy.update({ where: { id: disc.id }, data: { detail: RAW } })
+  await db.wmsReturnsInbox.update({ where: { id: inbox.id }, data: { reason: RAW, resolutionNote: RAW, rawPayload: { who: FULL_NAME } } })
+  await db.salesOrderRefund.update({ where: { id: fx.refundId }, data: { accountingWarning: RAW } })
+  await db.payment.update({ where: { id: note.id }, data: { notes: RAW } })
+  const after = await read()
+  assert.deepEqual(after, cleared, 'nothing written back after the erasure survives')
+  const newDisc = await db.wmsOrderDiscrepancy.create({ data: { orderId: fx.orderId, connector: 'mintsoft', category: 'UNMAPPED_SKU', detail: RAW } as never })
+  const newInbox = await db.wmsReturnsInbox.create({ data: { orderId: fx.orderId, connector: 'mintsoft', externalReturnId: `${retNo}-2`, reason: RAW, rawPayload: { who: FULL_NAME } } as never })
+  const newPay = await db.payment.create({ data: { orderId: fx.orderId, amount: 1, currency: 'GBP', paidAt: new Date('2026-11-03T10:00:00Z'), reference: 'GUARD-REF-2', notes: RAW } as never })
+  const exact = await db.payment.create({ data: { orderId: fx.orderId, amount: 1, currency: 'GBP', paidAt: new Date('2026-11-03T10:00:00Z'), reference: 'GUARD-REF-3', notes: 'Imported from WooCommerce (paid when the order was imported)' } as never })
+  assert.equal((await db.wmsOrderDiscrepancy.findUniqueOrThrow({ where: { id: newDisc.id } })).detail, ERASED_FREE_TEXT_MARKER, 'a NEW row is guarded on insert')
+  const ni = await db.wmsReturnsInbox.findUniqueOrThrow({ where: { id: newInbox.id } })
+  assert.deepEqual([ni.reason, ni.rawPayload], [ERASED_FREE_TEXT_MARKER, {}])
+  assert.equal((await db.payment.findUniqueOrThrow({ where: { id: newPay.id } })).notes, null)
+  assert.equal((await db.payment.findUniqueOrThrow({ where: { id: exact.id } })).notes, 'Imported from WooCommerce (paid when the order was imported)', 'the importer\'s exact sentence passes')
+  // The guard list covers every table it names: each has its trigger installed.
+  for (const g of GUARDED_FREE_TEXT) {
+    const rows = await db.$queryRaw<Array<{ n: bigint }>>`SELECT count(*)::bigint AS n FROM pg_trigger WHERE tgrelid = ${g.table}::regclass AND tgname LIKE '%erased_free_text'`
+    assert.equal(Number(rows[0]!.n), 1, `${g.table} has its guard trigger`)
+  }
+})
+
+test('[erasure] the free-text guard DURING an erasure: a writer blocked on a row the erasure holds is re-evaluated against the committed marker and writes none of its text', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { lockSalesOrder } = await import('@/lib/domain/sales/allocation-service')
+  const RAW = `Outer catch: ${FULL_NAME} at ${STREET}`
+  const link = await db.wmsOrderPushLink.create({ data: { orderId: fx.orderId, connector: 'mintsoft' } as never })
+  t.after(async () => { await db.wmsOrderPushLink.deleteMany({ where: { id: link.id } }); await fx.cleanup() })
+
+  // The erasure (simulated by what matters: it holds the order lock and the link row, with the marker uncommitted).
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const erasing = db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, fx.orderId)
+    await tx.salesOrder.update({ where: { id: fx.orderId }, data: { erasedAt: new Date() } })
+    await tx.wmsOrderPushLink.update({ where: { id: link.id }, data: { lastError: 'cleared by the erasure' } })
+    await gate
+  }, { timeout: 30_000 })
+  await new Promise((r) => setTimeout(r, 300))
+  // An outer catch with no lock writes the connector's exception text into the same row.
+  let written = false
+  const writer = db.wmsOrderPushLink.update({ where: { id: link.id }, data: { lastError: RAW } }).then(() => { written = true })
+  await new Promise((r) => setTimeout(r, 1000))
+  assert.equal(written, false, 'PRECONDITION: the writer is blocked on the row the erasure holds')
+  release()
+  await erasing
+  await writer
+  const row = await db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })
+  assert.equal(row.lastError, 'Text removed by GDPR erasure', 'the trigger was re-evaluated against the committed marker: nothing of the text survived')
+})

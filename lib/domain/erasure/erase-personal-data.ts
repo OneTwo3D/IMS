@@ -350,6 +350,9 @@ export async function scrubLinkedFreeText(tx: Prisma.TransactionClient, orderIds
     for (const field of ['lastError', 'dispatchLastError', 'dispatchUnresolvedError'] as const) {
       changed += (await tx.wmsOrderPushLink.updateMany({ where: { orderId: { in: ids }, [field]: { not: null }, NOT: { [field]: marker } }, data: { [field]: marker } })).count
     }
+    // The status snapshot's last error (the sweep writes the connector's exception text there) and the refund's accounting warning.
+    changed += (await tx.wmsOrderStatusSnapshot.updateMany({ where: { orderId: { in: ids }, lastError: { not: null }, NOT: { lastError: marker } }, data: { lastError: marker } })).count
+    changed += (await tx.salesOrderRefund.updateMany({ where: { orderId: { in: ids }, accountingWarning: { not: null }, NOT: { accountingWarning: marker } }, data: { accountingWarning: marker } })).count
     changed += (await tx.wmsOrderDiscrepancy.updateMany({ where: { orderId: { in: ids }, detail: { not: null }, NOT: { detail: marker } }, data: { detail: marker } })).count
     for (const field of ['reason', 'resolutionNote'] as const) {
       changed += (await tx.wmsReturnsInbox.updateMany({ where: { orderId: { in: ids }, [field]: { not: null }, NOT: { [field]: marker } }, data: { [field]: marker } })).count

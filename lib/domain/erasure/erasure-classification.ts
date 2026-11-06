@@ -65,8 +65,8 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
     },
   },
   WmsOrderStatusSnapshot: {
-    erased: ['deepLinkUrl', 'trackingNumber', 'carrier'],
-    notPersonal: ['id', 'orderId', 'connector', 'connectorLabel', 'externalOrderId', 'externalOrderNumber', 'status', 'statusLabel', 'mergedOrderNumbers', 'lastError', 'wcPushedStatus'],
+    erased: ['deepLinkUrl', 'trackingNumber', 'carrier', 'lastError'],
+    notPersonal: ['id', 'orderId', 'connector', 'connectorLabel', 'externalOrderId', 'externalOrderNumber', 'status', 'statusLabel', 'mergedOrderNumbers', 'wcPushedStatus'],
     retained: {
     },
   },
@@ -87,11 +87,10 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
     },
   },
   SalesOrderRefund: {
-    erased: [],
+    erased: ['accountingWarning'],
     notPersonal: ['id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState'],
     retained: {
       reason: 'owner decision: the refund reason text is kept',
-      accountingWarning: 'accounting diagnostic on the refund record',
     },
   },
   // Linked by a relation, with no text or JSON column of their own (only keys, amounts and dates).
