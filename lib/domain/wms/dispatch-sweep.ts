@@ -5,6 +5,8 @@ import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
+import { parseProducerCutoff } from '@/lib/security/producer-disposition'
+import { PRODUCER_CUTOFF_ENV } from '@/lib/security/producer-disposition-constants'
 import type { ZonelessDespatchReading } from '@/lib/connectors/wms/connector-hooks'
 import {
   decodeWmsDeltaCursor,
@@ -433,6 +435,8 @@ export type WmsDispatchSweepDeps = {
   verifyPreCutoverCompletion?(orderId: string, latestDespatchAt: Date | null): Promise<{ verified: boolean; detail: string }>
   /** How this WMS's zone-less despatch datetimes are read in the pre-cutover verification only. Absent: they are UNKNOWN (strict). */
   zonelessDespatchReading?: ZonelessDespatchReading
+  /** The storefront's live-from instant, or null when none is configured/readable. Used to tell whether an uncertain despatch time matters. */
+  storefrontCutoff?(): Date | null
   // Whether the active connector supports per-part reconciliation (fetchOrderParts). When
   // false, a split order is surfaced as a clear "unsupported" pending rather than silently
   // stalling as "no parts visible".
@@ -714,24 +718,65 @@ export function strictLatestDespatchTime(
   return latest
 }
 
+const DATE_ONLY_DESPATCH = /^(\d{4})-(\d{2})-(\d{2})$/
+
+/**
+ * Every instant a despatch value could mean under the zone reading, earliest to latest, or null when it cannot be read at all.
+ * An exact instant (Z or offset, or an unambiguous UK local time) is a single point. A date-only value spans that whole UK day. A
+ * UK local time that does not exist or occurs twice spans the two readings (an hour apart). Anything else is null.
+ */
+export function despatchInstantRange(value: string, reading: ZonelessDespatchReading): { from: Date; to: Date } | null {
+  const trimmed = value.trim()
+  const exact = preciseDespatchInstant(trimmed, { zoneless: reading })
+  if (exact !== null) return { from: exact, to: exact }
+  const dateOnly = DATE_ONLY_DESPATCH.exec(trimmed)
+  if (dateOnly) {
+    const [y, mo, d] = [Number(dateOnly[1]), Number(dateOnly[2]), Number(dateOnly[3])]
+    const day = new Date(Date.UTC(y, mo - 1, d))
+    if (day.getUTCFullYear() !== y || day.getUTCMonth() !== mo - 1 || day.getUTCDate() !== d) return null
+    // UK clock changes happen at 01:00 UTC, so local midnight always exists exactly once.
+    const start = londonLocalToInstant(day.getTime())
+    const next = londonLocalToInstant(day.getTime() + 24 * 60 * 60_000)
+    return start && next ? { from: start, to: new Date(next.getTime() - 1) } : null
+  }
+  const zoneless = ZONELESS_DESPATCH_DATETIME.exec(trimmed)
+  if (!zoneless) return null
+  const [, y, mo, d, h, mi, sec, frac] = zoneless
+  const wall = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(sec ?? 0), Number((frac ?? '').slice(0, 3).padEnd(3, '0')))
+  const check = new Date(wall)
+  if (check.getUTCFullYear() !== Number(y) || check.getUTCMonth() + 1 !== Number(mo) || check.getUTCDate() !== Number(d) || check.getUTCHours() !== Number(h) || check.getUTCMinutes() !== Number(mi)) return null
+  return { from: new Date(wall - 60 * 60_000), to: new Date(wall) }
+}
+
 /**
  * The business-event time a part's storefront push is judged by (the live-from cutoff decision), for a WMS whose zone-less
- * despatch datetimes have a known zone. Returns `{ unknown: true }` when any entry that CARRIES a value is not an unambiguous
- * instant under that reading (a date-only value, a clock-change time that does not exist or occurs twice, an unparseable value):
- * the caller must then hold the part pending, because an unknown time must never lead to a storefront write. Entries with no value
- * at all keep the lenient behaviour (skipped; none usable gives null, i.e. "now"). Without a reading, the lenient host parse stays.
+ * despatch datetimes have a known zone. Each value is read as the RANGE of instants it could mean; against the storefront cutoff
+ * (`cutoff`, null when none is configured, in which case the producer seam shadows everything anyway):
+ *  - the whole range is at or after the cutoff: live, judged by the range's earliest instant (the ordinary push);
+ *  - the whole range is before the cutoff: pre-cutover, judged by the range's latest instant (the seam shadows it and the
+ *    verification, which needs an exact instant, keeps it pending);
+ *  - the range STRADDLES the cutoff, or the value cannot be read at all: `{ unknown: true }`. The caller holds the part pending,
+ *    because an uncertain time must never lead to a storefront write.
+ * Entries with no value at all keep the lenient behaviour (skipped; none usable gives null, i.e. "now"). Without a reading the
+ * lenient host parse stays.
  */
 export function dispositionDespatchTime(
   tracking: ReadonlyArray<{ despatchedAt?: string | null }>,
   reading: ZonelessDespatchReading | undefined,
+  cutoff: Date | null = null,
 ): { unknown: false; at: Date | null } | { unknown: true } {
   if (reading === undefined) return { unknown: false, at: latestDespatchTime(tracking) }
   let latest: Date | null = null
   for (const entry of tracking) {
     if (!entry.despatchedAt) continue
-    const at = preciseDespatchInstant(entry.despatchedAt, { zoneless: reading })
-    if (at === null) return { unknown: true }
-    if (latest === null || at.getTime() > latest.getTime()) latest = at
+    const range = despatchInstantRange(entry.despatchedAt, reading)
+    if (range === null) return { unknown: true }
+    let judged = range.from
+    if (cutoff !== null) {
+      if (range.to.getTime() < cutoff.getTime()) judged = range.to
+      else if (range.from.getTime() < cutoff.getTime()) return { unknown: true }
+    }
+    if (latest === null || judged.getTime() > latest.getTime()) latest = judged
   }
   return { unknown: false, at: latest }
 }
@@ -784,15 +829,15 @@ async function reconcileSplitOrder(
   // What a verifying completion must postdate: the LATEST despatch among ALL despatched parts, not the part being asked about.
   const latestPartDespatch = strictLatestDespatchTime(dispatchedParts.flatMap((entry) => entry.tracking), { zoneless: deps.zonelessDespatchReading })
   // The cutoff disposition of a part is judged by its despatch time. For a WMS with a known zone for zone-less values that time must
-  // be an unambiguous instant: any part whose time is unknown is held pending BEFORE anything is pushed (never a storefront write).
+  // not straddle the cutover: any part whose time could fall either side is held pending BEFORE anything is pushed (never a storefront write).
   const partDespatch = new Map<object, Date | null>()
   if (recordPartials) {
     for (const part of dispatchedParts) {
-      const judged = dispositionDespatchTime(part.tracking, deps.zonelessDespatchReading)
+      const judged = dispositionDespatchTime(part.tracking, deps.zonelessDespatchReading, deps.storefrontCutoff?.() ?? null)
       if (judged.unknown) {
         return {
           action: 'pending',
-          reason: `Part ${part.partNumber} has a despatch time that cannot be read as an exact instant: holding it rather than risk a storefront write`,
+          reason: `Part ${part.partNumber} has a despatch time that could fall either side of the storefront go-live instant (or cannot be read): holding it rather than risk a storefront write`,
           unresolved: requireResolution,
         }
       }
@@ -2319,6 +2364,10 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
     ?? defaultWmsDeltaScopeLock(wmsDeltaStateRowKeys(deltaKeys))
   return {
     zonelessDespatchReading: getWmsConnectorHooks(connectorId).zonelessDespatchReading,
+    storefrontCutoff() {
+      const read = parseProducerCutoff(process.env[PRODUCER_CUTOFF_ENV.woocommerce])
+      return read.ok ? read.at : null
+    },
     async listCandidates(limit) {
       const rows = await db.wmsOrderPushLink.findMany({
         where: dispatchCandidateWhere(connectorId),

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
 import { OUTBOUND_GRANT_ENV } from '@/lib/security/outbound-write-hold-constants'
+import { parseProducerCutoff } from '@/lib/security/producer-disposition'
 import { PRODUCER_CUTOFF_ENV, PRODUCER_HOLD_ENFORCED_ENV } from '@/lib/security/producer-disposition-constants'
 
 /**
@@ -173,7 +174,10 @@ async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'e
   const applyOptions: Array<Record<string, unknown> | undefined> = []
   const asked: Array<string | null> = []
   const out = await runWmsDispatchSweepCore({
-    ...(options.zoneless ? { zonelessDespatchReading: options.zoneless } : {}),
+    ...(options.zoneless ? {
+      zonelessDespatchReading: options.zoneless,
+      storefrontCutoff: () => { const read = parseProducerCutoff(process.env[PRODUCER_CUTOFF_ENV.woocommerce]); return read.ok ? read.at : null },
+    } : {}),
     listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
     fetchOrderStatus: async () => ({
       externalOrderId: 'M-1', externalOrderNumber: 'WC-1001', status: 'DESPATCHED', statusLabel: 'Despatched', isSplit: true, partCount: parts.length,
@@ -755,13 +759,13 @@ test('UK TIME, END TO END: a pre-cutover part with a zone-less SUMMER value, aft
   })
 })
 
-test('UK TIME, END TO END: a zone-less value in the clock-change hour keeps the part pending with no read or write', async () => {
+test('UK TIME, END TO END: a zone-less value in the clock-change hour stays pending with no read or write', async () => {
   for (const at of ['2025-03-30T01:30:00', '2025-10-26T01:30:00', '2026-05-20']) {
     reset()
     await withEnv(LIVE_AT_CUTOFF, async () => {
       const run = await sweep([part(1, at)], { zoneless: 'europe-london' })
       assert.equal(run.out.counters.dispatched, 0, at)
-      assert.deepEqual(run.asked, [], at)
+      assert.deepEqual(run.asked, [null], at) // pre-cutover, but no exact instant to verify against: pending with no read
       assert.deepEqual(transport, [], at)
     })
   }
@@ -825,5 +829,54 @@ test('DISPOSITION: without the reading (any non-Mintsoft source) the lenient tim
   assert.deepEqual(dispositionDespatchTime([{ despatchedAt: '2026-06-01' }], undefined), { unknown: false, at: new Date('2026-06-01') })
   assert.deepEqual(dispositionDespatchTime([{ despatchedAt: PRE }, {}], 'europe-london'), { unknown: false, at: new Date(PRE) })
   assert.deepEqual(dispositionDespatchTime([{}], 'europe-london'), { unknown: false, at: null })
-  assert.deepEqual(dispositionDespatchTime([{ despatchedAt: PRE }, { despatchedAt: '2026-06-01' }], 'europe-london'), { unknown: true })
+  assert.deepEqual(dispositionDespatchTime([{ despatchedAt: PRE }, { despatchedAt: '2026-06-01' }], 'europe-london', new Date(CUTOFF)), { unknown: true })
+  assert.deepEqual(dispositionDespatchTime([{ despatchedAt: PRE }, { despatchedAt: 'x' }], 'europe-london'), { unknown: true })
+})
+
+test('RANGE: a date-only or clock-change time is judged by every instant it could mean: clearly after is live, clearly before is pre-cutover, straddling is held', async () => {
+  const run = async (at: string, cutoff: string) => {
+    reset()
+    return withEnv({ ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: cutoff }, async () => {
+      const out = await sweep([part(1, at)], { zoneless: 'europe-london' })
+      return { out, writes: writes().length, reads: reads().length }
+    })
+  }
+  // clearly AFTER the cutover (the day after): the ordinary live push, nothing read
+  const after = await run('2026-06-02', CUTOFF)
+  assert.deepEqual([after.out.out.counters.dispatched, after.writes, after.reads, after.out.asked], [1, 1, 0, []])
+  assert.deepEqual(after.out.applyOptions, [undefined])
+  // clearly BEFORE (the day before): pre-cutover, so verification is asked, but it needs an exact instant: pending, nothing written
+  const before = await run('2026-05-31', CUTOFF)
+  assert.deepEqual([before.out.out.counters.dispatched, before.writes, before.reads, before.out.asked], [0, 0, 0, [null]])
+  // STRADDLES (the cutover day itself): pending, no write, no read, verification not even asked
+  const same = await run('2026-06-01', CUTOFF)
+  assert.deepEqual([same.out.out.counters.dispatched, same.writes, same.reads, same.out.asked], [0, 0, 0, []])
+  // clock-change times far from the cutover are normal: after is live, before is pre-cutover and pending verification
+  for (const at of ['2026-03-29T01:30:00', '2026-10-25T01:30:00']) {
+    const live = await run(at, '2026-01-01T00:00:00Z')
+    assert.deepEqual([live.out.out.counters.dispatched, live.writes, live.out.asked], [1, 1, []], at)
+    const pre = await run(at, '2026-11-01T00:00:00Z')
+    assert.deepEqual([pre.out.out.counters.dispatched, pre.writes, pre.reads, pre.out.asked], [0, 0, 0, [null]], at)
+  }
+  // next to the cutover they straddle: held
+  for (const [at, cutoff] of [['2026-03-29T01:30:00', '2026-03-29T01:00:00Z'], ['2026-10-25T01:30:00', '2026-10-25T01:00:00Z'], ['2026-03-29T01:30:00', '2026-03-29T01:30:00Z']]) {
+    const near = await run(at!, cutoff!)
+    assert.deepEqual([near.out.out.counters.dispatched, near.writes, near.reads, near.out.asked], [0, 0, 0, []], at)
+  }
+  // an unreadable value is held too
+  const bad = await run('2026-13-45', CUTOFF)
+  assert.deepEqual([bad.out.out.counters.dispatched, bad.writes], [0, 0])
+})
+
+test('RANGE: despatchInstantRange spans the day, the hour either side of a clock change, or a single instant', async () => {
+  const { despatchInstantRange } = await import('@/lib/domain/wms/dispatch-sweep')
+  const iso = (v: string) => { const r = despatchInstantRange(v, 'europe-london'); return r && [r.from.toISOString(), r.to.toISOString()] }
+  assert.deepEqual(iso('2026-07-15'), ['2026-07-14T23:00:00.000Z', '2026-07-15T22:59:59.999Z'])
+  assert.deepEqual(iso('2026-01-15'), ['2026-01-15T00:00:00.000Z', '2026-01-15T23:59:59.999Z'])
+  assert.deepEqual(iso('2026-03-29'), ['2026-03-29T00:00:00.000Z', '2026-03-29T22:59:59.999Z'])
+  assert.deepEqual(iso('2026-03-29T01:30:00'), ['2026-03-29T00:30:00.000Z', '2026-03-29T01:30:00.000Z'])
+  assert.deepEqual(iso('2026-10-25T01:30:00'), ['2026-10-25T00:30:00.000Z', '2026-10-25T01:30:00.000Z'])
+  assert.deepEqual(iso('2026-07-15T09:00:00'), ['2026-07-15T08:00:00.000Z', '2026-07-15T08:00:00.000Z'])
+  assert.deepEqual(iso('2026-07-15T09:00:00Z'), ['2026-07-15T09:00:00.000Z', '2026-07-15T09:00:00.000Z'])
+  for (const bad of ['x', '2026-02-31', '2026-07-15T25:00:00', '']) assert.equal(despatchInstantRange(bad, 'europe-london'), null, bad)
 })
