@@ -654,6 +654,50 @@ t_cron_render_passes_only_database_url_to_the_renderer() {
   log_lacks "env-file $IMS_ENV_FILE .*--entrypoint node"
 }
 
+t_cron_render_adds_heartbeat_flags_only_when_the_env_file_asks() {
+  seed_active blue "$A"
+  : > "$STUB/calls.log"
+  rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
+  eq "$rc" 0 "render, heartbeats unset"
+  log_lacks 'render-managed-crontab.mjs.*--heartbeat'
+  : > "$STUB/calls.log"; printf 'IMS_CRON_HEARTBEATS=0\n' >> "$IMS_ENV_FILE"
+  rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
+  eq "$rc" 0 "render, heartbeats 0"
+  log_lacks 'render-managed-crontab.mjs.*--heartbeat'
+  : > "$STUB/calls.log"; printf 'IMS_CRON_HEARTBEATS=1\n' >> "$IMS_ENV_FILE"
+  # The checked path is the one the rendered lines run, NOT IMS_HC_BIN. Absent there (IMS_HC_BIN pointing at an executable elsewhere), then
+  # present but not executable: the live crontab stays as it was and the run fails (deploy exit 4).
+  export IMS_WRAPPER_TEST_ROOT="$T/wroot"; mkdir -p "$T/wroot/usr/local/bin"
+  printf '#!/bin/sh\nshift 2\nexec "$@"\n' > "$T/elsewhere-hc"; chmod 0755 "$T/elsewhere-hc"; export IMS_HC_BIN="$T/elsewhere-hc"
+  printf 'old\n' > "$IMS_CROND_DIR/onetwo3d-ims"
+  rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
+  [ "$rc" != 0 ] || fail "heartbeats on with no wrapper at the rendered path must fail"
+  grep -q 'heartbeats enabled but /usr/local/bin/o3d-hc is missing or not executable; crontab NOT replaced' "$T/out" || fail "the missing wrapper was not reported"
+  eq "$(cat "$IMS_CROND_DIR/onetwo3d-ims")" old "the live crontab must be untouched (absent wrapper)"
+  log_lacks 'render-managed-crontab'
+  printf '#!/bin/sh\n' > "$T/wroot/usr/local/bin/o3d-hc"; chmod 0644 "$T/wroot/usr/local/bin/o3d-hc"
+  rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
+  [ "$rc" != 0 ] || fail "a non-executable wrapper must fail"
+  eq "$(cat "$IMS_CROND_DIR/onetwo3d-ims")" old "the live crontab must be untouched (non-executable wrapper)"
+  chmod 0755 "$T/wroot/usr/local/bin/o3d-hc"
+  rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
+  eq "$rc" 0 "render, heartbeats 1"
+    log_has 'render-managed-crontab.mjs --format cron.d --cron-user root --heartbeats --base-url'
+  log_lacks '--heartbeat-prefix'
+  : > "$STUB/calls.log"; printf 'IMS_CRON_HEARTBEATS_PREFIX=ims-x-\n' >> "$IMS_ENV_FILE"
+  rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
+  eq "$rc" 0 "render, heartbeats 1 with a prefix"
+  log_has 'render-managed-crontab.mjs --format cron.d --cron-user root --heartbeats --heartbeat-prefix ims-x- --base-url'
+}
+
+t_the_checked_wrapper_path_is_the_one_the_renderer_emits() {
+  local sh_path ts_path
+  sh_path="$(sed -n 's/^IMS_RENDERED_WRAPPER=//p' "$BIN/lib.sh")"
+  ts_path="$(sed -n "s/^export const HEARTBEAT_WRAPPER_PATH = '\(.*\)'$/\1/p" "$BIN/../../lib/ops/cron-heartbeats.ts")"
+  [ -n "$sh_path" ] && [ -n "$ts_path" ] || fail "could not read one of the two wrapper-path constants"
+  eq "$sh_path" "$ts_path" "lib.sh IMS_RENDERED_WRAPPER and HEARTBEAT_WRAPPER_PATH differ"
+}
+
 t_cron_render_with_nothing_deployed_is_a_noop() {
   rc=0; "$BIN/cron-render.sh" --only-if-changed > "$T/out" 2>&1 || rc=$?
   eq "$rc" 0 "nothing deployed"
@@ -1033,6 +1077,167 @@ t_normal_deploy_never_enters_maintenance() {
   deploy "$B"
   eq "$rc" 0 "deploy"
   log_lacks 'maintenance'
+}
+
+# --- host-bootstrap.sh: the Docker CLI ---------------------------------------------------------------------------------------------
+# These run the package step (dpkg, apt-cache, apt-get, systemctl and docker are stubs) which is otherwise skipped under IMS_BOOTSTRAP_ROOT.
+bootstrap_packages() { export IMS_BOOTSTRAP_PACKAGES=1; : > "$STUB/dpkg_installed"; bootstrap_prepare; bootstrap; }
+
+t_bootstrap_installs_docker_cli_beside_docker_io_and_checks_docker_info() {
+  bootstrap_packages
+  eq "$rc" 0 "bootstrap: $(tail -n 3 "$T/out")"
+  log_has '^apt-get install .*docker\.io'
+  log_has '^apt-get install .*docker-cli'
+  before '^apt-get install' '^docker info'
+  # a re-run installs nothing more
+  : > "$STUB/calls.log"; bootstrap
+  eq "$rc" 0 "re-run"
+  log_lacks '^apt-get'
+  log_has '^docker info'
+}
+
+t_bootstrap_without_a_separate_docker_cli_package_still_works() {
+  touch "$STUB/no_pkg_docker-cli"
+  bootstrap_packages
+  eq "$rc" 0 "bootstrap: $(tail -n 3 "$T/out")"
+  log_has '^apt-get install .*docker\.io'
+  log_lacks '^apt-get .*docker-cli'
+  log_has '^docker info'
+}
+
+t_bootstrap_fails_loudly_when_docker_info_fails() {
+  touch "$STUB/docker_info_fail"
+  bootstrap_packages
+  [ "$rc" != 0 ] || fail "bootstrap succeeded although 'docker info' fails"
+  grep -q "'docker info' fails" "$T/out" || fail "no clear message: $(tail -n 3 "$T/out")"
+  [ ! -e "$R/srv/ims/state" ] || fail "bootstrap carried on past the docker check"
+}
+
+# --- deploy.sh: first install vs a serving release ---------------------------------------------------------------------------------
+
+t_first_install_with_part_of_the_history_applied_and_no_release_needs_no_flags() {
+  # An earlier first-install attempt migrated, then failed before any slot served: history non-empty, nothing serving or recorded.
+  migs "$B" m1:other m2:other m3:other; applied m1
+  printf 'upstream ims_active {\n    server 127.0.0.1:3100;\n}\n' > "$IMS_UPSTREAM_FILE"; cp "$IMS_UPSTREAM_FILE" "$STUB/loaded"
+  deploy "$B"
+  eq "$rc" 0 "first install without flags: $(tail -n 3 "$T/out")"
+  log_has '^MIGRATE'
+  log_lacks '^docker stop'
+  log_lacks 'maintenance'
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$B blue"
+  [ ! -e "$IMS_DEPLOY_DIR/previous" ] || fail "a first install has no previous"
+}
+
+t_pending_contract_migration_with_a_serving_release_still_refuses() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand m2:other; applied m1
+  deploy "$B"
+  eq "$rc" 3 "must refuse"
+  grep -q 'refusing to migrate: a release is protected (nginx is serving the blue slot)' "$T/out" || fail "wrong refusal: $(tail -n 3 "$T/out")"
+  log_lacks '^MIGRATE'
+  eq "$(container_running ims-blue)" 1 "the serving slot must be untouched"
+}
+
+t_pending_contract_migration_with_a_recorded_release_and_nothing_running_refuses() {
+  # nothing serves and nothing runs, but deploy/current names a release (a maintenance deploy that stopped midway): not a first install
+  seed_stopped blue "$A"; echo "$A blue" > "$IMS_DEPLOY_DIR/current"
+  migs "$A" m1:expand; migs "$B" m1:expand m2:other; applied m1
+  printf 'upstream ims_active {\n    server 127.0.0.1:3100;\n}\n' > "$IMS_UPSTREAM_FILE"; cp "$IMS_UPSTREAM_FILE" "$STUB/loaded"
+  deploy "$B"
+  eq "$rc" 3 "must refuse"
+  log_lacks '^MIGRATE'
+}
+
+t_pending_contract_migration_with_an_unreadable_current_record_refuses() {
+  # deploy/current exists but cannot be read as a regular file (a directory stands in, so this also fails as root)
+  migs "$B" m1:other m2:other; applied m1
+  printf 'upstream ims_active {\n    server 127.0.0.1:3100;\n}\n' > "$IMS_UPSTREAM_FILE"; cp "$IMS_UPSTREAM_FILE" "$STUB/loaded"
+  mkdir "$IMS_DEPLOY_DIR/current"
+  deploy "$B"
+  eq "$rc" 3 "an ambiguous host must refuse"
+  grep -q 'cannot tell whether a release exists' "$T/out" || fail "no ambiguity message: $(tail -n 4 "$T/out")"
+  log_lacks '^MIGRATE'
+  log_lacks '^RUN-SLOT'
+}
+
+t_empty_history_with_an_unreadable_upstream_file_refuses() {
+  migs "$B" m1:other; : > "$STUB/applied"
+  mkdir "$IMS_UPSTREAM_FILE"
+  deploy "$B"
+  eq "$rc" 3 "an ambiguous host must refuse even with an empty history"
+  log_lacks '^MIGRATE'
+}
+
+t_first_install_on_a_host_with_no_containers_passes_with_an_empty_or_partial_history() {
+  migs "$B" m1:other m2:other
+  deploy "$B"
+  eq "$rc" 0 "empty history, no containers: $(tail -n 3 "$T/out")"
+  log_has '^docker ps -a'
+  log_has '^MIGRATE'
+}
+
+t_a_stopped_slot_container_with_a_restart_policy_is_a_release_to_protect() {
+  # exited, and `--restart unless-stopped` may bring it back during the migration: it must count as existing
+  printf 'image=ghcr.io/onetwo3d/ims:%s\nrunning=0\nport=3101\nrestart=unless-stopped\n' "$A" > "$STUB/containers/ims-blue"
+  migs "$A" m1:expand; migs "$B" m1:expand m2:other; applied m1
+  deploy "$B"
+  eq "$rc" 3 "partial history"
+  grep -q 'slot container(s) exist: ims-blue' "$T/out" || fail "wrong refusal: $(tail -n 3 "$T/out")"
+  log_lacks '^MIGRATE'
+  migs "$B" m1:other; : > "$STUB/applied"; : > "$STUB/calls.log"
+  deploy "$B"
+  eq "$rc" 3 "empty history"
+  log_lacks '^MIGRATE'
+}
+
+t_a_docker_query_error_is_unknown_and_refuses_even_with_the_override_flags() {
+  touch "$STUB/ps_fail"
+  migs "$B" m1:other m2:other; applied m1
+  deploy "$B"
+  eq "$rc" 3 "partial history"
+  grep -q 'cannot tell whether a release exists (docker could not list the slot containers)' "$T/out" || fail "wrong refusal: $(tail -n 3 "$T/out")"
+  log_lacks '^MIGRATE'
+  : > "$STUB/applied"
+  deploy --allow-contract-migration --maintenance "$B"
+  eq "$rc" 3 "empty history with the override flags"
+  log_lacks '^MIGRATE'
+  log_lacks '^docker stop'
+}
+
+t_an_unreadable_record_refuses_even_with_the_override_flags() {
+  migs "$B" m1:other m2:other; applied m1
+  mkdir "$IMS_DEPLOY_DIR/current"
+  deploy --allow-contract-migration --maintenance "$B"
+  eq "$rc" 3 "override flags must not apply to an unknown host"
+  log_lacks '^MIGRATE'
+  log_lacks '^RUN-SLOT'
+}
+
+t_an_empty_history_with_a_recorded_stopped_release_refuses() {
+  # nothing serves and nothing exists, but deploy/current records a release: not a first install (the empty-history branch must not clear it)
+  echo "$A blue" > "$IMS_DEPLOY_DIR/current"
+  migs "$B" m1:other; : > "$STUB/applied"
+  deploy "$B"
+  eq "$rc" 3 "must refuse"
+  grep -q 'records a release' "$T/out" || fail "wrong refusal: $(tail -n 3 "$T/out")"
+  log_lacks '^MIGRATE'
+}
+
+t_a_stopped_slot_container_among_decoys_refuses() {
+  printf 'ims-blue-old\nxims-blue\n/ims-blue\nims-green-2\nims\n' > "$STUB/decoys"
+  printf 'image=ghcr.io/onetwo3d/ims:%s\nrunning=0\nport=3101\n' "$A" > "$STUB/containers/ims-blue"
+  migs "$A" m1:expand; migs "$B" m1:expand m2:other; applied m1
+  deploy "$B"
+  eq "$rc" 3 "partial history"
+  grep -q 'slot container(s) exist: ims-blue' "$T/out" || fail "wrong refusal: $(tail -n 3 "$T/out")"
+  log_lacks '^MIGRATE'
+}
+
+t_decoy_containers_only_means_an_empty_host() {
+  printf 'ims-blue-old\nxims-blue\n/ims-blue\nims-green-2\nims\npostgres\n' > "$STUB/decoys"
+  migs "$B" m1:other m2:other; applied m1
+  deploy "$B"
+  eq "$rc" 0 "decoys are not slot containers: $(tail -n 3 "$T/out")"
+  log_has '^MIGRATE'
 }
 
 # ---------------------------------------------------------------------------------------------------------------------------------

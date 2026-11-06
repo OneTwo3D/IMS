@@ -19,6 +19,20 @@ IMS holds each recipe in two places. One copy is what a build order consumes; th
 orders, and manufacturing analytics. Both are written together by the product form, by the product-type change, and by the CSV import, so
 they normally agree.
 
+Planning counts only the recipe a product **claims** (the one the product form, the CSV import and
+build orders write). If a stray second recipe for the same product exists, it is ignored by the reorder
+report and by automatic reorder build orders; it is never added to the claimed recipe's demand.
+
+A BOM product that needs building but has no claimed recipe is named in a note under the reorder report
+(its component demand cannot be planned until a recipe is imported or claimed). The component shortage
+report likewise leaves out a started order that has no usable frozen recipe, and a draft order whose product has no claimed recipe, and names them in a note. Reservation attribution and WIP valuation of a started order also use its frozen recipe: an order without one is named and not attributed or valued from the live recipe.
+
+Variance reporting works the other way round: it reads the recipe **frozen onto each build order when
+it was started**, so re-importing or editing a recipe later does not change the variance of orders that
+have already run. A started or completed order that has no frozen recipe (it started before recipes
+were frozen) is left out of the variance report and named in a note under it, rather than being
+measured against whatever the recipe is today.
+
 They can still fall out of step for recipes created before this was true, or edited directly in the
 database. The symptom is quiet: the product builds fine one order at a time, but the reorder report
 never suggests building it and its components are never reordered on its behalf. To check, open

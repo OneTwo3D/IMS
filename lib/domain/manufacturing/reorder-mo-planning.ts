@@ -59,3 +59,34 @@ export function partitionReorderMoCandidates(input: {
 
   return { toCreate, skipped }
 }
+
+/**
+ * The CLAIMED active Bom for each product (boms.productId = product), keyed by product id.
+ *
+ * Replaces "the most recently updated active Bom that has an item for this parent", which had no
+ * unique answer once two Boms listed the same parent and let `updatedAt` pick between a claimed
+ * recipe and a stray duplicate. A product with no claimed active Bom is simply absent from the
+ * map, so `partitionReorderMoCandidates` reports it as `no_active_bom` instead of guessing.
+ */
+export async function claimedActiveBomIdsByProduct(
+  client: {
+    bom: {
+      findMany(args: {
+        where: { active: true; productId: { in: string[] } }
+        select: { id: true; productId: true }
+      }): Promise<Array<{ id: string; productId: string | null }>>
+    }
+  },
+  productIds: string[],
+): Promise<Map<string, string>> {
+  const bomIdByProduct = new Map<string, string>()
+  if (productIds.length === 0) return bomIdByProduct
+  const claimed = await client.bom.findMany({
+    where: { active: true, productId: { in: productIds } },
+    select: { id: true, productId: true },
+  })
+  for (const bom of claimed) {
+    if (bom.productId) bomIdByProduct.set(bom.productId, bom.id)
+  }
+  return bomIdByProduct
+}

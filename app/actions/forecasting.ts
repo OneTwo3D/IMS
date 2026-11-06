@@ -6,7 +6,7 @@ import { logActivity } from '@/lib/activity-log'
 import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
-import { partitionReorderMoCandidates, type ReorderMoSkip } from '@/lib/domain/manufacturing/reorder-mo-planning'
+import { claimedActiveBomIdsByProduct, partitionReorderMoCandidates, type ReorderMoSkip } from '@/lib/domain/manufacturing/reorder-mo-planning'
 import { selectReorderPoCandidates, type ReorderPoSkip } from '@/lib/domain/purchasing/reorder-po-planning'
 import type { StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { ProductType } from '@/app/generated/prisma/client'
@@ -540,7 +540,7 @@ export async function createReorderPOs(
 // PurchaseOrder rows. For each selected BOM product the helper:
 //   - looks up the latest ProductionOrder to copy the manufacturer and
 //     warehouse (falling back to the first warehouse if none exists),
-//   - picks the most recently-updated active Bom for that product,
+//   - picks the product's CLAIMED active Bom (boms.productId), never by updatedAt,
 //   - re-runs getReorderReport to read the suggestedReorderQty consistent
 //     with the report the operator selected from, and
 //   - creates a DRAFT ProductionOrder for that quantity.
@@ -581,29 +581,10 @@ export async function createReorderMOs(
       }
     }
 
-    // Active BOMs per product. We pick the most recently-updated active BOM
-    // that lists the product as a parent on any of its items — that's the
-    // BOM the operator most recently shaped, mirroring the "latest MO" pick.
-    const bomCandidates = await db.bom.findMany({
-      where: {
-        active: true,
-        items: { some: { parentProductId: { in: eligible } } },
-      },
-      select: {
-        id: true,
-        updatedAt: true,
-        items: { where: { parentProductId: { in: eligible } }, select: { parentProductId: true } },
-      },
-      orderBy: { updatedAt: 'desc' },
-    })
-    const bomIdByProduct = new Map<string, string>()
-    for (const bom of bomCandidates) {
-      for (const item of bom.items) {
-        if (!bomIdByProduct.has(item.parentProductId)) {
-          bomIdByProduct.set(item.parentProductId, bom.id)
-        }
-      }
-    }
+    // The CLAIMED active Bom per product (boms.productId = product). Not "latest updated Bom with an
+    // item for this parent": two Boms can list the same parent, and updatedAt would let a stray
+    // duplicate win over the recipe the product claims.
+    const bomIdByProduct = await claimedActiveBomIdsByProduct(db, eligible)
 
     const fallbackWarehouse = await db.warehouse.findFirst({
       orderBy: { code: 'asc' },

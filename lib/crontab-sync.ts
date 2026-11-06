@@ -20,6 +20,15 @@ export const OTI_CRON_END_MARKER = '# --- OTI CRON END ---'
 // equality left whitespace- or CRLF-suffixed markers unmatched, so old blocks
 // survived as live duplicates).
 import { resolveCronEnablement } from '@/lib/domain/settings/cron-enablement'
+import {
+  heartbeatCheckSlug,
+  heartbeatChecksFor,
+  resolveHeartbeatsFromEnv,
+  unwrapJobLine,
+  wrapJobCommand,
+  type HeartbeatCheck,
+  type HeartbeatOptions,
+} from '@/lib/ops/cron-heartbeats'
 
 const START_MARKER_RE = /^# --- OTI CRON START ---[ \t\r]*$/
 const END_MARKER_RE = /^# --- OTI CRON END ---[ \t\r]*$/
@@ -299,15 +308,66 @@ export function renderCronJobCommand(params: { prefix: string; slug: string; log
   return String.raw`${prefix}case "$CRON_SECRET" in ''|*\\*) echo "cron-auth: CRON_SECRET is missing or unusable (empty, or holds a backslash); ${slug} was not run" ;; *) echo "header = \"Authorization: Bearer $CRON_SECRET\"" | curl -sf -o /dev/null -K - "$BASE_URL/${slug}" ;; esac >> '${logPath}' 2>&1`
 }
 
+/**
+ * The jobs the block carries, in order, each with its effective schedule: the enabled ones, a saved schedule or the registry default.
+ * The ONE place enablement and schedule are resolved, shared by the block builder and the heartbeat check list.
+ */
+export function listEnabledCronJobs(params: { jobs: CrontabJobDef[]; settings: Map<string, string> }):
+  | { ok: true; entries: { job: CrontabJobDef; schedule: string }[] }
+  | { ok: false; error: string } {
+  const { jobs, settings } = params
+  const entries: { job: CrontabJobDef; schedule: string }[] = []
+  for (const job of jobs) {
+    // THE SHARED RESOLVER (Codex r20 HIGH). This logic was correct and it was the ONLY place that
+    // had it: the backup route and the Backup settings page each read the legacy row alone, so a
+    // diverged pair meant a cron line that ran a no-op, or a screen that said "on" over a job with
+    // no cron line. Behaviour here is unchanged — the extraction is what lets the other two agree.
+    const enabled = resolveCronEnablement({
+      canonical: settings.get(`cron_${job.settingKey}_enabled`),
+      legacy: job.legacyEnabledKey ? settings.get(job.legacyEnabledKey) : undefined,
+      hasLegacyKey: Boolean(job.legacyEnabledKey),
+      defaultEnabled: job.defaultEnabled,
+    })
+    if (!enabled) continue
+
+    const schedule = settings.get(`cron_${job.settingKey}_schedule`) ?? job.defaultSchedule
+    const check = validateCronSchedule(schedule)
+    if (!check.ok) {
+      return { ok: false, error: `Invalid cron schedule for ${job.label}: "${schedule}" (${check.error})` }
+    }
+    entries.push({ job, schedule })
+  }
+  return { ok: true, entries }
+}
+
+/**
+ * The Healthchecks checks an operator creates for the enabled jobs: `(slug, cron schedule, tz)`. The app never calls Healthchecks.
+ * `tz` is the time zone the host's cron evaluates the schedules in.
+ */
+export function listHeartbeatChecks(params: { jobs: CrontabJobDef[]; settings: Map<string, string>; heartbeats: HeartbeatOptions; tz: string }):
+  | { ok: true; checks: HeartbeatCheck[] }
+  | { ok: false; error: string } {
+  const listed = listEnabledCronJobs(params)
+  if (!listed.ok) return listed
+  return { ok: true, checks: heartbeatChecksFor(listed.entries.map((entry) => ({ jobSlug: entry.job.slug, schedule: entry.schedule })), params.heartbeats, params.tz) }
+}
+
 export function buildOtiCrontabBlock(params: {
   jobs: CrontabJobDef[]
   settings: Map<string, string>
   secretRef: CrontabSecretRef
   baseUrl: string
   logPath?: string
+  /**
+   * Wrap every job line for Healthchecks (lib/ops/cron-heartbeats.ts). `null` forces the plain form; UNDEFINED reads
+   * IMS_CRON_HEARTBEATS from the environment (default off), so every reader that rebuilds the block to compare it with an installed
+   * crontab agrees with the writer without each call site passing the option.
+   */
+  heartbeats?: HeartbeatOptions | null
 }): BuildOtiCrontabBlockResult {
   const { jobs, settings, secretRef, baseUrl } = params
   const logPath = params.logPath ?? DEFAULT_CRON_LOG_PATH
+  const heartbeats = params.heartbeats === undefined ? resolveHeartbeatsFromEnv() : params.heartbeats
 
   if (secretRef.kind === 'env-file' && !isCronSafePath(secretRef.envFilePath)) {
     return { ok: false, error: 'App .env path contains characters cron cannot carry safely (quote, %, or control characters).' }
@@ -332,31 +392,16 @@ export function buildOtiCrontabBlock(params: {
 
   const commandPrefix = secretRef.kind === 'env-file' ? runtimeSecretPrefix(secretRef.envFilePath) : ''
 
-  for (const job of jobs) {
-    // THE SHARED RESOLVER (Codex r20 HIGH). This logic was correct and it was the ONLY place that
-    // had it: the backup route and the Backup settings page each read the legacy row alone, so a
-    // diverged pair meant a cron line that ran a no-op, or a screen that said "on" over a job with
-    // no cron line. Behaviour here is unchanged — the extraction is what lets the other two agree.
-    const enabled = resolveCronEnablement({
-      canonical: settings.get(`cron_${job.settingKey}_enabled`),
-      legacy: job.legacyEnabledKey ? settings.get(job.legacyEnabledKey) : undefined,
-      hasLegacyKey: Boolean(job.legacyEnabledKey),
-      defaultEnabled: job.defaultEnabled,
-    })
-    if (!enabled) continue
-
-    const schedule = settings.get(`cron_${job.settingKey}_schedule`) ?? job.defaultSchedule
-    const check = validateCronSchedule(schedule)
-    if (!check.ok) {
-      return { ok: false, error: `Invalid cron schedule for ${job.label}: "${schedule}" (${check.error})` }
-    }
-
+  const listed = listEnabledCronJobs({ jobs, settings })
+  if (!listed.ok) return listed
+  for (const { job, schedule } of listed.entries) {
+    const command = renderCronJobCommand({ prefix: commandPrefix, slug: job.slug, logPath })
     lines.push(
       `# ${job.label}`,
       // logPath is single-quoted (Codex r3: unquoted, a log path with a space
       // or shell operator ran arbitrary commands via the redirect); the ' and
       // % and control chars it can't survive are already rejected above.
-      `${schedule}  ${renderCronJobCommand({ prefix: commandPrefix, slug: job.slug, logPath })}`,
+      `${schedule}  ${heartbeats ? wrapJobCommand(command, heartbeatCheckSlug(heartbeats.slugPrefix, job.slug)) : command}`,
       '',
     )
   }
@@ -429,7 +474,9 @@ export function parseOtiCrontabStatus(crontabText: string, currentSecret: string
   // `echo "…"` all misclassified as healthy runtime. \S+ and \s+ don't overlap
   // so the {5} quantifier can't backtrack catastrophically.
   const RUNTIME_CMD = /^\s*\S+(?:\s+\S+){4}\s+CRON_SECRET=\$\(grep -m1 '\^CRON_SECRET=' '([^']+)' \| cut -d= -f2- \| tr -d '"'\)/
-  const blockJobLines = block.split('\n').filter(isJobLine)
+  // A heartbeat-wrapped line (lib/ops/cron-heartbeats.ts) is judged by the command it wraps, so the secret source is classified the
+  // same in both forms; WHICH form is expected is the exact-line comparison's business, not this classifier's.
+  const blockJobLines = block.split('\n').filter(isJobLine).map((line) => unwrapJobLine(line)?.line ?? line)
   const managedJobCount = blockJobLines.length
   const unmanagedCronApiLines = outside.split('\n').filter(isJobLine).length
 

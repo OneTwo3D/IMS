@@ -293,12 +293,49 @@ completed it.
 
 Not available inside the container: the in-app Scheduler's `crontab` reconciliation (see above).
 
+#### Healthchecks heartbeats for the cron jobs (opt-in)
+
+Every managed job line can be wrapped with `/usr/local/bin/o3d-hc` (the host heartbeat wrapper, which pings Healthchecks at start and
+with the exit code, never fails the job, and passes stdin through) so a job that stops firing or fails is noticed. **Default off: the
+rendered text is byte-identical to the unwrapped form unless you enable it.** The app never calls Healthchecks; you create the checks.
+
+A wrapped line is `<schedule>  [user  ]/usr/local/bin/o3d-hc <check-slug> -- sh -c '<the unchanged job command>'`. The command inside
+is exactly the one rendered without heartbeats, so `echo "header = ..." | curl -K -` and the `CRON_SECRET` handling are as before.
+The check slug is `ims-<job slug>` on production and `ims-stage-<job slug>` on stage (lowercase, `[a-z0-9-]`, at most 50 characters;
+a longer name ends in a hash so two long names never collide).
+
+| Where | How to enable |
+|-------|---------------|
+| Production | set `IMS_CRON_HEARTBEATS=1` (and optionally `IMS_CRON_HEARTBEATS_PREFIX=<p->`, default `ims-`) in the host's `/etc/ims/ims.env`. That file is the single switch: `install_host_cron` (deploy, rollback and the 5-minute `ims-cron-render` timer) adds `--heartbeats` / `--heartbeat-prefix` to the renderer when it says so, and the app containers read the same file through `--env-file`, so the renderer and the status reader cannot disagree. A manual `render-managed-crontab.mjs --heartbeats` render is only for one-off inspection; the next timer run would replace it with what ims.env says. |
+| Stage (in-app crontab writer on the host) | set `IMS_CRON_HEARTBEATS=1` in the app's environment (prefix `ims-stage-`, or `IMS_CRON_HEARTBEATS_PREFIX`), restart, then Save & Apply on the Scheduler page. |
+
+With heartbeats on, `install_host_cron` refuses to replace the live crontab (deploy exits 4, the timer retries); the in-app stage writer refuses the same way and shows the error on the Scheduler page while `/usr/local/bin/o3d-hc` is missing or not executable, because every wrapped job would otherwise stop.
+
+A wrapped job that is refused because `CRON_SECRET` is missing or unusable exits 1, so the check reports a failure (the unwrapped line keeps its documented exit 0).
+
+`/usr/local/bin/o3d-hc` and `HC_PING_BASE` (environment or `/etc/o3d/hc.env`) must exist on the host. Without a ping base the job still
+runs and the wrapper writes a warning to stderr.
+
+**Drift.** A job counts as scheduled only in the form the current settings produce: a wrapped line with heartbeats off, an unwrapped
+line with heartbeats on, or a different check slug all read as drift (the job shows as unscheduled). After switching the setting,
+re-render and reinstall (production) or Save & Apply (stage); in between, the half-applied state reads as drift, as intended.
+
+**Create the checks.** List `(slug, schedule, tz)` for the enabled jobs and create matching Healthchecks checks from it (tz is the
+zone the host's cron uses; the default is `UTC`):
+
+```bash
+docker run --rm --network <db-network> -e DATABASE_URL --entrypoint node ghcr.io/onetwo3d/ims:<sha> \
+  /app/dist-scripts/render-managed-crontab.mjs --print-heartbeat-checks --format cron.d [--heartbeat-tz Europe/London] [--defaults-only]
+```
+
+The output is `{"checks": [{"slug", "schedule", "tz", "job"}, ...]}`. Use `--format user` (the default) for stage's `ims-stage-` slugs.
+
 ### Production host: blue/green deploy
 
 Production runs on one Proxmox container (CT 115, Debian 13) with PostgreSQL 17 installed natively (127.0.0.1:5432). Releases are the
 CI-built images above, deployed by full commit SHA with the scripts in `deploy/bin`:
 
-- `host-bootstrap.sh`: one-time, re-runnable host setup (Docker from Debian's `docker.io`, `/srv/ims/state`, `/etc/ims`, the nginx
+- `host-bootstrap.sh`: one-time, re-runnable host setup (Docker from Debian's `docker.io` plus the separate `docker-cli` package where it exists (Debian 13 ships the CLI separately), checked with `docker info`, `/srv/ims/state`, `/etc/ims`, the nginx
   site on :3000 replacing the `ims-holding` page, the scripts under `/usr/local/lib/ims-deploy`, the cron-render timer). It never
   touches PostgreSQL, OpenLiteSpeed, `ims.env` or `cron.env`. The images are public: no `docker login` and no token.
 - `deploy.sh [--allow-contract-migration --maintenance] <full-sha>`, `rollback.sh [--force-schema-mismatch]`, `cron-render.sh`.
@@ -354,8 +391,11 @@ verified through nginx; the nginx workers still proxying to the running slot are
 running by an earlier failed switch-back cannot serve the old code against the new schema. The ordinary verified switch to the new slot
 leaves maintenance. After any failure in this mode nginx stays in maintenance and the log prints how to resume (rerun the same
 command) or abort (`deploy.sh <previous sha>`; `rollback.sh` cannot be used while nginx serves no slot) (if the new release then fails its health check the old slot is NOT restarted, because the schema may no longer
-fit it). `--allow-contract-migration` without `--maintenance` is a usage error. A database with no applied migrations is exempt ONLY
-when nothing is serving (nginx reports no slot and neither slot container is running): the first install. An empty history while a
+fit it). `--allow-contract-migration` without `--maintenance` is a usage error. A genuine first install is exempt: nginx reports no slot, NO slot container exists in any state (`docker ps -a`; a stopped one
+with a restart policy may come back) and `/srv/ims/deploy/current` does not exist. Then pending migrations run without the expand-only
+rule, whether the migration history is empty or an earlier first-install attempt already applied part of it. If the upstream file or
+`deploy/current` exists but is unreadable (or `deploy/current` is empty), or docker cannot list the containers, the host state is unknown
+and the deploy exits 3 at once, even with the override flags. The refusal names which condition blocked it. An empty history while a
 release is serving or running means `DATABASE_URL` points at the wrong database, and the deploy refuses (status 3) unless the
 maintenance flags are given. `rollback.sh` refuses when any migration applied since `previous` lacks the marker; `--force-schema-mismatch`
 overrides. `deploy.sh` applies the same rule to an OLDER target image: any already-applied migration the target does not ship must be

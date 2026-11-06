@@ -27,6 +27,7 @@ import {
   type CrontabJobDef,
   type CrontabSecretRef,
 } from '@/lib/crontab-sync'
+import { unwrapJobLine, type HeartbeatOptions } from '@/lib/ops/cron-heartbeats'
 
 export type SchedulerVerdict = {
   /** Why the block as a whole cannot be trusted; null when it is complete. */
@@ -44,7 +45,7 @@ export type ParsedManagedBlock =
  * trustworthy: exactly one managed region, both markers, and a header equal to the one the generator renders from those three.
  * Split out of `verifyJobsScheduled` so that a block is read in one place. Pure.
  */
-export function parseManagedBlock(rawCrontabText: string): ParsedManagedBlock {
+export function parseManagedBlock(rawCrontabText: string, heartbeats?: HeartbeatOptions | null): ParsedManagedBlock {
   // CRLF and lone CR are line endings too: normalise ONCE, before marker detection, extraction and header comparison.
   const crontabText = rawCrontabText.replace(/\r\n?/g, '\n')
   const allMissing = (problem: string): ParsedManagedBlock => ({ ok: false, problem })
@@ -79,10 +80,10 @@ export function parseManagedBlock(rawCrontabText: string): ParsedManagedBlock {
   }
 
   const firstJobLine = block.find((line) => line.includes('$BASE_URL/') && !line.trim().startsWith('#'))
-  const logPath = firstJobLine?.match(/ >> '(.+)' 2>&1$/)?.[1] ?? DEFAULT_CRON_LOG_PATH
+  const logPath = (firstJobLine === undefined ? undefined : unwrapJobLine(firstJobLine)?.line ?? firstJobLine)?.match(/ >> '(.+)' 2>&1$/)?.[1] ?? DEFAULT_CRON_LOG_PATH
 
   const render = (jobs: CrontabJobDef[], settings: Map<string, string>) =>
-    buildOtiCrontabBlock({ jobs, settings, secretRef, baseUrl, logPath })
+    buildOtiCrontabBlock({ jobs, settings, secretRef, baseUrl, logPath, heartbeats })
 
   // The header the generator writes for this block's own BASE_URL, secret source and log path.
   const header = render([], new Map())
@@ -100,12 +101,14 @@ export function verifyJobsScheduled(
   rawCrontabText: string,
   wanted: readonly CrontabJobDef[],
   storedSchedules: Readonly<Record<string, string | undefined>>,
+  /** Heartbeat wrapping the job lines must carry. UNDEFINED: from the environment (IMS_CRON_HEARTBEATS); null: none. A job line in the OTHER form is not the generated line, so the job reads as missing. */
+  heartbeats?: HeartbeatOptions | null,
 ): SchedulerVerdict {
-  const parsed = parseManagedBlock(rawCrontabText)
+  const parsed = parseManagedBlock(rawCrontabText, heartbeats)
   if (!parsed.ok) return { blockProblem: parsed.problem, missing: wanted.map((job) => job.slug) }
   const { block, baseUrl, secretRef, logPath } = parsed
   const render = (jobs: CrontabJobDef[], settings: Map<string, string>) =>
-    buildOtiCrontabBlock({ jobs, settings, secretRef, baseUrl, logPath })
+    buildOtiCrontabBlock({ jobs, settings, secretRef, baseUrl, logPath, heartbeats })
 
   const missing: string[] = []
   for (const job of wanted) {

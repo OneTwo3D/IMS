@@ -55,6 +55,7 @@ import {
   validateSalesOrderStatusTransition,
 } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
+import { LEDGER_STANDING_SELECT, isShadowedObligation, workSlotStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import {
   accountedAllocationQty,
@@ -1391,6 +1392,12 @@ export async function reverseOrphanedAllocationPosting(
  * exact amount, both account codes and the units — everything a human needs to post the reversal
  * by hand — which is precisely what the silent path destroyed.
  */
+/** Does this sync row hold the work slot (PENDING / PROCESSING / SYNCED) on the connector's own word, not an operator's assertion? */
+function isLiveUnassertedWorkSlot(row: LedgerStandingRow): boolean {
+  const slot = workSlotStanding(row)
+  return slot.slot === 'OCCUPIED' && !slot.asserted
+}
+
 async function assertAllocationReversalQueued(
   tx: Prisma.TransactionClient,
   orderId: string,
@@ -1415,7 +1422,7 @@ async function assertAllocationReversalQueued(
    */
   enqueueOutcome: AccountingEnqueueOutcome | null,
 ): Promise<boolean> {
-  const queued = await tx.accountingSyncLog.findFirst({
+  const row = await tx.accountingSyncLog.findFirst({
     where: {
       connector,
       type: 'ALLOCATION_REVERSAL',
@@ -1423,8 +1430,14 @@ async function assertAllocationReversalQueued(
       referenceId: orderId,
       payload: { path: ['_reversalToken'], equals: reversalToken },
     },
-    select: { id: true },
+    // THE ROW'S STANDING RIDES WITH IT. A row EXISTING is not the question; "is a journal going to move these pounds" is.
+    select: { id: true, ...LEDGER_STANDING_SELECT },
   })
+  // THE STANDING, NOT THE EXISTENCE. A shadow the producer-side hold recorded instead of queuing (CANCELLED, HELD_SHADOW) carries the
+  // token too, and so does a terminal or operator-asserted row; none of them is a LIVE journal. Counting one as "queued" recorded
+  // relief for a credit nobody will send, which shrinks the refund's open balance and leaves a real Allocated Inventory balance
+  // unreversed with no record. Only a row that holds the work slot AND is not an operator's assertion counts.
+  const queued = row !== null && isLiveUnassertedWorkSlot(row)
   // o3d-0i5y r12: the answer is RETURNED as well as reported, because the caller records relief off
   // the back of it. Relief claimed for a journal that was never queued shrinks the refund's open
   // balance and strands real pounds — the opposite error, and the silent one.
@@ -1439,7 +1452,8 @@ async function assertAllocationReversalQueued(
       level: 'ERROR',
       description:
         withLedgerCheck(`Allocation reversal of £${amount.toFixed(2)} on order ${orderId} was NOT queued — no `
-        + `AccountingSyncLog row exists for reversal token ${reversalToken}. `
+        + `LIVE AccountingSyncLog row exists for reversal token ${reversalToken}`
+        + (row ? ` (the row that carries it is ${isShadowedObligation(row) ? 'a SHADOW the producer-side hold kept instead of queuing' : `not live: ${row.status}`})` : '') + '. '
         + `${sumCostLayerSnapshotQty(orphaned).toString()} recorded unit(s) left the order and their `
         + 'Group A2 Allocated Inventory debit has been left standing with nothing downstream to '
         + 'relieve it. Post DR Inventory / CR Allocated Inventory for this amount by hand. '
@@ -1449,7 +1463,9 @@ async function assertAllocationReversalQueued(
             + 'connector selection back does not undo the debit — post the journal by hand.'
           : enqueueOutcome?.reason === 'not-configured'
             ? 'The connector does not post this journal type, so nothing will ever queue for it.'
-            : 'The enqueue reported no reason.')),
+            : enqueueOutcome?.reason === 'shadowed' || (row !== null && isShadowedObligation(row))
+              ? 'The producer-side hold recorded the journal as a shadow: IMS did not send it, so the ledger does not hold it from IMS.'
+              : 'The enqueue reported no reason.')),
       metadata: {
         reversalToken,
         amount,
@@ -1458,6 +1474,9 @@ async function assertAllocationReversalQueued(
         enqueueQueued: enqueueOutcome?.queued ?? null,
         enqueueReason: enqueueOutcome?.reason ?? null,
         enqueueConnector: enqueueOutcome?.connector ?? null,
+        // The standing of the row that carries the token, where one does: a shadow or a terminal row is NOT a queued journal.
+        rowStatus: row?.status ?? null,
+        rowSettlementBasis: row?.settlementBasis ?? null,
       },
     },
   })
