@@ -290,6 +290,20 @@ for (const order of ORDERS) {
     assert.equal(destinationOf(rows.billOldest.id), 'xero')
     assert.equal(destinationOf(jobs.billOldest.id), 'xero')
     assert.equal(destinationOf(rows.billMiddle.id), MIDDLE.getTime() < order.xero.getTime() ? 'xero' : undefined)
+    // The apply re-derives the destination under the row lock: items forced onto the WRONG destination (a note as Xero's, a Xero row as
+    // WooCommerce's, for the sync row and for its delivery job) change nothing. Done BEFORE the real apply, while every row is still queued.
+    const swap = (id: string, destination: 'xero' | 'woocommerce') => {
+      const item = plan.items.find((candidate: { id: string }) => candidate.id === id)
+      assert.ok(item, `PRECONDITION: ${id} was planned`)
+      return { ...item, destination }
+    }
+    const wrongItems = [
+      swap(rows.noteOldest.id, 'xero'), swap(jobs.noteOldest.id, 'xero'),
+      swap(rows.billOldest.id, 'woocommerce'), swap(jobs.billOldest.id, 'woocommerce'),
+    ]
+    const wrongApply = await d.retire.applyHeldBacklogRetirement({ ...plan, items: wrongItems } as never, { ...scope, destinations: [...scope.destinations] })
+    assert.deepEqual(wrongApply.outcomes.map((outcome: { result: string }) => outcome.result), ['changed_since_plan', 'changed_since_plan', 'changed_since_plan', 'changed_since_plan'])
+    for (const job of Object.values(jobs)) assert.equal((await d.db.integrationOutbox.findUniqueOrThrow({ where: { id: job.id } })).status, 'PENDING', 'a mis-attributed job is untouched')
     const applied = await d.retire.applyHeldBacklogRetirement({ ...plan, items: mine }, { ...scope, destinations: [...scope.destinations] })
     console.log(`# applied: ${JSON.stringify(applied.counts)}`)
     const status = async (id: string) => (await d.db.accountingSyncLog.findUniqueOrThrow({ where: { id }, select: { status: true } })).status
