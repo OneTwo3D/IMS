@@ -26,10 +26,12 @@ let accountingMocked = false
 let mailerImpl: ((message: { to: string }) => Promise<Record<string, unknown>>) | null = null
 // When set, the Mintsoft connector double returns these records from pollReturns.
 let pollReturnsRecords: (() => Array<Record<string, unknown>>) | null = null
-// Runs after upsertCustomer has returned (inside importWcOrder), before the order is created.
+// Runs when the importer's customer step is entered, inside the ORDER-CREATE TRANSACTION and before the customer is looked up.
 // The tracking each fulfilment update was asked to record (see the completion test). The real function still runs.
 const fulfilmentTracking: Array<unknown[]> = []
-let afterUpsertCustomer: (() => Promise<void>) | null = null
+// Runs after the customer step returned, still inside the order-create transaction: a hook that throws fails the whole transaction.
+let afterUpsertCustomerInTx: (() => Promise<void>) | null = null
+let beforeUpsertCustomer: (() => Promise<void>) | null = null
 // Runs after an email action has read the order's address and before it enqueues.
 let afterAddressRead: (() => Promise<void>) | null = null
 // Runs inside logActivityInTransaction, before the row is written (see mockActionEnvironment).
@@ -72,7 +74,7 @@ async function mockActionEnvironment() {
   mock.module('@/lib/mailer', { namedExports: { ...mailer, sendEmail: async (message: never) => (mailerImpl ? mailerImpl(message) : { success: true }) } })
   // A seam AFTER the importer's customer lookup/link step returned its customer and before the order create transaction starts.
   const fieldMapping = await import('@/lib/connectors/woocommerce/sync/field-mapping')
-  mock.module('@/lib/connectors/woocommerce/sync/field-mapping', { namedExports: { ...fieldMapping, upsertCustomer: async (order: never) => { const id = await fieldMapping.upsertCustomer(order); await afterUpsertCustomer?.(); return id } } })
+  mock.module('@/lib/connectors/woocommerce/sync/field-mapping', { namedExports: { ...fieldMapping, upsertCustomer: async (order: never, client?: never) => { await beforeUpsertCustomer?.(); const id = await fieldMapping.upsertCustomer(order, client); await afterUpsertCustomerInTx?.(); return id } } })
   // A seam between an email action's read of the order address and its enqueue (the read is real; the hook runs after it).
   const orderEmail = await import('@/lib/order-email')
   mock.module('@/lib/order-email', { namedExports: { ...orderEmail, getAccountingInvoiceQueueData: async (orderId: string) => { const data = await orderEmail.getAccountingInvoiceQueueData(orderId); await afterAddressRead?.(); return data } } })
@@ -417,8 +419,9 @@ test('[erasure] a customer erased between the importer\'s customer lookup and it
   const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
   const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
 
-  // A SECOND order from the same person (matched by email). The importer's customer step returns the not-yet-erased customer; THEN
-  // (from the seam) an erasure takes the customer row lock and has not committed, and the order create transaction blocks on it.
+  // A SECOND order from the same person (matched by email). The customer step now runs INSIDE the order-create transaction: on entering it (the
+  // seam) an erasure takes the customer row lock and has not committed; the step finds the still-live customer, then blocks on that lock, and
+  // re-reads the customer as erased once the erasure commits.
   // The customer's ORIGINAL erasure proof (as an earlier erasure would have written it).
   const ORIGINAL_REQUEST_ID = `orig-request-${randomUUID()}`
   await db.activityLog.create({ data: { entityType: 'CUSTOMER', entityId: fx.customerId, action: 'gdpr_erasure_recorded', description: 'Personal data erased', tag: 'sales', level: 'INFO', metadata: { requestId: ORIGINAL_REQUEST_ID, trigger: 'ON_REQUEST' } } as never })
@@ -426,8 +429,8 @@ test('[erasure] a customer erased between the importer\'s customer lookup and it
   let release!: () => void
   const gate = new Promise<void>((resolve) => { release = resolve })
   let erasing: Promise<void> = Promise.resolve()
-  afterUpsertCustomer = async () => {
-    afterUpsertCustomer = null
+  beforeUpsertCustomer = async () => {
+    beforeUpsertCustomer = null
     erasing = db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM "customers" WHERE id = ${fx.customerId} FOR UPDATE`
       await gate
@@ -438,7 +441,7 @@ test('[erasure] a customer erased between the importer\'s customer lookup and it
   let done = false
   const importing = importWcOrder(payload(fx.externalId + 1, wcRateId) as never).then((r) => { done = true; return r })
   await new Promise((r) => setTimeout(r, 1500))
-  assert.equal(done, false, 'the create transaction is waiting on the customer row lock')
+  assert.equal(done, false, 'the create transaction is waiting on the customer row lock (taken inside its customer step)')
   release()
   await erasing
   const result = await importing
@@ -1846,4 +1849,54 @@ test('[erasure] the first-import lock wait is bounded: a second acquire on a hel
   await release()
   const again = await acquireWcFirstImportLock(id, 300)
   await again()
+})
+
+test('[erasure] the customer step is atomic with the order create: a failure after it leaves no customer or link, so a later marked delivery leaves no identity anywhere; a successful import still creates and links', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const externalId = fx.externalId + 91
+  const okId = fx.externalId + 92
+  const tag = randomUUID().slice(0, 8)
+  const subject = { ...WC_ADDRESS, first_name: `Atomic${tag}`, last_name: `Subject${tag}`, email: `atomic.${tag}@example.test` }
+  const wooCustomerId = 400_000_000 + Math.floor(Math.random() * 90_000_000)
+  const okWooCustomerId = wooCustomerId + 1
+  t.after(async () => {
+    beforeUpsertCustomer = null; afterUpsertCustomerInTx = null
+    await db.shoppingCustomerLink.deleteMany({ where: { externalCustomerId: { in: [String(wooCustomerId), String(okWooCustomerId)] } } })
+    await cleanupImported(db, [externalId, okId])
+    await db.customer.deleteMany({ where: { OR: [{ email: subject.email }, { lastName: subject.last_name }] } })
+    await fx.cleanup()
+  })
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const unmarked = { ...payload(externalId, wcRateId), customer_id: wooCustomerId, billing: subject, shipping: subject }
+
+  // The customer step succeeds INSIDE the create transaction, then something later in the same transaction throws (injected).
+  let injected = false
+  afterUpsertCustomerInTx = async () => { afterUpsertCustomerInTx = null; injected = true; throw new Error('injected failure after the customer step') }
+  const failed = await importWcOrder(unmarked as never)
+  assert.equal(injected, true, 'the customer step was reached and returned')
+  assert.equal(failed.success, false, 'the import failed after the customer step')
+  assert.equal(await db.shoppingOrderLink.count({ where: { connector: 'woocommerce', externalOrderId: String(externalId) } }), 0, 'no order')
+  assert.equal(await db.customer.count({ where: { OR: [{ email: subject.email }, { lastName: subject.last_name }] } }), 0, 'and the customer step rolled back with it: no customer row')
+  assert.equal(await db.shoppingCustomerLink.count({ where: { externalCustomerId: String(wooCustomerId) } }), 0, 'and no storefront link')
+
+  // The marked delivery now creates an erased order, and nothing anywhere holds the identity.
+  assert.equal((await importWcOrder(anonymisedPayload(externalId, wcRateId) as never)).success, true)
+  const link = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })
+  const order = await db.salesOrder.findUniqueOrThrow({ where: { id: link.orderId } })
+  assert.ok(order.erasedAt)
+  assert.deepEqual([order.customerName, order.customerEmail, order.billingAddress, order.notes], ['GDPR Anonymised', null, null, null])
+  assert.equal(await db.customer.count({ where: { OR: [{ email: subject.email }, { lastName: subject.last_name }, { firstName: subject.first_name }] } }), 0, 'no customer holds the identity')
+  assert.equal(await db.shoppingCustomerLink.count({ where: { externalCustomerId: String(wooCustomerId) } }), 0)
+
+  // CONTROL: a successful first import still creates and links the customer.
+  const ok = { ...payload(okId, wcRateId), customer_id: okWooCustomerId, billing: { ...subject, email: `ok.${tag}@example.test`, first_name: `Okay${tag}` }, shipping: { ...subject, first_name: `Okay${tag}` } }
+  t.after(async () => { await db.customer.deleteMany({ where: { email: `ok.${tag}@example.test` } }) })
+  assert.equal((await importWcOrder(ok as never)).success, true)
+  const okLink = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(okId) }, select: { orderId: true } })
+  const okOrder = await db.salesOrder.findUniqueOrThrow({ where: { id: okLink.orderId } })
+  assert.ok(okOrder.customerId, 'the order is linked to a customer')
+  assert.equal((await db.customer.findUniqueOrThrow({ where: { id: okOrder.customerId! } })).email, `ok.${tag}@example.test`)
+  assert.equal(await db.shoppingCustomerLink.count({ where: { externalCustomerId: String(okWooCustomerId), customerId: okOrder.customerId! } }), 1, 'and the storefront link was written')
 })
