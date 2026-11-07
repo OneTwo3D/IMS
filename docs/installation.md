@@ -5954,6 +5954,7 @@ first, in any of the **four lock domains** this repository takes a session advis
 | WMS dispatch sweep | `lib/domain/wms/dispatch-sweep-lock.ts` | The dispatch sweep, and the operator actions that mutate dispatch state under it |
 | Restore selection | `app/api/backup/restore/route.ts` | A restore |
 | WooCommerce first import | `lib/connectors/woocommerce/sync/first-import-lock.ts` | The first import of a storefront order IMS has never seen: serialises two deliveries of one order (a WooCommerce-anonymised one and an ordinary one) so the loser never writes a customer. Built through the same factory (a dedicated pool of 20, so a burst waits on it and never on the application pool); the wait for another import of the same order is bounded at 60 s, after which the delivery fails and WooCommerce retries. Uses `DATABASE_SESSION_LOCK_URL` like the others; no new variable |
+| WooCommerce anonymisation sweep | `lib/connectors/woocommerce/sync/erasure-sweep-lease.ts` | A single-owner lease (`pg_try_advisory_lock` on a small session-lock pool) so the 15-minute cron tick and a manual reconcile cannot run the erasure sweep at once; a run that cannot take it does nothing |
 
 This is deliberately a map of the **domains**, not a roll-call of jobs. Most of these domains have
 **several callers** — scheduled cron jobs, operator actions in the UI and API routes all reach them —

@@ -44,6 +44,7 @@ import { wcFetch } from '../api'
 import type { WcFullOrder } from './types'
 import { isWcOrderAnonymised } from './anonymisation'
 import { mirrorWcAnonymisationIfHeld } from './anonymisation-mirror'
+import { tryAcquireWcErasureSweepLease } from './erasure-sweep-lease'
 
 export const WC_ERASURE_SWEEP_CURSOR_KEY = 'wc_erasure_sweep_cursor'
 export const WC_ERASURE_SWEEP_LAST_RUN_KEY = 'wc_erasure_sweep_last_run_at'
@@ -81,6 +82,8 @@ export type WcErasureSweepResult = {
   obligationsRecorded: number
   /** True when the run stopped on its budget with more to read. */
   budgetStop: boolean
+  /** True when another run held the lease: this one made no request and wrote no state. */
+  alreadyRunning: boolean
   errors: string[]
 }
 
@@ -116,11 +119,26 @@ async function saveState(state: State): Promise<void> {
 export async function sweepWcAnonymisedOrders(
   options: { maxPages?: number; maxMs?: number; now?: () => number; since?: Date } = {},
 ): Promise<WcErasureSweepResult> {
+  // ONE RUN AT A TIME: the cron tick and a manual reconcile must not each spend a budget and race on the shared cursor.
+  const release = await tryAcquireWcErasureSweepLease()
+  if (!release) {
+    return { pages: 0, scanned: 0, markedHeld: 0, mirrored: 0, alreadyRunning: true, alreadyErased: 0, obligationsRecorded: 0, budgetStop: false, errors: [] }
+  }
+  try {
+    return await sweepWcAnonymisedOrdersLeased(options)
+  } finally {
+    await release()
+  }
+}
+
+async function sweepWcAnonymisedOrdersLeased(
+  options: { maxPages?: number; maxMs?: number; now?: () => number; since?: Date },
+): Promise<WcErasureSweepResult> {
   const maxPages = options.maxPages ?? WC_ERASURE_SWEEP_MAX_PAGES
   const maxMs = options.maxMs ?? WC_ERASURE_SWEEP_MAX_MS
   const now = options.now ?? Date.now
   const startedAt = now()
-  const result: WcErasureSweepResult = { pages: 0, scanned: 0, markedHeld: 0, mirrored: 0, alreadyErased: 0, obligationsRecorded: 0, budgetStop: false, errors: [] }
+  const result: WcErasureSweepResult = { pages: 0, scanned: 0, markedHeld: 0, mirrored: 0, alreadyErased: 0, obligationsRecorded: 0, budgetStop: false, alreadyRunning: false, errors: [] }
   // NOT GATED on the initial import. The initial import commits orders before it sets its completion flag and can stay incomplete for days, so a gate
   // would leave an order it already imported unprotected. The sweep is read-only toward WooCommerce and only erases held orders / records obligations,
   // all under the first-import lock, so it serialises with the import and is safe while it runs.
@@ -149,7 +167,10 @@ export async function sweepWcAnonymisedOrders(
     }
     const { data, error } = await wcFetch('/orders', params)
     if (error) { result.errors.push(`erasure sweep: read failed (${error})`); break }
-    const orders = (Array.isArray(data) ? data : []) as WcFullOrder[]
+    // A SUCCESSFUL response that is not an order list (an HTML error page, a proxy's JSON, a changed shape) is a read FAILURE, never an empty page: an
+    // empty page means "caught up", and would clear the backlog and wait six hours. The state is left where it was and the next tick retries.
+    if (!Array.isArray(data)) { result.errors.push('erasure sweep: the store answered with something that is not an order list'); break }
+    const orders = data as WcFullOrder[]
     result.pages += 1
 
     let lastMod: number | null = null

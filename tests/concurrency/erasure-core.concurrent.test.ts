@@ -2410,3 +2410,43 @@ for (const sortBy of ['local', 'gmt'] as const) {
     assert.deepEqual(missing, [], 'every marked order was evaluated')
   })
 }
+
+test('[erasure] a successful response that is NOT an order list is a read failure: the cursor and the backlog are kept and the next tick retries', { skip }, async (t) => {
+  const db = await loadDb()
+  const keys = ['wc_erasure_sweep_last_run_at', 'wc_erasure_sweep_backlog']
+  await prepareSweep(db, t, () => [])
+  t.after(async () => { await db.setting.deleteMany({ where: { key: { in: keys } } }) })
+  await db.setting.deleteMany({ where: { key: { in: keys } } })
+  const { sweepWcAnonymisedOrders, runWcErasureSweepIfDue } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  const cursorBefore = (await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_cursor' } })).value
+  for (const bad of [null, '<html>502</html>', { message: 'proxy' }]) {
+    wcFetchImpl = async () => ({ data: bad, totalPages: 1, totalItems: 0 })
+    const result = await sweepWcAnonymisedOrders()
+    assert.equal(result.errors.length, 1, `a ${typeof bad} body is an error, not an empty page`)
+    assert.equal((await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_backlog' } })).value, 'true', 'the backlog is kept')
+    assert.equal((await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_cursor' } })).value, cursorBefore, 'the cursor did not move')
+  }
+  wcFetchImpl = fakeWooStore([]).impl
+  assert.ok(!('skipped' in (await runWcErasureSweepIfDue())), 'the next tick retries immediately')
+})
+
+test('[erasure] the sweep has a single owner: two concurrent invocations issue requests from only one; the other reports already-running and writes nothing', { skip }, async (t) => {
+  const db = await loadDb()
+  const keys = ['wc_erasure_sweep_last_run_at', 'wc_erasure_sweep_backlog']
+  await prepareSweep(db, t, () => [])
+  t.after(async () => { await db.setting.deleteMany({ where: { key: { in: keys } } }) })
+  await db.setting.deleteMany({ where: { key: { in: keys } } })
+  const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  const store = fakeWooStore([])
+  wcFetchImpl = async (path, params) => { await new Promise((r) => setTimeout(r, 600)); return store.impl(path, params) }
+  const [a, b] = await Promise.all([sweepWcAnonymisedOrders(), sweepWcAnonymisedOrders()])
+  const owners = [a, b].filter((r) => !r.alreadyRunning)
+  assert.equal(owners.length, 1, 'exactly one run owned the sweep')
+  assert.equal([a, b].filter((r) => r.alreadyRunning).length, 1)
+  assert.equal(store.calls.length, 1, 'only the owner issued a request')
+  const skipped = [a, b].find((r) => r.alreadyRunning)!
+  assert.deepEqual([skipped.pages, skipped.errors.length], [0, 0])
+  // The lease is released: the next run owns it again.
+  wcFetchImpl = store.impl
+  assert.equal((await sweepWcAnonymisedOrders()).alreadyRunning, false)
+})

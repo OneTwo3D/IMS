@@ -322,6 +322,12 @@ export const FIRST_LOAD_APPLY_STEP_LOCK_NAMESPACE = 411_220_875
 export const WC_FIRST_IMPORT_LOCK_NAMESPACE = 411_220_876
 
 /**
+ * The single-owner lease of the WooCommerce anonymisation sweep (pg_try_advisory_lock(namespace, 0)): the cron tick and a manual reconcile must not
+ * each run it at once with their own budgets. Taken on a SESSION-lock connection, never the Prisma pool.
+ */
+export const WC_ERASURE_SWEEP_LEASE_NAMESPACE = 411_220_877
+
+/**
  * The namespace the SESSION-LOCK-SPACE PROBE takes its key in (o3d-2k5r r26).
  *
  * Declared in `lib/db/database-url-schema.mjs` and re-exported here rather than written down twice:
@@ -367,6 +373,7 @@ export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   ACCOUNTING_POSTING_SUPPRESSION_LOCK_NAMESPACE,
   FIRST_LOAD_APPLY_STEP_LOCK_NAMESPACE,
   WC_FIRST_IMPORT_LOCK_NAMESPACE,
+  WC_ERASURE_SWEEP_LEASE_NAMESPACE,
   XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE,
   SESSION_LOCK_SPACE_PROBE_NAMESPACE,
 } as const
