@@ -47,6 +47,10 @@ export async function POST(request: NextRequest) {
       if (type === 'orders') {
         const { syncNewWcOrders } = await import('@/lib/connectors/woocommerce/sync/order-import')
         const result = await syncNewWcOrders({ mode: 'manual_reconcile' })
+        // The erasure backstop rides a manual reconcile too, after the order step, with its own small budget; it never fails the run.
+        const { runWcErasureSweep } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+        const sweep = await runWcErasureSweep()
+        result.errors.push(...sweep.errors)
         return NextResponse.json({ success: true, result: toSerializableResult(result) })
       }
       if (type === 'products') {

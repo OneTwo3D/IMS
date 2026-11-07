@@ -45,7 +45,10 @@ mock.module('@/lib/activity-log', {
 })
 mock.module('@/lib/maintenance-mode', { namedExports: { getMaintenanceModeResponse: async () => null } })
 mock.module('@/lib/integration-plugins', { namedExports: { isIntegrationPluginEnabled: async () => true } })
+mock.module('@/lib/connectors/woocommerce/sync/erasure-obligation', { namedExports: { recordWcErasureObligation: async () => undefined, hasOpenWcErasureObligation: async () => false, retireWcErasureObligation: async () => undefined } })
 mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
+// The per-storefront-order first-import session lock needs a real database; this fake arbitrates with its own store.
+mock.module('@/lib/connectors/woocommerce/sync/first-import-lock', { namedExports: { acquireWcFirstImportLock: async () => async () => undefined, wcFirstImportLockHeld: () => false, withWcFirstImportLock: async (_id: unknown, fn: () => Promise<unknown>) => fn(), WcFirstImportLockUnavailable: class extends Error {} } })
 
 /**
  * Every delegate the importer touches, built once so the top-level client and the TRANSACTION client
@@ -339,7 +342,9 @@ test('the gate DISCRIMINATES — a selected status still creates', async () => {
   reset()
   const admitted = await importOrder(wcOrder(206, 'processing'))
   assert.equal(admitted.skipped, undefined, 'an admitted status must reach the create path')
-  assert.equal(state.findFirstCalls, 1, 'and it must get there through the same single pivot read')
+  // 2 = the pivot read plus the ONE re-ask under the first-import lock, taken only on a create that is about to run the customer step. The ADMISSION
+  // decision still rests on the single pivot read; the re-ask cannot change it (it only turns a create into an update of an order that has appeared).
+  assert.equal(state.findFirstCalls, 2, 'the pivot read, plus the re-ask under the first-import lock')
 })
 
 // --- the refusal is durable, by order id ----------------------------------------------------
@@ -469,10 +474,12 @@ test('the link is read ONCE per delivery, so there is no second answer to go sta
 
   await pushOrder(wcOrder(212, 'processing'))
 
+  // The admission decision rests on ONE read (the pivot). The second is the re-ask under the first-import lock that a create about to run the
+  // customer step takes, which can only turn the create into an update of an order that has appeared meanwhile; it is never an admission answer.
   assert.equal(
     state.findFirstCalls,
-    1,
-    'two reads of "does IMS hold this order?" is what made the pivot raceable',
+    2,
+    'the pivot read, plus the single re-ask under the first-import lock (not a second admission answer)',
   )
 })
 
@@ -622,7 +629,7 @@ test('r13 — the currency gate DISCRIMINATES: an ordinary order is untouched by
 
   assert.equal(result.skipped, undefined, 'a stated currency must reach the create path')
   assert.equal(refusalRows().length, 0, 'and must not be queued as a refusal')
-  assert.equal(state.findFirstCalls, 1, 'through the same single pivot read as before')
+  assert.equal(state.findFirstCalls, 2, 'the pivot read, plus the re-ask under the first-import lock')
 
   // And the same order over the webhook. NOT asserted on the status code: this double carries no
   // tax-rate delegate, so an order that gets PAST the gate goes on to fail in the mapping work and

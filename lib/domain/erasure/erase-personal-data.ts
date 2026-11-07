@@ -387,6 +387,82 @@ export type EraseCustomerResult =
   | { success: true; requestId: string }
   | { success: false; error: string }
 
+/**
+ * THE SHARED BODY OF EVERY ERASURE, run inside a transaction whose caller has ALREADY taken the locks (customer row first when there is
+ * one, then the orders, in id order). `targetOrderIds` are the orders to erase; `eraseCustomer` says whether the customer row is erased
+ * with them. The customer wrapper passes all of the customer's orders and true; the order-first entry passes one order and decides
+ * `eraseCustomer` itself. Returns null on success or a refusal text (nothing written).
+ */
+async function eraseUnderLocksInTx(
+  tx: Prisma.TransactionClient,
+  input: { customerId: string | null; eraseCustomer: boolean; targetOrderIds: string[]; requestId: string; erasedAt: Date; trigger: ErasureTrigger; userId: string | null },
+): Promise<string | null> {
+  const { customerId, eraseCustomer, targetOrderIds: orderIds, erasedAt } = input
+  // Every value that identifies the subject (the tokens that remove it from activity rows) is read only AFTER the caller's locks, so an edit
+  // that was in flight has either committed (and is read here) or is blocked until the erasure is done.
+  const before = eraseCustomer && customerId ? await tx.customer.findUnique({ where: { id: customerId } }) : null
+  const orderRows = await tx.salesOrder.findMany({
+    where: { id: { in: orderIds } },
+    select: { customerName: true, customerEmail: true, customerVatNumber: true, billingAddress: true, shippingAddress: true, notes: true, internalNotes: true, trackingNumber: true },
+  })
+  const shipmentRows = await tx.shipment.findMany({ where: { orderId: { in: orderIds } }, select: { trackingNumber: true } })
+  if (eraseCustomer && customerId) {
+    const claimed = await tx.customer.updateMany({
+      where: { id: customerId, gdprAnonymisedAt: null },
+      data: {
+        firstName: ERASURE_PLACEHOLDER_FIRST_NAME,
+        lastName: ERASURE_PLACEHOLDER_LAST_NAME,
+        email: null,
+        phone: null,
+        company: null,
+        taxNumber: null,
+        billingAddress: Prisma.JsonNull,
+        shippingAddress: Prisma.JsonNull,
+        notes: null,
+        externalCustomerId: null,
+        active: false,
+        gdprAnonymisedAt: erasedAt,
+      },
+    })
+    if (claimed.count === 0) return 'Customer already anonymised'
+  }
+  const orderCounts = await eraseOrdersPersonalDataInTx(tx, orderIds, erasedAt)
+  // A customer who REMAINS LIVE (it keeps another live order) must not go on listing an order that was erased: the customer's name, email and
+  // link would keep the erased order attributable to them (getCustomerDetail lists a customer's orders). So the order is UNLINKED in the same
+  // transaction, which is what WooCommerce does to the anonymised order (customer_id 0). Only the link goes: totals, tax, lines, ledger ids and
+  // the invoice stay on the order. Nothing re-links it: the importer's update path never writes customerId, and the only writers of an order's
+  // customerId are the creates (a manual order, a clone, which refuses an erased source, and the importer's create).
+  if (!eraseCustomer && customerId) await tx.salesOrder.updateMany({ where: { id: { in: orderIds } }, data: { customerId: null } })
+  // The addresses the person is known by (the customer's and each order's), read under the locks, also have their suppression rows deleted.
+  const knownAddresses = [...new Set([before?.email, ...orderRows.map((o) => o.customerEmail)].map((a) => a?.trim().toLowerCase()).filter((a): a is string => Boolean(a)))]
+  if (knownAddresses.length > 0) orderCounts.bounceRecordsDeleted += (await tx.emailSuppression.deleteMany({ where: { email: { in: knownAddresses } } })).count
+  // THE STOREFRONT ACCOUNT LINK IS DELETED, not blanked: its externalCustomerId is the live storefront customer id and resolves to
+  // the account, and nothing financial references the row (it has no dependants; orders keep their own order link). With it gone
+  // a later order from the same storefront account finds no link, no email on the erased row to match, and so gets a FRESH
+  // customer; the new identity belongs to a new record. Only when the customer itself is erased: a customer who keeps other live
+  // orders keeps its link.
+  const links = eraseCustomer && customerId ? await tx.shoppingCustomerLink.deleteMany({ where: { customerId } }) : { count: 0 }
+  const tokens = collectIdentityTokens({
+    customer: before as unknown as Record<string, unknown> | null,
+    orders: orderRows as unknown as Array<Record<string, unknown>>,
+    shipmentTracking: shipmentRows.map((r) => r.trackingNumber),
+  })
+  const activityRowsScrubbed = await scrubActivityLogIdentity(tx, [...(eraseCustomer && customerId ? [customerId] : []), ...orderIds], tokens)
+  const linkedFreeTextScrubbed = await scrubLinkedFreeText(tx, orderIds)
+  const counts: ErasureCounts = { customers: eraseCustomer ? 1 : 0, shoppingCustomerLinks: links.count, activityRowsScrubbed, linkedFreeTextScrubbed, ...orderCounts }
+  const record = {
+    tag: 'sales',
+    description: ERASURE_RECORD_DESCRIPTION,
+    // The proof names the customer only when that customer was erased too; for a customer who stays live it would re-attribute the order.
+    metadata: buildErasureRecordMetadata({ requestId: input.requestId, erasedAt, trigger: input.trigger, customerId: eraseCustomer ? customerId : null, orderIds, counts }),
+    userId: input.userId,
+  }
+  // The proof is filed against the customer when the customer is erased, otherwise against the (first) order.
+  if (eraseCustomer && customerId) await logActivityInTransaction(tx, { entityType: 'CUSTOMER', entityId: customerId, action: ERASURE_RECORD_ACTION, ...record })
+  else await logActivityInTransaction(tx, { entityType: 'SALES_ORDER', entityId: orderIds[0]!, action: ERASURE_RECORD_ACTION, ...record })
+  return null
+}
+
 /** Erase a customer and every order linked to them. Idempotent: a second call refuses and changes nothing. */
 export async function eraseCustomerPersonalData(
   customerId: string,
@@ -396,67 +472,13 @@ export async function eraseCustomerPersonalData(
   const erasedAt = new Date()
   try {
     const refusal = await db.$transaction(async (tx): Promise<string | null> => {
-      // LOCKS FIRST, THEN THE IDENTITY SOURCES. The customer row is locked, then ALL of the customer's orders in one statement in id order
-      // (customer, then orders). Every value that identifies the subject (the tokens that remove it from activity rows) is read only AFTER
-      // those locks are held, so an edit that was in flight when the erasure began has either committed (and is read here) or is blocked
-      // until the erasure is done; no value can change between the read and the overwrite. New orders cannot appear under the customer
-      // meanwhile: creating one takes the same customer row lock.
+      // LOCKS FIRST: the customer row is locked, then ALL of the customer's orders in one statement in id order (customer, then orders).
+      // New orders cannot appear under the customer meanwhile: creating one takes the same customer row lock.
       const lockedCustomer = await tx.$queryRaw<Array<{ id: string; gdprAnonymisedAt: Date | null }>>`SELECT id, "gdprAnonymisedAt" FROM "customers" WHERE id = ${customerId} FOR UPDATE`
       if (lockedCustomer.length === 0) return 'Customer not found'
       if (lockedCustomer[0]!.gdprAnonymisedAt) return 'Customer already anonymised'
       const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "sales_orders" WHERE "customerId" = ${customerId} ORDER BY id FOR UPDATE`
-      const orderIds = locked.map((o) => o.id)
-      const before = await tx.customer.findUnique({ where: { id: customerId } })
-      const orderRows = await tx.salesOrder.findMany({
-        where: { customerId },
-        select: { customerName: true, customerEmail: true, customerVatNumber: true, billingAddress: true, shippingAddress: true, notes: true, internalNotes: true, trackingNumber: true },
-      })
-      const shipmentRows = await tx.shipment.findMany({ where: { order: { customerId } }, select: { trackingNumber: true } })
-      const claimed = await tx.customer.updateMany({
-        where: { id: customerId, gdprAnonymisedAt: null },
-        data: {
-          firstName: ERASURE_PLACEHOLDER_FIRST_NAME,
-          lastName: ERASURE_PLACEHOLDER_LAST_NAME,
-          email: null,
-          phone: null,
-          company: null,
-          taxNumber: null,
-          billingAddress: Prisma.JsonNull,
-          shippingAddress: Prisma.JsonNull,
-          notes: null,
-          externalCustomerId: null,
-          active: false,
-          gdprAnonymisedAt: erasedAt,
-        },
-      })
-      if (claimed.count === 0) return 'Customer already anonymised'
-      const orderCounts = await eraseOrdersPersonalDataInTx(tx, orderIds, erasedAt)
-      // The addresses the person is known by (the customer's and each order's), read under the locks, also have their suppression rows deleted.
-      const knownAddresses = [...new Set([before?.email, ...orderRows.map((o) => o.customerEmail)].map((a) => a?.trim().toLowerCase()).filter((a): a is string => Boolean(a)))]
-      if (knownAddresses.length > 0) orderCounts.bounceRecordsDeleted += (await tx.emailSuppression.deleteMany({ where: { email: { in: knownAddresses } } })).count
-      // THE STOREFRONT ACCOUNT LINK IS DELETED, not blanked: its externalCustomerId is the live storefront customer id and resolves to
-      // the account, and nothing financial references the row (it has no dependants; orders keep their own order link). With it gone
-      // a later order from the same storefront account finds no link, no email on the erased row to match, and so gets a FRESH
-      // customer; the new identity belongs to a new record.
-      const links = await tx.shoppingCustomerLink.deleteMany({ where: { customerId } })
-      const tokens = collectIdentityTokens({
-        customer: before as unknown as Record<string, unknown> | null,
-        orders: orderRows as unknown as Array<Record<string, unknown>>,
-        shipmentTracking: shipmentRows.map((r) => r.trackingNumber),
-      })
-      const activityRowsScrubbed = await scrubActivityLogIdentity(tx, [customerId, ...orderIds], tokens)
-      const linkedFreeTextScrubbed = await scrubLinkedFreeText(tx, orderIds)
-      const counts: ErasureCounts = { customers: 1, shoppingCustomerLinks: links.count, activityRowsScrubbed, linkedFreeTextScrubbed, ...orderCounts }
-      await logActivityInTransaction(tx, {
-        entityType: 'CUSTOMER',
-        entityId: customerId,
-        tag: 'sales',
-        action: ERASURE_RECORD_ACTION,
-        description: ERASURE_RECORD_DESCRIPTION,
-        metadata: buildErasureRecordMetadata({ requestId, erasedAt, trigger: options.trigger, customerId, orderIds, counts }),
-        userId: options.userId,
-      })
-      return null
+      return eraseUnderLocksInTx(tx, { customerId, eraseCustomer: true, targetOrderIds: locked.map((o) => o.id), requestId, erasedAt, trigger: options.trigger, userId: options.userId })
     }, ERASURE_TRANSACTION_OPTIONS)
     if (refusal) return { success: false, error: refusal }
     return { success: true, requestId }
@@ -466,6 +488,81 @@ export async function eraseCustomerPersonalData(
     await logActivity({
       entityType: 'CUSTOMER',
       entityId: customerId,
+      tag: 'sales',
+      action: ERASURE_FAILURE_ACTION,
+      level: 'ERROR',
+      description: ERASURE_FAILURE_DESCRIPTION,
+      metadata: { requestId, trigger: options.trigger, errorClass: e instanceof Error ? e.constructor.name : typeof e },
+      userId: options.userId,
+    })
+    return { success: false, error: ERASURE_FAILURE_DESCRIPTION }
+  }
+}
+
+export type EraseOrderResult =
+  | { success: true; already: true }
+  | { success: true; already: false; requestId: string; customerErased: boolean }
+  | { success: false; error: string }
+
+/** Thrown inside the transaction when the order was relinked to another customer between the unlocked read and the locks: roll back and retry. */
+class OrderRelinkedDuringErasure extends Error {}
+const ORDER_ERASURE_ATTEMPTS = 3
+
+/**
+ * ORDER-FIRST ERASURE: erase ONE order (a guest order included), and the linked customer only when no live order remains.
+ *
+ * Lock order is the customer-erasure's (customer row, then ALL of that customer's orders in one id-ordered statement), so the two cannot
+ * deadlock; a guest order locks just itself. The order's customer is read before the locks to know WHICH customer to lock, and read
+ * again under them: if it changed, the transaction rolls back and retries (bounded; a persistent change fails loudly so the caller's
+ * retry takes over). Idempotent: an order already marked erased writes nothing and records nothing.
+ *
+ * The customer row is erased in the same transaction when, under those locks, it is not already erased and every OTHER order linked to
+ * it is already erased. A customer who keeps another live order keeps its row and link.
+ */
+export async function eraseOrderPersonalData(
+  orderId: string,
+  options: { trigger: ErasureTrigger; userId: string | null },
+): Promise<EraseOrderResult> {
+  const requestId = randomUUID()
+  const erasedAt = new Date()
+  try {
+    for (let attempt = 1; attempt <= ORDER_ERASURE_ATTEMPTS; attempt += 1) {
+      try {
+        return await db.$transaction(async (tx): Promise<EraseOrderResult> => {
+          const peek = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { customerId: true } })
+          if (!peek) return { success: false, error: 'Order not found' }
+          let customerErased = false
+          let customerLive = false
+          if (peek.customerId) {
+            const lockedCustomer = await tx.$queryRaw<Array<{ gdprAnonymisedAt: Date | null }>>`SELECT "gdprAnonymisedAt" FROM "customers" WHERE id = ${peek.customerId} FOR UPDATE`
+            customerErased = lockedCustomer.length > 0 && lockedCustomer[0]!.gdprAnonymisedAt != null
+            customerLive = lockedCustomer.length > 0 && !customerErased
+            await tx.$queryRaw`SELECT id FROM "sales_orders" WHERE "customerId" = ${peek.customerId} ORDER BY id FOR UPDATE`
+          } else {
+            await tx.$queryRaw`SELECT id FROM "sales_orders" WHERE id = ${orderId} FOR UPDATE`
+          }
+          const order = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { customerId: true, erasedAt: true } })
+          if (!order) return { success: false, error: 'Order not found' }
+          if (order.customerId !== peek.customerId) throw new OrderRelinkedDuringErasure()
+          if (order.erasedAt) return { success: true, already: true }
+          const liveOthers = peek.customerId && customerLive
+            ? await tx.salesOrder.count({ where: { customerId: peek.customerId, id: { not: orderId }, erasedAt: null } })
+            : 1
+          const eraseCustomer = Boolean(peek.customerId) && customerLive && liveOthers === 0
+          const refusal = await eraseUnderLocksInTx(tx, { customerId: peek.customerId, eraseCustomer, targetOrderIds: [orderId], requestId, erasedAt, trigger: options.trigger, userId: options.userId })
+          if (refusal) return { success: false, error: refusal }
+          return { success: true, already: false, requestId, customerErased: eraseCustomer }
+        }, ERASURE_TRANSACTION_OPTIONS)
+      } catch (e) {
+        if (e instanceof OrderRelinkedDuringErasure && attempt < ORDER_ERASURE_ATTEMPTS) continue
+        throw e
+      }
+    }
+    return { success: false, error: ERASURE_FAILURE_DESCRIPTION }
+  } catch (e) {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
       tag: 'sales',
       action: ERASURE_FAILURE_ACTION,
       level: 'ERROR',

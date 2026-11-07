@@ -6,6 +6,7 @@ import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { scheduleInboxDrain } from '@/lib/jobs/shopping/drain-inbox'
 import { importWcOrder } from '@/lib/connectors/woocommerce/sync/order-import'
+import { isWcOrderAnonymised } from '@/lib/connectors/woocommerce/sync/anonymisation'
 import { syncWcOrderStatus } from '@/lib/connectors/woocommerce/sync/order-status'
 import { externalFulfillmentRefusalAwaitsRefunds } from '@/lib/fulfillment/external-fulfillment'
 import {
@@ -298,6 +299,13 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
         // linked, and the job never revisits it — a tombstone alone would just
         // sit there while a paid PROCESSING order stayed fulfillable. Apply the
         // withdrawal to it directly.
+        // A WooCommerce-ANONYMISED delivery for an order an earlier part of this job already imported is mirrored here (under the first-import
+        // lock), not dropped: the job never revisits that order, so nothing else would erase it. An order not imported yet is imported later
+        // from a fresh read, which carries the marker.
+        if (isWcOrderAnonymised(payload as WcFullOrder)) {
+          const { mirrorWcAnonymisationIfHeld } = await import('./sync/anonymisation-mirror')
+          await mirrorWcAnonymisationIfHeld(payload as WcFullOrder)
+        }
         const applied = await applyWithdrawalToLinkedOrder(payload as WcFullOrder)
         if (!applied) await recordWithdrawalSuppressionIfWithdrawn(payload as WcFullOrder)
       } catch (e) {

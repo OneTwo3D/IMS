@@ -32,6 +32,9 @@
  *   - the sweep's release pass skips the link.
  */
 
+import { isWcOrderAnonymised } from './anonymisation'
+import { recordWcErasureObligation } from './erasure-obligation'
+import { WcFirstImportLockUnavailable, withWcFirstImportLock } from './first-import-lock'
 import { randomUUID } from 'node:crypto'
 
 import { db } from '@/lib/db'
@@ -546,6 +549,35 @@ function wcEventTimestamp(wcOrder: WcFullOrder): Date | null {
  * rejected-held and invite an operator to release a live withdrawal.
  */
 export async function importWcOrderGuarded<R extends { success: boolean }>(
+  wcOrder: WcFullOrder,
+  runImport: () => Promise<R>,
+): Promise<
+  | { outcome: 'skipped-withdrawal' }
+  | { outcome: 'unresolved' }
+  | { outcome: 'imported'; result: R; suppressionHandled: boolean; compensationFailed: boolean }
+> {
+  // A WOOCOMMERCE-ANONYMISED DELIVERY IS NEVER SKIPPED ON AN UNLOCKED READ (Codex R5). The skip below decides "this order has never been imported"
+  // from a link read; an unmarked first import of the same order can be in flight and not yet committed, so the read says no, the marked delivery is
+  // skipped and acknowledged, and the order then commits identifiable with nothing left to erase it. A marked delivery therefore takes the
+  // first-import lock BEFORE the read (the in-flight import holds it until it has committed) and hands it down, so the decision below is taken
+  // against the committed state. If the lock cannot be had in time the delivery is reported unresolved, which every caller retries.
+  if (isWcOrderAnonymised(wcOrder)) {
+    try {
+      return await withWcFirstImportLock(wcOrder.id, async () => {
+        // Under the lock: a marked delivery for an order IMS does not hold leaves the durable obligation BEFORE the skip below can acknowledge it.
+        const link = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) }, select: { id: true } })
+        if (!link) await recordWcErasureObligation(wcOrder.id)
+        return importWcOrderGuardedLocked(wcOrder, runImport)
+      })
+    } catch (e) {
+      if (e instanceof WcFirstImportLockUnavailable) return { outcome: 'unresolved' }
+      throw e
+    }
+  }
+  return importWcOrderGuardedLocked(wcOrder, runImport)
+}
+
+async function importWcOrderGuardedLocked<R extends { success: boolean }>(
   wcOrder: WcFullOrder,
   runImport: () => Promise<R>,
 ): Promise<
