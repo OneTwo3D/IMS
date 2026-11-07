@@ -1865,6 +1865,8 @@ test('[erasure] the reconcile backstop: status=any, GET only, mirrors ONLY marke
   await db.setting.deleteMany({ where: { key: 'wc_erasure_sweep_cursor' } })
   for (const [key, value] of [['wc_sync_order_statuses', '[]'], ['wc_initial_import_completed', 'true']] as const) await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
   const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  await db.storefrontOrderErasureObligation.create({ data: { connector: 'woocommerce', externalOrderId: String(fx.externalId) } })
+  t.after(async () => { await db.storefrontOrderErasureObligation.deleteMany({ where: { externalOrderId: String(fx.externalId) } }) })
   const modified = '2026-11-05T10:00:00'
   const calls: Array<{ path: string; params: Record<string, string> }> = []
   const pages: unknown[][] = [[
@@ -1878,6 +1880,7 @@ test('[erasure] the reconcile backstop: status=any, GET only, mirrors ONLY marke
   assert.deepEqual([result.scanned, result.markedHeld, result.mirrored, result.errors.length], [3, 1, 1, 0])
   assert.ok((await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })).erasedAt)
   assert.equal(await db.salesOrder.count(), ordersBefore, 'the sweep created nothing')
+  assert.ok((await db.storefrontOrderErasureObligation.findUniqueOrThrow({ where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(fx.externalId) } } })).retiredAt, 'the backstop retired the open obligation for the order it erased')
   assert.ok(calls.length >= 1 && calls.every((c) => c.path === '/orders' && c.params.status === 'any' && c.params.orderby === 'modified'), 'GET /orders, status=any')
   assert.equal((await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_cursor' } })).value, new Date('2026-11-05T10:00:00Z').toISOString(), 'cursor = newest modified of the fully processed page')
   const logged = await db.activityLog.findFirstOrThrow({ where: { action: 'wc_anonymisation_sweep' }, orderBy: { createdAt: 'desc' } })

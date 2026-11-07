@@ -20,6 +20,7 @@ import { wcFetch, MAX_WC_PAGE_WALK_PAGES } from '../api'
 import type { WcFullOrder } from './types'
 import { isWcOrderAnonymised } from './anonymisation'
 import { mirrorWcAnonymisation } from './anonymisation-mirror'
+import { retireWcErasureObligation } from './erasure-obligation'
 
 export const WC_ERASURE_SWEEP_CURSOR_KEY = 'wc_erasure_sweep_cursor'
 /** The cursor is re-read from one second earlier so orders sharing the page boundary's modified second are not missed (mirroring is idempotent). */
@@ -60,6 +61,7 @@ export async function sweepWcAnonymisedOrders(): Promise<WcErasureSweepResult> {
       result.markedHeld += 1
       try {
         const mirrored = await mirrorWcAnonymisation(link.orderId)
+        await retireWcErasureObligation(order.id)
         if (mirrored.erasedNow) result.mirrored += 1
         else result.alreadyErased += 1
       } catch {
