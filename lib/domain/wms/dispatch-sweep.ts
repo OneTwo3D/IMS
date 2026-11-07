@@ -862,7 +862,7 @@ export function orderLevelDespatchDecision(
   now: Date,
   /** The earliest the despatch can have been when there is no usable despatch time; null when unknown. */
   lowerBound: Date | null = null,
-): { action: 'complete'; storefrontAlreadyCompleted: boolean } | { action: 'hold'; reason: string } {
+): { action: 'complete'; storefrontAlreadyCompleted: boolean } | { action: 'verify' } | { action: 'hold'; reason: string } {
   if (reading === undefined || cutoff === null) return { action: 'complete', storefrontAlreadyCompleted: false }
   let before = false
   // No usable despatch time is never "wholly after" by default: it is live only when the order cannot have been despatched before
@@ -879,7 +879,32 @@ export function orderLevelDespatchDecision(
   }
   if (!before) return { action: 'complete', storefrontAlreadyCompleted: false }
   if (now.getTime() < cutoff.getTime()) return { action: 'complete', storefrontAlreadyCompleted: true }
-  return { action: 'hold', reason: 'it was despatched before the storefront went live and an order-level completion is not verifiable' }
+  // Despatched wholly before the cutover and swept after it: the caller verifies by the fresh read-only storefront look (the same
+  // verifier as a split part) and completes IMS-only if it passes, otherwise holds.
+  return { action: 'verify' }
+}
+
+/**
+ * Settles an order-level `verify` decision with the fresh read-only storefront verification (the split-part verifier, reused).
+ * Verified: complete in IMS only (`storefrontAlreadyCompleted`, no storefront write). Anything else, including an unavailable
+ * verifier or a thrown one: hold pending with the reason.
+ */
+async function settleOrderLevelVerify(
+  deps: WmsDispatchSweepDeps,
+  orderId: string,
+  tracking: ReadonlyArray<{ despatchedAt?: string | null }>,
+): Promise<{ action: 'complete'; storefrontAlreadyCompleted: true } | { action: 'hold'; reason: string }> {
+  const latest = strictLatestDespatchTime(tracking, { zoneless: deps.zonelessDespatchReading })
+  let verdict: { verified: boolean; detail: string }
+  try {
+    verdict = deps.verifyPreCutoverCompletion
+      ? await deps.verifyPreCutoverCompletion(orderId, latest)
+      : { verified: false, detail: 'this sweep has no way to read the storefront order' }
+  } catch {
+    verdict = { verified: false, detail: 'the storefront order could not be verified' }
+  }
+  if (verdict.verified) return { action: 'complete', storefrontAlreadyCompleted: true }
+  return { action: 'hold', reason: `it was despatched before the storefront went live and the storefront order could not be verified as completed: ${verdict.detail}` }
 }
 
 /**
@@ -1034,7 +1059,8 @@ async function reconcileSplitOrder(
         return { action: 'pending', reason: `Merged order held: part ${undatedPart.partNumber} has no despatch time`, unresolved: requireResolution }
       }
     }
-    const decision = orderLevelDespatchDecision(allTracking, deps.zonelessDespatchReading, cutoff, (deps.clock ?? (() => new Date()))(), null)
+    let decision = orderLevelDespatchDecision(allTracking, deps.zonelessDespatchReading, cutoff, (deps.clock ?? (() => new Date()))(), null)
+    if (decision.action === 'verify') decision = await settleOrderLevelVerify(deps, candidate.orderId, allTracking)
     if (decision.action === 'hold') return { action: 'pending', reason: `Merged order held: ${decision.reason}`, unresolved: requireResolution }
     mergedAlreadyCompleted = decision.storefrontAlreadyCompleted
   }
@@ -1179,7 +1205,8 @@ export async function reconcileOneOrder(
 
   // An ordinary (non-split) order completes at ORDER level: judge its despatch time against the storefront cutoff first.
   const orderCutoff = deps.storefrontCutoff?.() ?? null
-  const decision = orderLevelDespatchDecision(status.tracking, deps.zonelessDespatchReading, orderCutoff, (deps.clock ?? (() => new Date()))(), await undatedLowerBound(deps, candidate.orderId, status.tracking, orderCutoff))
+  let decision = orderLevelDespatchDecision(status.tracking, deps.zonelessDespatchReading, orderCutoff, (deps.clock ?? (() => new Date()))(), await undatedLowerBound(deps, candidate.orderId, status.tracking, orderCutoff))
+  if (decision.action === 'verify') decision = await settleOrderLevelVerify(deps, candidate.orderId, status.tracking)
   if (decision.action === 'hold') return { action: 'pending', reason: `Order held: ${decision.reason}`, unresolved: requireResolution }
   const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking), decision.storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true } : undefined)
   if (!result.success) {

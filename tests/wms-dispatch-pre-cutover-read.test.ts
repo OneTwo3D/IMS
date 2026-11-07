@@ -958,6 +958,89 @@ test('ORDER LEVEL, RACE: the decision is made once from the despatch range and c
   }
 })
 
+test('ORDER LEVEL, VERIFIED: a non-split or merged order despatched wholly before the cutover and swept after it is verified by the fresh read and completes IMS-only', async () => {
+  const AFTER = new Date('2026-07-01T00:00:00Z')
+  for (const shape of ['single', 'merged'] as const) {
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const run = await sweep([part(1, '2026-05-20T10:00:00')], { zoneless: 'europe-london', shape, clock: AFTER })
+      assert.equal(run.out.counters.dispatched, 1, shape)
+      assert.deepEqual(run.applyOptions, [{ storefrontAlreadyCompleted: true }], shape)
+      assert.deepEqual(run.asked, ['2026-05-20T09:00:00.000Z'], `${shape}: asked once, with the exact UK-converted despatch instant`)
+      assert.deepEqual(reads(), [ORDER_READ], shape)
+      assert.deepEqual(writes(), [], `${shape}: no storefront write`)
+      assert.equal(activity.filter((a) => a.action === 'pre_cutover_part_verified').length, 1, shape)
+    })
+  }
+})
+
+test('ORDER LEVEL, NOT VERIFIED: every verifier refusal holds the order pending with a clear reason, and nothing is written', async () => {
+  const AFTER = new Date('2026-07-01T00:00:00Z')
+  const refusals: Array<[string, () => Response, string]> = [
+    ['not completed', wcOrder({ status: 'processing' }), 'not_completed'],
+    ['completed before the despatch', wcOrder({ date_completed_gmt: '2026-05-19T09:00:00', date_modified_gmt: '2026-05-19T09:00:05' }), 'completed_before_despatch'],
+    ['edited since', wcOrder({ date_modified_gmt: '2026-06-20T09:00:00' }), 'edited_after_completion'],
+    ['refunded', wcOrder({ refunds: [{ id: 1 }] }), 'refunded'],
+    ['lines differ', wcOrder({ line_items: [{ id: 11, quantity: 2 }] }), 'lines_differ'],
+    ['other store', wcOrder({ _links: { self: [{ href: 'https://other.example.org/wp-json/wc/v3/orders/555' }] } }), 'store_mismatch'],
+    ['read fails', () => new Response('{}', { status: 500 }), 'read_failed'],
+  ]
+  for (const shape of ['single', 'merged'] as const) {
+    for (const [label, read, code] of refusals) {
+      reset()
+      orderRead = read
+      await withEnv(LIVE_AT_CUTOFF, async () => {
+        const run = await sweep([part(1, '2026-05-20T10:00:00')], { zoneless: 'europe-london', shape, clock: AFTER })
+        assert.equal(run.out.counters.dispatched, 0, `${shape} ${label}`)
+        assert.equal(run.out.counters.pending, 1, `${shape} ${label}`)
+        assert.deepEqual(run.applyOptions, [], `${shape} ${label}`)
+        assert.deepEqual(writes(), [], `${shape} ${label}`)
+        assert.equal(activity.find((a) => a.action === 'pre_cutover_part_pending')?.metadata?.code, code, `${shape} ${label}`)
+      })
+    }
+  }
+  // binding changed after the link: pinned binding check holds it with no read
+  reset()
+  bindingChangedAt = new Date('2026-05-10T00:00:00Z')
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const run = await sweep([part(1, '2026-05-20T10:00:00')], { zoneless: 'europe-london', shape: 'single', clock: AFTER })
+    assert.equal(run.out.counters.dispatched, 0)
+    assert.deepEqual(reads(), [])
+    assert.equal(activity.find((a) => a.action === 'pre_cutover_part_pending')?.metadata?.code, 'binding_changed')
+  })
+})
+
+test('ORDER LEVEL, NOT VERIFIED: a date-only or clock-change despatch has no exact instant, so it stays pending with no read; the pending reason is carried', async () => {
+  const AFTER = new Date('2026-07-01T00:00:00Z')
+  reset()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const run = await sweep([part(1, '2026-05-20')], { zoneless: 'europe-london', shape: 'single', clock: AFTER })
+    assert.equal(run.out.counters.dispatched, 0)
+    assert.deepEqual(run.asked, [null])
+    assert.deepEqual(reads(), [])
+    assert.equal(activity.find((a) => a.action === 'pre_cutover_part_pending')?.metadata?.code, 'no_despatch_time')
+  })
+  // a verifier that throws is a hold, not a failure and not a completion
+  reset()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const { runWmsDispatchSweepCore, storefrontCutoffWhileEnforced } = await import('@/lib/domain/wms/dispatch-sweep')
+    const outcomes: unknown[] = []
+    const out = await runWmsDispatchSweepCore({
+      zonelessDespatchReading: 'europe-london', clock: () => AFTER, storefrontCutoff: () => storefrontCutoffWhileEnforced(), despatchLowerBound: async () => null,
+      listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+      fetchOrderStatus: async () => ({ externalOrderId: 'M-1', externalOrderNumber: 'WC-1001', status: 'DESPATCHED', statusLabel: 'Despatched', isSplit: false, partCount: 1, isMerged: false, mergedOrderNumbers: [], deepLinkUrl: null, tracking: part(1, '2026-05-20T10:00:00').tracking, dispatched: true, raw: null }),
+      partsSupported: true, fetchOrderParts: async () => [], fetchPartItems: async () => [], repointLink: async () => {}, clearDispatchFailures: async () => {},
+      countLinksByOrderNumber: async (numbers: string[]) => new Map(numbers.map((n) => [n, 1])),
+      applyDispatch: async () => { outcomes.push('applied'); return { success: true } },
+      pushPartialShipment: async () => ({ ok: true }), recordDispatchError: async () => ({ deadLettered: false }),
+      verifyPreCutoverCompletion: async () => { throw new Error('boom') },
+    } as never)
+    assert.equal(out.counters.dispatched, 0)
+    assert.equal(out.counters.errors, 0)
+    assert.deepEqual(outcomes, [])
+  })
+})
+
 test('ORDER LEVEL, CUTOFF STATE: no cutoff holds nothing; a future cutoff holds only what could be after it; a past cutoff is covered above', async () => {
   const sweepAt = async (cutoff: string | undefined, at: string) => {
     reset()
