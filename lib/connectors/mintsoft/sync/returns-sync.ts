@@ -275,7 +275,7 @@ export function mapMintsoftReturnsInboxRow(row: {
 }
 
 /**
- * The sync-log row for a return that FAILED. Like the success row it carries the raw warehouse payload only when the return's effective order
+ * The sync-log row for a return that FAILED. Neither log row carries the raw warehouse record any more (only the return id); before that, a row carried it only when the return's effective order
  * (the order its reference resolves to, or the one its inbox row is already linked to) is NOT erased, decided under that order's lock in the
  * same transaction that writes the row. If the effective order cannot be determined (a lookup fails), the payload is left out: an error
  * row must never be the way a name or address gets back in.
@@ -310,7 +310,9 @@ async function writeReturnsErrorLog(jobId: string, record: WmsReturnRecord, erro
         reason: erased
           ? `Return rejected: ${error instanceof Error ? error.name : 'UnknownError'}`
           : error instanceof Error ? error.message : 'Mintsoft returns sync error',
-        payload: (erased ? {} : (record.raw ?? {})) as Prisma.InputJsonValue,
+        // The raw warehouse record is NOT copied into the sync log (it holds the recipient; nothing reads it here, and the returns inbox keeps its own
+        // rawPayload for review). Only the return id, which is a reference and not personal data.
+        payload: (erased ? {} : { externalReturnId: record.externalReturnId }) as Prisma.InputJsonValue,
       },
     })
   })
@@ -459,7 +461,7 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
               sku: true,
             },
           })
-          // THE SYNC LOG ROW IS WRITTEN IN THIS SAME TRANSACTION, under the same order lock, with the same decision: a log row carries the raw
+          // THE SYNC LOG ROW IS WRITTEN IN THIS SAME TRANSACTION, under the same order lock, with the same decision: a log row used to carry the raw
           // warehouse payload only when the effective order is NOT erased. For an erased order it carries identity-free structured fields only.
           await tx.wmsSyncLog.create({
             data: {
@@ -472,7 +474,8 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
                 product ? null : 'SKU_UNMATCHED',
                 binding ? null : 'WAREHOUSE_UNMATCHED',
               ].filter(Boolean).join(',') || 'MATCHED',
-              payload: rawPayload,
+              // No raw warehouse record in the log: see writeReturnsErrorLog. The inbox row above keeps it for review.
+              payload: (orderErased ? {} : { externalReturnId: record.externalReturnId }) as Prisma.InputJsonValue,
             },
           })
           // THE AUDIT EVENT TOO, in this transaction: it carries the reason, so it is written under the same lock and with the same decision.

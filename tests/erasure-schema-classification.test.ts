@@ -50,7 +50,7 @@ function modelsLinkedToCustomerOrOrder(): string[] {
 }
 
 /** The two tables that point at an order only by a reference id (referenceType / referenceId, an action url), so no relation finds them. */
-const LINKED_BY_REFERENCE_ID = ['EmailOutbox', 'Notification', 'EmailSuppression', 'WmsMutationEvent', 'WmsSyncLog', 'StorefrontOrderErasureObligation']
+const LINKED_BY_REFERENCE_ID = ['EmailOutbox', 'Notification', 'EmailSuppression', 'WmsMutationEvent', 'WmsSyncLog', 'StorefrontOrderErasureObligation', 'ShoppingWebhookEvent', 'ShoppingSyncLog']
 
 test('every table with a relation path to Customer or SalesOrder is classified, column by column, and a new linked table fails here', () => {
   const models = parseModels()

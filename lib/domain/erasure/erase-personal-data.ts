@@ -5,6 +5,7 @@ import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { HELD_SALES_INVOICE_RECORD_KIND } from '@/lib/domain/sales/wc-sync-row-families'
 import { EMAIL_RECIPIENT_ERASED_REASON } from './email-recipient'
 import { scrubContactBlock } from './contact-gate'
+import { loadRawPayloadSubject, scrubRawPayloadsInTx, type RawPayloadCounts } from './raw-payloads'
 import { SYSTEM_PAYMENT_NOTES, orderIsErasedInTx } from './order-state'
 export { orderIsErasedInTx }
 import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
@@ -72,7 +73,7 @@ export async function eraseOrdersPersonalDataInTx(
   tx: Prisma.TransactionClient,
   orderIds: string[],
   erasedAt: Date,
-): Promise<Omit<ErasureCounts, 'customers' | 'shoppingCustomerLinks' | 'activityRowsScrubbed' | 'linkedFreeTextScrubbed'>> {
+): Promise<Omit<ErasureCounts, 'customers' | 'shoppingCustomerLinks' | 'activityRowsScrubbed' | 'linkedFreeTextScrubbed' | keyof RawPayloadCounts>> {
   const counts = { salesOrders: 0, shipments: 0, shoppingOrderLinks: 0, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, notifications: 0 }
   for (const ids of chunks(orderIds)) {
     counts.salesOrders += (await tx.salesOrder.updateMany({
@@ -441,6 +442,10 @@ async function eraseUnderLocksInTx(
   // a later order from the same storefront account finds no link, no email on the erased row to match, and so gets a FRESH
   // customer; the new identity belongs to a new record. Only when the customer itself is erased: a customer who keeps other live
   // orders keeps its link.
+  // The storefront customer ids are read BEFORE the links are deleted: they find the same person's raw deliveries for orders IMS never imported.
+  const storefrontCustomerIds = eraseCustomer && customerId
+    ? [before?.externalCustomerId, ...(await tx.shoppingCustomerLink.findMany({ where: { customerId }, select: { externalCustomerId: true } })).map((l) => l.externalCustomerId)]
+    : []
   const links = eraseCustomer && customerId ? await tx.shoppingCustomerLink.deleteMany({ where: { customerId } }) : { count: 0 }
   const tokens = collectIdentityTokens({
     customer: before as unknown as Record<string, unknown> | null,
@@ -449,7 +454,11 @@ async function eraseUnderLocksInTx(
   })
   const activityRowsScrubbed = await scrubActivityLogIdentity(tx, [...(eraseCustomer && customerId ? [customerId] : []), ...orderIds], tokens)
   const linkedFreeTextScrubbed = await scrubLinkedFreeText(tx, orderIds)
-  const counts: ErasureCounts = { customers: eraseCustomer ? 1 : 0, shoppingCustomerLinks: links.count, activityRowsScrubbed, linkedFreeTextScrubbed, ...orderCounts }
+  // THE RAW PAYLOAD COPIES (webhook inbox, queue snapshots, refund parks, tracking logs, warehouse return records), projected in this same transaction:
+  // a failure here fails the whole erasure, so raw identity cannot be left behind silently. See raw-payloads.ts.
+  const rawSubject = await loadRawPayloadSubject(tx, orderIds, storefrontCustomerIds)
+  const rawCounts = await scrubRawPayloadsInTx(tx, rawSubject.subject, rawSubject.missing)
+  const counts: ErasureCounts = { customers: eraseCustomer ? 1 : 0, shoppingCustomerLinks: links.count, activityRowsScrubbed, linkedFreeTextScrubbed, ...rawCounts, ...orderCounts }
   const record = {
     tag: 'sales',
     description: ERASURE_RECORD_DESCRIPTION,

@@ -69,6 +69,11 @@ export type ErasureCounts = {
   bounceRecordsDeleted: number
   /** Existing activity-log rows whose description or metadata held the subject's identifying values. */
   activityRowsScrubbed: number
+  /** Raw storefront / warehouse payload copies projected or cleared (raw-payloads.ts), and orders whose inbox rows could not be looked for. */
+  rawWebhookEventsProjected: number
+  rawSyncLogsProjected: number
+  rawReturnRecordsCleared: number
+  storefrontIdMissing: number
   notifications: number
 }
 

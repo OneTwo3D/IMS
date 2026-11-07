@@ -1209,6 +1209,10 @@ test('[erasure] the returns sync never reads the warehouse\'s free text back int
   assert.equal(first.orderId, fx.orderId)
   assert.ok(first.reason?.includes(NAME.last), 'not erased: the reason is stored')
   assert.ok(JSON.stringify(first.rawPayload).includes(STREET), 'not erased: the raw payload is stored')
+  // The sync LOG no longer copies the raw warehouse record for ANY order (only the return id); the inbox row above keeps it for review.
+  const returnLogs = await db.wmsSyncLog.findMany({ where: { sku: 'SKU-RET', job: { type: 'RETURNS_SYNC' } } })
+  assert.ok(returnLogs.length > 0, 'PRECONDITION: the sync wrote a log row')
+  assert.ok(returnLogs.every((l) => !JSON.stringify(l.payload).includes(STREET) && !JSON.stringify(l.payload).includes(NAME.last)), 'no raw warehouse record in the sync log')
   pollReturnsRecords = () => [record(live, { orderReference: null, reason: 'updated reason text' })]
   await runMintsoftReturnsSync('test')
   const again = await inbox(live)

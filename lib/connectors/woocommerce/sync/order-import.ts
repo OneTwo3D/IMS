@@ -3044,7 +3044,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             description: ERASURE_RECORD_DESCRIPTION,
             metadata: buildErasureRecordMetadata({
               requestId: originalErasureRequestId ?? randomUUID(), erasedAt, trigger: customerErasedDuringImport === null ? 'MIRRORED_FROM_STOREFRONT' : 'IMPORT_AFTER_ERASURE', customerId: customerErasedDuringImport, orderIds: [created.id],
-              counts: { customers: 0, salesOrders: 1, shipments: 0, shoppingCustomerLinks: 0, shoppingOrderLinks: 1, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, linkedFreeTextScrubbed: 0, activityRowsScrubbed: 0, notifications: 0 },
+              counts: { customers: 0, salesOrders: 1, shipments: 0, shoppingCustomerLinks: 0, shoppingOrderLinks: 1, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, rawWebhookEventsProjected: 0, rawSyncLogsProjected: 0, rawReturnRecordsCleared: 0, storefrontIdMissing: 0, linkedFreeTextScrubbed: 0, activityRowsScrubbed: 0, notifications: 0 },
             }),
             userId: null,
           })
