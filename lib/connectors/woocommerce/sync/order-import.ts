@@ -3758,6 +3758,23 @@ export async function noteWcOrderAdmissionRefusal(modifiedAtIso: string | null |
 export async function syncNewWcOrders(
   opts: { mode?: 'poll' | 'reconcile' | 'manual_reconcile' } = {},
 ): Promise<SyncResult> {
+  const result = await syncNewWcOrdersPass(opts)
+  // The erasure backstop rides the reconcile cadence only (never the frequent poll), and runs whatever the status selection is: it creates nothing.
+  if ((opts.mode ?? 'poll') !== 'poll') {
+    try {
+      const { sweepWcAnonymisedOrders } = await import('./anonymisation-sweep')
+      const sweep = await sweepWcAnonymisedOrders()
+      result.errors.push(...sweep.errors)
+    } catch (e) {
+      result.errors.push(`WooCommerce anonymisation sweep failed: ${e instanceof Error ? e.constructor.name : typeof e}`)
+    }
+  }
+  return result
+}
+
+async function syncNewWcOrdersPass(
+  opts: { mode?: 'poll' | 'reconcile' | 'manual_reconcile' } = {},
+): Promise<SyncResult> {
   const result: SyncResult = { synced: 0, skipped: 0, errors: [] }
   const mode = opts.mode ?? 'poll'
   const cursorKey = mode === 'poll' ? 'last_wc_order_sync_at' : 'last_wc_order_reconcile_at'

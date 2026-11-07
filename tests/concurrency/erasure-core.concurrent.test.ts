@@ -29,6 +29,8 @@ let pollReturnsRecords: (() => Array<Record<string, unknown>>) | null = null
 // Runs after upsertCustomer has returned (inside importWcOrder), before the order is created.
 // The tracking each fulfilment update was asked to record (see the completion test). The real function still runs.
 const fulfilmentTracking: Array<unknown[]> = []
+// When set, the WooCommerce REST read the erasure sweep makes is answered by this double (GET params recorded); otherwise the real one runs.
+let wcFetchImpl: ((path: string, params: Record<string, string>) => Promise<{ data: unknown; totalPages: number; totalItems: number; error?: string }>) | null = null
 let afterUpsertCustomer: (() => Promise<void>) | null = null
 // Runs after an email action has read the order's address and before it enqueues.
 let afterAddressRead: (() => Promise<void>) | null = null
@@ -79,6 +81,8 @@ async function mockActionEnvironment() {
   // A seam to pause an action between its write and its in-transaction activity row (and only there).
   const activity = await import('@/lib/activity-log')
   mock.module('@/lib/activity-log', { namedExports: { ...activity, logActivityInTransaction: async (tx: never, params: never) => { await beforeActivityWrite?.(); return activity.logActivityInTransaction(tx, params) } } })
+  const wcApi = await import('@/lib/connectors/woocommerce/api')
+  mock.module('@/lib/connectors/woocommerce/api', { namedExports: { ...wcApi, wcFetch: (path: string, params: Record<string, string> = {}, ...rest: never[]) => (wcFetchImpl ? wcFetchImpl(path, params) : (wcApi.wcFetch as (...a: unknown[]) => unknown)(path, params, ...rest)) } })
   const fulfilment = await import('@/lib/fulfillment/external-fulfillment')
   mock.module('@/lib/fulfillment/external-fulfillment', { namedExports: { ...fulfilment, applyExternalFulfillmentUpdate: async (args: { tracking?: unknown[] }) => { fulfilmentTracking.push(args.tracking ?? []); return fulfilment.applyExternalFulfillmentUpdate(args as never) } } })
   actionsMocked = true
@@ -1824,3 +1828,68 @@ test('[erasure] a mirror that cannot run THROWS so the delivery retries, with fi
   await assert.rejects(() => mirrorWcAnonymisation('no-such-order'), (e: Error) => e instanceof WcAnonymisationMirrorFailed && !/no-such-order/.test(e.message))
 })
 
+
+test('[erasure] the reconcile backstop: status=any, GET only, mirrors ONLY marked AND held orders, cursor moves after a clean page, per-run count logged, empty selection irrelevant', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const unheld = fx.externalId + 71
+  const prior = await db.setting.findMany({ where: { key: { in: ['wc_sync_order_statuses', 'wc_initial_import_completed', 'wc_erasure_sweep_cursor'] } } })
+  t.after(async () => {
+    wcFetchImpl = null
+    await db.setting.deleteMany({ where: { key: { in: ['wc_sync_order_statuses', 'wc_initial_import_completed', 'wc_erasure_sweep_cursor'] } } })
+    for (const row of prior) await db.setting.create({ data: { key: row.key, value: row.value } })
+    await db.activityLog.deleteMany({ where: { action: 'wc_anonymisation_sweep' } })
+    await fx.cleanup()
+  })
+  await db.setting.deleteMany({ where: { key: 'wc_erasure_sweep_cursor' } })
+  for (const [key, value] of [['wc_sync_order_statuses', '[]'], ['wc_initial_import_completed', 'true']] as const) await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+  const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  const modified = '2026-11-05T10:00:00'
+  const calls: Array<{ path: string; params: Record<string, string> }> = []
+  const pages: unknown[][] = [[
+    { ...anonymisedPayload(fx.externalId, wcRateId), status: 'cancelled', date_modified_gmt: modified },           // marked AND held -> mirrored
+    { ...payload(fx.externalId + 72, wcRateId), date_modified_gmt: '2026-11-05T09:00:00' },                         // not marked -> ignored
+    { ...anonymisedPayload(unheld, wcRateId), date_modified_gmt: '2026-11-05T08:00:00' },                           // marked, NOT held -> ignored, nothing created
+  ], []]
+  wcFetchImpl = async (path, params) => { calls.push({ path, params }); return { data: pages[Math.min(calls.length - 1, pages.length - 1)], totalPages: 1, totalItems: 3 } }
+  const ordersBefore = await db.salesOrder.count()
+  const result = await sweepWcAnonymisedOrders()
+  assert.deepEqual([result.scanned, result.markedHeld, result.mirrored, result.errors.length], [3, 1, 1, 0])
+  assert.ok((await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })).erasedAt)
+  assert.equal(await db.salesOrder.count(), ordersBefore, 'the sweep created nothing')
+  assert.ok(calls.length >= 1 && calls.every((c) => c.path === '/orders' && c.params.status === 'any' && c.params.orderby === 'modified'), 'GET /orders, status=any')
+  assert.equal((await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_cursor' } })).value, new Date('2026-11-05T10:00:00Z').toISOString(), 'cursor = newest modified of the fully processed page')
+  const logged = await db.activityLog.findFirstOrThrow({ where: { action: 'wc_anonymisation_sweep' }, orderBy: { createdAt: 'desc' } })
+  assert.equal((logged.metadata as { mirrored: number }).mirrored, 1, 'the per-run count is logged')
+
+  // A read error on the page: reported, and the cursor does NOT move.
+  const before = (await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_cursor' } })).value
+  calls.length = 0
+  wcFetchImpl = async (path, params) => { calls.push({ path, params }); return { data: null, totalPages: 0, totalItems: 0, error: 'rate limited' } }
+  const failed = await sweepWcAnonymisedOrders()
+  assert.equal(failed.errors.length, 1)
+  assert.equal((await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_cursor' } })).value, before)
+  assert.equal(calls.length, 1, 'one GET, then it stopped')
+})
+
+test('[erasure] the backstop rides the reconcile cadence only: reconcile and manual_reconcile run it (even with an empty selection), the frequent poll does not', { skip }, async (t) => {
+  const db = await loadDb()
+  const prior = await db.setting.findMany({ where: { key: { in: ['wc_sync_order_statuses', 'wc_initial_import_completed', 'wc_erasure_sweep_cursor'] } } })
+  t.after(async () => {
+    wcFetchImpl = null
+    await db.setting.deleteMany({ where: { key: { in: ['wc_sync_order_statuses', 'wc_initial_import_completed', 'wc_erasure_sweep_cursor'] } } })
+    for (const row of prior) await db.setting.create({ data: { key: row.key, value: row.value } })
+    await db.activityLog.deleteMany({ where: { action: 'wc_anonymisation_sweep' } })
+  })
+  for (const [key, value] of [['wc_sync_order_statuses', '[]'], ['wc_initial_import_completed', 'true']] as const) await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+  await db.setting.deleteMany({ where: { key: 'wc_erasure_sweep_cursor' } })
+  const { syncNewWcOrders } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const seen: string[] = []
+  wcFetchImpl = async (_path, params) => { seen.push(params.status ?? ''); return { data: [], totalPages: 1, totalItems: 0 } }
+  await syncNewWcOrders({ mode: 'poll' })
+  assert.deepEqual(seen, [], 'the empty selection fetches nothing on the poll, and the poll never runs the backstop')
+  await syncNewWcOrders({ mode: 'reconcile' })
+  await syncNewWcOrders({ mode: 'manual_reconcile' })
+  assert.deepEqual(seen, ['any', 'any'], 'each reconcile runs the backstop once (status=any), selection empty or not')
+})
