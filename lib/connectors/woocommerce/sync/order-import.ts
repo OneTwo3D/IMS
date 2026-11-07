@@ -5,6 +5,7 @@
 import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain/erasure/erase-personal-data'
 import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
 import { isWcOrderAnonymised, wcPayloadCarriesIdentity } from './anonymisation'
+import { mirrorWcAnonymisation } from './anonymisation-mirror'
 import { ERASURE_PLACEHOLDER_NAME, ERASURE_RECORD_ACTION, ERASURE_RECORD_DESCRIPTION, buildErasureRecordMetadata } from '@/lib/domain/erasure/erasure-record'
 import { randomUUID } from 'node:crypto'
 import { createHash } from 'node:crypto'
@@ -1160,6 +1161,10 @@ export function wclcComponentColumns(wcOrder: WcFullOrder): {
 }
 
 export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder: WcFullOrder, receiptPaymentId?: string, retryLogId?: string, snapshotVersion?: string): Promise<PaidBlockOutcome> {
+  // WOOCOMMERCE HAS ANONYMISED THIS ORDER (positive marker): mirror it FIRST, so the update below reads the erasure marker under the order lock
+  // and withholds the placeholder values WooCommerce now holds. Idempotent (an erased order is a no-op); a failure throws and the delivery retries.
+  // Every route onto a held order reaches this function, including the loser of a concurrent first-import create.
+  if (isWcOrderAnonymised(wcOrder)) await mirrorWcAnonymisation(orderId)
   const transition = await planWcPaidTransition(orderId, wcOrder)
   await wcReceiptRegistrationSeams.afterPlan?.(orderId)
   await updateExistingWcOrderCore(orderId, wcOrder, transition.kind !== 'none')
@@ -1182,19 +1187,24 @@ export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder:
  * order that IMS does not yet hold can still be created from a queued pre-anonymisation payload; the anonymised delivery that follows erases it.
  */
 async function recordRepopulationRefused(orderId: string, wcOrder: WcFullOrder): Promise<void> {
-  const since = new Date(Date.now() - 24 * 60 * 60 * 1000)
-  const recent = await db.activityLog.findFirst({ where: { entityType: 'SALES_ORDER', entityId: orderId, action: 'inbound_repopulation_refused', createdAt: { gte: since } }, select: { id: true } })
-  if (recent) return
-  await logActivity({
-    entityType: 'SALES_ORDER',
-    entityId: orderId,
-    action: 'inbound_repopulation_refused',
-    tag: 'sync',
-    level: 'WARNING',
-    description: 'A WooCommerce delivery for an erased order still carried personal data; the identity columns were not written back.',
-    metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) },
-    resolveUser: false,
-  })
+  // Best effort: a failure to WRITE this line must never fail the import it describes.
+  try {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000)
+    const recent = await db.activityLog.findFirst({ where: { entityType: 'SALES_ORDER', entityId: orderId, action: 'inbound_repopulation_refused', createdAt: { gte: since } }, select: { id: true } })
+    if (recent) return
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'inbound_repopulation_refused',
+      tag: 'sync',
+      level: 'WARNING',
+      description: 'A WooCommerce delivery for an erased order still carried personal data; the identity columns were not written back.',
+      metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) },
+      resolveUser: false,
+    })
+  } catch (e) {
+    console.error('inbound_repopulation_refused: could not record', e instanceof Error ? e.constructor.name : typeof e)
+  }
 }
 
 async function updateExistingWcOrderCore(
@@ -2271,12 +2281,50 @@ async function refuseWcOrderCreate(
   return { success: true, skipped: reason, configured }
 }
 
+/**
+ * A transaction-scoped advisory lock keyed on the storefront order, held by a transaction that does nothing else, on its own pool connection.
+ * Returns the release function. Bounded: if the holder is not released it ends at its timeout, which frees the lock.
+ */
+async function acquireWcFirstImportLock(externalOrderId: number | string): Promise<() => Promise<void>> {
+  const key = `wc-first-import:${externalOrderId}`
+  return new Promise((resolve, reject) => {
+    let release!: () => void
+    const released = new Promise<void>((r) => { release = r })
+    const holder = db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`
+      resolve(async () => { release(); await holder.catch(() => undefined) })
+      await released
+    }, { maxWait: 30_000, timeout: 300_000 })
+    holder.catch((e) => reject(e))
+  })
+}
+
 export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<ImportWcOrderResult> {
+  let releaseFirstImportLock: (() => Promise<void>) | null = null
   try {
     // Keep what another writer left on this order (the bridge's or the invoicing plugin's marks) for the coexistence check. Started, NOT
     // awaited: the write is bounded and its failure is logged on its own, so it can neither delay nor fail the import below, which
     // behaves exactly as it did. (Awaiting it would put a write blocked on the table in front of every import.)
     startWcIncumbentEvidence(wcOrder)
+    // An order IMS holds: the UPDATE path (never gated). A closure because the first-import lock below re-asks the same question.
+    const updateHeldOrder = async (heldOrderId: string): Promise<ImportWcOrderResult> => {
+      const updated = await updateExistingWcOrderFromPayload(heldOrderId, wcOrder, options.receiptPaymentId, options.pendingFxRetryLogId, options.pendingFxSnapshotVersion)
+      // A PAID ORDER WHOSE RECEIPT COULD NOT BE RECORDED keeps its obligation row: never retired as done, the scheduled run replays it.
+      if (updated.blocked) {
+        // a delivery is acknowledged (its obligation row is durable); only the retry row's own replay reports the block back to the retry loop
+        if (!options.pendingFxRetryLogId) return { success: true, orderId: heldOrderId }
+        return { success: false, error: updated.gaveUp ? 'The paid order still disagrees with IMS; the automatic retry has stopped' : 'The paid order disagrees with IMS; kept in the retry queue until it agrees' }
+      }
+      if (options.pendingFxRetryLogId) await markPendingFxRetryLogSynced(options.pendingFxRetryLogId, heldOrderId)
+      // o3d-z82a: deliberately NO marker resolution here. A redelivery can arrive while the
+      // import that created the order is still between its create transaction and its
+      // allocation, and resolving then answers the coverage question against an order that has
+      // no allocations YET — recording a shortfall that was about to be covered and discharging
+      // the marker permanently (Codex review r4). An unresolved marker is recovered by
+      // sweepUnresolvedDirectCreateMarkers instead, which waits out the import's grace window.
+      // It also keeps this, the hot path, free of the feature entirely.
+      return { success: true, orderId: heldOrderId }
+    }
     // THE SINGLE PIVOT (o3d-tj6v r4). This one read answers both "create or update?" and "is this
     // order gated?", and the two answers cannot disagree because there is only one of them.
     //
@@ -2312,24 +2360,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         },
       },
     })
-    if (existing) {
-      const updated = await updateExistingWcOrderFromPayload(existing.id, wcOrder, options.receiptPaymentId, options.pendingFxRetryLogId, options.pendingFxSnapshotVersion)
-      // A PAID ORDER WHOSE RECEIPT COULD NOT BE RECORDED keeps its obligation row: never retired as done, the scheduled run replays it.
-      if (updated.blocked) {
-        // a delivery is acknowledged (its obligation row is durable); only the retry row's own replay reports the block back to the retry loop
-        if (!options.pendingFxRetryLogId) return { success: true, orderId: existing.id }
-        return { success: false, error: updated.gaveUp ? 'The paid order still disagrees with IMS; the automatic retry has stopped' : 'The paid order disagrees with IMS; kept in the retry queue until it agrees' }
-      }
-      if (options.pendingFxRetryLogId) await markPendingFxRetryLogSynced(options.pendingFxRetryLogId, existing.id)
-      // o3d-z82a: deliberately NO marker resolution here. A redelivery can arrive while the
-      // import that created the order is still between its create transaction and its
-      // allocation, and resolving then answers the coverage question against an order that has
-      // no allocations YET — recording a shortfall that was about to be covered and discharging
-      // the marker permanently (Codex review r4). An unresolved marker is recovered by
-      // sweepUnresolvedDirectCreateMarkers instead, which waits out the import's grace window.
-      // It also keeps this, the hot path, free of the feature entirely.
-      return { success: true, orderId: existing.id }
-    }
+    if (existing) return await updateHeldOrder(existing.id)
 
     // IMS does not hold this order, so the selection decides whether it may take it on. Resolved
     // HERE rather than by the caller (r5): every route that receives an order without asking
@@ -2387,6 +2418,14 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // it never touches the customer table (no upsertCustomer, so no customer is matched, linked or minted) and is created ALREADY ERASED
     // below, exactly as an order for an erased customer is. Its money, lines and tax are imported as for any order.
     const payloadAnonymised = isWcOrderAnonymised(wcOrder)
+    // FIRST IMPORTS OF ONE STOREFRONT ORDER ARE SERIALISED. Two deliveries of an order IMS has never seen (one anonymised, one not) used to run
+    // upsertCustomer BEFORE the create transaction, so the contender that then LOST the create left a customer row and storefront link holding
+    // its identity, and a marked loser was acknowledged while the winner stayed identifiable. Under this lock the second contender re-asks the
+    // question after the first has committed and takes the UPDATE path (which mirrors a marked delivery), so it never writes a customer at all.
+    // Held on its own connection until the function returns; the customer-then-orders lock order of the erasure is untouched.
+    releaseFirstImportLock = await acquireWcFirstImportLock(wcOrder.id)
+    const racedHeld = await db.salesOrder.findFirst({ where: { shoppingLinks: { some: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) } } }, select: { id: true } })
+    if (racedHeld) return await updateHeldOrder(racedHeld.id)
     const customerId = payloadAnonymised ? null : await upsertCustomer(wcOrder)
     const customerName = payloadAnonymised
       ? ERASURE_PLACEHOLDER_NAME
@@ -3491,6 +3530,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       })
     }
     return { success: false, error: String(e) }
+  } finally {
+    if (releaseFirstImportLock) await releaseFirstImportLock()
   }
 }
 

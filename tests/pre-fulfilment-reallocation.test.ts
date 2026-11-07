@@ -1671,11 +1671,11 @@ test('a REDELIVERY never resolves a marker (o3d-z82a)', async () => {
   const path = await import('node:path')
   const source = await readFile(path.join(process.cwd(), 'lib/connectors/woocommerce/sync/order-import.ts'), 'utf8')
 
-  const redeliveryAt = source.indexOf('await updateExistingWcOrderFromPayload(existing.id, wcOrder, options.receiptPaymentId, options.pendingFxRetryLogId, options.pendingFxSnapshotVersion)')
+  const redeliveryAt = source.indexOf('await updateExistingWcOrderFromPayload(heldOrderId, wcOrder, options.receiptPaymentId, options.pendingFxRetryLogId, options.pendingFxSnapshotVersion)')
   assert.notEqual(redeliveryAt, -1)
-  const redelivery = source.slice(redeliveryAt, source.indexOf('return { success: true, orderId: existing.id }', redeliveryAt))
+  const redelivery = source.slice(redeliveryAt, source.indexOf('return { success: true, orderId: heldOrderId }', redeliveryAt))
   assert.ok(
-    !redelivery.includes('await resolveDirectCreateShortfall(existing.id)'),
+    !redelivery.includes('await resolveDirectCreateShortfall(heldOrderId)') && !redelivery.includes('await resolveDirectCreateShortfall(existing.id)'),
     'the hot redelivery path must not resolve markers',
   )
   assert.ok(

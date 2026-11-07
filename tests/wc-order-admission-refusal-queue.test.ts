@@ -204,6 +204,8 @@ function txClient() {
     ...base,
     // The order row lock, the customer row lock (FOR UPDATE; the customer is not erased) and the erasure-marker read.
     $queryRaw: async () => [],
+    // The per-storefront-order first-import advisory lock (a no-op here: the unique constraint is what this fake arbitrates).
+    $executeRaw: async () => 0,
     salesOrder: {
       ...base.salesOrder,
       findUnique: async () => ({ erasedAt: null }),
