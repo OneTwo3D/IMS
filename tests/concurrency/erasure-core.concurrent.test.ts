@@ -1857,7 +1857,11 @@ test('[erasure] a mirror that cannot run THROWS so the delivery retries, with fi
 
 type FakeOrder = { id: number; mod: number; marked: boolean }
 
-function fakeWooStore(orders: FakeOrder[], hook?: (requestNumber: number) => void) {
+/** Europe/London for the 2026 autumn rollback: BST (GMT+1) until 01:00 UTC on 2026-10-25, GMT after. */
+const londonLocal = (gmtMs: number) => (gmtMs < Date.UTC(2026, 9, 25, 1, 0, 0) ? gmtMs + 3_600_000 : gmtMs)
+
+/** `sortBy: 'local'` sorts by the SITE-LOCAL modified time while the filter stays on GMT, as a legacy posts store may do. */
+function fakeWooStore(orders: FakeOrder[], hook?: (requestNumber: number) => void, sortBy: 'gmt' | 'local' = 'gmt') {
   const calls: Array<Record<string, string>> = []
   const impl = async (_path: string, params: Record<string, string>) => {
     calls.push(params)
@@ -1866,7 +1870,8 @@ function fakeWooStore(orders: FakeOrder[], hook?: (requestNumber: number) => voi
     const before = params.modified_before ? Date.parse(`${params.modified_before}Z`) : Number.POSITIVE_INFINITY
     const perPage = Number(params.per_page)
     const page = Number(params.page)
-    const rows = orders.filter((o) => o.mod > after && o.mod < before).sort((a, b) => a.mod - b.mod || a.id - b.id)
+    const key = (o: FakeOrder) => (sortBy === 'local' ? londonLocal(o.mod) : o.mod)
+    const rows = orders.filter((o) => o.mod > after && o.mod < before).sort((a, b) => key(a) - key(b) || a.id - b.id)
     const slice = rows.slice((page - 1) * perPage, page * perPage)
     return {
       data: slice.map((o) => ({ id: o.id, number: String(o.id), date_modified_gmt: new Date(o.mod).toISOString().replace(/\.\d{3}Z$/, ''), meta_data: o.marked ? [{ id: 1, key: '_anonymized', value: 'yes' }] : [] })),
@@ -1908,9 +1913,9 @@ test('[erasure] the backstop: status=any, GET only, a marked HELD order is erase
   await db.storefrontOrderErasureObligation.create({ data: { connector: 'woocommerce', externalOrderId: String(fx.externalId) } })
   const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
   const store = fakeWooStore([
-    { id: fx.externalId, mod: T0 + 3000, marked: true },
-    { id: plain, mod: T0 + 2000, marked: false },
-    { id: unheld, mod: T0 + 1000, marked: true },
+    { id: fx.externalId, mod: T0 + 5 * 3_600_000, marked: true },
+    { id: plain, mod: T0 + 4 * 3_600_000, marked: false },
+    { id: unheld, mod: T0 + 3 * 3_600_000, marked: true },
   ])
   wcFetchImpl = store.impl
   const ordersBefore = await db.salesOrder.count()
@@ -1923,19 +1928,20 @@ test('[erasure] the backstop: status=any, GET only, a marked HELD order is erase
   assert.equal(await db.salesOrder.count(), ordersBefore, 'the sweep created nothing')
   assert.ok(store.calls.every((c) => c.status === 'any' && c.orderby === 'modified' && c.order === 'asc' && c.dates_are_gmt === 'true'), 'GET /orders, status=any, GMT comparison')
   const state = JSON.parse((await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_cursor' } })).value) as { after: string }
-  assert.equal(state.after, new Date(T0 + 3000 - 2000).toISOString(), 'the cursor is the newest modified time minus the overlap')
+  const { WC_ERASURE_SWEEP_CURSOR_OVERLAP_MS } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  assert.equal(state.after, new Date(T0 + 5 * 3_600_000 - WC_ERASURE_SWEEP_CURSOR_OVERLAP_MS).toISOString(), 'the cursor is the newest modified time minus the 65-minute overlap')
   assert.equal(((await db.activityLog.findFirstOrThrow({ where: { action: 'wc_anonymisation_sweep' }, orderBy: { createdAt: 'desc' } })).metadata as { obligationsRecorded: number }).obligationsRecorded, 1, 'the per-run count is logged')
 })
 
 test('[erasure] PAGE SHIFT: an order modified between two page reads is not skipped, and the order the old offset scheme skipped is covered', { skip }, async (t) => {
   const db = await loadDb()
   const base = 1_600_000_000 + Math.floor(Math.random() * 50_000_000)
-  const orders: FakeOrder[] = Array.from({ length: 250 }, (_, i) => ({ id: base + i, mod: T0 + i * 10_000, marked: true }))
+  const orders: FakeOrder[] = Array.from({ length: 250 }, (_, i) => ({ id: base + i, mod: T0 + i * 600_000, marked: true }))
   await prepareSweep(db, t, () => orders.map((o) => o.id))
   const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
   // Between the first and the second read, an order already read on page 1 is edited in WooCommerce: its modified time jumps to NOW. With offset
   // paging every later order shifts down one place and the 101st order (index 100) lands on the page that was already read: it is skipped.
-  const store = fakeWooStore(orders, (n) => { if (n === 2) orders[5]!.mod = T0 + 999_000_000 })
+  const store = fakeWooStore(orders, (n) => { if (n === 2) orders[5]!.mod = T0 + 999_000_000_000 })
   wcFetchImpl = store.impl
   const result = await sweepWcAnonymisedOrders({ maxPages: 20 })
   assert.equal(result.errors.length, 0)
@@ -1969,8 +1975,8 @@ test('[erasure] a block of orders sharing ONE modified second that is larger tha
 test('[erasure] the per-run budget stops the sweep cleanly and the next run RESUMES from the persisted state, including inside a tie window', { skip }, async (t) => {
   const db = await loadDb()
   const base = 1_800_000_000 + Math.floor(Math.random() * 50_000_000)
-  const spread: FakeOrder[] = Array.from({ length: 250 }, (_, i) => ({ id: base + i, mod: T0 + i * 10_000, marked: true }))
-  const tie: FakeOrder[] = Array.from({ length: 230 }, (_, i) => ({ id: base + 5000 + i, mod: T0 + 9_000_000, marked: true }))
+  const spread: FakeOrder[] = Array.from({ length: 250 }, (_, i) => ({ id: base + i, mod: T0 + i * 600_000, marked: true }))
+  const tie: FakeOrder[] = Array.from({ length: 230 }, (_, i) => ({ id: base + 5000 + i, mod: T0 + 300_000_000, marked: true }))
   const orders = [...spread, ...tie]
   await prepareSweep(db, t, () => orders.map((o) => o.id))
   const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
@@ -1996,7 +2002,7 @@ test('[erasure] the per-run budget stops the sweep cleanly and the next run RESU
 test('[erasure] an error mid-page leaves the cursor at a safe value, and the next run loses nothing', { skip }, async (t) => {
   const db = await loadDb()
   const base = 1_900_000_000 + Math.floor(Math.random() * 50_000_000)
-  const orders: FakeOrder[] = Array.from({ length: 250 }, (_, i) => ({ id: base + i, mod: T0 + i * 10_000, marked: true }))
+  const orders: FakeOrder[] = Array.from({ length: 250 }, (_, i) => ({ id: base + i, mod: T0 + i * 600_000, marked: true }))
   await prepareSweep(db, t, () => orders.map((o) => o.id))
   const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
   const good = fakeWooStore(orders)
@@ -2325,11 +2331,11 @@ test('[erasure] the FIRST run starts seven days back, not at the beginning of hi
 test('[erasure] an order that FLIPS from unmarked to marked between two page reads of one run is evaluated, not skipped as already seen', { skip }, async (t) => {
   const db = await loadDb()
   const base = 1_950_000_000 + Math.floor(Math.random() * 40_000_000)
-  const orders: FakeOrder[] = Array.from({ length: 150 }, (_, i) => ({ id: base + i, mod: T0 + i * 10_000, marked: false }))
+  const orders: FakeOrder[] = Array.from({ length: 150 }, (_, i) => ({ id: base + i, mod: T0 + i * 600_000, marked: false }))
   await prepareSweep(db, t, () => orders.map((o) => o.id))
   const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
   // Request 1 reads order index 10 unmarked. Before request 2, WooCommerce anonymises it: it is now marked and its modified time moves later.
-  const store = fakeWooStore(orders, (n) => { if (n === 2) { orders[10]!.marked = true; orders[10]!.mod = T0 + 5_000_000 } })
+  const store = fakeWooStore(orders, (n) => { if (n === 2) { orders[10]!.marked = true; orders[10]!.mod = T0 + 999_000_000_000 } })
   wcFetchImpl = store.impl
   const result = await sweepWcAnonymisedOrders({ maxPages: 20 })
   assert.equal(result.errors.length, 0)
@@ -2384,3 +2390,23 @@ test('[erasure] the initial cursor is persisted at once, and ANY incomplete run 
   assert.equal(await backlog(), 'false')
   assert.deepEqual(await runWcErasureSweepIfDue(), { skipped: true, reason: 'not_due' })
 })
+
+for (const sortBy of ['local', 'gmt'] as const) {
+  test(`[erasure] DST ROLLBACK: orders on both sides of the repeated hour are all evaluated when the store sorts by ${sortBy.toUpperCase()} time and filters by GMT, with a page boundary inside the hour`, { skip }, async (t) => {
+    const db = await loadDb()
+    const base = 1_960_000_000 + Math.floor(Math.random() * 20_000_000) + (sortBy === 'local' ? 0 : 5_000_000)
+    // One order a minute from 22:00 GMT on the 24th to 04:00 GMT on the 25th: 360 orders across the clock change at 01:00 GMT (02:00 BST back to 01:00 GMT).
+    const start = Date.UTC(2026, 9, 24, 22, 1, 0) // the minute offset puts a page boundary on the far side of the repeated hour (a 2-second overlap loses 20 orders here)
+    const orders: FakeOrder[] = Array.from({ length: 360 }, (_, i) => ({ id: base + i, mod: start + i * 60_000, marked: true }))
+    await prepareSweep(db, t, () => orders.map((o) => o.id))
+    await db.setting.upsert({ where: { key: 'wc_erasure_sweep_cursor' }, create: { key: 'wc_erasure_sweep_cursor', value: JSON.stringify({ after: new Date(start - 60_000).toISOString() }) }, update: { value: JSON.stringify({ after: new Date(start - 60_000).toISOString() }) } })
+    const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+    const store = fakeWooStore(orders, undefined, sortBy)
+    wcFetchImpl = store.impl
+    const result = await sweepWcAnonymisedOrders({ maxPages: 60 })
+    assert.equal(result.errors.length, 0)
+    const got = await obligationIds(db, orders.map((o) => o.id))
+    const missing = orders.filter((o) => !got.has(o.id)).map((o) => new Date(o.mod).toISOString())
+    assert.deepEqual(missing, [], 'every marked order was evaluated')
+  })
+}

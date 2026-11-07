@@ -18,13 +18,19 @@
  * and wall time). Progress is persisted, so a budget stop or an error resumes where it left off.
  *
  * PAGING IS BY TIMESTAMP (keyset), NOT BY OFFSET. Offset pages over orders sorted by a time that is itself rewritten by every edit can skip an
- * order that shifts between page reads (Codex R1). So every request is `page=1` of `modified_after = <cursor minus an overlap>` ordered by
- * modified ascending, and the cursor moves to the last order's modified time minus the overlap after each fully processed page. An order
- * modified mid-run moves to a LATER modified time, beyond the cursor, and is seen later; the overlap re-reads the boundary, and processing is
- * idempotent (an erased order is a no-op, the obligation is an upsert), so a re-read costs nothing but a request.
- *   A page that makes no progress by timestamp (a block of orders larger than a page sharing one modified second) is read by offset INSIDE
- *   that one window (modified_after = ts - overlap, modified_before = ts + overlap), page 2, 3, ..., TWICE through (a second pass catches an
- *   order that shifted during the first), and only then does the cursor move past the window.
+ * order that shifts between page reads (Codex R1). So every request is `page=1` of `modified_after = <cursor>` ordered by modified ascending, and
+ * the cursor moves to the LAST ROW's GMT modified time minus an overlap after each fully processed page. An order modified mid-run moves to a LATER
+ * modified time, beyond the cursor, and is seen later; the overlap re-reads the boundary, and processing is idempotent (an erased order is a no-op,
+ * the obligation is an upsert), so a re-read costs nothing but a request.
+ *   THE OVERLAP IS 65 MINUTES (WC_ERASURE_SWEEP_CURSOR_OVERLAP_MS), NOT A FEW SECONDS (Codex R4). The FILTER is on the GMT time, but `orderby=modified`
+ *   may sort by the SITE-LOCAL modified field (legacy post storage sorts post_modified; HPOS sorts date_updated_gmt), and this must not depend on which.
+ *   Local and GMT order differ by up to an hour, and across an autumn DST rollback the same local hour occurs twice, so a page can end at 01:30 GMT
+ *   with a 00:45 GMT order still unseen and sorted later. Any unseen order has a GMT time no more than that skew before the last row's, so a cursor
+ *   65 minutes before the last row's GMT time re-reads it. Re-reads are idempotent and cheap at the observed volumes.
+ *   A page whose GMT span is within the overlap (so the cursor cannot advance past the page's start: a dense hour, or a block of orders sharing one
+ *   modified second that fills a page) is read by offset INSIDE the window `(after, after + overlap)`, page 2, 3, ..., TWICE through (a second pass
+ *   catches an order that shifted during the first). That read is exhaustive by FILTER, so it does not depend on the sort at all; only then does the
+ *   cursor move to just inside the window's upper edge.
  *
  * TIME. Every request sets `dates_are_gmt=true`, so WooCommerce compares `modified_after` / `modified_before` against the GMT modified time
  * (post_modified_gmt); without it the comparison is against the SITE-LOCAL time and a site east of UTC would be read an hour wrong. The values
@@ -54,8 +60,11 @@ export const WC_ERASURE_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000
  * `wc_erasure_sweep_cursor` to `{"after":"<ISO timestamp>"}` (the sweep resumes from there), or call `sweepWcAnonymisedOrders({ since })`.
  */
 export const WC_ERASURE_SWEEP_INITIAL_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000
-/** The overlap between one request's lower bound and the last order read, so orders sharing a boundary second are re-read, not missed. */
-export const WC_ERASURE_SWEEP_OVERLAP_MS = 2000
+/**
+ * The overlap between the cursor and the last row read: covers any local/GMT ordering skew of `orderby=modified`, including a DST rollback (see the
+ * header), and orders sharing a boundary second. Re-reads are idempotent and cheap at the observed volumes.
+ */
+export const WC_ERASURE_SWEEP_CURSOR_OVERLAP_MS = 65 * 60 * 1000
 export const WC_ERASURE_SWEEP_PER_PAGE = 100
 /** The per-run budget. A run that reaches either stops cleanly and resumes from the persisted cursor on the next reconcile. */
 export const WC_ERASURE_SWEEP_MAX_PAGES = 5
@@ -75,7 +84,7 @@ export type WcErasureSweepResult = {
   errors: string[]
 }
 
-type State = { after: string | null; window?: { ts: string; pass: 1 | 2; page: number } }
+type State = { after: string | null; window?: { start: string; end: string; pass: 1 | 2; page: number } }
 
 function parseGmt(raw: unknown): number | null {
   if (typeof raw !== 'string' || !raw) return null
@@ -93,10 +102,10 @@ async function loadState(nowMs: number): Promise<State> {
   if (!row?.value) return { after: new Date(nowMs - WC_ERASURE_SWEEP_INITIAL_LOOKBACK_MS).toISOString() }
   try {
     const parsed = JSON.parse(row.value) as State
-    if (parsed && typeof parsed === 'object' && (parsed.after === null || typeof parsed.after === 'string')) return parsed
+    if (parsed && typeof parsed === 'object' && (parsed.after === null || typeof parsed.after === 'string')) return parsed.window && !('start' in parsed.window) ? { after: parsed.after } : parsed
   } catch { /* a bare ISO timestamp (an earlier shape of this setting) */ }
   const ms = parseGmt(row.value)
-  return { after: ms === null ? null : new Date(ms - WC_ERASURE_SWEEP_OVERLAP_MS).toISOString() }
+  return { after: ms === null ? null : new Date(ms - WC_ERASURE_SWEEP_CURSOR_OVERLAP_MS).toISOString() }
 }
 
 async function saveState(state: State): Promise<void> {
@@ -131,9 +140,8 @@ export async function sweepWcAnonymisedOrders(
       status: 'any', per_page: String(WC_ERASURE_SWEEP_PER_PAGE), orderby: 'modified', order: 'asc', dates_are_gmt: 'true',
     }
     if (state.window) {
-      const ts = Date.parse(state.window.ts)
-      params.modified_after = gmtParam(ts - WC_ERASURE_SWEEP_OVERLAP_MS)
-      params.modified_before = gmtParam(ts + WC_ERASURE_SWEEP_OVERLAP_MS)
+      params.modified_after = gmtParam(Date.parse(state.window.start))
+      params.modified_before = gmtParam(Date.parse(state.window.end))
       params.page = String(state.window.page)
     } else {
       if (state.after) params.modified_after = gmtParam(Date.parse(state.after))
@@ -172,10 +180,11 @@ export async function sweepWcAnonymisedOrders(
     // The state moves only after EVERY order on the page was processed.
     if (state.window) {
       if (orders.length >= WC_ERASURE_SWEEP_PER_PAGE) state = { after: state.after, window: { ...state.window, page: state.window.page + 1 } }
-      else if (state.window.pass === 1) state = { after: state.after, window: { ts: state.window.ts, pass: 2, page: 1 } }
+      else if (state.window.pass === 1) state = { after: state.after, window: { ...state.window, pass: 2, page: 1 } }
       else {
-        // Both passes over the window are done: everything inside (ts - overlap, ts + overlap) was read, so resume just inside its upper edge.
-        state = { after: new Date(Date.parse(state.window.ts) + WC_ERASURE_SWEEP_OVERLAP_MS - 1000).toISOString() }
+        // Both passes over the window are done: everything inside (start, end) was read, so resume just inside its upper edge (one second back, so an
+        // order stamped exactly at `end`, which the exclusive bound left out, is read next). That is always past the old cursor.
+        state = { after: new Date(Date.parse(state.window.end) - 1000).toISOString() }
       }
     } else if (orders.length === 0) {
       caughtUp = true
@@ -183,17 +192,20 @@ export async function sweepWcAnonymisedOrders(
       result.errors.push('erasure sweep: an order carried no modified time, so the sweep cannot advance; it stopped')
       break
     } else {
-      const candidate = lastMod - WC_ERASURE_SWEEP_OVERLAP_MS
+      const candidate = lastMod - WC_ERASURE_SWEEP_CURSOR_OVERLAP_MS
       const currentAfter = state.after ? Date.parse(state.after) : Number.NEGATIVE_INFINITY
       if (orders.length < WC_ERASURE_SWEEP_PER_PAGE) {
-        // A short page is the end of the data: nothing newer exists yet. Keep a lower bound that still re-reads the newest second.
+        // A short page is the end of the data (the whole remaining list came back, so its sort order is irrelevant): nothing newer exists yet. Keep a
+        // lower bound that still re-reads the newest overlap.
         if (candidate > currentAfter) state = { after: new Date(candidate).toISOString() }
         caughtUp = true
       } else if (candidate > currentAfter) {
         state = { after: new Date(candidate).toISOString() }
       } else {
-        // No progress by timestamp: a block of orders sharing one modified second that fills a page. Read inside that window by offset.
-        state = { after: state.after, window: { ts: new Date(lastMod).toISOString(), pass: 1, page: 1 } }
+        // No progress by timestamp: the page's GMT span is within the overlap (a dense hour, or a block sharing one modified second). Read the window
+        // (after, after + overlap) by offset, exhaustively by filter.
+        const start = Number.isFinite(currentAfter) ? currentAfter : lastMod - WC_ERASURE_SWEEP_CURSOR_OVERLAP_MS
+        state = { after: state.after, window: { start: new Date(start).toISOString(), end: new Date(start + WC_ERASURE_SWEEP_CURSOR_OVERLAP_MS).toISOString(), pass: 1, page: 1 } }
       }
     }
     await saveState(state)
