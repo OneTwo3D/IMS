@@ -6,6 +6,7 @@ import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain
 import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
 import { isWcOrderAnonymised, wcPayloadCarriesIdentity } from './anonymisation'
 import { mirrorWcAnonymisation } from './anonymisation-mirror'
+import { acquireWcFirstImportLock } from './first-import-lock'
 import { ERASURE_PLACEHOLDER_NAME, ERASURE_RECORD_ACTION, ERASURE_RECORD_DESCRIPTION, buildErasureRecordMetadata } from '@/lib/domain/erasure/erasure-record'
 import { randomUUID } from 'node:crypto'
 import { createHash } from 'node:crypto'
@@ -2281,24 +2282,6 @@ async function refuseWcOrderCreate(
   return { success: true, skipped: reason, configured }
 }
 
-/**
- * A transaction-scoped advisory lock keyed on the storefront order, held by a transaction that does nothing else, on its own pool connection.
- * Returns the release function. Bounded: if the holder is not released it ends at its timeout, which frees the lock.
- */
-async function acquireWcFirstImportLock(externalOrderId: number | string): Promise<() => Promise<void>> {
-  const key = `wc-first-import:${externalOrderId}`
-  return new Promise((resolve, reject) => {
-    let release!: () => void
-    const released = new Promise<void>((r) => { release = r })
-    const holder = db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`
-      resolve(async () => { release(); await holder.catch(() => undefined) })
-      await released
-    }, { maxWait: 30_000, timeout: 300_000 })
-    holder.catch((e) => reject(e))
-  })
-}
-
 export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<ImportWcOrderResult> {
   let releaseFirstImportLock: (() => Promise<void>) | null = null
   try {
@@ -2422,7 +2405,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // upsertCustomer BEFORE the create transaction, so the contender that then LOST the create left a customer row and storefront link holding
     // its identity, and a marked loser was acknowledged while the winner stayed identifiable. Under this lock the second contender re-asks the
     // question after the first has committed and takes the UPDATE path (which mirrors a marked delivery), so it never writes a customer at all.
-    // Held on its own connection until the function returns; the customer-then-orders lock order of the erasure is untouched.
+    // A SESSION lock on its own bounded pool (first-import-lock.ts), released in the finally below; never a connection of the main pool.
+    // The customer-then-orders lock order of the erasure is untouched.
     releaseFirstImportLock = await acquireWcFirstImportLock(wcOrder.id)
     const racedHeld = await db.salesOrder.findFirst({ where: { shoppingLinks: { some: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) } } }, select: { id: true } })
     if (racedHeld) return await updateHeldOrder(racedHeld.id)
