@@ -39,6 +39,13 @@ const nextConfig: NextConfig = {
     // Full-chain e2e rig (o3d-lgo): ims-e2e-dev.service on :3002, proxied by OLS.
     'ims-e2e.onetwo3d.co.uk',
   ],
+  experimental: {
+    // No Turbopack filesystem cache for `next dev`. The stage host runs `next dev`, and the
+    // persisted cache under .next/dev grew to ~20 GB and was rebuilt after a restart, writing
+    // tens of GB a day to the host SSD. Compiles start cold after each restart instead; that
+    // costs seconds per route, not disk wear. Builds are unaffected (their cache is off by default).
+    turbopackFileSystemCacheForDev: false,
+  },
   outputFileTracingExcludes: {
     '/api/backup/restore': ['./next.config.ts'],
   },
