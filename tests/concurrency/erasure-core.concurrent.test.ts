@@ -1284,8 +1284,9 @@ test('[erasure] the returns sync never reads the warehouse\'s free text back int
   const raceLogs = await db.wmsSyncLog.findMany({ where: { createdAt: { gt: raceMark, lt: erasedAtMark } } })
   assert.ok(raceLogs.length >= 1, 'PRECONDITION: the racing delivery wrote a log row')
   for (const row of raceLogs) assert.ok(!JSON.stringify(row).includes(STREET) && !JSON.stringify(row).includes(NAME.last), 'the racing row carries no payload')
-  // CONTROL: the rows written BEFORE the erasure, for the live order, did carry the payload (so the check above is not vacuous).
-  assert.ok((await db.wmsSyncLog.findMany({ where: { createdAt: { lt: erasedAtMark } } })).some((l) => JSON.stringify(l.payload).includes(STREET)), 'control: a pre-erasure log row carries the payload')
+  // CONTROL: rows written BEFORE the erasure exist, and (the raw record is no longer copied into the log; the erasure also clears the return id they carry) none holds the value.
+  const preLogs = await db.wmsSyncLog.findMany({ where: { createdAt: { lt: erasedAtMark } } })
+  assert.ok(preLogs.length > 0 && preLogs.every((l) => !JSON.stringify(l.payload).includes(STREET)), 'control: pre-erasure log rows exist and hold no raw record')
 
   // THE MUTATION EVENTS of the return hold the marker, not the reason.
   const events = await db.wmsMutationEvent.findMany({ where: { entityType: 'RETURN', action: 'return_inbox', entityId: redelivered.id } })
