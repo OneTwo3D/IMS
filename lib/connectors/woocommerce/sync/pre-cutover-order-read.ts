@@ -47,6 +47,7 @@ import { WC_CREDENTIAL_SETTING_KEYS, resolveWcCredentialsFromRows } from '../cre
 import { normaliseWcOrderStatus } from '../order-status-filter'
 import { WC_SETTINGS_VERSION_KEY } from '../sync-lock'
 import { isMirroredFeeLine } from '@/lib/domain/wms/mirrored-fee-line'
+import type { ShipmentServiceClient } from '@/lib/domain/sales/shipment-service'
 
 export type PreCutoverReadCode =
   | 'verified'
@@ -65,7 +66,14 @@ export type PreCutoverReadCode =
   | 'refunded'
   | 'lines_differ'
 
-export type PreCutoverReadVerdict = { verified: boolean; code: PreCutoverReadCode; detail: string }
+/**
+ * A check, run INSIDE the transaction that completes the order and under its order lock, that what the verification proved still
+ * holds. Returns null when it does, otherwise why not ("changed since verification"). The refusal leaves the order pending; the next
+ * sweep verifies afresh.
+ */
+export type PreCutoverFence = (tx: ShipmentServiceClient) => Promise<string | null>
+
+export type PreCutoverReadVerdict = { verified: boolean; code: PreCutoverReadCode; detail: string; fence?: PreCutoverFence }
 
 /**
  * How much later than `date_completed_gmt` the order's `date_modified_gmt` may be before the order counts as edited since it was
@@ -110,7 +118,7 @@ function orderStoreAttestation(order: Record<string, unknown>): string | null {
 }
 
 /** The binding generation a settings-version row stands for: its value and when it was last written (null when unreadable). */
-function bindingStamp(row: { value?: string; updatedAt?: unknown } | null | undefined): { present: boolean; value: string | null; changedAt: number | null } {
+export function bindingStamp(row: { value?: string; updatedAt?: unknown } | null | undefined): { present: boolean; value: string | null; changedAt: number | null } {
   if (!row) return { present: false, value: null, changedAt: null }
   const at = row.updatedAt instanceof Date ? row.updatedAt.getTime() : Number.NaN
   return { present: true, value: typeof row.value === 'string' ? row.value : null, changedAt: Number.isNaN(at) ? null : at }
@@ -141,6 +149,28 @@ function compareLines(wooItems: unknown, imsLines: ReadonlyArray<{ sku: string |
   return null
 }
 
+/** What the IMS order's lines are, as one comparable string (id, product, storefront line id, quantity, fee kind), order-independent. */
+export function linesFingerprint(lines: ReadonlyArray<{ id?: string | null; productId: string | null; externalLineItemId: number | null; qty: unknown; wclcFeeKind: string | null }>): string {
+  return lines.map((l) => [l.id ?? '', l.productId ?? '', l.externalLineItemId ?? '', String(l.qty), l.wclcFeeKind ?? ''].join(':')).sort().join('|')
+}
+
+/** The fence for a verification: the link, the binding generation and the IMS lines must be exactly what the verification saw. */
+export function buildPreCutoverFence(
+  orderId: string,
+  seen: { externalOrderId: string; binding: { present: boolean; value: string | null; changedAt: number | null }; lines: string },
+): PreCutoverFence {
+  return async (tx) => {
+    const changed = 'the order changed since the storefront verification (link, store binding or lines); it will be verified again on the next sweep'
+    const link = await tx.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', orderId }, select: { externalOrderId: true } })
+    if (link?.externalOrderId !== seen.externalOrderId) return changed
+    const binding = bindingStamp(await tx.setting.findUnique({ where: { key: WC_SETTINGS_VERSION_KEY }, select: { key: true, value: true, updatedAt: true } }))
+    if (binding.present !== seen.binding.present || binding.value !== seen.binding.value || binding.changedAt !== seen.binding.changedAt) return changed
+    const order = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { lines: { select: { id: true, qty: true, wclcFeeKind: true, productId: true, externalLineItemId: true } } } })
+    if (!order || linesFingerprint(order.lines) !== seen.lines) return changed
+    return null
+  }
+}
+
 async function decide(orderId: string, latestDespatchAt: Date | null): Promise<PreCutoverReadVerdict> {
   const no = (code: PreCutoverReadCode, detail: string): PreCutoverReadVerdict => ({ verified: false, code, detail })
   if (latestDespatchAt === null || Number.isNaN(latestDespatchAt.getTime())) {
@@ -155,7 +185,7 @@ async function decide(orderId: string, latestDespatchAt: Date | null): Promise<P
   // The store binding must not have changed since the order or its link came into being (the earlier of the two).
   const imsOrder = await db.salesOrder.findUnique({
     where: { id: orderId },
-    select: { createdAt: true, lines: { select: { sku: true, qty: true, wclcFeeKind: true, productId: true, externalLineItemId: true } } },
+    select: { createdAt: true, lines: { select: { id: true, sku: true, qty: true, wclcFeeKind: true, productId: true, externalLineItemId: true } } },
   })
   if (!imsOrder) return no('no_link', 'the IMS order could not be found')
   // PIN THE BINDING GENERATION: the credentials and the settings version are read in ONE statement, so the request below goes to
@@ -228,7 +258,12 @@ async function decide(orderId: string, latestDespatchAt: Date | null): Promise<P
   const lineVerdict = compareLines(order.line_items, imsOrder.lines)
   if (lineVerdict !== null) return no('lines_differ', lineVerdict)
 
-  return { verified: true, code: 'verified', detail: 'the storefront order is completed now, after the latest part was despatched, and unchanged since' }
+  return {
+    verified: true,
+    code: 'verified',
+    detail: 'the storefront order is completed now, after the latest part was despatched, and unchanged since',
+    fence: buildPreCutoverFence(orderId, { externalOrderId: link.externalOrderId, binding: pinned, lines: linesFingerprint(imsOrder.lines) }),
+  }
 }
 
 /** Verify, fail closed, and log the outcome. Never throws. */

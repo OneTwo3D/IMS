@@ -34,6 +34,7 @@ import { unresolvedDriftStateKey } from '@/lib/domain/wms/unresolved-drift'
 import { applyExternalFulfillmentUpdate } from '@/lib/fulfillment/external-fulfillment'
 import { notify } from '@/lib/notifications'
 import { getSettingValue } from '@/lib/settings-store'
+import type { ShipmentServiceClient } from '@/lib/domain/sales/shipment-service'
 import { scrubWmsError } from './error-scrub'
 import { recordWmsMutationEvent } from './mutation-audit'
 
@@ -413,6 +414,12 @@ export type WmsDispatchPartialShipmentInput = {
   despatchedAt?: Date | null
 }
 
+/**
+ * Re-checked INSIDE the transaction that ships the order, under the order lock: null while what the storefront verification proved
+ * still holds, otherwise why not (the dispatch is then refused and the order stays pending to be verified again).
+ */
+export type PreCutoverFence = (tx: ShipmentServiceClient) => Promise<string | null>
+
 export type WmsDispatchSweepDeps = {
   listCandidates(limit: number): Promise<WmsDispatchCandidate[]>
   fetchOrderStatus(orderNumber: string): Promise<import('@/lib/connectors/wms/types').WmsOrderStatus | null>
@@ -425,7 +432,7 @@ export type WmsDispatchSweepDeps = {
      * storefront data - no completion job, no tracking, no order note, no status. The one storefront effect that remains is IMS's
      * ordinary stock-level sync for the stock the shipment consumed (owner ruling: IMS is the stock master after cutover).
      */
-    options?: { storefrontAlreadyCompleted?: boolean },
+    options?: { storefrontAlreadyCompleted?: boolean; fence?: PreCutoverFence },
   ): Promise<{ success: boolean; error?: string }>
   /**
    * Fresh, READ-ONLY verification of a part despatched before the storefront went live. Asked only when the push for a part
@@ -433,7 +440,7 @@ export type WmsDispatchSweepDeps = {
    * (never a stored delivery) and answers `verified` only when the order is `completed` there with a completion instant at or
    * after `latestDespatchAt` (the LATEST despatch among the order's despatched parts). Absent: nothing is verifiable.
    */
-  verifyPreCutoverCompletion?(orderId: string, latestDespatchAt: Date | null): Promise<{ verified: boolean; detail: string }>
+  verifyPreCutoverCompletion?(orderId: string, latestDespatchAt: Date | null): Promise<{ verified: boolean; detail: string; fence?: PreCutoverFence }>
   /** How this WMS's zone-less despatch datetimes are read in the pre-cutover verification only. Absent: they are UNKNOWN (strict). */
   zonelessDespatchReading?: ZonelessDespatchReading
   /** The storefront's live-from instant, or null when none is configured/readable. Used to tell whether an uncertain despatch time matters. */
@@ -849,10 +856,10 @@ export function dispositionDespatchTime(
  * With a readable storefront `cutoff` (none configured: nothing is held, the existing shadowed path applies):
  *  - any value unreadable, or whose range STRADDLES the cutoff (it could be after it): HOLD pending, no write;
  *  - every value wholly AFTER the cutoff: complete normally;
- *  - any value wholly BEFORE the cutoff (a pre-cutover despatch; the incumbent writer owns its storefront side): if `now` is before the
+ *  - EVERY value wholly BEFORE the cutoff, none after (a pre-cutover despatch; the incumbent writer owns its storefront side): if `now` is before the
  *    cutoff, complete in IMS with `storefrontAlreadyCompleted`, which suppresses every order-level storefront write whatever the
- *    clock says when the job is enqueued; if `now` is at or after the cutoff, HOLD pending (a follow-up will verify these by the
- *    fresh read).
+ *    clock says when the job is enqueued; if `now` is at or after the cutoff, `verify` (the fresh read-only storefront look);
+ *  - values on BOTH sides of the cutoff (mixed): IMS owns the completion, as for a mixed split order: complete normally.
  * Entries with no value keep the old behaviour.
  */
 export function orderLevelDespatchDecision(
@@ -862,24 +869,64 @@ export function orderLevelDespatchDecision(
   now: Date,
   /** The earliest the despatch can have been when there is no usable despatch time; null when unknown. */
   lowerBound: Date | null = null,
-): { action: 'complete'; storefrontAlreadyCompleted: boolean } | { action: 'hold'; reason: string } {
+): { action: 'complete'; storefrontAlreadyCompleted: boolean; fence?: PreCutoverFence } | { action: 'verify' } | { action: 'hold'; reason: string } {
   if (reading === undefined || cutoff === null) return { action: 'complete', storefrontAlreadyCompleted: false }
   let before = false
+  let after = false
   // No usable despatch time is never "wholly after" by default: it is live only when the order cannot have been despatched before
   // the cutoff (IMS sent it to the WMS at or after it); otherwise the time is unknown and the order is held.
   if (hasUndatedDespatch(tracking) && (lowerBound === null || lowerBound.getTime() < cutoff.getTime())) {
     return { action: 'hold', reason: 'it has no despatch time and could have been despatched before the storefront went live' }
   }
+  // An undated entry that cannot predate the cutoff (the lower bound is at or after it) is wholly after it.
+  if (hasUndatedDespatch(tracking)) after = true
   for (const entry of tracking) {
     if (!entry.despatchedAt) continue
     const range = despatchInstantRange(entry.despatchedAt, reading)
     if (range === null) return { action: 'hold', reason: 'its despatch time cannot be read' }
     if (range.to.getTime() < cutoff.getTime()) before = true
     else if (range.from.getTime() < cutoff.getTime()) return { action: 'hold', reason: 'its despatch time could fall either side of the storefront go-live instant' }
+    else after = true
+  }
+  // ANY despatch dated at or after the cutoff (all-after or mixed) is judged against the clock FIRST: while IMS's own clock is still
+  // before the cutoff, such a time is not credible, and completing now would ship the order at a time the producer seam shadows
+  // (it judges the completion by the ship time), so the storefront completion would be lost for good. Hold it; the next sweep retries.
+  if (after && now.getTime() < cutoff.getTime()) {
+    return { action: 'hold', reason: 'it has a despatch dated after the storefront go-live instant while this system\'s clock is still before it' }
   }
   if (!before) return { action: 'complete', storefrontAlreadyCompleted: false }
+  // MIXED (some despatch wholly before the cutoff, some wholly after it; the clock is now past the cutoff): the order's latest
+  // despatch is live, so IMS owns the completion, exactly as the split-part path treats a mixed order (any part pushed live: no
+  // "already completed" flag, normal completion through the producer seam and the outbound-hold gates). Waiting for the storefront
+  // to show it completed would refuse for ever when the earlier writer only handled its own pre-cutover part.
+  if (after) return { action: 'complete', storefrontAlreadyCompleted: false }
   if (now.getTime() < cutoff.getTime()) return { action: 'complete', storefrontAlreadyCompleted: true }
-  return { action: 'hold', reason: 'it was despatched before the storefront went live and an order-level completion is not verifiable' }
+  // Despatched wholly before the cutover and swept after it: the caller verifies by the fresh read-only storefront look (the same
+  // verifier as a split part) and completes IMS-only if it passes, otherwise holds.
+  return { action: 'verify' }
+}
+
+/**
+ * Settles an order-level `verify` decision with the fresh read-only storefront verification (the split-part verifier, reused).
+ * Verified: complete in IMS only (`storefrontAlreadyCompleted`, no storefront write). Anything else, including an unavailable
+ * verifier or a thrown one: hold pending with the reason.
+ */
+async function settleOrderLevelVerify(
+  deps: WmsDispatchSweepDeps,
+  orderId: string,
+  tracking: ReadonlyArray<{ despatchedAt?: string | null }>,
+): Promise<{ action: 'complete'; storefrontAlreadyCompleted: true; fence?: PreCutoverFence } | { action: 'hold'; reason: string }> {
+  const latest = strictLatestDespatchTime(tracking, { zoneless: deps.zonelessDespatchReading })
+  let verdict: { verified: boolean; detail: string; fence?: PreCutoverFence }
+  try {
+    verdict = deps.verifyPreCutoverCompletion
+      ? await deps.verifyPreCutoverCompletion(orderId, latest)
+      : { verified: false, detail: 'this sweep has no way to read the storefront order' }
+  } catch {
+    verdict = { verified: false, detail: 'the storefront order could not be verified' }
+  }
+  if (verdict.verified) return { action: 'complete', storefrontAlreadyCompleted: true, ...(verdict.fence ? { fence: verdict.fence } : {}) }
+  return { action: 'hold', reason: `it was despatched before the storefront went live and the storefront order could not be verified as completed: ${verdict.detail}` }
 }
 
 /**
@@ -926,7 +973,7 @@ async function reconcileSplitOrder(
   // Parts whose storefront record was VERIFIED by a fresh read (pre-cutover) rather than written by this sweep.
   let verifiedPreCutoverParts = 0
   // The fresh read happens at most once per order per sweep: the first shadowed pre-cutover part asks, the rest reuse the answer.
-  let preCutoverVerdict: { verified: boolean; detail: string } | null = null
+  let preCutoverVerdict: { verified: boolean; detail: string; fence?: PreCutoverFence } | null = null
   // What a verifying completion must postdate: the LATEST despatch among ALL despatched parts, not the part being asked about.
   const latestPartDespatch = strictLatestDespatchTime(dispatchedParts.flatMap((entry) => entry.tracking), { zoneless: deps.zonelessDespatchReading })
   // The cutoff disposition of a part is judged by its despatch time. For a WMS with a known zone for zone-less values that time must
@@ -1022,6 +1069,7 @@ async function reconcileSplitOrder(
   // Every despatched part was VERIFIED by the fresh read (none was pushed by this sweep): the storefront order is already
   // complete, so IMS completes its own side only. A mixed order (some part pushed live) keeps the normal completion.
   let mergedAlreadyCompleted = false
+  let fence: PreCutoverFence | undefined = verifiedPreCutoverParts > 0 ? preCutoverVerdict?.fence : undefined
   if (!recordPartials) {
     // A merged survivor completes at ORDER level with no per-part judgement above, so judge every part's time here, once.
     const cutoff = deps.storefrontCutoff?.() ?? null
@@ -1034,12 +1082,14 @@ async function reconcileSplitOrder(
         return { action: 'pending', reason: `Merged order held: part ${undatedPart.partNumber} has no despatch time`, unresolved: requireResolution }
       }
     }
-    const decision = orderLevelDespatchDecision(allTracking, deps.zonelessDespatchReading, cutoff, (deps.clock ?? (() => new Date()))(), null)
+    let decision = orderLevelDespatchDecision(allTracking, deps.zonelessDespatchReading, cutoff, (deps.clock ?? (() => new Date()))(), null)
+    if (decision.action === 'verify') decision = await settleOrderLevelVerify(deps, candidate.orderId, allTracking)
     if (decision.action === 'hold') return { action: 'pending', reason: `Merged order held: ${decision.reason}`, unresolved: requireResolution }
     mergedAlreadyCompleted = decision.storefrontAlreadyCompleted
+    if (decision.fence) fence = decision.fence
   }
   const storefrontAlreadyCompleted = mergedAlreadyCompleted || (recordPartials && dispatchedParts.length > 0 && verifiedPreCutoverParts === dispatchedParts.length)
-  const result = await deps.applyDispatch(candidate.orderId, aggregated, storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true } : undefined)
+  const result = await deps.applyDispatch(candidate.orderId, aggregated, storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true, ...(fence ? { fence } : {}) } : undefined)
   if (!result.success) {
     return { action: 'error', reason: result.error ?? 'Dispatch apply failed after all parts despatched' }
   }
@@ -1179,9 +1229,10 @@ export async function reconcileOneOrder(
 
   // An ordinary (non-split) order completes at ORDER level: judge its despatch time against the storefront cutoff first.
   const orderCutoff = deps.storefrontCutoff?.() ?? null
-  const decision = orderLevelDespatchDecision(status.tracking, deps.zonelessDespatchReading, orderCutoff, (deps.clock ?? (() => new Date()))(), await undatedLowerBound(deps, candidate.orderId, status.tracking, orderCutoff))
+  let decision = orderLevelDespatchDecision(status.tracking, deps.zonelessDespatchReading, orderCutoff, (deps.clock ?? (() => new Date()))(), await undatedLowerBound(deps, candidate.orderId, status.tracking, orderCutoff))
+  if (decision.action === 'verify') decision = await settleOrderLevelVerify(deps, candidate.orderId, status.tracking)
   if (decision.action === 'hold') return { action: 'pending', reason: `Order held: ${decision.reason}`, unresolved: requireResolution }
-  const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking), decision.storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true } : undefined)
+  const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking), decision.storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true, ...(decision.fence ? { fence: decision.fence } : {}) } : undefined)
   if (!result.success) {
     return { action: 'error', reason: result.error ?? 'Dispatch apply failed' }
   }
@@ -2670,7 +2721,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         lookup: { orderId },
         targetShipmentStatus: 'SHIPPED',
         tracking,
-        ...(options?.storefrontAlreadyCompleted === true ? { storefrontAlreadyCompleted: true } : {}),
+        ...(options?.storefrontAlreadyCompleted === true ? { storefrontAlreadyCompleted: true, ...(options.fence ? { shipFence: options.fence } : {}) } : {}),
       })
       if (result.success) {
         await recordWmsMutationEvent({

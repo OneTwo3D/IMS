@@ -1,3 +1,4 @@
+import type { ShipmentServiceClient } from '@/lib/domain/sales/shipment-service'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -41,6 +42,11 @@ export type ExternalFulfillmentUpdate = {
    * was verified; a mixed order completes normally.
    */
   storefrontAlreadyCompleted?: boolean
+  /**
+   * With `storefrontAlreadyCompleted`: re-checked inside the transaction that ships the order, under the order lock. A non-null answer
+   * refuses the dispatch (what the verification proved no longer holds), so nothing is shipped on a stale proof.
+   */
+  shipFence?: (tx: ShipmentServiceClient) => Promise<string | null>
 }
 
 /**
@@ -740,6 +746,7 @@ export async function applyExternalFulfillmentUpdate(
           // completion must never push back, as it would only echo.
           storefrontCompletion: isWmsConnectorId(update.source) && update.storefrontAlreadyCompleted !== true,
           skipStorefrontPush: update.storefrontAlreadyCompleted === true,
+          ...(update.storefrontAlreadyCompleted === true && update.shipFence ? { shipFence: update.shipFence } : {}),
         },
       )
 
@@ -757,6 +764,34 @@ export async function applyExternalFulfillmentUpdate(
         return refuseExternalFulfillment(
           'shipment_status_transition_failed',
           result.error ?? `Failed to update shipment to ${target}`,
+        )
+      }
+    }
+  }
+
+  // RETRY OF A FENCED COMPLETION. Every shipment may already be SHIPPED while the order itself was left unflipped (a verification
+  // fence refused at the order flip after the shipment committed). No shipment is left to transition, so `updateShipmentStatus`
+  // (the only other place the order is reconciled) is never reached: reconcile the order here instead, under the order lock and with
+  // the FRESH fence, with no shipment transition and no stock work. Success is reported only once the order is flipped or already
+  // complete; a refusal is an apply error and the next sweep tries again. (The unfenced path is unchanged.)
+  if (update.targetShipmentStatus === 'SHIPPED' && update.storefrontAlreadyCompleted === true && update.shipFence && shipments.length === 0) {
+    const { reconcileOrderAfterShipment } = await import('@/lib/domain/sales/shipment-service')
+    const reconciliation = await reconcileOrderAfterShipment(db, { orderId: order.id }, undefined, {
+      completionAuthority: 'EXTERNAL',
+      storefrontCompletion: false,
+      fence: update.shipFence,
+    })
+    if (reconciliation.fenceRefused) {
+      return refuseExternalFulfillment('shipment_status_transition_failed', reconciliation.fenceRefused)
+    }
+    if (reconciliation.orderReachedShipped !== true) {
+      // Not flipped by this call: it must already BE shipped or complete. An order that became CANCELLED (or any other status that cannot
+      // be shipped) between selection and this retry is a mismatch to surface, never a recorded success.
+      const current = await db.salesOrder.findUnique({ where: { id: order.id }, select: { status: true } })
+      if (!current || !['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(String(current.status))) {
+        return refuseExternalFulfillment(
+          'shipment_status_transition_failed',
+          `The order could not be completed after verification: it is ${current ? String(current.status) : 'missing'}, not shipped`,
         )
       }
     }

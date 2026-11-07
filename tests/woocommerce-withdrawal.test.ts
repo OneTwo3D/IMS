@@ -317,7 +317,7 @@ test('the guarded wrapper imports BEFORE it compensates', async () => {
   // first is a guaranteed no-op that reads like protection.
   const { readFileSync } = await import('node:fs')
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
-  const fn = src.slice(src.indexOf('export async function importWcOrderGuarded'))
+  const fn = src.slice(src.indexOf('async function importWcOrderGuardedLocked'))
   const body = fn.slice(0, fn.indexOf('\n}\n'))
   assert.ok(body.indexOf('runImport()') < body.indexOf('reconcileSuppressionAfterImport'))
 })
@@ -329,7 +329,7 @@ test('compensation is retried for an order that is already LINKED', async () => 
   // ineffective attempt and the order stayed live and withdrawn.
   const { readFileSync } = await import('node:fs')
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
-  const fn = src.slice(src.indexOf('export async function importWcOrderGuarded'))
+  const fn = src.slice(src.indexOf('async function importWcOrderGuardedLocked'))
   const body = fn.slice(0, fn.indexOf('\n}\n'))
     .split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
   assert.ok(!body.includes('wasUnlinked'), 'compensation must not be gated on the order having been unlinked')
@@ -634,7 +634,7 @@ test('there is exactly ONE post-import decision point', async () => {
   const rBody = resolver.slice(0, resolver.indexOf('\n}\n'))
   assert.ok(!rBody.includes('retireSuppression'), 'the resolver must not retire the tombstone')
 
-  const wrapper = src.slice(src.indexOf('export async function importWcOrderGuarded'))
+  const wrapper = src.slice(src.indexOf('async function importWcOrderGuardedLocked'))
   const wBody = wrapper.slice(0, wrapper.indexOf('\n}\n'))
   assert.ok(!wBody.includes('retireSuppression'),
     'the wrapper must not retire on the pre-import read either')

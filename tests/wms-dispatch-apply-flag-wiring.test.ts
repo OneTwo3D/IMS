@@ -32,3 +32,14 @@ test('applyDispatch hands storefrontAlreadyCompleted to the boundary only when t
   assert.equal(updates[0]!.storefrontAlreadyCompleted, true)
   assert.equal('storefrontAlreadyCompleted' in updates[1]!, false, 'an ordinary dispatch does not carry it')
 })
+
+test('applyDispatch hands the verification fence to the boundary as shipFence, and only with the flag', async () => {
+  updates.length = 0
+  const { createPrismaDispatchDeps } = await import('@/lib/domain/wms/dispatch-sweep')
+  const deps = createPrismaDispatchDeps('mintsoft' as never, {} as never)
+  const fence = async () => null
+  await deps.applyDispatch('o1', [{ trackingNumber: 'T1' }], { storefrontAlreadyCompleted: true, fence })
+  await deps.applyDispatch('o1', [{ trackingNumber: 'T1' }], { fence })
+  assert.equal(updates[0]!.shipFence, fence)
+  assert.equal('shipFence' in updates[1]!, false, 'a fence without the flag is not carried')
+})
