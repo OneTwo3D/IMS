@@ -49,6 +49,8 @@ mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async 
 mock.module('@/lib/activity-log', {
   namedExports: { logActivity: async (entry: Row) => { store.activity.push(entry) } },
 })
+// The per-storefront-order first-import session lock needs a real database; the fake arbitrates with its unique constraint instead.
+mock.module('@/lib/connectors/woocommerce/sync/first-import-lock', { namedExports: { acquireWcFirstImportLock: async () => async () => undefined } })
 mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
 mock.module('@/lib/maintenance-mode', { namedExports: { getMaintenanceModeResponse: async () => null } })
 mock.module('@/lib/integration-plugins', { namedExports: { isIntegrationPluginEnabled: async () => true } })
@@ -204,8 +206,6 @@ function txClient() {
     ...base,
     // The order row lock, the customer row lock (FOR UPDATE; the customer is not erased) and the erasure-marker read.
     $queryRaw: async () => [],
-    // The per-storefront-order first-import advisory lock (a no-op here: the unique constraint is what this fake arbitrates).
-    $executeRaw: async () => 0,
     salesOrder: {
       ...base.salesOrder,
       findUnique: async () => ({ erasedAt: null }),

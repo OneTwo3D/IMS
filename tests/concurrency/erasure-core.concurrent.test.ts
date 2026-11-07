@@ -1659,14 +1659,9 @@ for (const winner of ['unmarked', 'marked'] as const) {
     const unmarked = { ...payload(externalId, wcRateId), customer_id: wooCustomerId, billing: subject, shipping: subject }
     const marked = anonymisedPayload(externalId, wcRateId)
 
-    // Hold the per-order lock ourselves so both deliveries queue on it, then release: the first to queue is the first to run.
-    let release!: () => void
-    const held = new Promise<void>((r) => { release = r })
-    const holder = db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`wc-first-import:${externalId}`}, 0))`
-      await held
-    }, { timeout: 60_000 })
-    await new Promise((r) => setTimeout(r, 300))
+    // Hold the per-order lock ourselves (the importer's own session lock) so both deliveries queue on it, then release: the first to queue is the first to run.
+    const { acquireWcFirstImportLock } = await import('@/lib/connectors/woocommerce/sync/first-import-lock')
+    const releaseHeld = await acquireWcFirstImportLock(externalId)
     const [first, second] = winner === 'unmarked' ? [unmarked, marked] : [marked, unmarked]
     const baseline = await blockedOnAdvisoryLock(db)
     const a = importWcOrder(first as never)
@@ -1674,8 +1669,7 @@ for (const winner of ['unmarked', 'marked'] as const) {
     const b = importWcOrder(second as never)
     for (let i = 0; i < 100 && (await blockedOnAdvisoryLock(db)) < baseline + 2; i += 1) await new Promise((r) => setTimeout(r, 50))
     assert.equal(await blockedOnAdvisoryLock(db), baseline + 2, 'both deliveries are queued on the per-order lock')
-    release()
-    await holder
+    await releaseHeld()
     const [ra, rb] = await Promise.all([a, b])
     assert.equal(ra.success, true, JSON.stringify(ra))
     assert.equal(rb.success, true, JSON.stringify(rb))
@@ -1824,3 +1818,32 @@ test('[erasure] a mirror that cannot run THROWS so the delivery retries, with fi
   await assert.rejects(() => mirrorWcAnonymisation('no-such-order'), (e: Error) => e instanceof WcAnonymisationMirrorFailed && !/no-such-order/.test(e.message))
 })
 
+
+test('[erasure] a burst of first imports larger than the application pool, a marked one among them, all complete: the lock never takes a connection of the main pool', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const { DB_POOL_MAX } = await import('@/lib/db')
+  const count = DB_POOL_MAX + 6
+  const ids = Array.from({ length: count }, (_, i) => fx.externalId + 200 + i)
+  const markedId = ids[3]!
+  t.after(async () => { await cleanupImported(db, ids); await fx.cleanup() })
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const blank = { ...WC_ADDRESS, first_name: '', last_name: '', company: '', email: '', phone: '' }
+  const results = await Promise.all(ids.map((id) => importWcOrder((id === markedId ? anonymisedPayload(id, wcRateId) : { ...payload(id, wcRateId), billing: blank, shipping: blank }) as never)))
+  results.forEach((r, i) => assert.equal(r.success, true, `import ${i}: ${JSON.stringify(r)}`))
+  assert.equal(await db.shoppingOrderLink.count({ where: { connector: 'woocommerce', externalOrderId: { in: ids.map(String) } } }), count, 'every order was created')
+  const marked = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(markedId) }, select: { orderId: true } })
+  assert.ok((await db.salesOrder.findUniqueOrThrow({ where: { id: marked.orderId } })).erasedAt, 'the marked order was created erased')
+})
+
+test('[erasure] the first-import lock wait is bounded: a second acquire on a held order throws the retryable error and frees its connection', { skip }, async () => {
+  await loadDb()
+  const { acquireWcFirstImportLock, WcFirstImportLockUnavailable } = await import('@/lib/connectors/woocommerce/sync/first-import-lock')
+  const id = 1_900_000_000 + Math.floor(Math.random() * 90_000_000)
+  const release = await acquireWcFirstImportLock(id)
+  await assert.rejects(() => acquireWcFirstImportLock(id, 300), (e: Error) => e instanceof WcFirstImportLockUnavailable)
+  await release()
+  const again = await acquireWcFirstImportLock(id, 300)
+  await again()
+})
