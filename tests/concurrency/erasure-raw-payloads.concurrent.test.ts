@@ -68,7 +68,7 @@ function payload(externalId: number, wcRateId: number) {
     date_paid_gmt: null, date_created: '2026-11-02T09:00:00', date_created_gmt: '2026-11-02T09:00:00',
     date_modified: '2026-11-02T09:00:00', date_modified_gmt: '2026-11-02T09:00:00',
     billing: WC_ADDRESS, shipping: WC_ADDRESS, meta_data: [{ id: 9, key: '_billing_vat', value: VAT }],
-    line_items: [{ id: 1, name: 'Widget', product_id: 1, variation_id: 0, quantity: 1, tax_class: '', subtotal: '100.00', subtotal_tax: '20.00', total: '100.00', total_tax: '20.00', sku: `NOSKU-${externalId}`, price: 100, taxes: [{ id: wcRateId, total: '20.00', subtotal: '20.00' }], meta_data: [] }],
+    line_items: [{ id: 1, name: `Widget for ${NAME.first}`, parent_name: `Gift for ${NAME.last}`, product_id: 1, variation_id: 0, quantity: 1, tax_class: '', subtotal: '100.00', subtotal_tax: '20.00', total: '100.00', total_tax: '20.00', sku: `NOSKU-${externalId}`, price: 100, taxes: [{ id: wcRateId, total: '20.00', subtotal: '20.00' }], meta_data: [] }],
     fee_lines: [],
     tax_lines: [{ id: 21, rate_code: 'GB-VAT-1', rate_id: wcRateId, label: 'VAT', compound: false, tax_total: '20.00', shipping_tax_total: '1.00', meta_data: [] }],
     shipping_lines: [{ id: 31, method_title: 'Royal Mail', method_id: 'flat_rate', total: '5.00', total_tax: '1.00', taxes: [{ id: wcRateId, total: '1.00' }], meta_data: [] }],
@@ -281,6 +281,7 @@ test('[raw payloads] the erasure projects every raw store: identity gone, curren
   assert.equal(o.currency, 'GBP'); assert.equal(o.total, '126.00'); assert.equal(o.total_tax, '21.00'); assert.equal(o.id, fx.externalId)
   assert.equal(o.version, '9.4.1'); assert.equal(o.created_via, 'checkout'); assert.equal(o.date_created_gmt, '2026-11-02T09:00:00')
   assert.equal(o.tax_lines[0].tax_total, '20.00'); assert.equal(o.tax_lines[0].rate_code, 'GB-VAT-1')
+  assert.equal(o.line_items[0].name, `NOSKU-${fx.externalId}`, 'a free-text item name becomes the SKU'); assert.equal('parent_name' in o.line_items[0], false)
   assert.equal(o.line_items[0].quantity, 2); assert.equal(o.line_items[0].price, 50); assert.equal(o.line_items[0].total, '100.00')
   assert.deepEqual(o.line_items[0].meta_data.map((m: { key: string }) => m.key), ['_line_total_base_currency'], 'line meta is allowlisted')
   assert.deepEqual(o.meta_data.map((m: { key: string }) => m.key), ['_base_currency_exchange_rate', '_order_total_base_currency', '_wcpdf_invoice_number'])
@@ -481,4 +482,60 @@ test('[raw payloads] key census: every key of a real-shaped order is classified 
   // idempotent
   const twice = (await db.$queryRaw<Array<{ p: unknown }>>`SELECT gdpr_project_wc_order(${JSON.stringify(projected)}::jsonb) AS p`)[0]!.p
   assert.deepEqual(twice, projected)
+})
+
+test('[raw payloads] fee and item names: a personalised name is dropped, a credit-named fee keeps its name (the coupon classifier reads it), the wclc markers survive', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  t.after(async () => { await fx.cleanup() })
+  const rate = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const sample = rawOrder(fx, rate, {
+    fee_lines: [
+      { id: 1, name: `Gift wrap for ${NAME.first}`, tax_class: '', tax_status: 'taxable', total: '2.00', total_tax: '0.40', taxes: [], meta_data: [{ id: 1, key: '_wclc_fee', value: 'yes' }, { id: 2, key: '_wclc_fee_kind', value: 'duty' }, { id: 3, key: 'note', value: NAME.last }] },
+      { id: 2, name: 'Store Credit', tax_class: '', tax_status: 'none', total: '-5.00', total_tax: '0.00', taxes: [], meta_data: [] },
+    ],
+  })
+  const p = (await db.$queryRaw<Array<{ p: Record<string, unknown> }>>`SELECT gdpr_project_wc_order(${JSON.stringify(sample)}::jsonb) AS p`)[0]!.p as { fee_lines: Array<{ name: string; total: string; meta_data: Array<{ key: string }> }> }
+  assert.deepEqual(leaks(p), [])
+  assert.equal(p.fee_lines[0]!.name, 'Fee'); assert.equal(p.fee_lines[0]!.total, '2.00')
+  assert.deepEqual(p.fee_lines[0]!.meta_data.map((m) => m.key), ['_wclc_fee', '_wclc_fee_kind'])
+  assert.equal(p.fee_lines[1]!.name, 'Store Credit', 'the credit wording the classifier reads is kept')
+  // the refund line name too
+  const r = (await db.$queryRaw<Array<{ p: { line_items: Array<{ name: string }> } }>>`SELECT gdpr_project_wc_refund(${JSON.stringify({ ...rawRefund(fx), line_items: [{ ...rawRefund(fx).line_items[0], name: `Mug for ${NAME.first}` }] })}::jsonb) AS p`)[0]!.p
+  assert.deepEqual(leaks(r), [])
+})
+
+test('[raw payloads] a delivery for an order IMS does not hold, found only through the customer id, leaves an order-keyed obligation: its redelivery is projected on insert and a later import creates it ERASED', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const cleanups: Array<() => Promise<void>> = []
+  const unheldId = fx.externalId + 7_000_000_000
+  t.after(async () => {
+    for (const c of cleanups) await c()
+    const link = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(unheldId) } })
+    if (link) { await db.accountingSyncLog.deleteMany({ where: { referenceId: link.orderId } }); await db.salesOrderLine.deleteMany({ where: { orderId: link.orderId } }); await db.activityLog.deleteMany({ where: { entityId: link.orderId } }); await db.shoppingOrderLink.deleteMany({ where: { orderId: link.orderId } }); await db.salesOrder.deleteMany({ where: { id: link.orderId } }) }
+    await db.shoppingSyncLog.deleteMany({ where: { externalId: String(unheldId) } })
+    await db.storefrontOrderErasureObligation.deleteMany({ where: { externalOrderId: String(unheldId) } })
+    await fx.cleanup()
+  })
+  const rows = await seedRaw(db, fx, cleanups)
+  assert.equal(await db.storefrontOrderErasureObligation.count({ where: { externalOrderId: String(unheldId) } }), 0, 'PRECONDITION: no obligation yet')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  assert.deepEqual(leaks(await ev(db, rows.inboxCustomerOnly)), [], 'the delivery found by customer id is projected')
+  const ob = await db.storefrontOrderErasureObligation.findUnique({ where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(unheldId) } } })
+  assert.ok(ob && ob.retiredAt === null, 'an open obligation names the unheld order')
+  assert.equal(await db.storefrontOrderErasureObligation.count({ where: { externalOrderId: String(fx.externalId) } }), 0, 'no obligation for the order IMS holds (its link is enough)')
+  // A later delivery of that order is projected on insert (trigger sees the obligation) ...
+  const rate = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const body = rawOrder(fx, rate, { id: unheldId })
+  const again = await db.shoppingWebhookEvent.create({ data: { connector: 'woocommerce', resource: 'orders', topic: 'order.updated', payloadHash: sha(randomUUID()), payloadJson: body as never, status: 'PENDING' } })
+  cleanups.push(async () => { await db.shoppingWebhookEvent.deleteMany({ where: { id: again.id } }) })
+  assert.deepEqual(leaks(again.payloadJson), [])
+  // ... and a later IMPORT of it creates the order already erased.
+  await (await import('@/lib/connectors/woocommerce/sync/order-import')).importWcOrder(rawOrder(fx, rate, { id: unheldId, number: String(unheldId) }) as never)
+  const link = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(unheldId) } })
+  const created = await db.salesOrder.findUniqueOrThrow({ where: { id: link.orderId } })
+  assert.ok(created.erasedAt, 'created already erased')
+  assert.deepEqual(leaks({ n: created.customerName, e: created.customerEmail, b: created.billingAddress, s: created.shippingAddress }), [])
 })

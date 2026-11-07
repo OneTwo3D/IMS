@@ -283,18 +283,21 @@ export function mapMintsoftReturnsInboxRow(row: {
 async function writeReturnsErrorLog(jobId: string, record: WmsReturnRecord, error: unknown): Promise<void> {
   let candidates: string[] = []
   let determined = true
+  let markedErased = false
   try {
     const order = await resolveMintsoftReturnOrder(record.orderReference)
     const row = await db.wmsReturnsInbox.findUnique({
       where: { connector_externalReturnId: { connector: 'mintsoft', externalReturnId: record.externalReturnId } },
-      select: { orderId: true },
+      select: { orderId: true, erasedAt: true },
     })
+    // The erasure's marker never goes away, so reading it outside the transaction is safe.
+    if (row?.erasedAt) markedErased = true
     candidates = [...new Set([order?.id, row?.orderId].filter((id): id is string => Boolean(id)))].sort()
   } catch {
     determined = false
   }
   await db.$transaction(async (tx) => {
-    let erased = !determined
+    let erased = !determined || markedErased
     for (const candidate of candidates) {
       await tx.$queryRaw`SELECT id FROM "sales_orders" WHERE id = ${candidate} FOR UPDATE`
       if ((await tx.salesOrder.findUnique({ where: { id: candidate }, select: { erasedAt: true } }))?.erasedAt) erased = true
@@ -413,10 +416,11 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
         // resolves to none (a redelivery with a missing order reference), the order the inbox row is ALREADY linked to. An established link is
         // never cleared by an unresolved delivery.
         await db.$transaction(async (tx) => {
-          const current = await tx.wmsReturnsInbox.findUnique({ where: inboxKey, select: { orderId: true } })
+          const current = await tx.wmsReturnsInbox.findUnique({ where: inboxKey, select: { orderId: true, erasedAt: true } })
           const effectiveOrderId = order?.id ?? current?.orderId ?? null
           const candidates = [...new Set([order?.id, current?.orderId].filter((id): id is string => Boolean(id)))].sort()
-          let orderErased = false
+          // A row an erasure cleared stays erased whatever the order resolves to now (the warehouse's reference may no longer resolve to the erased order).
+          let orderErased = current?.erasedAt != null
           for (const candidate of candidates) {
             await tx.$queryRaw`SELECT id FROM "sales_orders" WHERE id = ${candidate} FOR UPDATE`
             if ((await tx.salesOrder.findUnique({ where: { id: candidate }, select: { erasedAt: true } }))?.erasedAt) orderErased = true

@@ -2552,3 +2552,44 @@ test('[erasure] a MIRROR error ends the run, leaves the cursor at the last fully
   assert.equal(second.errors.length, 0)
   assert.equal((await obligationIds(db, orders.map((o) => o.id))).size, 250, 'the next run covered everything, including the order that failed')
 })
+
+test('[erasure] an UNMATCHED return cleared by the erasure stays erased: a later poll that resolves it to no order cannot write the raw record or the reason back', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { runMintsoftReturnsSync } = await import('@/lib/connectors/mintsoft/sync/returns-sync')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const uid = randomUUID().slice(0, 8)
+  const connection = await db.wmsConnection.create({ data: { connector: 'mintsoft', label: `unm-${uid}`, active: true }, select: { id: true } })
+  const binding = await db.externalWmsBinding.create({ data: { connectionId: connection.id, warehouseId: fx.warehouseId, connector: 'mintsoft', externalWarehouseId: `ext-${uid}`, active: true, returnsMode: 'POLL' } as never, select: { id: true } })
+  const returnId = `RET-UNM-${uid}`
+  t.after(async () => {
+    pollReturnsRecords = null
+    await db.wmsReturnsInbox.deleteMany({ where: { externalReturnId: returnId } })
+    await db.externalWmsBinding.deleteMany({ where: { id: binding.id } })
+    await db.wmsConnection.deleteMany({ where: { id: connection.id } })
+    await fx.cleanup()
+  })
+  const order = await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId }, select: { orderNumber: true } })
+  // The return was staged with NO order link (the warehouse's reference did not resolve then), carrying the recipient's raw record and a reason.
+  await db.wmsReturnsInbox.create({ data: { connector: 'mintsoft', externalReturnId: returnId, orderId: null, reference: order.orderNumber, reason: `${FULL_NAME} says broken`, rawPayload: { Customer: { Name: FULL_NAME }, Note: STREET } } as never })
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const after = await db.wmsReturnsInbox.findUniqueOrThrow({ where: { connector_externalReturnId: { connector: 'mintsoft', externalReturnId: returnId } } })
+  assert.ok(after.erasedAt, 'the erasure marked the row')
+  assert.deepEqual(after.rawPayload, {})
+  // A later poll: the same return, a reference that resolves to NO order now, and the raw record again.
+  pollReturnsRecords = () => [{
+    externalReturnId: returnId, externalWarehouseId: `ext-${uid}`, sku: 'SKU-RET', qty: 1, orderReference: 'NO-SUCH-REFERENCE', reason: `${FULL_NAME} says it arrived broken`,
+    receivedAt: '2026-11-04T10:00:00.000Z', raw: { Customer: { Name: FULL_NAME }, Note: `Collect from ${STREET}` },
+  }]
+  await runMintsoftReturnsSync('test')
+  const again = await db.wmsReturnsInbox.findUniqueOrThrow({ where: { connector_externalReturnId: { connector: 'mintsoft', externalReturnId: returnId } } })
+  assert.deepEqual(again.rawPayload, {}, 'the raw record is not written back')
+  assert.ok(again.reason === null || again.reason === 'Text removed by GDPR erasure', 'the reason is not written back')
+  assert.equal(again.erasedAt?.getTime(), after.erasedAt?.getTime(), 'the marker stays')
+  // ... and the trigger honours the marker for ANY writer.
+  await db.$executeRaw`UPDATE "wms_returns_inbox" SET "reason" = ${`from ${FULL_NAME}`}, "rawPayload" = ${JSON.stringify({ n: FULL_NAME })}::jsonb WHERE "externalReturnId" = ${returnId}`
+  const forced = await db.wmsReturnsInbox.findUniqueOrThrow({ where: { connector_externalReturnId: { connector: 'mintsoft', externalReturnId: returnId } } })
+  assert.deepEqual(forced.rawPayload, {}); assert.equal(forced.reason, 'Text removed by GDPR erasure')
+  const logs = await db.wmsSyncLog.findMany({ where: { sku: 'SKU-RET', job: { type: 'RETURNS_SYNC' } } })
+  assert.ok(logs.every((l) => !JSON.stringify(l.payload).includes(STREET)))
+})

@@ -31,7 +31,7 @@ CREATE OR REPLACE FUNCTION gdpr_wc_meta_key_allowed(k text) RETURNS boolean LANG
     k = ANY(ARRAY['_base_currency_exchange_rate', '_cogs_total_value_order_currency', '_cogs_value_order_currency', 'vat_compliance_vat_paid',
       '_wcpdf_invoice_number', '_wcpdf_invoice_number_data', '_wcpdf_invoice_date', '_wcpdf_invoice_date_formatted', '_wcpdf_invoice_display_date',
       'xeroom_invoice_no_sent', 'xeroom_invoice_reference_sent', 'xeroom_order_sent', '_reduced_stock', '_restock_refunded_items',
-      '_refunded_item_id', 'coupon_info']))
+      '_refunded_item_id', 'coupon_info', '_wclc_fee', '_wclc_fee_kind', '_wclc_duty_component', '_wclc_tax_component', '_wclc_handling_component']))
 $$;
 
 -- A meta_data array reduced to the allowed keys (each entry keeps id, key, value). Not an array -> [].
@@ -43,10 +43,19 @@ CREATE OR REPLACE FUNCTION gdpr_project_meta(meta jsonb, only_keys text[]) RETUR
   ), '[]'::jsonb) END
 $$;
 
--- Each element of an array reduced to `keys`, plus a projected meta_data when with_meta; `only_keys` limits that meta (NULL = the allowlist). Not an array -> [].
-CREATE OR REPLACE FUNCTION gdpr_project_lines(arr jsonb, keys text[], with_meta boolean, only_keys text[]) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+-- Each element of an array reduced to `keys`, plus a projected meta_data when with_meta; `only_keys` limits that meta (NULL = the allowlist).
+-- name_mode says what becomes of the element's free-text `name` (a personalised item can carry a recipient's name): 'sku' = the SKU (else 'Item'),
+-- 'fee' = kept only when it reads as store credit / gift card / wallet (the coupon classifier reads it), else 'Fee'; anything else = no name.
+-- parent_name is always dropped. Not an array -> [].
+CREATE OR REPLACE FUNCTION gdpr_project_lines(arr jsonb, keys text[], with_meta boolean, only_keys text[], name_mode text DEFAULT 'none') RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE WHEN arr IS NULL OR jsonb_typeof(arr) <> 'array' THEN '[]'::jsonb ELSE COALESCE((
-    SELECT jsonb_agg(gdpr_keep_keys(l, keys) || CASE WHEN with_meta AND l ? 'meta_data' THEN jsonb_build_object('meta_data', gdpr_project_meta(l->'meta_data', only_keys)) ELSE '{}'::jsonb END ORDER BY ord)
+    SELECT jsonb_agg(gdpr_keep_keys(l, keys)
+        || CASE WHEN with_meta AND l ? 'meta_data' THEN jsonb_build_object('meta_data', gdpr_project_meta(l->'meta_data', only_keys)) ELSE '{}'::jsonb END
+        || CASE name_mode
+             WHEN 'sku' THEN jsonb_build_object('name', COALESCE(NULLIF(l->>'sku', ''), 'Item'))
+             WHEN 'fee' THEN jsonb_build_object('name', CASE WHEN (l->>'name') ~* 'smart[_ -]?coupon|store[_ -]?credit|gift[_ -]?(card|cert)|giftcard|wallet' THEN l->'name' ELSE to_jsonb('Fee'::text) END)
+             ELSE '{}'::jsonb END
+        ORDER BY ord)
       FROM jsonb_array_elements(arr) WITH ORDINALITY AS t(l, ord)
      WHERE jsonb_typeof(l) = 'object'
   ), '[]'::jsonb) END
@@ -69,10 +78,10 @@ CREATE OR REPLACE FUNCTION gdpr_project_wc_order(o jsonb) RETURNS jsonb LANGUAGE
     || jsonb_build_object('billing', gdpr_empty_address(o->'billing'), 'shipping', gdpr_empty_address(o->'shipping'))
     || jsonb_build_object('meta_data', gdpr_project_meta(o->'meta_data', NULL))
     || jsonb_build_object('line_items', gdpr_project_lines(o->'line_items',
-         ARRAY['id', 'name', 'parent_name', 'product_id', 'variation_id', 'sku', 'global_unique_id', 'quantity', 'price', 'subtotal', 'subtotal_tax', 'total', 'total_tax', 'tax_class', 'taxes', 'cogs_value', 'cost_of_goods_sold'], true, NULL))
+         ARRAY['id', 'product_id', 'variation_id', 'sku', 'global_unique_id', 'quantity', 'price', 'subtotal', 'subtotal_tax', 'total', 'total_tax', 'tax_class', 'taxes', 'cogs_value', 'cost_of_goods_sold'], true, NULL, 'sku'))
     || jsonb_build_object('shipping_lines', gdpr_project_lines(o->'shipping_lines',
          ARRAY['id', 'method_id', 'method_title', 'instance_id', 'total', 'total_tax', 'taxes', 'tax_status'], true, NULL))
-    || jsonb_build_object('fee_lines', gdpr_project_lines(o->'fee_lines', ARRAY['id', 'name', 'tax_class', 'tax_status', 'total', 'total_tax', 'taxes'], true, NULL))
+    || jsonb_build_object('fee_lines', gdpr_project_lines(o->'fee_lines', ARRAY['id', 'tax_class', 'tax_status', 'total', 'total_tax', 'taxes'], true, NULL, 'fee'))
     || jsonb_build_object('coupon_lines', gdpr_project_lines(o->'coupon_lines', ARRAY['id', 'code', 'discount', 'discount_tax'], true, ARRAY['coupon_info']))
     || jsonb_build_object('tax_lines', gdpr_project_lines(o->'tax_lines', ARRAY['id', 'rate_code', 'rate_id', 'label', 'compound', 'tax_total', 'shipping_tax_total', 'rate_percent'], false, NULL))
     || jsonb_build_object('refunds', gdpr_project_lines(o->'refunds', ARRAY['id', 'total', 'reason'], false, NULL))
@@ -86,7 +95,7 @@ CREATE OR REPLACE FUNCTION gdpr_project_wc_refund(r jsonb) RETURNS jsonb LANGUAG
     || gdpr_neutral_for_present(r, jsonb_build_object('refunded_by', 0))
     || jsonb_build_object('meta_data', '[]'::jsonb)
     || jsonb_build_object('line_items', gdpr_project_lines(r->'line_items',
-         ARRAY['id', 'name', 'product_id', 'variation_id', 'quantity', 'tax_class', 'subtotal', 'subtotal_tax', 'total', 'total_tax', 'taxes', 'sku', 'refund_total'], true, ARRAY['_refunded_item_id']))
+         ARRAY['id', 'product_id', 'variation_id', 'quantity', 'tax_class', 'subtotal', 'subtotal_tax', 'total', 'total_tax', 'taxes', 'sku', 'refund_total'], true, ARRAY['_refunded_item_id'], 'sku'))
     || CASE WHEN r ? 'shipping_lines' THEN jsonb_build_object('shipping_lines', gdpr_project_lines(r->'shipping_lines', ARRAY['id', 'method_id', 'method_title', 'total', 'total_tax', 'taxes'], false, NULL)) ELSE '{}'::jsonb END
     || jsonb_build_object('_erasure_projected', true)
   END
@@ -185,3 +194,21 @@ CREATE TRIGGER shopping_webhook_events_erased_projection BEFORE INSERT OR UPDATE
   FOR EACH ROW EXECUTE FUNCTION erased_wc_webhook_event_guard();
 CREATE TRIGGER shopping_sync_logs_erased_projection BEFORE INSERT OR UPDATE OF "payload", "errorMessage" ON "shopping_sync_logs"
   FOR EACH ROW EXECUTE FUNCTION erased_wc_sync_log_guard();
+
+-- A returns-inbox row the erasure cleared: the instant, kept on the row. The warehouse reports a return against an order reference that IMS cannot always
+-- resolve again afterwards (the link, the number it matches on), so a later poll would otherwise treat the row as live and write the raw record back. The
+-- returns writer reads this marker under the order lock, and the trigger below honours it for every writer. Additive; NULL for every existing row.
+ALTER TABLE "wms_returns_inbox" ADD COLUMN "erasedAt" TIMESTAMP(3);
+
+CREATE OR REPLACE FUNCTION erased_returns_inbox_marker_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW."erasedAt" IS NULL THEN RETURN NEW; END IF;
+  IF NEW."reason" IS NOT NULL AND NEW."reason" <> 'Text removed by GDPR erasure' THEN NEW."reason" := 'Text removed by GDPR erasure'; END IF;
+  IF NEW."resolutionNote" IS NOT NULL AND NEW."resolutionNote" <> 'Text removed by GDPR erasure' THEN NEW."resolutionNote" := 'Text removed by GDPR erasure'; END IF;
+  IF NEW."rawPayload" IS NOT NULL AND NEW."rawPayload" <> '{}'::jsonb THEN NEW."rawPayload" := '{}'::jsonb; END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER wms_returns_inbox_erased_marker BEFORE INSERT OR UPDATE OF "reason", "resolutionNote", "rawPayload", "erasedAt" ON "wms_returns_inbox"
+  FOR EACH ROW EXECUTE FUNCTION erased_returns_inbox_marker_guard();

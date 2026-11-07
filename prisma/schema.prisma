@@ -4504,6 +4504,8 @@ model WmsReturnsInbox {
   resolvedAt       DateTime?
   resolvedBy       String?
   resolutionNote   String?
+  /// Set when an erasure cleared this row (see the erased_returns_inbox_marker_guard trigger). The returns sync treats a marked row as erased whatever order it resolves to.
+  erasedAt         DateTime?
   createdAt        DateTime              @default(now())
   updatedAt        DateTime              @updatedAt
 

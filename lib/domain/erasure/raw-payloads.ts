@@ -41,7 +41,7 @@ export type RawPayloadCounts = {
 
 export const EMPTY_RAW_PAYLOAD_COUNTS: RawPayloadCounts = { rawWebhookEventsProjected: 0, rawSyncLogsProjected: 0, rawReturnRecordsCleared: 0, storefrontIdMissing: 0 }
 
-type Client = Pick<Prisma.TransactionClient, '$executeRaw' | '$queryRaw'> & Pick<Prisma.TransactionClient, 'shoppingOrderLink' | 'shoppingSyncLog' | 'salesOrder' | 'wmsOrderPushLink' | 'wmsReturnsInbox'>
+type Client = Pick<Prisma.TransactionClient, '$executeRaw' | '$queryRaw'> & Pick<Prisma.TransactionClient, 'shoppingOrderLink' | 'shoppingSyncLog' | 'storefrontOrderErasureObligation' | 'salesOrder' | 'wmsOrderPushLink' | 'wmsReturnsInbox'>
 
 export type RawPayloadSubject = {
   /** The locked IMS orders. */
@@ -75,6 +75,26 @@ export async function loadRawPayloadSubject(tx: Client, orderIds: string[], stor
 
 export async function scrubRawPayloadsInTx(tx: Client, subject: RawPayloadSubject, missing = 0): Promise<RawPayloadCounts> {
   const counts: RawPayloadCounts = { ...EMPTY_RAW_PAYLOAD_COUNTS, storefrontIdMissing: missing }
+
+  // (BEFORE the projection: it neutralises the customer id the rows are found by.) DELIVERIES FOR AN ORDER IMS DOES NOT HOLD (found through the customer id): the later-write guard, the reconcile and a later import look an order up
+  // by its link or by an open erasure obligation, so without one a redelivery of that order would be stored in full and the order created identifiable.
+  // The obligation is order-keyed and carries no personal data; it is recorded here, in the same transaction, for every such storefront order id.
+  if (subject.storefrontCustomerIds.length > 0) {
+    const keys = await tx.$queryRaw<Array<{ k: string }>>`
+      SELECT DISTINCT gdpr_webhook_order_key(w."payloadJson", w."resource") AS k FROM "shopping_webhook_events" w
+       WHERE ${webhookWhere({ storefrontOrderIds: [], storefrontCustomerIds: subject.storefrontCustomerIds })}`
+    const candidates = keys.map((r) => r.k).filter((k) => /^[0-9]+$/.test(k) && !subject.storefrontOrderIds.includes(k))
+    if (candidates.length > 0) {
+      const held = new Set((await tx.shoppingOrderLink.findMany({ where: { connector: 'woocommerce', externalOrderId: { in: candidates } }, select: { externalOrderId: true } })).map((l) => l.externalOrderId))
+      for (const id of candidates.filter((k) => !held.has(k))) {
+        await tx.storefrontOrderErasureObligation.upsert({
+          where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: id } },
+          create: { connector: 'woocommerce', externalOrderId: id },
+          update: { retiredAt: null },
+        })
+      }
+    }
+  }
 
   if (subject.storefrontOrderIds.length > 0 || subject.storefrontCustomerIds.length > 0) {
     counts.rawWebhookEventsProjected += Number(await tx.$executeRaw`
@@ -130,6 +150,8 @@ export async function scrubRawPayloadsInTx(tx: Client, subject: RawPayloadSubjec
     counts.rawReturnRecordsCleared += Number(await tx.$executeRaw`
       UPDATE "wms_returns_inbox" SET "rawPayload" = '{}'::jsonb WHERE "id" = ANY(${text(unmatched)}) AND "rawPayload" IS NOT NULL AND "rawPayload" <> '{}'::jsonb`)
   }
+  // (After the clearing above: the marker's trigger would otherwise clear the payload first and the count would miss it.) A DURABLE MARKER on every inbox row the erasure reaches: a later poll that resolves the same return to no order (or to another) must still treat it as erased.
+  if (inbox.length > 0) await tx.wmsReturnsInbox.updateMany({ where: { id: { in: inbox.map((r) => r.id) }, erasedAt: null }, data: { erasedAt: new Date() } })
   const returnIds = [...new Set(inbox.map((r) => r.externalReturnId))]
   if (returnIds.length > 0 || refs.length > 0) {
     counts.rawReturnRecordsCleared += await clearRawReturnLogs(tx, returnIds, refs)
