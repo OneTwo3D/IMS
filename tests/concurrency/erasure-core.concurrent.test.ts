@@ -2010,7 +2010,6 @@ const MARKED_ROUTES: MarkedRoute[] = [
       const { submitted } = await getWithdrawalStatuses()
       const marked = { ...anonymisedPayload(externalId, wcRateId), status: submitted }
       const guarded = await importWcOrderGuarded(marked as never, () => importWcOrder(marked as never))
-      assert.notEqual(guarded.outcome, 'skipped-withdrawal', 'the marked delivery was not skipped on an unlocked read')
       return guarded
     },
   },
@@ -2065,7 +2064,8 @@ for (const [index, route] of MARKED_ROUTES.entries()) {
     assert.equal(done, false, 'the marked delivery is waiting for the in-flight import, not acknowledged on a read that says "no order"')
     release()
     await first
-    await second
+    const delivered = await second
+    assert.notEqual((delivered as { outcome?: string } | undefined)?.outcome, 'skipped-withdrawal', 'the marked delivery was not skipped on an unlocked read')
 
     const link = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })
     const order = await db.salesOrder.findUniqueOrThrow({ where: { id: link.orderId } })
@@ -2075,3 +2075,70 @@ for (const [index, route] of MARKED_ROUTES.entries()) {
     assert.equal(await db.shoppingCustomerLink.count({ where: { externalCustomerId: String(wooCustomerId) } }), 0, 'no storefront link survives')
   })
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// THE ORDER-KEYED ERASURE OBLIGATION (Codex R6): a marked delivery for an order IMS does not hold is acknowledged by several routes while an
+// import (the initial import's page snapshot, a refusal drain, a retry) may still hold an OLDER, identifiable read of that order. The
+// acknowledgement leaves a durable obligation; when that older read is imported it is created ALREADY ERASED, and the obligation retires.
+// ---------------------------------------------------------------------------------------------------------------------
+
+for (const [index, route] of MARKED_ROUTES.entries()) {
+  test(`[erasure] a marked delivery acknowledged for an order IMS does not hold leaves an obligation; the OLDER identifiable read imported afterwards is created erased: ${route.name}`, { skip }, async (t) => {
+    const db = await loadDb()
+    const fx = await importFixture(db)
+    const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+    const externalId = fx.externalId + 301 + index
+    const tag = randomUUID().slice(0, 8)
+    const subject = { ...WC_ADDRESS, first_name: `Stale${tag}`, last_name: `Snapshot${tag}`, email: `stale.${tag}@example.test` }
+    const wooCustomerId = 200_000_000 + Math.floor(Math.random() * 90_000_000)
+    t.after(async () => {
+      await db.shoppingCustomerLink.deleteMany({ where: { externalCustomerId: String(wooCustomerId) } })
+      await cleanupImported(db, [externalId])
+      await db.storefrontOrderErasureObligation.deleteMany({ where: { externalOrderId: String(externalId) } })
+      await db.customer.deleteMany({ where: { OR: [{ email: subject.email }, { lastName: subject.last_name }] } })
+      await fx.cleanup()
+    })
+    const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+    // The older read, fetched BEFORE the anonymisation (as the initial import's page snapshot is).
+    const stale = { ...payload(externalId, wcRateId), customer_id: wooCustomerId, billing: subject, shipping: subject }
+
+    // The marked delivery arrives; IMS does not hold the order, so the delivery is acknowledged (or refused) and nothing is created.
+    await route.deliver(externalId, wcRateId)
+    await route.deliver(externalId, wcRateId) // a redelivery: idempotent
+    assert.equal(await db.shoppingOrderLink.count({ where: { connector: 'woocommerce', externalOrderId: String(externalId) } }), 0, 'nothing was created')
+    const open = await db.storefrontOrderErasureObligation.findMany({ where: { externalOrderId: String(externalId) } })
+    assert.equal(open.length, 1, 'exactly one obligation, however many deliveries')
+    assert.equal(open[0]!.retiredAt, null, 'and it is open')
+
+    // The older read is imported afterwards: it is created ALREADY ERASED and the obligation retires in that transaction.
+    assert.equal((await importWcOrder(stale as never)).success, true)
+    const link = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })
+    const order = await db.salesOrder.findUniqueOrThrow({ where: { id: link.orderId } })
+    assert.ok(order.erasedAt, 'the identifiable older read was created erased')
+    assert.deepEqual([order.customerName, order.customerEmail, order.customerVatNumber, order.billingAddress, order.shippingAddress, order.notes], ['GDPR Anonymised', null, null, null, null, null])
+    assert.equal(order.customerId, null)
+    assert.equal(order.totalForeign.toString(), '126', 'the money is imported as usual')
+    assert.equal(await db.customer.count({ where: { OR: [{ email: subject.email }, { lastName: subject.last_name }, { firstName: subject.first_name }] } }), 0, 'no customer holds the identity')
+    assert.equal(await db.shoppingCustomerLink.count({ where: { externalCustomerId: String(wooCustomerId) } }), 0, 'no storefront link')
+    assert.ok((await db.storefrontOrderErasureObligation.findUniqueOrThrow({ where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(externalId) } } })).retiredAt, 'the obligation retired with the create')
+    assert.equal(await proofRows(db, [link.orderId]).then((r) => r.length), 1, 'one proof record')
+
+    // IDEMPOTENT: the marked delivery again, now for a HELD erased order, changes nothing and records no second proof or obligation.
+    await route.deliver(externalId, wcRateId)
+    assert.equal(await proofRows(db, [link.orderId]).then((r) => r.length), 1, 'still one proof record')
+    assert.ok((await db.storefrontOrderErasureObligation.findUniqueOrThrow({ where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(externalId) } } })).retiredAt, 'still retired')
+  })
+}
+
+test('[erasure] erasing a HELD order through the mirror retires an open obligation for it', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  t.after(async () => { await db.storefrontOrderErasureObligation.deleteMany({ where: { externalOrderId: String(fx.externalId) } }); await fx.cleanup() })
+  const { recordWcErasureObligation } = await import('@/lib/connectors/woocommerce/sync/erasure-obligation')
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  await recordWcErasureObligation(fx.externalId)
+  assert.equal((await importWcOrder(anonymisedPayload(fx.externalId, wcRateId) as never)).success, true)
+  assert.ok((await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })).erasedAt)
+  assert.ok((await db.storefrontOrderErasureObligation.findUniqueOrThrow({ where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(fx.externalId) } } })).retiredAt, 'retired after erasing the held order')
+})

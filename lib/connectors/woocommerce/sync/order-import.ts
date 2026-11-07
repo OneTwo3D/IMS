@@ -6,6 +6,7 @@ import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain
 import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
 import { isWcOrderAnonymised, wcPayloadCarriesIdentity } from './anonymisation'
 import { mirrorWcAnonymisation } from './anonymisation-mirror'
+import { hasOpenWcErasureObligation, recordWcErasureObligation, retireWcErasureObligation } from './erasure-obligation'
 import { acquireWcFirstImportLock, wcFirstImportLockHeld } from './first-import-lock'
 import { ERASURE_PLACEHOLDER_NAME, ERASURE_RECORD_ACTION, ERASURE_RECORD_DESCRIPTION, buildErasureRecordMetadata } from '@/lib/domain/erasure/erasure-record'
 import { randomUUID } from 'node:crypto'
@@ -1165,7 +1166,10 @@ export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder:
   // WOOCOMMERCE HAS ANONYMISED THIS ORDER (positive marker): mirror it FIRST, so the update below reads the erasure marker under the order lock
   // and withholds the placeholder values WooCommerce now holds. Idempotent (an erased order is a no-op); a failure throws and the delivery retries.
   // Every route onto a held order reaches this function, including the loser of a concurrent first-import create.
-  if (isWcOrderAnonymised(wcOrder)) await mirrorWcAnonymisation(orderId)
+  if (isWcOrderAnonymised(wcOrder)) {
+    await mirrorWcAnonymisation(orderId)
+    await retireWcErasureObligation(wcOrder.id)
+  }
   const transition = await planWcPaidTransition(orderId, wcOrder)
   await wcReceiptRegistrationSeams.afterPlan?.(orderId)
   await updateExistingWcOrderCore(orderId, wcOrder, transition.kind !== 'none')
@@ -2294,8 +2298,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // here" and the order would then commit identifiable with nothing left to erase it. So a marked delivery takes the lock FIRST, before the pivot
     // read, and waits for that import: it then sees the held order and mirrors it, or, when IMS truly holds nothing, is judged as before. (The
     // withdrawal wrapper takes the same lock before ITS read and hands it down, so it is not taken twice.)
-    const payloadAnonymised = isWcOrderAnonymised(wcOrder)
-    if (payloadAnonymised && !wcFirstImportLockHeld(wcOrder.id)) releaseFirstImportLock = await acquireWcFirstImportLock(wcOrder.id)
+    const payloadMarked = isWcOrderAnonymised(wcOrder)
+    if (payloadMarked && !wcFirstImportLockHeld(wcOrder.id)) releaseFirstImportLock = await acquireWcFirstImportLock(wcOrder.id)
     // An order IMS holds: the UPDATE path (never gated). A closure because the first-import lock below re-asks the same question.
     const updateHeldOrder = async (heldOrderId: string): Promise<ImportWcOrderResult> => {
       const updated = await updateExistingWcOrderFromPayload(heldOrderId, wcOrder, options.receiptPaymentId, options.pendingFxRetryLogId, options.pendingFxSnapshotVersion)
@@ -2351,6 +2355,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       },
     })
     if (existing) return await updateHeldOrder(existing.id)
+    // A MARKED delivery for an order IMS does not hold: whatever happens to it below (refused by the admission gate, a status or currency refusal,
+    // or created already erased), leave the durable obligation first, under the lock, so an older read of this order that arrives later through
+    // any route is created already erased too. Retired when the order is created erased, or when a held order is erased.
+    if (payloadMarked) await recordWcErasureObligation(wcOrder.id)
 
     // IMS does not hold this order, so the selection decides whether it may take it on. Resolved
     // HERE rather than by the caller (r5): every route that receives an order without asking
@@ -2417,6 +2425,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     if (!releaseFirstImportLock && !wcFirstImportLockHeld(wcOrder.id)) releaseFirstImportLock = await acquireWcFirstImportLock(wcOrder.id)
     const racedHeld = await db.salesOrder.findFirst({ where: { shoppingLinks: { some: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) } } }, select: { id: true } })
     if (racedHeld) return await updateHeldOrder(racedHeld.id)
+    // Under the lock: a marked payload, OR an open obligation (an anonymisation was seen for this order and acknowledged before it was imported;
+    // this payload is an older read of it), means the order is created ALREADY ERASED and never touches the customer table.
+    const payloadAnonymised = payloadMarked || await hasOpenWcErasureObligation(wcOrder.id)
     const customerName = payloadAnonymised
       ? ERASURE_PLACEHOLDER_NAME
       : [wcOrder.billing.first_name, wcOrder.billing.last_name].filter(Boolean).join(' ')
@@ -3014,6 +3025,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           await tx.activityLog.create({ data: directCreateMarker(created.id, lifecycleStatus) })
         }
         if (erasedOnCreate) {
+          // The obligation (if any) is retired in the transaction that creates the order erased.
+          await retireWcErasureObligation(wcOrder.id, tx)
           // The customer's ORIGINAL erasure request (its proof row, read under the customer lock held above): this order's record links to it.
           const original = customerErasedDuringImport === null ? null : await tx.activityLog.findFirst({
             where: { entityType: 'CUSTOMER', entityId: customerErasedDuringImport, action: ERASURE_RECORD_ACTION },
