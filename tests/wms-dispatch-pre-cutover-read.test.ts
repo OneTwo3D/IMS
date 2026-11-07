@@ -950,7 +950,10 @@ test('ORDER LEVEL, RACE: the decision is made once from the despatch range and c
     reset()
     await withEnv(LIVE_AT_CUTOFF, async () => {
       const after = await sweep([part(1, '2026-06-02T09:00:00')], { zoneless: 'europe-london', shape, verifier: false, clock: BEFORE_CUTOVER })
-      assert.deepEqual(after.applyOptions, [undefined], `${shape}: wholly-after completes normally`)
+      assert.deepEqual(after.applyOptions, [], `${shape}: wholly-after with the clock still before the cutoff is held`)
+      assert.deepEqual(writes(), [], shape)
+      const later = await sweep([part(1, '2026-06-02T09:00:00')], { zoneless: 'europe-london', shape, verifier: false, clock: new Date('2026-06-02T10:00:00Z') })
+      assert.deepEqual(later.applyOptions, [undefined], `${shape}: once the clock has passed the cutoff it completes normally`)
       const straddle = await sweep([part(1, '2026-06-01')], { zoneless: 'europe-london', shape, verifier: false, clock: BEFORE_CUTOVER })
       assert.equal(straddle.out.counters.dispatched, 0, `${shape}: a straddling value is held`)
     })
@@ -1105,12 +1108,13 @@ test('ORDER LEVEL, CUTOFF STATE: no cutoff holds nothing; a future cutoff holds 
     assert.equal(run.out.counters.dispatched, 1, `no cutoff ${at}`)
     assert.deepEqual(run.applyOptions, [undefined], `no cutoff ${at}`)
   }
-  // a FUTURE cutoff: wholly before completes in IMS only, wholly after is normal, a straddling or unreadable value is held
+  // a FUTURE cutoff: wholly before completes in IMS only, wholly after is held until the clock passes it, a straddling or unreadable value is held
   const FUTURE = '2099-06-01T00:00:00Z'
   const before = await sweepAt(FUTURE, '2026-05-20T10:00:00')
   assert.deepEqual([before.out.counters.dispatched, before.applyOptions], [1, [{ storefrontAlreadyCompleted: true }]])
+  // wholly after a FUTURE cutoff while the clock is still before it: held (the completion would be shadowed and lost)
   const after = await sweepAt(FUTURE, '2099-06-02T09:00:00')
-  assert.deepEqual([after.out.counters.dispatched, after.applyOptions], [1, [undefined]])
+  assert.deepEqual([after.out.counters.dispatched, after.applyOptions], [0, []])
   for (const at of ['2099-06-01', '2026-13-45']) {
     const held = await sweepAt(FUTURE, at)
     assert.deepEqual([held.out.counters.dispatched, held.applyOptions], [0, []], at)

@@ -888,17 +888,18 @@ export function orderLevelDespatchDecision(
     else if (range.from.getTime() < cutoff.getTime()) return { action: 'hold', reason: 'its despatch time could fall either side of the storefront go-live instant' }
     else after = true
   }
-  if (!before) return { action: 'complete', storefrontAlreadyCompleted: false }
-  // MIXED (some despatch wholly before the cutoff, some wholly after it) is judged BEFORE the clock: the order's latest despatch is
-  // live, so IMS owns the completion, exactly as the split-part path treats a mixed order (any part pushed live: no "already
-  // completed" flag, normal completion through the producer seam and the outbound-hold gates). Waiting for the storefront to show it
-  // completed would refuse for ever when the earlier writer only handled its own pre-cutover part. But while IMS's own clock is still
-  // before the cutoff, a post-cutoff despatch time is not credible (and the flag would suppress a write that is owed): hold it until
-  // the clock passes the cutoff.
-  if (after) {
-    if (now.getTime() < cutoff.getTime()) return { action: 'hold', reason: 'it has a despatch dated after the storefront go-live instant while this system\'s clock is still before it' }
-    return { action: 'complete', storefrontAlreadyCompleted: false }
+  // ANY despatch dated at or after the cutoff (all-after or mixed) is judged against the clock FIRST: while IMS's own clock is still
+  // before the cutoff, such a time is not credible, and completing now would ship the order at a time the producer seam shadows
+  // (it judges the completion by the ship time), so the storefront completion would be lost for good. Hold it; the next sweep retries.
+  if (after && now.getTime() < cutoff.getTime()) {
+    return { action: 'hold', reason: 'it has a despatch dated after the storefront go-live instant while this system\'s clock is still before it' }
   }
+  if (!before) return { action: 'complete', storefrontAlreadyCompleted: false }
+  // MIXED (some despatch wholly before the cutoff, some wholly after it; the clock is now past the cutoff): the order's latest
+  // despatch is live, so IMS owns the completion, exactly as the split-part path treats a mixed order (any part pushed live: no
+  // "already completed" flag, normal completion through the producer seam and the outbound-hold gates). Waiting for the storefront
+  // to show it completed would refuse for ever when the earlier writer only handled its own pre-cutover part.
+  if (after) return { action: 'complete', storefrontAlreadyCompleted: false }
   if (now.getTime() < cutoff.getTime()) return { action: 'complete', storefrontAlreadyCompleted: true }
   // Despatched wholly before the cutover and swept after it: the caller verifies by the fresh read-only storefront look (the same
   // verifier as a split part) and completes IMS-only if it passes, otherwise holds.
