@@ -4874,3 +4874,16 @@ model FirstLoadApplyRun {
 
   @@map("first_load_apply_runs")
 }
+
+/// An open erasure obligation for a storefront order IMS does not hold yet: a WooCommerce-anonymised delivery for it was acknowledged or
+/// dropped (initial-import pending, a status or currency refusal, a withdrawal skip) while the order could still arrive from an older read.
+/// When that order is created it is created ALREADY ERASED and the row is retired in the same transaction. Ids only: no personal data.
+model StorefrontOrderErasureObligation {
+  connector       String
+  externalOrderId String
+  receivedAt      DateTime  @default(now())
+  retiredAt       DateTime?
+
+  @@id([connector, externalOrderId])
+  @@map("storefront_order_erasure_obligations")
+}

@@ -10,6 +10,7 @@
 import { db } from '@/lib/db'
 import { eraseOrderPersonalData } from '@/lib/domain/erasure/erase-personal-data'
 import { withWcFirstImportLock } from './first-import-lock'
+import { recordWcErasureObligation, retireWcErasureObligation } from './erasure-obligation'
 
 export class WcAnonymisationMirrorFailed extends Error {
   constructor() {
@@ -32,8 +33,13 @@ export async function mirrorWcAnonymisation(orderId: string): Promise<{ erasedNo
 export async function mirrorWcAnonymisationIfHeld(wcOrder: { id: number | string }): Promise<{ held: boolean }> {
   return withWcFirstImportLock(wcOrder.id, async () => {
     const link = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) }, select: { orderId: true } })
-    if (!link) return { held: false }
+    if (!link) {
+      // Acknowledged for an order IMS does not hold: the older read of it that an import may still be holding must create it erased.
+      await recordWcErasureObligation(wcOrder.id)
+      return { held: false }
+    }
     await mirrorWcAnonymisation(link.orderId)
+    await retireWcErasureObligation(wcOrder.id)
     return { held: true }
   })
 }

@@ -152,6 +152,9 @@ ERASURE_CLASSIFICATION.WmsSyncLog = {
   retained: { payload: 'NOT written for a return of an erased order (success and error rows alike). Rows written before an erasure are the raw-payload copies, a separate scope, and are not scrubbed here' },
 }
 
+// Keyed by the storefront order id only; it carries no personal data (named in the schema test: no relation reaches it).
+ERASURE_CLASSIFICATION.StorefrontOrderErasureObligation = { erased: [], notPersonal: ['connector', 'externalOrderId'], retained: {} }
+
 export function classifiedColumns(model: string): string[] {
   const c = ERASURE_CLASSIFICATION[model]
   return c ? [...c.erased, ...c.notPersonal, ...Object.keys(c.retained)] : []

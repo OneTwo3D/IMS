@@ -33,6 +33,7 @@
  */
 
 import { isWcOrderAnonymised } from './anonymisation'
+import { recordWcErasureObligation } from './erasure-obligation'
 import { WcFirstImportLockUnavailable, withWcFirstImportLock } from './first-import-lock'
 import { randomUUID } from 'node:crypto'
 
@@ -562,7 +563,12 @@ export async function importWcOrderGuarded<R extends { success: boolean }>(
   // against the committed state. If the lock cannot be had in time the delivery is reported unresolved, which every caller retries.
   if (isWcOrderAnonymised(wcOrder)) {
     try {
-      return await withWcFirstImportLock(wcOrder.id, () => importWcOrderGuardedLocked(wcOrder, runImport))
+      return await withWcFirstImportLock(wcOrder.id, async () => {
+        // Under the lock: a marked delivery for an order IMS does not hold leaves the durable obligation BEFORE the skip below can acknowledge it.
+        const link = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) }, select: { id: true } })
+        if (!link) await recordWcErasureObligation(wcOrder.id)
+        return importWcOrderGuardedLocked(wcOrder, runImport)
+      })
     } catch (e) {
       if (e instanceof WcFirstImportLockUnavailable) return { outcome: 'unresolved' }
       throw e
