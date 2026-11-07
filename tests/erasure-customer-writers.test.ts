@@ -120,6 +120,8 @@ test('every writer of shopping_sync_logs is in the census', () => {
 const CUSTOMER_LINK_CENSUS: Record<string, { writers: number; verdict: string }> = {
   'app/actions/sales.ts': { writers: 2, verdict: 'refuses (createSalesOrder, cloneSalesOrder)' },
   'lib/connectors/woocommerce/sync/order-import.ts': { writers: 1, verdict: 'unlinks (importWcOrder create transaction)' },
+  // Not a link: it SETS customerId to null. An order erased while its customer stays live (another live order) is unlinked in the erasure's transaction.
+  'lib/domain/erasure/erase-personal-data.ts': { writers: 1, verdict: 'unlinks (the erasure of an order whose customer stays live)' },
 }
 
 test('every path that links a customer to a sales order is in the census', () => {
