@@ -769,6 +769,23 @@ export async function applyExternalFulfillmentUpdate(
     }
   }
 
+  // RETRY OF A FENCED COMPLETION. Every shipment may already be SHIPPED while the order itself was left unflipped (a verification
+  // fence refused at the order flip after the shipment committed). No shipment is left to transition, so `updateShipmentStatus`
+  // (the only other place the order is reconciled) is never reached: reconcile the order here instead, under the order lock and with
+  // the FRESH fence, with no shipment transition and no stock work. Success is reported only once the order is flipped or already
+  // complete; a refusal is an apply error and the next sweep tries again. (The unfenced path is unchanged.)
+  if (update.targetShipmentStatus === 'SHIPPED' && update.storefrontAlreadyCompleted === true && update.shipFence && shipments.length === 0) {
+    const { reconcileOrderAfterShipment } = await import('@/lib/domain/sales/shipment-service')
+    const reconciliation = await reconcileOrderAfterShipment(db, { orderId: order.id }, undefined, {
+      completionAuthority: 'EXTERNAL',
+      storefrontCompletion: false,
+      fence: update.shipFence,
+    })
+    if (reconciliation.fenceRefused) {
+      return refuseExternalFulfillment('shipment_status_transition_failed', reconciliation.fenceRefused)
+    }
+  }
+
   await logActivity({
     entityType: 'SALES_ORDER',
     entityId: order.id,

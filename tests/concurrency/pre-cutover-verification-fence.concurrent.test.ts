@@ -18,13 +18,14 @@ const SKIP = process.env.RUN_DB_CONCURRENCY_TESTS !== '1'
 async function loadDeps() {
   config({ path: '.env.local', quiet: true })
   config({ quiet: true })
-  const [{ db }, shipments, reader, lock] = await Promise.all([
+  const [{ db }, shipments, reader, lock, external] = await Promise.all([
     import('@/lib/db'),
     import('@/lib/domain/sales/shipment-service'),
     import('@/lib/connectors/woocommerce/sync/pre-cutover-order-read'),
     import('@/lib/connectors/woocommerce/sync-lock'),
+    import('@/lib/fulfillment/external-fulfillment'),
   ])
-  return { db, transition: shipments.transitionShipmentStatus, reconcile: shipments.reconcileOrderAfterShipment, reader, versionKey: lock.WC_SETTINGS_VERSION_KEY }
+  return { db, transition: shipments.transitionShipmentStatus, reconcile: shipments.reconcileOrderAfterShipment, apply: external.applyExternalFulfillmentUpdate, reader, versionKey: lock.WC_SETTINGS_VERSION_KEY }
 }
 type Deps = Awaited<ReturnType<typeof loadDeps>>
 
@@ -144,6 +145,42 @@ test('FENCE AT THE ORDER FLIP: a link or line change between the shipment commit
     assert.equal(await orderStatus(), 'SHIPPED')
     const again = await deps.reconcile(deps.db, { orderId: f.orderId }, undefined, { completionAuthority: 'EXTERNAL', storefrontCompletion: false, fence: fresh })
     assert.equal(again.orderReachedShipped, undefined, 'flips once')
+    assert.equal(await movements(deps, f.productId), 1)
+  })
+})
+
+test('END TO END through applyExternalFulfillmentUpdate: a fence refusal at the order flip is retried by the next call with a fresh fence; a stale fence is refused again; exactly one stock movement', { skip: SKIP }, async () => {
+  await withFixture(async (deps, f, fence) => {
+    const orderRow = () => deps.db.salesOrder.findUniqueOrThrow({ where: { id: f.orderId }, select: { status: true, shippedAt: true } })
+    const stale = await fence()
+    // First call: the shipment fence passes, then the link changes before the order flip (the fence refuses on its second use).
+    let uses = 0
+    const refusingAtFlip: PreCutoverFence = async (tx) => {
+      uses += 1
+      if (uses === 2) await deps.db.shoppingOrderLink.updateMany({ where: { orderId: f.orderId }, data: { externalOrderId: `W${f.suffix}` } })
+      return stale(tx)
+    }
+    const request = (shipFence: PreCutoverFence) => deps.apply({ source: 'mintsoft', lookup: { orderId: f.orderId }, targetShipmentStatus: 'SHIPPED', storefrontAlreadyCompleted: true, shipFence })
+    const first = await request(refusingAtFlip)
+    assert.equal(first.success, false, JSON.stringify(first))
+    assert.equal(uses, 2)
+    assert.equal(await status(deps, f.shipmentId), 'SHIPPED')
+    assert.equal((await orderRow()).status, 'ALLOCATED', 'the order is not flipped')
+    assert.equal(await movements(deps, f.productId), 1)
+    // Retry with the STALE fence (built before the link changed): refused again, and it is an apply error, not a success.
+    const staleRetry = await request(stale)
+    assert.equal(staleRetry.success, false, 'a stale fence is refused again')
+    assert.equal((await orderRow()).status, 'ALLOCATED')
+    // Retry with a FRESH fence over the current state: the order flips, no shipment transition, no second stock movement.
+    const retry = await request(await fence())
+    assert.equal(retry.success, true, JSON.stringify(retry))
+    const flipped = await orderRow()
+    assert.equal(flipped.status, 'SHIPPED')
+    assert.equal(await movements(deps, f.productId), 1, 'exactly one stock movement in total')
+    // A further call is a no-op success: the order is not flipped again.
+    const again = await request(await fence())
+    assert.equal(again.success, true)
+    assert.equal((await orderRow()).shippedAt?.getTime(), flipped.shippedAt?.getTime())
     assert.equal(await movements(deps, f.productId), 1)
   })
 })
