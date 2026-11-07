@@ -184,3 +184,16 @@ test('END TO END through applyExternalFulfillmentUpdate: a fence refusal at the 
     assert.equal(await movements(deps, f.productId), 1)
   })
 })
+
+test('RETRY: an order cancelled after selection is an apply failure naming its status, never a recorded success', { skip: SKIP }, async () => {
+  await withFixture(async (deps, f, fence) => {
+    const request = (shipFence: PreCutoverFence) => deps.apply({ source: 'mintsoft', lookup: { orderId: f.orderId }, targetShipmentStatus: 'SHIPPED', storefrontAlreadyCompleted: true, shipFence })
+    const first = await deps.transition(deps.db, { shipmentId: f.shipmentId, targetStatus: 'SHIPPED' })
+    assert.equal(first.success, true)
+    await deps.db.salesOrder.update({ where: { id: f.orderId }, data: { status: 'CANCELLED' } })
+    const result = await request(await fence())
+    assert.equal(result.success, false)
+    assert.match(String((result as { error?: string }).error), /CANCELLED/)
+    assert.equal((await deps.db.salesOrder.findUniqueOrThrow({ where: { id: f.orderId }, select: { status: true } })).status, 'CANCELLED')
+  })
+})

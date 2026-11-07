@@ -173,6 +173,7 @@ async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'e
   const applyOptions: Array<Record<string, unknown> | undefined> = []
   const asked: Array<string | null> = []
   const fences: boolean[] = []
+  const fenceFns: Array<(tx: unknown) => Promise<string | null>> = []
   const out = await runWmsDispatchSweepCore({
     ...(options.zoneless ? {
       zonelessDespatchReading: options.zoneless,
@@ -195,7 +196,7 @@ async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'e
     countLinksByOrderNumber: async (numbers: string[]) => new Map(numbers.map((n) => [n, 1])),
     applyDispatch: async (_orderId: string, _tracking: unknown, opts?: Record<string, unknown>) => {
       // The verification's fence travels with the completion; recorded apart so the flag assertions stay about the flag.
-      if (opts && 'fence' in opts) { const { fence, ...rest } = opts; fences.push(typeof fence === 'function'); applyOptions.push(rest) } else { applyOptions.push(opts) }
+      if (opts && 'fence' in opts) { const { fence, ...rest } = opts; fences.push(typeof fence === 'function'); fenceFns.push(fence as never); applyOptions.push(rest) } else { applyOptions.push(opts) }
       return { success: true }
     },
     pushPartialShipment: async (orderId: string, input: { part: number; totalParts: number; items: Array<{ sku: string; qty: number }>; despatchedAt?: Date | null }) => {
@@ -210,7 +211,7 @@ async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'e
       },
     }),
   } as never)
-  return { out, applyOptions, asked, fences }
+  return { out, applyOptions, asked, fences, fenceFns }
 }
 
 const LIVE_AT_CUTOFF = { ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: CUTOFF }
@@ -982,6 +983,26 @@ test('ORDER LEVEL, VERIFIED: a non-split or merged order despatched wholly befor
       assert.equal(activity.filter((a) => a.action === 'pre_cutover_part_verified').length, 1, shape)
     })
   }
+})
+
+test('FENCE CAPTURE: the fence a verification returns passes on the state it saw and refuses a changed link, binding or line', async () => {
+  const AFTER = new Date('2026-07-01T00:00:00Z')
+  reset()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const run = await sweep([part(1, '2026-05-20T10:00:00')], { zoneless: 'europe-london', shape: 'single', clock: AFTER })
+    assert.equal(run.out.counters.dispatched, 1)
+    const fence = run.fenceFns[0]!
+    assert.equal(await fence(fakeDb), null, 'unchanged: passes')
+    link = { ...link!, externalOrderId: '556' }
+    assert.match(String(await fence(fakeDb)), /changed since the storefront verification/, 'link changed')
+    link = { externalOrderId: '555', externalOrderNumber: '1001', createdAt: T0 }
+    bindingValue = '3'; bindingChangedAt = new Date('2026-05-10T00:00:00Z')
+    assert.match(String(await fence(fakeDb)), /changed since/, 'binding changed')
+    bindingChangedAt = null; bindingValue = '2'
+    assert.equal(await fence(fakeDb), null, 'restored: passes again')
+    imsLines = [{ ...GOODS, qty: 2 }]
+    assert.match(String(await fence(fakeDb)), /changed since/, 'line quantity changed')
+  })
 })
 
 test('ORDER LEVEL, NOT VERIFIED: every verifier refusal holds the order pending with a clear reason, and nothing is written', async () => {

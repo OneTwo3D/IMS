@@ -784,6 +784,17 @@ export async function applyExternalFulfillmentUpdate(
     if (reconciliation.fenceRefused) {
       return refuseExternalFulfillment('shipment_status_transition_failed', reconciliation.fenceRefused)
     }
+    if (reconciliation.orderReachedShipped !== true) {
+      // Not flipped by this call: it must already BE shipped or complete. An order that became CANCELLED (or any other status that cannot
+      // be shipped) between selection and this retry is a mismatch to surface, never a recorded success.
+      const current = await db.salesOrder.findUnique({ where: { id: order.id }, select: { status: true } })
+      if (!current || !['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(String(current.status))) {
+        return refuseExternalFulfillment(
+          'shipment_status_transition_failed',
+          `The order could not be completed after verification: it is ${current ? String(current.status) : 'missing'}, not shipped`,
+        )
+      }
+    }
   }
 
   await logActivity({
