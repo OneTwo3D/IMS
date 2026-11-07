@@ -1888,7 +1888,9 @@ async function prepareSweep(db: Awaited<ReturnType<typeof loadDb>>, t: { after: 
     await db.activityLog.deleteMany({ where: { action: 'wc_anonymisation_sweep' } })
   })
   for (const [key, value] of [['wc_sync_order_statuses', '[]'], ['wc_initial_import_completed', 'true']] as const) await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
-  await db.setting.deleteMany({ where: { key: 'wc_erasure_sweep_cursor' } })
+  // The tests' orders are dated in the past: start the cursor just before them (the production default is seven days back, tested separately).
+  const startAt = new Date(Date.parse('2026-10-01T00:00:00Z') - 60_000).toISOString()
+  await db.setting.upsert({ where: { key: 'wc_erasure_sweep_cursor' }, create: { key: 'wc_erasure_sweep_cursor', value: JSON.stringify({ after: startAt }) }, update: { value: JSON.stringify({ after: startAt }) } })
 }
 
 const obligationIds = async (db: Awaited<ReturnType<typeof loadDb>>, ids: number[]) =>
@@ -2281,7 +2283,7 @@ test('[erasure] erasing a HELD order through the mirror retires an open obligati
   assert.ok((await db.storefrontOrderErasureObligation.findUniqueOrThrow({ where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(fx.externalId) } } })).retiredAt, 'retired after erasing the held order')
 })
 
-test('[erasure] the backstop cadence: due when never run, not due again within a day, due again while a budget stop left a backlog', { skip }, async (t) => {
+test('[erasure] the backstop cadence: due when never run, not due again within 6 hours, due again after 6 hours, and on every tick while a budget stop left a backlog', { skip }, async (t) => {
   const db = await loadDb()
   const keys = ['wc_erasure_sweep_last_run_at', 'wc_erasure_sweep_backlog']
   await prepareSweep(db, t, () => [])
@@ -2295,7 +2297,42 @@ test('[erasure] the backstop cadence: due when never run, not due again within a
   const second = await runWcErasureSweepIfDue()
   assert.deepEqual(second, { skipped: true, reason: 'not_due' })
   assert.equal(store.calls.length, 1, 'a tick that is not due adds no request')
+  const setLastRun = (hoursAgo: number) => db.setting.update({ where: { key: 'wc_erasure_sweep_last_run_at' }, data: { value: new Date(Date.now() - hoursAgo * 3_600_000).toISOString() } })
+  await setLastRun(5)
+  assert.deepEqual(await runWcErasureSweepIfDue(), { skipped: true, reason: 'not_due' }, 'five hours: still not due')
+  await setLastRun(7)
+  assert.ok(!('skipped' in (await runWcErasureSweepIfDue())), 'seven hours: due')
   await db.setting.upsert({ where: { key: 'wc_erasure_sweep_backlog' }, create: { key: 'wc_erasure_sweep_backlog', value: 'true' }, update: { value: 'true' } })
-  const third = await runWcErasureSweepIfDue()
-  assert.ok(!('skipped' in third), 'a backlog makes the next tick due')
+  assert.ok(!('skipped' in (await runWcErasureSweepIfDue())), 'a backlog makes the very next tick due')
+})
+
+test('[erasure] the FIRST run starts seven days back, not at the beginning of history', { skip }, async (t) => {
+  const db = await loadDb()
+  await prepareSweep(db, t, () => [])
+  await db.setting.deleteMany({ where: { key: 'wc_erasure_sweep_cursor' } })
+  const { sweepWcAnonymisedOrders, WC_ERASURE_SWEEP_INITIAL_LOOKBACK_MS } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  const store = fakeWooStore([])
+  wcFetchImpl = store.impl
+  const before = Date.now()
+  await sweepWcAnonymisedOrders()
+  const asked = Date.parse(`${store.calls[0]!.modified_after}Z`)
+  assert.ok(Math.abs(asked - (before - WC_ERASURE_SWEEP_INITIAL_LOOKBACK_MS)) < 5000, 'the first request asks for the last seven days')
+  // An explicit `since` sweeps further back when an operator needs it.
+  await sweepWcAnonymisedOrders({ since: new Date('2026-01-01T00:00:00Z') })
+  assert.equal(store.calls[1]!.modified_after, '2026-01-01T00:00:00')
+})
+
+test('[erasure] an order that FLIPS from unmarked to marked between two page reads of one run is evaluated, not skipped as already seen', { skip }, async (t) => {
+  const db = await loadDb()
+  const base = 1_950_000_000 + Math.floor(Math.random() * 40_000_000)
+  const orders: FakeOrder[] = Array.from({ length: 150 }, (_, i) => ({ id: base + i, mod: T0 + i * 10_000, marked: false }))
+  await prepareSweep(db, t, () => orders.map((o) => o.id))
+  const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  // Request 1 reads order index 10 unmarked. Before request 2, WooCommerce anonymises it: it is now marked and its modified time moves later.
+  const store = fakeWooStore(orders, (n) => { if (n === 2) { orders[10]!.marked = true; orders[10]!.mod = T0 + 5_000_000 } })
+  wcFetchImpl = store.impl
+  const result = await sweepWcAnonymisedOrders({ maxPages: 20 })
+  assert.equal(result.errors.length, 0)
+  assert.equal((await obligationIds(db, [orders[10]!.id])).has(orders[10]!.id), true, 'the marked version was evaluated and left its obligation')
+  assert.equal((await obligationIds(db, orders.filter((o) => !o.marked).map((o) => o.id))).size, 0, 'and nothing else did')
 })

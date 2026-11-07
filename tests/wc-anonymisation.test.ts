@@ -49,11 +49,12 @@ test('census: every caller of extractWcTracking is classified (WooCommerce keeps
   ])
 })
 
-test('census: the erasure sweep runs AFTER every existing reconcile step on its own cadence, and neither runWcReconcile nor syncNewWcOrders runs it', async () => {
+test('census: the erasure sweep rides the 15-minute wc-withdrawal-sweep job, last, and neither runWcReconcile, the wc-reconcile cron nor syncNewWcOrders runs it', async () => {
   const { readFileSync } = await import('node:fs')
-  const route = readFileSync('app/api/cron/wc-reconcile/route.ts', 'utf8')
-  assert.ok(route.indexOf('await runWcReconcile()') > 0 && route.indexOf('runWcErasureSweepIfDue()') > route.indexOf('await runWcReconcile()'), 'the cron route awaits the whole reconcile before the sweep')
-  assert.ok(!readFileSync('lib/connectors/woocommerce/sync/reconcile.ts', 'utf8').includes('anonymisation-sweep'), 'the reconcile steps are unchanged')
+  const route = readFileSync('app/api/cron/wc-withdrawal-sweep/route.ts', 'utf8')
+  assert.ok(route.indexOf('runWcErasureSweepIfDue()') > route.indexOf('drainWcOrderAdmissionRefusals()'), 'it runs after every existing step of the host job')
+  assert.ok(!readFileSync('app/api/cron/wc-reconcile/route.ts', 'utf8').includes('anonymisation-sweep'), 'the daily reconcile cron is unchanged')
+  assert.ok(!readFileSync('lib/connectors/woocommerce/sync/reconcile.ts', 'utf8').includes('anonymisation-sweep'), 'and so are the reconcile steps')
   assert.ok(!readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8').includes('anonymisation-sweep'), 'and the existing order sweep does not run the backstop, so its request pattern is unchanged')
   for (const file of ['app/api/shopping/manual-sync/route.ts', 'app/actions/wc-sync.ts']) {
     assert.ok(readFileSync(file, 'utf8').includes('runWcErasureSweep'), `${file} runs the backstop after a manual order reconcile`)

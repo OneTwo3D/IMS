@@ -42,8 +42,18 @@ import { mirrorWcAnonymisationIfHeld } from './anonymisation-mirror'
 export const WC_ERASURE_SWEEP_CURSOR_KEY = 'wc_erasure_sweep_cursor'
 export const WC_ERASURE_SWEEP_LAST_RUN_KEY = 'wc_erasure_sweep_last_run_at'
 export const WC_ERASURE_SWEEP_BACKLOG_KEY = 'wc_erasure_sweep_backlog'
-/** Once a day when caught up (the order reconcile's own cadence); every cron tick while a budget stop left work to resume. */
-export const WC_ERASURE_SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000
+/**
+ * Caught up: at most one run per 6 hours. A budget stop left work: every tick of the host job (the 15-minute wc-withdrawal-sweep), so the catch-up
+ * rate is WC_ERASURE_SWEEP_MAX_PAGES * WC_ERASURE_SWEEP_PER_PAGE = 500 orders per 15 minutes = 2000 orders per hour.
+ */
+export const WC_ERASURE_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000
+/**
+ * THE FIRST RUN STARTS SEVEN DAYS BACK, NOT AT THE BEGINNING OF HISTORY. Reason: production is being reinstalled and its first load imports orders
+ * fresh, where a marked order is created already erased; historical HELD orders on the stage do not need a backfill. A longer look-back would
+ * spend months of budgeted runs on history that has no work in it. To sweep further back if it is ever needed: set the setting
+ * `wc_erasure_sweep_cursor` to `{"after":"<ISO timestamp>"}` (the sweep resumes from there), or call `sweepWcAnonymisedOrders({ since })`.
+ */
+export const WC_ERASURE_SWEEP_INITIAL_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000
 /** The overlap between one request's lower bound and the last order read, so orders sharing a boundary second are re-read, not missed. */
 export const WC_ERASURE_SWEEP_OVERLAP_MS = 2000
 export const WC_ERASURE_SWEEP_PER_PAGE = 100
@@ -78,9 +88,9 @@ function gmtParam(ms: number): string {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, '')
 }
 
-async function loadState(): Promise<State> {
+async function loadState(nowMs: number): Promise<State> {
   const row = await db.setting.findUnique({ where: { key: WC_ERASURE_SWEEP_CURSOR_KEY } })
-  if (!row?.value) return { after: null }
+  if (!row?.value) return { after: new Date(nowMs - WC_ERASURE_SWEEP_INITIAL_LOOKBACK_MS).toISOString() }
   try {
     const parsed = JSON.parse(row.value) as State
     if (parsed && typeof parsed === 'object' && (parsed.after === null || typeof parsed.after === 'string')) return parsed
@@ -95,7 +105,7 @@ async function saveState(state: State): Promise<void> {
 }
 
 export async function sweepWcAnonymisedOrders(
-  options: { maxPages?: number; maxMs?: number; now?: () => number } = {},
+  options: { maxPages?: number; maxMs?: number; now?: () => number; since?: Date } = {},
 ): Promise<WcErasureSweepResult> {
   const maxPages = options.maxPages ?? WC_ERASURE_SWEEP_MAX_PAGES
   const maxMs = options.maxMs ?? WC_ERASURE_SWEEP_MAX_MS
@@ -105,7 +115,7 @@ export async function sweepWcAnonymisedOrders(
   const initial = await db.setting.findUnique({ where: { key: 'wc_initial_import_completed' } })
   if (initial?.value !== 'true') return result // nothing is held before the initial import
 
-  let state = await loadState()
+  let state: State = options.since ? { after: options.since.toISOString() } : await loadState(startedAt)
   const seen = new Set<number>()
   let caughtUp = false
 
@@ -133,10 +143,13 @@ export async function sweepWcAnonymisedOrders(
     for (const order of orders) {
       const modified = parseGmt(order.date_modified_gmt)
       if (modified !== null) lastMod = modified
-      if (seen.has(order.id)) continue
+      // An order already read this run is skipped ONLY while it is unmarked: a later MARKED version of it (WooCommerce anonymised it between two
+      // page reads) must always be evaluated, or the cursor would move past it. Evaluating a marked order is idempotent.
+      const marked = isWcOrderAnonymised(order)
+      if (!marked && seen.has(order.id)) continue
+      if (!seen.has(order.id)) result.scanned += 1
       seen.add(order.id)
-      result.scanned += 1
-      if (!isWcOrderAnonymised(order)) continue
+      if (!marked) continue
       try {
         // Decided UNDER the first-import lock: held -> erase (and retire the obligation); not held -> record the obligation.
         const mirrored = await mirrorWcAnonymisationIfHeld(order)

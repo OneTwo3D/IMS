@@ -86,7 +86,12 @@ export async function GET(request: Request) {
               + '— the rotation cursor was held, so they are re-screened next run',
         )
       }
-      return { ...sweep, dispatchScreen: recon ?? undefined, admissionRefusals }
+      // A FOURTH by-id backstop rides this job, and it runs LAST, after every step above: the WooCommerce anonymisation sweep (erasure). It reads the store
+      // by modified time on its own cursor, at most once per WC_ERASURE_SWEEP_INTERVAL_MS when caught up and on every tick while a budget stop left a
+      // backlog, inside its own 5-page / 60 s budget and the same Woo limiter. It never throws, so it cannot fail the steps above.
+      const { runWcErasureSweepIfDue } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+      const erasureSweep = await runWcErasureSweepIfDue()
+      return { ...sweep, dispatchScreen: recon ?? undefined, admissionRefusals, erasureSweep }
     },
   })
 
