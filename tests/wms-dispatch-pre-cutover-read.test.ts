@@ -988,6 +988,7 @@ test('ORDER LEVEL, VERIFIED: a non-split or merged order despatched wholly befor
 test('FENCE CAPTURE: the fence a verification returns passes on the state it saw and refuses a changed link, binding or line', async () => {
   const AFTER = new Date('2026-07-01T00:00:00Z')
   reset()
+  bindingChangedAt = new Date('2026-03-01T00:00:00Z') // a binding generation that exists, written before the order was linked
   await withEnv(LIVE_AT_CUTOFF, async () => {
     const run = await sweep([part(1, '2026-05-20T10:00:00')], { zoneless: 'europe-london', shape: 'single', clock: AFTER })
     assert.equal(run.out.counters.dispatched, 1)
@@ -996,12 +997,29 @@ test('FENCE CAPTURE: the fence a verification returns passes on the state it saw
     link = { ...link!, externalOrderId: '556' }
     assert.match(String(await fence(fakeDb)), /changed since the storefront verification/, 'link changed')
     link = { externalOrderId: '555', externalOrderNumber: '1001', createdAt: T0 }
-    bindingValue = '3'; bindingChangedAt = new Date('2026-05-10T00:00:00Z')
-    assert.match(String(await fence(fakeDb)), /changed since/, 'binding changed')
-    bindingChangedAt = null; bindingValue = '2'
+    bindingValue = '3'
+    assert.match(String(await fence(fakeDb)), /changed since/, 'binding value changed')
+    bindingValue = '2'; bindingChangedAt = new Date('2026-03-02T00:00:00Z')
+    assert.match(String(await fence(fakeDb)), /changed since/, 'binding rewritten')
+    bindingChangedAt = new Date('2026-03-01T00:00:00Z')
     assert.equal(await fence(fakeDb), null, 'restored: passes again')
     imsLines = [{ ...GOODS, qty: 2 }]
     assert.match(String(await fence(fakeDb)), /changed since/, 'line quantity changed')
+  })
+})
+
+test('ORDER LEVEL, UNDATED NEXT TO PRE-CUTOVER: an undated entry that cannot predate the cutover counts as after it, so the order is IMS-owned and is not sent to verification', async () => {
+  const AFTER = new Date('2026-07-01T00:00:00Z')
+  reset()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const mixed: Part = {
+      externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', dispatched: true,
+      tracking: [{ trackingNumber: 'TN-1', carrier: 'DPD', despatchedAt: '2026-05-20T10:00:00' }, { trackingNumber: 'TN-2', carrier: 'DPD', despatchedAt: '' }],
+    }
+    const run = await sweep([mixed], { zoneless: 'europe-london', shape: 'single', clock: AFTER, lowerBound: new Date('2026-06-05T00:00:00Z') })
+    assert.equal(run.out.counters.dispatched, 1)
+    assert.deepEqual(run.applyOptions, [undefined])
+    assert.deepEqual(run.asked, [])
   })
 })
 

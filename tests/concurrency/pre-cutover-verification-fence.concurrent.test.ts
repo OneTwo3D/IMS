@@ -1,7 +1,7 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import test from 'node:test'
+import test, { mock } from 'node:test'
 import { config } from 'dotenv'
 import type { PreCutoverFence } from '@/lib/connectors/woocommerce/sync/pre-cutover-order-read'
 
@@ -14,6 +14,9 @@ import type { PreCutoverFence } from '@/lib/connectors/woocommerce/sync/pre-cuto
  * Gated behind RUN_DB_CONCURRENCY_TESTS=1: `npm run test:concurrency`.
  */
 const SKIP = process.env.RUN_DB_CONCURRENCY_TESTS !== '1'
+
+// revalidatePath needs a Next.js request context; outside one it throws AFTER the work is done, which would mask the result.
+mock.module('next/cache', { namedExports: { revalidatePath: () => undefined, revalidateTag: () => undefined } })
 
 async function loadDeps() {
   config({ path: '.env.local', quiet: true })
@@ -163,6 +166,7 @@ test('END TO END through applyExternalFulfillmentUpdate: a fence refusal at the 
     const request = (shipFence: PreCutoverFence) => deps.apply({ source: 'mintsoft', lookup: { orderId: f.orderId }, targetShipmentStatus: 'SHIPPED', storefrontAlreadyCompleted: true, shipFence })
     const first = await request(refusingAtFlip)
     assert.equal(first.success, false, JSON.stringify(first))
+    assert.match(String((first as { error?: string }).error), /changed since the storefront verification/, 'refused by the fence, not by something else')
     assert.equal(uses, 2)
     assert.equal(await status(deps, f.shipmentId), 'SHIPPED')
     assert.equal((await orderRow()).status, 'ALLOCATED', 'the order is not flipped')
@@ -170,6 +174,7 @@ test('END TO END through applyExternalFulfillmentUpdate: a fence refusal at the 
     // Retry with the STALE fence (built before the link changed): refused again, and it is an apply error, not a success.
     const staleRetry = await request(stale)
     assert.equal(staleRetry.success, false, 'a stale fence is refused again')
+    assert.match(String((staleRetry as { error?: string }).error), /changed since the storefront verification/)
     assert.equal((await orderRow()).status, 'ALLOCATED')
     // Retry with a FRESH fence over the current state: the order flips, no shipment transition, no second stock movement.
     const retry = await request(await fence())
