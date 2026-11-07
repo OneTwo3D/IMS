@@ -79,14 +79,19 @@ export async function scrubRawPayloadsInTx(tx: Client, subject: RawPayloadSubjec
   // (BEFORE the projection: it neutralises the customer id the rows are found by.) DELIVERIES FOR AN ORDER IMS DOES NOT HOLD (found through the customer id): the later-write guard, the reconcile and a later import look an order up
   // by its link or by an open erasure obligation, so without one a redelivery of that order would be stored in full and the order created identifiable.
   // The obligation is order-keyed and carries no personal data; it is recorded here, in the same transaction, for every such storefront order id.
+  const obligated: string[] = []
   if (subject.storefrontCustomerIds.length > 0) {
+    // The queue snapshots of the same person's orders IMS never imported carry the customer id inside `order`: their order ids are found too.
+    const queued = await tx.$queryRaw<Array<{ k: string | null }>>`
+      SELECT DISTINCT l."externalId" AS k FROM "shopping_sync_logs" l WHERE (l."payload"->'order'->>'customer_id') = ANY(${text(subject.storefrontCustomerIds)})`
     const keys = await tx.$queryRaw<Array<{ k: string }>>`
       SELECT DISTINCT gdpr_webhook_order_key(w."payloadJson", w."resource") AS k FROM "shopping_webhook_events" w
        WHERE ${webhookWhere({ storefrontOrderIds: [], storefrontCustomerIds: subject.storefrontCustomerIds })}`
-    const candidates = keys.map((r) => r.k).filter((k) => /^[0-9]+$/.test(k) && !subject.storefrontOrderIds.includes(k))
+    const candidates = [...keys.map((r) => r.k), ...queued.map((r) => r.k ?? '')].filter((k) => /^[0-9]+$/.test(k) && !subject.storefrontOrderIds.includes(k))
     if (candidates.length > 0) {
       const held = new Set((await tx.shoppingOrderLink.findMany({ where: { connector: 'woocommerce', externalOrderId: { in: candidates } }, select: { externalOrderId: true } })).map((l) => l.externalOrderId))
       for (const id of candidates.filter((k) => !held.has(k))) {
+        obligated.push(id)
         await tx.storefrontOrderErasureObligation.upsert({
           where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: id } },
           create: { connector: 'woocommerce', externalOrderId: id },
@@ -106,13 +111,15 @@ export async function scrubRawPayloadsInTx(tx: Client, subject: RawPayloadSubjec
     if (Number(left[0]?.n ?? 0) > 0) throw new Error('Raw webhook payload projection incomplete')
   }
 
-  for (const ids of chunks(subject.orderIds)) {
+  // The storefront orders the sweep keys no-entityId rows by: the subject's linked ones AND the ones just obligated (customer-only, unimported).
+  const sweepStorefrontIds = [...new Set([...subject.storefrontOrderIds, ...obligated])]
+  for (const ids of subject.orderIds.length > 0 ? chunks(subject.orderIds) : [[] as string[]]) {
     const found = await tx.shoppingSyncLog.findMany({
       where: {
         connector: 'woocommerce',
         OR: [
           { entityType: { in: ['SalesOrder', 'ORDER'] }, entityId: { in: ids } },
-          ...(subject.storefrontOrderIds.length > 0 ? [{ entityType: 'SalesOrder', entityId: null, externalId: { in: subject.storefrontOrderIds } }] : []),
+          ...(sweepStorefrontIds.length > 0 ? [{ entityType: 'SalesOrder', entityId: null, externalId: { in: sweepStorefrontIds } }] : []),
         ],
       },
       select: { id: true },

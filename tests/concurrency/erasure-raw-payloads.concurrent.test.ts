@@ -493,13 +493,21 @@ test('[raw payloads] fee and item names: a personalised name is dropped, a credi
     fee_lines: [
       { id: 1, name: `Gift wrap for ${NAME.first}`, tax_class: '', tax_status: 'taxable', total: '2.00', total_tax: '0.40', taxes: [], meta_data: [{ id: 1, key: '_wclc_fee', value: 'yes' }, { id: 2, key: '_wclc_fee_kind', value: 'duty' }, { id: 3, key: 'note', value: NAME.last }] },
       { id: 2, name: 'Store Credit', tax_class: '', tax_status: 'none', total: '-5.00', total_tax: '0.00', taxes: [], meta_data: [] },
+      { id: 3, name: `Gift card for ${NAME.first} ${NAME.last} (${EMAIL})`, tax_class: '', tax_status: 'none', total: '-3.00', total_tax: '0.00', taxes: [], meta_data: [] },
+      { id: 4, name: `TeraWallet payment ${NAME.last}`, tax_class: '', tax_status: 'none', total: '-1.00', total_tax: '0.00', taxes: [], meta_data: [] },
     ],
   })
   const p = (await db.$queryRaw<Array<{ p: Record<string, unknown> }>>`SELECT gdpr_project_wc_order(${JSON.stringify(sample)}::jsonb) AS p`)[0]!.p as { fee_lines: Array<{ name: string; total: string; meta_data: Array<{ key: string }> }> }
   assert.deepEqual(leaks(p), [])
   assert.equal(p.fee_lines[0]!.name, 'Fee'); assert.equal(p.fee_lines[0]!.total, '2.00')
   assert.deepEqual(p.fee_lines[0]!.meta_data.map((m) => m.key), ['_wclc_fee', '_wclc_fee_kind'])
-  assert.equal(p.fee_lines[1]!.name, 'Store Credit', 'the credit wording the classifier reads is kept')
+  assert.equal(p.fee_lines[1]!.name, 'Store credit', 'a credit fee gets a FIXED label, never the original text')
+  assert.equal(p.fee_lines[2]!.name, 'Gift card'); assert.equal(p.fee_lines[3]!.name, 'Wallet')
+  // the classifier reaches the same verdict on the projected fees as on the originals
+  const { classifyWcCouponLines } = await import('@/lib/connectors/woocommerce/sync/coupon-classification')
+  const verdict = (fees: unknown) => classifyWcCouponLines([], [], fees as never).signalProblems.length
+  assert.equal(verdict(p.fee_lines), verdict((sample as unknown as { fee_lines: unknown }).fee_lines), 'classification unchanged')
+  assert.ok(verdict(p.fee_lines) >= 3, 'PRECONDITION: the negative credit fees are problems both ways')
   // the refund line name too
   const r = (await db.$queryRaw<Array<{ p: { line_items: Array<{ name: string }> } }>>`SELECT gdpr_project_wc_refund(${JSON.stringify({ ...rawRefund(fx), line_items: [{ ...rawRefund(fx).line_items[0], name: `Mug for ${NAME.first}` }] })}::jsonb) AS p`)[0]!.p
   assert.deepEqual(leaks(r), [])
@@ -519,12 +527,19 @@ test('[raw payloads] a delivery for an order IMS does not hold, found only throu
     await fx.cleanup()
   })
   const rows = await seedRaw(db, fx, cleanups)
+  // An EXISTING pending-FX queue row for the customer-only order (no entity id; the customer id sits inside the snapshot).
+  const rateForQueue = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const queuedUnheld = await db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', externalId: String(unheldId), errorMessage: `rate missing for ${FULL_NAME}`,
+    payload: { reason: 'missing_fx_rate', connector: 'woocommerce', externalOrderId: String(unheldId), externalOrderNumber: String(unheldId), currency: 'GBP', asOf: null, order: rawOrder(fx, rateForQueue, { id: unheldId }) } as never } })
   assert.equal(await db.storefrontOrderErasureObligation.count({ where: { externalOrderId: String(unheldId) } }), 0, 'PRECONDITION: no obligation yet')
   const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
   assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
   assert.deepEqual(leaks(await ev(db, rows.inboxCustomerOnly)), [], 'the delivery found by customer id is projected')
   const ob = await db.storefrontOrderErasureObligation.findUnique({ where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(unheldId) } } })
   assert.ok(ob && ob.retiredAt === null, 'an open obligation names the unheld order')
+  const queuedAfter = await lg(db, queuedUnheld.id)
+  assert.deepEqual(leaks(queuedAfter), [], 'an existing queue row for the customer-only order is projected at erasure')
+  assert.equal((queuedAfter.payload as { externalOrderId: string }).externalOrderId, String(unheldId))
   assert.equal(await db.storefrontOrderErasureObligation.count({ where: { externalOrderId: String(fx.externalId) } }), 0, 'no obligation for the order IMS holds (its link is enough)')
   // A later delivery of that order is projected on insert (trigger sees the obligation) ...
   const rate = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)

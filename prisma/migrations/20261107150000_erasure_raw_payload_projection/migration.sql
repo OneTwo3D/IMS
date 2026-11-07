@@ -45,7 +45,7 @@ $$;
 
 -- Each element of an array reduced to `keys`, plus a projected meta_data when with_meta; `only_keys` limits that meta (NULL = the allowlist).
 -- name_mode says what becomes of the element's free-text `name` (a personalised item can carry a recipient's name): 'sku' = the SKU (else 'Item'),
--- 'fee' = kept only when it reads as store credit / gift card / wallet (the coupon classifier reads it), else 'Fee'; anything else = no name.
+-- 'fee' = a FIXED label per credit kind the coupon classifier reads (Smart coupon / Store credit / Gift card / Wallet; never the original text), else 'Fee'; anything else = no name.
 -- parent_name is always dropped. Not an array -> [].
 CREATE OR REPLACE FUNCTION gdpr_project_lines(arr jsonb, keys text[], with_meta boolean, only_keys text[], name_mode text DEFAULT 'none') RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE WHEN arr IS NULL OR jsonb_typeof(arr) <> 'array' THEN '[]'::jsonb ELSE COALESCE((
@@ -53,7 +53,12 @@ CREATE OR REPLACE FUNCTION gdpr_project_lines(arr jsonb, keys text[], with_meta 
         || CASE WHEN with_meta AND l ? 'meta_data' THEN jsonb_build_object('meta_data', gdpr_project_meta(l->'meta_data', only_keys)) ELSE '{}'::jsonb END
         || CASE name_mode
              WHEN 'sku' THEN jsonb_build_object('name', COALESCE(NULLIF(l->>'sku', ''), 'Item'))
-             WHEN 'fee' THEN jsonb_build_object('name', CASE WHEN (l->>'name') ~* 'smart[_ -]?coupon|store[_ -]?credit|gift[_ -]?(card|cert)|giftcard|wallet' THEN l->'name' ELSE to_jsonb('Fee'::text) END)
+             WHEN 'fee' THEN jsonb_build_object('name', to_jsonb(CASE
+               WHEN (l->>'name') ~* 'smart[_ -]?coupon' THEN 'Smart coupon'
+               WHEN (l->>'name') ~* 'store[_ -]?credit' THEN 'Store credit'
+               WHEN (l->>'name') ~* 'gift[_ -]?(card|cert)|giftcard' THEN 'Gift card'
+               WHEN (l->>'name') ~* 'wallet' THEN 'Wallet'
+               ELSE 'Fee' END))
              ELSE '{}'::jsonb END
         ORDER BY ord)
       FROM jsonb_array_elements(arr) WITH ORDINALITY AS t(l, ord)
