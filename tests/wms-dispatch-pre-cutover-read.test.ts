@@ -172,6 +172,7 @@ async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'e
   const { verifyPreCutoverCompletionByFreshRead } = await import('@/lib/connectors/woocommerce/sync/pre-cutover-order-read')
   const applyOptions: Array<Record<string, unknown> | undefined> = []
   const asked: Array<string | null> = []
+  const fences: boolean[] = []
   const out = await runWmsDispatchSweepCore({
     ...(options.zoneless ? {
       zonelessDespatchReading: options.zoneless,
@@ -192,7 +193,11 @@ async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'e
     repointLink: async () => {},
     clearDispatchFailures: async () => {},
     countLinksByOrderNumber: async (numbers: string[]) => new Map(numbers.map((n) => [n, 1])),
-    applyDispatch: async (_orderId: string, _tracking: unknown, opts?: Record<string, unknown>) => { applyOptions.push(opts); return { success: true } },
+    applyDispatch: async (_orderId: string, _tracking: unknown, opts?: Record<string, unknown>) => {
+      // The verification's fence travels with the completion; recorded apart so the flag assertions stay about the flag.
+      if (opts && 'fence' in opts) { const { fence, ...rest } = opts; fences.push(typeof fence === 'function'); applyOptions.push(rest) } else { applyOptions.push(opts) }
+      return { success: true }
+    },
     pushPartialShipment: async (orderId: string, input: { part: number; totalParts: number; items: Array<{ sku: string; qty: number }>; despatchedAt?: Date | null }) => {
       const result = await pushPartialShipmentToShopping(orderId, input as never)
       return { ok: result.success, error: result.error, ...(result.shadowed === true ? { shadowed: true } : {}), ...(result.shadowReason ? { shadowReason: result.shadowReason } : {}) }
@@ -205,7 +210,7 @@ async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'e
       },
     }),
   } as never)
-  return { out, applyOptions, asked }
+  return { out, applyOptions, asked, fences }
 }
 
 const LIVE_AT_CUTOFF = { ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: CUTOFF }
@@ -217,6 +222,7 @@ test('VERIFIED: completed now, completion at or after the LATEST despatch: the I
     assert.equal(run.out.counters.dispatched, 1)
     assert.deepEqual(run.applyOptions, [{ storefrontAlreadyCompleted: true }])
     assert.deepEqual(run.asked, [new Date(PRE2).toISOString()], 'asked once, against the LATEST despatch among the parts (not once per part)')
+    assert.deepEqual(run.fences, [true], 'the split path carries the fence too')
     assert.deepEqual(reads(), [ORDER_READ], 'one read of the linked order for the whole order, though two parts were shadowed')
     assert.deepEqual(writes(), [])
     const logged = activity.filter((a) => a.action.startsWith('pre_cutover_part_'))
@@ -967,6 +973,7 @@ test('ORDER LEVEL, VERIFIED: a non-split or merged order despatched wholly befor
       assert.equal(run.out.counters.dispatched, 1, shape)
       assert.deepEqual(run.applyOptions, [{ storefrontAlreadyCompleted: true }], shape)
       assert.deepEqual(run.asked, ['2026-05-20T09:00:00.000Z'], `${shape}: asked once, with the exact UK-converted despatch instant`)
+      assert.deepEqual(run.fences, [true], `${shape}: the verification's fence travels with the completion into applyDispatch`)
       assert.deepEqual(reads(), [ORDER_READ], shape)
       assert.deepEqual(writes(), [], `${shape}: no storefront write`)
       assert.equal(activity.filter((a) => a.action === 'pre_cutover_part_verified').length, 1, shape)

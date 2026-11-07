@@ -1,3 +1,4 @@
+import type { ShipmentServiceClient } from '@/lib/domain/sales/shipment-service'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -41,6 +42,11 @@ export type ExternalFulfillmentUpdate = {
    * was verified; a mixed order completes normally.
    */
   storefrontAlreadyCompleted?: boolean
+  /**
+   * With `storefrontAlreadyCompleted`: re-checked inside the transaction that ships the order, under the order lock. A non-null answer
+   * refuses the dispatch (what the verification proved no longer holds), so nothing is shipped on a stale proof.
+   */
+  shipFence?: (tx: ShipmentServiceClient) => Promise<string | null>
 }
 
 /**
@@ -740,6 +746,7 @@ export async function applyExternalFulfillmentUpdate(
           // completion must never push back, as it would only echo.
           storefrontCompletion: isWmsConnectorId(update.source) && update.storefrontAlreadyCompleted !== true,
           skipStorefrontPush: update.storefrontAlreadyCompleted === true,
+          ...(update.storefrontAlreadyCompleted === true && update.shipFence ? { shipFence: update.shipFence } : {}),
         },
       )
 

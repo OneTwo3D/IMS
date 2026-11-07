@@ -1,5 +1,6 @@
 'use server'
 
+import type { ShipmentServiceClient } from '@/lib/domain/sales/shipment-service'
 import { revalidatePath } from 'next/cache'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
@@ -1567,6 +1568,8 @@ export async function updateShipmentStatus(
      * after cutover; it sets an absolute level). Never set by an in-app dispatch.
      */
     skipStorefrontPush?: boolean
+    /** Re-checked under the order lock inside the SHIPPED transaction; a non-null answer refuses the dispatch. */
+    shipFence?: (tx: ShipmentServiceClient) => Promise<string | null>
   },
 ): Promise<{ success: boolean; error?: string }> {
   try {
@@ -1577,6 +1580,7 @@ export async function updateShipmentStatus(
       shipmentId,
       targetStatus,
       extra,
+      ...(targetStatus === 'SHIPPED' && options?.shipFence ? { fence: options.shipFence } : {}),
     })
     if (!result.success) {
       try {

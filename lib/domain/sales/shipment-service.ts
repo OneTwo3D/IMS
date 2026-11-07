@@ -1063,6 +1063,8 @@ export async function transitionShipmentStatus(
     shipmentId: string
     targetStatus: string
     extra?: { trackingNumber?: string; shippingService?: string }
+    /** Run under the order lock inside the SHIPPED transaction: a non-null answer refuses the transition with that reason. */
+    fence?: (tx: ShipmentServiceClient) => Promise<string | null>
   },
 ): Promise<ShipmentTransitionResult> {
   const { shipmentId, targetStatus, extra } = input
@@ -1099,6 +1101,10 @@ export async function transitionShipmentStatus(
       await tx.$queryRaw(
         Prisma.sql`SELECT id FROM "shipments" WHERE id = ${shipmentId} FOR UPDATE`,
       )
+      if (input.fence) {
+        const refused = await input.fence(tx)
+        if (refused !== null) return { success: false as const, error: refused }
+      }
 
       // o3d-e1yb [wdraw]: the LAST line of defence for an approved EU
       // withdrawal, and the only one that is atomic with the irreversible act.
