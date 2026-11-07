@@ -1992,3 +1992,86 @@ test('[erasure] the customer step is atomic with the order create: a failure aft
   assert.equal((await db.customer.findUniqueOrThrow({ where: { id: okOrder.customerId! } })).email, `ok.${tag}@example.test`)
   assert.equal(await db.shoppingCustomerLink.count({ where: { externalCustomerId: String(okWooCustomerId), customerId: okOrder.customerId! } }), 1, 'and the storefront link was written')
 })
+
+// ---------------------------------------------------------------------------------------------------------------------
+// A MARKED DELIVERY IS NEVER DECIDED BY AN UNLOCKED "IS THERE AN ORDER?" READ (Codex R5): an unmarked first import is paused INSIDE the
+// first-import lock (in its create transaction, order not committed) while the marked delivery arrives by each route that used to skip or
+// acknowledge it before the lock. It must wait for the in-flight import and then erase what it committed.
+// ---------------------------------------------------------------------------------------------------------------------
+
+type MarkedRoute = { name: string; deliver: (externalId: number, wcRateId: number) => Promise<unknown> }
+
+const MARKED_ROUTES: MarkedRoute[] = [
+  {
+    name: 'a withdrawal-status delivery through the withdrawal wrapper (used to be skipped as "never imported" and acknowledged)',
+    deliver: async (externalId, wcRateId) => {
+      const { getWithdrawalStatuses, importWcOrderGuarded } = await import('@/lib/connectors/woocommerce/sync/withdrawal')
+      const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+      const { submitted } = await getWithdrawalStatuses()
+      const marked = { ...anonymisedPayload(externalId, wcRateId), status: submitted }
+      const guarded = await importWcOrderGuarded(marked as never, () => importWcOrder(marked as never))
+      assert.notEqual(guarded.outcome, 'skipped-withdrawal', 'the marked delivery was not skipped on an unlocked read')
+      return guarded
+    },
+  },
+  {
+    name: 'a delivery in a status the operator has not ticked (used to be refused by the admission gate before the lock)',
+    deliver: async (externalId, wcRateId) => {
+      const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+      return importWcOrder({ ...anonymisedPayload(externalId, wcRateId), status: 'cancelled' } as never)
+    },
+  },
+  {
+    name: 'the initial-import-pending path (mirrors onto a held order instead of dropping the delivery)',
+    deliver: async (externalId) => {
+      const { mirrorWcAnonymisationIfHeld } = await import('@/lib/connectors/woocommerce/sync/anonymisation-mirror')
+      return mirrorWcAnonymisationIfHeld({ id: externalId })
+    },
+  },
+]
+
+for (const [index, route] of MARKED_ROUTES.entries()) {
+  test(`[erasure] a marked delivery arriving while an unmarked first import is in flight waits for it and erases the order: ${route.name}`, { skip }, async (t) => {
+    const db = await loadDb()
+    const fx = await importFixture(db)
+    const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+    const externalId = fx.externalId + 101 + index
+    const tag = randomUUID().slice(0, 8)
+    const subject = { ...WC_ADDRESS, first_name: `Inflight${tag}`, last_name: `Subject${tag}`, email: `inflight.${tag}@example.test` }
+    const wooCustomerId = 300_000_000 + Math.floor(Math.random() * 90_000_000)
+    t.after(async () => {
+      beforeUpsertCustomer = null
+      await db.shoppingCustomerLink.deleteMany({ where: { externalCustomerId: String(wooCustomerId) } })
+      await cleanupImported(db, [externalId])
+      await db.customer.deleteMany({ where: { OR: [{ email: subject.email }, { lastName: subject.last_name }] } })
+      await fx.cleanup()
+    })
+    const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+    const unmarked = { ...payload(externalId, wcRateId), customer_id: wooCustomerId, billing: subject, shipping: subject }
+
+    // Pause the unmarked first import inside its create transaction, which is inside the first-import lock.
+    let reached!: () => void
+    const atHook = new Promise<void>((r) => { reached = r })
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    beforeUpsertCustomer = async () => { beforeUpsertCustomer = null; reached(); await gate }
+    const first = importWcOrder(unmarked as never)
+    await atHook
+    assert.equal(await db.shoppingOrderLink.count({ where: { connector: 'woocommerce', externalOrderId: String(externalId) } }), 0, 'the in-flight import has committed nothing yet')
+
+    let done = false
+    const second = route.deliver(externalId, wcRateId).then((r) => { done = true; return r })
+    await new Promise((r) => setTimeout(r, 1500))
+    assert.equal(done, false, 'the marked delivery is waiting for the in-flight import, not acknowledged on a read that says "no order"')
+    release()
+    await first
+    await second
+
+    const link = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })
+    const order = await db.salesOrder.findUniqueOrThrow({ where: { id: link.orderId } })
+    assert.ok(order.erasedAt, 'the order the in-flight import committed was erased')
+    assert.deepEqual([order.customerName, order.customerEmail, order.billingAddress, order.shippingAddress, order.notes], ['GDPR Anonymised', null, null, null, null])
+    assert.equal(await db.customer.count({ where: { OR: [{ email: subject.email }, { lastName: subject.last_name }, { firstName: subject.first_name }] } }), 0, 'no customer holds the identity')
+    assert.equal(await db.shoppingCustomerLink.count({ where: { externalCustomerId: String(wooCustomerId) } }), 0, 'no storefront link survives')
+  })
+}
