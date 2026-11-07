@@ -1708,13 +1708,23 @@ test('[erasure] the mirror erases the marked order, keeps a customer who has ano
   const secondOrder = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(second) }, select: { orderId: true } })
   assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: secondOrder.orderId } })).customerId, fx.customerId, 'both orders belong to one customer')
 
+  const pre = await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
   // The marked delivery for the FIRST order. The payload still carries the placeholders and customer_id 0.
   assert.equal((await importWcOrder(anonymisedPayload(fx.externalId, wcRateId) as never)).success, true)
   const first = await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
   assert.deepEqual([first.customerName, first.customerEmail, first.customerVatNumber, first.billingAddress, first.shippingAddress, first.notes, first.trackingNumber, first.internalNotes],
     ['GDPR Anonymised', null, null, null, null, null, null, null], 'the order is erased and the placeholders were not written back')
-  assert.equal(first.customerId, fx.customerId, 'customer_id 0 did not unlink the order')
+  assert.equal(first.customerId, null, 'the erased order is UNLINKED from the customer who stays live (as WooCommerce does with customer_id 0): the live customer no longer lists it')
+  const { getCustomerDetail } = await import('@/app/actions/customers')
+  const detail = await getCustomerDetail(fx.customerId)
+  assert.deepEqual(detail!.orders.map((o) => o.id), [secondOrder.orderId], 'the live customer lists only its other order')
+  assert.equal(await db.salesOrder.count({ where: { customerId: fx.customerId } }), 1)
+  assert.equal(first.currency, 'GBP')
   assert.equal(first.totalForeign.toString(), '126', 'the money stays')
+  for (const col of ['totalForeign', 'totalBase', 'taxForeign', 'taxBase', 'subtotalBase', 'orderNumber', 'externalOrderNumber', 'currency', 'invoiceNumber', 'invoicePdfPath', 'status'] as const) {
+    assert.equal(String((first as Record<string, unknown>)[col]), String((pre as Record<string, unknown>)[col]), `${col} is retained`)
+  }
+  assert.equal(await db.salesOrderLine.count({ where: { orderId: fx.orderId } }), 1, 'the lines stay')
   let customer = await db.customer.findUniqueOrThrow({ where: { id: fx.customerId } })
   assert.equal(customer.gdprAnonymisedAt, null, 'the customer keeps another live order: not erased')
   assert.equal(customer.email, EMAIL)
@@ -1730,6 +1740,19 @@ test('[erasure] the mirror erases the marked order, keeps a customer who has ano
   assert.equal((await importWcOrder(anonymisedPayload(fx.externalId, wcRateId) as never)).success, true)
   assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })).erasedAt!.getTime(), stamp, 'erasedAt not rewritten')
   assert.equal((await proofRows(db, [fx.orderId, fx.customerId])).length, 1, 'no second proof row')
+
+  // NOTHING RE-LINKS IT: an unmarked redelivery of the erased order (the update path), and a NEW order from the same live customer, leave it unlinked.
+  assert.equal((await importWcOrder(payload(fx.externalId, wcRateId) as never)).success, true)
+  const third = fx.externalId + 33
+  t.after(async () => { await cleanupImported(db, [third], { keepCustomers: true }) })
+  assert.equal((await importWcOrder(payload(third, wcRateId) as never)).success, true)
+  const thirdOrder = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(third) }, select: { orderId: true } })
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: thirdOrder.orderId } })).customerId, fx.customerId, 'the new order links to the live customer')
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })).customerId, null, 'the erased order stays unlinked')
+  const proofMeta = (await proofRows(db, [fx.orderId]))[0]!.metadata as { customerId: unknown }
+  assert.equal(proofMeta.customerId, null, 'the proof does not name the live customer')
+  // The third order is a live order of the customer now: erase it as well so the later "last live order" step below still sees exactly two to go.
+  await db.salesOrder.update({ where: { id: thirdOrder.orderId }, data: { erasedAt: new Date(), customerId: null } })
 
   // The LAST live order: the customer goes with it, in the same transaction, with ONE proof row for the customer.
   assert.equal((await importWcOrder(anonymisedPayload(second, wcRateId) as never)).success, true)

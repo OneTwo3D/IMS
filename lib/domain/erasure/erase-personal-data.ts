@@ -427,6 +427,12 @@ async function eraseUnderLocksInTx(
     if (claimed.count === 0) return 'Customer already anonymised'
   }
   const orderCounts = await eraseOrdersPersonalDataInTx(tx, orderIds, erasedAt)
+  // A customer who REMAINS LIVE (it keeps another live order) must not go on listing an order that was erased: the customer's name, email and
+  // link would keep the erased order attributable to them (getCustomerDetail lists a customer's orders). So the order is UNLINKED in the same
+  // transaction, which is what WooCommerce does to the anonymised order (customer_id 0). Only the link goes: totals, tax, lines, ledger ids and
+  // the invoice stay on the order. Nothing re-links it: the importer's update path never writes customerId, and the only writers of an order's
+  // customerId are the creates (a manual order, a clone, which refuses an erased source, and the importer's create).
+  if (!eraseCustomer && customerId) await tx.salesOrder.updateMany({ where: { id: { in: orderIds } }, data: { customerId: null } })
   // The addresses the person is known by (the customer's and each order's), read under the locks, also have their suppression rows deleted.
   const knownAddresses = [...new Set([before?.email, ...orderRows.map((o) => o.customerEmail)].map((a) => a?.trim().toLowerCase()).filter((a): a is string => Boolean(a)))]
   if (knownAddresses.length > 0) orderCounts.bounceRecordsDeleted += (await tx.emailSuppression.deleteMany({ where: { email: { in: knownAddresses } } })).count
@@ -447,7 +453,8 @@ async function eraseUnderLocksInTx(
   const record = {
     tag: 'sales',
     description: ERASURE_RECORD_DESCRIPTION,
-    metadata: buildErasureRecordMetadata({ requestId: input.requestId, erasedAt, trigger: input.trigger, customerId, orderIds, counts }),
+    // The proof names the customer only when that customer was erased too; for a customer who stays live it would re-attribute the order.
+    metadata: buildErasureRecordMetadata({ requestId: input.requestId, erasedAt, trigger: input.trigger, customerId: eraseCustomer ? customerId : null, orderIds, counts }),
     userId: input.userId,
   }
   // The proof is filed against the customer when the customer is erased, otherwise against the (first) order.
