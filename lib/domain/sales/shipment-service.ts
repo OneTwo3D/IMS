@@ -125,6 +125,12 @@ export type ShipmentReconciliationResult = {
    */
   shortfall?: OrderShipmentShortfallLine[]
   /**
+   * Present only when a `fence` was given and it refused: the order was NOT promoted (nothing changed on the order), because what the
+   * storefront verification proved no longer holds. The shipments that shipped stay shipped (the goods left); the next sweep
+   * verifies again and completes the order then.
+   */
+  fenceRefused?: string
+  /**
    * o3d-zvec.15: present (and `true`) ONLY when THIS call moved the order to SHIPPED — the flip
    * happened under the order lock in this very reconciliation. It is the single "the order has just
    * been completed" signal the post-commit side effects key on (the WooCommerce completion push), so
@@ -1063,6 +1069,8 @@ export async function transitionShipmentStatus(
     shipmentId: string
     targetStatus: string
     extra?: { trackingNumber?: string; shippingService?: string }
+    /** Run under the order lock inside the SHIPPED transaction: a non-null answer refuses the transition with that reason. */
+    fence?: (tx: ShipmentServiceClient) => Promise<string | null>
   },
 ): Promise<ShipmentTransitionResult> {
   const { shipmentId, targetStatus, extra } = input
@@ -1099,6 +1107,10 @@ export async function transitionShipmentStatus(
       await tx.$queryRaw(
         Prisma.sql`SELECT id FROM "shipments" WHERE id = ${shipmentId} FOR UPDATE`,
       )
+      if (input.fence) {
+        const refused = await input.fence(tx)
+        if (refused !== null) return { success: false as const, error: refused }
+      }
 
       // o3d-e1yb [wdraw]: the LAST line of defence for an approved EU
       // withdrawal, and the only one that is atomic with the irreversible act.
@@ -1455,6 +1467,8 @@ export async function reconcileOrderAfterShipment(
      * Default false: only a caller that owns the storefront status asks for it.
      */
     storefrontCompletion?: boolean
+    /** Re-checked under the order lock, immediately before the order flip; a non-null answer leaves the order unflipped. */
+    fence?: (tx: ShipmentServiceClient) => Promise<string | null>
   },
 ): Promise<ShipmentReconciliationResult> {
   const completionAuthority: OrderCompletionAuthority = options?.completionAuthority ?? 'IMS'
@@ -1480,9 +1494,11 @@ export async function reconcileOrderAfterShipment(
   // only after `runInTransaction` returned, i.e. after the commit (a rollback throws past the read).
   let orderReachedShipped = false
   let storefrontCompletionKey: string | null = null
+  let fenceRefused: string | null = null
   const shortfall = await runInTransaction(client, async (tx) => {
     orderReachedShipped = false // a retried callback must not inherit an aborted attempt's flip
     storefrontCompletionKey = null
+    fenceRefused = null
     await lockSalesOrder(tx, shipment.orderId)
     const currentOrder = await tx.salesOrder.findUnique({
       where: { id: shipment.orderId },
@@ -1529,6 +1545,13 @@ export async function reconcileOrderAfterShipment(
       : null
     if (outstanding) return outstanding
 
+    // The storefront verification this completion rests on is re-checked HERE, under the order lock, before the flip (the shipment
+    // transaction checked it too, but this is a separate transaction and the link, binding or lines can change between the two).
+    if (options?.fence) {
+      const refused = await options.fence(tx)
+      if (refused !== null) { fenceRefused = refused; return null }
+    }
+
     const transition = validateSalesOrderStatusTransition(currentOrder.status, 'SHIPPED')
     if (!transition.success) throw new Error(transition.error)
     const shippedAt = new Date()
@@ -1556,9 +1579,10 @@ export async function reconcileOrderAfterShipment(
   return {
     // An order held short is not shipped, so the on_shipped invoice trigger must not fire for it:
     // invoicing it would bill the customer for units that have not left and are still owed.
-    shouldGenerateInvoice: !shortfall && trigger?.value === 'on_shipped',
+    shouldGenerateInvoice: !shortfall && !fenceRefused && trigger?.value === 'on_shipped',
     orderId: shipment.orderId,
     ...(shortfall ? { shortfall } : {}),
+    ...(fenceRefused ? { fenceRefused } : {}),
     ...(orderReachedShipped ? { orderReachedShipped: true as const } : {}),
     ...(orderReachedShipped && storefrontCompletionKey ? { storefrontCompletionKey } : {}),
   }

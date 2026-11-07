@@ -226,10 +226,10 @@ test('RACE: a pre-cutover NON-SPLIT despatch decided before the cutover creates 
   const { runWmsDispatchSweepCore, createPrismaDispatchDeps } = await import('@/lib/domain/wms/dispatch-sweep')
   const { applyDispatch } = createPrismaDispatchDeps('mintsoft' as never, {} as never)
   const cutoff = new Date('2026-06-01T00:00:00Z')
-  const run = async (despatchedAt: string) => runWmsDispatchSweepCore({
+  const run = async (despatchedAt: string, clockAt = '2026-05-31T23:59:59Z') => runWmsDispatchSweepCore({
     applyDispatch,
     // the guard sees a clock BEFORE the cutover; the real clock (used when the completion is enqueued) is after it
-    zonelessDespatchReading: 'europe-london', storefrontCutoff: () => cutoff, clock: () => new Date('2026-05-31T23:59:59Z'),
+    zonelessDespatchReading: 'europe-london', storefrontCutoff: () => cutoff, clock: () => new Date(clockAt),
     listCandidates: async () => [{ linkId: 'l1', orderId: 'so-1', externalOrderNumber: 'WC-1001' }],
     fetchOrderStatus: async () => ({ externalOrderId: 'M-1', externalOrderNumber: 'WC-1001', status: 'DESPATCHED', statusLabel: 'Despatched', isSplit: false, partCount: 1, isMerged: false, mergedOrderNumbers: [], deepLinkUrl: null, tracking: [{ trackingNumber: 'TN-1', carrier: 'DPD', despatchedAt }], dispatched: true, raw: null }),
     partsSupported: true, fetchOrderParts: async () => [], fetchPartItems: async () => [],
@@ -249,7 +249,13 @@ test('RACE: a pre-cutover NON-SPLIT despatch decided before the cutover creates 
   state.order = { id: 'so-1', status: 'PACKING' }
   state.shipments = [{ id: 'ship-1', orderId: 'so-1', status: 'PACKED', trackingNumber: 'T1' }]
   state.outbox.length = 0; state.jobs.length = 0
-  const control = await run('2026-06-02T09:00:00')
+  // a wholly-after despatch while the clock is still before the cutover is HELD (the completion would be shadowed and lost) ...
+  const held = await run('2026-06-02T09:00:00')
+  assert.equal(held.counters.dispatched, 0)
+  assert.equal(state.order.status, 'PACKING')
+  assert.deepEqual(state.outbox, [])
+  // ... and completes normally, with the order.complete job, once the clock has passed it
+  const control = await run('2026-06-02T09:00:00', '2026-06-02T10:00:00Z')
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(control.counters.dispatched, 1)
   assert.deepEqual(state.outbox, ['woocommerce/order.complete'])

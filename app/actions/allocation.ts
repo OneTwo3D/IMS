@@ -1,5 +1,6 @@
 'use server'
 
+import type { ShipmentServiceClient } from '@/lib/domain/sales/shipment-service'
 import { revalidatePath } from 'next/cache'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
@@ -1567,6 +1568,8 @@ export async function updateShipmentStatus(
      * after cutover; it sets an absolute level). Never set by an in-app dispatch.
      */
     skipStorefrontPush?: boolean
+    /** Re-checked under the order lock inside the SHIPPED transaction; a non-null answer refuses the dispatch. */
+    shipFence?: (tx: ShipmentServiceClient) => Promise<string | null>
   },
 ): Promise<{ success: boolean; error?: string }> {
   try {
@@ -1577,6 +1580,7 @@ export async function updateShipmentStatus(
       shipmentId,
       targetStatus,
       extra,
+      ...(targetStatus === 'SHIPPED' && options?.shipFence ? { fence: options.shipFence } : {}),
     })
     if (!result.success) {
       try {
@@ -1589,12 +1593,18 @@ export async function updateShipmentStatus(
 
     // o3d-zvec.15: set by the reconciliation below ONLY when this call moved the order to SHIPPED.
     let storefrontCompletionKey: string | null = null
+    let fenceRefusal: string | null = null
     const completionAuthority = options?.completionAuthority ?? 'IMS'
     if (targetStatus === 'SHIPPED') {
       const reconciliation = await reconcileOrderAfterShipment(db, result.shipment, extra, {
         completionAuthority,
         storefrontCompletion: options?.storefrontCompletion ?? completionAuthority === 'IMS',
+        ...(options?.shipFence ? { fence: options.shipFence } : {}),
       })
+      // The shipments shipped (the goods left) but the order was NOT flipped: the verification no longer holds. Everything below still
+      // runs (logs, stock sync); the refusal is reported at the end so the order stays pending and is verified again, then completed,
+      // on the next sweep.
+      fenceRefusal = reconciliation.fenceRefused ?? null
       storefrontCompletionKey = reconciliation.storefrontCompletionKey ?? null
       // o3d-0i5y: every shipment raised on this order has now shipped, but the order still owes
       // quantity, so it was deliberately left in its pre-shipment status instead of being declared
@@ -1633,7 +1643,7 @@ export async function updateShipmentStatus(
       const { queueDispatchEmailIfEligible } = await import('@/lib/dispatch-email')
       await queueDispatchEmailIfEligible(reconciliation.orderId)
     }
-    if (!result.transitioned) return { success: true }
+    if (!result.transitioned) return fenceRefusal === null ? { success: true } : { success: false, error: fenceRefusal }
 
     if (result.dispatched) {
       for (const line of result.shipment.lines) {
@@ -1681,7 +1691,7 @@ export async function updateShipmentStatus(
         console.error(syncError)
       }
     }
-    return { success: true }
+    return fenceRefusal === null ? { success: true } : { success: false, error: fenceRefusal }
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e)
     try {
