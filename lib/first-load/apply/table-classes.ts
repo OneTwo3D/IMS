@@ -112,6 +112,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   stock_sync_states: { kind: 'MUST_BE_EMPTY', reason: 'stock-sync state and jobs' },
   stock_transfer_lines: { kind: 'MUST_BE_EMPTY', reason: 'stock transfers' },
   stock_transfers: { kind: 'MUST_BE_EMPTY', reason: 'stock transfers' },
+  storefront_order_erasure_obligations: { kind: 'MUST_BE_EMPTY', reason: 'storefront erasure obligations: order ids only, written by the order sync' },
   supplier_credit_notes: { kind: 'MUST_BE_EMPTY', reason: 'supplier credit notes' },
   supplier_products: { kind: 'RUNNER_WRITES', reason: 'price cache written by every purchase order' },
   suppliers: { kind: 'RUNNER_WRITES', reason: 'the supplier list' },
