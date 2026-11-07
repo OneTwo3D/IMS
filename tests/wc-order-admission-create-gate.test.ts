@@ -47,7 +47,7 @@ mock.module('@/lib/maintenance-mode', { namedExports: { getMaintenanceModeRespon
 mock.module('@/lib/integration-plugins', { namedExports: { isIntegrationPluginEnabled: async () => true } })
 mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
 // The per-storefront-order first-import session lock needs a real database; this fake arbitrates with its own store.
-mock.module('@/lib/connectors/woocommerce/sync/first-import-lock', { namedExports: { acquireWcFirstImportLock: async () => async () => undefined } })
+mock.module('@/lib/connectors/woocommerce/sync/first-import-lock', { namedExports: { acquireWcFirstImportLock: async () => async () => undefined, wcFirstImportLockHeld: () => false, withWcFirstImportLock: async (_id: unknown, fn: () => Promise<unknown>) => fn(), WcFirstImportLockUnavailable: class extends Error {} } })
 
 /**
  * Every delegate the importer touches, built once so the top-level client and the TRANSACTION client

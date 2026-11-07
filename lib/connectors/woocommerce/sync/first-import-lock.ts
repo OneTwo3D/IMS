@@ -16,6 +16,7 @@
  * delivery fails, and WooCommerce redelivers. Nothing is written on that path.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks'
 import type { Pool, PoolClient } from 'pg'
 import { WC_FIRST_IMPORT_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { createSessionAdvisoryLockPool } from '@/lib/db/session-lock-pool'
@@ -87,5 +88,26 @@ export async function acquireWcFirstImportLock(externalOrderId: number | string,
     }
     // A connection whose unlock did not confirm is destroyed: ending the session releases every lock it holds.
     client.release(destroy || !held)
+  }
+}
+
+/**
+ * THE LOCK IS TAKEN BY THE OUTERMOST CALLER THAT NEEDS IT, and the inner `importWcOrder` must not take it again (a second session on the same key
+ * would wait on the first and deadlock). This context records which storefront orders' locks the current async flow already holds.
+ */
+const held = new AsyncLocalStorage<Set<string>>()
+
+export function wcFirstImportLockHeld(externalOrderId: number | string): boolean {
+  return held.getStore()?.has(String(externalOrderId)) ?? false
+}
+
+/** Run `fn` holding the first-import lock for this storefront order (released afterwards); `fn` and everything it awaits see it as held. */
+export async function withWcFirstImportLock<T>(externalOrderId: number | string, fn: () => Promise<T>): Promise<T> {
+  if (wcFirstImportLockHeld(externalOrderId)) return fn()
+  const release = await acquireWcFirstImportLock(externalOrderId)
+  try {
+    return await held.run(new Set([...(held.getStore() ?? []), String(externalOrderId)]), fn)
+  } finally {
+    await release()
   }
 }

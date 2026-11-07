@@ -6,7 +6,7 @@ import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain
 import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
 import { isWcOrderAnonymised, wcPayloadCarriesIdentity } from './anonymisation'
 import { mirrorWcAnonymisation } from './anonymisation-mirror'
-import { acquireWcFirstImportLock } from './first-import-lock'
+import { acquireWcFirstImportLock, wcFirstImportLockHeld } from './first-import-lock'
 import { ERASURE_PLACEHOLDER_NAME, ERASURE_RECORD_ACTION, ERASURE_RECORD_DESCRIPTION, buildErasureRecordMetadata } from '@/lib/domain/erasure/erasure-record'
 import { randomUUID } from 'node:crypto'
 import { createHash } from 'node:crypto'
@@ -2289,6 +2289,13 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // awaited: the write is bounded and its failure is logged on its own, so it can neither delay nor fail the import below, which
     // behaves exactly as it did. (Awaiting it would put a write blocked on the table in front of every import.)
     startWcIncumbentEvidence(wcOrder)
+    // A MARKED DELIVERY IS NEVER DECIDED BY AN UNLOCKED "IS THERE AN ORDER?" READ (Codex R5). An unmarked first import of the same order may be in
+    // flight (holding the first-import lock, order not yet committed); every refusal, skip and acknowledgement below this line would answer "nothing
+    // here" and the order would then commit identifiable with nothing left to erase it. So a marked delivery takes the lock FIRST, before the pivot
+    // read, and waits for that import: it then sees the held order and mirrors it, or, when IMS truly holds nothing, is judged as before. (The
+    // withdrawal wrapper takes the same lock before ITS read and hands it down, so it is not taken twice.)
+    const payloadAnonymised = isWcOrderAnonymised(wcOrder)
+    if (payloadAnonymised && !wcFirstImportLockHeld(wcOrder.id)) releaseFirstImportLock = await acquireWcFirstImportLock(wcOrder.id)
     // An order IMS holds: the UPDATE path (never gated). A closure because the first-import lock below re-asks the same question.
     const updateHeldOrder = async (heldOrderId: string): Promise<ImportWcOrderResult> => {
       const updated = await updateExistingWcOrderFromPayload(heldOrderId, wcOrder, options.receiptPaymentId, options.pendingFxRetryLogId, options.pendingFxSnapshotVersion)
@@ -2400,7 +2407,6 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // A payload WooCommerce has ANONYMISED (positive marker, never inferred from placeholders) is an order whose subject asked for erasure:
     // it never touches the customer table (no customer is matched, linked or minted) and is created ALREADY ERASED
     // below, exactly as an order for an erased customer is. Its money, lines and tax are imported as for any order.
-    const payloadAnonymised = isWcOrderAnonymised(wcOrder)
     // FIRST IMPORTS OF ONE STOREFRONT ORDER ARE SERIALISED. Two deliveries of an order IMS has never seen (one anonymised, one not) used to run
     // the customer step BEFORE the create transaction, so the contender that then LOST the create left a customer row and storefront link holding
     // its identity, and a marked loser was acknowledged while the winner stayed identifiable. Under this lock the second contender re-asks the
@@ -2408,7 +2414,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // inside the order-create transaction, so a failed or lost create leaves no customer behind either.
     // A SESSION lock on its own bounded pool (first-import-lock.ts), released in the finally below; never a connection of the main pool.
     // The customer-then-orders lock order of the erasure is untouched.
-    releaseFirstImportLock = await acquireWcFirstImportLock(wcOrder.id)
+    if (!releaseFirstImportLock && !wcFirstImportLockHeld(wcOrder.id)) releaseFirstImportLock = await acquireWcFirstImportLock(wcOrder.id)
     const racedHeld = await db.salesOrder.findFirst({ where: { shoppingLinks: { some: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) } } }, select: { id: true } })
     if (racedHeld) return await updateHeldOrder(racedHeld.id)
     const customerName = payloadAnonymised
