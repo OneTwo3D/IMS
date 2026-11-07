@@ -2398,19 +2398,19 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
 
     // Customer
     // A payload WooCommerce has ANONYMISED (positive marker, never inferred from placeholders) is an order whose subject asked for erasure:
-    // it never touches the customer table (no upsertCustomer, so no customer is matched, linked or minted) and is created ALREADY ERASED
+    // it never touches the customer table (no customer is matched, linked or minted) and is created ALREADY ERASED
     // below, exactly as an order for an erased customer is. Its money, lines and tax are imported as for any order.
     const payloadAnonymised = isWcOrderAnonymised(wcOrder)
     // FIRST IMPORTS OF ONE STOREFRONT ORDER ARE SERIALISED. Two deliveries of an order IMS has never seen (one anonymised, one not) used to run
-    // upsertCustomer BEFORE the create transaction, so the contender that then LOST the create left a customer row and storefront link holding
+    // the customer step BEFORE the create transaction, so the contender that then LOST the create left a customer row and storefront link holding
     // its identity, and a marked loser was acknowledged while the winner stayed identifiable. Under this lock the second contender re-asks the
-    // question after the first has committed and takes the UPDATE path (which mirrors a marked delivery), so it never writes a customer at all.
+    // question after the first has committed and takes the UPDATE path (which mirrors a marked delivery). The customer step itself now runs
+    // inside the order-create transaction, so a failed or lost create leaves no customer behind either.
     // A SESSION lock on its own bounded pool (first-import-lock.ts), released in the finally below; never a connection of the main pool.
     // The customer-then-orders lock order of the erasure is untouched.
     releaseFirstImportLock = await acquireWcFirstImportLock(wcOrder.id)
     const racedHeld = await db.salesOrder.findFirst({ where: { shoppingLinks: { some: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) } } }, select: { id: true } })
     if (racedHeld) return await updateHeldOrder(racedHeld.id)
-    const customerId = payloadAnonymised ? null : await upsertCustomer(wcOrder)
     const customerName = payloadAnonymised
       ? ERASURE_PLACEHOLDER_NAME
       : [wcOrder.billing.first_name, wcOrder.billing.last_name].filter(Boolean).join(' ')
@@ -2857,7 +2857,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const headerRateWasActive = taxRateName ? (await db.taxRate.findFirst({ where: { name: taxRateName, active: true }, select: { id: true } })) !== null : false
     // Create the sales order
     let so
-    let linkCustomerId: string | null = customerId
+    let linkCustomerId: string | null = null
     let customerErasedDuringImport: string | null = null
     try {
       so = await db.$transaction(async (tx) => {
@@ -2867,10 +2867,14 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         await lockOrderNamedTaxRate(tx, taxRateName, { lineRateIds: lineData.map((l) => l.taxRateId), allowMissing: !headerRateWasActive })
         // A mapped rate that a tax re-key retired follows its replacement (lenient: an inbound order is never lost over an operator-deactivated rate); under the row share lock the apply waits on.
         await resolveLinesTaxRates(tx, lineData, { lenient: true })
-        // CUSTOMER ERASURE GUARD. `upsertCustomer` ran before this transaction, so the customer it returned can have been
-        // anonymised since. The row is locked here (the erasure claims it with an UPDATE, which takes the same lock) and
-        // re-read: an erased customer is never linked to a new order. The erasure either committed first, and this sees it,
-        // or is queued behind this lock and then finds the new order under the customer and erases it.
+        // CUSTOMER ERASURE GUARD. The customer row is locked FOR UPDATE and re-read: an erased customer is never linked to a new order
+        // (the erasure claims the row with an UPDATE, which takes the same lock). The erasure either committed first, and this sees it, or is
+        // queued behind this lock and then finds the new order under the customer and erases it.
+        // THE CUSTOMER STEP RUNS IN THIS TRANSACTION (Codex R3): the customer row, its storefront link and the order commit together or not at all, so a
+        // failure after it (or a lost create race) can never leave a customer holding the subject's identity with no order, for a later anonymised
+        // delivery to miss. A marked payload never touches the customer table. A matched customer is locked FOR UPDATE inside the upsert and held to
+        // the end of the transaction (customer, then orders: the erasure's order).
+        const customerId = payloadAnonymised ? null : await upsertCustomer(wcOrder, tx)
         linkCustomerId = customerId
         if (customerId) {
           const locked = await tx.$queryRaw<Array<{ gdprAnonymisedAt: Date | null }>>`SELECT "gdprAnonymisedAt" FROM "customers" WHERE "id" = ${customerId} FOR UPDATE`

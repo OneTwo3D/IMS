@@ -6,7 +6,7 @@ import { db } from '@/lib/db'
 import { getFxRateToBase as getFxRateToBaseFromTable, isMissingFxRateError, MissingFxRateError } from '@/lib/currencies/fx-lookup'
 import { logActivity } from '@/lib/activity-log'
 import { currencyMinorUnits, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import type { TaxCategory } from '@/app/generated/prisma/client'
+import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
 import type { WcAddress, WcFullOrder, WcLineItem, WcCouponLine, WcFeeLine, WcMeta } from './types'
 import { classifyWcCouponLines } from './coupon-classification'
 import { knownWcTaxClassCategory } from './tax-class-category'
@@ -100,13 +100,24 @@ export function mapWcCustomer(order: WcFullOrder) {
   }
 }
 
-export async function upsertCustomer(order: WcFullOrder): Promise<string | null> {
+/**
+ * Match, link or create the customer for a storefront order.
+ *
+ * `client` is the importer's ORDER-CREATE TRANSACTION: when given, every read and write here runs on it, so the customer row, the storefront
+ * link and the order commit or roll back together (a failure after this step, or a lost create race, leaves no customer or link behind). In that
+ * mode a matched customer found ERASED (it is locked FOR UPDATE and re-read here, and the lock is then held to the end of the transaction)
+ * is RETURNED rather than replaced, so the importer's own erased-customer guard creates the order already erased and unlinked, as it does for
+ * a customer erased at any other point in the import. Without `client` it behaves as before: an erased match is a returning customer and a
+ * fresh one is created.
+ */
+export async function upsertCustomer(order: WcFullOrder, client?: Prisma.TransactionClient): Promise<string | null> {
   const cust = mapWcCustomer(order)
   if (!cust.firstName && !cust.lastName && !cust.email) return null
+  const c = (client ?? db) as Prisma.TransactionClient
 
   // Try to find by WC customer ID first, then by email
   let existing = cust.externalCustomerId
-    ? await db.customer.findFirst({
+    ? await c.customer.findFirst({
         where: {
           shoppingLinks: {
             some: {
@@ -119,7 +130,7 @@ export async function upsertCustomer(order: WcFullOrder): Promise<string | null>
     : null
   if (!existing && cust.email) {
     // An anonymised row is never a match target (its email is already null; this keeps that true if a writer ever changes).
-    existing = await db.customer.findFirst({ where: { email: cust.email, gdprAnonymisedAt: null } })
+    existing = await c.customer.findFirst({ where: { email: cust.email, gdprAnonymisedAt: null } })
   }
 
   // A customer matched here can be ERASED at any moment, and a link written to an erased row would put the raw storefront customer
@@ -129,7 +140,7 @@ export async function upsertCustomer(order: WcFullOrder): Promise<string | null>
   // is created below; the new identity belongs to a new record.
   if (existing) {
     const matchedId = existing.id
-    const outcome = await db.$transaction(async (tx) => {
+    const link = async (tx: Prisma.TransactionClient) => {
       const locked = await tx.$queryRaw<Array<{ gdprAnonymisedAt: Date | null }>>`SELECT "gdprAnonymisedAt" FROM "customers" WHERE "id" = ${matchedId} FOR UPDATE`
       if (locked[0]?.gdprAnonymisedAt) {
         await tx.shoppingCustomerLink.deleteMany({ where: { customerId: matchedId } })
@@ -151,13 +162,16 @@ export async function upsertCustomer(order: WcFullOrder): Promise<string | null>
         }
       }
       return 'live' as const
-    })
+    }
+    const outcome = client ? await link(client) : await db.$transaction(link)
     if (outcome === 'live') return matchedId
+    // Inside the importer's transaction the erased match is handed back (see above); the importer erases the order on create.
+    if (client) return matchedId
     // erased: fall through to a fresh customer
   }
 
   // Create new customer
-  const created = await db.customer.create({
+  const created = await c.customer.create({
     data: {
       firstName: cust.firstName,
       lastName: cust.lastName,
