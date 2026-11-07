@@ -24,7 +24,7 @@ async function loadDeps() {
     import('@/lib/connectors/woocommerce/sync/pre-cutover-order-read'),
     import('@/lib/connectors/woocommerce/sync-lock'),
   ])
-  return { db, transition: shipments.transitionShipmentStatus, reader, versionKey: lock.WC_SETTINGS_VERSION_KEY }
+  return { db, transition: shipments.transitionShipmentStatus, reconcile: shipments.reconcileOrderAfterShipment, reader, versionKey: lock.WC_SETTINGS_VERSION_KEY }
 }
 type Deps = Awaited<ReturnType<typeof loadDeps>>
 
@@ -121,5 +121,29 @@ test('FENCE: two concurrent completions on an unchanged order move stock once', 
     assert.equal(results.filter((r) => r.success && (r as { transitioned?: boolean }).transitioned === true).length, 1, JSON.stringify(results))
     assert.equal(await status(deps, f.shipmentId), 'SHIPPED')
     assert.equal(await movements(deps, f.productId), 1, 'no double stock movement')
+  })
+})
+
+test('FENCE AT THE ORDER FLIP: a link or line change between the shipment commit and the order reconcile leaves the order unflipped under EXTERNAL authority; unchanged flips once', { skip: SKIP }, async () => {
+  await withFixture(async (deps, f, fence) => {
+    const built = await fence()
+    const shipped = await deps.transition(deps.db, { shipmentId: f.shipmentId, targetStatus: 'SHIPPED', fence: built })
+    assert.equal(shipped.success, true, JSON.stringify(shipped))
+    const orderStatus = async () => (await deps.db.salesOrder.findUniqueOrThrow({ where: { id: f.orderId }, select: { status: true } })).status
+    // the change lands AFTER the shipment transaction committed and BEFORE the order reconcile
+    await deps.db.shoppingOrderLink.updateMany({ where: { orderId: f.orderId }, data: { externalOrderId: `Z${f.suffix}` } })
+    const refused = await deps.reconcile(deps.db, { orderId: f.orderId }, undefined, { completionAuthority: 'EXTERNAL', storefrontCompletion: false, fence: built })
+    assert.match(String(refused.fenceRefused), /changed since the storefront verification/)
+    assert.equal(refused.orderReachedShipped, undefined)
+    assert.equal(await orderStatus(), 'ALLOCATED', 'the order is not flipped')
+    assert.equal(await status(deps, f.shipmentId), 'SHIPPED', 'the shipment stays shipped: the goods left')
+    // a fresh verification (new fence over the current state) completes it, exactly once
+    const fresh = await fence()
+    const first = await deps.reconcile(deps.db, { orderId: f.orderId }, undefined, { completionAuthority: 'EXTERNAL', storefrontCompletion: false, fence: fresh })
+    assert.equal(first.orderReachedShipped, true)
+    assert.equal(await orderStatus(), 'SHIPPED')
+    const again = await deps.reconcile(deps.db, { orderId: f.orderId }, undefined, { completionAuthority: 'EXTERNAL', storefrontCompletion: false, fence: fresh })
+    assert.equal(again.orderReachedShipped, undefined, 'flips once')
+    assert.equal(await movements(deps, f.productId), 1)
   })
 })

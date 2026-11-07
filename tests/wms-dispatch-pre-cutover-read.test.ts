@@ -1071,6 +1071,16 @@ test('ORDER LEVEL, MIXED: despatches on both sides of the cutover are IMS-owned:
       assert.deepEqual(reads(), [], shape)
     })
   }
+  // while IMS's clock is still BEFORE the cutoff, a mixed order (a post-cutoff timestamp) is held, never given the IMS-only flag
+  for (const [shape, parts] of shapes) {
+    reset()
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const run = await sweep(parts, { zoneless: 'europe-london', shape, clock: new Date('2026-05-31T23:59:59Z') })
+      assert.equal(run.out.counters.dispatched, 0, `${shape}: held until the clock passes the cutoff`)
+      assert.deepEqual(run.applyOptions, [], shape)
+      assert.deepEqual(writes(), [], shape)
+    })
+  }
   // a mixed order with a straddling entry is still held; an all-before order is still verified
   reset()
   await withEnv(LIVE_AT_CUTOFF, async () => {
