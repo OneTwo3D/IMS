@@ -76,3 +76,13 @@ test('runWithErasureSweepAlways: the sweep is attempted even when the host work 
   assert.equal(ok2.scanned, 3)
   assert.match(JSON.stringify(ok2.erasureSweep), /sweep failed: Error/)
 })
+
+test('census: the webhook\'s initial-import-pending branch mirrors a marked delivery before it acknowledges it', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/webhooks.ts', 'utf8')
+  const pending = src.indexOf('async function handleOrderWebhook')
+  const mirror = src.indexOf('mirrorWcAnonymisationIfHeld', pending)
+  const ack = src.indexOf("skipped: 'initial_import_pending'", pending)
+  assert.ok(pending > 0 && mirror > pending && ack > mirror, 'the marked-delivery mirror sits before the initial_import_pending acknowledgement')
+  assert.match(src.slice(Math.max(0, mirror - 200), mirror), /isWcOrderAnonymised\(payload as WcFullOrder\)/, 'and is guarded by the marker')
+})

@@ -33,6 +33,8 @@ const fulfilmentTracking: Array<unknown[]> = []
 let wcFetchImpl: ((path: string, params: Record<string, string>) => Promise<{ data: unknown; totalPages: number; totalItems: number; error?: string }>) | null = null
 // Runs after the customer step returned, still inside the order-create transaction: a hook that throws fails the whole transaction.
 let afterUpsertCustomerInTx: (() => Promise<void>) | null = null
+// Makes the sweep's mirror step throw for an order id (a mirror ERROR, as opposed to a read error).
+let failMirrorFor: ((id: number | string) => boolean) | null = null
 let beforeUpsertCustomer: (() => Promise<void>) | null = null
 // Runs after an email action has read the order's address and before it enqueues.
 let afterAddressRead: (() => Promise<void>) | null = null
@@ -83,6 +85,8 @@ async function mockActionEnvironment() {
   // A seam to pause an action between its write and its in-transaction activity row (and only there).
   const activity = await import('@/lib/activity-log')
   mock.module('@/lib/activity-log', { namedExports: { ...activity, logActivityInTransaction: async (tx: never, params: never) => { await beforeActivityWrite?.(); return activity.logActivityInTransaction(tx, params) } } })
+  const mirrorModule = await import('@/lib/connectors/woocommerce/sync/anonymisation-mirror')
+  mock.module('@/lib/connectors/woocommerce/sync/anonymisation-mirror', { namedExports: { ...mirrorModule, mirrorWcAnonymisationIfHeld: async (o: { id: number | string }) => { if (failMirrorFor?.(o.id)) throw new Error('injected mirror failure'); return mirrorModule.mirrorWcAnonymisationIfHeld(o as never) } } })
   const wcApi = await import('@/lib/connectors/woocommerce/api')
   mock.module('@/lib/connectors/woocommerce/api', { namedExports: { ...wcApi, wcFetch: (path: string, params: Record<string, string> = {}, ...rest: never[]) => (wcFetchImpl ? wcFetchImpl(path, params) : (wcApi.wcFetch as (...a: unknown[]) => unknown)(path, params, ...rest)) } })
   const fulfilment = await import('@/lib/fulfillment/external-fulfillment')
@@ -1994,9 +1998,13 @@ test('[erasure] the per-run budget stops the sweep cleanly and the next run RESU
   assert.ok(runs >= 3 && runs < 30, `it took several budgeted runs (${runs + 1}) and finished`)
   assert.equal((await obligationIds(db, orders.map((o) => o.id))).size, orders.length, 'every order was covered across the resumed runs')
   // A wall-clock budget stops a run too.
+  // A wall-clock budget stops a run too, with plenty of data left to read.
+  const many: FakeOrder[] = Array.from({ length: 600 }, (_, i) => ({ id: base + 10_000 + i, mod: T0 + 4_000_000_000 + i * 600_000, marked: false }))
+  wcFetchImpl = fakeWooStore(many).impl
   let t0 = 0
   const timed = await sweepWcAnonymisedOrders({ maxMs: 1000, now: () => (t0 += 600) })
-  assert.ok(timed.pages <= 2, 'the time budget stopped the run')
+  assert.equal(timed.budgetStop, true, 'the time budget stopped the run')
+  assert.ok(timed.pages <= 2, `and after at most two pages (${timed.pages})`)
 })
 
 test('[erasure] an error mid-page leaves the cursor at a safe value, and the next run loses nothing', { skip }, async (t) => {
@@ -2449,4 +2457,93 @@ test('[erasure] the sweep has a single owner: two concurrent invocations issue r
   // The lease is released: the next run owns it again.
   wcFetchImpl = store.impl
   assert.equal((await sweepWcAnonymisedOrders()).alreadyRunning, false)
+})
+
+test('[erasure] the order-first erasure takes the customer row lock and ALL the customer\'s order locks (not only its own row): it waits behind a held customer lock and behind a held lock on the customer\'s OTHER order', { skip }, async (t) => {
+  const db = await loadDb()
+  const { eraseOrderPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const waits = async (target: string, hold: (tx: Parameters<Parameters<typeof db.$transaction>[0]>[0]) => Promise<unknown>, label: string) => {
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    let held!: () => void
+    const holding = new Promise<void>((r) => { held = r })
+    const holder = db.$transaction(async (tx) => { await hold(tx); held(); await gate }, { timeout: 30_000 })
+    await holding
+    let done = false
+    const erasing = eraseOrderPersonalData(target, { trigger: 'MIRRORED_FROM_STOREFRONT', userId: null }).then((r) => { done = true; return r })
+    await new Promise((r) => setTimeout(r, 1200))
+    assert.equal(done, false, `the erasure is waiting behind the held ${label} lock`)
+    release()
+    await holder
+    assert.equal((await erasing).success, true)
+  }
+  // Two orders of ONE live customer: erasing one leaves the customer live, so a customer-row lock is the only thing that can make it wait for a held
+  // customer lock, and only the customer's all-orders lock can make it wait for a held lock on the OTHER order.
+  for (const round of ['customer', 'other order'] as const) {
+    const fx = await importFixture(db)
+    const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+    const second = fx.externalId + 501 + (round === 'customer' ? 0 : 1)
+    // Each round cleans up BEFORE the next imports (both fixtures use the same email, so they would share one customer).
+    try {
+    assert.equal((await importWcOrder(payload(second, wcRateId) as never)).success, true)
+    const otherId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(second) }, select: { orderId: true } })).orderId
+    if (round === 'customer') await waits(fx.orderId, (tx) => tx.$queryRaw`SELECT id FROM "customers" WHERE id = ${fx.customerId} FOR UPDATE`, 'customer')
+    else await waits(fx.orderId, (tx) => tx.$queryRaw`SELECT id FROM "sales_orders" WHERE id = ${otherId} FOR UPDATE`, "customer's other order")
+    } finally {
+      await cleanupImported(db, [second], { keepCustomers: true })
+      await fx.cleanup()
+    }
+  }
+})
+
+test('[erasure] the obligation helpers: a retired row reads closed, and recording again re-opens it', { skip }, async (t) => {
+  const db = await loadDb()
+  const id = 1_990_000_000 + Math.floor(Math.random() * 9_000_000)
+  t.after(async () => { await db.storefrontOrderErasureObligation.deleteMany({ where: { externalOrderId: String(id) } }) })
+  const { recordWcErasureObligation, hasOpenWcErasureObligation, retireWcErasureObligation } = await import('@/lib/connectors/woocommerce/sync/erasure-obligation')
+  assert.equal(await hasOpenWcErasureObligation(id), false)
+  await recordWcErasureObligation(id)
+  await recordWcErasureObligation(id)
+  assert.equal(await hasOpenWcErasureObligation(id), true)
+  assert.equal(await db.storefrontOrderErasureObligation.count({ where: { externalOrderId: String(id) } }), 1, 'idempotent')
+  await retireWcErasureObligation(id)
+  assert.equal(await hasOpenWcErasureObligation(id), false, 'retired reads closed')
+  await recordWcErasureObligation(id)
+  assert.equal(await hasOpenWcErasureObligation(id), true, 'recording again re-opens it')
+})
+
+test('[erasure] the window is read TWICE: an order shifted out of a tie window while its first pass is running is still evaluated', { skip }, async (t) => {
+  const db = await loadDb()
+  const base = 1_940_000_000 + Math.floor(Math.random() * 20_000_000)
+  const orders: FakeOrder[] = Array.from({ length: 230 }, (_, i) => ({ id: base + i, mod: T0 + 50_000, marked: true }))
+  await prepareSweep(db, t, () => orders.map((o) => o.id))
+  const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  // Request 1 is the plain page, request 2 the window's first page, request 3 its SECOND page: an order already read on page 1 is edited (it leaves the
+  // window), every later order shifts down one place, and the one at the page boundary (index 100) is read by neither pass-1 page.
+  const store = fakeWooStore(orders, (n) => { if (n === 3) orders[5]!.mod = T0 + 999_000_000_000 })
+  wcFetchImpl = store.impl
+  const result = await sweepWcAnonymisedOrders({ maxPages: 40 })
+  assert.equal(result.errors.length, 0)
+  assert.equal((await obligationIds(db, orders.map((o) => o.id))).size, 230, 'the second pass covered the order the first pass skipped')
+})
+
+test('[erasure] a MIRROR error ends the run, leaves the cursor at the last fully processed page, keeps the backlog, and the next run loses nothing', { skip }, async (t) => {
+  const db = await loadDb()
+  const base = 1_930_000_000 + Math.floor(Math.random() * 20_000_000)
+  const orders: FakeOrder[] = Array.from({ length: 250 }, (_, i) => ({ id: base + i, mod: T0 + i * 600_000, marked: true }))
+  await prepareSweep(db, t, () => orders.map((o) => o.id))
+  t.after(async () => { failMirrorFor = null; await db.setting.deleteMany({ where: { key: { in: ['wc_erasure_sweep_backlog', 'wc_erasure_sweep_last_run_at'] } } }) })
+  const { sweepWcAnonymisedOrders, WC_ERASURE_SWEEP_CURSOR_OVERLAP_MS } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  wcFetchImpl = fakeWooStore(orders).impl
+  failMirrorFor = (id) => Number(id) === orders[150]!.id
+  const first = await sweepWcAnonymisedOrders({ maxPages: 20 })
+  assert.equal(first.errors.length, 1, 'one mirror error, and the run stopped')
+  const state = JSON.parse((await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_cursor' } })).value) as { after: string }
+  assert.equal(state.after, new Date(orders[99]!.mod - WC_ERASURE_SWEEP_CURSOR_OVERLAP_MS).toISOString(), 'the cursor is at the end of the last FULLY processed page, not past the failing one')
+  assert.equal((await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_backlog' } })).value, 'true')
+  failMirrorFor = null
+  const second = await sweepWcAnonymisedOrders({ maxPages: 20 })
+  assert.equal(second.errors.length, 0)
+  assert.equal((await obligationIds(db, orders.map((o) => o.id))).size, 250, 'the next run covered everything, including the order that failed')
 })
