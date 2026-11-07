@@ -28,7 +28,11 @@ export async function GET(request: Request) {
         return { skipped: true, reason: 'WC sync disabled' }
       }
 
-      return await runWcReconcile() as Record<string, unknown>
+      const results = await runWcReconcile() as Record<string, unknown>
+      // The erasure backstop runs AFTER every reconcile step, on its own daily cadence (and every tick while it has a backlog); it never fails the run.
+      const { runWcErasureSweepIfDue } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+      results.erasureSweep = await runWcErasureSweepIfDue()
+      return results
     },
   })
 

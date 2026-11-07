@@ -1849,73 +1849,208 @@ test('[erasure] a mirror that cannot run THROWS so the delivery retries, with fi
 })
 
 
-test('[erasure] the reconcile backstop: status=any, GET only, mirrors ONLY marked AND held orders, cursor moves after a clean page, per-run count logged, empty selection irrelevant', { skip }, async (t) => {
+// ---------------------------------------------------------------------------------------------------------------------
+// THE RECONCILE BACKSTOP (sweepWcAnonymisedOrders): keyset paging by modified time, a per-run budget, obligations for unheld marked orders.
+// The REST read is answered by an in-memory store that honours status=any, modified_after / modified_before (exclusive), orderby=modified asc,
+// page and per_page, so the paging behaviour is the real code against a faithful list; a hook can change the store between two requests.
+// ---------------------------------------------------------------------------------------------------------------------
+
+type FakeOrder = { id: number; mod: number; marked: boolean }
+
+function fakeWooStore(orders: FakeOrder[], hook?: (requestNumber: number) => void) {
+  const calls: Array<Record<string, string>> = []
+  const impl = async (_path: string, params: Record<string, string>) => {
+    calls.push(params)
+    hook?.(calls.length)
+    const after = params.modified_after ? Date.parse(`${params.modified_after}Z`) : Number.NEGATIVE_INFINITY
+    const before = params.modified_before ? Date.parse(`${params.modified_before}Z`) : Number.POSITIVE_INFINITY
+    const perPage = Number(params.per_page)
+    const page = Number(params.page)
+    const rows = orders.filter((o) => o.mod > after && o.mod < before).sort((a, b) => a.mod - b.mod || a.id - b.id)
+    const slice = rows.slice((page - 1) * perPage, page * perPage)
+    return {
+      data: slice.map((o) => ({ id: o.id, number: String(o.id), date_modified_gmt: new Date(o.mod).toISOString().replace(/\.\d{3}Z$/, ''), meta_data: o.marked ? [{ id: 1, key: '_anonymized', value: 'yes' }] : [] })),
+      totalPages: Math.ceil(rows.length / perPage), totalItems: rows.length,
+    }
+  }
+  return { calls, impl }
+}
+
+const SWEEP_KEYS = ['wc_sync_order_statuses', 'wc_initial_import_completed', 'wc_erasure_sweep_cursor']
+
+async function prepareSweep(db: Awaited<ReturnType<typeof loadDb>>, t: { after: (fn: () => Promise<void>) => void }, ids: () => number[]) {
+  const prior = await db.setting.findMany({ where: { key: { in: SWEEP_KEYS } } })
+  t.after(async () => {
+    wcFetchImpl = null
+    await db.setting.deleteMany({ where: { key: { in: SWEEP_KEYS } } })
+    for (const row of prior) await db.setting.create({ data: { key: row.key, value: row.value } })
+    await db.storefrontOrderErasureObligation.deleteMany({ where: { externalOrderId: { in: ids().map(String) } } })
+    await db.activityLog.deleteMany({ where: { action: 'wc_anonymisation_sweep' } })
+  })
+  for (const [key, value] of [['wc_sync_order_statuses', '[]'], ['wc_initial_import_completed', 'true']] as const) await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+  await db.setting.deleteMany({ where: { key: 'wc_erasure_sweep_cursor' } })
+}
+
+const obligationIds = async (db: Awaited<ReturnType<typeof loadDb>>, ids: number[]) =>
+  new Set((await db.storefrontOrderErasureObligation.findMany({ where: { externalOrderId: { in: ids.map(String) } }, select: { externalOrderId: true } })).map((r) => Number(r.externalOrderId)))
+
+const T0 = Date.parse('2026-10-01T00:00:00Z')
+
+test('[erasure] the backstop: status=any, GET only, a marked HELD order is erased under the lock, a marked UNHELD order leaves an obligation, an unmarked one is ignored, nothing is created, the cursor moves, the count is logged', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const unheld = fx.externalId + 72
+  const plain = fx.externalId + 73
+  await prepareSweep(db, t, () => [unheld, plain, fx.externalId])
+  t.after(async () => { await fx.cleanup() })
+  await db.storefrontOrderErasureObligation.create({ data: { connector: 'woocommerce', externalOrderId: String(fx.externalId) } })
+  const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  const store = fakeWooStore([
+    { id: fx.externalId, mod: T0 + 3000, marked: true },
+    { id: plain, mod: T0 + 2000, marked: false },
+    { id: unheld, mod: T0 + 1000, marked: true },
+  ])
+  wcFetchImpl = store.impl
+  const ordersBefore = await db.salesOrder.count()
+  const result = await sweepWcAnonymisedOrders()
+  assert.deepEqual([result.scanned, result.markedHeld, result.mirrored, result.obligationsRecorded, result.errors.length], [3, 1, 1, 1, 0])
+  assert.ok((await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })).erasedAt, 'the held marked order was erased')
+  assert.ok((await db.storefrontOrderErasureObligation.findUniqueOrThrow({ where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(fx.externalId) } } })).retiredAt, 'and its open obligation retired')
+  assert.equal((await obligationIds(db, [unheld])).has(unheld), true, 'the unheld marked order left an obligation (a later create is erased-on-create)')
+  assert.equal((await obligationIds(db, [plain])).has(plain), false, 'the unmarked order left nothing')
+  assert.equal(await db.salesOrder.count(), ordersBefore, 'the sweep created nothing')
+  assert.ok(store.calls.every((c) => c.status === 'any' && c.orderby === 'modified' && c.order === 'asc' && c.dates_are_gmt === 'true'), 'GET /orders, status=any, GMT comparison')
+  const state = JSON.parse((await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_cursor' } })).value) as { after: string }
+  assert.equal(state.after, new Date(T0 + 3000 - 2000).toISOString(), 'the cursor is the newest modified time minus the overlap')
+  assert.equal(((await db.activityLog.findFirstOrThrow({ where: { action: 'wc_anonymisation_sweep' }, orderBy: { createdAt: 'desc' } })).metadata as { obligationsRecorded: number }).obligationsRecorded, 1, 'the per-run count is logged')
+})
+
+test('[erasure] PAGE SHIFT: an order modified between two page reads is not skipped, and the order the old offset scheme skipped is covered', { skip }, async (t) => {
+  const db = await loadDb()
+  const base = 1_600_000_000 + Math.floor(Math.random() * 50_000_000)
+  const orders: FakeOrder[] = Array.from({ length: 250 }, (_, i) => ({ id: base + i, mod: T0 + i * 10_000, marked: true }))
+  await prepareSweep(db, t, () => orders.map((o) => o.id))
+  const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  // Between the first and the second read, an order already read on page 1 is edited in WooCommerce: its modified time jumps to NOW. With offset
+  // paging every later order shifts down one place and the 101st order (index 100) lands on the page that was already read: it is skipped.
+  const store = fakeWooStore(orders, (n) => { if (n === 2) orders[5]!.mod = T0 + 999_000_000 })
+  wcFetchImpl = store.impl
+  const result = await sweepWcAnonymisedOrders({ maxPages: 20 })
+  assert.equal(result.errors.length, 0)
+  const got = await obligationIds(db, orders.map((o) => o.id))
+  assert.equal(got.size, 250, 'every order has its obligation')
+  assert.ok(got.has(orders[100]!.id), 'including the one an offset scheme would have skipped')
+  assert.ok(store.calls.every((c) => c.page === '1'), 'no offset was used: every request is page 1 of a moving lower bound')
+})
+
+test('[erasure] a block of orders sharing ONE modified second that is larger than a page is read inside its window, twice, and fully covered', { skip }, async (t) => {
+  const db = await loadDb()
+  const base = 1_700_000_000 + Math.floor(Math.random() * 50_000_000)
+  const tie = Array.from({ length: 230 }, (_, i) => ({ id: base + i, mod: T0 + 50_000, marked: true }))
+  const after = Array.from({ length: 5 }, (_, i) => ({ id: base + 1000 + i, mod: T0 + 100_000 + i * 1000, marked: true }))
+  const before = [{ id: base + 2000, mod: T0 + 1000, marked: true }]
+  const orders: FakeOrder[] = [...before, ...tie, ...after]
+  await prepareSweep(db, t, () => orders.map((o) => o.id))
+  const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  const store = fakeWooStore(orders)
+  wcFetchImpl = store.impl
+  const result = await sweepWcAnonymisedOrders({ maxPages: 40 })
+  assert.equal(result.errors.length, 0)
+  assert.equal((await obligationIds(db, orders.map((o) => o.id))).size, orders.length, 'every order of the tie block, and those around it, is covered')
+  const windowed = store.calls.filter((c) => c.modified_before)
+  assert.ok(windowed.length >= 6, 'the window was read by offset, both passes')
+  assert.ok(windowed.some((c) => c.page === '2') && windowed.some((c) => c.page === '3'))
+  const state = JSON.parse((await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_cursor' } })).value) as { after: string; window?: unknown }
+  assert.equal(state.window, undefined, 'the window is closed')
+})
+
+test('[erasure] the per-run budget stops the sweep cleanly and the next run RESUMES from the persisted state, including inside a tie window', { skip }, async (t) => {
+  const db = await loadDb()
+  const base = 1_800_000_000 + Math.floor(Math.random() * 50_000_000)
+  const spread: FakeOrder[] = Array.from({ length: 250 }, (_, i) => ({ id: base + i, mod: T0 + i * 10_000, marked: true }))
+  const tie: FakeOrder[] = Array.from({ length: 230 }, (_, i) => ({ id: base + 5000 + i, mod: T0 + 9_000_000, marked: true }))
+  const orders = [...spread, ...tie]
+  await prepareSweep(db, t, () => orders.map((o) => o.id))
+  const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  const store = fakeWooStore(orders)
+  wcFetchImpl = store.impl
+  let runs = 0
+  let previousCalls = 0
+  for (; runs < 30; runs += 1) {
+    const result = await sweepWcAnonymisedOrders({ maxPages: 2 })
+    assert.equal(result.errors.length, 0)
+    assert.ok(store.calls.length - previousCalls <= 2, 'never more than the budget in one run')
+    previousCalls = store.calls.length
+    if (!result.budgetStop) break
+  }
+  assert.ok(runs >= 3 && runs < 30, `it took several budgeted runs (${runs + 1}) and finished`)
+  assert.equal((await obligationIds(db, orders.map((o) => o.id))).size, orders.length, 'every order was covered across the resumed runs')
+  // A wall-clock budget stops a run too.
+  let t0 = 0
+  const timed = await sweepWcAnonymisedOrders({ maxMs: 1000, now: () => (t0 += 600) })
+  assert.ok(timed.pages <= 2, 'the time budget stopped the run')
+})
+
+test('[erasure] an error mid-page leaves the cursor at a safe value, and the next run loses nothing', { skip }, async (t) => {
+  const db = await loadDb()
+  const base = 1_900_000_000 + Math.floor(Math.random() * 50_000_000)
+  const orders: FakeOrder[] = Array.from({ length: 250 }, (_, i) => ({ id: base + i, mod: T0 + i * 10_000, marked: true }))
+  await prepareSweep(db, t, () => orders.map((o) => o.id))
+  const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  const good = fakeWooStore(orders)
+  let n = 0
+  wcFetchImpl = async (path, params) => (++n === 2 ? { data: null, totalPages: 0, totalItems: 0, error: 'rate limited' } : good.impl(path, params))
+  const first = await sweepWcAnonymisedOrders({ maxPages: 20 })
+  assert.equal(first.errors.length, 1)
+  const state = JSON.parse((await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_cursor' } })).value) as { after: string }
+  assert.ok(Date.parse(state.after) <= orders[99]!.mod, 'the cursor is at or before the last order fully processed')
+  assert.equal((await obligationIds(db, orders.map((o) => o.id))).size, 100, 'exactly the first page was processed')
+  wcFetchImpl = good.impl
+  const second = await sweepWcAnonymisedOrders({ maxPages: 20 })
+  assert.equal(second.errors.length, 0)
+  assert.equal((await obligationIds(db, orders.map((o) => o.id))).size, 250, 'the next run covered everything')
+})
+
+test('[erasure] the backstop meets an UNHELD marked order while a stale first import of it is paused inside the lock: it waits, then erases what the import committed', { skip }, async (t) => {
   const db = await loadDb()
   const fx = await importFixture(db)
   const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
-  const unheld = fx.externalId + 71
-  const prior = await db.setting.findMany({ where: { key: { in: ['wc_sync_order_statuses', 'wc_initial_import_completed', 'wc_erasure_sweep_cursor'] } } })
+  const externalId = fx.externalId + 401
+  const tag = randomUUID().slice(0, 8)
+  const subject = { ...WC_ADDRESS, first_name: `Sweep${tag}`, last_name: `Race${tag}`, email: `sweep.${tag}@example.test` }
+  await prepareSweep(db, t, () => [externalId])
+  // The stale first import must be ADMITTED (the default selection), unlike the sweep tests above, which run under an empty one.
+  await db.setting.deleteMany({ where: { key: 'wc_sync_order_statuses' } })
   t.after(async () => {
-    wcFetchImpl = null
-    await db.setting.deleteMany({ where: { key: { in: ['wc_sync_order_statuses', 'wc_initial_import_completed', 'wc_erasure_sweep_cursor'] } } })
-    for (const row of prior) await db.setting.create({ data: { key: row.key, value: row.value } })
-    await db.activityLog.deleteMany({ where: { action: 'wc_anonymisation_sweep' } })
+    beforeUpsertCustomer = null
+    await cleanupImported(db, [externalId])
+    await db.customer.deleteMany({ where: { OR: [{ email: subject.email }, { lastName: subject.last_name }] } })
     await fx.cleanup()
   })
-  await db.setting.deleteMany({ where: { key: 'wc_erasure_sweep_cursor' } })
-  for (const [key, value] of [['wc_sync_order_statuses', '[]'], ['wc_initial_import_completed', 'true']] as const) await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
   const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
-  await db.storefrontOrderErasureObligation.create({ data: { connector: 'woocommerce', externalOrderId: String(fx.externalId) } })
-  t.after(async () => { await db.storefrontOrderErasureObligation.deleteMany({ where: { externalOrderId: String(fx.externalId) } }) })
-  const modified = '2026-11-05T10:00:00'
-  const calls: Array<{ path: string; params: Record<string, string> }> = []
-  const pages: unknown[][] = [[
-    { ...anonymisedPayload(fx.externalId, wcRateId), status: 'cancelled', date_modified_gmt: modified },           // marked AND held -> mirrored
-    { ...payload(fx.externalId + 72, wcRateId), date_modified_gmt: '2026-11-05T09:00:00' },                         // not marked -> ignored
-    { ...anonymisedPayload(unheld, wcRateId), date_modified_gmt: '2026-11-05T08:00:00' },                           // marked, NOT held -> ignored, nothing created
-  ], []]
-  wcFetchImpl = async (path, params) => { calls.push({ path, params }); return { data: pages[Math.min(calls.length - 1, pages.length - 1)], totalPages: 1, totalItems: 3 } }
-  const ordersBefore = await db.salesOrder.count()
-  const result = await sweepWcAnonymisedOrders()
-  assert.deepEqual([result.scanned, result.markedHeld, result.mirrored, result.errors.length], [3, 1, 1, 0])
-  assert.ok((await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })).erasedAt)
-  assert.equal(await db.salesOrder.count(), ordersBefore, 'the sweep created nothing')
-  assert.ok((await db.storefrontOrderErasureObligation.findUniqueOrThrow({ where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(fx.externalId) } } })).retiredAt, 'the backstop retired the open obligation for the order it erased')
-  assert.ok(calls.length >= 1 && calls.every((c) => c.path === '/orders' && c.params.status === 'any' && c.params.orderby === 'modified'), 'GET /orders, status=any')
-  assert.equal((await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_cursor' } })).value, new Date('2026-11-05T10:00:00Z').toISOString(), 'cursor = newest modified of the fully processed page')
-  const logged = await db.activityLog.findFirstOrThrow({ where: { action: 'wc_anonymisation_sweep' }, orderBy: { createdAt: 'desc' } })
-  assert.equal((logged.metadata as { mirrored: number }).mirrored, 1, 'the per-run count is logged')
-
-  // A read error on the page: reported, and the cursor does NOT move.
-  const before = (await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_cursor' } })).value
-  calls.length = 0
-  wcFetchImpl = async (path, params) => { calls.push({ path, params }); return { data: null, totalPages: 0, totalItems: 0, error: 'rate limited' } }
-  const failed = await sweepWcAnonymisedOrders()
-  assert.equal(failed.errors.length, 1)
-  assert.equal((await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_cursor' } })).value, before)
-  assert.equal(calls.length, 1, 'one GET, then it stopped')
+  let reached!: () => void
+  const atHook = new Promise<void>((r) => { reached = r })
+  let release!: () => void
+  const gate = new Promise<void>((r) => { release = r })
+  beforeUpsertCustomer = async () => { beforeUpsertCustomer = null; reached(); await gate }
+  const stale = importWcOrder({ ...payload(externalId, wcRateId), billing: subject, shipping: subject } as never)
+  await atHook
+  wcFetchImpl = fakeWooStore([{ id: externalId, mod: T0, marked: true }]).impl
+  let done = false
+  const sweeping = sweepWcAnonymisedOrders({ maxPages: 3 }).then((r) => { done = true; return r })
+  await new Promise((r) => setTimeout(r, 1500))
+  assert.equal(done, false, 'the sweep waits on the first-import lock: it does not decide on an unlocked read')
+  release()
+  await stale
+  const result = await sweeping
+  assert.equal(result.errors.length, 0)
+  const link = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })
+  const order = await db.salesOrder.findUniqueOrThrow({ where: { id: link.orderId } })
+  assert.ok(order.erasedAt, 'the order the stale import committed was erased')
+  assert.equal(await db.customer.count({ where: { OR: [{ email: subject.email }, { lastName: subject.last_name }] } }), 0, 'no customer holds the identity')
 })
 
-test('[erasure] the backstop rides the reconcile cadence only: reconcile and manual_reconcile run it (even with an empty selection), the frequent poll does not', { skip }, async (t) => {
-  const db = await loadDb()
-  const prior = await db.setting.findMany({ where: { key: { in: ['wc_sync_order_statuses', 'wc_initial_import_completed', 'wc_erasure_sweep_cursor'] } } })
-  t.after(async () => {
-    wcFetchImpl = null
-    await db.setting.deleteMany({ where: { key: { in: ['wc_sync_order_statuses', 'wc_initial_import_completed', 'wc_erasure_sweep_cursor'] } } })
-    for (const row of prior) await db.setting.create({ data: { key: row.key, value: row.value } })
-    await db.activityLog.deleteMany({ where: { action: 'wc_anonymisation_sweep' } })
-  })
-  for (const [key, value] of [['wc_sync_order_statuses', '[]'], ['wc_initial_import_completed', 'true']] as const) await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
-  await db.setting.deleteMany({ where: { key: 'wc_erasure_sweep_cursor' } })
-  const { syncNewWcOrders } = await import('@/lib/connectors/woocommerce/sync/order-import')
-  const seen: string[] = []
-  wcFetchImpl = async (_path, params) => { seen.push(params.status ?? ''); return { data: [], totalPages: 1, totalItems: 0 } }
-  await syncNewWcOrders({ mode: 'poll' })
-  assert.deepEqual(seen, [], 'the empty selection fetches nothing on the poll, and the poll never runs the backstop')
-  await syncNewWcOrders({ mode: 'reconcile' })
-  await syncNewWcOrders({ mode: 'manual_reconcile' })
-  assert.deepEqual(seen, ['any', 'any'], 'each reconcile runs the backstop once (status=any), selection empty or not')
-})
 
 test('[erasure] a burst of first imports larger than the application pool, a marked one among them, all complete: the lock never takes a connection of the main pool', { skip }, async (t) => {
   const db = await loadDb()
@@ -2144,4 +2279,23 @@ test('[erasure] erasing a HELD order through the mirror retires an open obligati
   assert.equal((await importWcOrder(anonymisedPayload(fx.externalId, wcRateId) as never)).success, true)
   assert.ok((await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })).erasedAt)
   assert.ok((await db.storefrontOrderErasureObligation.findUniqueOrThrow({ where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(fx.externalId) } } })).retiredAt, 'retired after erasing the held order')
+})
+
+test('[erasure] the backstop cadence: due when never run, not due again within a day, due again while a budget stop left a backlog', { skip }, async (t) => {
+  const db = await loadDb()
+  const keys = ['wc_erasure_sweep_last_run_at', 'wc_erasure_sweep_backlog']
+  await prepareSweep(db, t, () => [])
+  t.after(async () => { await db.setting.deleteMany({ where: { key: { in: keys } } }) })
+  await db.setting.deleteMany({ where: { key: { in: keys } } })
+  const { runWcErasureSweepIfDue } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  const store = fakeWooStore([])
+  wcFetchImpl = store.impl
+  const first = await runWcErasureSweepIfDue()
+  assert.ok(!('skipped' in first), 'never run: due')
+  const second = await runWcErasureSweepIfDue()
+  assert.deepEqual(second, { skipped: true, reason: 'not_due' })
+  assert.equal(store.calls.length, 1, 'a tick that is not due adds no request')
+  await db.setting.upsert({ where: { key: 'wc_erasure_sweep_backlog' }, create: { key: 'wc_erasure_sweep_backlog', value: 'true' }, update: { value: 'true' } })
+  const third = await runWcErasureSweepIfDue()
+  assert.ok(!('skipped' in third), 'a backlog makes the next tick due')
 })

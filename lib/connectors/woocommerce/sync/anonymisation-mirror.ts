@@ -30,7 +30,7 @@ export async function mirrorWcAnonymisation(orderId: string): Promise<{ erasedNo
  * under the first-import lock so an in-flight first import of the same order has committed (or not started) when the link is read. Throws on a
  * failure or a lock that cannot be had in time, so the delivery is retried. Returns whether an order was held.
  */
-export async function mirrorWcAnonymisationIfHeld(wcOrder: { id: number | string }): Promise<{ held: boolean }> {
+export async function mirrorWcAnonymisationIfHeld(wcOrder: { id: number | string }): Promise<{ held: false } | { held: true; erasedNow: boolean }> {
   return withWcFirstImportLock(wcOrder.id, async () => {
     const link = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) }, select: { orderId: true } })
     if (!link) {
@@ -38,8 +38,8 @@ export async function mirrorWcAnonymisationIfHeld(wcOrder: { id: number | string
       await recordWcErasureObligation(wcOrder.id)
       return { held: false }
     }
-    await mirrorWcAnonymisation(link.orderId)
+    const mirrored = await mirrorWcAnonymisation(link.orderId)
     await retireWcErasureObligation(wcOrder.id)
-    return { held: true }
+    return { held: true, erasedNow: mirrored.erasedNow }
   })
 }
