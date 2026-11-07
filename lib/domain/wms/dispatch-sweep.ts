@@ -856,10 +856,10 @@ export function dispositionDespatchTime(
  * With a readable storefront `cutoff` (none configured: nothing is held, the existing shadowed path applies):
  *  - any value unreadable, or whose range STRADDLES the cutoff (it could be after it): HOLD pending, no write;
  *  - every value wholly AFTER the cutoff: complete normally;
- *  - any value wholly BEFORE the cutoff (a pre-cutover despatch; the incumbent writer owns its storefront side): if `now` is before the
+ *  - EVERY value wholly BEFORE the cutoff, none after (a pre-cutover despatch; the incumbent writer owns its storefront side): if `now` is before the
  *    cutoff, complete in IMS with `storefrontAlreadyCompleted`, which suppresses every order-level storefront write whatever the
- *    clock says when the job is enqueued; if `now` is at or after the cutoff, HOLD pending (a follow-up will verify these by the
- *    fresh read).
+ *    clock says when the job is enqueued; if `now` is at or after the cutoff, `verify` (the fresh read-only storefront look);
+ *  - values on BOTH sides of the cutoff (mixed): IMS owns the completion, as for a mixed split order: complete normally.
  * Entries with no value keep the old behaviour.
  */
 export function orderLevelDespatchDecision(
@@ -872,20 +872,29 @@ export function orderLevelDespatchDecision(
 ): { action: 'complete'; storefrontAlreadyCompleted: boolean; fence?: PreCutoverFence } | { action: 'verify' } | { action: 'hold'; reason: string } {
   if (reading === undefined || cutoff === null) return { action: 'complete', storefrontAlreadyCompleted: false }
   let before = false
+  let after = false
   // No usable despatch time is never "wholly after" by default: it is live only when the order cannot have been despatched before
   // the cutoff (IMS sent it to the WMS at or after it); otherwise the time is unknown and the order is held.
   if (hasUndatedDespatch(tracking) && (lowerBound === null || lowerBound.getTime() < cutoff.getTime())) {
     return { action: 'hold', reason: 'it has no despatch time and could have been despatched before the storefront went live' }
   }
+  // An undated entry that cannot predate the cutoff (the lower bound is at or after it) is wholly after it.
+  if (hasUndatedDespatch(tracking)) after = true
   for (const entry of tracking) {
     if (!entry.despatchedAt) continue
     const range = despatchInstantRange(entry.despatchedAt, reading)
     if (range === null) return { action: 'hold', reason: 'its despatch time cannot be read' }
     if (range.to.getTime() < cutoff.getTime()) before = true
     else if (range.from.getTime() < cutoff.getTime()) return { action: 'hold', reason: 'its despatch time could fall either side of the storefront go-live instant' }
+    else after = true
   }
   if (!before) return { action: 'complete', storefrontAlreadyCompleted: false }
   if (now.getTime() < cutoff.getTime()) return { action: 'complete', storefrontAlreadyCompleted: true }
+  // MIXED (some despatch wholly before the cutoff, some wholly after it): the order's latest despatch is live, so IMS owns the
+  // completion, exactly as the split-part path treats a mixed order (any part pushed live: no "already completed" flag, normal
+  // completion through the producer seam and the outbound-hold gates). Waiting for the storefront to show it completed would
+  // refuse for ever when the earlier writer only handled its own pre-cutover part.
+  if (after) return { action: 'complete', storefrontAlreadyCompleted: false }
   // Despatched wholly before the cutover and swept after it: the caller verifies by the fresh read-only storefront look (the same
   // verifier as a split part) and completes IMS-only if it passes, otherwise holds.
   return { action: 'verify' }

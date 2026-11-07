@@ -1048,6 +1048,41 @@ test('ORDER LEVEL, NOT VERIFIED: a date-only or clock-change despatch has no exa
   })
 })
 
+test('ORDER LEVEL, MIXED: despatches on both sides of the cutover are IMS-owned: complete normally with no storefront read, even though the storefront order is not completed', async () => {
+  const AFTER = new Date('2026-07-01T00:00:00Z')
+  const twoEntries = (a: string, b: string): Part => ({
+    externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', dispatched: true,
+    tracking: [{ trackingNumber: 'TN-1', carrier: 'DPD', despatchedAt: a }, { trackingNumber: 'TN-2', carrier: 'DPD', despatchedAt: b }],
+  })
+  const shapes: Array<['single' | 'merged', Part[]]> = [
+    ['single', [twoEntries('2026-05-20T10:00:00', '2026-06-10T10:00:00')]],
+    ['single', [twoEntries('2026-06-10T10:00:00', '2026-05-20T10:00:00')]],
+    ['merged', [part(1, '2026-05-20T10:00:00'), part(2, '2026-06-10T10:00:00')]],
+    ['merged', [part(1, '2026-06-10T10:00:00'), part(2, '2026-05-20T10:00:00')]],
+  ]
+  for (const [shape, parts] of shapes) {
+    reset()
+    orderRead = wcOrder({ status: 'processing' })
+    await withEnv(LIVE_AT_CUTOFF, async () => {
+      const run = await sweep(parts, { zoneless: 'europe-london', shape, clock: AFTER })
+      assert.equal(run.out.counters.dispatched, 1, shape)
+      assert.deepEqual(run.applyOptions, [undefined], `${shape}: the normal completion, no already-completed flag`)
+      assert.deepEqual(run.asked, [], `${shape}: the storefront is not asked`)
+      assert.deepEqual(reads(), [], shape)
+    })
+  }
+  // a mixed order with a straddling entry is still held; an all-before order is still verified
+  reset()
+  await withEnv(LIVE_AT_CUTOFF, async () => {
+    const held = await sweep([twoEntries('2026-06-01', '2026-06-10T10:00:00')], { zoneless: 'europe-london', shape: 'single', clock: AFTER })
+    assert.equal(held.out.counters.dispatched, 0)
+    const allBefore = await sweep([twoEntries('2026-05-20T10:00:00', '2026-05-22T10:00:00')], { zoneless: 'europe-london', shape: 'single', clock: AFTER })
+    assert.equal(allBefore.out.counters.dispatched, 1)
+    assert.deepEqual(allBefore.applyOptions, [{ storefrontAlreadyCompleted: true }])
+    assert.equal(allBefore.asked.length, 1)
+  })
+})
+
 test('ORDER LEVEL, CUTOFF STATE: no cutoff holds nothing; a future cutoff holds only what could be after it; a past cutoff is covered above', async () => {
   const sweepAt = async (cutoff: string | undefined, at: string) => {
     reset()
