@@ -112,10 +112,16 @@ export async function sweepWcAnonymisedOrders(
   const now = options.now ?? Date.now
   const startedAt = now()
   const result: WcErasureSweepResult = { pages: 0, scanned: 0, markedHeld: 0, mirrored: 0, alreadyErased: 0, obligationsRecorded: 0, budgetStop: false, errors: [] }
-  const initial = await db.setting.findUnique({ where: { key: 'wc_initial_import_completed' } })
-  if (initial?.value !== 'true') return result // nothing is held before the initial import
+  // NOT GATED on the initial import. The initial import commits orders before it sets its completion flag and can stay incomplete for days, so a gate
+  // would leave an order it already imported unprotected. The sweep is read-only toward WooCommerce and only erases held orders / records obligations,
+  // all under the first-import lock, so it serialises with the import and is safe while it runs.
 
   let state: State = options.since ? { after: options.since.toISOString() } : await loadState(startedAt)
+  // THE INITIAL CURSOR IS PERSISTED AT ONCE, so a run that fails before its first page does not slide the seven-day window forward on the next run.
+  // now - 7 days is enough without an "earliest held order" anchor because the sweep runs from the first tick after deploy (not after the initial
+  // import completes): an anonymisation made while the initial import is still running lies after that start and is read, and one made before this
+  // feature existed is the pre-feature backlog the seven-day decision deliberately does not backfill.
+  if (!options.since && (await db.setting.findUnique({ where: { key: WC_ERASURE_SWEEP_CURSOR_KEY } })) === null) await saveState(state)
   const seen = new Set<number>()
   let caughtUp = false
 
@@ -195,7 +201,10 @@ export async function sweepWcAnonymisedOrders(
 
   // Bookkeeping for the cadence (runWcErasureSweepIfDue): when it last ran, and whether a budget stop left work to resume.
   const stamp = new Date().toISOString()
-  for (const [key, value] of [[WC_ERASURE_SWEEP_LAST_RUN_KEY, stamp], [WC_ERASURE_SWEEP_BACKLOG_KEY, result.budgetStop ? 'true' : 'false']] as const) {
+  // The 6-hour cadence applies only after a CONFIRMED caught-up run (a short final page, no error). ANY incomplete run (a read error, a mirror error, a
+  // budget stop) leaves the backlog flag set, so the very next tick retries.
+  const caughtUpClean = caughtUp && result.errors.length === 0 && !result.budgetStop
+  for (const [key, value] of [[WC_ERASURE_SWEEP_LAST_RUN_KEY, stamp], [WC_ERASURE_SWEEP_BACKLOG_KEY, caughtUpClean ? 'false' : 'true']] as const) {
     await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
   }
   await logActivity({
@@ -236,4 +245,32 @@ export async function runWcErasureSweepIfDue(): Promise<WcErasureSweepResult | {
   } catch (e) {
     return { errors: [`WooCommerce anonymisation sweep failed: ${e instanceof Error ? e.constructor.name : typeof e}`] }
   }
+}
+
+/**
+ * Run the host job's own work, then ALWAYS attempt the erasure sweep, whatever the first did: a permanently unresolved withdrawal (a 404 from the
+ * store, say) makes the host job fail every tick, and the sweep must not be starved by it. The host's failure is then re-raised with the erasure
+ * outcome attached, so the cron's status and health semantics for the withdrawal part are unchanged.
+ */
+export async function runWithErasureSweepAlways<T extends Record<string, unknown>>(
+  hostWork: () => Promise<T>,
+  sweep: () => Promise<unknown> = runWcErasureSweepIfDue,
+): Promise<T & { erasureSweep: unknown }> {
+  let outcome: { ok: true; value: T } | { ok: false; error: unknown }
+  try {
+    outcome = { ok: true, value: await hostWork() }
+  } catch (error) {
+    outcome = { ok: false, error }
+  }
+  let erasureSweep: unknown
+  try {
+    erasureSweep = await sweep()
+  } catch (e) {
+    erasureSweep = { errors: [`WooCommerce anonymisation sweep failed: ${e instanceof Error ? e.constructor.name : typeof e}`] }
+  }
+  if (!outcome.ok) {
+    if (outcome.error instanceof Error) outcome.error.message += ` [erasure sweep: ${JSON.stringify(erasureSweep)}]`
+    throw outcome.error
+  }
+  return { ...outcome.value, erasureSweep }
 }

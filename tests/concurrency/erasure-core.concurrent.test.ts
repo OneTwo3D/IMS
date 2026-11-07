@@ -2336,3 +2336,51 @@ test('[erasure] an order that FLIPS from unmarked to marked between two page rea
   assert.equal((await obligationIds(db, [orders[10]!.id])).has(orders[10]!.id), true, 'the marked version was evaluated and left its obligation')
   assert.equal((await obligationIds(db, orders.filter((o) => !o.marked).map((o) => o.id))).size, 0, 'and nothing else did')
 })
+
+test('[erasure] the backstop is NOT gated on the initial import: an order held during an incomplete initial import, anonymised with its webhook missed, is swept', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  await prepareSweep(db, t, () => [fx.externalId])
+  t.after(async () => { await fx.cleanup() })
+  await db.setting.upsert({ where: { key: 'wc_initial_import_completed' }, create: { key: 'wc_initial_import_completed', value: 'false' }, update: { value: 'false' } })
+  const { sweepWcAnonymisedOrders } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  wcFetchImpl = fakeWooStore([{ id: fx.externalId, mod: T0 + 1000, marked: true }]).impl
+  const result = await sweepWcAnonymisedOrders()
+  assert.equal(result.markedHeld, 1)
+  assert.ok((await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })).erasedAt, 'the held order was erased although the initial import never completed')
+})
+
+test('[erasure] the initial cursor is persisted at once, and ANY incomplete run (read error, mirror error, budget stop) leaves the backlog set so the next tick retries; only a confirmed caught-up run starts the 6-hour cadence', { skip }, async (t) => {
+  const db = await loadDb()
+  const keys = ['wc_erasure_sweep_last_run_at', 'wc_erasure_sweep_backlog']
+  await prepareSweep(db, t, () => [])
+  t.after(async () => { await db.setting.deleteMany({ where: { key: { in: keys } } }) })
+  await db.setting.deleteMany({ where: { key: { in: [...keys, 'wc_erasure_sweep_cursor'] } } })
+  const { sweepWcAnonymisedOrders, runWcErasureSweepIfDue } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  const backlog = async () => (await db.setting.findUniqueOrThrow({ where: { key: 'wc_erasure_sweep_backlog' } })).value
+
+  // A read error on the very first request: the run is incomplete, the initial cursor was still persisted, and the next tick is due.
+  wcFetchImpl = async () => ({ data: null, totalPages: 0, totalItems: 0, error: 'rate limited' })
+  const failed = await sweepWcAnonymisedOrders()
+  assert.equal(failed.errors.length, 1)
+  assert.ok(await db.setting.findUnique({ where: { key: 'wc_erasure_sweep_cursor' } }), 'the initial cursor was persisted before the failing read')
+  assert.equal(await backlog(), 'true', 'a read error leaves the backlog set')
+  const retry = fakeWooStore([])
+  wcFetchImpl = retry.impl
+  assert.ok(!('skipped' in (await runWcErasureSweepIfDue())), 'and the very next tick retries')
+
+  // A budget stop is incomplete too.
+  const base = 1_970_000_000 + Math.floor(Math.random() * 20_000_000)
+  const many: FakeOrder[] = Array.from({ length: 250 }, (_, i) => ({ id: base + i, mod: Date.now() - 3_000_000 + i * 1000, marked: false }))
+  wcFetchImpl = fakeWooStore(many).impl
+  const stopped = await sweepWcAnonymisedOrders({ maxPages: 1 })
+  assert.equal(stopped.budgetStop, true)
+  assert.equal(await backlog(), 'true')
+
+  // A confirmed caught-up run (a short final page, no errors) clears it, and the next tick is then NOT due.
+  wcFetchImpl = fakeWooStore([]).impl
+  const clean = await sweepWcAnonymisedOrders({ maxPages: 20 })
+  assert.equal(clean.errors.length, 0)
+  assert.equal(await backlog(), 'false')
+  assert.deepEqual(await runWcErasureSweepIfDue(), { skipped: true, reason: 'not_due' })
+})

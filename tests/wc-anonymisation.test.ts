@@ -52,11 +52,27 @@ test('census: every caller of extractWcTracking is classified (WooCommerce keeps
 test('census: the erasure sweep rides the 15-minute wc-withdrawal-sweep job, last, and neither runWcReconcile, the wc-reconcile cron nor syncNewWcOrders runs it', async () => {
   const { readFileSync } = await import('node:fs')
   const route = readFileSync('app/api/cron/wc-withdrawal-sweep/route.ts', 'utf8')
-  assert.ok(route.indexOf('runWcErasureSweepIfDue()') > route.indexOf('drainWcOrderAdmissionRefusals()'), 'it runs after every existing step of the host job')
+  assert.ok(route.includes('runWithErasureSweepAlways(') && route.indexOf('runWithErasureSweepAlways(') < route.indexOf('sweepWithdrawalSuppressions()'), 'the host job\'s own work runs INSIDE the always-sweep wrapper, so a withdrawal failure cannot starve the sweep')
   assert.ok(!readFileSync('app/api/cron/wc-reconcile/route.ts', 'utf8').includes('anonymisation-sweep'), 'the daily reconcile cron is unchanged')
   assert.ok(!readFileSync('lib/connectors/woocommerce/sync/reconcile.ts', 'utf8').includes('anonymisation-sweep'), 'and so are the reconcile steps')
   assert.ok(!readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8').includes('anonymisation-sweep'), 'and the existing order sweep does not run the backstop, so its request pattern is unchanged')
   for (const file of ['app/api/shopping/manual-sync/route.ts', 'app/actions/wc-sync.ts']) {
     assert.ok(readFileSync(file, 'utf8').includes('runWcErasureSweep'), `${file} runs the backstop after a manual order reconcile`)
   }
+})
+
+test('runWithErasureSweepAlways: the sweep is attempted even when the host work throws, the failure is re-raised with the outcome attached, and a sweep that throws never hides a host result', async () => {
+  const { runWithErasureSweepAlways } = await import('@/lib/connectors/woocommerce/sync/anonymisation-sweep')
+  let swept = 0
+  const sweep = async () => { swept += 1; return { pages: 1 } }
+  await assert.rejects(
+    () => runWithErasureSweepAlways(async () => { throw new Error('1 withdrawal suppression(s) could not be resolved') }, sweep),
+    (e: Error) => /could not be resolved/.test(e.message) && /erasure sweep: \{"pages":1\}/.test(e.message),
+  )
+  assert.equal(swept, 1, 'the sweep ran although the host work failed')
+  const ok = await runWithErasureSweepAlways(async () => ({ scanned: 3 }), sweep)
+  assert.deepEqual(ok, { scanned: 3, erasureSweep: { pages: 1 } })
+  const ok2 = await runWithErasureSweepAlways(async () => ({ scanned: 3 }), async () => { throw new Error('boom') })
+  assert.equal(ok2.scanned, 3)
+  assert.match(JSON.stringify(ok2.erasureSweep), /sweep failed: Error/)
 })
