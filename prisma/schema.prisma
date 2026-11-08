@@ -4889,3 +4889,15 @@ model StorefrontOrderErasureObligation {
   @@id([connector, externalOrderId])
   @@map("storefront_order_erasure_obligations")
 }
+
+/// A customer-keyed erasure tombstone: this storefront account was erased at `erasedAt`. It holds NO raw identifier, only a hash of the connector and the
+/// storefront customer id, so a delivery for one of the account's orders that arrives after the erasure (or was inserted while it was uncommitted) is
+/// recognised and projected without the customer id being kept. Orders created AFTER `erasedAt` are new data from a still-existing account and are left alone.
+model StorefrontCustomerErasureTombstone {
+  connector       String
+  customerKeyHash String
+  erasedAt        DateTime
+
+  @@id([connector, customerKeyHash])
+  @@map("storefront_customer_erasure_tombstones")
+}

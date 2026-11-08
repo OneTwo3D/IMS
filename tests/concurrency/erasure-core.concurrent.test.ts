@@ -2616,11 +2616,15 @@ test('[erasure] the audit events of an UNLINKED return hold the marker after the
   const inbox = await db.wmsReturnsInbox.create({ data: { connector: 'mintsoft', externalReturnId: returnId, orderId: null, reference: order.orderNumber, reason: `${FULL_NAME} says broken` } as never })
   inboxId = inbox.id
   await db.wmsMutationEvent.create({ data: { connector: 'mintsoft', direction: 'INBOUND', action: 'return_inbox', outcome: 'SUCCEEDED', entityType: 'RETURN', entityId: inbox.id, summary: 's', before: null, after: { reason: `${FULL_NAME} says broken`, sku: 'SKU-RET' } } as never })
+  // An event whose reasons are ALREADY marked but whose resolution note is not: each of the four values is checked on its own.
+  const half = await db.wmsMutationEvent.create({ data: { connector: 'mintsoft', direction: 'INBOUND', action: 'return_inbox', outcome: 'SUCCEEDED', entityType: 'RETURN', entityId: inbox.id, summary: 's', before: { reason: 'Text removed by GDPR erasure', resolutionNote: `${FULL_NAME} refunded` }, after: { reason: 'Text removed by GDPR erasure', resolutionNote: `${FULL_NAME} refunded` } } as never })
   assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
   const events = async () => db.wmsMutationEvent.findMany({ where: { entityType: 'RETURN', action: 'return_inbox', entityId: inbox.id } })
   const first = await events()
   assert.ok(first.length >= 1 && first.every((e) => !JSON.stringify(e).includes(NAME.last)), 'the existing event holds no name')
   assert.equal((first[0]!.after as { reason: string }).reason, 'Text removed by GDPR erasure')
+  const halfAfter = await db.wmsMutationEvent.findUniqueOrThrow({ where: { id: half.id } })
+  assert.ok(!JSON.stringify(halfAfter).includes(NAME.last), 'an unmarked resolution note next to a marked reason is scrubbed too')
   // A later poll of the same return: the event it writes carries no reason.
   pollReturnsRecords = () => [{ externalReturnId: returnId, externalWarehouseId: `ext-${uid}`, sku: 'SKU-RET', qty: 1, orderReference: 'NO-SUCH-REFERENCE', reason: `${FULL_NAME} says it arrived broken`, receivedAt: '2026-11-04T10:00:00.000Z', raw: { Name: FULL_NAME } }]
   await runMintsoftReturnsSync('test')

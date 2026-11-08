@@ -448,7 +448,7 @@ async function eraseUnderLocksInTx(
   // THE RAW PAYLOAD COPIES (webhook inbox, queue snapshots, refund parks, tracking logs, warehouse return records), projected in this same transaction:
   // a failure here fails the whole erasure, so raw identity cannot be left behind silently. See raw-payloads.ts.
   const rawSubject = await loadRawPayloadSubject(tx, orderIds, storefrontCustomerIds)
-  const rawCounts = await scrubRawPayloadsInTx(tx, rawSubject.subject, rawSubject.missing)
+  const rawCounts = await scrubRawPayloadsInTx(tx, rawSubject.subject, rawSubject.missing, erasedAt)
   const counts: ErasureCounts = { customers: eraseCustomer ? 1 : 0, shoppingCustomerLinks: links.count, activityRowsScrubbed, linkedFreeTextScrubbed, ...rawCounts, ...orderCounts }
   const record = {
     tag: 'sales',

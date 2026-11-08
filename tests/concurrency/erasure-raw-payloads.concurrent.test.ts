@@ -668,3 +668,80 @@ test('[raw payloads] coupon_info carrying an email keeps only its type: the clas
     assert.equal(JSON.stringify(projected).includes('example.test'), false, label)
   }
 })
+
+test('[raw payloads] structured fields are rebuilt from typed fields: taxes, cost_of_goods_sold and a nested value under a scalar key cannot carry an added field, in any shape', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  t.after(async () => { await fx.cleanup() })
+  const rate = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const shapes = (id: string): unknown[] => [id, [id], { a: id }, { total: id, subtotal: id, note: id, nested: { who: id } }, [{ id: rate, total: '1.00', subtotal: '1.00', email: id, meta: { who: id } }], { total_value: '5.00', note: id }]
+  for (const id of [FULL_NAME, EMAIL, PHONE, STREET]) {
+    for (const shape of shapes(id)) {
+      const order = rawOrder(fx, rate, {
+        cost_of_goods_sold: shape, store_credit_used: shape, customer_note: shape, currency: shape, total: shape, discount_total: shape,
+        line_items: [{ id: 1, product_id: 1, quantity: 1, price: shape, taxes: shape, cost_of_goods_sold: shape, cogs_value: shape, meta_data: [] }],
+        shipping_lines: [{ id: 2, method_id: 'flat_rate', total: '5.00', taxes: shape, meta_data: [] }],
+        fee_lines: [{ id: 3, name: 'x', total: '1.00', taxes: shape, meta_data: [] }],
+      })
+      const p = (await db.$queryRaw<Array<{ p: Record<string, any> }>>`SELECT gdpr_project_wc_order(${JSON.stringify(order)}::jsonb) AS p`)[0]!.p // eslint-disable-line @typescript-eslint/no-explicit-any
+      for (const frag of [NAME.first, NAME.last, 'example.test', '7700', 'Marmalade']) assert.equal(JSON.stringify(p).includes(frag), false, `"${frag}" survived a ${JSON.stringify(shape).slice(0, 60)}`)
+      assert.equal('cost_of_goods_sold' in p, false, 'cost_of_goods_sold has no reader and is dropped')
+      for (const line of [...p.line_items, ...p.shipping_lines, ...p.fee_lines]) {
+        for (const tax of line.taxes ?? []) assert.deepEqual(Object.keys(tax).filter((k) => !['id', 'total', 'subtotal'].includes(k)), [], 'a tax entry holds only id, total, subtotal')
+      }
+    }
+  }
+  // the typed fields themselves survive
+  const ok = (await db.$queryRaw<Array<{ p: { line_items: Array<{ taxes: unknown }> } }>>`SELECT gdpr_project_wc_order(${JSON.stringify(rawOrder(fx, rate))}::jsonb) AS p`)[0]!.p
+  assert.deepEqual(ok.line_items[0]!.taxes, [{ id: rate, total: '20.00', subtotal: '20.00' }])
+})
+
+test('[raw payloads] a customer TOMBSTONE (hash only) catches a delivery inserted between the scan and the commit, and leaves an order created after the erasure live', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const cleanups: Array<() => Promise<void>> = []
+  const lateId = fx.externalId + 8_000_000_000
+  const earlyId = fx.externalId + 9_000_000_000
+  t.after(async () => {
+    await db.$executeRawUnsafe('ALTER TABLE "shopping_webhook_events" ENABLE TRIGGER "shopping_webhook_events_erased_projection"')
+    for (const c of cleanups) await c()
+    await db.storefrontOrderErasureObligation.deleteMany({ where: { externalOrderId: { in: [String(lateId), String(earlyId)] } } })
+    await db.storefrontCustomerErasureTombstone.deleteMany({})
+    await fx.cleanup()
+  })
+  const rate = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { reconcileRawPayloads } = await import('@/lib/domain/erasure/raw-payloads')
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  // The tombstone holds a hash and a time, never the id.
+  const tombs = await db.storefrontCustomerErasureTombstone.findMany()
+  const expected = createHash('sha256').update(`woocommerce:${fx.wooCustomerId}`).digest('hex')
+  assert.ok(tombs.some((x) => x.customerKeyHash === expected), 'the tombstone is the sha256 of connector:customer id')
+  assert.equal(JSON.stringify(tombs).includes(String(fx.wooCustomerId)), false, 'no raw customer id in the tombstone')
+  const body = (id: number, created: string) => rawOrder(fx, rate, { id, number: String(id), date_created_gmt: created, date_created: created })
+  const mk = async (b: unknown) => {
+    const row = await db.shoppingWebhookEvent.create({ data: { connector: 'woocommerce', resource: 'orders', topic: 'order.created', payloadHash: sha(randomUUID()), payloadJson: b as never, status: 'PENDING' } })
+    cleanups.push(async () => { await db.shoppingWebhookEvent.deleteMany({ where: { id: row.id } }) })
+    return row.id
+  }
+  // (a) an order created BEFORE the erasure, inserted while the trigger could not see the marker: the reconcile finds it by the tombstone.
+  await db.$executeRawUnsafe('ALTER TABLE "shopping_webhook_events" DISABLE TRIGGER "shopping_webhook_events_erased_projection"')
+  const early = await mk(body(earlyId, '2020-01-01T00:00:00'))
+  const late = await mk(body(lateId, new Date(Date.now() + 86_400_000).toISOString().slice(0, 19)))
+  await db.$executeRawUnsafe('ALTER TABLE "shopping_webhook_events" ENABLE TRIGGER "shopping_webhook_events_erased_projection"')
+  assert.ok(leaks((await ev(db, early)).payloadJson).length > 3, 'PRECONDITION: the straggler is raw')
+  const out = await reconcileRawPayloads(db)
+  assert.equal(out.remaining, 0)
+  assert.deepEqual(leaks(await ev(db, early)), [], 'the delivery of the erased account is projected by the reconcile')
+  const ob = await db.storefrontOrderErasureObligation.findUnique({ where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(earlyId) } } })
+  assert.ok(ob && ob.retiredAt === null, 'and an order obligation is recorded for it')
+  // (b) an order created AFTER the erasure is new data from a still-existing account: it stays live, with no obligation.
+  assert.ok(leaks((await ev(db, late)).payloadJson).length > 3, 'an order created after the erasure stays live')
+  assert.equal(await db.storefrontOrderErasureObligation.count({ where: { externalOrderId: String(lateId) } }), 0)
+  // (c) with the trigger enabled, a new insert for an order created before the erasure is projected on insert and obligated.
+  const early2Id = earlyId + 1
+  const early2 = await mk(body(early2Id, '2020-01-02T00:00:00'))
+  assert.deepEqual(leaks((await ev(db, early2)).payloadJson), [])
+  assert.equal(await db.storefrontOrderErasureObligation.count({ where: { externalOrderId: String(early2Id), retiredAt: null } }), 1)
+  await db.storefrontOrderErasureObligation.deleteMany({ where: { externalOrderId: String(early2Id) } })
+})

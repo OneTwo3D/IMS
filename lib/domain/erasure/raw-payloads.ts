@@ -61,6 +61,7 @@ function webhookWhere(subject: Pick<RawPayloadSubject, 'storefrontOrderIds' | 's
     AND (gdpr_webhook_order_key(w."payloadJson", w."resource") = ANY(${text(subject.storefrontOrderIds)})
          OR (w."resource" = 'orders' AND (w."payloadJson"->>'customer_id') = ANY(${text(subject.storefrontCustomerIds)})))`
 }
+const syncLogDirty = Prisma.sql`gdpr_sync_log_row_dirty(l)`
 const webhookDirty = Prisma.sql`(w."payloadJson" IS DISTINCT FROM gdpr_project_webhook_payload(w."payloadJson", w."resource")
     OR (w."lastError" IS NOT NULL AND w."lastError" <> ${RAW_PAYLOAD_MARKER}::text))`
 
@@ -74,8 +75,18 @@ export async function loadRawPayloadSubject(tx: Client, orderIds: string[], stor
   return { subject: { orderIds, storefrontOrderIds: [...new Set(links.map((l) => l.externalOrderId))], storefrontCustomerIds: customerIds }, missing }
 }
 
-export async function scrubRawPayloadsInTx(tx: Client, subject: RawPayloadSubject, missing = 0): Promise<RawPayloadCounts> {
+export async function scrubRawPayloadsInTx(tx: Client, subject: RawPayloadSubject, missing = 0, erasedAt: Date = new Date()): Promise<RawPayloadCounts> {
   const counts: RawPayloadCounts = { ...EMPTY_RAW_PAYLOAD_COUNTS, storefrontIdMissing: missing }
+
+  // A CUSTOMER TOMBSTONE per storefront account erased here, holding only a hash of the id and the erasure time. It lets the guard triggers and the reconcile
+  // recognise a delivery for one of the account's orders that this transaction's scan cannot see (inserted before the commit, or arriving later), while an order
+  // created after `erasedAt` is new data from a still-existing account and is left alone.
+  for (const customerId of subject.storefrontCustomerIds) {
+    await tx.$executeRaw`
+      INSERT INTO "storefront_customer_erasure_tombstones" ("connector", "customerKeyHash", "erasedAt")
+      VALUES ('woocommerce', gdpr_customer_key_hash('woocommerce', ${customerId}::text), ${erasedAt})
+      ON CONFLICT ("connector", "customerKeyHash") DO UPDATE SET "erasedAt" = GREATEST("storefront_customer_erasure_tombstones"."erasedAt", EXCLUDED."erasedAt")`
+  }
 
   // (BEFORE the projection: it neutralises the customer id the rows are found by.) DELIVERIES FOR AN ORDER IMS DOES NOT HOLD (found through the customer id): the later-write guard, the reconcile and a later import look an order up
   // by its link or by an open erasure obligation, so without one a redelivery of that order would be stored in full and the order created identifiable.
@@ -174,21 +185,30 @@ export async function scrubRawPayloadsInTx(tx: Client, subject: RawPayloadSubjec
  * uncommitted (the trigger cannot see an uncommitted marker). Idempotent, batch-limited, run from the email-outbox cron after each drain.
  * Returns the rows changed and the rows still left (the batch limit, or a row the finder could not reach).
  */
+// A webhook delivery that belongs to an erased order, or to an order of an erased storefront account (customer tombstone), and still carries identity.
+const webhookReconcileWhere = Prisma.sql`w."connector" = 'woocommerce' AND w."resource" IN ('orders', 'refunds')
+  AND (gdpr_storefront_order_erased(gdpr_webhook_order_key(w."payloadJson", w."resource"))
+       OR (w."resource" = 'orders' AND gdpr_payload_customer_tombstoned(w."payloadJson"))) AND ${webhookDirty}`
+
 export async function reconcileRawPayloads(client: Pick<Prisma.TransactionClient, '$executeRaw' | '$queryRaw'>, batch = 500): Promise<{ projected: number; remaining: number }> {
+  // OBLIGATIONS FIRST: the projection neutralises the customer id a tombstone is matched by. An order of an erased account that IMS does not hold gets an open
+  // order obligation, so a later import creates it already erased.
+  await client.$queryRaw`
+    SELECT gdpr_record_order_obligation(x.k) FROM (SELECT DISTINCT gdpr_webhook_order_key(w."payloadJson", w."resource") AS k FROM "shopping_webhook_events" w
+      WHERE w."resource" = 'orders' AND gdpr_payload_customer_tombstoned(w."payloadJson") AND ${webhookDirty} LIMIT ${batch}) x`
+  await client.$queryRaw`
+    SELECT gdpr_record_order_obligation(x.k) FROM (SELECT DISTINCT l."externalId" AS k FROM "shopping_sync_logs" l
+      WHERE l."entityId" IS NULL AND l."payload" IS NOT NULL AND jsonb_typeof(l."payload") = 'object' AND gdpr_payload_customer_tombstoned(l."payload"->'order') AND ${syncLogDirty} LIMIT ${batch}) x`
   const projected = Number(await client.$executeRaw`
     UPDATE "shopping_webhook_events" w
        SET "payloadJson" = gdpr_project_webhook_payload(w."payloadJson", w."resource"),
            "lastError" = CASE WHEN w."lastError" IS NULL THEN NULL ELSE ${RAW_PAYLOAD_MARKER}::text END
-     WHERE w."id" IN (SELECT w2."id" FROM "shopping_webhook_events" w2 WHERE w2."connector" = 'woocommerce' AND w2."resource" IN ('orders', 'refunds')
-                         AND gdpr_storefront_order_erased(gdpr_webhook_order_key(w2."payloadJson", w2."resource"))
-                         AND (w2."payloadJson" IS DISTINCT FROM gdpr_project_webhook_payload(w2."payloadJson", w2."resource") OR (w2."lastError" IS NOT NULL AND w2."lastError" <> ${RAW_PAYLOAD_MARKER}::text)) LIMIT ${batch})`)
+     WHERE w."id" IN (SELECT w."id" FROM "shopping_webhook_events" w WHERE ${webhookReconcileWhere} LIMIT ${batch})`)
   const logs = Number(await client.$executeRaw`
     UPDATE "shopping_sync_logs" l
        SET "payload" = gdpr_project_sync_log_payload(l."payload"), "errorMessage" = gdpr_sync_log_row_message(l)
      WHERE l."id" IN (SELECT l2."id" FROM "shopping_sync_logs" l2 WHERE gdpr_sync_log_row_erased(l2) AND gdpr_sync_log_row_dirty(l2) LIMIT ${batch})`)
-  const leftWebhook = await client.$queryRaw<Array<{ n: bigint }>>`
-    SELECT count(*) AS n FROM "shopping_webhook_events" w WHERE w."connector" = 'woocommerce' AND w."resource" IN ('orders', 'refunds')
-       AND gdpr_storefront_order_erased(gdpr_webhook_order_key(w."payloadJson", w."resource")) AND ${webhookDirty}`
+  const leftWebhook = await client.$queryRaw<Array<{ n: bigint }>>`SELECT count(*) AS n FROM "shopping_webhook_events" w WHERE ${webhookReconcileWhere}`
   const leftLogs = await client.$queryRaw<Array<{ n: bigint }>>`SELECT count(*) AS n FROM "shopping_sync_logs" l WHERE gdpr_sync_log_row_erased(l) AND gdpr_sync_log_row_dirty(l)`
   return { projected: projected + logs, remaining: Number(leftWebhook[0]?.n ?? 0) + Number(leftLogs[0]?.n ?? 0) }
 }

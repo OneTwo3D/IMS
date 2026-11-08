@@ -166,6 +166,7 @@ ERASURE_CLASSIFICATION.ShoppingSyncLog = {
 }
 
 // Keyed by the storefront order id only; it carries no personal data (named in the schema test: no relation reaches it).
+ERASURE_CLASSIFICATION.StorefrontCustomerErasureTombstone = { erased: [], notPersonal: ['connector', 'customerKeyHash'], retained: {} } // a hash of connector + storefront customer id: no raw identifier
 ERASURE_CLASSIFICATION.StorefrontOrderErasureObligation = { erased: [], notPersonal: ['connector', 'externalOrderId'], retained: {} }
 
 export function classifiedColumns(model: string): string[] {

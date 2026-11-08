@@ -13,10 +13,24 @@
 -- ADDITIVE ONLY: functions and triggers; no table or column changes, no backfill (the erasure and its reconcile pass project existing rows).
 -- A row INSERTED while an erasure is still uncommitted is the one case a trigger cannot see; the reconcile pass clears it on its next run.
 
--- An object restricted to the named keys; any non-object input yields {}.
+-- A customer-keyed erasure tombstone (hash of connector + storefront customer id, and the erasure time; no raw identifier). See the schema comment.
+CREATE TABLE "storefront_customer_erasure_tombstones" (
+    "connector" TEXT NOT NULL,
+    "customerKeyHash" TEXT NOT NULL,
+    "erasedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "storefront_customer_erasure_tombstones_pkey" PRIMARY KEY ("connector","customerKeyHash")
+);
+
+CREATE OR REPLACE FUNCTION gdpr_customer_key_hash(connector text, customer_id text) RETURNS text LANGUAGE sql IMMUTABLE AS $$
+  SELECT encode(sha256(convert_to(connector || ':' || customer_id, 'UTF8')), 'hex')
+$$;
+
+-- An object restricted to the named keys and to SCALAR values (a key that arrives holding an object or array is dropped, so a nested field added upstream
+-- cannot ride along); any non-object input yields {}. Structured fields are rebuilt by their own functions below.
 CREATE OR REPLACE FUNCTION gdpr_keep_keys(src jsonb, keys text[]) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE WHEN src IS NULL OR jsonb_typeof(src) <> 'object' THEN '{}'::jsonb
-    ELSE COALESCE((SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each(src) e WHERE e.key = ANY(keys)), '{}'::jsonb) END
+    ELSE COALESCE((SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each(src) e WHERE e.key = ANY(keys) AND jsonb_typeof(e.value) NOT IN ('object', 'array')), '{}'::jsonb) END
 $$;
 
 -- Of the neutral replacements (an object), those whose key is present in src: a removed field keeps its TYPE so a replay does not trip over a missing key.
@@ -166,6 +180,30 @@ CREATE OR REPLACE FUNCTION gdpr_project_meta(meta jsonb, only_keys text[]) RETUR
   ), '[]'::jsonb) END
 $$;
 
+-- A readable (signed) number or numeric string stays; anything else is the fixed word 'unreadable'.
+CREATE OR REPLACE FUNCTION gdpr_number_or_unreadable(v jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'number' THEN v
+              WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^\s*-?[0-9]+(\.[0-9]+)?\s*$' THEN v
+              ELSE to_jsonb('unreadable'::text) END
+$$;
+
+-- Of `keys`, those present in src, each reduced to a number or 'unreadable'.
+CREATE OR REPLACE FUNCTION gdpr_numeric_for_present(src jsonb, keys text[]) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT COALESCE((SELECT jsonb_object_agg(k, gdpr_number_or_unreadable(src->k)) FROM unnest(keys) AS k WHERE src ? k), '{}'::jsonb)
+$$;
+
+-- A line's `taxes`: [{id, total, subtotal}] and nothing else (the importer reads taxes[].id as the storefront rate id). Not an array -> [].
+CREATE OR REPLACE FUNCTION gdpr_project_taxes(arr jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE WHEN arr IS NULL OR jsonb_typeof(arr) <> 'array' THEN '[]'::jsonb ELSE COALESCE((
+    SELECT jsonb_agg(
+             CASE WHEN jsonb_typeof(t->'id') = 'number' THEN jsonb_build_object('id', t->'id') ELSE '{}'::jsonb END
+             || gdpr_numeric_for_present(t, ARRAY['total', 'subtotal'])
+             ORDER BY ord)
+      FROM jsonb_array_elements(arr) WITH ORDINALITY AS x(t, ord)
+     WHERE jsonb_typeof(t) = 'object'
+  ), '[]'::jsonb) END
+$$;
+
 -- Each element of an array reduced to `keys`, plus a projected meta_data when with_meta; `only_keys` limits that meta (NULL = the allowlist).
 -- name_mode says what becomes of the element's free-text `name` (a personalised item can carry a recipient's name): 'sku' = the SKU (else 'Item'),
 -- 'fee' = a FIXED label per credit kind the coupon classifier reads (Smart coupon / Store credit / Gift card / Wallet; never the original text), else 'Fee'; anything else = no name.
@@ -173,6 +211,8 @@ $$;
 CREATE OR REPLACE FUNCTION gdpr_project_lines(arr jsonb, keys text[], with_meta boolean, only_keys text[], name_mode text DEFAULT 'none') RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE WHEN arr IS NULL OR jsonb_typeof(arr) <> 'array' THEN '[]'::jsonb ELSE COALESCE((
     SELECT jsonb_agg(gdpr_keep_keys(l, keys)
+        || CASE WHEN l ? 'taxes' THEN jsonb_build_object('taxes', gdpr_project_taxes(l->'taxes')) ELSE '{}'::jsonb END
+        || gdpr_numeric_for_present(l, ARRAY['cogs_value', 'id', 'product_id', 'variation_id', 'quantity', 'price', 'subtotal', 'subtotal_tax', 'total', 'total_tax', 'refund_total', 'instance_id', 'tax_total', 'shipping_tax_total', 'discount', 'discount_tax', 'rate_id', 'rate_percent'])
         || CASE WHEN with_meta AND l ? 'meta_data' THEN jsonb_build_object('meta_data', gdpr_project_meta(l->'meta_data', only_keys)) ELSE '{}'::jsonb END
         || CASE name_mode
              WHEN 'sku' THEN jsonb_build_object('name', COALESCE(NULLIF(l->>'sku', ''), 'Item'))
@@ -218,12 +258,16 @@ CREATE OR REPLACE FUNCTION gdpr_project_wc_order(o jsonb) RETURNS jsonb LANGUAGE
     gdpr_keep_keys(o, ARRAY['id', 'parent_id', 'number', 'status', 'currency', 'currency_symbol', 'version', 'created_via',
       'date_created', 'date_created_gmt', 'date_modified', 'date_modified_gmt', 'date_paid', 'date_paid_gmt', 'date_completed', 'date_completed_gmt',
       'prices_include_tax', 'discount_total', 'discount_tax', 'shipping_total', 'shipping_tax', 'cart_tax', 'total', 'total_tax',
-      'payment_method', 'payment_method_title', 'needs_payment', 'needs_processing', 'is_editable', 'wpo_wcpdf_invoice_number', 'cost_of_goods_sold', 'store_credit_used'])
+      'payment_method', 'payment_method_title', 'needs_payment', 'needs_processing', 'is_editable'])
+    || CASE WHEN o ? 'wpo_wcpdf_invoice_number' AND gdpr_project_meta_value('_wcpdf_invoice_number', o->'wpo_wcpdf_invoice_number') IS NOT NULL
+            THEN jsonb_build_object('wpo_wcpdf_invoice_number', gdpr_project_meta_value('_wcpdf_invoice_number', o->'wpo_wcpdf_invoice_number')) ELSE '{}'::jsonb END
+    || gdpr_numeric_for_present(o, ARRAY['store_credit_used', 'id', 'parent_id', 'discount_total', 'discount_tax', 'shipping_total', 'shipping_tax', 'cart_tax', 'total', 'total_tax'])
+    || CASE WHEN o ? 'currency' THEN jsonb_build_object('currency', CASE WHEN jsonb_typeof(o->'currency') = 'string' AND (o->>'currency') ~ '^[A-Za-z]{3}$' THEN o->'currency' ELSE to_jsonb('unreadable'::text) END) ELSE '{}'::jsonb END
     || gdpr_neutral_for_present(o, jsonb_build_object('customer_id', 0, 'customer_note', '', 'customer_ip_address', '', 'customer_user_agent', '', 'order_key', '', 'payment_url', '', 'cart_hash', '', 'transaction_id', '0'))
     || jsonb_build_object('billing', gdpr_empty_address(o->'billing'), 'shipping', gdpr_empty_address(o->'shipping'))
     || jsonb_build_object('meta_data', gdpr_project_meta(o->'meta_data', NULL))
     || jsonb_build_object('line_items', gdpr_project_lines(o->'line_items',
-         ARRAY['id', 'product_id', 'variation_id', 'sku', 'global_unique_id', 'quantity', 'price', 'subtotal', 'subtotal_tax', 'total', 'total_tax', 'tax_class', 'taxes', 'cogs_value', 'cost_of_goods_sold'], true, NULL, 'sku'))
+         ARRAY['id', 'product_id', 'variation_id', 'sku', 'global_unique_id', 'quantity', 'price', 'subtotal', 'subtotal_tax', 'total', 'total_tax', 'tax_class', 'taxes', 'cogs_value'], true, NULL, 'sku'))
     || jsonb_build_object('shipping_lines', gdpr_project_lines(o->'shipping_lines',
          ARRAY['id', 'method_id', 'method_title', 'instance_id', 'total', 'total_tax', 'taxes', 'tax_status'], true, NULL))
     || jsonb_build_object('fee_lines', gdpr_project_lines(o->'fee_lines', ARRAY['id', 'tax_class', 'tax_status', 'total', 'total_tax', 'taxes'], true, NULL, 'fee'))
@@ -238,6 +282,7 @@ CREATE OR REPLACE FUNCTION gdpr_project_wc_refund(r jsonb) RETURNS jsonb LANGUAG
   SELECT CASE WHEN r IS NULL OR jsonb_typeof(r) <> 'object' THEN r ELSE
     gdpr_keep_keys(r, ARRAY['id', 'parent_id', 'order_id', 'date_created', 'date_created_gmt', 'amount', 'reason', 'refunded_payment'])
     || gdpr_neutral_for_present(r, jsonb_build_object('refunded_by', 0))
+    || gdpr_numeric_for_present(r, ARRAY['id', 'parent_id', 'order_id', 'amount'])
     || jsonb_build_object('meta_data', '[]'::jsonb)
     || jsonb_build_object('line_items', gdpr_project_lines(r->'line_items',
          ARRAY['id', 'product_id', 'variation_id', 'quantity', 'tax_class', 'subtotal', 'subtotal_tax', 'total', 'total_tax', 'taxes', 'sku', 'refund_total'], true, ARRAY['_refunded_item_id'], 'sku'))
@@ -295,6 +340,37 @@ CREATE OR REPLACE FUNCTION gdpr_storefront_order_erased(external_order_id text) 
     OR EXISTS (SELECT 1 FROM "storefront_order_erasure_obligations" b WHERE b."connector" = 'woocommerce' AND b."externalOrderId" = external_order_id AND b."retiredAt" IS NULL))
 $$;
 
+-- A timestamp from the storefront's GMT date string, or NULL when it does not read as one.
+CREATE OR REPLACE FUNCTION gdpr_safe_timestamp(t text) RETURNS timestamp LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+  IF t IS NULL OR t !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}' THEN RETURN NULL; END IF;
+  RETURN substr(t, 1, 19)::timestamp;
+EXCEPTION WHEN others THEN
+  RETURN NULL;
+END
+$$;
+
+-- Whether a delivery's order belongs to an ERASED storefront account: its customer id hashes to a tombstone AND the order was created at or before the
+-- erasure (a missing or unreadable date counts as before: the safe side). An order created AFTER the erasure is new data from a still-existing account.
+CREATE OR REPLACE FUNCTION gdpr_payload_customer_tombstoned(p jsonb) RETURNS boolean LANGUAGE sql STABLE AS $$
+  SELECT COALESCE(p IS NOT NULL AND jsonb_typeof(p) = 'object' AND (p->>'customer_id') ~ '^[1-9][0-9]*$' AND EXISTS (
+    SELECT 1 FROM "storefront_customer_erasure_tombstones" t
+     WHERE t."connector" = 'woocommerce' AND t."customerKeyHash" = gdpr_customer_key_hash('woocommerce', p->>'customer_id')
+       AND (gdpr_safe_timestamp(p->>'date_created_gmt') IS NULL OR gdpr_safe_timestamp(p->>'date_created_gmt') <= t."erasedAt")), false)
+$$;
+
+-- Records an open erasure obligation for a storefront order IMS does not hold (idempotent; re-opens a retired one). A held order, or an id that is not
+-- a number, records nothing. Returns whether one is now open.
+CREATE OR REPLACE FUNCTION gdpr_record_order_obligation(external_order_id text) RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+  IF external_order_id IS NULL OR external_order_id !~ '^[0-9]+$' THEN RETURN false; END IF;
+  IF EXISTS (SELECT 1 FROM "shopping_order_links" l WHERE l."connector" = 'woocommerce' AND l."externalOrderId" = external_order_id) THEN RETURN false; END IF;
+  INSERT INTO "storefront_order_erasure_obligations" ("connector", "externalOrderId") VALUES ('woocommerce', external_order_id)
+    ON CONFLICT ("connector", "externalOrderId") DO UPDATE SET "retiredAt" = NULL;
+  RETURN true;
+END
+$$;
+
 CREATE OR REPLACE FUNCTION erased_wc_webhook_event_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
   marker CONSTANT text := 'Text removed by GDPR erasure';
@@ -302,7 +378,15 @@ DECLARE
 BEGIN
   IF NEW."connector" <> 'woocommerce' OR NEW."resource" NOT IN ('orders', 'refunds') THEN RETURN NEW; END IF;
   k := gdpr_webhook_order_key(NEW."payloadJson", NEW."resource");
-  IF k IS NULL OR NOT gdpr_storefront_order_erased(k) THEN RETURN NEW; END IF;
+  IF k IS NULL THEN RETURN NEW; END IF;
+  IF NOT gdpr_storefront_order_erased(k) THEN
+    -- an order of an erased storefront ACCOUNT that IMS does not hold: project it and open an order obligation, so a later import creates it erased
+    IF NEW."resource" = 'orders' AND gdpr_payload_customer_tombstoned(NEW."payloadJson") THEN
+      PERFORM gdpr_record_order_obligation(k);
+    ELSE
+      RETURN NEW;
+    END IF;
+  END IF;
   NEW."payloadJson" := gdpr_project_webhook_payload(NEW."payloadJson", NEW."resource");
   IF NEW."lastError" IS NOT NULL AND NEW."lastError" <> marker THEN NEW."lastError" := marker; END IF;
   RETURN NEW;
@@ -313,7 +397,8 @@ $$;
 CREATE OR REPLACE FUNCTION gdpr_sync_log_row_erased(l "shopping_sync_logs") RETURNS boolean LANGUAGE sql STABLE AS $$
   SELECT l."connector" = 'woocommerce' AND l."entityType" IN ('SalesOrder', 'ORDER') AND (
     (l."entityId" IS NOT NULL AND gdpr_order_id_erased(l."entityId"))
-    OR (l."entityId" IS NULL AND l."entityType" = 'SalesOrder' AND gdpr_storefront_order_erased(l."externalId")))
+    OR (l."entityId" IS NULL AND l."entityType" = 'SalesOrder' AND gdpr_storefront_order_erased(l."externalId"))
+    OR (l."entityId" IS NULL AND l."entityType" = 'SalesOrder' AND l."payload" IS NOT NULL AND jsonb_typeof(l."payload") = 'object' AND gdpr_payload_customer_tombstoned(l."payload"->'order')))
 $$;
 
 -- The error text the erasure leaves: the marker, except on a held-invoice park, whose text is a fixed IMS sentence naming an order number.
@@ -329,6 +414,9 @@ $$;
 CREATE OR REPLACE FUNCTION erased_wc_sync_log_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF NEW."connector" <> 'woocommerce' OR NOT gdpr_sync_log_row_erased(NEW) THEN RETURN NEW; END IF;
+  IF NEW."entityId" IS NULL AND NEW."payload" IS NOT NULL AND jsonb_typeof(NEW."payload") = 'object' AND gdpr_payload_customer_tombstoned(NEW."payload"->'order') THEN
+    PERFORM gdpr_record_order_obligation(NEW."externalId");
+  END IF;
   NEW."errorMessage" := gdpr_sync_log_row_message(NEW);
   NEW."payload" := gdpr_project_sync_log_payload(NEW."payload");
   RETURN NEW;
