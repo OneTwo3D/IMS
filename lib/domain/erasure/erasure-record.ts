@@ -91,7 +91,7 @@ export type ErasureCounts = {
 }
 
 /**
- * THE WAREHOUSE'S COPY, counted at erasure. Mintsoft has no erase endpoint and IMS may not rewrite a live order, so for each of the subject's orders that exists there
+ * THE WAREHOUSE'S COPY, counted at erasure. The warehouse has no erase endpoint and IMS may not rewrite a live order, so for each of the subject's orders that exists there
  * the record says which state it is in. `open` orders (pushed, not despatched, not cancelled) still hold the person's name and address: each is listed so an operator can
  * handle it by hand. Only the surrogate order id and the warehouse order NUMBER are listed (both are retained identifiers of an order, not of a person).
  */

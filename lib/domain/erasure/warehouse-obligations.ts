@@ -8,7 +8,7 @@ import {
 /**
  * THE WAREHOUSE'S COPY OF AN ERASED ORDER, enumerated at erasure (IMS only: nothing is written to the warehouse).
  *
- * Mintsoft exposes no erase endpoint, and the only way to change an order is a whole-order replace that IMS refuses unless the order is still new. An erasure
+ * The warehouse exposes no erase endpoint, and the only way to change an order is a whole-order replace that IMS refuses unless the order is still new. An erasure
  * therefore never becomes an outbound write (the push guard in lib/domain/wms/order-push-sweep.ts refuses an erased order, create and amend alike). What IMS can
  * do is be honest about what remains: for each of the subject's orders with a warehouse link it records whether the order is
  *   - despatched (shipped or delivered, or a shipment exists): the warehouse has the person's data and cannot be made to erase it;
@@ -62,7 +62,7 @@ export const OPEN_WAREHOUSE_ERASURE_NOTICE_TITLE = 'Personal data remains in the
 
 /** The operator-readable sentence for a count. Identity-free by construction: it carries a number and a request id. */
 export function openWarehouseOrdersWarning(open: number): string {
-  return `${open} open warehouse order${open === 1 ? '' : 's'} still hold${open === 1 ? 's' : ''} the erased person's name and address. IMS does not write to the live warehouse, so ${open === 1 ? 'it needs' : 'they need'} handling by hand in Mintsoft (see Settings > Erasure records).`
+  return `${open} open warehouse order${open === 1 ? '' : 's'} still hold${open === 1 ? 's' : ''} the erased person's name and address. IMS does not write to the live warehouse, so ${open === 1 ? 'it needs' : 'they need'} handling by hand in the warehouse system (see Settings > Erasure records).`
 }
 
 /** After the erasure committed: tell the operators. Never throws (a notification failure must not undo or hide an erasure). */

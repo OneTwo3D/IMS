@@ -117,7 +117,7 @@ test('[erasure record] anonymiseCustomer returns the count and a warning for ope
   assert.equal(first.success, true)
   assert.equal(first.openWarehouseOrders, 2)
   assert.match(first.warning ?? '', /2 open warehouse orders/)
-  assert.match(first.warning ?? '', /by hand in Mintsoft/)
+  assert.match(first.warning ?? '', /by hand in the warehouse system/)
   assert.doesNotMatch(JSON.stringify(first), new RegExp(`${NAME}|${EMAIL.replace(/[+.]/g, '\\$&')}`))
   assert.equal((await proof(db, withOpen.customerId)).systems.accounting, 'not-applicable', 'no ledger rows: nothing held there')
   // CONTROL: a customer whose orders are all despatched gets no warning and no notification.

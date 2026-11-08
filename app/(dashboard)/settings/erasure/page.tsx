@@ -15,7 +15,7 @@ const VERDICT_LABEL: Record<string, string> = {
   'not-attempted': 'Not attempted',
   propagated: 'Propagated',
 }
-const SYSTEM_LABEL: Record<string, string> = { storefront: 'Storefront', accounting: 'Accounting (Xero)', warehouse: 'Warehouse (Mintsoft)', carrierPortal: 'Carrier portal' }
+const SYSTEM_LABEL: Record<string, string> = { storefront: 'Storefront', accounting: 'Accounting (Xero)', warehouse: 'Warehouse', carrierPortal: 'Carrier portal' }
 
 export default async function ErasureRecordsPage() {
   // Page-level authorization, the FIRST statement so a denial performs no read (the dashboard layout establishes authentication only).
@@ -59,7 +59,7 @@ export default async function ErasureRecordsPage() {
               )}
               {r.warehouse && r.warehouse.openOrders.length > 0 && (
                 <div className="rounded border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900">
-                  <p className="font-medium">Open warehouse orders still holding the person&apos;s details. Handle each by hand in Mintsoft:</p>
+                  <p className="font-medium">Open warehouse orders still holding the person&apos;s details. Handle each by hand in the warehouse system:</p>
                   <ul className="mt-1 list-disc pl-5">
                     {r.warehouse.openOrders.map((o) => (
                       <li key={o.orderId}>Warehouse order {o.warehouseOrderNumber ?? '(number not recorded)'}</li>
