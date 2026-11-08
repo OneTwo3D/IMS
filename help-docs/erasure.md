@@ -28,9 +28,10 @@ The erasure record (Settings > **Erasure records**, administrators only) shows o
 | Storefront (WooCommerce) | *Erased at source* | WooCommerce anonymised first and IMS mirrored it. |
 | | *Not attempted* | The erasure was requested in IMS. Erase the customer in WooCommerce too. |
 | Accounting (Xero) | *Left untouched, pending legal ruling* | The Xero **contact** (name and email) is left as it is. A contact's name shows on every historical invoice, including those inside the six-year VAT retention, so renaming it would alter records that must stay intact. This waits for the accountant or DPO. Documents posted after the erasure carry the placeholder name and no email. |
-| Warehouse (Mintsoft) | *Not written; handle by hand* | At least one of the person's orders is still **open** (sent to the warehouse, not despatched, not cancelled). It still holds the name and address, and IMS will not rewrite a live warehouse order. |
+| Warehouse (Mintsoft) | *Not written; handle by hand* | At least one of the person's orders is still **open** (sent to the warehouse, not wholly despatched, not cancelled). An order with a pending shipment, or one that has shipped only in part, is open. It still holds the name and address, and IMS will not rewrite a live warehouse order. |
 | | *Cannot be erased there* | Only despatched orders: Mintsoft has no erase function. Nothing more can be done in IMS. |
-| | *Nothing held* | No order of this person reached the warehouse. |
+| | *Not written; handle by hand* (also) | An order whose warehouse create was sent but whose outcome IMS never recorded may exist in the warehouse. It is listed as **unverified**: check it there and handle it by hand if it exists. |
+| | *Nothing held* | No order of this person reached the warehouse (nothing was ever sent). |
 | Carrier portal (Click & Drop) | *Not attempted* | IMS has no Click & Drop integration and holds none of its data. A removal there is outside IMS. |
 
 ### Open warehouse orders: what you must do

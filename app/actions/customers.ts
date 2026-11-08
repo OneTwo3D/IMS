@@ -513,7 +513,7 @@ export async function importContactsCsv(formData: FormData): Promise<CsvImportAc
   }
 }
 
-export async function anonymiseCustomer(customerId: string): Promise<{ success: boolean; error?: string; warning?: string; openWarehouseOrders?: number }> {
+export async function anonymiseCustomer(customerId: string): Promise<{ success: boolean; error?: string; warning?: string; openWarehouseOrders?: number; ambiguousWarehouseOrders?: number }> {
   const session = await requirePermission('sync')
   // The erasure itself, and its name-free proof, live in one place: see lib/domain/erasure.
   const result = await eraseCustomerPersonalData(customerId, { trigger: 'ON_REQUEST', userId: session.user.id ?? null })
@@ -522,5 +522,8 @@ export async function anonymiseCustomer(customerId: string): Promise<{ success: 
   // The operator is told AT THE TIME OF ERASURE what the erasure did not reach: warehouse orders still open hold the person's name and address, and IMS
   // does not write to the live warehouse. The sentence carries a number only.
   const open = result.warehouse.open
-  return open > 0 ? { success: true, openWarehouseOrders: open, warning: openWarehouseOrdersWarning(open) } : { success: true }
+  const ambiguous = result.warehouse.ambiguous
+  return open + ambiguous > 0
+    ? { success: true, openWarehouseOrders: open, ambiguousWarehouseOrders: ambiguous, warning: openWarehouseOrdersWarning(open, ambiguous) }
+    : { success: true }
 }

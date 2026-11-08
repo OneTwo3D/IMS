@@ -29,10 +29,11 @@ export function readErasureRecord(metadata: unknown, fallbackDate: Date): Erasur
   const warehouse: ErasureWarehouseSummary | null = w
     ? {
         linkedOrders: Number(w.linkedOrders) || 0, despatched: Number(w.despatched) || 0, open: Number(w.open) || 0, cancelled: Number(w.cancelled) || 0,
-        notPushed: Number(w.notPushed) || 0, merged: Number(w.merged) || 0,
+        notPushed: Number(w.notPushed) || 0, ambiguous: Number(w.ambiguous) || 0, merged: Number(w.merged) || 0,
         openOrders: Array.isArray(w.openOrders)
           ? w.openOrders.filter(isObject).map((o) => ({ orderId: String(o.orderId ?? ''), warehouseOrderNumber: typeof o.warehouseOrderNumber === 'string' ? o.warehouseOrderNumber : null }))
           : [],
+        ambiguousOrders: Array.isArray(w.ambiguousOrders) ? w.ambiguousOrders.filter(isObject).map((o) => ({ orderId: String(o.orderId ?? '') })) : [],
       }
     : null
   return {

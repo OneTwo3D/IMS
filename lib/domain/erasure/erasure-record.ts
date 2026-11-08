@@ -104,12 +104,20 @@ export type ErasureWarehouseSummary = {
   cancelled: number
   /** Orders with a link that never reached the warehouse (no warehouse order id): nothing is held there. */
   notPushed: number
+  /**
+   * Links with NO warehouse order id where a create WAS attempted or claimed (the create is claimed immediately before the remote call, so a worker killed mid-push, a
+   * timeout or a repeated remote failure can leave an order that exists in the warehouse with no id recorded): the outcome is unknown, so each is listed for the operator
+   * to VERIFY in the warehouse. Never read as "nothing held".
+   */
+  ambiguous: number
   /** Links parked MERGED (the warehouse merged the order into another: the data lives on under the combined order). Counted inside despatched/open too. */
   merged: number
   openOrders: Array<{ orderId: string; warehouseOrderNumber: string | null }>
+  /** The ambiguous orders, by surrogate order id (no warehouse order number is known). */
+  ambiguousOrders: Array<{ orderId: string }>
 }
 
-export const EMPTY_WAREHOUSE_SUMMARY: ErasureWarehouseSummary = { linkedOrders: 0, despatched: 0, open: 0, cancelled: 0, notPushed: 0, merged: 0, openOrders: [] }
+export const EMPTY_WAREHOUSE_SUMMARY: ErasureWarehouseSummary = { linkedOrders: 0, despatched: 0, open: 0, cancelled: 0, notPushed: 0, ambiguous: 0, merged: 0, openOrders: [], ambiguousOrders: [] }
 
 export type ErasureRecordMetadata = {
   requestId: string
@@ -152,7 +160,7 @@ export function buildErasureRecordMetadata(input: {
     orderIds: [...input.orderIds],
     counts: { ...input.counts },
     systems: input.systems ? { ...input.systems } : defaultSystemVerdicts(input.trigger),
-    warehouse: input.warehouse ? { ...input.warehouse, openOrders: input.warehouse.openOrders.map((o) => ({ ...o })) } : { ...EMPTY_WAREHOUSE_SUMMARY, openOrders: [] },
+    warehouse: input.warehouse ? { ...input.warehouse, openOrders: input.warehouse.openOrders.map((o) => ({ ...o })), ambiguousOrders: input.warehouse.ambiguousOrders.map((o) => ({ ...o })) } : { ...EMPTY_WAREHOUSE_SUMMARY, openOrders: [], ambiguousOrders: [] },
   }
 }
 

@@ -464,6 +464,8 @@ async function eraseUnderLocksInTx(
   const accountingTraces = Boolean(before?.accountingContactId)
     || (await tx.accountingSyncLog.count({ where: { OR: [{ referenceType: 'SalesOrder', referenceId: { in: orderIds } }, { referenceType: 'SalesOrderRefund', referenceId: { in: refundRows.map((r) => r.id) } }] } })) > 0
     || (await tx.salesOrder.count({ where: { id: { in: orderIds }, accountingInvoiceId: { not: null } } })) > 0
+    // A credit note id is retained by decision and outlives the sync-log purge: a retained id alone means the ledger still holds the document and its contact.
+    || (await tx.salesOrderRefund.count({ where: { orderId: { in: orderIds }, accountingCreditNoteId: { not: null } } })) > 0
   const systems = decideSystemVerdicts({ trigger: input.trigger, warehouse, accountingTraces })
   const counts: ErasureCounts = { customers: eraseCustomer ? 1 : 0, shoppingCustomerLinks: links.count, activityRowsScrubbed, linkedFreeTextScrubbed, ...rawCounts, ...derivedCounts, ...orderCounts }
   const record = {
@@ -488,7 +490,7 @@ export async function eraseCustomerPersonalData(
   const erasedAt = new Date()
   try {
     let refusal: string | null = null
-    const outcome = { warehouse: { ...EMPTY_WAREHOUSE_SUMMARY, openOrders: [] } as ErasureWarehouseSummary }
+    const outcome = { warehouse: { ...EMPTY_WAREHOUSE_SUMMARY, openOrders: [], ambiguousOrders: [] } as ErasureWarehouseSummary }
     for (let attempt = 1; ; attempt += 1) {
       try {
         refusal = await db.$transaction(async (tx): Promise<string | null> => {
@@ -583,7 +585,7 @@ export async function eraseOrderPersonalData(
             ? await tx.salesOrder.count({ where: { customerId: peek.customerId, id: { not: orderId }, erasedAt: null } })
             : 1
           const eraseCustomer = Boolean(peek.customerId) && customerLive && liveOthers === 0
-          const outcome = { warehouse: { ...EMPTY_WAREHOUSE_SUMMARY, openOrders: [] } as ErasureWarehouseSummary }
+          const outcome = { warehouse: { ...EMPTY_WAREHOUSE_SUMMARY, openOrders: [], ambiguousOrders: [] } as ErasureWarehouseSummary }
           const refusal = await eraseUnderLocksInTx(tx, { customerId: peek.customerId, eraseCustomer, targetOrderIds: [orderId], requestId, erasedAt, trigger: options.trigger, userId: options.userId, outcome })
           if (refusal) return { success: false, error: refusal }
           return { success: true, already: false, requestId, customerErased: eraseCustomer, warehouse: outcome.warehouse }

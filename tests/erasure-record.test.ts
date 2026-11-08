@@ -21,7 +21,7 @@ test('the record names the request, date and scope, with the verdicts the trigge
   assert.equal(meta.requestId, 'req-1')
   assert.equal(meta.trigger, 'ON_REQUEST')
   assert.deepEqual(meta.systems, { storefront: 'not-attempted', accounting: 'not-applicable', warehouse: 'not-applicable', carrierPortal: 'not-attempted' })
-  assert.deepEqual(meta.warehouse, { linkedOrders: 0, despatched: 0, open: 0, cancelled: 0, notPushed: 0, merged: 0, openOrders: [] })
+  assert.deepEqual(meta.warehouse, { linkedOrders: 0, despatched: 0, open: 0, cancelled: 0, notPushed: 0, ambiguous: 0, merged: 0, openOrders: [], ambiguousOrders: [] })
   // A mirrored or created-after-erasure order was erased at the storefront first.
   for (const trigger of ['MIRRORED_FROM_STOREFRONT', 'IMPORT_AFTER_ERASURE'] as const) assert.equal(defaultSystemVerdicts(trigger).storefront, 'erased-at-source')
   // The activity-log sanitiser must leave every value intact: a key that matched its sensitive pattern would be blanked.

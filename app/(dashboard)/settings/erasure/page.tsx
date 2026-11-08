@@ -54,7 +54,7 @@ export default async function ErasureRecordsPage() {
               </dl>
               {r.warehouse && r.warehouse.linkedOrders > 0 && (
                 <p className="text-xs text-muted-foreground">
-                  Warehouse orders: {r.warehouse.linkedOrders} (despatched {r.warehouse.despatched}, open {r.warehouse.open}, cancelled {r.warehouse.cancelled}, merged {r.warehouse.merged}).
+                  Warehouse orders: {r.warehouse.linkedOrders} (despatched {r.warehouse.despatched}, open {r.warehouse.open}, cancelled {r.warehouse.cancelled}, unverified {r.warehouse.ambiguous}, merged {r.warehouse.merged}).
                 </p>
               )}
               {r.warehouse && r.warehouse.openOrders.length > 0 && (
@@ -64,6 +64,14 @@ export default async function ErasureRecordsPage() {
                     {r.warehouse.openOrders.map((o) => (
                       <li key={o.orderId}>Warehouse order {o.warehouseOrderNumber ?? '(number not recorded)'}</li>
                     ))}
+                  </ul>
+                </div>
+              )}
+              {r.warehouse && r.warehouse.ambiguousOrders.length > 0 && (
+                <div className="rounded border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900">
+                  <p className="font-medium">A create was sent to the warehouse for these orders and its outcome was never recorded. Check each in the warehouse system and handle it by hand if it exists:</p>
+                  <ul className="mt-1 list-disc pl-5">
+                    {r.warehouse.ambiguousOrders.map((o) => (<li key={o.orderId}>IMS order {o.orderId}</li>))}
                   </ul>
                 </div>
               )}
