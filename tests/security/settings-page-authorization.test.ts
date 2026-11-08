@@ -66,7 +66,7 @@ mock.module('@/lib/connectors/shopping-webhook-evidence-hold', {
 // ---- loader for /settings/erasure ------------------------------------------
 const erasureReads: string[] = []
 mock.module('@/lib/domain/erasure/erasure-record-view', {
-  namedExports: { listErasureRecords: async () => { erasureReads.push('listErasureRecords'); return [] } },
+  namedExports: { listErasureRecords: async () => { erasureReads.push('listErasureRecords'); return { rows: [], nextCursor: null } } },
 })
 
 // ---- loaders for /settings/users -------------------------------------------
@@ -172,7 +172,7 @@ for (const role of ['WAREHOUSE', 'READONLY', 'MANAGER'] as const) {
     currentRole = role
     erasureReads.length = 0
     const { default: ErasureRecordsPage } = await import('@/app/(dashboard)/settings/erasure/page')
-    const result = await ErasureRecordsPage()
+    const result = await ErasureRecordsPage({ searchParams: Promise.resolve({}) })
     assert.equal(deniedPermission(result), 'settings')
     assert.deepEqual(erasureReads, [], 'a denied render performs no read')
   })
@@ -182,7 +182,7 @@ test('/settings/erasure renders for ADMIN and does read the records', async () =
   currentRole = 'ADMIN'
   erasureReads.length = 0
   const { default: ErasureRecordsPage } = await import('@/app/(dashboard)/settings/erasure/page')
-  const result = await ErasureRecordsPage()
+  const result = await ErasureRecordsPage({ searchParams: Promise.resolve({}) })
   assert.equal(deniedPermission(result), null)
   assert.deepEqual(erasureReads, ['listErasureRecords'])
 })

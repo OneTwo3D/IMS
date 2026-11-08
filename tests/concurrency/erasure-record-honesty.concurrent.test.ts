@@ -116,7 +116,7 @@ test('[erasure record] the per-system verdicts and the warehouse enumeration are
   assert.doesNotMatch(JSON.stringify(notes), new RegExp(`${NAME}|${EMAIL.replace(/[+.]/g, '\\$&')}`))
   // THE READ-ONLY VIEW shows the record and carries no erased value.
   const { listErasureRecords } = await import('@/lib/domain/erasure/erasure-record-view')
-  const rows = await listErasureRecords()
+  const rows = (await listErasureRecords({ onlyObligations: true, limit: 200 })).rows
   const mine = rows.find((r) => r.warehouse?.openOrders.some((o) => o.orderId === fx.ids.open))
   assert.ok(mine, 'the record is listed')
   assert.equal(mine!.systems.accounting, 'refused-pending-legal')
@@ -185,4 +185,64 @@ test('[erasure record] an ambiguous create alone is never "nothing held"; a reta
   assert.deepEqual(p.warehouse.ambiguousOrders, [{ orderId: order.id, warehouseOrderNumber: null }])
   assert.equal(p.systems.warehouse, 'refused', 'an ambiguous create is never read as "nothing held"')
   assert.equal(p.systems.accounting, 'refused-pending-legal', 'a retained credit note id alone still means the ledger holds the document and its contact')
+})
+
+test('[erasure record] an order erasure whose customer stays live still sees the customer\'s ledger contact: contact-only is refused-pending-legal', { skip }, async (t) => {
+  const db = await loadDb()
+  const { eraseOrderPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const customer = await db.customer.create({ data: { firstName: 'Zebediah', lastName: 'Quillfeather', email: `${randomUUID().slice(0, 8)}@example.test`, accountingContactId: `contact-${randomUUID()}` } as never })
+  const mk = () => db.salesOrder.create({ data: { orderNumber: `HON-${randomUUID().slice(0, 8)}`, status: 'DELIVERED', currency: 'GBP', customerId: customer.id, customerName: NAME, subtotalForeign: 1, totalForeign: 1, subtotalBase: 1, totalBase: 1 } as never })
+  const target = await mk(); const other = await mk()
+  t.after(async () => { await db.activityLog.deleteMany({ where: { entityId: { in: [target.id, other.id, customer.id] } } }); await db.salesOrder.deleteMany({ where: { id: { in: [target.id, other.id] } } }); await db.customer.deleteMany({ where: { id: customer.id } }) })
+  const result = await eraseOrderPersonalData(target.id, { trigger: 'ON_REQUEST', userId: null })
+  assert.equal(result.success, true)
+  if (result.success && !result.already) assert.equal(result.customerErased, false, 'PRECONDITION: the customer stays live (another live order)')
+  const row = await db.activityLog.findFirstOrThrow({ where: { entityType: 'SALES_ORDER', entityId: target.id, action: 'gdpr_erasure_recorded' } })
+  assert.equal((row.metadata as { systems: Record<string, string> }).systems.accounting, 'refused-pending-legal', 'a contact the ledger holds for the live customer is never "nothing held"')
+})
+
+test('[erasure record view] a record beyond 200 newer ones is reachable by paging, by the obligations filter and by request id; it lists the IMS order numbers', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await seed(db, { accounting: false })
+  const uid = randomUUID().slice(0, 8)
+  t.after(async () => { await db.activityLog.deleteMany({ where: { id: { startsWith: `pgrec-${uid}-` } } }); await fx.cleanup() })
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { listErasureRecords } = await import('@/lib/domain/erasure/erasure-record-view')
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const real = await db.activityLog.findFirstOrThrow({ where: { entityType: 'CUSTOMER', entityId: fx.customerId, action: 'gdpr_erasure_recorded' } })
+  const realRequestId = (real.metadata as { requestId: string }).requestId
+  // 210 NEWER records (nothing outstanding in them): the real one is now the 211th, past any 200-row list.
+  const N = 210
+  await db.$executeRaw`
+    INSERT INTO "activity_logs" ("id", "entityType", "entityId", "action", "tag", "level", "description", "metadata", "createdAt")
+    SELECT ${`pgrec-${uid}-`} || g, 'CUSTOMER', 'pgrec-' || g, 'gdpr_erasure_recorded', 'sales', 'INFO', 'Personal data erased (see metadata for the request, scope and per-system verdicts)',
+           jsonb_build_object('requestId', ${`pgrec-${uid}-`} || g, 'erasedAt', now(), 'trigger', 'ON_REQUEST', 'orderIds', '[]'::jsonb, 'counts', '{}'::jsonb, 'systems', '{}'::jsonb,
+                              'warehouse', jsonb_build_object('linkedOrders', 0, 'open', 0, 'ambiguous', 0, 'despatched', 0, 'cancelled', 0, 'notPushed', 0, 'merged', 0, 'openOrders', '[]'::jsonb, 'ambiguousOrders', '[]'::jsonb)),
+           now() + (g || ' seconds')::interval
+      FROM generate_series(1, ${N}) g`
+  // PAGING: the real record is reached by following the cursor, and only after more than 200 newer rows.
+  let cursor: string | undefined
+  let seen = 0; let pages = 0; let found = false
+  for (let i = 0; i < 20 && !found; i += 1) {
+    const page = await listErasureRecords({ cursor, limit: 50 })
+    pages += 1
+    for (const r of page.rows) { if (r.requestId === realRequestId) found = true; else seen += 1 }
+    if (!page.nextCursor) break
+    cursor = page.nextCursor
+  }
+  assert.ok(found, 'the record is reachable by paging')
+  assert.ok(seen >= N, `it sits beyond ${N} newer rows (saw ${seen} first, in ${pages} pages)`)
+  // FILTER: the obligations filter shows it on the first page.
+  const filtered = await listErasureRecords({ onlyObligations: true, limit: 50 })
+  const mine = filtered.rows.find((r) => r.requestId === realRequestId)
+  assert.ok(mine, 'the obligations filter shows it on the first page')
+  assert.ok(filtered.rows.every((r) => (r.warehouse?.open ?? 0) > 0 || (r.warehouse?.ambiguous ?? 0) > 0), 'the filter shows only records with something outstanding')
+  // LOOKUP: by request id, exactly that record.
+  const looked = await listErasureRecords({ requestId: realRequestId })
+  assert.deepEqual(looked.rows.map((r) => r.requestId), [realRequestId])
+  assert.equal(looked.nextCursor, null)
+  // The IMS order numbers of the listed warehouse orders come with the record, so an order with no warehouse number is still identifiable by its IMS order.
+  const open = await db.salesOrder.findUniqueOrThrow({ where: { id: fx.ids.open }, select: { orderNumber: true } })
+  assert.equal(mine!.orderNumbers[fx.ids.open], open.orderNumber)
+  assert.doesNotMatch(JSON.stringify([...filtered.rows, ...looked.rows]), new RegExp(`${NAME}|${EMAIL.replace(/[+.]/g, '\\$&')}`), 'identity-free')
 })

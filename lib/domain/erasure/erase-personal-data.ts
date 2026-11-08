@@ -461,7 +461,10 @@ async function eraseUnderLocksInTx(
   const warehouse = await summariseWarehouseOrdersInTx(tx, orderIds)
   input.outcome.warehouse = warehouse
   const refundRows = await tx.salesOrderRefund.findMany({ where: { orderId: { in: orderIds } }, select: { id: true } })
-  const accountingTraces = Boolean(before?.accountingContactId)
+  // The linked customer's ledger contact id: read for an ORDER erasure too (the customer stays live and `before` is null), under the locks already held, so a contact
+  // the ledger holds for the person is never recorded as "nothing held".
+  const contactHolder = before ?? (customerId ? await tx.customer.findUnique({ where: { id: customerId }, select: { accountingContactId: true } }) : null)
+  const accountingTraces = Boolean(contactHolder?.accountingContactId)
     || (await tx.accountingSyncLog.count({ where: { OR: [{ referenceType: 'SalesOrder', referenceId: { in: orderIds } }, { referenceType: 'SalesOrderRefund', referenceId: { in: refundRows.map((r) => r.id) } }] } })) > 0
     || (await tx.salesOrder.count({ where: { id: { in: orderIds }, accountingInvoiceId: { not: null } } })) > 0
     // A credit note id is retained by decision and outlives the sync-log purge: a retained id alone means the ledger still holds the document and its contact.

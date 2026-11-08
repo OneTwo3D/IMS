@@ -104,6 +104,7 @@ export async function notifyOpenWarehouseOrders(summary: ErasureWarehouseSummary
     type: 'warning',
     title: OPEN_WAREHOUSE_ERASURE_NOTICE_TITLE,
     message: `${openWarehouseOrdersWarning(summary.open, summary.ambiguous)} Request ${requestId}.`,
-    actionUrl: '/settings/erasure',
+    // The list opens filtered to the records that still need handling by hand.
+    actionUrl: '/settings/erasure?filter=obligations',
   })
 }

@@ -36,7 +36,7 @@ The erasure record (Settings > **Erasure records**, administrators only) shows o
 
 ### Open warehouse orders: what you must do
 
-The moment an erasure leaves open warehouse orders, the operator who ran it is warned (the dialog stays open with the count), and a notification is raised for everyone. The record lists each open order by **warehouse order number**. Open the order in Mintsoft and change or cancel it by hand. The same applies when WooCommerce's anonymisation is mirrored.
+The moment an erasure leaves open warehouse orders, the operator who ran it is warned (the dialog stays open with the count), and a notification is raised for everyone. The record lists each open order by **warehouse order number** and by its IMS order (linked to the order page). The Erasure records page opens filtered to the records that still need handling by hand when you arrive from the notification; it pages back through every older record and can find one by its request id. Open the order in Mintsoft and change or cancel it by hand. The same applies when WooCommerce's anonymisation is mirrored.
 
 ## What erasure does not reach
 
