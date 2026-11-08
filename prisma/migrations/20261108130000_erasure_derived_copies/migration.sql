@@ -42,10 +42,15 @@ CREATE OR REPLACE FUNCTION gdpr_event_keeps_contact_name(e "accounting_events") 
 $$;
 
 CREATE OR REPLACE FUNCTION erased_accounting_event_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  keep boolean;
 BEGIN
   IF jsonb_typeof(NEW."linesJson" -> 'contact') = 'object'
      AND gdpr_accounting_ref_erased(NEW."sourceEntityType", NEW."sourceEntityId") THEN
-    NEW."linesJson" := gdpr_scrub_contact(NEW."linesJson", gdpr_event_keeps_contact_name(NEW));
+    keep := gdpr_event_keeps_contact_name(NEW);
+    -- A name that was replaced by the placeholder never comes back: a later write (the event turning POSTED, a rebuilt payload) cannot restore it.
+    IF TG_OP = 'UPDATE' AND (OLD."linesJson" #>> '{contact,name}') = 'GDPR Anonymised' THEN keep := false; END IF;
+    NEW."linesJson" := gdpr_scrub_contact(NEW."linesJson", keep);
   END IF;
   RETURN NEW;
 END
