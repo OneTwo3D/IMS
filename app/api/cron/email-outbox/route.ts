@@ -6,6 +6,7 @@ import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { reconcileErasedEmailOutbox } from '@/lib/domain/erasure/reconcile-email-outbox'
 import { reconcileErasedFreeText } from '@/lib/domain/erasure/reconcile-free-text'
 import { reconcileRawPayloads } from '@/lib/domain/erasure/raw-payloads'
+import { reconcileDerivedCopies } from '@/lib/domain/erasure/derived-copies'
 import { db } from '@/lib/db'
 
 export async function GET(request: Request) {
@@ -24,5 +25,7 @@ export async function GET(request: Request) {
   await reconcileErasedFreeText().catch(() => null)
   // And the raw storefront payload copies of erased orders (a delivery inserted while an erasure was uncommitted).
   await reconcileRawPayloads(db).catch(() => null)
+  // And the derived accounting copies and notification text of erased orders (a row inserted while an erasure was uncommitted).
+  await reconcileDerivedCopies(db).catch(() => null)
   return NextResponse.json(erasure && erasure.addressesErased > 0 ? { ...result, erasureReconciled: erasure } : result)
 }
