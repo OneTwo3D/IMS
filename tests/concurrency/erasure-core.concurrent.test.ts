@@ -2656,10 +2656,10 @@ test('[erasure] FORCED INTERLEAVINGS of a customer erasure and an import of that
   const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
   const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
   const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
-  const idA = fx.externalId + 1; const idB = fx.externalId + 2
+  const idA = fx.externalId + 1; const idB = fx.externalId + 2; const idC = fx.externalId + 3
   t.after(async () => {
     beforeUpsertCustomer = null; beforeActivityWrite = null
-    for (const id of [idA, idB]) {
+    for (const id of [idA, idB, idC]) {
       const link = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(id) }, select: { orderId: true } })
       if (link) {
         const o = await db.salesOrder.findUnique({ where: { id: link.orderId }, select: { customerId: true } })
@@ -2708,7 +2708,6 @@ test('[erasure] FORCED INTERLEAVINGS of a customer erasure and an import of that
   // Now erase THIS customer while an import of one of its (pre-existing) orders is started inside the erasure's window. (The first erasure's tombstone is removed so
   // the importer cannot decide from it: the only thing standing between it and a fresh customer is the key lock and the tombstone read under it.)
   await db.storefrontCustomerErasureTombstone.deleteMany({})
-  const idC = fx.externalId + 3
   let importing: Promise<{ success: boolean; orderId?: string; error?: string }> = Promise.resolve({ success: false })
   let importDone = false
   beforeActivityWrite = async () => {
