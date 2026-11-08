@@ -7,7 +7,7 @@
 -- There is ONE implementation of each rule, here: the erasure UPDATEs (lib/domain/erasure/derived-copies.ts) and the guard triggers below call the same
 -- functions. The contact rule matches the sync-log payload rule (erase-personal-data.ts scrubAccountingPayloadContacts): the email is always removed; the
 -- NAME is kept only where the copy describes a document that may be in the ledger (a posted document is a retained record) and is replaced by the
--- placeholder otherwise. An event is judged on its OWN posting evidence: status POSTED or SUPERSEDED, a document id, a revision stamp or a post basis.
+-- placeholder otherwise. An event is judged on its OWN posting evidence: status POSTED (mirroredPostStanding is not NOT_POSTED), or a document id, a revision stamp or a post basis.
 -- The contact block is rebuilt as { name } only, so no other key rides along.
 --
 -- ADDITIVE ONLY: functions and triggers, no table or column change, no backfill (the erasure and its reconcile pass clear existing rows).
@@ -36,9 +36,11 @@ CREATE OR REPLACE FUNCTION gdpr_contact_dirty(doc jsonb, keep_name boolean) RETU
   SELECT doc IS DISTINCT FROM gdpr_scrub_contact(doc, keep_name)
 $$;
 
--- Whether an accounting event may describe a document that reached the ledger (its own evidence; see the header).
+-- Whether an accounting event may describe a document that reached the ledger (its own evidence; see the header). SUPERSEDED ALONE IS NOT EVIDENCE: the mirror records
+-- SUPERSEDED for a replay that made no connector write and took no claim. A superseded event that really posted keeps its document id or revision stamp.
+-- Pinned to lib/domain/erasure/derived-copies.ts eventKeepsContactName (and so to mirroredPostStanding) by tests/concurrency/erasure-derived-copies.
 CREATE OR REPLACE FUNCTION gdpr_event_keeps_contact_name(e "accounting_events") RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
-  SELECT e."status" IN ('POSTED', 'SUPERSEDED') OR e."externalId" IS NOT NULL OR e."externalRevisionAt" IS NOT NULL OR e."postBasis" IS NOT NULL
+  SELECT e."status" = 'POSTED' OR e."externalId" IS NOT NULL OR e."externalRevisionAt" IS NOT NULL OR e."postBasis" IS NOT NULL
 $$;
 
 CREATE OR REPLACE FUNCTION erased_accounting_event_guard() RETURNS trigger LANGUAGE plpgsql AS $$

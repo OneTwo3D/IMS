@@ -202,3 +202,52 @@ test('[derived copies] a writer AFTER the erasure is held by the triggers; a row
   // CONTROL: the other subject still holds its own data after the reconcile.
   assert.equal((await db.accountingSyncLog.findUniqueOrThrow({ where: { id: fx.other.syncId } })).errorMessage, 'Other Person still failing')
 })
+
+test('[derived copies] the name rule: a no-write SUPERSEDED event gets the placeholder (event and copied log body), a posted-then-superseded one keeps the name; SQL and mirroredPostStanding agree', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await fixture(db)
+  t.after(() => fx.cleanup())
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { eventKeepsContactName } = await import('@/lib/domain/erasure/derived-copies')
+  const mk = (status: string, extra: Record<string, unknown> = {}) =>
+    db.accountingEvent.create({ data: { type: 'INVOICE', sourceEntityType: 'SalesOrder', sourceEntityId: fx.orderId, businessDate: new Date('2026-11-02'), status, idempotencyKey: `derived-${randomUUID()}`, linesJson: contactDoc(NAME, EMAIL), currency: 'GBP', ...extra } as never })
+  const matrix: Array<{ label: string; status: string; extra: Record<string, unknown> }> = [
+    { label: 'pending', status: 'PENDING', extra: {} },
+    { label: 'void', status: 'VOID', extra: {} },
+    { label: 'failed', status: 'FAILED', extra: {} },
+    { label: 'superseded no write (yield path)', status: 'SUPERSEDED', extra: {} },
+    { label: 'posted confirmed', status: 'POSTED', extra: { postBasis: 'CONNECTOR' } },
+    { label: 'posted asserted', status: 'POSTED', extra: { postBasis: 'OPERATOR_ASSERTION' } },
+    { label: 'posted unrecorded', status: 'POSTED', extra: {} },
+    { label: 'posted then superseded (document id)', status: 'SUPERSEDED', extra: { externalSystem: 'xero', externalId: `xero-${randomUUID()}` } },
+    { label: 'superseded with revision stamp', status: 'SUPERSEDED', extra: { externalRevisionAt: new Date('2026-11-02T10:00:00Z') } },
+    { label: 'superseded with post basis', status: 'SUPERSEDED', extra: { postBasis: 'CONNECTOR' } },
+  ]
+  const rows = [] as Array<{ label: string; id: string }>
+  for (const m of matrix) {
+    const e = await mk(m.status, m.extra)
+    await db.accountingEventLog.create({ data: { accountingEventId: e.id, action: 'payload_superseded', metadata: { enqueuedLinesJson: contactDoc(NAME, EMAIL) } } })
+    rows.push({ label: m.label, id: e.id })
+  }
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  for (const r of rows) {
+    const e = await db.accountingEvent.findUniqueOrThrow({ where: { id: r.id } })
+    const log = await db.accountingEventLog.findFirstOrThrow({ where: { accountingEventId: r.id } })
+    const keeps = eventKeepsContactName({ status: e.status, postBasis: e.postBasis, externalId: e.externalId, externalRevisionAt: e.externalRevisionAt })
+    const expected = { name: keeps ? NAME : PLACEHOLDER }
+    assert.deepEqual((e.linesJson as { contact: unknown }).contact, expected, `${r.label}: event`)
+    assert.deepEqual((log.metadata as { enqueuedLinesJson: { contact: unknown } }).enqueuedLinesJson.contact, expected, `${r.label}: log body`)
+    // THE TWO RULES AGREE: the SQL function answers what the TypeScript statement answers, for the same row.
+    const sql = await db.$queryRaw<Array<{ k: boolean }>>`SELECT gdpr_event_keeps_contact_name(e) AS k FROM "accounting_events" e WHERE e."id" = ${r.id}`
+    assert.equal(sql[0]!.k, keeps, `${r.label}: SQL and TypeScript agree`)
+  }
+  const byLabel = (l: string) => rows.find((r) => r.label === l)!.id
+  const keptNames = new Map<string, boolean>()
+  for (const r of rows) keptNames.set(r.label, ((await db.accountingEvent.findUniqueOrThrow({ where: { id: r.id } })).linesJson as { contact: { name: string } }).contact.name === NAME)
+  assert.equal(keptNames.get('superseded no write (yield path)'), false)
+  assert.equal(keptNames.get('posted then superseded (document id)'), true)
+  assert.equal(keptNames.get('posted confirmed'), true)
+  assert.equal(keptNames.get('pending'), false)
+  assert.ok(byLabel('void'))
+  assert.doesNotMatch(dump(await db.accountingEvent.findMany({ where: { sourceEntityId: fx.orderId } })), new RegExp(EMAIL.replace(/[+.]/g, '\\$&')))
+})

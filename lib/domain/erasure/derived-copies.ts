@@ -1,4 +1,5 @@
 import { Prisma } from '@/app/generated/prisma/client'
+import { mirroredPostStanding } from '@/lib/domain/accounting/ledger-standing'
 
 /**
  * THE DERIVED ACCOUNTING COPIES AND THE NOTIFICATION TEXT of an erased order (migration erasure_derived_copies).
@@ -9,7 +10,7 @@ import { Prisma } from '@/app/generated/prisma/client'
  *   notifications.title / .message                 free text of a notification that points at the order
  *
  * The contact rule is the SQL functions gdpr_scrub_contact / gdpr_event_keeps_contact_name: the email is always removed; the name is kept only where the copy may
- * describe a document in the ledger (the event's own evidence: status POSTED or SUPERSEDED, a document id, a revision stamp or a post basis: the event-side
+ * describe a document in the ledger (the event's own evidence: status POSTED, or a document id, a revision stamp or a post basis. SUPERSEDED alone is not evidence: a no-write yield records it: the event-side
  * counterpart of the ledger standing the sync-log rule reads), otherwise it becomes the placeholder. The erasure statements here and the guard triggers call the same
  * functions, so a writer that comes after the erasure is held to the same rule. After the writes the same predicates are run again; a row left over THROWS, which
  * rolls the whole erasure back.
@@ -17,6 +18,15 @@ import { Prisma } from '@/app/generated/prisma/client'
  * Rows are found by (sourceEntityType, sourceEntityId) / (referenceType, referenceId) = the order and its refunds. A SalesOrder event, a SalesOrderRefund event and the
  * sync rows of both are reached; nothing else keys an accounting row to a sales order.
  */
+
+/**
+ * The TypeScript statement of the SQL function gdpr_event_keeps_contact_name: the event's document may be in the ledger. `mirroredPostStanding` decides the
+ * POSTED half (every POSTED event, whatever its basis); a document id, a revision stamp or a post basis from an actual write covers an event that posted and was
+ * later superseded. The two are run over one fixture matrix by tests/concurrency/erasure-derived-copies, so they cannot drift.
+ */
+export function eventKeepsContactName(e: { status: string; postBasis: string | null; externalId: string | null; externalRevisionAt: Date | null }): boolean {
+  return mirroredPostStanding(e) !== 'NOT_POSTED' || e.externalId !== null || e.externalRevisionAt !== null || e.postBasis !== null
+}
 
 export const DERIVED_ERROR_MARKER = 'Text removed by GDPR erasure'
 
