@@ -24,28 +24,49 @@ CREATE OR REPLACE FUNCTION gdpr_neutral_for_present(src jsonb, neutral jsonb) RE
   SELECT COALESCE((SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each(neutral) e WHERE src ? e.key), '{}'::jsonb)
 $$;
 
--- The order meta keys that survive: money, FX, cost and invoice references. Anything else is dropped.
-CREATE OR REPLACE FUNCTION gdpr_wc_meta_key_allowed(k text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
-  SELECT k IS NOT NULL AND (
-    k LIKE '%\_base\_currency' ESCAPE '\' OR
-    k = ANY(ARRAY['_base_currency_exchange_rate', '_cogs_total_value_order_currency', '_cogs_value_order_currency', 'vat_compliance_vat_paid',
-      '_wcpdf_invoice_number', '_wcpdf_invoice_number_data', '_wcpdf_invoice_date', '_wcpdf_invoice_date_formatted', '_wcpdf_invoice_display_date',
-      'xeroom_invoice_no_sent', 'xeroom_invoice_reference_sent', 'xeroom_order_sent', '_reduced_stock', '_restock_refunded_items',
-      '_refunded_item_id', 'coupon_info', 'coupon_data', 'smart_coupons_contribution', '_wc_store_credit_used', '_store_credit_used', '_store_credit_applied', '_used_wallet_amount', '_woo_wallet_used', '_partial_pay_through_wallet_amount', '_ywgc_applied_gift_cards_total', '_gift_card_amount', '_giftcard_amount', 'wc_gift_cards_total', '_smart_coupon_credit_used', '_wclc_fee', '_wclc_fee_kind', '_wclc_duty_component', '_wclc_tax_component', '_wclc_handling_component']))
+-- META VALUES: EVERY allowlisted key has a declared value projection, and a value is rebuilt from typed fields only; nothing is passed through.
+--   number          a readable (signed) number, else the fixed word 'unreadable'
+--   decimal         a non-negative plain decimal, else 'unreadable' (the importer's own wclc amount reader)
+--   flag            a boolean, 0 / 1, or one of 1 0 true false yes no, else 'other'
+--   wclc_kind       one of the three wclc fee kinds, else 'other'
+--   (coupon types)  a closed vocabulary, else a fixed credit label, else 'other'
+--   invoice_number  a plain document number (one token of letters, digits and . _ / # -, with at least one digit, no spaces), else the ENTRY IS DROPPED (an unreadable number must read as "not numbered yet")
+--   int             a positive whole number, else 'unreadable'
+--   contribution    {coupon code: readable amount | 'unreadable'}
+--   credit_amount   a readable non-negative amount (or the empty string), else 'unreadable'
+--   coupon_info     [null, null, <discount type>, null]: the type is the only position the classifier reads
+--   coupon_data     {discount_type: <discount type>}
+-- gdpr_wc_meta_exact_keys() lists the allowlisted keys and gdpr_wc_meta_value_kind() their projections; a key with no kind is DROPPED, and the census test fails
+-- if the two disagree. Keys that end in _base_currency are numbers.
+CREATE OR REPLACE FUNCTION gdpr_wc_meta_exact_keys() RETURNS text[] LANGUAGE sql IMMUTABLE AS $$
+  SELECT ARRAY['_base_currency_exchange_rate', '_cogs_total_value_order_currency', '_cogs_value_order_currency', '_wcpdf_invoice_number',
+    'smart_coupons_contribution', '_wc_store_credit_used', '_store_credit_used', '_store_credit_applied', '_used_wallet_amount', '_woo_wallet_used',
+    '_partial_pay_through_wallet_amount', '_ywgc_applied_gift_cards_total', '_gift_card_amount', '_giftcard_amount', 'wc_gift_cards_total', '_smart_coupon_credit_used',
+    '_wclc_fee', '_wclc_fee_kind', '_wclc_duty_component', '_wclc_tax_component', '_wclc_handling_component']
 $$;
 
--- A value that IS a money amount stays; anything else becomes the fixed word 'unreadable', which the importer's strict money reader also refuses (an
--- amount-shaped value is not personal data; a free-text one is dropped). allow_empty: the empty string is a readable zero for the wallet meta keys.
-CREATE OR REPLACE FUNCTION gdpr_money_or_unreadable(v jsonb, allow_empty boolean) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+CREATE OR REPLACE FUNCTION gdpr_wc_meta_value_kind(k text) RETURNS text LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE
-    WHEN v IS NULL THEN to_jsonb('unreadable'::text)
-    WHEN jsonb_typeof(v) = 'number' AND (v#>>'{}')::numeric >= 0 THEN v
-    WHEN jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^\s*[0-9]+(\.[0-9]+)?\s*$' THEN v
-    WHEN jsonb_typeof(v) = 'string' AND allow_empty AND (v#>>'{}') = '' THEN v
-    ELSE to_jsonb('unreadable'::text) END
+    WHEN k LIKE '%\_base\_currency' ESCAPE '\' THEN 'number'
+    WHEN k IN ('_base_currency_exchange_rate', '_cogs_total_value_order_currency', '_cogs_value_order_currency') THEN 'number'
+    WHEN k = '_wcpdf_invoice_number' THEN 'invoice_number'
+    WHEN k = 'smart_coupons_contribution' THEN 'contribution'
+    WHEN k IN ('_wc_store_credit_used', '_store_credit_used', '_store_credit_applied', '_used_wallet_amount', '_woo_wallet_used', '_partial_pay_through_wallet_amount',
+               '_ywgc_applied_gift_cards_total', '_gift_card_amount', '_giftcard_amount', 'wc_gift_cards_total', '_smart_coupon_credit_used') THEN 'credit_amount'
+    WHEN k = '_wclc_fee' THEN 'flag'
+    WHEN k = '_wclc_fee_kind' THEN 'wclc_kind'
+    WHEN k IN ('_wclc_duty_component', '_wclc_tax_component', '_wclc_handling_component') THEN 'decimal'
+    WHEN k = 'coupon_info' THEN 'coupon_info'
+    WHEN k = 'coupon_data' THEN 'coupon_data'
+    WHEN k = '_refunded_item_id' THEN 'int'
+    ELSE NULL END
 $$;
 
--- A meta value the storefront may send as a JSON string: parsed when it is one, NULL when empty, a fixed marker when it does not parse.
+-- The order / line meta keys that survive: money, FX, cost, the invoice number and the credit evidence the importer reads. Anything else is dropped.
+CREATE OR REPLACE FUNCTION gdpr_wc_meta_key_allowed(k text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
+  SELECT k IS NOT NULL AND (k LIKE '%\_base\_currency' ESCAPE '\' OR k = ANY(gdpr_wc_meta_exact_keys()))
+$$;
+
 CREATE OR REPLACE FUNCTION gdpr_jsonb_maybe(v jsonb) RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
 BEGIN
   IF v IS NULL THEN RETURN NULL; END IF;
@@ -59,37 +80,89 @@ EXCEPTION WHEN others THEN
 END
 $$;
 
--- `smart_coupons_contribution`: the {coupon code: amount} map the importer reads to identify store credit. Codes are kept (they are discount evidence);
--- every amount becomes a readable amount or 'unreadable'. A value that is not a map becomes the fixed word 'unreadable' (the importer refuses it the same way).
+-- A value that IS a non-negative money amount stays; anything else becomes 'unreadable'. allow_empty: '' is a readable zero for the wallet meta keys.
+CREATE OR REPLACE FUNCTION gdpr_money_or_unreadable(v jsonb, allow_empty boolean) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE
+    WHEN v IS NULL THEN to_jsonb('unreadable'::text)
+    WHEN jsonb_typeof(v) = 'number' AND (v#>>'{}')::numeric >= 0 THEN v
+    WHEN jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^\s*[0-9]+(\.[0-9]+)?\s*$' THEN v
+    WHEN jsonb_typeof(v) = 'string' AND allow_empty AND (v#>>'{}') = '' THEN v
+    ELSE to_jsonb('unreadable'::text) END
+$$;
+
+-- A coupon discount type from a CLOSED vocabulary: the types the importer knows; anything that reads as credit becomes a fixed label for that kind (so the
+-- classifier's credit-words check still fires); anything else is 'other'. Never the original text.
+CREATE OR REPLACE FUNCTION gdpr_discount_type(v jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT to_jsonb(CASE
+    WHEN v IS NULL OR jsonb_typeof(v) <> 'string' THEN 'other'
+    WHEN lower(btrim(v#>>'{}')) IN ('fixed_cart', 'percent', 'fixed_product', 'percent_product', 'acfw_bogo', 'smart_coupon') THEN lower(btrim(v#>>'{}'))
+    WHEN (v#>>'{}') ~* 'smart[_ -]?coupon' THEN 'smart_coupon_other'
+    WHEN (v#>>'{}') ~* 'store[_ -]?credit' THEN 'store_credit'
+    WHEN (v#>>'{}') ~* 'gift[_ -]?(card|cert)|giftcard' THEN 'gift_card'
+    WHEN (v#>>'{}') ~* 'wallet' THEN 'wallet'
+    ELSE 'other' END)
+$$;
+
+-- `smart_coupons_contribution`: {coupon code: amount}. Codes are kept (discount evidence); every amount is a readable amount or 'unreadable'; a non-map is 'unreadable'.
 CREATE OR REPLACE FUNCTION gdpr_project_contribution(v jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE WHEN p IS NULL OR jsonb_typeof(p) <> 'object' THEN to_jsonb('unreadable'::text)
     ELSE COALESCE((SELECT jsonb_object_agg(e.key, gdpr_money_or_unreadable(e.value, false)) FROM jsonb_each(p) e), '{}'::jsonb) END
   FROM (SELECT gdpr_jsonb_maybe(v) AS p) x
 $$;
 
--- legacy `coupon_data`: only `discount_type`, the one field the importer's classifier reads; restrictions, emails and everything else are dropped.
+-- legacy `coupon_data`: only `discount_type`.
 CREATE OR REPLACE FUNCTION gdpr_project_coupon_data(v jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE WHEN p IS NOT NULL AND jsonb_typeof(p) = 'object' AND jsonb_typeof(p->'discount_type') = 'string'
-    THEN jsonb_build_object('discount_type', CASE WHEN (p->>'discount_type') ~ '^[A-Za-z_ -]{1,40}$' THEN p->'discount_type' ELSE to_jsonb('other'::text) END)
+    THEN jsonb_build_object('discount_type', gdpr_discount_type(p->'discount_type'))
     ELSE '{}'::jsonb END
   FROM (SELECT gdpr_jsonb_maybe(v) AS p) x
 $$;
 
-CREATE OR REPLACE FUNCTION gdpr_project_meta_value(k text, v jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
-  SELECT CASE
-    WHEN k = 'smart_coupons_contribution' THEN gdpr_project_contribution(v)
-    WHEN k = 'coupon_data' THEN gdpr_project_coupon_data(v)
-    WHEN k IN ('_wc_store_credit_used', '_store_credit_used', '_store_credit_applied', '_used_wallet_amount', '_woo_wallet_used', '_partial_pay_through_wallet_amount',
-               '_ywgc_applied_gift_cards_total', '_gift_card_amount', '_giftcard_amount', 'wc_gift_cards_total', '_smart_coupon_credit_used') THEN gdpr_money_or_unreadable(v, true)
-    ELSE v END
+-- `coupon_info` (8.7+): [id, code, discount_type, amount]; only position 2, typed. Not an array -> 'unreadable' (read as no type, as before).
+CREATE OR REPLACE FUNCTION gdpr_project_coupon_info(v jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE WHEN p IS NULL OR jsonb_typeof(p) <> 'array' THEN to_jsonb('unreadable'::text)
+    WHEN jsonb_typeof(p->2) = 'string' AND btrim(p->>2) <> '' THEN jsonb_build_array(NULL::text, NULL::text, gdpr_discount_type(to_jsonb(btrim(p->>2))), NULL::text)
+    ELSE jsonb_build_array(NULL::text, NULL::text, NULL::text, NULL::text) END
+  FROM (SELECT gdpr_jsonb_maybe(v) AS p) x
 $$;
 
--- A meta_data array reduced to the allowed keys (each entry keeps id, key, value; a credit-evidence value is reduced as above). Not an array -> [].
+-- The projection of ONE meta value by its declared kind; SQL NULL means "drop the entry".
+CREATE OR REPLACE FUNCTION gdpr_project_meta_value(k text, v jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE gdpr_wc_meta_value_kind(k)
+    WHEN 'number' THEN CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'number' THEN v
+                            WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^\s*-?[0-9]+(\.[0-9]+)?\s*$' THEN v
+                            ELSE to_jsonb('unreadable'::text) END
+    WHEN 'decimal' THEN CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'number' AND (v#>>'{}')::numeric >= 0 THEN v
+                             WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^[0-9]+(\.[0-9]+)?$' THEN v
+                             ELSE to_jsonb('unreadable'::text) END
+    WHEN 'flag' THEN CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'boolean' THEN v
+                          WHEN v IS NOT NULL AND jsonb_typeof(v) = 'number' AND (v#>>'{}') IN ('0', '1') THEN v
+                          WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND lower(btrim(v#>>'{}')) IN ('1', '0', 'true', 'false', 'yes', 'no') THEN to_jsonb(lower(btrim(v#>>'{}')))
+                          ELSE to_jsonb('other'::text) END
+    WHEN 'wclc_kind' THEN to_jsonb(CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND btrim(v#>>'{}') IN ('duty_flat', 'uhf', 'duty_fee') THEN btrim(v#>>'{}') ELSE 'other' END)
+    WHEN 'invoice_number' THEN CASE WHEN v IS NOT NULL AND jsonb_typeof(v) IN ('string', 'number') AND (v#>>'{}') ~ '^(?=.*[0-9])[A-Za-z0-9_./#-]{1,40}$' THEN v ELSE NULL END
+    WHEN 'int' THEN CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'number' AND (v#>>'{}') ~ '^[1-9][0-9]*$' THEN v
+                         WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^[1-9][0-9]*$' THEN v
+                         ELSE to_jsonb('unreadable'::text) END
+    WHEN 'contribution' THEN gdpr_project_contribution(v)
+    WHEN 'credit_amount' THEN gdpr_money_or_unreadable(v, true)
+    WHEN 'coupon_info' THEN gdpr_project_coupon_info(v)
+    WHEN 'coupon_data' THEN gdpr_project_coupon_data(v)
+    ELSE NULL END
+$$;
+
+-- A meta_data array reduced to the allowed keys; each entry is rebuilt from `key`, a numeric `id` and the PROJECTED value (an entry whose value has no
+-- projection is dropped). only_keys limits the keys (NULL = the allowlist). Not an array -> [].
 CREATE OR REPLACE FUNCTION gdpr_project_meta(meta jsonb, only_keys text[]) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE WHEN meta IS NULL OR jsonb_typeof(meta) <> 'array' THEN '[]'::jsonb ELSE COALESCE((
-    SELECT jsonb_agg(CASE WHEN m ? 'value' THEN k.entry || jsonb_build_object('value', gdpr_project_meta_value(m->>'key', m->'value')) ELSE k.entry END ORDER BY ord)
-      FROM jsonb_array_elements(meta) WITH ORDINALITY AS t(m, ord), LATERAL (SELECT gdpr_keep_keys(m, ARRAY['id', 'key', 'value']) AS entry) k
-     WHERE jsonb_typeof(m) = 'object' AND ((only_keys IS NULL AND gdpr_wc_meta_key_allowed(m->>'key')) OR (only_keys IS NOT NULL AND (m->>'key') = ANY(only_keys)))
+    SELECT jsonb_agg(
+             jsonb_build_object('key', m->'key')
+             || CASE WHEN jsonb_typeof(m->'id') = 'number' THEN jsonb_build_object('id', m->'id') ELSE '{}'::jsonb END
+             || jsonb_build_object('value', pv.v)
+             ORDER BY ord)
+      FROM jsonb_array_elements(meta) WITH ORDINALITY AS t(m, ord), LATERAL (SELECT gdpr_project_meta_value(m->>'key', m->'value') AS v) pv
+     WHERE jsonb_typeof(m) = 'object' AND jsonb_typeof(m->'key') = 'string' AND pv.v IS NOT NULL
+       AND ((only_keys IS NULL AND gdpr_wc_meta_key_allowed(m->>'key')) OR (only_keys IS NOT NULL AND (m->>'key') = ANY(only_keys)))
   ), '[]'::jsonb) END
 $$;
 

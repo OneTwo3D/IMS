@@ -598,3 +598,73 @@ test('[raw payloads] store-credit evidence survives the projection in both legac
     assert.deepEqual(p.meta_data, [{ id: 1, key, value: '3.00' }], `${key} survives`)
   }
 })
+
+// Every allowlisted meta key and the value projection declared for it. Add a key to the SQL allowlist and this test fails until it is declared here AND has a kind there.
+const DECLARED_META_VALUE_KINDS: Record<string, string> = {
+  _base_currency_exchange_rate: 'number', _cogs_total_value_order_currency: 'number', _cogs_value_order_currency: 'number', _wcpdf_invoice_number: 'invoice_number',
+  smart_coupons_contribution: 'contribution',
+  _wc_store_credit_used: 'credit_amount', _store_credit_used: 'credit_amount', _store_credit_applied: 'credit_amount', _used_wallet_amount: 'credit_amount', _woo_wallet_used: 'credit_amount',
+  _partial_pay_through_wallet_amount: 'credit_amount', _ywgc_applied_gift_cards_total: 'credit_amount', _gift_card_amount: 'credit_amount', _giftcard_amount: 'credit_amount',
+  wc_gift_cards_total: 'credit_amount', _smart_coupon_credit_used: 'credit_amount',
+  _wclc_fee: 'flag', _wclc_fee_kind: 'wclc_kind', _wclc_duty_component: 'decimal', _wclc_tax_component: 'decimal', _wclc_handling_component: 'decimal',
+}
+const SCOPED_META_VALUE_KINDS: Record<string, string> = { coupon_info: 'coupon_info', coupon_data: 'coupon_data', _refunded_item_id: 'int', _line_total_base_currency: 'number' }
+
+test('[raw payloads] meta census: every allowlisted meta key has a declared value projection, and an identity embedded in ANY allowlisted key\'s value (string, array element, object field, JSON string) does not survive', { skip }, async () => {
+  const db = await loadDb()
+  const rows = await db.$queryRaw<Array<{ k: string; kind: string | null }>>`SELECT k, gdpr_wc_meta_value_kind(k) AS kind FROM unnest(gdpr_wc_meta_exact_keys()) AS k`
+  assert.deepEqual(Object.fromEntries(rows.map((r) => [r.k, r.kind])), DECLARED_META_VALUE_KINDS, 'the SQL allowlist and its value kinds equal the declared census (a key without a kind fails here)')
+  for (const [key, kind] of Object.entries(SCOPED_META_VALUE_KINDS)) {
+    assert.equal((await db.$queryRaw<Array<{ kind: string | null }>>`SELECT gdpr_wc_meta_value_kind(${key}) AS kind`)[0]!.kind, kind, `${key} kind`)
+  }
+  const IDENTITY = [`${NAME.first} ${NAME.last}`, EMAIL, PHONE, STREET]
+  const shapes = (id: string): unknown[] => [id, [id], [1, 'CODE', id, id], { discount_type: id, customer_email: [id], note: id, x: { y: id } }, { [`k_${randomUUID().slice(0, 4)}`]: id }, JSON.stringify([1, 'CODE', id, '10', id]), JSON.stringify({ discount_type: id, email_restrictions: [id] })]
+  for (const key of [...Object.keys(DECLARED_META_VALUE_KINDS), ...Object.keys(SCOPED_META_VALUE_KINDS)]) {
+    for (const id of IDENTITY) {
+      for (const shape of shapes(id)) {
+        const out = (await db.$queryRaw<Array<{ p: unknown }>>`SELECT gdpr_project_meta_value(${key}, ${JSON.stringify(shape)}::jsonb) AS p`)[0]!.p
+        for (const frag of [NAME.first, NAME.last, 'example.test', '7700', 'Marmalade']) {
+          assert.equal(JSON.stringify(out ?? null).includes(frag), false, `${key}: "${frag}" survived a ${typeof shape} value: ${JSON.stringify(out)}`)
+        }
+      }
+    }
+  }
+})
+
+test('[raw payloads] the closed discount-type vocabulary matches the importer\'s: every type it knows survives verbatim, every wclc fee kind too', { skip }, async () => {
+  const db = await loadDb()
+  const { WC_GENUINE_DISCOUNT_TYPES, WC_STORE_CREDIT_DISCOUNT_TYPE } = await import('@/lib/connectors/woocommerce/sync/coupon-classification')
+  const { WCLC_FEE_KINDS } = await import('@/lib/connectors/woocommerce/sync/field-mapping')
+  for (const type of [...WC_GENUINE_DISCOUNT_TYPES, WC_STORE_CREDIT_DISCOUNT_TYPE]) {
+    const out = (await db.$queryRaw<Array<{ p: { discount_type: string } }>>`SELECT gdpr_project_coupon_data(${JSON.stringify({ discount_type: type })}::jsonb) AS p`)[0]!.p
+    assert.equal(out.discount_type, type, `${type} survives`)
+  }
+  for (const kind of WCLC_FEE_KINDS) {
+    const out = (await db.$queryRaw<Array<{ p: string }>>`SELECT gdpr_project_meta_value('_wclc_fee_kind', ${JSON.stringify(kind)}::jsonb) AS p`)[0]!.p
+    assert.equal(out, kind, `${kind} survives`)
+  }
+})
+
+test('[raw payloads] coupon_info carrying an email keeps only its type: the classifier reaches the same verdict', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  t.after(async () => { await fx.cleanup() })
+  const rate = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const { classifyWcCouponLines } = await import('@/lib/connectors/woocommerce/sync/coupon-classification')
+  const verdict = (o: { coupon_lines: unknown[]; meta_data: unknown[] }) => {
+    const c = classifyWcCouponLines(o.coupon_lines as never, o.meta_data as never, [])
+    return JSON.stringify({ lines: c.lines.map((l) => [l.code, l.kind, String(l.net), l.discountType, l.creditConflict]), problems: c.signalProblems.map((p) => p.code).sort(), unknown: c.unknown.length })
+  }
+  for (const [label, info] of [
+    ['a percent discount', JSON.stringify([1, 'SALE', 'percent', '10', EMAIL])],
+    ['store credit', JSON.stringify([2, 'gc-5', 'smart_coupon', '5', EMAIL, FULL_NAME])],
+    ['an unreadable record', `not json ${FULL_NAME}`],
+  ] as const) {
+    const code = label === 'store credit' ? 'gc-5' : 'SALE'
+    const original = { ...rawOrder(fx, rate, { coupon_lines: [{ id: 1, code, discount: '5.00', discount_tax: '0.00', meta_data: [{ id: 1, key: 'coupon_info', value: info }] }], meta_data: [] }), fee_lines: [] }
+    const projected = (await db.$queryRaw<Array<{ p: { coupon_lines: unknown[]; meta_data: unknown[] } }>>`SELECT gdpr_project_wc_order(${JSON.stringify(original)}::jsonb) AS p`)[0]!.p
+    assert.equal(verdict(projected), verdict(original as never), `same classification: ${label}`)
+    assert.deepEqual(leaks(projected), [], label)
+    assert.equal(JSON.stringify(projected).includes('example.test'), false, label)
+  }
+})
