@@ -328,6 +328,14 @@ export const WC_FIRST_IMPORT_LOCK_NAMESPACE = 411_220_876
 export const WC_ERASURE_SWEEP_LEASE_NAMESPACE = 411_220_877
 
 /**
+ * Per-STOREFRONT-CUSTOMER serialisation of a customer erasure against an import of that customer's order (pg_advisory_xact_lock(namespace, hash of
+ * connector + storefront customer id)), taken on the TRANSACTION's own connection. The erasure takes it for every storefront customer id it tombstones
+ * BEFORE it locks the customer row; the importer takes it inside the order-create transaction BEFORE it reads the tombstone and before its customer step.
+ * GLOBAL LOCK ORDER (nothing waits against it): first-import session lock -> this key lock -> customer row -> sales_order rows -> linked rows.
+ */
+export const WC_CUSTOMER_KEY_LOCK_NAMESPACE = 411_220_878
+
+/**
  * The namespace the SESSION-LOCK-SPACE PROBE takes its key in (o3d-2k5r r26).
  *
  * Declared in `lib/db/database-url-schema.mjs` and re-exported here rather than written down twice:
@@ -374,6 +382,7 @@ export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   FIRST_LOAD_APPLY_STEP_LOCK_NAMESPACE,
   WC_FIRST_IMPORT_LOCK_NAMESPACE,
   WC_ERASURE_SWEEP_LEASE_NAMESPACE,
+  WC_CUSTOMER_KEY_LOCK_NAMESPACE,
   XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE,
   SESSION_LOCK_SPACE_PROBE_NAMESPACE,
 } as const

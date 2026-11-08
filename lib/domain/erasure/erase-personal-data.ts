@@ -5,6 +5,7 @@ import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { HELD_SALES_INVOICE_RECORD_KIND } from '@/lib/domain/sales/wc-sync-row-families'
 import { EMAIL_RECIPIENT_ERASED_REASON } from './email-recipient'
 import { scrubContactBlock } from './contact-gate'
+import { CustomerKeysChanged, lockStorefrontCustomerKeys, readStorefrontCustomerIds } from './customer-key-lock'
 import { scrubReturnInboxEvents } from './return-events'
 import { loadRawPayloadSubject, scrubRawPayloadsInTx, type RawPayloadCounts } from './raw-payloads'
 import { SYSTEM_PAYMENT_NOTES, orderIsErasedInTx } from './order-state'
@@ -471,15 +472,28 @@ export async function eraseCustomerPersonalData(
   const requestId = randomUUID()
   const erasedAt = new Date()
   try {
-    const refusal = await db.$transaction(async (tx): Promise<string | null> => {
-      // LOCKS FIRST: the customer row is locked, then ALL of the customer's orders in one statement in id order (customer, then orders).
+    let refusal: string | null = null
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        refusal = await db.$transaction(async (tx): Promise<string | null> => {
+      // LOCKS FIRST. The storefront-customer KEY LOCKS (customer-key-lock.ts) come before the customer row lock, so an import of one of this customer's orders and
+      // this erasure serialise; the ids are read unlocked, locked, and re-read under the customer lock (a new id means retry).
+      const keysLocked = await lockStorefrontCustomerKeys(tx, await readStorefrontCustomerIds(tx, customerId))
+      // Then the customer row is locked, then ALL of the customer's orders in one statement in id order (customer, then orders).
       // New orders cannot appear under the customer meanwhile: creating one takes the same customer row lock.
       const lockedCustomer = await tx.$queryRaw<Array<{ id: string; gdprAnonymisedAt: Date | null }>>`SELECT id, "gdprAnonymisedAt" FROM "customers" WHERE id = ${customerId} FOR UPDATE`
       if (lockedCustomer.length === 0) return 'Customer not found'
       if (lockedCustomer[0]!.gdprAnonymisedAt) return 'Customer already anonymised'
       const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "sales_orders" WHERE "customerId" = ${customerId} ORDER BY id FOR UPDATE`
+      if ((await readStorefrontCustomerIds(tx, customerId)).some((id) => !keysLocked.includes(id))) throw new CustomerKeysChanged()
       return eraseUnderLocksInTx(tx, { customerId, eraseCustomer: true, targetOrderIds: locked.map((o) => o.id), requestId, erasedAt, trigger: options.trigger, userId: options.userId })
     }, ERASURE_TRANSACTION_OPTIONS)
+        break
+      } catch (e) {
+        if (e instanceof CustomerKeysChanged && attempt < 3) continue
+        throw e
+      }
+    }
     if (refusal) return { success: false, error: refusal }
     return { success: true, requestId }
   } catch (e) {
@@ -534,7 +548,10 @@ export async function eraseOrderPersonalData(
           let customerErased = false
           let customerLive = false
           if (peek.customerId) {
+            // The storefront-customer key locks first (see eraseCustomerPersonalData), then the customer row.
+            const keysLocked = await lockStorefrontCustomerKeys(tx, await readStorefrontCustomerIds(tx, peek.customerId))
             const lockedCustomer = await tx.$queryRaw<Array<{ gdprAnonymisedAt: Date | null }>>`SELECT "gdprAnonymisedAt" FROM "customers" WHERE id = ${peek.customerId} FOR UPDATE`
+            if ((await readStorefrontCustomerIds(tx, peek.customerId)).some((id) => !keysLocked.includes(id))) throw new CustomerKeysChanged()
             customerErased = lockedCustomer.length > 0 && lockedCustomer[0]!.gdprAnonymisedAt != null
             customerLive = lockedCustomer.length > 0 && !customerErased
             await tx.$queryRaw`SELECT id FROM "sales_orders" WHERE "customerId" = ${peek.customerId} ORDER BY id FOR UPDATE`
@@ -554,7 +571,7 @@ export async function eraseOrderPersonalData(
           return { success: true, already: false, requestId, customerErased: eraseCustomer }
         }, ERASURE_TRANSACTION_OPTIONS)
       } catch (e) {
-        if (e instanceof OrderRelinkedDuringErasure && attempt < ORDER_ERASURE_ATTEMPTS) continue
+        if ((e instanceof OrderRelinkedDuringErasure || e instanceof CustomerKeysChanged) && attempt < ORDER_ERASURE_ATTEMPTS) continue
         throw e
       }
     }
