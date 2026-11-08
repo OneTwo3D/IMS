@@ -80,37 +80,70 @@ export async function scrubAccountingDerivedCopiesInTx(tx: Client, orderIds: str
   return { accountingEventCopiesScrubbed: events + logs, accountingErrorsScrubbed: errors }
 }
 
-/** How far back the reconcile looks for a row inserted while an erasure was uncommitted. A trigger sees every committed erasure; only that window is open. */
-export const DERIVED_RECONCILE_WINDOW = Prisma.sql`interval '2 days'`
+/**
+ * HOW FAR BACK THE RECONCILE LOOKS FOR ERASURES, with a margin. The reconcile is driven by the SUBJECTS (orders erased, or whose customer was erased, within this
+ * window), never by the age of a row: a row that is OLD but was updated by a transaction that overlapped the erasure commit (the writer's trigger snapshot saw the
+ * order live) is revisited like any other. Every derived store is searched through the subject's keys (order id, its refund ids, the order url).
+ */
+export const DERIVED_RECONCILE_WINDOW = Prisma.sql`interval '3 days'`
+/** Rows changed per statement, and the most statements-rounds one run makes before it reports what is left instead of draining it. */
+export const DERIVED_RECONCILE_BATCH = 500
+export const DERIVED_RECONCILE_MAX_ROUNDS = 20
+
+export type DerivedReconcileResult = { changed: number; remaining: number; rounds: number }
+
+// The erased subjects of the window and their keys, as CTEs shared by every statement below.
+const subjects = Prisma.sql`
+  subj AS (SELECT o."id" FROM "sales_orders" o LEFT JOIN "customers" c ON c."id" = o."customerId"
+            WHERE o."erasedAt" >= now() - ${DERIVED_RECONCILE_WINDOW} OR c."gdprAnonymisedAt" >= now() - ${DERIVED_RECONCILE_WINDOW}),
+  refs AS (SELECT s."id" AS "refId", 'SalesOrder' AS "refType" FROM subj s
+           UNION ALL SELECT r."id", 'SalesOrderRefund' FROM "sales_order_refunds" r WHERE r."orderId" IN (SELECT "id" FROM subj))`
+
+const notificationDirty = Prisma.sql`(t."title" <> 'Notification redacted' OR t."message" <> 'The text of this notification was removed by a personal-data erasure.')`
+const notificationSubject = Prisma.sql`t."actionUrl" ~ '^/sales/[^/?#]+' AND substring(t."actionUrl" from '^/sales/([^/?#]+)') IN (SELECT "id" FROM subj)`
+
+async function remainingDerived(client: Pick<Prisma.TransactionClient, '$queryRaw'>): Promise<number> {
+  const left = await client.$queryRaw<Array<{ n: bigint }>>`
+    WITH ${subjects}
+    SELECT (SELECT count(*) FROM "accounting_events" e JOIN refs ON refs."refType" = e."sourceEntityType" AND refs."refId" = e."sourceEntityId"
+             WHERE jsonb_typeof(e."linesJson" -> 'contact') = 'object' AND ${eventDirty})
+         + (SELECT count(*) FROM "accounting_event_logs" l JOIN "accounting_events" e ON e."id" = l."accountingEventId"
+             JOIN refs ON refs."refType" = e."sourceEntityType" AND refs."refId" = e."sourceEntityId" WHERE ${logDirty})
+         + (SELECT count(*) FROM "accounting_sync_logs" s JOIN refs ON refs."refType" = s."referenceType" AND refs."refId" = s."referenceId" WHERE ${errorDirty('s')})
+         + (SELECT count(*) FROM "notifications" t WHERE ${notificationSubject} AND ${notificationDirty}) AS n`
+  return Number(left[0]?.n ?? 0)
+}
 
 /**
- * Finish what the triggers could not see: rows INSERTED while an erasure was still uncommitted. Idempotent; runs from the email-outbox cron.
- * Returns the number of rows changed and how many remain (0 after a clean run).
+ * Finish what the triggers could not see: rows written by a transaction that overlapped an erasure's commit. Idempotent; runs from the email-outbox cron.
+ * Drains in bounded batches until nothing is left or MAX_ROUNDS is reached; the caller must treat `remaining > 0` as a failure (the cron does).
  */
-export async function reconcileDerivedCopies(client: Pick<Prisma.TransactionClient, '$executeRaw' | '$queryRaw'>, batch = 500): Promise<{ changed: number; remaining: number }> {
-  const eventsRecent = Prisma.sql`e."createdAt" >= now() - ${DERIVED_RECONCILE_WINDOW} AND gdpr_accounting_ref_erased(e."sourceEntityType", e."sourceEntityId")`
-  const events = Number(await client.$executeRaw`
-    UPDATE "accounting_events" x SET "linesJson" = gdpr_scrub_contact(x."linesJson", gdpr_event_keeps_contact_name(x))
-     WHERE x."id" IN (SELECT e."id" FROM "accounting_events" e WHERE ${eventsRecent} AND jsonb_typeof(e."linesJson" -> 'contact') = 'object' AND ${eventDirty} LIMIT ${batch})`)
-  const logs = Number(await client.$executeRaw`
-    UPDATE "accounting_event_logs" x
-       SET "metadata" = jsonb_set(x."metadata", '{enqueuedLinesJson}', gdpr_scrub_contact(x."metadata" -> 'enqueuedLinesJson', gdpr_event_keeps_contact_name(e)))
-      FROM "accounting_events" e
-     WHERE x."id" IN (SELECT l."id" FROM "accounting_event_logs" l JOIN "accounting_events" e ON e."id" = l."accountingEventId"
-                       WHERE l."createdAt" >= now() - ${DERIVED_RECONCILE_WINDOW} AND gdpr_accounting_ref_erased(e."sourceEntityType", e."sourceEntityId") AND ${logDirty} LIMIT ${batch})
-       AND e."id" = x."accountingEventId"`)
-  const errors = Number(await client.$executeRaw`
-    UPDATE "accounting_sync_logs" x SET "errorMessage" = ${DERIVED_ERROR_MARKER}::text
-     WHERE x."id" IN (SELECT s."id" FROM "accounting_sync_logs" s
-                       WHERE s."createdAt" >= now() - ${DERIVED_RECONCILE_WINDOW} AND ${errorDirty('s')} AND gdpr_accounting_ref_erased(s."referenceType", s."referenceId") LIMIT ${batch})`)
-  const notes = Number(await client.$executeRaw`
-    UPDATE "notifications" n SET "title" = 'Notification redacted', "message" = 'The text of this notification was removed by a personal-data erasure.'
-     WHERE n."id" IN (SELECT t."id" FROM "notifications" t
-                       WHERE t."createdAt" >= now() - ${DERIVED_RECONCILE_WINDOW} AND t."actionUrl" ~ '^/sales/[^/?#]+'
-                         AND gdpr_order_id_erased(substring(t."actionUrl" from '^/sales/([^/?#]+)'))
-                         AND (t."title" <> 'Notification redacted' OR t."message" <> 'The text of this notification was removed by a personal-data erasure.') LIMIT ${batch})`)
-  const left = await client.$queryRaw<Array<{ n: bigint }>>`
-    SELECT (SELECT count(*) FROM "accounting_events" e WHERE ${eventsRecent} AND jsonb_typeof(e."linesJson" -> 'contact') = 'object' AND ${eventDirty})
-         + (SELECT count(*) FROM "accounting_sync_logs" s WHERE s."createdAt" >= now() - ${DERIVED_RECONCILE_WINDOW} AND ${errorDirty('s')} AND gdpr_accounting_ref_erased(s."referenceType", s."referenceId")) AS n`
-  return { changed: events + logs + errors + notes, remaining: Number(left[0]?.n ?? 0) }
+export async function reconcileDerivedCopies(client: Pick<Prisma.TransactionClient, '$executeRaw' | '$queryRaw'>, batch = DERIVED_RECONCILE_BATCH, maxRounds = DERIVED_RECONCILE_MAX_ROUNDS): Promise<DerivedReconcileResult> {
+  let changed = 0
+  let rounds = 0
+  while (rounds < maxRounds) {
+    rounds += 1
+    const events = Number(await client.$executeRaw`
+      UPDATE "accounting_events" x SET "linesJson" = gdpr_scrub_contact(x."linesJson", gdpr_event_keeps_contact_name(x))
+       WHERE x."id" IN (WITH ${subjects} SELECT e."id" FROM "accounting_events" e JOIN refs ON refs."refType" = e."sourceEntityType" AND refs."refId" = e."sourceEntityId"
+                         WHERE jsonb_typeof(e."linesJson" -> 'contact') = 'object' AND ${eventDirty} LIMIT ${batch})`)
+    const logs = Number(await client.$executeRaw`
+      UPDATE "accounting_event_logs" x
+         SET "metadata" = jsonb_set(x."metadata", '{enqueuedLinesJson}', gdpr_scrub_contact(x."metadata" -> 'enqueuedLinesJson', gdpr_event_keeps_contact_name(e)))
+        FROM "accounting_events" e
+       WHERE e."id" = x."accountingEventId"
+         AND x."id" IN (WITH ${subjects} SELECT l."id" FROM "accounting_event_logs" l JOIN "accounting_events" e ON e."id" = l."accountingEventId"
+                         JOIN refs ON refs."refType" = e."sourceEntityType" AND refs."refId" = e."sourceEntityId" WHERE ${logDirty} LIMIT ${batch})`)
+    const errors = Number(await client.$executeRaw`
+      UPDATE "accounting_sync_logs" x SET "errorMessage" = ${DERIVED_ERROR_MARKER}::text
+       WHERE x."id" IN (WITH ${subjects} SELECT s."id" FROM "accounting_sync_logs" s JOIN refs ON refs."refType" = s."referenceType" AND refs."refId" = s."referenceId"
+                         WHERE ${errorDirty('s')} LIMIT ${batch})`)
+    const notes = Number(await client.$executeRaw`
+      UPDATE "notifications" n SET "title" = 'Notification redacted', "message" = 'The text of this notification was removed by a personal-data erasure.'
+       WHERE n."id" IN (WITH ${subjects} SELECT t."id" FROM "notifications" t WHERE ${notificationSubject} AND ${notificationDirty} LIMIT ${batch})`)
+    const round = events + logs + errors + notes
+    changed += round
+    if (round === 0) break
+  }
+  return { changed, remaining: await remainingDerived(client), rounds }
 }
