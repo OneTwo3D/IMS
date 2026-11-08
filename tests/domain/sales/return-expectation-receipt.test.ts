@@ -84,7 +84,13 @@ test('an unreadable snapshot is refused, never read as free stock', async () => 
 
 type Line = { id: string; expectation_id: string; qty: Prisma.Decimal; qty_received: Prisma.Decimal; qty_written_off: Prisma.Decimal; cost_snapshot: unknown[]; valued?: boolean }
 
-function fakeTx(lines: Line[], expectation: { transitJournalKey: string | null; transitDebitBase?: string }) {
+type SyncRow = { status: string; connector: string; externalTransactionId?: string | null; abandonedBeforeRemoteCall?: boolean | null; settlementBasis?: string | null } | null
+function fakeTx(
+  lines: Line[],
+  expectation: { transitJournalKey: string | null; transitDebitBase?: string; syncRow?: SyncRow; retryRequired?: boolean },
+) {
+  const cleared = { value: new Prisma.Decimal(0) }
+  const syncRow: { current: SyncRow } = { current: expectation.syncRow === undefined ? { status: 'SYNCED', connector: 'xero' } : expectation.syncRow }
   const updates: Array<Record<string, unknown>> = []
   const logs: Array<Record<string, unknown>> = []
   const open = () => lines.filter((l) => l.qty.gt(l.qty_received.add(l.qty_written_off)))
@@ -101,10 +107,16 @@ function fakeTx(lines: Line[], expectation: { transitJournalKey: string | null; 
       findUniqueOrThrow: async () => ({
         id: 'e-1', reference: 'RX-CN-1', refundId: 'r-1', transitJournalKey: expectation.transitJournalKey,
         transitDebitBase: new Prisma.Decimal(expectation.transitDebitBase ?? '12.5'),
+        transitClearedAmount: cleared.value,
+        refund: { accountingRetryRequired: expectation.retryRequired ?? false },
         lines: lines.map((l) => ({ id: l.id, qty: l.qty, qtyReceived: l.qty_received, qtyWrittenOff: l.qty_written_off, costSnapshot: l.cost_snapshot })),
       }),
-      update: async (args: Record<string, unknown>) => { updates.push(args) },
+      update: async (args: { data?: { transitClearedAmount?: { increment: string } } }) => {
+        updates.push(args)
+        if (args.data?.transitClearedAmount) cleared.value = cleared.value.add(args.data.transitClearedAmount.increment)
+      },
     },
+    accountingSyncLog: { findFirst: async () => (syncRow.current ? { externalTransactionId: null, abandonedBeforeRemoteCall: null, settlementBasis: null, ...syncRow.current } : null) },
     transitSubledgerMovement: {
       aggregate: async () => ({
         _sum: { baseDelta: subledger.reduce((sum, r) => sum.add(r.baseDelta as Prisma.Decimal), new Prisma.Decimal(0)) },
@@ -112,7 +124,7 @@ function fakeTx(lines: Line[], expectation: { transitJournalKey: string | null; 
     },
     activityLog: { create: async (args: Record<string, unknown>) => { logs.push(args) } },
   }
-  return { tx: tx as unknown as Prisma.TransactionClient, updates, logs }
+  return { tx: tx as unknown as Prisma.TransactionClient, updates, logs, syncRow, cleared }
 }
 
 const oneLine = (): Line[] => [{ id: 'l-1', expectation_id: 'e-1', qty: new Prisma.Decimal(1), qty_received: new Prisma.Decimal(0), qty_written_off: new Prisma.Decimal(0), cost_snapshot: [entry('1', '12.5')] }]
@@ -158,16 +170,67 @@ test('a refused journal rolls the arrival back (the throw), and a missing accoun
   accounts = { inventoryAccount: '630', transitAccount: '840' }
 })
 
-test('a refund that never debited transit (no journal key) clears no ledger value; accounting off warns without queueing', async () => {
+test('a refund that never debited transit (no journal key, no retry owed) clears no ledger value; stock only', async () => {
   const { receiveReturnAgainstExpectationsTx } = await mod
   queued.length = 0; subledger.length = 0; enqueueAnswer = { queued: true }
-  await receiveReturnAgainstExpectationsTx(fakeTx(oneLine(), { transitJournalKey: null }).tx, params({ connector: 'xero', syncEnabled: true }))
+  const result = await receiveReturnAgainstExpectationsTx(fakeTx(oneLine(), { transitJournalKey: null }).tx, params({ connector: 'xero', syncEnabled: true }))
   assert.equal(queued.length, 0)
-  const off = fakeTx(oneLine(), { transitJournalKey: 'k' })
-  await receiveReturnAgainstExpectationsTx(off.tx, params({ connector: null, syncEnabled: false }))
+  assert.equal(result.expectationIds.length, 1)
+})
+
+test('accounting off while the refund DID queue a transit debit: the arrival is HELD with no stock, then clears once with GL equal to the sub-ledger', async () => {
+  const { receiveReturnAgainstExpectationsTx } = await mod
+  queued.length = 0; subledger.length = 0; enqueueAnswer = { queued: true }
+  const lines: Line[] = [{ id: 'l-1', expectation_id: 'e-1', qty: new Prisma.Decimal(2), qty_received: new Prisma.Decimal(0), qty_written_off: new Prisma.Decimal(0), cost_snapshot: [entry('2', '5')] }]
+  const { tx, updates } = fakeTx(lines, { transitJournalKey: 'k', transitDebitBase: '10' })
+  await assert.rejects(() => receiveReturnAgainstExpectationsTx(tx, params({ connector: null, syncEnabled: false })), /awaiting_accounting/)
+  assert.equal(updates.length, 0)
+  assert.equal(lines[0].qty_received.toFixed(0), '0', 'no quantity advanced without its journal')
+  await receiveReturnAgainstExpectationsTx(tx, params({ connector: 'xero', syncEnabled: true }))
+  await receiveReturnAgainstExpectationsTx(tx, params({ connector: 'xero', syncEnabled: true }))
+  const gl = queued.reduce((sum, q) => sum + ((q.payload as { lines: Array<{ debit?: number }> }).lines[0].debit ?? 0), 0)
+  const sub = subledger.reduce((sum, r) => sum.add(r.baseDelta as Prisma.Decimal), new Prisma.Decimal(0))
+  assert.equal(gl, 10)
+  assert.equal(sub.toFixed(2), '-10.00', 'GL equals the sub-ledger')
+})
+
+test('connector switch: the debit sits in another ledger than the active one, so the arrival is HELD', async () => {
+  const { receiveReturnAgainstExpectationsTx } = await mod
+  queued.length = 0
+  const { tx } = fakeTx(oneLine(), { transitJournalKey: 'k', syncRow: { status: 'SYNCED', connector: 'quickbooks' } })
+  await assert.rejects(() => receiveReturnAgainstExpectationsTx(tx, params({ connector: 'xero', syncEnabled: true })), /awaiting_accounting/)
   assert.equal(queued.length, 0)
-  assert.equal(off.logs.length, 1)
-  assert.equal((off.logs[0].data as { action: string }).action, 'return_expectation_arrival_not_journalled')
+})
+
+test('arrival before the refund journal is queued is HELD, then clears after it is', async () => {
+  const { receiveReturnAgainstExpectationsTx } = await mod
+  queued.length = 0; subledger.length = 0
+  const f = fakeTx(oneLine(), { transitJournalKey: 'k', syncRow: null })
+  await assert.rejects(() => receiveReturnAgainstExpectationsTx(f.tx, params({ connector: 'xero', syncEnabled: true })), /awaiting_refund_journal/)
+  const owed = fakeTx(oneLine(), { transitJournalKey: null, retryRequired: true })
+  await assert.rejects(() => receiveReturnAgainstExpectationsTx(owed.tx, params({ connector: 'xero', syncEnabled: true })), /awaiting_refund_journal/)
+  f.syncRow.current = { status: 'PENDING', connector: 'xero' }
+  await receiveReturnAgainstExpectationsTx(f.tx, params({ connector: 'xero', syncEnabled: true }))
+  assert.equal(queued.length, 1)
+})
+
+test('an unproven refund debit (failed with no proof) is HELD for a person, not restocked and not cleared', async () => {
+  const { receiveReturnAgainstExpectationsTx } = await mod
+  queued.length = 0
+  const { tx } = fakeTx(oneLine(), { transitJournalKey: 'k', syncRow: { status: 'FAILED', connector: 'xero' } })
+  await assert.rejects(() => receiveReturnAgainstExpectationsTx(tx, params({ connector: 'xero', syncEnabled: true })), /awaiting_refund_journal/)
+  assert.equal(queued.length, 0)
+})
+
+test('the refund debit was shadowed for good: stock comes back with no clearing journal, recorded, no sub-ledger row', async () => {
+  const { receiveReturnAgainstExpectationsTx } = await mod
+  queued.length = 0; subledger.length = 0
+  const f = fakeTx(oneLine(), { transitJournalKey: 'k', syncRow: { status: 'CANCELLED', connector: 'xero', settlementBasis: 'HELD_SHADOW' } })
+  const result = await receiveReturnAgainstExpectationsTx(f.tx, params({ connector: null, syncEnabled: false }))
+  assert.equal(result.expectationIds.length, 1)
+  assert.equal(queued.length, 0)
+  assert.equal(subledger.length, 0)
+  assert.equal((f.logs[0].data as { action: string }).action, 'return_expectation_arrival_debit_not_posted')
 })
 
 test('an arrival is HELD whole while the oldest open expectation that would take it is unvalued, and nothing falls through to a plain restock', async () => {

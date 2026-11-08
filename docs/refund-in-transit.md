@@ -21,6 +21,18 @@ return expectations clears them, in the inbox transaction, under the order lock:
   not even as a plain restock, and the operator sees "held, refund not valued yet". Nothing retries it by itself: the
   operator restocks the inbox item again once the refund is valued. An older unvalued refund is never skipped for a newer
   valued one.
+* The ledger leg is decided under the order lock **before anything is written**, and an arrival clears transit only against
+  a refund transit debit that is proven queued, in that debit's own ledger:
+  * the refund's COGS reversal row (found by its recorded key) is not there yet, or the refund still owes its accounting:
+    the arrival is **held** (`awaiting_refund_journal`);
+  * the row exists but accounting is off or another connector is active than the one the debit sits in: **held**
+    (`awaiting_accounting`), so stock is never booked without the journal that moves its value out of transit;
+  * the row's ledger standing proves the debit never reached the ledger (a producer-hold shadow, or an orphan proven not
+    posted): it will not be, so the units are restocked with **no clearing journal and no sub-ledger row** (the same as the refund side,
+    which writes none for a shadow) and a WARNING is logged;
+  * a row whose standing is unproven (failed with no proof, an operator's not-posted): **held** (`awaiting_refund_journal`),
+    a person decides;
+  * a held arrival writes nothing and is retried by the operator restocking the inbox item again.
 * Stock: one `RETURN_INBOUND` movement per cleared line, with cost layers at the refund's own dispatch-cost snapshot (a
   line's snapshot is consumed in order, so the first units' cost goes to the first arrival). This also fixes the old
   inbox restock creating stock with no layer when it clears a document.
@@ -33,8 +45,10 @@ return expectations clears them, in the inbox transaction, under the order lock:
   its stock and records a WARNING.
 * The value released is cumulative: an arrival journals round(value received after it) minus round(value received
   before it) at 2dp, so no cent is lost between arrivals (3 x 0.333333 clears 1.00) and an arrival too small to move a
-  cent records its quantity and carries the value forward. The arrival that closes the document clears exactly what the
-  refund posted (its 2dp journal total). The sub-ledger row equals the journal, except that the closing arrival also takes
+  cent records its quantity and carries the value forward. What was actually journalled is stored on the document
+  (`transit_cleared_amount`, advanced only when a clearing journal was queued and not shadowed) and each clearing is the target
+  for everything received so far minus that figure, so a missed clearing is made up by the next one. The arrival that
+  closes the document clears exactly what the refund posted (its 2dp journal total). The sub-ledger row equals the journal, except that the closing arrival also takes
   the sub-penny residue of the refund's 6dp row, so the document's rows net to exactly zero.
 
 ## The switch

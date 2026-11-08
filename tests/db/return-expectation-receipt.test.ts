@@ -158,3 +158,60 @@ test('[db] a legacy refund and another order are never cleared', { skip }, async
     assert.deepEqual((await arrive(tx, { ...fx, orderId: other.orderId }, 1)).expectationIds, [], 'other order')
   })
 })
+
+async function withTransitDebit(tx: Tx, fx: { orderId: string; refunds: Array<{ id: string; lineIds: string[] }>; product: { id: string } }, status: string | null) {
+  const refund = fx.refunds[0]
+  await createReturnExpectationTx(tx, {
+    valued: true, refundId: refund.id, orderId: fx.orderId, creditNoteNumber: 'T',
+    rows: [{ productId: fx.product.id, qty: 2, refundLineId: refund.lineIds[0], unitCostBase: '10' }],
+    transit: { journalKey: `sales-order-refund:${refund.id}:cogs-reversal`, debitBase: '20' },
+  })
+  if (status) {
+    await tx.accountingSyncLog.create({
+      data: {
+        connector: 'xero', type: 'COGS_REVERSAL', status, referenceType: 'SalesOrderRefund', referenceId: refund.id,
+        payload: { _idempotencyKey: `sales-order-refund:${refund.id}:cogs-reversal`, _returnInTransit: true },
+      },
+    })
+  }
+}
+
+test('[db] the refund journal must be a queued row on its recorded key: absent holds, a different ledger holds, a cancelled one restocks with no clearing journal', { skip }, async () => {
+  await withRollback(async (tx) => {
+    const fx = await seed(tx, { refunds: 1 })
+    await withTransitDebit(tx, fx, null)
+    await tx.$executeRaw`SAVEPOINT a`
+    await assert.rejects(() => arrive(tx, fx, 2), /awaiting_refund_journal/)
+    await tx.$executeRaw`ROLLBACK TO SAVEPOINT a`
+
+    const row = await tx.accountingSyncLog.create({
+      data: { connector: 'xero', type: 'COGS_REVERSAL', status: 'SYNCED', referenceType: 'SalesOrderRefund', referenceId: fx.refunds[0].id, payload: { _idempotencyKey: `sales-order-refund:${fx.refunds[0].id}:cogs-reversal` } },
+      select: { id: true },
+    })
+    await tx.$executeRaw`SAVEPOINT b`
+    await assert.rejects(() => arrive(tx, fx, 2), /awaiting_accounting/) // accounting is off in this arrival
+    await tx.$executeRaw`ROLLBACK TO SAVEPOINT b`
+    assert.equal(await tx.stockMovement.count({ where: { productId: fx.product.id } }), 0, 'held: no stock')
+    assert.equal((await tx.returnExpectationLine.findFirst({})).qtyReceived.toFixed(0), '0')
+
+    await tx.accountingSyncLog.update({ where: { id: row.id }, data: { status: 'CANCELLED', settlementBasis: 'HELD_SHADOW' } })
+    const result = await arrive(tx, fx, 2)
+    assert.equal(result.expectationIds.length, 1)
+    const level = await tx.stockLevel.findUnique({ where: { productId_warehouseId: { productId: fx.product.id, warehouseId: fx.warehouseId } } })
+    assert.equal(level.quantity.toFixed(0), '2')
+    assert.equal(await tx.activityLog.count({ where: { action: 'return_expectation_arrival_debit_not_posted' } }), 1)
+    assert.equal((await tx.returnExpectation.findUnique({ where: { refundId: fx.refunds[0].id } })).transitClearedAmount.toFixed(2), '0.00')
+  })
+})
+
+test('[db] the journalled amount cannot go negative', { skip }, async () => {
+  await withRollback(async (tx) => {
+    const fx = await seed(tx, { refunds: 1 })
+    await withTransitDebit(tx, fx, null)
+    await tx.$executeRaw`SAVEPOINT c`
+    let message = ''
+    try { await tx.returnExpectation.updateMany({ data: { transitClearedAmount: -1 } }) } catch (error) { message = String(error) }
+    await tx.$executeRaw`ROLLBACK TO SAVEPOINT c`
+    assert.ok(message.includes('transit_cleared_amount_check'), message.slice(0, 200))
+  })
+})

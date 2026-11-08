@@ -9,6 +9,7 @@ import {
   queueAccountingSyncTxWithOutcome,
   readStockReceiptAccountsTx,
 } from '@/lib/accounting'
+import { LEDGER_STANDING_SELECT, ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import { postingIsOwed, isShadowedOutcome } from '@/lib/domain/accounting/enqueue-outcome'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { compareDecimal, roundQuantity, subtractMoney, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
@@ -230,6 +231,13 @@ export async function receiveReturnAgainstExpectationsTx(
   // retries it by itself). Throwing rolls back the caller's transaction; nothing has been written yet.
   if (plan.awaitingValuation) throw new ReturnExpectationError('awaiting_refund_valuation')
 
+  // The ledger side is decided BEFORE anything is written, so a hold leaves nothing behind. An arrival clears transit
+  // only against a refund transit debit that is proven queued, in that debit's own ledger.
+  const modes = new Map<string, ClearingMode>()
+  for (const expectationId of new Set(plan.chunks.map((chunk) => chunk.expectationId))) {
+    modes.set(expectationId, await resolveClearingMode(tx, expectationId, params.accounting))
+  }
+
   const rows: ReceiptRow[] = []
   for (const chunk of plan.chunks) {
     for (const entry of chunk.entries) {
@@ -254,7 +262,7 @@ export async function receiveReturnAgainstExpectationsTx(
     const expectation = await tx.returnExpectation.findUniqueOrThrow({
       where: { id: expectationId },
       select: {
-        id: true, reference: true, refundId: true, transitJournalKey: true, transitDebitBase: true,
+        id: true, reference: true, refundId: true, transitJournalKey: true, transitDebitBase: true, transitClearedAmount: true,
         lines: { select: { id: true, qty: true, qtyReceived: true, qtyWrittenOff: true, costSnapshot: true } },
       },
     })
@@ -263,29 +271,40 @@ export async function receiveReturnAgainstExpectationsTx(
       where: { id: expectationId },
       data: { status, closedAt: status === 'RECEIVED' || status === 'WRITTEN_OFF' ? new Date() : null },
     })
-    // Nothing debited transit for this refund (accounting was off): no ledger movement to clear.
-    if (!expectation.transitJournalKey || expectation.transitDebitBase == null) continue
+    const mode = modes.get(expectationId)!
+    if (mode.kind === 'none') {
+      if (mode.record) {
+        await tx.activityLog.create({
+          data: {
+            entityType: 'SALES_ORDER',
+            entityId: expectation.refundId,
+            action: 'return_expectation_arrival_debit_not_posted',
+            tag: 'accounting',
+            level: 'WARNING',
+            description: 'A returned parcel arrived for a refund whose Stock in Transit debit was never posted (cancelled or shadowed), so no clearing journal was queued.',
+            metadata: { expectationId: expectation.id, inboxId: params.inboxId },
+          },
+        })
+      }
+      continue
+    }
+    if (expectation.transitJournalKey == null || expectation.transitDebitBase == null) continue
 
     // CUMULATIVE, not per arrival: the amount an arrival clears is round(value of everything received after it) minus
     // round(value of everything received before it), so cents are never lost to per-arrival rounding (3 x 0.333333
     // clears 1.00, not 0.99) and an arrival too small to move a cent carries its value forward. The arrival that closes
     // the document clears exactly what the refund posted, whatever the snapshot arithmetic says.
-    const chunkQtyByLine = new Map<string, Decimal>()
-    for (const chunk of plan.chunks.filter((c) => c.expectationId === expectationId)) {
-      chunkQtyByLine.set(chunk.lineId, (chunkQtyByLine.get(chunk.lineId) ?? toDecimal(0)).add(chunk.qty))
-    }
-    let before = toDecimal(0)
     let after = toDecimal(0)
     for (const line of expectation.lines) {
       const entries = parseEntries(line.costSnapshot)
       const receivedAfter = toDecimal(line.qtyReceived)
-      const receivedBefore = receivedAfter.sub(chunkQtyByLine.get(line.id) ?? 0)
-      before = before.add(cumulativeSnapshotValue(entries, receivedBefore))
       after = after.add(cumulativeSnapshotValue(entries, receivedAfter))
     }
     const closes = status === 'RECEIVED' || status === 'WRITTEN_OFF'
     const postedCents = roundQuantity(expectation.transitDebitBase, 2)
-    const cents = subtractMoney(closes ? postedCents : roundQuantity(after, 2), roundQuantity(before, 2))
+    // Target for everything received so far, less what has actually been journalled (not what an earlier arrival
+    // meant to journal), so a skipped or shadowed clearing is made up by the next one.
+    const cents = subtractMoney(closes ? postedCents : roundQuantity(after, 2), expectation.transitClearedAmount)
     if (compareDecimal(cents, 0) <= 0) continue
     // The sub-ledger equals the journal, except that the closing arrival also clears the sub-penny residue the refund's
     // 6dp row holds, so the document's rows net to exactly zero.
@@ -308,6 +327,7 @@ export async function receiveReturnAgainstExpectationsTx(
       subledgerBase,
       arrivedAt: params.arrivedAt,
       accounting: params.accounting,
+      connector: mode.connector,
     })
   }
 
@@ -317,6 +337,57 @@ export async function receiveReturnAgainstExpectationsTx(
     remainder: plan.remainder,
     expectationIds,
   }
+}
+
+type ClearingMode = { kind: 'none'; record: boolean } | { kind: 'journal'; connector: NonNullable<ReceiptAccounting['connector']> }
+
+/**
+ * May this arrival clear transit in the ledger, and against which ledger? Decided under the order lock, before any write.
+ *
+ *  - The refund recorded no transit journal key and owes no accounting retry: transit never held this value (accounting
+ *    was off at the refund). Nothing to clear: stock only.
+ *  - No key but the refund still owes its accounting, or a key with no sync row yet: the debit is not queued. HOLD
+ *    (`awaiting_refund_journal`): clearing it first would credit a transit the ledger has not debited.
+ *  - The sync row's standing says the debit never reached the ledger (a producer-hold shadow, or an orphan proven not
+ *    posted): it will not be. DEFINED OUTCOME: the same as the refund side's shadow, which writes no transit
+ *    sub-ledger row. The goods are restocked with no clearing journal and the arrival says so in the activity log.
+ *  - The row's standing is unproven (UNKNOWN, an operator's not-posted): HOLD (`awaiting_refund_journal`), a person decides.
+ *  - The row is queued or posted (live work or confirmed): the clearing must go to THAT ledger. If
+ *    accounting is off or the active connector is another one, HOLD (`awaiting_accounting`): stock must not be booked
+ *    without the journal that moves its value out of transit.
+ */
+async function resolveClearingMode(
+  tx: Prisma.TransactionClient,
+  expectationId: string,
+  accounting: ReceiptAccounting,
+): Promise<ClearingMode> {
+  const expectation = await tx.returnExpectation.findUniqueOrThrow({
+    where: { id: expectationId },
+    select: { refundId: true, transitJournalKey: true, refund: { select: { accountingRetryRequired: true } } },
+  })
+  if (!expectation.transitJournalKey) {
+    if (expectation.refund.accountingRetryRequired) throw new ReturnExpectationError('awaiting_refund_journal')
+    return { kind: 'none', record: false }
+  }
+  const row = await tx.accountingSyncLog.findFirst({
+    where: {
+      type: 'COGS_REVERSAL',
+      referenceType: 'SalesOrderRefund',
+      referenceId: expectation.refundId,
+      payload: { path: ['_idempotencyKey'], equals: expectation.transitJournalKey },
+    },
+    select: { connector: true, ...LEDGER_STANDING_SELECT },
+  })
+  if (!row) throw new ReturnExpectationError('awaiting_refund_journal')
+  // What the row says about the ledger is decided by the one reader of that rule.
+  const standing = ledgerStanding(row)
+  if (standing === 'SHADOW_NOT_SENT_BY_IMS' || standing === 'PROVEN_NOT_POSTED') return { kind: 'none', record: true }
+  // Unproven either way (an operator said not-posted, a failed or cancelled row nothing can read): a person decides.
+  if (standing === 'UNKNOWN' || standing === 'ASSERTED_NOT_POSTED') throw new ReturnExpectationError('awaiting_refund_journal')
+  if (!accounting.connector || !accounting.syncEnabled || accounting.connector !== row.connector) {
+    throw new ReturnExpectationError('awaiting_accounting')
+  }
+  return { kind: 'journal', connector: accounting.connector }
 }
 
 async function clearTransitInLedger(
@@ -330,10 +401,12 @@ async function clearTransitInLedger(
     subledgerBase: Decimal
     arrivedAt: Date
     accounting: ReceiptAccounting
+    connector: NonNullable<ReceiptAccounting['connector']>
   },
 ): Promise<void> {
-  const { connector, syncEnabled } = params.accounting
-  if (!connector || !syncEnabled) {
+  const { syncEnabled } = params.accounting
+  const connector = params.connector
+  if (!syncEnabled) {
     // The refund debited transit, the ledger is now off: the clearing cannot be posted. Say so, loudly and closed-code.
     await tx.activityLog.create({
       data: {
@@ -376,6 +449,10 @@ async function clearTransitInLedger(
     chartConnector: connector,
   })
   if (outcome.queued && !isShadowedOutcome(outcome)) {
+    await tx.returnExpectation.update({
+      where: { id: params.expectation.id },
+      data: { transitClearedAmount: { increment: amount.toFixed(2) } },
+    })
     await recordTransitSubledgerMovement(tx, {
       sourceType: 'CUSTOMER_RETURN_IN_TRANSIT',
       sourceRef: params.expectation.refundId,
