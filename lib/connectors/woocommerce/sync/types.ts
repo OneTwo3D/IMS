@@ -266,4 +266,9 @@ export type StockSyncResult = SyncResult & {
    * retry, NOT queued, NOT pushed: nothing was sent and nothing is waiting.
    */
   shadowed?: boolean
+  /**
+   * The outbound-write hold (no grant, or a grant for another store) refuses WooCommerce writes from this process, so the push
+   * stopped before it read anything. Always accompanies `aborted`. Nothing was sent. NOT a reconciliation: callers must not stamp it.
+   */
+  held?: boolean
 }

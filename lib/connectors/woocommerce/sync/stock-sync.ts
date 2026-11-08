@@ -40,6 +40,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import { wcFetch, wcPost } from '../api'
 import { assertWcAttemptMayStillSend } from '../attempt-fence'
+import { OutboundWriteHeldError, outboundWriteRefusal } from '@/lib/security/outbound-write-grant'
 import { wooProducerSeam, type WooShadow } from '../producer-seam'
 import {
   WC_SYNC_ADVISORY_LOCK_KEY,
@@ -490,6 +491,13 @@ function shadowedStockResult(seam: WooShadow): StockSyncResult {
   return { ...gateRefusalResult(seam.notice), shadowed: true }
 }
 
+// The outbound-write hold refuses every stock write this process would send, so the push is refused BEFORE its read phase. Without
+// this the run first reads WooCommerce for every candidate product (minutes on a full catalogue) and only then has its
+// write refused at the transport, which is how a held stage ran the daily reconcile for two minutes to send nothing.
+function heldStockResult(message: string): StockSyncResult {
+  return { ...gateRefusalResult(message), held: true }
+}
+
 export async function pushStockToWc(options?: PushStockOptions): Promise<StockSyncResult> {
   const enabled = await db.setting.findUnique({ where: { key: 'wc_stock_sync_enabled' } })
   if (enabled?.value !== 'true') {
@@ -548,6 +556,14 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   if (!creds) {
     return gateRefusalResult('WooCommerce credentials are not configured')
   }
+
+  // Every stock write goes to this one endpoint family on the one store origin (batch and variation batch share the decision).
+  const writeRefusal = outboundWriteRefusal({
+    connectorName: 'WooCommerce',
+    method: 'POST',
+    url: `${creds.url.replace(/\/+$/, '')}/wp-json/wc/v3/products/batch`,
+  })
+  if (writeRefusal) return heldStockResult(new OutboundWriteHeldError(writeRefusal, 0).message)
 
   const warehouses = await db.warehouse.findMany({
     where: { syncToStore: true, active: true },
