@@ -10,7 +10,7 @@ import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { isUsableImsRate } from '@/lib/domain/accounting/foreign-currency-rate-guard'
 import { isXeroForeignCurrencyRateError, xeroCurrencyRateOrRefuse } from './fx'
-import { accountingCutoffInForce, xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroNotNeverDeliverablePendingWhere, xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
+import { accountingCutoffInForce, xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroNotNeverDeliverablePendingWhere, xeroProducerSeamVerdict, xeroResolveObligationAt } from '@/lib/domain/accounting/xero-producer-seam'
 import { producerHeldNotice } from '@/lib/security/producer-disposition-constants'
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
@@ -1545,7 +1545,7 @@ export async function enqueueFollowUpSyncLog(
       // whose primitive asks the same question, records the shadow (CANCELLED / HELD_SHADOW and its durable record) and queues
       // nothing. The hold's answer is therefore the same whether the follow-up is created or revived.
       let revivalHeld = plan.action === 'reuse'
-        && xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload: plan.payload }).kind === 'shadow'
+        && xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload: plan.payload, obligationAt: await xeroResolveObligationAt(tx, { type, payload: plan.payload, connector: XERO_CONNECTOR, referenceType, referenceId }) }).kind === 'shadow'
       // THE WRITER-SIDE CUT-OFF AT THE REVIVAL. A FAILED row queued before the live-from instant is never made PENDING again: the claim
       // would refuse it and it would only cycle. The follow-up is not lost: the revival is declined exactly as a held one is, so the
       // create path below runs, and its primitive decides the NEW row on the follow-up's own business-event time (a pre-cut-off
@@ -6141,7 +6141,7 @@ export async function processClaimedEntry(
   // posted. When the hold is not enforced for Xero this is a no-op (verdict `legacy`). Nothing below can be reached
   // without passing it: the census (SEAM-4) holds every Xero transport call in this file to this function and this check
   // to come before the first of them.
-  const held = xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload })
+  const held = xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload, obligationAt: await xeroResolveObligationAt(db, { type, payload, connector: XERO_CONNECTOR, referenceType, referenceId }) })
   if (held.kind === 'shadow') {
     const message = producerHeldNotice({ connector: held.destination, reason: held.decision.reason, owner: held.decision.owner })
     return { success: false, error: message, notPosted: { reason: 'producer-held', operation: type, message } }

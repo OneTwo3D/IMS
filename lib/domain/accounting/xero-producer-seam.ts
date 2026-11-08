@@ -43,26 +43,147 @@ export function destinationAndOperationForSyncType(type: string): TypeIndexEntry
   return TYPE_INDEX.get(type) ?? null
 }
 
-/** Payload fields that carry the business-event date of a posting, in the order they are believed. */
-const OBLIGATION_DATE_FIELDS = ['paymentDate', 'date', 'invoiceDate'] as const
+/** The payload fields a business-event date can be declared on (see XERO_OBLIGATION_SOURCES). */
+const OBLIGATION_DATE_FIELDS = ['paymentDate', 'date'] as const
+type ObligationDateField = (typeof OBLIGATION_DATE_FIELDS)[number]
 const DATE_RE = /^\d{4}-\d{2}-\d{2}(?:[T ].*)?$/
 
 /**
- * The business-event time of a queued posting, from its payload: the payment date, else the document or journal date
- * (for a daily batch, the batch date). A date without a time is read as the start of that day in UTC, the earlier
- * reading, so a posting dated on the live-from day itself is the safe side of the line. Undefined when the payload
- * carries no readable date: the decision then treats an operation that requires the time as SHADOW.
+ * The business-event time of a queued posting, from the ONE payload field its type declares (XERO_OBLIGATION_SOURCES): the field the posting
+ * path itself uses as the Xero document date, never "the first date found". A date without a time is read as the start of that day in UTC,
+ * the earlier reading, so a posting dated on the live-from day itself is the safe side of the line. Undefined when that field is absent or
+ * unreadable, whatever other dates the payload carries: the decision then treats an operation that requires the time as SHADOW.
  */
-export function xeroObligationAt(payload: unknown): Date | undefined {
+export function xeroObligationAt(payload: unknown, field: ObligationDateField): Date | undefined {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
-  const record = payload as Record<string, unknown>
-  for (const field of OBLIGATION_DATE_FIELDS) {
-    const value = record[field]
-    if (typeof value !== 'string' || !DATE_RE.test(value)) continue
-    const at = new Date(value.includes('T') || value.includes(' ') ? value : `${value}T00:00:00Z`)
-    if (!Number.isNaN(at.getTime())) return at
+  const value = (payload as Record<string, unknown>)[field]
+  if (typeof value !== 'string' || !DATE_RE.test(value)) return undefined
+  const at = new Date(value.includes('T') || value.includes(' ') ? value : `${value}T00:00:00Z`)
+  return Number.isNaN(at.getTime()) ? undefined : at
+}
+
+/**
+ * WHERE EACH ACCOUNTING SYNC TYPE GETS ITS BUSINESS-EVENT TIME (`obligationAt`), DECLARED ONCE.
+ *
+ *   payload         read from the named payload field by {@link xeroObligationAt}; the producer is responsible for writing it.
+ *   parent          a follow-up: it inherits the obligation of the dated row it was raised from, found by walking the `sourceEntryId`
+ *                   chain declared in `via` ({@link xeroResolveObligationAt}). `via[i]` lists the row types the i-th hop is allowed to reach;
+ *                   the last hop is the dated ancestor and its payload date is the answer. A broken link, an unexpected type, a cycle, a
+ *                   missing or compacted row all give NO obligation, and the follow-up is SHADOW (fail closed). The follow-up payload's own
+ *                   date is never consulted: the walk's answer, including "none", is authoritative. The chain exists because a follow-up
+ *                   payload carries no date, and adding one would change the hashed fields of the request it pins.
+ *   not-applicable  the ownership map marks the operation `obligationTime: 'not-applicable'`: no event time is asked for.
+ *   excluded        not a destination write (ACCOUNTING_SYNC_TYPE_EXCLUSIONS).
+ *   dead            declared in the enum, no producer exists; kept so removing it stays a deliberate migration.
+ *
+ * A Record over the enum, so a new AccountingSyncType does not compile until it is declared here;
+ * tests/accounting/xero-obligation-sources.test.ts pins every entry against the ownership map and the real payload builders.
+ */
+/*
+ * WHY EACH `payload` FIELD IS THE ONE IT IS: it is the field the type's own posting path sends as the Xero document date (lib/connectors/xero/sync-processor.ts).
+ *   date         SALES_INVOICE :6219, SALES_INVOICE_UPDATE :6264, PURCHASE_INVOICE :6295, PURCHASE_INVOICE_UPDATE :6322, CREDIT_NOTE :6694,
+ *                PURCHASE_CREDIT_NOTE :6724, the manual-journal types (COGS_JOURNAL, INVENTORY_ADJUSTMENT, STOCK_IN_TRANSIT, STOCK_RECEIPT, COGS_REVERSAL,
+ *                the daily batches and their reconciliations, UNEARNED_REV_REVERSAL, ALLOCATION_REVERSAL, MANUFACTURING_*) :6891 prepareManualJournal.
+ *   paymentDate  INVOICE_PAYMENT :6352 and BILL_PAYMENT :6613 through moneyPostDateToSend; PURCHASE_CREDIT_NOTE_ALLOCATION is dated from `date`,
+ *                not `paymentDate` (:6752-6757). The three money types are pinned to MONEY_POST_DATE_FIELD (lib/domain/accounting/ledger-settlement-evidence.ts:313)
+ *                by tests/accounting/xero-obligation-sources.test.ts, so the two tables cannot drift.
+ */
+export type XeroObligationSource =
+  | { kind: 'payload'; field: (typeof OBLIGATION_DATE_FIELDS)[number] }
+  | { kind: 'parent'; via: ReadonlyArray<readonly AccountingSyncType[]> }
+  | { kind: 'not-applicable' }
+  | { kind: 'excluded' }
+  | { kind: 'dead' }
+
+export const XERO_OBLIGATION_SOURCES: Readonly<Record<AccountingSyncType, XeroObligationSource>> = {
+  PURCHASE_INVOICE: { kind: 'payload', field: 'date' },
+  PURCHASE_INVOICE_UPDATE: { kind: 'payload', field: 'date' },
+  COGS_JOURNAL: { kind: 'payload', field: 'date' },
+  INVENTORY_ADJUSTMENT: { kind: 'payload', field: 'date' },
+  SALES_INVOICE: { kind: 'payload', field: 'date' },
+  SALES_INVOICE_UPDATE: { kind: 'payload', field: 'date' },
+  INVOICE_PAYMENT: { kind: 'payload', field: 'paymentDate' },
+  // The bill attachment is raised from the posted purchase invoice row (enqueuePurchaseInvoiceFollowUps).
+  BILL_ATTACHMENT: { kind: 'parent', via: [['PURCHASE_INVOICE', 'PURCHASE_INVOICE_UPDATE']] },
+  INVOICE_PDF: { kind: 'excluded' },
+  INVOICE_EMAIL: { kind: 'excluded' },
+  // The invoice note is raised from the posted INVOICE_PDF row, which is raised from the posted sales invoice row (enqueueSalesInvoiceFollowUps).
+  WC_INVOICE_NOTE: { kind: 'parent', via: [['INVOICE_PDF'], ['SALES_INVOICE', 'SALES_INVOICE_UPDATE']] },
+  CREDIT_NOTE: { kind: 'payload', field: 'date' },
+  PURCHASE_CREDIT_NOTE: { kind: 'payload', field: 'date' },
+  PURCHASE_CREDIT_NOTE_ALLOCATION: { kind: 'payload', field: 'date' },
+  STOCK_IN_TRANSIT: { kind: 'payload', field: 'date' },
+  STOCK_RECEIPT: { kind: 'payload', field: 'date' },
+  COGS_REVERSAL: { kind: 'payload', field: 'date' },
+  STOCK_ALLOCATION: { kind: 'dead' },
+  DAILY_BATCH_REVENUE_DEFERRAL: { kind: 'payload', field: 'date' },
+  DAILY_BATCH_INVENTORY_ALLOC: { kind: 'payload', field: 'date' },
+  DAILY_BATCH_GROUP_B: { kind: 'payload', field: 'date' },
+  DAILY_BATCH_INVENTORY_RECONCILIATION: { kind: 'payload', field: 'date' },
+  DAILY_BATCH_COGS_RECONCILIATION: { kind: 'payload', field: 'date' },
+  DAILY_BATCH_TRANSIT_RECONCILIATION: { kind: 'payload', field: 'date' },
+  UNEARNED_REV_REVERSAL: { kind: 'payload', field: 'date' },
+  ALLOCATION_REVERSAL: { kind: 'payload', field: 'date' },
+  BILL_PAYMENT: { kind: 'payload', field: 'paymentDate' },
+  REALISED_FX_JOURNAL: { kind: 'not-applicable' },
+  UNREALISED_FX_JOURNAL: { kind: 'not-applicable' },
+  MANUFACTURING_JOURNAL: { kind: 'payload', field: 'date' },
+  MANUFACTURING_RECLASS: { kind: 'payload', field: 'date' },
+  TAX_RATE_SYNC: { kind: 'not-applicable' },
+}
+
+/** The row a chain hop reads. */
+export type ObligationParentRow = { type: string; connector: string; referenceType: string; referenceId: string; payload: unknown }
+
+/** The part of a Prisma client {@link xeroResolveObligationAt} needs. Optional on purpose: a client that cannot read the parent gives no obligation. */
+export type ObligationParentReader = {
+  accountingSyncLog?: {
+    findUnique?: (args: { where: { id: string }; select: { type: true; connector: true; referenceType: true; referenceId: true; payload: true } }) => Promise<ObligationParentRow | null>
   }
-  return undefined
+}
+
+/** The declared payload field of a type, or undefined when the type is not payload-sourced. */
+function declaredObligationAt(type: string, payload: unknown): Date | undefined {
+  const source = (XERO_OBLIGATION_SOURCES as Readonly<Record<string, XeroObligationSource>>)[type]
+  return source?.kind === 'payload' ? xeroObligationAt(payload, source.field) : undefined
+}
+
+/**
+ * The business-event time of a queued posting: the declared field of its own payload, or for a follow-up (source kind `parent`) the declared field
+ * of the dated ancestor its chain reaches. Every hop must be a row of the type that hop allows, of the SAME connector and about the SAME document
+ * (referenceType and referenceId) as the follow-up: an enqueue site raises a follow-up for the document it just posted, so another document's row, or
+ * another connector's, is a broken link. The chain is walked only when the hold is enforced for the follow-up's destination, so with the switch
+ * off no query is made. Undefined whenever the time cannot be established (broken or mismatched link, cycle, missing or compacted row): the decision
+ * then shadows an operation that requires it.
+ */
+export async function xeroResolveObligationAt(
+  client: ObligationParentReader,
+  input: { type: string; payload: unknown; connector: string; referenceType: string; referenceId: string; env?: Record<string, string | undefined> },
+): Promise<Date | undefined> {
+  const source = (XERO_OBLIGATION_SOURCES as Readonly<Record<string, XeroObligationSource>>)[input.type]
+  if (source?.kind !== 'parent') return declaredObligationAt(input.type, input.payload)
+  const target = destinationAndOperationForSyncType(input.type)
+  const enforcement = readProducerEnforcement(input.env ?? process.env)
+  if (!target || !enforcement.enforced || !enforcement.destinations.has(target.destination)) return undefined
+  if (typeof client.accountingSyncLog?.findUnique !== 'function') return undefined
+  const seen = new Set<string>()
+  let payload: unknown = input.payload
+  let ancestor: ObligationParentRow | null = null
+  for (let hop = 0; hop < source.via.length; hop += 1) {
+    if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
+    const parentId = (payload as Record<string, unknown>).sourceEntryId
+    if (typeof parentId !== 'string' || parentId === '' || seen.has(parentId)) return undefined
+    seen.add(parentId)
+    const parent = await client.accountingSyncLog.findUnique({
+      where: { id: parentId },
+      select: { type: true, connector: true, referenceType: true, referenceId: true, payload: true },
+    })
+    if (!parent || !(source.via[hop] as readonly string[]).includes(parent.type)) return undefined
+    if (parent.connector !== input.connector || parent.referenceType !== input.referenceType || parent.referenceId !== input.referenceId) return undefined
+    payload = parent.payload
+    ancestor = parent
+  }
+  return ancestor ? declaredObligationAt(ancestor.type, ancestor.payload) : undefined
 }
 
 export type XeroSeamVerdict =
@@ -77,10 +198,22 @@ export type XeroSeamVerdict =
       notice: string
     }
 
+/**
+ * The time the decision is asked about. A follow-up (source kind `parent`) has ONLY the resolved value, absent included: its own payload may
+ * carry a date of its own and that must never stand in for the ancestor's. Everything else reads its payload; an explicit value wins.
+ */
+function obligationAtOf(input: { type: string; payload: unknown; obligationAt?: Date }): Date | undefined {
+  const source = (XERO_OBLIGATION_SOURCES as Readonly<Record<string, XeroObligationSource>>)[input.type]
+  if (source?.kind === 'parent') return input.obligationAt
+  return input.obligationAt ?? declaredObligationAt(input.type, input.payload)
+}
+
 export function xeroProducerSeamVerdict(input: {
   connector: string
   type: string
   payload: unknown
+  /** The business-event time when it is not in the payload (a follow-up's parent: {@link xeroResolveObligationAt}). Wins over the payload. */
+  obligationAt?: Date
   env?: Record<string, string | undefined>
   now?: Date
 }): XeroSeamVerdict {
@@ -98,7 +231,7 @@ export function xeroProducerSeamVerdict(input: {
   const verdict = producerSeamVerdict(
     target.destination,
     target.operation as MappedOperation<typeof target.destination>,
-    xeroObligationAt(input.payload),
+    obligationAtOf(input),
     context,
   )
   if (verdict.kind === 'legacy') return { kind: 'legacy' }

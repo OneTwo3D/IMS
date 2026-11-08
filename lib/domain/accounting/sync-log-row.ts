@@ -5,7 +5,7 @@ import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { RETIRED_TAX_CODE_REASON, RetiredTaxCodeInPayloadError, retiredTaxCodesInPayload } from '@/lib/tax/retired-tax-code-guard'
 import { HELD_SHADOW_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
-import { xeroProducerSeamVerdict, type XeroSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
+import { xeroProducerSeamVerdict, xeroResolveObligationAt, type ObligationParentReader, type XeroSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
 import { attachShadowSyncLog, recordOutboundShadow } from '@/lib/domain/outbound-shadow/record'
 import { clearAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import {
@@ -39,7 +39,7 @@ import {
  * client the savepoint helper simply runs the statement.
  */
 export type SyncLogRowClient = {
-  accountingSyncLog: { create(args: { data: Prisma.AccountingSyncLogUncheckedCreateInput }): Promise<{ id: string }> }
+  accountingSyncLog: { create(args: { data: Prisma.AccountingSyncLogUncheckedCreateInput }): Promise<{ id: string }> } & NonNullable<ObligationParentReader['accountingSyncLog']>
 }
 
 /**
@@ -159,7 +159,13 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
   }
   // THE PRODUCER SEAM. After the suppression read on purpose: a posting marked handled by hand, or held by an operator's
   // claim, is answered above whatever the hold says, so a shadow can never discharge or postpone a claim.
-  const verdict = xeroProducerSeamVerdict({ connector: String(data.connector), type: String(data.type), payload: data.payload })
+  // A follow-up carries no date of its own: it takes the obligation of the row it was raised from (read in this same transaction).
+  const verdict = xeroProducerSeamVerdict({
+    connector: String(data.connector),
+    type: String(data.type),
+    payload: data.payload,
+    obligationAt: await xeroResolveObligationAt(client, { type: String(data.type), payload: data.payload, connector: String(data.connector), referenceType: String(data.referenceType), referenceId: String(data.referenceId) }),
+  })
   let rowData = data
   let shadow: PreparedShadow | null = null
   if (verdict.kind === 'shadow') {

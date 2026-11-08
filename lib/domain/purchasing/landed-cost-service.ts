@@ -1010,6 +1010,65 @@ export function resolveConsumedCogsOffsetAccount(
 }
 
 /**
+ * The STOCK_IN_TRANSIT journal a late landed cost raises on stock still on hand (inventory against transit). Extracted unchanged so the
+ * payload, and above all its `date` (the business-event time the producer-side hold reads), can be tested without the queue.
+ */
+export function buildLandedCostReclassJournalPayload(input: {
+  primaryPoRef: string
+  absDelta: number
+  isIncrease: boolean
+  inventoryAccount: string
+  transitAccount: string
+}) {
+  const { primaryPoRef, absDelta, isIncrease } = input
+  return {
+    date: new Date().toISOString().slice(0, 10),
+    reference: `Landed cost reclass — ${primaryPoRef}`,
+    narration: `Late landed cost ${isIncrease ? 'capitalisation' : 'reversal'} of £${absDelta.toFixed(2)} on ${primaryPoRef}`,
+    lines: [
+      {
+        accountCode: isIncrease ? input.inventoryAccount : input.transitAccount,
+        description: `Landed cost reclass — ${primaryPoRef}`,
+        debit: absDelta,
+      },
+      {
+        accountCode: isIncrease ? input.transitAccount : input.inventoryAccount,
+        description: `Landed cost reclass — ${primaryPoRef}`,
+        credit: absDelta,
+      },
+    ],
+  }
+}
+
+/** The COGS_JOURNAL a late landed cost raises on units already consumed. Extracted unchanged, for the same reason as the reclass above. */
+export function buildLandedCostCogsJournalPayload(input: {
+  primaryPoRef: string
+  absDelta: number
+  isIncrease: boolean
+  cogsAccount: string
+  offsetAccount: string
+}) {
+  const { primaryPoRef, absDelta, isIncrease } = input
+  return {
+    date: new Date().toISOString().slice(0, 10),
+    reference: `Landed cost adjustment — ${primaryPoRef}`,
+    narration: `Retrospective COGS adjustment: landed cost ${isIncrease ? 'increase' : 'decrease'} of £${absDelta.toFixed(2)} on ${primaryPoRef}`,
+    lines: [
+      {
+        accountCode: isIncrease ? input.cogsAccount : input.offsetAccount,
+        description: `COGS adjustment — ${primaryPoRef}`,
+        debit: absDelta,
+      },
+      {
+        accountCode: isIncrease ? input.offsetAccount : input.cogsAccount,
+        description: `COGS adjustment — ${primaryPoRef}`,
+        credit: absDelta,
+      },
+    ],
+  }
+}
+
+/**
  * o3d-j625 r4 (SWEEP 1) — HOW MANY OF THIS RUN'S JOURNALS ARE STILL OWED.
  *
  * Returned so the landed-cost journal OUTBOX — the backstop that exists precisely to re-run this — can
@@ -1029,23 +1088,9 @@ export async function queueLandedCostAdjustmentJournals(
     const absDelta = Math.abs(adj.totalDelta)
     if (absDelta <= 0.01) continue
     const isIncrease = adj.totalDelta > 0
-    const payload = {
-      date: new Date().toISOString().slice(0, 10),
-      reference: `Landed cost reclass — ${adj.primaryPoRef}`,
-      narration: `Late landed cost ${isIncrease ? 'capitalisation' : 'reversal'} of £${absDelta.toFixed(2)} on ${adj.primaryPoRef}`,
-      lines: [
-        {
-          accountCode: isIncrease ? settings.inventoryAccount : settings.transitAccount,
-          description: `Landed cost reclass — ${adj.primaryPoRef}`,
-          debit: absDelta,
-        },
-        {
-          accountCode: isIncrease ? settings.transitAccount : settings.inventoryAccount,
-          description: `Landed cost reclass — ${adj.primaryPoRef}`,
-          credit: absDelta,
-        },
-      ],
-    }
+    const payload = buildLandedCostReclassJournalPayload({
+      primaryPoRef: adj.primaryPoRef, absDelta, isIncrease, inventoryAccount: settings.inventoryAccount, transitAccount: settings.transitAccount,
+    })
     // 6oyu.4 (khdw): commit the STOCK_IN_TRANSIT reclass queue + its transit subledger
     // row atomically (mirrors the COGS bcz9.2 pattern below) so a crash between them
     // can't desync the ledger from the GL. Record only when actually queued; the
@@ -1117,23 +1162,9 @@ export async function queueLandedCostAdjustmentJournals(
     const absDelta = Math.abs(adj.totalDelta)
     if (absDelta <= 0.01) continue
     const isIncrease = adj.totalDelta > 0
-    const payload = {
-      date: new Date().toISOString().slice(0, 10),
-      reference: `Landed cost adjustment — ${adj.primaryPoRef}`,
-      narration: `Retrospective COGS adjustment: landed cost ${isIncrease ? 'increase' : 'decrease'} of £${absDelta.toFixed(2)} on ${adj.primaryPoRef}`,
-      lines: [
-        {
-          accountCode: isIncrease ? settings.cogsAccount : consumedCogsOffsetAccount,
-          description: `COGS adjustment — ${adj.primaryPoRef}`,
-          debit: absDelta,
-        },
-        {
-          accountCode: isIncrease ? consumedCogsOffsetAccount : settings.cogsAccount,
-          description: `COGS adjustment — ${adj.primaryPoRef}`,
-          credit: absDelta,
-        },
-      ],
-    }
+    const payload = buildLandedCostCogsJournalPayload({
+      primaryPoRef: adj.primaryPoRef, absDelta, isIncrease, cogsAccount: settings.cogsAccount, offsetAccount: consumedCogsOffsetAccount,
+    })
     const cogsIdempotencyKey = landedCostAdjustmentIdempotencyKey('cogs', adj)
     // o3d-j625 r3 (Codex HIGH 1 family): a HOLDER, so TypeScript does not collapse it to `never` on the
     // strength of assignments it cannot see inside the transaction callback.

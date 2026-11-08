@@ -474,11 +474,18 @@ test('SEAM-4 PRECONDITION: every Xero transport call in the real tree is behind 
   assert.deepEqual(report.failures, [])
 })
 
+/** The claim-boundary gate line in processClaimedEntry, found by shape so a change to its arguments does not silently skip the mutation. */
+function claimGateLine(text: string): string {
+  const lines = text.match(/^ *const held = xeroProducerSeamVerdict\(\{.*\}\)$/gm) ?? []
+  assert.equal(lines.length, 1, 'precondition: exactly one claim-boundary gate line')
+  return lines[0]!.trim()
+}
+
 test('SEAM-4 MUTATION (the claim-boundary check removed from processClaimedEntry): red, naming the transport site', () => {
   const inputs = realInputs()
   const file = 'lib/connectors/xero/sync-processor.ts'
   const text = inputs.sources!.get(file)!
-  const mutated = text.replace('const held = xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload })', 'const held = { kind: \'legacy\' as const }')
+  const mutated = text.replace(claimGateLine(text), 'const held = { kind: \'legacy\' as const }')
   assert.notEqual(mutated, text, 'precondition: the check was found and removed')
   const sources = new Map(inputs.sources!)
   sources.set(file, mutated)
@@ -490,7 +497,7 @@ test('SEAM-4 MUTATION (the check moved AFTER the first transport call): red', ()
   const inputs = realInputs()
   const file = 'lib/connectors/xero/sync-processor.ts'
   const text = inputs.sources!.get(file)!
-  const gateLine = 'const held = xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload })'
+  const gateLine = claimGateLine(text)
   assert.ok(text.includes(gateLine), 'precondition: the gate is there')
   // Remove the gate at the top and put an equivalent call in the LAST case of the switch, after the earlier transport calls.
   const withoutGate = text.replace(gateLine, 'const held = { kind: \'legacy\' as const }')
