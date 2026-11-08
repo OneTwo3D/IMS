@@ -153,9 +153,24 @@ test('NOTE LAST CHECK BEFORE THE TRANSPORT: processClaimedEntry on a note create
   const between = await seed(d, `${tag}-between`, 'WC_INVOICE_NOTE', BETWEEN)
   const late = await seed(d, `${tag}-late`, 'WC_INVOICE_NOTE', AFTER_BOTH)
   const lease = { fenceBeforeRemoteWrite: async () => { throw new Error('reached the pre-write fence') } } as never
-  const run = (row: { id: string }, ref: string) => d.processor.processClaimedEntry(
-    row.id, 'WC_INVOICE_NOTE' as never, 'SalesOrder', ref, { referenceId: ref, date: iso(AFTER_BOTH).slice(0, 10) }, lease, { attemptRevision: 1 } as never,
-  ).then((result) => ({ result, threw: null as string | null }), (error) => ({ result: null, threw: String(error) }))
+  // A note is raised from its INVOICE_PDF row, which is raised from the posted sales invoice, and takes the invoice's date as its business-event time
+  // (XERO_OBLIGATION_SOURCES): so the fixture is the real chain, the invoice dated after both instants, not a date on the note's own payload.
+  const chainFor = async (ref: string) => {
+    const invoice = await d.db.accountingSyncLog.create({
+      data: { connector: 'xero', type: 'SALES_INVOICE', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: ref, payload: { date: iso(AFTER_BOTH).slice(0, 10) }, externalTransactionId: `ext-${ref}`, syncedAt: new Date() } as never,
+      select: { id: true },
+    })
+    return d.db.accountingSyncLog.create({
+      data: { connector: 'xero', type: 'INVOICE_PDF', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: ref, payload: { referenceId: ref, sourceEntryId: invoice.id }, syncedAt: new Date() } as never,
+      select: { id: true },
+    })
+  }
+  const run = async (row: { id: string }, ref: string) => {
+    const pdf = await chainFor(ref)
+    return d.processor.processClaimedEntry(
+      row.id, 'WC_INVOICE_NOTE' as never, 'SalesOrder', ref, { referenceId: ref, sourceEntryId: pdf.id }, lease, { attemptRevision: 1 } as never,
+    ).then((result) => ({ result, threw: null as string | null }), (error) => ({ result: null, threw: String(error) }))
+  }
   await withEnv(bothLive, async () => {
     const refused = await run(between, `${tag}-between`)
     console.log(`# last check: ${JSON.stringify(refused.result)?.slice(0, 160)} threw=${refused.threw}`)

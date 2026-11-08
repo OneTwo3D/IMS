@@ -57,6 +57,16 @@ async function withEnv<T>(values: Record<string, string>, fn: () => Promise<T>):
 }
 
 async function withSettings<T>(db: Awaited<ReturnType<typeof deps>>['db'], fn: () => Promise<T>): Promise<T> {
+  // THESE FILES SHARE SETTING ROWS (the Xero switches), and `npm run test:db` runs files in parallel processes: one file restoring the rows while
+  // the other still needs them made cases fail. A transaction-scoped advisory lock, held for the whole body, serialises the two (and any other
+  // file that takes the same lock); it is released by the transaction ending, even if the body throws.
+  return db.$transaction(async (lockTx: { $executeRaw: (q: TemplateStringsArray, ...v: unknown[]) => Promise<unknown> }) => {
+    await lockTx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('test:xero-switch-settings'))`
+    return withSettingsLocked(db, fn)
+  }, { timeout: 600_000, maxWait: 600_000 })
+}
+
+async function withSettingsLocked<T>(db: Awaited<ReturnType<typeof deps>>['db'], fn: () => Promise<T>): Promise<T> {
   const before = await db.setting.findMany({ where: { key: { in: SETTINGS.map(([key]) => key) } } })
   for (const [key, value] of SETTINGS) await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
   try { return await fn() } finally {

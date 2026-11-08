@@ -335,3 +335,22 @@ test('A HOP MUST BE THE SAME DOCUMENT: a parent of the right type from another r
   const same = readerOf({ 'bill-1': { type: 'PURCHASE_INVOICE', payload: { date: DATED }, referenceType: 'PurchaseInvoice', referenceId: 'pi-1' } })
   assert.equal((await xeroResolveObligationAt(same.client, { type: 'BILL_ATTACHMENT', payload: attachment, env: XERO_ENV, connector: 'xero', referenceType: 'PurchaseInvoice', referenceId: 'pi-1' }))?.toISOString(), `${DATED}T00:00:00.000Z`)
 })
+
+/**
+ * THE FIELD EACH PAYLOAD-SOURCED TYPE DECLARES, WRITTEN OUT INDEPENDENTLY OF THE DECLARATION. It is what the posting path sends as the Xero document date
+ * (citations in lib/domain/accounting/xero-producer-seam.ts above XeroObligationSource), so a declaration edited to the wrong field is red here even though
+ * every other test reads the declaration it is judging.
+ */
+const POSTING_PATH_FIELD: Record<string, 'date' | 'paymentDate'> = {
+  PURCHASE_INVOICE: 'date', PURCHASE_INVOICE_UPDATE: 'date', COGS_JOURNAL: 'date', INVENTORY_ADJUSTMENT: 'date', SALES_INVOICE: 'date', SALES_INVOICE_UPDATE: 'date',
+  INVOICE_PAYMENT: 'paymentDate', CREDIT_NOTE: 'date', PURCHASE_CREDIT_NOTE: 'date', PURCHASE_CREDIT_NOTE_ALLOCATION: 'date', STOCK_IN_TRANSIT: 'date',
+  STOCK_RECEIPT: 'date', COGS_REVERSAL: 'date', DAILY_BATCH_REVENUE_DEFERRAL: 'date', DAILY_BATCH_INVENTORY_ALLOC: 'date', DAILY_BATCH_GROUP_B: 'date',
+  DAILY_BATCH_INVENTORY_RECONCILIATION: 'date', DAILY_BATCH_COGS_RECONCILIATION: 'date', DAILY_BATCH_TRANSIT_RECONCILIATION: 'date', UNEARNED_REV_REVERSAL: 'date',
+  ALLOCATION_REVERSAL: 'date', BILL_PAYMENT: 'paymentDate', MANUFACTURING_JOURNAL: 'date', MANUFACTURING_RECLASS: 'date',
+}
+
+test('EVERY PAYLOAD-SOURCED TYPE declares the field its posting path dates the Xero document from', () => {
+  const declared = ALL_TYPES.filter((type) => XERO_OBLIGATION_SOURCES[type as AccountingSyncType].kind === 'payload')
+  assert.deepEqual([...declared].sort(), Object.keys(POSTING_PATH_FIELD).sort(), 'the independent table covers exactly the payload-sourced types')
+  for (const type of declared) assert.equal(fieldOf(type), POSTING_PATH_FIELD[type], type)
+})
