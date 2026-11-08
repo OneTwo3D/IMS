@@ -101,7 +101,7 @@ test('MUTATION WOO-1 (a seam function is renamed away): red, and the message say
 })
 
 test('MUTATION WOO-1b (the reconcile stamps a shadowed push): red', () => {
-  const report = wooCensusFindings(input({}, { 'lib/connectors/woocommerce/sync/reconcile.ts': (text) => text.replace('if (stock.shadowed === true) {', 'if (false) {') }))
+  const report = wooCensusFindings(input({}, { 'lib/connectors/woocommerce/sync/reconcile.ts': (text) => text.replace('if (stock.shadowed === true || stock.held === true) {', 'if (false) {') }))
   assert.equal(red(report, 'WOO-1b').length, 1, JSON.stringify(report.failures))
   const missing = wooCensusFindings(input({}, { 'lib/connectors/woocommerce/sync/reconcile.ts': (text) => text.replaceAll('last_wc_stock_daily_reconcile_at', 'some_other_key') }))
   assert.equal(red(missing, 'WOO-1b').length, 1, 'a reconcile that no longer stamps has nothing to guard: the row must be updated, not silently pass')
