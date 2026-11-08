@@ -6,7 +6,9 @@ import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain
 import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
 import { isWcOrderAnonymised, wcPayloadCarriesIdentity } from './anonymisation'
 import { mirrorWcAnonymisation } from './anonymisation-mirror'
-import { hasOpenWcErasureObligation, recordWcErasureObligation, retireWcErasureObligation } from './erasure-obligation'
+import { projectWcOrderForErasure } from './erased-payload'
+import { lockStorefrontCustomerKeys } from '@/lib/domain/erasure/customer-key-lock'
+import { hasOpenWcErasureObligation, payloadCustomerTombstoned, recordWcErasureObligation, retireWcErasureObligation } from './erasure-obligation'
 import { acquireWcFirstImportLock, wcFirstImportLockHeld } from './first-import-lock'
 import { ERASURE_PLACEHOLDER_NAME, ERASURE_RECORD_ACTION, ERASURE_RECORD_DESCRIPTION, buildErasureRecordMetadata } from '@/lib/domain/erasure/erasure-record'
 import { randomUUID } from 'node:crypto'
@@ -81,6 +83,8 @@ import {
 // ---------------------------------------------------------------------------
 
 export type ImportWcOrderOptions = {
+  /** INTERNAL: set by the retry below when a customer erasure was found mid-import; the order is then created erased from the whole projection. */
+  erasedOnCreate?: { customerId: string | null }
   skipAccounting?: boolean
   useWcDateAsCreatedAt?: boolean
   pendingFxRetryLogId?: string
@@ -1008,7 +1012,7 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
     // The episode marker is minted EXACTLY as the update path always did, in the same write as paidAt, whatever receipts exist (the value is the DATABASE's clock, whatever is
     // written: trigger of migration 20260901090000). A new paid episode starts here; only addPayment clears the marker, and only for a receipt it records (o3d-psrx r6/r8). The registration
     // below, or an earlier one completing after this fence, discharges it.
-    const order = await tx.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { totalForeign: true, currency: true, orderNumber: true, externalOrderNumber: true, paidAt: true } })
+    const order = await tx.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { totalForeign: true, currency: true, orderNumber: true, externalOrderNumber: true, paidAt: true, erasedAt: true } })
     if (order.paidAt !== null) return null
     // THE PAID TOTAL MUST BE THE TOTAL IMS HOLDS. An update delivery refreshes addresses and notes but NOT the lines or the total (updateExistingWcOrderCore), so an order edited in
     // WooCommerce between the import and the payment still carries the old total here. Compared to the minor unit of the order currency, under the lock: if they differ nothing is
@@ -1046,7 +1050,8 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
         amount: remaining,
         currency: order.currency,
         method: wcOrder.payment_method_title || wcOrder.payment_method || null,
-        reference: wcOrder.transaction_id || null,
+        // An erased order's receipt carries no gateway reference (the storefront's own eraser sets it to "0").
+        reference: order.erasedAt ? null : (wcOrder.transaction_id || null),
         notes: existing.length > 0
           ? WC_RECEIPT_NOTE_PAID_LATER_PARTIAL
           : WC_RECEIPT_NOTE_PAID_LATER,
@@ -2142,6 +2147,8 @@ export function readWcOrderCurrency(wcOrder: Pick<WcFullOrder, 'currency'>): str
 
 export type ImportWcOrderResult = {
   success: boolean
+  /** INTERNAL (stripped by importWcOrder): the create transaction found a customer erasure and must be retried through the erased-on-create path. */
+  erasedRetry?: { customerId: string | null }
   orderId?: string
   error?: string
   /**
@@ -2286,7 +2293,27 @@ async function refuseWcOrderCreate(
   return { success: true, skipped: reason, configured }
 }
 
+/** Thrown out of the create transaction (rolling it back) when a customer erasure is found: the import is re-entered through the erased-on-create path. */
+class WcImportErasedRetry extends Error {
+  constructor(readonly customerId: string | null) {
+    super('A customer erasure was found while this order was being imported; the import is retried already erased')
+    this.name = 'WcImportErasedRetry'
+  }
+}
+
+/**
+ * Import (create or update) a WooCommerce order. A create that meets a customer erasure mid-transaction is ROLLED BACK and re-entered through the
+ * erased-on-create path (which projects the whole payload before anything is mapped), never patched field by field.
+ */
 export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<ImportWcOrderResult> {
+  const first = await importWcOrderOnce(wcOrder, options)
+  if (!first.erasedRetry) return first
+  const { erasedRetry, ...rest } = await importWcOrderOnce(wcOrder, { ...options, erasedOnCreate: first.erasedRetry })
+  void erasedRetry
+  return rest
+}
+
+async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOptions): Promise<ImportWcOrderResult> {
   let releaseFirstImportLock: (() => Promise<void>) | null = null
   try {
     // Keep what another writer left on this order (the bridge's or the invoicing plugin's marks) for the coexistence check. Started, NOT
@@ -2427,7 +2454,15 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     if (racedHeld) return await updateHeldOrder(racedHeld.id)
     // Under the lock: a marked payload, OR an open obligation (an anonymisation was seen for this order and acknowledged before it was imported;
     // this payload is an older read of it), means the order is created ALREADY ERASED and never touches the customer table.
-    const payloadAnonymised = payloadMarked || await hasOpenWcErasureObligation(wcOrder.id)
+    // A third way an order is created erased: its CUSTOMER was erased after this read was taken (a customer tombstone, same rule as the insert guards): the
+    // storefront link is gone by then, so neither the marker nor an obligation need exist for an order no raw store ever saw.
+    const erasedByObligation = payloadMarked || await hasOpenWcErasureObligation(wcOrder.id) || options.erasedOnCreate !== undefined
+    const erasedByTombstone = !erasedByObligation && await payloadCustomerTombstoned(wcOrder)
+    const payloadAnonymised = erasedByObligation || erasedByTombstone
+    // EVERY ERASED-ON-CREATE PATH (a marked payload, an open obligation, a tombstone) maps the payload's ALLOWLIST PROJECTION, not the original: item and fee names,
+    // the gateway transaction id and every other free-text field are replaced by the database's own projection (one implementation) before anything is mapped or
+    // persisted. Money, tax, lines and totals are untouched by it. (The customer-erased-mid-import path decides inside the transaction and is patched there.)
+    if (payloadAnonymised) wcOrder = await projectWcOrderForErasure(wcOrder)
     const customerName = payloadAnonymised
       ? ERASURE_PLACEHOLDER_NAME
       : [wcOrder.billing.first_name, wcOrder.billing.last_name].filter(Boolean).join(' ')
@@ -2875,7 +2910,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // Create the sales order
     let so
     let linkCustomerId: string | null = null
-    let customerErasedDuringImport: string | null = null
+    const customerErasedDuringImport: string | null = options.erasedOnCreate?.customerId ?? null
     try {
       so = await db.$transaction(async (tx) => {
         // The rates this order rests on are locked FIRST, in one statement in id order (lib/tax/writable-tax-rate.ts): the lines' rates and the ACTIVE rate the header names (the tax import's
@@ -2891,17 +2926,21 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         // failure after it (or a lost create race) can never leave a customer holding the subject's identity with no order, for a later anonymised
         // delivery to miss. A marked payload never touches the customer table. A matched customer is locked FOR UPDATE inside the upsert and held to
         // the end of the transaction (customer, then orders: the erasure's order).
+        // THE STOREFRONT-CUSTOMER KEY LOCK (customer-key-lock.ts) is taken first, then the tombstone is read UNDER it: a customer erasure for this payload's customer
+        // either committed already (this sees its tombstone) or is waiting for this transaction (it will find the order committed here and erase it). Never a
+        // fresh customer minted behind a completed erasure.
+        if (!payloadAnonymised) {
+          await lockStorefrontCustomerKeys(tx, [wcOrder.customer_id])
+          if (await payloadCustomerTombstoned(wcOrder, tx)) throw new WcImportErasedRetry(null)
+        }
         const customerId = payloadAnonymised ? null : await upsertCustomer(wcOrder, tx)
         linkCustomerId = customerId
         if (customerId) {
           const locked = await tx.$queryRaw<Array<{ gdprAnonymisedAt: Date | null }>>`SELECT "gdprAnonymisedAt" FROM "customers" WHERE "id" = ${customerId} FOR UPDATE`
-          if (locked[0]?.gdprAnonymisedAt) {
-            linkCustomerId = null
-            customerErasedDuringImport = customerId
-          }
+          // The matched customer was erased (by email or link, with no tombstone to say so): roll back and re-enter through the erased-on-create path, which
+          // projects the WHOLE payload before mapping. Nothing is patched here: the lines, methods, number and receipt were mapped from the original.
+          if (locked[0]?.gdprAnonymisedAt) throw new WcImportErasedRetry(customerId)
         }
-        // The customer was erased between the lookup and this lock: the order is created ALREADY ERASED, in this same transaction.
-        // Its money stays in the books (it is created, with its lines, totals and tax); the identity is never written.
         const erasedOnCreate = customerErasedDuringImport !== null || payloadAnonymised
         const erasedAt = new Date()
         const created = await tx.salesOrder.create({
@@ -3003,7 +3042,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
               amount: totalForeign,
               currency,
               method: wcOrder.payment_method_title || wcOrder.payment_method || null,
-              reference: wcOrder.transaction_id || null,
+              reference: erasedOnCreate ? null : (wcOrder.transaction_id || null),
               notes: WC_RECEIPT_NOTE_IMPORTED_PAID,
               paidAt: parseWcGmtInstant(wcOrder.date_paid_gmt as string),
               paidAtExplicitInstant: parseWcGmtInstant(wcOrder.date_paid_gmt as string), // an explicit instant, midnight included
@@ -3043,8 +3082,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             action: ERASURE_RECORD_ACTION,
             description: ERASURE_RECORD_DESCRIPTION,
             metadata: buildErasureRecordMetadata({
-              requestId: originalErasureRequestId ?? randomUUID(), erasedAt, trigger: customerErasedDuringImport === null ? 'MIRRORED_FROM_STOREFRONT' : 'IMPORT_AFTER_ERASURE', customerId: customerErasedDuringImport, orderIds: [created.id],
-              counts: { customers: 0, salesOrders: 1, shipments: 0, shoppingCustomerLinks: 0, shoppingOrderLinks: 1, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, linkedFreeTextScrubbed: 0, activityRowsScrubbed: 0, notifications: 0 },
+              requestId: originalErasureRequestId ?? randomUUID(), erasedAt, trigger: customerErasedDuringImport === null && !erasedByTombstone ? 'MIRRORED_FROM_STOREFRONT' : 'IMPORT_AFTER_ERASURE', customerId: customerErasedDuringImport, orderIds: [created.id],
+              counts: { customers: 0, salesOrders: 1, shipments: 0, shoppingCustomerLinks: 0, shoppingOrderLinks: 1, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, rawWebhookEventsProjected: 0, rawSyncLogsProjected: 0, rawReturnRecordsCleared: 0, storefrontIdMissing: 0, linkedFreeTextScrubbed: 0, activityRowsScrubbed: 0, notifications: 0 },
             }),
             userId: null,
           })
@@ -3510,6 +3549,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
 
     return { success: true, orderId: so.id }
   } catch (e) {
+    if (e instanceof WcImportErasedRetry) return { success: false, error: e.message, erasedRetry: { customerId: e.customerId } }
     if (e instanceof WcReceiptRegistrationNotRecorded) {
       await recordPendingFxOrder(wcOrder, { message: e.message, currency: e.currency, ...(e.paymentId ? { paymentId: e.paymentId } : options.receiptPaymentId ? { paymentId: options.receiptPaymentId } : {}) }, options.pendingFxRetryLogId)
       return { success: false, error: `${e.message}; kept in the retry queue` }

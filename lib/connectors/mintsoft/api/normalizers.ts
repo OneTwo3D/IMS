@@ -1,3 +1,4 @@
+import { RETURN_ID_KEYS, RETURN_ORDER_REFERENCE_KEYS } from '@/lib/connectors/wms/return-record-keys'
 import type { WmsAsnLineRef, WmsAsnRef, WmsBundleComponent, WmsBundleRef, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import { readMintsoftAsnItemExpectedQty, readMintsoftAsnItemReceipt } from './asn-quantities'
 import { readMintsoftAsnWireStatusField } from './asn-status'
@@ -11,8 +12,6 @@ const STOCK_SKU_KEYS = ['sku', 'SKU', 'productSku', 'ProductSku', 'productCode',
 const PRODUCT_ID_KEYS = ['productId', 'ProductId', 'id', 'Id', 'ID']
 const PRODUCT_NAME_KEYS = ['name', 'Name', 'productName', 'ProductName', 'description', 'Description']
 const PRODUCT_BARCODE_KEYS = ['ean', 'EAN', 'barcode', 'Barcode', 'upc', 'UPC', 'eanCode', 'EANCode']
-const RETURN_ID_KEYS = ['returnId', 'ReturnId', 'externalReturnId', 'ExternalReturnId', 'id', 'Id', 'ID']
-const RETURN_ORDER_REFERENCE_KEYS = ['orderReference', 'OrderReference', 'orderNumber', 'OrderNumber', 'externalOrderNumber', 'ExternalOrderNumber', 'reference', 'Reference']
 const RETURN_REASON_KEYS = ['reason', 'Reason', 'returnReason', 'ReturnReason']
 const RETURN_QTY_KEYS = ['qty', 'Qty', 'quantity', 'Quantity', 'returnedQty', 'ReturnedQty', 'returnQty', 'ReturnQty', 'receivedQty', 'ReceivedQty']
 const RETURN_RECEIVED_AT_KEYS = ['receivedAt', 'ReceivedAt', 'createdAt', 'CreatedAt', 'updatedAt', 'UpdatedAt', 'returnDate', 'ReturnDate', 'date', 'Date']

@@ -275,7 +275,7 @@ export function mapMintsoftReturnsInboxRow(row: {
 }
 
 /**
- * The sync-log row for a return that FAILED. Like the success row it carries the raw warehouse payload only when the return's effective order
+ * The sync-log row for a return that FAILED. Neither log row carries the raw warehouse record any more (only the return id); before that, a row carried it only when the return's effective order
  * (the order its reference resolves to, or the one its inbox row is already linked to) is NOT erased, decided under that order's lock in the
  * same transaction that writes the row. If the effective order cannot be determined (a lookup fails), the payload is left out: an error
  * row must never be the way a name or address gets back in.
@@ -283,18 +283,21 @@ export function mapMintsoftReturnsInboxRow(row: {
 async function writeReturnsErrorLog(jobId: string, record: WmsReturnRecord, error: unknown): Promise<void> {
   let candidates: string[] = []
   let determined = true
+  let markedErased = false
   try {
     const order = await resolveMintsoftReturnOrder(record.orderReference)
     const row = await db.wmsReturnsInbox.findUnique({
       where: { connector_externalReturnId: { connector: 'mintsoft', externalReturnId: record.externalReturnId } },
-      select: { orderId: true },
+      select: { orderId: true, erasedAt: true },
     })
+    // The erasure's marker never goes away, so reading it outside the transaction is safe.
+    if (row?.erasedAt) markedErased = true
     candidates = [...new Set([order?.id, row?.orderId].filter((id): id is string => Boolean(id)))].sort()
   } catch {
     determined = false
   }
   await db.$transaction(async (tx) => {
-    let erased = !determined
+    let erased = !determined || markedErased
     for (const candidate of candidates) {
       await tx.$queryRaw`SELECT id FROM "sales_orders" WHERE id = ${candidate} FOR UPDATE`
       if ((await tx.salesOrder.findUnique({ where: { id: candidate }, select: { erasedAt: true } }))?.erasedAt) erased = true
@@ -310,7 +313,9 @@ async function writeReturnsErrorLog(jobId: string, record: WmsReturnRecord, erro
         reason: erased
           ? `Return rejected: ${error instanceof Error ? error.name : 'UnknownError'}`
           : error instanceof Error ? error.message : 'Mintsoft returns sync error',
-        payload: (erased ? {} : (record.raw ?? {})) as Prisma.InputJsonValue,
+        // The raw warehouse record is NOT copied into the sync log (it holds the recipient; nothing reads it here, and the returns inbox keeps its own
+        // rawPayload for review). Only the return id, which is a reference and not personal data.
+        payload: (erased ? {} : { externalReturnId: record.externalReturnId }) as Prisma.InputJsonValue,
       },
     })
   })
@@ -411,14 +416,19 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
         // resolves to none (a redelivery with a missing order reference), the order the inbox row is ALREADY linked to. An established link is
         // never cleared by an unresolved delivery.
         await db.$transaction(async (tx) => {
-          const current = await tx.wmsReturnsInbox.findUnique({ where: inboxKey, select: { orderId: true } })
+          const current = await tx.wmsReturnsInbox.findUnique({ where: inboxKey, select: { orderId: true, erasedAt: true } })
           const effectiveOrderId = order?.id ?? current?.orderId ?? null
           const candidates = [...new Set([order?.id, current?.orderId].filter((id): id is string => Boolean(id)))].sort()
-          let orderErased = false
+          // A row an erasure cleared stays erased whatever the order resolves to now (the warehouse's reference may no longer resolve to the erased order).
+          let orderErased = current?.erasedAt != null
           for (const candidate of candidates) {
             await tx.$queryRaw`SELECT id FROM "sales_orders" WHERE id = ${candidate} FOR UPDATE`
             if ((await tx.salesOrder.findUnique({ where: { id: candidate }, select: { erasedAt: true } }))?.erasedAt) orderErased = true
           }
+          // THE INBOX ROW IS LOCKED TOO (after the orders, the erasure's own order: orders, then linked rows) and its marker re-read under that lock: a return with no
+          // order link has no order lock to wait on, and an erasure committing after the unlocked read above would otherwise be missed.
+          const lockedRow = await tx.$queryRaw<Array<{ erasedAt: Date | null }>>`SELECT "erasedAt" FROM "wms_returns_inbox" WHERE "connector" = 'mintsoft' AND "externalReturnId" = ${record.externalReturnId} FOR UPDATE`
+          if (lockedRow[0]?.erasedAt) orderErased = true
           const reason = orderErased ? null : reasonText
           const rawPayload = (orderErased ? {} : (record.raw ?? {})) as Prisma.InputJsonValue
           const saved = await tx.wmsReturnsInbox.upsert({
@@ -457,9 +467,10 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
               id: true,
               productId: true,
               sku: true,
+              erasedAt: true,
             },
           })
-          // THE SYNC LOG ROW IS WRITTEN IN THIS SAME TRANSACTION, under the same order lock, with the same decision: a log row carries the raw
+          // THE SYNC LOG ROW IS WRITTEN IN THIS SAME TRANSACTION, under the same order lock, with the same decision: a log row used to carry the raw
           // warehouse payload only when the effective order is NOT erased. For an erased order it carries identity-free structured fields only.
           await tx.wmsSyncLog.create({
             data: {
@@ -472,7 +483,8 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
                 product ? null : 'SKU_UNMATCHED',
                 binding ? null : 'WAREHOUSE_UNMATCHED',
               ].filter(Boolean).join(',') || 'MATCHED',
-              payload: rawPayload,
+              // No raw warehouse record in the log: see writeReturnsErrorLog. The inbox row above keeps it for review.
+              payload: (orderErased ? {} : { externalReturnId: record.externalReturnId }) as Prisma.InputJsonValue,
             },
           })
           // THE AUDIT EVENT TOO, in this transaction: it carries the reason, so it is written under the same lock and with the same decision.
@@ -484,7 +496,7 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
                 ? `Mintsoft return ${record.externalReturnId} updated in the returns inbox`
                 : `Mintsoft return ${record.externalReturnId} staged in the returns inbox`,
               before: existing ? { status: existing.status, warehouseId: existing.warehouseId } : null,
-              after: { sku: saved.sku, qty, reason, reference, orderMatched: Boolean(order), productMatched: Boolean(product) },
+              after: { sku: saved.sku, qty, reason: saved.erasedAt ? null : reason, reference, orderMatched: Boolean(order), productMatched: Boolean(product) },
               triggeredBy: 'returns-sync',
             }),
           })

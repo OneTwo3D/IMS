@@ -223,6 +223,11 @@ const MIGRATION_OWNERS = new Map([
     + 'has to name the family it is asserting about.',
   ],
   [
+    '20261107150000_erasure_raw_payload_projection/migration.sql',
+    'Maps a sync-log row to its family from its recordKind and direction columns, to project the raw payload of an erased order. The mapping is held to '
+    + 'lib/domain/sales/wc-sync-row-families.ts by tests/erasure-sync-log-family-mapping.test.ts, which asserts the migration names exactly the shared constants.',
+  ],
+  [
     '20260909090000_refund_park_unique_index_record_kind/migration.sql',
     'Rebuilds the index with the refund-park recordKind clause. Its WHERE predicate is the string '
     + 'activeRefundParkIndexPredicateSql() renders, asserted character for character by '

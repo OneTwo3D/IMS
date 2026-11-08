@@ -47,4 +47,8 @@ export const UNGUARDED_FREE_TEXT: Readonly<Record<string, string>> = {
   'EmailSuppression.reason': 'deleted by the erasure; the drain writes none for an erased order (the invalid-recipient write is made under the order lock)',
   'WmsMutationEvent.before': 'audit JSON written with the decision made under the order lock (returns sync); cleared by the erasure',
   'WmsMutationEvent.after': 'audit JSON written with the decision made under the order lock (returns sync); cleared by the erasure',
+  'ShoppingWebhookEvent.lastError': 'guarded by the raw-payload trigger (erased_wc_webhook_event_guard, migration erasure_raw_payload_projection), which keys on the storefront order id inside the payload, not on an order column',
+  'ShoppingSyncLog.payload': 'guarded by the raw-payload trigger (erased_wc_sync_log_guard), which projects the payload by its shape',
+  'ShoppingSyncLog.errorMessage': 'guarded by the raw-payload trigger (erased_wc_sync_log_guard)',
+  'WmsSyncLog.payload': 'the returns sync no longer writes the raw warehouse record here (only the return id); rows written before that are cleared by the erasure (raw-payloads.ts)',
 }

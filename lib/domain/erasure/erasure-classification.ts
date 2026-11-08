@@ -146,13 +146,27 @@ ERASURE_CLASSIFICATION.WmsMutationEvent = {
   notPersonal: ['connector', 'action', 'entityType', 'entityId', 'externalId', 'summary', 'error', 'jobId', 'triggeredBy'],
   retained: {},
 }
+// The returns sync no longer copies the raw warehouse record here (only the return id); rows written before that are cleared by the erasure (raw-payloads.ts).
 ERASURE_CLASSIFICATION.WmsSyncLog = {
-  erased: [],
+  erased: ['payload'],
   notPersonal: ['jobId', 'sku', 'productId', 'reason'],
-  retained: { payload: 'NOT written for a return of an erased order (success and error rows alike). Rows written before an erasure are the raw-payload copies, a separate scope, and are not scrubbed here' },
+  retained: {},
+}
+// The raw storefront copies: reached by the storefront order id inside the payload, not by a relation (named in the schema test). The payload is replaced
+// by an allowlist projection, the error text by the marker; every other column is an id, a status, a count or a clock.
+ERASURE_CLASSIFICATION.ShoppingWebhookEvent = {
+  erased: ['payloadJson', 'lastError'],
+  notPersonal: ['connector', 'resource', 'externalEventId', 'topic', 'payloadHash', 'originAttestation', 'status'],
+  retained: {},
+}
+ERASURE_CLASSIFICATION.ShoppingSyncLog = {
+  erased: ['payload', 'errorMessage'],
+  notPersonal: ['connector', 'entityType', 'entityId', 'externalId', 'recordKind'],
+  retained: {},
 }
 
 // Keyed by the storefront order id only; it carries no personal data (named in the schema test: no relation reaches it).
+ERASURE_CLASSIFICATION.StorefrontCustomerErasureTombstone = { erased: [], notPersonal: ['connector', 'customerKeyHash'], retained: {} } // a hash of connector + storefront customer id: no raw identifier
 ERASURE_CLASSIFICATION.StorefrontOrderErasureObligation = { erased: [], notPersonal: ['connector', 'externalOrderId'], retained: {} }
 
 export function classifiedColumns(model: string): string[] {

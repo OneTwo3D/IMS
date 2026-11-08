@@ -5,6 +5,9 @@ import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { HELD_SALES_INVOICE_RECORD_KIND } from '@/lib/domain/sales/wc-sync-row-families'
 import { EMAIL_RECIPIENT_ERASED_REASON } from './email-recipient'
 import { scrubContactBlock } from './contact-gate'
+import { CustomerKeysChanged, lockStorefrontCustomerKeys, readStorefrontCustomerIds } from './customer-key-lock'
+import { scrubReturnInboxEvents } from './return-events'
+import { loadRawPayloadSubject, scrubRawPayloadsInTx, type RawPayloadCounts } from './raw-payloads'
 import { SYSTEM_PAYMENT_NOTES, orderIsErasedInTx } from './order-state'
 export { orderIsErasedInTx }
 import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
@@ -72,7 +75,7 @@ export async function eraseOrdersPersonalDataInTx(
   tx: Prisma.TransactionClient,
   orderIds: string[],
   erasedAt: Date,
-): Promise<Omit<ErasureCounts, 'customers' | 'shoppingCustomerLinks' | 'activityRowsScrubbed' | 'linkedFreeTextScrubbed'>> {
+): Promise<Omit<ErasureCounts, 'customers' | 'shoppingCustomerLinks' | 'activityRowsScrubbed' | 'linkedFreeTextScrubbed' | keyof RawPayloadCounts>> {
   const counts = { salesOrders: 0, shipments: 0, shoppingOrderLinks: 0, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, notifications: 0 }
   for (const ids of chunks(orderIds)) {
     counts.salesOrders += (await tx.salesOrder.updateMany({
@@ -362,17 +365,7 @@ export async function scrubLinkedFreeText(tx: Prisma.TransactionClient, orderIds
     // the inbox row ids and their free-text keys are replaced with the marker, set-based; null stays null and other keys are untouched.
     if (returns.length > 0) {
       const inboxIds = returns.map((r) => r.id)
-      changed += Number(await tx.$executeRaw`
-        UPDATE "wms_mutation_events" e
-           SET "before" = CASE WHEN e."before" IS NULL THEN NULL ELSE
-                 e."before" || (CASE WHEN (e."before"->>'reason') IS NOT NULL THEN jsonb_build_object('reason', ${marker}::text) ELSE '{}'::jsonb END)
-                            || (CASE WHEN (e."before"->>'resolutionNote') IS NOT NULL THEN jsonb_build_object('resolutionNote', ${marker}::text) ELSE '{}'::jsonb END) END,
-               "after" = CASE WHEN e."after" IS NULL THEN NULL ELSE
-                 e."after" || (CASE WHEN (e."after"->>'reason') IS NOT NULL THEN jsonb_build_object('reason', ${marker}::text) ELSE '{}'::jsonb END)
-                           || (CASE WHEN (e."after"->>'resolutionNote') IS NOT NULL THEN jsonb_build_object('resolutionNote', ${marker}::text) ELSE '{}'::jsonb END) END
-         WHERE e."entityType" = 'RETURN' AND e."action" = 'return_inbox' AND e."entityId" = ANY(${inboxIds}::text[])
-           AND ((e."before"->>'reason') IS DISTINCT FROM ${marker}::text OR (e."after"->>'reason') IS DISTINCT FROM ${marker}::text)
-           AND ((e."before"->>'reason') IS NOT NULL OR (e."after"->>'reason') IS NOT NULL OR (e."before"->>'resolutionNote') IS NOT NULL OR (e."after"->>'resolutionNote') IS NOT NULL)`)
+      changed += await scrubReturnInboxEvents(tx, inboxIds)
     }
     const rawIds = returns.filter((r) => r.rawPayload != null && JSON.stringify(r.rawPayload) !== '{}').map((r) => r.id)
     if (rawIds.length > 0) changed += (await tx.wmsReturnsInbox.updateMany({ where: { id: { in: rawIds } }, data: { rawPayload: {} } })).count
@@ -441,6 +434,10 @@ async function eraseUnderLocksInTx(
   // a later order from the same storefront account finds no link, no email on the erased row to match, and so gets a FRESH
   // customer; the new identity belongs to a new record. Only when the customer itself is erased: a customer who keeps other live
   // orders keeps its link.
+  // The storefront customer ids are read BEFORE the links are deleted: they find the same person's raw deliveries for orders IMS never imported.
+  const storefrontCustomerIds = eraseCustomer && customerId
+    ? [before?.externalCustomerId, ...(await tx.shoppingCustomerLink.findMany({ where: { customerId }, select: { externalCustomerId: true } })).map((l) => l.externalCustomerId)]
+    : []
   const links = eraseCustomer && customerId ? await tx.shoppingCustomerLink.deleteMany({ where: { customerId } }) : { count: 0 }
   const tokens = collectIdentityTokens({
     customer: before as unknown as Record<string, unknown> | null,
@@ -449,7 +446,11 @@ async function eraseUnderLocksInTx(
   })
   const activityRowsScrubbed = await scrubActivityLogIdentity(tx, [...(eraseCustomer && customerId ? [customerId] : []), ...orderIds], tokens)
   const linkedFreeTextScrubbed = await scrubLinkedFreeText(tx, orderIds)
-  const counts: ErasureCounts = { customers: eraseCustomer ? 1 : 0, shoppingCustomerLinks: links.count, activityRowsScrubbed, linkedFreeTextScrubbed, ...orderCounts }
+  // THE RAW PAYLOAD COPIES (webhook inbox, queue snapshots, refund parks, tracking logs, warehouse return records), projected in this same transaction:
+  // a failure here fails the whole erasure, so raw identity cannot be left behind silently. See raw-payloads.ts.
+  const rawSubject = await loadRawPayloadSubject(tx, orderIds, storefrontCustomerIds)
+  const rawCounts = await scrubRawPayloadsInTx(tx, rawSubject.subject, rawSubject.missing, erasedAt)
+  const counts: ErasureCounts = { customers: eraseCustomer ? 1 : 0, shoppingCustomerLinks: links.count, activityRowsScrubbed, linkedFreeTextScrubbed, ...rawCounts, ...orderCounts }
   const record = {
     tag: 'sales',
     description: ERASURE_RECORD_DESCRIPTION,
@@ -471,15 +472,28 @@ export async function eraseCustomerPersonalData(
   const requestId = randomUUID()
   const erasedAt = new Date()
   try {
-    const refusal = await db.$transaction(async (tx): Promise<string | null> => {
-      // LOCKS FIRST: the customer row is locked, then ALL of the customer's orders in one statement in id order (customer, then orders).
+    let refusal: string | null = null
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        refusal = await db.$transaction(async (tx): Promise<string | null> => {
+      // LOCKS FIRST. The storefront-customer KEY LOCKS (customer-key-lock.ts) come before the customer row lock, so an import of one of this customer's orders and
+      // this erasure serialise; the ids are read unlocked, locked, and re-read under the customer lock (a new id means retry).
+      const keysLocked = await lockStorefrontCustomerKeys(tx, await readStorefrontCustomerIds(tx, customerId))
+      // Then the customer row is locked, then ALL of the customer's orders in one statement in id order (customer, then orders).
       // New orders cannot appear under the customer meanwhile: creating one takes the same customer row lock.
       const lockedCustomer = await tx.$queryRaw<Array<{ id: string; gdprAnonymisedAt: Date | null }>>`SELECT id, "gdprAnonymisedAt" FROM "customers" WHERE id = ${customerId} FOR UPDATE`
       if (lockedCustomer.length === 0) return 'Customer not found'
       if (lockedCustomer[0]!.gdprAnonymisedAt) return 'Customer already anonymised'
       const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "sales_orders" WHERE "customerId" = ${customerId} ORDER BY id FOR UPDATE`
+      if ((await readStorefrontCustomerIds(tx, customerId)).some((id) => !keysLocked.includes(id))) throw new CustomerKeysChanged()
       return eraseUnderLocksInTx(tx, { customerId, eraseCustomer: true, targetOrderIds: locked.map((o) => o.id), requestId, erasedAt, trigger: options.trigger, userId: options.userId })
     }, ERASURE_TRANSACTION_OPTIONS)
+        break
+      } catch (e) {
+        if (e instanceof CustomerKeysChanged && attempt < 3) continue
+        throw e
+      }
+    }
     if (refusal) return { success: false, error: refusal }
     return { success: true, requestId }
   } catch (e) {
@@ -534,7 +548,10 @@ export async function eraseOrderPersonalData(
           let customerErased = false
           let customerLive = false
           if (peek.customerId) {
+            // The storefront-customer key locks first (see eraseCustomerPersonalData), then the customer row.
+            const keysLocked = await lockStorefrontCustomerKeys(tx, await readStorefrontCustomerIds(tx, peek.customerId))
             const lockedCustomer = await tx.$queryRaw<Array<{ gdprAnonymisedAt: Date | null }>>`SELECT "gdprAnonymisedAt" FROM "customers" WHERE id = ${peek.customerId} FOR UPDATE`
+            if ((await readStorefrontCustomerIds(tx, peek.customerId)).some((id) => !keysLocked.includes(id))) throw new CustomerKeysChanged()
             customerErased = lockedCustomer.length > 0 && lockedCustomer[0]!.gdprAnonymisedAt != null
             customerLive = lockedCustomer.length > 0 && !customerErased
             await tx.$queryRaw`SELECT id FROM "sales_orders" WHERE "customerId" = ${peek.customerId} ORDER BY id FOR UPDATE`
@@ -554,7 +571,7 @@ export async function eraseOrderPersonalData(
           return { success: true, already: false, requestId, customerErased: eraseCustomer }
         }, ERASURE_TRANSACTION_OPTIONS)
       } catch (e) {
-        if (e instanceof OrderRelinkedDuringErasure && attempt < ORDER_ERASURE_ATTEMPTS) continue
+        if ((e instanceof OrderRelinkedDuringErasure || e instanceof CustomerKeysChanged) && attempt < ORDER_ERASURE_ATTEMPTS) continue
         throw e
       }
     }

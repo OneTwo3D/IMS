@@ -15,7 +15,7 @@ const NAME = 'Zebediah Quillfeather'
 test('the record names the request, date and scope, with every external system not-attempted', () => {
   const meta = buildErasureRecordMetadata({
     requestId: 'req-1', erasedAt: new Date('2026-11-06T10:00:00Z'), trigger: 'ON_REQUEST', customerId: 'cust1', orderIds: ['o1', 'o2'],
-    counts: { customers: 1, salesOrders: 2, shipments: 1, shoppingCustomerLinks: 1, shoppingOrderLinks: 2, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, activityRowsScrubbed: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, linkedFreeTextScrubbed: 0, notifications: 0 },
+    counts: { customers: 1, salesOrders: 2, shipments: 1, shoppingCustomerLinks: 1, shoppingOrderLinks: 2, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, activityRowsScrubbed: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, linkedFreeTextScrubbed: 0, rawWebhookEventsProjected: 0, rawSyncLogsProjected: 0, rawReturnRecordsCleared: 0, storefrontIdMissing: 0, notifications: 0 },
   })
   assert.equal(meta.requestId, 'req-1')
   assert.equal(meta.trigger, 'ON_REQUEST')

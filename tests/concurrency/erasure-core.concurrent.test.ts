@@ -416,6 +416,7 @@ test('[erasure] a customer erased between the importer\'s customer lookup and it
   t.after(async () => {
     const link = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(fx.externalId + 1) }, select: { orderId: true } })
     if (link) {
+      await db.payment.deleteMany({ where: { orderId: link.orderId } })
       await db.accountingSyncLog.deleteMany({ where: { referenceId: link.orderId } })
       await db.activityLog.deleteMany({ where: { entityId: link.orderId } })
       await db.salesOrderLine.deleteMany({ where: { orderId: link.orderId } })
@@ -447,7 +448,13 @@ test('[erasure] a customer erased between the importer\'s customer lookup and it
     await new Promise((r) => setTimeout(r, 300))
   }
   let done = false
-  const importing = importWcOrder(payload(fx.externalId + 1, wcRateId) as never).then((r) => { done = true; return r })
+  // The payload carries free text that must not reach a line, a fee or the payment of an order created erased: a personalised item name, a fee name, the gateway id.
+  const midBase = payload(fx.externalId + 1, wcRateId) as unknown as Record<string, unknown> & { line_items: Array<Record<string, unknown>> }
+  const midPayload = { ...midBase, transaction_id: `TXN-${NAME.last}-MID`, date_paid_gmt: '2026-11-02T09:05:00', date_paid: '2026-11-02T09:05:00', payment_method_title: `Card of ${NAME.first} ${NAME.last}`,
+    shipping_lines: [{ id: 31, method_title: `Courier for ${NAME.first} ${NAME.last}`, method_id: 'flat_rate', total: '5.00', total_tax: '1.00', taxes: [{ id: wcRateId, total: '1.00' }], meta_data: [] }],
+    line_items: [{ ...midBase.line_items[0]!, name: `Widget engraved for ${NAME.first}`, sku: `${NAME.first} ${NAME.last} sku` }],
+    fee_lines: [{ id: 41, name: `Gift wrap for ${NAME.last}`, tax_class: '', tax_status: 'none', total: '0.00', total_tax: '0.00', taxes: [], meta_data: [] }] }
+  const importing = importWcOrder(midPayload as never).then((r) => { done = true; return r })
   await new Promise((r) => setTimeout(r, 1500))
   assert.equal(done, false, 'the create transaction is waiting on the customer row lock (taken inside its customer step)')
   release()
@@ -463,7 +470,14 @@ test('[erasure] a customer erased between the importer\'s customer lookup and it
     ['GDPR Anonymised', null, null, null, null, null])
   assert.ok(created.erasedAt, 'the erasure marker is set')
   assert.equal(created.totalForeign.toString(), '126', 'the order and its money stay in the books')
-  assert.equal(await db.salesOrderLine.count({ where: { orderId: link.orderId } }), 1)
+  const midLines = await db.salesOrderLine.findMany({ where: { orderId: link.orderId } })
+  assert.ok(midLines.length >= 1)
+  assert.ok(midLines.every((l) => !JSON.stringify(l).includes(NAME.first) && !JSON.stringify(l).includes(NAME.last)), 'no personalised item or fee name on the lines of an order created erased mid-import')
+  assert.deepEqual([created.paymentMethod, created.shippingService].map((v) => String(v ?? '')).filter((v) => v.includes(NAME.first) || v.includes(NAME.last)), [], 'the payment and shipping method titles persisted are the projected ones, not the original free text')
+  assert.ok(midLines.every((l) => !String(l.sku ?? '').includes(NAME.first)), 'no personalised sku persisted')
+  const midPayments = await db.payment.findMany({ where: { orderId: link.orderId } })
+  assert.ok(midPayments.every((x) => x.reference === null), 'no gateway transaction id on the receipt')
+  await db.payment.deleteMany({ where: { orderId: link.orderId } })
   assert.equal((await db.shoppingOrderLink.findFirstOrThrow({ where: { orderId: link.orderId } })).metadata, null, 'the storefront order key is not stored')
   const proof = await db.activityLog.findFirst({ where: { entityId: link.orderId, action: 'gdpr_erasure_recorded' } })
   assert.ok(proof, 'the name-free proof record was written as an erasure of this order')
@@ -1209,6 +1223,10 @@ test('[erasure] the returns sync never reads the warehouse\'s free text back int
   assert.equal(first.orderId, fx.orderId)
   assert.ok(first.reason?.includes(NAME.last), 'not erased: the reason is stored')
   assert.ok(JSON.stringify(first.rawPayload).includes(STREET), 'not erased: the raw payload is stored')
+  // The sync LOG no longer copies the raw warehouse record for ANY order (only the return id); the inbox row above keeps it for review.
+  const returnLogs = await db.wmsSyncLog.findMany({ where: { sku: 'SKU-RET', job: { type: 'RETURNS_SYNC' } } })
+  assert.ok(returnLogs.length > 0, 'PRECONDITION: the sync wrote a log row')
+  assert.ok(returnLogs.every((l) => !JSON.stringify(l.payload).includes(STREET) && !JSON.stringify(l.payload).includes(NAME.last)), 'no raw warehouse record in the sync log')
   pollReturnsRecords = () => [record(live, { orderReference: null, reason: 'updated reason text' })]
   await runMintsoftReturnsSync('test')
   const again = await inbox(live)
@@ -1280,8 +1298,9 @@ test('[erasure] the returns sync never reads the warehouse\'s free text back int
   const raceLogs = await db.wmsSyncLog.findMany({ where: { createdAt: { gt: raceMark, lt: erasedAtMark } } })
   assert.ok(raceLogs.length >= 1, 'PRECONDITION: the racing delivery wrote a log row')
   for (const row of raceLogs) assert.ok(!JSON.stringify(row).includes(STREET) && !JSON.stringify(row).includes(NAME.last), 'the racing row carries no payload')
-  // CONTROL: the rows written BEFORE the erasure, for the live order, did carry the payload (so the check above is not vacuous).
-  assert.ok((await db.wmsSyncLog.findMany({ where: { createdAt: { lt: erasedAtMark } } })).some((l) => JSON.stringify(l.payload).includes(STREET)), 'control: a pre-erasure log row carries the payload')
+  // CONTROL: rows written BEFORE the erasure exist, and (the raw record is no longer copied into the log; the erasure also clears the return id they carry) none holds the value.
+  const preLogs = await db.wmsSyncLog.findMany({ where: { createdAt: { lt: erasedAtMark } } })
+  assert.ok(preLogs.length > 0 && preLogs.every((l) => !JSON.stringify(l.payload).includes(STREET)), 'control: pre-erasure log rows exist and hold no raw record')
 
   // THE MUTATION EVENTS of the return hold the marker, not the reason.
   const events = await db.wmsMutationEvent.findMany({ where: { entityType: 'RETURN', action: 'return_inbox', entityId: redelivered.id } })
@@ -2546,4 +2565,202 @@ test('[erasure] a MIRROR error ends the run, leaves the cursor at the last fully
   const second = await sweepWcAnonymisedOrders({ maxPages: 20 })
   assert.equal(second.errors.length, 0)
   assert.equal((await obligationIds(db, orders.map((o) => o.id))).size, 250, 'the next run covered everything, including the order that failed')
+})
+
+test('[erasure] an UNMATCHED return cleared by the erasure stays erased: a later poll that resolves it to no order cannot write the raw record or the reason back', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { runMintsoftReturnsSync } = await import('@/lib/connectors/mintsoft/sync/returns-sync')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const uid = randomUUID().slice(0, 8)
+  const connection = await db.wmsConnection.create({ data: { connector: 'mintsoft', label: `unm-${uid}`, active: true }, select: { id: true } })
+  const binding = await db.externalWmsBinding.create({ data: { connectionId: connection.id, warehouseId: fx.warehouseId, connector: 'mintsoft', externalWarehouseId: `ext-${uid}`, active: true, returnsMode: 'POLL' } as never, select: { id: true } })
+  const returnId = `RET-UNM-${uid}`
+  t.after(async () => {
+    pollReturnsRecords = null
+    await db.wmsReturnsInbox.deleteMany({ where: { externalReturnId: returnId } })
+    await db.externalWmsBinding.deleteMany({ where: { id: binding.id } })
+    await db.wmsConnection.deleteMany({ where: { id: connection.id } })
+    await fx.cleanup()
+  })
+  const order = await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId }, select: { orderNumber: true } })
+  // The return was staged with NO order link (the warehouse's reference did not resolve then), carrying the recipient's raw record and a reason.
+  await db.wmsReturnsInbox.create({ data: { connector: 'mintsoft', externalReturnId: returnId, orderId: null, reference: order.orderNumber, reason: `${FULL_NAME} says broken`, rawPayload: { Customer: { Name: FULL_NAME }, Note: STREET } } as never })
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const after = await db.wmsReturnsInbox.findUniqueOrThrow({ where: { connector_externalReturnId: { connector: 'mintsoft', externalReturnId: returnId } } })
+  assert.ok(after.erasedAt, 'the erasure marked the row')
+  assert.deepEqual(after.rawPayload, {})
+  // A later poll: the same return, a reference that resolves to NO order now, and the raw record again.
+  pollReturnsRecords = () => [{
+    externalReturnId: returnId, externalWarehouseId: `ext-${uid}`, sku: 'SKU-RET', qty: 1, orderReference: 'NO-SUCH-REFERENCE', reason: `${FULL_NAME} says it arrived broken`,
+    receivedAt: '2026-11-04T10:00:00.000Z', raw: { Customer: { Name: FULL_NAME }, Note: `Collect from ${STREET}` },
+  }]
+  await runMintsoftReturnsSync('test')
+  const again = await db.wmsReturnsInbox.findUniqueOrThrow({ where: { connector_externalReturnId: { connector: 'mintsoft', externalReturnId: returnId } } })
+  assert.deepEqual(again.rawPayload, {}, 'the raw record is not written back')
+  assert.ok(again.reason === null || again.reason === 'Text removed by GDPR erasure', 'the reason is not written back')
+  assert.equal(again.erasedAt?.getTime(), after.erasedAt?.getTime(), 'the marker stays')
+  // ... and the trigger honours the marker for ANY writer.
+  await db.$executeRaw`UPDATE "wms_returns_inbox" SET "reason" = ${`from ${FULL_NAME}`}, "rawPayload" = ${JSON.stringify({ n: FULL_NAME })}::jsonb WHERE "externalReturnId" = ${returnId}`
+  const forced = await db.wmsReturnsInbox.findUniqueOrThrow({ where: { connector_externalReturnId: { connector: 'mintsoft', externalReturnId: returnId } } })
+  assert.deepEqual(forced.rawPayload, {}); assert.equal(forced.reason, 'Text removed by GDPR erasure')
+  const logs = await db.wmsSyncLog.findMany({ where: { sku: 'SKU-RET', job: { type: 'RETURNS_SYNC' } } })
+  assert.ok(logs.every((l) => !JSON.stringify(l.payload).includes(STREET)))
+})
+
+test('[erasure] the audit events of an UNLINKED return hold the marker after the erasure, and a later update of that return writes no reason into a new event', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { runMintsoftReturnsSync } = await import('@/lib/connectors/mintsoft/sync/returns-sync')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const uid = randomUUID().slice(0, 8)
+  const connection = await db.wmsConnection.create({ data: { connector: 'mintsoft', label: `evt-${uid}`, active: true }, select: { id: true } })
+  const binding = await db.externalWmsBinding.create({ data: { connectionId: connection.id, warehouseId: fx.warehouseId, connector: 'mintsoft', externalWarehouseId: `ext-${uid}`, active: true, returnsMode: 'POLL' } as never, select: { id: true } })
+  const returnId = `RET-EVT-${uid}`
+  let inboxId = ''
+  t.after(async () => {
+    pollReturnsRecords = null
+    await db.wmsMutationEvent.deleteMany({ where: { entityId: inboxId } })
+    await db.wmsReturnsInbox.deleteMany({ where: { externalReturnId: returnId } })
+    await db.externalWmsBinding.deleteMany({ where: { id: binding.id } })
+    await db.wmsConnection.deleteMany({ where: { id: connection.id } })
+    await fx.cleanup()
+  })
+  const order = await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId }, select: { orderNumber: true } })
+  const inbox = await db.wmsReturnsInbox.create({ data: { connector: 'mintsoft', externalReturnId: returnId, orderId: null, reference: order.orderNumber, reason: `${FULL_NAME} says broken` } as never })
+  inboxId = inbox.id
+  await db.wmsMutationEvent.create({ data: { connector: 'mintsoft', direction: 'INBOUND', action: 'return_inbox', outcome: 'SUCCEEDED', entityType: 'RETURN', entityId: inbox.id, summary: 's', before: null, after: { reason: `${FULL_NAME} says broken`, sku: 'SKU-RET' } } as never })
+  // An event whose reasons are ALREADY marked but whose resolution note is not: each of the four values is checked on its own.
+  const half = await db.wmsMutationEvent.create({ data: { connector: 'mintsoft', direction: 'INBOUND', action: 'return_inbox', outcome: 'SUCCEEDED', entityType: 'RETURN', entityId: inbox.id, summary: 's', before: { reason: 'Text removed by GDPR erasure', resolutionNote: `${FULL_NAME} refunded` }, after: { reason: 'Text removed by GDPR erasure', resolutionNote: `${FULL_NAME} refunded` } } as never })
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const events = async () => db.wmsMutationEvent.findMany({ where: { entityType: 'RETURN', action: 'return_inbox', entityId: inbox.id } })
+  const first = await events()
+  assert.ok(first.length >= 1 && first.every((e) => !JSON.stringify(e).includes(NAME.last)), 'the existing event holds no name')
+  assert.equal((first[0]!.after as { reason: string }).reason, 'Text removed by GDPR erasure')
+  const halfAfter = await db.wmsMutationEvent.findUniqueOrThrow({ where: { id: half.id } })
+  assert.ok(!JSON.stringify(halfAfter).includes(NAME.last), 'an unmarked resolution note next to a marked reason is scrubbed too')
+  // A later poll of the same return: the event it writes carries no reason.
+  pollReturnsRecords = () => [{ externalReturnId: returnId, externalWarehouseId: `ext-${uid}`, sku: 'SKU-RET', qty: 1, orderReference: 'NO-SUCH-REFERENCE', reason: `${FULL_NAME} says it arrived broken`, receivedAt: '2026-11-04T10:00:00.000Z', raw: { Name: FULL_NAME } }]
+  await runMintsoftReturnsSync('test')
+  const second = await events()
+  assert.ok(second.length > first.length, 'PRECONDITION: the poll wrote a new event')
+  assert.ok(second.every((e) => !JSON.stringify(e).includes(NAME.last) && !JSON.stringify(e).includes(NAME.first)), 'no new event carries the reason')
+  // The trigger honours the marker for any writer.
+  const forced = await db.wmsMutationEvent.create({ data: { connector: 'mintsoft', direction: 'INBOUND', action: 'return_inbox', outcome: 'SUCCEEDED', entityType: 'RETURN', entityId: inbox.id, summary: 's', before: { reason: FULL_NAME, resolutionNote: FULL_NAME }, after: { reason: FULL_NAME } } as never })
+  assert.ok(!JSON.stringify(forced).includes(NAME.last))
+})
+
+test('[erasure] FORCED INTERLEAVINGS of a customer erasure and an import of that customer\'s order, both orders: never a fresh identifiable customer or a live order outside the erasure', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const idA = fx.externalId + 1; const idB = fx.externalId + 2; const idC = fx.externalId + 3
+  t.after(async () => {
+    beforeUpsertCustomer = null; beforeActivityWrite = null
+    for (const id of [idA, idB, idC]) {
+      const link = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(id) }, select: { orderId: true } })
+      if (link) {
+        const o = await db.salesOrder.findUnique({ where: { id: link.orderId }, select: { customerId: true } })
+        await db.payment.deleteMany({ where: { orderId: link.orderId } }); await db.accountingSyncLog.deleteMany({ where: { referenceId: link.orderId } }); await db.activityLog.deleteMany({ where: { entityId: link.orderId } })
+        await db.salesOrderLine.deleteMany({ where: { orderId: link.orderId } }); await db.shoppingOrderLink.deleteMany({ where: { orderId: link.orderId } }); await db.salesOrder.deleteMany({ where: { id: link.orderId } })
+        if (o?.customerId && o.customerId !== fx.customerId) { await db.shoppingCustomerLink.deleteMany({ where: { customerId: o.customerId } }); await db.customer.deleteMany({ where: { id: o.customerId } }) }
+      }
+    }
+    await db.storefrontCustomerErasureTombstone.deleteMany({})
+    await fx.cleanup()
+  })
+  const body = (id: number) => ({ ...(payload(id, wcRateId) as object), customer_id: fx.wooCustomerId, transaction_id: `TXN-${NAME.last}-${id}` }) as never
+  const liveCustomers = () => db.customer.count({ where: { OR: [{ email: EMAIL }, { lastName: NAME.last }], gdprAnonymisedAt: null } })
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+  // (A) THE IMPORTER IS FIRST: paused after it took the key lock and read "no tombstone", before its customer step. The erasure starts and must WAIT; once the
+  // importer commits the (live, linked) order, the erasure finds it under the customer and erases it with the customer.
+  let erasedDone = false
+  let erasing: Promise<unknown> = Promise.resolve()
+  beforeUpsertCustomer = async () => {
+    beforeUpsertCustomer = null
+    erasing = eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null }).then((r) => { erasedDone = true; return r })
+    await sleep(1500)
+    assert.equal(erasedDone, false, 'the erasure WAITS for the importer (key lock), it does not slip between the tombstone read and the customer step')
+  }
+  const importedA = await importWcOrder(body(idA))
+  assert.equal(importedA.success, true, JSON.stringify(importedA))
+  assert.equal(((await erasing) as { success: boolean }).success, true)
+  const linkA = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(idA) } })
+  const orderA = await db.salesOrder.findUniqueOrThrow({ where: { id: linkA.orderId } })
+  assert.ok(orderA.erasedAt, 'A: the order the importer committed was erased with the customer')
+  assert.equal(await liveCustomers(), 0, 'A: no live identifiable customer remains')
+  assert.equal(JSON.stringify([orderA.customerName, orderA.customerEmail, orderA.billingAddress, orderA.shippingAddress]).includes(NAME.last), false)
+
+  // (B) THE ERASURE IS FIRST: a second person's identical customer is not needed; the same account is erased already, so a fresh import of ANOTHER order of that
+  // account, started while a second erasure of a re-created customer is uncommitted, ends erased. (Re-create the customer by a live import after the tombstone's erasure time.)
+  const later = new Date(Date.now() + 86_400_000).toISOString().slice(0, 19)
+  const bodyLater = (id: number) => ({ ...(body(id) as object), date_created_gmt: later, date_created: later }) as never
+  const importedLive = await importWcOrder(bodyLater(idB))
+  assert.equal(importedLive.success, true, JSON.stringify(importedLive))
+  const linkB = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(idB) } })
+  const orderB = await db.salesOrder.findUniqueOrThrow({ where: { id: linkB.orderId } })
+  assert.equal(orderB.erasedAt, null, 'B: an order created after the erasure is live, with a fresh customer')
+  assert.ok(orderB.customerId && orderB.customerId !== fx.customerId)
+  const customerB = orderB.customerId!
+  // Now erase THIS customer while an import of one of its (pre-existing) orders is started inside the erasure's window. (The first erasure's tombstone is removed so
+  // the importer cannot decide from it: the only thing standing between it and a fresh customer is the key lock and the tombstone read under it.)
+  await db.storefrontCustomerErasureTombstone.deleteMany({})
+  let importing: Promise<{ success: boolean; orderId?: string; error?: string }> = Promise.resolve({ success: false })
+  let importDone = false
+  beforeActivityWrite = async () => {
+    beforeActivityWrite = null
+    importing = (importWcOrder(body(idC)) as Promise<{ success: boolean; orderId?: string; error?: string }>).then((r) => { importDone = true; return r })
+    await sleep(1500)
+    assert.equal(importDone, false, 'the importer WAITS for the uncommitted erasure (key lock)')
+  }
+  const erasedB = await eraseCustomerPersonalData(customerB, { trigger: 'ON_REQUEST', userId: null })
+  assert.equal(erasedB.success, true, JSON.stringify(erasedB))
+  const importedC = await importing
+  assert.equal(importedC.success, true, JSON.stringify(importedC))
+  const linkC = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(idC) } })
+  const orderC = await db.salesOrder.findUniqueOrThrow({ where: { id: linkC.orderId } })
+  assert.ok(orderC.erasedAt, 'B: the order imported behind the committed erasure was created ERASED')
+  assert.equal(orderC.customerId, null)
+  assert.equal(await liveCustomers(), 0, 'B: no fresh identifiable customer was minted')
+  assert.equal(JSON.stringify([orderC.customerName, orderC.customerEmail, orderC.billingAddress, orderC.shippingAddress]).includes(NAME.last), false)
+  const cLines = await db.salesOrderLine.findMany({ where: { orderId: orderC.id } })
+  assert.equal(JSON.stringify(cLines).includes(NAME.last), false)
+  const orderCClean = await db.payment.findMany({ where: { orderId: orderC.id } })
+  assert.ok(orderCClean.every((p) => p.reference === null))
+})
+
+test('[erasure] the storefront MIRROR (an order erased on its own, taking its last-order customer with it) waits for an import of that customer\'s order, and erases what the import committed', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { eraseOrderPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const idM = fx.externalId + 41
+  t.after(async () => {
+    beforeUpsertCustomer = null
+    const link = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(idM) }, select: { orderId: true } })
+    if (link) { await db.payment.deleteMany({ where: { orderId: link.orderId } }); await db.accountingSyncLog.deleteMany({ where: { referenceId: link.orderId } }); await db.activityLog.deleteMany({ where: { entityId: link.orderId } }); await db.salesOrderLine.deleteMany({ where: { orderId: link.orderId } }); await db.shoppingOrderLink.deleteMany({ where: { orderId: link.orderId } }); await db.salesOrder.deleteMany({ where: { id: link.orderId } }) }
+    await db.storefrontCustomerErasureTombstone.deleteMany({})
+    await fx.cleanup()
+  })
+  let erasedDone = false
+  let erasing: Promise<unknown> = Promise.resolve()
+  beforeUpsertCustomer = async () => {
+    beforeUpsertCustomer = null
+    erasing = eraseOrderPersonalData(fx.orderId, { trigger: 'MIRRORED_FROM_STOREFRONT', userId: null }).then((r) => { erasedDone = true; return r })
+    await new Promise((r) => setTimeout(r, 1500))
+    assert.equal(erasedDone, false, 'the mirror erasure WAITS for the importer (key lock before the customer row lock)')
+  }
+  const imported = await importWcOrder({ ...(payload(idM, wcRateId) as object), customer_id: fx.wooCustomerId } as never)
+  assert.equal(imported.success, true, JSON.stringify(imported))
+  const erased = (await erasing) as { success: boolean }
+  assert.equal(erased.success, true)
+  const link = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(idM) } })
+  const imported2 = await db.salesOrder.findUniqueOrThrow({ where: { id: link.orderId } })
+  // the first order was erased on its own; the customer keeps the second live order the importer committed first, so the customer is NOT erased and that order is live
+  assert.equal(imported2.erasedAt, null)
+  assert.ok((await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })).erasedAt, 'the mirrored order is erased')
 })
