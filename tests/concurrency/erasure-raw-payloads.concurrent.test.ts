@@ -894,3 +894,41 @@ test('[raw payloads] EVERY erased-on-create path maps the projection: a marked p
     assert.equal(money(r), money(normal), `${label}: money, tax, lines and receipt equal a normal import of the same order`)
   }
 })
+
+test('[raw payloads] the erasure\'s own customer-id scans apply the tombstone cutoff: a delivery or queue row for an order created AFTER the erasure, present while it runs, stays live (no projection, no obligation) and imports normally; a pre-erasure one is still projected', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const cleanups: Array<() => Promise<void>> = []
+  const preId = fx.externalId + 4_100_000_000
+  const postId = fx.externalId + 4_200_000_000
+  t.after(async () => {
+    for (const c of cleanups) await c()
+    const link = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(postId) } })
+    if (link) { const o = await db.salesOrder.findUnique({ where: { id: link.orderId } }); await db.payment.deleteMany({ where: { orderId: link.orderId } }); await db.accountingSyncLog.deleteMany({ where: { referenceId: link.orderId } }); await db.salesOrderLine.deleteMany({ where: { orderId: link.orderId } }); await db.activityLog.deleteMany({ where: { entityId: link.orderId } }); await db.shoppingOrderLink.deleteMany({ where: { orderId: link.orderId } }); await db.salesOrder.deleteMany({ where: { id: link.orderId } }); if (o?.customerId) { await db.shoppingCustomerLink.deleteMany({ where: { customerId: o.customerId } }); await db.customer.deleteMany({ where: { id: o.customerId } }) } }
+    await db.storefrontOrderErasureObligation.deleteMany({ where: { externalOrderId: { in: [String(preId), String(postId)] } } })
+    await db.storefrontCustomerErasureTombstone.deleteMany({})
+    await fx.cleanup()
+  })
+  const rate = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const future = new Date(Date.now() + 86_400_000).toISOString().slice(0, 19)
+  const body = (id: number, created: string) => rawOrder(fx, rate, { id, number: String(id), date_created_gmt: created, date_created: created })
+  const mkEv = async (b: unknown) => { const row = await db.shoppingWebhookEvent.create({ data: { connector: 'woocommerce', resource: 'orders', topic: 'order.created', payloadHash: sha(randomUUID()), payloadJson: b as never, status: 'PENDING' } }); cleanups.push(async () => { await db.shoppingWebhookEvent.deleteMany({ where: { id: row.id } }) }); return row.id }
+  const mkQ = async (id: number, created: string) => { const row = await db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', externalId: String(id), payload: { reason: 'missing_fx_rate', connector: 'woocommerce', externalOrderId: String(id), externalOrderNumber: String(id), currency: 'GBP', asOf: null, order: body(id, created) } as never } }); cleanups.push(async () => { await db.shoppingSyncLog.deleteMany({ where: { id: row.id } }) }); return row.id }
+  const preEv = await mkEv(body(preId, '2020-01-01T00:00:00'))
+  const postEv = await mkEv(body(postId, future))
+  const preQ = await mkQ(preId, '2020-01-01T00:00:00')
+  const postQ = await mkQ(postId, future)
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  assert.deepEqual(leaks(await ev(db, preEv)), [], 'the pre-erasure delivery is projected')
+  assert.deepEqual(leaks(await lg(db, preQ)), [], 'the pre-erasure queue row is projected')
+  assert.equal(await db.storefrontOrderErasureObligation.count({ where: { externalOrderId: String(preId), retiredAt: null } }), 1)
+  assert.ok(leaks((await ev(db, postEv)).payloadJson).length > 3, 'the post-erasure delivery stays live')
+  assert.ok(leaks(await lg(db, postQ)).length > 3, 'the post-erasure queue row stays live')
+  assert.equal(await db.storefrontOrderErasureObligation.count({ where: { externalOrderId: String(postId) } }), 0, 'no obligation for the post-erasure order')
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const r = await importWcOrder(body(postId, future) as never)
+  assert.equal(r.success, true, JSON.stringify(r))
+  const link = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(postId) } })
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: link.orderId } })).erasedAt, null, 'it imports as a live order')
+})

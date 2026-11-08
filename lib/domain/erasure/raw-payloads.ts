@@ -56,10 +56,12 @@ export type RawPayloadSubject = {
 const chunks = <T,>(items: T[], size = 100): T[][] => Array.from({ length: Math.ceil(items.length / size) }, (_, i) => items.slice(i * size, (i + 1) * size))
 const text = (ids: string[]) => Prisma.sql`${ids}::text[]`
 
+// The customer-keyed half uses the TOMBSTONE rule itself (gdpr_payload_customer_tombstoned: the customer id hashes to a tombstone and the order was created at or
+// before the erasure time written to it a moment earlier in this transaction), so an order created AFTER the erasure is never swept and the rule lives in one place.
 function webhookWhere(subject: Pick<RawPayloadSubject, 'storefrontOrderIds' | 'storefrontCustomerIds'>): Prisma.Sql {
   return Prisma.sql`w."connector" = 'woocommerce' AND w."resource" IN ('orders', 'refunds')
     AND (gdpr_webhook_order_key(w."payloadJson", w."resource") = ANY(${text(subject.storefrontOrderIds)})
-         OR (w."resource" = 'orders' AND (w."payloadJson"->>'customer_id') = ANY(${text(subject.storefrontCustomerIds)})))`
+         OR (w."resource" = 'orders' AND gdpr_payload_customer_tombstoned(w."payloadJson")))`
 }
 const syncLogDirty = Prisma.sql`gdpr_sync_log_row_dirty(l)`
 const webhookDirty = Prisma.sql`(w."payloadJson" IS DISTINCT FROM gdpr_project_webhook_payload(w."payloadJson", w."resource")
@@ -95,7 +97,7 @@ export async function scrubRawPayloadsInTx(tx: Client, subject: RawPayloadSubjec
   if (subject.storefrontCustomerIds.length > 0) {
     // The queue snapshots of the same person's orders IMS never imported carry the customer id inside `order`: their order ids are found too.
     const queued = await tx.$queryRaw<Array<{ k: string | null }>>`
-      SELECT DISTINCT l."externalId" AS k FROM "shopping_sync_logs" l WHERE (l."payload"->'order'->>'customer_id') = ANY(${text(subject.storefrontCustomerIds)})`
+      SELECT DISTINCT l."externalId" AS k FROM "shopping_sync_logs" l WHERE l."payload" IS NOT NULL AND jsonb_typeof(l."payload") = 'object' AND gdpr_payload_customer_tombstoned(l."payload"->'order')`
     const keys = await tx.$queryRaw<Array<{ k: string }>>`
       SELECT DISTINCT gdpr_webhook_order_key(w."payloadJson", w."resource") AS k FROM "shopping_webhook_events" w
        WHERE ${webhookWhere({ storefrontOrderIds: [], storefrontCustomerIds: subject.storefrontCustomerIds })}`
