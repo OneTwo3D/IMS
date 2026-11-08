@@ -102,19 +102,20 @@ export type ErasureWarehouseSummary = {
   open: number
   /** Linked orders that were cancelled in the warehouse. */
   cancelled: number
-  /** Orders with a link that never reached the warehouse (no warehouse order id): nothing is held there. */
+  /** Links with no warehouse order id that the push code PROVES were never sent (its own no-remote-call predicate): nothing is held there. */
   notPushed: number
   /**
-   * Links with NO warehouse order id where a create WAS attempted or claimed (the create is claimed immediately before the remote call, so a worker killed mid-push, a
-   * timeout or a repeated remote failure can leave an order that exists in the warehouse with no id recorded): the outcome is unknown, so each is listed for the operator
-   * to VERIFY in the warehouse. Never read as "nothing held".
+   * Orders IMS cannot PROVE are gone from, or never reached, the warehouse: a link with no warehouse order id that the push code does not prove was never sent (a create is
+   * claimed immediately before the remote call, so a killed worker, a timeout, a replay that cleared the attempt columns or an old link with no claim history can all leave an
+   * order in the warehouse with no id here), and a CANCELLED link whose cancellation the warehouse did not confirm (it answered NOT_FOUND, or no evidence is kept). Each is
+   * listed for the operator to VERIFY. Never read as "nothing held".
    */
   ambiguous: number
   /** Links parked MERGED (the warehouse merged the order into another: the data lives on under the combined order). Counted inside despatched/open too. */
   merged: number
   openOrders: Array<{ orderId: string; warehouseOrderNumber: string | null }>
-  /** The ambiguous orders, by surrogate order id (no warehouse order number is known). */
-  ambiguousOrders: Array<{ orderId: string }>
+  /** The ambiguous orders, by surrogate order id and, when one is recorded, the warehouse order number. */
+  ambiguousOrders: Array<{ orderId: string; warehouseOrderNumber: string | null }>
 }
 
 export const EMPTY_WAREHOUSE_SUMMARY: ErasureWarehouseSummary = { linkedOrders: 0, despatched: 0, open: 0, cancelled: 0, notPushed: 0, ambiguous: 0, merged: 0, openOrders: [], ambiguousOrders: [] }

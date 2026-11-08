@@ -69,9 +69,9 @@ export default async function ErasureRecordsPage() {
               )}
               {r.warehouse && r.warehouse.ambiguousOrders.length > 0 && (
                 <div className="rounded border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900">
-                  <p className="font-medium">A create was sent to the warehouse for these orders and its outcome was never recorded. Check each in the warehouse system and handle it by hand if it exists:</p>
+                  <p className="font-medium">IMS cannot prove these orders are gone from the warehouse (a create whose outcome was never recorded, or a cancellation the warehouse did not confirm). Check each in the warehouse system and handle it by hand if it exists:</p>
                   <ul className="mt-1 list-disc pl-5">
-                    {r.warehouse.ambiguousOrders.map((o) => (<li key={o.orderId}>IMS order {o.orderId}</li>))}
+                    {r.warehouse.ambiguousOrders.map((o) => (<li key={o.orderId}>IMS order {o.orderId}{o.warehouseOrderNumber ? `, warehouse order ${o.warehouseOrderNumber}` : ''}</li>))}
                   </ul>
                 </div>
               )}

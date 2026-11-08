@@ -33,7 +33,7 @@ export function readErasureRecord(metadata: unknown, fallbackDate: Date): Erasur
         openOrders: Array.isArray(w.openOrders)
           ? w.openOrders.filter(isObject).map((o) => ({ orderId: String(o.orderId ?? ''), warehouseOrderNumber: typeof o.warehouseOrderNumber === 'string' ? o.warehouseOrderNumber : null }))
           : [],
-        ambiguousOrders: Array.isArray(w.ambiguousOrders) ? w.ambiguousOrders.filter(isObject).map((o) => ({ orderId: String(o.orderId ?? '') })) : [],
+        ambiguousOrders: Array.isArray(w.ambiguousOrders) ? w.ambiguousOrders.filter(isObject).map((o) => ({ orderId: String(o.orderId ?? ''), warehouseOrderNumber: typeof o.warehouseOrderNumber === 'string' ? o.warehouseOrderNumber : null })) : [],
       }
     : null
   return {
