@@ -2731,3 +2731,36 @@ test('[erasure] FORCED INTERLEAVINGS of a customer erasure and an import of that
   const orderCClean = await db.payment.findMany({ where: { orderId: orderC.id } })
   assert.ok(orderCClean.every((p) => p.reference === null))
 })
+
+test('[erasure] the storefront MIRROR (an order erased on its own, taking its last-order customer with it) waits for an import of that customer\'s order, and erases what the import committed', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { eraseOrderPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const wcRateId = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const idM = fx.externalId + 41
+  t.after(async () => {
+    beforeUpsertCustomer = null
+    const link = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(idM) }, select: { orderId: true } })
+    if (link) { await db.payment.deleteMany({ where: { orderId: link.orderId } }); await db.accountingSyncLog.deleteMany({ where: { referenceId: link.orderId } }); await db.activityLog.deleteMany({ where: { entityId: link.orderId } }); await db.salesOrderLine.deleteMany({ where: { orderId: link.orderId } }); await db.shoppingOrderLink.deleteMany({ where: { orderId: link.orderId } }); await db.salesOrder.deleteMany({ where: { id: link.orderId } }) }
+    await db.storefrontCustomerErasureTombstone.deleteMany({})
+    await fx.cleanup()
+  })
+  let erasedDone = false
+  let erasing: Promise<unknown> = Promise.resolve()
+  beforeUpsertCustomer = async () => {
+    beforeUpsertCustomer = null
+    erasing = eraseOrderPersonalData(fx.orderId, { trigger: 'MIRRORED_FROM_STOREFRONT', userId: null }).then((r) => { erasedDone = true; return r })
+    await new Promise((r) => setTimeout(r, 1500))
+    assert.equal(erasedDone, false, 'the mirror erasure WAITS for the importer (key lock before the customer row lock)')
+  }
+  const imported = await importWcOrder({ ...(payload(idM, wcRateId) as object), customer_id: fx.wooCustomerId } as never)
+  assert.equal(imported.success, true, JSON.stringify(imported))
+  const erased = (await erasing) as { success: boolean }
+  assert.equal(erased.success, true)
+  const link = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(idM) } })
+  const imported2 = await db.salesOrder.findUniqueOrThrow({ where: { id: link.orderId } })
+  // the first order was erased on its own; the customer keeps the second live order the importer committed first, so the customer is NOT erased and that order is live
+  assert.equal(imported2.erasedAt, null)
+  assert.ok((await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })).erasedAt, 'the mirrored order is erased')
+})

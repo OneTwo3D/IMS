@@ -163,6 +163,16 @@ const TRACK_TOKEN = 'TRK-RAW-777'
 const REFUND_REASON = 'Item arrived damaged, kept per the retention ruling'
 const RAW_TOKENS = [NAME.first, NAME.last, EMAIL, PHONE, COMPANY, STREET, POSTCODE, GIFT, IP, UA, ORDER_KEY_TOKEN, TRACK_TOKEN, 'Mrs Quillfeather', 'Leeds', ORDER_NOTE]
 
+/** The refund reason is free text KEPT by owner ruling: remove it (when it is a string) before looking for fragments; a non-string reason must be gone already. */
+function stripKeptText(v: unknown): string {
+  const o = JSON.parse(JSON.stringify(v ?? null)) as Record<string, unknown> | null
+  if (o && typeof o === 'object') {
+    if (typeof o.reason === 'string') delete o.reason
+    if (Array.isArray(o.refunds)) for (const r of o.refunds as Array<Record<string, unknown>>) if (r && typeof r.reason === 'string') delete r.reason
+  }
+  return JSON.stringify(o)
+}
+
 const sha = (body: string) => createHash('sha256').update(body).digest('hex')
 const rowText = (row: unknown) => JSON.stringify(row)
 const leaks = (row: unknown) => RAW_TOKENS.filter((tok) => rowText(row).includes(tok))
@@ -618,7 +628,7 @@ test('[raw payloads] meta census: every allowlisted meta key has a declared valu
     assert.equal((await db.$queryRaw<Array<{ kind: string | null }>>`SELECT gdpr_wc_meta_value_kind(${key}) AS kind`)[0]!.kind, kind, `${key} kind`)
   }
   const IDENTITY = [`${NAME.first} ${NAME.last}`, EMAIL, PHONE, STREET]
-  const shapes = (id: string): unknown[] => [id, [id], [1, 'CODE', id, id], { discount_type: id, customer_email: [id], note: id, x: { y: id } }, { [`k_${randomUUID().slice(0, 4)}`]: id }, JSON.stringify([1, 'CODE', id, '10', id]), JSON.stringify({ discount_type: id, email_restrictions: [id] })]
+  const shapes = (id: string): unknown[] => [id, [id], [1, 'CODE', id, id], { discount_type: id, customer_email: [id], note: id, x: { y: id } }, { [`k_${randomUUID().slice(0, 4)}`]: id }, JSON.stringify([1, 'CODE', id, '10', id]), JSON.stringify([id, id, id, id]), [id, id, id, id], JSON.stringify({ discount_type: id, email_restrictions: [id] })]
   for (const key of [...Object.keys(DECLARED_META_VALUE_KINDS), ...Object.keys(SCOPED_META_VALUE_KINDS)]) {
     for (const id of IDENTITY) {
       for (const shape of shapes(id)) {
@@ -818,7 +828,7 @@ test('[raw payloads] one projection is FINAL: project(project(x)) = project(x) f
       assert.deepEqual(twice, once, `projection is idempotent for ${JSON.stringify(shape).slice(0, 50)}`)
       for (const frag of [NAME.first, NAME.last, 'example.test', '7700', 'Marmalade']) {
         // the refund reason is free text KEPT by owner ruling; every other field must be clean
-        const text = JSON.stringify({ ...(once as Record<string, unknown>), refunds: undefined })
+        const text = stripKeptText(once)
         assert.equal(text.includes(frag), false, `"${frag}" survived ${JSON.stringify(shape).slice(0, 50)}`)
       }
     }
@@ -989,7 +999,7 @@ test('[raw payloads] EVERY family\'s envelope is rebuilt from typed fields: an e
   const sl = (payload: unknown, family: string) => call(db.$queryRaw<Array<{ p: unknown }>>`SELECT gdpr_project_sync_log_payload(${JSON.stringify(payload)}::jsonb, ${family}) AS p`)
   const wh = (payload: unknown, resource: string) => call(db.$queryRaw<Array<{ p: unknown }>>`SELECT gdpr_project_webhook_payload(${JSON.stringify(payload)}::jsonb, ${resource}) AS p`)
   const ev2 = (payload: unknown) => call(db.$queryRaw<Array<{ p: unknown }>>`SELECT gdpr_project_return_event(${JSON.stringify(payload)}::jsonb) AS p`)
-  const clean = (v: unknown) => { const o = JSON.parse(JSON.stringify(v ?? null)) as Record<string, unknown> | null; if (o && typeof o === 'object') { delete o.reason; delete o.refunds } return JSON.stringify(o) }
+  const clean = (v: unknown) => { const o = JSON.parse(JSON.stringify(v ?? null)) as Record<string, unknown> | null; if (o && typeof o === 'object') { if (typeof o.reason === 'string') delete o.reason; if (Array.isArray(o.refunds)) for (const r of o.refunds as Array<Record<string, unknown>>) if (r && typeof r.reason === 'string') delete r.reason } return JSON.stringify(o) }
   const order = rawOrder(fx, rate) as Record<string, unknown>
   for (const id of [FULL_NAME, EMAIL, PHONE, STREET]) {
     for (const shape of shapes(id)) {
@@ -1036,4 +1046,73 @@ test('[raw payloads] EVERY family\'s envelope is rebuilt from typed fields: an e
   const reconciled = (await lg(db, slip.id)).payload as { currency: string }
   assert.equal(reconciled.currency, 'unreadable'); assert.equal(JSON.stringify(reconciled).includes('example.test'), false)
   assert.equal(JSON.stringify((await lg(db, sweepRow.id)).payload).includes('example.test'), false, 'the erasure sweep removed the email-shaped currency')
+})
+
+test('[raw payloads] targeted gaps from the mutation pass: reason typing, single-word invoice numbers, country, the held park, error-only rows, queue rows of a tombstoned account, undated deliveries, the sync-log recheck, storefrontIdMissing', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const cleanups: Array<() => Promise<void>> = []
+  t.after(async () => { await db.$executeRawUnsafe('DROP TRIGGER IF EXISTS test_undo_sync_projection ON "shopping_sync_logs"'); await db.$executeRawUnsafe('DROP FUNCTION IF EXISTS test_undo_sync_projection()'); await db.$executeRawUnsafe('ALTER TABLE "shopping_webhook_events" ENABLE TRIGGER "shopping_webhook_events_erased_projection"'); for (const c of cleanups) await c(); await db.storefrontOrderErasureObligation.deleteMany({ where: { externalOrderId: { in: [String(undatedId), String(queuedId)] } } }); await db.storefrontCustomerErasureTombstone.deleteMany({}); await fx.cleanup() })
+  const undatedId = fx.externalId + 7_100_000_000
+  const queuedId = fx.externalId + 7_200_000_000
+  const rate = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const one = async (q: Promise<Array<{ p: unknown }>>) => (await q)[0]!.p
+
+  // reason: a non-string is the empty string; a string is kept (owner ruling)
+  const r1 = await one(db.$queryRaw<Array<{ p: unknown }>>`SELECT gdpr_project_wc_refund(${JSON.stringify({ id: 1, reason: { who: FULL_NAME }, amount: '1.00' })}::jsonb) AS p`) as { reason: string }
+  assert.equal(r1.reason, '')
+  const r2 = await one(db.$queryRaw<Array<{ p: unknown }>>`SELECT gdpr_project_wc_refund(${JSON.stringify({ id: 1, reason: REFUND_REASON, amount: '1.00' })}::jsonb) AS p`) as { reason: string }
+  assert.equal(r2.reason, REFUND_REASON)
+  // a single-word name is not an invoice number (a document number has a digit)
+  assert.equal(await one(db.$queryRaw<Array<{ p: unknown }>>`SELECT gdpr_project_meta_value('_wcpdf_invoice_number', ${JSON.stringify(NAME.last)}::jsonb) AS p`), null)
+  assert.equal(await one(db.$queryRaw<Array<{ p: unknown }>>`SELECT gdpr_project_meta_value('_wcpdf_invoice_number', ${JSON.stringify('INV-2026-17')}::jsonb) AS p`), 'INV-2026-17')
+  // the country is two letters or nothing
+  const addr = await one(db.$queryRaw<Array<{ p: unknown }>>`SELECT gdpr_empty_address(${JSON.stringify({ country: EMAIL })}::jsonb) AS p`) as { country: string }
+  assert.equal(addr.country, '')
+
+  // a held-invoice park keeps its STRUCTURE and its fixed error text through the sweep (the contact step owns its contact block)
+  const held = await db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', entityId: fx.orderId, externalId: String(fx.externalId), recordKind: 'WC_HELD_SALES_INVOICE', payload: { reason: 'missing_wc_invoice_number', accountingPayload: { contactName: 'Held Name', lines: [{ amount: 1 }] } }, errorMessage: 'Waiting for _wcpdf_invoice_number on WooCommerce order 1' } })
+  cleanups.push(async () => { await db.shoppingSyncLog.deleteMany({ where: { id: held.id } }) })
+  // an error-only row: NO payload at all, identity in its error text
+  const errOnly = await db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'TO_CONNECTOR', status: 'FAILED', entityType: 'SalesOrder', entityId: fx.orderId, externalId: String(fx.externalId), errorMessage: `push failed for ${FULL_NAME}` } })
+  cleanups.push(async () => { await db.shoppingSyncLog.deleteMany({ where: { id: errOnly.id } }) })
+  // the sync-log recheck: a saboteur that restores the payload makes the erasure FAIL and roll back
+  const sab = await db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', entityId: fx.orderId, externalId: '5551', recordKind: 'WC_REFUND_PARK', payload: rawRefund(fx) } })
+  cleanups.push(async () => { await db.shoppingSyncLog.deleteMany({ where: { id: sab.id } }) })
+  await db.$executeRawUnsafe(`CREATE FUNCTION test_undo_sync_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD."id" = '${sab.id}' THEN NEW."payload" := OLD."payload"; END IF; RETURN NEW; END $$`)
+  await db.$executeRawUnsafe('CREATE TRIGGER test_undo_sync_projection BEFORE UPDATE OF "payload" ON "shopping_sync_logs" FOR EACH ROW EXECUTE FUNCTION test_undo_sync_projection()')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const failed = await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })
+  assert.equal(failed.success, false, 'a sync-log row left raw fails the erasure')
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })).erasedAt, null)
+  await db.$executeRawUnsafe('DROP TRIGGER test_undo_sync_projection ON "shopping_sync_logs"')
+
+  // storefrontIdMissing: an order that looks like a storefront order but has no link is COUNTED in the proof
+  await db.shoppingOrderLink.deleteMany({ where: { orderId: fx.orderId } })
+  const ok = await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })
+  assert.equal(ok.success, true, JSON.stringify(ok))
+  const proof = await db.activityLog.findFirstOrThrow({ where: { action: 'gdpr_erasure_recorded', entityId: fx.customerId } })
+  assert.equal((proof.metadata as { counts: { storefrontIdMissing: number } }).counts.storefrontIdMissing, 1)
+  const heldAfter = await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } })
+  assert.equal((heldAfter.payload as { accountingPayload: { lines: unknown[] } }).accountingPayload.lines.length, 1, 'the held park keeps its structure')
+  assert.equal(heldAfter.errorMessage, 'Waiting for _wcpdf_invoice_number on WooCommerce order 1', 'and its fixed error text')
+  const errAfter = await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: errOnly.id } })
+  assert.deepEqual(leaks(errAfter), [], 'an error-only row is cleared'); assert.equal(errAfter.errorMessage, 'Text removed by GDPR erasure')
+
+  // tombstone: a queue row of an unimported order of the erased account is found by the rule alone; an undated delivery counts as BEFORE the erasure
+  await db.$executeRawUnsafe('ALTER TABLE "shopping_sync_logs" DISABLE TRIGGER "shopping_sync_logs_erased_projection"')
+  const queued = await db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', externalId: String(queuedId), payload: { reason: 'missing_fx_rate', connector: 'woocommerce', externalOrderId: String(queuedId), externalOrderNumber: String(queuedId), currency: 'GBP', asOf: null, order: rawOrder(fx, rate, { id: queuedId, number: String(queuedId), date_created_gmt: '2020-01-01T00:00:00' }) } as never } })
+  cleanups.push(async () => { await db.shoppingSyncLog.deleteMany({ where: { id: queued.id } }) })
+  await db.$executeRawUnsafe('ALTER TABLE "shopping_sync_logs" ENABLE TRIGGER "shopping_sync_logs_erased_projection"')
+  await db.$executeRawUnsafe('ALTER TABLE "shopping_webhook_events" DISABLE TRIGGER "shopping_webhook_events_erased_projection"')
+  const undatedBody = { ...(rawOrder(fx, rate, { id: undatedId, number: String(undatedId) }) as Record<string, unknown>) }
+  delete undatedBody.date_created_gmt; delete undatedBody.date_created
+  const undated = await db.shoppingWebhookEvent.create({ data: { connector: 'woocommerce', resource: 'orders', topic: 'order.created', payloadHash: sha(randomUUID()), payloadJson: undatedBody as never, status: 'PENDING' } })
+  cleanups.push(async () => { await db.shoppingWebhookEvent.deleteMany({ where: { id: undated.id } }) })
+  await db.$executeRawUnsafe('ALTER TABLE "shopping_webhook_events" ENABLE TRIGGER "shopping_webhook_events_erased_projection"')
+  const { reconcileRawPayloads } = await import('@/lib/domain/erasure/raw-payloads')
+  const out = await reconcileRawPayloads(db)
+  assert.equal(out.remaining, 0)
+  assert.deepEqual(leaks(await lg(db, queued.id)), [], 'the queue row of a tombstoned, unimported account is projected by the reconcile')
+  assert.deepEqual(leaks((await ev(db, undated.id)).payloadJson), [], 'an undated delivery counts as before the erasure')
 })
