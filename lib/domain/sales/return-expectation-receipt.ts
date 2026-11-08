@@ -45,6 +45,8 @@ export type ReceiptLineCandidate = {
   qtyReceived: DecimalInput
   qtyWrittenOff: DecimalInput
   costSnapshot: unknown
+  /** False while the refund's accounting staging has not valued the document yet. */
+  valued: boolean
 }
 
 export type ReceiptChunk = {
@@ -58,7 +60,15 @@ export type ReceiptChunk = {
   valueBase: Decimal
 }
 
-export type ReceiptPlan = { chunks: ReceiptChunk[]; remainder: Decimal }
+export type ReceiptPlan = {
+  chunks: ReceiptChunk[]
+  remainder: Decimal
+  /**
+   * The oldest open expectation that would absorb a unit of this arrival is not valued yet. Nothing may be received
+   * until it is: the arrival is held whole, and no quantity falls through to the plain restock.
+   */
+  awaitingValuation: boolean
+}
 
 function parseEntries(snapshot: unknown): ReturnExpectationCostEntry[] {
   if (!Array.isArray(snapshot)) throw new ReturnExpectationError('snapshot_unreadable')
@@ -117,6 +127,8 @@ export function planReturnReceipt(qty: DecimalInput, candidates: readonly Receip
     if (compareDecimal(remaining, 0) <= 0) break
     const outstanding = subtractMoney(subtractMoney(candidate.qty, candidate.qtyReceived), candidate.qtyWrittenOff)
     if (compareDecimal(outstanding, 0) <= 0) continue
+    // Oldest first, valued or not: an unvalued document that would take units holds the whole arrival.
+    if (!candidate.valued) return { chunks: [], remainder: roundQuantity(qty, 6), awaitingValuation: true }
     const take = outstanding.lt(remaining) ? outstanding : remaining
     const entries = parseEntries(candidate.costSnapshot)
     const received = toDecimal(candidate.qtyReceived)
@@ -128,7 +140,7 @@ export function planReturnReceipt(qty: DecimalInput, candidates: readonly Receip
     chunks.push({ lineId: candidate.lineId, expectationId: candidate.expectationId, qty: roundQuantity(take, 6), entries: sliced, valueBase })
     remaining = remaining.sub(take)
   }
-  return { chunks, remainder: roundQuantity(remaining, 6) }
+  return { chunks, remainder: roundQuantity(remaining, 6), awaitingValuation: false }
 }
 
 export type ReceiptAccounting = {
@@ -176,6 +188,7 @@ type Candidate = {
   qty_received: Prisma.Decimal
   qty_written_off: Prisma.Decimal
   cost_snapshot: unknown
+  valued: boolean
 }
 
 /**
@@ -195,12 +208,11 @@ export async function receiveReturnAgainstExpectationsTx(
   },
 ): Promise<ReceiveAgainstExpectationsResult> {
   const candidates = await tx.$queryRaw<Candidate[]>(Prisma.sql`
-    SELECT l.id AS line_id, l.expectation_id, l.qty, l.qty_received, l.qty_written_off, l.cost_snapshot
+    SELECT l.id AS line_id, l.expectation_id, l.qty, l.qty_received, l.qty_written_off, l.cost_snapshot, (e.valued_at IS NOT NULL) AS valued
       FROM return_expectation_lines l
       JOIN return_expectations e ON e.id = l.expectation_id
      WHERE e.order_id = ${params.orderId}
        AND l.product_id = ${params.productId}
-       AND e.valued_at IS NOT NULL
        AND e.status IN ('IN_TRANSIT', 'PARTIALLY_RECEIVED', 'PARTIALLY_WRITTEN_OFF')
        AND l.qty > l.qty_received + l.qty_written_off
      ORDER BY e.created_at ASC, e.id ASC, l.created_at ASC, l.id ASC
@@ -212,7 +224,11 @@ export async function receiveReturnAgainstExpectationsTx(
     qtyReceived: row.qty_received,
     qtyWrittenOff: row.qty_written_off,
     costSnapshot: row.cost_snapshot,
+    valued: row.valued,
   })))
+  // HELD, not restocked: an operator re-runs the restock from the returns inbox once the refund is valued (nothing
+  // retries it by itself). Throwing rolls back the caller's transaction; nothing has been written yet.
+  if (plan.awaitingValuation) throw new ReturnExpectationError('awaiting_refund_valuation')
 
   const rows: ReceiptRow[] = []
   for (const chunk of plan.chunks) {
@@ -238,8 +254,8 @@ export async function receiveReturnAgainstExpectationsTx(
     const expectation = await tx.returnExpectation.findUniqueOrThrow({
       where: { id: expectationId },
       select: {
-        id: true, reference: true, refundId: true, transitJournalKey: true,
-        lines: { select: { qty: true, qtyReceived: true, qtyWrittenOff: true } },
+        id: true, reference: true, refundId: true, transitJournalKey: true, transitDebitBase: true,
+        lines: { select: { id: true, qty: true, qtyReceived: true, qtyWrittenOff: true, costSnapshot: true } },
       },
     })
     const status = deriveReturnExpectationStatus(expectation.lines)
@@ -247,16 +263,49 @@ export async function receiveReturnAgainstExpectationsTx(
       where: { id: expectationId },
       data: { status, closedAt: status === 'RECEIVED' || status === 'WRITTEN_OFF' ? new Date() : null },
     })
+    // Nothing debited transit for this refund (accounting was off): no ledger movement to clear.
+    if (!expectation.transitJournalKey || expectation.transitDebitBase == null) continue
 
-    const value = plan.chunks
-      .filter((chunk) => chunk.expectationId === expectationId)
-      .reduce((sum, chunk) => sum.add(chunk.valueBase), toDecimal(0))
-    // Nothing debited transit for this refund (accounting was off), or nothing is priced: no ledger movement to clear.
-    if (!expectation.transitJournalKey || compareDecimal(value, 0) <= 0) continue
+    // CUMULATIVE, not per arrival: the amount an arrival clears is round(value of everything received after it) minus
+    // round(value of everything received before it), so cents are never lost to per-arrival rounding (3 x 0.333333
+    // clears 1.00, not 0.99) and an arrival too small to move a cent carries its value forward. The arrival that closes
+    // the document clears exactly what the refund posted, whatever the snapshot arithmetic says.
+    const chunkQtyByLine = new Map<string, Decimal>()
+    for (const chunk of plan.chunks.filter((c) => c.expectationId === expectationId)) {
+      chunkQtyByLine.set(chunk.lineId, (chunkQtyByLine.get(chunk.lineId) ?? toDecimal(0)).add(chunk.qty))
+    }
+    let before = toDecimal(0)
+    let after = toDecimal(0)
+    for (const line of expectation.lines) {
+      const entries = parseEntries(line.costSnapshot)
+      const receivedAfter = toDecimal(line.qtyReceived)
+      const receivedBefore = receivedAfter.sub(chunkQtyByLine.get(line.id) ?? 0)
+      before = before.add(cumulativeSnapshotValue(entries, receivedBefore))
+      after = after.add(cumulativeSnapshotValue(entries, receivedAfter))
+    }
+    const closes = status === 'RECEIVED' || status === 'WRITTEN_OFF'
+    const postedCents = roundQuantity(expectation.transitDebitBase, 2)
+    const cents = subtractMoney(closes ? postedCents : roundQuantity(after, 2), roundQuantity(before, 2))
+    if (compareDecimal(cents, 0) <= 0) continue
+    // The sub-ledger equals the journal, except that the closing arrival also clears the sub-penny residue the refund's
+    // 6dp row holds, so the document's rows net to exactly zero.
+    let subledgerBase = cents
+    if (closes) {
+      const prior = await tx.transitSubledgerMovement.aggregate({
+        where: {
+          sourceType: 'CUSTOMER_RETURN_IN_TRANSIT',
+          sourceRef: expectation.refundId,
+          idempotencyKey: { startsWith: `return-expectation-receipt:${expectation.id}:` },
+        },
+        _sum: { baseDelta: true },
+      })
+      subledgerBase = subtractMoney(expectation.transitDebitBase, subtractMoney(0, prior._sum.baseDelta ?? 0))
+    }
     await clearTransitInLedger(tx, {
       expectation: { id: expectation.id, reference: expectation.reference, refundId: expectation.refundId },
       inboxId: params.inboxId,
-      valueBase: value,
+      amount: cents.toNumber(),
+      subledgerBase,
       arrivedAt: params.arrivedAt,
       accounting: params.accounting,
     })
@@ -275,7 +324,10 @@ async function clearTransitInLedger(
   params: {
     expectation: { id: string; reference: string; refundId: string }
     inboxId: string
-    valueBase: Decimal
+    /** Cents to journal (2dp). */
+    amount: number
+    /** The sub-ledger movement magnitude (6dp). */
+    subledgerBase: Decimal
     arrivedAt: Date
     accounting: ReceiptAccounting
   },
@@ -302,7 +354,7 @@ async function clearTransitInLedger(
   // accounts are mapped. Posting to a guessed account would put value in the wrong place.
   if (!accounts.inventoryAccount || !accounts.transitAccount) throw new ReturnExpectationError('arrival_accounts_not_configured')
 
-  const amount = roundQuantity(params.valueBase, 2).toNumber()
+  const amount = params.amount
   if (amount <= 0) return
   const payload = {
     date: params.arrivedAt.toISOString().slice(0, 10),
@@ -328,7 +380,7 @@ async function clearTransitInLedger(
       sourceType: 'CUSTOMER_RETURN_IN_TRANSIT',
       sourceRef: params.expectation.refundId,
       idempotencyKey,
-      baseDelta: params.valueBase.neg(),
+      baseDelta: params.subledgerBase.neg(),
       journalDate: payload.date,
     })
     return

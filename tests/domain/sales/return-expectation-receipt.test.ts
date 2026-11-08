@@ -32,8 +32,8 @@ mock.module('@/lib/domain/accounting/transit-subledger-movement', {
 const mod = import('../../../lib/domain/sales/return-expectation-receipt')
 
 const entry = (qty: string, unitCostBase: string | null) => ({ qty, unitCostBase, poLineId: null, sourceCostLayerId: null })
-const candidate = (id: string, qty: string, received: string, snapshot: unknown[], expectationId = `e-${id}`) => ({
-  lineId: id, expectationId, qty, qtyReceived: received, qtyWrittenOff: '0', costSnapshot: snapshot,
+const candidate = (id: string, qty: string, received: string, snapshot: unknown[], expectationId = `e-${id}`, valued = true) => ({
+  lineId: id, expectationId, qty, qtyReceived: received, qtyWrittenOff: '0', costSnapshot: snapshot, valued,
 })
 
 test('the oldest line is cleared first, a short arrival leaves the next line untouched', async () => {
@@ -82,20 +82,33 @@ test('an unreadable snapshot is refused, never read as free stock', async () => 
   assert.throws(() => planReturnReceipt(1, [candidate('a', '1', '0', 'nope' as unknown as unknown[])]), /snapshot_unreadable/)
 })
 
-type Line = { id: string; expectation_id: string; qty: Prisma.Decimal; qty_received: Prisma.Decimal; qty_written_off: Prisma.Decimal; cost_snapshot: unknown[] }
+type Line = { id: string; expectation_id: string; qty: Prisma.Decimal; qty_received: Prisma.Decimal; qty_written_off: Prisma.Decimal; cost_snapshot: unknown[]; valued?: boolean }
 
-function fakeTx(lines: Line[], expectation: { transitJournalKey: string | null }) {
+function fakeTx(lines: Line[], expectation: { transitJournalKey: string | null; transitDebitBase?: string }) {
   const updates: Array<Record<string, unknown>> = []
   const logs: Array<Record<string, unknown>> = []
+  const open = () => lines.filter((l) => l.qty.gt(l.qty_received.add(l.qty_written_off)))
   const tx = {
-    $queryRaw: async () => lines.map((l) => ({ line_id: l.id, expectation_id: l.expectation_id, qty: l.qty, qty_received: l.qty_received, qty_written_off: l.qty_written_off, cost_snapshot: l.cost_snapshot })),
-    returnExpectationLine: { update: async (args: Record<string, unknown>) => { updates.push(args) } },
+    $queryRaw: async () => open().map((l) => ({ line_id: l.id, expectation_id: l.expectation_id, qty: l.qty, qty_received: l.qty_received, qty_written_off: l.qty_written_off, cost_snapshot: l.cost_snapshot, valued: l.valued ?? true })),
+    returnExpectationLine: {
+      update: async (args: { where: { id: string }; data: { qtyReceived: { increment: string } } }) => {
+        updates.push(args)
+        const line = lines.find((l) => l.id === args.where.id)!
+        line.qty_received = line.qty_received.add(args.data.qtyReceived.increment)
+      },
+    },
     returnExpectation: {
       findUniqueOrThrow: async () => ({
         id: 'e-1', reference: 'RX-CN-1', refundId: 'r-1', transitJournalKey: expectation.transitJournalKey,
-        lines: lines.map((l) => ({ qty: l.qty, qtyReceived: l.qty_received.add(1), qtyWrittenOff: l.qty_written_off })),
+        transitDebitBase: new Prisma.Decimal(expectation.transitDebitBase ?? '12.5'),
+        lines: lines.map((l) => ({ id: l.id, qty: l.qty, qtyReceived: l.qty_received, qtyWrittenOff: l.qty_written_off, costSnapshot: l.cost_snapshot })),
       }),
       update: async (args: Record<string, unknown>) => { updates.push(args) },
+    },
+    transitSubledgerMovement: {
+      aggregate: async () => ({
+        _sum: { baseDelta: subledger.reduce((sum, r) => sum.add(r.baseDelta as Prisma.Decimal), new Prisma.Decimal(0)) },
+      }),
     },
     activityLog: { create: async (args: Record<string, unknown>) => { logs.push(args) } },
   }
@@ -103,8 +116,8 @@ function fakeTx(lines: Line[], expectation: { transitJournalKey: string | null }
 }
 
 const oneLine = (): Line[] => [{ id: 'l-1', expectation_id: 'e-1', qty: new Prisma.Decimal(1), qty_received: new Prisma.Decimal(0), qty_written_off: new Prisma.Decimal(0), cost_snapshot: [entry('1', '12.5')] }]
-const params = (accounting: { connector: 'xero' | null; syncEnabled: boolean }) => ({
-  inboxId: 'in-1', orderId: 'o-1', productId: 'p-1', qty: 1, arrivedAt: new Date('2026-11-03T10:00:00Z'), accounting,
+const params = (accounting: { connector: 'xero' | null; syncEnabled: boolean }, qty = 1) => ({
+  inboxId: 'in-1', orderId: 'o-1', productId: 'p-1', qty, arrivedAt: new Date('2026-11-03T10:00:00Z'), accounting,
 })
 
 test('arrival queues DR Inventory / CR Stock in Transit dated the arrival, and records the negative transit row on the queue answer', async () => {
@@ -155,4 +168,62 @@ test('a refund that never debited transit (no journal key) clears no ledger valu
   assert.equal(queued.length, 0)
   assert.equal(off.logs.length, 1)
   assert.equal((off.logs[0].data as { action: string }).action, 'return_expectation_arrival_not_journalled')
+})
+
+test('an arrival is HELD whole while the oldest open expectation that would take it is unvalued, and nothing falls through to a plain restock', async () => {
+  const { planReturnReceipt, receiveReturnAgainstExpectationsTx } = await mod
+  const plan = planReturnReceipt(2, [candidate('a', '1', '0', [entry('1', '5')], 'e-a', false), candidate('b', '5', '0', [entry('5', '9')], 'e-b', true)])
+  assert.equal(plan.awaitingValuation, true, 'the older unvalued one wins over the newer valued one')
+  assert.equal(plan.chunks.length, 0)
+  // A valued older one clears first, and only then does the unvalued one hold the rest.
+  const mixed = planReturnReceipt(3, [candidate('a', '1', '0', [entry('1', '5')], 'e-a', true), candidate('b', '5', '0', [entry('5', '9')], 'e-b', false)])
+  assert.equal(mixed.awaitingValuation, true)
+  // Quantity beyond ALL open expectations is the only plain remainder; an unvalued one that is not reached holds nothing.
+  const beyond = planReturnReceipt(3, [candidate('a', '1', '0', [entry('1', '5')], 'e-a', true)])
+  assert.equal(beyond.awaitingValuation, false)
+  assert.equal(beyond.remainder.toFixed(6), '2.000000')
+
+  queued.length = 0
+  const lines = oneLine(); lines[0].valued = false
+  const { tx, updates } = fakeTx(lines, { transitJournalKey: 'k' })
+  await assert.rejects(() => receiveReturnAgainstExpectationsTx(tx, params({ connector: 'xero', syncEnabled: true })), /awaiting_refund_valuation/)
+  assert.equal(updates.length, 0, 'nothing written')
+  assert.equal(queued.length, 0)
+  // After valuation the same arrival clears once.
+  lines[0].valued = true
+  const result = await receiveReturnAgainstExpectationsTx(tx, params({ connector: 'xero', syncEnabled: true }))
+  assert.equal(result.expectationIds.length, 1)
+  assert.equal(queued.length, 1)
+})
+
+test('three one-unit arrivals at 0.333333 clear 1.00 in total and the transit sub-ledger nets to zero with the refund row', async () => {
+  const { receiveReturnAgainstExpectationsTx } = await mod
+  queued.length = 0; subledger.length = 0; enqueueAnswer = { queued: true }
+  const lines: Line[] = [{ id: 'l-1', expectation_id: 'e-1', qty: new Prisma.Decimal(3), qty_received: new Prisma.Decimal(0), qty_written_off: new Prisma.Decimal(0), cost_snapshot: [entry('3', '0.333333')] }]
+  // The refund debited 0.999999 at 6dp, which its 2dp journal posted as 1.00.
+  const { tx } = fakeTx(lines, { transitJournalKey: 'k', transitDebitBase: '0.999999' })
+  const amounts: number[] = []
+  for (let i = 0; i < 3; i += 1) {
+    const before = queued.length
+    await receiveReturnAgainstExpectationsTx(tx, { ...params({ connector: 'xero', syncEnabled: true }), inboxId: `in-${i}` })
+    amounts.push(queued.length > before ? ((queued[queued.length - 1].payload as { lines: Array<{ debit?: number }> }).lines[0].debit ?? 0) : 0)
+  }
+  assert.deepEqual(amounts, [0.33, 0.34, 0.33], 'cumulative rounding: no cent is lost between arrivals')
+  assert.equal(Number(amounts.reduce((a, b) => a + b, 0).toFixed(2)), 1)
+  const net = subledger.reduce((sum, r) => sum.add(r.baseDelta as Prisma.Decimal), new Prisma.Decimal('0.999999'))
+  assert.equal(net.toFixed(6), '0.000000')
+})
+
+test('an intermediate arrival too small to move a cent records its quantity and journals nothing, carrying the value forward', async () => {
+  const { receiveReturnAgainstExpectationsTx } = await mod
+  queued.length = 0; subledger.length = 0; enqueueAnswer = { queued: true }
+  const lines: Line[] = [{ id: 'l-1', expectation_id: 'e-1', qty: new Prisma.Decimal(3), qty_received: new Prisma.Decimal(0), qty_written_off: new Prisma.Decimal(0), cost_snapshot: [entry('3', '0.004')] }]
+  const { tx } = fakeTx(lines, { transitJournalKey: 'k', transitDebitBase: '0.012' })
+  await receiveReturnAgainstExpectationsTx(tx, params({ connector: 'xero', syncEnabled: true }))
+  assert.equal(queued.length, 0)
+  assert.equal(lines[0].qty_received.toFixed(0), '1', 'the quantity is recorded')
+  await receiveReturnAgainstExpectationsTx(tx, params({ connector: 'xero', syncEnabled: true }))
+  await receiveReturnAgainstExpectationsTx(tx, params({ connector: 'xero', syncEnabled: true }))
+  assert.equal(queued.length, 1)
+  assert.equal((queued[0].payload as { lines: Array<{ debit?: number }> }).lines[0].debit, 0.01)
 })

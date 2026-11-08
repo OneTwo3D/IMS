@@ -14,9 +14,13 @@ enabling it safe, but the write-off, the aging alert and slice 3 are not built: 
 Restocking a Mintsoft returns inbox item (`restockMintsoftReturnInboxItem`) for an order that has open, **valued**
 return expectations clears them, in the inbox transaction, under the order lock:
 
-* Matched by order and product, oldest refund first, line by line. A part-arrival clears part of a line; the units that
-  no document covers (an over-return, a refund made before the switch, no refund) are booked as the plain restock they
-  always were. An unvalued document is never cleared.
+* Matched by order and product against **all** open documents, oldest refund first, line by line. A part-arrival clears
+  part of a line; the units beyond every open document (an over-return, a refund made before the switch, no refund) are
+  booked as the plain restock they always were. If the oldest open document that would take a unit is **not valued yet**
+  (its refund's accounting staging is still running or retrying), the whole arrival is **held**: nothing is restocked,
+  not even as a plain restock, and the operator sees "held, refund not valued yet". Nothing retries it by itself: the
+  operator restocks the inbox item again once the refund is valued. An older unvalued refund is never skipped for a newer
+  valued one.
 * Stock: one `RETURN_INBOUND` movement per cleared line, with cost layers at the refund's own dispatch-cost snapshot (a
   line's snapshot is consumed in order, so the first units' cost goes to the first arrival). This also fixes the old
   inbox restock creating stock with no layer when it clears a document.
@@ -27,8 +31,11 @@ return expectations clears them, in the inbox transaction, under the order lock:
   in the same transaction, on the queue's own answer and never for a shadowed journal. A refused journal or an unmapped
   account rolls the whole arrival back (the inbox row stays unrestocked); with accounting off the arrival still books
   its stock and records a WARNING.
-* The value released is the difference of cumulative values, each rounded once at 6dp, so the pieces of a line add up to
-  exactly the value the refund put in transit.
+* The value released is cumulative: an arrival journals round(value received after it) minus round(value received
+  before it) at 2dp, so no cent is lost between arrivals (3 x 0.333333 clears 1.00) and an arrival too small to move a
+  cent records its quantity and carries the value forward. The arrival that closes the document clears exactly what the
+  refund posted (its 2dp journal total). The sub-ledger row equals the journal, except that the closing arrival also takes
+  the sub-penny residue of the refund's 6dp row, so the document's rows net to exactly zero.
 
 ## The switch
 

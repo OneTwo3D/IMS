@@ -47,7 +47,8 @@ export class ReturnExpectationError extends Error {
     | 'unvalued_document_has_accounted_quantity'
     | 'snapshot_unreadable'
     | 'arrival_accounts_not_configured'
-    | 'arrival_journal_refused') {
+    | 'arrival_journal_refused'
+    | 'awaiting_refund_valuation') {
     super(`return_expectation:${code}`)
     this.name = 'ReturnExpectationError'
   }

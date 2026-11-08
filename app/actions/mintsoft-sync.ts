@@ -7,6 +7,7 @@ import { Prisma, type WmsAsnStatus, type WmsStockMasterSystem, type WmsStockSync
 import { z } from 'zod'
 import { applyReturnInboundStockTx, type RefundReturnRow } from '@/lib/domain/sales/refund-service'
 import { readReceiptAccounting, receiveReturnAgainstExpectationsTx } from '@/lib/domain/sales/return-expectation-receipt'
+import { ReturnExpectationError } from '@/lib/domain/sales/return-expectation'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -5445,6 +5446,12 @@ export async function restockMintsoftReturnInboxItem(
       }
     })
   } catch (error) {
+    if (error instanceof ReturnExpectationError && error.code === 'awaiting_refund_valuation') {
+      return {
+        success: false,
+        error: 'This return is held: the refund it belongs to has not been valued yet (its accounting is still being staged). Nothing was restocked. Try again once the refund has been valued; nothing retries this automatically.',
+      }
+    }
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Failed to restock Mintsoft return.',

@@ -124,14 +124,37 @@ test('[db] arrival books stock and layers at the refund cost, oldest refund firs
   })
 })
 
-test('[db] an unvalued document, a legacy refund and another order are never cleared', { skip }, async () => {
+test('[db] an arrival is HELD while the oldest open document is unvalued (older unvalued beats newer valued), then clears once after valuation', { skip }, async () => {
   await withRollback(async (tx) => {
-    const fx = await seed(tx, { refunds: 1 })
-    const [r1] = fx.refunds
-    await createReturnExpectationTx(tx, { valued: false, refundId: r1.id, orderId: fx.orderId, rows: [{ productId: fx.product.id, qty: 2, refundLineId: r1.lineIds[0], unitCostBase: '10' }] })
-    assert.deepEqual((await arrive(tx, fx, 2)).expectationIds, [], 'unvalued')
+    const fx = await seed(tx, { refunds: 2 })
+    const [r1, r2] = fx.refunds
+    await createReturnExpectationTx(tx, { valued: false, refundId: r1.id, orderId: fx.orderId, creditNoteNumber: 'A', rows: [{ productId: fx.product.id, qty: 2, refundLineId: r1.lineIds[0], unitCostBase: '10' }] })
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    await createReturnExpectationTx(tx, { valued: true, refundId: r2.id, orderId: fx.orderId, creditNoteNumber: 'B', rows: [{ productId: fx.product.id, qty: 2, refundLineId: r2.lineIds[0], unitCostBase: '20' }] })
+
+    await tx.$executeRaw`SAVEPOINT held`
+    await assert.rejects(() => arrive(tx, fx, 2), /awaiting_refund_valuation/)
+    await tx.$executeRaw`ROLLBACK TO SAVEPOINT held`
+    assert.equal(await tx.stockMovement.count({ where: { productId: fx.product.id } }), 0, 'held: no stock, not even a plain restock')
+    assert.deepEqual((await tx.returnExpectationLine.findMany({})).map((l: { qtyReceived: Prisma.Decimal }) => l.qtyReceived.toFixed(0)), ['0', '0'])
+
+    // Valuation lands: the same arrival now clears the OLDER document, once.
+    await tx.returnExpectation.update({ where: { refundId: r1.id }, data: { valuedAt: new Date() } })
+    const cleared = await arrive(tx, fx, 2)
+    assert.equal(cleared.expectationIds.length, 1)
+    assert.equal(cleared.remainder.toFixed(6), '0.000000')
+    const level = await tx.stockLevel.findUnique({ where: { productId_warehouseId: { productId: fx.product.id, warehouseId: fx.warehouseId } } })
+    assert.equal(level.quantity.toFixed(0), '2')
+    assert.equal((await tx.returnExpectation.findUnique({ where: { refundId: r1.id } })).status, 'RECEIVED')
+    assert.equal((await tx.returnExpectation.findUnique({ where: { refundId: r2.id } })).status, 'IN_TRANSIT')
+  })
+})
+
+test('[db] a legacy refund and another order are never cleared', { skip }, async () => {
+  await withRollback(async (tx) => {
+    const fx = await seed(tx, { refunds: 0 })
     const other = await seed(tx, { refunds: 0 })
+    assert.deepEqual((await arrive(tx, fx, 1)).expectationIds, [], 'no document: plain')
     assert.deepEqual((await arrive(tx, { ...fx, orderId: other.orderId }, 1)).expectationIds, [], 'other order')
-    assert.equal((await tx.returnExpectationLine.findFirst({})).qtyReceived.toFixed(6), '0.000000')
   })
 })
