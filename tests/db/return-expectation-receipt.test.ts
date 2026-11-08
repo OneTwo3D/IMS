@@ -184,6 +184,10 @@ test('[db] the refund journal must be a queued row on its recorded key: absent h
     await assert.rejects(() => arrive(tx, fx, 2), /awaiting_refund_journal/)
     await tx.$executeRaw`ROLLBACK TO SAVEPOINT a`
 
+    // A sync row of the same refund under ANOTHER key must not be mistaken for the debit.
+    await tx.accountingSyncLog.create({
+      data: { connector: 'xero', type: 'COGS_REVERSAL', status: 'CANCELLED', settlementBasis: 'HELD_SHADOW', referenceType: 'SalesOrderRefund', referenceId: fx.refunds[0].id, payload: { _idempotencyKey: 'some-other-key' } },
+    })
     const row = await tx.accountingSyncLog.create({
       data: { connector: 'xero', type: 'COGS_REVERSAL', status: 'SYNCED', referenceType: 'SalesOrderRefund', referenceId: fx.refunds[0].id, payload: { _idempotencyKey: `sales-order-refund:${fx.refunds[0].id}:cogs-reversal` } },
       select: { id: true },

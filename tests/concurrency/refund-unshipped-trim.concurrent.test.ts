@@ -75,8 +75,15 @@ async function cleanup(rig: Rig, fx: Awaited<ReturnType<typeof seed>> | undefine
   await db.product.delete({ where: { id: fx.productId } }).catch(() => {})
 }
 
+let resolved = 0
 const release = (rig: Rig, orderId: string) =>
-  rig.allocateSalesOrder(rig.db, { orderId, refuseIfShipmentsExist: true, trimUnshippedWhenShipmentsExist: true })
+  rig.allocateSalesOrder(rig.db, {
+    orderId,
+    refuseIfShipmentsExist: true,
+    trimUnshippedWhenShipmentsExist: true,
+    // The durable backstop is resolved inside the same transaction on the trimmed path too.
+    onReconciledInTx: async () => { resolved += 1 },
+  })
 
 async function state(rig: Rig, fx: Awaited<ReturnType<typeof seed>>) {
   const [row, level] = await Promise.all([
@@ -95,6 +102,7 @@ test('o3d-zvec.26 arm 1: two concurrent releases for one refund release the unsh
     assert.notEqual(a.refused, true)
     assert.notEqual(b.refused, true)
     assert.equal(a.success && b.success, true)
+    assert.equal(resolved, 2, 'the backstop is resolved in the transaction by each pass')
     // 5 allocated, 3 shipped + 1 packed committed, 1 refunded of the 2 unshipped -> keep 4, release exactly 1.
     assert.deepEqual(await state(rig, fx), { rowQty: 4, reserved: 1 })
     // A third pass changes nothing.

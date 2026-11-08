@@ -80,3 +80,27 @@ test('no demand (cancelled or refunded in full) releases everything above what c
   })
   assert.deepEqual(summary(steps), [['p', 'w', '3.0000']])
 })
+
+test('the committed floor can exceed what the refund would leave: committed rows are kept', () => {
+  const steps = planUnshippedTrim({
+    lines: [simple('L', 'p', '5')],
+    rows: [{ lineId: 'L', productId: 'p', warehouseId: 'w', qty: '5' }],
+    committed: [{ lineId: 'L', productId: 'p', warehouseId: 'w', qty: '4' }],
+    refundedByLine: new Map([['L', '3']]),
+    noDemand: false,
+  })
+  // target 2 but 4 are committed: keep 4, release 1.
+  assert.deepEqual(summary(steps), [['p', 'w', '1.0000']])
+})
+
+test('the excess is floored to the column scale, never rounded up past what the arithmetic allows', () => {
+  const steps = planUnshippedTrim({
+    lines: [{ id: 'L', qty: '2', requirements: [{ productId: 'c', factor: D('0.33335') }] }],
+    rows: [{ lineId: 'L', productId: 'c', warehouseId: 'w', qty: '0.6667' }],
+    committed: [],
+    refundedByLine: new Map([['L', '1']]),
+    noDemand: false,
+  })
+  // keep 0.33335, current 0.6667, excess 0.33335 -> floored 0.3333.
+  assert.deepEqual(summary(steps), [['c', 'w', '0.3333']])
+})

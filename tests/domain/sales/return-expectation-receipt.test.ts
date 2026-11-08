@@ -310,3 +310,14 @@ test('accounting switched off with a connector still named is held too (the swit
   await assert.rejects(() => receiveReturnAgainstExpectationsTx(tx, params({ connector: 'xero', syncEnabled: false })), /awaiting_accounting/)
   assert.equal(queued.length, 0)
 })
+
+test('the closing arrival clears what the refund POSTED, even when the snapshot arithmetic says otherwise', async () => {
+  const { receiveReturnAgainstExpectationsTx } = await mod
+  queued.length = 0; subledger.length = 0; enqueueAnswer = { queued: true }
+  const lines: Line[] = [{ id: 'l-1', expectation_id: 'e-1', qty: new Prisma.Decimal(3), qty_received: new Prisma.Decimal(0), qty_written_off: new Prisma.Decimal(0), cost_snapshot: [entry('3', '0.33')] }]
+  // The snapshot sums to 0.99 but the refund's journal posted 1.00.
+  const { tx } = fakeTx(lines, { transitJournalKey: 'k', transitDebitBase: '1.00' })
+  for (let i = 0; i < 3; i += 1) await receiveReturnAgainstExpectationsTx(tx, { ...params({ connector: 'xero', syncEnabled: true }), inboxId: `in-${i}` })
+  const gl = queued.reduce((sum, q) => sum + ((q.payload as { lines: Array<{ debit?: number }> }).lines[0].debit ?? 0), 0)
+  assert.equal(Number(gl.toFixed(2)), 1)
+})
