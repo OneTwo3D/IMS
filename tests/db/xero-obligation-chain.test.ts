@@ -132,3 +132,64 @@ test('WC_INVOICE_NOTE, raised from the real INVOICE_PDF row, inherits the SALES_
     assert.deepEqual([broken!.status, broken!.settlementBasis], ['CANCELLED', 'HELD_SHADOW'])
   })
 })
+
+/**
+ * A chain hop must be the same document on the same connector. Each arm builds a real parent chain whose rows have the right TYPES and a dated
+ * invoice after the cut-off, but one hop belongs to another reference or another connector; the follow-up must be a shadow at creation (the producer
+ * verdict) and must be held when it is claimed (the claim boundary), while the matching chain is created live and passes the claim boundary.
+ */
+test('A parent of the right type from another reference or another connector breaks the chain: shadowed at the producer and held at the claim boundary', { skip }, async (t) => {
+  const d = await deps()
+  const { processClaimedEntry } = await import('../../lib/connectors/xero/sync-processor.ts')
+  const ref = `OBLCHAIN-${randomUUID()}`
+  const refs = { ok: `${ref}-ok`, otherRef: `${ref}-or`, otherConn: `${ref}-oc`, foreign: `${ref}-fx` }
+  t.after(async () => { for (const r of [...Object.values(refs), `${ref}-nt`]) await cleanup(d.db, r) })
+  const origin = (payload: unknown) => ({ from: 'postedRow' as const, record: { payload, connectionProvenance: null } })
+  const lease = { fenceBeforeRemoteWrite: async () => { throw new Error('the processor reached its pre-write fence') } } as never
+
+  await withSettings(d.db, async () => {
+    const mkChain = async (referenceId: string, invoiceDocument: string, invoiceConnector: string) => {
+      // The invoice row belongs to `invoiceDocument` on `invoiceConnector`; the PDF row is for `referenceId`, raised from it by the real enqueue code.
+      const invoice = await withEnv({}, () => d.db.$transaction((tx) => d.createAccountingSyncLogRow(tx, {
+        connector: invoiceConnector, type: 'SALES_INVOICE', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: invoiceDocument,
+        payload: { date: '2026-05-30' }, externalTransactionId: `ext-${randomUUID()}`, syncedAt: new Date(),
+      }), { timeout: 60_000, maxWait: 30_000 }))
+      assert.ok(invoice.row)
+      await withEnv(LIVE_ENV, () => d.enqueueFollowUpSyncLog('INVOICE_PDF', 'SalesOrder', referenceId, { accountingInvoiceId: 'xero-inv', referenceId, invoiceNumber: 'INV-1', sourceEntryId: invoice.row!.id }, origin({ date: '2026-05-30' })))
+      const pdf = await d.db.accountingSyncLog.findFirst({ where: { referenceId, type: 'INVOICE_PDF' }, select: { id: true, payload: true } })
+      assert.ok(pdf, 'precondition: the real enqueue created the PDF row')
+      return pdf!
+    }
+    const chains: Array<[string, string, string, string]> = [
+      ['same document, same connector', refs.ok, refs.ok, 'xero'],
+      ['invoice of another reference', refs.otherRef, `${refs.otherRef}-other`, 'xero'],
+      ['invoice of another connector', refs.otherConn, refs.otherConn, 'quickbooks'],
+    ]
+    for (const [label, referenceId, invoiceDocument, connector] of chains) {
+      const pdf = await mkChain(referenceId, invoiceDocument, connector)
+      const notePayload = { referenceId, sourceEntryId: pdf.id }
+      await withEnv(LIVE_ENV, () => d.enqueueFollowUpSyncLog('WC_INVOICE_NOTE', 'SalesOrder', referenceId, notePayload, origin(pdf.payload)))
+      const note = await d.db.accountingSyncLog.findFirst({ where: { referenceId, type: 'WC_INVOICE_NOTE' }, select: { id: true, status: true, settlementBasis: true } })
+      assert.ok(note, label)
+      const live = referenceId === refs.ok
+      // PRODUCER VERDICT. MUTATION: drop the reference/connector comparison => the mismatched chains are PENDING => red.
+      if (live) assert.equal(note!.status, 'PENDING', `${label}: queued`)
+      else assert.deepEqual([note!.status, note!.settlementBasis], ['CANCELLED', 'HELD_SHADOW'], `${label}: shadowed`)
+
+      // CLAIM BOUNDARY: the same chain and payload reach processClaimedEntry (against the real row of that note, so the cut-off read on its creation time is real).
+      const claimed = await withEnv(LIVE_ENV, async () => {
+        try { return { result: await processClaimedEntry(note!.id, 'WC_INVOICE_NOTE', 'SalesOrder', referenceId, notePayload as never, lease, { attemptRevision: 1 } as never), threw: null as string | null } }
+        catch (error) { return { result: null, threw: error instanceof Error ? error.message : String(error) } }
+      })
+      console.log(`# claim boundary, ${label}: ${JSON.stringify(claimed.result)} threw=${claimed.threw}`)
+      if (live) {
+        assert.notEqual(claimed.result?.notPosted?.reason, 'producer-held', `${label}: passes the claim boundary`)
+        assert.notEqual(claimed.result?.notPosted?.reason, 'before-cutoff', `${label}: and the cut-off check`)
+      }
+      else {
+        assert.equal(claimed.threw, null, `${label}: handed back, not run on`)
+        assert.equal(claimed.result?.notPosted?.reason, 'producer-held', `${label}: held at the claim boundary`)
+      }
+    }
+  })
+})

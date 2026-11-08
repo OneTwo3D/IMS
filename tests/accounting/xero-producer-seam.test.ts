@@ -120,21 +120,24 @@ test('only connector xero is asked', () => {
   assert.deepEqual(xeroProducerSeamVerdict({ connector: 'quickbooks', type: 'PURCHASE_INVOICE', payload: { date: '2026-06-01' }, env: ENFORCED, now: NOW }), { kind: 'legacy' })
 })
 
-test('the business-event date: payment date, then document date, then invoice date; a date without a time is the start of that UTC day; garbage is undefined', () => {
-  const cases: Array<[string, unknown, string | undefined]> = [
-    ['document date', { date: '2026-05-30' }, '2026-05-30T00:00:00.000Z'],
-    ['payment date wins', { paymentDate: '2026-05-29', date: '2026-05-30' }, '2026-05-29T00:00:00.000Z'],
-    ['full instant', { date: '2026-05-30T10:15:00Z' }, '2026-05-30T10:15:00.000Z'],
-    ['invoice date', { invoiceDate: '2026-05-28' }, '2026-05-28T00:00:00.000Z'],
-    ['unreadable payment date falls through to the document date', { paymentDate: 'soon', date: '2026-05-30' }, '2026-05-30T00:00:00.000Z'],
-    ['impossible date', { date: '2026-13-45' }, undefined],
-    ['not a string', { date: 20260530 }, undefined],
-    ['no date', { amount: 5 }, undefined],
-    ['null payload', null, undefined],
-    ['array payload', [{ date: '2026-05-30' }], undefined],
+test('the business-event date is the ONE declared field: a date without a time is the start of that UTC day; absent or unreadable is undefined whatever other dates the payload carries', () => {
+  const cases: Array<[string, unknown, 'date' | 'paymentDate', string | undefined]> = [
+    ['document date', { date: '2026-05-30' }, 'date', '2026-05-30T00:00:00.000Z'],
+    ['payment date', { paymentDate: '2026-05-29', date: '2026-05-30' }, 'paymentDate', '2026-05-29T00:00:00.000Z'],
+    ['the declared document date wins over a payment date', { paymentDate: '2026-05-29', date: '2026-05-30' }, 'date', '2026-05-30T00:00:00.000Z'],
+    ['full instant', { date: '2026-05-30T10:15:00Z' }, 'date', '2026-05-30T10:15:00.000Z'],
+    ['no fallback to a payment date', { paymentDate: '2026-05-29' }, 'date', undefined],
+    ['no fallback to the document date', { date: '2026-05-30' }, 'paymentDate', undefined],
+    ['no fallback to an invoice date', { invoiceDate: '2026-05-28' }, 'date', undefined],
+    ['unreadable declared date does not fall through', { paymentDate: 'soon', date: '2026-05-30' }, 'paymentDate', undefined],
+    ['impossible date', { date: '2026-13-45' }, 'date', undefined],
+    ['not a string', { date: 20260530 }, 'date', undefined],
+    ['no date', { amount: 5 }, 'date', undefined],
+    ['null payload', null, 'date', undefined],
+    ['array payload', [{ date: '2026-05-30' }], 'date', undefined],
   ]
-  for (const [label, payload, expected] of cases) {
-    const got = xeroObligationAt(payload)
+  for (const [label, payload, field, expected] of cases) {
+    const got = xeroObligationAt(payload, field)
     console.log(`# obligation ${label}: ${got?.toISOString() ?? 'undefined'}`)
     assert.equal(got?.toISOString(), expected, label)
   }

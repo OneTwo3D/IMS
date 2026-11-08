@@ -11,6 +11,7 @@ import {
   xeroResolveObligationAt,
   type ObligationParentReader,
 } from '@/lib/domain/accounting/xero-producer-seam'
+import { moneyPostDateFieldFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { buildInventoryAdjustmentJournal } from '@/lib/domain/inventory/stock-adjustment-apply'
 import { buildLandedCostCogsJournalPayload, buildLandedCostReclassJournalPayload } from '@/lib/domain/purchasing/landed-cost-service'
 import { buildPurchaseInvoiceAccountingPayload } from '@/lib/domain/purchasing/purchase-invoice-edit'
@@ -77,6 +78,7 @@ test('the types Xeroom owns in every phase never go LIVE, so their obligation so
 })
 
 const DAY = '2026-06-02'
+const OBLIGATION_FIELDS = ['date', 'paymentDate'] as const
 
 function fieldOf(type: string): string {
   const source = XERO_OBLIGATION_SOURCES[type as AccountingSyncType]
@@ -89,12 +91,12 @@ test('REAL BUILDERS: the payload each exported producer builds carries the decla
     const field = fieldOf(type)
     const record = payload as Record<string, unknown>
     assert.equal(typeof record[field], 'string', `${type}: payload has ${field}`)
-    assert.ok(xeroObligationAt(payload), `${type}: xeroObligationAt reads it`)
+    assert.ok(xeroObligationAt(payload, field as 'date' | 'paymentDate'), `${type}: xeroObligationAt reads the declared field`)
   }
   const bill = buildPurchaseInvoiceAccountingPayload({ poReference: 'PO-1', contactName: 'S', date: DAY, currency: 'GBP', fxRateToBase: 1, lines: [] })
   day('PURCHASE_INVOICE', bill)
   day('PURCHASE_INVOICE_UPDATE', bill)
-  assert.equal(xeroObligationAt(bill)?.toISOString(), `${DAY}T00:00:00.000Z`)
+  assert.equal(xeroObligationAt(bill, 'date')?.toISOString(), `${DAY}T00:00:00.000Z`)
   day('PURCHASE_CREDIT_NOTE', buildSupplierCreditNoteSyncPayload({
     creditNoteId: 'cn-1', creditNoteNumber: 'CN-1', reference: null, reason: null, supplierName: 'S', supplierId: 's-1', currency: 'GBP', fxRateToBase: 1,
     amountForeign: 5, transitAccount: '600', taxType: 'NONE', date: DAY,
@@ -108,7 +110,7 @@ test('REAL BUILDERS: the payload each exported producer builds carries the decla
   day('STOCK_IN_TRANSIT', buildLandedCostReclassJournalPayload({ primaryPoRef: 'PO-1', absDelta: 5, isIncrease: true, inventoryAccount: '630', transitAccount: '840' }))
   day('COGS_JOURNAL', buildLandedCostCogsJournalPayload({ primaryPoRef: 'PO-1', absDelta: 5, isIncrease: false, cogsAccount: '310', offsetAccount: '840' }))
   // The decrease branches keep the date too (the payload is one literal, but pin both directions).
-  assert.ok(xeroObligationAt(buildLandedCostReclassJournalPayload({ primaryPoRef: 'PO-1', absDelta: 5, isIncrease: false, inventoryAccount: '630', transitAccount: '840' })))
+  assert.ok(xeroObligationAt(buildLandedCostReclassJournalPayload({ primaryPoRef: 'PO-1', absDelta: 5, isIncrease: false, inventoryAccount: '630', transitAccount: '840' }), 'date'))
 })
 
 /**
@@ -156,13 +158,15 @@ const XERO_ENV = { [PRODUCER_HOLD_ENFORCED_ENV]: 'xero', [OUTBOUND_GRANT_ENV.xer
 const WOO_ENV = { [PRODUCER_HOLD_ENFORCED_ENV]: 'woocommerce', [OUTBOUND_GRANT_ENV.woocommerce]: SHOP, [PRODUCER_CUTOFF_ENV.woocommerce]: LIVE_FROM }
 const NOW = new Date('2026-06-01T12:00:00Z')
 
-type FakeRow = { type: string; payload: unknown }
+type FakeRow = { type: string; payload: unknown; connector?: string; referenceType?: string; referenceId?: string }
+/** The document every follow-up in these tests is raised for. */
+const DOC = { connector: 'xero', referenceType: 'SalesOrder', referenceId: 'order-1' }
 
 function readerOf(rows: Record<string, FakeRow>): { client: ObligationParentReader; reads: string[] } {
   const reads: string[] = []
   return {
     reads,
-    client: { accountingSyncLog: { findUnique: async ({ where }) => { reads.push(where.id); return where.id in rows ? rows[where.id]! : null } } },
+    client: { accountingSyncLog: { findUnique: async ({ where }) => { reads.push(where.id); return where.id in rows ? { ...DOC, ...rows[where.id]! } : null } } },
   }
 }
 
@@ -206,7 +210,7 @@ test('FOLLOW-UPS INHERIT THE DATED ANCESTOR through their declared chain; a brok
     const payload = { sourceEntryId: c.start, accountingInvoiceId: 'x', date: '2026-05-31', paymentDate: '2026-05-31', invoiceDate: '2026-05-31' }
     const decide = async (rows: Record<string, FakeRow>, p: unknown = payload) => {
       const { client, reads } = readerOf(rows)
-      const obligationAt = await xeroResolveObligationAt(client, { type: c.type, payload: p, env: c.env })
+      const obligationAt = await xeroResolveObligationAt(client, { type: c.type, payload: p, env: c.env, ...DOC })
       return { verdict: xeroProducerSeamVerdict({ connector: 'xero', type: c.type, payload: p, obligationAt, env: c.env, now: NOW }), reads, obligationAt }
     }
     const live = await decide(c.chain(DATED))
@@ -229,23 +233,23 @@ test('FOLLOW-UPS INHERIT THE DATED ANCESTOR through their declared chain; a brok
   assert.ok(unresolved.kind === 'shadow' && unresolved.decision.reason === 'obligation_time_required')
   // A cycle or a self-reference is a broken link.
   const cyc = readerOf({ 'a': { type: 'INVOICE_PDF', payload: { sourceEntryId: 'a' } } })
-  assert.equal(await xeroResolveObligationAt(cyc.client, { type: 'WC_INVOICE_NOTE', payload: { sourceEntryId: 'a' }, env: WOO_ENV }), undefined)
+  assert.equal(await xeroResolveObligationAt(cyc.client, { type: 'WC_INVOICE_NOTE', payload: { sourceEntryId: 'a' }, env: WOO_ENV, ...DOC }), undefined)
   assert.deepEqual(cyc.reads, ['a'], 'a self-referencing row is read once, never looped')
   // No parent named, or a client that cannot read: no obligation, never a guess.
-  assert.equal(await xeroResolveObligationAt({}, { type: 'BILL_ATTACHMENT', payload: { sourceEntryId: 'bill-1' }, env: XERO_ENV }), undefined)
-  assert.equal(await xeroResolveObligationAt(readerOf({ 'bill-1': { type: 'PURCHASE_INVOICE', payload: { date: DATED } } }).client, { type: 'BILL_ATTACHMENT', payload: [{ sourceEntryId: 'bill-1' }], env: XERO_ENV }), undefined)
+  assert.equal(await xeroResolveObligationAt({}, { type: 'BILL_ATTACHMENT', payload: { sourceEntryId: 'bill-1' }, env: XERO_ENV, ...DOC }), undefined)
+  assert.equal(await xeroResolveObligationAt(readerOf({ 'bill-1': { type: 'PURCHASE_INVOICE', payload: { date: DATED } } }).client, { type: 'BILL_ATTACHMENT', payload: [{ sourceEntryId: 'bill-1' }], env: XERO_ENV, ...DOC }), undefined)
 })
 
 test('SWITCH OFF IS BYTE-IDENTICAL: with the hold not enforced the parent is never read and the verdict is legacy', async () => {
   const { client, reads } = readerOf({ 'parent-1': { type: 'PURCHASE_INVOICE', payload: { date: '2026-05-30' } } })
   for (const type of ['BILL_ATTACHMENT', 'WC_INVOICE_NOTE']) {
-    const obligationAt = await xeroResolveObligationAt(client, { type, payload: { sourceEntryId: 'parent-1' }, env: {} })
+    const obligationAt = await xeroResolveObligationAt(client, { type, payload: { sourceEntryId: 'parent-1' }, env: {}, ...DOC })
     assert.equal(obligationAt, undefined)
     assert.deepEqual(xeroProducerSeamVerdict({ connector: 'xero', type, payload: { sourceEntryId: 'parent-1' }, obligationAt, env: {}, now: NOW }), { kind: 'legacy' })
   }
   assert.deepEqual(reads, [], 'no query when the hold is off')
   // A non-follow-up type is read from its payload without touching the client.
-  assert.equal((await xeroResolveObligationAt(client, { type: 'PURCHASE_INVOICE', payload: { date: '2026-05-30' }, env: XERO_ENV }))?.toISOString(), '2026-05-30T00:00:00.000Z')
+  assert.equal((await xeroResolveObligationAt(client, { type: 'PURCHASE_INVOICE', payload: { date: '2026-05-30' }, env: XERO_ENV, ...DOC }))?.toISOString(), '2026-05-30T00:00:00.000Z')
   assert.deepEqual(reads, [])
 })
 
@@ -260,4 +264,74 @@ test('A DATE-ONLY OBLIGATION READS AS 00:00Z: with a mid-day live-from instant, 
   const midnight = { ...XERO_ENV, [PRODUCER_CUTOFF_ENV.xero]: '2026-06-02T00:00:00Z' }
   assert.equal(xeroProducerSeamVerdict({ connector: 'xero', type: 'PURCHASE_INVOICE', payload: { date: '2026-06-02' }, env: midnight, now }).kind, 'live', 'with live-from at 00:00Z the same-day work is live')
   assert.ok(xeroProducerSeamVerdict({ connector: 'xero', type: 'PURCHASE_INVOICE', payload: { date: '2026-06-01' }, env: midnight, now }).kind === 'shadow', 'the day before is still the earlier writer\'s')
+})
+
+
+/**
+ * THE DECLARED FIELD IS THE ONLY FIELD. A payload carrying several dates is judged by the one the type's posting path sends as the Xero document
+ * date; another date, on either side of the cut-off, never decides, and a missing declared field is not made up from another.
+ */
+test('CONFLICTING DATE FIELDS across the cut-off: every payload-sourced type is judged by its declared field alone', () => {
+  const BEFORE = '2025-12-31'
+  const AFTER = '2026-05-30'
+  const others = (field: string) => OBLIGATION_FIELDS.filter((f) => f !== field)
+  for (const type of ALL_TYPES) {
+    const source = XERO_OBLIGATION_SOURCES[type as AccountingSyncType]
+    if (source.kind !== 'payload') continue
+    const row = mapRowFor(type)!
+    if (row.owners.P2 !== 'IMS') continue
+    const ask = (payload: Record<string, unknown>) => xeroProducerSeamVerdict({ connector: 'xero', type, payload, env: XERO_ENV, now: NOW })
+    const conflictingEarly = ask({ [source.field]: BEFORE, ...Object.fromEntries(others(source.field).map((f) => [f, AFTER])) })
+    assert.ok(conflictingEarly.kind === 'shadow' && conflictingEarly.decision.reason === 'obligation_before_cutoff', `${type}: declared ${source.field} before the cut-off beats other later dates`)
+    const conflictingLate = ask({ [source.field]: AFTER, ...Object.fromEntries(others(source.field).map((f) => [f, BEFORE])) })
+    assert.equal(conflictingLate.kind, 'live', `${type}: declared ${source.field} after the cut-off is not dragged back by other earlier dates`)
+    const missing = ask(Object.fromEntries(others(source.field).map((f) => [f, AFTER])))
+    assert.ok(missing.kind === 'shadow' && missing.decision.reason === 'obligation_time_required', `${type}: a missing ${source.field} is not made up from another date`)
+    const unreadable = ask({ [source.field]: 'soon', ...Object.fromEntries(others(source.field).map((f) => [f, AFTER])) })
+    assert.ok(unreadable.kind === 'shadow' && unreadable.decision.reason === 'obligation_time_required', `${type}: an unreadable ${source.field} does not fall through`)
+  }
+})
+
+test('THE THREE MONEY-POST TYPES: the declared field is the one the posting path dates the Xero payment or allocation from (ledger-settlement-evidence MONEY_POST_DATE_FIELD)', () => {
+  for (const type of ['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION']) {
+    const source = XERO_OBLIGATION_SOURCES[type as AccountingSyncType]
+    assert.equal(source.kind, 'payload', type)
+    assert.equal((source as { field: string }).field, moneyPostDateFieldFor(type), `${type}: declared field equals the posting path's date field`)
+  }
+  // The allocation is the one whose conflict matters: dated from `date`, never `paymentDate`.
+  const ask = (payload: Record<string, unknown>) => xeroProducerSeamVerdict({ connector: 'xero', type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', payload, env: XERO_ENV, now: NOW })
+  const early = ask({ date: '2025-12-31', paymentDate: '2026-05-30' })
+  assert.ok(early.kind === 'shadow' && early.decision.reason === 'obligation_before_cutoff')
+})
+
+test('A HOP MUST BE THE SAME DOCUMENT: a parent of the right type from another reference or another connector is a broken link (shadow), whatever date it carries', async () => {
+  const DATED = '2026-05-30'
+  const note = { sourceEntryId: 'pdf-1', date: '2026-05-31' }
+  const chain = (overrides: { pdf?: Partial<FakeRow>; invoice?: Partial<FakeRow> }): Record<string, FakeRow> => ({
+    'pdf-1': { type: 'INVOICE_PDF', payload: { sourceEntryId: 'inv-1' }, ...overrides.pdf },
+    'inv-1': { type: 'SALES_INVOICE', payload: { date: DATED }, ...overrides.invoice },
+  })
+  const verdictFor = async (rows: Record<string, FakeRow>) => {
+    const { client } = readerOf(rows)
+    const obligationAt = await xeroResolveObligationAt(client, { type: 'WC_INVOICE_NOTE', payload: note, env: WOO_ENV, ...DOC })
+    return xeroProducerSeamVerdict({ connector: 'xero', type: 'WC_INVOICE_NOTE', payload: note, obligationAt, env: WOO_ENV, now: NOW })
+  }
+  assert.equal((await verdictFor(chain({}))).kind, 'live', 'PRECONDITION: the same document, same connector is live')
+  for (const [label, rows] of [
+    ['first hop, other reference', chain({ pdf: { referenceId: 'order-2' } })],
+    ['last hop, other reference', chain({ invoice: { referenceId: 'order-2' } })],
+    ['first hop, other reference type', chain({ pdf: { referenceType: 'PurchaseOrder' } })],
+    ['last hop, other reference type', chain({ invoice: { referenceType: 'PurchaseOrder' } })],
+    ['first hop, other connector', chain({ pdf: { connector: 'quickbooks' } })],
+    ['last hop, other connector', chain({ invoice: { connector: 'quickbooks' } })],
+  ] as const) {
+    const verdict = await verdictFor(rows)
+    assert.ok(verdict.kind === 'shadow' && verdict.decision.reason === 'obligation_time_required', label)
+  }
+  // The bill attachment: a purchase invoice of ANOTHER document is not its parent.
+  const attachment = { sourceEntryId: 'bill-1' }
+  const bill = readerOf({ 'bill-1': { type: 'PURCHASE_INVOICE', payload: { date: DATED }, referenceType: 'PurchaseInvoice', referenceId: 'pi-2' } })
+  assert.equal(await xeroResolveObligationAt(bill.client, { type: 'BILL_ATTACHMENT', payload: attachment, env: XERO_ENV, connector: 'xero', referenceType: 'PurchaseInvoice', referenceId: 'pi-1' }), undefined)
+  const same = readerOf({ 'bill-1': { type: 'PURCHASE_INVOICE', payload: { date: DATED }, referenceType: 'PurchaseInvoice', referenceId: 'pi-1' } })
+  assert.equal((await xeroResolveObligationAt(same.client, { type: 'BILL_ATTACHMENT', payload: attachment, env: XERO_ENV, connector: 'xero', referenceType: 'PurchaseInvoice', referenceId: 'pi-1' }))?.toISOString(), `${DATED}T00:00:00.000Z`)
 })

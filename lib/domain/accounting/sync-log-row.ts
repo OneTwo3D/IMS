@@ -164,7 +164,7 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
     connector: String(data.connector),
     type: String(data.type),
     payload: data.payload,
-    obligationAt: await xeroResolveObligationAt(client, { type: String(data.type), payload: data.payload }),
+    obligationAt: await xeroResolveObligationAt(client, { type: String(data.type), payload: data.payload, connector: String(data.connector), referenceType: String(data.referenceType), referenceId: String(data.referenceId) }),
   })
   let rowData = data
   let shadow: PreparedShadow | null = null
