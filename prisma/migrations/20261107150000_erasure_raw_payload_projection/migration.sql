@@ -38,6 +38,41 @@ CREATE OR REPLACE FUNCTION gdpr_neutral_for_present(src jsonb, neutral jsonb) RE
   SELECT COALESCE((SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each(neutral) e WHERE src ? e.key), '{}'::jsonb)
 $$;
 
+-- A scalar REBUILT from its own text: the value a validator accepted is returned as a NEW JSON value, never as the input node. (The projection SQL has no
+-- pass-through of an input object, sub-object or remainder; tests/erasure-projection-no-passthrough.test.ts reads this file to keep it that way.)
+CREATE OR REPLACE FUNCTION gdpr_rebuild_scalar(v jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE jsonb_typeof(v)
+    WHEN 'number' THEN to_jsonb((v#>>'{}')::numeric)
+    WHEN 'string' THEN to_jsonb(v#>>'{}')
+    WHEN 'boolean' THEN to_jsonb((v#>>'{}')::boolean)
+    ELSE 'null'::jsonb END
+$$;
+
+-- A single-token string (no whitespace, no '@', at most 60 characters) rebuilt, else ''.
+CREATE OR REPLACE FUNCTION gdpr_token(v jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^[^[:space:]@]{0,60}$' THEN to_jsonb(v#>>'{}') ELSE to_jsonb(''::text) END
+$$;
+
+-- A plain code string rebuilt, else the fallback text.
+CREATE OR REPLACE FUNCTION gdpr_code_or(v jsonb, fallback text) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^[A-Za-z0-9_./-]{1,60}$' THEN to_jsonb(v#>>'{}') ELSE to_jsonb(fallback) END
+$$;
+
+-- A currency: three letters rebuilt; the empty string is a legitimate stated value (a missing currency is refused with that word); anything else 'unreadable'.
+CREATE OR REPLACE FUNCTION gdpr_currency(v jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^([A-Za-z]{3})?$' THEN to_jsonb(v#>>'{}') ELSE to_jsonb('unreadable'::text) END
+$$;
+
+-- A fixed label per credit kind (what the coupon classifier reads), else 'Fee'; never the original text.
+CREATE OR REPLACE FUNCTION gdpr_credit_label(v jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT to_jsonb(CASE
+    WHEN (v#>>'{}') ~* 'smart[_ -]?coupon' THEN 'Smart coupon'
+    WHEN (v#>>'{}') ~* 'store[_ -]?credit' THEN 'Store credit'
+    WHEN (v#>>'{}') ~* 'gift[_ -]?(card|cert)|giftcard' THEN 'Gift card'
+    WHEN (v#>>'{}') ~* 'wallet' THEN 'Wallet'
+    ELSE 'Fee' END)
+$$;
+
 -- META VALUES: EVERY allowlisted key has a declared value projection, and a value is rebuilt from typed fields only; nothing is passed through.
 --   number          a readable (signed) number, else the fixed word 'unreadable'
 --   decimal         a non-negative plain decimal, else 'unreadable' (the importer's own wclc amount reader)
@@ -98,9 +133,9 @@ $$;
 CREATE OR REPLACE FUNCTION gdpr_money_or_unreadable(v jsonb, allow_empty boolean) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE
     WHEN v IS NULL THEN to_jsonb('unreadable'::text)
-    WHEN jsonb_typeof(v) = 'number' AND (v#>>'{}')::numeric >= 0 THEN v
-    WHEN jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^\s*[0-9]+(\.[0-9]+)?\s*$' THEN v
-    WHEN jsonb_typeof(v) = 'string' AND allow_empty AND (v#>>'{}') = '' THEN v
+    WHEN jsonb_typeof(v) = 'number' AND (v#>>'{}')::numeric >= 0 THEN gdpr_rebuild_scalar(v)
+    WHEN jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^\s*[0-9]+(\.[0-9]+)?\s*$' THEN gdpr_rebuild_scalar(v)
+    WHEN jsonb_typeof(v) = 'string' AND allow_empty AND (v#>>'{}') = '' THEN gdpr_rebuild_scalar(v)
     ELSE to_jsonb('unreadable'::text) END
 $$;
 
@@ -143,20 +178,20 @@ $$;
 -- The projection of ONE meta value by its declared kind; SQL NULL means "drop the entry".
 CREATE OR REPLACE FUNCTION gdpr_project_meta_value(k text, v jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE gdpr_wc_meta_value_kind(k)
-    WHEN 'number' THEN CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'number' THEN v
-                            WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^\s*-?[0-9]+(\.[0-9]+)?\s*$' THEN v
+    WHEN 'number' THEN CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'number' THEN gdpr_rebuild_scalar(v)
+                            WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^\s*-?[0-9]+(\.[0-9]+)?\s*$' THEN gdpr_rebuild_scalar(v)
                             ELSE to_jsonb('unreadable'::text) END
-    WHEN 'decimal' THEN CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'number' AND (v#>>'{}')::numeric >= 0 THEN v
-                             WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^[0-9]+(\.[0-9]+)?$' THEN v
+    WHEN 'decimal' THEN CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'number' AND (v#>>'{}')::numeric >= 0 THEN gdpr_rebuild_scalar(v)
+                             WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^[0-9]+(\.[0-9]+)?$' THEN gdpr_rebuild_scalar(v)
                              ELSE to_jsonb('unreadable'::text) END
-    WHEN 'flag' THEN CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'boolean' THEN v
-                          WHEN v IS NOT NULL AND jsonb_typeof(v) = 'number' AND (v#>>'{}') IN ('0', '1') THEN v
+    WHEN 'flag' THEN CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'boolean' THEN gdpr_rebuild_scalar(v)
+                          WHEN v IS NOT NULL AND jsonb_typeof(v) = 'number' AND (v#>>'{}') IN ('0', '1') THEN gdpr_rebuild_scalar(v)
                           WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND lower(btrim(v#>>'{}')) IN ('1', '0', 'true', 'false', 'yes', 'no') THEN to_jsonb(lower(btrim(v#>>'{}')))
                           ELSE to_jsonb('other'::text) END
     WHEN 'wclc_kind' THEN to_jsonb(CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND btrim(v#>>'{}') IN ('duty_flat', 'uhf', 'duty_fee') THEN btrim(v#>>'{}') ELSE 'other' END)
-    WHEN 'invoice_number' THEN CASE WHEN v IS NOT NULL AND jsonb_typeof(v) IN ('string', 'number') AND (v#>>'{}') ~ '^(?=.*[0-9])[A-Za-z0-9_./#-]{1,40}$' THEN v ELSE NULL END
-    WHEN 'int' THEN CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'number' AND (v#>>'{}') ~ '^[1-9][0-9]*$' THEN v
-                         WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^[1-9][0-9]*$' THEN v
+    WHEN 'invoice_number' THEN CASE WHEN v IS NOT NULL AND jsonb_typeof(v) IN ('string', 'number') AND (v#>>'{}') ~ '^(?=.*[0-9])[A-Za-z0-9_./#-]{1,40}$' THEN gdpr_rebuild_scalar(v) ELSE NULL END
+    WHEN 'int' THEN CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'number' AND (v#>>'{}') ~ '^[1-9][0-9]*$' THEN gdpr_rebuild_scalar(v)
+                         WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^[1-9][0-9]*$' THEN gdpr_rebuild_scalar(v)
                          ELSE to_jsonb('unreadable'::text) END
     WHEN 'contribution' THEN gdpr_project_contribution(v)
     WHEN 'credit_amount' THEN gdpr_money_or_unreadable(v, true)
@@ -182,8 +217,8 @@ $$;
 
 -- A readable (signed) number or numeric string stays; anything else is the fixed word 'unreadable'.
 CREATE OR REPLACE FUNCTION gdpr_number_or_unreadable(v jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
-  SELECT CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'number' THEN v
-              WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^\s*-?[0-9]+(\.[0-9]+)?\s*$' THEN v
+  SELECT CASE WHEN v IS NOT NULL AND jsonb_typeof(v) = 'number' THEN gdpr_rebuild_scalar(v)
+              WHEN v IS NOT NULL AND jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^\s*-?[0-9]+(\.[0-9]+)?\s*$' THEN gdpr_rebuild_scalar(v)
               ELSE to_jsonb('unreadable'::text) END
 $$;
 
@@ -195,19 +230,19 @@ $$;
 -- TEXT SCALARS: a kept text field is a single token (no whitespace, no '@', at most 60 characters), else the empty string. A human label (the payment method
 -- title, a shipping method title, a tax label) is replaced by the token its machine counterpart carries, never kept as free text.
 CREATE OR REPLACE FUNCTION gdpr_token_for_present(src jsonb, keys text[]) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
-  SELECT COALESCE((SELECT jsonb_object_agg(k, CASE WHEN jsonb_typeof(src->k) = 'string' AND (src->>k) ~ '^[^[:space:]@]{0,60}$' THEN src->k ELSE to_jsonb(''::text) END)
+  SELECT COALESCE((SELECT jsonb_object_agg(k, CASE WHEN jsonb_typeof(src->k) = 'string' AND (src->>k) ~ '^[^[:space:]@]{0,60}$' THEN gdpr_rebuild_scalar(src->k) ELSE to_jsonb(''::text) END)
                      FROM unnest(keys) AS k WHERE src ? k), '{}'::jsonb)
 $$;
 
 -- Dates: a plain date or date-time, else JSON null.
 CREATE OR REPLACE FUNCTION gdpr_date_for_present(src jsonb, keys text[]) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
-  SELECT COALESCE((SELECT jsonb_object_agg(k, CASE WHEN jsonb_typeof(src->k) = 'string' AND (src->>k) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}([T ][0-9:.]{1,15})?(Z|[+-][0-9:]{2,5})?$' THEN src->k ELSE 'null'::jsonb END)
+  SELECT COALESCE((SELECT jsonb_object_agg(k, CASE WHEN jsonb_typeof(src->k) = 'string' AND (src->>k) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}([T ][0-9:.]{1,15})?(Z|[+-][0-9:]{2,5})?$' THEN gdpr_rebuild_scalar(src->k) ELSE 'null'::jsonb END)
                      FROM unnest(keys) AS k WHERE src ? k), '{}'::jsonb)
 $$;
 
 -- Flags: a JSON boolean, else false.
 CREATE OR REPLACE FUNCTION gdpr_bool_for_present(src jsonb, keys text[]) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
-  SELECT COALESCE((SELECT jsonb_object_agg(k, CASE WHEN jsonb_typeof(src->k) = 'boolean' THEN src->k ELSE 'false'::jsonb END) FROM unnest(keys) AS k WHERE src ? k), '{}'::jsonb)
+  SELECT COALESCE((SELECT jsonb_object_agg(k, CASE WHEN jsonb_typeof(src->k) = 'boolean' THEN gdpr_rebuild_scalar(src->k) ELSE 'false'::jsonb END) FROM unnest(keys) AS k WHERE src ? k), '{}'::jsonb)
 $$;
 
 -- A line's `taxes`: [{id, total, subtotal}] and nothing else (the importer reads taxes[].id as the storefront rate id). Not an array -> [].
@@ -231,21 +266,16 @@ CREATE OR REPLACE FUNCTION gdpr_project_lines(arr jsonb, keys text[], with_meta 
   SELECT CASE WHEN arr IS NULL OR jsonb_typeof(arr) <> 'array' THEN '[]'::jsonb ELSE COALESCE((
     SELECT jsonb_agg(gdpr_keep_keys(l, keys)
         || CASE WHEN l ? 'taxes' THEN jsonb_build_object('taxes', gdpr_project_taxes(l->'taxes')) ELSE '{}'::jsonb END
-        || CASE WHEN l ? 'sku' THEN jsonb_build_object('sku', CASE WHEN jsonb_typeof(l->'sku') = 'string' AND (l->>'sku') ~ '^[A-Za-z0-9_./-]{1,60}$' THEN l->'sku' ELSE to_jsonb(''::text) END) ELSE '{}'::jsonb END
+        || CASE WHEN l ? 'sku' THEN jsonb_build_object('sku', gdpr_code_or(l->'sku', '')) ELSE '{}'::jsonb END
         || gdpr_numeric_for_present(l, ARRAY['cogs_value', 'id', 'product_id', 'variation_id', 'quantity', 'price', 'subtotal', 'subtotal_tax', 'total', 'total_tax', 'refund_total', 'instance_id', 'tax_total', 'shipping_tax_total', 'discount', 'discount_tax', 'rate_id', 'rate_percent'])
         || gdpr_token_for_present(l, ARRAY['tax_class', 'tax_status', 'method_id', 'rate_code', 'global_unique_id'])
-        || CASE WHEN l ? 'method_title' THEN jsonb_build_object('method_title', CASE WHEN jsonb_typeof(l->'method_id') = 'string' AND (l->>'method_id') ~ '^[^[:space:]@]{1,60}$' THEN l->'method_id' ELSE to_jsonb(''::text) END) ELSE '{}'::jsonb END
-        || CASE WHEN l ? 'label' THEN jsonb_build_object('label', CASE WHEN jsonb_typeof(l->'rate_code') = 'string' AND (l->>'rate_code') ~ '^[^[:space:]@]{1,60}$' THEN l->'rate_code' ELSE to_jsonb(''::text) END) ELSE '{}'::jsonb END
+        || CASE WHEN l ? 'method_title' THEN jsonb_build_object('method_title', gdpr_token(l->'method_id')) ELSE '{}'::jsonb END
+        || CASE WHEN l ? 'label' THEN jsonb_build_object('label', gdpr_token(l->'rate_code')) ELSE '{}'::jsonb END
         || gdpr_bool_for_present(l, ARRAY['compound'])
         || CASE WHEN with_meta AND l ? 'meta_data' THEN jsonb_build_object('meta_data', gdpr_project_meta(l->'meta_data', only_keys)) ELSE '{}'::jsonb END
         || CASE name_mode
-             WHEN 'sku' THEN jsonb_build_object('name', CASE WHEN jsonb_typeof(l->'sku') = 'string' AND (l->>'sku') ~ '^[A-Za-z0-9_./-]{1,60}$' THEN l->'sku' ELSE to_jsonb('Item'::text) END)
-             WHEN 'fee' THEN jsonb_build_object('name', to_jsonb(CASE
-               WHEN (l->>'name') ~* 'smart[_ -]?coupon' THEN 'Smart coupon'
-               WHEN (l->>'name') ~* 'store[_ -]?credit' THEN 'Store credit'
-               WHEN (l->>'name') ~* 'gift[_ -]?(card|cert)|giftcard' THEN 'Gift card'
-               WHEN (l->>'name') ~* 'wallet' THEN 'Wallet'
-               ELSE 'Fee' END))
+             WHEN 'sku' THEN jsonb_build_object('name', gdpr_code_or(l->'sku', 'Item'))
+             WHEN 'fee' THEN jsonb_build_object('name', gdpr_credit_label(l->'name'))
              ELSE '{}'::jsonb END
         ORDER BY ord)
       FROM jsonb_array_elements(arr) WITH ORDINALITY AS t(l, ord)
@@ -275,12 +305,12 @@ $$;
 -- A billing / shipping block of the same SHAPE, every field empty except the 2-letter country (VAT place-of-supply evidence, owner ruling).
 CREATE OR REPLACE FUNCTION gdpr_empty_address(a jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT jsonb_build_object('first_name', '', 'last_name', '', 'company', '', 'address_1', '', 'address_2', '', 'city', '', 'state', '', 'postcode', '',
-    'country', CASE WHEN a IS NOT NULL AND jsonb_typeof(a) = 'object' AND jsonb_typeof(a->'country') = 'string' AND (a->>'country') ~ '^[A-Za-z]{2}$' THEN a->'country' ELSE to_jsonb(''::text) END,
+    'country', CASE WHEN a IS NOT NULL AND jsonb_typeof(a) = 'object' AND jsonb_typeof(a->'country') = 'string' AND (a->>'country') ~ '^[A-Za-z]{2}$' THEN to_jsonb(a->>'country') ELSE to_jsonb(''::text) END,
     'email', '', 'phone', '')
 $$;
 
 CREATE OR REPLACE FUNCTION gdpr_project_wc_order(o jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
-  SELECT CASE WHEN o IS NULL OR jsonb_typeof(o) <> 'object' THEN o ELSE
+  SELECT CASE WHEN o IS NULL THEN NULL WHEN jsonb_typeof(o) <> 'object' THEN jsonb_build_object('_erasure_projected', true) ELSE
     gdpr_keep_keys(o, ARRAY['id', 'parent_id', 'number', 'status', 'currency', 'currency_symbol', 'version', 'created_via',
       'date_created', 'date_created_gmt', 'date_modified', 'date_modified_gmt', 'date_paid', 'date_paid_gmt', 'date_completed', 'date_completed_gmt',
       'prices_include_tax', 'discount_total', 'discount_tax', 'shipping_total', 'shipping_tax', 'cart_tax', 'total', 'total_tax',
@@ -289,10 +319,10 @@ CREATE OR REPLACE FUNCTION gdpr_project_wc_order(o jsonb) RETURNS jsonb LANGUAGE
             THEN jsonb_build_object('wpo_wcpdf_invoice_number', gdpr_project_meta_value('_wcpdf_invoice_number', o->'wpo_wcpdf_invoice_number')) ELSE '{}'::jsonb END
     || gdpr_numeric_for_present(o, ARRAY['store_credit_used', 'id', 'parent_id', 'discount_total', 'discount_tax', 'shipping_total', 'shipping_tax', 'cart_tax', 'total', 'total_tax'])
     || gdpr_token_for_present(o, ARRAY['number', 'status', 'version', 'created_via', 'payment_method', 'currency_symbol'])
-    || CASE WHEN o ? 'payment_method_title' THEN jsonb_build_object('payment_method_title', CASE WHEN jsonb_typeof(o->'payment_method') = 'string' AND (o->>'payment_method') ~ '^[^[:space:]@]{1,60}$' THEN o->'payment_method' ELSE to_jsonb(''::text) END) ELSE '{}'::jsonb END
+    || CASE WHEN o ? 'payment_method_title' THEN jsonb_build_object('payment_method_title', gdpr_token(o->'payment_method')) ELSE '{}'::jsonb END
     || gdpr_date_for_present(o, ARRAY['date_created', 'date_created_gmt', 'date_modified', 'date_modified_gmt', 'date_paid', 'date_paid_gmt', 'date_completed', 'date_completed_gmt'])
     || gdpr_bool_for_present(o, ARRAY['prices_include_tax', 'needs_payment', 'needs_processing', 'is_editable'])
-    || CASE WHEN o ? 'currency' THEN jsonb_build_object('currency', CASE WHEN jsonb_typeof(o->'currency') = 'string' AND (o->>'currency') ~ '^[A-Za-z]{3}$' THEN o->'currency' ELSE to_jsonb('unreadable'::text) END) ELSE '{}'::jsonb END
+    || CASE WHEN o ? 'currency' THEN jsonb_build_object('currency', gdpr_currency(o->'currency')) ELSE '{}'::jsonb END
     || gdpr_neutral_for_present(o, jsonb_build_object('customer_id', 0, 'customer_note', '', 'customer_ip_address', '', 'customer_user_agent', '', 'order_key', '', 'payment_url', '', 'cart_hash', '', 'transaction_id', '0'))
     || jsonb_build_object('billing', gdpr_empty_address(o->'billing'), 'shipping', gdpr_empty_address(o->'shipping'))
     || jsonb_build_object('meta_data', gdpr_project_meta(o->'meta_data', NULL))
@@ -309,7 +339,7 @@ CREATE OR REPLACE FUNCTION gdpr_project_wc_order(o jsonb) RETURNS jsonb LANGUAGE
 $$;
 
 CREATE OR REPLACE FUNCTION gdpr_project_wc_refund(r jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
-  SELECT CASE WHEN r IS NULL OR jsonb_typeof(r) <> 'object' THEN r ELSE
+  SELECT CASE WHEN r IS NULL THEN NULL WHEN jsonb_typeof(r) <> 'object' THEN jsonb_build_object('_erasure_projected', true) ELSE
     gdpr_keep_keys(r, ARRAY['id', 'parent_id', 'order_id', 'date_created', 'date_created_gmt', 'amount', 'reason', 'refunded_payment'])
     || gdpr_neutral_for_present(r, jsonb_build_object('refunded_by', 0))
     || gdpr_numeric_for_present(r, ARRAY['id', 'parent_id', 'order_id', 'amount'])
@@ -345,16 +375,30 @@ CREATE OR REPLACE FUNCTION gdpr_project_sync_log_payload(p jsonb, family text) R
   SELECT CASE
     WHEN p IS NULL THEN NULL
     WHEN jsonb_typeof(p) <> 'object' THEN jsonb_build_object('_erasure_projected', true)
+    -- the ONE deliberate pass-through, pinned by tests/erasure-projection-no-passthrough.test.ts: the erasure's contact-block step owns this family
     WHEN family = 'held_invoice' THEN p
     WHEN family = 'refund_park' THEN gdpr_project_wc_refund(p)
+    -- outbound: a tracking log, or a status push; each REBUILT from its typed fields
     WHEN family = 'outbound' AND p->>'meta_key' = '_wc_shipment_tracking_items' THEN
       jsonb_build_object('meta_key', '_wc_shipment_tracking_items', 'items', '[]'::jsonb, '_erasure_projected', true) || gdpr_date_for_present(p, ARRAY['pushedDateModifiedGmt'])
-    WHEN family = 'outbound' AND NOT EXISTS (SELECT 1 FROM jsonb_object_keys(p) k WHERE k NOT IN ('status', 'pushedDateModifiedGmt')) THEN
-      gdpr_token_for_present(p, ARRAY['status']) || gdpr_date_for_present(p, ARRAY['pushedDateModifiedGmt'])
+    WHEN family = 'outbound' AND p ? 'status' THEN
+      gdpr_token_for_present(p, ARRAY['status']) || gdpr_date_for_present(p, ARRAY['pushedDateModifiedGmt']) || jsonb_build_object('_erasure_projected', true)
+    -- inbound: the pending-FX queue envelope, or an admission refusal; each REBUILT from its typed fields
     WHEN family = 'inbound' AND p ? 'order' AND p ? 'externalOrderId' THEN
-      jsonb_set(p, '{order}', gdpr_project_wc_order(p->'order')) || jsonb_build_object('_erasure_projected', true)
-    WHEN family = 'inbound' AND p ? 'queue' AND NOT EXISTS (SELECT 1 FROM jsonb_object_keys(p) k
-         WHERE k NOT IN ('queue', 'reason', 'connector', 'externalOrderId', 'externalOrderNumber', 'status', 'configured', 'currency', 'refusedAt', 'attempts')) THEN p
+      gdpr_token_for_present(p, ARRAY['reason', 'connector', 'externalOrderId', 'externalOrderNumber', 'receiptPaymentId'])
+      || jsonb_build_object('currency', gdpr_currency(p->'currency'))
+      || gdpr_date_for_present(p, ARRAY['asOf'])
+      || jsonb_build_object('order', gdpr_project_wc_order(p->'order'))
+      || CASE WHEN jsonb_typeof(p->'paidBlock') = 'object' THEN jsonb_build_object('paidBlock',
+           gdpr_token_for_present(p->'paidBlock', ARRAY['kind']) || gdpr_numeric_for_present(p->'paidBlock', ARRAY['attempts']) || gdpr_date_for_present(p->'paidBlock', ARRAY['firstAt'])) ELSE '{}'::jsonb END
+      || jsonb_build_object('_erasure_projected', true)
+    WHEN family = 'inbound' AND p ? 'queue' THEN
+      gdpr_token_for_present(p, ARRAY['queue', 'reason', 'connector', 'externalOrderId', 'externalOrderNumber', 'status'])
+      || jsonb_build_object('currency', gdpr_currency(p->'currency'))
+      || gdpr_date_for_present(p, ARRAY['refusedAt'])
+      || gdpr_numeric_for_present(p, ARRAY['attempts'])
+      || jsonb_build_object('configured', CASE WHEN jsonb_typeof(p->'configured') = 'array' THEN COALESCE((SELECT jsonb_agg(gdpr_token(c.v) ORDER BY c.ord) FROM jsonb_array_elements(p->'configured') WITH ORDINALITY AS c(v, ord)), '[]'::jsonb) ELSE '[]'::jsonb END)
+      || jsonb_build_object('_erasure_projected', true)
     ELSE jsonb_build_object('_erasure_projected', true)
   END
 $$;
@@ -367,10 +411,11 @@ $$;
 -- The webhook inbox payload, by resource. Anything else, or a payload with no order id, comes back unchanged.
 CREATE OR REPLACE FUNCTION gdpr_project_webhook_payload(p jsonb, resource text) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE
-    WHEN p IS NULL OR jsonb_typeof(p) <> 'object' THEN p
-    WHEN resource = 'orders' AND p ? 'id' THEN gdpr_project_wc_order(p)
-    WHEN resource = 'refunds' AND (p ? 'id') THEN gdpr_project_wc_refund(p)
-    ELSE p
+    WHEN p IS NULL THEN NULL
+    WHEN jsonb_typeof(p) = 'object' AND p = '{}'::jsonb THEN '{}'::jsonb
+    WHEN jsonb_typeof(p) = 'object' AND resource = 'orders' AND p ? 'id' THEN gdpr_project_wc_order(p)
+    WHEN jsonb_typeof(p) = 'object' AND resource = 'refunds' AND p ? 'id' THEN gdpr_project_wc_refund(p)
+    ELSE jsonb_build_object('_erasure_projected', true)
   END
 $$;
 
@@ -504,22 +549,26 @@ CREATE TRIGGER wms_returns_inbox_erased_marker BEFORE INSERT OR UPDATE OF "reaso
 
 -- The audit event of a return the erasure marked: the event copies the free-text reason and note into its before / after JSON, so an event written (or
 -- rewritten) for a marked inbox row gets the marker, whoever writes it. Keyed on the inbox row id the event names.
+-- A return_inbox event's before / after JSON REBUILT from its typed fields: the free-text values become the marker (or null where they were null), the
+-- structured ones (sku, reference, status, warehouse id as tokens; quantity as a number; the two match flags as booleans) are typed, and every other key is dropped.
+CREATE OR REPLACE FUNCTION gdpr_project_return_event(j jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE
+    WHEN j IS NULL THEN NULL
+    WHEN jsonb_typeof(j) <> 'object' THEN jsonb_build_object('_erasure_projected', true)
+    ELSE gdpr_token_for_present(j, ARRAY['sku', 'reference', 'status', 'warehouseId'])
+      || gdpr_numeric_for_present(j, ARRAY['qty'])
+      || gdpr_bool_for_present(j, ARRAY['orderMatched', 'productMatched'])
+      || COALESCE((SELECT jsonb_object_agg(k, CASE WHEN jsonb_typeof(j->k) = 'null' THEN 'null'::jsonb ELSE to_jsonb('Text removed by GDPR erasure'::text) END)
+                     FROM unnest(ARRAY['reason', 'resolutionNote']) AS k WHERE j ? k), '{}'::jsonb)
+  END
+$$;
+
 CREATE OR REPLACE FUNCTION erased_return_event_guard() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE
-  marker CONSTANT text := 'Text removed by GDPR erasure';
 BEGIN
   IF NEW."entityType" <> 'RETURN' OR NEW."action" <> 'return_inbox' THEN RETURN NEW; END IF;
   IF NOT EXISTS (SELECT 1 FROM "wms_returns_inbox" r WHERE r."id" = NEW."entityId" AND r."erasedAt" IS NOT NULL) THEN RETURN NEW; END IF;
-  IF NEW."before" IS NOT NULL AND jsonb_typeof(NEW."before") = 'object' THEN
-    NEW."before" := NEW."before"
-      || (CASE WHEN (NEW."before"->>'reason') IS NOT NULL THEN jsonb_build_object('reason', marker) ELSE '{}'::jsonb END)
-      || (CASE WHEN (NEW."before"->>'resolutionNote') IS NOT NULL THEN jsonb_build_object('resolutionNote', marker) ELSE '{}'::jsonb END);
-  END IF;
-  IF NEW."after" IS NOT NULL AND jsonb_typeof(NEW."after") = 'object' THEN
-    NEW."after" := NEW."after"
-      || (CASE WHEN (NEW."after"->>'reason') IS NOT NULL THEN jsonb_build_object('reason', marker) ELSE '{}'::jsonb END)
-      || (CASE WHEN (NEW."after"->>'resolutionNote') IS NOT NULL THEN jsonb_build_object('resolutionNote', marker) ELSE '{}'::jsonb END);
-  END IF;
+  NEW."before" := gdpr_project_return_event(NEW."before");
+  NEW."after" := gdpr_project_return_event(NEW."after");
   RETURN NEW;
 END
 $$;

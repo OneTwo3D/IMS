@@ -371,7 +371,7 @@ test('[raw payloads] writers AFTER the erasure: the guard triggers project a del
   assert.deepEqual(leaks(updated), [], 'an UPDATE is projected too')
   // (6) a status push (ids only) is not rewritten
   const push = await mk(gone, { direction: 'TO_CONNECTOR', status: 'SYNCED', payload: { status: 'completed', pushedDateModifiedGmt: '2026-11-02T10:00:00' } })
-  assert.deepEqual(push.payload, { status: 'completed', pushedDateModifiedGmt: '2026-11-02T10:00:00' })
+  assert.deepEqual(push.payload, { status: 'completed', pushedDateModifiedGmt: '2026-11-02T10:00:00', _erasure_projected: true }, 'a status push is rebuilt from its two typed fields')
 })
 
 test('[raw payloads] a row the trigger could not see (inserted while an erasure was uncommitted) is cleared by the reconcile pass', { skip }, async (t) => {
@@ -947,7 +947,7 @@ test('[raw payloads] the sync-log projection dispatches by the row\'s own column
   const unknownOut = await mk({ direction: 'TO_CONNECTOR', status: 'SYNCED', payload: { who: FULL_NAME }, externalId: '6004' })
   const refusal = await mk({ payload: { queue: 'admission_refusal', reason: 'status_not_admitted', connector: 'woocommerce', externalOrderId: '6005', externalOrderNumber: '6005', status: 'pending', configured: ['processing'], currency: 'GBP', refusedAt: '2026-11-01T00:00:00.000Z', attempts: 0 }, externalId: '6005' })
   for (const r of [parkSweep, unknownIn, unknownArr, unknownOut]) assert.equal(await dirty(r.id), true, 'PRECONDITION: unrecognised or raw counts as dirty')
-  assert.equal(await dirty(refusal.id), false, 'a recognised refusal (ids and counters only) is clean')
+  assert.equal(await dirty(refusal.id), true, 'a refusal is REBUILT too (no recognised family passes through): dirty until projected')
   const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
   assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
   const p = (await lg(db, parkSweep.id)).payload as { amount: string; reason: string; queue?: string }
@@ -957,7 +957,9 @@ test('[raw payloads] the sync-log projection dispatches by the row\'s own column
     assert.deepEqual((await lg(db, r.id)).payload, { _erasure_projected: true }, 'an unrecognised shape in scope is stubbed')
     assert.equal(await dirty(r.id), false, 'and is clean only once stubbed')
   }
-  assert.deepEqual((await lg(db, refusal.id)).payload, refusal.payload, 'a recognised refusal is untouched')
+  const refusalAfter = (await lg(db, refusal.id)).payload as Record<string, unknown>
+  assert.deepEqual({ ...refusalAfter, _erasure_projected: undefined }, { ...(refusal.payload as Record<string, unknown>), _erasure_projected: undefined }, 'a clean refusal keeps every typed field')
+  assert.equal(refusalAfter._erasure_projected, true)
   // THE GUARD: an insert or update of the same park for the erased order is projected on the way in.
   const guarded = await mk({ recordKind: 'WC_REFUND_PARK', payload: trick, externalId: '6006' })
   assert.deepEqual(leaks(guarded), []); assert.equal(((guarded.payload as { queue?: string }).queue), undefined)
@@ -973,4 +975,65 @@ test('[raw payloads] the sync-log projection dispatches by the row\'s own column
   assert.equal((await reconcileRawPayloads(db)).remaining, 0)
   assert.deepEqual(leaks(await lg(db, slipPark.id)), []); assert.equal(((await lg(db, slipPark.id)).payload as { queue?: string }).queue, undefined)
   assert.deepEqual((await lg(db, slipUnknown.id)).payload, { _erasure_projected: true })
+})
+
+test('[raw payloads] EVERY family\'s envelope is rebuilt from typed fields: an extra unknown top-level key and the seven identity shapes in every field leave no fragment, the projection is idempotent, and an email-shaped currency on an erased order\'s admission refusal is removed by the sweep, the guard and the reconcile', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const cleanups: Array<() => Promise<void>> = []
+  t.after(async () => { await db.$executeRawUnsafe('ALTER TABLE "shopping_sync_logs" ENABLE TRIGGER "shopping_sync_logs_erased_projection"'); for (const c of cleanups) await c(); await fx.cleanup() })
+  const rate = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const shapes = (id: string): unknown[] => [id, [id], { a: id }, { total: id, nested: { who: id } }, [{ id: 1, email: id }], JSON.stringify([1, 'CODE', id]), 7]
+  const fill = (keys: string[], shape: unknown, extra = 'x_unknown') => ({ ...Object.fromEntries(keys.map((k) => [k, shape])), [extra]: shape })
+  const call = async <T,>(q: Promise<Array<{ p: T }>>) => (await q)[0]!.p
+  const sl = (payload: unknown, family: string) => call(db.$queryRaw<Array<{ p: unknown }>>`SELECT gdpr_project_sync_log_payload(${JSON.stringify(payload)}::jsonb, ${family}) AS p`)
+  const wh = (payload: unknown, resource: string) => call(db.$queryRaw<Array<{ p: unknown }>>`SELECT gdpr_project_webhook_payload(${JSON.stringify(payload)}::jsonb, ${resource}) AS p`)
+  const ev2 = (payload: unknown) => call(db.$queryRaw<Array<{ p: unknown }>>`SELECT gdpr_project_return_event(${JSON.stringify(payload)}::jsonb) AS p`)
+  const clean = (v: unknown) => { const o = JSON.parse(JSON.stringify(v ?? null)) as Record<string, unknown> | null; if (o && typeof o === 'object') { delete o.reason; delete o.refunds } return JSON.stringify(o) }
+  const order = rawOrder(fx, rate) as Record<string, unknown>
+  for (const id of [FULL_NAME, EMAIL, PHONE, STREET]) {
+    for (const shape of shapes(id)) {
+      const cases: Array<[string, () => Promise<unknown>, (v: unknown) => Promise<unknown>]> = [
+        ['queue envelope', () => sl({ ...fill(['reason', 'connector', 'externalOrderId', 'externalOrderNumber', 'currency', 'asOf', 'receiptPaymentId'], shape), paidBlock: fill(['kind', 'attempts', 'firstAt'], shape), order }, 'inbound'), (v) => sl(v, 'inbound')],
+        ['queue envelope, hostile order', () => sl({ reason: 'x', connector: 'woocommerce', externalOrderId: '1', externalOrderNumber: '1', currency: 'GBP', asOf: null, order: fill(Object.keys(order), shape) }, 'inbound'), (v) => sl(v, 'inbound')],
+        ['admission refusal', () => sl(fill(['queue', 'reason', 'connector', 'externalOrderId', 'externalOrderNumber', 'status', 'configured', 'currency', 'refusedAt', 'attempts'], shape), 'inbound'), (v) => sl(v, 'inbound')],
+        ['tracking log', () => sl(fill(['meta_key', 'items', 'pushedDateModifiedGmt'], shape), 'outbound'), (v) => sl(v, 'outbound')],
+        ['tracking log (real discriminator)', () => sl({ ...fill(['items', 'pushedDateModifiedGmt'], shape), meta_key: '_wc_shipment_tracking_items' }, 'outbound'), (v) => sl(v, 'outbound')],
+        ['status push', () => sl({ ...fill(['pushedDateModifiedGmt'], shape), status: shape }, 'outbound'), (v) => sl(v, 'outbound')],
+        ['refund park', () => sl(fill(['id', 'parent_id', 'order_id', 'date_created', 'amount', 'reason', 'refunded_by', 'refunded_payment', 'meta_data', 'line_items', 'shipping_lines', 'queue'], shape), 'refund_park'), (v) => sl(v, 'refund_park')],
+        ['webhook order', () => wh({ ...fill(Object.keys(order), shape), id: 5 }, 'orders'), (v) => wh(v, 'orders')],
+        ['webhook refund', () => wh({ ...fill(['parent_id', 'order_id', 'amount', 'reason', 'refunded_by', 'meta_data', 'line_items'], shape), id: 5 }, 'refunds'), (v) => wh(v, 'refunds')],
+        ['return event', () => ev2(fill(['reason', 'resolutionNote', 'sku', 'qty', 'reference', 'status', 'warehouseId', 'orderMatched', 'productMatched'], shape)), (v) => ev2(v)],
+      ]
+      for (const [label, project, again] of cases) {
+        const once = await project()
+        assert.deepEqual(await again(once), once, `${label}: idempotent for ${JSON.stringify(shape).slice(0, 40)}`)
+        for (const frag of [NAME.first, NAME.last, 'example.test', '7700', 'Marmalade']) assert.equal(clean(once).includes(frag), false, `${label}: "${frag}" survived ${JSON.stringify(shape).slice(0, 40)}: ${clean(once).slice(0, 200)}`)
+        assert.equal(clean(once).includes('x_unknown'), false, `${label}: an unknown top-level key is dropped`)
+      }
+    }
+  }
+
+  // REGRESSION: an erased order's admission refusal whose stated currency is email-shaped.
+  const mk = async (externalId: string, payload: unknown) => { const row = await db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', externalId, payload: payload as never } }); cleanups.push(async () => { await db.shoppingSyncLog.deleteMany({ where: { id: row.id } }) }); return row }
+  const refusalBody = (id: string, currency: string) => ({ queue: 'admission_refusal', reason: 'currency_missing', connector: 'woocommerce', externalOrderId: id, externalOrderNumber: id, status: 'pending', configured: ['processing'], currency, refusedAt: '2026-11-01T00:00:00.000Z', attempts: 0, billing_email: EMAIL })
+  const preId = String(fx.externalId) // an order IMS holds: its refusal row has no entity id and is keyed by the storefront order id, which the erasure sweep reads from the link
+  const sweepRow = await mk(preId, refusalBody(preId, EMAIL))
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  cleanups.push(async () => { await db.storefrontOrderErasureObligation.deleteMany({ where: { externalOrderId: { in: [guardId, slipId] } } }) })
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  // sweep: the refusal row of an order IMS holds (entity id set) is found by the erasure; the unheld one by the obligation, below via the guard and reconcile
+  const guardId = String(fx.externalId + 2_200_000_000); const slipId = String(fx.externalId + 2_300_000_000)
+  await db.storefrontOrderErasureObligation.createMany({ data: [{ connector: 'woocommerce', externalOrderId: guardId }, { connector: 'woocommerce', externalOrderId: slipId }] })
+  const guarded = await mk(guardId, refusalBody(guardId, EMAIL))
+  assert.deepEqual(leaks(guarded), [], 'the guard rebuilds the refusal'); assert.equal((guarded.payload as { currency: string }).currency, 'unreadable'); assert.equal('billing_email' in (guarded.payload as object), false)
+  await db.$executeRawUnsafe('ALTER TABLE "shopping_sync_logs" DISABLE TRIGGER "shopping_sync_logs_erased_projection"')
+  const slip = await mk(slipId, refusalBody(slipId, EMAIL))
+  await db.$executeRawUnsafe('ALTER TABLE "shopping_sync_logs" ENABLE TRIGGER "shopping_sync_logs_erased_projection"')
+  const { reconcileRawPayloads } = await import('@/lib/domain/erasure/raw-payloads')
+  assert.ok(leaks(await lg(db, slip.id)).length > 0 || JSON.stringify((await lg(db, slip.id)).payload).includes('example.test'), 'PRECONDITION: raw')
+  assert.equal((await reconcileRawPayloads(db)).remaining, 0)
+  const reconciled = (await lg(db, slip.id)).payload as { currency: string }
+  assert.equal(reconciled.currency, 'unreadable'); assert.equal(JSON.stringify(reconciled).includes('example.test'), false)
+  assert.equal(JSON.stringify((await lg(db, sweepRow.id)).payload).includes('example.test'), false, 'the erasure sweep removed the email-shaped currency')
 })
