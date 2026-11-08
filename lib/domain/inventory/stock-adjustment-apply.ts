@@ -33,7 +33,7 @@ import { manualStockAdjustmentMovementKey } from '@/lib/domain/inventory/stock-m
  * Returns null when there is nothing to post (no cost, no reason account,
  * or zero quantity).
  */
-function buildInventoryAdjustmentJournal(params: {
+export function buildInventoryAdjustmentJournal(params: {
   reasonAccountCode: string
   inventoryAccountCode: string
   productSku: string

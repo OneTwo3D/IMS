@@ -1,6 +1,6 @@
 'use server'
 
-import { xeroBeforeCutoffRefusal, xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
+import { xeroBeforeCutoffRefusal, xeroProducerSeamVerdict, xeroResolveObligationAt } from '@/lib/domain/accounting/xero-producer-seam'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission, requireRole } from '@/lib/auth/server'
 
 import { revalidatePath } from 'next/cache'
@@ -752,7 +752,7 @@ export async function retryFailedXeroSync(
       // writes PENDING, so the decision is asked on the row's own type and payload BEFORE the write. Held: the row stays FAILED.
       const lateRow = await db.accountingSyncLog.findUnique({ where: { id: entryId }, select: { type: true, payload: true, createdAt: true } })
       if (lateRow) {
-        const lateHold = xeroProducerSeamVerdict({ connector: 'xero', type: String(lateRow.type), payload: lateRow.payload })
+        const lateHold = xeroProducerSeamVerdict({ connector: 'xero', type: String(lateRow.type), payload: lateRow.payload, obligationAt: await xeroResolveObligationAt(db, { type: String(lateRow.type), payload: lateRow.payload }) })
         if (lateHold.kind === 'shadow') return { success: false, reset: 0, error: lateHold.notice }
         // THE WRITER-SIDE CUT-OFF: a row queued before the live-from instant is never made claimable again, however it is re-queued.
         const lateBeforeCutoff = xeroBeforeCutoffRefusal({ createdAt: lateRow.createdAt, type: String(lateRow.type) })
@@ -876,7 +876,7 @@ export async function retryFailedXeroSync(
         for (const candidate of scopeCandidates) {
           // THE PRODUCER-SIDE HOLD AT THE RE-QUEUE: a row whose decision is SHADOW is not made claimable again. (The claim
           // boundary in the processor would refuse to send it anyway; this stops the row cycling back to PENDING.)
-          const hold = xeroProducerSeamVerdict({ connector: 'xero', type: String(candidate.type), payload: candidate.payload })
+          const hold = xeroProducerSeamVerdict({ connector: 'xero', type: String(candidate.type), payload: candidate.payload, obligationAt: await xeroResolveObligationAt(db, { type: String(candidate.type), payload: candidate.payload }) })
           if (hold.kind === 'shadow') {
             refused.push({ id: candidate.id, reason: hold.notice, tokenCount: 1 })
             continue

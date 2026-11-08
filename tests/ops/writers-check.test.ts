@@ -82,6 +82,53 @@ test('ARM (a): IMS live for mintsoft.order.create while orders paid after the cu
   assert.match(finding!.message, /^3 MINTSOFT_ORDER_ID marks/)
 })
 
+const WOO_LIVE_ENV = { WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', WC_WRITES_LIVE_FROM: CUTOFF, PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce' }
+
+test('ARM (a5): XEROOM_MARKER evidence while IMS can write the WooCommerce invoice note is a double claim (the invoicing plugin is still writing it)', () => {
+  const env = WOO_LIVE_ENV
+  const clean = evaluateWritersCheck(inputs({ env }))
+  const note = clean.operations.find((op) => op.key === 'woocommerce.order.invoice-note')
+  console.log(`# woo live, no evidence: imsCanWrite invoice-note=${note?.imsCanWrite} verdict=${clean.verdict}`)
+  assert.equal(note?.imsCanWrite, true, 'precondition: IMS can write the invoice note')
+  assert.equal(clean.verdict, 'ok', 'precondition: with no evidence the same installation is clean, so the evidence is what fails it')
+
+  const dirty = evaluateWritersCheck(inputs({ env, evidence: { ...cleanEvidence(), XEROOM_MARKER: reading(4, 9) } }))
+  // MUTATION: drop XEROOM_MARKER from EVIDENCE_CONTESTS (or skip the evidence) => verdict ok => red.
+  assert.equal(dirty.verdict, 'double-claim')
+  assert.equal(dirty.exitCode, 1)
+  const finding = dirty.findings.find((f) => f.code === 'incumbent-evidence-vs-ims-writer' && f.subject === 'woocommerce.order.invoice-note')
+  assert.ok(finding, JSON.stringify(dirty.findings))
+  assert.match(finding!.message, /^4 XEROOM_MARKER marks/)
+  // Evidence that predates the cut-off is not a current claim.
+  const old = evaluateWritersCheck(inputs({ env, evidence: { ...cleanEvidence(), XEROOM_MARKER: reading(0, 9) } }))
+  assert.equal(old.verdict, 'ok')
+})
+
+test('ARM (a6): the WooCommerce writeback the woo-mintsoft plugin owns (status, tracking, partial shipment) is a double claim the moment IMS can write it; the real map is clean while IMS cannot', () => {
+  const real = evaluateWritersCheck(inputs({ env: {} }))
+  for (const key of ['woocommerce.order.status', 'woocommerce.order.tracking', 'woocommerce.order.partial-shipment']) {
+    assert.equal(real.operations.find((op) => op.key === key)?.imsCanWrite, false, `precondition: ${key} is held while no grant is set`)
+  }
+  assert.equal(real.verdict, 'ok')
+  const legacyWrite = { WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test' }
+  const claimed = evaluateWritersCheck(inputs({ env: legacyWrite }))
+  for (const key of ['woocommerce.order.status', 'woocommerce.order.tracking', 'woocommerce.order.partial-shipment']) {
+    const owner = (WRITER_OWNERSHIP_MAP as readonly OwnershipRow[]).find((row) => `${row.destination}.${row.operation}` === key)!.owners.P1
+    assert.equal(owner, 'woo-mintsoft-plugin', `precondition: the map names the plugin as the P1 owner of ${key}`)
+    // MUTATION: skip the owned-elsewhere rule for woocommerce => no finding => red.
+    assert.ok(claimed.findings.some((f) => f.code === 'ims-writes-owned-elsewhere' && f.severity === 'fail' && f.subject === key), `${key} must be a double claim`)
+  }
+  assert.equal(claimed.verdict, 'double-claim')
+  assert.equal(claimed.exitCode, 1)
+  // Switching the plugin's own switch is not the point: a mutated map that hands the row to IMS removes the claim, proving the finding is about ownership.
+  const handed = (WRITER_OWNERSHIP_MAP as readonly OwnershipRow[]).map((row) =>
+    ['woocommerce.order.status', 'woocommerce.order.tracking', 'woocommerce.order.partial-shipment'].includes(`${row.destination}.${row.operation}`)
+      ? { ...row, owners: { ...row.owners, P1: 'IMS' as const } }
+      : row)
+  const cleared = evaluateWritersCheck(inputs({ env: legacyWrite, map: handed }))
+  assert.ok(!cleared.findings.some((f) => f.code === 'ims-writes-owned-elsewhere' && ['woocommerce.order.status', 'woocommerce.order.tracking', 'woocommerce.order.partial-shipment'].includes(f.subject ?? '')))
+})
+
 test('ARM (a2): evidence that predates the cut-off or is not current does not fail (no false finding for pre-cutoff orders)', () => {
   const evidence = { ...cleanEvidence(), MINTSOFT_ORDER_ID: { counted: 0, total: 40, unpaid: 2, floor: '2026-10-10T00:00:00.000Z' } }
   const report = evaluateWritersCheck(inputs({ env: MINTSOFT_LIVE_ENV, evidence }))
