@@ -290,3 +290,15 @@ test('an intermediate arrival too small to move a cent records its quantity and 
   assert.equal(queued.length, 1)
   assert.equal((queued[0].payload as { lines: Array<{ debit?: number }> }).lines[0].debit, 0.01)
 })
+
+test('the closing arrival writes the sub-penny residue row even with no cent left to journal, so a closed document nets to exactly zero', async () => {
+  const { receiveReturnAgainstExpectationsTx } = await mod
+  queued.length = 0; subledger.length = 0; enqueueAnswer = { queued: true }
+  const lines: Line[] = [{ id: 'l-1', expectation_id: 'e-1', qty: new Prisma.Decimal(3), qty_received: new Prisma.Decimal(0), qty_written_off: new Prisma.Decimal(0), cost_snapshot: [entry('3', '0.004')] }]
+  const { tx } = fakeTx(lines, { transitJournalKey: 'k', transitDebitBase: '0.012' })
+  for (let i = 0; i < 3; i += 1) await receiveReturnAgainstExpectationsTx(tx, { ...params({ connector: 'xero', syncEnabled: true }), inboxId: `in-${i}` })
+  assert.equal(queued.length, 1, 'one journal of 0.01; the closing arrival journals nothing')
+  assert.ok(subledger.some((r) => String(r.idempotencyKey).endsWith(':residue')))
+  const net = subledger.reduce((sum, r) => sum.add(r.baseDelta as Prisma.Decimal), new Prisma.Decimal('0.012'))
+  assert.equal(net.toFixed(6), '0.000000')
+})

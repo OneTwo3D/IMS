@@ -305,7 +305,7 @@ export async function receiveReturnAgainstExpectationsTx(
     // Target for everything received so far, less what has actually been journalled (not what an earlier arrival
     // meant to journal), so a skipped or shadowed clearing is made up by the next one.
     const cents = subtractMoney(closes ? postedCents : roundQuantity(after, 2), expectation.transitClearedAmount)
-    if (compareDecimal(cents, 0) <= 0) continue
+    if (compareDecimal(cents, 0) <= 0 && !closes) continue
     // The sub-ledger equals the journal, except that the closing arrival also clears the sub-penny residue the refund's
     // 6dp row holds, so the document's rows net to exactly zero.
     let subledgerBase = cents
@@ -319,6 +319,21 @@ export async function receiveReturnAgainstExpectationsTx(
         _sum: { baseDelta: true },
       })
       subledgerBase = subtractMoney(expectation.transitDebitBase, subtractMoney(0, prior._sum.baseDelta ?? 0))
+    }
+    if (compareDecimal(cents, 0) <= 0) {
+      // The closing arrival has no cent left to journal (earlier arrivals already cleared the posted amount): no
+      // zero-value journal, but the residue row is still written so a closed document's rows net to exactly zero.
+      // Keyed like the other clearing rows, so a replay is a no-op.
+      if (compareDecimal(subledgerBase, 0) !== 0) {
+        await recordTransitSubledgerMovement(tx, {
+          sourceType: 'CUSTOMER_RETURN_IN_TRANSIT',
+          sourceRef: expectation.refundId,
+          idempotencyKey: `return-expectation-receipt:${expectation.id}:${params.inboxId}:residue`,
+          baseDelta: subledgerBase.neg(),
+          journalDate: params.arrivedAt.toISOString().slice(0, 10),
+        })
+      }
+      continue
     }
     await clearTransitInLedger(tx, {
       expectation: { id: expectation.id, reference: expectation.reference, refundId: expectation.refundId },
