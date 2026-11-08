@@ -17,8 +17,8 @@ import {
  * Transit on the next.
  *
  * WHAT IT DOES NOT DO. It creates no stock movement, no stock level change and no cost layer, so nothing returned
- * is on hand, allocatable or pushed to a storefront until it arrives. Arrival (clearing the document against the
- * returns inbox, and writing off units that never come back) is a later slice; until then the switch stays off.
+ * is on hand, allocatable or pushed to a storefront until it arrives. Arrival clears the document against the
+ * returns inbox (return-expectation-receipt.ts); writing off units that never come back is a later slice.
  */
 export const REFUND_RETURNS_IN_TRANSIT_SETTING = 'refund_returns_in_transit_enabled'
 
@@ -44,7 +44,10 @@ export class ReturnExpectationError extends Error {
     | 'refund_line_not_on_refund'
     | 'transit_link_conflict'
     | 'transit_value_not_positive'
-    | 'unvalued_document_has_accounted_quantity') {
+    | 'unvalued_document_has_accounted_quantity'
+    | 'snapshot_unreadable'
+    | 'arrival_accounts_not_configured'
+    | 'arrival_journal_refused') {
     super(`return_expectation:${code}`)
     this.name = 'ReturnExpectationError'
   }

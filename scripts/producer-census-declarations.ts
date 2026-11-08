@@ -445,6 +445,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Queues SALES_INVOICE_UPDATE for a posted invoice; xeroom owns this operation, so IMS shadows it.'),
   d('lib/domain/sales/shipment-service.ts::reconcileOrderAfterShipment::scheduleShoppingOrderCompletion#1', 'woocommerce', 'order.status', 'queue-producer', 'required',
     'Schedules the storefront completion of a shipped order.'),
+  d('lib/domain/sales/return-expectation-receipt.ts::clearTransitInLedger::queueAccountingSyncTxWithOutcome#1', 'xero', 'inventory.journals', 'queue-producer', 'required',
+    'Queues STOCK_RECEIPT (DR Inventory / CR Stock in Transit) when a returned parcel clears its refund\'s return expectation.'),
   d('lib/domain/wms/booked-in-service.ts::processBookedInEvent::queueAccountingSyncTxWithOutcome#1', 'xero', 'inventory.journals', 'queue-producer', 'required',
     'Queues STOCK_RECEIPT when Mintsoft books an ASN in.'),
   d('lib/domain/wms/booked-in-service.ts::processBookedInEvent::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',

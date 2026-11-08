@@ -121,6 +121,7 @@ const INLINE_SITES: Array<{ types: string[]; file: string; pattern: RegExp }> = 
   { types: ['STOCK_RECEIPT'], file: 'app/actions/purchase-orders.ts', pattern: /date: new Date\(\)\.toISOString\(\)\.slice\(0, 10\),\n\s*reference: `Receipt: \$\{po\.reference\}`/ },
   { types: ['STOCK_RECEIPT'], file: 'lib/connectors/mintsoft/sync/stock-sync.ts', pattern: /date: now\.toISOString\(\)\.slice\(0, 10\),\n\s*reference: `Receipt: \$\{purchaseCost\.poReference\}`/ },
   { types: ['STOCK_RECEIPT'], file: 'lib/domain/wms/booked-in-service.ts', pattern: /date: now\.toISOString\(\)\.slice\(0, 10\),\n\s*reference: `Receipt: \$\{po\.reference\}`/ },
+  { types: ['STOCK_RECEIPT'], file: 'lib/domain/sales/return-expectation-receipt.ts', pattern: /date: params\.arrivedAt\.toISOString\(\)\.slice\(0, 10\),\n\s*reference: `Return received: \$\{params\.expectation\.reference\}`/ },
   { types: ['INVENTORY_ADJUSTMENT'], file: 'app/actions/purchase-orders.ts', pattern: /date: new Date\(\)\.toISOString\(\)\.slice\(0, 10\),\n\s*reference: returnRef,/ },
   { types: ['BILL_PAYMENT'], file: 'app/actions/purchase-orders.ts', pattern: /paymentDate: input\.paymentDate,/ },
   { types: ['INVOICE_PAYMENT'], file: 'lib/domain/accounting/invoice-payment-enqueue.ts', pattern: /paymentDate: params\.paidAt\.toISOString\(\)\.slice\(0, 10\),/ },
