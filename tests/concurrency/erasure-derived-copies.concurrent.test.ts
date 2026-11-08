@@ -326,6 +326,9 @@ test('[derived copies] more dirty event logs and notifications than one batch ar
   // A capped run (one round, 500 per statement) leaves rows and SAYS so.
   const capped = await reconcileDerivedCopies(db, 500, 1)
   assert.ok(capped.remaining >= N - 500, `the cap leaves rows behind and reports them (${capped.remaining})`)
+  // EACH store is capped on its own: the notifications left are at least the overflow too.
+  const dirtyNotes = await db.notification.count({ where: { actionUrl: `/sales/${fx.orderId}`, title: NAME } })
+  assert.ok(dirtyNotes >= N - 500, `the notifications are capped per statement (${dirtyNotes})`)
   // A full run drains them in rounds.
   const full = await reconcileDerivedCopies(db)
   assert.equal(full.remaining, 0)
@@ -365,4 +368,55 @@ test('[derived copies] an event-log MESSAGE that echoes a name (a final failure)
   assert.equal(result.remaining, 0)
   assert.equal((await db.accountingEventLog.findUniqueOrThrow({ where: { id: later.id } })).message, MARKER)
   assert.equal((await db.accountingEventLog.findUniqueOrThrow({ where: { id: live.id } })).message, 'Other Person rejected')
+})
+
+test('[derived copies] an incomplete scrub FAILS CLOSED: the whole erasure rolls back and the order is not marked erased', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await fixture(db)
+  t.after(() => fx.cleanup())
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  // A trigger that runs after the guard and puts the old body back (a stand-in for any writer that undoes the scrub), so the erasure's UPDATEs change nothing
+  // and its re-check (built on the real rule) finds the rows still dirty.
+  await db.$executeRawUnsafe(`CREATE OR REPLACE FUNCTION zz_revert_scrub() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW."linesJson" := OLD."linesJson"; RETURN NEW; END $$`)
+  await db.$executeRawUnsafe(`CREATE TRIGGER zz_revert_scrub BEFORE UPDATE ON "accounting_events" FOR EACH ROW EXECUTE FUNCTION zz_revert_scrub()`)
+  try {
+    const result = await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })
+    assert.equal(result.success, false, 'the erasure reports failure')
+  } finally {
+    await db.$executeRawUnsafe(`DROP TRIGGER IF EXISTS zz_revert_scrub ON "accounting_events"`)
+    await db.$executeRawUnsafe(`DROP FUNCTION IF EXISTS zz_revert_scrub()`)
+  }
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })).erasedAt, null, 'rolled back: the order is not erased')
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })).customerName, NAME)
+  assert.equal((await db.customer.findUniqueOrThrow({ where: { id: fx.customerId } })).gdprAnonymisedAt, null)
+  // And with the real function the erasure then succeeds (the failure was the injected one).
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+})
+
+test('[derived copies] "remaining" counts every store: one dirty row in each is reported on its own', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await fixture(db)
+  t.after(() => fx.cleanup())
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { reconcileDerivedCopies } = await import('@/lib/domain/erasure/derived-copies')
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const log = await db.accountingEventLog.findFirstOrThrow({ where: { accountingEventId: fx.ids.pendingEvent } })
+  const note = await db.notification.findFirstOrThrow({ where: { actionUrl: `/sales/${fx.orderId}` } })
+  const dirtyOne: Array<[string, (tx: Parameters<Parameters<typeof db.$transaction>[0]>[0]) => Promise<unknown>]> = [
+    ['event', (tx) => tx.accountingEvent.update({ where: { id: fx.ids.pendingEvent }, data: { linesJson: contactDoc(NAME, EMAIL) } })],
+    ['event log body', (tx) => tx.accountingEventLog.update({ where: { id: log.id }, data: { metadata: { enqueuedLinesJson: contactDoc(NAME, EMAIL) } } })],
+    ['event log message', (tx) => tx.accountingEventLog.update({ where: { id: log.id }, data: { message: `echo ${NAME}` } })],
+    ['sync error', (tx) => tx.accountingSyncLog.update({ where: { id: fx.ids.syncFailed }, data: { errorMessage: `echo ${NAME}` } })],
+    ['notification', (tx) => tx.notification.update({ where: { id: note.id }, data: { message: NAME } })],
+  ]
+  for (const [label, dirty] of dirtyOne) {
+    await withTriggersOff(db, dirty)
+    // Zero rounds: nothing is drained, only counted.
+    const counted = await reconcileDerivedCopies(db, 500, 0)
+    assert.equal(counted.remaining, 1, `${label}: counted`)
+    assert.equal(counted.changed, 0)
+    const drained = await reconcileDerivedCopies(db)
+    assert.equal(drained.remaining, 0, `${label}: drained`)
+    assert.ok(drained.changed >= 1)
+  }
 })
