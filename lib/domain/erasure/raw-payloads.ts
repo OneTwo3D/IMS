@@ -1,4 +1,5 @@
 import { Prisma } from '@/app/generated/prisma/client'
+import { scrubReturnInboxEvents } from './return-events'
 import { clearRawReturnLogs } from '@/lib/connectors/wms/return-record-keys'
 
 /**
@@ -159,6 +160,8 @@ export async function scrubRawPayloadsInTx(tx: Client, subject: RawPayloadSubjec
   }
   // (After the clearing above: the marker's trigger would otherwise clear the payload first and the count would miss it.) A DURABLE MARKER on every inbox row the erasure reaches: a later poll that resolves the same return to no order (or to another) must still treat it as erased.
   if (inbox.length > 0) await tx.wmsReturnsInbox.updateMany({ where: { id: { in: inbox.map((r) => r.id) }, erasedAt: null }, data: { erasedAt: new Date() } })
+  // The audit events of EVERY inbox row reached here (the linked ones are scrubbed by the free-text step too; this covers the unlinked ones it cannot find).
+  if (inbox.length > 0) counts.rawReturnRecordsCleared += await scrubReturnInboxEvents(tx, inbox.map((r) => r.id))
   const returnIds = [...new Set(inbox.map((r) => r.externalReturnId))]
   if (returnIds.length > 0 || refs.length > 0) {
     counts.rawReturnRecordsCleared += await clearRawReturnLogs(tx, returnIds, refs)

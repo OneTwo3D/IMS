@@ -5,6 +5,7 @@ import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { HELD_SALES_INVOICE_RECORD_KIND } from '@/lib/domain/sales/wc-sync-row-families'
 import { EMAIL_RECIPIENT_ERASED_REASON } from './email-recipient'
 import { scrubContactBlock } from './contact-gate'
+import { scrubReturnInboxEvents } from './return-events'
 import { loadRawPayloadSubject, scrubRawPayloadsInTx, type RawPayloadCounts } from './raw-payloads'
 import { SYSTEM_PAYMENT_NOTES, orderIsErasedInTx } from './order-state'
 export { orderIsErasedInTx }
@@ -363,17 +364,7 @@ export async function scrubLinkedFreeText(tx: Prisma.TransactionClient, orderIds
     // the inbox row ids and their free-text keys are replaced with the marker, set-based; null stays null and other keys are untouched.
     if (returns.length > 0) {
       const inboxIds = returns.map((r) => r.id)
-      changed += Number(await tx.$executeRaw`
-        UPDATE "wms_mutation_events" e
-           SET "before" = CASE WHEN e."before" IS NULL THEN NULL ELSE
-                 e."before" || (CASE WHEN (e."before"->>'reason') IS NOT NULL THEN jsonb_build_object('reason', ${marker}::text) ELSE '{}'::jsonb END)
-                            || (CASE WHEN (e."before"->>'resolutionNote') IS NOT NULL THEN jsonb_build_object('resolutionNote', ${marker}::text) ELSE '{}'::jsonb END) END,
-               "after" = CASE WHEN e."after" IS NULL THEN NULL ELSE
-                 e."after" || (CASE WHEN (e."after"->>'reason') IS NOT NULL THEN jsonb_build_object('reason', ${marker}::text) ELSE '{}'::jsonb END)
-                           || (CASE WHEN (e."after"->>'resolutionNote') IS NOT NULL THEN jsonb_build_object('resolutionNote', ${marker}::text) ELSE '{}'::jsonb END) END
-         WHERE e."entityType" = 'RETURN' AND e."action" = 'return_inbox' AND e."entityId" = ANY(${inboxIds}::text[])
-           AND ((e."before"->>'reason') IS DISTINCT FROM ${marker}::text OR (e."after"->>'reason') IS DISTINCT FROM ${marker}::text)
-           AND ((e."before"->>'reason') IS NOT NULL OR (e."after"->>'reason') IS NOT NULL OR (e."before"->>'resolutionNote') IS NOT NULL OR (e."after"->>'resolutionNote') IS NOT NULL)`)
+      changed += await scrubReturnInboxEvents(tx, inboxIds)
     }
     const rawIds = returns.filter((r) => r.rawPayload != null && JSON.stringify(r.rawPayload) !== '{}').map((r) => r.id)
     if (rawIds.length > 0) changed += (await tx.wmsReturnsInbox.updateMany({ where: { id: { in: rawIds } }, data: { rawPayload: {} } })).count

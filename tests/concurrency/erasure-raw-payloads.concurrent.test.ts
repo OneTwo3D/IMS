@@ -554,3 +554,47 @@ test('[raw payloads] a delivery for an order IMS does not hold, found only throu
   assert.ok(created.erasedAt, 'created already erased')
   assert.deepEqual(leaks({ n: created.customerName, e: created.customerEmail, b: created.billingAddress, s: created.shippingAddress }), [])
 })
+
+test('[raw payloads] store-credit evidence survives the projection in both legacy shapes: the importer\'s classifier reaches the SAME verdict on the projected order, and no email or restriction survives', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  t.after(async () => { await fx.cleanup() })
+  const rate = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const { classifyWcCouponLines, WC_UNMODELLED_CREDIT_META_KEYS } = await import('@/lib/connectors/woocommerce/sync/coupon-classification')
+  const project = async (order: unknown) => (await db.$queryRaw<Array<{ p: { coupon_lines: unknown[]; meta_data: unknown[]; fee_lines: unknown[] } }>>`SELECT gdpr_project_wc_order(${JSON.stringify(order)}::jsonb) AS p`)[0]!.p
+  const verdict = (o: { coupon_lines: unknown[]; meta_data: unknown[]; fee_lines?: unknown[] }) => {
+    const c = classifyWcCouponLines(o.coupon_lines as never, o.meta_data as never, (o.fee_lines ?? []) as never)
+    return JSON.stringify({ lines: c.lines.map((l) => [l.code, l.kind, String(l.net), String(l.tax), l.discountType, l.creditConflict]), problems: c.signalProblems.map((p) => p.code).sort(), unknown: c.unknown.length, creditNet: String(c.creditNet) })
+  }
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ['contribution as a JSON string + legacy coupon_data with an email restriction', {
+      coupon_lines: [{ id: 1, code: 'gc-5', discount: '5.00', discount_tax: '0.00', meta_data: [{ id: 1, key: 'coupon_data', value: { discount_type: 'smart_coupon', customer_email: [EMAIL], note: NAME.last } }] }],
+      meta_data: [{ id: 2, key: 'smart_coupons_contribution', value: JSON.stringify({ 'gc-5': '5.00' }) }] }],
+    ['contribution as an object, no type record', {
+      coupon_lines: [{ id: 1, code: 'gc-7', discount: '7.00', discount_tax: '0.00', meta_data: [] }],
+      meta_data: [{ id: 2, key: 'smart_coupons_contribution', value: { 'gc-7': 7 } }] }],
+    ['a contribution amount that is junk', {
+      coupon_lines: [{ id: 1, code: 'gc-9', discount: '9.00', discount_tax: '0.00', meta_data: [] }],
+      meta_data: [{ id: 2, key: 'smart_coupons_contribution', value: { 'gc-9': `junk ${NAME.first}` } }] }],
+    ['legacy coupon_data only, a genuine percent discount', {
+      coupon_lines: [{ id: 1, code: 'save10', discount: '10.00', discount_tax: '2.00', meta_data: [{ id: 1, key: 'coupon_data', value: JSON.stringify({ discount_type: 'percent', email_restrictions: [EMAIL] }) }] }],
+      meta_data: [] }],
+    ['credit words only in an unrelated coupon-line meta entry', {
+      coupon_lines: [{ id: 1, code: 'plain', discount: '4.00', discount_tax: '0.00', meta_data: [{ id: 1, key: 'campaign', value: 'Store credit top-up' }] }],
+      meta_data: [] }],
+    ['wallet meta: a readable amount and a junk one', {
+      coupon_lines: [], meta_data: [{ id: 1, key: '_used_wallet_amount', value: '2.50' }, { id: 2, key: '_gift_card_amount', value: `abc ${NAME.first}` }] }],
+  ]
+  for (const [label, extra] of cases) {
+    const original = { ...rawOrder(fx, rate, extra), fee_lines: [] }
+    const projected = await project(original)
+    assert.equal(verdict(projected), verdict(original as never), `same classification: ${label}`)
+    assert.deepEqual(leaks(projected), [], `no identity: ${label}`)
+    assert.equal(JSON.stringify(projected).includes('customer_email'), false)
+  }
+  // The SQL's wallet-key list covers every key the classifier's own list names.
+  for (const key of WC_UNMODELLED_CREDIT_META_KEYS) {
+    const p = await project({ ...rawOrder(fx, rate, { meta_data: [{ id: 1, key, value: '3.00' }], coupon_lines: [] }), fee_lines: [] })
+    assert.deepEqual(p.meta_data, [{ id: 1, key, value: '3.00' }], `${key} survives`)
+  }
+})

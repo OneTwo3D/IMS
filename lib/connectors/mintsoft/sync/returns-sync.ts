@@ -425,6 +425,10 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
             await tx.$queryRaw`SELECT id FROM "sales_orders" WHERE id = ${candidate} FOR UPDATE`
             if ((await tx.salesOrder.findUnique({ where: { id: candidate }, select: { erasedAt: true } }))?.erasedAt) orderErased = true
           }
+          // THE INBOX ROW IS LOCKED TOO (after the orders, the erasure's own order: orders, then linked rows) and its marker re-read under that lock: a return with no
+          // order link has no order lock to wait on, and an erasure committing after the unlocked read above would otherwise be missed.
+          const lockedRow = await tx.$queryRaw<Array<{ erasedAt: Date | null }>>`SELECT "erasedAt" FROM "wms_returns_inbox" WHERE "connector" = 'mintsoft' AND "externalReturnId" = ${record.externalReturnId} FOR UPDATE`
+          if (lockedRow[0]?.erasedAt) orderErased = true
           const reason = orderErased ? null : reasonText
           const rawPayload = (orderErased ? {} : (record.raw ?? {})) as Prisma.InputJsonValue
           const saved = await tx.wmsReturnsInbox.upsert({
@@ -463,6 +467,7 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
               id: true,
               productId: true,
               sku: true,
+              erasedAt: true,
             },
           })
           // THE SYNC LOG ROW IS WRITTEN IN THIS SAME TRANSACTION, under the same order lock, with the same decision: a log row used to carry the raw
@@ -491,7 +496,7 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
                 ? `Mintsoft return ${record.externalReturnId} updated in the returns inbox`
                 : `Mintsoft return ${record.externalReturnId} staged in the returns inbox`,
               before: existing ? { status: existing.status, warehouseId: existing.warehouseId } : null,
-              after: { sku: saved.sku, qty, reason, reference, orderMatched: Boolean(order), productMatched: Boolean(product) },
+              after: { sku: saved.sku, qty, reason: saved.erasedAt ? null : reason, reference, orderMatched: Boolean(order), productMatched: Boolean(product) },
               triggeredBy: 'returns-sync',
             }),
           })

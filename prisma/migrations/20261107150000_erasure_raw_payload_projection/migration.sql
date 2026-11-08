@@ -31,14 +31,64 @@ CREATE OR REPLACE FUNCTION gdpr_wc_meta_key_allowed(k text) RETURNS boolean LANG
     k = ANY(ARRAY['_base_currency_exchange_rate', '_cogs_total_value_order_currency', '_cogs_value_order_currency', 'vat_compliance_vat_paid',
       '_wcpdf_invoice_number', '_wcpdf_invoice_number_data', '_wcpdf_invoice_date', '_wcpdf_invoice_date_formatted', '_wcpdf_invoice_display_date',
       'xeroom_invoice_no_sent', 'xeroom_invoice_reference_sent', 'xeroom_order_sent', '_reduced_stock', '_restock_refunded_items',
-      '_refunded_item_id', 'coupon_info', '_wclc_fee', '_wclc_fee_kind', '_wclc_duty_component', '_wclc_tax_component', '_wclc_handling_component']))
+      '_refunded_item_id', 'coupon_info', 'coupon_data', 'smart_coupons_contribution', '_wc_store_credit_used', '_store_credit_used', '_store_credit_applied', '_used_wallet_amount', '_woo_wallet_used', '_partial_pay_through_wallet_amount', '_ywgc_applied_gift_cards_total', '_gift_card_amount', '_giftcard_amount', 'wc_gift_cards_total', '_smart_coupon_credit_used', '_wclc_fee', '_wclc_fee_kind', '_wclc_duty_component', '_wclc_tax_component', '_wclc_handling_component']))
 $$;
 
--- A meta_data array reduced to the allowed keys (each entry keeps id, key, value). Not an array -> [].
+-- A value that IS a money amount stays; anything else becomes the fixed word 'unreadable', which the importer's strict money reader also refuses (an
+-- amount-shaped value is not personal data; a free-text one is dropped). allow_empty: the empty string is a readable zero for the wallet meta keys.
+CREATE OR REPLACE FUNCTION gdpr_money_or_unreadable(v jsonb, allow_empty boolean) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE
+    WHEN v IS NULL THEN to_jsonb('unreadable'::text)
+    WHEN jsonb_typeof(v) = 'number' AND (v#>>'{}')::numeric >= 0 THEN v
+    WHEN jsonb_typeof(v) = 'string' AND (v#>>'{}') ~ '^\s*[0-9]+(\.[0-9]+)?\s*$' THEN v
+    WHEN jsonb_typeof(v) = 'string' AND allow_empty AND (v#>>'{}') = '' THEN v
+    ELSE to_jsonb('unreadable'::text) END
+$$;
+
+-- A meta value the storefront may send as a JSON string: parsed when it is one, NULL when empty, a fixed marker when it does not parse.
+CREATE OR REPLACE FUNCTION gdpr_jsonb_maybe(v jsonb) RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+  IF v IS NULL THEN RETURN NULL; END IF;
+  IF jsonb_typeof(v) = 'string' THEN
+    IF btrim(v#>>'{}') = '' THEN RETURN NULL; END IF;
+    RETURN (v#>>'{}')::jsonb;
+  END IF;
+  RETURN v;
+EXCEPTION WHEN others THEN
+  RETURN to_jsonb('unparseable'::text);
+END
+$$;
+
+-- `smart_coupons_contribution`: the {coupon code: amount} map the importer reads to identify store credit. Codes are kept (they are discount evidence);
+-- every amount becomes a readable amount or 'unreadable'. A value that is not a map becomes the fixed word 'unreadable' (the importer refuses it the same way).
+CREATE OR REPLACE FUNCTION gdpr_project_contribution(v jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE WHEN p IS NULL OR jsonb_typeof(p) <> 'object' THEN to_jsonb('unreadable'::text)
+    ELSE COALESCE((SELECT jsonb_object_agg(e.key, gdpr_money_or_unreadable(e.value, false)) FROM jsonb_each(p) e), '{}'::jsonb) END
+  FROM (SELECT gdpr_jsonb_maybe(v) AS p) x
+$$;
+
+-- legacy `coupon_data`: only `discount_type`, the one field the importer's classifier reads; restrictions, emails and everything else are dropped.
+CREATE OR REPLACE FUNCTION gdpr_project_coupon_data(v jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE WHEN p IS NOT NULL AND jsonb_typeof(p) = 'object' AND jsonb_typeof(p->'discount_type') = 'string'
+    THEN jsonb_build_object('discount_type', CASE WHEN (p->>'discount_type') ~ '^[A-Za-z_ -]{1,40}$' THEN p->'discount_type' ELSE to_jsonb('other'::text) END)
+    ELSE '{}'::jsonb END
+  FROM (SELECT gdpr_jsonb_maybe(v) AS p) x
+$$;
+
+CREATE OR REPLACE FUNCTION gdpr_project_meta_value(k text, v jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE
+    WHEN k = 'smart_coupons_contribution' THEN gdpr_project_contribution(v)
+    WHEN k = 'coupon_data' THEN gdpr_project_coupon_data(v)
+    WHEN k IN ('_wc_store_credit_used', '_store_credit_used', '_store_credit_applied', '_used_wallet_amount', '_woo_wallet_used', '_partial_pay_through_wallet_amount',
+               '_ywgc_applied_gift_cards_total', '_gift_card_amount', '_giftcard_amount', 'wc_gift_cards_total', '_smart_coupon_credit_used') THEN gdpr_money_or_unreadable(v, true)
+    ELSE v END
+$$;
+
+-- A meta_data array reduced to the allowed keys (each entry keeps id, key, value; a credit-evidence value is reduced as above). Not an array -> [].
 CREATE OR REPLACE FUNCTION gdpr_project_meta(meta jsonb, only_keys text[]) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE WHEN meta IS NULL OR jsonb_typeof(meta) <> 'array' THEN '[]'::jsonb ELSE COALESCE((
-    SELECT jsonb_agg(gdpr_keep_keys(m, ARRAY['id', 'key', 'value']) ORDER BY ord)
-      FROM jsonb_array_elements(meta) WITH ORDINALITY AS t(m, ord)
+    SELECT jsonb_agg(CASE WHEN m ? 'value' THEN k.entry || jsonb_build_object('value', gdpr_project_meta_value(m->>'key', m->'value')) ELSE k.entry END ORDER BY ord)
+      FROM jsonb_array_elements(meta) WITH ORDINALITY AS t(m, ord), LATERAL (SELECT gdpr_keep_keys(m, ARRAY['id', 'key', 'value']) AS entry) k
      WHERE jsonb_typeof(m) = 'object' AND ((only_keys IS NULL AND gdpr_wc_meta_key_allowed(m->>'key')) OR (only_keys IS NOT NULL AND (m->>'key') = ANY(only_keys)))
   ), '[]'::jsonb) END
 $$;
@@ -66,6 +116,23 @@ CREATE OR REPLACE FUNCTION gdpr_project_lines(arr jsonb, keys text[], with_meta 
   ), '[]'::jsonb) END
 $$;
 
+-- Coupon lines: id, code and amounts; meta limited to the two type records the classifier reads (coupon_info, and legacy coupon_data reduced to its type).
+-- The classifier also looks for credit WORDS anywhere in a line's meta: when a dropped entry held one, a fixed evidence entry stands in for it.
+CREATE OR REPLACE FUNCTION gdpr_project_coupon_lines(arr jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE WHEN arr IS NULL OR jsonb_typeof(arr) <> 'array' THEN '[]'::jsonb ELSE COALESCE((
+    SELECT jsonb_agg(
+      gdpr_keep_keys(l, ARRAY['id', 'code', 'discount', 'discount_tax'])
+      || jsonb_build_object('meta_data',
+           gdpr_project_meta(l->'meta_data', ARRAY['coupon_info', 'coupon_data'])
+           || CASE WHEN (l->'meta_data')::text ~* 'smart[_ -]?coupon|store[_ -]?credit|gift[_ -]?(card|cert)|giftcard|wallet'
+                    AND (gdpr_project_meta(l->'meta_data', ARRAY['coupon_info', 'coupon_data']))::text !~* 'smart[_ -]?coupon|store[_ -]?credit|gift[_ -]?(card|cert)|giftcard|wallet'
+                   THEN jsonb_build_array(jsonb_build_object('key', '_erasure_credit_evidence', 'value', 'store credit')) ELSE '[]'::jsonb END)
+      ORDER BY ord)
+      FROM jsonb_array_elements(arr) WITH ORDINALITY AS t(l, ord)
+     WHERE jsonb_typeof(l) = 'object'
+  ), '[]'::jsonb) END
+$$;
+
 -- A billing / shipping block of the same SHAPE, every field empty except the 2-letter country (VAT place-of-supply evidence, owner ruling).
 CREATE OR REPLACE FUNCTION gdpr_empty_address(a jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT jsonb_build_object('first_name', '', 'last_name', '', 'company', '', 'address_1', '', 'address_2', '', 'city', '', 'state', '', 'postcode', '',
@@ -87,7 +154,7 @@ CREATE OR REPLACE FUNCTION gdpr_project_wc_order(o jsonb) RETURNS jsonb LANGUAGE
     || jsonb_build_object('shipping_lines', gdpr_project_lines(o->'shipping_lines',
          ARRAY['id', 'method_id', 'method_title', 'instance_id', 'total', 'total_tax', 'taxes', 'tax_status'], true, NULL))
     || jsonb_build_object('fee_lines', gdpr_project_lines(o->'fee_lines', ARRAY['id', 'tax_class', 'tax_status', 'total', 'total_tax', 'taxes'], true, NULL, 'fee'))
-    || jsonb_build_object('coupon_lines', gdpr_project_lines(o->'coupon_lines', ARRAY['id', 'code', 'discount', 'discount_tax'], true, ARRAY['coupon_info']))
+    || jsonb_build_object('coupon_lines', gdpr_project_coupon_lines(o->'coupon_lines'))
     || jsonb_build_object('tax_lines', gdpr_project_lines(o->'tax_lines', ARRAY['id', 'rate_code', 'rate_id', 'label', 'compound', 'tax_total', 'shipping_tax_total', 'rate_percent'], false, NULL))
     || jsonb_build_object('refunds', gdpr_project_lines(o->'refunds', ARRAY['id', 'total', 'reason'], false, NULL))
     || jsonb_build_object('_erasure_projected', true)
@@ -217,3 +284,28 @@ $$;
 
 CREATE TRIGGER wms_returns_inbox_erased_marker BEFORE INSERT OR UPDATE OF "reason", "resolutionNote", "rawPayload", "erasedAt" ON "wms_returns_inbox"
   FOR EACH ROW EXECUTE FUNCTION erased_returns_inbox_marker_guard();
+
+-- The audit event of a return the erasure marked: the event copies the free-text reason and note into its before / after JSON, so an event written (or
+-- rewritten) for a marked inbox row gets the marker, whoever writes it. Keyed on the inbox row id the event names.
+CREATE OR REPLACE FUNCTION erased_return_event_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  marker CONSTANT text := 'Text removed by GDPR erasure';
+BEGIN
+  IF NEW."entityType" <> 'RETURN' OR NEW."action" <> 'return_inbox' THEN RETURN NEW; END IF;
+  IF NOT EXISTS (SELECT 1 FROM "wms_returns_inbox" r WHERE r."id" = NEW."entityId" AND r."erasedAt" IS NOT NULL) THEN RETURN NEW; END IF;
+  IF NEW."before" IS NOT NULL AND jsonb_typeof(NEW."before") = 'object' THEN
+    NEW."before" := NEW."before"
+      || (CASE WHEN (NEW."before"->>'reason') IS NOT NULL THEN jsonb_build_object('reason', marker) ELSE '{}'::jsonb END)
+      || (CASE WHEN (NEW."before"->>'resolutionNote') IS NOT NULL THEN jsonb_build_object('resolutionNote', marker) ELSE '{}'::jsonb END);
+  END IF;
+  IF NEW."after" IS NOT NULL AND jsonb_typeof(NEW."after") = 'object' THEN
+    NEW."after" := NEW."after"
+      || (CASE WHEN (NEW."after"->>'reason') IS NOT NULL THEN jsonb_build_object('reason', marker) ELSE '{}'::jsonb END)
+      || (CASE WHEN (NEW."after"->>'resolutionNote') IS NOT NULL THEN jsonb_build_object('resolutionNote', marker) ELSE '{}'::jsonb END);
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER wms_mutation_events_erased_return BEFORE INSERT OR UPDATE OF "before", "after" ON "wms_mutation_events"
+  FOR EACH ROW EXECUTE FUNCTION erased_return_event_guard();

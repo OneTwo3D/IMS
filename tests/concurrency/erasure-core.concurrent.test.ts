@@ -2593,3 +2593,41 @@ test('[erasure] an UNMATCHED return cleared by the erasure stays erased: a later
   const logs = await db.wmsSyncLog.findMany({ where: { sku: 'SKU-RET', job: { type: 'RETURNS_SYNC' } } })
   assert.ok(logs.every((l) => !JSON.stringify(l.payload).includes(STREET)))
 })
+
+test('[erasure] the audit events of an UNLINKED return hold the marker after the erasure, and a later update of that return writes no reason into a new event', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const { runMintsoftReturnsSync } = await import('@/lib/connectors/mintsoft/sync/returns-sync')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const uid = randomUUID().slice(0, 8)
+  const connection = await db.wmsConnection.create({ data: { connector: 'mintsoft', label: `evt-${uid}`, active: true }, select: { id: true } })
+  const binding = await db.externalWmsBinding.create({ data: { connectionId: connection.id, warehouseId: fx.warehouseId, connector: 'mintsoft', externalWarehouseId: `ext-${uid}`, active: true, returnsMode: 'POLL' } as never, select: { id: true } })
+  const returnId = `RET-EVT-${uid}`
+  let inboxId = ''
+  t.after(async () => {
+    pollReturnsRecords = null
+    await db.wmsMutationEvent.deleteMany({ where: { entityId: inboxId } })
+    await db.wmsReturnsInbox.deleteMany({ where: { externalReturnId: returnId } })
+    await db.externalWmsBinding.deleteMany({ where: { id: binding.id } })
+    await db.wmsConnection.deleteMany({ where: { id: connection.id } })
+    await fx.cleanup()
+  })
+  const order = await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId }, select: { orderNumber: true } })
+  const inbox = await db.wmsReturnsInbox.create({ data: { connector: 'mintsoft', externalReturnId: returnId, orderId: null, reference: order.orderNumber, reason: `${FULL_NAME} says broken` } as never })
+  inboxId = inbox.id
+  await db.wmsMutationEvent.create({ data: { connector: 'mintsoft', direction: 'INBOUND', action: 'return_inbox', outcome: 'SUCCEEDED', entityType: 'RETURN', entityId: inbox.id, summary: 's', before: null, after: { reason: `${FULL_NAME} says broken`, sku: 'SKU-RET' } } as never })
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const events = async () => db.wmsMutationEvent.findMany({ where: { entityType: 'RETURN', action: 'return_inbox', entityId: inbox.id } })
+  const first = await events()
+  assert.ok(first.length >= 1 && first.every((e) => !JSON.stringify(e).includes(NAME.last)), 'the existing event holds no name')
+  assert.equal((first[0]!.after as { reason: string }).reason, 'Text removed by GDPR erasure')
+  // A later poll of the same return: the event it writes carries no reason.
+  pollReturnsRecords = () => [{ externalReturnId: returnId, externalWarehouseId: `ext-${uid}`, sku: 'SKU-RET', qty: 1, orderReference: 'NO-SUCH-REFERENCE', reason: `${FULL_NAME} says it arrived broken`, receivedAt: '2026-11-04T10:00:00.000Z', raw: { Name: FULL_NAME } }]
+  await runMintsoftReturnsSync('test')
+  const second = await events()
+  assert.ok(second.length > first.length, 'PRECONDITION: the poll wrote a new event')
+  assert.ok(second.every((e) => !JSON.stringify(e).includes(NAME.last) && !JSON.stringify(e).includes(NAME.first)), 'no new event carries the reason')
+  // The trigger honours the marker for any writer.
+  const forced = await db.wmsMutationEvent.create({ data: { connector: 'mintsoft', direction: 'INBOUND', action: 'return_inbox', outcome: 'SUCCEEDED', entityType: 'RETURN', entityId: inbox.id, summary: 's', before: { reason: FULL_NAME, resolutionNote: FULL_NAME }, after: { reason: FULL_NAME } } as never })
+  assert.ok(!JSON.stringify(forced).includes(NAME.last))
+})
