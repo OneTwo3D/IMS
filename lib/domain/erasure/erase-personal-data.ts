@@ -8,7 +8,7 @@ import { scrubContactBlock } from './contact-gate'
 import { CustomerKeysChanged, lockStorefrontCustomerKeys, readStorefrontCustomerIds } from './customer-key-lock'
 import { scrubReturnInboxEvents } from './return-events'
 import { loadRawPayloadSubject, scrubRawPayloadsInTx, type RawPayloadCounts } from './raw-payloads'
-import { summariseWarehouseOrdersInTx, decideSystemVerdicts, notifyOpenWarehouseOrders } from './warehouse-obligations'
+import { summariseWarehouseOrdersInTx, decideSystemVerdicts, recordOpenWarehouseOrdersNoticeInTx } from './warehouse-obligations'
 import { scrubAccountingDerivedCopiesInTx, type DerivedCopyCounts } from './derived-copies'
 import { SYSTEM_PAYMENT_NOTES, orderIsErasedInTx } from './order-state'
 export { orderIsErasedInTx }
@@ -460,6 +460,8 @@ async function eraseUnderLocksInTx(
   // the ledger holds a contact or documents for the subject.
   const warehouse = await summariseWarehouseOrdersInTx(tx, orderIds)
   input.outcome.warehouse = warehouse
+  // The operator notice commits WITH the record or the erasure rolls back (see warehouse-obligations.ts).
+  await recordOpenWarehouseOrdersNoticeInTx(tx, warehouse, input.requestId)
   const refundRows = await tx.salesOrderRefund.findMany({ where: { orderId: { in: orderIds } }, select: { id: true } })
   // The linked customer's ledger contact id: read for an ORDER erasure too (the customer stays live and `before` is null), under the locks already held, so a contact
   // the ledger holds for the person is never recorded as "nothing held".
@@ -516,7 +518,6 @@ export async function eraseCustomerPersonalData(
       }
     }
     if (refusal) return { success: false, error: refusal }
-    await notifyOpenWarehouseOrders(outcome.warehouse, requestId)
     return { success: true, requestId, warehouse: outcome.warehouse }
   } catch (e) {
     // The exception text is NOT logged and NOT returned verbatim: a driver error can echo the values it was
@@ -593,8 +594,6 @@ export async function eraseOrderPersonalData(
           if (refusal) return { success: false, error: refusal }
           return { success: true, already: false, requestId, customerErased: eraseCustomer, warehouse: outcome.warehouse }
         }, ERASURE_TRANSACTION_OPTIONS)
-        // After the commit: an erasure that left open warehouse orders tells the operators at once (never throws).
-        if (result.success && !result.already) await notifyOpenWarehouseOrders(result.warehouse, result.requestId)
         return result
       } catch (e) {
         if ((e instanceof OrderRelinkedDuringErasure || e instanceof CustomerKeysChanged) && attempt < ORDER_ERASURE_ATTEMPTS) continue

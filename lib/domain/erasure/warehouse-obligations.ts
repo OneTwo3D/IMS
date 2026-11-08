@@ -1,5 +1,4 @@
 import type { Prisma } from '@/app/generated/prisma/client'
-import { notify } from '@/lib/notifications'
 import { provesNoRemoteWmsCall } from '@/lib/domain/wms/order-push-sweep'
 import {
   EMPTY_WAREHOUSE_SUMMARY, defaultSystemVerdicts,
@@ -101,14 +100,23 @@ export function openWarehouseOrdersWarning(open: number, ambiguous = 0): string 
   return `${parts.join(', and ')}. IMS does not write to the live warehouse, so each needs handling by hand in the warehouse system (see Settings > Erasure records).`
 }
 
-/** After the erasure committed: tell the operators. Never throws (a notification failure must not undo or hide an erasure). */
-export async function notifyOpenWarehouseOrders(summary: ErasureWarehouseSummary, requestId: string): Promise<void> {
-  if (summary.open === 0 && summary.ambiguous === 0) return
-  await notify({
-    type: 'warning',
-    title: OPEN_WAREHOUSE_ERASURE_NOTICE_TITLE,
-    message: `${openWarehouseOrdersWarning(summary.open, summary.ambiguous)} Request ${requestId}.`,
-    // The list opens filtered to the records that still need handling by hand.
-    actionUrl: '/settings/erasure?filter=obligations',
+/**
+ * The operator notice, written INSIDE the erasure transaction with the transaction's own client: it commits with the erasure record or not at all, so a background
+ * mirrored erasure can never leave open or ambiguous warehouse orders without an alert (a post-commit notify() swallows an insert failure and the erasure would have
+ * committed silently). A broadcast row (no user) is visible to every user. A failure to write it fails the erasure, which rolls back and is retried or reported.
+ * Identity-free: a count, a request id and a link to the records page, filtered to what still needs handling.
+ */
+export async function recordOpenWarehouseOrdersNoticeInTx(tx: Pick<Prisma.TransactionClient, 'notification'>, summary: ErasureWarehouseSummary, requestId: string): Promise<boolean> {
+  if (summary.open === 0 && summary.ambiguous === 0) return false
+  await tx.notification.create({
+    data: {
+      userId: null,
+      type: 'warning',
+      title: OPEN_WAREHOUSE_ERASURE_NOTICE_TITLE,
+      message: `${openWarehouseOrdersWarning(summary.open, summary.ambiguous)} Request ${requestId}.`,
+      // The list opens filtered to the records that still need handling by hand.
+      actionUrl: '/settings/erasure?filter=obligations',
+    },
   })
+  return true
 }
