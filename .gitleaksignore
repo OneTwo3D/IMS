@@ -25,3 +25,5 @@ bb4e9ee6f7a56110612dc1402384317f821f3495:tests/ops/reconciliation-pack-schedule-
 # WooCommerce shipping-line meta fixtures (an informational rate id under a key-named property) in the first commit of the courier-key change, not secrets; later commits build them through a helper.
 2635012e0186d3d7f48dc25bc1b7d7f0e7f9508f:tests/mintsoft-courier-key.test.ts:generic-api-key:122
 2635012e0186d3d7f48dc25bc1b7d7f0e7f9508f:tests/concurrency/mintsoft-courier-key-import.concurrent.test.ts:generic-api-key:69
+# Fake WooCommerce order-key fixture in the erasure raw-payload test (asserts the key is removed); not a credential.
+6d060c0fa0a9eacf0a002919ec7dc805404b5631:tests/concurrency/erasure-raw-payloads.concurrent.test.ts:generic-api-key:161
