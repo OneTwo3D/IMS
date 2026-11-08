@@ -478,7 +478,7 @@ test('SEAM-4 MUTATION (the claim-boundary check removed from processClaimedEntry
   const inputs = realInputs()
   const file = 'lib/connectors/xero/sync-processor.ts'
   const text = inputs.sources!.get(file)!
-  const mutated = text.replace('const held = xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload })', 'const held = { kind: \'legacy\' as const }')
+  const mutated = text.replace('const held = xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload, obligationAt: await xeroResolveObligationAt(db, { type, payload }) })', 'const held = { kind: \'legacy\' as const }')
   assert.notEqual(mutated, text, 'precondition: the check was found and removed')
   const sources = new Map(inputs.sources!)
   sources.set(file, mutated)
@@ -490,7 +490,7 @@ test('SEAM-4 MUTATION (the check moved AFTER the first transport call): red', ()
   const inputs = realInputs()
   const file = 'lib/connectors/xero/sync-processor.ts'
   const text = inputs.sources!.get(file)!
-  const gateLine = 'const held = xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload })'
+  const gateLine = 'const held = xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload, obligationAt: await xeroResolveObligationAt(db, { type, payload }) })'
   assert.ok(text.includes(gateLine), 'precondition: the gate is there')
   // Remove the gate at the top and put an equivalent call in the LAST case of the switch, after the earlier transport calls.
   const withoutGate = text.replace(gateLine, 'const held = { kind: \'legacy\' as const }')
