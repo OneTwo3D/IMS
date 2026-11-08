@@ -1,3 +1,4 @@
+-- prisma-schema-scope-ok: db-native functions and triggers | reason: Prisma schema cannot represent PL/pgSQL functions or triggers; this migration adds no table or column
 -- Erasure of the DERIVED accounting copies and notification text, in the database.
 --
 -- The ledger contact block is copied into accounting_events.linesJson (the whole document payload) and, when a payload changes, the superseded body is
