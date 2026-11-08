@@ -291,7 +291,9 @@ test('[erasure] the core erases every personal column, keeps the decided retenti
   assert.equal(meta.counts.salesOrders, 1)
   assert.equal(meta.counts.outboxRowsClaimedFenced, 1)
   assert.ok(meta.counts.activityRowsScrubbed >= 3, 'earlier activity rows were scrubbed')
-  assert.deepEqual(Object.values(meta.systems), ['not-attempted', 'not-attempted', 'not-attempted', 'not-attempted'])
+  assert.equal(meta.systems.storefront, 'not-attempted')
+  assert.ok(['not-applicable', 'refused-pending-legal'].includes(meta.systems.accounting!), 'the ledger verdict follows what is held')
+  assert.equal(meta.systems.carrierPortal, 'not-attempted')
 
   // IDEMPOTENT: a second request refuses and writes nothing more.
   const recordsBefore = logs.filter((l) => l.action === ERASURE_RECORD_ACTION).length

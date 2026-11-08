@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import {
+  defaultSystemVerdicts,
   ERASURE_FAILURE_DESCRIPTION,
   ERASURE_RECORD_ACTION,
   ERASURE_RECORD_DESCRIPTION,
@@ -12,14 +13,17 @@ import { sanitizeActivityLogMetadata } from '../lib/activity-log.ts'
 
 const NAME = 'Zebediah Quillfeather'
 
-test('the record names the request, date and scope, with every external system not-attempted', () => {
+test('the record names the request, date and scope, with the verdicts the trigger alone decides', () => {
   const meta = buildErasureRecordMetadata({
     requestId: 'req-1', erasedAt: new Date('2026-11-06T10:00:00Z'), trigger: 'ON_REQUEST', customerId: 'cust1', orderIds: ['o1', 'o2'],
     counts: { customers: 1, salesOrders: 2, shipments: 1, shoppingCustomerLinks: 1, shoppingOrderLinks: 2, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, activityRowsScrubbed: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, linkedFreeTextScrubbed: 0, rawWebhookEventsProjected: 0, rawSyncLogsProjected: 0, rawReturnRecordsCleared: 0, storefrontIdMissing: 0, accountingEventCopiesScrubbed: 0, accountingErrorsScrubbed: 0, notifications: 0 },
   })
   assert.equal(meta.requestId, 'req-1')
   assert.equal(meta.trigger, 'ON_REQUEST')
-  assert.deepEqual(meta.systems, { storefront: 'not-attempted', accounting: 'not-attempted', warehouse: 'not-attempted', carrierPortal: 'not-attempted' })
+  assert.deepEqual(meta.systems, { storefront: 'not-attempted', accounting: 'not-applicable', warehouse: 'not-applicable', carrierPortal: 'not-attempted' })
+  assert.deepEqual(meta.warehouse, { linkedOrders: 0, despatched: 0, open: 0, cancelled: 0, notPushed: 0, merged: 0, openOrders: [] })
+  // A mirrored or created-after-erasure order was erased at the storefront first.
+  for (const trigger of ['MIRRORED_FROM_STOREFRONT', 'IMPORT_AFTER_ERASURE'] as const) assert.equal(defaultSystemVerdicts(trigger).storefront, 'erased-at-source')
   // The activity-log sanitiser must leave every value intact: a key that matched its sensitive pattern would be blanked.
   assert.deepEqual(sanitizeActivityLogMetadata(meta), JSON.parse(JSON.stringify(meta)))
 })

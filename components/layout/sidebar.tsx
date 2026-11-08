@@ -51,6 +51,7 @@ function getSettingsChildren(accountingIntegrationEnabled: boolean) {
     ...(accountingIntegrationEnabled ? [{ href: '/settings/accounting', label: 'Accounting' }] : []),
     { href: '/settings/users', label: 'Users' },
     { href: '/settings/backup', label: 'Backup & Restore' },
+    { href: '/settings/erasure', label: 'Erasure records' },
     { href: '/settings/system', label: 'System' },
   ]
 }
