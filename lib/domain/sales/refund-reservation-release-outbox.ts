@@ -515,6 +515,8 @@ const defaultDrainDeps = (): RefundReservationReleaseDrainDeps => ({
     return autoAllocateOrder(orderId, {
       internalBypassToken: INTERNAL_ACTION_BYPASS,
       refuseIfShipmentsExist: true,
+      // A part-shipped order is not rebuilt; the refunded units' unshipped reservation is given back instead.
+      trimUnshippedWhenShipmentsExist: true,
       onReconciledInTx: opts?.onReconciledInTx,
     })
   },
