@@ -302,3 +302,11 @@ test('the closing arrival writes the sub-penny residue row even with no cent lef
   const net = subledger.reduce((sum, r) => sum.add(r.baseDelta as Prisma.Decimal), new Prisma.Decimal('0.012'))
   assert.equal(net.toFixed(6), '0.000000')
 })
+
+test('accounting switched off with a connector still named is held too (the switch, not only the connector, decides)', async () => {
+  const { receiveReturnAgainstExpectationsTx } = await mod
+  queued.length = 0
+  const { tx } = fakeTx(oneLine(), { transitJournalKey: 'k' })
+  await assert.rejects(() => receiveReturnAgainstExpectationsTx(tx, params({ connector: 'xero', syncEnabled: false })), /awaiting_accounting/)
+  assert.equal(queued.length, 0)
+})

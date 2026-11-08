@@ -161,3 +161,15 @@ test('[db] a reserved quantity too low to release refuses and rolls the trim bac
     assert.equal(await reserved(tx, fx.a, fx.wh), '1.0000')
   })
 })
+
+test('[db] a pending draft that the shrunken rows no longer back is retired by the trim; the shipped shipment stays', { skip }, async () => {
+  await withRollback(async (tx) => {
+    const fx = await seed(tx)
+    // A draft for the 2 unshipped units of line A: backed while the row holds 5, unbacked once it holds 3.
+    const draft = await tx.shipment.create({ data: { orderId: fx.orderId, warehouseId: fx.wh, status: 'PENDING', lines: { create: [{ lineId: fx.lineA, productId: fx.a, qty: D('2') }] } }, select: { id: true } })
+    await refund(tx, fx, fx.lineA, fx.a, '2')
+    await run(tx, fx.orderId)
+    assert.equal(await tx.shipment.count({ where: { id: draft.id } }), 0, 'the unbacked draft is retired')
+    assert.equal((await tx.shipment.findUnique({ where: { id: fx.shipmentId } })).status, 'SHIPPED')
+  })
+})
