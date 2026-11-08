@@ -180,8 +180,9 @@ ERASURE_CLASSIFICATION.AccountingEvent = {
   notPersonal: ['type', 'sourceEntityType', 'sourceEntityId', 'status', 'idempotencyKey', 'currency', 'externalSystem', 'revisionOrderBasis', 'voidBasis', 'postBasis', 'reversalOfId'],
   retained: { externalId: 'the ledger document id reconciles the posted document' },
 }
-// The event log's message is a fixed sentence written by the mirror; only the superseded body in metadata can hold a contact block.
-ERASURE_CLASSIFICATION.AccountingEventLog = { erased: ['metadata'], notPersonal: ['action', 'message'], retained: {} }
+// The event log's MESSAGE is free text: a final failure writes the raw connector error into it (it can echo the customer's or a third party's name), so it is
+// replaced by the marker; the superseded body in metadata can hold a contact block. The action stays: it says what happened.
+ERASURE_CLASSIFICATION.AccountingEventLog = { erased: ['metadata', 'message'], notPersonal: ['action'], retained: {} }
 
 // Keyed by the storefront order id only; it carries no personal data (named in the schema test: no relation reaches it).
 ERASURE_CLASSIFICATION.StorefrontCustomerErasureTombstone = { erased: [], notPersonal: ['connector', 'customerKeyHash'], retained: {} } // a hash of connector + storefront customer id: no raw identifier

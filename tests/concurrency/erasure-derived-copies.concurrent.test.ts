@@ -224,6 +224,9 @@ test('[derived copies] the name rule: a no-write SUPERSEDED event gets the place
     { label: 'posted then superseded (document id)', status: 'SUPERSEDED', extra: { externalSystem: 'xero', externalId: `xero-${randomUUID()}` } },
     { label: 'superseded with revision stamp', status: 'SUPERSEDED', extra: { externalRevisionAt: new Date('2026-11-02T10:00:00Z') } },
     { label: 'superseded with post basis', status: 'SUPERSEDED', extra: { postBasis: 'CONNECTOR' } },
+    { label: 'unstamped live write later superseded by document-id takeover', status: 'SUPERSEDED', extra: { revisionOrderBasis: 'live_write_unstamped' } },
+    { label: 'backfill repair of a recorded write, superseded', status: 'SUPERSEDED', extra: { revisionOrderBasis: 'historical_backfill_repair' } },
+    { label: 'pending with an unrelated basis string', status: 'PENDING', extra: { revisionOrderBasis: 'something_else' } },
   ]
   const rows = [] as Array<{ label: string; id: string }>
   for (const m of matrix) {
@@ -235,7 +238,7 @@ test('[derived copies] the name rule: a no-write SUPERSEDED event gets the place
   for (const r of rows) {
     const e = await db.accountingEvent.findUniqueOrThrow({ where: { id: r.id } })
     const log = await db.accountingEventLog.findFirstOrThrow({ where: { accountingEventId: r.id } })
-    const keeps = eventKeepsContactName({ status: e.status, postBasis: e.postBasis, externalId: e.externalId, externalRevisionAt: e.externalRevisionAt })
+    const keeps = eventKeepsContactName({ status: e.status, postBasis: e.postBasis, externalId: e.externalId, externalRevisionAt: e.externalRevisionAt, revisionOrderBasis: e.revisionOrderBasis })
     const expected = { name: keeps ? NAME : PLACEHOLDER }
     assert.deepEqual((e.linesJson as { contact: unknown }).contact, expected, `${r.label}: event`)
     assert.deepEqual((log.metadata as { enqueuedLinesJson: { contact: unknown } }).enqueuedLinesJson.contact, expected, `${r.label}: log body`)
@@ -249,6 +252,9 @@ test('[derived copies] the name rule: a no-write SUPERSEDED event gets the place
   assert.equal(keptNames.get('superseded no write (yield path)'), false)
   assert.equal(keptNames.get('posted then superseded (document id)'), true)
   assert.equal(keptNames.get('posted confirmed'), true)
+  assert.equal(keptNames.get('unstamped live write later superseded by document-id takeover'), true)
+  assert.equal(keptNames.get('backfill repair of a recorded write, superseded'), true)
+  assert.equal(keptNames.get('pending with an unrelated basis string'), false)
   assert.equal(keptNames.get('pending'), false)
   assert.ok(byLabel('void'))
   assert.doesNotMatch(dump(await db.accountingEvent.findMany({ where: { sourceEntityId: fx.orderId } })), new RegExp(EMAIL.replace(/[+.]/g, '\\$&')))
@@ -328,4 +334,35 @@ test('[derived copies] more dirty event logs and notifications than one batch ar
   assert.equal(left, N, 'the rows are scrubbed in place, not deleted')
   assert.equal(await db.notification.count({ where: { actionUrl: `/sales/${fx.orderId}`, title: NAME } }), 0)
   assert.equal(await db.accountingEventLog.count({ where: { accountingEventId: fx.ids.pendingEvent, metadata: { path: ['enqueuedLinesJson', 'contact', 'name'], equals: NAME } } }), 0)
+})
+
+test('[derived copies] an event-log MESSAGE that echoes a name (a final failure) is the marker after the erasure, on a later write, on an update, and through the reconcile', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await fixture(db)
+  t.after(() => fx.cleanup())
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { reconcileDerivedCopies } = await import('@/lib/domain/erasure/derived-copies')
+  const echo = `Xero rejected the contact ${NAME} <${EMAIL}> (existing contact ${THIRD_PARTY})`
+  const before = await db.accountingEventLog.create({ data: { accountingEventId: fx.ids.pendingEvent, action: 'failed_from_sync_log', message: echo, metadata: { syncType: 'SALES_INVOICE' } } })
+  assert.match(before.message ?? '', new RegExp(THIRD_PARTY))
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const after = await db.accountingEventLog.findUniqueOrThrow({ where: { id: before.id } })
+  assert.equal(after.message, MARKER)
+  assert.equal(after.action, 'failed_from_sync_log', 'the action, which says what happened, survives')
+  assert.equal((after.metadata as { syncType: string }).syncType, 'SALES_INVOICE')
+  // A later write (the mirror writing a final failure after the erasure) and an update are held by the trigger.
+  const later = await db.accountingEventLog.create({ data: { accountingEventId: fx.ids.pendingEvent, action: 'failed_from_sync_log', message: echo } })
+  assert.equal(later.message, MARKER)
+  const updated = await db.accountingEventLog.update({ where: { id: later.id }, data: { message: echo } })
+  assert.equal(updated.message, MARKER)
+  // CONTROL: a log of another subject keeps its message.
+  const live = await db.accountingEventLog.create({ data: { accountingEventId: fx.other.eventId, action: 'failed_from_sync_log', message: 'Other Person rejected' } })
+  assert.equal(live.message, 'Other Person rejected')
+  // The reconcile revisits it when the writer's snapshot saw the order live (triggers off).
+  await withTriggersOff(db, (tx) => tx.accountingEventLog.update({ where: { id: later.id }, data: { message: echo } }))
+  assert.equal((await db.accountingEventLog.findUniqueOrThrow({ where: { id: later.id } })).message, echo, 'PRECONDITION: the straggler carries the echo')
+  const result = await reconcileDerivedCopies(db)
+  assert.equal(result.remaining, 0)
+  assert.equal((await db.accountingEventLog.findUniqueOrThrow({ where: { id: later.id } })).message, MARKER)
+  assert.equal((await db.accountingEventLog.findUniqueOrThrow({ where: { id: live.id } })).message, 'Other Person rejected')
 })

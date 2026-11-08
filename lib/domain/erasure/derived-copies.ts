@@ -1,5 +1,6 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { mirroredPostStanding } from '@/lib/domain/accounting/ledger-standing'
+import { HISTORICAL_BACKFILL_REVISION_ORDER_BASIS, LIVE_UNSTAMPED_WRITE_REVISION_ORDER_BASIS } from '@/lib/domain/accounting/accounting-event-mirror'
 
 /**
  * THE DERIVED ACCOUNTING COPIES AND THE NOTIFICATION TEXT of an erased order (migration erasure_derived_copies).
@@ -10,7 +11,7 @@ import { mirroredPostStanding } from '@/lib/domain/accounting/ledger-standing'
  *   notifications.title / .message                 free text of a notification that points at the order
  *
  * The contact rule is the SQL functions gdpr_scrub_contact / gdpr_event_keeps_contact_name: the email is always removed; the name is kept only where the copy may
- * describe a document in the ledger (the event's own evidence: status POSTED, or a document id, a revision stamp or a post basis. SUPERSEDED alone is not evidence: a no-write yield records it: the event-side
+ * describe a document in the ledger (the event's own evidence: status POSTED, or a document id, a revision stamp, a post basis or a connector-write revisionOrderBasis. SUPERSEDED alone is not evidence: a no-write yield records it: the event-side
  * counterpart of the ledger standing the sync-log rule reads), otherwise it becomes the placeholder. The erasure statements here and the guard triggers call the same
  * functions, so a writer that comes after the erasure is held to the same rule. After the writes the same predicates are run again; a row left over THROWS, which
  * rolls the whole erasure back.
@@ -24,9 +25,13 @@ import { mirroredPostStanding } from '@/lib/domain/accounting/ledger-standing'
  * POSTED half (every POSTED event, whatever its basis); a document id, a revision stamp or a post basis from an actual write covers an event that posted and was
  * later superseded. The two are run over one fixture matrix by tests/concurrency/erasure-derived-copies, so they cannot drift.
  */
-export function eventKeepsContactName(e: { status: string; postBasis: string | null; externalId: string | null; externalRevisionAt: Date | null }): boolean {
+export function eventKeepsContactName(e: { status: string; postBasis: string | null; externalId: string | null; externalRevisionAt: Date | null; revisionOrderBasis: string | null }): boolean {
   return mirroredPostStanding(e) !== 'NOT_POSTED' || e.externalId !== null || e.externalRevisionAt !== null || e.postBasis !== null
+    // The revisionOrderBasis values that mean a connector write happened (the mirror's own constants): a document id taken over by a later revision clears externalId and postBasis.
+    || (ACTUAL_WRITE_REVISION_ORDER_BASES as readonly string[]).includes(e.revisionOrderBasis ?? '')
 }
+
+export const ACTUAL_WRITE_REVISION_ORDER_BASES = [LIVE_UNSTAMPED_WRITE_REVISION_ORDER_BASIS, HISTORICAL_BACKFILL_REVISION_ORDER_BASIS] as const
 
 export const DERIVED_ERROR_MARKER = 'Text removed by GDPR erasure'
 
@@ -50,7 +55,12 @@ function scope(alias: string, typeCol: string, idCol: string, orderIds: string[]
 }
 
 const eventDirty = Prisma.sql`gdpr_contact_dirty(e."linesJson", gdpr_event_keeps_contact_name(e))`
-const logDirty = Prisma.sql`jsonb_typeof(l."metadata" -> 'enqueuedLinesJson') = 'object' AND gdpr_contact_dirty(l."metadata" -> 'enqueuedLinesJson', gdpr_event_keeps_contact_name(e))`
+// An event log is dirty when its superseded body still carries contact identity the rule would remove, or its message is anything but the marker (a final failure writes the raw connector error there).
+const logDirty = Prisma.sql`((jsonb_typeof(l."metadata" -> 'enqueuedLinesJson') = 'object' AND gdpr_contact_dirty(l."metadata" -> 'enqueuedLinesJson', gdpr_event_keeps_contact_name(e)))
+    OR (l."message" IS NOT NULL AND l."message" <> ${DERIVED_ERROR_MARKER}::text))`
+const logSet = (a: string) => Prisma.raw(`"metadata" = CASE WHEN jsonb_typeof(${a}."metadata" -> 'enqueuedLinesJson') = 'object'
+      THEN jsonb_set(${a}."metadata", '{enqueuedLinesJson}', gdpr_scrub_contact(${a}."metadata" -> 'enqueuedLinesJson', gdpr_event_keeps_contact_name(e))) ELSE ${a}."metadata" END,
+      "message" = CASE WHEN ${a}."message" IS NULL THEN NULL ELSE '${DERIVED_ERROR_MARKER}' END`)
 const errorDirty = (a: string) => Prisma.raw(`${a}."errorMessage" IS NOT NULL AND ${a}."errorMessage" <> '${DERIVED_ERROR_MARKER}'`)
 
 /** Scrub the derived accounting copies of these orders (and their refunds). The caller owns the transaction and holds the order locks. */
@@ -66,7 +76,7 @@ export async function scrubAccountingDerivedCopiesInTx(tx: Client, orderIds: str
      WHERE ${eventScope} AND jsonb_typeof(e."linesJson" -> 'contact') = 'object' AND ${eventDirty}`)
   const logs = Number(await tx.$executeRaw`
     UPDATE "accounting_event_logs" l
-       SET "metadata" = jsonb_set(l."metadata", '{enqueuedLinesJson}', gdpr_scrub_contact(l."metadata" -> 'enqueuedLinesJson', gdpr_event_keeps_contact_name(e)))
+       SET ${logSet('l')}
       FROM "accounting_events" e
      WHERE l."accountingEventId" = e."id" AND ${logScope} AND ${logDirty}`)
   const errors = Number(await tx.$executeRaw`
@@ -129,7 +139,7 @@ export async function reconcileDerivedCopies(client: Pick<Prisma.TransactionClie
                          WHERE jsonb_typeof(e."linesJson" -> 'contact') = 'object' AND ${eventDirty} LIMIT ${batch})`)
     const logs = Number(await client.$executeRaw`
       UPDATE "accounting_event_logs" x
-         SET "metadata" = jsonb_set(x."metadata", '{enqueuedLinesJson}', gdpr_scrub_contact(x."metadata" -> 'enqueuedLinesJson', gdpr_event_keeps_contact_name(e)))
+         SET ${logSet('x')}
         FROM "accounting_events" e
        WHERE e."id" = x."accountingEventId"
          AND x."id" IN (WITH ${subjects} SELECT l."id" FROM "accounting_event_logs" l JOIN "accounting_events" e ON e."id" = l."accountingEventId"

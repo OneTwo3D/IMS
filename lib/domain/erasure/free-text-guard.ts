@@ -52,6 +52,7 @@ export const UNGUARDED_FREE_TEXT: Readonly<Record<string, string>> = {
   'ShoppingSyncLog.errorMessage': 'guarded by the raw-payload trigger (erased_wc_sync_log_guard)',
   'AccountingSyncLog.errorMessage': 'guarded by trigger accounting_sync_logs_erased_error (migration erasure_derived_copies), which keys on referenceType and referenceId, not on an order column',
   'AccountingSyncLog.payload': 'the contact block is replaced by the erasure and by the central accounting-row gate (createAccountingSyncLogRow) and the posting gate; financial fields are kept',
+  'AccountingEventLog.message': 'guarded by trigger accounting_event_logs_erased_contact (migration erasure_derived_copies); a final failure writes the raw connector error here',
   'AccountingEventLog.metadata': 'the superseded body is guarded by trigger accounting_event_logs_erased_contact (migration erasure_derived_copies)',
   'WmsSyncLog.payload': 'the returns sync no longer writes the raw warehouse record here (only the return id); rows written before that are cleared by the erasure (raw-payloads.ts)',
 }

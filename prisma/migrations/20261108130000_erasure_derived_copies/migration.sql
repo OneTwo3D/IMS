@@ -41,6 +41,9 @@ $$;
 -- Pinned to lib/domain/erasure/derived-copies.ts eventKeepsContactName (and so to mirroredPostStanding) by tests/concurrency/erasure-derived-copies.
 CREATE OR REPLACE FUNCTION gdpr_event_keeps_contact_name(e "accounting_events") RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
   SELECT e."status" = 'POSTED' OR e."externalId" IS NOT NULL OR e."externalRevisionAt" IS NOT NULL OR e."postBasis" IS NOT NULL
+      -- Every revisionOrderBasis the mirror writes for a connector write that happened: a live write that returned no stamp, and a backfill repair of a write the sync log recorded complete.
+      -- A later revision taking the document id leaves such an event SUPERSEDED with externalId and postBasis cleared; the basis is what still says it posted.
+      OR COALESCE(e."revisionOrderBasis" IN ('live_write_unstamped', 'historical_backfill_repair'), false)
 $$;
 
 CREATE OR REPLACE FUNCTION erased_accounting_event_guard() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -61,21 +64,27 @@ $$;
 CREATE TRIGGER accounting_events_erased_contact BEFORE INSERT OR UPDATE ON "accounting_events"
   FOR EACH ROW EXECUTE FUNCTION erased_accounting_event_guard();
 
--- The superseded body kept on an event log is a copy of an earlier linesJson of the SAME event: it follows the event's rule.
+-- The superseded body kept on an event log is a copy of an earlier linesJson of the SAME event: it follows the event's rule. The log's MESSAGE is free text (a final
+-- failure writes the raw connector error into it, which can echo the customer's or a third party's name): for an erased order it is the fixed marker.
 CREATE OR REPLACE FUNCTION erased_accounting_event_log_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
   ev "accounting_events";
+  has_body boolean := NEW."metadata" IS NOT NULL AND jsonb_typeof(NEW."metadata" -> 'enqueuedLinesJson') = 'object';
+  has_message boolean := NEW."message" IS NOT NULL AND NEW."message" <> 'Text removed by GDPR erasure';
 BEGIN
-  IF NEW."metadata" IS NULL OR jsonb_typeof(NEW."metadata" -> 'enqueuedLinesJson') IS DISTINCT FROM 'object' THEN RETURN NEW; END IF;
+  IF NOT has_body AND NOT has_message THEN RETURN NEW; END IF;
   SELECT * INTO ev FROM "accounting_events" WHERE "id" = NEW."accountingEventId";
   IF FOUND AND gdpr_accounting_ref_erased(ev."sourceEntityType", ev."sourceEntityId") THEN
-    NEW."metadata" := jsonb_set(NEW."metadata", '{enqueuedLinesJson}', gdpr_scrub_contact(NEW."metadata" -> 'enqueuedLinesJson', gdpr_event_keeps_contact_name(ev)));
+    IF has_body THEN
+      NEW."metadata" := jsonb_set(NEW."metadata", '{enqueuedLinesJson}', gdpr_scrub_contact(NEW."metadata" -> 'enqueuedLinesJson', gdpr_event_keeps_contact_name(ev)));
+    END IF;
+    IF has_message THEN NEW."message" := 'Text removed by GDPR erasure'; END IF;
   END IF;
   RETURN NEW;
 END
 $$;
 
-CREATE TRIGGER accounting_event_logs_erased_contact BEFORE INSERT ON "accounting_event_logs"
+CREATE TRIGGER accounting_event_logs_erased_contact BEFORE INSERT OR UPDATE OF "message", "metadata" ON "accounting_event_logs"
   FOR EACH ROW EXECUTE FUNCTION erased_accounting_event_log_guard();
 
 -- An accounting sync row's error text for an erased order or refund is the fixed erasure marker. No reader branches on the text (it carries no provenance).
