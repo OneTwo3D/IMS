@@ -72,7 +72,9 @@ jobs:
     needs: classify_changes
     if: needs.classify_changes.outputs.run_expensive == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The unit-test step alone now takes ~25-28 min and several runs hit the old 30 min cap with no
+    # failing test. 45 min is headroom, not a target: shard the unit tests if a run approaches it.
+    timeout-minutes: 45
     # check:migration-conventions runs inside `npm run validate`. Its own default base (origin/development) is HEAD
     # on a push to development, an empty comparison that fails loudly (o3d-ok6hk), so give it the real range.
     env:
