@@ -367,6 +367,13 @@ This means an admin viewing the activity log can see who did what but not see se
   and a reference — no customer names, addresses or line detail — and there is one per payment or
   allocation ever made. Everything else, including invoice PDFs, emails and WooCommerce notes,
   expires on the schedule you configure.
+  **What each retention setting destroys, and what it only hides.**
+  - *Destroys* (rows are deleted): sync logs, stock movements (old ones), finished WMS sync runs, and activity-log entries by level.
+  - *Compacts* (the row stays, its content is cleared): shopping and warehouse webhook events, and accounting sync rows whose back-reference is still unresolved.
+  - *Only hides* (the row is flagged archived and every value on it survives): **sales orders**, **purchase orders** and **customers**. Archiving removes them from lists. It does **not** erase a name, an address or an email.
+  - **Customers are archived only when all of their orders are archived**, and orders are archived by the separate **sales orders** window (off by default). Turning on the customers window alone therefore does nothing at all: enable the sales-orders window first.
+  - None of the retention settings erases personal data. That is done by the GDPR erasure, which follows WooCommerce's own anonymisation and the operator's **GDPR Anonymise** button: see [Personal-data erasure](erasure.md). IMS has no separate erasure schedule of its own.
+
 - **System health** — at-a-glance status of FX sync, accounting sync, integration outbox depth, recent cron runs, and invariant check results
 - **Database reset** — reset system data with three levels of severity:
   - **Transactions only** — clears orders, invoices, and movements but keeps products and settings
