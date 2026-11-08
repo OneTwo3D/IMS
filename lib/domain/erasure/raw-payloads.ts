@@ -143,7 +143,7 @@ export async function scrubRawPayloadsInTx(tx: Client, subject: RawPayloadSubjec
     if (logIds.length === 0) continue
     counts.rawSyncLogsProjected += Number(await tx.$executeRaw`
       UPDATE "shopping_sync_logs" l
-         SET "payload" = gdpr_project_sync_log_payload(l."payload"), "errorMessage" = gdpr_sync_log_row_message(l)
+         SET "payload" = gdpr_sync_log_row_projection(l), "errorMessage" = gdpr_sync_log_row_message(l)
        WHERE l."id" = ANY(${text(logIds)}) AND gdpr_sync_log_row_dirty(l) AND gdpr_sync_log_row_erased(l)`)
     const left = await tx.$queryRaw<Array<{ n: bigint }>>`SELECT count(*) AS n FROM "shopping_sync_logs" l WHERE l."id" = ANY(${text(logIds)}) AND gdpr_sync_log_row_dirty(l) AND gdpr_sync_log_row_erased(l)`
     if (Number(left[0]?.n ?? 0) > 0) throw new Error('Raw sync log projection incomplete')
@@ -208,7 +208,7 @@ export async function reconcileRawPayloads(client: Pick<Prisma.TransactionClient
      WHERE w."id" IN (SELECT w."id" FROM "shopping_webhook_events" w WHERE ${webhookReconcileWhere} LIMIT ${batch})`)
   const logs = Number(await client.$executeRaw`
     UPDATE "shopping_sync_logs" l
-       SET "payload" = gdpr_project_sync_log_payload(l."payload"), "errorMessage" = gdpr_sync_log_row_message(l)
+       SET "payload" = gdpr_sync_log_row_projection(l), "errorMessage" = gdpr_sync_log_row_message(l)
      WHERE l."id" IN (SELECT l2."id" FROM "shopping_sync_logs" l2 WHERE gdpr_sync_log_row_erased(l2) AND gdpr_sync_log_row_dirty(l2) LIMIT ${batch})`)
   const leftWebhook = await client.$queryRaw<Array<{ n: bigint }>>`SELECT count(*) AS n FROM "shopping_webhook_events" w WHERE ${webhookReconcileWhere}`
   const leftLogs = await client.$queryRaw<Array<{ n: bigint }>>`SELECT count(*) AS n FROM "shopping_sync_logs" l WHERE gdpr_sync_log_row_erased(l) AND gdpr_sync_log_row_dirty(l)`

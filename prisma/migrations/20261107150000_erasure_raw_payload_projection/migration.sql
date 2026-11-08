@@ -323,21 +323,45 @@ CREATE OR REPLACE FUNCTION gdpr_project_wc_refund(r jsonb) RETURNS jsonb LANGUAG
   END
 $$;
 
--- A sync-log payload, projected by its SHAPE. Shape and not the row's family column: the family rule lives in one place (the shared TypeScript
--- module) and the database does not restate it. A payload that holds no raw storefront data comes back UNCHANGED, so "payload IS DISTINCT FROM
--- projection" is false for it: the held-invoice park (its `accountingPayload` is scrubbed by the erasure's own contact-block step), a status push, an
--- admission refusal (ids only).
-CREATE OR REPLACE FUNCTION gdpr_project_sync_log_payload(p jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+-- THE FAMILY OF A SYNC-LOG ROW, from the columns the writers stamp (recordKind, direction); the one declared mapping, pinned by a test against
+-- lib/domain/sales/wc-sync-row-families.ts. The payload's own shape is never trusted to say which writer wrote it (a refund body can carry any field).
+CREATE OR REPLACE FUNCTION gdpr_sync_log_family(l "shopping_sync_logs") RETURNS text LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE
-    WHEN p IS NULL OR jsonb_typeof(p) <> 'object' THEN p
-    WHEN p ? 'accountingPayload' THEN p
-    WHEN p->>'meta_key' = '_wc_shipment_tracking_items' THEN
-      (CASE WHEN p ? 'items' THEN jsonb_set(p, '{items}', '[]'::jsonb) ELSE p END) || jsonb_build_object('_erasure_projected', true)
-    WHEN p ? 'order' AND p ? 'externalOrderId' THEN
+    WHEN l."recordKind" = 'WC_HELD_SALES_INVOICE' THEN 'held_invoice'
+    WHEN l."recordKind" = 'WC_REFUND_PARK' THEN 'refund_park'
+    WHEN l."recordKind" IS NULL AND l."direction"::text = 'TO_CONNECTOR' THEN 'outbound'
+    WHEN l."recordKind" IS NULL THEN 'inbound'
+    ELSE 'unknown' END
+$$;
+
+-- A sync-log payload, projected by its FAMILY. FAIL CLOSED: a payload the family does not recognise is replaced by an identity-free stub, so "payload IS
+-- DISTINCT FROM projection" is TRUE for it until it has been stubbed (the recheck cannot call an unrecognised row clean).
+--   held_invoice  unchanged (the erasure's contact-block step owns it)
+--   refund_park   the refund projection, whatever fields the body carries
+--   outbound      a tracking log (items emptied) or a status push (status and push time only); anything else is stubbed
+--   inbound       the queue envelope (its order projected) or an admission refusal (IMS-written ids and counters only); anything else is stubbed
+-- A NULL payload stays NULL.
+CREATE OR REPLACE FUNCTION gdpr_project_sync_log_payload(p jsonb, family text) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE
+    WHEN p IS NULL THEN NULL
+    WHEN jsonb_typeof(p) <> 'object' THEN jsonb_build_object('_erasure_projected', true)
+    WHEN family = 'held_invoice' THEN p
+    WHEN family = 'refund_park' THEN gdpr_project_wc_refund(p)
+    WHEN family = 'outbound' AND p->>'meta_key' = '_wc_shipment_tracking_items' THEN
+      jsonb_build_object('meta_key', '_wc_shipment_tracking_items', 'items', '[]'::jsonb, '_erasure_projected', true) || gdpr_date_for_present(p, ARRAY['pushedDateModifiedGmt'])
+    WHEN family = 'outbound' AND NOT EXISTS (SELECT 1 FROM jsonb_object_keys(p) k WHERE k NOT IN ('status', 'pushedDateModifiedGmt')) THEN
+      gdpr_token_for_present(p, ARRAY['status']) || gdpr_date_for_present(p, ARRAY['pushedDateModifiedGmt'])
+    WHEN family = 'inbound' AND p ? 'order' AND p ? 'externalOrderId' THEN
       jsonb_set(p, '{order}', gdpr_project_wc_order(p->'order')) || jsonb_build_object('_erasure_projected', true)
-    WHEN p ? 'amount' AND NOT (p ? 'queue') THEN gdpr_project_wc_refund(p)
-    ELSE p
+    WHEN family = 'inbound' AND p ? 'queue' AND NOT EXISTS (SELECT 1 FROM jsonb_object_keys(p) k
+         WHERE k NOT IN ('queue', 'reason', 'connector', 'externalOrderId', 'externalOrderNumber', 'status', 'configured', 'currency', 'refusedAt', 'attempts')) THEN p
+    ELSE jsonb_build_object('_erasure_projected', true)
   END
+$$;
+
+-- The projected payload of a row: the family comes from the row's own columns.
+CREATE OR REPLACE FUNCTION gdpr_sync_log_row_projection(l "shopping_sync_logs") RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT gdpr_project_sync_log_payload(l."payload", gdpr_sync_log_family(l))
 $$;
 
 -- The webhook inbox payload, by resource. Anything else, or a payload with no order id, comes back unchanged.
@@ -435,12 +459,12 @@ $$;
 
 -- The error text the erasure leaves: the marker, except on a held-invoice park, whose text is a fixed IMS sentence naming an order number.
 CREATE OR REPLACE FUNCTION gdpr_sync_log_row_message(l "shopping_sync_logs") RETURNS text LANGUAGE sql IMMUTABLE AS $$
-  SELECT CASE WHEN l."errorMessage" IS NULL OR COALESCE(l."payload" ? 'accountingPayload', false) THEN l."errorMessage" ELSE 'Text removed by GDPR erasure' END
+  SELECT CASE WHEN l."errorMessage" IS NULL OR gdpr_sync_log_family(l) = 'held_invoice' THEN l."errorMessage" ELSE 'Text removed by GDPR erasure' END
 $$;
 
 -- Whether the row still carries raw identity (a payload the projection would change, or error text that is not yet the marker).
 CREATE OR REPLACE FUNCTION gdpr_sync_log_row_dirty(l "shopping_sync_logs") RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
-  SELECT (l."payload" IS DISTINCT FROM gdpr_project_sync_log_payload(l."payload")) OR (l."errorMessage" IS DISTINCT FROM gdpr_sync_log_row_message(l))
+  SELECT (l."payload" IS DISTINCT FROM gdpr_sync_log_row_projection(l)) OR (l."errorMessage" IS DISTINCT FROM gdpr_sync_log_row_message(l))
 $$;
 
 CREATE OR REPLACE FUNCTION erased_wc_sync_log_guard() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -450,7 +474,7 @@ BEGIN
     PERFORM gdpr_record_order_obligation(NEW."externalId");
   END IF;
   NEW."errorMessage" := gdpr_sync_log_row_message(NEW);
-  NEW."payload" := gdpr_project_sync_log_payload(NEW."payload");
+  NEW."payload" := gdpr_sync_log_row_projection(NEW);
   RETURN NEW;
 END
 $$;

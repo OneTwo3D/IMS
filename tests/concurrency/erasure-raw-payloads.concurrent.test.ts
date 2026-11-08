@@ -932,3 +932,45 @@ test('[raw payloads] the erasure\'s own customer-id scans apply the tombstone cu
   const link = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(postId) } })
   assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: link.orderId } })).erasedAt, null, 'it imports as a live order')
 })
+
+test('[raw payloads] the sync-log projection dispatches by the row\'s own columns and FAILS CLOSED: a refund park whose body carries a `queue` field is still projected by the sweep, the guard and the reconcile; an unrecognised shape in scope is stubbed, and counts as dirty until it is', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const cleanups: Array<() => Promise<void>> = []
+  t.after(async () => { await db.$executeRawUnsafe('ALTER TABLE "shopping_sync_logs" ENABLE TRIGGER "shopping_sync_logs_erased_projection"'); for (const c of cleanups) await c(); await fx.cleanup() })
+  const mk = async (data: Record<string, unknown>) => { const row = await db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', entityId: fx.orderId, externalId: String(Math.floor(Math.random() * 1e9)), ...data } as never }); cleanups.push(async () => { await db.shoppingSyncLog.deleteMany({ where: { id: row.id } }) }); return row }
+  const dirty = async (id: string) => (await db.$queryRaw<Array<{ d: boolean }>>`SELECT gdpr_sync_log_row_dirty(l) AS d FROM "shopping_sync_logs" l WHERE l."id" = ${id}`)[0]!.d
+  const trick = { ...rawRefund(fx), queue: 'admission_refusal', reason: REFUND_REASON }
+  const parkSweep = await mk({ recordKind: 'WC_REFUND_PARK', payload: trick, externalId: '6001' })
+  const unknownIn = await mk({ payload: { whatever: `${FULL_NAME} ${EMAIL}`, nested: { note: STREET } }, externalId: '6002' })
+  const unknownArr = await mk({ payload: [FULL_NAME, EMAIL], externalId: '6003' })
+  const unknownOut = await mk({ direction: 'TO_CONNECTOR', status: 'SYNCED', payload: { who: FULL_NAME }, externalId: '6004' })
+  const refusal = await mk({ payload: { queue: 'admission_refusal', reason: 'status_not_admitted', connector: 'woocommerce', externalOrderId: '6005', externalOrderNumber: '6005', status: 'pending', configured: ['processing'], currency: 'GBP', refusedAt: '2026-11-01T00:00:00.000Z', attempts: 0 }, externalId: '6005' })
+  for (const r of [parkSweep, unknownIn, unknownArr, unknownOut]) assert.equal(await dirty(r.id), true, 'PRECONDITION: unrecognised or raw counts as dirty')
+  assert.equal(await dirty(refusal.id), false, 'a recognised refusal (ids and counters only) is clean')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const p = (await lg(db, parkSweep.id)).payload as { amount: string; reason: string; queue?: string }
+  assert.equal(p.amount, '10.00'); assert.equal(p.reason, REFUND_REASON); assert.equal('queue' in p, false, 'the refund projection ran whatever fields the body carried')
+  assert.deepEqual(leaks(await lg(db, parkSweep.id)), [])
+  for (const r of [unknownIn, unknownArr, unknownOut]) {
+    assert.deepEqual((await lg(db, r.id)).payload, { _erasure_projected: true }, 'an unrecognised shape in scope is stubbed')
+    assert.equal(await dirty(r.id), false, 'and is clean only once stubbed')
+  }
+  assert.deepEqual((await lg(db, refusal.id)).payload, refusal.payload, 'a recognised refusal is untouched')
+  // THE GUARD: an insert or update of the same park for the erased order is projected on the way in.
+  const guarded = await mk({ recordKind: 'WC_REFUND_PARK', payload: trick, externalId: '6006' })
+  assert.deepEqual(leaks(guarded), []); assert.equal(((guarded.payload as { queue?: string }).queue), undefined)
+  const guardedUnknown = await mk({ payload: { who: FULL_NAME }, externalId: '6007' })
+  assert.deepEqual(guardedUnknown.payload, { _erasure_projected: true })
+  // THE RECONCILE: with the trigger off, rows slip in raw; the reconcile projects and stubs them, and reports none left.
+  await db.$executeRawUnsafe('ALTER TABLE "shopping_sync_logs" DISABLE TRIGGER "shopping_sync_logs_erased_projection"')
+  const slipPark = await mk({ recordKind: 'WC_REFUND_PARK', payload: trick, externalId: '6008' })
+  const slipUnknown = await mk({ payload: { who: FULL_NAME }, externalId: '6009' })
+  await db.$executeRawUnsafe('ALTER TABLE "shopping_sync_logs" ENABLE TRIGGER "shopping_sync_logs_erased_projection"')
+  assert.ok(leaks(await lg(db, slipPark.id)).length > 0 && leaks(await lg(db, slipUnknown.id)).length > 0, 'PRECONDITION: raw')
+  const { reconcileRawPayloads } = await import('@/lib/domain/erasure/raw-payloads')
+  assert.equal((await reconcileRawPayloads(db)).remaining, 0)
+  assert.deepEqual(leaks(await lg(db, slipPark.id)), []); assert.equal(((await lg(db, slipPark.id)).payload as { queue?: string }).queue, undefined)
+  assert.deepEqual((await lg(db, slipUnknown.id)).payload, { _erasure_projected: true })
+})
