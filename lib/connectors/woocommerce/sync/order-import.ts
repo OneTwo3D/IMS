@@ -6,6 +6,7 @@ import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain
 import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
 import { isWcOrderAnonymised, wcPayloadCarriesIdentity } from './anonymisation'
 import { mirrorWcAnonymisation } from './anonymisation-mirror'
+import { projectWcOrderForErasure } from './erased-payload'
 import { hasOpenWcErasureObligation, payloadCustomerTombstoned, recordWcErasureObligation, retireWcErasureObligation } from './erasure-obligation'
 import { acquireWcFirstImportLock, wcFirstImportLockHeld } from './first-import-lock'
 import { ERASURE_PLACEHOLDER_NAME, ERASURE_RECORD_ACTION, ERASURE_RECORD_DESCRIPTION, buildErasureRecordMetadata } from '@/lib/domain/erasure/erasure-record'
@@ -1008,7 +1009,7 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
     // The episode marker is minted EXACTLY as the update path always did, in the same write as paidAt, whatever receipts exist (the value is the DATABASE's clock, whatever is
     // written: trigger of migration 20260901090000). A new paid episode starts here; only addPayment clears the marker, and only for a receipt it records (o3d-psrx r6/r8). The registration
     // below, or an earlier one completing after this fence, discharges it.
-    const order = await tx.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { totalForeign: true, currency: true, orderNumber: true, externalOrderNumber: true, paidAt: true } })
+    const order = await tx.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { totalForeign: true, currency: true, orderNumber: true, externalOrderNumber: true, paidAt: true, erasedAt: true } })
     if (order.paidAt !== null) return null
     // THE PAID TOTAL MUST BE THE TOTAL IMS HOLDS. An update delivery refreshes addresses and notes but NOT the lines or the total (updateExistingWcOrderCore), so an order edited in
     // WooCommerce between the import and the payment still carries the old total here. Compared to the minor unit of the order currency, under the lock: if they differ nothing is
@@ -1046,7 +1047,8 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
         amount: remaining,
         currency: order.currency,
         method: wcOrder.payment_method_title || wcOrder.payment_method || null,
-        reference: wcOrder.transaction_id || null,
+        // An erased order's receipt carries no gateway reference (the storefront's own eraser sets it to "0").
+        reference: order.erasedAt ? null : (wcOrder.transaction_id || null),
         notes: existing.length > 0
           ? WC_RECEIPT_NOTE_PAID_LATER_PARTIAL
           : WC_RECEIPT_NOTE_PAID_LATER,
@@ -2432,6 +2434,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const erasedByObligation = payloadMarked || await hasOpenWcErasureObligation(wcOrder.id)
     const erasedByTombstone = !erasedByObligation && await payloadCustomerTombstoned(wcOrder)
     const payloadAnonymised = erasedByObligation || erasedByTombstone
+    // EVERY ERASED-ON-CREATE PATH (a marked payload, an open obligation, a tombstone) maps the payload's ALLOWLIST PROJECTION, not the original: item and fee names,
+    // the gateway transaction id and every other free-text field are replaced by the database's own projection (one implementation) before anything is mapped or
+    // persisted. Money, tax, lines and totals are untouched by it. (The customer-erased-mid-import path decides inside the transaction and is patched there.)
+    if (payloadAnonymised) wcOrder = await projectWcOrderForErasure(wcOrder)
     const customerName = payloadAnonymised
       ? ERASURE_PLACEHOLDER_NAME
       : [wcOrder.billing.first_name, wcOrder.billing.last_name].filter(Boolean).join(' ')
@@ -2908,6 +2914,13 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         }
         // The customer was erased between the lookup and this lock: the order is created ALREADY ERASED, in this same transaction.
         // Its money stays in the books (it is created, with its lines, totals and tax); the identity is never written.
+        // The customer was erased mid-import: the lines were mapped from the original payload before this was known, so their descriptions (item and fee names)
+        // are re-derived from the projection, position for position. Money, tax and quantities are untouched.
+        if (customerErasedDuringImport !== null && !payloadAnonymised) {
+          const projected = await projectWcOrderForErasure(wcOrder, tx)
+          const erasedMapped = [...(await mapWcLineItems(projected.line_items, fxRate)), ...mapWcFeeLines(projected.fee_lines)]
+          if (erasedMapped.length === lineData.length) erasedMapped.forEach((m, i) => { lineData[i]!.description = m.description })
+        }
         const erasedOnCreate = customerErasedDuringImport !== null || payloadAnonymised
         const erasedAt = new Date()
         const created = await tx.salesOrder.create({
@@ -3009,7 +3022,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
               amount: totalForeign,
               currency,
               method: wcOrder.payment_method_title || wcOrder.payment_method || null,
-              reference: wcOrder.transaction_id || null,
+              reference: erasedOnCreate ? null : (wcOrder.transaction_id || null),
               notes: WC_RECEIPT_NOTE_IMPORTED_PAID,
               paidAt: parseWcGmtInstant(wcOrder.date_paid_gmt as string),
               paidAtExplicitInstant: parseWcGmtInstant(wcOrder.date_paid_gmt as string), // an explicit instant, midnight included

@@ -794,3 +794,103 @@ test('[raw payloads] a DIRECT import of a pre-erasure snapshot of an unseen orde
   assert.equal(newOrder.erasedAt, null, 'an order created after the erasure stays live')
   assert.ok(newOrder.customerId, 'and gets a customer')
 })
+
+test('[raw payloads] one projection is FINAL: project(project(x)) = project(x) for the whole payload, over the seven identity shapes in every kept and dropped field, and no fragment survives', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  t.after(async () => { await fx.cleanup() })
+  const rate = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const project = async (v: unknown) => (await db.$queryRaw<Array<{ p: unknown }>>`SELECT gdpr_project_wc_order(${JSON.stringify(v)}::jsonb) AS p`)[0]!.p
+  const shapes = (id: string): unknown[] => [id, [id], { a: id }, { total: id, subtotal: id, note: id, nested: { who: id } }, [{ id: rate, total: '1.00', email: id, meta: { who: id } }], JSON.stringify([1, 'CODE', id]), 7]
+  const base = rawOrder(fx, rate) as Record<string, unknown>
+  const topKeys = Object.keys(base).filter((k) => !['line_items', 'meta_data'].includes(k))
+  for (const id of [FULL_NAME, EMAIL, PHONE, STREET]) {
+    for (const shape of shapes(id)) {
+      const order: Record<string, unknown> = { ...base }
+      for (const k of topKeys) order[k] = shape
+      order.line_items = [Object.fromEntries(['id', 'name', 'parent_name', 'sku', 'product_id', 'quantity', 'price', 'subtotal', 'total', 'tax_class', 'taxes', 'meta_data', 'image', 'cogs_value', 'global_unique_id'].map((k) => [k, shape]))]
+      order.fee_lines = [Object.fromEntries(['id', 'name', 'total', 'taxes', 'meta_data', 'tax_class'].map((k) => [k, shape]))]
+      order.shipping_lines = [Object.fromEntries(['id', 'method_id', 'method_title', 'total', 'taxes', 'meta_data'].map((k) => [k, shape]))]
+      order.coupon_lines = [Object.fromEntries(['id', 'code', 'discount', 'meta_data'].map((k) => [k, shape]))]
+      order.meta_data = [...Object.keys(DECLARED_META_VALUE_KINDS), 'coupon_info', 'coupon_data', 'other_key'].map((key, i) => ({ id: i, key, value: shape }))
+      const once = await project(order)
+      const twice = await project(once)
+      assert.deepEqual(twice, once, `projection is idempotent for ${JSON.stringify(shape).slice(0, 50)}`)
+      for (const frag of [NAME.first, NAME.last, 'example.test', '7700', 'Marmalade']) {
+        // the refund reason is free text KEPT by owner ruling; every other field must be clean
+        const text = JSON.stringify({ ...(once as Record<string, unknown>), refunds: undefined })
+        assert.equal(text.includes(frag), false, `"${frag}" survived ${JSON.stringify(shape).slice(0, 50)}`)
+      }
+    }
+  }
+})
+
+test('[raw payloads] a structured sku never becomes a name: an object or array sku gives "Item" and an empty sku', { skip }, async () => {
+  const db = await loadDb()
+  for (const sku of [{ a: `${NAME.first} ${NAME.last}` }, [`${NAME.first}`], `${NAME.first} ${NAME.last}`, EMAIL]) {
+    const p = (await db.$queryRaw<Array<{ p: { line_items: Array<{ name: string; sku: string }> } }>>`SELECT gdpr_project_wc_order(${JSON.stringify({ id: 1, line_items: [{ id: 1, name: 'x', sku, quantity: 1 }] })}::jsonb) AS p`)[0]!.p
+    assert.equal(p.line_items[0]!.name, 'Item'); assert.equal(p.line_items[0]!.sku, '')
+  }
+  const ok = (await db.$queryRaw<Array<{ p: { line_items: Array<{ name: string; sku: string }> } }>>`SELECT gdpr_project_wc_order(${JSON.stringify({ id: 1, line_items: [{ id: 1, name: 'x', sku: 'AB-12_x.3', quantity: 1 }] })}::jsonb) AS p`)[0]!.p
+  assert.equal(ok.line_items[0]!.name, 'AB-12_x.3'); assert.equal(ok.line_items[0]!.sku, 'AB-12_x.3')
+})
+
+test('[raw payloads] EVERY erased-on-create path maps the projection: a marked payload, an open obligation and a tombstone each create an order with no personalised item name, fee name or gateway id, and its money equals a normal import of the same order', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const made: Array<{ orderId: string; customerId: string | null }> = []
+  const ids = { marked: fx.externalId + 3_100_000_000, obligation: fx.externalId + 3_200_000_000, tombstone: fx.externalId + 3_300_000_000, normal: fx.externalId + 3_400_000_000 }
+  t.after(async () => {
+    for (const e of made) {
+      await db.payment.deleteMany({ where: { orderId: e.orderId } }); await db.accountingSyncLog.deleteMany({ where: { referenceId: e.orderId } }); await db.salesOrderLine.deleteMany({ where: { orderId: e.orderId } })
+      await db.activityLog.deleteMany({ where: { OR: [{ entityId: e.orderId }, ...(e.customerId ? [{ entityId: e.customerId }] : [])] } })
+      await db.shoppingOrderLink.deleteMany({ where: { orderId: e.orderId } }); await db.salesOrder.deleteMany({ where: { id: e.orderId } })
+      if (e.customerId) { await db.shoppingCustomerLink.deleteMany({ where: { customerId: e.customerId } }); await db.customer.deleteMany({ where: { id: e.customerId } }) }
+    }
+    await db.storefrontOrderErasureObligation.deleteMany({ where: { externalOrderId: { in: Object.values(ids).map(String) } } })
+    await db.storefrontCustomerErasureTombstone.deleteMany({})
+    await fx.cleanup()
+  })
+  const rate = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const mk = (id: number, over: Record<string, unknown> = {}) => {
+    const base = rawOrder(fx, rate, { id, number: String(id), ...over }) as Record<string, unknown> & { line_items: Array<Record<string, unknown>> }
+    return { ...base, transaction_id: `TXN-${NAME.last}-${id}`, date_paid_gmt: '2026-11-02T09:05:00', date_paid: '2026-11-02T09:05:00',
+      line_items: [{ ...base.line_items[0]!, name: `Widget engraved for ${NAME.first}`, parent_name: `Gift for ${NAME.last}` }],
+      fee_lines: [{ id: 41, name: `Gift wrap for ${NAME.last}`, tax_class: '', tax_status: 'none', total: '0.00', total_tax: '0.00', taxes: [], meta_data: [] }] }
+  }
+  const run = async (id: number, over: Record<string, unknown> = {}) => {
+    const r = await importWcOrder(mk(id, over) as never)
+    assert.equal(r.success, true, JSON.stringify(r))
+    const link = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(id) } })
+    const order = await db.salesOrder.findUniqueOrThrow({ where: { id: link.orderId }, include: { lines: true } })
+    const payments = await db.payment.findMany({ where: { orderId: order.id } })
+    made.push({ orderId: order.id, customerId: order.customerId })
+    return { order, payments }
+  }
+  const money = (o: Awaited<ReturnType<typeof run>>) => JSON.stringify({ total: String(o.order.totalForeign), lines: o.order.lines.map((l) => [String(l.qty), String(l.unitPriceForeign), String(l.totalForeign), String(l.taxForeign)]).sort(), pay: o.payments.map((p) => String(p.amount)) })
+
+  // The reference: a NORMAL import of the same order from a live customer (a different person, so it is not caught by anything).
+  const normal = await run(ids.normal, { billing: { ...WC_ADDRESS, email: `live.${randomUUID().slice(0, 6)}@example.test`, first_name: 'Livia', last_name: 'Other' }, shipping: { ...WC_ADDRESS, first_name: 'Livia', last_name: 'Other' }, customer_id: 0 })
+  assert.equal(normal.order.erasedAt, null)
+  assert.ok(normal.order.lines.some((l) => l.description.includes(NAME.first)), 'PRECONDITION: a normal import keeps the item name')
+
+  // PATH 1: a payload the storefront marked anonymised.
+  const marked = await run(ids.marked, { meta_data: [{ id: 5, key: '_anonymized', value: 'yes' }], customer_id: 0 })
+  // PATH 2: an open obligation for the order.
+  await db.storefrontOrderErasureObligation.create({ data: { connector: 'woocommerce', externalOrderId: String(ids.obligation) } })
+  const obligated = await run(ids.obligation, { customer_id: 0 })
+  // PATH 3: a customer tombstone (the account was erased after this snapshot was taken).
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const tombstoned = await run(ids.tombstone, { customer_id: fx.wooCustomerId })
+
+  for (const [label, r] of [['marked payload', marked], ['open obligation', obligated], ['tombstone', tombstoned]] as const) {
+    assert.ok(r.order.erasedAt, `${label}: created erased`)
+    for (const l of r.order.lines) assert.deepEqual(leaks(l), [], `${label}: no personalised name on a line (${l.description})`)
+    assert.ok(r.order.lines.every((l) => !l.description.includes('Widget engraved') && !l.description.includes('Gift wrap')), `${label}: line and fee descriptions come from the projection`)
+    assert.ok(r.payments.length >= 1 && r.payments.every((p) => p.reference === null), `${label}: the receipt carries no gateway id`)
+    assert.deepEqual(leaks(r.payments), [], `${label}: no identity on the payment`)
+    assert.equal(money(r), money(normal), `${label}: money, tax, lines and receipt equal a normal import of the same order`)
+  }
+})

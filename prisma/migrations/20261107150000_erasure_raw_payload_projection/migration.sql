@@ -192,6 +192,24 @@ CREATE OR REPLACE FUNCTION gdpr_numeric_for_present(src jsonb, keys text[]) RETU
   SELECT COALESCE((SELECT jsonb_object_agg(k, gdpr_number_or_unreadable(src->k)) FROM unnest(keys) AS k WHERE src ? k), '{}'::jsonb)
 $$;
 
+-- TEXT SCALARS: a kept text field is a single token (no whitespace, no '@', at most 60 characters), else the empty string. A human label (the payment method
+-- title, a shipping method title, a tax label) is replaced by the token its machine counterpart carries, never kept as free text.
+CREATE OR REPLACE FUNCTION gdpr_token_for_present(src jsonb, keys text[]) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT COALESCE((SELECT jsonb_object_agg(k, CASE WHEN jsonb_typeof(src->k) = 'string' AND (src->>k) ~ '^[^[:space:]@]{0,60}$' THEN src->k ELSE to_jsonb(''::text) END)
+                     FROM unnest(keys) AS k WHERE src ? k), '{}'::jsonb)
+$$;
+
+-- Dates: a plain date or date-time, else JSON null.
+CREATE OR REPLACE FUNCTION gdpr_date_for_present(src jsonb, keys text[]) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT COALESCE((SELECT jsonb_object_agg(k, CASE WHEN jsonb_typeof(src->k) = 'string' AND (src->>k) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}([T ][0-9:.]{1,15})?(Z|[+-][0-9:]{2,5})?$' THEN src->k ELSE 'null'::jsonb END)
+                     FROM unnest(keys) AS k WHERE src ? k), '{}'::jsonb)
+$$;
+
+-- Flags: a JSON boolean, else false.
+CREATE OR REPLACE FUNCTION gdpr_bool_for_present(src jsonb, keys text[]) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT COALESCE((SELECT jsonb_object_agg(k, CASE WHEN jsonb_typeof(src->k) = 'boolean' THEN src->k ELSE 'false'::jsonb END) FROM unnest(keys) AS k WHERE src ? k), '{}'::jsonb)
+$$;
+
 -- A line's `taxes`: [{id, total, subtotal}] and nothing else (the importer reads taxes[].id as the storefront rate id). Not an array -> [].
 CREATE OR REPLACE FUNCTION gdpr_project_taxes(arr jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE WHEN arr IS NULL OR jsonb_typeof(arr) <> 'array' THEN '[]'::jsonb ELSE COALESCE((
@@ -205,17 +223,23 @@ CREATE OR REPLACE FUNCTION gdpr_project_taxes(arr jsonb) RETURNS jsonb LANGUAGE 
 $$;
 
 -- Each element of an array reduced to `keys`, plus a projected meta_data when with_meta; `only_keys` limits that meta (NULL = the allowlist).
--- name_mode says what becomes of the element's free-text `name` (a personalised item can carry a recipient's name): 'sku' = the SKU (else 'Item'),
+-- name_mode says what becomes of the element's free-text `name` (a personalised item can carry a recipient's name): 'sku' = the SKU when it is a plain code
+-- string (else 'Item'); the `sku` itself is kept only when it is a plain code string, else emptied,
 -- 'fee' = a FIXED label per credit kind the coupon classifier reads (Smart coupon / Store credit / Gift card / Wallet; never the original text), else 'Fee'; anything else = no name.
 -- parent_name is always dropped. Not an array -> [].
 CREATE OR REPLACE FUNCTION gdpr_project_lines(arr jsonb, keys text[], with_meta boolean, only_keys text[], name_mode text DEFAULT 'none') RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE WHEN arr IS NULL OR jsonb_typeof(arr) <> 'array' THEN '[]'::jsonb ELSE COALESCE((
     SELECT jsonb_agg(gdpr_keep_keys(l, keys)
         || CASE WHEN l ? 'taxes' THEN jsonb_build_object('taxes', gdpr_project_taxes(l->'taxes')) ELSE '{}'::jsonb END
+        || CASE WHEN l ? 'sku' THEN jsonb_build_object('sku', CASE WHEN jsonb_typeof(l->'sku') = 'string' AND (l->>'sku') ~ '^[A-Za-z0-9_./-]{1,60}$' THEN l->'sku' ELSE to_jsonb(''::text) END) ELSE '{}'::jsonb END
         || gdpr_numeric_for_present(l, ARRAY['cogs_value', 'id', 'product_id', 'variation_id', 'quantity', 'price', 'subtotal', 'subtotal_tax', 'total', 'total_tax', 'refund_total', 'instance_id', 'tax_total', 'shipping_tax_total', 'discount', 'discount_tax', 'rate_id', 'rate_percent'])
+        || gdpr_token_for_present(l, ARRAY['tax_class', 'tax_status', 'method_id', 'rate_code', 'global_unique_id'])
+        || CASE WHEN l ? 'method_title' THEN jsonb_build_object('method_title', CASE WHEN jsonb_typeof(l->'method_id') = 'string' AND (l->>'method_id') ~ '^[^[:space:]@]{1,60}$' THEN l->'method_id' ELSE to_jsonb(''::text) END) ELSE '{}'::jsonb END
+        || CASE WHEN l ? 'label' THEN jsonb_build_object('label', CASE WHEN jsonb_typeof(l->'rate_code') = 'string' AND (l->>'rate_code') ~ '^[^[:space:]@]{1,60}$' THEN l->'rate_code' ELSE to_jsonb(''::text) END) ELSE '{}'::jsonb END
+        || gdpr_bool_for_present(l, ARRAY['compound'])
         || CASE WHEN with_meta AND l ? 'meta_data' THEN jsonb_build_object('meta_data', gdpr_project_meta(l->'meta_data', only_keys)) ELSE '{}'::jsonb END
         || CASE name_mode
-             WHEN 'sku' THEN jsonb_build_object('name', COALESCE(NULLIF(l->>'sku', ''), 'Item'))
+             WHEN 'sku' THEN jsonb_build_object('name', CASE WHEN jsonb_typeof(l->'sku') = 'string' AND (l->>'sku') ~ '^[A-Za-z0-9_./-]{1,60}$' THEN l->'sku' ELSE to_jsonb('Item'::text) END)
              WHEN 'fee' THEN jsonb_build_object('name', to_jsonb(CASE
                WHEN (l->>'name') ~* 'smart[_ -]?coupon' THEN 'Smart coupon'
                WHEN (l->>'name') ~* 'store[_ -]?credit' THEN 'Store credit'
@@ -235,6 +259,8 @@ CREATE OR REPLACE FUNCTION gdpr_project_coupon_lines(arr jsonb) RETURNS jsonb LA
   SELECT CASE WHEN arr IS NULL OR jsonb_typeof(arr) <> 'array' THEN '[]'::jsonb ELSE COALESCE((
     SELECT jsonb_agg(
       gdpr_keep_keys(l, ARRAY['id', 'code', 'discount', 'discount_tax'])
+      || gdpr_token_for_present(l, ARRAY['code'])
+      || gdpr_numeric_for_present(l, ARRAY['id', 'discount', 'discount_tax'])
       || jsonb_build_object('meta_data',
            gdpr_project_meta(l->'meta_data', ARRAY['coupon_info', 'coupon_data'])
            || CASE WHEN (l->'meta_data')::text ~* 'smart[_ -]?coupon|store[_ -]?credit|gift[_ -]?(card|cert)|giftcard|wallet'
@@ -262,6 +288,10 @@ CREATE OR REPLACE FUNCTION gdpr_project_wc_order(o jsonb) RETURNS jsonb LANGUAGE
     || CASE WHEN o ? 'wpo_wcpdf_invoice_number' AND gdpr_project_meta_value('_wcpdf_invoice_number', o->'wpo_wcpdf_invoice_number') IS NOT NULL
             THEN jsonb_build_object('wpo_wcpdf_invoice_number', gdpr_project_meta_value('_wcpdf_invoice_number', o->'wpo_wcpdf_invoice_number')) ELSE '{}'::jsonb END
     || gdpr_numeric_for_present(o, ARRAY['store_credit_used', 'id', 'parent_id', 'discount_total', 'discount_tax', 'shipping_total', 'shipping_tax', 'cart_tax', 'total', 'total_tax'])
+    || gdpr_token_for_present(o, ARRAY['number', 'status', 'version', 'created_via', 'payment_method', 'currency_symbol'])
+    || CASE WHEN o ? 'payment_method_title' THEN jsonb_build_object('payment_method_title', CASE WHEN jsonb_typeof(o->'payment_method') = 'string' AND (o->>'payment_method') ~ '^[^[:space:]@]{1,60}$' THEN o->'payment_method' ELSE to_jsonb(''::text) END) ELSE '{}'::jsonb END
+    || gdpr_date_for_present(o, ARRAY['date_created', 'date_created_gmt', 'date_modified', 'date_modified_gmt', 'date_paid', 'date_paid_gmt', 'date_completed', 'date_completed_gmt'])
+    || gdpr_bool_for_present(o, ARRAY['prices_include_tax', 'needs_payment', 'needs_processing', 'is_editable'])
     || CASE WHEN o ? 'currency' THEN jsonb_build_object('currency', CASE WHEN jsonb_typeof(o->'currency') = 'string' AND (o->>'currency') ~ '^[A-Za-z]{3}$' THEN o->'currency' ELSE to_jsonb('unreadable'::text) END) ELSE '{}'::jsonb END
     || gdpr_neutral_for_present(o, jsonb_build_object('customer_id', 0, 'customer_note', '', 'customer_ip_address', '', 'customer_user_agent', '', 'order_key', '', 'payment_url', '', 'cart_hash', '', 'transaction_id', '0'))
     || jsonb_build_object('billing', gdpr_empty_address(o->'billing'), 'shipping', gdpr_empty_address(o->'shipping'))
@@ -283,6 +313,8 @@ CREATE OR REPLACE FUNCTION gdpr_project_wc_refund(r jsonb) RETURNS jsonb LANGUAG
     gdpr_keep_keys(r, ARRAY['id', 'parent_id', 'order_id', 'date_created', 'date_created_gmt', 'amount', 'reason', 'refunded_payment'])
     || gdpr_neutral_for_present(r, jsonb_build_object('refunded_by', 0))
     || gdpr_numeric_for_present(r, ARRAY['id', 'parent_id', 'order_id', 'amount'])
+    || gdpr_date_for_present(r, ARRAY['date_created', 'date_created_gmt'])
+    || gdpr_bool_for_present(r, ARRAY['refunded_payment'])
     || jsonb_build_object('meta_data', '[]'::jsonb)
     || jsonb_build_object('line_items', gdpr_project_lines(r->'line_items',
          ARRAY['id', 'product_id', 'variation_id', 'quantity', 'tax_class', 'subtotal', 'subtotal_tax', 'total', 'total_tax', 'taxes', 'sku', 'refund_total'], true, ARRAY['_refunded_item_id'], 'sku'))

@@ -416,6 +416,7 @@ test('[erasure] a customer erased between the importer\'s customer lookup and it
   t.after(async () => {
     const link = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(fx.externalId + 1) }, select: { orderId: true } })
     if (link) {
+      await db.payment.deleteMany({ where: { orderId: link.orderId } })
       await db.accountingSyncLog.deleteMany({ where: { referenceId: link.orderId } })
       await db.activityLog.deleteMany({ where: { entityId: link.orderId } })
       await db.salesOrderLine.deleteMany({ where: { orderId: link.orderId } })
@@ -447,7 +448,11 @@ test('[erasure] a customer erased between the importer\'s customer lookup and it
     await new Promise((r) => setTimeout(r, 300))
   }
   let done = false
-  const importing = importWcOrder(payload(fx.externalId + 1, wcRateId) as never).then((r) => { done = true; return r })
+  // The payload carries free text that must not reach a line, a fee or the payment of an order created erased: a personalised item name, a fee name, the gateway id.
+  const midBase = payload(fx.externalId + 1, wcRateId) as unknown as Record<string, unknown> & { line_items: Array<Record<string, unknown>> }
+  const midPayload = { ...midBase, transaction_id: `TXN-${NAME.last}-MID`, date_paid_gmt: '2026-11-02T09:05:00', date_paid: '2026-11-02T09:05:00', line_items: [{ ...midBase.line_items[0]!, name: `Widget engraved for ${NAME.first}` }],
+    fee_lines: [{ id: 41, name: `Gift wrap for ${NAME.last}`, tax_class: '', tax_status: 'none', total: '0.00', total_tax: '0.00', taxes: [], meta_data: [] }] }
+  const importing = importWcOrder(midPayload as never).then((r) => { done = true; return r })
   await new Promise((r) => setTimeout(r, 1500))
   assert.equal(done, false, 'the create transaction is waiting on the customer row lock (taken inside its customer step)')
   release()
@@ -463,7 +468,12 @@ test('[erasure] a customer erased between the importer\'s customer lookup and it
     ['GDPR Anonymised', null, null, null, null, null])
   assert.ok(created.erasedAt, 'the erasure marker is set')
   assert.equal(created.totalForeign.toString(), '126', 'the order and its money stay in the books')
-  assert.equal(await db.salesOrderLine.count({ where: { orderId: link.orderId } }), 1)
+  const midLines = await db.salesOrderLine.findMany({ where: { orderId: link.orderId } })
+  assert.ok(midLines.length >= 1)
+  assert.ok(midLines.every((l) => !JSON.stringify(l).includes(NAME.first) && !JSON.stringify(l).includes(NAME.last)), 'no personalised item or fee name on the lines of an order created erased mid-import')
+  const midPayments = await db.payment.findMany({ where: { orderId: link.orderId } })
+  assert.ok(midPayments.every((x) => x.reference === null), 'no gateway transaction id on the receipt')
+  await db.payment.deleteMany({ where: { orderId: link.orderId } })
   assert.equal((await db.shoppingOrderLink.findFirstOrThrow({ where: { orderId: link.orderId } })).metadata, null, 'the storefront order key is not stored')
   const proof = await db.activityLog.findFirst({ where: { entityId: link.orderId, action: 'gdpr_erasure_recorded' } })
   assert.ok(proof, 'the name-free proof record was written as an erasure of this order')
