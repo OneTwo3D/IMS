@@ -2,6 +2,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { toWmsMutationEventRow } from '@/lib/domain/wms/mutation-audit'
+import { scrubWmsError } from '@/lib/domain/wms/error-scrub'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsReturnRecord } from '@/lib/connectors/wms/types'
 import { resolveOrderForExternalFulfillment } from '@/lib/fulfillment/external-fulfillment'
@@ -312,7 +313,7 @@ async function writeReturnsErrorLog(jobId: string, record: WmsReturnRecord, erro
         // message can echo the rejected value, which is exactly the name or address that was erased.
         reason: erased
           ? `Return rejected: ${error instanceof Error ? error.name : 'UnknownError'}`
-          : error instanceof Error ? error.message : 'Mintsoft returns sync error',
+          : scrubWmsError(error, 'Mintsoft returns sync error'),
         // The raw warehouse record is NOT copied into the sync log (it holds the recipient; nothing reads it here, and the returns inbox keeps its own
         // rawPayload for review). Only the return id, which is a reference and not personal data.
         payload: (erased ? {} : { externalReturnId: record.externalReturnId }) as Prisma.InputJsonValue,
@@ -571,7 +572,7 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
       errors: counters.errors,
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Mintsoft returns sync failed'
+    const message = scrubWmsError(error, 'Mintsoft returns sync failed')
     await completeReturnsJob(job.id, 'FAILED', counters, buildReturnsSummary({
       bindingCount: bindings.length,
       since,

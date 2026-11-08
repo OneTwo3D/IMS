@@ -74,6 +74,10 @@ export type ErasureCounts = {
   rawSyncLogsProjected: number
   rawReturnRecordsCleared: number
   storefrontIdMissing: number
+  /** Accounting events and event-log rows whose stored document payload had its contact block scrubbed (derived-copies.ts). */
+  accountingEventCopiesScrubbed: number
+  /** Accounting sync rows whose error text was replaced by the fixed marker. */
+  accountingErrorsScrubbed: number
   notifications: number
 }
 

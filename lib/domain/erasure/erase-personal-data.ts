@@ -8,6 +8,7 @@ import { scrubContactBlock } from './contact-gate'
 import { CustomerKeysChanged, lockStorefrontCustomerKeys, readStorefrontCustomerIds } from './customer-key-lock'
 import { scrubReturnInboxEvents } from './return-events'
 import { loadRawPayloadSubject, scrubRawPayloadsInTx, type RawPayloadCounts } from './raw-payloads'
+import { scrubAccountingDerivedCopiesInTx, type DerivedCopyCounts } from './derived-copies'
 import { SYSTEM_PAYMENT_NOTES, orderIsErasedInTx } from './order-state'
 export { orderIsErasedInTx }
 import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
@@ -75,7 +76,7 @@ export async function eraseOrdersPersonalDataInTx(
   tx: Prisma.TransactionClient,
   orderIds: string[],
   erasedAt: Date,
-): Promise<Omit<ErasureCounts, 'customers' | 'shoppingCustomerLinks' | 'activityRowsScrubbed' | 'linkedFreeTextScrubbed' | keyof RawPayloadCounts>> {
+): Promise<Omit<ErasureCounts, 'customers' | 'shoppingCustomerLinks' | 'activityRowsScrubbed' | 'linkedFreeTextScrubbed' | keyof RawPayloadCounts | keyof DerivedCopyCounts>> {
   const counts = { salesOrders: 0, shipments: 0, shoppingOrderLinks: 0, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, notifications: 0 }
   for (const ids of chunks(orderIds)) {
     counts.salesOrders += (await tx.salesOrder.updateMany({
@@ -450,7 +451,9 @@ async function eraseUnderLocksInTx(
   // a failure here fails the whole erasure, so raw identity cannot be left behind silently. See raw-payloads.ts.
   const rawSubject = await loadRawPayloadSubject(tx, orderIds, storefrontCustomerIds)
   const rawCounts = await scrubRawPayloadsInTx(tx, rawSubject.subject, rawSubject.missing, erasedAt)
-  const counts: ErasureCounts = { customers: eraseCustomer ? 1 : 0, shoppingCustomerLinks: links.count, activityRowsScrubbed, linkedFreeTextScrubbed, ...rawCounts, ...orderCounts }
+  // THE DERIVED ACCOUNTING COPIES (event payloads, superseded bodies on event logs, sync-row error text): same transaction, same locks, fail closed.
+  const derivedCounts = await scrubAccountingDerivedCopiesInTx(tx, orderIds)
+  const counts: ErasureCounts = { customers: eraseCustomer ? 1 : 0, shoppingCustomerLinks: links.count, activityRowsScrubbed, linkedFreeTextScrubbed, ...rawCounts, ...derivedCounts, ...orderCounts }
   const record = {
     tag: 'sales',
     description: ERASURE_RECORD_DESCRIPTION,

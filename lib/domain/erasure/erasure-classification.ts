@@ -165,6 +165,25 @@ ERASURE_CLASSIFICATION.ShoppingSyncLog = {
   retained: {},
 }
 
+// The derived accounting copies: reached by (referenceType, referenceId) / (sourceEntityType, sourceEntityId) = the order and its refunds, not by a relation (named in the schema test).
+// The contact block of a payload is scrubbed by derived-copies.ts / erase-personal-data.ts (email always; name kept only where the copy may describe a posted, retained document).
+ERASURE_CLASSIFICATION.AccountingSyncLog = {
+  erased: ['payload', 'errorMessage'],
+  notPersonal: ['connector', 'referenceType', 'referenceId', 'settlementBasis', 'connectionProvenance', 'createDispatchIdempotencyKey', 'followUpObligations'],
+  retained: {
+    externalTransactionId: 'the ledger document id reconciles the posted document',
+    attemptedInvoiceNumber: 'the invoice number is part of the retained invoice record',
+  },
+}
+ERASURE_CLASSIFICATION.AccountingEvent = {
+  erased: ['linesJson'],
+  notPersonal: ['type', 'sourceEntityType', 'sourceEntityId', 'status', 'idempotencyKey', 'currency', 'externalSystem', 'revisionOrderBasis', 'voidBasis', 'postBasis', 'reversalOfId'],
+  retained: { externalId: 'the ledger document id reconciles the posted document' },
+}
+// The event log's MESSAGE is free text: a final failure writes the raw connector error into it (it can echo the customer's or a third party's name), so it is
+// replaced by the marker; the superseded body in metadata can hold a contact block. The action stays: it says what happened.
+ERASURE_CLASSIFICATION.AccountingEventLog = { erased: ['metadata', 'message'], notPersonal: ['action'], retained: {} }
+
 // Keyed by the storefront order id only; it carries no personal data (named in the schema test: no relation reaches it).
 ERASURE_CLASSIFICATION.StorefrontCustomerErasureTombstone = { erased: [], notPersonal: ['connector', 'customerKeyHash'], retained: {} } // a hash of connector + storefront customer id: no raw identifier
 ERASURE_CLASSIFICATION.StorefrontOrderErasureObligation = { erased: [], notPersonal: ['connector', 'externalOrderId'], retained: {} }

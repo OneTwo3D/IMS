@@ -2,6 +2,7 @@ import { requireApiAuth } from '@/lib/auth/server'
 import { db } from '@/lib/db'
 import { csvResponse, toCsv } from '@/lib/csv'
 import { hasPermission } from '@/lib/permissions'
+import { scrubWmsError } from '@/lib/domain/wms/error-scrub'
 
 const HEADERS = ['timestamp', 'warehouseCode', 'sku', 'productName', 'imsBefore', 'wmsQty', 'imsAfter', 'delta', 'action', 'reason']
 
@@ -62,7 +63,8 @@ export async function GET(
     imsAfter: line.imsQtyAfter?.toString() ?? '',
     delta: line.delta?.toString() ?? '',
     action: line.action,
-    reason: line.reason ?? '',
+    // The export is egress: rows written before the writers scrubbed their text can still hold an address or an email, so the text is scrubbed on the way out too.
+    reason: line.reason ? scrubWmsError(line.reason) : '',
   }))
 
   return csvResponse(toCsv(rows, HEADERS), `mintsoft-sync-${job.id}.csv`)
