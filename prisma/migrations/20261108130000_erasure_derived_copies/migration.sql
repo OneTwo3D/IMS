@@ -25,7 +25,7 @@ $$;
 -- The contact block of an accounting document payload with the email removed and the name kept or replaced. Anything that is not an object with a contact object is returned unchanged.
 CREATE OR REPLACE FUNCTION gdpr_scrub_contact(doc jsonb, keep_name boolean) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE
-    WHEN doc IS NULL OR jsonb_typeof(doc) <> 'object' OR jsonb_typeof(doc -> 'contact') <> 'object' THEN doc
+    WHEN doc IS NULL OR jsonb_typeof(doc) <> 'object' OR COALESCE(jsonb_typeof(doc -> 'contact'), '') <> 'object' THEN doc
     WHEN keep_name AND jsonb_typeof(doc #> '{contact,name}') = 'string' THEN jsonb_set(doc, '{contact}', jsonb_build_object('name', doc #> '{contact,name}'))
     ELSE jsonb_set(doc, '{contact}', jsonb_build_object('name', to_jsonb('GDPR Anonymised'::text)))
   END

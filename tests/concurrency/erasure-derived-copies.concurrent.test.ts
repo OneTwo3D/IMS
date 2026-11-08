@@ -322,13 +322,21 @@ test('[derived copies] more dirty event logs and notifications than one batch ar
     await tx.$executeRaw`
       INSERT INTO "notifications" ("id", "type", "title", "message", "actionUrl", "createdAt")
       SELECT 'dn-' || ${fx.orderId} || '-' || g, 'info', ${NAME}, ${NAME}, ${`/sales/${fx.orderId}`}, now() FROM generate_series(1, ${N}) g`
+    await tx.$executeRaw`
+      INSERT INTO "accounting_events" ("id", "type", "sourceEntityType", "sourceEntityId", "businessDate", "status", "idempotencyKey", "linesJson", "currency", "createdAt", "updatedAt")
+      SELECT 'de-' || ${fx.orderId} || '-' || g, 'INVOICE', 'SalesOrder', ${fx.orderId}, now(), 'PENDING', 'bulk-' || ${fx.orderId} || '-' || g, ${JSON.stringify(contactDoc(NAME, EMAIL))}::jsonb, 'GBP', now(), now()
+        FROM generate_series(1, ${N}) g`
+    await tx.$executeRaw`
+      INSERT INTO "accounting_sync_logs" ("id", "connector", "type", "referenceType", "referenceId", "status", "errorMessage", "createdAt")
+      SELECT 'ds-' || ${fx.orderId} || '-' || g, 'xero', 'SALES_INVOICE', 'SalesOrder', ${fx.orderId}, 'FAILED', ${`echo ${NAME}`}, now() FROM generate_series(1, ${N}) g`
   })
-  // A capped run (one round, 500 per statement) leaves rows and SAYS so.
+  // A capped run (one round, 500 per statement) leaves rows and SAYS so; EACH store is capped on its own.
   const capped = await reconcileDerivedCopies(db, 500, 1)
-  assert.ok(capped.remaining >= N - 500, `the cap leaves rows behind and reports them (${capped.remaining})`)
-  // EACH store is capped on its own: the notifications left are at least the overflow too.
-  const dirtyNotes = await db.notification.count({ where: { actionUrl: `/sales/${fx.orderId}`, title: NAME } })
-  assert.ok(dirtyNotes >= N - 500, `the notifications are capped per statement (${dirtyNotes})`)
+  assert.ok(capped.remaining >= 4 * (N - 500), `the cap leaves rows behind in every store and reports them (${capped.remaining})`)
+  assert.ok(await db.notification.count({ where: { actionUrl: `/sales/${fx.orderId}`, title: NAME } }) >= N - 500, 'notifications are capped per statement')
+  assert.ok(await db.accountingEvent.count({ where: { id: { startsWith: `de-${fx.orderId}` }, linesJson: { path: ['contact', 'name'], equals: NAME } } }) >= N - 500, 'events are capped per statement')
+  assert.ok(await db.accountingSyncLog.count({ where: { id: { startsWith: `ds-${fx.orderId}` }, errorMessage: { contains: NAME } } }) >= N - 500, 'sync rows are capped per statement')
+  assert.ok(await db.accountingEventLog.count({ where: { id: { startsWith: `dl-${fx.orderId}` }, metadata: { path: ['enqueuedLinesJson', 'contact', 'name'], equals: NAME } } }) >= N - 500, 'event logs are capped per statement')
   // A full run drains them in rounds.
   const full = await reconcileDerivedCopies(db)
   assert.equal(full.remaining, 0)
@@ -419,4 +427,64 @@ test('[derived copies] "remaining" counts every store: one dirty row in each is 
     assert.equal(drained.remaining, 0, `${label}: drained`)
     assert.ok(drained.changed >= 1)
   }
+})
+
+test('[derived copies] refund-keyed rows: later writers are held, and the reconcile reaches them', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await fixture(db)
+  t.after(() => fx.cleanup())
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { reconcileDerivedCopies } = await import('@/lib/domain/erasure/derived-copies')
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  // Triggers: a refund's event and sync row written after the erasure.
+  const ev = await db.accountingEvent.create({ data: { type: 'CREDIT_NOTE', sourceEntityType: 'SalesOrderRefund', sourceEntityId: fx.refundId, businessDate: new Date('2026-11-03'), status: 'PENDING', idempotencyKey: `derived-${randomUUID()}`, linesJson: contactDoc(NAME, EMAIL), currency: 'GBP' } as never })
+  assert.deepEqual((ev.linesJson as { contact: unknown }).contact, { name: PLACEHOLDER })
+  const sync = await db.accountingSyncLog.update({ where: { id: fx.ids.refundSync }, data: { errorMessage: `late ${NAME}` } })
+  assert.equal(sync.errorMessage, MARKER)
+  // Reconcile: the same rows written with the triggers off.
+  await withTriggersOff(db, async (tx) => {
+    await tx.accountingEvent.update({ where: { id: fx.ids.refundEvent }, data: { linesJson: contactDoc(NAME, EMAIL) } })
+    await tx.accountingSyncLog.update({ where: { id: fx.ids.refundSync }, data: { errorMessage: `late ${NAME}` } })
+  })
+  const r = await reconcileDerivedCopies(db)
+  assert.equal(r.remaining, 0)
+  assert.ok(r.changed >= 2)
+  assert.deepEqual(((await db.accountingEvent.findUniqueOrThrow({ where: { id: fx.ids.refundEvent } })).linesJson as { contact: unknown }).contact, { name: PLACEHOLDER })
+  assert.equal((await db.accountingSyncLog.findUniqueOrThrow({ where: { id: fx.ids.refundSync } })).errorMessage, MARKER)
+})
+
+test('[derived copies] every store has its own fail-closed re-check: a write that undoes the scrub in ANY store rolls the erasure back', { skip }, async (t) => {
+  const db = await loadDb()
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const stores: Array<{ label: string; table: string; fn: string; body: string }> = [
+    { label: 'event logs', table: 'accounting_event_logs', fn: 'zz_revert_logs', body: `NEW."metadata" := OLD."metadata"; NEW."message" := OLD."message";` },
+    { label: 'sync rows', table: 'accounting_sync_logs', fn: 'zz_revert_sync', body: `NEW."errorMessage" := OLD."errorMessage";` },
+  ]
+  for (const s of stores) {
+    const fx = await fixture(db)
+    t.after(() => fx.cleanup())
+    await db.accountingEventLog.create({ data: { accountingEventId: fx.ids.pendingEvent, action: 'failed_from_sync_log', message: `echo ${NAME}` } })
+    await db.$executeRawUnsafe(`CREATE OR REPLACE FUNCTION ${s.fn}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN ${s.body} RETURN NEW; END $$`)
+    await db.$executeRawUnsafe(`CREATE TRIGGER ${s.fn} BEFORE UPDATE ON "${s.table}" FOR EACH ROW EXECUTE FUNCTION ${s.fn}()`)
+    try {
+      assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, false, `${s.label}: the erasure reports failure`)
+    } finally {
+      await db.$executeRawUnsafe(`DROP TRIGGER IF EXISTS ${s.fn} ON "${s.table}"`)
+      await db.$executeRawUnsafe(`DROP FUNCTION IF EXISTS ${s.fn}()`)
+    }
+    assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })).erasedAt, null, `${s.label}: rolled back`)
+  }
+})
+
+test('[derived copies] an event-log body that has no contact block is left exactly as it is (and never blocks an erasure)', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await fixture(db)
+  t.after(() => fx.cleanup())
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const body = { kind: 'journal', lines: [{ account: '200', amount: 5 }] }
+  const log = await db.accountingEventLog.create({ data: { accountingEventId: fx.ids.pendingEvent, action: 'payload_superseded', metadata: { enqueuedLinesJson: body } } })
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  assert.deepEqual((await db.accountingEventLog.findUniqueOrThrow({ where: { id: log.id } })).metadata, { enqueuedLinesJson: body })
+  const later = await db.accountingEventLog.create({ data: { accountingEventId: fx.ids.pendingEvent, action: 'payload_superseded', metadata: { enqueuedLinesJson: body } } })
+  assert.deepEqual(later.metadata, { enqueuedLinesJson: body })
 })
