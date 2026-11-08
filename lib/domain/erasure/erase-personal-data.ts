@@ -8,6 +8,7 @@ import { scrubContactBlock } from './contact-gate'
 import { CustomerKeysChanged, lockStorefrontCustomerKeys, readStorefrontCustomerIds } from './customer-key-lock'
 import { scrubReturnInboxEvents } from './return-events'
 import { loadRawPayloadSubject, scrubRawPayloadsInTx, type RawPayloadCounts } from './raw-payloads'
+import { summariseWarehouseOrdersInTx, decideSystemVerdicts, notifyOpenWarehouseOrders } from './warehouse-obligations'
 import { scrubAccountingDerivedCopiesInTx, type DerivedCopyCounts } from './derived-copies'
 import { SYSTEM_PAYMENT_NOTES, orderIsErasedInTx } from './order-state'
 export { orderIsErasedInTx }
@@ -21,6 +22,8 @@ import {
   ERASURE_PLACEHOLDER_LAST_NAME,
   ERASURE_PLACEHOLDER_NAME,
   ERASURE_RECORD_ACTION,
+  EMPTY_WAREHOUSE_SUMMARY,
+  type ErasureWarehouseSummary,
   ERASURE_RECORD_DESCRIPTION,
   buildErasureRecordMetadata,
   type ErasureCounts,
@@ -378,7 +381,7 @@ export async function scrubLinkedFreeText(tx: Prisma.TransactionClient, orderIds
 }
 
 export type EraseCustomerResult =
-  | { success: true; requestId: string }
+  | { success: true; requestId: string; warehouse: ErasureWarehouseSummary }
   | { success: false; error: string }
 
 /**
@@ -389,7 +392,7 @@ export type EraseCustomerResult =
  */
 async function eraseUnderLocksInTx(
   tx: Prisma.TransactionClient,
-  input: { customerId: string | null; eraseCustomer: boolean; targetOrderIds: string[]; requestId: string; erasedAt: Date; trigger: ErasureTrigger; userId: string | null },
+  input: { customerId: string | null; eraseCustomer: boolean; targetOrderIds: string[]; requestId: string; erasedAt: Date; trigger: ErasureTrigger; userId: string | null; outcome: { warehouse: ErasureWarehouseSummary } },
 ): Promise<string | null> {
   const { customerId, eraseCustomer, targetOrderIds: orderIds, erasedAt } = input
   // Every value that identifies the subject (the tokens that remove it from activity rows) is read only AFTER the caller's locks, so an edit
@@ -453,12 +456,21 @@ async function eraseUnderLocksInTx(
   const rawCounts = await scrubRawPayloadsInTx(tx, rawSubject.subject, rawSubject.missing, erasedAt)
   // THE DERIVED ACCOUNTING COPIES (event payloads, superseded bodies on event logs, sync-row error text): same transaction, same locks, fail closed.
   const derivedCounts = await scrubAccountingDerivedCopiesInTx(tx, orderIds)
+  // WHAT REMAINS IN THE EXTERNAL SYSTEMS, decided from what is held (nothing is written to any of them): the warehouse's copy, order by order, and whether
+  // the ledger holds a contact or documents for the subject.
+  const warehouse = await summariseWarehouseOrdersInTx(tx, orderIds)
+  input.outcome.warehouse = warehouse
+  const refundRows = await tx.salesOrderRefund.findMany({ where: { orderId: { in: orderIds } }, select: { id: true } })
+  const accountingTraces = Boolean(before?.accountingContactId)
+    || (await tx.accountingSyncLog.count({ where: { OR: [{ referenceType: 'SalesOrder', referenceId: { in: orderIds } }, { referenceType: 'SalesOrderRefund', referenceId: { in: refundRows.map((r) => r.id) } }] } })) > 0
+    || (await tx.salesOrder.count({ where: { id: { in: orderIds }, accountingInvoiceId: { not: null } } })) > 0
+  const systems = decideSystemVerdicts({ trigger: input.trigger, warehouse, accountingTraces })
   const counts: ErasureCounts = { customers: eraseCustomer ? 1 : 0, shoppingCustomerLinks: links.count, activityRowsScrubbed, linkedFreeTextScrubbed, ...rawCounts, ...derivedCounts, ...orderCounts }
   const record = {
     tag: 'sales',
     description: ERASURE_RECORD_DESCRIPTION,
     // The proof names the customer only when that customer was erased too; for a customer who stays live it would re-attribute the order.
-    metadata: buildErasureRecordMetadata({ requestId: input.requestId, erasedAt, trigger: input.trigger, customerId: eraseCustomer ? customerId : null, orderIds, counts }),
+    metadata: buildErasureRecordMetadata({ requestId: input.requestId, erasedAt, trigger: input.trigger, customerId: eraseCustomer ? customerId : null, orderIds, counts, systems, warehouse }),
     userId: input.userId,
   }
   // The proof is filed against the customer when the customer is erased, otherwise against the (first) order.
@@ -476,6 +488,7 @@ export async function eraseCustomerPersonalData(
   const erasedAt = new Date()
   try {
     let refusal: string | null = null
+    const outcome = { warehouse: { ...EMPTY_WAREHOUSE_SUMMARY, openOrders: [] } as ErasureWarehouseSummary }
     for (let attempt = 1; ; attempt += 1) {
       try {
         refusal = await db.$transaction(async (tx): Promise<string | null> => {
@@ -489,7 +502,7 @@ export async function eraseCustomerPersonalData(
       if (lockedCustomer[0]!.gdprAnonymisedAt) return 'Customer already anonymised'
       const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "sales_orders" WHERE "customerId" = ${customerId} ORDER BY id FOR UPDATE`
       if ((await readStorefrontCustomerIds(tx, customerId)).some((id) => !keysLocked.includes(id))) throw new CustomerKeysChanged()
-      return eraseUnderLocksInTx(tx, { customerId, eraseCustomer: true, targetOrderIds: locked.map((o) => o.id), requestId, erasedAt, trigger: options.trigger, userId: options.userId })
+      return eraseUnderLocksInTx(tx, { customerId, eraseCustomer: true, targetOrderIds: locked.map((o) => o.id), requestId, erasedAt, trigger: options.trigger, userId: options.userId, outcome })
     }, ERASURE_TRANSACTION_OPTIONS)
         break
       } catch (e) {
@@ -498,7 +511,8 @@ export async function eraseCustomerPersonalData(
       }
     }
     if (refusal) return { success: false, error: refusal }
-    return { success: true, requestId }
+    await notifyOpenWarehouseOrders(outcome.warehouse, requestId)
+    return { success: true, requestId, warehouse: outcome.warehouse }
   } catch (e) {
     // The exception text is NOT logged and NOT returned verbatim: a driver error can echo the values it was
     // writing. The class name is enough to triage; the transaction rolled back, so nothing was erased.
@@ -518,7 +532,7 @@ export async function eraseCustomerPersonalData(
 
 export type EraseOrderResult =
   | { success: true; already: true }
-  | { success: true; already: false; requestId: string; customerErased: boolean }
+  | { success: true; already: false; requestId: string; customerErased: boolean; warehouse: ErasureWarehouseSummary }
   | { success: false; error: string }
 
 /** Thrown inside the transaction when the order was relinked to another customer between the unlocked read and the locks: roll back and retry. */
@@ -545,7 +559,7 @@ export async function eraseOrderPersonalData(
   try {
     for (let attempt = 1; attempt <= ORDER_ERASURE_ATTEMPTS; attempt += 1) {
       try {
-        return await db.$transaction(async (tx): Promise<EraseOrderResult> => {
+        const result = await db.$transaction(async (tx): Promise<EraseOrderResult> => {
           const peek = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { customerId: true } })
           if (!peek) return { success: false, error: 'Order not found' }
           let customerErased = false
@@ -569,10 +583,14 @@ export async function eraseOrderPersonalData(
             ? await tx.salesOrder.count({ where: { customerId: peek.customerId, id: { not: orderId }, erasedAt: null } })
             : 1
           const eraseCustomer = Boolean(peek.customerId) && customerLive && liveOthers === 0
-          const refusal = await eraseUnderLocksInTx(tx, { customerId: peek.customerId, eraseCustomer, targetOrderIds: [orderId], requestId, erasedAt, trigger: options.trigger, userId: options.userId })
+          const outcome = { warehouse: { ...EMPTY_WAREHOUSE_SUMMARY, openOrders: [] } as ErasureWarehouseSummary }
+          const refusal = await eraseUnderLocksInTx(tx, { customerId: peek.customerId, eraseCustomer, targetOrderIds: [orderId], requestId, erasedAt, trigger: options.trigger, userId: options.userId, outcome })
           if (refusal) return { success: false, error: refusal }
-          return { success: true, already: false, requestId, customerErased: eraseCustomer }
+          return { success: true, already: false, requestId, customerErased: eraseCustomer, warehouse: outcome.warehouse }
         }, ERASURE_TRANSACTION_OPTIONS)
+        // After the commit: an erasure that left open warehouse orders tells the operators at once (never throws).
+        if (result.success && !result.already) await notifyOpenWarehouseOrders(result.warehouse, result.requestId)
+        return result
       } catch (e) {
         if ((e instanceof OrderRelinkedDuringErasure || e instanceof CustomerKeysChanged) && attempt < ORDER_ERASURE_ATTEMPTS) continue
         throw e
