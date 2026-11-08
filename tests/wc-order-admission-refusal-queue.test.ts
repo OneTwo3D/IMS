@@ -51,7 +51,8 @@ mock.module('@/lib/activity-log', {
 })
 // The per-storefront-order first-import session lock needs a real database; the fake arbitrates with its unique constraint instead.
 mock.module('@/lib/connectors/woocommerce/sync/first-import-lock', { namedExports: { acquireWcFirstImportLock: async () => async () => undefined, wcFirstImportLockHeld: () => false, withWcFirstImportLock: async (_id: unknown, fn: () => Promise<unknown>) => fn(), WcFirstImportLockUnavailable: class extends Error {} } })
-mock.module('@/lib/connectors/woocommerce/sync/erasure-obligation', { namedExports: { recordWcErasureObligation: async () => undefined, hasOpenWcErasureObligation: async () => false, retireWcErasureObligation: async () => undefined } })
+mock.module('@/lib/connectors/woocommerce/sync/erasure-obligation', { namedExports: { recordWcErasureObligation: async () => undefined, hasOpenWcErasureObligation: async () => false, retireWcErasureObligation: async () => undefined, payloadCustomerTombstoned: async () => false } })
+mock.module('@/lib/domain/erasure/customer-key-lock', { namedExports: { lockStorefrontCustomerKeys: async () => [] } })
 mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
 mock.module('@/lib/maintenance-mode', { namedExports: { getMaintenanceModeResponse: async () => null } })
 mock.module('@/lib/integration-plugins', { namedExports: { isIntegrationPluginEnabled: async () => true } })
