@@ -246,3 +246,31 @@ test('[erasure record view] a record beyond 200 newer ones is reachable by pagin
   assert.equal(mine!.orderNumbers[fx.ids.open], open.orderNumber)
   assert.doesNotMatch(JSON.stringify([...filtered.rows, ...looked.rows]), new RegExp(`${NAME}|${EMAIL.replace(/[+.]/g, '\\$&')}`), 'identity-free')
 })
+
+test('[erasure record] a cancellation the warehouse confirmed is NOT proof once a reconcile found the order still active: open finding = ambiguous, resolved = closed', { skip }, async (t) => {
+  const db = await loadDb()
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const make = async (resolved: boolean) => {
+    const customer = await db.customer.create({ data: { firstName: 'Zebediah', lastName: 'Quillfeather', email: `${randomUUID().slice(0, 8)}@example.test` } })
+    const order = await db.salesOrder.create({ data: { orderNumber: `HON-${randomUUID().slice(0, 8)}`, status: 'CANCELLED', currency: 'GBP', customerId: customer.id, customerName: NAME, subtotalForeign: 1, totalForeign: 1, subtotalBase: 1, totalBase: 1 } as never })
+    await db.wmsOrderPushLink.create({ data: { orderId: order.id, connector: 'mintsoft', externalOrderId: 'm-20', externalOrderNumber: 'MS-20', state: 'CANCELLED' } as never })
+    await db.wmsMutationEvent.create({ data: { connector: 'mintsoft', direction: 'OUTBOUND', action: 'order_cancel', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: order.id, summary: 'cancel', after: { state: 'CANCELLED', wmsCancelStatus: 'CANCELLED' } } as never })
+    await db.wmsOrderDiscrepancy.create({ data: { connector: 'mintsoft', orderId: order.id, category: 'ACTIVE_AFTER_CANCEL', status: resolved ? 'RESOLVED' : 'OPEN', externalOrderNumber: 'MS-20', resolvedAt: resolved ? new Date() : null } as never })
+    t.after(async () => { await db.wmsOrderDiscrepancy.deleteMany({ where: { orderId: order.id } }); await db.wmsMutationEvent.deleteMany({ where: { entityId: order.id } }); await db.wmsOrderPushLink.deleteMany({ where: { orderId: order.id } }); await db.notification.deleteMany({ where: { title: 'Personal data remains in the warehouse', createdAt: { gte: new Date(Date.now() - 600_000) } } }); await db.activityLog.deleteMany({ where: { entityId: { in: [order.id, customer.id] } } }); await db.salesOrder.deleteMany({ where: { id: order.id } }); await db.customer.deleteMany({ where: { id: customer.id } }) })
+    return { customerId: customer.id, orderId: order.id }
+  }
+  const active = await make(false)
+  assert.equal((await eraseCustomerPersonalData(active.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const a = await proof(db, active.customerId)
+  assert.equal(a.warehouse.cancelled, 0)
+  assert.equal(a.warehouse.ambiguous, 1)
+  assert.deepEqual(a.warehouse.ambiguousOrders, [{ orderId: active.orderId, warehouseOrderNumber: 'MS-20' }])
+  assert.equal(a.systems.warehouse, 'refused')
+  // CONTROL: the same order with the finding RESOLVED is closed.
+  const resolved = await make(true)
+  assert.equal((await eraseCustomerPersonalData(resolved.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const r = await proof(db, resolved.customerId)
+  assert.equal(r.warehouse.cancelled, 1)
+  assert.equal(r.warehouse.ambiguous, 0)
+  assert.equal(r.systems.warehouse, 'not-technically-possible')
+})

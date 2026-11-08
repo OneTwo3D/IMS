@@ -23,7 +23,7 @@ import {
 const DESPATCHED_ORDER_STATUSES = new Set(['SHIPPED', 'COMPLETED', 'DELIVERED'])
 
 export async function summariseWarehouseOrdersInTx(
-  tx: Pick<Prisma.TransactionClient, 'wmsOrderPushLink' | 'salesOrder' | 'wmsMutationEvent'>,
+  tx: Pick<Prisma.TransactionClient, 'wmsOrderPushLink' | 'salesOrder' | 'wmsMutationEvent' | 'wmsOrderDiscrepancy'>,
   orderIds: string[],
 ): Promise<ErasureWarehouseSummary> {
   const out: ErasureWarehouseSummary = { ...EMPTY_WAREHOUSE_SUMMARY, openOrders: [], ambiguousOrders: [] }
@@ -40,7 +40,11 @@ export async function summariseWarehouseOrdersInTx(
   const confirmedCancels = new Set<string>()
   if (cancelledIds.length > 0) {
     const events = await tx.wmsMutationEvent.findMany({ where: { entityType: 'SALES_ORDER', entityId: { in: cancelledIds }, action: 'order_cancel', outcome: 'SUCCEEDED' }, select: { entityId: true, after: true } })
+    // A later reconcile can find the cancelled order STILL ACTIVE in the warehouse (a split part included): an open ACTIVE_AFTER_CANCEL discrepancy overrides an
+    // earlier successful cancellation, which is then not proof of anything. (NOT_PUSHED and MISSING_IN_WMS say the order is not there, not that it is still live.)
+    const active = new Set((await tx.wmsOrderDiscrepancy.findMany({ where: { orderId: { in: cancelledIds }, category: 'ACTIVE_AFTER_CANCEL', status: { not: 'RESOLVED' } }, select: { orderId: true } })).map((d) => d.orderId))
     for (const e of events) {
+      if (e.entityId && active.has(e.entityId)) continue
       const after = e.after as { wmsCancelStatus?: unknown } | null
       if (e.entityId && after && typeof after === 'object' && after.wmsCancelStatus === 'CANCELLED') confirmedCancels.add(e.entityId)
     }
