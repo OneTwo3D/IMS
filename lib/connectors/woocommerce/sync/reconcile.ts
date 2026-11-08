@@ -73,12 +73,13 @@ export async function runWcReconcile(): Promise<Record<string, unknown>> {
       // A push the producer-side hold shadowed did NOT reconcile anything: the daily stamp is what makes the next 24 hours
       // "not due", so stamping it would tell the live phase's first run that stock was just reconciled. Leave the stamp alone,
       // and say so in the result. (A push the setting or the gates refused is stamped as before: that is the unchanged path.)
-      if (stock.shadowed === true) {
+      // The same holds for a push the outbound-write hold refused before it read anything: nothing was reconciled.
+      if (stock.shadowed === true || stock.held === true) {
         results.stock = {
           queued,
           sync: stock,
           skipped: true,
-          reason: 'producer_hold_shadowed',
+          reason: stock.held === true ? 'outbound_write_held' : 'producer_hold_shadowed',
           reconciliationDue: true,
           lastReconciledAt: lastReconcile?.value ?? null,
         }
