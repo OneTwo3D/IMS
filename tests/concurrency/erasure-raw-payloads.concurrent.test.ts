@@ -745,3 +745,52 @@ test('[raw payloads] a customer TOMBSTONE (hash only) catches a delivery inserte
   assert.equal(await db.storefrontOrderErasureObligation.count({ where: { externalOrderId: String(early2Id), retiredAt: null } }), 1)
   await db.storefrontOrderErasureObligation.deleteMany({ where: { externalOrderId: String(early2Id) } })
 })
+
+test('[raw payloads] a DIRECT import of a pre-erasure snapshot of an unseen order (no webhook row, no sync-log row) is created already erased; an order created after the erasure imports normally', { skip }, async (t) => {
+  const db = await loadDb()
+  const fx = await importFixture(db)
+  const extra: Array<{ orderId: string; customerId: string | null }> = []
+  t.after(async () => {
+    for (const e of extra) {
+      await db.accountingSyncLog.deleteMany({ where: { referenceId: e.orderId } }); await db.salesOrderLine.deleteMany({ where: { orderId: e.orderId } })
+      await db.activityLog.deleteMany({ where: { OR: [{ entityId: e.orderId }, ...(e.customerId ? [{ entityId: e.customerId }] : [])] } })
+      await db.shoppingOrderLink.deleteMany({ where: { orderId: e.orderId } }); await db.salesOrder.deleteMany({ where: { id: e.orderId } })
+      if (e.customerId) { await db.shoppingCustomerLink.deleteMany({ where: { customerId: e.customerId } }); await db.customer.deleteMany({ where: { id: e.customerId } }) }
+    }
+    await db.storefrontOrderErasureObligation.deleteMany({ where: { externalOrderId: { in: [String(oldId), String(newId)] } } })
+    await db.storefrontCustomerErasureTombstone.deleteMany({})
+    await fx.cleanup()
+  })
+  const oldId = fx.externalId + 5_000_000_000
+  const newId = fx.externalId + 6_000_000_000
+  const rate = Number((await db.shoppingTaxRateMapping.findFirstOrThrow({ where: { taxRateId: fx.rateId } })).externalTaxRateId)
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  assert.equal((await eraseCustomerPersonalData(fx.customerId, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const customersBefore = await db.customer.count()
+
+  // A snapshot fetched BEFORE the erasure (the order was created in 2026-11-02), delivered after it. Nothing else has seen this order.
+  assert.equal(await db.shoppingWebhookEvent.count({ where: { payloadHash: { contains: String(oldId) } } }), 0)
+  const oldResult = await importWcOrder(rawOrder(fx, rate, { id: oldId, number: String(oldId), customer_id: fx.wooCustomerId }) as never)
+  assert.equal(oldResult.success, true, JSON.stringify(oldResult))
+  const oldLink = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(oldId) } })
+  const oldOrder = await db.salesOrder.findUniqueOrThrow({ where: { id: oldLink.orderId } })
+  extra.push({ orderId: oldOrder.id, customerId: oldOrder.customerId })
+  assert.ok(oldOrder.erasedAt, 'created already erased')
+  assert.equal(oldOrder.customerId, null, 'no customer step')
+  assert.deepEqual(leaks({ n: oldOrder.customerName, e: oldOrder.customerEmail, b: oldOrder.billingAddress, s: oldOrder.shippingAddress, nt: oldOrder.notes }), [])
+  assert.equal(await db.customer.count(), customersBefore, 'no customer row was minted')
+  assert.equal(await db.shoppingCustomerLink.count({ where: { externalCustomerId: String(fx.wooCustomerId) } }), 0, 'no storefront account link')
+  assert.equal(await db.storefrontOrderErasureObligation.count({ where: { externalOrderId: String(oldId), retiredAt: null } }), 0)
+  assert.ok(await db.activityLog.findFirst({ where: { entityId: oldOrder.id, action: 'gdpr_erasure_recorded' } }), 'the name-free proof is written')
+
+  // An order created AFTER the erasure is new data from a still-existing account: an ordinary import.
+  const later = new Date(Date.now() + 86_400_000).toISOString().slice(0, 19)
+  const newResult = await importWcOrder(rawOrder(fx, rate, { id: newId, number: String(newId), customer_id: fx.wooCustomerId, date_created_gmt: later, date_created: later }) as never)
+  assert.equal(newResult.success, true, JSON.stringify(newResult))
+  const newLink = await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(newId) } })
+  const newOrder = await db.salesOrder.findUniqueOrThrow({ where: { id: newLink.orderId } })
+  extra.push({ orderId: newOrder.id, customerId: newOrder.customerId })
+  assert.equal(newOrder.erasedAt, null, 'an order created after the erasure stays live')
+  assert.ok(newOrder.customerId, 'and gets a customer')
+})

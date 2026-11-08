@@ -40,3 +40,14 @@ export async function retireWcErasureObligation(externalOrderId: number | string
     data: { retiredAt: new Date() },
   })
 }
+
+/**
+ * Whether this order belongs to an ERASED storefront account: its customer id hashes to a customer tombstone AND it was created at or before the erasure (a
+ * missing or unreadable date counts as before). This is the database's own rule, `gdpr_payload_customer_tombstoned`, which the insert guards and the
+ * reconcile use too, so the three cannot drift. An order created after the erasure is new data from a still-existing account and is not matched.
+ */
+export async function payloadCustomerTombstoned(order: { customer_id?: unknown; date_created_gmt?: unknown }, client: Prisma.TransactionClient | typeof db = db): Promise<boolean> {
+  const probe = JSON.stringify({ customer_id: order.customer_id ?? null, date_created_gmt: order.date_created_gmt ?? null })
+  const rows = await client.$queryRaw<Array<{ hit: boolean }>>`SELECT gdpr_payload_customer_tombstoned(${probe}::jsonb) AS hit`
+  return rows[0]?.hit === true
+}

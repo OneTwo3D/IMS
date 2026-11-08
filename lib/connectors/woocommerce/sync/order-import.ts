@@ -6,7 +6,7 @@ import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain
 import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
 import { isWcOrderAnonymised, wcPayloadCarriesIdentity } from './anonymisation'
 import { mirrorWcAnonymisation } from './anonymisation-mirror'
-import { hasOpenWcErasureObligation, recordWcErasureObligation, retireWcErasureObligation } from './erasure-obligation'
+import { hasOpenWcErasureObligation, payloadCustomerTombstoned, recordWcErasureObligation, retireWcErasureObligation } from './erasure-obligation'
 import { acquireWcFirstImportLock, wcFirstImportLockHeld } from './first-import-lock'
 import { ERASURE_PLACEHOLDER_NAME, ERASURE_RECORD_ACTION, ERASURE_RECORD_DESCRIPTION, buildErasureRecordMetadata } from '@/lib/domain/erasure/erasure-record'
 import { randomUUID } from 'node:crypto'
@@ -2427,7 +2427,11 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     if (racedHeld) return await updateHeldOrder(racedHeld.id)
     // Under the lock: a marked payload, OR an open obligation (an anonymisation was seen for this order and acknowledged before it was imported;
     // this payload is an older read of it), means the order is created ALREADY ERASED and never touches the customer table.
-    const payloadAnonymised = payloadMarked || await hasOpenWcErasureObligation(wcOrder.id)
+    // A third way an order is created erased: its CUSTOMER was erased after this read was taken (a customer tombstone, same rule as the insert guards): the
+    // storefront link is gone by then, so neither the marker nor an obligation need exist for an order no raw store ever saw.
+    const erasedByObligation = payloadMarked || await hasOpenWcErasureObligation(wcOrder.id)
+    const erasedByTombstone = !erasedByObligation && await payloadCustomerTombstoned(wcOrder)
+    const payloadAnonymised = erasedByObligation || erasedByTombstone
     const customerName = payloadAnonymised
       ? ERASURE_PLACEHOLDER_NAME
       : [wcOrder.billing.first_name, wcOrder.billing.last_name].filter(Boolean).join(' ')
@@ -2891,6 +2895,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         // failure after it (or a lost create race) can never leave a customer holding the subject's identity with no order, for a later anonymised
         // delivery to miss. A marked payload never touches the customer table. A matched customer is locked FOR UPDATE inside the upsert and held to
         // the end of the transaction (customer, then orders: the erasure's order).
+        // The tombstone is re-read INSIDE the create transaction: an erasure that committed after the decision above fails this attempt (retried, then created erased).
+        if (!payloadAnonymised && await payloadCustomerTombstoned(wcOrder, tx)) throw new Error('A customer erasure committed while this order was being imported; the retry creates it already erased')
         const customerId = payloadAnonymised ? null : await upsertCustomer(wcOrder, tx)
         linkCustomerId = customerId
         if (customerId) {
@@ -3043,7 +3049,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             action: ERASURE_RECORD_ACTION,
             description: ERASURE_RECORD_DESCRIPTION,
             metadata: buildErasureRecordMetadata({
-              requestId: originalErasureRequestId ?? randomUUID(), erasedAt, trigger: customerErasedDuringImport === null ? 'MIRRORED_FROM_STOREFRONT' : 'IMPORT_AFTER_ERASURE', customerId: customerErasedDuringImport, orderIds: [created.id],
+              requestId: originalErasureRequestId ?? randomUUID(), erasedAt, trigger: customerErasedDuringImport === null && !erasedByTombstone ? 'MIRRORED_FROM_STOREFRONT' : 'IMPORT_AFTER_ERASURE', customerId: customerErasedDuringImport, orderIds: [created.id],
               counts: { customers: 0, salesOrders: 1, shipments: 0, shoppingCustomerLinks: 0, shoppingOrderLinks: 1, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, rawWebhookEventsProjected: 0, rawSyncLogsProjected: 0, rawReturnRecordsCleared: 0, storefrontIdMissing: 0, linkedFreeTextScrubbed: 0, activityRowsScrubbed: 0, notifications: 0 },
             }),
             userId: null,
