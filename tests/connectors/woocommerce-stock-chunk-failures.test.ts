@@ -86,7 +86,7 @@ const okPreflight: Fetch = (path, params) => {
 const okUpdate = (ids: number[]) => ({ data: { update: ids.map((id) => ({ id, stock_quantity: 5 })) } })
 
 test('CONTROL: every candidate looked up, verified and pushed: the window is handled and says where the next one starts', async () => {
-  reset([product('a', 'S1', 1n), product('b', 'S2', 2n)])
+  reset([product('a', 'S1', BigInt(1)), product('b', 'S2', BigInt(2))])
   fetchImpl = okPreflight
   postImpl = () => okUpdate([1, 2])
   const result = await run()
@@ -95,7 +95,7 @@ test('CONTROL: every candidate looked up, verified and pushed: the window is han
 })
 
 test('SKU lookup: one lookup failing leaves the window unhandled', async () => {
-  reset([product('a', 'S1', 1n), product('b', 'S2', null), product('c', 'S3', null)])
+  reset([product('a', 'S1', BigInt(1)), product('b', 'S2', null), product('c', 'S3', null)])
   fetchImpl = (path, params) => {
     if (params.include) return okPreflight(path, params)
     if (params.sku === 'S2') return { data: [{ id: 2, sku: 'S2' }] }
@@ -108,7 +108,7 @@ test('SKU lookup: one lookup failing leaves the window unhandled', async () => {
 })
 
 test('preflight: one failing page leaves the window unhandled', async () => {
-  reset([product('a', 'S1', 1n), product('b', 'S2', 2n)])
+  reset([product('a', 'S1', BigInt(1)), product('b', 'S2', BigInt(2))])
   // 100 ids per page, so two pages need >100 candidates; the failing page here is the only page for variant-free products, which
   // is an outage and also unhandled. A partial page failure is covered by the unit flag set on any preflight error.
   fetchImpl = (_path, params) => (params.include ? { data: null, error: 'WC API error: 502' } : { data: [] })
@@ -139,7 +139,7 @@ test('preflight: a partial page failure (one of two pages) leaves the window unh
 })
 
 test('batch push: a failed batch leaves the window unhandled', async () => {
-  reset([product('a', 'S1', 1n), product('b', 'S2', 2n)])
+  reset([product('a', 'S1', BigInt(1)), product('b', 'S2', BigInt(2))])
   fetchImpl = okPreflight
   postImpl = () => ({ data: null, error: 'WC API error: 500' })
   const result = await run()
@@ -148,7 +148,7 @@ test('batch push: a failed batch leaves the window unhandled', async () => {
 })
 
 test('batch push: an item the store dropped from its response leaves the window unhandled', async () => {
-  reset([product('a', 'S1', 1n), product('b', 'S2', 2n)])
+  reset([product('a', 'S1', BigInt(1)), product('b', 'S2', BigInt(2))])
   fetchImpl = okPreflight
   postImpl = () => okUpdate([1])
   const result = await run()
