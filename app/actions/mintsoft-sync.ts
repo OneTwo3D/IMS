@@ -3654,6 +3654,9 @@ export async function createMintsoftPurchaseOrderAsn(
       },
       data: {
         status: 'CREATE_IN_FLIGHT',
+        // Durable, never cleared: a stale in-flight row is demoted to CREATE_PENDING later, and a manual receipt must still
+        // be refused for it (po-receipt-asn-guard) because the warehouse may already hold the ASN.
+        remoteCreateAttemptedAt: new Date(),
       },
     })
 
@@ -4841,6 +4844,9 @@ export async function createMintsoftTransferAsn(
       },
       data: {
         status: 'CREATE_IN_FLIGHT',
+        // Durable, never cleared: a stale in-flight row is demoted to CREATE_PENDING later, and a manual receipt must still
+        // be refused for it (po-receipt-asn-guard) because the warehouse may already hold the ASN.
+        remoteCreateAttemptedAt: new Date(),
       },
     })
 

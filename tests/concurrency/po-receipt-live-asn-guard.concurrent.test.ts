@@ -55,21 +55,24 @@ async function waitForReceiptBlockedBy(holderPid: number, timeoutMs = 20_000): P
   }
 }
 
-const MATRIX: Array<{ status: string; closed: boolean; refused: boolean }> = [
-  { status: 'CREATE_PENDING', closed: false, refused: false }, // an unclaimed local reservation: no remote ASN exists
+const MATRIX: Array<{ status: string; closed: boolean; refused: boolean; attempted?: boolean }> = [
+  { status: 'CREATE_PENDING', closed: false, refused: false }, // never claimed: no remote ASN was ever requested
+  { status: 'CREATE_PENDING', closed: false, refused: true, attempted: true }, // demoted from a claimed create: the warehouse may hold the ASN
+  { status: 'CREATE_PENDING', closed: true, refused: false, attempted: true }, // ...unless the creator has since retired it
   { status: 'CREATE_IN_FLIGHT', closed: false, refused: true }, // the remote ASN may already exist
   { status: 'OPEN', closed: false, refused: true },
   { status: 'PARTIALLY_BOOKED_IN', closed: false, refused: true },
-  { status: 'BOOKED_IN', closed: false, refused: false },
+  { status: 'BOOKED_IN', closed: false, refused: true }, // mapped to an ASN the warehouse had already received: reconciliation still owed
+  { status: 'BOOKED_IN', closed: true, refused: false },
   { status: 'OPEN', closed: true, refused: false }, // retired / discarded
   { status: 'PARTIALLY_BOOKED_IN', closed: true, refused: false },
 ]
 
 for (const row of MATRIX) {
-  test(`live-ASN guard: ${row.status}${row.closed ? ' (closed)' : ''} -> manual receipt ${row.refused ? 'REFUSED' : 'allowed'}`, SKIP, async () => {
-    const po = await seedPo(`g-${row.status.toLowerCase().slice(0, 8)}${row.closed ? 'c' : ''}`, [10])
+  test(`live-ASN guard: ${row.status}${row.closed ? ' (closed)' : ''}${row.attempted ? ' (claimed before)' : ''} -> manual receipt ${row.refused ? 'REFUSED' : 'allowed'}`, SKIP, async () => {
+    const po = await seedPo(`g-${row.status.toLowerCase().slice(0, 8)}${row.closed ? 'c' : ''}${row.attempted ? 'a' : ''}`, [10])
     const line = po.lines[0]!
-    await addAsn(po, line, { expectedQty: 10, status: row.status, closed: row.closed })
+    await addAsn(po, line, { expectedQty: 10, status: row.status, closed: row.closed, attempted: row.attempted })
     const result = await receive(po, line, 4)
     const after = await snapshotOf(po, line)
     if (row.refused) {

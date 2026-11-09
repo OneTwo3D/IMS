@@ -838,6 +838,70 @@ test(
 )
 
 test(
+  'live-ASN guard handoff 1: while the creator holds a CLAIMED row mid-push the row is stamped and a manual receipt is refused; after the finalize it stays refused (OPEN)',
+  SKIP,
+  async () => {
+    const { createMintsoftPurchaseOrderAsn } = await loadModules()
+    const { db } = await import('@/lib/db')
+    const po = await seedPo('g1', [10])
+    const line = po.lines[0]!
+    await makeCreatable(po)
+    const reservation = await addPendingReservation(po, [{ line, expectedQty: 10 }])
+    const before = await db.wmsAsnMap.findUniqueOrThrow({ where: { id: reservation.asnId }, select: { remoteCreateAttemptedAt: true } })
+    assert.equal(before.remoteCreateAttemptedAt, null, 'PRECONDITION: a fresh reservation has never been claimed')
+    nextExternalAsnId = `${uid()}-g1-remote`
+
+    let observed: { status: string; stamped: boolean; refusal: string | undefined } | null = null
+    createAsnHook = async () => {
+      const row = await db.wmsAsnMap.findUniqueOrThrow({ where: { id: reservation.asnId }, select: { status: true, remoteCreateAttemptedAt: true } })
+      const manual = await receive(po, line, 1)
+      observed = { status: row.status, stamped: row.remoteCreateAttemptedAt !== null, refusal: manual.success ? undefined : manual.error }
+    }
+    await createMintsoftPurchaseOrderAsn(po.poId, { autoCallback: false })
+    assert.deepEqual({ status: observed!.status, stamped: observed!.stamped }, { status: 'CREATE_IN_FLIGHT', stamped: true })
+    assert.match(observed!.refusal ?? '', /open warehouse ASN/, 'refused while the push is in flight')
+    const after = await db.wmsAsnMap.findUniqueOrThrow({ where: { id: reservation.asnId }, select: { status: true, remoteCreateAttemptedAt: true } })
+    assert.equal(after.status, 'OPEN')
+    assert.notEqual(after.remoteCreateAttemptedAt, null, 'the stamp is never cleared')
+    assert.equal((await receive(po, line, 1)).success, false, 'and an OPEN ASN still refuses')
+  },
+)
+
+test(
+  'live-ASN guard handoff 2: a stale CREATE_IN_FLIGHT row demoted to CREATE_PENDING keeps its stamp, so manual receipts stay refused until the creator reconciles it',
+  SKIP,
+  async () => {
+    const { createMintsoftPurchaseOrderAsn } = await loadModules()
+    const { db } = await import('@/lib/db')
+    const po = await seedPo('g2', [10])
+    const line = po.lines[0]!
+    await makeCreatable(po)
+    const reservation = await addPendingReservation(po, [{ line, expectedQty: 10 }])
+    // The state a crashed request leaves: claimed (stamped), still IN_FLIGHT, and older than the in-flight grace.
+    await db.wmsAsnMap.update({ where: { id: reservation.asnId }, data: { status: 'CREATE_IN_FLIGHT', remoteCreateAttemptedAt: new Date() } })
+    await db.$executeRaw`UPDATE wms_asn_maps SET "updatedAt" = now() - interval '2 hours' WHERE id = ${reservation.asnId}`
+    assert.equal((await receive(po, line, 1)).success, false, 'IN_FLIGHT refuses')
+
+    // The next create request demotes it. Observe the demoted state at the moment the creator pushes again (it re-claims it),
+    // and independently pin the demoted state itself: only the status moves, the stamp survives.
+    await db.wmsAsnMap.update({ where: { id: reservation.asnId }, data: { status: 'CREATE_PENDING' } })
+    const demoted = await db.wmsAsnMap.findUniqueOrThrow({ where: { id: reservation.asnId }, select: { status: true, remoteCreateAttemptedAt: true } })
+    assert.equal(demoted.status, 'CREATE_PENDING')
+    assert.notEqual(demoted.remoteCreateAttemptedAt, null)
+    const refused = await receive(po, line, 1)
+    assert.equal(refused.success, false, 'demoted-but-attempted still refuses')
+    assert.match(refused.error ?? '', /open warehouse ASN/)
+
+    // Reconciled: the creator finalizes it to an OPEN mapped ASN, then it books in and closes -> manual receipts of the remainder work.
+    nextExternalAsnId = `${uid()}-g2-remote`
+    const created = await createMintsoftPurchaseOrderAsn(po.poId, { autoCallback: false })
+    assert.equal(created.success, true, created.error)
+    await db.wmsAsnMap.update({ where: { id: reservation.asnId }, data: { status: 'BOOKED_IN', closedAt: new Date() } })
+    assert.equal((await receive(po, line, 1)).success, true, 'a reconciled (closed) ASN no longer blocks')
+  },
+)
+
+test(
   'R2-5: the reservation was retired while its create was in flight: the finalize FAILS CLOSED, does not reopen or map it, and the remote ASN\'s id is retained',
   SKIP,
   async () => {

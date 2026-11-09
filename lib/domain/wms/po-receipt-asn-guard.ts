@@ -8,20 +8,23 @@
  * rule was considered and rejected (it turns the first case into overstated stock). The ruling is to refuse: the
  * operator books the goods in through the ASN.
  *
- * WHAT COUNTS AS LIVE, per PO line (the line has a WmsAsnLineMap row whose ASN is):
- *   - closedAt IS NULL, and
- *   - status CREATE_IN_FLIGHT, OPEN or PARTIALLY_BOOKED_IN.
+ * WHAT COUNTS AS LIVE, per PO line (the line has a WmsAsnLineMap row whose ASN header has closedAt NULL and is):
+ *   - CREATE_IN_FLIGHT, OPEN or PARTIALLY_BOOKED_IN; or
+ *   - BOOKED_IN while closedAt is still null: the creator maps an ASN the warehouse had ALREADY received straight to BOOKED_IN and
+ *     leaves it open while the local receipt reconciliation is still owed; a manual receipt now would be the double entry; or
+ *   - CREATE_PENDING that has been CLAIMED before (remoteCreateAttemptedAt set): the creator demotes a stale CREATE_IN_FLIGHT row
+ *     back to CREATE_PENDING when its push may have been accepted but not verified, so the warehouse may already hold the ASN. It
+ *     stays blocking until the creator reconciles it (finalizes it to OPEN, adopts the remote ASN, or retires it with closedAt).
  *
  * CREATE_IN_FLIGHT counts because the remote ASN may already exist: the finalizer adopts it when the create returns.
  *
- * CREATE_PENDING DELIBERATELY DOES NOT. It is an unclaimed local reservation: no request has been made, no remote ASN
- * exists, and nothing the warehouse could book is waiting on it. The creators already treat it as "not open"
- * (a PO with only a pending reservation may create an ASN). Counting it would let a reservation that is stuck, or that
- * the creator abandoned, refuse manual receipts for as long as the row lives. A reservation that is claimed afterwards
- * is sized against the units already received by hand (manualQtyBaseline), which is the existing, correct path.
+ * A NEVER-CLAIMED CREATE_PENDING DELIBERATELY DOES NOT. It is an unclaimed local reservation: no request has been made, no remote
+ * ASN exists, and nothing the warehouse could book is waiting on it. The creators already treat it as "not open" (a PO with only
+ * a pending reservation may create an ASN). Counting it would let a reservation that is stuck, or that the creator abandoned before
+ * sending, refuse manual receipts for as long as the row lives. A reservation that is claimed afterwards is sized against the units
+ * already received by hand (manualQtyBaseline), which is the existing, correct path.
  *
- * BOOKED_IN or closed ASNs do not count: the goods have been booked, so a manual receipt of the remainder is a
- * different receipt.
+ * A closed ASN (closedAt set: fully booked in, retired or discarded) never counts: the goods are booked or the reservation is gone.
  *
  * LOCKING. Callers read this UNDER the purchase_orders row lock (the transaction in receivePurchaseOrder). The global
  * lock order is PARENT -> ASN header -> ASN lines (lib/domain/wms/transfer-asn-lock-order.ts), the booked-in service
@@ -32,7 +35,7 @@
 
 import type { Prisma } from '@/app/generated/prisma/client'
 
-export const MANUAL_RECEIPT_BLOCKING_ASN_STATUSES = ['CREATE_IN_FLIGHT', 'OPEN', 'PARTIALLY_BOOKED_IN'] as const
+export const MANUAL_RECEIPT_BLOCKING_ASN_STATUSES = ['CREATE_IN_FLIGHT', 'OPEN', 'PARTIALLY_BOOKED_IN', 'BOOKED_IN'] as const
 
 export type LiveAsnBlock = {
   poLineId: string
@@ -57,7 +60,13 @@ export async function findLiveAsnBlocks(client: AsnLineReader, poLineIds: readon
     where: {
       sourceType: 'PURCHASE_ORDER_LINE',
       sourceLineId: { in: ids },
-      asn: { closedAt: null, status: { in: [...MANUAL_RECEIPT_BLOCKING_ASN_STATUSES] } },
+      asn: {
+        closedAt: null,
+        OR: [
+          { status: { in: [...MANUAL_RECEIPT_BLOCKING_ASN_STATUSES] } },
+          { status: 'CREATE_PENDING', remoteCreateAttemptedAt: { not: null } },
+        ],
+      },
     },
     select: { sourceLineId: true, sku: true, asn: { select: { externalAsnId: true, status: true } } },
     orderBy: [{ sourceLineId: 'asc' }, { createdAt: 'asc' }],

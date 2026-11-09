@@ -148,6 +148,8 @@ export async function addAsn(
     closed?: boolean
     viaSnapshot?: number
     createdAt?: Date
+    /** The reservation was claimed for a remote create at some point (remoteCreateAttemptedAt set). */
+    attempted?: boolean
   },
 ): Promise<SeededAsn> {
   const { db } = await import('@/lib/db')
@@ -161,6 +163,7 @@ export async function addAsn(
       warehouseId: po.warehouseId,
       status: (input.status ?? 'OPEN') as never,
       ...(input.closed ? { closedAt: new Date() } : {}),
+      ...(input.attempted ? { remoteCreateAttemptedAt: new Date() } : {}),
       ...(input.createdAt ? { createdAt: input.createdAt } : {}),
       lines: {
         create: [{

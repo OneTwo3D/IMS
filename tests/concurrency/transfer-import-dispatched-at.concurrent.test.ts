@@ -116,3 +116,27 @@ test('dispatchedAt column: rows of one transferKey must agree, and preview valid
   assert.match(JSON.stringify(preview), /more than 366 days/)
   assert.equal(await dispatchedAtOf(previewKey), null)
 })
+
+test('one invalid row of an explicit transferKey group invalidates the WHOLE group: nothing is created, both rows are reported', SKIP, async () => {
+  const { importTransfersCsv } = await import('@/app/actions/import')
+  const s = await seedSource('di-poison')
+  const key = `${fixtures.uid()}-Z`
+  const day = new Date(Date.now() - 3 * 86_400_000).toISOString().slice(0, 10)
+  const future = new Date(Date.now() + 5 * 86_400_000).toISOString().slice(0, 10)
+  const result = await importTransfersCsv(form([HEADER,
+    [key, s.fromCode, s.toCode, 'IN_TRANSIT', s.line.sku, '1', day],
+    [key, s.fromCode, s.toCode, 'IN_TRANSIT', s.line.sku, '1', future]]))
+  const errors = (result.errors ?? []).join(' | ')
+  assert.match(errors, /Row 3: dispatchedAt .* in the future/, 'the invalid row is reported')
+  assert.match(errors, new RegExp(`Transfer "${key}" was not created: row 3`), 'and the valid row\'s transfer is reported as not created')
+  assert.equal(await dispatchedAtOf(key), null, 'no transfer exists')
+  assert.equal((await fixtures.snapshotOf(s.po, s.line)).stock, 10, 'no stock moved')
+
+  // A group whose rows all validate is still created whole (control).
+  const okKey = `${fixtures.uid()}-Y`
+  const ok = await importTransfersCsv(form([HEADER,
+    [okKey, s.fromCode, s.toCode, 'IN_TRANSIT', s.line.sku, '1', day],
+    [okKey, s.fromCode, s.toCode, 'IN_TRANSIT', s.line.sku, '2', day]]))
+  assert.equal(ok.errors?.length ?? 0, 0, JSON.stringify(ok.errors))
+  assert.ok(await dispatchedAtOf(okKey))
+})

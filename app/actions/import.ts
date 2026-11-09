@@ -1537,10 +1537,23 @@ export async function importTransfersCsv(formData: FormData, system?: SystemImpo
     lines: { productId: string; sku: string; productName: string; qty: number }[]
   }>()
   const importedAt = new Date()
+  // A row that fails validation poisons its WHOLE explicit transferKey group: creating the valid rows alone would build a
+  // different transfer from the one the file describes, and a re-run would then skip it as a duplicate. Detected by comparing the
+  // skip counter across one row's processing (every refusal in the loop bumps it), so no refusal site can forget to report.
+  const invalidTransferKeys = new Map<string, number>()
+  let previousRowKey = ''
+  let skippedBeforePreviousRow = result.skipped
+  let previousLineNum = 0
 
   for (let i = 0; i < rows.length; i++) {
+    if (previousRowKey && result.skipped > skippedBeforePreviousRow && !invalidTransferKeys.has(previousRowKey)) {
+      invalidTransferKeys.set(previousRowKey, previousLineNum)
+    }
     const row = rows[i]
     const lineNum = i + 2
+    skippedBeforePreviousRow = result.skipped
+    previousRowKey = readCsvValue(row, 'transferKey', 'transferkey').trim()
+    previousLineNum = lineNum
     const fromCode = (row['fromWarehouseCode'] ?? row['fromwarehousecode'] ?? '').trim().toUpperCase()
     const toCode = (row['toWarehouseCode'] ?? row['towarehousecode'] ?? '').trim().toUpperCase()
     const sku = (row['sku'] ?? '').trim()
@@ -1598,6 +1611,16 @@ export async function importTransfersCsv(formData: FormData, system?: SystemImpo
       continue
     }
     groups.get(key)!.lines.push({ productId: product.id, sku, productName: product.name, qty })
+  }
+  if (previousRowKey && result.skipped > skippedBeforePreviousRow && !invalidTransferKeys.has(previousRowKey)) {
+    invalidTransferKeys.set(previousRowKey, previousLineNum)
+  }
+  for (const [badKey, firstBadLine] of invalidTransferKeys) {
+    const group = groups.get(badKey)
+    if (group && !group.invalid) {
+      group.invalid = true
+      result.errors.push(`Transfer "${badKey}" was not created: row ${firstBadLine} of the same transferKey is invalid, and a transfer is created whole or not at all`)
+    }
   }
 
   const explicitTransferKeys = Array.from(
