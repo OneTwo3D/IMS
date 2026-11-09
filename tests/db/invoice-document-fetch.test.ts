@@ -1000,3 +1000,29 @@ test('a reset holding the lock stops a promotion: it stores nothing and is retri
     await cleanup(db, order.id)
   }
 })
+
+test('the reset\'s own transaction lock keeps promotions out even when the pinned session lock is gone', { skip }, async () => {
+  const { db, service } = await setup()
+  const { order } = await seedOrder(db)
+  const { lockResetInTransaction, invoiceDocumentResetRunning } = await import('../../lib/domain/invoice-documents/reset-lock')
+  try {
+    assert.equal(await invoiceDocumentResetRunning(), false)
+    let release: () => void = () => {}
+    const hold = new Promise<void>((resolve) => { release = resolve })
+    let locked: () => void = () => {}
+    const holding = new Promise<void>((resolve) => { locked = resolve })
+    // NO session lock is held here: only the transaction-scoped one, as if the pinned connection had dropped.
+    const tx = db.$transaction(async (t) => { await lockResetInTransaction(t); locked(); await hold }, { timeout: 30_000 })
+    await holding
+    assert.equal(await invoiceDocumentResetRunning(), true, 'the transaction lock alone is seen')
+    const downloads = { n: 0 }
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, depsFor(order, { downloads }))).status, 'busy')
+    assert.equal(downloads.n, 0)
+    release()
+    await tx
+    assert.equal(await invoiceDocumentResetRunning(), false, 'released at commit')
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, depsFor(order))).status, 'stored')
+  } finally {
+    await cleanup(db, order.id)
+  }
+})

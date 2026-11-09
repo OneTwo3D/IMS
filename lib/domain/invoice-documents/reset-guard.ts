@@ -1,3 +1,4 @@
+import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { expectedDisposableDatabaseMarker } from '@/lib/disposable-database-marker'
 
@@ -16,10 +17,12 @@ export type InvoiceDocumentResetVerdict =
  *     that a database is destroyable): the reset deletes the documents with everything else;
  *   - stored documents on any other database: REFUSED, with the way forward in the message.
  */
-export async function invoiceDocumentResetVerdict(): Promise<InvoiceDocumentResetVerdict> {
-  const stored = await db.salesOrderInvoiceDocument.count()
+export class InvoiceDocumentsRetainedError extends Error {}
+
+export async function invoiceDocumentResetVerdict(client: Prisma.TransactionClient | typeof db = db): Promise<InvoiceDocumentResetVerdict> {
+  const stored = await client.salesOrderInvoiceDocument.count()
   if (stored === 0) return { ok: true, mayDeleteDocuments: false }
-  const rows = await db.$queryRaw<Array<{ db: string | null; comment: string | null }>>`
+  const rows = await client.$queryRaw<Array<{ db: string | null; comment: string | null }>>`
     SELECT current_database()::text AS db, shobj_description(d.oid, 'pg_database') AS comment
     FROM pg_database d WHERE d.datname = current_database()
   `

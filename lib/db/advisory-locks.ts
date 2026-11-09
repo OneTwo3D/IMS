@@ -345,6 +345,9 @@ export const WC_CUSTOMER_KEY_LOCK_NAMESPACE = 411_220_878
  */
 export const INVOICE_DOCUMENT_RESET_LOCK_NAMESPACE = 411_220_879
 
+/** The key, within that namespace, that the reset's own sales-deletion TRANSACTION takes exclusive (transaction scope); the session lock above is key 0. A promotion takes both shared. */
+export const INVOICE_DOCUMENT_RESET_TRANSACTION_LOCK_KEY = 1
+
 /**
  * THE INVOICE-DOCUMENT PROMOTION LOCK (two-int, key = a hash of the document's subject).
  *

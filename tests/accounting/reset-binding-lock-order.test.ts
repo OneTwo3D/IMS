@@ -106,7 +106,7 @@ const client: Record<string, unknown> = new Proxy({}, {
   },
 })
 
-mock.module('@/lib/domain/invoice-documents/reset-lock', { namedExports: { withInvoiceDocumentResetLock: async (run: () => Promise<unknown>) => run(), AdvisoryLockWaitTimeoutError: class extends Error {} } })
+mock.module('@/lib/domain/invoice-documents/reset-lock', { namedExports: { withInvoiceDocumentResetLock: async (run: (lock: { assertHeld: (context?: string) => void }) => Promise<unknown>) => run({ assertHeld: () => {} }), lockResetInTransaction: async () => {}, AdvisoryLockWaitTimeoutError: class extends Error {} } })
 mock.module('@/lib/db', { namedExports: { db: client } })
 mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
 mock.module('@/lib/integration-plugin-selection-lock', {
