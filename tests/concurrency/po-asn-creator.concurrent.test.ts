@@ -469,7 +469,10 @@ test(
       // The window the tenant-wide ASN list fetch opens: AFTER the reservation committed, BEFORE the revalidation.
       const aligned = await fixtures.alignUp(po, line, { delta: 6, imsQty: 0 })
       assert.equal(aligned.applied, true, `PRECONDITION: alignment applied inside the window: ${JSON.stringify(aligned)}`)
-      const manual = await receive(po, line, 4)
+      // The window is now STAMPED (po-receipt-asn-guard), so a plain manual receipt is refused here (see the guard arm below). This arm
+      // is about what the creator does when the outstanding HAS moved by a real receipt (stock, layers, status), so the receipt is made
+      // as one accepted before the stamp existed: the order's live ASNs are set aside for the duration of the call.
+      const manual = await fixtures.receiveLegacy(po, line, 4)
       assert.equal(manual.success, true, `PRECONDITION: the manual 4 committed inside the window: ${manual.error}`)
       injected = true
     }
@@ -642,8 +645,9 @@ test(
     const probe = await rawSession()
     let holderPid = 0
     duplicateRecoveryHook = async () => {
-      const manual = await receive(po, line, 1) // moves the outstanding so the revalidation mismatches and DISCARDS
-      assert.equal(manual.success, true, `PRECONDITION: the manual 1 committed: ${manual.error}`)
+      // moves the outstanding so the revalidation mismatches and DISCARDS (directly: a manual receipt is refused inside this window)
+      const { db: hookDb } = await import('@/lib/db')
+      await hookDb.purchaseOrderLine.update({ where: { id: line.poLineId }, data: { qtyReceived: { increment: '1.0000' } } })
       holderPid = await holdHeaderLock(holder, po.poId)
     }
     try {
@@ -898,6 +902,32 @@ test(
     assert.equal(created.success, true, created.error)
     await db.wmsAsnMap.update({ where: { id: reservation.asnId }, data: { status: 'BOOKED_IN', closedAt: new Date() } })
     assert.equal((await receive(po, line, 1)).success, true, 'a reconciled (closed) ASN no longer blocks')
+  },
+)
+
+test(
+  'live-ASN guard: the reservation is stamped BEFORE the duplicate-recovery lookup, so a manual receipt inside that window is refused (and nothing is finalized over it)',
+  SKIP,
+  async () => {
+    const { createMintsoftPurchaseOrderAsn } = await loadModules()
+    const { db } = await import('@/lib/db')
+    const po = await seedPo('g3', [10])
+    const line = po.lines[0]!
+    await makeCreatable(po)
+    const reservation = await addPendingReservation(po, [{ line, expectedQty: 10 }])
+    const before = await db.wmsAsnMap.findUniqueOrThrow({ where: { id: reservation.asnId }, select: { remoteCreateAttemptedAt: true, status: true } })
+    assert.deepEqual({ stamped: before.remoteCreateAttemptedAt !== null, status: before.status }, { stamped: false, status: 'CREATE_PENDING' }, 'PRECONDITION: unstamped CREATE_PENDING')
+    let inWindow: { stamped: boolean; status: string; manual: { success: boolean; error?: string } } | null = null
+    duplicateRecoveryHook = async () => {
+      const row = await db.wmsAsnMap.findUniqueOrThrow({ where: { id: reservation.asnId }, select: { remoteCreateAttemptedAt: true, status: true } })
+      inWindow = { stamped: row.remoteCreateAttemptedAt !== null, status: row.status, manual: await receive(po, line, 4) }
+    }
+    const result = await createMintsoftPurchaseOrderAsn(po.poId, { autoCallback: false })
+    assert.deepEqual({ stamped: inWindow!.stamped, status: inWindow!.status }, { stamped: true, status: 'CREATE_PENDING' }, 'stamped (still pending) before the lookup began')
+    assert.equal(inWindow!.manual.success, false, 'the manual receipt inside the lookup window is refused')
+    assert.match(inWindow!.manual.error ?? '', /open warehouse ASN/)
+    assert.equal(result.success, true, result.error)
+    assert.equal((await snapshotOf(po, line)).stock, 0, 'no stock was added by the refused receipt')
   },
 )
 

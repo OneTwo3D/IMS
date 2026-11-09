@@ -3567,9 +3567,21 @@ export async function createMintsoftPurchaseOrderAsn(
 
   async function revalidatePendingReservation(
     reservation: Extract<AsnReservation, { kind: 'pending' }>,
+    options: { stampRemoteAttempt?: boolean } = {},
   ): Promise<string | null> {
     return db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${reservation.poId} FOR UPDATE`
+
+      // Before any remote lookup (duplicate recovery) the reservation is stamped as having touched the warehouse, under the SAME
+      // purchase_orders lock the comparison below reads under. A manual receipt either committed before this lock (the comparison
+      // sees it and the recovery is refused) or starts after it and meets the stamp (po-receipt-asn-guard refuses it), so it can no
+      // longer slip in during the lookup and be missed by the recovery's finalize. Only an open, unstamped row is stamped.
+      if (options.stampRemoteAttempt === true) {
+        await tx.wmsAsnMap.updateMany({
+          where: { id: reservation.asnMapId, closedAt: null, remoteCreateAttemptedAt: null },
+          data: { remoteCreateAttemptedAt: new Date() },
+        })
+      }
 
       const po = await tx.purchaseOrder.findUnique({
         where: { id: reservation.poId },
@@ -3850,6 +3862,14 @@ export async function createMintsoftPurchaseOrderAsn(
     if (reservation.kind === 'existing') {
       outcome = { ...reservation, receiptMayHaveHappened: false, remoteStatusName: null }
     } else {
+      // The lookup below may adopt an ASN the warehouse already holds, so the reservation is stamped (and its outstanding quantities
+      // re-read) under the purchase_orders lock FIRST: a manual receipt that landed since the reservation was sized discards it
+      // for a retry instead of being finalized over; one that arrives later is refused by the stamp.
+      const preLookupMismatch = await revalidatePendingReservation(reservation, { stampRemoteAttempt: true })
+      if (preLookupMismatch) {
+        await discardPendingReservation(reservation)
+        throw new Error(`${preLookupMismatch} Please retry creating the Mintsoft ASN.`)
+      }
       const recoveredAsn = await findExistingRemoteAsn(reservation)
       if (recoveredAsn) {
         outcome = await finalizePendingAsn(reservation, recoveredAsn, 'recovered')
