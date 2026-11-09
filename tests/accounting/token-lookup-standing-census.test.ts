@@ -26,6 +26,7 @@ const EXPECTED = [
   'lib/connectors/woocommerce/sync/held-sales-invoice.ts', // releasedSalesInvoiceQueueWhere: live statuses or a document id
   'lib/domain/accounting/prior-posting-evidence.ts', // priorAttemptsWhere + PRIOR_ATTEMPT_SELECT, classified by classifyPriorAttempts
   'lib/domain/sales/allocation-service.ts', // assertAllocationReversalQueued: live, unasserted work slot only
+  'lib/domain/sales/return-expectation-receipt.ts', // resolveClearingMode: reads the refund's COGS_REVERSAL row by key and judges it via ledgerStanding
 ]
 
 function files(dir: string, out: string[] = []): string[] {
