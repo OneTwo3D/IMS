@@ -62,10 +62,11 @@ function warningStore(initial: Record<string, number> = {}, initialCheckedAt = '
   }
   let notifications: FakeNotification[] = []
   const control = { failNotification: false, admins: ['admin-1', 'admin-2'] as string[] }
+  const order: string[] = []
   const tx = {
-    $executeRaw: async () => 1,
+    $executeRaw: async (_strings: TemplateStringsArray, ...values: unknown[]) => { order.push(`lock:${String(values[0])}`); return 1 },
     setting: {
-      findUnique: async ({ where }: { where: { key: string } }) => (settings.has(where.key) ? { value: settings.get(where.key)! } : null),
+      findUnique: async ({ where }: { where: { key: string } }) => (order.push('read'), settings.has(where.key) ? { value: settings.get(where.key)! } : null),
       upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => { settings.set(where.key, create.value); return {} },
     },
     user: { findMany: async () => control.admins.map((id) => ({ id })) },
@@ -98,6 +99,7 @@ function warningStore(initial: Record<string, number> = {}, initialCheckedAt = '
       return raw ? (JSON.parse(raw) as { checkedAt: string }).checkedAt : null
     },
     notifications: () => notifications,
+    order,
     control,
   }
 }
@@ -422,6 +424,8 @@ test('named warning codes notify when newly appearing or rising, and are quiet o
 
   await runWithWarnings(store, warningFindings(code, 2))
   assert.equal(store.notifications().length, 4, 'rising again after a fall notifies again')
+  assert.match(String(store.notifications()[2]?.message), /stock_cost_layer_quantity_mismatch 1 -> 2/, 'the message carries the previous count')
+  assert.deepEqual([...new Set(store.notifications().map((n) => n.userId))].sort(), ['admin-1', 'admin-2'], 'admin-scoped: never a null-user broadcast')
 
   await runWithWarnings(store, [])
   assert.deepEqual(store.read(), {}, 'cleared')
@@ -568,4 +572,54 @@ test('truncation markers are the ones the reports emit', async () => {
   const { REPORT_TRUNCATION_CODES } = await import('@/lib/cron/invariant-check')
   const sources = ['lib/domain/inventory/invariants.ts', 'lib/domain/sales/refund-status-reconciliation.ts'].map((f) => readFileSync(f, 'utf8')).join('\n')
   for (const code of REPORT_TRUNCATION_CODES) assert.ok(sources.includes(`'${code}'`), `${code} is emitted`)
+})
+
+test('the baseline step takes the registered advisory lock BEFORE it reads the baseline', async () => {
+  const { INVARIANT_WARNING_BASELINE_LOCK_KEY } = await import('@/lib/db/advisory-locks')
+  const store = warningStore()
+  await runWithWarnings(store, warningFindings('accounting_sync_failed', 1))
+  assert.deepEqual(store.order.slice(0, 2), [`lock:${INVARIANT_WARNING_BASELINE_LOCK_KEY}`, 'read'])
+})
+
+test('the named warning list is exactly the six reviewed codes', () => {
+  assert.deepEqual([...NOTIFIABLE_WARNING_CODES].sort(), [
+    'accounting_sync_failed',
+    'refund_missing_credit_note_sync',
+    'refund_missing_reversal_sync',
+    'refund_reversal_record_undecidable',
+    'stock_cost_layer_quantity_mismatch',
+    'transfer_stranded_in_transit',
+  ])
+})
+
+test('either report cap marker makes a run truncated (the sales row cap too)', async () => {
+  const store = warningStore({ transfer_stranded_in_transit: 3 })
+  const result = await runScheduledInvariantCheck({
+    createRunId: () => 'run-cap',
+    now: () => new Date('2026-03-01T00:00:00.000Z'),
+    runInventoryReport: async () => emptyReport('2026-03-01T00:00:01.000Z'),
+    runAccountingReport: async () => emptyReport('2026-03-01T00:00:02.000Z'),
+    runSalesReport: async () => ({
+      checkedAt: '2026-03-01T00:00:03.000Z',
+      findings: [{ severity: 'warning', code: 'refund_status_reconciliation_row_cap_reached', message: 'cap', details: {} }],
+      summary: { total: 1, info: 0, warning: 1, critical: 0 },
+    }),
+    writeActivityLog: async () => {},
+    notifyAdmins: async () => {},
+    getPreviousCriticalFindingsHash: async () => null,
+    setCriticalFindingsHash: async () => {},
+    commitWarningBaseline: store.commitWarningBaseline,
+  })
+  assert.equal(result.status, 'completed')
+  assert.deepEqual(store.read(), { transfer_stranded_in_transit: 3 }, 'counts kept, not cleared by the capped sales list')
+  assert.equal(store.notifications()[0]?.title, 'Invariant report was truncated')
+})
+
+test('every caller that runs the scheduled check with its writers silenced also silences the warning baseline (read-only callers write nothing)', async () => {
+  const { readFileSync } = await import('node:fs')
+  for (const file of ['lib/cron/invariant-check-preflight.ts', 'scripts/reconciliation-pack.ts']) {
+    const text = readFileSync(file, 'utf8')
+    assert.ok(text.includes('setCriticalFindingsHash: async () => {}'), `${file} silences the writers`)
+    assert.ok(text.includes('commitWarningBaseline: async () => ({ applied: false'), `${file} must also silence the warning baseline`)
+  }
 })
