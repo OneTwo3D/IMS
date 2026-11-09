@@ -139,3 +139,14 @@ test('two readings of one ledger document must agree on every field the ownershi
     assert.equal(ownershipFingerprintsMatch(base, { ...base, ...change }), false, JSON.stringify(change))
   }
 })
+
+test('evidence failures say whether they are a POSITIVE conflict (withdraws a stored document) or missing information (does not)', () => {
+  const failure = (claim: DocumentClaim) => { const r = assessDocumentEvidence(subject(), claim); return r.ok ? null : r.conflict }
+  assert.equal(failure(doc({ total: 999, reference: '12345' })), true, 'total contradicts')
+  assert.equal(failure(doc({ currencyCode: 'EUR', reference: '12345' })), true, 'currency contradicts')
+  assert.equal(failure(doc({ contactName: 'Bob', reference: '12345' })), true, 'customer contradicts')
+  assert.equal(failure(doc({ reference: '99999', contactName: 'Ada Lovelace' })), true, 'reference names another order')
+  assert.equal(failure(doc({ currencyCode: undefined, reference: '12345' })), false, 'currency not stated')
+  assert.equal(failure(doc({ total: undefined, reference: '12345' })), false, 'total not stated')
+  assert.equal(failure(doc({})), false, 'nothing states whose it is')
+})

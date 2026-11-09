@@ -45,7 +45,13 @@ function parseFloor(raw: string | null): Date | 'bad' | null {
 
 type Candidate = { orderId: string; kind: 'INVOICE' | 'CREDIT_NOTE'; refundId?: string }
 
-export async function selectInvoiceDocumentCandidates(floor: Date, now: Date, limit: number, includeCreditNotes: boolean): Promise<Candidate[]> {
+/** At least this share of a run (a quarter, never fewer than one slot) is reserved for DUE RECHECKS of stored documents, so a long backlog of new orders cannot starve them. */
+export function reservedRecheckSlots(limit: number): number {
+  return Math.max(1, Math.floor(limit / 4))
+}
+
+async function selectNewFetchCandidates(floor: Date, now: Date, take: number, includeCreditNotes: boolean): Promise<Candidate[]> {
+  if (take <= 0) return []
   const dueState = (kind: 'INVOICE' | 'CREDIT_NOTE') => ({
     OR: [
       { invoiceDocumentFetches: { none: { kind } } },
@@ -61,12 +67,12 @@ export async function selectInvoiceDocumentCandidates(floor: Date, now: Date, li
       ...dueState('INVOICE'),
     },
     orderBy: { createdAt: 'asc' },
-    take: limit,
+    take,
     select: { id: true },
   })
   const candidates: Candidate[] = orders.map((order) => ({ orderId: order.id, kind: 'INVOICE' as const }))
 
-  if (includeCreditNotes && candidates.length < limit) {
+  if (includeCreditNotes && candidates.length < take) {
     const refunds = await db.salesOrderRefund.findMany({
       where: {
         creditNoteNumber: { not: null },
@@ -79,40 +85,56 @@ export async function selectInvoiceDocumentCandidates(floor: Date, now: Date, li
         ],
       },
       orderBy: { createdAt: 'asc' },
-      take: limit - candidates.length,
+      take: take - candidates.length,
       select: { id: true, orderId: true },
     })
     for (const refund of refunds) candidates.push({ orderId: refund.orderId, kind: 'CREDIT_NOTE', refundId: refund.id })
   }
+  return candidates
+}
 
-  // RECHECKS of documents already stored: the ledger can amend or re-issue one, so a stored document's fetch state carries the
-  // time it is next looked at (1 day, 7 days, then every 30 days after the last look). Not floor-limited: it was fetched already.
-  if (candidates.length < limit) {
-    const due = await db.invoiceDocumentFetchState.findMany({
-      where: {
-        status: { in: ['DONE', 'PENDING'] },
-        nextAttemptAt: { lte: now },
-        ...(includeCreditNotes ? {} : { kind: 'INVOICE' as const }),
-        order: { invoiceDocuments: { some: { supersededAt: null } } },
-      },
-      orderBy: { nextAttemptAt: 'asc' },
-      take: (limit - candidates.length) * 3,
-      select: { orderId: true, refundId: true, kind: true },
-    })
-    if (due.length > 0) {
-      const current = await db.salesOrderInvoiceDocument.findMany({
-        where: { supersededAt: null, orderId: { in: [...new Set(due.map((state) => state.orderId))] } },
-        select: { orderId: true, refundId: true, kind: true },
-      })
-      const hasCurrent = new Set(current.map((doc) => `${doc.orderId}:${doc.kind}:${doc.refundId ?? '-'}`))
-      for (const state of due) {
-        if (candidates.length >= limit) break
-        if (!hasCurrent.has(`${state.orderId}:${state.kind}:${state.refundId ?? '-'}`)) continue
-        candidates.push({ orderId: state.orderId, kind: state.kind, ...(state.refundId ? { refundId: state.refundId } : {}) })
-      }
-    }
+/**
+ * RECHECKS of documents already stored: the ledger can amend or re-issue one, so a stored document's fetch state carries the time it is next
+ * looked at (1 day, 7 days, then every 30 days after the last look). Not floor-limited: it was fetched already. Longest-overdue first.
+ */
+async function selectDueRechecks(now: Date, take: number, includeCreditNotes: boolean): Promise<Candidate[]> {
+  if (take <= 0) return []
+  const due = await db.invoiceDocumentFetchState.findMany({
+    where: {
+      status: { in: ['DONE', 'PENDING'] },
+      nextAttemptAt: { lte: now },
+      ...(includeCreditNotes ? {} : { kind: 'INVOICE' as const }),
+      order: { invoiceDocuments: { some: { supersededAt: null } } },
+    },
+    orderBy: { nextAttemptAt: 'asc' },
+    take: take * 3,
+    select: { orderId: true, refundId: true, kind: true },
+  })
+  if (due.length === 0) return []
+  const current = await db.salesOrderInvoiceDocument.findMany({
+    where: { supersededAt: null, orderId: { in: [...new Set(due.map((state) => state.orderId))] } },
+    select: { orderId: true, refundId: true, kind: true },
+  })
+  const hasCurrent = new Set(current.map((doc) => `${doc.orderId}:${doc.kind}:${doc.refundId ?? '-'}`))
+  const candidates: Candidate[] = []
+  for (const state of due) {
+    if (candidates.length >= take) break
+    if (!hasCurrent.has(`${state.orderId}:${state.kind}:${state.refundId ?? '-'}`)) continue
+    candidates.push({ orderId: state.orderId, kind: state.kind, ...(state.refundId ? { refundId: state.refundId } : {}) })
   }
   return candidates
+}
+
+/**
+ * One run's work: due rechecks get a RESERVED share (reservedRecheckSlots), new fetches take the rest, and any slot either kind does not use
+ * rolls over to the other. A backlog of new orders therefore cannot starve the rechecks of documents already shown to customers.
+ */
+export async function selectInvoiceDocumentCandidates(floor: Date, now: Date, limit: number, includeCreditNotes: boolean): Promise<Candidate[]> {
+  const rechecks = await selectDueRechecks(now, limit, includeCreditNotes)
+  const reserved = Math.min(reservedRecheckSlots(limit), rechecks.length)
+  const fresh = await selectNewFetchCandidates(floor, now, limit - reserved, includeCreditNotes)
+  const spare = limit - reserved - fresh.length
+  return [...rechecks.slice(0, reserved), ...fresh, ...rechecks.slice(reserved, reserved + Math.max(0, spare))]
 }
 
 /**

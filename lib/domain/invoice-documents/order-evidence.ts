@@ -34,7 +34,11 @@ export type EvidenceSubject = {
   dateToleranceDays: number
 }
 
-export type EvidenceResult = { ok: true; matched: string[] } | { ok: false; reason: string }
+/**
+ * `conflict` distinguishes a POSITIVE disagreement (the ledger states a total, currency, customer or reference that differs from the order's)
+ * from MISSING information (the ledger did not state something we need). Only a positive conflict withdraws a document already stored.
+ */
+export type EvidenceResult = { ok: true; matched: string[] } | { ok: false; reason: string; conflict: boolean }
 
 export const TOTAL_TOLERANCE = 0.02
 
@@ -58,16 +62,16 @@ function withinDays(dateString: string, anchor: Date, days: number): boolean {
 export function assessDocumentEvidence(subject: EvidenceSubject, claim: DocumentClaim): EvidenceResult {
   const matched: string[] = []
 
-  if (!claim.currencyCode) return { ok: false, reason: 'the ledger did not report the document currency, so it cannot be tied to this order' }
+  if (!claim.currencyCode) return { ok: false, reason: 'the ledger did not report the document currency, so it cannot be tied to this order', conflict: false }
   if (claim.currencyCode.toUpperCase() !== subject.currency.toUpperCase()) {
-    return { ok: false, reason: `the ledger document is in ${claim.currencyCode} and the order is in ${subject.currency}` }
+    return { ok: false, reason: `the ledger document is in ${claim.currencyCode} and the order is in ${subject.currency}`, conflict: true }
   }
   matched.push('currency')
 
   if (subject.expectedTotal !== null) {
-    if (typeof claim.total !== 'number') return { ok: false, reason: 'the ledger did not report the document total, so it cannot be tied to this order' }
+    if (typeof claim.total !== 'number') return { ok: false, reason: 'the ledger did not report the document total, so it cannot be tied to this order', conflict: false }
     if (Math.abs(claim.total - subject.expectedTotal) > TOTAL_TOLERANCE) {
-      return { ok: false, reason: `the ledger document totals ${claim.total} and the order totals ${subject.expectedTotal}: it may belong to a different order` }
+      return { ok: false, reason: `the ledger document totals ${claim.total} and the order totals ${subject.expectedTotal}: it may belong to a different order`, conflict: true }
     }
     matched.push('total')
   }
@@ -81,13 +85,13 @@ export function assessDocumentEvidence(subject: EvidenceSubject, claim: Document
 
   // An explicit conflict is a refusal whatever else agrees.
   if (customerStated && !customerMatches) {
-    return { ok: false, reason: `the ledger document is for "${claim.contactName}" and the order is for "${subject.customerName}": it may belong to a different order` }
+    return { ok: false, reason: `the ledger document is for "${claim.contactName}" and the order is for "${subject.customerName}": it may belong to a different order`, conflict: true }
   }
   if (referenceStated && !referenceMatches) {
-    return { ok: false, reason: `the ledger document's reference "${claim.reference}" does not mention this order: it may belong to a different order` }
+    return { ok: false, reason: `the ledger document's reference "${claim.reference}" does not mention this order: it may belong to a different order`, conflict: true }
   }
   if (!customerMatches && !referenceMatches) {
-    return { ok: false, reason: 'neither the customer nor the order reference is stated by the ledger, so the document cannot be tied to this order' }
+    return { ok: false, reason: 'neither the customer nor the order reference is stated by the ledger, so the document cannot be tied to this order', conflict: false }
   }
   if (customerMatches) matched.push('contact')
   if (referenceMatches) matched.push('reference')

@@ -181,6 +181,18 @@ async function escalate(input: EnsureInvoiceDocumentInput, reason: string): Prom
   }).catch(() => { /* logging must never change the outcome */ })
 }
 
+/**
+ * A PERSON'S REVIEW of a document that needs attention (an ambiguous or conflicting ledger answer): puts it back to be looked at on the next
+ * pass. Nothing is un-withdrawn here: a withdrawn document is served again only if the next fetch validates it, or a replacement is promoted.
+ */
+export async function releaseInvoiceDocumentForReview(subject: { orderId: string; kind: InvoiceDocumentKindName; refundId?: string }): Promise<boolean> {
+  const released = await db.invoiceDocumentFetchState.updateMany({
+    where: { subjectKey: invoiceDocumentSubjectKey(subject.orderId, subject.kind, subject.refundId), status: 'NEEDS_ATTENTION' },
+    data: { status: 'PENDING', nextAttemptAt: null, lastError: null },
+  })
+  return released.count > 0
+}
+
 export async function ensureInvoiceDocument(
   input: EnsureInvoiceDocumentInput,
   deps: InvoiceDocumentDeps,
@@ -318,11 +330,40 @@ async function ensureUnderLease(
     await escalate(input, reason)
     return { status: 'needs-attention', reason }
   }
+  // Stop showing the stored document to the customer: bytes and history stay, the lease is checked in the same transaction, staff can still
+  // open it (labelled). Used only for a POSITIVE finding about a stored document (voided on a live order, or an ownership conflict).
+  const withdrawStored = async (action: string, description: string): Promise<void> => {
+    const withdrawn = await db.$transaction(async (tx) => {
+      const held = await tx.invoiceDocumentFetchState.updateMany({ where: { subjectKey, leaseHolder: token }, data: { leaseUntil: new Date(deps.now().getTime() + INVOICE_DOCUMENT_LEASE_MS) } })
+      if (held.count === 0) return false
+      await tx.salesOrderInvoiceDocument.updateMany({
+        where: { orderId: input.orderId, kind: input.kind, refundId: input.refundId ?? null, supersededAt: null, withdrawnAt: null },
+        data: { withdrawnAt: deps.now() },
+      })
+      return true
+    })
+    if (!withdrawn) throw new LeaseLost()
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: input.orderId,
+      action,
+      tag: 'accounting',
+      level: 'WARNING',
+      description,
+      metadata: { kind: input.kind, refundId: input.refundId ?? null },
+      resolveUser: false,
+    }).catch(() => { /* logging must never change the outcome */ })
+  }
+  /** A positive ownership finding on a stored document: withdraw it from the customer, then ask for a person. */
+  const conflictNeedsAttention = async (reason: string): Promise<EnsureInvoiceDocumentOutcome> => {
+    if (isRecheck) await withdrawStored('invoice_document_withdrawn', `The ${input.kind === 'INVOICE' ? 'invoice' : 'credit note'} stored for this order no longer matches it in the ledger and is no longer shown to the customer: ${reason}`)
+    return needsAttention(reason)
+  }
   const missing = (reason: string) => (!isRecheck && shouldEscalateMissing(firstSeenAt, now) ? needsAttention(reason) : defer(reason, 'waiting'))
 
   if (!number) return missing(`${label}: the order carries no number for this document yet`)
   if (sharedByOthers > 0) {
-    return needsAttention(`${label}: ${sharedByOthers} other IMS ${input.kind === 'INVOICE' ? 'order(s) carry' : 'refund(s) carry'} the same number, so the ledger document cannot be tied to this one`)
+    return conflictNeedsAttention(`${label}: ${sharedByOthers} other IMS ${input.kind === 'INVOICE' ? 'order(s) carry' : 'refund(s) carry'} the same number, so the ledger document cannot be tied to this one`)
   }
 
   if (grossUnderivable) return needsAttention(`${label}: ${grossUnderivable}`)
@@ -340,35 +381,14 @@ async function ensureUnderLease(
   if (selection.outcome === 'attention') return needsAttention(selection.reason)
   if (selection.outcome === 'wait') {
     if (selection.voidedOnActiveOrder && isRecheck) {
-      // The ledger has VOIDED the document we hold and the order is live: stop serving it (bytes and history are kept) until a valid
-      // replacement is promoted. Written under the lease like every other write.
-      const withdrawn = await db.$transaction(async (tx) => {
-        const held = await tx.invoiceDocumentFetchState.updateMany({ where: { subjectKey, leaseHolder: token }, data: { leaseUntil: new Date(deps.now().getTime() + INVOICE_DOCUMENT_LEASE_MS) } })
-        if (held.count === 0) return false
-        await tx.salesOrderInvoiceDocument.updateMany({
-          where: { orderId: input.orderId, kind: input.kind, refundId: input.refundId ?? null, supersededAt: null, withdrawnAt: null },
-          data: { withdrawnAt: deps.now() },
-        })
-        return true
-      })
-      if (!withdrawn) throw new LeaseLost()
-      await logActivity({
-        entityType: 'SALES_ORDER',
-        entityId: input.orderId,
-        action: 'invoice_document_withdrawn',
-        tag: 'accounting',
-        level: 'WARNING',
-        description: `The ledger voided ${label} on an order that is not cancelled: the stored PDF is no longer shown to the customer until a replacement is issued`,
-        metadata: { kind: input.kind, refundId: input.refundId ?? null },
-        resolveUser: false,
-      }).catch(() => { /* logging must never change the outcome */ })
+      await withdrawStored('invoice_document_withdrawn', `The ledger voided ${label} on an order that is not cancelled: the stored PDF is no longer shown to the customer until a replacement is issued`)
     }
     return missing(selection.reason)
   }
   const claim = selection.claim
 
   const evidence = assessDocumentEvidence(evidenceSubject, claim)
-  if (!evidence.ok) return needsAttention(`${label}: ${evidence.reason}`)
+  if (!evidence.ok) return evidence.conflict ? conflictNeedsAttention(`${label}: ${evidence.reason}`) : needsAttention(`${label}: ${evidence.reason}`)
 
   // The download is built from the connection that answered the lookup (a change refuses it before it is sent)...
   const download = await deps.downloadPdf(input.kind, claim.documentId, lookup.connection)

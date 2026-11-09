@@ -773,3 +773,84 @@ test('a stored invoice later VOIDED on an order that is not cancelled is withdra
     await cleanup(db, order.id)
   }
 })
+
+test('a recheck that finds a POSITIVE ownership conflict withdraws the stored document; a transient failure does not; a person\'s review plus a valid answer serves it again', { skip }, async () => {
+  const { db, service } = await setup()
+  const { order } = await seedOrder(db, false, { customerName: 'Ada Lovelace' })
+  try {
+    const { loadCurrentInvoicePdf, currentInvoiceIsWithdrawn } = await import('../../lib/domain/invoice-documents/current-document')
+    const t0 = new Date('2026-11-09T10:00:00Z')
+    let now = t0
+    let answer: 'ok' | 'conflict' | 'down' | 'unstated' = 'ok'
+    const bytes = pdf('stored')
+    const deps: Deps = {
+      ...depsFor(order),
+      now: () => now,
+      lookupInvoiceClaims: async (number) => {
+        if (answer === 'down') return { ok: false, error: 'HTTP 503' }
+        const claim = ledgerClaim(order, number, { contactName: answer === 'conflict' ? 'Bob Builder' : 'Ada Lovelace' })
+        if (answer === 'unstated') return { ok: true, claims: [{ ...claim, currencyCode: undefined }] }
+        return { ok: true, claims: [claim] }
+      },
+      downloadPdf: async () => ({ ok: true, buffer: bytes }),
+    }
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, deps)).status, 'stored')
+
+    // Unanswered, or information MISSING rather than contradicted: the stored PDF stays served.
+    now = new Date(t0.getTime() + 25 * 3600_000)
+    answer = 'down'
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, deps)).status, 'failed')
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id), bytes, 'a transient failure keeps the stored PDF')
+    now = new Date(now.getTime() + 8 * 24 * 3600_000)
+    answer = 'unstated'
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, deps)).status, 'needs-attention')
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id), bytes, 'missing information is not a conflict: still served')
+    assert.equal(await currentInvoiceIsWithdrawn(order.id), false)
+    assert.equal(await service.releaseInvoiceDocumentForReview({ orderId: order.id, kind: 'INVOICE' }), true)
+
+    // The ledger now states a DIFFERENT customer: positive conflict. Withdrawn from the customer, kept, staff can open it.
+    now = new Date(now.getTime() + 31 * 24 * 3600_000)
+    answer = 'conflict'
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, deps)).status, 'needs-attention')
+    assert.equal(await loadCurrentInvoicePdf(order.id), null, 'no longer shown to the customer')
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id, { includeWithdrawn: true }), bytes, 'retained, and staff can open it')
+    assert.equal(await currentInvoiceIsWithdrawn(order.id), true)
+    // Not retried on its own.
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE', ignoreBackoff: true }, deps)).status, 'needs-attention')
+
+    // A person has looked; the next answer validates: served again.
+    assert.equal(await service.releaseInvoiceDocumentForReview({ orderId: order.id, kind: 'INVOICE' }), true)
+    answer = 'ok'
+    now = new Date(now.getTime() + 3600_000)
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE', ignoreBackoff: true }, deps)).status, 'stored')
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id), bytes)
+    assert.equal(await currentInvoiceIsWithdrawn(order.id), false)
+  } finally {
+    await cleanup(db, order.id)
+  }
+})
+
+test('a full backlog of new orders cannot starve a due recheck', { skip }, async () => {
+  const { db, service, sweep } = await setup()
+  const fresh: string[] = []
+  const stored = await seedOrder(db)
+  try {
+    for (let i = 0; i < 12; i += 1) fresh.push((await seedOrder(db)).order.id)
+    // One order already has a stored document whose recheck has fallen due.
+    const t0 = new Date('2026-11-09T10:00:00Z')
+    assert.equal((await service.ensureInvoiceDocument({ orderId: stored.order.id, kind: 'INVOICE' }, { ...depsFor(stored.order), now: () => t0 })).status, 'stored')
+    const later = new Date(t0.getTime() + 25 * 3600_000)
+    const limit = 8
+    assert.equal(sweep.reservedRecheckSlots(limit), 2)
+    const picked = await sweep.selectInvoiceDocumentCandidates(new Date(0), later, limit, false)
+    assert.equal(picked.length, limit)
+    assert.ok(picked.some((c) => c.orderId === stored.order.id), 'the due recheck runs although twelve new orders are waiting')
+    // And the unused reserved slots roll over to new fetches when there is no recheck due.
+    const none = await sweep.selectInvoiceDocumentCandidates(new Date(0), t0, limit, false)
+    assert.equal(none.length, limit, 'no recheck due: all slots go to new orders')
+    assert.ok(!none.some((c) => c.orderId === stored.order.id))
+  } finally {
+    await cleanup(db, stored.order.id)
+    for (const id of fresh) await cleanup(db, id)
+  }
+})
