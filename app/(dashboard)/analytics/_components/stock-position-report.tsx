@@ -1,3 +1,4 @@
+import { csvHrefWithNotices } from '@/lib/csv-links'
 import Link from 'next/link'
 import { Download } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -55,6 +56,8 @@ type StockPositionReportPageProps<Row> = {
   description: string
   reportKey: 'stock-on-hand' | 'stock-allocations' | 'negative-stock' | 'inventory-aging' | 'dead-stock' | 'reorder' | 'backorder' | 'component-shortage'
   exportBasePath?: string
+  /** The export route appends the report's notices after the data when asked (`?notices=1`). */
+  exportCarriesNotices?: boolean
   filters: StockPositionFilterValues
   filterOptions: StockPositionFilterOptions
   pageInfo: PageInfo
@@ -86,6 +89,7 @@ export function StockPositionReportPage<Row>({
   description,
   reportKey,
   exportBasePath = '/api/export/stock-position',
+  exportCarriesNotices = false,
   filters,
   filterOptions,
   pageInfo,
@@ -104,7 +108,8 @@ export function StockPositionReportPage<Row>({
   selectionColumn,
 }: StockPositionReportPageProps<Row>) {
   const params = currentParams(filters)
-  const csvHref = `${exportBasePath}?${appendParams(params, { type: reportKey })}`
+  const plainCsvHref = `${exportBasePath}?${appendParams(params, { type: reportKey })}`
+  const csvHref = exportCarriesNotices ? csvHrefWithNotices(plainCsvHref) : plainCsvHref
   const previousHref = `?${appendParams(params, { page: pageInfo.page - 1 })}`
   const nextHref = `?${appendParams(params, { page: pageInfo.page + 1 })}`
 

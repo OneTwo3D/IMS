@@ -77,6 +77,7 @@ export default async function BackorderPage({ searchParams }: { searchParams: Pr
       description="Sales demand that is not covered by committed shipments or current allocations, aggregated by SKU."
       reportKey="backorder"
       exportBasePath="/api/export/replenishment"
+      exportCarriesNotices
       filters={filtersForUi}
       filterOptions={filterOptions}
       pageInfo={report.pageInfo}

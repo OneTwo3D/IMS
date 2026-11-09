@@ -875,6 +875,9 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // existing partial-result/error plumbing — recordAttempt, activity
   // log, unmatched counts — all intact for the operator-facing report.
   let versionBumpedMidRun = false
+  // A chunked window is handled only if every candidate in it reached a completed outcome. Any failed SKU lookup, preflight page,
+  // cleared stale mapping or failed/rejected push entry sets this, and the window is reported as not handled (no `chunk`).
+  let windowFailed = false
 
   if (needsResolution.length > 0) {
     await options?.onProgress?.({ phase: 'resolving', processed: 0, synced: 0, total: needsResolution.length })
@@ -902,6 +905,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
 
     // Partial failures: record as errors, leave those SKUs out of matched/unmatched counting.
     const failedLookupSkus = new Set(lookupErrors.map((e) => e.sku))
+    if (lookupErrors.length > 0) windowFailed = true
     for (const err of lookupErrors) {
       result.errors.push(`lookup failure for SKU ${err.sku}: ${err.error}`)
     }
@@ -998,6 +1002,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     }
 
     // Record non-fatal preflight errors so operators can see them.
+    if (preflightErrors.length > 0) windowFailed = true
     for (const msg of preflightErrors) {
       result.errors.push(`preflight warning: ${msg}`)
     }
@@ -1023,6 +1028,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
             `WC product ${externalId} not found in preflight response (likely deleted)`,
           )
           if (invalidation.status === 'cleared') {
+            windowFailed = true
             result.skipped++
             result.errors.push(
               `Stale WC mapping for SKU ${expectedSku ?? ''} (IMS ${pid}, WC ${externalId}): ${invalidation.log.reason} — cleared for re-resolution`,
@@ -1068,6 +1074,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
           `preflight: WC id ${externalId} now has SKU "${actualSku}" (expected "${expectedSku}")`,
         )
         if (invalidation.status === 'cleared') {
+          windowFailed = true
           result.skipped++
           result.errors.push(
             `Stale WC mapping for SKU ${expectedSku} (IMS ${pid}, WC ${externalId}): ${invalidation.log.reason} — cleared for re-resolution`,
@@ -1219,7 +1226,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       ? 'errors during preflight/resolution'
       : 'no changed WooCommerce-matched products'
     result.message = `0 synced — ${reason}`
-    result.chunk = chunkOutcome()
+    if (!windowFailed) result.chunk = chunkOutcome()
     await recordAttempt()
     await logActivity({
       entityType: 'SYNC', action: 'stock_sync', tag: 'sync', level: 'WARNING',
@@ -1266,6 +1273,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     }
 
     if (batchOutcome.status === 'batch_error') {
+      windowFailed = true
       result.errors.push(`batch push ${i / WC_BATCH_SIZE + 1}: ${batchOutcome.error}`)
       continue
     }
@@ -1273,6 +1281,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     if (batchOutcome.outcome.successEntries.length > 0) result.pushed = true
     result.synced += batchOutcome.outcome.successEntries.length
     result.skipped += batchOutcome.outcome.skipped
+    if (batchOutcome.outcome.errors.length > 0) windowFailed = true
     result.errors.push(...batchOutcome.outcome.errors)
     await options?.onProgress?.({
       phase: 'pushing',
@@ -1321,6 +1330,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
           break
         }
         if (outcome.status === 'push_error') {
+          windowFailed = true
           result.errors.push(`variation batch push ${batch[0]?.parentWcId ?? 'unknown'}: ${outcome.error}`)
           processedVariantEntries += batch.length
           continue
@@ -1329,6 +1339,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         if (outcome.outcome.successEntries.length > 0) result.pushed = true
         result.synced += outcome.outcome.successEntries.length
         result.skipped += outcome.outcome.skipped
+        if (outcome.outcome.errors.length > 0) windowFailed = true
         result.errors.push(...outcome.outcome.errors)
 
         for (const invalidation of outcome.outcome.invalidations) {
@@ -1372,7 +1383,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     ? `${result.synced} synced, ${result.unmatched} unmatched in WooCommerce`
     : `${result.synced} synced`
   // A window cut short by a credentials rebind is not handled: the caller must retry it, not move on.
-  if (!versionBumpedMidRun) result.chunk = chunkOutcome()
+  if (!versionBumpedMidRun && !windowFailed) result.chunk = chunkOutcome()
 
   return result
 }

@@ -161,6 +161,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
       description="Demand-driven replenishment suggestions using sales velocity, supplier lead time, safety stock, available stock, and inbound open POs."
       reportKey="reorder"
       exportBasePath="/api/export/replenishment"
+      exportCarriesNotices
       filters={filtersForUi}
       filterOptions={filterOptions}
       pageInfo={report.pageInfo}

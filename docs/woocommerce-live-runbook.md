@@ -173,6 +173,11 @@ Use this only to validate the backup path, not as the primary success criterion.
    - drains queued stock retry jobs
    - force-pushes a current stock catch-up snapshot when the daily stock reconcile is due, one window of the catalogue at a time: a run that stops with `reconciliation_continues_next_run` has saved its cursor (`wc_stock_daily_reconcile_cursor`) and the next run carries on from it; the daily stamp is written only after the last window
 
+Limits of the windowed stock catch-up:
+
+- A window counts as done only when every product in it was looked up, verified and pushed. If any SKU lookup, preflight page or push entry in it fails (or a stale mapping is cleared), the cursor stays, no daily stamp is written, the next run retries the same window, and each such run writes a `stock_reconcile_window` WARNING to the activity log with the first errors. A product that keeps failing therefore holds the pass at its window until it is fixed (or the manual stock push is used); the log line is the signal.
+- The candidate list is read fresh for every window, in id order. A product that becomes eligible (new SKU, status change, first stock) with an id before the cursor is not picked up until the next full pass.
+
 Expected result:
 
 - backup reconciliation behaves as a safety net, not the main sync mechanism

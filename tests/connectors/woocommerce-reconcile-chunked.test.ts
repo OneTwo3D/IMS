@@ -33,7 +33,9 @@ type PushArgs = { forceAll?: boolean; chunk?: { afterId: string | null; limit: n
 const pushCalls: PushArgs[] = []
 let script: Array<Record<string, unknown>> = []
 
+const activities: string[] = []
 mock.module('@/lib/db', { namedExports: { db: fakeDb } })
+mock.module('@/lib/activity-log', { namedExports: { logActivity: async (e: { level?: string; action?: string }) => { activities.push(`${e.level}:${e.action}`) }, logActivityPersisted: async () => true } })
 mock.module('@/lib/connectors/woocommerce/sync/order-import', {
   namedExports: {
     isWcOrderWebhookPrimaryActive: async () => true,
@@ -62,6 +64,7 @@ function reset(script_: Array<Record<string, unknown>>) {
   upserts.length = 0
   deletes.length = 0
   pushCalls.length = 0
+  activities.length = 0
   script = script_
   settings.set('wc_stock_sync_enabled', 'true')
   settings.set('last_wc_order_reconcile_at', new Date().toISOString())
@@ -144,4 +147,24 @@ test('a held or shadowed window stops the pass without stamping and leaves the c
   assert.equal((results.stock as { reason?: string }).reason, 'outbound_write_held')
   assert.equal(settings.get(CURSOR_KEY), 'p-150')
   assert.ok(!upserts.includes(STAMP_KEY))
+})
+
+test('a first window that did not finish (no cursor yet, not a gate refusal) is not stamped either, and says so in the activity log', async () => {
+  const { runWcReconcile } = await import('@/lib/connectors/woocommerce/sync/reconcile')
+  reset([{ message: 'partial failure', errors: ['lookup failure for SKU X: boom'] }])
+  const results = await runWcReconcile()
+  assert.equal((results.stock as { reason?: string }).reason, 'reconciliation_window_incomplete')
+  assert.ok(!upserts.includes(STAMP_KEY), 'no stamp over a window with failed products')
+  assert.ok(!upserts.includes(CURSOR_KEY), 'no cursor advance')
+  assert.deepEqual(activities, ['WARNING:stock_reconcile_window'])
+})
+
+test('a later window with failed products holds the pass at that window: cursor stays, no stamp, a warning each run', async () => {
+  const { runWcReconcile } = await import('@/lib/connectors/woocommerce/sync/reconcile')
+  reset([done('p-150'), { errors: ['batch push 1: boom'] }])
+  const results = await runWcReconcile()
+  assert.equal((results.stock as { resumeAfter?: string }).resumeAfter, 'p-150')
+  assert.equal(settings.get(CURSOR_KEY), 'p-150')
+  assert.ok(!upserts.includes(STAMP_KEY))
+  assert.equal(activities.length, 1)
 })

@@ -1,3 +1,4 @@
+import { csvHrefWithNotices } from '@/lib/csv-links'
 import Link from 'next/link'
 import { Download } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -54,7 +55,7 @@ export function ManufacturingAnalyticsReportPage<Row>({
   showDateFilters = true,
 }: ManufacturingAnalyticsReportPageProps<Row>) {
   const params = currentParams(filters)
-  const csvHref = `/api/export/manufacturing-analytics?${appendParams(params, { report: reportKey })}`
+  const csvHref = csvHrefWithNotices(`/api/export/manufacturing-analytics?${appendParams(params, { report: reportKey })}`)
   const previousHref = `?${appendParams(params, { page: pageInfo.page - 1 })}`
   const nextHref = `?${appendParams(params, { page: pageInfo.page + 1 })}`
 

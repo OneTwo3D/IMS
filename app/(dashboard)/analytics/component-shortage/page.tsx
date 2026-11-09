@@ -78,6 +78,7 @@ export default async function ComponentShortagePage({ searchParams }: { searchPa
       description="BOM component shortfalls across draft and in-progress production orders, net of available stock and inbound open POs."
       reportKey="component-shortage"
       exportBasePath="/api/export/replenishment"
+      exportCarriesNotices
       filters={filtersForUi}
       filterOptions={filterOptions}
       pageInfo={report.pageInfo}

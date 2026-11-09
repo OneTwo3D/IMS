@@ -267,8 +267,8 @@ export type StockSyncResult = SyncResult & {
    */
   shadowed?: boolean
   /**
-   * Set only on a run given a `chunk` window that reached its end (not on a refusal, an outage or a mid-run abort): the window
-   * was handled, and `nextCursor` is the id to resume after, or null when the window was the last one.
+   * Set only on a run given a `chunk` window in which EVERY candidate reached a completed outcome (not on a refusal, an outage,
+   * a mid-run abort, or any failed SKU lookup, preflight page, cleared stale mapping or failed push entry): the window was handled, and `nextCursor` is the id to resume after, or null when the window was the last one.
    */
   chunk?: { nextCursor: string | null; totalCandidates: number }
   /**

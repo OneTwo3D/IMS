@@ -1,3 +1,4 @@
+import { logActivity } from '@/lib/activity-log'
 import { db } from '@/lib/db'
 import { isWcOrderWebhookPrimaryActive, retryHeldWcSalesInvoiceReleases, syncNewWcOrders } from './order-import'
 import { isWcProductWebhookPrimaryActive, syncAllWcProducts } from './product-sync'
@@ -139,14 +140,23 @@ export async function runWcReconcile(): Promise<Record<string, unknown>> {
             }
             return results
           }
-        } else if (cursor != null) {
-          // The window did not finish (an outage or a credentials rebind cut it short, or a gate refused it). The pass is
-          // unfinished: keep the cursor, leave the stamp, and retry this window on the next run.
+        } else if (cursor != null || stock.aborted !== true) {
+          // The window was not handled: an outage or a credentials rebind cut it short, or a SKU lookup, a preflight page or a
+          // push entry in it failed. Only a gate refusal on the first window (aborted, no cursor) falls through to the legacy
+          // stamp. The pass is unfinished: keep the cursor, leave the stamp, and retry this window on the next run. A product
+          // that keeps failing therefore holds the pass here, so every such run says so in the activity log instead of retrying
+          // silently; the manual push remains available.
+          await logActivity({
+            entityType: 'SYNC', action: 'stock_reconcile_window', tag: 'sync', level: 'WARNING',
+            description: `Daily stock reconcile window after ${cursor ?? 'the start'} is not complete (${stock.errors.length} error(s)); the pass is held at this window and no daily stamp is written`,
+            metadata: { resumeAfter: cursor, message: stock.message, errors: stock.errors.slice(0, 10) },
+          })
           results.stock = {
             queued,
             sync: stock,
             skipped: true,
             reason: 'reconciliation_window_incomplete',
+            errors: stock.errors.slice(0, 10),
             reconciliationDue: true,
             chunks,
             resumeAfter: cursor,
