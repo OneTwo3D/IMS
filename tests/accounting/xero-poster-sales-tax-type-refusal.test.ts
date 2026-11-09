@@ -19,12 +19,23 @@ for (const [module, names] of [
   mock.module(module, { namedExports: Object.fromEntries(names.map((name) => [name, record(name)])) })
 }
 
+// The processor reads the stored token's granted scopes (a database read) before the case runs. The unit tier has no database, so that
+// one read is doubled as "grant never recorded" (null, which fails OPEN in blockingScopeFor); everything else in the module is real.
+let authDoubled = false
+async function doubleScopeRead() {
+  if (authDoubled) return
+  authDoubled = true
+  const actual = await import('@/lib/connectors/xero/auth') // loads without a database; only the one read needs doubling
+  mock.module('@/lib/connectors/xero/auth', { namedExports: { ...actual, getGrantedScopes: async () => null } })
+}
+
 let fenced = 0
 const lease = { fenceBeforeRemoteWrite: async () => { fenced += 1; throw new Error('reached the pre-write fence') } } as never
 
 async function run(type: string, payload: Record<string, unknown>) {
   sent.length = 0
   fenced = 0
+  await doubleScopeRead()
   const { processClaimedEntry } = await import('@/lib/connectors/xero/sync-processor')
   try {
     return { result: await processClaimedEntry('entry-1', type as never, 'SalesOrder', 'so-1', { _postingMode: 'submitted', ...payload } as never, lease, { attemptRevision: 1 } as never), threw: null as string | null }
