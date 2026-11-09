@@ -2,7 +2,7 @@ import { db } from '@/lib/db'
 import { EmailRecipientErasedError } from '@/lib/domain/erasure/email-recipient'
 import { assertNoStoreCreditInvoiceDocument } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import { renderEmailHtml } from '@/lib/email-template'
-import { loadInvoicePdf } from '@/lib/invoice-pdf'
+import { loadCurrentInvoicePdf } from '@/lib/domain/invoice-documents/current-document'
 import { formatCountryDisplay } from '@/lib/countries'
 import {
   createPdfDocument,
@@ -331,7 +331,7 @@ async function buildInvoiceEmail(orderId: string, options?: { accountingPdf?: bo
   const ref = so.invoiceNumber ?? so.orderNumber ?? so.externalOrderNumber ?? orderId.slice(0, 8)
   const { money } = await getCurrencyFormat(so.currency)
   const pdfBuffer = options?.accountingPdf
-    ? await loadInvoicePdf(orderId)
+    ? await loadCurrentInvoicePdf(orderId)
     : await generateInvoicePdf(so, branding)
   if (!pdfBuffer) {
     throw new Error(options?.accountingPdf ? 'Invoice PDF file not found on disk' : 'Failed to generate invoice PDF')

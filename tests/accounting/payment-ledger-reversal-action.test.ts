@@ -30,6 +30,11 @@ type SyncRow = {
   /** o3d-f709: the ledger-standing columns; absent in the double reads as null, as an untouched row does. */
   settlementBasis?: string | null
   abandonedBeforeRemoteCall?: boolean | null
+  /** Claim count; 0 = never claimed. Defaulted by `syncRow`. */
+  attemptRevision?: number
+  /** The canonical never-attempted record; `syncRow` defaults to a row created in custody that never attempted. */
+  remoteAttemptedAt?: Date | null
+  attemptStampingCustodyAt?: Date | null
 }
 
 /**
@@ -157,7 +162,17 @@ function makeClient() {
       },
       updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
         const hits = state.syncRows.filter((r) => matches(r as unknown as Record<string, unknown>, where))
-        for (const hit of hits) Object.assign(hit, data)
+        for (const hit of hits) {
+          for (const [key, value] of Object.entries(data)) {
+            // Prisma's atomic `{ increment: n }`, which the reversal uses to advance the attempt fence.
+            if (value !== null && typeof value === 'object' && 'increment' in (value as object)) {
+              const record = hit as unknown as Record<string, number>
+              record[key] = (record[key] ?? 0) + Number((value as { increment: number }).increment)
+            } else {
+              (hit as unknown as Record<string, unknown>)[key] = value
+            }
+          }
+        }
         return { count: hits.length }
       },
     },
@@ -320,6 +335,9 @@ function syncRow(over: Partial<SyncRow> = {}): SyncRow {
     externalTransactionId: 'PAY-9',
     errorMessage: null,
     payload: { paymentId: 'pay-1' },
+    attemptRevision: 0,
+    remoteAttemptedAt: null,
+    attemptStampingCustodyAt: new Date('2026-01-01T00:00:00Z'),
     ...over,
   }
 }
@@ -419,14 +437,24 @@ test('a FAILED registration is READ at all — the query, not just the classific
   assert.ok(readWithStatus, 'the registration query must ask for FAILED rows, not only rows with a document id')
 })
 
-test('a CANCELLED registration with no document id and no operator assertion still lets the receipt go', async () => {
-  // The boundary of the change. widening FAILED must not sweep up the rows IMS itself retired and make
-  // an ordinary correction impossible (the documented divergence from mayHaveReachedLedger, o3d-7sn5).
+test('a CANCELLED registration carrying the pre-call stamp still lets the receipt go; the same row UNSTAMPED refuses', async () => {
+  // The boundary of the change. Widening FAILED must not sweep up the rows IMS retired WITH proof. Rows retired
+  // without the stamp (before the writers stamped it) prove nothing and now read UNDECIDED.
   const { deletePayment } = await loadActions()
-  state.syncRows = [syncRow({ status: 'CANCELLED', externalTransactionId: null })]
+  state.syncRows = [syncRow({ status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true })]
   const result = await deletePayment('pay-1', 'order-1')
   assert.equal(result.success, true)
   assert.ok(!paymentStillThere())
+})
+
+test('the identical CANCELLED registration WITHOUT the pre-call stamp refuses the delete (isolating arm)', async () => {
+  const { deletePayment } = await loadActions()
+  // `abandonedBeforeRemoteCall: null` is what an untouched column holds; the double reads an absent property differently.
+  state.syncRows = [syncRow({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: null })]
+  const refused = await deletePayment('pay-1', 'order-1')
+  assert.equal(refused.success, false)
+  assert.equal(refused.code, 'registration_attempt_undecided')
+  assert.ok(paymentStillThere())
 })
 
 test('[o3d-f709 M15, C1] a CANCELLED registration an operator settled NOT_POSTED REFUSES the delete - it is read, and it is UNDECIDED', async () => {
@@ -453,7 +481,89 @@ test('a receipt with only a queued registration deletes, retiring it in the SAME
   assert.ok(!paymentStillThere())
   assert.equal(row().status, 'CANCELLED')
   assert.match(row().errorMessage ?? '', /Retired: the local payment it registered was deleted/)
+  assert.equal(row().abandonedBeforeRemoteCall, true, 'the retirement records the pre-call proof in the same UPDATE')
   assert.equal(state.order.paidAt, null, 'the order is no longer fully paid')
+})
+
+test('a LEGACY queued registration (revision 0 but no record that no attempt was made, e.g. a revived attempted row) is not stamped or retired', async () => {
+  const { deletePayment } = await loadActions()
+  state.syncRows = [syncRow({ status: 'PENDING', externalTransactionId: null, attemptRevision: 0, attemptStampingCustodyAt: null })]
+  const result = await deletePayment('pay-1', 'order-1')
+  assert.equal(result.success, false)
+  assert.equal(result.code, 'registration_attempt_undecided')
+  assert.ok(paymentStillThere())
+  assert.equal(row().status, 'PENDING')
+  assert.notEqual(row().abandonedBeforeRemoteCall, true)
+  // and an attempted row that was revived to PENDING at revision 0 (attempt stamp present) is no different
+  state.syncRows = [syncRow({ status: 'PENDING', externalTransactionId: null, attemptRevision: 0, remoteAttemptedAt: new Date('2026-02-01T00:00:00Z') })]
+  const revived = await deletePayment('pay-1', 'order-1')
+  assert.equal(revived.code, 'registration_attempt_undecided')
+  assert.notEqual(row().abandonedBeforeRemoteCall, true)
+})
+
+test('the refusal wording is chosen from status and basis: unstamped cancellation and requeued attempt do not claim FAILED or an operator assertion', async () => {
+  const { deletePayment } = await loadActions()
+  state.syncRows = [syncRow({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: null })]
+  const cancelled = await deletePayment('pay-1', 'order-1')
+  assert.doesNotMatch(cancelled.error ?? '', /recorded as FAILED/)
+  assert.doesNotMatch(cancelled.error ?? '', /operator settled/)
+  assert.match(cancelled.error ?? '', /retired \(cancelled\) without any record/)
+  // A retired entry is not retried by anything: the text must not send the operator to a retry that does not exist.
+  assert.doesNotMatch(cancelled.error ?? '', /retry the registration under Sync/)
+  assert.match(cancelled.error ?? '', /a retired entry cannot be retried/)
+  state.syncRows = [syncRow({ status: 'PENDING', externalTransactionId: null, attemptRevision: 3 })]
+  const requeued = await deletePayment('pay-1', 'order-1')
+  assert.doesNotMatch(requeued.error ?? '', /recorded as FAILED/)
+  assert.doesNotMatch(requeued.error ?? '', /operator settled/)
+  assert.match(requeued.error ?? '', /still queued/)
+  assert.match(requeued.error ?? '', /retry the registration under Sync/)
+})
+
+test('a claim + retry between the Xero check and the commit aborts a VERIFIED reversal and keeps the receipt', async () => {
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-1', status: 'SYNCED', externalTransactionId: 'PAY-9', attemptRevision: 1 })]
+  state.xeroPayments.set('PAY-9', 'DELETED')
+  // Same status and same id, newer attempt: only the revision tells them apart.
+  state.mutateUnderLock = () => { row('log-1').attemptRevision = 2 }
+  const result = await reverseLedgerPayment('pay-1', 'order-1')
+  assert.equal((result as { code?: string }).code, 'hold_moved')
+  assert.ok(paymentStillThere())
+  assert.equal(row('log-1').status, 'SYNCED')
+  assert.equal(row('log-1').attemptRevision, 1, 'the transaction rolled back, taking the simulated claim with it, and wrote no decision')
+})
+
+test('a claim + retry between the Xero check and the commit aborts an ASSERTED reversal and keeps the receipt', async () => {
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null, attemptRevision: 1 })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.mutateUnderLock = () => { row('log-7').attemptRevision = 2 }
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'hold_moved')
+  assert.ok(paymentStillThere())
+  assert.equal(row('log-7').status, 'FAILED')
+})
+
+test('a successful reversal records its decision by advancing the attempt revision', async () => {
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-1', status: 'SYNCED', externalTransactionId: 'PAY-9', attemptRevision: 1 })]
+  state.xeroPayments.set('PAY-9', 'DELETED')
+  const result = await reverseLedgerPayment('pay-1', 'order-1')
+  assert.equal(result.success, true)
+  assert.equal(row('log-1').status, 'CANCELLED')
+  assert.equal(row('log-1').attemptRevision, 2)
+})
+
+test('a queued registration that was CLAIMED once (attemptRevision > 0) is not retired: the delete refuses and nothing is stamped', async () => {
+  // PENDING again after a failed attempt: the remote call may have posted. Stamping it would forge the proof.
+  const { deletePayment } = await loadActions()
+  state.syncRows = [syncRow({ status: 'PENDING', externalTransactionId: null, attemptRevision: 2 })]
+  const result = await deletePayment('pay-1', 'order-1')
+  assert.equal(result.success, false)
+  assert.equal(result.code, 'registration_attempt_undecided')
+  assert.match(result.error ?? '', /still queued/)
+  assert.ok(paymentStillThere())
+  assert.equal(row().status, 'PENDING')
+  assert.notEqual(row().abandonedBeforeRemoteCall, true)
 })
 
 test('a registration claimed by a worker mid-delete ABORTS the delete instead of stranding it', async () => {
@@ -469,6 +579,41 @@ test('a registration claimed by a worker mid-delete ABORTS the delete instead of
   // Deliberately no assertion on the row's own status here: the worker's claim is simulated INSIDE
   // this transaction, so the double's rollback undoes it too. What matters — and what the sibling
   // test below pins — is that nothing this action wrote survives.
+})
+
+for (const [label, mutate] of [
+  ['its attempt revision moves (claimed and put back, still PENDING)', (r: SyncRow) => { r.attemptRevision = 1 }],
+  ['it acquires a document id (still PENDING)', (r: SyncRow) => { r.externalTransactionId = 'PAY-LATE' }],
+  ['it records an attempt stamp (still PENDING, revision 0)', (r: SyncRow) => { r.remoteAttemptedAt = new Date('2026-03-01T00:00:00Z') }],
+  ['it loses its custody record (still PENDING, revision 0)', (r: SyncRow) => { r.attemptStampingCustodyAt = null }],
+] as const) {
+  test(`the retirement's compare-and-swap names every fact the stamp rests on: ${label} -> the delete aborts`, async () => {
+    const { deletePayment } = await loadActions()
+    state.syncRows = [syncRow({ status: 'PENDING', externalTransactionId: null })]
+    state.mutateAfterRegistrationRead = () => { mutate(state.syncRows[0]) }
+    const result = await deletePayment('pay-1', 'order-1')
+    assert.equal(result.success, false)
+    assert.equal(result.code, 'registration_in_flight')
+    assert.ok(paymentStillThere())
+  })
+}
+
+test('an ASSERTED reversal records its decision by advancing the attempt revision', async () => {
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null, attemptRevision: 1 })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal(result.success, true)
+  assert.equal(row('log-7').status, 'CANCELLED')
+  assert.equal(row('log-7').attemptRevision, 2)
+})
+
+test('an operator-asserted NOT_POSTED refusal does not carry the unstamped-cancellation paragraph', async () => {
+  const { deletePayment } = await loadActions()
+  state.syncRows = [syncRow({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' })]
+  const result = await deletePayment('pay-1', 'order-1')
+  assert.match(result.error ?? '', /operator settled/)
+  assert.doesNotMatch(result.error ?? '', /retired \(cancelled\) without any record/)
 })
 
 test('a registration already claimed before the read refuses on the ledger hold instead', async () => {

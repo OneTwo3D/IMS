@@ -2060,6 +2060,7 @@ settles expire normally.
 | `/api/cron/accounting-payment-poll` | Every 15 min | Detect paid invoices and bills in the active accounting connector |
 | `/api/cron/accounting-payment-reconcile` | Daily (03:00) | Backlog sweep: check every locally-linked invoice/bill against its current Xero status by id (report-only unless `xero_payment_reconcile_apply`) |
 | `/api/cron/accounting-fx-revaluation` | Daily | Periodic unrealised FX revaluation of open AR/AP balances |
+| `/api/cron/xero-chart-sync` | Daily | Refresh the stored Xero chart of accounts (read-only) before the balance snapshot |
 | `/api/cron/account-balance-snapshot` | Daily | Snapshot Xero account balances for period reporting |
 | `/api/cron/xero-tax-rate-drift` | Hourly | Read the full Xero tax-rate list into the tax-rate master store (rows, header and read-sync stamp in one transaction) and record IMS-vs-Xero tax-rate drift |
 

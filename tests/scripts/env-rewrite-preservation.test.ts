@@ -940,6 +940,7 @@ const NOT_CARRIED: Record<string, string> = {
   ENCRYPTION_KEY: 'secret',
   NEXTAUTH_SECRET: 'secret (legacy name)',
   INTEGRATION_CONNECTION_FINGERPRINT_KEY: 'secret',
+  INVOICE_DOCUMENT_MAX_BYTES: 'optional size ceiling for a fetched invoice PDF (default 10 MB); an operator tuning, set in the environment when wanted',
   XERO_AUDIT_CLIENT_ID: 'credential of a one-off audit script',
   XERO_AUDIT_CLIENT_SECRET: 'secret of a one-off audit script',
   // database connection settings: never carried (admin-credential rule)

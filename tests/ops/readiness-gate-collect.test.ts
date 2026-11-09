@@ -128,7 +128,7 @@ test('read-sync liveness is optional until the script exists, then required and 
   const absent = deps()
   assert.equal((await collectGateResults(OPTIONS, absent)).results['read-sync-liveness']!.kind, 'not-available')
   const entry = (stream: string, over: object = {}) => ({ stream, instance: null, state: 'fresh', lastSuccessAt: '2026-10-08T11:00:00.000Z', ageMs: 3600000, maxAgeMs: 259200000, futureTimestamp: false, ...over })
-  const stdout = JSON.stringify({ schemaVersion: 1, generatedAt: NOW.toISOString(), counts: { fresh: 6, stale: 0, never: 0, off: 0 }, entries: REQUIRED_READ_SYNC_STREAMS.map((name) => entry(name)), scheduler: { examined: true, unreadable: null, blockProblem: null, unscheduled: [], disabled: [] } })
+  const stdout = JSON.stringify({ schemaVersion: 1, generatedAt: NOW.toISOString(), counts: { fresh: 7, stale: 0, never: 0, off: 0 }, entries: REQUIRED_READ_SYNC_STREAMS.map((name) => entry(name)), scheduler: { examined: true, unreadable: null, blockProblem: null, unscheduled: [], disabled: [] } })
   const present = deps({}, { [READ_SYNC_STATUS_SCRIPT]: 'tsx scripts/read-sync-status.ts' })
   present.runScript = async (spec) => { present.spawned.push(spec); return { exitCode: 0, stdout: spec.script === READ_SYNC_STATUS_SCRIPT ? stdout : '', stderr: '', timedOut: false } }
   assert.equal((await collectGateResults(OPTIONS, present)).results['read-sync-liveness']!.kind, 'pass')

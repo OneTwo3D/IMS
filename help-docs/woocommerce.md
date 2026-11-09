@@ -554,6 +554,8 @@ Refunds created in WooCommerce are automatically synced to One Two Inventory:
 
 Refunds are deduplicated by WooCommerce refund ID, so they are safe to re-process.
 
+**WooCommerce restocks first.** WooCommerce raises its own stock for a refunded line inside the refund request, before IMS hears of it. IMS is the stock master, so once the `order.updated` delivery has applied a refund, IMS force-pushes its own absolute stock level for the refunded products (reason `IMS_CHANGE`, `force`), through the normal stock job: behind the producer seam and the outbound hold, so it is a recorded shadow while `woocommerce.stock` is not IMS's to write. It follows the refund sweep, so the level already reflects what the refund did in IMS; with refund-returns-in-transit on, the returned units are not back yet and WooCommerce is lowered to IMS's level until they arrive. The push cannot undo what WooCommerce already did at the moment of the refund (a flip to in-stock and any back-in-stock mail); only a store-side change (not restocking refunded items) prevents that. Backstops: the `product.updated` webhook correction and the stock reconcile. The reservation-release backstop pushes the released unshipped units the same way.
+
 **All of them, not the first ten.** WooCommerce returns refunds ten at a time unless asked for more, so an
 order with many separate refunds used to sync only its ten most recent. Every page is now read. If a page
 cannot be read, the sync keeps what it got and logs `wc_refund_read_incomplete` (WARNING) naming the order

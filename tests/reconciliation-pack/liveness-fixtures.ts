@@ -35,6 +35,7 @@ export function goodReport(overrides: { entries?: ReadSyncEntry[]; scheduler?: P
     freshEntry('mintsoft-order-status'),
     freshEntry('xero-balance-snapshots'),
     freshEntry('xero-tax-rates'),
+    freshEntry('xero-chart-of-accounts'),
   ]
   return recount({ schemaVersion: 1, generatedAt: GENERATED_AT, entries, counts: { fresh: 0, stale: 0, never: 0, off: 0 }, scheduler: { ...cleanScheduler(), ...overrides.scheduler } })
 }

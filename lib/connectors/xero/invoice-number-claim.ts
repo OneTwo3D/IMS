@@ -125,6 +125,10 @@ type XeroInvoiceNumberLookupResponse = {
     Status?: unknown
     Total?: unknown
     Contact?: { Name?: unknown }
+    Reference?: unknown
+    CurrencyCode?: unknown
+    DateString?: unknown
+    UpdatedDateUTC?: unknown
   }>
   /** Xero returns this alongside a paged request. Used only to fail closed, never to widen. */
   pagination?: { pageCount?: unknown; itemCount?: unknown }
@@ -137,7 +141,7 @@ type XeroInvoiceNumberLookupResponse = {
 const LIST_SEPARATOR = ','
 
 type LookupDeps = {
-  get: <T>(path: string) => Promise<{ ok: boolean; status: number; data?: T; error?: string; tenantId?: string }>
+  get: <T>(path: string) => Promise<{ ok: boolean; status: number; data?: T; error?: string; tenantId?: string; connectionGeneration?: string | null }>
 }
 
 function asString(value: unknown): string | undefined {
@@ -179,7 +183,7 @@ export async function lookupXeroInvoiceNumberClaim(
     }
   }
 
-  let res: { ok: boolean; status: number; data?: XeroInvoiceNumberLookupResponse; error?: string; tenantId?: string }
+  let res: { ok: boolean; status: number; data?: XeroInvoiceNumberLookupResponse; error?: string; tenantId?: string; connectionGeneration?: string | null }
   try {
     res = await deps.get<XeroInvoiceNumberLookupResponse>(
       `Invoices?InvoiceNumbers=${encodeURIComponent(wanted)}&page=1&pageSize=${PAGE_SIZE}`,
@@ -191,7 +195,7 @@ export async function lookupXeroInvoiceNumberClaim(
   }
 
   if (!res.ok) {
-    return { ok: false, error: res.error ?? `invoice-number lookup failed with HTTP ${res.status}` }
+    return { ok: false, error: res.error ?? `invoice-number lookup failed with HTTP ${res.status}`, httpStatus: res.status }
   }
   if (!res.data || !Array.isArray(res.data.Invoices)) {
     return { ok: false, error: 'the invoice-number lookup returned no Invoices array' }
@@ -256,8 +260,17 @@ export async function lookupXeroInvoiceNumberClaim(
     const contactName = asString(inv?.Contact?.Name)
     if (contactName) claim.contactName = contactName
     if (typeof inv?.Total === 'number' && Number.isFinite(inv.Total)) claim.total = inv.Total
+    const reference = asString(inv?.Reference)
+    if (reference) claim.reference = reference
+    const currencyCode = asString(inv?.CurrencyCode)
+    if (currencyCode) claim.currencyCode = currencyCode.toUpperCase()
+    const dateString = asString(inv?.DateString)
+    if (dateString) claim.dateString = dateString
+    if (type) claim.type = type.toUpperCase()
+    const updatedDateUtc = asString(inv?.UpdatedDateUTC)
+    if (updatedDateUtc) claim.updatedDateUtc = updatedDateUtc
     claims.push(claim)
   }
 
-  return { ok: true, claims, tenantId }
+  return { ok: true, claims, tenantId, ...(res.connectionGeneration !== undefined ? { connectionGeneration: res.connectionGeneration } : {}) }
 }

@@ -427,7 +427,7 @@ For multi-instance deployments (multiple application replicas behind a load bala
 
 ### Invariant check
 
-The system runs a periodic invariant check that scans inventory, accounting, and sales data for known drift conditions (negative stock, orphan cost layers, refund-status mismatches, etc.). Critical findings trigger an admin notification.
+The system runs a periodic invariant check that scans inventory, accounting, and sales data for known drift conditions (negative stock, orphan cost layers, refund-status mismatches, etc.). Critical findings trigger an admin notification, and so do a few actionable warnings (unlayered stock, goods stranded in transit, failed accounting postings, refunds not yet mirrored in the ledger), but only when one newly appears or its count rises.
 
 You can also run the check manually:
 

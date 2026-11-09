@@ -197,7 +197,7 @@ export function packPass(id: PackItemId): ItemInput {
   return { id, outcome: 'pass', reasons: [], proof: { kind: 'proven-empty', source: 'snapshot-run-row-present' }, sources: [...getPackItem(id).sources] }
 }
 const PACK_STAMP = '2026-10-07T03:00:00.000Z'
-export const packStreams = (): StreamBracket[] => (['woocommerce-order-sweep', 'mintsoft-stock-sync', 'mintsoft-dispatch-poll', 'mintsoft-order-status', 'xero-balance-snapshots', 'xero-tax-rates'] as const).map((stream) => ({ stream, start: PACK_STAMP, end: PACK_STAMP }))
+export const packStreams = (): StreamBracket[] => (['woocommerce-order-sweep', 'mintsoft-stock-sync', 'mintsoft-dispatch-poll', 'mintsoft-order-status', 'xero-balance-snapshots', 'xero-tax-rates', 'xero-chart-of-accounts'] as const).map((stream) => ({ stream, start: PACK_STAMP, end: PACK_STAMP }))
 
 /**
  * A pack report record as the publisher would have written it (built by the real builder), for the installation APPLY_SYSTEM_ID, one hour

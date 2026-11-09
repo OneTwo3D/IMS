@@ -141,8 +141,16 @@ export type LedgerInvoiceClaim = {
   status: string
   /** Whose invoice it is, when the ledger says. Message material only — never part of the rule. */
   contactName?: string
-  /** The document total, when the ledger says. Message material only. */
+  /** The document total, when the ledger says. Message material only in the ownership rule. */
   total?: number
+  /** The ledger's Reference text, its currency and its date, when it says. Read by the invoice-document fetch to tie the document to ONE order; the ownership rule never reads them. */
+  reference?: string
+  currencyCode?: string
+  dateString?: string
+  /** The ledger's last-modified stamp for the document. */
+  updatedDateUtc?: string
+  /** The ledger's document Type (ACCREC, ACCPAY) when it stated one. The ownership fence treats a missing Type as a claim; the invoice-document fetch REQUIRES an explicit ACCREC. */
+  type?: string
 }
 
 /**
@@ -175,6 +183,8 @@ export type InvoiceNumberLookup =
        * closed instead of returning claims nobody can attribute.
        */
       tenantId: string
+      /** The connection generation of the same request (null when the stored connection predates it). Lets a later read of the same document be bound to this connection. */
+      connectionGeneration?: string | null
     }
   | {
       ok: false
@@ -186,6 +196,8 @@ export type InvoiceNumberLookup =
        * that, so the refusal it produces is permanent and names a different remedy.
        */
       unaskable?: boolean
+      /** The HTTP status of the refusal, when the ledger gave one: 429 and the like tell a sweep to stop. */
+      httpStatus?: number
     }
 
 export type InvoiceNumberRefusalCode =

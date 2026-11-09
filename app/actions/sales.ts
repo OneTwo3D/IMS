@@ -53,6 +53,8 @@ import {
   type PaymentDeleteRefusalCode,
   type PaymentRegistrationRow,
 } from '@/lib/domain/accounting/payment-ledger-hold'
+import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
+import { ATTEMPT_PROVEN_NEVER_MADE_WHERE } from '@/lib/domain/accounting/money-attempt-provenance'
 import { UNPROVEN_CANCELLED_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import {
   queueAccountingSync,
@@ -4200,14 +4202,38 @@ async function readPaymentRegistrations(
     // so omitting it here is a compile error rather than a silently permissive delete.
     select: {
       id: true, connector: true, status: true, externalTransactionId: true, settlementBasis: true,
-      abandonedBeforeRemoteCall: true, payload: true,
+      abandonedBeforeRemoteCall: true, attemptRevision: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true, payload: true,
     },
   })
   return rows
     .filter((row) => payloadPaymentId(row.payload) === paymentId)
-    .map(({ id, connector, status, externalTransactionId, settlementBasis, abandonedBeforeRemoteCall }) => (
-      { id, connector, status, externalTransactionId, settlementBasis, abandonedBeforeRemoteCall }
+    .map(({ id, connector, status, externalTransactionId, settlementBasis, abandonedBeforeRemoteCall, attemptRevision, remoteAttemptedAt, attemptStampingCustodyAt }) => (
+      { id, connector, status, externalTransactionId, settlementBasis, abandonedBeforeRemoteCall, attemptRevision, remoteAttemptedAt, attemptStampingCustodyAt }
     ))
+}
+
+/**
+ * RETIRE QUEUED PAYMENT REGISTRATIONS THAT WERE NEVER SENT, and record the proof in the same UPDATE.
+ *
+ * The compare-and-swap names every fact the pre-call stamp rests on: PENDING (queued, not claimed or finished),
+ * attemptRevision 0 (a claim mints revision >= 1, so nobody ever held it), no document id. A row that fails any of
+ * them does not match, the count falls short and the caller aborts the whole transaction. `ledgerStanding` then
+ * reads what this writes PROVEN_NOT_POSTED (truth-table row 8) instead of UNKNOWN, which is what lets
+ * `registrationLedgerStanding` agree with it. The sibling writers that stamp are the orphan sweep, the BILL_PAYMENT
+ * supersession and the sale-cancel sweep.
+ */
+async function retireUnsentRegistrations(tx: Prisma.TransactionClient, ids: readonly string[]): Promise<{ count: number }> {
+  return tx.accountingSyncLog.updateMany({
+    where: {
+      id: { in: [...ids] },
+      status: { in: [...RETIRABLE_REGISTRATION_STATUSES] },
+      attemptRevision: UNCLAIMED_ATTEMPT_REVISION,
+      externalTransactionId: null,
+      // Revision 0 alone is not proof (legacy rows, revivals): the canonical never-attempted record as well.
+      ...ATTEMPT_PROVEN_NEVER_MADE_WHERE,
+    },
+    data: { status: 'CANCELLED', errorMessage: 'Retired: the local payment it registered was deleted.', abandonedBeforeRemoteCall: true },
+  })
 }
 
 /**
@@ -4329,10 +4355,7 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
           // CANCELLED rather than deleted, because that is the retirement the processor already
           // understands — it re-reads the live status after claiming and treats CANCELLED as an
           // intentional no-op — and it leaves the audit trail intact.
-          const retired = await tx.accountingSyncLog.updateMany({
-            where: { id: { in: retirable.map((row) => row.id) }, status: { in: [...RETIRABLE_REGISTRATION_STATUSES] } },
-            data: { status: 'CANCELLED', errorMessage: 'Retired: the local payment it registered was deleted.' },
-          })
+          const retired = await retireUnsentRegistrations(tx, retirable.map((row) => row.id))
           // A row that did NOT transition was claimed by a worker between the read and this write, so
           // it may be posting right now. Abort — the whole transaction rolls back and the receipt
           // stays. This is the window the old post-transaction retirement could only report on.
@@ -4770,8 +4793,11 @@ export async function reverseLedgerPayment(
             // generated Prisma enums; it can only ever hold a value read off this same column.
             status: row.status as Prisma.AccountingSyncLogWhereInput['status'],
             externalTransactionId: row.externalTransactionId,
+            // THE ATTEMPT THAT WAS VERIFIED. A claim and retry while Xero was being asked moves the revision, and a
+            // verification of the old attempt must not be written onto the new one.
+            attemptRevision: row.attemptRevision,
           },
-          data: buildVerifiedReversalData(note),
+          data: { ...buildVerifiedReversalData(note), attemptRevision: { increment: 1 } },
         })
         // THROWN, so any row retired earlier in this loop rolls back with it. A `return` would commit
         // a partial retirement while reporting that nothing changed.
@@ -4788,19 +4814,20 @@ export async function reverseLedgerPayment(
             id: row.id,
             status: row.status as Prisma.AccountingSyncLogWhereInput['status'],
             externalTransactionId: null,
+            attemptRevision: row.attemptRevision,
           },
-          data: buildAssertedReversalData(
-            reference,
-            assertedReversalNote(reference, orderForReference.accountingInvoiceId ?? '', now),
-          ),
+          data: {
+            ...buildAssertedReversalData(
+              reference,
+              assertedReversalNote(reference, orderForReference.accountingInvoiceId ?? '', now),
+            ),
+            attemptRevision: { increment: 1 },
+          },
         })
         if (decided.count !== 1) throw new PaymentTransactionRefusal(HOLD_MOVED_REFUSAL.code, HOLD_MOVED_REFUSAL.message)
       }
       if (retirable.length > 0) {
-        const retired = await tx.accountingSyncLog.updateMany({
-          where: { id: { in: retirable.map((row) => row.id) }, status: { in: [...RETIRABLE_REGISTRATION_STATUSES] } },
-          data: { status: 'CANCELLED', errorMessage: 'Retired: the local payment it registered was deleted.' },
-        })
+        const retired = await retireUnsentRegistrations(tx, retirable.map((row) => row.id))
         if (retired.count !== retirable.length) {
           // A queued sibling registration was claimed while this was being recorded. Reported as
           // hold_moved rather than as a delete refusal: from here the remedy is the same — reload and

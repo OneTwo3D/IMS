@@ -22,6 +22,16 @@ registerCronJobs([
     defaultEnabled: true,
   },
   {
+    slug: 'xero-chart-sync',
+    settingKey: 'xero_chart_sync',
+    module: 'accounting',
+    moduleLabel: 'Accounting',
+    label: 'Xero Chart of Accounts Refresh',
+    description: 'Reads the Xero chart of accounts into the local account list ahead of the balance-snapshot pull. Read-only against Xero.',
+    defaultSchedule: '30 0 * * *',
+    defaultEnabled: true,
+  },
+  {
     slug: 'accounting-daily-batch',
     settingKey: 'xero_daily_batch',
     module: 'accounting',

@@ -49,7 +49,10 @@ export function parseManufacturingCostLines(
     }
   }
 
-  const fxRate = fxRateToBase
+  // CONVENTION (fx_rates, owner ruling 2026-11-06): the rate is FOREIGN units per ONE base unit, so
+  // base = foreign / rate, exactly as purchasing converts. It was multiplied here, which only agreed
+  // with the convention at rate 1.
+  const fxRate = toDecimal(fxRateToBase)
   const parsed: ParsedManufacturingCostLine[] = []
 
   for (const [idx, line] of lines.entries()) {
@@ -57,7 +60,7 @@ export function parseManufacturingCostLines(
     if (description.length === 0 || !Number.isFinite(line.amountForeign)) continue
 
     const amountForeign = toDecimal(line.amountForeign)
-    const amountBase = amountForeign.mul(fxRate)
+    const amountBase = amountForeign.div(fxRate)
     if (amountForeign.lt(NEGATIVE_DUST_TOLERANCE.neg()) || amountBase.lt(NEGATIVE_DUST_TOLERANCE.neg())) {
       return {
         success: false,

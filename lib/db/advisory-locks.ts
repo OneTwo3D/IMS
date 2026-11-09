@@ -171,6 +171,16 @@ export const RECONCILIATION_PACK_SCHEDULE_SETTINGS_LOCK_KEY = 918_274_302
 export const WOO_TAX_RATE_WRITE_LOCK_KEY = 918_274_501
 
 /**
+ * The scheduled invariant check's WARNING-NOTIFICATION BASELINE fence (transaction-scoped, `pg_advisory_xact_lock`).
+ *
+ * Held for the one short transaction in which a run reads the stored baseline of named-warning counts, decides what is
+ * news, writes the new baseline and inserts the admin notifications. Two overlapping runs (a slow run plus the next tick,
+ * or a manual trigger) therefore take that step one after the other, and the older one finds the newer one's baseline and
+ * stands down. Its own domain, shared with nothing.
+ */
+export const INVARIANT_WARNING_BASELINE_LOCK_KEY = 918_274_601
+
+/**
  * Every single-bigint domain above, for the uniqueness test. A new lock MUST be
  * declared here — the test fails on any module that writes its own key literal.
  */
@@ -185,6 +195,7 @@ export const SINGLE_KEY_ADVISORY_LOCKS = {
   RECONCILIATION_PACK_SCHEDULE_SETTINGS_LOCK_KEY,
   FX_TABLE_LOCK_KEY,
   WOO_TAX_RATE_WRITE_LOCK_KEY,
+  INVARIANT_WARNING_BASELINE_LOCK_KEY,
 } as const
 
 /**
@@ -336,6 +347,27 @@ export const WC_ERASURE_SWEEP_LEASE_NAMESPACE = 411_220_877
 export const WC_CUSTOMER_KEY_LOCK_NAMESPACE = 411_220_878
 
 /**
+ * THE INVOICE-DOCUMENT RESET LOCK (two-int, key 0).
+ *
+ * Stored customer invoice documents are a retained record, and a database reset is a sequence of separate deletes that must not meet one that
+ * appears halfway. The reset takes this lock EXCLUSIVE (session-scoped, pinned connection) before its preflight and holds it through every delete;
+ * the promotion of a fetched document takes it SHARED for the length of its transaction, with the TRY form, so a fetch that meets a running reset
+ * promotes nothing and is retried instead of waiting on, or racing, the reset. Shared holders coexist, so fetches do not serialise each other.
+ */
+export const INVOICE_DOCUMENT_RESET_LOCK_NAMESPACE = 411_220_879
+
+/** The key, within that namespace, that the reset's own sales-deletion TRANSACTION takes exclusive (transaction scope); the session lock above is key 0. A promotion takes both shared. */
+export const INVOICE_DOCUMENT_RESET_TRANSACTION_LOCK_KEY = 1
+
+/**
+ * THE INVOICE-DOCUMENT PROMOTION LOCK (two-int, key = a hash of the document's subject).
+ *
+ * Held transaction-scoped (`pg_advisory_xact_lock`) by the promotion of a fetched invoice / credit note document, so two promotions of the SAME
+ * document are applied one after the other. Its own namespace: it never contends with the reset lock above, which is a different question.
+ */
+export const INVOICE_DOCUMENT_PROMOTION_LOCK_NAMESPACE = 411_220_880
+
+/**
  * The namespace the SESSION-LOCK-SPACE PROBE takes its key in (o3d-2k5r r26).
  *
  * Declared in `lib/db/database-url-schema.mjs` and re-exported here rather than written down twice:
@@ -383,6 +415,8 @@ export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   WC_FIRST_IMPORT_LOCK_NAMESPACE,
   WC_ERASURE_SWEEP_LEASE_NAMESPACE,
   WC_CUSTOMER_KEY_LOCK_NAMESPACE,
+  INVOICE_DOCUMENT_RESET_LOCK_NAMESPACE,
+  INVOICE_DOCUMENT_PROMOTION_LOCK_NAMESPACE,
   XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE,
   SESSION_LOCK_SPACE_PROBE_NAMESPACE,
 } as const

@@ -481,7 +481,7 @@ test('production: a live-Xero job has an IP-independent rolling daily budget; th
   // job's budget exceeds its busiest day.
   const registry = getAllCronJobs()
   const accountingJobs = registry.filter((j) => j.module === 'accounting')
-  assert.equal(accountingJobs.length, 6, 'the accounting module registers the six Xero-calling jobs; a new one needs a census decision')
+  assert.equal(accountingJobs.length, 7, 'the accounting module registers the seven Xero-calling jobs; a new one needs a census decision')
   for (const job of accountingJobs) {
     assert.ok(XERO_LIVE_CRON_JOBS.has(job.slug), `${job.slug} is an accounting-module job missing from XERO_LIVE_CRON_JOBS`)
   }

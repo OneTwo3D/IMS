@@ -143,6 +143,7 @@ async function defaultRunInvariant(): Promise<unknown> {
       notifyAdmins: async () => {},
       getPreviousCriticalFindingsHash: async () => null,
       setCriticalFindingsHash: async () => {},
+      commitWarningBaseline: async () => ({ applied: false, increases: [] }), // read-only callers write nothing, including the named-warning baseline
       runInventoryReport: serial(() => runInventoryInvariantReport({ collectionMode: 'sql', pageSize: 500, maxFindings: 5000, stockMovementLookbackDays: null })),
       runAccountingReport: serial(() => runAccountingInvariantReport()),
       runSalesReport: serial(() => runRefundStatusReconciliationReport()),

@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
 
 import { logActivity } from '@/lib/activity-log'
+import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { INVARIANT_WARNING_BASELINE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import {
   runAccountingInvariantReport,
   type AccountingInvariantFinding,
@@ -20,6 +22,174 @@ import {
 import { notify } from '@/lib/notifications'
 
 const CRITICAL_FINDINGS_HASH_SETTING = 'cron_invariant_check_critical_findings_hash'
+const NOTIFIABLE_WARNING_COUNTS_SETTING = 'cron_invariant_check_notifiable_warning_counts'
+
+/**
+ * The WARNING-level findings an admin is told about, in addition to every critical one. Short on purpose: each is a
+ * standing state that needs an operator's decision, not a drift that tidies itself, so a notification is actionable.
+ *
+ *  - stock_cost_layer_quantity_mismatch: on-hand above the remaining FIFO layers (unlayered stock; understates
+ *    valuation and mis-costs a later consumption).
+ *  - transfer_stranded_in_transit: goods dispatched and not received within the stranded window.
+ *  - accounting_sync_failed: a posting that failed and is held in the backlog.
+ *  - refund_missing_credit_note_sync / refund_missing_reversal_sync: refund money not yet mirrored in the ledger.
+ *  - refund_reversal_record_undecidable: a refund that still owes accounting and must be decided by hand.
+ *
+ * Notification is on CHANGE only: a code that newly appears or whose count rises. See notifiableWarningIncreases.
+ */
+export const NOTIFIABLE_WARNING_CODES: readonly string[] = [
+  'stock_cost_layer_quantity_mismatch',
+  'transfer_stranded_in_transit',
+  'accounting_sync_failed',
+  'refund_missing_credit_note_sync',
+  'refund_missing_reversal_sync',
+  'refund_reversal_record_undecidable',
+]
+
+export type NotifiableWarningCounts = Record<string, number>
+
+/** The findings a report appends when it stopped at its row cap: the list is then INCOMPLETE and says nothing about absence. */
+export const REPORT_TRUNCATION_CODES: readonly string[] = [
+  'invariant_report_truncated',
+  'refund_status_reconciliation_row_cap_reached',
+]
+
+export function reportsWereTruncated(findings: ReadonlyArray<{ code: string }>): boolean {
+  return findings.some((finding) => REPORT_TRUNCATION_CODES.includes(finding.code))
+}
+
+export function countNotifiableWarnings(
+  findings: ReadonlyArray<{ severity: string; code: string }>,
+): NotifiableWarningCounts {
+  const counts: NotifiableWarningCounts = {}
+  for (const finding of findings) {
+    if (finding.severity !== 'warning' || !NOTIFIABLE_WARNING_CODES.includes(finding.code)) continue
+    counts[finding.code] = (counts[finding.code] ?? 0) + 1
+  }
+  return counts
+}
+
+/** The codes whose count is above the previous run's (a code absent before counts as zero). Falling counts are not news. */
+export function notifiableWarningIncreases(
+  previous: NotifiableWarningCounts,
+  current: NotifiableWarningCounts,
+): Array<{ code: string; previous: number; current: number }> {
+  return Object.entries(current)
+    .filter(([code, count]) => count > (previous[code] ?? 0))
+    .map(([code, count]) => ({ code, previous: previous[code] ?? 0, current: count }))
+    .sort((a, b) => a.code.localeCompare(b.code))
+}
+
+type WarningBaseline = { counts: NotifiableWarningCounts; checkedAt: string; truncated?: boolean }
+
+function parseWarningBaseline(raw: string | null | undefined): WarningBaseline | null {
+  if (!raw) return null
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    const { counts, checkedAt, truncated } = parsed as { counts?: unknown; checkedAt?: unknown; truncated?: unknown }
+    if (typeof checkedAt !== 'string' || !counts || typeof counts !== 'object' || Array.isArray(counts)) return null
+    const clean: NotifiableWarningCounts = {}
+    for (const [code, value] of Object.entries(counts)) {
+      if (typeof value === 'number' && Number.isFinite(value) && value > 0) clean[code] = value
+    }
+    return { counts: clean, checkedAt, ...(truncated === true ? { truncated: true } : {}) }
+  } catch {
+    return null
+  }
+}
+
+export type WarningBaselineOutcome = {
+  /** False when a NEWER run's baseline was already stored (this run stood down) or the alert had nobody to go to. Nothing was written. */
+  applied: boolean
+  /** True when an alert was due but no active admin exists: the baseline was RETAINED so the alert is still due, and the caller logs it. */
+  undeliverable?: boolean
+  increases: Array<{ code: string; previous: number; current: number }>
+}
+
+export type WarningBaselineTx = Pick<Prisma.TransactionClient, 'setting' | 'user' | 'notification' | '$executeRaw'>
+
+/**
+ * Move the named-warning baseline AND tell the admins, in ONE transaction. The notification rows are inserted with the
+ * transaction's own client (notify() swallows a failed insert and would let the baseline advance over an alert nobody
+ * received); if any insert fails the whole step rolls back, the baseline stays where it was, and the next run sees the
+ * same increase and tries again. A transaction-scoped advisory lock serialises the step, and the stored baseline carries
+ * the START time of the run that wrote it, so an older run that finishes late stands down instead of overwriting a
+ * newer baseline.
+ */
+async function activeAdminIds(tx: WarningBaselineTx): Promise<string[]> {
+  return (await tx.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })).map((admin) => admin.id)
+}
+
+async function writeBaseline(tx: WarningBaselineTx, baseline: WarningBaseline): Promise<void> {
+  const value = JSON.stringify(baseline satisfies WarningBaseline)
+  await tx.setting.upsert({
+    where: { key: NOTIFIABLE_WARNING_COUNTS_SETTING },
+    create: { key: NOTIFIABLE_WARNING_COUNTS_SETTING, value },
+    update: { value },
+  })
+}
+
+export async function commitWarningBaselineInTx(
+  tx: WarningBaselineTx,
+  input: { counts: NotifiableWarningCounts; checkedAt: string; runId: string; truncated?: boolean },
+): Promise<WarningBaselineOutcome> {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${INVARIANT_WARNING_BASELINE_LOCK_KEY})`
+  const row = await tx.setting.findUnique({ where: { key: NOTIFIABLE_WARNING_COUNTS_SETTING }, select: { value: true } })
+  const baseline = parseWarningBaseline(row?.value)
+  if (baseline && baseline.checkedAt > input.checkedAt) return { applied: false, increases: [] }
+  // A report that stopped at its row cap lists only the first findings, so a count taken from it is a floor, not a count: a code
+  // missing from it is not "cleared" and a code in it is not "newly appeared". The counts are NOT moved. Admins are told ONCE
+  // that the named warnings were not evaluated (the flag below dedups it), and the next complete run compares against the
+  // counts kept here.
+  if (input.truncated === true) {
+    if (baseline?.truncated === true) {
+      // Already told: only the run time moves.
+      await writeBaseline(tx, { counts: baseline.counts, checkedAt: input.checkedAt, truncated: true })
+      return { applied: true, increases: [] }
+    }
+    const admins = await activeAdminIds(tx)
+    // Admin-scoped, never a broadcast: with nobody to tell, retain the baseline (so the notice is still due) and say so.
+    if (admins.length === 0) return { applied: false, undeliverable: true, increases: [] }
+    await writeBaseline(tx, { counts: baseline?.counts ?? {}, checkedAt: input.checkedAt, truncated: true })
+    for (const userId of admins) {
+      await tx.notification.create({
+        data: {
+          userId,
+          type: 'warning',
+          title: 'Invariant report was truncated',
+          message: `Scheduled invariant check ${input.runId} stopped at its row cap, so the named warnings were not evaluated this run. Fix or accept the existing findings, or raise INVARIANT_CHECK_MAX_FINDINGS.`,
+          actionUrl: null,
+        },
+      })
+    }
+    return { applied: true, increases: [] }
+  }
+  const increases = notifiableWarningIncreases(baseline?.counts ?? {}, input.counts)
+  if (increases.length === 0) {
+    await writeBaseline(tx, { counts: input.counts, checkedAt: input.checkedAt })
+    return { applied: true, increases }
+  }
+  const admins = await activeAdminIds(tx)
+  // Admin-scoped, never a broadcast (a null-user notification is visible to every user). With no active admin the baseline is
+  // RETAINED, so the rise is still news on the next run that has someone to tell, and the caller logs an ERROR.
+  if (admins.length === 0) return { applied: false, undeliverable: true, increases }
+  await writeBaseline(tx, { counts: input.counts, checkedAt: input.checkedAt })
+  const message = `Scheduled invariant check ${input.runId}: ${increases
+    .map((entry) => `${entry.code} ${entry.previous} -> ${entry.current}`)
+    .join(', ')}.`
+  for (const userId of admins) {
+    await tx.notification.create({
+      data: { userId, type: 'warning', title: 'Invariant warnings need attention', message, actionUrl: null },
+    })
+  }
+  return { applied: true, increases }
+}
+
+async function commitWarningBaseline(input: { counts: NotifiableWarningCounts; checkedAt: string; runId: string; truncated?: boolean }): Promise<WarningBaselineOutcome> {
+  return db.$transaction((tx) => commitWarningBaselineInTx(tx, input))
+}
+
 const DEFAULT_INVENTORY_INVARIANT_PAGE_SIZE = 500
 const DEFAULT_INVENTORY_INVARIANT_MAX_FINDINGS = 5000
 const DEFAULT_STOCK_MOVEMENT_LOOKBACK_DAYS = 90
@@ -95,6 +265,7 @@ type ScheduledInvariantCheckDependencies = {
   notifyAdmins?: (params: Omit<Parameters<typeof notify>[0], 'userId'>) => Promise<void>
   getPreviousCriticalFindingsHash?: () => Promise<string | null>
   setCriticalFindingsHash?: (hash: string | null) => Promise<void>
+  commitWarningBaseline?: typeof commitWarningBaseline
 }
 
 const EMPTY_SUMMARY: InvariantReportSummary = {
@@ -263,6 +434,7 @@ export async function runScheduledInvariantCheck(
   const notifyAdmins = dependencies.notifyAdmins ?? notifyActiveAdmins
   const readCriticalFindingsHash = dependencies.getPreviousCriticalFindingsHash ?? getPreviousCriticalFindingsHash
   const writeCriticalFindingsHash = dependencies.setCriticalFindingsHash ?? setCriticalFindingsHash
+  const advanceWarningBaseline = dependencies.commitWarningBaseline ?? commitWarningBaseline
 
   const [inventoryResult, accountingResult, salesResult] = await Promise.allSettled([
     runInventoryReport(),
@@ -346,6 +518,30 @@ export async function runScheduledInvariantCheck(
     }
   } else {
     await writeCriticalFindingsHash(null)
+  }
+
+  // A report that failed to run says nothing about its findings, so the baseline is only moved when all three ran:
+  // otherwise a failed domain would read as "cleared" and its next successful run as "newly appeared".
+  if (errors.length === 0 && inventory && accounting && sales) {
+    const allFindings = [...inventory.findings, ...accounting.findings, ...sales.findings]
+    const outcome = await advanceWarningBaseline({
+      counts: countNotifiableWarnings(allFindings),
+      checkedAt,
+      runId,
+      truncated: reportsWereTruncated(allFindings),
+    })
+    if (outcome.undeliverable) {
+      await writeActivityLog({
+        entityType: 'SYSTEM',
+        entityId: runId,
+        action: 'invariant_check_warning_alert_undeliverable',
+        tag: 'system',
+        level: 'ERROR',
+        description: `Scheduled invariant check ${runId}: named warning alert undeliverable, no active admin. The baseline was kept, so the alert is still due.`,
+        metadata: { runId, checkedAt, increases: outcome.increases, truncated: reportsWereTruncated(allFindings) },
+        resolveUser: false,
+      })
+    }
   }
 
   return result

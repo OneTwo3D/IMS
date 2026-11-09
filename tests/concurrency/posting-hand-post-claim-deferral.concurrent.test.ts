@@ -113,7 +113,7 @@ async function saveLaterEdit(
   const answer = await db.$transaction((tx) => create(tx, {
     connector: 'xero',
     type: posting.type,
-    status: 'PENDING',
+    status: 'PENDING', attemptStampingCustodyAt: new Date(), // as the production enqueue paths seed it
     referenceType: posting.referenceType,
     referenceId,
     payload: { narration },

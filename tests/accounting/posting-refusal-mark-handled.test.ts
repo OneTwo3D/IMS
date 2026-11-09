@@ -21,6 +21,8 @@ type SyncRow = {
   attemptRevision: number; externalTransactionId: string | null; payload: unknown; errorMessage?: string | null
   /** o3d-1e7sl: absent = NULL (the connector's own writeback), as the double's `findMany` fills in. */
   settlementBasis?: string | null; abandonedBeforeRemoteCall?: boolean | null
+  /** The canonical never-attempted record; `sync()` defaults to a row created in custody that never attempted. */
+  remoteAttemptedAt?: Date | null; attemptStampingCustodyAt?: Date | null
 }
 const refusals: Refusal[] = []
 const syncRows: SyncRow[] = []
@@ -236,7 +238,8 @@ function refusal(id: string, kind: string | null, overrides: Partial<Refusal> = 
 function sync(id: string, of: Refusal, overrides: Partial<SyncRow> = {}): SyncRow {
   return {
     id, connector: 'xero', type: of.type, referenceType: of.referenceType, referenceId: of.referenceId, status: 'PENDING',
-    attemptRevision: 0, externalTransactionId: null, payload: of.scope ? { _idempotencyKey: of.scope } : {}, ...overrides,
+    attemptRevision: 0, externalTransactionId: null, payload: of.scope ? { _idempotencyKey: of.scope } : {},
+    remoteAttemptedAt: null, attemptStampingCustodyAt: new Date('2026-01-01T00:00:00Z'), ...overrides,
   }
 }
 
@@ -301,8 +304,23 @@ test('[o3d-j625 r7 H-A] a row IMS RETRIES (but can get stuck) is markable, and i
   syncRows.push(sync('s-pending', row), sync('s-other-scope', row, { payload: { _idempotencyKey: 'a-different-adjustment' } }))
   assert.deepEqual(await mark('r2'), { success: true })
   assert.equal(syncRows.find((s) => s.id === 's-pending')!.status, 'CANCELLED', 'IMS\'s own attempt is cancelled')
+  assert.equal(syncRows.find((s) => s.id === 's-pending')!.abandonedBeforeRemoteCall, true, 'and the pre-call proof is recorded in the same write')
   assert.equal(syncRows.find((s) => s.id === 's-other-scope')!.status, 'PENDING', 'a DIFFERENT posting on the same PO is untouched')
   assert.deepEqual(mirrorWrites, [{ syncLogId: 's-pending', status: 'VOID', voidBasis: 'source_cancelled' }])
+})
+
+test('the mark is REFUSED for a queued revision-0 row with no never-attempted record, and NOTHING is cancelled', async () => {
+  const row = refusal('r3b', 'landed_cost_cogs_journal', { type: 'COGS_JOURNAL' })
+  refusals.push(row)
+  syncRows.push(sync('s-legacy', row, { attemptStampingCustodyAt: null }), sync('s-clean', row))
+  const result = await mark('r3b')
+  assert.equal(ok(result), false)
+  assert.match(errorOf(result), /may already have posted this/)
+  assert.match(errorOf(result), /nothing on it records that no attempt was ever made/)
+  assert.match(errorOf(result), /if it is there, settle the row with its reference/)
+  assert.equal(syncRows.find((r) => r.id === 's-legacy')!.status, 'PENDING')
+  assert.equal(syncRows.find((r) => r.id === 's-clean')!.status, 'PENDING', 'a refused mark cancels no sibling either')
+  assert.deepEqual(mirrorWrites, [])
 })
 
 for (const [label, overrides] of [
@@ -347,6 +365,10 @@ test('[o3d-1e7sl G5] the claim decides per STANDING of the row under the key, an
   }
   const cases: Case[] = [
     { name: 'LIVE_WORK: PENDING never claimed (provably unsent) is CANCELLED by the claim', standing: 'LIVE_WORK', row: { status: 'PENDING', attemptRevision: 0 }, claims: true, cancelled: true },
+    // Revision 0 is not proof: a legacy row (no custody record) or a revived attempted row sits there too. Not cancelled,
+    // and the claim REFUSES, so the operator cannot hand-post what a worker may have posted already.
+    { name: 'LIVE_WORK: PENDING at revision 0 with NO never-attempted record (legacy) is not provably unsent', standing: 'LIVE_WORK', row: { status: 'PENDING', attemptRevision: 0, attemptStampingCustodyAt: null }, claims: false, refuses: /nothing on it records that no attempt was ever made[\s\S]*check the ledger for this posting/i },
+    { name: 'LIVE_WORK: PENDING at revision 0 whose attempt stamp is set (revived) is not provably unsent', standing: 'LIVE_WORK', row: { status: 'PENDING', attemptRevision: 0, remoteAttemptedAt: new Date('2026-02-01T00:00:00Z') }, claims: false, refuses: /is PENDING \(queued or in flight\)/ },
     { name: 'LIVE_WORK: PENDING already claimed once may have been sent', standing: 'LIVE_WORK', row: { status: 'PENDING', attemptRevision: 2 }, claims: false, refuses: /is PENDING \(queued or in flight\)/ },
     // THE ISOLATING ARM for "provably unsent" going through the module: a PENDING, never-claimed row with NO id
     // that carries an operator basis is UNKNOWN (truth-table row 2: no writer produces it). A test that only had
@@ -400,7 +422,7 @@ test('[o3d-1e7sl G5] the claim decides per STANDING of the row under the key, an
   }
   console.log(`# G5 cases: ${cases.length}; claimed ${claimed}; refused ${refused}; reported-unproven ${reported}`)
   assert.ok(claimed > 0 && refused > 0 && reported === 2)
-  assert.equal(cases.length, 10)
+  assert.equal(cases.length, 12)
 })
 
 test('[o3d-j625 r7] a processor claiming the row between the read and the cancel makes the mark fail, not cancel a row in flight', async () => {
@@ -420,6 +442,27 @@ test('[o3d-j625 r7] a processor claiming the row between the read and the cancel
     assert.equal(ok(result), false)
     assert.match(errorOf(result), /changed while it was being marked/)
     assert.equal(syncRows[0]!.status, 'PROCESSING', 'the in-flight row was not cancelled')
+  } finally {
+    syncTable.findMany = original
+  }
+})
+
+test('a row that loses its never-attempted record between the read and the cancel makes the mark fail, not cancel it', async () => {
+  const row = refusal('r4b', 'landed_cost_cogs_journal', { type: 'COGS_JOURNAL' })
+  refusals.push(row)
+  syncRows.push(sync('s-1', row))
+  const original = syncTable.findMany
+  syncTable.findMany = async (args) => {
+    const found = await original(args)
+    const snapshot = found.map((r) => ({ ...r }))
+    syncRows[0]!.attemptStampingCustodyAt = null // still PENDING at revision 0, but no longer provable
+    return snapshot
+  }
+  try {
+    const result = await mark('r4b')
+    assert.equal(ok(result), false)
+    assert.match(errorOf(result), /changed while it was being marked/)
+    assert.equal(syncRows[0]!.status, 'PENDING', 'the unprovable row was not cancelled')
   } finally {
     syncTable.findMany = original
   }

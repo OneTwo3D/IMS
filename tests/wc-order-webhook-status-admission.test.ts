@@ -159,6 +159,13 @@ mock.module('@/lib/connectors/woocommerce/sync/refund-sync', {
   },
 })
 
+// The order webhook asks for the stock corrections that refunds of the delivery's order still owe the store. That is a database read this
+// file's db double does not serve and is not what these tests are about; a lookup failure is logged with the order id, which would read as
+// a skip report. Doubled so the assertions stay about the admission gate.
+mock.module('@/lib/connectors/woocommerce/sync/refund-stock-correction', {
+  namedExports: { queueRefundStockCorrections: async () => ({ open: 0, queued: 0, failed: 0 }) },
+})
+
 mock.module('@/lib/connectors/woocommerce/sync/order-webhook-echo', {
   namedExports: { shouldSuppressWcOrderWebhookEcho: async () => ({ suppress: false }) },
 })

@@ -2040,6 +2040,8 @@ model SalesOrder {
   lines             SalesOrderLine[]
   refunds           SalesOrderRefund[]
   returnExpectations ReturnExpectation[]
+  invoiceDocuments  SalesOrderInvoiceDocument[]
+  invoiceDocumentFetches InvoiceDocumentFetchState[]
   payments          Payment[]
   allocations       OrderAllocation[]
   shipments         Shipment[]
@@ -2137,6 +2139,14 @@ model SalesOrderRefund {
   /// can never be provenance-less, and cleared in the same statement when the claim is released.
   accountingCreditNoteConnector String? @map("accounting_credit_note_connector")
   externalRefundId Int?
+  /// A storefront refund that returns quantity owes the storefront a stock correction (the store raised its own
+  /// stock for it before IMS heard). Written TRUE in the refund's own transaction, so a refund can never commit
+  /// without the obligation; FALSE for every other refund (manual, money-only, chargeback) and every row that
+  /// predates the column.
+  stockCorrectionRequired Boolean @default(false) @map("stock_correction_required")
+  /// When the correction was durably recorded as a stock job. NULL while still owed: the order sweep and the stock
+  /// reconcile both queue every refund that is required and not yet recorded, so a failure leaves it open.
+  stockCorrectionQueuedAt DateTime? @map("stock_correction_queued_at")
   returnWarehouseId String?
   reason          String?
   totalForeign    Decimal    @db.Decimal(18, 4)
@@ -2223,9 +2233,12 @@ model SalesOrderRefund {
   lines           SalesOrderRefundLine[]
   payments        Payment[]
   returnExpectation ReturnExpectation?
+  invoiceDocuments  SalesOrderInvoiceDocument[]
+  invoiceDocumentFetches InvoiceDocumentFetchState[]
 
   @@unique([externalRefundId])
   @@index([orderId])
+  @@index([stockCorrectionRequired, stockCorrectionQueuedAt])
   @@map("sales_order_refunds")
 }
 
@@ -2233,6 +2246,95 @@ model SalesOrderRefund {
 /// It holds NO stock: nothing here is on hand, allocatable or pushed to a storefront. The value sits in the
 /// Stock in Transit account (the refund's COGS reversal debits it) until the units arrive or are written off.
 /// Lines carry the dispatch-cost snapshot the refund was valued at, so arrival can clear exactly that value.
+enum InvoiceDocumentKind {
+  INVOICE
+  CREDIT_NOTE
+}
+
+enum InvoiceDocumentFetchStatus {
+  PENDING
+  /// Needs a person: the ledger answer is ambiguous or the document cannot be asked about. Never retried on its own.
+  NEEDS_ATTENTION
+  DONE
+}
+
+/// The customer-facing invoice (or credit note) PDF IMS fetched from the accounting ledger and keeps.
+///
+/// One row per document VERSION: the bytes are content-addressed (`sha256`), so a re-issued or amended
+/// document becomes a new row and the previous one is marked `supersededAt`, never overwritten or deleted. The
+/// current version of a document is the row with `supersededAt` NULL.
+///
+/// A statutory record: kept for six years, and nothing in IMS deletes a row or its file (no retention job
+/// exists; adding one is an owner decision). The files live under INVOICE_PDF_STORAGE_DIR, which therefore
+/// belongs in the backup set.
+///
+/// This table is the READ side only. It does not write `SalesOrder.accountingInvoiceId` (the ledger document
+/// may be one IMS did not post, and that column drives payment polling and updates).
+model SalesOrderInvoiceDocument {
+  id                 String              @id @default(cuid())
+  orderId            String              @map("order_id")
+  /// Set for a credit note: the refund it documents. NULL for an invoice.
+  refundId           String?             @map("refund_id")
+  kind               InvoiceDocumentKind
+  connector          String
+  /// The ledger's own id for the document (Xero InvoiceID / CreditNoteID).
+  externalDocumentId String              @map("external_document_id")
+  documentNumber     String              @map("document_number")
+  /// The ledger status when fetched (AUTHORISED, PAID, VOIDED, ...).
+  externalStatus     String              @map("external_status")
+  sha256             String
+  byteSize           Int                 @map("byte_size")
+  /// Logical path under INVOICE_PDF_STORAGE_DIR, derived from order id and hash.
+  storedPath         String              @map("stored_path")
+  fetchedAt          DateTime            @default(now()) @map("fetched_at")
+  supersededAt       DateTime?           @map("superseded_at")
+  /// Set when a recheck finds the ledger has VOIDED this current document on an order that is not cancelled: the bytes and history are kept,
+  /// but no customer-facing reader serves it until a valid replacement is promoted (staff can still see it, labelled).
+  withdrawnAt        DateTime?           @map("withdrawn_at")
+  /// SHA-256 of what the document was judged against when it was promoted (customer, currency, gross total incl. store credit, cancelled or not, order numbers, invoice number). A customer read compares it with the order as it is NOW and refuses on a difference. NULL only for a row that predates it.
+  evidenceKey        String?             @map("evidence_key")
+
+  order  SalesOrder        @relation(fields: [orderId], references: [id])
+  refund SalesOrderRefund? @relation(fields: [refundId], references: [id])
+
+  @@unique([connector, externalDocumentId, sha256])
+  @@index([orderId, kind])
+  @@index([refundId])
+  @@map("sales_order_invoice_documents")
+}
+
+/// Where the fetch of one document stands: attempts, backoff, the last reason, and whether it needs a person.
+/// One row per (order, kind, refund). Also the lazy-fetch throttle: a customer clicking again before
+/// `nextAttemptAt` does not reach the ledger.
+model InvoiceDocumentFetchState {
+  id            String                     @id @default(cuid())
+  orderId       String                     @map("order_id")
+  refundId      String?                    @map("refund_id")
+  kind          InvoiceDocumentKind
+  /// orderId plus kind plus refund id: one row per document. A plain column because NULLs are not equal in a unique index.
+  subjectKey    String                     @unique @map("subject_key")
+  status        InvoiceDocumentFetchStatus @default(PENDING)
+  attempts      Int                        @default(0)
+  lastAttemptAt DateTime?                  @map("last_attempt_at")
+  nextAttemptAt DateTime?                  @map("next_attempt_at")
+  lastError     String?                    @map("last_error")
+  /// Completed rechecks of a stored document (the ledger can amend it): 0 until the first recheck, then 1, 2, 3.
+  rechecks      Int                        @default(0)
+  /// One fetch of this document at a time: set to an expiry while a fetch holds it, renewed between its steps, cleared when it ends. An
+  /// expired value is a crashed or stalled holder and may be taken. Held across the ledger read, the download and the promotion.
+  leaseUntil    DateTime?                  @map("lease_until")
+  /// Who holds the lease: a token unique to one fetch. Renewal, every state write, the promotion and the release all require it, so a holder whose lease was taken over cannot write or release the new holder's.
+  leaseHolder   String?                    @map("lease_holder")
+  createdAt     DateTime                   @default(now()) @map("created_at")
+  updatedAt     DateTime                   @updatedAt @map("updated_at")
+
+  order  SalesOrder        @relation(fields: [orderId], references: [id])
+  refund SalesOrderRefund? @relation(fields: [refundId], references: [id])
+
+  @@index([status, nextAttemptAt])
+  @@map("invoice_document_fetch_states")
+}
+
 model ReturnExpectation {
   id                  String                  @id @default(cuid())
   /// Human reference, `RX-` plus the credit note number (or the refund id when it has none).
@@ -2558,7 +2660,8 @@ model ProductionOrder {
 
   // Order currency + FX for foreign-currency manufacturing costs (labour
   // priced in a non-base currency, etc.). Base totals on cost lines use
-  // this rate. Defaults to base currency / 1.0.
+  // this rate, in the fx_rates convention: 1 base = fxRateToBase foreign, so
+  // base = foreign / fxRateToBase. Defaults to base currency / 1.0.
   currency        String               @default("GBP")
   fxRateToBase    Decimal              @db.Decimal(18, 8) @default(1)
 

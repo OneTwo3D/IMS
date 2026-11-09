@@ -54,7 +54,8 @@ export function ManufacturingCostLinesEditor({
     const n = Number.parseFloat(l.amountForeign)
     return s + (Number.isFinite(n) ? n : 0)
   }, 0)
-  const totalBase = totalForeign * fxRateToBase
+  // fxRateToBase is foreign per ONE base unit: base = foreign / rate.
+  const totalBase = totalForeign / fxRateToBase
 
   const isDirty = JSON.stringify(draft) !== JSON.stringify(originalSnapshot)
 

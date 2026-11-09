@@ -155,7 +155,7 @@ test(
     const requeuedResult = await db.$transaction((tx) => createAccountingSyncLogRow<{ id: string }>(tx, {
       connector: 'xero',
       type: MJ.type as never,
-      status: 'PENDING',
+      status: 'PENDING', attemptStampingCustodyAt: new Date(), // as the production enqueue paths seed it
       referenceType: MJ.referenceType,
       referenceId,
       payload: { narration: `o3d-j625 r16 operator B re-queue ${referenceId}` },
@@ -232,7 +232,7 @@ test(
     const took = await db.$transaction((tx) => mark.claimPostingForHandPosting(tx as never, { id: refusalId, userId: 'operator-A' }), TX)
     assert.equal(took.ok, true)
     const enqueue = async () => (await db.$transaction((tx) => createAccountingSyncLogRow<{ id: string }>(tx, {
-      connector: 'xero', type: MJ.type as never, status: 'PENDING',
+      connector: 'xero', type: MJ.type as never, status: 'PENDING', attemptStampingCustodyAt: new Date(), // as the production enqueue paths seed it
       referenceType: MJ.referenceType, referenceId,
       payload: { narration: `o3d-j625 r16 release probe ${referenceId}` },
     }), TX)).row

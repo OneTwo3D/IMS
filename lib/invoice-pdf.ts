@@ -284,6 +284,63 @@ export async function saveInvoicePdfFile(orderId: string, buffer: Buffer): Promi
   return invoicePdfStoredPath(orderId)
 }
 
+// ---------------------------------------------------------------------------
+// Versioned, content-addressed invoice DOCUMENTS (SalesOrderInvoiceDocument)
+// ---------------------------------------------------------------------------
+// The flat `<orderId>.pdf` above is the CURRENT invoice of an order and is overwritten in place. A document
+// kept as a statutory record is never overwritten: each version lives at its own path named by its SHA-256,
+// so a re-issued or amended document sits beside the one it replaced. Nothing here deletes a file.
+
+const INVOICE_DOCUMENT_DIR = 'documents'
+const SHA256_HEX = /^[a-f0-9]{64}$/
+
+/** The logical stored path of one document version, relative to the invoice PDF storage directory. */
+export function invoiceDocumentStoredPath(orderId: string, sha256: string): string {
+  if (!invoicePdfFilename(orderId)) throw new Error('Invalid order id for an invoice document path')
+  if (!SHA256_HEX.test(sha256)) throw new Error('Invalid SHA-256 for an invoice document path')
+  return path.posix.join(INVOICE_PDF_STORED_PATH_PREFIX, INVOICE_DOCUMENT_DIR, orderId, `${sha256}.pdf`)
+}
+
+function resolveInvoiceDocumentPath(orderId: string, sha256: string): string | null {
+  if (!invoicePdfFilename(orderId) || !SHA256_HEX.test(sha256)) return null
+  const root = configuredInvoicePdfStorageDir()
+  const filePath = path.resolve(root, INVOICE_DOCUMENT_DIR, orderId, `${sha256}.pdf`)
+  return isWithinDirectory(root, filePath) ? filePath : null
+}
+
+/**
+ * Save one document version. Content-addressed: writing the same bytes again lands on the same path, so
+ * a concurrent double fetch is harmless. Returns the logical stored path.
+ */
+export async function saveInvoiceDocumentFile(orderId: string, sha256: string, buffer: Buffer): Promise<string> {
+  const filePath = resolveInvoiceDocumentPath(orderId, sha256)
+  if (!filePath) throw new Error('Invalid invoice document path')
+  if (process.env.NODE_ENV === 'production') {
+    // The storage root must already exist and be writable in production (preflight), but the per-order
+    // subdirectory is ours to create.
+    await access(configuredInvoicePdfStorageDir(), constants.W_OK)
+  }
+  await mkdir(path.dirname(filePath), { recursive: true })
+  await ensureInvoicePdfStorageDir(filePath)
+  const tempPath = `${path.dirname(filePath)}${path.sep}.${path.basename(filePath)}.${randomBytes(8).toString('hex')}.tmp`
+  await writeFile(tempPath, buffer)
+  await rename(tempPath, filePath)
+  return invoiceDocumentStoredPath(orderId, sha256)
+}
+
+/** Load one stored document version, or null when it is missing or resolves outside the storage directory. */
+export async function loadInvoiceDocumentFile(orderId: string, sha256: string): Promise<Buffer | null> {
+  const filePath = resolveInvoiceDocumentPath(orderId, sha256)
+  if (!filePath) return null
+  const realFilePath = await resolveRealInvoicePdfPath(filePath)
+  if (!realFilePath) return null
+  try {
+    return await readFile(realFilePath)
+  } catch {
+    return null
+  }
+}
+
 /** Generate an expiring HMAC-signed token for public PDF download. */
 export function signPdfToken(orderId: string, options: TokenOptions = {}): string {
   const issuedAt = nowSeconds(options.now)

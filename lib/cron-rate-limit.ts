@@ -192,6 +192,7 @@ export const XERO_LIVE_CRON_JOBS: ReadonlySet<string> = new Set([
   'accounting-payment-poll',
   'xero-tax-rate-drift',
   'account-balance-snapshot',
+  'xero-chart-sync',
 ])
 
 /** Hard ceiling on one job's daily run budget, however fast its schedule is set. */
