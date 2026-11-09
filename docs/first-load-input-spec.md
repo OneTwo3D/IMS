@@ -464,7 +464,9 @@ is then moved by the dispatch. Whether the source system's on-hand figure alread
 - `excluded-from-source`: the source on-hand already excludes them. Opening quantity = reported quantity plus the in-transit quantity, at the group's weighted-average cost; a source with no cost basis rejects the transfer.
 
 Either way the units are counted once: after the dispatch the warehouse holds the physical quantity and the transfer holds the in-transit quantity. The destination's reported on-hand is assumed to exclude in-transit units until received; the tool cannot verify that, so confirm it from the sample.
-Only the outstanding quantity (shipped minus received) of an IN_TRANSIT or PARTIALLY_RECEIVED transfer is emitted, as an IN_TRANSIT transfer. The importer stamps the dispatch at import time, not at the source's dispatch date.
+Only the outstanding quantity (shipped minus received) of an IN_TRANSIT or PARTIALLY_RECEIVED transfer is emitted, as an IN_TRANSIT transfer. By default the importer stamps the dispatch at import time.
+
+`importTransfersCsv` also reads an optional **`dispatchedAt`** column, so a transfer can carry the source's real dispatch moment (the stranded-in-transit warning counts its 7 days from that stamp). It is allowed on IN_TRANSIT and RECEIVED rows only, and every row of one `transferKey` must carry the same value. Accepted: `YYYY-MM-DD` (read as 12:00 UK time that day; today's date before noon is stamped now) or an ISO-8601 date-time with an offset such as `2026-10-20T14:30:00Z`. Refused: a future moment, anything more than 366 days before the import, a bare local date-time and ambiguous forms such as `20/10/2026`. **It moves only the stamp**: the quantity still leaves the source at import time, FIFO consumption and the stock movement are dated at import time, and a transfer dispatched 20 days ago is flagged stranded immediately, which is the intent. The first-load preparation tool does not emit this column yet; its `dispatchDate` input is still used only for the warning against `asOf`.
 
 ## Qoblex native exports
 

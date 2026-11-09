@@ -805,8 +805,10 @@ test(
       await aReachedPush // A has reserved, revalidated and CLAIMED the row, and is inside its push
       const aligned = await fixtures.alignUp(po, line, { delta: 6, imsQty: 0 })
       assert.equal(aligned.applied, true, `PRECONDITION: alignment credited the claimed row: ${JSON.stringify(aligned)}`)
-      const manual = await receive(po, line, 4)
-      assert.equal(manual.success, true, `PRECONDITION: the manual 4 committed: ${manual.error}`)
+      // The outstanding must move while A's row is CLAIMED. A manual receipt can no longer do that (it is refused while the ASN is
+      // live, po-receipt-asn-guard), so the same 4 units are recorded on the line directly, as receipts accepted before the guard did.
+      const { db } = await import('@/lib/db')
+      await db.purchaseOrderLine.update({ where: { id: line.poLineId }, data: { qtyReceived: { increment: '4.0000' } } })
     }
 
     const requestB = await createMintsoftPurchaseOrderAsn(po.poId, { autoCallback: false })

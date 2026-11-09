@@ -13,7 +13,9 @@ export async function GET(req: NextRequest) {
   if (!hasPermission(session.user.role, 'stock_control')) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
   if (req.nextUrl.searchParams.get('template')) {
-    return csvResponse(buildTemplateCsv(HEADERS, REQUIRED_HEADERS), 'transfers-template.csv')
+    // The import also reads an optional dispatchedAt column (YYYY-MM-DD or an ISO date-time with an offset). It is on the TEMPLATE only: the
+    // export does not carry it, so an export re-imported does not back-date anything.
+    return csvResponse(buildTemplateCsv([...HEADERS, 'dispatchedAt'], REQUIRED_HEADERS), 'transfers-template.csv')
   }
   const rows = await db.stockTransfer.findMany({
     orderBy: { createdAt: 'desc' },

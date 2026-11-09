@@ -1,5 +1,6 @@
 'use server'
 
+import { parseTransferDispatchedAt } from '@/lib/domain/import/transfer-dispatch-date'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
@@ -1530,9 +1531,12 @@ export async function importTransfersCsv(formData: FormData, system?: SystemImpo
     notes: string
     status: 'DRAFT' | 'IN_TRANSIT' | 'RECEIVED'
     importKey?: string
+    /** The incumbent's dispatch moment, when the file carries one (IN_TRANSIT and RECEIVED rows only). */
+    dispatchedAt?: Date
     invalid: boolean
     lines: { productId: string; sku: string; productName: string; qty: number }[]
   }>()
+  const importedAt = new Date()
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]
@@ -1551,6 +1555,24 @@ export async function importTransfersCsv(formData: FormData, system?: SystemImpo
       result.skipped++
       continue
     }
+    // Optional dispatch moment. Blank = the import time (unchanged). Only a transfer that is dispatched can carry one.
+    const dispatchedAtRaw = readCsvValue(row, 'dispatchedAt', 'dispatchedat').trim()
+    let dispatchedAt: Date | undefined
+    if (dispatchedAtRaw) {
+      if (status === 'DRAFT') {
+        result.errors.push(`Row ${lineNum}: dispatchedAt is only allowed on IN_TRANSIT or RECEIVED rows`)
+        result.skipped++
+        continue
+      }
+      const parsedDispatch = parseTransferDispatchedAt(dispatchedAtRaw, importedAt)
+      if (!parsedDispatch.ok) {
+        result.errors.push(`Row ${lineNum}: ${parsedDispatch.error}`)
+        result.skipped++
+        continue
+      }
+      dispatchedAt = parsedDispatch.value
+    }
+
     const fromId = codeToWh.get(fromCode)
     const toId = codeToWh.get(toCode)
     if (!fromId) { result.errors.push(`Row ${lineNum}: warehouse "${fromCode}" not found`); result.skipped++; continue }
@@ -1562,15 +1584,16 @@ export async function importTransfersCsv(formData: FormData, system?: SystemImpo
     const key = transferKey || `${fromId}:${toId}:${notes}`
     const existing = groups.get(key)
     if (!existing) {
-      groups.set(key, { fromId, toId, notes, status, importKey: transferKey || undefined, invalid: false, lines: [] })
+      groups.set(key, { fromId, toId, notes, status, importKey: transferKey || undefined, dispatchedAt, invalid: false, lines: [] })
     } else if (
       existing.fromId !== fromId ||
       existing.toId !== toId ||
       existing.notes !== notes ||
-      existing.status !== status
+      existing.status !== status ||
+      existing.dispatchedAt?.getTime() !== dispatchedAt?.getTime()
     ) {
       existing.invalid = true
-      result.errors.push(`Row ${lineNum}: grouped transfer "${key}" has inconsistent warehouse, status, or notes values`)
+      result.errors.push(`Row ${lineNum}: grouped transfer "${key}" has inconsistent warehouse, status, dispatchedAt, or notes values`)
       result.skipped++
       continue
     }
@@ -1622,6 +1645,15 @@ export async function importTransfersCsv(formData: FormData, system?: SystemImpo
             result.created += g.lines.length
             if (g.importKey) existingTransferRefs.add(g.importKey)
             continue
+          }
+          if (g.dispatchedAt) {
+            // The dispatch stamp only: stock, FIFO consumption and journals stay at the import time. The action's own
+            // transaction has committed; this single UPDATE carries the incumbent's moment onto the stamp the stranded warning reads.
+            try {
+              await db.stockTransfer.updateMany({ where: { id: created.transfer.id, status: 'IN_TRANSIT' }, data: { dispatchedAt: g.dispatchedAt } })
+            } catch (stampError) {
+              result.errors.push(`Transfer "${label}" (id ${created.transfer.id}) was dispatched but its dispatchedAt could not be set (${stampError instanceof Error ? stampError.message : String(stampError)}); it carries the import time`)
+            }
           }
         }
         if (g.status === 'RECEIVED') {

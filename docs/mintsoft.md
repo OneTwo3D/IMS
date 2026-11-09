@@ -663,3 +663,7 @@ Two System Settings → Data Retention windows cover the WMS tables:
 
 - Keep connector-setting-mutating e2e specs serialized. The Playwright `wc-isolated` project already does this for Mintsoft/WooCommerce/security flows.
 - When adding new Mintsoft API shapes, add boundary normalization tests in `tests/*.test.ts` before wiring UI behavior.
+
+## Manual receipts beside an open ASN
+
+`receivePurchaseOrder` refuses a manual receipt for a PO line that has a live ASN row (`closedAt` null and status `CREATE_IN_FLIGHT`, `OPEN` or `PARTIALLY_BOOKED_IN`; `CREATE_PENDING` is an unclaimed local reservation and does not count). The check runs in the receipt transaction after the `purchase_orders` row lock (the same parent-first order the booked-in service and both ASN creators use, so it takes no ASN lock) and is preceded by an unlocked early read for a clearer message; a call carrying an idempotency token skips the early read so a retry of a committed receipt still reports success. See `lib/domain/wms/po-receipt-asn-guard.ts`. Receipts accepted before the guard existed are untouched; the book-in reconciliation still reads them through the manual-receipt pool.

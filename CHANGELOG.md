@@ -8,6 +8,11 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Manual purchase-order receipts and the warehouse ASN
+
+- **Changed: a manual purchase-order receipt is refused for a line that still has an open warehouse ASN.** An ASN that is being created at the warehouse, open, or partly booked in (and not closed) means the goods are booked in through the ASN; receiving the same SKU by hand beside it could not be told apart from the units the warehouse will book, and the stock for different units was silently never added. The message names the SKU and ASN. Other lines of the same order, and lines whose ASN is fully booked in or closed, can still be received by hand. An unclaimed ASN reservation (nothing sent to the warehouse yet) does not block.
+- **Added: the transfers CSV import reads an optional `dispatchedAt` column** (`YYYY-MM-DD`, read as 12:00 UK time, or an ISO date-time with an offset) for IN_TRANSIT and RECEIVED rows, so a transfer dispatched before the first load carries its real dispatch moment. It moves only the dispatch stamp (and so the stranded-in-transit clock), not the stock movement.
+
 ### WooCommerce invoice notes are floored by the WooCommerce live-from instant
 
 - **Fixed: a queued WooCommerce invoice note is judged against `WC_WRITES_LIVE_FROM`, not `XERO_WRITES_LIVE_FROM`.** The note is a WooCommerce write that rides the accounting queue. Its claim, selection, re-queue refusal and last check before sending now use the WooCommerce cut-off, and every Xero write keeps the Xero one. Before this, a note created after the Xero instant but before the WooCommerce one would have been sent while the former writer still owned that write. `npm run outbound:status` counts the note under WooCommerce, with its own floor. Nothing changes while the producer hold is not enforced.
