@@ -179,3 +179,25 @@ test('the apply sets the marker only where declared and never clears a category 
   const stale = planEuVatSeedApply(withWorld((w) => { setIms(w, 112, { reportingCategory: 'IOSS' }) }))
   assert.deepEqual(stale.changes.map((c) => [c.wooId, c.to.reportingCategory]), [[112, null]], 'an IOSS marker on a rate that is not a scheme rate is removed')
 })
+
+test('the identity facts the plan judged are in the digest even where the row stays plannable (case of the name, side, a replaced mapping), and the changes are in ascending id order', () => {
+  const clear = (w: World): void => { for (const [id, r] of w.ims) w.ims.set(id, { ...r, schemePostingTaxType: null, reportingCategory: null }) }
+  const base = planEuVatSeedApply(withWorld(clear))
+  for (const [label, mutate] of [
+    ['name case', (w: World) => { setIms(w, 220, { name: 'de vat' }) }],
+    ['side', (w: World) => { setIms(w, 220, { usedFor: 'BOTH' }) }],
+    ['mapping id', (w: World) => { w.mappings.set(220, { ...w.mappings.get(220)!, id: 'another-mapping' }) }],
+  ] as const) {
+    const changed = planEuVatSeedApply(withWorld((w) => { clear(w); mutate(w) }))
+    assert.equal(changed.changes.some((c) => c.wooId === 220), true, `${label}: still plannable`)
+    assert.notEqual(changed.digest, base.digest, label)
+  }
+  // The seed order is by WooCommerce id; the ids of the IMS rows are made to run the other way, so only the plan's own sort puts them in ascending id order (the lock order of the apply).
+  const reversed = planEuVatSeedApply(withWorld((w) => {
+    clear(w)
+    for (const [wooId, r] of [...w.ims]) { const id = `z${String(1000 - wooId).padStart(4, '0')}`; w.ims.set(wooId, { ...r, id }); w.mappings.set(wooId, { ...w.mappings.get(wooId)!, taxRateId: id }) }
+  }))
+  const ids = reversed.changes.map((c) => c.taxRateId)
+  assert.equal(ids.length, 30)
+  assert.deepEqual(ids, [...ids].sort())
+})
