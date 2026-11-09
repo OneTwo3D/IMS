@@ -21,9 +21,14 @@ export const MAX_DISPATCH_AGE_DAYS = 366
 
 const LONDON = 'Europe/London'
 const DATE_ONLY = /^(\d{4})-(\d{2})-(\d{2})$/
-const ISO_WITH_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})$/
+const ISO_WITH_OFFSET = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(?:Z|[+-](\d{2}):?(\d{2}))$/
 
 export type DispatchDateResult = { ok: true; value: Date } | { ok: false; error: string }
+
+function isRealCalendarDate(year: number, month: number, day: number): boolean {
+  const probe = new Date(Date.UTC(year, month - 1, day))
+  return probe.getUTCFullYear() === year && probe.getUTCMonth() === month - 1 && probe.getUTCDate() === day
+}
 
 function londonOffsetMinutes(at: Date): number {
   const part = new Intl.DateTimeFormat('en-GB', { timeZone: LONDON, timeZoneName: 'longOffset' })
@@ -52,13 +57,19 @@ export function parseTransferDispatchedAt(raw: string, now: Date): DispatchDateR
   const dateOnly = DATE_ONLY.exec(text)
   if (dateOnly) {
     const [year, month, day] = [Number(dateOnly[1]), Number(dateOnly[2]), Number(dateOnly[3])]
-    const probe = new Date(Date.UTC(year, month - 1, day))
-    if (probe.getUTCFullYear() !== year || probe.getUTCMonth() !== month - 1 || probe.getUTCDate() !== day) {
-      return { ok: false, error: `dispatchedAt "${text}" is not a real calendar date` }
-    }
+    if (!isRealCalendarDate(year, month, day)) return { ok: false, error: `dispatchedAt "${text}" is not a real calendar date` }
     value = londonNoon(year, month, day)
     if (text === londonDateString(now) && value.getTime() > now.getTime()) value = new Date(now.getTime())
   } else if (ISO_WITH_OFFSET.test(text)) {
+    // `new Date` ROLLS an impossible component over (2026-02-30 becomes 2 March, T24:00 becomes the next day): every component of the
+    // text is checked as written, not just the instant it parses to.
+    const c = ISO_WITH_OFFSET.exec(text)!
+    const [year, month, day, hour, minute, second] = [Number(c[1]), Number(c[2]), Number(c[3]), Number(c[4]), Number(c[5]), Number(c[6] ?? 0)]
+    const offsetHours = c[7] === undefined ? 0 : Number(c[7])
+    const offsetMinutes = c[8] === undefined ? 0 : Number(c[8])
+    if (!isRealCalendarDate(year, month, day) || hour > 23 || minute > 59 || second > 59 || offsetHours > 23 || offsetMinutes > 59) {
+      return { ok: false, error: `dispatchedAt "${text}" is not a real calendar date and time` }
+    }
     value = new Date(text.replace(/([+-]\d{2})(\d{2})$/, '$1:$2'))
     if (Number.isNaN(value.getTime())) return { ok: false, error: `dispatchedAt "${text}" is not a valid date-time` }
   } else {

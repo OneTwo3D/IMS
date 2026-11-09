@@ -198,3 +198,37 @@ test('manual receipt FIRST, then ASN creation: the receipt stands (the creator s
   assert.equal(await bookIn(asn, line, 6, 6), 'processed')
   assert.equal((await snapshotOf(po, line)).stock, 10, 'no double entry for the manual 4')
 })
+
+/** The one data statement of the migration that introduced remoteCreateAttemptedAt, read from the file so the test cannot drift from it. */
+async function legacyStampStatement(): Promise<string> {
+  const { readFileSync } = await import('node:fs')
+  const sql = readFileSync('prisma/migrations/20261109120000_wms_asn_remote_create_attempted/migration.sql', 'utf8')
+  const statement = sql.split('\n').find((line) => line.startsWith('UPDATE "wms_asn_maps" SET "remoteCreateAttemptedAt"'))
+  assert.ok(statement, 'the migration stamps existing unclosed CREATE_PENDING rows')
+  return statement!
+}
+
+test('migration: a LEGACY CREATE_PENDING row (no stamp, from the previous build) blocks a manual receipt once the migration has stamped it; closed and other rows are untouched', SKIP, async () => {
+  const { db } = await import('@/lib/db')
+  const legacy = await seedPo('g-legacy', [10])
+  const legacyLine = legacy.lines[0]!
+  const legacyAsn = await addAsn(legacy, legacyLine, { expectedQty: 10, status: 'CREATE_PENDING' })
+  const closedPo = await seedPo('g-legacyc', [10])
+  const closedAsn = await addAsn(closedPo, closedPo.lines[0]!, { expectedQty: 10, status: 'CREATE_PENDING', closed: true })
+  const openPo = await seedPo('g-legacyo', [10])
+  const openAsn = await addAsn(openPo, openPo.lines[0]!, { expectedQty: 10, status: 'OPEN' })
+
+  // BEFORE the migration's UPDATE the legacy row reads as never claimed (the gap the statement closes).
+  const stampOf = async (asnId: string) => (await db.wmsAsnMap.findUniqueOrThrow({ where: { id: asnId }, select: { remoteCreateAttemptedAt: true } })).remoteCreateAttemptedAt
+  assert.equal(await stampOf(legacyAsn.asnId), null)
+
+  await db.$executeRawUnsafe(await legacyStampStatement())
+
+  assert.notEqual(await stampOf(legacyAsn.asnId), null, 'the unclosed CREATE_PENDING row is stamped')
+  assert.equal(await stampOf(closedAsn.asnId), null, 'a closed row is untouched')
+  assert.equal(await stampOf(openAsn.asnId), null, 'a row in another status is untouched')
+  const refused = await receive(legacy, legacyLine, 4)
+  assert.equal(refused.success, false, 'the legacy reservation now blocks the manual receipt')
+  assert.match(refused.error ?? '', /open warehouse ASN/)
+  assert.equal((await snapshotOf(legacy, legacyLine)).stock, 0)
+})

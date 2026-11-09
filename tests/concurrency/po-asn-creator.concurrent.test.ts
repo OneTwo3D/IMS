@@ -932,6 +932,28 @@ test(
 )
 
 test(
+  'live-ASN guard: a legacy reservation stamped by the migration is not wedged - the next create request resolves it and the manual-receipt block lifts',
+  SKIP,
+  async () => {
+    const { createMintsoftPurchaseOrderAsn } = await loadModules()
+    const { db } = await import('@/lib/db')
+    const po = await seedPo('g4', [10])
+    const line = po.lines[0]!
+    await makeCreatable(po)
+    const reservation = await addPendingReservation(po, [{ line, expectedQty: 10 }])
+    // The state the migration leaves a pre-existing CREATE_PENDING reservation in.
+    await db.wmsAsnMap.update({ where: { id: reservation.asnId }, data: { remoteCreateAttemptedAt: new Date() } })
+    assert.equal((await receive(po, line, 1)).success, false, 'PRECONDITION: the stamped legacy row blocks a manual receipt')
+    nextExternalAsnId = `${uid()}-g4-remote`
+    const result = await createMintsoftPurchaseOrderAsn(po.poId, { autoCallback: false })
+    assert.equal(result.success, true, result.error)
+    const row = await db.wmsAsnMap.findUniqueOrThrow({ where: { id: reservation.asnId }, select: { status: true, closedAt: true, externalAsnId: true } })
+    assert.equal(row.status, 'OPEN', 'resolved: mapped to the warehouse ASN')
+    assert.equal(row.closedAt, null)
+  },
+)
+
+test(
   'R2-5: the reservation was retired while its create was in flight: the finalize FAILS CLOSED, does not reopen or map it, and the remote ASN\'s id is retained',
   SKIP,
   async () => {
