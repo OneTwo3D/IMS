@@ -32,7 +32,7 @@ export async function invoiceDocumentResetVerdict(client: Prisma.TransactionClie
     ok: false,
     reason: `Nothing was deleted. This database holds ${stored} stored customer invoice / credit note document${stored === 1 ? '' : 's'}, which are statutory `
       + 'records kept for six years, and a reset would fail part-way through because orders and refunds cannot be deleted while they are stored. '
-      + 'To reset a disposable installation, declare the database destroyable first (`npm run db:stamp-scratch -- <database-name>`) and run the reset '
-      + 'again; to keep the records, do not reset this database.',
+      + 'A disposable installation is cleared once its database has been declared destroyable (`npm run db:stamp-scratch -- <database-name>`) and the '
+      + 'database reset is attempted afterwards; an installation whose records must be kept is left as it is.',
   }
 }

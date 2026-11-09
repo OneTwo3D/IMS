@@ -488,7 +488,7 @@ test('a lookup refusal carries the stop signal to the sweep, which stops at once
 })
 
 test('a crash between the file write and the promotion leaves nothing current; the next sweep recovers it', { skip }, async () => {
-  const { db, service, sweep } = await setup()
+  const { db, sweep } = await setup()
   const { order } = await seedOrder(db)
   const keys = [sweep.INVOICE_DOCUMENTS_SWEEP_FLOOR_SETTING]
   const saved = await db.setting.findMany({ where: { key: { in: keys } } })
@@ -685,7 +685,7 @@ test('the importer corrects the order\'s invoice number: the old-number PDF is n
   try {
     const { loadCurrentInvoicePdf } = await import('../../lib/domain/invoice-documents/current-document')
     const t0 = new Date('2026-11-09T10:00:00Z')
-    let now = t0
+    const now = t0
     const bytesFor = (number: string) => pdf(`for-${number}`)
     const deps: Deps = {
       ...depsFor(order),
