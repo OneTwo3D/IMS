@@ -77,7 +77,7 @@ async function agingRow(name = 'Acme') {
 async function exportBody(): Promise<string> {
   const { GET } = await import('@/app/api/export/analytics/route')
   const { NextRequest } = await import('next/server')
-  const res = await GET(new NextRequest('https://ims.test/api/export/analytics?type=po_aging'))
+  const res = await GET(new NextRequest('https://ims.test/api/export/analytics?type=po_aging&metadata=1'))
   return res.text()
 }
 
