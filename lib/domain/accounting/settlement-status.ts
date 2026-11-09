@@ -837,7 +837,9 @@ export function aggregatePaymentSyncRows(rows: PaymentSyncRow[]): PaymentSyncRow
       ...cancelled,
       amount: syncedAmount,
       registeredAmount: syncedRegistered,
-      settlementBasis: cancelled.settlementBasis ?? syncedBasis,
+      // The chosen row's OWN basis. Inheriting another receipt's operator-asserted SYNCED basis made the badge say an
+      // operator settled THIS cancelled attempt, which nobody did (and it would turn UNDECIDED into the asserted wording).
+      settlementBasis: cancelled.settlementBasis,
     }
   }
   const inFlight = rows.filter((r) => r.status === 'PENDING' || r.status === 'PROCESSING')

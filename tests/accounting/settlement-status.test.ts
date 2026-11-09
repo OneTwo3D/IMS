@@ -439,6 +439,20 @@ test('a deleted receipt\'s UNSTAMPED cancellation stays, and the order shows LED
   assert.equal(unpaid.status, 'LEDGER_UNDECIDED')
 })
 
+test('the chosen cancelled row keeps its OWN basis: another receipt\'s operator-asserted SYNCED row does not make the cancelled attempt "operator settled"', () => {
+  const live = new Set(['pay-2'])
+  const rows = effectivePaymentSyncRows([
+    row({ status: 'SYNCED', externalTransactionId: 'PAY-2', amount: 100, paymentId: 'pay-2', settlementBasis: 'OPERATOR_ASSERTION' }),
+    row({ status: 'CANCELLED', externalTransactionId: null, paymentId: 'pay-1' }),
+  ], { livePaymentIds: live })
+  const aggregate = aggregatePaymentSyncRows(rows)!
+  assert.equal(aggregate.settlementBasis ?? null, null)
+  const v = settlementStatus({ ...base, payment: aggregate, totalForeign: 100 })
+  assert.equal(v.status, 'LEDGER_UNDECIDED')
+  assert.notEqual(v.basis, 'OPERATOR_ASSERTION')
+  assert.doesNotMatch(v.detail, /operator/i)
+})
+
 test('a deleted receipt\'s VERIFIED-REVERSAL cancellation is history, like a stamped one', () => {
   const rows = effectivePaymentSyncRows([
     row({ status: 'CANCELLED', externalTransactionId: 'PAY-1', settlementBasis: 'VERIFIED_REVERSAL', paymentId: 'pay-1' }),
