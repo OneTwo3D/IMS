@@ -80,9 +80,32 @@ test('manufacturing cost line parser rounds positive amounts, trims accounts, an
     lines: [{
       description: 'labour',
       amountForeign: 1.2345,
-      amountBase: 1.4813,
+      amountBase: 1.0287,
       accountCode: '5100',
       sortOrder: 2,
     }],
   })
+})
+
+test('manufacturing cost line parser divides by the rate: foreign per ONE base unit (fx_rates convention)', () => {
+  const result = parseManufacturingCostLines([
+    { description: 'EUR labour', amountForeign: 100 },
+  ], 1.17)
+
+  assert.deepEqual(result, {
+    success: true,
+    lines: [{ description: 'EUR labour', amountForeign: 100, amountBase: 85.4701, accountCode: null, sortOrder: 0 }],
+  })
+})
+
+test('manufacturing cost line parser: a rate below 1 makes base larger than foreign, and rate 1 is the identity', () => {
+  const half = parseManufacturingCostLines([{ description: 'x', amountForeign: 10 }], 0.5)
+  assert.deepEqual(half, { success: true, lines: [{ description: 'x', amountForeign: 10, amountBase: 20, accountCode: null, sortOrder: 0 }] })
+  const one = parseManufacturingCostLines([{ description: 'x', amountForeign: 10 }], 1)
+  assert.deepEqual(one, { success: true, lines: [{ description: 'x', amountForeign: 10, amountBase: 10, accountCode: null, sortOrder: 0 }] })
+})
+
+test('manufacturing cost line parser drops a line whose base amount rounds to zero after division', () => {
+  const result = parseManufacturingCostLines([{ description: 'tiny', amountForeign: 0.0001 }], 5)
+  assert.deepEqual(result, { success: true, lines: [] })
 })

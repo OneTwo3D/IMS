@@ -34,7 +34,7 @@ import {
   type Decimal,
   type DecimalInput,
 } from '@/lib/domain/math/decimal'
-import { hasPostEvidence, registrationLedgerStanding } from './payment-ledger-hold'
+import { hasPostEvidence, registrationLedgerStanding, UNDECIDED_REGISTRATION_STATUSES } from './payment-ledger-hold'
 import { isShadowedObligation } from './ledger-standing'
 
 /** The payment sync row for one invoice/bill, reduced to what the verdict depends on. */
@@ -376,6 +376,11 @@ export function settlementStatus(input: {
             + 'payment is on it before recording or registering anything else against it.',
         }
       }
+      // Basis NULL, not FAILED, no id: the only UNDECIDED row left is a CANCELLED one nothing proves unsent (a shadow
+      // carries its own basis and an asserted one is handled above).
+      if (standing === 'UNDECIDED' && (p.settlementBasis ?? null) === null && !(UNDECIDED_REGISTRATION_STATUSES as readonly string[]).includes(p.status) && !hasPostEvidence(p)) {
+        return { status: 'LEDGER_UNDECIDED', discrepancy: true, basis: 'NONE', detail: UNPROVEN_RETIREMENT_DETAIL }
+      }
       if (standing === 'UNDECIDED') {
         return {
           status: 'LEDGER_UNDECIDED',
@@ -625,6 +630,17 @@ export function settlementStatus(input: {
       // word presented as the verdict. The classifier now calls it UNDECIDED, and the verdict has to
       // say so rather than reach the LEDGER_UNRESOLVED sentence beneath, which names a payment id this
       // row does not have.
+      // A CANCELLED row with no id and no stamp that nobody asserted anything about: it was retired without the
+      // proof that it was never sent (a retirement written before the writers recorded it, or a claimed attempt
+      // cancelled by a sweep). Not "never told" - nothing on the row can say that - and not a payment id it lacks.
+      if (standing === 'UNDECIDED' && !assertedPost && !hasPostEvidence(p)) {
+        return {
+          status: 'LEDGER_UNDECIDED',
+          discrepancy: true,
+          basis: 'NONE',
+          detail: UNPROVEN_RETIREMENT_DETAIL,
+        }
+      }
       if (standing === 'UNDECIDED' && assertedPost && !hasPostEvidence(p)) {
         return {
           status: 'LEDGER_UNDECIDED',
@@ -671,8 +687,8 @@ export function settlementStatus(input: {
             + `it before registering anything else against this document.`,
         }
       }
-      // Only a standing the classifier calls NOTHING reaches this line (PROVEN_NOT_POSTED, or the documented
-      // unflagged-CANCELLED divergence), and neither is an operator's assertion: an asserted NOT_POSTED reads
+      // Only a standing the classifier calls NOTHING reaches this line (PROVEN_NOT_POSTED: a retirement that
+      // stamped the pre-call proof, or a verified reversal), and neither is an operator's assertion: an asserted NOT_POSTED reads
       // UNDECIDED above (C1). The sentence used to carry an "it was an OPERATOR'S ASSERTION" clause for a row
       // that could not arrive here; it is gone rather than left to describe a state that no longer exists.
       return {
@@ -686,6 +702,15 @@ export function settlementStatus(input: {
     }
   }
 }
+
+/**
+ * The sentence for a CANCELLED payment registration that names no document and carries no proof it was never
+ * sent. Shared by both branches so the paid-locally and not-paid-locally readings cannot diverge.
+ */
+const UNPROVEN_RETIREMENT_DETAIL =
+  'The payment sync for this settlement was retired, and nothing on the row says whether the accounting system '
+  + 'received it, so IMS cannot say what the ledger holds. Open the invoice there and check whether a '
+  + 'payment is on it before recording or registering anything else against this document.'
 
 /** The states worth surfacing as a problem rather than as progress. */
 export function isSettlementDiscrepancy(v: SettlementVerdict): boolean {
@@ -711,7 +736,8 @@ export function isSettlementDiscrepancy(v: SettlementVerdict): boolean {
  * Two ways a terminal row outlives what it describes, both introduced by doing the right thing
  * elsewhere (Codex, PR #582 round 4):
  *
- *  1. The RECEIPT IT BELONGED TO WAS DELETED. deletePayment retires a queued registration to CANCELLED
+ *  1. The RECEIPT IT BELONGED TO WAS DELETED (and, for a CANCELLED row, the classifier reads NOTHING owed on it).
+ *     deletePayment retires a queued registration to CANCELLED
  *     rather than deleting it — that is what keeps a worker from posting a payment whose only record we
  *     erased — and leaves FAILED rows alone. Record a receipt, delete it, record a corrected one that
  *     posts cleanly, and the aggregate's worst-first rule would still read the dead row and report
@@ -735,7 +761,11 @@ export function effectivePaymentSyncRows(
   const newestSuccessIdx = rows.findIndex((r) => r.status === 'SYNCED')
   return rows.filter((r, i) => {
     if (!isTerminal(r)) return true
-    if (belongsToDeletedReceipt(r)) return false
+    // A deleted receipt's registration is history ONLY when the shared classifier can say nothing is owed on it
+    // (any terminal row, FAILED included): a CANCELLED row that is PROVEN not posted (pre-call stamp) or verified reversed reads NOTHING. An unstamped
+    // cancellation may have reached the ledger, and dropping it would show the order unpaid or settled by another
+    // receipt over a payment that may stand there; it stays, so aggregation surfaces it as UNDECIDED.
+    if (belongsToDeletedReceipt(r)) return registrationLedgerStanding(r) !== 'NOTHING'
     // Newest-first, so a higher index is OLDER: a terminal row older than the newest success is history.
     return !(newestSuccessIdx !== -1 && i > newestSuccessIdx)
   })
@@ -807,7 +837,9 @@ export function aggregatePaymentSyncRows(rows: PaymentSyncRow[]): PaymentSyncRow
       ...cancelled,
       amount: syncedAmount,
       registeredAmount: syncedRegistered,
-      settlementBasis: cancelled.settlementBasis ?? syncedBasis,
+      // The chosen row's OWN basis. Inheriting another receipt's operator-asserted SYNCED basis made the badge say an
+      // operator settled THIS cancelled attempt, which nobody did (and it would turn UNDECIDED into the asserted wording).
+      settlementBasis: cancelled.settlementBasis,
     }
   }
   const inFlight = rows.filter((r) => r.status === 'PENDING' || r.status === 'PROCESSING')

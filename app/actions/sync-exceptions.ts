@@ -1841,7 +1841,7 @@ async function classifyQueuedRowsForRefusals(
     select: {
       id: true, type: true, referenceType: true, referenceId: true, payload: true,
       status: true, attemptRevision: true, externalTransactionId: true,
-      settlementBasis: true, abandonedBeforeRemoteCall: true,
+      settlementBasis: true, abandonedBeforeRemoteCall: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true,
     },
   })
   const live = everyRow.filter(accountingSyncRowCanPostOrHasPosted)

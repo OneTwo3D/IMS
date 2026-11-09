@@ -266,7 +266,7 @@ test(
       created = (await createAccountingSyncLogRow<{ id: string }>(tx, {
         connector: 'xero',
         type: TYPE,
-        status: 'PENDING',
+        status: 'PENDING', attemptStampingCustodyAt: new Date(), // as the production enqueue paths seed it
         referenceType: REFERENCE_TYPE,
         referenceId,
         payload: { narration: `o3d-j625 r9 probe ${referenceId}` },
@@ -533,7 +533,7 @@ test(
       await createAccountingSyncLogRow<{ id: string }>(tx, {
         connector: 'xero',
         type: TYPE,
-        status: 'PENDING',
+        status: 'PENDING', attemptStampingCustodyAt: new Date(), // as the production enqueue paths seed it
         referenceType: REFERENCE_TYPE,
         referenceId,
         payload: { narration: `o3d-j625 r10 rolled back ${referenceId}` },
@@ -587,7 +587,7 @@ test(
       await createAccountingSyncLogRow<{ id: string }>(tx, {
         connector: 'xero',
         type: TYPE,
-        status: 'PENDING',
+        status: 'PENDING', attemptStampingCustodyAt: new Date(), // as the production enqueue paths seed it
         referenceType: REFERENCE_TYPE,
         referenceId,
         payload: { narration: `o3d-j625 r10 committed ${referenceId}` },
@@ -721,7 +721,7 @@ test(
       await createAccountingSyncLogRow<{ id: string }>(tx, {
         connector: 'xero',
         type: TYPE,
-        status: 'PENDING',
+        status: 'PENDING', attemptStampingCustodyAt: new Date(), // as the production enqueue paths seed it
         referenceType: REFERENCE_TYPE,
         referenceId,
         payload: { narration: `o3d-j625 r9 probe ${referenceId}` },
@@ -762,6 +762,9 @@ test(
     await db.accountingSyncLog.create({
       data: {
         connector: 'xero', type: 'INVOICE_PAYMENT', status: 'PENDING', referenceType: 'SalesOrder', referenceId,
+        // Seeded as the production primitive does: in stamping custody, never attempted. A row without the record is
+        // not provably unsent, and the hand-post claim would (rightly) refuse it.
+        attemptStampingCustodyAt: new Date(),
         payload: { paymentId: 'pay-A', _idempotencyKey: `invoice-payment:${referenceId}:pay-A` },
       },
     })
@@ -874,6 +877,7 @@ test(
     const queued = await db.accountingSyncLog.create({
       data: {
         connector: 'xero', type: TYPE, status: 'PENDING', referenceType: REFERENCE_TYPE, referenceId,
+        attemptStampingCustodyAt: new Date(), // as the production primitive seeds it (see above)
         payload: { narration: `o3d-j625 r10 queued after the decision ${referenceId}` },
       },
       select: { id: true, createdAt: true },
@@ -1099,7 +1103,7 @@ test(
       await createAccountingSyncLogRow<{ id: string }>(tx, {
         connector: 'xero',
         type: UPDATE_TYPE,
-        status: 'PENDING',
+        status: 'PENDING', attemptStampingCustodyAt: new Date(), // as the production enqueue paths seed it
         referenceType: UPDATE_REFERENCE_TYPE,
         referenceId,
         payload: { narration: `o3d-j625 r11 EDIT 2, rolled back ${referenceId}` },
@@ -1205,6 +1209,7 @@ test(
         data: {
           connector: 'xero', type: UPDATE_TYPE, status: 'PENDING',
           referenceType: UPDATE_REFERENCE_TYPE, referenceId,
+          attemptStampingCustodyAt: new Date(), // as the production primitive seeds it (see above)
           payload: { narration: `o3d-j625 r12 queued by a process a year behind ${referenceId}` },
           createdAt: new Date(Date.now() - YEAR_MS),
         },
@@ -1322,7 +1327,7 @@ test(
     const aheadDecidedAt = new Date()
     await sleep(20)
     const queued = await db.$transaction(async (tx) => createAccountingSyncLogRow<{ id: string }>(tx, {
-      connector: 'xero', type: UPDATE_TYPE, status: 'PENDING',
+      connector: 'xero', type: UPDATE_TYPE, status: 'PENDING', attemptStampingCustodyAt: new Date(), // as the production enqueue paths seed it
       referenceType: UPDATE_REFERENCE_TYPE, referenceId: aheadRef,
       payload: { narration: `o3d-j625 r11 queued after the decision ${aheadRef}` },
     }), TX)
@@ -1505,7 +1510,7 @@ test(
     const queued = await db.$transaction(async (tx) => createAccountingSyncLogRow<{ id: string }>(tx, {
       connector: 'xero',
       type: RECEIPT_TYPE,
-      status: 'PENDING',
+      status: 'PENDING', attemptStampingCustodyAt: new Date(), // as the production enqueue paths seed it
       referenceType: RECEIPT_REFERENCE_TYPE,
       referenceId,
       payload: { paymentId, _idempotencyKey: `invoice-payment:${referenceId}:${paymentId}` },
@@ -1973,7 +1978,7 @@ test(
     const laterEdit = await db.$transaction(async (tx) => createAccountingSyncLogRow<{ id: string }>(tx, {
       connector: 'xero',
       type: BILL_UPDATE_TYPE,
-      status: 'PENDING',
+      status: 'PENDING', attemptStampingCustodyAt: new Date(), // as the production enqueue paths seed it
       referenceType: BILL_UPDATE_REFERENCE_TYPE,
       referenceId: poId,
       payload: { accountingInvoiceId: billId, _idempotencyKey: `purchase-invoice-update:${poId}:edit-2` },
@@ -2020,7 +2025,7 @@ test(
     const later = await db.$transaction(async (tx) => createAccountingSyncLogRow<{ id: string }>(tx, {
       connector: 'xero',
       type: TYPE,
-      status: 'PENDING',
+      status: 'PENDING', attemptStampingCustodyAt: new Date(), // as the production enqueue paths seed it
       referenceType: REFERENCE_TYPE,
       referenceId,
       payload: { narration: `o3d-j625 r13 the same journal again ${referenceId}` },
@@ -2067,7 +2072,7 @@ test(
     // 1. THE QUEUE COMMITS THE PENDING ROW. Through the production primitive, in its own transaction, which
     //    is what makes the clear a SEPARATE step on the facade path.
     const queued = await db.$transaction(async (tx) => createAccountingSyncLogRow<{ id: string }>(tx, {
-      connector: 'xero', type: TYPE as never, status: 'PENDING',
+      connector: 'xero', type: TYPE as never, status: 'PENDING', attemptStampingCustodyAt: new Date(), // as the production enqueue paths seed it
       referenceType: REFERENCE_TYPE, referenceId,
       payload: { narration: `o3d-j625 r26 queued row ${referenceId}` },
     }), TX)
@@ -2230,7 +2235,7 @@ async function runSalesInvoiceUpdateThroughFacadeShape(
         const created = await deps.createAccountingSyncLogRow(deps.db as never, {
           connector: 'xero',
           type: key.type,
-          status: 'PENDING',
+          status: 'PENDING', attemptStampingCustodyAt: new Date(), // as the production enqueue paths seed it
           referenceType: key.referenceType,
           referenceId,
           payload: { InvoiceID: 'xero-invoice-1' },

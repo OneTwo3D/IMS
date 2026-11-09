@@ -2567,7 +2567,8 @@ model ProductionOrder {
 
   // Order currency + FX for foreign-currency manufacturing costs (labour
   // priced in a non-base currency, etc.). Base totals on cost lines use
-  // this rate. Defaults to base currency / 1.0.
+  // this rate, in the fx_rates convention: 1 base = fxRateToBase foreign, so
+  // base = foreign / fxRateToBase. Defaults to base currency / 1.0.
   currency        String               @default("GBP")
   fxRateToBase    Decimal              @db.Decimal(18, 8) @default(1)
 

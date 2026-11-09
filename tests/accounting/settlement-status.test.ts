@@ -99,9 +99,19 @@ test('a payment that was never queued is the QUIETEST failure, and still a discr
 })
 
 test('a cancelled payment sync is also "the ledger was never told"', () => {
-  const v = settlementStatus({ ...base, payment: row({ status: 'CANCELLED', externalTransactionId: null }) })
+  const v = settlementStatus({ ...base, payment: row({ status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }) })
   assert.equal(v.status, 'NOT_SENT')
   assert.equal(v.discrepancy, true)
+})
+
+test('a cancelled payment sync with NO pre-call stamp is undecided, not "the ledger was never told"', () => {
+  for (const paidLocally of [true, false]) {
+    const v = settlementStatus({ ...base, paidLocally, payment: row({ status: 'CANCELLED', externalTransactionId: null }) })
+    assert.equal(v.status, 'LEDGER_UNDECIDED', `paidLocally=${paidLocally}`)
+    assert.equal(v.discrepancy, true)
+    assert.doesNotMatch(v.detail, /never told about/)
+    assert.doesNotMatch(v.detail, /undefined/)
+  }
 })
 
 test('SYNCED with no ledger id is NOT treated as settled', () => {
@@ -173,7 +183,7 @@ test('turning sync OFF does not unmake a payment the ledger already rejected', (
 })
 
 test('a cancelled payment also survives sync being switched off', () => {
-  const v = settlementStatus({ ...base, syncEnabled: false, payment: row({ status: 'CANCELLED', externalTransactionId: null }) })
+  const v = settlementStatus({ ...base, syncEnabled: false, payment: row({ status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }) })
   assert.equal(v.status, 'NOT_SENT')
   assert.equal(v.discrepancy, true)
 })
@@ -333,7 +343,7 @@ test('a CANCELLED payment leaves an unclaimed order genuinely unpaid', () => {
   // CANCELLED is the one status IMS only ever writes where "nothing stands in the ledger" has
   // ALREADY been established — a queued row retired before any call was made, or a registration
   // retired after Xero was asked and answered DELETED. Nothing is unknown about it.
-  const v = settlementStatus({ ...base, paidLocally: false, payment: row({ status: 'CANCELLED', externalTransactionId: null }) })
+  const v = settlementStatus({ ...base, paidLocally: false, payment: row({ status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }) })
   assert.equal(v.status, 'UNPAID')
   assert.equal(v.discrepancy, false)
 })
@@ -402,12 +412,53 @@ test('a registration whose receipt was deleted no longer speaks for the order', 
   const live = new Set(['pay-2'])
   const rows = effectivePaymentSyncRows([
     row({ status: 'SYNCED', externalTransactionId: 'PAY-2', amount: 100, paymentId: 'pay-2' }),
-    row({ status: 'CANCELLED', externalTransactionId: null, paymentId: 'pay-1' }),
+    row({ status: 'CANCELLED', externalTransactionId: null, paymentId: 'pay-1', abandonedBeforeRemoteCall: true }),
   ], { livePaymentIds: live })
   assert.equal(rows.length, 1)
   const v = settlementStatus({ ...base, payment: aggregatePaymentSyncRows(rows), totalForeign: 100 })
   assert.equal(v.status, 'SETTLED')
   assert.equal(v.discrepancy, false)
+})
+
+test('a deleted receipt\'s UNSTAMPED cancellation stays, and the order shows LEDGER_UNDECIDED (the sales-detail path: filter + aggregate + verdict)', () => {
+  const live = new Set(['pay-2'])
+  const unstamped = row({ status: 'CANCELLED', externalTransactionId: null, paymentId: 'pay-1' })
+  // Beside another receipt's settled registration, newest first.
+  const withOther = effectivePaymentSyncRows([
+    row({ status: 'SYNCED', externalTransactionId: 'PAY-2', amount: 100, paymentId: 'pay-2' }),
+    unstamped,
+  ], { livePaymentIds: live })
+  assert.equal(withOther.length, 2, 'the unproven cancellation is not history')
+  const v = settlementStatus({ ...base, payment: aggregatePaymentSyncRows(withOther), totalForeign: 100 })
+  assert.equal(v.status, 'LEDGER_UNDECIDED')
+  assert.equal(v.discrepancy, true)
+  // Alone, with the order not paid locally any more.
+  const alone = effectivePaymentSyncRows([unstamped], { livePaymentIds: new Set<string>() })
+  assert.equal(alone.length, 1)
+  const unpaid = settlementStatus({ ...base, paidLocally: false, payment: aggregatePaymentSyncRows(alone), totalForeign: 100 })
+  assert.equal(unpaid.status, 'LEDGER_UNDECIDED')
+  assert.match(unpaid.detail, /was retired, and nothing on the row says whether the accounting system received it/)
+})
+
+test('the chosen cancelled row keeps its OWN basis: another receipt\'s operator-asserted SYNCED row does not make the cancelled attempt "operator settled"', () => {
+  const live = new Set(['pay-2'])
+  const rows = effectivePaymentSyncRows([
+    row({ status: 'SYNCED', externalTransactionId: 'PAY-2', amount: 100, paymentId: 'pay-2', settlementBasis: 'OPERATOR_ASSERTION' }),
+    row({ status: 'CANCELLED', externalTransactionId: null, paymentId: 'pay-1' }),
+  ], { livePaymentIds: live })
+  const aggregate = aggregatePaymentSyncRows(rows)!
+  assert.equal(aggregate.settlementBasis ?? null, null)
+  const v = settlementStatus({ ...base, payment: aggregate, totalForeign: 100 })
+  assert.equal(v.status, 'LEDGER_UNDECIDED')
+  assert.notEqual(v.basis, 'OPERATOR_ASSERTION')
+  assert.doesNotMatch(v.detail, /operator/i)
+})
+
+test('a deleted receipt\'s VERIFIED-REVERSAL cancellation is history, like a stamped one', () => {
+  const rows = effectivePaymentSyncRows([
+    row({ status: 'CANCELLED', externalTransactionId: 'PAY-1', settlementBasis: 'VERIFIED_REVERSAL', paymentId: 'pay-1' }),
+  ], { livePaymentIds: new Set<string>() })
+  assert.equal(rows.length, 0)
 })
 
 test('a failure a later success overtook is history; one AFTER the last success is not', () => {
@@ -637,7 +688,7 @@ test('[o3d-1e7sl D9] the verdict states its BASIS for every standing, on the pai
 test('[o3d-anu8] an ordinary connector cancellation is unchanged', () => {
   const v = settlementStatus({
     ...base,
-    payment: row({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: null }),
+    payment: row({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: true }),
     totalForeign: 100,
   })
   assert.equal(v.status, 'NOT_SENT')
