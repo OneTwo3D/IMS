@@ -99,9 +99,19 @@ test('a payment that was never queued is the QUIETEST failure, and still a discr
 })
 
 test('a cancelled payment sync is also "the ledger was never told"', () => {
-  const v = settlementStatus({ ...base, payment: row({ status: 'CANCELLED', externalTransactionId: null }) })
+  const v = settlementStatus({ ...base, payment: row({ status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }) })
   assert.equal(v.status, 'NOT_SENT')
   assert.equal(v.discrepancy, true)
+})
+
+test('a cancelled payment sync with NO pre-call stamp is undecided, not "the ledger was never told"', () => {
+  for (const paidLocally of [true, false]) {
+    const v = settlementStatus({ ...base, paidLocally, payment: row({ status: 'CANCELLED', externalTransactionId: null }) })
+    assert.equal(v.status, 'LEDGER_UNDECIDED', `paidLocally=${paidLocally}`)
+    assert.equal(v.discrepancy, true)
+    assert.doesNotMatch(v.detail, /never told about/)
+    assert.doesNotMatch(v.detail, /undefined/)
+  }
 })
 
 test('SYNCED with no ledger id is NOT treated as settled', () => {
@@ -173,7 +183,7 @@ test('turning sync OFF does not unmake a payment the ledger already rejected', (
 })
 
 test('a cancelled payment also survives sync being switched off', () => {
-  const v = settlementStatus({ ...base, syncEnabled: false, payment: row({ status: 'CANCELLED', externalTransactionId: null }) })
+  const v = settlementStatus({ ...base, syncEnabled: false, payment: row({ status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }) })
   assert.equal(v.status, 'NOT_SENT')
   assert.equal(v.discrepancy, true)
 })
@@ -333,7 +343,7 @@ test('a CANCELLED payment leaves an unclaimed order genuinely unpaid', () => {
   // CANCELLED is the one status IMS only ever writes where "nothing stands in the ledger" has
   // ALREADY been established — a queued row retired before any call was made, or a registration
   // retired after Xero was asked and answered DELETED. Nothing is unknown about it.
-  const v = settlementStatus({ ...base, paidLocally: false, payment: row({ status: 'CANCELLED', externalTransactionId: null }) })
+  const v = settlementStatus({ ...base, paidLocally: false, payment: row({ status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }) })
   assert.equal(v.status, 'UNPAID')
   assert.equal(v.discrepancy, false)
 })
@@ -637,7 +647,7 @@ test('[o3d-1e7sl D9] the verdict states its BASIS for every standing, on the pai
 test('[o3d-anu8] an ordinary connector cancellation is unchanged', () => {
   const v = settlementStatus({
     ...base,
-    payment: row({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: null }),
+    payment: row({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: true }),
     totalForeign: 100,
   })
   assert.equal(v.status, 'NOT_SENT')

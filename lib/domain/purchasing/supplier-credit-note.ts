@@ -23,7 +23,7 @@ import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
  * for the rare untied-inclusive-standard-credit edge case.
  */
 export function resolveSupplierCreditNoteTransitBase(params: {
-  /** The credit's GROSS base-currency amount (amountForeign × fxRateToBase). */
+  /** The credit's GROSS base-currency amount (amountForeign / fxRateToBase). */
   grossBase: number
   /** The offset bill's net subtotal (foreign or base — only the ratio is used). */
   billSubtotalForeign: number

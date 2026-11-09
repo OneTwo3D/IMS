@@ -311,7 +311,10 @@ async function cancelProvablyUnsentRows(
   if (ids.length === 0) return []
   const cancelled = await tx.accountingSyncLog.updateMany({
     where: { id: { in: ids }, status: 'PENDING', attemptRevision: UNCLAIMED_ATTEMPT_REVISION, externalTransactionId: null },
-    data: { status: 'CANCELLED', errorMessage: note, processingStartedAt: null },
+    // The predicate IS the pre-call proof (PENDING, never claimed, no document id), so it is recorded in the same
+    // UPDATE, as the orphan sweep and the sale-cancel sweep record theirs: without it `ledgerStanding` reads the
+    // row UNKNOWN and a same-key re-enqueue stays blocked behind a row this function itself proved unsent.
+    data: { status: 'CANCELLED', errorMessage: note, processingStartedAt: null, abandonedBeforeRemoteCall: true },
   })
   if (cancelled.count !== ids.length) throw new MarkHandledRaceError()
   for (const sync of rows) {

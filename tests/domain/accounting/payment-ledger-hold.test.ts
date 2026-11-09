@@ -47,6 +47,7 @@ function reg(over: Partial<PaymentRegistrationRow> = {}): PaymentRegistrationRow
     // existed carries and what the verified reversal leaves. `true` is the orphan sweep's claim and
     // has to be stated by a fixture that means it.
     abandonedBeforeRemoteCall: null,
+    attemptRevision: 0,
     ...over,
   }
 }
@@ -99,13 +100,14 @@ test('a FAILED row with no document id is UNDECIDED — an attempt nobody can sp
   assert.deepEqual(split.undecided.map((r) => r.id), ['a'])
 })
 
-test('a CANCELLED row with no document id holds nothing and needs no action', () => {
-  // CANCELLED is the one status IMS only ever writes where "nothing was sent" has ALREADY been
-  // established, so unlike FAILED it asserts something rather than merely recording an outcome.
-  const split = splitPaymentRegistrations([reg({ id: 'b', status: 'CANCELLED' })])
+test('a CANCELLED row with no document id holds nothing and needs no action ONLY when it carries the pre-call stamp', () => {
+  // A stamped CANCELLED row asserts "nothing was sent" with its proof; an unstamped one proves nothing and is undecided.
+  const split = splitPaymentRegistrations([reg({ id: 'b', status: 'CANCELLED', abandonedBeforeRemoteCall: true })])
   assert.deepEqual(split.retirable, [])
   assert.deepEqual(split.ledgerHold, [])
   assert.deepEqual(split.undecided, [])
+  const unstamped = splitPaymentRegistrations([reg({ id: 'c', status: 'CANCELLED' })])
+  assert.deepEqual(unstamped.undecided.map((r) => r.id), ['c'])
 })
 
 test('post evidence still wins over undecided: a FAILED row naming a document is a HOLD', () => {
@@ -218,9 +220,10 @@ test('registrationLedgerStanding gives the three answers; a VERIFIED reversal th
   // anything was verified, so it now reads HELD like every other CANCELLED row naming a document.
   assert.equal(registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: 'PAY-1', settlementBasis: 'VERIFIED_REVERSAL' }), 'NOTHING')
   assert.equal(registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: 'PAY-1' }), 'HELD')
-  // A CANCELLED row naming no document and carrying no operator assertion: the documented divergence
-  // from `mayHaveReachedLedger` (see the adapter's header, o3d-7sn5).
-  assert.equal(registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: null }), 'NOTHING')
+  // A CANCELLED row naming no document and carrying no operator assertion agrees with `ledgerStanding`: UNKNOWN
+  // unless the canceller stamped the pre-call proof, which the deletePayment retirements now do.
+  assert.equal(registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: null }), 'UNDECIDED')
+  assert.equal(registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }), 'NOTHING')
 })
 
 test('the splitter is expressed in those same answers, so it cannot classify a row differently', () => {
@@ -229,11 +232,14 @@ test('the splitter is expressed in those same answers, so it cannot classify a r
     reg({ id: 'queued', status: 'PENDING' }),
     reg({ id: 'unknown', status: 'FAILED' }),
     reg({ id: 'reversed', status: 'CANCELLED', externalTransactionId: 'PAY-2', settlementBasis: 'VERIFIED_REVERSAL' }),
+    reg({ id: 'requeued', status: 'PENDING', attemptRevision: 1 }),
+    reg({ id: 'retired-stamped', status: 'CANCELLED', abandonedBeforeRemoteCall: true }),
+    reg({ id: 'retired-unstamped', status: 'CANCELLED' }),
   ]
   const split = splitPaymentRegistrations(rows)
   assert.deepEqual(split.ledgerHold.map((r) => r.id), ['held'])
   assert.deepEqual(split.retirable.map((r) => r.id), ['queued'])
-  assert.deepEqual(split.undecided.map((r) => r.id), ['unknown'])
+  assert.deepEqual(split.undecided.map((r) => r.id), ['unknown', 'requeued', 'retired-unstamped'])
   for (const row of rows) {
     const standing = registrationLedgerStanding(row)
     const bucketed = split.ledgerHold.includes(row) || split.retirable.includes(row) || split.undecided.includes(row)
@@ -472,8 +478,9 @@ test('[o3d-anu8, C1] a CANCELLED registration an OPERATOR asserted HOLDS (with a
   const settled = { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' }
   console.log(`# precondition M15: ${JSON.stringify(settled)} => ${registrationLedgerStanding(settled)}`)
   assert.equal(registrationLedgerStanding(settled), 'UNDECIDED')
-  // ISOLATING ARM: the identical row without the assertion is still NOTHING (the documented divergence).
-  assert.equal(registrationLedgerStanding({ ...settled, settlementBasis: null }), 'NOTHING')
+  // ISOLATING ARM: the identical row without the assertion is UNDECIDED too (nothing proves it unsent), and NOTHING only once stamped.
+  assert.equal(registrationLedgerStanding({ ...settled, settlementBasis: null }), 'UNDECIDED')
+  assert.equal(registrationLedgerStanding({ ...settled, settlementBasis: null, abandonedBeforeRemoteCall: true }), 'NOTHING')
   // The splitter files it under `undecided`, so deletePayment refuses.
   const split = splitPaymentRegistrations([reg({ id: 'settled', ...settled })])
   assert.deepEqual(split.undecided.map((r) => r.id), ['settled'])
@@ -540,7 +547,7 @@ test('[o3d-f709] a CANCELLED registration the ORPHAN SWEEP retired still HOLDS w
 test('[o3d-f709] the delete split routes the orphan-swept posted registration into ledgerHold', () => {
   const row = {
     id: 'r1', connector: 'xero', status: 'CANCELLED', externalTransactionId: 'PAY-9',
-    settlementBasis: null, abandonedBeforeRemoteCall: true,
+    settlementBasis: null, abandonedBeforeRemoteCall: true, attemptRevision: 0,
   }
   // Asserted rather than assumed: a fixture that lost its id would make this pass while testing the
   // shape next door.
@@ -557,7 +564,7 @@ test('[o3d-anu8] the delete split routes the asserted cancellation into ledgerHo
   const split = splitPaymentRegistrations([
     {
       id: 'r1', connector: 'xero', status: 'CANCELLED', externalTransactionId: 'PAY-1',
-      settlementBasis: 'OPERATOR_ASSERTION', abandonedBeforeRemoteCall: null,
+      settlementBasis: 'OPERATOR_ASSERTION', abandonedBeforeRemoteCall: null, attemptRevision: 0,
     },
   ])
   assert.deepEqual(split.ledgerHold.map((row) => row.id), ['r1'])

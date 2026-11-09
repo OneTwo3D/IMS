@@ -30,6 +30,8 @@ type SyncRow = {
   /** o3d-f709: the ledger-standing columns; absent in the double reads as null, as an untouched row does. */
   settlementBasis?: string | null
   abandonedBeforeRemoteCall?: boolean | null
+  /** Claim count; 0 = never claimed. Defaulted by `syncRow`. */
+  attemptRevision?: number
 }
 
 /**
@@ -320,6 +322,7 @@ function syncRow(over: Partial<SyncRow> = {}): SyncRow {
     externalTransactionId: 'PAY-9',
     errorMessage: null,
     payload: { paymentId: 'pay-1' },
+    attemptRevision: 0,
     ...over,
   }
 }
@@ -419,14 +422,24 @@ test('a FAILED registration is READ at all — the query, not just the classific
   assert.ok(readWithStatus, 'the registration query must ask for FAILED rows, not only rows with a document id')
 })
 
-test('a CANCELLED registration with no document id and no operator assertion still lets the receipt go', async () => {
-  // The boundary of the change. widening FAILED must not sweep up the rows IMS itself retired and make
-  // an ordinary correction impossible (the documented divergence from mayHaveReachedLedger, o3d-7sn5).
+test('a CANCELLED registration carrying the pre-call stamp still lets the receipt go; the same row UNSTAMPED refuses', async () => {
+  // The boundary of the change. Widening FAILED must not sweep up the rows IMS retired WITH proof. Rows retired
+  // without the stamp (before the writers stamped it) prove nothing and now read UNDECIDED.
   const { deletePayment } = await loadActions()
-  state.syncRows = [syncRow({ status: 'CANCELLED', externalTransactionId: null })]
+  state.syncRows = [syncRow({ status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true })]
   const result = await deletePayment('pay-1', 'order-1')
   assert.equal(result.success, true)
   assert.ok(!paymentStillThere())
+})
+
+test('the identical CANCELLED registration WITHOUT the pre-call stamp refuses the delete (isolating arm)', async () => {
+  const { deletePayment } = await loadActions()
+  // `abandonedBeforeRemoteCall: null` is what an untouched column holds; the double reads an absent property differently.
+  state.syncRows = [syncRow({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: null })]
+  const refused = await deletePayment('pay-1', 'order-1')
+  assert.equal(refused.success, false)
+  assert.equal(refused.code, 'registration_attempt_undecided')
+  assert.ok(paymentStillThere())
 })
 
 test('[o3d-f709 M15, C1] a CANCELLED registration an operator settled NOT_POSTED REFUSES the delete - it is read, and it is UNDECIDED', async () => {
@@ -453,7 +466,21 @@ test('a receipt with only a queued registration deletes, retiring it in the SAME
   assert.ok(!paymentStillThere())
   assert.equal(row().status, 'CANCELLED')
   assert.match(row().errorMessage ?? '', /Retired: the local payment it registered was deleted/)
+  assert.equal(row().abandonedBeforeRemoteCall, true, 'the retirement records the pre-call proof in the same UPDATE')
   assert.equal(state.order.paidAt, null, 'the order is no longer fully paid')
+})
+
+test('a queued registration that was CLAIMED once (attemptRevision > 0) is not retired: the delete refuses and nothing is stamped', async () => {
+  // PENDING again after a failed attempt: the remote call may have posted. Stamping it would forge the proof.
+  const { deletePayment } = await loadActions()
+  state.syncRows = [syncRow({ status: 'PENDING', externalTransactionId: null, attemptRevision: 2 })]
+  const result = await deletePayment('pay-1', 'order-1')
+  assert.equal(result.success, false)
+  assert.equal(result.code, 'registration_attempt_undecided')
+  assert.match(result.error ?? '', /queued for a retry after an earlier attempt/)
+  assert.ok(paymentStillThere())
+  assert.equal(row().status, 'PENDING')
+  assert.notEqual(row().abandonedBeforeRemoteCall, true)
 })
 
 test('a registration claimed by a worker mid-delete ABORTS the delete instead of stranding it', async () => {

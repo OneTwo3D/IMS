@@ -32,6 +32,7 @@
 
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { isShadowedObligation, ledgerStanding } from './ledger-standing'
+import { UNCLAIMED_ATTEMPT_REVISION } from './sync-log-attempt'
 import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from './sync-row-settlement'
 
 /** The sync type that registers a locally-recorded sales receipt against the ledger invoice. */
@@ -121,10 +122,16 @@ export type PaymentRegistrationRow = {
    * verdict.
    */
   abandonedBeforeRemoteCall: boolean | null
+  /**
+   * How many times a worker has CLAIMED this row (0 = never). REQUIRED, for the same reason as the column
+   * above: absent would read as "never claimed", which is the permissive answer. A PENDING row above 0 was
+   * claimed, failed and was queued again, so it may have posted; only revision 0 is provably unsent.
+   */
+  attemptRevision: number
 }
 
 export type PaymentRegistrationSplit = {
-  /** PENDING, nothing sent, nothing to take back — deletePayment retires these itself. */
+  /** PENDING, never claimed (attemptRevision 0), no document id: nothing sent, nothing to take back — deletePayment retires these itself, stamping the proof. */
   retirable: PaymentRegistrationRow[]
   /**
    * Rows the ledger holds, or that carry evidence of a document that exists. A FAILED row with a
@@ -189,14 +196,11 @@ export type RegistrationLedgerStanding =
  *   UNKNOWN                                     -> FAILED / an unrecognised basis -> UNDECIDED;
  *                                                  CANCELLED with NULL basis and no id -> NOTHING.
  *
- * THAT LAST ARM IS THE ONE DELIBERATE DIVERGENCE FROM `mayHaveReachedLedger`, and it is stated rather
- * than hidden (o3d-7sn5): an unflagged CANCELLED registration with no id and no operator assertion
- * reads UNKNOWN to the module and NOTHING here. The producers of that row on THIS path are the two
- * `deletePayment` retirements ("Retired: the local payment it registered was deleted"), which retire
- * PENDING rows this very module classifies `retirable` - nothing sent. Reading them UNDECIDED would
- * alarm for ever over every order that ever had a receipt deleted. Closing the divergence means
- * stamping those writers `abandonedBeforeRemoteCall` and reading the arm UNDECIDED; that is filed,
- * not done here.
+ * THERE IS NO LONGER A DIVERGENCE FROM `ledgerStanding`. An unflagged CANCELLED registration with
+ * no id and no operator assertion reads UNKNOWN to the module and UNDECIDED here. The two `deletePayment`
+ * retirements ("Retired: the local payment it registered was deleted") now stamp `abandonedBeforeRemoteCall`
+ * in the same UPDATE, over PENDING rows at attemptRevision 0 with no id, so what they write reads NOTHING.
+ * Rows retired before that change stay UNDECIDED: nothing on them can say they were never sent.
  *
  * `settlementBasis` and `abandonedBeforeRemoteCall` stay OPTIONAL in the parameter, as before, and
  * absent reads as null: callers that have only a status and an id (the settlement verdict) are not
@@ -238,8 +242,8 @@ export function registrationLedgerStanding(
   if (hasPostEvidence(row)) return 'HELD'
   if ((UNDECIDED_REGISTRATION_STATUSES as readonly string[]).includes(row.status)) return 'UNDECIDED'
   if (row.status === 'CANCELLED') {
-    const unflagged = (row.settlementBasis ?? null) === null && !hasPostEvidence(row)
-    return unflagged ? 'NOTHING' : 'UNDECIDED'
+    // Reached only for a CANCELLED row `ledgerStanding` could not prove (UNKNOWN): nothing says it was never sent.
+    return 'UNDECIDED'
   }
   if ((LEDGER_HELD_REGISTRATION_STATUSES as readonly string[]).includes(row.status)) return 'HELD'
   return 'NOTHING'
@@ -269,8 +273,14 @@ export function splitPaymentRegistrations(rows: readonly PaymentRegistrationRow[
       // verdict — a queued payment is on its way to the ledger and IMS must not look settled-free —
       // but for the DELETE it takes nothing away, because nothing has left yet. The compare-and-swap
       // in deletePayment is what makes that safe: a worker claiming it in the window aborts.
-      if (row.status === 'PENDING' && !hasPostEvidence(row)) retirable.push(row)
-      else ledgerHold.push(row)
+      // ...and only if it was NEVER CLAIMED. A PENDING row above attemptRevision 0 was claimed, failed and was
+      // queued again: the remote call may have posted before the failure was written down (o3d-ju8t), so it is
+      // an attempt nobody can speak for, exactly like a FAILED one. Retiring it would either forge the pre-call
+      // proof or leave an unstamped CANCELLED row that reads UNDECIDED for ever.
+      if (row.status === 'PENDING' && !hasPostEvidence(row)) {
+        if (row.attemptRevision === UNCLAIMED_ATTEMPT_REVISION) retirable.push(row)
+        else undecided.push(row)
+      } else ledgerHold.push(row)
     } else if (standing === 'UNDECIDED') {
       undecided.push(row)
     }
@@ -363,6 +373,15 @@ export function describeAttemptUndecidedRefusal(
       + 'accounting system IMS did not check, not proof - the payment may still be there - so it does not '
       + 'free this receipt for deletion.'
     : ''
+  // A PENDING row above attemptRevision 0 was claimed, failed and queued again: it is "undecided" because the claim
+  // may have posted, not because it FAILED, and the operator needs the way out named.
+  const requeuedAfterClaim = undecided.some((row) => row.status === 'PENDING')
+  const requeuedNote = requeuedAfterClaim
+    ? '\n\nOne of these entries is queued for a retry after an earlier attempt, so it may already have posted. It cannot be '
+      + 'cancelled here as "never sent". Check the invoice in the accounting system: if a payment is there, reverse it, then '
+      + 'use "Check that payment and delete" (reverse in ledger) with its payment reference; IMS will verify it with the '
+      + 'accounting system before removing anything.'
+    : ''
   // THE PRODUCER-SIDE HOLD: a SHADOW is not an attempt by IMS at all, so "IMS tried ... FAILED" would be untrue of it. It gets
   // its own account: IMS did not send the registration, and the writer that owns payment registration may have.
   const shadowed = undecided.filter((row) => isShadowedObligation({
@@ -406,7 +425,8 @@ export function describeAttemptUndecidedRefusal(
       + `IMS cannot settle this on its own: the failed entry (${entries}) names no payment to look up, `
       + 'and an invoice showing nothing looks the same whether the payment was removed or never '
       + 'arrived — which is why the reference has to come from you, and why IMS still checks it.'
-      + operatorNote,
+      + operatorNote
+      + requeuedNote,
   }
 }
 
