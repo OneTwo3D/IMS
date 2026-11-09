@@ -13,8 +13,8 @@ import type { WcFullOrder } from '@/lib/connectors/woocommerce/sync/types'
 
 type Slice = Pick<WcFullOrder, 'line_items' | 'shipping_lines' | 'fee_lines' | 'tax_lines'>
 
-const item = (name: string, total: string, taxes: Array<{ id: number; total: string }>) =>
-  ({ id: 1, name, product_id: 1, variation_id: 0, quantity: 1, tax_class: '', subtotal: total, subtotal_tax: '0', total, total_tax: '0', taxes: taxes.map((t) => ({ ...t, subtotal: t.total })), meta_data: [], sku: 'S', price: 1 }) as WcFullOrder['line_items'][number]
+const item = (name: string, total: string, taxes: Array<{ id: number; total: string; subtotal?: string }>, subtotal = total) =>
+  ({ id: 1, name, product_id: 1, variation_id: 0, quantity: 1, tax_class: '', subtotal, subtotal_tax: '0', total, total_tax: '0', taxes: taxes.map((t) => ({ ...t, subtotal: t.subtotal ?? t.total })), meta_data: [], sku: 'S', price: 1 }) as WcFullOrder['line_items'][number]
 const order = (over: Partial<Slice> = {}): Slice => ({ line_items: [], shipping_lines: [], fee_lines: [], tax_lines: [], ...over })
 const mapped = (name: string, active = true): WcRateResolution => ({ source: 'mapped', taxRateName: name, active })
 
@@ -84,4 +84,33 @@ test('the importer is wired to refuse: the document is stamped, no payment regis
   assert.match(mapping, /active: mapping\.taxRate\.active/)
   assert.match(mapping, /reverseCharge: true, active: true \}/)
   assert.match(importer, /noTaxKind: 'fee-no-tax' as const/)
+})
+
+// Each source of "money" is sufficient ON ITS OWN: the rate is refused when only that one figure is non-zero.
+const NO_MAP = new Map<number, WcRateResolution>()
+const ids = (o: Slice) => findWcRateMoneyProblems(o, NO_MAP).map((p) => p.wcRateId)
+
+test('a line item moved money by its net alone, its pre-discount subtotal alone, its tax alone, or its pre-discount tax alone', () => {
+  assert.deepEqual(ids(order({ line_items: [item('A', '10.00', [{ id: 11, total: '0', subtotal: '0' }], '0')] })), [11], 'net (total) alone')
+  assert.deepEqual(ids(order({ line_items: [item('A', '0', [{ id: 12, total: '0', subtotal: '0' }], '10.00')] })), [12], 'subtotal alone (a 100% coupon line)')
+  assert.deepEqual(ids(order({ line_items: [item('A', '0', [{ id: 13, total: '2.00', subtotal: '0' }], '0')] })), [13], 'tax total alone')
+  assert.deepEqual(ids(order({ line_items: [item('A', '0', [{ id: 14, total: '0', subtotal: '2.00' }], '0')] })), [14], 'tax subtotal alone')
+  assert.deepEqual(ids(order({ line_items: [item('A', '0', [{ id: 15, total: '0', subtotal: '0' }], '0')] })), [], 'and nothing at all moves nothing')
+})
+
+test('shipping and a fee moved money by net alone and by tax alone', () => {
+  const ship = (id: number, total: string, tax: string) => ({ id: 2, method_title: 'P', method_id: 'f', total, total_tax: '0', taxes: [{ id, total: tax }] })
+  const fee = (id: number, total: string, tax: string) => ({ id: 3, name: 'F', total, total_tax: '0', taxes: [{ id, total: tax }] })
+  assert.deepEqual(ids(order({ shipping_lines: [ship(21, '4.00', '0')] })), [21])
+  assert.deepEqual(ids(order({ shipping_lines: [ship(22, '0', '0.80')] })), [22], 'shipping tax alone')
+  assert.deepEqual(ids(order({ fee_lines: [fee(23, '3.00', '0')] })), [23])
+  assert.deepEqual(ids(order({ fee_lines: [fee(24, '0', '0.60')] })), [24], 'fee tax alone')
+  assert.deepEqual(ids(order({ shipping_lines: [ship(25, '0', '0')], fee_lines: [fee(26, '0', '0')] })), [])
+})
+
+test('tax_lines moved money by cart tax alone and by shipping tax alone', () => {
+  const tl = (rate_id: number, tax_total: string, shipping_tax_total: string) => ({ id: 1, rate_code: 'X', rate_id, label: 'X', compound: false, tax_total, shipping_tax_total })
+  assert.deepEqual(ids(order({ tax_lines: [tl(31, '1.00', '0')] })), [31])
+  assert.deepEqual(ids(order({ tax_lines: [tl(32, '0', '1.00')] })), [32], 'shipping tax alone')
+  assert.deepEqual(ids(order({ tax_lines: [tl(33, '0', '0')] })), [])
 })

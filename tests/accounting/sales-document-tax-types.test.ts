@@ -127,5 +127,6 @@ test('the poster and both connector modules run the same refusal; no sales path 
   // The sales credit note is the first DEFAULT_TAX_TYPE site; the supplier credit note below is a PURCHASE document and keeps its default (out of scope).
   const salesPart = credit.slice(0, credit.indexOf('export const XERO_PURCHASE_CREDIT_NOTE_TYPE'))
   assert.doesNotMatch(salesPart, /DEFAULT_TAX_TYPE/)
+  assert.doesNotMatch(salesPart, /\|\|\s*'NONE'/)
   assert.match(salesPart, /salesDocumentTaxTypeRefusal\(/)
 })
