@@ -1,4 +1,5 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
+import { withLiveAsnsSetAside } from './po-landed-fixtures'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import { config } from 'dotenv'
@@ -1792,9 +1793,9 @@ test('o3d-6nd55 r5: a supplier return interleaved with a receipt of the same PO 
   const seeded = await seedAlignmentTarget('R5', 10, 5)
 
   // Something to return: a first receipt, run to completion with no barrier.
-  const firstReceipt = await receivePurchaseOrder(seeded.poId, [
+  const firstReceipt = await withLiveAsnsSetAside(seeded.poId, () => receivePurchaseOrder(seeded.poId, [
     { poLineId: seeded.poLineId, qtyReceived: 6, warehouseId: seeded.warehouseId },
-  ])
+  ]))
   assert.equal(firstReceipt.success, true, `PRECONDITION: the seeding receipt must succeed: ${firstReceipt.error}`)
   const beforeLine = await db.purchaseOrderLine.findUniqueOrThrow({
     where: { id: seeded.poLineId },
@@ -1815,9 +1816,9 @@ test('o3d-6nd55 r5: a supplier return interleaved with a receipt of the same PO 
   // The receipt holds the PARENT and has not yet touched the stock row.
   let receiptResult: { success: boolean; error?: string } | null = null as { success: boolean; error?: string } | null
   let receiptError: unknown = null
-  const receiving = receivePurchaseOrder(seeded.poId, [
+  const receiving = withLiveAsnsSetAside(seeded.poId, () => receivePurchaseOrder(seeded.poId, [
     { poLineId: seeded.poLineId, qtyReceived: 2, warehouseId: seeded.warehouseId },
-  ]).then(
+  ])).then(
     (result) => { receiptResult = result },
     (error) => { receiptError = error },
   )

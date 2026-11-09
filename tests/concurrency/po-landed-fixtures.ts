@@ -197,6 +197,29 @@ export async function alignUp(po: SeededPo, line: SeededLine, amounts: { delta: 
   })
 }
 
+/**
+ * Run `fn` with the order's live ASNs set aside (closedAt stamped), then put them back. A manual receipt for a line with a live
+ * ASN is now refused (po-receipt-asn-guard), but a database that holds receipts accepted BEFORE the guard still has that history;
+ * the book-in and alignment arms that exercise it seed it through this helper. It reaches the receipt action only through the
+ * ASN being absent, so the guard is bypassed by CONDITIONS, never by a flag in the action.
+ */
+export async function withLiveAsnsSetAside<T>(poId: string, fn: () => Promise<T>): Promise<T> {
+  const { db } = await import('@/lib/db')
+  const live = await db.wmsAsnMap.findMany({ where: { sourceType: 'PURCHASE_ORDER', sourceId: poId, closedAt: null }, select: { id: true } })
+  const ids = live.map((row) => row.id)
+  await db.wmsAsnMap.updateMany({ where: { id: { in: ids } }, data: { closedAt: new Date() } })
+  try {
+    return await fn()
+  } finally {
+    await db.wmsAsnMap.updateMany({ where: { id: { in: ids } }, data: { closedAt: null } })
+  }
+}
+
+/** A manual receipt as it could be made before the live-ASN guard existed. */
+export async function receiveLegacy(po: SeededPo, line: SeededLine, qty: number) {
+  return withLiveAsnsSetAside(po.poId, () => receive(po, line, qty))
+}
+
 export async function receive(po: SeededPo, line: SeededLine, qty: number) {
   const { receivePurchaseOrder } = await import('@/app/actions/purchase-orders')
   return receivePurchaseOrder(po.poId, [{ poLineId: line.poLineId, qtyReceived: qty, warehouseId: po.warehouseId }])
