@@ -1068,7 +1068,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
 // Mutations
 // ---------------------------------------------------------------------------
 
-type OrderTaxRow = NonNullable<Awaited<ReturnType<typeof db.taxRate.findUnique<{ select: typeof taxRateProfileSelect }>>>>
+type OrderTaxRow = Prisma.TaxRateGetPayload<{ select: typeof taxRateProfileSelect }>
 
 /**
  * The order-level tax rate a purchase order names. An id wins outright. A name alone is looked up the way the purchase-order importer
