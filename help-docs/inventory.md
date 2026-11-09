@@ -89,6 +89,13 @@ Rules for the `components` column:
   with no recipe looks perfectly normal on the product page. Re-import the row once the component
   exists. A partial recipe is never written, which is deliberate: a recipe missing one component
   would produce under-picked builds and mis-picked orders that nothing reports.
+- **Every part is `SKU:qty`, and the quantity is read strictly.** A plain positive number with a point
+  for the decimal mark and at most 4 decimal places (`1`, `2.5`, `0.0001`). A part with no `:`, a
+  quantity such as `1,5`, `2 units`, `3abc`, `1e3` or `-1`, or a zero quantity is refused, and as with
+  an unknown SKU the whole recipe for that row is refused (`Row N: invalid component "X": ...`).
+  The quantity is what follows the last `:`, so a component SKU that itself contains `:` (`PART:A:2`) is read as SKU `PART:A`.
+  The importer used to read a numeric prefix and to give a part with no `:` quantity 1, so a decimal
+  comma loaded as 1 with nothing reported.
 - **A circular recipe is refused.** A product cannot be a component of itself, directly or through a
   chain. Both the fulfilment copy and the planning copy are checked, and a refusal writes neither.
 - **A BOM recipe can be re-imported at any time**, regardless of open sales orders — see the BOM

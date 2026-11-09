@@ -236,7 +236,7 @@ test('LIVE: one write, the marker is saved, a rescan and a replay send nothing m
     assert.equal(tick.succeeded, 1, JSON.stringify(tick))
     assert.equal(transport.puts.length, 1)
     assert.deepEqual(transport.puts[0]!.body, { meta_data: [{ key: '_ims_invoice_pdf_available', value: 'yes' }] })
-    assert.equal(transport.puts[0]!.path, `orders/wc-${order.orderNumber!.slice(5)}`)
+    assert.equal(transport.puts[0]!.path, `/orders/wc-${order.orderNumber!.slice(5)}`)
     const marker = await d.db.invoiceStorePublication.findUniqueOrThrow({ where: { orderId: order.id } })
     const doc = await d.db.salesOrderInvoiceDocument.findFirstOrThrow({ where: { orderId: order.id } })
     assert.equal(marker.flagDocumentId, doc.id)
