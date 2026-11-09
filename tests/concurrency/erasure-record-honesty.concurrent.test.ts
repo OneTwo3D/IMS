@@ -33,6 +33,7 @@ async function seed(db: Db, opts: { accounting: boolean }) {
   const despatched = await mk('SHIPPED'); const open = await mk('PROCESSING'); const cancelled = await mk('PROCESSING')
   const merged = await mk('PROCESSING'); const noLink = await mk('DRAFT'); const withShipment = await mk('PROCESSING')
   const confirmedCancel = await mk('PROCESSING'); const notFoundCancel = await mk('PROCESSING'); const legacyNoId = await mk('PROCESSING')
+  const validationAttempted = await mk('PROCESSING'); const holdEvent = await mk('PROCESSING'); const failedCancel = await mk('PROCESSING')
   const partial = await mk('PROCESSING'); const ambiguousA = await mk('PROCESSING'); const ambiguousB = await mk('PROCESSING'); const validationFailed = await mk('PROCESSING')
   const link = (orderId: string, state: string, ext: string | null, num: string | null) =>
     db.wmsOrderPushLink.create({ data: { orderId, connector: 'mintsoft', externalOrderId: ext, externalOrderNumber: num, state } as never })
@@ -47,6 +48,11 @@ async function seed(db: Db, opts: { accounting: boolean }) {
   await cancelEvent(confirmedCancel.id, 'CANCELLED'); await cancelEvent(notFoundCancel.id, 'NOT_FOUND')
   // A legacy or replayed link: no id, every attempt column cleared, in the plain create-queue state. IMS cannot prove nothing was sent.
   await link(legacyNoId.id, 'PENDING_CREATE', null, null)
+  // A VALIDATION_FAILED link that already spent remote attempts is NOT the proven shape; a cancel audit that is a HOLD, and a cancel audit that FAILED, are not confirmations.
+  await db.wmsOrderPushLink.create({ data: { orderId: validationAttempted.id, connector: 'mintsoft', state: 'VALIDATION_FAILED', attempts: 2 } as never })
+  await link(holdEvent.id, 'CANCELLED', 'm-12', 'MS-12'); await link(failedCancel.id, 'CANCELLED', 'm-13', 'MS-13')
+  await db.wmsMutationEvent.create({ data: { connector: 'mintsoft', direction: 'OUTBOUND', action: 'order_hold', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: holdEvent.id, summary: 'hold', after: { wmsCancelStatus: 'CANCELLED' } } as never })
+  await db.wmsMutationEvent.create({ data: { connector: 'mintsoft', direction: 'OUTBOUND', action: 'order_cancel', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: failedCancel.id, summary: 'cancel failed', after: { wmsCancelStatus: 'CANCELLED' } } as never })
   // A payload that could not be built: provably never sent.
   await db.wmsOrderPushLink.create({ data: { orderId: validationFailed.id, connector: 'mintsoft', state: 'VALIDATION_FAILED', attempts: 0, lastAttemptAt: new Date() } as never })
   const warehouse = await db.warehouse.create({ data: { code: `HON-${randomUUID().slice(0, 8)}`, name: 'Honesty warehouse', syncToStore: true, availableForSale: true } })
@@ -54,9 +60,9 @@ async function seed(db: Db, opts: { accounting: boolean }) {
   await db.shipment.create({ data: { orderId: withShipment.id, warehouseId: warehouse.id } })
   await db.shipment.create({ data: { orderId: partial.id, warehouseId: warehouse.id, status: 'SHIPPED', shippedAt: new Date() } as never })
   if (opts.accounting) await db.accountingSyncLog.create({ data: { connector: 'xero', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: despatched.id, status: 'SYNCED', payload: { contactName: NAME } } as never })
-  const orderIds = [despatched.id, open.id, cancelled.id, merged.id, confirmedCancel.id, notFoundCancel.id, legacyNoId.id, noLink.id, withShipment.id, partial.id, ambiguousA.id, ambiguousB.id, validationFailed.id]
+  const orderIds = [validationAttempted.id, holdEvent.id, failedCancel.id, despatched.id, open.id, cancelled.id, merged.id, confirmedCancel.id, notFoundCancel.id, legacyNoId.id, noLink.id, withShipment.id, partial.id, ambiguousA.id, ambiguousB.id, validationFailed.id]
   return {
-    customerId: customer.id, orderIds, ids: { despatched: despatched.id, open: open.id, merged: merged.id, pendingShipment: withShipment.id, partial: partial.id, ambiguousA: ambiguousA.id, ambiguousB: ambiguousB.id, notFoundCancel: notFoundCancel.id, legacyNoId: legacyNoId.id, cancelledNoEvidence: cancelled.id },
+    customerId: customer.id, orderIds, ids: { despatched: despatched.id, open: open.id, merged: merged.id, pendingShipment: withShipment.id, partial: partial.id, ambiguousA: ambiguousA.id, ambiguousB: ambiguousB.id, notFoundCancel: notFoundCancel.id, legacyNoId: legacyNoId.id, cancelledNoEvidence: cancelled.id, validationAttempted: validationAttempted.id, holdEvent: holdEvent.id, failedCancel: failedCancel.id },
     async cleanup() {
       await db.notification.deleteMany({ where: { title: 'Personal data remains in the warehouse', createdAt: { gte: new Date(Date.now() - 600_000) } } })
       await db.wmsMutationEvent.deleteMany({ where: { entityId: { in: orderIds } } })
@@ -96,10 +102,10 @@ test('[erasure record] the per-system verdicts and the warehouse enumeration are
   // The warehouse's copy, order by order: only the SHIPPED order is despatched. The plain processing order, the MERGED one, the order with a PENDING shipment and the
   // partly shipped order (a SHIPPED shipment, order not yet SHIPPED) are all OPEN and listed. The cancelled link is closed. A link that provably never sent holds nothing
   // (never claimed, and the one whose payload could not be built). Two creates whose outcome was never recorded are AMBIGUOUS and listed. The order with no link is not counted.
-  assert.deepEqual({ ...p.warehouse, openOrders: undefined, ambiguousOrders: undefined }, { linkedOrders: 8, despatched: 1, open: 4, cancelled: 1, notPushed: 1, ambiguous: 5, merged: 1, openOrders: undefined, ambiguousOrders: undefined })
+  assert.deepEqual({ ...p.warehouse, openOrders: undefined, ambiguousOrders: undefined }, { linkedOrders: 10, despatched: 1, open: 4, cancelled: 1, notPushed: 1, ambiguous: 8, merged: 1, openOrders: undefined, ambiguousOrders: undefined })
   assert.deepEqual(p.warehouse.openOrders.map((o) => o.warehouseOrderNumber).sort(), ['MS-2', 'MS-5+MS-6', 'MS-7', 'MS-8'])
   assert.deepEqual(p.warehouse.openOrders.map((o) => o.orderId).sort(), [fx.ids.open, fx.ids.merged, fx.ids.pendingShipment, fx.ids.partial].sort())
-  assert.deepEqual(p.warehouse.ambiguousOrders.map((o) => o.orderId).sort(), [fx.ids.ambiguousA, fx.ids.ambiguousB, fx.ids.notFoundCancel, fx.ids.legacyNoId, fx.ids.cancelledNoEvidence].sort())
+  assert.deepEqual(p.warehouse.ambiguousOrders.map((o) => o.orderId).sort(), [fx.ids.ambiguousA, fx.ids.ambiguousB, fx.ids.notFoundCancel, fx.ids.legacyNoId, fx.ids.cancelledNoEvidence, fx.ids.validationAttempted, fx.ids.holdEvent, fx.ids.failedCancel].sort())
   assert.ok(p.warehouse.ambiguousOrders.some((o) => o.orderId === fx.ids.notFoundCancel && o.warehouseOrderNumber === 'MS-11'), 'a NOT_FOUND cancellation is listed with its warehouse number')
   assert.equal(p.systems.warehouse, 'refused', 'open orders: IMS wrote nothing to the live warehouse')
   assert.equal(p.systems.accounting, 'refused-pending-legal', 'the Xero contact is left as it is, pending the accountant')
@@ -109,10 +115,10 @@ test('[erasure record] the per-system verdicts and the warehouse enumeration are
   // The proof carries no identity.
   assert.doesNotMatch(JSON.stringify(p), new RegExp(`${NAME}|${EMAIL.replace(/[+.]/g, '\\$&')}`))
   // The operator is told at once, with a count and the request id and nothing about the person; the result carries the same count.
-  if (result.success) { assert.equal(result.warehouse.open, 4); assert.equal(result.warehouse.ambiguous, 5) }
+  if (result.success) { assert.equal(result.warehouse.open, 4); assert.equal(result.warehouse.ambiguous, 8) }
   const notes = await db.notification.findMany({ where: { title: 'Personal data remains in the warehouse', createdAt: { gte: since } } })
   assert.equal(notes.length, 1)
-  assert.match(notes[0]!.message, /^4 open warehouse orders still hold.*5 warehouse orders may exist there/)
+  assert.match(notes[0]!.message, /^4 open warehouse orders still hold.*8 warehouse orders may exist there/)
   assert.doesNotMatch(JSON.stringify(notes), new RegExp(`${NAME}|${EMAIL.replace(/[+.]/g, '\\$&')}`))
   // THE READ-ONLY VIEW shows the record and carries no erased value.
   const { listErasureRecords } = await import('@/lib/domain/erasure/erasure-record-view')
@@ -121,11 +127,11 @@ test('[erasure record] the per-system verdicts and the warehouse enumeration are
   assert.ok(mine, 'the record is listed')
   assert.equal(mine!.systems.accounting, 'refused-pending-legal')
   assert.equal(mine!.warehouse!.open, 4)
-  assert.equal(mine!.warehouse!.ambiguousOrders.length, 5)
-  assert.equal(mine!.orderCount, 13)
+  assert.equal(mine!.warehouse!.ambiguousOrders.length, 8)
+  assert.equal(mine!.orderCount, 16)
   assert.doesNotMatch(JSON.stringify(rows), new RegExp(`${NAME}|${EMAIL.replace(/[+.]/g, '\\$&')}`), 'the view shows no erased value')
   // The erased orders' own push guard is untouched: the link of an open order is still there and still not sent anywhere.
-  assert.equal(await db.wmsOrderPushLink.count({ where: { orderId: { in: fx.orderIds } } }), 12)
+  assert.equal(await db.wmsOrderPushLink.count({ where: { orderId: { in: fx.orderIds } } }), 15)
 })
 
 test('[erasure record] anonymiseCustomer returns the count and a warning for open warehouse orders, and no warning when there are none', { skip }, async (t) => {
@@ -136,9 +142,9 @@ test('[erasure record] anonymiseCustomer returns the count and a warning for ope
   const first = await anonymiseCustomer(withOpen.customerId)
   assert.equal(first.success, true)
   assert.equal(first.openWarehouseOrders, 4)
-  assert.equal(first.ambiguousWarehouseOrders, 5)
+  assert.equal(first.ambiguousWarehouseOrders, 8)
   assert.match(first.warning ?? '', /4 open warehouse orders/)
-  assert.match(first.warning ?? '', /5 warehouse orders may exist there/)
+  assert.match(first.warning ?? '', /8 warehouse orders may exist there/)
   assert.match(first.warning ?? '', /by hand in the warehouse system/)
   assert.doesNotMatch(JSON.stringify(first), new RegExp(`${NAME}|${EMAIL.replace(/[+.]/g, '\\$&')}`))
   assert.equal((await proof(db, withOpen.customerId)).systems.accounting, 'not-applicable', 'no ledger rows: nothing held there')
@@ -146,11 +152,17 @@ test('[erasure record] anonymiseCustomer returns the count and a warning for ope
   const customer = await db.customer.create({ data: { firstName: 'Zebediah', lastName: 'Quillfeather', email: `${randomUUID().slice(0, 8)}@example.test` } })
   const order = await db.salesOrder.create({ data: { orderNumber: `HON-${randomUUID().slice(0, 8)}`, status: 'DELIVERED', currency: 'GBP', customerId: customer.id, customerName: NAME, subtotalForeign: 1, totalForeign: 1, subtotalBase: 1, totalBase: 1 } as never })
   await db.wmsOrderPushLink.create({ data: { orderId: order.id, connector: 'mintsoft', externalOrderId: 'm-9', externalOrderNumber: 'MS-9', state: 'SYNCED' } as never })
-  t.after(async () => { await db.wmsOrderPushLink.deleteMany({ where: { orderId: order.id } }); await db.activityLog.deleteMany({ where: { entityId: { in: [order.id, customer.id] } } }); await db.salesOrder.deleteMany({ where: { id: order.id } }); await db.customer.deleteMany({ where: { id: customer.id } }) })
+  // A COMPLETED order is despatched too.
+  const completed = await db.salesOrder.create({ data: { orderNumber: `HON-${randomUUID().slice(0, 8)}`, status: 'COMPLETED', currency: 'GBP', customerId: customer.id, customerName: NAME, subtotalForeign: 1, totalForeign: 1, subtotalBase: 1, totalBase: 1 } as never })
+  await db.wmsOrderPushLink.create({ data: { orderId: completed.id, connector: 'mintsoft', externalOrderId: 'm-9c', externalOrderNumber: 'MS-9C', state: 'SYNCED' } as never })
+  t.after(async () => { await db.wmsOrderPushLink.deleteMany({ where: { orderId: { in: [order.id, completed.id] } } }); await db.activityLog.deleteMany({ where: { entityId: { in: [order.id, completed.id, customer.id] } } }); await db.salesOrder.deleteMany({ where: { id: { in: [order.id, completed.id] } } }); await db.customer.deleteMany({ where: { id: customer.id } }) })
   const before = await db.notification.count({ where: { title: 'Personal data remains in the warehouse' } })
   const second = await anonymiseCustomer(customer.id)
   assert.deepEqual(second, { success: true })
-  assert.equal((await proof(db, customer.id)).systems.warehouse, 'not-technically-possible', 'despatched only: the warehouse cannot be made to erase it')
+  const control = await proof(db, customer.id)
+  assert.equal(control.systems.warehouse, 'not-technically-possible', 'despatched only: the warehouse cannot be made to erase it')
+  assert.equal(control.warehouse.despatched, 2, 'DELIVERED and COMPLETED are both despatched')
+  assert.equal(control.warehouse.open, 0)
   assert.equal(await db.notification.count({ where: { title: 'Personal data remains in the warehouse' } }), before)
 })
 
@@ -185,6 +197,24 @@ test('[erasure record] an ambiguous create alone is never "nothing held"; a reta
   assert.deepEqual(p.warehouse.ambiguousOrders, [{ orderId: order.id, warehouseOrderNumber: null }])
   assert.equal(p.systems.warehouse, 'refused', 'an ambiguous create is never read as "nothing held"')
   assert.equal(p.systems.accounting, 'refused-pending-legal', 'a retained credit note id alone still means the ledger holds the document and its contact')
+  // An ambiguous-only erasure still raises the operator notice (it is an obligation to verify).
+  const notes = await db.notification.findMany({ where: { title: 'Personal data remains in the warehouse', message: { contains: '1 warehouse order may exist there' } } })
+  assert.ok(notes.length >= 1, 'the notice is raised for an ambiguous-only erasure')
+})
+
+test('[erasure record] anonymiseCustomer warns for an ambiguous-only customer, and a retained invoice id alone is refused-pending-legal', { skip }, async (t) => {
+  const db = await loadDb()
+  const { anonymiseCustomer } = await import('@/app/actions/customers')
+  const customer = await db.customer.create({ data: { firstName: 'Zebediah', lastName: 'Quillfeather', email: `${randomUUID().slice(0, 8)}@example.test` } })
+  const order = await db.salesOrder.create({ data: { orderNumber: `HON-${randomUUID().slice(0, 8)}`, status: 'PROCESSING', currency: 'GBP', customerId: customer.id, customerName: NAME, subtotalForeign: 1, totalForeign: 1, subtotalBase: 1, totalBase: 1, accountingInvoiceId: `inv-${randomUUID()}` } as never })
+  await db.wmsOrderPushLink.create({ data: { orderId: order.id, connector: 'mintsoft', state: 'AMBIGUOUS_CREATE' } as never })
+  t.after(async () => { await db.wmsOrderPushLink.deleteMany({ where: { orderId: order.id } }); await db.notification.deleteMany({ where: { title: 'Personal data remains in the warehouse', createdAt: { gte: new Date(Date.now() - 600_000) } } }); await db.activityLog.deleteMany({ where: { entityId: { in: [order.id, customer.id] } } }); await db.salesOrder.deleteMany({ where: { id: order.id } }); await db.customer.deleteMany({ where: { id: customer.id } }) })
+  const result = await anonymiseCustomer(customer.id)
+  assert.equal(result.success, true)
+  assert.equal(result.openWarehouseOrders, 0)
+  assert.equal(result.ambiguousWarehouseOrders, 1)
+  assert.match(result.warning ?? '', /1 warehouse order may exist there/)
+  assert.equal((await proof(db, customer.id)).systems.accounting, 'refused-pending-legal', 'an invoice id alone means the ledger holds the document')
 })
 
 test('[erasure record] an order erasure whose customer stays live still sees the customer\'s ledger contact: contact-only is refused-pending-legal', { skip }, async (t) => {
@@ -221,21 +251,32 @@ test('[erasure record view] a record beyond 200 newer ones is reachable by pagin
            now() + (g || ' seconds')::interval
       FROM generate_series(1, ${N}) g`
   // PAGING: the real record is reached by following the cursor, and only after more than 200 newer rows.
+  // Two more records that leave something outstanding: one with a single OPEN order, one with a single AMBIGUOUS order (the filter must show both).
+  for (const [k, w] of [['open', { open: 1, ambiguous: 0 }], ['ambiguous', { open: 0, ambiguous: 1 }]] as const) {
+    await db.$executeRaw`
+      INSERT INTO "activity_logs" ("id", "entityType", "entityId", "action", "tag", "level", "description", "metadata", "createdAt")
+      VALUES (${`pgrec-${uid}-${k}`}, 'CUSTOMER', ${`pgrec-${k}`}, 'gdpr_erasure_recorded', 'sales', 'INFO', 'Personal data erased (see metadata for the request, scope and per-system verdicts)',
+              ${JSON.stringify({ requestId: `pgrec-${uid}-${k}`, erasedAt: new Date().toISOString(), trigger: 'ON_REQUEST', orderIds: [], counts: {}, systems: {}, warehouse: { linkedOrders: 1, despatched: 0, cancelled: 0, notPushed: 0, merged: 0, openOrders: [], ambiguousOrders: [], ...w } })}::jsonb, now() + interval '1000 seconds')`
+  }
   let cursor: string | undefined
   let seen = 0; let pages = 0; let found = false
+  const allIds: string[] = []
   for (let i = 0; i < 20 && !found; i += 1) {
     const page = await listErasureRecords({ cursor, limit: 50 })
     pages += 1
-    for (const r of page.rows) { if (r.requestId === realRequestId) found = true; else seen += 1 }
+    assert.ok(page.rows.length <= 50, 'a page never exceeds its limit')
+    for (const r of page.rows) { allIds.push(r.requestId); if (r.requestId === realRequestId) found = true; else seen += 1 }
     if (!page.nextCursor) break
     cursor = page.nextCursor
   }
   assert.ok(found, 'the record is reachable by paging')
-  assert.ok(seen >= N, `it sits beyond ${N} newer rows (saw ${seen} first, in ${pages} pages)`)
+  assert.equal(new Set(allIds).size, allIds.length, 'paging never repeats a record')
+  assert.ok(seen >= N + 2, `it sits beyond ${N + 2} newer rows (saw ${seen} first, in ${pages} pages)`)
   // FILTER: the obligations filter shows it on the first page.
   const filtered = await listErasureRecords({ onlyObligations: true, limit: 50 })
   const mine = filtered.rows.find((r) => r.requestId === realRequestId)
   assert.ok(mine, 'the obligations filter shows it on the first page')
+  for (const k of ['open', 'ambiguous']) assert.ok(filtered.rows.some((r) => r.requestId === `pgrec-${uid}-${k}`), `the filter shows a record with a single ${k} order`)
   assert.ok(filtered.rows.every((r) => (r.warehouse?.open ?? 0) > 0 || (r.warehouse?.ambiguous ?? 0) > 0), 'the filter shows only records with something outstanding')
   // LOOKUP: by request id, exactly that record.
   const looked = await listErasureRecords({ requestId: realRequestId })
