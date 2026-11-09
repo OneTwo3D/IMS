@@ -1,5 +1,6 @@
 'use server'
 
+import { parseComponentsCell } from '@/lib/domain/import/component-recipe-cell'
 import { parseTransferDispatchedAt } from '@/lib/domain/import/transfer-dispatch-date'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
@@ -900,25 +901,22 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
     const productId = cr.productId
 
     // Parse "SKU1:qty;SKU2:qty" format
-    const parts = cr.components.split(';').map((s) => s.trim()).filter(Boolean)
     const components: { componentId: string; qty: number }[] = []
     let hasComponentError = false
 
-    for (const part of parts) {
-      const [compSku, qtyStr] = part.split(':').map((s) => s.trim())
-      const componentId = skuToId.get(compSku)
+    for (const part of parseComponentsCell(cr.components)) {
+      if (!part.ok) {
+        result.errors.push(`Row ${cr.lineNum}: invalid component "${part.sku}": ${part.reason}`)
+        hasComponentError = true
+        continue
+      }
+      const componentId = skuToId.get(part.sku)
       if (!componentId) {
-        result.errors.push(`Row ${cr.lineNum}: component SKU "${compSku}" not found`)
+        result.errors.push(`Row ${cr.lineNum}: component SKU "${part.sku}" not found`)
         hasComponentError = true
         continue
       }
-      const qty = parseFloat(qtyStr ?? '1')
-      if (isNaN(qty) || qty <= 0) {
-        result.errors.push(`Row ${cr.lineNum}: invalid qty for component "${compSku}"`)
-        hasComponentError = true
-        continue
-      }
-      components.push({ componentId, qty })
+      components.push({ componentId, qty: part.qty })
     }
 
     if (hasComponentError) {

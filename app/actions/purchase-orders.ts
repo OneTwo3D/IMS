@@ -1190,7 +1190,10 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
         })
       : input.taxRateName
       ? await db.taxRate.findFirst({
-          where: { name: input.taxRateName, active: true },
+          // Case-insensitive, like the purchase-order importer's own lookup (`resolveImportedTaxRateId`): an order whose tax name differs
+          // only in case passed the importer and then failed here. The id order makes the pick stable if two active rates differ only in case.
+          where: { name: { equals: input.taxRateName.trim(), mode: 'insensitive' }, active: true },
+          orderBy: { id: 'asc' },
           select: taxRateProfileSelect,
         })
       : null
@@ -1522,7 +1525,8 @@ export async function updatePurchaseOrder(
             })
           : input.taxRateName
           ? await tx.taxRate.findFirst({
-              where: { name: input.taxRateName, active: true },
+              where: { name: { equals: input.taxRateName.trim(), mode: 'insensitive' }, active: true },
+              orderBy: { id: 'asc' },
               select: taxRateProfileSelect,
             })
           : null

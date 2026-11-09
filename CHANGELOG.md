@@ -8,6 +8,12 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Invoice note path, strict recipe quantities, purchase tax names
+
+- **Fixed: the WooCommerce invoice note, the invoice-link order meta and the invoice-document marker are now sent to the right route.** Their paths had no leading slash, so the transport built `/wp-json/wc/v3orders/...`, which does not exist; the writes (and the read of the order's existing notes) failed as if the store were down. A source scan now refuses any literal WooCommerce request path without a leading slash.
+- **Fixed: the products CSV `components` cell is read strictly.** Each part must be `SKU:qty` with a plain positive quantity of at most 4 decimal places. A quantity such as `1,5`, `2 units` or `3abc` used to load as 1, 2 and 3 with nothing reported, and a part with no `:` silently took quantity 1; both are now refused by name, and the whole recipe for that row is not written (as for an unknown component SKU).
+- **Fixed: a purchase order that names its tax rate in other case now takes that rate.** `createPurchaseOrder` and `updatePurchaseOrder` looked the name up exactly while the purchase-order importer ignores case, so a file that passed the importer's check took no rate at all.
+
 ### Retired Kit tables, clean CSV bodies, and a retention exemption that lifts itself
 
 - **Removed: the unused Kit and KitItem tables and the KIT-filtered component view of inventory aging.** A KIT's recipe is its component list, which every allocation and availability reader already uses; Kit and KitItem had no writer and one reader. Inventory aging filtered to Type KIT now returns an empty report with a notice (age the component SKUs instead), and the "KIT mode" summary and the kit-components source label are gone. A new forward migration drops `kits` and `kit_items`; it refuses to run if either table holds rows, so nothing is lost silently (production is schema-only).
