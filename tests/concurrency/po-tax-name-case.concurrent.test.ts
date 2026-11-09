@@ -31,7 +31,7 @@ mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
  * The fixture rates are never deleted (purchase order lines point at them), so they are retired when the test ends. An ACTIVE sales rate left behind
  * is read by the reconciliation pack's VAT set identity (R13) and fails its test in a shared database.
  */
-function retireWhenDone(t: { after: (fn: () => Promise<void>) => void }, db: { taxRate: { updateMany: (args: unknown) => Promise<unknown> } }, tag: string): void {
+function retireWhenDone(t: { after: (fn: () => Promise<void>) => void }, db: Pick<typeof import('@/lib/db')['db'], 'taxRate'>, tag: string): void {
   t.after(async () => { await db.taxRate.updateMany({ where: { name: { contains: tag } }, data: { active: false } }) })
 }
 
