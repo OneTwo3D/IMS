@@ -138,6 +138,14 @@ async function cleanup(d: Deps, orderIds: string[]) {
   await setFlag(d, null)
 }
 
+/** Scan and drain ONLY these orders: other test files share the database and run in parallel, so an unscoped pass would publish their orders too. */
+async function tickFor(d: Deps, orderIds: string[]) {
+  const scan = await d.jobs.enqueueInvoiceDocumentPublications({ orderIds })
+  const docs = await d.db.salesOrderInvoiceDocument.findMany({ where: { orderId: { in: orderIds }, kind: 'INVOICE' }, select: { id: true, orderId: true } })
+  const run = await d.jobs.runWcInvoiceDocumentJobs({ idempotencyKeys: docs.map((doc) => d.jobs.wcInvoiceDocumentIdempotencyKey(doc.orderId, doc.id)) })
+  return { scan, ...run }
+}
+
 const jobsFor = (d: Deps, orderId: string) => d.db.integrationOutbox.findMany({
   where: { connector: 'woocommerce', operation: 'order.invoice-document', payloadJson: { path: ['orderId'], equals: orderId } },
 })
@@ -172,11 +180,11 @@ test('THE PRODUCER HOLD: switched on but held, the scan leaves a shadow and no r
   t.after(() => cleanup(d, [order.id]))
   await setFlag(d, 'true')
   await withEnv(HELD, async () => {
-    const scan = await d.jobs.enqueueInvoiceDocumentPublications()
-    assert.ok(scan.shadowed >= 1 && scan.queued === 0, JSON.stringify(scan))
+    const scan = await d.jobs.enqueueInvoiceDocumentPublications({ orderIds: [order.id] })
+    assert.ok(scan.shadowed === 1 && scan.queued === 0, JSON.stringify(scan))
     assert.equal((await jobsFor(d, order.id)).length, 0, 'a shadow writes no outbox row')
     assert.ok(await d.db.outboundShadowWrite.count({ where: { subjectId: order.id } }) >= 1, 'a shadow record is kept')
-    const tick = await d.jobs.processWcInvoiceDocumentPublications()
+    const tick = await tickFor(d, [order.id])
     assert.equal(tick.claimed, 0)
   })
   assert.equal(transport.puts.length, 0)
@@ -189,8 +197,8 @@ test('LIVE: one write, the marker is saved, a rescan and a replay send nothing m
   t.after(() => cleanup(d, [order.id]))
   await setFlag(d, 'true')
   await withEnv(LIVE, async () => {
-    const tick = await d.jobs.processWcInvoiceDocumentPublications()
-    assert.equal(tick.scan?.queued, 1, JSON.stringify(tick))
+    const tick = await tickFor(d, [order.id])
+    assert.equal(tick.scan.queued, 1, JSON.stringify(tick))
     assert.equal(tick.succeeded, 1, JSON.stringify(tick))
     assert.equal(transport.puts.length, 1)
     assert.deepEqual(transport.puts[0]!.body, { meta_data: [{ key: '_ims_invoice_pdf_available', value: 'yes' }] })
@@ -203,8 +211,8 @@ test('LIVE: one write, the marker is saved, a rescan and a replay send nothing m
     const [row] = await jobsFor(d, order.id)
     assert.equal(row!.status, 'SUCCEEDED')
 
-    const again = await d.jobs.processWcInvoiceDocumentPublications()
-    assert.equal(again.scan?.queued, 0)
+    const again = await tickFor(d, [order.id])
+    assert.equal(again.scan.queued, 0)
     assert.equal(again.claimed, 0)
     assert.deepEqual(await d.writer.publishInvoiceDocumentFlagToWc(order.id), { kind: 'already-published', documentId: doc.id })
     assert.equal(transport.puts.length, 1, 'nothing more was sent')
@@ -220,7 +228,7 @@ test('A HELD OR REJECTED WRITE IS A RETRY: no marker is saved, the row stays ret
   await withEnv(LIVE, async () => {
     for (const failing of [{ data: null, error: 'Not sent by IMS: writes to WooCommerce are held', held: true as const }, { data: null, error: 'WC API PUT error: 400 nope' }]) {
       transport.putResult = () => failing
-      const tick = await d.jobs.processWcInvoiceDocumentPublications()
+      const tick = await tickFor(d, [order.id])
       assert.equal(tick.succeeded, 0, JSON.stringify(tick))
       assert.equal(await d.db.invoiceStorePublication.count({ where: { orderId: order.id } }), 0, 'no marker for a write that did not land')
       const [row] = await jobsFor(d, order.id)
@@ -228,7 +236,7 @@ test('A HELD OR REJECTED WRITE IS A RETRY: no marker is saved, the row stays ret
       await d.db.integrationOutbox.update({ where: { id: row!.id }, data: { nextAttemptAt: new Date(Date.now() - 1000) } })
     }
     transport.putResult = () => ({ data: {} })
-    const tick = await d.jobs.processWcInvoiceDocumentPublications()
+    const tick = await tickFor(d, [order.id])
     assert.equal(tick.succeeded, 1, JSON.stringify(tick))
     assert.ok((await d.db.invoiceStorePublication.findUniqueOrThrow({ where: { orderId: order.id } })).flagWrittenAt)
   })
@@ -243,17 +251,17 @@ test('NOT IMS\'S TO PUBLISH: an order older than the live-from instant is never 
   await setFlag(d, 'true')
   await d.db.salesOrderInvoiceDocument.updateMany({ where: { orderId: withdrawn.id }, data: { withdrawnAt: new Date() } })
   await withEnv(LIVE, async () => {
-    const scan = await d.jobs.enqueueInvoiceDocumentPublications()
+    await d.jobs.enqueueInvoiceDocumentPublications({ orderIds: [old.id, withdrawn.id] })
     assert.equal((await jobsFor(d, old.id)).length, 0, 'created before the live-from instant: left out')
     assert.equal((await jobsFor(d, withdrawn.id)).length, 0, 'withdrawn: left out')
-    void scan
     // A document withdrawn AFTER it was queued: the attempt re-reads IMS and writes nothing.
     const later = await seedOrder(d)
     t.after(() => cleanup(d, [later.id]))
-    await d.jobs.enqueueInvoiceDocumentPublications()
+    await d.jobs.enqueueInvoiceDocumentPublications({ orderIds: [later.id] })
     assert.equal((await jobsFor(d, later.id)).length, 1)
     await d.db.salesOrderInvoiceDocument.updateMany({ where: { orderId: later.id }, data: { withdrawnAt: new Date() } })
-    const tick = await d.jobs.runWcInvoiceDocumentJobs()
+    const laterDoc = await d.db.salesOrderInvoiceDocument.findFirstOrThrow({ where: { orderId: later.id } })
+    const tick = await d.jobs.runWcInvoiceDocumentJobs({ idempotencyKeys: [d.jobs.wcInvoiceDocumentIdempotencyKey(later.id, laterDoc.id)] })
     assert.equal(tick.succeeded, 0, JSON.stringify(tick))
     assert.equal(transport.puts.filter((p) => p.path.includes(later.orderNumber!.slice(5))).length, 0)
     const [row] = await jobsFor(d, later.id)
@@ -295,9 +303,11 @@ test('TWO CONCURRENT DRAINS WRITE ONCE (repeated: one pass proves nothing about 
     const order = await seedOrder(d)
     ids.push(order.id)
     await withEnv(LIVE, async () => {
-      await d.jobs.enqueueInvoiceDocumentPublications()
+      await d.jobs.enqueueInvoiceDocumentPublications({ orderIds: [order.id] })
       transport.putResult = () => ({ data: {} })
-      const [a, b] = await Promise.all([d.jobs.runWcInvoiceDocumentJobs(), d.jobs.runWcInvoiceDocumentJobs()])
+      const doc = await d.db.salesOrderInvoiceDocument.findFirstOrThrow({ where: { orderId: order.id } })
+      const keys = [d.jobs.wcInvoiceDocumentIdempotencyKey(order.id, doc.id)]
+      const [a, b] = await Promise.all([d.jobs.runWcInvoiceDocumentJobs({ idempotencyKeys: keys }), d.jobs.runWcInvoiceDocumentJobs({ idempotencyKeys: keys })])
       const mine = transport.puts.filter((p) => p.path.endsWith(order.orderNumber!.slice(5)))
       assert.equal(mine.length, 1, `round ${round}: exactly one write (${JSON.stringify([a.succeeded, b.succeeded])})`)
     })

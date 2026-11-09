@@ -95,7 +95,7 @@ export type WcInvoiceDocumentScanSummary = { scanned: number; queued: number; sh
  * turned on is found the same way, and a lost enqueue heals on the next pass. Does nothing while the writer is switched off.
  */
 export async function enqueueInvoiceDocumentPublications(
-  options: { limit?: number } = {},
+  options: { limit?: number; /** Restrict the scan to these orders (a one-order catch-up, or a test that must not touch other orders). */ orderIds?: string[] } = {},
 ): Promise<WcInvoiceDocumentScanSummary> {
   const summary: WcInvoiceDocumentScanSummary = { scanned: 0, queued: 0, shadowed: 0, alreadyQueued: 0 }
   if (!(await isInvoiceDocumentPublishingEnabled())) return summary
@@ -108,6 +108,7 @@ export async function enqueueInvoiceDocumentPublications(
       refundId: null,
       supersededAt: null,
       withdrawnAt: null,
+      ...(options.orderIds ? { orderId: { in: options.orderIds } } : {}),
       order: {
         // An order older than the live-from instant is never IMS's to publish: leave it out so it cannot fill the window.
         ...(floor ? { createdAt: { gte: floor } } : {}),
