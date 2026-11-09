@@ -437,6 +437,7 @@ test('a deleted receipt\'s UNSTAMPED cancellation stays, and the order shows LED
   assert.equal(alone.length, 1)
   const unpaid = settlementStatus({ ...base, paidLocally: false, payment: aggregatePaymentSyncRows(alone), totalForeign: 100 })
   assert.equal(unpaid.status, 'LEDGER_UNDECIDED')
+  assert.match(unpaid.detail, /was retired, and nothing on the row says whether the accounting system received it/)
 })
 
 test('the chosen cancelled row keeps its OWN basis: another receipt\'s operator-asserted SYNCED row does not make the cancelled attempt "operator settled"', () => {

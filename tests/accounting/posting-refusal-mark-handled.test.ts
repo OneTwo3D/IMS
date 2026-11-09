@@ -304,6 +304,7 @@ test('[o3d-j625 r7 H-A] a row IMS RETRIES (but can get stuck) is markable, and i
   syncRows.push(sync('s-pending', row), sync('s-other-scope', row, { payload: { _idempotencyKey: 'a-different-adjustment' } }))
   assert.deepEqual(await mark('r2'), { success: true })
   assert.equal(syncRows.find((s) => s.id === 's-pending')!.status, 'CANCELLED', 'IMS\'s own attempt is cancelled')
+  assert.equal(syncRows.find((s) => s.id === 's-pending')!.abandonedBeforeRemoteCall, true, 'and the pre-call proof is recorded in the same write')
   assert.equal(syncRows.find((s) => s.id === 's-other-scope')!.status, 'PENDING', 'a DIFFERENT posting on the same PO is untouched')
   assert.deepEqual(mirrorWrites, [{ syncLogId: 's-pending', status: 'VOID', voidBasis: 'source_cancelled' }])
 })
@@ -441,6 +442,27 @@ test('[o3d-j625 r7] a processor claiming the row between the read and the cancel
     assert.equal(ok(result), false)
     assert.match(errorOf(result), /changed while it was being marked/)
     assert.equal(syncRows[0]!.status, 'PROCESSING', 'the in-flight row was not cancelled')
+  } finally {
+    syncTable.findMany = original
+  }
+})
+
+test('a row that loses its never-attempted record between the read and the cancel makes the mark fail, not cancel it', async () => {
+  const row = refusal('r4b', 'landed_cost_cogs_journal', { type: 'COGS_JOURNAL' })
+  refusals.push(row)
+  syncRows.push(sync('s-1', row))
+  const original = syncTable.findMany
+  syncTable.findMany = async (args) => {
+    const found = await original(args)
+    const snapshot = found.map((r) => ({ ...r }))
+    syncRows[0]!.attemptStampingCustodyAt = null // still PENDING at revision 0, but no longer provable
+    return snapshot
+  }
+  try {
+    const result = await mark('r4b')
+    assert.equal(ok(result), false)
+    assert.match(errorOf(result), /changed while it was being marked/)
+    assert.equal(syncRows[0]!.status, 'PENDING', 'the unprovable row was not cancelled')
   } finally {
     syncTable.findMany = original
   }

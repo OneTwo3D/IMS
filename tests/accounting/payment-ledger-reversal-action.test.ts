@@ -581,6 +581,41 @@ test('a registration claimed by a worker mid-delete ABORTS the delete instead of
   // test below pins — is that nothing this action wrote survives.
 })
 
+for (const [label, mutate] of [
+  ['its attempt revision moves (claimed and put back, still PENDING)', (r: SyncRow) => { r.attemptRevision = 1 }],
+  ['it acquires a document id (still PENDING)', (r: SyncRow) => { r.externalTransactionId = 'PAY-LATE' }],
+  ['it records an attempt stamp (still PENDING, revision 0)', (r: SyncRow) => { r.remoteAttemptedAt = new Date('2026-03-01T00:00:00Z') }],
+  ['it loses its custody record (still PENDING, revision 0)', (r: SyncRow) => { r.attemptStampingCustodyAt = null }],
+] as const) {
+  test(`the retirement's compare-and-swap names every fact the stamp rests on: ${label} -> the delete aborts`, async () => {
+    const { deletePayment } = await loadActions()
+    state.syncRows = [syncRow({ status: 'PENDING', externalTransactionId: null })]
+    state.mutateAfterRegistrationRead = () => { mutate(state.syncRows[0]) }
+    const result = await deletePayment('pay-1', 'order-1')
+    assert.equal(result.success, false)
+    assert.equal(result.code, 'registration_in_flight')
+    assert.ok(paymentStillThere())
+  })
+}
+
+test('an ASSERTED reversal records its decision by advancing the attempt revision', async () => {
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null, attemptRevision: 1 })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal(result.success, true)
+  assert.equal(row('log-7').status, 'CANCELLED')
+  assert.equal(row('log-7').attemptRevision, 2)
+})
+
+test('an operator-asserted NOT_POSTED refusal does not carry the unstamped-cancellation paragraph', async () => {
+  const { deletePayment } = await loadActions()
+  state.syncRows = [syncRow({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' })]
+  const result = await deletePayment('pay-1', 'order-1')
+  assert.match(result.error ?? '', /operator settled/)
+  assert.doesNotMatch(result.error ?? '', /retired \(cancelled\) without any record/)
+})
+
 test('a registration already claimed before the read refuses on the ledger hold instead', async () => {
   const { deletePayment } = await loadActions()
   state.syncRows = [syncRow({ status: 'PENDING', externalTransactionId: null })]
