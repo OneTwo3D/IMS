@@ -80,6 +80,64 @@ export const VERIFY_FILENAME = 'verify.sql'
 export const REQUIRED_FILENAME = 'verification-required.txt'
 
 /**
+ * Pure: which migrations' checks all passed, and which have a failing or erroring check.
+ *
+ * A migration is PASSED only when it ran at least one check, every check returned zero and none of
+ * its statements errored. A migration that ran nothing is neither passed nor failed: absence of
+ * evidence is not a pass.
+ *
+ * @param {Array<{migration: string, passed: boolean}>} checks
+ * @param {string[]} errorMigrations migrations with a contract error or a statement that failed to run
+ * @returns {{ passed: Array<{migration: string, checks: number}>, failed: string[] }}
+ */
+export function classifyMigrationOutcomes(checks, errorMigrations = []) {
+  const byMigration = new Map()
+  for (const check of checks) {
+    const entry = byMigration.get(check.migration) ?? { total: 0, failing: 0 }
+    entry.total += 1
+    if (!check.passed) entry.failing += 1
+    byMigration.set(check.migration, entry)
+  }
+  const errored = new Set(errorMigrations)
+  const passed = []
+  const failed = new Set(errored)
+  for (const [migration, entry] of byMigration) {
+    if (entry.failing > 0) failed.add(migration)
+    else if (!errored.has(migration)) passed.push({ migration, checks: entry.total })
+  }
+  return { passed: passed.sort((a, b) => a.migration.localeCompare(b.migration)), failed: [...failed].sort() }
+}
+
+/**
+ * Record the outcome durably in `migration_verification_passes`, so a reader that should behave
+ * differently once a cutover check has passed (today: the data-retention sweep) has a fact to read.
+ * First pass wins (the original instant is kept); a failing run removes the record, so whatever the
+ * pass lifted comes back with the incident. Written after the checks, never before, and only for
+ * migrations that actually ran.
+ */
+/**
+ * Pure: the migrations whose recorded pass this run can no longer stand behind, beyond the ones that ran
+ * and failed: a migration REQUIRED to declare checks whose verify.sql is missing (or whose name is stale),
+ * and one that declares checks but is not recorded as applied. A pass nothing re-verified must not keep
+ * lifting what it lifted.
+ */
+export function unbackedPasses(coverage, unapplied) {
+  return [...new Set([...coverage.missing, ...coverage.stale, ...unapplied])].sort()
+}
+
+export async function recordVerificationOutcomes(client, outcomes) {
+  for (const { migration, checks } of outcomes.passed) {
+    await client.query(
+      `INSERT INTO migration_verification_passes (migration_name, checks_passed) VALUES ($1, $2) ON CONFLICT (migration_name) DO NOTHING`,
+      [migration, checks],
+    )
+  }
+  for (const migration of [...new Set([...outcomes.failed, ...(outcomes.unbacked ?? [])])]) {
+    await client.query(`DELETE FROM migration_verification_passes WHERE migration_name = $1`, [migration])
+  }
+}
+
+/**
  * Pure: given the migration directory names present on disk and the set recorded as
  * applied, decide which verification files should run.
  *
@@ -219,6 +277,20 @@ export function parseRequiredList(text) {
     .sort()
 }
 
+/** True when the required list is present. An artifact without it reads as an empty list, which is not the same as "nothing is required". */
+export function requiredListPresent(migrationsDir) {
+  return existsSync(join(migrationsDir, REQUIRED_FILENAME))
+}
+
+/**
+ * Pure: when the required list is ABSENT the run cannot tell which declarations should exist, so any recorded pass it
+ * did not just execute from a present declaration is not backed by this run and is revoked.
+ */
+export function passesToRevokeWithoutRequiredList(recorded, executed) {
+  const ran = new Set(executed)
+  return [...recorded].filter((name) => !ran.has(name)).sort()
+}
+
 export function readRequiredList(migrationsDir) {
   const file = join(migrationsDir, REQUIRED_FILENAME)
   if (!existsSync(file)) return []
@@ -287,6 +359,25 @@ async function main() {
   const coverage = assessCoverage(allMigrations, withVerify, readRequiredList(migrationsDir))
 
   if (withVerify.length === 0) {
+    // No file declares checks, so nothing can be re-verified: revoke the pass of every required migration
+    // (its verify.sql is missing) rather than leave an old pass lifting a retention exemption.
+    // Nothing at all was executed, so no recorded pass is backed by this run, whether the required list is absent,
+    // present and empty, or names things that are missing: revoke every one.
+    if (process.env.DATABASE_URL) {
+      const revoker = new pg.Client({ connectionString: process.env.DATABASE_URL })
+      await revoker.connect()
+      try {
+        const unbacked = [...unbackedPasses(coverage, [])]
+        const recorded = await revoker.query('SELECT migration_name FROM migration_verification_passes')
+        unbacked.push(...passesToRevokeWithoutRequiredList(recorded.rows.map((row) => row.migration_name), []))
+        await recordVerificationOutcomes(revoker, { passed: [], failed: [], unbacked })
+      } catch (error) {
+        console.error(`could not revoke recorded verification passes: ${error instanceof Error ? error.message : String(error)}`)
+        process.exitCode = 1
+      } finally {
+        await revoker.end()
+      }
+    }
     reportCoverage({ allMigrations, withVerify, coverage, strict, ran: [], skipped: [], checkCount: 0 })
     if (strict && !coverage.satisfied) {
       console.error('\nCoverage assertion FAILED: the migrations above are required to declare verification checks.')
@@ -326,6 +417,7 @@ async function main() {
       allErrors.push(`${name} declares ${VERIFY_FILENAME} but is not recorded as applied — the migration step did not do what this run assumed.`)
     }
 
+    const errorMigrations = []
     for (const name of runnable) {
       const sql = readFileSync(join(migrationsDir, name, VERIFY_FILENAME), 'utf8')
       let results
@@ -333,11 +425,28 @@ async function main() {
         results = await client.query(sql)
       } catch (error) {
         allErrors.push(`${name}/${VERIFY_FILENAME} failed to execute: ${error instanceof Error ? error.message : String(error)}`)
+        errorMigrations.push(name)
         continue
       }
       const evaluated = evaluateFileResults(name, results)
       allChecks.push(...evaluated.checks)
       allErrors.push(...evaluated.errors)
+      if (evaluated.errors.length > 0) errorMigrations.push(name)
+    }
+
+    // A failure to RECORD is reported and fatal: the record is what lets a retention exemption lift, and
+    // silently not writing it would leave that exemption in force with nothing saying so.
+    try {
+      const unbacked = unbackedPasses(coverage, unapplied)
+      // Without a required list, or when no declaration was executed at all, nothing vouches for a recorded pass
+      // this run did not itself re-verify.
+      if (!requiredListPresent(migrationsDir) || runnable.length === 0) {
+        const recorded = await client.query('SELECT migration_name FROM migration_verification_passes')
+        unbacked.push(...passesToRevokeWithoutRequiredList(recorded.rows.map((row) => row.migration_name), runnable))
+      }
+      await recordVerificationOutcomes(client, { ...classifyMigrationOutcomes(allChecks, errorMigrations), unbacked })
+    } catch (error) {
+      allErrors.push(`could not record the verification outcome in migration_verification_passes: ${error instanceof Error ? error.message : String(error)}`)
     }
   } finally {
     await client.end()

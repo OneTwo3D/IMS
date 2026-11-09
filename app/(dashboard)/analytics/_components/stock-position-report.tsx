@@ -10,7 +10,7 @@ import type { PageInfo, StockPositionFilterOptions } from '@/lib/domain/inventor
 import { cn } from '@/lib/utils'
 import { ReportPageTitle } from './report-page-title'
 import { StockPositionFilterCombobox } from './stock-position-filter-combobox'
-import { appendParams, currentParams, toneClass, type SummaryTone } from './report-utils'
+import { appendParams, currentParams, toneClass, type SummaryTone, reportCsvHref } from './report-utils'
 
 export type StockPositionColumn<Row> = {
   key: string
@@ -104,7 +104,7 @@ export function StockPositionReportPage<Row>({
   selectionColumn,
 }: StockPositionReportPageProps<Row>) {
   const params = currentParams(filters)
-  const csvHref = `${exportBasePath}?${appendParams(params, { type: reportKey })}`
+  const csvHref = reportCsvHref(exportBasePath, params, { type: reportKey })
   const previousHref = `?${appendParams(params, { page: pageInfo.page - 1 })}`
   const nextHref = `?${appendParams(params, { page: pageInfo.page + 1 })}`
 

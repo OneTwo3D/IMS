@@ -14,6 +14,7 @@ import {
   CSV_EXPORT_METADATA_TRUNCATED_HEADER,
   csvBufferedStreamResponse,
   csvResponse,
+  csvResponseFor,
   parseCsv,
   toCsv,
 } from '@/lib/csv'
@@ -31,11 +32,12 @@ const authorizedRouteDeps = {
   loadMpnByProductId: async () => new Map([['product-1', 'MPN-1']]),
 }
 
-test('csvResponse exposes encoded export metadata once and keeps metadata visible in the downloaded CSV', async () => {
+test('csvResponse exposes encoded export metadata once and appends it to the CSV body only when asked', async () => {
   const response = csvResponse(
     toCsv([{ sku: 'SKU-1', qty: '10.000000' }], ['sku', 'qty']),
     'stock.csv',
     { generatedAt: '2026-06-09T10:00:00.000Z', source: 'snapshot', generatedBy: 'café Admin' },
+    { includeMetadataRows: true },
   )
   const body = await response.text()
 
@@ -50,12 +52,30 @@ test('csvResponse exposes encoded export metadata once and keeps metadata visibl
   assert.match(response.headers.get('Access-Control-Expose-Headers') ?? '', new RegExp(CSV_EXPORT_METADATA_HEADER))
 })
 
+test('by default the CSV body is data rows only while the metadata header is still sent', async () => {
+  const metadata = { generatedAt: '2026-06-09T10:00:00.000Z', source: 'snapshot' }
+  const plain = csvResponse(toCsv([{ sku: 'SKU-1' }], ['sku']), 'stock.csv', metadata)
+  const plainBody = await plain.text()
+  assert.equal(plainBody, 'sku\r\nSKU-1')
+  assert.deepEqual(decodeMetadata(plain), metadata)
+
+  const streamed = csvBufferedStreamResponse([{ sku: 'SKU-1' }], ['sku'], 'ledger.csv', metadata)
+  assert.equal(await streamed.text(), 'sku\r\nSKU-1')
+  assert.deepEqual(decodeMetadata(streamed), metadata)
+
+  const optedIn = csvResponseFor(new Request('https://ims.test/x?metadata=1'), toCsv([{ sku: 'SKU-1' }], ['sku']), 'stock.csv', metadata)
+  assert.match(await optedIn.text(), /\r\n# IMS export metadata\r\n/)
+  const notOptedIn = csvResponseFor(new Request('https://ims.test/x?metadata=0'), toCsv([{ sku: 'SKU-1' }], ['sku']), 'stock.csv', metadata)
+  assert.equal(await notOptedIn.text(), 'sku\r\nSKU-1')
+})
+
 test('csvBufferedStreamResponse exposes encoded metadata without adding data columns', async () => {
   const response = csvBufferedStreamResponse(
     [{ createdAt: '2026-06-09T10:00:00.000Z', sku: 'SKU-1' }],
     ['createdAt', 'sku'],
     'ledger.csv',
     { generatedAt: '2026-06-09T10:05:00.000Z', openingQty: '1.000000', closingQty: '2.000000' },
+    { includeMetadataRows: true },
   )
   const body = await response.text()
 

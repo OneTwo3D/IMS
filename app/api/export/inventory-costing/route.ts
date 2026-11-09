@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
-import { csvBufferedStreamResponse } from '@/lib/csv'
+import { csvBufferedStreamResponseFor } from '@/lib/csv'
 import { REFUND_BASIS_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
 import { ExactFigure, ExactRatio, roundExact } from '@/lib/domain/math/exact-figure'
 import type { DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
@@ -88,7 +88,7 @@ export async function getInventoryCostingExportResponse(
         glBalanceBase: row.glBalanceBase ?? '',
         glVarianceBase: row.glVarianceBase ?? '',
       }))
-      return csvBufferedStreamResponse(
+      return csvBufferedStreamResponseFor(req, 
         rows,
         INVENTORY_VALUATION_CSV_HEADERS,
         `inventory-valuation-${date}.csv`,
@@ -134,13 +134,13 @@ export async function getInventoryCostingExportResponse(
         movementCount: row.movementCount,
         revenueCaptured: row.revenueCaptured,
       }))
-      return csvBufferedStreamResponse(
+      return csvBufferedStreamResponseFor(req, 
         rows,
         ['groupLabel', 'sku', 'mpn', 'categoryName', 'warehouseCode', 'customerName', 'channel', 'qty', 'cogsBase', 'revenueBase', 'revenueBaseBound', 'grossMarginBase', 'grossMarginBaseBound', 'grossMarginPct', 'grossMarginPctBound', 'refundsNetBasis', 'refundsGrossBasis', 'refundsUnknownBasis', 'movementCount', 'revenueCaptured'],
         `cogs-${date}.csv`,
         // A FILE READER HAS NO TOOLTIP. The repo's own CSV metadata channel turns this into `#`
-        // comment rows at the foot of the file (which parseCsv skips, so re-import is unharmed) and an
-        // X-IMS-Export-Metadata header for API consumers. o3d-rv4a carries the producer's WHOLE totals
+        // comment rows at the foot of the file (only when the request carries `?metadata=1`; the default
+        // file is data rows only) and an X-IMS-Export-Metadata header for API consumers. o3d-rv4a carries the producer's WHOLE totals
         // map through it by ITERATION, not a hand-kept list: the bounds on the period figures and the
         // credit that reached no row exist nowhere in `rows`, so an export built from rows alone drops
         // them silently — and a totals key added tomorrow ships tomorrow. Same rule and same reason as
@@ -185,7 +185,7 @@ export async function getInventoryCostingExportResponse(
         landedCostMethod: row.landedCostMethod,
         revaluationCount: row.revaluationCount,
       }))
-      return csvBufferedStreamResponse(
+      return csvBufferedStreamResponseFor(req, 
         rows,
         ['poReference', 'supplierName', 'status', 'sku', 'mpn', 'productName', 'categoryName', 'qty', 'goodsUnitCostBase', 'landedUnitCostBase', 'landedUpliftUnitBase', 'landedUpliftPct', 'goodsValueBase', 'landedValueBase', 'landedCostMethod', 'revaluationCount'],
         `landed-cost-${date}.csv`,
@@ -218,7 +218,7 @@ export async function getInventoryCostingExportResponse(
         cogsEntryCount: row.cogsEntryCount,
         snapshotDayCount: row.snapshotDayCount,
       }))
-      return csvBufferedStreamResponse(rows, ['groupLabel', 'sku', 'mpn', 'categoryName', 'warehouseCode', 'supplierName', 'cogsBase', 'averageInventoryValueBase', 'turnoverRatio', 'daysInventoryOutstanding', 'cogsEntryCount', 'snapshotDayCount'], `inventory-turnover-${date}.csv`)
+      return csvBufferedStreamResponseFor(req, rows, ['groupLabel', 'sku', 'mpn', 'categoryName', 'warehouseCode', 'supplierName', 'cogsBase', 'averageInventoryValueBase', 'turnoverRatio', 'daysInventoryOutstanding', 'cogsEntryCount', 'snapshotDayCount'], `inventory-turnover-${date}.csv`)
     }
   }
 }

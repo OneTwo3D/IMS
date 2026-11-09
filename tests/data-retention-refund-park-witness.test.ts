@@ -127,6 +127,45 @@ test('o3d-xnwu r15: the sweep cannot delete a sync log the recovery witness name
   )
 })
 
+test('after the migration verification pass only the rows check 7 would accuse stay protected', async () => {
+  // MUTATION ROUTE: drop the accusation disjunct from `recoveryWitnessRetainsRowSql`, or the pass
+  // condition. The first assertions fail (a pass would release accused rows, or never release any).
+  const { WC_REFUND_PARK_VERIFICATION_MIGRATION } = await import('@/lib/domain/sales/refund-park-recovery')
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const call = await syncLogDelete()
+  const witnessStart = call.sql.indexOf('FROM "activity_logs"')
+  assert.notEqual(witnessStart, -1, 'precondition: the witness subquery is present')
+  const witness = call.sql.slice(witnessStart)
+  assert.match(witness, /NOT EXISTS\s*\(\s*SELECT 1\s*FROM "migration_verification_passes"/, 'the pass narrows the exemption')
+  assert.match(witness, /"migration_verification_passes"\."migration_name" = [?$]/)
+  assert.ok(call.values.includes(WC_REFUND_PARK_VERIFICATION_MIGRATION), 'and it names the migration whose checks are watched')
+  assert.equal(WC_REFUND_PARK_VERIFICATION_MIGRATION, '20260822120000_shopping_sync_log_record_kind')
+
+  // The accusation kept after the pass is check 7's own predicate: every atom of it appears in both texts.
+  const norm = (text: string) => text.replace(/--[^\n]*/g, '').replace(/"shopping_sync_logs"\./g, '').replace(/"/g, '').replace(/\s+/g, '')
+  const verify = await readFile(path.join(process.cwd(), 'prisma/migrations/20260822120000_shopping_sync_log_record_kind/verify.sql'), 'utf8')
+  const check7 = norm(verify.slice(verify.lastIndexOf("SELECT 'shopping_sync_logs recovered refund park")))
+  const retention = norm(witness)
+  const atoms = [
+    "connector='woocommerce'",
+    "direction='FROM_CONNECTOR'",
+    "entityType='SalesOrder'",
+    "jsonb_typeof(payload)='object'",
+    "payload->'id'ISNULL",
+    "payload->>'reason'='missing_wc_invoice_number'",
+    "jsonb_typeof(payload->'accountingPayload')='object'",
+    "payload->>'metaKey'ISNOTNULL",
+    'recordKind=',
+  ]
+  for (const atom of atoms) {
+    assert.ok(check7.includes(atom), `check 7 carries ${atom}`)
+    assert.ok(retention.includes(atom), `retention carries ${atom}`)
+  }
+  assert.ok(call.values.includes('WC_HELD_SALES_INVOICE'), 'and the held-invoice stamp reaches the statement')
+  assert.ok(check7.includes("'WC_HELD_SALES_INVOICE'"))
+})
+
 test('o3d-xnwu r15: the witness exemption is NOT inside the active-park group, so a SYNCED row is protected too', async () => {
   // THE FINDING'S OWN SEQUENCE, AS AN ASSERTION ABOUT STRUCTURE. The pre-existing exemption is
   // `NOT (connector ... AND status = ANY(PENDING/FAILED/QUARANTINED) ...)`, and step 3 of the

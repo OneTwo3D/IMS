@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
 import { db } from '@/lib/db'
-import { toCsv, csvResponse } from '@/lib/csv'
+import { toCsv, csvResponseFor } from '@/lib/csv'
 import {
   getNegativeStockReport,
   getStockAllocationReport,
@@ -116,7 +116,7 @@ export async function getStockPositionExportResponse(
         reservationSnapshotDate: r.reservationSnapshotDate ?? '',
         reservationSourceCount: r.reservationSourceCount ?? 'unknown',
       }))
-      return csvResponse(
+      return csvResponseFor(req, 
         toCsv(data, STOCK_ON_HAND_CSV_HEADERS),
         `stock-on-hand-${date}.csv`,
         { asOf: report.asOf, source: report.source, generatedAt: report.generatedAt },
@@ -146,7 +146,7 @@ export async function getStockPositionExportResponse(
         stockLevelReservedQty: r.stockLevelReservedQty,
         driftQty: r.driftQty,
       }))
-      return csvResponse(
+      return csvResponseFor(req, 
         toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'warehouseCode', 'warehouseName', 'source', 'referenceId', 'referenceLabel', 'expectedDate', 'ageBucket', 'stockUnit', 'reservedQty', 'stockLevelReservedQty', 'driftQty']),
         `stock-allocations-${date}.csv`,
         { generatedAt: report.generatedAt },
@@ -174,7 +174,7 @@ export async function getStockPositionExportResponse(
         lastMovementAt: r.lastMovementAt ?? '',
         movementCount: r.movementCount,
       }))
-      return csvResponse(
+      return csvResponseFor(req, 
         toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'warehouseCode', 'warehouseName', 'stockUnit', 'status', 'currentQty', 'minimumQty', 'firstNegativeAt', 'lastMovementAt', 'movementCount']),
         `negative-stock-${date}.csv`,
         { dateFrom: report.dateFrom, dateTo: report.dateTo, generatedAt: report.generatedAt },
@@ -209,7 +209,7 @@ export async function getStockPositionExportResponse(
         valueBase: r.valueBase,
         source: r.source,
       }))
-      return csvResponse(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'bucket', 'minAgeDays', 'maxAgeDays', 'qty', 'valueBase', 'source']), `inventory-aging-${date}.csv`)
+      return csvResponseFor(req, toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'bucket', 'minAgeDays', 'maxAgeDays', 'qty', 'valueBase', 'source']), `inventory-aging-${date}.csv`)
     }
 
     case 'dead-stock': {
@@ -239,7 +239,7 @@ export async function getStockPositionExportResponse(
         lastSaleAt: r.lastSaleAt ?? '',
         firstStockedAt: r.firstStockedAt ?? '',
       }))
-      return csvResponse(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'qty', 'valueBase', 'daysSinceLastSale', 'lastSaleAt', 'firstStockedAt']), `dead-stock-${date}.csv`)
+      return csvResponseFor(req, toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'qty', 'valueBase', 'daysSinceLastSale', 'lastSaleAt', 'firstStockedAt']), `dead-stock-${date}.csv`)
     }
 
     default:

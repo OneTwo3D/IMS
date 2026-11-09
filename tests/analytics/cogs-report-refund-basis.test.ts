@@ -247,10 +247,10 @@ function pctText(row: { grossMarginPct: ExactRoundable | null; grossMarginPctBou
   return roundExact(row.grossMarginPct, 2, row.grossMarginPctBound ?? 'exact', { trailingZeros: false })
 }
 
-async function csvRows(): Promise<{ rows: Record<string, string>[]; header: string[]; metadata: Map<string, string>; body: string }> {
+async function csvRows(optIn = true): Promise<{ rows: Record<string, string>[]; header: string[]; metadata: Map<string, string>; body: string }> {
   const { GET } = await import('@/app/api/export/inventory-costing/route')
   const { NextRequest } = await import('next/server')
-  const params = new URLSearchParams({ report: 'cogs', ...FILTERS })
+  const params = new URLSearchParams({ report: 'cogs', ...FILTERS, ...(optIn ? { metadata: '1' } : {}) })
   const res = await GET(new NextRequest(`https://ims.test/api/export/inventory-costing?${params.toString()}`))
   const body = await res.text()
   const metadata = new Map<string, string>()
@@ -1073,6 +1073,16 @@ test('the report says, truthfully, that rows and totals are rounded independentl
   assert.equal(page.notices.filter((notice) => /rounded/i.test(notice)).length, 1, `notices: ${JSON.stringify(page.notices)}`)
 })
 
+test('the CSV body is data rows only unless the request opts in with metadata=1', async () => {
+  workedExample([creditAgainstLine('L1', 'O1', 'p1', '120', 'GROSS')])
+  const clean = await csvRows(false)
+  assert.ok(clean.rows.length > 0, 'the file has data rows')
+  assert.equal(clean.metadata.size, 0)
+  assert.deepEqual(clean.body.split('\r\n').filter((line) => line.startsWith('#') || line.startsWith('"#')), [])
+  const opted = await csvRows(true)
+  assert.ok(opted.metadata.size > 10, `opt-in carries the metadata: ${opted.metadata.size} keys`)
+})
+
 test('the CSV adds no rounding-notice row to the record stream (Codex r4 MEDIUM 2)', async () => {
   // Codex round 4, verbatim: "CSV has no standard `#` comment syntax. Only the repository's custom
   // `parseCsv` skips these rows; common parsers will interpret the new reconciliation and `totals.*`
@@ -1080,10 +1090,8 @@ test('the CSV adds no rounding-notice row to the record stream (Codex r4 MEDIUM 
   //
   // True, and not provable away: no test can show a generic parser skipping a row that CSV has no
   // syntax to mark. So round 3's rounding-notice row is REMOVED from the file rather than
-  // defended. The trailing `#` metadata section itself — dateFrom/dateTo/groupBy/generatedAt/
-  // refundTreatment on development, plus this branch's `totals.*` — is the repository-wide contract in
-  // docs/architecture.md (nineteen export files), and moving it out of the row stream is filed as its
-  // own issue rather than half-done for one report.
+  // defended, and the trailing `#` metadata section is now opt-in (`?metadata=1`): the default file is
+  // data rows only. This test reads the opted-in file.
   //
   // WHAT THIS PINS IS THE EXACT KEY SET, so no further row can join the stream unnoticed: the five keys
   // development already emitted and one `totals.<name>` per producer totals field — nothing else.

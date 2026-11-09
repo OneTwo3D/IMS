@@ -40,7 +40,6 @@ function makeClient(overrides: Partial<InventoryHealthReportClient>): InventoryH
     stockMovement: unused,
     costLayer: unused,
     cogsEntry: unused,
-    kitItem: unused,
     ...overrides,
   }
 }
@@ -132,32 +131,14 @@ test('inventory aging reports BOM products from their own production cost layer'
   assert.equal(report.rows[0]?.valueBase, '50')
 })
 
-test('inventory aging rolls KIT exposure up from component cost layers when filtered to KIT', async () => {
+test('inventory aging filtered to KIT is empty with a notice and reads no cost layers', async () => {
+  let costLayerReads = 0
   const client = makeClient({
-    kitItem: {
-      findMany: async () => [
-        {
-          parentProductId: 'kit-1',
-          componentProductId: 'component-1',
-          qty: decimal('2'),
-          parentProduct: product({ id: 'kit-1', sku: 'KIT-1', name: 'Starter kit', type: ProductType.KIT }),
-          component: product({ id: 'component-1', sku: 'COMP-1', name: 'Component' }),
-        },
-      ],
-    },
     costLayer: {
-      findMany: async () => [
-        {
-          id: 'component-layer',
-          productId: 'component-1',
-          warehouseId: 'warehouse-1',
-          remainingQty: decimal('10'),
-          unitCostBase: decimal('5'),
-          receivedAt: new Date('2026-03-01T00:00:00.000Z'),
-          product: product({ id: 'component-1', sku: 'COMP-1', name: 'Component' }),
-          warehouse,
-        },
-      ],
+      findMany: async () => {
+        costLayerReads += 1
+        return []
+      },
     },
   })
 
@@ -169,14 +150,9 @@ test('inventory aging rolls KIT exposure up from component cost layers when filt
     },
   )
 
-  assert.equal(report.kitAgingMode, 'component')
-  assert.equal(report.rows.length, 1)
-  assert.equal(report.rows[0]?.sku, 'COMP-1')
-  assert.equal(report.rows[0]?.productName, 'Component for KIT-1')
-  assert.equal(report.rows[0]?.source, 'kit_component')
-  assert.equal(report.rows[0]?.qty, '10')
-  assert.equal(report.rows[0]?.valueBase, '50')
-  assert.match(report.notices[0] ?? '', /component exposure/)
+  assert.equal(report.rows.length, 0)
+  assert.equal(costLayerReads, 0)
+  assert.match(report.notices[0] ?? '', /hold no cost layers/)
   assert.match(report.notices[1] ?? '', /current CostLayer\.unitCostBase/)
 })
 
@@ -211,51 +187,6 @@ test('inventory aging caps source cost-layer scans before in-memory bucketing', 
     /cost-layer scan exceeds 100,000 rows/,
   )
   assert.equal(observedTake, 100001)
-})
-
-test('inventory aging caps KIT component layer scans before component bucketing', async () => {
-  const observedTakes: unknown[] = []
-  const client = makeClient({
-    kitItem: {
-      findMany: async (args?: unknown) => {
-        observedTakes.push((args as { take?: unknown } | undefined)?.take)
-        return [{
-          parentProductId: 'kit-1',
-          componentProductId: 'component-1',
-          qty: decimal('1'),
-          parentProduct: product({ id: 'kit-1', sku: 'KIT-1', name: 'Starter kit', type: ProductType.KIT }),
-          component: product({ id: 'component-1', sku: 'COMP-1', name: 'Component' }),
-        }]
-      },
-    },
-    costLayer: {
-      findMany: async (args?: unknown) => {
-        observedTakes.push((args as { take?: unknown } | undefined)?.take)
-        return Array.from({ length: Number((args as { take?: number }).take) }, (_, index) => ({
-          id: `component-layer-${index}`,
-          productId: 'component-1',
-          warehouseId: 'warehouse-1',
-          remainingQty: decimal('1'),
-          unitCostBase: decimal('1'),
-          receivedAt: new Date('2026-05-01T00:00:00.000Z'),
-          product: product({ id: 'component-1', sku: 'COMP-1', name: 'Component' }),
-          warehouse,
-        }))
-      },
-    },
-  })
-
-  await assert.rejects(
-    () => getInventoryAgingReport(
-      { asOf: '2026-06-01', productType: ProductType.KIT },
-      {
-        paginate: false,
-        deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') },
-      },
-    ),
-    /KIT component cost-layer scan exceeds 100,000 rows/,
-  )
-  assert.deepEqual(observedTakes, [50001, 100001])
 })
 
 test('warehouse-less imported sales history counts as demand, so the SKU is not called dead (o3d-t9k)', async () => {

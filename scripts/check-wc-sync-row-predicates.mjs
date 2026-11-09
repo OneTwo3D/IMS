@@ -167,6 +167,14 @@ const PREDICATE_OWNERS = [
 const SQL_OWNER = 'lib/domain/sales/wc-sync-row-families.ts::unresolvedWcOrderRowSql'
 
 /**
+ * The second SQL renderer: the row the recovery witness ACCUSES (check 7 of the 20260822120000 migration's
+ * verify.sql), which the retention sweep must keep. It is a different claim from the union above, it is
+ * rendered once here, and tests/data-retention-refund-park-witness.test.ts holds it to the verify.sql text.
+ */
+const SQL_ACCUSED_OWNER = 'lib/domain/sales/wc-sync-row-families.ts::recoveryAccusedRowSql'
+const SQL_OWNERS = [SQL_OWNER, SQL_ACCUSED_OWNER]
+
+/**
  * Tokens that make a raw SQL string a family predicate rather than an ordinary statement about this
  * table. Deliberately the DISCRIMINATORS only: `status` and `connector` alone appear in legitimate
  * statements about other things, but nothing has a reason to name `entityType`, `recordKind` or any
@@ -584,7 +592,7 @@ for (const file of files) {
         const named = SQL_FAMILY_TOKENS.filter((token) => text.includes(token))
         if (named.length > 0) {
           const owner = `${relativePath}::${enclosingDeclaration(node) ?? '(top level)'}`
-          if (owner === SQL_OWNER) ownersSeen.add(owner)
+          if (SQL_OWNERS.includes(owner)) ownersSeen.add(owner)
           else {
             violations.push(
               `${relativePath}:${at(node)}  raw SQL over ${SQL_TABLE} names the family discriminator(s) `
@@ -668,7 +676,7 @@ if (migrationPredicateCount === 0) structural.push(`found 0 migrations stating t
 for (const owner of MIGRATION_OWNERS.keys()) {
   if (!migrationOwnersSeen.has(owner)) structural.push(`allowlisted migration no longer states the rule: ${MIGRATIONS_ROOT}/${owner}`)
 }
-for (const owner of [...PREDICATE_OWNERS, SQL_OWNER]) {
+for (const owner of [...PREDICATE_OWNERS, ...SQL_OWNERS]) {
   if (!ownersSeen.has(owner)) structural.push(`allowlisted definition not found: ${owner}`)
 }
 
