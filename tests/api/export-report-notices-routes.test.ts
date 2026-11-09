@@ -60,6 +60,7 @@ test('manufacturing export: the same for production variance and WIP', async () 
 test('the in-app download links ask for the notices', () => {
   assert.equal(csvHrefWithNotices('/api/export/replenishment?type=reorder'), '/api/export/replenishment?type=reorder&notices=1')
   assert.equal(csvHrefWithNotices('/api/export/x'), '/api/export/x?notices=1')
+  assert.equal(new URL(csvHrefWithNotices('/api/export/x?a=1'), 'http://h').searchParams.get('notices'), '1')
   assert.equal(csvHrefWithNotices('/api/export/x?a=1#top'), '/api/export/x?a=1&notices=1#top')
   const read = (path: string) => readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8')
   const shared = read('app/(dashboard)/analytics/_components/stock-position-report.tsx')

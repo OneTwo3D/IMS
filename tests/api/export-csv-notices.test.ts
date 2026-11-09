@@ -47,8 +47,17 @@ test('notices past the header cap are cut from the end and flagged', () => {
   const notices = Array.from({ length: 40 }, (_, i) => `${i}:${'x'.repeat(300)}`)
   const response = csvResponseWithNotices(csv, 'x.csv', notices)
   const kept = decode(response)
-  assert.ok(kept.length > 0 && kept.length < notices.length)
+  assert.ok(kept.length > 1 && kept.length < notices.length, 'cut from the end, not down to one')
   assert.deepEqual(kept, notices.slice(0, kept.length))
+  assert.ok(Buffer.byteLength(JSON.stringify(kept), 'utf8') <= CSV_EXPORT_METADATA_MAX_JSON_BYTES)
+  assert.equal(response.headers.get(CSV_EXPORT_NOTICES_TRUNCATED_HEADER), 'true')
+})
+
+test('a single notice past the header cap is shortened and flagged', () => {
+  const response = csvResponseWithNotices(csv, 'x.csv', ['y'.repeat(6000)])
+  const kept = decode(response)
+  assert.equal(kept.length, 1)
+  assert.ok(kept[0].length <= 1000)
   assert.ok(Buffer.byteLength(JSON.stringify(kept), 'utf8') <= CSV_EXPORT_METADATA_MAX_JSON_BYTES)
   assert.equal(response.headers.get(CSV_EXPORT_NOTICES_TRUNCATED_HEADER), 'true')
 })

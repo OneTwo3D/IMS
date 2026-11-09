@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
+import { WC_SETTINGS_VERSION_KEY } from '@/lib/connectors/woocommerce/sync-lock'
 import { OUTBOUND_GRANT_ENV } from '@/lib/security/outbound-write-hold-constants'
 
 /**
@@ -32,6 +33,10 @@ function modelProxy(name: string) {
       }
       if (name === 'product' && method === 'findMany') return candidates
       if (name === 'product' && method === 'updateMany') return { count: 1 }
+      if (name === 'product' && method === 'findUnique') {
+        const found = candidates.find((p) => p.id === (args as { where?: { id?: string } } | undefined)?.where?.id)
+        return found ? { externalProductId: found.externalProductId } : null
+      }
       if (method === 'findMany') return []
       return null
     },
@@ -67,12 +72,12 @@ function reset(list: Array<Record<string, unknown>>) {
   postImpl = () => ({ data: { update: [] } })
 }
 
-async function run() {
+async function run(options: { forceAll?: boolean; chunk?: { afterId: string | null; limit: number }; productIds?: string[] } = { forceAll: true, chunk: { afterId: null, limit: 10 } }) {
   const { pushStockToWc } = await import('@/lib/connectors/woocommerce/sync/stock-sync')
   const saved = process.env[OUTBOUND_GRANT_ENV.woocommerce]
   process.env[OUTBOUND_GRANT_ENV.woocommerce] = ORIGIN
   try {
-    return await pushStockToWc({ forceAll: true, chunk: { afterId: null, limit: 10 } })
+    return await pushStockToWc(options)
   } finally {
     if (saved === undefined) delete process.env[OUTBOUND_GRANT_ENV.woocommerce]
     else process.env[OUTBOUND_GRANT_ENV.woocommerce] = saved
@@ -154,4 +159,99 @@ test('batch push: an item the store dropped from its response leaves the window 
   const result = await run()
   assert.ok(result.errors.some((e) => e.includes('missing from batch response')))
   assert.equal(result.chunk, undefined)
+})
+
+const variant = (id: string, sku: string, externalId: bigint) => ({
+  ...product(id, sku, externalId), type: 'VARIANT', parent: { sku: 'PARENT', externalProductId: BigInt(100) },
+})
+
+test('stale mapping: a cached id the store no longer has is cleared, so the window is unhandled', async () => {
+  reset([product('a', 'S1', BigInt(1)), product('b', 'S2', BigInt(2))])
+  fetchImpl = (_p, params) => ({ data: params.include ? [{ id: 1, sku: 'S1' }] : [] }) // id 2 absent from a page that succeeded
+  postImpl = () => okUpdate([1])
+  const result = await run()
+  assert.ok(result.errors.some((e) => e.includes('Stale WC mapping')))
+  assert.equal(result.chunk, undefined)
+})
+
+test('stale mapping: a cached id that now carries another SKU is cleared, so the window is unhandled', async () => {
+  reset([product('a', 'S1', BigInt(1)), product('b', 'S2', BigInt(2))])
+  fetchImpl = (_p, params) => ({ data: params.include ? [{ id: 1, sku: 'S1' }, { id: 2, sku: 'OTHER' }] : [] })
+  postImpl = () => okUpdate([1])
+  const result = await run()
+  assert.ok(result.errors.some((e) => e.includes('Stale WC mapping')))
+  assert.equal(result.chunk, undefined)
+})
+
+test('lookup failures with nothing left to push: the empty result is still an unhandled window', async () => {
+  reset([product('a', 'S1', null), product('b', 'S2', null)])
+  fetchImpl = (_p, params) => (params.sku === 'S1' ? { data: [] } : { data: null, error: 'WC API error: 500' })
+  const result = await run()
+  assert.match(result.message, /^0 synced/)
+  assert.equal(result.chunk, undefined)
+})
+
+test('variation push: a failed variation batch, or an item missing from its response, leaves the window unhandled', async () => {
+  const fetchOk: Fetch = (path, params) => (path.includes('/variations') ? { data: [{ id: 11, sku: 'V1' }] } : okPreflight(path, params))
+  reset([variant('v', 'V1', BigInt(11))])
+  fetchImpl = fetchOk
+  postImpl = () => okUpdate([11])
+  const control = await run()
+  assert.deepEqual(control.errors, [])
+  assert.deepEqual(control.chunk, { nextCursor: null, totalCandidates: 1 })
+
+  reset([variant('v', 'V1', BigInt(11))])
+  fetchImpl = fetchOk
+  postImpl = () => ({ data: null, error: 'WC API error: 500' })
+  const failed = await run()
+  assert.ok(failed.errors.some((e) => e.startsWith('variation batch push')))
+  assert.equal(failed.chunk, undefined)
+
+  reset([variant('v', 'V1', BigInt(11))])
+  fetchImpl = fetchOk
+  postImpl = () => okUpdate([])
+  const dropped = await run()
+  assert.ok(dropped.errors.some((e) => e.includes('missing from batch response')))
+  assert.equal(dropped.chunk, undefined)
+})
+
+test('credentials rebound while the window was pushing: the window is unhandled', async () => {
+  reset([product('a', 'S1', BigInt(1))])
+  fetchImpl = okPreflight
+  postImpl = () => { settings.set(WC_SETTINGS_VERSION_KEY, 'rebound'); return okUpdate([1]) }
+  const result = await run()
+  assert.ok(result.errors.some((e) => e.includes('rebound')))
+  assert.equal(result.chunk, undefined)
+})
+
+test('a window past the end of the catalogue is handled and empty, and ends the pass', async () => {
+  reset([product('a', 'S1', BigInt(1))])
+  const result = await run({ forceAll: true, chunk: { afterId: 'a', limit: 10 } })
+  assert.deepEqual(result.chunk, { nextCursor: null, totalCandidates: 1 })
+})
+
+test('chunking applies only to an unscoped forceAll push', async () => {
+  reset([product('a', 'S1', BigInt(1)), product('b', 'S2', BigInt(2)), product('c', 'S3', BigInt(3))])
+  fetchImpl = okPreflight
+  postImpl = () => okUpdate([1, 2, 3])
+  const notForced = await run({ chunk: { afterId: null, limit: 1 } })
+  assert.equal(notForced.candidates, 3, 'no forceAll: every candidate')
+  assert.equal(notForced.chunk, undefined)
+  const scoped = await run({ forceAll: true, productIds: ['a', 'b', 'c'], chunk: { afterId: null, limit: 1 } })
+  assert.equal(scoped.candidates, 3, 'scoped: every candidate')
+  assert.equal(scoped.chunk, undefined)
+  const chunked = await run({ forceAll: true, chunk: { afterId: null, limit: 1 } })
+  assert.equal(chunked.candidates, 1)
+  assert.deepEqual(chunked.chunk, { nextCursor: 'a', totalCandidates: 3 })
+})
+
+test('a kit in this window sees its component in another window', async () => {
+  const kit = { ...product('b', 'KIT1', BigInt(2)), type: 'KIT', productComponents: [{ componentId: 'a', qty: 1, component: { type: 'SIMPLE', lifecycleStatus: 'ACTIVE' } }] }
+  reset([product('a', 'S1', BigInt(1)), kit])
+  fetchImpl = (path, params) => (params.include ? { data: params.include.split(',').map((id) => ({ id: Number(id), sku: id === '2' ? 'KIT1' : 'S1' })) } : { data: [] })
+  let sent: Array<{ id: number; stock_quantity?: number }> = []
+  postImpl = (_p, body) => { sent = (body as { update: typeof sent }).update; return okUpdate(sent.map((u) => u.id)) }
+  const result = await run({ forceAll: true, chunk: { afterId: 'a', limit: 1 } })
+  assert.deepEqual(result.errors, [])
+  assert.equal(sent.find((u) => u.id === 2)?.stock_quantity, 5, 'the kit is as available as its component, which is not in this window')
 })

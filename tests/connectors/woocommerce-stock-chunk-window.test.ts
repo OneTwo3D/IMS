@@ -19,3 +19,9 @@ test('selectChunkWindow: id-ordered windows cover every candidate exactly once a
   assert.deepEqual(selectChunkWindow(candidates, { afterId: 'e', limit: 2 }), { window: [], nextCursor: null })
   assert.deepEqual(selectChunkWindow(candidates, { afterId: null, limit: 5 }).nextCursor, null, 'an exactly full window is the last')
 })
+
+test('selectChunkWindow: a limit below 1 still takes one candidate, so a pass cannot end early on a bad limit', async () => {
+  const { selectChunkWindow } = await import('@/lib/connectors/woocommerce/sync/stock-sync')
+  const candidates = ['a', 'b'].map((id) => ({ id }))
+  assert.deepEqual(selectChunkWindow(candidates, { afterId: null, limit: 0 }), { window: [{ id: 'a' }], nextCursor: 'a' })
+})
