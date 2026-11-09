@@ -781,6 +781,22 @@ t_env_template_sets_the_storage_and_scan_variables_preflight_requires() {
   grep -q 'INVOICE_PDF_STORAGE_DIR.*MUST be in the backup set' "$tpl" || fail "the template does not say invoice PDFs must be backed up"
 }
 
+# A symlink planted at a state subdirectory (the container can write there) is refused, not followed, and its target is left alone.
+t_bootstrap_refuses_a_symlink_at_a_state_subdirectory() {
+  R="$T/root"; export IMS_BOOTSTRAP_ROOT="$R" IMS_UPSTREAM_FILE="$T/root/etc/nginx/ims-upstream.conf"
+  mkdir -p "$R/etc/nginx/sites-available" "$R/etc/nginx/sites-enabled" "$R/srv/ims/state" "$T/victim"
+  chmod 0777 "$T/victim"
+  ln -s "$T/victim" "$R/srv/ims/state/invoice-pdfs"
+  rc=0; "$BIN/host-bootstrap.sh" > "$T/out1" 2>&1 || rc=$?
+  [ "$rc" != 0 ] || fail "bootstrap succeeded with a symlink at a state subdirectory"
+  grep -q 'symlink or not a directory' "$T/out1" || fail "no refusal message: $(tail -n 3 "$T/out1")"
+  eq "$(stat -c %a "$T/victim")" 777 "the symlink target was modified"
+  [ -L "$R/srv/ims/state/invoice-pdfs" ] || fail "the symlink was replaced"
+  rm "$R/srv/ims/state/invoice-pdfs"; : > "$R/srv/ims/state/invoice-pdfs"
+  rc=0; "$BIN/host-bootstrap.sh" > "$T/out1" 2>&1 || rc=$?
+  [ "$rc" != 0 ] || fail "bootstrap succeeded with a regular file at a state subdirectory"
+}
+
 t_bootstrap_is_idempotent_and_leaves_secrets_and_postgres_alone() {
   R="$T/root"; export IMS_BOOTSTRAP_ROOT="$R" IMS_UPSTREAM_FILE="$T/root/etc/nginx/ims-upstream.conf" IMS_UPSTREAM_FILE="$T/root/etc/nginx/ims-upstream.conf"
   mkdir -p "$R/etc/nginx/sites-available" "$R/etc/nginx/sites-enabled"
