@@ -48,7 +48,7 @@
  * next one is added to it rather than discovered):
  *
  *   settings
- *     xero_*_account (15 roles)                         CLEAR on known change   (XERO_ACCOUNT_ROLE_KEYS)
+ *     xero_*_account (18 roles)                         CLEAR on known change   (XERO_ACCOUNT_ROLE_KEYS)
  *     accounting_payment_account_map                    CLEAR                   (Xero bank-account ids)
  *     accounting_reverse_charge_sales_tax_type          CLEAR                   (Xero tax-type code)
  *     accounting_reverse_charge_purchase_tax_type       CLEAR                   (Xero tax-type code)
@@ -98,7 +98,7 @@ export const XERO_ACCOUNT_MAPPING_UNCONFIRMED_KEY = 'xero_account_mapping_unconf
 
 const SYNC_ENABLED_KEY = 'xero_sync_enabled'
 
-/** The fifteen account roles, derived from the settings module's own key list so a sixteenth is covered. */
+/** The account roles (eighteen), derived from the settings module's own key list so a sixteenth is covered. */
 export const XERO_ACCOUNT_ROLE_KEYS: readonly string[] = XERO_SETTING_KEYS.filter(
   (key) => key.startsWith('xero_') && key.endsWith('_account'),
 )

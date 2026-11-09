@@ -8,6 +8,13 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### EU IOSS / VOEC rate configuration and parity (configuration only)
+
+- **Added: `TaxRate.schemePostingTaxType`**, the zero-rated Xero tax type an IOSS or VOEC sale's goods, shipping and discount lines will post on (for example `TAX131` for DE VAT 19%), beside the existing reporting category (`IOSS`, `VOEC`) that marks the rate. A nullable column with a forward migration. **Nothing reads it to post a line yet and the Sales Invoices switch is untouched**; the invoice treatment follows in later changes.
+- **Added: a versioned declaration of the 65 live WooCommerce rates** (`lib/tax/eu-vat-seed.json`), `npm run eu-vat:preflight` (read only: what is missing or mismatched against the database and the stored Xero list) and `npm run eu-vat:seed` (a dry run unless `--apply --confirm <digest>`; sets only the two rate fields through the WooCommerce mappings). Nothing writes a tax rate to Xero and nothing applies the declaration automatically.
+- **Added: a parity test** (`tests/tax/eu-vat-parity.test.ts`) that judges the declaration against the measured Xeroom resolution of every one of the 65 rates, and **a drift check** that the hourly tax-rate sweep now makes, by code, on every rate's scheme posting type.
+- **Added: settings.** Three Xero account roles (*EU IOSS/VOEC VAT collected*, *EU DDP charges collected*, *EU landed-cost fees*) and two credit-note hold settings (`eu_vat_refund182_hold_threshold`, `eu_vat_refund182_held_count`); configuration only. A tax re-key now copies `schemePostingTaxType` to the replacement rate.
+
 ### No tax type, no sales document
 
 - **Changed: a sales invoice or credit note line with no tax type is refused instead of posting on "No VAT".** The Xero connector no longer defaults a missing `TaxType` to `NONE` on sales invoices, sales invoice updates or credit notes (supplier bills and supplier credit notes are unchanged). The refusal is an ordinary failed sync row on /sync, raised at the head of the poster case and again in the connector, before any contact, item or document request. An explicit `NONE` is refused too unless the line names an allowed kind; the only one today is a WooCommerce fee the shop charged no tax on. Shipping and the order discount can never be on `NONE`.

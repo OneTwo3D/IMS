@@ -2931,13 +2931,13 @@ test('[o3d-emus] xeroBaseCurrencyConnectRefusal: unreadable never passes, a matc
 
 const OTHER = { id: 'c-other', tenantId: '7a1c0e22-other-org', tenantName: 'Other Trading Ltd', tenantType: 'ORGANISATION' }
 
-/** The fifteen account roles, derived from the settings module's own list so a sixteenth is covered. */
+/** The account roles (eighteen), derived from the settings module's own list so another is covered. */
 async function accountRoleKeys(): Promise<string[]> {
   const { XERO_ACCOUNT_ROLE_KEYS } = await import('@/lib/connectors/xero/account-mapping-rebind')
   return [...XERO_ACCOUNT_ROLE_KEYS]
 }
 
-/** Every setting the rebind rule treats as "a mapping exists": 15 roles, the payment map, two reverse-charge types. */
+/** Every setting the rebind rule treats as "a mapping exists": 18 roles, the payment map, two reverse-charge types. */
 async function mappingKeys(): Promise<string[]> {
   const { XERO_ACCOUNT_MAPPING_KEYS } = await import('@/lib/connectors/xero/account-mapping-rebind')
   return [...XERO_ACCOUNT_MAPPING_KEYS]
@@ -2971,8 +2971,8 @@ test('[o3d-6thk1] KNOWN DIFFERENT organisation: accounts, payment map, reverse-c
 
   const before = await mappingRowsPresent()
   console.log(`# o3d-6thk1 known-different: mapping settings=${before.length}, tax types mapped=${taxTypesMapped()}, chart rows=${chartRows}, token=${tokenRow === null ? 'gone' : 'present'}, pin=${settings.xero_expected_tenant_id ?? 'gone'}, stamp=${settings.xero_account_mapping_tenant_id}`)
-  assert.equal((await accountRoleKeys()).length, 15, 'PRECONDITION: fifteen account roles')
-  assert.equal(before.length, 18, 'PRECONDITION: 15 roles + payment map + 2 reverse-charge types present')
+  assert.equal((await accountRoleKeys()).length, 18, 'PRECONDITION: eighteen account roles')
+  assert.equal(before.length, 21, 'PRECONDITION: 18 roles + payment map + 2 reverse-charge types present')
   assert.equal(taxTypesMapped(), 3)
   assert.equal(chartRows, 40)
   assert.equal(tokenRow, null)
@@ -3002,7 +3002,7 @@ test('[o3d-6thk1] KNOWN SAME organisation (stamped), even after a disconnect: ma
   await disconnect()
   connectionsBody = [DEMO]
   const before = await mappingRowsPresent()
-  assert.equal(before.length, 18, 'PRECONDITION: mapping present, token and pin gone, stamp names the same organisation')
+  assert.equal(before.length, 21, 'PRECONDITION: mapping present, token and pin gone, stamp names the same organisation')
 
   const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
 
@@ -3025,7 +3025,7 @@ test('[o3d-6thk1] an in-place re-consent to the pinned organisation keeps everyt
   const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
 
   assert.equal(result.success, true)
-  assert.equal((await mappingRowsPresent()).length, 18)
+  assert.equal((await mappingRowsPresent()).length, 21)
   assert.equal(taxTypesMapped(), 3)
   assert.equal(settings.xero_sync_enabled, 'true')
   assert.equal(settings.xero_account_mapping_tenant_id, DEMO.tenantId, 'stamped, so the NEXT Disconnect leaves durable evidence')
@@ -3038,7 +3038,7 @@ test('[o3d-6thk1 round-1 HIGH 1] a PRE-STAMP instance: Disconnect then reconnect
   connectionsBody = [DEMO]
   const before = await mappingRowsPresent()
   console.log(`# o3d-6thk1 pre-stamp: mapping before=${before.length}, stamp=${settings.xero_account_mapping_tenant_id}, token=${tokenRow === null ? 'gone' : 'present'}, sync=${settings.xero_sync_enabled}`)
-  assert.equal(before.length, 18, 'PRECONDITION: Disconnect preserved the mapping')
+  assert.equal(before.length, 21, 'PRECONDITION: Disconnect preserved the mapping')
   assert.equal(settings.xero_account_mapping_tenant_id, undefined, 'PRECONDITION: no stamp (an instance from before it existed)')
   assert.equal(tokenRow, null, 'PRECONDITION: the token row (the only other record) is gone')
 
@@ -3129,7 +3129,7 @@ test('[o3d-6thk1 round-2 HIGH 1] WRONG organisation first, then the right one: t
   assert.equal(wrong.success, true)
   assert.equal((tokenRow as TokenRow | null)?.tenantId, OTHER.tenantId, 'PRECONDITION: the operator picked the WRONG organisation')
   assertStillHeld('after the wrong organisation')
-  assert.equal((await mappingRowsPresent()).length, 18, 'kept: unknown is not proof it is another organisation')
+  assert.equal((await mappingRowsPresent()).length, 21, 'kept: unknown is not proof it is another organisation')
   assert.equal(taxTypesMapped(), 3)
 
   await disconnect()
@@ -3137,7 +3137,7 @@ test('[o3d-6thk1 round-2 HIGH 1] WRONG organisation first, then the right one: t
   const right = await exchangeCodeForTokens('code-2', 'https://ims.example/cb')
   assert.equal(right.success, true)
   assertStillHeld('after the right organisation')
-  assert.equal((await mappingRowsPresent()).length, 18)
+  assert.equal((await mappingRowsPresent()).length, 21)
   assert.match(right.accountMappingResetNotice ?? '', /could not confirm/)
   assert.doesNotMatch(right.accountMappingResetNotice ?? '', /not the organisation|different/i)
 })
@@ -3197,7 +3197,7 @@ test('[o3d-6thk1] a binding that FAILS part-way rolls the clear back with it', a
   connectionsBody = [OTHER]
   const before = JSON.stringify({ settings, taxRateTypes, chartRows })
   bindingTokenWriteGate = async () => { throw new Error('token write failed (injected)') }
-  assert.equal((await mappingRowsPresent()).length, 18, 'PRECONDITION: mapping present')
+  assert.equal((await mappingRowsPresent()).length, 21, 'PRECONDITION: mapping present')
 
   const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
 
@@ -3213,7 +3213,7 @@ test('[o3d-6thk1] a failure of the CLEAR itself rolls the binding back, tax type
   connectionsBody = [OTHER]
   const before = JSON.stringify({ settings, taxRateTypes, chartRows })
   mappingClearFails = true
-  assert.equal((await mappingRowsPresent()).length, 18, 'PRECONDITION: mapping present')
+  assert.equal((await mappingRowsPresent()).length, 21, 'PRECONDITION: mapping present')
 
   const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
 

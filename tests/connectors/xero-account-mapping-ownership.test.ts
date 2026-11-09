@@ -45,8 +45,8 @@ test('getXeroSyncReadiness derives `ready` from syncReadinessVerdict, not from a
   assert.match(ready, /syncReadinessVerdict\(\{[^}]*ownership: ownership\.state/)
 })
 
-test('the mapping key list covers 15 roles, the payment map and the two reverse-charge types', () => {
-  assert.equal(XERO_ACCOUNT_MAPPING_KEYS.length, 18)
+test('the mapping key list covers 18 roles, the payment map and the two reverse-charge types', () => {
+  assert.equal(XERO_ACCOUNT_MAPPING_KEYS.length, 21)
   assert.ok(XERO_ACCOUNT_MAPPING_KEYS.includes('accounting_payment_account_map'))
   assert.ok(XERO_ACCOUNT_MAPPING_KEYS.includes('xero_rounding_difference_account'))
 })
