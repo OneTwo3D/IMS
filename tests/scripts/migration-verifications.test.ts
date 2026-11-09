@@ -11,6 +11,8 @@ import {
   classifyMigrationOutcomes,
   recordVerificationOutcomes,
   unbackedPasses,
+  passesToRevokeWithoutRequiredList,
+  requiredListPresent,
   evaluateFileResults,
   findMigrationsWithVerify,
   listMigrationDirectories,
@@ -82,9 +84,22 @@ test('a pass nothing re-verified is revoked: a required migration with no verify
   assert.ok(queries.every((q) => /DELETE FROM migration_verification_passes/.test(q.sql)))
 })
 
+test('without a required list every recorded pass the run did not execute is revoked', () => {
+  assert.deepEqual(passesToRevokeWithoutRequiredList(['m_ran', 'm_other', 'm_old'], ['m_ran']), ['m_old', 'm_other'])
+  assert.deepEqual(passesToRevokeWithoutRequiredList(['m_ran'], ['m_ran']), [])
+  const dir = mkdtempSync(join(tmpdir(), 'req-list-'))
+  try {
+    assert.equal(requiredListPresent(dir), false)
+    writeFileSync(join(dir, 'verification-required.txt'), '')
+    assert.equal(requiredListPresent(dir), true, 'an empty file is a list; a missing file is not')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('the runner revokes a recorded pass whose verify.sql is missing (source wiring)', () => {
   const source = readFileSync(join(process.cwd(), 'scripts/run-migration-verifications.mjs'), 'utf8')
-  assert.match(source, /unbacked: unbackedPasses\(coverage, unapplied\)/, 'the main path revokes unbacked passes')
+  assert.match(source, /const unbacked = unbackedPasses\(coverage, unapplied\)[\s\S]*recordVerificationOutcomes\(client, \{[^}]*unbacked \}\)/, 'the main path revokes unbacked passes')
   assert.match(source, /unbackedPasses\(coverage, \[\]\)[\s\S]*recordVerificationOutcomes\(revoker/, 'and so does the path where no file declares checks')
 })
 

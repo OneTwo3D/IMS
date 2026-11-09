@@ -1,0 +1,35 @@
+import { NextResponse } from 'next/server'
+
+import { verifyCron } from '@/lib/cron-auth'
+import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
+import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
+import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
+import { runInvoiceDocumentSweep } from '@/lib/domain/invoice-documents/sweep'
+import { getInvoiceDocumentHealth } from '@/lib/domain/invoice-documents/health'
+import { xeroInvoiceDocumentDeps } from '@/lib/connectors/xero/invoice-document-deps'
+
+export const runtime = 'nodejs'
+
+// Called by cron with Authorization: Bearer $CRON_SECRET. Read-only toward every vendor: it GETs invoice and credit note
+// PDFs from the accounting ledger and stores them in IMS. It writes nothing to the ledger and nothing to the storefront.
+export async function GET(request: Request) {
+  const cronErr = await verifyCron(request)
+  if (cronErr) return cronErr
+  const rateLimitErr = await enforceCronRateLimit('invoice-documents', { request })
+  if (rateLimitErr) return rateLimitErr
+  const maintenance = await getMaintenanceModeResponse('cron')
+  if (maintenance) return maintenance
+
+  const { runId, result, responseStatus } = await runCronWithLogging({
+    jobName: 'invoice-documents',
+    run: async () => ({ ...(await runInvoiceDocumentSweep(xeroInvoiceDocumentDeps())), health: await getInvoiceDocumentHealth() }),
+    getOutcome: (outcome) => ({
+      status: outcome.stoppedEarly && outcome.stored === 0 && outcome.failed > 0 ? 'failed' : 'completed',
+      counts: { considered: outcome.considered, stored: outcome.stored, waiting: outcome.waiting, needsAttention: outcome.needsAttention, failed: outcome.failed, needsAttentionTotal: outcome.health.needsAttention, pendingTotal: outcome.health.pending },
+      statusReason: outcome.stoppedEarly ?? (outcome.skipped ? `skipped: ${outcome.skipped}` : null),
+      responseStatus: outcome.stoppedEarly && outcome.stored === 0 && outcome.failed > 0 ? 500 : 200,
+    }),
+  })
+
+  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit({ status: responseStatus ?? 200 }))
+}

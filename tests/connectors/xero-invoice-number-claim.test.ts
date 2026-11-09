@@ -85,6 +85,7 @@ test('a matching ACCREC document is returned as the claim, with who holds it', a
       status: 'AUTHORISED',
       contactName: 'A Customer',
       total: 120.5,
+      type: 'ACCREC',
     }],
   })
 })
@@ -198,7 +199,9 @@ test('a document under a different number is not a claim on this one', async () 
 test('a failed call is a lookup failure carrying the ledger’s own error', async () => {
   const { get } = getter({ ok: false, status: 0, error: 'Not connected to Xero' })
   const lookup = await lookupXeroInvoiceNumberClaim('164981', { get })
-  assert.deepEqual(lookup, { ok: false, error: 'Not connected to Xero' })
+  assert.deepEqual(lookup, { ok: false, error: 'Not connected to Xero', httpStatus: 0 }, 'the HTTP status travels so a sweep can tell a refusal from a miss')
+  const limited = await lookupXeroInvoiceNumberClaim('164981', { get: getter({ ok: false, status: 429, error: 'Rate limited' }).get })
+  assert.deepEqual(limited, { ok: false, error: 'Rate limited', httpStatus: 429 })
 })
 
 test('a 200 with no Invoices array is a FAILURE, never an empty result', async () => {

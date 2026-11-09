@@ -19,6 +19,7 @@ import { config } from 'dotenv'
  *   a later run whose verify.sql errors   -> the pass is removed
  *   a later run that breaks the contract (two rows from one statement) -> the pass is removed
  *   a required migration whose verify.sql has gone missing -> the pass is removed (no file declares checks at all)
+ *   an artifact with no verification-required.txt -> a recorded pass the run did not execute is removed, the executed one is kept
  */
 const skip = process.env.RUN_DB_RETENTION_TESTS !== '1'
 
@@ -82,6 +83,31 @@ test('the runner records a pass, and removes it when the checks fail, error or d
     writeFileSync(path.join(dir, 'verification-required.txt'), `${name}\n`)
     runRunner()
     assert.equal(await passRows(), 0, 'a required migration whose verify.sql is missing loses its pass')
+
+    // An artifact that lost verification-required.txt reads as "nothing required"; recorded passes this run cannot
+    // match to a present, executed declaration must not stay trusted. The executed probe keeps / gets its pass.
+    const stranger = `${name}_stranger`
+    rmSync(path.join(dir, 'verification-required.txt'))
+    writeFileSync(verify, "SELECT 'probe check' AS check_name, 0 AS violations;\n")
+    await db.$executeRaw`INSERT INTO migration_verification_passes (migration_name, checks_passed) VALUES (${stranger}, 1)`
+    try {
+      assert.equal(runRunner(), 0)
+      assert.equal(await passRows(), 1, 'the executed declaration is recorded')
+      const left = await db.$queryRaw<Array<{ n: bigint }>>`SELECT count(*) AS n FROM migration_verification_passes WHERE migration_name = ${stranger}`
+      assert.equal(Number(left[0]!.n), 0, 'a recorded pass with no present, executed declaration is revoked when the required list is absent')
+    } finally {
+      await db.$executeRaw`DELETE FROM migration_verification_passes WHERE migration_name = ${stranger}`
+    }
+    // And the same when no declaration exists at all (the early path).
+    rmSync(verify)
+    await db.$executeRaw`INSERT INTO migration_verification_passes (migration_name, checks_passed) VALUES (${stranger}, 1)`
+    try {
+      runRunner()
+      const left = await db.$queryRaw<Array<{ n: bigint }>>`SELECT count(*) AS n FROM migration_verification_passes WHERE migration_name IN (${stranger}, ${name})`
+      assert.equal(Number(left[0]!.n), 0, 'with no declaration and no required list, no recorded pass survives')
+    } finally {
+      await db.$executeRaw`DELETE FROM migration_verification_passes WHERE migration_name = ${stranger}`
+    }
   } finally {
     await db.$executeRaw`DELETE FROM migration_verification_passes WHERE migration_name = ${name}`
     await db.$executeRaw`DELETE FROM _prisma_migrations WHERE migration_name = ${name}`

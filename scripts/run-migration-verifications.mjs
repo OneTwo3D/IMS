@@ -277,6 +277,20 @@ export function parseRequiredList(text) {
     .sort()
 }
 
+/** True when the required list is present. An artifact without it reads as an empty list, which is not the same as "nothing is required". */
+export function requiredListPresent(migrationsDir) {
+  return existsSync(join(migrationsDir, REQUIRED_FILENAME))
+}
+
+/**
+ * Pure: when the required list is ABSENT the run cannot tell which declarations should exist, so any recorded pass it
+ * did not just execute from a present declaration is not backed by this run and is revoked.
+ */
+export function passesToRevokeWithoutRequiredList(recorded, executed) {
+  const ran = new Set(executed)
+  return [...recorded].filter((name) => !ran.has(name)).sort()
+}
+
 export function readRequiredList(migrationsDir) {
   const file = join(migrationsDir, REQUIRED_FILENAME)
   if (!existsSync(file)) return []
@@ -347,11 +361,16 @@ async function main() {
   if (withVerify.length === 0) {
     // No file declares checks, so nothing can be re-verified: revoke the pass of every required migration
     // (its verify.sql is missing) rather than leave an old pass lifting a retention exemption.
-    const unbacked = unbackedPasses(coverage, [])
-    if (unbacked.length > 0 && process.env.DATABASE_URL) {
+    const listMissing = !requiredListPresent(migrationsDir)
+    if ((unbackedPasses(coverage, []).length > 0 || listMissing) && process.env.DATABASE_URL) {
       const revoker = new pg.Client({ connectionString: process.env.DATABASE_URL })
       await revoker.connect()
       try {
+        const unbacked = [...unbackedPasses(coverage, [])]
+        if (listMissing) {
+          const recorded = await revoker.query('SELECT migration_name FROM migration_verification_passes')
+          unbacked.push(...passesToRevokeWithoutRequiredList(recorded.rows.map((row) => row.migration_name), []))
+        }
         await recordVerificationOutcomes(revoker, { passed: [], failed: [], unbacked })
       } catch (error) {
         console.error(`could not revoke recorded verification passes: ${error instanceof Error ? error.message : String(error)}`)
@@ -419,7 +438,12 @@ async function main() {
     // A failure to RECORD is reported and fatal: the record is what lets a retention exemption lift, and
     // silently not writing it would leave that exemption in force with nothing saying so.
     try {
-      await recordVerificationOutcomes(client, { ...classifyMigrationOutcomes(allChecks, errorMigrations), unbacked: unbackedPasses(coverage, unapplied) })
+      const unbacked = unbackedPasses(coverage, unapplied)
+      if (!requiredListPresent(migrationsDir)) {
+        const recorded = await client.query('SELECT migration_name FROM migration_verification_passes')
+        unbacked.push(...passesToRevokeWithoutRequiredList(recorded.rows.map((row) => row.migration_name), runnable))
+      }
+      await recordVerificationOutcomes(client, { ...classifyMigrationOutcomes(allChecks, errorMigrations), unbacked })
     } catch (error) {
       allErrors.push(`could not record the verification outcome in migration_verification_passes: ${error instanceof Error ? error.message : String(error)}`)
     }

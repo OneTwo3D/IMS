@@ -421,7 +421,7 @@ test('on disk and through the gate: a real published P0 report feeds the P0 slot
   assert.equal(results.R1.kind, 'not-available', 'not applicable at P0')
   const elsewhere = assessPackItems(read, ctx({ phase: 'P0', systemIdentifier: '7400000000000000009' }))
   assert.equal(elsewhere.R3.kind, 'unreadable')
-  assert.equal(packStreams().length, 6)
+  assert.equal(packStreams().length, 7)
 })
 
 // ---- R1 (the Mintsoft stock item) maps exactly as R9 does ---------------------------------------------

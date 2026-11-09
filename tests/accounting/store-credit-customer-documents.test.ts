@@ -57,11 +57,11 @@ test('CENSUS 1: every file that RENDERS a PDF document is classified', () => {
 })
 
 test('CENSUS 2: every place a STORED invoice PDF is served is the accounting system\'s own document (exempt), and every email kind is classified', () => {
-  const loaders = grepFiles('loadInvoicePdf\\(')
+  const loaders = grepFiles('(loadInvoicePdf|loadCurrentInvoicePdf)\\(')
   precondition('stored PDF servers', { files: loaders })
   assert.deepEqual(loaders, [
     'app/api/invoice/[id]/route.ts', 'app/api/invoices/[id]/route.ts', 'app/api/shopping/[connector]/invoice-pdf/route.ts',
-    'lib/invoice-pdf.ts', 'lib/order-email.ts',
+    'lib/domain/invoice-documents/current-document.ts', 'lib/invoice-pdf.ts', 'lib/order-email.ts',
   ].sort(), 'a new place serves a stored invoice PDF: classify it')
   // Stored PDFs are written only by the Xero INVOICE_PDF follow-up (saveInvoicePdf), which never runs for a credit order.
   assert.ok(read('lib/connectors/xero/sync-processor.ts').includes('saveInvoicePdf'))

@@ -363,6 +363,7 @@ There is no separate worker process. Background tasks are handled via HTTP endpo
 
 | Task | Endpoint | Schedule | Description |
 |---|---|---|---|
+| Xero chart of accounts refresh | `GET /api/cron/xero-chart-sync` | Daily 00:30 | Read-only refresh of the Xero chart of accounts into the local account list, ahead of the balance-snapshot pull; stamps the read-sync last-success time with the stored chart |
 | Account balance snapshot | `GET /api/cron/account-balance-snapshot` | Daily 01:00 | Fetch previous-day Xero Trial Balance account balances for inventory and COGS GL variance reporting |
 | Product lifecycle archive | `GET /api/cron/product-lifecycle-archive` | Daily 00:30 | Archive EOL products after all warehouse stock and incoming supply are depleted |
 | FX rate refresh | `GET /api/cron/fx-rates` | Daily 06:00 | Fetch rates from frankfurter.dev, upsert FxRate rows, and re-attempt any WooCommerce orders queued for a previously-missing rate |

@@ -140,7 +140,7 @@ export type XeroNotSentReason =
  * connection that answered its probe). Compared with the auth THIS request resolved, before anything is
  * built — see `connection-changed`.
  */
-export type RequiredXeroConnection = { tenantId: string; connectionGeneration: string }
+export type RequiredXeroConnection = { tenantId: string; connectionGeneration: string | null }
 
 /**
  * How the reason travels from `performRequest` (which returns a `Response`) to `xeroFetchWithAuth`
@@ -1033,7 +1033,8 @@ export async function xeroPut<T = unknown>(
 export async function xeroGetRaw(
   path: string,
   accept: string = 'application/pdf',
-): Promise<{ ok: boolean; status: number; buffer?: Buffer; error?: string }> {
+  opts?: { requireConnection?: RequiredXeroConnection },
+): Promise<{ ok: boolean; status: number; buffer?: Buffer; error?: string; tenantId?: string; connectionGeneration?: string | null }> {
   // THE ONE ARM THAT STILL LETS A RESOLVER EXCEPTION THROUGH, AND IT IS SAID OUT LOUD (o3d-2w2j r2).
   //
   // Its return type has no `notSent` field to carry a tag on, because nothing it is used for holds a
@@ -1043,6 +1044,22 @@ export async function xeroGetRaw(
   // `XeroResponse` rather than add a second, weaker tag here.
   const auth = await getAccessToken()
   if (!auth) return await notConnectedResponse()
+
+  // A download that an earlier READ authorised is built from that read's connection, or not sent at all: a reconnect (or a refresh
+  // onto a rebound row) between the lookup and the download would otherwise fetch a document from a different organisation than the
+  // one whose answer was checked. Compared before the request object exists, as `xeroFetch` does for a write.
+  const required = opts?.requireConnection
+  if (required && (auth.tenantId !== required.tenantId || (auth.connectionGeneration ?? null) !== required.connectionGeneration)) {
+    return {
+      ok: false,
+      status: XERO_NOT_SENT_STATUS,
+      error: `The Xero connection changed after the document was looked up (looked up under organisation ${required.tenantId}, `
+        + `connection ${required.connectionGeneration}; now ${auth.tenantId}, connection ${auth.connectionGeneration ?? '(none)'}). `
+        + 'NOTHING WAS SENT; it is checked again on the next pass.',
+      tenantId: auth.tenantId,
+      connectionGeneration: auth.connectionGeneration ?? null,
+    }
+  }
 
   const url = path.startsWith('http') ? path : `${XERO_BASE_URL}/${path}`
 
@@ -1069,7 +1086,7 @@ export async function xeroGetRaw(
   }
 
   const arrayBuffer = await res.arrayBuffer()
-  return { ok: true, status: res.status, buffer: Buffer.from(arrayBuffer) }
+  return { ok: true, status: res.status, buffer: Buffer.from(arrayBuffer), tenantId: auth.tenantId, connectionGeneration: auth.connectionGeneration ?? null }
 }
 
 /**

@@ -10888,6 +10888,7 @@ CRON_BASE="http://localhost:${APP_PORT}/api/cron"
 
 # schedule|slug|label pairs for the bootstrap set
 CRON_JOBS=(
+  "30 0 * * *|xero-chart-sync|Xero Chart of Accounts Refresh"
   "0 1 * * *|account-balance-snapshot|Account Balance Snapshot"
   "0 6 * * *|fx-rates|FX Rate Update"
   "0 3 * * *|activity-cleanup|Activity Log Cleanup"

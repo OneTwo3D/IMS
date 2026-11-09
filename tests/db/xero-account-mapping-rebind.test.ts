@@ -55,7 +55,7 @@ async function withRollback<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
   return captured as T
 }
 
-const DERIVED = ['xero_tax_rate_drift_current', 'xero_tax_rate_drift_last_checked_at']
+const DERIVED = ['xero_tax_rate_drift_current', 'xero_tax_rate_drift_last_checked_at', 'xero_chart_of_accounts_last_success_at']
 
 /** A clean slate, then a full mapping: settings, tax types on real rate rows, a cached chart row, sync on. */
 async function seedMapping(tx: Tx, owner: string, stampedFor: string | null, run: string) {
@@ -103,7 +103,7 @@ test('o3d-6thk1 (real tables): KNOWN DIFFERENT organisation clears 18 mapping se
   })
   console.log(`# o3d-6thk1 db known-different: before=${JSON.stringify(observed.before)} after=${JSON.stringify(observed.after)} previous=${observed.previous.tenantId} (${observed.previous.basis})`)
   assert.equal(XERO_ACCOUNT_MAPPING_KEYS.length, 18, 'PRECONDITION: 15 roles + payment map + 2 reverse-charge types')
-  assert.deepEqual([observed.before.settings, observed.before.derived, observed.before.rateTypes, observed.before.componentTypes, observed.before.chart], [18, 2, 1, 1, 1], 'PRECONDITION: all of it present before')
+  assert.deepEqual([observed.before.settings, observed.before.derived, observed.before.rateTypes, observed.before.componentTypes, observed.before.chart], [18, 3, 1, 1, 1], 'PRECONDITION: all of it present before')
   assert.equal(observed.outcome.kind, 'cleared')
   assert.deepEqual([observed.after.settings, observed.after.derived, observed.after.rateTypes, observed.after.componentTypes, observed.after.chart], [0, 0, 0, 0, 0])
   assert.equal(observed.after.sync, undefined)
@@ -260,9 +260,9 @@ test('o3d-6thk1 (real tables): the HOLD is persisted, and a token row created wh
 type Post = { chart: number; taxTypes: number; rcTypes: number; drift: number; payMap: number; roles: number; sync: string | undefined; stamp: 'prev' | 'new' | undefined; hold: boolean }
 const KEPT_ALL = (mapped: boolean): Pick<Post, 'taxTypes' | 'rcTypes' | 'payMap' | 'roles'> => mapped ? { taxTypes: 2, rcTypes: 2, payMap: 1, roles: 15 } : { taxTypes: 0, rcTypes: 0, payMap: 0, roles: 0 }
 const BRANCHES: Array<{ name: string; previous: 'stamp' | 'token' | 'unknown' | 'hold'; mapped: boolean; to: 'same' | 'other'; kind: string; expect: Post }> = [
-  { name: 'known same (stamp), mapped', previous: 'stamp', mapped: true, to: 'same', kind: 'none', expect: { chart: 1, ...KEPT_ALL(true), drift: 2, sync: 'true', stamp: 'prev', hold: false } },
-  { name: 'known same (token row), mapped', previous: 'token', mapped: true, to: 'same', kind: 'none', expect: { chart: 1, ...KEPT_ALL(true), drift: 2, sync: 'true', stamp: 'prev', hold: false } },
-  { name: 'known same (stamp), nothing mapped', previous: 'stamp', mapped: false, to: 'same', kind: 'none', expect: { chart: 1, ...KEPT_ALL(false), drift: 2, sync: 'true', stamp: 'prev', hold: false } },
+  { name: 'known same (stamp), mapped', previous: 'stamp', mapped: true, to: 'same', kind: 'none', expect: { chart: 1, ...KEPT_ALL(true), drift: 3, sync: 'true', stamp: 'prev', hold: false } },
+  { name: 'known same (token row), mapped', previous: 'token', mapped: true, to: 'same', kind: 'none', expect: { chart: 1, ...KEPT_ALL(true), drift: 3, sync: 'true', stamp: 'prev', hold: false } },
+  { name: 'known same (stamp), nothing mapped', previous: 'stamp', mapped: false, to: 'same', kind: 'none', expect: { chart: 1, ...KEPT_ALL(false), drift: 3, sync: 'true', stamp: 'prev', hold: false } },
   { name: 'known different (stamp), mapped', previous: 'stamp', mapped: true, to: 'other', kind: 'cleared', expect: { chart: 0, taxTypes: 0, rcTypes: 0, payMap: 0, roles: 0, drift: 0, sync: undefined, stamp: 'new', hold: false } },
   { name: 'known different (token row), mapped', previous: 'token', mapped: true, to: 'other', kind: 'cleared', expect: { chart: 0, taxTypes: 0, rcTypes: 0, payMap: 0, roles: 0, drift: 0, sync: undefined, stamp: 'new', hold: false } },
   { name: 'known different (stamp), NOTHING mapped (round-3 HIGH)', previous: 'stamp', mapped: false, to: 'other', kind: 'none', expect: { chart: 0, ...KEPT_ALL(false), drift: 0, sync: 'true', stamp: 'new', hold: false } },
@@ -325,7 +325,7 @@ test('o3d-6thk1 (real tables): EVERY branch x EVERY store, table-driven', { skip
     results.push({ name: branch.name, kind: observed.outcome.kind, pre: observed.pre, post: observed.post })
     assert.equal(observed.previous.basis, branch.previous, `${branch.name}: PRECONDITION: the previous organisation is known by ${branch.previous}`)
     assert.equal(observed.pre.chart, 1, `${branch.name}: PRECONDITION: a chart is cached`)
-    assert.equal(observed.pre.drift, 2, `${branch.name}: PRECONDITION: a drift snapshot exists`)
+    assert.equal(observed.pre.drift, 3, `${branch.name}: PRECONDITION: a drift snapshot exists`)
     assert.equal(observed.pre.sync, 'true', `${branch.name}: PRECONDITION: sync is on`)
     assert.equal(observed.pre.roles, branch.mapped ? 15 : 0, `${branch.name}: PRECONDITION: mapping ${branch.mapped ? 'present' : 'absent'}`)
     assert.equal(observed.outcome.kind, branch.kind, `${branch.name}: outcome`)

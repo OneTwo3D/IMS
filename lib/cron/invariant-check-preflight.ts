@@ -20,6 +20,7 @@ export async function runInvariantCheckPreflight(
     notifyAdmins: async () => {},
     getPreviousCriticalFindingsHash: async () => null,
     setCriticalFindingsHash: async () => {},
+    commitWarningBaseline: async () => ({ applied: false, increases: [] }), // read-only callers write nothing, including the named-warning baseline
   }),
 ): Promise<InvariantCheckPreflightResult> {
   const result = await runCheck()
