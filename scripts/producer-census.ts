@@ -104,6 +104,7 @@ export const PRIMITIVES: Readonly<Record<string, Primitive>> = {
   scheduleWcOrderCompletion: { family: 'outbox' },
   scheduleWcOrderCancel: { family: 'outbox' },
   scheduleWcOrderHold: { family: 'outbox' },
+  scheduleWcInvoiceDocument: { family: 'outbox' },
   // ---- The lib/shopping.ts facade --------------------------------------------------------------------------------
   enqueueStockSync: { family: 'woocommerce-facade' },
   syncShoppingConnectorStock: { family: 'woocommerce-facade' },
@@ -125,6 +126,7 @@ export const PRIMITIVES: Readonly<Record<string, Primitive>> = {
   pushWmsOrderStatusToWc: { family: 'woocommerce-writer' },
   pushPartialShipmentToWc: { family: 'woocommerce-writer' },
   pushInvoiceNoteToWc: { family: 'woocommerce-writer' },
+  publishInvoiceDocumentFlagToWc: { family: 'woocommerce-writer' },
   pushFxRatesToWc: { family: 'woocommerce-writer' },
   pushCurrentFxRatesToWc: { family: 'woocommerce-writer' },
   probeFxHelperPlugin: { family: 'woocommerce-writer' },

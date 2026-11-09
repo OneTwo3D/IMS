@@ -32,6 +32,13 @@ export const WcOrderStatusOutboxPayloadSchema = z.object({
   orderId: nonEmptyString,
 })
 
+// The durable "tell the storefront this order has a customer invoice to download" job. Carries the order id and the id of the stored
+// document it was queued for (part of the idempotency key); every attempt re-reads IMS for the document that is current NOW.
+export const WcInvoiceDocumentOutboxPayloadSchema = z.object({
+  orderId: nonEmptyString,
+  documentId: nonEmptyString,
+})
+
 export const XeroAccountingOutboxPayloadSchema = z.object({
   accountingSyncLogId: nonEmptyString,
 })
@@ -376,6 +383,30 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
       },
       replay: 'unsafe-to-replay',
     },
+    // The My Account invoice flag. ONE guarded effect (a PUT of the order meta `_ims_invoice_pdf_available` = yes, an ABSOLUTE constant: two
+    // runs, or two runs in the wrong order, leave the same value) followed by effects the guard does not cover (the publication marker row
+    // and the activity log). The meta is a constant and nothing computed is delivered late, so a stale reclaim could not write a WRONG value;
+    // it is declared `unsafe-to-replay` all the same, because the attempt re-reads IMS and then writes to a remote that offers no ordering
+    // token, and a later clear of the flag (a rollback) would be reordered by exactly such a late write. A row whose worker died is surfaced
+    // and not re-driven: the drain moves a PROCESSING row past the drain lease to PERMANENT_FAILED (`parkStaleWcInvoiceDocumentClaims`,
+    // compare-and-set on the dead worker's lock), and Replay on Sync > Exceptions is safe because the retry re-reads IMS first and a flag
+    // that already landed is a no-op. PERMANENT_FAILED is inert: the only enqueue is keyed per (order, document) and returns the existing
+    // row untouched. Every attempt runs under the attempt deadline and re-checks its own row, the cut-off and that IMS still holds a
+    // servable document immediately before the PUT (attempt-fence.ts).
+    'order.invoice-document': {
+      name: 'orderInvoiceDocument',
+      destination: 'woocommerce',
+      schema: WcInvoiceDocumentOutboxPayloadSchema,
+      effects: {
+        keyedBy: 'effect-sequence',
+        guardedEffect: 'the WooCommerce order meta PUT of _ims_invoice_pdf_available=yes, behind a fresh IMS read of the servable current document and the publication marker on every attempt',
+        effectsOutsideTheGuard: [
+          'invoice_store_publications marker row (flag document id and time)',
+          'logActivity invoice_document_published / invoice_document_publish_retry / invoice_document_publish_dead_lettered',
+        ],
+      },
+      replay: 'unsafe-to-replay',
+    },
   },
   xero: {
     // UNSAFE (Codex round 2, HIGH 2 — round 1 declared `remote-write-fenced-by-consumer` here, and
@@ -680,6 +711,7 @@ export type SalesRefundReservationReleaseOutboxPayload = z.infer<typeof SalesRef
 export type WcStockSyncOutboxPayload = z.infer<typeof WcStockSyncOutboxPayloadSchema>
 export type WcOrderCompletionOutboxPayload = z.infer<typeof WcOrderCompletionOutboxPayloadSchema>
 export type WcOrderStatusOutboxPayload = z.infer<typeof WcOrderStatusOutboxPayloadSchema>
+export type WcInvoiceDocumentOutboxPayload = z.infer<typeof WcInvoiceDocumentOutboxPayloadSchema>
 export type XeroAccountingOutboxPayload = z.infer<typeof XeroAccountingOutboxPayloadSchema>
 export type MintsoftBookedInOutboxPayload = z.infer<typeof MintsoftBookedInOutboxPayloadSchema>
 
