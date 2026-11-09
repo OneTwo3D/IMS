@@ -186,3 +186,36 @@ test('a job that fails to record is not the same as one a hold shadowed: only a 
     await cleanup(db, s)
   }
 })
+
+test('a scoped call queues only that order\'s corrections; the real enqueue path stamps the obligation and records the job', { skip }, async () => {
+  const { db, correction } = await load()
+  const mine = await seed(db)
+  const other = await seed(db)
+  try {
+    // REAL dependencies: the stock job is recorded in the outbox and the obligation is stamped through `onEnqueued`.
+    const result = await correction.queueRefundStockCorrections({ externalOrderId: mine.wcOrderId as unknown as number })
+    assert.deepEqual(result, { open: 1, queued: 1, failed: 0 })
+    assert.notEqual((await db.salesOrderRefund.findUniqueOrThrow({ where: { id: mine.refundId } })).stockCorrectionQueuedAt, null)
+    assert.equal((await stockJob(db, mine.productId)).connector, 'woocommerce', 'the stock job is durably recorded')
+    assert.equal((await db.salesOrderRefund.findUniqueOrThrow({ where: { id: other.refundId } })).stockCorrectionQueuedAt, null, 'another order\'s obligation is untouched')
+  } finally {
+    await cleanup(db, mine)
+    await cleanup(db, other)
+  }
+})
+
+test('the drain takes at most the limit it is given', { skip }, async () => {
+  const { db, correction } = await load()
+  const a = await seed(db)
+  const b = await seed(db)
+  try {
+    const recorded: string[][] = []
+    const deps = { enqueue: (async (ids: string[], _r: string, options: { onEnqueued?: () => Promise<void> }) => { recorded.push(ids); await options.onEnqueued?.() }) as never }
+    const result = await correction.queueRefundStockCorrections({ limit: 1 }, deps)
+    assert.equal(result.open, 1)
+    assert.equal(recorded.length, 1)
+  } finally {
+    await cleanup(db, a)
+    await cleanup(db, b)
+  }
+})

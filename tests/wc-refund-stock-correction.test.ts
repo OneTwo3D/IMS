@@ -168,3 +168,12 @@ test('the refund row is born owing its correction, in the refund transaction, fo
   const createAt = service.indexOf('const createdRefund = await tx.salesOrderRefund.create({')
   assert.ok(createAt > 0 && service.indexOf('stockCorrectionRequired:', createAt) - createAt < 1500)
 })
+
+test('the stock reconcile drains open corrections (capped) before it processes the stock jobs', async () => {
+  const { readFileSync } = await import('node:fs')
+  const source = readFileSync('lib/connectors/woocommerce/sync/reconcile.ts', 'utf8')
+  const drain = source.indexOf('await queueRefundStockCorrections({ limit: 50 })')
+  const process = source.indexOf('await processQueuedWcStockSyncJobs({ limit: 100 })')
+  assert.ok(drain > 0, 'the reconcile drains open obligations, 50 at a time')
+  assert.ok(drain < process, 'and records their jobs first so the same run processes them')
+})
