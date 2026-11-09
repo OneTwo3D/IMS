@@ -1048,3 +1048,20 @@ test('a lookup answer with an untyped row reaches the service as the existing re
     await cleanup(db, order.id)
   }
 })
+
+test('the REAL reset lock reports a lost pinned connection through assertHeld', { skip }, async () => {
+  const { db } = await setup()
+  const { withInvoiceDocumentResetLock } = await import('../../lib/domain/invoice-documents/reset-lock')
+  const { INVOICE_DOCUMENT_RESET_LOCK_NAMESPACE } = await import('../../lib/db/advisory-locks')
+  let threw = false
+  await withInvoiceDocumentResetLock(async (lock) => {
+    lock.assertHeld('before the connection drops')
+    const holders = await db.$queryRaw<Array<{ pid: number }>>`
+      SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND classid = ${INVOICE_DOCUMENT_RESET_LOCK_NAMESPACE}::oid AND objid = 0 AND mode = 'ExclusiveLock' AND granted`
+    assert.equal(holders.length, 1, 'the reset holds the session lock')
+    await db.$executeRawUnsafe(`SELECT pg_terminate_backend(${Number(holders[0]!.pid)})`)
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    try { lock.assertHeld('after the connection dropped') } catch { threw = true }
+  }).catch(() => { /* releasing a lost lock may report it */ })
+  assert.equal(threw, true, 'a lost session lock stops the reset')
+})
