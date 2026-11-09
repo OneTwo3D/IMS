@@ -8,11 +8,11 @@ test('selectChunkWindow: id-ordered windows cover every candidate exactly once a
   let afterId: string | null = null
   let windows = 0
   for (;;) {
-    const { window, nextCursor } = selectChunkWindow(candidates, { afterId, limit: 2 })
-    seen.push(...window.map((p) => p.id))
+    const slice: { window: Array<{ id: string }>; nextCursor: string | null } = selectChunkWindow(candidates, { afterId, limit: 2 })
+    seen.push(...slice.window.map((p) => p.id))
     windows++
-    if (nextCursor == null) break
-    afterId = nextCursor
+    if (slice.nextCursor == null) break
+    afterId = slice.nextCursor
   }
   assert.deepEqual(seen, ['a', 'b', 'c', 'd', 'e'])
   assert.equal(windows, 3)

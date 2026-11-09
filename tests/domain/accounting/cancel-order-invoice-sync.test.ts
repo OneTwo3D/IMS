@@ -265,7 +265,7 @@ test('the sale-cancel sweep does NOT stamp a revision-0 PENDING row that lacks t
   assert.equal(standing('proven'), 'PROVEN_NOT_POSTED')
   assert.equal(standing('no-custody'), 'UNKNOWN')
   assert.equal(standing('attempted'), 'UNKNOWN')
-  for (const id of ['no-custody', 'attempted']) assert.notEqual(store.get(id)?.abandonedBeforeRemoteCall, true, `${id} carries no pre-call stamp`)
+  for (const id of ['no-custody', 'attempted']) assert.notEqual((store.get(id) as unknown as { abandonedBeforeRemoteCall?: boolean | null }).abandonedBeforeRemoteCall, true, `${id} carries no pre-call stamp`)
   for (const id of ['no-custody', 'attempted']) assert.equal(store.get(id)?.attemptRevision, 0, `${id} stays at revision 0 (no forged attempt)`)
 })
 

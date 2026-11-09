@@ -5,6 +5,7 @@ import { cancelOrphanedPendingRows } from '@/lib/domain/accounting/orphan-sweep'
 import { createSyncLogStore, syncLogRow } from '../fixtures/accounting-sync-log-store.ts'
 
 const AT = new Date('2026-09-01T10:00:00.000Z')
+const abandoned = (row: unknown): unknown => (row as { abandonedBeforeRemoteCall?: boolean | null } | undefined)?.abandonedBeforeRemoteCall
 const SCOPE = { referenceType: 'SalesOrder', referenceId: 'order-1' }
 
 test('the orphan sweep stamps abandonedBeforeRemoteCall only on a revision-0 row that carries the canonical never-attempted record', async () => {
@@ -21,8 +22,8 @@ test('the orphan sweep stamps abandonedBeforeRemoteCall only on a revision-0 row
   const count = await cancelOrphanedPendingRows({ accountingSyncLog: store.delegate } as never, SCOPE, 'orphaned')
   assert.equal(count, 4, 'every orphan is retired')
   for (const id of ['proven', 'legacy-no-custody', 'attempted', 'revived']) assert.equal(store.get(id)?.status, 'CANCELLED', id)
-  assert.equal(store.get('proven')?.abandonedBeforeRemoteCall, true)
+  assert.equal(abandoned(store.get('proven')), true)
   for (const id of ['legacy-no-custody', 'attempted', 'revived']) {
-    assert.notEqual(store.get(id)?.abandonedBeforeRemoteCall, true, `${id} is retired UNSTAMPED (UNKNOWN to ledgerStanding)`)
+    assert.notEqual(abandoned(store.get(id)), true, `${id} is retired UNSTAMPED (UNKNOWN to ledgerStanding)`)
   }
 })
