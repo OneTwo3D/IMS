@@ -36,7 +36,11 @@ export async function fetchXeroChartOfAccounts(): Promise<{ ok: true; accounts: 
  * a statement that fails inside an interactive transaction aborts it, so a per-account failure fails the caller's transaction
  * instead of leaving a half-written chart.
  */
-export async function storeChartOfAccounts(tx: Pick<Prisma.TransactionClient, 'accountingAccount'>, accounts: XeroChartAccount[]): Promise<number> {
+export async function storeChartOfAccounts(
+  tx: Pick<Prisma.TransactionClient, 'accountingAccount'>,
+  accounts: XeroChartAccount[],
+  options: { deactivateMissing?: boolean } = {},
+): Promise<number> {
   for (const acc of accounts) {
     await tx.accountingAccount.upsert({
       where: { connector_externalAccountId: { connector: XERO_CONNECTOR, externalAccountId: acc.AccountID } },
@@ -60,11 +64,15 @@ export async function storeChartOfAccounts(tx: Pick<Prisma.TransactionClient, 'a
       },
     })
   }
-  // Deactivate accounts that no longer exist in Xero
-  await tx.accountingAccount.updateMany({
-    where: { connector: XERO_CONNECTOR, externalAccountId: { notIn: accounts.map((a) => a.AccountID) } },
-    data: { active: false },
-  })
+  // Deactivate accounts that no longer exist in Xero. Only when the caller can stand behind the list being the WHOLE chart:
+  // the scheduled refresh cannot (the Accounts endpoint is not paged, but nothing in a 200 response proves it is complete), so
+  // it only inserts and updates and leaves deactivation to the operator's manual refresh.
+  if (options.deactivateMissing !== false) {
+    await tx.accountingAccount.updateMany({
+      where: { connector: XERO_CONNECTOR, externalAccountId: { notIn: accounts.map((a) => a.AccountID) } },
+      data: { active: false },
+    })
+  }
   return accounts.length
 }
 
@@ -81,13 +89,20 @@ export async function syncChartOfAccounts(
   const connection = await captureXeroConnection()
   const fetched = await fetchXeroChartOfAccounts()
   if (!fetched.ok) return { synced: 0, errors: [fetched.error] }
+  const scheduled = options.recordScheduledSuccess === true
+  // A scheduled run never writes from a response that cannot be a real chart: an empty list, or a row without an id or a name.
+  // (A real organisation always has accounts; an empty body is a failed read, not an empty chart.) Nothing is stored and the
+  // stamp does not advance.
+  if (scheduled && (fetched.accounts.length === 0 || fetched.accounts.some((a) => !a || typeof a.AccountID !== 'string' || a.AccountID === '' || typeof a.Name !== 'string'))) {
+    return { synced: 0, errors: ['Xero returned an empty or malformed chart of accounts; nothing was stored and the last-success stamp was not advanced'] }
+  }
   let fenced
   try {
     fenced = await withXeroConnectionFence(connection, async (tx) => {
-      const stored = await storeChartOfAccounts(tx, fetched.accounts)
+      const stored = await storeChartOfAccounts(tx, fetched.accounts, { deactivateMissing: !scheduled })
       // The read-sync last-success stamp is written in THIS transaction, with the chart, and only by the scheduled
       // refresh: an on-demand refresh from the Sync page does not advance it. An empty chart is not a success.
-      if (options.recordScheduledSuccess === true && stored > 0) {
+      if (scheduled && stored > 0) {
         const stampedAt = new Date().toISOString()
         await tx.setting.upsert({
           where: { key: XERO_CHART_OF_ACCOUNTS_LAST_SUCCESS_SETTING },

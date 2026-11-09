@@ -84,6 +84,7 @@
  * migration (nothing stored is rewritten, only cleared or kept).
  */
 
+import { XERO_CHART_OF_ACCOUNTS_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
 import { XERO_SETTING_KEYS } from './settings'
 
 /** Which organisation the account mapping is OWNED by. Written by the binding and by an owned save. */
@@ -116,7 +117,12 @@ export const XERO_ACCOUNT_MAPPING_KEYS: readonly string[] = [
 ]
 
 /** Derived from the old organisation's data; cleared with it, never evidence of a mapping. */
-const DERIVED_ORG_KEYED_KEYS = ['xero_tax_rate_drift_current', 'xero_tax_rate_drift_last_checked_at'] as const
+export const DERIVED_ORG_KEYED_KEYS = [
+  'xero_tax_rate_drift_current',
+  'xero_tax_rate_drift_last_checked_at',
+  // The chart-of-accounts refresh's last-success stamp describes the cached chart, which is deleted below with the rest.
+  XERO_CHART_OF_ACCOUNTS_LAST_SUCCESS_SETTING,
+] as const
 
 /** The part of a Prisma transaction client this module uses. */
 export type AccountMappingRebindTx = {

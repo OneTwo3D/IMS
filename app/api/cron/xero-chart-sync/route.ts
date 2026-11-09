@@ -63,7 +63,7 @@ export async function handleXeroChartSyncCron(
     },
     getOutcome: (outcome) => {
       if ('skipped' in outcome && outcome.skipped === true) {
-        return { status: 'skipped', counts: {}, statusReason: outcome.reason, responseStatus: 200 }
+        return { status: 'skipped', counts: {} as Record<string, number>, statusReason: outcome.reason, responseStatus: 200 }
       }
       const failed = 'errors' in outcome && outcome.errors.length > 0
       return {

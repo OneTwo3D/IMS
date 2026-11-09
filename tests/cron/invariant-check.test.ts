@@ -4,6 +4,7 @@ import test from 'node:test'
 import { GET } from '@/app/api/cron/invariant-check/route'
 import { getAllCronJobs } from '@/lib/cron-jobs'
 import {
+  commitWarningBaselineInTx,
   countNotifiableWarnings,
   NOTIFIABLE_WARNING_CODES,
   notifiableWarningIncreases,
@@ -48,12 +49,56 @@ async function withCronEnv(env: CronEnv, fn: () => Promise<void>): Promise<void>
   }
 }
 
-function warningStore(initial: Record<string, number> = {}) {
-  let stored = initial
+type FakeNotification = { userId: string | null; type: string; title: string; message: string }
+
+/**
+ * An in-memory stand-in for the transaction client with REAL rollback semantics: if the callback throws, every
+ * setting and notification written inside it is undone, as PostgreSQL would.
+ */
+function warningStore(initial: Record<string, number> = {}, initialCheckedAt = '2000-01-01T00:00:00.000Z') {
+  let settings = new Map<string, string>()
+  if (Object.keys(initial).length > 0) {
+    settings.set('cron_invariant_check_notifiable_warning_counts', JSON.stringify({ counts: initial, checkedAt: initialCheckedAt }))
+  }
+  let notifications: FakeNotification[] = []
+  const control = { failNotification: false }
+  const tx = {
+    $executeRaw: async () => 1,
+    setting: {
+      findUnique: async ({ where }: { where: { key: string } }) => (settings.has(where.key) ? { value: settings.get(where.key)! } : null),
+      upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => { settings.set(where.key, create.value); return {} },
+    },
+    user: { findMany: async () => [{ id: 'admin-1' }, { id: 'admin-2' }] },
+    notification: {
+      create: async ({ data }: { data: FakeNotification }) => {
+        if (control.failNotification) throw new Error('insert failed')
+        notifications.push(data)
+        return {}
+      },
+    },
+  }
   return {
-    getPreviousWarningCounts: async () => stored,
-    setWarningCounts: async (counts: Record<string, number>) => { stored = counts },
-    read: () => stored,
+    commitWarningBaseline: async (input: { counts: Record<string, number>; checkedAt: string; runId: string }) => {
+      const snapshot = new Map(settings)
+      const kept = notifications.length
+      try {
+        return await commitWarningBaselineInTx(tx as never, input)
+      } catch (error) {
+        settings = snapshot
+        notifications = notifications.slice(0, kept)
+        throw error
+      }
+    },
+    read: (): Record<string, number> => {
+      const raw = settings.get('cron_invariant_check_notifiable_warning_counts')
+      return raw ? (JSON.parse(raw) as { counts: Record<string, number> }).counts : {}
+    },
+    readCheckedAt: (): string | null => {
+      const raw = settings.get('cron_invariant_check_notifiable_warning_counts')
+      return raw ? (JSON.parse(raw) as { checkedAt: string }).checkedAt : null
+    },
+    notifications: () => notifications,
+    control,
   }
 }
 
@@ -167,7 +212,7 @@ test('scheduled invariant check logs counts and notifies only for critical findi
     setCriticalFindingsHash: async (hash) => {
       storedCriticalHash = hash
     },
-    ...warningStore({ stock_cost_layer_quantity_mismatch: 1 }),
+    commitWarningBaseline: warningStore({ stock_cost_layer_quantity_mismatch: 1 }).commitWarningBaseline,
   })
 
   assert.equal(result.runId, 'run-1')
@@ -217,7 +262,7 @@ test('scheduled invariant check logs counts and notifies only for critical findi
     setCriticalFindingsHash: async (hash) => {
       storedCriticalHash = hash
     },
-    ...warningStore({ stock_cost_layer_quantity_mismatch: 1 }),
+    commitWarningBaseline: warningStore({ stock_cost_layer_quantity_mismatch: 1 }).commitWarningBaseline,
   })
 
   assert.equal(repeatedResult.status, 'completed')
@@ -252,7 +297,7 @@ test('scheduled invariant check does not notify when there are no critical findi
     setCriticalFindingsHash: async (hash) => {
       storedCriticalHash = hash
     },
-    ...warningStore({ stock_cost_layer_quantity_mismatch: 1 }),
+    commitWarningBaseline: warningStore({ stock_cost_layer_quantity_mismatch: 1 }).commitWarningBaseline,
   })
 
   assert.equal(result.status, 'completed')
@@ -296,7 +341,7 @@ test('scheduled invariant check logs partial report failures without discarding 
     setCriticalFindingsHash: async (hash) => {
       storedCriticalHash = hash
     },
-    ...warningStore({ stock_cost_layer_quantity_mismatch: 1 }),
+    commitWarningBaseline: warningStore({ stock_cost_layer_quantity_mismatch: 1 }).commitWarningBaseline,
   })
 
   assert.equal(result.status, 'partial_failure')
@@ -333,13 +378,15 @@ function warningFindings(code: string, n: number) {
   }))
 }
 
+let clockMs = Date.parse('2026-01-01T00:00:00.000Z')
 async function runWithWarnings(
   store: ReturnType<typeof warningStore>,
   inventoryFindings: ReturnType<typeof warningFindings>,
-  notifications: Array<Record<string, unknown>>,
+  startedAt: Date = new Date((clockMs += 60_000)),
 ) {
   return runScheduledInvariantCheck({
     createRunId: () => 'run-w',
+    now: () => startedAt,
     runInventoryReport: async () => ({
       checkedAt: '2026-01-01T00:00:01.000Z',
       findings: inventoryFindings,
@@ -348,44 +395,89 @@ async function runWithWarnings(
     runAccountingReport: async () => emptyReport('2026-01-01T00:00:02.000Z'),
     runSalesReport: async () => cleanSalesReport(),
     writeActivityLog: async () => {},
-    notifyAdmins: async (n) => { notifications.push(n) },
+    notifyAdmins: async () => { throw new Error('warnings must not go through notifyAdmins') },
     getPreviousCriticalFindingsHash: async () => null,
     setCriticalFindingsHash: async () => {},
-    ...store,
+    commitWarningBaseline: store.commitWarningBaseline,
   })
 }
 
 test('named warning codes notify when newly appearing or rising, and are quiet otherwise', async () => {
-  const notifications: Array<Record<string, unknown>> = []
   const store = warningStore()
   const code = 'stock_cost_layer_quantity_mismatch'
 
-  await runWithWarnings(store, warningFindings(code, 2), notifications)
-  assert.equal(notifications.length, 1, 'newly appearing')
-  assert.equal(notifications[0]?.type, 'warning')
-  assert.match(String(notifications[0]?.message), /stock_cost_layer_quantity_mismatch 0 -> 2/)
+  await runWithWarnings(store, warningFindings(code, 2))
+  assert.equal(store.notifications().length, 2, 'newly appearing: one row per active admin')
+  assert.equal(store.notifications()[0]?.type, 'warning')
+  assert.match(String(store.notifications()[0]?.message), /stock_cost_layer_quantity_mismatch 0 -> 2/)
 
-  await runWithWarnings(store, warningFindings(code, 2), notifications)
-  assert.equal(notifications.length, 1, 'same count is deduplicated')
+  await runWithWarnings(store, warningFindings(code, 2))
+  assert.equal(store.notifications().length, 2, 'same count is deduplicated')
 
-  await runWithWarnings(store, warningFindings(code, 1), notifications)
-  assert.equal(notifications.length, 1, 'a falling count is not news')
+  await runWithWarnings(store, warningFindings(code, 1))
+  assert.equal(store.notifications().length, 2, 'a falling count is not news')
   assert.deepEqual(store.read(), { [code]: 1 }, 'but it lowers the baseline')
 
-  await runWithWarnings(store, warningFindings(code, 2), notifications)
-  assert.equal(notifications.length, 2, 'rising again after a fall notifies again')
+  await runWithWarnings(store, warningFindings(code, 2))
+  assert.equal(store.notifications().length, 4, 'rising again after a fall notifies again')
 
-  await runWithWarnings(store, [], notifications)
+  await runWithWarnings(store, [])
   assert.deepEqual(store.read(), {}, 'cleared')
-  await runWithWarnings(store, warningFindings(code, 2), notifications)
-  assert.equal(notifications.length, 3, 'reappearing after a clear notifies')
+  await runWithWarnings(store, warningFindings(code, 2))
+  assert.equal(store.notifications().length, 6, 'reappearing after a clear notifies')
+})
+
+test('a notification that cannot be stored leaves the baseline unchanged, so the next run tries again', async () => {
+  const store = warningStore()
+  const code = 'transfer_stranded_in_transit'
+  store.control.failNotification = true
+  await assert.rejects(runWithWarnings(store, warningFindings(code, 3)), /insert failed/)
+  assert.deepEqual(store.read(), {}, 'baseline did not advance over an alert nobody received')
+  assert.equal(store.notifications().length, 0)
+
+  store.control.failNotification = false
+  await runWithWarnings(store, warningFindings(code, 3))
+  assert.equal(store.notifications().length, 2, 'the retry notifies')
+  assert.deepEqual(store.read(), { [code]: 3 })
+})
+
+test('an older run that finishes late stands down and cannot overwrite a newer baseline', async () => {
+  const store = warningStore()
+  const code = 'accounting_sync_failed'
+  const older = new Date('2026-02-01T00:00:00.000Z')
+  const newer = new Date('2026-02-01T00:10:00.000Z')
+  await runWithWarnings(store, warningFindings(code, 5), newer)
+  assert.equal(store.notifications().length, 2)
+  await runWithWarnings(store, warningFindings(code, 1), older)
+  assert.deepEqual(store.read(), { [code]: 5 }, 'the newer baseline stands')
+  assert.equal(store.readCheckedAt(), newer.toISOString())
+  assert.equal(store.notifications().length, 2, 'the older run notifies nobody')
+})
+
+test('with no active admin the alert is a broadcast, not nothing', async () => {
+  const outcome = await (async () => {
+    const settings = new Map<string, string>()
+    const created: Array<{ userId: string | null }> = []
+    const tx = {
+      $executeRaw: async () => 1,
+      setting: {
+        findUnique: async () => null,
+        upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => { settings.set(where.key, create.value); return {} },
+      },
+      user: { findMany: async () => [] },
+      notification: { create: async ({ data }: { data: { userId: string | null } }) => { created.push(data); return {} } },
+    }
+    await commitWarningBaselineInTx(tx as never, { counts: { accounting_sync_failed: 1 }, checkedAt: '2026-01-01T00:00:00.000Z', runId: 'r' })
+    return created
+  })()
+  assert.equal(outcome.length, 1)
+  assert.equal(outcome[0]?.userId, null)
 })
 
 test('warnings outside the named set never notify, and a failed report leaves the baseline alone', async () => {
-  const notifications: Array<Record<string, unknown>> = []
   const store = warningStore({ transfer_stranded_in_transit: 3 })
-  await runWithWarnings(store, warningFindings('stock_negative_reserved_quantity_unlisted', 5), notifications)
-  assert.equal(notifications.length, 0)
+  await runWithWarnings(store, warningFindings('stock_negative_reserved_quantity_unlisted', 5))
+  assert.equal(store.notifications().length, 0)
   assert.deepEqual(store.read(), {})
 
   const baseline = warningStore({ transfer_stranded_in_transit: 3 })
@@ -395,13 +487,13 @@ test('warnings outside the named set never notify, and a failed report leaves th
     runAccountingReport: async () => emptyReport('2026-01-01T00:00:02.000Z'),
     runSalesReport: async () => cleanSalesReport(),
     writeActivityLog: async () => {},
-    notifyAdmins: async (n) => { notifications.push(n) },
+    notifyAdmins: async () => {},
     getPreviousCriticalFindingsHash: async () => null,
     setCriticalFindingsHash: async () => {},
-    ...baseline,
+    commitWarningBaseline: baseline.commitWarningBaseline,
   })
   assert.equal(result.status, 'partial_failure')
-  assert.equal(notifications.length, 0)
+  assert.equal(baseline.notifications().length, 0)
   assert.deepEqual(baseline.read(), { transfer_stranded_in_transit: 3 })
 })
 

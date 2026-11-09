@@ -55,7 +55,7 @@ async function withRollback<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
   return captured as T
 }
 
-const DERIVED = ['xero_tax_rate_drift_current', 'xero_tax_rate_drift_last_checked_at']
+const DERIVED = ['xero_tax_rate_drift_current', 'xero_tax_rate_drift_last_checked_at', 'xero_chart_of_accounts_last_success_at']
 
 /** A clean slate, then a full mapping: settings, tax types on real rate rows, a cached chart row, sync on. */
 async function seedMapping(tx: Tx, owner: string, stampedFor: string | null, run: string) {
