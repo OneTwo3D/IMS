@@ -31,6 +31,7 @@ The overlapping user manuals in `docs/` should be symlinks back to this director
 ### Administration
 - [Settings](settings.md) — company, inventory, sales, accounting, backup, system
 - [User Management & Security](user-management.md) — roles, permissions, 2FA
+- [Personal-data erasure](erasure.md) — what GDPR erasure removes, keeps and cannot reach
 
 ### Integrations
 - [WooCommerce Integration](woocommerce.md) — order sync, product sync, refunds

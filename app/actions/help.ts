@@ -25,6 +25,7 @@ const HELP_DOCS = [
   { slug: 'analytics', title: 'Analytics & Reports' },
   { slug: 'settings', title: 'Settings' },
   { slug: 'user-management', title: 'User Management & Security' },
+  { slug: 'erasure', title: 'Personal-data Erasure' },
   { slug: 'documents-email', title: 'Documents & Email' },
   { slug: 'activity-log', title: 'Activity Log' },
   { slug: 'woocommerce', title: 'WooCommerce Integration' },

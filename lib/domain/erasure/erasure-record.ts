@@ -40,8 +40,17 @@ export const ERASURE_TRIGGERS = ['ON_REQUEST', 'MIRRORED_FROM_STOREFRONT', 'SCHE
 /** IMPORT_AFTER_ERASURE: an order that arrived after its customer was erased, created already erased; the record carries the customer's ORIGINAL request id. */
 export type ErasureTrigger = (typeof ERASURE_TRIGGERS)[number]
 
-/** What happened to an external system's copy. `not-attempted` until the propagation work lands. */
-export const ERASURE_SYSTEM_VERDICTS = ['propagated', 'refused', 'not-technically-possible', 'not-attempted'] as const
+/**
+ * What happened to an external system's copy. IMS makes NO write to any external system for an erasure (an erasure must never become an outbound write), so
+ * `propagated` is reserved for a future propagation and is not written today.
+ *   erased-at-source          the storefront anonymised the order first and IMS mirrored it (the trigger says so)
+ *   refused-pending-legal     IMS holds a copy it deliberately left untouched until the accountant / DPO rules (the Xero contact: its name shows on every historical invoice)
+ *   refused                   the copy is still live and IMS did not write to the system (open warehouse orders: an operator handles them by hand)
+ *   not-technically-possible  the system has no way to erase it (despatched warehouse orders)
+ *   not-applicable            IMS holds nothing in that system for this subject
+ *   not-attempted             nothing was done and nothing is recorded as decided
+ */
+export const ERASURE_SYSTEM_VERDICTS = ['propagated', 'refused', 'refused-pending-legal', 'erased-at-source', 'not-technically-possible', 'not-applicable', 'not-attempted'] as const
 export type ErasureSystemVerdict = (typeof ERASURE_SYSTEM_VERDICTS)[number]
 
 export const ERASURE_EXTERNAL_SYSTEMS = ['storefront', 'accounting', 'warehouse', 'carrierPortal'] as const
@@ -81,6 +90,46 @@ export type ErasureCounts = {
   notifications: number
 }
 
+/**
+ * THE WAREHOUSE'S COPY, counted at erasure. The warehouse has no erase endpoint and IMS may not rewrite a live order, so for each of the subject's orders that exists there
+ * the record says which state it is in. `open` orders (pushed, not despatched, not cancelled) still hold the person's name and address: each is listed so an operator can
+ * handle it by hand. Only the surrogate order id and the warehouse order NUMBER are listed (both are retained identifiers of an order, not of a person).
+ */
+export type ErasureWarehouseSummary = {
+  /** Orders with a warehouse link that carries a warehouse order id. */
+  linkedOrders: number
+  despatched: number
+  open: number
+  /** Linked orders that were cancelled in the warehouse. */
+  cancelled: number
+  /** Links with no warehouse order id that the push code PROVES were never sent (its own no-remote-call predicate): nothing is held there. */
+  notPushed: number
+  /**
+   * Orders IMS cannot PROVE are gone from, or never reached, the warehouse: a link with no warehouse order id that the push code does not prove was never sent (a create is
+   * claimed immediately before the remote call, so a killed worker, a timeout, a replay that cleared the attempt columns or an old link with no claim history can all leave an
+   * order in the warehouse with no id here), and a CANCELLED link whose cancellation the warehouse did not confirm (it answered NOT_FOUND, or no evidence is kept). Each is
+   * listed for the operator to VERIFY. Never read as "nothing held".
+   */
+  ambiguous: number
+  /** Links parked MERGED (the warehouse merged the order into another: the data lives on under the combined order). Counted inside despatched/open too. */
+  merged: number
+  openOrders: Array<{ orderId: string; warehouseOrderNumber: string | null; numberWithheld?: boolean }>
+  /** The ambiguous orders, by surrogate order id and, when one is recorded, the warehouse order number. */
+  ambiguousOrders: Array<{ orderId: string; warehouseOrderNumber: string | null; numberWithheld?: boolean }>
+}
+
+/**
+ * AN ORDER NUMBER FROM OUTSIDE IS NOT TRUSTED TO BE IDENTITY-FREE. A warehouse order number can derive from the storefront's order number (which a plugin or a person can
+ * set), so it could carry a name or an email. Only a plain token reaches the retained record or the page: letters, digits and `_ . / # + -`, 1 to 40 characters, no
+ * whitespace and no `@`. Anything else is WITHHELD (the surrogate id identifies the order instead).
+ */
+export const IDENTITY_FREE_ORDER_TOKEN = /^[A-Za-z0-9_./#+-]{1,40}$/
+export function identityFreeOrderToken(value: unknown): string | null {
+  return typeof value === 'string' && IDENTITY_FREE_ORDER_TOKEN.test(value) ? value : null
+}
+
+export const EMPTY_WAREHOUSE_SUMMARY: ErasureWarehouseSummary = { linkedOrders: 0, despatched: 0, open: 0, cancelled: 0, notPushed: 0, ambiguous: 0, merged: 0, openOrders: [], ambiguousOrders: [] }
+
 export type ErasureRecordMetadata = {
   requestId: string
   erasedAt: string
@@ -90,6 +139,13 @@ export type ErasureRecordMetadata = {
   orderIds: string[]
   counts: ErasureCounts
   systems: Record<ErasureExternalSystem, ErasureSystemVerdict>
+  warehouse: ErasureWarehouseSummary
+}
+
+/** The verdicts that follow from the trigger alone (nothing in the subject's data is read): used where no richer decision was made (an order created already erased). */
+export function defaultSystemVerdicts(trigger: ErasureTrigger): Record<ErasureExternalSystem, ErasureSystemVerdict> {
+  const atSource = trigger === 'MIRRORED_FROM_STOREFRONT' || trigger === 'IMPORT_AFTER_ERASURE'
+  return { storefront: atSource ? 'erased-at-source' : 'not-attempted', accounting: 'not-applicable', warehouse: 'not-applicable', carrierPortal: 'not-attempted' }
 }
 
 /**
@@ -104,6 +160,8 @@ export function buildErasureRecordMetadata(input: {
   customerId: string | null
   orderIds: string[]
   counts: ErasureCounts
+  systems?: Record<ErasureExternalSystem, ErasureSystemVerdict>
+  warehouse?: ErasureWarehouseSummary
 }): ErasureRecordMetadata {
   return {
     requestId: input.requestId,
@@ -112,7 +170,8 @@ export function buildErasureRecordMetadata(input: {
     customerId: input.customerId,
     orderIds: [...input.orderIds],
     counts: { ...input.counts },
-    systems: { storefront: 'not-attempted', accounting: 'not-attempted', warehouse: 'not-attempted', carrierPortal: 'not-attempted' },
+    systems: input.systems ? { ...input.systems } : defaultSystemVerdicts(input.trigger),
+    warehouse: input.warehouse ? { ...input.warehouse, openOrders: input.warehouse.openOrders.map((o) => ({ ...o })), ambiguousOrders: input.warehouse.ambiguousOrders.map((o) => ({ ...o })) } : { ...EMPTY_WAREHOUSE_SUMMARY, openOrders: [], ambiguousOrders: [] },
   }
 }
 

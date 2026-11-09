@@ -119,6 +119,11 @@ export function monthsAgo(months: number): Date {
  * - Sync logs & stock movements: hard-deleted
  * - Sales orders, purchase orders, customers: soft-archived (archived = true)
  * Call on a daily schedule via /api/cron/activity-cleanup.
+ *
+ * THIS PASS ARCHIVES; IT ERASES NO PERSONAL DATA. An archived order or customer is only hidden from lists: every name, address and email on it survives. The
+ * erasure of personal data is a separate act (lib/domain/erasure), triggered by a WooCommerce anonymisation that IMS mirrors, or by an operator's GDPR
+ * Anonymise. By owner ruling there is no separate IMS erasure schedule: IMS erases when WooCommerce does. Nothing here may be read as a data lifecycle for
+ * personal data, and nothing here may be turned into an anonymise-by-age without that ruling being changed.
  */
 export async function purgeExpiredData(): Promise<{
   syncLogsDeleted: number
@@ -720,7 +725,13 @@ export async function purgeExpiredData(): Promise<{
     purchaseOrdersArchived = count
   }
 
-  // Customers — soft archive inactive customers with no unarchived orders
+  // Customers — soft archive inactive customers with no unarchived orders.
+  // ARCHIVES ONLY: `archived: true` and nothing else. No personal data is erased here (see the header of this function).
+  // The predicate reads `updatedAt`, and an erasure writes the customer row (which bumps `updatedAt`), so an erased customer moves back out of this window. That is
+  // safe ONLY because this pass does nothing conditional on age except hide a row: it never erases, so a reset clock changes when a row is hidden and nothing else.
+  // If this pass ever starts doing anything else by age, the clock must stop being `updatedAt`.
+  // It is also gated on every order of the customer being archived, and orders are archived by the SEPARATE `retention_sales_orders_months` setting (default 0 = off):
+  // turning this setting on alone archives nothing.
   const custMonths = settings.retention_customers_months
   if (custMonths > 0) {
     const cutoff = monthsAgo(custMonths)

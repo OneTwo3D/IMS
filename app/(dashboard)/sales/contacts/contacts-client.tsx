@@ -205,6 +205,7 @@ function GdprDialog({ customer, onClose }: { customer: CustomerRow; onClose: () 
   const [isPending, startTransition] = useTransition()
   const [confirmation, setConfirmation] = useState('')
   const [error, setError] = useState('')
+  const [warning, setWarning] = useState('')
 
   const expectedName = customer.fullName
   const canConfirm = confirmation === expectedName
@@ -213,8 +214,12 @@ function GdprDialog({ customer, onClose }: { customer: CustomerRow; onClose: () 
     setError('')
     startTransition(async () => {
       const result = await anonymiseCustomer(customer.id)
-      if (result.success) { router.refresh(); onClose() }
-      else setError(result.error ?? 'Anonymisation failed')
+      if (result.success) {
+        router.refresh()
+        // An erasure that left open warehouse orders says so here, and stays open until the operator has read it.
+        if (result.warning) setWarning(result.warning)
+        else onClose()
+      } else setError(result.error ?? 'Anonymisation failed')
     })
   }
 
@@ -245,13 +250,16 @@ function GdprDialog({ customer, onClose }: { customer: CustomerRow; onClose: () 
             />
           </div>
           {error && <p className="text-destructive text-sm">{error}</p>}
+          {warning && <p role="alert" className="text-sm font-medium text-amber-700">{warning}</p>}
         </div>
         <DialogFooter>
+          {warning ? <Button onClick={onClose}>Close</Button> : (<>
           <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
           <Button variant="destructive" onClick={handleAnonymise} disabled={isPending || !canConfirm}>
             {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
             Anonymise
           </Button>
+          </>)}
         </DialogFooter>
       </DialogContent>
     </Dialog>

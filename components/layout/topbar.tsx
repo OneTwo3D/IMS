@@ -109,6 +109,7 @@ const SECTION_TITLES: Array<{ prefix: string; title: string }> = [
   { prefix: '/settings/system', title: 'System Settings' },
   { prefix: '/settings/users', title: 'User Management' },
   { prefix: '/settings/backup', title: 'Backup & Restore' },
+  { prefix: '/settings/erasure', title: 'Erasure records' },
   { prefix: '/settings', title: 'Settings' },
   { prefix: '/profile', title: 'Profile' },
   { prefix: '/activity', title: 'Activity Log' },

@@ -6,6 +6,7 @@ import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { eraseCustomerPersonalData } from '@/lib/domain/erasure/erase-personal-data'
+import { openWarehouseOrdersWarning } from '@/lib/domain/erasure/warehouse-obligations'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { toIsoCountryCode } from '@/lib/countries'
 import {
@@ -512,10 +513,17 @@ export async function importContactsCsv(formData: FormData): Promise<CsvImportAc
   }
 }
 
-export async function anonymiseCustomer(customerId: string): Promise<{ success: boolean; error?: string }> {
+export async function anonymiseCustomer(customerId: string): Promise<{ success: boolean; error?: string; warning?: string; openWarehouseOrders?: number; ambiguousWarehouseOrders?: number }> {
   const session = await requirePermission('sync')
   // The erasure itself, and its name-free proof, live in one place: see lib/domain/erasure.
   const result = await eraseCustomerPersonalData(customerId, { trigger: 'ON_REQUEST', userId: session.user.id ?? null })
   if (result.success) revalidatePath('/sales/contacts')
-  return result.success ? { success: true } : { success: false, error: result.error }
+  if (!result.success) return { success: false, error: result.error }
+  // The operator is told AT THE TIME OF ERASURE what the erasure did not reach: warehouse orders still open hold the person's name and address, and IMS
+  // does not write to the live warehouse. The sentence carries a number only.
+  const open = result.warehouse.open
+  const ambiguous = result.warehouse.ambiguous
+  return open + ambiguous > 0
+    ? { success: true, openWarehouseOrders: open, ambiguousWarehouseOrders: ambiguous, warning: openWarehouseOrdersWarning(open, ambiguous) }
+    : { success: true }
 }
