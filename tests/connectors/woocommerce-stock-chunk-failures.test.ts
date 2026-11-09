@@ -245,13 +245,16 @@ test('chunking applies only to an unscoped forceAll push', async () => {
   assert.deepEqual(chunked.chunk, { nextCursor: 'a', totalCandidates: 3 })
 })
 
-test('a kit in this window sees its component in another window', async () => {
-  const kit = { ...product('b', 'KIT1', BigInt(2)), type: 'KIT', productComponents: [{ componentId: 'a', qty: 1, component: { type: 'SIMPLE', lifecycleStatus: 'ACTIVE' } }] }
-  reset([product('a', 'S1', BigInt(1)), kit])
-  fetchImpl = (path, params) => (params.include ? { data: params.include.split(',').map((id) => ({ id: Number(id), sku: id === '2' ? 'KIT1' : 'S1' })) } : { data: [] })
+test('a kit in this window sees a nested kit (and its components) that sit in other windows', async () => {
+  const component = (componentId: string, type: string) => [{ componentId, qty: 1, component: { type, lifecycleStatus: 'ACTIVE' } }]
+  const inner = { ...product('b', 'KIT-IN', BigInt(2)), type: 'KIT', productComponents: component('a', 'SIMPLE') }
+  const outer = { ...product('c', 'KIT-OUT', BigInt(3)), type: 'KIT', productComponents: component('b', 'KIT') }
+  reset([product('a', 'S1', BigInt(1)), inner, outer])
+  const skuById: Record<string, string> = { 1: 'S1', 2: 'KIT-IN', 3: 'KIT-OUT' }
+  fetchImpl = (_path, params) => (params.include ? { data: params.include.split(',').map((id) => ({ id: Number(id), sku: skuById[id] })) } : { data: [] })
   let sent: Array<{ id: number; stock_quantity?: number }> = []
   postImpl = (_p, body) => { sent = (body as { update: typeof sent }).update; return okUpdate(sent.map((u) => u.id)) }
-  const result = await run({ forceAll: true, chunk: { afterId: 'a', limit: 1 } })
+  const result = await run({ forceAll: true, chunk: { afterId: 'b', limit: 1 } })
   assert.deepEqual(result.errors, [])
-  assert.equal(sent.find((u) => u.id === 2)?.stock_quantity, 5, 'the kit is as available as its component, which is not in this window')
+  assert.equal(sent.find((u) => u.id === 3)?.stock_quantity, 5, 'the outer kit is as available as the component two windows back')
 })
