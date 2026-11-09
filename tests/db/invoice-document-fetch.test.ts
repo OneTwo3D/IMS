@@ -92,8 +92,9 @@ test('stores a version, is idempotent, supersedes an amended document, never tou
 
     const row = await db.salesOrder.findUniqueOrThrow({ where: { id: order.id }, select: { invoicePdfPath: true, accountingInvoiceId: true } })
     assert.equal(row.accountingInvoiceId, null, 'the ledger link column is never written')
-    assert.equal(row.invoicePdfPath, `invoice-pdfs/${order.id}.pdf`)
-    const { loadInvoicePdf } = await import('../../lib/invoice-pdf')
+    const firstDoc = await db.salesOrderInvoiceDocument.findFirstOrThrow({ where: { orderId: order.id } })
+    assert.equal(row.invoicePdfPath, firstDoc.storedPath, 'the compatibility pointer names the immutable file of the current version')
+    const { loadCurrentInvoicePdf: loadInvoicePdf } = await import('../../lib/domain/invoice-documents/current-document')
     assert.deepEqual(await loadInvoicePdf(order.id), bytes)
 
     // The same bytes again: no new row, no new file.
@@ -116,7 +117,7 @@ test('stores a version, is idempotent, supersedes an amended document, never tou
       assert.ok(existsSync(file), `version file kept: ${r.storedPath}`)
       assert.match(readFileSync(file, 'latin1'), /^%PDF-/)
     }
-    assert.deepEqual(await loadInvoicePdf(order.id), bytes, 'the flat pointer follows the current version')
+    assert.deepEqual(await loadInvoicePdf(order.id), bytes, 'readers are served the current version')
   } finally {
     await cleanup(db, order.id)
   }
@@ -345,7 +346,7 @@ test('an amendment after first storage is picked up by the due recheck, and not 
     const rows = await db.salesOrderInvoiceDocument.findMany({ where: { orderId: order.id }, orderBy: { fetchedAt: 'asc' } })
     assert.equal(rows.length, 2)
     assert.equal(rows.filter((r) => r.supersededAt === null).length, 1)
-    const { loadInvoicePdf } = await import('../../lib/invoice-pdf')
+    const { loadCurrentInvoicePdf: loadInvoicePdf } = await import('../../lib/domain/invoice-documents/current-document')
     assert.deepEqual(await loadInvoicePdf(order.id), bytes)
     const state1 = await db.invoiceDocumentFetchState.findFirstOrThrow({ where: { orderId: order.id } })
     assert.equal(state1.rechecks, 1)
@@ -382,7 +383,7 @@ test('overlapping fetches: the second does not run while the first holds the doc
     assert.equal(next.status === 'stored' && next.created, true)
     const current = await db.salesOrderInvoiceDocument.findMany({ where: { orderId: order.id, supersededAt: null } })
     assert.equal(current.length, 1)
-    const { loadInvoicePdf } = await import('../../lib/invoice-pdf')
+    const { loadCurrentInvoicePdf: loadInvoicePdf } = await import('../../lib/domain/invoice-documents/current-document')
     assert.deepEqual(await loadInvoicePdf(order.id), bytes)
     const lease = await db.invoiceDocumentFetchState.findFirstOrThrow({ where: { orderId: order.id } })
     assert.equal(lease.leaseUntil, null, 'the lease is released')
@@ -440,7 +441,7 @@ test('a lease taken over while the first download is still running: the first wo
     const current = await db.salesOrderInvoiceDocument.findMany({ where: { orderId: order.id, supersededAt: null } })
     assert.equal(current.length, 1)
     assert.equal(await db.salesOrderInvoiceDocument.count({ where: { orderId: order.id } }), 1, 'the older PDF was never promoted')
-    const { loadInvoicePdf } = await import('../../lib/invoice-pdf')
+    const { loadCurrentInvoicePdf: loadInvoicePdf } = await import('../../lib/domain/invoice-documents/current-document')
     assert.deepEqual(await loadInvoicePdf(order.id), bytes)
     const state = await db.invoiceDocumentFetchState.findFirstOrThrow({ where: { orderId: order.id } })
     assert.equal(state.status, 'DONE', 'the new holder\'s state was not overwritten')
@@ -479,5 +480,109 @@ test('a lookup refusal carries the stop signal to the sweep, which stops at once
     for (const row of saved) await db.setting.create({ data: { key: row.key, value: row.value } })
     await cleanup(db, a.order.id)
     await cleanup(db, b.order.id)
+  }
+})
+
+test('a crash between the file write and the promotion leaves nothing current; the next sweep recovers it', { skip }, async () => {
+  const { db, service, sweep } = await setup()
+  const { order } = await seedOrder(db)
+  const keys = [sweep.INVOICE_DOCUMENTS_SWEEP_FLOOR_SETTING]
+  const saved = await db.setting.findMany({ where: { key: { in: keys } } })
+  try {
+    const { saveInvoiceDocumentFile } = await import('../../lib/invoice-pdf')
+    const { loadCurrentInvoicePdf } = await import('../../lib/domain/invoice-documents/current-document')
+    const { createHash } = await import('node:crypto')
+    // The crash: the immutable file is on disk, the promotion never ran.
+    const bytes = pdf('crashed-before-promotion')
+    await saveInvoiceDocumentFile(order.id, createHash('sha256').update(bytes).digest('hex'), bytes)
+    assert.equal(await db.salesOrderInvoiceDocument.count({ where: { orderId: order.id } }), 0, 'no row, so nothing current')
+    assert.equal(await loadCurrentInvoicePdf(order.id), null, 'and the orphan file is never served')
+    assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: order.id }, select: { invoicePdfPath: true } })).invoicePdfPath, null)
+
+    await db.setting.deleteMany({ where: { key: { in: keys } } })
+    await db.setting.create({ data: { key: sweep.INVOICE_DOCUMENTS_SWEEP_FLOOR_SETTING, value: new Date(Date.now() - 86_400_000).toISOString() } })
+    const deps = depsFor(order, { bytes: () => bytes })
+    const result = await sweep.runInvoiceDocumentSweep(deps)
+    assert.ok(result.stored >= 1)
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id), bytes)
+  } finally {
+    await db.setting.deleteMany({ where: { key: { in: keys } } })
+    for (const row of saved) await db.setting.create({ data: { key: row.key, value: row.value } })
+    await cleanup(db, order.id)
+  }
+})
+
+test('an expired holder resuming after a newer promotion never publishes: the newer version is served, the older bytes never are', { skip }, async () => {
+  const { db, service } = await setup()
+  const { order } = await seedOrder(db)
+  try {
+    const { loadCurrentInvoicePdf } = await import('../../lib/domain/invoice-documents/current-document')
+    const t0 = new Date('2026-11-09T10:00:00Z')
+    let now = t0
+    const older = pdf('older')
+    const newer = pdf('newer')
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let started: () => void = () => {}
+    const downloading = new Promise<void>((resolve) => { started = resolve })
+    const slow: Deps = { ...depsFor(order), now: () => now, downloadPdf: async () => { started(); await gate; return { ok: true, buffer: older } } }
+    const first = service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, slow)
+    await downloading
+    now = new Date(t0.getTime() + service.INVOICE_DOCUMENT_LEASE_MS + 60_000)
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, { ...depsFor(order, { bytes: () => newer }), now: () => now })).status, 'stored')
+    // Mid-way: the newer one is what a reader gets.
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id), newer)
+    release()
+    assert.equal((await first).status, 'busy')
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id), newer, 'after the late holder gave up, still the newer version')
+    const row = await db.salesOrder.findUniqueOrThrow({ where: { id: order.id }, select: { invoicePdfPath: true } })
+    const current = await db.salesOrderInvoiceDocument.findFirstOrThrow({ where: { orderId: order.id, supersededAt: null } })
+    assert.equal(row.invoicePdfPath, current.storedPath, 'the compatibility pointer was written only by the fenced promotion')
+    assert.equal(await db.salesOrderInvoiceDocument.count({ where: { orderId: order.id } }), 1, 'the older PDF has no row, so it can never be current')
+  } finally {
+    await cleanup(db, order.id)
+  }
+})
+
+test('readers resolve the current hash-named file, not the flat file; a missing or altered file is not served and is repaired', { skip }, async () => {
+  const { db, service, sweep } = await setup()
+  const { order } = await seedOrder(db)
+  const keys = [sweep.INVOICE_DOCUMENTS_SWEEP_FLOOR_SETTING]
+  const saved = await db.setting.findMany({ where: { key: { in: keys } } })
+  try {
+    const { loadCurrentInvoicePdf } = await import('../../lib/domain/invoice-documents/current-document')
+    const { saveInvoicePdfFile, getInvoicePdfStorageDir } = await import('../../lib/invoice-pdf')
+    const good = pdf('current')
+    const deps = depsFor(order, { bytes: () => good })
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, deps)).status, 'stored')
+    // A stale flat file (the old publication path) must not be read once a document row exists.
+    await saveInvoicePdfFile(order.id, pdf('STALE-FLAT-FILE'))
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id), good)
+
+    // Tamper with the immutable file: not served, document made due.
+    const doc = await db.salesOrderInvoiceDocument.findFirstOrThrow({ where: { orderId: order.id, supersededAt: null } })
+    const { writeFileSync, rmSync } = await import('node:fs')
+    const file = path.join(getInvoicePdfStorageDir(), doc.storedPath.replace(/^invoice-pdfs\//, ''))
+    writeFileSync(file, pdf('tampered'))
+    assert.equal(await loadCurrentInvoicePdf(order.id), null, 'altered bytes are never served')
+    const due = await db.invoiceDocumentFetchState.findFirstOrThrow({ where: { orderId: order.id } })
+    assert.ok(due.nextAttemptAt && due.nextAttemptAt.getTime() <= Date.now(), 'and the document is due for a re-fetch')
+
+    // The sweep re-fetches and rewrites the file.
+    await db.setting.deleteMany({ where: { key: { in: keys } } })
+    await db.setting.create({ data: { key: sweep.INVOICE_DOCUMENTS_SWEEP_FLOOR_SETTING, value: new Date(Date.now() - 86_400_000).toISOString() } })
+    await sweep.runInvoiceDocumentSweep(deps)
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id), good, 'repaired')
+
+    // A file lost entirely is found by the integrity scan before anyone asks for it.
+    rmSync(file)
+    await db.setting.deleteMany({ where: { key: sweep.INVOICE_DOCUMENTS_INTEGRITY_CURSOR_SETTING } })
+    assert.ok((await sweep.markDocumentsWithBadFilesDue(new Date(), 5000)) >= 1)
+    await sweep.runInvoiceDocumentSweep(deps)
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id), good, 'repaired from the scan')
+  } finally {
+    await db.setting.deleteMany({ where: { key: { in: [...keys, sweep.INVOICE_DOCUMENTS_INTEGRITY_CURSOR_SETTING] } } })
+    for (const row of saved) await db.setting.create({ data: { key: row.key, value: row.value } })
+    await cleanup(db, order.id)
   }
 })

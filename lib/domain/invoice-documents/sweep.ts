@@ -12,7 +12,10 @@
  * three lookups in a row fail. Every call also passes the connector's own minute and daily budget.
  */
 
+import { createHash } from 'node:crypto'
+
 import { db } from '@/lib/db'
+import { loadInvoiceDocumentFile } from '@/lib/invoice-pdf'
 import { getSettingValue } from '@/lib/settings-store'
 import { ensureInvoiceDocument, type InvoiceDocumentDeps, type EnsureInvoiceDocumentOutcome } from './fetch-service'
 
@@ -20,6 +23,8 @@ export const INVOICE_DOCUMENTS_SWEEP_FLOOR_SETTING = 'invoice_documents_sweep_fl
 export const INVOICE_DOCUMENTS_CREDIT_NOTES_SETTING = 'invoice_documents_credit_notes_enabled'
 export const INVOICE_DOCUMENTS_LAZY_FETCH_SETTING = 'invoice_documents_lazy_fetch_enabled'
 export const DEFAULT_SWEEP_LIMIT = 20
+export const INVOICE_DOCUMENTS_INTEGRITY_CURSOR_SETTING = 'invoice_documents_integrity_cursor'
+const INTEGRITY_SCAN_BATCH = 100
 const MAX_CONSECUTIVE_FAILURES = 3
 
 export type InvoiceDocumentSweepResult = {
@@ -110,6 +115,40 @@ export async function selectInvoiceDocumentCandidates(floor: Date, now: Date, li
   return candidates
 }
 
+/**
+ * REPAIR: a current document whose immutable file is missing or no longer matches its hash (a lost disk, a restore without the files) is
+ * made due for a re-fetch, and the recheck path rewrites the file. A rolling scan, INTEGRITY_SCAN_BATCH current documents per run, in id
+ * order from a stored cursor and wrapping round, so every stored document is verified over time without reading them all each run. The
+ * customer read path marks a document due the moment it finds its file bad (current-document.ts); this finds the ones nobody has asked for.
+ * Returns how many were marked due.
+ */
+export async function markDocumentsWithBadFilesDue(now: Date, batch: number = INTEGRITY_SCAN_BATCH): Promise<number> {
+  const cursor = (await getSettingValue(INVOICE_DOCUMENTS_INTEGRITY_CURSOR_SETTING)) ?? ''
+  let docs = await db.salesOrderInvoiceDocument.findMany({
+    where: { supersededAt: null, ...(cursor ? { id: { gt: cursor } } : {}) },
+    orderBy: { id: 'asc' },
+    take: batch,
+    select: { id: true, orderId: true, refundId: true, kind: true, sha256: true },
+  })
+  const wrapped = docs.length < batch
+  if (wrapped && cursor) {
+    docs = [...docs, ...(await db.salesOrderInvoiceDocument.findMany({ where: { supersededAt: null, id: { lte: cursor } }, orderBy: { id: 'asc' }, take: batch - docs.length, select: { id: true, orderId: true, refundId: true, kind: true, sha256: true } }))]
+  }
+  let marked = 0
+  for (const doc of docs) {
+    const bytes = await loadInvoiceDocumentFile(doc.orderId, doc.sha256)
+    if (bytes && createHash('sha256').update(bytes).digest('hex') === doc.sha256) continue
+    const updated = await db.invoiceDocumentFetchState.updateMany({
+      where: { orderId: doc.orderId, kind: doc.kind, refundId: doc.refundId, status: { not: 'NEEDS_ATTENTION' } },
+      data: { nextAttemptAt: new Date(now.getTime() - 1) },
+    })
+    if (updated.count > 0) marked++
+  }
+  const last = docs.length > 0 && !wrapped ? docs[docs.length - 1]!.id : ''
+  await db.setting.upsert({ where: { key: INVOICE_DOCUMENTS_INTEGRITY_CURSOR_SETTING }, create: { key: INVOICE_DOCUMENTS_INTEGRITY_CURSOR_SETTING, value: last }, update: { value: last } })
+  return marked
+}
+
 export async function runInvoiceDocumentSweep(
   deps: InvoiceDocumentDeps,
   options: { limit?: number } = {},
@@ -121,6 +160,8 @@ export async function runInvoiceDocumentSweep(
   const includeCreditNotes = (await getSettingValue(INVOICE_DOCUMENTS_CREDIT_NOTES_SETTING)) === 'true'
   const limit = Math.max(1, Math.min(options.limit ?? DEFAULT_SWEEP_LIMIT, 200))
 
+  // Verify stored files first, so a bad one is due for a re-fetch in this very run.
+  await markDocumentsWithBadFilesDue(deps.now()).catch(() => 0)
   const candidates = await selectInvoiceDocumentCandidates(floor, deps.now(), limit, includeCreditNotes)
   let consecutiveFailures = 0
   for (const candidate of candidates) {

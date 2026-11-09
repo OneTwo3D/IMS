@@ -49,3 +49,17 @@ test('the document fetch never touches the ledger link column or writes to a led
     assert.doesNotMatch(source, /\b(xeroPost|xeroPut|xeroUploadAttachment|wcPost|wcPut)\b/, `${file} must stay read-only toward every vendor`)
   }
 })
+
+test('nothing publishes an invoice through the mutable flat file: the fetch never writes it, and every reader resolves the current document', () => {
+  const service = readFileSync('lib/domain/invoice-documents/fetch-service.ts', 'utf8')
+  assert.doesNotMatch(service, /saveInvoicePdfFile/, 'the fetch writes only immutable, hash-named files')
+  const promotion = service.slice(service.indexOf('db.$transaction'), service.indexOf("if (recorded.kind === 'lost')"))
+  assert.match(promotion, /leaseHolder: token/, 'the promotion is fenced by the lease token')
+  assert.match(promotion, /invoicePdfPath: storedPath/, 'the compatibility pointer is written inside that same transaction')
+  assert.doesNotMatch(service, /\bdb\.salesOrder\.update\(/, 'and never by a separate write outside the transaction')
+  for (const reader of ['app/api/shopping/[connector]/invoice-pdf/route.ts', 'app/api/invoices/[id]/route.ts', 'app/api/invoice/[id]/route.ts', 'lib/order-email.ts']) {
+    const source = readFileSync(reader, 'utf8')
+    assert.match(source, /loadCurrentInvoicePdf/, `${reader} reads the current document`)
+    assert.doesNotMatch(source, /import \{[^}]*\bloadInvoicePdf\b[^}]*\} from '@\/lib\/invoice-pdf'/, `${reader} does not read the flat file directly`)
+  }
+})

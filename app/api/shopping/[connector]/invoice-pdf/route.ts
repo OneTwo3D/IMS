@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 
 import { logActivity } from '@/lib/activity-log'
 import { db } from '@/lib/db'
-import { loadInvoicePdf } from '@/lib/invoice-pdf'
+import { loadCurrentInvoicePdf } from '@/lib/domain/invoice-documents/current-document'
 import { checkRateLimit, type RateLimitResult } from '@/lib/rate-limit'
 import { getClientIp } from '@/lib/request-ip'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
@@ -42,7 +42,7 @@ type ShoppingInvoicePdfRouteDependencies = {
   getSecret: (connector: ShoppingConnectorId) => Promise<string | null>
   findOrder: (request: ShoppingInvoicePdfRequest) => Promise<ShoppingInvoicePdfOrder | null>
   consumeNonce: (request: ShoppingInvoicePdfRequest) => Promise<boolean>
-  loadInvoicePdf: typeof loadInvoicePdf
+  loadInvoicePdf: typeof loadCurrentInvoicePdf
   auditAttempt: (input: ShoppingInvoicePdfAuditInput) => Promise<void>
   checkRateLimit?: (key: string, max: number, windowMs: number) => Promise<RateLimitResult>
   /**
@@ -73,7 +73,7 @@ const defaultDependencies: ShoppingInvoicePdfRouteDependencies = {
   getSecret: getShoppingInvoicePdfSecret,
   findOrder: findShoppingInvoicePdfOrder,
   consumeNonce: consumeShoppingInvoicePdfNonce,
-  loadInvoicePdf,
+  loadInvoicePdf: loadCurrentInvoicePdf,
   auditAttempt: auditShoppingInvoicePdfAttempt,
   checkRateLimit,
   ensureInvoiceOnDemand: ensureShoppingInvoiceOnDemand,

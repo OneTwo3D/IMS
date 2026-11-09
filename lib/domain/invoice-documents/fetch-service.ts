@@ -10,8 +10,12 @@
  *    and the ledger's filter answers for whatever holds the number, so a document is stored only when (a) no other IMS order
  *    carries the same number and (b) the ledger's own record of it agrees with the order on independent keys (total and
  *    currency, plus reference / customer / date): see order-evidence.ts. Anything else needs a person and stores nothing.
+ *  - NOTHING IS PUBLISHED THROUGH A MUTABLE FILE. A version's bytes live in an immutable, hash-named file and only the DATABASE decides which
+ *    one is current: promotion (set the new row current, supersede the previous, point `invoicePdfPath` at it) is ONE transaction whose first
+ *    statement is the lease check, so an expired holder cannot publish and its bytes are never served. Readers resolve the current row
+ *    (current-document.ts) and stream that file.
  *  - ONE FETCH PER DOCUMENT AT A TIME. A lease on the document's fetch state is taken BEFORE the ledger is read and held through
- *    lookup, download, version promotion and the `invoicePdfPath` pointer, so two overlapping fetches run one after the other and
+ *    lookup, download and version promotion, so two overlapping fetches run one after the other and
  *    the later one reads the ledger as it then is: an older PDF cannot be promoted over a newer one.
  *  - IDEMPOTENT. A version is keyed by (connector, ledger document id, sha256); fetching an unchanged
  *    document again creates nothing. A changed or re-issued document becomes a NEW row and the previous
@@ -29,7 +33,7 @@ import { createHash, randomUUID } from 'node:crypto'
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { invoiceDocumentStoredPath, saveInvoiceDocumentFile, saveInvoicePdfFile } from '@/lib/invoice-pdf'
+import { invoiceDocumentStoredPath, saveInvoiceDocumentFile } from '@/lib/invoice-pdf'
 import { selectDocumentClaim, type DocumentClaim } from './claim-selection'
 import { assessDocumentEvidence, type EvidenceSubject } from './order-evidence'
 import { nextAttemptDelayMs, recheckDelayMs, shouldEscalateMissing } from './backoff'
@@ -367,20 +371,16 @@ async function ensureUnderLease(
       documentId = row.id
       created = true
     }
+    if (input.kind === 'INVOICE') {
+      // Compatibility pointer for readers that only ask whether an invoice PDF exists: set in the SAME fenced transaction as the
+      // promotion, never by a separate write. It names the immutable file of the current version.
+      await tx.salesOrder.update({ where: { id: input.orderId }, data: { invoicePdfPath: storedPath } })
+    }
     return { kind: 'stored' as const, documentId, created }
   })
 
   if (recorded.kind === 'lost') throw new LeaseLost()
   if (recorded.kind === 'conflict') return needsAttention(recorded.reason)
-
-  if (input.kind === 'INVOICE') {
-    // The pointer the existing customer and staff download routes and the invoice e-mail read. It is the
-    // order's CURRENT invoice, overwritten in place; the versioned record above is the permanent one. The lease was
-    // renewed by the promotion a moment ago; renew and check once more so a takeover in between writes nothing.
-    if (!(await renewLease(subjectKey, token, deps.now()))) throw new LeaseLost()
-    const flatPath = await saveInvoicePdfFile(input.orderId, download.buffer)
-    await db.salesOrder.update({ where: { id: input.orderId }, data: { invoicePdfPath: flatPath } })
-  }
 
   await recordState(input, subjectKey, token, {
     status: 'DONE',

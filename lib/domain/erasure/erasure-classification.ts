@@ -112,7 +112,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
       storedPath: 'the issued invoice / credit note PDF is a statutory record, kept six years',
     },
   },
-  InvoiceDocumentFetchState: { erased: [], notPersonal: ['subjectKey', 'lastError'], retained: {} },
+  InvoiceDocumentFetchState: { erased: [], notPersonal: ['subjectKey', 'lastError', 'leaseHolder'], retained: {} },
   ReturnExpectation: { erased: [], notPersonal: ['reference', 'transitJournalKey'], retained: {} },
   ReturnExpectationLine: { erased: [], notPersonal: ['sku', 'costSnapshot'], retained: {} },
   SalesOrderLine: {

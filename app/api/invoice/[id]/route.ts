@@ -4,7 +4,7 @@ import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { db } from '@/lib/db'
 import { formatCountryDisplay } from '@/lib/countries'
-import { loadInvoicePdf } from '@/lib/invoice-pdf'
+import { loadCurrentInvoicePdf } from '@/lib/domain/invoice-documents/current-document'
 import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, groupVatBreakdown, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
 import { formatMoney } from '@/lib/utils'
 import { getBaseCurrencyDisplay } from '@/lib/base-currency'
@@ -38,7 +38,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   // Authenticated singular route; public signed downloads live in sibling /api/invoices/[id].
   // Serve connector-downloaded PDF if available.
   if (so.invoicePdfPath) {
-    const pdfBuffer = await loadInvoicePdf(so.id)
+    const pdfBuffer = await loadCurrentInvoicePdf(so.id)
     if (pdfBuffer) {
       const invNum = so.invoiceNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
       return new NextResponse(new Uint8Array(pdfBuffer), {

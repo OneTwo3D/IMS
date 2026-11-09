@@ -9,8 +9,8 @@ import { logActivity } from '@/lib/activity-log'
 import { auth } from '@/lib/auth'
 import { checkRateLimit, type RateLimitResult } from '@/lib/rate-limit'
 import { getClientIp } from '@/lib/request-ip'
+import { loadCurrentInvoicePdf } from '@/lib/domain/invoice-documents/current-document'
 import {
-  loadInvoicePdf,
   verifyPdfTokenDetailed,
   type InvoicePdfTokenBinding,
   type PdfTokenVerificationResult,
@@ -29,7 +29,7 @@ type InvoicePdfTokenAuditInput = {
 }
 
 type InvoicePdfRouteDependencies = {
-  loadInvoicePdf: typeof loadInvoicePdf
+  loadInvoicePdf: typeof loadCurrentInvoicePdf
   verifyPdfToken: typeof verifyPdfTokenDetailed
   auditTokenAttempt: (input: InvoicePdfTokenAuditInput) => Promise<void>
   getTokenBinding?: (request: NextRequest, clientIp: string) => Promise<InvoicePdfTokenBinding | null>
@@ -41,7 +41,7 @@ const NO_STORE_HEADERS = {
 } as const
 
 const defaultDependencies: InvoicePdfRouteDependencies = {
-  loadInvoicePdf,
+  loadInvoicePdf: loadCurrentInvoicePdf,
   verifyPdfToken: verifyPdfTokenDetailed,
   auditTokenAttempt: auditInvoicePdfTokenAttempt,
   getTokenBinding: getInvoicePdfTokenBinding,
