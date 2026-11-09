@@ -6,6 +6,9 @@ import { revalidatePath } from 'next/cache'
 import { Prisma, type WmsAsnStatus, type WmsStockMasterSystem, type WmsStockSyncMode } from '@/app/generated/prisma/client'
 import { z } from 'zod'
 import { applyReturnInboundStockTx, type RefundReturnRow } from '@/lib/domain/sales/refund-service'
+import { readReceiptAccounting, receiveReturnAgainstExpectationsTx } from '@/lib/domain/sales/return-expectation-receipt'
+import { ReturnExpectationError } from '@/lib/domain/sales/return-expectation'
+import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
@@ -5329,6 +5332,9 @@ export async function restockMintsoftReturnInboxItem(
   let successMessage = 'Mintsoft return restocked.'
   let activityMetadata: MintsoftReturnRestockActivityMetadata | null = null
 
+  // Pool read before the transaction: the ledger an arrival that clears a refund's Stock in Transit would post to.
+  const receiptAccounting = await readReceiptAccounting()
+
   try {
     await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM wms_returns_inbox WHERE id = ${data.id} FOR UPDATE`
@@ -5347,6 +5353,7 @@ export async function restockMintsoftReturnInboxItem(
             productId: true,
             sku: true,
             qty: true,
+            receivedAt: true,
             order: {
               select: {
                 id: true,
@@ -5384,10 +5391,29 @@ export async function restockMintsoftReturnInboxItem(
         throw new Error('This Mintsoft return does not have a positive quantity to restock.')
       }
 
-      const rows: RefundReturnRow[] = [{
+      let rows: RefundReturnRow[] = [{
         productId: item.productId,
         qty,
       }]
+      // A parcel for an order whose refund sent its goods in transit CLEARS that refund's return expectation: the
+      // units come back at the refund's own dispatch cost and Stock in Transit is released to Inventory. Whatever
+      // no expectation covers (an over-return, a legacy refund that already restocked, no refund at all) is booked
+      // exactly as before. Order lock first, then the expectation lines: the refund transaction takes them in the
+      // same order, so the two serialise.
+      if (item.orderId) {
+        await lockSalesOrder(tx, item.orderId)
+        const now = new Date()
+        const arrivedAt = item.receivedAt && item.receivedAt.getTime() < now.getTime() ? item.receivedAt : now
+        const receipt = await receiveReturnAgainstExpectationsTx(tx, {
+          inboxId: item.id,
+          orderId: item.orderId,
+          productId: item.productId,
+          qty,
+          arrivedAt,
+          accounting: receiptAccounting,
+        })
+        if (receipt.expectationIds.length > 0) rows = receipt.rows
+      }
 
       const returnedRows = await applyReturnInboundStockTx(tx, {
         referenceType: 'WmsReturnsInbox',
@@ -5420,6 +5446,12 @@ export async function restockMintsoftReturnInboxItem(
       }
     })
   } catch (error) {
+    if (error instanceof ReturnExpectationError && error.code === 'awaiting_refund_valuation') {
+      return {
+        success: false,
+        error: 'This return is held: the refund it belongs to has not been valued yet (its accounting is still being staged). Nothing was restocked. Try again once the refund has been valued; nothing retries this automatically.',
+      }
+    }
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Failed to restock Mintsoft return.',

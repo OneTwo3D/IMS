@@ -2517,8 +2517,8 @@ export async function createRefund(
     // (scheduleRefundReservationReleaseOutbox), and the refund-reservation-release cron
     // re-runs allocation idempotently if this immediate attempt was bypassed or lost.
     // The allocator nets refunded qty (kit/BOM aware) and re-reserves only remaining
-    // demand; refuseIfShipmentsExist makes it a no-op once any shipment exists (the
-    // shipment build caps shippable qty net of refunds). Limited to PROCESSING/ALLOCATED
+    // demand; refuseIfShipmentsExist stops the rebuild once any shipment exists (the
+    // shipment build caps shippable qty net of refunds) and trimUnshippedWhenShipmentsExist gives the refunded units' unshipped reservation back instead. Limited to PROCESSING/ALLOCATED
     // so a refund can't promote a DRAFT/PENDING_PAYMENT order to ALLOCATED.
     await releaseReservationsAfterRefund(
       { orderId, refundId: refundResult.createdRefund?.id, eligible: refundResult.releaseEligible === true },
@@ -2532,6 +2532,9 @@ export async function createRefund(
           return autoAllocateOrder(id, {
             internalBypassToken: INTERNAL_ACTION_BYPASS,
             refuseIfShipmentsExist: true,
+            // Once a shipment exists the order is not rebuilt; the refunded units' UNSHIPPED reservation is given back
+            // instead (shipped rows, shipments and their cost records untouched).
+            trimUnshippedWhenShipmentsExist: true,
             // o3d-67y (Codex r11): resolve the durable backstop ATOMICALLY with the reservation mutations. The
             // committed allocation and the outbox SUCCEEDED write share one transaction, so a crash cannot leave
             // the row pending for a redundant, non-idempotent re-allocation. Runs on the committed path only; a

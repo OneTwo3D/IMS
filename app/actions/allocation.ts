@@ -396,6 +396,9 @@ export async function autoAllocateOrder(
     // order whose only shipments are PENDING drafts can still be rebuilt (the reconciler retires
     // exactly the drafts the rewrite unbacks). See AllocateSalesOrderInput.refuseIfCommittedShipmentsExist.
     refuseIfCommittedShipmentsExist?: boolean
+    // With refuseIfShipmentsExist: give back the unshipped reservation of refunded units instead of declining once a
+    // shipment exists. See AllocateSalesOrderInput.trimUnshippedWhenShipmentsExist.
+    trimUnshippedWhenShipmentsExist?: boolean
     // o3d-67y (Codex r11): resolve a durable backstop INSIDE the allocation tx (committed path only) so a
     // redundant re-allocation can't run in the commit→resolve window. See AllocateSalesOrderInput.onReconciledInTx.
     onReconciledInTx?: (tx: Prisma.TransactionClient) => Promise<void>
@@ -447,6 +450,7 @@ export async function autoAllocateOrder(
       orderId,
       refuseIfShipmentsExist: options?.refuseIfShipmentsExist,
       refuseIfCommittedShipmentsExist: options?.refuseIfCommittedShipmentsExist,
+      trimUnshippedWhenShipmentsExist: options?.trimUnshippedWhenShipmentsExist,
       onReconciledInTx: options?.onReconciledInTx,
       requireStatusUnderLock: options?.requireStatusUnderLock,
       userId: actingUserId,

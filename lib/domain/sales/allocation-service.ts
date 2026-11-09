@@ -16,6 +16,7 @@ import {
   scaleFulfillmentRequirements,
   type DecimalFulfillmentRequirement,
 } from '@/lib/products/fulfillment-coverage'
+import { planUnshippedTrim } from '@/lib/domain/sales/refund-unshipped-trim-plan'
 import {
   loadFulfillmentProductGraph,
   type FulfillmentGraphNode,
@@ -150,6 +151,12 @@ export type AllocateSalesOrderInput = {
    * is the original hazard.
    */
   refuseIfCommittedShipmentsExist?: boolean
+  /**
+   * With `refuseIfShipmentsExist`: instead of declining once a shipment exists, give back the UNSHIPPED reservation of
+   * the units a refund took off the order (see `trimUnshippedAllocationsForRefundTx`). Shipped quantity, shipments and
+   * the rows they retain are left alone. Has no effect on an order with no shipment, which is rebuilt as usual.
+   */
+  trimUnshippedWhenShipmentsExist?: boolean
   /**
    * o3d-67y (Codex review r11): run INSIDE the allocation transaction, after reservations are mutated and
    * immediately before it commits, ONLY on the committed (non-refused) path. Lets the caller atomically mark a
@@ -2250,6 +2257,87 @@ export async function updateSalesOrderStatusUnderLock(
   return { previousStatus: lockedOrder.status }
 }
 
+/**
+ * Give back the UNSHIPPED reservation of the units a refund removed from an order that already has a shipment.
+ *
+ * Runs inside the allocation transaction, under the order lock and after the status re-read. The arithmetic is
+ * `planUnshippedTrim` (read its note first): rows shrink toward `lineQty - refunded`, never below what committed
+ * shipments cover, and the stock level's reserved quantity falls by exactly the trimmed amount through the same guarded
+ * release every other path uses (a reserved quantity too low to release refuses and rolls the whole thing back, so the
+ * outbox retries and dead-letters visibly rather than robbing another order). Pending drafts the shrunken rows no longer
+ * back are retired by the shared rule. Shipments, shipped rows' cost snapshots and the order's posted allocation amount
+ * are not touched.
+ */
+export async function trimUnshippedAllocationsForRefundTx(
+  tx: Prisma.TransactionClient,
+  params: { orderId: string; noDemand: boolean; userId: string | null },
+): Promise<{ trimmed: number; syncProductIds: string[]; retiredPendingShipments: RetiredPendingShipment[] }> {
+  const rows = await tx.orderAllocation.findMany({
+    where: { orderId: params.orderId },
+    select: { id: true, lineId: true, productId: true, warehouseId: true, qty: true },
+  })
+  if (rows.length === 0) return { trimmed: 0, syncProductIds: [], retiredPendingShipments: [] }
+
+  const lines = await tx.salesOrderLine.findMany({
+    where: { orderId: params.orderId },
+    select: { id: true, productId: true, qty: true, fulfillmentRequirements: true },
+  })
+  const graph = await loadFulfillmentProductGraph(tx, lines.map((line) => line.productId).filter((id): id is string => !!id))
+  const trimLines = lines.filter((line) => line.productId).map((line) => ({
+    id: line.id,
+    qty: line.qty,
+    requirements: lineFulfillmentRequirements(
+      { id: line.id, productId: line.productId, fulfillmentRequirements: line.fulfillmentRequirements },
+      graph,
+    ),
+  }))
+  const refundLines = await tx.salesOrderRefundLine.findMany({
+    where: { refund: { orderId: params.orderId } },
+    select: { salesOrderLineId: true, qty: true },
+  })
+  const refundedByLine = new Map<string, Prisma.Decimal>()
+  for (const refundLine of refundLines) {
+    if (!refundLine.salesOrderLineId) continue
+    refundedByLine.set(refundLine.salesOrderLineId, (refundedByLine.get(refundLine.salesOrderLineId) ?? new Prisma.Decimal(0)).add(toDecimal(refundLine.qty)))
+  }
+  const committed = await tx.shipmentLine.findMany({
+    where: { shipment: { orderId: params.orderId, status: { not: UNCOMMITTED_SHIPMENT_STATUS } } },
+    select: { lineId: true, productId: true, qty: true, shipment: { select: { warehouseId: true } } },
+  })
+
+  const steps = planUnshippedTrim({
+    lines: trimLines,
+    rows,
+    committed: committed.map((line) => ({ lineId: line.lineId, productId: line.productId, warehouseId: line.shipment.warehouseId, qty: line.qty })),
+    refundedByLine,
+    noDemand: params.noDemand,
+  })
+  if (steps.length === 0) return { trimmed: 0, syncProductIds: [], retiredPendingShipments: [] }
+
+  await lockStockLevels(tx, [...new Set(steps.map((step) => step.productId))], [...new Set(steps.map((step) => step.warehouseId))])
+  for (const step of steps) {
+    const row = rows.find((candidate) => candidate.lineId === step.lineId && candidate.productId === step.productId && candidate.warehouseId === step.warehouseId)
+    if (!row) continue
+    const remaining = toDecimal(row.qty).sub(step.qty)
+    const stillCommitted = committed.some((line) => line.lineId === row.lineId && line.productId === row.productId && line.shipment.warehouseId === row.warehouseId)
+    if (remaining.lte(ALLOCATION_EPSILON_DECIMAL) && !stillCommitted) {
+      await tx.orderAllocation.delete({ where: { id: row.id } })
+    } else {
+      await tx.orderAllocation.update({ where: { id: row.id }, data: { qty: remaining.toFixed(4) } })
+    }
+    await applyAllocationReservationDelta(tx, [{ productId: step.productId, warehouseId: step.warehouseId, qty: step.qty }], 'release')
+  }
+  const reconciliation = await reconcilePendingShipments(tx, params.orderId, {
+    cause: 'a refund releasing the unshipped reservation of its units',
+    userId: params.userId,
+  })
+  return {
+    trimmed: steps.length,
+    syncProductIds: [...new Set(steps.map((step) => step.productId))],
+    retiredPendingShipments: reconciliation.retired,
+  }
+}
+
 export async function applyAllocationReservationDelta(
   tx: Prisma.TransactionClient,
   rows: Array<{ productId: string; warehouseId: string; qty: DecimalInput }>,
@@ -3265,6 +3353,25 @@ export async function allocateSalesOrder(
         select: { id: true },
       })
       if (shipmentExists) {
+        if (input.refuseIfShipmentsExist && input.trimUnshippedWhenShipmentsExist) {
+          const trim = await trimUnshippedAllocationsForRefundTx(tx, {
+            orderId,
+            noDemand: lockedStatus === 'CANCELLED' || locked?.refundStatus === 'FULL',
+            userId: input.userId ?? null,
+          })
+          await input.onReconciledInTx?.(tx)
+          return {
+            nextAllocations: [],
+            syncProductIds: trim.syncProductIds,
+            refused: false as const,
+            skippedStatus: null,
+            trimmedUnshipped: true as const,
+            unallocatedLines: [] as AllocationUnallocatedLine[],
+            unallocatedQty: 0,
+            backorderLineCount: 0,
+            retiredPendingShipments: trim.retiredPendingShipments,
+          }
+        }
         return { nextAllocations: [], syncProductIds: [], refused: true as const, skippedStatus: null }
       }
     }

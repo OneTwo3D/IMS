@@ -1,11 +1,55 @@
-# Refund in transit (slice 1 of 3)
+# Refund in transit (slices 1 and 2 of 3)
 
 A refund of goods that were shipped does not mean the goods are back. Today IMS restocks them the moment the refund
 is recorded, and a second restock follows when the Mintsoft returns inbox sees the parcel arrive. This work holds the
 returned units **in transit** until they arrive.
 
-This page describes slice 1 (the document, the refund routing, the transit journal and the transit sub-ledger). It
-ships **switched off**, and slices 2 and 3 are not built. Read "What is not built yet" before switching it on.
+This page describes slice 1 (the document, the refund routing, the transit journal and the transit sub-ledger) and the
+arrival half of slice 2 (the returns inbox clears the document). It ships **switched off**: no migration turns it on.
+**Enabling `refund_returns_in_transit_enabled` is a cut-over step** for whoever runs the cut-over. Arrival clearing makes
+enabling it safe, but the write-off, the aging alert and slice 3 are not built: read "What is not built yet" first.
+
+## Arrival (slice 2, first half)
+
+Restocking a Mintsoft returns inbox item (`restockMintsoftReturnInboxItem`) for an order that has open, **valued**
+return expectations clears them, in the inbox transaction, under the order lock:
+
+* Matched by order and product against **all** open documents, oldest refund first, line by line. A part-arrival clears
+  part of a line; the units beyond every open document (an over-return, a refund made before the switch, no refund) are
+  booked as the plain restock they always were. If the oldest open document that would take a unit is **not valued yet**
+  (its refund's accounting staging is still running or retrying), the whole arrival is **held**: nothing is restocked,
+  not even as a plain restock, and the operator sees "held, refund not valued yet". Nothing retries it by itself: the
+  operator restocks the inbox item again once the refund is valued. An older unvalued refund is never skipped for a newer
+  valued one.
+* The ledger leg is decided under the order lock **before anything is written**, and an arrival clears transit only against
+  a refund transit debit that is proven queued, in that debit's own ledger:
+  * the refund's COGS reversal row (found by its recorded key) is not there yet, or the refund still owes its accounting:
+    the arrival is **held** (`awaiting_refund_journal`);
+  * the row exists but accounting is off or another connector is active than the one the debit sits in: **held**
+    (`awaiting_accounting`), so stock is never booked without the journal that moves its value out of transit;
+  * the row's ledger standing proves the debit never reached the ledger (a producer-hold shadow, or an orphan proven not
+    posted): it will not be, so the units are restocked with **no clearing journal and no sub-ledger row** (the same as the refund side,
+    which writes none for a shadow) and a WARNING is logged;
+  * a row whose standing is unproven (failed with no proof, an operator's not-posted): **held** (`awaiting_refund_journal`),
+    a person decides;
+  * a held arrival writes nothing and is retried by the operator restocking the inbox item again.
+* Stock: one `RETURN_INBOUND` movement per cleared line, with cost layers at the refund's own dispatch-cost snapshot (a
+  line's snapshot is consumed in order, so the first units' cost goes to the first arrival). This also fixes the old
+  inbox restock creating stock with no layer when it clears a document.
+* The line's `qty_received` rises and the document's status is re-derived (closing it when nothing is outstanding).
+* Ledger, only when the refund really debited Stock in Transit (the document recorded a journal key): a `STOCK_RECEIPT`
+  journal DR Inventory / CR Stock in Transit at the cleared value, dated the arrival's business date (the inbox row's
+  received date, never later than now), and a negative `CUSTOMER_RETURN_IN_TRANSIT` sub-ledger row under the same key
+  in the same transaction, on the queue's own answer and never for a shadowed journal. A refused journal or an unmapped
+  account rolls the whole arrival back (the inbox row stays unrestocked); with accounting off the arrival still books
+  its stock and records a WARNING.
+* The value released is cumulative: an arrival journals round(value received after it) minus round(value received
+  before it) at 2dp, so no cent is lost between arrivals (3 x 0.333333 clears 1.00) and an arrival too small to move a
+  cent records its quantity and carries the value forward. What was actually journalled is stored on the document
+  (`transit_cleared_amount`, advanced only when a clearing journal was queued and not shadowed) and each clearing is the target
+  for everything received so far minus that figure, so a missed clearing is made up by the next one. The arrival that
+  closes the document clears exactly what the refund posted (its 2dp journal total). The sub-ledger row equals the journal, except that the closing arrival also takes
+  the sub-penny residue of the refund's 6dp row, so the document's rows net to exactly zero.
 
 ## The switch
 
@@ -72,15 +116,16 @@ the components still returnable. Not fixed in slice 1; it only matters once the 
 
 ## What is not built yet
 
-**Do not switch it on until slice 2 exists.** With the switch on and only slice 1 deployed:
+With the switch on:
 
-* The refund no longer restocks, but the Mintsoft returns inbox **still** restocks on arrival (and, as today, creates no
-  cost layer for it). The document never closes and the value stays in Stock in Transit.
-* Nothing clears or writes off a document.
+* A parcel clears its document through the returns inbox (above). A return the inbox never sees stays in Stock in
+  Transit: **nothing writes off a document yet**, so watch the "Returns in transit" figure by hand until it exists.
+* Nothing alerts on a document that ages.
 
 | Slice | Content |
 |---|---|
-| 2 | Returns inbox receives against the document (matched by order and product, oldest refund first, partial and over-return handling), the arrival journal and sub-ledger row, early returns auto-clearing when unambiguous, the operator write-off and the 30-day alert, the "Returns in transit" panel, and the receipts table |
+| 2 (built: arrival) | Returns inbox receives against the document (matched by order and product, oldest refund first, partial and over-return handling), the arrival journal and sub-ledger row |
+| 2 (not built) | Early returns auto-clearing when unambiguous (a return before its refund), the operator write-off and the 30-day alert, the "Returns in transit" panel, and the receipts table |
 | 3 | A forced storefront stock push for the refunded products on the refund webhook, behind `wc_stock_sync_enabled` |
 | later | Treating refunded units of a partly shipped line as the **unshipped** ones first (owner-accepted, not built: it changes the shipped/unshipped split that stock, the per-line cap and COGS share, so it needs its own change); the WooCommerce-side restock filter |
 
@@ -90,7 +135,7 @@ Slice 1 adds **no new outbound writer**. The only journal involved is the existi
 changes for an in-transit refund; it goes through the same enqueue, the same producer seam (legacy, live, shadow;
 `PRODUCER_HOLD_ENFORCED_DESTINATIONS` unset is byte-identical to legacy) and the same ownership-map row
 (`xero.inventory.journals`) as before. `npm run writers:check` and `npm run check:shadow-readers` need no new row.
-Slice 2 adds two journals of existing types (`STOCK_RECEIPT`, `INVENTORY_ADJUSTMENT`) and must register them.
+Arrival adds one producer of an existing type (`STOCK_RECEIPT`, in `return-expectation-receipt.ts`), declared in the producer census under `xero.inventory.journals`. The write-off will add `INVENTORY_ADJUSTMENT`.
 
 ## Readers of the COGS reversal that were audited
 

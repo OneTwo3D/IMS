@@ -258,9 +258,19 @@ Normally the returned units are restocked the moment the refund is recorded. Whe
 `refund_returns_in_transit_enabled` is `true`, a refund that returns stock instead creates a **return expectation**:
 the units are not stock yet, so they cannot be allocated, sold or pushed to the storefront, and the refund's COGS
 reversal debits **Stock in Transit** instead of Inventory (DR Stock in Transit / CR COGS). The decision is stored on the
-refund when it is created, so a retry later does the same thing. The arrival side (clearing the expectation from the
-Mintsoft returns inbox, and writing off units that never come back) is not built yet, so leave the setting off. See
-`docs/refund-in-transit.md`.
+refund when it is created, so a retry later does the same thing. When the parcel arrives, restocking its Mintsoft returns
+inbox item clears the expectation: the units come back into stock at the refund's own cost, oldest refund first, and Stock
+in Transit is released to Inventory (DR Inventory / CR Stock in Transit). Anything the expectations do not cover is
+restocked as a plain return, as before. Writing off units that never come back is not built yet, so the setting is
+switched on only as a cut-over step. See `docs/refund-in-transit.md`.
+
+### Refunds on a partly shipped order
+
+A refund of units that have not shipped gives their reserved stock back even when other units of the order have already
+shipped. Refunded units come out of the **unshipped** part first: the reservation falls by the refunded quantity, never
+below what has shipped or what a picked or packed shipment still covers, and shipments, shipped quantity and their cost
+records are left alone. Running it again changes nothing. Previously such a release was refused and left the reserved
+stock held until someone reconciled it by hand.
 
 ### Refund-time cost revaluation
 
