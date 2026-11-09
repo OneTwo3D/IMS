@@ -87,7 +87,7 @@ export async function publishInvoiceDocumentFlagToWc(
   // THE SWITCH, READ AGAIN IMMEDIATELY BEFORE THE SEND: an operator who turns publishing off while an attempt is under way stops its PUT.
   await hooks.beforeLastSwitchRead?.()
   if (!(await isInvoiceDocumentPublishingEnabled())) return { kind: 'disabled' }
-  const result = await wcPut(`orders/${externalOrderId}`, { meta_data: [{ key: WC_INVOICE_DOCUMENT_META_KEY, value: 'yes' }] })
+  const result = await wcPut(`/orders/${externalOrderId}`, { meta_data: [{ key: WC_INVOICE_DOCUMENT_META_KEY, value: 'yes' }] })
   if (result.held) return { kind: 'failed', held: true, error: `The invoice flag was not written to the WooCommerce order: ${result.error}` }
   if (result.error) return { kind: 'failed', held: false, error: `The invoice flag was not accepted by the WooCommerce order: ${result.error}` }
 

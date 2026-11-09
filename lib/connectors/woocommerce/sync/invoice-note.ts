@@ -81,7 +81,7 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: b
   }
   if (!noteAlreadyWritten && reconciledNoteId === null) {
     try {
-      const noteResult = await wcPost(`orders/${wcLink.externalOrderId}/notes`, {
+      const noteResult = await wcPost(`/orders/${wcLink.externalOrderId}/notes`, {
         note: `Accounting invoice: <a href="${accountingInvoiceUrl}">View Invoice</a>`,
         customer_note: false,
       })
@@ -100,7 +100,7 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: b
 
   // Link meta on the WC order for the order screen. Absolute, so a repeat is harmless.
   try {
-    const metaResult = await wcPut(`orders/${wcLink.externalOrderId}`, { meta_data: [{ key: '_accounting_invoice_url', value: accountingInvoiceUrl }] })
+    const metaResult = await wcPut(`/orders/${wcLink.externalOrderId}`, { meta_data: [{ key: '_accounting_invoice_url', value: accountingInvoiceUrl }] })
     if (metaResult.held && !failure) failure = `Failed to store invoice metadata on WooCommerce order: ${metaResult.error}`
   } catch (e) {
     await logActivity({
@@ -131,7 +131,7 @@ async function readAllOrderNotes(externalOrderId: string): Promise<{ ok: true; n
   let totalPages = 1
   for (let page = 1; page <= totalPages; page++) {
     if (page > NOTES_MAX_PAGES) return { ok: false, error: `more than ${NOTES_MAX_PAGES} pages of notes` }
-    const result = await wcFetch(`orders/${externalOrderId}/notes`, { per_page: String(NOTES_PER_PAGE), page: String(page) })
+    const result = await wcFetch(`/orders/${externalOrderId}/notes`, { per_page: String(NOTES_PER_PAGE), page: String(page) })
     if (result.error || !Array.isArray(result.data)) return { ok: false, error: result.error ?? 'unexpected answer' }
     if (typeof result.totalPages !== 'number' || result.totalPages < 0) return { ok: false, error: 'the store did not say how many pages of notes there are' }
     totalPages = Math.max(result.totalPages, 1)
