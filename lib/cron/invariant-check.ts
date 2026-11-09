@@ -100,8 +100,10 @@ function parseWarningBaseline(raw: string | null | undefined): WarningBaseline |
 }
 
 export type WarningBaselineOutcome = {
-  /** False when a NEWER run's baseline was already stored: this run stood down and wrote nothing. */
+  /** False when a NEWER run's baseline was already stored (this run stood down) or the alert had nobody to go to. Nothing was written. */
   applied: boolean
+  /** True when an alert was due but no active admin exists: the baseline was RETAINED so the alert is still due, and the caller logs it. */
+  undeliverable?: boolean
   increases: Array<{ code: string; previous: number; current: number }>
 }
 
@@ -115,6 +117,19 @@ export type WarningBaselineTx = Pick<Prisma.TransactionClient, 'setting' | 'user
  * the START time of the run that wrote it, so an older run that finishes late stands down instead of overwriting a
  * newer baseline.
  */
+async function activeAdminIds(tx: WarningBaselineTx): Promise<string[]> {
+  return (await tx.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })).map((admin) => admin.id)
+}
+
+async function writeBaseline(tx: WarningBaselineTx, baseline: WarningBaseline): Promise<void> {
+  const value = JSON.stringify(baseline satisfies WarningBaseline)
+  await tx.setting.upsert({
+    where: { key: NOTIFIABLE_WARNING_COUNTS_SETTING },
+    create: { key: NOTIFIABLE_WARNING_COUNTS_SETTING, value },
+    update: { value },
+  })
+}
+
 export async function commitWarningBaselineInTx(
   tx: WarningBaselineTx,
   input: { counts: NotifiableWarningCounts; checkedAt: string; runId: string; truncated?: boolean },
@@ -128,49 +143,45 @@ export async function commitWarningBaselineInTx(
   // that the named warnings were not evaluated (the flag below dedups it), and the next complete run compares against the
   // counts kept here.
   if (input.truncated === true) {
-    const kept = baseline?.counts ?? {}
-    const keptValue = JSON.stringify({ counts: kept, checkedAt: input.checkedAt, truncated: true } satisfies WarningBaseline)
-    await tx.setting.upsert({
-      where: { key: NOTIFIABLE_WARNING_COUNTS_SETTING },
-      create: { key: NOTIFIABLE_WARNING_COUNTS_SETTING, value: keptValue },
-      update: { value: keptValue },
-    })
-    if (baseline?.truncated !== true) {
-      const admins = await tx.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
-      const recipients: Array<string | null> = admins.length > 0 ? admins.map((admin) => admin.id) : [null]
-      for (const userId of recipients) {
-        await tx.notification.create({
-          data: {
-            userId,
-            type: 'warning',
-            title: 'Invariant report was truncated',
-            message: `Scheduled invariant check ${input.runId} stopped at its row cap, so the named warnings were not evaluated this run. Fix or accept the existing findings, or raise INVARIANT_CHECK_MAX_FINDINGS.`,
-            actionUrl: null,
-          },
-        })
-      }
+    if (baseline?.truncated === true) {
+      // Already told: only the run time moves.
+      await writeBaseline(tx, { counts: baseline.counts, checkedAt: input.checkedAt, truncated: true })
+      return { applied: true, increases: [] }
+    }
+    const admins = await activeAdminIds(tx)
+    // Admin-scoped, never a broadcast: with nobody to tell, retain the baseline (so the notice is still due) and say so.
+    if (admins.length === 0) return { applied: false, undeliverable: true, increases: [] }
+    await writeBaseline(tx, { counts: baseline?.counts ?? {}, checkedAt: input.checkedAt, truncated: true })
+    for (const userId of admins) {
+      await tx.notification.create({
+        data: {
+          userId,
+          type: 'warning',
+          title: 'Invariant report was truncated',
+          message: `Scheduled invariant check ${input.runId} stopped at its row cap, so the named warnings were not evaluated this run. Fix or accept the existing findings, or raise INVARIANT_CHECK_MAX_FINDINGS.`,
+          actionUrl: null,
+        },
+      })
     }
     return { applied: true, increases: [] }
   }
   const increases = notifiableWarningIncreases(baseline?.counts ?? {}, input.counts)
-  const value = JSON.stringify({ counts: input.counts, checkedAt: input.checkedAt } satisfies WarningBaseline)
-  await tx.setting.upsert({
-    where: { key: NOTIFIABLE_WARNING_COUNTS_SETTING },
-    create: { key: NOTIFIABLE_WARNING_COUNTS_SETTING, value },
-    update: { value },
-  })
-  if (increases.length > 0) {
-    const admins = await tx.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
-    // With no active admin the alert is a broadcast rather than nothing: the baseline is about to move over it.
-    const recipients: Array<string | null> = admins.length > 0 ? admins.map((admin) => admin.id) : [null]
-    const message = `Scheduled invariant check ${input.runId}: ${increases
-      .map((entry) => `${entry.code} ${entry.previous} -> ${entry.current}`)
-      .join(', ')}.`
-    for (const userId of recipients) {
-      await tx.notification.create({
-        data: { userId, type: 'warning', title: 'Invariant warnings need attention', message, actionUrl: null },
-      })
-    }
+  if (increases.length === 0) {
+    await writeBaseline(tx, { counts: input.counts, checkedAt: input.checkedAt })
+    return { applied: true, increases }
+  }
+  const admins = await activeAdminIds(tx)
+  // Admin-scoped, never a broadcast (a null-user notification is visible to every user). With no active admin the baseline is
+  // RETAINED, so the rise is still news on the next run that has someone to tell, and the caller logs an ERROR.
+  if (admins.length === 0) return { applied: false, undeliverable: true, increases }
+  await writeBaseline(tx, { counts: input.counts, checkedAt: input.checkedAt })
+  const message = `Scheduled invariant check ${input.runId}: ${increases
+    .map((entry) => `${entry.code} ${entry.previous} -> ${entry.current}`)
+    .join(', ')}.`
+  for (const userId of admins) {
+    await tx.notification.create({
+      data: { userId, type: 'warning', title: 'Invariant warnings need attention', message, actionUrl: null },
+    })
   }
   return { applied: true, increases }
 }
@@ -513,12 +524,24 @@ export async function runScheduledInvariantCheck(
   // otherwise a failed domain would read as "cleared" and its next successful run as "newly appeared".
   if (errors.length === 0 && inventory && accounting && sales) {
     const allFindings = [...inventory.findings, ...accounting.findings, ...sales.findings]
-    await advanceWarningBaseline({
+    const outcome = await advanceWarningBaseline({
       counts: countNotifiableWarnings(allFindings),
       checkedAt,
       runId,
       truncated: reportsWereTruncated(allFindings),
     })
+    if (outcome.undeliverable) {
+      await writeActivityLog({
+        entityType: 'SYSTEM',
+        entityId: runId,
+        action: 'invariant_check_warning_alert_undeliverable',
+        tag: 'system',
+        level: 'ERROR',
+        description: `Scheduled invariant check ${runId}: named warning alert undeliverable, no active admin. The baseline was kept, so the alert is still due.`,
+        metadata: { runId, checkedAt, increases: outcome.increases, truncated: reportsWereTruncated(allFindings) },
+        resolveUser: false,
+      })
+    }
   }
 
   return result

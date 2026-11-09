@@ -61,14 +61,14 @@ function warningStore(initial: Record<string, number> = {}, initialCheckedAt = '
     settings.set('cron_invariant_check_notifiable_warning_counts', JSON.stringify({ counts: initial, checkedAt: initialCheckedAt }))
   }
   let notifications: FakeNotification[] = []
-  const control = { failNotification: false }
+  const control = { failNotification: false, admins: ['admin-1', 'admin-2'] as string[] }
   const tx = {
     $executeRaw: async () => 1,
     setting: {
       findUnique: async ({ where }: { where: { key: string } }) => (settings.has(where.key) ? { value: settings.get(where.key)! } : null),
       upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => { settings.set(where.key, create.value); return {} },
     },
-    user: { findMany: async () => [{ id: 'admin-1' }, { id: 'admin-2' }] },
+    user: { findMany: async () => control.admins.map((id) => ({ id })) },
     notification: {
       create: async ({ data }: { data: FakeNotification }) => {
         if (control.failNotification) throw new Error('insert failed')
@@ -378,6 +378,8 @@ function warningFindings(code: string, n: number) {
   }))
 }
 
+const activityRows: Array<Record<string, unknown>> = []
+const undeliverableRows = () => activityRows.filter((r) => r.action === 'invariant_check_warning_alert_undeliverable')
 let clockMs = Date.parse('2026-01-01T00:00:00.000Z')
 async function runWithWarnings(
   store: ReturnType<typeof warningStore>,
@@ -394,7 +396,7 @@ async function runWithWarnings(
     }),
     runAccountingReport: async () => emptyReport('2026-01-01T00:00:02.000Z'),
     runSalesReport: async () => cleanSalesReport(),
-    writeActivityLog: async () => {},
+    writeActivityLog: async (entry) => { activityRows.push(entry as unknown as Record<string, unknown>) },
     notifyAdmins: async () => { throw new Error('warnings must not go through notifyAdmins') },
     getPreviousCriticalFindingsHash: async () => null,
     setCriticalFindingsHash: async () => {},
@@ -454,24 +456,41 @@ test('an older run that finishes late stands down and cannot overwrite a newer b
   assert.equal(store.notifications().length, 2, 'the older run notifies nobody')
 })
 
-test('with no active admin the alert is a broadcast, not nothing', async () => {
-  const outcome = await (async () => {
-    const settings = new Map<string, string>()
-    const created: Array<{ userId: string | null }> = []
-    const tx = {
-      $executeRaw: async () => 1,
-      setting: {
-        findUnique: async () => null,
-        upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => { settings.set(where.key, create.value); return {} },
-      },
-      user: { findMany: async () => [] },
-      notification: { create: async ({ data }: { data: { userId: string | null } }) => { created.push(data); return {} } },
-    }
-    await commitWarningBaselineInTx(tx as never, { counts: { accounting_sync_failed: 1 }, checkedAt: '2026-01-01T00:00:00.000Z', runId: 'r' })
-    return created
-  })()
-  assert.equal(outcome.length, 1)
-  assert.equal(outcome[0]?.userId, null)
+test('with no active admin the alert is NOT broadcast: the baseline is retained and an ERROR activity row is written', async () => {
+  const store = warningStore({ accounting_sync_failed: 1 })
+  store.control.admins = []
+  activityRows.length = 0
+  await runWithWarnings(store, [], undefined)
+  // (a run that lowers a count has nothing to tell; it is quiet and moves the baseline)
+  assert.deepEqual(store.read(), {})
+  activityRows.length = 0
+
+  const code = 'stock_cost_layer_quantity_mismatch'
+  await runWithWarnings(store, warningFindings(code, 2))
+  assert.equal(store.notifications().length, 0, 'no broadcast (a userId-null notification is visible to every user)')
+  assert.deepEqual(store.read(), {}, 'baseline retained: the rise is still news')
+  assert.equal(undeliverableRows().length, 1)
+  assert.equal(undeliverableRows()[0]?.level, 'ERROR')
+  assert.match(String(undeliverableRows()[0]?.description), /no active admin/)
+
+  store.control.admins = ['admin-1']
+  await runWithWarnings(store, warningFindings(code, 2))
+  assert.equal(store.notifications().length, 1, 'once an admin exists the retained rise is delivered')
+  assert.deepEqual(store.read(), { [code]: 2 })
+})
+
+test('with no active admin a truncation notice is retained too (not broadcast, flag not set)', async () => {
+  const store = warningStore({ transfer_stranded_in_transit: 3 })
+  store.control.admins = []
+  activityRows.length = 0
+  const truncatedFinding = { severity: 'warning' as const, code: 'invariant_report_truncated', message: 'capped', details: {} }
+  await runWithWarnings(store, [truncatedFinding])
+  assert.equal(store.notifications().length, 0)
+  assert.equal(undeliverableRows().length, 1)
+  assert.equal(undeliverableRows()[0]?.level, 'ERROR')
+  store.control.admins = ['admin-1']
+  await runWithWarnings(store, [truncatedFinding])
+  assert.equal(store.notifications().length, 1, 'delivered once someone can receive it')
 })
 
 test('warnings outside the named set never notify, and a failed report leaves the baseline alone', async () => {

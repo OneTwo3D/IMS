@@ -11,6 +11,7 @@ import test, { mock } from 'node:test'
 
 let accountsBody: unknown = { Accounts: [] }
 let upserts: string[] = []
+let updateData: Array<Record<string, unknown>> = []
 let deactivations = 0
 let stamps: string[] = []
 
@@ -28,7 +29,7 @@ mock.module('@/lib/connectors/xero/connection-fence', {
       ok: true,
       value: await fn({
         accountingAccount: {
-          upsert: async ({ create }: { create: { externalAccountId: string } }) => { upserts.push(create.externalAccountId) },
+          upsert: async ({ create, update }: { create: { externalAccountId: string }; update: Record<string, unknown> }) => { upserts.push(create.externalAccountId); updateData.push(update) },
           updateMany: async () => { deactivations += 1 },
         },
         setting: { upsert: async ({ where }: { where: { key: string } }) => { stamps.push(where.key) } },
@@ -39,7 +40,7 @@ mock.module('@/lib/connectors/xero/connection-fence', {
 
 const chart = (ids: string[]) => ({ Accounts: ids.map((id) => ({ AccountID: id, Code: id, Name: `n-${id}`, Type: 'BANK', TaxType: 'NONE', Status: 'ACTIVE', Class: 'ASSET' })) })
 
-test.beforeEach(() => { upserts = []; deactivations = 0; stamps = [] })
+test.beforeEach(() => { upserts = []; updateData = []; deactivations = 0; stamps = [] })
 
 test('scheduled: an empty response is a failed run - nothing written, no stamp', async () => {
   const { syncChartOfAccounts } = await import('../../../lib/connectors/xero/accounts.ts')
@@ -111,4 +112,25 @@ test('the rebind clears the chart stamp together with the cached chart', async (
   const { DERIVED_ORG_KEYED_KEYS } = await import('../../../lib/connectors/xero/account-mapping-rebind.ts')
   const { XERO_CHART_OF_ACCOUNTS_LAST_SUCCESS_SETTING } = await import('../../../lib/ops/read-sync-liveness-constants.ts')
   assert.ok((DERIVED_ORG_KEYED_KEYS as readonly string[]).includes(XERO_CHART_OF_ACCOUNTS_LAST_SUCCESS_SETTING))
+})
+
+test('scheduled: an OMITTED Code or TaxType never overwrites the stored value; explicit values (even null) apply; on-demand writes through', async () => {
+  const { syncChartOfAccounts } = await import('../../../lib/connectors/xero/accounts.ts')
+  const full = chart(['a1']).Accounts[0]!
+  accountsBody = { Accounts: [{ ...full, Code: undefined, TaxType: undefined }] }
+  await syncChartOfAccounts({ recordScheduledSuccess: true })
+  assert.equal('code' in updateData[0]!, false, 'omitted Code: stored code preserved')
+  assert.equal('taxType' in updateData[0]!, false, 'omitted TaxType: stored value preserved')
+  assert.equal(updateData[0]!.name, 'n-a1')
+
+  updateData = []
+  accountsBody = { Accounts: [{ ...full, Code: '210', TaxType: null }] }
+  await syncChartOfAccounts({ recordScheduledSuccess: true })
+  assert.equal(updateData[0]!.code, '210', 'an explicit value applies')
+  assert.equal(updateData[0]!.taxType, null, 'an explicit null applies')
+
+  updateData = []
+  accountsBody = { Accounts: [{ ...full, Code: undefined, TaxType: undefined }] }
+  await syncChartOfAccounts()
+  assert.equal(updateData[0]!.code, null, 'the operator refresh keeps its old write-through')
 })

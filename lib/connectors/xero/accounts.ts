@@ -39,8 +39,9 @@ export async function fetchXeroChartOfAccounts(): Promise<{ ok: true; accounts: 
 export async function storeChartOfAccounts(
   tx: Pick<Prisma.TransactionClient, 'accountingAccount'>,
   accounts: XeroChartAccount[],
-  options: { deactivateMissing?: boolean } = {},
+  options: { deactivateMissing?: boolean; preserveOmittedFields?: boolean } = {},
 ): Promise<number> {
+  const preserve = options.preserveOmittedFields === true
   for (const acc of accounts) {
     await tx.accountingAccount.upsert({
       where: { connector_externalAccountId: { connector: XERO_CONNECTOR, externalAccountId: acc.AccountID } },
@@ -55,10 +56,12 @@ export async function storeChartOfAccounts(
         syncedAt: new Date(),
       },
       update: {
-        code: acc.Code ?? null,
+        // The scheduled refresh never blanks a stored value because the response OMITTED the key (a missing Code is not "no code");
+        // an explicit value, including an explicit null, still applies. The operator's manual refresh keeps the old write-through.
+        ...(preserve && acc.Code === undefined ? {} : { code: acc.Code ?? null }),
         name: acc.Name,
         type: acc.Type,
-        taxType: acc.TaxType ?? null,
+        ...(preserve && acc.TaxType === undefined ? {} : { taxType: acc.TaxType ?? null }),
         active: acc.Status === 'ACTIVE',
         syncedAt: new Date(),
       },
@@ -130,7 +133,7 @@ export async function syncChartOfAccounts(
   let fenced
   try {
     fenced = await withXeroConnectionFence(connection, async (tx) => {
-      const stored = await storeChartOfAccounts(tx, fetched.accounts, { deactivateMissing: !scheduled })
+      const stored = await storeChartOfAccounts(tx, fetched.accounts, { deactivateMissing: !scheduled, preserveOmittedFields: scheduled })
       // The read-sync last-success stamp is written in THIS transaction, with the chart, and only by the scheduled
       // refresh: an on-demand refresh from the Sync page does not advance it. An empty chart is not a success.
       if (scheduled && stored > 0) {
