@@ -7,6 +7,8 @@ import test, { mock } from 'node:test'
  */
 
 const CURSOR_KEY = 'wc_stock_daily_reconcile_cursor'
+const VERSION_KEY = 'wc_settings_version'
+const cursorValue = (afterId: string, version = '0') => JSON.stringify({ afterId, version })
 const STAMP_KEY = 'last_wc_stock_daily_reconcile_at'
 
 const settings = new Map<string, string>()
@@ -101,7 +103,7 @@ test('a request past its budget saves the cursor, does not stamp, and the next r
     Date.now = realNow
   }
   assert.equal(pushCalls.length, 1, 'one window only')
-  assert.equal(settings.get(CURSOR_KEY), 'p-150')
+  assert.equal(settings.get(CURSOR_KEY), cursorValue('p-150'))
   assert.ok(!upserts.includes(STAMP_KEY), 'an unfinished pass is not stamped')
 
   // The next run: a stamp from an hour ago says "not due", but the cursor says the pass is unfinished.
@@ -126,18 +128,53 @@ test('with no cursor and a fresh stamp the reconcile does not run', async () => 
 test('a window that did not finish keeps the cursor and the stamp where they were, and is retried', async () => {
   const { runWcReconcile } = await import('@/lib/connectors/woocommerce/sync/reconcile')
   reset([{ message: 'WooCommerce API unreachable during preflight' }])
-  settings.set(CURSOR_KEY, 'p-150')
+  settings.set(CURSOR_KEY, cursorValue('p-150'))
   const results = await runWcReconcile()
   assert.equal((results.stock as { reason?: string }).reason, 'reconciliation_window_incomplete')
-  assert.equal(settings.get(CURSOR_KEY), 'p-150')
+  assert.equal(settings.get(CURSOR_KEY), cursorValue('p-150'))
   assert.ok(!upserts.includes(STAMP_KEY))
 })
 
-test('a first window refused outright (setting, credentials) ends the pass and stamps exactly as before', async () => {
+test('a first window refused outright (setting, credentials) is NOT stamped: the pass stays due and the refusal is reported', async () => {
   const { runWcReconcile } = await import('@/lib/connectors/woocommerce/sync/reconcile')
   reset([{ aborted: true, message: 'WooCommerce credentials are not configured' }])
+  const results = await runWcReconcile()
+  assert.equal((results.stock as { reason?: string }).reason, 'reconciliation_refused')
+  assert.equal((results.stock as { reconciliationDue?: boolean }).reconciliationDue, true)
+  assert.ok(!upserts.includes(STAMP_KEY), 'restored configuration is not suppressed for 24 h')
+  assert.ok(!upserts.includes(CURSOR_KEY))
+  // The next run, with the configuration restored, runs the pass.
+  script = [done(null)]
   await runWcReconcile()
   assert.ok(upserts.includes(STAMP_KEY))
+})
+
+test('a cursor taken against another WooCommerce settings version is dropped: the pass restarts from the beginning, with no stamp', async () => {
+  const { runWcReconcile } = await import('@/lib/connectors/woocommerce/sync/reconcile')
+  reset([done('p-150')])
+  settings.set(VERSION_KEY, '7')
+  settings.set(CURSOR_KEY, cursorValue('p-300', '6')) // saved before a rebind or cache reset
+  settings.set(STAMP_KEY, new Date(Date.now() - 3600_000).toISOString()) // not due by the clock: only the cursor says unfinished
+  const realNow = Date.now
+  let calls = 0
+  Date.now = () => (calls++ === 0 ? 1_000_000 : 1_060_000)
+  try { await runWcReconcile() } finally { Date.now = realNow }
+  assert.equal(pushCalls[0].chunk?.afterId, null, 'starts again from the beginning')
+  assert.equal(settings.get(CURSOR_KEY), cursorValue('p-150', '7'), 'the new cursor carries the current version')
+  assert.equal(upserts.includes(STAMP_KEY), false, 'no stamp')
+})
+
+test('an unreadable (legacy) cursor is dropped the same way, and a cursor of the current version is kept', async () => {
+  const { runWcReconcile } = await import('@/lib/connectors/woocommerce/sync/reconcile')
+  reset([done(null)])
+  settings.set(CURSOR_KEY, 'p-150')
+  await runWcReconcile()
+  assert.equal(pushCalls[0].chunk?.afterId, null)
+  reset([done(null)])
+  settings.set(VERSION_KEY, '7')
+  settings.set(CURSOR_KEY, cursorValue('p-150', '7'))
+  await runWcReconcile()
+  assert.equal(pushCalls[0].chunk?.afterId, 'p-150')
 })
 
 test('a held or shadowed window stops the pass without stamping and leaves the cursor', async () => {
@@ -145,7 +182,7 @@ test('a held or shadowed window stops the pass without stamping and leaves the c
   reset([done('p-150'), { held: true, aborted: true }])
   const results = await runWcReconcile()
   assert.equal((results.stock as { reason?: string }).reason, 'outbound_write_held')
-  assert.equal(settings.get(CURSOR_KEY), 'p-150')
+  assert.equal(settings.get(CURSOR_KEY), cursorValue('p-150'))
   assert.ok(!upserts.includes(STAMP_KEY))
 })
 
@@ -164,7 +201,7 @@ test('a later window with failed products holds the pass at that window: cursor 
   reset([done('p-150'), { errors: ['batch push 1: boom'] }])
   const results = await runWcReconcile()
   assert.equal((results.stock as { resumeAfter?: string }).resumeAfter, 'p-150')
-  assert.equal(settings.get(CURSOR_KEY), 'p-150')
+  assert.equal(settings.get(CURSOR_KEY), cursorValue('p-150'))
   assert.ok(!upserts.includes(STAMP_KEY))
   assert.equal(activities.length, 1)
 })

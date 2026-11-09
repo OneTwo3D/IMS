@@ -175,7 +175,9 @@ Use this only to validate the backup path, not as the primary success criterion.
 
 Limits of the windowed stock catch-up:
 
-- A window counts as done only when every product in it was looked up, verified and pushed. If any SKU lookup, preflight page or push entry in it fails (or a stale mapping is cleared), the cursor stays, no daily stamp is written, the next run retries the same window, and each such run writes a `stock_reconcile_window` WARNING to the activity log with the first errors. A product that keeps failing therefore holds the pass at its window until it is fixed (or the manual stock push is used); the log line is the signal.
+- A window counts as done only when every product in it completed without any error. If any SKU lookup, preflight page or push entry fails, a mapping cannot be saved or is cleared, two products share one WooCommerce id, or a kit's availability cannot be computed (a kit cycle), the cursor stays, no daily stamp is written, the next run retries the same window, and each such run writes a `stock_reconcile_window` WARNING to the activity log with the first errors. A product that keeps failing therefore holds the pass at its window until it is fixed (or the manual stock push is used); the log line is the signal.
+- The saved cursor carries the WooCommerce settings version. After a credentials rebind or a product-id cache reset the next run drops it and starts the pass again from the beginning (still unstamped until the pass finishes).
+- A run refused before its first window is handled (stock sync disabled, credentials missing, no sync warehouses) writes no daily stamp and reports `reconciliation_refused`, so the pass is due again on the next run once the configuration is restored.
 - The candidate list is read fresh for every window, in id order. A product that becomes eligible (new SKU, status change, first stock) with an id before the cursor is not picked up until the next full pass.
 
 Expected result:

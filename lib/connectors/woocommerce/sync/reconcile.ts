@@ -1,5 +1,6 @@
 import { logActivity } from '@/lib/activity-log'
 import { db } from '@/lib/db'
+import { WC_SETTINGS_VERSION_KEY } from '../sync-lock'
 import { isWcOrderWebhookPrimaryActive, retryHeldWcSalesInvoiceReleases, syncNewWcOrders } from './order-import'
 import { isWcProductWebhookPrimaryActive, syncAllWcProducts } from './product-sync'
 import { processQueuedWcStockSyncJobs } from './stock-sync-jobs'
@@ -15,6 +16,21 @@ const STOCK_RECONCILE_INTERVAL_MS = 24 * 60 * 60 * 1000
 const STOCK_RECONCILE_CHUNK_SIZE = 150
 const STOCK_RECONCILE_REQUEST_BUDGET_MS = 20_000
 export const STOCK_RECONCILE_CURSOR_KEY = 'wc_stock_daily_reconcile_cursor'
+
+function formatCursor(afterId: string, version: string): string {
+  return JSON.stringify({ afterId, version })
+}
+
+function parseCursor(value: string): { afterId: string; version: string } | null {
+  try {
+    const parsed = JSON.parse(value) as { afterId?: unknown; version?: unknown }
+    return typeof parsed.afterId === 'string' && parsed.afterId !== '' && typeof parsed.version === 'string'
+      ? { afterId: parsed.afterId, version: parsed.version }
+      : null
+  } catch {
+    return null
+  }
+}
 
 export async function runWcReconcile(): Promise<Record<string, unknown>> {
   const startedAt = Date.now()
@@ -86,8 +102,15 @@ export async function runWcReconcile(): Promise<Record<string, unknown>> {
     // A pass that was cut short by the request budget carries on from its cursor on the next run, whether or not 24 hours have
     // passed: the daily stamp is only written when the pass reaches the end of the catalogue.
     const cursorRow = await db.setting.findUnique({ where: { key: STOCK_RECONCILE_CURSOR_KEY } })
-    let cursor: string | null = cursorRow?.value ? cursorRow.value : null
-    if (reconcileDue || cursor != null) {
+    // The cursor is only meaningful for the store it was taken against: it carries the WooCommerce settings version, which a
+    // credentials rebind or a product-id cache reset bumps. A cursor from another version (or one that cannot be read) is
+    // dropped and the pass starts again from the beginning, still without a stamp until it finishes.
+    const versionRow = await db.setting.findUnique({ where: { key: WC_SETTINGS_VERSION_KEY } })
+    const settingsVersion = versionRow?.value ?? '0'
+    const saved = cursorRow?.value ? parseCursor(cursorRow.value) : null
+    const restartedPass = cursorRow != null && saved?.version !== settingsVersion
+    let cursor: string | null = restartedPass ? null : (saved?.afterId ?? null)
+    if (reconcileDue || cursor != null || restartedPass) {
       let chunks = 0
       let pushed = 0
       let candidatesTotal = 0
@@ -99,7 +122,7 @@ export async function runWcReconcile(): Promise<Record<string, unknown>> {
         })
         // A push the producer-side hold shadowed did NOT reconcile anything: the daily stamp is what makes the next 24 hours
         // "not due", so stamping it would tell the live phase's first run that stock was just reconciled. Leave the stamp alone,
-        // and say so in the result. (A push the setting or the gates refused is stamped as before: that is the unchanged path.)
+        // and say so in the result.
         // The same holds for a push the outbound-write hold refused before it read anything: nothing was reconciled.
         if (stock.shadowed === true || stock.held === true) {
           results.stock = {
@@ -122,8 +145,8 @@ export async function runWcReconcile(): Promise<Record<string, unknown>> {
             cursor = stock.chunk.nextCursor
             await db.setting.upsert({
               where: { key: STOCK_RECONCILE_CURSOR_KEY },
-              create: { key: STOCK_RECONCILE_CURSOR_KEY, value: cursor },
-              update: { value: cursor },
+              create: { key: STOCK_RECONCILE_CURSOR_KEY, value: formatCursor(cursor, settingsVersion) },
+              update: { value: formatCursor(cursor, settingsVersion) },
             })
             if (Date.now() - startedAt < STOCK_RECONCILE_REQUEST_BUDGET_MS) continue
             results.stock = {
@@ -140,12 +163,24 @@ export async function runWcReconcile(): Promise<Record<string, unknown>> {
             }
             return results
           }
-        } else if (cursor != null || stock.aborted !== true) {
-          // The window was not handled: an outage or a credentials rebind cut it short, or a SKU lookup, a preflight page or a
-          // push entry in it failed. Only a gate refusal on the first window (aborted, no cursor) falls through to the legacy
-          // stamp. The pass is unfinished: keep the cursor, leave the stamp, and retry this window on the next run. A product
-          // that keeps failing therefore holds the pass here, so every such run says so in the activity log instead of retrying
-          // silently; the manual push remains available.
+        } else if (stock.aborted === true && cursor == null) {
+          // Refused before any window was handled (the setting, the credentials or the warehouses). Nothing was reconciled, so
+          // the pass stays due: no stamp, and the next run tries again as soon as the configuration is restored.
+          results.stock = {
+            queued,
+            sync: stock,
+            skipped: true,
+            reason: 'reconciliation_refused',
+            reconciliationDue: true,
+            lastReconciledAt: lastReconcile?.value ?? null,
+          }
+          return results
+        } else {
+          // The window was not handled: an outage or a credentials rebind cut it short, or a candidate in it did not complete
+          // (a failed lookup, preflight page or push entry, a mapping that could not be saved, a duplicate external id, a kit
+          // availability error). The pass is unfinished: keep the cursor, leave the stamp, and retry this window on the next
+          // run. A product that keeps failing therefore holds the pass here, so every such run says so in the activity log
+          // instead of retrying silently; the manual push remains available.
           await logActivity({
             entityType: 'SYNC', action: 'stock_reconcile_window', tag: 'sync', level: 'WARNING',
             description: `Daily stock reconcile window after ${cursor ?? 'the start'} is not complete (${stock.errors.length} error(s)); the pass is held at this window and no daily stamp is written`,
@@ -164,7 +199,7 @@ export async function runWcReconcile(): Promise<Record<string, unknown>> {
           }
           return results
         }
-        // The last window, or a refusal on the first one (which stamps exactly as before): the pass is over.
+        // The last window handled: the pass is over.
         if (cursor != null || cursorRow) await db.setting.deleteMany({ where: { key: STOCK_RECONCILE_CURSOR_KEY } })
         const now = new Date().toISOString()
         await db.setting.upsert({

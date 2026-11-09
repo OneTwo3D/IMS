@@ -13,6 +13,11 @@ import { OUTBOUND_GRANT_ENV } from '@/lib/security/outbound-write-hold-constants
 const ORIGIN = 'https://shop.example.com'
 const settings = new Map<string, string>()
 let candidates: Array<Record<string, unknown>> = []
+let updateManyMode: number | 'throw' = 1
+async function withUpdateCount<T>(mode: number | 'throw', fn: () => Promise<T>): Promise<T> {
+  updateManyMode = mode
+  try { return await fn() } finally { updateManyMode = 1 }
+}
 
 type Fetch = (path: string, params: Record<string, string>) => { data: unknown; error?: string }
 type Post = (path: string, body: unknown) => { data: unknown; error?: string }
@@ -32,7 +37,10 @@ function modelProxy(name: string) {
         return candidates.map((p) => ({ productId: p.id, warehouseId: 'w1', quantity: 5, reservedQty: 0 }))
       }
       if (name === 'product' && method === 'findMany') return candidates
-      if (name === 'product' && method === 'updateMany') return { count: 1 }
+      if (name === 'product' && method === 'updateMany') {
+        if (updateManyMode === 'throw') throw new Error('unique constraint')
+        return { count: updateManyMode }
+      }
       if (name === 'product' && method === 'findUnique') {
         const found = candidates.find((p) => p.id === (args as { where?: { id?: string } } | undefined)?.where?.id)
         return found ? { externalProductId: found.externalProductId } : null
@@ -257,4 +265,47 @@ test('a kit in this window sees a nested kit (and its components) that sit in ot
   const result = await run({ forceAll: true, chunk: { afterId: 'b', limit: 1 } })
   assert.deepEqual(result.errors, [])
   assert.equal(sent.find((u) => u.id === 3)?.stock_quantity, 5, 'the outer kit is as available as the component two windows back')
+})
+
+test('mapping collision: two products resolving to one WooCommerce id are skipped, so the window is unhandled', async () => {
+  reset([product('a', 'S1', BigInt(1)), product('b', 'S2', BigInt(1))])
+  fetchImpl = okPreflight
+  postImpl = () => okUpdate([1])
+  const result = await run()
+  assert.ok(result.errors.some((e) => e.includes('is mapped to 2 IMS products')))
+  assert.equal(result.chunk, undefined)
+})
+
+test('mapping persistence: a mapping claimed by another sync while resolving, or one that cannot be saved, leaves the window unhandled', async () => {
+  const lookup: Fetch = (_path, params) => (params.sku ? { data: [{ id: 5, sku: params.sku }] } : { data: params.include ? [{ id: 5, sku: 'S1' }] : [] })
+  reset([product('a', 'S1', null)])
+  fetchImpl = lookup
+  postImpl = () => okUpdate([5])
+  const control = await run()
+  assert.deepEqual(control.errors, [])
+  assert.ok(control.chunk)
+
+  // Changed mapping: the conditional update matches nothing.
+  reset([product('a', 'S1', null)])
+  fetchImpl = lookup
+  const changed = await withUpdateCount(0, () => run())
+  assert.ok(changed.errors.some((e) => e.includes('claimed by another sync')))
+  assert.equal(changed.chunk, undefined)
+
+  // Unsaveable mapping: the write throws (a unique-constraint collision in the database).
+  reset([product('a', 'S1', null)])
+  fetchImpl = lookup
+  const failed = await withUpdateCount('throw', () => run())
+  assert.ok(failed.errors.some((e) => e.includes('externalProductId collision')))
+  assert.equal(failed.chunk, undefined)
+})
+
+test('kit cycle: a kit that contains itself is reported as an error, so the window is unhandled', async () => {
+  const component = (componentId: string) => [{ componentId, qty: 1, component: { type: 'KIT', lifecycleStatus: 'ACTIVE' } }]
+  reset([{ ...product('a', 'K1', BigInt(1)), type: 'KIT', productComponents: component('b') }, { ...product('b', 'K2', BigInt(2)), type: 'KIT', productComponents: component('a') }])
+  fetchImpl = okPreflight
+  postImpl = (_p, body) => okUpdate(((body as { update: Array<{ id: number }> }).update).map((u) => u.id))
+  const result = await run()
+  assert.ok(result.errors.length > 0, 'the cycle is reported')
+  assert.equal(result.chunk, undefined)
 })
