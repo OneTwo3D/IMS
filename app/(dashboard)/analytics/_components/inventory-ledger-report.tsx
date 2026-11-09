@@ -11,7 +11,7 @@ import { COMBOBOX_THRESHOLD } from '@/lib/ui/select-policy'
 import { cn } from '@/lib/utils'
 import { ReportPageTitle } from './report-page-title'
 import { StockPositionFilterCombobox } from './stock-position-filter-combobox'
-import { appendParams, currentParams, toneClass, type SummaryTone } from './report-utils'
+import { appendParams, currentParams, toneClass, type SummaryTone, reportCsvHref } from './report-utils'
 
 export type InventoryLedgerColumn<Row> = {
   key: string
@@ -75,7 +75,7 @@ export function InventoryLedgerReportPage<Row>({
   showMinValue = false,
 }: InventoryLedgerReportPageProps<Row>) {
   const params = currentParams(filters)
-  const csvHref = `/api/export/inventory-ledger?${appendParams(params, { report: reportKey })}`
+  const csvHref = reportCsvHref('/api/export/inventory-ledger', params, { report: reportKey })
   const previousHref = `?${appendParams(params, { page: pageInfo.page - 1 })}`
   const nextHref = `?${appendParams(params, { page: pageInfo.page + 1 })}`
   const statuses = statusOptions(statusKind)

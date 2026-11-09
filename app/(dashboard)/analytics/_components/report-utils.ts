@@ -9,6 +9,15 @@ export function appendParams(base: URLSearchParams, updates: Record<string, stri
   return params.toString()
 }
 
+/**
+ * The in-app CSV download link for a report. It always asks for `metadata=1`: the totals and disclosures
+ * that exist only as export metadata (period totals, rounding and refund-basis notices) are appended to the
+ * file only on request, and a download from the dashboard must carry them. A bare API call stays data-only.
+ */
+export function reportCsvHref(path: string, base: URLSearchParams, updates: Record<string, string | number | undefined>): string {
+  return `${path}?${appendParams(base, { ...updates, metadata: 1 })}`
+}
+
 export function currentParams(filters: Record<string, unknown>): URLSearchParams {
   const params = new URLSearchParams()
   for (const [key, value] of Object.entries(filters)) {

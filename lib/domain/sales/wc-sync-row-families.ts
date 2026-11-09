@@ -363,6 +363,32 @@ export function unresolvedWcOrderRowSql(): Prisma.Sql {
 }
 
 /**
+ * THE ROW THE RECOVERY WITNESS ACCUSES: a `shopping_sync_logs` row an operator recovery once acted on that is
+ * NOW shaped or stamped as a held sales invoice. This is the predicate of check 7 of the 20260822120000
+ * migration's verify.sql, spelt here for the retention sweep and compared with that file by a test, because the
+ * sweep must keep exactly the rows the check would otherwise fail to see once they were deleted.
+ *
+ * Positive only (read inside an EXISTS), so the nullable `recordKind` needs no COALESCE.
+ */
+export function recoveryAccusedRowSql(): Prisma.Sql {
+  return Prisma.sql`(
+        "shopping_sync_logs".connector = 'woocommerce'
+    AND "shopping_sync_logs".direction = 'FROM_CONNECTOR'
+    AND "shopping_sync_logs"."entityType" = 'SalesOrder'
+    AND jsonb_typeof("shopping_sync_logs".payload) = 'object'
+    AND "shopping_sync_logs".payload->'id' IS NULL
+    AND (
+         "shopping_sync_logs"."recordKind" = ${HELD_SALES_INVOICE_RECORD_KIND}
+      OR (
+               "shopping_sync_logs".payload->>'reason' = 'missing_wc_invoice_number'
+           AND jsonb_typeof("shopping_sync_logs".payload->'accountingPayload') = 'object'
+           AND "shopping_sync_logs".payload->>'metaKey' IS NOT NULL
+         )
+    )
+  )`
+}
+
+/**
  * WHAT AN OPERATOR IS TOLD ABOUT A ROW OF EACH FAMILY.
  *
  * This is the second half of o3d-272i, and the half that is not about queries at all. The delete

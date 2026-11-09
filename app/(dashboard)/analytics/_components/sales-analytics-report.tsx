@@ -9,7 +9,7 @@ import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import type { SalesAnalyticsGroupBy, SalesCurrencyMode } from '@/lib/domain/sales/sales-fulfillment-analytics'
 import { cn } from '@/lib/utils'
 import { ReportPageTitle } from './report-page-title'
-import { appendParams, currentParams, toneClass, type SummaryTone } from './report-utils'
+import { appendParams, currentParams, toneClass, type SummaryTone, reportCsvHref } from './report-utils'
 
 export type SalesAnalyticsFilterValues = {
   dateFrom?: string
@@ -66,7 +66,7 @@ export function SalesAnalyticsReportPage<Row>({
   showCurrencyMode = false,
 }: SalesAnalyticsReportPageProps<Row>) {
   const params = currentParams(filters)
-  const csvHref = `/api/export/sales-analytics?${appendParams(params, { report: reportKey })}`
+  const csvHref = reportCsvHref('/api/export/sales-analytics', params, { report: reportKey })
   const previousHref = `?${appendParams(params, { page: pageInfo.page - 1 })}`
   const nextHref = `?${appendParams(params, { page: pageInfo.page + 1 })}`
 

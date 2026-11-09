@@ -10,6 +10,7 @@ import {
   assessCoverage,
   classifyMigrationOutcomes,
   recordVerificationOutcomes,
+  unbackedPasses,
   evaluateFileResults,
   findMigrationsWithVerify,
   listMigrationDirectories,
@@ -64,6 +65,27 @@ test('the outcome is recorded: first pass wins, a failure removes the record', a
   assert.deepEqual(queries[0]!.params, ['m_ok', 7])
   assert.match(queries[1]!.sql, /DELETE FROM migration_verification_passes WHERE migration_name = \$1/)
   assert.deepEqual(queries[1]!.params, ['m_bad'])
+})
+
+test('a pass nothing re-verified is revoked: a required migration with no verify.sql, a stale name, an unapplied declaration', async () => {
+  const coverage = assessCoverage(['m_a', 'm_b'], ['m_a'], ['m_a', 'm_b', 'm_gone'])
+  assert.deepEqual(coverage.missing, ['m_b'])
+  assert.deepEqual(coverage.stale, ['m_gone'])
+  assert.deepEqual(unbackedPasses(coverage, ['m_unapplied']), ['m_b', 'm_gone', 'm_unapplied'])
+  // A fully covered tree revokes nothing.
+  assert.deepEqual(unbackedPasses(assessCoverage(['m_a'], ['m_a'], ['m_a']), []), [])
+
+  const queries: Array<{ sql: string; params: unknown[] }> = []
+  const client = { query: async (sql: string, params: unknown[]) => { queries.push({ sql, params }); return { rows: [] } } }
+  await recordVerificationOutcomes(client, { passed: [], failed: ['m_b'], unbacked: ['m_b', 'm_gone'] })
+  assert.deepEqual(queries.map((q) => q.params), [['m_b'], ['m_gone']], 'each revoked once, a failed-and-unbacked name not twice')
+  assert.ok(queries.every((q) => /DELETE FROM migration_verification_passes/.test(q.sql)))
+})
+
+test('the runner revokes a recorded pass whose verify.sql is missing (source wiring)', () => {
+  const source = readFileSync(join(process.cwd(), 'scripts/run-migration-verifications.mjs'), 'utf8')
+  assert.match(source, /unbacked: unbackedPasses\(coverage, unapplied\)/, 'the main path revokes unbacked passes')
+  assert.match(source, /unbackedPasses\(coverage, \[\]\)[\s\S]*recordVerificationOutcomes\(revoker/, 'and so does the path where no file declares checks')
 })
 
 test('a non-zero violation count fails the deploy and names the check', () => {

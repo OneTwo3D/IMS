@@ -115,6 +115,16 @@ export function classifyMigrationOutcomes(checks, errorMigrations = []) {
  * pass lifted comes back with the incident. Written after the checks, never before, and only for
  * migrations that actually ran.
  */
+/**
+ * Pure: the migrations whose recorded pass this run can no longer stand behind, beyond the ones that ran
+ * and failed: a migration REQUIRED to declare checks whose verify.sql is missing (or whose name is stale),
+ * and one that declares checks but is not recorded as applied. A pass nothing re-verified must not keep
+ * lifting what it lifted.
+ */
+export function unbackedPasses(coverage, unapplied) {
+  return [...new Set([...coverage.missing, ...coverage.stale, ...unapplied])].sort()
+}
+
 export async function recordVerificationOutcomes(client, outcomes) {
   for (const { migration, checks } of outcomes.passed) {
     await client.query(
@@ -122,7 +132,7 @@ export async function recordVerificationOutcomes(client, outcomes) {
       [migration, checks],
     )
   }
-  for (const migration of outcomes.failed) {
+  for (const migration of [...new Set([...outcomes.failed, ...(outcomes.unbacked ?? [])])]) {
     await client.query(`DELETE FROM migration_verification_passes WHERE migration_name = $1`, [migration])
   }
 }
@@ -335,6 +345,21 @@ async function main() {
   const coverage = assessCoverage(allMigrations, withVerify, readRequiredList(migrationsDir))
 
   if (withVerify.length === 0) {
+    // No file declares checks, so nothing can be re-verified: revoke the pass of every required migration
+    // (its verify.sql is missing) rather than leave an old pass lifting a retention exemption.
+    const unbacked = unbackedPasses(coverage, [])
+    if (unbacked.length > 0 && process.env.DATABASE_URL) {
+      const revoker = new pg.Client({ connectionString: process.env.DATABASE_URL })
+      await revoker.connect()
+      try {
+        await recordVerificationOutcomes(revoker, { passed: [], failed: [], unbacked })
+      } catch (error) {
+        console.error(`could not revoke recorded verification passes: ${error instanceof Error ? error.message : String(error)}`)
+        process.exitCode = 1
+      } finally {
+        await revoker.end()
+      }
+    }
     reportCoverage({ allMigrations, withVerify, coverage, strict, ran: [], skipped: [], checkCount: 0 })
     if (strict && !coverage.satisfied) {
       console.error('\nCoverage assertion FAILED: the migrations above are required to declare verification checks.')
@@ -394,7 +419,7 @@ async function main() {
     // A failure to RECORD is reported and fatal: the record is what lets a retention exemption lift, and
     // silently not writing it would leave that exemption in force with nothing saying so.
     try {
-      await recordVerificationOutcomes(client, classifyMigrationOutcomes(allChecks, errorMigrations))
+      await recordVerificationOutcomes(client, { ...classifyMigrationOutcomes(allChecks, errorMigrations), unbacked: unbackedPasses(coverage, unapplied) })
     } catch (error) {
       allErrors.push(`could not record the verification outcome in migration_verification_passes: ${error instanceof Error ? error.message : String(error)}`)
     }
