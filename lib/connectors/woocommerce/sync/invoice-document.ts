@@ -55,7 +55,11 @@ async function currentFlagDocumentId(orderId: string): Promise<string> {
   return current?.id ?? LEGACY_FLAG_DOCUMENT_ID
 }
 
-export async function publishInvoiceDocumentFlagToWc(orderId: string): Promise<PublishInvoiceDocumentFlagOutcome> {
+export async function publishInvoiceDocumentFlagToWc(
+  orderId: string,
+  /** Test seam: runs after the guards and before the switch is read for the last time. */
+  hooks: { beforeLastSwitchRead?: () => Promise<void> } = {},
+): Promise<PublishInvoiceDocumentFlagOutcome> {
   if (!(await isInvoiceDocumentPublishingEnabled())) return { kind: 'disabled' }
 
   const order = await db.salesOrder.findUnique({
@@ -80,6 +84,9 @@ export async function publishInvoiceDocumentFlagToWc(orderId: string): Promise<P
   if (!isInsideWcAttemptFence()) return { kind: 'failed', held: false, error: 'The invoice flag is written only by its guarded outbox job, never directly.' }
   // The attempt fence: deadline, row ownership, cut-off: deadline, row ownership, cut-off, and that IMS still wants the write.
   await assertWcAttemptMayWrite()
+  // THE SWITCH, READ AGAIN IMMEDIATELY BEFORE THE SEND: an operator who turns publishing off while an attempt is under way stops its PUT.
+  await hooks.beforeLastSwitchRead?.()
+  if (!(await isInvoiceDocumentPublishingEnabled())) return { kind: 'disabled' }
   const result = await wcPut(`orders/${externalOrderId}`, { meta_data: [{ key: WC_INVOICE_DOCUMENT_META_KEY, value: 'yes' }] })
   if (result.held) return { kind: 'failed', held: true, error: `The invoice flag was not written to the WooCommerce order: ${result.error}` }
   if (result.error) return { kind: 'failed', held: false, error: `The invoice flag was not accepted by the WooCommerce order: ${result.error}` }

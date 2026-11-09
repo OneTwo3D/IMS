@@ -33,6 +33,8 @@ const transport = {
   /** The notes the (fake) storefront order holds; a successful or lost-response POST adds to it. */
   notes: [] as Array<{ id: number; note: string; customer_note: boolean }>,
   notesRead: (): { data: unknown; error?: string } => ({ data: transport.notes }),
+  failPage: 0,
+  pagesUnknown: false,
 }
 function resetTransport() {
   transport.puts.length = 0
@@ -41,6 +43,8 @@ function resetTransport() {
   transport.postResult = () => ({ data: { id: 9001 } })
   transport.notes = []
   transport.notesRead = () => ({ data: transport.notes })
+  transport.failPage = 0
+  transport.pagesUnknown = false
 }
 if (!skip) {
   mock.module('@/lib/connectors/woocommerce/api', {
@@ -53,7 +57,16 @@ if (!skip) {
         if (typeof note === 'string') transport.notes.push({ id: 9000 + transport.notes.length + 1, note, customer_note: false })
         return transport.postResult()
       },
-      wcFetch: async () => ({ ...transport.notesRead(), totalPages: 1, totalItems: 0 }),
+      // Newest first, as WooCommerce answers, in pages of per_page; the page count comes with every page.
+      wcFetch: async (_p: string, params: Record<string, string> = {}) => {
+        const read = transport.notesRead()
+        if (read.error || !Array.isArray(read.data)) return { ...read, totalPages: 0, totalItems: 0 }
+        const perPage = Number(params.per_page ?? '10')
+        const page = Number(params.page ?? '1')
+        const newestFirst = [...(read.data as unknown[])].reverse()
+        if (transport.failPage === page) return { data: null, totalPages: 0, totalItems: 0, error: `WC API error: 500 on page ${page}` }
+        return { data: newestFirst.slice((page - 1) * perPage, page * perPage), totalPages: transport.pagesUnknown ? -1 : Math.max(1, Math.ceil(newestFirst.length / perPage)), totalItems: newestFirst.length }
+      },
     },
   })
 }
@@ -467,6 +480,68 @@ test('THE SCAN\'S FILTERS, one by one: superseded, already marked, before live-f
     const recentDoc = await d.db.salesOrderInvoiceDocument.findFirstOrThrow({ where: { orderId: outOfScope.id } })
     assert.ok(await d.jobs.scheduleWcInvoiceDocument(d.db, { orderId: outOfScope.id, documentId: recentDoc.id, obligationAt: new Date() }))
   })
+})
+
+test('THE SWITCH IS READ AGAIN BEFORE THE SEND: turned off during an attempt, no PUT leaves', { skip }, async (t) => {
+  const d = await setup()
+  const { runWithWcAttemptFence } = await import('../../lib/connectors/woocommerce/attempt-fence')
+  resetTransport()
+  const order = await seedOrder(d)
+  t.after(() => cleanup(d, [order.id]))
+  await setFlag(d, 'true')
+  const fence = { signal: AbortSignal.timeout(60_000), stillOwned: async () => true }
+  const off = await withEnv(LIVE, () => runWithWcAttemptFence(fence, () => d.writer.publishInvoiceDocumentFlagToWc(order.id, { beforeLastSwitchRead: () => setFlag(d, 'false') })))
+  assert.deepEqual(off, { kind: 'disabled' })
+  assert.equal(transport.puts.length, 0, 'the switch was turned off mid-attempt: nothing was sent')
+  assert.equal(await d.db.invoiceStorePublication.count({ where: { orderId: order.id } }), 0)
+  await setFlag(d, 'true')
+  const on = await withEnv(LIVE, () => runWithWcAttemptFence(fence, () => d.writer.publishInvoiceDocumentFlagToWc(order.id, { beforeLastSwitchRead: async () => {} })))
+  assert.equal(on.kind, 'written', 'CONTROL: switched on throughout, it is sent')
+})
+
+test('THE NOTE IS MATCHED BY ITS EXACT LINK: one invoice id extending another, or a template with no id, never adopts another invoice\'s note', { skip }, async (t) => {
+  const d = await setup()
+  resetTransport()
+  const base = `acct-${randomUUID().slice(0, 8)}`
+  const order = await seedOrder(d, { stored: false, accountingInvoiceId: `${base}9` })
+  t.after(async () => { await d.db.setting.deleteMany({ where: { key: 'accounting_invoice_url_template' } }); await cleanup(d, [order.id]) })
+  const template = async (value: string) => d.db.setting.upsert({ where: { key: 'accounting_invoice_url_template' }, create: { key: 'accounting_invoice_url_template', value }, update: { value } })
+  await template('https://acct.example.test/{id}')
+  assert.deepEqual(await d.note.pushInvoiceNoteToWc(order.id), { success: true })
+  assert.equal(transport.posts.length, 1)
+  // The order now carries a different invoice whose id is a PREFIX of the first one's: its link is a substring of the first note's link.
+  await d.db.salesOrder.update({ where: { id: order.id }, data: { accountingInvoiceId: base } })
+  assert.deepEqual(await d.note.pushInvoiceNoteToWc(order.id), { success: true })
+  assert.equal(transport.posts.length, 2, 'the other invoice\'s note was not adopted: this invoice got its own')
+  // A template with no id cannot tell invoices apart: nothing is posted.
+  await d.db.invoiceStorePublication.deleteMany({ where: { orderId: order.id } })
+  await template('https://acct.example.test/invoices')
+  const result = await d.note.pushInvoiceNoteToWc(order.id)
+  assert.equal(result.success, false)
+  assert.equal(transport.posts.length, 2)
+})
+
+test('THE NOTES ARE READ TO A VERIFIED END: a note beyond page one is found; an unreadable later page, or an unstated page count, posts nothing', { skip }, async (t) => {
+  const d = await setup()
+  resetTransport()
+  const order = await seedOrder(d, { stored: false, accountingInvoiceId: `acct-${randomUUID().slice(0, 8)}` })
+  t.after(async () => { await d.db.setting.deleteMany({ where: { key: 'accounting_invoice_url_template' } }); await cleanup(d, [order.id]) })
+  await d.db.setting.upsert({ where: { key: 'accounting_invoice_url_template' }, create: { key: 'accounting_invoice_url_template', value: 'https://acct.example.test/{id}' }, update: { value: 'https://acct.example.test/{id}' } })
+  transport.postResult = () => { throw new Error('socket hang up') }
+  await d.note.pushInvoiceNoteToWc(order.id)
+  assert.equal(transport.notes.length, 1, 'the note landed, the response was lost')
+  // 120 later notes push it onto page two (newest first, 100 a page).
+  for (let i = 0; i < 120; i++) transport.notes.push({ id: 100 + i, note: `filler ${i}`, customer_note: false })
+  transport.postResult = () => ({ data: { id: 5555 } })
+  transport.failPage = 2
+  assert.equal((await d.note.pushInvoiceNoteToWc(order.id)).success, false, 'page two unreadable: the read is incomplete')
+  transport.failPage = 0
+  transport.pagesUnknown = true
+  assert.equal((await d.note.pushInvoiceNoteToWc(order.id)).success, false, 'the store did not say how many pages there are')
+  assert.equal(transport.posts.length, 1, 'nothing was posted on an incomplete read')
+  transport.pagesUnknown = false
+  assert.deepEqual(await d.note.pushInvoiceNoteToWc(order.id), { success: true })
+  assert.equal(transport.posts.length, 1, 'the note beyond page one was found and adopted: no second note')
 })
 
 test('TWO CONCURRENT DRAINS WRITE ONCE (repeated: one pass proves nothing about a race)', { skip }, async (t) => {

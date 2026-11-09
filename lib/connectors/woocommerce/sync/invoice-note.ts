@@ -61,16 +61,19 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: b
   const noteAlreadyWritten = !!marker?.noteWrittenAt && marker.noteInvoiceId === so.accountingInvoiceId
   let reconciledNoteId: string | null = null
   if (!noteAlreadyWritten) {
-    // A LOST RESPONSE leaves no marker although the storefront may have kept the note. Before posting, read the order's notes and look for
-    // one carrying THIS invoice's link (the ledger invoice id is in the URL, so it is a stable, invoice-specific identifier). If one is
-    // there, adopt it as the marker instead of posting a second. If the notes cannot be read, post nothing: a blind post is how a
-    // duplicate is made, and a failed read is retried.
-    const existing = await wcFetch(`orders/${wcLink.externalOrderId}/notes`, { per_page: '100' })
-    if (existing.error || !Array.isArray(existing.data)) {
-      return { success: false, error: `Could not read the WooCommerce order's notes to check whether the invoice note is already there, so none was added: ${existing.error ?? 'unexpected answer'}` }
+    // A LOST RESPONSE leaves no marker although the storefront may have kept the note. Before posting, read ALL of the order's notes and
+    // look for one whose link is EXACTLY this invoice's. If one is there, adopt it as the marker instead of posting a second. If the notes
+    // cannot be read to a verified end, post nothing: a blind post is how a duplicate is made, and an incomplete read is retried.
+    // The link must be invoice-specific (contain this invoice's ledger id), or a template without {id} would make every invoice's note
+    // look like every other's; with such a template nothing can be told apart, so nothing is posted.
+    if (!accountingInvoiceUrl.includes(so.accountingInvoiceId!)) {
+      return { success: false, error: 'The invoice URL template has no {id}, so this invoice\'s note cannot be told from another\'s and none was added. Fix the template.' }
     }
-    const found = (existing.data as Array<{ id?: unknown; note?: unknown; customer_note?: unknown }>)
-      .find((n) => n.customer_note !== true && typeof n.note === 'string' && n.note.includes(accountingInvoiceUrl))
+    const notes = await readAllOrderNotes(wcLink.externalOrderId)
+    if (!notes.ok) {
+      return { success: false, error: `Could not read all of the WooCommerce order's notes to check whether the invoice note is already there, so none was added: ${notes.error}` }
+    }
+    const found = notes.notes.find((n) => n.customer_note !== true && typeof n.note === 'string' && noteLinkTargets(n.note).includes(accountingInvoiceUrl))
     if (found && (typeof found.id === 'number' || typeof found.id === 'string')) {
       reconciledNoteId = String(found.id)
       await recordNoteWritten(orderId, so.accountingInvoiceId!, found.id)
@@ -111,6 +114,30 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: b
 
   if (failure) return { success: false, error: failure }
   return { success: true }
+}
+
+type OrderNote = { id?: unknown; note?: unknown; customer_note?: unknown }
+const NOTES_PER_PAGE = 100
+const NOTES_MAX_PAGES = 20
+
+/** The exact link targets (href values, entity-decoded) of a note's HTML. Compared whole, never as a substring. */
+export function noteLinkTargets(html: string): string[] {
+  return [...html.matchAll(/href=(["'])(.*?)\1/gi)].map((m) => m[2]!.replace(/&amp;/g, '&').replace(/&#0?38;/g, '&'))
+}
+
+/** Every page of the order's notes, to a VERIFIED end: the store must state its page count, and every page up to it must read. Anything else is not ok. */
+async function readAllOrderNotes(externalOrderId: string): Promise<{ ok: true; notes: OrderNote[] } | { ok: false; error: string }> {
+  const notes: OrderNote[] = []
+  let totalPages = 1
+  for (let page = 1; page <= totalPages; page++) {
+    if (page > NOTES_MAX_PAGES) return { ok: false, error: `more than ${NOTES_MAX_PAGES} pages of notes` }
+    const result = await wcFetch(`orders/${externalOrderId}/notes`, { per_page: String(NOTES_PER_PAGE), page: String(page) })
+    if (result.error || !Array.isArray(result.data)) return { ok: false, error: result.error ?? 'unexpected answer' }
+    if (typeof result.totalPages !== 'number' || result.totalPages < 0) return { ok: false, error: 'the store did not say how many pages of notes there are' }
+    totalPages = Math.max(result.totalPages, 1)
+    notes.push(...(result.data as OrderNote[]))
+  }
+  return { ok: true, notes }
 }
 
 /**
