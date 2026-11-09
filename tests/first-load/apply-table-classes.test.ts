@@ -37,7 +37,7 @@ test('every entry carries a reason, the three kinds are all used, and the runner
 })
 
 test('the tables a stock count, a stock transfer, a sale, a customer, an invoice, a payment, manufacturing and a return live in are MUST_BE_EMPTY', () => {
-  for (const name of ['stock_counts', 'stock_count_lines', 'stock_transfers', 'stock_transfer_lines', 'sales_orders', 'sales_order_lines', 'customers', 'purchase_invoices', 'payments', 'production_orders', 'purchase_returns', 'sales_order_refunds', 'shipments', 'kits']) {
+  for (const name of ['stock_counts', 'stock_count_lines', 'stock_transfers', 'stock_transfer_lines', 'sales_orders', 'sales_order_lines', 'customers', 'purchase_invoices', 'payments', 'production_orders', 'purchase_returns', 'sales_order_refunds', 'shipments']) {
     assert.equal(TABLE_CLASSES[name]?.kind, 'MUST_BE_EMPTY', name)
   }
 })

@@ -16,6 +16,8 @@ const upserts: string[] = []
 const deletes: string[] = []
 
 const fakeDb = {
+  $executeRaw: async () => 1,
+  $transaction: async (fn: (tx: unknown) => unknown) => fn(fakeDb),
   setting: {
     findUnique: async (args: { where: { key: string } }) => (settings.has(args.where.key) ? { key: args.where.key, value: settings.get(args.where.key) } : null),
     upsert: async (args: { where: { key: string }; update: { value: string } }) => {
@@ -56,6 +58,7 @@ mock.module('@/lib/connectors/woocommerce/sync/stock-sync', {
       pushCalls.push(args)
       const next = script.shift()
       assert.ok(next, 'the push was called more often than scripted')
+      if (next.rebindAfter) { settings.set(VERSION_KEY, String(next.rebindAfter)); delete next.rebindAfter }
       return { synced: 0, skipped: 0, errors: [], candidates: 0, matched: 0, unmatched: 0, pushed: false, message: '', unmatchedSkuSample: [], ...next }
     },
   },
@@ -204,4 +207,54 @@ test('a later window with failed products holds the pass at that window: cursor 
   assert.equal(settings.get(CURSOR_KEY), cursorValue('p-150'))
   assert.ok(!upserts.includes(STAMP_KEY))
   assert.equal(activities.length, 1)
+})
+
+test('a rebind between the last window and the stamp: no stamp, the cursor is left, the pass stays due', async () => {
+  const { runWcReconcile } = await import('@/lib/connectors/woocommerce/sync/reconcile')
+  reset([{ ...done(null), rebindAfter: 9 }])
+  settings.set(VERSION_KEY, '8')
+  settings.set(CURSOR_KEY, cursorValue('p-300', '8'))
+  const results = await runWcReconcile()
+  assert.equal((results.stock as { reason?: string }).reason, 'settings_changed_before_stamp')
+  assert.equal((results.stock as { reconciliationDue?: boolean }).reconciliationDue, true)
+  assert.ok(!upserts.includes(STAMP_KEY), 'the new store is not stamped as reconciled')
+  assert.ok(!deletes.includes(CURSOR_KEY), 'the cursor is not cleared by this run')
+  // Next run: the old cursor is of another version, so the pass starts again from the beginning.
+  script = [done(null)]
+  pushCalls.length = 0
+  await runWcReconcile()
+  assert.equal(pushCalls[0].chunk?.afterId, null)
+  assert.ok(upserts.includes(STAMP_KEY))
+})
+
+test('the cursor clear and the stamp are written inside one transaction, not around it', async () => {
+  const { runWcReconcile } = await import('@/lib/connectors/woocommerce/sync/reconcile')
+  reset([done(null)])
+  settings.set(CURSOR_KEY, cursorValue('p-300', '0'))
+  const order: string[] = []
+  const realTransaction = fakeDb.$transaction
+  const realDelete = fakeDb.setting.deleteMany
+  const realUpsert = fakeDb.setting.upsert
+  const tag = (where: { key: string }) => (where.key === STAMP_KEY ? 'stamp' : where.key === CURSOR_KEY ? 'cursor' : 'other')
+  fakeDb.setting.deleteMany = async (a) => { order.push(`db:delete:${tag(a.where)}`); return realDelete(a) }
+  fakeDb.setting.upsert = async (a) => { order.push(`db:upsert:${tag(a.where)}`); return realUpsert(a) }
+  fakeDb.$transaction = async (fn) => {
+    order.push('tx-begin')
+    const tx = {
+      $executeRaw: async () => 1,
+      setting: {
+        findUnique: fakeDb.setting.findUnique,
+        deleteMany: async (a: { where: { key: string } }) => { order.push(`tx:delete:${tag(a.where)}`); return realDelete(a) },
+        upsert: async (a: { where: { key: string }; update: { value: string } }) => { order.push(`tx:upsert:${tag(a.where)}`); return realUpsert(a) },
+      },
+    }
+    const out = await fn(tx)
+    order.push('tx-end')
+    return out
+  }
+  try { await runWcReconcile() } finally {
+    fakeDb.$transaction = realTransaction; fakeDb.setting.deleteMany = realDelete; fakeDb.setting.upsert = realUpsert
+  }
+  assert.deepEqual(order.slice(order.indexOf('tx-begin')), ['tx-begin', 'tx:delete:cursor', 'tx:upsert:stamp', 'tx-end'])
+  assert.ok(!order.some((entry) => entry.startsWith('db:') && (entry.endsWith(':stamp') || entry.endsWith(':cursor'))), 'nothing outside the transaction touches the stamp or the cursor')
 })

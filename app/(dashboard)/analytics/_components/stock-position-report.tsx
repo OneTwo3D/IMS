@@ -1,4 +1,3 @@
-import { csvHrefWithNotices } from '@/lib/csv-links'
 import Link from 'next/link'
 import { Download } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -11,7 +10,7 @@ import type { PageInfo, StockPositionFilterOptions } from '@/lib/domain/inventor
 import { cn } from '@/lib/utils'
 import { ReportPageTitle } from './report-page-title'
 import { StockPositionFilterCombobox } from './stock-position-filter-combobox'
-import { appendParams, currentParams, toneClass, type SummaryTone } from './report-utils'
+import { appendParams, currentParams, toneClass, type SummaryTone, reportCsvHref } from './report-utils'
 
 export type StockPositionColumn<Row> = {
   key: string
@@ -56,8 +55,6 @@ type StockPositionReportPageProps<Row> = {
   description: string
   reportKey: 'stock-on-hand' | 'stock-allocations' | 'negative-stock' | 'inventory-aging' | 'dead-stock' | 'reorder' | 'backorder' | 'component-shortage'
   exportBasePath?: string
-  /** The export route appends the report's notices after the data when asked (`?notices=1`). */
-  exportCarriesNotices?: boolean
   filters: StockPositionFilterValues
   filterOptions: StockPositionFilterOptions
   pageInfo: PageInfo
@@ -89,7 +86,6 @@ export function StockPositionReportPage<Row>({
   description,
   reportKey,
   exportBasePath = '/api/export/stock-position',
-  exportCarriesNotices = false,
   filters,
   filterOptions,
   pageInfo,
@@ -108,8 +104,7 @@ export function StockPositionReportPage<Row>({
   selectionColumn,
 }: StockPositionReportPageProps<Row>) {
   const params = currentParams(filters)
-  const plainCsvHref = `${exportBasePath}?${appendParams(params, { type: reportKey })}`
-  const csvHref = exportCarriesNotices ? csvHrefWithNotices(plainCsvHref) : plainCsvHref
+  const csvHref = reportCsvHref(exportBasePath, params, { type: reportKey })
   const previousHref = `?${appendParams(params, { page: pageInfo.page - 1 })}`
   const nextHref = `?${appendParams(params, { page: pageInfo.page + 1 })}`
 

@@ -1,6 +1,6 @@
 import { logActivity } from '@/lib/activity-log'
 import { db } from '@/lib/db'
-import { WC_SETTINGS_VERSION_KEY } from '../sync-lock'
+import { WC_SETTINGS_VERSION_KEY, WC_SYNC_ADVISORY_LOCK_KEY } from '../sync-lock'
 import { isWcOrderWebhookPrimaryActive, retryHeldWcSalesInvoiceReleases, syncNewWcOrders } from './order-import'
 import { isWcProductWebhookPrimaryActive, syncAllWcProducts } from './product-sync'
 import { processQueuedWcStockSyncJobs } from './stock-sync-jobs'
@@ -199,14 +199,34 @@ export async function runWcReconcile(): Promise<Record<string, unknown>> {
           }
           return results
         }
-        // The last window handled: the pass is over.
-        if (cursor != null || cursorRow) await db.setting.deleteMany({ where: { key: STOCK_RECONCILE_CURSOR_KEY } })
+        // The last window handled: the pass is over. Clearing the cursor and writing the stamp are ONE commit, and only while the
+        // WooCommerce settings version is still the one this pass ran against. A credentials rebind or cache reset after the last
+        // push would otherwise stamp the NEW store as reconciled; under the same advisory lock the rebind takes, it either lands
+        // first (then this refuses and the pass stays due) or after (then the stamp is for the store that was reconciled).
         const now = new Date().toISOString()
-        await db.setting.upsert({
-          where: { key: 'last_wc_stock_daily_reconcile_at' },
-          create: { key: 'last_wc_stock_daily_reconcile_at', value: now },
-          update: { value: now },
+        const committed = await db.$transaction(async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
+          const current = await tx.setting.findUnique({ where: { key: WC_SETTINGS_VERSION_KEY } })
+          if ((current?.value ?? '0') !== settingsVersion) return false
+          await tx.setting.deleteMany({ where: { key: STOCK_RECONCILE_CURSOR_KEY } })
+          await tx.setting.upsert({
+            where: { key: 'last_wc_stock_daily_reconcile_at' },
+            create: { key: 'last_wc_stock_daily_reconcile_at', value: now },
+            update: { value: now },
+          })
+          return true
         })
+        if (!committed) {
+          results.stock = {
+            queued,
+            sync: stock,
+            skipped: true,
+            reason: 'settings_changed_before_stamp',
+            reconciliationDue: true,
+            lastReconciledAt: lastReconcile?.value ?? null,
+          }
+          return results
+        }
         results.stock = {
           queued,
           sync: stock,

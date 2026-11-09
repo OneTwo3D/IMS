@@ -9,8 +9,8 @@ import {
 } from '@/lib/domain/accounting/back-reference-sweep'
 import { followUpObligationsOwedBy } from '@/lib/domain/accounting/compacted-followup-loss'
 import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
-import { WC_REFUND_PARK_RECOVERED_ACTION } from '@/lib/domain/sales/refund-park-recovery'
-import { unresolvedWcOrderRowSql } from '@/lib/domain/sales/wc-sync-row-families'
+import { WC_REFUND_PARK_RECOVERED_ACTION, WC_REFUND_PARK_VERIFICATION_MIGRATION } from '@/lib/domain/sales/refund-park-recovery'
+import { recoveryAccusedRowSql, unresolvedWcOrderRowSql } from '@/lib/domain/sales/wc-sync-row-families'
 import { EXTERNAL_DOCUMENT_EVIDENCE_WHERE } from '@/lib/domain/accounting/external-document-evidence'
 import { REMOTE_MONEY_EVIDENCE_TYPES } from '@/lib/domain/accounting/remote-money-evidence'
 import { UNRESOLVED_ABANDONED_CLAIM_WHERE } from '@/lib/domain/accounting/unresolved-abandoned-claim'
@@ -115,6 +115,32 @@ export function monthsAgo(months: number): Date {
 }
 
 /**
+ * TRUE for a `shopping_sync_logs` row the recovery witness names and retention must therefore keep.
+ *
+ * Until the migration's checks have passed (recorded by the verification runner) every witnessed row is kept.
+ * After that only the rows check 7 would ACCUSE are kept: a witnessed row now shaped or stamped as a held
+ * invoice. Check 7 drives from this table, so deleting such a row would turn a real accusation into zero; a clean
+ * witnessed row has nothing left to prove and expires by age. A verification run that fails removes the pass,
+ * which restores the full protection.
+ */
+export function recoveryWitnessRetainsRowSql(): Prisma.Sql {
+  return Prisma.sql`EXISTS (
+    SELECT 1
+      FROM "activity_logs"
+     WHERE "activity_logs".action = ${WC_REFUND_PARK_RECOVERED_ACTION}
+       AND "activity_logs".metadata->>'shoppingSyncLogId' = "shopping_sync_logs".id
+       AND (
+             NOT EXISTS (
+               SELECT 1
+                 FROM "migration_verification_passes"
+                WHERE "migration_verification_passes"."migration_name" = ${WC_REFUND_PARK_VERIFICATION_MIGRATION}
+             )
+          OR ${recoveryAccusedRowSql()}
+       )
+  )`
+}
+
+/**
  * Purge or archive expired data based on retention settings.
  * - Sync logs & stock movements: hard-deleted
  * - Sales orders, purchase orders, customers: soft-archived (archived = true)
@@ -200,13 +226,15 @@ export async function purgeExpiredData(): Promise<{
       // than the retention period it would fail the cutover over healthy history — the one outcome
       // this file's own comments call a cutover outage. So the row is kept.
       //
-      // WHAT THAT COSTS. These rows now outlive the retention period the settings UI promises,
-      // indefinitely, and unlike the PENDING/FAILED/QUARANTINED exemption above there is no state
-      // they later move into that releases them — the witness is permanent by design. The set is
-      // bounded by MANUAL OPERATOR RECOVERIES, which are rare and each of which is a refund whose
-      // money left the business, so it is small and every member of it is worth keeping; but it is
-      // retention coupled to a migration that may run much later, and it does not lift itself when
-      // that migration finally does run. components/settings/data-retention.tsx says so.
+      // WHAT THAT COSTS, AND WHAT BOUNDS IT. Until the migration's verification has passed, these
+      // rows outlive the retention period the settings UI promises. The exemption is bounded by that
+      // pass: `scripts/run-migration-verifications.mjs` records it in `migration_verification_passes`
+      // once every check of the migration returned zero (check 7 included), and the NOT EXISTS below
+      // then protects only the witnessed rows check 7 would accuse (see `recoveryAccusedRowSql`);
+      // a clean one expires by age like any other settled row. Check 7 cannot report a deleted row,
+      // so an accused row must never be deleted, and that is what the narrowed exemption guarantees.
+      // A later verification run that FAILS removes the record, so the full protection comes back. The set is bounded by MANUAL OPERATOR RECOVERIES, which are rare.
+      // components/settings/data-retention.tsx says so.
       db.$queryRaw<Array<{ count: number }>>`
         WITH deleted AS (
           DELETE FROM "shopping_sync_logs"
@@ -232,12 +260,7 @@ export async function purgeExpiredData(): Promise<{
              -- protect this DELETE and no future one, and the next reader would write the obvious
              -- negation and be wrong again with nothing in the tree to say so.
              AND NOT (${unresolvedWcOrderRowSql()})
-             AND NOT EXISTS (
-                   SELECT 1
-                     FROM "activity_logs"
-                    WHERE "activity_logs".action = ${WC_REFUND_PARK_RECOVERED_ACTION}
-                      AND "activity_logs".metadata->>'shoppingSyncLogId' = "shopping_sync_logs".id
-                 )
+             AND NOT ${recoveryWitnessRetainsRowSql()}
           RETURNING 1
         )
         SELECT COUNT(*)::int AS count FROM deleted

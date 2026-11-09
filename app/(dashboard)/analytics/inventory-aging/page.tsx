@@ -78,7 +78,7 @@ export default async function InventoryAgingPage({ searchParams }: { searchParam
     { key: 'category', label: 'Category', render: (row) => row.categoryName ?? 'Uncategorised' },
     { key: 'type', label: 'Type', render: (row) => row.productType },
     { key: 'bucket', label: 'Age bucket', render: (row) => `${row.bucket} (${ageLabel(row)})` },
-    { key: 'source', label: 'Source', render: (row) => row.source === 'kit_component' ? 'KIT components' : 'Cost layers' },
+    { key: 'source', label: 'Source', render: () => 'Cost layers' },
     {
       key: 'qty',
       label: 'Qty',
@@ -110,7 +110,6 @@ export default async function InventoryAgingPage({ searchParams }: { searchParam
         { label: 'Aged rows', value: report.pageInfo.totalRows.toLocaleString() },
         { label: 'Quantity', value: report.totals.qty },
         { label: `Value (${currency})`, value: formatMoneyCode(Number(report.totals.valueBase), currency) },
-        { label: 'KIT mode', value: report.kitAgingMode },
       ]}
       notices={report.notices}
       dateMode="as-of"

@@ -10893,7 +10893,7 @@ CRON_JOBS=(
   "0 6 * * *|fx-rates|FX Rate Update"
   "0 3 * * *|activity-cleanup|Activity Log Cleanup"
   "0 2 * * *|backup|Database Backup"
-  "0 4 * * *|wc-reconcile|WooCommerce Reconciliation"
+  "0 * * * *|wc-reconcile|WooCommerce Reconciliation"
   "*/15 * * * *|delivery-status|Delivery Status Check"
   "*/15 * * * *|refund-reservation-release|Refund Reservation Release"
   "*/15 * * * *|wc-withdrawal-sweep|WooCommerce Withdrawal Sweep"

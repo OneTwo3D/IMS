@@ -221,20 +221,32 @@ test('the guard refuses a stamped, declared database that has been set up as an 
   }
 })
 
+test('a database whose only rows are deploy bookkeeping (migration_verification_passes) is stamped; a real application table still refuses', () => {
+  const base = { database: 'ims_ci', requestedName: 'ims_ci', inRecovery: false, isTemplate: false, subscriptionCount: 0 }
+  // The probe no longer reports the bookkeeping table, so an otherwise empty database stamps.
+  const probe = buildPopulatedTableProbe([{ schema: 'public', name: 'migration_verification_passes', kind: 'r' }], 'public')
+  assert.deepEqual(probe.probed, [])
+  assert.equal(refuseToStamp({ ...base, populatedTables: probe.probed }), null)
+  // The refusal is intact for a real application table.
+  assert.match(refuseToStamp({ ...base, populatedTables: ['public.products'] }) ?? '', /holds application data/)
+})
+
 test('the data probe exempts the migration-seeded tables ONLY in the application schema', () => {
   // r8 review L-1: tests the statement the server is sent, not an injected array.
   const relations = [
     { schema: 'public', name: '_prisma_migrations', kind: 'r' },
+    { schema: 'public', name: 'migration_verification_passes', kind: 'r' },
     { schema: 'public', name: 'settings', kind: 'r' },
     { schema: 'public', name: 'shopping_status_mappings', kind: 'r' },
     { schema: 'public', name: 'products', kind: 'r' },
     { schema: 'tenant', name: 'settings', kind: 'r' },
+    { schema: 'tenant', name: 'migration_verification_passes', kind: 'r' },
     { schema: 'tenant', name: 'products', kind: 'p' },
     { schema: 'public', name: 'report_cache', kind: 'm' },
   ]
   const probe = buildPopulatedTableProbe(relations, 'public')
-  assert.deepEqual(probe.exempted, ['public._prisma_migrations', 'public.settings', 'public.shopping_status_mappings'])
-  assert.deepEqual(probe.probed, ['public.products', 'tenant.settings', 'tenant.products', 'public.report_cache'])
+  assert.deepEqual(probe.exempted, ['public._prisma_migrations', 'public.migration_verification_passes', 'public.settings', 'public.shopping_status_mappings'])
+  assert.deepEqual(probe.probed, ['public.products', 'tenant.settings', 'tenant.migration_verification_passes', 'tenant.products', 'public.report_cache'])
   const ims = buildPopulatedTableProbe(
     [{ schema: 'ims', name: 'settings', kind: 'r' }, { schema: 'public', name: 'settings', kind: 'r' }],
     'ims',

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
-import { csvResponseWithNotices, toCsv } from '@/lib/csv'
+import { csvResponseWithNotices, toCsv, wantsCsvMetadataRows } from '@/lib/csv'
 import { db } from '@/lib/db'
 import {
   getBackorderDemandReport,
@@ -81,8 +81,8 @@ export async function GET(req: NextRequest) {
   const filters = filtersFromRequest(req)
   const date = new Date().toISOString().slice(0, 10)
   // The CSV is data rows only. The report's notices (products left unplanned, estimated lead times) ride in a response header,
-  // and follow the data as `#` rows only when the caller asks with ?notices=1.
-  const includeInBody = req.nextUrl.searchParams.get('notices') === '1'
+  // and follow the data as `#` rows only with ?metadata=1 (the dashboard links) or ?notices=1.
+  const includeInBody = wantsCsvMetadataRows(req) || req.nextUrl.searchParams.get('notices') === '1'
 
   try {
     switch (type) {

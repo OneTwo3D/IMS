@@ -5,7 +5,7 @@ import test, { mock } from 'node:test'
 import { NextRequest } from 'next/server'
 
 import { CSV_EXPORT_NOTICES_HEADER } from '@/lib/csv'
-import { csvHrefWithNotices } from '@/lib/csv-links'
+import { reportCsvHref } from '../../app/(dashboard)/analytics/_components/report-utils.ts'
 
 const NOTICE = 'No claimed recipe: component demand not planned for 1 BOM product(s) that need building: BOM-1.'
 const emptyReport = { generatedAt: 'x', rows: [], pageInfo: { totalRows: 0 }, totals: {}, notices: [NOTICE] }
@@ -41,7 +41,7 @@ test('replenishment export: notices in the header by default, appended as # rows
     assert.ok(!plainBody.includes('BOM-1') && !plainBody.includes('#'), `${type}: body is data rows only`)
     const withRows = await GET(new NextRequest(`http://localhost/api/export/replenishment?type=${type}&notices=1`))
     const body = await withRows.text()
-    assert.match(body, /\r\n# IMS export metadata\r\n/, type)
+    assert.match(body, /\r\n# IMS export notices\r\n/, type)
     assert.ok(body.includes('BOM-1'), type)
   }
 })
@@ -57,16 +57,19 @@ test('manufacturing export: the same for production variance and WIP', async () 
   }
 })
 
-test('the in-app download links ask for the notices', () => {
-  assert.equal(csvHrefWithNotices('/api/export/replenishment?type=reorder'), '/api/export/replenishment?type=reorder&notices=1')
-  assert.equal(csvHrefWithNotices('/api/export/x'), '/api/export/x?notices=1')
-  assert.equal(new URL(csvHrefWithNotices('/api/export/x?a=1'), 'http://h').searchParams.get('notices'), '1')
-  assert.equal(csvHrefWithNotices('/api/export/x?a=1#top'), '/api/export/x?a=1&notices=1#top')
+test('?metadata=1 (what the in-app links send) opts in as well as ?notices=1', async () => {
+  const { GET } = await import('../../app/api/export/replenishment/route.ts')
+  const response = await GET(new NextRequest('http://localhost/api/export/replenishment?type=reorder&metadata=1'))
+  assert.ok((await response.text()).includes('BOM-1'))
+})
+
+test('the in-app download links carry the opt-in', () => {
+  const href = reportCsvHref('/api/export/replenishment', new URLSearchParams('a=1'), { type: 'reorder' })
+  assert.equal(new URL(href, 'http://h').searchParams.get('metadata'), '1')
   const read = (path: string) => readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8')
-  const shared = read('app/(dashboard)/analytics/_components/stock-position-report.tsx')
-  assert.match(shared, /exportCarriesNotices \? csvHrefWithNotices\(plainCsvHref\)/)
+  assert.match(read('app/(dashboard)/analytics/_components/stock-position-report.tsx'), /reportCsvHref\(exportBasePath, params, \{ type: reportKey \}\)/)
   for (const page of ['reorder', 'backorder', 'component-shortage']) {
-    assert.match(read(`app/(dashboard)/analytics/${page}/page.tsx`), /exportBasePath="\/api\/export\/replenishment"\s+exportCarriesNotices\b/, page)
+    assert.match(read(`app/(dashboard)/analytics/${page}/page.tsx`), /exportBasePath="\/api\/export\/replenishment"/, page)
   }
-  assert.match(read('app/(dashboard)/analytics/_components/manufacturing-analytics-report.tsx'), /csvHrefWithNotices\(`\/api\/export\/manufacturing-analytics\?/)
+  assert.match(read('app/(dashboard)/analytics/_components/manufacturing-analytics-report.tsx'), /reportCsvHref\('\/api\/export\/manufacturing-analytics', params/)
 })

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
-import { csvResponseWithNotices, toCsv } from '@/lib/csv'
+import { csvResponseWithNotices, toCsv, wantsCsvMetadataRows } from '@/lib/csv'
 import {
   getProductionVarianceReport,
   getWipReport,
@@ -47,8 +47,8 @@ export async function GET(req: NextRequest) {
   const filters = filtersFromRequest(req)
   const reportType = req.nextUrl.searchParams.get('report') ?? 'production-variance'
   const date = new Date().toISOString().slice(0, 10)
-  // Data rows only; the report's notices ride in a response header, and follow the data as `#` rows only with ?notices=1.
-  const includeInBody = req.nextUrl.searchParams.get('notices') === '1'
+  // Data rows only; the report's notices ride in a response header, and follow the data as `#` rows only with ?metadata=1 or ?notices=1.
+  const includeInBody = wantsCsvMetadataRows(req) || req.nextUrl.searchParams.get('notices') === '1'
 
   try {
     switch (reportType) {

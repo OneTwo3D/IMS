@@ -2451,7 +2451,7 @@ test('gross margin: off-row credit that CAN only lower the figure keeps its ≤,
  */
 async function exportedCsv(reportType: string, report: { rows: Record<string, unknown>[]; totals: Record<string, string> }) {
   const { salesAnalyticsCsvResponse } = await import('@/app/api/export/sales-analytics/route')
-  const response = salesAnalyticsCsvResponse(reportType as never, report, WINDOW, '2026-06-30')
+  const response = salesAnalyticsCsvResponse(reportType as never, report, WINDOW, '2026-06-30', { url: 'https://ims.test/api/export/sales-analytics?metadata=1' })
   return response.text()
 }
 
