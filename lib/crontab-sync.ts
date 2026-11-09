@@ -20,6 +20,7 @@ export const OTI_CRON_END_MARKER = '# --- OTI CRON END ---'
 // equality left whitespace- or CRLF-suffixed markers unmatched, so old blocks
 // survived as live duplicates).
 import { resolveCronEnablement } from '@/lib/domain/settings/cron-enablement'
+import { isSafePublicBaseUrl } from '@/lib/domain/settings/public-app-url-input'
 import {
   heartbeatCheckSlug,
   heartbeatChecksFor,
@@ -371,6 +372,9 @@ export function buildOtiCrontabBlock(params: {
 
   if (secretRef.kind === 'env-file' && !isCronSafePath(secretRef.envFilePath)) {
     return { ok: false, error: 'App .env path contains characters cron cannot carry safely (quote, %, or control characters).' }
+  }
+  if (!isSafePublicBaseUrl(baseUrl)) {
+    return { ok: false, error: 'The public app URL is not a plain https URL (it holds spaces, control or shell characters, credentials, a query or a fragment), so the crontab was NOT written. Save a valid Public App URL in Settings.' }
   }
   if (!isCronSafePath(logPath)) {
     return { ok: false, error: 'Cron log path contains characters cron cannot carry safely (quote, %, or control characters).' }

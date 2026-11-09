@@ -1807,6 +1807,9 @@ export async function updateManufacturingCostLines(
 ): Promise<{ success: boolean; error?: string; warning?: string }> {
   try {
     await requirePermission('manufacturing')
+    // Cost lines set unit costs and, on a completed order, queue a ledger journal: warehouse staff run
+    // the floor but do not price or post. Same permission that guards product cost prices.
+    await requirePermission('inventory.prices')
 
     const po = await db.productionOrder.findUnique({
       where: { id: productionOrderId },
@@ -1818,6 +1821,19 @@ export async function updateManufacturingCostLines(
     const parsed = parseManufacturingCostLines(lines, Number(po.fxRateToBase))
     if (!parsed.success) return { success: false, error: parsed.error }
     const cleaned = parsed.lines
+
+    // A per-line account override is credited by the reclass journal, so it is not a free-text field:
+    // it must be the Manufacturing Overhead account the accounting settings configure.
+    if (cleaned.some((line) => line.accountCode)) {
+      const configuredOverhead = (await getAccountingSettings()).manufacturingOverheadAccount?.trim() ?? ''
+      const refused = cleaned.find((line) => line.accountCode && line.accountCode !== configuredOverhead)
+      if (refused) {
+        return {
+          success: false,
+          error: 'A cost-line account override must be the Manufacturing Overhead account configured in Settings. Clear the override to use the default.',
+        }
+      }
+    }
 
     let cogsDeltaBase = 0
     let inventoryDeltaBase = 0

@@ -13,6 +13,30 @@ export type PublicAppUrlNormalization =
   | { ok: true; url: string }
   | { ok: false; error: string }
 
+/**
+ * The public base URL is written into the managed crontab (`BASE_URL="<url>/api/cron"`) and every cron job
+ * sends the cron secret to it, so it must be a plain origin plus an optional path: an absolute https URL
+ * (http only for a loopback host), no userinfo, query or fragment, and only characters that carry no meaning
+ * to cron or the shell. Control characters, whitespace, quotes, `$`, backtick, backslash and `%` all fail
+ * the character allowlist. The same predicate gates the write and the crontab render, so a bad value that
+ * is already stored is refused at render rather than spliced in.
+ */
+const SAFE_URL_CHARS = /^[A-Za-z0-9\-._~:/[\]]+$/
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
+
+export function isSafePublicBaseUrl(value: string): boolean {
+  if (!SAFE_URL_CHARS.test(value)) return false
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    return false
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash || value.includes('?') || value.includes('#')) return false
+  if (parsed.protocol === 'http:') return LOOPBACK_HOSTS.has(parsed.hostname)
+  return parsed.protocol === 'https:'
+}
+
 export function normalizePublicAppUrl(value: string): PublicAppUrlNormalization {
   const normalized = value.trim().replace(/\/+$/, '')
   if (!normalized) return { ok: false, error: 'Enter the public base URL.' }
@@ -24,7 +48,13 @@ export function normalizePublicAppUrl(value: string): PublicAppUrlNormalization 
     return { ok: false, error: 'Enter a valid URL.' }
   }
   if (!['http:', 'https:'].includes(parsed.protocol)) {
-    return { ok: false, error: 'URL must start with http:// or https://' }
+    return { ok: false, error: 'URL must start with https://' }
+  }
+  if (!isSafePublicBaseUrl(normalized)) {
+    return {
+      ok: false,
+      error: 'URL must be an https:// address (http:// only for localhost) with no spaces, credentials, query, fragment or special characters.',
+    }
   }
   return { ok: true, url: normalized }
 }

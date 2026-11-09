@@ -169,7 +169,7 @@ Each line records:
 
 - **Description** (e.g. "Labour", "Machine time")
 - **Amount** in the order's currency
-- **Account override** (optional) — leave blank to credit the default Manufacturing Overhead account from Settings; enter an account code to route this specific line to a different GL account (e.g. "Wages" for labour, "Utilities" for power)
+- **Account override** (optional) — leave blank to credit the default Manufacturing Overhead account from Settings; an override must be the Manufacturing Overhead account configured in Settings, so in practice leave it blank (any other code is refused). Editing cost lines needs the cost-price permission (Admin, Manager or Finance), not the warehouse role
 
 ### How costs are capitalised
 

@@ -387,14 +387,12 @@ export async function saveWcCredentials(url: string, key: string, secret: string
   const nextKey = key.trim()
   const nextSecret = secret.trim()
   const incomingKeyIsMasked = isMaskedSecret(nextKey)
-  const currentKey = incomingKeyIsMasked
-    ? await getSettingValue('wc_consumer_key')
-    : nextKey
   const incomingSecretIsMasked = isMaskedSecret(nextSecret)
   const shouldReuseStoredSecret = incomingSecretIsMasked || !nextSecret
-  const currentSecret = shouldReuseStoredSecret
-    ? await getSettingValue('wc_consumer_secret')
-    : nextSecret
+  const resolved = await resolveWcCredentialsForUrl(validatedUrl.normalizedUrl, nextKey, nextSecret)
+  if (!resolved.ok) return { success: false, wipedMappings: 0, error: resolved.error }
+  const currentKey = resolved.key
+  const currentSecret = resolved.secret
   const currencyValidation = await validateWooStoreBaseCurrency({
     url: validatedUrl.normalizedUrl,
     key: currentKey ?? '',
@@ -616,6 +614,36 @@ export async function resetWcProductIdCache(): Promise<{ success: boolean; wiped
   return { success: true, wipedMappings: wipedCount }
 }
 
+/**
+ * STORED CREDENTIALS GO ONLY TO THE STORED STORE URL.
+ *
+ * The consumer key and secret are sent to the URL being tested or saved. A masked or blank field means
+ * "keep what is stored", which is only safe while the destination is the store the credentials were
+ * issued for; against any other URL it would hand them to a host the caller chose. So a reuse is
+ * refused unless the normalised URL equals the normalised stored one, and a different URL needs the
+ * key and secret typed in the same request.
+ */
+async function resolveWcCredentialsForUrl(
+  normalizedUrl: string,
+  nextKey: string,
+  nextSecret: string,
+): Promise<{ ok: true; key: string; secret: string } | { ok: false; error: string }> {
+  const reuseKey = isMaskedSecret(nextKey)
+  const reuseSecret = isMaskedSecret(nextSecret) || !nextSecret
+  if (!reuseKey && !reuseSecret) return { ok: true, key: nextKey, secret: nextSecret }
+
+  const storedUrl = await getSettingValue('wc_url')
+  const storedValidated = storedUrl ? validateWooCommerceBaseUrl(storedUrl) : null
+  if (!storedValidated || !storedValidated.ok || storedValidated.normalizedUrl !== normalizedUrl) {
+    return { ok: false, error: 'Enter the consumer key and secret to use a store URL other than the saved one. Saved credentials are only used with the saved URL.' }
+  }
+  return {
+    ok: true,
+    key: reuseKey ? ((await getSettingValue('wc_consumer_key')) ?? '') : nextKey,
+    secret: reuseSecret ? ((await getSettingValue('wc_consumer_secret')) ?? '') : nextSecret,
+  }
+}
+
 export async function testWcCredentials(url: string, key: string, secret: string): Promise<{ success: boolean; error?: string; message?: string }> {
   await requireFreshAdmin()
 
@@ -624,10 +652,10 @@ export async function testWcCredentials(url: string, key: string, secret: string
     return { success: false, error: validatedUrl.error }
   }
 
-  const nextKey = key.trim()
-  const nextSecret = secret.trim()
-  const currentKey = isMaskedSecret(nextKey) ? await getSettingValue('wc_consumer_key') : nextKey
-  const currentSecret = isMaskedSecret(nextSecret) || !nextSecret ? await getSettingValue('wc_consumer_secret') : nextSecret
+  const resolved = await resolveWcCredentialsForUrl(validatedUrl.normalizedUrl, key.trim(), secret.trim())
+  if (!resolved.ok) return { success: false, error: resolved.error }
+  const currentKey = resolved.key
+  const currentSecret = resolved.secret
   const fingerprint = buildWooCommerceConnectionFingerprint({
     url: validatedUrl.normalizedUrl,
     key: currentKey ?? '',

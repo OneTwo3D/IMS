@@ -8,6 +8,13 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Security: scheduler URL, purchasing analytics, cost-line journals, WooCommerce test
+
+- **Fixed: the Public App URL is validated strictly and cannot inject into the managed crontab.** The value is stored as typed, so a newline (or a quote, `$`, backtick, `%`) inside an otherwise parseable URL became part of the crontab. It must now be an `https://` URL (`http://` only for `localhost` or `127.0.0.1`) with no whitespace, control or shell characters, credentials, query or fragment. The crontab builder applies the same rule to the stored value and refuses to write the crontab if it fails. Saved cron schedules were already validated field by field and are unchanged.
+- **Fixed: the five purchasing-analytics pages (open POs, purchase price variance, spend, supplier performance, lead times) are restricted to Admin, Manager and Finance,** matching their CSV export and the sidebar. Other roles are sent back to the dashboard before any report is read.
+- **Fixed: editing manufacturing cost lines needs the cost-price permission, and an account override must be the configured Manufacturing Overhead account.** A warehouse user could previously queue a reclass journal to any account code. An existing line whose override is some other code is refused on the next save until the override is cleared.
+- **Fixed: saved WooCommerce credentials are only used with the saved store URL.** Testing or saving a different URL with a masked key or blank secret is refused; the key and secret must be typed in the same request.
+
 ### No tax type, no sales document
 
 - **Changed: a sales invoice or credit note line with no tax type is refused instead of posting on "No VAT".** The Xero connector no longer defaults a missing `TaxType` to `NONE` on sales invoices, sales invoice updates or credit notes (supplier bills and supplier credit notes are unchanged). The refusal is an ordinary failed sync row on /sync, raised at the head of the poster case and again in the connector, before any contact, item or document request. An explicit `NONE` is refused too unless the line names an allowed kind; the only one today is a WooCommerce fee the shop charged no tax on. Shipping and the order discount can never be on `NONE`.
