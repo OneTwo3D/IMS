@@ -51,7 +51,10 @@ if (!skip) {
 const ENV_KEYS = ['PRODUCER_HOLD_ENFORCED_DESTINATIONS', 'WC_WRITEBACK_ALLOWED_ORIGIN', 'WC_WRITES_LIVE_FROM']
 const DAY = 86_400_000
 const iso = (date: Date) => date.toISOString().replace(/\.\d+Z$/, 'Z')
-const LIVE = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', WC_WRITES_LIVE_FROM: iso(new Date(Date.now() - DAY)) }
+// Fixture orders are 30 days old and the storefront went live 60 days ago: another test file in the same database runs the invoice-document
+// sweep with a floor of yesterday, and an order older than that floor is none of its business.
+const FIXTURE_AGE_DAYS = 30
+const LIVE = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', WC_WRITES_LIVE_FROM: iso(new Date(Date.now() - 60 * DAY)) }
 const HELD = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce' }
 
 async function withEnv<T>(values: Record<string, string>, fn: () => Promise<T>): Promise<T> {
@@ -94,7 +97,7 @@ async function setFlag(d: Deps, value: string | null) {
 /** An order with a storefront link and (unless asked not to) a stored, servable invoice document. */
 async function seedOrder(d: Deps, options: { stored?: boolean; ageDays?: number; accountingInvoiceId?: string } = {}) {
   const suffix = randomUUID().slice(0, 8)
-  const createdAt = new Date(Date.now() - (options.ageDays ?? 0) * DAY)
+  const createdAt = new Date(Date.now() - (options.ageDays ?? FIXTURE_AGE_DAYS) * DAY)
   const order = await d.db.salesOrder.create({
     data: {
       orderNumber: `IPUB-${suffix}`,
@@ -130,11 +133,19 @@ async function cleanup(d: Deps, orderIds: string[]) {
   const keys = { OR: orderIds.map((id) => ({ idempotencyKey: { contains: id } })) }
   await d.db.integrationOutbox.deleteMany({ where: keys })
   await d.db.outboundShadowWrite.deleteMany({ where: { subjectId: { in: orderIds } } })
-  await d.db.invoiceStorePublication.deleteMany({ where: { orderId: { in: orderIds } } })
-  await d.db.salesOrderInvoiceDocument.deleteMany({ where: { orderId: { in: orderIds } } })
-  await d.db.invoiceDocumentFetchState.deleteMany({ where: { orderId: { in: orderIds } } })
-  await d.db.shoppingOrderLink.deleteMany({ where: { orderId: { in: orderIds } } })
-  await d.db.salesOrder.deleteMany({ where: { id: { in: orderIds } } })
+  // Retried: a test file running in parallel on the same database can create a fetch state for an order between these two deletes.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await d.db.invoiceStorePublication.deleteMany({ where: { orderId: { in: orderIds } } })
+      await d.db.salesOrderInvoiceDocument.deleteMany({ where: { orderId: { in: orderIds } } })
+      await d.db.invoiceDocumentFetchState.deleteMany({ where: { orderId: { in: orderIds } } })
+      await d.db.shoppingOrderLink.deleteMany({ where: { orderId: { in: orderIds } } })
+      await d.db.salesOrder.deleteMany({ where: { id: { in: orderIds } } })
+      break
+    } catch (error) {
+      if (attempt >= 4) throw error
+    }
+  }
   await setFlag(d, null)
 }
 
@@ -245,14 +256,14 @@ test('A HELD OR REJECTED WRITE IS A RETRY: no marker is saved, the row stays ret
 test('NOT IMS\'S TO PUBLISH: an order older than the live-from instant is never queued; a withdrawn document is not scanned and not published', { skip }, async (t) => {
   const d = await setup()
   resetTransport()
-  const old = await seedOrder(d, { ageDays: 10 })
+  const old = await seedOrder(d, { ageDays: 90 })
   const withdrawn = await seedOrder(d)
   t.after(() => cleanup(d, [old.id, withdrawn.id]))
   await setFlag(d, 'true')
   await d.db.salesOrderInvoiceDocument.updateMany({ where: { orderId: withdrawn.id }, data: { withdrawnAt: new Date() } })
   await withEnv(LIVE, async () => {
     await d.jobs.enqueueInvoiceDocumentPublications({ orderIds: [old.id, withdrawn.id] })
-    assert.equal((await jobsFor(d, old.id)).length, 0, 'created before the live-from instant: left out')
+    assert.equal((await jobsFor(d, old.id)).length, 0, 'created before the live-from instant (90 days old, live from 60): left out')
     assert.equal((await jobsFor(d, withdrawn.id)).length, 0, 'withdrawn: left out')
     // A document withdrawn AFTER it was queued: the attempt re-reads IMS and writes nothing.
     const later = await seedOrder(d)
