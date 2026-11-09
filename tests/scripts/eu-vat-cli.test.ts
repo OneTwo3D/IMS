@@ -75,14 +75,16 @@ test('the seed command applies only with --apply --confirm <digest>, hands the d
 
 test('nothing in the preflight, the seed or their commands can reach Xero, WooCommerce or a network: a source scan', () => {
   const files = ['lib/tax/eu-vat-seed.ts', 'lib/tax/eu-vat-preflight.ts', 'lib/tax/eu-vat-cli.ts', 'scripts/eu-vat-preflight.ts', 'scripts/eu-vat-seed.ts', 'lib/connectors/xero/scheme-posting-drift.ts', 'lib/domain/accounting/eu-vat-settings.ts']
-  const allowedXeroImports = new Set(['tax-rate-list', 'tax-rate-report-type', 'connection-fence'])
+  const bareFetch = /\bfetch\s*\(|wcFetch|xeroFetch|node:https?|node:net\b|axios|undici/
+  // Xero: the pure list shape, the report-type helper and the connection read. WooCommerce: only the stored-settings reader and the pure URL normaliser (no request is made by either).
+  const allowedImports: Record<string, Set<string>> = { xero: new Set(['tax-rate-list', 'tax-rate-report-type', 'connection-fence']), woocommerce: new Set(['api', 'tax-rate-plan']) }
   for (const file of files) {
     const source = readFileSync(new URL(`../../${file}`, import.meta.url), 'utf8')
-    assert.doesNotMatch(source, /\bfetch\s*\(|wcFetch|xeroFetch|node:https?|node:net\b|axios|undici/, `${file} makes no request`)
+    assert.doesNotMatch(source, bareFetch, `${file} makes no request`)
     for (const m of source.matchAll(/from ['"](?:@\/lib|\.\.\/lib|\.)\/connectors\/(xero|woocommerce|mintsoft)\/([\w-]+)['"]|import\(['"](?:@\/lib|\.\.\/lib)\/connectors\/(xero|woocommerce|mintsoft)\/([\w-]+)(?:\.ts)?['"]\)/g)) {
       const connector = m[1] ?? m[3]
       const imported = m[2] ?? m[4]
-      assert.ok(connector === 'xero' && allowedXeroImports.has(imported!), `${file} imports connectors/${connector}/${imported}`)
+      assert.ok(allowedImports[connector!]?.has(imported!) === true, `${file} imports connectors/${connector}/${imported}`)
     }
     assert.doesNotMatch(source, /(?:tx|db|client)\.(?:xeroTaxRate|xeroTaxRateList|accountingSyncLog|accountingEvent|shoppingTaxRateMapping)\.(?:create|update|upsert|delete)/, `${file} writes no mapping, no Xero cache and no ledger row`)
   }

@@ -36,14 +36,18 @@ function replaceProcessEnv(env: Record<string, string>): void {
 }
 
 async function defaultDeps(): Promise<EuVatPreflightDeps> {
-  const [{ readEuVatPreflightInput, evaluateEuVatPreflight }, { loadEuVatSeed }, { db }, { captureXeroConnection }] = await Promise.all([
+  const [{ readEuVatPreflightInput, evaluateEuVatPreflight }, { loadEuVatSeed }, { db }, { captureXeroConnection }, { getWcCredentials }, { normaliseStoreIdentity }] = await Promise.all([
     import('../lib/tax/eu-vat-preflight.ts'), import('../lib/tax/eu-vat-seed.ts'), import('../lib/db/index.ts'), import('../lib/connectors/xero/connection-fence.ts'),
+    // Both only read the stored settings and normalise a URL: no request is made.
+    import('../lib/connectors/woocommerce/api.ts'), import('../lib/connectors/woocommerce/tax-rate-plan.ts'),
   ])
   return {
     run: async () => {
       const seed = loadEuVatSeed()
       const connection = await captureXeroConnection()
-      const input = await readEuVatPreflightInput(db as unknown as Parameters<typeof readEuVatPreflightInput>[0], seed, new Date(), connection?.tenantId ?? null)
+      const creds = await getWcCredentials().catch(() => null)
+      const storeIdentity = creds === null ? null : normaliseStoreIdentity(creds.url)
+      const input = await readEuVatPreflightInput(db as unknown as Parameters<typeof readEuVatPreflightInput>[0], seed, new Date(), connection?.tenantId ?? null, storeIdentity)
       return evaluateEuVatPreflight(input)
     },
     disconnect: async () => {

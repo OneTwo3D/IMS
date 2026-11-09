@@ -39,16 +39,20 @@ function replaceProcessEnv(env: Record<string, string>): void {
 }
 
 async function defaultDeps(): Promise<EuVatSeedDeps> {
-  const [{ applyEuVatSeed, planEuVatSeedApply, readEuVatImsSide }, { loadEuVatSeed }, { db }] = await Promise.all([
-    import('../lib/tax/eu-vat-preflight.ts'), import('../lib/tax/eu-vat-seed.ts'), import('../lib/db/index.ts'),
+  const [{ applyEuVatSeed, readEuVatSeedPlan }, { loadEuVatSeed }, { db }, { captureXeroConnection }, { getWcCredentials }, { normaliseStoreIdentity }] = await Promise.all([
+    import('../lib/tax/eu-vat-preflight.ts'), import('../lib/tax/eu-vat-seed.ts'), import('../lib/db/index.ts'), import('../lib/connectors/xero/connection-fence.ts'),
+    // Both only read the stored settings and normalise a URL: no request is made.
+    import('../lib/connectors/woocommerce/api.ts'), import('../lib/connectors/woocommerce/tax-rate-plan.ts'),
   ])
-  type Tx = Parameters<typeof readEuVatImsSide>[0]
   return {
     run: async ({ apply, confirm }) => {
       const seed = loadEuVatSeed()
-      if (apply && confirm !== null) return applyEuVatSeed(db as unknown as Parameters<typeof applyEuVatSeed>[0], seed, confirm)
+      const connection = await captureXeroConnection()
+      const creds = await getWcCredentials().catch(() => null)
+      const ctx = { connectedTenantId: connection?.tenantId ?? null, storeIdentity: creds === null ? null : normaliseStoreIdentity(creds.url) }
+      if (apply && confirm !== null) return applyEuVatSeed(db as unknown as Parameters<typeof applyEuVatSeed>[0], seed, confirm, ctx)
       // The dry run: read only.
-      const plan = planEuVatSeedApply({ seed, ...(await readEuVatImsSide(db as unknown as Tx)) })
+      const plan = await readEuVatSeedPlan(db as unknown as Parameters<typeof readEuVatSeedPlan>[0], seed, ctx)
       return { applied: false, plan, refusal: null }
     },
     disconnect: async () => {

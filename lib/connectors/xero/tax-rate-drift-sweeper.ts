@@ -196,10 +196,20 @@ export async function runXeroTaxRateDriftSweep(): Promise<TaxRateDriftSweepResul
   const { computeSchemePostingDrift } = await import('./scheme-posting-drift')
   const result = await sweepTaxRateDrift({
     async checkSchemePosting() {
-      const rates = await db.taxRate.findMany({ where: { active: true, schemePostingTaxType: { not: null } }, select: { id: true, name: true, schemePostingTaxType: true, reportingCategory: true, accountingTaxType: true } })
-      const expectedNames = new Map<string, string>()
-      for (const declared of loadEuVatSeed().rates) if (declared.schemePostingTaxType !== null && declared.schemePostingXeroName !== null) expectedNames.set(declared.schemePostingTaxType, declared.schemePostingXeroName)
-      return computeSchemePostingDrift(rates.flatMap((r) => (r.schemePostingTaxType === null ? [] : [{ taxRateId: r.id, name: r.name, schemePostingTaxType: r.schemePostingTaxType, reportingCategory: r.reportingCategory, accountingTaxType: r.accountingTaxType }])), fetchedRows, expectedNames)
+      // Only settings are read (no request): the store configured now, to match the declared mappings against.
+      const [{ getWcCredentials }, { normaliseStoreIdentity }] = await Promise.all([import('@/lib/connectors/woocommerce/api'), import('@/lib/connectors/woocommerce/tax-rate-plan')])
+      const creds = await getWcCredentials().catch(() => null)
+      const [rates, mappings] = await Promise.all([
+        db.taxRate.findMany({ select: { id: true, name: true, active: true, schemePostingTaxType: true, reportingCategory: true, accountingTaxType: true } }),
+        db.shoppingTaxRateMapping.findMany({ where: { connector: 'woocommerce' }, select: { externalTaxRateId: true, taxRateId: true, storeIdentity: true, externalCountry: true, externalRatePct: true, externalClass: true } }),
+      ])
+      return computeSchemePostingDrift({
+        declared: loadEuVatSeed().rates,
+        mappings: mappings.map((m) => ({ ...m, externalRatePct: m.externalRatePct.toFixed() })),
+        rates: rates.map((r) => ({ taxRateId: r.id, name: r.name, active: r.active, accountingTaxType: r.accountingTaxType, reportingCategory: r.reportingCategory, schemePostingTaxType: r.schemePostingTaxType })),
+        storeIdentity: creds === null ? null : normaliseStoreIdentity(creds.url),
+        xero: fetchedRows,
+      })
     },
     async loadImsProfiles() {
       const rows = await db.taxRate.findMany({

@@ -120,7 +120,7 @@ test('an already seeded world has nothing to apply', () => {
   assert.equal(plan.unchanged, 65)
 })
 
-test('rates that cannot be touched are skipped with a reason, and the apply never writes through a mapping made against another store', () => {
+test('rates that cannot be touched are skipped with the preflight\'s reason, and the apply never writes through a mapping made against another store', () => {
   const plan = planEuVatSeedApply(withWorld((w) => {
     for (const [id, r] of w.ims) w.ims.set(id, { ...r, schemePostingTaxType: null, reportingCategory: null })
     w.mappings.delete(215)
@@ -133,6 +133,43 @@ test('rates that cannot be touched are skipped with a reason, and the apply neve
   const reasons = Object.fromEntries(plan.skipped.map((s) => [s.wooId, s.reason]))
   assert.deepEqual(reasons, { 215: 'WOO_UNMAPPED', 216: 'MAPPING_DIFFERS', 217: 'IMS_RATE_INACTIVE', 218: 'IMS_RATE_NOT_SALES', 219: 'IMS_RATE_MISSING', 151: 'SHARED_IMS_ROW', 152: 'SHARED_IMS_ROW' })
   assert.equal(plan.changes.some((c) => [215, 216, 217, 218, 219].includes(c.wooId)), false)
+})
+
+test('a foreign, unstamped or unidentifiable store never enters the plan or passes the preflight, and the store is bound into the digest', () => {
+  const clear = (w: World): void => { for (const [id, r] of w.ims) w.ims.set(id, { ...r, schemePostingTaxType: null, reportingCategory: null }) }
+  const base = planEuVatSeedApply(withWorld(clear))
+  const foreign = withWorld((w) => { clear(w); w.mappings.set(220, { ...w.mappings.get(220)!, storeIdentity: 'https://other.example' }) })
+  const unstamped = withWorld((w) => { clear(w); w.mappings.set(220, { ...w.mappings.get(220)!, storeIdentity: null }) })
+  assert.deepEqual(planEuVatSeedApply(foreign).skipped.map((s) => [s.wooId, s.reason]), [[220, 'MAPPING_OTHER_STORE']])
+  assert.deepEqual(planEuVatSeedApply(unstamped).skipped.map((s) => [s.wooId, s.reason]), [[220, 'MAPPING_UNSTAMPED']])
+  assert.equal(planEuVatSeedApply(foreign).changes.some((c) => c.wooId === 220), false)
+  assert.ok(codesOf(foreign).includes('MAPPING_OTHER_STORE'))
+  assert.ok(codesOf(unstamped).includes('MAPPING_UNSTAMPED'))
+  const none = planEuVatSeedApply({ ...withWorld(clear), storeIdentity: null })
+  assert.equal(none.changes.length, 0)
+  assert.equal(new Set(none.skipped.map((s) => s.reason)).size, 1)
+  assert.equal(none.skipped[0]!.reason, 'STORE_NOT_IDENTIFIED')
+  assert.ok(codesOf({ ...withWorld(clear), storeIdentity: null }).includes('STORE_NOT_IDENTIFIED'))
+  assert.notEqual(planEuVatSeedApply({ ...withWorld(clear), storeIdentity: 'https://shop2.example' }).digest, base.digest, 'the configured store is in the digest')
+})
+
+test('a row enters the plan only if its identity and charged code are right, and what the plan judged is bound into the digest', () => {
+  const clear = (w: World): void => { for (const [id, r] of w.ims) w.ims.set(id, { ...r, schemePostingTaxType: null, reportingCategory: null }) }
+  const base = planEuVatSeedApply(withWorld(clear))
+  assert.ok(base.changes.every((c) => c.identity.charged.code !== '' && c.identity.scheme !== null))
+  const skippedReason = (mutate: (w: World) => void, id = 220): string | undefined => planEuVatSeedApply(withWorld((w) => { clear(w); mutate(w) })).skipped.find((s) => s.wooId === id)?.reason
+  assert.equal(skippedReason((w) => { setIms(w, 220, { rate: '0.2100' }) }), 'IMS_PERCENT_DIFFERS')
+  assert.equal(skippedReason((w) => { setIms(w, 220, { countryCode: 'AT' }) }), 'IMS_COUNTRY_DIFFERS')
+  assert.equal(skippedReason((w) => { setIms(w, 220, { name: 'Germany VAT' }) }), 'IMS_NAME_DIFFERS')
+  assert.equal(skippedReason((w) => { setIms(w, 220, { accountingTaxType: 'NONE' }) }), 'CHARGED_TYPE_NONE')
+  assert.equal(skippedReason((w) => { setIms(w, 220, { accountingTaxType: null }) }), 'CHARGED_TYPE_MISSING')
+  assert.equal(skippedReason((w) => { setIms(w, 220, { accountingTaxType: 'TAX001' }) }), 'CHARGED_TYPE_NOT_IN_XERO')
+  assert.equal(skippedReason((w) => { w.xero.set('TAX131', xeroType('TAX131', 'DE IOSS VAT', '19.0000')) }), 'SCHEME_NOT_ZERO')
+  assert.equal(skippedReason((w) => { w.xero.delete('TAX131') }), 'SCHEME_TYPE_NOT_IN_XERO')
+  // A change in a fact the plan judged moves the digest even where the row stays plannable (the percentage Xero states for the charged type is not one: it skips, so use the identity of a type).
+  const renamed = planEuVatSeedApply(withWorld((w) => { clear(w); w.xero.set('TAXC239', xeroType('TAXC239', 'NO VAT', '25.0000')) }))
+  assert.equal(renamed.digest, base.digest, 'control: an equal Xero fact leaves the digest alone')
+  assert.equal(planEuVatSeedApply({ ...withWorld(clear), xero: { proven: false, reason: 'x' } }).changes.length, 0, 'no proven Xero list, no plan')
 })
 
 test('the apply sets the marker only where declared and never clears a category it did not set', () => {

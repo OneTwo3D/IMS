@@ -6,7 +6,7 @@ import { config } from 'dotenv'
 
 /**
  * THE EU IOSS / VOEC SEED APPLY, COMMITTED, AGAINST A REAL DATABASE (the plan, the preflight and the command line are unit-tested in tests/tax/eu-vat-preflight.test.ts and
- * tests/scripts/eu-vat-cli.test.ts). It seeds its own tagged IMS rates and WooCommerce mappings for three declared rates (Woo 112 UK VAT, 220 DE VAT, 239 NO VAT) and removes only those by id. The
+ * tests/scripts/eu-vat-cli.test.ts). It seeds its own IMS rates, stamped WooCommerce mappings and a stored Xero list (tenant tagged per run) for three declared rates (Woo 112 UK VAT, 220 DE VAT, 239 NO VAT) and removes only those by id; the Xero store, like the mappings, must be empty of anything else (precondition, before any write). The
  * mappings' external ids are the declared ones, so the run FAILS LOUDLY at the precondition, before any write, when the database already holds a mapping with one of them.
  *
  * What it pins: a dry run writes nothing; a wrong or missing digest writes nothing; the right digest sets schemePostingTaxType and reportingCategory on the two scheme rates and nothing else (the UK
@@ -21,19 +21,24 @@ const skip = !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1 (npm run test:concurrency)'
 const run = randomBytes(4).toString('hex')
 const TAG = `ZQEU${run} `
 const WOO = { uk: 112, de: 220, no: 239 } as const
+const TENANT = `tenant-eu-${run}`
+const STORE = 'https://shop.example'
+const CTX = { connectedTenantId: TENANT, storeIdentity: STORE }
 
 async function loadDeps() {
   config({ path: '.env.local', quiet: true })
   config({ quiet: true })
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required when RUN_DB_CONCURRENCY_TESTS=1')
-  const [{ db }, pre, seedLib] = await Promise.all([import('../../lib/db/index.ts'), import('../../lib/tax/eu-vat-preflight.ts'), import('../../lib/tax/eu-vat-seed.ts')])
-  return { db, pre, seed: seedLib.loadEuVatSeed() }
+  const [{ db }, pre, seedLib, listLib, drift] = await Promise.all([import('../../lib/db/index.ts'), import('../../lib/tax/eu-vat-preflight.ts'), import('../../lib/tax/eu-vat-seed.ts'), import('../../lib/connectors/xero/tax-rate-list.ts'), import('../../lib/connectors/xero/tax-rate-drift-sweeper.ts')])
+  return { db, pre, seed: seedLib.loadEuVatSeed(), listLib, drift }
 }
 type Deps = Awaited<ReturnType<typeof loadDeps>>
 
 const ids: { rates: string[]; mappings: string[] } = { rates: [], mappings: [] }
+const xeroRow = (taxType: string, name: string, percent: string) => ({ taxType, name, status: 'ACTIVE' as const, reportTaxType: 'OUTPUT', effectiveRate: `${percent}.000000`, displayTaxRate: `${percent}.000000`, components: [{ name, rate: `${percent}.000000`, compound: false, nonRecoverable: false }], canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: true } })
 let d: Deps
 const asClient = (db: Deps['db']) => db as unknown as Parameters<Deps['pre']['applyEuVatSeed']>[0]
+const apply = (digest: string, client: Parameters<Deps['pre']['applyEuVatSeed']>[0] = asClient(d.db)) => d.pre.applyEuVatSeed(client, d.seed, digest, CTX)
 
 async function snapshotRates(): Promise<Record<string, unknown>[]> {
   return d.db.taxRate.findMany({ where: { id: { in: ids.rates } }, orderBy: { name: 'asc' } }) as unknown as Record<string, unknown>[]
@@ -42,28 +47,38 @@ async function snapshotRates(): Promise<Record<string, unknown>[]> {
 before(async () => {
   if (!RUN) return
   d = await loadDeps()
+  const foreign = { xeroRates: await d.db.xeroTaxRate.count(), xeroLists: await d.db.xeroTaxRateList.count(), stamp: await d.db.setting.count({ where: { key: d.drift.TAX_RATE_DRIFT_LAST_CHECKED_SETTING } }) }
+  assert.deepEqual(foreign, { xeroRates: 0, xeroLists: 0, stamp: 0 }, 'PRECONDITION: this scratch database holds a Xero tax-rate store this test did not create; it will not delete it. Use a database with an empty Xero store.')
   const clash = await d.db.shoppingTaxRateMapping.count({ where: { connector: 'woocommerce', externalTaxRateId: { in: Object.values(WOO).map(String) } } })
   assert.equal(clash, 0, 'the database already holds a mapping for a declared WooCommerce rate id: refusing before any write')
   const make = async (key: keyof typeof WOO, over: { name: string; rate: string; country: string; code: string }) => {
     const declared = d.seed.rates.find((r) => r.wooId === WOO[key])!
-    const rate = await d.db.taxRate.create({ data: { name: `${TAG}${over.name}`, rate: over.rate, usedFor: 'SALES', countryCode: over.country, accountingTaxType: over.code, active: true, taxCategory: 'STANDARD' } })
+    const rate = await d.db.taxRate.create({ data: { name: over.name, rate: over.rate, usedFor: 'SALES', countryCode: over.country, accountingTaxType: over.code, active: true, taxCategory: 'STANDARD' } })
     ids.rates.push(rate.id)
-    const mapping = await d.db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: String(declared.wooId), externalName: declared.wooName, externalCountry: declared.country, externalRatePct: declared.ratePercent, externalClass: declared.wooClass, taxRateId: rate.id } })
+    const mapping = await d.db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: String(declared.wooId), externalName: declared.wooName, externalCountry: declared.country, externalRatePct: declared.ratePercent, externalClass: declared.wooClass, taxRateId: rate.id, storeIdentity: STORE } })
     ids.mappings.push(mapping.id)
   }
+  const rows = [xeroRow('OUTPUT2', 'GB VAT (Income)', '20'), xeroRow('ZQTAXDE', 'DE VAT', '19'), xeroRow('TAX131', 'DE IOSS VAT', '0'), xeroRow('TAX124', 'NO VAT', '25'), xeroRow('TAX122', 'NO VOEC VAT', '0')]
+  const fetchedAt = new Date(Date.now() - 300_000)
+  await d.db.xeroTaxRate.createMany({ data: rows.map((r) => ({ connector: 'xero', tenantId: TENANT, fetchedAt, taxType: r.taxType, name: r.name, status: r.status, reportTaxType: r.reportTaxType, effectiveRate: r.effectiveRate, displayTaxRate: r.displayTaxRate, components: r.components, canApplyToRevenue: true, canApplyToAssets: false, canApplyToEquity: false, canApplyToExpenses: false, canApplyToLiabilities: false })) })
+  await d.db.xeroTaxRateList.create({ data: { connector: 'xero', tenantId: TENANT, fetchedAt, rowCount: rows.length, digest: d.listLib.digestTaxRateList(TENANT, rows as never) } })
+  await d.db.setting.upsert({ where: { key: d.drift.TAX_RATE_DRIFT_LAST_CHECKED_SETTING }, create: { key: d.drift.TAX_RATE_DRIFT_LAST_CHECKED_SETTING, value: fetchedAt.toISOString() }, update: { value: fetchedAt.toISOString() } })
   await make('uk', { name: 'UK VAT', rate: '0.2000', country: 'GB', code: 'OUTPUT2' })
-  await make('de', { name: 'DE VAT', rate: '0.1900', country: 'DE', code: `${TAG}TAXDE`.trim() })
-  await make('no', { name: 'NO VAT', rate: '0.2500', country: 'NO', code: `${TAG}TAXNO`.trim() })
+  await make('de', { name: 'DE VAT', rate: '0.1900', country: 'DE', code: 'ZQTAXDE' })
+  await make('no', { name: 'NO VAT', rate: '0.2500', country: 'NO', code: 'TAX124' })
 })
 
 after(async () => {
   if (!RUN || !d) return
   await d.db.shoppingTaxRateMapping.deleteMany({ where: { id: { in: ids.mappings } } })
   await d.db.taxRate.deleteMany({ where: { id: { in: ids.rates } } })
+  await d.db.setting.deleteMany({ where: { key: d.drift.TAX_RATE_DRIFT_LAST_CHECKED_SETTING } })
+  await d.db.xeroTaxRateList.deleteMany({ where: { tenantId: TENANT } })
+  await d.db.xeroTaxRate.deleteMany({ where: { tenantId: TENANT } })
   await d.db.$disconnect()
 })
 
-const plan = async () => d.pre.planEuVatSeedApply({ seed: d.seed, ...(await d.pre.readEuVatImsSide(d.db as never)) })
+const plan = async () => d.pre.readEuVatSeedPlan(d.db as never, d.seed, CTX)
 
 test('a dry run writes nothing; the plan names exactly the two scheme rates', { skip }, async () => {
   const before = await snapshotRates()
@@ -74,20 +89,21 @@ test('a dry run writes nothing; the plan names exactly the two scheme rates', { 
   assert.deepEqual(await snapshotRates(), before)
 })
 
-test('the preflight read changes nothing and, with no stored Xero list, refuses to judge', { skip }, async () => {
+test('the preflight read changes nothing and judges against the stored list', { skip }, async () => {
   const before = await snapshotRates()
-  const input = await d.pre.readEuVatPreflightInput(d.db as never, d.seed, new Date(), null)
+  const input = await d.pre.readEuVatPreflightInput(d.db as never, d.seed, new Date(), TENANT, STORE)
   const result = d.pre.evaluateEuVatPreflight(input)
-  assert.equal(result.status, 'refused')
+  assert.equal(result.status, 'checked')
+  assert.equal(d.pre.evaluateEuVatPreflight(await d.pre.readEuVatPreflightInput(d.db as never, d.seed, new Date(), 'another-org', STORE)).status, 'refused', 'a list read from another organisation is not proven')
   assert.deepEqual(await snapshotRates(), before)
 })
 
 test('a missing or wrong digest writes nothing', { skip }, async () => {
   const before = await snapshotRates()
-  const none = await d.pre.applyEuVatSeed(asClient(d.db), d.seed, 'not-a-digest')
+  const none = await d.pre.applyEuVatSeed(asClient(d.db), d.seed, 'not-a-digest', CTX)
   assert.equal(none.applied, false)
   assert.equal(none.applied === false && none.refusal?.code, 'CONFIRM_REQUIRED')
-  const wrong = await d.pre.applyEuVatSeed(asClient(d.db), d.seed, 'c'.repeat(64))
+  const wrong = await d.pre.applyEuVatSeed(asClient(d.db), d.seed, 'c'.repeat(64), CTX)
   assert.equal(wrong.applied === false && wrong.refusal?.code, 'DIGEST_MISMATCH')
   assert.deepEqual(await snapshotRates(), before)
 })
@@ -98,7 +114,7 @@ test('the stale digest of a plan whose rate was edited afterwards refuses and wr
   await d.db.taxRate.update({ where: { id: de }, data: { reportingCategory: 'OSS' } })
   try {
     const before = await snapshotRates()
-    const result = await d.pre.applyEuVatSeed(asClient(d.db), d.seed, stale)
+    const result = await d.pre.applyEuVatSeed(asClient(d.db), d.seed, stale, CTX)
     assert.equal(result.applied === false && result.refusal?.code, 'DIGEST_MISMATCH')
     assert.deepEqual(await snapshotRates(), before)
   } finally {
@@ -109,7 +125,7 @@ test('the stale digest of a plan whose rate was edited afterwards refuses and wr
 test('the right digest sets the two columns on the two scheme rates and nothing else; a second apply has nothing to do', { skip }, async () => {
   const before = await snapshotRates()
   const p = await plan()
-  const result = await d.pre.applyEuVatSeed(asClient(d.db), d.seed, p.digest)
+  const result = await d.pre.applyEuVatSeed(asClient(d.db), d.seed, p.digest, CTX)
   assert.equal(result.applied, true)
   assert.equal(result.applied && result.written, 2)
   const after = await snapshotRates()
@@ -124,14 +140,14 @@ test('the right digest sets the two columns on the two scheme rates and nothing 
   assert.deepEqual([de.schemePostingTaxType, de.reportingCategory], ['TAX131', 'IOSS'])
   assert.deepEqual([no.schemePostingTaxType, no.reportingCategory], ['TAX122', 'VOEC'])
   assert.equal(await d.db.shoppingTaxRateMapping.count({ where: { id: { in: ids.mappings } } }), 3, 'no mapping touched')
-  const again = await d.pre.applyEuVatSeed(asClient(d.db), d.seed, (await plan()).digest)
+  const again = await d.pre.applyEuVatSeed(asClient(d.db), d.seed, (await plan()).digest, CTX)
   assert.equal(again.applied === false && again.refusal?.code, 'NOTHING_TO_APPLY')
 })
 
 test('two concurrent applies of one plan write once, refuse the other cleanly and never deadlock', { skip }, async () => {
   for (const id of ids.rates) await d.db.taxRate.update({ where: { id }, data: { schemePostingTaxType: null, reportingCategory: null } })
   const { digest } = await plan()
-  const results = await Promise.all([d.pre.applyEuVatSeed(asClient(d.db), d.seed, digest), d.pre.applyEuVatSeed(asClient(d.db), d.seed, digest)])
+  const results = await Promise.all([apply(digest), apply(digest)])
   assert.equal(results.filter((r) => r.applied).length, 1, 'exactly one apply wrote')
   const refused = results.find((r) => !r.applied)
   assert.ok(refused && !refused.applied && ['DIGEST_MISMATCH', 'NOTHING_TO_APPLY', 'RATE_CHANGED_DURING_APPLY'].includes(refused.refusal?.code ?? ''))
@@ -149,5 +165,85 @@ test('a rate a re-key replaced (so inactive) is skipped by the plan and never wr
     assert.equal(p.skipped.find((s) => s.wooId === 220)?.reason, 'IMS_RATE_INACTIVE')
   } finally {
     await d.db.taxRate.update({ where: { id: de }, data: { active: true, replacedById: null } })
+  }
+})
+
+test('a mapping stamped for another store, or never stamped, is not written through; no store configured refuses the apply', { skip }, async () => {
+  for (const id of ids.rates) await d.db.taxRate.update({ where: { id }, data: { schemePostingTaxType: null, reportingCategory: null } })
+  const de = ids.mappings[1]!
+  for (const stamp of ['https://other.example', null]) {
+    await d.db.shoppingTaxRateMapping.update({ where: { id: de }, data: { storeIdentity: stamp } })
+    try {
+      const p = await plan()
+      assert.equal(p.changes.some((c) => c.wooId === 220), false)
+      assert.equal(p.skipped.find((s) => s.wooId === 220)?.reason, stamp === null ? 'MAPPING_UNSTAMPED' : 'MAPPING_OTHER_STORE')
+      assert.equal((await apply(p.digest)).applied, true, 'the other rate (Norway) is still written by its own plan')
+    } finally {
+      await d.db.shoppingTaxRateMapping.update({ where: { id: de }, data: { storeIdentity: STORE } })
+      for (const id of ids.rates) await d.db.taxRate.update({ where: { id }, data: { schemePostingTaxType: null, reportingCategory: null } })
+    }
+  }
+  const beforeNone = await snapshotRates()
+  const none = await d.pre.applyEuVatSeed(asClient(d.db), d.seed, (await plan()).digest, { connectedTenantId: TENANT, storeIdentity: null })
+  assert.equal(none.applied, false)
+  assert.deepEqual(await snapshotRates(), beforeNone)
+})
+
+test('a rate edited after the dry run (percentage, country, name, charged code) changes the digest and the apply refuses, writing nothing', { skip }, async () => {
+  for (const id of ids.rates) await d.db.taxRate.update({ where: { id }, data: { schemePostingTaxType: null, reportingCategory: null } })
+  const de = ids.rates[1]!
+  const original = await d.db.taxRate.findUniqueOrThrow({ where: { id: de } })
+  for (const edit of [{ rate: '0.2000' }, { countryCode: 'AT' }, { name: 'DE VAT x' }, { accountingTaxType: 'TAX124' }]) {
+    const stale = (await plan()).digest
+    await d.db.taxRate.update({ where: { id: de }, data: edit })
+    try {
+      const before = await snapshotRates()
+      const result = await apply(stale)
+      assert.equal(result.applied === false && result.refusal?.code, 'DIGEST_MISMATCH', JSON.stringify(edit))
+      assert.deepEqual(await snapshotRates(), before)
+    } finally {
+      await d.db.taxRate.update({ where: { id: de }, data: { rate: original.rate, countryCode: original.countryCode, name: original.name, accountingTaxType: original.accountingTaxType } })
+    }
+  }
+})
+
+test('a rate edited in the instant between the plan read and the row lock fails the compare-and-set and rolls the whole apply back', { skip }, async () => {
+  const [, de, no] = ids.rates as [string, string, string]
+  for (const id of ids.rates) await d.db.taxRate.update({ where: { id }, data: { schemePostingTaxType: null, reportingCategory: null } })
+  const { digest } = await plan()
+  const original = await d.db.taxRate.findUniqueOrThrow({ where: { id: de } })
+  // The first row lock is preceded by a committed edit made from another session, exactly as an editor that read before the apply took the lock would have made it.
+  const edits: Array<() => Promise<unknown>> = [
+    () => d.db.taxRate.update({ where: { id: de }, data: { rate: '0.2000' } }),
+    () => d.db.taxRate.update({ where: { id: de }, data: { name: 'DE VAT renamed' } }),
+    () => d.db.taxRate.update({ where: { id: de }, data: { countryCode: 'AT' } }),
+    () => d.db.taxRate.update({ where: { id: de }, data: { accountingTaxType: 'TAX124' } }),
+    () => d.db.taxRate.update({ where: { id: de }, data: { usedFor: 'BOTH' } }),
+    () => d.db.taxRate.update({ where: { id: de }, data: { reverseCharge: true } }),
+    () => d.db.taxRate.update({ where: { id: de }, data: { reportingCategory: 'OSS' } }),
+    () => d.db.taxRate.update({ where: { id: de }, data: { schemePostingTaxType: 'TAX122' } }),
+    () => d.db.shoppingTaxRateMapping.update({ where: { id: ids.mappings[1]! }, data: { storeIdentity: 'https://other.example' } }),
+    () => d.db.shoppingTaxRateMapping.update({ where: { id: ids.mappings[1]! }, data: { taxRateId: no } }),
+  ]
+  for (const edit of edits) {
+    let fired = false
+    const hooked = { $transaction: <T>(fn: (tx: never) => Promise<T>) => (d.db as never as { $transaction: (f: (tx: Record<string | symbol, unknown>) => Promise<T>) => Promise<T> }).$transaction((tx) => fn(new Proxy(tx, { get(target, prop) {
+      const value = target[prop]
+      if (prop === '$queryRaw') return async (...args: unknown[]) => { if (!fired) { fired = true; await edit() } return (value as (...a: unknown[]) => Promise<unknown>).apply(target, args) }
+      return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value
+    } }) as never)) }
+    try {
+      // Rows are locked in ascending id order, so make the edited rate's lock the first one the apply takes.
+      const result = await apply(digest, hooked as never)
+      assert.equal(fired, true)
+      assert.equal(result.applied, false)
+      assert.equal(result.applied === false && result.refusal?.code, 'RATE_CHANGED_DURING_APPLY')
+      const after = await snapshotRates()
+      assert.equal(after.some((r) => r.schemePostingTaxType === 'TAX131' || r.reportingCategory === 'IOSS' || r.reportingCategory === 'VOEC'), false, 'nothing the plan would set was written, the other rate included')
+      assert.deepEqual(after.filter((r) => r.id !== de).map((r) => [r.schemePostingTaxType, r.reportingCategory]), [[null, null], [null, null]])
+    } finally {
+      await d.db.taxRate.update({ where: { id: de }, data: { rate: original.rate, name: original.name, countryCode: original.countryCode, accountingTaxType: original.accountingTaxType, usedFor: original.usedFor, reverseCharge: original.reverseCharge, reportingCategory: null, schemePostingTaxType: null } })
+      await d.db.shoppingTaxRateMapping.update({ where: { id: ids.mappings[1]! }, data: { storeIdentity: STORE, taxRateId: de } })
+    }
   }
 })

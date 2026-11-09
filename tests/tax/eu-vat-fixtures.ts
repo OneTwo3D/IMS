@@ -13,6 +13,7 @@ export function xeroType(taxType: string, name: string, percent: string, status:
   return { taxType, name, status, reportTaxType: 'OUTPUT', effectiveRate: six(percent), displayTaxRate: six(percent), components: [{ name, rate: six(percent), compound: false, nonRecoverable: false }], canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: true } }
 }
 
+export const STORE = 'https://shop.example'
 export const syntheticChargedCode = (wooId: number): string => `TAXC${wooId}`
 
 export type World = { input: PreflightInput; ims: Map<number, PreflightImsRate>; mappings: Map<number, PreflightMapping>; xero: Map<string, NormalisedXeroTaxRate> }
@@ -27,7 +28,7 @@ export function perfectWorld(seed: EuVatSeed = loadEuVatSeed()): World {
       id: `ims-${r.wooId}`, name: r.imsName, rate: (Number(r.ratePercent) / 100).toFixed(4), usedFor: 'SALES', active: true, reverseCharge: false, countryCode: r.country === '' ? null : r.country,
       accountingTaxType: code, reportingCategory: r.reportingCategory, schemePostingTaxType: r.schemePostingTaxType,
     })
-    mappings.set(r.wooId, { externalTaxRateId: String(r.wooId), externalName: r.wooName, externalCountry: r.country === '' ? null : r.country, externalRatePct: r.ratePercent, externalClass: r.wooClass, taxRateId: `ims-${r.wooId}` })
+    mappings.set(r.wooId, { id: `map-${r.wooId}`, storeIdentity: STORE, externalTaxRateId: String(r.wooId), externalName: r.wooName, externalCountry: r.country === '' ? null : r.country, externalRatePct: r.ratePercent, externalClass: r.wooClass, taxRateId: `ims-${r.wooId}` })
     if (!xero.has(code)) xero.set(code, xeroType(code, r.accountingXeroName ?? r.imsName, r.ratePercent))
     if (r.schemePostingTaxType !== null && !xero.has(r.schemePostingTaxType)) xero.set(r.schemePostingTaxType, xeroType(r.schemePostingTaxType, r.schemePostingXeroName!, '0.0000'))
   }
@@ -35,6 +36,7 @@ export function perfectWorld(seed: EuVatSeed = loadEuVatSeed()): World {
   for (const a of seed.accounts) if (a.settingKey !== null) settings[a.settingKey] = a.code
   const input: PreflightInput = {
     seed,
+    storeIdentity: STORE,
     xero: { proven: true, fetchedAt: '2026-11-09T14:00:00.000Z', rows: [...xero.values()] },
     imsRates: [...ims.values()],
     mappings: [...mappings.values()],
