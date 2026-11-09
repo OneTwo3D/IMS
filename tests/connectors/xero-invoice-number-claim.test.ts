@@ -85,6 +85,7 @@ test('a matching ACCREC document is returned as the claim, with who holds it', a
       status: 'AUTHORISED',
       contactName: 'A Customer',
       total: 120.5,
+      type: 'ACCREC',
     }],
   })
 })

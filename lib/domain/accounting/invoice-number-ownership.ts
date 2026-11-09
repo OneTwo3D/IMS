@@ -149,6 +149,8 @@ export type LedgerInvoiceClaim = {
   dateString?: string
   /** The ledger's last-modified stamp for the document. */
   updatedDateUtc?: string
+  /** The ledger's document Type (ACCREC, ACCPAY) when it stated one. The ownership fence treats a missing Type as a claim; the invoice-document fetch REQUIRES an explicit ACCREC. */
+  type?: string
 }
 
 /**

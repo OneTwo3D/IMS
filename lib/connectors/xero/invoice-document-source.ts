@@ -32,9 +32,19 @@ function isStopStatus(status: number | undefined): boolean {
   return status === 429 || status === 0 || status === 401 || status === 403
 }
 
-export async function lookupInvoiceDocumentClaims(invoiceNumber: string): Promise<DocumentClaimsLookup> {
-  const lookup = await lookupXeroInvoiceNumberClaim(invoiceNumber)
+export async function lookupInvoiceDocumentClaims(
+  invoiceNumber: string,
+  deps?: Parameters<typeof lookupXeroInvoiceNumberClaim>[1],
+): Promise<DocumentClaimsLookup> {
+  const lookup = await lookupXeroInvoiceNumberClaim(invoiceNumber, deps)
   if (!lookup.ok) return { ok: false, error: lookup.error, unaskable: lookup.unaskable, stop: isStopStatus(lookup.httpStatus) }
+  // The ownership fence reads a row with no Type as a claim on the number (an unknown document counts, because the cost of missing one is an
+  // overwrite). Choosing a document to SHOW A CUSTOMER is the opposite question: only a document the ledger explicitly says is a sales invoice
+  // (ACCREC) may be selected, so an answer with an untyped row is refused here rather than guessed at.
+  const untyped = lookup.claims.filter((claim) => claim.type !== SALES_INVOICE_TYPE)
+  if (untyped.length > 0) {
+    return { ok: false, error: `the ledger returned ${untyped.length} document(s) under this number without an explicit sales-invoice Type (${SALES_INVOICE_TYPE}), so none can be chosen for a customer` }
+  }
   return {
     ok: true,
     connection: lookup.tenantId ? { tenantId: lookup.tenantId, connectionGeneration: lookup.connectionGeneration ?? null } : undefined,
@@ -52,6 +62,7 @@ export async function lookupInvoiceDocumentClaims(invoiceNumber: string): Promis
   }
 }
 
+const SALES_INVOICE_TYPE = 'ACCREC'
 const SALES_CREDIT_NOTE_TYPE = 'ACCRECCREDIT'
 const WHERE_CLAUSE_HAZARDS = ['"', '\\']
 
@@ -106,7 +117,9 @@ export async function lookupSalesCreditNoteDocumentClaims(
     const number = asString(row?.CreditNoteNumber)
     if (!number || number.toLowerCase() !== wanted.toLowerCase()) continue
     const type = asString(row?.Type)
-    if (type !== undefined && type.toUpperCase() !== SALES_CREDIT_NOTE_TYPE) continue
+    // A different type is not a claim on this number; a MISSING type cannot be told apart from one, so the answer is refused (see the invoice lookup).
+    if (type === undefined) return { ok: false, error: `a credit note under number ${wanted} came back without an explicit Type (${SALES_CREDIT_NOTE_TYPE}), so none can be chosen for a customer` }
+    if (type.toUpperCase() !== SALES_CREDIT_NOTE_TYPE) continue
     const documentId = asString(row?.CreditNoteID)
     if (!documentId) return { ok: false, error: `a document holds credit note number ${wanted} but the lookup returned no CreditNoteID` }
     const reference = asString(row?.Reference)

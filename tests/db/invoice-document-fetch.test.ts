@@ -1026,3 +1026,25 @@ test('the reset\'s own transaction lock keeps promotions out even when the pinne
     await cleanup(db, order.id)
   }
 })
+
+test('a lookup answer with an untyped row reaches the service as the existing refusal: nothing downloaded or stored', { skip }, async () => {
+  const { db, service } = await setup()
+  const { order } = await seedOrder(db)
+  try {
+    const { lookupInvoiceDocumentClaims } = await import('../../lib/connectors/xero/invoice-document-source')
+    const downloads = { n: 0 }
+    const deps: Deps = {
+      ...depsFor(order, { downloads }),
+      lookupInvoiceClaims: (number) => lookupInvoiceDocumentClaims(number, {
+        get: (async () => ({ ok: true, status: 200, tenantId: 'tenant-A', data: { Invoices: [{ InvoiceID: 'x', InvoiceNumber: number, Status: 'AUTHORISED', Total: 100, CurrencyCode: 'GBP', Reference: order.orderNumber }] } })) as never,
+      }),
+    }
+    const outcome = await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, deps)
+    assert.equal(outcome.status, 'failed')
+    assert.match(outcome.status === 'failed' ? outcome.reason : '', /explicit sales-invoice Type/)
+    assert.equal(downloads.n, 0)
+    assert.equal(await db.salesOrderInvoiceDocument.count({ where: { orderId: order.id } }), 0)
+  } finally {
+    await cleanup(db, order.id)
+  }
+})

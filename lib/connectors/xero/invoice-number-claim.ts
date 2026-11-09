@@ -266,6 +266,7 @@ export async function lookupXeroInvoiceNumberClaim(
     if (currencyCode) claim.currencyCode = currencyCode.toUpperCase()
     const dateString = asString(inv?.DateString)
     if (dateString) claim.dateString = dateString
+    if (type) claim.type = type.toUpperCase()
     const updatedDateUtc = asString(inv?.UpdatedDateUTC)
     if (updatedDateUtc) claim.updatedDateUtc = updatedDateUtc
     claims.push(claim)
