@@ -8,6 +8,11 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Manual purchase-order receipts and the warehouse ASN
+
+- **Changed: a manual purchase-order receipt is refused for a line that still has an open warehouse ASN.** An ASN that is being created at the warehouse (including one demoted after a create whose result was never verified), open, or booked in but not yet reconciled (and not closed) means the goods are booked in through the ASN; receiving the same SKU by hand beside it could not be told apart from the units the warehouse will book, and the stock for different units was silently never added. The message names the SKU and ASN. Other lines of the same order, and lines whose ASN is fully booked in or closed, can still be received by hand. An unclaimed ASN reservation (nothing ever sent to the warehouse) does not block. The ASN table gains a nullable `remoteCreateAttemptedAt` column to tell the two apart.
+- **Added: the transfers CSV import reads an optional `dispatchedAt` column** (`YYYY-MM-DD`, read as 12:00 UK time, or an ISO date-time with an offset) for IN_TRANSIT and RECEIVED rows, so a transfer dispatched before the first load carries its real dispatch moment. A row that fails validation now invalidates its whole `transferKey` group (nothing is created for it) instead of creating the valid rows alone. It moves only the dispatch stamp (and so the stranded-in-transit clock), not the stock movement.
+
 ### Ops alerting and chart-of-accounts refresh
 
 - **Added: a daily, read-only refresh of the Xero chart of accounts (`xero-chart-sync`, 00:30).** It reads Xero's Accounts list with one GET, stores the whole chart and advances its own read-sync last-success stamp in one connection-fenced transaction; the read-sync liveness alarm now watches it (a seventh feed, stale after 36 hours). An on-demand refresh from the Sync page does not advance the stamp.

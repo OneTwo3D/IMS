@@ -4303,6 +4303,10 @@ model WmsAsnMap {
   /// q66in.4.6: when the watchdog last alerted on this ASN (dedupe); cleared by
   /// a fresh callback or close so a RENEWED breach re-alerts.
   sloAlertedAt   DateTime?
+  /// When this reservation was CLAIMED for a remote create (status moved to CREATE_IN_FLIGHT). Never cleared: a stale in-flight
+  /// row is demoted back to CREATE_PENDING while the warehouse may already hold the ASN, and this is what tells such a row from a
+  /// reservation that was never sent. A manual purchase-order receipt is refused while it is set on an unclosed row.
+  remoteCreateAttemptedAt DateTime?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
