@@ -48,6 +48,8 @@ function reg(over: Partial<PaymentRegistrationRow> = {}): PaymentRegistrationRow
     // has to be stated by a fixture that means it.
     abandonedBeforeRemoteCall: null,
     attemptRevision: 0,
+    remoteAttemptedAt: null,
+    attemptStampingCustodyAt: new Date('2026-01-01T00:00:00Z'),
     ...over,
   }
 }
@@ -233,13 +235,15 @@ test('the splitter is expressed in those same answers, so it cannot classify a r
     reg({ id: 'unknown', status: 'FAILED' }),
     reg({ id: 'reversed', status: 'CANCELLED', externalTransactionId: 'PAY-2', settlementBasis: 'VERIFIED_REVERSAL' }),
     reg({ id: 'requeued', status: 'PENDING', attemptRevision: 1 }),
+    reg({ id: 'legacy-no-custody', status: 'PENDING', attemptStampingCustodyAt: null }),
+    reg({ id: 'revived-attempted', status: 'PENDING', remoteAttemptedAt: new Date('2026-02-01T00:00:00Z') }),
     reg({ id: 'retired-stamped', status: 'CANCELLED', abandonedBeforeRemoteCall: true }),
     reg({ id: 'retired-unstamped', status: 'CANCELLED' }),
   ]
   const split = splitPaymentRegistrations(rows)
   assert.deepEqual(split.ledgerHold.map((r) => r.id), ['held'])
   assert.deepEqual(split.retirable.map((r) => r.id), ['queued'])
-  assert.deepEqual(split.undecided.map((r) => r.id), ['unknown', 'requeued', 'retired-unstamped'])
+  assert.deepEqual(split.undecided.map((r) => r.id), ['unknown', 'requeued', 'legacy-no-custody', 'revived-attempted', 'retired-unstamped'])
   for (const row of rows) {
     const standing = registrationLedgerStanding(row)
     const bucketed = split.ledgerHold.includes(row) || split.retirable.includes(row) || split.undecided.includes(row)
@@ -547,7 +551,7 @@ test('[o3d-f709] a CANCELLED registration the ORPHAN SWEEP retired still HOLDS w
 test('[o3d-f709] the delete split routes the orphan-swept posted registration into ledgerHold', () => {
   const row = {
     id: 'r1', connector: 'xero', status: 'CANCELLED', externalTransactionId: 'PAY-9',
-    settlementBasis: null, abandonedBeforeRemoteCall: true, attemptRevision: 0,
+    settlementBasis: null, abandonedBeforeRemoteCall: true, attemptRevision: 0, remoteAttemptedAt: null, attemptStampingCustodyAt: null,
   }
   // Asserted rather than assumed: a fixture that lost its id would make this pass while testing the
   // shape next door.
@@ -564,7 +568,7 @@ test('[o3d-anu8] the delete split routes the asserted cancellation into ledgerHo
   const split = splitPaymentRegistrations([
     {
       id: 'r1', connector: 'xero', status: 'CANCELLED', externalTransactionId: 'PAY-1',
-      settlementBasis: 'OPERATOR_ASSERTION', abandonedBeforeRemoteCall: null, attemptRevision: 0,
+      settlementBasis: 'OPERATOR_ASSERTION', abandonedBeforeRemoteCall: null, attemptRevision: 0, remoteAttemptedAt: null, attemptStampingCustodyAt: null,
     },
   ])
   assert.deepEqual(split.ledgerHold.map((row) => row.id), ['r1'])

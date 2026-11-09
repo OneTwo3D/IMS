@@ -582,7 +582,6 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'the external id was recorded by the single-statement fallback', verdict: 'DESCRIPTION', why: 'states what IMS recorded and that it will not re-post' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'the supplier credit note {} is posted in the ledger', verdict: 'DESCRIPTION', why: 'states a ledger fact' },
   { file: 'lib/domain/accounting/allocation-debit-posting-proof.ts', prefix: 'the A2 journal this order was staged into was settled as posted', verdict: 'CHECKS_FIRST', why: 'states how the journal came to be claimed and instructs only to confirm it in the accounting system' },
-  { file: 'lib/domain/accounting/payment-ledger-hold.ts', prefix: 'IMS tried to register this receipt', verdict: 'DESCRIPTION', why: 'states what IMS attempted and its outcome' },
   { file: 'lib/domain/accounting/posting-refusal-copy.ts', prefix: 'Postings an operator has taken to settle BY HAND.', verdict: 'DESCRIPTION', why: 'section label naming claimed postings' },
   { file: 'lib/domain/accounting/posting-refusal-copy.ts', prefix: 'Waiting for the accounting sync run to settle whether this posting is owed', verdict: 'DESCRIPTION', why: 'states that no action is offered yet' },
   { file: 'lib/domain/accounting/posting-refusal-inbox.ts', prefix: 'A queued {} for {} {} did NOT close its refused-posting row', verdict: 'DESCRIPTION', why: 'states what happened to a claimed row' },

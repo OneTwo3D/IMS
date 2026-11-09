@@ -54,6 +54,7 @@ import {
   type PaymentRegistrationRow,
 } from '@/lib/domain/accounting/payment-ledger-hold'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
+import { ATTEMPT_PROVEN_NEVER_MADE_WHERE } from '@/lib/domain/accounting/money-attempt-provenance'
 import { UNPROVEN_CANCELLED_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import {
   queueAccountingSync,
@@ -4201,13 +4202,13 @@ async function readPaymentRegistrations(
     // so omitting it here is a compile error rather than a silently permissive delete.
     select: {
       id: true, connector: true, status: true, externalTransactionId: true, settlementBasis: true,
-      abandonedBeforeRemoteCall: true, attemptRevision: true, payload: true,
+      abandonedBeforeRemoteCall: true, attemptRevision: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true, payload: true,
     },
   })
   return rows
     .filter((row) => payloadPaymentId(row.payload) === paymentId)
-    .map(({ id, connector, status, externalTransactionId, settlementBasis, abandonedBeforeRemoteCall, attemptRevision }) => (
-      { id, connector, status, externalTransactionId, settlementBasis, abandonedBeforeRemoteCall, attemptRevision }
+    .map(({ id, connector, status, externalTransactionId, settlementBasis, abandonedBeforeRemoteCall, attemptRevision, remoteAttemptedAt, attemptStampingCustodyAt }) => (
+      { id, connector, status, externalTransactionId, settlementBasis, abandonedBeforeRemoteCall, attemptRevision, remoteAttemptedAt, attemptStampingCustodyAt }
     ))
 }
 
@@ -4228,6 +4229,8 @@ async function retireUnsentRegistrations(tx: Prisma.TransactionClient, ids: read
       status: { in: [...RETIRABLE_REGISTRATION_STATUSES] },
       attemptRevision: UNCLAIMED_ATTEMPT_REVISION,
       externalTransactionId: null,
+      // Revision 0 alone is not proof (legacy rows, revivals): the canonical never-attempted record as well.
+      ...ATTEMPT_PROVEN_NEVER_MADE_WHERE,
     },
     data: { status: 'CANCELLED', errorMessage: 'Retired: the local payment it registered was deleted.', abandonedBeforeRemoteCall: true },
   })
@@ -4790,8 +4793,11 @@ export async function reverseLedgerPayment(
             // generated Prisma enums; it can only ever hold a value read off this same column.
             status: row.status as Prisma.AccountingSyncLogWhereInput['status'],
             externalTransactionId: row.externalTransactionId,
+            // THE ATTEMPT THAT WAS VERIFIED. A claim and retry while Xero was being asked moves the revision, and a
+            // verification of the old attempt must not be written onto the new one.
+            attemptRevision: row.attemptRevision,
           },
-          data: buildVerifiedReversalData(note),
+          data: { ...buildVerifiedReversalData(note), attemptRevision: { increment: 1 } },
         })
         // THROWN, so any row retired earlier in this loop rolls back with it. A `return` would commit
         // a partial retirement while reporting that nothing changed.
@@ -4808,11 +4814,15 @@ export async function reverseLedgerPayment(
             id: row.id,
             status: row.status as Prisma.AccountingSyncLogWhereInput['status'],
             externalTransactionId: null,
+            attemptRevision: row.attemptRevision,
           },
-          data: buildAssertedReversalData(
-            reference,
-            assertedReversalNote(reference, orderForReference.accountingInvoiceId ?? '', now),
-          ),
+          data: {
+            ...buildAssertedReversalData(
+              reference,
+              assertedReversalNote(reference, orderForReference.accountingInvoiceId ?? '', now),
+            ),
+            attemptRevision: { increment: 1 },
+          },
         })
         if (decided.count !== 1) throw new PaymentTransactionRefusal(HOLD_MOVED_REFUSAL.code, HOLD_MOVED_REFUSAL.message)
       }

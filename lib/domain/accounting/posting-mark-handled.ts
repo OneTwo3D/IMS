@@ -13,6 +13,7 @@ import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/acc
 import { POSTING_REFUSAL_KINDS, postingRefusalMarkable, type PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
 import { lockPostingKey, type PostingSuppressionClient } from '@/lib/domain/accounting/posting-suppression'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
+import { ATTEMPT_PROVEN_NEVER_MADE_WHERE } from '@/lib/domain/accounting/money-attempt-provenance'
 import { settlementMirrorGuard } from '@/lib/domain/accounting/sync-row-settlement'
 
 /**
@@ -309,14 +310,21 @@ async function cancelProvablyUnsentRows(
 ): Promise<string[]> {
   const ids = rows.map((sync) => sync.id)
   if (ids.length === 0) return []
-  const cancelled = await tx.accountingSyncLog.updateMany({
-    where: { id: { in: ids }, status: 'PENDING', attemptRevision: UNCLAIMED_ATTEMPT_REVISION, externalTransactionId: null },
-    // The predicate IS the pre-call proof (PENDING, never claimed, no document id), so it is recorded in the same
-    // UPDATE, as the orphan sweep and the sale-cancel sweep record theirs: without it `ledgerStanding` reads the
-    // row UNKNOWN and a same-key re-enqueue stays blocked behind a row this function itself proved unsent.
+  // The pre-call stamp is written ONLY over a row with the canonical never-attempted record (revision 0 alone is not
+  // proof: legacy rows and revivals sit there), in the same UPDATE as the status, as the orphan sweep does. A row
+  // without that record is still cancelled (it is provably unsent for THIS purpose) but UNSTAMPED, so it reads UNKNOWN.
+  const stamped = await tx.accountingSyncLog.updateMany({
+    where: {
+      id: { in: ids }, status: 'PENDING', attemptRevision: UNCLAIMED_ATTEMPT_REVISION, externalTransactionId: null,
+      ...ATTEMPT_PROVEN_NEVER_MADE_WHERE,
+    },
     data: { status: 'CANCELLED', errorMessage: note, processingStartedAt: null, abandonedBeforeRemoteCall: true },
   })
-  if (cancelled.count !== ids.length) throw new MarkHandledRaceError()
+  const unstamped = await tx.accountingSyncLog.updateMany({
+    where: { id: { in: ids }, status: 'PENDING', attemptRevision: UNCLAIMED_ATTEMPT_REVISION, externalTransactionId: null },
+    data: { status: 'CANCELLED', errorMessage: note, processingStartedAt: null },
+  })
+  if (stamped.count + unstamped.count !== ids.length) throw new MarkHandledRaceError()
   for (const sync of rows) {
     const mirror = await updateMirroredAccountingEventStatus(tx as unknown as Prisma.TransactionClient, {
       connector: sync.connector,

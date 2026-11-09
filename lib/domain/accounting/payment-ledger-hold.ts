@@ -32,8 +32,9 @@
 
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { isShadowedObligation, ledgerStanding } from './ledger-standing'
+import { attemptProvenNeverMade } from './money-attempt-provenance'
 import { UNCLAIMED_ATTEMPT_REVISION } from './sync-log-attempt'
-import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from './sync-row-settlement'
+import { OPERATOR_ASSERTION_SETTLEMENT_BASIS, VERIFIED_REVERSAL_SETTLEMENT_BASIS } from './sync-row-settlement'
 
 /** The sync type that registers a locally-recorded sales receipt against the ledger invoice. */
 export const PAYMENT_REGISTRATION_TYPE = 'INVOICE_PAYMENT'
@@ -128,6 +129,14 @@ export type PaymentRegistrationRow = {
    * claimed, failed and was queued again, so it may have posted; only revision 0 is provably unsent.
    */
   attemptRevision: number
+  /**
+   * The two columns that, TOGETHER, are the canonical record that no remote call left this row
+   * (`attemptProvenNeverMade`, money-attempt-provenance.ts). Revision 0 alone is not proof: rows attempted before
+   * revisions existed sit at 0, and a revival can return an attempted row to PENDING without advancing it.
+   * REQUIRED for the same reason as `attemptRevision`.
+   */
+  remoteAttemptedAt: Date | null
+  attemptStampingCustodyAt: Date | null
 }
 
 export type PaymentRegistrationSplit = {
@@ -278,7 +287,7 @@ export function splitPaymentRegistrations(rows: readonly PaymentRegistrationRow[
       // an attempt nobody can speak for, exactly like a FAILED one. Retiring it would either forge the pre-call
       // proof or leave an unstamped CANCELLED row that reads UNDECIDED for ever.
       if (row.status === 'PENDING' && !hasPostEvidence(row)) {
-        if (row.attemptRevision === UNCLAIMED_ATTEMPT_REVISION) retirable.push(row)
+        if (row.attemptRevision === UNCLAIMED_ATTEMPT_REVISION && attemptProvenNeverMade(row)) retirable.push(row)
         else undecided.push(row)
       } else ledgerHold.push(row)
     } else if (standing === 'UNDECIDED') {
@@ -367,21 +376,30 @@ export function describeAttemptUndecidedRefusal(
   const entries = undecided.map((row) => row.id).join(', ')
   // o3d-f709 / M15 (C1): an UNDECIDED row can now be a CANCELLED one an operator settled "not posted".
   // The text below says FAILED, which would be untrue of it, so it gets its own paragraph.
-  const settledByOperator = undecided.some((row) => row.status === 'CANCELLED')
+  const settledByOperator = undecided.some((row) => row.status === 'CANCELLED' && row.settlementBasis === OPERATOR_ASSERTION_SETTLEMENT_BASIS)
   const operatorNote = settledByOperator
     ? '\n\nAn operator settled one of these entries as "not posted". That is a person\'s word about an '
       + 'accounting system IMS did not check, not proof - the payment may still be there - so it does not '
       + 'free this receipt for deletion.'
     : ''
-  // A PENDING row above attemptRevision 0 was claimed, failed and queued again: it is "undecided" because the claim
-  // may have posted, not because it FAILED, and the operator needs the way out named.
+  // A PENDING row that is not provably unclaimed (claimed and queued again, or a legacy row with no record either way)
+  // is "undecided" because an attempt may have posted, not because it FAILED, and the operator needs the way out named.
   const requeuedAfterClaim = undecided.some((row) => row.status === 'PENDING')
   const requeuedNote = requeuedAfterClaim
-    ? '\n\nOne of these entries is queued for a retry after an earlier attempt, so it may already have posted. It cannot be '
-      + 'cancelled here as "never sent". Check the invoice in the accounting system: if a payment is there, reverse it, then '
+    ? '\n\nOne of these entries is still queued, but nothing on it shows that no attempt was ever made for it (it was retried '
+      + 'after an earlier attempt, or it predates that record), so it may already have posted. It cannot be cancelled here as '
+      + 'if nothing had been sent. Check the invoice in the accounting system: if a payment is there, reverse it, then '
       + 'use "Check that payment and delete" (reverse in ledger) with its payment reference; IMS will verify it with the '
       + 'accounting system before removing anything.'
     : ''
+  // A CANCELLED entry no operator spoke for and that carries no record it was retired before any attempt: a retirement
+  // written before that record existed, or one made after a worker had picked the entry up.
+  const unprovenCancellation = undecided.some((row) => row.status === 'CANCELLED' && (row.settlementBasis ?? null) === null)
+  const unprovenNote = unprovenCancellation
+    ? '\n\nOne of these entries was retired (cancelled) without any record that it was retired before an attempt was made, so IMS '
+      + 'cannot say it never reached the accounting system. A payment may still be there, so it does not free this receipt for deletion.'
+    : ''
+  const anyFailed = undecided.some((row) => (UNDECIDED_REGISTRATION_STATUSES as readonly string[]).includes(row.status))
   // THE PRODUCER-SIDE HOLD: a SHADOW is not an attempt by IMS at all, so "IMS tried ... FAILED" would be untrue of it. It gets
   // its own account: IMS did not send the registration, and the writer that owns payment registration may have.
   const shadowed = undecided.filter((row) => isShadowedObligation({
@@ -409,12 +427,15 @@ export function describeAttemptUndecidedRefusal(
   }
   return {
     code: 'registration_attempt_undecided',
-    message:
-      `IMS tried to register this receipt against the invoice for ${orderReference} in the accounting `
-      + 'system and the attempt was recorded as FAILED, without a payment reference. A failure is not '
-      + 'proof that nothing was posted: the accounting system is called BEFORE the result is written '
-      + 'down, so a timeout or a lost response is recorded as a failure even when the payment went '
-      + 'through. Nothing was deleted.\n\n'
+    message: withLedgerCheck(
+      (anyFailed
+        ? `IMS tried to register this receipt against the invoice for ${orderReference} in the accounting `
+          + 'system and the attempt was recorded as FAILED, without a payment reference. A failure is not '
+          + 'proof that nothing was posted: the accounting system is called BEFORE the result is written '
+          + 'down, so a timeout or a lost response is recorded as a failure even when the payment went '
+          + 'through. Nothing was deleted.\n\n'
+        : `IMS cannot tell whether the registration of this receipt against the invoice for ${orderReference} `
+          + 'reached the accounting system, and a payment may stand there. Nothing was deleted.\n\n')
       + `Open the invoice for ${orderReference} in the accounting system and look at the payments on it.\n`
       + '• If a payment IS there, the attempt landed. Reverse it there, then copy its payment '
       + 'reference and use "Check that payment and delete" below — IMS will ask the accounting system '
@@ -422,11 +443,12 @@ export function describeAttemptUndecidedRefusal(
       + 'confirm it really is gone before removing anything here.\n'
       + '• If there is NO payment, retry the registration under Sync → Xero. Once it posts, IMS knows '
       + 'the payment reference and can check the reversal for you.\n\n'
-      + `IMS cannot settle this on its own: the failed entry (${entries}) names no payment to look up, `
+      + `IMS cannot settle this on its own: the ${anyFailed ? 'failed ' : ''}entry (${entries}) names no payment to look up, `
       + 'and an invoice showing nothing looks the same whether the payment was removed or never '
       + 'arrived — which is why the reference has to come from you, and why IMS still checks it.'
       + operatorNote
-      + requeuedNote,
+      + unprovenNote
+      + requeuedNote),
   }
 }
 

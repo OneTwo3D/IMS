@@ -103,6 +103,8 @@ export const DECLARATIONS = [
     reason: "M15 (converted in slice 1a): the thin adapter over ledgerStanding. The CANCELLED/UNKNOWN arm now reads UNDECIDED (the deletePayment retirements stamp abandonedBeforeRemoteCall, so a stamped row reads PROVEN_NOT_POSTED -> NOTHING); only the held-status fallback remains." },
   { key: "lib/domain/accounting/payment-ledger-hold.ts::describeAttemptUndecidedRefusal::cmp-cancelled#1", class: "DISPLAY",
     reason: "describeAttemptUndecidedRefusal: chooses whether to add a paragraph about an operator-settled entry; the classification was made by registrationLedgerStanding." },
+  { key: "lib/domain/accounting/payment-ledger-hold.ts::describeAttemptUndecidedRefusal::cmp-cancelled#2", class: "DISPLAY",
+    reason: "describeAttemptUndecidedRefusal: chooses the paragraph for an unstamped cancellation (wording only); the row is already classified UNDECIDED by registrationLedgerStanding." },
   { key: "lib/domain/accounting/prior-posting-evidence.ts::PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR::where-admits-synced#1", class: "WORK_SLOT",
     reason: "M11 (converted in slice 1a): the counterpart-exists predicate for the held-invoice release, pinned to classifyPriorAttempts / WORK_SLOT_STATUSES by tests; positive arms only." },
   { key: "lib/domain/accounting/prior-posting-evidence.ts::PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR::where-id-not-null#1", class: "WORK_SLOT",

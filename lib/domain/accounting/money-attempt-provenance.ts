@@ -144,6 +144,15 @@ export function attemptProvenNeverMade(row: MoneyAttemptProvenance): boolean {
 }
 
 /**
+ * {@link attemptProvenNeverMade} AS A QUERY PREDICATE, for a writer that stamps `abandonedBeforeRemoteCall`: the
+ * stamp is only true of a row this matches. One spelling, so the function and the UPDATE cannot disagree.
+ */
+export const ATTEMPT_PROVEN_NEVER_MADE_WHERE: Prisma.AccountingSyncLogWhereInput = {
+  remoteAttemptedAt: null,
+  attemptStampingCustodyAt: { not: null },
+}
+
+/**
  * Custody for a row this binary is CREATING.
  *
  * Every `accountingSyncLog.create` in this codebase spreads this. A row created without it is a
