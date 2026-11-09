@@ -18,7 +18,6 @@ import {
   markIntegrationOutboxRetryableFailure,
   currentOutboxRowBeforeCutoff,
   outboxRowBeforeCutoff,
-  outboxRowCutoffFloor,
   refuseClaimedJobBeforeCutoff,
   type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
@@ -96,14 +95,14 @@ async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions):
     })
 
     if (current.status === INTEGRATION_OUTBOX_STATUS.PROCESSING) {
-      // A LIVE producer is writing into a job a worker holds. While a cut-off applies, the merge MOVES THE JOB'S CREATION TIME in the same statement. That does two things: a job
-      // that predates the instant would otherwise be refused by the worker's send-time check and excluded by every later claim, stranding the new update for ever; and,
-      // because the worker read the stock BEFORE this event, the moved creation time is the generation stamp that stops completeClaimedJob taking an unchanged payload
-      // for proof the event was handled. The job is RE-DATED in the same statement that merges the payload (the claim is keyed on its lock, not on createdAt, so the worker is unaffected), and the
-      // worker, which judges the current row, sends it. This applies to an identical payload too: the producer's event still needs its push after the instant.
-      // With no floor in force nothing is re-dated and the statement is the legacy one.
-      const redateProcessing = outboxRowCutoffFloor(current.connector, current.operation) !== null
-      if (samePayload(current.payloadJson, payload) && !redateProcessing) return true
+      // A LIVE producer is writing into a job a worker holds. EVERY such enqueue, identical payload or not, MOVES THE JOB'S CREATION TIME in the
+      // same statement. The worker read the stock BEFORE this event, so the moved creation time is the generation stamp that stops
+      // completeClaimedJob taking an unchanged payload for proof the event was handled: the worker requeues the job and the next pass
+      // re-reads and pushes the latest absolute level. (A reservation release landing after the worker's read and before its send has an
+      // identical merged payload; dropping it would push the earlier, lower quantity and nothing would ever re-pass.) With a cut-off in
+      // force the same move also keeps a job that predates the instant from being refused by the worker's send-time check and excluded by
+      // every later claim, stranding the new update for ever. The job is re-dated in the same statement that merges the payload (the claim
+      // is keyed on its lock, not on createdAt, so the worker is unaffected), and the worker, which judges the current row, sends it.
       const updated = await db.integrationOutbox.updateMany({
         where: {
           id: current.id,
@@ -111,7 +110,7 @@ async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions):
         },
         data: {
           // strictly later than the value the worker holds, so the generation always differs
-          ...(redateProcessing ? { createdAt: new Date(Math.max(Date.now(), current.createdAt.getTime() + 1)) } : {}),
+          createdAt: new Date(Math.max(Date.now(), current.createdAt.getTime() + 1)),
           payloadJson: payload,
           lastError: null,
         },
@@ -486,9 +485,16 @@ export async function processQueuedWcStockSyncJobs(options?: {
 export async function enqueueAndProcessImmediateWcStockSync(
   productIds: string[],
   reason: Extract<StockSyncReason, 'IMS_CHANGE' | 'WC_WEBHOOK' | 'MANUAL'>,
-  options?: { force?: boolean; webhookQty?: number | null },
+  options?: {
+    force?: boolean
+    webhookQty?: number | null
+    /** Called once the jobs are durably recorded (or the hold shadowed them), BEFORE they are processed. Not called when the enqueue throws. */
+    onEnqueued?: () => Promise<void>
+  },
 ): Promise<void> {
-  const scope = await enqueueWcStockSyncJobs(productIds, reason, options)
+  const { onEnqueued, ...enqueueOptions } = options ?? {}
+  const scope = await enqueueWcStockSyncJobs(productIds, reason, enqueueOptions)
+  if (onEnqueued) await onEnqueued()
   if (scope.length === 0) return
   for (const productId of scope) immediateStockSyncProductIds.add(productId)
   if (immediateStockSyncScheduled) return

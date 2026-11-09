@@ -4555,6 +4555,10 @@ export async function createSalesOrderRefund(
         orderId: input.orderId,
         creditNoteNumber,
         externalRefundId: input.externalRefundId ?? null,
+        // A storefront refund that returns quantity owes the storefront a stock correction (it raised its own stock first).
+        // Written here, in the refund's own transaction: the obligation exists exactly when the refund does. Cleared (queued)
+        // by lib/connectors/woocommerce/sync/refund-stock-correction.ts once the stock job is durably recorded.
+        stockCorrectionRequired: storefrontRefund && refundLines.some((line) => line.qty > 0 && Boolean(line.productId)),
         reason: input.reason || null,
         totalForeign,
         totalBase,
