@@ -215,7 +215,8 @@ function accountingLines(fees: WcFeeLine[], usePatchedResolution: boolean) {
     const taxType = usePatchedResolution
       ? resolveWcLineAccountingTaxType({ forceNoTax: l.forceNoTax, baseTaxType: base, reverseCharge: false, reverseChargeSalesTaxType: '' })
       : (base ?? OUTPUT_IOSS) // the old behaviour: a missing code falls through to the order default
-    return { description: l.description, quantity: 1, unitAmount: l.unitPriceForeign, accountCode: '260', taxType }
+    // The importer names the one line kind it may post on NONE; the connector refuses any other NONE.
+    return { description: l.description, quantity: 1, unitAmount: l.unitPriceForeign, accountCode: '260', taxType, ...(l.forceNoTax ? { noTaxKind: 'fee-no-tax' as const } : {}) }
   })
   return [goodsLine, ...feeLines]
 }

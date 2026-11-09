@@ -9,6 +9,7 @@ import { xeroGet, xeroPost, xeroPut } from './api'
 import { findOrCreateContact } from './contacts'
 import { foreignCurrencyRateProblem, xeroCurrencyRateOrRefuse } from './fx'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { salesDocumentTaxTypeRefusal } from '@/lib/domain/accounting/sales-document-tax-types'
 import type { CreditNoteData, InvoiceLine } from '../types'
 import { PAGE_SIZE } from './invoice-delta'
 import { readAllocatedToInvoiceCents, readSingleXeroDocument, readXeroBalance } from './single-document'
@@ -70,6 +71,11 @@ export async function pushCreditNote(
   status: string = 'AUTHORISED',
   opts?: { idempotencyKey?: string; customerId?: string; contactGate?: ContactGate },
 ): Promise<{ success: boolean; creditNoteId?: string; error?: string }> {
+  // Xero mandates a TaxType on every line, and there is NO default: a missing one is refused, an explicit NONE only
+  // where the line names why it carries no tax (lib/domain/accounting/sales-document-tax-types.ts). BEFORE every round trip.
+  const taxTypeRefusal = salesDocumentTaxTypeRefusal(`Credit note ${data.creditNoteNumber ?? '(no number)'}`, data)
+  if (taxTypeRefusal) return { success: false, error: taxTypeRefusal }
+
   // o3d-q0x56.3: BEFORE the contact round trip, which creates a contact in Xero. A foreign credit note with no usable rate leaves no trace.
   const baseCurrency = await getBaseCurrencyCode()
   const rateProblem = foreignCurrencyRateProblem({
@@ -92,9 +98,6 @@ export async function pushCreditNote(
     return { success: false, error: `Contact error: ${contactResult.error}` }
   }
 
-  // Xero mandates TaxType on every line; "NONE" is the no-tax fallback.
-  const DEFAULT_TAX_TYPE = 'NONE'
-
   // Validate account codes up front.
   for (const line of data.lines) {
     if (!line.accountCode) {
@@ -112,7 +115,7 @@ export async function pushCreditNote(
       Quantity: line.quantity,
       UnitAmount: line.unitAmount,
       AccountCode: line.accountCode,
-      TaxType: line.taxType || DEFAULT_TAX_TYPE,
+      TaxType: line.taxType,
     }
     if (line.itemCode) xeroLine.ItemCode = line.itemCode
     return xeroLine

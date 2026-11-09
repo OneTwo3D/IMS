@@ -490,6 +490,8 @@ type ResolvedTaxRate = {
   // rate pointing at an RC IMS TaxRate must post on the reverse-charge boxes,
   // not the standard code, exactly as the resolver-derived path does.
   reverseCharge: boolean
+  /** The IMS rate's `active` flag. A mapping to an INACTIVE rate still resolves (`source: 'mapped'`); the importer refuses it where it moved money. */
+  active: boolean
   source: 'mapped' | 'default'
 }
 
@@ -547,6 +549,7 @@ async function fallbackDefaultTaxRate(unmappedWcRateId: number | null = null): P
       taxRateValue: Number(defaultRate.rate),
       accountingTaxType: defaultRate.accountingTaxType,
       reverseCharge: defaultRate.reverseCharge,
+      active: true,
       source: 'default',
     }
   }
@@ -569,7 +572,7 @@ async function fallbackDefaultTaxRate(unmappedWcRateId: number | null = null): P
     })
   }
 
-  return { taxRateId: null, taxRateName: null, taxRateValue: 0, accountingTaxType: null, reverseCharge: false, source: 'default' }
+  return { taxRateId: null, taxRateName: null, taxRateValue: 0, accountingTaxType: null, reverseCharge: false, active: true, source: 'default' }
 }
 
 export async function resolveWcTaxRateById(wcRateId: number | null | undefined): Promise<ResolvedTaxRate> {
@@ -583,7 +586,7 @@ export async function resolveWcTaxRateById(wcRateId: number | null | undefined):
         externalTaxRateId: String(wcRateId),
       },
     },
-    include: { taxRate: { select: { id: true, name: true, rate: true, accountingTaxType: true, reverseCharge: true } } },
+    include: { taxRate: { select: { id: true, name: true, rate: true, accountingTaxType: true, reverseCharge: true, active: true } } },
   })
   // Pass the id: WooCommerce named a rate and we could not resolve it, which is the case that
   // must be reported. Calling this bare — as it used to — is what made the substitution silent.
@@ -594,6 +597,7 @@ export async function resolveWcTaxRateById(wcRateId: number | null | undefined):
     taxRateValue: Number(mapping.taxRate.rate),
     accountingTaxType: mapping.taxRate.accountingTaxType,
     reverseCharge: mapping.taxRate.reverseCharge,
+    active: mapping.taxRate.active,
     source: 'mapped',
   }
 }

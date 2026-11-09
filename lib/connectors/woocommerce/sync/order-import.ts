@@ -2,6 +2,7 @@
  * WooCommerce → IMS order import.
  */
 
+import { describeWcRateMoneyRefusal, findWcRateMoneyProblems } from '@/lib/domain/accounting/wc-rate-money-refusal'
 import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain/erasure/erase-personal-data'
 import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
 import { isWcOrderAnonymised, wcPayloadCarriesIdentity } from './anonymisation'
@@ -2503,7 +2504,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     ]))
     const wcResolvedById = new Map<
       number,
-      { taxRateId: string | null; taxRateName: string | null; taxRateValue: number; accountingTaxType: string | null; reverseCharge: boolean; source?: 'mapped' | 'default' }
+      { taxRateId: string | null; taxRateName: string | null; taxRateValue: number; accountingTaxType: string | null; reverseCharge: boolean; active?: boolean; source?: 'mapped' | 'default' }
     >()
     for (const id of distinctWcRateIds) {
       wcResolvedById.set(id, await resolveWcTaxRateById(id))
@@ -2819,7 +2820,10 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
         ),
       },
     ], currency)
-    const documentTotalsToTheOrder = shippingTax.resolved && documentTaxReconciliation.reconciles
+    // A rate that moved money and is unmapped or inactive (lib/domain/accounting/wc-rate-money-refusal.ts) stamps the document as surely as a tax
+    // mismatch does: same refusal at the poster, and no payment registered against a document that will not post.
+    const rateMoneyRefusal = describeWcRateMoneyRefusal(String(wcOrder.number), findWcRateMoneyProblems(wcOrder, wcResolvedById))
+    const documentTotalsToTheOrder = shippingTax.resolved && documentTaxReconciliation.reconciles && rateMoneyRefusal === null
 
     // GBP conversions
     const subtotalBase = divideRoundedNumber(subtotalForeign, fxRate, 4)
@@ -3276,7 +3280,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           },
         })
       }
-      const unreconciledReason = !documentTotalsToTheOrder
+      const taxMismatchReason = !shippingTax.resolved || !documentTaxReconciliation.reconciles
         ? `The tax the accounting document would produce does not match the tax WooCommerce charged on order `
           + `${wcOrder.number}, so the invoice would not total the order's ${wcOrder.total}. `
           + (shippingTax.resolved ? '' : `${shippingTax.reason} `)
@@ -3287,6 +3291,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
             .map((d) => `${d.label}: document ${d.modelledTax.toFixed(orderMoneyDigits)} vs WooCommerce ${d.reportedTax.toFixed(orderMoneyDigits)}`)
             .join('; ')
         : null
+      const unreconciledReason = [taxMismatchReason, rateMoneyRefusal].filter((r): r is string => r !== null).join(' ') || null
       if (unreconciledReason) {
         await logActivity({
           entityType: 'SALES_ORDER',
@@ -3296,8 +3301,8 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           level: 'ERROR',
           description:
             `${unreconciledReason} The invoice was NOT posted to the ledger and no payment was registered — `
-            + `posting it would put a receivable at a total nobody reconciles against. Map the shipping tax rate `
-            + `in IMS and re-import the order.`,
+            + `posting it would put a receivable at a total nobody reconciles against. Map the tax rate named above `
+            + `(shipping's included) to an active IMS rate in IMS and re-import the order.`,
           metadata: {
             connector: 'woocommerce',
             externalOrderId: String(wcOrder.id),
@@ -3305,6 +3310,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
             orderTotal: wcOrder.total,
             orderPaid: !!wcOrder.date_paid_gmt,
             documentPosted: false,
+            rateMoneyRefusal,
             shippingTaxResolved: shippingTax.resolved,
             shippingTaxType: shippingTax.taxType,
             shippingTaxRate: shippingTax.rateValue,
@@ -3359,6 +3365,9 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
             // The rate that code was read from (never sent), with the basis the code was derived on (a sales goods line, lib/accounting/reverse-charge.ts): the guard recomputes the type from the rate as
             // it is now. A forced no-tax fee line has no rate-derived code and is not bound.
             ...(mappedLines[idx]?.isFeeLine === true && mappedLines[idx]?.forceNoTax ? {} : rateBinding(rateNow?.id, 'sales_line')),
+            // The ONE line kind this importer may post on NONE: it says why, so the connector accepts it (lib/domain/accounting/sales-document-tax-types.ts).
+            // Any other line that resolves to NONE - a mapped rate whose own code is NONE, such as WooCommerce rate 182 - is refused.
+            ...(mappedLines[idx]?.isFeeLine === true && mappedLines[idx]?.forceNoTax ? { noTaxKind: 'fee-no-tax' as const } : {}),
             discountAmount: l.discountAmount > 0 ? roundDecimalNumber(l.discountAmount, 4) : undefined,
             }
           }),

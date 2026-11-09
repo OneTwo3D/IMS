@@ -36,7 +36,7 @@ mock.module('@/lib/activity-log', {
 // Lazily imported: tsx transpiles this to CJS, where a top-level await will not compile.
 // The mocks above are registered before any test body runs, so the first call still gets them.
 type Resolver = (id: number | null) => Promise<{
-  taxRateValue: number; accountingTaxType: string | null; source: string
+  taxRateValue: number; accountingTaxType: string | null; source: string; active: boolean
 }>
 let resolve: Resolver | null = null
 const resolveWcTaxRateById: Resolver = async (id) => {
@@ -47,7 +47,7 @@ const resolveWcTaxRateById: Resolver = async (id) => {
   return resolve(id)
 }
 
-const UK_VAT = { id: 'r1', name: 'UK VAT', rate: 0.2, accountingTaxType: 'OUTPUT2', reverseCharge: false }
+const UK_VAT = { id: 'r1', name: 'UK VAT', rate: 0.2, accountingTaxType: 'OUTPUT2', reverseCharge: false, active: true }
 
 test.beforeEach(() => {
   logs.length = 0
@@ -62,6 +62,15 @@ test('a mapped WC rate resolves to it, and says nothing', async () => {
   assert.equal(r.accountingTaxType, 'OUTPUT2')
   assert.equal(r.source, 'mapped')
   assert.deepEqual(logs, [], 'the normal path must be silent')
+})
+
+test('a mapping to an INACTIVE rate still resolves as mapped, but REPORTS that it is inactive so the importer can refuse it where it moved money', async () => {
+  mapping = { taxRate: { ...UK_VAT, active: false } }
+  const r = await resolveWcTaxRateById(112)
+  assert.equal(r.source, 'mapped')
+  assert.equal(r.active, false)
+  mapping = { taxRate: UK_VAT }
+  assert.equal((await resolveWcTaxRateById(112)).active, true)
 })
 
 test('an order naming NO tax rate is silent — 0% is correct, not a guess', async () => {

@@ -5,6 +5,8 @@
  * Accounting connectors: Xero (current), QuickBooks (future)
  */
 
+import type { SalesNoTaxLineKind } from '@/lib/domain/accounting/sales-document-tax-types'
+
 // ---------------------------------------------------------------------------
 // Shopping Connector
 // ---------------------------------------------------------------------------
@@ -167,6 +169,12 @@ export type InvoiceLine = {
   accountCode: string
   taxType?: string
   /**
+   * Why this SALES line may carry no tax (taxType NONE). A sales invoice or credit-note line with no `taxType` is refused, and an
+   * explicit NONE is refused unless this names an allowed kind: lib/domain/accounting/sales-document-tax-types.ts. Never sent to
+   * the accounting system, and ignored on purchase documents.
+   */
+  noTaxKind?: SalesNoTaxLineKind
+  /**
    * Per-line discount amount (in the invoice currency, same tax convention
    * as `unitAmount`). Generic across connectors — each connector decides how
    * to represent it in its target system:
@@ -211,17 +219,17 @@ export type InvoiceData = {
   shippingDescription?: string
   shippingAccountCode?: string
   /**
-   * Tax type for the shipping line. Defaults to the connector's "no tax" code
-   * when omitted, but orders with a VAT rate should pass the matching
-   * accounting tax type so shipping is taxed at the same rate as the products.
+   * Tax type for the shipping line. REQUIRED when there is shipping: there is no
+   * "no tax" default, and an omitted type refuses the document. Pass the accounting
+   * tax type that taxes shipping at the rate the shop charged on it.
    */
   shippingTaxType?: string
   discountAmount?: number
   discountAccountCode?: string
   /**
    * Tax type for the order-level discount line. Should match the order's tax
-   * rate so the discount reduces the taxable base correctly. Defaults to the
-   * connector's "no tax" code when omitted.
+   * rate so the discount reduces the taxable base correctly. REQUIRED when there
+   * is a discount: there is no "no tax" default.
    */
   discountTaxType?: string
   /**

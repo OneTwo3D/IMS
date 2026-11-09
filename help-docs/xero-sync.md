@@ -1578,6 +1578,31 @@ tax types through one shared resolver, so the two can never drift. The swap is d
 from that line's own tax rate; shipping and discount lines follow the order-level tax rate without
 the swap on both the invoice and the credit note (kept identical so the two sides match).
 
+### No tax type, no document ("No VAT" is never a default)
+
+A sales invoice or credit note line is posted on the tax type IMS decided for it. If it has none, **the document is refused** and nothing
+is sent to Xero (no contact or item is created either). The row fails on **/sync** with an error that begins *NOTHING WAS SENT* and names each
+part that has no type (a product line, shipping, the order discount, a credit-note line). IMS no longer falls back to Xero's `NONE`
+("No VAT"), because a missing code that quietly becomes "No VAT" books VAT-bearing sales outside the VAT return.
+
+An **explicit** `NONE` is refused too, unless the line says why it carries no tax. Today there is one such kind: a WooCommerce **fee** the
+shop charged no tax on and named no rate for (for example the over-threshold import duty). A tax rate whose own Xero tax type is `NONE`
+(WooCommerce rate 182, *Taxes & Duties*, is mapped that way) therefore refuses any ordinary line it lands on; map it to a real,
+active tax type. Shipping and the order discount can never be on `NONE`. The check runs at the head of the sales invoice, sales invoice
+update and credit note cases of the poster, and again in the connector as the last word. Supplier bills and supplier credit notes are not
+covered yet.
+
+For **WooCommerce orders** the import also refuses, at import time, an order that moved money on a tax rate IMS cannot post under: a
+WooCommerce rate id with **no mapping** (IMS used to substitute the default rate with a warning), or one mapped to an **inactive** IMS
+rate. "Moved money" means a line (item, shipping or fee) naming the rate has a non-zero net or tax, or the order's `tax_lines` carries
+tax under it. The order is imported, but its invoice is marked and **refused at the poster** (and no payment is registered against it) with
+the rates named in the message and on the activity log (*wc_invoice_tax_does_not_reconcile*). Map the rate to an active IMS rate with a
+real accounting tax type, then re-import the order.
+
+**What to expect while mappings are incomplete.** Until every WooCommerce rate in use is mapped to an active IMS rate that carries a real
+Xero tax type, affected invoices and credit notes will sit as failed rows on /sync instead of posting. That is the intended behaviour; keep the
+Sales Invoices sync type switched off until the mappings are in place, then enable it.
+
 ## Invoice PDF & Email
 
 When a sales invoice is synced to Xero and payment is registered:

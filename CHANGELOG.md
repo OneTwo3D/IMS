@@ -8,6 +8,11 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### No tax type, no sales document
+
+- **Changed: a sales invoice or credit note line with no tax type is refused instead of posting on "No VAT".** The Xero connector no longer defaults a missing `TaxType` to `NONE` on sales invoices, sales invoice updates or credit notes (supplier bills and supplier credit notes are unchanged). The refusal is an ordinary failed sync row on /sync, raised at the head of the poster case and again in the connector, before any contact, item or document request. An explicit `NONE` is refused too unless the line names an allowed kind; the only one today is a WooCommerce fee the shop charged no tax on. Shipping and the order discount can never be on `NONE`.
+- **Changed: a WooCommerce order that moved money on an unmapped or inactive tax rate has its invoice refused.** Previously an unmapped rate id was replaced by the default rate and a mapping to an inactive IMS rate posted as if it were live. The invoice is now marked at import and refused at the poster with the rate ids named, and no payment is registered against it. See *No tax type, no document* in the Xero sync guide.
+
 ### Retired Kit tables, clean CSV bodies, and a retention exemption that lifts itself
 
 - **Removed: the unused Kit and KitItem tables and the KIT-filtered component view of inventory aging.** A KIT's recipe is its component list, which every allocation and availability reader already uses; Kit and KitItem had no writer and one reader. Inventory aging filtered to Type KIT now returns an empty report with a notice (age the component SKUs instead), and the "KIT mode" summary and the kit-components source label are gone. A new forward migration drops `kits` and `kit_items`; it refuses to run if either table holds rows, so nothing is lost silently (production is schema-only).

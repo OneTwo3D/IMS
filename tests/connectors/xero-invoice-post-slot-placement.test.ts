@@ -128,8 +128,8 @@ const data = {
   date: '2026-08-20',
   currency: 'GBP',
   lines: [
-    { itemCode: 'SKU-1', description: 'One', quantity: 1, unitAmount: 10, accountCode: '200' },
-    { itemCode: 'SKU-2', description: 'Two', quantity: 2, unitAmount: 5, accountCode: '200' },
+    { itemCode: 'SKU-1', description: 'One', quantity: 1, unitAmount: 10, accountCode: '200', taxType: 'OUTPUT2' },
+    { itemCode: 'SKU-2', description: 'Two', quantity: 2, unitAmount: 5, accountCode: '200', taxType: 'OUTPUT2' },
   ],
 }
 
