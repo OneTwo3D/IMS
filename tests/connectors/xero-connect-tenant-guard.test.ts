@@ -313,6 +313,18 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
     // The full reset deletes the storefront mappings and the tax-rate writer's records in a transaction of their own (under the shared apply lock).
     shoppingTaxRateMapping: inertModel,
     wooTaxRateWrite: inertModel,
+    // The reset's sales-deletion stage is one transaction (retained invoice documents meet the orders that reference them); these deletes are not what this file measures.
+    shipmentLine: inertModel,
+    shipment: inertModel,
+    orderAllocation: inertModel,
+    returnExpectationLine: inertModel,
+    returnExpectation: inertModel,
+    invoiceDocumentFetchState: inertModel,
+    salesOrderInvoiceDocument: inertModel,
+    salesOrderRefundLine: inertModel,
+    salesOrderRefund: inertModel,
+    salesOrderLine: inertModel,
+    salesOrder: inertModel,
     setting: {
       findUnique: async ({ where }: { where: { key: string } }): Promise<SettingRow | null> => {
         if (settingReadGate) await settingReadGate(where.key)
@@ -563,6 +575,21 @@ const dbDouble: Record<string, unknown> = {
       : Promise.all(arg as Array<Promise<unknown>>),
 }
 
+// resetDatabase takes the invoice-document reset lock (a pinned advisory-lock connection and an in-transaction lock): neither exists in this double,
+// and they are not what these tests are about.
+mock.module('@/lib/domain/invoice-documents/reset-lock', {
+  namedExports: {
+    withInvoiceDocumentResetLock: async (run: (lock: { assertHeld: (context?: string) => void }) => Promise<unknown>) => run({ assertHeld: () => {} }),
+    lockResetInTransaction: async () => {},
+    AdvisoryLockWaitTimeoutError: class extends Error {},
+  },
+})
+mock.module('@/lib/domain/invoice-documents/reset-guard', {
+  namedExports: {
+    invoiceDocumentResetVerdict: async () => ({ ok: true, mayDeleteDocuments: false }),
+    InvoiceDocumentsRetainedError: class extends Error {},
+  },
+})
 mock.module('@/lib/db', {
   namedExports: {
     db: new Proxy(dbDouble, {

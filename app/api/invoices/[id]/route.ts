@@ -9,8 +9,8 @@ import { logActivity } from '@/lib/activity-log'
 import { auth } from '@/lib/auth'
 import { checkRateLimit, type RateLimitResult } from '@/lib/rate-limit'
 import { getClientIp } from '@/lib/request-ip'
+import { currentInvoiceIsWithdrawn, loadCurrentInvoicePdf } from '@/lib/domain/invoice-documents/current-document'
 import {
-  loadInvoicePdf,
   verifyPdfTokenDetailed,
   type InvoicePdfTokenBinding,
   type PdfTokenVerificationResult,
@@ -29,7 +29,9 @@ type InvoicePdfTokenAuditInput = {
 }
 
 type InvoicePdfRouteDependencies = {
-  loadInvoicePdf: typeof loadInvoicePdf
+  loadInvoicePdf: typeof loadCurrentInvoicePdf
+  /** Whether the order's current document is one the ledger withdrew (staff label). */
+  isWithdrawn?: (orderId: string) => Promise<boolean>
   verifyPdfToken: typeof verifyPdfTokenDetailed
   auditTokenAttempt: (input: InvoicePdfTokenAuditInput) => Promise<void>
   getTokenBinding?: (request: NextRequest, clientIp: string) => Promise<InvoicePdfTokenBinding | null>
@@ -41,7 +43,8 @@ const NO_STORE_HEADERS = {
 } as const
 
 const defaultDependencies: InvoicePdfRouteDependencies = {
-  loadInvoicePdf,
+  loadInvoicePdf: loadCurrentInvoicePdf,
+  isWithdrawn: currentInvoiceIsWithdrawn,
   verifyPdfToken: verifyPdfTokenDetailed,
   auditTokenAttempt: auditInvoicePdfTokenAttempt,
   getTokenBinding: getInvoicePdfTokenBinding,
@@ -178,16 +181,18 @@ export async function handleInvoicePdfRoute(
     userAgent,
   })
 
-  const pdf = await dependencies.loadInvoicePdf(id)
+  const pdf = await dependencies.loadInvoicePdf(id, { includeWithdrawn: true })
   if (!pdf) {
     return jsonNoStore({ error: 'Invoice PDF not found' }, 404)
   }
 
+  const withdrawn = dependencies.isWithdrawn ? await dependencies.isWithdrawn(id).catch(() => false) : false
   return new NextResponse(new Uint8Array(pdf), {
     status: 200,
     headers: {
       'Content-Type': 'application/pdf',
-      'Content-Disposition': `inline; filename="invoice-${safeInvoiceFilenameId(id)}.pdf"`,
+      'Content-Disposition': `inline; filename="invoice-${safeInvoiceFilenameId(id)}${withdrawn ? '-WITHDRAWN' : ''}.pdf"`,
+      ...(withdrawn ? { 'X-Invoice-Document-Status': 'withdrawn-by-ledger' } : {}),
       ...NO_STORE_HEADERS,
     },
   })

@@ -14,6 +14,8 @@ import {
 } from '@/lib/connectors/accounting-binding-lock-order'
 import { WC_ORDER_SWEEP_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
 import { freshAuthFailureResult, requireFreshAdmin } from '@/lib/auth/server'
+import { InvoiceDocumentsRetainedError, invoiceDocumentResetVerdict } from '@/lib/domain/invoice-documents/reset-guard'
+import { AdvisoryLockWaitTimeoutError, lockResetInTransaction, withInvoiceDocumentResetLock } from '@/lib/domain/invoice-documents/reset-lock'
 import { issueDestructiveActionCode, consumeDestructiveActionCode } from '@/lib/destructive-action-confirm'
 import {
   countUnrecordedIncidents,
@@ -52,7 +54,13 @@ async function clearSettingKeys(keys: readonly string[]) {
 // added, removed, or relationships change, update the relevant reset scope
 // below so the three UI options continue to match their labels.
 
-async function clearTransactionScope() {
+type ResetGuards = {
+  /** Throws once the reset's session lock has been lost: called between stages so a lost lock stops the reset before further deletes commit. */
+  assertHeld: (context?: string) => void
+}
+
+async function clearTransactionScope(guards: ResetGuards) {
+  guards.assertHeld('email and WMS state')
   // Email / notifications / transient operational state
   await db.emailOutbox.deleteMany({})
   await db.notificationReadReceipt.deleteMany({})
@@ -68,11 +76,13 @@ async function clearTransactionScope() {
   await db.wmsAsnLineMap.deleteMany({})
   await db.wmsAsnMap.deleteMany({})
 
+  guards.assertHeld('stock sync state')
   // Generic stock sync operational state
   await db.integrationOutbox.deleteMany({})
   await db.stockSyncJob.deleteMany({})
   await db.stockSyncState.deleteMany({})
 
+  guards.assertHeld('stock ledger')
   // Stock valuation / ledger
   await db.payment.deleteMany({})
   await db.cogsEntry.deleteMany({})
@@ -80,18 +90,32 @@ async function clearTransactionScope() {
   await db.costLayer.deleteMany({})
   await db.stockMovement.deleteMany({})
 
-  // Sales
-  await db.shipmentLine.deleteMany({})
-  await db.shipment.deleteMany({})
-  await db.orderAllocation.deleteMany({})
-  // Return expectations reference the refund and its lines (restrict), so they go first.
-  await db.returnExpectationLine.deleteMany({})
-  await db.returnExpectation.deleteMany({})
-  await db.salesOrderRefundLine.deleteMany({})
-  await db.salesOrderRefund.deleteMany({})
-  await db.salesOrderLine.deleteMany({})
-  await db.salesOrder.deleteMany({})
+  // Sales: ONE TRANSACTION, because it is where the retained invoice documents meet the orders they reference (RESTRICT foreign keys).
+  // It takes the reset's transaction-scoped exclusive lock and re-runs the document verdict INSIDE, so nothing depends on the pinned session
+  // lock still being alive: a promotion cannot commit between the verdict and the order delete (it takes both keys shared), and a refusal
+  // rolls the whole stage back. The stages before and after it are separate statements that commit one by one; see the note on resetDatabase.
+  guards.assertHeld('sales')
+  await db.$transaction(async (tx) => {
+    await lockResetInTransaction(tx)
+    const verdict = await invoiceDocumentResetVerdict(tx)
+    if (!verdict.ok) throw new InvoiceDocumentsRetainedError(verdict.reason)
+    await tx.shipmentLine.deleteMany({})
+    await tx.shipment.deleteMany({})
+    await tx.orderAllocation.deleteMany({})
+    // Return expectations reference the refund and its lines (restrict), so they go first.
+    await tx.returnExpectationLine.deleteMany({})
+    await tx.returnExpectation.deleteMany({})
+    // Stored customer invoice documents are a statutory record (six years) and their foreign keys to orders and refunds are RESTRICT: deleted
+    // only on a database declared disposable (the verdict above, in this transaction), otherwise the verdict has already refused.
+    await tx.invoiceDocumentFetchState.deleteMany({})
+    if (verdict.mayDeleteDocuments) await tx.salesOrderInvoiceDocument.deleteMany({})
+    await tx.salesOrderRefundLine.deleteMany({})
+    await tx.salesOrderRefund.deleteMany({})
+    await tx.salesOrderLine.deleteMany({})
+    await tx.salesOrder.deleteMany({})
+  }, { timeout: 600_000, maxWait: 30_000 })
 
+  guards.assertHeld('purchasing')
   // Purchasing
   await db.purchaseReturnLine.deleteMany({})
   await db.purchaseReturn.deleteMany({})
@@ -104,6 +128,7 @@ async function clearTransactionScope() {
   await db.purchaseOrderLine.deleteMany({})
   await db.purchaseOrder.deleteMany({})
 
+  guards.assertHeld('manufacturing and warehouse ops')
   // Manufacturing / warehouse ops
   await db.productionOrder.deleteMany({})
   await db.stockLevel.deleteMany({})
@@ -112,6 +137,7 @@ async function clearTransactionScope() {
   await db.stockCountLine.deleteMany({})
   await db.stockCount.deleteMany({})
 
+  guards.assertHeld('sync and audit history')
   // Sync / audit history
   await db.shoppingSyncLog.deleteMany({})
   await db.accountingSyncLog.deleteMany({})
@@ -364,32 +390,57 @@ export async function sendDatabaseResetCode(): Promise<{ success: boolean; email
   }
 }
 
+/**
+ * WHAT A RESET GUARANTEES, AND WHAT IT CANNOT. The stages are separate statements and (apart from the sales stage) commit one by one, as they always
+ * have. The sales stage, where the retained invoice documents meet the orders that reference them, is ONE transaction that takes its own exclusive
+ * lock and re-runs the document verdict inside, so it either deletes consistently or rolls back, whether or not the pinned session lock is alive.
+ * `assertHeld` between stages stops the reset when that session lock is lost. What can still be left partial: if the reset stops (a lost lock, a
+ * refusal in the sales stage, a crash), the stages that already committed (email, WMS, stock sync, stock ledger, payments) stay deleted and the
+ * rest are untouched; every stage is idempotent, so running the reset again completes it (and on a database that holds retained invoice documents
+ * and is not declared disposable it refuses up front, before any deletion, as it does on the first run).
+ */
 export async function resetDatabase(level: ResetLevel, confirmationCode: string): Promise<{ success: boolean; error?: string; code?: string; reason?: string }> {
   try {
     const session = await requireFreshAdmin()
     if (!confirmationCode || confirmationCode.trim().length < 6) {
       return { success: false, error: 'Email confirmation code is required.' }
     }
-    const confirmed = await consumeDestructiveActionCode({
-      purpose: 'database_reset',
-      token: confirmationCode,
-      userId: session.user.id,
+    // THE INVOICE-DOCUMENT RESET LOCK, EXCLUSIVE, before the preflight and through every delete: a fetch promoting a document between the preflight
+    // and the deletes would otherwise make the order delete fail part-way. A fetch that meets it promotes nothing and is retried.
+    const outcome = await withInvoiceDocumentResetLock(async (lock): Promise<{ success: false; error: string } | null> => {
+      // BEFORE the confirmation code is spent and before anything is deleted: stored invoice documents are retained records.
+      const documentVerdict = await invoiceDocumentResetVerdict()
+      if (!documentVerdict.ok) return { success: false, error: documentVerdict.reason }
+      const confirmed = await consumeDestructiveActionCode({
+        purpose: 'database_reset',
+        token: confirmationCode,
+        userId: session.user.id,
+      })
+      if (!confirmed) {
+        return { success: false, error: 'Email confirmation code is invalid or expired.' }
+      }
+
+      if (level === 'transactions' || level === 'products' || level === 'full') {
+        await clearTransactionScope(lock)
+      }
+
+      if (level === 'products' || level === 'full') {
+        lock.assertHeld('product scope')
+        await clearProductScope()
+      }
+
+      if (level === 'full') {
+        lock.assertHeld('full scope')
+        await clearFullScope()
+      }
+
+      return null
+    }).catch((error): { success: false; error: string } => {
+      if (error instanceof InvoiceDocumentsRetainedError) return { success: false, error: error.message }
+      if (error instanceof AdvisoryLockWaitTimeoutError) return { success: false, error: 'Another operation is holding the database reset lock. Nothing was deleted; try again in a moment.' }
+      throw error
     })
-    if (!confirmed) {
-      return { success: false, error: 'Email confirmation code is invalid or expired.' }
-    }
-
-    if (level === 'transactions' || level === 'products' || level === 'full') {
-      await clearTransactionScope()
-    }
-
-    if (level === 'products' || level === 'full') {
-      await clearProductScope()
-    }
-
-    if (level === 'full') {
-      await clearFullScope()
-    }
+    if (outcome) return outcome
 
     revalidatePath('/')
     if (level !== 'full') {

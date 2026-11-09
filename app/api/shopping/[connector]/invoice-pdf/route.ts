@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 
 import { logActivity } from '@/lib/activity-log'
 import { db } from '@/lib/db'
-import { loadInvoicePdf } from '@/lib/invoice-pdf'
+import { loadCurrentInvoicePdf } from '@/lib/domain/invoice-documents/current-document'
 import { checkRateLimit, type RateLimitResult } from '@/lib/rate-limit'
 import { getClientIp } from '@/lib/request-ip'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
@@ -42,9 +42,20 @@ type ShoppingInvoicePdfRouteDependencies = {
   getSecret: (connector: ShoppingConnectorId) => Promise<string | null>
   findOrder: (request: ShoppingInvoicePdfRequest) => Promise<ShoppingInvoicePdfOrder | null>
   consumeNonce: (request: ShoppingInvoicePdfRequest) => Promise<boolean>
-  loadInvoicePdf: typeof loadInvoicePdf
+  loadInvoicePdf: typeof loadCurrentInvoicePdf
   auditAttempt: (input: ShoppingInvoicePdfAuditInput) => Promise<void>
   checkRateLimit?: (key: string, max: number, windowMs: number) => Promise<RateLimitResult>
+  /**
+   * Fetch the invoice from the accounting ledger for an order IMS holds no PDF for yet (historic orders are
+   * fetched on first customer download). Called only AFTER the request is verified and the order is proved to be
+   * the caller's. True when a PDF is now stored. Absent in tests that do not exercise it.
+   */
+  ensureInvoiceOnDemand?: (orderId: string) => Promise<boolean>
+  /**
+   * Look again at a PDF IMS already holds when its recheck is due (the ledger can amend an invoice). Never throws; whatever is
+   * stored is served when the ledger cannot be asked.
+   */
+  refreshStaleInvoice?: (orderId: string) => Promise<void>
   now?: Date | number
 }
 
@@ -62,9 +73,11 @@ const defaultDependencies: ShoppingInvoicePdfRouteDependencies = {
   getSecret: getShoppingInvoicePdfSecret,
   findOrder: findShoppingInvoicePdfOrder,
   consumeNonce: consumeShoppingInvoicePdfNonce,
-  loadInvoicePdf,
+  loadInvoicePdf: loadCurrentInvoicePdf,
   auditAttempt: auditShoppingInvoicePdfAttempt,
   checkRateLimit,
+  ensureInvoiceOnDemand: ensureShoppingInvoiceOnDemand,
+  refreshStaleInvoice: refreshShoppingInvoice,
 }
 
 // DERIVED FROM THE REGISTRY (o3d-remove-parked-connectors): a second id union here would mean this
@@ -85,6 +98,22 @@ function safeInvoiceFilename(value: string | null | undefined): string {
 async function isShoppingConnectorPluginEnabled(connector: ShoppingConnectorId): Promise<boolean> {
   const pluginState = await getIntegrationPluginState()
   return pluginState[connector]
+}
+
+async function ensureShoppingInvoiceOnDemand(orderId: string): Promise<boolean> {
+  const [{ ensureInvoiceDocumentOnDemand }, { xeroInvoiceDocumentDeps }] = await Promise.all([
+    import('@/lib/domain/invoice-documents/sweep'),
+    import('@/lib/connectors/xero/invoice-document-deps'),
+  ])
+  return ensureInvoiceDocumentOnDemand(orderId, xeroInvoiceDocumentDeps())
+}
+
+async function refreshShoppingInvoice(orderId: string): Promise<void> {
+  const [{ refreshStaleInvoiceDocument }, { xeroInvoiceDocumentDeps }] = await Promise.all([
+    import('@/lib/domain/invoice-documents/sweep'),
+    import('@/lib/connectors/xero/invoice-document-deps'),
+  ])
+  await refreshStaleInvoiceDocument(orderId, xeroInvoiceDocumentDeps())
 }
 
 function isUniqueConstraintError(error: unknown): error is { code: string } {
@@ -276,9 +305,24 @@ export async function handleShoppingInvoicePdfRoute(
     orderId: order?.orderId ?? null,
   }
   if (!order) return reject(dependencies, auditWithOrder, 'order_not_found')
-  if (!order.invoicePdfPath) return reject(dependencies, auditWithOrder, 'invoice_pdf_missing', 404)
-  if (!await dependencies.consumeNonce(parsed.request)) {
+  let nonceConsumed = false
+  if (!order.invoicePdfPath) {
+    // A historic order the sweep never covered: ask the ledger once (throttled per document, and only with the
+    // lazy-fetch setting on). The caller is already proved to own the order. The request's one-time nonce is spent
+    // BEFORE the ledger is asked, so a replayed request cannot be used to drive ledger calls. Any failure is the
+    // same 404 as before.
+    if (!dependencies.ensureInvoiceOnDemand) return reject(dependencies, auditWithOrder, 'invoice_pdf_missing', 404)
+    if (!await dependencies.consumeNonce(parsed.request)) return reject(dependencies, auditWithOrder, 'nonce_replayed')
+    nonceConsumed = true
+    const fetched = await dependencies.ensureInvoiceOnDemand(order.orderId).catch(() => false)
+    if (!fetched) return reject(dependencies, auditWithOrder, 'invoice_pdf_missing', 404)
+  }
+  if (!nonceConsumed && !await dependencies.consumeNonce(parsed.request)) {
     return reject(dependencies, auditWithOrder, 'nonce_replayed')
+  }
+  if (!nonceConsumed && dependencies.refreshStaleInvoice) {
+    // The nonce is spent, so a replay cannot drive this. Failures are swallowed inside: the stored PDF is served.
+    await dependencies.refreshStaleInvoice(order.orderId).catch(() => undefined)
   }
 
   const pdf = await dependencies.loadInvoicePdf(order.orderId)
