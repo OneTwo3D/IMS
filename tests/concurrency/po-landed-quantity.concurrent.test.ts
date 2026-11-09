@@ -43,7 +43,7 @@ mock.module('@/lib/domain/wms/mutation-audit', {
 })
 mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
 
-const { loadEnv, enableStockReceiptPosting, uid, seedPo, addAsn, alignUp, receive, bookIn, snapshotOf } = fixtures
+const { loadEnv, enableStockReceiptPosting, uid, seedPo, addAsn, alignUp, receive, receiveLegacy, bookIn, snapshotOf } = fixtures
 
 test.before(async () => {
   if (!RUN) return
@@ -124,7 +124,7 @@ test(
     const po = await seedPo('a3full', [10])
     const line = po.lines[0]!
     const asn = await addAsn(po, line, { expectedQty: 10 })
-    const received = await receive(po, line, 10)
+    const received = await receiveLegacy(po, line, 10)
     assert.equal(received.success, true, `PRECONDITION: the manual receipt must succeed: ${received.error}`)
     const before = await snapshotOf(po, line)
     // PRECONDITIONS: the ASN row still has all its own room (so only the LINE cap can refuse), the line is
@@ -153,7 +153,7 @@ test(
     const po = await seedPo('a3small', [10])
     const line = po.lines[0]!
     const asn = await addAsn(po, line, { expectedQty: 10 })
-    assert.equal((await receive(po, line, 7)).success, true, 'PRECONDITION: the manual receipt of 7 must succeed')
+    assert.equal((await receiveLegacy(po, line, 7)).success, true, 'PRECONDITION: the manual receipt of 7 must succeed')
     const base = await snapshotOf(po, line)
     assert.equal(base.stock, 7)
     assert.equal(base.credits.get(asn.asnLineMapId)?.snapshot, 0, 'PRECONDITION: the ASN row has residue 10 (uncredited); the line has residue 3')
@@ -447,7 +447,7 @@ test(
       // WAITS for this lock inside its transaction.
       await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${po.poId} FOR UPDATE`
       const [{ pid: holderPid }] = await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid() AS pid`
-      receipt = receive(po, line, 10)
+      receipt = receiveLegacy(po, line, 10)
       blockedPid = await waitForBackendBlockedBy(holderPid)
       // The credit lands while the receipt is parked: 6 units aligned, exactly as the alignment writes them.
       await tx.wmsAsnLineMap.update({

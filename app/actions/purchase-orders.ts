@@ -1,5 +1,6 @@
 'use server'
 
+import { assertNoLiveAsnForReceipt, ManualReceiptRefusedByLiveAsnError } from '@/lib/domain/wms/po-receipt-asn-guard'
 import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
 import { taxTypeForBasis } from '@/lib/accounting/reverse-charge'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
@@ -1940,6 +1941,18 @@ export async function receivePurchaseOrder(
       if (!rl.warehouseId) return { success: false, error: 'Warehouse is required for each line' }
       if (!po.lines.find((l) => l.id === rl.poLineId)) return { success: false, error: 'Invalid PO line' }
     }
+    // o3d-papk follow-up: a line with a live warehouse ASN is booked in through the ASN, not by hand. This unlocked read
+    // only gives the operator the answer early; the authoritative check is in the transaction below, under the PO lock.
+    // Skipped when the call carries an idempotency token: a retry of a receipt that already committed must reach the
+    // in-transaction idempotency check and report success, and the in-transaction refusal still covers a fresh receipt.
+    if (!options?.idempotencyToken) {
+      try {
+        await assertNoLiveAsnForReceipt(db, po.reference, linesWithQty.map((rl) => rl.poLineId))
+      } catch (refusal) {
+        if (refusal instanceof ManualReceiptRefusedByLiveAsnError) return { success: false, error: refusal.message }
+        throw refusal
+      }
+    }
     // mgyk: validate SUMMED qty per PO line against outstanding, not per row. A single
     // receipt may legitimately split one line across warehouses, but the TOTAL must not
     // over-receive it — the old per-row check let two rows for the same line each pass
@@ -2004,6 +2017,11 @@ export async function receivePurchaseOrder(
         })
         if (priorReceipt) return { alreadyApplied: true as const }
       }
+
+      // AUTHORITATIVE live-ASN refusal, read under the purchase_orders row lock taken above (ASN creation and the booked-in
+      // service take the PO first too, so this read cannot race them). After the idempotency check, so a retry of a receipt
+      // that already committed still reports success. See lib/domain/wms/po-receipt-asn-guard.ts.
+      await assertNoLiveAsnForReceipt(tx, po.reference, linesWithQty.map((rl) => rl.poLineId))
 
       const currentPo = await tx.purchaseOrder.findUnique({
         where: { id },
@@ -2464,6 +2482,7 @@ export async function receivePurchaseOrder(
     }
     return warnings.length > 0 ? { success: true, warnings } : { success: true }
   } catch (e) {
+    if (e instanceof ManualReceiptRefusedByLiveAsnError) return { success: false, error: e.message }
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,

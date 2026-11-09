@@ -43,7 +43,7 @@ mock.module('@/lib/activity-log', {
 mock.module('@/lib/fulfillment/backorder-allocator', { namedExports: { allocateBackordersForProducts: async () => ({}) } })
 mock.module('@/lib/fulfillment/overallocation-rebalancer', { namedExports: { releaseOverallocations: async () => ({}) } })
 
-const { loadEnv, enableStockReceiptPosting, uid, seedPo, addAsn, alignUp, receive, snapshotOf, UNIT_COST } = fixtures
+const { loadEnv, enableStockReceiptPosting, uid, seedPo, addAsn, alignUp, receive, receiveLegacy, snapshotOf, UNIT_COST } = fixtures
 
 test.before(async () => {
   if (!RUN) return
@@ -101,7 +101,7 @@ test(
 
     const aligned = await alignUp(po, line, { delta: 6, imsQty: 0 })
     assert.equal(aligned.applied, true, `PRECONDITION: alignment applied: ${JSON.stringify(aligned)}`)
-    const manual = await receive(po, line, 4)
+    const manual = await receiveLegacy(po, line, 4)
     assert.equal(manual.success, true, `PRECONDITION: the manual 4 is accepted (6 landed, 4 outstanding): ${manual.error}`)
     const mid = await snapshotOf(po, line)
     assert.equal(mid.stock, 10, 'PRECONDITION: 6 aligned + 4 manual = 10 physical units in stock')
@@ -121,7 +121,7 @@ test(
     assert.equal(after.layerQty, 10, 'cost layers total 10 units')
     assert.equal(after.layerCount, after.journals, 'one STOCK_RECEIPT journal per cost layer: 10 x cost in total')
 
-    const second = await receive(po, line, 4)
+    const second = await receiveLegacy(po, line, 4)
     const final = await snapshotOf(po, line)
     assert.equal(second.success, false, `a SECOND manual 4 must be refused: nothing is outstanding (stock is ${final.stock} for 10 physical units)`)
     assert.equal(final.stock, 10)
@@ -168,7 +168,7 @@ test(
     const po = await seedPo('ad4', [10])
     const line = po.lines[0]!
     const asn = await addAsn(po, line, { expectedQty: 10, status: 'OPEN' })
-    const manual = await receive(po, line, 4)
+    const manual = await receiveLegacy(po, line, 4)
     assert.equal(manual.success, true, `PRECONDITION: the manual 4 is accepted: ${manual.error}`)
     assert.equal((await snapshotOf(po, line)).stock, 4, 'PRECONDITION: the manual receipt put 4 in stock')
 

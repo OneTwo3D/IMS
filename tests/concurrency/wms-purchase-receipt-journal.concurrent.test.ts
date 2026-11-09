@@ -1,4 +1,5 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
+import { withLiveAsnsSetAside } from './po-landed-fixtures'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import { config } from 'dotenv'
@@ -909,9 +910,9 @@ test('o3d-8f0p6: a book-in of goods already received by hand adds no second jour
   const expectedAmount = seeded.qty * UNIT_COST
 
   const { receivePurchaseOrder } = await import('@/app/actions/purchase-orders')
-  const manual = await receivePurchaseOrder(seeded.poId, [
+  const manual = await withLiveAsnsSetAside(seeded.poId, () => receivePurchaseOrder(seeded.poId, [
     { poLineId: seeded.poLineId, qtyReceived: seeded.qty, warehouseId: seeded.warehouseId },
-  ])
+  ]))
   assert.equal(manual.success, true, `PRECONDITION: the manual receipt must succeed: ${manual.error}`)
   const afterManual = await stockReceiptLogsFor(seeded.poId)
   const transitAfterManual = await transitRowsFor(seeded.poId)
@@ -1723,9 +1724,9 @@ test('o3d-8m8pe: a cancelled linked freight order contributes nothing to the MAN
   const wrongUnitCost = GOODS_UNIT + (LIVE_FREIGHT + CANCELLED_FREIGHT) / QTY
 
   const { receivePurchaseOrder } = await import('@/app/actions/purchase-orders')
-  const received = await receivePurchaseOrder(seeded.poId, [
+  const received = await withLiveAsnsSetAside(seeded.poId, () => receivePurchaseOrder(seeded.poId, [
     { poLineId: seeded.poLineId, qtyReceived: RECEIVE_QTY, warehouseId: seeded.warehouseId },
-  ])
+  ]))
   assert.equal(received.success, true, `PRECONDITION: the manual receipt must succeed: ${received.error}`)
   const po = await db.purchaseOrder.findUniqueOrThrow({ where: { id: seeded.poId }, select: { status: true } })
   assert.equal(po.status, 'PARTIALLY_RECEIVED', 'PRECONDITION: the receipt must be the PARTIAL one this arm is about')
@@ -1816,9 +1817,9 @@ test('o3d-8m8pe: a FULL manual receipt with a cancelled linked freight order com
   assert.notEqual(expectedUnitCost, wrongUnitCost, 'PRECONDITION: the two answers must be distinguishable')
 
   const { receivePurchaseOrder } = await import('@/app/actions/purchase-orders')
-  const received = await receivePurchaseOrder(seeded.poId, [
+  const received = await withLiveAsnsSetAside(seeded.poId, () => receivePurchaseOrder(seeded.poId, [
     { poLineId: seeded.poLineId, qtyReceived: QTY, warehouseId: seeded.warehouseId },
-  ])
+  ]))
   assert.equal(
     received.success,
     true,
