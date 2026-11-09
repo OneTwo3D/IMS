@@ -15,6 +15,7 @@ import { createHash } from 'node:crypto'
 import { db } from '@/lib/db'
 import { xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
 import { otherOrdersHoldingInvoiceNumber } from './number-uniqueness'
+import { ORDER_EVIDENCE_SELECT, orderEvidenceFingerprint } from './order-fingerprint'
 import { loadInvoiceDocumentFile, loadInvoicePdf } from '@/lib/invoice-pdf'
 
 async function markDue(orderId: string): Promise<void> {
@@ -24,7 +25,7 @@ async function markDue(orderId: string): Promise<void> {
   }).catch(() => { /* the integrity scan finds it too */ })
 }
 
-export type InvoiceUnavailableReason = 'withdrawn' | 'number-shared'
+export type InvoiceUnavailableReason = 'withdrawn' | 'number-shared' | 'order-changed'
 
 /**
  * Why the order's current invoice document is NOT shown to the customer although IMS holds it, or null when it is available: the ledger
@@ -33,11 +34,12 @@ export type InvoiceUnavailableReason = 'withdrawn' | 'number-shared'
 export async function currentInvoiceUnavailableReason(orderId: string): Promise<InvoiceUnavailableReason | null> {
   const current = await db.salesOrderInvoiceDocument.findFirst({
     where: { orderId, kind: 'INVOICE', refundId: null, supersededAt: null },
-    select: { withdrawnAt: true, documentNumber: true },
+    select: { withdrawnAt: true, documentNumber: true, evidenceKey: true, order: { select: ORDER_EVIDENCE_SELECT } },
     orderBy: { fetchedAt: 'desc' },
   })
   if (!current) return null
   if (current.withdrawnAt) return 'withdrawn'
+  if (current.evidenceKey && current.evidenceKey !== orderEvidenceFingerprint(current.order, null)) return 'order-changed'
   return (await otherOrdersHoldingInvoiceNumber(db, orderId, current.documentNumber)) > 0 ? 'number-shared' : null
 }
 
@@ -60,7 +62,7 @@ async function flagNumberCollision(orderId: string): Promise<void> {
 export async function loadCurrentInvoicePdf(orderId: string, options: { includeWithdrawn?: boolean } = {}): Promise<Buffer | null> {
   const current = await db.salesOrderInvoiceDocument.findFirst({
     where: { orderId, kind: 'INVOICE', refundId: null, supersededAt: null },
-    select: { sha256: true, documentNumber: true, withdrawnAt: true, order: { select: { invoiceNumber: true } } },
+    select: { sha256: true, documentNumber: true, withdrawnAt: true, evidenceKey: true, order: { select: ORDER_EVIDENCE_SELECT } },
     orderBy: { fetchedAt: 'desc' },
   })
   if (!current) return loadInvoicePdf(orderId)
@@ -72,6 +74,15 @@ export async function loadCurrentInvoicePdf(orderId: string, options: { includeW
   if (xeroInvoiceNumberIdentity(current.order.invoiceNumber ?? '') !== xeroInvoiceNumberIdentity(current.documentNumber)) {
     await markDue(orderId)
     return null
+  }
+
+  // THE ORDER MUST STILL BE WHAT THE DOCUMENT WAS JUDGED AGAINST: customer, currency, gross total (incl. store credit), cancelled or not and
+  // the order numbers. A change after storage means the document may no longer be this order's; it is not served to the customer, the
+  // document is made due for a re-fetch (which re-judges it and refreshes the fingerprint), and staff can still open it.
+  // A row with no fingerprint predates the column and cannot be checked.
+  if (current.evidenceKey && current.evidenceKey !== orderEvidenceFingerprint(current.order, null)) {
+    await markDue(orderId)
+    if (!options.includeWithdrawn) return null
   }
 
   // NOR MAY ANOTHER ORDER HOLD THAT NUMBER NOW: the storefront's number is not unique in IMS, so a collision arriving after the document was

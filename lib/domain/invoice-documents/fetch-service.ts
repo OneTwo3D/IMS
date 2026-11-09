@@ -31,6 +31,8 @@
 
 import { createHash, randomUUID } from 'node:crypto'
 
+import { INVOICE_DOCUMENT_PROMOTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { invoiceDocumentStoredPath, saveInvoiceDocumentFile } from '@/lib/invoice-pdf'
@@ -40,6 +42,8 @@ import { assessDocumentEvidence, expectedInvoiceGross, type EvidenceSubject } fr
 import { nextAttemptDelayMs, recheckDelayMs, shouldEscalateMissing } from './backoff'
 import { validateFetchedPdf } from './pdf-validate'
 import { otherOrdersHoldingInvoiceNumber } from './number-uniqueness'
+import { orderEvidenceFingerprint, orderEvidenceKey } from './order-fingerprint'
+import { invoiceDocumentResetRunning, tryShareResetLock } from './reset-lock'
 
 export type InvoiceDocumentKindName = 'INVOICE' | 'CREDIT_NOTE'
 
@@ -91,39 +95,6 @@ export function invoiceDocumentSubjectKey(orderId: string, kind: InvoiceDocument
 function lockKeyOf(subjectKey: string): number {
   // A stable 32-bit key from the subject, for pg_advisory_xact_lock(int4, int4).
   return createHash('sha256').update(subjectKey).digest().readInt32BE(0)
-}
-const LOCK_NAMESPACE = 0x1d0c // distinguishes these locks from other advisory-lock users
-
-type OrderEvidenceRow = {
-  status: string
-  invoiceNumber: string | null
-  orderNumber: string | null
-  externalOrderNumber: string | null
-  customerName: string | null
-  currency: string
-  totalForeign: unknown
-  storeCreditForeign: unknown
-  storeCreditAssessment: unknown
-}
-
-/**
- * Everything the ownership check and the expected gross were computed from, as one comparable string. The importer can correct an
- * order's invoice number (while no ledger invoice is linked), its credit or its customer while a fetch is in flight, so promotion
- * re-reads these under the order row lock and refuses to publish a document judged against values that have since moved.
- */
-function orderEvidenceKey(order: OrderEvidenceRow, creditNoteNumber: string | null): string {
-  return JSON.stringify([
-    order.status === 'CANCELLED',
-    (order.invoiceNumber ?? '').trim().toLowerCase(),
-    creditNoteNumber === null ? null : creditNoteNumber.trim().toLowerCase(),
-    order.orderNumber,
-    order.externalOrderNumber,
-    order.customerName,
-    order.currency,
-    String(order.totalForeign),
-    String(order.storeCreditForeign),
-    order.storeCreditAssessment ?? null,
-  ])
 }
 
 type StatePatch = {
@@ -203,6 +174,9 @@ export async function ensureInvoiceDocument(
     return { status: 'not-applicable', reason: 'a credit note document needs the refund it documents' }
   }
   const subjectKey = invoiceDocumentSubjectKey(input.orderId, input.kind, input.refundId)
+
+  // A database reset holds its lock exclusive for its whole run: skip rather than call the ledger for a document that cannot be stored.
+  if (await invoiceDocumentResetRunning()) return { status: 'busy' }
 
   // THE LEASE, BEFORE THE LEDGER IS READ. The state row is the lock: created if missing, then taken by an atomic compare-and-set on its
   // expiry that also writes a holder token unique to this fetch. Everything below (lookup, download, promotion, pointer) happens under it,
@@ -299,6 +273,7 @@ async function ensureUnderLease(
   }
 
   const evidenceKeyAtStart = orderEvidenceKey(order, snapshotCreditNote)
+  const fingerprintAtStart = orderEvidenceFingerprint(order, snapshotCreditNote)
   const state = await db.invoiceDocumentFetchState.findUnique({ where: { subjectKey } })
   if (state?.status === 'NEEDS_ATTENTION') {
     return { status: 'needs-attention', reason: state.lastError ?? 'needs attention' }
@@ -420,7 +395,9 @@ async function ensureUnderLease(
   const storedPath = invoiceDocumentStoredPath(input.orderId, validation.sha256)
 
   const recorded = await db.$transaction(async (tx) => {
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${LOCK_NAMESPACE}::int4, ${lockKeyOf(subjectKey)}::int4)`
+    // A DATABASE RESET IN PROGRESS: it holds the reset lock exclusive, so nothing is promoted under it (the fetch is retried afterwards).
+    if (!(await tryShareResetLock(tx))) return { kind: 'reset-running' as const }
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${INVOICE_DOCUMENT_PROMOTION_LOCK_NAMESPACE}::int4, ${lockKeyOf(subjectKey)}::int4)`
     // THE PROMOTION REQUIRES THE LEASE: the first statement renews it as its holder, and a fetch that was taken over writes nothing.
     const stillHeld = await tx.invoiceDocumentFetchState.updateMany({
       where: { subjectKey, leaseHolder: token },
@@ -464,7 +441,7 @@ async function ensureUnderLease(
       documentId = existing.id
       if (!existing.supersededAt) {
         // Already the current version (a recheck found it unchanged, or a withdrawn one is valid again): make sure it is served.
-        await tx.salesOrderInvoiceDocument.update({ where: { id: existing.id }, data: { withdrawnAt: null } })
+        await tx.salesOrderInvoiceDocument.update({ where: { id: existing.id }, data: { withdrawnAt: null, evidenceKey: fingerprintAtStart } })
       }
       if (existing.supersededAt) {
         // The ledger reverted to bytes seen before: that version is current again.
@@ -472,7 +449,7 @@ async function ensureUnderLease(
           where: { orderId: input.orderId, kind: input.kind, refundId: input.refundId ?? null, supersededAt: null },
           data: { supersededAt: deps.now() },
         })
-        await tx.salesOrderInvoiceDocument.update({ where: { id: existing.id }, data: { supersededAt: null, withdrawnAt: null } })
+        await tx.salesOrderInvoiceDocument.update({ where: { id: existing.id }, data: { supersededAt: null, withdrawnAt: null, evidenceKey: fingerprintAtStart } })
       }
     } else {
       await tx.salesOrderInvoiceDocument.updateMany({
@@ -492,6 +469,7 @@ async function ensureUnderLease(
           byteSize: validation.byteSize,
           storedPath,
           fetchedAt: deps.now(),
+          evidenceKey: fingerprintAtStart,
         },
         select: { id: true },
       })
@@ -507,6 +485,7 @@ async function ensureUnderLease(
   })
 
   if (recorded.kind === 'lost') throw new LeaseLost()
+  if (recorded.kind === 'reset-running') return defer(`${label}: a database reset is running, so nothing is stored; the fetch is retried afterwards`, 'failed')
   if (recorded.kind === 'number-shared') return conflictNeedsAttention(`${label}: another IMS ${input.kind === 'INVOICE' ? 'order' : 'refund'} was given the same number while the document was being fetched, so it cannot be tied to this one`)
   if (recorded.kind === 'order-changed') return defer(`${label}: the order changed while the document was being fetched (invoice number, total, credit or customer), so the downloaded bytes are discarded`, 'failed')
   if (recorded.kind === 'conflict') return needsAttention(recorded.reason)

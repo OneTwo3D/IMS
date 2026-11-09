@@ -106,7 +106,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   },
   SalesOrderInvoiceDocument: {
     erased: [],
-    notPersonal: ['connector', 'externalDocumentId', 'externalStatus', 'sha256'],
+    notPersonal: ['connector', 'externalDocumentId', 'externalStatus', 'sha256', 'evidenceKey'],
     retained: {
       documentNumber: 'issued invoice / credit note number, statutory record',
       storedPath: 'the issued invoice / credit note PDF is a statutory record, kept six years',

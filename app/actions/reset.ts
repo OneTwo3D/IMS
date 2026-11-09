@@ -15,6 +15,7 @@ import {
 import { WC_ORDER_SWEEP_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
 import { freshAuthFailureResult, requireFreshAdmin } from '@/lib/auth/server'
 import { invoiceDocumentResetVerdict } from '@/lib/domain/invoice-documents/reset-guard'
+import { AdvisoryLockWaitTimeoutError, withInvoiceDocumentResetLock } from '@/lib/domain/invoice-documents/reset-lock'
 import { issueDestructiveActionCode, consumeDestructiveActionCode } from '@/lib/destructive-action-confirm'
 import {
   countUnrecordedIncidents,
@@ -376,29 +377,39 @@ export async function resetDatabase(level: ResetLevel, confirmationCode: string)
     if (!confirmationCode || confirmationCode.trim().length < 6) {
       return { success: false, error: 'Email confirmation code is required.' }
     }
-    // BEFORE the confirmation code is spent and before anything is deleted: stored invoice documents are retained records.
-    const documentVerdict = await invoiceDocumentResetVerdict()
-    if (!documentVerdict.ok) return { success: false, error: documentVerdict.reason }
-    const confirmed = await consumeDestructiveActionCode({
-      purpose: 'database_reset',
-      token: confirmationCode,
-      userId: session.user.id,
+    // THE INVOICE-DOCUMENT RESET LOCK, EXCLUSIVE, before the preflight and through every delete: a fetch promoting a document between the preflight
+    // and the deletes would otherwise make the order delete fail part-way. A fetch that meets it promotes nothing and is retried.
+    const outcome = await withInvoiceDocumentResetLock(async (): Promise<{ success: false; error: string } | null> => {
+      // BEFORE the confirmation code is spent and before anything is deleted: stored invoice documents are retained records.
+      const documentVerdict = await invoiceDocumentResetVerdict()
+      if (!documentVerdict.ok) return { success: false, error: documentVerdict.reason }
+      const confirmed = await consumeDestructiveActionCode({
+        purpose: 'database_reset',
+        token: confirmationCode,
+        userId: session.user.id,
+      })
+      if (!confirmed) {
+        return { success: false, error: 'Email confirmation code is invalid or expired.' }
+      }
+
+      if (level === 'transactions' || level === 'products' || level === 'full') {
+        await clearTransactionScope({ mayDeleteInvoiceDocuments: documentVerdict.mayDeleteDocuments })
+      }
+
+      if (level === 'products' || level === 'full') {
+        await clearProductScope()
+      }
+
+      if (level === 'full') {
+        await clearFullScope()
+      }
+
+      return null
+    }).catch((error): { success: false; error: string } => {
+      if (error instanceof AdvisoryLockWaitTimeoutError) return { success: false, error: 'Another operation is holding the database reset lock. Nothing was deleted; try again in a moment.' }
+      throw error
     })
-    if (!confirmed) {
-      return { success: false, error: 'Email confirmation code is invalid or expired.' }
-    }
-
-    if (level === 'transactions' || level === 'products' || level === 'full') {
-      await clearTransactionScope({ mayDeleteInvoiceDocuments: documentVerdict.mayDeleteDocuments })
-    }
-
-    if (level === 'products' || level === 'full') {
-      await clearProductScope()
-    }
-
-    if (level === 'full') {
-      await clearFullScope()
-    }
+    if (outcome) return outcome
 
     revalidatePath('/')
     if (level !== 'full') {

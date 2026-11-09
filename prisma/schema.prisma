@@ -2282,6 +2282,8 @@ model SalesOrderInvoiceDocument {
   /// Set when a recheck finds the ledger has VOIDED this current document on an order that is not cancelled: the bytes and history are kept,
   /// but no customer-facing reader serves it until a valid replacement is promoted (staff can still see it, labelled).
   withdrawnAt        DateTime?           @map("withdrawn_at")
+  /// SHA-256 of what the document was judged against when it was promoted (customer, currency, gross total incl. store credit, cancelled or not, order numbers, invoice number). A customer read compares it with the order as it is NOW and refuses on a difference. NULL only for a row that predates it.
+  evidenceKey        String?             @map("evidence_key")
 
   order  SalesOrder        @relation(fields: [orderId], references: [id])
   refund SalesOrderRefund? @relation(fields: [refundId], references: [id])

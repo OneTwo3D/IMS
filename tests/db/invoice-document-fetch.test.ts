@@ -915,3 +915,88 @@ test('the reset refuses BEFORE deleting anything when invoice documents are stor
     await cleanup(db, order.id)
   }
 })
+
+test('the order\'s customer, total or credit changed after storage: not served to the customer, due for a re-fetch, staff can still open it; the re-fetch refreshes the fingerprint', { skip }, async () => {
+  const { db, service } = await setup()
+  const { order } = await seedOrder(db, false, { customerName: 'Ada Lovelace' })
+  try {
+    const { loadCurrentInvoicePdf, currentInvoiceUnavailableReason } = await import('../../lib/domain/invoice-documents/current-document')
+    const bytes = pdf('judged-against-ada')
+    let customer = 'Ada Lovelace'
+    const deps: Deps = { ...depsFor(order, { bytes: () => bytes }), lookupInvoiceClaims: async (number) => ({ ok: true, claims: [ledgerClaim(order, number, { contactName: customer })] }) }
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, deps)).status, 'stored')
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id), bytes)
+    assert.ok((await db.salesOrderInvoiceDocument.findFirstOrThrow({ where: { orderId: order.id } })).evidenceKey, 'the fingerprint is stored on the row')
+
+    for (const change of [{ customerName: 'Grace Hopper' }, { totalForeign: new Prisma.Decimal('90') }, { storeCreditForeign: new Prisma.Decimal('10'), storeCreditAssessment: 'ASSESSED' as const }, { currency: 'EUR' }]) {
+      await db.salesOrder.update({ where: { id: order.id }, data: change })
+      assert.equal(await loadCurrentInvoicePdf(order.id), null, `not served after ${Object.keys(change)[0]} changed`)
+      assert.deepEqual(await loadCurrentInvoicePdf(order.id, { includeWithdrawn: true }), bytes, 'staff can still open it')
+      assert.equal(await currentInvoiceUnavailableReason(order.id), 'order-changed')
+      const due = await db.invoiceDocumentFetchState.findFirstOrThrow({ where: { orderId: order.id } })
+      assert.ok(due.nextAttemptAt && due.nextAttemptAt.getTime() <= Date.now(), 'and it is due for a re-fetch')
+      // Put it back for the next iteration.
+      await db.salesOrder.update({ where: { id: order.id }, data: { customerName: 'Ada Lovelace', totalForeign: new Prisma.Decimal('100'), storeCreditForeign: new Prisma.Decimal('0'), storeCreditAssessment: null, currency: 'GBP' } })
+      assert.deepEqual(await loadCurrentInvoicePdf(order.id), bytes, 'served again once the order matches what it was judged against')
+    }
+
+    // The customer really changed: the re-fetch re-judges the document against the new customer and refreshes the fingerprint.
+    await db.salesOrder.update({ where: { id: order.id }, data: { customerName: 'Grace Hopper' } })
+    customer = 'Grace Hopper'
+    assert.equal(await loadCurrentInvoicePdf(order.id), null)
+    const refetched = await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, deps)
+    assert.equal(refetched.status === 'stored' && refetched.created, false, 'same bytes, so no new version')
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id), bytes, 'but the fingerprint is refreshed and it is served again')
+  } finally {
+    await cleanup(db, order.id)
+  }
+})
+
+test('a reset holding the lock stops a promotion: it stores nothing and is retried; a promotion that committed first is seen by the reset preflight', { skip }, async () => {
+  const { db, service } = await setup()
+  const { order } = await seedOrder(db)
+  const { withInvoiceDocumentResetLock, invoiceDocumentResetRunning } = await import('../../lib/domain/invoice-documents/reset-lock')
+  const { invoiceDocumentResetVerdict } = await import('../../lib/domain/invoice-documents/reset-guard')
+  try {
+    assert.equal(await invoiceDocumentResetRunning(), false)
+    const downloads = { n: 0 }
+    await withInvoiceDocumentResetLock(async () => {
+      assert.equal(await invoiceDocumentResetRunning(), true)
+      // The fetch is skipped outright while the reset runs: no ledger call.
+      const skipped = await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, depsFor(order, { downloads }))
+      assert.equal(skipped.status, 'busy')
+      assert.equal(downloads.n, 0)
+      assert.equal(await db.salesOrderInvoiceDocument.count({ where: { orderId: order.id } }), 0)
+    })
+    assert.equal(await invoiceDocumentResetRunning(), false, 'released')
+
+    // The reset starts DURING a fetch (after its probe, before its promotion): the promotion stores nothing.
+    let raced = false
+    const deps: Deps = {
+      ...depsFor(order),
+      downloadPdf: async () => {
+        raced = true
+        // Hold the lock for the rest of the fetch from a concurrent "reset" that began after the fetch's own probe.
+        resetRelease = await acquireForTest()
+        return { ok: true, buffer: pdf('racing') }
+      },
+    }
+    let resetRelease: (() => Promise<void>) | null = null
+    const { acquirePinnedAdvisoryLockWaiting } = await import('../../lib/db/pinned-advisory-lock')
+    const { INVOICE_DOCUMENT_RESET_LOCK_NAMESPACE } = await import('../../lib/db/advisory-locks')
+    const acquireForTest = async () => { const l = await acquirePinnedAdvisoryLockWaiting(0, { namespace: INVOICE_DOCUMENT_RESET_LOCK_NAMESPACE, timeoutMs: 5000 }); return () => l.release() }
+    const during = await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, deps)
+    assert.equal(raced, true)
+    assert.equal(during.status, 'failed')
+    assert.equal(await db.salesOrderInvoiceDocument.count({ where: { orderId: order.id } }), 0, 'a reset in progress means nothing is promoted')
+    await resetRelease!()
+
+    // Promotion first: the reset's preflight (which runs under the lock) then sees the document.
+    await db.invoiceDocumentFetchState.deleteMany({ where: { orderId: order.id } })
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, depsFor(order))).status, 'stored')
+    const verdict = await withInvoiceDocumentResetLock(() => invoiceDocumentResetVerdict())
+    assert.equal(verdict.ok, false, 'a document that committed before the reset took the lock is seen and protected')
+  } finally {
+    await cleanup(db, order.id)
+  }
+})

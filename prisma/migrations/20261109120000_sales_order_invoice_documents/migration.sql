@@ -31,6 +31,7 @@ CREATE TABLE "sales_order_invoice_documents" (
     "fetched_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "superseded_at" TIMESTAMP(3),
     "withdrawn_at" TIMESTAMP(3),
+    "evidence_key" TEXT,
 
     CONSTRAINT "sales_order_invoice_documents_pkey" PRIMARY KEY ("id")
 );
