@@ -2304,6 +2304,11 @@ model InvoiceDocumentFetchState {
   lastAttemptAt DateTime?                  @map("last_attempt_at")
   nextAttemptAt DateTime?                  @map("next_attempt_at")
   lastError     String?                    @map("last_error")
+  /// Completed rechecks of a stored document (the ledger can amend it): 0 until the first recheck, then 1, 2, 3.
+  rechecks      Int                        @default(0)
+  /// One fetch of this document at a time: set to a short expiry while a fetch holds it, cleared when it ends. An
+  /// expired value is a crashed holder and may be taken. Held across the ledger read, the download and the promotion.
+  leaseUntil    DateTime?                  @map("lease_until")
   createdAt     DateTime                   @default(now()) @map("created_at")
   updatedAt     DateTime                   @updatedAt @map("updated_at")
 

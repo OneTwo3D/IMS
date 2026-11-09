@@ -60,24 +60,53 @@ export async function selectInvoiceDocumentCandidates(floor: Date, now: Date, li
     select: { id: true },
   })
   const candidates: Candidate[] = orders.map((order) => ({ orderId: order.id, kind: 'INVOICE' as const }))
-  if (!includeCreditNotes || candidates.length >= limit) return candidates
 
-  const refunds = await db.salesOrderRefund.findMany({
-    where: {
-      creditNoteNumber: { not: null },
-      createdAt: { gte: floor },
-      order: { shoppingLinks: { some: { connector: 'woocommerce' } } },
-      invoiceDocuments: { none: { kind: 'CREDIT_NOTE', supersededAt: null } },
-      OR: [
-        { invoiceDocumentFetches: { none: { kind: 'CREDIT_NOTE' } } },
-        { invoiceDocumentFetches: { some: { kind: 'CREDIT_NOTE', status: 'PENDING', OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }] } } },
-      ],
-    },
-    orderBy: { createdAt: 'asc' },
-    take: limit - candidates.length,
-    select: { id: true, orderId: true },
-  })
-  for (const refund of refunds) candidates.push({ orderId: refund.orderId, kind: 'CREDIT_NOTE', refundId: refund.id })
+  if (includeCreditNotes && candidates.length < limit) {
+    const refunds = await db.salesOrderRefund.findMany({
+      where: {
+        creditNoteNumber: { not: null },
+        createdAt: { gte: floor },
+        order: { shoppingLinks: { some: { connector: 'woocommerce' } } },
+        invoiceDocuments: { none: { kind: 'CREDIT_NOTE', supersededAt: null } },
+        OR: [
+          { invoiceDocumentFetches: { none: { kind: 'CREDIT_NOTE' } } },
+          { invoiceDocumentFetches: { some: { kind: 'CREDIT_NOTE', status: 'PENDING', OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }] } } },
+        ],
+      },
+      orderBy: { createdAt: 'asc' },
+      take: limit - candidates.length,
+      select: { id: true, orderId: true },
+    })
+    for (const refund of refunds) candidates.push({ orderId: refund.orderId, kind: 'CREDIT_NOTE', refundId: refund.id })
+  }
+
+  // RECHECKS of documents already stored: the ledger can amend or re-issue one, so a stored document's fetch state carries the
+  // time it is next looked at (1 day, 7 days, then every 30 days after the last look). Not floor-limited: it was fetched already.
+  if (candidates.length < limit) {
+    const due = await db.invoiceDocumentFetchState.findMany({
+      where: {
+        status: { in: ['DONE', 'PENDING'] },
+        nextAttemptAt: { lte: now },
+        ...(includeCreditNotes ? {} : { kind: 'INVOICE' as const }),
+        order: { invoiceDocuments: { some: { supersededAt: null } } },
+      },
+      orderBy: { nextAttemptAt: 'asc' },
+      take: (limit - candidates.length) * 3,
+      select: { orderId: true, refundId: true, kind: true },
+    })
+    if (due.length > 0) {
+      const current = await db.salesOrderInvoiceDocument.findMany({
+        where: { supersededAt: null, orderId: { in: [...new Set(due.map((state) => state.orderId))] } },
+        select: { orderId: true, refundId: true, kind: true },
+      })
+      const hasCurrent = new Set(current.map((doc) => `${doc.orderId}:${doc.kind}:${doc.refundId ?? '-'}`))
+      for (const state of due) {
+        if (candidates.length >= limit) break
+        if (!hasCurrent.has(`${state.orderId}:${state.kind}:${state.refundId ?? '-'}`)) continue
+        candidates.push({ orderId: state.orderId, kind: state.kind, ...(state.refundId ? { refundId: state.refundId } : {}) })
+      }
+    }
+  }
   return candidates
 }
 
@@ -107,6 +136,7 @@ export async function runInvoiceDocumentSweep(
     if (outcome.status === 'stored') { result.stored++; consecutiveFailures = 0 }
     else if (outcome.status === 'waiting') { result.waiting++; consecutiveFailures = 0 }
     else if (outcome.status === 'needs-attention') { result.needsAttention++; consecutiveFailures = 0 }
+    else if (outcome.status === 'busy' || outcome.status === 'backoff') { consecutiveFailures = 0 }
     else if (outcome.status === 'failed') {
       result.failed++
       consecutiveFailures++
@@ -118,12 +148,31 @@ export async function runInvoiceDocumentSweep(
 }
 
 /**
- * Lazy fetch for ONE order's invoice, called when a customer asks for a PDF IMS does not hold yet. Honours the
- * per-document backoff, so repeated clicks do not reach the ledger. Returns whether a PDF is now stored.
- * Off unless `invoice_documents_lazy_fetch_enabled` is exactly 'true'.
+ * Lazy fetch for ONE order's invoice, called when a customer asks for the PDF. Off unless `invoice_documents_lazy_fetch_enabled`
+ * is exactly 'true'. Honours the per-document backoff, so repeated clicks do not reach the ledger:
+ *   - no PDF stored yet (a historic order): fetch it; returns whether a PDF is now stored;
+ *   - a PDF stored and its recheck is due (the ledger may have amended it): look again, so the customer is served the current
+ *     version. The old one is served if the ledger cannot be asked. Returns true whenever a PDF is stored.
  */
 export async function ensureInvoiceDocumentOnDemand(orderId: string, deps: InvoiceDocumentDeps): Promise<boolean> {
   if ((await getSettingValue(INVOICE_DOCUMENTS_LAZY_FETCH_SETTING)) !== 'true') return false
   const outcome = await ensureInvoiceDocument({ orderId, kind: 'INVOICE' }, deps)
-  return outcome.status === 'stored'
+  if (outcome.status === 'stored') return true
+  // A recheck that did not come back with a new answer leaves the stored version in place.
+  const stored = await db.salesOrderInvoiceDocument.findFirst({ where: { orderId, kind: 'INVOICE', supersededAt: null }, select: { id: true } })
+  return stored !== null
+}
+
+/**
+ * The same look-again for an order that ALREADY has a stored PDF: called by the customer download route before it serves, so an
+ * amended invoice is picked up on the first request after its recheck falls due. Never throws and never blocks the download on a
+ * failure: whatever is stored is served.
+ */
+export async function refreshStaleInvoiceDocument(orderId: string, deps: InvoiceDocumentDeps): Promise<void> {
+  try {
+    if ((await getSettingValue(INVOICE_DOCUMENTS_LAZY_FETCH_SETTING)) !== 'true') return
+    await ensureInvoiceDocument({ orderId, kind: 'INVOICE' }, deps)
+  } catch {
+    /* serve what is stored */
+  }
 }

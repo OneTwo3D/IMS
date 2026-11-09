@@ -61,3 +61,20 @@ test('without an on-demand hook the old behaviour holds: 404 and the nonce is no
   assert.equal(response.status, 404)
   assert.deepEqual(log, [])
 })
+
+test('a stored PDF is looked at again (the ledger may have amended it) after the nonce is spent, and a failure there still serves what is stored', async () => {
+  const log: string[] = []
+  const base = deps({ log })
+  const withStored = {
+    ...base,
+    async findOrder() { return { orderId: 'so-1', invoiceNumber: 'INV-1', invoicePdfPath: 'invoice-pdfs/so-1.pdf' } },
+    async refreshStaleInvoice(orderId: string) { log.push(`refresh:${orderId}`) },
+  }
+  const ok = await handleShoppingInvoicePdfRoute(request(), { connector: 'woocommerce' }, withStored)
+  assert.equal(ok.status, 200)
+  assert.deepEqual(log, ['nonce', 'refresh:so-1', 'load'])
+
+  const failing = { ...withStored, async refreshStaleInvoice() { throw new Error('ledger down') } }
+  const still = await handleShoppingInvoicePdfRoute(request(), { connector: 'woocommerce' }, failing)
+  assert.equal(still.status, 200, 'the stored PDF is served')
+})

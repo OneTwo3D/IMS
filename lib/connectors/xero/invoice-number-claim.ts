@@ -125,6 +125,9 @@ type XeroInvoiceNumberLookupResponse = {
     Status?: unknown
     Total?: unknown
     Contact?: { Name?: unknown }
+    Reference?: unknown
+    CurrencyCode?: unknown
+    DateString?: unknown
   }>
   /** Xero returns this alongside a paged request. Used only to fail closed, never to widen. */
   pagination?: { pageCount?: unknown; itemCount?: unknown }
@@ -256,6 +259,12 @@ export async function lookupXeroInvoiceNumberClaim(
     const contactName = asString(inv?.Contact?.Name)
     if (contactName) claim.contactName = contactName
     if (typeof inv?.Total === 'number' && Number.isFinite(inv.Total)) claim.total = inv.Total
+    const reference = asString(inv?.Reference)
+    if (reference) claim.reference = reference
+    const currencyCode = asString(inv?.CurrencyCode)
+    if (currencyCode) claim.currencyCode = currencyCode.toUpperCase()
+    const dateString = asString(inv?.DateString)
+    if (dateString) claim.dateString = dateString
     claims.push(claim)
   }
 

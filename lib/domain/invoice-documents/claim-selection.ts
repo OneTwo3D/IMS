@@ -8,6 +8,8 @@
  * document is not issued yet, and asks for a person when the ledger's answer cannot be trusted to name one
  * document. It never picks "the first" or "the newest": which of two live documents the customer should
  * see is a finance question.
+ *
+ * Selecting a document by number is NOT proof that it is THIS order's: that is order-evidence.ts.
  */
 
 export type DocumentClaim = {
@@ -16,6 +18,12 @@ export type DocumentClaim = {
   documentNumber: string
   /** Ledger status: DRAFT, SUBMITTED, AUTHORISED, PAID, VOIDED, DELETED. */
   status: string
+  /** What the ledger says about the document, when it says: read by the order-evidence check. */
+  total?: number
+  reference?: string
+  contactName?: string
+  currencyCode?: string
+  dateString?: string
 }
 
 export type ClaimSelection =
@@ -29,7 +37,13 @@ const LIVE = new Set(['AUTHORISED', 'PAID'])
 const NOT_ISSUED = new Set(['DRAFT', 'SUBMITTED'])
 const KNOWN = new Set([...LIVE, ...NOT_ISSUED, 'VOIDED', 'DELETED'])
 
-export function selectDocumentClaim(claims: readonly DocumentClaim[], label: string): ClaimSelection {
+/**
+ * `orderCancelled` is whether IMS holds the order as cancelled. A voided document is the customer's only when the order
+ * itself is cancelled: on an active order a voided invoice is a document the ledger withdrew, usually to re-issue, and showing
+ * it would show the customer a cancelled invoice for an order that is live. There it is waited for (and escalated if the
+ * replacement never comes).
+ */
+export function selectDocumentClaim(claims: readonly DocumentClaim[], label: string, options: { orderCancelled: boolean }): ClaimSelection {
   const normalised = claims.map((claim) => ({ claim, status: claim.status.trim().toUpperCase() }))
   const unknown = normalised.filter((entry) => !KNOWN.has(entry.status))
   if (unknown.length > 0) {
@@ -51,9 +65,11 @@ export function selectDocumentClaim(claims: readonly DocumentClaim[], label: str
   if (notIssued.length > 0) {
     return { outcome: 'wait', reason: `${label}: the ledger document is still ${notIssued.map((entry) => entry.status).join('/')}, not issued yet` }
   }
-  // Only voided documents: a cancelled order's invoice is still the customer's document.
-  if (voided.length === 1) return { outcome: 'select', claim: voided[0].claim }
-  if (voided.length > 1) {
+  if (voided.length > 0) {
+    if (!options.orderCancelled) {
+      return { outcome: 'wait', reason: `${label}: the only document under this number is voided and the order is not cancelled, so IMS waits for the replacement` }
+    }
+    if (voided.length === 1) return { outcome: 'select', claim: voided[0].claim }
     return { outcome: 'attention', reason: `${label}: ${voided.length} voided documents and no live one hold this number, so IMS will not choose one` }
   }
   return { outcome: 'wait', reason: `${label}: the ledger holds no document under this number yet` }

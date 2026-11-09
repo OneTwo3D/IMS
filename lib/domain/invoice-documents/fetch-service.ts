@@ -6,14 +6,23 @@
  * and that column drives payment polling and updates). The storefront publication is a separate step.
  *
  * Properties the rest of the design leans on:
+ *  - THE DOCUMENT IS THIS ORDER'S, not merely the holder of a number. The storefront's invoice number is not unique in IMS
+ *    and the ledger's filter answers for whatever holds the number, so a document is stored only when (a) no other IMS order
+ *    carries the same number and (b) the ledger's own record of it agrees with the order on independent keys (total and
+ *    currency, plus reference / customer / date): see order-evidence.ts. Anything else needs a person and stores nothing.
+ *  - ONE FETCH PER DOCUMENT AT A TIME. A lease on the document's fetch state is taken BEFORE the ledger is read and held through
+ *    lookup, download, version promotion and the `invoicePdfPath` pointer, so two overlapping fetches run one after the other and
+ *    the later one reads the ledger as it then is: an older PDF cannot be promoted over a newer one.
  *  - IDEMPOTENT. A version is keyed by (connector, ledger document id, sha256); fetching an unchanged
  *    document again creates nothing. A changed or re-issued document becomes a NEW row and the previous
  *    current one is marked superseded. Nothing is overwritten or deleted.
- *  - FAIL CLOSED. The document is selected only from an unambiguous ledger answer (see claim-selection.ts).
+ *  - RECHECKED. The ledger can amend or re-issue a document after IMS stored it, so a stored document is looked at again after
+ *    1 day, 7 days and then every 30 days (the fetch state's next time), and a changed one is promoted by the rule above.
+ *  - FAIL CLOSED. The document is selected only from an unambiguous ledger answer (see claim-selection.ts), and a voided
+ *    document is the customer's only on a cancelled order.
  *  - BOUNDED. A document the ledger does not hold yet is retried on a widening schedule; a missing one is
  *    escalated after a long time and an ambiguous one at once. Neither is retried by the sweep again until
  *    a person acts.
- *  - ONE FETCH PER DOCUMENT AT A TIME, by a transaction-scoped advisory lock on the document's subject.
  */
 
 import { createHash } from 'node:crypto'
@@ -22,12 +31,16 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { invoiceDocumentStoredPath, saveInvoiceDocumentFile, saveInvoicePdfFile } from '@/lib/invoice-pdf'
 import { selectDocumentClaim, type DocumentClaim } from './claim-selection'
-import { nextAttemptDelayMs, shouldEscalateMissing } from './backoff'
+import { assessDocumentEvidence, type EvidenceSubject } from './order-evidence'
+import { nextAttemptDelayMs, recheckDelayMs, shouldEscalateMissing } from './backoff'
 import { validateFetchedPdf } from './pdf-validate'
 
 export type InvoiceDocumentKindName = 'INVOICE' | 'CREDIT_NOTE'
 
 export const INVOICE_DOCUMENT_CONNECTOR = 'xero'
+
+/** How long one fetch may hold a document before another may take it over (a crashed holder). */
+export const INVOICE_DOCUMENT_LEASE_MS = 3 * 60_000
 
 export type DocumentClaimsResult =
   | { ok: true; claims: DocumentClaim[] }
@@ -54,6 +67,8 @@ export type EnsureInvoiceDocumentInput = {
 export type EnsureInvoiceDocumentOutcome =
   | { status: 'stored'; documentId: string; created: boolean }
   | { status: 'backoff'; nextAttemptAt: Date | null }
+  /** Another fetch of this document is running right now. */
+  | { status: 'busy' }
   | { status: 'waiting'; reason: string }
   | { status: 'needs-attention'; reason: string }
   | { status: 'not-applicable'; reason: string }
@@ -69,12 +84,16 @@ function lockKeyOf(subjectKey: string): number {
 }
 const LOCK_NAMESPACE = 0x1d0c // distinguishes these locks from other advisory-lock users
 
-async function recordState(
-  input: EnsureInvoiceDocumentInput,
-  subjectKey: string,
-  patch: { status: 'PENDING' | 'NEEDS_ATTENTION' | 'DONE'; error?: string | null; nextAttemptAt?: Date | null; attempted: boolean },
-  now: Date,
-): Promise<void> {
+type StatePatch = {
+  status: 'PENDING' | 'NEEDS_ATTENTION' | 'DONE'
+  error?: string | null
+  nextAttemptAt?: Date | null
+  attempted: boolean
+  /** Set only by a stored result: the number of completed rechecks. */
+  rechecks?: number
+}
+
+async function recordState(input: EnsureInvoiceDocumentInput, subjectKey: string, patch: StatePatch, now: Date): Promise<void> {
   await db.invoiceDocumentFetchState.upsert({
     where: { subjectKey },
     create: {
@@ -87,12 +106,14 @@ async function recordState(
       lastAttemptAt: patch.attempted ? now : null,
       nextAttemptAt: patch.nextAttemptAt ?? null,
       lastError: patch.error ?? null,
+      rechecks: patch.rechecks ?? 0,
     },
     update: {
       status: patch.status,
       ...(patch.attempted ? { attempts: { increment: 1 }, lastAttemptAt: now } : {}),
       nextAttemptAt: patch.nextAttemptAt ?? null,
       lastError: patch.error ?? null,
+      ...(patch.rechecks !== undefined ? { rechecks: patch.rechecks } : {}),
     },
   })
 }
@@ -120,22 +141,85 @@ export async function ensureInvoiceDocument(
   }
   const subjectKey = invoiceDocumentSubjectKey(input.orderId, input.kind, input.refundId)
 
+  // THE LEASE, BEFORE THE LEDGER IS READ. The state row is the lock: created if missing, then taken by an atomic compare-and-set on
+  // its expiry. Everything below (lookup, download, promotion, pointer) happens under it.
+  await db.invoiceDocumentFetchState.upsert({
+    where: { subjectKey },
+    create: { subjectKey, orderId: input.orderId, refundId: input.refundId ?? null, kind: input.kind },
+    update: {},
+  }).catch(() => { /* a concurrent creator won: the row exists */ })
+  const leased = await db.invoiceDocumentFetchState.updateMany({
+    where: { subjectKey, OR: [{ leaseUntil: null }, { leaseUntil: { lt: now } }] },
+    data: { leaseUntil: new Date(now.getTime() + INVOICE_DOCUMENT_LEASE_MS) },
+  })
+  if (leased.count === 0) return { status: 'busy' }
+  try {
+    return await ensureUnderLease(input, deps, subjectKey, now)
+  } finally {
+    await db.invoiceDocumentFetchState.updateMany({ where: { subjectKey }, data: { leaseUntil: null } }).catch(() => { /* an expired lease is taken over */ })
+  }
+}
+
+async function ensureUnderLease(
+  input: EnsureInvoiceDocumentInput,
+  deps: InvoiceDocumentDeps,
+  subjectKey: string,
+  now: Date,
+): Promise<EnsureInvoiceDocumentOutcome> {
   const order = await db.salesOrder.findUnique({
     where: { id: input.orderId },
-    select: { id: true, invoiceNumber: true },
+    select: {
+      id: true,
+      status: true,
+      invoiceNumber: true,
+      orderNumber: true,
+      externalOrderNumber: true,
+      customerName: true,
+      currency: true,
+      totalForeign: true,
+      createdAt: true,
+    },
   })
   if (!order) return { status: 'not-applicable', reason: 'the order does not exist' }
 
   let number: string | null
+  let sharedByOthers = 0
+  let evidenceSubject: EvidenceSubject
+  const orderNumbers = [order.externalOrderNumber, order.orderNumber].flatMap((value) => (value ? [value] : []))
   if (input.kind === 'INVOICE') {
     number = order.invoiceNumber?.trim() || null
+    if (number) {
+      sharedByOthers = await db.salesOrder.count({ where: { id: { not: order.id }, invoiceNumber: { equals: number, mode: 'insensitive' } } })
+    }
+    evidenceSubject = {
+      orderNumbers,
+      customerName: order.customerName ?? null,
+      currency: order.currency,
+      expectedTotal: Number(order.totalForeign),
+      anchorDate: order.createdAt,
+      dateToleranceDays: 14,
+      minCorroboration: 1,
+    }
   } else {
     const refund = await db.salesOrderRefund.findUnique({
       where: { id: input.refundId! },
-      select: { orderId: true, creditNoteNumber: true },
+      select: { orderId: true, creditNoteNumber: true, createdAt: true },
     })
     if (!refund || refund.orderId !== input.orderId) return { status: 'not-applicable', reason: 'the refund is not on this order' }
     number = refund.creditNoteNumber?.trim() || null
+    if (number) {
+      sharedByOthers = await db.salesOrderRefund.count({ where: { id: { not: input.refundId! }, creditNoteNumber: { equals: number, mode: 'insensitive' } } })
+    }
+    evidenceSubject = {
+      orderNumbers,
+      customerName: order.customerName ?? null,
+      currency: order.currency,
+      // A refund stores NET amounts, so there is no gross total to compare: it needs two of reference / customer / date instead.
+      expectedTotal: null,
+      anchorDate: refund.createdAt,
+      dateToleranceDays: 30,
+      minCorroboration: 2,
+    }
   }
 
   const state = await db.invoiceDocumentFetchState.findUnique({ where: { subjectKey } })
@@ -145,28 +229,36 @@ export async function ensureInvoiceDocument(
   if (!input.ignoreBackoff && state?.nextAttemptAt && state.nextAttemptAt.getTime() > now.getTime()) {
     return { status: 'backoff', nextAttemptAt: state.nextAttemptAt }
   }
+  const existingCurrent = await db.salesOrderInvoiceDocument.findFirst({
+    where: { orderId: input.orderId, kind: input.kind, refundId: input.refundId ?? null, supersededAt: null },
+    select: { id: true },
+  })
+  // A document already stored is being RECHECKED: a failure or a wait leaves it in place and never escalates a "missing" document.
+  const isRecheck = existingCurrent !== null
   const firstSeenAt = state?.createdAt ?? now
   const attemptsSoFar = (state?.attempts ?? 0) + 1
+  const rechecksDone = isRecheck && state?.status === 'DONE' ? state.rechecks + 1 : (state?.rechecks ?? 0)
   const label = input.kind === 'INVOICE' ? `invoice ${number ?? '(no number)'}` : `credit note ${number ?? '(no number)'}`
 
-  const retryLater = async (reason: string): Promise<EnsureInvoiceDocumentOutcome> => {
+  const defer = async (reason: string, outcome: 'waiting' | 'failed', stop = false): Promise<EnsureInvoiceDocumentOutcome> => {
     await recordState(input, subjectKey, {
-      status: 'PENDING',
+      status: isRecheck ? 'DONE' : 'PENDING',
       error: reason,
-      nextAttemptAt: new Date(now.getTime() + nextAttemptDelayMs(attemptsSoFar)),
+      nextAttemptAt: new Date(now.getTime() + (isRecheck ? recheckDelayMs(rechecksDone) : nextAttemptDelayMs(attemptsSoFar))),
       attempted: true,
     }, now)
-    return { status: 'waiting', reason }
+    return outcome === 'waiting' ? { status: 'waiting', reason } : { status: 'failed', reason, stop }
   }
   const needsAttention = async (reason: string): Promise<EnsureInvoiceDocumentOutcome> => {
     await recordState(input, subjectKey, { status: 'NEEDS_ATTENTION', error: reason, attempted: true }, now)
     await escalate(input, reason)
     return { status: 'needs-attention', reason }
   }
+  const missing = (reason: string) => (!isRecheck && shouldEscalateMissing(firstSeenAt, now) ? needsAttention(reason) : defer(reason, 'waiting'))
 
-  if (!number) {
-    const reason = `${label}: the order carries no number for this document yet`
-    return shouldEscalateMissing(firstSeenAt, now) ? needsAttention(reason) : retryLater(reason)
+  if (!number) return missing(`${label}: the order carries no number for this document yet`)
+  if (sharedByOthers > 0) {
+    return needsAttention(`${label}: ${sharedByOthers} other IMS ${input.kind === 'INVOICE' ? 'order(s) carry' : 'refund(s) carry'} the same number, so the ledger document cannot be tied to this one`)
   }
 
   const lookup = input.kind === 'INVOICE' ? await deps.lookupInvoiceClaims(number) : await deps.lookupCreditNoteClaims(number)
@@ -174,45 +266,22 @@ export async function ensureInvoiceDocument(
     const reason = `${label}: ${lookup.error}`
     // A number the ledger's filter cannot express will never come right by waiting.
     if (lookup.unaskable) return needsAttention(reason)
-    await recordState(input, subjectKey, {
-      status: 'PENDING',
-      error: reason,
-      nextAttemptAt: new Date(now.getTime() + nextAttemptDelayMs(attemptsSoFar)),
-      attempted: true,
-    }, now)
-    return { status: 'failed', reason, stop: false }
+    return defer(reason, 'failed')
   }
 
-  const selection = selectDocumentClaim(lookup.claims, label)
+  const selection = selectDocumentClaim(lookup.claims, label, { orderCancelled: order.status === 'CANCELLED' })
   if (selection.outcome === 'attention') return needsAttention(selection.reason)
-  if (selection.outcome === 'wait') {
-    return shouldEscalateMissing(firstSeenAt, now) ? needsAttention(selection.reason) : retryLater(selection.reason)
-  }
+  if (selection.outcome === 'wait') return missing(selection.reason)
   const claim = selection.claim
 
+  const evidence = assessDocumentEvidence(evidenceSubject, claim)
+  if (!evidence.ok) return needsAttention(`${label}: ${evidence.reason}`)
+
   const download = await deps.downloadPdf(input.kind, claim.documentId)
-  if (!download.ok) {
-    const reason = `${label}: ${download.error}`
-    await recordState(input, subjectKey, {
-      status: 'PENDING',
-      error: reason,
-      nextAttemptAt: new Date(now.getTime() + nextAttemptDelayMs(attemptsSoFar)),
-      attempted: true,
-    }, now)
-    return { status: 'failed', reason, stop: download.stop }
-  }
+  if (!download.ok) return defer(`${label}: ${download.error}`, 'failed', download.stop)
 
   const validation = validateFetchedPdf(download.buffer)
-  if (!validation.ok) {
-    const reason = `${label}: ${validation.reason}`
-    await recordState(input, subjectKey, {
-      status: 'PENDING',
-      error: reason,
-      nextAttemptAt: new Date(now.getTime() + nextAttemptDelayMs(attemptsSoFar)),
-      attempted: true,
-    }, now)
-    return { status: 'failed', reason, stop: false }
-  }
+  if (!validation.ok) return defer(`${label}: ${validation.reason}`, 'failed')
 
   // The bytes go to disk BEFORE the row that points at them, content-addressed so a crash in between leaves
   // an unreferenced file that the next attempt reuses, never a row without its file.
@@ -278,21 +347,30 @@ export async function ensureInvoiceDocument(
 
   if (input.kind === 'INVOICE') {
     // The pointer the existing customer and staff download routes and the invoice e-mail read. It is the
-    // order's CURRENT invoice, overwritten in place; the versioned record above is the permanent one.
+    // order's CURRENT invoice, overwritten in place; the versioned record above is the permanent one. Still under the lease.
     const flatPath = await saveInvoicePdfFile(input.orderId, download.buffer)
     await db.salesOrder.update({ where: { id: input.orderId }, data: { invoicePdfPath: flatPath } })
   }
 
-  await recordState(input, subjectKey, { status: 'DONE', error: null, nextAttemptAt: null, attempted: true }, now)
+  await recordState(input, subjectKey, {
+    status: 'DONE',
+    error: null,
+    // When this stored document is looked at again.
+    nextAttemptAt: new Date(now.getTime() + recheckDelayMs(rechecksDone)),
+    attempted: true,
+    rechecks: rechecksDone,
+  }, now)
   if (recorded.created) {
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: input.orderId,
-      action: 'invoice_document_fetched',
+      action: isRecheck ? 'invoice_document_amended' : 'invoice_document_fetched',
       tag: 'accounting',
       level: 'INFO',
-      description: `Stored the ${input.kind === 'INVOICE' ? 'invoice' : 'credit note'} PDF for ${label} from the ledger`,
-      metadata: { kind: input.kind, refundId: input.refundId ?? null, externalDocumentId: claim.documentId, sha256: validation.sha256, byteSize: validation.byteSize },
+      description: isRecheck
+        ? `The ledger amended the ${input.kind === 'INVOICE' ? 'invoice' : 'credit note'} for ${label}: stored the new version and kept the previous one`
+        : `Stored the ${input.kind === 'INVOICE' ? 'invoice' : 'credit note'} PDF for ${label} from the ledger`,
+      metadata: { kind: input.kind, refundId: input.refundId ?? null, externalDocumentId: claim.documentId, sha256: validation.sha256, byteSize: validation.byteSize, evidence: evidence.matched },
       resolveUser: false,
     }).catch(() => { /* logging must never change the outcome */ })
   }

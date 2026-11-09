@@ -3,36 +3,42 @@ import test from 'node:test'
 
 import { selectDocumentClaim, type DocumentClaim } from '../../lib/domain/invoice-documents/claim-selection.ts'
 import { DEFAULT_INVOICE_DOCUMENT_MAX_BYTES, invoiceDocumentMaxBytes, validateFetchedPdf } from '../../lib/domain/invoice-documents/pdf-validate.ts'
-import { DOCUMENT_MISSING_ESCALATION_MS, nextAttemptDelayMs, shouldEscalateMissing } from '../../lib/domain/invoice-documents/backoff.ts'
+import { assessDocumentEvidence, type EvidenceSubject } from '../../lib/domain/invoice-documents/order-evidence.ts'
+import { DOCUMENT_MISSING_ESCALATION_MS, nextAttemptDelayMs, recheckDelayMs, shouldEscalateMissing } from '../../lib/domain/invoice-documents/backoff.ts'
 
+const ACTIVE = { orderCancelled: false }
+const CANCELLED = { orderCancelled: true }
 const claim = (id: string, status: string): DocumentClaim => ({ documentId: id, documentNumber: 'INV-1', status })
 
 test('one live document is selected, whatever voided predecessors stand beside it', () => {
-  const r = selectDocumentClaim([claim('a', 'VOIDED'), claim('b', 'AUTHORISED')], 'invoice INV-1')
+  const r = selectDocumentClaim([claim('a', 'VOIDED'), claim('b', 'AUTHORISED')], 'invoice INV-1', ACTIVE)
   assert.deepEqual(r, { outcome: 'select', claim: claim('b', 'AUTHORISED') })
-  assert.equal(selectDocumentClaim([claim('p', 'PAID')], 'x').outcome, 'select')
+  assert.equal(selectDocumentClaim([claim('p', 'PAID')], 'x', ACTIVE).outcome, 'select')
 })
 
 test('two live documents are never chosen between', () => {
-  const r = selectDocumentClaim([claim('a', 'AUTHORISED'), claim('b', 'PAID')], 'invoice INV-1')
+  const r = selectDocumentClaim([claim('a', 'AUTHORISED'), claim('b', 'PAID')], 'invoice INV-1', ACTIVE)
   assert.equal(r.outcome, 'attention')
 })
 
 test('a draft or submitted document is waited for, an empty answer is waited for', () => {
-  assert.equal(selectDocumentClaim([claim('a', 'DRAFT')], 'x').outcome, 'wait')
-  assert.equal(selectDocumentClaim([claim('a', 'SUBMITTED')], 'x').outcome, 'wait')
-  assert.equal(selectDocumentClaim([], 'x').outcome, 'wait')
-  assert.equal(selectDocumentClaim([claim('a', 'DELETED')], 'x').outcome, 'wait')
+  assert.equal(selectDocumentClaim([claim('a', 'DRAFT')], 'x', ACTIVE).outcome, 'wait')
+  assert.equal(selectDocumentClaim([claim('a', 'SUBMITTED')], 'x', ACTIVE).outcome, 'wait')
+  assert.equal(selectDocumentClaim([], 'x', ACTIVE).outcome, 'wait')
+  assert.equal(selectDocumentClaim([claim('a', 'DELETED')], 'x', ACTIVE).outcome, 'wait')
 })
 
-test('a cancelled order: a single voided document is still the customer document, several are not chosen between', () => {
-  assert.equal(selectDocumentClaim([claim('a', 'VOIDED')], 'x').outcome, 'select')
-  assert.equal(selectDocumentClaim([claim('a', 'VOIDED'), claim('b', 'VOIDED')], 'x').outcome, 'attention')
+test('a voided document is the customer document only on a CANCELLED order; on an active order it is waited for', () => {
+  assert.equal(selectDocumentClaim([claim('a', 'VOIDED')], 'x', CANCELLED).outcome, 'select')
+  assert.equal(selectDocumentClaim([claim('a', 'VOIDED'), claim('b', 'VOIDED')], 'x', CANCELLED).outcome, 'attention')
+  assert.equal(selectDocumentClaim([claim('a', 'VOIDED')], 'x', ACTIVE).outcome, 'wait')
+  assert.equal(selectDocumentClaim([claim('a', 'VOIDED'), claim('b', 'VOIDED')], 'x', ACTIVE).outcome, 'wait')
+  assert.equal(selectDocumentClaim([claim('a', 'VOIDED'), claim('b', 'AUTHORISED')], 'x', ACTIVE).outcome, 'select', 'a live replacement wins on either kind of order')
 })
 
 test('a status IMS does not know needs a person', () => {
-  assert.equal(selectDocumentClaim([claim('a', 'SOMETHING_NEW')], 'x').outcome, 'attention')
-  assert.equal(selectDocumentClaim([claim('a', 'authorised')], 'x').outcome, 'select', 'case-insensitive')
+  assert.equal(selectDocumentClaim([claim('a', 'SOMETHING_NEW')], 'x', ACTIVE).outcome, 'attention')
+  assert.equal(selectDocumentClaim([claim('a', 'authorised')], 'x', ACTIVE).outcome, 'select', 'case-insensitive')
 })
 
 function pdf(body = 'x'.repeat(400)): Buffer {
@@ -63,4 +69,40 @@ test('retries widen, then hold at a day; a long-missing document is escalated', 
   const first = new Date('2026-11-01T00:00:00Z')
   assert.equal(shouldEscalateMissing(first, new Date(first.getTime() + DOCUMENT_MISSING_ESCALATION_MS - 1)), false)
   assert.equal(shouldEscalateMissing(first, new Date(first.getTime() + DOCUMENT_MISSING_ESCALATION_MS)), true)
+})
+
+const subject = (over: Partial<EvidenceSubject> = {}): EvidenceSubject => ({
+  orderNumbers: ['12345', 'SO-0099'], customerName: 'Ada Lovelace', currency: 'GBP', expectedTotal: 100,
+  anchorDate: new Date('2026-11-01T00:00:00Z'), dateToleranceDays: 14, minCorroboration: 1, ...over,
+})
+const doc = (over: Partial<DocumentClaim> = {}): DocumentClaim => ({ documentId: 'd', documentNumber: 'INV-1', status: 'AUTHORISED', total: 100, currencyCode: 'GBP', ...over })
+
+test('evidence: total must match within a penny or two, and the ledger must report one', () => {
+  assert.equal(assessDocumentEvidence(subject(), doc({ dateString: '2026-11-02' })).ok, true)
+  assert.equal(assessDocumentEvidence(subject(), doc({ total: 100.01, dateString: '2026-11-02' })).ok, true)
+  assert.equal(assessDocumentEvidence(subject(), doc({ total: 101, dateString: '2026-11-02' })).ok, false)
+  assert.equal(assessDocumentEvidence(subject(), doc({ total: undefined, dateString: '2026-11-02' })).ok, false)
+})
+
+test('evidence: currency must agree when stated', () => {
+  assert.equal(assessDocumentEvidence(subject(), doc({ currencyCode: 'EUR', dateString: '2026-11-02' })).ok, false)
+  assert.equal(assessDocumentEvidence(subject(), doc({ currencyCode: undefined, dateString: '2026-11-02' })).ok, true)
+})
+
+test('evidence: one of reference / customer / date must also agree; the reference matches on token boundaries only', () => {
+  assert.equal(assessDocumentEvidence(subject(), doc({ reference: 'WC order #12345' })).ok, true)
+  assert.equal(assessDocumentEvidence(subject(), doc({ reference: 'order 123456' })).ok, false, '123456 is not 12345')
+  assert.equal(assessDocumentEvidence(subject(), doc({ contactName: 'ada  LOVELACE' })).ok, true)
+  assert.equal(assessDocumentEvidence(subject(), doc({ dateString: '2026-12-25' })).ok, false, 'outside the date tolerance')
+  assert.equal(assessDocumentEvidence(subject(), doc({})).ok, false, 'a total alone is not enough')
+})
+
+test('evidence: a credit note (no gross total to compare) needs two of the three', () => {
+  const cn = subject({ expectedTotal: null, minCorroboration: 2, dateToleranceDays: 30 })
+  assert.equal(assessDocumentEvidence(cn, doc({ reference: '12345' })).ok, false)
+  assert.equal(assessDocumentEvidence(cn, doc({ reference: '12345', dateString: '2026-11-10' })).ok, true)
+})
+
+test('rechecks of a stored document: a day, a week, then every thirty days', () => {
+  assert.deepEqual([0, 1, 2, 3, 9].map(recheckDelayMs), [86_400_000, 604_800_000, 2_592_000_000, 2_592_000_000, 2_592_000_000])
 })

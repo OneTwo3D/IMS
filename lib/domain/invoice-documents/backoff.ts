@@ -21,3 +21,13 @@ export function nextAttemptDelayMs(attempts: number): number {
 export function shouldEscalateMissing(firstSeenAt: Date, now: Date): boolean {
   return now.getTime() - firstSeenAt.getTime() >= DOCUMENT_MISSING_ESCALATION_MS
 }
+
+/**
+ * When a STORED document is looked at again, because the ledger can amend or re-issue it after the first fetch: 1 day, 7 days,
+ * then every 30 days. `rechecksDone` is how many rechecks have completed (0 right after the first fetch).
+ */
+const RECHECK_SCHEDULE_MS = [24 * HOUR, 7 * 24 * HOUR, 30 * 24 * HOUR] as const
+
+export function recheckDelayMs(rechecksDone: number): number {
+  return RECHECK_SCHEDULE_MS[Math.min(Math.max(rechecksDone, 0), RECHECK_SCHEDULE_MS.length - 1)]
+}

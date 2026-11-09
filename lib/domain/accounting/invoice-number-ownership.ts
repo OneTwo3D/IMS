@@ -141,8 +141,12 @@ export type LedgerInvoiceClaim = {
   status: string
   /** Whose invoice it is, when the ledger says. Message material only — never part of the rule. */
   contactName?: string
-  /** The document total, when the ledger says. Message material only. */
+  /** The document total, when the ledger says. Message material only in the ownership rule. */
   total?: number
+  /** The ledger's Reference text, its currency and its date, when it says. Read by the invoice-document fetch to tie the document to ONE order; the ownership rule never reads them. */
+  reference?: string
+  currencyCode?: string
+  dateString?: string
 }
 
 /**

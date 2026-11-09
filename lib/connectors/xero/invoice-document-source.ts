@@ -32,7 +32,16 @@ export async function lookupInvoiceDocumentClaims(invoiceNumber: string): Promis
   if (!lookup.ok) return { ok: false, error: lookup.error, unaskable: lookup.unaskable }
   return {
     ok: true,
-    claims: lookup.claims.map((claim) => ({ documentId: claim.invoiceId, documentNumber: claim.invoiceNumber, status: claim.status })),
+    claims: lookup.claims.map((claim) => ({
+      documentId: claim.invoiceId,
+      documentNumber: claim.invoiceNumber,
+      status: claim.status,
+      ...(claim.total !== undefined ? { total: claim.total } : {}),
+      ...(claim.reference ? { reference: claim.reference } : {}),
+      ...(claim.contactName ? { contactName: claim.contactName } : {}),
+      ...(claim.currencyCode ? { currencyCode: claim.currencyCode } : {}),
+      ...(claim.dateString ? { dateString: claim.dateString } : {}),
+    })),
   }
 }
 
@@ -40,7 +49,17 @@ const SALES_CREDIT_NOTE_TYPE = 'ACCRECCREDIT'
 const WHERE_CLAUSE_HAZARDS = ['"', '\\']
 
 type XeroSalesCreditNoteLookupResponse = {
-  CreditNotes?: Array<{ CreditNoteID?: unknown; CreditNoteNumber?: unknown; Type?: unknown; Status?: unknown }>
+  CreditNotes?: Array<{
+    CreditNoteID?: unknown
+    CreditNoteNumber?: unknown
+    Type?: unknown
+    Status?: unknown
+    Total?: unknown
+    Reference?: unknown
+    CurrencyCode?: unknown
+    DateString?: unknown
+    Contact?: { Name?: unknown }
+  }>
   pagination?: { pageCount?: unknown }
 }
 
@@ -82,7 +101,20 @@ export async function lookupSalesCreditNoteDocumentClaims(
     if (type !== undefined && type.toUpperCase() !== SALES_CREDIT_NOTE_TYPE) continue
     const documentId = asString(row?.CreditNoteID)
     if (!documentId) return { ok: false, error: `a document holds credit note number ${wanted} but the lookup returned no CreditNoteID` }
-    claims.push({ documentId, documentNumber: number, status: (asString(row?.Status) ?? 'UNKNOWN').toUpperCase() })
+    const reference = asString(row?.Reference)
+    const contactName = asString(row?.Contact?.Name)
+    const currencyCode = asString(row?.CurrencyCode)
+    const dateString = asString(row?.DateString)
+    claims.push({
+      documentId,
+      documentNumber: number,
+      status: (asString(row?.Status) ?? 'UNKNOWN').toUpperCase(),
+      ...(typeof row?.Total === 'number' && Number.isFinite(row.Total) ? { total: row.Total } : {}),
+      ...(reference ? { reference } : {}),
+      ...(contactName ? { contactName } : {}),
+      ...(currencyCode ? { currencyCode: currencyCode.toUpperCase() } : {}),
+      ...(dateString ? { dateString } : {}),
+    })
   }
   return { ok: true, claims }
 }
