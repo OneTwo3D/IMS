@@ -32,18 +32,30 @@ const transport = {
   posts: [] as Array<{ path: string; body: unknown }>,
   putResult: (): WcResult => ({ data: {} }),
   postResult: (): WcResult => ({ data: { id: 9001 } }),
+  /** The notes the (fake) storefront order holds; a successful or lost-response POST adds to it. */
+  notes: [] as Array<{ id: number; note: string; customer_note: boolean }>,
+  notesRead: (): { data: unknown; error?: string } => ({ data: transport.notes }),
 }
 function resetTransport() {
   transport.puts.length = 0
   transport.posts.length = 0
   transport.putResult = () => ({ data: {} })
   transport.postResult = () => ({ data: { id: 9001 } })
+  transport.notes = []
+  transport.notesRead = () => ({ data: transport.notes })
 }
 if (!skip) {
   mock.module('@/lib/connectors/woocommerce/api', {
     namedExports: {
       wcPut: async (p: string, body: unknown) => { transport.puts.push({ path: p, body }); return transport.putResult() },
-      wcPost: async (p: string, body: unknown) => { transport.posts.push({ path: p, body }); return transport.postResult() },
+      wcPost: async (p: string, body: unknown) => {
+        transport.posts.push({ path: p, body })
+        // The storefront keeps the note first; the answer (which a test may make throw) comes after.
+        const note = (body as { note?: string }).note
+        if (typeof note === 'string') transport.notes.push({ id: 9000 + transport.notes.length + 1, note, customer_note: false })
+        return transport.postResult()
+      },
+      wcFetch: async () => ({ ...transport.notesRead(), totalPages: 1, totalItems: 0 }),
     },
   })
 }
@@ -172,7 +184,7 @@ test('OFF BY DEFAULT: with the setting unset nothing is scanned, queued, claimed
       const tick = await d.jobs.processWcInvoiceDocumentPublications()
       assert.equal(tick.reason, 'wc_invoice_document_disabled')
       assert.deepEqual([tick.claimed, tick.succeeded, tick.retried], [0, 0, 0])
-      assert.deepEqual(await d.jobs.enqueueInvoiceDocumentPublications(), { scanned: 0, queued: 0, shadowed: 0, alreadyQueued: 0 })
+      assert.deepEqual(await d.jobs.enqueueInvoiceDocumentPublications(), { scanned: 0, queued: 0, shadowed: 0 })
       assert.deepEqual(await d.writer.publishInvoiceDocumentFlagToWc(order.id), { kind: 'disabled' })
     })
   }
@@ -302,6 +314,79 @@ test('THE NOTE IS POSTED ONCE PER LEDGER INVOICE: a failing meta write retried a
   assert.equal(transport.posts.length, 1)
   assert.equal(transport.puts.at(-1)!.body && JSON.stringify(transport.puts.at(-1)!.body).includes('_accounting_invoice_url'), true)
   assert.equal(JSON.stringify(transport.puts).includes('_ims_invoice_pdf_available'), false, 'the note writer never writes the download flag')
+})
+
+test('A LOST RESPONSE DOES NOT DUPLICATE THE NOTE: the retry finds the note already on the order by its invoice link and adopts it; an unreadable notes list posts nothing', { skip }, async (t) => {
+  const d = await setup()
+  resetTransport()
+  const order = await seedOrder(d, { stored: false, accountingInvoiceId: `acct-${randomUUID().slice(0, 8)}` })
+  t.after(async () => { await d.db.setting.deleteMany({ where: { key: 'accounting_invoice_url_template' } }); await cleanup(d, [order.id]) })
+  await d.db.setting.upsert({ where: { key: 'accounting_invoice_url_template' }, create: { key: 'accounting_invoice_url_template', value: 'https://acct.example.test/{id}' }, update: { value: 'https://acct.example.test/{id}' } })
+  // The storefront keeps the note but the response is lost: the writer sees a thrown error and saves no marker.
+  transport.postResult = () => { throw new Error('socket hang up') }
+  await d.note.pushInvoiceNoteToWc(order.id)
+  assert.equal(transport.posts.length, 1)
+  assert.equal(transport.notes.length, 1, 'the note landed')
+  assert.equal(await d.db.invoiceStorePublication.count({ where: { orderId: order.id, noteWrittenAt: { not: null } } }), 0, 'no marker: the response was lost')
+  // The retry reconciles first.
+  transport.postResult = () => ({ data: { id: 9999 } })
+  assert.deepEqual(await d.note.pushInvoiceNoteToWc(order.id), { success: true })
+  assert.equal(transport.posts.length, 1, 'no second note was posted')
+  const marker = await d.db.invoiceStorePublication.findUniqueOrThrow({ where: { orderId: order.id } })
+  assert.equal(marker.noteStoreId, String(transport.notes[0]!.id), 'the existing note was adopted as the marker')
+  // A fresh order whose notes cannot be read: nothing is posted at all.
+  const other = await seedOrder(d, { stored: false, accountingInvoiceId: `acct-${randomUUID().slice(0, 8)}` })
+  t.after(() => cleanup(d, [other.id]))
+  transport.notesRead = () => ({ data: null, error: 'WC API error: 500' })
+  const result = await d.note.pushInvoiceNoteToWc(other.id)
+  assert.equal(result.success, false)
+  assert.equal(transport.posts.length, 1, 'a blind post is how a duplicate is made')
+})
+
+test('NO STARVATION: 200+ documents whose jobs are parked or retrying do not keep a newer document from being queued', { skip }, async (t) => {
+  const d = await setup()
+  resetTransport()
+  const stuck: string[] = []
+  const created: string[] = []
+  t.after(() => cleanup(d, created))
+  await setFlag(d, 'true')
+  for (let i = 0; i < 205; i++) {
+    const suffix = randomUUID().slice(0, 8)
+    const order = await d.db.salesOrder.create({
+      data: {
+        orderNumber: `ISTK-${suffix}`, invoiceNumber: `INV-${suffix}`, status: 'SHIPPED', currency: 'GBP', fxRateToBase: new Prisma.Decimal('1'),
+        subtotalForeign: new Prisma.Decimal('1'), totalForeign: new Prisma.Decimal('1'), subtotalBase: new Prisma.Decimal('1'), taxBase: new Prisma.Decimal('0'), totalBase: new Prisma.Decimal('1'),
+        createdAt: new Date(Date.now() - 30 * DAY),
+        shoppingLinks: { create: { connector: 'woocommerce', externalOrderId: `wc-${suffix}` } },
+        invoiceDocuments: { create: { kind: 'INVOICE', connector: 'xero', externalDocumentId: `x-${suffix}`, documentNumber: `INV-${suffix}`, externalStatus: 'AUTHORISED', sha256: suffix.padEnd(64, '0'), byteSize: 500, storedPath: `invoice-pdfs/documents/x/${suffix}.pdf`, fetchedAt: new Date(Date.now() - 40 * DAY + i) } },
+      },
+      select: { id: true, invoiceDocuments: { select: { id: true } } },
+    })
+    created.push(order.id)
+    stuck.push(order.id)
+    await d.db.integrationOutbox.create({ data: {
+      connector: 'woocommerce', operation: 'order.invoice-document', idempotencyKey: d.jobs.wcInvoiceDocumentIdempotencyKey(order.id, order.invoiceDocuments[0]!.id),
+      payloadJson: { orderId: order.id, documentId: order.invoiceDocuments[0]!.id }, status: i % 2 ? 'PERMANENT_FAILED' : 'RETRYABLE_FAILED', attempts: 8,
+    } })
+  }
+  const newer = await seedOrder(d)
+  created.push(newer.id)
+  await withEnv(LIVE, async () => {
+    const scan = await d.jobs.enqueueInvoiceDocumentPublications({ orderIds: [...stuck, newer.id] })
+    assert.equal(scan.queued, 1, JSON.stringify(scan))
+    assert.equal((await jobsFor(d, newer.id)).length, 1, 'the newer document is queued although 205 older ones are unresolved')
+  })
+})
+
+test('THE FLAG IS WRITTEN ONLY INSIDE A GUARDED ATTEMPT: a direct call refuses and sends nothing', { skip }, async (t) => {
+  const d = await setup()
+  resetTransport()
+  const order = await seedOrder(d)
+  t.after(() => cleanup(d, [order.id]))
+  await setFlag(d, 'true')
+  const out = await withEnv(LIVE, () => d.writer.publishInvoiceDocumentFlagToWc(order.id))
+  assert.equal(out.kind, 'failed')
+  assert.equal(transport.puts.length, 0)
 })
 
 test('TWO CONCURRENT DRAINS WRITE ONCE (repeated: one pass proves nothing about a race)', { skip }, async (t) => {

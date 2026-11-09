@@ -7,7 +7,7 @@
  *
  * OFF BY DEFAULT. Nothing is written unless the setting `wc_invoice_document_enabled` is `true`. The write also meets every existing
  * WooCommerce gate: the producer-side hold (wcPut's egress barrier, and the claim boundary of the drain), the writer-side cut-off, and the
- * attempt fence of the outbox job that drives it.
+ * attempt fence of the outbox job that drives it; called outside that fence it refuses to write.
  *
  * WHAT IT WRITES ONLY WHEN IT IS TRUE. The flag is written only if the customer could actually be served the document: the same reader
  * the customer download route uses (`loadCurrentInvoicePdf`) must return the bytes. A withdrawn, voided-on-a-live-order, order-changed,
@@ -22,7 +22,7 @@ import { logActivity } from '@/lib/activity-log'
 import { getSettingValue } from '@/lib/settings-store'
 import { loadCurrentInvoicePdf } from '@/lib/domain/invoice-documents/current-document'
 import { wcPut } from '../api'
-import { assertWcAttemptMayWrite } from '../attempt-fence'
+import { assertWcAttemptMayWrite, isInsideWcAttemptFence } from '../attempt-fence'
 
 export const WC_INVOICE_DOCUMENT_ENABLED_SETTING = 'wc_invoice_document_enabled'
 export const WC_INVOICE_DOCUMENT_META_KEY = '_ims_invoice_pdf_available'
@@ -75,7 +75,10 @@ export async function publishInvoiceDocumentFlagToWc(orderId: string): Promise<P
   const marker = order.invoiceStorePublication
   if (marker?.flagWrittenAt && marker.flagDocumentId === documentId) return { kind: 'already-published', documentId }
 
-  // The attempt fence (a no-op outside an outbox attempt): deadline, row ownership, cut-off, and that IMS still wants the write.
+  // NEVER OUTSIDE A GUARDED ATTEMPT: the cut-off, claim ownership and deadline are checked only inside the outbox job's fence, so a direct
+  // call (a follow-up, a script) must not write.
+  if (!isInsideWcAttemptFence()) return { kind: 'failed', held: false, error: 'The invoice flag is written only by its guarded outbox job, never directly.' }
+  // The attempt fence: deadline, row ownership, cut-off: deadline, row ownership, cut-off, and that IMS still wants the write.
   await assertWcAttemptMayWrite()
   const result = await wcPut(`orders/${externalOrderId}`, { meta_data: [{ key: WC_INVOICE_DOCUMENT_META_KEY, value: 'yes' }] })
   if (result.held) return { kind: 'failed', held: true, error: `The invoice flag was not written to the WooCommerce order: ${result.error}` }

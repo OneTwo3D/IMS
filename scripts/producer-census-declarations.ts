@@ -408,8 +408,6 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Uploads a bill attachment.'),
   d('lib/connectors/xero/sync-processor.ts::processClaimedEntry::pushInvoiceNoteToWc#1', 'woocommerce', 'order.invoice-note', 'drain', 'required',
     'The WC_INVOICE_NOTE follow-up: the Xero processor asks for the invoice note to be written to the order.'),
-  d('lib/connectors/xero/sync-processor.ts::processClaimedEntry::publishInvoiceDocumentFlagToWc#1', 'woocommerce', 'order.invoice-document', 'drain', 'required',
-    'The WC_INVOICE_NOTE follow-up also asks for the My Account download flag of an invoice IMS posted itself (off unless wc_invoice_document_enabled).'),
   d('lib/connectors/xero/sync-processor.ts::processClaimedEntry::xeroPost#2', 'xero', 'purchase.bill-payment', 'drain', 'required',
     'POSTs a bill payment.'),
   d('lib/connectors/xero/sync-processor.ts::processClaimedEntry::putXeroTaxRate#1', 'xero', 'tax-rate', 'drain', 'not-applicable',

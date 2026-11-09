@@ -125,10 +125,6 @@ mock.module('@/lib/connectors/xero/auth', {
 mock.module('@/lib/connectors/woocommerce/sync/invoice-note', {
   namedExports: { pushInvoiceNoteToWc: async () => ({ success: true }) },
 })
-// The same follow-up also asks the download-flag writer (its own switch, off by default); it writes nothing here either.
-mock.module('@/lib/connectors/woocommerce/sync/invoice-document', {
-  namedExports: { publishInvoiceDocumentFlagToWc: async () => ({ kind: 'disabled' }) },
-})
 
 async function loadProcessor() {
   return (await import('@/lib/connectors/xero/sync-processor')).processPendingXeroSync

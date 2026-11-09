@@ -8,12 +8,12 @@
  *
  * A note is APPENDED by the storefront, so a repeat adds a second one. The note is therefore written at most once per ledger invoice id:
  * the marker (`InvoiceStorePublication.noteInvoiceId` / `noteWrittenAt`) is saved as soon as the storefront has accepted the note, and a
- * retry that finds it skips the note and goes on to the meta (an absolute PUT, harmless to repeat). Before this marker a meta PUT that
+ * retry that finds it skips the note (and, with no marker, the order's notes are read first and a note already carrying this invoice's link is adopted, which covers a lost response); a retry that finds it skips the note and goes on to the meta (an absolute PUT, harmless to repeat). Before this marker a meta PUT that
  * failed or was held made the whole call fail, and the queue retried it by posting the note AGAIN.
  */
 
 import { db } from '@/lib/db'
-import { wcPost, wcPut } from '../api'
+import { wcFetch, wcPost, wcPut } from '../api'
 import { getAccountingSettings } from '@/lib/accounting'
 import { logActivity } from '@/lib/activity-log'
 
@@ -59,7 +59,24 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: b
   // Admin-only note with accounting invoice link, at most once per ledger invoice id.
   const marker = so.invoiceStorePublication
   const noteAlreadyWritten = !!marker?.noteWrittenAt && marker.noteInvoiceId === so.accountingInvoiceId
+  let reconciledNoteId: string | null = null
   if (!noteAlreadyWritten) {
+    // A LOST RESPONSE leaves no marker although the storefront may have kept the note. Before posting, read the order's notes and look for
+    // one carrying THIS invoice's link (the ledger invoice id is in the URL, so it is a stable, invoice-specific identifier). If one is
+    // there, adopt it as the marker instead of posting a second. If the notes cannot be read, post nothing: a blind post is how a
+    // duplicate is made, and a failed read is retried.
+    const existing = await wcFetch(`orders/${wcLink.externalOrderId}/notes`, { per_page: '100' })
+    if (existing.error || !Array.isArray(existing.data)) {
+      return { success: false, error: `Could not read the WooCommerce order's notes to check whether the invoice note is already there, so none was added: ${existing.error ?? 'unexpected answer'}` }
+    }
+    const found = (existing.data as Array<{ id?: unknown; note?: unknown; customer_note?: unknown }>)
+      .find((n) => n.customer_note !== true && typeof n.note === 'string' && n.note.includes(accountingInvoiceUrl))
+    if (found && (typeof found.id === 'number' || typeof found.id === 'string')) {
+      reconciledNoteId = String(found.id)
+      await recordNoteWritten(orderId, so.accountingInvoiceId!, found.id)
+    }
+  }
+  if (!noteAlreadyWritten && reconciledNoteId === null) {
     try {
       const noteResult = await wcPost(`orders/${wcLink.externalOrderId}/notes`, {
         note: `Accounting invoice: <a href="${accountingInvoiceUrl}">View Invoice</a>`,

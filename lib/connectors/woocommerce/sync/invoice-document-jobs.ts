@@ -16,7 +16,7 @@
  * Retry bound: 8 attempts on the outbox's default back-off, then PERMANENT_FAILED on Sync > Exceptions, where Replay resets the row and
  * the next attempt re-reads everything.
  */
-import type { Prisma } from '@/app/generated/prisma/client'
+import { Prisma } from '@/app/generated/prisma/client'
 import type { db as appDb } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import {
@@ -46,8 +46,6 @@ const CONNECTOR = 'woocommerce'
 const OPERATION = INTEGRATION_OUTBOX_OPERATIONS.woocommerce.orderInvoiceDocument
 const WORKER_ID = 'woocommerce-order-invoice-document'
 export const WC_INVOICE_DOCUMENT_MAX_ATTEMPTS = 8
-/** How many documents one scan looks at, and how many it may queue. */
-export const WC_INVOICE_DOCUMENT_SCAN_LIMIT = 200
 export const WC_INVOICE_DOCUMENT_QUEUE_LIMIT = 50
 
 type PublishTxClient = (Prisma.TransactionClient | typeof appDb) & IntegrationOutboxClient
@@ -87,7 +85,7 @@ export async function scheduleWcInvoiceDocument(
   return key
 }
 
-export type WcInvoiceDocumentScanSummary = { scanned: number; queued: number; shadowed: number; alreadyQueued: number }
+export type WcInvoiceDocumentScanSummary = { scanned: number; queued: number; shadowed: number }
 
 /**
  * QUEUE the publication of every current, customer-servable invoice document whose order has no flag marker yet. The scan, not the
@@ -97,42 +95,35 @@ export type WcInvoiceDocumentScanSummary = { scanned: number; queued: number; sh
 export async function enqueueInvoiceDocumentPublications(
   options: { limit?: number; /** Restrict the scan to these orders (a one-order catch-up, or a test that must not touch other orders). */ orderIds?: string[] } = {},
 ): Promise<WcInvoiceDocumentScanSummary> {
-  const summary: WcInvoiceDocumentScanSummary = { scanned: 0, queued: 0, shadowed: 0, alreadyQueued: 0 }
+  const summary: WcInvoiceDocumentScanSummary = { scanned: 0, queued: 0, shadowed: 0 }
   if (!(await isInvoiceDocumentPublishingEnabled())) return summary
   const { db } = await import('@/lib/db')
   const { producerCutoffFloor } = await import('@/lib/security/producer-seam')
   const floor = producerCutoffFloor('woocommerce')
-  const documents = await db.salesOrderInvoiceDocument.findMany({
-    where: {
-      kind: 'INVOICE',
-      refundId: null,
-      supersededAt: null,
-      withdrawnAt: null,
-      ...(options.orderIds ? { orderId: { in: options.orderIds } } : {}),
-      order: {
-        // An order older than the live-from instant is never IMS's to publish: leave it out so it cannot fill the window.
-        ...(floor ? { createdAt: { gte: floor } } : {}),
-        shoppingLinks: { some: { connector: CONNECTOR } },
-        OR: [{ invoiceStorePublication: { is: null } }, { invoiceStorePublication: { flagWrittenAt: null } }],
-      },
-    },
-    orderBy: { fetchedAt: 'asc' },
-    take: WC_INVOICE_DOCUMENT_SCAN_LIMIT,
-    select: { id: true, orderId: true, order: { select: { createdAt: true } } },
-  })
-  summary.scanned = documents.length
-  if (documents.length === 0) return summary
-  const keys = new Map(documents.map((doc) => [wcInvoiceDocumentIdempotencyKey(doc.orderId, doc.id), doc]))
-  const existing = await db.integrationOutbox.findMany({
-    where: { idempotencyKey: { in: [...keys.keys()] } },
-    select: { idempotencyKey: true },
-  })
-  const queuedAlready = new Set(existing.map((row) => row.idempotencyKey))
-  const limit = options.limit ?? WC_INVOICE_DOCUMENT_QUEUE_LIMIT
-  for (const [key, doc] of keys) {
-    if (queuedAlready.has(key)) { summary.alreadyQueued++; continue }
-    if (summary.queued + summary.shadowed >= limit) break
-    const scheduled = await scheduleWcInvoiceDocument(db, { orderId: doc.orderId, documentId: doc.id, obligationAt: doc.order.createdAt })
+  // The exclusion of documents that already have a job (queued, retrying, parked or done) is made IN THE DATABASE, before the window is
+  // cut: a window taken first and filtered after is filled by the oldest unresolved jobs and starves every newer document.
+  const orderFilter = options.orderIds ? Prisma.sql`AND d.order_id = ANY(${options.orderIds})` : Prisma.empty
+  const floorFilter = floor ? Prisma.sql`AND o."createdAt" >= ${floor}` : Prisma.empty
+  const rows = await db.$queryRaw<Array<{ id: string; orderId: string; orderCreatedAt: Date }>>`
+    SELECT d.id AS id, d.order_id AS "orderId", o."createdAt" AS "orderCreatedAt"
+    FROM sales_order_invoice_documents d
+    JOIN sales_orders o ON o.id = d.order_id
+    WHERE d.kind = 'INVOICE' AND d.refund_id IS NULL AND d.superseded_at IS NULL AND d.withdrawn_at IS NULL
+      ${orderFilter}
+      ${floorFilter}
+      AND EXISTS (SELECT 1 FROM shopping_order_links l WHERE l."orderId" = d.order_id AND l.connector = ${CONNECTOR})
+      AND NOT EXISTS (SELECT 1 FROM invoice_store_publications p WHERE p.order_id = d.order_id AND p.flag_written_at IS NOT NULL)
+      AND NOT EXISTS (
+        SELECT 1 FROM integration_outbox x
+        WHERE x.connector = ${CONNECTOR} AND x.operation = ${OPERATION}
+          AND x."payloadJson"->>'documentId' = d.id AND x."payloadJson"->>'orderId' = d.order_id
+      )
+    ORDER BY d.fetched_at ASC, d.id ASC
+    LIMIT ${options.limit ?? WC_INVOICE_DOCUMENT_QUEUE_LIMIT}
+  `
+  summary.scanned = rows.length
+  for (const doc of rows) {
+    const scheduled = await scheduleWcInvoiceDocument(db, { orderId: doc.orderId, documentId: doc.id, obligationAt: doc.orderCreatedAt })
     if (scheduled === null) summary.shadowed++
     else summary.queued++
   }

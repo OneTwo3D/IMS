@@ -6591,12 +6591,9 @@ export async function processClaimedEntry(
       const fence = await lease.fenceBeforeRemoteWrite('wc-invoice-note')
       if (!fence.ok) return fence.result
       const wcResult = await pushInvoiceNoteToWc(orderId)
-      if (!wcResult.success) return { success: false, error: wcResult.error ?? 'Failed to notify WooCommerce about invoice' }
-      // The customer download flag is its own operation (order.invoice-document) with its own switch (wc_invoice_document_enabled,
-      // off by default) and its own marker. A switched-off, not-applicable or nothing-to-serve answer is not a failure of the note.
-      const { publishInvoiceDocumentFlagToWc } = await import('@/lib/connectors/woocommerce/sync/invoice-document')
-      const flagResult = await publishInvoiceDocumentFlagToWc(orderId)
-      return flagResult.kind === 'failed' ? { success: false, error: flagResult.error } : { success: true }
+      // The customer download flag is NOT written here: it is the separate operation order.invoice-document, written only by its guarded
+      // outbox job (cut-off, claim, deadline and hold checks), never by this follow-up.
+      return wcResult.success ? { success: true } : { success: false, error: wcResult.error ?? 'Failed to notify WooCommerce about invoice' }
     }
 
     case 'BILL_PAYMENT': {
