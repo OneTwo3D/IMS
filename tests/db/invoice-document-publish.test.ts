@@ -389,6 +389,88 @@ test('THE FLAG IS WRITTEN ONLY INSIDE A GUARDED ATTEMPT: a direct call refuses a
   assert.equal(transport.puts.length, 0)
 })
 
+test('THE CUT-OFF: a job queued before the live-from instant is never sent, even though it is claimable by status', { skip }, async (t) => {
+  const d = await setup()
+  resetTransport()
+  const order = await seedOrder(d)
+  t.after(() => cleanup(d, [order.id]))
+  await setFlag(d, 'true')
+  const doc = await d.db.salesOrderInvoiceDocument.findFirstOrThrow({ where: { orderId: order.id } })
+  const key = d.jobs.wcInvoiceDocumentIdempotencyKey(order.id, doc.id)
+  await d.db.integrationOutbox.create({ data: {
+    connector: 'woocommerce', operation: 'order.invoice-document', idempotencyKey: key, payloadJson: { orderId: order.id, documentId: doc.id },
+    status: 'PENDING', createdAt: new Date(Date.now() - 100 * DAY),
+  } })
+  await withEnv(LIVE, async () => {
+    const run = await d.jobs.runWcInvoiceDocumentJobs({ idempotencyKeys: [key] })
+    assert.equal(run.succeeded, 0, JSON.stringify(run))
+  })
+  assert.equal(transport.puts.length, 0, 'a job from before the storefront went live is its former writer\'s')
+  assert.equal(await d.db.invoiceStorePublication.count({ where: { orderId: order.id } }), 0)
+})
+
+test('THE NOTE MARKER IS SAVED AT ONCE, and a held note write fails the call and saves nothing', { skip }, async (t) => {
+  const d = await setup()
+  resetTransport()
+  const order = await seedOrder(d, { stored: false, accountingInvoiceId: `acct-${randomUUID().slice(0, 8)}` })
+  t.after(async () => { await d.db.setting.deleteMany({ where: { key: 'accounting_invoice_url_template' } }); await cleanup(d, [order.id]) })
+  await d.db.setting.upsert({ where: { key: 'accounting_invoice_url_template' }, create: { key: 'accounting_invoice_url_template', value: 'https://acct.example.test/{id}' }, update: { value: 'https://acct.example.test/{id}' } })
+  transport.postResult = () => ({ data: null, error: 'Not sent by IMS: writes to WooCommerce are held', held: true })
+  const held = await d.note.pushInvoiceNoteToWc(order.id)
+  assert.equal(held.success, false, 'a held note write is a failure the queue retries')
+  assert.equal(await d.db.invoiceStorePublication.count({ where: { orderId: order.id } }), 0, 'nothing landed, so no marker')
+  transport.postResult = () => ({ data: { id: 777 } })
+  transport.notes = []
+  assert.deepEqual(await d.note.pushInvoiceNoteToWc(order.id), { success: true })
+  const marker = await d.db.invoiceStorePublication.findUniqueOrThrow({ where: { orderId: order.id } })
+  assert.equal(marker.noteStoreId, '777', 'the marker comes from the POST answer itself, not from a later reconcile')
+})
+
+test('THE DRAIN STANDS DOWN UNDER THE HOLD: a queued job is neither claimed nor sent while the hold stands, and is sent once it is lifted', { skip }, async (t) => {
+  const d = await setup()
+  resetTransport()
+  const order = await seedOrder(d)
+  t.after(() => cleanup(d, [order.id]))
+  await setFlag(d, 'true')
+  const doc = await d.db.salesOrderInvoiceDocument.findFirstOrThrow({ where: { orderId: order.id } })
+  const key = d.jobs.wcInvoiceDocumentIdempotencyKey(order.id, doc.id)
+  await withEnv(LIVE, () => d.jobs.enqueueInvoiceDocumentPublications({ orderIds: [order.id] }))
+  await withEnv(HELD, async () => {
+    const run = await d.jobs.runWcInvoiceDocumentJobs({ idempotencyKeys: [key] })
+    assert.equal(run.claimed, 0)
+  })
+  assert.equal(transport.puts.length, 0)
+  assert.equal((await jobsFor(d, order.id))[0]!.status, 'PENDING', 'untouched, no attempt spent')
+  await withEnv(LIVE, async () => assert.equal((await d.jobs.runWcInvoiceDocumentJobs({ idempotencyKeys: [key] })).succeeded, 1))
+})
+
+test('THE SCAN\'S FILTERS, one by one: superseded, already marked, before live-from and out-of-scope documents are not queued; the obligation time is the order\'s', { skip }, async (t) => {
+  const d = await setup()
+  resetTransport()
+  const superseded = await seedOrder(d)
+  const marked = await seedOrder(d)
+  const old = await seedOrder(d, { ageDays: 90 })
+  const inScope = await seedOrder(d)
+  const outOfScope = await seedOrder(d)
+  t.after(() => cleanup(d, [superseded.id, marked.id, old.id, inScope.id, outOfScope.id]))
+  await setFlag(d, 'true')
+  await d.db.salesOrderInvoiceDocument.updateMany({ where: { orderId: superseded.id }, data: { supersededAt: new Date() } })
+  const markedDoc = await d.db.salesOrderInvoiceDocument.findFirstOrThrow({ where: { orderId: marked.id } })
+  await d.db.invoiceStorePublication.create({ data: { orderId: marked.id, flagDocumentId: markedDoc.id, flagWrittenAt: new Date() } })
+  await withEnv(LIVE, async () => {
+    const none = await d.jobs.enqueueInvoiceDocumentPublications({ orderIds: [superseded.id, marked.id, old.id] })
+    assert.deepEqual(none, { scanned: 0, queued: 0, shadowed: 0 }, 'not even looked at')
+    const scoped = await d.jobs.enqueueInvoiceDocumentPublications({ orderIds: [inScope.id] })
+    assert.equal(scoped.queued, 1)
+    assert.equal((await jobsFor(d, outOfScope.id)).length, 0, 'an order outside the scope is left alone')
+    // The obligation time decides whether a job is IMS's: an order from before the live-from instant is a shadow, a recent one a job.
+    const oldDoc = await d.db.salesOrderInvoiceDocument.findFirstOrThrow({ where: { orderId: old.id } })
+    assert.equal(await d.jobs.scheduleWcInvoiceDocument(d.db, { orderId: old.id, documentId: oldDoc.id, obligationAt: new Date(Date.now() - 90 * DAY) }), null)
+    const recentDoc = await d.db.salesOrderInvoiceDocument.findFirstOrThrow({ where: { orderId: outOfScope.id } })
+    assert.ok(await d.jobs.scheduleWcInvoiceDocument(d.db, { orderId: outOfScope.id, documentId: recentDoc.id, obligationAt: new Date() }))
+  })
+})
+
 test('TWO CONCURRENT DRAINS WRITE ONCE (repeated: one pass proves nothing about a race)', { skip }, async (t) => {
   const d = await setup()
   await setFlag(d, 'true')
