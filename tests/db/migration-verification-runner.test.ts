@@ -98,14 +98,26 @@ test('the runner records a pass, and removes it when the checks fail, error or d
     } finally {
       await db.$executeRaw`DELETE FROM migration_verification_passes WHERE migration_name = ${stranger}`
     }
-    // And the same when no declaration exists at all (the early path).
+    // And the same when no declaration exists at all (the early path), with the required list absent.
     rmSync(verify)
     await db.$executeRaw`INSERT INTO migration_verification_passes (migration_name, checks_passed) VALUES (${stranger}, 1)`
     try {
       runRunner()
       const left = await db.$queryRaw<Array<{ n: bigint }>>`SELECT count(*) AS n FROM migration_verification_passes WHERE migration_name IN (${stranger}, ${name})`
       assert.equal(Number(left[0]!.n), 0, 'with no declaration and no required list, no recorded pass survives')
+  
+    // A required list that is present but EMPTY, with no verify.sql, executes zero declarations: still nothing
+    // vouches for a recorded pass, so it is revoked.
+    writeFileSync(path.join(dir, 'verification-required.txt'), '')
+    await db.$executeRaw`INSERT INTO migration_verification_passes (migration_name, checks_passed) VALUES (${stranger}, 1)`
+    try {
+      runRunner()
+      const left = await db.$queryRaw<Array<{ n: bigint }>>`SELECT count(*) AS n FROM migration_verification_passes WHERE migration_name = ${stranger}`
+      assert.equal(Number(left[0]!.n), 0, 'a present but empty required list with no declarations still revokes recorded passes')
     } finally {
+      await db.$executeRaw`DELETE FROM migration_verification_passes WHERE migration_name = ${stranger}`
+    }
+  } finally {
       await db.$executeRaw`DELETE FROM migration_verification_passes WHERE migration_name = ${stranger}`
     }
   } finally {

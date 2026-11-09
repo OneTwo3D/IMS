@@ -69,13 +69,15 @@
  * because their parent sees their rows; with foreign tables excluded first, every partition is
  * local).
  *
- * WHAT DOES NOT COUNT: exactly three tables, IN THE APPLICATION'S OWN SCHEMA, which a fresh
- * `prisma migrate deploy` seeds (measured 2026-09-17: `_prisma_migrations` 262 rows, `settings` 2,
- * `shopping_status_mappings` 7, and nothing else across 109 tables). `appSchema` is the schema the
+ * WHAT DOES NOT COUNT: exactly four tables, IN THE APPLICATION'S OWN SCHEMA, which a fresh
+ * `prisma migrate deploy` and the post-migration verification run that follows it write (measured 2026-09-17:
+ * `_prisma_migrations` 262 rows, `settings` 2, `shopping_status_mappings` 7, and nothing else across 109 tables;
+ * `migration_verification_passes` is deploy bookkeeping the verification runner records, one row per migration that
+ * declares checks). `appSchema` is the schema the
  * application resolves from DATABASE_URL (`public` unless the URL names another).
  */
 
-export const MIGRATION_SEEDED_TABLE_NAMES = ['_prisma_migrations', 'settings', 'shopping_status_mappings'] as const
+export const MIGRATION_SEEDED_TABLE_NAMES = ['_prisma_migrations', 'migration_verification_passes', 'settings', 'shopping_status_mappings'] as const
 
 /**
  * Tables every INSTALLED application populates and the concurrency tier does not write — the guard's

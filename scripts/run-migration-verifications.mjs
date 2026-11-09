@@ -361,16 +361,15 @@ async function main() {
   if (withVerify.length === 0) {
     // No file declares checks, so nothing can be re-verified: revoke the pass of every required migration
     // (its verify.sql is missing) rather than leave an old pass lifting a retention exemption.
-    const listMissing = !requiredListPresent(migrationsDir)
-    if ((unbackedPasses(coverage, []).length > 0 || listMissing) && process.env.DATABASE_URL) {
+    // Nothing at all was executed, so no recorded pass is backed by this run, whether the required list is absent,
+    // present and empty, or names things that are missing: revoke every one.
+    if (process.env.DATABASE_URL) {
       const revoker = new pg.Client({ connectionString: process.env.DATABASE_URL })
       await revoker.connect()
       try {
         const unbacked = [...unbackedPasses(coverage, [])]
-        if (listMissing) {
-          const recorded = await revoker.query('SELECT migration_name FROM migration_verification_passes')
-          unbacked.push(...passesToRevokeWithoutRequiredList(recorded.rows.map((row) => row.migration_name), []))
-        }
+        const recorded = await revoker.query('SELECT migration_name FROM migration_verification_passes')
+        unbacked.push(...passesToRevokeWithoutRequiredList(recorded.rows.map((row) => row.migration_name), []))
         await recordVerificationOutcomes(revoker, { passed: [], failed: [], unbacked })
       } catch (error) {
         console.error(`could not revoke recorded verification passes: ${error instanceof Error ? error.message : String(error)}`)
@@ -439,7 +438,9 @@ async function main() {
     // silently not writing it would leave that exemption in force with nothing saying so.
     try {
       const unbacked = unbackedPasses(coverage, unapplied)
-      if (!requiredListPresent(migrationsDir)) {
+      // Without a required list, or when no declaration was executed at all, nothing vouches for a recorded pass
+      // this run did not itself re-verify.
+      if (!requiredListPresent(migrationsDir) || runnable.length === 0) {
         const recorded = await client.query('SELECT migration_name FROM migration_verification_passes')
         unbacked.push(...passesToRevokeWithoutRequiredList(recorded.rows.map((row) => row.migration_name), runnable))
       }
