@@ -1,3 +1,4 @@
+import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { mkdtempSync } from 'node:fs'
@@ -14,17 +15,14 @@ import { Prisma } from '../../app/generated/prisma/client'
  * invoice-document reader are real; ONLY the two WooCommerce transport functions (wcPost, wcPut) are doubled, and they record every call.
  * Nothing contacts any vendor (tests/no-outbound-network.cjs fails a test that tried).
  *
- * Committing, with its own cleanup. GATED on RUN_DB_RETENTION_TESTS with the REQUIRE_DB_RETENTION_TESTS tripwire (npm run test:db).
+ * Committing, with its own cleanup, so it lives in the SERIAL concurrency tier: it stores documents and the database-reset test in tests/db expects none to exist while it runs. GATED on RUN_DB_CONCURRENCY_TESTS (npm run test:concurrency).
  *
  * Arms: OFF by default (no scan, no row, no write, with or without the hold); the producer hold shadows (no row, a record, no write);
  * live: one write, marker saved, no repeat on a rescan or a replay; a held / rejected write is a retry and saves no marker; an order
  * older than the live-from instant is never queued; an unservable document is not published; the note is posted once per ledger invoice
  * id however often the meta fails; two concurrent drains write once (repeated, because one pass proves nothing about a race).
  */
-const skip = process.env.RUN_DB_RETENTION_TESTS !== '1'
-if (skip && process.env.REQUIRE_DB_RETENTION_TESTS === '1') {
-  throw new Error('REQUIRE_DB_RETENTION_TESTS=1 but RUN_DB_RETENTION_TESTS is not 1, so every test in tests/db/invoice-document-publish.test.ts would have been skipped. Fix the invocation (npm run test:db).')
-}
+const skip = process.env.RUN_DB_CONCURRENCY_TESTS !== '1'
 
 type WcResult = { data: unknown; error?: string; held?: true }
 const transport = {
@@ -88,7 +86,7 @@ function pdf(tag: string): Buffer {
 async function setup() {
   config({ path: '.env.local', quiet: true })
   config({ quiet: true })
-  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required when RUN_DB_RETENTION_TESTS=1')
+  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required when RUN_DB_CONCURRENCY_TESTS=1')
   process.env.INVOICE_PDF_STORAGE_DIR = mkdtempSync(path.join(os.tmpdir(), 'invpub-'))
   const [{ db }, service, jobs, writer, note] = await Promise.all([
     import('../../lib/db'),
