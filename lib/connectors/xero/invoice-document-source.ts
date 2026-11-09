@@ -10,12 +10,12 @@
  */
 
 import type { DocumentClaim } from '@/lib/domain/invoice-documents/claim-selection'
-import { xeroGet, xeroGetRaw } from './api'
+import { xeroGet, xeroGetRaw, type RequiredXeroConnection } from './api'
 import { PAGE_SIZE } from './invoice-delta'
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 
 export type DocumentClaimsLookup =
-  | { ok: true; claims: DocumentClaim[] }
+  | { ok: true; claims: DocumentClaim[]; /** The organisation and connection that answered: the download must be built from the same. */ connection?: RequiredXeroConnection }
   | { ok: false; error: string; unaskable?: boolean; /** The ledger refused or is rate-limited: the sweep should stop, not try the next order. */ stop?: boolean }
 
 export type DocumentPdfDownload =
@@ -37,6 +37,7 @@ export async function lookupInvoiceDocumentClaims(invoiceNumber: string): Promis
   if (!lookup.ok) return { ok: false, error: lookup.error, unaskable: lookup.unaskable, stop: isStopStatus(lookup.httpStatus) }
   return {
     ok: true,
+    connection: lookup.tenantId ? { tenantId: lookup.tenantId, connectionGeneration: lookup.connectionGeneration ?? null } : undefined,
     claims: lookup.claims.map((claim) => ({
       documentId: claim.invoiceId,
       documentNumber: claim.invoiceNumber,
@@ -46,6 +47,7 @@ export async function lookupInvoiceDocumentClaims(invoiceNumber: string): Promis
       ...(claim.contactName ? { contactName: claim.contactName } : {}),
       ...(claim.currencyCode ? { currencyCode: claim.currencyCode } : {}),
       ...(claim.dateString ? { dateString: claim.dateString } : {}),
+      ...(claim.updatedDateUtc ? { updatedDateUtc: claim.updatedDateUtc } : {}),
     })),
   }
 }
@@ -63,6 +65,7 @@ type XeroSalesCreditNoteLookupResponse = {
     Reference?: unknown
     CurrencyCode?: unknown
     DateString?: unknown
+    UpdatedDateUTC?: unknown
     Contact?: { Name?: unknown }
   }>
   pagination?: { pageCount?: unknown }
@@ -75,7 +78,7 @@ function asString(value: unknown): string | undefined {
 /** Who holds this credit note number as a SALES credit note (ACCRECCREDIT). Same fail-closed shape as the invoice lookup. */
 export async function lookupSalesCreditNoteDocumentClaims(
   creditNoteNumber: string,
-  deps: { get: <T>(path: string) => Promise<{ ok: boolean; status: number; data?: T; error?: string }> } = { get: (path) => xeroGet(path) },
+  deps: { get: <T>(path: string) => Promise<{ ok: boolean; status: number; data?: T; error?: string; tenantId?: string; connectionGeneration?: string | null }> } = { get: (path) => xeroGet(path) },
 ): Promise<DocumentClaimsLookup> {
   const wanted = creditNoteNumber.trim()
   if (!wanted) return { ok: false, unaskable: true, error: 'the refund carries no credit note number to look up' }
@@ -85,7 +88,7 @@ export async function lookupSalesCreditNoteDocumentClaims(
     }
   }
   const where = `Type=="${SALES_CREDIT_NOTE_TYPE}" AND CreditNoteNumber=="${wanted}"`
-  let res: { ok: boolean; status: number; data?: XeroSalesCreditNoteLookupResponse; error?: string }
+  let res: { ok: boolean; status: number; data?: XeroSalesCreditNoteLookupResponse; error?: string; tenantId?: string; connectionGeneration?: string | null }
   try {
     res = await deps.get<XeroSalesCreditNoteLookupResponse>(`CreditNotes?where=${encodeURIComponent(where)}&page=1&pageSize=${PAGE_SIZE}`)
   } catch (error) {
@@ -110,6 +113,7 @@ export async function lookupSalesCreditNoteDocumentClaims(
     const contactName = asString(row?.Contact?.Name)
     const currencyCode = asString(row?.CurrencyCode)
     const dateString = asString(row?.DateString)
+    const updatedDateUtc = asString(row?.UpdatedDateUTC)
     claims.push({
       documentId,
       documentNumber: number,
@@ -119,15 +123,18 @@ export async function lookupSalesCreditNoteDocumentClaims(
       ...(contactName ? { contactName } : {}),
       ...(currencyCode ? { currencyCode: currencyCode.toUpperCase() } : {}),
       ...(dateString ? { dateString } : {}),
+      ...(updatedDateUtc ? { updatedDateUtc } : {}),
     })
   }
-  return { ok: true, claims }
+  const tenantId = typeof res.tenantId === 'string' ? res.tenantId.trim() : ''
+  return { ok: true, claims, connection: tenantId ? { tenantId, connectionGeneration: res.connectionGeneration ?? null } : undefined }
 }
 
 /** GET the document as a PDF. A 429, a refusal to send, or an auth failure means the run should stop. */
-export async function downloadLedgerDocumentPdf(kind: 'INVOICE' | 'CREDIT_NOTE', documentId: string): Promise<DocumentPdfDownload> {
+export async function downloadLedgerDocumentPdf(kind: 'INVOICE' | 'CREDIT_NOTE', documentId: string, connection?: RequiredXeroConnection): Promise<DocumentPdfDownload> {
   const path = kind === 'INVOICE' ? `Invoices/${encodeURIComponent(documentId)}` : `CreditNotes/${encodeURIComponent(documentId)}`
-  const result = await xeroGetRaw(path, 'application/pdf')
+  // Bound to the connection that answered the lookup: if it changed in between, nothing is sent.
+  const result = await xeroGetRaw(path, 'application/pdf', connection ? { requireConnection: connection } : undefined)
   if (result.ok && result.buffer) return { ok: true, buffer: result.buffer }
   const stop = isStopStatus(result.status)
   return { ok: false, stop, error: result.error ?? `PDF download failed with HTTP ${result.status}` }

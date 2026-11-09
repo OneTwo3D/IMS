@@ -119,3 +119,23 @@ test('evidence: a credit note (no gross total to compare) needs currency plus cu
 test('rechecks of a stored document: a day, a week, then every thirty days', () => {
   assert.deepEqual([0, 1, 2, 3, 9].map(recheckDelayMs), [86_400_000, 604_800_000, 2_592_000_000, 2_592_000_000, 2_592_000_000])
 })
+
+test('the invoice gross is the amount paid PLUS the store credit settled against it, and only when the credit was assessed', async () => {
+  const { expectedInvoiceGross } = await import('../../lib/domain/invoice-documents/order-evidence.ts')
+  assert.deepEqual(expectedInvoiceGross({ totalForeign: '80', storeCreditForeign: '20', storeCreditAssessment: 'ASSESSED' }), { ok: true, total: 100 })
+  assert.deepEqual(expectedInvoiceGross({ totalForeign: '100', storeCreditForeign: '0', storeCreditAssessment: null }), { ok: true, total: 100 })
+  assert.equal(expectedInvoiceGross({ totalForeign: '80', storeCreditForeign: '20', storeCreditAssessment: null }).ok, false, 'credit never assessed')
+  assert.equal(expectedInvoiceGross({ totalForeign: '80', storeCreditForeign: '20', storeCreditAssessment: 'REVIEW_REQUIRED' }).ok, false)
+  assert.equal(expectedInvoiceGross({ totalForeign: '100', storeCreditForeign: '0', storeCreditAssessment: 'REVIEW_REQUIRED' }).ok, false)
+  assert.equal(expectedInvoiceGross({ totalForeign: '80', storeCreditForeign: 'lots', storeCreditAssessment: 'ASSESSED' }).ok, false, 'an unreadable amount fails closed')
+})
+
+test('two readings of one ledger document must agree on every field the ownership check rests on', async () => {
+  const { ownershipFingerprintsMatch } = await import('../../lib/domain/invoice-documents/claim-selection.ts')
+  const base: DocumentClaim = { documentId: 'd', documentNumber: 'INV-1', status: 'AUTHORISED', total: 100, currencyCode: 'GBP', contactName: 'Ada', reference: '12345', dateString: '2026-11-01', updatedDateUtc: '/Date(1)/' }
+  assert.equal(ownershipFingerprintsMatch(base, { ...base }), true)
+  assert.equal(ownershipFingerprintsMatch(base, { ...base, status: 'authorised' }), true, 'case is not a change')
+  for (const change of [{ status: 'PAID' }, { total: 101 }, { currencyCode: 'EUR' }, { contactName: 'Bob' }, { reference: '999' }, { dateString: '2026-11-02' }, { updatedDateUtc: '/Date(2)/' }, { documentId: 'e' }]) {
+    assert.equal(ownershipFingerprintsMatch(base, { ...base, ...change }), false, JSON.stringify(change))
+  }
+})

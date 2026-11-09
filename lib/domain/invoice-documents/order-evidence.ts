@@ -20,6 +20,7 @@
  * until a person looks; that is the safe direction for a document shown to a customer.
  */
 
+import { toDecimal } from '@/lib/domain/math/decimal'
 import type { DocumentClaim } from './claim-selection'
 
 export type EvidenceSubject = {
@@ -92,4 +93,33 @@ export function assessDocumentEvidence(subject: EvidenceSubject, claim: Document
   if (referenceMatches) matched.push('reference')
   if (claim.dateString && withinDays(claim.dateString, subject.anchorDate, subject.dateToleranceDays)) matched.push('date')
   return { ok: true, matched }
+}
+
+export type ExpectedInvoiceGross = { ok: true; total: number } | { ok: false; reason: string }
+
+/**
+ * The gross the LEDGER invoice states for an order. The WooCommerce import records `totalForeign` as what the customer PAID, which is
+ * after store credit (Smart Coupons credit, wallet, gift card: all kept on `storeCreditForeign`), while the invoice states the FULL goods
+ * value and the credit is settled against it as a payment (store-credit-invoice-refusal.ts). The importer proves
+ * lines + tax + shipping - order discount - credit = total before it accepts the credit (checkWcStoreCreditReconciles), so the invoice
+ * gross is `totalForeign + storeCreditForeign`.
+ *
+ * That identity is only trusted for an order whose credit was ASSESSED by the importer. Credit that was never assessed, or an order held
+ * for store-credit review, has no total IMS can vouch for, and the document needs a person rather than being compared with a guess.
+ */
+export function expectedInvoiceGross(order: { totalForeign: unknown; storeCreditForeign: unknown; storeCreditAssessment: unknown }): ExpectedInvoiceGross {
+  if (order.storeCreditAssessment === 'REVIEW_REQUIRED') {
+    return { ok: false, reason: 'the order is held for store-credit review, so the gross its invoice states cannot be derived' }
+  }
+  let credit
+  try {
+    credit = toDecimal(order.storeCreditForeign as string | number)
+  } catch {
+    return { ok: false, reason: 'the order\'s store-credit amount is unreadable, so the gross its invoice states cannot be derived' }
+  }
+  if (!credit.isFinite()) return { ok: false, reason: 'the order\'s store-credit amount is unreadable, so the gross its invoice states cannot be derived' }
+  if (credit.gt(0) && order.storeCreditAssessment !== 'ASSESSED') {
+    return { ok: false, reason: 'the order carries store credit that the import never assessed, so the gross its invoice states cannot be derived' }
+  }
+  return { ok: true, total: toDecimal(order.totalForeign as string | number).add(credit).toNumber() }
 }

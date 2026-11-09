@@ -35,7 +35,7 @@ async function setup() {
   return { db, service, sweep }
 }
 
-async function seedOrder(db: Awaited<ReturnType<typeof setup>>['db'], withCreditNote = false, options: { invoiceNumber?: string; status?: string; customerName?: string } = {}) {
+async function seedOrder(db: Awaited<ReturnType<typeof setup>>['db'], withCreditNote = false, options: { invoiceNumber?: string; status?: string; customerName?: string; totalForeign?: string; storeCredit?: string; assessment?: 'ASSESSED' | 'REVIEW_REQUIRED' } = {}) {
   const suffix = randomUUID().slice(0, 8)
   const order = await db.salesOrder.create({
     data: {
@@ -46,7 +46,9 @@ async function seedOrder(db: Awaited<ReturnType<typeof setup>>['db'], withCredit
       currency: 'GBP',
       fxRateToBase: new Prisma.Decimal('1'),
       subtotalForeign: new Prisma.Decimal('100'),
-      totalForeign: new Prisma.Decimal('100'),
+      totalForeign: new Prisma.Decimal(options.totalForeign ?? '100'),
+      ...(options.storeCredit ? { storeCreditForeign: new Prisma.Decimal(options.storeCredit) } : {}),
+      ...(options.assessment ? { storeCreditAssessment: options.assessment } : {}),
       subtotalBase: new Prisma.Decimal('100'),
       taxBase: new Prisma.Decimal('0'),
       totalBase: new Prisma.Decimal('100'),
@@ -60,9 +62,11 @@ async function seedOrder(db: Awaited<ReturnType<typeof setup>>['db'], withCredit
   return { suffix, order }
 }
 
+const LEDGER_DATE = new Date().toISOString()
+
 /** What the ledger says about a document that really is this order's. */
 function ledgerClaim(order: { orderNumber: string | null }, number: string, over: Record<string, unknown> = {}) {
-  return { documentId: 'xero-1', documentNumber: number, status: 'AUTHORISED', total: 100, currencyCode: 'GBP', dateString: new Date().toISOString(), reference: order.orderNumber ?? undefined, ...over }
+  return { documentId: 'xero-1', documentNumber: number, status: 'AUTHORISED', total: 100, currencyCode: 'GBP', dateString: LEDGER_DATE, reference: order.orderNumber ?? undefined, ...over }
 }
 
 async function cleanup(db: Awaited<ReturnType<typeof setup>>['db'], orderId: string) {
@@ -583,6 +587,94 @@ test('readers resolve the current hash-named file, not the flat file; a missing 
   } finally {
     await db.setting.deleteMany({ where: { key: { in: [...keys, sweep.INVOICE_DOCUMENTS_INTEGRITY_CURSOR_SETTING] } } })
     for (const row of saved) await db.setting.create({ data: { key: row.key, value: row.value } })
+    await cleanup(db, order.id)
+  }
+})
+
+test('a store-credit order whose ledger invoice states the FULL goods value is stored; a mismatch or an unassessed credit is not', { skip }, async () => {
+  const { db, service } = await setup()
+  const credit = await seedOrder(db, false, { totalForeign: '80', storeCredit: '20', assessment: 'ASSESSED' })
+  const unassessed = await seedOrder(db, false, { totalForeign: '80', storeCredit: '20' })
+  const review = await seedOrder(db, false, { totalForeign: '80', storeCredit: '20', assessment: 'REVIEW_REQUIRED' })
+  try {
+    // The importer recorded 80 (paid); the invoice states 100 (goods) with the 20 settled as a payment: stored.
+    assert.equal((await service.ensureInvoiceDocument({ orderId: credit.order.id, kind: 'INVOICE' }, depsFor(credit.order, { claim: { total: 100 } }))).status, 'stored')
+    // CONTROL: the amount PAID is not the invoice gross for a credit order.
+    await db.invoiceDocumentFetchState.deleteMany({ where: { orderId: credit.order.id } })
+    await db.salesOrderInvoiceDocument.updateMany({ where: { orderId: credit.order.id }, data: { supersededAt: new Date() } })
+    assert.equal((await service.ensureInvoiceDocument({ orderId: credit.order.id, kind: 'INVOICE', ignoreBackoff: true }, depsFor(credit.order, { claim: { total: 80 } }))).status, 'needs-attention')
+    // Credit the import never assessed, or an order held for review: no total IMS can vouch for.
+    for (const o of [unassessed.order, review.order]) {
+      const downloads = { n: 0 }
+      const outcome = await service.ensureInvoiceDocument({ orderId: o.id, kind: 'INVOICE' }, depsFor(o, { claim: { total: 100 }, downloads }))
+      assert.equal(outcome.status, 'needs-attention')
+      assert.equal(downloads.n, 0)
+    }
+  } finally {
+    await cleanup(db, credit.order.id)
+    await cleanup(db, unassessed.order.id)
+    await cleanup(db, review.order.id)
+  }
+})
+
+test('the ledger document changes between the lookup and the download: the bytes are discarded and nothing is promoted', { skip }, async () => {
+  const { db, service } = await setup()
+  for (const [name, change] of [
+    ['status', { status: 'VOIDED' }],
+    ['total', { total: 120 }],
+    ['customer', { contactName: 'Bob Builder' }],
+    ['reference', { reference: 'another order' }],
+    ['last-modified stamp', { updatedDateUtc: '/Date(2)/' }],
+  ] as const) {
+    const { order } = await seedOrder(db, false, { customerName: 'Ada Lovelace' })
+    try {
+      let lookups = 0
+      const deps: Deps = {
+        ...depsFor(order),
+        lookupInvoiceClaims: async (number) => {
+          lookups++
+          const base = ledgerClaim(order, number, { contactName: 'Ada Lovelace', updatedDateUtc: '/Date(1)/' })
+          return { ok: true, claims: [lookups === 1 ? base : { ...base, ...change }] }
+        },
+      }
+      const outcome = await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, deps)
+      assert.notEqual(outcome.status, 'stored', name)
+      assert.equal(await db.salesOrderInvoiceDocument.count({ where: { orderId: order.id } }), 0, `${name}: nothing promoted`)
+      assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: order.id }, select: { invoicePdfPath: true } })).invoicePdfPath, null)
+      assert.equal(lookups, 2, `${name}: the document was re-read after the download`)
+    } finally {
+      await cleanup(db, order.id)
+    }
+  }
+})
+
+test('the connection changes between the lookup and the re-read, or the download is refused for it: nothing is promoted', { skip }, async () => {
+  const { db, service } = await setup()
+  const { order } = await seedOrder(db)
+  try {
+    const conn = (generation: string) => ({ tenantId: 'tenant-A', connectionGeneration: generation })
+    let lookups = 0
+    const seenByDownload: unknown[] = []
+    const moved: Deps = {
+      ...depsFor(order),
+      lookupInvoiceClaims: async (number) => { lookups++; return { ok: true, claims: [ledgerClaim(order, number)], connection: conn(lookups === 1 ? 'gen-1' : 'gen-2') } },
+      downloadPdf: async (_k, _id, connection) => { seenByDownload.push(connection); return { ok: true, buffer: pdf('x') } },
+    }
+    const outcome = await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, moved)
+    assert.equal(outcome.status, 'failed')
+    assert.deepEqual(seenByDownload, [conn('gen-1')], 'the download was asked to run under the connection that answered the lookup')
+    assert.equal(await db.salesOrderInvoiceDocument.count({ where: { orderId: order.id } }), 0)
+
+    // The transport refuses a download whose connection changed (xeroGetRaw returns not-sent): nothing is promoted.
+    await db.invoiceDocumentFetchState.deleteMany({ where: { orderId: order.id } })
+    const refused: Deps = {
+      ...depsFor(order),
+      lookupInvoiceClaims: async (number) => ({ ok: true, claims: [ledgerClaim(order, number)], connection: conn('gen-1') }),
+      downloadPdf: async () => ({ ok: false, error: 'The Xero connection changed after the document was looked up', stop: false }),
+    }
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, refused)).status, 'failed')
+    assert.equal(await db.salesOrderInvoiceDocument.count({ where: { orderId: order.id } }), 0)
+  } finally {
     await cleanup(db, order.id)
   }
 })

@@ -147,6 +147,8 @@ export type LedgerInvoiceClaim = {
   reference?: string
   currencyCode?: string
   dateString?: string
+  /** The ledger's last-modified stamp for the document. */
+  updatedDateUtc?: string
 }
 
 /**
@@ -179,6 +181,8 @@ export type InvoiceNumberLookup =
        * closed instead of returning claims nobody can attribute.
        */
       tenantId: string
+      /** The connection generation of the same request (null when the stored connection predates it). Lets a later read of the same document be bound to this connection. */
+      connectionGeneration?: string | null
     }
   | {
       ok: false

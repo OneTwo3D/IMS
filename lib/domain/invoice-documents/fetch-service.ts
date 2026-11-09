@@ -34,8 +34,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { invoiceDocumentStoredPath, saveInvoiceDocumentFile } from '@/lib/invoice-pdf'
-import { selectDocumentClaim, type DocumentClaim } from './claim-selection'
-import { assessDocumentEvidence, type EvidenceSubject } from './order-evidence'
+import { ownershipFingerprintsMatch, selectDocumentClaim, type DocumentClaim } from './claim-selection'
+import type { RequiredXeroConnection } from '@/lib/connectors/xero/api'
+import { assessDocumentEvidence, expectedInvoiceGross, type EvidenceSubject } from './order-evidence'
 import { nextAttemptDelayMs, recheckDelayMs, shouldEscalateMissing } from './backoff'
 import { validateFetchedPdf } from './pdf-validate'
 
@@ -51,7 +52,7 @@ export const INVOICE_DOCUMENT_CONNECTOR = 'xero'
 export const INVOICE_DOCUMENT_LEASE_MS = 10 * 60_000
 
 export type DocumentClaimsResult =
-  | { ok: true; claims: DocumentClaim[] }
+  | { ok: true; claims: DocumentClaim[]; /** The organisation and connection that answered: the download must be built from the same. */ connection?: RequiredXeroConnection }
   | { ok: false; error: string; unaskable?: boolean; /** The ledger refused or is rate-limited: the sweep stops. */ stop?: boolean }
 
 export type DocumentDownloadResult = { ok: true; buffer: Buffer } | { ok: false; error: string; stop: boolean }
@@ -59,7 +60,7 @@ export type DocumentDownloadResult = { ok: true; buffer: Buffer } | { ok: false;
 export type InvoiceDocumentDeps = {
   lookupInvoiceClaims: (invoiceNumber: string) => Promise<DocumentClaimsResult>
   lookupCreditNoteClaims: (creditNoteNumber: string) => Promise<DocumentClaimsResult>
-  downloadPdf: (kind: InvoiceDocumentKindName, documentId: string) => Promise<DocumentDownloadResult>
+  downloadPdf: (kind: InvoiceDocumentKindName, documentId: string, connection?: RequiredXeroConnection) => Promise<DocumentDownloadResult>
   now: () => Date
 }
 
@@ -202,6 +203,8 @@ async function ensureUnderLease(
       customerName: true,
       currency: true,
       totalForeign: true,
+      storeCreditForeign: true,
+      storeCreditAssessment: true,
       createdAt: true,
     },
   })
@@ -210,17 +213,20 @@ async function ensureUnderLease(
   let number: string | null
   let sharedByOthers = 0
   let evidenceSubject: EvidenceSubject
+  let grossUnderivable: string | null = null
   const orderNumbers = [order.externalOrderNumber, order.orderNumber].flatMap((value) => (value ? [value] : []))
   if (input.kind === 'INVOICE') {
     number = order.invoiceNumber?.trim() || null
     if (number) {
       sharedByOthers = await db.salesOrder.count({ where: { id: { not: order.id }, invoiceNumber: { equals: number, mode: 'insensitive' } } })
     }
+    const gross = expectedInvoiceGross(order)
+    if (!gross.ok) grossUnderivable = gross.reason
     evidenceSubject = {
       orderNumbers,
       customerName: order.customerName ?? null,
       currency: order.currency,
-      expectedTotal: Number(order.totalForeign),
+      expectedTotal: gross.ok ? gross.total : null,
       anchorDate: order.createdAt,
       dateToleranceDays: 14,
     }
@@ -284,6 +290,8 @@ async function ensureUnderLease(
     return needsAttention(`${label}: ${sharedByOthers} other IMS ${input.kind === 'INVOICE' ? 'order(s) carry' : 'refund(s) carry'} the same number, so the ledger document cannot be tied to this one`)
   }
 
+  if (grossUnderivable) return needsAttention(`${label}: ${grossUnderivable}`)
+
   const lookup = input.kind === 'INVOICE' ? await deps.lookupInvoiceClaims(number) : await deps.lookupCreditNoteClaims(number)
   if (!(await renewLease(subjectKey, token, deps.now()))) throw new LeaseLost()
   if (!lookup.ok) {
@@ -301,9 +309,25 @@ async function ensureUnderLease(
   const evidence = assessDocumentEvidence(evidenceSubject, claim)
   if (!evidence.ok) return needsAttention(`${label}: ${evidence.reason}`)
 
-  const download = await deps.downloadPdf(input.kind, claim.documentId)
+  // The download is built from the connection that answered the lookup (a change refuses it before it is sent)...
+  const download = await deps.downloadPdf(input.kind, claim.documentId, lookup.connection)
   if (!(await renewLease(subjectKey, token, deps.now()))) throw new LeaseLost()
   if (!download.ok) return defer(`${label}: ${download.error}`, 'failed', download.stop)
+
+  // ...and the document is read AGAIN: ownership was judged on the lookup, the bytes came from a separate request, and the ledger can
+  // change a document (or the connection can move to another organisation) in between. The re-read must name the same connection and
+  // the same document with the same status, total, currency, customer, reference, date and last-modified stamp, and must pass
+  // selection and the order evidence again; otherwise the bytes are discarded and the next pass starts again.
+  const recheck = input.kind === 'INVOICE' ? await deps.lookupInvoiceClaims(number) : await deps.lookupCreditNoteClaims(number)
+  if (!(await renewLease(subjectKey, token, deps.now()))) throw new LeaseLost()
+  if (!recheck.ok) return defer(`${label}: the document could not be re-read after the download, so its bytes are discarded: ${recheck.error}`, 'failed', recheck.stop === true)
+  if (lookup.connection && (recheck.connection?.tenantId !== lookup.connection.tenantId || (recheck.connection?.connectionGeneration ?? null) !== lookup.connection.connectionGeneration)) {
+    return defer(`${label}: the Xero connection changed between the lookup and the re-read, so the downloaded bytes are discarded`, 'failed')
+  }
+  const reselected = selectDocumentClaim(recheck.claims, label, { orderCancelled: order.status === 'CANCELLED' })
+  if (reselected.outcome !== 'select' || !ownershipFingerprintsMatch(claim, reselected.claim) || !assessDocumentEvidence(evidenceSubject, reselected.claim).ok) {
+    return defer(`${label}: the ledger document changed between the lookup and the download, so the downloaded bytes are discarded`, 'failed')
+  }
 
   const validation = validateFetchedPdf(download.buffer)
   if (!validation.ok) return defer(`${label}: ${validation.reason}`, 'failed')

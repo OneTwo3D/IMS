@@ -24,6 +24,8 @@ export type DocumentClaim = {
   contactName?: string
   currencyCode?: string
   dateString?: string
+  /** The ledger's last-modified stamp for the document. */
+  updatedDateUtc?: string
 }
 
 export type ClaimSelection =
@@ -73,4 +75,22 @@ export function selectDocumentClaim(claims: readonly DocumentClaim[], label: str
     return { outcome: 'attention', reason: `${label}: ${voided.length} voided documents and no live one hold this number, so IMS will not choose one` }
   }
   return { outcome: 'wait', reason: `${label}: the ledger holds no document under this number yet` }
+}
+
+/**
+ * Do two readings of the SAME ledger document agree on every field the ownership check and the selection rest on? Used after the PDF is
+ * downloaded: the document is re-read and must still be the document that passed (same id, status, total, currency, customer,
+ * reference, date and last-modified stamp). Any difference means the ledger changed it between the check and the download, so the
+ * bytes are discarded and the next pass starts again.
+ */
+export function ownershipFingerprintsMatch(before: DocumentClaim, after: DocumentClaim): boolean {
+  const norm = (value: string | undefined) => (value ?? '').trim().toLowerCase()
+  return before.documentId === after.documentId
+    && norm(before.status) === norm(after.status)
+    && before.total === after.total
+    && norm(before.currencyCode) === norm(after.currencyCode)
+    && norm(before.contactName) === norm(after.contactName)
+    && norm(before.reference) === norm(after.reference)
+    && norm(before.dateString) === norm(after.dateString)
+    && norm(before.updatedDateUtc) === norm(after.updatedDateUtc)
 }
