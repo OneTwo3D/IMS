@@ -736,7 +736,8 @@ export function isSettlementDiscrepancy(v: SettlementVerdict): boolean {
  * Two ways a terminal row outlives what it describes, both introduced by doing the right thing
  * elsewhere (Codex, PR #582 round 4):
  *
- *  1. The RECEIPT IT BELONGED TO WAS DELETED. deletePayment retires a queued registration to CANCELLED
+ *  1. The RECEIPT IT BELONGED TO WAS DELETED (and, for a CANCELLED row, the classifier reads NOTHING owed on it).
+ *     deletePayment retires a queued registration to CANCELLED
  *     rather than deleting it — that is what keeps a worker from posting a payment whose only record we
  *     erased — and leaves FAILED rows alone. Record a receipt, delete it, record a corrected one that
  *     posts cleanly, and the aggregate's worst-first rule would still read the dead row and report
@@ -760,7 +761,11 @@ export function effectivePaymentSyncRows(
   const newestSuccessIdx = rows.findIndex((r) => r.status === 'SYNCED')
   return rows.filter((r, i) => {
     if (!isTerminal(r)) return true
-    if (belongsToDeletedReceipt(r)) return false
+    // A deleted receipt's registration is history ONLY when the shared classifier can say nothing is owed on it
+    // (any terminal row, FAILED included): a CANCELLED row that is PROVEN not posted (pre-call stamp) or verified reversed reads NOTHING. An unstamped
+    // cancellation may have reached the ledger, and dropping it would show the order unpaid or settled by another
+    // receipt over a payment that may stand there; it stays, so aggregation surfaces it as UNDECIDED.
+    if (belongsToDeletedReceipt(r)) return registrationLedgerStanding(r) !== 'NOTHING'
     // Newest-first, so a higher index is OLDER: a terminal row older than the newest success is history.
     return !(newestSuccessIdx !== -1 && i > newestSuccessIdx)
   })

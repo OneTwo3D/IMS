@@ -412,12 +412,38 @@ test('a registration whose receipt was deleted no longer speaks for the order', 
   const live = new Set(['pay-2'])
   const rows = effectivePaymentSyncRows([
     row({ status: 'SYNCED', externalTransactionId: 'PAY-2', amount: 100, paymentId: 'pay-2' }),
-    row({ status: 'CANCELLED', externalTransactionId: null, paymentId: 'pay-1' }),
+    row({ status: 'CANCELLED', externalTransactionId: null, paymentId: 'pay-1', abandonedBeforeRemoteCall: true }),
   ], { livePaymentIds: live })
   assert.equal(rows.length, 1)
   const v = settlementStatus({ ...base, payment: aggregatePaymentSyncRows(rows), totalForeign: 100 })
   assert.equal(v.status, 'SETTLED')
   assert.equal(v.discrepancy, false)
+})
+
+test('a deleted receipt\'s UNSTAMPED cancellation stays, and the order shows LEDGER_UNDECIDED (the sales-detail path: filter + aggregate + verdict)', () => {
+  const live = new Set(['pay-2'])
+  const unstamped = row({ status: 'CANCELLED', externalTransactionId: null, paymentId: 'pay-1' })
+  // Beside another receipt's settled registration, newest first.
+  const withOther = effectivePaymentSyncRows([
+    row({ status: 'SYNCED', externalTransactionId: 'PAY-2', amount: 100, paymentId: 'pay-2' }),
+    unstamped,
+  ], { livePaymentIds: live })
+  assert.equal(withOther.length, 2, 'the unproven cancellation is not history')
+  const v = settlementStatus({ ...base, payment: aggregatePaymentSyncRows(withOther), totalForeign: 100 })
+  assert.equal(v.status, 'LEDGER_UNDECIDED')
+  assert.equal(v.discrepancy, true)
+  // Alone, with the order not paid locally any more.
+  const alone = effectivePaymentSyncRows([unstamped], { livePaymentIds: new Set<string>() })
+  assert.equal(alone.length, 1)
+  const unpaid = settlementStatus({ ...base, paidLocally: false, payment: aggregatePaymentSyncRows(alone), totalForeign: 100 })
+  assert.equal(unpaid.status, 'LEDGER_UNDECIDED')
+})
+
+test('a deleted receipt\'s VERIFIED-REVERSAL cancellation is history, like a stamped one', () => {
+  const rows = effectivePaymentSyncRows([
+    row({ status: 'CANCELLED', externalTransactionId: 'PAY-1', settlementBasis: 'VERIFIED_REVERSAL', paymentId: 'pay-1' }),
+  ], { livePaymentIds: new Set<string>() })
+  assert.equal(rows.length, 0)
 })
 
 test('a failure a later success overtook is history; one AFTER the last success is not', () => {
