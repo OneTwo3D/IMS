@@ -215,7 +215,7 @@ test('o3d-7o0 supersedes o3d-e2mz r4: a claim taken SECONDS ago REFUSES the canc
  *
  * A same-key re-enqueue is free only for a row `ledgerStanding` calls PROVEN_NOT_POSTED. This sweep
  * stamps `abandonedBeforeRemoteCall` on exactly the rows it can PROVE were never claimed: PENDING,
- * attemptRevision 0, no document id. A claimed attempt it also retires (PENDING revived at revision > 0,
+ * attemptRevision 0, no document id, and the canonical never-attempted record (custody present, no attempt stamp). A claimed attempt it also retires (PENDING revived at revision > 0,
  * FAILED, a stale PROCESSING) stays UNSTAMPED, i.e. UNKNOWN.
  */
 const STANDING_COLUMNS = (id: string, store: SyncLogStore) => {
@@ -230,7 +230,7 @@ const STANDING_COLUMNS = (id: string, store: SyncLogStore) => {
 
 test('o3d-f709: the sale-cancel sweep stamps a NEVER-CLAIMED PENDING row pre-call, and ONLY that shape', async () => {
   const store = createSyncLogStore([
-    syncLogRow({ ...CLAIMED_ROW, id: 'never-claimed', status: 'PENDING', attemptRevision: 0 }),
+    syncLogRow({ ...CLAIMED_ROW, id: 'never-claimed', status: 'PENDING', attemptRevision: 0, attemptStampingCustodyAt: NOW }),
     syncLogRow({ ...CLAIMED_ROW, id: 'revived-pending', status: 'PENDING', attemptRevision: 2 }),
     syncLogRow({ ...CLAIMED_ROW, id: 'failed', status: 'FAILED', attemptRevision: 3 }),
     syncLogRow({
@@ -250,9 +250,28 @@ test('o3d-f709: the sale-cancel sweep stamps a NEVER-CLAIMED PENDING row pre-cal
   assert.equal(standing('stale-processing'), 'UNKNOWN')
 })
 
+test('the sale-cancel sweep does NOT stamp a revision-0 PENDING row that lacks the canonical never-attempted record', async () => {
+  // Revision 0 alone is not proof: a legacy row attempted before the custody column existed was left at 0, and a revival can
+  // return a FAILED row to PENDING without advancing it. Each is still retired, but UNSTAMPED, so it reads UNKNOWN.
+  const store = createSyncLogStore([
+    syncLogRow({ ...CLAIMED_ROW, id: 'proven', status: 'PENDING', attemptRevision: 0, attemptStampingCustodyAt: NOW }),
+    syncLogRow({ ...CLAIMED_ROW, id: 'no-custody', status: 'PENDING', attemptRevision: 0 }),
+    syncLogRow({ ...CLAIMED_ROW, id: 'attempted', status: 'PENDING', attemptRevision: 0, attemptStampingCustodyAt: NOW, remoteAttemptedAt: NOW }),
+  ])
+  const { tx } = storeTx(store)
+  const retired = await cancelPendingSalesInvoiceSyncForOrder(tx, 'order-1', NOW)
+  const standing = (id: string) => ledgerStanding(STANDING_COLUMNS(id, store))
+  assert.equal(retired, 3, 'all three are retired')
+  assert.equal(standing('proven'), 'PROVEN_NOT_POSTED')
+  assert.equal(standing('no-custody'), 'UNKNOWN')
+  assert.equal(standing('attempted'), 'UNKNOWN')
+  for (const id of ['no-custody', 'attempted']) assert.notEqual(store.get(id)?.abandonedBeforeRemoteCall, true, `${id} carries no pre-call stamp`)
+  for (const id of ['no-custody', 'attempted']) assert.equal(store.get(id)?.attemptRevision, 0, `${id} stays at revision 0 (no forged attempt)`)
+})
+
 test('o3d-f709: the writer and the ENQUEUE DECISION agree - a never-claimed cancelled row re-enqueues, a claimed one refuses', async () => {
   const store = createSyncLogStore([
-    syncLogRow({ ...CLAIMED_ROW, id: 'never-claimed', status: 'PENDING', attemptRevision: 0 }),
+    syncLogRow({ ...CLAIMED_ROW, id: 'never-claimed', status: 'PENDING', attemptRevision: 0, attemptStampingCustodyAt: NOW }),
     syncLogRow({ ...CLAIMED_ROW, id: 'failed', status: 'FAILED', attemptRevision: 3 }),
   ])
   const { tx } = storeTx(store)
@@ -581,6 +600,7 @@ test('a claim landing mid-sweep cannot carry an unclaimed row out of the sweep (
     id: 'synclog-fresh',
     status: 'PENDING',
     attemptRevision: 0,
+    attemptStampingCustodyAt: NOW,
   })])
   const { tx, claims } = txWithClaimAfterFirstWrite(store, 'synclog-fresh')
 

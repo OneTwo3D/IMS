@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
-import { csvResponse, toCsv } from '@/lib/csv'
+import { csvResponseWithNotices, toCsv } from '@/lib/csv'
 import { db } from '@/lib/db'
 import {
   getBackorderDemandReport,
@@ -80,6 +80,9 @@ export async function GET(req: NextRequest) {
   const type = req.nextUrl.searchParams.get('type') ?? 'reorder'
   const filters = filtersFromRequest(req)
   const date = new Date().toISOString().slice(0, 10)
+  // The CSV is data rows only. The report's notices (products left unplanned, estimated lead times) ride in a response header,
+  // and follow the data as `#` rows only when the caller asks with ?notices=1.
+  const includeInBody = req.nextUrl.searchParams.get('notices') === '1'
 
   try {
     switch (type) {
@@ -112,7 +115,7 @@ export async function GET(req: NextRequest) {
         abcClass: row.abcClass ?? '',
         urgency: row.urgency,
       }))
-      return csvResponse(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'supplierName', 'supplierSku', 'neededFor', 'stockUnit', 'availableQty', 'warehouseAvailabilityBreakdown', 'inboundOpenPoQty', 'averageDailyDemand', 'leadTimeDays', 'safetyStockQty', 'reorderPoint', 'configuredReorderQty', 'suggestedReorderQty', 'abcClass', 'urgency']), `reorder-${date}.csv`)
+      return csvResponseWithNotices(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'supplierName', 'supplierSku', 'neededFor', 'stockUnit', 'availableQty', 'warehouseAvailabilityBreakdown', 'inboundOpenPoQty', 'averageDailyDemand', 'leadTimeDays', 'safetyStockQty', 'reorderPoint', 'configuredReorderQty', 'suggestedReorderQty', 'abcClass', 'urgency']), `reorder-${date}.csv`, report.notices, { includeInBody })
     }
 
     case 'backorder': {
@@ -137,7 +140,7 @@ export async function GET(req: NextRequest) {
         projectedFillDate: row.projectedFillDate ?? '',
         oldestOrderAt: row.oldestOrderAt,
       }))
-      return csvResponse(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'stockUnit', 'orderCount', 'orderedQty', 'committedQty', 'allocatedQty', 'backorderQty', 'inboundOpenPoQty', 'projectedFillDate', 'oldestOrderAt']), `backorder-${date}.csv`)
+      return csvResponseWithNotices(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'stockUnit', 'orderCount', 'orderedQty', 'committedQty', 'allocatedQty', 'backorderQty', 'inboundOpenPoQty', 'projectedFillDate', 'oldestOrderAt']), `backorder-${date}.csv`, report.notices, { includeInBody })
     }
 
     case 'component-shortage': {
@@ -163,7 +166,7 @@ export async function GET(req: NextRequest) {
         earliestScheduledAt: row.earliestScheduledAt ?? '',
         outputProducts: row.outputProducts.join('; '),
       }))
-      return csvResponse(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'productionOrderCount', 'requiredQty', 'availableQty', 'inboundOpenPoQty', 'shortageQty', 'earliestScheduledAt', 'outputProducts']), `component-shortage-${date}.csv`)
+      return csvResponseWithNotices(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'productionOrderCount', 'requiredQty', 'availableQty', 'inboundOpenPoQty', 'shortageQty', 'earliestScheduledAt', 'outputProducts']), `component-shortage-${date}.csv`, report.notices, { includeInBody })
     }
 
     default:

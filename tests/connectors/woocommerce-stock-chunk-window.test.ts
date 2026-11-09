@@ -1,0 +1,21 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+
+test('selectChunkWindow: id-ordered windows cover every candidate exactly once and the last window has no cursor', async () => {
+  const { selectChunkWindow } = await import('@/lib/connectors/woocommerce/sync/stock-sync')
+  const candidates = ['a', 'b', 'c', 'd', 'e'].map((id) => ({ id }))
+  const seen: string[] = []
+  let afterId: string | null = null
+  let windows = 0
+  for (;;) {
+    const { window, nextCursor } = selectChunkWindow(candidates, { afterId, limit: 2 })
+    seen.push(...window.map((p) => p.id))
+    windows++
+    if (nextCursor == null) break
+    afterId = nextCursor
+  }
+  assert.deepEqual(seen, ['a', 'b', 'c', 'd', 'e'])
+  assert.equal(windows, 3)
+  assert.deepEqual(selectChunkWindow(candidates, { afterId: 'e', limit: 2 }), { window: [], nextCursor: null })
+  assert.deepEqual(selectChunkWindow(candidates, { afterId: null, limit: 5 }).nextCursor, null, 'an exactly full window is the last')
+})

@@ -171,7 +171,7 @@ Use this only to validate the backup path, not as the primary success criterion.
 2. Confirm it:
    - reconciles orders/products only when due or when webhook-primary mode is inactive
    - drains queued stock retry jobs
-   - force-pushes a current stock catch-up snapshot when the daily stock reconcile is due
+   - force-pushes a current stock catch-up snapshot when the daily stock reconcile is due, one window of the catalogue at a time: a run that stops with `reconciliation_continues_next_run` has saved its cursor (`wc_stock_daily_reconcile_cursor`) and the next run carries on from it; the daily stamp is written only after the last window
 
 Expected result:
 

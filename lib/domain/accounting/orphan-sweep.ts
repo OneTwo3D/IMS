@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { ATTEMPT_PROVEN_NEVER_MADE_WHERE } from '@/lib/domain/accounting/money-attempt-provenance'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
 
 /**
@@ -8,8 +9,10 @@ import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-att
  * `status = PENDING` is NOT proof a row was never claimed. A CLAIMED row can be returned to PENDING after
  * a failed remote call (`applyMainSyncFailureRetry` keeps the attempt revision and writes no id), and a
  * posted row put back to PENDING keeps the id the ledger issued. So `abandonedBeforeRemoteCall: true` is
- * written ONLY over a PENDING row at `attemptRevision` 0 with no external id - the row's own claim
- * evidence, in the SAME predicate as the cancelling UPDATE (a claim mints revision >= 1, so a claim that
+ * written ONLY over a PENDING row at `attemptRevision` 0 with no external id that also carries the
+ * canonical never-attempted record (`ATTEMPT_PROVEN_NEVER_MADE_WHERE`: no `remoteAttemptedAt`, custody
+ * present; revision 0 alone does not prove it) - the row's own claim evidence, in the SAME predicate as
+ * the cancelling UPDATE (a claim mints revision >= 1, so a claim that
  * lands between the two statements moves the row out of the first and into the second). Every other
  * PENDING row is still retired - it is an orphan either way - but UNSTAMPED, i.e. UNKNOWN to
  * `ledgerStanding`: it may have posted, so nothing may read it as proof of absence or free a same-key
@@ -27,7 +30,15 @@ export async function cancelOrphanedPendingRows(
   // reconciliation/backfill sweeps and error dashboards.
   const neverClaimed = await tx.accountingSyncLog.updateMany({
     where: {
-      AND: [scope, { status: 'PENDING' }, { attemptRevision: UNCLAIMED_ATTEMPT_REVISION }, { externalTransactionId: null }],
+      AND: [
+        scope,
+        { status: 'PENDING' },
+        { attemptRevision: UNCLAIMED_ATTEMPT_REVISION },
+        { externalTransactionId: null },
+        // Revision 0 alone is not proof (a legacy row attempted before the column existed, or a revival that did not advance
+        // it): the row must also carry the canonical never-attempted record. A row without it is retired below, unstamped.
+        ATTEMPT_PROVEN_NEVER_MADE_WHERE,
+      ],
     },
     data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null, abandonedBeforeRemoteCall: true },
   })

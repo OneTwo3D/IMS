@@ -8,6 +8,12 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Reconcile, exports and the pre-call stamp
+
+- **Changed: the daily WooCommerce stock catch-up no longer reads the whole catalogue in one cron request.** The forceAll reconcile takes the candidates in id order, 150 at a time, saves a cursor (`wc_stock_daily_reconcile_cursor`) after each window and stops taking windows once about 20 seconds of the request are used, so the proxy's 60 s cut-off is not reached. An unfinished pass continues on the next run even inside the 24-hour window; `last_wc_stock_daily_reconcile_at` is written only when the last window is done. A window cut short by an outage or a credentials rebind keeps the cursor and is retried. With the default daily schedule a large catalogue takes several days to finish; schedule `wc-reconcile` hourly to finish within a day. The manual push is unchanged.
+- **Fixed: the replenishment (reorder, backorder, component shortage) and manufacturing (production variance, WIP) CSV exports no longer lose the report's notices.** Products with no claimed recipe and started orders with no usable frozen recipe were named only on screen. The CSV stays data rows only; the notices are in the new `X-IMS-Export-Notices` response header, and `?notices=1` appends them after the data as `#` rows.
+- **Fixed: the orphan sweep and the sale-cancel invoice sweep stamp `abandonedBeforeRemoteCall` only on a row that carries the canonical never-attempted record** (no attempt stamp, custody present), not on revision 0 alone. A legacy or revived revision-0 row is still retired, but unstamped, so it reads as unknown rather than proven not posted.
+
 ### Customer invoice: publish side (off by default)
 
 - **New: IMS can tell the storefront to show the stored invoice in My Account.** A new outbox operation `woocommerce/order.invoice-document` (ownership-map operation `woocommerce.order.invoice-document`) sets the order meta `_ims_invoice_pdf_available` for an order whose stored invoice document IMS would serve. **It is off:** nothing is scanned, queued or written unless the setting `wc_invoice_document_enabled` is exactly `true`, and every write also meets the producer-side hold, the live-from cut-off and the attempt fence. An order created before the storefront's live-from instant is never queued. `npm run writers:check` lists the operation with that setting as its switch.
