@@ -19,7 +19,6 @@ import { config } from 'dotenv'
 const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const skip = !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1 (npm run test:concurrency)'
 const run = randomBytes(4).toString('hex')
-const TAG = `ZQEU${run} `
 const WOO = { uk: 112, de: 220, no: 239 } as const
 const TENANT = `tenant-eu-${run}`
 const STORE = 'https://shop.example'
