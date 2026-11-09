@@ -1,5 +1,5 @@
 import { db } from '@/lib/db'
-import { ERASURE_RECORD_ACTION, type ErasureWarehouseSummary } from './erasure-record'
+import { ERASURE_RECORD_ACTION, identityFreeOrderToken, type ErasureWarehouseSummary } from './erasure-record'
 
 /**
  * THE READ-ONLY VIEW OF THE ERASURE RECORDS (Settings > Erasure records): what an operator or an auditor reads to see that an erasure was done, when, under which
@@ -20,6 +20,13 @@ export type ErasureRecordRow = {
   warehouse: ErasureWarehouseSummary | null
 }
 
+/** A stored order entry, re-validated on READ too: records written before the token rule, or by hand, never put a free-text number on the page. */
+function listedOrder(o: Record<string, unknown>): { orderId: string; warehouseOrderNumber: string | null; numberWithheld?: boolean } {
+  const token = identityFreeOrderToken(o.warehouseOrderNumber)
+  const present = typeof o.warehouseOrderNumber === 'string' && o.warehouseOrderNumber !== ''
+  return { orderId: String(o.orderId ?? ''), warehouseOrderNumber: token, ...(present && !token ? { numberWithheld: true } : o.numberWithheld === true ? { numberWithheld: true } : {}) }
+}
+
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
 /** A record's metadata, read defensively: records written before a field existed lack it. Anything that is not the expected scalar shape is dropped. */
@@ -33,9 +40,9 @@ export function readErasureRecord(metadata: unknown, fallbackDate: Date, logId =
         linkedOrders: Number(w.linkedOrders) || 0, despatched: Number(w.despatched) || 0, open: Number(w.open) || 0, cancelled: Number(w.cancelled) || 0,
         notPushed: Number(w.notPushed) || 0, ambiguous: Number(w.ambiguous) || 0, merged: Number(w.merged) || 0,
         openOrders: Array.isArray(w.openOrders)
-          ? w.openOrders.filter(isObject).map((o) => ({ orderId: String(o.orderId ?? ''), warehouseOrderNumber: typeof o.warehouseOrderNumber === 'string' ? o.warehouseOrderNumber : null }))
+          ? w.openOrders.filter(isObject).map((o) => listedOrder(o))
           : [],
-        ambiguousOrders: Array.isArray(w.ambiguousOrders) ? w.ambiguousOrders.filter(isObject).map((o) => ({ orderId: String(o.orderId ?? ''), warehouseOrderNumber: typeof o.warehouseOrderNumber === 'string' ? o.warehouseOrderNumber : null })) : [],
+        ambiguousOrders: Array.isArray(w.ambiguousOrders) ? w.ambiguousOrders.filter(isObject).map((o) => listedOrder(o)) : [],
       }
     : null
   return {
@@ -92,7 +99,7 @@ export async function listErasureRecords(query: ErasureRecordQuery = {}): Promis
   const records = page.map((r) => readErasureRecord(r.metadata, r.createdAt, r.id)).filter((r): r is ErasureRecordRow => r !== null)
   const ids = [...new Set(records.flatMap((r) => [...(r.warehouse?.openOrders ?? []), ...(r.warehouse?.ambiguousOrders ?? [])].map((o) => o.orderId)))]
   const numbers = ids.length === 0 ? [] : await db.salesOrder.findMany({ where: { id: { in: ids } }, select: { id: true, orderNumber: true } })
-  const byId = Object.fromEntries(numbers.filter((o) => o.orderNumber).map((o) => [o.id, o.orderNumber as string]))
+  const byId = Object.fromEntries(numbers.map((o) => [o.id, identityFreeOrderToken(o.orderNumber)] as const).filter((e): e is readonly [string, string] => e[1] !== null))
   return {
     rows: records.map((r) => {
       const mine = [...(r.warehouse?.openOrders ?? []), ...(r.warehouse?.ambiguousOrders ?? [])].map((o) => o.orderId)

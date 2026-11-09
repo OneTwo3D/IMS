@@ -1,7 +1,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { provesNoRemoteWmsCall } from '@/lib/domain/wms/order-push-sweep'
 import {
-  EMPTY_WAREHOUSE_SUMMARY, defaultSystemVerdicts,
+  EMPTY_WAREHOUSE_SUMMARY, defaultSystemVerdicts, identityFreeOrderToken,
   type ErasureExternalSystem, type ErasureSystemVerdict, type ErasureTrigger, type ErasureWarehouseSummary,
 } from './erasure-record'
 
@@ -19,6 +19,13 @@ import {
  *   A cancelled link without that confirmation (the warehouse answered NOT_FOUND, or no evidence is kept) is ambiguous too.
  * A link parked MERGED means the warehouse merged the order into another and the data lives on under the combined order; it is counted as well.
  */
+/** One listed order: the warehouse order number only if it is a plain identity-free token (see identityFreeOrderToken); otherwise it is withheld. */
+function listed(orderId: string, number: string | null | undefined): { orderId: string; warehouseOrderNumber: string | null; numberWithheld?: boolean } {
+  if (number === null || number === undefined || number === '') return { orderId, warehouseOrderNumber: null }
+  const token = identityFreeOrderToken(number)
+  return token ? { orderId, warehouseOrderNumber: token } : { orderId, warehouseOrderNumber: null, numberWithheld: true }
+}
+
 const DESPATCHED_ORDER_STATUSES = new Set(['SHIPPED', 'COMPLETED', 'DELIVERED'])
 
 export async function summariseWarehouseOrdersInTx(
@@ -54,7 +61,7 @@ export async function summariseWarehouseOrdersInTx(
       // but whose answer was lost leaves a warehouse order with no id here; a replay clears the attempt columns and old links have no claim history. The ONLY proof
       // IMS accepts is the push code's own no-remote-call predicate (the one its hard-delete guard uses); every other link without an id is ambiguous.
       if (provesNoRemoteWmsCall({ state: link.state, attempts: link.attempts, pushedAt: link.pushedAt, externalOrderId: link.externalOrderId })) out.notPushed += 1
-      else { out.ambiguous += 1; out.ambiguousOrders.push({ orderId: link.orderId, warehouseOrderNumber: null }) }
+      else { out.ambiguous += 1; out.ambiguousOrders.push(listed(link.orderId, null)) }
       continue
     }
     out.linkedOrders += 1
@@ -65,14 +72,14 @@ export async function summariseWarehouseOrdersInTx(
       // link keeps `cancelledAt` for both. The only retained evidence is the audit row the cancel wrote (wmsCancelStatus). Confirmed -> closed; anything else, or no
       // evidence, is ambiguous and listed for verification.
       if (confirmedCancels.has(link.orderId)) { out.cancelled += 1; continue }
-      out.ambiguous += 1; out.ambiguousOrders.push({ orderId: link.orderId, warehouseOrderNumber: link.externalOrderNumber ?? null })
+      out.ambiguous += 1; out.ambiguousOrders.push(listed(link.orderId, link.externalOrderNumber))
       continue
     }
     // DESPATCHED means the whole order has gone: the order status reaches SHIPPED only when every shipment has (a partial dispatch leaves the order before SHIPPED),
     // so a pending, picking or packed shipment, and a partly shipped order, are still OPEN: the undespatched part is a live warehouse order holding the details.
     if (order && DESPATCHED_ORDER_STATUSES.has(order.status)) { out.despatched += 1; continue }
     out.open += 1
-    out.openOrders.push({ orderId: link.orderId, warehouseOrderNumber: link.externalOrderNumber ?? null })
+    out.openOrders.push(listed(link.orderId, link.externalOrderNumber))
   }
   return out
 }

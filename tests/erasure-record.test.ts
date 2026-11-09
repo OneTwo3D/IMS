@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import {
   defaultSystemVerdicts,
+  identityFreeOrderToken,
   ERASURE_FAILURE_DESCRIPTION,
   ERASURE_RECORD_ACTION,
   ERASURE_RECORD_DESCRIPTION,
@@ -49,4 +50,9 @@ test('the superseded action name is not exempted, so name-bearing legacy rows st
 test('the failure path never logs or returns the exception text', () => {
   const core = readFileSync(new URL('../lib/domain/erasure/erase-personal-data.ts', import.meta.url), 'utf8')
   assert.ok(!/String\(e\)/.test(core) && !/e\.message/.test(core))
+})
+
+test('only a plain token may be written to the record as an order number', () => {
+  for (const ok of ['MS-123', 'SO-2026/45', 'A_B.C#1', 'MS-5+MS-6', 'x'.repeat(40)]) assert.equal(identityFreeOrderToken(ok), ok)
+  for (const bad of ['Zebediah Quillfeather', 'z@example.test', 'a b', '', 'x'.repeat(41), 'Zeb\n1', null, undefined, 5]) assert.equal(identityFreeOrderToken(bad), null)
 })

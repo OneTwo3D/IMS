@@ -83,8 +83,8 @@ export default async function ErasureRecordsPage({ searchParams }: { searchParam
                   <ul className="mt-1 list-disc pl-5">
                     {r.warehouse.openOrders.map((o) => (
                       <li key={o.orderId}>
-                        Warehouse order {o.warehouseOrderNumber ?? '(number not recorded)'}; IMS order{' '}
-                        <Link className="underline" href={`/sales/${o.orderId}`}>{r.orderNumbers[o.orderId] ?? o.orderId}</Link>
+                        Warehouse order {o.warehouseOrderNumber ?? (o.numberWithheld ? '(number withheld)' : '(number not recorded)')}; IMS order{' '}
+                        <Link className="underline" href={`/sales/${o.orderId}`}>{r.orderNumbers[o.orderId] ?? '(number withheld)'}</Link>
                         <span className="text-muted-foreground"> ({o.orderId})</span>
                       </li>
                     ))}
@@ -96,8 +96,8 @@ export default async function ErasureRecordsPage({ searchParams }: { searchParam
                   <p className="font-medium">IMS cannot prove these orders are gone from the warehouse (a create whose outcome was never recorded, or a cancellation the warehouse did not confirm). Check each in the warehouse system and handle it by hand if it exists:</p>
                   <ul className="mt-1 list-disc pl-5">
                     {r.warehouse.ambiguousOrders.map((o) => (<li key={o.orderId}>
-                      IMS order <Link className="underline" href={`/sales/${o.orderId}`}>{r.orderNumbers[o.orderId] ?? o.orderId}</Link>
-                      <span className="text-muted-foreground"> ({o.orderId})</span>{o.warehouseOrderNumber ? `, warehouse order ${o.warehouseOrderNumber}` : ''}
+                      IMS order <Link className="underline" href={`/sales/${o.orderId}`}>{r.orderNumbers[o.orderId] ?? '(number withheld)'}</Link>
+                      <span className="text-muted-foreground"> ({o.orderId})</span>{o.warehouseOrderNumber ? `, warehouse order ${o.warehouseOrderNumber}` : o.numberWithheld ? ', warehouse order number withheld' : ''}
                     </li>))}
                   </ul>
                 </div>

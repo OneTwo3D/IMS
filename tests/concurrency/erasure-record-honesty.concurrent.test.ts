@@ -301,3 +301,33 @@ test('[erasure record] the operator notice commits WITH the erasure: a failed no
   assert.equal(notes[0]!.actionUrl, '/settings/erasure?filter=obligations')
   if (ok.success) assert.match(notes[0]!.message, new RegExp(ok.requestId))
 })
+
+test('[erasure record] an upstream order number that carries a name or an email never reaches the record or the view; a plain token does', { skip }, async (t) => {
+  const db = await loadDb()
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { listErasureRecords } = await import('@/lib/domain/erasure/erasure-record-view')
+  const dirtyNumber = `${NAME} ${EMAIL}`
+  const customer = await db.customer.create({ data: { firstName: 'Zebediah', lastName: 'Quillfeather', email: `${randomUUID().slice(0, 8)}@example.test` } })
+  // The IMS order number can derive from the storefront's (a person can set it): it carries the name here.
+  const badImsNumber = `${NAME.replace(' ', '-')}-${randomUUID().slice(0, 4)}@x.test`
+  const mk = (orderNumber: string) => db.salesOrder.create({ data: { orderNumber, status: 'PROCESSING', currency: 'GBP', customerId: customer.id, customerName: NAME, subtotalForeign: 1, totalForeign: 1, subtotalBase: 1, totalBase: 1 } as never })
+  const dirty = await mk(badImsNumber); const clean = await mk(`HON-${randomUUID().slice(0, 8)}`)
+  await db.wmsOrderPushLink.create({ data: { orderId: dirty.id, connector: 'mintsoft', externalOrderId: 'm-30', externalOrderNumber: dirtyNumber, state: 'SYNCED' } as never })
+  await db.wmsOrderPushLink.create({ data: { orderId: clean.id, connector: 'mintsoft', externalOrderId: 'm-31', externalOrderNumber: 'MS-31', state: 'SYNCED' } as never })
+  t.after(async () => { await db.notification.deleteMany({ where: { title: 'Personal data remains in the warehouse', createdAt: { gte: new Date(Date.now() - 600_000) } } }); await db.wmsOrderPushLink.deleteMany({ where: { orderId: { in: [dirty.id, clean.id] } } }); await db.activityLog.deleteMany({ where: { entityId: { in: [dirty.id, clean.id, customer.id] } } }); await db.salesOrder.deleteMany({ where: { id: { in: [dirty.id, clean.id] } } }); await db.customer.deleteMany({ where: { id: customer.id } }) })
+  assert.equal((await eraseCustomerPersonalData(customer.id, { trigger: 'ON_REQUEST', userId: null })).success, true)
+  const p = await proof(db, customer.id)
+  const byId = Object.fromEntries(p.warehouse.openOrders.map((o) => [o.orderId, o as { warehouseOrderNumber: string | null; numberWithheld?: boolean }]))
+  assert.deepEqual(byId[dirty.id], { orderId: dirty.id, warehouseOrderNumber: null, numberWithheld: true })
+  assert.equal(byId[clean.id]!.warehouseOrderNumber, 'MS-31', 'a plain token is kept')
+  const raw = JSON.stringify(await db.activityLog.findMany({ where: { entityId: customer.id, action: 'gdpr_erasure_recorded' } }))
+  assert.doesNotMatch(raw, /Zebediah|Quillfeather|example\.test|x\.test/, 'the retained record carries neither the name nor the email')
+  const view = JSON.stringify((await listErasureRecords({ onlyObligations: true, limit: 200 })).rows.filter((r) => r.customerId === customer.id))
+  assert.ok(view.includes(dirty.id), 'PRECONDITION: the record is in the view')
+  assert.doesNotMatch(view, /Zebediah|Quillfeather|example\.test|x\.test/, 'the view carries neither')
+  // A hand-written legacy record with a free-text number is re-validated on READ.
+  const { readErasureRecord } = await import('@/lib/domain/erasure/erasure-record-view')
+  const legacy = readErasureRecord({ requestId: 'r', warehouse: { open: 1, openOrders: [{ orderId: 'o1', warehouseOrderNumber: dirtyNumber }], ambiguousOrders: [{ orderId: 'o2', warehouseOrderNumber: 'a b' }] } }, new Date())
+  assert.doesNotMatch(JSON.stringify(legacy), /Zebediah|Quillfeather|example\.test/)
+  assert.equal(legacy!.warehouse!.openOrders[0]!.numberWithheld, true)
+})

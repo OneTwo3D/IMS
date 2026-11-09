@@ -113,9 +113,19 @@ export type ErasureWarehouseSummary = {
   ambiguous: number
   /** Links parked MERGED (the warehouse merged the order into another: the data lives on under the combined order). Counted inside despatched/open too. */
   merged: number
-  openOrders: Array<{ orderId: string; warehouseOrderNumber: string | null }>
+  openOrders: Array<{ orderId: string; warehouseOrderNumber: string | null; numberWithheld?: boolean }>
   /** The ambiguous orders, by surrogate order id and, when one is recorded, the warehouse order number. */
-  ambiguousOrders: Array<{ orderId: string; warehouseOrderNumber: string | null }>
+  ambiguousOrders: Array<{ orderId: string; warehouseOrderNumber: string | null; numberWithheld?: boolean }>
+}
+
+/**
+ * AN ORDER NUMBER FROM OUTSIDE IS NOT TRUSTED TO BE IDENTITY-FREE. A warehouse order number can derive from the storefront's order number (which a plugin or a person can
+ * set), so it could carry a name or an email. Only a plain token reaches the retained record or the page: letters, digits and `_ . / # + -`, 1 to 40 characters, no
+ * whitespace and no `@`. Anything else is WITHHELD (the surrogate id identifies the order instead).
+ */
+export const IDENTITY_FREE_ORDER_TOKEN = /^[A-Za-z0-9_./#+-]{1,40}$/
+export function identityFreeOrderToken(value: unknown): string | null {
+  return typeof value === 'string' && IDENTITY_FREE_ORDER_TOKEN.test(value) ? value : null
 }
 
 export const EMPTY_WAREHOUSE_SUMMARY: ErasureWarehouseSummary = { linkedOrders: 0, despatched: 0, open: 0, cancelled: 0, notPushed: 0, ambiguous: 0, merged: 0, openOrders: [], ambiguousOrders: [] }
