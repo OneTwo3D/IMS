@@ -140,3 +140,20 @@ test('one invalid row of an explicit transferKey group invalidates the WHOLE gro
   assert.equal(ok.errors?.length ?? 0, 0, JSON.stringify(ok.errors))
   assert.ok(await dispatchedAtOf(okKey))
 })
+
+test('an invalid row FIRST in an explicit transferKey group invalidates the group too (not only a trailing one)', SKIP, async () => {
+  const { importTransfersCsv } = await import('@/app/actions/import')
+  const s = await seedSource('di-poison-first')
+  const key = `${fixtures.uid()}-F`
+  const day = new Date(Date.now() - 3 * 86_400_000).toISOString().slice(0, 10)
+  const future = new Date(Date.now() + 5 * 86_400_000).toISOString().slice(0, 10)
+  const result = await importTransfersCsv(form([HEADER,
+    [key, s.fromCode, s.toCode, 'IN_TRANSIT', s.line.sku, '1', future],
+    [key, s.fromCode, s.toCode, 'IN_TRANSIT', s.line.sku, '1', day],
+    [key, s.fromCode, s.toCode, 'IN_TRANSIT', s.line.sku, '1', day]]))
+  const errors = (result.errors ?? []).join(' | ')
+  assert.match(errors, /Row 2: dispatchedAt .* in the future/)
+  assert.match(errors, new RegExp(`Transfer "${key}" was not created: row 2`))
+  assert.equal(await dispatchedAtOf(key), null, 'the later valid rows did not create a transfer on their own')
+  assert.equal((await fixtures.snapshotOf(s.po, s.line)).stock, 10)
+})

@@ -78,6 +78,7 @@ for (const row of MATRIX) {
     if (row.refused) {
       assert.equal(result.success, false)
       assert.match(result.error ?? '', /open warehouse ASN/)
+      assert.match(result.error ?? '', /^Cannot receive by hand on /, 'the operator sees the plain message, not a stringified Error')
       assert.match(result.error ?? '', new RegExp(line.sku))
       assert.equal(after.stock, 0, 'a refusal moves no stock')
       assert.equal(after.qtyReceived, 0)
@@ -116,6 +117,7 @@ test('live-ASN guard: a retry of a receipt that already committed still reports 
   const fresh = await receivePurchaseOrder(po.poId, input, undefined, { idempotencyToken: `tok-${fixtures.uid()}` })
   assert.equal(fresh.success, false, 'a NEW receipt with a token is still refused, by the in-transaction check')
   assert.match(fresh.error ?? '', /open warehouse ASN/)
+  assert.match(fresh.error ?? '', /^Cannot receive by hand on /, 'the in-transaction refusal reaches the operator as the plain message')
 })
 
 test('booked-in FIRST then manual receipt: the ASN closes, the remainder is received by hand, stock is added once each', SKIP, async () => {
