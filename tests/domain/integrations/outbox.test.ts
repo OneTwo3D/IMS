@@ -951,6 +951,9 @@ test('every registered outbox operation declares a known replay-safety answer an
       // fresh GET and the classifier on every attempt, with the sync-log row and the activity log outside that
       // guard. An effect sequence, hence unsafe-to-replay (no stale reclaim); a dead worker's claim is parked.
       'woocommerce/order.hold',
+      // The My Account invoice flag: one guarded meta PUT (an absolute constant) behind a fresh IMS read and the publication marker,
+      // with the marker row and the activity log outside that guard: an effect sequence, hence unsafe-to-replay; a dead claim is parked.
+      'woocommerce/order.invoice-document',
       'woocommerce/stock.push',
       'xero/accounting.post',
     ],
@@ -975,6 +978,8 @@ test('the seven verdicts are the round-3 corrected ones', () => {
     // effect sequence over a guarded status PUT, so no safe verdict.
     'woocommerce/order.cancel': 'unsafe-to-replay',
     'woocommerce/order.hold': 'unsafe-to-replay',
+    // The My Account invoice flag: an effect sequence over one guarded meta PUT, so no safe verdict.
+    'woocommerce/order.invoice-document': 'unsafe-to-replay',
     // Codex round 2 HIGH 2: multiplexes AccountingSyncType; INVOICE_EMAIL enqueues an EmailOutbox
     // row that no fence couples to this worker's completion. ROUND 16: this line used to add "whose
     // own queue is unfenced — o3d-alnk", and o3d-alnk is the branch that stopped it being true. The

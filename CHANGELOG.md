@@ -8,6 +8,11 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Customer invoice: publish side (off by default)
+
+- **New: IMS can tell the storefront to show the stored invoice in My Account.** A new outbox operation `woocommerce/order.invoice-document` (ownership-map operation `woocommerce.order.invoice-document`) sets the order meta `_ims_invoice_pdf_available` for an order whose stored invoice document IMS would serve. **It is off:** nothing is scanned, queued or written unless the setting `wc_invoice_document_enabled` is exactly `true`, and every write also meets the producer-side hold, the live-from cut-off and the attempt fence. An order created before the storefront's live-from instant is never queued. `npm run writers:check` lists the operation with that setting as its switch.
+- **Fixed: a retried invoice note no longer posts a second note.** A failing or held meta write made the whole call fail, and the queue retried it by posting the note again. The note is now written at most once per ledger invoice id (new table `invoice_store_publications`), and the note writer no longer writes the customer download flag; that is the separate writer above. For an invoice IMS posted itself the flag is written only when `wc_invoice_document_enabled` is `true` (it used to be written with the note).
+
 ### Ops alerting and chart-of-accounts refresh
 
 - **Added: a daily, read-only refresh of the Xero chart of accounts (`xero-chart-sync`, 00:30).** It reads Xero's Accounts list with one GET, stores the whole chart and advances its own read-sync last-success stamp in one connection-fenced transaction; the read-sync liveness alarm now watches it (a seventh feed, stale after 36 hours). An on-demand refresh from the Sync page does not advance the stamp.

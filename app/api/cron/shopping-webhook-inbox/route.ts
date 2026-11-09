@@ -93,6 +93,23 @@ async function drainOrderStatusPushes(): Promise<ConnectorTickResult> {
   }
 }
 
+/**
+ * Queue and drain the "show this order's invoice in My Account" publications. OFF unless `wc_invoice_document_enabled` is `true`; while it
+ * is not, nothing is queued, claimed or sent. Same plugin gate as the other drains, separate so one failing never hides another. Never throws.
+ */
+async function drainInvoiceDocumentPublications(): Promise<ConnectorTickResult> {
+  try {
+    if (!(await isIntegrationPluginEnabled('woocommerce'))) {
+      return { skipped: true, reason: 'woocommerce_plugin_disabled' }
+    }
+    const { processShoppingInvoiceDocumentPublications } = await import('@/lib/shopping')
+    return { ...(await processShoppingInvoiceDocumentPublications()) }
+  } catch (error) {
+    console.warn('[shopping-webhook-inbox] invoice-document publication drain failed', { error: normalizeCronError(error) })
+    return { skipped: false, error: normalizeCronError(error) }
+  }
+}
+
 async function getWcSyncEnabled(): Promise<boolean> {
   const enabled = await db.setting.findUnique({ where: { key: 'wc_sync_enabled' } })
   return enabled?.value === 'true'
@@ -126,8 +143,9 @@ export async function GET(request: Request) {
 
       const orderCompletions = await drainOrderCompletions()
       const orderStatusPushes = await drainOrderStatusPushes()
+      const invoiceDocumentPublications = await drainInvoiceDocumentPublications()
 
-      return { connectors: { woocommerce: { ...woocommerce, orderCompletions, orderStatusPushes } } } as Record<string, unknown>
+      return { connectors: { woocommerce: { ...woocommerce, orderCompletions, orderStatusPushes, invoiceDocumentPublications } } } as Record<string, unknown>
     },
   })
 

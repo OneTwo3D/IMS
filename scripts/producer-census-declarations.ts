@@ -51,7 +51,6 @@ export const EXCLUDED_OPERATIONS: Readonly<Record<string, string>> = {
 export const NO_PRODUCER: Readonly<Record<string, string>> = {
   'woocommerce.order.withdrawal-outcome': 'Owner answer 6: the endpoint stays in the WooCommerce withdrawal plugin; IMS only RECEIVES the outcome through an authenticated API, so IMS has no outbound producer for it.',
   'woocommerce.order.trackship-reconcile': 'Owner answer 6: the endpoint stays in the TrackShip plugin; IMS only receives TrackShip events through an authenticated API, so IMS has no outbound producer for it.',
-  'woocommerce.order.invoice-document': 'Owner answer 4: IMS will put the invoice into the customer\'s My Account at P2, but that producer is not written yet; there is no call site in this repo.',
 }
 
 export const DECLARATIONS: readonly Declaration[] = [
@@ -308,9 +307,17 @@ export const DECLARATIONS: readonly Declaration[] = [
   d('lib/connectors/woocommerce/index.ts::<module>::pushFxRatesToWc[reexport]#1', 'woocommerce', 'fx-rates', 'reexport', 'not-applicable',
     'Re-exports a WooCommerce FX writer from the connector index.'),
   d('lib/connectors/woocommerce/sync/invoice-note.ts::pushInvoiceNoteToWc::wcPost#1', 'woocommerce', 'order.invoice-note', 'direct-write', 'required',
-    'Writes the invoice note and invoice meta onto the WooCommerce order.'),
+    'Writes the invoice note onto the WooCommerce order, at most once per ledger invoice id (persisted marker).'),
   d('lib/connectors/woocommerce/sync/invoice-note.ts::pushInvoiceNoteToWc::wcPut#1', 'woocommerce', 'order.invoice-note', 'direct-write', 'required',
-    'Writes the invoice note and invoice meta onto the WooCommerce order.'),
+    'Writes the invoice link meta onto the WooCommerce order.'),
+  d('lib/connectors/woocommerce/sync/invoice-document.ts::publishInvoiceDocumentFlagToWc::wcPut#1', 'woocommerce', 'order.invoice-document', 'direct-write', 'required',
+    'Writes the My Account invoice download flag onto the WooCommerce order: off unless wc_invoice_document_enabled, behind the egress barrier and the attempt fence, marker persisted after it lands.'),
+  d('lib/connectors/woocommerce/sync/invoice-document-jobs.ts::scheduleWcInvoiceDocument::enqueueIntegrationOutbox#1', 'woocommerce', 'order.invoice-document', 'queue-producer', 'required',
+    'Enqueues woocommerce/order.invoice-document for a stored, servable customer invoice; a shadow writes a record and no row.'),
+  d('lib/connectors/woocommerce/sync/invoice-document-jobs.ts::enqueueInvoiceDocumentPublications::scheduleWcInvoiceDocument#1', 'woocommerce', 'order.invoice-document', 'queue-producer', 'required',
+    'The publication scan queues the My Account invoice flag job for each stored, servable document (off unless wc_invoice_document_enabled).'),
+  d('lib/connectors/woocommerce/sync/invoice-document-jobs.ts::attemptWcInvoiceDocumentPublish::publishInvoiceDocumentFlagToWc#1', 'woocommerce', 'order.invoice-document', 'drain', 'required',
+    'The invoice publication drain writes the My Account flag through the fenced attempt.'),
   d('lib/connectors/woocommerce/sync/order-completion-jobs.ts::scheduleWcOrderCompletion::enqueueIntegrationOutbox#1', 'woocommerce', 'order.status', 'queue-producer', 'required',
     'Enqueues woocommerce/order.complete inside the shipping transaction.'),
   d('lib/connectors/woocommerce/sync/order-completion-jobs.ts::processWcOrderCompletionJobs::pushOrderDeliveryMetadata#1', 'woocommerce', 'order.tracking', 'facade', 'required',
@@ -401,6 +408,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Uploads a bill attachment.'),
   d('lib/connectors/xero/sync-processor.ts::processClaimedEntry::pushInvoiceNoteToWc#1', 'woocommerce', 'order.invoice-note', 'drain', 'required',
     'The WC_INVOICE_NOTE follow-up: the Xero processor asks for the invoice note to be written to the order.'),
+  d('lib/connectors/xero/sync-processor.ts::processClaimedEntry::publishInvoiceDocumentFlagToWc#1', 'woocommerce', 'order.invoice-document', 'drain', 'required',
+    'The WC_INVOICE_NOTE follow-up also asks for the My Account download flag of an invoice IMS posted itself (off unless wc_invoice_document_enabled).'),
   d('lib/connectors/xero/sync-processor.ts::processClaimedEntry::xeroPost#2', 'xero', 'purchase.bill-payment', 'drain', 'required',
     'POSTs a bill payment.'),
   d('lib/connectors/xero/sync-processor.ts::processClaimedEntry::putXeroTaxRate#1', 'xero', 'tax-rate', 'drain', 'not-applicable',
