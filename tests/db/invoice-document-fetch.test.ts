@@ -35,11 +35,12 @@ async function setup() {
   return { db, service, sweep }
 }
 
-async function seedOrder(db: Awaited<ReturnType<typeof setup>>['db'], withCreditNote = false, options: { invoiceNumber?: string; status?: string } = {}) {
+async function seedOrder(db: Awaited<ReturnType<typeof setup>>['db'], withCreditNote = false, options: { invoiceNumber?: string; status?: string; customerName?: string } = {}) {
   const suffix = randomUUID().slice(0, 8)
   const order = await db.salesOrder.create({
     data: {
       orderNumber: `IDOC-${suffix}`,
+      ...(options.customerName ? { customerName: options.customerName } : {}),
       invoiceNumber: options.invoiceNumber ?? `INV-${suffix}`,
       status: (options.status ?? 'SHIPPED') as never,
       currency: 'GBP',
@@ -60,8 +61,8 @@ async function seedOrder(db: Awaited<ReturnType<typeof setup>>['db'], withCredit
 }
 
 /** What the ledger says about a document that really is this order's. */
-function ledgerClaim(order: { orderNumber: string }, number: string, over: Record<string, unknown> = {}) {
-  return { documentId: 'xero-1', documentNumber: number, status: 'AUTHORISED', total: 100, currencyCode: 'GBP', dateString: new Date().toISOString(), reference: order.orderNumber, ...over }
+function ledgerClaim(order: { orderNumber: string | null }, number: string, over: Record<string, unknown> = {}) {
+  return { documentId: 'xero-1', documentNumber: number, status: 'AUTHORISED', total: 100, currencyCode: 'GBP', dateString: new Date().toISOString(), reference: order.orderNumber ?? undefined, ...over }
 }
 
 async function cleanup(db: Awaited<ReturnType<typeof setup>>['db'], orderId: string) {
@@ -245,7 +246,7 @@ test('the sweep does nothing without a floor, takes only recent WooCommerce orde
 
 type Deps = import('../../lib/domain/invoice-documents/fetch-service').InvoiceDocumentDeps
 
-function depsFor(order: { orderNumber: string }, over: Partial<Deps> & { claim?: Record<string, unknown>; bytes?: () => Buffer; downloads?: { n: number } } = {}): Deps {
+function depsFor(order: { orderNumber: string | null }, over: Partial<Deps> & { claim?: Record<string, unknown>; bytes?: () => Buffer; downloads?: { n: number } } = {}): Deps {
   return {
     lookupInvoiceClaims: async (number) => ({ ok: true, claims: [ledgerClaim(order, number, over.claim ?? {})] }),
     lookupCreditNoteClaims: async () => ({ ok: true, claims: [] }),
@@ -284,7 +285,9 @@ test('a document whose independent keys disagree with the order is refused: wron
       ['wrong total', { total: 250 }],
       ['no total reported', { total: undefined }],
       ['wrong currency', { currencyCode: 'EUR' }],
-      ['right total but reference, customer and date all disagree', { reference: 'someone-else', dateString: '2020-01-01T00:00:00' }],
+      ['right total but the reference names another order', { reference: 'someone-else', dateString: '2020-01-01T00:00:00' }],
+      ['no currency reported', { currencyCode: undefined }],
+      ['total and currency and date agree, nothing says whose it is', { reference: undefined }],
     ]
     for (const [name, claim] of cases) {
       await db.invoiceDocumentFetchState.deleteMany({ where: { orderId: order.id } })
@@ -385,5 +388,96 @@ test('overlapping fetches: the second does not run while the first holds the doc
     assert.equal(lease.leaseUntil, null, 'the lease is released')
   } finally {
     await cleanup(db, order.id)
+  }
+})
+
+test('same number, total, currency and date but an explicitly DIFFERENT customer: needs a person, nothing downloaded or stored', { skip }, async () => {
+  const { db, service } = await setup()
+  const { order } = await seedOrder(db, false, { customerName: 'Ada Lovelace' })
+  try {
+    const downloads = { n: 0 }
+    const outcome = await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, depsFor(order, { claim: { contactName: 'Bob Builder' }, downloads }))
+    assert.equal(outcome.status, 'needs-attention')
+    assert.equal(downloads.n, 0)
+    assert.equal(await db.salesOrderInvoiceDocument.count({ where: { orderId: order.id } }), 0)
+    // CONTROL: the same document for the right customer, with no reference at all, is stored (customer alone identifies it).
+    await db.invoiceDocumentFetchState.deleteMany({ where: { orderId: order.id } })
+    const ok = await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, depsFor(order, { claim: { contactName: 'ada lovelace', reference: undefined }, downloads }))
+    assert.equal(ok.status, 'stored')
+  } finally {
+    await cleanup(db, order.id)
+  }
+})
+
+test('a lease taken over while the first download is still running: the first worker writes nothing and the newer version stays current', { skip }, async () => {
+  const { db, service } = await setup()
+  const { order } = await seedOrder(db)
+  try {
+    const t0 = new Date('2026-11-09T10:00:00Z')
+    let now = t0
+    let bytes = pdf('older')
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let started: () => void = () => {}
+    const downloading = new Promise<void>((resolve) => { started = resolve })
+    const slow: Deps = {
+      ...depsFor(order),
+      now: () => now,
+      downloadPdf: async () => { const read = bytes; started(); await gate; return { ok: true, buffer: read } },
+    }
+    const first = service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, slow)
+    await downloading
+
+    // The first has stalled past its lease (the ledger retries outlasted it); the ledger has moved on; a second worker takes over.
+    bytes = pdf('newer')
+    now = new Date(t0.getTime() + service.INVOICE_DOCUMENT_LEASE_MS + 60_000)
+    const second = await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, { ...depsFor(order, { bytes: () => bytes }), now: () => now })
+    assert.equal(second.status === 'stored' && second.created, true)
+
+    release()
+    const late = await first
+    assert.equal(late.status, 'busy', 'the first fetch lost its lease and aborts')
+    const current = await db.salesOrderInvoiceDocument.findMany({ where: { orderId: order.id, supersededAt: null } })
+    assert.equal(current.length, 1)
+    assert.equal(await db.salesOrderInvoiceDocument.count({ where: { orderId: order.id } }), 1, 'the older PDF was never promoted')
+    const { loadInvoicePdf } = await import('../../lib/invoice-pdf')
+    assert.deepEqual(await loadInvoicePdf(order.id), bytes)
+    const state = await db.invoiceDocumentFetchState.findFirstOrThrow({ where: { orderId: order.id } })
+    assert.equal(state.status, 'DONE', 'the new holder\'s state was not overwritten')
+    assert.equal(state.leaseHolder, null, 'the lease is released, and by its own holder')
+  } finally {
+    await cleanup(db, order.id)
+  }
+})
+
+test('a lookup refusal carries the stop signal to the sweep, which stops at once', { skip }, async () => {
+  const { db, service, sweep } = await setup()
+  const a = await seedOrder(db)
+  const b = await seedOrder(db)
+  const keys = [sweep.INVOICE_DOCUMENTS_SWEEP_FLOOR_SETTING]
+  const saved = await db.setting.findMany({ where: { key: { in: keys } } })
+  try {
+    await db.setting.deleteMany({ where: { key: { in: keys } } })
+    await db.setting.create({ data: { key: sweep.INVOICE_DOCUMENTS_SWEEP_FLOOR_SETTING, value: new Date(Date.now() - 86_400_000).toISOString() } })
+    let lookups = 0
+    const deps: Deps = {
+      lookupInvoiceClaims: async () => { lookups++; return { ok: false, error: 'HTTP 429 rate limited', stop: true } },
+      lookupCreditNoteClaims: async () => ({ ok: true, claims: [] }),
+      downloadPdf: async () => { throw new Error('unused') },
+      now: () => new Date(),
+    }
+    const one = await service.ensureInvoiceDocument({ orderId: a.order.id, kind: 'INVOICE' }, deps)
+    assert.equal(one.status === 'failed' && one.stop, true)
+    await db.invoiceDocumentFetchState.deleteMany({ where: { orderId: a.order.id } })
+    lookups = 0
+    const result = await sweep.runInvoiceDocumentSweep(deps)
+    assert.equal(lookups, 1, 'the sweep did not move on to the next order')
+    assert.match(result.stoppedEarly ?? '', /refused or is rate-limited/)
+    assert.equal(b.order.id.length > 0, true)
+  } finally {
+    await db.setting.deleteMany({ where: { key: { in: keys } } })
+    for (const row of saved) await db.setting.create({ data: { key: row.key, value: row.value } })
+    await cleanup(db, a.order.id)
+    await cleanup(db, b.order.id)
   }
 })

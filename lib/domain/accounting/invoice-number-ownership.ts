@@ -190,6 +190,8 @@ export type InvoiceNumberLookup =
        * that, so the refusal it produces is permanent and names a different remedy.
        */
       unaskable?: boolean
+      /** The HTTP status of the refusal, when the ledger gave one: 429 and the like tell a sweep to stop. */
+      httpStatus?: number
     }
 
 export type InvoiceNumberRefusalCode =

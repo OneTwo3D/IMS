@@ -25,7 +25,7 @@
  *    a person acts.
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -39,12 +39,16 @@ export type InvoiceDocumentKindName = 'INVOICE' | 'CREDIT_NOTE'
 
 export const INVOICE_DOCUMENT_CONNECTOR = 'xero'
 
-/** How long one fetch may hold a document before another may take it over (a crashed holder). */
-export const INVOICE_DOCUMENT_LEASE_MS = 3 * 60_000
+/**
+ * How long one fetch may hold a document before another may take it over (a crashed or stalled holder). The holder RENEWS it between
+ * its steps (after the lookup, after the download, and as the first statement of the promotion), so this only has to cover the
+ * longest single ledger step, retries included, with margin.
+ */
+export const INVOICE_DOCUMENT_LEASE_MS = 10 * 60_000
 
 export type DocumentClaimsResult =
   | { ok: true; claims: DocumentClaim[] }
-  | { ok: false; error: string; unaskable?: boolean }
+  | { ok: false; error: string; unaskable?: boolean; /** The ledger refused or is rate-limited: the sweep stops. */ stop?: boolean }
 
 export type DocumentDownloadResult = { ok: true; buffer: Buffer } | { ok: false; error: string; stop: boolean }
 
@@ -93,22 +97,21 @@ type StatePatch = {
   rechecks?: number
 }
 
-async function recordState(input: EnsureInvoiceDocumentInput, subjectKey: string, patch: StatePatch, now: Date): Promise<void> {
-  await db.invoiceDocumentFetchState.upsert({
-    where: { subjectKey },
-    create: {
-      subjectKey,
-      orderId: input.orderId,
-      refundId: input.refundId ?? null,
-      kind: input.kind,
-      status: patch.status,
-      attempts: patch.attempted ? 1 : 0,
-      lastAttemptAt: patch.attempted ? now : null,
-      nextAttemptAt: patch.nextAttemptAt ?? null,
-      lastError: patch.error ?? null,
-      rechecks: patch.rechecks ?? 0,
-    },
-    update: {
+/** A fetch that no longer holds its lease writes NOTHING. */
+class LeaseLost extends Error {
+  constructor() {
+    super('the document lease was taken over by another fetch')
+  }
+}
+
+/**
+ * Write the fetch state, but only as the CURRENT lease holder: the compare-and-set is on the holder token, so a fetch whose lease was
+ * taken over (it stalled past the expiry) cannot overwrite the new holder's state.
+ */
+async function recordState(input: EnsureInvoiceDocumentInput, subjectKey: string, token: string, patch: StatePatch, now: Date): Promise<void> {
+  const updated = await db.invoiceDocumentFetchState.updateMany({
+    where: { subjectKey, leaseHolder: token },
+    data: {
       status: patch.status,
       ...(patch.attempted ? { attempts: { increment: 1 }, lastAttemptAt: now } : {}),
       nextAttemptAt: patch.nextAttemptAt ?? null,
@@ -116,6 +119,16 @@ async function recordState(input: EnsureInvoiceDocumentInput, subjectKey: string
       ...(patch.rechecks !== undefined ? { rechecks: patch.rechecks } : {}),
     },
   })
+  if (updated.count === 0) throw new LeaseLost()
+}
+
+/** Extend the lease, as its holder. False when it was taken over: the caller must stop and write nothing. */
+async function renewLease(subjectKey: string, token: string, now: Date): Promise<boolean> {
+  const renewed = await db.invoiceDocumentFetchState.updateMany({
+    where: { subjectKey, leaseHolder: token },
+    data: { leaseUntil: new Date(now.getTime() + INVOICE_DOCUMENT_LEASE_MS) },
+  })
+  return renewed.count > 0
 }
 
 async function escalate(input: EnsureInvoiceDocumentInput, reason: string): Promise<void> {
@@ -141,22 +154,29 @@ export async function ensureInvoiceDocument(
   }
   const subjectKey = invoiceDocumentSubjectKey(input.orderId, input.kind, input.refundId)
 
-  // THE LEASE, BEFORE THE LEDGER IS READ. The state row is the lock: created if missing, then taken by an atomic compare-and-set on
-  // its expiry. Everything below (lookup, download, promotion, pointer) happens under it.
+  // THE LEASE, BEFORE THE LEDGER IS READ. The state row is the lock: created if missing, then taken by an atomic compare-and-set on its
+  // expiry that also writes a holder token unique to this fetch. Everything below (lookup, download, promotion, pointer) happens under it,
+  // renews it between steps, and requires the token for every write and for the release.
   await db.invoiceDocumentFetchState.upsert({
     where: { subjectKey },
     create: { subjectKey, orderId: input.orderId, refundId: input.refundId ?? null, kind: input.kind },
     update: {},
   }).catch(() => { /* a concurrent creator won: the row exists */ })
+  const token = randomUUID()
   const leased = await db.invoiceDocumentFetchState.updateMany({
     where: { subjectKey, OR: [{ leaseUntil: null }, { leaseUntil: { lt: now } }] },
-    data: { leaseUntil: new Date(now.getTime() + INVOICE_DOCUMENT_LEASE_MS) },
+    data: { leaseUntil: new Date(now.getTime() + INVOICE_DOCUMENT_LEASE_MS), leaseHolder: token },
   })
   if (leased.count === 0) return { status: 'busy' }
   try {
-    return await ensureUnderLease(input, deps, subjectKey, now)
+    return await ensureUnderLease(input, deps, subjectKey, token, now)
+  } catch (error) {
+    // A fetch that lost its lease aborts without having written anything after the loss.
+    if (error instanceof LeaseLost) return { status: 'busy' }
+    throw error
   } finally {
-    await db.invoiceDocumentFetchState.updateMany({ where: { subjectKey }, data: { leaseUntil: null } }).catch(() => { /* an expired lease is taken over */ })
+    // Release only OUR lease: if it was taken over, the new holder's lease is not ours to clear.
+    await db.invoiceDocumentFetchState.updateMany({ where: { subjectKey, leaseHolder: token }, data: { leaseUntil: null, leaseHolder: null } }).catch(() => { /* an expired lease is taken over */ })
   }
 }
 
@@ -164,6 +184,7 @@ async function ensureUnderLease(
   input: EnsureInvoiceDocumentInput,
   deps: InvoiceDocumentDeps,
   subjectKey: string,
+  token: string,
   now: Date,
 ): Promise<EnsureInvoiceDocumentOutcome> {
   const order = await db.salesOrder.findUnique({
@@ -198,7 +219,6 @@ async function ensureUnderLease(
       expectedTotal: Number(order.totalForeign),
       anchorDate: order.createdAt,
       dateToleranceDays: 14,
-      minCorroboration: 1,
     }
   } else {
     const refund = await db.salesOrderRefund.findUnique({
@@ -214,11 +234,10 @@ async function ensureUnderLease(
       orderNumbers,
       customerName: order.customerName ?? null,
       currency: order.currency,
-      // A refund stores NET amounts, so there is no gross total to compare: it needs two of reference / customer / date instead.
+      // A refund stores NET amounts, so there is no gross total to compare: currency plus customer or reference decide.
       expectedTotal: null,
       anchorDate: refund.createdAt,
       dateToleranceDays: 30,
-      minCorroboration: 2,
     }
   }
 
@@ -241,7 +260,7 @@ async function ensureUnderLease(
   const label = input.kind === 'INVOICE' ? `invoice ${number ?? '(no number)'}` : `credit note ${number ?? '(no number)'}`
 
   const defer = async (reason: string, outcome: 'waiting' | 'failed', stop = false): Promise<EnsureInvoiceDocumentOutcome> => {
-    await recordState(input, subjectKey, {
+    await recordState(input, subjectKey, token, {
       status: isRecheck ? 'DONE' : 'PENDING',
       error: reason,
       nextAttemptAt: new Date(now.getTime() + (isRecheck ? recheckDelayMs(rechecksDone) : nextAttemptDelayMs(attemptsSoFar))),
@@ -250,7 +269,7 @@ async function ensureUnderLease(
     return outcome === 'waiting' ? { status: 'waiting', reason } : { status: 'failed', reason, stop }
   }
   const needsAttention = async (reason: string): Promise<EnsureInvoiceDocumentOutcome> => {
-    await recordState(input, subjectKey, { status: 'NEEDS_ATTENTION', error: reason, attempted: true }, now)
+    await recordState(input, subjectKey, token, { status: 'NEEDS_ATTENTION', error: reason, attempted: true }, now)
     await escalate(input, reason)
     return { status: 'needs-attention', reason }
   }
@@ -262,11 +281,12 @@ async function ensureUnderLease(
   }
 
   const lookup = input.kind === 'INVOICE' ? await deps.lookupInvoiceClaims(number) : await deps.lookupCreditNoteClaims(number)
+  if (!(await renewLease(subjectKey, token, deps.now()))) throw new LeaseLost()
   if (!lookup.ok) {
     const reason = `${label}: ${lookup.error}`
     // A number the ledger's filter cannot express will never come right by waiting.
     if (lookup.unaskable) return needsAttention(reason)
-    return defer(reason, 'failed')
+    return defer(reason, 'failed', lookup.stop === true)
   }
 
   const selection = selectDocumentClaim(lookup.claims, label, { orderCancelled: order.status === 'CANCELLED' })
@@ -278,6 +298,7 @@ async function ensureUnderLease(
   if (!evidence.ok) return needsAttention(`${label}: ${evidence.reason}`)
 
   const download = await deps.downloadPdf(input.kind, claim.documentId)
+  if (!(await renewLease(subjectKey, token, deps.now()))) throw new LeaseLost()
   if (!download.ok) return defer(`${label}: ${download.error}`, 'failed', download.stop)
 
   const validation = validateFetchedPdf(download.buffer)
@@ -290,6 +311,12 @@ async function ensureUnderLease(
 
   const recorded = await db.$transaction(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(${LOCK_NAMESPACE}::int4, ${lockKeyOf(subjectKey)}::int4)`
+    // THE PROMOTION REQUIRES THE LEASE: the first statement renews it as its holder, and a fetch that was taken over writes nothing.
+    const stillHeld = await tx.invoiceDocumentFetchState.updateMany({
+      where: { subjectKey, leaseHolder: token },
+      data: { leaseUntil: new Date(deps.now().getTime() + INVOICE_DOCUMENT_LEASE_MS) },
+    })
+    if (stillHeld.count === 0) return { kind: 'lost' as const }
     const existing = await tx.salesOrderInvoiceDocument.findUnique({
       where: {
         connector_externalDocumentId_sha256: {
@@ -312,14 +339,14 @@ async function ensureUnderLease(
         // The ledger reverted to bytes seen before: that version is current again.
         await tx.salesOrderInvoiceDocument.updateMany({
           where: { orderId: input.orderId, kind: input.kind, refundId: input.refundId ?? null, supersededAt: null },
-          data: { supersededAt: now },
+          data: { supersededAt: deps.now() },
         })
         await tx.salesOrderInvoiceDocument.update({ where: { id: existing.id }, data: { supersededAt: null } })
       }
     } else {
       await tx.salesOrderInvoiceDocument.updateMany({
         where: { orderId: input.orderId, kind: input.kind, refundId: input.refundId ?? null, supersededAt: null },
-        data: { supersededAt: now },
+        data: { supersededAt: deps.now() },
       })
       const row = await tx.salesOrderInvoiceDocument.create({
         data: {
@@ -333,7 +360,7 @@ async function ensureUnderLease(
           sha256: validation.sha256,
           byteSize: validation.byteSize,
           storedPath,
-          fetchedAt: now,
+          fetchedAt: deps.now(),
         },
         select: { id: true },
       })
@@ -343,16 +370,19 @@ async function ensureUnderLease(
     return { kind: 'stored' as const, documentId, created }
   })
 
+  if (recorded.kind === 'lost') throw new LeaseLost()
   if (recorded.kind === 'conflict') return needsAttention(recorded.reason)
 
   if (input.kind === 'INVOICE') {
     // The pointer the existing customer and staff download routes and the invoice e-mail read. It is the
-    // order's CURRENT invoice, overwritten in place; the versioned record above is the permanent one. Still under the lease.
+    // order's CURRENT invoice, overwritten in place; the versioned record above is the permanent one. The lease was
+    // renewed by the promotion a moment ago; renew and check once more so a takeover in between writes nothing.
+    if (!(await renewLease(subjectKey, token, deps.now()))) throw new LeaseLost()
     const flatPath = await saveInvoicePdfFile(input.orderId, download.buffer)
     await db.salesOrder.update({ where: { id: input.orderId }, data: { invoicePdfPath: flatPath } })
   }
 
-  await recordState(input, subjectKey, {
+  await recordState(input, subjectKey, token, {
     status: 'DONE',
     error: null,
     // When this stored document is looked at again.

@@ -16,7 +16,7 @@ import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 
 export type DocumentClaimsLookup =
   | { ok: true; claims: DocumentClaim[] }
-  | { ok: false; error: string; unaskable?: boolean; stop?: boolean }
+  | { ok: false; error: string; unaskable?: boolean; /** The ledger refused or is rate-limited: the sweep should stop, not try the next order. */ stop?: boolean }
 
 export type DocumentPdfDownload =
   | { ok: true; buffer: Buffer }
@@ -27,9 +27,14 @@ export type DocumentPdfDownload =
       stop: boolean
     }
 
+/** A refusal that means the ledger cannot or will not answer right now: rate-limited, not sent (0), or unauthorised. */
+function isStopStatus(status: number | undefined): boolean {
+  return status === 429 || status === 0 || status === 401 || status === 403
+}
+
 export async function lookupInvoiceDocumentClaims(invoiceNumber: string): Promise<DocumentClaimsLookup> {
   const lookup = await lookupXeroInvoiceNumberClaim(invoiceNumber)
-  if (!lookup.ok) return { ok: false, error: lookup.error, unaskable: lookup.unaskable }
+  if (!lookup.ok) return { ok: false, error: lookup.error, unaskable: lookup.unaskable, stop: isStopStatus(lookup.httpStatus) }
   return {
     ok: true,
     claims: lookup.claims.map((claim) => ({
@@ -86,7 +91,7 @@ export async function lookupSalesCreditNoteDocumentClaims(
   } catch (error) {
     return { ok: false, error: `the credit-note lookup threw: ${String(error)}` }
   }
-  if (!res.ok) return { ok: false, error: res.error ?? `credit-note lookup failed with HTTP ${res.status}` }
+  if (!res.ok) return { ok: false, error: res.error ?? `credit-note lookup failed with HTTP ${res.status}`, stop: isStopStatus(res.status) }
   if (!res.data || !Array.isArray(res.data.CreditNotes)) return { ok: false, error: 'the credit-note lookup returned no CreditNotes array' }
   const rows = res.data.CreditNotes
   if (rows.length >= PAGE_SIZE) return { ok: false, error: `the credit-note lookup filled its page (${rows.length}) for ${wanted}, so it cannot show it saw every document` }
@@ -124,6 +129,6 @@ export async function downloadLedgerDocumentPdf(kind: 'INVOICE' | 'CREDIT_NOTE',
   const path = kind === 'INVOICE' ? `Invoices/${encodeURIComponent(documentId)}` : `CreditNotes/${encodeURIComponent(documentId)}`
   const result = await xeroGetRaw(path, 'application/pdf')
   if (result.ok && result.buffer) return { ok: true, buffer: result.buffer }
-  const stop = result.status === 429 || result.status === 0 || result.status === 401 || result.status === 403
+  const stop = isStopStatus(result.status)
   return { ok: false, stop, error: result.error ?? `PDF download failed with HTTP ${result.status}` }
 }

@@ -1,18 +1,23 @@
 /**
- * Is this ledger document THIS order's? A number alone does not say: the storefront's invoice number is not unique in IMS
- * and the ledger's number filter answers for whatever holds the number. So a selected document is stored and shown only when
- * the ledger's own record of it agrees with the order on independent keys. Pure.
+ * Is this ledger document THIS order's? A number does not say: the storefront's invoice number is not unique in IMS and the
+ * ledger's number filter answers for whatever holds the number. So a selected document is stored and shown only when the
+ * ledger's own record of it agrees with the order on independent keys. Pure.
  *
- * What the document carries that is independent of its number (all optional in the ledger's answer):
- *   total          the gross total, in the document's currency. For an invoice the order's total in the order currency; the
- *                  strongest key, and REQUIRED to match (a document that does not report one cannot be tied to the order).
- *   currency       must agree when both state one.
- *   reference      free text the invoicing writer fills; matched against the order's own numbers (storefront and IMS) on token
- *                  boundaries. The invoicing writer's format is not verified here, so this is used when it matches, never required.
- *   contact        the customer name, compared normalised.
- *   date           within a tolerance of the order's date.
- * Beyond the total (and currency) at least `minCorroboration` of reference / contact / date must agree. A credit note has no gross
- * total to compare (a refund stores net amounts), so it needs two of the three.
+ * REQUIRED, all of them:
+ *   currency   the ledger must REPORT one, and it must equal the order's. A document that states no currency cannot be tied to the
+ *              order's money.
+ *   total      (invoice) the gross total, within 0.02, and the ledger must report it. A credit note has no gross total to compare (a
+ *              refund stores net amounts).
+ *   identity   the customer name (normalised) OR the order reference (the ledger's Reference text contains the order's storefront or
+ *              IMS order number, on token boundaries) must match.
+ * AND NO CONFLICT: if the ledger states a customer and it differs from the order's, or states a reference that does not mention
+ * the order, the document needs a person EVEN IF another key matches. Same number, total, currency and date with an explicitly
+ * different customer is a different order's invoice.
+ * The date is supporting evidence only: it is reported as matched when it falls inside the tolerance and never decides.
+ *
+ * KNOWN LIMIT (unverified): what the invoicing writer puts in the ledger's Reference field and Contact name. If its Reference is
+ * not the order number, or the Contact is a company where the order has a person, the conflict rules refuse every such document
+ * until a person looks; that is the safe direction for a document shown to a customer.
  */
 
 import type { DocumentClaim } from './claim-selection'
@@ -22,12 +27,10 @@ export type EvidenceSubject = {
   orderNumbers: readonly string[]
   customerName: string | null
   currency: string
-  /** The gross total the document must carry, or null when it cannot be derived. */
+  /** The gross total the document must carry, or null when it cannot be derived (a credit note). */
   expectedTotal: number | null
   anchorDate: Date
   dateToleranceDays: number
-  /** How many of reference / contact / date must agree. */
-  minCorroboration: number
 }
 
 export type EvidenceResult = { ok: true; matched: string[] } | { ok: false; reason: string }
@@ -54,6 +57,12 @@ function withinDays(dateString: string, anchor: Date, days: number): boolean {
 export function assessDocumentEvidence(subject: EvidenceSubject, claim: DocumentClaim): EvidenceResult {
   const matched: string[] = []
 
+  if (!claim.currencyCode) return { ok: false, reason: 'the ledger did not report the document currency, so it cannot be tied to this order' }
+  if (claim.currencyCode.toUpperCase() !== subject.currency.toUpperCase()) {
+    return { ok: false, reason: `the ledger document is in ${claim.currencyCode} and the order is in ${subject.currency}` }
+  }
+  matched.push('currency')
+
   if (subject.expectedTotal !== null) {
     if (typeof claim.total !== 'number') return { ok: false, reason: 'the ledger did not report the document total, so it cannot be tied to this order' }
     if (Math.abs(claim.total - subject.expectedTotal) > TOTAL_TOLERANCE) {
@@ -61,21 +70,26 @@ export function assessDocumentEvidence(subject: EvidenceSubject, claim: Document
     }
     matched.push('total')
   }
-  if (claim.currencyCode && claim.currencyCode.toUpperCase() !== subject.currency.toUpperCase()) {
-    return { ok: false, reason: `the ledger document is in ${claim.currencyCode} and the order is in ${subject.currency}` }
-  }
-  if (claim.currencyCode) matched.push('currency')
 
-  const corroboration: string[] = []
-  if (claim.reference && subject.orderNumbers.some((number) => referenceMentions(claim.reference!, number))) corroboration.push('reference')
-  if (claim.contactName && subject.customerName && normaliseName(claim.contactName) !== '' && normaliseName(claim.contactName) === normaliseName(subject.customerName)) corroboration.push('contact')
-  if (claim.dateString && withinDays(claim.dateString, subject.anchorDate, subject.dateToleranceDays)) corroboration.push('date')
+  const orderName = subject.customerName ? normaliseName(subject.customerName) : ''
+  const docName = claim.contactName ? normaliseName(claim.contactName) : ''
+  const customerStated = docName !== '' && orderName !== ''
+  const customerMatches = customerStated && docName === orderName
+  const referenceStated = Boolean(claim.reference && claim.reference.trim())
+  const referenceMatches = referenceStated && subject.orderNumbers.some((number) => referenceMentions(claim.reference!, number))
 
-  if (corroboration.length < subject.minCorroboration) {
-    return {
-      ok: false,
-      reason: `only ${corroboration.length} of the reference, customer and date agree between the ledger document and the order (${subject.minCorroboration} needed), so it cannot be tied to this order`,
-    }
+  // An explicit conflict is a refusal whatever else agrees.
+  if (customerStated && !customerMatches) {
+    return { ok: false, reason: `the ledger document is for "${claim.contactName}" and the order is for "${subject.customerName}": it may belong to a different order` }
   }
-  return { ok: true, matched: [...matched, ...corroboration] }
+  if (referenceStated && !referenceMatches) {
+    return { ok: false, reason: `the ledger document's reference "${claim.reference}" does not mention this order: it may belong to a different order` }
+  }
+  if (!customerMatches && !referenceMatches) {
+    return { ok: false, reason: 'neither the customer nor the order reference is stated by the ledger, so the document cannot be tied to this order' }
+  }
+  if (customerMatches) matched.push('contact')
+  if (referenceMatches) matched.push('reference')
+  if (claim.dateString && withinDays(claim.dateString, subject.anchorDate, subject.dateToleranceDays)) matched.push('date')
+  return { ok: true, matched }
 }

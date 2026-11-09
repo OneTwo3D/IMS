@@ -73,34 +73,47 @@ test('retries widen, then hold at a day; a long-missing document is escalated', 
 
 const subject = (over: Partial<EvidenceSubject> = {}): EvidenceSubject => ({
   orderNumbers: ['12345', 'SO-0099'], customerName: 'Ada Lovelace', currency: 'GBP', expectedTotal: 100,
-  anchorDate: new Date('2026-11-01T00:00:00Z'), dateToleranceDays: 14, minCorroboration: 1, ...over,
+  anchorDate: new Date('2026-11-01T00:00:00Z'), dateToleranceDays: 14, ...over,
 })
 const doc = (over: Partial<DocumentClaim> = {}): DocumentClaim => ({ documentId: 'd', documentNumber: 'INV-1', status: 'AUTHORISED', total: 100, currencyCode: 'GBP', ...over })
 
 test('evidence: total must match within a penny or two, and the ledger must report one', () => {
-  assert.equal(assessDocumentEvidence(subject(), doc({ dateString: '2026-11-02' })).ok, true)
-  assert.equal(assessDocumentEvidence(subject(), doc({ total: 100.01, dateString: '2026-11-02' })).ok, true)
-  assert.equal(assessDocumentEvidence(subject(), doc({ total: 101, dateString: '2026-11-02' })).ok, false)
-  assert.equal(assessDocumentEvidence(subject(), doc({ total: undefined, dateString: '2026-11-02' })).ok, false)
+  assert.equal(assessDocumentEvidence(subject(), doc({ reference: 'order 12345' })).ok, true)
+  assert.equal(assessDocumentEvidence(subject(), doc({ total: 100.01, reference: 'order 12345' })).ok, true)
+  assert.equal(assessDocumentEvidence(subject(), doc({ total: 101, reference: 'order 12345' })).ok, false)
+  assert.equal(assessDocumentEvidence(subject(), doc({ total: undefined, reference: 'order 12345' })).ok, false)
 })
 
-test('evidence: currency must agree when stated', () => {
-  assert.equal(assessDocumentEvidence(subject(), doc({ currencyCode: 'EUR', dateString: '2026-11-02' })).ok, false)
-  assert.equal(assessDocumentEvidence(subject(), doc({ currencyCode: undefined, dateString: '2026-11-02' })).ok, true)
+test('evidence: currency must be REPORTED and equal', () => {
+  assert.equal(assessDocumentEvidence(subject(), doc({ currencyCode: 'EUR', reference: '12345' })).ok, false)
+  assert.equal(assessDocumentEvidence(subject(), doc({ currencyCode: undefined, reference: '12345' })).ok, false, 'a document that states no currency is refused')
 })
 
-test('evidence: one of reference / customer / date must also agree; the reference matches on token boundaries only', () => {
+test('evidence: the customer OR the order reference must match; a total and a date alone are not identity', () => {
   assert.equal(assessDocumentEvidence(subject(), doc({ reference: 'WC order #12345' })).ok, true)
-  assert.equal(assessDocumentEvidence(subject(), doc({ reference: 'order 123456' })).ok, false, '123456 is not 12345')
   assert.equal(assessDocumentEvidence(subject(), doc({ contactName: 'ada  LOVELACE' })).ok, true)
-  assert.equal(assessDocumentEvidence(subject(), doc({ dateString: '2026-12-25' })).ok, false, 'outside the date tolerance')
-  assert.equal(assessDocumentEvidence(subject(), doc({})).ok, false, 'a total alone is not enough')
+  assert.equal(assessDocumentEvidence(subject(), doc({ dateString: '2026-11-02' })).ok, false, 'total + currency + date, nothing about who: refused')
+  assert.equal(assessDocumentEvidence(subject(), doc({})).ok, false)
 })
 
-test('evidence: a credit note (no gross total to compare) needs two of the three', () => {
-  const cn = subject({ expectedTotal: null, minCorroboration: 2, dateToleranceDays: 30 })
-  assert.equal(assessDocumentEvidence(cn, doc({ reference: '12345' })).ok, false)
-  assert.equal(assessDocumentEvidence(cn, doc({ reference: '12345', dateString: '2026-11-10' })).ok, true)
+test('evidence: an explicit conflict on the customer or the reference refuses the document even when another key matches', () => {
+  assert.equal(assessDocumentEvidence(subject(), doc({ reference: '12345', contactName: 'Bob Builder', dateString: '2026-11-02' })).ok, false, 'reference matches, customer is someone else')
+  assert.equal(assessDocumentEvidence(subject(), doc({ contactName: 'Ada Lovelace', reference: 'order 99999', dateString: '2026-11-02' })).ok, false, 'customer matches, reference names another order')
+  assert.equal(assessDocumentEvidence(subject(), doc({ reference: 'order 123456' })).ok, false, '123456 is not 12345')
+})
+
+test('evidence: the date is supporting only', () => {
+  const near = assessDocumentEvidence(subject(), doc({ reference: '12345', dateString: '2026-11-02' }))
+  const far = assessDocumentEvidence(subject(), doc({ reference: '12345', dateString: '2026-12-25' }))
+  assert.equal(near.ok && near.matched.includes('date'), true)
+  assert.equal(far.ok && !far.matched.includes('date'), true, 'a far date neither refuses nor corroborates')
+})
+
+test('evidence: a credit note (no gross total to compare) needs currency plus customer or reference', () => {
+  const cn = subject({ expectedTotal: null, dateToleranceDays: 30 })
+  assert.equal(assessDocumentEvidence(cn, doc({ total: undefined, reference: '12345' })).ok, true)
+  assert.equal(assessDocumentEvidence(cn, doc({ total: undefined, dateString: '2026-11-10' })).ok, false)
+  assert.equal(assessDocumentEvidence(cn, doc({ total: undefined, currencyCode: undefined, reference: '12345' })).ok, false)
 })
 
 test('rechecks of a stored document: a day, a week, then every thirty days', () => {

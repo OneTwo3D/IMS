@@ -194,7 +194,7 @@ export async function lookupXeroInvoiceNumberClaim(
   }
 
   if (!res.ok) {
-    return { ok: false, error: res.error ?? `invoice-number lookup failed with HTTP ${res.status}` }
+    return { ok: false, error: res.error ?? `invoice-number lookup failed with HTTP ${res.status}`, httpStatus: res.status }
   }
   if (!res.data || !Array.isArray(res.data.Invoices)) {
     return { ok: false, error: 'the invoice-number lookup returned no Invoices array' }

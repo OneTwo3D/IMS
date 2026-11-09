@@ -48,6 +48,7 @@ CREATE TABLE "invoice_document_fetch_states" (
     "last_error" TEXT,
     "rechecks" INTEGER NOT NULL DEFAULT 0,
     "lease_until" TIMESTAMP(3),
+    "lease_holder" TEXT,
     "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_at" TIMESTAMP(3) NOT NULL,
 

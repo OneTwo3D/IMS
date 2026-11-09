@@ -2306,9 +2306,11 @@ model InvoiceDocumentFetchState {
   lastError     String?                    @map("last_error")
   /// Completed rechecks of a stored document (the ledger can amend it): 0 until the first recheck, then 1, 2, 3.
   rechecks      Int                        @default(0)
-  /// One fetch of this document at a time: set to a short expiry while a fetch holds it, cleared when it ends. An
-  /// expired value is a crashed holder and may be taken. Held across the ledger read, the download and the promotion.
+  /// One fetch of this document at a time: set to an expiry while a fetch holds it, renewed between its steps, cleared when it ends. An
+  /// expired value is a crashed or stalled holder and may be taken. Held across the ledger read, the download and the promotion.
   leaseUntil    DateTime?                  @map("lease_until")
+  /// Who holds the lease: a token unique to one fetch. Renewal, every state write, the promotion and the release all require it, so a holder whose lease was taken over cannot write or release the new holder's.
+  leaseHolder   String?                    @map("lease_holder")
   createdAt     DateTime                   @default(now()) @map("created_at")
   updatedAt     DateTime                   @updatedAt @map("updated_at")
 
