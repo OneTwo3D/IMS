@@ -187,6 +187,18 @@ if ! wait_front_slot "$new_slot" "$IMS_FRONT_TIMEOUT_S"; then
   if [ "$old_slot" != none ] && [ "$contract" = 0 ]; then
     log "nginx does not serve the new release; switching back to ${old_slot}"
     switch_upstream "$(slot_port "$old_slot")" || log "ALSO could not switch back; fix ${IMS_UPSTREAM_FILE} by hand"
+  else
+    # First install, or the active slot was stopped for a maintenance deploy: there is nothing to switch back to. The upstream file still
+    # names the new slot, so stopping it now would leave a later reload serving 503s from a dead upstream. Put nginx in the known safe
+    # state (maintenance: holding page, 503, slot none) and verify THAT before the attempted slot is stopped. If it cannot be verified
+    # the serving state is uncertain: the container is kept running and the deploy fails loudly.
+    log "nginx does not serve the new release and there is no previous slot to return to; switching to the maintenance holding page"
+    if switch_upstream maintenance && wait_front_maintenance "$IMS_FRONT_TIMEOUT_S"; then
+      log "nginx verified on the holding page (503, slot none); the new slot is stopped next"
+    else
+      log "MANUAL ATTENTION: could not verify nginx on the holding page; $(slot_name "$new_slot") is LEFT RUNNING because nginx may still serve it. Check ${IMS_FRONT_URL}/login and ${IMS_UPSTREAM_FILE} by hand."
+      exit 1
+    fi
   fi
   fail_new_slot "${IMS_FRONT_URL}/login did not answer 200 after the switch"
 fi
