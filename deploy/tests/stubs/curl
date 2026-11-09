@@ -3,7 +3,15 @@
 set -u
 url="${*: -1}"
 # The upstream port the RUNNING nginx uses: the file as of the last reload (a switch that never reloaded is not live).
-loaded_port() { grep -oE 'server 127\.0\.0\.1:[0-9]+' "$STUB/loaded" 2>/dev/null | head -n1 | cut -d: -f2; }
+# While $STUB/lag_left holds N > 0 (nginx stub, reload_lag) the previous config is still the one answering; each read of :3000 uses one.
+loaded_port() {
+  local f="$STUB/loaded" left
+  if [ -s "$STUB/lag_left" ]; then
+    left="$(cat "$STUB/lag_left")"
+    if [ "$left" -gt 0 ]; then echo $((left - 1)) > "$STUB/lag_left"; f="$STUB/loaded_old"; fi
+  fi
+  grep -oE 'server 127\.0\.0\.1:[0-9]+' "$f" 2>/dev/null | head -n1 | cut -d: -f2
+}
 port="$(sed -E 's#^http://[^:/]+:([0-9]+).*#\1#' <<< "$url")"
 if [ "$port" = 3000 ]; then
   port="$(loaded_port)"
@@ -12,6 +20,23 @@ if [ "$port" = 3000 ]; then
     slot=none; [ "$port" = 3101 ] && slot=blue; [ "$port" = 3102 ] && slot=green
     echo "curl -I $url -> $slot" >> "$STUB/calls.log"
     printf 'HTTP/1.1 200 OK\r\nX-IMS-Slot: %s\r\n\r\n' "$slot"; exit 0 ;;
+  esac
+  # One GET that dumps the response headers (-D -): the status line and X-IMS-Slot come from the SAME answer, as wait_front_slot needs.
+  case " $* " in *" -D "*)
+    slot=none; [ "$port" = 3101 ] && slot=blue; [ "$port" = 3102 ] && slot=green
+    if grep -q '^# MAINTENANCE' "$STUB/loaded" 2>/dev/null; then code=503
+    elif [ -e "$STUB/front_fail" ]; then echo "curl -D $url -> 000" >> "$STUB/calls.log"; exit 7
+    else
+      code=502
+      for f in "$STUB"/containers/*; do
+        [ -f "$f" ] || continue
+        cport="$(sed -n 's/^port=//p' "$f")" crun="$(sed -n 's/^running=//p' "$f")" cimg="$(sed -n 's/^image=//p' "$f")"
+        if [ "$cport" = "${port:-}" ] && [ "$crun" = 1 ] && [ ! -e "$STUB/unhealthy/${cimg##*:}" ]; then code=200; fi
+      done
+    fi
+    echo "curl -D $url -> $code $slot" >> "$STUB/calls.log"
+    if [ -e "$STUB/no_header" ]; then printf 'HTTP/1.1 %s X\r\n\r\n' "$code"; else printf 'HTTP/1.1 %s X\r\nX-IMS-Slot: %s\r\n\r\n' "$code" "$slot"; fi
+    exit 0 ;;
   esac
   if grep -q '^# MAINTENANCE' "$STUB/loaded" 2>/dev/null; then echo "curl $url -> 503 (maintenance)" >> "$STUB/calls.log"; echo -n 503; exit 0; fi
   [ ! -e "$STUB/front_fail" ] || { echo -n 000; echo "curl $url -> 000" >> "$STUB/calls.log"; exit 7; }

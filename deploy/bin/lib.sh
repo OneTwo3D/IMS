@@ -294,6 +294,39 @@ wait_http_200() { # <url> <timeout-s>
   done
 }
 
+# Wait until the RUNNING nginx answers 200 on /login AND that same response carries X-IMS-Slot: <slot>, bounded by <timeout-s>. A bare 200
+# proves nothing right after a switch: `nginx -s reload` returns at once, and until the new workers take over the old ones still answer
+# (proxying to the OLD slot, which is up: 200, old header). The status and the header are read from ONE GET response, so workers of two
+# generations cannot be mixed into a false pass. If nginx never serves <slot> this returns 1.
+front_probe() { # prints "<status> <slot-header>" of one GET of /login; rc 1 when nginx does not answer
+  local out code value
+  out="$(curl -s -D - -o /dev/null --max-time 5 "${IMS_FRONT_URL}/login" 2>/dev/null)" || return 1
+  out="$(printf '%s\n' "$out" | tr -d '\r')"
+  code="$(printf '%s\n' "$out" | awk '/^HTTP\// { print $2; exit }')"
+  value="$(printf '%s\n' "$out" | awk -F': *' 'tolower($1) == "x-ims-slot" { print $2; exit }')"
+  printf '%s %s\n' "${code:-none}" "${value:-none}"
+}
+wait_front_slot() { # <slot> <timeout-s>
+  local slot="$1" timeout="$2" waited=0 probe=""
+  while :; do
+    probe="$(front_probe || true)"
+    [ "$probe" = "200 ${slot}" ] && return 0
+    [ "$waited" -ge "$timeout" ] && { log "${IMS_FRONT_URL}/login did not serve slot '${slot}' within ${timeout}s (last: status/slot '${probe:-no answer}')"; return 1; }
+    sleep "$IMS_HEALTH_INTERVAL_S"
+    waited=$((waited + IMS_HEALTH_INTERVAL_S))
+  done
+}
+# Wait until the RUNNING nginx answers the maintenance 503 with slot none (the safe "nothing is served" state), bounded by <timeout-s>.
+wait_front_maintenance() { # <timeout-s>
+  local timeout="$1" waited=0
+  while :; do
+    [ "$(front_probe || true)" = "503 none" ] && return 0
+    [ "$waited" -ge "$timeout" ] && return 1
+    sleep "$IMS_HEALTH_INTERVAL_S"
+    waited=$((waited + IMS_HEALTH_INTERVAL_S))
+  done
+}
+
 # --- the env file ---------------------------------------------------------------------------------------------------------------
 env_value() { # <NAME> -> the value of the LAST NAME=value line (docker --env-file semantics: literal text after the first '=')
   local line

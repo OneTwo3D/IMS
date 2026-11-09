@@ -70,7 +70,7 @@ if ! switch_upstream "$prev_port"; then
   stop_unless_serving "$prev_slot" || true
   die "could not switch the nginx upstream; the current release keeps serving"
 fi
-if ! wait_http_200 "${IMS_FRONT_URL}/login" "$IMS_FRONT_TIMEOUT_S" || [ "$(header_slot || true)" != "$prev_slot" ]; then
+if ! wait_front_slot "$prev_slot" "$IMS_FRONT_TIMEOUT_S"; then
   log "nginx does not serve the rolled-back release; switching back to ${cur_slot}"
   switch_upstream "$(slot_port "$cur_slot")" || log "ALSO could not switch back; fix ${IMS_UPSTREAM_FILE} by hand"
   stop_unless_serving "$prev_slot" || true

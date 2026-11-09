@@ -70,6 +70,18 @@ T_LOGROTATE_TMP="$(mktemp)"; trap 'rm -f "$T_LOGROTATE_TMP"' EXIT
 install -d -m 0755 "$R/srv/ims" "$R/srv/ims/deploy" "$R/srv/ims/holding"
 install -d -m 0750 "$R/srv/ims/state"; own 1001:1001 "$R/srv/ims/state"
 chmod 0750 "$R/srv/ims/state"
+# The image creates these under /var/lib/onetwoinventory, but the bind mount hides them: preflight requires each to exist and be writable by
+# uid 1001. The state directory is writable by the app container (uid 1001), so a compromised container could plant a symlink here. The
+# directories are therefore created AS uid 1001 (setpriv, when root): root never creates, chmods or chowns anything below the state
+# directory, so there is nothing for a symlink to redirect and no check-then-use race. A path that is a symlink or not a directory is
+# refused up front for a clear error. The state directory itself is root-created and chowned above (its parent /srv/ims is root-only).
+# Not recursive: existing contents are never touched. A pre-existing subdirectory owned by someone else makes the chmod fail: bootstrap stops.
+as_app() { if [ "$(id -u)" = 0 ]; then setpriv --reuid=1001 --regid=1001 --clear-groups "$@"; else "$@"; fi; }
+for d in backups uploads public-uploads invoice-pdfs; do
+  p="$R/srv/ims/state/$d"
+  if [ -L "$p" ] || { [ -e "$p" ] && [ ! -d "$p" ]; }; then die "$p is a symlink or not a directory; refusing to touch it. Inspect /srv/ims/state by hand"; fi
+  as_app install -d -m 0750 "$p" || die "could not create $p as uid 1001"
+done
 install -d -m 0700 "$R/etc/ims"; own root:root "$R/etc/ims"
 # The cron log directory: cron runs the jobs as root and each job appends to ${IMS_CRON_LOG_DIR}/cron.log. Created before anything that
 # installs or enables host cron, and checked writable, or bootstrap stops.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test stub for nginx: -t fails when $STUB/nginx_t_fail exists; every call is logged.
+# Test stub for nginx (reload_lag: see below): -t fails when $STUB/nginx_t_fail exists; every call is logged.
 set -u
 case "$*" in
   -t)
@@ -13,6 +13,13 @@ case "$*" in
     echo "nginx reload" >> "$STUB/calls.log"; touch "$STUB/reloaded"
     # $STUB/reload_fail_after holds N: the first N reloads work, every later one fails and does not load the file.
     if [ -e "$STUB/reload_fail_after" ] && [ "$n" -ge "$(cat "$STUB/reload_fail_after")" ]; then exit 1; fi
+    # $STUB/reload_lag holds N: the FIRST reload takes effect only after N curl reads of :3000 (old workers still answer meanwhile, as a
+    # real graceful reload does); the file is consumed, so later reloads (a switch back) are immediate.
+    # $STUB/reload_lag_after holds K: the first K reloads are immediate and the lag hits the next one.
+    if [ -e "$STUB/reload_lag" ] && [ "$n" -ge "$(cat "$STUB/reload_lag_after" 2>/dev/null || echo 0)" ]; then
+      cp "$STUB/loaded" "$STUB/loaded_old" 2>/dev/null || : > "$STUB/loaded_old"
+      mv "$STUB/reload_lag" "$STUB/lag_left"
+    fi
     cp "$IMS_UPSTREAM_FILE" "$STUB/loaded" ;;   # the "loaded config" is the file as of the last reload
   *) echo "nginx $*" >> "$STUB/calls.log" ;;
 esac
