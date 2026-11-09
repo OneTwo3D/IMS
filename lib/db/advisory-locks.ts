@@ -171,6 +171,16 @@ export const RECONCILIATION_PACK_SCHEDULE_SETTINGS_LOCK_KEY = 918_274_302
 export const WOO_TAX_RATE_WRITE_LOCK_KEY = 918_274_501
 
 /**
+ * The scheduled invariant check's WARNING-NOTIFICATION BASELINE fence (transaction-scoped, `pg_advisory_xact_lock`).
+ *
+ * Held for the one short transaction in which a run reads the stored baseline of named-warning counts, decides what is
+ * news, writes the new baseline and inserts the admin notifications. Two overlapping runs (a slow run plus the next tick,
+ * or a manual trigger) therefore take that step one after the other, and the older one finds the newer one's baseline and
+ * stands down. Its own domain, shared with nothing.
+ */
+export const INVARIANT_WARNING_BASELINE_LOCK_KEY = 918_274_601
+
+/**
  * Every single-bigint domain above, for the uniqueness test. A new lock MUST be
  * declared here — the test fails on any module that writes its own key literal.
  */
@@ -185,6 +195,7 @@ export const SINGLE_KEY_ADVISORY_LOCKS = {
   RECONCILIATION_PACK_SCHEDULE_SETTINGS_LOCK_KEY,
   FX_TABLE_LOCK_KEY,
   WOO_TAX_RATE_WRITE_LOCK_KEY,
+  INVARIANT_WARNING_BASELINE_LOCK_KEY,
 } as const
 
 /**

@@ -122,6 +122,10 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'IMS↔Xero TaxRate drift detection (alert-only); guarded by verifyCron.',
   },
+  '/api/cron/xero-chart-sync': {
+    access: 'cron-secret',
+    reason: 'Daily read-only Xero chart-of-accounts refresh; guarded by verifyCron.',
+  },
   '/api/cron/activity-cleanup': {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',

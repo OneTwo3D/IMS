@@ -85,6 +85,7 @@ export const REQUIRED_READ_SYNC_STREAMS = [
   'mintsoft-order-status',
   'xero-balance-snapshots',
   'xero-tax-rates',
+  'xero-chart-of-accounts',
 ] as const
 export const READ_SYNC_CONTRACT = `${READ_SYNC_CONTRACT_VERSION}: \`npm run --silent read-sync:status\` exits 0 and prints one JSON object with \`schemaVersion\` 1, \`generatedAt\`, \`counts\` that equal the tally of its entries, and an \`entries\` list (one per stream, or per binding for the stock sync) carrying \`stream\`, \`state\` (must be fresh), \`lastSuccessAt\` (a valid ISO time, not in the future), \`futureTimestamp\`, \`ageMs\` (consistent with the two times) and \`maxAgeMs\`, covering all of ${REQUIRED_READ_SYNC_STREAMS.join(', ')}, and a \`scheduler\` object with \`examined\` true, \`unreadable\` and \`blockProblem\` exactly null, and \`unscheduled\` and \`disabled\` empty lists. Every field named here must be present with its type; a missing or malformed one makes the output unreadable, not fresh`
 

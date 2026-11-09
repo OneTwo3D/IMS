@@ -197,7 +197,7 @@ test('never, off and the exit-code precedence', () => {
   assert.equal(readSyncStatusExitCode(never), 2)
 
   const off = assembleReadSyncReport({ ...base, pluginEnabled: { woocommerce: true, mintsoft: true, xero: false } }, NOW)
-  assert.deepEqual(off.entries.filter((e) => e.state === 'off').map((e) => e.stream).sort(), ['xero-balance-snapshots', 'xero-tax-rates'])
+  assert.deepEqual(off.entries.filter((e) => e.state === 'off').map((e) => e.stream).sort(), ['xero-balance-snapshots', 'xero-chart-of-accounts', 'xero-tax-rates'])
   assert.equal(readSyncStatusExitCode(off), 4)
   assert.match(renderReadSyncStatusText(off), /OFF .*Xero plugin|plugin is disabled/i)
 
@@ -293,7 +293,7 @@ test('alert text says only what the stamp shows, names no unconditional action, 
   assert.match(future.message, /later than the clock/)
 })
 
-const NEEDED = ['read-sync-liveness', 'wc-reconcile', 'mintsoft-dispatch-sync', 'wms-order-status', 'account-balance-snapshot', 'xero-tax-rate-drift', 'mintsoft-stock-sync', 'wms-watchdog']
+const NEEDED = ['read-sync-liveness', 'wc-reconcile', 'mintsoft-dispatch-sync', 'wms-order-status', 'account-balance-snapshot', 'xero-chart-sync', 'xero-tax-rate-drift', 'mintsoft-stock-sync', 'wms-watchdog']
 const ENV_FILE = '/opt/ims/.env'
 // Assembled at run time: a fixture value, not a credential (and not a literal a secret scanner would flag).
 const LITERAL_CRON_SECRET = ['fixture', 'cron', 'value', String(NOW.getUTCFullYear())].join('_')

@@ -1181,11 +1181,12 @@ The service is configured with:
 
 ## Cron Jobs
 
-Scheduled tasks are configured automatically, in two ways. The installer's bootstrap crontab carries `account-balance-snapshot`, `fx-rates`, `activity-cleanup`, `backup`, `wc-reconcile`, `delivery-status`, `refund-reservation-release` and `wc-withdrawal-sweep`. Every other job below is a registered scheduled job (`lib/cron-jobs/`): it reaches the crontab when the in-app scheduler writes its managed block, so on an installation that already has one it is scheduled after **Settings > System > Scheduler > Save & Apply** (see "The installer bootstraps, it does not reconcile" below), and Settings shows whether each is switched on.
+Scheduled tasks are configured automatically, in two ways. The installer's bootstrap crontab carries `xero-chart-sync`, `account-balance-snapshot`, `fx-rates`, `activity-cleanup`, `backup`, `wc-reconcile`, `delivery-status`, `refund-reservation-release` and `wc-withdrawal-sweep`. Every other job below is a registered scheduled job (`lib/cron-jobs/`): it reaches the crontab when the in-app scheduler writes its managed block, so on an installation that already has one it is scheduled after **Settings > System > Scheduler > Save & Apply** (see "The installer bootstraps, it does not reconcile" below), and Settings shows whether each is switched on.
 
 | Time | Endpoint | Purpose |
 |---|---|---|
 | 00:30 | `/api/cron/product-lifecycle-archive` | Archive EOL products once all warehouse stock and incoming supply are depleted |
+| 00:30 | `/api/cron/xero-chart-sync` | Read-only refresh of the Xero chart of accounts (the balance-snapshot pull matches its account codes against it) |
 | 01:00 | `/api/cron/account-balance-snapshot` | Fetch previous-day Xero Trial Balance account balances for GL variance reporting |
 | 02:00 | `/api/cron/backup` | Scheduled backup (if enabled in settings) with retention and remote upload |
 | 03:00 | `/api/cron/activity-cleanup` | Purge activity log entries past their retention period |
@@ -1342,6 +1343,7 @@ Verify each scheduled job is registered with your cron daemon and has run succes
       sit in **Sync → Exceptions** marked *Unconfirmed* instead of being settled.
 - [ ] `/api/cron/accounting-payment-poll` — every 15 min (if accounting connected)
 - [ ] `/api/cron/accounting-fx-revaluation` — daily (if accounting connected)
+- [ ] `/api/cron/xero-chart-sync` — daily (if accounting connected)
 - [ ] `/api/cron/account-balance-snapshot` — daily (if accounting connected)
 - [ ] `/api/cron/delivery-status` — every 15 min (if delivery tracking enabled)
 - [ ] `/api/cron/mintsoft-dispatch-sync` — every 15 min (if Mintsoft receives orders from IMS; a registered job, so it is scheduled by Save & Apply on an existing crontab)
@@ -1787,7 +1789,7 @@ What this does not cover (the residual): a credential that avoids every listed w
 | first | evidence settling | an ISO time in UTC with a trailing Z |
 | later | evidence settling | a list of ISO times in UTC with a trailing Z |
 | count | evidence settling | a whole number equal to the length of later |
-| streams | JSON | at most six stream brackets |
+| streams | JSON | at most seven stream brackets |
 | items | JSON | exactly sixteen item records, R1 to R16 in order (fifteen, R1 to R15, in a schemaVersion 1 report) |
 | evidence | JSON | an object with file, sha256 and lines |
 | proof | JSON items | null, or an object with kind (and source) |
@@ -5756,6 +5758,7 @@ The feeds, when each is expected to complete, what counts as a success and when 
 | Mintsoft order-status refresh | every 15 minutes (the wms-order-status job; off by default) | the refresh resolved a connector and a lookup source and read every order it selected without an error; a refresh with no stale orders to read counts, a refresh that was skipped does not | 2 hours (eight missed 15 minute runs, the same reasoning as the despatch poll) | read-sync-liveness job |
 | Xero balance-snapshot pull | daily at 01:00 (the account-balance-snapshot job) | the scheduled pull read the Xero trial balance and stored a snapshot for every configured account without an error; an on-demand refresh for one date or one account does not count | 36 hours (a day and a half: one missed daily run is the first thing that is not explained by the schedule) | read-sync-liveness job |
 | Xero tax-rate read | hourly (the xero-tax-rate-drift job) | the sweep read the full Xero tax-rate list, validated every row and stored the list with its header row (and its drift result) in one transaction; a sweep that found no drift counts, and a response that was empty, partial or malformed does not | 6 hours (six missed hourly runs, long enough to ride out a Xero outage or rate-limit window) | read-sync-liveness job |
+| Xero chart-of-accounts refresh | daily at 00:30 (the xero-chart-sync job), ahead of the 01:00 balance-snapshot pull that matches its account codes against the stored chart | the scheduled refresh read the Xero chart of accounts, validated every row (an empty or malformed response fails the run) and stored it, inserting and updating only, in one connection-fenced transaction together with its stamp. It does not prove the list was complete, and an account removed in Xero stays active until an operator refresh from the Sync page; that on-demand refresh does not advance the stamp | 36 hours (a day and a half: one missed daily run is the first thing that is not explained by the schedule) | read-sync-liveness job |
 <!-- /read-sync-liveness:streams -->
 
 To check them:
