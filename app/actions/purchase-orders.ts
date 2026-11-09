@@ -1070,38 +1070,42 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
 
 type OrderTaxRow = Prisma.TaxRateGetPayload<{ select: typeof taxRateProfileSelect }>
 
+/** A tax name as compared: trimmed, runs of white space collapsed, case ignored (stored names are not trimmed, so both sides are normalised). */
+function normalisedTaxName(name: string): string {
+  return name.trim().replace(/\s+/g, ' ').toLowerCase()
+}
+
 /**
  * The order-level tax rate a purchase order names. An id wins outright. A name alone is looked up the way the purchase-order importer
- * does it: among ACTIVE rates usable for purchases (PURCHASE or BOTH), ignoring case and surrounding spaces. Names are not unique, so
- * several matches are narrowed first, on an edit, to the one a line of this order already carries and then to the one that spells the
- * name exactly; if that still leaves more than one the order is refused and the caller must choose by id, because picking one
- * silently would book the order at the wrong rate. No match takes no rate, as an unknown name always did.
+ * does it: among ACTIVE rates usable for purchases (PURCHASE or BOTH), comparing the normalised names in code (so a stored `VAT ` matches
+ * `vat`). Names are not unique: one eligible match is taken; several are narrowed to the one that spells the name exactly (trimmed); if
+ * that still leaves more than one the order is refused and the caller must choose by id, because picking one silently would book the order
+ * at the wrong rate. A line's own rate is an override of the order default, so it is never evidence of which default was meant, and an
+ * order stores no default rate id, so an edit has nothing further to prefer. A name that matches nothing takes no rate, exactly as before:
+ * callers send a bare header name with `taxRateValue` (a "No VAT" supplier, a hand-typed label), and refusing it would break them.
  */
 async function resolveOrderDefaultTaxRate(
   client: Pick<typeof db, 'taxRate'>,
   input: { taxRateId?: string | null; taxRateName?: string | null },
-  carriedRateIds?: ReadonlySet<string | null | undefined>,
 ): Promise<{ rate: OrderTaxRow | null } | { error: string }> {
   if (input.taxRateId) {
     return { rate: await client.taxRate.findUnique({ where: { id: input.taxRateId }, select: taxRateProfileSelect }) }
   }
   const name = input.taxRateName?.trim()
   if (!name) return { rate: null }
-  let matches = await client.taxRate.findMany({
-    where: { name: { equals: name, mode: 'insensitive' }, active: true, usedFor: { in: ['PURCHASE', 'BOTH'] } },
+  const wanted = normalisedTaxName(name)
+  const eligible = await client.taxRate.findMany({
+    where: { active: true, usedFor: { in: ['PURCHASE', 'BOTH'] } },
     orderBy: { id: 'asc' },
     select: taxRateProfileSelect,
   })
-  if (matches.length > 1 && carriedRateIds) {
-    const carried = matches.filter((m) => carriedRateIds.has(m.id))
-    if (carried.length === 1) matches = carried
-  }
+  let matches = eligible.filter((rate) => normalisedTaxName(rate.name) === wanted)
   if (matches.length > 1) {
-    const exact = matches.filter((m) => m.name.trim() === name)
+    const exact = matches.filter((rate) => rate.name.trim() === name)
     if (exact.length === 1) matches = exact
   }
   if (matches.length > 1) {
-    return { error: `The tax rate name "${name}" matches ${matches.length} active purchase tax rates (${matches.map((m) => `"${m.name}"`).join(', ')}); choose the rate by id` }
+    return { error: `The tax rate name "${name}" matches ${matches.length} active purchase tax rates (${matches.map((m) => `"${m.name.trim()}"`).join(', ')}); choose the rate by id` }
   }
   return { rate: matches[0] ?? null }
 }
@@ -1545,10 +1549,7 @@ export async function updatePurchaseOrder(
 
       if (input.lines) {
         // --- Tax rate resolution (mirror createPurchaseOrder) -------------
-        // Rates the order's lines already carry: a name that is unchanged keeps resolving to the rate it resolved to before, never to a
-        // different rate that now shares the name.
-        const priorLineRates = new Set((await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { taxRateId: true } })).map((l) => l.taxRateId))
-        const orderDefaultLookup = await resolveOrderDefaultTaxRate(tx, input, priorLineRates)
+        const orderDefaultLookup = await resolveOrderDefaultTaxRate(tx, input)
         if ('error' in orderDefaultLookup) return { refused: orderDefaultLookup.error }
         const orderDefaultRate = orderDefaultLookup.rate
         const orderDefaultProfile = orderDefaultRate ? resolvedTaxRateFromProfile(orderDefaultRate, 'fallback') : null
@@ -1577,6 +1578,7 @@ export async function updatePurchaseOrder(
         }
 
         // Supplier's Default VAT Rate is authoritative for every line (per-line manual override still wins).
+        const priorLineRates = new Set((await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { taxRateId: true } })).map((l) => l.taxRateId))
         const lineResolved = await resolvePurchaseLineTaxRates(input.lines, orderDefaultCtx, tx, priorLineRates)
 
         // Delete existing lines and recreate

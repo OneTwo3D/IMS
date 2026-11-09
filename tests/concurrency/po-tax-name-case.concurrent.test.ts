@@ -27,6 +27,14 @@ mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidate
 mock.module('@/lib/shopping', { namedExports: { enqueueStockSync: async () => {} } })
 mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
 
+/**
+ * The fixture rates are never deleted (purchase order lines point at them), so they are retired when the test ends. An ACTIVE sales rate left behind
+ * is read by the reconciliation pack's VAT set identity (R13) and fails its test in a shared database.
+ */
+function retireWhenDone(t: { after: (fn: () => Promise<void>) => void }, db: { taxRate: { updateMany: (args: unknown) => Promise<unknown> } }, tag: string): void {
+  t.after(async () => { await db.taxRate.updateMany({ where: { name: { contains: tag } }, data: { active: false } }) })
+}
+
 test.before(async () => {
   if (!RUN) return
   config({ path: '.env.local', quiet: true })
@@ -34,10 +42,11 @@ test.before(async () => {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required when RUN_DB_CONCURRENCY_TESTS=1')
 })
 
-test('a tax name in other case resolves the stored active rate on create and on edit; an unknown name still takes none', SKIP, async () => {
+test('a tax name in other case resolves the stored active rate on create and on edit; an unknown name still takes none', SKIP, async (t) => {
   const { db } = await import('@/lib/db')
   const { createPurchaseOrder, updatePurchaseOrder } = await import('@/app/actions/purchase-orders')
   const tag = `${fixtures.uid()}-taxcase`
+  retireWhenDone(t, db, tag)
   const rateName = `Tag Rate ${tag}`
   const rate = await db.taxRate.create({ data: { name: rateName, rate: '0.1234', usedFor: 'PURCHASE', active: true }, select: { id: true } })
   const warehouse = await db.warehouse.create({ data: { code: `${fixtures.uid()}-W`, name: `${tag} wh`, type: 'STANDARD' }, select: { id: true } })
@@ -68,10 +77,11 @@ test('a tax name in other case resolves the stored active rate on create and on 
   assert.deepEqual(await lineRates(unknownPo.id), [rate.id], 'edit: the line takes the named rate in other case')
 })
 
-test('names are not unique: an ambiguous name is refused, an id or an exact spelling decides, a sales-only rate is ignored, an unchanged name keeps an edit on its rate', SKIP, async () => {
+test('names are not unique: an ambiguous name is refused, an id or an exact spelling decides, a sales-only rate is ignored, a refused edit changes nothing', SKIP, async (t) => {
   const { db } = await import('@/lib/db')
   const { createPurchaseOrder, updatePurchaseOrder } = await import('@/app/actions/purchase-orders')
   const tag = `${fixtures.uid()}-taxamb`
+  retireWhenDone(t, db, tag)
   const upper = `VAT ${tag}`
   const lower = upper.toLowerCase()
   // Created in this order, so ids ascend: the sales-only rate is the EARLIEST by id and must never win a purchase lookup.
@@ -102,6 +112,10 @@ test('names are not unique: an ambiguous name is refused, an id or an exact spel
   assert.equal((await createPurchaseOrder({ ...base, reference: `${tag}-low`, taxRateName: lower, lines: [line] })).success, true)
   assert.deepEqual(await lineRates((await poOf(`${tag}-low`)).id), [b.id])
 
+  // The supplied name is trimmed before the exact-spelling comparison.
+  assert.equal((await createPurchaseOrder({ ...base, reference: `${tag}-uppad`, taxRateName: `  ${upper}  `, lines: [line] })).success, true)
+  assert.deepEqual(await lineRates((await poOf(`${tag}-uppad`)).id), [a.id])
+
   // An id wins over any name.
   assert.equal((await createPurchaseOrder({ ...base, reference: `${tag}-id`, taxRateId: a.id, taxRateName: lower, lines: [line] })).success, true)
   assert.deepEqual(await lineRates((await poOf(`${tag}-id`)).id), [a.id])
@@ -116,12 +130,14 @@ test('names are not unique: an ambiguous name is refused, an id or an exact spel
   assert.equal((await createPurchaseOrder({ ...base, reference: `${tag}-none`, taxRateName: `sales only ${tag}`, lines: [line] })).success, true)
   assert.deepEqual(await lineRates((await poOf(`${tag}-none`)).id), [null])
 
-  // Edit: a PO whose lines carry rate B, edited with an ambiguous spelling, stays on B (its lines' rate is the tie-break)...
+  // Edit: a line's own rate is an override, not evidence of the default. A PO whose lines carry rate B, edited with a name that is
+  // ambiguous, is REFUSED and keeps its lines; it is never settled by quietly taking the rate its lines already carry.
   const lowId = (await poOf(`${tag}-low`)).id
   const kept = await updatePurchaseOrder(lowId, { taxRateName: mixed, lines: [line] })
-  assert.equal(kept.success, true, `edit: ${kept.error}`)
-  assert.deepEqual(await lineRates(lowId), [b.id], 'an edit that leaves the tax name as it was cannot move the line to the other rate')
-  // ...and an ambiguous name on a PO whose lines carry neither is refused with the lines untouched.
+  assert.equal(kept.success, false)
+  assert.match(kept.error ?? '', /choose the rate by id/)
+  assert.deepEqual(await lineRates(lowId), [b.id], 'a refused edit leaves the lines as they were')
+  // ...and so is an ambiguous name on a PO whose lines carry nothing:
   const nonePo = (await poOf(`${tag}-none`)).id
   const refusedEdit = await updatePurchaseOrder(nonePo, { taxRateName: mixed, lines: [line] })
   assert.equal(refusedEdit.success, false)
@@ -129,10 +145,11 @@ test('names are not unique: an ambiguous name is refused, an id or an exact spel
   assert.deepEqual(await lineRates(nonePo), [null], 'a refused edit leaves the lines as they were')
 })
 
-test('an inactive rate never matches by name, and narrowing never shrinks a tie to a smaller tie', SKIP, async () => {
+test('an inactive rate never matches by name, and narrowing to the exact spelling never shrinks a tie to a smaller tie', SKIP, async (t) => {
   const { db } = await import('@/lib/db')
   const { createPurchaseOrder, updatePurchaseOrder } = await import('@/app/actions/purchase-orders')
   const tag = `${fixtures.uid()}-taxtie`
+  retireWhenDone(t, db, tag)
   const mk = (name: string, usedFor: string, active = true) => db.taxRate.create({ data: { name, rate: '0.1000', usedFor, active }, select: { id: true } })
   const warehouse = await db.warehouse.create({ data: { code: `${fixtures.uid()}-W`, name: `${tag} wh`, type: 'STANDARD' }, select: { id: true } })
   const supplier = await db.supplier.create({ data: { name: `${tag} supplier`, currency: 'GBP' }, select: { id: true } })
@@ -160,7 +177,7 @@ test('an inactive rate never matches by name, and narrowing never shrinks a tie 
   assert.equal(refused.success, false)
   assert.match(refused.error ?? '', /matches 3 active purchase tax rates/)
 
-  // An edit whose lines carry two of the three (by id) is still a tie of three, not of the two it carries.
+  // An edit whose lines override with two of the three is still a tie of three: the overrides are not evidence of the default.
   const seeded = await createPurchaseOrder({ ...base, reference: `${tag}-seed`, taxRateId: t1.id, lines: [line, { ...line, taxRateId: t2.id }] })
   assert.equal(seeded.success, true, `seed: ${seeded.error}`)
   const po = await db.purchaseOrder.findUniqueOrThrow({ where: { reference: `${tag}-seed` }, select: { id: true } })
@@ -168,4 +185,45 @@ test('an inactive rate never matches by name, and narrowing never shrinks a tie 
   assert.equal(edit.success, false)
   assert.match(edit.error ?? '', /matches 3 active purchase tax rates/)
   assert.ok(t3.id)
+})
+
+test('a stored name with stray spaces matches; an edit keeps the default its name selects even when every line overrides it', SKIP, async (t) => {
+  const { db } = await import('@/lib/db')
+  const { createPurchaseOrder, updatePurchaseOrder } = await import('@/app/actions/purchase-orders')
+  const tag = `${fixtures.uid()}-taxdef`
+  retireWhenDone(t, db, tag)
+  const mk = (name: string, rate: string) => db.taxRate.create({ data: { name, rate, usedFor: 'BOTH', active: true }, select: { id: true } })
+  const warehouse = await db.warehouse.create({ data: { code: `${fixtures.uid()}-W`, name: `${tag} wh`, type: 'STANDARD' }, select: { id: true } })
+  const supplier = await db.supplier.create({ data: { name: `${tag} supplier`, currency: 'GBP' }, select: { id: true } })
+  const sku = `${tag}-sku`
+  const product = await db.product.create({ data: { sku, name: `taxdef ${tag}`, type: 'SIMPLE', countryOfOrigin: 'CN' }, select: { id: true } })
+  const line = { productId: product.id, sku, productName: `taxdef ${tag}`, qty: 1, unitCostForeign: 10 }
+  const base = { supplierId: supplier.id, currency: 'GBP', destinationWarehouseId: warehouse.id, pricesIncludeVat: false, taxRateValue: 0 }
+  const lineRates = async (ref: string) => (await db.purchaseOrderLine.findMany({ where: { po: { reference: ref } }, orderBy: { sortOrder: 'asc' }, select: { taxRateId: true } })).map((l) => l.taxRateId)
+
+  // Stored with a trailing space and a doubled inner space: the name still matches.
+  const padded = await mk(`  Pad  Rate ${tag} `, '0.0800')
+  assert.equal((await createPurchaseOrder({ ...base, reference: `${tag}-pad`, taxRateName: `pad rate ${tag}`, lines: [line] })).success, true)
+  assert.deepEqual(await lineRates(`${tag}-pad`), [padded.id])
+
+  // The default and an override differ. Line 1 overrides, line 2 takes the default.
+  const dflt = await mk(`Dflt ${tag}`, '0.2000')
+  const ovr = await mk(`Ovr ${tag}`, '0.0500')
+  const two = [{ ...line, taxRateId: ovr.id }, { ...line }]
+  assert.equal((await createPurchaseOrder({ ...base, reference: `${tag}-def`, taxRateName: `Dflt ${tag}`, lines: two })).success, true)
+  assert.deepEqual(await lineRates(`${tag}-def`), [ovr.id, dflt.id])
+  const po = await db.purchaseOrder.findUniqueOrThrow({ where: { reference: `${tag}-def` }, select: { id: true } })
+
+  // Edit with the same name, every line overridden: the override rate is not taken for the default, and no line moves.
+  const same = await updatePurchaseOrder(po.id, { taxRateName: `DFLT ${tag}`, lines: [{ ...line, taxRateId: ovr.id }, { ...line, taxRateId: ovr.id }] })
+  assert.equal(same.success, true, `edit: ${same.error}`)
+  assert.deepEqual(await lineRates(`${tag}-def`), [ovr.id, ovr.id])
+  // The default really is still Dflt: the next edit that overrides only one line puts the other on it.
+  const back = await updatePurchaseOrder(po.id, { taxRateName: `DFLT ${tag}`, lines: [{ ...line, taxRateId: ovr.id }, { ...line }] })
+  assert.equal(back.success, true, `edit: ${back.error}`)
+  assert.deepEqual(await lineRates(`${tag}-def`), [ovr.id, dflt.id], 'the default selected by the name is Dflt, not the override')
+
+  // A name that matches nothing still takes no rate (callers send a bare header name with a value), and is not refused.
+  assert.equal((await createPurchaseOrder({ ...base, reference: `${tag}-nomatch`, taxRateName: `No such rate ${tag}`, lines: [line] })).success, true)
+  assert.deepEqual(await lineRates(`${tag}-nomatch`), [null])
 })
