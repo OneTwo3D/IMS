@@ -381,7 +381,7 @@ function warningFindings(code: string, n: number) {
 let clockMs = Date.parse('2026-01-01T00:00:00.000Z')
 async function runWithWarnings(
   store: ReturnType<typeof warningStore>,
-  inventoryFindings: ReturnType<typeof warningFindings>,
+  inventoryFindings: Array<{ severity: 'warning' | 'info'; code: string; productId?: string; warehouseId?: string; message: string; details: unknown }>,
   startedAt: Date = new Date((clockMs += 60_000)),
 ) {
   return runScheduledInvariantCheck({
@@ -521,4 +521,32 @@ test('every named warning code exists as a warning in the domain it is read from
     assert.ok(at > 0, `${code} is emitted`)
     assert.match(sources.slice(Math.max(0, at - 160), at), /severity: 'warning'/, `${code} is a warning`)
   }
+})
+
+test('a truncated report does not move the baseline; admins hear about it once; the next complete run compares against the kept counts', async () => {
+  const store = warningStore({ transfer_stranded_in_transit: 3 })
+  const code = 'transfer_stranded_in_transit'
+  const truncatedFinding = { severity: 'warning' as const, code: 'invariant_report_truncated', message: 'capped', details: {} }
+
+  // The capped list happens to hold only 1 of the 3 stranded transfers, plus the truncation marker.
+  await runWithWarnings(store, [...warningFindings(code, 1), truncatedFinding])
+  assert.deepEqual(store.read(), { [code]: 3 }, 'counts kept: the 1 visible finding is a floor, not a count')
+  assert.equal(store.notifications().length, 2, 'one truncation notice per admin')
+  assert.equal(store.notifications()[0]?.title, 'Invariant report was truncated')
+
+  await runWithWarnings(store, [...warningFindings(code, 9), truncatedFinding])
+  assert.deepEqual(store.read(), { [code]: 3 }, 'a rise seen only through a capped list is not acted on either')
+  assert.equal(store.notifications().length, 2, 'the truncation notice is deduplicated while it persists')
+
+  await runWithWarnings(store, warningFindings(code, 3))
+  assert.equal(store.notifications().length, 2, 'complete run, same count as the kept baseline: quiet')
+  await runWithWarnings(store, warningFindings(code, 4))
+  assert.equal(store.notifications().length, 4, 'a real rise after truncation ended notifies')
+})
+
+test('truncation markers are the ones the reports emit', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { REPORT_TRUNCATION_CODES } = await import('@/lib/cron/invariant-check')
+  const sources = ['lib/domain/inventory/invariants.ts', 'lib/domain/sales/refund-status-reconciliation.ts'].map((f) => readFileSync(f, 'utf8')).join('\n')
+  for (const code of REPORT_TRUNCATION_CODES) assert.ok(sources.includes(`'${code}'`), `${code} is emitted`)
 })

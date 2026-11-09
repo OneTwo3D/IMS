@@ -183,7 +183,7 @@ export const READ_SYNC_STREAMS: readonly ReadSyncStreamDef[] = [
     source: { kind: 'setting', key: XERO_CHART_OF_ACCOUNTS_LAST_SUCCESS_SETTING },
     maxAge: { kind: 'fixed', ms: 36 * HOUR_MS },
     cadence: 'daily at 00:30 (the xero-chart-sync job), ahead of the 01:00 balance-snapshot pull that matches its account codes against the stored chart',
-    successMeans: 'the scheduled refresh read the full Xero chart of accounts and stored it in one connection-fenced transaction together with its stamp; an on-demand refresh from the Sync page does not count, and a response that was empty, partial or malformed does not',
+    successMeans: 'the scheduled refresh read the Xero chart of accounts, validated every row (an empty or malformed response fails the run) and stored it, inserting and updating only, in one connection-fenced transaction together with its stamp. It does not prove the list was complete, and an account removed in Xero stays active until an operator refresh from the Sync page; that on-demand refresh does not advance the stamp',
     rationale: 'a day and a half: one missed daily run is the first thing that is not explained by the schedule',
     alarm: 'read-sync-liveness',
   },

@@ -76,8 +76,39 @@ export async function storeChartOfAccounts(
   return accounts.length
 }
 
+const XERO_ACCOUNT_STATUSES: ReadonlySet<string> = new Set(['ACTIVE', 'ARCHIVED', 'DELETED'])
+
 /**
- * Pull the full chart of accounts from Xero and upsert into AccountingAccount.
+ * Why a fetched Accounts body is not safe to store, or null. Mirrors exactly what storeChartOfAccounts reads: AccountID and Name
+ * (non-empty strings), Type (non-empty string), Status (one of Xero's three values - the upsert turns it into `active`, so an
+ * unknown or missing one must not be read as "inactive"), and Code / TaxType (a string when present). An empty list is refused
+ * because a real organisation always has accounts; duplicate ids are refused because the upserts would race each other.
+ */
+export function validateChartResponse(accounts: unknown): string | null {
+  if (!Array.isArray(accounts) || accounts.length === 0) return 'the list is empty'
+  const seen = new Set<string>()
+  for (const [index, raw] of accounts.entries()) {
+    const row = raw as Record<string, unknown> | null
+    if (!row || typeof row !== 'object') return `row ${index} is not an object`
+    for (const field of ['AccountID', 'Name', 'Type'] as const) {
+      if (typeof row[field] !== 'string' || (row[field] as string).trim() === '') return `row ${index} has no ${field}`
+    }
+    if (typeof row.Status !== 'string' || !XERO_ACCOUNT_STATUSES.has(row.Status)) return `row ${index} has an unknown Status`
+    for (const field of ['Code', 'TaxType'] as const) {
+      if (row[field] !== undefined && row[field] !== null && typeof row[field] !== 'string') return `row ${index} has a non-text ${field}`
+    }
+    if (seen.has(row.AccountID as string)) return `row ${index} repeats an AccountID`
+    seen.add(row.AccountID as string)
+  }
+  return null
+}
+
+/**
+ * Pull the chart of accounts from Xero and upsert into AccountingAccount.
+ *
+ * The SCHEDULED form (recordScheduledSuccess) is non-destructive and its stamp means "a scheduled read succeeded and every row
+ * validated". It does NOT mean the list was complete: the Accounts endpoint cannot prove that, so the scheduled path only inserts
+ * and updates, and an account removed in Xero stays until an operator's manual refresh deactivates it.
  */
 export async function syncChartOfAccounts(
   options: { recordScheduledSuccess?: boolean } = {},
@@ -90,11 +121,11 @@ export async function syncChartOfAccounts(
   const fetched = await fetchXeroChartOfAccounts()
   if (!fetched.ok) return { synced: 0, errors: [fetched.error] }
   const scheduled = options.recordScheduledSuccess === true
-  // A scheduled run never writes from a response that cannot be a real chart: an empty list, or a row without an id or a name.
-  // (A real organisation always has accounts; an empty body is a failed read, not an empty chart.) Nothing is stored and the
-  // stamp does not advance.
-  if (scheduled && (fetched.accounts.length === 0 || fetched.accounts.some((a) => !a || typeof a.AccountID !== 'string' || a.AccountID === '' || typeof a.Name !== 'string'))) {
-    return { synced: 0, errors: ['Xero returned an empty or malformed chart of accounts; nothing was stored and the last-success stamp was not advanced'] }
+  // A scheduled run never writes from a response that cannot be a real chart. EVERY field the upsert uses is checked for EVERY row
+  // before anything is written: one malformed row rejects the whole response (nothing stored, stamp not advanced, run fails).
+  if (scheduled) {
+    const problem = validateChartResponse(fetched.accounts)
+    if (problem) return { synced: 0, errors: [`Xero returned an unusable chart of accounts (${problem}); nothing was stored and the last-success stamp was not advanced`] }
   }
   let fenced
   try {

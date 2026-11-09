@@ -48,6 +48,16 @@ export const NOTIFIABLE_WARNING_CODES: readonly string[] = [
 
 export type NotifiableWarningCounts = Record<string, number>
 
+/** The findings a report appends when it stopped at its row cap: the list is then INCOMPLETE and says nothing about absence. */
+export const REPORT_TRUNCATION_CODES: readonly string[] = [
+  'invariant_report_truncated',
+  'refund_status_reconciliation_row_cap_reached',
+]
+
+export function reportsWereTruncated(findings: ReadonlyArray<{ code: string }>): boolean {
+  return findings.some((finding) => REPORT_TRUNCATION_CODES.includes(finding.code))
+}
+
 export function countNotifiableWarnings(
   findings: ReadonlyArray<{ severity: string; code: string }>,
 ): NotifiableWarningCounts {
@@ -70,20 +80,20 @@ export function notifiableWarningIncreases(
     .sort((a, b) => a.code.localeCompare(b.code))
 }
 
-type WarningBaseline = { counts: NotifiableWarningCounts; checkedAt: string }
+type WarningBaseline = { counts: NotifiableWarningCounts; checkedAt: string; truncated?: boolean }
 
 function parseWarningBaseline(raw: string | null | undefined): WarningBaseline | null {
   if (!raw) return null
   try {
     const parsed: unknown = JSON.parse(raw)
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
-    const { counts, checkedAt } = parsed as { counts?: unknown; checkedAt?: unknown }
+    const { counts, checkedAt, truncated } = parsed as { counts?: unknown; checkedAt?: unknown; truncated?: unknown }
     if (typeof checkedAt !== 'string' || !counts || typeof counts !== 'object' || Array.isArray(counts)) return null
     const clean: NotifiableWarningCounts = {}
     for (const [code, value] of Object.entries(counts)) {
       if (typeof value === 'number' && Number.isFinite(value) && value > 0) clean[code] = value
     }
-    return { counts: clean, checkedAt }
+    return { counts: clean, checkedAt, ...(truncated === true ? { truncated: true } : {}) }
   } catch {
     return null
   }
@@ -107,12 +117,41 @@ export type WarningBaselineTx = Pick<Prisma.TransactionClient, 'setting' | 'user
  */
 export async function commitWarningBaselineInTx(
   tx: WarningBaselineTx,
-  input: { counts: NotifiableWarningCounts; checkedAt: string; runId: string },
+  input: { counts: NotifiableWarningCounts; checkedAt: string; runId: string; truncated?: boolean },
 ): Promise<WarningBaselineOutcome> {
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(${INVARIANT_WARNING_BASELINE_LOCK_KEY})`
   const row = await tx.setting.findUnique({ where: { key: NOTIFIABLE_WARNING_COUNTS_SETTING }, select: { value: true } })
   const baseline = parseWarningBaseline(row?.value)
   if (baseline && baseline.checkedAt > input.checkedAt) return { applied: false, increases: [] }
+  // A report that stopped at its row cap lists only the first findings, so a count taken from it is a floor, not a count: a code
+  // missing from it is not "cleared" and a code in it is not "newly appeared". The counts are NOT moved. Admins are told ONCE
+  // that the named warnings were not evaluated (the flag below dedups it), and the next complete run compares against the
+  // counts kept here.
+  if (input.truncated === true) {
+    const kept = baseline?.counts ?? {}
+    const keptValue = JSON.stringify({ counts: kept, checkedAt: input.checkedAt, truncated: true } satisfies WarningBaseline)
+    await tx.setting.upsert({
+      where: { key: NOTIFIABLE_WARNING_COUNTS_SETTING },
+      create: { key: NOTIFIABLE_WARNING_COUNTS_SETTING, value: keptValue },
+      update: { value: keptValue },
+    })
+    if (baseline?.truncated !== true) {
+      const admins = await tx.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
+      const recipients: Array<string | null> = admins.length > 0 ? admins.map((admin) => admin.id) : [null]
+      for (const userId of recipients) {
+        await tx.notification.create({
+          data: {
+            userId,
+            type: 'warning',
+            title: 'Invariant report was truncated',
+            message: `Scheduled invariant check ${input.runId} stopped at its row cap, so the named warnings were not evaluated this run. Fix or accept the existing findings, or raise INVARIANT_CHECK_MAX_FINDINGS.`,
+            actionUrl: null,
+          },
+        })
+      }
+    }
+    return { applied: true, increases: [] }
+  }
   const increases = notifiableWarningIncreases(baseline?.counts ?? {}, input.counts)
   const value = JSON.stringify({ counts: input.counts, checkedAt: input.checkedAt } satisfies WarningBaseline)
   await tx.setting.upsert({
@@ -136,7 +175,7 @@ export async function commitWarningBaselineInTx(
   return { applied: true, increases }
 }
 
-async function commitWarningBaseline(input: { counts: NotifiableWarningCounts; checkedAt: string; runId: string }): Promise<WarningBaselineOutcome> {
+async function commitWarningBaseline(input: { counts: NotifiableWarningCounts; checkedAt: string; runId: string; truncated?: boolean }): Promise<WarningBaselineOutcome> {
   return db.$transaction((tx) => commitWarningBaselineInTx(tx, input))
 }
 
@@ -473,10 +512,12 @@ export async function runScheduledInvariantCheck(
   // A report that failed to run says nothing about its findings, so the baseline is only moved when all three ran:
   // otherwise a failed domain would read as "cleared" and its next successful run as "newly appeared".
   if (errors.length === 0 && inventory && accounting && sales) {
+    const allFindings = [...inventory.findings, ...accounting.findings, ...sales.findings]
     await advanceWarningBaseline({
-      counts: countNotifiableWarnings([...inventory.findings, ...accounting.findings, ...sales.findings]),
+      counts: countNotifiableWarnings(allFindings),
       checkedAt,
       runId,
+      truncated: reportsWereTruncated(allFindings),
     })
   }
 

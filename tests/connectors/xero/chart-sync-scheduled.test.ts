@@ -58,6 +58,36 @@ test('scheduled: a row without an id is a failed run - nothing written, no stamp
   assert.deepEqual({ upserts, deactivations, stamps }, { upserts: [], deactivations: 0, stamps: [] })
 })
 
+test('scheduled: ONE malformed row (every field the upsert reads is checked) rejects the whole response', async () => {
+  const { syncChartOfAccounts } = await import('../../../lib/connectors/xero/accounts.ts')
+  const good = chart(['a1', 'a2']).Accounts
+  const bad: Array<[string, Record<string, unknown>]> = [
+    ['unknown Status', { ...good[1], Status: 'PAUSED' }],
+    ['missing Status', { ...good[1], Status: undefined }],
+    ['missing Type', { ...good[1], Type: undefined }],
+    ['blank Name', { ...good[1], Name: '  ' }],
+    ['numeric Code', { ...good[1], Code: 200 }],
+    ['non-text TaxType', { ...good[1], TaxType: 5 }],
+    ['repeated AccountID', { ...good[0] }],
+  ]
+  for (const [label, row] of bad) {
+    accountsBody = { Accounts: [good[0], row] }
+    const result = await syncChartOfAccounts({ recordScheduledSuccess: true })
+    assert.equal(result.errors.length, 1, label)
+    assert.deepEqual({ upserts, deactivations, stamps }, { upserts: [], deactivations: 0, stamps: [] }, `${label}: nothing written`)
+  }
+})
+
+test('scheduled: a valid but partial chart is stored and stamped as "read and validated" - the stamp does not claim completeness', async () => {
+  const { syncChartOfAccounts } = await import('../../../lib/connectors/xero/accounts.ts')
+  const { getReadSyncStream } = await import('../../../lib/ops/read-sync-liveness-constants.ts')
+  accountsBody = chart(['a1'])
+  const result = await syncChartOfAccounts({ recordScheduledSuccess: true })
+  assert.deepEqual(result, { synced: 1, errors: [] })
+  assert.equal(deactivations, 0)
+  assert.match(getReadSyncStream('xero-chart-of-accounts').successMeans, /does not prove the list was complete/)
+})
+
 test('scheduled: inserts and updates, stamps, and never deactivates', async () => {
   const { syncChartOfAccounts } = await import('../../../lib/connectors/xero/accounts.ts')
   accountsBody = chart(['a1', 'a2'])
