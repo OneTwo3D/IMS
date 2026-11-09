@@ -8,7 +8,11 @@ registerCronJobs([
     moduleLabel: 'WooCommerce',
     label: 'WooCommerce Reconcile',
     description: 'Runs WooCommerce backup reconciliation for orders/products and drains queued stock retries after webhook-first sync.',
-    defaultSchedule: '0 4 * * *',
+    // Hourly, not daily: the forceAll stock catch-up works through the catalogue in windows within a per-request time budget and
+    // carries on from a saved cursor on the next run, so a daily job would need several days to finish a large catalogue. The job
+    // does nothing for stock when no pass is due or unfinished, and the webhook-primary order/product reconciles keep their own
+    // 24 hour gate.
+    defaultSchedule: '0 * * * *',
     defaultEnabled: true,
     legacyEnabledKey: 'cron_wc_sync_enabled',
   },

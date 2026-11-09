@@ -320,6 +320,12 @@ type PushStockOptions = {
   productIds?: string[]
   forceProductIds?: string[]
   forceAll?: boolean
+  /**
+   * Handle only one window of the candidate catalogue: the next `limit` candidates (in id order) after `afterId`. Used by the
+   * daily forceAll reconcile so one cron request reads WooCommerce for a bounded slice instead of the whole catalogue. Ignored
+   * unless `forceAll` is set and the push is unscoped. The result's `chunk.nextCursor` says where the next window starts.
+   */
+  chunk?: { afterId: string | null; limit: number }
   source?: string
   /** Called before the first batch (with the total) and after every batch. */
   onProgress?: (snapshot: StockPushProgressSnapshot) => void | Promise<void>
@@ -498,6 +504,21 @@ function heldStockResult(message: string): StockSyncResult {
   return { ...gateRefusalResult(message), held: true }
 }
 
+/**
+ * The window of an id-ordered candidate list a chunked push handles: the next `limit` ids after `afterId`, and the id to resume
+ * after (null when this window reaches the end).
+ */
+export function selectChunkWindow<T extends { id: string }>(
+  orderedCandidates: readonly T[],
+  chunk: { afterId: string | null; limit: number },
+): { window: T[]; nextCursor: string | null } {
+  const after = chunk.afterId
+  const remaining = after == null ? orderedCandidates : orderedCandidates.filter((p) => p.id > after)
+  const window = remaining.slice(0, Math.max(1, chunk.limit))
+  const nextCursor = remaining.length > window.length ? (window[window.length - 1]?.id ?? null) : null
+  return { window, nextCursor }
+}
+
 export async function pushStockToWc(options?: PushStockOptions): Promise<StockSyncResult> {
   const enabled = await db.setting.findUnique({ where: { key: 'wc_stock_sync_enabled' } })
   if (enabled?.value !== 'true') {
@@ -664,6 +685,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
             ],
           }),
     },
+    orderBy: { id: 'asc' },
     select: {
       id: true,
       sku: true,
@@ -680,9 +702,23 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       },
     },
   })
-  const products = rawProducts.filter(
-    (p): p is CandidateProduct => p.type !== 'VARIABLE' && p.type !== 'NON_INVENTORY',
-  )
+  const allCandidates = rawProducts
+    .filter((p): p is CandidateProduct => p.type !== 'VARIABLE' && p.type !== 'NON_INVENTORY')
+    // One order for the cursor, whatever collation the database sorts ids with.
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+  // The window this run pushes. The availability graph below still sees every candidate (a kit's component may sit in another
+  // window), only the read-and-push work is bounded.
+  const chunkWindow = options?.chunk && forceAll && !scopedProductIds ? options.chunk : null
+  const chunkSlice = chunkWindow ? selectChunkWindow(allCandidates, chunkWindow) : null
+  const chunkNextCursor = chunkSlice?.nextCursor ?? null
+  const products = chunkSlice ? chunkSlice.window : allCandidates
+  // A chunked window is handled only if every candidate in it reached a completed outcome. Every way a candidate can fall out
+  // (failed SKU lookup, preflight page, mapping that could not be saved or cleared, duplicate external id, kit availability
+  // error, failed or rejected push entry, credentials rebound) appends to `result.errors`, so any error withholds `chunk` and
+  // the caller retries the window instead of moving past it. A product with no WooCommerce match is not an error.
+  const windowHandled = (): boolean => result.errors.length === 0
+  const chunkOutcome = (): StockSyncResult['chunk'] =>
+    chunkWindow ? { nextCursor: chunkNextCursor, totalCandidates: allCandidates.length } : undefined
 
   // yi4m: a KIT candidate's component may ITSELF be a KIT (nested). computeKitAvailability
   // recurses only when that nested KIT is present in productById; a scoped sync that
@@ -775,7 +811,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // yi4m: include nested KITs so computeKitAvailability can recurse into them; they are
   // lookup-only here (not in `products`, so not pushed).
   const productById = new Map(
-    [...products, ...nestedKitById.values()].map((product) => [product.id, product]),
+    [...allCandidates, ...nestedKitById.values()].map((product) => [product.id, product]),
   )
   const availableByProduct = computeAvailableByProduct(
     products,
@@ -799,6 +835,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
 
   if (products.length === 0) {
     result.message = 'No stocked products with SKUs to sync'
+    result.chunk = chunkOutcome()
     await recordAttempt()
     return result
   }
@@ -1187,6 +1224,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       ? 'errors during preflight/resolution'
       : 'no changed WooCommerce-matched products'
     result.message = `0 synced — ${reason}`
+    if (windowHandled()) result.chunk = chunkOutcome()
     await recordAttempt()
     await logActivity({
       entityType: 'SYNC', action: 'stock_sync', tag: 'sync', level: 'WARNING',
@@ -1338,6 +1376,8 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   result.message = result.unmatched > 0
     ? `${result.synced} synced, ${result.unmatched} unmatched in WooCommerce`
     : `${result.synced} synced`
+  // A window cut short by a credentials rebind is not handled: the caller must retry it, not move on.
+  if (windowHandled()) result.chunk = chunkOutcome()
 
   return result
 }

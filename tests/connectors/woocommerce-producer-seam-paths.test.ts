@@ -275,7 +275,7 @@ test('STOCK, every trigger below the import: enqueueStockSync queues nothing and
   })
 })
 
-test('STOCK, the daily reconcile: a push the hold shadowed does NOT stamp last_wc_stock_daily_reconcile_at; a push that ran does', async () => {
+test('STOCK, the daily reconcile: a push the hold shadowed does NOT stamp last_wc_stock_daily_reconcile_at, and neither does a push the gates refused', async () => {
   mock.module('@/lib/connectors/woocommerce/sync/order-import', {
     namedExports: {
       isWcOrderWebhookPrimaryActive: async () => true,
@@ -285,13 +285,17 @@ test('STOCK, the daily reconcile: a push the hold shadowed does NOT stamp last_w
   })
   const { runWcReconcile } = await import('@/lib/connectors/woocommerce/sync/reconcile')
   const stamped = () => calls.filter((c) => c === 'setting.upsert').length
-  // CONTROL: switch off. The push runs (it ends at the credentials gate with the fake database) and the stamp is written.
+  // CONTROL: switch off. The push runs (it ends at the credentials gate with the fake database): a refusal before any window was
+  // handled, which is reported and NOT stamped, so restored configuration is not suppressed for 24 hours.
   reset()
   settings.set('last_wc_order_reconcile_at', new Date().toISOString())
   await withEnv({}, async () => {
     const results = await runWcReconcile()
     console.log(`# reconcile control: ${JSON.stringify(results.stock)}`)
-    assert.equal(stamped(), 1, 'CONTROL: the reconcile stamps when the push ran')
+    const control = results.stock as { reason?: string; sync?: { shadowed?: boolean; aborted?: boolean } }
+    assert.equal(control.reason, 'reconciliation_refused', 'CONTROL: the push ran and was refused at the gate, not shadowed')
+    assert.equal(control.sync?.shadowed, undefined)
+    assert.equal(stamped(), 0, 'CONTROL: a refusal before the first window is not stamped')
   })
   reset()
   settings.set('last_wc_order_reconcile_at', new Date().toISOString())

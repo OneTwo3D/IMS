@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
-import { csvResponse, toCsv } from '@/lib/csv'
+import { csvResponseWithNotices, toCsv, wantsCsvMetadataRows } from '@/lib/csv'
 import {
   getProductionVarianceReport,
   getWipReport,
@@ -47,6 +47,8 @@ export async function GET(req: NextRequest) {
   const filters = filtersFromRequest(req)
   const reportType = req.nextUrl.searchParams.get('report') ?? 'production-variance'
   const date = new Date().toISOString().slice(0, 10)
+  // Data rows only; the report's notices ride in a response header, and follow the data as `#` rows only with ?metadata=1 or ?notices=1.
+  const includeInBody = wantsCsvMetadataRows(req) || req.nextUrl.searchParams.get('notices') === '1'
 
   try {
     switch (reportType) {
@@ -54,13 +56,13 @@ export async function GET(req: NextRequest) {
         const report = await getProductionVarianceReport(filters, { paginate: false })
         const oversized = rejectOversizedExport(report.pageInfo.totalRows)
         if (oversized) return oversized
-        return csvResponse(toCsv(report.rows, ['productionOrderReference', 'status', 'warehouseCode', 'outputSku', 'outputProductName', 'componentSku', 'componentName', 'plannedQty', 'actualQty', 'varianceQty', 'variancePct', 'overConsumedQty', 'overConsumedValueBase', 'orderYieldPct', 'outcome']), `production-variance-${date}.csv`)
+        return csvResponseWithNotices(toCsv(report.rows, ['productionOrderReference', 'status', 'warehouseCode', 'outputSku', 'outputProductName', 'componentSku', 'componentName', 'plannedQty', 'actualQty', 'varianceQty', 'variancePct', 'overConsumedQty', 'overConsumedValueBase', 'orderYieldPct', 'outcome']), `production-variance-${date}.csv`, report.notices, { includeInBody })
       }
       case 'wip': {
         const report = await getWipReport(filters, { paginate: false })
         const oversized = rejectOversizedExport(report.pageInfo.totalRows)
         if (oversized) return oversized
-        return csvResponse(toCsv(report.rows, ['productionOrderReference', 'status', 'warehouseCode', 'outputSku', 'outputProductName', 'startedAt', 'scheduledAt', 'daysSinceStart', 'plannedOutputQty', 'producedQty', 'remainingOutputQty', 'manufacturingCostBase', 'consumedComponentValueBase', 'reservedComponentValueBase', 'expectedOutputValueBase', 'wipValueBase', 'costLineCount']), `wip-${date}.csv`)
+        return csvResponseWithNotices(toCsv(report.rows, ['productionOrderReference', 'status', 'warehouseCode', 'outputSku', 'outputProductName', 'startedAt', 'scheduledAt', 'daysSinceStart', 'plannedOutputQty', 'producedQty', 'remainingOutputQty', 'manufacturingCostBase', 'consumedComponentValueBase', 'reservedComponentValueBase', 'expectedOutputValueBase', 'wipValueBase', 'costLineCount']), `wip-${date}.csv`, report.notices, { includeInBody })
       }
       default:
         return NextResponse.json({ error: 'Unknown manufacturing analytics export type' }, { status: 400 })

@@ -1,6 +1,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import { voidMirroredAccountingEventsForOrder } from './accounting-event-mirror'
+import { ATTEMPT_PROVEN_NEVER_MADE_WHERE } from './money-attempt-provenance'
 import { UNCLAIMED_ATTEMPT_REVISION, nextAttemptRevision, type AttemptRef } from './sync-log-attempt'
 
 /** SALES_INVOICE sync types that recognise revenue for a sales order. */
@@ -222,7 +223,8 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
   // so nothing can move them before the bump lands. The bump is scoped to those ids and to the ones
   // that carry a fence, which is read from the returned rows rather than from a prior read.
   // o3d-f709 / o3d-kj718 - THE PRE-CALL PROOF, WRITTEN BY THE WRITER THAT KNOWS IT. A PENDING row at
-  // attemptRevision 0 with no document id has never been claimed (a claim mints revision >= 1), so
+  // attemptRevision 0 with no document id, carrying the canonical never-attempted record
+  // (ATTEMPT_PROVEN_NEVER_MADE_WHERE), has never been claimed (a claim mints revision >= 1), so
   // cancelling it IS the whole event: nothing was ever sent. It is stamped `abandonedBeforeRemoteCall`
   // in the same UPDATE, exactly as the orphan sweep and the BILL_PAYMENT supersession stamp theirs, so
   // `ledgerStanding` reads it PROVEN_NOT_POSTED and a same-key re-enqueue is free to proceed. It is a
@@ -238,6 +240,9 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
       externalTransactionId: null,
       status: 'PENDING',
       attemptRevision: UNCLAIMED_ATTEMPT_REVISION,
+      // Revision 0 alone is not proof (legacy rows, revivals): the canonical never-attempted record as well. A row without it
+      // falls through to the general statement below and is retired unstamped, i.e. UNKNOWN to `ledgerStanding`.
+      ...ATTEMPT_PROVEN_NEVER_MADE_WHERE,
     },
     data: { ...retirement, abandonedBeforeRemoteCall: true },
   })

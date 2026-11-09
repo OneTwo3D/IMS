@@ -8,7 +8,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { cn } from '@/lib/utils'
 import { ReportPageTitle } from './report-page-title'
-import { appendParams, currentParams, toneClass, type SummaryTone } from './report-utils'
+import { appendParams, currentParams, toneClass, type SummaryTone, reportCsvHref } from './report-utils'
 
 export type ManufacturingAnalyticsReportKey = 'production-variance' | 'wip'
 
@@ -54,7 +54,7 @@ export function ManufacturingAnalyticsReportPage<Row>({
   showDateFilters = true,
 }: ManufacturingAnalyticsReportPageProps<Row>) {
   const params = currentParams(filters)
-  const csvHref = `/api/export/manufacturing-analytics?${appendParams(params, { report: reportKey })}`
+  const csvHref = reportCsvHref('/api/export/manufacturing-analytics', params, { report: reportKey })
   const previousHref = `?${appendParams(params, { page: pageInfo.page - 1 })}`
   const nextHref = `?${appendParams(params, { page: pageInfo.page + 1 })}`
 

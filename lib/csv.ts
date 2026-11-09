@@ -24,6 +24,13 @@ export const CSV_EXPORT_METADATA_ENCODING_HEADER = 'X-IMS-Export-Metadata-Encodi
 export const CSV_EXPORT_METADATA_TRUNCATED_HEADER = 'X-IMS-Export-Metadata-Truncated'
 export const CSV_EXPORT_METADATA_ENCODING = 'base64url-json'
 export const CSV_EXPORT_METADATA_MAX_JSON_BYTES = 4096
+/**
+ * Report notices (what the report left out or could not plan) for an export whose body stays clean data rows. Carried as a
+ * base64url JSON array of strings in this header; the same notices are appended to the body as `#` rows only when the caller
+ * opts in (`includeInBody`).
+ */
+export const CSV_EXPORT_NOTICES_HEADER = 'X-IMS-Export-Notices'
+export const CSV_EXPORT_NOTICES_TRUNCATED_HEADER = 'X-IMS-Export-Notices-Truncated'
 
 type CsvExportMetadata = Record<string, unknown>
 export type CsvResponseOptions = {
@@ -214,6 +221,38 @@ export function csvResponse(csv: string, filename: string, metadata?: CsvExportM
   return new Response(`${csv}${metadataCommentRows(metadata, options)}`, {
     headers: csvHeaders(filename, metadata),
   })
+}
+
+function noticeCommentRows(notices: string[]): string {
+  if (notices.length === 0) return ''
+  const rows = ['# IMS export notices', ...notices.map((notice) => csvLine({ key: '# notice', value: notice }, ['key', 'value']))]
+  return `\r\n${rows.join('\r\n')}`
+}
+
+/**
+ * A CSV download for a report that has notices. The body is the data rows only, unless `includeInBody` is set, in which
+ * every notice follows the data as a `# notice` row, uncapped. The notices always travel in the {@link CSV_EXPORT_NOTICES_HEADER}
+ * response header, dropping trailing ones (and flagging {@link CSV_EXPORT_NOTICES_TRUNCATED_HEADER}) to stay inside the header cap.
+ */
+export function csvResponseWithNotices(csv: string, filename: string, notices: string[], options: { includeInBody?: boolean } = {}): Response {
+  // The body rows come from the COMPLETE list: only the header payload below is capped.
+  const response = csvResponse(csv, filename)
+  const body = options.includeInBody ? noticeCommentRows(notices) : ''
+  const out = body ? new Response(`${csv}${body}`, { headers: response.headers }) : response
+  if (notices.length === 0) return out
+  let kept = notices
+  while (kept.length > 1 && Buffer.byteLength(JSON.stringify(kept), 'utf8') > CSV_EXPORT_METADATA_MAX_JSON_BYTES) {
+    kept = kept.slice(0, -1)
+  }
+  let truncated = kept.length < notices.length
+  if (Buffer.byteLength(JSON.stringify(kept), 'utf8') > CSV_EXPORT_METADATA_MAX_JSON_BYTES) {
+    kept = [kept[0].slice(0, 1000)]
+    truncated = true
+  }
+  out.headers.set(CSV_EXPORT_NOTICES_HEADER, Buffer.from(JSON.stringify(kept), 'utf8').toString('base64url'))
+  out.headers.set('Access-Control-Expose-Headers', [out.headers.get('Access-Control-Expose-Headers'), CSV_EXPORT_NOTICES_HEADER, CSV_EXPORT_NOTICES_TRUNCATED_HEADER].filter(Boolean).join(', '))
+  if (truncated) out.headers.set(CSV_EXPORT_NOTICES_TRUNCATED_HEADER, 'true')
+  return out
 }
 
 /**

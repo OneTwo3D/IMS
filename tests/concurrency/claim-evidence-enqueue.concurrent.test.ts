@@ -161,7 +161,8 @@ test('[o3d-f709 round 2 HIGH 1] the orphan sweep stamps ONLY a never-claimed PEN
     const mk = (suffix: string, extra: Record<string, unknown>) => d.db.accountingSyncLog.create({
       data: { ...base, referenceId, payload: { _idempotencyKey: `${referenceId}:${suffix}` }, ...extra }, select: { id: true },
     })
-    const never = await mk('never', {})
+    const never = await mk('never', { attemptStampingCustodyAt: new Date() }) // revision 0 AND the canonical never-attempted record
+    const legacy = await mk('legacy', {}) // revision 0 but nothing vouches for the silence (a legacy row): not proof
     const claimedBack = await mk('claimed', { attemptRevision: 3 }) // claimed, remote call failed, returned to PENDING
     const posted = await mk('posted', { externalTransactionId: 'XJ-1' }) // posted, follow-up failed, back to PENDING
 
@@ -172,10 +173,11 @@ test('[o3d-f709 round 2 HIGH 1] the orphan sweep stamps ONLY a never-claimed PEN
       })
       return { status: row.status, standing: d.standing.ledgerStanding(row) }
     }
-    const got = { never: await standing(never.id), claimedBack: await standing(claimedBack.id), posted: await standing(posted.id) }
+    const got = { never: await standing(never.id), legacy: await standing(legacy.id), claimedBack: await standing(claimedBack.id), posted: await standing(posted.id) }
     console.log(`# precondition round2-HIGH1: cancelled=${cancelled} ${JSON.stringify(got)}`)
-    assert.equal(cancelled, 3, 'all three orphans are retired')
+    assert.equal(cancelled, 4, 'all four orphans are retired')
     assert.deepEqual(got.never, { status: 'CANCELLED', standing: 'PROVEN_NOT_POSTED' })
+    assert.deepEqual(got.legacy, { status: 'CANCELLED', standing: 'UNKNOWN' }, 'revision 0 alone is not proof: retired unstamped')
     assert.deepEqual(got.claimedBack, { status: 'CANCELLED', standing: 'UNKNOWN' }, 'a claimed attempt may have posted: NOT proven')
     assert.deepEqual(got.posted, { status: 'CANCELLED', standing: 'CONFIRMED_POSTED' }, 'it names the ledger document')
   })

@@ -267,6 +267,11 @@ export type StockSyncResult = SyncResult & {
    */
   shadowed?: boolean
   /**
+   * Set only on a run given a `chunk` window in which EVERY candidate reached a completed outcome (not on a refusal, an outage,
+   * a mid-run abort, or any failed SKU lookup, preflight page, cleared stale mapping or failed push entry): the window was handled, and `nextCursor` is the id to resume after, or null when the window was the last one.
+   */
+  chunk?: { nextCursor: string | null; totalCandidates: number }
+  /**
    * The outbound-write hold (no grant, or a grant for another store) refuses WooCommerce writes from this process, so the push
    * stopped before it read anything. Always accompanies `aborted`. Nothing was sent. NOT a reconciliation: callers must not stamp it.
    */

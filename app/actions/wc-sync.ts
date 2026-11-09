@@ -84,7 +84,7 @@ export type WcSyncSettings = {
  * It was typed, defaulted to '5', saved by `saveWcSyncSettings` and rendered as an editable
  * "Polling interval (minutes)" input — while the cadence that actually decides when
  * WooCommerce is polled is the `wc-reconcile` cron schedule (lib/cron-jobs/woocommerce.ts,
- * `0 4 * * *` by default), stored as `cron_wc_reconcile_schedule` and edited in
+ * `0 * * * *` by default), stored as `cron_wc_reconcile_schedule` and edited in
  * Settings -> System -> Scheduler. An operator who set five minutes after a webhook outage
  * got a daily 04:00 sweep and was told nothing.
  *
