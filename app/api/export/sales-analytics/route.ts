@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
-import { csvResponse, toCsv } from '@/lib/csv'
+import { csvResponseFor, toCsv } from '@/lib/csv'
 import {
   getCustomerAnalyticsReport,
   getFulfillmentAnalyticsReport,
@@ -29,8 +29,8 @@ export type SalesAnalyticsExportType = 'sales' | 'customers' | 'margin' | 'retur
  * o3d-iigc round 5. A FILE READER HAS NO TOOLTIP — the rule round 3 set when it renamed a column
  * rather than relying on a header hint. Three of these six CSVs carry revenue/profit/margin
  * figures that never see a refund, and one carries credit values whose basis varies row by row.
- * `csvResponse` turns this metadata into `#` comment rows at the foot of the file (skipped by
- * parseCsv, so re-import is unaffected) plus the X-IMS-Export-Metadata header, which is this
+ * `csvResponseFor` sends this metadata in the X-IMS-Export-Metadata header and, when the request
+ * carries `?metadata=1`, as `#` comment rows at the foot of the file (skipped by parseCsv), which is this
  * repo's existing channel for saying something about a file inside the file.
  */
 type SalesAnalyticsExportSpec = {
@@ -115,9 +115,11 @@ export function salesAnalyticsCsvResponse(
   report: { rows: Record<string, unknown>[]; totals: Record<string, string> },
   filters: SalesAnalyticsFilters,
   date: string,
+  req: { url: string },
 ): Response {
   const spec = SALES_ANALYTICS_EXPORTS[reportType]
-  return csvResponse(
+  return csvResponseFor(
+    req,
     toCsv(report.rows, spec.columns),
     `${spec.filename}-${date}.csv`,
     exportMetadata(spec, filters, report.totals),
@@ -179,35 +181,35 @@ export async function GET(req: NextRequest) {
       const report = await getSalesAnalyticsReport(wideFilters, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return salesAnalyticsCsvResponse('sales', report, filters, date)
+      return salesAnalyticsCsvResponse('sales', report, filters, date, req)
     }
     case 'customers': {
       const report = await getCustomerAnalyticsReport(wideFilters, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return salesAnalyticsCsvResponse('customers', report, filters, date)
+      return salesAnalyticsCsvResponse('customers', report, filters, date, req)
     }
     case 'margin': {
       const report = await getMarginAnalyticsReport(wideFilters, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return salesAnalyticsCsvResponse('margin', report, filters, date)
+      return salesAnalyticsCsvResponse('margin', report, filters, date, req)
     }
     case 'returns': {
       const report = await getReturnsAnalyticsReport(wideFilters, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return salesAnalyticsCsvResponse('returns', report, filters, date)
+      return salesAnalyticsCsvResponse('returns', report, filters, date, req)
     }
     case 'fulfillment': {
       const report = await getFulfillmentAnalyticsReport(filters)
-      return salesAnalyticsCsvResponse('fulfillment', report, filters, date)
+      return salesAnalyticsCsvResponse('fulfillment', report, filters, date, req)
     }
     case 'throughput': {
       const report = await getThroughputAnalyticsReport(wideFilters, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return salesAnalyticsCsvResponse('throughput', report, filters, date)
+      return salesAnalyticsCsvResponse('throughput', report, filters, date, req)
     }
     default:
       return NextResponse.json({ error: 'Unknown sales analytics export type' }, { status: 400 })

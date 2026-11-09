@@ -218,14 +218,12 @@ async function clearProductScope() {
   await db.productComponent.deleteMany({})
   await db.productOption.deleteMany({})
   await db.bomItem.deleteMany({})
-  await db.kitItem.deleteMany({})
 
   // Delete variants first, then parents
   await db.product.deleteMany({ where: { type: 'VARIANT' } })
   await db.product.deleteMany({})
 
   await db.bom.deleteMany({})
-  await db.kit.deleteMany({})
 
   // Preserve user accounts by detaching any supplier-portal users before
   // deleting supplier records.

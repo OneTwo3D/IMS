@@ -851,7 +851,7 @@ When it finds one it:
 2. installs and **verifies** the reboot-fence drop-in, before anything is stopped;
 3. stops the service **and every legacy launcher**, waits for the port to go free, **then** fences
    the crontab, revokes `CONNECT` for the window and proves nothing else is connected;
-4. migrates, checks for drift, and runs the migrations' own `verify.sql` checks;
+4. migrates, checks for drift, and runs the migrations' own `verify.sql` checks (a migration whose checks all return zero is recorded in `migration_verification_passes`; a later failing run removes the record, and the retention sweep stops keeping the sync-log rows a refund-park recovery names once the record for `20260822120000_shopping_sync_log_record_kind` exists);
 5. seeds, bootstraps and builds — all through the connection that survives the fence;
 6. releases the connection fence, lifts the reboot fence, starts the service, **proves the process
    on the port is this build and belongs to this unit**, and only then restores the crontab, before

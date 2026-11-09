@@ -80,6 +80,54 @@ export const VERIFY_FILENAME = 'verify.sql'
 export const REQUIRED_FILENAME = 'verification-required.txt'
 
 /**
+ * Pure: which migrations' checks all passed, and which have a failing or erroring check.
+ *
+ * A migration is PASSED only when it ran at least one check, every check returned zero and none of
+ * its statements errored. A migration that ran nothing is neither passed nor failed: absence of
+ * evidence is not a pass.
+ *
+ * @param {Array<{migration: string, passed: boolean}>} checks
+ * @param {string[]} errorMigrations migrations with a contract error or a statement that failed to run
+ * @returns {{ passed: Array<{migration: string, checks: number}>, failed: string[] }}
+ */
+export function classifyMigrationOutcomes(checks, errorMigrations = []) {
+  const byMigration = new Map()
+  for (const check of checks) {
+    const entry = byMigration.get(check.migration) ?? { total: 0, failing: 0 }
+    entry.total += 1
+    if (!check.passed) entry.failing += 1
+    byMigration.set(check.migration, entry)
+  }
+  const errored = new Set(errorMigrations)
+  const passed = []
+  const failed = new Set(errored)
+  for (const [migration, entry] of byMigration) {
+    if (entry.failing > 0) failed.add(migration)
+    else if (!errored.has(migration)) passed.push({ migration, checks: entry.total })
+  }
+  return { passed: passed.sort((a, b) => a.migration.localeCompare(b.migration)), failed: [...failed].sort() }
+}
+
+/**
+ * Record the outcome durably in `migration_verification_passes`, so a reader that should behave
+ * differently once a cutover check has passed (today: the data-retention sweep) has a fact to read.
+ * First pass wins (the original instant is kept); a failing run removes the record, so whatever the
+ * pass lifted comes back with the incident. Written after the checks, never before, and only for
+ * migrations that actually ran.
+ */
+export async function recordVerificationOutcomes(client, outcomes) {
+  for (const { migration, checks } of outcomes.passed) {
+    await client.query(
+      `INSERT INTO migration_verification_passes (migration_name, checks_passed) VALUES ($1, $2) ON CONFLICT (migration_name) DO NOTHING`,
+      [migration, checks],
+    )
+  }
+  for (const migration of outcomes.failed) {
+    await client.query(`DELETE FROM migration_verification_passes WHERE migration_name = $1`, [migration])
+  }
+}
+
+/**
  * Pure: given the migration directory names present on disk and the set recorded as
  * applied, decide which verification files should run.
  *
@@ -326,6 +374,7 @@ async function main() {
       allErrors.push(`${name} declares ${VERIFY_FILENAME} but is not recorded as applied — the migration step did not do what this run assumed.`)
     }
 
+    const errorMigrations = []
     for (const name of runnable) {
       const sql = readFileSync(join(migrationsDir, name, VERIFY_FILENAME), 'utf8')
       let results
@@ -333,11 +382,21 @@ async function main() {
         results = await client.query(sql)
       } catch (error) {
         allErrors.push(`${name}/${VERIFY_FILENAME} failed to execute: ${error instanceof Error ? error.message : String(error)}`)
+        errorMigrations.push(name)
         continue
       }
       const evaluated = evaluateFileResults(name, results)
       allChecks.push(...evaluated.checks)
       allErrors.push(...evaluated.errors)
+      if (evaluated.errors.length > 0) errorMigrations.push(name)
+    }
+
+    // A failure to RECORD is reported and fatal: the record is what lets a retention exemption lift, and
+    // silently not writing it would leave that exemption in force with nothing saying so.
+    try {
+      await recordVerificationOutcomes(client, classifyMigrationOutcomes(allChecks, errorMigrations))
+    } catch (error) {
+      allErrors.push(`could not record the verification outcome in migration_verification_passes: ${error instanceof Error ? error.message : String(error)}`)
     }
   } finally {
     await client.end()

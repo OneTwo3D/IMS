@@ -11,9 +11,14 @@ const NUMERIC_LITERAL = /^-?\d+(?:\.\d+)?$/
 
 /**
  * Base64url-encoded JSON object with report-level metadata for API consumers.
- * The CSV body also includes `#` comment rows with the same metadata for
- * operator downloads. Header payloads are capped to avoid proxy/header limits.
+ * The CSV body is data rows only by default: standard CSV parsers have no comment
+ * syntax and would read trailing `#` rows as records. A caller that asks for
+ * `?metadata=1` additionally gets the same metadata as trailing `#` comment rows
+ * (see `CSV_METADATA_ROWS_QUERY_PARAM`). Header payloads are capped to avoid
+ * proxy/header limits.
  */
+export const CSV_METADATA_ROWS_QUERY_PARAM = 'metadata'
+
 export const CSV_EXPORT_METADATA_HEADER = 'X-IMS-Export-Metadata'
 export const CSV_EXPORT_METADATA_ENCODING_HEADER = 'X-IMS-Export-Metadata-Encoding'
 export const CSV_EXPORT_METADATA_TRUNCATED_HEADER = 'X-IMS-Export-Metadata-Truncated'
@@ -21,6 +26,10 @@ export const CSV_EXPORT_METADATA_ENCODING = 'base64url-json'
 export const CSV_EXPORT_METADATA_MAX_JSON_BYTES = 4096
 
 type CsvExportMetadata = Record<string, unknown>
+export type CsvResponseOptions = {
+  /** Append the metadata as trailing `#` comment rows. Off unless the request opted in. */
+  includeMetadataRows?: boolean
+}
 type CsvHeaderMetadata = CsvExportMetadata & {
   metadataTruncated?: true
   originalByteLength?: number
@@ -85,7 +94,13 @@ function encodeMetadataHeader(metadata: CsvHeaderMetadata): string {
   return Buffer.from(JSON.stringify(metadata), 'utf8').toString('base64url')
 }
 
-function metadataCommentRows(metadata?: CsvExportMetadata): string {
+/** True when the request explicitly opted in to metadata comment rows in the CSV body (`?metadata=1`). */
+export function wantsCsvMetadataRows(request: { url: string }): boolean {
+  return new URL(request.url).searchParams.get(CSV_METADATA_ROWS_QUERY_PARAM) === '1'
+}
+
+function metadataCommentRows(metadata?: CsvExportMetadata, options?: CsvResponseOptions): string {
+  if (!options?.includeMetadataRows) return ''
   if (!metadata || Object.keys(metadata).length === 0) return ''
   const rows = ['# IMS export metadata']
   for (const [key, value] of Object.entries(headerMetadata(metadata))) {
@@ -195,8 +210,8 @@ function csvHeaders(filename: string, metadata?: CsvExportMetadata): Record<stri
 }
 
 /** Build a Response that triggers a file download */
-export function csvResponse(csv: string, filename: string, metadata?: CsvExportMetadata): Response {
-  return new Response(`${csv}${metadataCommentRows(metadata)}`, {
+export function csvResponse(csv: string, filename: string, metadata?: CsvExportMetadata, options?: CsvResponseOptions): Response {
+  return new Response(`${csv}${metadataCommentRows(metadata, options)}`, {
     headers: csvHeaders(filename, metadata),
   })
 }
@@ -205,7 +220,7 @@ export function csvResponse(csv: string, filename: string, metadata?: CsvExportM
  * Build a streamed CSV download response from already-materialized rows.
  * This chunks the wire response but does not make the caller's memory profile O(1).
  */
-export function csvBufferedStreamResponse(rows: Iterable<Record<string, unknown>>, headers: string[], filename: string, metadata?: CsvExportMetadata): Response {
+export function csvBufferedStreamResponse(rows: Iterable<Record<string, unknown>>, headers: string[], filename: string, metadata?: CsvExportMetadata, options?: CsvResponseOptions): Response {
   const encoder = new TextEncoder()
   const iterator = rows[Symbol.iterator]()
   let headerSent = false
@@ -221,7 +236,7 @@ export function csvBufferedStreamResponse(rows: Iterable<Record<string, unknown>
       while (pushed < 100) {
         const next = iterator.next()
         if (next.done) {
-          const comments = metadataCommentRows(metadata)
+          const comments = metadataCommentRows(metadata, options)
           if (comments) controller.enqueue(encoder.encode(comments))
           controller.close()
           return
@@ -235,4 +250,20 @@ export function csvBufferedStreamResponse(rows: Iterable<Record<string, unknown>
   return new Response(stream, {
     headers: csvHeaders(filename, metadata),
   })
+}
+
+/** `csvResponse` for a request: metadata comment rows only when the request carries `?metadata=1`. */
+export function csvResponseFor(request: { url: string }, csv: string, filename: string, metadata?: CsvExportMetadata): Response {
+  return csvResponse(csv, filename, metadata, { includeMetadataRows: wantsCsvMetadataRows(request) })
+}
+
+/** `csvBufferedStreamResponse` for a request: metadata comment rows only when the request carries `?metadata=1`. */
+export function csvBufferedStreamResponseFor(
+  request: { url: string },
+  rows: Iterable<Record<string, unknown>>,
+  headers: string[],
+  filename: string,
+  metadata?: CsvExportMetadata,
+): Response {
+  return csvBufferedStreamResponse(rows, headers, filename, metadata, { includeMetadataRows: wantsCsvMetadataRows(request) })
 }

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
-import { csvBufferedStreamResponse } from '@/lib/csv'
+import { csvBufferedStreamResponseFor } from '@/lib/csv'
 import { db } from '@/lib/db'
 import {
   getInventoryLedgerExportRowCount,
@@ -112,7 +112,7 @@ export async function getInventoryLedgerExportResponse(
         referenceId: row.referenceId ?? '',
         note: row.note ?? '',
       }))
-      return csvBufferedStreamResponse(
+      return csvBufferedStreamResponseFor(req, 
         rows,
         STOCK_MOVEMENT_LEDGER_CSV_HEADERS,
         `stock-movements-${date}.csv`,
@@ -139,7 +139,7 @@ export async function getInventoryLedgerExportResponse(
         referenceId: row.referenceId ?? '',
         note: row.note ?? '',
       }))
-      return csvBufferedStreamResponse(
+      return csvBufferedStreamResponseFor(req, 
         rows,
         ['createdAt', 'sku', 'mpn', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'reasonName', 'reasonMatched', 'signedQty', 'totalValueBase', 'referenceType', 'referenceId', 'note'],
         `stock-adjustments-${date}.csv`,
@@ -167,7 +167,7 @@ export async function getInventoryLedgerExportResponse(
         movementInQty: row.movementInQty,
         movementValueBase: row.movementValueBase,
       }))
-      return csvBufferedStreamResponse(
+      return csvBufferedStreamResponseFor(req, 
         rows,
         ['reference', 'status', 'fromWarehouseCode', 'fromWarehouseName', 'toWarehouseCode', 'toWarehouseName', 'dispatchedAt', 'completedAt', 'daysInTransit', 'overdue', 'requestedQty', 'receivedQty', 'driftQty', 'movementOutQty', 'movementInQty', 'movementValueBase'],
         `transfers-${date}.csv`,
@@ -193,7 +193,7 @@ export async function getInventoryLedgerExportResponse(
         adjustmentEvidence: row.adjustmentEvidence,
         completedAt: row.completedAt ?? '',
       }))
-      return csvBufferedStreamResponse(
+      return csvBufferedStreamResponseFor(req, 
         rows,
         ['reference', 'status', 'warehouseCode', 'warehouseName', 'sku', 'mpn', 'productId', 'expectedQty', 'countedQty', 'varianceQty', 'linkedAdjustmentValueBase', 'adjustmentEvidence', 'completedAt'],
         `stock-counts-${date}.csv`,

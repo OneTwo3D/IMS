@@ -8,6 +8,12 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Retired Kit tables, clean CSV bodies, and a retention exemption that lifts itself
+
+- **Removed: the unused Kit and KitItem tables and the KIT-filtered component view of inventory aging.** A KIT's recipe is its component list, which every allocation and availability reader already uses; Kit and KitItem had no writer and one reader. Inventory aging filtered to Type KIT now returns an empty report with a notice (age the component SKUs instead), and the "KIT mode" summary and the kit-components source label are gone. A new forward migration drops `kits` and `kit_items`; it refuses to run if either table holds rows, so nothing is lost silently (production is schema-only).
+- **Changed: report CSV exports are data rows only by default.** The trailing `# IMS export metadata` rows, which standard CSV parsers read as records, are now added only when the request carries `?metadata=1`. The same metadata still travels in the `X-IMS-Export-Metadata` response header on every export that has it. Affects the stock-position, inventory-ledger, inventory-costing (COGS, valuation, landed cost), sales-analytics and supplier-aging exports.
+- **Changed: the retention exemption for refund-park recovery rows lifts itself.** The verification runner records in a new `migration_verification_passes` table when every check of a migration returned zero, and a later failing run removes the record. Once the record for the sync-log record-kind migration exists, the sweep stops keeping the sync-log rows a recovery names; they expire by age like any settled row. Databases that already passed record it on their next deploy.
+
 ### WooCommerce invoice notes are floored by the WooCommerce live-from instant
 
 - **Fixed: a queued WooCommerce invoice note is judged against `WC_WRITES_LIVE_FROM`, not `XERO_WRITES_LIVE_FROM`.** The note is a WooCommerce write that rides the accounting queue. Its claim, selection, re-queue refusal and last check before sending now use the WooCommerce cut-off, and every Xero write keeps the Xero one. Before this, a note created after the Xero instant but before the WooCommerce one would have been sent while the former writer still owned that write. `npm run outbound:status` counts the note under WooCommerce, with its own floor. Nothing changes while the producer hold is not enforced.

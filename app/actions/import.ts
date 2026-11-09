@@ -1045,9 +1045,8 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
             // code did NOT write.
             //
             // BOM ONLY. A KIT is consumed at sale, never manufactured: it has no production
-            // order, so a Bom for it would be a recipe with no reader. `Kit`/`KitItem` is
-            // deliberately left alone here for the same reason it has no reader today — see the
-            // note on the issue.
+            // order, so a Bom for it would be a recipe with no reader. Its recipe is the
+            // ProductComponent list and nothing else.
             if (current.type === 'BOM') {
               const bomOutcome = await syncBomRecipeFromProductComponents(tx, {
                 productId,

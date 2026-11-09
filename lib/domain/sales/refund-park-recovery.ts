@@ -100,6 +100,15 @@ export type { RecoverableRefundParkStatus } from '@/lib/domain/sales/wc-sync-row
 export const WC_REFUND_PARK_RECOVERED_ACTION = 'wc_refund_park_recovered'
 
 /**
+ * The migration whose verify.sql check 7 joins the recovery witness to the recovered row. Retention
+ * keeps a witnessed row only until `scripts/run-migration-verifications.mjs` has recorded this
+ * migration's checks as passed in `migration_verification_passes`: once check 7 has had its look
+ * the row has done its job, and holding it longer would only outlive the retention period the
+ * settings page promises.
+ */
+export const WC_REFUND_PARK_VERIFICATION_MIGRATION = '20260822120000_shopping_sync_log_record_kind'
+
+/**
  * THE ONE PREDICATE THAT SAYS "THIS ROW IS AN ACTIVE REFUND PARK" — AND IT SAYS SO POSITIVELY
  * (o3d-xnwu r7, Codex HIGH).
  *

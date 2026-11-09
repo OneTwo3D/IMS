@@ -127,6 +127,20 @@ test('o3d-xnwu r15: the sweep cannot delete a sync log the recovery witness name
   )
 })
 
+test('the witness exemption lifts once the migration verification pass is recorded', async () => {
+  // MUTATION ROUTE: delete the `migration_verification_passes` NOT EXISTS from the witness subquery in
+  // lib/data-retention.ts. The first assertion fails and the exemption never lifts again.
+  const { WC_REFUND_PARK_VERIFICATION_MIGRATION } = await import('@/lib/domain/sales/refund-park-recovery')
+  const call = await syncLogDelete()
+  const witnessStart = call.sql.indexOf('FROM "activity_logs"')
+  assert.notEqual(witnessStart, -1, 'precondition: the witness subquery is present')
+  const witness = call.sql.slice(witnessStart)
+  assert.match(witness, /NOT EXISTS\s*\(\s*SELECT 1\s*FROM "migration_verification_passes"/, 'the pass lifts the exemption')
+  assert.match(witness, /"migration_verification_passes"\."migration_name" = [?$]/)
+  assert.ok(call.values.includes(WC_REFUND_PARK_VERIFICATION_MIGRATION), 'and it names the migration whose checks are watched')
+  assert.equal(WC_REFUND_PARK_VERIFICATION_MIGRATION, '20260822120000_shopping_sync_log_record_kind')
+})
+
 test('o3d-xnwu r15: the witness exemption is NOT inside the active-park group, so a SYNCED row is protected too', async () => {
   // THE FINDING'S OWN SEQUENCE, AS AN ASSERTION ABOUT STRUCTURE. The pre-existing exemption is
   // `NOT (connector ... AND status = ANY(PENDING/FAILED/QUARANTINED) ...)`, and step 3 of the

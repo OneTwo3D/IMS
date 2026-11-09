@@ -8,6 +8,8 @@ import { join } from 'node:path'
 
 import {
   assessCoverage,
+  classifyMigrationOutcomes,
+  recordVerificationOutcomes,
   evaluateFileResults,
   findMigrationsWithVerify,
   listMigrationDirectories,
@@ -37,6 +39,31 @@ test('a passing check is one row of (check_name, violations) equal to zero', () 
   assert.equal(evaluated.checks.length, 2)
   assert.ok(evaluated.checks.every((check) => check.passed))
   assert.equal(verdict(evaluated.checks, evaluated.errors).ok, true)
+})
+
+test('a migration whose every check returned zero is classified passed; a failing or erroring one is failed', () => {
+  const checks = [
+    { migration: 'm_ok', name: 'a', violations: 0, passed: true },
+    { migration: 'm_ok', name: 'b', violations: 0, passed: true },
+    { migration: 'm_bad', name: 'c', violations: 2, passed: false },
+    { migration: 'm_err', name: 'd', violations: 0, passed: true },
+  ]
+  const outcome = classifyMigrationOutcomes(checks, ['m_err', 'm_unrun'])
+  assert.deepEqual(outcome.passed, [{ migration: 'm_ok', checks: 2 }])
+  assert.deepEqual(outcome.failed, ['m_bad', 'm_err', 'm_unrun'])
+  // A migration that ran nothing is neither passed nor failed.
+  assert.deepEqual(classifyMigrationOutcomes([], []), { passed: [], failed: [] })
+})
+
+test('the outcome is recorded: first pass wins, a failure removes the record', async () => {
+  const queries: Array<{ sql: string; params: unknown[] }> = []
+  const client = { query: async (sql: string, params: unknown[]) => { queries.push({ sql, params }); return { rows: [] } } }
+  await recordVerificationOutcomes(client, { passed: [{ migration: 'm_ok', checks: 7 }], failed: ['m_bad'] })
+  assert.equal(queries.length, 2)
+  assert.match(queries[0]!.sql, /INSERT INTO migration_verification_passes[\s\S]*ON CONFLICT \(migration_name\) DO NOTHING/)
+  assert.deepEqual(queries[0]!.params, ['m_ok', 7])
+  assert.match(queries[1]!.sql, /DELETE FROM migration_verification_passes WHERE migration_name = \$1/)
+  assert.deepEqual(queries[1]!.params, ['m_bad'])
 })
 
 test('a non-zero violation count fails the deploy and names the check', () => {

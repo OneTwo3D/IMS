@@ -9,7 +9,7 @@ import {
 } from '@/lib/domain/accounting/back-reference-sweep'
 import { followUpObligationsOwedBy } from '@/lib/domain/accounting/compacted-followup-loss'
 import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
-import { WC_REFUND_PARK_RECOVERED_ACTION } from '@/lib/domain/sales/refund-park-recovery'
+import { WC_REFUND_PARK_RECOVERED_ACTION, WC_REFUND_PARK_VERIFICATION_MIGRATION } from '@/lib/domain/sales/refund-park-recovery'
 import { unresolvedWcOrderRowSql } from '@/lib/domain/sales/wc-sync-row-families'
 import { EXTERNAL_DOCUMENT_EVIDENCE_WHERE } from '@/lib/domain/accounting/external-document-evidence'
 import { REMOTE_MONEY_EVIDENCE_TYPES } from '@/lib/domain/accounting/remote-money-evidence'
@@ -200,13 +200,14 @@ export async function purgeExpiredData(): Promise<{
       // than the retention period it would fail the cutover over healthy history — the one outcome
       // this file's own comments call a cutover outage. So the row is kept.
       //
-      // WHAT THAT COSTS. These rows now outlive the retention period the settings UI promises,
-      // indefinitely, and unlike the PENDING/FAILED/QUARANTINED exemption above there is no state
-      // they later move into that releases them — the witness is permanent by design. The set is
-      // bounded by MANUAL OPERATOR RECOVERIES, which are rare and each of which is a refund whose
-      // money left the business, so it is small and every member of it is worth keeping; but it is
-      // retention coupled to a migration that may run much later, and it does not lift itself when
-      // that migration finally does run. components/settings/data-retention.tsx says so.
+      // WHAT THAT COSTS, AND WHAT BOUNDS IT. Until the migration's verification has passed, these
+      // rows outlive the retention period the settings UI promises. The exemption is bounded by that
+      // pass: `scripts/run-migration-verifications.mjs` records it in `migration_verification_passes`
+      // once every check of the migration returned zero (check 7 included), and the NOT EXISTS below
+      // then stops protecting the row, which expires by age like any other settled row. A later
+      // verification run that FAILS removes the record, so the protection comes back with the
+      // incident. The set is bounded by MANUAL OPERATOR RECOVERIES, which are rare.
+      // components/settings/data-retention.tsx says so.
       db.$queryRaw<Array<{ count: number }>>`
         WITH deleted AS (
           DELETE FROM "shopping_sync_logs"
@@ -237,6 +238,15 @@ export async function purgeExpiredData(): Promise<{
                      FROM "activity_logs"
                     WHERE "activity_logs".action = ${WC_REFUND_PARK_RECOVERED_ACTION}
                       AND "activity_logs".metadata->>'shoppingSyncLogId' = "shopping_sync_logs".id
+                      -- THE EXEMPTION LIFTS ITSELF. Once the migration's checks have passed
+                      -- (recorded by the verification runner) check 7 has seen the row, and
+                      -- the witnessed row expires by age like any other settled row. Until
+                      -- then, and again if a later run fails and removes the record, it is kept.
+                      AND NOT EXISTS (
+                            SELECT 1
+                              FROM "migration_verification_passes"
+                             WHERE "migration_verification_passes"."migration_name" = ${WC_REFUND_PARK_VERIFICATION_MIGRATION}
+                          )
                  )
           RETURNING 1
         )
