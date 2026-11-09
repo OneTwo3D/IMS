@@ -22,7 +22,7 @@ import {
   recordIncomingWcWebhook,
   shouldSuppressWcWebhookEcho,
 } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
-import { productIdsForAppliedWcRefunds } from '@/lib/connectors/woocommerce/sync/refund-stock-push'
+import { queueRefundStockCorrections } from '@/lib/connectors/woocommerce/sync/refund-stock-correction'
 import { verifyWcWebhook } from '@/lib/connectors/woocommerce/sync/webhook-verify'
 import { judgeWebhookOrigin, type WebhookOriginJudgement } from '@/lib/connectors/webhook-origin'
 import { readWcDeliveryOrigin } from '@/lib/connectors/woocommerce/webhook-origin'
@@ -539,34 +539,22 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
     } catch (e) {
       failures.push(`syncRefundsForOrder: ${e instanceof Error ? e.message : String(e)}`)
     }
-    // WOOCOMMERCE RAISED ITS OWN STOCK FOR THESE REFUNDS before IMS heard of them. IMS is the stock master,
-    // and with refund-returns-in-transit on the units are not back yet, so correct the storefront with
-    // IMS's absolute level now that the refund is in IMS (ordering: AFTER the sweep, so the level already
-    // reflects what the refund did here; a push before it would flap the level). Forced, because the
-    // lastPushedQty dedupe would otherwise skip a level IMS pushed earlier. Best-effort and never a
-    // delivery failure: the job is durable and retried, the product webhook and the stock reconcile are
-    // the backstops, and a retried delivery would see these refunds as already applied anyway.
-    const appliedRefundIds = refundSweep?.appliedExternalRefundIds ?? []
-    if (appliedRefundIds.length > 0) {
-      try {
-        const refundedProductIds = await productIdsForAppliedWcRefunds(wcOrder.id, appliedRefundIds)
-        if (refundedProductIds.length > 0) {
-          await enqueueAndProcessImmediateWcStockSync(refundedProductIds, 'IMS_CHANGE', { force: true })
-        }
-      } catch (error) {
-        await logActivity({
-          entityType: 'SYNC',
-          action: 'wc_refund_stock_correction',
-          tag: 'sync',
-          level: 'WARNING',
-          description: `Could not queue the stock correction for the refunds applied on WC order #${wcOrder.number}`,
-          metadata: {
-            externalOrderId: wcOrder.id,
-            externalRefundIds: appliedRefundIds,
-            error: error instanceof Error ? error.message : String(error),
-          },
-        })
-      }
+    // WOOCOMMERCE RAISED ITS OWN STOCK FOR THESE REFUNDS before IMS heard of them. IMS is the stock master, so it owes the
+    // store a correction (a forced push of its absolute level). The obligation lives on the refund row, written in the refund's
+    // own transaction, so this queues it for EVERY committed refund of the order that still owes it (applied now OR applied by an
+    // earlier delivery whose later steps failed), after the sweep so the level already reflects what the refund did. A failure
+    // leaves it open: the stock reconcile retries it. Never a delivery failure: the refund is in IMS.
+    try {
+      await queueRefundStockCorrections({ externalOrderId: wcOrder.id })
+    } catch (error) {
+      await logActivity({
+        entityType: 'SYNC',
+        action: 'wc_refund_stock_correction',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `Could not look up the stock corrections owed for WC order #${wcOrder.number}; they stay open and are retried`,
+        metadata: { externalOrderId: wcOrder.id, error: error instanceof Error ? error.message : String(error) },
+      })
     }
 
     if (heldForRefunds) {

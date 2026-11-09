@@ -2,6 +2,7 @@ import { db } from '@/lib/db'
 import { isWcOrderWebhookPrimaryActive, retryHeldWcSalesInvoiceReleases, syncNewWcOrders } from './order-import'
 import { isWcProductWebhookPrimaryActive, syncAllWcProducts } from './product-sync'
 import { processQueuedWcStockSyncJobs } from './stock-sync-jobs'
+import { queueRefundStockCorrections } from './refund-stock-correction'
 import { pushStockToWc } from './stock-sync'
 
 const ORDER_RECONCILE_INTERVAL_MS = 24 * 60 * 60 * 1000
@@ -63,6 +64,12 @@ export async function runWcReconcile(): Promise<Record<string, unknown>> {
 
   const stockEnabled = await db.setting.findUnique({ where: { key: 'wc_stock_sync_enabled' } })
   if (stockEnabled?.value === 'true') {
+    // Stock corrections that refunds still owe the store (a queue failure left them open): record their jobs first so this run processes them.
+    try {
+      await queueRefundStockCorrections({ limit: 50 })
+    } catch (error) {
+      console.error('[wc-reconcile] queueing open refund stock corrections failed', error)
+    }
     const queued = await processQueuedWcStockSyncJobs({ limit: 100 })
     const lastReconcile = await db.setting.findUnique({ where: { key: 'last_wc_stock_daily_reconcile_at' } })
     const lastReconcileTs = lastReconcile?.value ? Date.parse(lastReconcile.value) : Number.NaN

@@ -3,24 +3,21 @@ import test, { mock } from 'node:test'
 import { WEBHOOK_ORIGIN_NOT_APPLICABLE } from '@/lib/connectors/webhook-origin'
 
 /**
- * WooCommerce raises its own stock for a refunded line inside the refund request, before IMS hears of
- * it. IMS is the stock master, so once a refund is APPLIED in IMS the order webhook force-pushes IMS's
- * absolute level for the refunded products. The subject here is WHEN and FOR WHAT it does that:
- *   - after the refund sweep, never before it;
- *   - only for refunds this delivery created (a redelivery that finds them already applied pushes nothing);
- *   - forced, so the lastPushedQty dedupe cannot swallow it;
- *   - never a reason to fail the delivery.
- * The webhook handler is real; the sweep, the product lookup and the stock queue are doubled because they
- * are its inputs and its effect.
+ * WooCommerce raises its own stock for a refunded line inside the refund request, before IMS hears of it, so IMS owes the
+ * store a stock correction. The obligation is on the refund row (tests/db/refund-stock-correction.test.ts covers it against a
+ * real database); THIS file pins how the order webhook uses it:
+ *   - it asks for the corrections of the delivery's order AFTER the refund sweep, never before;
+ *   - it asks on EVERY delivery that carries the order, not only when this delivery applied a refund (a refund an earlier delivery
+ *     committed but whose later steps failed is `already-applied` here and still owes its correction);
+ *   - a failure to ask is logged and never fails the delivery (the obligation stays open and the stock reconcile retries it).
+ * The webhook handler is real; the sweep and the correction queue are doubled because they are its input and its effect.
  */
 
 const calls: string[] = []
-const pushes: Array<{ productIds: string[]; reason: string; options: unknown }> = []
+const asked: Array<{ externalOrderId?: number }> = []
 const activityLog: Array<{ action?: string; level?: string }> = []
-let appliedRefundIds: number[] = []
-let lookedUp: Array<{ externalOrderId: number; ids: readonly number[] }> = []
-let productIdsForRefunds: string[] = []
-let pushThrows = false
+let sweepOutcome: 'applied' | 'already-applied' | 'none' = 'none'
+let askThrows = false
 
 mock.module('@/lib/activity-log', {
   namedExports: { logActivity: async (entry: { action?: string; level?: string }) => { activityLog.push(entry) } },
@@ -66,14 +63,8 @@ mock.module('@/lib/connectors/woocommerce/sync/refund-sync', {
   namedExports: {
     syncRefundsForOrder: async () => {
       calls.push('refunds')
-      return {
-        synced: appliedRefundIds.length,
-        fetched: appliedRefundIds.length,
-        unapplied: 0,
-        outstanding: 0,
-        complete: true,
-        appliedExternalRefundIds: appliedRefundIds,
-      }
+      const n = sweepOutcome === 'none' ? 0 : 1
+      return { synced: n, fetched: n, unapplied: 0, outstanding: 0, complete: true }
     },
     syncWcRefund: async () => ({ outcome: 'applied' }),
     refundIsInIms: (outcome: string) => outcome === 'applied' || outcome === 'already-applied',
@@ -81,23 +72,20 @@ mock.module('@/lib/connectors/woocommerce/sync/refund-sync', {
   },
 })
 
-mock.module('@/lib/connectors/woocommerce/sync/refund-stock-push', {
+mock.module('@/lib/connectors/woocommerce/sync/refund-stock-correction', {
   namedExports: {
-    productIdsForAppliedWcRefunds: async (externalOrderId: number, ids: readonly number[]) => {
-      calls.push('lookup')
-      lookedUp.push({ externalOrderId, ids })
-      return productIdsForRefunds
+    queueRefundStockCorrections: async (scope: { externalOrderId?: number }) => {
+      calls.push('queue')
+      asked.push(scope)
+      if (askThrows) throw new Error('database unavailable')
+      return { open: 0, queued: 0, failed: 0 }
     },
   },
 })
 
 mock.module('@/lib/connectors/woocommerce/sync/stock-sync-jobs', {
   namedExports: {
-    enqueueAndProcessImmediateWcStockSync: async (productIds: string[], reason: string, options: unknown) => {
-      calls.push('push')
-      if (pushThrows) throw new Error('queue unavailable')
-      pushes.push({ productIds, reason, options })
-    },
+    enqueueAndProcessImmediateWcStockSync: async () => {},
     recordIncomingWcWebhook: async () => {},
     shouldSuppressWcWebhookEcho: async () => false,
   },
@@ -109,12 +97,10 @@ mock.module('@/lib/connectors/woocommerce/sync/order-webhook-echo', {
 
 function reset() {
   calls.length = 0
-  pushes.length = 0
+  asked.length = 0
   activityLog.length = 0
-  lookedUp = []
-  appliedRefundIds = []
-  productIdsForRefunds = []
-  pushThrows = false
+  sweepOutcome = 'none'
+  askThrows = false
 }
 
 async function deliver() {
@@ -134,45 +120,34 @@ async function deliver() {
   })
 }
 
-test('a refund applied by this delivery force-pushes IMS stock for its products, after the sweep', async () => {
+test('the corrections of the delivery order are asked for AFTER the refund sweep', async () => {
   reset()
-  appliedRefundIds = [901]
-  productIdsForRefunds = ['p-1', 'p-2']
-
-  const response = await deliver()
-
-  assert.equal(response.status, 200)
-  assert.deepEqual(lookedUp, [{ externalOrderId: 5001, ids: [901] }])
-  assert.deepEqual(pushes, [{ productIds: ['p-1', 'p-2'], reason: 'IMS_CHANGE', options: { force: true } }])
-  assert.ok(calls.indexOf('push') > calls.indexOf('refunds'), 'the push follows the sweep: the level must already reflect the refund')
-})
-
-test('a delivery that applied no refund (money-only, or all already applied) pushes nothing', async () => {
-  reset()
+  sweepOutcome = 'applied'
   const response = await deliver()
   assert.equal(response.status, 200)
-  assert.deepEqual(pushes, [])
-  assert.ok(!calls.includes('lookup'), 'no refund applied, no lookup')
+  assert.deepEqual(asked, [{ externalOrderId: 5001 }])
+  assert.ok(calls.indexOf('queue') > calls.indexOf('refunds'), 'the level must already reflect the refund')
 })
 
-test('refunds applied but with no quantity lines push nothing', async () => {
+test('a delivery whose sweep found its refund already applied still asks (an earlier delivery may have failed after the commit)', async () => {
   reset()
-  appliedRefundIds = [902]
-  productIdsForRefunds = []
+  sweepOutcome = 'already-applied'
+  await deliver()
+  assert.deepEqual(asked, [{ externalOrderId: 5001 }])
+})
+
+test('a delivery with no refund asks too: the obligation is read from the refund rows, not from this delivery', async () => {
+  reset()
   const response = await deliver()
   assert.equal(response.status, 200)
-  assert.deepEqual(pushes, [])
+  assert.deepEqual(asked, [{ externalOrderId: 5001 }])
 })
 
-test('a failed stock queue is logged and never fails the delivery', async () => {
+test('a failure to look up the open corrections is logged and never fails the delivery', async () => {
   reset()
-  appliedRefundIds = [903]
-  productIdsForRefunds = ['p-3']
-  pushThrows = true
-
+  askThrows = true
   const response = await deliver()
-
-  assert.equal(response.status, 200, 'the refund is in IMS; a 500 would only redeliver it as already-applied')
+  assert.equal(response.status, 200, 'the refund is in IMS; the obligation stays open and the reconcile retries it')
   assert.equal(activityLog.filter((entry) => entry.action === 'wc_refund_stock_correction' && entry.level === 'WARNING').length, 1)
 })
 
@@ -183,4 +158,13 @@ test('the reservation-release backstop pushes the released stock to the storefro
   // The release runs autoAllocateOrder; its post-commit storefront push is skipped only by deferStockSync.
   assert.ok(!/deferStockSync/.test(outbox), 'the release drain must not defer the storefront stock sync')
   assert.match(allocation, /if \(!options\?\.deferStockSync\) \{\s*try \{\s*await enqueueStockSync\(\s*allocationResult\.syncProductIds,\s*'IMS_CHANGE'/)
+})
+
+test('the refund row is born owing its correction, in the refund transaction, for a storefront refund that returns quantity', async () => {
+  const { readFileSync } = await import('node:fs')
+  const service = readFileSync('lib/domain/sales/refund-service.ts', 'utf8')
+  assert.match(service, /stockCorrectionRequired: storefrontRefund && refundLines\.some\(\(line\) => line\.qty > 0 && Boolean\(line\.productId\)\)/)
+  // and it is inside the salesOrderRefund.create data, not a later update
+  const createAt = service.indexOf('const createdRefund = await tx.salesOrderRefund.create({')
+  assert.ok(createAt > 0 && service.indexOf('stockCorrectionRequired:', createAt) - createAt < 1500)
 })

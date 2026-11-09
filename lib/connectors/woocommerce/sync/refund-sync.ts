@@ -1479,12 +1479,6 @@ export type RefundSweepResult = {
   outstanding: number
   complete: boolean
   error?: string
-  /**
-   * WooCommerce ids of the refunds THIS walk created in IMS (outcome `applied`, not `already-applied`).
-   * What the caller needs to correct the storefront stock WooCommerce itself raised for them
-   * (lib/connectors/woocommerce/sync/refund-stock-push.ts). Optional so a hand-built result stays valid.
-   */
-  appliedExternalRefundIds?: number[]
 }
 
 /**
@@ -1496,7 +1490,6 @@ export async function syncRefundsForOrder(externalOrderId: number): Promise<Refu
   let synced = 0
   let unapplied = 0
   let outstanding = 0
-  const appliedExternalRefundIds: number[] = []
 
   for (const refund of refunds) {
     // o3d-7yf: BOTH the already-synced check and the parked-refund skip live in syncWcRefund now, scoped to
@@ -1512,7 +1505,6 @@ export async function syncRefundsForOrder(externalOrderId: number): Promise<Refu
     // applied is what let a caller conclude the store's refunds were all in IMS when they were not.
     if (refundIsInIms(result.outcome)) {
       synced++
-      if (result.outcome === 'applied' && typeof refund.id === 'number') appliedExternalRefundIds.push(refund.id)
       continue
     }
     unapplied++
@@ -1526,5 +1518,5 @@ export async function syncRefundsForOrder(externalOrderId: number): Promise<Refu
   // The refunds that WERE read are still applied — that is the deliberate leniency above. What
   // changes is that the caller is told the list was short, and told how much of it is not in IMS,
   // instead of inferring either from a number that cannot carry them.
-  return { synced, fetched: refunds.length, unapplied, outstanding, complete: error === undefined, error, appliedExternalRefundIds }
+  return { synced, fetched: refunds.length, unapplied, outstanding, complete: error === undefined, error }
 }

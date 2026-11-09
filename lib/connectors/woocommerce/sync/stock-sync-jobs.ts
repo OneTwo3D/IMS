@@ -76,6 +76,8 @@ type ApplyStockOutboxPayloadOptions = {
   status: string
   attempts?: number
   lastError?: string | null
+  /** This event MUST get its own pass even if a worker is processing an identical job right now. See `redo`. */
+  redo?: boolean
 }
 
 async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions): Promise<boolean> {
@@ -102,7 +104,10 @@ async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions):
       // for proof the event was handled. The job is RE-DATED in the same statement that merges the payload (the claim is keyed on its lock, not on createdAt, so the worker is unaffected), and the
       // worker, which judges the current row, sends it. This applies to an identical payload too: the producer's event still needs its push after the instant.
       // With no floor in force nothing is re-dated and the statement is the legacy one.
-      const redateProcessing = outboxRowCutoffFloor(current.connector, current.operation) !== null
+      // `redo` asks for the same outcome with no cut-off in force: an event that must be pushed AFTER the read the worker already
+      // made (a refund's restock the store applied on its own). The creation time is the generation the worker re-checks before it
+      // completes, so moving it makes the worker requeue the job instead of taking an identical payload for proof it was handled.
+      const redateProcessing = options.redo === true || outboxRowCutoffFloor(current.connector, current.operation) !== null
       if (samePayload(current.payloadJson, payload) && !redateProcessing) return true
       const updated = await db.integrationOutbox.updateMany({
         where: {
@@ -290,7 +295,7 @@ async function migrateLegacyWcStockSyncJobs(productIds?: string[], limit = 100):
 export async function enqueueWcStockSyncJobs(
   productIds: string[],
   reason: StockSyncReason,
-  options?: { force?: boolean; webhookQty?: number | null },
+  options?: { force?: boolean; webhookQty?: number | null; redo?: boolean },
 ): Promise<string[]> {
   const scope = await expandProductScope(productIds)
   if (scope.length === 0) return []
@@ -314,6 +319,7 @@ export async function enqueueWcStockSyncJobs(
       reason,
       force: options?.force,
       webhookQty: options?.webhookQty,
+      redo: options?.redo,
       nextAttemptAt: now,
       status: INTEGRATION_OUTBOX_STATUS.PENDING,
     })
@@ -486,9 +492,17 @@ export async function processQueuedWcStockSyncJobs(options?: {
 export async function enqueueAndProcessImmediateWcStockSync(
   productIds: string[],
   reason: Extract<StockSyncReason, 'IMS_CHANGE' | 'WC_WEBHOOK' | 'MANUAL'>,
-  options?: { force?: boolean; webhookQty?: number | null },
+  options?: {
+    force?: boolean
+    webhookQty?: number | null
+    redo?: boolean
+    /** Called once the jobs are durably recorded (or the hold shadowed them), BEFORE they are processed. Not called when the enqueue throws. */
+    onEnqueued?: () => Promise<void>
+  },
 ): Promise<void> {
-  const scope = await enqueueWcStockSyncJobs(productIds, reason, options)
+  const { onEnqueued, ...enqueueOptions } = options ?? {}
+  const scope = await enqueueWcStockSyncJobs(productIds, reason, enqueueOptions)
+  if (onEnqueued) await onEnqueued()
   if (scope.length === 0) return
   for (const productId of scope) immediateStockSyncProductIds.add(productId)
   if (immediateStockSyncScheduled) return
