@@ -25,7 +25,12 @@ const files = ROOTS.flatMap((root) => sources(root))
 
 test('no code deletes invoice document rows or fetch state through the client', () => {
   const offenders = files.filter((file) => /\b(salesOrderInvoiceDocument|invoiceDocumentFetchState)\s*\.\s*(delete|deleteMany)\b/.test(readFileSync(file, 'utf8')))
-  assert.deepEqual(offenders, [])
+  // The one exception is the database reset, and only behind its preflight: documents are deleted only on a database declared disposable.
+  assert.deepEqual(offenders, ['app/actions/reset.ts'])
+  const reset = readFileSync('app/actions/reset.ts', 'utf8')
+  assert.match(reset, /if \(options\.mayDeleteInvoiceDocuments\) await db\.salesOrderInvoiceDocument\.deleteMany\(\{\}\)/, 'the documents are deleted only when the preflight allowed it')
+  const verdictAt = reset.indexOf('invoiceDocumentResetVerdict()')
+  assert.ok(verdictAt > 0 && verdictAt < reset.indexOf('consumeDestructiveActionCode({'), 'and the preflight runs before the confirmation code is spent')
 })
 
 test('no raw SQL deletes from the document tables', () => {

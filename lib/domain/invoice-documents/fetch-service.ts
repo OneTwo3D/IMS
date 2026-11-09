@@ -39,6 +39,7 @@ import type { RequiredXeroConnection } from '@/lib/connectors/xero/api'
 import { assessDocumentEvidence, expectedInvoiceGross, type EvidenceSubject } from './order-evidence'
 import { nextAttemptDelayMs, recheckDelayMs, shouldEscalateMissing } from './backoff'
 import { validateFetchedPdf } from './pdf-validate'
+import { otherOrdersHoldingInvoiceNumber } from './number-uniqueness'
 
 export type InvoiceDocumentKindName = 'INVOICE' | 'CREDIT_NOTE'
 
@@ -263,7 +264,7 @@ async function ensureUnderLease(
   if (input.kind === 'INVOICE') {
     number = order.invoiceNumber?.trim() || null
     if (number) {
-      sharedByOthers = await db.salesOrder.count({ where: { id: { not: order.id }, invoiceNumber: { equals: number, mode: 'insensitive' } } })
+      sharedByOthers = await otherOrdersHoldingInvoiceNumber(db, order.id, number)
     }
     const gross = expectedInvoiceGross(order)
     if (!gross.ok) grossUnderivable = gross.reason
@@ -438,6 +439,11 @@ async function ensureUnderLease(
       nowCreditNote = (await tx.salesOrderRefund.findUnique({ where: { id: input.refundId! }, select: { creditNoteNumber: true } }))?.creditNoteNumber ?? ''
     }
     if (!nowOrder || orderEvidenceKey(nowOrder, nowCreditNote) !== evidenceKeyAtStart) return { kind: 'order-changed' as const }
+    // AND THE NUMBER IS STILL ONLY THIS ORDER'S: another order may have been given it since the uniqueness check at the start.
+    const heldBy = input.kind === 'INVOICE'
+      ? await otherOrdersHoldingInvoiceNumber(tx, input.orderId, number)
+      : await tx.salesOrderRefund.count({ where: { id: { not: input.refundId! }, creditNoteNumber: { equals: number, mode: 'insensitive' } } })
+    if (heldBy > 0) return { kind: 'number-shared' as const }
     const existing = await tx.salesOrderInvoiceDocument.findUnique({
       where: {
         connector_externalDocumentId_sha256: {
@@ -501,6 +507,7 @@ async function ensureUnderLease(
   })
 
   if (recorded.kind === 'lost') throw new LeaseLost()
+  if (recorded.kind === 'number-shared') return conflictNeedsAttention(`${label}: another IMS ${input.kind === 'INVOICE' ? 'order' : 'refund'} was given the same number while the document was being fetched, so it cannot be tied to this one`)
   if (recorded.kind === 'order-changed') return defer(`${label}: the order changed while the document was being fetched (invoice number, total, credit or customer), so the downloaded bytes are discarded`, 'failed')
   if (recorded.kind === 'conflict') return needsAttention(recorded.reason)
 

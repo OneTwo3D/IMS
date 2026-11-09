@@ -82,3 +82,9 @@ ALTER TABLE "invoice_document_fetch_states" ADD CONSTRAINT "invoice_document_fet
 
 -- AddForeignKey
 ALTER TABLE "invoice_document_fetch_states" ADD CONSTRAINT "invoice_document_fetch_states_refund_id_fkey" FOREIGN KEY ("refund_id") REFERENCES "sales_order_refunds"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- CreateIndex
+-- The fetch and the reader both ask "does any OTHER order carry this invoice number?" (case-insensitively, as the ledger matches numbers). An
+-- expression index keeps that a single index probe on the read path. Created non-concurrently: the table is small enough that the lock is brief,
+-- and nothing deployed before this migration depends on it.
+CREATE INDEX "sales_orders_invoice_number_lower_idx" ON "sales_orders" (lower("invoiceNumber"));

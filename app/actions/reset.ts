@@ -14,6 +14,7 @@ import {
 } from '@/lib/connectors/accounting-binding-lock-order'
 import { WC_ORDER_SWEEP_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
 import { freshAuthFailureResult, requireFreshAdmin } from '@/lib/auth/server'
+import { invoiceDocumentResetVerdict } from '@/lib/domain/invoice-documents/reset-guard'
 import { issueDestructiveActionCode, consumeDestructiveActionCode } from '@/lib/destructive-action-confirm'
 import {
   countUnrecordedIncidents,
@@ -52,7 +53,7 @@ async function clearSettingKeys(keys: readonly string[]) {
 // added, removed, or relationships change, update the relevant reset scope
 // below so the three UI options continue to match their labels.
 
-async function clearTransactionScope() {
+async function clearTransactionScope(options: { mayDeleteInvoiceDocuments: boolean }) {
   // Email / notifications / transient operational state
   await db.emailOutbox.deleteMany({})
   await db.notificationReadReceipt.deleteMany({})
@@ -87,6 +88,11 @@ async function clearTransactionScope() {
   // Return expectations reference the refund and its lines (restrict), so they go first.
   await db.returnExpectationLine.deleteMany({})
   await db.returnExpectation.deleteMany({})
+  // Stored customer invoice documents are a statutory record (six years) and their foreign keys to orders and refunds are RESTRICT. The reset
+  // asks first (invoiceDocumentResetVerdict, before anything is deleted) and only deletes them on a database declared disposable; on any other
+  // the order delete below would fail, which is safe, and the verdict has already refused with the reason.
+  await db.invoiceDocumentFetchState.deleteMany({})
+  if (options.mayDeleteInvoiceDocuments) await db.salesOrderInvoiceDocument.deleteMany({})
   await db.salesOrderRefundLine.deleteMany({})
   await db.salesOrderRefund.deleteMany({})
   await db.salesOrderLine.deleteMany({})
@@ -370,6 +376,9 @@ export async function resetDatabase(level: ResetLevel, confirmationCode: string)
     if (!confirmationCode || confirmationCode.trim().length < 6) {
       return { success: false, error: 'Email confirmation code is required.' }
     }
+    // BEFORE the confirmation code is spent and before anything is deleted: stored invoice documents are retained records.
+    const documentVerdict = await invoiceDocumentResetVerdict()
+    if (!documentVerdict.ok) return { success: false, error: documentVerdict.reason }
     const confirmed = await consumeDestructiveActionCode({
       purpose: 'database_reset',
       token: confirmationCode,
@@ -380,7 +389,7 @@ export async function resetDatabase(level: ResetLevel, confirmationCode: string)
     }
 
     if (level === 'transactions' || level === 'products' || level === 'full') {
-      await clearTransactionScope()
+      await clearTransactionScope({ mayDeleteInvoiceDocuments: documentVerdict.mayDeleteDocuments })
     }
 
     if (level === 'products' || level === 'full') {

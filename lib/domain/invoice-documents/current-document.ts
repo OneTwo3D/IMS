@@ -14,6 +14,7 @@ import { createHash } from 'node:crypto'
 
 import { db } from '@/lib/db'
 import { xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
+import { otherOrdersHoldingInvoiceNumber } from './number-uniqueness'
 import { loadInvoiceDocumentFile, loadInvoicePdf } from '@/lib/invoice-pdf'
 
 async function markDue(orderId: string): Promise<void> {
@@ -23,10 +24,33 @@ async function markDue(orderId: string): Promise<void> {
   }).catch(() => { /* the integrity scan finds it too */ })
 }
 
-/** Is the order's current invoice document one the ledger has withdrawn (voided on a live order)? For the staff label. */
+export type InvoiceUnavailableReason = 'withdrawn' | 'number-shared'
+
+/**
+ * Why the order's current invoice document is NOT shown to the customer although IMS holds it, or null when it is available: the ledger
+ * withdrew it (voided on a live order, or an ownership conflict), or another order now carries the same invoice number. For the staff label.
+ */
+export async function currentInvoiceUnavailableReason(orderId: string): Promise<InvoiceUnavailableReason | null> {
+  const current = await db.salesOrderInvoiceDocument.findFirst({
+    where: { orderId, kind: 'INVOICE', refundId: null, supersededAt: null },
+    select: { withdrawnAt: true, documentNumber: true },
+    orderBy: { fetchedAt: 'desc' },
+  })
+  if (!current) return null
+  if (current.withdrawnAt) return 'withdrawn'
+  return (await otherOrdersHoldingInvoiceNumber(db, orderId, current.documentNumber)) > 0 ? 'number-shared' : null
+}
+
+/** Kept for the staff routes' label: true when the document is held back from the customer for either reason. */
 export async function currentInvoiceIsWithdrawn(orderId: string): Promise<boolean> {
-  const current = await db.salesOrderInvoiceDocument.findFirst({ where: { orderId, kind: 'INVOICE', refundId: null, supersededAt: null }, select: { withdrawnAt: true }, orderBy: { fetchedAt: 'desc' } })
-  return current?.withdrawnAt != null
+  return (await currentInvoiceUnavailableReason(orderId)) !== null
+}
+
+async function flagNumberCollision(orderId: string): Promise<void> {
+  await db.invoiceDocumentFetchState.updateMany({
+    where: { orderId, kind: 'INVOICE', refundId: null, status: { not: 'NEEDS_ATTENTION' } },
+    data: { status: 'NEEDS_ATTENTION', lastError: 'another IMS order carries this invoice number, so the stored document can no longer be tied to this order' },
+  }).catch(() => { /* the next read flags it again */ })
 }
 
 /**
@@ -48,6 +72,13 @@ export async function loadCurrentInvoicePdf(orderId: string, options: { includeW
   if (xeroInvoiceNumberIdentity(current.order.invoiceNumber ?? '') !== xeroInvoiceNumberIdentity(current.documentNumber)) {
     await markDue(orderId)
     return null
+  }
+
+  // NOR MAY ANOTHER ORDER HOLD THAT NUMBER NOW: the storefront's number is not unique in IMS, so a collision arriving after the document was
+  // stored means it can no longer be tied to this order. Refused for the customer (staff can still open it, labelled) and flagged for a person.
+  if ((await otherOrdersHoldingInvoiceNumber(db, orderId, current.documentNumber)) > 0) {
+    await flagNumberCollision(orderId)
+    if (!options.includeWithdrawn) return null
   }
 
   const bytes = await loadInvoiceDocumentFile(orderId, current.sha256)

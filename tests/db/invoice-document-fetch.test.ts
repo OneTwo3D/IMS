@@ -854,3 +854,64 @@ test('a full backlog of new orders cannot starve a due recheck', { skip }, async
     for (const id of fresh) await cleanup(db, id)
   }
 })
+
+test('another order is given the invoice number DURING the fetch: nothing is promoted; AFTER storage: not served to the customer, flagged, staff can still open it', { skip }, async () => {
+  const { db, service } = await setup()
+  const { order } = await seedOrder(db)
+  let other: { order: { id: string } } | null = null
+  try {
+    const { loadCurrentInvoicePdf, currentInvoiceUnavailableReason } = await import('../../lib/domain/invoice-documents/current-document')
+    const deps: Deps = {
+      ...depsFor(order),
+      downloadPdf: async () => {
+        // Collision arriving mid-fetch: a second order takes the same number (different case, as the ledger would match it).
+        other = await seedOrder(db, false, { invoiceNumber: order.invoiceNumber!.toLowerCase() })
+        return { ok: true, buffer: pdf('collided') }
+      },
+    }
+    const during = await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, deps)
+    assert.equal(during.status, 'needs-attention')
+    assert.equal(await db.salesOrderInvoiceDocument.count({ where: { orderId: order.id } }), 0, 'not promoted')
+    assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: order.id }, select: { invoicePdfPath: true } })).invoicePdfPath, null)
+
+    // Clear the collision, store the document, then let the collision arrive AFTER storage.
+    await cleanup(db, other!.order.id)
+    other = null
+    await db.invoiceDocumentFetchState.deleteMany({ where: { orderId: order.id } })
+    const bytes = pdf('stored-first')
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, depsFor(order, { bytes: () => bytes }))).status, 'stored')
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id), bytes)
+    other = await seedOrder(db, false, { invoiceNumber: order.invoiceNumber! })
+    assert.equal(await loadCurrentInvoicePdf(order.id), null, 'refused to the customer')
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id, { includeWithdrawn: true }), bytes, 'staff can still open it')
+    assert.equal(await currentInvoiceUnavailableReason(order.id), 'number-shared')
+    assert.equal((await db.invoiceDocumentFetchState.findFirstOrThrow({ where: { orderId: order.id } })).status, 'NEEDS_ATTENTION', 'and a person is asked')
+  } finally {
+    if (other) await cleanup(db, (other as { order: { id: string } }).order.id)
+    await cleanup(db, order.id)
+  }
+})
+
+test('the reset refuses BEFORE deleting anything when invoice documents are stored, unless the database is declared disposable', { skip }, async () => {
+  const { db, service } = await setup()
+  const { order } = await seedOrder(db)
+  const { invoiceDocumentResetVerdict } = await import('../../lib/domain/invoice-documents/reset-guard')
+  const { expectedDisposableDatabaseMarker } = await import('../../lib/disposable-database-marker')
+  const dbName = (await db.$queryRaw<Array<{ n: string }>>`SELECT current_database()::text AS n`)[0]!.n
+  const comment = (await db.$queryRaw<Array<{ c: string | null }>>`SELECT shobj_description(oid, 'pg_database') AS c FROM pg_database WHERE datname = current_database()`)[0]?.c ?? null
+  const setComment = async (value: string | null) => { await db.$executeRawUnsafe(`COMMENT ON DATABASE "${dbName}" IS ${value === null ? 'NULL' : `'${value.replace(/'/g, "''")}'`}`) }
+  try {
+    await setComment(null)
+    assert.deepEqual(await invoiceDocumentResetVerdict(), { ok: true, mayDeleteDocuments: false }, 'nothing stored: nothing in the way')
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, depsFor(order))).status, 'stored')
+    const refused = await invoiceDocumentResetVerdict()
+    assert.equal(refused.ok, false)
+    assert.match(refused.ok ? '' : refused.reason, /Nothing was deleted/)
+    assert.match(refused.ok ? '' : refused.reason, /db:stamp-scratch/)
+    await setComment(expectedDisposableDatabaseMarker(dbName))
+    assert.deepEqual(await invoiceDocumentResetVerdict(), { ok: true, mayDeleteDocuments: true })
+  } finally {
+    await setComment(comment)
+    await cleanup(db, order.id)
+  }
+})
