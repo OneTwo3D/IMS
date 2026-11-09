@@ -1068,6 +1068,44 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
 // Mutations
 // ---------------------------------------------------------------------------
 
+type OrderTaxRow = NonNullable<Awaited<ReturnType<typeof db.taxRate.findUnique<{ select: typeof taxRateProfileSelect }>>>>
+
+/**
+ * The order-level tax rate a purchase order names. An id wins outright. A name alone is looked up the way the purchase-order importer
+ * does it: among ACTIVE rates usable for purchases (PURCHASE or BOTH), ignoring case and surrounding spaces. Names are not unique, so
+ * several matches are narrowed first, on an edit, to the one a line of this order already carries and then to the one that spells the
+ * name exactly; if that still leaves more than one the order is refused and the caller must choose by id, because picking one
+ * silently would book the order at the wrong rate. No match takes no rate, as an unknown name always did.
+ */
+async function resolveOrderDefaultTaxRate(
+  client: Pick<typeof db, 'taxRate'>,
+  input: { taxRateId?: string | null; taxRateName?: string | null },
+  carriedRateIds?: ReadonlySet<string | null | undefined>,
+): Promise<{ rate: OrderTaxRow | null } | { error: string }> {
+  if (input.taxRateId) {
+    return { rate: await client.taxRate.findUnique({ where: { id: input.taxRateId }, select: taxRateProfileSelect }) }
+  }
+  const name = input.taxRateName?.trim()
+  if (!name) return { rate: null }
+  let matches = await client.taxRate.findMany({
+    where: { name: { equals: name, mode: 'insensitive' }, active: true, usedFor: { in: ['PURCHASE', 'BOTH'] } },
+    orderBy: { id: 'asc' },
+    select: taxRateProfileSelect,
+  })
+  if (matches.length > 1 && carriedRateIds) {
+    const carried = matches.filter((m) => carriedRateIds.has(m.id))
+    if (carried.length === 1) matches = carried
+  }
+  if (matches.length > 1) {
+    const exact = matches.filter((m) => m.name.trim() === name)
+    if (exact.length === 1) matches = exact
+  }
+  if (matches.length > 1) {
+    return { error: `The tax rate name "${name}" matches ${matches.length} active purchase tax rates (${matches.map((m) => `"${m.name}"`).join(', ')}); choose the rate by id` }
+  }
+  return { rate: matches[0] ?? null }
+}
+
 /** Order-level tax context — the supplier's Default VAT Rate (or a per-PO override of it). */
 type OrderDefaultTaxCtx = {
   id: ResolvedTaxRate['taxRateId']
@@ -1183,20 +1221,9 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
 
     // Order-level rate = the supplier's Default VAT Rate (or a per-PO override
     // of it). Applied to every non-override line + additional costs / discount.
-    const orderDefaultRate = input.taxRateId
-      ? await db.taxRate.findUnique({
-          where: { id: input.taxRateId },
-          select: taxRateProfileSelect,
-        })
-      : input.taxRateName
-      ? await db.taxRate.findFirst({
-          // Case-insensitive, like the purchase-order importer's own lookup (`resolveImportedTaxRateId`): an order whose tax name differs
-          // only in case passed the importer and then failed here. The id order makes the pick stable if two active rates differ only in case.
-          where: { name: { equals: input.taxRateName.trim(), mode: 'insensitive' }, active: true },
-          orderBy: { id: 'asc' },
-          select: taxRateProfileSelect,
-        })
-      : null
+    const orderDefaultLookup = await resolveOrderDefaultTaxRate(db, input)
+    if ('error' in orderDefaultLookup) return { success: false, error: orderDefaultLookup.error }
+    const orderDefaultRate = orderDefaultLookup.rate
     const orderDefaultProfile = orderDefaultRate ? resolvedTaxRateFromProfile(orderDefaultRate, 'fallback') : null
     const orderDefaultCtx = {
       id: orderDefaultProfile?.taxRateId ?? null,
@@ -1518,18 +1545,12 @@ export async function updatePurchaseOrder(
 
       if (input.lines) {
         // --- Tax rate resolution (mirror createPurchaseOrder) -------------
-        const orderDefaultRate = input.taxRateId
-          ? await tx.taxRate.findUnique({
-              where: { id: input.taxRateId },
-              select: taxRateProfileSelect,
-            })
-          : input.taxRateName
-          ? await tx.taxRate.findFirst({
-              where: { name: { equals: input.taxRateName.trim(), mode: 'insensitive' }, active: true },
-              orderBy: { id: 'asc' },
-              select: taxRateProfileSelect,
-            })
-          : null
+        // Rates the order's lines already carry: a name that is unchanged keeps resolving to the rate it resolved to before, never to a
+        // different rate that now shares the name.
+        const priorLineRates = new Set((await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { taxRateId: true } })).map((l) => l.taxRateId))
+        const orderDefaultLookup = await resolveOrderDefaultTaxRate(tx, input, priorLineRates)
+        if ('error' in orderDefaultLookup) return { refused: orderDefaultLookup.error }
+        const orderDefaultRate = orderDefaultLookup.rate
         const orderDefaultProfile = orderDefaultRate ? resolvedTaxRateFromProfile(orderDefaultRate, 'fallback') : null
         const orderDefaultCtx = {
           id: orderDefaultProfile?.taxRateId ?? null,
@@ -1556,7 +1577,6 @@ export async function updatePurchaseOrder(
         }
 
         // Supplier's Default VAT Rate is authoritative for every line (per-line manual override still wins).
-        const priorLineRates = new Set((await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { taxRateId: true } })).map((l) => l.taxRateId))
         const lineResolved = await resolvePurchaseLineTaxRates(input.lines, orderDefaultCtx, tx, priorLineRates)
 
         // Delete existing lines and recreate

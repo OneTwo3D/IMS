@@ -30,13 +30,13 @@ export function parseComponentQty(raw: string): { ok: true; qty: number } | { ok
 export function parseComponentsCell(cell: string): ComponentCellPart[] {
   const parts = cell.split(';').map((s) => s.trim()).filter(Boolean)
   return parts.map((part): ComponentCellPart => {
-    const pieces = part.split(':').map((s) => s.trim())
-    const sku = pieces[0] ?? ''
-    if (pieces.length !== 2) {
-      return { ok: false, sku, reason: pieces.length === 1 ? 'a part must be SKU:qty (no ":" found)' : 'a part must be SKU:qty (more than one ":" found)' }
-    }
+    // The quantity is what follows the LAST ":", so a SKU that itself contains ":" (`PART:A`) survives the export's `SKU:qty` form.
+    const colon = part.lastIndexOf(':')
+    if (colon < 0) return { ok: false, sku: part, reason: 'a part must be SKU:qty (no ":" found)' }
+    const sku = part.slice(0, colon).trim()
+    const qtyText = part.slice(colon + 1)
     if (sku === '') return { ok: false, sku, reason: 'the component SKU is empty' }
-    const qty = parseComponentQty(pieces[1]!)
+    const qty = parseComponentQty(qtyText)
     return qty.ok ? { ok: true, sku, qty: qty.qty } : { ok: false, sku, reason: qty.reason }
   })
 }

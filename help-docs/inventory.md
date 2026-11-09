@@ -93,6 +93,7 @@ Rules for the `components` column:
   for the decimal mark and at most 4 decimal places (`1`, `2.5`, `0.0001`). A part with no `:`, a
   quantity such as `1,5`, `2 units`, `3abc`, `1e3` or `-1`, or a zero quantity is refused, and as with
   an unknown SKU the whole recipe for that row is refused (`Row N: invalid component "X": ...`).
+  The quantity is what follows the last `:`, so a component SKU that itself contains `:` (`PART:A:2`) is read as SKU `PART:A`.
   The importer used to read a numeric prefix and to give a part with no `:` quantity 1, so a decimal
   comma loaded as 1 with nothing reported.
 - **A circular recipe is refused.** A product cannot be a component of itself, directly or through a

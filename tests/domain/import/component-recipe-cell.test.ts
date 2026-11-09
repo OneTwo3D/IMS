@@ -19,11 +19,20 @@ test('a quantity that parseFloat read a prefix of is refused, not truncated', ()
   }
 })
 
-test('a part without ":" is refused instead of defaulting to 1, as is one with two, an empty SKU or an empty quantity', () => {
-  for (const bad of ['SKU', 'SKU:1:2', ':3', 'SKU:', 'SKU: ']) {
+test('a part without ":" is refused instead of defaulting to 1, as is an empty SKU or an empty quantity', () => {
+  for (const bad of ['SKU', ':3', 'SKU:', 'SKU: ', 'SKU:1:']) {
     const parsed = parseComponentsCell(bad)
     assert.equal(parsed[0]!.ok, false, `"${bad}" must be refused`)
   }
+})
+
+test('each refusal names its own reason', () => {
+  const reason = (cell: string) => { const p = parseComponentsCell(cell)[0]!; return p.ok ? '' : p.reason }
+  assert.match(reason(':3'), /SKU is empty/)
+  assert.match(reason('SKU'), /no ":" found/)
+  assert.match(reason('SKU:'), /quantity is empty/)
+  assert.match(reason('SKU:0'), /greater than zero/)
+  assert.match(reason('SKU:1,5'), /plain number/)
 })
 
 test('parseComponentQty names the reason', () => {
@@ -32,4 +41,19 @@ test('parseComponentQty names the reason', () => {
   assert.equal(refused.ok, false)
   assert.match(refused.ok ? '' : refused.reason, /plain number/)
   assert.deepEqual(parseComponentQty(''), { ok: false, reason: 'the quantity is empty' })
+})
+
+test('a SKU containing ":" round-trips through the export form SKU:qty, because the quantity follows the last ":"', () => {
+  assert.deepEqual(parseComponentsCell('PART:A:1'), [{ ok: true, sku: 'PART:A', qty: 1 }])
+  assert.deepEqual(parseComponentsCell('PART:A:1;B:2.5;X:Y:Z:0.0001'), [
+    { ok: true, sku: 'PART:A', qty: 1 },
+    { ok: true, sku: 'B', qty: 2.5 },
+    { ok: true, sku: 'X:Y:Z', qty: 0.0001 },
+  ])
+  // The export writes `${sku}:${Number(qty)}`; reading it back gives the same pair.
+  for (const [sku, qty] of [['PART:A', 3], ['A:B:C', 0.25], ['PLAIN', 12]] as const) {
+    assert.deepEqual(parseComponentsCell(`${sku}:${Number(qty)}`), [{ ok: true, sku, qty }])
+  }
+  // A SKU with a ":" and no quantity reads its tail as the quantity and is refused.
+  assert.equal(parseComponentsCell('PART:A')[0]!.ok, false)
 })
