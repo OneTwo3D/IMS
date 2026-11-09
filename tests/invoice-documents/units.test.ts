@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readFileSync } from 'node:fs'
 
 import { selectDocumentClaim, type DocumentClaim } from '../../lib/domain/invoice-documents/claim-selection.ts'
 import { DEFAULT_INVOICE_DOCUMENT_MAX_BYTES, invoiceDocumentMaxBytes, validateFetchedPdf } from '../../lib/domain/invoice-documents/pdf-validate.ts'
@@ -149,4 +150,19 @@ test('evidence failures say whether they are a POSITIVE conflict (withdraws a st
   assert.equal(failure(doc({ currencyCode: undefined, reference: '12345' })), false, 'currency not stated')
   assert.equal(failure(doc({ total: undefined, reference: '12345' })), false, 'total not stated')
   assert.equal(failure(doc({})), false, 'nothing states whose it is')
+})
+
+test('the invoice-note follow-up issues no download flag write of its own: the flag is written only by its guarded outbox job', () => {
+  const source = readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8')
+  assert.doesNotMatch(source, /publishInvoiceDocumentFlagToWc|woocommerce\/sync\/invoice-document['"]/, 'sync-processor must not call the flag writer')
+})
+
+test('the invoice-document operation is registered as a WooCommerce effect, unsafe to replay, and switched by an off-by-default setting', async () => {
+  const { INTEGRATION_OUTBOX_REGISTRY } = await import('../../lib/domain/integrations/outbox-registry.ts')
+  const entry = INTEGRATION_OUTBOX_REGISTRY.woocommerce['order.invoice-document']
+  assert.equal(entry.destination, 'woocommerce')
+  assert.equal(entry.replay, 'unsafe-to-replay')
+  const { IMS_WRITER_SWITCHES } = await import('../../lib/ops/writers-check.ts')
+  const row = IMS_WRITER_SWITCHES.find((r) => r.key === 'woocommerce.order.invoice-document')
+  assert.deepEqual(row?.requires, [{ plugin: 'woocommerce' }, { settingTrue: 'wc_invoice_document_enabled', defaultValue: 'false' }])
 })

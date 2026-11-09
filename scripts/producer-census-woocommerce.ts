@@ -52,8 +52,8 @@ export const WOO_SEAM_FUNCTIONS: readonly WooSeamFunction[] = [
   {
     file: 'lib/domain/integrations/outbox.ts', decl: 'enqueueIntegrationOutbox', role: 'outbox-primitive',
     mustCall: ['outboxProducerVerdict'], beforeCalls: ['create'],
-    operations: ['stock', 'order.status'],
-    why: 'The one outbox enqueue: a WooCommerce operation is decided here, and a shadow writes no row. Every WooCommerce stock and order-status job is made by it.',
+    operations: ['stock', 'order.status', 'order.invoice-document'],
+    why: 'The one outbox enqueue: a WooCommerce operation is decided here, and a shadow writes no row. Every WooCommerce stock, order-status and invoice-publication job is made by it.',
   },
   {
     file: 'lib/connectors/woocommerce/sync/stock-sync.ts', decl: 'pushStockToWc', role: 'producer',
@@ -78,6 +78,12 @@ export const WOO_SEAM_FUNCTIONS: readonly WooSeamFunction[] = [
     mustCall: ['wooDrainHold'], beforeCalls: ['claimIntegrationOutboxWork'],
     operations: [],
     why: 'Claim boundary of the order cancel and hold queues.',
+  },
+  {
+    file: 'lib/connectors/woocommerce/sync/invoice-document-jobs.ts', decl: 'runWcInvoiceDocumentJobs', role: 'drain',
+    mustCall: ['wooDrainHold'], beforeCalls: ['claimIntegrationOutboxWork'],
+    operations: [],
+    why: 'Claim boundary of the invoice publication queue.',
   },
   {
     file: 'lib/connectors/woocommerce/api.ts', decl: 'wcPost', role: 'transport-barrier',
@@ -136,7 +142,6 @@ export const WOO_SEAM_FUNCTIONS: readonly WooSeamFunction[] = [
 export const WOO_OPERATIONS_GOVERNED_ELSEWHERE: Readonly<Record<string, string>> = {
   'order.withdrawal-outcome': 'No IMS producer exists: the endpoint stays in the WooCommerce withdrawal plugin (producer census NO_PRODUCER).',
   'order.trackship-reconcile': 'No IMS producer exists: the endpoint stays in the TrackShip plugin (producer census NO_PRODUCER).',
-  'order.invoice-document': 'No IMS producer exists yet: the My Account invoice is a later build (producer census NO_PRODUCER).',
 }
 
 export const SOURCE_ROOTS = ['app', 'lib', 'scripts', 'components'] as const

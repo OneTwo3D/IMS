@@ -60,6 +60,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   inventory_snapshot_runs: { kind: 'MUST_BE_EMPTY', reason: 'inventory snapshots' },
   inventory_snapshots: { kind: 'MUST_BE_EMPTY', reason: 'inventory snapshots' },
   invoice_document_fetch_states: { kind: 'MUST_BE_EMPTY', reason: 'customer invoice documents fetched from the ledger for existing orders' },
+  invoice_store_publications: { kind: 'MUST_BE_EMPTY', reason: 'what was written to the storefront about the customer invoice of existing orders' },
   landed_cost_links: { kind: 'MUST_BE_EMPTY', reason: 'landed-cost records' },
   landed_cost_revaluation_runs: { kind: 'MUST_BE_EMPTY', reason: 'landed-cost records' },
   manufacturing_cost_lines: { kind: 'MUST_BE_EMPTY', reason: 'manufacturing cost records' },

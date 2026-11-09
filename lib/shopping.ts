@@ -455,6 +455,12 @@ export async function processShoppingOrderStatusPushes(options?: { idempotencyKe
   return processWcOrderStatusJobs(options)
 }
 
+/** Queue and drain the storefront "show this order's invoice in My Account" publications. Does nothing while `wc_invoice_document_enabled` is not `true`. */
+export async function processShoppingInvoiceDocumentPublications(options?: { idempotencyKeys?: string[]; limit?: number; now?: Date }) {
+  const { processWcInvoiceDocumentPublications } = await import('@/lib/connectors/woocommerce/sync/invoice-document-jobs')
+  return processWcInvoiceDocumentPublications(options)
+}
+
 /**
  * Fan the current FX rate set out to every configured shopping connector so the
  * storefront, IMS and the accounting platform share one rate. Each connector

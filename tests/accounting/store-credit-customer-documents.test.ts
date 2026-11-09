@@ -61,6 +61,9 @@ test('CENSUS 2: every place a STORED invoice PDF is served is the accounting sys
   precondition('stored PDF servers', { files: loaders })
   assert.deepEqual(loaders, [
     'app/api/invoice/[id]/route.ts', 'app/api/invoices/[id]/route.ts', 'app/api/shopping/[connector]/invoice-pdf/route.ts',
+    // The two publish-side files only PROBE whether the customer could be served the document (the reader is asked, the bytes are
+    // discarded) before telling the storefront to show the download button; they serve nothing.
+    'lib/connectors/woocommerce/sync/invoice-document-jobs.ts', 'lib/connectors/woocommerce/sync/invoice-document.ts',
     'lib/domain/invoice-documents/current-document.ts', 'lib/invoice-pdf.ts', 'lib/order-email.ts',
   ].sort(), 'a new place serves a stored invoice PDF: classify it')
   // Stored PDFs are written only by the Xero INVOICE_PDF follow-up (saveInvoicePdf), which never runs for a credit order.

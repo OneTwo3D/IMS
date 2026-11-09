@@ -67,6 +67,19 @@ A document the ledger does not hold yet is retried after 10 minutes, 30 minutes,
 
 A statutory record, kept six years. **Nothing in IMS deletes a document row or a stored file** (pinned by `tests/invoice-documents/retention.test.ts`); a retention job is an owner decision. The storage directory **must be in the backup set**, restored with the database (see installation.md). The tables are `MUST_BE_EMPTY` for a first load.
 
-## Not here (next step)
+## Publishing to the storefront (publish side)
 
-Publishing to the customer's WooCommerce My Account (the order meta that makes the helper plugin show the button, including for historic orders that have no flag) and the credit note download route are the publish side and are not part of this change.
+Once IMS holds a document it can serve, the storefront's My Account still has to be told to show the download button. The storefront's helper plugin shows the button when the order meta `_ims_invoice_pdf_available` is `yes`; the PDF bytes never go to the storefront (the plugin asks IMS for them when the customer clicks). Publishing is the ownership-map operation `woocommerce.order.invoice-document`, driven by the outbox operation `woocommerce/order.invoice-document`.
+
+**It is OFF.** Nothing is scanned, queued, claimed or written unless the setting **`wc_invoice_document_enabled`** is exactly `true` (unset, empty or anything else is off; writers:check reports the operation as switchable by this setting). Turning it on does not by itself write anything to the storefront either: every write also meets the existing producer-side hold (see below).
+
+* **Scan.** The `shopping-webhook-inbox` cron (which already drains the other storefront jobs) scans, while the setting is on, for current INVOICE documents of storefront-linked orders that are not withdrawn and whose order has no flag marker yet, and queues one job per (order, document) through the producer seam. Documents stored by the sweep, by a customer's first click on a historic order, or before the setting was turned on are all found this way, and a lost enqueue heals on the next pass. Orders created before the storefront's live-from instant are never queued: they are not IMS's to publish.
+* **Hold.** While the producer-side hold stands, a queued job is a shadow (a record, no row), the drain claims nothing and spends no attempt, and the transport barrier (`wcPut`) refuses anyway. A job queued before the destination went live is refused again at the last check before sending.
+* **Attempt.** Fenced like the other storefront jobs (deadline, row ownership, writer-side cut-off) and, immediately before the PUT, **IMS must still hold a document it would serve to the customer** (`loadCurrentInvoicePdf`): a withdrawn, order-changed, number-shared, missing or altered document writes nothing and is retried. A held, rejected or unconfirmed write is a retry (8 attempts, then Sync > Exceptions); the only successes are written, already published, and an order that no longer has a storefront link.
+* **Marker.** After the storefront accepts the PUT, `InvoiceStorePublication.flagDocumentId` / `flagWrittenAt` record it. A repeat for the same document sends nothing. The PUT is an absolute value, so a lost marker costs one harmless repeat.
+* **Not undone.** IMS does not clear the flag when a document is later withdrawn: the customer route refuses to serve it, so the button answers "not available". Clearing the meta (rollback) is a manual step.
+
+**The invoice note** (`woocommerce.order.invoice-note`) is a separate operation and writer. It still exists only for an invoice IMS posted itself and is not triggered for an invoice the incumbent posted. It is now written at most once per ledger invoice id (`InvoiceStorePublication.noteInvoiceId` / `noteWrittenAt`): before the marker, a failed or held meta write made the whole call fail and the queue retried it by posting the note again. It no longer writes the download flag; the note follow-up never writes the flag: only the guarded job does, and only for a stored document, so an invoice IMS posted itself (flat file, no document row) gets no flag from this change.
+
+**Not built here:** the runbook (order of operations at the switchover, duplicate-button overlap while the old plugin is still on, rollback), the e-mail hook-up and the credit note download route.
+

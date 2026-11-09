@@ -113,6 +113,7 @@ export const IMS_WRITER_SWITCHES: readonly Switch[] = [
   { key: 'woocommerce.order.partial-shipment', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }] },
   { key: 'woocommerce.order.wms-status-meta', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }] },
   { key: 'woocommerce.order.invoice-note', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, ...XERO_MASTER, { mode: 'xero_sync_sales_invoice' }] },
+  { key: 'woocommerce.order.invoice-document', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, { settingTrue: 'wc_invoice_document_enabled', defaultValue: 'false' }] },
   { key: 'woocommerce.fx-rates', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, { settingTrue: 'wc_fx_push_enabled', defaultValue: 'false' }] },
   { key: 'woocommerce.webhooks', trigger: 'operator', requires: [{ plugin: 'woocommerce' }] },
 ]
@@ -124,7 +125,6 @@ export const WRITERS_WITHOUT_IMS_SWITCH: Readonly<Record<string, string>> = {
   'mintsoft.auth.login': 'key minting is governed by the transport hold, not by a producer',
   'woocommerce.order.withdrawal-outcome': 'the endpoint lives in the storefront plugin; IMS only receives',
   'woocommerce.order.trackship-reconcile': 'the endpoint lives in the storefront plugin; IMS only receives',
-  'woocommerce.order.invoice-document': 'IMS has no writer for it yet',
   'woocommerce.tax-rate': 'IMS has no writer for it yet (P1: the owner corrects WooCommerce by hand from the VAT difference report; the P2 writer is a later build)',
 }
 

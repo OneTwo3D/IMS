@@ -224,6 +224,7 @@ export const WRITER_OWNERSHIP_MAP = [
   }),
   row('woocommerce', 'order.invoice-document', { P1: 'xeroom', P2: 'IMS' }, {
     obligationTime: 'required',
+    outboxOperations: ['woocommerce/order.invoice-document'],
     note: 'Owner answer 4: IMS puts the one invoice (generated in Xero) into the customer\'s My Account, replacing what Xeroom and the PDF-invoices plugin do today.',
   }),
   row('woocommerce', 'fx-rates', { P1: 'aelia', P2: 'aelia' }, {

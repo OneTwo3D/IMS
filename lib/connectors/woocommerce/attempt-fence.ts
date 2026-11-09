@@ -51,6 +51,11 @@ export function runWithWcAttemptFence<T>(fence: WcAttemptFence, fn: () => Promis
   return storage.run(fence, fn)
 }
 
+/** True only inside a drain's fenced attempt. A writer that must never run outside one asks this before it writes. */
+export function isInsideWcAttemptFence(): boolean {
+  return storage.getStore() !== undefined
+}
+
 /** The ambient attempt signal, if a completion attempt is running. */
 export function currentWcAttemptSignal(): AbortSignal | undefined {
   return storage.getStore()?.signal

@@ -2037,6 +2037,7 @@ model SalesOrder {
   returnExpectations ReturnExpectation[]
   invoiceDocuments  SalesOrderInvoiceDocument[]
   invoiceDocumentFetches InvoiceDocumentFetchState[]
+  invoiceStorePublication InvoiceStorePublication?
   payments          Payment[]
   allocations       OrderAllocation[]
   shipments         Shipment[]
@@ -2296,6 +2297,29 @@ model SalesOrderInvoiceDocument {
   @@index([orderId, kind])
   @@index([refundId])
   @@map("sales_order_invoice_documents")
+}
+
+/// What IMS has already written to the storefront order about its customer invoice, so a retried writer never repeats a write that landed.
+/// One row per order. The NOTE marker belongs to the invoice-note writer (an admin note naming an IMS-posted ledger invoice): the note is
+/// APPENDED by the storefront, so a repeat would add a second one. The FLAG marker belongs to the invoice-document writer (the order meta
+/// that makes the storefront show the download button). Not a statutory record: it only remembers writes, and goes with the order.
+model InvoiceStorePublication {
+  id              String    @id @default(cuid())
+  orderId         String    @unique @map("order_id")
+  /// The ledger invoice id the admin note was written for. A note for another invoice id is a new note.
+  noteInvoiceId   String?   @map("note_invoice_id")
+  noteWrittenAt   DateTime? @map("note_written_at")
+  /// The storefront's id for the note it created, when it said.
+  noteStoreId     String?   @map("note_store_id")
+  /// The SalesOrderInvoiceDocument id (or `legacy` for the flat file of an invoice IMS posted itself) the download flag was written for.
+  flagDocumentId  String?   @map("flag_document_id")
+  flagWrittenAt   DateTime? @map("flag_written_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  order SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@map("invoice_store_publications")
 }
 
 /// Where the fetch of one document stands: attempts, backoff, the last reason, and whether it needs a person.
