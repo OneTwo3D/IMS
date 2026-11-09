@@ -20,6 +20,69 @@ import {
 import { notify } from '@/lib/notifications'
 
 const CRITICAL_FINDINGS_HASH_SETTING = 'cron_invariant_check_critical_findings_hash'
+const NOTIFIABLE_WARNING_COUNTS_SETTING = 'cron_invariant_check_notifiable_warning_counts'
+
+/**
+ * The WARNING-level findings an admin is told about, in addition to every critical one. Short on purpose: each is a
+ * standing state that needs an operator's decision, not a drift that tidies itself, so a notification is actionable.
+ *
+ *  - stock_cost_layer_quantity_mismatch: on-hand above the remaining FIFO layers (unlayered stock; understates
+ *    valuation and mis-costs a later consumption).
+ *  - transfer_stranded_in_transit: goods dispatched and not received within the stranded window.
+ *  - accounting_sync_failed: a posting that failed and is held in the backlog.
+ *  - refund_missing_credit_note_sync / refund_missing_reversal_sync: refund money not yet mirrored in the ledger.
+ *  - refund_reversal_record_undecidable: a refund that still owes accounting and must be decided by hand.
+ *
+ * Notification is on CHANGE only: a code that newly appears or whose count rises. See notifiableWarningIncreases.
+ */
+export const NOTIFIABLE_WARNING_CODES: readonly string[] = [
+  'stock_cost_layer_quantity_mismatch',
+  'transfer_stranded_in_transit',
+  'accounting_sync_failed',
+  'refund_missing_credit_note_sync',
+  'refund_missing_reversal_sync',
+  'refund_reversal_record_undecidable',
+]
+
+export type NotifiableWarningCounts = Record<string, number>
+
+export function countNotifiableWarnings(
+  findings: ReadonlyArray<{ severity: string; code: string }>,
+): NotifiableWarningCounts {
+  const counts: NotifiableWarningCounts = {}
+  for (const finding of findings) {
+    if (finding.severity !== 'warning' || !NOTIFIABLE_WARNING_CODES.includes(finding.code)) continue
+    counts[finding.code] = (counts[finding.code] ?? 0) + 1
+  }
+  return counts
+}
+
+/** The codes whose count is above the previous run's (a code absent before counts as zero). Falling counts are not news. */
+export function notifiableWarningIncreases(
+  previous: NotifiableWarningCounts,
+  current: NotifiableWarningCounts,
+): Array<{ code: string; previous: number; current: number }> {
+  return Object.entries(current)
+    .filter(([code, count]) => count > (previous[code] ?? 0))
+    .map(([code, count]) => ({ code, previous: previous[code] ?? 0, current: count }))
+    .sort((a, b) => a.code.localeCompare(b.code))
+}
+
+function parseWarningCounts(raw: string | null | undefined): NotifiableWarningCounts {
+  if (!raw) return {}
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const counts: NotifiableWarningCounts = {}
+    for (const [code, value] of Object.entries(parsed)) {
+      if (typeof value === 'number' && Number.isFinite(value) && value > 0) counts[code] = value
+    }
+    return counts
+  } catch {
+    return {}
+  }
+}
+
 const DEFAULT_INVENTORY_INVARIANT_PAGE_SIZE = 500
 const DEFAULT_INVENTORY_INVARIANT_MAX_FINDINGS = 5000
 const DEFAULT_STOCK_MOVEMENT_LOOKBACK_DAYS = 90
@@ -95,6 +158,8 @@ type ScheduledInvariantCheckDependencies = {
   notifyAdmins?: (params: Omit<Parameters<typeof notify>[0], 'userId'>) => Promise<void>
   getPreviousCriticalFindingsHash?: () => Promise<string | null>
   setCriticalFindingsHash?: (hash: string | null) => Promise<void>
+  getPreviousWarningCounts?: () => Promise<NotifiableWarningCounts>
+  setWarningCounts?: (counts: NotifiableWarningCounts) => Promise<void>
 }
 
 const EMPTY_SUMMARY: InvariantReportSummary = {
@@ -231,6 +296,23 @@ async function setCriticalFindingsHash(hash: string | null): Promise<void> {
   })
 }
 
+async function getPreviousWarningCounts(): Promise<NotifiableWarningCounts> {
+  const setting = await db.setting.findUnique({
+    where: { key: NOTIFIABLE_WARNING_COUNTS_SETTING },
+    select: { value: true },
+  })
+  return parseWarningCounts(setting?.value)
+}
+
+async function setWarningCounts(counts: NotifiableWarningCounts): Promise<void> {
+  const value = JSON.stringify(counts)
+  await db.setting.upsert({
+    where: { key: NOTIFIABLE_WARNING_COUNTS_SETTING },
+    create: { key: NOTIFIABLE_WARNING_COUNTS_SETTING, value },
+    update: { value },
+  })
+}
+
 async function notifyActiveAdmins(params: Omit<Parameters<typeof notify>[0], 'userId'>): Promise<void> {
   const admins = await db.user.findMany({
     where: {
@@ -263,6 +345,8 @@ export async function runScheduledInvariantCheck(
   const notifyAdmins = dependencies.notifyAdmins ?? notifyActiveAdmins
   const readCriticalFindingsHash = dependencies.getPreviousCriticalFindingsHash ?? getPreviousCriticalFindingsHash
   const writeCriticalFindingsHash = dependencies.setCriticalFindingsHash ?? setCriticalFindingsHash
+  const readWarningCounts = dependencies.getPreviousWarningCounts ?? getPreviousWarningCounts
+  const writeWarningCounts = dependencies.setWarningCounts ?? setWarningCounts
 
   const [inventoryResult, accountingResult, salesResult] = await Promise.allSettled([
     runInventoryReport(),
@@ -346,6 +430,23 @@ export async function runScheduledInvariantCheck(
     }
   } else {
     await writeCriticalFindingsHash(null)
+  }
+
+  // A report that failed to run says nothing about its findings, so the baseline is only moved when all three ran:
+  // otherwise a failed domain would read as "cleared" and its next successful run as "newly appeared".
+  if (errors.length === 0 && inventory && accounting && sales) {
+    const currentWarnings = countNotifiableWarnings([...inventory.findings, ...accounting.findings, ...sales.findings])
+    const increases = notifiableWarningIncreases(await readWarningCounts(), currentWarnings)
+    await writeWarningCounts(currentWarnings)
+    if (increases.length > 0) {
+      await notifyAdmins({
+        type: 'warning',
+        title: 'Invariant warnings need attention',
+        message: `Scheduled invariant check ${runId}: ${increases
+          .map((entry) => `${entry.code} ${entry.previous} -> ${entry.current}`)
+          .join(', ')}.`,
+      })
+    }
   }
 
   return result

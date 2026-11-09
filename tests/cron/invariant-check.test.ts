@@ -3,7 +3,12 @@ import test from 'node:test'
 
 import { GET } from '@/app/api/cron/invariant-check/route'
 import { getAllCronJobs } from '@/lib/cron-jobs'
-import { runScheduledInvariantCheck } from '@/lib/cron/invariant-check'
+import {
+  countNotifiableWarnings,
+  NOTIFIABLE_WARNING_CODES,
+  notifiableWarningIncreases,
+  runScheduledInvariantCheck,
+} from '@/lib/cron/invariant-check'
 import type { AccountingInvariantReport } from '@/lib/domain/accounting/invariants'
 import type { InventoryInvariantReport } from '@/lib/domain/inventory/invariants'
 import type { RefundStatusReconciliationReport } from '@/lib/domain/sales/refund-status-reconciliation'
@@ -40,6 +45,15 @@ async function withCronEnv(env: CronEnv, fn: () => Promise<void>): Promise<void>
         mutableEnv[key] = previous[key]
       }
     }
+  }
+}
+
+function warningStore(initial: Record<string, number> = {}) {
+  let stored = initial
+  return {
+    getPreviousWarningCounts: async () => stored,
+    setWarningCounts: async (counts: Record<string, number>) => { stored = counts },
+    read: () => stored,
   }
 }
 
@@ -153,6 +167,7 @@ test('scheduled invariant check logs counts and notifies only for critical findi
     setCriticalFindingsHash: async (hash) => {
       storedCriticalHash = hash
     },
+    ...warningStore({ stock_cost_layer_quantity_mismatch: 1 }),
   })
 
   assert.equal(result.runId, 'run-1')
@@ -202,6 +217,7 @@ test('scheduled invariant check logs counts and notifies only for critical findi
     setCriticalFindingsHash: async (hash) => {
       storedCriticalHash = hash
     },
+    ...warningStore({ stock_cost_layer_quantity_mismatch: 1 }),
   })
 
   assert.equal(repeatedResult.status, 'completed')
@@ -236,6 +252,7 @@ test('scheduled invariant check does not notify when there are no critical findi
     setCriticalFindingsHash: async (hash) => {
       storedCriticalHash = hash
     },
+    ...warningStore({ stock_cost_layer_quantity_mismatch: 1 }),
   })
 
   assert.equal(result.status, 'completed')
@@ -279,6 +296,7 @@ test('scheduled invariant check logs partial report failures without discarding 
     setCriticalFindingsHash: async (hash) => {
       storedCriticalHash = hash
     },
+    ...warningStore({ stock_cost_layer_quantity_mismatch: 1 }),
   })
 
   assert.equal(result.status, 'partial_failure')
@@ -296,4 +314,119 @@ test('scheduled invariant check logs partial report failures without discarding 
     'inventory query failed',
   )
   assert.equal(notifications.length, 1)
+})
+
+const emptyReport = (checkedAt: string) => ({
+  checkedAt,
+  findings: [],
+  summary: { total: 0, info: 0, warning: 0, critical: 0 },
+})
+
+function warningFindings(code: string, n: number) {
+  return Array.from({ length: n }, (_, i) => ({
+    severity: 'warning' as const,
+    code,
+    productId: `p-${i}`,
+    warehouseId: 'w-1',
+    message: 'Stock quantity does not match remaining cost-layer quantity',
+    details: {},
+  }))
+}
+
+async function runWithWarnings(
+  store: ReturnType<typeof warningStore>,
+  inventoryFindings: ReturnType<typeof warningFindings>,
+  notifications: Array<Record<string, unknown>>,
+) {
+  return runScheduledInvariantCheck({
+    createRunId: () => 'run-w',
+    runInventoryReport: async () => ({
+      checkedAt: '2026-01-01T00:00:01.000Z',
+      findings: inventoryFindings,
+      summary: { total: inventoryFindings.length, info: 0, warning: inventoryFindings.length, critical: 0 },
+    }),
+    runAccountingReport: async () => emptyReport('2026-01-01T00:00:02.000Z'),
+    runSalesReport: async () => cleanSalesReport(),
+    writeActivityLog: async () => {},
+    notifyAdmins: async (n) => { notifications.push(n) },
+    getPreviousCriticalFindingsHash: async () => null,
+    setCriticalFindingsHash: async () => {},
+    ...store,
+  })
+}
+
+test('named warning codes notify when newly appearing or rising, and are quiet otherwise', async () => {
+  const notifications: Array<Record<string, unknown>> = []
+  const store = warningStore()
+  const code = 'stock_cost_layer_quantity_mismatch'
+
+  await runWithWarnings(store, warningFindings(code, 2), notifications)
+  assert.equal(notifications.length, 1, 'newly appearing')
+  assert.equal(notifications[0]?.type, 'warning')
+  assert.match(String(notifications[0]?.message), /stock_cost_layer_quantity_mismatch 0 -> 2/)
+
+  await runWithWarnings(store, warningFindings(code, 2), notifications)
+  assert.equal(notifications.length, 1, 'same count is deduplicated')
+
+  await runWithWarnings(store, warningFindings(code, 1), notifications)
+  assert.equal(notifications.length, 1, 'a falling count is not news')
+  assert.deepEqual(store.read(), { [code]: 1 }, 'but it lowers the baseline')
+
+  await runWithWarnings(store, warningFindings(code, 2), notifications)
+  assert.equal(notifications.length, 2, 'rising again after a fall notifies again')
+
+  await runWithWarnings(store, [], notifications)
+  assert.deepEqual(store.read(), {}, 'cleared')
+  await runWithWarnings(store, warningFindings(code, 2), notifications)
+  assert.equal(notifications.length, 3, 'reappearing after a clear notifies')
+})
+
+test('warnings outside the named set never notify, and a failed report leaves the baseline alone', async () => {
+  const notifications: Array<Record<string, unknown>> = []
+  const store = warningStore({ transfer_stranded_in_transit: 3 })
+  await runWithWarnings(store, warningFindings('stock_negative_reserved_quantity_unlisted', 5), notifications)
+  assert.equal(notifications.length, 0)
+  assert.deepEqual(store.read(), {})
+
+  const baseline = warningStore({ transfer_stranded_in_transit: 3 })
+  const result = await runScheduledInvariantCheck({
+    createRunId: () => 'run-f',
+    runInventoryReport: async () => { throw new Error('boom') },
+    runAccountingReport: async () => emptyReport('2026-01-01T00:00:02.000Z'),
+    runSalesReport: async () => cleanSalesReport(),
+    writeActivityLog: async () => {},
+    notifyAdmins: async (n) => { notifications.push(n) },
+    getPreviousCriticalFindingsHash: async () => null,
+    setCriticalFindingsHash: async () => {},
+    ...baseline,
+  })
+  assert.equal(result.status, 'partial_failure')
+  assert.equal(notifications.length, 0)
+  assert.deepEqual(baseline.read(), { transfer_stranded_in_transit: 3 })
+})
+
+test('notifiable warning helpers count only named warning-severity findings', () => {
+  assert.deepEqual(
+    countNotifiableWarnings([
+      { severity: 'warning', code: 'accounting_sync_failed' },
+      { severity: 'warning', code: 'accounting_sync_failed' },
+      { severity: 'critical', code: 'accounting_sync_failed' },
+      { severity: 'warning', code: 'sales_order_stage_dates_out_of_order' },
+    ]),
+    { accounting_sync_failed: 2 },
+  )
+  assert.deepEqual(notifiableWarningIncreases({ a: 2 }, { a: 2, b: 1 }), [{ code: 'b', previous: 0, current: 1 }])
+})
+
+test('every named warning code exists as a warning in the domain it is read from', async () => {
+  const { readFileSync } = await import('node:fs')
+  const sources = [
+    'lib/domain/inventory/invariants.ts',
+    'lib/domain/accounting/invariants.ts',
+  ].map((file) => readFileSync(file, 'utf8')).join('\n')
+  for (const code of NOTIFIABLE_WARNING_CODES) {
+    const at = sources.indexOf(`code: '${code}'`)
+    assert.ok(at > 0, `${code} is emitted`)
+    assert.match(sources.slice(Math.max(0, at - 160), at), /severity: 'warning'/, `${code} is a warning`)
+  }
 })

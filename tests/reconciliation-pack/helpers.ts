@@ -30,7 +30,7 @@ export function passItem(id: PackItemId): ItemInput {
   return { id, outcome: 'pass', reasons: [], proof: { kind: 'proven-empty', source: 'snapshot-run-row-present' }, sources: [...getPackItem(id).sources] }
 }
 export const STAMP = '2026-10-19T00:00:00.000Z'
-export const allBrackets = (stamp: string = STAMP) => (['woocommerce-order-sweep', 'mintsoft-stock-sync', 'mintsoft-dispatch-poll', 'mintsoft-order-status', 'xero-balance-snapshots', 'xero-tax-rates'] as const).map((stream) => ({ stream, start: stamp, end: stamp }))
+export const allBrackets = (stamp: string = STAMP) => (['woocommerce-order-sweep', 'mintsoft-stock-sync', 'mintsoft-dispatch-poll', 'mintsoft-order-status', 'xero-balance-snapshots', 'xero-tax-rates', 'xero-chart-of-accounts'] as const).map((stream) => ({ stream, start: stamp, end: stamp }))
 
 /** An item input built from a real comparison, the way a runner will build one. */
 export function itemFromComparison(id: PackItemId, input: Partial<Omit<CompareInput, 'mode' | 'tolerance'>> & Pick<CompareInput, 'ims' | 'vendor'>): { item: ItemInput; result: CompareResult } {

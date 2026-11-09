@@ -8,6 +8,11 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Ops alerting and chart-of-accounts refresh
+
+- **Added: a daily, read-only refresh of the Xero chart of accounts (`xero-chart-sync`, 00:30).** It reads Xero's Accounts list with one GET, stores the whole chart and advances its own read-sync last-success stamp in one connection-fenced transaction; the read-sync liveness alarm now watches it (a seventh feed, stale after 36 hours). An on-demand refresh from the Sync page does not advance the stamp.
+- **Changed: the scheduled invariant check also notifies admins about a short named set of warnings.** `stock_cost_layer_quantity_mismatch`, `transfer_stranded_in_transit`, `accounting_sync_failed`, `refund_missing_credit_note_sync`, `refund_missing_reversal_sync` and `refund_reversal_record_undecidable`. It notifies only when a code newly appears or its count rises since the previous complete run; critical findings notify exactly as before.
+
 ### WooCommerce invoice notes are floored by the WooCommerce live-from instant
 
 - **Fixed: a queued WooCommerce invoice note is judged against `WC_WRITES_LIVE_FROM`, not `XERO_WRITES_LIVE_FROM`.** The note is a WooCommerce write that rides the accounting queue. Its claim, selection, re-queue refusal and last check before sending now use the WooCommerce cut-off, and every Xero write keeps the Xero one. Before this, a note created after the Xero instant but before the WooCommerce one would have been sent while the former writer still owned that write. `npm run outbound:status` counts the note under WooCommerce, with its own floor. Nothing changes while the producer hold is not enforced.

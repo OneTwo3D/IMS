@@ -23,6 +23,7 @@ export const READ_SYNC_STREAM_IDS = [
   'mintsoft-order-status',
   'xero-balance-snapshots',
   'xero-tax-rates',
+  'xero-chart-of-accounts',
 ] as const
 export type ReadSyncStreamId = (typeof READ_SYNC_STREAM_IDS)[number]
 
@@ -80,6 +81,9 @@ export const XERO_BALANCE_SNAPSHOT_LAST_SUCCESS_SETTING = 'xero_balance_snapshot
 /** The stamp the Xero tax-rate read has always written, after its snapshot, inside one connection-fenced transaction. */
 export const XERO_TAX_RATE_LAST_SUCCESS_SETTING = 'xero_tax_rate_drift_last_checked_at'
 
+/** The stamp written, with the stored chart, by a scheduled chart-of-accounts refresh that stored the whole chart. */
+export const XERO_CHART_OF_ACCOUNTS_LAST_SUCCESS_SETTING = 'xero_chart_of_accounts_last_success_at'
+
 /** When the alarm job first evaluated; a stream that has never succeeded is only alarmed once the limit has run since. */
 export const READ_SYNC_FIRST_EVALUATED_SETTING = 'read_sync_liveness_first_evaluated_at'
 export const READ_SYNC_ALERTED_SETTING_PREFIX = 'read_sync_liveness_alerted_'
@@ -93,6 +97,7 @@ export const READ_SYNC_OWNED_SETTING_KEYS: readonly string[] = [
   WC_ORDER_SWEEP_LAST_SUCCESS_SETTING,
   WMS_ORDER_STATUS_LAST_SUCCESS_SETTING,
   XERO_BALANCE_SNAPSHOT_LAST_SUCCESS_SETTING,
+  XERO_CHART_OF_ACCOUNTS_LAST_SUCCESS_SETTING,
   READ_SYNC_FIRST_EVALUATED_SETTING,
   ...READ_SYNC_STREAM_IDS.map(readSyncAlertedSettingKey),
 ]
@@ -168,6 +173,18 @@ export const READ_SYNC_STREAMS: readonly ReadSyncStreamDef[] = [
     cadence: 'hourly (the xero-tax-rate-drift job)',
     successMeans: 'the sweep read the full Xero tax-rate list, validated every row and stored the list with its header row (and its drift result) in one transaction; a sweep that found no drift counts, and a response that was empty, partial or malformed does not',
     rationale: 'six missed hourly runs, long enough to ride out a Xero outage or rate-limit window',
+    alarm: 'read-sync-liveness',
+  },
+  {
+    id: 'xero-chart-of-accounts',
+    label: 'Xero chart-of-accounts refresh',
+    plugin: 'xero',
+    cronSlug: 'xero-chart-sync',
+    source: { kind: 'setting', key: XERO_CHART_OF_ACCOUNTS_LAST_SUCCESS_SETTING },
+    maxAge: { kind: 'fixed', ms: 36 * HOUR_MS },
+    cadence: 'daily at 00:30 (the xero-chart-sync job), ahead of the 01:00 balance-snapshot pull that matches its account codes against the stored chart',
+    successMeans: 'the scheduled refresh read the full Xero chart of accounts and stored it in one connection-fenced transaction together with its stamp; an on-demand refresh from the Sync page does not count, and a response that was empty, partial or malformed does not',
+    rationale: 'a day and a half: one missed daily run is the first thing that is not explained by the schedule',
     alarm: 'read-sync-liveness',
   },
 ]

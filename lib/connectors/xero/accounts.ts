@@ -5,6 +5,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { xeroGet, xeroGetCached } from './api'
+import { XERO_CHART_OF_ACCOUNTS_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
 import { captureXeroConnection, withXeroConnectionFence } from './connection-fence'
 
 const XERO_CONNECTOR = 'xero'
@@ -70,7 +71,9 @@ export async function storeChartOfAccounts(tx: Pick<Prisma.TransactionClient, 'a
 /**
  * Pull the full chart of accounts from Xero and upsert into AccountingAccount.
  */
-export async function syncChartOfAccounts(): Promise<{ synced: number; errors: string[] }> {
+export async function syncChartOfAccounts(
+  options: { recordScheduledSuccess?: boolean } = {},
+): Promise<{ synced: number; errors: string[] }> {
   // o3d-6thk1 round 3: the connection the fetch is made under is remembered BEFORE it, and the write below is
   // refused if a rebind happened in between (see connection-fence.ts). Without that, a refresh that fetched
   // organisation A could land A's chart AFTER the rebind to B had cleared the cache, and the Sync page would
@@ -80,7 +83,20 @@ export async function syncChartOfAccounts(): Promise<{ synced: number; errors: s
   if (!fetched.ok) return { synced: 0, errors: [fetched.error] }
   let fenced
   try {
-    fenced = await withXeroConnectionFence(connection, (tx) => storeChartOfAccounts(tx, fetched.accounts), { timeoutMs: 120_000 })
+    fenced = await withXeroConnectionFence(connection, async (tx) => {
+      const stored = await storeChartOfAccounts(tx, fetched.accounts)
+      // The read-sync last-success stamp is written in THIS transaction, with the chart, and only by the scheduled
+      // refresh: an on-demand refresh from the Sync page does not advance it. An empty chart is not a success.
+      if (options.recordScheduledSuccess === true && stored > 0) {
+        const stampedAt = new Date().toISOString()
+        await tx.setting.upsert({
+          where: { key: XERO_CHART_OF_ACCOUNTS_LAST_SUCCESS_SETTING },
+          create: { key: XERO_CHART_OF_ACCOUNTS_LAST_SUCCESS_SETTING, value: stampedAt },
+          update: { value: stampedAt },
+        })
+      }
+      return stored
+    }, { timeoutMs: 120_000 })
   } catch (e) {
     return { synced: 0, errors: [`Chart of accounts was not stored: ${String(e)}`] }
   }
