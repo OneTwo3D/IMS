@@ -59,6 +59,7 @@ import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { refuseUnreconciledDocument } from '@/lib/domain/accounting/document-tax-reconciliation'
+import { salesDocumentTaxTypeRefusal, type SalesDocumentTaxTypeInput, type SalesNoTaxLineKind } from '@/lib/domain/accounting/sales-document-tax-types'
 import { storeCreditBlock, type StoreCreditBlock, storeCreditCreditNotePosterError, storeCreditFollowUpPosterError, storeCreditInvoicePosterError } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import {
   BACK_REFERENCE_REPAIRABLE_STATUSES,
@@ -6195,6 +6196,10 @@ export async function processClaimedEntry(
       // attached — see lib/domain/accounting/document-tax-reconciliation.ts.
       const reconciled = refuseUnreconciledDocument(payload)
       if (!reconciled.post) return { success: false, error: reconciled.reason }
+      // A line with no decided tax type, or an explicit NONE on a line that does not name why, is refused here with the document's own
+      // words - at the head of the case, before any read or claim - and again by the connector as the last word.
+      const untypedInvoice = salesDocumentTaxTypeRefusal(`Sales invoice ${String(payload.invoiceNumber ?? '(no number)')}`, payload as SalesDocumentTaxTypeInput)
+      if (untypedInvoice) return { success: false, error: untypedInvoice }
       const guard = await guardCancelledSalesOrderInvoice(attempt, referenceType, referenceId, lease)
       if (!guard.post) return guard.result
       const customerId = guard.customerId
@@ -6220,7 +6225,7 @@ export async function processClaimedEntry(
         dueDate: payload.dueDate as string | undefined,
         currency: payload.currency as string,
         currencyRateToBase: payload.currencyRateToBase as number | undefined,
-        lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; discountAmount?: number }>,
+        lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; noTaxKind?: SalesNoTaxLineKind; discountAmount?: number }>,
         shippingAmount: payload.shippingAmount as number | undefined,
         shippingDescription: payload.shippingDescription as string | undefined,
         shippingAccountCode: payload.shippingAccountCode as string | undefined,
@@ -6242,6 +6247,9 @@ export async function processClaimedEntry(
       // same damage as the create and one step harder to spot.
       const reconciledUpdate = refuseUnreconciledDocument(payload)
       if (!reconciledUpdate.post) return { success: false, error: reconciledUpdate.reason }
+      // As the create: an update must not overwrite a good document with one carrying an undecided tax type.
+      const untypedUpdate = salesDocumentTaxTypeRefusal(`Sales invoice ${String(payload.invoiceNumber ?? '(no number)')}`, payload as SalesDocumentTaxTypeInput)
+      if (untypedUpdate) return { success: false, error: untypedUpdate }
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       if (!accountingInvoiceId) {
         return { success: false, error: 'Missing accountingInvoiceId for SALES_INVOICE_UPDATE' }
@@ -6265,7 +6273,7 @@ export async function processClaimedEntry(
         dueDate: payload.dueDate as string | undefined,
         currency: payload.currency as string,
         currencyRateToBase: payload.currencyRateToBase as number | undefined,
-        lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; discountAmount?: number }>,
+        lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; noTaxKind?: SalesNoTaxLineKind; discountAmount?: number }>,
         shippingAmount: payload.shippingAmount as number | undefined,
         shippingDescription: payload.shippingDescription as string | undefined,
         shippingAccountCode: payload.shippingAccountCode as string | undefined,
@@ -6676,6 +6684,9 @@ export async function processClaimedEntry(
     }
 
     case 'CREDIT_NOTE': {
+      // As the sales invoice: no decided tax type, no document. Before the store-credit guard's reads and any claim.
+      const untypedCreditNote = salesDocumentTaxTypeRefusal(`Credit note ${String(payload.creditNoteNumber ?? '(no number)')}`, payload as SalesDocumentTaxTypeInput)
+      if (untypedCreditNote) return { success: false, error: untypedCreditNote }
       const storeCreditRefusal = await guardStoreCreditCreditNote(referenceType, referenceId)
       if (storeCreditRefusal) return storeCreditRefusal
       const creditCustomerId = referenceType === 'SalesOrderRefund'
@@ -6696,7 +6707,7 @@ export async function processClaimedEntry(
         date: payload.date as string,
         currency: payload.currency as string,
         currencyRateToBase: payload.currencyRateToBase as number | undefined,
-        lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
+        lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; noTaxKind?: SalesNoTaxLineKind }>,
         reference: payload.reference as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId, contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))

@@ -50,15 +50,15 @@ test.beforeEach(() => { wire.length = 0; contactResolves = 0; itemResolves = 0 }
 
 const invoice = (extra: Partial<InvoiceData> = {}): InvoiceData => ({
   invoiceNumber: 'INV-1', contactName: 'Customer', date: '2026-08-20', currency: 'EUR',
-  lines: [{ itemCode: 'SKU-1', description: 'Widget', quantity: 1, unitAmount: 10, accountCode: '200' }], ...extra,
+  lines: [{ itemCode: 'SKU-1', description: 'Widget', quantity: 1, unitAmount: 10, accountCode: '200', taxType: 'OUTPUT2' }], ...extra,
 }) as InvoiceData
 const billData = (extra: Partial<BillData> = {}): BillData => ({
   invoiceNumber: 'B-1', contactName: 'Supplier', date: '2026-08-20', currency: 'EUR',
-  lines: [{ description: 'Goods', quantity: 1, unitAmount: 10, accountCode: '630' }], ...extra,
+  lines: [{ description: 'Goods', quantity: 1, unitAmount: 10, accountCode: '630', taxType: 'OUTPUT2' }], ...extra,
 }) as BillData
 const credit = (extra: Partial<CreditNoteData> = {}): CreditNoteData => ({
   creditNoteNumber: 'SCN-scn-2', contactName: 'Supplier', date: '2026-08-20', currency: 'EUR',
-  lines: [{ description: 'Credit', quantity: 1, unitAmount: 10, accountCode: '6200' }], ...extra,
+  lines: [{ description: 'Credit', quantity: 1, unitAmount: 10, accountCode: '6200', taxType: 'OUTPUT2' }], ...extra,
 }) as CreditNoteData
 
 const UNUSABLE: Array<[string, unknown]> = [

@@ -121,6 +121,7 @@ async function buildInvoiceForWcOrder(order: {
       shippingTaxType: 'OUTPUT2',
       discountAmount,
       discountAccountCode: '210',
+      discountTaxType: 'OUTPUT2',
       lineAmountsIncludeTax,
     },
     'AUTHORISED',

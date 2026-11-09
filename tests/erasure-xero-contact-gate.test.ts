@@ -16,8 +16,8 @@ mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async 
 mock.module('../lib/connectors/xero/api.ts', { namedExports: { xeroPost: async () => { throw new Error('no post expected'); }, xeroGet: async () => ({}), xeroPut: async () => ({}) } })
 
 const REAL = { contactName: 'Zebediah Quillfeather', contactEmail: 'z.quillfeather@example.test' }
-const invoice = { invoiceNumber: 'INV-1', ...REAL, date: '2026-11-02', currency: 'GBP', lines: [{ description: 'Widget', quantity: 1, unitAmount: 10, accountCode: '200' }] }
-const creditNote = { creditNoteNumber: 'CN-1', ...REAL, date: '2026-11-02', currency: 'GBP', lines: [{ description: 'Widget', quantity: 1, unitAmount: 10, accountCode: '200' }] }
+const invoice = { invoiceNumber: 'INV-1', ...REAL, date: '2026-11-02', currency: 'GBP', lines: [{ description: 'Widget', quantity: 1, unitAmount: 10, accountCode: '200', taxType: 'OUTPUT2' }] }
+const creditNote = { creditNoteNumber: 'CN-1', ...REAL, date: '2026-11-02', currency: 'GBP', lines: [{ description: 'Widget', quantity: 1, unitAmount: 10, accountCode: '200', taxType: 'OUTPUT2' }] }
 const erased = async () => ({ ok: true as const, contactName: 'GDPR Anonymised', contactEmail: undefined })
 const unreadable = async () => ({ ok: false as const, error: 'erasure state unreadable; retried' })
 

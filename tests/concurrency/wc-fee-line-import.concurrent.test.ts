@@ -71,9 +71,9 @@ function payload(externalId: number, wcRateId: number, orderMeta: Array<{ id: nu
   }
 }
 
-async function seedTaxRate(db: Awaited<ReturnType<typeof loadDb>>, wcRateId: number) {
-  const rate = await db.taxRate.create({ data: { name: `NL Standard ${randomUUID()}`, rate: 0.21, usedFor: 'SALES', accountingTaxType: 'OUTPUT2', countryCode: 'NL', taxCategory: 'STANDARD' } })
-  await db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: String(wcRateId), externalName: 'NL VAT', externalCountry: 'NL', externalRatePct: 21, taxRateId: rate.id } })
+async function seedTaxRate(db: Awaited<ReturnType<typeof loadDb>>, wcRateId: number, opts: { active?: boolean; mapped?: boolean } = {}) {
+  const rate = await db.taxRate.create({ data: { name: `NL Standard ${randomUUID()}`, rate: 0.21, usedFor: 'SALES', accountingTaxType: 'OUTPUT2', countryCode: 'NL', taxCategory: 'STANDARD', active: opts.active ?? true } })
+  if (opts.mapped !== false) await db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: String(wcRateId), externalName: 'NL VAT', externalCountry: 'NL', externalRatePct: 21, taxRateId: rate.id } })
   return rate
 }
 
@@ -141,6 +141,13 @@ test('[wclc fees] a new import mirrors taxed and untaxed fee lines, persists kin
     Object.fromEntries(lines.map((l) => [l.description, l.taxType])),
     { Widget: 'OUTPUT2', 'EU Import Duty': 'OUTPUT2', 'EU Customs Fee': 'OUTPUT2', 'Import Duty': 'NONE', 'EU Duty': 'NONE' },
   )
+  // The two lines on NONE name why (the connector refuses any other NONE); no other line carries a name; the ordinary document is NOT stamped.
+  const payloadLines = (invoice.payload as { lines: Array<{ description: string; noTaxKind?: string }> }).lines
+  assert.deepEqual(
+    Object.fromEntries(payloadLines.map((l) => [l.description, l.noTaxKind ?? null])),
+    { Widget: null, 'EU Import Duty': null, 'EU Customs Fee': null, 'Import Duty': 'fee-no-tax', 'EU Duty': 'fee-no-tax' },
+  )
+  assert.equal('_taxUnreconciled' in (invoice.payload as Record<string, unknown>), false)
   const rateOf = (type?: string) => (type === 'OUTPUT2' ? 0.21 : 0)
   const documentTotal = lines.reduce((sum, l) => {
     const net = Math.round(l.quantity * l.unitAmount * 100) / 100
@@ -184,3 +191,49 @@ test('[wclc fees] an EXISTING order updated by a later delivery keeps its lines 
     assert.equal(after.wclcHandlingComponent, null, 'no handling component appears from a later delivery')
   }
 })
+
+// A rate that moved money and is unmapped or inactive: the document is stamped (so the poster refuses it) and no payment is registered.
+for (const scenario of [
+  { label: 'a mapping to an INACTIVE IMS rate', seed: { active: false }, expect: /INACTIVE/ },
+  { label: 'a rate id with NO mapping', seed: { mapped: false }, expect: /has no mapping to an IMS tax rate/ },
+] as const) {
+  test(`[rate floor] ${scenario.label} that moved money stamps the invoice so the poster refuses it, and registers no payment`, { skip }, async (t) => {
+    const db = await loadDb()
+    await mockAccounting()
+    const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+    const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+    const externalId = Math.floor(Math.random() * 2_000_000_000)
+    const rate = await seedTaxRate(db, wcRateId, scenario.seed)
+    const warehouse = await db.warehouse.create({ data: { code: `WRF-${randomUUID().slice(0, 8)}`, name: 'Rate-floor test warehouse', syncToStore: true, availableForSale: true } })
+    let orderId: string | undefined
+    t.after(async () => {
+      orderId ??= (await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } }))?.orderId
+      if (orderId) {
+        await db.accountingSyncLog.deleteMany({ where: { referenceId: orderId } })
+        await db.activityLog.deleteMany({ where: { entityId: orderId } })
+        await db.payment.deleteMany({ where: { orderId } })
+        await db.salesOrderLine.deleteMany({ where: { orderId } })
+        await db.salesOrder.deleteMany({ where: { id: orderId } })
+      }
+      await db.shoppingOrderLink.deleteMany({ where: { connector: 'woocommerce', externalOrderId: String(externalId) } })
+      await db.shoppingTaxRateMapping.deleteMany({ where: { taxRateId: rate.id } })
+      await db.warehouse.deleteMany({ where: { id: warehouse.id } })
+      await db.taxRate.deleteMany({ where: { id: rate.id } })
+    })
+    const wc = { ...payload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }]), date_paid_gmt: '2026-11-02T09:05:00' }
+    const result = await importWcOrder(wc as never)
+    assert.equal(result.success, true, `import succeeded: ${JSON.stringify(result)}`)
+    orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+    const invoice = await db.accountingSyncLog.findFirst({ where: { type: 'SALES_INVOICE', referenceId: orderId! } })
+    assert.ok(invoice, 'the invoice row is queued deliberately so the refusal is visible as a failed row')
+    const body = invoice.payload as Record<string, unknown>
+    const marker = body._taxUnreconciled as { reason: string } | undefined
+    assert.ok(marker, 'the document is stamped')
+    assert.match(marker.reason, scenario.expect)
+    assert.match(marker.reason, new RegExp(`rate ${wcRateId}`))
+    assert.equal(body._registerPayment, false, 'no payment is registered against a document that will not post')
+    const logged = await db.activityLog.findFirst({ where: { entityId: orderId!, action: 'wc_invoice_tax_does_not_reconcile' } })
+    assert.ok(logged, 'and the refusal is on the activity log at ERROR')
+    assert.equal(logged.level, 'ERROR')
+  })
+}

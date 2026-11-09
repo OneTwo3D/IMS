@@ -12,6 +12,7 @@ import {
   withAccountingEgressAuthorization,
   type AccountingEgressRequest,
 } from '@/lib/connectors/accounting-egress-authorization'
+import { salesDocumentTaxTypeRefusal } from '@/lib/domain/accounting/sales-document-tax-types'
 import type { InvoiceData, InvoiceLine } from '../types'
 
 /**
@@ -100,6 +101,18 @@ type XeroInvoiceResponse = {
   }>
 }
 
+/** A sales invoice that would have posted a line with no decided tax type. Thrown by the builder; `prepareSalesInvoicePayload` turns it into a refusal. */
+export class XeroSalesDocumentTaxTypeError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'XeroSalesDocumentTaxTypeError'
+  }
+}
+
+export function isXeroSalesDocumentTaxTypeError(error: unknown): error is XeroSalesDocumentTaxTypeError {
+  return error instanceof XeroSalesDocumentTaxTypeError
+}
+
 // Exported for unit tests: the payload shape is where coupon/discount arithmetic actually resolves, and it
 // is far cheaper to pin here than through a full-chain order (o3d-lgo.5.1).
 export function buildSalesInvoicePayload(
@@ -118,10 +131,13 @@ export function buildSalesInvoicePayload(
     rateToBase: data.currencyRateToBase,
     what: `Sales invoice ${data.invoiceNumber ?? '(no number)'}`,
   })
-  // Xero requires a TaxType on every line item. "NONE" is the no-tax fallback
-  // for customers/products that carry no VAT, so we default to it whenever the
-  // caller hasn't supplied a specific tax type.
-  const DEFAULT_TAX_TYPE = 'NONE'
+  // Xero requires a TaxType on every line item, and there is NO default: a line that arrives without one is
+  // refused rather than posted on "NONE" (No VAT), which on a VAT-bearing sale silently books the VAT outside the
+  // return. An explicit NONE is accepted only on a line naming why it carries no tax. See
+  // lib/domain/accounting/sales-document-tax-types.ts. Thrown here so a direct caller of the builder cannot
+  // produce a payload either; `prepareSalesInvoicePayload` asks first so nothing is created in Xero.
+  const taxTypeRefusal = salesDocumentTaxTypeRefusal(`Sales invoice ${data.invoiceNumber ?? '(no number)'}`, data)
+  if (taxTypeRefusal) throw new XeroSalesDocumentTaxTypeError(taxTypeRefusal)
 
   // Build line items. Xero takes a per-line discount on a sales invoice (ACCREC) as either
   // `DiscountAmount` (absolute) or `DiscountRate` (a percentage) — we send the amount, so the generic
@@ -133,7 +149,7 @@ export function buildSalesInvoicePayload(
       Quantity: line.quantity,
       UnitAmount: line.unitAmount,
       AccountCode: line.accountCode,
-      TaxType: line.taxType || DEFAULT_TAX_TYPE,
+      TaxType: line.taxType,
     }
     if (line.itemCode && !droppedItemCodes.has(line.itemCode)) xeroLine.ItemCode = line.itemCode
     if (line.discountAmount && line.discountAmount > 0) {
@@ -151,27 +167,27 @@ export function buildSalesInvoicePayload(
 
   // Add shipping as separate line item. When the caller supplies a
   // shippingTaxType (e.g. the order has a VAT rate), use it so shipping is
-  // taxed at the same rate as the products. Otherwise fall back to NONE.
+  // taxed at the same rate as the products. There is no fallback: no type refuses (above).
   if (data.shippingAmount && data.shippingAmount > 0 && data.shippingAccountCode) {
     lineItems.push({
       Description: data.shippingDescription ?? 'Shipping',
       Quantity: 1,
       UnitAmount: data.shippingAmount,
       AccountCode: data.shippingAccountCode,
-      TaxType: data.shippingTaxType || DEFAULT_TAX_TYPE,
+      TaxType: data.shippingTaxType,
     })
   }
 
   // Add order-level discount as negative line item. Use the caller-supplied
   // tax type (matching the order's VAT rate) so the discount reduces the
-  // taxable base correctly. Falls back to NONE if omitted.
+  // taxable base correctly. No fallback: an omitted type refuses (above).
   if (data.discountAmount && data.discountAmount > 0 && data.discountAccountCode) {
     lineItems.push({
       Description: 'Order discount',
       Quantity: 1,
       UnitAmount: -data.discountAmount,
       AccountCode: data.discountAccountCode,
-      TaxType: data.discountTaxType || DEFAULT_TAX_TYPE,
+      TaxType: data.discountTaxType,
     })
   }
 
@@ -213,6 +229,10 @@ async function prepareSalesInvoicePayload(
   status: string,
   opts?: { customerId?: string; contactGate?: ContactGate },
 ): Promise<{ success: true; invoice: Record<string, unknown> } | { success: false; error: string }> {
+  // BEFORE every round trip, and before the base-currency read: a line with no decided tax type leaves no trace in Xero.
+  const taxTypeRefusal = salesDocumentTaxTypeRefusal(`Sales invoice ${data.invoiceNumber ?? '(no number)'}`, data)
+  if (taxTypeRefusal) return { success: false, error: taxTypeRefusal }
+
   // o3d-q0x56.3: BEFORE the contact and item round trips, which create things in Xero. A foreign invoice with no usable rate leaves no trace.
   const baseCurrency = await getBaseCurrencyCode()
   const rateProblem = foreignCurrencyRateProblem({
@@ -269,7 +289,7 @@ async function prepareSalesInvoicePayload(
       invoice: buildSalesInvoicePayload(data, status, contactResult.contactId, droppedItemCodes, baseCurrency),
     }
   } catch (error) {
-    if (isXeroForeignCurrencyRateError(error)) return { success: false, error: error.message }
+    if (isXeroForeignCurrencyRateError(error) || isXeroSalesDocumentTaxTypeError(error)) return { success: false, error: error.message }
     throw error
   }
 }

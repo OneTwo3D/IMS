@@ -388,8 +388,10 @@ test('the importer stamps the document it computed will not total to the order',
   const { readFileSync } = await import('node:fs')
   const src = withoutComments(readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8'))
 
-  assert.match(src, /const unreconciledReason = !documentTotalsToTheOrder/,
+  assert.match(src, /const taxMismatchReason = !shippingTax\.resolved \|\| !documentTaxReconciliation\.reconciles/,
     'the reason must be derived from the reconciliation, not re-decided at the payload')
+  assert.match(src, /const unreconciledReason = \[taxMismatchReason, rateMoneyRefusal\]/,
+    'a rate that moved money without a usable mapping stamps the document by the same marker')
   assert.match(
     src,
     /\.\.\.\(unreconciledReason\s*\n?\s*\? \{ \[UNRECONCILED_TAX_PAYLOAD_KEY\]: buildUnreconciledTaxMarker\(unreconciledReason\) \}/,

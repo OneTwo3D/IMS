@@ -8,6 +8,11 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### No tax type, no sales document
+
+- **Changed: a sales invoice or credit note line with no tax type is refused instead of posting on "No VAT".** The Xero connector no longer defaults a missing `TaxType` to `NONE` on sales invoices, sales invoice updates or credit notes (supplier bills and supplier credit notes are unchanged). The refusal is an ordinary failed sync row on /sync, raised at the head of the poster case and again in the connector, before any contact, item or document request. An explicit `NONE` is refused too unless the line names an allowed kind; the only one today is a WooCommerce fee the shop charged no tax on. Shipping and the order discount can never be on `NONE`.
+- **Changed: a WooCommerce order that moved money on an unmapped or inactive tax rate has its invoice refused.** Previously an unmapped rate id was replaced by the default rate and a mapping to an inactive IMS rate posted as if it were live. The invoice is now marked at import and refused at the poster with the rate ids named, and no payment is registered against it. See *No tax type, no document* in the Xero sync guide.
+
 ### Invoice note path, strict recipe quantities, purchase tax names
 
 - **Fixed: the WooCommerce invoice note, the invoice-link order meta and the invoice-document marker are now sent to the right route.** Their paths had no leading slash, so the transport built `/wp-json/wc/v3orders/...`, which does not exist; the writes (and the read of the order's existing notes) failed as if the store were down. A source scan now refuses any literal WooCommerce request path without a leading slash.
