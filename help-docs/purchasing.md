@@ -81,6 +81,8 @@ Generate a purchase order PDF to send to the supplier. The PO PDF includes produ
 
 When goods arrive, open the PO and click **Receive**. You can receive all lines at once or partially receive individual lines.
 
+**Lines with an open warehouse ASN are booked in through the ASN, not by hand.** If a line's Mintsoft (warehouse) ASN is still open, partly booked in, or being created, **Receive** refuses that line and names the SKU and the ASN. Use **Recheck booked-in** on the order once the warehouse has booked the goods, so the stock is added once. Other lines of the same order, and lines whose ASN is fully booked in or closed, can still be received here.
+
 When stock is received:
 
 - A **FIFO cost layer** is created for each line, recording the quantity and unit cost.
