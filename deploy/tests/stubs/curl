@@ -3,7 +3,15 @@
 set -u
 url="${*: -1}"
 # The upstream port the RUNNING nginx uses: the file as of the last reload (a switch that never reloaded is not live).
-loaded_port() { grep -oE 'server 127\.0\.0\.1:[0-9]+' "$STUB/loaded" 2>/dev/null | head -n1 | cut -d: -f2; }
+# While $STUB/lag_left holds N > 0 (nginx stub, reload_lag) the previous config is still the one answering; each read of :3000 uses one.
+loaded_port() {
+  local f="$STUB/loaded" left
+  if [ -s "$STUB/lag_left" ]; then
+    left="$(cat "$STUB/lag_left")"
+    if [ "$left" -gt 0 ]; then echo $((left - 1)) > "$STUB/lag_left"; f="$STUB/loaded_old"; fi
+  fi
+  grep -oE 'server 127\.0\.0\.1:[0-9]+' "$f" 2>/dev/null | head -n1 | cut -d: -f2
+}
 port="$(sed -E 's#^http://[^:/]+:([0-9]+).*#\1#' <<< "$url")"
 if [ "$port" = 3000 ]; then
   port="$(loaded_port)"

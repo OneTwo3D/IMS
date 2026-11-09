@@ -183,7 +183,7 @@ wait_http_200 "http://127.0.0.1:${new_port}/login" "$IMS_HEALTH_TIMEOUT_S" \
 
 # --- 6./7. switch and verify through nginx --------------------------------------------------------------------------------------
 switch_upstream "$new_port" || fail_new_slot "could not switch the nginx upstream; the previous upstream is restored"
-if ! wait_http_200 "${IMS_FRONT_URL}/login" "$IMS_FRONT_TIMEOUT_S" || [ "$(header_slot || true)" != "$new_slot" ]; then
+if ! wait_front_slot "$new_slot" "$IMS_FRONT_TIMEOUT_S"; then
   if [ "$old_slot" != none ] && [ "$contract" = 0 ]; then
     log "nginx does not serve the new release; switching back to ${old_slot}"
     switch_upstream "$(slot_port "$old_slot")" || log "ALSO could not switch back; fix ${IMS_UPSTREAM_FILE} by hand"

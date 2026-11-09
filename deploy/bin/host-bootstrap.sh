@@ -70,6 +70,10 @@ T_LOGROTATE_TMP="$(mktemp)"; trap 'rm -f "$T_LOGROTATE_TMP"' EXIT
 install -d -m 0755 "$R/srv/ims" "$R/srv/ims/deploy" "$R/srv/ims/holding"
 install -d -m 0750 "$R/srv/ims/state"; own 1001:1001 "$R/srv/ims/state"
 chmod 0750 "$R/srv/ims/state"
+# The image creates these under /var/lib/onetwoinventory, but the bind mount hides them: preflight requires each to exist and be writable by uid 1001.
+for d in backups uploads public-uploads invoice-pdfs; do
+  install -d -m 0750 "$R/srv/ims/state/$d"; own 1001:1001 "$R/srv/ims/state/$d"
+done
 install -d -m 0700 "$R/etc/ims"; own root:root "$R/etc/ims"
 # The cron log directory: cron runs the jobs as root and each job appends to ${IMS_CRON_LOG_DIR}/cron.log. Created before anything that
 # installs or enables host cron, and checked writable, or bootstrap stops.

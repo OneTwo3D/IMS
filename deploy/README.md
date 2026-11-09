@@ -356,6 +356,13 @@ anonymous volume. `/etc/cron.d` is mounted read-only at `/host-cron.d` with `IMS
 lines. Both are rendered from the password manager by a separate step; the bootstrap does not create them. The deploy refuses a file that
 is not 0600/0400.
 
+**Storage variables and the backup set.** `ims.env` must set `BACKUP_DIR`, `UPLOAD_STORAGE_DIR`, `PUBLIC_UPLOAD_STORAGE_DIR`,
+`INVOICE_PDF_STORAGE_DIR` and `FILE_SCAN_MODE` explicitly (production preflight fails without them; the template carries the values). The
+four paths are container paths under `/var/lib/onetwoinventory`, the mount of the host's `/srv/ims/state`; `host-bootstrap.sh` creates
+`backups`, `uploads`, `public-uploads` and `invoice-pdfs` there (1001:1001, 0750), because the bind mount hides the directories the image
+creates. `FILE_SCAN_MODE=disabled` because the image ships no scanner. **`INVOICE_PDF_STORAGE_DIR` (host path `/srv/ims/state/invoice-pdfs`)
+must be in the backup set**: stored invoice PDFs are retained for 6 years, and a database backup does not contain them.
+
 **Connector writers are held by default.** `deploy.sh` and `rollback.sh` refuse to start a release unless `ims.env` sets
 `PRODUCER_HOLD_ENFORCED_DESTINATIONS` to exactly `all` (surrounding whitespace trimmed, case-sensitive). A partial list such as `xero`
 would leave Mintsoft and WooCommerce writing, so it is refused too. There is deliberately NO override flag: releasing connectors belongs

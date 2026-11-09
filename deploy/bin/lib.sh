@@ -294,6 +294,24 @@ wait_http_200() { # <url> <timeout-s>
   done
 }
 
+# Wait until the RUNNING nginx answers 200 on /login AND reports <slot> in X-IMS-Slot, bounded by <timeout-s>. A bare 200 proves nothing
+# right after a switch: `nginx -s reload` only signals the master and returns at once, and until the new workers take over the old ones
+# still answer, proxying to the OLD slot, which is up and healthy (so 200) but reports the old slot. A single header read straight after
+# a 200 therefore races the reload. Both conditions are re-read on every attempt; if nginx never serves <slot> this returns 1.
+wait_front_slot() { # <slot> <timeout-s>
+  local slot="$1" timeout="$2" waited=0 code hdr=""
+  while :; do
+    code="$(http_code "${IMS_FRONT_URL}/login")"
+    if [ "$code" = 200 ]; then
+      hdr="$(header_slot || true)"
+      [ "$hdr" = "$slot" ] && return 0
+    fi
+    [ "$waited" -ge "$timeout" ] && { log "${IMS_FRONT_URL}/login did not serve slot '${slot}' within ${timeout}s (last: HTTP ${code:-none}, X-IMS-Slot '${hdr:-unreadable}')"; return 1; }
+    sleep "$IMS_HEALTH_INTERVAL_S"
+    waited=$((waited + IMS_HEALTH_INTERVAL_S))
+  done
+}
+
 # --- the env file ---------------------------------------------------------------------------------------------------------------
 env_value() { # <NAME> -> the value of the LAST NAME=value line (docker --env-file semantics: literal text after the first '=')
   local line

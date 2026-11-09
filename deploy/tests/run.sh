@@ -158,6 +158,40 @@ t_state_files_untouched_when_nginx_does_not_serve_the_new_release() {
   eq "$(container_running ims-green)" 0
 }
 
+# The reload is asynchronous: for a moment old workers still answer 200 on :3000 (proxying to the old, healthy slot) with the old slot's header.
+t_deploy_waits_for_the_new_slot_header_after_a_lagging_reload() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  echo 3 > "$STUB/reload_lag"
+  deploy "$B"
+  eq "$rc" 0 "deploy must succeed once nginx catches up: $(tail -n 4 "$T/out")"
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$B green"
+  eq "$(cat "$IMS_DEPLOY_DIR/previous")" "$A blue"
+  log_has 'curl -I http://127.0.0.1:3000/login -> blue'
+  log_has 'curl -I http://127.0.0.1:3000/login -> green'
+  eq "$(container_running ims-blue)" 0 "previous slot stopped only after nginx served green"
+}
+
+t_deploy_fails_and_rolls_back_when_nginx_never_serves_the_new_slot() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  echo 1000 > "$STUB/reload_lag"     # the old config keeps answering 200 for the whole bound
+  deploy "$B"
+  [ "$rc" != 0 ] || fail "deploy succeeded although nginx never reported the new slot"
+  grep -q "did not serve slot 'green'" "$T/out" || fail "no bounded-wait message: $(tail -n 5 "$T/out")"
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$A blue" "current"
+  [ ! -e "$IMS_DEPLOY_DIR/previous" ] || fail "previous written before a verified switch"
+  grep -q 'server 127.0.0.1:3101;' "$IMS_UPSTREAM_FILE" || fail "the upstream was not switched back to blue"
+  eq "$(container_running ims-blue)" 1 "the old slot must keep running"
+  eq "$(container_running ims-green)" 0
+}
+
+t_rollback_waits_for_the_target_slot_header_after_a_lagging_reload() {
+  seed_active green "$B"; seed_stopped blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  echo 3 > "$STUB/reload_lag"
+  rollback
+  eq "$rc" 0 "rollback must succeed once nginx catches up: $(tail -n 4 "$T/out")"
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$A blue"
+}
+
 t_nginx_test_failure_restores_the_old_upstream() {
   seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
   cp -p "$IMS_UPSTREAM_FILE" "$T/upstream.before"
@@ -728,6 +762,25 @@ t_heartbeat_wraps_deploy_and_cron_render_when_installed() {
   log_has '^o3d-hc ims-cron-render --$'
 }
 
+# preflight-production refuses to pass unless these five are set explicitly. The template must set them, to paths the container sees through
+# the state mount, equal to the image's own defaults, and each directory must be one the bootstrap creates under the mounted host directory.
+t_env_template_sets_the_storage_and_scan_variables_preflight_requires() {
+  local tpl="$HERE/../host/ims.env.template" root="$HERE/../.." name val sub
+  local mount; mount="$(sed -n 's#.*-v "${IMS_STATE_DIR}:\(/[^"]*\)".*#\1#p' "$BIN/lib.sh" | head -n1)"
+  eq "$mount" /var/lib/onetwoinventory "the state mount target in run_slot"
+  for name in BACKUP_DIR UPLOAD_STORAGE_DIR PUBLIC_UPLOAD_STORAGE_DIR INVOICE_PDF_STORAGE_DIR; do
+    eq "$(grep -c "^${name}=" "$tpl")" 1 "$name lines in the template"
+    val="$(sed -n "s/^${name}=//p" "$tpl")"
+    case "$val" in "$mount"/*) ;; *) fail "$name=$val is not under the mounted $mount" ;; esac
+    sub="${val#"$mount"/}"
+    grep -q "^      ${mount}/${sub}\\\?\$" "$root/Dockerfile" || grep -q "^    ${name}=${val}" "$root/Dockerfile" || fail "$name=$val differs from the image default"
+    grep -q "for d in .*\b${sub}\b" "$BIN/host-bootstrap.sh" || fail "host-bootstrap.sh does not create $sub"
+  done
+  eq "$(grep -c '^FILE_SCAN_MODE=' "$tpl")" 1 "FILE_SCAN_MODE lines"
+  case "$(sed -n 's/^FILE_SCAN_MODE=//p' "$tpl")" in disabled|command) ;; *) fail "FILE_SCAN_MODE must be disabled or command" ;; esac
+  grep -q 'INVOICE_PDF_STORAGE_DIR.*MUST be in the backup set' "$tpl" || fail "the template does not say invoice PDFs must be backed up"
+}
+
 t_bootstrap_is_idempotent_and_leaves_secrets_and_postgres_alone() {
   R="$T/root"; export IMS_BOOTSTRAP_ROOT="$R" IMS_UPSTREAM_FILE="$T/root/etc/nginx/ims-upstream.conf" IMS_UPSTREAM_FILE="$T/root/etc/nginx/ims-upstream.conf"
   mkdir -p "$R/etc/nginx/sites-available" "$R/etc/nginx/sites-enabled"
@@ -739,6 +792,10 @@ t_bootstrap_is_idempotent_and_leaves_secrets_and_postgres_alone() {
   eq "$(readlink "$R/etc/nginx/sites-enabled/ims")" ../sites-available/ims
   [ -f "$R/etc/nginx/ims-upstream.conf" ] || fail "no upstream placeholder"
   eq "$(stat -c %a "$R/srv/ims/state")" 750
+  for d in backups uploads public-uploads invoice-pdfs; do
+    [ -d "$R/srv/ims/state/$d" ] || fail "bootstrap did not create the state subdirectory $d (the bind mount hides the image's own)"
+    eq "$(stat -c %a "$R/srv/ims/state/$d")" 750 "mode of $d"
+  done
   eq "$(stat -c %a "$R/etc/ims")" 700
   log_has '^nginx reload'
   [ ! -e "$R/etc/ims/ims.env" ] && [ ! -e "$R/etc/ims/cron.env" ] || fail "bootstrap created a secrets file"
