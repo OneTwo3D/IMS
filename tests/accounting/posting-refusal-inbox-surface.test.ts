@@ -402,6 +402,8 @@ function liveRowFor(overrides: Record<string, unknown>) {
     payload: {},
     status: 'PENDING',
     attemptRevision: 0,
+    remoteAttemptedAt: null,
+    attemptStampingCustodyAt: new Date('2026-01-01T00:00:00Z'),
     externalTransactionId: null,
     ...overrides,
   }

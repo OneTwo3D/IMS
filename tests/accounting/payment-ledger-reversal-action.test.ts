@@ -508,11 +508,15 @@ test('the refusal wording is chosen from status and basis: unstamped cancellatio
   assert.doesNotMatch(cancelled.error ?? '', /recorded as FAILED/)
   assert.doesNotMatch(cancelled.error ?? '', /operator settled/)
   assert.match(cancelled.error ?? '', /retired \(cancelled\) without any record/)
+  // A retired entry is not retried by anything: the text must not send the operator to a retry that does not exist.
+  assert.doesNotMatch(cancelled.error ?? '', /retry the registration under Sync/)
+  assert.match(cancelled.error ?? '', /a retired entry cannot be retried/)
   state.syncRows = [syncRow({ status: 'PENDING', externalTransactionId: null, attemptRevision: 3 })]
   const requeued = await deletePayment('pay-1', 'order-1')
   assert.doesNotMatch(requeued.error ?? '', /recorded as FAILED/)
   assert.doesNotMatch(requeued.error ?? '', /operator settled/)
   assert.match(requeued.error ?? '', /still queued/)
+  assert.match(requeued.error ?? '', /retry the registration under Sync/)
 })
 
 test('a claim + retry between the Xero check and the commit aborts a VERIFIED reversal and keeps the receipt', async () => {

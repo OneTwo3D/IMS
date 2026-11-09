@@ -13,7 +13,7 @@ import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/acc
 import { POSTING_REFUSAL_KINDS, postingRefusalMarkable, type PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
 import { lockPostingKey, type PostingSuppressionClient } from '@/lib/domain/accounting/posting-suppression'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
-import { ATTEMPT_PROVEN_NEVER_MADE_WHERE } from '@/lib/domain/accounting/money-attempt-provenance'
+import { ATTEMPT_PROVEN_NEVER_MADE_WHERE, attemptProvenNeverMade, type MoneyAttemptProvenance } from '@/lib/domain/accounting/money-attempt-provenance'
 import { settlementMirrorGuard } from '@/lib/domain/accounting/sync-row-settlement'
 
 /**
@@ -61,6 +61,8 @@ export type MarkHandledClient = PostingSuppressionClient & {
       externalTransactionId: string | null; payload: unknown
       /** o3d-1e7sl: the two columns `ledgerStanding` needs beside status + id. */
       settlementBasis: string | null; abandonedBeforeRemoteCall: boolean | null
+      /** The canonical never-attempted record (money-attempt-provenance.ts); both required to prove a row pre-call. */
+      remoteAttemptedAt: Date | null; attemptStampingCustodyAt: Date | null
     }>>
     updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>
   }
@@ -140,7 +142,7 @@ export class MarkHandledRaceError extends Error {
  * mark cancels it) or "settle the sync log first" (the mark will refuse), and two spellings of that rule
  * would eventually disagree about which instruction an operator is given.
  */
-export function accountingSyncRowIsProvablyUnsent(sync: LedgerStandingRow & {
+export function accountingSyncRowIsProvablyUnsent(sync: LedgerStandingRow & MoneyAttemptProvenance & {
   attemptRevision: number | null
 }): boolean {
   // o3d-1e7sl: `LIVE_WORK` is the ledger-standing module's "PENDING or PROCESSING, no document id, no
@@ -149,6 +151,9 @@ export function accountingSyncRowIsProvablyUnsent(sync: LedgerStandingRow & {
   // unrecognised basis is therefore NOT provably unsent - the direction that cannot post twice.
   return sync.status === 'PENDING'
     && sync.attemptRevision === UNCLAIMED_ATTEMPT_REVISION
+    // Revision 0 is not proof (legacy rows, revived attempts): only the canonical never-attempted record is. A queued
+    // row without it stays BLOCKING, so the operator cannot hand-post an obligation a worker may have posted already.
+    && attemptProvenNeverMade(sync)
     && ledgerStanding(sync) === 'LIVE_WORK'
 }
 
@@ -210,6 +215,7 @@ type PostingKeyRow = {
   id: string; connector: string; status: string; attemptRevision: number | null
   externalTransactionId: string | null; payload: unknown
   settlementBasis: string | null; abandonedBeforeRemoteCall: boolean | null
+  remoteAttemptedAt: Date | null; attemptStampingCustodyAt: Date | null
 }
 
 /**
@@ -225,7 +231,7 @@ async function postingKeyRows(tx: MarkHandledClient, key: { type: string; refere
     where: { type: key.type, referenceType: key.referenceType, referenceId: key.referenceId },
     select: {
       id: true, connector: true, status: true, attemptRevision: true, externalTransactionId: true, payload: true,
-      settlementBasis: true, abandonedBeforeRemoteCall: true,
+      settlementBasis: true, abandonedBeforeRemoteCall: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true,
     },
   })).filter((sync) => accountingPostingKeyForRow({ ...key, payload: sync.payload }).scope === key.scope)
   const candidates = everyRow.filter(accountingSyncRowCanPostOrHasPosted)
@@ -270,10 +276,17 @@ export function describeSyncRowStanding(sync: LedgerStandingRow): string {
 
 /** The one sentence both the claim and the mark refuse with, so an operator cannot read two accounts of it. */
 function mayBePostedMessage(rows: PostingKeyRows): string {
+  const unprovable = rows.blocking.filter((sync) => sync.status === 'PENDING' && sync.attemptRevision === UNCLAIMED_ATTEMPT_REVISION
+    && ledgerStanding(sync) === 'LIVE_WORK' && !attemptProvenNeverMade(sync))
   return 'IMS may already have posted this, or be posting it now — accounting sync '
     + `${rows.blocking.map((sync) => `row ${sync.id} is ${describeSyncRowStanding(sync)}`).join('; ')}. `
     + 'Check the ledger and settle that row in the accounting sync log first; marking this handled now could '
     + 'post it twice.'
+    + (unprovable.length > 0
+      ? ` Row ${unprovable.map((sync) => sync.id).join(', ')} is queued, but nothing on it records that no attempt was ever `
+        + 'made for it, so IMS cannot cancel it for you. Check the ledger for this posting: if it is there, settle the row '
+        + 'with its reference in the accounting sync log; if it is not, resolve the row there before posting by hand.'
+      : '')
 }
 
 /** One line per retired-and-unproven row, each naming whose word its standing rests on (o3d-1e7sl). */
@@ -310,9 +323,9 @@ async function cancelProvablyUnsentRows(
 ): Promise<string[]> {
   const ids = rows.map((sync) => sync.id)
   if (ids.length === 0) return []
-  // The pre-call stamp is written ONLY over a row with the canonical never-attempted record (revision 0 alone is not
-  // proof: legacy rows and revivals sit there), in the same UPDATE as the status, as the orphan sweep does. A row
-  // without that record is still cancelled (it is provably unsent for THIS purpose) but UNSTAMPED, so it reads UNKNOWN.
+  // Only rows with the canonical never-attempted record reach here (`accountingSyncRowIsProvablyUnsent`); a queued row
+  // without it is BLOCKING and is never cancelled, because cancelling it would let the operator hand-post an obligation
+  // a worker may already have posted. The predicate is repeated so a row that lost the record in the window is a race.
   const stamped = await tx.accountingSyncLog.updateMany({
     where: {
       id: { in: ids }, status: 'PENDING', attemptRevision: UNCLAIMED_ATTEMPT_REVISION, externalTransactionId: null,
@@ -320,11 +333,7 @@ async function cancelProvablyUnsentRows(
     },
     data: { status: 'CANCELLED', errorMessage: note, processingStartedAt: null, abandonedBeforeRemoteCall: true },
   })
-  const unstamped = await tx.accountingSyncLog.updateMany({
-    where: { id: { in: ids }, status: 'PENDING', attemptRevision: UNCLAIMED_ATTEMPT_REVISION, externalTransactionId: null },
-    data: { status: 'CANCELLED', errorMessage: note, processingStartedAt: null },
-  })
-  if (stamped.count + unstamped.count !== ids.length) throw new MarkHandledRaceError()
+  if (stamped.count !== ids.length) throw new MarkHandledRaceError()
   for (const sync of rows) {
     const mirror = await updateMirroredAccountingEventStatus(tx as unknown as Prisma.TransactionClient, {
       connector: sync.connector,

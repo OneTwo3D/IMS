@@ -399,6 +399,7 @@ export function describeAttemptUndecidedRefusal(
     ? '\n\nOne of these entries was retired (cancelled) without any record that it was retired before an attempt was made, so IMS '
       + 'cannot say it never reached the accounting system. A payment may still be there, so it does not free this receipt for deletion.'
     : ''
+  const canRetry = undecided.some((row) => row.status === 'FAILED' || row.status === 'PENDING')
   const anyFailed = undecided.some((row) => (UNDECIDED_REGISTRATION_STATUSES as readonly string[]).includes(row.status))
   // THE PRODUCER-SIDE HOLD: a SHADOW is not an attempt by IMS at all, so "IMS tried ... FAILED" would be untrue of it. It gets
   // its own account: IMS did not send the registration, and the writer that owns payment registration may have.
@@ -441,8 +442,12 @@ export function describeAttemptUndecidedRefusal(
       + 'reference and use "Check that payment and delete" below — IMS will ask the accounting system '
       + 'about that exact payment, check it belongs to this invoice and matches this receipt, and '
       + 'confirm it really is gone before removing anything here.\n'
-      + '• If there is NO payment, retry the registration under Sync → Xero. Once it posts, IMS knows '
-      + 'the payment reference and can check the reversal for you.\n\n'
+      + (canRetry
+        ? '• If there is NO payment, retry the registration under Sync → Xero. Once it posts, IMS knows '
+          + 'the payment reference and can check the reversal for you.\n\n'
+        // A retired (CANCELLED) entry is not retried by anything, so telling the operator to retry it would be a dead end.
+        : '• If there is NO payment, a retired entry cannot be retried. IMS still cannot clear it on a statement that nothing '
+          + 'posted, so this receipt stays until a payment reference is supplied or the entry is resolved some other way.\n\n')
       + `IMS cannot settle this on its own: the ${anyFailed ? 'failed ' : ''}entry (${entries}) names no payment to look up, `
       + 'and an invoice showing nothing looks the same whether the payment was removed or never '
       + 'arrived — which is why the reference has to come from you, and why IMS still checks it.'
