@@ -1119,7 +1119,7 @@ test('OUTBOX: the send-time recheck judges the job\'s CURRENT creation time, not
 //
 // Named mutation (shown red in the PR): q1 the PROCESSING branch merges the payload without re-dating.
 
-test('STOCK JOB IN FLIGHT: a live event merged into a job a worker holds re-dates it, so the worker\'s send-time check passes and the update is not stranded; identical payloads too; no floor changes nothing', { skip }, async (t) => {
+test('STOCK JOB IN FLIGHT: a live event merged into a job a worker holds re-dates it, so the worker\'s send-time check passes and the update is not stranded; identical payloads too; with no floor the event is re-dated just the same (any enqueue onto a processing job makes another pass)', { skip }, async (t) => {
   const d = await deps()
   const tag = tagOf()
   t.after(() => cleanupJobs(d, `woocommerce:stock.push:${tag}`))
@@ -1150,7 +1150,7 @@ test('STOCK JOB IN FLIGHT: a live event merged into a job a worker holds re-date
   })
   await withEnv({}, async () => {
     await d.stock.enqueueWcStockSyncJobs([off.productId], 'MANUAL', { force: true })
-    assert.equal((await read(off.id))?.createdAt.getTime(), BEFORE.getTime(), 'CONTROL: no floor, nothing is re-dated (the legacy statement)')
+    assert.ok((await read(off.id))!.createdAt.getTime() > BEFORE.getTime(), 'no floor: the event still moves the generation, so the worker takes another pass (a reservation release must not be swallowed)')
   })
 })
 
@@ -1158,7 +1158,7 @@ test('STOCK JOB IN FLIGHT: a live event merged into a job a worker holds re-date
 //
 // Named mutation (shown red in the PR): g1 completeClaimedJob takes an unchanged payload for completion without comparing the generation.
 
-test('STOCK COMPLETION GENERATION: an event merged into the job while a worker held it (identical payload included) makes the completion REQUEUE it, not succeed; nothing merged completes; the switch off is the legacy completion', { skip }, async (t) => {
+test('STOCK COMPLETION GENERATION: an event merged into the job while a worker held it (identical payload included) makes the completion REQUEUE it, not succeed; nothing merged completes; with the switch off an identical event requeues too', { skip }, async (t) => {
   const d = await deps()
   const tag = tagOf()
   t.after(() => cleanupJobs(d, `woocommerce:stock.push:${tag}`))
@@ -1182,5 +1182,5 @@ test('STOCK COMPLETION GENERATION: an event merged into the job while a worker h
 
   const legacy = await claim('legacy', {})
   await withEnv({}, async () => { await d.stock.enqueueWcStockSyncJobs([legacy.productId], 'MANUAL') })
-  assert.equal(await d.stock.completeClaimedJob(legacy.claimed), 'succeeded', 'CONTROL: switch off, an identical payload is handled exactly as before')
+  assert.equal(await d.stock.completeClaimedJob(legacy.claimed), 'requeued', 'switch off: an identical event still requeues; the worker re-reads and pushes the latest level')
 })

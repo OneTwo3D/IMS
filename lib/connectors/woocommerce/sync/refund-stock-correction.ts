@@ -11,7 +11,7 @@
  * the refund, so none of these can lose it:
  *   - a lookup or queue failure leaves the obligation open and the next attempt queues it;
  *   - a refund that committed but whose later steps failed is `already-applied` on the next sweep, and still owes it;
- *   - two refunds on one product while the first job is processing: the job is told to take another pass (`redo`).
+ *   - two refunds on one product while the first job is processing: any enqueue onto a processing job makes it take another pass.
  * Callers: the order webhook's refund sweep (every committed refund of that order, applied or already-applied) and the
  * stock reconcile (every open obligation, any order).
  *
@@ -74,10 +74,10 @@ export async function queueRefundStockCorrections(
         // Required but no line names a product any more: nothing can be pushed, and leaving it open would retry for ever.
         await discharge()
       } else {
-        // Forced (the lastPushedQty dedupe must not swallow it) and `redo` (a job a worker is processing right now must take
-        // another pass even though its payload is identical). The obligation is discharged the moment the job is recorded,
+        // Forced (the lastPushedQty dedupe must not swallow it). A job a worker is processing right now takes another pass whatever its
+        // payload (stock-sync-jobs.ts). The obligation is discharged the moment the job is recorded,
         // BEFORE it is processed: processing is retried by the job itself.
-        await deps.enqueue(productIds, 'IMS_CHANGE', { force: true, redo: true, onEnqueued: discharge })
+        await deps.enqueue(productIds, 'IMS_CHANGE', { force: true, onEnqueued: discharge })
       }
       result.queued++
     } catch (error) {

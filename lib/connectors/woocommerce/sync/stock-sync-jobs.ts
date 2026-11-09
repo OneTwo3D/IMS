@@ -18,7 +18,6 @@ import {
   markIntegrationOutboxRetryableFailure,
   currentOutboxRowBeforeCutoff,
   outboxRowBeforeCutoff,
-  outboxRowCutoffFloor,
   refuseClaimedJobBeforeCutoff,
   type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
@@ -76,8 +75,6 @@ type ApplyStockOutboxPayloadOptions = {
   status: string
   attempts?: number
   lastError?: string | null
-  /** This event MUST get its own pass even if a worker is processing an identical job right now. See `redo`. */
-  redo?: boolean
 }
 
 async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions): Promise<boolean> {
@@ -98,17 +95,14 @@ async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions):
     })
 
     if (current.status === INTEGRATION_OUTBOX_STATUS.PROCESSING) {
-      // A LIVE producer is writing into a job a worker holds. While a cut-off applies, the merge MOVES THE JOB'S CREATION TIME in the same statement. That does two things: a job
-      // that predates the instant would otherwise be refused by the worker's send-time check and excluded by every later claim, stranding the new update for ever; and,
-      // because the worker read the stock BEFORE this event, the moved creation time is the generation stamp that stops completeClaimedJob taking an unchanged payload
-      // for proof the event was handled. The job is RE-DATED in the same statement that merges the payload (the claim is keyed on its lock, not on createdAt, so the worker is unaffected), and the
-      // worker, which judges the current row, sends it. This applies to an identical payload too: the producer's event still needs its push after the instant.
-      // With no floor in force nothing is re-dated and the statement is the legacy one.
-      // `redo` asks for the same outcome with no cut-off in force: an event that must be pushed AFTER the read the worker already
-      // made (a refund's restock the store applied on its own). The creation time is the generation the worker re-checks before it
-      // completes, so moving it makes the worker requeue the job instead of taking an identical payload for proof it was handled.
-      const redateProcessing = options.redo === true || outboxRowCutoffFloor(current.connector, current.operation) !== null
-      if (samePayload(current.payloadJson, payload) && !redateProcessing) return true
+      // A LIVE producer is writing into a job a worker holds. EVERY such enqueue, identical payload or not, MOVES THE JOB'S CREATION TIME in the
+      // same statement. The worker read the stock BEFORE this event, so the moved creation time is the generation stamp that stops
+      // completeClaimedJob taking an unchanged payload for proof the event was handled: the worker requeues the job and the next pass
+      // re-reads and pushes the latest absolute level. (A reservation release landing after the worker's read and before its send has an
+      // identical merged payload; dropping it would push the earlier, lower quantity and nothing would ever re-pass.) With a cut-off in
+      // force the same move also keeps a job that predates the instant from being refused by the worker's send-time check and excluded by
+      // every later claim, stranding the new update for ever. The job is re-dated in the same statement that merges the payload (the claim
+      // is keyed on its lock, not on createdAt, so the worker is unaffected), and the worker, which judges the current row, sends it.
       const updated = await db.integrationOutbox.updateMany({
         where: {
           id: current.id,
@@ -116,7 +110,7 @@ async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions):
         },
         data: {
           // strictly later than the value the worker holds, so the generation always differs
-          ...(redateProcessing ? { createdAt: new Date(Math.max(Date.now(), current.createdAt.getTime() + 1)) } : {}),
+          createdAt: new Date(Math.max(Date.now(), current.createdAt.getTime() + 1)),
           payloadJson: payload,
           lastError: null,
         },
@@ -295,7 +289,7 @@ async function migrateLegacyWcStockSyncJobs(productIds?: string[], limit = 100):
 export async function enqueueWcStockSyncJobs(
   productIds: string[],
   reason: StockSyncReason,
-  options?: { force?: boolean; webhookQty?: number | null; redo?: boolean },
+  options?: { force?: boolean; webhookQty?: number | null },
 ): Promise<string[]> {
   const scope = await expandProductScope(productIds)
   if (scope.length === 0) return []
@@ -319,7 +313,6 @@ export async function enqueueWcStockSyncJobs(
       reason,
       force: options?.force,
       webhookQty: options?.webhookQty,
-      redo: options?.redo,
       nextAttemptAt: now,
       status: INTEGRATION_OUTBOX_STATUS.PENDING,
     })
@@ -495,7 +488,6 @@ export async function enqueueAndProcessImmediateWcStockSync(
   options?: {
     force?: boolean
     webhookQty?: number | null
-    redo?: boolean
     /** Called once the jobs are durably recorded (or the hold shadowed them), BEFORE they are processed. Not called when the enqueue throws. */
     onEnqueued?: () => Promise<void>
   },

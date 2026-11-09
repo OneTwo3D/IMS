@@ -80,28 +80,47 @@ async function stockJob(db: Ctx['db'], productId: string) {
   return db.integrationOutbox.findFirstOrThrow({ where: { connector: 'woocommerce', idempotencyKey: { contains: productId } } })
 }
 
-for (const redo of [true, false]) {
-  test(`an identical forced job enqueued while the first is PROCESSING ${redo ? 'takes another pass (redo)' : 'is dropped (control: without redo)'}`, { skip }, async () => {
-    const { db, jobs } = await load()
-    const s = await seed(db)
-    try {
-      await jobs.enqueueWcStockSyncJobs([s.productId], 'IMS_CHANGE', { force: true, redo: true })
-      // A worker claims it and reads the stock.
-      const claimed = await db.integrationOutbox.update({
-        where: { id: (await stockJob(db, s.productId)).id },
-        data: { status: 'PROCESSING', lockedBy: 'woocommerce-stock-sync', lockedAt: new Date() },
-      })
-      // The second refund's restock: the very same forced payload, while the worker holds the job.
-      await new Promise((resolve) => setTimeout(resolve, 5))
-      await jobs.enqueueWcStockSyncJobs([s.productId], 'IMS_CHANGE', { force: true, redo })
-      const outcome = await jobs.completeClaimedJob(claimed)
-      assert.equal(outcome, redo ? 'requeued' : 'succeeded')
-      if (redo) assert.equal((await stockJob(db, s.productId)).status, 'PENDING', 'the job runs again')
-    } finally {
-      await cleanup(db, s)
-    }
-  })
-}
+test('an identical forced job enqueued while the first is PROCESSING makes the worker take another pass', { skip }, async () => {
+  const { db, jobs } = await load()
+  const s = await seed(db)
+  try {
+    await jobs.enqueueWcStockSyncJobs([s.productId], 'IMS_CHANGE', { force: true })
+    // A worker claims it and reads the stock.
+    const claimed = await db.integrationOutbox.update({
+      where: { id: (await stockJob(db, s.productId)).id },
+      data: { status: 'PROCESSING', lockedBy: 'woocommerce-stock-sync', lockedAt: new Date() },
+    })
+    // The second refund's restock: the very same forced payload, while the worker holds the job.
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    await jobs.enqueueWcStockSyncJobs([s.productId], 'IMS_CHANGE', { force: true })
+    assert.equal(await jobs.completeClaimedJob(claimed), 'requeued')
+    assert.equal((await stockJob(db, s.productId)).status, 'PENDING', 'the job runs again')
+  } finally {
+    await cleanup(db, s)
+  }
+})
+
+test('a reservation release committed after the worker read the stock and before it sent: the plain IMS_CHANGE it enqueues makes a second pass', { skip }, async () => {
+  const { db, jobs } = await load()
+  const s = await seed(db)
+  try {
+    // The refund's forced correction is the job; the worker has claimed it and read the (lower) stock.
+    await jobs.enqueueWcStockSyncJobs([s.productId], 'IMS_CHANGE', { force: true })
+    const claimed = await db.integrationOutbox.update({
+      where: { id: (await stockJob(db, s.productId)).id },
+      data: { status: 'PROCESSING', lockedBy: 'woocommerce-stock-sync', lockedAt: new Date() },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    // autoAllocateOrder's post-release push: an ordinary, non-forced IMS_CHANGE. The merged payload is IDENTICAL to the job's
+    // (force is sticky), which is exactly the case that used to be swallowed.
+    await jobs.enqueueWcStockSyncJobs([s.productId], 'IMS_CHANGE')
+    const merged = await stockJob(db, s.productId)
+    assert.deepEqual(merged.payloadJson, claimed.payloadJson, 'the payload really is identical')
+    assert.equal(await jobs.completeClaimedJob(claimed), 'requeued', 'so the worker must not complete it: it re-reads and pushes the released quantity')
+  } finally {
+    await cleanup(db, s)
+  }
+})
 
 test('a queue failure leaves the obligation open; the next attempt queues it; once recorded it is not queued again', { skip }, async () => {
   const { db, correction } = await load()
@@ -126,7 +145,6 @@ test('a queue failure leaves the obligation open; the next attempt queues it; on
     assert.deepEqual(second, { open: 1, queued: 1, failed: 0 })
     assert.deepEqual(recorded[0].ids, [s.productId])
     assert.equal(recorded[0].options.force, true)
-    assert.equal(recorded[0].options.redo, true)
     assert.notEqual((await db.salesOrderRefund.findUniqueOrThrow({ where: { id: s.refundId } })).stockCorrectionQueuedAt, null)
 
     const third = await correction.queueRefundStockCorrections({ externalOrderId: scopeId }, working)
