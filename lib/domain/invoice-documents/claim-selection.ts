@@ -31,7 +31,7 @@ export type DocumentClaim = {
 export type ClaimSelection =
   | { outcome: 'select'; claim: DocumentClaim }
   /** Nothing to fetch yet; ask again later. */
-  | { outcome: 'wait'; reason: string }
+  | { outcome: 'wait'; reason: string; /** The only document under the number is VOIDED on an order that is not cancelled: a stored copy of it is withdrawn from the customer. */ voidedOnActiveOrder?: true }
   /** The ledger's answer needs a person; never retried on its own. */
   | { outcome: 'attention'; reason: string }
 
@@ -69,7 +69,7 @@ export function selectDocumentClaim(claims: readonly DocumentClaim[], label: str
   }
   if (voided.length > 0) {
     if (!options.orderCancelled) {
-      return { outcome: 'wait', reason: `${label}: the only document under this number is voided and the order is not cancelled, so IMS waits for the replacement` }
+      return { outcome: 'wait', reason: `${label}: the only document under this number is voided and the order is not cancelled, so IMS waits for the replacement`, voidedOnActiveOrder: true }
     }
     if (voided.length === 1) return { outcome: 'select', claim: voided[0].claim }
     return { outcome: 'attention', reason: `${label}: ${voided.length} voided documents and no live one hold this number, so IMS will not choose one` }

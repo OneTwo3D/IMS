@@ -28,6 +28,14 @@ Every ledger call is a GET through the connector's own request path, so its minu
 
 Every reader (the customer download route, the staff routes, the invoice e-mail) resolves the order's CURRENT document row and streams its hash-named file (`loadCurrentInvoicePdf`). The bytes are hashed on the way out and must equal the row's SHA-256: a missing or altered file is **not served**, and the document is made due for a re-fetch. An order with no document row (an invoice IMS posted itself) falls back to the legacy flat file; once a row exists the flat file is never read. The sweep also verifies stored files on a rolling scan (100 per run, cursor in `invoice_documents_integrity_cursor`) and makes a bad one due. A crash between the file write and the promotion leaves a file with no row: nothing is current, the orphan is never served, and the next sweep fetches the document again.
 
+## The order changes under a stored document
+
+The importer can correct an order's invoice number while no ledger invoice is linked, and the ledger can void a stored invoice. Both are handled on the READ and the PROMOTION:
+
+* A document is served only while its number equals the order's CURRENT invoice number; a document fetched under the old number is not served and is made due, and the sweep fetches the one under the corrected number.
+* Promotion takes a share lock on the order row, re-reads the fields the document was judged against (invoice number, status, total, store credit, customer, currency) and aborts, discarding the bytes, if any moved while the three GETs were in flight.
+* A recheck that finds the current document **voided on an order that is not cancelled** marks it **withdrawn**: bytes and history stay, no customer-facing reader serves it, staff can still open it (labelled `-WITHDRAWN`, header `X-Invoice-Document-Status`), until a valid replacement is promoted.
+
 ## Amended documents: rechecks
 
 The ledger can amend or re-issue a document after IMS stored it, so a stored document is looked at again **1 day, then 7 days, then every 30 days** after the last look (the next time is on the document's fetch state). The sweep picks due rechecks up (they are not limited to the floor date), and the customer download route looks again, on the first request after one falls due, before it serves (setting `invoice_documents_lazy_fetch_enabled`; the stored PDF is served if the ledger cannot be asked). A changed document (different hash) is promoted by the versioning rule above; a recheck that cannot get an answer leaves the stored version in place and never escalates a "missing" document.

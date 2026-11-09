@@ -678,3 +678,98 @@ test('the connection changes between the lookup and the re-read, or the download
     await cleanup(db, order.id)
   }
 })
+
+test('the importer corrects the order\'s invoice number: the old-number PDF is not served, and the one under the new number is fetched', { skip }, async () => {
+  const { db, service } = await setup()
+  const { order } = await seedOrder(db)
+  try {
+    const { loadCurrentInvoicePdf } = await import('../../lib/domain/invoice-documents/current-document')
+    const t0 = new Date('2026-11-09T10:00:00Z')
+    let now = t0
+    const bytesFor = (number: string) => pdf(`for-${number}`)
+    const deps: Deps = {
+      ...depsFor(order),
+      now: () => now,
+      lookupInvoiceClaims: async (number) => ({ ok: true, claims: [ledgerClaim(order, number, { documentId: `doc-${number}` })] }),
+      downloadPdf: async (_kind, id) => ({ ok: true, buffer: bytesFor(id.replace('doc-', '')) }),
+    }
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, deps)).status, 'stored')
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id), bytesFor(order.invoiceNumber!))
+
+    // The correction lands before the recheck is due.
+    const corrected = `${order.invoiceNumber}-FIXED`
+    await db.salesOrder.update({ where: { id: order.id }, data: { invoiceNumber: corrected } })
+    assert.equal(await loadCurrentInvoicePdf(order.id), null, 'the old-number PDF is no longer this order\'s invoice')
+    const due = await db.invoiceDocumentFetchState.findFirstOrThrow({ where: { orderId: order.id } })
+    assert.ok(due.nextAttemptAt && due.nextAttemptAt.getTime() <= now.getTime(), 'and the document is due at once')
+
+    const outcome = await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, deps)
+    assert.equal(outcome.status === 'stored' && outcome.created, true)
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id), bytesFor(corrected))
+    const rows = await db.salesOrderInvoiceDocument.findMany({ where: { orderId: order.id }, orderBy: { fetchedAt: 'asc' } })
+    assert.equal(rows.length, 2)
+    assert.equal(rows.filter((r) => r.supersededAt === null).length, 1)
+  } finally {
+    await cleanup(db, order.id)
+  }
+})
+
+test('the invoice number is corrected DURING the three GETs: the old-number PDF is not promoted', { skip }, async () => {
+  const { db, service } = await setup()
+  const { order } = await seedOrder(db)
+  try {
+    const deps: Deps = {
+      ...depsFor(order),
+      downloadPdf: async () => {
+        // The importer's correction lands while the fetch is in flight.
+        await db.salesOrder.update({ where: { id: order.id }, data: { invoiceNumber: `${order.invoiceNumber}-FIXED` } })
+        return { ok: true, buffer: pdf('old-number') }
+      },
+    }
+    const outcome = await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, deps)
+    assert.equal(outcome.status, 'failed')
+    assert.match(outcome.status === 'failed' ? outcome.reason : '', /order changed/)
+    assert.equal(await db.salesOrderInvoiceDocument.count({ where: { orderId: order.id } }), 0)
+    assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: order.id }, select: { invoicePdfPath: true } })).invoicePdfPath, null)
+  } finally {
+    await cleanup(db, order.id)
+  }
+})
+
+test('a stored invoice later VOIDED on an order that is not cancelled is withdrawn from the customer, kept for staff, and a replacement is served', { skip }, async () => {
+  const { db, service } = await setup()
+  const { order } = await seedOrder(db)
+  try {
+    const { loadCurrentInvoicePdf, currentInvoiceIsWithdrawn } = await import('../../lib/domain/invoice-documents/current-document')
+    const t0 = new Date('2026-11-09T10:00:00Z')
+    let now = t0
+    let claim: Record<string, unknown> = { documentId: 'doc-1' }
+    let bytes = pdf('original')
+    const deps: Deps = { ...depsFor(order), now: () => now, lookupInvoiceClaims: async (number) => ({ ok: true, claims: [ledgerClaim(order, number, claim)] }), downloadPdf: async () => ({ ok: true, buffer: bytes }) }
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, deps)).status, 'stored')
+    const original = bytes
+
+    // The ledger voids it (the replacement has not been issued yet); the recheck falls due.
+    claim = { documentId: 'doc-1', status: 'VOIDED' }
+    now = new Date(t0.getTime() + 25 * 3600_000)
+    const waiting = await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, deps)
+    assert.equal(waiting.status, 'waiting')
+    assert.equal(await loadCurrentInvoicePdf(order.id), null, 'not served to the customer')
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id, { includeWithdrawn: true }), original, 'but retained, and staff can still open it')
+    assert.equal(await currentInvoiceIsWithdrawn(order.id), true)
+    assert.equal(await db.salesOrderInvoiceDocument.count({ where: { orderId: order.id } }), 1, 'bytes and history kept')
+
+    // A valid replacement is issued: it is promoted and served.
+    claim = { documentId: 'doc-2' }
+    bytes = pdf('replacement')
+    now = new Date(t0.getTime() + 60 * 3600_000)
+    assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE', ignoreBackoff: true }, deps)).status, 'stored')
+    assert.deepEqual(await loadCurrentInvoicePdf(order.id), bytes)
+    assert.equal(await currentInvoiceIsWithdrawn(order.id), false)
+    const rows = await db.salesOrderInvoiceDocument.findMany({ where: { orderId: order.id } })
+    assert.equal(rows.length, 2)
+    assert.equal(rows.filter((r) => r.supersededAt === null && r.withdrawnAt === null).length, 1)
+  } finally {
+    await cleanup(db, order.id)
+  }
+})

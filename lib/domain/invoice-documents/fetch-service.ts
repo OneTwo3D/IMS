@@ -93,6 +93,38 @@ function lockKeyOf(subjectKey: string): number {
 }
 const LOCK_NAMESPACE = 0x1d0c // distinguishes these locks from other advisory-lock users
 
+type OrderEvidenceRow = {
+  status: string
+  invoiceNumber: string | null
+  orderNumber: string | null
+  externalOrderNumber: string | null
+  customerName: string | null
+  currency: string
+  totalForeign: unknown
+  storeCreditForeign: unknown
+  storeCreditAssessment: unknown
+}
+
+/**
+ * Everything the ownership check and the expected gross were computed from, as one comparable string. The importer can correct an
+ * order's invoice number (while no ledger invoice is linked), its credit or its customer while a fetch is in flight, so promotion
+ * re-reads these under the order row lock and refuses to publish a document judged against values that have since moved.
+ */
+function orderEvidenceKey(order: OrderEvidenceRow, creditNoteNumber: string | null): string {
+  return JSON.stringify([
+    order.status === 'CANCELLED',
+    (order.invoiceNumber ?? '').trim().toLowerCase(),
+    creditNoteNumber === null ? null : creditNoteNumber.trim().toLowerCase(),
+    order.orderNumber,
+    order.externalOrderNumber,
+    order.customerName,
+    order.currency,
+    String(order.totalForeign),
+    String(order.storeCreditForeign),
+    order.storeCreditAssessment ?? null,
+  ])
+}
+
 type StatePatch = {
   status: 'PENDING' | 'NEEDS_ATTENTION' | 'DONE'
   error?: string | null
@@ -214,6 +246,7 @@ async function ensureUnderLease(
   let sharedByOthers = 0
   let evidenceSubject: EvidenceSubject
   let grossUnderivable: string | null = null
+  let snapshotCreditNote: string | null = null
   const orderNumbers = [order.externalOrderNumber, order.orderNumber].flatMap((value) => (value ? [value] : []))
   if (input.kind === 'INVOICE') {
     number = order.invoiceNumber?.trim() || null
@@ -237,6 +270,7 @@ async function ensureUnderLease(
     })
     if (!refund || refund.orderId !== input.orderId) return { status: 'not-applicable', reason: 'the refund is not on this order' }
     number = refund.creditNoteNumber?.trim() || null
+    snapshotCreditNote = refund.creditNoteNumber ?? ''
     if (number) {
       sharedByOthers = await db.salesOrderRefund.count({ where: { id: { not: input.refundId! }, creditNoteNumber: { equals: number, mode: 'insensitive' } } })
     }
@@ -251,6 +285,7 @@ async function ensureUnderLease(
     }
   }
 
+  const evidenceKeyAtStart = orderEvidenceKey(order, snapshotCreditNote)
   const state = await db.invoiceDocumentFetchState.findUnique({ where: { subjectKey } })
   if (state?.status === 'NEEDS_ATTENTION') {
     return { status: 'needs-attention', reason: state.lastError ?? 'needs attention' }
@@ -303,7 +338,33 @@ async function ensureUnderLease(
 
   const selection = selectDocumentClaim(lookup.claims, label, { orderCancelled: order.status === 'CANCELLED' })
   if (selection.outcome === 'attention') return needsAttention(selection.reason)
-  if (selection.outcome === 'wait') return missing(selection.reason)
+  if (selection.outcome === 'wait') {
+    if (selection.voidedOnActiveOrder && isRecheck) {
+      // The ledger has VOIDED the document we hold and the order is live: stop serving it (bytes and history are kept) until a valid
+      // replacement is promoted. Written under the lease like every other write.
+      const withdrawn = await db.$transaction(async (tx) => {
+        const held = await tx.invoiceDocumentFetchState.updateMany({ where: { subjectKey, leaseHolder: token }, data: { leaseUntil: new Date(deps.now().getTime() + INVOICE_DOCUMENT_LEASE_MS) } })
+        if (held.count === 0) return false
+        await tx.salesOrderInvoiceDocument.updateMany({
+          where: { orderId: input.orderId, kind: input.kind, refundId: input.refundId ?? null, supersededAt: null, withdrawnAt: null },
+          data: { withdrawnAt: deps.now() },
+        })
+        return true
+      })
+      if (!withdrawn) throw new LeaseLost()
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: input.orderId,
+        action: 'invoice_document_withdrawn',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: `The ledger voided ${label} on an order that is not cancelled: the stored PDF is no longer shown to the customer until a replacement is issued`,
+        metadata: { kind: input.kind, refundId: input.refundId ?? null },
+        resolveUser: false,
+      }).catch(() => { /* logging must never change the outcome */ })
+    }
+    return missing(selection.reason)
+  }
   const claim = selection.claim
 
   const evidence = assessDocumentEvidence(evidenceSubject, claim)
@@ -345,6 +406,18 @@ async function ensureUnderLease(
       data: { leaseUntil: new Date(deps.now().getTime() + INVOICE_DOCUMENT_LEASE_MS) },
     })
     if (stillHeld.count === 0) return { kind: 'lost' as const }
+    // THE ORDER IS PINNED WHILE IT IS RE-READ: a share lock on its row keeps the importer from correcting the invoice number (or the credit,
+    // or the customer) between this read and the commit. If any of what the document was judged against has moved, nothing is published.
+    await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${input.orderId} FOR SHARE`
+    const nowOrder = await tx.salesOrder.findUnique({
+      where: { id: input.orderId },
+      select: { status: true, invoiceNumber: true, orderNumber: true, externalOrderNumber: true, customerName: true, currency: true, totalForeign: true, storeCreditForeign: true, storeCreditAssessment: true },
+    })
+    let nowCreditNote: string | null = null
+    if (input.kind === 'CREDIT_NOTE') {
+      nowCreditNote = (await tx.salesOrderRefund.findUnique({ where: { id: input.refundId! }, select: { creditNoteNumber: true } }))?.creditNoteNumber ?? ''
+    }
+    if (!nowOrder || orderEvidenceKey(nowOrder, nowCreditNote) !== evidenceKeyAtStart) return { kind: 'order-changed' as const }
     const existing = await tx.salesOrderInvoiceDocument.findUnique({
       where: {
         connector_externalDocumentId_sha256: {
@@ -363,13 +436,17 @@ async function ensureUnderLease(
     let created = false
     if (existing) {
       documentId = existing.id
+      if (!existing.supersededAt) {
+        // Already the current version (a recheck found it unchanged, or a withdrawn one is valid again): make sure it is served.
+        await tx.salesOrderInvoiceDocument.update({ where: { id: existing.id }, data: { withdrawnAt: null } })
+      }
       if (existing.supersededAt) {
         // The ledger reverted to bytes seen before: that version is current again.
         await tx.salesOrderInvoiceDocument.updateMany({
           where: { orderId: input.orderId, kind: input.kind, refundId: input.refundId ?? null, supersededAt: null },
           data: { supersededAt: deps.now() },
         })
-        await tx.salesOrderInvoiceDocument.update({ where: { id: existing.id }, data: { supersededAt: null } })
+        await tx.salesOrderInvoiceDocument.update({ where: { id: existing.id }, data: { supersededAt: null, withdrawnAt: null } })
       }
     } else {
       await tx.salesOrderInvoiceDocument.updateMany({
@@ -404,6 +481,7 @@ async function ensureUnderLease(
   })
 
   if (recorded.kind === 'lost') throw new LeaseLost()
+  if (recorded.kind === 'order-changed') return defer(`${label}: the order changed while the document was being fetched (invoice number, total, credit or customer), so the downloaded bytes are discarded`, 'failed')
   if (recorded.kind === 'conflict') return needsAttention(recorded.reason)
 
   await recordState(input, subjectKey, token, {

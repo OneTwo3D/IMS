@@ -200,7 +200,7 @@ export async function ensureInvoiceDocumentOnDemand(orderId: string, deps: Invoi
   const outcome = await ensureInvoiceDocument({ orderId, kind: 'INVOICE' }, deps)
   if (outcome.status === 'stored') return true
   // A recheck that did not come back with a new answer leaves the stored version in place.
-  const stored = await db.salesOrderInvoiceDocument.findFirst({ where: { orderId, kind: 'INVOICE', supersededAt: null }, select: { id: true } })
+  const stored = await db.salesOrderInvoiceDocument.findFirst({ where: { orderId, kind: 'INVOICE', supersededAt: null, withdrawnAt: null }, select: { id: true } })
   return stored !== null
 }
 
