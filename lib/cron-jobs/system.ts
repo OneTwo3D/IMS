@@ -23,6 +23,16 @@ registerCronJobs([
     defaultEnabled: false,
   },
   {
+    slug: 'invoice-documents',
+    settingKey: 'invoice_documents',
+    module: 'system',
+    moduleLabel: 'System',
+    label: 'Customer Invoice Documents',
+    description: 'Fetches the customer invoice (and, when enabled, credit note) PDF from the accounting ledger for WooCommerce orders created on or after the date in the setting invoice_documents_sweep_floor, and stores it in IMS. Read-only toward the ledger and the storefront; with no floor date it does nothing. Historic orders are fetched on first customer download instead (invoice_documents_lazy_fetch_enabled).',
+    defaultSchedule: '*/15 * * * *',
+    defaultEnabled: false,
+  },
+  {
     slug: PACK_SCHEDULE_SLUG,
     settingKey: PACK_SCHEDULE_SETTING_KEY,
     module: 'system',

@@ -1078,10 +1078,13 @@ persisted connector-downloaded PDFs.
 Create `/var/lib/one-two-inventory/invoice-pdfs` during deployment with the same
 owner as the IMS application process and restrictive permissions, for example
 `chown app:app /var/lib/one-two-inventory/invoice-pdfs` and
-`chmod 750 /var/lib/one-two-inventory/invoice-pdfs`. Connector PDFs are usually
-re-fetchable from the accounting connector, so they do not need the same backup policy
-as the database, but include the directory in operational snapshots if customer
-invoice links must remain available during connector outages. Plan disk capacity
+`chmod 750 /var/lib/one-two-inventory/invoice-pdfs`. The directory now also holds the
+stored customer invoice and credit note documents (`documents/<order id>/<sha256>.pdf`,
+see [invoice-documents.md](invoice-documents.md)), which are a statutory record kept
+six years and which nothing in IMS deletes. **The directory must be in the backup set**,
+restored together with the database: the database rows say which files exist and each
+row carries the file's SHA-256, so a restore with the rows and without the files is
+detectable but not recoverable except by re-fetching from the ledger. Plan disk capacity
 for roughly 50-500 KB per invoice PDF; 100,000 invoices can consume about
 5-50 GB. Pre-release files under the old local `data/invoices` path are not
 migrated by IMS because production installs are not live yet.

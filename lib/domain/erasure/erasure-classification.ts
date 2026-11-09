@@ -104,6 +104,15 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
     notPersonal: ['currency', 'method'],
     retained: { reference: 'the payment reference / transaction id reconciles the receipt with the bank and the ledger' },
   },
+  SalesOrderInvoiceDocument: {
+    erased: [],
+    notPersonal: ['connector', 'externalDocumentId', 'externalStatus', 'sha256'],
+    retained: {
+      documentNumber: 'issued invoice / credit note number, statutory record',
+      storedPath: 'the issued invoice / credit note PDF is a statutory record, kept six years',
+    },
+  },
+  InvoiceDocumentFetchState: { erased: [], notPersonal: ['subjectKey', 'lastError'], retained: {} },
   ReturnExpectation: { erased: [], notPersonal: ['reference', 'transitJournalKey'], retained: {} },
   ReturnExpectationLine: { erased: [], notPersonal: ['sku', 'costSnapshot'], retained: {} },
   SalesOrderLine: {

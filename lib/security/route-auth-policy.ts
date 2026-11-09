@@ -222,6 +222,10 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
   },
+  '/api/cron/invoice-documents': {
+    access: 'cron-secret',
+    reason: 'Cron endpoint guarded by verifyCron.',
+  },
   '/api/cron/writers-check': {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
