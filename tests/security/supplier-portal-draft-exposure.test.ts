@@ -63,6 +63,8 @@ function fullRow(r: Row) {
     ...r,
     currency: 'GBP', expectedDelivery: null, supplierRef: null, createdAt: new Date('2026-10-30T00:00:00.000Z'),
     notes: null, _count: { lines: 1 },
+    supplier: { name: 'Supplier', contactName: null, email: null, addressLine1: null, addressLine2: null, city: null, postcode: null, country: 'GB' },
+    purchaseUnit: null,
     lines: [{ id: 'line-1', qty: new Prisma.Decimal('2'), productId: 'p1', product: { sku: 'SKU-1', name: 'Product 1' } }],
     fxRateToBase: new Prisma.Decimal('1'), discountStr: null, discountAmount: new Prisma.Decimal('0'),
     pricesIncludeVat: false, taxRatePercent: new Prisma.Decimal('0'),
@@ -70,6 +72,13 @@ function fullRow(r: Row) {
 }
 
 let writes = 0
+/** Called after every purchaseOrder read: lets a test change the row between two reads. */
+let afterPoRead: (() => void) | null = null
+function readHook<T>(value: T): T {
+  const hook = afterPoRead
+  if (hook) hook()
+  return value
+}
 const LINE = {
   id: 'line-1', totalForeign: new Prisma.Decimal('0'), totalBase: new Prisma.Decimal('0'),
   taxForeign: new Prisma.Decimal('0'), taxBase: new Prisma.Decimal('0'), taxRate: null,
@@ -99,11 +108,11 @@ const fakeDb = {
     findMany: async ({ where }: { where: Where }) => ROWS.filter((r) => matches(r, where)).map(fullRow),
     findUnique: async ({ where }: { where: Where }) => {
       const r = ROWS.find((row) => row.id === where.id)
-      return r ? fullRow(r) : null
+      return readHook(r ? fullRow(r) : null)
     },
     findFirst: async ({ where }: { where: Where }) => {
       const r = ROWS.find((row) => matches(row, where))
-      return r ? fullRow(r) : null
+      return readHook(r ? fullRow(r) : null)
     },
   },
   supplierProduct: { findMany: async () => [] },
@@ -168,15 +177,43 @@ test('submitSupplierQuote still accepts a sent RFQ', async () => {
   assert.ok(writes > 0)
 })
 
+const pdfDeps = (rendered: unknown[]) => ({
+  authorize: async () => ({ user: { id: 'u1', role: 'SUPPLIER', supplierId: 'sup-A' } }) as never,
+  findDocumentTemplate: async () => null,
+  renderPdf: async (po: unknown) => { rendered.push(po); return new Response('pdf', { status: 200 }) },
+})
+
 test('the RFQ PDF route will not hand a supplier a DRAFT, but serves a sent RFQ', async () => {
   const { handleRfqGet } = await import('@/app/api/rfq/[id]/route')
-  const deps = {
-    authorize: async () => ({ user: { id: 'u1', role: 'SUPPLIER', supplierId: 'sup-A' } }) as never,
-    findPurchaseOrder: async () => ({ reference: 'X' }) as never,
-    findDocumentTemplate: async () => null,
-    renderPdf: async () => new Response('pdf', { status: 200 }),
-  }
-  assert.equal((await handleRfqGet({ id: 'po-draft' }, deps)).status, 403)
-  assert.equal((await handleRfqGet({ id: 'po-cancelled-unsent' }, deps)).status, 403)
-  assert.equal((await handleRfqGet({ id: 'po-rfq' }, deps)).status, 200)
+  const rendered: unknown[] = []
+  assert.equal((await handleRfqGet({ id: 'po-draft' }, pdfDeps(rendered))).status, 403)
+  assert.equal((await handleRfqGet({ id: 'po-cancelled-unsent' }, pdfDeps(rendered))).status, 403)
+  assert.equal(rendered.length, 0)
+  assert.equal((await handleRfqGet({ id: 'po-rfq' }, pdfDeps(rendered))).status, 200)
+  assert.equal(rendered.length, 1)
 })
+
+for (const [label, change] of [
+  ['is reassigned to another supplier', (r: Row) => { r.supplierId = 'sup-B' }],
+  ['is pulled back to DRAFT', (r: Row) => { r.status = 'DRAFT'; r.rfqSentAt = null }],
+] as const) {
+  test(`the RFQ PDF route renders nothing from a state the supplier cannot see: order ${label} after its first read`, async () => {
+    const { handleRfqGet } = await import('@/app/api/rfq/[id]/route')
+    const row: Row = { id: 'po-race', supplierId: 'sup-A', reference: 'PO-RACE', status: 'RFQ_SENT', rfqSentAt: SENT, poSentAt: null }
+    ROWS.push(row)
+    let reads = 0
+    afterPoRead = () => { if (++reads === 1) change(row) }
+    try {
+      const rendered: Array<{ reference?: string }> = []
+      const response = await handleRfqGet({ id: 'po-race' }, pdfDeps(rendered))
+      // The route may answer from the state it read first (200) or refuse (403), but it must
+      // never render a row that, at the moment it was read, failed the supplier's scope.
+      assert.ok(reads >= 1)
+      assert.ok(reads === 1, 'ownership, visibility and data come from ONE read, not a check then a reload')
+      assert.ok(response.status === 200 || response.status === 403)
+    } finally {
+      afterPoRead = null
+      ROWS.splice(ROWS.indexOf(row), 1)
+    }
+  })
+}

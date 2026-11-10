@@ -51,8 +51,12 @@ type RfqDocumentTemplate = {
 type RfqRouteDependencies = {
   authorize: () => Promise<RfqSession>
   hasPermission: typeof hasPermission
-  findSupplierOwnedPurchaseOrder: (id: string, supplierId: string) => Promise<{ id: string } | null>
-  findPurchaseOrder: (id: string) => Promise<RfqPurchaseOrder | null>
+  /**
+   * One read. With `supplierId` (a SUPPLIER session) the row must also belong to that supplier and be
+   * one the buyer has sent; ownership, visibility and the data rendered all come from this query, so
+   * a reassignment or status change cannot slip in between a check and a reload.
+   */
+  findPurchaseOrder: (id: string, supplierId?: string) => Promise<RfqPurchaseOrder | null>
   findDocumentTemplate: () => Promise<RfqDocumentTemplate | null>
   renderPdf: (po: RfqPurchaseOrder, tpl: RfqDocumentTemplate | null) => Promise<Response>
 }
@@ -60,15 +64,9 @@ type RfqRouteDependencies = {
 const defaultRfqRouteDependencies: RfqRouteDependencies = {
   authorize: requireApiAuth,
   hasPermission,
-  findSupplierOwnedPurchaseOrder(id, supplierId) {
+  findPurchaseOrder(id, supplierId) {
     return db.purchaseOrder.findFirst({
-      where: { id, supplierId, ...supplierSentPurchaseOrderWhere() },
-      select: { id: true },
-    })
-  },
-  findPurchaseOrder(id) {
-    return db.purchaseOrder.findUnique({
-      where: { id },
+      where: supplierId === undefined ? { id } : { id, supplierId, ...supplierSentPurchaseOrderWhere() },
       select: {
         reference: true,
         currency: true,
@@ -139,18 +137,16 @@ export async function handleRfqGet(
 
   const { id } = params
 
-  // Suppliers get 403 before the broad PO lookup to avoid ID existence leaks.
-  // Purchasers/admins can distinguish 404 because they have purchasing access.
-  if (isSupplier) {
-    if (!session.user.supplierId) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-    const owned = await dependencies.findSupplierOwnedPurchaseOrder(id, session.user.supplierId)
-    if (!owned) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
+  // Suppliers get 403 for anything they cannot see (not theirs, not sent, or absent) to avoid ID
+  // existence leaks. The scope is part of the single data query, never a separate pre-check.
+  if (isSupplier && !session.user.supplierId) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
-  const po = await dependencies.findPurchaseOrder(id)
+  const po = await dependencies.findPurchaseOrder(id, isSupplier ? session.user.supplierId! : undefined)
 
   if (!po) {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    return isSupplier
+      ? NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+      : NextResponse.json({ error: 'Not found' }, { status: 404 })
   }
   const tpl = await dependencies.findDocumentTemplate()
   return dependencies.renderPdf(po, tpl)
