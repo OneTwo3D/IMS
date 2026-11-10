@@ -173,3 +173,85 @@ for (const [resource, payload, key] of [
     assert.equal((logged.metadata as Row).originScope, 'under')
   })
 }
+
+// --- receipt: a header outside the signature is not proof for money-moving resources -----------
+
+async function receive(resource: 'orders' | 'refunds' | 'products', body: string, headers: Record<string, string>) {
+  const { handleWcWebhook } = await import('@/lib/connectors/woocommerce/webhooks')
+  const persisted: Row[] = []
+  const response = await handleWcWebhook(
+    resource,
+    new Request(`https://ims.example.com/api/webhooks/woocommerce/${resource}`, {
+      method: 'POST',
+      headers: { 'x-wc-webhook-topic': 'order.updated', 'x-wc-webhook-signature': 'sig', ...headers },
+      body,
+    }),
+    body,
+    {
+      getMaintenanceModeResponse: async () => null,
+      verifyWebhook: async () => true, // a VALID signature: the body is genuinely store-signed
+      recordWebhookReceipt: async () => {},
+      getWebhookProcessingGate: async () => ({ enabled: true }),
+      persistWebhookEvent: async (_repository, input) => {
+        persisted.push(input as unknown as Row)
+        return { status: 'created', event: { id: 'evt-1' } as never }
+      },
+      webhookEventRepository: {} as never,
+      handleOrderWebhook: async () => new Response(null, { status: 200 }),
+      handleProductWebhook: async () => new Response(null, { status: 200 }),
+      handleRefundWebhook: async () => new Response(null, { status: 200 }),
+    },
+  )
+  assert.equal(response.status, 202)
+  return persisted[0].originAttestation as string
+}
+
+for (const resource of ['orders', 'refunds'] as const) {
+  test(`${resource}: a valid signature with a FORGED source header and no signed store evidence is held, not imported`, async () => {
+    reset()
+    const body = JSON.stringify({ id: 9001, order_id: 9001 })
+    const attestation = await receive(resource, body, { 'x-wc-webhook-source': `${STORE_A}/` })
+    assert.equal(attestation, 'store-header:store-a.example.com', 'header-only evidence is recorded as unsigned')
+
+    const { calls, dependencies } = spies()
+    const response = await dispatch(resource, attestation, JSON.parse(body), dependencies)
+
+    assert.equal(response.status, 503)
+    assert.deepEqual(calls[resource === 'orders' ? 'order' : 'refund'], [])
+    const logged = state.activity.find((entry) => String(entry.action).endsWith('_webhook_held'))
+    assert.ok(logged)
+    assert.equal((logged.metadata as Row).originScope, 'header')
+  })
+
+  test(`${resource}: signed body evidence still outranks a header, and is accepted as exact`, async () => {
+    reset()
+    const body = JSON.stringify({ id: 9001, order_id: 9001, _links: { self: [{ href: `${STORE_A}/wp-json/wc/v3/orders/9001` }] } })
+    const attestation = await receive(resource, body, { 'x-wc-webhook-source': 'https://forged.example.com/' })
+    assert.equal(attestation, 'store:store-a.example.com')
+  })
+}
+
+test('products keep the plain store: encoding for header-only evidence (unchanged behaviour)', async () => {
+  reset()
+  const attestation = await receive('products', JSON.stringify({ id: 1, sku: 'S' }), { 'x-wc-webhook-source': `${STORE_A}/` })
+  assert.equal(attestation, 'store:store-a.example.com')
+})
+
+// --- an unreadable binding is checked BEFORE the evidence is judged ---------------------------------
+
+for (const [resource, payload, key] of [['orders', ORDER, 'order'], ['refunds', REFUND, 'refund']] as const) {
+  for (const attestation of ['unproven:not-stated', 'unproven:pre-attestation', 'store:store-b.example.com']) {
+    test(`${key}: wc_url missing AND evidence "${attestation}": held (503), never acknowledged and lost`, async () => {
+      reset()
+      state.settings.delete('wc_url')
+      const { calls, dependencies } = spies()
+
+      const response = await dispatch(resource, attestation, payload, dependencies)
+
+      assert.equal(response.status, 503)
+      assert.deepEqual(calls[key], [])
+      assert.ok(state.activity.some((entry) => entry.action === `wc_${key}_webhook_held`))
+      assert.equal(state.activity.some((entry) => entry.action === `wc_${key}_webhook_foreign_store`), false)
+    })
+  }
+}

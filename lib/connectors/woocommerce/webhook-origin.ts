@@ -1,4 +1,4 @@
-import { attestWebhookOrigin, attestWebhookOriginUnder } from '@/lib/connectors/webhook-origin'
+import { attestWebhookOrigin, attestWebhookOriginFromUnsignedHeader, attestWebhookOriginUnder } from '@/lib/connectors/webhook-origin'
 
 /** WooCommerce builds every REST link as `<site root>/wp-json/<namespace>/...`. */
 const REST_ROOT_MARKER = '/wp-json/'
@@ -33,7 +33,16 @@ const REST_ROOT_MARKER = '/wp-json/'
  * entirely contained in what the store sent, which is the property that makes it survive a
  * rebind that happens later.
  */
-export function readWcDeliveryOrigin(request: Request, payload: unknown): string {
+export function readWcDeliveryOrigin(
+  request: Request,
+  payload: unknown,
+  /**
+   * Orders and refunds pass `'header-unsigned'`: they move money, and a header outside the HMAC is
+   * not proof of the sender, so header-only evidence is recorded as such (`store-header:`) and the
+   * handler holds it. Products keep the plain `store:` encoding they always had.
+   */
+  headerEvidence: 'trusted' | 'header-unsigned' = 'trusted',
+): string {
   const restRoot = readPayloadRestRoot(payload)
   if (restRoot) {
     const fromRestRoot = attestWebhookOrigin(restRoot)
@@ -46,7 +55,8 @@ export function readWcDeliveryOrigin(request: Request, payload: unknown): string
     if (!fromPermalink.startsWith('unproven:')) return fromPermalink
   }
 
-  return attestWebhookOrigin(request.headers.get('x-wc-webhook-source'))
+  const header = request.headers.get('x-wc-webhook-source')
+  return headerEvidence === 'header-unsigned' ? attestWebhookOriginFromUnsignedHeader(header) : attestWebhookOrigin(header)
 }
 
 /**

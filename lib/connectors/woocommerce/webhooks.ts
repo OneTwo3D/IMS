@@ -777,8 +777,15 @@ async function refuseNonBoundStoreDelivery(
   //   - an `under` statement (a permalink or a self-link below the root): on a root-installed
   //     binding it proves only "somewhere on this host", so a multisite subsite or a clone on
   //     the same host would pass. Only an exact store identity is accepted.
+  //   - `unproven` or `foreign-store` evidence is judged only AFTER the binding is known to be readable: with
+  //     `wc_url` missing the comparison cannot be made, and a delivery refused (acknowledged) then would be lost
+  //     for good although it may be perfectly valid once the URL is repaired.
+  //   - header-only evidence (`store-header:`): X-WC-Webhook-Source sits outside the HMAC, so a signed body
+  //     replayed with a forged header would otherwise look like it came from the bound store.
   const held = origin.verdict === 'binding-unreadable'
+    || origin.boundStore === null
     || (origin.verdict === 'same-store' && origin.scope !== 'exact')
+    || (origin.verdict === 'foreign-store' && origin.scope === 'header')
   if (held) {
     try {
       await logActivity({
@@ -790,9 +797,13 @@ async function refuseNonBoundStoreDelivery(
           ? `WooCommerce ${ref} webhook is held: the store URL this installation is bound to is missing or unreadable, `
             + 'so the sender cannot be checked. Nothing was imported. It is retried and, if the URL is not repaired, '
             + 'appears under Sync > Exceptions where it can be replayed.'
-          : `WooCommerce ${ref} webhook is held: it only showed it came from somewhere under ${origin.deliveryStore} `
-            + `(${origin.attestation}), not from exactly ${origin.boundStore}. Nothing was imported. It is retried and `
-            + 'then appears under Sync > Exceptions where it can be replayed.',
+          : origin.scope === 'header'
+            ? `WooCommerce ${ref} webhook is held: the only thing naming its store is the X-WC-Webhook-Source header, `
+              + 'which is not covered by the signature, so it does not prove who sent it. Nothing was imported. It is '
+              + 'retried and then appears under Sync > Exceptions.'
+            : `WooCommerce ${ref} webhook is held: it only showed it came from somewhere under ${origin.deliveryStore} `
+              + `(${origin.attestation}), not from exactly ${origin.boundStore}. Nothing was imported. It is retried and `
+              + 'then appears under Sync > Exceptions where it can be replayed.',
         metadata: {
           externalId: externalId ?? null,
           verdict: origin.verdict,
@@ -1140,7 +1151,11 @@ export async function handleWcWebhook(
   // the inbox, and by the time a retry runs, the headers are long gone and every setting has
   // moved on. No database read: the answer is entirely the store's own statement, which is what
   // makes it survive a rebind that happens afterwards.
-  const originAttestation = readWcDeliveryOrigin(request, parsed.value)
+  const originAttestation = readWcDeliveryOrigin(
+    request,
+    parsed.value,
+    resource === 'products' ? 'trusted' : 'header-unsigned',
+  )
 
   const result: PersistWcWebhookEventResult = await dependencies.persistWebhookEvent(
     dependencies.webhookEventRepository,
