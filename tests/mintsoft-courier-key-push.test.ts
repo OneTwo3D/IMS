@@ -56,7 +56,7 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
         return { data: next.result, status: 200 }
       }
       if (pathname === '/api/Order/Search') return { data: searchRows, status: 200 }
-      if (pathname === '/api/Order/900' && (init?.method ?? 'GET') === 'GET') return { data: { ID: 900, OrderStatusId: 1, ClientId: 5 }, status: 200 }
+      if (pathname === '/api/Order/900' && (init?.method ?? 'GET') === 'GET') return { data: { ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', OrderStatusId: 1, ClientId: 5 }, status: 200 }
       if (pathname === '/api/Order/900/Items') {
         if ((init?.method ?? 'GET') === 'GET') return itemsFail ? { data: null, error: 'Mintsoft items endpoint down', status: 500 } : { data: [], status: 200 }
         itemWrites += 1
