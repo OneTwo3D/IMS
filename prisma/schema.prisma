@@ -3932,6 +3932,12 @@ model WmsOrderPushLink {
   /// re-polled forever. Distinct from reconcileCheckedAt, which the separate
   /// q66in.4.4 order-reconcile sweep owns — the two must not clobber each other.
   dispatchReconcileCheckedAt DateTime?
+  /// IMS asked the warehouse to HOLD / CANCEL this order and the warehouse could not honour it (the order is already past NEW, was not found,
+  /// or is a merged survivor holding other orders' goods). A person has been told (the reason is in lastError); the link stays SYNCED/MERGED
+  /// so dispatch polling carries on. The hold / cancel passes skip a link whose notice is set: one attempt, one warehouse note. Cleared when
+  /// the link is pointed at a new warehouse order.
+  holdNoticeAt        DateTime? @map("hold_notice_at")
+  cancelNoticeAt      DateTime? @map("cancel_notice_at")
   createdAt           DateTime          @default(now())
   updatedAt           DateTime          @updatedAt
 

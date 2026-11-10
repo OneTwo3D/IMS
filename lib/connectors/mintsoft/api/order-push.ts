@@ -1,5 +1,6 @@
 import { isOutboundMaybeSentRefusalText, isOutboundWriteHeldText, outboundTextAfterEarlierSend } from '@/lib/security/outbound-write-hold-constants'
 import type {
+  WmsAmbiguousCreateResolution,
   WmsOrderCancelResult,
   WmsOrderPushInput,
   WmsOrderPushLine,
@@ -150,7 +151,8 @@ async function getPushClientId(operation: string): Promise<number> {
   return requireMintsoftClientId(parseMintsoftPositiveId(settings.mintsoft_client_id), operation)
 }
 
-async function findExistingByReference(input: WmsOrderPushInput, clientId: number): Promise<RawOrder | null> {
+/** The scoped Order/Search for an order's number: every row ClientId-asserted, merged survivors dropped, then the number/reference match. */
+async function searchExistingByReference(input: Pick<WmsOrderPushInput, 'orderNumber' | 'externalReference'>, clientId: number): Promise<RawOrder[]> {
   // Mintsoft's search is OrderNumber-based; match field-for-field (never
   // number-vs-reference) and only resolve when exactly one order matches.
   //
@@ -163,7 +165,7 @@ async function findExistingByReference(input: WmsOrderPushInput, clientId: numbe
   const query = new URLSearchParams({ OrderNumber: input.orderNumber, ClientId: String(clientId) })
   const result = await mintsoftRequest<unknown>(`/api/Order/Search?${query.toString()}`)
   if (result.error) throw new Error(result.error)
-  const matches = extractMintsoftArrayPayloadStrict(result.data, 'Order/Search (push dedupe)')
+  return extractMintsoftArrayPayloadStrict(result.data, 'Order/Search (push dedupe)')
     .map((row) => assertMintsoftOrderClient(row, clientId, 'Mintsoft Order/Search (push dedupe)'))
     .filter((row) => {
       const number = toStr(row.OrderNumber)
@@ -171,7 +173,38 @@ async function findExistingByReference(input: WmsOrderPushInput, clientId: numbe
       const ref = toStr(row.ExternalOrderReference)
       return number === input.orderNumber || ref === input.externalReference
     })
+}
+
+async function findExistingByReference(input: WmsOrderPushInput, clientId: number): Promise<RawOrder | null> {
+  const matches = await searchExistingByReference(input, clientId)
   return matches.length === 1 ? matches[0] : null
+}
+
+/**
+ * Resolve a create whose outcome IS NOT RECORDED (a timed-out PUT, a 5xx, a lost link write) by READING Mintsoft: the same scoped
+ * Order/Search the push dedupe uses. Nothing is written. An order is adopted only when exactly one row matches and that row carries
+ * THIS order's own stable external reference; a number-only match can be another order of ours that shares a number, so it (and
+ * several matches, and a row that has no usable id) is UNRESOLVED and left for a person. Zero matches is NONE.
+ */
+export async function reconcileMintsoftAmbiguousCreate(
+  reference: { orderNumber: string; externalReference: string },
+): Promise<WmsAmbiguousCreateResolution> {
+  const clientId = await getPushClientId('Mintsoft ambiguous-create reconcile')
+  const matches = await searchExistingByReference(reference, clientId)
+  if (matches.length === 0) return { kind: 'NONE' }
+  const ownReference = reference.externalReference.trim()
+  const exact = ownReference ? matches.filter((row) => toStr(row.ExternalOrderReference) === ownReference) : []
+  if (matches.length === 1 && exact.length === 1) {
+    const id = toStr(exact[0].ID ?? exact[0].Id ?? exact[0].id)
+    if (id) return { kind: 'ADOPT', externalOrderId: id, externalOrderNumber: toStr(exact[0].OrderNumber) ?? reference.orderNumber }
+  }
+  const seen = matches.map((row) => toStr(row.OrderNumber) ?? '?').join(', ')
+  return {
+    kind: 'UNRESOLVED',
+    reason: matches.length > 1
+      ? `Mintsoft holds ${matches.length} orders that match (${seen}), so none can be proved to be this order`
+      : `Mintsoft holds order ${seen} under this number, but it does not carry this order's own reference, so it cannot be proved to be this order`,
+  }
 }
 
 async function createOrder(payload: Record<string, unknown>): Promise<{ ok: boolean; data: RawOrder | null; message: string | null }> {

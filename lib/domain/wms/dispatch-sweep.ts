@@ -124,6 +124,16 @@ export function formatCursorInTimeZone(instant: Date, timeZone?: string | null):
 export const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'] as const
 
 /**
+ * Which orders' links are polled for despatch: an order that has not left the poll set, OR an IMS-CANCELLED order whose link carries a
+ * cancel notice (the warehouse could not honour the cancel, so the goods may still ship). The second arm exists so that a despatch
+ * after an IMS cancel is SEEN and raised for a person; `applyDispatch` never applies it to the cancelled order.
+ */
+export const DISPATCH_POLLED_ORDER_WHERE = [
+  { order: { status: { notIn: [...POST_DISPATCH_STATUSES] } } },
+  { cancelNoticeAt: { not: null }, order: { status: 'CANCELLED' as const } },
+]
+
+/**
  * What makes a link a dispatch candidate — the ONE definition (o3d-0gzr).
  *
  * The operator-facing isolate path has to quarantine exactly the set the sweep
@@ -151,7 +161,7 @@ export function dispatchCandidateWhere(connectorId: string) {
     // dead-lettered one is — its record cannot be read, so re-polling it every
     // tick only pins the watermark. It comes back when an operator acts.
     dispatchUnresolvedAt: null,
-    order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
+    OR: DISPATCH_POLLED_ORDER_WHERE,
   }
 }
 
@@ -2581,7 +2591,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
             // dead-lettered one is — its record cannot be read, so re-polling it every
             // tick only pins the watermark. It comes back when an operator acts.
             dispatchUnresolvedAt: null,
-            order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
+            OR: DISPATCH_POLLED_ORDER_WHERE,
           },
           select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
         })
@@ -2611,7 +2621,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
             // dead-lettered one is — its record cannot be read, so re-polling it every
             // tick only pins the watermark. It comes back when an operator acts.
             dispatchUnresolvedAt: null,
-            order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
+            OR: DISPATCH_POLLED_ORDER_WHERE,
           },
           select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
         })
@@ -2716,6 +2726,18 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       // q66in.4.6 audit timeline: capture the order status pre-image so the
       // dispatch event carries a real before/after, not just the target state.
       const orderBefore = await db.salesOrder.findUnique({ where: { id: orderId }, select: { status: true, orderNumber: true } }).catch(() => null)
+      // NEVER applied to an order IMS has cancelled. Its stock was released and its money settled on the footing that nothing would ship;
+      // applying a despatch would re-allocate and ship it on its own. The warehouse despatched it anyway (the cancel arrived too late),
+      // which is a stock-and-refund decision for a person: refuse, and the ordinary dispatch failure path puts it in the inbox.
+      if (orderBefore?.status === 'CANCELLED') {
+        return {
+          success: false,
+          error: `The warehouse despatched order ${orderBefore.orderNumber ?? orderId} after IMS cancelled it. IMS has not recorded the shipment: `
+            + 'decide with the warehouse whether the goods are recalled or the order is reinstated, then record it by hand.',
+          refusal: 'shipment_status_transition_failed',
+          permanent: false,
+        }
+      }
       const result = await applyExternalFulfillmentUpdate({
         source: connectorId,
         lookup: { orderId },

@@ -526,6 +526,12 @@ export type WmsOrderUpdateResult = {
  * assume. That degradation is what the seam test exercises, because with one shipped
  * connector implementing nearly everything, no other test can reach those branches.
  */
+/** The answer of {@link WmsConnector.reconcileAmbiguousCreate}. */
+export type WmsAmbiguousCreateResolution =
+  | { kind: 'ADOPT'; externalOrderId: string; externalOrderNumber: string }
+  | { kind: 'NONE' }
+  | { kind: 'UNRESOLVED'; reason: string }
+
 export interface WmsConnector<Id extends string = WmsConnectorId> {
   readonly id: Id
   readonly name: string
@@ -614,6 +620,20 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
     externalOrderId: string,
     reference: { orderNumber: string | null; externalReference: string | null },
   ): Promise<'ours' | 'foreign' | 'unknown'>
+  /**
+   * Resolve a create whose outcome was never recorded, by READING the warehouse (no write, ever).
+   *
+   * `reference` is OUR record of the order. The answer binds an id only when the warehouse's own record
+   * carries THIS order's stable external reference:
+   *   'ADOPT'      - exactly one order, provably ours. The caller links it (still to be proved by
+   *                  verifyPushedOrder before anything is amended, cancelled or dispatched).
+   *   'NONE'       - the warehouse holds nothing under the reference; the caller's ordinary flow decides.
+   *   'UNRESOLVED' - something is there that is NOT provably this order (a number-only match, several
+   *                  matches, a merged survivor). Nothing is bound; `reason` is for the operator.
+   */
+  reconcileAmbiguousCreate?(
+    reference: { orderNumber: string; externalReference: string },
+  ): Promise<WmsAmbiguousCreateResolution>
   /** Amend an already-pushed WMS order; a no-op (updated=false) if past NEW. */
   updateOrder?(externalOrderId: string, input: WmsOrderPushInput, clearance: WmsWriteClearance<'order.amend'>): Promise<WmsOrderUpdateResult>
   /** Cancel a WMS order by its external id; a no-op (success) if past NEW. */

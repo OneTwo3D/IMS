@@ -364,6 +364,23 @@ export type WmsPushDeadLetterRow = {
  */
 const BLOCKED_WMS_PUSH_STATES = ['DEAD_LETTER', 'VALIDATION_FAILED', 'AMBIGUOUS_CREATE'] as const
 
+/**
+ * Links that are LIVE but carry an operator notice: IMS asked the warehouse to hold / cancel the order and it could not (already past
+ * NEW, not found, a merged survivor). They stay SYNCED/MERGED so a despatch is still recorded, which is exactly why they are not in
+ * BLOCKED_WMS_PUSH_STATES and need their own clause here. A hold notice matters only while the order is still ON_HOLD; a cancel notice
+ * until the dispatch sweep has parked or quarantined the link (those have their own sections). NOT EXPORTED: 'use server' module.
+ */
+const WMS_PUSH_NOTICE_WHERE = {
+  state: { in: ['SYNCED', 'MERGED'] as Array<'SYNCED' | 'MERGED'> },
+  dispatchDeadLetteredAt: null,
+  dispatchUnresolvedAt: null,
+  OR: [
+    { holdNoticeAt: { not: null }, order: { status: 'ON_HOLD' as const } },
+    { cancelNoticeAt: { not: null }, order: { status: 'CANCELLED' as const } },
+  ],
+}
+const WMS_PUSH_INBOX_WHERE = { OR: [{ state: { in: [...BLOCKED_WMS_PUSH_STATES] } }, WMS_PUSH_NOTICE_WHERE] }
+
 export type PennyMismatchRow = {
   orderId: string
   orderNumber: string | null
@@ -1052,7 +1069,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // o3d-92fu / o3d-2k5r: the count is over EVERY blocked push state, not DEAD_LETTER alone — a
     // VALIDATION_FAILED or AMBIGUOUS_CREATE order reaches the warehouse only via a human, so it
     // belongs in the same total. Kept through the merge with o3d-0bfh's follow-up obligations.
-    db.wmsOrderPushLink.count({ where: { state: { in: [...BLOCKED_WMS_PUSH_STATES] } } }),
+    db.wmsOrderPushLink.count({ where: WMS_PUSH_INBOX_WHERE }),
     db.integrationOutbox.count({ where: { status: { in: OUTBOX_FAILURE_STATUSES } } }),
     db.wmsInboundReceiptEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
     db.wmsWebhookEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
@@ -1183,10 +1200,12 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
   const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, deadShoppingWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents, followUpObligationRows, postingRefusalRows] = await Promise.all([
     db.wmsOrderPushLink.findMany({
-      where: { state: { in: [...BLOCKED_WMS_PUSH_STATES] } },
+      where: WMS_PUSH_INBOX_WHERE,
       orderBy: { lastAttemptAt: 'desc' },
       take: SECTION_LIMIT,
       select: {
+        holdNoticeAt: true,
+        cancelNoticeAt: true,
         orderId: true,
         connector: true,
         state: true,
