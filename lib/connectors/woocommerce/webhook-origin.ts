@@ -37,13 +37,14 @@ export function readWcDeliveryOrigin(
   request: Request,
   payload: unknown,
   /**
-   * Orders and refunds pass `'header-unsigned'`: they move money, and a header outside the HMAC is
+   * Orders and refunds pass `'header-unsigned'`, which also lets a plain-permalink `?rest_route=` self-link
+   * yield the exact site root (products keep recording it as containment): they move money, and a header outside the HMAC is
    * not proof of the sender, so header-only evidence is recorded as such (`store-header:`) and the
    * handler holds it. Products keep the plain `store:` encoding they always had.
    */
   headerEvidence: 'trusted' | 'header-unsigned' = 'trusted',
 ): string {
-  const restRoot = readPayloadRestRoot(payload)
+  const restRoot = readPayloadRestRoot(payload, headerEvidence === 'header-unsigned')
   if (restRoot) {
     const fromRestRoot = attestWebhookOrigin(restRoot)
     if (!fromRestRoot.startsWith('unproven:')) return fromRestRoot
@@ -68,12 +69,12 @@ export function readWcDeliveryOrigin(
  * `index.php` and slashes removed — see `restRouteSiteRoot`. Any other shape proves nothing
  * exactly and is left to the permalink/containment path.
  */
-function readPayloadRestRoot(payload: unknown): string | null {
+function readPayloadRestRoot(payload: unknown, allowRestRoute: boolean): string | null {
   const href = readPayloadSelfHref(payload)
   if (!href) return null
   const markerAt = href.indexOf(REST_ROOT_MARKER)
   if (markerAt > 0) return href.slice(0, markerAt)
-  return restRouteSiteRoot(href)
+  return allowRestRoute ? restRouteSiteRoot(href) : null
 }
 
 /**
