@@ -3,7 +3,7 @@ import test, { mock } from 'node:test'
 import { Prisma, SalesOrderStatus } from '@/app/generated/prisma/client'
 import { getCurrencySummaryReport, type FinanceAnalyticsClient } from '@/lib/domain/finance/finance-period-analytics'
 import { getMarginAnalyticsReport, type SalesFulfillmentAnalyticsClient } from '@/lib/domain/sales/sales-fulfillment-analytics'
-import { invoicedPeriodDate } from '@/lib/domain/sales/invoiced-revenue-basis'
+import { invoicedPeriodDate, isInvoicedOrder } from '@/lib/domain/sales/invoiced-revenue-basis'
 
 /**
  * Three follow-ups to the shared invoiced basis:
@@ -40,6 +40,7 @@ function matches(record: Row | undefined | null, where: Row | undefined): boolea
         case 'gte': return value != null && cmp(value) >= cmp(arg)
         case 'lte': return value != null && cmp(value) <= cmp(arg)
         case 'lt': return value != null && cmp(value) < cmp(arg)
+        case 'some': return ((value as Row[]) ?? []).some((child) => matches(child, arg as Row))
         default: throw new Error(`unsupported operator ${op}`)
       }
     })
@@ -59,7 +60,7 @@ function salesOrder(id: string, over: Row): Row {
     currency: 'GBP', customerId: 'c1', customerName: 'Acme', customerEmail: null, createdAt: DAY, invoicedAt: null,
     expectedDelivery: null, paidAt: null,
     totalForeign: D(100), totalBase: D(100), taxForeign: D(0), taxBase: D(0), shippingForeign: D(0), shippingBase: D(0), discountAmount: D(0),
-    shoppingLinks: [],
+    shoppingLinks: over.invoiceNumber ? [{ connector: 'woocommerce' }] : [],
     lines: [{
       id: `${id}-l`, productId: 'p1', sku: 'P1', description: 'Widget', qty: D(1), totalForeign: D(100), totalBase: D(100),
       taxForeign: D(0), taxBase: D(0), discountAmount: D(0),
@@ -190,9 +191,49 @@ test('customer aging ages a Xeroom-era order from its order date', async () => {
   }
 })
 
+test('a Xeroom-era order created on 31 Oct and paid on 2 Nov lands in November, and is not approximate', async () => {
+  INVOICE_ORDERS.push(salesOrder('crossmonth', {
+    invoiceNumber: 'INV-120', createdAt: new Date('2026-10-31T22:00:00.000Z'), paidAt: new Date('2026-11-02T09:00:00.000Z'),
+    payments: [], refunds: [], orderNumber: 'SO-6', externalOrderNumber: null, salesRep: null, totalBase: D(40), totalForeign: D(40),
+  }))
+  try {
+    const { getInvoiceStats } = await import('@/app/actions/sales-stats')
+    assert.ok(!(await getInvoiceStats('2026-10-01', '2026-10-31')).some((r) => r.orderId === 'crossmonth'))
+    const nov = (await getInvoiceStats('2026-11-01', '2026-11-30')).find((r) => r.orderId === 'crossmonth')!
+    assert.equal(nov.invoicedAt, '2026-11-02T09:00:00.000Z')
+    assert.equal(nov.invoicedAtApproximate, false)
+    const client = { salesOrder: { findMany: async (args?: { where?: Row }) => INVOICE_ORDERS.filter((o) => matches(o, args?.where)) }, salesOrderLine: none, payment: none, purchaseInvoice: none, fxRate: none } as FinanceAnalyticsClient
+    const deps = { client, now: () => new Date('2026-11-30T00:00:00.000Z'), baseCurrency: async () => 'GBP' }
+    const oct = await getCurrencySummaryReport({ dateFrom: '2026-10-01', dateTo: '2026-10-31' }, { deps })
+    assert.equal(Number(oct.totals.salesBase), 0)
+    const novReport = await getCurrencySummaryReport({ dateFrom: '2026-11-01', dateTo: '2026-11-30' }, { deps })
+    assert.equal(Number(novReport.totals.salesBase), 40)
+    assert.ok(!novReport.notices.some((n) => /approximate/.test(n)))
+  } finally {
+    INVOICE_ORDERS.pop()
+  }
+})
+
+test('an unpaid Xeroom-era order with no invoice date is dated by the order date and flagged approximate', async () => {
+  const { getInvoiceStats } = await import('@/app/actions/sales-stats')
+  const row = (await getInvoiceStats('2026-05-01', '2026-05-31')).find((r) => r.orderId === 'xeroom')!
+  assert.equal(row.invoicedAtApproximate, true)
+  const client = { salesOrder: { findMany: async (args?: { where?: Row }) => INVOICE_ORDERS.filter((o) => matches(o, args?.where)) }, salesOrderLine: none, payment: none, purchaseInvoice: none, fxRate: none } as FinanceAnalyticsClient
+  const may = await getCurrencySummaryReport({ dateFrom: '2026-05-01', dateTo: '2026-05-31' }, { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z'), baseCurrency: async () => 'GBP' } })
+  assert.ok(may.notices.some((n) => /approximate/.test(n)), 'the report says some orders are dated approximately')
+})
+
+test('an IMS-minted invoice number with no posted invoice is not an invoiced order', () => {
+  assert.equal(isInvoicedOrder({ status: 'SHIPPED', invoiceNumber: 'INV-1', shoppingLinks: [] }), false)
+  assert.equal(isInvoicedOrder({ status: 'SHIPPED', invoiceNumber: 'INV-1', shoppingLinks: [{ connector: 'woocommerce' }] }), true)
+  assert.equal(isInvoicedOrder({ status: 'SHIPPED', invoiceNumber: 'INV-1', accountingInvoiceId: 'x', shoppingLinks: [] }), true)
+})
+
 test('invoicedPeriodDate prefers invoicedAt and falls back to the order date', () => {
   const created = new Date('2026-01-01T00:00:00.000Z')
   assert.equal(invoicedPeriodDate({ invoicedAt: null, createdAt: created }), created)
+  const paid = new Date('2026-01-15T00:00:00.000Z')
+  assert.equal(invoicedPeriodDate({ invoicedAt: null, paidAt: paid, createdAt: created }), paid)
   const inv = new Date('2026-02-01T00:00:00.000Z')
   assert.equal(invoicedPeriodDate({ invoicedAt: inv, createdAt: created }), inv)
 })

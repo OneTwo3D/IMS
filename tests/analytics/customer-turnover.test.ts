@@ -3,7 +3,7 @@ import test from 'node:test'
 import { orderTurnoverBase, type TurnoverRefund } from '@/lib/domain/sales/customer-turnover'
 
 const order = (refunds: TurnoverRefund[], over: Record<string, unknown> = {}) => ({
-  status: 'SHIPPED', invoiceNumber: 'INV-1', totalBase: 120, refunds, ...over,
+  status: 'SHIPPED', invoiceNumber: 'INV-1', shoppingLinks: [{ connector: 'woocommerce' }], totalBase: 120, refunds, ...over,
 })
 /** A credit line of `totalBase` against a sales line whose STORED net and tax are `lineNet` and `lineTax`. */
 const line = (totalBase: number, lineNet: number | null, lineTax: number | null) => ({
@@ -47,6 +47,7 @@ test('drafts, cancelled and un-invoiced orders contribute nothing', () => {
   assert.equal(orderTurnoverBase(order([], { status: 'DRAFT' })), null)
   assert.equal(orderTurnoverBase(order([], { status: 'CANCELLED' })), null)
   assert.equal(orderTurnoverBase(order([], { invoiceNumber: null })), null)
+  assert.equal(orderTurnoverBase(order([], { shoppingLinks: [] })), null, 'an IMS-minted number alone is not an invoice')
 })
 
 test('the charged rate is read from the line\u2019s stored net and tax, not from a TaxRate edited since the sale', () => {

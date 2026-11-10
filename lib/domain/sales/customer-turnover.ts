@@ -54,6 +54,7 @@ export function orderTurnoverBase(order: {
   status: string
   invoiceNumber?: string | null
   accountingInvoiceId?: string | null
+  shoppingLinks?: ReadonlyArray<{ connector: string }>
   totalBase: unknown
   refunds?: TurnoverRefund[]
 }): { value: number; complete: boolean } | null {

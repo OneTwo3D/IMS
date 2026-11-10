@@ -8,7 +8,7 @@ import { getFxSourceRegime, type FxSourceRegime } from '@/lib/currencies/fx-sour
 import { multiplyMoney, roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
-import { invoicedInPeriodWhere } from '@/lib/domain/sales/invoiced-revenue-basis'
+import { INVOICED_ORDER_WHERE, invoicedInPeriodWhere, invoicedPeriodDateIsApproximate } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 
 const DEFAULT_PAGE_SIZE = 100
@@ -688,8 +688,8 @@ export async function getArAgingReport(
   const orders = await client.salesOrder.findMany({
     where: {
       archived: false,
-      // Invoiced basis (shared with the revenue reports), dated by invoicedPeriodDate.
-      AND: [invoicedInPeriodWhere({ lt: asOfExclusive }), { OR: [{ paidAt: null }, { paidAt: { gte: asOfExclusive } }, { payments: { some: { refundId: null, paidAt: { lt: asOfExclusive } } } }] }],
+      // Invoiced basis (shared with the revenue reports). Owed from the invoice date, else the order date (not paidAt: a since-paid invoice was still owed before payment).
+      AND: [INVOICED_ORDER_WHERE, { OR: [{ invoicedAt: { lt: asOfExclusive } }, { invoicedAt: null, createdAt: { lt: asOfExclusive } }] }, { OR: [{ paidAt: null }, { paidAt: { gte: asOfExclusive } }, { payments: { some: { refundId: null, paidAt: { lt: asOfExclusive } } } }] }],
     },
     select: {
       id: true,
@@ -783,6 +783,8 @@ export async function getArAgingReport(
     'Customer credit balances are excluded from aging buckets and surfaced in totals.creditBalanceBase.',
     `Bucket boundaries are configurable through bucket1Days/bucket2Days/bucket3Days and currently use ${buckets[0]}/${buckets[1]}/${buckets[2]} days.`,
     ...bucketResult.notices,
+    // Receivable from the invoice date, else from the order date: an invoice that has since been paid was still owed before it was paid, so paidAt cannot stand in here.
+    ...approximateDateNotice(orders.map((o) => ({ invoicedAt: (o as { invoicedAt?: Date | null }).invoicedAt, paidAt: null }))),
   ], options.paginate !== false)
 }
 
@@ -893,6 +895,7 @@ export async function getCurrencySummaryReport(
         currency: true,
         totalForeign: true,
         totalBase: true,
+        invoicedAt: true,
         paidAt: true,
         payments: { select: { amount: true, currency: true, paidAt: true, refundId: true } },
       },
@@ -1016,7 +1019,14 @@ export async function getCurrencySummaryReport(
   }, [
     'Currency summary groups invoiced sales orders and purchase invoices by their document currency, preserving foreign-currency totals alongside base equivalents.',
     'AR outstanding is estimated per sales order from same-currency non-refund payments; AP outstanding is full invoice value until PurchaseInvoice.paidAt because supplier partial payments are not modelled.',
+    ...approximateDateNotice(salesOrders as Array<{ invoicedAt?: Date | null; paidAt?: Date | null }>),
   ], options.paginate !== false)
+}
+
+/** A notice when some invoiced orders are dated by their order date because no invoice or paid date is stored. */
+function approximateDateNotice(orders: Array<{ invoicedAt?: Date | null; paidAt?: Date | null }>): string[] {
+  const count = orders.filter(invoicedPeriodDateIsApproximate).length
+  return count === 0 ? [] : [`${count} invoiced order${count === 1 ? ' is' : 's are'} dated by the order date because no invoice date or paid date is stored for ${count === 1 ? 'it' : 'them'}; the period they fall in is approximate.`]
 }
 
 async function loadFxRegime(client: FinanceAnalyticsClient): Promise<FxSourceRegime> {

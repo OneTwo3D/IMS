@@ -184,7 +184,7 @@ export async function getCustomers(activeOnly = true): Promise<CustomerRow[]> {
       _count: { select: { salesOrders: true } },
       salesOrders: {
         select: {
-          status: true, invoiceNumber: true, accountingInvoiceId: true, totalBase: true, createdAt: true,
+          status: true, invoiceNumber: true, accountingInvoiceId: true, shoppingLinks: { select: { connector: true } }, totalBase: true, createdAt: true,
           refunds: REFUND_TURNOVER_SELECT,
         },
       },
@@ -235,6 +235,7 @@ export async function getCustomerDetail(id: string): Promise<CustomerDetail | nu
           refundStatus: true,
           invoiceNumber: true,
           accountingInvoiceId: true,
+          shoppingLinks: { select: { connector: true } },
           refunds: REFUND_TURNOVER_SELECT,
           currency: true,
           totalForeign: true,

@@ -638,7 +638,7 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
     if (tabKey === 'invoices') {
       if (key === 'productName') return row.productId ? <ProductLink productId={row.productId} sku="" name={row.productName} /> : <span className="truncate max-w-40 block text-xs">{row.productName}</span>
       if (key === 'orderNumber') return <Link href={`/sales/${row.orderId}`} className="hover:underline font-mono text-xs">{row.orderNumber}</Link>
-      if (key === 'invoicedAt') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
+      if (key === 'invoicedAt') return <span className="text-xs text-muted-foreground" title={row.invoicedAtApproximate ? 'Approximate: no invoice or paid date is stored, so this is the order date' : undefined}>{row.invoicedAtApproximate ? '≈ ' : ''}{fmtDate(v)}</span>
       if (key === 'status') return row.paidAt ? <StatusBadge status="Paid" /> : <StatusBadge status="Unpaid" />
       if (key === 'totalBase' || key === 'balance') return <span className="tabular-nums text-xs font-mono">{fmtBase(v)}</span>
       if (key === 'qty') return <span className="tabular-nums text-xs">{v}</span>

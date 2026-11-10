@@ -5,7 +5,7 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
-import { INVOICED_ORDER_WHERE, invoicedInPeriodWhere, invoicedPeriodDate } from '@/lib/domain/sales/invoiced-revenue-basis'
+import { INVOICED_ORDER_WHERE, invoicedInPeriodWhere, invoicedPeriodDate, invoicedPeriodDateIsApproximate } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
 import { marginFigureBound, netLinearFigureBound, netOfRefunds, refundLineBucket, refundPctOfSale, refundTotalsBasis, unplacedCreditBoundFromParts, type DerivedFigureBound, type RefundSetBasis, type RefundTotalsBasis } from '@/lib/domain/sales/refund-basis-analytics'
@@ -438,6 +438,8 @@ export type InvoiceRow = {
   customerName: string
   salesRep: string | null
   invoicedAt: string
+  /** True when `invoicedAt` is the order date because the order has neither an invoice date nor a paid date. */
+  invoicedAtApproximate: boolean
   status: string
   qty: number
   totalBase: number
@@ -473,7 +475,7 @@ export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promi
         // Xero id, or a dash when neither exists, rather than a blank or a crash.
         invoiceNumber: o.invoiceNumber ?? o.accountingInvoiceId ?? '—', productId: l.productId, sku: l.sku ?? '',
         productName: l.description, customerName: o.customerName ?? '—', salesRep: o.salesRep,
-        invoicedAt: invoicedPeriodDate(o).toISOString(), status: o.status,
+        invoicedAt: invoicedPeriodDate(o).toISOString(), invoicedAtApproximate: invoicedPeriodDateIsApproximate(o), status: o.status,
         qty: Number(l.qty), totalBase: Number(l.totalBase),
         paidAt: o.paidAt?.toISOString() ?? null, balance,
       })

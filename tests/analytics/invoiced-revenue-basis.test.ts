@@ -19,7 +19,8 @@ import { getCustomerAnalyticsReport, getSalesAnalyticsReport, type SalesFulfillm
  *             B  IMS-posted Xero invoice, no invoice number ........ 70
  *             C  shipped, invoiced, paid ........................... 100
  *             D  refunded (part), invoiced, paid ................... 200
- *   excluded  X  DRAFT, carries an invoice number ................... 11
+ *   excluded  M  IMS-minted number on a manual order, never posted .. 19
+ *             X  DRAFT, carries an invoice number ................... 11
  *             Y  PENDING_PAYMENT, never invoiced .................... 13
  *             Z  CANCELLED, carries an invoice ...................... 17
  *
@@ -58,7 +59,7 @@ function row(id: string, total: number, over: Row): Row {
     currency: 'GBP', expectedDelivery: null,
     totalBase: D(total), totalForeign: D(total), taxBase: D(0), taxForeign: D(0), subtotalBase: D(total),
     shippingBase: D(0), shippingForeign: D(0), discountAmount: D(0), fxRateToBase: D(1),
-    pricesIncludeVat: false, taxRatePercent: 0, shoppingLinks: [], shipFromWarehouse: { code: 'W1' },
+    pricesIncludeVat: false, taxRatePercent: 0, shoppingLinks: over.invoiceNumber ? [{ connector: 'woocommerce' }] : [], shipFromWarehouse: { code: 'W1' },
     payments: paid ? [{ amount: D(total), paidAt: TODAY_NOON, refundId: null, currency: 'GBP' }] : [],
     refunds: [],
     lines: [{
@@ -82,6 +83,8 @@ const ORDERS: Row[] = [
   }),
   row('X', 11, { status: SalesOrderStatus.DRAFT, invoiceNumber: 'INV-5' }),
   row('Y', 13, { status: SalesOrderStatus.PENDING_PAYMENT }),
+  // IMS-minted number on a manual order (no WooCommerce link), never posted: not proof of an invoice.
+  row('M', 19, { status: SalesOrderStatus.SHIPPED, invoiceNumber: 'INV-IMS-1', shoppingLinks: [] }),
   row('Z', 17, { status: SalesOrderStatus.CANCELLED, invoiceNumber: 'INV-6', accountingInvoiceId: 'xero-z' }),
 ]
 const COUNTED = ['A', 'B', 'C', 'D']
