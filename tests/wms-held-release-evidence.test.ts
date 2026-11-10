@@ -120,14 +120,11 @@ test('o3d-2k5r r6 release: an unsafe-create hold whose cancellation was NEVER co
   assert.equal(parked!.data.externalOrderId, undefined)
 })
 
-test('o3d-2k5r r6 hold: an unsafe-create NOT_FOUND is parked at the HOLD, and stamps no cancellation', async () => {
-  // The same rule, asked where the ambiguity is CREATED. Route: holdableLinks -> cancelOrder
-  // answers NOT_FOUND -> decideWmsHeldRelease refuses -> DEAD_LETTER with the guidance.
+test('o3d-2k5r r6 hold: a NOT_FOUND is never recorded as held: an operator notice, no HELD, no cancellation stamp', async () => {
+  // A 404 is not a confirmed cancellation on ANY connector (the order may be merged away or removed), so it neither parks HELD (which the
+  // release pass would re-create) nor stamps `cancelledAt` (the persisted evidence the release reads).
   //
-  // Mutation: restore `{ state: 'HELD', cancelledAt: ts }` for the NOT_FOUND branch and this fails
-  // twice over — on the state, and on `cancelledAt`, which is the persisted evidence the release
-  // reads. Stamping "cancelled at 09:04" for an order nobody confirmed was cancelled is the whole
-  // defect, written into a column.
+  // Mutation: treat NOT_FOUND as a successful hold again and this fails on the state, the stamp and the notice.
   const h = harness({
     holdable: [{ id: 'link-1', orderId: 'so-1', externalOrderId: 'wms-7' }],
     cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }),
@@ -135,12 +132,13 @@ test('o3d-2k5r r6 hold: an unsafe-create NOT_FOUND is parked at the HOLD, and st
   const result = await runWmsOrderPushSweepCore(h.connector, ACME_WMS_ID, h.port, { now: NOW, registry: SEAM_REGISTRY })
 
   assert.equal(result.held, 0)
+  assert.equal(result.operatorNotices, 1)
   const write = h.updates.find((u) => u.id === 'link-1')!
-  assert.equal(write.data.state, 'DEAD_LETTER')
-  assert.equal(write.data.cancelledAt, null)
+  assert.equal(write.data.state, undefined)
+  assert.equal(write.data.cancelledAt, undefined)
+  assert.ok(write.data.holdNoticeAt)
   const audit = h.events.find((e) => e.action === 'order_hold')!
   assert.equal(audit.outcome, 'FAILED')
-  assert.equal((audit.after as Record<string, unknown>).remoteCancellationConfirmed, false)
 })
 
 test('o3d-2k5r r6 hold: a CONFIRMED cancellation on an unsafe-create connector still parks HELD and stamps the evidence', async () => {

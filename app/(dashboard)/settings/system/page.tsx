@@ -169,6 +169,16 @@ export default async function SystemSettingsPage({
                   ))}
                 </ul>
               </div>
+              {CURRENT_RELEASE.operatorActions && CURRENT_RELEASE.operatorActions.length > 0 && (
+                <div className="rounded-lg border border-amber-300 bg-amber-50 p-4 dark:border-amber-900 dark:bg-amber-950/40" data-testid="release-operator-actions">
+                  <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">Before or after updating: operator actions</p>
+                  <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-amber-900 dark:text-amber-200">
+                    {CURRENT_RELEASE.operatorActions.map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
               <div>
                 <p className="text-sm font-medium">Versioning policy</p>
                 <p className="mt-2 text-sm text-muted-foreground">

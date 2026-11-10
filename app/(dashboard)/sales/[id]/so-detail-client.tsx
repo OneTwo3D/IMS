@@ -36,6 +36,7 @@ import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 import { resolveSalesOrderDeleteBlock } from '@/lib/domain/sales/order-delete-affordance'
 import { repackControlsFor } from '@/lib/domain/sales/repack-recovery-affordance'
+import { buildRefundRequest, creditNoteAmounts, salesOrderMoneyView, type MoneyViewOrder } from '@/lib/domain/sales/sales-order-money-view'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
@@ -158,6 +159,25 @@ const ACCOUNTING_SYNC_TYPE_LABEL: Record<RejectedAccountingDocumentUpdateWarning
   PURCHASE_INVOICE_UPDATE: 'purchase invoice update',
 }
 
+/** The order as the money view reads it: the amounts as stored, on the basis they are stored in (SoRow.amountsIncludeVat). */
+function moneyViewOrderOf(so: SoDetail): MoneyViewOrder & { fxRateToBase: number; currencyMinorUnits: number; priorRefundLines: SoDetail['refunds'][number]['lines']; discount: { amount: number; amountsIncludeVat: boolean }; lines: (SoDetail['lines'][number])[] } {
+  return {
+    pricesIncludeVat: so.amountsIncludeVat,
+    taxRatePercent: so.taxRatePercent,
+    subtotalForeign: so.subtotalForeign,
+    discountAmount: so.discountAmount,
+    shippingForeign: so.shippingForeign,
+    taxForeign: so.taxForeign,
+    totalForeign: so.totalForeign,
+    storeCreditForeign: so.storeCreditForeign,
+    fxRateToBase: so.fxRateToBase,
+    currencyMinorUnits: so.currencyMinorUnits,
+    priorRefundLines: so.refunds.flatMap((r) => r.lines),
+    discount: { amount: so.discountAmount, amountsIncludeVat: so.amountsIncludeVat },
+    lines: so.lines,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Refund dialog
 // ---------------------------------------------------------------------------
@@ -166,10 +186,13 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
   const [isPending, startTransition] = useTransition()
   const [reason, setReason] = useState('')
   const [returnWhId, setReturnWhId] = useState(warehouses[0]?.id ?? '')
-  const [refundLines, setRefundLines] = useState(order.lines.map((l) => ({ ...l, qtyRefund: 0, refundAmount: 0 })))
+  const [refundLines, setRefundLines] = useState(order.lines.map((l) => ({ ...l, qtyRefund: 0 })))
   const [error, setError] = useState('')
   const [warning, setWarning] = useState('')
-  const totalRefund = refundLines.reduce((s, l) => s + l.refundAmount, 0)
+  // What is shown is what is sent and what the credit note posts: the line's stored NET pro rata, plus the VAT the ledger adds at the line's own rate.
+  const moneyOrder = moneyViewOrderOf(order)
+  const request = buildRefundRequest(moneyOrder, refundLines.map((l) => ({ lineId: l.id, qty: l.qtyRefund })))
+  const totalRefund = request.total
   function handleConfirm() {
     setError('')
     setWarning('')
@@ -177,18 +200,14 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
     if (!toRefund.length) { setError('Select at least one line'); return }
     if (!reason.trim()) { setError('Reason is required'); return }
     startTransition(async () => {
-      const result = await createRefund(order.id, toRefund.map((l) => ({
-        lineId: l.id,
-        productId: l.productId,
-        description: l.description,
-        qty: l.qtyRefund,
-        totalForeign: l.refundAmount,
-        totalBase: l.refundAmount / (order.fxRateToBase || 1),
-      })), reason, returnWhId || undefined)
+      const result = await createRefund(order.id, request.lines, reason, returnWhId || undefined)
       if (result.success) {
         router.refresh()
-        if (result.warning) {
-          setWarning(result.warning)
+        // The server cuts the refund again under the order lock; if what it recorded differs from this preview, show the server's figure.
+        const drift = result.recordedNetForeign != null && Math.abs(result.recordedNetForeign - request.total.net) > 0.005
+        const driftNote = drift ? `The refund was recorded at ${formatMoney(result.recordedNetForeign!, sym)} net, not the ${formatMoney(request.total.net, sym)} previewed (an earlier refund landed first). The credit note shows the recorded figures.` : ''
+        if (result.warning || drift) {
+          setWarning([driftNote, result.warning].filter(Boolean).join(' '))
         } else {
           onClose()
         }
@@ -211,16 +230,26 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
           <TableHead className="text-xs">Product</TableHead>
           <TableHead className="text-xs text-right w-16">Ordered</TableHead>
           <TableHead className="text-xs text-right w-24">Refund Qty</TableHead>
-          <TableHead className="text-xs text-right w-28">Amount ({sym})</TableHead>
+          <TableHead className="text-xs text-right w-24">Net ({sym})</TableHead>
+          <TableHead className="text-xs text-right w-24">VAT ({sym})</TableHead>
+          <TableHead className="text-xs text-right w-28">Credit note incl. VAT ({sym})</TableHead>
         </TableRow></TableHeader><TableBody>
           {refundLines.map((l) => (<TableRow key={l.id}>
             <TableCell>{l.productId ? <ProductLink productId={l.productId} sku={l.sku} name={l.description} /> : l.description}</TableCell>
             <TableCell className="text-right tabular-nums">{l.qty}</TableCell>
-            <TableCell><Input type="number" min={0} max={l.qty} step={1} value={l.qtyRefund} onChange={(e) => { const q = Number(e.target.value) || 0; setRefundLines((p) => p.map((rl) => rl.id === l.id ? { ...rl, qtyRefund: q, refundAmount: q * l.unitPriceForeign } : rl)) }} className="h-7 text-sm text-right w-24 ml-auto font-mono" /></TableCell>
-            <TableCell className="text-right font-mono text-xs">{formatMoney(l.refundAmount, sym)}</TableCell>
+            <TableCell><Input type="number" min={0} max={l.qty} step={1} value={l.qtyRefund} onChange={(e) => { const q = Number(e.target.value) || 0; setRefundLines((p) => p.map((rl) => rl.id === l.id ? { ...rl, qtyRefund: q } : rl)) }} className="h-7 text-sm text-right w-24 ml-auto font-mono" /></TableCell>
+            <TableCell className="text-right font-mono text-xs">{formatMoney(request.perLine[l.id]?.net ?? 0, sym)}</TableCell>
+            <TableCell className="text-right font-mono text-xs">{formatMoney(request.perLine[l.id]?.vat ?? 0, sym)}</TableCell>
+            <TableCell className="text-right font-mono text-xs">{formatMoney(request.perLine[l.id]?.gross ?? 0, sym)}</TableCell>
           </TableRow>))}
         </TableBody></Table>
-        <div className="flex justify-end text-sm font-medium">Total: {formatMoney(totalRefund, sym)}</div>
+        <div className="flex flex-col items-end gap-0.5 text-sm">
+          {request.discountReversal.net !== 0 && (
+            <span className="text-xs text-muted-foreground">Order discount reversed: {formatMoney(request.discountReversal.gross, sym)} incl. VAT (net {formatMoney(request.discountReversal.net, sym)}), added by the server</span>
+          )}
+          <span className="text-xs text-muted-foreground">Net {formatMoney(totalRefund.net, sym)} + VAT {formatMoney(totalRefund.vat, sym)}</span>
+          <span className="font-medium">Credit note total (incl. VAT): {formatMoney(totalRefund.gross, sym)}</span>
+        </div>
         {warning && (
           <Alert>
             <AlertTriangle className="h-4 w-4" />
@@ -1011,20 +1040,15 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const money = (n: number) => formatMoney(n, sym, symPos)
   const baseMoney = (n: number) => formatMoney(n, baseCurrency.symbol, baseCurrency.symbolPosition)
 
-  // VAT display helpers. All *Foreign totals on SalesOrder are stored NET.
-  // When the order was entered with tax-inclusive prices we display gross
-  // values (net * (1 + rate)) throughout the table so the figures match
-  // what the user typed in. discountAmount is stored in the raw input
-  // convention (gross when inclVat), matching the WC importer.
+  // ONE basis for every figure on this page (lib/domain/sales/sales-order-money-view.ts): the basis the order's amounts are STORED in
+  // (a WooCommerce order is net whatever the storefront displays), each line carrying its own VAT, shipping grossed up exactly as the
+  // invoice is sent. Nothing here multiplies by the header rate.
   const vatRate = so.taxRatePercent ?? 0
-  const inclVat = so.pricesIncludeVat && vatRate > 0
-  const toGross = (net: number) => inclVat ? net * (1 + vatRate) : net
-  // Refund/credit-note amounts are always shown tax-inclusive (like the order's
-  // grand total), since refund line totals are stored net regardless of inclVat.
-  const grossWithVat = (net: number) => vatRate > 0 ? net * (1 + vatRate) : net
-  const subtotalDisplay = toGross(so.subtotalForeign)
-  const shippingDisplay = toGross(so.shippingForeign)
-  const discountDisplay = so.discountAmount // already gross in inclVat mode
+  const moneyOrder = moneyViewOrderOf(so)
+  const view = salesOrderMoneyView(moneyOrder)
+  // A recorded credit note's VAT and gross are not stored: they are priced from the tax code the line posts under at TODAY's rate.
+  const ESTIMATE_NOTE = 'VAT estimated at the current tax rate; the accounting system holds the posted figure'
+  const hasLineVat = view.lines.some((l) => l.vat !== 0) || vatRate > 0
 
   const hasShipments = shipments.length > 0
   // Filter out Delivered action if delivery tracking is not enabled
@@ -1569,10 +1593,10 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               <TableHead className="w-12 px-2" />
               <TableHead className="px-4 text-xs">Product</TableHead>
               <TableHead className="px-4 text-xs text-right w-16">Qty</TableHead>
-              <TableHead className="px-4 text-xs text-right w-28">Unit Price ({sym})</TableHead>
+              <TableHead className="px-4 text-xs text-right w-28">Unit Price {view.basisLabel} ({sym})</TableHead>
               <TableHead className="px-4 text-xs text-right w-24">Discount</TableHead>
-              {vatRate > 0 && <TableHead className="px-4 text-xs text-right w-20">VAT ({sym})</TableHead>}
-              <TableHead className="px-4 text-xs text-right w-28">Total ({sym})</TableHead>
+              {hasLineVat && <TableHead className="px-4 text-xs text-right w-20">{view.vatIsAdditional ? 'VAT' : 'incl. VAT'} ({sym})</TableHead>}
+              <TableHead className="px-4 text-xs text-right w-28">Total {view.basisLabel} ({sym})</TableHead>
               {visibleCols.has('cogs') && <TableHead className="px-4 text-xs text-right w-20">COGS ({baseCurrency.code})</TableHead>}
               {visibleCols.has('margin') && <TableHead className="px-4 text-xs text-right w-20">Margin ({baseCurrency.code})</TableHead>}
               {visibleCols.has('marginPct') && <TableHead className="px-4 text-xs text-right w-16">Margin %</TableHead>}
@@ -1591,9 +1615,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               const shipped = ['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(so.status) ? line.qty : 0
               const cancelled = so.status === 'CANCELLED' ? line.qty : 0
               const returned = so.refunds?.reduce((s, r) => s + r.lines.filter((rl) => rl.productId === line.productId).reduce((s2, rl) => s2 + rl.qty, 0), 0) ?? 0
-              // In inclVat mode the stored totalForeign is NET — display gross
-              // (user-entered) values so Unit Price, VAT and Total all line up.
-              const lineTotalDisplay = toGross(line.totalForeign)
+              const lineView = view.lines[so.lines.indexOf(line)]
+              const lineTotalDisplay = lineView.total
               return (
                 <TableRow key={line.id}>
                   <TableCell className="w-12 px-2 py-1">
@@ -1603,11 +1626,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                   <TableCell className="px-4 text-right tabular-nums">{line.qty}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums font-mono text-xs">{formatMoney(line.unitPriceForeign, sym)}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums font-mono text-xs text-destructive">{line.discountAmount > 0 ? (line.discountStr ?? formatMoney(-line.discountAmount, sym)) : '—'}</TableCell>
-                  {vatRate > 0 && (
+                  {hasLineVat && (
                     <TableCell className="px-4 text-right tabular-nums font-mono text-xs text-muted-foreground">
                       {formatMoney(line.taxForeign, sym)}
                       {line.taxRatePercent != null && Math.abs(line.taxRatePercent - vatRate) > 0.0001 && (
-                        <span className="ml-1 inline-flex items-center rounded-sm border border-amber-300 bg-amber-50 px-1 py-0 text-[10px] font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
+                        <span title={`This line is taxed at ${(line.taxRatePercent * 100).toFixed(line.taxRatePercent * 100 % 1 === 0 ? 0 : 1)}%; the order's default rate is ${(vatRate * 100).toFixed(0)}%`} className="ml-1 inline-flex items-center rounded-sm border border-amber-300 bg-amber-50 px-1 py-0 text-[10px] font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
                           {(line.taxRatePercent * 100).toFixed(line.taxRatePercent * 100 % 1 === 0 ? 0 : 1)}%
                         </span>
                       )}
@@ -1642,7 +1665,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               // Align totals under the Total column. Base cols before Total =
               // img + Product + Qty + Unit Price + Discount (+ VAT) = 5 or 6.
               // Add optional columns after Total into the right-hand span.
-              const labelSpan = 5 + (vatRate > 0 ? 1 : 0)
+              const labelSpan = 5 + (hasLineVat ? 1 : 0)
               const rightSpan = 1
                 + (visibleCols.has('cogs') ? 1 : 0)
                 + (visibleCols.has('margin') ? 1 : 0)
@@ -1653,34 +1676,53 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                 + (visibleCols.has('qtyOnHand') ? 1 : 0)
               return <>
                 <tr>
-                  <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-muted-foreground">Subtotal</td>
-                  <td colSpan={rightSpan} className="px-4 py-1.5 text-right tabular-nums font-mono">{money(subtotalDisplay)}</td>
+                  <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-muted-foreground">Subtotal ({view.basisLabel})</td>
+                  <td colSpan={rightSpan} className="px-4 py-1.5 text-right tabular-nums font-mono">{money(view.subtotal)}</td>
                 </tr>
-                {so.discountAmount > 0 && (
+                {view.orderDiscount > 0 && (
                   <tr>
-                    <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-destructive">Order Discount</td>
-                    <td colSpan={rightSpan} className="px-4 py-1.5 text-right tabular-nums font-mono text-destructive">{money(-discountDisplay)}</td>
+                    <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-destructive">Order Discount ({view.basisLabel})</td>
+                    <td colSpan={rightSpan} className="px-4 py-1.5 text-right tabular-nums font-mono text-destructive">{money(-view.orderDiscount)}</td>
                   </tr>
                 )}
-                {so.shippingForeign > 0 && (
+                {view.shipping > 0 && (
                   <tr>
-                    <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-muted-foreground">Shipping{so.shippingService ? ` (${so.shippingService})` : ''}</td>
-                    <td colSpan={rightSpan} className="px-4 py-1.5 text-right tabular-nums font-mono">{money(shippingDisplay)}</td>
+                    <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-muted-foreground">Shipping{so.shippingService ? ` (${so.shippingService})` : ''} ({view.basisLabel})</td>
+                    <td colSpan={rightSpan} className="px-4 py-1.5 text-right tabular-nums font-mono">{money(view.shipping)}</td>
                   </tr>
                 )}
-                {so.taxForeign > 0 && (
+                {view.vatIsAdditional && view.vat !== 0 && (
                   <tr>
-                    <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-muted-foreground">{so.taxRateName ?? 'Tax'}{so.taxRatePercent != null ? ` (${(so.taxRatePercent * 100).toFixed(0)}%)` : ''}</td>
-                    <td colSpan={rightSpan} className="px-4 py-1.5 text-right tabular-nums font-mono">{money(so.taxForeign)}</td>
+                    <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-muted-foreground">{so.taxRateName ?? 'VAT'}{so.taxRatePercent != null ? ` (${(so.taxRatePercent * 100).toFixed(0)}%)` : ''}</td>
+                    <td colSpan={rightSpan} className="px-4 py-1.5 text-right tabular-nums font-mono">{money(view.vat)}</td>
+                  </tr>
+                )}
+                {view.storeCredit > 0 && (
+                  <tr>
+                    <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-muted-foreground">Store credit</td>
+                    <td colSpan={rightSpan} className="px-4 py-1.5 text-right tabular-nums font-mono">{money(-view.storeCredit)}</td>
                   </tr>
                 )}
                 <tr className="border-t">
-                  <td colSpan={labelSpan} className="px-4 py-2 text-right font-medium text-muted-foreground">Total</td>
+                  <td colSpan={labelSpan} className="px-4 py-2 text-right font-medium text-muted-foreground">Total (incl. VAT)</td>
                   <td colSpan={rightSpan} className="px-4 py-2 text-right tabular-nums font-mono">
                     <span className="font-semibold">{money(so.totalForeign)}</span>
                     {so.currency !== baseCurrency.code && <span className="text-muted-foreground font-normal text-xs ml-1">({baseMoney(so.totalBase)})</span>}
                   </td>
                 </tr>
+                {!view.vatIsAdditional && view.vat !== 0 && (
+                  <tr>
+                    <td colSpan={labelSpan} className="px-4 py-1 text-right text-xs text-muted-foreground">of which {so.taxRateName ?? 'VAT'}</td>
+                    <td colSpan={rightSpan} className="px-4 py-1 text-right tabular-nums font-mono text-xs text-muted-foreground">{money(view.vat)}</td>
+                  </tr>
+                )}
+                {!view.reconciles && (
+                  <tr>
+                    <td colSpan={labelSpan + rightSpan} className="px-4 py-2 text-right text-xs text-destructive">
+                      The figures above add up to {money(view.computedTotal)}, not the stored total {money(so.totalForeign)}: do not rely on this order until it is checked.
+                    </td>
+                  </tr>
+                )}
               </>
             })()}
           </tfoot>
@@ -1923,7 +1965,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                   {r.creditNoteNumber && <span className="font-mono text-xs font-medium">{r.creditNoteNumber}</span>}
                   <span className="text-muted-foreground text-xs">{formatDateTime(r.refundedAt, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
                 </div>
-                <span className="font-mono font-medium text-destructive">-{money(grossWithVat(r.totalForeign))}</span>
+                <span className="font-mono font-medium text-destructive" title={ESTIMATE_NOTE}>≈ -{money(creditNoteAmounts(moneyOrder, r).total.gross)}</span>
               </div>
               {r.reason && <p className="text-xs"><span className="text-muted-foreground">Reason:</span> {r.reason}</p>}
               <Table className="text-xs">
@@ -1931,18 +1973,18 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                   <TableRow>
                     <TableHead className="py-1 pr-4 text-xs">Item</TableHead>
                     <TableHead className="py-1 pr-4 text-xs text-right">Qty</TableHead>
-                    <TableHead className="py-1 pr-4 text-xs text-right">Unit Price</TableHead>
-                    {vatRate > 0 && <TableHead className="py-1 pr-4 text-xs text-right">VAT</TableHead>}
-                    <TableHead className="py-1 text-xs text-right">Total</TableHead>
+                    <TableHead className="py-1 pr-4 text-xs text-right">Unit Price excl. VAT</TableHead>
+                    <TableHead className="py-1 pr-4 text-xs text-right">VAT (est.)</TableHead>
+                    <TableHead className="py-1 text-xs text-right">Total incl. VAT (est.)</TableHead>
                   </TableRow>
                 </TableHeader>
-                <TableBody>{r.lines.map((rl) => (
+                <TableBody>{r.lines.map((rl, rlIdx) => (
                   <TableRow key={rl.id}>
                     <TableCell className="py-1 pr-4">{rl.description}</TableCell>
                     <TableCell className="py-1 pr-4 text-right tabular-nums">{rl.qty > 0 ? rl.qty : '—'}</TableCell>
                     <TableCell className="py-1 pr-4 text-right font-mono tabular-nums">{rl.qty > 0 ? money(rl.unitPriceForeign) : '—'}</TableCell>
-                    {vatRate > 0 && <TableCell className="py-1 pr-4 text-right font-mono tabular-nums text-muted-foreground">{money(rl.totalForeign * vatRate)}</TableCell>}
-                    <TableCell className="py-1 text-right font-mono tabular-nums">{money(toGross(rl.totalForeign))}</TableCell>
+                    <TableCell className="py-1 pr-4 text-right font-mono tabular-nums text-muted-foreground" title={ESTIMATE_NOTE}>≈ {money(creditNoteAmounts(moneyOrder, r).perLine[rlIdx].vat)}</TableCell>
+                    <TableCell className="py-1 text-right font-mono tabular-nums" title={ESTIMATE_NOTE}>≈ {money(creditNoteAmounts(moneyOrder, r).perLine[rlIdx].gross)}</TableCell>
                   </TableRow>
                 ))}</TableBody>
               </Table>
@@ -2039,14 +2081,14 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                 <TableRow>
                   <TableHead className="text-xs">Description</TableHead>
                   <TableHead className="text-xs text-right w-16">Qty</TableHead>
-                  <TableHead className="text-xs text-right w-24">Unit Price</TableHead>
+                  <TableHead className="text-xs text-right w-24">Unit Price {view.basisLabel}</TableHead>
                   <TableHead className="text-xs text-right w-20">Discount</TableHead>
-                  <TableHead className="text-xs text-right w-20">Tax</TableHead>
-                  <TableHead className="text-xs text-right w-24">Total ({sym})</TableHead>
+                  <TableHead className="text-xs text-right w-20">{view.vatIsAdditional ? 'VAT' : 'incl. VAT'}</TableHead>
+                  <TableHead className="text-xs text-right w-24">Total {view.basisLabel} ({sym})</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {so.lines.map((line) => (
+                {so.lines.map((line, lineIdx) => (
                   <TableRow key={line.id}>
                     <TableCell>
                       {line.productId ? (
@@ -2059,16 +2101,18 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                     <TableCell className="text-right font-mono text-xs">{line.unitPriceForeign.toFixed(2)}</TableCell>
                     <TableCell className="text-right font-mono text-xs text-destructive">{line.discountAmount > 0 ? `-${line.discountAmount.toFixed(2)}` : '—'}</TableCell>
                     <TableCell className="text-right font-mono text-xs">{line.taxForeign > 0 ? line.taxForeign.toFixed(2) : '—'}</TableCell>
-                    <TableCell className="text-right font-mono text-xs">{money(line.totalForeign)}</TableCell>
+                    <TableCell className="text-right font-mono text-xs">{money(view.lines[lineIdx].total)}</TableCell>
                   </TableRow>
                 ))}
               </TableBody>
               <tfoot className="border-t bg-muted/30 text-sm">
-                <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">Subtotal</td><td className="px-3 py-1.5 text-right font-mono">{money(so.subtotalForeign)}</td></tr>
-                {so.discountAmount > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-destructive">Discount</td><td className="px-3 py-1.5 text-right font-mono text-destructive">-{money(so.discountAmount)}</td></tr>}
-                {so.shippingForeign > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">Shipping</td><td className="px-3 py-1.5 text-right font-mono">{money(so.shippingForeign)}</td></tr>}
-                {so.taxForeign > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">{so.taxRateName ?? 'Tax'}{so.taxRatePercent != null ? ` (${(so.taxRatePercent * 100).toFixed(0)}%)` : ''}</td><td className="px-3 py-1.5 text-right font-mono">{money(so.taxForeign)}</td></tr>}
-                <tr className="border-t"><td colSpan={5} className="px-3 py-2 text-right font-medium">Total</td><td className="px-3 py-2 text-right font-mono font-semibold">{money(so.totalForeign)}{so.currency !== baseCurrency.code && <span className="text-muted-foreground font-normal text-xs ml-1">({baseMoney(so.totalBase)})</span>}</td></tr>
+                <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">Subtotal ({view.basisLabel})</td><td className="px-3 py-1.5 text-right font-mono">{money(view.subtotal)}</td></tr>
+                {view.orderDiscount > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-destructive">Discount ({view.basisLabel})</td><td className="px-3 py-1.5 text-right font-mono text-destructive">-{money(view.orderDiscount)}</td></tr>}
+                {view.shipping > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">Shipping ({view.basisLabel})</td><td className="px-3 py-1.5 text-right font-mono">{money(view.shipping)}</td></tr>}
+                {view.vatIsAdditional && view.vat !== 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">{so.taxRateName ?? 'VAT'}{so.taxRatePercent != null ? ` (${(so.taxRatePercent * 100).toFixed(0)}%)` : ''}</td><td className="px-3 py-1.5 text-right font-mono">{money(view.vat)}</td></tr>}
+                {view.storeCredit > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">Store credit</td><td className="px-3 py-1.5 text-right font-mono">-{money(view.storeCredit)}</td></tr>}
+                <tr className="border-t"><td colSpan={5} className="px-3 py-2 text-right font-medium">Total (incl. VAT)</td><td className="px-3 py-2 text-right font-mono font-semibold">{money(so.totalForeign)}{so.currency !== baseCurrency.code && <span className="text-muted-foreground font-normal text-xs ml-1">({baseMoney(so.totalBase)})</span>}</td></tr>
+                {!view.vatIsAdditional && view.vat !== 0 && <tr><td colSpan={5} className="px-3 py-1 text-right text-xs text-muted-foreground">of which {so.taxRateName ?? 'VAT'}</td><td className="px-3 py-1 text-right font-mono text-xs text-muted-foreground">{money(view.vat)}</td></tr>}
               </tfoot>
             </Table>
 
@@ -2083,7 +2127,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                         {r.creditNoteNumber && <span className="font-mono text-xs font-medium">{r.creditNoteNumber}</span>}
                         <span className="text-muted-foreground text-xs">{formatDateTime(r.refundedAt, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
                       </div>
-                      <span className="font-mono font-medium text-destructive">-{money(r.totalForeign)}</span>
+                      <span className="font-mono font-medium text-destructive" title={ESTIMATE_NOTE}>≈ -{money(creditNoteAmounts(moneyOrder, r).total.gross)}</span>
                     </div>
                     {r.reason && <p className="text-xs text-muted-foreground">{r.reason}</p>}
                     {r.lines.map((rl) => (

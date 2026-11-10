@@ -1,5 +1,7 @@
 import { isOutboundMaybeSentRefusalText, isOutboundWriteHeldText, outboundTextAfterEarlierSend } from '@/lib/security/outbound-write-hold-constants'
 import type {
+  WmsAmbiguousCreateResolution,
+  WmsMergedSurvivorLookup,
   WmsOrderCancelResult,
   WmsOrderPushInput,
   WmsOrderPushLine,
@@ -10,7 +12,7 @@ import { WmsOrderUpdatePartialError, legacyCourierFormInput } from '@/lib/connec
 import { roundTransmittedMoney } from '@/lib/connectors/wms/transmitted-money'
 import { extractMintsoftArrayPayload, extractMintsoftArrayPayloadStrict, extractMintsoftObjectPayload } from './normalizers'
 import { mintsoftRequest } from './client'
-import { assertMintsoftOrderClient, requireMintsoftClientId } from './orders'
+import { assertMintsoftOrderClient, mergedParts as mintsoftMergedParts, requireMintsoftClientId } from './orders'
 import { getMintsoftSettings, parseMintsoftPositiveId } from '../settings/schema'
 
 /**
@@ -28,6 +30,46 @@ import { getMintsoftSettings, parseMintsoftPositiveId } from '../settings/schema
  */
 
 type RawOrder = Record<string, unknown>
+
+/**
+ * Mintsoft OrderStatusIds this module acts on (confirmed against the live API: a new order with stock is 1, a backordered one 9, and a
+ * cancelled one 3, which keeps its OrderNumber for ever).
+ */
+const MINTSOFT_STATUS_NEW = 1
+const MINTSOFT_STATUS_CANCELLED = 3
+const MINTSOFT_STATUS_ON_BACKORDER = 9
+/** Order/Search returns at most this many rows; a response this size may have been cut short. */
+const MINTSOFT_SEARCH_PAGE = 10
+
+/**
+ * THE ONE STATUS PREDICATE for "may IMS treat this Mintsoft order as the live one?", shared by the read-back before binding, the by-id
+ * verification and the by-reference verification so they cannot drift apart: a PRESENT status that is not CANCELLED is live; CANCELLED is
+ * dead; an absent status proves nothing.
+ */
+function orderLiveness(row: RawOrder): 'live' | 'cancelled' | 'unknown' {
+  const status = orderStatusId(row)
+  if (status === null) return 'unknown'
+  return status === MINTSOFT_STATUS_CANCELLED ? 'cancelled' : 'live'
+}
+
+/**
+ * THE ONE IDENTITY PREDICATE, shared by the read-back before binding and both verification routes: an order is OURS only if it carries
+ * BOTH this order's OrderNumber AND its own ExternalOrderReference, exactly. `incomplete` (a field is absent, nothing contradicts) proves
+ * nothing either way and stays unverified; `mismatch` (a present field differs) is somebody else's order.
+ */
+function orderIdentity(row: RawOrder, identity: { orderNumber: string | null; externalReference: string | null }): 'match' | 'mismatch' | 'incomplete' {
+  if (!identity.orderNumber || !identity.externalReference) return 'incomplete'
+  const number = toStr(row.OrderNumber)
+  const ref = toStr(row.ExternalOrderReference)
+  if ((number !== null && number !== identity.orderNumber) || (ref !== null && ref !== identity.externalReference)) return 'mismatch'
+  return number === null || ref === null ? 'incomplete' : 'match'
+}
+
+function orderStatusId(row: RawOrder): number | null {
+  const value = row.OrderStatusId
+  const n = typeof value === 'number' ? value : Number.parseInt(toStr(value) ?? '', 10)
+  return Number.isFinite(n) ? n : null
+}
 
 function toStr(value: unknown): string | null {
   if (typeof value === 'string') return value.trim() || null
@@ -150,28 +192,165 @@ async function getPushClientId(operation: string): Promise<number> {
   return requireMintsoftClientId(parseMintsoftPositiveId(settings.mintsoft_client_id), operation)
 }
 
-async function findExistingByReference(input: WmsOrderPushInput, clientId: number): Promise<RawOrder | null> {
-  // Mintsoft's search is OrderNumber-based; match field-for-field (never
-  // number-vs-reference) and only resolve when exactly one order matches.
-  //
-  // o3d-bjc.6: scope the query by ClientId AND assert every returned row echoes
-  // it. Without this, a cross-client order-number collision on the shared tenant
-  // would bind our push link to a FOREIGN order — after which our own update and
-  // cancel calls would mutate someone else's order. A row that cannot be verified
-  // (no ClientId) or that is foreign rejects the whole response rather than being
-  // quietly filtered out, so a silently-ignored filter can't look like "no match".
-  const query = new URLSearchParams({ OrderNumber: input.orderNumber, ClientId: String(clientId) })
+/**
+ * The ONE Order/Search request (OrderNumber + ClientId). Mintsoft documents no ClientId parameter and the search is a TERM search over
+ * order number, tracking number and external reference returning at most MINTSOFT_SEARCH_PAGE rows, so callers filter by ClientId and
+ * exact fields themselves and treat a full page as possibly truncated.
+ */
+async function fetchSearchRows(orderNumber: string, clientId: number): Promise<RawOrder[]> {
+  const query = new URLSearchParams({ OrderNumber: orderNumber, ClientId: String(clientId) })
   const result = await mintsoftRequest<unknown>(`/api/Order/Search?${query.toString()}`)
   if (result.error) throw new Error(result.error)
-  const matches = extractMintsoftArrayPayloadStrict(result.data, 'Order/Search (push dedupe)')
+  return extractMintsoftArrayPayloadStrict(result.data, 'Order/Search (push dedupe)') as RawOrder[]
+}
+
+/**
+ * The existing order a duplicate-number refusal points at. Resolves ONLY when the search page is complete (a full page may have cut the
+ * real order off) and exactly one same-client, non-merged row carries BOTH this order's OrderNumber AND its own ExternalOrderReference,
+ * exactly. A reused reference under another number, or a reused number under another reference, is somebody else's order.
+ */
+async function findExistingByReference(input: WmsOrderPushInput, clientId: number): Promise<RawOrder | null> {
+  const raw = await fetchSearchRows(input.orderNumber, clientId)
+  if (raw.length >= MINTSOFT_SEARCH_PAGE) return null
+  const matches = raw
     .map((row) => assertMintsoftOrderClient(row, clientId, 'Mintsoft Order/Search (push dedupe)'))
     .filter((row) => {
       const number = toStr(row.OrderNumber)
       if (number && number.includes('+')) return false // skip merged survivors
-      const ref = toStr(row.ExternalOrderReference)
-      return number === input.orderNumber || ref === input.externalReference
+      return number === input.orderNumber && input.externalReference !== '' && toStr(row.ExternalOrderReference) === input.externalReference
     })
   return matches.length === 1 ? matches[0] : null
+}
+
+type LiveOrderRead = { ok: true } | { ok: false; kind: 'cancelled' | 'unconfirmed'; reason: string }
+
+/**
+ * THE ONE READ-BACK BEFORE IMS BINDS TO AN ORDER IT FOUND BY SEARCH (shared by the ambiguous-create reconcile and the duplicate-create
+ * path). The search row's own status is not trusted (it can be absent): the order is read by id and bound only if that scoped read
+ * succeeds, is ours, and carries a PRESENT status that is not CANCELLED.
+ */
+async function readBackLiveOrder(id: string, clientId: number, identity: { orderNumber: string; externalReference: string }): Promise<LiveOrderRead> {
+  const detail = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(id)}?ClientId=${clientId}`)
+  const row = !detail.error && detail.data && typeof detail.data === 'object' && !Array.isArray(detail.data) ? (detail.data as RawOrder) : null
+  if (!row) return { ok: false, kind: 'unconfirmed', reason: 'Mintsoft holds this order but it could not be read back to check its status, so it was not linked' }
+  if (toStr(row.ClientId ?? row.clientId) !== String(clientId) || toStr(row.ID ?? row.Id ?? row.id) !== id) {
+    return { ok: false, kind: 'unconfirmed', reason: 'Mintsoft holds this order but the read-back did not confirm it is ours, so it was not linked' }
+  }
+  // IDENTITY: the order read back must carry BOTH this order's number and its own reference, exactly. A missing field is a mismatch.
+  if (orderIdentity(row, identity) !== 'match') {
+    return { ok: false, kind: 'unconfirmed', reason: 'Mintsoft holds an order under this number but the read-back does not carry this order\'s own number and reference, so it was not linked' }
+  }
+  const liveness = orderLiveness(row)
+  if (liveness === 'unknown') return { ok: false, kind: 'unconfirmed', reason: 'Mintsoft holds this order but its status could not be read, so it was not linked' }
+  if (liveness === 'cancelled') {
+    return { ok: false, kind: 'cancelled', reason: 'Mintsoft holds this order but it is CANCELLED there (a cancelled order keeps its number), so it was not linked' }
+  }
+  return { ok: true }
+}
+
+/**
+ * Resolve a create whose outcome IS NOT RECORDED (a timed-out PUT, a 5xx, a lost link write) by READING Mintsoft: the same scoped
+ * Order/Search the push dedupe uses. Nothing is written. An order is adopted only when exactly one row matches and that row carries
+ * THIS order's own stable external reference; a number-only match can be another order of ours that shares a number, so it (and
+ * several matches, and a row that has no usable id) is UNRESOLVED and left for a person. Zero matches is NONE.
+ */
+export async function reconcileMintsoftAmbiguousCreate(
+  reference: { orderNumber: string; externalReference: string },
+): Promise<WmsAmbiguousCreateResolution> {
+  const clientId = await getPushClientId('Mintsoft ambiguous-create reconcile')
+  const raw = await fetchSearchRows(reference.orderNumber, clientId)
+  // A term search can return other clients' orders (it matches tracking numbers and references too) and stops at one page: a full page
+  // may have cut the order we want off, so nothing is adopted from it.
+  if (raw.length >= MINTSOFT_SEARCH_PAGE) {
+    return { kind: 'UNRESOLVED', reason: `Mintsoft returned a full page of ${raw.length} search results, which may be incomplete, so none can be proved to be this order` }
+  }
+  const ours: RawOrder[] = []
+  for (const row of raw) {
+    const rowClient = toStr(row.ClientId ?? row.clientId)
+    // No ClientId on a row means ownership cannot be shown: nothing is adopted.
+    if (rowClient === null) return { kind: 'UNRESOLVED', reason: 'a Mintsoft search result carries no ClientId, so ownership cannot be shown' }
+    if (rowClient === String(clientId)) ours.push(row)
+  }
+  // A same-client MERGED order that lists OUR exact number as one of its parts means Mintsoft merged this order with another: the create
+  // landed and was absorbed. It is never adopted and never "absent": the survivor is named, and the guidance does not suggest cancelling
+  // it, because that would take the other order's goods with it.
+  const mergedInto = ours.find((row) => {
+    const number = toStr(row.OrderNumber)
+    return number !== null && number.includes('+') && mintsoftMergedParts(number).includes(reference.orderNumber)
+  })
+  if (mergedInto) {
+    const survivorNumber = toStr(mergedInto.OrderNumber)
+    const survivorId = toStr(mergedInto.ID ?? mergedInto.Id ?? mergedInto.id)
+    return {
+      kind: 'UNRESOLVED',
+      reason: `Mintsoft merged this order with another into order ${survivorNumber}${survivorId ? ` (id ${survivorId})` : ''}, which also holds the other order's goods, so IMS did not link it. Do not cancel that order on this order's behalf`,
+    }
+  }
+  const matches = ours.filter((row) => {
+    const number = toStr(row.OrderNumber)
+    if (number && number.includes('+')) return false // a merged survivor holds other orders too
+    return number === reference.orderNumber || toStr(row.ExternalOrderReference) === reference.externalReference
+  })
+  if (matches.length === 0) return { kind: 'NONE' }
+  const ownReference = reference.externalReference.trim()
+  const exact = ownReference ? matches.filter((row) => toStr(row.ExternalOrderReference) === ownReference && toStr(row.OrderNumber) === reference.orderNumber) : []
+  if (matches.length === 1 && exact.length === 1) {
+    const id = toStr(exact[0].ID ?? exact[0].Id ?? exact[0].id)
+    if (id) {
+      // THE SEARCH ROW'S STATUS IS NOT TRUSTED: the order is read back by id and adopted only if that shows a live order.
+      const live = await readBackLiveOrder(id, clientId, reference)
+      if (!live.ok) return { kind: 'UNRESOLVED', reason: live.reason }
+      return { kind: 'ADOPT', externalOrderId: id, externalOrderNumber: toStr(exact[0].OrderNumber) ?? reference.orderNumber }
+    }
+  }
+  const seen = matches.map((row) => toStr(row.OrderNumber) ?? '?').join(', ')
+  return {
+    kind: 'UNRESOLVED',
+    reason: matches.length > 1
+      ? `Mintsoft holds ${matches.length} orders that match (${seen}), so none can be proved to be this order`
+      : `Mintsoft holds order ${seen} under this number, but it does not carry this order's own reference, so it cannot be proved to be this order`,
+  }
+}
+
+/**
+ * READ-ONLY (live-confirmed): when order B is merged into C the survivor keeps C's id, its OrderNumber becomes "<absorbing>+<absorbed>"
+ * (so this order's number can be ANY part), its ExternalOrderReference stays the absorbing order's, and it gains the order name/value
+ * MergedOrder=True; B itself then 404s like a deletion. Order/Search by either original number returns the survivor. Adopted as the
+ * survivor only when: our ClientId, a full-page-free search, the number is one exact "+" part, the MergedOrder flag is set, and exactly
+ * one order qualifies.
+ */
+// WHY A SAME-CLIENT SURVIVOR WITH OUR EXACT NUMBER AS A PART CAN ONLY HAVE ABSORBED OUR ORDER: observed live, Mintsoft refuses a second
+// order with an existing OrderNumber within a client ("Order Number already exists!"), and keeps refusing it after the first is
+// cancelled (a cancelled order keeps its number). So within our client the number belongs to exactly one order for good, and a merged
+// survivor listing it as one "+" part has absorbed that order. The checks that remain are therefore the ones that tie the survivor to
+// OUR client (ClientId), to a real merge (MergedOrder=True) and to our order (an EXACT part, never a prefix or substring).
+export async function findMintsoftMergedSurvivor(orderNumber: string): Promise<WmsMergedSurvivorLookup> {
+  const clientId = await getPushClientId('Mintsoft merged-survivor lookup')
+  const wanted = orderNumber.trim()
+  if (!wanted) return { kind: 'ABSENT' }
+  const raw = await fetchSearchRows(wanted, clientId)
+  if (raw.length >= MINTSOFT_SEARCH_PAGE) return { kind: 'INCONCLUSIVE', reason: 'the search returned a full page of results, which may be incomplete' }
+  const survivors: RawOrder[] = []
+  for (const row of raw) {
+    const parts = mintsoftMergedParts(toStr(row.OrderNumber))
+    if (!parts.includes(wanted)) continue // not a merge containing this number: ruled out
+    // A row whose number IS a merge containing ours but which cannot be tied to our client, or says nothing about being a merge, rules
+    // nothing out: it may be the survivor, so the answer is INCONCLUSIVE and never ABSENT.
+    const rowClient = toStr(row.ClientId ?? row.clientId)
+    if (rowClient === null) return { kind: 'INCONCLUSIVE', reason: 'a search result that contains this number in a merged number carries no ClientId' }
+    if (rowClient !== String(clientId)) continue // another client's: ruled out
+    if (!Array.isArray(row.OrderNameValues)) return { kind: 'INCONCLUSIVE', reason: 'a merged-number search result carries no order name/values, so it cannot be told whether it is flagged as a merge' }
+    const flagged = (row.OrderNameValues as unknown[]).some((entry) => {
+      const nv = entry as Record<string, unknown> | null
+      return nv !== null && typeof nv === 'object' && toStr(nv.Name) === 'MergedOrder' && toStr(nv.Value)?.toLowerCase() === 'true'
+    })
+    if (flagged) survivors.push(row)
+  }
+  if (survivors.length === 0) return { kind: 'ABSENT' }
+  if (survivors.length > 1) return { kind: 'INCONCLUSIVE', reason: `${survivors.length} merged orders contain this number` }
+  const id = toStr(survivors[0].ID ?? survivors[0].Id ?? survivors[0].id)
+  const number = toStr(survivors[0].OrderNumber)
+  return id && number ? { kind: 'FOUND', externalOrderId: id, externalOrderNumber: number } : { kind: 'INCONCLUSIVE', reason: 'the merged order carries no readable id or number' }
 }
 
 async function createOrder(payload: Record<string, unknown>): Promise<{ ok: boolean; data: RawOrder | null; message: string | null }> {
@@ -357,6 +536,14 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
     })
     const externalOrderId = existing ? toStr(existing.ID ?? existing.Id ?? existing.id) : null
     if (existing && externalOrderId) {
+      // A cancelled Mintsoft order keeps its OrderNumber, so "already exists" can be answered by one. Binding to it would make IMS treat
+      // a dead order as the live one (it would never despatch). Refused: the push fails for an operator instead.
+      const live = await readBackLiveOrder(externalOrderId, clientId, input)
+      if (!live.ok) {
+        throw new Error(live.kind === 'cancelled'
+          ? 'Mintsoft refused the create because the order number already exists, and the order holding it is CANCELLED in Mintsoft (a cancelled order keeps its number). IMS did not link to it.'
+          : 'Mintsoft refused the create because the order number already exists, but the order holding it could not be confirmed live (the read-back failed, was not ours, or showed no status). IMS did not link to it.')
+      }
       return {
         externalOrderId,
         externalOrderNumber: toStr(existing.OrderNumber) ?? input.orderNumber,
@@ -364,8 +551,8 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
         // Which form the pre-existing order carries is unknown: record none, flag the courier for review, and let the first
         // amendment pick it like a fresh create.
         courierFallback: true,
-        // Already proven: findExistingByReference asserts our ClientId on every
-        // row it considers, so this id came from a read, not from trust.
+        // Already proven: findExistingByReference asserts our ClientId on every row it considers and the read-back above confirmed a live
+        // order, so this id came from reads, not from trust.
         needsVerification: false,
       }
     }
@@ -397,15 +584,9 @@ export async function verifyMintsoftPushedOrder(
   // response said. A create that answered with some other order's id would
   // otherwise verify perfectly — same tenant, same id — and the link would go
   // SYNCED pointing at another customer's order while ours stayed orphaned.
-  const identifies = (row: RawOrder): boolean => {
-    const number = toStr(row.OrderNumber)
-    const ref = toStr(row.ExternalOrderReference)
-    if (wantNumber && number === wantNumber) return true
-    if (wantReference && ref === wantReference) return true
-    return false
-  }
-  if (!wantNumber && !wantReference) {
-    // Nothing to check identity against: refuse to claim either way.
+  const want = { orderNumber: wantNumber, externalReference: wantReference }
+  if (!wantNumber || !wantReference) {
+    // BOTH are needed to say an order is ours (a reused reference under another number is another order): refuse to claim either way.
     return 'unknown'
   }
 
@@ -421,7 +602,14 @@ export async function verifyMintsoftPushedOrder(
       if (rowId && rowId === externalOrderId) {
         // BOTH have to agree: the tenant AND the order. Tenant alone says only
         // "we may touch this row", not "this row is the order we created".
-        if (rowClient === String(clientId) && identifies(row)) return 'ours'
+        // Only a PRESENT, non-CANCELLED status proves a live order ours: a link must not become SYNCED against a dead one, nor on a row that
+        // says nothing about its status. Otherwise it stays unproven (retried, then quarantined for an operator).
+        if (rowClient === String(clientId)) {
+          const identity = orderIdentity(row, want)
+          if (identity === 'match') return orderLiveness(row) === 'live' ? 'ours' : 'unknown'
+          // A field the order does not echo proves nothing: unverified (retried, then quarantined for an operator), never accepted.
+          if (identity === 'incomplete') return 'unknown'
+        }
         if (rowClient && rowClient !== String(clientId)) return 'foreign'
         if (rowClient === String(clientId)) {
           // Ours to touch, but it is somebody else's ORDER. Not 'foreign' in the
@@ -437,14 +625,16 @@ export async function verifyMintsoftPushedOrder(
 
   // 2. By reference. If the create landed but the id we recorded is wrong, our
   //    own order number still finds it under our own tenant.
-  if (wantNumber) {
+  {
     try {
       const query = new URLSearchParams({ OrderNumber: wantNumber, ClientId: String(clientId) })
       const search = await mintsoftRequest<unknown>(`/api/Order/Search?${query.toString()}`)
       if (!search.error) {
         const rows = extractMintsoftArrayPayloadStrict(search.data, 'Order/Search (push verify)')
           .map((row) => assertMintsoftOrderClient(row, clientId, 'Mintsoft Order/Search (push verify)'))
-          .filter(identifies)
+          .filter((row) => orderIdentity(row, want) === 'match')
+          // Only a row whose status is KNOWN and not CANCELLED proves a live order (an absent status proves nothing).
+          .filter((row) => orderLiveness(row) === 'live')
         if (rows.some((row) => toStr(row.ID ?? row.Id ?? row.id) === externalOrderId)) return 'ours'
       }
     } catch {
@@ -467,7 +657,7 @@ export async function verifyMintsoftPushedOrder(
 async function fetchMintsoftOrderStatusId(
   externalOrderId: string,
   clientId: number,
-): Promise<{ found: boolean; isNew: boolean }> {
+): Promise<{ found: boolean; isNew: boolean; statusId: number | null }> {
   const current = await mintsoftRequest<unknown>(
     `/api/Order/${encodeURIComponent(externalOrderId)}?ClientId=${clientId}`,
   )
@@ -476,7 +666,7 @@ async function fetchMintsoftOrderStatusId(
   // client renders a 204 as `data: null`, and reporting that as NOT_FOUND would
   // tell the push sweep the remote cancellation succeeded — moving the local link
   // to CANCELLED/HELD while the warehouse carries on fulfilling the order.
-  if (current.status === 404) return { found: false, isNew: false }
+  if (current.status === 404) return { found: false, isNew: false, statusId: null }
   if (current.error) throw new Error(current.error)
   const raw = extractMintsoftObjectPayload(current.data)
   if (raw === null) {
@@ -486,8 +676,8 @@ async function fetchMintsoftOrderStatusId(
     )
   }
   const order = assertMintsoftOrderClient(raw, clientId, 'Mintsoft Order detail (push gate)')
-  const statusId = order.OrderStatusId
-  return { found: true, isNew: statusId === 1 || statusId === '1' }
+  const statusId = orderStatusId(order)
+  return { found: true, isNew: statusId === MINTSOFT_STATUS_NEW, statusId }
 }
 
 type MintsoftOrderItem = { ID: number; SKU: string | null; Quantity: number }
@@ -717,16 +907,24 @@ export async function addMintsoftOrderComment(externalOrderId: string, comment: 
 }
 
 export async function cancelMintsoftOrder(externalOrderId: string): Promise<WmsOrderCancelResult> {
-  // Only NEW orders are cancellable; check first so a dispatched order is a no-op.
+  // Only a NEW or a BACKORDERED order is cancellable (both confirmed live); anything further along is a no-op.
   // The gate also proves the order is OURS before we cancel it (o3d-bjc.6).
   const clientId = await getPushClientId('Mintsoft order cancel')
-  const { found, isNew } = await fetchMintsoftOrderStatusId(externalOrderId, clientId)
+  const { found, statusId } = await fetchMintsoftOrderStatusId(externalOrderId, clientId)
   if (!found) return { cancelled: false, status: 'NOT_FOUND' }
-  if (!isNew) return { cancelled: false, status: 'NOT_CANCELLABLE' }
+  // Already cancelled (by the warehouse, or by an earlier attempt whose answer was lost): Mintsoft answers /Cancel with Success: true
+  // either way, so Success alone cannot tell this apart from a cancellation IMS just made. It is reported as its own status and /Cancel
+  // is not called.
+  if (statusId === MINTSOFT_STATUS_CANCELLED) return { cancelled: false, status: 'ALREADY_CANCELLED' }
+  if (statusId !== MINTSOFT_STATUS_NEW && statusId !== MINTSOFT_STATUS_ON_BACKORDER) return { cancelled: false, status: 'NOT_CANCELLABLE' }
 
   const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/Cancel`)
   if (result.error) throw new Error(result.error)
   const data = extractMintsoftObjectPayload(result.data) as RawOrder | null
-  if (data?.Success === true) return { cancelled: true, status: 'CANCELLED' }
+  if (data?.Success === true) {
+    // A race: it was cancelled between the status read and this call. Not a cancellation IMS made.
+    if (/already cancelled/i.test(toStr(data.Message) ?? '')) return { cancelled: false, status: 'ALREADY_CANCELLED' }
+    return { cancelled: true, status: 'CANCELLED' }
+  }
   throw new Error(toStr(data?.Message) ?? 'Mintsoft order cancel failed')
 }

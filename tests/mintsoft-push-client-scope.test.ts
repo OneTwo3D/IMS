@@ -140,6 +140,7 @@ test('[o3d-bjc.6] the push dedupe search is scoped by ClientId', async () => {
   const { pushMintsoftOrder } = await push()
   createResult = [DUPLICATE]
   searchRows = [{ ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT }]
+  details.set('900', { ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 }) // the read-back before binding
 
   const result = await pushMintsoftOrder(INPUT)
   assert.equal(result.externalOrderId, '900')
@@ -198,7 +199,7 @@ test('[o3d-bjc.6] even a minted id cannot be MUTATED without proving ownership',
 
   // This is what makes binding without a read-back safe: had that id been another
   // client's, every mutation path refuses it before writing anything.
-  details.set('700', { ID: 700, OrderNumber: 'WC-1001', OrderStatusId: 1, ClientId: 99 })
+  details.set('700', { ID: 700, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', OrderStatusId: 1, ClientId: 99 })
   await assert.rejects(() => cancelMintsoftOrder('700'), /does not match configured 5/)
   await assert.rejects(() => updateMintsoftOrder('700', INPUT), /does not match configured 5/)
   await assert.rejects(() => addMintsoftOrderComment('700', 'IMS note'), /does not match configured 5/)
@@ -212,6 +213,7 @@ test('[o3d-bjc.6] a FAILED create that merely echoes an OrderId does not bind it
   // outright, before the scoped dedupe branch could ever run.
   createResult = [{ Success: false, OrderId: 999, Message: 'Order already exists' }]
   searchRows = [{ ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT }]
+  details.set('900', { ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 }) // the read-back before binding
 
   const result = await pushMintsoftOrder(INPUT)
   assert.equal(result.externalOrderId, '900', 'bound the ClientId-verified order, not the echoed id')
@@ -308,7 +310,7 @@ test('[o3d-bjc.6] a genuine 404 is still an authoritative NOT_FOUND for cancel/u
 test('[o3d-bjc.6] an owned NEW order amends its items and posts the update — the gate precedes every write', async () => {
   reset()
   const { updateMintsoftOrder } = await push()
-  details.set('900', { ID: 900, OrderNumber: 'WC-1001', OrderStatusId: 1, ClientId: CLIENT })
+  details.set('900', { ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', OrderStatusId: 1, ClientId: CLIENT })
   // One line to update and one stale line to delete, so the whole write set runs.
   itemRows = [
     { ID: 11, SKU: 'SKU-1', Quantity: 5 },
@@ -334,6 +336,7 @@ test('outbound-write hold: a create refused on a REDIRECT HOP (already sent) is 
   reset()
   createError = new OutboundWriteHeldError(refusal, 1).message
   searchRows = [{ ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT }]
+  details.set('900', { ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 }) // the read-back before binding
   console.log('precondition (redirect create): the first PUT answered with a hop-1 refusal; the order exists at the WMS under our ClientId')
   const found = await pushMintsoftOrder(INPUT)
   assert.equal(found.externalOrderId, '900', 'the order that may have been created is found by lookup and bound')

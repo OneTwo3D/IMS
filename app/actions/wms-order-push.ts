@@ -197,6 +197,67 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
       }
     }
     if (presence === 'FOUND') {
+      // The warehouse holds the order: if it is PROVABLY this one (it carries this order's own reference), the create landed and only its
+      // recording was lost. Bind it (as an unverified id: the push sweep's verify pass proves it before anything acts on it) instead of
+      // re-queueing a create. This is the control the parked row has always promised and never had.
+      if (connector.reconcileAmbiguousCreate && typeof connector.verifyPushedOrder === 'function') {
+        let reconciled: Awaited<ReturnType<NonNullable<typeof connector.reconcileAmbiguousCreate>>>
+        try {
+          reconciled = await connector.reconcileAmbiguousCreate({ orderNumber: reference, externalReference: link.order.id })
+        } catch (error) {
+          return {
+            success: false,
+            error: `The WMS could not be asked which order it holds for ${reference} (${error instanceof Error ? error.message : String(error)}), so nothing was linked. Try again once the WMS is reachable.`,
+          }
+        }
+        if (reconciled.kind === 'ADOPT') {
+          const linked = await db.wmsOrderPushLink.updateMany({
+            where: { id: link.id, state: link.state, attempts: link.attempts, externalOrderId: null, pushedAt: link.pushedAt },
+            data: {
+              state: 'PENDING_VERIFY',
+              externalOrderId: reconciled.externalOrderId,
+              externalOrderNumber: reconciled.externalOrderNumber,
+              attempts: 0,
+              pushedAt: new Date(),
+              lastError: null,
+              lastAttemptAt: new Date(),
+              cancelledAt: null,
+              dispatchFailureCount: 0,
+              dispatchLastError: null,
+              dispatchDeadLetteredAt: null,
+              dispatchUnresolvedCount: 0,
+              dispatchUnresolvedError: null,
+              dispatchUnresolvedAt: null,
+              holdNoticeAt: null,
+              cancelNoticeAt: null,
+              holdNoticeCommentAt: null,
+              cancelNoticeCommentAt: null,
+            },
+          })
+          if (linked.count === 0) {
+            return {
+              success: false,
+              error: 'This push changed while you were looking at it. Reload the order and check its current push state before replaying.',
+            }
+          }
+          await logActivity({
+            entityType: 'SALES_ORDER',
+            entityId: salesOrderId,
+            action: 'wms_push_linked',
+            tag: 'sync',
+            level: 'INFO',
+            description: `Linked the order to WMS order ${reconciled.externalOrderNumber}, which the WMS already held under this order's reference (pending verification)`,
+          })
+          revalidatePath(`/sales/${salesOrderId}`)
+          return { success: true }
+        }
+        if (reconciled.kind === 'UNRESOLVED') {
+          return {
+            success: false,
+            error: `The WMS holds something under reference ${reference} that cannot be proved to be this order: ${reconciled.reason}. Nothing was linked or re-queued — check it in the WMS and resolve it by hand.`,
+          }
+        }
+      }
       return {
         success: false,
         error: `The WMS already holds an order under reference ${reference}. A create was dispatched before and its `
