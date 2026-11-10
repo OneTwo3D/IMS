@@ -159,6 +159,12 @@ original PO FX rate and is wrapped in a single transaction that:
 - Queues a `PURCHASE_INVOICE_UPDATE` accounting sync (if the bill has already been synced) using a
   payload-derived idempotency key. Saving without any content change short-circuits with a
   "No bill changes to save" notice — no queue row is created.
+- If the bill's **first posting has not been sent yet** (it is queued, or failed before any request was
+  made), the edit is written into that queued posting in the same transaction, so the one posting that
+  goes out carries the corrected bill. No update is queued and nothing is posted twice. If the first
+  posting is being sent, was sent and has not been linked back to the bill yet, or failed after a request
+  left, the edit is **refused** ("Nothing was saved"): wait until the posting has finished on the sync
+  page, then edit the bill.
 
 If the bill was previously synced and the accounting connector rejects the update (e.g. the
 external bill is paid, locked, or voided), an amber **rejected sync** alert appears at the top of

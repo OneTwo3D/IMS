@@ -22,6 +22,10 @@ To create a new order manually:
 5. Add notes if needed
 6. Save the order
 
+**VAT and "Incl. VAT".** The order has one default VAT rate and one setting for whether the prices you type include VAT. If prices include VAT, choose the order's default VAT rate: the VAT is taken out of the prices you typed, the order totals are what you typed, and the invoice goes to the accounting system as VAT-inclusive at those same prices. Ticking **Incl. VAT** while the default rate is **No VAT** and a line carries VAT (from its product's tax category or a rate you chose on the line) is refused, because the prices could be read two ways: choose the default rate, or untick **Incl. VAT** and enter net prices. A draft saved earlier in that state cannot be moved out of Draft; cancel it and raise it again.
+
+**Cloning.** **Clone** makes a new **Draft** with the same lines, prices and VAT basis. A draft holds no stock and has no invoice; move it out of Draft (for example to Pending Payment or Processing) when it is ready and stock is allocated and the sales invoice is queued then, exactly as for any new order. Allocating a Draft directly is refused.
+
 ### WooCommerce Integration
 
 When WooCommerce sync is configured, orders are imported automatically into the system. These orders display a **WooCommerce link** that takes you directly to the order in your WC admin panel. This link only appears for orders that were synced from WooCommerce (i.e. those with a WC Order ID).

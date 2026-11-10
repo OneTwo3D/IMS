@@ -1,0 +1,104 @@
+import { ATTEMPT_PROVEN_NEVER_MADE_WHERE } from '@/lib/domain/accounting/money-attempt-provenance'
+import type { Prisma } from '@/app/generated/prisma/client'
+import type { PurchaseInvoiceAccountingPayload } from '@/lib/domain/purchasing/purchase-invoice-edit'
+
+/**
+ * EDITING A BILL BEFORE ITS FIRST POSTING HAS REACHED THE LEDGER.
+ *
+ * A bill edit queues a PURCHASE_INVOICE_UPDATE against the ledger document, and that needs the document's id. Until the
+ * bill's first posting (the PURCHASE_INVOICE row) has been written back there is none, so the edit was saved in IMS and
+ * nothing at all was queued: the create row still carried the PRE-edit figures and posted them, and the ledger and IMS
+ * disagreed for good (AP, VAT and the transit clearing leg all wrong, and a later payment settling a bill the ledger holds
+ * at a different total).
+ *
+ * The first posting is therefore made to carry the edit. While the create row has not left IMS (queued, or failed before
+ * any request was made) its payload is replaced with the edited bill's, in the same transaction as the edit, and the
+ * single posting that goes out is the latest version: one document, no update, nothing posted twice. The processor reads a
+ * row's payload AFTER it claims it (lib/domain/accounting/claimed-sync-payload.ts), and this write is a compare-and-swap on
+ * the row still being unsent, so a worker either has not claimed the row (and posts the new payload) or has (and the swap
+ * matches nothing).
+ *
+ * Where the create row HAS been, or may have been, sent (claimed, posted but not yet linked back, or failed after a request
+ * left) the bill cannot be rewritten in place and no update can be addressed to a document nobody has an id for. The edit is
+ * REFUSED, so IMS never holds a version the ledger will not receive; the operator is told to edit once the posting has settled.
+ */
+
+export const PURCHASE_BILL_FIRST_POSTING_IN_FLIGHT_MESSAGE =
+  'This bill is being posted to the accounting system for the first time, or has been posted and not yet linked back, '
+  + 'so an edit could not reach the ledger. Nothing was saved. Wait until its posting has finished (Sync), then edit the bill.'
+
+export class PurchaseBillFirstPostingInFlightError extends Error {
+  constructor() {
+    super(PURCHASE_BILL_FIRST_POSTING_IN_FLIGHT_MESSAGE)
+    this.name = 'PurchaseBillFirstPostingInFlightError'
+  }
+}
+
+export type PendingCreateRefreshOutcome =
+  /** The unsent create row now carries the edited bill; the first posting will be the edited version. */
+  | { kind: 'refreshed'; syncLogId: string }
+  /** No create row exists for this bill (sync off, a hold recorded it as a shadow, or it was never queued): nothing is owed to a ledger document. */
+  | { kind: 'no-create-row' }
+
+export type PendingCreateRefreshTx = Pick<Prisma.TransactionClient, 'accountingSyncLog'>
+
+/** The keys the enqueue stamped on the row (`_postingMode`, `_idempotencyKey`, the connection stamp): the row's identity, never the document. */
+function enqueueStamps(payload: unknown): Record<string, unknown> {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return {}
+  return Object.fromEntries(Object.entries(payload as Record<string, unknown>).filter(([key]) => key.startsWith('_')))
+}
+
+export async function refreshPendingPurchaseInvoiceCreate(params: {
+  tx: PendingCreateRefreshTx
+  invoiceId: string
+  /** The connector whose chart `accountingPayload` was built from; the row must belong to it. */
+  chartConnector: string | null
+  /** The edited bill, built exactly as the create builds it (no ledger document id). */
+  accountingPayload: PurchaseInvoiceAccountingPayload
+}): Promise<PendingCreateRefreshOutcome> {
+  const rows = await params.tx.accountingSyncLog.findMany({
+    where: {
+      type: 'PURCHASE_INVOICE',
+      referenceType: 'PurchaseInvoice',
+      referenceId: params.invoiceId,
+      status: { not: 'CANCELLED' },
+    },
+    select: {
+      id: true,
+      connector: true,
+      status: true,
+      externalTransactionId: true,
+      remoteAttemptedAt: true,
+      attemptStampingCustodyAt: true,
+      backReferenceEvidenceCompactedAt: true,
+      payload: true,
+    },
+  })
+  if (rows.length === 0) return { kind: 'no-create-row' }
+  // Two live create rows for one bill cannot be told apart; a posted one (SYNCED, or carrying a document id) means the document exists
+  // in the ledger while the bill is still unlinked.
+  if (rows.length > 1) throw new PurchaseBillFirstPostingInFlightError()
+  const row = rows[0]!
+  const unsent = (row.status === 'PENDING' || row.status === 'FAILED')
+    && row.externalTransactionId === null
+    && row.remoteAttemptedAt === null
+    && row.attemptStampingCustodyAt !== null
+    && row.backReferenceEvidenceCompactedAt === null
+    && params.chartConnector !== null
+    && row.connector === params.chartConnector
+  if (!unsent) throw new PurchaseBillFirstPostingInFlightError()
+
+  const payload = { ...params.accountingPayload, accountingInvoiceId: undefined, ...enqueueStamps(row.payload) }
+  const swapped = await params.tx.accountingSyncLog.updateMany({
+    where: {
+      id: row.id,
+      status: { in: ['PENDING', 'FAILED'] },
+      externalTransactionId: null,
+      ...ATTEMPT_PROVEN_NEVER_MADE_WHERE,
+    },
+    data: { payload: payload as never },
+  })
+  // A worker claimed it between the read and the swap: it holds the pre-edit payload's attempt, and may be on the wire.
+  if (swapped.count !== 1) throw new PurchaseBillFirstPostingInFlightError()
+  return { kind: 'refreshed', syncLogId: row.id }
+}

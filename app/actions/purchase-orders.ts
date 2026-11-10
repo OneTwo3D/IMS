@@ -81,6 +81,12 @@ import {
 } from '@/lib/domain/purchasing/purchase-invoice-edit'
 import { maybeQueuePurchaseInvoiceUpdate, purchaseInvoiceUpdateIsOwed, purchaseInvoiceUpdatePostingKey } from '@/lib/domain/purchasing/purchase-invoice-update-sync'
 import {
+  PurchaseBillFirstPostingInFlightError,
+  refreshPendingPurchaseInvoiceCreate,
+} from '@/lib/domain/purchasing/purchase-invoice-pending-create-refresh'
+import { retiredTaxCodesInPayload } from '@/lib/tax/retired-tax-code-guard'
+import { randomUUID } from 'node:crypto'
+import {
   computeLandedCostForPendingLines,
   CONTRIBUTING_LANDED_COST_LINK_WHERE,
   freightPoContributesLandedCost,
@@ -3777,6 +3783,8 @@ export async function updateInvoice(
     // from the bill's own columns (`accountingInvoiceId && idempotencyKey`), which consults the enqueue
     // not at all — so a refused update was recorded as a queued one.
     const billUpdateSync: { outcome: Awaited<ReturnType<typeof maybeQueuePurchaseInvoiceUpdate>> } = { outcome: 'skipped-no-external-id' }
+    // True when the edit was written into the bill's still-unsent first posting instead of being queued as an update.
+    let firstPostingRefreshed = false
     await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM purchase_invoices WHERE id = ${invoice.id} FOR UPDATE`
       await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${invoice.poId} FOR UPDATE`
@@ -3790,11 +3798,17 @@ export async function updateInvoice(
           paidAt: true,
           // 6oyu.4 (khdw): the pre-edit NET subtotal, to record the transit delta.
           subtotalBase: true,
+          // The id the edit's payload was built against, re-read under the lock: a first posting that was written back since the unlocked read
+          // makes a payload built without it the wrong kind (a refresh of a create that no longer exists, rather than an update).
+          accountingInvoiceId: true,
           lines: { select: { poLineId: true, qtyBilled: true } },
         },
       })
       if (!lockedInvoice) throw new Error('Bill not found')
       assertPurchaseInvoiceEditable(lockedInvoice)
+      if ((lockedInvoice.accountingInvoiceId ?? null) !== (invoice.accountingInvoiceId ?? null)) {
+        throw new Error('This bill was posted to the accounting system while it was being edited, so the edit was not saved. Reload the bill and edit it again.')
+      }
 
       const otherLines = await tx.purchaseInvoiceLine.findMany({
         where: { invoice: { poId: invoice.poId, id: { not: invoice.id } } },
@@ -3900,6 +3914,32 @@ export async function updateInvoice(
         })
       }
 
+      // A bill that has no ledger document yet has nothing to update: its first posting is still to go out (or has gone out and is not linked
+      // back), so the edit has to ride on that posting instead of being dropped. See purchase-invoice-pending-create-refresh.ts.
+      if (!invoice.accountingInvoiceId) {
+        const retired = await retiredTaxCodesInPayload(tx, { type: 'PURCHASE_INVOICE', payload: accountingPayload })
+        if (retired.length > 0) {
+          throw new Error(`The edited bill carries a tax code the accounting system no longer accepts (${retired.map((f) => f.code).join(', ')}), so the edit was not saved. Check the tax rates on the purchase order and the supplier.`)
+        }
+        const refresh = await refreshPendingPurchaseInvoiceCreate({
+          tx,
+          invoiceId: invoice.id,
+          chartConnector: accountingSettings.connector,
+          accountingPayload,
+        })
+        if (refresh.kind === 'refreshed') {
+          firstPostingRefreshed = true
+          // The queued create recorded the transit debit at the OLD net subtotal; the posting now carries the new one, so the subledger takes the
+          // signed difference. A fresh key per edit: the row commits or rolls back with this transaction, so there is no retry to deduplicate.
+          await recordTransitSubledgerMovement(tx, {
+            sourceType: 'PURCHASE_BILL_UPDATE',
+            sourceRef: invoice.poId,
+            idempotencyKey: `purchase-invoice-refresh:${invoice.id}:${randomUUID()}`,
+            baseDelta: Number(invoiceCalculation.subtotalBase) - Number(lockedInvoice.subtotalBase),
+            journalDate: String(accountingPayload.date),
+          })
+        }
+      }
       billUpdateSync.outcome = await maybeQueuePurchaseInvoiceUpdate({
         tx,
         syncEnabled: accountingSettings.syncEnabled,
@@ -3945,6 +3985,8 @@ export async function updateInvoice(
         // o3d-j625 r3: the enqueue's OWN answer.
         queuedAccountingUpdate: billUpdateSync.outcome === 'queued',
         accountingUpdateOutcome: billUpdateSync.outcome,
+        // The edit rode on the not-yet-sent first posting (no update was needed, none was queued).
+        firstPostingRefreshed,
       },
     })
     // o3d-j625 r3 (Codex HIGH 1 family) — A REFUSED UPDATE IS REPORTED, NOT SWALLOWED.
@@ -4024,7 +4066,7 @@ export async function updateInvoice(
       description: `Failed to update bill ${invoiceId}: ${String(e)}`,
       metadata: { invoiceId },
     })
-    if (e instanceof PurchaseInvoiceInputsChangedError) return { success: false, error: e.message }
+    if (e instanceof PurchaseInvoiceInputsChangedError || e instanceof PurchaseBillFirstPostingInFlightError) return { success: false, error: e.message }
     return { success: false, error: String(e) }
   }
 }

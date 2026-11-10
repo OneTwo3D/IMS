@@ -124,6 +124,11 @@ import {
   expectedSalesOrderLineTaxForeign,
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
+import {
+  INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
+  STORED_INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
+  inclusivePricesWithoutOrderRate,
+} from '@/lib/domain/sales/sales-order-vat-basis'
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import { decideChargebackOrderDiscount, resolvePostedOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
 import { invoiceNumberIsExternallySupplied, resolveSalesInvoiceNumberForPost } from '@/lib/domain/accounting/sales-invoice-number'
@@ -1076,6 +1081,11 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
       )
     })
 
+    // One basis for the whole document: inclusive prices with no default rate but VAT-bearing lines is refused, not guessed at.
+    if (inclusivePricesWithoutOrderRate({ pricesIncludeVat: inclVat, orderRate: vatRate, anyLineCarriesVat: lineResolved.some((r) => r.taxRateValue > 0) })) {
+      return { success: false, error: INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE }
+    }
+
     const taxValidation = validateSalesOrderLineTaxInputs(
       input.lines.map((line, idx) => ({
         sku: line.sku,
@@ -1389,6 +1399,7 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
           unitPriceForeign: true,
           discountAmount: true,
           totalForeign: true,
+          taxForeign: true,
           taxRateId: true,
           taxRate: {
             select: {
@@ -1433,6 +1444,12 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
   const orderDefaultTaxType = orderDefaultRate?.accountingTaxType ?? null
 
   const vatPct = Number(so.taxRatePercent ?? 0)
+  // The document is sent inclusive or exclusive as a whole, from the header rate, while each line's net was cut from its gross at the
+  // line's own rate. An order that stored gross prices with no header rate would go out as NET prices and have its VAT added a second
+  // time, so it is not sent (new orders cannot be written this way; this covers one stored before that refusal).
+  if (inclusivePricesWithoutOrderRate({ pricesIncludeVat: !!so.pricesIncludeVat, orderRate: vatPct, anyLineCarriesVat: so.lines.some((l) => Number(l.taxForeign ?? 0) > 0) })) {
+    throw new Error(STORED_INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE)
+  }
   const lineAmountsIncludeTax = !!so.pricesIncludeVat && vatPct > 0
 
   // Shipping is stored NET on the SalesOrder. Reconstruct gross when
@@ -1641,7 +1658,10 @@ export async function applySalesOrderStatusTransition(
         // b8i6.1: detect a shopping order via ANY connector (not just WooCommerce)
         // so an order linked to any registered storefront also gets its IMS status pushed back.
         shoppingLinks: { select: { id: true }, take: 1 },
-        lines: { select: { id: true, productId: true, sku: true, qty: true } },
+        // The VAT basis a draft's invoice will be built from (see lib/domain/sales/sales-order-vat-basis.ts).
+        pricesIncludeVat: true,
+        taxRatePercent: true,
+        lines: { select: { id: true, productId: true, sku: true, qty: true, taxForeign: true } },
       },
     })
     if (!so) return { success: false, error: 'Order not found' }
@@ -1693,6 +1713,15 @@ export async function applySalesOrderStatusTransition(
     }
 
     const isDraftFinalization = so.status === 'DRAFT' && targetStatus !== 'CANCELLED' && targetStatus !== 'DRAFT'
+    // A draft whose stored amounts could only reach the ledger with its VAT added twice is not finalised: the invoice is queued at
+    // finalisation, and a finalised order cannot be finalised again, so refusing here (before anything moves) is the only clean place.
+    if (isDraftFinalization && inclusivePricesWithoutOrderRate({
+      pricesIncludeVat: !!so.pricesIncludeVat,
+      orderRate: Number(so.taxRatePercent ?? 0),
+      anyLineCarriesVat: so.lines.some((l) => Number(l.taxForeign ?? 0) > 0),
+    })) {
+      return { success: false, error: STORED_INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE }
+    }
 
     // o3d-zvec.15 / o3d-6ldlj: whether this transition owns the storefront status push (false for a WooCommerce-driven
     // transition, which would only echo). Decided before the transactions so the SHIPPED / CANCELLED / ON_HOLD
@@ -3351,6 +3380,9 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
         discountAmount: so.discountAmount,
         taxRateName: so.taxRateName,
         taxRatePercent: so.taxRatePercent,
+        // The unit prices and discount below are copied as typed, so the clone must read them the way the source did (gross or net): left
+        // to the column default it read an inclusive order's gross prices as net, and the invoice it now queues added the VAT twice.
+        pricesIncludeVat: so.pricesIncludeVat,
         notes: so.notes,
         internalNotes: so.internalNotes,
         lines: {
@@ -3374,9 +3406,9 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     })
     })
 
-    // Auto-allocate stock for cloned order
-    const { autoAllocateOrder } = await import('./allocation')
-    await autoAllocateOrder(clone.id)
+    // The clone stays a DRAFT, as the UI says it is: it holds no stock and queues no invoice until the operator reviews it and
+    // finalises it through updateSalesOrderStatus (which allocates AND queues the sales invoice). It used to be auto-allocated here,
+    // which promoted it to ALLOCATED and skipped that finalisation, so a shipped, paid clone had no invoice to settle against.
 
     revalidatePath('/sales')
     await logActivity({
