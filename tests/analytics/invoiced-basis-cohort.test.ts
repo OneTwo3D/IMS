@@ -285,6 +285,14 @@ test('AR Aging nets credits: a fully credited unpaid invoice is not outstanding,
   assert.ok(unproven.notices.some((n) => /upper bound/.test(n)), 'the report flags the unplaceable credit')
 })
 
+test('AR as-of: a payment at exactly midnight after the as-of day is not counted', async () => {
+  const order = salesOrder('arb', {
+    invoiceNumber: 'INV-160', createdAt: new Date('2026-10-10T12:00:00.000Z'), totalBase: D(70), totalForeign: D(70),
+    payments: [{ amount: D(70), currency: 'GBP', paidAt: new Date('2026-11-01T00:00:00.000Z'), refundId: null }],
+  })
+  assert.equal(Number((await arReport([order], '2026-10-31')).totals.outstandingBase), 70, 'paid in November, so still owed on 31 Oct')
+})
+
 test('an IMS-minted invoice number with no posted invoice is not an invoiced order', () => {
   assert.equal(isInvoicedOrder({ status: 'SHIPPED', invoiceNumber: 'INV-1', shoppingLinks: [] }), false)
   assert.equal(isInvoicedOrder({ status: 'SHIPPED', invoiceNumber: 'INV-1', shoppingLinks: [{ connector: 'woocommerce' }] }), true)

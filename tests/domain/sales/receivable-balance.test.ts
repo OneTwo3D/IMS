@@ -32,6 +32,12 @@ const CASES: Case[] = [
   { name: 'a later credit is outside the cutoff', order: order({ refunds: [gross(100, '2026-07-02')] }), balance: 100, status: 'outstanding' },
   { name: 'a later cash refund is outside the cutoff', order: order({ payments: [pay(100), out(100, '2026-07-02')] }), balance: 0, status: 'settled' },
   { name: 'paidAt after the cutoff does not settle it', order: order({ paidAt: d('2026-07-02') }), balance: 100, status: 'outstanding' },
+  { name: 'a payment exactly at the cutoff instant counts', order: order({ payments: [{ amount: 100, currency: 'GBP', refundId: null, paidAt: CUT }] }), balance: 0, status: 'settled' },
+  { name: 'a zero foreign total falls back to a rate of 1', order: order({ totalBase: 80, totalForeign: 0, payments: [pay(30)] }), balance: 50, status: 'outstanding' },
+  { name: 'exactly one penny owed is settled', order: order({ payments: [pay(99.99)] }), balance: 0.01, status: 'settled' },
+  { name: 'two pence owed is outstanding', order: order({ payments: [pay(99.98)] }), balance: 0.02, status: 'outstanding' },
+  { name: 'exactly one penny over-received is settled', order: order({ payments: [pay(100.01)] }), balance: -0.01, status: 'settled' },
+  { name: 'two pence over-received is a credit balance', order: order({ payments: [pay(100.02)] }), balance: -0.02, status: 'credit' },
   { name: 'rounding noise under a penny is settled', order: order({ payments: [pay(99.996)] }), balance: 0, status: 'settled' },
 ]
 

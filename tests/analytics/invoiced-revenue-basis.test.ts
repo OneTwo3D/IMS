@@ -368,3 +368,18 @@ test('one order, one balance: AR Aging, Customer Aging and the Invoices tab agre
     assert.equal((await getInvoiceStats()).find((r) => r.orderNumber === 'T')!.balance, -10)
   } finally { ORDERS.length -= 2 }
 })
+
+test('Invoices tab carries the bound marker for an unplaceable credit, on screen and in the CSV', async () => {
+  ORDERS.push(row('U', 45, { invoiceNumber: 'INV-U', refunds: [{ totalsBasis: null, totalBase: D(5), lines: [], refundedAt: TODAY_START }] }))
+  try {
+    const { getInvoiceStats } = await import('@/app/actions/sales-stats')
+    const r = (await getInvoiceStats()).find((x) => x.orderNumber === 'U')!
+    assert.equal(r.balance, 45)
+    assert.equal(r.balanceBound, 'upper')
+    const { GET } = await import('@/app/api/export/analytics/route')
+    const csv = await (await GET(new NextRequest('http://localhost/api/export/analytics?type=invoices'))).text()
+    const lines = csv.trim().split(/\r?\n/); const cols = lines[0]!.split(',')
+    const u = lines.slice(1).find((l) => l.split(',')[cols.indexOf('orderNumber')] === 'U')!
+    assert.equal(u.split(',')[cols.indexOf('balanceBound')], 'upper')
+  } finally { ORDERS.pop() }
+})
