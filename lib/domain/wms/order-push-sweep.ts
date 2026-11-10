@@ -1037,8 +1037,18 @@ export interface WmsOrderPushPort {
    */
   clearStaleNotices?(connector: string): Promise<number>
   /** Notices whose warehouse note was never delivered (the comment failed, was shadowed, or the connector could not post). */
-  noticesAwaitingComment?(connector: string, limit: number): Promise<Array<{ id: string; orderId: string; externalOrderId: string; state: 'SYNCED' | 'MERGED'; intent: 'HOLD' | 'CANCEL' }>>
-  updateLinkIfLinked?(id: string, expect: { state: 'SYNCED' | 'MERGED'; externalOrderId: string }, data: LinkWrite): Promise<boolean>
+  noticesAwaitingComment?(connector: string, limit: number): Promise<Array<{ id: string; orderId: string; externalOrderId: string; state: 'SYNCED' | 'MERGED'; intent: 'HOLD' | 'CANCEL'; noticeAt: Date }>>
+  updateLinkIfLinked?(
+    id: string,
+    expect: {
+      state: 'SYNCED' | 'MERGED'
+      externalOrderId: string
+      /** Also require the link's hold / cancel notice to still carry exactly this timestamp (the notice that was read). */
+      holdNoticeAt?: Date
+      cancelNoticeAt?: Date
+    },
+    data: LinkWrite,
+  ): Promise<boolean>
   /**
    * o3d-2k5r r2 — apply `data` ONLY while the link is still in `fromState`; false when it has
    * moved on. The convention already exists in order-reconcile-sweep (its per-attempt CAS), and
@@ -1206,6 +1216,27 @@ export async function runWmsOrderPushSweepCore(
    * carries a NOTICE instead: the reason on `lastError`, the intent's notice timestamp set so the pass does not try again every
    * sweep, and one warehouse-visible note. Nothing about the IMS order, its stock or its money is touched.
    */
+  /**
+   * Stamp a posted note delivered ONLY while the link is still the one the note was posted for: the same state and warehouse order, and
+   * the same notice (its timestamp, which also fixes the intent). A worker that posted for an old order and finds the link re-pointed at
+   * a merged survivor, with a new notice of its own, stamps nothing, so the new notice's note is still posted.
+   */
+  const stampNoteDelivered = async (
+    note: { id: string; state: 'SYNCED' | 'MERGED'; externalOrderId: string; intent: 'HOLD' | 'CANCEL'; noticeAt: Date },
+    deliveredAt: Date,
+  ) => {
+    const data = note.intent === 'HOLD' ? { holdNoticeCommentAt: deliveredAt } : { cancelNoticeCommentAt: deliveredAt }
+    if (port.updateLinkIfLinked) {
+      await port.updateLinkIfLinked(
+        note.id,
+        { state: note.state, externalOrderId: note.externalOrderId, ...(note.intent === 'HOLD' ? { holdNoticeAt: note.noticeAt } : { cancelNoticeAt: note.noticeAt }) },
+        data,
+      ).catch(() => false)
+    } else {
+      await port.updateLink(note.id, data).catch(() => {})
+    }
+  }
+
   const raiseWmsRefusalNotice = async (
     link: WmsPushLinkRef,
     intent: 'HOLD' | 'CANCEL',
@@ -1242,7 +1273,7 @@ export async function runWmsOrderPushSweepCore(
       // The notice stays on the link either way. Only a note that was actually posted is stamped delivered; a failed, shadowed or
       // unsupported one is retried by the retry pass on a later sweep.
       if ((await postConflictComment(link.externalOrderId, spec.comment, link.orderId)) === 'posted') {
-        await port.updateLink(link.id, intent === 'HOLD' ? { holdNoticeCommentAt: ts } : { cancelNoticeCommentAt: ts }).catch(() => {})
+        await stampNoteDelivered({ id: link.id, state: link.state ?? 'SYNCED', externalOrderId: link.externalOrderId, intent, noticeAt: ts }, ts)
       }
     }
   }
@@ -2803,8 +2834,7 @@ export async function runWmsOrderPushSweepCore(
     for (const pending of warehouseHeld ? [] : (await port.noticesAwaitingComment?.(connectorId, batchSize).catch(() => [])) ?? []) {
       const note = wmsNoticeComment(pending.intent, pending.state === 'MERGED')
       if ((await postConflictComment(pending.externalOrderId, note, pending.orderId)) === 'posted') {
-        const ts = now()
-        await port.updateLink(pending.id, pending.intent === 'HOLD' ? { holdNoticeCommentAt: ts } : { cancelNoticeCommentAt: ts }).catch(() => {})
+        await stampNoteDelivered(pending, now())
         noticeCommentsRetried += 1
       }
     }
@@ -3543,16 +3573,20 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     async noticesAwaitingComment(connector, limit) {
       const base = { connector, state: { in: ['SYNCED', 'MERGED'] as Array<'SYNCED' | 'MERGED'> }, externalOrderId: { not: null } }
       const [holds, cancels] = await Promise.all([
-        db.wmsOrderPushLink.findMany({ where: { ...base, holdNoticeAt: { not: null }, holdNoticeCommentAt: null, order: { status: 'ON_HOLD' } }, select: { id: true, orderId: true, externalOrderId: true, state: true }, take: limit, orderBy: { holdNoticeAt: 'asc' } }),
-        db.wmsOrderPushLink.findMany({ where: { ...base, cancelNoticeAt: { not: null }, cancelNoticeCommentAt: null, order: WMS_CANCELLABLE_ORDER_WHERE }, select: { id: true, orderId: true, externalOrderId: true, state: true }, take: limit, orderBy: { cancelNoticeAt: 'asc' } }),
+        db.wmsOrderPushLink.findMany({ where: { ...base, holdNoticeAt: { not: null }, holdNoticeCommentAt: null, order: { status: 'ON_HOLD' } }, select: { id: true, orderId: true, externalOrderId: true, state: true, holdNoticeAt: true }, take: limit, orderBy: { holdNoticeAt: 'asc' } }),
+        db.wmsOrderPushLink.findMany({ where: { ...base, cancelNoticeAt: { not: null }, cancelNoticeCommentAt: null, order: WMS_CANCELLABLE_ORDER_WHERE }, select: { id: true, orderId: true, externalOrderId: true, state: true, cancelNoticeAt: true }, take: limit, orderBy: { cancelNoticeAt: 'asc' } }),
       ])
-      const shape = (intent: 'HOLD' | 'CANCEL') => (row: { id: string; orderId: string; externalOrderId: string | null; state: string }) =>
-        ({ id: row.id, orderId: row.orderId, externalOrderId: row.externalOrderId as string, state: row.state as 'SYNCED' | 'MERGED', intent })
+      const shape = (intent: 'HOLD' | 'CANCEL') => (row: { id: string; orderId: string; externalOrderId: string | null; state: string; holdNoticeAt?: Date | null; cancelNoticeAt?: Date | null }) =>
+        ({ id: row.id, orderId: row.orderId, externalOrderId: row.externalOrderId as string, state: row.state as 'SYNCED' | 'MERGED', intent, noticeAt: (intent === 'HOLD' ? row.holdNoticeAt : row.cancelNoticeAt) as Date })
       return [...holds.map(shape('HOLD')), ...cancels.map(shape('CANCEL'))].slice(0, limit)
     },
     async updateLinkIfLinked(id, expect, data) {
       const { count } = await db.wmsOrderPushLink.updateMany({
-        where: { id, state: expect.state as never, externalOrderId: expect.externalOrderId },
+        where: {
+          id, state: expect.state as never, externalOrderId: expect.externalOrderId,
+          ...(expect.holdNoticeAt ? { holdNoticeAt: expect.holdNoticeAt } : {}),
+          ...(expect.cancelNoticeAt ? { cancelNoticeAt: expect.cancelNoticeAt } : {}),
+        },
         data,
       })
       return count > 0

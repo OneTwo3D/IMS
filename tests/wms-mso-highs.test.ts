@@ -41,9 +41,9 @@ type Seed = {
   /** The Nth (1-based) upsertByOrder call throws, as a database fault between the remote create and the writeback would. */
   failUpsertCall?: number
   /** The link as it is NOW, for the conditional notice write: a link that moved on since it was read matches nothing. */
-  linkNow?: { state: string; externalOrderId: string }
+  linkNow?: { state: string; externalOrderId: string; holdNoticeAt?: Date; cancelNoticeAt?: Date }
   /** Notices whose warehouse note was never delivered, as the real port would list them. */
-  pendingNotices?: Array<{ id: string; orderId: string; externalOrderId: string; state: 'SYNCED' | 'MERGED'; intent: 'HOLD' | 'CANCEL' }>
+  pendingNotices?: Array<{ id: string; orderId: string; externalOrderId: string; state: 'SYNCED' | 'MERGED'; intent: 'HOLD' | 'CANCEL'; noticeAt: Date }>
 }
 
 function makePort(seed: Seed) {
@@ -75,8 +75,10 @@ function makePort(seed: Seed) {
     noticesAwaitingComment: async () => seed.pendingNotices ?? [],
     ...(seed.linkNow
       ? {
-        updateLinkIfLinked: async (id: string, expect: { state: string; externalOrderId: string }, data: Record<string, unknown>) => {
+        updateLinkIfLinked: async (id: string, expect: { state: string; externalOrderId: string; holdNoticeAt?: Date; cancelNoticeAt?: Date }, data: Record<string, unknown>) => {
           if (seed.linkNow!.state !== expect.state || seed.linkNow!.externalOrderId !== expect.externalOrderId) return false
+          if (expect.holdNoticeAt && seed.linkNow!.holdNoticeAt?.getTime() !== expect.holdNoticeAt.getTime()) return false
+          if (expect.cancelNoticeAt && seed.linkNow!.cancelNoticeAt?.getTime() !== expect.cancelNoticeAt.getTime()) return false
           updates.push({ id, data })
           // The write lands, so the link now IS what it was written as.
           if (typeof data.state === 'string') seed.linkNow!.state = data.state
@@ -343,13 +345,13 @@ test('R1: a despatched SPLIT order IMS has cancelled makes NO partial-shipment (
     fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
     pushPartialShipment: async (orderId) => { partials.push(orderId); return { ok: true } },
     applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
-    orderCancelledInIms: async () => true,
+    cancelIntendedForOrder: async () => true,
     recordDispatchError: async (_c, reason) => { errors.push(reason); return { deadLettered: false } },
   }))
   assert.deepEqual(partials, [], 'no WooCommerce write for a cancelled order')
   assert.deepEqual(applied, [])
   assert.equal(counters.errors, 1)
-  assert.match(errors[0], /after IMS cancelled it/)
+  assert.match(errors[0], /after IMS cancelled or fully refunded it/)
 })
 
 test('R1: a cancelled order that is not despatched stays pending (no error, no write)', async () => {
@@ -358,7 +360,7 @@ test('R1: a cancelled order that is not despatched stays pending (no error, no w
     fetchOrderStatus: async () => dstatus({ isSplit: true, partCount: 2, dispatched: false, status: 'PICKED' }),
     fetchOrderParts: async () => [dpart({ dispatched: false }), dpart({ externalId: 'b', partNumber: 2, dispatched: false })],
     pushPartialShipment: async (orderId) => { partials.push(orderId); return { ok: true } },
-    orderCancelledInIms: async () => true,
+    cancelIntendedForOrder: async () => true,
   }))
   assert.deepEqual(partials, [])
   assert.equal(counters.errors, 0)
@@ -372,7 +374,7 @@ test('R1 control: the same split order for a live (not cancelled) IMS order stil
     fetchOrderParts: async () => [dpart({ externalId: 'a', partNumber: 1 }), dpart({ externalId: 'b', partNumber: 2 })],
     fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
     pushPartialShipment: async (orderId) => { partials.push(orderId); return { ok: true } },
-    orderCancelledInIms: async () => false,
+    cancelIntendedForOrder: async () => false,
   }))
   assert.ok(partials.length >= 1)
 })
@@ -428,12 +430,12 @@ test('R1: a cancelled split order whose PRIMARY row reads not-despatched but who
     fetchOrderStatus: async () => dstatus({ isSplit: true, partCount: 2, dispatched: false, status: 'PART_DESPATCHED' }),
     fetchOrderParts: async () => [dpart({ externalId: 'a', partNumber: 1 }), dpart({ externalId: 'b', partNumber: 2, dispatched: false })],
     pushPartialShipment: async (orderId) => { partials.push(orderId); return { ok: true } },
-    orderCancelledInIms: async () => true,
+    cancelIntendedForOrder: async () => true,
     recordDispatchError: async (_c, reason) => { errors.push(reason); return { deadLettered: false } },
   }))
   assert.deepEqual(partials, [])
   assert.equal(counters.errors, 1)
-  assert.match(errors[0], /after IMS cancelled it/)
+  assert.match(errors[0], /after IMS cancelled or fully refunded it/)
 })
 
 // ---------------------------------------------------------------- round 2: stale notices, note delivery -----------------------
@@ -468,8 +470,8 @@ test('R2-2: a delivered note is stamped; a 404 notice (no note) is delivered by 
 test('R2-2: an undelivered note is RETRIED on a later sweep with the same text, and stamped once posted', async () => {
   const comments: Array<{ externalOrderId: string; comment: string }> = []
   const pending = [
-    { id: 'link-1', orderId: 'so-3', externalOrderId: 'wms-3', state: 'SYNCED' as const, intent: 'HOLD' as const },
-    { id: 'link-2', orderId: 'so-4', externalOrderId: 'surv-4', state: 'MERGED' as const, intent: 'CANCEL' as const },
+    { id: 'link-1', orderId: 'so-3', externalOrderId: 'wms-3', state: 'SYNCED' as const, intent: 'HOLD' as const, noticeAt: new Date('2026-06-25T00:00:00.000Z') },
+    { id: 'link-2', orderId: 'so-4', externalOrderId: 'surv-4', state: 'MERGED' as const, intent: 'CANCEL' as const, noticeAt: new Date('2026-06-25T00:00:00.000Z') },
   ]
   const { port, updates } = makePort({ pendingNotices: pending })
   const r = await quiet(() => runWmsOrderPushSweepCore(connector({ comments }).connector, 'mintsoft', port, { now: NOW }))
@@ -562,4 +564,67 @@ test('merge: a link that moved on before the re-point matches nothing - no notic
   const r = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
   assert.equal(r.operatorNotices, undefined)
   assert.deepEqual(updates, [])
+})
+
+// ---------------------------------------------------------------- round 3: delivery stamp is a compare-and-set ----------------------
+
+test('R3-2: a retried note posted for a link that was re-pointed since it was selected stamps NOTHING (the new notice\'s note is still owed)', async () => {
+  const NOTICE_AT = new Date('2026-06-25T00:00:00.000Z')
+  const { port, updates } = makePort({
+    pendingNotices: [{ id: 'link-1', orderId: 'so-3', externalOrderId: 'old-1', state: 'SYNCED', intent: 'HOLD', noticeAt: NOTICE_AT }],
+    // Re-pointed at a survivor, with a NEW notice, between the selection and the stamp.
+    linkNow: { state: 'MERGED', externalOrderId: 'surv-1', holdNoticeAt: new Date('2026-06-26T00:00:00.000Z') },
+  })
+  const r = await quiet(() => runWmsOrderPushSweepCore(connector({ comments: [] }).connector, 'mintsoft', port, { now: NOW }))
+  assert.deepEqual(updates, [])
+  assert.equal(r.noticeCommentsRetried, 1, 'the (old) note was posted; only its stamp is refused')
+})
+
+test('R3-2: the stamp also requires the SAME notice timestamp (a re-raised notice on the same order is a different notice)', async () => {
+  const { port, updates } = makePort({
+    pendingNotices: [{ id: 'link-1', orderId: 'so-3', externalOrderId: 'wms-3', state: 'SYNCED', intent: 'HOLD', noticeAt: new Date('2026-06-25T00:00:00.000Z') }],
+    linkNow: { state: 'SYNCED', externalOrderId: 'wms-3', holdNoticeAt: new Date('2026-06-26T12:00:00.000Z') },
+  })
+  await quiet(() => runWmsOrderPushSweepCore(connector({ comments: [] }).connector, 'mintsoft', port, { now: NOW }))
+  assert.deepEqual(updates, [])
+  const same = makePort({
+    pendingNotices: [{ id: 'link-1', orderId: 'so-3', externalOrderId: 'wms-3', state: 'SYNCED', intent: 'HOLD', noticeAt: new Date('2026-06-25T00:00:00.000Z') }],
+    linkNow: { state: 'SYNCED', externalOrderId: 'wms-3', holdNoticeAt: new Date('2026-06-25T00:00:00.000Z') },
+  })
+  await quiet(() => runWmsOrderPushSweepCore(connector({ comments: [] }).connector, 'mintsoft', same.port, { now: NOW }))
+  assert.ok(same.updates[0].data.holdNoticeCommentAt, 'control: the same notice on the same order is stamped')
+})
+
+test('R3-2: the INITIAL post is guarded the same way - a link re-pointed while the note was in flight is not stamped by this worker', async () => {
+  const seed = {
+    holdable: [{ id: 'link-1', orderId: 'so-3', externalOrderId: 'wms-3' }],
+    linkNow: { state: 'SYNCED', externalOrderId: 'wms-3' } as { state: string; externalOrderId: string; holdNoticeAt?: Date },
+  }
+  const { port, updates } = makePort(seed)
+  const wms = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }) })
+  const racing = {
+    ...wms.connector,
+    // While the note posts, the dispatch sweep re-points the link at a merged survivor.
+    addOrderComment: async () => { seed.linkNow.state = 'MERGED'; seed.linkNow.externalOrderId = 'surv-1' },
+  }
+  await quiet(() => runWmsOrderPushSweepCore(racing, 'mintsoft', port, { now: NOW }))
+  assert.equal(updates.length, 1, 'the notice itself; no delivery stamp')
+  assert.ok(updates[0].data.holdNoticeAt)
+})
+
+test('R3-1: the dispatch guard is the CANCEL intent, not the CANCELLED status - a fully refunded active order despatched after a refused cancel is an error with no storefront write', async () => {
+  const partials: string[] = []
+  const applied: string[] = []
+  const errors: string[] = []
+  await runWmsDispatchSweepCore(dispatchDeps({
+    fetchOrderStatus: async () => dstatus({ isSplit: true, partCount: 2 }),
+    fetchOrderParts: async () => [dpart({ externalId: 'a', partNumber: 1 }), dpart({ externalId: 'b', partNumber: 2 })],
+    fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+    pushPartialShipment: async (orderId) => { partials.push(orderId); return { ok: true } },
+    applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
+    cancelIntendedForOrder: async () => true,
+    recordDispatchError: async (_c, reason) => { errors.push(reason); return { deadLettered: false } },
+  }))
+  assert.deepEqual([partials, applied], [[], []])
+  assert.match(errors[0], /after IMS cancelled or fully refunded it/)
 })

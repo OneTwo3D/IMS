@@ -1,6 +1,7 @@
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { WMS_CANCELLABLE_ORDER_WHERE } from '@/lib/domain/wms/order-push-sweep'
 import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
@@ -129,8 +130,22 @@ export const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CAN
  * after an IMS cancel is SEEN and raised for a person; `applyDispatch` never applies it to the cancelled order.
  */
 /** What a person is told when the warehouse despatched an order IMS had cancelled. Fixed wording: no caught error text. */
+/**
+ * Does IMS intend this order NOT to ship? The cancel pass's own predicate, so the two cannot disagree: cancelled, or fully refunded and
+ * not yet despatched (WMS_CANCELLABLE_ORDER_WHERE), or its link carries a cancel notice (the warehouse refused the cancel). A despatch
+ * for such an order is never applied: no shipment, no stock movement, no storefront write.
+ */
+async function cancelIntendedForOrder(orderId: string): Promise<boolean> {
+  const hit = await db.wmsOrderPushLink.count({
+    where: { orderId, OR: [{ cancelNoticeAt: { not: null } }, { order: WMS_CANCELLABLE_ORDER_WHERE }] },
+  })
+  if (hit > 0) return true
+  // An order with no link at all is judged on the order alone.
+  return (await db.salesOrder.count({ where: { id: orderId, ...WMS_CANCELLABLE_ORDER_WHERE } })) > 0
+}
+
 export function cancelledOrderDespatchedReason(orderNumber: string | null | undefined): string {
-  return `The warehouse despatched order ${orderNumber ?? 'unknown'} after IMS cancelled it, so IMS has not recorded the shipment. `
+  return `The warehouse despatched order ${orderNumber ?? 'unknown'} after IMS cancelled or fully refunded it, so IMS has not recorded the shipment. `
     + 'The goods and the order need a decision from a person with the warehouse.'
 }
 
@@ -470,10 +485,10 @@ export type WmsDispatchSweepDeps = {
   // stalling as "no parts visible".
   partsSupported: boolean
   /**
-   * Is this IMS order CANCELLED? A despatch is never applied to a cancelled order, and nothing is written for one (no split-part
+   * Does IMS intend this order not to ship (cancelled, fully refunded, or a refused cancel on record)? A despatch is never applied to a cancelled order, and nothing is written for one (no split-part
    * storefront push, no shipment): reconcileOneOrder asks BEFORE the split and dispatched branches. Absent: not asked.
    */
-  orderCancelledInIms?(orderId: string): Promise<boolean>
+  cancelIntendedForOrder?(orderId: string): Promise<boolean>
   // Split-order reconciliation: fetch every part, its line items, and push each despatched
   // part to the storefront as a partial shipment.
   fetchOrderParts(orderNumber: string): Promise<import('@/lib/connectors/wms/types').WmsOrderPart[]>
@@ -1225,7 +1240,7 @@ export async function reconcileOneOrder(
   // purpose: a split order pushes each despatched part to the storefront (a WooCommerce write) before anything else can refuse it.
   // Only READS happen below this line for a cancelled order. A despatch (any part of a split) is an error for a person, which is the
   // ordinary dispatch failure path; an order not yet despatched stays pending.
-  if (deps.orderCancelledInIms && (!status.isSplit || deps.partsSupported) && await deps.orderCancelledInIms(candidate.orderId)) {
+  if (deps.cancelIntendedForOrder && (!status.isSplit || deps.partsSupported) && await deps.cancelIntendedForOrder(candidate.orderId)) {
     const despatched = status.isSplit
       ? status.dispatched || (await deps.fetchOrderParts(effectiveOrderNumber)).some((part) => part.dispatched)
       : status.dispatched
@@ -2756,10 +2771,10 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       // NEVER applied to an order IMS has cancelled. Its stock was released and its money settled on the footing that nothing would ship;
       // applying a despatch would re-allocate and ship it on its own. The warehouse despatched it anyway (the cancel arrived too late),
       // which is a stock-and-refund decision for a person: refuse, and the ordinary dispatch failure path puts it in the inbox.
-      if (orderBefore?.status === 'CANCELLED') {
+      if (await cancelIntendedForOrder(orderId)) {
         return {
           success: false,
-          error: cancelledOrderDespatchedReason(orderBefore.orderNumber ?? orderId),
+          error: cancelledOrderDespatchedReason(orderBefore?.orderNumber ?? orderId),
           refusal: 'shipment_status_transition_failed',
           permanent: false,
         }
@@ -2784,8 +2799,8 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       return result
     },
     partsSupported: Boolean(connector.fetchOrderParts),
-    async orderCancelledInIms(orderId) {
-      return (await db.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } }))?.status === 'CANCELLED'
+    async cancelIntendedForOrder(orderId) {
+      return cancelIntendedForOrder(orderId)
     },
     fetchOrderParts(orderNumber) {
       return connector.fetchOrderParts ? connector.fetchOrderParts(orderNumber) : Promise.resolve([])
