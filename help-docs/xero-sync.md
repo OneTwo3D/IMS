@@ -1651,6 +1651,50 @@ npm run eu-vat:seed -- --apply --confirm <digest>    # write exactly the plan th
   (`xero_rounding_difference_account`), not 821. Two further settings are read by the credit-note work to come: `eu_vat_refund182_hold_threshold` (default 10) and `eu_vat_refund182_held_count`
   (a persisted counter): refund VAT booked on WooCommerce rate 182 is to be posted to the order's VAT account, with the first N such credit notes held for a person to check. Nothing uses them yet.
 
+### EU VAT regime: how an order is classified, and the stamp (decision only)
+
+For an order destined to an EU member state, Monaco or Norway, IMS decides which consumer VAT regime its VAT was collected under, from facts on the order, and records the answer **once** on the sales order.
+**This change decides and records; nothing builds a document from the stamp yet, so no posted line, invoice total or credit note changes, and the Sales Invoices switch is untouched.** (The stamp
+is written by `stampEuVatRegime`, which the invoice treatment will call; until that follows, no order carries one.)
+
+- **Who decides: the setting `eu_vat_regime_mode`.** `adopt_plugin` (the default, and what an unset value means) is the parallel phase while the storefront plugin still posts: IMS **adopts the plugin's decision** instead of re-making
+  it. The account the plugin recorded on the order (`_o3d_ioss_vat_account`) determines the regime: the *EU IOSS/VOEC VAT collected* account is IOSS (VOEC for Norway), the *EU DDP charges collected* account is DDP; any other value
+  refuses. An order **with scheme VAT and no such meta refuses**; IMS does not guess (an order with no scheme VAT, such as a UK sale, needs none). The plugin's conversion is recorded in the stamp's basis from three order metas it
+  will write: `_o3d_ioss_fx_rate` (threshold-currency units per one order-currency unit), `_o3d_ioss_fx_pair` (for example `GBP>EUR`) and `_o3d_ioss_threshold_value`. IMS's own value test still runs as a cross-check and a disagreement
+  is the warning `adopted_regime_differs` (never a refusal). With the account present, a conversion record that is **incomplete or unreadable** (the rate, pair and threshold value are written together; the rate must be a positive
+  decimal, the pair like `GBP>EUR`), or an `_o3d_ioss_reason` carrying the plugin's "FX meta already present and different from this decision; left unchanged" marker, **refuses** (`plugin_fx_incomplete`, `plugin_fx_conflict`).
+  With a complete conversion record the plugin's evidence must also agree with itself and with the order, or the order refuses (`plugin_evidence_contradicts`): the recorded goods value selects the recorded account as the plugin compares
+  (at the minor unit, strictly above EUR 150 / NOK 3000 is the DDP account, otherwise the IOSS/VOEC account), and the plugin's rate applied to the goods IMS sees must give the recorded value within 0.02 in the threshold currency (unflagged goods lines may be
+  gift cards the plugin left out, so the recorded value may lie anywhere between the known goods alone and all the goods). A conversion field that is present but unreadable is an unreadable figure of the order and refuses first in both modes.
+  An order with the account and **no** conversion record at all (from before the plugin wrote it) is a deliberate exception: it is stamped from the account and the basis records `pluginFx` as "not recorded by the plugin", so historic orders still work; a pair other than the order's refuses; the 5% band is not raised in this mode. `decide` is the state after the switchover: IMS decides by value with
+  its own order-date rates, as below. A stored value that is neither mode is not coerced; it reads as invalid and the caller refuses.
+- **The regimes (decide mode).** **IOSS**: an EU member state or Monaco, goods at or under EUR 150. **VOEC**: Norway, goods at or under NOK 3000. **DDP**: over the threshold, VAT collected by the seller as delivered-duty-paid.
+  The thresholds are constants, not settings. Over means **strictly** over, compared at the minor unit: exactly 150.00 is IOSS, 150.01 is DDP, and 150.004 rounds to 150.00.
+- **The value tested** is the sum of the goods lines after coupons, excluding VAT, shipping and fees, with gift cards left out. A gift card is a line carrying the order-line flag `_o3d_is_voucher` (yes). The product-level marker
+  (`_coupon_title`) is not on the order and IMS imports no product meta (that would need a product column, a product-sync change and a lookup), so a line with no readable flag is **unknown**, not goods and not a gift card. In decide
+  mode an order **refuses** (`voucher_status_unknown`) when taking its unknown lines out would change the regime; unknown lines that cannot change it do not matter. Note what this means in practice: until the storefront writes the
+  flag (yes or no) on every goods line, a decide-mode order over the threshold refuses. Adopt mode does not use it. The value is converted to EUR (NOK for Norway) at the **order date** with IMS's own rates (the Aelia-fed `fx_rates`), through
+  the base currency. In decide mode no rate for the day refuses the order; nothing is defaulted. Because the plugin converts with its live rate at send time, a boundary order can decide differently from the plugin (owner ruling): in
+  decide mode any value within 5% of the threshold, either side, carries the warning `threshold_band`, and the stamp records the rate used.
+- **How a rate is recognised.** By WooCommerce rate id through the mapping, never by label. A scheme rate is an IMS rate with a `reportingCategory` of IOSS (Norway: VOEC) **and** a `schemePostingTaxType`; one without the other is
+  misconfigured and refuses. The destination is the shipping country, else the billing country; only EU-27, Monaco and Norway can be on the scheme.
+- **What refuses** (nothing is posted for it and nothing is stamped; it is decided afresh once fixed): a rate that charged money and is unmapped or mapped to an inactive IMS rate; a rate of an EU country, Monaco or Norway that
+  charged money and is **not** on the scheme (no goods ship from EU stock, so it is never treated as OSS); UK or Isle of Man VAT charged outside its own territory; a scheme rate on a destination outside the allowlist or of another
+  country (or the wrong scheme for Norway); more than one scheme posting type on an order; tax charged to a covered destination with no scheme rate identified; scheme VAT on an order flagged VAT-exempt; an EU VAT Compliance
+  record that is present and non-empty but disagrees with the tax lines by more than 0.02 or is in another currency (an absent or empty record never refuses); tax that moved on a rate other than the scheme rates, or a WooCommerce order tax that is not the scheme total by more than 0.02; no usable exchange rate (decide mode); no account configured for the VAT line; in adopt mode, no plugin account on an order with scheme VAT, or one that is neither configured account.
+- **Unreadable is named, never zero.** A goods total, a tax line amount or rate id, the order tax, the order currency, the over-threshold duty fee total, or the plugin's account or reason that is present but cannot be read refuses the whole order
+  before anything is decided (`order_figure_unreadable`, the reason lists each). A non-empty EU VAT record whose total, currency or shape cannot be read refuses a scheme order (`vat_record_unreadable`); an empty one (no rates) is absent and
+  never refuses. An unreadable EAS payload only warns (`eas_unreadable`). In adopt mode the plugin's conversion pair must be the order's own (order currency > EUR, or > NOK for Norway); any other pair refuses as `plugin_fx_conflict`.
+- **What is skipped.** An order with no scheme VAT is left alone. An EU-27 business sale flagged `is_vat_exempt` with no tax is recorded as a skip that says so, for the zero-rating that follows; Norway and Monaco are not treated that way. A zero-tax EU-27 order whose `is_vat_exempt` is missing or unreadable is **not** skipped: it refuses (`vat_exempt_status_unknown`) until its B2B status is known.
+- **Warnings, never refusals.** `threshold_band` (decide mode), `adopted_regime_differs` (adopt mode), `eas_unreadable`, `eas_disagrees` (the EAS merchandise figure, same currency, differs from the goods value by more than 0.02; EAS never decides, and Norway has none), `plugin_account_differs` (decide mode: the plugin recorded another VAT account on the order than IMS resolves) and `label_regime_disagrees` (accounting resolves by value, the customs label by the presence of the over-threshold duty fee;
+  accounting follows value, and a label that disagrees is a separate fix in the label service. Norway is not compared).
+- **The stamp** is four columns on the sales order. `euVatRegime` (IOSS, VOEC or DDP; NULL on an order decided to be outside the scheme), `euVatLineAccount` (the account code the one VAT line will post to, 821 or 232 in the live chart;
+  the same form as the plugin's `_o3d_ioss_vat_account`, so a credit note on an order the plugin handled before cut-over can use either), `euVatRegimeStampedAt` (set by every successful decision; NULL means never decided) and
+  `euVatRegimeBasis` (threshold, goods value, converted value, the exchange rate and its date, the rates and the warnings; no personal data). It is written by a compare-and-set that matches only an unstamped order, under
+  the order's row lock, so two builders agree on whichever wrote first, and a stamped order is **never re-derived**: a later exchange rate cannot move it between regimes. The database refuses a regime without an account and a
+  marker. The VAT accounts come from the *EU IOSS/VOEC VAT collected* and *EU DDP charges collected* account roles.
+- **Orders that predate the stamp** carry none. A credit note on a scheme order with no stamp must come from the plugin's recorded account or go to the exceptions queue (the credit-note change).
+
 ## Invoice PDF & Email
 
 When a sales invoice is synced to Xero and payment is registered:

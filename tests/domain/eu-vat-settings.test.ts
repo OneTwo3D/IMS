@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { EU_VAT_REFUND_HOLD_DEFAULT_THRESHOLD, parseCountSetting, refundHoldThreshold } from '@/lib/domain/accounting/eu-vat-settings'
+import { EU_VAT_REFUND_HOLD_DEFAULT_THRESHOLD, parseCountSetting, parseRegimeMode, refundHoldThreshold } from '@/lib/domain/accounting/eu-vat-settings'
 import { XERO_SETTING_KEYS } from '@/lib/connectors/xero/settings'
 import { XERO_ACCOUNT_ROLE_KEYS } from '@/lib/connectors/xero/account-mapping-rebind'
 import { ACCOUNT_FIELDS, isFieldAvailableForConnector } from '@/app/(dashboard)/sync/accounting-settings-fields'
@@ -34,4 +34,13 @@ test('the declaration names the account settings and the hold settings the code 
   assert.equal(seed.refundHold.defaultThreshold, EU_VAT_REFUND_HOLD_DEFAULT_THRESHOLD)
   assert.equal(seed.accounts.find((a) => a.role === 'iossVatCollected')!.code, '821')
   assert.equal(seed.accounts.find((a) => a.role === 'rounding')!.code, '860', 'rounding posts to 860 (ruling Q7)')
+})
+
+test('the regime mode defaults to adopting the plugin, takes either named mode, and is null (refuse, do not guess) for anything else', () => {
+  assert.equal(parseRegimeMode(undefined), 'adopt_plugin')
+  assert.equal(parseRegimeMode(null), 'adopt_plugin')
+  assert.equal(parseRegimeMode('  '), 'adopt_plugin')
+  assert.equal(parseRegimeMode('adopt_plugin'), 'adopt_plugin')
+  assert.equal(parseRegimeMode(' decide '), 'decide')
+  for (const bad of ['Decide', 'on', 'true', 'adopt', 'decide;']) assert.equal(parseRegimeMode(bad), null, bad)
 })
