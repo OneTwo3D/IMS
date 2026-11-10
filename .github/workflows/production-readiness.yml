@@ -219,7 +219,12 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npx prisma generate --schema prisma/schema.prisma
+      # next build peaks just over Node's default ~4 GB heap on this runner and OOMs intermittently
+      # (2026-11-10: development a1f55b7f and four PR heads failed, re-run passed). Give it 5.5 GB,
+      # leaving headroom on the runner for the build workers and the Postgres service.
       - run: npm run build
+        env:
+          NODE_OPTIONS: --max-old-space-size=5632
       # THIS LEG'S PROBE HAS TO REACH THE BACKEND DIRECTLY, AND THE PUBLISHED PORT DOES NOT (o3d-2k5r).
       #
       # `services:` publishes the container's 5432 on the runner, and docker-proxy carries the
