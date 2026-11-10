@@ -619,6 +619,7 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
   })
 
   const now = Date.now()
+  // The shared invoiced filter admits paid orders; aging lists only what is still owed (same 0.01 tolerance as the buckets).
   return orders.map((o) => {
     const total = Number(o.totalBase)
     const paid = o.payments.reduce((s, p) => s + Number(p.amount), 0)
@@ -648,7 +649,7 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
       overdue0_30: Math.round(o0 * 100) / 100, overdue31_60: Math.round(o31 * 100) / 100,
       overdue61_90: Math.round(o61 * 100) / 100, overdue91plus: Math.round(o91 * 100) / 100,
     }
-  })
+  }).filter((row) => row.dueAmount > 0.01)
 }
 
 // ---------------------------------------------------------------------------

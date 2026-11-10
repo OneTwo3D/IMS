@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
+import { NextRequest } from 'next/server'
 import { Prisma, SalesOrderStatus } from '@/app/generated/prisma/client'
 import {
   INVOICED_ORDER_WHERE,
@@ -33,6 +34,7 @@ mock.module('@/lib/auth/server', {
   namedExports: {
     requirePermission: async () => ({ user: { id: 'u1' } }),
     requireInternalUser: async () => ({ user: { id: 'u1' } }),
+    requireApiAuth: async () => ({ user: { id: 'u1', role: 'ADMIN' } }),
   },
 })
 mock.module('@/app/actions/settings', {
@@ -194,7 +196,8 @@ test('Sales Statistics invoice list and customer aging read the same orders', as
   const invoices = await getInvoiceStats()
   assert.deepEqual([...new Set(invoices.map((r) => r.orderNumber))].sort(), COUNTED)
   const aging = await getCustomerAging()
-  assert.deepEqual(aging.map((r) => r.orderNumber).sort(), COUNTED)
+  // Only what is still owed: A and B are unpaid; C and D are paid in full and drop out.
+  assert.deepEqual(aging.map((r) => r.orderNumber).sort(), ['A', 'B'])
 })
 
 test('Sales Analytics and Customer Mix invoiced revenue is the invoiced basis', async () => {
@@ -244,4 +247,18 @@ test('Details tab and its export list only invoiced orders', async () => {
   const rows = await getDetails()
   assert.deepEqual([...new Set(rows.map((r) => r.orderNumber))].sort(), COUNTED)
   assert.equal(rows.reduce((s, r) => s + r.totalBase, 0), EXPECTED_REVENUE)
+})
+
+test('Customer Aging and its CSV list only orders with an outstanding balance, never a paid one', async () => {
+  const { getCustomerAging } = await import('@/app/actions/sales-stats')
+  const rows = await getCustomerAging()
+  assert.ok(!rows.some((r) => ['C', 'D'].includes(r.orderNumber)), 'paid orders are absent from the screen rows')
+  assert.ok(rows.every((r) => r.dueAmount > 0))
+  // The CSV is built from the same rows.
+  const { GET } = await import('@/app/api/export/analytics/route')
+  const res = await GET(new NextRequest('http://localhost/api/export/analytics?type=aging'))
+  const csv = await res.text()
+  const dataRows = csv.trim().split('\n').slice(1)
+  assert.equal(dataRows.length, 2)
+  assert.ok(!/(^|,)"?[CD]"?,/.test(dataRows.join('\n')), 'no paid order in the CSV')
 })

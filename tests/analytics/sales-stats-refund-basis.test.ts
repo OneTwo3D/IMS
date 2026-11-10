@@ -215,7 +215,7 @@ test('products: an EXACTLY-zero unstamped credit line does not spoil the row (o3
 // ---------------------------------------------------------------------------
 
 test('aging: a NET credit is measured against the EX-VAT invoice total — £0.00, not £20.00 (o3d-iigc)', async () => {
-  AGING_ORDERS = [agingOrder({ id: 'SO-1', totalBase: 120, taxBase: 20, paid: 120, refunds: [{ totalBase: 100, totalsBasis: 'NET' }] })]
+  AGING_ORDERS = [agingOrder({ id: 'SO-1', totalBase: 120, taxBase: 20, paid: 0, refunds: [{ totalBase: 100, totalsBasis: 'NET' }] })]
   const byRef = await aging()
   const r = byRef.get('SO-1')!
 
