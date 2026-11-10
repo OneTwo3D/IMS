@@ -1036,6 +1036,12 @@ async function reconcileSplitOrder(
         allRecorded = false
         continue
       }
+      // The cancel intent is re-read IMMEDIATELY BEFORE each storefront write, so a cancel or refund that committed since the check at the
+      // top of this order is honoured for every part not yet pushed. What remains is the window between this read and the POST itself: an
+      // inter-system limit that cannot be closed from inside IMS (see docs/mintsoft.md).
+      if (deps.cancelIntendedForOrder && await deps.cancelIntendedForOrder(candidate.orderId)) {
+        return { action: 'error', reason: cancelledOrderDespatchedReason(null) }
+      }
       const push = await deps.pushPartialShipment(candidate.orderId, {
         part: part.partNumber,
         totalParts,

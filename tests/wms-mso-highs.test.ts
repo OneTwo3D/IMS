@@ -628,3 +628,20 @@ test('R3-1: the dispatch guard is the CANCEL intent, not the CANCELLED status - 
   assert.deepEqual([partials, applied], [[], []])
   assert.match(errors[0], /after IMS cancelled or fully refunded it/)
 })
+
+test('R4: the cancel intent is re-read before EACH split-part storefront write - a cancel that lands after the first part stops the rest', async () => {
+  const partials: string[] = []
+  let reads = 0
+  const errors: string[] = []
+  await runWmsDispatchSweepCore(dispatchDeps({
+    fetchOrderStatus: async () => dstatus({ isSplit: true, partCount: 2 }),
+    fetchOrderParts: async () => [dpart({ externalId: 'a', partNumber: 1 }), dpart({ externalId: 'b', partNumber: 2 })],
+    fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+    pushPartialShipment: async (orderId) => { partials.push(orderId); return { ok: true } },
+    // Live at the top-of-order check and before part 1; the cancel commits before part 2.
+    cancelIntendedForOrder: async () => { reads += 1; return reads >= 3 },
+    recordDispatchError: async (_c, reason) => { errors.push(reason); return { deadLettered: false } },
+  }))
+  assert.equal(partials.length, 1, 'only the part pushed before the cancel')
+  assert.match(errors[0], /after IMS cancelled or fully refunded it/)
+})

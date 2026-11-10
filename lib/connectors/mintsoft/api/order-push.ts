@@ -254,6 +254,11 @@ export async function reconcileMintsoftAmbiguousCreate(
  * survivor only when: our ClientId, a full-page-free search, the number is one exact "+" part, the MergedOrder flag is set, and exactly
  * one order qualifies.
  */
+// WHY A SAME-CLIENT SURVIVOR WITH OUR EXACT NUMBER AS A PART CAN ONLY HAVE ABSORBED OUR ORDER: observed live, Mintsoft refuses a second
+// order with an existing OrderNumber within a client ("Order Number already exists!"), and keeps refusing it after the first is
+// cancelled (a cancelled order keeps its number). So within our client the number belongs to exactly one order for good, and a merged
+// survivor listing it as one "+" part has absorbed that order. The checks that remain are therefore the ones that tie the survivor to
+// OUR client (ClientId), to a real merge (MergedOrder=True) and to our order (an EXACT part, never a prefix or substring).
 export async function findMintsoftMergedSurvivor(orderNumber: string): Promise<{ externalOrderId: string; externalOrderNumber: string } | null> {
   const clientId = await getPushClientId('Mintsoft merged-survivor lookup')
   const wanted = orderNumber.trim()

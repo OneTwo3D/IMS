@@ -82,6 +82,8 @@ const models: Record<string, unknown> = {
   salesOrder: {
     findUnique: async () => ({ ...state.order, orderNumber: 'SO-1', externalOrderNumber: 'WC-1', createdAt: new Date('2026-04-01T00:00:00Z'), lines: [{ sku: 'SKU-1', qty: 1, wclcFeeKind: null, productId: 'prod-1', externalLineItemId: 11 }] }),
     update: async ({ data }: { data: Partial<Order> }) => { Object.assign(state.order, data); return state.order },
+    // The dispatch guard asks whether IMS intends this order not to ship; these fixtures are ordinary, live orders.
+    count: async () => 0,
   },
   orderAllocation: { count: async () => 1 },
   shipment: {
