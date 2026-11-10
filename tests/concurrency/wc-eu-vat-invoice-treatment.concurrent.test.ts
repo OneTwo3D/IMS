@@ -205,7 +205,7 @@ test('[eu vat] switch ON, IOSS: zero-rated goods and shipping, fee on 232, one V
   assert.equal(total(invoice), 135.66, 'the invoice totals the order')
   assert.equal(invoice._taxUnreconciled, undefined)
   assert.equal(invoice._registerPayment, true)
-  assert.deepEqual(invoice._euVatTreatment, { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', vatAccount: '821', feesRecoded: 1, roundingAdjustment: null })
+  assert.deepEqual(invoice._euVatTreatment, { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', orderTotal: '135.66', vatAccount: '821', feesRecoded: 1, roundingAdjustment: null })
   assert.equal(order.euVatRegime, 'IOSS')
   assert.equal(order.euVatLineAccount, '821')
   assert.ok(order.euVatRegimeStampedAt)
@@ -248,7 +248,7 @@ test('[eu vat] a hold parked while the switch is off is not released untreated o
   const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
   const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
   const accountingPayload = (held.payload as unknown as { accountingPayload: Invoice }).accountingPayload
-  assert.deepEqual(accountingPayload._euVatTreatment, { applied: false, reason: 'sales_invoices_switch_off' })
+  assert.equal('_euVatTreatment' in accountingPayload, false, 'a switch-off hold carries NO marker: it is parked exactly as built')
   assert.equal(accountingPayload.lines[0]!.taxType, 'DE_CHARGED', 'parked untreated')
 
   // The number arrives. Switch still off: the release is not-configured as ever (no row, hold still PENDING).
@@ -387,7 +387,7 @@ async function parkOffThenReimport(t: test.TestContext, reimportMeta: Array<{ id
   assert.equal((await importWcOrder(payload(externalId, wcRateId, PLUGIN('821')) as never)).success, true)
   const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
   const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
-  assert.equal(((held.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment as { applied: boolean }).applied, false)
+  assert.equal('_euVatTreatment' in (held.payload as unknown as { accountingPayload: Invoice }).accountingPayload, false, 'parked with no marker')
   // The switch comes on, WooCommerce numbers the invoice, and the order is delivered again.
   switchOn = true
   await importWcOrder(payload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...reimportMeta]) as never)
@@ -561,4 +561,87 @@ test('[eu vat] a held invoice whose order changed currency while held is not rel
   assert.equal(rows.length, 0, 'nothing was queued')
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /the order changed after it was held \(the parked invoice is in GBP but the order is now in EUR\) and needs its invoice rebuilt/)
+})
+
+// ---- an ordinary domestic (non-scheme) 20% VAT hold ----
+const GB_ADDRESS = { ...ADDRESS, city: 'London', postcode: 'SW1A 1AA', country: 'GB' }
+function domesticPayload(externalId: number, wcRateId: number, meta: Meta) {
+  return {
+    ...payload(externalId, wcRateId, meta), billing: GB_ADDRESS, shipping: GB_ADDRESS,
+    line_items: [{ id: 1, name: 'Widget', product_id: 1, variation_id: 0, quantity: 1, tax_class: '', subtotal: '100.00', subtotal_tax: '20.00', total: '100.00', total_tax: '20.00', sku: `NOSKU-${externalId}`, price: 100, taxes: [{ id: wcRateId, total: '20.00', subtotal: '20.00' }], meta_data: [] }],
+    fee_lines: [],
+    tax_lines: [{ id: 21, rate_code: 'GB-VAT-1', rate_id: wcRateId, label: 'VAT', compound: false, tax_total: '20.00', shipping_tax_total: '2.00', meta_data: [] }],
+    shipping_lines: [{ id: 31, method_title: 'Flat', method_id: 'flat_rate', total: '10.00', total_tax: '2.00', taxes: [{ id: wcRateId, total: '2.00' }], meta_data: [] }],
+    total: '132.00', total_tax: '22.00',
+  }
+}
+async function seedDomestic(db: Awaited<ReturnType<typeof loadDb>>, wcRateId: number) {
+  const rate = await db.taxRate.create({ data: { name: `GB VAT ${randomUUID()}`, rate: 0.2, usedFor: 'SALES', accountingTaxType: 'OUTPUT2', countryCode: 'GB', taxCategory: 'STANDARD', active: true } })
+  await db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: String(wcRateId), externalName: 'UK VAT', externalCountry: 'GB', externalRatePct: 20, taxRateId: rate.id } })
+  const warehouse = await db.warehouse.create({ data: { code: `EUD-${randomUUID().slice(0, 8)}`, name: 'Domestic hold test warehouse', syncToStore: true, availableForSale: true } })
+  return { rate, warehouse }
+}
+async function domesticHold(t: test.TestContext, changeTotal: boolean) {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = true
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seedDomestic(db, wcRateId)
+  t.after(async () => { switchOn = false; await cleanup(db, externalId, ctx) })
+  const extra: Meta = [{ id: 2, key: 'is_vat_exempt', value: 'no' }]
+  assert.equal((await importWcOrder(domesticPayload(externalId, wcRateId, extra) as never)).success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  const marker = (held.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment as Record<string, unknown>
+  assert.deepEqual([marker.applied, marker.route, marker.orderTotal], [true, 'none', '132.00'])
+  const again = domesticPayload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...extra])
+  if (changeTotal) { again.shipping_lines[0]!.total_tax = '3.00'; again.tax_lines[0]!.shipping_tax_total = '3.00'; again.total = '133.00'; again.total_tax = '23.00' }
+  await importWcOrder(again as never)
+  return { after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }), rows: await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId } }) }
+}
+
+test('[eu vat] an UNCHANGED domestic 20% VAT hold (route none) is released on re-import: its taxed total is not compared as an untaxed sum', { skip }, async (t) => {
+  const { after, rows } = await domesticHold(t, false)
+  assert.equal(rows.length, 1, 'released')
+  assert.equal(after.status, 'SYNCED')
+  const invoice = rows[0]!.payload as unknown as Invoice
+  assert.deepEqual(invoice.lines.map((l) => [l.accountCode, l.taxType]), [['200', 'OUTPUT2']])
+  assert.equal(invoice.shippingTaxType, 'OUTPUT2')
+})
+
+test('[eu vat] a domestic hold whose order total changed (a tax figure) while held stays PENDING', { skip }, async (t) => {
+  const { after, rows } = await domesticHold(t, true)
+  assert.equal(rows.length, 0)
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /the order total was 132\.00 when the invoice was held and is 133\.00 now/)
+})
+
+test('[eu vat] a hold parked with the switch OFF is parked byte for byte as the importer built it: no marker, same keys and lines as the payload queued for a numbered order', { skip }, async (t) => {
+  recordWhenOff = true
+  t.after(() => { recordWhenOff = false })
+  // The numbered order: the double records what the importer built (switch off).
+  const queued = await run(t, PLUGIN('821'), false)
+  assert.ok(queued.invoice)
+  // The unnumbered order: the same importer parks the same payload.
+  const db = await loadDb()
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seed(db, wcRateId)
+  t.after(async () => { await cleanup(db, externalId, ctx) })
+  switchOn = false
+  assert.equal((await importWcOrder(payload(externalId, wcRateId, PLUGIN('821')) as never)).success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const parked = ((await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })).payload as unknown as { accountingPayload: Record<string, unknown> & { lines: Array<Record<string, unknown>> } }).accountingPayload
+  assert.equal('_euVatTreatment' in parked, false)
+  const built = queued.invoice as unknown as Record<string, unknown> & { lines: Array<Record<string, unknown>> }
+  const strip = (l: Record<string, unknown>) => { const { itemCode: _i, taxRateId: _r, ...rest } = l; void _i; void _r; return rest }
+  const control = (o: Record<string, unknown>) => Object.keys(o).filter((k) => !['invoiceNumber', '_idempotencyKey', 'reference', '_paymentId'].includes(k)).sort()
+  assert.deepEqual(control(parked), control(built), 'the same set of payload keys')
+  assert.deepEqual(parked.lines.map(strip), built.lines.map(strip), 'the same lines')
+  for (const key of ['shippingAmount', 'shippingTaxType', 'shippingAccountCode', 'currency', 'lineAmountsIncludeTax', '_registerPayment']) assert.deepEqual(parked[key], built[key], key)
 })

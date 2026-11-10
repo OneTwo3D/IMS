@@ -100,6 +100,7 @@ export async function treatImportedSalesInvoice(params: {
         applied: true,
         route: treated.applied.route,
         regime: treated.applied.regime,
+        orderTotal: String(params.wcOrder.total ?? ''),
         schemePostingTaxType: routed.route.kind === 'scheme' ? routed.route.schemePostingTaxType : null,
         vatAccount: routed.route.kind === 'scheme' ? routed.route.vatAccount : null,
         feesRecoded: treated.applied.feesRecoded,

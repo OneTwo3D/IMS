@@ -34,7 +34,16 @@ const same = (a: unknown, b: number | undefined): boolean => {
 const NAMED_EXTRA_KINDS = ['eu-vat-recovery', 'rounding-difference']
 
 /** null when the parked payload still matches the order; otherwise the first difference, as a sentence fragment. */
-export function heldInvoiceDifference(parked: Record<string, unknown>, expected: ExpectedHeldInvoice, treated: boolean): string | null {
+export function heldInvoiceDifference(
+  parked: Record<string, unknown>,
+  expected: ExpectedHeldInvoice,
+  treated: boolean,
+  /**
+   * Whether the parked document is on zero-tax types (the scheme and B2B routes), so its lines sum to the order's total. An ordinary taxed invoice (route none) books net plus tax by the codes it is sent on, so
+   * its untaxed sum is not the order's VAT-inclusive total and is not compared here; its total is compared by the caller from the order total recorded in the marker.
+   */
+  untaxedTotal: boolean = treated,
+): string | null {
   // The currency every parked figure is in must be the order's currency now: a held invoice never releases in a currency the order has left.
   const parkedCurrency = typeof parked.currency === 'string' ? parked.currency.trim().toUpperCase() : ''
   if (parkedCurrency !== expected.currency.trim().toUpperCase()) return `the parked invoice is in ${parkedCurrency === '' ? '(no currency)' : parkedCurrency} but the order is now in ${expected.currency}`
@@ -63,7 +72,7 @@ export function heldInvoiceDifference(parked: Record<string, unknown>, expected:
   }
   if (!same(parked.shippingAmount, expected.shippingAmount)) return `the parked shipping is ${String(parked.shippingAmount ?? 0)}, the order's is ${expected.shippingAmount ?? 0}`
   if (!same(parked.discountAmount, expected.discountAmount)) return `the parked order discount is ${String(parked.discountAmount ?? 0)}, the order's is ${expected.discountAmount ?? 0}`
-  if (treated) {
+  if (untaxedTotal) {
     const total = predictedUntaxedTotal(parked as unknown as TreatablePayload)
     const order = num(expected.orderTotal)
     if (total === null || order === null) return 'the parked invoice total or the order total cannot be read'

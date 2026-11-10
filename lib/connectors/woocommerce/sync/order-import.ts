@@ -1672,7 +1672,7 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   const row = await db.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
   if (!row || !isHeldSalesInvoicePayload(row.payload)) return { outcome: 'not-needed' }
   const held: HeldSalesInvoicePayload = row.payload
-  type Marker = { applied?: unknown; reason?: unknown; route?: unknown; regime?: unknown; vatAccount?: unknown; schemePostingTaxType?: unknown }
+  type Marker = { applied?: unknown; reason?: unknown; route?: unknown; regime?: unknown; vatAccount?: unknown; schemePostingTaxType?: unknown; orderTotal?: unknown }
   const markerOf = (payload: Record<string, unknown>) => payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as Marker | null | undefined
   const marker = markerOf(held.accountingPayload)
   if (marker?.reason === 'store_credit') return { outcome: 'not-needed' }
@@ -1713,8 +1713,14 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
 
   // The whole check of a TREATED hold, reading through `client` (the caller's order-locked transaction): the parked payload against the order, and the regime re-resolved from the current facts against what was parked and the order's stamp.
   const verifyTreated = async (client: Prisma.TransactionClient, parked: HeldSalesInvoicePayload, parkedMarker: Marker): Promise<string | null> => {
-    const difference = heldInvoiceDifference(parked.accountingPayload, expected, true)
+    // Zero-tax routes (scheme, B2B) sum to the order's total; an ordinary taxed invoice (route none) does not, so its total is compared as the order total recorded when it was parked.
+    const zeroTax = parkedMarker.route === 'scheme' || parkedMarker.route === 'b2b_zero_rate'
+    const difference = heldInvoiceDifference(parked.accountingPayload, expected, true, zeroTax)
     if (difference !== null) return difference
+    if (!zeroTax) {
+      const parkedTotal = typeof parkedMarker.orderTotal === 'string' ? parkedMarker.orderTotal.trim() : ''
+      if (!/^-?\d+(\.\d+)?$/.test(parkedTotal) || !toDecimal(parkedTotal).eq(toDecimal(expected.orderTotal))) return `the order total was ${parkedTotal || '(not recorded)'} when the invoice was held and is ${expected.orderTotal} now`
+    }
     const mode = await readEuVatRegimeMode()
     if (mode === null) return 'the EU VAT regime mode setting is unreadable'
     const input = await buildEuVatRegimeInput(client, wcOrder, { ioss: accounts.ioss, ddp: accounts.ddp }, { mode })
@@ -1763,7 +1769,7 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   if (outcome.kind === 'skipped') return { outcome: 'not-needed' }
   const treated = outcome.payload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
     ? outcome.payload
-    : { ...outcome.payload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null } }
+    : { ...outcome.payload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? '') } }
   const written = await db.$transaction(async (tx) => {
     await lockSalesOrder(tx, orderId)
     const current = await tx.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
@@ -3708,12 +3714,13 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           orderNumber,
           metaKey: invoiceNumberResolution.metaKey,
           // A hold parked while the Sales Invoices switch is off carries the EU VAT treatment's absence on it, so a later release (switch on) does not post it untreated.
-          // Every parked payload says whether the treatment ran on it: applied:true when it did (even where it left the lines alone), applied:false when the switch was off or the order carries store credit.
+          // With the switch ON every parked payload says whether the treatment ran on it (applied:true, even where it left the lines alone; applied:false for a store-credit order). With the switch OFF the original payload is parked exactly as built, with no marker:
+          // an absent marker is an untreated hold, which the release and the re-import already treat as such.
           accountingPayload: euVatOutcome.kind === 'skipped'
-            ? { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: euVatOutcome.why === 'switch_off' ? 'sales_invoices_switch_off' : 'store_credit' } }
+            ? (euVatOutcome.why === 'store_credit' ? { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'store_credit' } } : invoicePayload)
             : invoicePayload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
               ? invoicePayload
-              : { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null } },
+              : { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? '') } },
           // o3d-j625: the same chart read that produced every account code in `accountingPayload`,
           // parked alongside them — the release can be days later and must not re-resolve it.
           chartConnector: settings.connector,
