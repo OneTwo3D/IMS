@@ -3948,7 +3948,7 @@ export async function createSalesOrderRefund(
     const reverseChargeSalesTaxType = input.accountingSettings?.reverseChargeSalesTaxType
 
     // A public refund's credit note, GROSSED UP at the rate it posts under, must stay within what the customer paid for each line.
-    let publicGrossRateOf: ((lineId: string | null) => number) | null = null
+    let publicGrossRateOf: ((lineId: string | null, net: number) => number) | null = null
     // The rate an EARLIER refund line was actually posted at: its persisted tax code (else the code the credit note falls back to), priced like the payload; null when it cannot be.
     let publicPriorRateOf: ((row: { salesOrderLineId: string | null; accountingTaxType: string | null }) => number | null) | null = null
     if (input.deriveSaleLineNetsFromStoredBalance) {
@@ -3984,17 +3984,19 @@ export async function createSalesOrderRefund(
         const priced = type ? priceSnapshottedTaxIdentity({ accountingTaxType: type, rateByTaxType: salesRates, label: 'earlier refund line' }) : null
         return priced?.ok ? priced.rate.toNumber() : null
       }
-      publicGrossRateOf = (lineId) => {
-        if (!lineId) {
-          const type = orderDefaultTaxType
-          const priced = type ? priceSnapshottedTaxIdentity({ accountingTaxType: type, rateByTaxType: salesRates, label: 'shipping' }) : null
-          return Math.max(orderRate, priced?.ok ? priced.rate.toNumber() : 0)
-        }
+      // Each NEW row is valued at the rate it will actually POST at: the tax code the credit note payload resolves for it (a line's own code, else the order
+      // default), priced from the sales tax table. Only when that cannot be priced is a conservative stand-in used, and its direction depends on the sign: a
+      // credit counts at the higher of the line's charged rate and the order's rate, a reversal (negative net, e.g. the discount) at no VAT, so neither is understated.
+      publicGrossRateOf = (lineId, net) => {
+        const type = lineId ? taxTypeOfLine({ accountingTaxType: null, lineId }) : orderDefaultTaxType
+        const priced = type ? priceSnapshottedTaxIdentity({ accountingTaxType: type, rateByTaxType: salesRates, label: 'refund line' }) : null
+        if (priced?.ok) return priced.rate.toNumber()
+        if (net < 0) return 0
+        if (!lineId) return orderRate
         const line = so.lines.find((l) => l.id === lineId)
-        const net = line ? refundBoundaryNumber(line.totalForeign) : 0
-        const own = line && net > 0 ? refundBoundaryNumber(line.taxForeign) / net : 0
-        const posted = findPostedRate(lineId)
-        return Math.max(own, posted ?? 0)
+        const lineNet = line ? refundBoundaryNumber(line.totalForeign) : 0
+        const own = line && lineNet > 0 ? refundBoundaryNumber(line.taxForeign) / lineNet : 0
+        return Math.max(own, orderRate)
       }
     }
 
@@ -4413,7 +4415,7 @@ export async function createSalesOrderRefund(
         usedFallbackRate = true
         return sum + net * (1 + (net >= 0 ? Math.max(blendedRate, maxLineRate) : 0))
       }, 0)
-      const newGrossForeign = refundLines.reduce((sum, line) => sum + storedForeign(line) * (1 + publicGrossRateOf!(line.lineId ?? null)), 0)
+      const newGrossForeign = refundLines.reduce((sum, line) => sum + storedForeign(line) * (1 + publicGrossRateOf!(line.lineId ?? null, storedForeign(line))), 0)
       if (priorGrossForeign + newGrossForeign > paidForeign + 0.005) {
         return { error: `The credit note, including VAT, would exceed what the order was paid in its own currency.${usedFallbackRate ? ' (An earlier refund\'s VAT rate could not be established, so it was counted at the highest rate on the order.)' : ''}` } as const
       }

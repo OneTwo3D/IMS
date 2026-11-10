@@ -59,6 +59,8 @@ type Order = {
   totalBase: number
   taxBase?: number
   taxRatePercent?: number
+  /** Whether the order's amounts (its discount) include VAT. */
+  pricesIncludeVat?: boolean
   taxRateName?: string | null
   // o3d-w00 (Codex r3 #2): the shipping charge is a refund TARGET with its own remaining balance,
   // enforced under the order lock, so the locked read of the order carries it.
@@ -1598,6 +1600,30 @@ test('a mixed-rate order (100 at 0% + 100 at 20%, 220 paid) is fully refundable 
     assert.equal(over.success, false, `${order.join(' then ')}: over-refund refused`)
     assert.equal(state.refunds.length, 2)
   }
+})
+
+// [mutation: the discount reversal valued at the stored order rate / the higher rate instead of the rate it will post at]
+test('a full refund after the order default tax code was changed from 20% to 0% cannot return more than was paid', async () => {
+  // Two 100 lines at 20%, a 60 GROSS discount (50 net, 10 VAT): paid 240 - 60 = 180. The default code the discount posts under is 0% NOW,
+  // so a full refund would post 240 (lines) - 50 (discount at 0%) = 190.
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], totalBase: 180, totalForeign: 180, taxBase: 30, taxForeign: 30, taxRatePercent: 0.2, pricesIncludeVat: true, discountAmount: 60, taxRateName: 'Default' }],
+    taxRates: [{ name: 'Default', accountingTaxType: 'DEFAULT0', active: true, rate: 0 }, { name: 'Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.2 }],
+  })
+  const std = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
+  state.lines[0] = { id: 'line-a', orderId: 'order-1', productId: 'product-a', description: 'A', qty: 1, totalBase: 100, totalForeign: 100, taxForeign: 20, taxRate: std }
+  state.lines.push({ id: 'line-b', orderId: 'order-1', productId: 'product-b', description: 'B', qty: 1, totalBase: 100, totalForeign: 100, taxForeign: 20, taxRate: std })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [
+      { lineId: 'line-a', productId: 'product-a', description: 'A', qty: 1, totalForeign: 100, totalBase: 100, lineKind: 'sale' },
+      { lineId: 'line-b', productId: 'product-b', description: 'B', qty: 1, totalForeign: 100, totalBase: 100, lineKind: 'sale' },
+    ],
+    reason: 'full after code change', creditNotePrefix: 'CN-', ...refundSafeguards({ isInternal: false }),
+  })
+  assert.equal(result.success, false)
+  assert.match(result.success === false ? result.error : '', /The credit note, including VAT, would exceed what the order was paid/)
+  assert.equal(state.refunds.length, 0)
 })
 
 test('two lines of the same product cannot lend each other units: a line is refunded only up to its own remaining quantity', async () => {
