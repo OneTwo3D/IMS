@@ -548,3 +548,54 @@ test('the region and name parsers are the shared ones of lib/tax/tax-country (R1
   assert.equal(regionToken('PT-30', 'PT'), '30')
   assert.equal(comparableName('  AT  IOSS\tVAT '), 'at ioss vat')
 })
+
+// ---- one IMS rate per Xero rate (owner ruling Q2, option A): sharing declared in lib/tax/eu-vat-seed.json is accepted, anything else is not --------------------------------------------------------------
+
+/** The zero-rated Xero rate three WooCommerce rates stand for (Woo 150 GB, 151 AT, 182 standard-class "Taxes & Duties"), as ONE IMS rate. */
+function zeroShared(): VatSetInput {
+  const name = 'Zero Rated Income'
+  return {
+    woo: [woo('150', { name, country: 'GB', rate: '0.0000', class: 'zero-rate' }), woo('151', { name, country: 'AT', rate: '0.0000', class: 'zero-rate' }), woo('182', { name, country: '', rate: '0.0000', class: '' })],
+    rates: [ims('rZ', 'ZERORATEDOUTPUT', { name, rate: '0.0000', countryCode: null, taxCategory: 'ZERO' })],
+    mappings: [{ ...map('150', 'rZ'), externalClass: 'zero-rate' }, { ...map('151', 'rZ'), externalClass: 'zero-rate' }, map('182', 'rZ')],
+    componentRates: [],
+    xero: [xero('ZERORATEDOUTPUT', { name, reportTaxType: 'OUTPUT', effectiveRate: '0.000000', displayTaxRate: '0.000000' })],
+  }
+}
+
+test('WooCommerce rates the declaration says are one Xero rate may share one IMS rate: no DUPLICATE_MAPPING, no COUNTRY_DIFFERS, no CATEGORY_DIFFERS', () => {
+  const rows = compareVatSetIdentity(zeroShared())
+  assert.deepEqual(rows.filter((row) => row.reasons.length > 0), [])
+})
+
+test('sharing stays refused where the types differ: an undeclared WooCommerce rate, a rate declared as another Xero rate, or a shared IMS rate that carries another type', () => {
+  const undeclared = zeroShared()
+  undeclared.woo = [...undeclared.woo, woo('99999', { name: 'Zero Rated Income', country: 'AT', rate: '0.0000', class: 'zero-rate' })]
+  undeclared.mappings = [...undeclared.mappings, map('99999', 'rZ')]
+  assert.ok(reasonsOf(compareVatSetIdentity(undeclared), 'woo', '150').includes('DUPLICATE_MAPPING'))
+
+  const other = zeroShared()
+  other.woo = [...other.woo, woo('215', { name: 'Zero Rated Income', country: 'AT', rate: '0.0000', class: 'zero-rate' })]
+  other.mappings = [...other.mappings, map('215', 'rZ')]
+  assert.ok(reasonsOf(compareVatSetIdentity(other), 'woo', '215').includes('DUPLICATE_MAPPING'), 'Woo 215 is declared as AT VAT, not as the zero-rated rate')
+  assert.ok(reasonsOf(compareVatSetIdentity(other), 'woo', '150').includes('DUPLICATE_MAPPING'))
+
+  const otherType = zeroShared()
+  otherType.woo = [...otherType.woo, woo('112', { name: 'Zero Rated Income', country: 'GB', rate: '0.0000', class: 'zero-rate' })]
+  otherType.mappings = [...otherType.mappings, { ...map('112', 'rZ'), externalClass: 'zero-rate' }]
+  assert.ok(reasonsOf(compareVatSetIdentity(otherType), 'woo', '150').includes('DUPLICATE_MAPPING'), 'Woo 112 is declared on OUTPUT2, a plain rate with no scheme type like the zero-rated ones: only the charged type tells them apart')
+
+  const wrongType = zeroShared()
+  wrongType.rates = [ims('rZ', 'TAX999', { name: 'Zero Rated Income', rate: '0.0000', countryCode: null, taxCategory: 'ZERO' })]
+  wrongType.xero = [xero('TAX999', { name: 'Zero Rated Income', reportTaxType: 'OUTPUT', effectiveRate: '0.000000', displayTaxRate: '0.000000' })]
+  assert.ok(reasonsOf(compareVatSetIdentity(wrongType), 'woo', '150').includes('DUPLICATE_MAPPING'), 'declared as ZERORATEDOUTPUT, the IMS rate carries another type')
+})
+
+test('two IMS rates on one Xero type are still a DUPLICATE_MAPPING (the IMS side of one-per-Xero-rate)', () => {
+  const input = zeroShared()
+  input.rates = [...input.rates, ims('rZ2', 'ZERORATEDOUTPUT', { name: 'Zero Rated Income 2', rate: '0.0000', countryCode: null, taxCategory: 'ZERO' })]
+  input.mappings = [map('150', 'rZ'), map('151', 'rZ'), map('182', 'rZ2')]
+  const rows = compareVatSetIdentity(input)
+  assert.ok(reasonsOf(rows, 'ims', 'rZ').includes('DUPLICATE_MAPPING'))
+  assert.ok(reasonsOf(rows, 'ims', 'rZ2').includes('DUPLICATE_MAPPING'))
+})

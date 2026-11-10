@@ -33,6 +33,9 @@ export type XeroSettings = {
   xero_unearned_revenue_account: string
   xero_transit_account: string
   xero_rounding_difference_account: string
+  xero_eu_vat_ioss_account: string
+  xero_eu_vat_ddp_account: string
+  xero_eu_fee_account: string
   xero_accounts_receivable_account: string
   xero_accounts_payable_account: string
   xero_realised_fx_gain_loss_account: string
@@ -57,6 +60,7 @@ export const XERO_SETTING_KEYS = [
   'xero_unearned_revenue_account',
   'xero_transit_account',
   'xero_rounding_difference_account',
+  'xero_eu_vat_ioss_account', 'xero_eu_vat_ddp_account', 'xero_eu_fee_account',
   'xero_accounts_receivable_account', 'xero_accounts_payable_account',
   'xero_realised_fx_gain_loss_account', 'xero_unrealised_fx_gain_loss_account',
   'xero_manufacturing_overhead_account',
@@ -91,6 +95,9 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_unearned_revenue_account: '',
   xero_transit_account: '',
   xero_rounding_difference_account: '',
+  xero_eu_vat_ioss_account: '',
+  xero_eu_vat_ddp_account: '',
+  xero_eu_fee_account: '',
   xero_accounts_receivable_account: '',
   xero_accounts_payable_account: '',
   xero_realised_fx_gain_loss_account: '',

@@ -8,6 +8,13 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### EU IOSS / VOEC rate configuration and parity (configuration only)
+
+- **Added: `TaxRate.schemePostingTaxType`**, the zero-rated Xero tax type an IOSS or VOEC sale's goods, shipping and discount lines will post on (for example `TAX131` for DE VAT 19%), beside the existing reporting category (`IOSS`, `VOEC`) that marks the rate. A nullable column with a forward migration. **Nothing reads it to post a line yet and the Sales Invoices switch is untouched**; the invoice treatment follows in later changes.
+- **Added: a versioned declaration of the 65 live WooCommerce rates** (`lib/tax/eu-vat-seed.json`), `npm run eu-vat:preflight` (read only: what is missing or mismatched against the database and the stored Xero list) and `npm run eu-vat:seed` (a dry run unless `--apply --confirm <digest>`; sets only the two rate fields through the WooCommerce mappings, stamped for the configured store). WooCommerce rates on the same Xero type share one IMS rate (the 33 on `ZERORATEDOUTPUT`); the set-identity report accepts exactly that declared sharing. A change of Xero organisation now also clears `schemePostingTaxType`. Nothing writes a tax rate to Xero and nothing applies the declaration automatically.
+- **Added: a parity test** (`tests/tax/eu-vat-parity.test.ts`) that judges the declaration against the measured Xeroom resolution of every one of the 65 rates, and **a drift check** that the hourly tax-rate sweep now makes, by code, on every rate's scheme posting type.
+- **Added: settings.** Three Xero account roles (*EU IOSS/VOEC VAT collected*, *EU DDP charges collected*, *EU landed-cost fees*) and two credit-note hold settings (`eu_vat_refund182_hold_threshold`, `eu_vat_refund182_held_count`); configuration only. A tax re-key now copies `schemePostingTaxType` to the replacement rate.
+
 ### Purchase orders: edit, close and cancel at every stage
 
 - **Changed: a purchase order can be edited from Draft through Part-received.** An order nothing has touched (no goods received, no supplier bill, no return, no warehouse ASN) is fully editable at RFQ Sent, Quote Received, PO Sent and Shipped, so quoted prices can be entered and a typo in quantity, price or warehouse corrected after sending. Once goods, a bill or an ASN touch it, it is amended in place: line ids are kept, received, billed or returned lines keep their price and cannot be removed, a quantity cannot go below what was received, billed or returned, and supplier, currency, exchange rate and VAT are fixed. On a part-received order with freight or cost lines, quantity and line-set changes are refused because they would change the cost of goods already in stock.

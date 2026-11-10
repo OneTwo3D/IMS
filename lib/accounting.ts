@@ -59,6 +59,14 @@ export type AccountingSettings = {
   realisedFxGainLossAccount: string
   unrealisedFxGainLossAccount: string
   manufacturingOverheadAccount: string
+  /**
+   * EU IOSS / VOEC / DDP treatment (configuration only until the invoice treatment reads it): the account the single recovered-VAT line of a
+   * scheme sale posts to under IOSS or VOEC (Xero "Non-UK VAT", 821 in the OneTwo3D chart), the account it posts to under DDP, and the account a
+   * marked landed-cost fee posts to. Empty = not configured; whoever needs one refuses rather than guessing.
+   */
+  euVatIossAccount: string
+  euVatDdpAccount: string
+  euFeeAccount: string
   paymentAccountMap: string
   invoiceUrlTemplate: string
   billUrlTemplate: string
@@ -142,6 +150,9 @@ const DEFAULT_ACCOUNTING_SETTINGS: AccountingSettings = {
   realisedFxGainLossAccount: '',
   unrealisedFxGainLossAccount: '',
   manufacturingOverheadAccount: '',
+  euVatIossAccount: '',
+  euVatDdpAccount: '',
+  euFeeAccount: '',
   paymentAccountMap: '{}',
   invoiceUrlTemplate: '',
   billUrlTemplate: '',
@@ -1964,6 +1975,9 @@ export async function getAccountingSettingsFor(
         realisedFxGainLossAccount: xs.xero_realised_fx_gain_loss_account,
         unrealisedFxGainLossAccount: xs.xero_unrealised_fx_gain_loss_account,
         manufacturingOverheadAccount: xs.xero_manufacturing_overhead_account,
+        euVatIossAccount: xs.xero_eu_vat_ioss_account,
+        euVatDdpAccount: xs.xero_eu_vat_ddp_account,
+        euFeeAccount: xs.xero_eu_fee_account,
         paymentAccountMap: paymentMapSetting?.value ?? '{}',
         invoiceUrlTemplate: invoiceUrlSetting?.value ?? '',
         billUrlTemplate: billUrlSetting?.value ?? '',

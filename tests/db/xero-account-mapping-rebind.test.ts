@@ -90,7 +90,7 @@ const counts = async (tx: Tx) => ({
   stamp: (await tx.setting.findUnique({ where: { key: XERO_ACCOUNT_MAPPING_TENANT_KEY } }))?.value as string | undefined,
 })
 
-test('o3d-6thk1 (real tables): KNOWN DIFFERENT organisation clears 18 mapping settings, derived drift, tax-type mappings, the cached chart and the toggle, nothing else', { skip }, async () => {
+test('o3d-6thk1 (real tables): KNOWN DIFFERENT organisation clears 21 mapping settings, derived drift, tax-type mappings, the cached chart and the toggle, nothing else', { skip }, async () => {
   const run = randomUUID().slice(0, 8)
   const observed = await withRollback(async (tx) => {
     await lockAccountingMappingSelection(tx, 'xero')
@@ -102,8 +102,8 @@ test('o3d-6thk1 (real tables): KNOWN DIFFERENT organisation clears 18 mapping se
     return { before, previous, outcome, after: await counts(tx), unrelated: (await tx.setting.findUnique({ where: { key: `unrelated_${run}` } }))?.value }
   })
   console.log(`# o3d-6thk1 db known-different: before=${JSON.stringify(observed.before)} after=${JSON.stringify(observed.after)} previous=${observed.previous.tenantId} (${observed.previous.basis})`)
-  assert.equal(XERO_ACCOUNT_MAPPING_KEYS.length, 18, 'PRECONDITION: 15 roles + payment map + 2 reverse-charge types')
-  assert.deepEqual([observed.before.settings, observed.before.derived, observed.before.rateTypes, observed.before.componentTypes, observed.before.chart], [18, 3, 1, 1, 1], 'PRECONDITION: all of it present before')
+  assert.equal(XERO_ACCOUNT_MAPPING_KEYS.length, 21, 'PRECONDITION: 18 roles + payment map + 2 reverse-charge types')
+  assert.deepEqual([observed.before.settings, observed.before.derived, observed.before.rateTypes, observed.before.componentTypes, observed.before.chart], [21, 3, 1, 1, 1], 'PRECONDITION: all of it present before')
   assert.equal(observed.outcome.kind, 'cleared')
   assert.deepEqual([observed.after.settings, observed.after.derived, observed.after.rateTypes, observed.after.componentTypes, observed.after.chart], [0, 0, 0, 0, 0])
   assert.equal(observed.after.sync, undefined)
@@ -121,7 +121,7 @@ test('o3d-6thk1 (real tables): the SAME organisation changes nothing', { skip },
     return { outcome, after: await counts(tx) }
   })
   assert.equal(observed.outcome.kind, 'none')
-  assert.deepEqual([observed.after.settings, observed.after.rateTypes, observed.after.chart, observed.after.sync], [18, 1, 1, 'true'])
+  assert.deepEqual([observed.after.settings, observed.after.rateTypes, observed.after.chart, observed.after.sync], [21, 1, 1, 'true'])
 })
 
 test('o3d-6thk1 (real tables): UNKNOWN provenance with a mapping keeps it, turns sync off, stamps nothing; confirmation then owns it (idempotently)', { skip }, async () => {
@@ -143,7 +143,7 @@ test('o3d-6thk1 (real tables): UNKNOWN provenance with a mapping keeps it, turns
   console.log(`# o3d-6thk1 db unknown: previous=${observed.previous.basis}, outcome=${observed.outcome.kind}, kept settings=${observed.after.settings}, sync=${observed.after.sync}, stamp=${observed.after.stamp}, ownership ${observed.before.state} -> ${observed.owned.state}`)
   assert.equal(observed.previous.basis, 'unknown', 'PRECONDITION: no stamp and no token row')
   assert.equal(observed.outcome.kind, 'unconfirmed')
-  assert.deepEqual([observed.after.settings, observed.after.rateTypes, observed.after.chart], [18, 1, 0], 'mapping kept; the unattributable chart CACHE cleared')
+  assert.deepEqual([observed.after.settings, observed.after.rateTypes, observed.after.chart], [21, 1, 0], 'mapping kept; the unattributable chart CACHE cleared')
   assert.equal(observed.after.sync, undefined, 'sync off')
   assert.equal(observed.after.stamp, undefined, 'nothing stamped')
   assert.equal(observed.before.state, 'unconfirmed')
@@ -235,9 +235,9 @@ test('o3d-6thk1 (real tables): the HOLD is persisted, and a token row created wh
   assert.equal(observed.previous2.basis, 'hold', 'with a token row now present the previous organisation is STILL the hold, not the token\'s tenant')
   assert.equal(observed.second.kind, 'unconfirmed')
   assert.equal(observed.afterSecond.counts.stamp, undefined, 'nothing stamped by the second consent')
-  assert.equal(observed.afterSecond.counts.settings, 18)
+  assert.equal(observed.afterSecond.counts.settings, 21)
   assert.equal(observed.third.kind, 'unconfirmed', 'a different organisation while held keeps the mapping too')
-  assert.deepEqual([observed.afterThird.counts.settings, observed.afterThird.counts.rateTypes, observed.afterThird.counts.chart], [18, 1, 0])
+  assert.deepEqual([observed.afterThird.counts.settings, observed.afterThird.counts.rateTypes, observed.afterThird.counts.chart], [21, 1, 0])
   assert.equal(observed.afterThird.counts.stamp, undefined)
   assert.equal(observed.ownershipHeld.state, 'unconfirmed')
   assert.equal(observed.confirmed.ok, true)
@@ -258,7 +258,7 @@ test('o3d-6thk1 (real tables): the HOLD is persisted, and a token row created wh
  * sync toggle, stamp, hold.
  */
 type Post = { chart: number; taxTypes: number; rcTypes: number; drift: number; payMap: number; roles: number; sync: string | undefined; stamp: 'prev' | 'new' | undefined; hold: boolean }
-const KEPT_ALL = (mapped: boolean): Pick<Post, 'taxTypes' | 'rcTypes' | 'payMap' | 'roles'> => mapped ? { taxTypes: 2, rcTypes: 2, payMap: 1, roles: 15 } : { taxTypes: 0, rcTypes: 0, payMap: 0, roles: 0 }
+const KEPT_ALL = (mapped: boolean): Pick<Post, 'taxTypes' | 'rcTypes' | 'payMap' | 'roles'> => mapped ? { taxTypes: 2, rcTypes: 2, payMap: 1, roles: 18 } : { taxTypes: 0, rcTypes: 0, payMap: 0, roles: 0 }
 const BRANCHES: Array<{ name: string; previous: 'stamp' | 'token' | 'unknown' | 'hold'; mapped: boolean; to: 'same' | 'other'; kind: string; expect: Post }> = [
   { name: 'known same (stamp), mapped', previous: 'stamp', mapped: true, to: 'same', kind: 'none', expect: { chart: 1, ...KEPT_ALL(true), drift: 3, sync: 'true', stamp: 'prev', hold: false } },
   { name: 'known same (token row), mapped', previous: 'token', mapped: true, to: 'same', kind: 'none', expect: { chart: 1, ...KEPT_ALL(true), drift: 3, sync: 'true', stamp: 'prev', hold: false } },
@@ -327,10 +327,31 @@ test('o3d-6thk1 (real tables): EVERY branch x EVERY store, table-driven', { skip
     assert.equal(observed.pre.chart, 1, `${branch.name}: PRECONDITION: a chart is cached`)
     assert.equal(observed.pre.drift, 3, `${branch.name}: PRECONDITION: a drift snapshot exists`)
     assert.equal(observed.pre.sync, 'true', `${branch.name}: PRECONDITION: sync is on`)
-    assert.equal(observed.pre.roles, branch.mapped ? 15 : 0, `${branch.name}: PRECONDITION: mapping ${branch.mapped ? 'present' : 'absent'}`)
+    assert.equal(observed.pre.roles, branch.mapped ? 18 : 0, `${branch.name}: PRECONDITION: mapping ${branch.mapped ? 'present' : 'absent'}`)
     assert.equal(observed.outcome.kind, branch.kind, `${branch.name}: outcome`)
     assert.deepEqual(observed.post, branch.expect, `${branch.name}: post-state of every store`)
   }
   console.log(`# o3d-6thk1 branch x store: ${results.length} branches\n${results.map((r) => `#   ${r.name}: ${r.kind} -> ${JSON.stringify(r.post)}`).join('\n')}`)
   assert.equal(results.length, BRANCHES.length)
+})
+
+test('a rate that holds ONLY a scheme posting type (no charged type) is an organisation-owned mapping and is cleared on a change of organisation', { skip }, async () => {
+  const run = randomUUID().slice(0, 8)
+  const observed = await withRollback(async (tx) => {
+    await lockAccountingMappingSelection(tx, 'xero')
+    await tx.setting.deleteMany({ where: { key: { in: [...XERO_ACCOUNT_MAPPING_KEYS, ...DERIVED, 'xero_sync_enabled', XERO_ACCOUNT_MAPPING_TENANT_KEY] } } })
+    await tx.accountingToken.deleteMany({ where: { connector: 'xero' } })
+    await tx.taxRate.updateMany({ data: { accountingTaxType: null, schemePostingTaxType: null } })
+    await tx.taxRateComponent.updateMany({ data: { accountingTaxType: null } })
+    await tx.accountingAccount.deleteMany({ where: { connector: 'xero' } })
+    await tx.setting.create({ data: { key: XERO_ACCOUNT_MAPPING_TENANT_KEY, value: `tenant-A-${run}` } })
+    const rate = await tx.taxRate.create({ data: { name: `s-${run}`, rate: '0.2', schemePostingTaxType: `TAXA-${run}`, reportingCategory: 'IOSS' } })
+    const previous = await readPreviousMappingOrganisation(tx, 'xero')
+    const outcome = await resetAccountMappingForOrganisationChange(tx, { previous, newTenantId: `tenant-B-${run}`, connector: 'xero' })
+    const after = await tx.taxRate.findUnique({ where: { id: rate.id } })
+    return { outcome, after }
+  })
+  assert.equal(observed.outcome.kind, 'cleared', 'a scheme posting type alone is a mapping')
+  assert.equal(observed.after.schemePostingTaxType, null)
+  assert.equal(observed.after.reportingCategory, 'IOSS', 'the marker is not an organisation code and stays')
 })

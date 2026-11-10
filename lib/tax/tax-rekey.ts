@@ -28,7 +28,7 @@
  * the invoice falls back to the order default's code, so the enqueue guard refuses a payload bound to a cleared rate (missing_tax_code) until someone maps it.
  *
  * WHAT THE DIGEST BINDS: the plan (rows, outcomes, targets, report types, cleared components, counts, the clear choice, the list digest) AND every posting-relevant field copied to the new row
- * (each row's `copied`: type, taxCategory, isCompound, reverseCharge, reportingCategory and the full snapshot of every component - name, rate, compounding, code, active flag, order). A toggle of
+ * (each row's `copied`: type, taxCategory, isCompound, reverseCharge, reportingCategory, schemePostingTaxType and the full snapshot of every component - name, rate, compounding, code, active flag, order). A toggle of
  * any of them between the preview and the apply is a DIGEST_MISMATCH. The row locks held from before the plan is built and the comparison of the old row after its deactivation stay as belt and braces.
  *
  * THE APPLY (explicit). `confirm` must be the digest of the plan the operator saw. In ONE transaction inside the Xero connection fence (the lock #797's import takes, so a rebind or a second
@@ -120,6 +120,8 @@ export interface RekeyImsRate {
   isCompound?: boolean
   reverseCharge?: boolean
   reportingCategory?: string | null
+  /** The zero-rated Xero type a scheme (IOSS/VOEC) sale posts on (TaxRate.schemePostingTaxType): copied to the replacement, so a re-key never drops it. */
+  schemePostingTaxType?: string | null
   /** Copied to the replacement (writeTaxRekey) and so bound by the plan digest. Optional so a fixture may omit them. */
   type?: string | null
   taxCategory?: string | null
@@ -133,6 +135,7 @@ export interface RekeyCopiedFields {
   isCompound: boolean
   reverseCharge: boolean
   reportingCategory: string | null
+  schemePostingTaxType: string | null
   /** In copy order (sortOrder, id): the FULL snapshot of each component, not just count / rate / compound / active. */
   components: Array<{ sortOrder: number; name: string; rate: string; compoundOnPrevious: boolean; accountingTaxType: string | null; active: boolean }>
 }
@@ -272,6 +275,7 @@ export function imsMeaningDifference(a: RekeyImsRate, b: RekeyImsRate): string |
   if ((a.isCompound ?? false) !== (b.isCompound ?? false)) return 'isCompound'
   if ((a.reverseCharge ?? false) !== (b.reverseCharge ?? false)) return 'reverseCharge'
   if ((a.reportingCategory ?? null) !== (b.reportingCategory ?? null)) return 'reportingCategory'
+  if ((a.schemePostingTaxType ?? null) !== (b.schemePostingTaxType ?? null)) return 'schemePostingTaxType'
   return null
 }
 /**
@@ -307,7 +311,7 @@ export function matchRekeyRates(input: { rates: readonly RekeyImsRate[]; xero: r
       imsRateId: rate.id, name: rate.name, usedFor: rate.usedFor, countryCode: rate.countryCode, currentCode,
       imsPercent: column.toFixed(), imsEffectivePercent: effective.eq(column) ? null : effective.toFixed(),
       copied: {
-        type: rate.type ?? null, taxCategory: rate.taxCategory ?? null, isCompound: rate.isCompound ?? false, reverseCharge: rate.reverseCharge ?? false, reportingCategory: rate.reportingCategory ?? null,
+        type: rate.type ?? null, taxCategory: rate.taxCategory ?? null, isCompound: rate.isCompound ?? false, reverseCharge: rate.reverseCharge ?? false, reportingCategory: rate.reportingCategory ?? null, schemePostingTaxType: rate.schemePostingTaxType ?? null,
         components: rate.components.map((c, index) => ({ sortOrder: c.sortOrder ?? index, name: c.name ?? '', rate: new Dec(c.rate).toFixed(4), compoundOnPrevious: c.compoundOnPrevious, accountingTaxType: c.accountingTaxType ?? null, active: c.active })),
       },
     }
@@ -497,14 +501,14 @@ async function referencesOf(client: Client, row: RekeyRow, rate: RekeyImsRate): 
     pendingRefundSnapshots(client, row.currentCode),
     client.taxRate.findMany({
       where: { accountingTaxType: row.currentCode, id: { not: row.imsRateId } },
-      select: { id: true, name: true, rate: true, usedFor: true, countryCode: true, isCompound: true, reverseCharge: true, reportingCategory: true, accountingTaxType: true, components: { select: { rate: true, compoundOnPrevious: true, active: true, sortOrder: true } } },
+      select: { id: true, name: true, rate: true, usedFor: true, countryCode: true, isCompound: true, reverseCharge: true, reportingCategory: true, schemePostingTaxType: true, accountingTaxType: true, components: { select: { rate: true, compoundOnPrevious: true, active: true, sortOrder: true } } },
     }),
   ])
   // ANY other carrier of the old code (active or not) that differs in ANY posting meaning makes a stored snapshot of the code ambiguous: the snapshot is then not migrated.
   const refundSnapshotConflict = sharing.some((other) => other.id !== row.imsRateId && other.accountingTaxType === row.currentCode
     && imsMeaningDifference(rate, {
       id: other.id, name: other.name, rate: other.rate.toFixed(4), usedFor: other.usedFor, countryCode: other.countryCode, accountingTaxType: other.accountingTaxType, isDefault: false,
-      isCompound: other.isCompound, reverseCharge: other.reverseCharge, reportingCategory: other.reportingCategory,
+      isCompound: other.isCompound, reverseCharge: other.reverseCharge, reportingCategory: other.reportingCategory, schemePostingTaxType: other.schemePostingTaxType,
       components: (other.components ?? []).map((c) => ({ rate: c.rate.toFixed(4), compoundOnPrevious: c.compoundOnPrevious, active: c.active, sortOrder: c.sortOrder })),
     }) !== null)
   return {
@@ -532,12 +536,12 @@ export async function readRekeyPlan(client: Client, options: { now: Date; connec
   }
   const stored = await client.taxRate.findMany({
     where: { active: true },
-    select: { id: true, name: true, rate: true, type: true, taxCategory: true, usedFor: true, countryCode: true, accountingTaxType: true, isDefault: true, isCompound: true, reverseCharge: true, reportingCategory: true, components: { select: { name: true, rate: true, compoundOnPrevious: true, accountingTaxType: true, active: true, sortOrder: true }, orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } },
+    select: { id: true, name: true, rate: true, type: true, taxCategory: true, usedFor: true, countryCode: true, accountingTaxType: true, isDefault: true, isCompound: true, reverseCharge: true, reportingCategory: true, schemePostingTaxType: true, components: { select: { name: true, rate: true, compoundOnPrevious: true, accountingTaxType: true, active: true, sortOrder: true }, orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } },
     orderBy: [{ name: 'asc' }, { id: 'asc' }],
   })
   const rates: RekeyImsRate[] = stored.map((r) => ({
     id: r.id, name: r.name, rate: r.rate.toFixed(4), usedFor: r.usedFor, countryCode: r.countryCode, accountingTaxType: r.accountingTaxType, isDefault: r.isDefault,
-    isCompound: r.isCompound, reverseCharge: r.reverseCharge, reportingCategory: r.reportingCategory, type: r.type, taxCategory: r.taxCategory,
+    isCompound: r.isCompound, reverseCharge: r.reverseCharge, reportingCategory: r.reportingCategory, schemePostingTaxType: r.schemePostingTaxType, type: r.type, taxCategory: r.taxCategory,
     components: r.components.map((c) => ({ name: c.name, rate: c.rate.toFixed(4), compoundOnPrevious: c.compoundOnPrevious, accountingTaxType: c.accountingTaxType, active: c.active, sortOrder: c.sortOrder })),
   }))
   const matched = matchRekeyRates({ rates, xero: read.list.rows })
@@ -596,7 +600,9 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
     const fresh = await tx.taxRate.create({
       data: {
         name: old.name, rate: old.rate, type: old.type, taxCategory: old.taxCategory, usedFor: old.usedFor, accountingTaxType: toCode, countryCode: old.countryCode,
-        isCompound: old.isCompound, reverseCharge: old.reverseCharge, reportingCategory: old.reportingCategory, active: true, isDefault: old.isDefault,
+        isCompound: old.isCompound, reverseCharge: old.reverseCharge, // A CLEAR replacement has NO tax code, and the scheme posting type is the same organisation's code (and IOSS/VOEC means something only with that type): it carries neither.
+        reportingCategory: row.outcome === 'CLEAR' && ['IOSS', 'VOEC'].includes((old.reportingCategory ?? '').trim().toUpperCase()) ? null : old.reportingCategory,
+        schemePostingTaxType: row.outcome === 'CLEAR' ? null : old.schemePostingTaxType, active: true, isDefault: old.isDefault,
         components: old.components.length === 0 ? undefined : {
           create: old.components.map((c) => ({ name: c.name, rate: c.rate, compoundOnPrevious: c.compoundOnPrevious, accountingTaxType: row.outcome === 'CLEAR' ? null : row.clearedComponents.some((x) => x.sortOrder === c.sortOrder && x.taxType === c.accountingTaxType) ? null : c.accountingTaxType, sortOrder: c.sortOrder, active: c.active })),
         },
@@ -608,7 +614,7 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
     // Belt and braces behind the row locks the apply holds: the row as it stands after the deactivation (which waits for anything still holding the row) must be what was copied.
     const after = await tx.taxRate.findUniqueOrThrow({ where: { id: old.id }, include: { components: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } } })
     const sameMeaning = after.rate.equals(old.rate) && after.name === old.name && after.usedFor === old.usedFor && after.countryCode === old.countryCode && after.isCompound === old.isCompound && after.reverseCharge === old.reverseCharge
-      && after.reportingCategory === old.reportingCategory && after.components.length === old.components.length && after.components.every((c, i) => c.rate.equals(old.components[i]!.rate) && c.compoundOnPrevious === old.components[i]!.compoundOnPrevious && c.active === old.components[i]!.active)
+      && after.reportingCategory === old.reportingCategory && after.schemePostingTaxType === old.schemePostingTaxType && after.components.length === old.components.length && after.components.every((c, i) => c.rate.equals(old.components[i]!.rate) && c.compoundOnPrevious === old.components[i]!.compoundOnPrevious && c.active === old.components[i]!.active)
     if (!sameMeaning) throw new RekeyDocumentRaceError(row.imsRateId)
     // The UPDATE above waited for every writer that holds a share lock on the old row (lib/tax/writable-tax-rate.ts). A document such a writer committed meanwhile references the old row:
     // without the flag that is a source the plan did not count, so the apply stops (and rolls back); with it, the re-pointing below picks it up.

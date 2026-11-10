@@ -387,6 +387,20 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       '`revenue` is the Xero can-apply-to flag of a tax type (canApply.revenue: it may be applied to revenue accounts), read to decide whether a type is a sales type. A boolean on a tax-rate definition, not a figure; no refund moves it.',
   },
   {
+    file: 'lib/tax/eu-vat-preflight.ts',
+    figures: ['revenue'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      '`revenue` is the Xero can-apply-to flag of a tax type (canApply.revenue: it may be applied to revenue accounts), read to require that a declared tax type is a sales type. A boolean on a tax-rate definition, not a figure; no refund moves it.',
+  },
+  {
+    file: 'lib/connectors/xero/scheme-posting-drift.ts',
+    figures: ['revenue'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      '`revenue` is the Xero can-apply-to flag of a tax type (canApply.revenue), read to report a declared scheme posting type that cannot be applied to revenue accounts. A boolean on a tax-rate definition, not a figure; no refund moves it.',
+  },
+  {
     file: 'lib/reconciliation-pack/constants.ts',
     figures: ['xero_unearned_revenue_account'],
     treatment: 'not-refund-sensitive',
