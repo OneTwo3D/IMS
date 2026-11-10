@@ -626,3 +626,18 @@ test('a re-point is refused while a stock sync for the binding is running; edits
     }
   }
 })
+
+test('a save is refused when only the pairing stamp moved (the binding was pointed away and back)', async () => {
+  const { saveMintsoftBinding } = await loadActions()
+  reset()
+  existingBindingRow = { ...BASE_BINDING, connectionId: 'conn-1', pairingChangedAt: new Date('2026-11-01T00:00:00Z') }
+  const staleRead = { ...existingBindingRow }
+  onBindingLock = () => {
+    onBindingLock = null
+    existingBindingRow = { ...staleRead, pairingChangedAt: new Date('2026-11-03T00:00:00Z') }
+  }
+  const result = await saveMintsoftBinding({ id: 'bind-1', warehouseId: 'wh-1', externalWarehouseId: '7', active: true, stockSyncMode: 'NOTIFICATION_ONLY', syncFrequencyMinutes: 15 })
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /changed while you were saving/)
+  assert.equal(bindingUpdates.length, 0)
+})

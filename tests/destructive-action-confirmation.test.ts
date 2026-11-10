@@ -365,3 +365,32 @@ test('a fresh dry run for the new pairing is accepted after a re-point', async (
   assert.deepEqual(result, { success: true })
   assert.equal(bindingUpdates.length, 1)
 })
+
+test('a concurrent change of ONLY the connection, or ONLY the pairing stamp (A -> B -> A), also refuses the confirmation', async () => {
+  const { confirmMintsoftAlignmentMode } = await import('@/app/actions/mintsoft-sync')
+  for (const [name, change] of [
+    ['connection only', { connectionId: 'conn-2' }],
+    ['stamp only (pointed away and back)', { pairingChangedAt: new Date('2026-11-03T00:00:00Z') }],
+  ] as const) {
+    reset()
+    bindingRow = alignBinding()
+    betweenReadAndWrite = () => { bindingRow = { ...bindingRow!, ...change } }
+    const result = await confirmMintsoftAlignmentMode('bind-1', { confirmed: true, typedName: 'MIL1' })
+    assert.equal(result.success, false, name)
+    assert.deepEqual(bindingUpdates, [], name)
+  }
+})
+
+test('a confirmation naming MORE rows than are failed now is refused, and a null row id is a bulk request that needs the confirmation', async () => {
+  reset()
+  failedIds = ['a', 'b']
+  for (const [name, retry] of await entryPoints()) {
+    const superset = await retry(undefined, undefined, { confirmed: true, rowIds: ['a', 'b', 'c'] } as never)
+    assert.equal(superset.success, false, name)
+    // A JavaScript caller can pass null for "no id"; it must not skip the bulk guard.
+    const viaNull = await retry(null as never, undefined, undefined)
+    assert.equal(viaNull.success, false, name)
+    assert.equal(viaNull.code, CONFIRMATION_REQUIRED_CODE, name)
+  }
+  assert.deepEqual(candidateQueries, [])
+})
