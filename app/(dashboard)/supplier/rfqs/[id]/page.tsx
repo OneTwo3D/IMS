@@ -26,7 +26,7 @@ export default async function SupplierRfqDetailPage({ params }: Props) {
         </Link>
         <h1 className="text-2xl font-semibold font-mono">{data.po.reference}</h1>
         <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-yellow-100 text-yellow-800">
-          {data.po.status === 'RFQ_SENT' ? 'Awaiting Quote' : data.po.status}
+          {data.po.status === 'RFQ_SENT' ? 'Awaiting Quote' : data.po.status === 'QUOTE_RECEIVED' ? 'Quote Submitted' : data.po.status}
         </span>
       </div>
       <SupplierRfqClient po={data.po} lines={data.lines} />

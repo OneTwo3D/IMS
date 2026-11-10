@@ -44,8 +44,9 @@ export function SupplierRfqClient({ po, lines }: Props) {
         shippingMethod: shippingMethod.trim(),
       })
       if (result.success) {
+        // No router.refresh(): the action has already revalidated the route, and the RFQ is
+        // now QUOTE_RECEIVED, which the detail page serves read-only. Keep the confirmation.
         setSuccess(true)
-        router.refresh()
       } else {
         setError(result.error ?? 'Failed')
       }
@@ -62,10 +63,16 @@ export function SupplierRfqClient({ po, lines }: Props) {
     )
   }
 
-  const canQuote = po.status === 'RFQ_SENT' || po.status === 'DRAFT'
+  const canQuote = po.status === 'RFQ_SENT'
 
   return (
     <div className="space-y-6">
+      {po.status === 'QUOTE_RECEIVED' && (
+        <div className="rounded-md border p-4 text-sm text-muted-foreground">
+          Your quote for {po.reference} has been submitted and is awaiting review by the buyer.
+        </div>
+      )}
+
       {/* Line items */}
       <div className="rounded-md border">
         <div className="px-4 py-2 bg-muted/50 border-b">

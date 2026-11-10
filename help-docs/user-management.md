@@ -124,7 +124,7 @@ The system includes a role-based access control (RBAC) layer defined in `lib/per
 
 Users with the **Supplier** role access a dedicated portal with its own navigation:
 
-- **RFQs** — view requests for quotation and submit quotes (with prices, quantities, PO number, delivery date, and shipping details)
+- **RFQs** — view requests for quotation that the buyer has sent (never drafts) and submit quotes (with prices, quantities, PO number, delivery date, and shipping details)
 - **Purchase Orders** — view purchase orders addressed to their supplier company
 - **My Products** — view products linked to their supplier (without financial data such as prices, margins, or COGS)
 
@@ -133,7 +133,7 @@ Supplier users are linked to a supplier company record. They cannot access price
 Two separate controls keep a supplier inside its own data, and they are not substitutes for one another:
 
 - **Outside the portal**, a supplier is refused entirely. The internal purchasing, sales, inventory and settings endpoints require a permission no supplier holds, so a supplier session cannot read another company's orders even by calling the endpoint directly.
-- **Inside the portal**, a permission proves nothing — every supplier holds the same supplier-portal permissions. Each query is therefore filtered by the signed-in user's own supplier id, and any record fetched by id is re-checked for ownership before it is returned. Asking for another supplier's RFQ by id returns nothing.
+- **Inside the portal**, a permission proves nothing — every supplier holds the same supplier-portal permissions. Each query is therefore filtered by the signed-in user's own supplier id, and any record fetched by id is re-checked for ownership before it is returned. Asking for another supplier's RFQ by id returns nothing, and neither does asking for a purchase order that has not been sent yet.
 
 
 ## Sessions

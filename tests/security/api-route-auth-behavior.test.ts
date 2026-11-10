@@ -830,11 +830,9 @@ test('supplier RFQ route allows own RFQ PDFs and rejects foreign RFQs', async ()
     hasPermission() {
       return false
     },
-    async findSupplierOwnedPurchaseOrder(id: string, supplierId: string) {
-      return id === 'rfq-owned' && supplierId === 'supplier-owned' ? { id } : null
-    },
-    async findPurchaseOrder(id: string) {
+    async findPurchaseOrder(id: string, supplierId?: string) {
       findPurchaseOrderCalls.push(id)
+      if (!(id === 'rfq-owned' && supplierId === 'supplier-owned')) return null
       return {
         reference: 'PO-001',
         currency: 'GBP',
@@ -880,7 +878,7 @@ test('supplier RFQ route allows own RFQ PDFs and rejects foreign RFQs', async ()
   const foreign = await handleRfqGet({ id: 'rfq-foreign' }, dependencies)
   assert.equal(foreign.status, 403)
   assert.deepEqual(await foreign.json(), { error: 'Forbidden' })
-  assert.deepEqual(findPurchaseOrderCalls, ['rfq-owned'])
+  assert.deepEqual(findPurchaseOrderCalls, ['rfq-owned', 'rfq-foreign'])
 })
 
 test('supplier RFQ route rejects supplier sessions without supplier ownership context', async () => {
@@ -892,7 +890,6 @@ test('supplier RFQ route rejects supplier sessions without supplier ownership co
       async authorize() {
         return session('SUPPLIER', { supplierId: null })
       },
-      findSupplierOwnedPurchaseOrder: unreachableAsync('findSupplierOwnedPurchaseOrder'),
       findPurchaseOrder: unreachableAsync('findPurchaseOrder'),
       renderPdf: unreachableAsync('renderPdf'),
     },
@@ -914,7 +911,6 @@ test('supplier RFQ route rejects non-suppliers without purchasing permission', a
       hasPermission() {
         return false
       },
-      findSupplierOwnedPurchaseOrder: unreachableAsync('findSupplierOwnedPurchaseOrder'),
       findPurchaseOrder: unreachableAsync('findPurchaseOrder'),
       renderPdf: unreachableAsync('renderPdf'),
     },
@@ -937,11 +933,8 @@ test('supplier RFQ route allows purchasing users to fetch RFQ PDFs', async () =>
       hasPermission(role, permission) {
         return role === 'MANAGER' && permission === 'purchasing'
       },
-      async findSupplierOwnedPurchaseOrder() {
-        ownershipLookupCalled = true
-        return null
-      },
-      async findPurchaseOrder() {
+      async findPurchaseOrder(_id: string, supplierId?: string) {
+        ownershipLookupCalled = supplierId !== undefined
         return {
           reference: 'PO-002',
           currency: 'GBP',
@@ -984,9 +977,6 @@ test('supplier RFQ route returns not found when an owned RFQ is deleted before d
       async authorize() {
         return session('SUPPLIER', { supplierId: 'supplier-owned' })
       },
-      async findSupplierOwnedPurchaseOrder() {
-        return { id: 'rfq-owned' }
-      },
       async findPurchaseOrder() {
         return null
       },
@@ -994,8 +984,9 @@ test('supplier RFQ route returns not found when an owned RFQ is deleted before d
     },
   )
 
-  assert.equal(response.status, 404)
-  assert.deepEqual(await response.json(), { error: 'Not found' })
+  // One scoped read: a supplier cannot tell "gone" from "not yours / not sent".
+  assert.equal(response.status, 403)
+  assert.deepEqual(await response.json(), { error: 'Forbidden' })
 })
 
 test('supplier RFQ route adapter resolves promised params before auth enforcement', async () => {
@@ -1007,7 +998,6 @@ test('supplier RFQ route adapter resolves promised params before auth enforcemen
       async authorize() {
         return session('SUPPLIER', { supplierId: null })
       },
-      findSupplierOwnedPurchaseOrder: unreachableAsync('findSupplierOwnedPurchaseOrder'),
       findPurchaseOrder: unreachableAsync('findPurchaseOrder'),
     },
   )
