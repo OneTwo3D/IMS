@@ -25,6 +25,7 @@ let itemRows: unknown[] = []
 let emptyDetailIds = new Set<string>()
 let calls: string[] = []
 let writes: Array<{ path: string; method: string }> = []
+let cancelResponse: unknown = { ID: 0, Success: true, Message: 'Order: 1 was successfully cancelled' }
 
 mock.module('@/lib/connectors/mintsoft/settings/schema', {
   namedExports: {
@@ -78,7 +79,7 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
       const cancelMatch = pathname.match(/^\/api\/Order\/([^/]+)\/Cancel$/)
       if (cancelMatch) {
         writes.push({ path, method: 'CANCEL' })
-        return { data: { Success: true }, status: 200 }
+        return { data: cancelResponse, status: 200 }
       }
       throw new Error(`Unexpected Mintsoft path: ${path}`)
     },
@@ -102,6 +103,7 @@ function reset() {
   emptyDetailIds = new Set()
   calls = []
   writes = []
+  cancelResponse = { ID: 0, Success: true, Message: 'Order: 1 was successfully cancelled' }
 }
 
 const REF = { orderNumber: 'WC-1001', externalReference: 'REF-1001' }
@@ -151,13 +153,100 @@ test('reconcile: a merged survivor is never adopted (it holds other orders too)'
   assert.deepEqual(await reconcileMintsoftAmbiguousCreate(REF), { kind: 'NONE' })
 })
 
-test('reconcile: a FOREIGN client row rejects the read; an empty own reference adopts nothing', async () => {
+test('reconcile: Order/Search is a term search, so another client\'s row is DROPPED (not adopted, not fatal) and our own still adopts', async () => {
   reset()
   const { reconcileMintsoftAmbiguousCreate } = await push()
-  searchRows = [{ ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: 99 }]
-  await assert.rejects(() => reconcileMintsoftAmbiguousCreate(REF), /does not match configured 5/)
-  searchRows = [{ ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: '', ClientId: CLIENT }]
-  assert.equal((await reconcileMintsoftAmbiguousCreate({ orderNumber: 'WC-1001', externalReference: '' })).kind, 'UNRESOLVED')
+  searchRows = [{ ID: 1, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: 99 }]
+  assert.deepEqual(await reconcileMintsoftAmbiguousCreate(REF), { kind: 'NONE' })
+  searchRows = [
+    { ID: 1, OrderNumber: 'X-1', ExternalOrderReference: 'REF-1001', ClientId: 99 },
+    { ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT },
+  ]
+  assert.deepEqual(await reconcileMintsoftAmbiguousCreate(REF), { kind: 'ADOPT', externalOrderId: '555', externalOrderNumber: 'WC-1001' })
+})
+
+test('reconcile: a row with no ClientId means ownership cannot be shown - nothing is adopted', async () => {
+  reset()
+  const { reconcileMintsoftAmbiguousCreate } = await push()
+  searchRows = [{ ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001' }]
+  assert.equal((await reconcileMintsoftAmbiguousCreate(REF)).kind, 'UNRESOLVED')
+})
+
+test('reconcile: a FULL page of 10 results may be truncated - held, even when one row is exact', async () => {
+  reset()
+  const { reconcileMintsoftAmbiguousCreate } = await push()
+  searchRows = Array.from({ length: 10 }, (_, i) => ({ ID: 600 + i, OrderNumber: i === 0 ? 'WC-1001' : `OTHER-${i}`, ExternalOrderReference: i === 0 ? 'REF-1001' : `R-${i}`, ClientId: CLIENT }))
+  const result = await reconcileMintsoftAmbiguousCreate(REF)
+  assert.equal(result.kind, 'UNRESOLVED')
+  searchRows = (searchRows as unknown[]).slice(0, 9)
+  assert.equal((await reconcileMintsoftAmbiguousCreate(REF)).kind, 'ADOPT', 'control: nine rows is a complete answer')
+})
+
+test('reconcile: the order is there but CANCELLED (status 3) - never adopted', async () => {
+  reset()
+  const { reconcileMintsoftAmbiguousCreate } = await push()
+  searchRows = [{ ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 3 }]
+  const result = await reconcileMintsoftAmbiguousCreate(REF)
+  assert.equal(result.kind, 'UNRESOLVED')
+  assert.match((result as { reason: string }).reason, /CANCELLED/)
+})
+
+// ---- the live duplicate-create answer and the cancel answers (shapes taken from a live API test; no personal data) -----------------
+
+const INPUT = {
+  orderNumber: 'WC-1001', externalReference: 'REF-1001', externalWarehouseId: '3', currency: 'GBP', email: 'a@example.com', phone: null, vatNumber: null,
+  comments: null, courierService: 'DPD', totalVat: 0, shippingExVat: 0, shippingVat: 0, discountExVat: 0, discountVat: 0,
+  lines: [{ sku: 'SKU-1', quantity: 1, unitPriceExVat: 10, unitPriceVat: 2, description: 'Widget' }],
+  shippingAddress: { firstName: 'A', lastName: 'B', company: '', address1: '1 St', address2: '', town: 'T', county: '', postCode: 'PC1', country: 'GB' },
+}
+const LIVE_DUPLICATE = [{ ID: 0, Success: false, OrderId: 0, OrderStatusId: 0, Message: 'Order Number already exists!' }]
+
+test('live duplicate answer: the existing LIVE order (backordered, status 9) is bound', async () => {
+  reset()
+  const { pushMintsoftOrder } = await push()
+  createResult = LIVE_DUPLICATE
+  searchRows = [{ ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 9 }]
+  assert.equal((await pushMintsoftOrder(INPUT as never)).externalOrderId, '900')
+})
+
+test('live duplicate answer: a CANCELLED order keeps its number - IMS refuses to bind to it and the push fails for an operator', async () => {
+  reset()
+  const { pushMintsoftOrder } = await push()
+  createResult = LIVE_DUPLICATE
+  searchRows = [{ ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 3 }]
+  await assert.rejects(() => pushMintsoftOrder(INPUT as never), /holding it is CANCELLED in Mintsoft/)
+})
+
+test('cancel: a BACKORDERED order (status 9) is cancellable, and the answer is a fresh cancellation', async () => {
+  reset()
+  const { cancelMintsoftOrder } = await push()
+  details.set('900', { ID: 900, OrderNumber: 'WC-1001', ClientId: CLIENT, OrderStatusId: 9 })
+  assert.deepEqual(await cancelMintsoftOrder('900'), { cancelled: true, status: 'CANCELLED' })
+  assert.equal(writes.filter((w) => w.method === 'CANCEL').length, 1)
+})
+
+test('cancel: an already CANCELLED order (status 3) is ALREADY_CANCELLED - distinct from a fresh cancel, and /Cancel is not called', async () => {
+  reset()
+  const { cancelMintsoftOrder } = await push()
+  details.set('900', { ID: 900, OrderNumber: 'WC-1001', ClientId: CLIENT, OrderStatusId: 3 })
+  assert.deepEqual(await cancelMintsoftOrder('900'), { cancelled: false, status: 'ALREADY_CANCELLED' })
+  assert.deepEqual(writes, [])
+})
+
+test('cancel: a cancel that races an earlier one (Success:true "was already cancelled") is not reported as a fresh cancellation', async () => {
+  reset()
+  const { cancelMintsoftOrder } = await push()
+  details.set('900', { ID: 900, OrderNumber: 'WC-1001', ClientId: CLIENT, OrderStatusId: 1 })
+  cancelResponse = { ID: 0, Success: true, Message: 'Order: 1 was already cancelled' }
+  assert.deepEqual(await cancelMintsoftOrder('900'), { cancelled: false, status: 'ALREADY_CANCELLED' })
+})
+
+test('cancel: any other status is still NOT_CANCELLABLE and nothing is sent', async () => {
+  reset()
+  const { cancelMintsoftOrder } = await push()
+  details.set('900', { ID: 900, OrderNumber: 'WC-1001', ClientId: CLIENT, OrderStatusId: 5 })
+  assert.deepEqual(await cancelMintsoftOrder('900'), { cancelled: false, status: 'NOT_CANCELLABLE' })
+  assert.deepEqual(writes, [])
 })
 
 test('reconcile: an unconfigured tenant fails closed before any request', async () => {

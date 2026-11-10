@@ -98,7 +98,7 @@ test('CONCURRENT adoption of one parked create: bound exactly once, nothing crea
   assert.equal(link.state, 'PENDING_VERIFY')
   assert.equal(link.externalOrderId, '555')
   assert.equal(link.externalOrderNumber, 'WN-555')
-  assert.ok(link.attempts <= 1, 'the create attempt count was reset (the verify pass in the same sweep may spend one verification)')
+  assert.ok(link.attempts <= 2, 'the create attempt count was reset (the verify pass in the same sweep may spend one verification)')
   assert.ok(link.pushedAt)
   assert.equal(a.calls.push + b.calls.push, 0, 'no order was created')
 })

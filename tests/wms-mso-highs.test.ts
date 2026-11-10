@@ -481,3 +481,18 @@ test('R2-2: an undelivered note is RETRIED on a later sweep with the same text, 
   assert.equal(r2.noticeCommentsRetried, undefined)
   assert.deepEqual(again.updates, [])
 })
+
+test('live: an ALREADY_CANCELLED Mintsoft order satisfies the cancel pass (CANCELLED), but is a hold-pass notice (it keeps its number, so it cannot be re-created)', async () => {
+  const cancel = makePort({ cancellable: [{ id: 'link-1', orderId: 'so-2', externalOrderId: 'c-1' }] })
+  const wms = connector({ cancelOrder: async () => ({ cancelled: false, status: 'ALREADY_CANCELLED' }) })
+  const r = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', cancel.port, { now: NOW }))
+  assert.equal(r.cancelled, 1)
+  assert.equal(cancel.updates[0].data.state, 'CANCELLED')
+  assert.match(String(cancel.events.find((e) => e.action === 'order_cancel')?.summary), /already cancelled/)
+  const hold = makePort({ holdable: [{ id: 'link-1', orderId: 'so-2', externalOrderId: 'c-1' }] })
+  const r2 = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', hold.port, { now: NOW }))
+  assert.equal(r2.held, 0)
+  assert.equal(r2.operatorNotices, 1)
+  assert.notEqual(hold.updates[0].data.state, 'HELD')
+  assert.equal(hold.updates[0].data.cancelledAt, undefined)
+})

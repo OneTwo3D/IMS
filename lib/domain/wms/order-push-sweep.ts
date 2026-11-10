@@ -2252,7 +2252,7 @@ export async function runWmsOrderPushSweepCore(
             })
             if (!pullBack.proceed) shadowedCount += 1
             const cancel = pullBack.proceed ? await connector.cancelOrder?.(push.externalOrderId, pullBack.clearance) : undefined
-            const pulled = Boolean(cancel && (cancel.cancelled || cancel.status === 'NOT_FOUND'))
+            const pulled = Boolean(cancel && (cancel.cancelled || cancel.status === 'NOT_FOUND' || cancel.status === 'ALREADY_CANCELLED'))
             if (pulled) {
               // CANCELLED for an approved withdrawal — there is nothing to
               // release later. HELD only for a submitted one, which an
@@ -2516,7 +2516,7 @@ export async function runWmsOrderPushSweepCore(
               continue
             }
             const cancel = await connector.cancelOrder?.(link.externalOrderId, verifiedPullBack.clearance)
-            pulled = Boolean(cancel && (cancel.cancelled || cancel.status === 'NOT_FOUND'))
+            pulled = Boolean(cancel && (cancel.cancelled || cancel.status === 'NOT_FOUND' || cancel.status === 'ALREADY_CANCELLED'))
             cancelConfirmed = cancel?.cancelled === true
           } catch (e) {
             console.error(`[wms-order-push] verified-then-withdrawn cancel failed for ${link.orderId}: ${scrubWmsError(e, 'cancel failed')}`)
@@ -2796,6 +2796,15 @@ export async function runWmsOrderPushSweepCore(
             { wmsStatus: 'NOT_FOUND', summary: 'IMS hold could not be confirmed: the WMS order was not found — left for an operator', comment: null }, ts)
           continue
         }
+        // Already cancelled in Mintsoft (by the warehouse, or an earlier attempt). Not a cancellation IMS made, and a cancelled order keeps
+        // its number so the release pass could never re-create it: a person has to decide.
+        if (cancel.status === 'ALREADY_CANCELLED') {
+          await raiseWmsRefusalNotice(link, 'HOLD',
+            `Held in IMS, but WMS order ${link.externalOrderId} is already CANCELLED in the WMS and keeps its order number, so it cannot be re-created when the hold is lifted. `
+            + 'IMS has NOT recorded it as held — decide with the warehouse what should happen to this order.',
+            { wmsStatus: 'ALREADY_CANCELLED', summary: 'IMS hold: the WMS order was already cancelled — left for an operator', comment: null }, ts)
+          continue
+        }
         if (cancel.cancelled) {
           // o3d-2k5r r6 — WHAT THIS WRITE RECORDS IS NOW THE DIFFERENCE BETWEEN THE TWO.
           //
@@ -2903,12 +2912,13 @@ export async function runWmsOrderPushSweepCore(
             { wmsStatus: 'NOT_FOUND', summary: 'IMS cancel could not be confirmed: the WMS order was not found — left for an operator', comment: null }, ts)
           continue
         }
-        if (cancel.cancelled) {
+        if (cancel.cancelled || cancel.status === 'ALREADY_CANCELLED') {
+          // ALREADY_CANCELLED: the WMS order is cancelled, which is what the cancel pass wants; the audit says it was not IMS's cancellation.
           await port.updateLink(link.id, { state: 'CANCELLED', cancelledAt: ts, lastError: null, lastAttemptAt: ts , reconcileCheckedAt: null })
           result.cancelled += 1
           await audit({
             action: 'order_cancel', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
-            summary: 'IMS-cancelled/fully-refunded order cancelled in the WMS',
+            summary: cancel.status === 'ALREADY_CANCELLED' ? 'IMS-cancelled/fully-refunded order was already cancelled in the WMS' : 'IMS-cancelled/fully-refunded order cancelled in the WMS',
             before: { state: 'SYNCED', externalOrderId: link.externalOrderId },
             after: { state: 'CANCELLED', wmsCancelStatus: cancel.status },
           })

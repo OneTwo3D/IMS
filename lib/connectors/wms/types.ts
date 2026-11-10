@@ -493,7 +493,7 @@ export type WmsOrderPushResult = WmsOrderPushProvenResult | WmsOrderPushUnverifi
 
 export type WmsOrderCancelResult = {
   cancelled: boolean
-  /** WMS status observed; a non-NEW order is not cancellable and is left as-is. */
+  /** WMS status observed; a non-cancellable order is left as-is. ALREADY_CANCELLED: the WMS order was cancelled before this call (not a cancellation this call made). */
   status: string
 }
 
