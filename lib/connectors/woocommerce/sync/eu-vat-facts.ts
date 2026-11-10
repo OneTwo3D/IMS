@@ -8,7 +8,8 @@
  *    threshold, and the configured VAT accounts.
  *
  * EVERY ORDER META IS ABSENT-ABLE. Which of `vat_compliance_vat_paid`, `is_vat_exempt`, `easproj_payload`, `_o3d_ioss_vat_account` and `_o3d_is_voucher` the REST API exposes has not been
- * established on the live store, so a missing or unreadable one reads as absent. Only `is_vat_exempt` (B2B) and `_o3d_ioss_vat_account` (credit notes) change an outcome when absent, and neither refuses.
+ * established on the live store, so each is read with an explicit UNKNOWN state, never as "no". The resolver decides what unknown means: a missing `is_vat_exempt` on an EU-27 order with no scheme VAT, an unflagged goods line that could decide the regime (decide mode) and a missing
+ * `_o3d_ioss_vat_account` on a scheme order (adopt mode) all refuse; the others (the VAT record, EAS) only cross-check.
  * An EU VAT record that is present but EMPTY (no rates; it is sometimes empty at checkout) reads as absent: a present, non-empty record that disagrees with the tax lines refuses, an absent one does not.
  */
 import { Prisma } from '@/app/generated/prisma/client'
@@ -74,21 +75,43 @@ export function readEasFact(order: Pick<WcFullOrder, 'meta_data'>): EasFact {
   return { state: 'present', merchandiseVatExcl: merchandise, currency: currencyText(payload.payment_currency) }
 }
 
-/** The plugin's own conversion record. Present only when the rate and the pair are both readable; the threshold value is carried when readable. */
+/** The marker the plugin appends to `_o3d_ioss_reason` when FX meta already existed and differed from its decision, so it kept the old values. */
+export const PLUGIN_FX_CONFLICT_MARKER = 'FX meta already present and different from this decision'
+
+export function readPluginFxConflict(order: Pick<WcFullOrder, 'meta_data'>): boolean {
+  const reason = metaValue(order.meta_data, '_o3d_ioss_reason')
+  return typeof reason === 'string' && reason.includes(PLUGIN_FX_CONFLICT_MARKER)
+}
+
+/**
+ * The plugin's own conversion record: `_o3d_ioss_fx_rate` (exact decimal string), `_o3d_ioss_fx_pair` ("GBP>EUR") and `_o3d_ioss_threshold_value` (two decimals), written together with the account.
+ * None of the three is `absent` (an order from before the plugin wrote them); all three readable is `present`; anything between is `incomplete`.
+ */
 export function readPluginFx(order: Pick<WcFullOrder, 'meta_data'>): PluginFxFact {
-  const rate = decimalText(metaValue(order.meta_data, '_o3d_ioss_fx_rate'))
-  const pairRaw = metaValue(order.meta_data, '_o3d_ioss_fx_pair')
+  const raw = ['_o3d_ioss_fx_rate', '_o3d_ioss_fx_pair', '_o3d_ioss_threshold_value'].map((key) => metaValue(order.meta_data, key))
+  const given = raw.map((value) => value !== undefined && !(typeof value === 'string' && value.trim() === ''))
+  if (given.every((g) => !g)) return { state: 'absent' }
+  const rate = decimalText(raw[0])
+  const pairRaw = raw[1]
   const pair = typeof pairRaw === 'string' && /^[A-Za-z]{3}>[A-Za-z]{3}$/.test(pairRaw.trim()) ? pairRaw.trim().toUpperCase() : null
-  if (rate === null || pair === null || !D(rate).gt(0)) return { state: 'absent' }
-  return { state: 'present', rate, pair, thresholdValue: decimalText(metaValue(order.meta_data, '_o3d_ioss_threshold_value')) }
+  const thresholdValue = decimalText(raw[2])
+  const bad = [rate === null || !D(rate).gt(0) ? 'rate' : null, pair === null ? 'pair' : null, thresholdValue === null ? 'threshold value' : null].filter((x): x is string => x !== null)
+  if (bad.length > 0) return { state: 'incomplete', detail: `${bad.join(', ')} ${given.every(Boolean) ? 'unreadable' : 'missing or unreadable'}` }
+  return { state: 'present', rate: rate!, pair: pair!, thresholdValue: thresholdValue! }
+}
+
+/** A flag value the plugin writes for "no": 'no', '0', 'false', '' (or the boolean/number forms). Anything else that is not a yes is unreadable. */
+function readFalsyFlag(value: unknown): boolean {
+  if (value === false || value === 0) return true
+  return typeof value === 'string' && ['no', '0', 'false', ''].includes(value.trim().toLowerCase())
 }
 
 export function readGoodsLines(order: Pick<WcFullOrder, 'line_items'>): GoodsLineFact[] {
   return order.line_items.map((line) => {
     const flag = (line.meta_data ?? []).find((entry) => entry.key === '_o3d_is_voucher')
     const total = decimalText(line.total) ?? '0'
-    // Only the line's own flag is read. The product-level marker (`_coupon_title`) is not on the order and IMS imports no product meta, so an unflagged gift card is goods here.
-    return { total, voucher: flag !== undefined && wcMetaFlag(flag.value) }
+    // Only the line's own flag is read. The product-level marker (`_coupon_title`) is not on the order and IMS imports no product meta, so a line with no (or an unreadable) flag is unknown and the resolver decides what that means.
+    return { total, voucher: flag === undefined ? 'unknown' : wcMetaFlag(flag.value) ? 'yes' : readFalsyFlag(flag.value) ? 'no' : 'unknown' }
   })
 }
 
@@ -113,7 +136,8 @@ export function readWcEuVatFacts(order: WcFullOrder): WcEuVatFacts {
     goodsLines: readGoodsLines(order),
     rateTax: readRateTax(order),
     orderTax: decimalText(order.total_tax) ?? '0',
-    vatExempt: exempt !== undefined && wcMetaFlag(exempt),
+    vatExempt: exempt === undefined ? 'unknown' : wcMetaFlag(exempt) ? 'yes' : readFalsyFlag(exempt) ? 'no' : 'unknown',
+    pluginFxConflict: readPluginFxConflict(order),
     vatRecord: readVatRecord(order),
     eas: readEasFact(order),
     pluginFx: readPluginFx(order),

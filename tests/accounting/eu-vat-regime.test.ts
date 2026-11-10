@@ -20,11 +20,11 @@ const plainRate = (country: string | null, rate = '0.2000', over: Partial<Extrac
 /** A German order in EUR: goods 100.00, VAT 19.00 on the DE scheme rate, plugin record agreeing, accounts configured. */
 function order(over: Partial<EuVatRegimeInput> = {}): EuVatRegimeInput {
   return {
-    mode: 'decide', pluginFx: { state: 'absent' },
+    mode: 'decide', pluginFx: { state: 'absent' }, pluginFxConflict: false,
     shippingCountry: 'DE', billingCountry: 'DE', currency: 'EUR',
-    goodsLines: [{ total: '100.00', voucher: false }],
+    goodsLines: [{ total: '100.00', voucher: 'no' }],
     rates: [{ wooRateId: 216, tax: '19.00', mapping: schemeRate('DE') }],
-    orderTax: '19.00', vatExempt: false, vatRecord: { state: 'absent' }, eas: { state: 'absent' },
+    orderTax: '19.00', vatExempt: 'no', vatRecord: { state: 'absent' }, eas: { state: 'absent' },
     thresholdFx: { state: 'ok', rate: '1', sameCurrency: true, asOf: '2026-11-01T00:00:00.000Z', source: 'same currency' },
     accounts: { ioss: '821', ddp: '232' }, pluginVatAccount: null, overThresholdDutyFee: false,
     ...over,
@@ -32,9 +32,9 @@ function order(over: Partial<EuVatRegimeInput> = {}): EuVatRegimeInput {
 }
 const scheme = (d: EuVatRegimeDecision) => { assert.equal(d.kind, 'SCHEME', JSON.stringify(d)); return d as Extract<EuVatRegimeDecision, { kind: 'SCHEME' }> }
 const refused = (d: EuVatRegimeDecision) => { assert.equal(d.kind, 'REFUSE', JSON.stringify(d)); return d as Extract<EuVatRegimeDecision, { kind: 'REFUSE' }> }
-const eurOrderOf = (value: string, over: Partial<EuVatRegimeInput> = {}) => order({ goodsLines: [{ total: value, voucher: false }], ...over })
+const eurOrderOf = (value: string, over: Partial<EuVatRegimeInput> = {}) => order({ goodsLines: [{ total: value, voucher: 'no' }], ...over })
 const nokOrderOf = (value: string, over: Partial<EuVatRegimeInput> = {}) => order({
-  shippingCountry: 'NO', billingCountry: 'NO', currency: 'NOK', goodsLines: [{ total: value, voucher: false }],
+  shippingCountry: 'NO', billingCountry: 'NO', currency: 'NOK', goodsLines: [{ total: value, voucher: 'no' }],
   rates: [{ wooRateId: 239, tax: '500.00', mapping: schemeRate('NO', { rate: '0.2500' }) }], orderTax: '500.00',
   thresholdFx: { state: 'ok', rate: '1', sameCurrency: true, asOf: '2026-11-01T00:00:00.000Z', source: 'same currency' },
   overThresholdDutyFee: false, ...over,
@@ -61,10 +61,10 @@ const boundaryRows: Array<[string, EuVatRegimeInput, 'IOSS' | 'VOEC' | 'DDP', st
   ['NOK exactly 3000.00 is VOEC', nokOrderOf('3000.00'), 'VOEC', '821'],
   ['NOK 3000.01 is DDP', nokOrderOf('3000.01'), 'DDP', '232'],
   ['a coupon-reduced line below the threshold is IOSS', eurOrderOf('149.00'), 'IOSS', '821'],
-  ['several lines add up past the threshold', order({ goodsLines: [{ total: '75.00', voucher: false }, { total: '75.01', voucher: false }] }), 'DDP', '232'],
-  ['a gift card line is not goods: 100 + a 120 gift card is IOSS', order({ goodsLines: [{ total: '100.00', voucher: false }, { total: '120.00', voucher: true }] }), 'IOSS', '821'],
-  ['GBP 130 at 1.15 EUR is 149.50: IOSS', order({ currency: 'GBP', goodsLines: [{ total: '130.00', voucher: false }], thresholdFx: { state: 'ok', rate: '1.15', sameCurrency: false, asOf: 'x', source: 'fx_rates' } }), 'IOSS', '821'],
-  ['GBP 131 at 1.15 EUR is 150.65: DDP', order({ currency: 'GBP', goodsLines: [{ total: '131.00', voucher: false }], thresholdFx: { state: 'ok', rate: '1.15', sameCurrency: false, asOf: 'x', source: 'fx_rates' } }), 'DDP', '232'],
+  ['several lines add up past the threshold', order({ goodsLines: [{ total: '75.00', voucher: 'no' }, { total: '75.01', voucher: 'no' }] }), 'DDP', '232'],
+  ['a gift card line is not goods: 100 + a 120 gift card is IOSS', order({ goodsLines: [{ total: '100.00', voucher: 'no' }, { total: '120.00', voucher: 'yes' }] }), 'IOSS', '821'],
+  ['GBP 130 at 1.15 EUR is 149.50: IOSS', order({ currency: 'GBP', goodsLines: [{ total: '130.00', voucher: 'no' }], thresholdFx: { state: 'ok', rate: '1.15', sameCurrency: false, asOf: 'x', source: 'fx_rates' } }), 'IOSS', '821'],
+  ['GBP 131 at 1.15 EUR is 150.65: DDP', order({ currency: 'GBP', goodsLines: [{ total: '131.00', voucher: 'no' }], thresholdFx: { state: 'ok', rate: '1.15', sameCurrency: false, asOf: 'x', source: 'fx_rates' } }), 'DDP', '232'],
   ['GBP 200 to Norway at 13.4 NOK is 2680: VOEC', nokOrderOf('200.00', { currency: 'GBP', thresholdFx: { state: 'ok', rate: '13.4', sameCurrency: false, asOf: 'x', source: 'fx_rates' } }), 'VOEC', '821'],
   ['GBP 230 to Norway at 13.4 NOK is 3082: DDP', nokOrderOf('230.00', { currency: 'GBP', thresholdFx: { state: 'ok', rate: '13.4', sameCurrency: false, asOf: 'x', source: 'fx_rates' } }), 'DDP', '232'],
 ]
@@ -82,7 +82,7 @@ test('a scheme decision states the VAT, the zero-rated posting type and what it 
   assert.equal(d.schemePostingTaxType, 'TAX-DE')
   assert.deepEqual(d.basis, {
     source: 'ims', destination: 'DE', thresholdCurrency: 'EUR', threshold: '150', intrinsicValue: '100', convertedValue: '100.00',
-    fx: { rate: '1', sameCurrency: true, asOf: '2026-11-01T10:00:00.000Z', source: 'same currency' }, pluginFx: null, vatTotal: '19', wooRateIds: [216], imsRateIds: ['ims-DE'],
+    fx: { rate: '1', sameCurrency: true, asOf: '2026-11-01T10:00:00.000Z', source: 'same currency' }, pluginFx: notRecorded, vatTotal: '19', wooRateIds: [216], imsRateIds: ['ims-DE'],
   })
   const no = scheme(resolveEuVatRegime(nokOrderOf('1000')))
   assert.equal(no.basis.thresholdCurrency, 'NOK')
@@ -94,11 +94,11 @@ test('the destination is the shipping country, else the billing country; UK and 
   assert.equal(scheme(resolveEuVatRegime(order({ shippingCountry: null, billingCountry: 'de' }))).basis.destination, 'DE')
   // Shipping wins over billing: shipping to DE with a French billing address is a DE sale.
   assert.equal(scheme(resolveEuVatRegime(order({ shippingCountry: 'DE', billingCountry: 'FR' }))).basis.destination, 'DE')
-  assert.equal(scheme(resolveEuVatRegime(order({ shippingCountry: 'EL', billingCountry: 'EL', rates: [{ wooRateId: 1, tax: '24', mapping: schemeRate('GR') }] }))).basis.destination, 'GR')
+  assert.equal(scheme(resolveEuVatRegime(order({ shippingCountry: 'EL', billingCountry: 'EL', rates: [{ wooRateId: 1, tax: '19.00', mapping: schemeRate('GR') }] }))).basis.destination, 'GR')
 })
 
 test('Monaco is on the scheme with its own rate', () => {
-  const d = scheme(resolveEuVatRegime(order({ shippingCountry: 'MC', billingCountry: 'MC', rates: [{ wooRateId: 236, tax: '20.00', mapping: schemeRate('MC') }] })))
+  const d = scheme(resolveEuVatRegime(order({ shippingCountry: 'MC', billingCountry: 'MC', rates: [{ wooRateId: 236, tax: '19.00', mapping: schemeRate('MC') }] })))
   assert.equal(d.basis.destination, 'MC')
   assert.equal(d.basis.thresholdCurrency, 'EUR')
 })
@@ -134,10 +134,10 @@ test('skip: the Isle of Man and the Channel Islands on their own rates', () => {
 })
 
 test('B2B: an EU buyer flagged VAT-exempt with no tax is a skip that says so; Norway and Monaco are not zero-rated that way', () => {
-  const eu = resolveEuVatRegime(order({ vatExempt: true, rates: [], orderTax: '0' }))
+  const eu = resolveEuVatRegime(order({ vatExempt: 'yes', rates: [], orderTax: '0' }))
   assert.deepEqual(eu, { kind: 'SKIP', reason: 'vat_exempt_b2b', vatExemptB2b: true, warnings: [] })
   for (const country of ['NO', 'MC', 'US']) {
-    const d = resolveEuVatRegime(order({ shippingCountry: country, billingCountry: country, vatExempt: true, rates: [], orderTax: '0' }))
+    const d = resolveEuVatRegime(order({ shippingCountry: country, billingCountry: country, vatExempt: 'yes', rates: [], orderTax: '0' }))
     assert.deepEqual(d, { kind: 'SKIP', reason: 'no_scheme_vat', vatExemptB2b: false, warnings: [] }, country)
   }
 })
@@ -170,7 +170,7 @@ const refusalRows: Array<[string, EuVatRegimeInput, (typeof REFUSAL_CODES)[numbe
   ['a scheme rate with no country', order({ rates: [{ wooRateId: 218, tax: '19.00', mapping: schemeRate('DE', { countryCode: null }) }] }), 'rate_country_mismatch'],
   ['an IOSS-marked rate on Norway', nokOrderOf('1000', { rates: [{ wooRateId: 239, tax: '500', mapping: schemeRate('NO', { reportingCategory: 'IOSS' }) }] }), 'rate_scheme_mismatch'],
   ['a VOEC-marked rate on Germany', order({ rates: [{ wooRateId: 216, tax: '19.00', mapping: schemeRate('DE', { reportingCategory: 'VOEC' }) }] }), 'rate_scheme_mismatch'],
-  ['VAT-exempt with scheme VAT charged', order({ vatExempt: true }), 'exempt_but_vat_charged'],
+  ['VAT-exempt with scheme VAT charged', order({ vatExempt: 'yes' }), 'exempt_but_vat_charged'],
   ['the VAT record in another currency', order({ vatRecord: { state: 'present', currency: 'GBP', total: '19.00' } }), 'vat_record_currency_mismatch'],
   ['the VAT record disagreeing with the tax lines', order({ vatRecord: { state: 'present', currency: 'EUR', total: '19.50' } }), 'vat_record_mismatch'],
   ['no exchange rate for the threshold', order({ currency: 'GBP', thresholdFx: { state: 'unavailable', reason: 'no rate' } }), 'threshold_value_unavailable'],
@@ -178,6 +178,11 @@ const refusalRows: Array<[string, EuVatRegimeInput, (typeof REFUSAL_CODES)[numbe
   ['no IOSS account configured (blank)', order({ accounts: { ioss: ' ', ddp: '232' } }), 'vat_account_not_configured'],
   ['adopt: scheme VAT and no plugin account', order({ mode: 'adopt_plugin', pluginVatAccount: null }), 'plugin_account_missing'],
   ['adopt: a plugin account that is neither configured account', order({ mode: 'adopt_plugin', pluginVatAccount: '330' }), 'plugin_account_unrecognised'],
+  ['adopt: the plugin FX record incomplete', order({ mode: 'adopt_plugin', pluginVatAccount: '821', pluginFx: { state: 'incomplete', detail: 'pair missing' } }), 'plugin_fx_incomplete'],
+  ['adopt: the plugin left differing FX meta unchanged', order({ mode: 'adopt_plugin', pluginVatAccount: '821', pluginFxConflict: true }), 'plugin_fx_conflict'],
+  ['tax on a rate that is not a scheme rate beside scheme VAT', order({ orderTax: '25.00' }), 'tax_not_explained_by_scheme_rates'],
+  ['an unflagged line decides DDP', order({ goodsLines: [{ total: '400.00', voucher: 'unknown' }] }), 'voucher_status_unknown'],
+  ['a zero-tax EU order with the exempt flag unknown', order({ vatExempt: 'unknown', rates: [], orderTax: '0' }), 'vat_exempt_status_unknown'],
   ['no DDP account configured on a DDP order', eurOrderOf('200.00', { accounts: { ioss: '821', ddp: '' } }), 'vat_account_not_configured'],
 ]
 for (const [name, input, code] of refusalRows) {
@@ -225,12 +230,12 @@ test('warning: a value within 5% of the threshold either side, and not just outs
 
 test('warning: the band is judged on the CONVERTED value (the order-date rate), and the basis records that rate', () => {
   const fx = { state: 'ok' as const, rate: '1.15', sameCurrency: false, asOf: '2026-11-01T00:00:00.000Z', source: 'fx_rates GBP/EUR' }
-  const d = resolveEuVatRegime(order({ currency: 'GBP', goodsLines: [{ total: '130.00', voucher: false }], thresholdFx: fx }))
+  const d = resolveEuVatRegime(order({ currency: 'GBP', goodsLines: [{ total: '130.00', voucher: 'no' }], thresholdFx: fx }))
   assert.ok(warningCodes(d).includes('threshold_band'))
   assert.equal(scheme(d).basis.convertedValue, '149.50')
-  assert.equal(scheme(d).basis.fx.rate, '1.15')
+  assert.equal(scheme(d).basis.fx?.rate, '1.15')
   // A rate that moves the same goods across the boundary changes the regime, which is exactly what the warning is for.
-  assert.equal(scheme(resolveEuVatRegime(order({ currency: 'GBP', goodsLines: [{ total: '130.00', voucher: false }], thresholdFx: { ...fx, rate: '1.16' } }))).regime, 'DDP')
+  assert.equal(scheme(resolveEuVatRegime(order({ currency: 'GBP', goodsLines: [{ total: '130.00', voucher: 'no' }], thresholdFx: { ...fx, rate: '1.16' } }))).regime, 'DDP')
 })
 
 test('warning: the EAS figure disagreeing, and not when absent, in another currency or within 0.02', () => {
@@ -245,10 +250,10 @@ test('warning: the EAS figure disagreeing, and not when absent, in another curre
 
 test('gift cards: a flagged line is left out of the value, an unflagged one is goods', () => {
   // 100 goods + a flagged 120 gift card: 100 is IOSS. The same 120 unflagged makes 220: DDP.
-  assert.equal(scheme(resolveEuVatRegime(order({ goodsLines: [{ total: '100.00', voucher: false }, { total: '120.00', voucher: true }], overThresholdDutyFee: false }))).regime, 'IOSS')
-  assert.equal(scheme(resolveEuVatRegime(order({ goodsLines: [{ total: '100.00', voucher: false }, { total: '120.00', voucher: false }], overThresholdDutyFee: true }))).regime, 'DDP')
+  assert.equal(scheme(resolveEuVatRegime(order({ goodsLines: [{ total: '100.00', voucher: 'no' }, { total: '120.00', voucher: 'yes' }], overThresholdDutyFee: false }))).regime, 'IOSS')
+  assert.equal(scheme(resolveEuVatRegime(order({ goodsLines: [{ total: '100.00', voucher: 'no' }, { total: '120.00', voucher: 'no' }], overThresholdDutyFee: true }))).regime, 'DDP')
   // Only gift cards: nothing in the consignment, IOSS.
-  assert.equal(scheme(resolveEuVatRegime(order({ goodsLines: [{ total: '500.00', voucher: true }] }))).basis.intrinsicValue, '0')
+  assert.equal(scheme(resolveEuVatRegime(order({ goodsLines: [{ total: '500.00', voucher: 'yes' }] }))).basis.intrinsicValue, '0')
 })
 
 test('warning (Q6): accounting and the customs label disagree, never a refusal', () => {
@@ -275,7 +280,7 @@ test('every warning code is declared (each is exercised by a test above or in th
 })
 
 test('the resolver does not mutate its input and is deterministic', () => {
-  const input = order({ goodsLines: [{ total: '149.99', voucher: false }] })
+  const input = order({ goodsLines: [{ total: '149.99', voucher: 'no' }] })
   const snapshot = JSON.stringify(input)
   const first = resolveEuVatRegime(input)
   assert.equal(JSON.stringify(input), snapshot)
@@ -285,12 +290,14 @@ test('the resolver does not mutate its input and is deterministic', () => {
 // ---- adopt_plugin mode: the plugin's decision is adopted, not re-made -----------------------------------------------------------------------------------------------------
 const adopt = (over: Partial<EuVatRegimeInput> = {}) => order({ mode: 'adopt_plugin', pluginVatAccount: '821', ...over })
 const pluginFx = { state: 'present' as const, rate: '1.1500', pair: 'GBP>EUR', thresholdValue: '149.50' }
+const recorded = { recorded: true, rate: '1.1500', pair: 'GBP>EUR', thresholdValue: '149.50' }
+const notRecorded = { recorded: false, note: 'not recorded by the plugin' }
 
 test('adopt: each account value determines the regime, whatever the value says', () => {
   const rows: Array<[string, Partial<EuVatRegimeInput>, 'IOSS' | 'VOEC' | 'DDP', string]> = [
     ['821 on an EU order is IOSS', { pluginVatAccount: '821' }, 'IOSS', '821'],
-    ['232 on an EU order is DDP, even for goods of EUR 10', { pluginVatAccount: '232', goodsLines: [{ total: '10.00', voucher: false }], overThresholdDutyFee: true }, 'DDP', '232'],
-    ['821 on an order of EUR 500 is IOSS (the plugin decided; the value test only warns)', { pluginVatAccount: '821', goodsLines: [{ total: '500.00', voucher: false }] }, 'IOSS', '821'],
+    ['232 on an EU order is DDP, even for goods of EUR 10', { pluginVatAccount: '232', goodsLines: [{ total: '10.00', voucher: 'no' }], overThresholdDutyFee: true }, 'DDP', '232'],
+    ['821 on an order of EUR 500 is IOSS (the plugin decided; the value test only warns)', { pluginVatAccount: '821', goodsLines: [{ total: '500.00', voucher: 'no' }] }, 'IOSS', '821'],
     ['821 on a Norwegian order is VOEC', { ...nokOrderOf('1000'), mode: 'adopt_plugin', pluginVatAccount: '821' }, 'VOEC', '821'],
     ['232 on a Norwegian order is DDP', { ...nokOrderOf('1000'), mode: 'adopt_plugin', pluginVatAccount: '232' }, 'DDP', '232'],
     ['the account is compared after trimming', { pluginVatAccount: ' 821 ' }, 'IOSS', '821'],
@@ -327,8 +334,8 @@ test('adopt: an order with no scheme VAT needs no plugin account (a UK order is 
 
 test("adopt: the plugin's rate, pair and converted value are recorded in the basis; absent means null", () => {
   const withFx = scheme(resolveEuVatRegime(adopt({ pluginFx })))
-  assert.deepEqual(withFx.basis.pluginFx, { rate: '1.1500', pair: 'GBP>EUR', thresholdValue: '149.50' })
-  assert.equal(scheme(resolveEuVatRegime(adopt())).basis.pluginFx, null)
+  assert.deepEqual(withFx.basis.pluginFx, recorded)
+  assert.deepEqual(scheme(resolveEuVatRegime(adopt())).basis.pluginFx, notRecorded)
   // IMS's own rate and value are still recorded beside it when it has them.
   assert.equal(withFx.basis.convertedValue, '100.00')
   assert.notEqual(withFx.basis.fx, null)
@@ -344,13 +351,13 @@ test("adopt: with no IMS rate the plugin's converted value stands in and the mis
 })
 
 test('adopt: the value test is a cross-check that warns on disagreement and never raises the 5% band', () => {
-  const disagree = resolveEuVatRegime(adopt({ pluginVatAccount: '232', goodsLines: [{ total: '40.00', voucher: false }], overThresholdDutyFee: true }))
+  const disagree = resolveEuVatRegime(adopt({ pluginVatAccount: '232', goodsLines: [{ total: '40.00', voucher: 'no' }], overThresholdDutyFee: true }))
   assert.equal(scheme(disagree).regime, 'DDP')
   assert.ok(warningCodes(disagree).includes('adopted_regime_differs'))
   const agree = resolveEuVatRegime(adopt({ pluginVatAccount: '821' }))
   assert.ok(!warningCodes(agree).includes('adopted_regime_differs'))
   // 149.00 is inside the band: decide mode warns, adopt mode does not.
-  const nearEdge = { goodsLines: [{ total: '149.00', voucher: false }] }
+  const nearEdge = { goodsLines: [{ total: '149.00', voucher: 'no' }] }
   assert.ok(warningCodes(resolveEuVatRegime(order(nearEdge))).includes('threshold_band'))
   assert.ok(!warningCodes(resolveEuVatRegime(adopt(nearEdge))).includes('threshold_band'))
 })
@@ -366,6 +373,66 @@ test('decide mode ignores the plugin fields except for the account cross-check',
   const d = scheme(resolveEuVatRegime(order({ pluginFx, pluginVatAccount: '232' })))
   assert.equal(d.regime, 'IOSS')
   assert.equal(d.basis.source, 'ims')
-  assert.deepEqual(d.basis.pluginFx, { rate: '1.1500', pair: 'GBP>EUR', thresholdValue: '149.50' })
+  assert.deepEqual(d.basis.pluginFx, recorded)
   assert.ok(warningCodes(d).includes('plugin_account_differs'))
+})
+
+// ---- Codex R1 and the plugin's FX record ------------------------------------------------------------------------------------------------------------------------------
+const unflagged = (total: string) => ({ total, voucher: 'unknown' as const })
+
+test('decide: an unflagged line that decides DDP over IOSS refuses; one that cannot change the outcome does not', () => {
+  const flips = resolveEuVatRegime(order({ goodsLines: [{ total: '100.00', voucher: 'no' }, unflagged('60.00')], overThresholdDutyFee: true }))
+  assert.equal(refused(flips).code, 'voucher_status_unknown')
+  // all unflagged and over the threshold: they could all be gift cards, so it refuses too
+  assert.equal(refused(resolveEuVatRegime(order({ goodsLines: [unflagged('400.00')] }))).code, 'voucher_status_unknown')
+  // known goods alone already decide DDP: the unflagged extra changes nothing
+  assert.equal(scheme(resolveEuVatRegime(order({ goodsLines: [{ total: '400.00', voucher: 'no' }, unflagged('10.00')], overThresholdDutyFee: true }))).regime, 'DDP')
+  // under the threshold with the unflagged line counted: removing it can only lower the value, so IOSS stands
+  assert.equal(scheme(resolveEuVatRegime(order({ goodsLines: [unflagged('40.00')] }))).regime, 'IOSS')
+  // the flag settles it: the same 60 flagged as goods or as a gift card decides without refusal
+  assert.equal(scheme(resolveEuVatRegime(order({ goodsLines: [{ total: '100.00', voucher: 'no' }, { total: '60.00', voucher: 'yes' }] }))).regime, 'IOSS')
+  // adopt mode does not refuse on it: the plugin decided
+  assert.equal(resolveEuVatRegime(adopt({ pluginVatAccount: '232', goodsLines: [{ total: '100.00', voucher: 'no' }, unflagged('60.00')], overThresholdDutyFee: true })).kind, 'SCHEME')
+})
+
+test('unexplained tax: money on a rate that is not a scheme rate, or an order tax that is not the scheme total, refuses', () => {
+  const other = { wooRateId: 300, tax: '6.00', mapping: plainRate('US', '0.0600') }
+  const d = refused(resolveEuVatRegime(order({ rates: [{ wooRateId: 216, tax: '19.00', mapping: schemeRate('DE') }, other], orderTax: '25.00' })))
+  assert.equal(d.code, 'tax_not_explained_by_scheme_rates')
+  // a UK-territory rate alongside is also unexplained
+  assert.equal(refused(resolveEuVatRegime(order({ shippingCountry: 'DE', rates: [{ wooRateId: 216, tax: '19.00', mapping: schemeRate('DE') }, { wooRateId: 112, tax: '2.00', mapping: plainRate('GB') }], orderTax: '21.00' }))).code, 'domestic_rate_abroad')
+  // the order total is more than the rates: 19 on the scheme rate against 25 in WooCommerce
+  assert.equal(refused(resolveEuVatRegime(order({ orderTax: '25.00' }))).code, 'tax_not_explained_by_scheme_rates')
+  // within 0.02 is rounding
+  assert.equal(resolveEuVatRegime(order({ orderTax: '19.02' })).kind, 'SCHEME')
+  // a rate that moved no money is not unexplained tax
+  assert.equal(resolveEuVatRegime(order({ rates: [{ wooRateId: 216, tax: '19.00', mapping: schemeRate('DE') }, { wooRateId: 182, tax: '0.00', mapping: plainRate('XX', '0.0000') }] })).kind, 'SCHEME')
+  // a skipped order with unrelated money is untouched: this rule is only for scheme orders
+  assert.equal(resolveEuVatRegime(order({ shippingCountry: 'AU', billingCountry: 'AU', rates: [{ wooRateId: 7, tax: '10.00', mapping: plainRate('AU', '0.1000') }], orderTax: '10.00' })).kind, 'SKIP')
+})
+
+test('exempt status unknown: a zero-tax EU-27 order is deferred, not stamped as outside the scheme', () => {
+  const zeroTax = (vatExempt: 'yes' | 'no' | 'unknown', country = 'DE') => order({ shippingCountry: country, billingCountry: country, vatExempt, rates: [], orderTax: '0' })
+  assert.equal(refused(resolveEuVatRegime(zeroTax('unknown'))).code, 'vat_exempt_status_unknown')
+  assert.deepEqual(resolveEuVatRegime(zeroTax('no')), { kind: 'SKIP', reason: 'no_scheme_vat', vatExemptB2b: false, warnings: [] })
+  assert.equal(resolveEuVatRegime(zeroTax('yes')).kind === 'SKIP' && (resolveEuVatRegime(zeroTax('yes')) as { vatExemptB2b: boolean }).vatExemptB2b, true)
+  // not EU-27 (Norway, Monaco) or outside the allowlist: the flag changes nothing there
+  for (const country of ['NO', 'MC', 'US', 'GB']) assert.equal(resolveEuVatRegime(zeroTax('unknown', country)).kind, 'SKIP', country)
+  // with scheme VAT charged, an unknown flag does not block the decision
+  assert.equal(resolveEuVatRegime(order({ vatExempt: 'unknown' })).kind, 'SCHEME')
+})
+
+test("adopt: the plugin's FX record - incomplete or conflicting refuses; none at all (an order from before it) is stamped as not recorded", () => {
+  assert.equal(refused(resolveEuVatRegime(adopt({ pluginFx: { state: 'incomplete', detail: 'pair missing or unreadable' } }))).code, 'plugin_fx_incomplete')
+  assert.equal(refused(resolveEuVatRegime(adopt({ pluginFx, pluginFxConflict: true }))).code, 'plugin_fx_conflict')
+  assert.equal(refused(resolveEuVatRegime(adopt({ pluginFxConflict: true }))).code, 'plugin_fx_conflict')
+  const historic = scheme(resolveEuVatRegime(adopt({ pluginFx: { state: 'absent' }, pluginVatAccount: '232' })))
+  assert.equal(historic.regime, 'DDP')
+  assert.deepEqual(historic.basis.pluginFx, notRecorded)
+  // a complete record with no conflict stamps and is recorded
+  assert.deepEqual(scheme(resolveEuVatRegime(adopt({ pluginFx }))).basis.pluginFx, recorded)
+  // the checks only apply once the account is known: no account still says so first
+  assert.equal(refused(resolveEuVatRegime(adopt({ pluginVatAccount: null, pluginFx: { state: 'incomplete', detail: 'x' } }))).code, 'plugin_account_missing')
+  // decide mode ignores an incomplete or conflicting record
+  assert.equal(resolveEuVatRegime(order({ pluginFx: { state: 'incomplete', detail: 'x' }, pluginFxConflict: true })).kind, 'SCHEME')
 })

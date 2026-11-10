@@ -22,6 +22,13 @@
  * THRESHOLDS ARE CONSTANTS, not settings (a setting is how the customs label code came to disagree with the law). DDP when the converted goods value is STRICTLY above the threshold
  * (EUR 150, or NOK 3000 for Norway); exactly at the threshold is IOSS/VOEC. The value is compared at the minor unit (rounded half up to 2 places): 150.004 is 150.00.
  *
+ * UNKNOWN INPUTS DEFER, THEY ARE NOT GUESSED. A goods line with no gift-card flag counts as goods, and in `decide` mode the order REFUSES (`voucher_status_unknown`) when taking those lines out would change the regime. A missing or
+ * unreadable VAT-exempt flag on an EU-27 order with no scheme VAT refuses (`vat_exempt_status_unknown`) rather than stamping "outside the scheme". Tax that moved on any rate other than the scheme rates, or a WooCommerce
+ * order tax that is not the scheme total, refuses (`tax_not_explained_by_scheme_rates`).
+ *
+ * PLUGIN CONVERSION RECORD (adopt mode). With the account present: a conversion record that is incomplete or unreadable, or a reason text saying the plugin left differing FX meta unchanged, REFUSES; no conversion record at all
+ * (an order from before the plugin wrote it) is stamped from the account and recorded as "not recorded by the plugin" (a deliberate exception so historic orders still work).
+ *
  * INTRINSIC VALUE = the sum of the goods lines' totals (after coupons, excluding VAT, shipping and fees), gift cards excluded. A gift card is a line flagged `_o3d_is_voucher`; the product-level marker
  * (`_coupon_title`) is not on the order and IMS does not import product meta, so an unflagged gift card counts as goods. That limit only matters in `decide` mode.
  *
@@ -82,15 +89,20 @@ export type RateFact = {
 export type GoodsLineFact = {
   /** The line total after coupons, excluding tax, in the order currency. */
   total: string
-  /** The line carries the gift-card flag (`_o3d_is_voucher`). A line without it is goods. */
-  voucher: boolean
+  /** The gift-card flag (`_o3d_is_voucher`): yes and no were read from the line; unknown means the line carried none and the product-level marker (`_coupon_title`) is not imported to settle it. */
+  voucher: 'yes' | 'no' | 'unknown'
 }
 
 export type EuVatRegimeMode = 'adopt_plugin' | 'decide'
 export const EU_VAT_REGIME_MODES: readonly EuVatRegimeMode[] = ['adopt_plugin', 'decide']
 
 /** What the plugin recorded about its own conversion: `_o3d_ioss_fx_rate` (threshold-currency units per one order-currency unit), `_o3d_ioss_fx_pair` ("GBP>EUR") and `_o3d_ioss_threshold_value`. */
-export type PluginFxFact = { state: 'absent' } | { state: 'present'; rate: string; pair: string; thresholdValue: string | null }
+export type PluginFxFact =
+  /** None of the three metas exists: an order from before the plugin recorded its conversion. */
+  | { state: 'absent' }
+  | { state: 'present'; rate: string; pair: string; thresholdValue: string }
+  /** Some of the three exist, or one is unreadable. */
+  | { state: 'incomplete'; detail: string }
 
 export type VatRecordFact = { state: 'absent' } | { state: 'present'; currency: string | null; total: string }
 export type EasFact = { state: 'absent' } | { state: 'present'; merchandiseVatExcl: string; currency: string | null }
@@ -111,7 +123,9 @@ export type EuVatRegimeInput = {
   /** WooCommerce's own order tax total, independent of the per-rate lines: tells "no VAT charged" from "the evidence is missing". */
   orderTax: string
   /** The B2B exemption flag (`is_vat_exempt`). */
-  vatExempt: boolean
+  vatExempt: 'yes' | 'no' | 'unknown'
+  /** The plugin's reason text says it left differing FX meta unchanged (`[FX meta already present and different from this decision; left unchanged: ...]`). */
+  pluginFxConflict: boolean
   vatRecord: VatRecordFact
   eas: EasFact
   thresholdFx: ThresholdFxFact
@@ -141,6 +155,11 @@ export const REFUSAL_CODES = [
   'vat_account_not_configured',
   'plugin_account_missing',
   'plugin_account_unrecognised',
+  'plugin_fx_incomplete',
+  'plugin_fx_conflict',
+  'tax_not_explained_by_scheme_rates',
+  'voucher_status_unknown',
+  'vat_exempt_status_unknown',
 ] as const
 export type RefusalCode = (typeof REFUSAL_CODES)[number]
 
@@ -164,7 +183,7 @@ export type SchemeBasis = {
   /** IMS's order-date rate; null when none was available (only possible in adopt mode). */
   fx: { rate: string; sameCurrency: boolean; asOf: string; source: string } | null
   /** The plugin's recorded conversion, when it wrote one. */
-  pluginFx: { rate: string; pair: string; thresholdValue: string | null } | null
+  pluginFx: { recorded: true; rate: string; pair: string; thresholdValue: string } | { recorded: false; note: 'not recorded by the plugin' }
   vatTotal: string
   wooRateIds: number[]
   imsRateIds: string[]
@@ -203,6 +222,7 @@ export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision
   const moneyMin = D(MONEY_MOVED_MIN)
 
   // 1. Every rate that moved money. The tax evidence is looked at BEFORE the destination puts the order out of scope: a non-EU order carrying a scheme rate is a contradiction, not a skip.
+  const otherMoney: string[] = []
   const qualifying: Array<{ fact: RateFact; mapped: Extract<RateMappingFact, { state: 'mapped' }>; country: string }> = []
   for (const fact of input.rates) {
     const tax = D(fact.tax)
@@ -224,12 +244,14 @@ export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision
     if (territories !== undefined) {
       // A UK or Isle of Man rate is ordinary on its own territory and a contradiction anywhere else.
       if (tax.gt(0) && !territories.includes(destination)) return refuse('domestic_rate_abroad', `tax rate "${mapped.name}" (${country}) was charged on an order to ${where}, which is neither its own territory nor an EU sale`)
+      otherMoney.push(`${mapped.name} ${tax.toFixed(2)}`)
       continue
     }
     // Q1: an EU, Monaco or Norway rate that moved money and is not on the scheme. No goods ship from EU stock, so this is never an OSS sale.
     if (SCHEME_DESTINATIONS.has(country) && D(mapped.rate).gt(0)) {
       return refuse('eu_rated_not_on_scheme', `tax rate "${mapped.name}" (${country}) charged ${tax.toFixed(2)} but is not an IOSS/VOEC scheme rate, and no goods ship from EU stock`)
     }
+    otherMoney.push(`${mapped.name} ${tax.toFixed(2)}`)
   }
 
   // 2. A scheme rate on an order that is not going to a covered destination.
@@ -242,7 +264,11 @@ export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision
     if (covered && D(input.orderTax).abs().gt(moneyMin)) {
       return refuse('tax_without_scheme_rate', `WooCommerce charged ${D(input.orderTax).toFixed(2)} of tax to ${where} but no scheme rate could be identified`)
     }
-    const exemptB2b = input.vatExempt && EU27.has(destination)
+    // An EU-27 order with no tax may be a business sale that is zero-rated. Whether it is depends on the exemption flag, so an unknown flag defers the order rather than stamping it as outside the scheme.
+    if (EU27.has(destination) && input.vatExempt === 'unknown') {
+      return refuse('vat_exempt_status_unknown', `the order ships to ${where} with no scheme VAT and its VAT-exempt (B2B) status is missing or unreadable, so it cannot be classed as outside the scheme`)
+    }
+    const exemptB2b = input.vatExempt === 'yes' && EU27.has(destination)
     return { kind: 'SKIP', reason: exemptB2b ? 'vat_exempt_b2b' : 'no_scheme_vat', vatExemptB2b: exemptB2b, warnings: [] }
   }
 
@@ -260,8 +286,16 @@ export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision
 
   const vatTotal = qualifying.reduce((sum, q) => sum.plus(D(q.fact.tax)), D(0))
 
-  if (input.vatExempt) {
+  if (input.vatExempt === 'yes') {
     return refuse('exempt_but_vat_charged', `the order is flagged VAT-exempt but ${vatTotal.toFixed(2)} of scheme VAT was charged`)
+  }
+
+  // Every pound of tax that moved money must be explained by the scheme rates: tax on any other rate, or a WooCommerce total that is not the scheme total, is unexplained and refuses.
+  if (otherMoney.length > 0) {
+    return refuse('tax_not_explained_by_scheme_rates', `tax moved on rates that are not scheme rates alongside ${vatTotal.toFixed(2)} on the scheme rates: ${otherMoney.join(', ')}`)
+  }
+  if (D(input.orderTax).minus(vatTotal).abs().gt(D(FIGURE_TOLERANCE))) {
+    return refuse('tax_not_explained_by_scheme_rates', `WooCommerce's order tax is ${D(input.orderTax).toFixed(2)} but the scheme rates account for ${vatTotal.toFixed(2)}`)
   }
 
   // 4. The EU VAT record, when it is present and non-empty, is a cross-check: a mismatch refuses, its absence does not.
@@ -278,7 +312,7 @@ export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision
   const isNorway = destination === 'NO'
   const thresholdCurrency = isNorway ? 'NOK' : 'EUR'
   const threshold = D(isNorway ? VOEC_THRESHOLD_NOK : IOSS_THRESHOLD_EUR)
-  const goodsExVoucher = input.goodsLines.filter((line) => !line.voucher)
+  const goodsExVoucher = input.goodsLines.filter((line) => line.voucher !== 'yes')
   const intrinsic = goodsExVoucher.reduce((sum, line) => sum.plus(D(line.total)), D(0))
   const fx = input.thresholdFx.state === 'ok' ? input.thresholdFx : null
   const converted = fx === null ? null : roundMinor(intrinsic.times(D(fx.rate)))
@@ -296,6 +330,8 @@ export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision
     if (recorded === ioss) regime = isNorway ? 'VOEC' : 'IOSS'
     else if (recorded === ddp) regime = 'DDP'
     else return refuse('plugin_account_unrecognised', `the plugin recorded VAT account ${recorded}, which is neither the IOSS/VOEC account (${ioss}) nor the DDP account (${ddp})`)
+    if (input.pluginFx.state === 'incomplete') return refuse('plugin_fx_incomplete', `the plugin recorded the VAT account but its conversion record is incomplete or unreadable: ${input.pluginFx.detail}`)
+    if (input.pluginFxConflict) return refuse('plugin_fx_conflict', 'the plugin left differing FX meta unchanged when it recorded this decision, so the conversion on the order is not the one that decided it')
     if (byValue !== null && byValue !== regime) {
       warnings.push({ code: 'adopted_regime_differs', message: `the plugin's account says ${regime} but IMS's own order-date value test (${converted!.toFixed(2)} ${thresholdCurrency}) says ${byValue}; the plugin's decision is adopted` })
     }
@@ -307,6 +343,14 @@ export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision
       return refuse('threshold_value_unavailable', `cannot value the goods in ${thresholdCurrency} to apply the ${isNorway ? 'VOEC' : 'IOSS'} threshold: ${input.thresholdFx.state === 'unavailable' ? input.thresholdFx.reason : 'no rate'}`)
     }
     regime = byValue
+    // A line with no gift-card flag counts as goods. If taking the unflagged lines out would change the outcome, the order's regime rests on a fact IMS does not have: refuse.
+    const unknownLines = goodsExVoucher.filter((line) => line.voucher === 'unknown')
+    if (unknownLines.length > 0) {
+      const withoutUnknown = roundMinor(goodsExVoucher.filter((line) => line.voucher === 'no').reduce((sum, line) => sum.plus(D(line.total)), D(0)).times(D(fx.rate)))
+      if (withoutUnknown.gt(threshold) !== converted.gt(threshold)) {
+        return refuse('voucher_status_unknown', `${unknownLines.length} goods line(s) carry no gift-card flag and whether they are gift cards decides between ${isNorway ? 'VOEC' : 'IOSS'} and DDP`)
+      }
+    }
     if (converted.minus(threshold).abs().div(threshold).lte(D(THRESHOLD_WARN_BAND))) {
       warnings.push({
         code: 'threshold_band',
@@ -355,7 +399,9 @@ export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision
       intrinsicValue: intrinsic.toString(),
       convertedValue: converted !== null ? converted.toFixed(2) : input.pluginFx.state === 'present' ? input.pluginFx.thresholdValue : null,
       fx: fx === null ? null : { rate: fx.rate, sameCurrency: fx.sameCurrency, asOf: fx.asOf, source: fx.source },
-      pluginFx: input.pluginFx.state === 'present' ? { rate: input.pluginFx.rate, pair: input.pluginFx.pair, thresholdValue: input.pluginFx.thresholdValue } : null,
+      pluginFx: input.pluginFx.state === 'present'
+        ? { recorded: true, rate: input.pluginFx.rate, pair: input.pluginFx.pair, thresholdValue: input.pluginFx.thresholdValue }
+        : { recorded: false, note: 'not recorded by the plugin' },
       vatTotal: vatTotal.toString(),
       wooRateIds: qualifying.map((q) => q.fact.wooRateId).sort((a, b) => a - b),
       imsRateIds: [...new Set(qualifying.map((q) => q.mapped.imsRateId))].sort(),

@@ -40,7 +40,7 @@ test('tax per rate id sums items, fees and shipping, and merges repeated ids', (
   assert.deepEqual(readRateTax(order), [{ wooRateId: 182, tax: '0' }, { wooRateId: 216, tax: '20.5' }])
 })
 
-test('gift-card detection: only a line carrying the flag is a gift card; an unflagged line is goods (the product-level marker is not on the order)', () => {
+test('gift-card detection: yes and no are read from the line; a line with no flag is unknown (the product-level marker is not on the order)', () => {
   const lines = readGoodsLines(wcOrder({
     line_items: [
       { id: 1, total: '10.00', meta_data: [meta('_o3d_is_voucher', 'yes')] },
@@ -51,13 +51,13 @@ test('gift-card detection: only a line carrying the flag is a gift card; an unfl
     ] as never,
   }))
   assert.deepEqual(lines, [
-    { total: '10.00', voucher: true }, { total: '20.00', voucher: false }, { total: '30.00', voucher: false }, { total: '40.00', voucher: false }, { total: '0', voucher: false },
+    { total: '10.00', voucher: 'yes' }, { total: '20.00', voucher: 'no' }, { total: '30.00', voucher: 'no' }, { total: '40.00', voucher: 'unknown' }, { total: '0', voucher: 'unknown' },
   ])
 })
 
-test('the B2B exemption flag: yes, 1 and true are exempt; no, absent and junk are not', () => {
+test('the B2B exemption flag: yes, 1 and true are exempt; no, 0, false and blank are not; absent or junk is unknown', () => {
   const exempt = (value: unknown | undefined) => readWcEuVatFacts(wcOrder({ meta_data: value === undefined ? [] : [meta('is_vat_exempt', value)] })).vatExempt
-  assert.deepEqual([exempt('yes'), exempt('1'), exempt(true), exempt('no'), exempt(undefined), exempt('maybe'), exempt('')], [true, true, true, false, false, false, false])
+  assert.deepEqual([exempt('yes'), exempt('1'), exempt(true), exempt('no'), exempt('0'), exempt(false), exempt(''), exempt(undefined), exempt('maybe'), exempt({})], ['yes', 'yes', 'yes', 'no', 'no', 'no', 'no', 'unknown', 'unknown', 'unknown'])
 })
 
 test('the EU VAT record: present when readable with rates and a total; empty, unreadable or absent reads as absent', () => {
@@ -72,15 +72,27 @@ test('the EU VAT record: present when readable with rates and a total; empty, un
   assert.deepEqual(record({ total: '19', by_rates: { 216: {} } }), { state: 'present', currency: null, total: '19' })
 })
 
-test("the plugin's conversion record: rate and pair must both be readable; the threshold value is carried when readable", () => {
+test("the plugin's conversion record: all three readable is present, none is absent, anything between is incomplete", () => {
   const fx = (entries: Array<[string, unknown]>) => readPluginFx(wcOrder({ meta_data: entries.map(([k, v]) => meta(k, v)) }))
-  assert.deepEqual(fx([['_o3d_ioss_fx_rate', '1.1534'], ['_o3d_ioss_fx_pair', 'gbp>eur'], ['_o3d_ioss_threshold_value', '149.50']]), { state: 'present', rate: '1.1534', pair: 'GBP>EUR', thresholdValue: '149.50' })
-  assert.deepEqual(fx([['_o3d_ioss_fx_rate', 1.15], ['_o3d_ioss_fx_pair', 'GBP>EUR']]), { state: 'present', rate: '1.15', pair: 'GBP>EUR', thresholdValue: null })
-  assert.deepEqual(fx([['_o3d_ioss_fx_rate', '1.15']]), { state: 'absent' })
-  assert.deepEqual(fx([['_o3d_ioss_fx_pair', 'GBP>EUR']]), { state: 'absent' })
-  assert.deepEqual(fx([['_o3d_ioss_fx_rate', '0'], ['_o3d_ioss_fx_pair', 'GBP>EUR']]), { state: 'absent' })
-  assert.deepEqual(fx([['_o3d_ioss_fx_rate', '1.15'], ['_o3d_ioss_fx_pair', 'GBPEUR']]), { state: 'absent' })
+  const full: Array<[string, unknown]> = [['_o3d_ioss_fx_rate', '1.1534'], ['_o3d_ioss_fx_pair', 'gbp>eur'], ['_o3d_ioss_threshold_value', '149.50']]
+  assert.deepEqual(fx(full), { state: 'present', rate: '1.1534', pair: 'GBP>EUR', thresholdValue: '149.50' })
+  assert.deepEqual(fx([['_o3d_ioss_fx_rate', 1.15], ['_o3d_ioss_fx_pair', 'EUR>EUR'], ['_o3d_ioss_threshold_value', '100.00']]), { state: 'present', rate: '1.15', pair: 'EUR>EUR', thresholdValue: '100.00' })
+  assert.deepEqual(fx([]), { state: 'absent' })
+  assert.deepEqual(fx([['_o3d_ioss_fx_rate', ''], ['_o3d_ioss_fx_pair', '']]), { state: 'absent' })
+  for (const drop of [0, 1, 2]) assert.equal(fx(full.filter((_, i) => i !== drop)).state, 'incomplete', `missing ${full[drop]![0]}`)
+  assert.equal(fx([['_o3d_ioss_fx_rate', '1.15']]).state, 'incomplete')
+  assert.equal(fx([full[0]!, full[1]!, ['_o3d_ioss_threshold_value', 'abc']]).state, 'incomplete')
+  assert.equal(fx([['_o3d_ioss_fx_rate', '0'], full[1]!, full[2]!]).state, 'incomplete')
+  assert.equal(fx([full[0]!, ['_o3d_ioss_fx_pair', 'GBPEUR'], full[2]!]).state, 'incomplete')
   assert.deepEqual(readWcEuVatFacts(wcOrder()).pluginFx, { state: 'absent' })
+})
+
+test("the plugin's FX-conflict marker in _o3d_ioss_reason", () => {
+  const conflict = (reason: unknown) => readWcEuVatFacts(wcOrder({ meta_data: reason === undefined ? [] : [meta('_o3d_ioss_reason', reason)] })).pluginFxConflict
+  assert.equal(conflict('IOSS by value. [FX meta already present and different from this decision; left unchanged: {"rate":"1.1"}]'), true)
+  assert.equal(conflict('IOSS by value'), false)
+  assert.equal(conflict(undefined), false)
+  assert.equal(conflict(42), false)
 })
 
 test('the EAS figure: needs a readable merchandise value', () => {
@@ -170,12 +182,12 @@ test('an order with no creation date cannot be valued: the threshold fact is una
 })
 
 test('adopt mode end to end (the default): the plugin account decides and its conversion record lands in the basis', async () => {
-  const withMeta = wcOrder({ meta_data: [meta('_o3d_ioss_vat_account', '232'), meta('_o3d_ioss_fx_rate', '1.15'), meta('_o3d_ioss_fx_pair', 'EUR>EUR'), meta('_o3d_ioss_threshold_value', '100')] })
+  const withMeta = wcOrder({ meta_data: [meta('_o3d_ioss_vat_account', '232'), meta('_o3d_ioss_fx_rate', '1.15'), meta('_o3d_ioss_fx_pair', 'EUR>EUR'), meta('_o3d_ioss_threshold_value', '100.00')] })
   const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), withMeta, { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP' })
   assert.equal(input.mode, 'adopt_plugin')
   const d = resolveEuVatRegime(input)
   assert.equal(d.kind === 'SCHEME' && d.regime, 'DDP')
-  assert.equal(d.kind === 'SCHEME' && d.basis.pluginFx?.rate, '1.15')
+  assert.equal(d.kind === 'SCHEME' && d.basis.pluginFx.recorded && d.basis.pluginFx.rate, '1.15')
   // the same order without the account refuses; in decide mode it decides by value
   const bare = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder(), { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP' })
   assert.equal(resolveEuVatRegime(bare).kind === 'REFUSE' && (resolveEuVatRegime(bare) as { code: string }).code, 'plugin_account_missing')
