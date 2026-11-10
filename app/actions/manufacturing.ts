@@ -29,6 +29,8 @@ import {
 import {
   manufacturingCostLayerReceivedAt,
   parseManufacturingCostLines,
+  findDisallowedOverheadOverride,
+  overheadOverrideRefusal,
 } from '@/lib/domain/manufacturing/manufacturing-action-inputs'
 import {
   buildDisassemblyRecoveryPlan,
@@ -1033,6 +1035,11 @@ export async function updateManufacturingOrderStatus(
             let missingAccount = false
             const defaultedCostLineIds: string[] = []
             const creditLines: Array<{ accountCode: string; description: string; credit: number }> = []
+            // Stored overrides are credited by this journal, so each must still be the configured Manufacturing
+            // Overhead account. A line stored under another code (an earlier edit, or a mapping that has since
+            // changed) stops the completion rather than posting to a caller-chosen account.
+            const stray = findDisallowedOverheadOverride(order.manufacturingCostLines, defaultOverheadAccount)
+            if (stray) throw new Error(`Cannot complete production order: ${overheadOverrideRefusal(stray, defaultOverheadAccount)}`)
             for (const costLine of order.manufacturingCostLines) {
               const account = costLine.accountCode || defaultOverheadAccount
               const amount = roundCurrency(Number(costLine.amountBase))
@@ -1834,6 +1841,13 @@ export async function updateManufacturingCostLines(
       await tx.$queryRaw(
         Prisma.sql`SELECT id FROM production_orders WHERE id = ${productionOrderId} FOR UPDATE`,
       )
+      // THE STATUS THIS TRANSACTION ACTS ON IS THE ONE READ UNDER THE ROW LOCK. `po.status` above was read
+      // before the lock, so a completion (or cancel) that committed in between would leave this edit
+      // recalculating, or skipping the recalculation and the journal, for a state the order no longer has.
+      const lockedOrder = await tx.productionOrder.findUnique({ where: { id: productionOrderId }, select: { status: true } })
+      if (!lockedOrder) throw new Error('Production order not found.')
+      if (lockedOrder.status === 'CANCELLED') throw new Error('Cannot edit manufacturing cost lines on a cancelled production order.')
+      const lockedStatus = lockedOrder.status
       const existing = await tx.manufacturingCostLine.findMany({
         where: { productionOrderId },
         select: { amountBase: true, accountCode: true },
@@ -1844,18 +1858,7 @@ export async function updateManufacturingCostLines(
 
       // o3d-j625 r4 (SWEEP 1): chart first, verdict asked OF IT — see the completion journal above. A
       // retired chart is recorded as a refusal and reported after the commit.
-      const reclassChart = po.status === 'COMPLETED' ? await getAccountingSettings() : null
-      // A per-line account override is credited by the reclass journal, so it is not a free-text field: it must
-      // be the Manufacturing Overhead account the accounting settings configure. Checked HERE, against the same
-      // chart the reclass below is built from (a mapping read before the transaction could differ from it), and
-      // by throwing so the cost-line write rolls back with it.
-      if (cleaned.some((line) => line.accountCode)) {
-        const overrideChart = reclassChart ?? await getAccountingSettings()
-        const configuredOverhead = overrideChart.manufacturingOverheadAccount?.trim() ?? ''
-        if (cleaned.some((line) => line.accountCode && line.accountCode !== configuredOverhead)) {
-          throw new Error('A cost-line account override must be the Manufacturing Overhead account configured in Settings. Clear the override to use the default.')
-        }
-      }
+      const reclassChart = lockedStatus === 'COMPLETED' ? await getAccountingSettings() : null
       const reclassVerdict = reclassChart
         ? await accountingPostingVerdictForChart(reclassChart.connector, 'MANUFACTURING_RECLASS')
         : null
@@ -1872,6 +1875,13 @@ export async function updateManufacturingCostLines(
             ? { ...line, accountCode: settings.manufacturingOverheadAccount }
             : line
         ))
+      }
+      // A per-line account override is credited by the reclass journal, so it is not a free-text field: when this
+      // edit posts, an override must be the Manufacturing Overhead account the SAME chart configures. Checked here,
+      // against the chart the reclass is built from, by throwing so the cost-line write rolls back with it.
+      if (shouldPostReclass && settings) {
+        const stray = findDisallowedOverheadOverride(cleanedForWrite, settings.manufacturingOverheadAccount)
+        if (stray) throw new Error(`Cannot update completed manufacturing costs: ${overheadOverrideRefusal(stray, settings.manufacturingOverheadAccount)}`)
       }
       const overheadAccountDeltas = settings
         ? buildOverheadAccountDeltas(existing, cleanedForWrite, settings.manufacturingOverheadAccount)
@@ -1897,7 +1907,7 @@ export async function updateManufacturingCostLines(
       // If completed, recalc produced cost layers + downstream snapshots,
       // then queue the reclass journal IN-TX so the cost-layer change and
       // the GL post are durable atomically.
-      if (po.status === 'COMPLETED') {
+      if (lockedStatus === 'COMPLETED') {
         // One nonce per cost-edit run, shared by the shipment COGS_REVERSAL (inside
         // the recalc) and the MANUFACTURING_RECLASS key below, so an A→B→A edit
         // posts/dedups both together (cogs-audit scjz.33).

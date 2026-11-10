@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
-import { isSafePublicBaseUrl, normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
+import { isCrontabSafeBaseUrl, isSafePublicBaseUrl, normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
 import { buildOtiCrontabBlock, validateCronSchedule, type CrontabJobDef } from '@/lib/crontab-sync'
 
 // The Public App URL is written into the managed crontab as BASE_URL="<url>/api/cron". A value that
@@ -44,8 +45,8 @@ test('the write-side rule still accepts ordinary public URLs', () => {
   }
 })
 
-test('the crontab renderer refuses a stored bad URL instead of splicing it into the block', () => {
-  for (const baseUrl of INJECTED) {
+test('the crontab renderer refuses an unsafe base URL instead of splicing it into the block', () => {
+  for (const baseUrl of INJECTED.filter((value) => value !== 'http://ims.example.com')) {
     const block = buildOtiCrontabBlock({
       jobs: [JOB],
       settings: new Map(),
@@ -75,4 +76,34 @@ test('the parser-tolerant forms `https:example.com` and `https:/example.com` are
 test('the stored form is the parser canonical form, not the raw text', () => {
   const result = normalizePublicAppUrl('  HTTPS://IMS.Example.com/app/./x/../  ')
   assert.deepEqual(result, { ok: true, url: 'https://ims.example.com/app' })
+})
+
+test('the renderer still takes the operator-supplied internal base URLs the container and host installs use', () => {
+  for (const baseUrl of ['http://app:3000', 'http://127.0.0.1:3000', 'https://ims.example.com']) {
+    const block = buildOtiCrontabBlock({
+      jobs: [JOB], settings: new Map(), secretRef: { kind: 'env-file', envFilePath: '/etc/ims/.env' },
+      baseUrl, logPath: '/var/log/ims/cron.log', heartbeats: null,
+    })
+    assert.equal(block.ok, true, baseUrl)
+    assert.equal(isCrontabSafeBaseUrl(baseUrl), true, baseUrl)
+  }
+})
+
+test('the Public App URL setting keeps the strict rule: private-network http is renderer-only', () => {
+  assert.equal(isSafePublicBaseUrl('http://app:3000'), false)
+  assert.equal(normalizePublicAppUrl('http://app:3000').ok, false)
+})
+
+test('the real stage and production values pass the setting rule unchanged', () => {
+  for (const value of ['https://ims-stage.onetwo3d.co.uk', 'https://ims-stage.onetwo3d.co.uk/', 'https://ims.onetwo3d.co.uk']) {
+    assert.deepEqual(normalizePublicAppUrl(value), { ok: true, url: value.replace(/\/+$/, '') }, value)
+    assert.equal(isSafePublicBaseUrl(value.replace(/\/+$/, '')), true, value)
+  }
+})
+
+test('the reconcile path applies the strict rule to the stored setting before it builds the block', () => {
+  const source = readFileSync('lib/crontab-reconcile.ts', 'utf8')
+  const check = source.indexOf('isSafePublicBaseUrl(baseUrl)')
+  const build = source.indexOf('buildOtiCrontabBlock({')
+  assert.ok(check !== -1 && build !== -1 && check < build, 'the stored Public App URL is not checked before the block is built')
 })

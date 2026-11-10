@@ -530,7 +530,7 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     return {
       success: false,
       wipedMappings: 0,
-      error: 'The saved WooCommerce connection changed while this was being saved. Enter the consumer key and secret and save again.',
+      error: 'The saved WooCommerce connection changed while this save was running, so the saved credentials were not reused and nothing was saved.',
     }
   }
   if ('blocked' in saveOutcome && saveOutcome.blocked) {

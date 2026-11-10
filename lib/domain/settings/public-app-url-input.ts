@@ -24,7 +24,13 @@ export type PublicAppUrlNormalization =
 const SAFE_URL_CHARS = /^[A-Za-z0-9\-._~:/[\]]+$/
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
 
-export function isSafePublicBaseUrl(value: string): boolean {
+/**
+ * What the CRONTAB can carry safely, whatever its source: `scheme://host[:port][/path]`, http or https, only
+ * characters that mean nothing to cron or the shell, no credentials, query or fragment. The host-install and
+ * container renderers take their base URL from the operator's own command line (`http://127.0.0.1:3000`, or
+ * a private container-network name such as `http://app:3000`), so this layer does not judge the scheme or host.
+ */
+export function isCrontabSafeBaseUrl(value: string): boolean {
   // The WHATWG parser accepts `https:example.com` and `https:/example.com` and rewrites them to a full URL, so
   // the raw text must itself carry the `scheme://` form: the text is what a stored value is checked against.
   if (!/^https?:\/\/[^/]/i.test(value)) return false
@@ -35,7 +41,16 @@ export function isSafePublicBaseUrl(value: string): boolean {
   } catch {
     return false
   }
-  if (parsed.username || parsed.password || parsed.search || parsed.hash || value.includes('?') || value.includes('#')) return false
+  return !(parsed.username || parsed.password || parsed.search || parsed.hash || value.includes('?') || value.includes('#'))
+}
+
+/**
+ * The stricter rule for the Public App URL SETTING, which an administrator types and which every cron job sends
+ * the cron secret to: also https, or http only for a loopback host.
+ */
+export function isSafePublicBaseUrl(value: string): boolean {
+  if (!isCrontabSafeBaseUrl(value)) return false
+  const parsed = new URL(value)
   if (parsed.protocol === 'http:') return LOOPBACK_HOSTS.has(parsed.hostname)
   return parsed.protocol === 'https:'
 }
