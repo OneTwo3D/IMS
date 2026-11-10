@@ -109,3 +109,10 @@ test('debounced search keeps a filter changed during the debounce, and resyncs o
   assert.equal(shouldResyncSearchInput('back-q', 'typed'), true, 'Back changed q')
   assert.equal(shouldResyncSearchInput('typed', 'typed'), false, 'our own push does not clobber the box')
 })
+
+test('purchase-order includeArchived shows archived orders with no search; the exact short match is case-insensitive', () => {
+  assert.equal(poListHidesArchived({ includeArchived: true }), false)
+  assert.ok(!json(buildPurchaseOrderListWhere({ includeArchived: true })).includes('"archived"'))
+  assert.ok(json(buildSalesOrderListWhere({ q: 'a' })).includes('"equals":"a","mode":"insensitive"'))
+  assert.ok(json(buildPurchaseOrderListWhere({ q: 'a' })).includes('"equals":"a","mode":"insensitive"'))
+})

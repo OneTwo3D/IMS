@@ -104,3 +104,23 @@ test('a not-computed stock-position report (aging, dead stock) shows dashes, not
   assert.match(limited, /Report not computed/)
   assert.ok(render([]).includes('0.00'), 'a computed report still shows its footer')
 })
+
+test('a not-computed inventory-costing report (COGS, turnover) shows dashes in footers and no row or page count', async () => {
+  const { InventoryCostingReportPage } = await import('@/app/(dashboard)/analytics/_components/inventory-costing-report')
+  const render = (notices: string[]) => renderToStaticMarkup(
+    React.createElement(InventoryCostingReportPage<{ key: string }>, {
+      title: 'COGS', description: 'd', reportKey: 'cogs', filters: {},
+      filterOptions: { warehouses: [], categories: [], suppliers: [], productTypes: [] } as never,
+      pageInfo: { page: 1, pageSize: 100, totalRows: 0, totalPages: 1, hasNextPage: false, hasPreviousPage: false },
+      rows: [], rowKey: (r) => r.key, dateMode: 'range', notices,
+      columns: [{ key: 'v', label: 'Value', align: 'right', render: () => null, footer: '0.00' }],
+      summary: [],
+    }),
+  )
+  const limited = render([sourceLimitNotice(error)])
+  assert.ok(!limited.includes('0.00'), 'no zero footer')
+  assert.ok(!/>0 rows</.test(limited) && !/Page \d+ of/.test(limited), 'no row or page count')
+  assert.match(limited, /Report not computed/)
+  const normal = render([])
+  assert.ok(normal.includes('0.00') && /Page 1 of 1/.test(normal) && />0 rows</.test(normal), 'a computed report keeps them')
+})
