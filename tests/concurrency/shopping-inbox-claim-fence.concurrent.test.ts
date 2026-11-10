@@ -56,6 +56,13 @@ test(
       })
       assert.equal(replay.count, 1)
 
+      // B's own (duplicate) finish after the replay: same generation as the dead-letter, but the row is no longer
+      // PROCESSING, so the status half of the fence refuses it
+      assert.equal(await repository.markProcessed(id, t0, claimB.claimGeneration), false)
+      assert.equal(await repository.markFailed({ id, now: t0, error: 'x', nextAttemptAt: t0, claimGeneration: claimB.claimGeneration }), false)
+      assert.equal(await repository.markDeadLetter({ id, now: t0, error: 'x', claimGeneration: claimB.claimGeneration }), false)
+      assert.equal((await db.shoppingWebhookEvent.findUniqueOrThrow({ where: { id } })).status, 'PENDING')
+
       // A is a straggler that finishes NOW, with every possible outcome, against a PENDING row...
       assert.equal(await repository.markProcessed(id, t0, claimA.claimGeneration), false)
       assert.equal(await repository.markFailed({ id, now: t0, error: 'x', nextAttemptAt: t0, claimGeneration: claimA.claimGeneration }), false)
@@ -73,6 +80,13 @@ test(
       assert.equal(await repository.markProcessed(id, t0, claimA.claimGeneration), false)
       row = await db.shoppingWebhookEvent.findUniqueOrThrow({ where: { id } })
       assert.equal(row.status, 'PROCESSING', 'the live claim is not finished by the stale worker')
+
+      // A straggler's FAILED and DEAD-LETTER writes cannot touch the live claim either
+      assert.equal(await repository.markFailed({ id, now: t0, error: 'x', nextAttemptAt: t0, claimGeneration: claimA.claimGeneration }), false)
+      assert.equal(await repository.markDeadLetter({ id, now: t0, error: 'x', claimGeneration: claimA.claimGeneration }), false)
+      row = await db.shoppingWebhookEvent.findUniqueOrThrow({ where: { id } })
+      assert.equal(row.status, 'PROCESSING')
+      assert.equal(row.lastError, null)
 
       // the live claim's own finish applies, once
       assert.equal(await repository.markProcessed(id, t0, claimC.claimGeneration), true)
@@ -106,8 +120,29 @@ test(
         })
         ids.push(row.id)
       }
+      // a row that is PROCESSED, or that was processed before being dead-lettered, is not replayable
+      const processedId = (await db.shoppingWebhookEvent.create({
+        data: {
+          connector: 'woocommerce', resource: 'orders', externalEventId: `p-${randomUUID()}`, topic: 'order.created',
+          payloadHash: `p-${randomUUID()}`, payloadJson: {}, originAttestation: 'unproven:not-applicable', status: 'PROCESSED', attempts: 1,
+        },
+      })).id
+      const everProcessedId = (await db.shoppingWebhookEvent.create({
+        data: {
+          connector: 'woocommerce', resource: 'orders', externalEventId: `q-${randomUUID()}`, topic: 'order.created',
+          payloadHash: `q-${randomUUID()}`, payloadJson: {}, originAttestation: 'unproven:not-applicable', status: 'DEAD_LETTER', attempts: 1,
+          processedAt: new Date(),
+        },
+      })).id
+      ids.push(processedId, everProcessedId)
+      for (const blocked of [processedId, everProcessedId]) {
+        const attempt = await db.shoppingWebhookEvent.updateMany({
+          where: buildDeadShoppingWebhookReplayWhere(blocked), data: buildDeadShoppingWebhookReplayData(),
+        })
+        assert.equal(attempt.count, 0, 'only a dead letter that was never processed can be replayed')
+      }
       const listed = await db.shoppingWebhookEvent.findMany({ where: { ...DEAD_SHOPPING_WEBHOOK_WHERE, id: { in: ids } } })
-      assert.deepEqual(listed.map((row) => row.id), [ids[0]])
+      assert.deepEqual(listed.map((row) => row.id).sort(), [ids[0], everProcessedId].sort())
       const archived = await db.shoppingWebhookEvent.updateMany({
         where: buildDeadShoppingWebhookReplayWhere(ids[1]), data: buildDeadShoppingWebhookReplayData(),
       })

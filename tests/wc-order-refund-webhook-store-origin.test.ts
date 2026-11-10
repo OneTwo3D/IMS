@@ -312,3 +312,32 @@ for (const resource of ['orders', 'refunds'] as const) {
     assert.deepEqual(calls[key], [])
   })
 }
+
+// --- mutation-pass additions ---------------------------------------------------------------------
+
+for (const [resource, payload, key] of [['orders', ORDER, 'order'], ['refunds', REFUND, 'refund']] as const) {
+  test(`${key}: header-only evidence naming ANOTHER store is held (unsigned, so not proof of foreignness either)`, async () => {
+    reset()
+    const { calls, dependencies } = spies()
+    const response = await dispatch(resource, 'store-header:store-b.example.com', payload, dependencies)
+    assert.equal(response.status, 503)
+    assert.deepEqual(calls[key], [])
+    assert.equal(state.activity.some((entry) => entry.action === `wc_${key}_webhook_foreign_store`), false)
+    assert.equal((state.activity.find((entry) => entry.action === `wc_${key}_webhook_held`)?.metadata as Row).originScope, 'header')
+  })
+}
+
+test('a refund hold names the order from order_id, or from parent_id when order_id is absent', async () => {
+  for (const [payload, expected] of [[{ id: 77, order_id: 9001 }, 9001], [{ id: 77, parent_id: 9002 }, 9002]] as const) {
+    reset()
+    state.settings.delete('wc_url')
+    const { dependencies } = spies()
+    await dispatch('refunds', 'store:store-a.example.com', payload, dependencies)
+    assert.equal((state.activity.find((entry) => entry.action === 'wc_refund_webhook_held')?.metadata as Row).externalId, expected)
+  }
+})
+
+test('restRouteSiteRoot refuses a link with a fragment', async () => {
+  const { restRouteSiteRoot } = await import('@/lib/connectors/woocommerce/webhook-origin')
+  assert.equal(restRouteSiteRoot('https://store-a.example.com/?rest_route=/wc/v3/orders/1#frag'), null)
+})

@@ -189,3 +189,17 @@ test('turned off (or switched to from_wc) while the push is in flight: the final
     assert.deepEqual(writes(), [], 'nothing may be written after the setting was turned off')
   }
 })
+
+test('decideWcProductPush names the reason: disabled, from_wc/unset/blank, or an unrecognised value', async () => {
+  const { decideWcProductPush } = await import('@/lib/connectors/woocommerce/sync/product-push-gate')
+  const reason = (enabled: string | null, direction: string | null) => {
+    const d = decideWcProductPush(enabled, direction)
+    return d.allowed ? 'allowed' : d.reason
+  }
+  assert.equal(reason('false', 'to_wc'), 'disabled')
+  assert.equal(reason(null, 'to_wc'), 'disabled')
+  for (const direction of ['from_wc', null, '']) assert.equal(reason('true', direction), 'direction_from_wc', String(direction))
+  assert.equal(reason('true', 'sideways'), 'direction_unreadable')
+  assert.equal(reason('true', 'to_wc'), 'allowed')
+  assert.equal(reason('true', 'both'), 'allowed')
+})

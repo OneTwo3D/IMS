@@ -154,3 +154,49 @@ test('dead letters of a connector with no active drain are not listed and cannot
   assert.equal(matches({ ...dead, connector: 'woocommerce' } as unknown as Row, buildDeadShoppingWebhookReplayWhere('x')), true)
   assert.equal(matches({ ...dead, connector: 'shopify' } as unknown as Row, buildDeadShoppingWebhookReplayWhere('x')), false)
 })
+
+test('a worker that lost its claim on a RETRYABLE failure (not the last attempt) is also discarded, not recorded as failed', async () => {
+  const { processShoppingWebhookEvent } = await import('@/lib/jobs/shopping/process-shopping-webhook-events')
+  const claimed = {
+    id: 'evt-8', connector: 'woocommerce', resource: 'orders', externalEventId: null, topic: 'order.created',
+    payloadHash: 'h', payloadJson: {}, originAttestation: 'store:store-a.example.com', status: 'PROCESSING',
+    attempts: 1, claimGeneration: 3, nextAttemptAt: null, processedAt: null, lastError: null,
+    receivedAt: new Date(), updatedAt: new Date(),
+  }
+  const seen: number[] = []
+  const repository = {
+    claimEvent: async () => claimed,
+    markProcessed: async () => true,
+    markFailed: async (input: { claimGeneration: number }) => { seen.push(input.claimGeneration); return false },
+    markDeadLetter: async () => true,
+  } as never
+  const originalWarn = console.warn
+  console.warn = () => {}
+  try {
+    const result = await processShoppingWebhookEvent('evt-8', {
+      connector: 'woocommerce', connectorLabel: 'WooCommerce', logPrefix: '[t]', repository,
+      env: { WC_WEBHOOK_INBOX_MAX_ATTEMPTS: '5' },
+      processPayload: async () => Response.json({ ok: false }, { status: 503 }),
+    } as never)
+    assert.deepEqual(result, { status: 'skipped', eventId: 'evt-8', reason: 'claim_lost' })
+  } finally {
+    console.warn = originalWarn
+  }
+  assert.deepEqual(seen, [3])
+})
+
+test('the replay builders say exactly what is re-queued and what is cleared', async () => {
+  const { buildDeadShoppingWebhookReplayData, buildDeadShoppingWebhookReplayWhere } = await import('@/lib/domain/shopping-webhook-exception')
+  assert.deepEqual(buildDeadShoppingWebhookReplayData(), { status: 'PENDING', attempts: 0, nextAttemptAt: null, lastError: null })
+  const where = buildDeadShoppingWebhookReplayWhere('x') as Record<string, unknown>
+  assert.equal(where.id, 'x')
+  assert.equal(where.status, 'DEAD_LETTER')
+  assert.equal(where.processedAt, null)
+  assert.deepEqual(where.connector, { in: ['woocommerce'] })
+  // a row that is not dead, or was ever processed, does not match
+  const base = { id: 'x', connector: 'woocommerce', status: 'DEAD_LETTER', processedAt: null }
+  assert.equal(matches(base as unknown as Row, where), true)
+  assert.equal(matches({ ...base, status: 'PROCESSED' } as unknown as Row, where), false)
+  assert.equal(matches({ ...base, status: 'PENDING' } as unknown as Row, where), false)
+  assert.equal(matches({ ...base, processedAt: new Date() } as unknown as Row, where), false)
+})
