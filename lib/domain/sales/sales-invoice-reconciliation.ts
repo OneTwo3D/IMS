@@ -80,3 +80,17 @@ export class SalesInvoiceDoesNotReconcileError extends Error {
     this.name = 'SalesInvoiceDoesNotReconcileError'
   }
 }
+
+/**
+ * A positive shipping or order-discount amount the connector would DROP because its account is not mapped: the invoice would book short of (or over) that
+ * money. Named so the message says which mapping is missing; still a reconciliation refusal, so every caller that refuses a mismatch refuses this.
+ */
+export class SalesInvoiceExtraNotMappedError extends SalesInvoiceDoesNotReconcileError {
+  constructor(which: 'shipping' | 'discount', amount: number, currency: string) {
+    super({ expected: 0, orderTotal: 0, difference: 0 }, currency)
+    this.message = which === 'shipping'
+      ? `This order has shipping of ${amount.toFixed(2)} ${currency}, but the shipping account is not set in the accounting settings, so the invoice would leave the shipping out and total less than the order. It was not queued and the order was not moved or saved. The shipping account is set under Settings, Accounting.`
+      : `This order has an order discount of ${amount.toFixed(2)} ${currency}, but the discount account is not set in the accounting settings, so the invoice would leave the discount out and total more than the order. It was not queued and the order was not moved or saved. The discount account is set under Settings, Accounting.`
+    this.name = 'SalesInvoiceExtraNotMappedError'
+  }
+}

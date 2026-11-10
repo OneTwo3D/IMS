@@ -34,7 +34,7 @@ let seq = 0
 
 before(async () => {
   s = await startScratch('ims-audit-fixes')
-  for (const [key, value] of [['plugin_xero_enabled', 'true'], ['xero_sync_enabled', 'true'], ['xero_sales_account', '200'], ['xero_transit_account', '631']] as const) {
+  for (const [key, value] of [['plugin_xero_enabled', 'true'], ['xero_sync_enabled', 'true'], ['xero_sales_account', '200'], ['xero_shipping_account', '210'], ['xero_discount_account', '220'], ['xero_transit_account', '631']] as const) {
     await s.db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
   }
   productId = (await s.db.product.create({ data: { sku: 'AUD-1', name: 'AUD 1', type: 'SIMPLE' }, select: { id: true } })).id
@@ -359,6 +359,44 @@ test('SO-H2: a LIVE order whose invoice would not book to its total is refused a
   const ok = await createSalesOrder(orderInput({ pricesIncludeVat: false, lines: [line(100)], taxRateName: 'AUD Sales 20', taxRateValue: 0.2, shippingForeign: 10 }) as never)
   assert.equal(ok.success, true, ok.error)
   assert.equal((await invoiceRows(ok.order!.id)).length, 1)
+})
+
+// [mutation: reconcile against the amounts instead of the lines the connector emits; or drop the missing-mapping refusal]
+test('SO-H2: shipping or an order discount whose account is not mapped would be DROPPED by the connector: live creation and finalisation refuse, naming the mapping', async () => {
+  const { createSalesOrder, updateSalesOrderStatus } = await import('@/app/actions/sales')
+  const keys = ['xero_shipping_account', 'xero_discount_account']
+  const saved = await s.db.setting.findMany({ where: { key: { in: keys } } })
+  const restore = async () => { for (const r of saved) await s.db.setting.upsert({ where: { key: r.key }, create: { key: r.key, value: r.value }, update: { value: r.value } }) }
+  const base = { pricesIncludeVat: false, lines: [line(100)], taxRateName: 'AUD Sales 20', taxRateValue: 0.2 }
+  try {
+    // (a) no shipping account
+    await s.db.setting.deleteMany({ where: { key: 'xero_shipping_account' } })
+    const before = await s.db.salesOrder.count()
+    const noShip = await createSalesOrder(orderInput({ ...base, shippingForeign: 10 }) as never)
+    assert.equal(noShip.success, false)
+    assert.match(String(noShip.error), /^This order has shipping of 10\.00 GBP, but the shipping account is not set/)
+    assert.equal(await s.db.salesOrder.count(), before, 'nothing was saved')
+    const draft = await createSalesOrder(orderInput({ ...base, shippingForeign: 10, isDraft: true }) as never)
+    assert.equal(draft.success, true, draft.error)
+    const fin = await updateSalesOrderStatus(draft.order!.id, 'PENDING_PAYMENT')
+    assert.equal(fin.success, false)
+    assert.match(String(fin.error), /shipping account is not set/)
+    assert.equal((await s.db.salesOrder.findUniqueOrThrow({ where: { id: draft.order!.id } })).status, 'DRAFT')
+    const plain = await createSalesOrder(orderInput(base) as never)
+    assert.equal(plain.success, true, 'an order with no shipping does not need the mapping: ' + plain.error)
+    await restore()
+    // (b) shipping mapped, no discount account
+    await s.db.setting.deleteMany({ where: { key: 'xero_discount_account' } })
+    const noDisc = await createSalesOrder(orderInput({ ...base, shippingForeign: 10, orderDiscountForeign: 5 }) as never)
+    assert.equal(noDisc.success, false)
+    assert.match(String(noDisc.error), /^This order has an order discount of 5\.00 GBP, but the discount account is not set/)
+    const shipOnly = await createSalesOrder(orderInput({ ...base, shippingForeign: 10 }) as never)
+    assert.equal(shipOnly.success, true, 'shipping alone does not need the discount mapping: ' + shipOnly.error)
+  } finally {
+    await restore()
+    await s.db.setting.upsert({ where: { key: 'xero_discount_account' }, create: { key: 'xero_discount_account', value: '220' }, update: { value: '220' } })
+    await s.db.setting.upsert({ where: { key: 'xero_shipping_account' }, create: { key: 'xero_shipping_account', value: '210' }, update: { value: '210' } })
+  }
 })
 
 test('SO-H2: the reconciliation also refuses a stored order whose amounts are net but flagged gross, and lets every consistent order through', async () => {

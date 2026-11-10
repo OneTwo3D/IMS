@@ -124,8 +124,8 @@ import {
   expectedSalesOrderLineTaxForeign,
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
-import { NO_TAX_TYPE, isNoTaxType } from '@/lib/domain/accounting/sales-document-tax-types'
-import { SalesInvoiceDoesNotReconcileError, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
+import { NO_TAX_TYPE, connectorEmitsDiscount, connectorEmitsShipping, droppedExtraMapping, isNoTaxType } from '@/lib/domain/accounting/sales-document-tax-types'
+import { SalesInvoiceDoesNotReconcileError, SalesInvoiceExtraNotMappedError, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
 import {
   INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
   STORED_INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
@@ -1548,6 +1548,11 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     return rates.size === 1 ? [...rates][0]! : null
   }
   // The invoice must book to the order's own total (lib/domain/sales/sales-invoice-reconciliation.ts): refused here rather than queued.
+  // Only what the connector will actually send is reconciled (one shared decision, lib/domain/accounting/sales-document-tax-types.ts): a positive
+  // shipping or discount amount whose account is not set is DROPPED by the builder, so it is refused here, naming the missing mapping.
+  const droppedExtra = droppedExtraMapping(payload)
+  if (droppedExtra === 'shipping') throw new SalesInvoiceExtraNotMappedError('shipping', Number(payload.shippingAmount), so.currency)
+  if (droppedExtra === 'discount') throw new SalesInvoiceExtraNotMappedError('discount', Number(payload.discountAmount), so.currency)
   const reconciliation = invoiceReconciliationProblem({
     lineAmountsIncludeTax,
     headerRate: vatPct,
@@ -1556,8 +1561,8 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     lines: payload.lines.map((l, idx) => ({ quantity: l.quantity, unitAmount: l.unitAmount, discountAmount: l.discountAmount, rate: rateOfSentCode(l.taxType), storedTax: Number(so.lines[idx]?.taxForeign ?? 0) })),
     shippingRate: rateOfSentCode(payload.shippingTaxType),
     discountRate: rateOfSentCode(payload.discountTaxType),
-    shippingAmount: payload.shippingAmount,
-    discountAmount: payload.discountAmount,
+    shippingAmount: connectorEmitsShipping(payload) ? payload.shippingAmount : undefined,
+    discountAmount: connectorEmitsDiscount(payload) ? payload.discountAmount : undefined,
   }, Number(so.totalForeign))
   if (reconciliation) throw new SalesInvoiceDoesNotReconcileError(reconciliation, so.currency)
   if (options?.checkOnly) return
