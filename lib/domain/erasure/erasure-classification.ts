@@ -166,7 +166,7 @@ ERASURE_CLASSIFICATION.WmsSyncLog = {
 // by an allowlist projection, the error text by the marker; every other column is an id, a status, a count or a clock.
 ERASURE_CLASSIFICATION.ShoppingWebhookEvent = {
   erased: ['payloadJson', 'lastError'],
-  notPersonal: ['connector', 'resource', 'externalEventId', 'topic', 'payloadHash', 'originAttestation', 'status', 'claimGeneration'],
+  notPersonal: ['connector', 'resource', 'externalEventId', 'topic', 'payloadHash', 'originAttestation', 'status'],
   retained: {},
 }
 ERASURE_CLASSIFICATION.ShoppingSyncLog = {
