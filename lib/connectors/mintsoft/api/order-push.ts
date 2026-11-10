@@ -200,6 +200,28 @@ async function findExistingByReference(input: WmsOrderPushInput, clientId: numbe
   return matches.length === 1 ? matches[0] : null
 }
 
+type LiveOrderRead = { ok: true } | { ok: false; kind: 'cancelled' | 'unconfirmed'; reason: string }
+
+/**
+ * THE ONE READ-BACK BEFORE IMS BINDS TO AN ORDER IT FOUND BY SEARCH (shared by the ambiguous-create reconcile and the duplicate-create
+ * path). The search row's own status is not trusted (it can be absent): the order is read by id and bound only if that scoped read
+ * succeeds, is ours, and carries a PRESENT status that is not CANCELLED.
+ */
+async function readBackLiveOrder(id: string, clientId: number): Promise<LiveOrderRead> {
+  const detail = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(id)}?ClientId=${clientId}`)
+  const row = !detail.error && detail.data && typeof detail.data === 'object' && !Array.isArray(detail.data) ? (detail.data as RawOrder) : null
+  if (!row) return { ok: false, kind: 'unconfirmed', reason: 'Mintsoft holds this order but it could not be read back to check its status, so it was not linked' }
+  if (toStr(row.ClientId ?? row.clientId) !== String(clientId) || toStr(row.ID ?? row.Id ?? row.id) !== id) {
+    return { ok: false, kind: 'unconfirmed', reason: 'Mintsoft holds this order but the read-back did not confirm it is ours, so it was not linked' }
+  }
+  const status = orderStatusId(row)
+  if (status === null) return { ok: false, kind: 'unconfirmed', reason: 'Mintsoft holds this order but its status could not be read, so it was not linked' }
+  if (status === MINTSOFT_STATUS_CANCELLED) {
+    return { ok: false, kind: 'cancelled', reason: 'Mintsoft holds this order but it is CANCELLED there (a cancelled order keeps its number), so it was not linked' }
+  }
+  return { ok: true }
+}
+
 /**
  * Resolve a create whose outcome IS NOT RECORDED (a timed-out PUT, a 5xx, a lost link write) by READING Mintsoft: the same scoped
  * Order/Search the push dedupe uses. Nothing is written. An order is adopted only when exactly one row matches and that row carries
@@ -234,19 +256,9 @@ export async function reconcileMintsoftAmbiguousCreate(
   if (matches.length === 1 && exact.length === 1) {
     const id = toStr(exact[0].ID ?? exact[0].Id ?? exact[0].id)
     if (id) {
-      // THE SEARCH ROW'S STATUS IS NOT TRUSTED (it can be absent). The order is read by id and its status taken from THAT: adopted only
-      // while the read succeeds, is ours, and carries a status that is not CANCELLED. Anything else leaves the link parked, visibly.
-      const detail = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(id)}?ClientId=${clientId}`)
-      const row = !detail.error && detail.data && typeof detail.data === 'object' && !Array.isArray(detail.data) ? (detail.data as RawOrder) : null
-      if (!row) return { kind: 'UNRESOLVED', reason: 'Mintsoft holds this order but it could not be read back to check its status, so it was not linked' }
-      if (toStr(row.ClientId ?? row.clientId) !== String(clientId) || toStr(row.ID ?? row.Id ?? row.id) !== id) {
-        return { kind: 'UNRESOLVED', reason: 'Mintsoft holds this order but the read-back did not confirm it is ours, so it was not linked' }
-      }
-      const status = orderStatusId(row)
-      if (status === null) return { kind: 'UNRESOLVED', reason: 'Mintsoft holds this order but its status could not be read, so it was not linked' }
-      if (status === MINTSOFT_STATUS_CANCELLED) {
-        return { kind: 'UNRESOLVED', reason: 'Mintsoft holds this order but it is CANCELLED there (a cancelled order keeps its number), so it was not linked' }
-      }
+      // THE SEARCH ROW'S STATUS IS NOT TRUSTED: the order is read back by id and adopted only if that shows a live order.
+      const live = await readBackLiveOrder(id, clientId)
+      if (!live.ok) return { kind: 'UNRESOLVED', reason: live.reason }
       return { kind: 'ADOPT', externalOrderId: id, externalOrderNumber: toStr(exact[0].OrderNumber) ?? reference.orderNumber }
     }
   }
@@ -478,8 +490,11 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
     if (existing && externalOrderId) {
       // A cancelled Mintsoft order keeps its OrderNumber, so "already exists" can be answered by one. Binding to it would make IMS treat
       // a dead order as the live one (it would never despatch). Refused: the push fails for an operator instead.
-      if (orderStatusId(existing) === MINTSOFT_STATUS_CANCELLED) {
-        throw new Error('Mintsoft refused the create because the order number already exists, and the order holding it is CANCELLED in Mintsoft (a cancelled order keeps its number). IMS did not link to it.')
+      const live = await readBackLiveOrder(externalOrderId, clientId)
+      if (!live.ok) {
+        throw new Error(live.kind === 'cancelled'
+          ? 'Mintsoft refused the create because the order number already exists, and the order holding it is CANCELLED in Mintsoft (a cancelled order keeps its number). IMS did not link to it.'
+          : 'Mintsoft refused the create because the order number already exists, but the order holding it could not be confirmed live (the read-back failed, was not ours, or showed no status). IMS did not link to it.')
       }
       return {
         externalOrderId,
@@ -488,8 +503,8 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
         // Which form the pre-existing order carries is unknown: record none, flag the courier for review, and let the first
         // amendment pick it like a fresh create.
         courierFallback: true,
-        // Already proven: findExistingByReference asserts our ClientId on every
-        // row it considers, so this id came from a read, not from trust.
+        // Already proven: findExistingByReference asserts our ClientId on every row it considers and the read-back above confirmed a live
+        // order, so this id came from reads, not from trust.
         needsVerification: false,
       }
     }

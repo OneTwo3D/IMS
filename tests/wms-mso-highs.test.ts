@@ -645,3 +645,33 @@ test('R4: the cancel intent is re-read before EACH split-part storefront write -
   assert.equal(partials.length, 1, 'only the part pushed before the cancel')
   assert.match(errors[0], /after IMS cancelled or fully refunded it/)
 })
+
+test('R6: a merge lookup that FAILS leaves the link retryable (no final not-found stamp); a later lookup that finds the survivor re-points it', async () => {
+  let lookups = 0
+  const seed = {
+    holdable: [{ id: 'link-1', orderId: 'so-2', externalOrderId: 'old-1', externalOrderNumber: 'ORD-B' }],
+    linkNow: { state: 'SYNCED', externalOrderId: 'old-1' },
+  }
+  const { port, updates } = makePort(seed)
+  const wms = connector({
+    cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), comments: [],
+    findMergedSurvivor: async () => { lookups += 1; if (lookups === 1) throw new Error('search unavailable'); return { externalOrderId: 'surv-1', externalOrderNumber: 'ORD-C+ORD-B' } },
+  })
+  const first = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
+  assert.equal(first.operatorNotices, undefined, 'no notice yet')
+  assert.equal(updates.length, 1)
+  assert.equal(updates[0].data.holdNoticeAt, undefined, 'NOT stamped: the link stays in the hold pass')
+  assert.match(String(updates[0].data.lastError), /will be retried on the next sweep/)
+  const second = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
+  assert.equal(second.operatorNotices, 1)
+  assert.equal(updates.find((u) => u.data.state === 'MERGED')?.data.externalOrderId, 'surv-1')
+  assert.equal(lookups, 2)
+})
+
+test('R6: only a lookup that SUCCEEDS and finds nothing raises the final not-found notice', async () => {
+  const { port, updates } = makePort({ cancellable: [{ id: 'link-1', orderId: 'so-2', externalOrderId: 'old-1', externalOrderNumber: 'ORD-B' }] })
+  const wms = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), findMergedSurvivor: async () => null })
+  const r = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
+  assert.equal(r.operatorNotices, 1)
+  assert.ok(updates[0].data.cancelNoticeAt)
+})

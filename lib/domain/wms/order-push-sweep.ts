@@ -1310,7 +1310,14 @@ export async function runWmsOrderPushSweepCore(
       try {
         survivor = await connector.findMergedSurvivor(link.externalOrderNumber)
       } catch (error) {
+        // An INCONCLUSIVE lookup is not "no survivor". The final not-found notice would take the link out of the hold/cancel passes for
+        // good, so nothing is stamped: the link stays retryable and the transient reason is left on it. The next sweep asks again.
         console.warn(`[wms-order-push] merge lookup failed for link ${link.id}: ${scrubWmsError(error, 'merge lookup failed')}`)
+        await port.updateLink(link.id, {
+          lastError: `A hold or cancel found WMS order ${link.externalOrderId} missing and the check for a merge failed; it will be retried on the next sweep.`,
+          lastAttemptAt: ts,
+        }).catch(() => {})
+        return
       }
     }
     if (survivor && survivor.externalOrderId !== link.externalOrderId && link.externalOrderId) {

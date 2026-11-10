@@ -248,6 +248,7 @@ test('live duplicate answer: the existing LIVE order (backordered, status 9) is 
   const { pushMintsoftOrder } = await push()
   createResult = LIVE_DUPLICATE
   searchRows = [{ ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 9 }]
+  details.set('900', { ID: 900, OrderNumber: 'WC-1001', ClientId: CLIENT, OrderStatusId: 9 })
   assert.equal((await pushMintsoftOrder(INPUT as never)).externalOrderId, '900')
 })
 
@@ -256,7 +257,29 @@ test('live duplicate answer: a CANCELLED order keeps its number - IMS refuses to
   const { pushMintsoftOrder } = await push()
   createResult = LIVE_DUPLICATE
   searchRows = [{ ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 3 }]
+  details.set('900', { ID: 900, OrderNumber: 'WC-1001', ClientId: CLIENT, OrderStatusId: 3 })
   await assert.rejects(() => pushMintsoftOrder(INPUT as never), /holding it is CANCELLED in Mintsoft/)
+})
+
+test('live duplicate answer: a search row with NO status is not trusted - the read-back says CANCELLED, so IMS does not bind', async () => {
+  reset()
+  const { pushMintsoftOrder } = await push()
+  createResult = LIVE_DUPLICATE
+  searchRows = [{ ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: null }]
+  details.set('900', { ID: 900, OrderNumber: 'WC-1001', ClientId: CLIENT, OrderStatusId: 3 })
+  await assert.rejects(() => pushMintsoftOrder(INPUT as never), /CANCELLED in Mintsoft/)
+})
+
+test('live duplicate answer: no read-back, or a read-back with no status, is not a live order - IMS does not bind', async () => {
+  reset()
+  const { pushMintsoftOrder } = await push()
+  createResult = LIVE_DUPLICATE
+  searchRows = [{ ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT }]
+  await assert.rejects(() => pushMintsoftOrder(INPUT as never), /could not be confirmed live/)
+  details.set('900', { ID: 900, OrderNumber: 'WC-1001', ClientId: CLIENT })
+  await assert.rejects(() => pushMintsoftOrder(INPUT as never), /could not be confirmed live/)
+  details.set('900', { ID: 900, OrderNumber: 'WC-1001', ClientId: CLIENT, OrderStatusId: 1 })
+  assert.equal((await pushMintsoftOrder(INPUT as never)).externalOrderId, '900', 'control: a live order binds')
 })
 
 test('cancel: a BACKORDERED order (status 9) is cancellable, and the answer is a fresh cancellation', async () => {
