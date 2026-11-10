@@ -383,3 +383,20 @@ test('Invoices tab carries the bound marker for an unplaceable credit, on screen
     assert.equal(u.split(',')[cols.indexOf('balanceBound')], 'upper')
   } finally { ORDERS.pop() }
 })
+
+test('an own-currency part payment at a different settlement rate owes the same 40 on every receivables screen', async () => {
+  // $100 invoice booked at 80 base; $50 received settling at 1.20. At the booked rate that is 40 received, 40 owed: the rate difference is FX, not receivable.
+  ORDERS.push(row('V', 80, {
+    invoiceNumber: 'INV-V', currency: 'USD', totalForeign: D(100),
+    payments: [{ amount: D(50), currency: 'USD', paidAt: TODAY_START, refundId: null, settlementRateToBase: D(1.2) }],
+  }))
+  try {
+    const { getCustomerAging, getInvoiceStats } = await import('@/app/actions/sales-stats')
+    assert.equal((await getCustomerAging()).find((r) => r.orderNumber === 'V')!.dueAmount, 40)
+    assert.equal((await getInvoiceStats()).find((r) => r.orderNumber === 'V')!.balance, 40)
+    const deps = { client: financeClient(), now: () => TODAY_NOON, baseCurrency: async () => 'GBP' }
+    assert.equal(Number((await getArAgingReport({ dateTo: TODAY }, { deps })).totals.outstandingBase), 160, 'A 50 + B 70 + V 40')
+    const summary = await getCurrencySummaryReport({ dateFrom: TODAY, dateTo: TODAY }, { deps })
+    assert.equal(Number(summary.totals.arOutstandingBase), 160)
+  } finally { ORDERS.pop() }
+})
