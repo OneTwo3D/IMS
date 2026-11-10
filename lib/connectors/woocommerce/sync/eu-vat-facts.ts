@@ -107,17 +107,22 @@ export function readPluginFxConflict(order: Pick<WcFullOrder, 'meta_data'>): boo
 
 /**
  * The plugin's own conversion record: `_o3d_ioss_fx_rate` (exact decimal string), `_o3d_ioss_fx_pair` ("GBP>EUR") and `_o3d_ioss_threshold_value` (two decimals), written together with the account.
- * None of the three is `absent` (an order from before the plugin wrote them); all three readable is `present`; anything between is `incomplete`.
+ * None of the three is `absent` (an order from before the plugin wrote them); all three readable is `present`; anything between is `incomplete`. A field that is present but unreadable is also named in `problems`.
  */
-export function readPluginFx(order: Pick<WcFullOrder, 'meta_data'>): PluginFxFact {
-  const raw = ['_o3d_ioss_fx_rate', '_o3d_ioss_fx_pair', '_o3d_ioss_threshold_value'].map((key) => metaValue(order.meta_data, key))
+export function readPluginFx(order: Pick<WcFullOrder, 'meta_data'>, problems: string[] = []): PluginFxFact {
+  const keys = ['_o3d_ioss_fx_rate', '_o3d_ioss_fx_pair', '_o3d_ioss_threshold_value']
+  const raw = keys.map((key) => metaValue(order.meta_data, key))
   const given = raw.map((value) => value !== undefined && !(typeof value === 'string' && value.trim() === ''))
   if (given.every((g) => !g)) return { state: 'absent' }
   const rate = decimalText(raw[0])
   const pairRaw = raw[1]
   const pair = typeof pairRaw === 'string' && /^[A-Za-z]{3}>[A-Za-z]{3}$/.test(pairRaw.trim()) ? pairRaw.trim().toUpperCase() : null
   const thresholdValue = decimalText(raw[2])
-  const bad = [rate === null || !D(rate).gt(0) ? 'rate' : null, pair === null ? 'pair' : null, thresholdValue === null ? 'threshold value' : null].filter((x): x is string => x !== null)
+  const readable = [rate !== null && D(rate).gt(0), pair !== null, thresholdValue !== null]
+  const names = ['rate', 'pair', 'threshold value']
+  // A field that is present but cannot be read is an unreadable figure of the order (both modes refuse first); a field that is simply missing makes the record incomplete (adopt mode refuses).
+  readable.forEach((ok, i) => { if (!ok && given[i]) problems.push(`the plugin FX ${names[i]} (${keys[i]}) is present but unreadable`) })
+  const bad = names.filter((_, i) => !readable[i])
   if (bad.length > 0) return { state: 'incomplete', detail: `${bad.join(', ')} ${given.every(Boolean) ? 'unreadable' : 'missing or unreadable'}` }
   return { state: 'present', rate: rate!, pair: pair!, thresholdValue: thresholdValue! }
 }
@@ -189,7 +194,7 @@ export function readWcEuVatFacts(order: WcFullOrder): WcEuVatFacts {
     pluginFxConflict: readPluginFxConflict(order),
     vatRecord: readVatRecord(order),
     eas: readEasFact(order),
-    pluginFx: readPluginFx(order),
+    pluginFx: readPluginFx(order, unreadable),
     pluginVatAccount,
     overThresholdDutyFee,
   }

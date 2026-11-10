@@ -198,12 +198,12 @@ test('an order with no creation date cannot be valued: the threshold fact is una
 })
 
 test('adopt mode end to end (the default): the plugin account decides and its conversion record lands in the basis', async () => {
-  const withMeta = wcOrder({ meta_data: [meta('_o3d_ioss_vat_account', '232'), meta('_o3d_ioss_fx_rate', '1.15'), meta('_o3d_ioss_fx_pair', 'EUR>EUR'), meta('_o3d_ioss_threshold_value', '100.00')] })
+  const withMeta = wcOrder({ line_items: [{ id: 1, total: '200.00', meta_data: [] }] as never, meta_data: [meta('_o3d_ioss_vat_account', '232'), meta('_o3d_ioss_fx_rate', '1'), meta('_o3d_ioss_fx_pair', 'EUR>EUR'), meta('_o3d_ioss_threshold_value', '200.00')] })
   const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), withMeta, { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP' })
   assert.equal(input.mode, 'adopt_plugin')
   const d = resolveEuVatRegime(input)
   assert.equal(d.kind === 'SCHEME' && d.regime, 'DDP')
-  assert.equal(d.kind === 'SCHEME' && d.basis.pluginFx.recorded && d.basis.pluginFx.rate, '1.15')
+  assert.equal(d.kind === 'SCHEME' && d.basis.pluginFx.recorded && d.basis.pluginFx.rate, '1')
   // the same order without the account refuses; in decide mode it decides by value
   const bare = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder(), { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP' })
   assert.equal(resolveEuVatRegime(bare).kind === 'REFUSE' && (resolveEuVatRegime(bare) as { code: string }).code, 'plugin_account_missing')
@@ -249,5 +249,30 @@ test('every malformed figure refuses the order end to end, before it is resolved
     const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder(over), { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide' })
     const d = resolveEuVatRegime(input)
     assert.equal(d.kind === 'REFUSE' && d.code, 'order_figure_unreadable', name)
+  }
+})
+
+test('a plugin FX field that is present but unreadable is an unreadable figure (both modes refuse first); a missing one is only incomplete', async () => {
+  const withFx = (entries: Array<[string, unknown]>) => wcOrder({ meta_data: entries.map(([k, v]) => meta(k, v)) })
+  const good: Array<[string, unknown]> = [['_o3d_ioss_fx_rate', '1'], ['_o3d_ioss_fx_pair', 'EUR>EUR'], ['_o3d_ioss_threshold_value', '100.00']]
+  assert.deepEqual(readWcEuVatFacts(withFx(good)).unreadable, [])
+  const cases: Array<[string, Array<[string, unknown]>, RegExp]> = [
+    ['rate', [['_o3d_ioss_fx_rate', 'abc'], good[1]!, good[2]!], /FX rate \(_o3d_ioss_fx_rate\) is present but unreadable/],
+    ['zero rate', [['_o3d_ioss_fx_rate', '0'], good[1]!, good[2]!], /FX rate/],
+    ['pair', [good[0]!, ['_o3d_ioss_fx_pair', 'EURUSD'], good[2]!], /FX pair \(_o3d_ioss_fx_pair\)/],
+    ['value', [good[0]!, good[1]!, ['_o3d_ioss_threshold_value', '1,5']], /FX threshold value \(_o3d_ioss_threshold_value\)/],
+    ['one bad, one missing', [['_o3d_ioss_fx_rate', 'abc'], good[1]!], /FX rate/],
+  ]
+  for (const [name, entries, pattern] of cases) assert.match(readWcEuVatFacts(withFx(entries)).unreadable.join(), pattern, name)
+  // a missing field alone is incomplete, not unreadable
+  const missing = readWcEuVatFacts(withFx([good[0]!, good[1]!]))
+  assert.deepEqual(missing.unreadable, [])
+  assert.equal(missing.pluginFx.state, 'incomplete')
+  // end to end: both modes refuse first with order_figure_unreadable, before any adopt-mode FX check
+  for (const mode of ['adopt_plugin', 'decide'] as const) {
+    const order = withFx([['_o3d_ioss_vat_account', '821'], ['_o3d_ioss_fx_rate', 'abc'], good[1]!, good[2]!])
+    const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), order, { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode })
+    const d = resolveEuVatRegime(input)
+    assert.equal(d.kind === 'REFUSE' && d.code, 'order_figure_unreadable', mode)
   }
 })

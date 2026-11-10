@@ -43,6 +43,8 @@ export const IOSS_THRESHOLD_EUR = '150'
 export const VOEC_THRESHOLD_NOK = '3000'
 /** A converted value within this fraction of the threshold is "too close to call": the exchange rate on the day decides the regime. */
 export const THRESHOLD_WARN_BAND = '0.05'
+/** The plugin's recorded goods value may differ from rate x IMS's goods by this much in the threshold currency (a cent of rounding on each side). */
+export const PLUGIN_VALUE_TOLERANCE = '0.02'
 /** Tolerance for agreement between two figures that should be equal (the plugin's own). */
 export const FIGURE_TOLERANCE = '0.02'
 /** Tax below this moved no money. */
@@ -163,6 +165,7 @@ export const REFUSAL_CODES = [
   'plugin_account_unrecognised',
   'plugin_fx_incomplete',
   'plugin_fx_conflict',
+  'plugin_evidence_contradicts',
   'order_figure_unreadable',
   'vat_record_unreadable',
   'tax_not_explained_by_scheme_rates',
@@ -343,6 +346,22 @@ export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision
     if (input.pluginFx.state === 'incomplete') return refuse('plugin_fx_incomplete', `the plugin recorded the VAT account but its conversion record is incomplete or unreadable: ${input.pluginFx.detail}`)
     if (input.pluginFx.state === 'present' && input.pluginFx.pair !== `${input.currency}>${thresholdCurrency}`) {
       return refuse('plugin_fx_conflict', `the plugin's conversion pair is ${input.pluginFx.pair} but this order converts ${input.currency}>${thresholdCurrency}, so its record does not belong to this decision`)
+    }
+    if (input.pluginFx.state === 'present') {
+      // The plugin's own evidence must agree with itself and with the order. (1) Its recorded value selects its recorded account, as it compares: at the minor unit, strictly above the threshold is DDP. (2) Its rate applied to
+      // the goods IMS sees must give its recorded value within rounding: PLUGIN_VALUE_TOLERANCE in the threshold currency. Goods lines with no gift-card flag may be gift cards the plugin left out, so the recorded value may
+      // be anywhere between the known goods alone and all the unflagged goods too. A contradiction refuses; an order with no conversion record is exempt (before the plugin wrote one).
+      const recordedValue = roundMinor(D(input.pluginFx.thresholdValue))
+      if (recordedValue.gt(threshold) !== (regime === 'DDP')) {
+        return refuse('plugin_evidence_contradicts', `the plugin recorded a goods value of ${recordedValue.toFixed(2)} ${thresholdCurrency} (${recordedValue.gt(threshold) ? 'over' : 'at or under'} ${threshold.toFixed(0)}) but VAT account ${recorded}, which is the ${regime === 'DDP' ? 'DDP' : 'IOSS/VOEC'} account`)
+      }
+      const pluginRate = D(input.pluginFx.rate)
+      const high = roundMinor(intrinsic.times(pluginRate))
+      const low = roundMinor(goodsExVoucher.filter((line) => line.voucher === 'no').reduce((sum, line) => sum.plus(D(line.total)), D(0)).times(pluginRate))
+      const tol = D(PLUGIN_VALUE_TOLERANCE)
+      if (recordedValue.lt(low.minus(tol)) || recordedValue.gt(high.plus(tol))) {
+        return refuse('plugin_evidence_contradicts', `the plugin's rate ${input.pluginFx.rate} on this order's goods (${intrinsic.toFixed(2)} ${input.currency}) gives ${high.toFixed(2)} ${thresholdCurrency}${low.eq(high) ? '' : ` (${low.toFixed(2)} without the unflagged lines)`}, not the ${recordedValue.toFixed(2)} it recorded (tolerance ${PLUGIN_VALUE_TOLERANCE})`)
+      }
     }
     if (input.pluginFxConflict) return refuse('plugin_fx_conflict', 'the plugin left differing FX meta unchanged when it recorded this decision, so the conversion on the order is not the one that decided it')
     if (byValue !== null && byValue !== regime) {

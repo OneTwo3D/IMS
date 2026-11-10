@@ -182,6 +182,7 @@ const refusalRows: Array<[string, EuVatRegimeInput, (typeof REFUSAL_CODES)[numbe
   ['adopt: a conversion pair that is not the order\'s', order({ mode: 'adopt_plugin', pluginVatAccount: '821', pluginFx: { state: 'present', rate: '1', pair: 'USD>EUR', thresholdValue: '100.00' } }), 'plugin_fx_conflict'],
   ['an unreadable order figure', order({ unreadable: ['order tax unreadable'] }), 'order_figure_unreadable'],
   ['an unreadable EU VAT record', order({ vatRecord: { state: 'unreadable', detail: 'x' } }), 'vat_record_unreadable'],
+  ['adopt: the plugin recorded DDP-sized evidence for an IOSS account', order({ mode: 'adopt_plugin', pluginVatAccount: '821', pluginFx: { state: 'present', rate: '1', pair: 'EUR>EUR', thresholdValue: '200.00' } }), 'plugin_evidence_contradicts'],
   ['adopt: the plugin left differing FX meta unchanged', order({ mode: 'adopt_plugin', pluginVatAccount: '821', pluginFxConflict: true }), 'plugin_fx_conflict'],
   ['tax on a rate that is not a scheme rate beside scheme VAT', order({ orderTax: '25.00' }), 'tax_not_explained_by_scheme_rates'],
   ['an unflagged line decides DDP', order({ goodsLines: [{ total: '400.00', voucher: 'unknown' }] }), 'voucher_status_unknown'],
@@ -292,8 +293,8 @@ test('the resolver does not mutate its input and is deterministic', () => {
 
 // ---- adopt_plugin mode: the plugin's decision is adopted, not re-made -----------------------------------------------------------------------------------------------------
 const adopt = (over: Partial<EuVatRegimeInput> = {}) => order({ mode: 'adopt_plugin', pluginVatAccount: '821', ...over })
-const pluginFx = { state: 'present' as const, rate: '1.1500', pair: 'EUR>EUR', thresholdValue: '149.50' }
-const recorded = { recorded: true, rate: '1.1500', pair: 'EUR>EUR', thresholdValue: '149.50' }
+const pluginFx = { state: 'present' as const, rate: '1', pair: 'EUR>EUR', thresholdValue: '100.00' }
+const recorded = { recorded: true, rate: '1', pair: 'EUR>EUR', thresholdValue: '100.00' }
 const notRecorded = { recorded: false, note: 'not recorded by the plugin' }
 
 test('adopt: each account value determines the regime, whatever the value says', () => {
@@ -345,7 +346,7 @@ test("adopt: the plugin's rate, pair and converted value are recorded in the bas
 })
 
 test("adopt: with no IMS rate the plugin's converted value stands in and the missing rate does not refuse", () => {
-  const d = scheme(resolveEuVatRegime(adopt({ currency: 'GBP', thresholdFx: { state: 'unavailable', reason: 'no rate' }, pluginFx: { ...pluginFx, pair: 'GBP>EUR' } })))
+  const d = scheme(resolveEuVatRegime(adopt({ currency: 'GBP', goodsLines: [{ total: '130.00', voucher: 'no' }], thresholdFx: { state: 'unavailable', reason: 'no rate' }, pluginFx: { state: 'present', rate: '1.15', pair: 'GBP>EUR', thresholdValue: '149.50' } })))
   assert.equal(d.basis.fx, null)
   assert.equal(d.basis.convertedValue, '149.50')
   const none = scheme(resolveEuVatRegime(adopt({ currency: 'GBP', thresholdFx: { state: 'unavailable', reason: 'no rate' } })))
@@ -380,7 +381,7 @@ test("adopt: a complete conversion record whose pair is not order currency > thr
   assert.equal(scheme(resolveEuVatRegime(adopt({ currency: 'GBP', pluginFx: pair('GBP>EUR') }))).regime, 'IOSS')
   assert.equal(refused(resolveEuVatRegime(adopt({ currency: 'GBP', pluginFx: pair('GBP>NOK') }))).code, 'plugin_fx_conflict')
   const norway = nokOrderOf('1000', { mode: 'adopt_plugin', currency: 'GBP', pluginVatAccount: '821' })
-  assert.equal(scheme(resolveEuVatRegime({ ...norway, pluginFx: pair('GBP>NOK') })).regime, 'VOEC')
+  assert.equal(scheme(resolveEuVatRegime({ ...norway, pluginFx: { ...pair('GBP>NOK'), thresholdValue: '1000.00' } })).regime, 'VOEC')
   assert.equal(refused(resolveEuVatRegime({ ...norway, pluginFx: pair('GBP>EUR') })).code, 'plugin_fx_conflict')
   // decide mode does not read the pair
   assert.equal(resolveEuVatRegime(order({ pluginFx: pair('USD>NOK') })).kind, 'SCHEME')
@@ -497,4 +498,55 @@ test('the WooCommerce rate ids in the basis are sorted as numbers', () => {
     rates: [{ wooRateId: 100, tax: '3.00', mapping: schemeRate('PT', { imsRateId: 'pt-b' }) }, { wooRateId: 9, tax: '10.00', mapping: schemeRate('PT', { imsRateId: 'pt-a' }) }],
   })))
   assert.deepEqual(d.basis.wooRateIds, [9, 100])
+})
+
+// ---- adopt: the plugin's own evidence must be consistent -----------------------------------------------------------------------------------------------------------------
+const evidence = (over: Partial<EuVatRegimeInput>, value: string, rate = '1', pair = 'EUR>EUR') => adopt({ pluginFx: { state: 'present', rate, pair, thresholdValue: value }, ...over })
+
+test('adopt evidence: EUR 100 goods, a recorded value of 100.00 and the DDP account is a contradiction', () => {
+  const d = refused(resolveEuVatRegime(evidence({ pluginVatAccount: '232' }, '100.00')))
+  assert.equal(d.code, 'plugin_evidence_contradicts')
+  assert.ok(d.reason.includes('232'))
+})
+
+test('adopt evidence: the recorded value selects the account at the minor unit, strictly above the threshold is DDP', () => {
+  const rows: Array<[string, string, string, boolean]> = [
+    ['150.00', '821', '150.00', true], ['150.00', '232', '150.00', false], ['150.01', '232', '150.01', true], ['150.01', '821', '150.01', false],
+    ['150.004', '821', '150.00', true], ['150.005', '232', '150.01', true], ['149.99', '232', '149.99', false],
+  ]
+  for (const [value, account, goods, ok] of rows) {
+    const d = resolveEuVatRegime(evidence({ pluginVatAccount: account, goodsLines: [{ total: goods, voucher: 'no' }], overThresholdDutyFee: account === '232' }, value))
+    assert.equal(d.kind, ok ? 'SCHEME' : 'REFUSE', `${value} on ${account}`)
+    if (!ok) assert.equal(d.kind === 'REFUSE' && d.code, 'plugin_evidence_contradicts')
+  }
+  // Norway: NOK 3000.00 is VOEC, 3000.01 is DDP
+  const no = (value: string, account: string) => resolveEuVatRegime({ ...nokOrderOf(value), mode: 'adopt_plugin', pluginVatAccount: account, pluginFx: { state: 'present', rate: '1', pair: 'NOK>NOK', thresholdValue: value } })
+  assert.equal(no('3000.00', '821').kind, 'SCHEME')
+  assert.equal(no('3000.00', '232').kind, 'REFUSE')
+  assert.equal(no('3000.01', '232').kind, 'SCHEME')
+  assert.equal(no('3000.01', '821').kind, 'REFUSE')
+})
+
+test("adopt evidence: the plugin's rate times IMS's goods must give its recorded value within 0.02", () => {
+  const gbp = (value: string, rate = '1.15') => resolveEuVatRegime(evidence({ currency: 'GBP', goodsLines: [{ total: '130.00', voucher: 'no' }] }, value, rate, 'GBP>EUR'))
+  assert.equal(gbp('149.50').kind, 'SCHEME')
+  assert.equal(gbp('149.52').kind, 'SCHEME')
+  assert.equal(gbp('149.48').kind, 'SCHEME')
+  for (const bad of ['149.53', '149.47', '100.00']) assert.equal(gbp(bad).kind === 'REFUSE' && (gbp(bad) as { code: string }).code, 'plugin_evidence_contradicts', bad)
+  // a rate that does not produce the value from these goods
+  assert.equal(gbp('149.50', '1.30').kind, 'REFUSE')
+})
+
+test('adopt evidence: unflagged lines may be gift cards the plugin left out, so the value may be anywhere between the known goods and all the goods', () => {
+  const lines = [{ total: '100.00', voucher: 'no' as const }, { total: '40.00', voucher: 'unknown' as const }]
+  for (const ok of ['100.00', '120.00', '140.00']) assert.equal(resolveEuVatRegime(evidence({ goodsLines: lines }, ok)).kind, 'SCHEME', ok)
+  for (const bad of ['99.00', '141.00']) assert.equal(resolveEuVatRegime(evidence({ goodsLines: lines }, bad)).kind, 'REFUSE', bad)
+  // a flagged gift card is simply not goods
+  assert.equal(resolveEuVatRegime(evidence({ goodsLines: [{ total: '100.00', voucher: 'no' }, { total: '60.00', voucher: 'yes' }] }, '100.00')).kind, 'SCHEME')
+  assert.equal(resolveEuVatRegime(evidence({ goodsLines: [{ total: '100.00', voucher: 'no' }, { total: '60.00', voucher: 'yes' }] }, '160.00')).kind, 'REFUSE')
+})
+
+test('adopt evidence: an order with no conversion record is exempt (before the plugin wrote one); decide mode never reads it', () => {
+  assert.equal(resolveEuVatRegime(adopt({ pluginVatAccount: '232', pluginFx: { state: 'absent' } })).kind, 'SCHEME')
+  assert.equal(resolveEuVatRegime(order({ pluginFx: { state: 'present', rate: '1', pair: 'EUR>EUR', thresholdValue: '900.00' } })).kind, 'SCHEME')
 })
