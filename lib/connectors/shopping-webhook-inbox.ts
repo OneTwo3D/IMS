@@ -50,6 +50,8 @@ export type ShoppingWebhookEventRow = {
   originAttestation: string
   status: string
   attempts: number
+  /** Counts every claim, never reset: the terminal writes are fenced on it. */
+  claimGeneration: number
   nextAttemptAt: Date | null
   processedAt: Date | null
   lastError: string | null
@@ -95,9 +97,13 @@ export type ShoppingWebhookEventRepository = {
     staleProcessingBefore: Date
   }): Promise<Array<Pick<ShoppingWebhookEventRow, 'id'>>>
   claimEvent(id: string, now: Date, staleProcessingBefore: Date): Promise<ShoppingWebhookEventRow | null>
-  markProcessed(id: string, now: Date): Promise<ShoppingWebhookEventRow>
-  markFailed(input: { id: string; now: Date; error: string; nextAttemptAt: Date }): Promise<ShoppingWebhookEventRow>
-  markDeadLetter(input: { id: string; now: Date; error: string }): Promise<ShoppingWebhookEventRow>
+  /**
+   * The terminal writes are fenced on the claim (status PROCESSING and the `claimGeneration` the claim
+   * returned) and answer whether they applied: `false` means this worker no longer holds the row.
+   */
+  markProcessed(id: string, now: Date, claimGeneration: number): Promise<boolean>
+  markFailed(input: { id: string; now: Date; error: string; nextAttemptAt: Date; claimGeneration: number }): Promise<boolean>
+  markDeadLetter(input: { id: string; now: Date; error: string; claimGeneration: number }): Promise<boolean>
 }
 
 /** @deprecated Use ShoppingWebhookEventRepository. */
@@ -125,6 +131,7 @@ const eventSelect = {
   originAttestation: true,
   status: true,
   attempts: true,
+  claimGeneration: true,
   nextAttemptAt: true,
   processedAt: true,
   lastError: true,
@@ -247,6 +254,7 @@ export function createShoppingWebhookEventRepository(
         SET
           "status" = ${WC_WEBHOOK_EVENT_STATUS.processing},
           "attempts" = "attempts" + 1,
+          "claimGeneration" = "claimGeneration" + 1,
           "nextAttemptAt" = NULL,
           "lastError" = NULL,
           "updatedAt" = ${now}
@@ -268,6 +276,7 @@ export function createShoppingWebhookEventRepository(
           "originAttestation",
           "status",
           "attempts",
+          "claimGeneration",
           "nextAttemptAt",
           "processedAt",
           "lastError",
@@ -276,39 +285,42 @@ export function createShoppingWebhookEventRepository(
       `
       return rows[0] ?? null
     },
-    async markProcessed(id, now) {
-      return client.update({
-        where: { id },
+    // The three terminal writes are FENCED on the claim: status PROCESSING and the claimGeneration the
+    // claim returned. A worker whose claim expired and was taken over (or dead-lettered and replayed)
+    // matches no row and gets `false`, so it cannot overwrite the row's newer state.
+    async markProcessed(id, now, claimGeneration) {
+      const { count } = await client.updateMany({
+        where: { id, status: WC_WEBHOOK_EVENT_STATUS.processing, claimGeneration },
         data: {
           status: WC_WEBHOOK_EVENT_STATUS.processed,
           processedAt: now,
           nextAttemptAt: null,
           lastError: null,
         },
-        select: eventSelect,
       })
+      return count === 1
     },
     async markFailed(input) {
-      return client.update({
-        where: { id: input.id },
+      const { count } = await client.updateMany({
+        where: { id: input.id, status: WC_WEBHOOK_EVENT_STATUS.processing, claimGeneration: input.claimGeneration },
         data: {
           status: WC_WEBHOOK_EVENT_STATUS.failed,
           lastError: input.error,
           nextAttemptAt: input.nextAttemptAt,
         },
-        select: eventSelect,
       })
+      return count === 1
     },
     async markDeadLetter(input) {
-      return client.update({
-        where: { id: input.id },
+      const { count } = await client.updateMany({
+        where: { id: input.id, status: WC_WEBHOOK_EVENT_STATUS.processing, claimGeneration: input.claimGeneration },
         data: {
           status: WC_WEBHOOK_EVENT_STATUS.deadLetter,
           lastError: input.error,
           nextAttemptAt: null,
         },
-        select: eventSelect,
       })
+      return count === 1
     },
   }
 }

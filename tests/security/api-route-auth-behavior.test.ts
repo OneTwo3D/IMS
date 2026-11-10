@@ -92,6 +92,7 @@ function wcWebhookEvent(overrides: Partial<{
     originAttestation: 'unproven:not-applicable',
     status: WC_WEBHOOK_EVENT_STATUS.pending,
     attempts: 0,
+    claimGeneration: 0,
     nextAttemptAt: null,
     processedAt: null,
     lastError: null,
