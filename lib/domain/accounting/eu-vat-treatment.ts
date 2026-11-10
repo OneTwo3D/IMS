@@ -285,6 +285,13 @@ export function routeFor(
   }
   if (decision.kind !== 'SCHEME') return { ok: false, reason: `the order was stamped ${stamp.regime} but its tax no longer identifies a scheme rate; it is not posted until a person looks` }
   if (stamp.vatAccount === null || stamp.vatAccount.trim() === '') return { ok: false, reason: `the order's ${stamp.regime} stamp names no VAT account` }
+  // The stamp is written once and never re-derived, so a fresh decision that differs from it (the goods value or the mode changed since) is not posted through the old stamp: it needs a person.
+  if (decision.regime !== stamp.regime || decision.vatAccount.trim() !== stamp.vatAccount.trim()) {
+    return {
+      ok: false,
+      reason: `the order was stamped ${stamp.regime} on account ${stamp.vatAccount}, but its facts now decide ${decision.regime} on account ${decision.vatAccount.trim()}; the stamp is never re-derived, so it is not posted until a person looks`,
+    }
+  }
   const percent = schemeRatePercent(input)
   return {
     ok: true,

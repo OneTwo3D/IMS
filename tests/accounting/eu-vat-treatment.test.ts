@@ -275,8 +275,29 @@ test('routeFor: a stamp and the current facts that contradict each other refuse;
   // a REFUSE
   const d = routeFor({ regime: 'IOSS', vatAccount: '821', stampedAt }, { kind: 'REFUSE', code: 'rate_unmapped', reason: 'x' }, built.input)
   assert.equal(d.ok, false)
-  // the stamped account and regime are used as stamped, not as the facts would now choose them
-  const e = routeFor({ regime: 'DDP', vatAccount: '232', stampedAt }, scheme, built.input)
+  // a stamp that agrees with the fresh decision routes with the stamped account and regime
+  const e = routeFor({ regime: 'IOSS', vatAccount: '821', stampedAt }, scheme, built.input)
   assert.ok(e.ok)
-  assert.deepEqual(e.ok && e.route.kind === 'scheme' && [e.route.regime, e.route.vatAccount], ['DDP', '232'])
+  assert.deepEqual(e.ok && e.route.kind === 'scheme' && [e.route.regime, e.route.vatAccount], ['IOSS', '821'])
+  // the stamp is never re-derived: a fresh decision of another regime or another account is NOT posted through the old stamp
+  const f = routeFor({ regime: 'DDP', vatAccount: '232', stampedAt }, scheme, built.input)
+  assert.equal(f.ok, false)
+  assert.match(f.ok ? '' : f.reason, /stamped DDP on account 232, but its facts now decide IOSS on account 821/)
+  const g = routeFor({ regime: 'IOSS', vatAccount: '999', stampedAt }, scheme, built.input)
+  assert.equal(g.ok, false)
+})
+
+test('a threshold-crossing re-import: stamped IOSS at 96, the goods rise over EUR 150, the fresh decision is DDP, so the invoice is refused, not posted through the IOSS stamp', () => {
+  const de = schemeRows.find((r) => r.country === 'DE')!
+  const first = build(de, { goodsSubtotal: '100.00' })
+  const ioss = resolveEuVatRegime(first.input)
+  assert.equal(ioss.kind === 'SCHEME' && ioss.regime, 'IOSS')
+  const stamp = { regime: 'IOSS' as const, vatAccount: '821', stampedAt: new Date() }
+  const later = build(de, { goodsSubtotal: '200.00' })
+  const ddp = resolveEuVatRegime(later.input)
+  assert.equal(ddp.kind === 'SCHEME' && ddp.regime, 'DDP')
+  const routed = routeFor(stamp, ddp, later.input)
+  assert.equal(routed.ok, false)
+  // the same order again with the same facts still routes
+  assert.ok(routeFor(stamp, ioss, first.input).ok)
 })

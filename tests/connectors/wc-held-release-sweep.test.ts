@@ -66,7 +66,7 @@ function heldRow(overrides: Partial<HeldRow> & { id: string; entityId: string })
       salesOrderId: overrides.entityId,
       orderNumber: 'WC-164981',
       metaKey: '_wcpdf_invoice_number',
-      accountingPayload: { contactName: 'A Customer', date: '2026-08-01', currency: 'GBP', lines: [] },
+      accountingPayload: { contactName: 'A Customer', date: '2026-08-01', currency: 'GBP', lines: [], _euVatTreatment: { applied: true, route: 'none' } },
       // o3d-j625: whose chart the frozen account codes are. Present on every hold this build parks, and
       // the release REFUSES a hold that cannot name one (o3d-j625 r2) — see the legacy-hold test below.
       chartConnector: 'xero',

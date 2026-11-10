@@ -1712,16 +1712,15 @@ async function releaseHeldWcSalesInvoice(
     }
     return 'not-queued'
   }
-  // A HOLD PARKED WHILE THE SALES INVOICES SWITCH WAS OFF was built without the EU IOSS/VOEC/DDP treatment (the import skips it while the switch is off). Released now that the switch is on, it would
+  // A HOLD WITH NO TREATMENT MARKER (parked before the treatment existed) OR PARKED WHILE THE SALES INVOICES SWITCH WAS OFF was built without the EU IOSS/VOEC/DDP treatment (the import skips it while the switch is off; every hold the treatment ran on carries applied:true). Released now that the switch is on, it would
   // post a scheme sale on its charged rate. It stays PENDING with the reason; re-importing the order rebuilds the payload with the treatment and replaces the parked one. With the switch still off nothing
   // changes: the release is not-configured as ever.
-  if (held.accountingPayload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
-    && (held.accountingPayload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown } | null)?.applied === false
+  if ((held.accountingPayload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown } | null | undefined)?.applied !== true
     && heldChartConnector !== null
     && (await (await import('@/lib/accounting')).isAccountingSyncTypeEnabledFor(heldChartConnector, 'SALES_INVOICE'))) {
     await noteHeldReleaseFailure(
       row.id,
-      `WooCommerce numbered this invoice ${invoiceNumber}, but this hold was parked while the Sales Invoices switch was off, so it was built without the EU IOSS/VOEC/DDP treatment. `
+      `WooCommerce numbered this invoice ${invoiceNumber}, but this hold was parked before the EU IOSS/VOEC/DDP treatment ran on it (before it existed, or while the Sales Invoices switch was off), so it was built without the EU IOSS/VOEC/DDP treatment. `
       + 'NOTHING was queued: re-import the order from WooCommerce to rebuild the invoice, which then releases.',
     )
     return 'not-queued'
@@ -3537,9 +3536,12 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           orderNumber,
           metaKey: invoiceNumberResolution.metaKey,
           // A hold parked while the Sales Invoices switch is off carries the EU VAT treatment's absence on it, so a later release (switch on) does not post it untreated.
-          accountingPayload: euVatOutcome.kind === 'skipped' && euVatOutcome.why === 'switch_off'
-            ? { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'sales_invoices_switch_off' } }
-            : invoicePayload,
+          // Every parked payload says whether the treatment ran on it: applied:true when it did (even where it left the lines alone), applied:false when the switch was off or the order carries store credit.
+          accountingPayload: euVatOutcome.kind === 'skipped'
+            ? { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: euVatOutcome.why === 'switch_off' ? 'sales_invoices_switch_off' : 'store_credit' } }
+            : invoicePayload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
+              ? invoicePayload
+              : { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null } },
           // o3d-j625: the same chart read that produced every account code in `accountingPayload`,
           // parked alongside them — the release can be days later and must not re-resolve it.
           chartConnector: settings.connector,

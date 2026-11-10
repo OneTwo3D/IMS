@@ -27,6 +27,8 @@ async function mockAccounting() {
     namedExports: {
       ...actual,
       getAccountingSettings: async () => ({ connector: 'xero', salesAccount: '200', shippingAccount: '260', discountAccount: '270', reverseChargeSalesTaxType: '' }),
+      // The EU VAT invoice treatment is gated on the real Sales Invoices switch, which other tests in the shared CI database may leave on: pinned off here, this test is about the untreated payload.
+      isAccountingSyncTypeEnabledFor: async () => false,
       // The importer enqueues its invoice INSIDE the order-locked transaction. The queue double writes the real accounting_sync_logs row in that
       // transaction (the connector registry is not configured here), and the test reads the payload back from the row.
       queueAccountingSyncTxWithOutcome: async (tx: { accountingSyncLog: { create(args: unknown): Promise<unknown> } }, params: { type: string; referenceType: string; referenceId: string; payload: Record<string, unknown>; idempotencyKey?: string }) => {
