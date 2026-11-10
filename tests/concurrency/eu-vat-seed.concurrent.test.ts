@@ -246,6 +246,8 @@ test('a rate edited in the instant between the plan read and the row lock fails 
     () => d.db.shoppingTaxRateMapping.update({ where: { id: zMapping }, data: { taxRateId: de } }),
     () => d.db.shoppingTaxRateMapping.update({ where: { id: zMapping }, data: { externalTaxRateId: '99151' } }),
     () => d.db.shoppingTaxRateMapping.delete({ where: { id: zMapping } }),
+    // An active tax component that changes the percentage tax is computed at arrives on the German rate between the plan read and the lock.
+    () => d.db.taxRateComponent.create({ data: { taxRateId: de, name: 'late', rate: '0.2100', sortOrder: 0, active: true } }),
     // A mapping nobody declared arrives on the German rate between the plan read and the lock.
     () => d.db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: '88888', externalName: 'Stray', externalCountry: 'DE', externalRatePct: '19.0000', externalClass: 'standard', taxRateId: de, storeIdentity: STORE } }),
   ]
@@ -273,6 +275,7 @@ test('a rate edited in the instant between the plan read and the row lock fails 
       const fields = { connector: origMapping.connector, externalTaxRateId: origMapping.externalTaxRateId, externalName: origMapping.externalName, externalCountry: origMapping.externalCountry, externalRatePct: origMapping.externalRatePct, externalClass: origMapping.externalClass, taxRateId: origMapping.taxRateId, storeIdentity: origMapping.storeIdentity }
       await d.db.shoppingTaxRateMapping.upsert({ where: { id: zMapping }, create: origMapping, update: fields })
       await d.db.shoppingTaxRateMapping.deleteMany({ where: { connector: 'woocommerce', externalTaxRateId: '88888' } })
+      await d.db.taxRateComponent.deleteMany({ where: { taxRateId: de } })
     }
   }
   await d.db.taxRate.update({ where: { id: ids.rates[3]! }, data: { reportingCategory: null } })
@@ -410,5 +413,21 @@ test('an undeclared mapping onto a declared rate after the dry run is a differen
     assert.deepEqual(await snapshotRates(), before)
   } finally {
     await d.db.shoppingTaxRateMapping.delete({ where: { id: stray.id } })
+  }
+})
+
+test('an active component added after the dry run changes the percentage tax is computed at: the plan skips the rate and the apply refuses', { skip }, async () => {
+  for (const id of ids.rates) await d.db.taxRate.update({ where: { id }, data: { schemePostingTaxType: null, reportingCategory: null } })
+  const { digest } = await plan()
+  const de = ids.rates[1]!
+  const component = await d.db.taxRateComponent.create({ data: { taxRateId: de, name: 'late', rate: '0.2100', sortOrder: 0, active: true } })
+  try {
+    assert.equal((await plan()).skipped.find((s) => s.wooId === 220)?.reason, 'IMS_PERCENT_DIFFERS')
+    const before = await snapshotRates()
+    const result = await apply(digest)
+    assert.equal(result.applied === false && result.refusal?.code, 'DIGEST_MISMATCH')
+    assert.deepEqual(await snapshotRates(), before)
+  } finally {
+    await d.db.taxRateComponent.delete({ where: { id: component.id } })
   }
 })

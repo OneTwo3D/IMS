@@ -17,6 +17,8 @@
  * SEVERITY. `error` blocks readiness; `advisory` is listed and does not.
  */
 import { createHash } from 'node:crypto'
+import { imsPercent as effectiveImsPercent } from '@/lib/reconciliation-pack/vat-set-identity'
+import type { TaxComponentRateRow, TaxRateRow } from '@/lib/reconciliation-pack/ims-readers'
 import { Prisma } from '@/app/generated/prisma/client'
 import { EU_ISO_CODES, VOEC_ISO_CODES } from '@/lib/connectors/xero/tax-rate-report-type'
 import type { XeroConnectionStamp } from '@/lib/connectors/xero/connection-fence'
@@ -55,6 +57,8 @@ export type PreflightInput = {
   seed: EuVatSeed
   xero: PreflightXero
   imsRates: readonly PreflightImsRate[]
+  /** The tax components of the IMS rates (all rows; the active ones of a rate decide the percentage tax is computed at, as in the set-identity report). */
+  componentRates: readonly TaxComponentRateRow[]
   mappings: readonly PreflightMapping[]
   /** The cached chart of accounts, active accounts with a code. */
   accounts: readonly PreflightAccount[]
@@ -127,6 +131,11 @@ function mappingsByImsRate(mappings: readonly PreflightMapping[]): Map<string, s
   return out
 }
 
+/** The active components of a rate in order, as bound into the plan (rate as four-decimal text). */
+function activeComponents(all: readonly TaxComponentRateRow[], rateId: string): Array<{ rate: string; compoundOnPrevious: boolean; sortOrder: number }> {
+  return all.filter((c) => c.taxRateId === rateId && c.active).sort((a, b) => a.sortOrder - b.sortOrder).map((c) => ({ rate: new Dec(c.rate).toFixed(4), compoundOnPrevious: c.compoundOnPrevious, sortOrder: c.sortOrder }))
+}
+
 function resolveRates(input: PreflightInput): Resolved[] {
   const mappingBy = new Map(input.mappings.map((m) => [m.externalTaxRateId, m]))
   const imsBy = new Map(input.imsRates.map((r) => [r.id, r]))
@@ -171,7 +180,8 @@ export function evaluateEuVatPreflight(input: PreflightInput): PreflightResult {
     if (strangers.length > 0) err('SHARED_IMS_ROW', `IMS rate "${ims.name}" also stands for Woo ${strangers.join(', ')}, which are not declared to be the same Xero rate (an undeclared mapping counts)`)
     if (!ims.active) err('IMS_RATE_INACTIVE', `"${ims.name}"`)
     else if (!isActiveSalesRate(ims)) err('IMS_RATE_NOT_SALES', `"${ims.name}" is used for ${ims.usedFor}${ims.reverseCharge ? ', reverse charge' : ''}`)
-    const imsPercent = exactDec(ims.rate)?.mul(100) ?? null
+    // The percentage IMS computes tax at: the active components' effective rate when it has any, else the rate column (the set-identity report's own function).
+    const imsPercent = effectiveImsPercent({ id: ims.id, rate: ims.rate } as TaxRateRow, input.componentRates)
     if (imsPercent === null || !imsPercent.eq(new Dec(rate.ratePercent))) err('IMS_PERCENT_DIFFERS', `IMS ${imsPercent === null ? 'unreadable' : imsPercent.toFixed()}%, declared ${rate.ratePercent}%`)
     if (rate.imsCountry !== null && normaliseCountryCode(ims.countryCode ?? '') !== normaliseCountryCode(rate.imsCountry)) err('IMS_COUNTRY_DIFFERS', `IMS "${ims.countryCode ?? ''}", declared "${rate.imsCountry}"`)
     if (!sameName(ims.name, rate.imsName)) err('IMS_NAME_DIFFERS', `IMS "${ims.name}", declared "${rate.imsName}"`)
@@ -265,12 +275,14 @@ export function evaluateEuVatPreflight(input: PreflightInput): PreflightResult {
 // ---------------------------------------------------------------------------
 
 /** Read-only: the IMS rows and the WooCommerce mappings (all the apply needs). */
-export async function readEuVatImsSide(client: Client): Promise<Pick<PreflightInput, 'imsRates' | 'mappings'>> {
-  const [rates, mappings] = await Promise.all([
+export async function readEuVatImsSide(client: Client): Promise<Pick<PreflightInput, 'imsRates' | 'mappings' | 'componentRates'>> {
+  const [rates, mappings, components] = await Promise.all([
     client.taxRate.findMany({ select: { id: true, name: true, rate: true, usedFor: true, active: true, reverseCharge: true, countryCode: true, accountingTaxType: true, reportingCategory: true, schemePostingTaxType: true }, orderBy: { id: 'asc' } }),
     client.shoppingTaxRateMapping.findMany({ where: { connector: 'woocommerce' }, select: { id: true, externalTaxRateId: true, externalName: true, externalCountry: true, externalRatePct: true, externalClass: true, taxRateId: true, storeIdentity: true }, orderBy: { externalTaxRateId: 'asc' } }),
+    client.taxRateComponent.findMany({ select: { taxRateId: true, rate: true, compoundOnPrevious: true, active: true, sortOrder: true }, orderBy: [{ taxRateId: 'asc' }, { sortOrder: 'asc' }, { id: 'asc' }] }),
   ])
   return {
+    componentRates: components.map((c) => ({ ...c, rate: c.rate.toFixed() })),
     imsRates: rates.map((r) => ({ ...r, rate: r.rate.toFixed() })),
     mappings: mappings.map((m) => ({ ...m, externalRatePct: m.externalRatePct.toFixed() })),
   }
@@ -313,6 +325,8 @@ export type SeedChangeIdentity = {
   usedFor: string
   charged: { code: string; xeroName: string; xeroPercent: string }
   scheme: { code: string; xeroName: string; xeroPercent: string } | null
+  /** The ACTIVE tax components the percentage was computed from, in order: the apply re-reads and compares them under the row lock. */
+  components: Array<{ rate: string; compoundOnPrevious: boolean; sortOrder: number }>
 }
 export type SeedChange = { taxRateId: string; imsName: string; wooId: number; identity: SeedChangeIdentity; from: { schemePostingTaxType: string | null; reportingCategory: string | null }; to: { schemePostingTaxType: string | null; reportingCategory: string | null } }
 export type SeedSkip = { wooId: number; reason: PreflightCode | 'XERO_LIST_NOT_PROVEN'; detail: string }
@@ -352,6 +366,7 @@ export function planEuVatSeedApply(input: PreflightInput): SeedApplyPlan {
       if (existing !== undefined) { existing.identity.mappings.push(facts); existing.identity.mappings.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)); continue }
       const identity: SeedChangeIdentity = {
         storeIdentity: input.storeIdentity, mappings: [facts], allMappingIds: input.mappings.filter((m) => m.taxRateId === ims.id).map((m) => m.id).sort(), name: ims.name, rate: ims.rate, country: ims.countryCode, usedFor: ims.usedFor,
+        components: activeComponents(input.componentRates, ims.id),
         charged: fact(ims.accountingTaxType ?? ''), scheme: rate.schemePostingTaxType === null ? null : fact(rate.schemePostingTaxType),
       }
       changes.push({ taxRateId: ims.id, imsName: ims.name, wooId: rate.wooId, identity, from, to })
@@ -420,6 +435,12 @@ export async function applyEuVatSeed(db: { $transaction: <T>(fn: (tx: Client) =>
         const same = row !== undefined && row.connector === 'woocommerce' && row.externalTaxRateId === facts.externalTaxRateId && row.taxRateId === change.taxRateId && row.storeIdentity === change.identity.storeIdentity
           && (row.externalCountry ?? null) === facts.externalCountry && row.externalRatePct.toFixed(4) === facts.externalRatePct && (row.externalClass ?? null) === facts.externalClass
         if (!same) throw new SeedRaceError(`the mapping of Woo rate ${facts.externalTaxRateId} changed since the plan was read`)
+      }
+      // The components the percentage was computed from, compared with the plan's in order. The rate rows are locked above, and the one editor of a rate's components (the settings action) takes that same row lock first.
+      const components = await tx.taxRateComponent.findMany({ where: { taxRateId: { in: plan.changes.map((c) => c.taxRateId) } }, select: { taxRateId: true, rate: true, compoundOnPrevious: true, active: true, sortOrder: true } })
+      for (const change of plan.changes) {
+        const now = activeComponents(components.map((c) => ({ ...c, rate: c.rate.toFixed() })), change.taxRateId)
+        if (JSON.stringify(now) !== JSON.stringify(change.identity.components)) throw new SeedRaceError(`the tax components of tax rate ${change.taxRateId} changed since the plan was read`)
       }
       for (const change of plan.changes) {
         // Under the row lock: the row must STILL be what the plan judged (identity, charged code, flags) and what it will change from, or the whole apply rolls back.

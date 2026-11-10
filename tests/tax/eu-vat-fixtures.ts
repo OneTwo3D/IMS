@@ -50,6 +50,7 @@ export function perfectWorld(seed: EuVatSeed = loadEuVatSeed()): World {
     storeIdentity: STORE,
     xero: { proven: true, fetchedAt: '2026-11-09T14:00:00.000Z', rows: [...xero.values()] },
     imsRates: uniqueRates(ims),
+    componentRates: [],
     mappings: [...mappings.values()],
     accounts: seed.accounts.map((a) => ({ code: a.code, name: a.name ?? `Account ${a.code}` })),
     settings,

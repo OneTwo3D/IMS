@@ -67,6 +67,7 @@ export function computeSchemePostingDrift(input: {
       if (live === undefined) add(rate.taxRateId, `Scheme posting type ${expectedType} is not in the Xero tax-rate list`)
       else {
         if (live.status !== 'ACTIVE') add(rate.taxRateId, `Scheme posting type ${expectedType} is ${live.status} in Xero, not ACTIVE`)
+        if (live.canApply.revenue !== true) add(rate.taxRateId, `Scheme posting type ${expectedType} cannot be applied to revenue in Xero`)
         const stated = live.effectiveRate ?? live.displayTaxRate
         if (stated === null) add(rate.taxRateId, `Scheme posting type ${expectedType} states no rate in Xero, so it cannot be shown to be zero-rated`)
         else if (Number(stated) !== 0) add(rate.taxRateId, `Scheme posting type ${expectedType} is ${Number(stated)}% in Xero, not 0%`)

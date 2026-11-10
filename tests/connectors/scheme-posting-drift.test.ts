@@ -49,6 +49,8 @@ test('the declared type itself drifting in Xero is reported by code: gone, not A
   const lines = (xero: ReturnType<typeof xeroType>[], rates = good()): string => run(rates, xero).join(' | ')
   assert.match(lines([XERO[1]!]), /TAX131 is not in the Xero tax-rate list/)
   assert.match(lines([xeroType('TAX131', 'DE IOSS VAT', '0.0000', 'ARCHIVED'), XERO[1]!]), /ARCHIVED in Xero, not ACTIVE/)
+  assert.match(lines([{ ...xeroType('TAX131', 'DE IOSS VAT', '0.0000'), canApply: { assets: false, equity: false, expenses: true, liabilities: false, revenue: false } }, XERO[1]!]), /cannot be applied to revenue in Xero/)
+  assert.match(lines([{ ...xeroType('TAX131', 'DE IOSS VAT', '0.0000'), canApply: { assets: null, equity: null, expenses: null, liabilities: null, revenue: null } }, XERO[1]!]), /cannot be applied to revenue in Xero/)
   assert.match(lines([xeroType('TAX131', 'DE IOSS VAT', '19.0000'), XERO[1]!]), /19% in Xero, not 0%/)
   assert.match(lines([{ ...xeroType('TAX131', 'DE IOSS VAT', '0.0000'), effectiveRate: null, displayTaxRate: null }, XERO[1]!]), /states no rate/)
   assert.match(lines([xeroType('TAX131', 'DE IOSS  VAT', '0.0000'), XERO[1]!]), /named "DE IOSS  VAT" in Xero, declared "DE IOSS VAT"/)
