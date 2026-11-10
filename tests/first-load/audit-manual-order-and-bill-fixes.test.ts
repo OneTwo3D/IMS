@@ -340,6 +340,27 @@ test('SO-H2: a code carried by two active rates with different values is not pri
   assert.equal(r.success, true, r.error)
 })
 
+// [mutation: drop the in-transaction reconciliation in createSalesOrder, or make it a warning]
+test('SO-H2: a LIVE order whose invoice would not book to its total is refused at creation: nothing is saved, nothing is allocated, nothing is queued', async () => {
+  const { createSalesOrder } = await import('@/app/actions/sales')
+  const orders = await s.db.salesOrder.count()
+  const allocations = await s.db.orderAllocation.count()
+  const syncRows = await s.db.accountingSyncLog.count()
+  // The header names the 20% code but the order is told 10%: shipping is stored with 10% VAT and sent on the 20% code.
+  const r = await createSalesOrder(orderInput({ pricesIncludeVat: false, lines: [line(100)], taxRateName: 'AUD Sales 20', taxRateValue: 0.1, shippingForeign: 10 }) as never)
+  assert.equal(r.success, false)
+  assert.match(String(r.error), /^The invoice built for this order would total 132\.00 GBP but the order totals 131\.00 GBP/, 'the operator sees the message itself, not an error class')
+  assert.equal(await s.db.salesOrder.count(), orders, 'no order was written')
+  assert.equal(await s.db.orderAllocation.count(), allocations, 'no stock was allocated')
+  assert.equal(await s.db.accountingSyncLog.count(), syncRows, 'no invoice was queued')
+  // The same order as a DRAFT is saved (it is checked at finalisation), and the consistent live order still goes through.
+  const draft = await createSalesOrder(orderInput({ isDraft: true, pricesIncludeVat: false, lines: [line(100)], taxRateName: 'AUD Sales 20', taxRateValue: 0.1, shippingForeign: 10 }) as never)
+  assert.equal(draft.success, true, draft.error)
+  const ok = await createSalesOrder(orderInput({ pricesIncludeVat: false, lines: [line(100)], taxRateName: 'AUD Sales 20', taxRateValue: 0.2, shippingForeign: 10 }) as never)
+  assert.equal(ok.success, true, ok.error)
+  assert.equal((await invoiceRows(ok.order!.id)).length, 1)
+})
+
 test('SO-H2: the reconciliation also refuses a stored order whose amounts are net but flagged gross, and lets every consistent order through', async () => {
   const { updateSalesOrderStatus } = await import('@/app/actions/sales')
   const mk = (flag: boolean, unit: string, total: string) => s.db.salesOrder.create({

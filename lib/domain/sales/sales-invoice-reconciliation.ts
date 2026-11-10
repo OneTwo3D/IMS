@@ -33,7 +33,24 @@ export type ReconcilableInvoice = {
   discountAmount?: number | null
 }
 
-export const RECONCILIATION_TOLERANCE_PER_PART = 0.01
+/**
+ * HOW FAR A GENUINE INVOICE CAN SIT FROM THE ORDER'S TOTAL, in the order's currency.
+ *
+ * The order stores its amounts to four places; the ledger works to two. Each figure the ledger computes by itself (the tax of a line, of the shipping,
+ * of the discount) is rounded once, to the nearest minor unit, so it can be off by at most half a minor unit: 0.005 per line, plus 0.01 for the shipping
+ * and the discount between them. One more cent covers the total itself being rounded. That is the whole of what rounding can produce, and it grows only with
+ * the number of lines.
+ *
+ * It is CAPPED at 1.00: a difference of a whole currency unit is not rounding whatever the line count (at 0.005 a line the cap is reached at 194 lines, far
+ * beyond any order this system holds), so the bound can never be wide enough to hide a mis-taxed shipping line or a fee on the wrong code.
+ */
+export const RECONCILIATION_TOLERANCE_PER_LINE = 0.005
+export const RECONCILIATION_TOLERANCE_FIXED = 0.03
+export const RECONCILIATION_TOLERANCE_CAP = 1
+
+export function reconciliationBound(lineCount: number): number {
+  return Math.min(RECONCILIATION_TOLERANCE_CAP, Math.round((RECONCILIATION_TOLERANCE_PER_LINE * lineCount + RECONCILIATION_TOLERANCE_FIXED) * 10000) / 10000)
+}
 
 export function expectedLedgerTotal(invoice: ReconcilableInvoice): number {
   const shipping = Number(invoice.shippingAmount ?? 0)
@@ -49,7 +66,7 @@ export function expectedLedgerTotal(invoice: ReconcilableInvoice): number {
 export function invoiceReconciliationProblem(invoice: ReconcilableInvoice, orderTotal: number): { expected: number; orderTotal: number; difference: number } | null {
   const expected = Math.round(expectedLedgerTotal(invoice) * 100) / 100
   const difference = Math.round((expected - orderTotal) * 100) / 100
-  const bound = RECONCILIATION_TOLERANCE_PER_PART * (invoice.lines.length + 2)
+  const bound = reconciliationBound(invoice.lines.length)
   return Math.abs(difference) <= bound + 1e-9 ? null : { expected, orderTotal, difference }
 }
 

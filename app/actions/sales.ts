@@ -1224,7 +1224,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
       await resolveLinesTaxRates(tx, lineData)
       // An erased customer is never linked to a new order (lock + re-read; see lib/domain/erasure/customer-link.ts).
       await lockCustomerForOrderLink(tx, input.customerId)
-      return tx.salesOrder.create({
+      const written = await tx.salesOrder.create({
         data: {
           externalOrderNumber,
           orderNumber,
@@ -1259,6 +1259,17 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
         },
         select: SO_SELECT,
       })
+      // A LIVE order is invoiced the moment it is created, and nothing downstream can repair an invoice that does not book to the order. So the invoice
+      // that will be queued is built from the rows just written, INSIDE this transaction, and reconciled to the order's total before anything is
+      // committed or allocated: a mismatch throws, the order is rolled back and nothing is saved. (A draft is checked when it is finalised.)
+      if (!input.isDraft) {
+        try {
+          await queueSalesInvoiceForOrder(written.id, { checkOnly: true, client: tx as unknown as typeof db })
+        } catch (checkError) {
+          if (checkError instanceof SalesInvoiceDoesNotReconcileError) throw checkError
+        }
+      }
+      return written
     }, STOCK_TX_OPTIONS)
 
     const postCommitWarnings: string[] = []
@@ -1348,6 +1359,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
     return postCommitWarnings.length > 0 ? { success: true, order: mapped, postCommitWarnings } : { success: true, order: mapped }
   } catch (e) {
     if (e instanceof CustomerAnonymisedError) return { success: false, error: e.message }
+    if (e instanceof SalesInvoiceDoesNotReconcileError) return { success: false, error: e.message }
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: null,
@@ -1370,8 +1382,10 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
  * invoice id, IMS cannot mutate that accounting document through this create
  * queue; attempts are logged so post-push changes are not silently dropped.
  */
-async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boolean }): Promise<void> {
-  const so = await db.salesOrder.findUnique({
+async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boolean; client?: typeof db }): Promise<void> {
+  // `client` is the creating transaction when the order is not committed yet (the pre-commit reconciliation of a live order).
+  const reader = options?.client ?? db
+  const so = await reader.salesOrder.findUnique({
     where: { id },
     select: {
       id: true,
@@ -1440,7 +1454,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   const orderNumber = getSalesOrderReference(so)
 
   const orderDefaultRate = so.taxRateName
-    ? await db.taxRate.findFirst({
+    ? await reader.taxRate.findFirst({
         where: { name: so.taxRateName, active: true },
         select: { id: true, accountingTaxType: true },
       })
@@ -1525,7 +1539,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   }
 
   const sentCodes = [...new Set([...payload.lines.map((l) => l.taxType), payload.shippingTaxType, payload.discountTaxType].filter((c): c is string => typeof c === 'string' && c.trim() !== '' && !isNoTaxType(c)))]
-  const codeRates = sentCodes.length ? await db.taxRate.findMany({ where: { accountingTaxType: { in: sentCodes }, active: true }, select: { accountingTaxType: true, rate: true } }) : []
+  const codeRates = sentCodes.length ? await reader.taxRate.findMany({ where: { accountingTaxType: { in: sentCodes }, active: true }, select: { accountingTaxType: true, rate: true } }) : []
   const rateOfSentCode = (code: string | null | undefined): number | null => {
     if (typeof code !== 'string' || code.trim() === '') return null
     if (isNoTaxType(code)) return 0
