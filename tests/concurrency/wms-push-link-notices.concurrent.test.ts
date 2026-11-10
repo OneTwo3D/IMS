@@ -286,3 +286,18 @@ test('REAL PORT: the delivery stamp is a compare-and-set on the notice, the stat
   assert.equal(await port.updateLinkIfLinked!(link.id, { state: 'SYNCED', externalOrderId: 'c-1', holdNoticeAt: noticeAt }, { holdNoticeCommentAt: stamp }), true)
   assert.ok((await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })).holdNoticeCommentAt)
 })
+
+test('REAL DISPATCH DEPS: each arm of the cancel-intent guard stands on its own (a refused cancel alone; a full refund alone)', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `arm${randomUUID().slice(0, 8)}`
+  const noticeOnly = await seed(d, `${tag}n`, 'PROCESSING')
+  const refundOnly = await seed(d, `${tag}f`, 'PROCESSING')
+  t.after(async () => { for (const s of [noticeOnly, refundOnly]) await cleanup(d, s) })
+  await d.db.salesOrder.update({ where: { id: refundOnly.orderId }, data: { refundStatus: 'FULL' } })
+  const base = { connector: 'mintsoft', state: 'SYNCED' as const, externalOrderNumber: 'MS-A' }
+  await d.db.wmsOrderPushLink.create({ data: { ...base, orderId: noticeOnly.orderId, externalOrderId: 'a-1', cancelNoticeAt: new Date() } })
+  await d.db.wmsOrderPushLink.create({ data: { ...base, orderId: refundOnly.orderId, externalOrderId: 'a-2' } })
+  const deps2 = d.dispatch.createPrismaDispatchDeps('mintsoft', connector().connector as never)
+  assert.equal(await deps2.cancelIntendedForOrder!(noticeOnly.orderId), true, 'a link carrying a cancel notice, though the order is not otherwise cancellable')
+  assert.equal(await deps2.cancelIntendedForOrder!(refundOnly.orderId), true, 'a fully refunded, undespatched order with no notice yet')
+})

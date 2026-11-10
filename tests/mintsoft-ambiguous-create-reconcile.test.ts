@@ -145,6 +145,16 @@ test('reconcile: two matches are NOT adopted, even when one carries the referenc
     { ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT },
     { ID: 556, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-OTHER', ClientId: CLIENT },
   ]
+  // The read-back WOULD pass for the exact row, so it is the two-match rule that refuses.
+  details.set('555', { ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 })
+  assert.equal((await reconcileMintsoftAmbiguousCreate(REF)).kind, 'UNRESOLVED')
+})
+
+test('reconcile: a single row that is not EXACT (right reference, another number) is not adopted even if its detail looks right', async () => {
+  reset()
+  const { reconcileMintsoftAmbiguousCreate } = await push()
+  searchRows = [{ ID: 555, OrderNumber: 'OTHER-1', ExternalOrderReference: 'REF-1001', ClientId: CLIENT }]
+  details.set('555', { ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 })
   assert.equal((await reconcileMintsoftAmbiguousCreate(REF)).kind, 'UNRESOLVED')
 })
 
@@ -181,6 +191,8 @@ test('reconcile: a FULL page of 10 results may be truncated - held, even when on
   searchRows = Array.from({ length: 10 }, (_, i) => ({ ID: 600 + i, OrderNumber: i === 0 ? 'WC-1001' : `OTHER-${i}`, ExternalOrderReference: i === 0 ? 'REF-1001' : `R-${i}`, ClientId: CLIENT }))
   const result = await reconcileMintsoftAmbiguousCreate(REF)
   assert.equal(result.kind, 'UNRESOLVED')
+  details.set('600', { ID: 600, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 })
+  assert.equal((await reconcileMintsoftAmbiguousCreate(REF)).kind, 'UNRESOLVED', 'even when the read-back would pass, a full page is never adopted')
   searchRows = (searchRows as unknown[]).slice(0, 9)
   details.set('600', { ID: 600, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 })
   assert.equal((await reconcileMintsoftAmbiguousCreate(REF)).kind, 'ADOPT', 'control: nine rows is a complete answer')
@@ -441,4 +453,52 @@ test('R10: a result whose number is a merge containing ours but which has no Cli
   // Conclusive rule-outs stay ABSENT: another client's row, a flag that is present and false, a number that is not a merge containing ours.
   searchRows = [survivorRow({ ClientId: 99 }), survivorRow({ ID: 2, OrderNumber: 'Z-1+Z-2' }), survivorRow({ ID: 3, OrderNameValues: [{ Name: 'MergedOrder', Value: 'False' }] })]
   assert.deepEqual(await findMintsoftMergedSurvivor('ORD-B'), { kind: 'ABSENT' })
+})
+
+test('R10b: the duplicate path selects ONLY the row that carries both fields exactly, among look-alikes; two exact rows are ambiguous', async () => {
+  reset()
+  const { pushMintsoftOrder } = await push()
+  createResult = LIVE_DUPLICATE
+  const exact = { ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 }
+  searchRows = [
+    { ID: 901, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-OTHER', ClientId: CLIENT, OrderStatusId: 1 },
+    { ID: 902, OrderNumber: 'OTHER-1', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 },
+    exact,
+  ]
+  details.set('900', exact)
+  assert.equal((await pushMintsoftOrder(INPUT as never)).externalOrderId, '900', 'number-only and reference-only look-alikes are not candidates')
+  searchRows = [exact, { ...exact, ID: 903 }]
+  details.set('903', { ...exact, ID: 903 })
+  await assert.rejects(() => pushMintsoftOrder(INPUT as never), /already exists|Mintsoft order push failed/, 'two exact rows cannot be told apart')
+})
+
+test('R10b: a full page leaves the duplicate unresolved even when the read-back would pass', async () => {
+  reset()
+  const { pushMintsoftOrder } = await push()
+  createResult = LIVE_DUPLICATE
+  searchRows = Array.from({ length: 10 }, (_, i) => ({ ID: 900 + i, OrderNumber: i === 0 ? 'WC-1001' : `Z-${i}`, ExternalOrderReference: i === 0 ? 'REF-1001' : `R-${i}`, ClientId: CLIENT, OrderStatusId: 1 }))
+  details.set('900', { ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 })
+  await assert.rejects(() => pushMintsoftOrder(INPUT as never), /already exists|Mintsoft order push failed/)
+})
+
+test('R10b: a flagged merged survivor with no readable id is INCONCLUSIVE, not ABSENT', async () => {
+  reset()
+  const { findMintsoftMergedSurvivor } = await push()
+  const row = survivorRow()
+  delete (row as Record<string, unknown>).ID
+  searchRows = [row]
+  assert.equal((await findMintsoftMergedSurvivor('ORD-B')).kind, 'INCONCLUSIVE')
+})
+
+test('R10b: verify by REFERENCE (the by-id read failed) never proves a cancelled or status-less order ours', async () => {
+  reset()
+  const { verifyMintsoftPushedOrder } = await push()
+  const ref = { orderNumber: 'WC-1001', externalReference: 'REF-1001' }
+  // no detail row: the by-id route yields nothing, so only the search can speak
+  searchRows = [{ ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 3 }]
+  assert.equal(await verifyMintsoftPushedOrder('555', ref), 'unknown')
+  searchRows = [{ ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT }]
+  assert.equal(await verifyMintsoftPushedOrder('555', ref), 'unknown')
+  searchRows = [{ ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 }]
+  assert.equal(await verifyMintsoftPushedOrder('555', ref), 'ours', 'control')
 })
