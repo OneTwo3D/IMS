@@ -730,3 +730,48 @@ test('a return on an order stranded in PARTIALLY_RETURNED by an older return reo
   assert.equal(result.success, true, String(result.error))
   assert.equal((await poState(po)).status, 'PARTIALLY_RECEIVED')
 })
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// UNCHANGED SAVE OF A VAT-INCLUSIVE, HEADER-DISCOUNTED ORDER AFTER RECEIPT
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+
+test('an unchanged save of a VAT-inclusive, header-discounted order after receipt leaves every money field identical (net-price request and gross-price request)', SKIP, async () => {
+  const { updatePurchaseOrder } = await actions()
+  const { db } = await import('@/lib/db')
+  const po = await seedPo('ed-incl-disc', [2])
+  const vat = { pricesIncludeVat: true, taxRateValue: 0.2, taxRateName: 'Test VAT 20', orderDiscountForeign: 12, orderDiscountStr: '12' }
+  // Stored as the create path stores it: 2 x 60 gross = 120 gross, less a 12 gross header discount = 108 total.
+  const made = await updatePurchaseOrder(po.poId, {
+    currency: 'GBP', ...vat,
+    lines: [{ productId: po.lines[0]!.productId, sku: po.lines[0]!.sku, productName: 'incl', qty: 2, unitCostForeign: 60 }],
+  } as Edit)
+  assert.equal(made.success, true, String(made.error))
+  const lineRow = await db.purchaseOrderLine.findFirstOrThrow({ where: { poId: po.poId }, select: { id: true } })
+  const line = { ...po.lines[0]!, poLineId: lineRow.id }
+  const live: SeededPo = { ...po, lines: [line] }
+  assert.equal((await receive(live, line, 1)).success, true)
+
+  const money = async () => {
+    const row = await db.purchaseOrder.findUniqueOrThrow({
+      where: { id: po.poId },
+      select: {
+        pricesIncludeVat: true, discountAmount: true, discountStr: true, subtotalForeign: true, subtotalBase: true, taxForeign: true, taxBase: true,
+        totalForeign: true, totalBase: true, directFreightForeign: true, directFreightBase: true, status: true,
+        lines: { select: { id: true, qty: true, unitCostForeign: true, unitCostBase: true, totalForeign: true, totalBase: true, taxForeign: true, taxBase: true } },
+      },
+    })
+    return JSON.stringify(row)
+  }
+  const before = await money()
+  assert.match(before, /"totalForeign":"108"/, 'precondition: 120 gross less 12 gross discount is 108')
+
+  // The form as it was before (net prices, convention flag false) and as it is now (gross prices, the stored flag).
+  const netRequest = { currency: 'GBP', pricesIncludeVat: false, taxRateValue: 0.2, taxRateName: 'Test VAT 20', orderDiscountForeign: 12, orderDiscountStr: '12',
+    lines: [{ poLineId: line.poLineId, productId: line.productId, sku: line.sku, productName: 'incl', qty: 2, unitCostForeign: 50 }] } as Edit
+  const grossRequest = { ...netRequest, pricesIncludeVat: true, lines: [{ ...netRequest.lines![0]!, unitCostForeign: 60 }] } as Edit
+  for (const request of [netRequest, grossRequest]) {
+    const result = await updatePurchaseOrder(po.poId, request)
+    assert.equal(result.success, true, String(result.error))
+    assert.equal(await money(), before, 'every stored money field, header and line, is unchanged by an unchanged save')
+  }
+})

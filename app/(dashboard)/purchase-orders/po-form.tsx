@@ -258,11 +258,11 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   const [notes, setNotes] = useState(existingPo?.notes ?? '')
   const [internalNotes, setInternalNotes] = useState(existingPo?.internalNotes ?? '')
 
-  // VAT — in edit mode we show stored NET prices (since that's how the DB
-  // persists them), so pricesIncludeVat starts `false` regardless of how
-  // the original PO was created.
+  // VAT — the form is loaded in the convention the order was stored in. The DB persists NET unit costs, so for an order stored
+  // with prices including VAT the line prices below are grossed up again (and the header discount, which was entered in that
+  // convention, is read in it). Sending the flag the order was loaded with is what keeps an unchanged save from moving the totals.
   const [taxRateId, setTaxRateId] = useState(initialTaxRate?.id ?? '')
-  const [pricesIncludeVat, setPricesIncludeVat] = useState(false)
+  const [pricesIncludeVat, setPricesIncludeVat] = useState(existingPo?.pricesIncludeVat ?? false)
 
   // Order-level discount — stored input string + live parsing against the
   // lines subtotal. Seeded from `existingPo` when editing.
@@ -295,8 +295,8 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
 
   // Lines — seeded from existingPo with pre-discount unit cost reconstructed
   // so the user can re-edit the discount. Stored `unitCostForeign` is
-  // always NET-of-VAT per stock unit, so the edit form starts in
-  // "prices exclude VAT" mode.
+  // always NET-of-VAT per stock unit; an order stored with prices including
+  // VAT is loaded back in that convention (see `loadedInclVat`).
   const [lines, setLines] = useState<LineItem[]>(() => {
     if (!existingPo) return []
     // Purchases follow the supplier's Default VAT Rate (the order-level rate)
@@ -313,9 +313,14 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
       // Reconstruct pre-discount unit cost: the stored value is
       // (qty * unitCost - discount) / qty, so adding discount/qty back
       // gives the original entry.
-      const preUnitCost = l.qty > 0 && l.discountAmount > 0
-        ? Math.round((l.unitCostForeign + l.discountAmount / l.qty) * 10000) / 10000
+      // A VAT-inclusive order stored its line discount in the gross convention: take the VAT out of it before adding it to the
+      // net unit cost, then gross the price up again, so the displayed price is the one that was entered.
+      const loadedInclVat = existingPo.pricesIncludeVat && lineOrderDefault.rate > 0
+      const netDiscount = loadedInclVat ? l.discountAmount / (1 + lineOrderDefault.rate) : l.discountAmount
+      const preNetUnitCost = l.qty > 0 && l.discountAmount > 0
+        ? Math.round((l.unitCostForeign + netDiscount / l.qty) * 10000) / 10000
         : l.unitCostForeign
+      const preUnitCost = loadedInclVat ? Math.round(preNetUnitCost * (1 + lineOrderDefault.rate) * 10000) / 10000 : preNetUnitCost
       // Reconstruct purchase-unit qty/cost if the line used one.
       const purchaseUnitId = l.purchaseUnitId ?? ''
       const puFactor = purchaseUnitId

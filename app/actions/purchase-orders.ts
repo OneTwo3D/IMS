@@ -213,6 +213,8 @@ export type PoRow = {
   totalBase: number
   directFreightForeign: number
   directFreightBase: number
+  /** The VAT convention the order's prices and header discount were entered in (gross when true). */
+  pricesIncludeVat: boolean
   orderDiscountStr: string | null
   orderDiscountForeign: number
   landedCostMethod: string
@@ -413,6 +415,7 @@ const PO_SELECT = {
   subtotalBase: true,
   taxRateName: true,
   taxRatePercent: true,
+  pricesIncludeVat: true,
   taxForeign: true,
   taxBase: true,
   totalForeign: true,
@@ -478,6 +481,7 @@ function mapPoRow(po: {
   taxBase: unknown
   totalForeign: unknown
   totalBase: unknown
+  pricesIncludeVat: boolean
   directFreightForeign: unknown
   directFreightBase: unknown
   discountStr: string | null
@@ -522,6 +526,7 @@ function mapPoRow(po: {
     totalBase: Number(po.totalBase),
     directFreightForeign: Number(po.directFreightForeign),
     directFreightBase: Number(po.directFreightBase),
+    pricesIncludeVat: po.pricesIncludeVat,
     orderDiscountStr: po.discountStr,
     orderDiscountForeign: Number(po.discountAmount ?? 0),
     landedCostMethod: po.landedCostMethod as string,
@@ -1579,6 +1584,10 @@ export async function updatePurchaseOrder(
           fxRateToBase: true,
           taxRateName: true,
           taxRatePercent: true,
+          pricesIncludeVat: true,
+          subtotalBase: true,
+          taxBase: true,
+          totalBase: true,
           discountStr: true,
           discountAmount: true,
           destinationWarehouseId: true,
@@ -1707,6 +1716,7 @@ export async function updatePurchaseOrder(
         let subtotalBase = 0
         let totalTaxForeign = 0
         let totalTaxBase = 0
+        let lineMoneyChanged = false
 
         const lineData = input.lines.map((l, i) => {
           const resolved = lineResolved[i]
@@ -1762,6 +1772,7 @@ export async function updatePurchaseOrder(
             const row = lineData[k.requestIndex]!
             if (k.touched) {
               // Received, billed or returned: the cost layers and the bill carry this price, so it is not editable here.
+              if (k.qtyChanged) lineMoneyChanged = true
               if (!unitCostMatchesStored(row.unitCostForeign, k.fact.unitCostForeign)) {
                 return { refused: `${k.fact.sku ?? k.fact.id}: the price is locked because this line has been received, billed or returned. Correct it on the supplier bill or with a credit note.` }
               }
@@ -1791,11 +1802,21 @@ export async function updatePurchaseOrder(
               if (editFacts.anyLanded && editFacts.hasCostLines && !unitCostMatchesStored(row.unitCostForeign, k.fact.unitCostForeign)) {
                 return { refused: PO_COST_LINES_PART_RECEIVED_MESSAGE }
               }
-              const { poId: _poId, ...rowData } = row
-              lineUpdates.push({ id: k.fact.id, data: rowData })
-              finalRows.push(row)
+              if (!k.qtyChanged && unitCostMatchesStored(row.unitCostForeign, k.fact.unitCostForeign)) {
+                // Unchanged: the stored figures stand. Recomputing under the request's VAT convention can differ by rounding (and
+                // the form sends net prices), and an unchanged save must not move a stored money field.
+                const stored = { totalForeign: k.fact.totalForeign, totalBase: k.fact.totalBase, taxForeign: k.fact.taxForeign, taxBase: k.fact.taxBase }
+                lineUpdates.push({ id: k.fact.id, data: { description: row.description, sortOrder: row.sortOrder } })
+                finalRows.push(stored)
+              } else {
+                lineMoneyChanged = true
+                const { poId: _poId, ...rowData } = row
+                lineUpdates.push({ id: k.fact.id, data: rowData })
+                finalRows.push(row)
+              }
             }
           }
+          if (plan.create.length > 0 || plan.remove.length > 0) lineMoneyChanged = true
           for (const index of plan.create) finalRows.push(lineData[index]!)
           if (plan.remove.length > 0) {
             await tx.purchaseOrderLine.deleteMany({ where: { poId: id, id: { in: plan.remove.map((l) => l.id) } } })
@@ -1822,7 +1843,9 @@ export async function updatePurchaseOrder(
           taxForeign: totalTaxForeign,
           taxBase: totalTaxBase,
           orderDiscountForeign: orderDiscountForeignInput,
-          inclVat,
+          // The discount amount was entered in the order's STORED convention (gross when prices include VAT). An amend keeps that
+          // convention for the discount even though the form sends net line prices, so the net/VAT split is the one first stored.
+          inclVat: amend ? !!locked.pricesIncludeVat : inclVat,
           fxRate,
         })
         subtotalForeign = editDiscounted.subtotalForeign
@@ -1897,6 +1920,18 @@ export async function updatePurchaseOrder(
         updates.taxBase = totalTaxBase
         updates.totalForeign = subtotalForeign + totalTaxForeign + currentDirectFreightForeign
         updates.totalBase = subtotalBase + totalTaxBase + currentDirectFreightBase
+        // An amend that changes no line's money (no quantity, price, added or removed line) and no cost line must reproduce the
+        // stored header figures exactly. If it does not, the recalculation disagrees with how the order was first stored (a
+        // convention, discount split or rounding difference), and saving would move money fields under received stock and bills.
+        if (amend && !lineMoneyChanged && (editFacts.anyLanded || editFacts.billCount > 0)) {
+          const close = (a: unknown, b: unknown) => Math.abs(Number(a) - Number(b)) <= 0.005
+          const drift = (
+            [['subtotalForeign', 'subtotalForeign'], ['subtotalBase', 'subtotalBase'], ['taxForeign', 'taxForeign'], ['taxBase', 'taxBase'], ['totalForeign', 'totalForeign'], ['totalBase', 'totalBase']] as const
+          ).filter(([field, stored]) => !close(updates[field], locked[stored]))
+          if (drift.length > 0) {
+            return { refused: `Saving would change the order's stored figures (${drift.map(([f]) => f).join(', ')}) although no line, price or quantity changed. Nothing was saved; reload the order and try again.` }
+          }
+        }
         // Persist the VAT convention actually used to recompute these totals + the header discount, so a
         // later supplier requote reapplies the discount in the same convention (o3d-lx1). Kept aligned with
         // the recalculation: an edit that recomputes as net stores false, inclusive stores true.
