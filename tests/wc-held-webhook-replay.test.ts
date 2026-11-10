@@ -149,8 +149,8 @@ test('a worker that lost its claim has its result discarded and logged, not reco
 test('dead letters of a connector with no active drain are not listed and cannot be replayed', async () => {
   const { DEAD_SHOPPING_WEBHOOK_WHERE, buildDeadShoppingWebhookReplayWhere } = await import('@/lib/domain/shopping-webhook-exception')
   const dead = { id: 'x', status: 'DEAD_LETTER', processedAt: null }
-  assert.equal(matches({ ...dead, connector: 'woocommerce' } as Row, DEAD_SHOPPING_WEBHOOK_WHERE), true)
-  assert.equal(matches({ ...dead, connector: 'shopify' } as Row, DEAD_SHOPPING_WEBHOOK_WHERE), false)
-  assert.equal(matches({ ...dead, connector: 'woocommerce' } as Row, buildDeadShoppingWebhookReplayWhere('x')), true)
-  assert.equal(matches({ ...dead, connector: 'shopify' } as Row, buildDeadShoppingWebhookReplayWhere('x')), false)
+  assert.equal(matches({ ...dead, connector: 'woocommerce' } as unknown as Row, DEAD_SHOPPING_WEBHOOK_WHERE), true)
+  assert.equal(matches({ ...dead, connector: 'shopify' } as unknown as Row, DEAD_SHOPPING_WEBHOOK_WHERE), false)
+  assert.equal(matches({ ...dead, connector: 'woocommerce' } as unknown as Row, buildDeadShoppingWebhookReplayWhere('x')), true)
+  assert.equal(matches({ ...dead, connector: 'shopify' } as unknown as Row, buildDeadShoppingWebhookReplayWhere('x')), false)
 })
