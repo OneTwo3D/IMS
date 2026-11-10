@@ -138,7 +138,7 @@ Client --> nginx --> Next.js Route Handler (/api/...)
 | `PRODUCTION_IN` | Manufacturing output/recovery uses consumed component and overhead cost. |
 | `PRODUCTION_OUT` | Manufacturing consumption/disassembly uses FIFO consumption. |
 | `PURCHASE_RECEIPT` | Purchase receipts use landed or gross purchase unit cost. |
-| `PURCHASE_REVERSAL` | Purchase cancellation reversals use the remaining PO receipt cost-layer cost. |
+| `PURCHASE_REVERSAL` | Historic: purchase cancellation reversals used the remaining PO receipt cost-layer cost. Cancelling a part-received order now closes it short and writes none; rows already written still count here. |
 | `RETURN_INBOUND` | Customer returns use shipped cost snapshots where available. |
 | `SALE_DISPATCH` | Sales dispatch uses FIFO consumption; historical imports use the zero-cost provenance sentinel. |
 | `TRANSFER_IN` | Transfer receipts use the dispatch FIFO snapshot slice. |
