@@ -373,6 +373,13 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'The same Xero can-apply-to flag, copied into the stored tax-rate list. A boolean on a tax-rate definition; no refund moves it.',
   },
   {
+    file: 'lib/domain/accounting/eu-vat-treatment.ts',
+    figures: ['revenue'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      '`revenue` is the Xero can-apply-to-revenue flag of a stored tax-rate row, read to prove the scheme posting type is a sales type; a boolean on a tax-rate definition, not a figure. The file builds a sales invoice for posting and moves no analytics figure; refunds do not touch it.',
+  },
+  {
     file: 'lib/reconciliation-pack/ims-readers.ts',
     figures: ['c_revenue', 'canApplyToRevenue', 'revenue'],
     treatment: 'not-refund-sensitive',

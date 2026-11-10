@@ -56,12 +56,16 @@ import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { rateBinding, resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { treatImportedSalesInvoice } from './eu-vat-invoice-treatment'
-import { EU_VAT_TREATMENT_PAYLOAD_KEY } from '@/lib/domain/accounting/eu-vat-treatment'
+import { heldInvoiceDifference, type ExpectedHeldInvoice } from './held-invoice-verification'
+import { buildEuVatRegimeInput, readEuVatRegimeMode } from './eu-vat-facts'
+import { resolveEuVatRegime } from '@/lib/domain/accounting/eu-vat-regime'
+import { readEuVatRegimeStamp } from '@/lib/domain/accounting/eu-vat-regime-stamp'
+import { EU_VAT_TREATMENT_PAYLOAD_KEY, routeFor } from '@/lib/domain/accounting/eu-vat-treatment'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { directCreateMarker, isFulfilmentStatus, resolveDirectCreateMarker } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
-import { addMoney, currencyMinorUnits, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, currencyMinorUnits, roundMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
 import { WC_ORDER_SWEEP_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
 import {
@@ -1377,8 +1381,8 @@ async function updateExistingWcOrderCore(
   // ever queued. Skipping here also refuses, structurally, to release an invoice for an order that
   // has already been invoiced.
   if (so.accountingInvoiceId) return
-  // A hold with no EU treatment is treated now (switch on) before the release looks at it; a refusal keeps it PENDING with its reason and nothing is released.
-  if (await treatUntreatedHeldWcSalesInvoice(orderId, wcOrder).catch((error) => { console.error(`[wc-import] could not treat the held sales invoice for ${orderId}:`, error); return 'refused' as const }) === 'refused') return
+  // With the switch on, a held invoice is checked against the order (and an untreated one treated) before the release looks at it; a difference or refusal keeps it PENDING with its reason and nothing is released.
+  if (await reconcileHeldWcSalesInvoice(orderId, wcOrder).catch((error) => { console.error(`[wc-import] could not treat the held sales invoice for ${orderId}:`, error); return 'refused' as const }) === 'refused') return
   await releaseHeldWcSalesInvoice(orderId, { externalOrderId: String(wcOrder.id), externalOrderNumber: wcOrder.number }, usableInvoiceNumber)
 }
 
@@ -1629,47 +1633,105 @@ async function noteHeldReleaseFailure(rowId: string, message: string): Promise<v
 }
 
 /**
- * AN UNTREATED HOLD IS REBUILT ON RE-IMPORT. A held invoice parked before the EU IOSS/VOEC/DDP treatment existed (no marker), or while the Sales Invoices switch was off (`applied:false`), would post a scheme sale on its
- * charged rate. When the switch is on and the order is re-delivered (the one call site that has the WooCommerce order in hand: a re-import of an order IMS already holds), the parked payload gets the treatment now, from the
- * order's own facts, and is replaced under the order lock before the release guard looks at it. The lines are the ones that were parked (only the treatment is added, as only the number is on release); the parked lines must
- * match the order's own lines one for one. A refusal (regime, accounts, stored Xero list, total) leaves the hold PENDING with the refusal's reason, and the release is not attempted. Store-credit orders are left alone.
+ * A HELD INVOICE IS CHECKED AGAINST THE ORDER ON RE-IMPORT, BEFORE ANYTHING IS RELEASED (switch on only; with it off nothing here runs).
+ *
+ *   TREATED HOLD (marker applied:true). WooCommerce can change the order between the hold and the number. The parked payload is compared with the order as it is now (lines, discounts, shipping, fees, the document total: lib/connectors/woocommerce/sync/held-invoice-verification.ts) and the
+ *   treatment is re-resolved from the current facts (the regime, VAT account, zero-rated type and VAT amount) and compared with what was parked and with the order's stamp, in one order-locked transaction. Any difference keeps the hold PENDING.
+ *   UNTREATED HOLD (no marker, applied:false). The parked lines are first verified against the order the same way, then the treatment is applied to the parked payload (only the treatment is added, as only the number is on release) and the payload replaced under the order lock.
+ * A difference or a refusal leaves the hold PENDING with the reason and the release is not attempted. A hold whose order changed is marked (applied:false, reason order_changed), so neither the sweep nor a later re-import releases or re-treats it: an invoice built from an order that has changed
+ * has to be rebuilt, and there is no automatic rebuild of a held invoice. Store-credit orders are left alone. The held-release sweep has no WooCommerce order in hand, so it does not compare; it only refuses holds that are not marked applied:true.
  */
-async function treatUntreatedHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder): Promise<'not-needed' | 'treated' | 'refused'> {
+async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder): Promise<'not-needed' | 'treated' | 'refused'> {
   const row = await db.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
   if (!row || !isHeldSalesInvoicePayload(row.payload)) return 'not-needed'
   const held: HeldSalesInvoicePayload = row.payload
-  const markerOf = (payload: Record<string, unknown>) => payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown; reason?: unknown } | null | undefined
+  type Marker = { applied?: unknown; reason?: unknown; route?: unknown; regime?: unknown; vatAccount?: unknown; schemePostingTaxType?: unknown }
+  const markerOf = (payload: Record<string, unknown>) => payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as Marker | null | undefined
   const marker = markerOf(held.accountingPayload)
-  if (marker?.applied === true || marker?.reason === 'store_credit') return 'not-needed'
+  if (marker?.reason === 'store_credit') return 'not-needed'
   const chart = heldSalesInvoiceChartConnector(held)
   if (!chart) return 'not-needed'
   const { isAccountingSyncTypeEnabledFor, getAccountingSettings } = await import('@/lib/accounting')
   if (!(await isAccountingSyncTypeEnabledFor(chart, 'SALES_INVOICE'))) return 'not-needed'
-  const credit = classifyWcCouponLines(wcOrder.coupon_lines, wcOrder.meta_data, wcOrder.fee_lines).creditGross
-  if (credit.gt(0)) return 'not-needed'
   const refuse = async (reason: string): Promise<'refused'> => {
-    await noteHeldReleaseFailure(
-      row.id,
-      `This held invoice was parked without the EU IOSS/VOEC/DDP treatment and could not be treated now: ${reason}. NOTHING was queued. Fix that, then re-import the order from WooCommerce to try again.`,
-    )
+    await noteHeldReleaseFailure(row.id, `This held invoice was not released: ${reason}. NOTHING was queued.`)
     return 'refused'
   }
-  const settings = await getAccountingSettings()
+  // The order changed after the invoice was held: mark the hold so nothing releases or re-treats it, and say what is needed.
+  const refuseChanged = async (what: string): Promise<'refused'> => {
+    await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
+      const current = await tx.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
+      if (!current || current.id !== row.id || !isHeldSalesInvoicePayload(current.payload)) return
+      const currentHeld: HeldSalesInvoicePayload = current.payload
+      await tx.shoppingSyncLog.update({
+        where: { id: row.id },
+        data: {
+          payload: { ...currentHeld, accountingPayload: { ...currentHeld.accountingPayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'order_changed' } } } as unknown as Prisma.InputJsonValue,
+          errorMessage: `This held invoice was NOT released: the order changed after it was held (${what}) and needs its invoice rebuilt. NOTHING was queued.`,
+          syncedAt: null,
+        },
+      })
+    })
+    return 'refused'
+  }
+  if (marker?.reason === 'order_changed') return await refuseChanged('it was already found to have changed')
+
+  const currency = (wcOrder.currency ?? '').toString().trim().toUpperCase()
   const mappedLines = [...(await mapWcLineItems(wcOrder.line_items, 1)), ...mapWcFeeLines(wcOrder.fee_lines)]
+  const lineDiscountTotal = mappedLines.reduce((sum, line) => addMoney(sum, toDecimal(line.discountAmount)), toDecimal(0))
+  const coupons = planWcOrderCoupons({
+    couponLines: wcOrder.coupon_lines, orderMeta: wcOrder.meta_data, feeLines: wcOrder.fee_lines, lineDiscountTotalForeign: lineDiscountTotal, currency,
+    resolveResidual: ({ couponTotalForeign, lineDiscountTotalForeign: lineTotal, currency: cur }) => resolveWcOrderLevelDiscount({ couponTotalForeign, lineDiscountTotalForeign: lineTotal, currency: cur }),
+  })
+  if (coupons.storeCreditForeign.gt(0)) return 'not-needed'
+  if (coupons.refusal) return await refuseChanged('its coupons can no longer be classified')
+  const amounts = resolveWcAccountingAmountConvention({ pricesIncludeVat: wcOrder.prices_include_tax, shippingForeign: mapWcShipping(wcOrder).shippingForeign, orderLevelDiscountForeign: coupons.orderLevelDiscount })
+  const expected: ExpectedHeldInvoice = {
+    lines: mappedLines.map((l) => ({
+      description: l.description, quantity: l.qty, unitAmount: l.unitPriceForeign, discountAmount: l.discountAmount > 0 ? roundDecimalNumber(l.discountAmount, 4) : 0,
+      untaxedFee: l.isFeeLine === true && l.forceNoTax === true, markedFee: l.isFeeLine === true && l.wclcFeeKind != null,
+    })),
+    shippingAmount: amounts.shippingAmount, discountAmount: amounts.discountAmount, orderTotal: String(wcOrder.total ?? ''), currency,
+  }
+  const settings = await getAccountingSettings()
+  const accounts = { ioss: settings.euVatIossAccount, ddp: settings.euVatDdpAccount, fee: settings.euFeeAccount, rounding: settings.roundingDifferenceAccount }
+
+  if (marker?.applied === true) {
+    // A TREATED hold: verify, under the order lock, that nothing it rests on has moved.
+    const verdict = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
+      const difference = heldInvoiceDifference(held.accountingPayload, expected, true)
+      if (difference !== null) return difference
+      const mode = await readEuVatRegimeMode()
+      if (mode === null) return 'the EU VAT regime mode setting is unreadable'
+      const input = await buildEuVatRegimeInput(db, wcOrder, { ioss: accounts.ioss, ddp: accounts.ddp }, { mode })
+      const stamp = await readEuVatRegimeStamp(db, orderId)
+      if (stamp === null) return 'the order carries no EU VAT regime stamp'
+      const routed = routeFor(stamp, resolveEuVatRegime(input), input)
+      if (!routed.ok) return routed.reason
+      if (routed.route.kind !== marker.route) return `the order is now on the ${routed.route.kind} route, the hold was treated on ${String(marker.route)}`
+      if (routed.route.kind === 'scheme') {
+        const vatLines = (held.accountingPayload.lines as Array<Record<string, unknown>>).filter((l) => l.noTaxKind === 'eu-vat-recovery')
+        if (routed.route.regime !== marker.regime) return `the order now decides ${routed.route.regime}, the hold was treated as ${String(marker.regime)}`
+        if (routed.route.vatAccount !== marker.vatAccount) return `the order's VAT account is now ${routed.route.vatAccount}, the hold was treated on ${String(marker.vatAccount)}`
+        if (routed.route.schemePostingTaxType !== marker.schemePostingTaxType) return 'the order\u2019s zero-rated posting type changed'
+        if (vatLines.length !== 1 || !roundMoney(Number(vatLines[0]!.unitAmount), currency).eq(roundMoney(routed.route.vatAmount, currency))) return 'the VAT charged on the order changed'
+      }
+      return null
+    })
+    return verdict === null ? 'not-needed' : await refuseChanged(verdict)
+  }
+
+  // An UNTREATED hold: the parked lines must be the order's lines before the treatment is put on them.
+  const difference = heldInvoiceDifference(held.accountingPayload, expected, false)
+  if (difference !== null) return await refuseChanged(difference)
   const { [EU_VAT_TREATMENT_PAYLOAD_KEY]: _marker, ...untreated } = held.accountingPayload
   void _marker
-  if (!Array.isArray(untreated.lines) || untreated.lines.length !== mappedLines.length) return await refuse('its parked lines do not match the order\u2019s lines')
   const outcome = await treatImportedSalesInvoice({
-    orderId,
-    wcOrder,
-    payload: untreated,
-    mappedLines,
-    connector: chart,
-    accounts: { ioss: settings.euVatIossAccount, ddp: settings.euVatDdpAccount, fee: settings.euFeeAccount, rounding: settings.roundingDifferenceAccount },
-    storeCreditForeign: credit,
-    now: new Date(),
+    orderId, wcOrder, payload: untreated, mappedLines, connector: chart, accounts, storeCreditForeign: coupons.storeCreditForeign, now: new Date(),
   })
-  if (outcome.kind === 'refused') return await refuse(outcome.reason)
+  if (outcome.kind === 'refused') return await refuse(`the EU IOSS/VOEC/DDP treatment refused it: ${outcome.reason}. Fix that, then re-import the order from WooCommerce to try again`)
   if (outcome.kind === 'skipped') return 'not-needed'
   const treated = outcome.payload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
     ? outcome.payload

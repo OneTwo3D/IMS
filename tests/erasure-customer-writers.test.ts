@@ -90,7 +90,7 @@ test('every writer of order notes, internal notes and tracking numbers is in the
 const SYNC_LOG_CENSUS: Record<string, { writers: number; verdict: string }> = {
   'app/actions/sync-exceptions.ts': { writers: 5, verdict: 'no-identity (operator resolution: status updateMany)' },
   'lib/connectors/woocommerce/sync/order-admission.ts': { writers: 4, verdict: 'raw-woo (the refusal queue parks the raw order)' },
-  'lib/connectors/woocommerce/sync/order-import.ts': { writers: 22, verdict: 'scrubbed (held sales invoice) / raw-woo (pending-FX queue and paid-block rows) / no-identity (status writes)' },
+  'lib/connectors/woocommerce/sync/order-import.ts': { writers: 24, verdict: 'scrubbed (held sales invoice: the EU treatment and order-changed rewrites keep the parked payload as is and the release scrubs it under the order lock) / raw-woo (pending-FX queue and paid-block rows) / no-identity (status writes)' },
   'lib/connectors/woocommerce/sync/order-status.ts': { writers: 1, verdict: 'no-identity (status push record)' },
   'lib/connectors/woocommerce/sync/product-sync.ts': { writers: 4, verdict: 'no-identity (products)' },
   'lib/connectors/woocommerce/sync/refund-sync.ts': { writers: 6, verdict: 'raw-woo (refund parks carry the raw refund and its free-text reason)' },
