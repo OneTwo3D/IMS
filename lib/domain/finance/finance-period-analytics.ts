@@ -8,7 +8,8 @@ import { getFxSourceRegime, type FxSourceRegime } from '@/lib/currencies/fx-sour
 import { multiplyMoney, roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
-import { refundCreditsAsGross, REFUND_TURNOVER_SELECT, type TurnoverRefund } from '@/lib/domain/sales/customer-turnover'
+import { REFUND_TURNOVER_SELECT, type TurnoverRefund } from '@/lib/domain/sales/customer-turnover'
+import { receivableBalance } from '@/lib/domain/sales/receivable-balance'
 import { invoicedInPeriodWhere, invoicedPeriodDate, invoicedPeriodDateIsApproximate } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 
@@ -221,9 +222,11 @@ type SalesOrderAgingRow = {
   paymentDueAt: Date | null
   paidAt: Date | null
   totalBase: DecimalInput
-  payments: Array<{ amount: DecimalInput; paidAt: Date; refundId: string | null }>
+  totalForeign?: DecimalInput
+  currency?: string | null
+  payments: Array<{ amount: DecimalInput; currency?: string | null; paidAt: Date; refundId: string | null; settlementRateToBase?: DecimalInput | null }>
   /** Credits raised before the as-of date, with their lines, so they can be read as the customer pages read them. */
-  refunds?: TurnoverRefund[]
+  refunds?: Array<TurnoverRefund & { refundedAt?: Date | null }>
 }
 
 type SalesOrderCurrencyRow = {
@@ -693,8 +696,9 @@ export async function getArAgingReport(
       archived: false,
       // Invoiced basis (shared with the revenue reports), dated by the same invoice date as the period
       // reports (invoicedAt, else paidAt, else the order date): an order is in AR at the cutoff only if
-      // that date is on or before it and the order is not yet paid at it.
-      AND: [invoicedInPeriodWhere({ lt: asOfExclusive }), { OR: [{ paidAt: null }, { paidAt: { gte: asOfExclusive } }, { payments: { some: { refundId: null, paidAt: { lt: asOfExclusive } } } }] }],
+      // that date is on or before it.
+      // Paid orders are NOT excluded: receivableBalance decides, and a paid-and-credited order is a customer credit balance.
+      AND: [invoicedInPeriodWhere({ lt: asOfExclusive })],
     },
     select: {
       id: true,
@@ -706,8 +710,10 @@ export async function getArAgingReport(
       paymentDueAt: true,
       paidAt: true,
       totalBase: true,
-      payments: { select: { amount: true, paidAt: true, refundId: true } },
-      refunds: { where: { refundedAt: { lt: asOfExclusive } }, ...REFUND_TURNOVER_SELECT },
+      totalForeign: true,
+      currency: true,
+      payments: { select: { amount: true, currency: true, paidAt: true, refundId: true, settlementRateToBase: true } },
+      refunds: { where: { refundedAt: { lt: asOfExclusive } }, select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
     },
     take: SOURCE_ROW_LIMIT + 1,
   }) as SalesOrderAgingRow[]
@@ -727,20 +733,15 @@ export async function getArAgingReport(
     lastPaymentDate: Date | null
   }>()
   let unplacedCreditOrders = 0
+  const asOfInclusive = new Date(asOfExclusive.getTime() - 1)
+  const balances = new Map<string, ReturnType<typeof receivableBalance>>()
   for (const order of orders) {
-    const paidBase = order.payments
-      .filter((payment) => payment.refundId == null && payment.paidAt.getTime() < asOfExclusive.getTime())
-      .reduce((total, payment) => total.add(toDecimal(payment.amount)), new Prisma.Decimal(0))
-    const refundedBase = order.payments
-      .filter((payment) => payment.refundId != null && payment.paidAt.getTime() < asOfExclusive.getTime())
-      .reduce((total, payment) => total.add(toDecimal(payment.amount).abs()), new Prisma.Decimal(0))
-    // Credits raised by the as-of date come off too (read exactly as customer turnover reads them); a refund that
-    // was paid out in cash is already in `refundedBase`, so the larger of the two comes off, never both.
-    const credits = refundCreditsAsGross(order.refunds)
-    if (credits.bound !== 'exact') unplacedCreditOrders += 1
-    const rawOutstanding = toDecimal(order.totalBase).sub(paidBase).sub(Prisma.Decimal.max(refundedBase, toDecimal(credits.credit)))
-    const outstanding = Prisma.Decimal.max(new Prisma.Decimal(0), rawOutstanding)
-    if (outstanding.lte(0)) continue
+    // ONE arithmetic for every receivables screen: see receivable-balance.ts.
+    const result = receivableBalance(order, asOfInclusive)
+    balances.set(order.id, result)
+    if (result.bound !== 'exact') unplacedCreditOrders += 1
+    if (result.status !== 'outstanding') continue
+    const outstanding = toDecimal(result.balance)
     const key = order.customerId ?? order.customerEmail ?? order.customerName ?? 'unknown'
     let row = byCustomer.get(key)
     if (!row) {
@@ -774,14 +775,8 @@ export async function getArAgingReport(
   const rows = agingRowsFromAccumulators(byCustomer, baseCurrency)
   const outstandingBase = rows.reduce((total, row) => total.add(row.outstandingBase), new Prisma.Decimal(0))
   const creditBalanceBase = orders.reduce((total, order) => {
-    const paidBase = order.payments
-      .filter((payment) => payment.refundId == null && payment.paidAt.getTime() < asOfExclusive.getTime())
-      .reduce((sum, payment) => sum.add(toDecimal(payment.amount)), new Prisma.Decimal(0))
-    const refundedBase = order.payments
-      .filter((payment) => payment.refundId != null && payment.paidAt.getTime() < asOfExclusive.getTime())
-      .reduce((sum, payment) => sum.add(toDecimal(payment.amount).abs()), new Prisma.Decimal(0))
-    const rawOutstanding = toDecimal(order.totalBase).sub(paidBase).sub(Prisma.Decimal.max(refundedBase, toDecimal(refundCreditsAsGross(order.refunds).credit)))
-    return rawOutstanding.lt(0) ? total.add(rawOutstanding.abs()) : total
+    const result = balances.get(order.id)!
+    return result.status === 'credit' ? total.add(toDecimal(result.balance).abs()) : total
   }, new Prisma.Decimal(0))
   return report(rows, filters, window, generatedAt, {
     outstandingBase: moneyString(outstandingBase, baseCurrency),
@@ -790,7 +785,7 @@ export async function getArAgingReport(
     bucket2Days: String(buckets[1]),
     bucket3Days: String(buckets[2]),
   }, [
-    `AR aging is as of ${dateOnly(asOf)}. Outstanding balance is SalesOrder.totalBase minus non-refund payments and refund payments paid on or before that date and credits raised by it (the larger of a credit and the cash refunded against it); due date is paymentDueAt, falling back to the invoice date: invoicedAt, else paidAt, else createdAt (shown as approximate).`,
+    `AR aging is as of ${dateOnly(asOf)}. Outstanding balance is SalesOrder.totalBase minus non-refund payments and refund payments paid on or before that date and credits raised by it, all in base currency by one shared arithmetic (invoice less credits less receipts, an order held as paid counting as settled); due date is paymentDueAt, falling back to the invoice date: invoicedAt, else paidAt, else createdAt (shown as approximate).`,
     'Customer credit balances are excluded from aging buckets and surfaced in totals.creditBalanceBase.',
     `Bucket boundaries are configurable through bucket1Days/bucket2Days/bucket3Days and currently use ${buckets[0]}/${buckets[1]}/${buckets[2]} days.`,
     ...bucketResult.notices,

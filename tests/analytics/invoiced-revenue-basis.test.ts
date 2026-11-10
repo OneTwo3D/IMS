@@ -49,6 +49,8 @@ const D = (value: string | number) => new Prisma.Decimal(value)
 const NOW = new Date()
 const TODAY_NOON = new Date(NOW.getFullYear(), NOW.getMonth(), NOW.getDate(), 12)
 const TODAY = TODAY_NOON.toISOString().slice(0, 10)
+/** Receipt times are the start of today, so they are always on or before "now" whatever time the suite runs. */
+const TODAY_START = new Date(NOW.getFullYear(), NOW.getMonth(), NOW.getDate())
 
 type Row = Record<string, unknown>
 
@@ -63,7 +65,7 @@ function row(id: string, total: number, over: Row): Row {
     totalBase: D(total), totalForeign: D(total), taxBase: D(0), taxForeign: D(0), subtotalBase: D(total),
     shippingBase: D(0), shippingForeign: D(0), discountAmount: D(0), fxRateToBase: D(1),
     pricesIncludeVat: false, taxRatePercent: 0, shoppingLinks: over.invoiceNumber ? [{ connector: 'woocommerce' }] : [], shipFromWarehouse: { code: 'W1' },
-    payments: paid ? [{ amount: D(total), paidAt: TODAY_NOON, refundId: null, currency: 'GBP' }] : [],
+    payments: paid ? [{ amount: D(total), paidAt: TODAY_START, refundId: null, currency: 'GBP' }] : [],
     refunds: [],
     lines: [{
       id: `${id}-l1`, productId: 'p1', sku: 'P1', description: 'Widget', qty: D(1),
@@ -75,7 +77,7 @@ function row(id: string, total: number, over: Row): Row {
   }
 }
 
-const PAID = { paidAt: TODAY_NOON }
+const PAID = { paidAt: TODAY_START }
 const ORDERS: Row[] = [
   row('A', 50, { status: SalesOrderStatus.PENDING_PAYMENT, invoiceNumber: 'INV-1' }),
   row('B', 70, { status: SalesOrderStatus.ALLOCATED, accountingInvoiceId: 'xero-b' }),
@@ -285,7 +287,7 @@ test('customer figures carry the right marker: upper bound for a positive unplac
 
 test('an order held as paid (paidAt set) with no Payment rows is not in Customer Aging or its CSV', async () => {
   // markSalesOrderPaid and the importer set paidAt without a Payment row; subtracting Payment rows alone would leave the full amount due.
-  ORDERS.push(row('P', 55, { invoiceNumber: 'INV-P', paidAt: TODAY_NOON, payments: [] }))
+  ORDERS.push(row('P', 55, { invoiceNumber: 'INV-P', paidAt: TODAY_START, payments: [] }))
   try {
     const { getCustomerAging } = await import('@/app/actions/sales-stats')
     assert.ok(!(await getCustomerAging()).some((r) => r.orderNumber === 'P'), 'absent from the screen rows')
@@ -324,8 +326,8 @@ test('Customer Aging nets credits: fully credited is absent, partly credited sho
 
 test('Invoices tab: an order held as paid with no Payment rows shows balance 0, and a part-paid one still shows its balance', async () => {
   ORDERS.push(
-    row('P2', 40, { invoiceNumber: 'INV-P2', paidAt: TODAY_NOON, payments: [] }),
-    row('Q2', 90, { invoiceNumber: 'INV-Q2', payments: [{ amount: D(25), paidAt: TODAY_NOON, refundId: null }] }),
+    row('P2', 40, { invoiceNumber: 'INV-P2', paidAt: TODAY_START, payments: [] }),
+    row('Q2', 90, { invoiceNumber: 'INV-Q2', payments: [{ amount: D(25), paidAt: TODAY_START, refundId: null }] }),
   )
   try {
     const { getInvoiceStats } = await import('@/app/actions/sales-stats')
@@ -337,5 +339,32 @@ test('Invoices tab: an order held as paid with no Payment rows shows balance 0, 
     const lines = csv.trim().split(/\r?\n/); const cols = lines[0]!.split(',')
     const p2 = lines.slice(1).find((l) => l.split(',')[cols.indexOf('orderNumber')] === 'P2')!
     assert.equal(p2.split(',')[cols.indexOf('balance')], '0.00')
+  } finally { ORDERS.length -= 2 }
+})
+
+test('one order, one balance: AR Aging, Customer Aging and the Invoices tab agree (USD order booked at 0.8, $50 received, 10 credited)', async () => {
+  // 80 base for 100 USD; $50 received = 40 base; 10 base credited: 80 - 10 - 40 = 30 owed.
+  ORDERS.push(
+    row('S', 80, {
+      invoiceNumber: 'INV-S', currency: 'USD', totalForeign: D(100),
+      payments: [{ amount: D(50), currency: 'USD', paidAt: TODAY_START, refundId: null }],
+      refunds: [{ totalsBasis: 'GROSS', totalBase: D(10), lines: [], refundedAt: TODAY_START }],
+    }),
+    // Held as paid with no Payment row, then 10 credited: a customer credit balance of 10.
+    row('T', 50, { invoiceNumber: 'INV-T', paidAt: TODAY_START, payments: [], refunds: [{ totalsBasis: 'GROSS', totalBase: D(10), lines: [], refundedAt: TODAY_START }] }),
+  )
+  try {
+    const { getCustomerAging, getInvoiceStats } = await import('@/app/actions/sales-stats')
+    const aging = (await getCustomerAging()).find((r) => r.orderNumber === 'S')!
+    const invoice = (await getInvoiceStats()).find((r) => r.orderNumber === 'S')!
+    const ar = await getArAgingReport({ dateTo: TODAY }, { deps: { client: financeClient(), now: () => TODAY_NOON, baseCurrency: async () => 'GBP' } })
+    assert.equal(aging.dueAmount, 30)
+    assert.equal(invoice.balance, 30)
+    assert.equal(Number(ar.totals.outstandingBase), 150, 'A 50 + B 70 + S 30')
+    assert.equal(aging.dueBound, 'exact')
+    assert.equal(invoice.balanceBound, 'exact')
+    // The credit-balance order: not owed anywhere, shown as -10 on the Invoices tab.
+    assert.ok(!(await getCustomerAging()).some((r) => r.orderNumber === 'T'))
+    assert.equal((await getInvoiceStats()).find((r) => r.orderNumber === 'T')!.balance, -10)
   } finally { ORDERS.length -= 2 }
 })

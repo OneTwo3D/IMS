@@ -5,7 +5,8 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
-import { refundCreditsAsGross, REFUND_TURNOVER_SELECT, type TurnoverBound } from '@/lib/domain/sales/customer-turnover'
+import { REFUND_TURNOVER_SELECT, type TurnoverBound } from '@/lib/domain/sales/customer-turnover'
+import { receivableBalance } from '@/lib/domain/sales/receivable-balance'
 import { INVOICED_ORDER_WHERE, invoicedInPeriodWhere, invoicedPeriodDate, invoicedPeriodDateIsApproximate } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
@@ -445,7 +446,10 @@ export type InvoiceRow = {
   qty: number
   totalBase: number
   paidAt: string | null
+  /** Signed: positive owed to us, negative a customer credit balance. The same figure Customer Aging and AR Aging use. */
   balance: number
+  /** `exact`, or `upper`/`indeterminate` when a credit or payment could not be placed exactly. */
+  balanceBound: TurnoverBound
 }
 
 export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promise<InvoiceRow[]> {
@@ -459,18 +463,18 @@ export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promi
     where: Object.keys(dateFilter).length ? invoicedInPeriodWhere(dateFilter as { gte?: Date; lte?: Date }) : INVOICED_ORDER_WHERE,
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, invoiceNumber: true, accountingInvoiceId: true, customerName: true, salesRep: true,
-      invoicedAt: true, createdAt: true, status: true, totalBase: true, paidAt: true,
+      invoicedAt: true, createdAt: true, status: true, totalBase: true, totalForeign: true, currency: true, paidAt: true,
       lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true } },
-      payments: { where: { refundId: null }, select: { amount: true } },
+      payments: { select: { amount: true, currency: true, paidAt: true, refundId: true, settlementRateToBase: true } },
+      refunds: { select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
     },
   })
 
   const rows: InvoiceRow[] = []
   for (const o of orders) {
-    const paid = o.payments.reduce((s, p) => s + Number(p.amount), 0)
-    // Held as paid (`paidAt` set) means nothing is owed even when no Payment row exists (markSalesOrderPaid, the importer);
-    // otherwise Payment rows decide, so a partial payment still shows.
-    const balance = o.paidAt ? 0 : Math.round((Number(o.totalBase) - paid) * 100) / 100
+    // One receivables arithmetic for every screen (receivable-balance.ts): invoice less credits less receipts, in base,
+    // an order held as paid counting as settled even with no Payment row.
+    const { balance, bound: balanceBound } = receivableBalance(o, new Date())
     for (const l of o.lines) {
       rows.push({
         orderId: o.id, orderNumber: getSalesOrderReference(o),
@@ -480,7 +484,7 @@ export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promi
         productName: l.description, customerName: o.customerName ?? '—', salesRep: o.salesRep,
         invoicedAt: invoicedPeriodDate(o).toISOString(), invoicedAtApproximate: invoicedPeriodDateIsApproximate(o), status: o.status,
         qty: Number(l.qty), totalBase: Number(l.totalBase),
-        paidAt: o.paidAt?.toISOString() ?? null, balance,
+        paidAt: o.paidAt?.toISOString() ?? null, balance, balanceBound,
       })
     }
   }
@@ -611,16 +615,16 @@ export type CustomerAgingRow = {
 export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
   await requirePermission('analytics')
   const orders = await db.salesOrder.findMany({
-    // Held as paid (`paidAt` set) means nothing is owed, whether or not a local Payment row exists:
-    // markSalesOrderPaid and the importer set paidAt without one. Same rule AR Aging applies.
-    where: { ...INVOICED_ORDER_WHERE, paidAt: null },
+    // Paid orders are not excluded in the query: receivableBalance (one arithmetic shared with AR Aging and the
+    // Invoices tab) decides what is still owed, including orders held as paid with no Payment row.
+    where: INVOICED_ORDER_WHERE,
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, customerId: true, customerName: true, salesRep: true,
-      currency: true, totalBase: true, taxBase: true, invoicedAt: true, paidAt: true, createdAt: true,
+      currency: true, totalBase: true, totalForeign: true, taxBase: true, invoicedAt: true, paidAt: true, createdAt: true,
       shipFromWarehouse: { select: { code: true } },
-      payments: { where: { refundId: null }, select: { amount: true } },
+      payments: { select: { amount: true, currency: true, paidAt: true, refundId: true, settlementRateToBase: true } },
       // o3d-iigc: the basis was not fetched before, so the report could not have respected it.
-      refunds: REFUND_TURNOVER_SELECT,
+      refunds: { select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
     },
     orderBy: { createdAt: 'desc' },
   })
@@ -629,15 +633,9 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
   // The shared invoiced filter admits paid orders; aging lists only what is still owed (same 0.01 tolerance as the buckets).
   return orders.map((o) => {
     const total = Number(o.totalBase)
-    const paid = o.payments.reduce((s, p) => s + Number(p.amount), 0)
-    // `balance` stays GROSS-on-GROSS and is untouched: Payment.amount is cash actually moved, which
-    // is the same unit as the VAT-inclusive invoice total. Only the net-of-credits figure below has
-    // a basis question, because a credit's stored total does not.
     const credits = netOfRefunds(o, o.refunds)
-    // What is owed: the gross total less cash received AND credits raised, the credits read exactly as
-    // customer turnover reads them. A credit whose basis cannot be proven comes off nothing and the row is flagged.
-    const { credit, bound: dueBound } = refundCreditsAsGross(o.refunds)
-    const balance = Math.max(0, total - paid - credit)
+    const { balance: signedBalance, bound: dueBound } = receivableBalance(o, new Date(now))
+    const balance = Math.max(0, signedBalance)
     const ageDays = Math.round((now - invoicedPeriodDate(o).getTime()) / 86400000)
     let o0 = 0, o31 = 0, o61 = 0, o91 = 0
     if (balance > 0.01) {

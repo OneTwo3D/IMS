@@ -105,9 +105,9 @@ export async function GET(req: NextRequest) {
         productName: r.productName, orderNumber: r.orderNumber, invoiceNumber: r.invoiceNumber,
         invoicedAt: r.invoicedAt.slice(0, 10), dateApproximate: r.invoicedAtApproximate ? 'yes' : '', sku: r.sku, customerName: r.customerName,
         salesRep: r.salesRep, status: r.paidAt ? 'Paid' : 'Unpaid', qty: r.qty,
-        totalBase: r.totalBase.toFixed(2), balance: r.balance.toFixed(2),
+        totalBase: r.totalBase.toFixed(2), balance: r.balance.toFixed(2), balanceBound: r.balanceBound,
       }))
-      return csvResponseFor(req, toCsv(data, ['productName', 'orderNumber', 'invoiceNumber', 'invoicedAt', 'dateApproximate', 'sku', 'customerName', 'salesRep', 'status', 'qty', 'totalBase', 'balance']), `invoices-${date}.csv`)
+      return csvResponseFor(req, toCsv(data, ['productName', 'orderNumber', 'invoiceNumber', 'invoicedAt', 'dateApproximate', 'sku', 'customerName', 'salesRep', 'status', 'qty', 'totalBase', 'balance', 'balanceBound']), `invoices-${date}.csv`)
     }
 
     case 'refunds': {

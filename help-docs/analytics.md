@@ -148,6 +148,8 @@ These reports, **Purchase Statistics** (page, data and the `po_*` CSV exports) a
 
 During the parallel phase an order with a WooCommerce (Xeroom) invoice number counts as invoiced; IMS does not check that Xeroom's post to Xero succeeded.
 
+What is owed on an order is worked out once, the same way on AR Aging, Customer Aging and the Invoices tab: the invoice total less credit notes less receipts, all in the base currency (a payment is converted at its stored settlement rate, otherwise at the order's booked rate), as of the report date. An order held as paid with no payment record counts as settled, cash paid back out puts the money back on the receivable, and a paid order that was credited shows as a customer credit balance. Where a credit could not be placed exactly the balance is marked ≤ or ≈.
+
 Reports that are bounded by invoice date (the Sales Statistics invoice list, the currency summary and AR Aging) date an order by its invoice date when IMS has one, otherwise by the date it was paid, and only then by the order date (shown as approximate, with a notice on the report and a column in the CSV). Orders invoiced by Xeroom carry an invoice number but no invoice date in IMS; Xeroom issues the invoice as the order is paid, so the paid date is the closest date IMS holds. The VAT report is not affected: it keeps its own invoice-date tax point.
 
 The Gross Margin and COGS reports use the same invoiced orders for revenue and credit. A dispatch of an order that has no invoice yet keeps its cost, but no revenue or credit is counted against it, and its COGS row reads Unmatched.
