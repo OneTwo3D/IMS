@@ -426,3 +426,19 @@ test('R9: a matching detail row with NO OrderStatusId is never proved ours (it m
   details.set('555', { ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 })
   assert.equal(await verifyMintsoftPushedOrder('555', ref), 'ours', 'control: a present, live status verifies')
 })
+
+test('R10: a result whose number is a merge containing ours but which has no ClientId or no order name/values is INCONCLUSIVE, not ABSENT', async () => {
+  reset()
+  const { findMintsoftMergedSurvivor } = await push()
+  const noClient = survivorRow()
+  delete (noClient as Record<string, unknown>).ClientId
+  searchRows = [noClient]
+  assert.equal((await findMintsoftMergedSurvivor('ORD-B')).kind, 'INCONCLUSIVE')
+  const noValues = survivorRow()
+  delete (noValues as Record<string, unknown>).OrderNameValues
+  searchRows = [noValues]
+  assert.equal((await findMintsoftMergedSurvivor('ORD-B')).kind, 'INCONCLUSIVE')
+  // Conclusive rule-outs stay ABSENT: another client's row, a flag that is present and false, a number that is not a merge containing ours.
+  searchRows = [survivorRow({ ClientId: 99 }), survivorRow({ ID: 2, OrderNumber: 'Z-1+Z-2' }), survivorRow({ ID: 3, OrderNameValues: [{ Name: 'MergedOrder', Value: 'False' }] })]
+  assert.deepEqual(await findMintsoftMergedSurvivor('ORD-B'), { kind: 'ABSENT' })
+})

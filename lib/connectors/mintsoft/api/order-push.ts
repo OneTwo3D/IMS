@@ -302,16 +302,22 @@ export async function findMintsoftMergedSurvivor(orderNumber: string): Promise<W
   if (!wanted) return { kind: 'ABSENT' }
   const raw = await fetchSearchRows(wanted, clientId)
   if (raw.length >= MINTSOFT_SEARCH_PAGE) return { kind: 'INCONCLUSIVE', reason: 'the search returned a full page of results, which may be incomplete' }
-  const survivors = raw.filter((row) => {
-    if (toStr(row.ClientId ?? row.clientId) !== String(clientId)) return false
+  const survivors: RawOrder[] = []
+  for (const row of raw) {
     const parts = mintsoftMergedParts(toStr(row.OrderNumber))
-    if (!parts.includes(wanted)) return false
-    const values = Array.isArray(row.OrderNameValues) ? (row.OrderNameValues as unknown[]) : []
-    return values.some((entry) => {
+    if (!parts.includes(wanted)) continue // not a merge containing this number: ruled out
+    // A row whose number IS a merge containing ours but which cannot be tied to our client, or says nothing about being a merge, rules
+    // nothing out: it may be the survivor, so the answer is INCONCLUSIVE and never ABSENT.
+    const rowClient = toStr(row.ClientId ?? row.clientId)
+    if (rowClient === null) return { kind: 'INCONCLUSIVE', reason: 'a search result that contains this number in a merged number carries no ClientId' }
+    if (rowClient !== String(clientId)) continue // another client's: ruled out
+    if (!Array.isArray(row.OrderNameValues)) return { kind: 'INCONCLUSIVE', reason: 'a merged-number search result carries no order name/values, so it cannot be told whether it is flagged as a merge' }
+    const flagged = (row.OrderNameValues as unknown[]).some((entry) => {
       const nv = entry as Record<string, unknown> | null
       return nv !== null && typeof nv === 'object' && toStr(nv.Name) === 'MergedOrder' && toStr(nv.Value)?.toLowerCase() === 'true'
     })
-  })
+    if (flagged) survivors.push(row)
+  }
   if (survivors.length === 0) return { kind: 'ABSENT' }
   if (survivors.length > 1) return { kind: 'INCONCLUSIVE', reason: `${survivors.length} merged orders contain this number` }
   const id = toStr(survivors[0].ID ?? survivors[0].Id ?? survivors[0].id)
