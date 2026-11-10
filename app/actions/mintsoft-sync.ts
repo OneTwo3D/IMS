@@ -50,6 +50,7 @@ import { inferShoppingOrderLookupConnector } from '@/lib/fulfillment/shopping-or
 import {
   clearMintsoftAlignmentCreditsForBinding,
   createMintsoftBindingHandover,
+  findLiveStockSyncForWarehouse,
   runStockSyncForBinding,
 } from '@/lib/connectors/mintsoft/sync/stock-sync'
 import { mintsoftAsnCreateShadowNotice, mintsoftProducerSeam } from '@/lib/connectors/mintsoft/producer-seam'
@@ -2355,6 +2356,7 @@ export async function saveMintsoftBinding(
           id: true,
           warehouseId: true,
           connectionId: true,
+          pairingChangedAt: true,
           active: true,
           stockSyncMode: true,
           alignmentConfirmedAt: true,
@@ -2407,21 +2409,51 @@ export async function saveMintsoftBinding(
         && existingBinding.externalWarehouseId === bindingData.externalWarehouseId
         && existingBinding.connectionId === bindingData.connectionId
       )
-      const binding = await db.externalWmsBinding.update({
-        where: { id: existingBinding.id },
-        data: {
-          ...bindingData,
-          ...(pointsAtSameTarget ? {} : { pairingChangedAt: new Date() }),
-          alignmentConfirmedAt: bindingData.stockSyncMode === 'ALIGN_TO_WMS'
-            ? (
-                existingBinding.stockSyncMode === 'ALIGN_TO_WMS' && pointsAtSameTarget
-                  ? existingBinding.alignmentConfirmedAt
-                  : null
-              )
-            : null,
-        },
-        select: { id: true },
+      // ATOMIC with the reads above. Under the binding's row lock (the same lock a stock-sync
+      // reservation takes before it records a run) this refuses a re-point while a sync is running,
+      // and writes only if the row still has the pairing, approval and mode this save was computed
+      // from — otherwise two saves that both read pairing A could end with B's approval cleared and
+      // then A restored from a stale read with the old approval back.
+      const outcome = await db.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM external_wms_bindings WHERE id = ${existingBinding.id} FOR UPDATE`
+        if (!pointsAtSameTarget && await findLiveStockSyncForWarehouse(tx, existingBinding.warehouseId)) {
+          return 'sync-running' as const
+        }
+        const written = await tx.externalWmsBinding.updateMany({
+          where: {
+            id: existingBinding.id,
+            connector: 'mintsoft',
+            warehouseId: existingBinding.warehouseId,
+            externalWarehouseId: existingBinding.externalWarehouseId,
+            connectionId: existingBinding.connectionId,
+            pairingChangedAt: existingBinding.pairingChangedAt,
+            stockSyncMode: existingBinding.stockSyncMode,
+            alignmentConfirmedAt: existingBinding.alignmentConfirmedAt,
+          },
+          data: {
+            ...bindingData,
+            ...(pointsAtSameTarget ? {} : { pairingChangedAt: new Date() }),
+            alignmentConfirmedAt: bindingData.stockSyncMode === 'ALIGN_TO_WMS'
+              ? (
+                  existingBinding.stockSyncMode === 'ALIGN_TO_WMS' && pointsAtSameTarget
+                    ? existingBinding.alignmentConfirmedAt
+                    : null
+                )
+              : null,
+          },
+        })
+        return written.count === 1 ? ('saved' as const) : ('moved' as const)
       })
+      if (outcome === 'sync-running') {
+        return {
+          success: false,
+          error: 'A stock sync is running for this warehouse binding, so it cannot be pointed at a different warehouse or connection now. Wait for the sync to finish, then save again.',
+        }
+      }
+      if (outcome === 'moved') {
+        return { success: false, error: 'The binding changed while you were saving it. Reload the page and try again.' }
+      }
+      const binding = { id: existingBinding.id }
       bindingId = binding.id
     } else {
       const binding = await db.externalWmsBinding.create({

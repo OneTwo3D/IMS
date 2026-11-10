@@ -278,6 +278,26 @@ async function heartbeatStockSyncJob(jobId: string, binding: SyncBinding, leaseT
   return updated.count === 1
 }
 
+/**
+ * A stock sync that is running for this IMS warehouse RIGHT NOW: RUNNING and still heartbeating (a job
+ * whose heartbeat is older than the reclaim window is dead and does not count — the reservation reclaims
+ * it the same way). Used to refuse re-pointing a binding underneath a run that keeps its start-time
+ * snapshot of the pairing and the dry-run flag.
+ */
+export async function findLiveStockSyncForWarehouse(
+  client: { wmsSyncJob: { findFirst: typeof db.wmsSyncJob.findFirst } },
+  warehouseId: string,
+): Promise<{ id: string } | null> {
+  const running = await client.wmsSyncJob.findFirst({
+    where: { connector: 'mintsoft', type: 'STOCK_SYNC', warehouseId, status: 'RUNNING' },
+    select: { id: true, startedAt: true, summary: true },
+    orderBy: { startedAt: 'desc' },
+  })
+  if (!running) return null
+  const lastHeartbeatAt = parseRunningHeartbeat(running.summary) ?? running.startedAt
+  return lastHeartbeatAt < new Date(Date.now() - STALE_RUNNING_STOCK_SYNC_MS) ? null : { id: running.id }
+}
+
 async function reserveStockSyncJob(
   bindingId: string,
   triggeredBy: string,

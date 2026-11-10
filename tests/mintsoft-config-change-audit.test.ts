@@ -17,6 +17,9 @@ const settingRows = new Map<string, string>()
 const upserts: Array<{ key: string; value: string }> = []
 const deletedSettingKeys: string[] = []
 let existingBindingRow: Record<string, unknown> | null = null
+let runningSyncJob: Record<string, unknown> | null = null
+/** Fires when the save takes the binding's row lock — where a competing save lands. */
+let onBindingLock: (() => void) | null = null
 const bindingUpdates: Array<Record<string, unknown>> = []
 
 // q66in.7.2 / Codex r10 #2 — the harness models WHEN a value is read, not just what it holds.
@@ -67,11 +70,21 @@ const db: Record<string, unknown> = {
       bindingUpdates.push(data)
       return { id: 'bind-1' }
     },
+    // The save is a compare-and-set: it writes only while every field in `where` still equals the row.
+    updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+      const row = existingBindingRow ?? {}
+      const same = Object.entries(where).every(([key, want]) => key === 'connector' || (want instanceof Date ? (row[key] as Date | undefined)?.getTime() === want.getTime() : row[key] === want))
+      if (!same) return { count: 0 }
+      bindingUpdates.push(data)
+      existingBindingRow = { ...row, ...data }
+      return { count: 1 }
+    },
     create: async ({ data }: { data: Record<string, unknown> }) => {
       bindingUpdates.push(data)
       return { id: 'bind-new' }
     },
   },
+  wmsSyncJob: { findFirst: async () => runningSyncJob },
   adjustmentReason: { findUnique: async () => ({ active: true, accountCode: '5000' }) },
   shoppingOrderLink: { findMany: async () => [] },
   // BOTH forms. Prisma's array form has already evaluated each delegate call by the time it
@@ -102,6 +115,10 @@ const db: Record<string, unknown> = {
   },
   $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
     const sql = strings.join(' ')
+    if (/external_wms_bindings/i.test(sql)) {
+      onBindingLock?.()
+      return []
+    }
     if (!/FOR UPDATE/i.test(sql)) throw new Error(`the before-image read must take a row lock: ${sql}`)
     if (!inTransaction) throw new Error('the row lock must be taken INSIDE the write transaction')
     lockedKeys = [...(values[0] as string[])].sort()
@@ -161,6 +178,8 @@ function reset() {
   inTransaction = false
   concurrentWrite = null
   existingBindingRow = null
+  runningSyncJob = null
+  onBindingLock = null
   settingRows.clear()
 }
 
@@ -554,4 +573,56 @@ test('a different connection also clears the confirmation', async () => {
   const result = await saveMintsoftBinding(alignSave({}))
   assert.equal(result.success, true)
   assert.equal(bindingUpdates.at(-1)?.alignmentConfirmedAt, null)
+})
+
+// ---------------------------------------------------------------------------
+// The binding save is atomic: it cannot be overtaken by a competing save, and it will not re-point a
+// binding underneath a stock sync that is running.
+// ---------------------------------------------------------------------------
+
+test('two saves that both read pairing A: the stale one is refused instead of restoring A and the old approval', async () => {
+  const { saveMintsoftBinding } = await loadActions()
+  reset()
+  existingBindingRow = { ...CONFIRMED_ALIGN, pairingChangedAt: new Date('2026-11-01T00:00:00Z') }
+  const staleReadOfA = { ...existingBindingRow }
+  // The competing save (A -> B) lands after the stale save has read A and before it writes.
+  onBindingLock = () => {
+    onBindingLock = null
+    existingBindingRow = { ...staleReadOfA, externalWarehouseId: '8', pairingChangedAt: new Date('2026-11-03T00:00:00Z'), alignmentConfirmedAt: null }
+  }
+  // The stale save is an unrelated edit that still points at A and would keep the old approval.
+  const result = await saveMintsoftBinding(alignSave({ syncFrequencyMinutes: 15 }))
+
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /changed while you were saving/)
+  assert.equal(bindingUpdates.length, 0, 'the stale save wrote nothing')
+  assert.equal(existingBindingRow.externalWarehouseId, '8', 'B stays')
+  assert.equal(existingBindingRow.alignmentConfirmedAt, null, 'and the old approval is not restored')
+  assert.equal(logs.some((log) => log.action === 'mintsoft_binding_updated'), false, 'nothing is audited as saved')
+})
+
+test('a re-point is refused while a stock sync for the binding is running; edits, finished and dead runs are not', async () => {
+  const { saveMintsoftBinding } = await loadActions()
+  const live = { id: 'job-1', startedAt: new Date(Date.now() - 60_000), summary: { heartbeatAt: new Date().toISOString() } }
+  const dead = { id: 'job-2', startedAt: new Date(Date.now() - 3_600_000), summary: { heartbeatAt: new Date(Date.now() - 3_600_000).toISOString() } }
+
+  for (const [name, job, over, allowed] of [
+    ['re-point during a live run', live, { warehouseId: 'wh-9' }, false],
+    ['other Mintsoft warehouse during a live run', live, { externalWarehouseId: '8' }, false],
+    ['unrelated edit during a live run (control)', live, { syncFrequencyMinutes: 15 }, true],
+    ['re-point with no run', null, { warehouseId: 'wh-9' }, true],
+    ['re-point with a dead run (heartbeat long stale)', dead, { warehouseId: 'wh-9' }, true],
+  ] as const) {
+    reset()
+    existingBindingRow = { ...CONFIRMED_ALIGN, pairingChangedAt: new Date('2026-11-01T00:00:00Z') }
+    runningSyncJob = job
+    const result = await saveMintsoftBinding(alignSave(over))
+    assert.equal(result.success, allowed, name)
+    if (allowed) assert.equal(bindingUpdates.length, 1, name)
+    else {
+      assert.match(result.error ?? '', /stock sync is running/, name)
+      assert.equal(bindingUpdates.length, 0, `${name}: nothing written`)
+      assert.equal(existingBindingRow.warehouseId, 'wh-1', `${name}: still pointing where it was`)
+    }
+  }
 })
