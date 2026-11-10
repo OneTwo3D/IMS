@@ -333,28 +333,38 @@ test('merged survivor: found from the ABSORBED number (second part) and from the
   reset()
   const { findMintsoftMergedSurvivor } = await push()
   searchRows = [survivorRow()]
-  assert.deepEqual(await findMintsoftMergedSurvivor('ORD-B'), { externalOrderId: '2001', externalOrderNumber: 'ORD-C+ORD-B' })
-  assert.deepEqual(await findMintsoftMergedSurvivor('ORD-C'), { externalOrderId: '2001', externalOrderNumber: 'ORD-C+ORD-B' })
+  assert.deepEqual(await findMintsoftMergedSurvivor('ORD-B'), { kind: 'FOUND', externalOrderId: '2001', externalOrderNumber: 'ORD-C+ORD-B' })
+  assert.deepEqual(await findMintsoftMergedSurvivor('ORD-C'), { kind: 'FOUND', externalOrderId: '2001', externalOrderNumber: 'ORD-C+ORD-B' })
   assert.deepEqual(writes, [])
   assert.ok(calls.every((c) => c.startsWith('/api/Order/Search')), 'only the search read')
 })
 
-test('merged survivor: refused without the MergedOrder flag, for a partial part, a foreign client, two candidates or a full page', async () => {
+test('merged survivor: ABSENT only when the search conclusively holds no such order (no flag, a partial part, a foreign client)', async () => {
   reset()
   const { findMintsoftMergedSurvivor } = await push()
   searchRows = [survivorRow({ OrderNameValues: [] })]
-  assert.equal(await findMintsoftMergedSurvivor('ORD-B'), null, 'no flag')
+  assert.deepEqual(await findMintsoftMergedSurvivor('ORD-B'), { kind: 'ABSENT' }, 'no flag')
   searchRows = [survivorRow({ OrderNameValues: [{ Name: 'MergedOrder', Value: 'False' }] })]
-  assert.equal(await findMintsoftMergedSurvivor('ORD-B'), null, 'flag false')
+  assert.deepEqual(await findMintsoftMergedSurvivor('ORD-B'), { kind: 'ABSENT' }, 'flag false')
   searchRows = [survivorRow()]
-  assert.equal(await findMintsoftMergedSurvivor('ORD'), null, 'a prefix of a part is not a part')
-  assert.equal(await findMintsoftMergedSurvivor('ORD-B+ORD'), null)
+  assert.deepEqual(await findMintsoftMergedSurvivor('ORD'), { kind: 'ABSENT' }, 'a prefix of a part is not a part')
+  assert.deepEqual(await findMintsoftMergedSurvivor('ORD-B+ORD'), { kind: 'ABSENT' })
   searchRows = [survivorRow({ ClientId: 99 })]
-  assert.equal(await findMintsoftMergedSurvivor('ORD-B'), null, 'foreign client')
+  assert.deepEqual(await findMintsoftMergedSurvivor('ORD-B'), { kind: 'ABSENT' }, 'foreign client')
+  searchRows = []
+  assert.deepEqual(await findMintsoftMergedSurvivor('ORD-B'), { kind: 'ABSENT' }, 'nothing at all')
+})
+
+test('merged survivor: two candidates or a FULL page cannot be told apart from a survivor - INCONCLUSIVE, never ABSENT', async () => {
+  reset()
+  const { findMintsoftMergedSurvivor } = await push()
   searchRows = [survivorRow(), survivorRow({ ID: 2002, OrderNumber: 'ORD-X+ORD-B' })]
-  assert.equal(await findMintsoftMergedSurvivor('ORD-B'), null, 'two candidates')
+  const several = await findMintsoftMergedSurvivor('ORD-B')
+  assert.equal(several.kind, 'INCONCLUSIVE')
   searchRows = Array.from({ length: 10 }, (_, i) => survivorRow({ ID: 3000 + i, OrderNumber: i === 0 ? 'ORD-C+ORD-B' : `Z-${i}`, OrderNameValues: i === 0 ? [MERGED] : [] }))
-  assert.equal(await findMintsoftMergedSurvivor('ORD-B'), null, 'a full page may be truncated')
+  const full = await findMintsoftMergedSurvivor('ORD-B')
+  assert.equal(full.kind, 'INCONCLUSIVE')
+  assert.match((full as { reason: string }).reason, /full page/)
 })
 
 test('merged parts: the number is recognised in ANY position', async () => {

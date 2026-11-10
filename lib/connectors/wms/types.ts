@@ -526,6 +526,12 @@ export type WmsOrderUpdateResult = {
  * assume. That degradation is what the seam test exercises, because with one shipped
  * connector implementing nearly everything, no other test can reach those branches.
  */
+/** The answer of {@link WmsConnector.findMergedSurvivor}. */
+export type WmsMergedSurvivorLookup =
+  | { kind: 'FOUND'; externalOrderId: string; externalOrderNumber: string }
+  | { kind: 'ABSENT' }
+  | { kind: 'INCONCLUSIVE'; reason: string }
+
 /** The answer of {@link WmsConnector.reconcileAmbiguousCreate}. */
 export type WmsAmbiguousCreateResolution =
   | { kind: 'ADOPT'; externalOrderId: string; externalOrderNumber: string }
@@ -639,7 +645,7 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
    * with this number as one part of a combined number AND flagged as a merge. Exactly one such order is returned; anything else
    * (none, several, an incomplete search page) is null, and the caller treats the order as simply not found.
    */
-  findMergedSurvivor?(orderNumber: string): Promise<{ externalOrderId: string; externalOrderNumber: string } | null>
+  findMergedSurvivor?(orderNumber: string): Promise<WmsMergedSurvivorLookup>
   /** Amend an already-pushed WMS order; a no-op (updated=false) if past NEW. */
   updateOrder?(externalOrderId: string, input: WmsOrderPushInput, clearance: WmsWriteClearance<'order.amend'>): Promise<WmsOrderUpdateResult>
   /** Cancel a WMS order by its external id; a no-op (success) if past NEW. */

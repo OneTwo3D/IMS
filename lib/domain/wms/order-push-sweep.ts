@@ -64,6 +64,9 @@ const MAX_ATTEMPTS = 5
  */
 const PRESENCE_PROBE_BUDGET = 5
 
+/** How many sweeps an INCONCLUSIVE merge lookup is retried (after a hold/cancel 404) before a person is told. Counted on the link's attempts (unused while SYNCED). */
+const MERGE_CHECK_RETRY_BUDGET = 5
+
 /**
  * How long a create claim is exclusive (o3d-38gl).
  *
@@ -845,6 +848,8 @@ export type WmsPushLinkRef = {
   externalOrderId: string | null
   /** The warehouse's own number for the order (what a merge shows up under). Optional: absent means no merge lookup. */
   externalOrderNumber?: string | null
+  /** Attempts already spent on this link (the merge-check retry counter while SYNCED). */
+  attempts?: number
   /** SYNCED unless the dispatch sweep re-pointed the link at a merged survivor (MERGED). Absent reads as SYNCED. */
   state?: 'SYNCED' | 'MERGED'
 }
@@ -1307,16 +1312,32 @@ export async function runWmsOrderPushSweepCore(
   const handleNotFound = async (link: WmsPushLinkRef, intent: 'HOLD' | 'CANCEL', notFoundReason: string, notFoundSummary: string, ts: Date) => {
     let survivor: { externalOrderId: string; externalOrderNumber: string } | null = null
     if (connector.findMergedSurvivor && link.externalOrderNumber && link.externalOrderId) {
+      let lookup: Awaited<ReturnType<NonNullable<PushConnector['findMergedSurvivor']>>>
       try {
-        survivor = await connector.findMergedSurvivor(link.externalOrderNumber)
+        lookup = await connector.findMergedSurvivor(link.externalOrderNumber)
       } catch (error) {
-        // An INCONCLUSIVE lookup is not "no survivor". The final not-found notice would take the link out of the hold/cancel passes for
-        // good, so nothing is stamped: the link stays retryable and the transient reason is left on it. The next sweep asks again.
-        console.warn(`[wms-order-push] merge lookup failed for link ${link.id}: ${scrubWmsError(error, 'merge lookup failed')}`)
-        await port.updateLink(link.id, {
-          lastError: `A hold or cancel found WMS order ${link.externalOrderId} missing and the check for a merge failed; it will be retried on the next sweep.`,
-          lastAttemptAt: ts,
-        }).catch(() => {})
+        lookup = { kind: 'INCONCLUSIVE', reason: scrubWmsError(error, 'the merge lookup failed') }
+      }
+      if (lookup.kind === 'FOUND') survivor = { externalOrderId: lookup.externalOrderId, externalOrderNumber: lookup.externalOrderNumber }
+      if (lookup.kind === 'INCONCLUSIVE') {
+        // An INCONCLUSIVE lookup (an error, a full page, several candidates) is not "no survivor". The final not-found notice would take
+        // the link out of the hold/cancel passes for good, so nothing is stamped: the link stays retryable with the transient reason on
+        // it. Retried a bounded number of sweeps (counted on the link), then a person is told the check could not settle it.
+        const tries = (link.attempts ?? 0) + 1
+        console.warn(`[wms-order-push] merge lookup inconclusive for link ${link.id} (try ${tries}): ${lookup.reason}`)
+        if (tries < MERGE_CHECK_RETRY_BUDGET) {
+          await port.updateLink(link.id, {
+            attempts: tries,
+            lastError: `A hold or cancel found WMS order ${link.externalOrderId} missing and the check for a merge was inconclusive (${tries} of ${MERGE_CHECK_RETRY_BUDGET}); it will be retried on the next sweep.`,
+            lastAttemptAt: ts,
+          }).catch(() => {})
+          return
+        }
+        await port.updateLink(link.id, { attempts: 0 }).catch(() => {})
+        await raiseWmsRefusalNotice(link, intent,
+          `${intent === 'HOLD' ? 'Held' : 'Cancelled'} in IMS, but WMS order ${link.externalOrderId} was not found and the check for a merge stayed inconclusive after ${MERGE_CHECK_RETRY_BUDGET} sweeps (${lookup.reason}). `
+          + 'IMS has NOT recorded it as ' + (intent === 'HOLD' ? 'held' : 'cancelled in the WMS') + ' — find the order in the WMS and decide.',
+          { wmsStatus: 'NOT_FOUND', summary: 'IMS ' + (intent === 'HOLD' ? 'hold' : 'cancel') + ' could not be confirmed: the WMS order was not found and the merge check was inconclusive — left for an operator', comment: null }, ts)
         return
       }
     }
@@ -3504,7 +3525,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       db.wmsOrderPushLink.findMany({
         // MERGED links are included (their survivor holds the goods); a link whose hold the WMS already refused carries a notice and is not retried.
         where: { connector, state: { in: ['SYNCED', 'MERGED'] }, holdNoticeAt: null, externalOrderId: { not: null }, order: { status: 'ON_HOLD' } },
-        select: { id: true, orderId: true, externalOrderId: true, externalOrderNumber: true, state: true },
+        select: { id: true, orderId: true, externalOrderId: true, externalOrderNumber: true, attempts: true, state: true },
         take: limit,
       }) as Promise<WmsPushLinkRef[]>,
     cancellableLinks: (connector, limit) =>
@@ -3516,7 +3537,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           externalOrderId: { not: null },
           order: WMS_CANCELLABLE_ORDER_WHERE,
         },
-        select: { id: true, orderId: true, externalOrderId: true, externalOrderNumber: true, state: true },
+        select: { id: true, orderId: true, externalOrderId: true, externalOrderNumber: true, attempts: true, state: true },
         take: limit,
       }) as Promise<WmsPushLinkRef[]>,
     async verifyWithdrawalFence(orderId) {

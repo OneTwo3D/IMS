@@ -1,4 +1,4 @@
-import type { WmsAmbiguousCreateResolution, WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsOrderPart, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsOrderUpdateResult, WmsProductContentResult, WmsProductContentUpdate, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAmbiguousCreateResolution, WmsMergedSurvivorLookup, WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsOrderPart, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsOrderUpdateResult, WmsProductContentResult, WmsProductContentUpdate, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   getMintsoftApiConfiguration,
   isMintsoftConfigured,
@@ -167,7 +167,7 @@ export class MintsoftConnector implements WmsConnector {
   }
 
   /** A READ. Was this order merged into another? Mutates nothing. */
-  async findMergedSurvivor(orderNumber: string): Promise<{ externalOrderId: string; externalOrderNumber: string } | null> {
+  async findMergedSurvivor(orderNumber: string): Promise<WmsMergedSurvivorLookup> {
     return findMintsoftMergedSurvivor(orderNumber)
   }
 

@@ -1,6 +1,7 @@
 import { isOutboundMaybeSentRefusalText, isOutboundWriteHeldText, outboundTextAfterEarlierSend } from '@/lib/security/outbound-write-hold-constants'
 import type {
   WmsAmbiguousCreateResolution,
+  WmsMergedSurvivorLookup,
   WmsOrderCancelResult,
   WmsOrderPushInput,
   WmsOrderPushLine,
@@ -283,12 +284,12 @@ export async function reconcileMintsoftAmbiguousCreate(
 // cancelled (a cancelled order keeps its number). So within our client the number belongs to exactly one order for good, and a merged
 // survivor listing it as one "+" part has absorbed that order. The checks that remain are therefore the ones that tie the survivor to
 // OUR client (ClientId), to a real merge (MergedOrder=True) and to our order (an EXACT part, never a prefix or substring).
-export async function findMintsoftMergedSurvivor(orderNumber: string): Promise<{ externalOrderId: string; externalOrderNumber: string } | null> {
+export async function findMintsoftMergedSurvivor(orderNumber: string): Promise<WmsMergedSurvivorLookup> {
   const clientId = await getPushClientId('Mintsoft merged-survivor lookup')
   const wanted = orderNumber.trim()
-  if (!wanted) return null
+  if (!wanted) return { kind: 'ABSENT' }
   const raw = await fetchSearchRows(wanted, clientId)
-  if (raw.length >= MINTSOFT_SEARCH_PAGE) return null
+  if (raw.length >= MINTSOFT_SEARCH_PAGE) return { kind: 'INCONCLUSIVE', reason: 'the search returned a full page of results, which may be incomplete' }
   const survivors = raw.filter((row) => {
     if (toStr(row.ClientId ?? row.clientId) !== String(clientId)) return false
     const parts = mintsoftMergedParts(toStr(row.OrderNumber))
@@ -299,10 +300,11 @@ export async function findMintsoftMergedSurvivor(orderNumber: string): Promise<{
       return nv !== null && typeof nv === 'object' && toStr(nv.Name) === 'MergedOrder' && toStr(nv.Value)?.toLowerCase() === 'true'
     })
   })
-  if (survivors.length !== 1) return null
+  if (survivors.length === 0) return { kind: 'ABSENT' }
+  if (survivors.length > 1) return { kind: 'INCONCLUSIVE', reason: `${survivors.length} merged orders contain this number` }
   const id = toStr(survivors[0].ID ?? survivors[0].Id ?? survivors[0].id)
   const number = toStr(survivors[0].OrderNumber)
-  return id && number ? { externalOrderId: id, externalOrderNumber: number } : null
+  return id && number ? { kind: 'FOUND', externalOrderId: id, externalOrderNumber: number } : { kind: 'INCONCLUSIVE', reason: 'the merged order carries no readable id or number' }
 }
 
 async function createOrder(payload: Record<string, unknown>): Promise<{ ok: boolean; data: RawOrder | null; message: string | null }> {

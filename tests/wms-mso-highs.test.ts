@@ -9,7 +9,7 @@ import {
 } from '../lib/domain/wms/order-push-sweep.ts'
 import { runWmsDispatchSweepCore, type WmsDispatchSweepDeps } from '../lib/domain/wms/dispatch-sweep.ts'
 import type { WmsOrderPart, WmsOrderStatus } from '../lib/connectors/wms/types.ts'
-import type { WmsAmbiguousCreateResolution, WmsOrderCancelResult, WmsOrderPushInput, WmsOrderPushResult } from '../lib/connectors/wms/types.ts'
+import type { WmsMergedSurvivorLookup, WmsAmbiguousCreateResolution, WmsOrderCancelResult, WmsOrderPushInput, WmsOrderPushResult } from '../lib/connectors/wms/types.ts'
 import type { WmsMutationEventInput } from '../lib/domain/wms/mutation-audit.ts'
 
 /**
@@ -105,7 +105,7 @@ function connector(overrides: {
   cancelOrder?: (id: string) => Promise<WmsOrderCancelResult>
   reconcile?: (reference: { orderNumber: string; externalReference: string }) => Promise<WmsAmbiguousCreateResolution>
   probe?: () => Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'>
-  findMergedSurvivor?: (orderNumber: string) => Promise<{ externalOrderId: string; externalOrderNumber: string } | null>
+  findMergedSurvivor?: (orderNumber: string) => Promise<WmsMergedSurvivorLookup>
   comments?: Array<{ externalOrderId: string; comment: string }>
 } = {}) {
   const calls = { push: 0, cancel: [] as string[], reconcile: [] as Array<{ orderNumber: string; externalReference: string }> }
@@ -515,7 +515,7 @@ test('merge: a hold that 404s but whose number sits inside a merged survivor re-
   })
   const wms = connector({
     cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), comments,
-    findMergedSurvivor: async (number) => { asked.push(number); return { externalOrderId: 'surv-1', externalOrderNumber: 'ORD-C+ORD-B' } },
+    findMergedSurvivor: async (number) => { asked.push(number); return { kind: 'FOUND' as const, externalOrderId: 'surv-1', externalOrderNumber: 'ORD-C+ORD-B' } },
   })
   const r = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
   assert.deepEqual(asked, ['ORD-B'])
@@ -537,7 +537,7 @@ test('merge: the same for a cancel; and with no survivor (a deletion) the plain 
   })
   const m = connector({
     cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), comments: [],
-    findMergedSurvivor: async () => ({ externalOrderId: 'surv-1', externalOrderNumber: 'ORD-B+ORD-C' }),
+    findMergedSurvivor: async () => ({ kind: 'FOUND' as const, externalOrderId: 'surv-1', externalOrderNumber: 'ORD-B+ORD-C' }),
   })
   await quiet(() => runWmsOrderPushSweepCore(m.connector, 'mintsoft', merged.port, { now: NOW }))
   assert.equal(merged.updates[0].data.state, 'MERGED')
@@ -545,7 +545,7 @@ test('merge: the same for a cancel; and with no survivor (a deletion) the plain 
   assert.notEqual(merged.updates[1].data.state, 'CANCELLED')
 
   const gone = makePort({ cancellable: [{ id: 'link-1', orderId: 'so-2', externalOrderId: 'old-1', externalOrderNumber: 'ORD-B' }] })
-  const g = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), findMergedSurvivor: async () => null })
+  const g = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), findMergedSurvivor: async () => ({ kind: 'ABSENT' as const }) })
   await quiet(() => runWmsOrderPushSweepCore(g.connector, 'mintsoft', gone.port, { now: NOW }))
   assert.equal(gone.updates.length, 1)
   assert.equal(gone.updates[0].data.state, undefined)
@@ -559,7 +559,7 @@ test('merge: a link that moved on before the re-point matches nothing - no notic
   })
   const wms = connector({
     cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), comments: [],
-    findMergedSurvivor: async () => ({ externalOrderId: 'surv-1', externalOrderNumber: 'ORD-C+ORD-B' }),
+    findMergedSurvivor: async () => ({ kind: 'FOUND' as const, externalOrderId: 'surv-1', externalOrderNumber: 'ORD-C+ORD-B' }),
   })
   const r = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
   assert.equal(r.operatorNotices, undefined)
@@ -655,7 +655,7 @@ test('R6: a merge lookup that FAILS leaves the link retryable (no final not-foun
   const { port, updates } = makePort(seed)
   const wms = connector({
     cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), comments: [],
-    findMergedSurvivor: async () => { lookups += 1; if (lookups === 1) throw new Error('search unavailable'); return { externalOrderId: 'surv-1', externalOrderNumber: 'ORD-C+ORD-B' } },
+    findMergedSurvivor: async () => { lookups += 1; if (lookups === 1) throw new Error('search unavailable'); return { kind: 'FOUND' as const, externalOrderId: 'surv-1', externalOrderNumber: 'ORD-C+ORD-B' } },
   })
   const first = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
   assert.equal(first.operatorNotices, undefined, 'no notice yet')
@@ -670,8 +670,37 @@ test('R6: a merge lookup that FAILS leaves the link retryable (no final not-foun
 
 test('R6: only a lookup that SUCCEEDS and finds nothing raises the final not-found notice', async () => {
   const { port, updates } = makePort({ cancellable: [{ id: 'link-1', orderId: 'so-2', externalOrderId: 'old-1', externalOrderNumber: 'ORD-B' }] })
-  const wms = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), findMergedSurvivor: async () => null })
+  const wms = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), findMergedSurvivor: async () => ({ kind: 'ABSENT' as const }) })
   const r = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
   assert.equal(r.operatorNotices, 1)
   assert.ok(updates[0].data.cancelNoticeAt)
+})
+
+test('R7: an INCONCLUSIVE merge lookup (full page, several candidates) never stamps the final not-found notice', async () => {
+  for (const reason of ['the search returned a full page of results, which may be incomplete', '2 merged orders contain this number']) {
+    const { port, updates } = makePort({ holdable: [{ id: 'link-1', orderId: 'so-2', externalOrderId: 'old-1', externalOrderNumber: 'ORD-B', attempts: 0 }] })
+    const wms = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), findMergedSurvivor: async () => ({ kind: 'INCONCLUSIVE' as const, reason }) })
+    const r = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
+    assert.equal(r.operatorNotices, undefined)
+    assert.equal(updates.length, 1)
+    assert.equal(updates[0].data.holdNoticeAt, undefined, 'stays in the hold pass')
+    assert.equal(updates[0].data.attempts, 1, 'the retry is counted on the link')
+    assert.match(String(updates[0].data.lastError), /inconclusive \(1 of 5\)/)
+  }
+})
+
+test('R7: after the retry budget an inconclusive merge check raises the operator notice, so it is not retried in silence for ever', async () => {
+  const wms = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), comments: [], findMergedSurvivor: async () => ({ kind: 'INCONCLUSIVE' as const, reason: 'the search returned a full page of results, which may be incomplete' }) })
+  for (const attempts of [0, 1, 2, 3]) {
+    const { port } = makePort({ cancellable: [{ id: 'link-1', orderId: 'so-2', externalOrderId: 'old-1', externalOrderNumber: 'ORD-B', attempts }] })
+    const r = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
+    assert.equal(r.operatorNotices, undefined, `try ${attempts + 1}: still retrying`)
+  }
+  const last = makePort({ cancellable: [{ id: 'link-1', orderId: 'so-2', externalOrderId: 'old-1', externalOrderNumber: 'ORD-B', attempts: 4 }] })
+  const r = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', last.port, { now: NOW }))
+  assert.equal(r.operatorNotices, 1)
+  const notice = last.updates.find((u) => u.data.cancelNoticeAt)!
+  assert.match(String(notice.data.lastError), /merge stayed inconclusive after 5 sweeps/)
+  assert.ok(last.updates.some((u) => u.data.attempts === 0), 'the counter is reset')
+  assert.notEqual(last.updates.find((u) => u.data.state)?.data.state, 'CANCELLED')
 })
