@@ -307,7 +307,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
     figures: ['orderTurnoverBase', 'turnover'],
     treatment: 'basis-aware',
     reason:
-      'The per-order turnover helper behind the customer figures, VAT-inclusive throughout: a GROSS credit comes off as it stands, a NET credit comes off as its gross equivalent only when every credit line names a sales line with a known rate and the lines add up to the credit, and anything else comes off nothing and flags the sum as an upper bound.',
+      'The per-order turnover helper behind the customer figures, VAT-inclusive throughout: a GROSS credit comes off as it stands, a NET credit comes off as its gross equivalent from the sales line\u2019s STORED net and tax (never the current tax rate, which can be edited after the sale), and only when every credit line names a sales line with stored amounts and the lines add up to the credit, and anything else comes off nothing and flags the sum as an upper bound.',
   },
   {
     file: 'app/actions/dashboard.ts',

@@ -7,19 +7,23 @@ import { isInvoicedOrder } from '@/lib/domain/sales/invoiced-revenue-basis'
  * Every order contributes in the SAME unit, the gross order total less gross credit:
  *  - not invoiced (draft, cancelled, no invoice): nothing (`null`);
  *  - a GROSS-basis credit comes off as it stands;
- *  - a NET-basis credit comes off as its gross equivalent, computed line by line at the refunded
- *    line's own tax rate, but ONLY when that is exact: every credit line must name a sales line
- *    whose rate is known, and the credit lines must add up to the credit's header total;
- *  - any credit that cannot be placed exactly (unproven basis, no lines, a line with no known rate,
- *    lines that do not add up) is not guessed at: it comes off nothing and `complete` is false,
- *    so the sum is an upper bound.
+ *  - a NET-basis credit comes off as its gross equivalent: the credited share of the sales line's
+ *    own STORED gross, i.e. amount x (net + tax) / net using the line's stored `totalBase` (ex-VAT)
+ *    and `taxBase`. The stored tax is what was charged. The linked `TaxRate.rate` is deliberately
+ *    not read, because a rate can be edited after the sale;
+ *  - that is done only when exact: every credit line must name a sales line with a positive stored
+ *    net and a stored non-negative tax, no credit line may exceed its sales line's net, and the
+ *    credit lines must add up to the credit's header total;
+ *  - any credit that cannot be placed exactly (unproven basis, no lines, missing or zero stored
+ *    amounts, lines that do not add up) is not guessed at: it comes off nothing and `complete` is
+ *    false, so the sum is an upper bound.
  */
 export type TurnoverRefund = {
   totalBase: unknown
   totalsBasis: string | null
   lines?: Array<{
     totalBase: unknown
-    salesOrderLine?: { taxBase?: unknown; taxRate?: { rate: unknown } | null } | null
+    salesOrderLine?: { totalBase?: unknown; taxBase?: unknown } | null
   }>
 }
 
@@ -33,13 +37,14 @@ function netCreditAsGross(refund: TurnoverRefund): number | null {
   let gross = 0
   for (const line of lines) {
     const sales = line.salesOrderLine
-    if (!sales) return null
-    // A line with no tax rate row is untaxed only if it carries no tax; otherwise its rate is unknown.
-    const rate = sales.taxRate ? Number(sales.taxRate.rate) : Number(sales.taxBase ?? NaN) === 0 ? 0 : NaN
-    if (!Number.isFinite(rate) || rate < 0) return null
+    if (!sales || sales.totalBase == null || sales.taxBase == null) return null
+    const lineNet = Number(sales.totalBase)
+    const lineTax = Number(sales.taxBase)
     const amount = Number(line.totalBase)
+    if (!Number.isFinite(lineNet) || !Number.isFinite(lineTax) || !Number.isFinite(amount)) return null
+    if (lineNet <= 0 || lineTax < 0 || amount < 0 || amount > lineNet + 0.005) return null
     net += amount
-    gross += amount * (1 + rate)
+    gross += (amount * (lineNet + lineTax)) / lineNet
   }
   if (Math.abs(net - Number(refund.totalBase)) > 0.005) return null
   return round2(gross)

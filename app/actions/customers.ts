@@ -109,12 +109,12 @@ function normalizeAddress(address: AddressData | null | undefined): AddressData 
   return Object.keys(normalized).length > 0 ? normalized : Prisma.JsonNull
 }
 
-/** What `orderTurnoverBase` needs of each refund: its basis and total, and each line's own tax rate. */
+/** What `orderTurnoverBase` needs of each refund: its basis and total, and each line's stored tax. */
 const REFUND_TURNOVER_SELECT = {
   select: {
     totalBase: true,
     totalsBasis: true,
-    lines: { select: { totalBase: true, salesOrderLine: { select: { taxBase: true, taxRate: { select: { rate: true } } } } } },
+    lines: { select: { totalBase: true, salesOrderLine: { select: { totalBase: true, taxBase: true } } } },
   },
 } as const
 

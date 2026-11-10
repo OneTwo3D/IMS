@@ -78,7 +78,7 @@ const ORDERS: Row[] = [
   row('C', 100, { ...PAID, status: SalesOrderStatus.SHIPPED, invoiceNumber: 'INV-3' }),
   row('D', 200, {
     ...PAID, status: SalesOrderStatus.COMPLETED, invoiceNumber: 'INV-4', refundStatus: 'PARTIAL',
-    refunds: [{ totalsBasis: 'NET', totalBase: D(20), lines: [{ productId: 'p1', qty: D(1), totalBase: D(20), salesOrderLine: { taxBase: D(0), taxRate: { rate: 0 } } }] }],
+    refunds: [{ totalsBasis: 'NET', totalBase: D(20), lines: [{ productId: 'p1', qty: D(1), totalBase: D(20), salesOrderLine: { totalBase: D(200), taxBase: D(0) } }] }],
   }),
   row('X', 11, { status: SalesOrderStatus.DRAFT, invoiceNumber: 'INV-5' }),
   row('Y', 13, { status: SalesOrderStatus.PENDING_PAYMENT }),
