@@ -357,8 +357,8 @@ Lifecycle exclusions apply: EOL and Archived products are skipped, even if the f
 
 Suppliers with user accounts (SUPPLIER role) can access a dedicated portal to:
 
-- **View RFQs** addressed to their company and **submit quotes** with prices, quantities, PO number, delivery date, and shipping details
-- **View Purchase Orders** for their company
+- **View RFQs** addressed to their company and **submit quotes** with prices, quantities, PO number, delivery date, and shipping details. An RFQ appears only once you have marked it **RFQ Sent**; a purchase order still in Draft is never visible to the supplier (not in the list, by direct link, or as an RFQ PDF). After a quote is submitted the supplier sees a read-only confirmation, and the order moves to **Quote Received** for your review.
+- **View Purchase Orders** for their company (sent orders only; drafts, and cancelled orders that were never sent, are hidden)
 - **View their products** linked to the supplier (without financial data such as sell prices, margins, or COGS)
 
-Supplier users see a separate navigation with only the sections relevant to them. All supplier actions are verified server-side to ensure suppliers can only access their own data.
+Supplier users land on the RFQ list after login (they have no dashboard) and see a separate navigation with only the sections relevant to them. All supplier actions are verified server-side to ensure suppliers can only access their own data.

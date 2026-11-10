@@ -11,6 +11,7 @@ import { assertSupplierOwnsResource, SupplierPortalAccessError, type SupplierPor
 import { sessionAccessDenial } from '@/lib/auth/session-state'
 import { applyHeaderOrderDiscount, resolveHeaderOrderDiscountForeign } from '@/lib/domain/purchasing/order-discount'
 import { calcRequotedLineAmounts } from '@/lib/domain/purchasing/quote-line-amounts'
+import { SUPPLIER_QUOTABLE_STATUSES, SUPPLIER_RFQ_VIEWABLE_STATUSES, supplierSentPurchaseOrderWhere } from '@/lib/domain/purchasing/supplier-portal-visibility'
 import { z } from 'zod'
 
 // ---------------------------------------------------------------------------
@@ -102,7 +103,8 @@ function roundDecimalString(value: ReturnType<typeof toDecimal>, precision: numb
 }
 
 // ---------------------------------------------------------------------------
-// Supplier's RFQs (DRAFT or RFQ_SENT purchase orders for this supplier)
+// Supplier's RFQs (purchase orders the buyer has sent and the supplier has not yet quoted).
+// A DRAFT is the buyer's unsent work and is never shown to the supplier.
 // ---------------------------------------------------------------------------
 
 export type SupplierPoRow = {
@@ -121,7 +123,7 @@ export async function getSupplierRfqs(): Promise<SupplierPoRow[]> {
   if (!ctx) return []
 
   const orders = await db.purchaseOrder.findMany({
-    where: { supplierId: ctx.supplierId, status: { in: ['DRAFT', 'RFQ_SENT'] } },
+    where: { supplierId: ctx.supplierId, status: { in: [...SUPPLIER_QUOTABLE_STATUSES] } },
     select: {
       id: true, reference: true, status: true, currency: true,
       expectedDelivery: true, supplierRef: true, createdAt: true,
@@ -147,7 +149,7 @@ export async function getSupplierOrders(): Promise<SupplierPoRow[]> {
   if (!ctx) return []
 
   const orders = await db.purchaseOrder.findMany({
-    where: { supplierId: ctx.supplierId, status: { notIn: ['DRAFT'] } },
+    where: { supplierId: ctx.supplierId, ...supplierSentPurchaseOrderWhere() },
     select: {
       id: true, reference: true, status: true, currency: true,
       expectedDelivery: true, supplierRef: true, createdAt: true,
@@ -245,7 +247,7 @@ export async function getSupplierRfqDetail(poId: string): Promise<{
     })
     if (!po) return null
     assertSupplierOwnsResource(ctx, po)
-    if (!['DRAFT', 'RFQ_SENT'].includes(po.status)) return null
+    if (!(SUPPLIER_RFQ_VIEWABLE_STATUSES as readonly string[]).includes(po.status)) return null
 
     // Get supplier SKUs
     const supplierProducts = await db.supplierProduct.findMany({
@@ -320,7 +322,7 @@ export async function submitSupplierQuote(
         FOR UPDATE
       `
       const lockedPo = await tx.purchaseOrder.findFirst({
-        where: { id: poId, supplierId: ctx.supplierId, status: { in: ['DRAFT', 'RFQ_SENT'] } },
+        where: { id: poId, supplierId: ctx.supplierId, status: { in: [...SUPPLIER_QUOTABLE_STATUSES] } },
         select: {
           id: true, supplierId: true, reference: true, currency: true, fxRateToBase: true,
           discountStr: true, discountAmount: true, pricesIncludeVat: true,
@@ -414,7 +416,7 @@ export async function submitSupplierQuote(
       const taxBase = toDecimal(netted.taxBase)
 
       const updated = await tx.purchaseOrder.updateMany({
-        where: { id: poId, supplierId: ctx.supplierId, status: { in: ['DRAFT', 'RFQ_SENT'] } },
+        where: { id: poId, supplierId: ctx.supplierId, status: { in: [...SUPPLIER_QUOTABLE_STATUSES] } },
         data: {
           subtotalForeign: roundDecimalString(subtotalForeign, 4),
           subtotalBase: roundDecimalString(subtotalBase, 4),
