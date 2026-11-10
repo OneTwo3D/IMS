@@ -3155,21 +3155,26 @@ export async function runStockSyncForBinding(
   }
 }
 
-export async function createMintsoftBindingHandover(
-  bindingId: string,
-  triggeredBy: string,
-): Promise<string | null> {
-  const binding = await getSyncBinding(bindingId)
-  if (!binding) return null
+type HandoverClient = Pick<Prisma.TransactionClient, 'wmsStockSnapshot' | 'wmsStockDiscrepancy' | 'wmsSyncJob' | 'externalWmsBinding'>
 
+/**
+ * Records the handover (a SUCCEEDED stock-sync job plus the binding's last-sync stamps) on `client`.
+ * Callers that save the binding at the same time pass their transaction, so a refused save leaves no
+ * handover behind.
+ */
+export async function writeMintsoftBindingHandover(
+  client: HandoverClient,
+  binding: { id: string; warehouseId: string },
+  triggeredBy: string,
+): Promise<string> {
   const [snapshotCount, discrepancyCount] = await Promise.all([
-    db.wmsStockSnapshot.count({
+    client.wmsStockSnapshot.count({
       where: {
         connector: 'mintsoft',
         warehouseId: binding.warehouseId,
       },
     }),
-    db.wmsStockDiscrepancy.count({
+    client.wmsStockDiscrepancy.count({
       where: {
         connector: 'mintsoft',
         warehouseId: binding.warehouseId,
@@ -3178,7 +3183,7 @@ export async function createMintsoftBindingHandover(
     }),
   ])
 
-  const job = await db.wmsSyncJob.create({
+  const job = await client.wmsSyncJob.create({
     data: {
       connector: 'mintsoft',
       type: 'STOCK_SYNC',
@@ -3196,7 +3201,7 @@ export async function createMintsoftBindingHandover(
     select: { id: true },
   })
 
-  await db.externalWmsBinding.update({
+  await client.externalWmsBinding.update({
     where: { id: binding.id },
     data: {
       lastStockSyncAt: new Date(),
@@ -3211,6 +3216,15 @@ export async function createMintsoftBindingHandover(
   })
 
   return job.id
+}
+
+export async function createMintsoftBindingHandover(
+  bindingId: string,
+  triggeredBy: string,
+): Promise<string | null> {
+  const binding = await getSyncBinding(bindingId)
+  if (!binding) return null
+  return writeMintsoftBindingHandover(db, binding, triggeredBy)
 }
 
 export async function clearMintsoftAlignmentCreditsForBinding(bindingId: string): Promise<{

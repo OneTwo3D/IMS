@@ -52,6 +52,7 @@ import {
   createMintsoftBindingHandover,
   findLiveStockSyncForWarehouse,
   runStockSyncForBinding,
+  writeMintsoftBindingHandover,
 } from '@/lib/connectors/mintsoft/sync/stock-sync'
 import { mintsoftAsnCreateShadowNotice, mintsoftProducerSeam } from '@/lib/connectors/mintsoft/producer-seam'
 import { runMintsoftProductVerify } from '@/lib/connectors/mintsoft/sync/product-sync'
@@ -2389,16 +2390,15 @@ export async function saveMintsoftBinding(
         }
       }
 
-      if (
+      // Decided here, WRITTEN below inside the save's transaction: a save that is refused (running
+      // sync, or the row moved) must leave no handover job and no last-sync stamps behind.
+      const handoverTrigger = (
         (existingBinding.active && bindingData.active === false)
         || (existingBinding.stockSyncMode !== 'DISABLED' && bindingData.stockSyncMode === 'DISABLED')
         || leavingAlignmentMode
-      ) {
-        await createMintsoftBindingHandover(
-          existingBinding.id,
-          leavingAlignmentMode ? 'manual:alignment-exit' : 'manual:disable',
-        )
-      }
+      )
+        ? (leavingAlignmentMode ? 'manual:alignment-exit' : 'manual:disable')
+        : null
 
       // The dry run and the typed confirmation were given for ONE warehouse pairing. Re-pointing the
       // binding at another IMS warehouse, another Mintsoft warehouse or another connection makes
@@ -2442,7 +2442,11 @@ export async function saveMintsoftBinding(
               : null,
           },
         })
-        return written.count === 1 ? ('saved' as const) : ('moved' as const)
+        if (written.count !== 1) return 'moved' as const
+        if (handoverTrigger) {
+          await writeMintsoftBindingHandover(tx, { id: existingBinding.id, warehouseId: existingBinding.warehouseId }, handoverTrigger)
+        }
+        return 'saved' as const
       })
       if (outcome === 'sync-running') {
         return {
