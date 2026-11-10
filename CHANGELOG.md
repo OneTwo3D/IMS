@@ -8,6 +8,11 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### EU VAT regime resolver and order stamp (decision only)
+
+- **Added: the EU VAT regime resolver** (`lib/domain/accounting/eu-vat-regime.ts`, pure) and the facts it reads from a WooCommerce order (`lib/connectors/woocommerce/sync/eu-vat-facts.ts`): the VAT record, the B2B exemption flag, the gift-card flag, the EAS cross-check and the plugin's recorded VAT account. It decides IOSS, VOEC or DDP (strictly over EUR 150 or NOK 3000, converted at the order date with IMS's own rates), skips an order with no scheme VAT, and refuses one it cannot classify (including an EU-rated order that is not on the scheme). A value within 5% of the threshold, an EAS figure that disagrees, an accounting regime that disagrees with the customs label and an unflagged gift-card line that decides the regime are warnings, not refusals.
+- **Added: the regime stamp on the sales order** (`euVatRegime`, `euVatLineAccount`, `euVatRegimeStampedAt`, `euVatRegimeBasis`) with a forward migration and a database check that a regime travels with its account. It is written once by a compare-and-set and never re-derived. **Nothing builds a document from it yet and nothing calls the writer yet: no posted line, invoice total or credit note changes, and the Sales Invoices switch is untouched.**
+
 ### EU IOSS / VOEC rate configuration and parity (configuration only)
 
 - **Added: `TaxRate.schemePostingTaxType`**, the zero-rated Xero tax type an IOSS or VOEC sale's goods, shipping and discount lines will post on (for example `TAX131` for DE VAT 19%), beside the existing reporting category (`IOSS`, `VOEC`) that marks the rate. A nullable column with a forward migration. **Nothing reads it to post a line yet and the Sales Invoices switch is untouched**; the invoice treatment follows in later changes.
