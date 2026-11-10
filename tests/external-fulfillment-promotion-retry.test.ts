@@ -22,10 +22,12 @@ const state = {
   totalShipments: 1,
   transitions: [] as Array<{ target: string; options: Row | undefined }>,
   notifications: [] as Row[],
+  /** Activity rows already persisted (what `db.activityLog.findFirst` sees). */
+  persistedActivity: [] as Row[],
 }
 
 mock.module('@/lib/activity-log', {
-  namedExports: { logActivity: async (entry: Row) => { state.activity.push(entry) } },
+  namedExports: { logActivity: async (entry: Row) => { state.activity.push(entry); state.persistedActivity.push(entry) } },
 })
 
 mock.module('@/lib/db', {
@@ -35,6 +37,7 @@ mock.module('@/lib/db', {
         findUnique: async () => ({ id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1', status: state.orderStatus }),
       },
       user: { findMany: async () => [{ id: 'admin-1' }] },
+      activityLog: { findFirst: async ({ where }: { where: Row }) => state.persistedActivity.find((row) => row.action === where.action) ?? null },
       salesOrderLine: { findMany: async () => [] },
       shipmentLine: { findMany: async () => [] },
       salesOrderRefundLine: { findMany: async () => [] },
@@ -79,6 +82,7 @@ function reset() {
   state.totalShipments = 1
   state.transitions = []
   state.notifications = []
+  state.persistedActivity = []
 }
 
 async function apply(extra: Row = {}) {
@@ -144,13 +148,14 @@ for (const held of ['ON_HOLD', 'PENDING_PAYMENT']) {
     assert.equal(state.transitions[0].options?.storefrontCompletion, false, 'no storefront completion is queued')
     assert.equal(state.transitions[0].options?.skipStorefrontPush, true)
     assert.equal(state.reconcileCalls.length, 0, 'the order is not reconciled or promoted')
-    assert.ok(state.activity.some((row) => row.action === 'external_fulfillment_order_not_ready' && row.level === 'WARNING'))
+    assert.ok(state.activity.some((row) => row.action === 'external_despatch_recorded_order_not_ready' && row.level === 'WARNING'))
     assert.equal(state.notifications.length, 1)
   })
 
   test(`SHP-H1: the next sweep tick for a recorded ${held} despatch is a quiet success, not a second notice`, async () => {
     reset()
     state.orderStatus = held
+    state.persistedActivity = [{ action: 'external_despatch_recorded_order_not_ready' }]
 
     const result = await apply()
 
@@ -158,6 +163,21 @@ for (const held of ['ON_HOLD', 'PENDING_PAYMENT']) {
     assert.equal(state.reconcileCalls.length, 0)
     assert.equal(state.notifications.length, 0)
     assert.equal(state.activity.length, 0)
+  })
+
+  test(`SHP-H1: a crash after the ${held} despatch committed but before the review event was written is healed by the retry`, async () => {
+    reset()
+    state.orderStatus = held // no open shipment left, and no marker row: the first pass died before raising the event
+
+    const result = await apply()
+
+    assert.deepEqual(result, { success: true, despatchedWhileNotReady: held })
+    assert.equal(state.notifications.length, 1, 'the notice is raised on the retry')
+    assert.ok(state.activity.some((row) => row.action === 'external_despatch_recorded_order_not_ready'))
+
+    const again = await apply()
+    assert.deepEqual(again, { success: true, despatchedWhileNotReady: held })
+    assert.equal(state.notifications.length, 1, 'and only once')
   })
 }
 

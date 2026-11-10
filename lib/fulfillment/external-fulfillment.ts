@@ -147,6 +147,9 @@ export function externalFulfillmentRefusalAwaitsRefunds(
   return refusal !== undefined && REFUSALS_AWAITING_REFUNDS.has(refusal)
 }
 
+/** Marks that the operator review event for a recorded despatch on an unreleased order has been raised. */
+const NOT_READY_DESPATCH_ACTION = 'external_despatch_recorded_order_not_ready'
+
 function refuseExternalFulfillment(
   refusal: ExternalFulfillmentRefusal,
   error: string,
@@ -840,33 +843,42 @@ export async function applyExternalFulfillmentUpdate(
   }
 
   if (orderNotReady) {
-    // Every shipment is already recorded (an earlier pass): nothing new, so no second notice and no loop.
-    if (shipments.length === 0) return { success: true, despatchedWhileNotReady: String(order.status) }
-    const notice = `${update.source} despatched order ${orderRef} while IMS holds it as ${String(order.status)}. The despatch, stock and`
-      + ' cost have been recorded, but the order has NOT been marked shipped, its status is unchanged and no completion was sent to the'
-      + ' storefront. Review the order: finalise or release it, then set it to Shipped if it should be closed.'
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: order.id,
-      action: 'external_fulfillment_order_not_ready',
-      tag: 'sync',
-      level: 'WARNING',
-      description: notice,
-      metadata: { source: update.source, orderStatus: order.status, shipmentsProcessed: shipments.length },
-      resolveUser: false,
-    })
-    try {
-      const { notify } = await import('@/lib/notifications')
-      const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
-      await Promise.all(admins.map((admin) => notify({
-        userId: admin.id,
-        type: 'error',
-        title: 'Despatch on an order that is not ready to ship',
-        message: notice,
-        actionUrl: `/sales/${order.id}`,
-      })))
-    } catch (noticeError) {
-      console.error('[external-fulfillment] not-ready despatch notice failed:', noticeError)
+    // The review event is ENSURED, not just written: this runs after the despatch committed, so a crash between the
+    // commit and the notice would otherwise leave the retry (no open shipment left) reporting a quiet success with
+    // nobody told. The marker is the activity row, written LAST; the retry raises the event again unless the row exists.
+    const alreadyRaised = shipments.length === 0
+      ? await db.activityLog.findFirst({
+        where: { entityType: 'SALES_ORDER', entityId: order.id, action: NOT_READY_DESPATCH_ACTION },
+        select: { id: true },
+      })
+      : null
+    if (shipments.length > 0 || !alreadyRaised) {
+      const notice = `${update.source} despatched order ${orderRef} while IMS holds it as ${String(order.status)}. The despatch, stock and`
+        + ' cost have been recorded, but the order has NOT been marked shipped, its status is unchanged and no completion was sent to the'
+        + ' storefront. Review the order: finalise or release it, then set it to Shipped if it should be closed.'
+      try {
+        const { notify } = await import('@/lib/notifications')
+        const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
+        await Promise.all(admins.map((admin) => notify({
+          userId: admin.id,
+          type: 'error',
+          title: 'Despatch on an order that is not ready to ship',
+          message: notice,
+          actionUrl: `/sales/${order.id}`,
+        })))
+      } catch (noticeError) {
+        console.error('[external-fulfillment] not-ready despatch notice failed:', noticeError)
+      }
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: order.id,
+        action: NOT_READY_DESPATCH_ACTION,
+        tag: 'sync',
+        level: 'WARNING',
+        description: notice,
+        metadata: { source: update.source, orderStatus: order.status, shipmentsProcessed: shipments.length },
+        resolveUser: false,
+      })
     }
     return { success: true, despatchedWhileNotReady: String(order.status) }
   }
