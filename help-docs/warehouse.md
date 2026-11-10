@@ -52,7 +52,8 @@ A **binding** links an IMS warehouse to a Mintsoft warehouse. Each binding has a
 Effects you will notice in other screens:
 
 - A stock count (Stock Control > Stock Counts) cannot be posted for an Align To WMS warehouse, and a notification-only warehouse asks you to confirm. See [Stock Control](stock-control.md).
-- Manual stock adjustments for a bound warehouse should be made in the warehouse system, otherwise the next sync flags the difference.
+- **Notification only (the default):** IMS is the stock master. Correct stock in IMS as usual (an adjustment, or a stock count after confirming the warning), then settle the physical figure in Mintsoft, because any remaining difference is flagged again on the next stock sync.
+- **Align To WMS:** Mintsoft is the stock master. Make stock corrections and counts in Mintsoft; the sync brings them into IMS, and an IMS-side count is refused.
 - The stock sync, returns and verification jobs are **off by default**; the Scheduler lists them.
 
 **Products.** Products are pushed to Mintsoft with their customs data. A commodity code that is not a valid 8-digit 2026 CN8 code is left out of the push (the rest of the product still syncs) and an **Open Discrepancy** names the product; it clears itself once the code is corrected. A blank country of origin is sent as China; an unrecognised one is also sent as China and flagged until you correct it. See [Inventory](inventory.md) for the HS Code Review queue.
