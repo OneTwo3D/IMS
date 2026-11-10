@@ -570,13 +570,13 @@ test('WooCommerce rates the declaration says are one Xero rate may share one IMS
 
 test('sharing stays refused where the types differ: an undeclared WooCommerce rate, a rate declared as another Xero rate, or a shared IMS rate that carries another type', () => {
   const undeclared = zeroShared()
-  undeclared.woo.push(woo('99999', { name: 'Zero Rated Income', country: 'AT', rate: '0.0000', class: 'zero-rate' }))
-  undeclared.mappings.push(map('99999', 'rZ'))
+  undeclared.woo = [...undeclared.woo, woo('99999', { name: 'Zero Rated Income', country: 'AT', rate: '0.0000', class: 'zero-rate' })]
+  undeclared.mappings = [...undeclared.mappings, map('99999', 'rZ')]
   assert.ok(reasonsOf(compareVatSetIdentity(undeclared), 'woo', '150').includes('DUPLICATE_MAPPING'))
 
   const other = zeroShared()
-  other.woo.push(woo('215', { name: 'Zero Rated Income', country: 'AT', rate: '0.0000', class: 'zero-rate' }))
-  other.mappings.push(map('215', 'rZ'))
+  other.woo = [...other.woo, woo('215', { name: 'Zero Rated Income', country: 'AT', rate: '0.0000', class: 'zero-rate' })]
+  other.mappings = [...other.mappings, map('215', 'rZ')]
   assert.ok(reasonsOf(compareVatSetIdentity(other), 'woo', '215').includes('DUPLICATE_MAPPING'), 'Woo 215 is declared as AT VAT, not as the zero-rated rate')
   assert.ok(reasonsOf(compareVatSetIdentity(other), 'woo', '150').includes('DUPLICATE_MAPPING'))
 
@@ -588,7 +588,7 @@ test('sharing stays refused where the types differ: an undeclared WooCommerce ra
 
 test('two IMS rates on one Xero type are still a DUPLICATE_MAPPING (the IMS side of one-per-Xero-rate)', () => {
   const input = zeroShared()
-  input.rates.push(ims('rZ2', 'ZERORATEDOUTPUT', { name: 'Zero Rated Income 2', rate: '0.0000', countryCode: null, taxCategory: 'ZERO' }))
+  input.rates = [...input.rates, ims('rZ2', 'ZERORATEDOUTPUT', { name: 'Zero Rated Income 2', rate: '0.0000', countryCode: null, taxCategory: 'ZERO' })]
   input.mappings = [map('150', 'rZ'), map('151', 'rZ'), map('182', 'rZ2')]
   const rows = compareVatSetIdentity(input)
   assert.ok(reasonsOf(rows, 'ims', 'rZ').includes('DUPLICATE_MAPPING'))
