@@ -64,6 +64,32 @@ export type EuVatTreatmentPlan = {
   orderTotal: string
   /** The tax WooCommerce charged on each payload line, aligned with `lines`: a fee carrying tax cannot move to NONE outside the scheme. */
   lineTax: readonly string[]
+  /**
+   * Why the scheme's zero-rated posting type cannot be relied on (unknown, not ACTIVE, not for revenue, not exactly 0%, or the stored Xero list cannot prove it), or null when the stored list proves it.
+   * REQUIRED, never defaulted: the total check below assumes the scheme type adds no tax, which only a zero-rated type guarantees. Ignored outside the scheme route.
+   */
+  schemePostingTypeProblem: string | null
+}
+
+/** The part of a stored Xero tax-rate row the scheme posting type is judged on. */
+export type StoredXeroTypeRow = { taxType: string; status: string; effectiveRate: string | null; displayTaxRate: string | null; canApply: { revenue: boolean | null } }
+
+/**
+ * Whether `taxType` is a known, ACTIVE, revenue, exactly 0% Xero type in the stored list: null when it is, else the reason it is not. Pure. (The same facts the preflight and the drift check judge a declared
+ * scheme type on; the effective rate is the one Xero reports, falling back to the displayed rate as the preflight does.)
+ */
+export function schemePostingTypeProblem(rows: readonly StoredXeroTypeRow[], taxType: string): string | null {
+  const code = taxType.trim()
+  if (code === '') return 'the scheme posting type is blank'
+  const row = rows.find((r) => r.taxType === code)
+  if (row === undefined) return `the scheme posting type ${code} is not in the stored Xero tax-rate list`
+  if (row.status !== 'ACTIVE') return `the scheme posting type ${code} is ${row.status} in Xero, not ACTIVE`
+  if (row.canApply.revenue !== true) return `the scheme posting type ${code} cannot be applied to revenue in Xero`
+  const text = row.effectiveRate ?? row.displayTaxRate
+  const rate = text === null ? null : dec(text)
+  if (rate === null) return `the rate of the scheme posting type ${code} is not stated in Xero, so it cannot be shown to be zero`
+  if (!rate.isZero()) return `the scheme posting type ${code} is ${rate.toString()}% in Xero, not zero-rated; posting on it would add tax to the invoice`
+  return null
 }
 
 export type TreatableLine = {
@@ -189,6 +215,8 @@ export function applyEuVatTreatment<P extends TreatablePayload>(payload: P, plan
   // 2. The scheme's one VAT line.
   const currency = payload.currency
   if (route.kind === 'scheme') {
+    // The total check below assumes the scheme type adds no tax. Only a type the stored Xero list shows to be ACTIVE and exactly 0% makes that true.
+    if (plan.schemePostingTypeProblem !== null) return refuse(plan.schemePostingTypeProblem)
     if (isBlank(route.vatAccount)) return refuse('the stamp names no account for the VAT line')
     const vat = dec(route.vatAmount)
     if (vat === null) return refuse('the collected VAT cannot be read')

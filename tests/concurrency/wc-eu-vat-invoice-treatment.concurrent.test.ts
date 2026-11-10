@@ -77,7 +77,28 @@ async function seed(db: Awaited<ReturnType<typeof loadDb>>, wcRateId: number) {
   })
   await db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: String(wcRateId), externalName: 'DE VAT', externalCountry: 'DE', externalRatePct: 19, taxRateId: rate.id } })
   const warehouse = await db.warehouse.create({ data: { code: `EUV-${randomUUID().slice(0, 8)}`, name: 'EU VAT treatment test warehouse', syncToStore: true, availableForSale: true } })
+  await seedXeroList(db, { TAX131: '0.000000' })
   return { rate, warehouse }
+}
+
+/** The stored Xero tax-rate list the treatment proves the scheme posting type against (the hourly drift job's list): a connected organisation, a stamped, digested list. `rates` is taxType -> effective rate; a missing key is an unknown type. */
+async function seedXeroList(db: Awaited<ReturnType<typeof loadDb>>, rates: Record<string, string>) {
+  const { replaceXeroTaxRateList } = await import('@/lib/connectors/xero/tax-rate-store')
+  const { TAX_RATE_DRIFT_LAST_CHECKED_SETTING } = await import('@/lib/connectors/xero/tax-rate-drift-sweeper')
+  const now = new Date()
+  await db.accountingToken.deleteMany({ where: { connector: 'xero' } })
+  await db.accountingToken.create({ data: { connector: 'xero', accessToken: 'test', expiresAt: new Date(now.getTime() + 3_600_000), tenantId: 'tenant-eu-vat-test' } })
+  await db.$transaction(async (tx) => {
+    await replaceXeroTaxRateList(tx, {
+      tenantId: 'tenant-eu-vat-test',
+      fetchedAt: now,
+      rows: [
+        ...Object.entries(rates).map(([taxType, effectiveRate]) => ({ taxType, name: taxType, status: 'ACTIVE' as const, reportTaxType: null, effectiveRate, displayTaxRate: effectiveRate, components: [], canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: true } })),
+        { taxType: 'ZERORATEDOUTPUT', name: 'Zero Rated', status: 'ACTIVE' as const, reportTaxType: null, effectiveRate: '0.000000', displayTaxRate: '0.000000', components: [], canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: true } },
+      ],
+    })
+    await tx.setting.upsert({ where: { key: TAX_RATE_DRIFT_LAST_CHECKED_SETTING }, create: { key: TAX_RATE_DRIFT_LAST_CHECKED_SETTING, value: now.toISOString() }, update: { value: now.toISOString() } })
+  })
 }
 
 async function cleanup(db: Awaited<ReturnType<typeof loadDb>>, externalId: number, ctx: { rate: { id: string }; warehouse: { id: string } }) {
@@ -92,6 +113,9 @@ async function cleanup(db: Awaited<ReturnType<typeof loadDb>>, externalId: numbe
   await db.shoppingSyncLog.deleteMany({ where: { externalId: String(externalId) } })
   await db.shoppingOrderLink.deleteMany({ where: { connector: 'woocommerce', externalOrderId: String(externalId) } })
   await db.shoppingTaxRateMapping.deleteMany({ where: { taxRateId: ctx.rate.id } })
+  await db.xeroTaxRateList.deleteMany({ where: { connector: 'xero' } })
+  await db.xeroTaxRate.deleteMany({ where: { connector: 'xero' } })
+  await db.accountingToken.deleteMany({ where: { connector: 'xero', tenantId: 'tenant-eu-vat-test' } })
   await db.warehouse.deleteMany({ where: { id: ctx.warehouse.id } })
   await db.taxRate.deleteMany({ where: { id: ctx.rate.id } })
 }
@@ -99,7 +123,7 @@ async function cleanup(db: Awaited<ReturnType<typeof loadDb>>, externalId: numbe
 type Line = { description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; noTaxKind?: string }
 type Invoice = { lines: Line[]; shippingAmount: number; shippingTaxType?: string; shippingAccountCode?: string; _registerPayment?: boolean; _taxUnreconciled?: { reason: string }; _euVatTreatment?: Record<string, unknown> }
 
-async function run(t: test.TestContext, meta: Array<{ id: number; key: string; value: unknown }>, on: boolean) {
+async function run(t: test.TestContext, meta: Array<{ id: number; key: string; value: unknown }>, on: boolean, list?: Record<string, string>) {
   const db = await loadDb()
   await mockAccounting()
   switchOn = on
@@ -108,6 +132,7 @@ async function run(t: test.TestContext, meta: Array<{ id: number; key: string; v
   const externalId = Math.floor(Math.random() * 2_000_000_000)
   const ctx = await seed(db, wcRateId)
   t.after(async () => { switchOn = false; await cleanup(db, externalId, ctx) })
+  if (list) await seedXeroList(db, list)
   const result = await importWcOrder(payload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...meta]) as never)
   assert.equal(result.success, true, `import succeeded: ${JSON.stringify(result)}`)
   const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
@@ -152,7 +177,7 @@ test('[eu vat] switch ON, IOSS: zero-rated goods and shipping, fee on 232, one V
   assert.equal(total(invoice), 135.66, 'the invoice totals the order')
   assert.equal(invoice._taxUnreconciled, undefined)
   assert.equal(invoice._registerPayment, true)
-  assert.deepEqual(invoice._euVatTreatment, { applied: true, route: 'scheme', regime: 'IOSS', vatAccount: '821', feesRecoded: 1, roundingAdjustment: null })
+  assert.deepEqual(invoice._euVatTreatment, { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', vatAccount: '821', feesRecoded: 1, roundingAdjustment: null })
   assert.equal(order.euVatRegime, 'IOSS')
   assert.equal(order.euVatLineAccount, '821')
   assert.ok(order.euVatRegimeStampedAt)
@@ -283,4 +308,84 @@ test('[eu vat] a stamped IOSS order whose facts now decide DDP is refused, not t
   assert.equal(changed.kind, 'refused')
   assert.match(changed.kind === 'refused' ? changed.reason : '', /stamped IOSS on account 821, but its facts now decide DDP on account 232/)
   assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: orderId } })).euVatRegime, 'IOSS', 'the stamp is never re-derived')
+})
+
+const REFUSED_LISTS: Array<{ label: string; list: Record<string, string>; expect: RegExp }> = [
+  { label: 'a TAXABLE posting type (19% in Xero)', list: { TAX131: '19.000000' }, expect: /19.*% in Xero, not zero-rated/ },
+  { label: 'an UNKNOWN posting type (not in the stored Xero list)', list: { TAX999: '0.000000' }, expect: /TAX131 is not in the stored Xero tax-rate list/ },
+]
+for (const scenario of REFUSED_LISTS) {
+  test(`[eu vat] ${scenario.label}: the invoice is refused, not built on it`, { skip }, async (t) => {
+    const { invoice, order } = await run(t, PLUGIN('821'), true, scenario.list)
+    assert.ok(invoice)
+    assert.match(invoice._taxUnreconciled?.reason ?? '', scenario.expect)
+    assert.equal(invoice._registerPayment, false)
+    assert.equal(invoice.lines.some((l) => l.noTaxKind === 'eu-vat-recovery'), false)
+    void order
+  })
+}
+
+test('[eu vat] the poster re-checks the scheme posting type: proven zero-rated posts, a type that turned taxable in Xero since is refused, and a payload without the marker is untouched', { skip }, async (t) => {
+  const db = await loadDb()
+  await mockAccounting()
+  const { euSchemePostingRefusal } = await import('@/lib/connectors/xero/scheme-posting-check')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seed(db, wcRateId)
+  t.after(async () => { await cleanup(db, externalId, ctx) })
+  const treated = { invoiceNumber: 'INV-1', _euVatTreatment: { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', vatAccount: '821' } }
+  assert.equal(await euSchemePostingRefusal(treated), null)
+  assert.equal(await euSchemePostingRefusal({ invoiceNumber: 'INV-2' }), null)
+  assert.equal(await euSchemePostingRefusal({ invoiceNumber: 'INV-3', _euVatTreatment: { applied: true, route: 'none' } }), null)
+  await seedXeroList(db, { TAX131: '20.000000' })
+  assert.match((await euSchemePostingRefusal(treated)) ?? '', /^NOTHING WAS SENT\. Sales invoice INV-1 was refused: .*20.*% in Xero, not zero-rated/)
+  await seedXeroList(db, { TAX999: '0.000000' })
+  assert.match((await euSchemePostingRefusal(treated)) ?? '', /not in the stored Xero tax-rate list/)
+  await db.xeroTaxRateList.deleteMany({ where: { connector: 'xero' } })
+  assert.match((await euSchemePostingRefusal(treated)) ?? '', /cannot be relied on/)
+})
+
+async function parkOffThenReimport(t: test.TestContext, reimportMeta: Array<{ id: number; key: string; value: unknown }>) {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = false
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seed(db, wcRateId)
+  t.after(async () => { switchOn = false; await cleanup(db, externalId, ctx) })
+  // Parked with the switch off: no invoice number yet, built without the treatment.
+  assert.equal((await importWcOrder(payload(externalId, wcRateId, PLUGIN('821')) as never)).success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  assert.equal(((held.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment as { applied: boolean }).applied, false)
+  // The switch comes on, WooCommerce numbers the invoice, and the order is delivered again.
+  switchOn = true
+  await importWcOrder(payload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...reimportMeta]) as never)
+  return {
+    db, orderId, held,
+    after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }),
+    rows: await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId } }),
+    order: await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { euVatRegime: true, euVatLineAccount: true } }),
+  }
+}
+
+test('[eu vat] a hold parked with the switch OFF is treated and released when the switch is on and the order is re-imported', { skip }, async (t) => {
+  const { rows, order, after } = await parkOffThenReimport(t, PLUGIN('821'))
+  assert.equal(rows.length, 1, 'the held invoice was released')
+  const invoice = rows[0]!.payload as unknown as Invoice
+  assert.deepEqual(invoice.lines.map((l) => [l.accountCode, l.taxType, l.noTaxKind ?? null]), [['200', 'TAX131', null], ['232', 'NONE', 'fee-no-tax'], ['821', 'NONE', 'eu-vat-recovery']])
+  assert.equal(invoice.shippingTaxType, 'TAX131')
+  assert.equal(total(invoice), 135.66)
+  assert.equal(invoice._taxUnreconciled, undefined)
+  assert.equal(order.euVatRegime, 'IOSS')
+  assert.equal(after.status, 'SYNCED')
+})
+
+test('[eu vat] a re-import whose treatment REFUSES leaves the hold PENDING with the refusal reason, queues nothing', { skip }, async (t) => {
+  const { rows, after } = await parkOffThenReimport(t, [{ id: 2, key: 'is_vat_exempt', value: 'no' }])
+  assert.equal(rows.length, 0, 'nothing was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /could not be treated now: .*plugin_account_missing.*NOTHING was queued.*re-import the order/)
 })

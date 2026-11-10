@@ -21,6 +21,7 @@ import { stampEuVatRegime } from '@/lib/domain/accounting/eu-vat-regime-stamp'
 import {
   applyEuVatTreatment, EU_VAT_TREATMENT_PAYLOAD_KEY, lineKindsOf, routeFor, type EuVatTreatmentPlan, type TreatablePayload,
 } from '@/lib/domain/accounting/eu-vat-treatment'
+import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
 import { buildEuVatRegimeInput, readEuVatRegimeMode } from './eu-vat-facts'
 import type { MappedLine } from './field-mapping'
 import type { WcFullOrder } from './types'
@@ -83,6 +84,8 @@ export async function treatImportedSalesInvoice(params: {
     roundingAccount: params.accounts.rounding,
     orderTotal: String(params.wcOrder.total ?? ''),
     lineTax: params.mappedLines.map((line) => String(line.taxForeign)),
+    // Asked only for a scheme order: the stored Xero list must show the zero-rated posting type to be known, ACTIVE and exactly 0%.
+    schemePostingTypeProblem: routed.route.kind === 'scheme' ? await storedSchemePostingTypeProblem(routed.route.schemePostingTaxType, params.now) : null,
   }
   const treated = applyEuVatTreatment(params.payload as TreatablePayload, plan)
   if (!treated.ok) return { kind: 'refused', reason: treated.reason }
@@ -97,6 +100,7 @@ export async function treatImportedSalesInvoice(params: {
         applied: true,
         route: treated.applied.route,
         regime: treated.applied.regime,
+        schemePostingTaxType: routed.route.kind === 'scheme' ? routed.route.schemePostingTaxType : null,
         vatAccount: routed.route.kind === 'scheme' ? routed.route.vatAccount : null,
         feesRecoded: treated.applied.feesRecoded,
         roundingAdjustment: treated.applied.roundingAdjustment,

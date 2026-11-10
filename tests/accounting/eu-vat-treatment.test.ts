@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs'
 import { Prisma } from '../../app/generated/prisma/client'
 import { resolveEuVatRegime, type EuVatRegimeDecision, type EuVatRegimeInput, type RateFact } from '../../lib/domain/accounting/eu-vat-regime'
 import {
-  applyEuVatTreatment, B2B_ZERO_RATE_TAX_TYPE, lineKindsOf, predictedUntaxedTotal, routeFor,
+  applyEuVatTreatment, B2B_ZERO_RATE_TAX_TYPE, lineKindsOf, predictedUntaxedTotal, routeFor, schemePostingTypeProblem,
   type EuVatTreatmentPlan, type TreatableLine, type TreatablePayload, type TreatedLineKind,
 } from '../../lib/domain/accounting/eu-vat-treatment'
 import { findSalesDocumentTaxTypeProblems } from '../../lib/domain/accounting/sales-document-tax-types'
@@ -74,6 +74,7 @@ function build(row: FixtureRow, opts: { goodsSubtotal: string; destination?: str
   const plan: EuVatTreatmentPlan = {
     route: { kind: 'none' }, lineKinds: kinds, feeAccount: '232', roundingAccount: '860', orderTotal: orderTotal.toString(),
     lineTax: ['0', opts.feeTaxed === false ? '0' : r2(feeNet.times(pct)).toString()],
+    schemePostingTypeProblem: null,
   }
   return { payload, plan, input, orderTotal: orderTotal.toString(), vat: vat.toString() }
 }
@@ -300,4 +301,32 @@ test('a threshold-crossing re-import: stamped IOSS at 96, the goods rise over EU
   assert.equal(routed.ok, false)
   // the same order again with the same facts still routes
   assert.ok(routeFor(stamp, ioss, first.input).ok)
+})
+
+test('the scheme posting type must be a known, ACTIVE, revenue, exactly 0% Xero type: a taxable code, an unknown one, an inactive one and an unstated rate each refuse', () => {
+  const row = (over: Partial<{ taxType: string; status: string; effectiveRate: string | null; displayTaxRate: string | null; revenue: boolean | null }> = {}) => ({
+    taxType: 'TAX131', status: 'ACTIVE', effectiveRate: '0.000000', displayTaxRate: '0.000000', canApply: { revenue: over.revenue === undefined ? true : over.revenue }, ...over,
+  })
+  assert.equal(schemePostingTypeProblem([row()], 'TAX131'), null)
+  assert.equal(schemePostingTypeProblem([row({ effectiveRate: null, displayTaxRate: '0' })], 'TAX131'), null, 'the displayed rate stands in when no effective rate is given')
+  assert.match(schemePostingTypeProblem([row({ effectiveRate: '19.000000' })], 'TAX131') ?? '', /19.*% in Xero, not zero-rated/)
+  assert.match(schemePostingTypeProblem([row()], 'TAX999') ?? '', /not in the stored Xero tax-rate list/)
+  assert.match(schemePostingTypeProblem([row({ status: 'ARCHIVED' })], 'TAX131') ?? '', /ARCHIVED in Xero, not ACTIVE/)
+  assert.match(schemePostingTypeProblem([row({ revenue: false })], 'TAX131') ?? '', /cannot be applied to revenue/)
+  assert.match(schemePostingTypeProblem([row({ revenue: null })], 'TAX131') ?? '', /cannot be applied to revenue/)
+  assert.match(schemePostingTypeProblem([row({ effectiveRate: null, displayTaxRate: null })], 'TAX131') ?? '', /not stated in Xero/)
+  assert.match(schemePostingTypeProblem([row()], '  ') ?? '', /blank/)
+})
+
+test('a scheme order whose posting type is not proven zero-rated refuses, and the reason is the one given; a non-scheme order ignores it', () => {
+  const de = schemeRows.find((r) => r.country === 'DE')!
+  const built = build(de, { goodsSubtotal: '100.00' })
+  const { plan } = route(built)
+  const refused = applyEuVatTreatment(built.payload, { ...plan, schemePostingTypeProblem: 'the scheme posting type TAX131 is 19% in Xero, not zero-rated' })
+  assert.equal(refused.ok, false)
+  assert.match(refused.ok ? '' : refused.reason, /19% in Xero, not zero-rated/)
+  const uk = otherRows.find((r) => r.wooId === 112)!
+  const ukBuilt = build(uk, { goodsSubtotal: '100.00', destination: 'GB', feeTaxed: false })
+  const ukPlan = { ...route(ukBuilt).plan, lineKinds: ['goods', 'untaxed-fee'] as TreatedLineKind[], schemePostingTypeProblem: 'irrelevant' }
+  assert.ok(applyEuVatTreatment(ukBuilt.payload, ukPlan).ok)
 })

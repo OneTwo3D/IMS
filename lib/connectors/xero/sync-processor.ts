@@ -3,6 +3,7 @@
  * Each entry represents one IMS transaction → one Xero API call.
  */
 
+import { euSchemePostingRefusal } from './scheme-posting-check'
 import { resolveSalesPostContact } from '@/lib/domain/erasure/accounting-contact'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { getRateLimitBackoffMs, isRateLimitError } from './deferral'
@@ -6200,6 +6201,9 @@ export async function processClaimedEntry(
       // words - at the head of the case, before any read or claim - and again by the connector as the last word.
       const untypedInvoice = salesDocumentTaxTypeRefusal(`Sales invoice ${String(payload.invoiceNumber ?? '(no number)')}`, payload as SalesDocumentTaxTypeInput)
       if (untypedInvoice) return { success: false, error: untypedInvoice }
+      // An EU-treated scheme invoice was built on a zero-rated type: the stored Xero list must still show that type ACTIVE and 0% now, before anything is sent.
+      const schemeRefusal = await euSchemePostingRefusal(payload as Record<string, unknown>)
+      if (schemeRefusal) return { success: false, error: schemeRefusal }
       const guard = await guardCancelledSalesOrderInvoice(attempt, referenceType, referenceId, lease)
       if (!guard.post) return guard.result
       const customerId = guard.customerId
@@ -6250,6 +6254,8 @@ export async function processClaimedEntry(
       // As the create: an update must not overwrite a good document with one carrying an undecided tax type.
       const untypedUpdate = salesDocumentTaxTypeRefusal(`Sales invoice ${String(payload.invoiceNumber ?? '(no number)')}`, payload as SalesDocumentTaxTypeInput)
       if (untypedUpdate) return { success: false, error: untypedUpdate }
+      const schemeRefusalUpdate = await euSchemePostingRefusal(payload as Record<string, unknown>)
+      if (schemeRefusalUpdate) return { success: false, error: schemeRefusalUpdate }
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       if (!accountingInvoiceId) {
         return { success: false, error: 'Missing accountingInvoiceId for SALES_INVOICE_UPDATE' }
