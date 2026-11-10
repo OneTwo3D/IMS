@@ -27,6 +27,7 @@ mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
 let s: Scratch
 let productId: string
 let vat20Id: string
+let zeroId: string
 let supplierId: string
 let warehouseId: string
 let seq = 0
@@ -38,6 +39,7 @@ before(async () => {
   }
   productId = (await s.db.product.create({ data: { sku: 'AUD-1', name: 'AUD 1', type: 'SIMPLE' }, select: { id: true } })).id
   vat20Id = (await s.db.taxRate.create({ data: { name: 'AUD Sales 20', rate: '0.2', usedFor: 'SALES', accountingTaxType: 'OUTPUT2', active: true }, select: { id: true } })).id
+  zeroId = (await s.db.taxRate.create({ data: { name: 'AUD Zero', rate: '0', usedFor: 'SALES', accountingTaxType: 'ZEROOUT', active: true }, select: { id: true } })).id
   supplierId = (await s.db.supplier.create({ data: { name: 'AUD Supplier', currency: 'GBP', prepaid: true }, select: { id: true } })).id
   const wh = await s.db.warehouse.findFirstOrThrow({ where: { availableForSale: true }, select: { id: true } })
   warehouseId = wh.id
@@ -64,6 +66,10 @@ test('SO-H1: prices including VAT with "No VAT" as the default rate, a line carr
   assert.equal(await s.db.salesOrder.count(), before, 'no order was written')
   const noRate = await createSalesOrder(orderInput({ pricesIncludeVat: true }) as never)
   assert.equal(noRate.success, false, 'taxRateValue left out is the same combination')
+  const mixed = await createSalesOrder(orderInput({ pricesIncludeVat: true, lines: [line(120), line(50, { taxRateId: zeroId })] }) as never)
+  assert.equal(mixed.success, false, 'one taxed line among zero-rated ones is enough')
+  const allZero = await createSalesOrder(orderInput({ pricesIncludeVat: true, lines: [line(50, { taxRateId: zeroId })] }) as never)
+  assert.equal(allZero.success, true, allZero.error)
 })
 
 // [mutation: lineAmountsIncludeTax stops following the header rate, or the refusal is removed]
@@ -271,5 +277,34 @@ test('PO-H3: once the first posting may have left (claimed, attempted, or posted
     assert.equal(Number((await s.db.purchaseInvoice.findUniqueOrThrow({ where: { id: invoice.id } })).subtotalForeign), 120, `${label}: IMS still holds the posted figures`)
     const p = (await createRows(invoice.id))[0]!.payload as BillPayload
     assert.equal(p.lines.reduce((t, l) => t + l.quantity * l.unitAmount, 0), 120, `${label}: the row is untouched`)
+  }
+})
+
+// [mutation: delete the retiredTaxCodesInPayload refusal in updateInvoice]
+test('PO-H3: an edit that would put a retired tax code into the unsent first posting is refused and nothing is saved', async () => {
+  const { createPurchaseOrder, createInvoice, updateInvoice } = await import('@/app/actions/purchase-orders')
+  const rate = await s.db.taxRate.create({ data: { name: `AUD Bill ${++seq}`, rate: '0.2', usedFor: 'PURCHASE', accountingTaxType: 'TAX003', active: true }, select: { id: true } })
+  const supplier = await s.db.supplier.create({ data: { name: `AUD Supplier ${seq}`, currency: 'GBP', prepaid: true, taxRateId: rate.id }, select: { id: true } })
+  const ref = `AUD-PO-RC-${seq}-${Date.now()}`
+  const created = await createPurchaseOrder({ reference: ref, supplierId: supplier.id, currency: 'GBP', destinationWarehouseId: warehouseId, pricesIncludeVat: false, taxRateValue: 0, lines: [{ productId, sku: 'AUD-1', productName: 'AUD 1', qty: 10, unitCostForeign: 12 }] } as never)
+  assert.equal(created.success, true, String(created.error))
+  const po = await s.db.purchaseOrder.findUniqueOrThrow({ where: { reference: ref }, select: { id: true, lines: { select: { id: true } } } })
+  await s.db.purchaseOrder.update({ where: { id: po.id }, data: { status: 'PO_SENT' } })
+  await s.db.purchaseOrderLine.updateMany({ where: { poId: po.id }, data: { taxRateId: rate.id } })
+  const bill = await createInvoice(po.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-RC', lines: [{ kind: 'product', poLineId: po.lines[0]!.id, qtyBilled: 10, unitCostForeign: 12 }] } as never)
+  assert.equal(bill.success, true, String(bill.error))
+  const invoice = await s.db.purchaseInvoice.findFirstOrThrow({ where: { poId: po.id }, select: { id: true, lines: { select: { id: true } } } })
+  assert.equal((await createRows(invoice.id)).length, 1, 'the first posting is queued')
+  // A tax re-key retires the code after the bill was queued: the rate is replaced and the old code is on the retired list.
+  const replacement = await s.db.taxRate.create({ data: { name: `AUD Bill repl ${seq}`, rate: '0.2', usedFor: 'PURCHASE', accountingTaxType: 'TAX004', active: true }, select: { id: true } })
+  await s.db.taxRate.update({ where: { id: rate.id }, data: { active: false, replacedById: replacement.id } })
+  await s.db.setting.upsert({ where: { key: 'tax_rekey_retired_codes' }, create: { key: 'tax_rekey_retired_codes', value: JSON.stringify({ TAX003: { rateId: rate.id, newCode: 'TAX004', at: new Date().toISOString() } }) }, update: { value: JSON.stringify({ TAX003: { rateId: rate.id, newCode: 'TAX004', at: new Date().toISOString() } }) } })
+  try {
+    const r = await updateInvoice(invoice.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-RC', lines: [{ id: invoice.lines[0]!.id, qtyBilled: 10, unitCostForeign: 10 }] } as never)
+    assert.equal(r.success, false)
+    assert.match(String(r.error), /no longer accepts/)
+    assert.equal(Number((await s.db.purchaseInvoice.findUniqueOrThrow({ where: { id: invoice.id } })).subtotalForeign), 120)
+  } finally {
+    await s.db.setting.deleteMany({ where: { key: 'tax_rekey_retired_codes' } })
   }
 })

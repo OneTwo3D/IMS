@@ -1,4 +1,4 @@
-import { LEDGER_STANDING_SELECT, ledgerStanding, namesADocument } from '@/lib/domain/accounting/ledger-standing'
+import { LEDGER_STANDING_SELECT, ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import { ATTEMPT_PROVEN_NEVER_MADE_WHERE, attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
 import type { Prisma } from '@/app/generated/prisma/client'
 import type { PurchaseInvoiceAccountingPayload } from '@/lib/domain/purchasing/purchase-invoice-edit'
@@ -81,11 +81,13 @@ export async function refreshPendingPurchaseInvoiceCreate(params: {
   const row = postings[0]!
   // Refreshable only while the row is queued (or failed) and PROVEN never to have made a request: a claim, an attempt, a posted-but-unlinked
   // document or a row nobody can vouch for are all "may have left".
+  // The standing is read with the proof of "never sent" the row itself carries: queued work is LIVE_WORK, and a failure is PROVEN_NOT_POSTED only
+  // when no request ever left. Anything else (a document id, an operator's word, a basis this build does not write, a claim) is not refreshable.
+  const standing = ledgerStanding(row, { couldHaveReachedLedger: !attemptProvenNeverMade(row) })
   const unsent = (row.status === 'PENDING' || row.status === 'FAILED')
-    && !namesADocument(row)
+    && (standing === 'LIVE_WORK' || standing === 'PROVEN_NOT_POSTED')
     && attemptProvenNeverMade(row)
     && row.backReferenceEvidenceCompactedAt === null
-    && params.chartConnector !== null
     && row.connector === params.chartConnector
   if (!unsent) throw new PurchaseBillFirstPostingInFlightError()
 

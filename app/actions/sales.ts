@@ -1399,7 +1399,6 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
           unitPriceForeign: true,
           discountAmount: true,
           totalForeign: true,
-          taxForeign: true,
           taxRateId: true,
           taxRate: {
             select: {
@@ -1444,12 +1443,7 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
   const orderDefaultTaxType = orderDefaultRate?.accountingTaxType ?? null
 
   const vatPct = Number(so.taxRatePercent ?? 0)
-  // The document is sent inclusive or exclusive as a whole, from the header rate, while each line's net was cut from its gross at the
-  // line's own rate. An order that stored gross prices with no header rate would go out as NET prices and have its VAT added a second
-  // time, so it is not sent (new orders cannot be written this way; this covers one stored before that refusal).
-  if (inclusivePricesWithoutOrderRate({ pricesIncludeVat: !!so.pricesIncludeVat, orderRate: vatPct, anyLineCarriesVat: so.lines.some((l) => Number(l.taxForeign ?? 0) > 0) })) {
-    throw new Error(STORED_INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE)
-  }
+  // (An order whose gross prices have no header rate never gets here: createSalesOrder refuses it and updateSalesOrderStatus refuses to finalise a stored one.)
   const lineAmountsIncludeTax = !!so.pricesIncludeVat && vatPct > 0
 
   // Shipping is stored NET on the SalesOrder. Reconstruct gross when

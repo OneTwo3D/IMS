@@ -38,6 +38,12 @@ test('an unsent create row takes the edited document and keeps its own stamps', 
   assert.equal(writes[0]!.where.remoteAttemptedAt, null)
 })
 
+test('a create row that FAILED before any request was made is refreshed too (a retry would otherwise post the old bill)', async () => {
+  const { tx, writes } = fake([{ ...unsent, status: 'FAILED' }])
+  assert.deepEqual(await run(tx), { kind: 'refreshed', syncLogId: 'r1' })
+  assert.equal(writes.length, 1)
+})
+
 test('no create row: nothing is owed and nothing is written', async () => {
   const { tx, writes } = fake([])
   assert.deepEqual(await run(tx), { kind: 'no-create-row' })
@@ -70,7 +76,7 @@ test('a row that may have left IMS refuses the edit and is not written', async (
     await assert.rejects(run(tx), PurchaseBillFirstPostingInFlightError, label)
     assert.equal(writes.length, 0, label)
   }
-  for (const [label, row] of [['compacted evidence', { ...unsent, backReferenceEvidenceCompactedAt: new Date() }], ['legacy row with a settlement basis', { ...unsent, settlementBasis: 'OPERATOR_ASSERTION' }]] as const) {
+  for (const [label, row] of [['compacted evidence', { ...unsent, backReferenceEvidenceCompactedAt: new Date() }], ['pending row that names a document', { ...unsent, externalTransactionId: 'X9' }], ['legacy row with a settlement basis', { ...unsent, settlementBasis: 'OPERATOR_ASSERTION' }]] as const) {
     const f = fake([row])
     await assert.rejects(run(f.tx), PurchaseBillFirstPostingInFlightError, label)
     assert.equal(f.writes.length, 0, label)
