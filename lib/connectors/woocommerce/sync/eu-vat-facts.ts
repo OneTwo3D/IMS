@@ -36,17 +36,6 @@ function metaValue(meta: readonly WcMeta[] | undefined, key: string): unknown {
   return (meta ?? []).find((entry) => entry.key === key)?.value
 }
 
-function asObject(value: unknown): Record<string, unknown> | null {
-  if (typeof value === 'string') {
-    try {
-      value = JSON.parse(value)
-    } catch {
-      return null
-    }
-  }
-  return value !== null && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null
-}
-
 function decimalText(value: unknown): string | null {
   if (typeof value === 'number' && Number.isFinite(value)) return String(value)
   if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value.trim())) return value.trim()
@@ -57,22 +46,55 @@ function currencyText(value: unknown): string | null {
   return typeof value === 'string' && /^[A-Za-z]{3}$/.test(value.trim()) ? value.trim().toUpperCase() : null
 }
 
-/** The EU VAT Compliance record: present only when readable, with at least one rate, and with a total. */
-export function readVatRecord(order: Pick<WcFullOrder, 'meta_data'>): VatRecordFact {
-  const record = asObject(metaValue(order.meta_data, 'vat_compliance_vat_paid'))
-  if (record === null) return { state: 'absent' }
-  const byRates = record.by_rates
-  const rateCount = Array.isArray(byRates) ? byRates.length : byRates !== null && typeof byRates === 'object' ? Object.keys(byRates).length : 0
-  const total = decimalText(record.total)
-  if (rateCount === 0 || total === null) return { state: 'absent' }
-  return { state: 'present', currency: currencyText(record.currency), total }
+const isEmpty = (value: unknown): boolean =>
+  value === undefined || value === null || (typeof value === 'string' && value.trim() === '') || (Array.isArray(value) && value.length === 0)
+  || (typeof value === 'object' && !Array.isArray(value) && Object.keys(value as object).length === 0)
+
+/** Parse a meta that WooCommerce may hand over as an object or as JSON text: `empty`, an object, or `unreadable` (text that is not JSON, or JSON that is not an object). */
+function readRecord(value: unknown): { kind: 'empty' } | { kind: 'object'; record: Record<string, unknown> } | { kind: 'unreadable'; detail: string } {
+  if (isEmpty(value)) return { kind: 'empty' }
+  let parsed = value
+  if (typeof value === 'string') {
+    try {
+      parsed = JSON.parse(value)
+    } catch {
+      return { kind: 'unreadable', detail: 'not JSON' }
+    }
+    if (isEmpty(parsed)) return { kind: 'empty' }
+  }
+  return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? { kind: 'object', record: parsed as Record<string, unknown> } : { kind: 'unreadable', detail: 'not an object' }
 }
 
+/**
+ * The EU VAT Compliance record. EMPTY (nothing, or no rates) is `absent`, which never refuses. A record with rates whose total or currency cannot be read, or text that is not a record, is `unreadable`, which refuses a scheme order.
+ */
+export function readVatRecord(order: Pick<WcFullOrder, 'meta_data'>): VatRecordFact {
+  const read = readRecord(metaValue(order.meta_data, 'vat_compliance_vat_paid'))
+  if (read.kind === 'empty') return { state: 'absent' }
+  if (read.kind === 'unreadable') return { state: 'unreadable', detail: read.detail }
+  const record = read.record
+  const byRates = record.by_rates
+  if (isEmpty(byRates)) return { state: 'absent' }
+  if (typeof byRates !== 'object') return { state: 'unreadable', detail: 'by_rates is not a list' }
+  const total = decimalText(record.total)
+  if (total === null) return { state: 'unreadable', detail: 'total is missing or not a number' }
+  const currency = isEmpty(record.currency) ? null : currencyText(record.currency)
+  if (!isEmpty(record.currency) && currency === null) return { state: 'unreadable', detail: 'currency is not a three-letter code' }
+  return { state: 'present', currency, total }
+}
+
+/** The EAS payload: only a cross-check. Empty or without a merchandise value is `absent`; a merchandise value or currency that cannot be read is `unreadable` (a warning, not a refusal). */
 export function readEasFact(order: Pick<WcFullOrder, 'meta_data'>): EasFact {
-  const payload = asObject(metaValue(order.meta_data, 'easproj_payload'))
-  const merchandise = payload === null ? null : decimalText(payload.merchandise_cost_vat_excl)
-  if (payload === null || merchandise === null) return { state: 'absent' }
-  return { state: 'present', merchandiseVatExcl: merchandise, currency: currencyText(payload.payment_currency) }
+  const read = readRecord(metaValue(order.meta_data, 'easproj_payload'))
+  if (read.kind === 'empty') return { state: 'absent' }
+  if (read.kind === 'unreadable') return { state: 'unreadable', detail: read.detail }
+  const raw = read.record.merchandise_cost_vat_excl
+  if (isEmpty(raw)) return { state: 'absent' }
+  const merchandise = decimalText(raw)
+  if (merchandise === null) return { state: 'unreadable', detail: 'merchandise_cost_vat_excl is not a number' }
+  const currency = isEmpty(read.record.payment_currency) ? null : currencyText(read.record.payment_currency)
+  if (!isEmpty(read.record.payment_currency) && currency === null) return { state: 'unreadable', detail: 'payment_currency is not a three-letter code' }
+  return { state: 'present', merchandiseVatExcl: merchandise, currency }
 }
 
 /** The marker the plugin appends to `_o3d_ioss_reason` when FX meta already existed and differed from its decision, so it kept the old values. */
@@ -106,43 +128,70 @@ function readFalsyFlag(value: unknown): boolean {
   return typeof value === 'string' && ['no', '0', 'false', ''].includes(value.trim().toLowerCase())
 }
 
-export function readGoodsLines(order: Pick<WcFullOrder, 'line_items'>): GoodsLineFact[] {
-  return order.line_items.map((line) => {
+export function readGoodsLines(order: Pick<WcFullOrder, 'line_items'>, problems: string[] = []): GoodsLineFact[] {
+  return order.line_items.map((line, index) => {
     const flag = (line.meta_data ?? []).find((entry) => entry.key === '_o3d_is_voucher')
-    const total = decimalText(line.total) ?? '0'
+    const total = decimalText(line.total)
+    if (total === null) problems.push(`goods line ${index + 1} (id ${String(line.id)}) has an unreadable total`)
     // Only the line's own flag is read. The product-level marker (`_coupon_title`) is not on the order and IMS imports no product meta, so a line with no (or an unreadable) flag is unknown and the resolver decides what that means.
-    return { total, voucher: flag === undefined ? 'unknown' : wcMetaFlag(flag.value) ? 'yes' : readFalsyFlag(flag.value) ? 'no' : 'unknown' }
+    return { total: total ?? '0', voucher: flag === undefined ? 'unknown' : wcMetaFlag(flag.value) ? 'yes' : readFalsyFlag(flag.value) ? 'no' : 'unknown' }
   })
 }
 
-/** Tax per WooCommerce rate id from the order's tax lines: the items-and-fees tax plus the shipping tax. */
-export function readRateTax(order: Pick<WcFullOrder, 'tax_lines'>): Array<{ wooRateId: number; tax: string }> {
+/** Tax per WooCommerce rate id from the order's tax lines: the items-and-fees tax plus the shipping tax. An unreadable amount or rate id is named in `problems`, never counted as 0. */
+export function readRateTax(order: Pick<WcFullOrder, 'tax_lines'>, problems: string[] = []): Array<{ wooRateId: number; tax: string }> {
   const byId = new Map<number, Prisma.Decimal>()
-  for (const line of order.tax_lines ?? []) {
-    const amount = D(decimalText(line.tax_total) ?? '0').plus(D(decimalText(line.shipping_tax_total) ?? '0'))
-    byId.set(line.rate_id, (byId.get(line.rate_id) ?? D(0)).plus(amount))
+  for (const [index, line] of (order.tax_lines ?? []).entries()) {
+    const items = decimalText(line.tax_total)
+    const shipping = decimalText(line.shipping_tax_total)
+    if (!Number.isInteger(line.rate_id) || line.rate_id <= 0) {
+      problems.push(`tax line ${index + 1} has an unreadable rate id`)
+      continue
+    }
+    if (items === null) problems.push(`tax line for rate ${line.rate_id} has an unreadable tax total`)
+    if (shipping === null) problems.push(`tax line for rate ${line.rate_id} has an unreadable shipping tax total`)
+    byId.set(line.rate_id, (byId.get(line.rate_id) ?? D(0)).plus(D(items ?? '0')).plus(D(shipping ?? '0')))
   }
   return [...byId.entries()].sort((a, b) => a[0] - b[0]).map(([wooRateId, tax]) => ({ wooRateId, tax: tax.toString() }))
 }
 
 export function readWcEuVatFacts(order: WcFullOrder): WcEuVatFacts {
+  const unreadable: string[] = []
   const account = metaValue(order.meta_data, '_o3d_ioss_vat_account')
-  const accountText = typeof account === 'string' || typeof account === 'number' ? String(account).trim() : ''
+  let pluginVatAccount: string | null = null
+  if (typeof account === 'string' || typeof account === 'number') pluginVatAccount = String(account).trim() === '' ? null : String(account).trim()
+  else if (account !== undefined && account !== null) unreadable.push('the plugin VAT account (_o3d_ioss_vat_account) is not text')
+  const reason = metaValue(order.meta_data, '_o3d_ioss_reason')
+  if (reason !== undefined && reason !== null && typeof reason !== 'string') unreadable.push('the plugin reason (_o3d_ioss_reason) is not text')
   const exempt = metaValue(order.meta_data, 'is_vat_exempt')
+  const currency = (order.currency ?? '').toString().trim().toUpperCase()
+  if (!/^[A-Z]{3}$/.test(currency)) unreadable.push('the order currency is missing or not a three-letter code')
+  const orderTax = decimalText(order.total_tax)
+  if (orderTax === null) unreadable.push('the order tax total (total_tax) is unreadable')
+  const goodsLines = readGoodsLines(order, unreadable)
+  const rateTax = readRateTax(order, unreadable)
+  let overThresholdDutyFee = false
+  for (const fee of order.fee_lines ?? []) {
+    if (readWclcFeeKind(fee) !== 'duty_fee') continue
+    const total = decimalText(fee.total)
+    if (total === null) unreadable.push(`the over-threshold duty fee line "${String(fee.name)}" has an unreadable total`)
+    else if (D(total).abs().gt(0)) overThresholdDutyFee = true
+  }
   return {
+    unreadable,
     shippingCountry: order.shipping?.country?.trim() ? order.shipping.country : null,
     billingCountry: order.billing?.country?.trim() ? order.billing.country : null,
-    currency: (order.currency ?? '').trim().toUpperCase(),
-    goodsLines: readGoodsLines(order),
-    rateTax: readRateTax(order),
-    orderTax: decimalText(order.total_tax) ?? '0',
+    currency,
+    goodsLines,
+    rateTax,
+    orderTax: orderTax ?? '0',
     vatExempt: exempt === undefined ? 'unknown' : wcMetaFlag(exempt) ? 'yes' : readFalsyFlag(exempt) ? 'no' : 'unknown',
     pluginFxConflict: readPluginFxConflict(order),
     vatRecord: readVatRecord(order),
     eas: readEasFact(order),
     pluginFx: readPluginFx(order),
-    pluginVatAccount: accountText === '' ? null : accountText,
-    overThresholdDutyFee: (order.fee_lines ?? []).some((fee) => readWclcFeeKind(fee) === 'duty_fee' && D(decimalText(fee.total) ?? '0').abs().gt(0)),
+    pluginVatAccount,
+    overThresholdDutyFee,
   }
 }
 

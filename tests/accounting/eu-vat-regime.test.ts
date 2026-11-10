@@ -20,7 +20,7 @@ const plainRate = (country: string | null, rate = '0.2000', over: Partial<Extrac
 /** A German order in EUR: goods 100.00, VAT 19.00 on the DE scheme rate, plugin record agreeing, accounts configured. */
 function order(over: Partial<EuVatRegimeInput> = {}): EuVatRegimeInput {
   return {
-    mode: 'decide', pluginFx: { state: 'absent' }, pluginFxConflict: false,
+    unreadable: [], mode: 'decide', pluginFx: { state: 'absent' }, pluginFxConflict: false,
     shippingCountry: 'DE', billingCountry: 'DE', currency: 'EUR',
     goodsLines: [{ total: '100.00', voucher: 'no' }],
     rates: [{ wooRateId: 216, tax: '19.00', mapping: schemeRate('DE') }],
@@ -179,6 +179,9 @@ const refusalRows: Array<[string, EuVatRegimeInput, (typeof REFUSAL_CODES)[numbe
   ['adopt: scheme VAT and no plugin account', order({ mode: 'adopt_plugin', pluginVatAccount: null }), 'plugin_account_missing'],
   ['adopt: a plugin account that is neither configured account', order({ mode: 'adopt_plugin', pluginVatAccount: '330' }), 'plugin_account_unrecognised'],
   ['adopt: the plugin FX record incomplete', order({ mode: 'adopt_plugin', pluginVatAccount: '821', pluginFx: { state: 'incomplete', detail: 'pair missing' } }), 'plugin_fx_incomplete'],
+  ['adopt: a conversion pair that is not the order\'s', order({ mode: 'adopt_plugin', pluginVatAccount: '821', pluginFx: { state: 'present', rate: '1', pair: 'USD>EUR', thresholdValue: '100.00' } }), 'plugin_fx_conflict'],
+  ['an unreadable order figure', order({ unreadable: ['order tax unreadable'] }), 'order_figure_unreadable'],
+  ['an unreadable EU VAT record', order({ vatRecord: { state: 'unreadable', detail: 'x' } }), 'vat_record_unreadable'],
   ['adopt: the plugin left differing FX meta unchanged', order({ mode: 'adopt_plugin', pluginVatAccount: '821', pluginFxConflict: true }), 'plugin_fx_conflict'],
   ['tax on a rate that is not a scheme rate beside scheme VAT', order({ orderTax: '25.00' }), 'tax_not_explained_by_scheme_rates'],
   ['an unflagged line decides DDP', order({ goodsLines: [{ total: '400.00', voucher: 'unknown' }] }), 'voucher_status_unknown'],
@@ -276,7 +279,7 @@ test('warning: the plugin recorded another VAT account (Q8 cross-check); the sam
 })
 
 test('every warning code is declared (each is exercised by a test above or in the adopt-mode block below)', () => {
-  assert.deepEqual([...WARNING_CODES].sort(), ['adopted_regime_differs', 'eas_disagrees', 'label_regime_disagrees', 'plugin_account_differs', 'plugin_fx_pair_unexpected', 'threshold_band'])
+  assert.deepEqual([...WARNING_CODES].sort(), ['adopted_regime_differs', 'eas_disagrees', 'eas_unreadable', 'label_regime_disagrees', 'plugin_account_differs', 'threshold_band'])
 })
 
 test('the resolver does not mutate its input and is deterministic', () => {
@@ -289,8 +292,8 @@ test('the resolver does not mutate its input and is deterministic', () => {
 
 // ---- adopt_plugin mode: the plugin's decision is adopted, not re-made -----------------------------------------------------------------------------------------------------
 const adopt = (over: Partial<EuVatRegimeInput> = {}) => order({ mode: 'adopt_plugin', pluginVatAccount: '821', ...over })
-const pluginFx = { state: 'present' as const, rate: '1.1500', pair: 'GBP>EUR', thresholdValue: '149.50' }
-const recorded = { recorded: true, rate: '1.1500', pair: 'GBP>EUR', thresholdValue: '149.50' }
+const pluginFx = { state: 'present' as const, rate: '1.1500', pair: 'EUR>EUR', thresholdValue: '149.50' }
+const recorded = { recorded: true, rate: '1.1500', pair: 'EUR>EUR', thresholdValue: '149.50' }
 const notRecorded = { recorded: false, note: 'not recorded by the plugin' }
 
 test('adopt: each account value determines the regime, whatever the value says', () => {
@@ -342,7 +345,7 @@ test("adopt: the plugin's rate, pair and converted value are recorded in the bas
 })
 
 test("adopt: with no IMS rate the plugin's converted value stands in and the missing rate does not refuse", () => {
-  const d = scheme(resolveEuVatRegime(adopt({ currency: 'GBP', thresholdFx: { state: 'unavailable', reason: 'no rate' }, pluginFx })))
+  const d = scheme(resolveEuVatRegime(adopt({ currency: 'GBP', thresholdFx: { state: 'unavailable', reason: 'no rate' }, pluginFx: { ...pluginFx, pair: 'GBP>EUR' } })))
   assert.equal(d.basis.fx, null)
   assert.equal(d.basis.convertedValue, '149.50')
   const none = scheme(resolveEuVatRegime(adopt({ currency: 'GBP', thresholdFx: { state: 'unavailable', reason: 'no rate' } })))
@@ -362,11 +365,41 @@ test('adopt: the value test is a cross-check that warns on disagreement and neve
   assert.ok(!warningCodes(resolveEuVatRegime(adopt(nearEdge))).includes('threshold_band'))
 })
 
-test("adopt: a pair other than the order's is a warning; the customs-label and EAS checks still run on the adopted regime", () => {
-  assert.ok(warningCodes(resolveEuVatRegime(adopt({ pluginFx: { ...pluginFx, pair: 'USD>EUR' } }))).includes('plugin_fx_pair_unexpected'))
-  assert.ok(!warningCodes(resolveEuVatRegime(adopt({ currency: 'GBP', pluginFx, thresholdFx: { state: 'unavailable', reason: 'x' } }))).includes('plugin_fx_pair_unexpected'))
+test("adopt: the customs-label and EAS checks still run on the adopted regime", () => {
   assert.ok(warningCodes(resolveEuVatRegime(adopt({ pluginVatAccount: '232', overThresholdDutyFee: false }))).includes('label_regime_disagrees'))
   assert.ok(warningCodes(resolveEuVatRegime(adopt({ eas: { state: 'present', merchandiseVatExcl: '90.00', currency: 'EUR' } }))).includes('eas_disagrees'))
+  assert.ok(warningCodes(resolveEuVatRegime(adopt({ eas: { state: 'unreadable', detail: 'x' } }))).includes('eas_unreadable'))
+  assert.ok(warningCodes(resolveEuVatRegime(order({ eas: { state: 'unreadable', detail: 'x' } }))).includes('eas_unreadable'))
+})
+
+test("adopt: a complete conversion record whose pair is not order currency > threshold currency refuses (plugin_fx_conflict)", () => {
+  const pair = (value: string) => ({ ...pluginFx, pair: value })
+  // EUR order to Germany converts EUR>EUR; GBP order GBP>EUR; GBP order to Norway GBP>NOK
+  assert.equal(scheme(resolveEuVatRegime(adopt({ pluginFx: pair('EUR>EUR') }))).regime, 'IOSS')
+  for (const wrong of ['GBP>EUR', 'USD>EUR', 'EUR>NOK', 'EUR>GBP']) assert.equal(refused(resolveEuVatRegime(adopt({ pluginFx: pair(wrong) }))).code, 'plugin_fx_conflict', wrong)
+  assert.equal(scheme(resolveEuVatRegime(adopt({ currency: 'GBP', pluginFx: pair('GBP>EUR') }))).regime, 'IOSS')
+  assert.equal(refused(resolveEuVatRegime(adopt({ currency: 'GBP', pluginFx: pair('GBP>NOK') }))).code, 'plugin_fx_conflict')
+  const norway = nokOrderOf('1000', { mode: 'adopt_plugin', currency: 'GBP', pluginVatAccount: '821' })
+  assert.equal(scheme(resolveEuVatRegime({ ...norway, pluginFx: pair('GBP>NOK') })).regime, 'VOEC')
+  assert.equal(refused(resolveEuVatRegime({ ...norway, pluginFx: pair('GBP>EUR') })).code, 'plugin_fx_conflict')
+  // decide mode does not read the pair
+  assert.equal(resolveEuVatRegime(order({ pluginFx: pair('USD>NOK') })).kind, 'SCHEME')
+})
+
+test('unreadable order figures refuse before anything is decided, in both modes and for a non-scheme order too', () => {
+  const unreadable = ['goods line 1 (id 7) has an unreadable total']
+  for (const mode of ['decide', 'adopt_plugin'] as const) {
+    const d = refused(resolveEuVatRegime(order({ mode, pluginVatAccount: '821', unreadable })))
+    assert.equal(d.code, 'order_figure_unreadable')
+    assert.ok(d.reason.includes('goods line 1'))
+  }
+  assert.equal(refused(resolveEuVatRegime(order({ shippingCountry: 'US', billingCountry: 'US', rates: [], orderTax: '0', unreadable }))).code, 'order_figure_unreadable')
+})
+
+test('an unreadable EU VAT record refuses a scheme order; an absent one does not; it is not looked at on an order with no scheme VAT', () => {
+  assert.equal(refused(resolveEuVatRegime(order({ vatRecord: { state: 'unreadable', detail: 'total is missing or not a number' } }))).code, 'vat_record_unreadable')
+  assert.equal(refused(resolveEuVatRegime(adopt({ vatRecord: { state: 'unreadable', detail: 'x' } }))).code, 'vat_record_unreadable')
+  assert.equal(resolveEuVatRegime(order({ shippingCountry: 'US', billingCountry: 'US', rates: [], orderTax: '0', vatRecord: { state: 'unreadable', detail: 'x' } })).kind, 'SKIP')
 })
 
 test('decide mode ignores the plugin fields except for the account cross-check', () => {

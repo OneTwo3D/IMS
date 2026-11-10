@@ -104,8 +104,9 @@ export type PluginFxFact =
   /** Some of the three exist, or one is unreadable. */
   | { state: 'incomplete'; detail: string }
 
-export type VatRecordFact = { state: 'absent' } | { state: 'present'; currency: string | null; total: string }
-export type EasFact = { state: 'absent' } | { state: 'present'; merchandiseVatExcl: string; currency: string | null }
+/** `absent`: no record, or an empty one (no rates; it is sometimes empty at checkout). `unreadable`: a non-empty record whose total, currency or shape cannot be read: a scheme order refuses on it. */
+export type VatRecordFact = { state: 'absent' } | { state: 'present'; currency: string | null; total: string } | { state: 'unreadable'; detail: string }
+export type EasFact = { state: 'absent' } | { state: 'present'; merchandiseVatExcl: string; currency: string | null } | { state: 'unreadable'; detail: string }
 
 /** Order currency to the threshold currency (EUR, or NOK for Norway): units of threshold currency per ONE unit of order currency. */
 export type ThresholdFxFact =
@@ -113,6 +114,11 @@ export type ThresholdFxFact =
   | { state: 'unavailable'; reason: string }
 
 export type EuVatRegimeInput = {
+  /**
+   * Order figures that were present but could not be read (a goods total, a line or order tax, a rate id, a currency, a fee total, the plugin's account or reason). Each is named here instead of becoming 0 or a default;
+   * a non-empty list refuses the order before anything else is looked at (`order_figure_unreadable`).
+   */
+  unreadable: readonly string[]
   mode: EuVatRegimeMode
   pluginFx: PluginFxFact
   shippingCountry: string | null
@@ -157,13 +163,15 @@ export const REFUSAL_CODES = [
   'plugin_account_unrecognised',
   'plugin_fx_incomplete',
   'plugin_fx_conflict',
+  'order_figure_unreadable',
+  'vat_record_unreadable',
   'tax_not_explained_by_scheme_rates',
   'voucher_status_unknown',
   'vat_exempt_status_unknown',
 ] as const
 export type RefusalCode = (typeof REFUSAL_CODES)[number]
 
-export const WARNING_CODES = ['threshold_band', 'eas_disagrees', 'plugin_account_differs', 'label_regime_disagrees', 'adopted_regime_differs', 'plugin_fx_pair_unexpected'] as const
+export const WARNING_CODES = ['threshold_band', 'eas_disagrees', 'plugin_account_differs', 'label_regime_disagrees', 'adopted_regime_differs', 'eas_unreadable'] as const
 export type WarningCode = (typeof WARNING_CODES)[number]
 export type RegimeWarning = { code: WarningCode; message: string }
 
@@ -216,6 +224,7 @@ const isSchemeCategory = (value: string | null): boolean => ['IOSS', 'VOEC'].inc
 const roundMinor = (value: Decimal): Decimal => value.toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP)
 
 export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision {
+  if (input.unreadable.length > 0) return refuse('order_figure_unreadable', `the order carries figures that cannot be read, so nothing can be decided: ${input.unreadable.join('; ')}`)
   const destination = normaliseDestination(input.shippingCountry) || normaliseDestination(input.billingCountry)
   const covered = SCHEME_DESTINATIONS.has(destination)
   const where = destination === '' ? '(nowhere)' : destination
@@ -298,7 +307,8 @@ export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision
     return refuse('tax_not_explained_by_scheme_rates', `WooCommerce's order tax is ${D(input.orderTax).toFixed(2)} but the scheme rates account for ${vatTotal.toFixed(2)}`)
   }
 
-  // 4. The EU VAT record, when it is present and non-empty, is a cross-check: a mismatch refuses, its absence does not.
+  // 4. The EU VAT record, when it is present and non-empty, is a cross-check: a mismatch refuses, its absence does not, and a non-empty record that cannot be read refuses.
+  if (input.vatRecord.state === 'unreadable') return refuse('vat_record_unreadable', `the EU VAT record is present but cannot be read: ${input.vatRecord.detail}`)
   if (input.vatRecord.state === 'present') {
     if (input.vatRecord.currency !== null && input.vatRecord.currency !== input.currency) {
       return refuse('vat_record_currency_mismatch', `VAT is recorded in ${input.vatRecord.currency} but the order is in ${input.currency}`)
@@ -331,12 +341,12 @@ export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision
     else if (recorded === ddp) regime = 'DDP'
     else return refuse('plugin_account_unrecognised', `the plugin recorded VAT account ${recorded}, which is neither the IOSS/VOEC account (${ioss}) nor the DDP account (${ddp})`)
     if (input.pluginFx.state === 'incomplete') return refuse('plugin_fx_incomplete', `the plugin recorded the VAT account but its conversion record is incomplete or unreadable: ${input.pluginFx.detail}`)
+    if (input.pluginFx.state === 'present' && input.pluginFx.pair !== `${input.currency}>${thresholdCurrency}`) {
+      return refuse('plugin_fx_conflict', `the plugin's conversion pair is ${input.pluginFx.pair} but this order converts ${input.currency}>${thresholdCurrency}, so its record does not belong to this decision`)
+    }
     if (input.pluginFxConflict) return refuse('plugin_fx_conflict', 'the plugin left differing FX meta unchanged when it recorded this decision, so the conversion on the order is not the one that decided it')
     if (byValue !== null && byValue !== regime) {
       warnings.push({ code: 'adopted_regime_differs', message: `the plugin's account says ${regime} but IMS's own order-date value test (${converted!.toFixed(2)} ${thresholdCurrency}) says ${byValue}; the plugin's decision is adopted` })
-    }
-    if (input.pluginFx.state === 'present' && input.pluginFx.pair !== `${input.currency}>${thresholdCurrency}`) {
-      warnings.push({ code: 'plugin_fx_pair_unexpected', message: `the plugin's exchange pair is ${input.pluginFx.pair} but this order converts ${input.currency}>${thresholdCurrency}` })
     }
   } else {
     if (fx === null || converted === null || byValue === null) {
@@ -359,6 +369,7 @@ export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision
     }
   }
   const isDdp = regime === 'DDP'
+  if (input.eas.state === 'unreadable') warnings.push({ code: 'eas_unreadable', message: `the EAS payload is present but its merchandise value cannot be read (${input.eas.detail}); the cross-check was not made` })
   if (input.eas.state === 'present' && input.eas.currency === input.currency && D(input.eas.merchandiseVatExcl).minus(intrinsic).abs().gt(D(FIGURE_TOLERANCE))) {
     warnings.push({ code: 'eas_disagrees', message: `goods value ${intrinsic.toFixed(2)} disagrees with the EAS figure ${D(input.eas.merchandiseVatExcl).toFixed(2)}` })
   }

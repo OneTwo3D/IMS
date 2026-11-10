@@ -60,16 +60,29 @@ test('the B2B exemption flag: yes, 1 and true are exempt; no, 0, false and blank
   assert.deepEqual([exempt('yes'), exempt('1'), exempt(true), exempt('no'), exempt('0'), exempt(false), exempt(''), exempt(undefined), exempt('maybe'), exempt({})], ['yes', 'yes', 'yes', 'no', 'no', 'no', 'no', 'unknown', 'unknown', 'unknown'])
 })
 
-test('the EU VAT record: present when readable with rates and a total; empty, unreadable or absent reads as absent', () => {
+test('the EU VAT record: present when readable; empty is absent; non-empty but unreadable is unreadable', () => {
   const record = (value: unknown) => readVatRecord(wcOrder({ meta_data: [meta('vat_compliance_vat_paid', value)] }))
   assert.deepEqual(record({ currency: 'eur', total: 19, by_rates: { 216: { rate: 19 } } }), { state: 'present', currency: 'EUR', total: '19' })
   assert.deepEqual(record(JSON.stringify({ currency: 'EUR', total: '19.00', by_rates: [{ rate: 19 }] })), { state: 'present', currency: 'EUR', total: '19.00' })
-  assert.deepEqual(record({ currency: 'EUR', total: '19.00', by_rates: {} }), { state: 'absent' })
-  assert.deepEqual(record({ currency: 'EUR', by_rates: { 216: {} } }), { state: 'absent' })
-  assert.deepEqual(record('not json'), { state: 'absent' })
-  assert.deepEqual(record([1, 2]), { state: 'absent' })
-  assert.deepEqual(readVatRecord(wcOrder()), { state: 'absent' })
   assert.deepEqual(record({ total: '19', by_rates: { 216: {} } }), { state: 'present', currency: null, total: '19' })
+  // empty is absent: nothing, blank text, an empty list or object, or a record with no rates
+  for (const empty of [undefined, null, '', '  ', [], {}, '[]', '{}', { currency: 'EUR', total: '19.00', by_rates: {} }, { currency: 'EUR', total: '19.00', by_rates: [] }, { currency: 'EUR' }]) {
+    assert.deepEqual(record(empty), { state: 'absent' }, JSON.stringify(empty))
+  }
+  assert.deepEqual(readVatRecord(wcOrder()), { state: 'absent' })
+  // non-empty and unreadable
+  for (const [bad, detail] of [
+    [{ currency: 'EUR', by_rates: { 216: {} } }, 'total is missing or not a number'],
+    [{ currency: 'EUR', total: 'n/a', by_rates: { 216: {} } }, 'total is missing or not a number'],
+    [{ currency: 'EUR', total: '1,5', by_rates: { 216: {} } }, 'total is missing or not a number'],
+    [{ currency: 'EURO', total: '19', by_rates: { 216: {} } }, 'currency is not a three-letter code'],
+    [{ currency: 'EUR', total: '19', by_rates: 'x' }, 'by_rates is not a list'],
+    ['not json', 'not JSON'],
+    [[1, 2], 'not an object'],
+    [42, 'not an object'],
+  ] as Array<[unknown, string]>) {
+    assert.deepEqual(record(bad), { state: 'unreadable', detail }, JSON.stringify(bad))
+  }
 })
 
 test("the plugin's conversion record: all three readable is present, none is absent, anything between is incomplete", () => {
@@ -95,11 +108,14 @@ test("the plugin's FX-conflict marker in _o3d_ioss_reason", () => {
   assert.equal(conflict(42), false)
 })
 
-test('the EAS figure: needs a readable merchandise value', () => {
+test('the EAS figure: needs a readable merchandise value; empty is absent; garbage is unreadable', () => {
   const eas = (value: unknown) => readEasFact(wcOrder({ meta_data: [meta('easproj_payload', value)] }))
   assert.deepEqual(eas({ merchandise_cost_vat_excl: '100.00', payment_currency: 'EUR' }), { state: 'present', merchandiseVatExcl: '100.00', currency: 'EUR' })
-  assert.deepEqual(eas({ merchandise_cost_vat_excl: 'x' }), { state: 'absent' })
-  assert.deepEqual(eas('garbage'), { state: 'absent' })
+  assert.deepEqual(eas({ merchandise_cost_vat_excl: '100.00' }), { state: 'present', merchandiseVatExcl: '100.00', currency: null })
+  for (const empty of [undefined, '', {}, [], { other: 1 }, { merchandise_cost_vat_excl: '' }]) assert.deepEqual(eas(empty), { state: 'absent' }, JSON.stringify(empty))
+  assert.deepEqual(eas({ merchandise_cost_vat_excl: 'x' }), { state: 'unreadable', detail: 'merchandise_cost_vat_excl is not a number' })
+  assert.deepEqual(eas({ merchandise_cost_vat_excl: '1', payment_currency: 'EURO' }), { state: 'unreadable', detail: 'payment_currency is not a three-letter code' })
+  assert.deepEqual(eas('garbage'), { state: 'unreadable', detail: 'not JSON' })
   assert.deepEqual(readEasFact(wcOrder()), { state: 'absent' })
 })
 
@@ -194,4 +210,44 @@ test('adopt mode end to end (the default): the plugin account decides and its co
   const decide = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder(), { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide' })
   assert.equal(decide.mode, 'decide')
   assert.equal(resolveEuVatRegime(decide).kind === 'SCHEME' && (resolveEuVatRegime(decide) as { regime: string }).regime, 'IOSS')
+})
+
+// ---- unreadable figures are named, never defaulted to 0 -------------------------------------------------------------------------------------------------------------
+test('well-formed figures report nothing unreadable', () => {
+  assert.deepEqual(readWcEuVatFacts(wcOrder()).unreadable, [])
+})
+
+test('a malformed goods line total, tax line amount, rate id or order tax is named as unreadable', () => {
+  const unreadable = (over: Partial<WcFullOrder>) => readWcEuVatFacts(wcOrder(over)).unreadable
+  assert.match(unreadable({ line_items: [{ id: 9, total: 'abc', meta_data: [] }] as never }).join(), /goods line 1 \(id 9\) has an unreadable total/)
+  assert.match(unreadable({ line_items: [{ id: 9, meta_data: [] }] as never }).join(), /goods line 1/)
+  assert.match(unreadable({ line_items: [{ id: 1, total: '1e3', meta_data: [] }] as never }).join(), /unreadable total/)
+  assert.match(unreadable({ tax_lines: [{ id: 1, rate_id: 216, tax_total: 'x', shipping_tax_total: '2.00' }] as never }).join(), /rate 216 has an unreadable tax total/)
+  assert.match(unreadable({ tax_lines: [{ id: 1, rate_id: 216, tax_total: '17.00', shipping_tax_total: undefined }] as never }).join(), /rate 216 has an unreadable shipping tax total/)
+  assert.match(unreadable({ tax_lines: [{ id: 1, rate_id: 0, tax_total: '17.00', shipping_tax_total: '0' }] as never }).join(), /tax line 1 has an unreadable rate id/)
+  assert.match(unreadable({ tax_lines: [{ id: 1, rate_id: '216', tax_total: '17.00', shipping_tax_total: '0' }] as never }).join(), /unreadable rate id/)
+  assert.match(unreadable({ total_tax: 'n/a' }).join(), /order tax total/)
+  assert.match(unreadable({ total_tax: undefined as never }).join(), /order tax total/)
+  assert.match(unreadable({ currency: '' }).join(), /currency/)
+  assert.match(unreadable({ currency: 'EURO' }).join(), /currency/)
+  assert.match(unreadable({ fee_lines: [{ id: 1, name: 'Import Duty', total: 'x', total_tax: '0', meta_data: [meta('_wclc_fee', '1'), meta('_wclc_fee_kind', 'duty_fee')] }] as never }).join(), /duty fee line "Import Duty"/)
+  // an unreadable total on a fee that is not the duty fee is not this reader's business
+  assert.deepEqual(unreadable({ fee_lines: [{ id: 1, name: 'Other', total: 'x', total_tax: '0', meta_data: [] }] as never }), [])
+  assert.match(unreadable({ meta_data: [meta('_o3d_ioss_vat_account', { a: 1 })] }).join(), /plugin VAT account/)
+  assert.match(unreadable({ meta_data: [meta('_o3d_ioss_reason', 5)] }).join(), /plugin reason/)
+  // empty strings and absent metas are not unreadable
+  assert.deepEqual(unreadable({ meta_data: [meta('_o3d_ioss_vat_account', ''), meta('_o3d_ioss_reason', '')] }), [])
+})
+
+test('every malformed figure refuses the order end to end, before it is resolved', async () => {
+  const bad: Array<[string, Partial<WcFullOrder>]> = [
+    ['line total', { line_items: [{ id: 1, total: 'abc', meta_data: [] }] as never }],
+    ['rate tax', { tax_lines: [{ id: 1, rate_id: 216, tax_total: 'x', shipping_tax_total: '2.00' }] as never }],
+    ['order tax', { total_tax: 'n/a' }],
+  ]
+  for (const [name, over] of bad) {
+    const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder(over), { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide' })
+    const d = resolveEuVatRegime(input)
+    assert.equal(d.kind === 'REFUSE' && d.code, 'order_figure_unreadable', name)
+  }
 })

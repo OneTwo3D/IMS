@@ -37,7 +37,7 @@ async function seedOrder(db: Awaited<ReturnType<typeof setup>>['db']): Promise<s
 
 function input(goods: string, over: Partial<EuVatRegimeInput> = {}): EuVatRegimeInput {
   return {
-    mode: 'decide', pluginFx: { state: 'absent' }, pluginFxConflict: false,
+    unreadable: [], mode: 'decide', pluginFx: { state: 'absent' }, pluginFxConflict: false,
     shippingCountry: 'DE', billingCountry: 'DE', currency: 'EUR', goodsLines: [{ total: goods, voucher: 'no' }],
     rates: [{ wooRateId: 216, tax: '19.00', mapping: { state: 'mapped', imsRateId: 'r', name: 'DE VAT', active: true, countryCode: 'DE', rate: '0.19', reportingCategory: 'IOSS', schemePostingTaxType: 'TAX131' } }],
     orderTax: '19.00', vatExempt: 'no', vatRecord: { state: 'absent' }, eas: { state: 'absent' },
@@ -166,15 +166,19 @@ test("adopt mode stamps the plugin's decision with its conversion record in the 
   const adopted = await seedOrder(db)
   const bare = await seedOrder(db)
   try {
-    const fx = { state: 'present' as const, rate: '1.1500', pair: 'GBP>EUR', thresholdValue: '149.50' }
+    const fx = { state: 'present' as const, rate: '1.1500', pair: 'EUR>EUR', thresholdValue: '149.50' }
     const a = await db.$transaction((tx) => stampEuVatRegime(tx, adopted, () => input('100.00', { mode: 'adopt_plugin', pluginVatAccount: '232', pluginFx: fx }), NOW))
     assert.deepEqual(a.kind === 'stamped' && a.stamp, { regime: 'DDP', vatAccount: '232', stampedAt: NOW })
     const row = await db.salesOrder.findUniqueOrThrow({ where: { id: adopted }, select: { euVatRegimeBasis: true } })
     const basis = row.euVatRegimeBasis as { scheme: { source: string; pluginFx: unknown } }
     assert.equal(basis.scheme.source, 'plugin')
-    assert.deepEqual(basis.scheme.pluginFx, { recorded: true, rate: '1.1500', pair: 'GBP>EUR', thresholdValue: '149.50' })
+    assert.deepEqual(basis.scheme.pluginFx, { recorded: true, rate: '1.1500', pair: 'EUR>EUR', thresholdValue: '149.50' })
     const b = await db.$transaction((tx) => stampEuVatRegime(tx, bare, () => input('100.00', { mode: 'adopt_plugin', pluginVatAccount: null }), NOW))
     assert.equal(b.kind === 'refused' && b.code, 'plugin_account_missing')
+    const wrongPair = await db.$transaction((tx) => stampEuVatRegime(tx, bare, () => input('100.00', { mode: 'adopt_plugin', pluginVatAccount: '821', pluginFx: { ...fx, pair: 'USD>EUR' } }), NOW))
+    assert.equal(wrongPair.kind === 'refused' && wrongPair.code, 'plugin_fx_conflict')
+    const unreadable = await db.$transaction((tx) => stampEuVatRegime(tx, bare, () => input('100.00', { unreadable: ['order tax unreadable'] }), NOW))
+    assert.equal(unreadable.kind === 'refused' && unreadable.code, 'order_figure_unreadable')
     const untouched = await db.salesOrder.findUniqueOrThrow({ where: { id: bare }, select: { euVatRegimeStampedAt: true } })
     assert.equal(untouched.euVatRegimeStampedAt, null)
   } finally {
