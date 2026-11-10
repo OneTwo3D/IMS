@@ -121,6 +121,7 @@ import {
   describeBilledAhead,
   describeRetireOutcome,
   retirePurchaseOrderLocked,
+  settleCloseShortRevaluation,
   type RetireOutcome,
 } from '@/lib/domain/purchasing/po-close-short'
 import { assertFinitePurchaseReceiptUnitCost } from '@/lib/domain/purchasing/purchase-receipt-cost'
@@ -2022,7 +2023,11 @@ export async function advancePoStatus(
   try {
     await requirePermission('purchasing.create')
     const result = await db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
+      // Closing a GOODS order may reallocate the unreceived freight share onto the received units (close-short), which revalues
+      // cost layers: it takes the whole revaluation scope first, which includes the order row.
+      const typeProbe = targetStatus === 'CLOSED' ? await tx.purchaseOrder.findUnique({ where: { id }, select: { type: true } }) : null
+      if (typeProbe?.type === 'GOODS') await lockLandedCostRevaluationScope(tx, { primaryPoIds: [id] })
+      else await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
       const existing = await tx.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
       if (!existing) throw new Error('PO not found')
       if (existing.status === targetStatus) {
@@ -2057,6 +2062,9 @@ export async function advancePoStatus(
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
     const warnings: string[] = []
+    if (result.changed && result.retired) {
+      warnings.push(...await settleCloseShortRevaluation(result.retired.landedCostRecalc, result.retired, id))
+    }
     if (result.changed) {
       await logActivity({
         entityType: 'PURCHASE_ORDER',

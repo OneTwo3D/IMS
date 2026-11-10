@@ -9,6 +9,7 @@ import {
   describeBilledAhead,
   describeRetireOutcome,
   retirePurchaseOrderLocked,
+  settleCloseShortRevaluation,
   type RetireOutcome,
 } from '@/lib/domain/purchasing/po-close-short'
 import {
@@ -134,7 +135,10 @@ export async function cancelPurchaseOrderService(
       if (typeProbe?.type === 'FREIGHT') {
         await (deps.lockLandedCostRevaluationScope ?? lockLandedCostRevaluationScope)(tx, { freightPoId: id })
       } else {
-        await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
+        // A GOODS order takes the whole revaluation scope too (transfers, the order with its lines and cost lines, then its cost
+        // layers and everything downstream): a part-received order with freight is closed short by reallocating the unreceived
+        // freight share onto the received units, which revalues those layers. The scope lock also takes the order row first.
+        await (deps.lockLandedCostRevaluationScope ?? lockLandedCostRevaluationScope)(tx, { primaryPoIds: [id] })
       }
       const existing = await tx.purchaseOrder.findUnique({
         where: { id },
@@ -216,6 +220,10 @@ export async function cancelPurchaseOrderService(
     if (retired) {
       const billedAheadWarning = describeBilledAhead(retired.billedAhead)
       if (billedAheadWarning) warnings.push(billedAheadWarning)
+      warnings.push(...await settleCloseShortRevaluation(retired.landedCostRecalc, retired, id, {
+        logActivity: deps.logActivity,
+        queueLandedCostAdjustmentJournals: deps.queueLandedCostAdjustmentJournals,
+      }))
       await deps.logActivity({
         entityType: 'PURCHASE_ORDER',
         entityId: id,

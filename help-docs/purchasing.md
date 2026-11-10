@@ -130,10 +130,11 @@ The unit cost is validated as finite and non-negative before stock movements are
 Closing or cancelling a part-received order **drops the quantity still due and keeps what you received**:
 
 - The goods already received stay in stock, with their quantities and FIFO cost layers unchanged.
-- No stock is reversed and no accounting entry is made. An unreceived balance has no ledger entry to undo.
+- No stock is reversed. An unreceived balance has no ledger entry to undo; the only entries are the freight re-spread described below.
 - The order ends **Closed** (both buttons), shown as **Closed short: received 60 of 100**. The ordered quantities are kept as the record of what was ordered.
 - The dropped quantity stops counting as incoming and in open-PO and replenishment figures.
 - Received goods that have not been billed yet can still be billed afterwards.
+- **Freight and other cost lines are re-spread over what arrived.** Freight on the order (its own cost lines and linked freight orders) was spread over the whole ordered quantity when the goods were received. When the balance is dropped, the full freight is spread over the units that did arrive: a BY_VALUE cost line follows the value of what landed, BY_QUANTITY the units that landed, and a line that landed nothing carries none. The remaining cost layers are revalued (5.50 a unit becomes 5.83 in a 100-unit order with 50.00 of freight and 60 received), the share for units already sold is posted to cost of sales, and units still in transit between warehouses carry their share. The journals are DR Inventory / CR Transit for stock on hand and DR Cost of sales / CR Transit for stock already sold, so Goods in Transit for the order clears once the goods and the freight are billed. If the freight is not billed yet, the credit stays in Transit until its bill arrives. A freight credit larger than the goods cost is held at 0.00 per unit and you are warned. Other orders linked to the same freight order keep their own share and are not touched. An order with no freight posts nothing.
 
 **To take received goods back out of stock, use Return Items first** (a supplier return), then close the order. Returning goods does not close or cancel the order and does not stop you receiving the rest: while quantity is still due, the order stays open after a return. A closed order cannot have goods returned against it.
 

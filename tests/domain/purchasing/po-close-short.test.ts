@@ -12,7 +12,7 @@ import {
 
 type FakeLine = { id: string; qty: number; qtyReceived: number; sku: string }
 
-function fakeTx(po: { status: PurchaseOrderStatus; lines: FakeLine[]; invoiceLines?: Array<{ poLineId: string; qtyBilled: number; totalBase: number }>; live?: Array<{ sourceLineId: string; status: string }> }) {
+function fakeTx(po: { status: PurchaseOrderStatus; lines: FakeLine[]; invoiceLines?: Array<{ poLineId: string; qtyBilled: number; totalBase: number }>; live?: Array<{ sourceLineId: string; status: string }>; freight?: Array<{ amountBase: number }> }) {
   const writes: Array<{ status: PurchaseOrderStatus }> = []
   const tx = {
     purchaseOrder: {
@@ -20,6 +20,8 @@ function fakeTx(po: { status: PurchaseOrderStatus; lines: FakeLine[]; invoiceLin
         status: po.status,
         reference: 'PO-T',
         lines: po.lines.map((l) => ({ id: l.id, qty: l.qty, qtyReceived: l.qtyReceived, product: { sku: l.sku } })),
+        freightCostLines: po.freight ?? [],
+        landedCostLinks: [],
         invoices: [{ lines: po.invoiceLines ?? [] }],
       }),
       update: async ({ data }: { data: { status: PurchaseOrderStatus } }) => {

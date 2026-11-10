@@ -77,6 +77,7 @@ function makeDeps(po: Po, overrides: Partial<CancelPurchaseOrderServiceDeps> = {
         landedQty: 0,
         droppedQty: 5,
         billedAhead: [],
+        landedCostRecalc: null,
       } satisfies RetireOutcome
     },
     // Not invoked for GOODS POs (type !== 'FREIGHT'); counts so a test can prove it.
@@ -98,6 +99,7 @@ function closeShortRetire(outcome: Partial<RetireOutcome> & { reference: string 
       landedQty: 60,
       droppedQty: 40,
       billedAhead: [],
+      landedCostRecalc: null,
       ...outcome,
     } satisfies RetireOutcome
   }

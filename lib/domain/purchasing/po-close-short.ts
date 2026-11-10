@@ -3,6 +3,14 @@ import { loadPurchaseOrderLineLandedQty, PO_LANDED_QTY_EPSILON } from '@/lib/dom
 import { findLiveAsnBlocks, type LiveAsnBlock } from '@/lib/domain/wms/po-receipt-asn-guard'
 import { validatePurchaseOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
+import { logActivity } from '@/lib/activity-log'
+import {
+  CONTRIBUTING_LANDED_COST_LINK_WHERE,
+  logLandedCostCreditFloorActivities,
+  queueLandedCostAdjustmentJournals,
+  recalculateDirectLandedCosts,
+  type LandedCostRecalcResult,
+} from '@/lib/domain/purchasing/landed-cost-service'
 
 /**
  * CLOSING A PURCHASE ORDER, AND CANCELLING A PART-RECEIVED ONE, ARE ONE OPERATION: DROP WHAT HAS NOT ARRIVED, KEEP WHAT HAS.
@@ -103,6 +111,11 @@ export type RetireOutcome = {
   /** Ordered quantity that will now never be received (sum over lines of max(0, qty - landed)). */
   droppedQty: number
   billedAhead: BilledAheadLine[]
+  /**
+   * Set when the unreceived share of freight was reallocated onto the received units (the order carries contributing costs and
+   * quantity was dropped). The caller posts its journals after commit with `settleCloseShortRevaluation`.
+   */
+  landedCostRecalc: LandedCostRecalcResult | null
 }
 
 /**
@@ -122,6 +135,11 @@ export async function retirePurchaseOrderLocked(
       status: true,
       reference: true,
       lines: { select: { id: true, qty: true, qtyReceived: true, product: { select: { sku: true } } } },
+      freightCostLines: { select: { amountBase: true } },
+      landedCostLinks: {
+        where: { ...CONTRIBUTING_LANDED_COST_LINK_WHERE },
+        select: { freightPO: { select: { freightCostLines: { select: { amountBase: true } } } } },
+      },
       invoices: { select: { lines: { select: { poLineId: true, qtyBilled: true, totalBase: true } } } },
     },
   })
@@ -146,6 +164,24 @@ export async function retirePurchaseOrderLocked(
   if (!transition.success) throw new Error(transition.error)
   beforeWrite?.({ keptReceivedStock })
 
+  // THE FREIGHT. The unreceived share of the order's freight (its own cost lines and its linked freight orders') is spread over the
+  // units that landed: remaining layers revalued, sold units' share to COGS, in-transit residue capitalised, journals returned for
+  // the caller to post. BEFORE the status write: the revaluation refuses a CLOSED order. The caller holds the revaluation scope
+  // lock (lockLandedCostRevaluationScope), which this call requires.
+  let landedCostRecalc: LandedCostRecalcResult | null = null
+  const hasContributingCosts = po.freightCostLines.some((c) => !toDecimal(c.amountBase).isZero())
+    || po.landedCostLinks.some((link) => link.freightPO.freightCostLines.some((c) => !toDecimal(c.amountBase).isZero()))
+  if (keptReceivedStock && droppedQty > PO_LANDED_QTY_EPSILON && hasContributingCosts) {
+    landedCostRecalc = await recalculateDirectLandedCosts(tx, id, undefined, {
+      triggeredById: null,
+      reason: 'purchase_order_closed_short',
+      scheduleAdjustmentJournals: true, // durable backstop, as for every journaling revaluation
+      landedQtyBasis: new Map(lineLanded.map((l) => [l.id, l.landedQty])),
+    })
+    // The links' cost now sits on the units that landed.
+    await tx.landedCostLink.updateMany({ where: { primaryPoId: id, ...CONTRIBUTING_LANDED_COST_LINK_WHERE }, data: { allocated: true } })
+  }
+
   await tx.purchaseOrder.update({ where: { id }, data: { status: newStatus } })
 
   const billedAhead = computeBilledAheadOfReceipt({
@@ -160,7 +196,59 @@ export async function retirePurchaseOrderLocked(
     landedQty: roundQuantity(landedQty, 4).toNumber(),
     droppedQty: roundQuantity(droppedQty, 4).toNumber(),
     billedAhead,
+    landedCostRecalc,
   }
+}
+
+export type SettleCloseShortDeps = {
+  logActivity: typeof logActivity
+  queueLandedCostAdjustmentJournals: typeof queueLandedCostAdjustmentJournals
+}
+
+const defaultSettleDeps: SettleCloseShortDeps = { logActivity, queueLandedCostAdjustmentJournals }
+
+/**
+ * After the close-short transaction committed: post the freight reallocation's journals (DR Inventory / CR Transit for retained
+ * units, DR COGS / CR Transit for sold units; the existing queue, behind the existing holds, keyed by the adjustment's event key so
+ * the in-transaction outbox row and this call are one posting), write the credit-floor WARNING, and log each COGS correction.
+ * Returns operator-facing warnings. Never throws: the close already committed.
+ */
+export async function settleCloseShortRevaluation(
+  recalc: LandedCostRecalcResult | null,
+  outcome: Pick<RetireOutcome, 'reference'>,
+  poId: string,
+  deps: SettleCloseShortDeps = defaultSettleDeps,
+): Promise<string[]> {
+  if (!recalc) return []
+  const warnings: string[] = []
+  try {
+    await logLandedCostCreditFloorActivities(recalc)
+  } catch (error) {
+    console.error('Failed to log close-short credit-floor activity:', error)
+  }
+  for (const w of recalc.warnings) warnings.push(w.message)
+  try {
+    await deps.queueLandedCostAdjustmentJournals(recalc)
+  } catch (error) {
+    console.error('Failed to queue close-short freight reallocation journals:', error)
+    warnings.push('The freight reallocation is saved, but its accounting journals could not be queued now; they are held in the retry outbox.')
+  }
+  for (const adj of recalc.cogsAdjustments) {
+    try {
+      await deps.logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: poId,
+        action: 'cogs_adjusted',
+        tag: 'purchase',
+        level: 'INFO',
+        description: `Retrospective COGS correction of ${adj.totalDelta.toFixed(2)} for ${outcome.reference} after closing it short (freight reallocated onto the units received)`,
+        metadata: { totalDelta: adj.totalDelta, reason: 'purchase_order_closed_short' },
+      })
+    } catch (error) {
+      console.error('Failed to log close-short COGS adjustment:', error)
+    }
+  }
+  return warnings
 }
 
 export function describeRetireOutcome(outcome: RetireOutcome, intent: PoRetireIntent): string {
