@@ -28,7 +28,7 @@ import {
 } from '@/lib/domain/sales/refund-reversal-record'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
-import { findGrossOverPaidBalance, findOverAllocatedRefundTarget, nonSaleRowRefusal, overAllocatedRefundTargetMessage, publicRefundLineRefusal } from '@/lib/domain/sales/refund-target-balances'
+import { findGrossOverPaidBalance, findOverAllocatedRefundTarget, invalidQuantityRefusal, nonSaleRowRefusal, overAllocatedRefundTargetMessage, publicRefundLineRefusal } from '@/lib/domain/sales/refund-target-balances'
 import { orderDiscountReversal, refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
 import { storedAmountsIncludeVat } from '@/lib/domain/sales/sales-order-vat-basis'
 import {
@@ -3658,6 +3658,11 @@ export async function createSalesOrderRefund(
   // would otherwise drop — a chargeback mirrors the invoice's order-discount line.
   const refundLines = input.lines.filter((line) => line.qty > 0 || line.totalBase > 0 || line.lineKind === 'discount')
   if (!refundLines.length) return { success: false, error: 'Select at least one line to refund' }
+  // No caller may write a negative or non-numeric quantity.
+  {
+    const refusal = invalidQuantityRefusal(refundLines)
+    if (refusal) return { success: false, error: refusal }
+  }
   // Shipping and discount rows are money only, for EVERY caller: nothing but a sale line may return stock or move a quantity.
   {
     const refusal = nonSaleRowRefusal(refundLines)
@@ -3838,7 +3843,7 @@ export async function createSalesOrderRefund(
         const takenBase = new Map<string, number>()
         for (const row of priorRows) {
           const id = row.salesOrderLineId as string
-          takenQty.set(id, (takenQty.get(id) ?? 0) + refundBoundaryNumber(row.qty))
+          takenQty.set(id, (takenQty.get(id) ?? 0) + Math.max(0, refundBoundaryNumber(row.qty))) // (a legacy negative quantity never counts as a credit)
           takenForeign.set(id, (takenForeign.get(id) ?? 0) + refundBoundaryNumber(row.totalForeign))
           takenBase.set(id, (takenBase.get(id) ?? 0) + refundBoundaryNumber(row.totalBase))
         }
@@ -4459,7 +4464,7 @@ export async function createSalesOrderRefund(
       if (!refundLine.productId) continue
       refundedQtyByProduct.set(
         refundLine.productId,
-        (refundedQtyByProduct.get(refundLine.productId) ?? 0) + refundBoundaryNumber(refundLine.qty),
+        (refundedQtyByProduct.get(refundLine.productId) ?? 0) + Math.max(0, refundBoundaryNumber(refundLine.qty)),
       )
     }
     const originalQtyByProduct = new Map<string, number>()

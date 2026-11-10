@@ -99,10 +99,19 @@ test(
         reason: 'above the ceiling',
         creditNotePrefix: `CNNET${suffix.slice(0, 6)}-`,
         enforcePerTargetBalances: true,
-        deriveSaleLineNetsFromStoredBalance: true,
       })
       assert.equal(overCeiling.success, false)
-      assert.match(overCeiling.success === false ? overCeiling.error : '', /more than the 0\.50 it was paid/, 'refused on the grossed-up credit note against what the line was paid')
+      assert.match(overCeiling.success === false ? overCeiling.error : '', /Refund total would exceed order total/, 'an amount-only row on a fully refunded order is refused by the order-wide ceiling')
+      const publicZero = await createSalesOrderRefund(db, {
+        orderId: order.id,
+        lines: [{ lineId, productId: null, description: 'Tiny', qty: 0, totalForeign: 0.1, totalBase: 0.1, lineKind: 'sale' }],
+        reason: 'public amount-only',
+        creditNotePrefix: `CNNET${suffix.slice(0, 6)}-`,
+        enforcePerTargetBalances: true,
+        deriveSaleLineNetsFromStoredBalance: true,
+      })
+      assert.equal(publicZero.success, false)
+      assert.match(publicZero.success === false ? publicZero.error : '', /quantity above zero/)
       assert.equal(await db.salesOrderRefundLine.count({ where: { refund: { orderId: order.id } } }), 100, 'nothing was written by the refusals')
     } finally {
       if (orderId) {

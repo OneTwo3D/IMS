@@ -1626,6 +1626,50 @@ test('a full refund after the order default tax code was changed from 20% to 0% 
   assert.equal(state.refunds.length, 0)
 })
 
+// [mutation: negative / zero quantities accepted on the public path, or negative quantities allowed for any caller]
+test('a public sale row with quantity 0 or -1 is refused with nothing written, and -1 then +2 cannot reach 2 refunded against 1 sold', async () => {
+  const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 100, taxBase: 0 }] })
+  state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget', qty: 1, totalBase: 100, totalForeign: 100 }
+  const client = createClient(state)
+  const flags = refundSafeguards({ isInternal: false })
+  for (const qty of [0, -1, Number.NaN]) {
+    const result = await createSalesOrderRefund(client, {
+      orderId: 'order-1',
+      lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Widget', qty, totalForeign: 10, totalBase: 10, lineKind: 'sale' }],
+      reason: `qty ${qty}`, creditNotePrefix: 'CN-', ...flags,
+    })
+    assert.equal(result.success, false, `qty ${qty}`)
+    assert.equal(state.refunds.length, 0)
+    assert.equal(state.refundLines.length, 0)
+  }
+  const plusTwo = await createSalesOrderRefund(client, {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Widget', qty: 2, totalForeign: 100, totalBase: 100, lineKind: 'sale' }],
+    reason: '+2', creditNotePrefix: 'CN-', ...flags,
+  })
+  assert.equal(plusTwo.success, false)
+  assert.equal(state.refunds.length, 0)
+})
+
+test('no caller, internal included, may write a negative quantity; internal amount-only (quantity 0) rows stay allowed', async () => {
+  const neg = baseState()
+  const refused = await createSalesOrderRefund(createClient(neg), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: -1, totalBase: 10 }],
+    reason: 'negative', creditNotePrefix: 'CN-',
+  })
+  assert.equal(refused.success, false)
+  assert.match(refused.success === false ? refused.error : '', /quantity must be zero or more/)
+  assert.equal(neg.refunds.length, 0)
+  const amountOnly = baseState()
+  const ok = await createSalesOrderRefund(createClient(amountOnly), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: null, description: 'Product 1', qty: 0, totalBase: 10, lineKind: 'sale' }],
+    reason: 'amount only', creditNotePrefix: 'CN-', enforcePerTargetBalances: true,
+  })
+  assert.equal(ok.success, true, ok.success ? '' : ok.error)
+})
+
 test('two lines of the same product cannot lend each other units: a line is refunded only up to its own remaining quantity', async () => {
   const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 20, taxBase: 0 }] })
   state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget A', qty: 1, totalBase: 10, totalForeign: 10 }
@@ -1669,7 +1713,7 @@ test('a public refund line takes its product from the locked order line; a forge
   assert.equal(ok.refundLines[0].productId, 'product-1')
 })
 
-test('a price-only refund above the line\'s stored net is refused when the per-target cap is on (public refunds)', async () => {
+test('an internal price-only refund above the line\'s stored net is refused when the per-target cap is on', async () => {
   const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 100, taxBase: 0 }] })
   state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget', qty: 2, totalBase: 50, totalForeign: 50 }
   const over = await createSalesOrderRefund(createClient(state), {
@@ -1678,10 +1722,9 @@ test('a price-only refund above the line\'s stored net is refused when the per-t
     reason: 'inflated',
     creditNotePrefix: 'CN-',
     enforcePerTargetBalances: true,
-    deriveSaleLineNetsFromStoredBalance: true,
   })
   assert.equal(over.success, false)
-  assert.match(over.success === false ? over.error : '', /more than (it has left to refund|the 50\.00 it was paid)/)
+  assert.match(over.success === false ? over.error : '', /more than it has left to refund/)
   assert.equal(state.refunds.length, 0)
 })
 
