@@ -23,8 +23,36 @@ let switchOn = false
 /** The OFF case needs to see what the importer built; the real queue would write nothing. Only that case sets it. */
 let recordWhenOff = false
 let accountingMocked = false
+/** A change made between the importer's first verification of a held invoice and its release's own order lock (the release re-verifies under that lock). Armed by one test. */
+const betweenHook: { armed: boolean; verified: boolean; run: null | (() => Promise<void>) } = { armed: false, verified: false, run: null }
 async function mockAccounting() {
   if (accountingMocked) return
+  const verification = await import('@/lib/connectors/woocommerce/sync/held-invoice-verification')
+  mock.module('@/lib/connectors/woocommerce/sync/held-invoice-verification', {
+    namedExports: {
+      ...verification,
+      heldInvoiceDifference: (...args: Parameters<typeof verification.heldInvoiceDifference>) => {
+        const difference = verification.heldInvoiceDifference(...args)
+        if (betweenHook.armed && difference === null) betweenHook.verified = true
+        return difference
+      },
+    },
+  })
+  const allocation = await import('@/lib/domain/sales/allocation-service')
+  mock.module('@/lib/domain/sales/allocation-service', {
+    namedExports: {
+      ...allocation,
+      lockSalesOrder: async (...args: Parameters<typeof allocation.lockSalesOrder>) => {
+        if (betweenHook.armed && betweenHook.verified && betweenHook.run) {
+          const run = betweenHook.run
+          betweenHook.run = null
+          betweenHook.armed = false
+          await run()
+        }
+        return allocation.lockSalesOrder(...args)
+      },
+    },
+  })
   const actual = await import('@/lib/accounting')
   mock.module('@/lib/accounting', {
     namedExports: {
@@ -450,5 +478,34 @@ test('[eu vat] a LEGACY hold whose order keeps the same line count and total but
   assert.equal(rows.length, 0, 'nothing was queued')
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /the order changed after it was held .*unit amount.*needs its invoice rebuilt/)
+  assert.deepEqual(((after.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment), { applied: false, reason: 'order_changed' })
+})
+
+test('[eu vat] the order changes AFTER the first verification and BEFORE the release: the release re-verifies under its own lock and does not release', { skip }, async (t) => {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = true
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seed(db, wcRateId)
+  t.after(async () => { switchOn = false; betweenHook.armed = false; betweenHook.run = null; await cleanup(db, externalId, ctx) })
+  // Parked treated (IOSS, 821) with the switch on.
+  assert.equal((await importWcOrder(payload(externalId, wcRateId, PLUGIN('821')) as never)).success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  assert.equal(((held.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment as { applied: boolean }).applied, true)
+  // The numbered delivery is unchanged, so the FIRST verification passes. Then, just before the release takes its lock, the order's regime stamp is changed by someone else.
+  betweenHook.verified = false
+  betweenHook.armed = true
+  betweenHook.run = async () => { await db.salesOrder.update({ where: { id: orderId }, data: { euVatRegime: 'DDP', euVatLineAccount: '232' } }) }
+  await importWcOrder(payload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...PLUGIN('821')]) as never)
+  assert.equal(betweenHook.verified, true, 'the first verification passed')
+  assert.equal(betweenHook.run, null, 'the change really happened between the verification and the release')
+  assert.equal(await db.accountingSyncLog.count({ where: { type: 'SALES_INVOICE', referenceId: orderId } }), 0, 'nothing was queued')
+  const after = await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } })
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /the order changed after it was held \(.*stamped DDP on account 232.*\) and needs its invoice rebuilt/)
   assert.deepEqual(((after.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment), { applied: false, reason: 'order_changed' })
 })

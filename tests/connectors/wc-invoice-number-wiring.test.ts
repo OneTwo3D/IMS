@@ -113,7 +113,7 @@ test('a redelivery captures the number, may correct it before anything posts, an
   // numbered, PROCESSING and permanently un-invoiced.
   assert.ok(
     body.includes(
-      'await releaseHeldWcSalesInvoice(orderId, { externalOrderId: String(wcOrder.id), externalOrderNumber: wcOrder.number }, usableInvoiceNumber)',
+      'await releaseHeldWcSalesInvoice(orderId, { externalOrderId: String(wcOrder.id), externalOrderNumber: wcOrder.number }, usableInvoiceNumber',
     ),
     'capturing the number must RELEASE the invoice that was held back for it',
   )

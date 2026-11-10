@@ -257,7 +257,7 @@ test('both manual order creators lock and re-read the customer inside the create
 test('the held-invoice release reads the marker, builds the payload and inserts inside ONE order-locked transaction, with no after-the-fact scrub', () => {
   const src = readFileSync(new URL('../lib/connectors/woocommerce/sync/order-import.ts', import.meta.url), 'utf8')
   const release = src.slice(src.indexOf('async function releaseHeldWcSalesInvoice'))
-  assert.match(release, /db\.\$transaction\(async \(tx\) => \{\s*await lockSalesOrder\(tx, orderId\)[\s\S]*erasedAt[\s\S]*scrubContactInAccountingPayload\(held\.accountingPayload\)[\s\S]*queueAccountingSyncTxWithOutcome\(tx,/)
+  assert.match(release, /db\.\$transaction\(async \(tx\) => \{\s*await lockSalesOrder\(tx, orderId\)[\s\S]*erasedAt[\s\S]*scrubContactInAccountingPayload\(heldNow\.accountingPayload\)[\s\S]*queueAccountingSyncTxWithOutcome\(tx,/)
   assert.ok(!/scrubErasedOrderAccountingPayloads|isOrderErasedUnderLock/.test(src), 'the read-then-scrub-afterwards shape is gone')
 })
 

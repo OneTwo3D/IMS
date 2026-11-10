@@ -1382,8 +1382,10 @@ async function updateExistingWcOrderCore(
   // has already been invoiced.
   if (so.accountingInvoiceId) return
   // With the switch on, a held invoice is checked against the order (and an untreated one treated) before the release looks at it; a difference or refusal keeps it PENDING with its reason and nothing is released.
-  if (await reconcileHeldWcSalesInvoice(orderId, wcOrder).catch((error) => { console.error(`[wc-import] could not treat the held sales invoice for ${orderId}:`, error); return 'refused' as const }) === 'refused') return
-  await releaseHeldWcSalesInvoice(orderId, { externalOrderId: String(wcOrder.id), externalOrderNumber: wcOrder.number }, usableInvoiceNumber)
+  const reconciled = await reconcileHeldWcSalesInvoice(orderId, wcOrder).catch((error) => { console.error(`[wc-import] could not treat the held sales invoice for ${orderId}:`, error); return { outcome: 'refused' as const } })
+  if (reconciled.outcome === 'refused') return
+  // The release re-verifies a treated hold under its own order lock, immediately before it enqueues (`recheck`).
+  await releaseHeldWcSalesInvoice(orderId, { externalOrderId: String(wcOrder.id), externalOrderNumber: wcOrder.number }, usableInvoiceNumber, { recheck: reconciled.recheck })
 }
 
 /**
@@ -1632,6 +1634,30 @@ async function noteHeldReleaseFailure(rowId: string, message: string): Promise<v
   })
 }
 
+/** Re-checks a treated hold against the order INSIDE the release's own order-locked transaction, immediately before it enqueues; the hold it returns is the one that is released. */
+type HeldRecheck = (tx: Prisma.TransactionClient) => Promise<{ ok: true; held: HeldSalesInvoicePayload } | { ok: false; reason: string }>
+class HeldRecheckRefusal extends Error {
+  constructor(readonly reason: string) { super(reason) }
+}
+
+/** The order changed after the invoice was held: mark the hold so nothing releases or re-treats it, and say what is needed. */
+async function markHeldInvoiceOrderChanged(orderId: string, rowId: string, what: string): Promise<void> {
+  await db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, orderId)
+    const current = await tx.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
+    if (!current || current.id !== rowId || !isHeldSalesInvoicePayload(current.payload)) return
+    const currentHeld: HeldSalesInvoicePayload = current.payload
+    await tx.shoppingSyncLog.update({
+      where: { id: rowId },
+      data: {
+        payload: { ...currentHeld, accountingPayload: { ...currentHeld.accountingPayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'order_changed' } } } as unknown as Prisma.InputJsonValue,
+        errorMessage: `This held invoice was NOT released: the order changed after it was held (${what}) and needs its invoice rebuilt. NOTHING was queued.`,
+        syncedAt: null,
+      },
+    })
+  })
+}
+
 /**
  * A HELD INVOICE IS CHECKED AGAINST THE ORDER ON RE-IMPORT, BEFORE ANYTHING IS RELEASED (switch on only; with it off nothing here runs).
  *
@@ -1641,39 +1667,25 @@ async function noteHeldReleaseFailure(rowId: string, message: string): Promise<v
  * A difference or a refusal leaves the hold PENDING with the reason and the release is not attempted. A hold whose order changed is marked (applied:false, reason order_changed), so neither the sweep nor a later re-import releases or re-treats it: an invoice built from an order that has changed
  * has to be rebuilt, and there is no automatic rebuild of a held invoice. Store-credit orders are left alone. The held-release sweep has no WooCommerce order in hand, so it does not compare; it only refuses holds that are not marked applied:true.
  */
-async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder): Promise<'not-needed' | 'treated' | 'refused'> {
+async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder): Promise<{ outcome: 'not-needed' | 'treated' | 'refused'; recheck?: HeldRecheck }> {
   const row = await db.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
-  if (!row || !isHeldSalesInvoicePayload(row.payload)) return 'not-needed'
+  if (!row || !isHeldSalesInvoicePayload(row.payload)) return { outcome: 'not-needed' }
   const held: HeldSalesInvoicePayload = row.payload
   type Marker = { applied?: unknown; reason?: unknown; route?: unknown; regime?: unknown; vatAccount?: unknown; schemePostingTaxType?: unknown }
   const markerOf = (payload: Record<string, unknown>) => payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as Marker | null | undefined
   const marker = markerOf(held.accountingPayload)
-  if (marker?.reason === 'store_credit') return 'not-needed'
+  if (marker?.reason === 'store_credit') return { outcome: 'not-needed' }
   const chart = heldSalesInvoiceChartConnector(held)
-  if (!chart) return 'not-needed'
+  if (!chart) return { outcome: 'not-needed' }
   const { isAccountingSyncTypeEnabledFor, getAccountingSettings } = await import('@/lib/accounting')
-  if (!(await isAccountingSyncTypeEnabledFor(chart, 'SALES_INVOICE'))) return 'not-needed'
-  const refuse = async (reason: string): Promise<'refused'> => {
+  if (!(await isAccountingSyncTypeEnabledFor(chart, 'SALES_INVOICE'))) return { outcome: 'not-needed' }
+  const refuse = async (reason: string): Promise<{ outcome: 'refused' }> => {
     await noteHeldReleaseFailure(row.id, `This held invoice was not released: ${reason}. NOTHING was queued.`)
-    return 'refused'
+    return { outcome: 'refused' }
   }
-  // The order changed after the invoice was held: mark the hold so nothing releases or re-treats it, and say what is needed.
-  const refuseChanged = async (what: string): Promise<'refused'> => {
-    await db.$transaction(async (tx) => {
-      await lockSalesOrder(tx, orderId)
-      const current = await tx.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
-      if (!current || current.id !== row.id || !isHeldSalesInvoicePayload(current.payload)) return
-      const currentHeld: HeldSalesInvoicePayload = current.payload
-      await tx.shoppingSyncLog.update({
-        where: { id: row.id },
-        data: {
-          payload: { ...currentHeld, accountingPayload: { ...currentHeld.accountingPayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'order_changed' } } } as unknown as Prisma.InputJsonValue,
-          errorMessage: `This held invoice was NOT released: the order changed after it was held (${what}) and needs its invoice rebuilt. NOTHING was queued.`,
-          syncedAt: null,
-        },
-      })
-    })
-    return 'refused'
+  const refuseChanged = async (what: string): Promise<{ outcome: 'refused' }> => {
+    await markHeldInvoiceOrderChanged(orderId, row.id, what)
+    return { outcome: 'refused' }
   }
   if (marker?.reason === 'order_changed') return await refuseChanged('it was already found to have changed')
 
@@ -1684,7 +1696,7 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     couponLines: wcOrder.coupon_lines, orderMeta: wcOrder.meta_data, feeLines: wcOrder.fee_lines, lineDiscountTotalForeign: lineDiscountTotal, currency,
     resolveResidual: ({ couponTotalForeign, lineDiscountTotalForeign: lineTotal, currency: cur }) => resolveWcOrderLevelDiscount({ couponTotalForeign, lineDiscountTotalForeign: lineTotal, currency: cur }),
   })
-  if (coupons.storeCreditForeign.gt(0)) return 'not-needed'
+  if (coupons.storeCreditForeign.gt(0)) return { outcome: 'not-needed' }
   if (coupons.refusal) return await refuseChanged('its coupons can no longer be classified')
   const amounts = resolveWcAccountingAmountConvention({ pricesIncludeVat: wcOrder.prices_include_tax, shippingForeign: mapWcShipping(wcOrder).shippingForeign, orderLevelDiscountForeign: coupons.orderLevelDiscount })
   const expected: ExpectedHeldInvoice = {
@@ -1697,30 +1709,44 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   const settings = await getAccountingSettings()
   const accounts = { ioss: settings.euVatIossAccount, ddp: settings.euVatDdpAccount, fee: settings.euFeeAccount, rounding: settings.roundingDifferenceAccount }
 
+  // The whole check of a TREATED hold, reading through `client` (the caller's order-locked transaction): the parked payload against the order, and the regime re-resolved from the current facts against what was parked and the order's stamp.
+  const verifyTreated = async (client: Prisma.TransactionClient, parked: HeldSalesInvoicePayload, parkedMarker: Marker): Promise<string | null> => {
+    const difference = heldInvoiceDifference(parked.accountingPayload, expected, true)
+    if (difference !== null) return difference
+    const mode = await readEuVatRegimeMode()
+    if (mode === null) return 'the EU VAT regime mode setting is unreadable'
+    const input = await buildEuVatRegimeInput(client, wcOrder, { ioss: accounts.ioss, ddp: accounts.ddp }, { mode })
+    const stamp = await readEuVatRegimeStamp(client, orderId)
+    if (stamp === null) return 'the order carries no EU VAT regime stamp'
+    const routed = routeFor(stamp, resolveEuVatRegime(input), input)
+    if (!routed.ok) return routed.reason
+    if (routed.route.kind !== parkedMarker.route) return `the order is now on the ${routed.route.kind} route, the hold was treated on ${String(parkedMarker.route)}`
+    if (routed.route.kind === 'scheme') {
+      const vatLines = (parked.accountingPayload.lines as Array<Record<string, unknown>>).filter((l) => l.noTaxKind === 'eu-vat-recovery')
+      if (routed.route.regime !== parkedMarker.regime) return `the order now decides ${routed.route.regime}, the hold was treated as ${String(parkedMarker.regime)}`
+      if (routed.route.vatAccount !== parkedMarker.vatAccount) return `the order's VAT account is now ${routed.route.vatAccount}, the hold was treated on ${String(parkedMarker.vatAccount)}`
+      if (routed.route.schemePostingTaxType !== parkedMarker.schemePostingTaxType) return 'the order\u2019s zero-rated posting type changed'
+      if (vatLines.length !== 1 || !roundMoney(Number(vatLines[0]!.unitAmount), currency).eq(roundMoney(routed.route.vatAmount, currency))) return 'the VAT charged on the order changed'
+    }
+    return null
+  }
+  // The release runs this AGAIN inside its own order-locked transaction, immediately before it enqueues: re-reading the hold and the order's facts there closes the gap between this check and the release.
+  const recheck: HeldRecheck = async (tx) => {
+    const current = await tx.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
+    if (!current || current.id !== row.id || !isHeldSalesInvoicePayload(current.payload)) return { ok: false, reason: 'the held invoice changed while it was being released' }
+    const currentHeld: HeldSalesInvoicePayload = current.payload
+    const currentMarker = markerOf(currentHeld.accountingPayload)
+    if (currentMarker?.applied !== true) return { ok: false, reason: 'the held invoice is no longer marked as treated' }
+    const why = await verifyTreated(tx, currentHeld, currentMarker)
+    return why === null ? { ok: true, held: currentHeld } : { ok: false, reason: why }
+  }
+
   if (marker?.applied === true) {
-    // A TREATED hold: verify, under the order lock, that nothing it rests on has moved.
     const verdict = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
-      const difference = heldInvoiceDifference(held.accountingPayload, expected, true)
-      if (difference !== null) return difference
-      const mode = await readEuVatRegimeMode()
-      if (mode === null) return 'the EU VAT regime mode setting is unreadable'
-      const input = await buildEuVatRegimeInput(db, wcOrder, { ioss: accounts.ioss, ddp: accounts.ddp }, { mode })
-      const stamp = await readEuVatRegimeStamp(db, orderId)
-      if (stamp === null) return 'the order carries no EU VAT regime stamp'
-      const routed = routeFor(stamp, resolveEuVatRegime(input), input)
-      if (!routed.ok) return routed.reason
-      if (routed.route.kind !== marker.route) return `the order is now on the ${routed.route.kind} route, the hold was treated on ${String(marker.route)}`
-      if (routed.route.kind === 'scheme') {
-        const vatLines = (held.accountingPayload.lines as Array<Record<string, unknown>>).filter((l) => l.noTaxKind === 'eu-vat-recovery')
-        if (routed.route.regime !== marker.regime) return `the order now decides ${routed.route.regime}, the hold was treated as ${String(marker.regime)}`
-        if (routed.route.vatAccount !== marker.vatAccount) return `the order's VAT account is now ${routed.route.vatAccount}, the hold was treated on ${String(marker.vatAccount)}`
-        if (routed.route.schemePostingTaxType !== marker.schemePostingTaxType) return 'the order\u2019s zero-rated posting type changed'
-        if (vatLines.length !== 1 || !roundMoney(Number(vatLines[0]!.unitAmount), currency).eq(roundMoney(routed.route.vatAmount, currency))) return 'the VAT charged on the order changed'
-      }
-      return null
+      return await verifyTreated(tx, held, marker)
     })
-    return verdict === null ? 'not-needed' : await refuseChanged(verdict)
+    return verdict === null ? { outcome: 'not-needed', recheck } : await refuseChanged(verdict)
   }
 
   // An UNTREATED hold: the parked lines must be the order's lines before the treatment is put on them.
@@ -1732,11 +1758,11 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     orderId, wcOrder, payload: untreated, mappedLines, connector: chart, accounts, storeCreditForeign: coupons.storeCreditForeign, now: new Date(),
   })
   if (outcome.kind === 'refused') return await refuse(`the EU IOSS/VOEC/DDP treatment refused it: ${outcome.reason}. Fix that, then re-import the order from WooCommerce to try again`)
-  if (outcome.kind === 'skipped') return 'not-needed'
+  if (outcome.kind === 'skipped') return { outcome: 'not-needed' }
   const treated = outcome.payload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
     ? outcome.payload
     : { ...outcome.payload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null } }
-  return await db.$transaction(async (tx) => {
+  const written = await db.$transaction(async (tx) => {
     await lockSalesOrder(tx, orderId)
     const current = await tx.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
     if (!current || current.id !== row.id || !isHeldSalesInvoicePayload(current.payload)) return 'not-needed' as const
@@ -1745,13 +1771,14 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     await tx.shoppingSyncLog.update({ where: { id: row.id }, data: { payload: { ...currentHeld, accountingPayload: treated } as unknown as Prisma.InputJsonValue, errorMessage: null } })
     return 'treated' as const
   }, { maxWait: 5_000, timeout: 20_000 })
+  return written === 'treated' ? { outcome: 'treated', recheck } : { outcome: 'not-needed' }
 }
 
 async function releaseHeldWcSalesInvoice(
   orderId: string,
   wcOrder: HeldReleaseOrderRef,
   invoiceNumber: string,
-  options?: { logFailure?: boolean },
+  options?: { logFailure?: boolean; recheck?: HeldRecheck },
 ): Promise<HeldSalesInvoiceReleaseOutcome> {
   const logFailure = options?.logFailure ?? true
   let row: { id: string; payload: Prisma.JsonValue | null } | null = null
@@ -1871,9 +1898,16 @@ async function releaseHeldWcSalesInvoice(
     const { queueAccountingSyncTxWithOutcome } = await import('@/lib/accounting')
     enqueueOutcome.outcome = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
+      // A re-import's treated hold is verified AGAIN here, under this same lock and immediately before the enqueue: the hold is re-read and the order's facts re-resolved, and what is released is the hold as re-read.
+      let heldNow = held
+      if (options?.recheck) {
+        const rechecked = await options.recheck(tx)
+        if (!rechecked.ok) throw new HeldRecheckRefusal(rechecked.reason)
+        heldNow = rechecked.held
+      }
       const subject = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, customer: { select: { gdprAnonymisedAt: true } } } })
       const erased = Boolean(subject?.erasedAt || subject?.customer?.gdprAnonymisedAt)
-      const releasable = erased ? { ...held, accountingPayload: scrubContactInAccountingPayload(held.accountingPayload) } : held
+      const releasable = erased ? { ...heldNow, accountingPayload: scrubContactInAccountingPayload(heldNow.accountingPayload) } : heldNow
       return queueAccountingSyncTxWithOutcome(tx, {
         type: 'SALES_INVOICE',
         referenceType: 'SalesOrder',
@@ -1888,6 +1922,11 @@ async function releaseHeldWcSalesInvoice(
       })
     }, { maxWait: 5_000, timeout: 20_000 })
   } catch (error) {
+    if (error instanceof HeldRecheckRefusal) {
+      // The order or the hold changed between the check and the release: nothing was queued (the transaction rolled back); the hold is marked so nothing releases it.
+      await markHeldInvoiceOrderChanged(orderId, row.id, error.reason).catch((markError) => { console.error(`[wc-import] could not mark the held sales invoice ${row.id} as changed:`, markError) })
+      return 'not-queued'
+    }
     // Left PENDING on purpose — the release sweep retries it (see retryHeldWcSalesInvoiceReleases).
     await noteHeldReleaseFailure(
       row.id,
