@@ -1702,6 +1702,140 @@ test('a negative-quantity, zero-amount row beside a valid row refuses the whole 
   }
 })
 
+// [mutation: public refunds may carry discount / unattributed lines again; the per-line grossed-up check dropped]
+test('a public refund cannot offset the ceiling with an unlinked sale line and a negative discount line', async () => {
+  const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxForeign: 20 }] })
+  state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget', qty: 1, totalBase: 100, totalForeign: 100, taxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false } }
+  const flags = refundSafeguards({ isInternal: false })
+  const forged = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [
+      { lineId: null, productId: null, description: 'Unattributed', qty: 1, totalForeign: 100, totalBase: 100, lineKind: 'sale' },
+      { lineId: null, productId: null, description: 'Discount', qty: 0, totalForeign: -100, totalBase: -100, lineKind: 'discount' },
+    ],
+    reason: 'forged', creditNotePrefix: 'CN-', ...flags,
+  })
+  assert.equal(forged.success, false)
+  assert.match(forged.success === false ? forged.error : '', /discount line/)
+  assert.equal(state.refunds.length, 0)
+  // An unlinked sale row on its own (with a quantity, so only the attribution rule can refuse it).
+  const unattributed = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: 'product-1', description: 'Unattributed', qty: 1, totalForeign: 10, totalBase: 10, lineKind: 'sale' }],
+    reason: 'unattributed', creditNotePrefix: 'CN-', ...flags,
+  })
+  assert.equal(unattributed.success, false)
+  assert.match(unattributed.success === false ? unattributed.error : '', /line of the order/)
+  // The internal path (storefront sync, chargeback) still sends a mirrored discount line.
+  const internal = await createSalesOrderRefund(createClient(baseState()), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }, { lineId: null, productId: null, description: 'Discount', qty: 0, totalForeign: -10, totalBase: -10, lineKind: 'discount' }],
+    reason: 'internal', creditNotePrefix: 'CN-', ...refundSafeguards({ isInternal: true }),
+  })
+  assert.equal(internal.success, true, internal.success ? '' : internal.error)
+})
+
+test('a public refund whose posting code is worth more than the line was charged at is refused on that line\'s grossed-up amount', async () => {
+  // The line was charged at 0% (net 100, tax 0) but its tax code posts at 20%: refunding the 100 net would credit 120.
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], totalBase: 100, taxBase: 0, taxForeign: 0, taxRateName: 'Standard' }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.2 }],
+  })
+  state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget', qty: 1, totalBase: 100, totalForeign: 100, taxForeign: 0, taxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false } }
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Widget', qty: 1, totalForeign: 100, totalBase: 100, lineKind: 'sale' }],
+    reason: 'grossed up', creditNotePrefix: 'CN-', ...refundSafeguards({ isInternal: false }),
+  })
+  assert.equal(result.success, false)
+  assert.match(result.success === false ? result.error : '', /would be 120\.00 including VAT, more than the 100\.00 it was paid/)
+  assert.equal(state.refunds.length, 0)
+})
+
+// [mutation: NaN allowed for internal callers; discount / shipping rows may name a product or a quantity; row-shape each checked on its own]
+test('row shapes: an internal NaN quantity beside a valid row, and discount or shipping rows with a product or a quantity, each refuse the request', async () => {
+  const valid = { lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }
+  const cases: [string, Array<Record<string, unknown>>, RegExp][] = [
+    ['NaN quantity', [valid, { lineId: 'line-1', productId: 'product-1', description: 'NaN', qty: Number.NaN, totalBase: 10 }], /quantity must be zero or more/],
+    ['discount row with a quantity', [valid, { lineId: null, productId: null, description: 'Discount', qty: 1, totalBase: -5, lineKind: 'discount' }], /money only/],
+    ['shipping row with a product only', [valid, { lineId: null, productId: 'product-1', description: 'Shipping', qty: 0, totalBase: 2, lineKind: 'shipping' }], /money only/],
+    ['shipping row with a quantity only', [valid, { lineId: null, productId: null, description: 'Shipping', qty: 1, totalBase: 2, lineKind: 'shipping' }], /money only/],
+  ]
+  for (const [name, lines, pattern] of cases) {
+    const state = baseState()
+    const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', lines: lines as never, reason: name, creditNotePrefix: 'CN-' })
+    assert.equal(result.success, false, name)
+    assert.match(result.success === false ? result.error : '', pattern, name)
+    assert.equal(state.refunds.length, 0, name)
+  }
+})
+
+// [mutation: a restated discount reversed anyway; shipping base kept from the caller]
+test('a hand refund on an order whose discount was restated is refused; a shipping row\'s stated base is replaced by the derived one', async () => {
+  const restated = baseState({ orders: [{ ...baseState().orders[0], totalBase: 90, totalForeign: 90, taxBase: 0, taxForeign: 0, discountAmount: 10, discountRestatement: { restated: true } } as never] })
+  restated.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget', qty: 1, totalBase: 100, totalForeign: 100 }
+  const r1 = await createSalesOrderRefund(createClient(restated), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Widget', qty: 1, totalForeign: 100, totalBase: 100, lineKind: 'sale' }],
+    reason: 'restated', creditNotePrefix: 'CN-', ...refundSafeguards({ isInternal: false }),
+  })
+  assert.equal(r1.success, false)
+  assert.match(r1.success === false ? r1.error : '', /restated after it was invoiced/)
+  assert.equal(restated.refunds.length, 0)
+  const eur = baseState({ orders: [{ ...baseState().orders[0], currency: 'EUR', fxRateToBase: 2, totalBase: 50, totalForeign: 100, taxBase: 0, taxForeign: 0, shippingForeign: 10 }] })
+  const r2 = await createSalesOrderRefund(createClient(eur), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Shipping', qty: 0, totalForeign: 10, totalBase: 5.005, lineKind: 'shipping' }],
+    reason: 'shipping', creditNotePrefix: 'CN-', ...refundSafeguards({ isInternal: false }),
+  })
+  assert.equal(r2.success, true, r2.success ? '' : r2.error)
+  assert.equal(Number(eur.refundLines[0].totalBase), 5)
+})
+
+// [mutation: earlier refunds not counted in the cumulative gross; an unpriced earlier reversal valued at VAT; the fallback note dropped]
+test('the cumulative credit note counts earlier refunds at their posted rate, and an unpriced earlier reversal conservatively at no VAT, saying so', async () => {
+  // Paid 229 (190 net + 39 VAT). Earlier: line A refunded (120 incl. VAT) and a 10 discount reversal whose code IMS cannot price (counted -10, not -12).
+  // Now line B in full (120): 120 - 10 + 120 = 230 > 229.
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], totalBase: 229, totalForeign: 229, taxBase: 39, taxForeign: 39, taxRatePercent: 0.2, taxRateName: 'Standard' }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.2 }],
+    refunds: [{ id: 'refund-0', orderId: 'order-1', creditNoteNumber: 'CN-0', externalRefundId: null, reason: 'earlier', totalForeign: 90, totalBase: 90, returnWarehouseId: null, totalsBasis: 'NET' }],
+    refundLines: [
+      { id: 'rl-0', refundId: 'refund-0', salesOrderLineId: 'line-a', productId: 'product-a', description: 'A', qty: 1, unitPriceForeign: 100, unitPriceBase: 100, totalForeign: 100, totalBase: 100, lineKind: 'sale', accountingTaxType: 'OUTPUT2' },
+      { id: 'rl-1', refundId: 'refund-0', salesOrderLineId: null, productId: null, description: 'Order discount', qty: 0, unitPriceForeign: 0, unitPriceBase: 0, totalForeign: -10, totalBase: -10, lineKind: 'discount', accountingTaxType: 'UNPRICED' },
+    ] as never,
+  })
+  const std = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
+  state.lines[0] = { id: 'line-a', orderId: 'order-1', productId: 'product-a', description: 'A', qty: 1, totalBase: 100, totalForeign: 100, taxForeign: 20, taxRate: std }
+  state.lines.push({ id: 'line-b', orderId: 'order-1', productId: 'product-b', description: 'B', qty: 1, totalBase: 100, totalForeign: 100, taxForeign: 20, taxRate: std })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-b', productId: 'product-b', description: 'B', qty: 1, totalForeign: 100, totalBase: 100, lineKind: 'sale' }],
+    reason: 'second', creditNotePrefix: 'CN-', ...refundSafeguards({ isInternal: false }),
+  })
+  assert.equal(result.success, false)
+  assert.match(result.success === false ? result.error : '', /including VAT, would exceed what the order was paid.*highest rate on the order/)
+  assert.equal(state.refunds.length, 1)
+})
+
+// [mutation: an unpriceable discount reversal valued at the order's VAT rate instead of none]
+test('a server-added discount reversal whose posting code cannot be priced is valued at no VAT, so the conservative total is held to what was paid', async () => {
+  // One 100 line at 20%, a 10 net discount (VAT 2), paid 108. Default code unknown to the tax table: the reversal counts -10, so 120 - 10 = 110 > 108.
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], totalBase: 108, totalForeign: 108, taxBase: 18, taxForeign: 18, taxRatePercent: 0.2, taxRateName: 'Gone', discountAmount: 10 }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.2 }],
+  })
+  state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget', qty: 1, totalBase: 100, totalForeign: 100, taxForeign: 20, taxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false } }
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Widget', qty: 1, totalForeign: 100, totalBase: 100, lineKind: 'sale' }],
+    reason: 'full', creditNotePrefix: 'CN-', ...refundSafeguards({ isInternal: false }),
+  })
+  assert.equal(result.success, false)
+  assert.match(result.success === false ? result.error : '', /The credit note, including VAT, would exceed what the order was paid/)
+  assert.equal(state.refunds.length, 0)
+})
+
 test('two lines of the same product cannot lend each other units: a line is refunded only up to its own remaining quantity', async () => {
   const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 20, taxBase: 0 }] })
   state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget A', qty: 1, totalBase: 10, totalForeign: 10 }

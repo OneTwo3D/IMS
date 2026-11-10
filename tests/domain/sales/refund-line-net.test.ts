@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
+import { orderDiscountReversal, refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
 
 const line = { qty: 100, net: 0.5 }
 
@@ -41,4 +41,15 @@ test('a refund never exceeds what is left, is cut from what is left, and a fully
   assert.equal(refundableNet({ line: { qty: 4, net: 10 }, prior: { qty: 1, net: 3 }, qty: 1, minorUnits: 2 }), 2.33, 'cut from the 7 left over 3 units, not 10 over 4')
   assert.equal(refundableNet({ line: { qty: 2, net: 10 }, prior: { qty: 2, net: 5 }, qty: 1, minorUnits: 2 }), 0, 'no units left')
   assert.equal(refundableNet({ line: { qty: 2, net: 0.1234 }, prior: { qty: 0, net: 0 }, qty: 2, minorUnits: 2 }), 0.1234, 'the last units take the exact (4 dp) remainder')
+})
+
+const reversal = { discountAmount: 12, amountsIncludeVat: true, vatRate: 0.2, orderSaleNet: 100, priorSaleNet: 0, priorDiscountForeign: 0, priorDiscountBase: 0, refundedSaleNet: 100, fxRateToBase: 1, minorUnits: 2 }
+
+// [mutation: the discount's VAT stripped whenever there is a rate, or never; share ignoring fx in base]
+test('the order discount is stripped of VAT only when the amounts include VAT; the base share follows the booked rate', () => {
+  assert.deepEqual(orderDiscountReversal(reversal), { foreign: 10, base: 10 })
+  assert.deepEqual(orderDiscountReversal({ ...reversal, amountsIncludeVat: false }), { foreign: 12, base: 12 })
+  const half = orderDiscountReversal({ ...reversal, discountAmount: 10, amountsIncludeVat: false, vatRate: 0, refundedSaleNet: 50, fxRateToBase: 2 })
+  assert.deepEqual(half, { foreign: 5, base: 2.5 }, 'a partial share: foreign pro rata, base at the rate')
+  assert.deepEqual(orderDiscountReversal({ ...reversal, discountAmount: 10, amountsIncludeVat: false, vatRate: 0, fxRateToBase: 2 }), { foreign: 10, base: 5 })
 })

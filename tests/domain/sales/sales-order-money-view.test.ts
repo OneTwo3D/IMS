@@ -313,3 +313,22 @@ test('a credit note total is summed from the unrounded amounts and rounded once'
   assert.equal(cn.total.gross, 0.01)
   assert.equal(cn.perLine.length, 2)
 })
+
+// [mutation: the preview's discount VAT sign flipped]
+test('the dialog preview reverses the discount\'s VAT too: 100 at 20% less a 10 discount is 108 incl. VAT', () => {
+  const order: Fixture = { ...manualExclusive20, taxRatePercent: 0.2, lines: [line('a', 'A', 1, 100, 100, 20, 0.2)] }
+  const preview = buildRefundRequest({ ...order, discount: { amount: 10, amountsIncludeVat: false } }, [{ lineId: 'a', qty: 1 }])
+  assert.deepEqual(preview.discountReversal, { net: -10, vat: -2, gross: -12 })
+  assert.equal(preview.total.gross, 108)
+  assert.equal(preview.total.vat, 18)
+})
+
+// [mutation: the estimate marking or the dialog's server-figure note removed]
+test('the order page marks recorded credit-note VAT and totals as estimates, shows the discount reversal row, and the server figure on drift', () => {
+  const src = readFileSync('app/(dashboard)/sales/[id]/so-detail-client.tsx', 'utf8')
+  assert.ok(src.includes("const ESTIMATE_NOTE = 'VAT estimated at the current tax rate; the accounting system holds the posted figure'"))
+  assert.ok(src.includes('title={ESTIMATE_NOTE}>≈ -{money(creditNoteAmounts(moneyOrder, r).total.gross)}</span>'))
+  assert.ok(src.includes('title={ESTIMATE_NOTE}>≈ {money(creditNoteAmounts(moneyOrder, r).perLine[rlIdx].gross)}'))
+  assert.ok(src.includes('const drift = result.recordedNetForeign != null && Math.abs(result.recordedNetForeign - request.total.net) > 0.005'))
+  assert.ok(src.includes('{request.discountReversal.net !== 0 && ('))
+})
