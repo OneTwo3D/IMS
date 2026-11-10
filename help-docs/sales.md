@@ -260,6 +260,8 @@ To process a refund:
 
 Returned stock is added back into the selected warehouse's inventory automatically.
 
+The refund dialog shows, for each line, the **net**, the **VAT** and the **credit note amount including VAT**, and below them the credit note total. If the order had an **order-level discount**, the dialog adds a separate **Order discount reversed** row: IMS gives back the refunded share of the discount itself (you never enter it), so a full refund of a discounted order credits exactly what was paid. The share is worked out on the server when you confirm; if an earlier refund landed first and the recorded figure differs from the preview, the dialog shows the recorded figure. A refund entered by hand can only contain order lines (and the order's shipping charge), never a discount line of its own.
+
 For Kit / Bundle sales, refunds reverse the component-level stock movements. Returned stock, FIFO cost restoration, and shipment reversal all happen against the underlying component products.
 
 ### Returned goods in transit (switched off by default)
