@@ -2747,7 +2747,8 @@ export async function runWmsOrderPushSweepCore(
     // Warehouse notes that were never delivered are retried until one is posted. The notice itself stays until then. There is no remote
     // idempotency key on a note, so a duplicate is possible in exactly two cases: the note posted and recording its delivery failed, or
     // two overlapping sweeps retried the same note. A repeated note is harmless; a lost one is not, so that is the direction chosen.
-    for (const pending of (await port.noticesAwaitingComment?.(connectorId, batchSize).catch(() => [])) ?? []) {
+    // Stands down while the producer-side hold is on: every note would only be shadowed, and the oldest ones would crowd the batch.
+    for (const pending of warehouseHeld ? [] : (await port.noticesAwaitingComment?.(connectorId, batchSize).catch(() => [])) ?? []) {
       const note = wmsNoticeComment(pending.intent, pending.state === 'MERGED')
       if ((await postConflictComment(pending.externalOrderId, note, pending.orderId)) === 'posted') {
         const ts = now()
