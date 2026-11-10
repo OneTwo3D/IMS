@@ -162,6 +162,16 @@ test('reconcile: a merged survivor is never adopted (it holds other orders too)'
   reset()
   const { reconcileMintsoftAmbiguousCreate } = await push()
   searchRows = [{ ID: 777, OrderNumber: 'WC-1001+WC-1002', ExternalOrderReference: 'REF-1001', ClientId: CLIENT }]
+  const result = await reconcileMintsoftAmbiguousCreate(REF)
+  assert.equal(result.kind, 'UNRESOLVED', 'not NONE: the generic "link it or cancel it" guidance would be wrong for a merged order')
+  const reason = (result as { reason: string }).reason
+  assert.match(reason, /merged this order with another into order WC-1001\+WC-1002 \(id 777\)/, 'names the survivor')
+  assert.match(reason, /Do not cancel that order/, 'and never suggests cancelling it')
+  // our number in ANY position
+  searchRows = [{ ID: 778, OrderNumber: 'WC-1002+WC-1001', ExternalOrderReference: 'REF-1002', ClientId: CLIENT }]
+  assert.equal((await reconcileMintsoftAmbiguousCreate(REF)).kind, 'UNRESOLVED')
+  // a merged order that does NOT contain our number as an exact part, or another client's, is nothing to do with us
+  searchRows = [{ ID: 779, OrderNumber: 'WC-10010+WC-1002', ExternalOrderReference: 'REF-X', ClientId: CLIENT }, { ID: 780, OrderNumber: 'WC-1001+WC-1003', ExternalOrderReference: 'REF-Y', ClientId: 99 }]
   assert.deepEqual(await reconcileMintsoftAmbiguousCreate(REF), { kind: 'NONE' })
 })
 

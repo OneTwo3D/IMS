@@ -198,3 +198,14 @@ test('replay: the link is a compare-and-set - a link another worker moved on is 
   assert.equal(result.success, false)
   assert.equal(state.links[0].externalOrderId, 'wms-99')
 })
+
+test('replay: the merged-order guidance is shown to the operator unchanged', async () => {
+  reset([ambiguousCreate()])
+  state.presence = 'FOUND'
+  state.reconcile = { kind: 'UNRESOLVED', reason: "Mintsoft merged this order with another into order WC-1001+WC-1002 (id 777), which also holds the other order's goods, so IMS did not link it. Do not cancel that order on this order's behalf" }
+  const result = await (await loadAction())('so-1')
+  assert.equal(result.success, false)
+  assert.match(result.error!, /merged this order with another into order WC-1001\+WC-1002 \(id 777\)/)
+  assert.match(result.error!, /Do not cancel that order/)
+  assert.equal(state.links[0].state, 'AMBIGUOUS_CREATE')
+})

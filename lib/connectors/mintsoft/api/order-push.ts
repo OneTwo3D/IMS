@@ -271,6 +271,21 @@ export async function reconcileMintsoftAmbiguousCreate(
     if (rowClient === null) return { kind: 'UNRESOLVED', reason: 'a Mintsoft search result carries no ClientId, so ownership cannot be shown' }
     if (rowClient === String(clientId)) ours.push(row)
   }
+  // A same-client MERGED order that lists OUR exact number as one of its parts means Mintsoft merged this order with another: the create
+  // landed and was absorbed. It is never adopted and never "absent": the survivor is named, and the guidance does not suggest cancelling
+  // it, because that would take the other order's goods with it.
+  const mergedInto = ours.find((row) => {
+    const number = toStr(row.OrderNumber)
+    return number !== null && number.includes('+') && mintsoftMergedParts(number).includes(reference.orderNumber)
+  })
+  if (mergedInto) {
+    const survivorNumber = toStr(mergedInto.OrderNumber)
+    const survivorId = toStr(mergedInto.ID ?? mergedInto.Id ?? mergedInto.id)
+    return {
+      kind: 'UNRESOLVED',
+      reason: `Mintsoft merged this order with another into order ${survivorNumber}${survivorId ? ` (id ${survivorId})` : ''}, which also holds the other order's goods, so IMS did not link it. Do not cancel that order on this order's behalf`,
+    }
+  }
   const matches = ours.filter((row) => {
     const number = toStr(row.OrderNumber)
     if (number && number.includes('+')) return false // a merged survivor holds other orders too

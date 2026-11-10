@@ -704,3 +704,13 @@ test('R7: after the retry budget an inconclusive merge check raises the operator
   assert.ok(last.updates.some((u) => u.data.attempts === 0), 'the counter is reset')
   assert.notEqual(last.updates.find((u) => u.data.state)?.data.state, 'CANCELLED')
 })
+
+test('R12: the merged-order guidance reaches the parked link verbatim, and the generic cancel-it text is not used', async () => {
+  const reason = "Mintsoft merged this order with another into order WC-1001+WC-1002 (id 777), which also holds the other order's goods, so IMS did not link it. Do not cancel that order on this order's behalf"
+  const { port, updates } = makePort({ ambiguous: [ambiguousLink()] })
+  const wms = connector({ reconcile: async () => ({ kind: 'UNRESOLVED', reason }), probe: async () => 'FOUND' })
+  await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
+  assert.equal(updates.length, 1)
+  assert.match(String(updates[0].data.lastError), /merged this order with another into order WC-1001\+WC-1002 \(id 777\)/)
+  assert.doesNotMatch(String(updates[0].data.lastError), /cancel it in the WMS/i)
+})
