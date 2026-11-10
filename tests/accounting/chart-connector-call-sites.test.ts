@@ -501,9 +501,10 @@ test('[o3d-j625 r2] every IN-TRANSACTION accounting enqueue in app/ and lib/ nam
   // lib/domain/purchasing/purchase-invoice-update-sync.ts and lib/domain/sales/allocation-service.ts.
   // A floor rather than an equality so a new enqueue does not fail this test for the wrong reason.
   assert.ok(
-    // o3d-j625 r6: 17 — the stock adjustment joined (review M3). The floor is the count.
-    sites.length >= 17,
-    `expected the 17 in-transaction enqueue call sites, found `
+    // o3d-j625 r6: 17 — the stock adjustment joined (review M3). 16 now: cancelling a part-received purchase order closes it
+    // short and no longer queues a reversal journal. The floor is the count.
+    sites.length >= 16,
+    `expected the 16 in-transaction enqueue call sites, found `
     + `${sites.length}. The detector is not examining the source it claims to.`,
   )
 
@@ -554,7 +555,6 @@ test('[o3d-j625 r2] the transactional census names the files it examined, so a s
     'lib/cost-layers.ts',
     'lib/domain/accounting/invoice-payment-enqueue.ts',
     'lib/domain/inventory/stock-adjustment-apply.ts',
-    'lib/domain/purchasing/cancellation-service.ts',
     'lib/domain/purchasing/landed-cost-service.ts',
     'lib/domain/purchasing/purchase-invoice-update-sync.ts',
     'lib/domain/sales/allocation-service.ts',

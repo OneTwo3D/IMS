@@ -100,7 +100,7 @@ export const POSTING_REFUSAL_KINDS = {
   },
   purchase_order_cancellation_reversal: {
     type: 'INVENTORY_ADJUSTMENT', referenceType: 'PurchaseOrder', clearing: 'manual',
-    how: 'The reversal is queued once, when the purchase order is cancelled, which cannot happen twice.',
+    how: 'Retired. Cancelling a part-received purchase order now closes it short and queues no reversal, so nothing raises this posting any more; the kind stays so a row already in the inbox can still be marked handled.',
   },
   supplier_return_reversal: {
     type: 'INVENTORY_ADJUSTMENT', referenceType: 'PurchaseReturn', clearing: 'manual',

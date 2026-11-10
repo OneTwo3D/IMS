@@ -244,7 +244,6 @@ test('[o3d-j625 r3] the census covers every file r3 enumerated', () => {
     'lib/cost-layers.ts',
     'lib/domain/accounting/invoice-payment-enqueue.ts',
     'lib/domain/inventory/stock-adjustment-apply.ts',
-    'lib/domain/purchasing/cancellation-service.ts',
     'lib/domain/purchasing/landed-cost-service.ts',
     'lib/domain/purchasing/purchase-invoice-update-sync.ts',
     'lib/domain/sales/allocation-service.ts',

@@ -4,6 +4,7 @@ import test, { mock } from 'node:test'
 import { config } from 'dotenv'
 import * as fixtures from './po-landed-fixtures'
 import type { SeededPo } from './po-landed-fixtures'
+import { PO_EDIT_REFUSED_STATUS_MESSAGE } from '@/lib/domain/purchasing/po-edit-plan'
 
 /**
  * o3d-fgu3 — THE DRAFT PURCHASE-ORDER EDIT IS ONE TRANSACTION, PARENT FIRST, STATUS RE-READ UNDER THE LOCK.
@@ -293,15 +294,15 @@ test(
       // The edit is blocked on the parent lock, so its OUTER status read already saw DRAFT.
       const blocked = await waitForBlockedBackend(probe, holderPid, PARENT_LOCK, 'A4')
       console.log(`# A4: edit backend ${blocked.pid} has passed the DRAFT check and is parked on the lock`)
-      await holder.query(`UPDATE purchase_orders SET status = 'PO_SENT' WHERE id = $1`, [po.poId])
+      await holder.query(`UPDATE purchase_orders SET status = 'CLOSED' WHERE id = $1`, [po.poId])
       await holder.query('COMMIT')
       const result = await action
       const after = await snapshot(po.poId)
       console.log(`# A4: success=${result.success} error=${result.error} status=${after.status} lines unchanged=${JSON.stringify(after.lines) === JSON.stringify(before.lines)}`)
-      assert.equal(result.success, false, 'an order sent while the edit waited must not be edited')
-      assert.equal(result.error, 'Only DRAFT POs can be edited')
-      assert.equal(after.status, 'PO_SENT')
-      assert.deepEqual(after.lines, before.lines, 'the sent order keeps its lines')
+      assert.equal(result.success, false, 'an order closed while the edit waited must not be edited')
+      assert.equal(result.error, PO_EDIT_REFUSED_STATUS_MESSAGE)
+      assert.equal(after.status, 'CLOSED')
+      assert.deepEqual(after.lines, before.lines, 'the closed order keeps its lines')
     } finally {
       await holder.query('ROLLBACK').catch(() => {})
       if (action) await action.catch(() => {})
@@ -311,16 +312,16 @@ test(
 )
 
 test(
-  'A4 isolating arm: an order already PO_SENT is refused by the outer check (so the race arm above is the only proof of the in-transaction re-read)',
+  'A4 isolating arm: an order already CLOSED is refused by the outer check (so the race arm above is the only proof of the in-transaction re-read)',
   SKIP,
   async () => {
     const { updatePurchaseOrder } = await import('@/app/actions/purchase-orders')
     const { db } = await import('@/lib/db')
     const { po } = await seedDraft('a4ctl', [3])
-    await db.purchaseOrder.update({ where: { id: po.poId }, data: { status: 'PO_SENT' } })
+    await db.purchaseOrder.update({ where: { id: po.poId }, data: { status: 'CLOSED' } })
     const result = await updatePurchaseOrder(po.poId, editFor(po, [9]))
     assert.equal(result.success, false)
-    assert.equal(result.error, 'Only DRAFT POs can be edited')
+    assert.equal(result.error, PO_EDIT_REFUSED_STATUS_MESSAGE)
   },
 )
 

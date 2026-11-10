@@ -122,6 +122,26 @@ test('purchase order state machine includes manual, receipt, return, and cancel 
   )
 })
 
+test('purchase order: every stage from RFQ onwards can be closed and cancelled, a part-received one both ways, and a return cannot strand the order', () => {
+  for (const from of ['RFQ_SENT', 'QUOTE_RECEIVED', 'PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'] as const) {
+    assert.equal(canTransitionPurchaseOrder(from, 'CLOSED'), true, `${from} -> CLOSED`)
+    assert.equal(canTransitionPurchaseOrder(from, 'CANCELLED'), true, `${from} -> CANCELLED`)
+  }
+  // A draft was never ordered: Cancel is its only exit.
+  assert.equal(canTransitionPurchaseOrder('DRAFT', 'CLOSED'), false)
+  // A fully received order is closed, not cancelled (cancelling would imply the received stock goes).
+  assert.equal(canTransitionPurchaseOrder('RECEIVED', 'CANCELLED'), false)
+  // An order already stranded in PARTIALLY_RETURNED by an old return can be reopened, closed or cancelled.
+  for (const to of ['PARTIALLY_RECEIVED', 'CLOSED', 'CANCELLED', 'RETURNED'] as const) {
+    assert.equal(canTransitionPurchaseOrder('PARTIALLY_RETURNED', to), true, `PARTIALLY_RETURNED -> ${to}`)
+  }
+  for (const terminal of ['CLOSED', 'CANCELLED', 'RETURNED'] as const) {
+    for (const to of ['PARTIALLY_RECEIVED', 'CLOSED', 'CANCELLED', 'PO_SENT'] as const) {
+      assert.equal(canTransitionPurchaseOrder(terminal, to), false, `${terminal} -> ${to}`)
+    }
+  }
+})
+
 test('refund state machine documents the current derived lifecycle', () => {
   assert.equal(canTransitionRefund('RECORDED', 'CREDIT_NOTE_SYNCED'), true)
   assert.equal(canTransitionRefund('RECORDED', 'PAID'), true)
