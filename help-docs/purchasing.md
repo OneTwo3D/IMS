@@ -164,7 +164,8 @@ original PO FX rate and is wrapped in a single transaction that:
   goes out carries the corrected bill. No update is queued and nothing is posted twice. If the first
   posting is being sent, was sent and has not been linked back to the bill yet, or failed after a request
   left, the edit is **refused** ("Nothing was saved"): wait until the posting has finished on the sync
-  page, then edit the bill.
+  page, then edit the bill. A bill from before postings were keyed to the bill (its posting is keyed to the
+  purchase order) is refreshed only when it is provably that bill's and unsent, otherwise it is refused the same way.
 
 If the bill was previously synced and the accounting connector rejects the update (e.g. the
 external bill is paid, locked, or voided), an amber **rejected sync** alert appears at the top of
