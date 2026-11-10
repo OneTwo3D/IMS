@@ -42,6 +42,8 @@ type Seed = {
   failUpsertCall?: number
   /** The link as it is NOW, for the conditional notice write: a link that moved on since it was read matches nothing. */
   linkNow?: { state: string; externalOrderId: string }
+  /** Notices whose warehouse note was never delivered, as the real port would list them. */
+  pendingNotices?: Array<{ id: string; orderId: string; externalOrderId: string; state: 'SYNCED' | 'MERGED'; intent: 'HOLD' | 'CANCEL' }>
 }
 
 function makePort(seed: Seed) {
@@ -49,6 +51,7 @@ function makePort(seed: Seed) {
   const updates: Array<{ id: string; data: Record<string, unknown>; ifState?: string }> = []
   const events: WmsMutationEventInput[] = []
   let upsertCalls = 0
+  const cleared = { count: 0 }
   const port: WmsOrderPushPort = {
     activeBindings: async () => BINDINGS,
     releasableHeldOrders: async () => [],
@@ -68,6 +71,8 @@ function makePort(seed: Seed) {
     },
     updateLink: async (id, data) => { updates.push({ id, data }) },
     updateLinkIfState: async (id, fromState, data) => { updates.push({ id, data, ifState: fromState }); return true },
+    clearStaleNotices: async () => { cleared.count += 1; return 0 },
+    noticesAwaitingComment: async () => seed.pendingNotices ?? [],
     ...(seed.linkNow
       ? {
         updateLinkIfLinked: async (id: string, expect: { state: string; externalOrderId: string }, data: Record<string, unknown>) => {
@@ -79,7 +84,7 @@ function makePort(seed: Seed) {
       : {}),
     recordEvent: async (event) => { events.push(event) },
   }
-  return { port, upserts, updates, events }
+  return { port, upserts, updates, events, cleared }
 }
 
 function ambiguousLink(overrides: Partial<WmsPushAmbiguousCreateLink> = {}): WmsPushAmbiguousCreateLink {
@@ -193,7 +198,7 @@ test('H2: a hold for a MERGED link never cancels the surviving order; a person i
   assert.deepEqual(wms.calls.cancel, [], 'the survivor holds other orders\' goods and is never cancelled for one of them')
   assert.equal(r.held, 0)
   assert.equal(r.operatorNotices, 1)
-  assert.equal(updates.length, 1)
+  assert.equal(updates.length, 2, 'the notice, then the delivery stamp of its note')
   assert.ok(updates[0].data.holdNoticeAt)
   assert.equal(updates[0].data.state, undefined, 'the link is not moved')
   assert.match(String(updates[0].data.lastError), /MERGED order/)
@@ -246,7 +251,7 @@ test('H4: a hold past NEW keeps the link LIVE (not DEAD_LETTER), records the not
   const r = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
   assert.equal(r.deadLettered, 0)
   assert.equal(r.operatorNotices, 1)
-  assert.equal(updates.length, 1)
+  assert.equal(updates.length, 2, 'the notice, then the delivery stamp of its note')
   assert.equal(updates[0].data.state, undefined, 'the link stays SYNCED, so dispatch polling carries on and the despatch is recorded')
   assert.ok(updates[0].data.holdNoticeAt)
   assert.match(String(updates[0].data.lastError), /past NEW .*NOT_CANCELLABLE/)
@@ -399,7 +404,7 @@ test('R4: the warehouse note and the notice texts carry no status or error text 
   await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
   assert.equal(comments.length, 1)
   assert.equal(comments[0].comment.includes('ZZ-SENTINEL-STATUS'), false)
-  assert.equal(updates.length, 1)
+  assert.equal(updates.length, 2, 'the notice, then the delivery stamp of its note')
 })
 
 test('R2: the exception inbox lists a cancel notice by the cancel pass\'s OWN order predicate, not a copy of it', async () => {
@@ -424,4 +429,55 @@ test('R1: a cancelled split order whose PRIMARY row reads not-despatched but who
   assert.deepEqual(partials, [])
   assert.equal(counters.errors, 1)
   assert.match(errors[0], /after IMS cancelled it/)
+})
+
+// ---------------------------------------------------------------- round 2: stale notices, note delivery -----------------------
+
+test('R2-1: stale notices are cleared at the start of every hold pass, so a later re-hold is attempted afresh', async () => {
+  const { port, cleared } = makePort({})
+  await quiet(() => runWmsOrderPushSweepCore(connector().connector, 'mintsoft', port, { now: NOW }))
+  assert.equal(cleared.count, 1)
+})
+
+test('R2-2: a warehouse note that FAILED leaves the notice in place and undelivered', async () => {
+  const { port, updates } = makePort({ holdable: [{ id: 'link-1', orderId: 'so-3', externalOrderId: 'wms-3' }] })
+  const wms = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }) })
+  const failing = { ...wms.connector, addOrderComment: async () => { throw new Error('comments endpoint down') } }
+  const r = await quiet(() => runWmsOrderPushSweepCore(failing, 'mintsoft', port, { now: NOW }))
+  assert.equal(r.operatorNotices, 1, 'the notice stays')
+  assert.equal(updates.length, 1, 'and nothing stamps the note as delivered')
+  assert.ok(updates[0].data.holdNoticeAt)
+  assert.equal(updates[0].data.holdNoticeCommentAt, null)
+})
+
+test('R2-2: a delivered note is stamped; a 404 notice (no note) is delivered by definition', async () => {
+  const delivered = makePort({ holdable: [{ id: 'link-1', orderId: 'so-3', externalOrderId: 'wms-3' }] })
+  await quiet(() => runWmsOrderPushSweepCore(connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }), comments: [] }).connector, 'mintsoft', delivered.port, { now: NOW }))
+  assert.equal(delivered.updates.length, 2)
+  assert.ok(delivered.updates[1].data.holdNoticeCommentAt, 'stamped after the note posted')
+  const notFound = makePort({ holdable: [{ id: 'link-1', orderId: 'so-3', externalOrderId: 'wms-3' }] })
+  await quiet(() => runWmsOrderPushSweepCore(connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }) }).connector, 'mintsoft', notFound.port, { now: NOW }))
+  assert.ok(notFound.updates[0].data.holdNoticeCommentAt)
+})
+
+test('R2-2: an undelivered note is RETRIED on a later sweep with the same text, and stamped once posted', async () => {
+  const comments: Array<{ externalOrderId: string; comment: string }> = []
+  const pending = [
+    { id: 'link-1', orderId: 'so-3', externalOrderId: 'wms-3', state: 'SYNCED' as const, intent: 'HOLD' as const },
+    { id: 'link-2', orderId: 'so-4', externalOrderId: 'surv-4', state: 'MERGED' as const, intent: 'CANCEL' as const },
+  ]
+  const { port, updates } = makePort({ pendingNotices: pending })
+  const r = await quiet(() => runWmsOrderPushSweepCore(connector({ comments }).connector, 'mintsoft', port, { now: NOW }))
+  assert.equal(r.noticeCommentsRetried, 2)
+  assert.deepEqual(comments.map((c) => c.externalOrderId), ['wms-3', 'surv-4'])
+  assert.match(comments[0].comment, /ON HOLD/)
+  assert.match(comments[1].comment, /merged into this one has been CANCELLED/)
+  assert.ok(updates.find((u) => u.id === 'link-1')!.data.holdNoticeCommentAt)
+  assert.ok(updates.find((u) => u.id === 'link-2')!.data.cancelNoticeCommentAt)
+  // ...and one that fails again is simply left for the next sweep.
+  const again = makePort({ pendingNotices: [pending[0]] })
+  const failing = { ...connector().connector, addOrderComment: async () => { throw new Error('down') } }
+  const r2 = await quiet(() => runWmsOrderPushSweepCore(failing, 'mintsoft', again.port, { now: NOW }))
+  assert.equal(r2.noticeCommentsRetried, undefined)
+  assert.deepEqual(again.updates, [])
 })

@@ -3938,6 +3938,9 @@ model WmsOrderPushLink {
   /// the link is pointed at a new warehouse order.
   holdNoticeAt        DateTime? @map("hold_notice_at")
   cancelNoticeAt      DateTime? @map("cancel_notice_at")
+  /// When the warehouse-visible note for that notice was actually posted. Null while undelivered: the push sweep retries it.
+  holdNoticeCommentAt   DateTime? @map("hold_notice_comment_at")
+  cancelNoticeCommentAt DateTime? @map("cancel_notice_comment_at")
   createdAt           DateTime          @default(now())
   updatedAt           DateTime          @updatedAt
 

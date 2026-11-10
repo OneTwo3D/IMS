@@ -197,3 +197,55 @@ test('REAL PORT: every link the cancel pass notices is listed by the inbox predi
   const cancellable = (await d.sweep.createPrismaWmsOrderPushPort().cancellableLinks('mintsoft', 500)).filter((l) => [refunded.orderId, plain.orderId, cancelled.orderId].includes(l.orderId))
   assert.equal(cancellable.length, 0, 'already noticed, so the pass does not retry them')
 })
+
+test('REAL PORT: release then RE-HOLD - the stale hold notice is cleared, and the second hold is sent and noticed again', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `rhd${randomUUID().slice(0, 8)}`
+  const s = await seed(d, tag, 'ON_HOLD')
+  t.after(() => cleanup(d, s))
+  await d.db.wmsOrderPushLink.create({ data: { orderId: s.orderId, connector: 'mintsoft', state: 'SYNCED', externalOrderId: 'r-1', externalOrderNumber: 'MS-R1', pushedAt: new Date() } })
+  const double = connector({ cancel: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }) })
+  const run = () => d.sweep.runWmsOrderPushSweepCore(double.connector as never, 'mintsoft', d.sweep.createPrismaWmsOrderPushPort(), { batchSize: 500 })
+
+  assert.equal((await run()).operatorNotices, 1)
+  assert.equal(double.calls.cancel, 1)
+  assert.equal((await run()).operatorNotices, undefined, 'still the same hold: one attempt')
+
+  await d.db.salesOrder.update({ where: { id: s.orderId }, data: { status: 'PROCESSING' } })
+  await run()
+  const cleared = await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { orderId: s.orderId } })
+  assert.equal(cleared.holdNoticeAt, null, 'the hold was released: the old notice no longer looks current')
+  assert.equal(cleared.holdNoticeCommentAt, null)
+
+  await d.db.salesOrder.update({ where: { id: s.orderId }, data: { status: 'ON_HOLD' } })
+  const again = await run()
+  assert.equal(again.operatorNotices, 1, 'the second hold is noticed afresh')
+  assert.equal(double.calls.cancel, 2, 'and sent to the warehouse again')
+  assert.ok((await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { orderId: s.orderId } })).holdNoticeAt)
+})
+
+test('REAL PORT: a failed warehouse note is retried on a later sweep and then stamped delivered; the notice stays throughout', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `ncm${randomUUID().slice(0, 8)}`
+  const s = await seed(d, tag, 'ON_HOLD')
+  t.after(() => cleanup(d, s))
+  await d.db.wmsOrderPushLink.create({ data: { orderId: s.orderId, connector: 'mintsoft', state: 'SYNCED', externalOrderId: 'n-1', externalOrderNumber: 'MS-N1', pushedAt: new Date() } })
+  const double = connector({ cancel: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }) })
+  let commentOk = false
+  const flaky = { ...double.connector, addOrderComment: async () => { double.calls.comment += 1; if (!commentOk) throw new Error('comments endpoint down') } }
+  const run = () => d.sweep.runWmsOrderPushSweepCore(flaky as never, 'mintsoft', d.sweep.createPrismaWmsOrderPushPort(), { batchSize: 500 })
+
+  await run()
+  let link = await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { orderId: s.orderId } })
+  assert.ok(link.holdNoticeAt)
+  assert.equal(link.holdNoticeCommentAt, null, 'the note failed: not delivered')
+  commentOk = true
+  const second = await run()
+  assert.equal(second.noticeCommentsRetried, 1)
+  link = await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { orderId: s.orderId } })
+  assert.ok(link.holdNoticeAt, 'the notice is still there')
+  assert.ok(link.holdNoticeCommentAt, 'and the note is now stamped delivered')
+  await run()
+  assert.equal(double.calls.comment, 2, 'one failed attempt, one delivery, nothing after')
+  assert.equal(double.calls.cancel, 1)
+})

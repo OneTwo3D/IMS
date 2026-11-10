@@ -338,6 +338,8 @@ export type WmsOrderPushSweepResult = {
   ambiguousCreateAdopted?: number
   /** PRESENT ONLY WHEN NON-ZERO: holds / cancellations the warehouse could not honour, left on the link as an operator notice (the link stays live). */
   operatorNotices?: number
+  /** PRESENT ONLY WHEN NON-ZERO: warehouse notes for earlier notices that were delivered on this sweep after an earlier failure. */
+  noticeCommentsRetried?: number
   /**
    * The producer-side hold kept this many units of work as a shadow instead of producing them: an order create, an amendment, a
    * hold, a cancellation or a note. PRESENT ONLY WHEN NON-ZERO, so a sweep on an installation that does not enforce the hold
@@ -750,6 +752,9 @@ type LinkWrite = {
   reconcileCheckedAt?: Date | null
   holdNoticeAt?: Date | null
   cancelNoticeAt?: Date | null
+  /** When the warehouse-visible note for that notice was DELIVERED. Null while undelivered (retried by the sweep). */
+  holdNoticeCommentAt?: Date | null
+  cancelNoticeCommentAt?: Date | null
 }
 
 /**
@@ -773,6 +778,8 @@ const RESET_DISPATCH_FAILURES = {
   // A hold / cancel notice belonged to the PREVIOUS warehouse order; the fresh one has had no hold or cancel refused.
   holdNoticeAt: null,
   cancelNoticeAt: null,
+  holdNoticeCommentAt: null,
+  cancelNoticeCommentAt: null,
 } satisfies LinkWrite
 
 /** Where the held create pass's walk stands (a Setting). Cleared when a page comes back short. */
@@ -804,6 +811,20 @@ export type WmsPushRevalidateLink = {
  * port's where-clause to have filtered.
  */
 export type WmsPushAmbiguousCreateLink = WmsPushRevalidateLink
+
+/**
+ * The ONE warehouse-visible note per notice kind (fixed wording, no warehouse or error text). The retry pass re-derives a note from
+ * (intent, merged) alone, so the text a failed note is retried with is exactly the text it would first have carried.
+ */
+const WMS_NOTICE_COMMENTS = {
+  HOLD_MERGED: 'IMS: An order that was merged into this one has been placed ON HOLD in IMS. IMS has not cancelled this order because it holds other orders\' goods. Please take the held order\'s items out of it if you can, or raise a query.',
+  HOLD_PAST_NEW: 'IMS: This order has been placed ON HOLD in IMS but is already being fulfilled here and could not be auto-cancelled. Please pause it if possible, or raise a cancellation query.',
+  CANCEL_MERGED: 'IMS: An order that was merged into this one has been CANCELLED / fully refunded in IMS. IMS has not cancelled this order because it holds other orders\' goods. Please take the cancelled order\'s items out of it before despatch.',
+  CANCEL_PAST_NEW: 'IMS: This order has been cancelled / fully refunded in IMS but is already being fulfilled here and could not be auto-cancelled. Please raise a cancellation query.',
+} as const
+export function wmsNoticeComment(intent: 'HOLD' | 'CANCEL', merged: boolean): string {
+  return WMS_NOTICE_COMMENTS[`${intent}_${merged ? 'MERGED' : 'PAST_NEW'}` as keyof typeof WMS_NOTICE_COMMENTS]
+}
 
 /**
  * Which ORDERS the cancel pass pulls from the warehouse: cancelled in IMS, or fully refunded and not yet despatched. ONE definition:
@@ -1007,6 +1028,14 @@ export interface WmsOrderPushPort {
    * predicate and a stale one can never land on a link that now means something else. Optional so existing test ports keep
    * compiling; when absent the write is the plain `updateLink`.
    */
+  /**
+   * Notices that no longer describe the order: the hold notice once the IMS order has left ON_HOLD, the cancel notice once it is no
+   * longer cancellable. Cleared (with their note-delivery stamps) so a LATER hold or cancel of the same warehouse order is sent and
+   * noticed afresh instead of being skipped behind a stale notice. Optional so existing test ports keep compiling.
+   */
+  clearStaleNotices?(connector: string): Promise<number>
+  /** Notices whose warehouse note was never delivered (the comment failed, was shadowed, or the connector could not post). */
+  noticesAwaitingComment?(connector: string, limit: number): Promise<Array<{ id: string; orderId: string; externalOrderId: string; state: 'SYNCED' | 'MERGED'; intent: 'HOLD' | 'CANCEL' }>>
   updateLinkIfLinked?(id: string, expect: { state: 'SYNCED' | 'MERGED'; externalOrderId: string }, data: LinkWrite): Promise<boolean>
   /**
    * o3d-2k5r r2 — apply `data` ONLY while the link is still in `fromState`; false when it has
@@ -1182,8 +1211,12 @@ export async function runWmsOrderPushSweepCore(
     spec: { wmsStatus: string; summary: string; comment: string | null },
     ts: Date,
   ) => {
+    // A notice that needs no warehouse note (a 404) is delivered by definition; the others are stamped only once the note is posted.
+    const noteNotNeeded = !spec.comment
     const noticeWrite = {
-      ...(intent === 'HOLD' ? { holdNoticeAt: ts } : { cancelNoticeAt: ts }),
+      ...(intent === 'HOLD'
+        ? { holdNoticeAt: ts, holdNoticeCommentAt: noteNotNeeded ? ts : null }
+        : { cancelNoticeAt: ts, cancelNoticeCommentAt: noteNotNeeded ? ts : null }),
       lastError: reason,
       lastAttemptAt: ts,
     }
@@ -1203,7 +1236,13 @@ export async function runWmsOrderPushSweepCore(
       after: { state: link.state ?? 'SYNCED', wmsStatus: spec.wmsStatus, operatorNotice: intent },
       error: reason,
     })
-    if (spec.comment && link.externalOrderId) await postConflictComment(link.externalOrderId, spec.comment, link.orderId)
+    if (spec.comment && link.externalOrderId) {
+      // The notice stays on the link either way. Only a note that was actually posted is stamped delivered; a failed, shadowed or
+      // unsupported one is retried by the retry pass on a later sweep.
+      if ((await postConflictComment(link.externalOrderId, spec.comment, link.orderId)) === 'posted') {
+        await port.updateLink(link.id, intent === 'HOLD' ? { holdNoticeCommentAt: ts } : { cancelNoticeCommentAt: ts }).catch(() => {})
+      }
+    }
   }
 
   /**
@@ -1221,6 +1260,7 @@ export async function runWmsOrderPushSweepCore(
   let presenceProbeBudget = PRESENCE_PROBE_BUDGET
   let ambiguousCreateAdopted = 0
   let operatorNoticeCount = 0
+  let noticeCommentsRetried = 0
   const probeWarehouseAbsence = async (reference: string): Promise<{ absent: boolean; reason: string }> => {
     if (!connector.probeOrderPresence) {
       return { absent: false, reason: 'the active WMS connector cannot check whether such an order exists, so it cannot be re-queued automatically — check the WMS and resolve it by hand' }
@@ -2700,6 +2740,21 @@ export async function runWmsOrderPushSweepCore(
   // --- Hold pass: an IMS-held order that was pushed is pulled back from the WMS
   // (cancelled) and parked as HELD so a later release re-pushes it. ---
   if (connector.cancelOrder) {
+    // Notices describe ONE hold or cancel. Once the IMS order has left that state they are history: cleared here so a later re-hold or
+    // re-cancel of the same warehouse order is attempted and noticed afresh. (A release and re-hold inside ONE sweep interval cannot be
+    // told apart from the original hold; the next sweep sees the order still held and the old notice stands.)
+    await port.clearStaleNotices?.(connectorId).catch((e) => console.error('[wms-order-push] failed to clear stale notices', e))
+    // Warehouse notes that were never delivered are retried until one is posted. The notice itself stays until then. There is no remote
+    // idempotency key on a note, so a duplicate is possible in exactly two cases: the note posted and recording its delivery failed, or
+    // two overlapping sweeps retried the same note. A repeated note is harmless; a lost one is not, so that is the direction chosen.
+    for (const pending of (await port.noticesAwaitingComment?.(connectorId, batchSize).catch(() => [])) ?? []) {
+      const note = wmsNoticeComment(pending.intent, pending.state === 'MERGED')
+      if ((await postConflictComment(pending.externalOrderId, note, pending.orderId)) === 'posted') {
+        const ts = now()
+        await port.updateLink(pending.id, pending.intent === 'HOLD' ? { holdNoticeCommentAt: ts } : { cancelNoticeCommentAt: ts }).catch(() => {})
+        noticeCommentsRetried += 1
+      }
+    }
     for (const link of await port.holdableLinks(connectorId, batchSize)) {
       if (!link.externalOrderId) continue
       const ts = now()
@@ -2714,7 +2769,7 @@ export async function runWmsOrderPushSweepCore(
             {
               wmsStatus: 'MERGED',
               summary: 'IMS hold not propagated: the order was merged into another WMS order — left for an operator',
-              comment: 'IMS: An order that was merged into this one has been placed ON HOLD in IMS. IMS has not cancelled this order because it holds other orders\' goods. Please take the held order\'s items out of it if you can, or raise a query.',
+              comment: wmsNoticeComment('HOLD', true),
             }, ts)
           continue
         }
@@ -2789,7 +2844,7 @@ export async function runWmsOrderPushSweepCore(
             {
               wmsStatus: cancel.status,
               summary: 'IMS hold could not cancel the WMS order (past NEW) — link kept live, operator notified',
-              comment: 'IMS: This order has been placed ON HOLD in IMS but is already being fulfilled here and could not be auto-cancelled. Please pause it if possible, or raise a cancellation query.',
+              comment: wmsNoticeComment('HOLD', false),
             }, ts)
         }
       } catch (error) {
@@ -2823,7 +2878,7 @@ export async function runWmsOrderPushSweepCore(
             {
               wmsStatus: 'MERGED',
               summary: 'IMS cancel not propagated: the order was merged into another WMS order — left for an operator',
-              comment: 'IMS: An order that was merged into this one has been CANCELLED / fully refunded in IMS. IMS has not cancelled this order because it holds other orders\' goods. Please take the cancelled order\'s items out of it before despatch.',
+              comment: wmsNoticeComment('CANCEL', true),
             }, ts)
           continue
         }
@@ -2866,7 +2921,7 @@ export async function runWmsOrderPushSweepCore(
             {
               wmsStatus: cancel.status,
               summary: 'IMS cancel could not cancel the WMS order (past NEW) — link kept live, operator notified',
-              comment: 'IMS: This order has been cancelled / fully refunded in IMS but is already being fulfilled here and could not be auto-cancelled. Please raise a cancellation query.',
+              comment: wmsNoticeComment('CANCEL', false),
             }, ts)
         }
       } catch (error) {
@@ -2887,6 +2942,7 @@ export async function runWmsOrderPushSweepCore(
 
   if (ambiguousCreateAdopted > 0) result.ambiguousCreateAdopted = ambiguousCreateAdopted
   if (operatorNoticeCount > 0) result.operatorNotices = operatorNoticeCount
+  if (noticeCommentsRetried > 0) result.noticeCommentsRetried = noticeCommentsRetried
   if (shadowedCount > 0) result.shadowed = shadowedCount
   if (shadowUnrecordedCount > 0) result.shadowUnrecorded = shadowUnrecordedCount
   if (recoveryRefusedCount > 0) result.recoveryRefusedPreCutoff = recoveryRefusedCount
@@ -3423,6 +3479,27 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         data,
       })
       return count > 0
+    },
+    async clearStaleNotices(connector) {
+      const hold = await db.wmsOrderPushLink.updateMany({
+        where: { connector, holdNoticeAt: { not: null }, order: { status: { not: 'ON_HOLD' } } },
+        data: { holdNoticeAt: null, holdNoticeCommentAt: null },
+      })
+      const cancel = await db.wmsOrderPushLink.updateMany({
+        where: { connector, cancelNoticeAt: { not: null }, order: { NOT: WMS_CANCELLABLE_ORDER_WHERE } },
+        data: { cancelNoticeAt: null, cancelNoticeCommentAt: null },
+      })
+      return hold.count + cancel.count
+    },
+    async noticesAwaitingComment(connector, limit) {
+      const base = { connector, state: { in: ['SYNCED', 'MERGED'] as Array<'SYNCED' | 'MERGED'> }, externalOrderId: { not: null } }
+      const [holds, cancels] = await Promise.all([
+        db.wmsOrderPushLink.findMany({ where: { ...base, holdNoticeAt: { not: null }, holdNoticeCommentAt: null, order: { status: 'ON_HOLD' } }, select: { id: true, orderId: true, externalOrderId: true, state: true }, take: limit, orderBy: { holdNoticeAt: 'asc' } }),
+        db.wmsOrderPushLink.findMany({ where: { ...base, cancelNoticeAt: { not: null }, cancelNoticeCommentAt: null, order: WMS_CANCELLABLE_ORDER_WHERE }, select: { id: true, orderId: true, externalOrderId: true, state: true }, take: limit, orderBy: { cancelNoticeAt: 'asc' } }),
+      ])
+      const shape = (intent: 'HOLD' | 'CANCEL') => (row: { id: string; orderId: string; externalOrderId: string | null; state: string }) =>
+        ({ id: row.id, orderId: row.orderId, externalOrderId: row.externalOrderId as string, state: row.state as 'SYNCED' | 'MERGED', intent })
+      return [...holds.map(shape('HOLD')), ...cancels.map(shape('CANCEL'))].slice(0, limit)
     },
     async updateLinkIfLinked(id, expect, data) {
       const { count } = await db.wmsOrderPushLink.updateMany({

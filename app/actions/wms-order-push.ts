@@ -230,6 +230,8 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
               dispatchUnresolvedAt: null,
               holdNoticeAt: null,
               cancelNoticeAt: null,
+              holdNoticeCommentAt: null,
+              cancelNoticeCommentAt: null,
             },
           })
           if (linked.count === 0) {

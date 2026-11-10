@@ -2833,6 +2833,8 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           // hold and cancel passes judge the survivor afresh and raise the MERGED notice for it.
           holdNoticeAt: null,
           cancelNoticeAt: null,
+          holdNoticeCommentAt: null,
+          cancelNoticeCommentAt: null,
         },
       })
     },
