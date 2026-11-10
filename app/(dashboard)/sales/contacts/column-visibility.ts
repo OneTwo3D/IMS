@@ -9,11 +9,11 @@ export function resolveColumnVisibility<K extends string>(
 ): Record<K, boolean> {
   if (!stored) return { ...defaults }
   try {
+    // null, numbers and arrays carry none of the keys, so they fall through to the defaults.
     const parsed: unknown = JSON.parse(stored)
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ...defaults }
     const next = { ...defaults }
     for (const key of Object.keys(defaults) as K[]) {
-      const value = (parsed as Record<string, unknown>)[key]
+      const value = (parsed as Record<string, unknown> | null)?.[key]
       if (typeof value === 'boolean') next[key] = value
     }
     return next

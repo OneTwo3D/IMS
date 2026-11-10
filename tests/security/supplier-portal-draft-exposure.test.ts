@@ -28,6 +28,7 @@ const ROWS: Row[] = [
   { id: 'po-quoted', supplierId: 'sup-A', reference: 'PO-QUOTED', status: 'QUOTE_RECEIVED', rfqSentAt: SENT, poSentAt: null },
   { id: 'po-sent', supplierId: 'sup-A', reference: 'PO-SENT', status: 'PO_SENT', rfqSentAt: null, poSentAt: SENT },
   { id: 'po-cancelled-unsent', supplierId: 'sup-A', reference: 'PO-CANC-UNSENT', status: 'CANCELLED', rfqSentAt: null, poSentAt: null },
+  { id: 'po-cancelled-po-sent', supplierId: 'sup-A', reference: 'PO-CANC-POSENT', status: 'CANCELLED', rfqSentAt: null, poSentAt: SENT },
   { id: 'po-cancelled-sent', supplierId: 'sup-A', reference: 'PO-CANC-SENT', status: 'CANCELLED', rfqSentAt: SENT, poSentAt: null },
   { id: 'po-other', supplierId: 'sup-B', reference: 'PO-OTHER', status: 'RFQ_SENT', rfqSentAt: SENT, poSentAt: null },
 ]
@@ -72,6 +73,9 @@ function fullRow(r: Row) {
 }
 
 let writes = 0
+let poWrites = 0
+/** Called after the quote's locked read of the order. */
+let afterLockedRead: (() => void) | null = null
 /** Called after every purchaseOrder read: lets a test change the row between two reads. */
 let afterPoRead: (() => void) | null = null
 function readHook<T>(value: T): T {
@@ -88,11 +92,14 @@ const tx = {
   purchaseOrder: {
     findFirst: async ({ where }: { where: Where }) => {
       const r = ROWS.find((row) => matches(row, where))
-      return r ? fullRow(r) : null
+      const out = r ? fullRow(r) : null
+      afterLockedRead?.()
+      return out
     },
     updateMany: async ({ where }: { where: Where }) => {
       const hit = ROWS.filter((row) => matches(row, where))
       writes += hit.length
+      poWrites += hit.length
       return { count: hit.length }
     },
   },
@@ -143,7 +150,7 @@ test('getSupplierRfqs lists only sent, unanswered RFQs: no DRAFT, no other suppl
 test('getSupplierOrders never lists a DRAFT or a cancelled order that was never sent', async () => {
   const { getSupplierOrders } = await import('@/app/actions/supplier-portal')
   const refs = (await getSupplierOrders()).map((r) => r.reference).sort()
-  assert.deepEqual(refs, ['PO-CANC-SENT', 'PO-QUOTED', 'PO-RFQ', 'PO-SENT'])
+  assert.deepEqual(refs, ['PO-CANC-POSENT', 'PO-CANC-SENT', 'PO-QUOTED', 'PO-RFQ', 'PO-SENT'])
 })
 
 test('getSupplierRfqDetail refuses a DRAFT and a cancelled draft, and serves a sent RFQ', async () => {
@@ -177,10 +184,47 @@ test('submitSupplierQuote still accepts a sent RFQ', async () => {
   assert.ok(writes > 0)
 })
 
+test('submitSupplierQuote refuses another supplier\'s sent RFQ and writes nothing', async () => {
+  const { submitSupplierQuote } = await import('@/app/actions/supplier-portal')
+  writes = 0
+  const result = await submitSupplierQuote('po-other', QUOTE)
+  assert.equal(result.success, false)
+  assert.equal(writes, 0)
+})
+
+for (const [label, change] of [
+  ['goes back to DRAFT', (r: Row) => { r.status = 'DRAFT'; r.rfqSentAt = null }],
+  ['is reassigned to another supplier', (r: Row) => { r.supplierId = 'sup-B' }],
+  ['moves past RFQ_SENT (already quoted)', (r: Row) => { r.status = 'QUOTE_RECEIVED' }],
+] as const) {
+  test(`submitSupplierQuote does not update the order if it ${label} after the locked read`, async () => {
+    const { submitSupplierQuote } = await import('@/app/actions/supplier-portal')
+    const row: Row = { id: 'po-race-q', supplierId: 'sup-A', reference: 'PO-RACE-Q', status: 'RFQ_SENT', rfqSentAt: SENT, poSentAt: null }
+    ROWS.push(row)
+    poWrites = 0
+    afterLockedRead = () => change(row)
+    try {
+      const result = await submitSupplierQuote('po-race-q', QUOTE)
+      assert.equal(result.success, false, 'the guarded update must match nothing')
+      assert.equal(poWrites, 0)
+    } finally {
+      afterLockedRead = null
+      ROWS.splice(ROWS.indexOf(row), 1)
+    }
+  })
+}
+
 const pdfDeps = (rendered: unknown[]) => ({
   authorize: async () => ({ user: { id: 'u1', role: 'SUPPLIER', supplierId: 'sup-A' } }) as never,
   findDocumentTemplate: async () => null,
   renderPdf: async (po: unknown) => { rendered.push(po); return new Response('pdf', { status: 200 }) },
+})
+
+test('the RFQ PDF route will not hand a supplier another supplier\'s sent RFQ', async () => {
+  const { handleRfqGet } = await import('@/app/api/rfq/[id]/route')
+  const rendered: unknown[] = []
+  assert.equal((await handleRfqGet({ id: 'po-other' }, pdfDeps(rendered))).status, 403)
+  assert.equal(rendered.length, 0)
 })
 
 test('the RFQ PDF route will not hand a supplier a DRAFT, but serves a sent RFQ', async () => {

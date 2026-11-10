@@ -56,3 +56,21 @@ test('resolveColumnVisibility overlays a partial stored preference on the defaul
   assert.deepEqual(resolveColumnVisibility(defaults, '[1]'), defaults)
   assert.deepEqual(resolveColumnVisibility(defaults, '{"email":"yes","zzz":true}'), defaults)
 })
+
+test('the customers list overlays a saved column preference on the defaults', async () => {
+  const { ContactsClient } = await import('@/app/(dashboard)/sales/contacts/contacts-client')
+  const g = globalThis as Record<string, unknown>
+  g.window = {}
+  g.localStorage = { getItem: () => JSON.stringify({ phone: true, company: false }), setItem() {} }
+  try {
+    const html = renderToStaticMarkup(
+      React.createElement(ContactsClient, { initialCustomers: [CUSTOMER] }),
+    )
+    assert.ok(html.includes('Phone'), 'the saved choice to show Phone is honoured')
+    assert.ok(!html.includes('Example Co'), 'the saved choice to hide Company is honoured')
+    assert.ok(html.includes('Lifetime Value'), 'columns the preference does not mention keep their defaults')
+  } finally {
+    delete g.window
+    delete g.localStorage
+  }
+})
