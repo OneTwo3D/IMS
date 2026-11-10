@@ -34,6 +34,7 @@ import {
   mapWcAddress, upsertCustomer, mapWcLineItems,
   mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, getFxRateToBase, isMissingFxRateError,
   readWcCustomerVat, resolveWcOrderLevelDiscount,
+  type MappedLine,
 } from './field-mapping'
 import { assertNoOrderPostingInFlightForReview } from '@/lib/domain/accounting/store-credit-posting-fence'
 import { checkWcStoreCreditReconciles, classifyWcCouponLines, describeWcCouponRefusal, planWcOrderCoupons, wcReportedOrderAmounts, wcUpdateNeedsStoreCreditReview } from './coupon-classification'
@@ -664,6 +665,185 @@ export function resolveWcLineAccountingTaxType(params: {
 }): string | undefined {
   if (params.forceNoTax) return WC_NO_TAX_ACCOUNTING_TYPE
   return resolveSalesLineTaxType(params)
+}
+
+/** Where a line's tax rate came from: the WooCommerce rate id it names, the product-category resolver, the order default, or (a fee WooCommerce charged no tax on) the no-tax rule. */
+export type WcLineRateSource = 'woo-rate' | 'category' | 'default' | 'no-tax'
+
+/**
+ * THE ONE RESOLUTION OF AN ORDER'S TAX RATES, shared by the importer's invoice build and by the check a held invoice undergoes before release, so the two cannot drift: each WooCommerce rate id is resolved through the mapping; the order default is picked from
+ * the order's own tax lines; each line takes the rate its WooCommerce id names, else the product-category resolver's, else the order default (and a fee WooCommerce charged no tax on takes none).
+ */
+export async function resolveWcOrderTaxResolution(wcOrder: WcFullOrder, mappedLines: MappedLine[]) {
+  const distinctWcRateIds = Array.from(new Set([
+    ...mappedLines.map((l) => l.externalTaxRateId).filter((x): x is number => typeof x === 'number'),
+    ...wcOrder.tax_lines.map((line) => line.rate_id).filter((x): x is number => typeof x === 'number'),
+    // o3d-cyn r2: the SHIPPING line's own rate ids. They normally also appear in `tax_lines`, but
+    // the shipping tax type is now resolved from them directly, and a rate this map does not hold
+    // cannot be resolved at all.
+    ...wcOrder.shipping_lines.flatMap((line) => (line.taxes ?? []).map((tax) => tax.id))
+      .filter((x): x is number => typeof x === 'number'),
+  ]))
+  const wcResolvedById = new Map<
+    number,
+    { taxRateId: string | null; taxRateName: string | null; taxRateValue: number; accountingTaxType: string | null; reverseCharge: boolean; active?: boolean; source?: 'mapped' | 'default' }
+  >()
+  for (const id of distinctWcRateIds) {
+    wcResolvedById.set(id, await resolveWcTaxRateById(id))
+  }
+
+  const orderLevelRates = wcOrder.tax_lines
+    .map((line) => wcResolvedById.get(line.rate_id))
+    .filter((rate): rate is NonNullable<typeof rate> => rate != null)
+  const resolvedOrderDefault =
+    orderLevelRates.find((rate) => /standard/i.test(rate.taxRateName ?? ''))
+    ?? [...orderLevelRates].sort((a, b) => b.taxRateValue - a.taxRateValue)[0]
+    ?? [...wcResolvedById.values()].sort((a, b) => b.taxRateValue - a.taxRateValue)[0]
+    ?? await resolveWcTaxRateById(null)
+  const {
+    taxRateId: orderDefaultTaxRateId,
+    taxRateName,
+    taxRateValue,
+    accountingTaxType,
+  } = resolvedOrderDefault
+
+  // Load product categories for lines that need the resolver fallback.
+  const productIds = Array.from(
+    new Set(mappedLines.map((l) => l.productId).filter((x): x is string => typeof x === 'string')),
+  )
+  const productRows = productIds.length
+    ? await db.product.findMany({
+        where: { id: { in: productIds } },
+        select: { id: true, taxCategory: true },
+      })
+    : []
+  const productCategoryById = new Map<string, TaxCategory>(
+    productRows.map((p) => [p.id, p.taxCategory]),
+  )
+
+  const destCountry = wcOrder.shipping?.country
+    ? wcOrder.shipping.country.toLowerCase()
+    : wcOrder.billing?.country
+    ? wcOrder.billing.country.toLowerCase()
+    : null
+
+  const orderDefaultCtx = {
+    id: orderDefaultTaxRateId,
+    name: taxRateName,
+    rate: taxRateValue,
+    accountingTaxType,
+  }
+  const needsResolver = mappedLines
+    .map((l, idx) => ({
+      id: String(idx),
+      productCategory: (l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory),
+      hasMappedWc: l.externalTaxRateId != null && wcResolvedById.get(l.externalTaxRateId)?.source === 'mapped',
+    }))
+    .filter((l) => !l.hasMappedWc)
+  const resolverMap = await resolveLineTaxRateBatch(
+    needsResolver.map((l) => ({ id: l.id, productCategory: l.productCategory })),
+    { destinationCountry: destCountry, usedFor: 'SALES', orderDefault: orderDefaultCtx },
+  )
+  const expectedDestinationRates = await loadExpectedDestinationSalesTaxRates(
+    needsResolver.map((line) => line.productCategory),
+    destCountry,
+  )
+
+  const taxFallbackLines: WcTaxRateFallbackLine[] = []
+  const lineSources: WcLineRateSource[] = []
+  const lineTaxResolved = mappedLines.map((l, idx) => {
+    if (l.forceNoTax) {
+      lineSources.push('no-tax')
+      return {
+        taxRateId: null,
+        taxRateName: null,
+        taxRateValue: 0,
+        accountingTaxType: null,
+        // Tax-exempt lines are never reverse-charged — keeps the union uniform
+        // so the accounting-payload swap reads a real flag, not an absent one.
+        reverseCharge: false,
+      }
+    }
+    if (l.externalTaxRateId != null) {
+      const wc = wcResolvedById.get(l.externalTaxRateId)
+      if (wc?.source === 'mapped') {
+        lineSources.push('woo-rate')
+        return wc
+      }
+    }
+    const resolved = resolverMap.get(String(idx)) ?? {
+      taxRateId: orderDefaultTaxRateId,
+      taxRateName,
+      taxRateValue,
+      accountingTaxType,
+      isCompound: false,
+      reverseCharge: false,
+      reportingCategory: null,
+      components: [],
+      matched: 'fallback' as const,
+      warning: `No configured sales rate for ${destCountry ? destCountry.toUpperCase() : 'unknown country'} / ${l.taxCategoryFallback ?? 'STANDARD'}. Using order default.`,
+    }
+    lineSources.push(resolved.matched === 'fallback' ? 'default' : 'category')
+    if (resolved.matched === 'fallback') {
+      taxFallbackLines.push({
+        sku: l.sku,
+        productCategory: (l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory),
+        externalTaxRateId: l.externalTaxRateId ?? null,
+        taxRateValue: resolved.taxRateValue,
+        expectedTaxRateValue: expectedDestinationRates.get((l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory)) ?? null,
+        warning: resolved.warning,
+      })
+    }
+    return resolved
+  })
+  return { wcResolvedById, orderDefaultTaxRateId, taxRateName, taxRateValue, accountingTaxType, destCountry, taxFallbackLines, lineTaxResolved, lineSources }
+}
+
+export type WcOrderTaxResolution = Awaited<ReturnType<typeof resolveWcOrderTaxResolution>>
+
+/** The resolved IMS rate and the effective posted tax type of every invoice line and of the shipping, as the importer's invoice builder sends them. */
+export type WcInvoiceTaxTypes = {
+  lines: Array<{ rateId: string | null; source: WcLineRateSource; type: string | null }>
+  shipping: { rateId: string | null; type: string | null }
+}
+
+/**
+ * THE ONE DECISION OF A LINE'S (AND THE SHIPPING'S) POSTED TAX TYPE: the resolved rate above, followed to its current row (a tax re-key's replacement), then the reverse-charge swap and the fee no-tax rule
+ * (`resolveWcLineAccountingTaxType`); the shipping's from `resolveWcShippingTaxRate`, never swapped. The invoice build in `importWcOrder` takes every line's and the shipping's type from here, and the check before a held invoice is released
+ * calls this same function on the order as it is now, so what is compared is what would be sent.
+ */
+export async function resolveWcInvoiceTaxTypes(params: {
+  wcOrder: WcFullOrder
+  mappedLines: MappedLine[]
+  resolution: WcOrderTaxResolution
+  reverseChargeSalesTaxType: string | null | undefined
+  shippingForeign: number
+  currency: string
+}): Promise<WcInvoiceTaxTypes> {
+  const { wcOrder, mappedLines, resolution } = params
+  const { wcResolvedById, orderDefaultTaxRateId, taxRateValue, accountingTaxType, lineTaxResolved, lineSources } = resolution
+  const shippingTax = resolveWcShippingTaxRate({
+    shippingLines: wcOrder.shipping_lines,
+    shippingNetForeign: params.shippingForeign,
+    rateById: wcResolvedById,
+    orderDefault: { accountingTaxType, taxRateValue, taxRateId: orderDefaultTaxRateId },
+    currency: params.currency,
+  })
+  const ratesNow = await currentTaxRates(db, [...lineTaxResolved.map((r) => r.taxRateId), shippingTax.taxRateId, orderDefaultTaxRateId])
+  const lines = mappedLines.map((l, idx) => {
+    const resolved = lineTaxResolved[idx]
+    const rateNow = resolved?.taxRateId ? ratesNow.get(resolved.taxRateId) : undefined
+    const type = resolveWcLineAccountingTaxType({
+      forceNoTax: l.isFeeLine === true ? l.forceNoTax : undefined,
+      baseTaxType: rateNow?.accountingTaxType ?? resolved?.accountingTaxType ?? accountingTaxType,
+      reverseCharge: rateNow?.reverseCharge ?? resolved?.reverseCharge,
+      reverseChargeSalesTaxType: params.reverseChargeSalesTaxType,
+    })
+    return { rateId: resolved?.taxRateId ?? null, source: lineSources[idx]!, type: type ?? null }
+  })
+  const shippingRateNow = shippingTax.taxRateId ? ratesNow.get(shippingTax.taxRateId) : undefined
+  const shippingType = shippingRateNow ? (shippingRateNow.accountingTaxType ?? undefined) : (shippingTax.taxType ?? accountingTaxType ?? undefined)
+  return { lines, shipping: { rateId: shippingTax.taxRateId ?? null, type: shippingType ?? null } }
 }
 
 export function reconcileWcDocumentTax(
@@ -1712,8 +1892,14 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   const settings = await getAccountingSettings()
   const accounts = { ioss: settings.euVatIossAccount, ddp: settings.euVatDdpAccount, fee: settings.euFeeAccount, rounding: settings.roundingDifferenceAccount }
   // Every input that decides the posted tax types, resolved now (wc-tax-binding.ts lists them), compared with what the hold recorded before anything is released.
-  const bindingDeps = { reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, lineType: resolveWcLineAccountingTaxType }
-  const binding = await currentWcTaxBinding(wcOrder, mappedLines, bindingDeps)
+  // The order's tax resolution NOW, by the very functions the invoice build uses (resolveWcOrderTaxResolution, resolveWcInvoiceTaxTypes): per line and for the shipping, the resolved rate, its source and the effective posted type, plus the inputs.
+  const computeBinding = async () => {
+    const invoiceTypes = await resolveWcInvoiceTaxTypes({
+      wcOrder, mappedLines, resolution: await resolveWcOrderTaxResolution(wcOrder, mappedLines), reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, shippingForeign: mapWcShipping(wcOrder).shippingForeign, currency,
+    })
+    return { invoiceTypes, binding: await currentWcTaxBinding(wcOrder, mappedLines, { reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, invoiceTypes }) }
+  }
+  const { invoiceTypes: currentInvoiceTypes } = await computeBinding()
 
   // The whole check of a TREATED hold, reading through `client` (the caller's order-locked transaction): the parked payload against the order, and the regime re-resolved from the current facts against what was parked and the order's stamp.
   const verifyTreated = async (client: Prisma.TransactionClient, parked: HeldSalesInvoicePayload, parkedMarker: Marker): Promise<string | null> => {
@@ -1722,7 +1908,7 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     const difference = heldInvoiceDifference(parked.accountingPayload, expected, true, zeroTax)
     if (difference !== null) return difference
     // Re-resolved on every call (the release's own re-check included), so a mapping changed in between is seen.
-    const taxDifference = heldTaxBindingDifference(parkedMarker.taxBinding, await currentWcTaxBinding(wcOrder, mappedLines, bindingDeps))
+    const taxDifference = heldTaxBindingDifference(parkedMarker.taxBinding, (await computeBinding()).binding)
     if (taxDifference !== null) return taxDifference
     if (!zeroTax) {
       const parkedTotal = typeof parkedMarker.orderTotal === 'string' ? parkedMarker.orderTotal.trim() : ''
@@ -1768,14 +1954,12 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   const difference = heldInvoiceDifference(held.accountingPayload, expected, false)
   if (difference !== null) return await refuseChanged(difference)
   // Each parked line's tax type must be the effective type the order's line resolves to now, with every input (the reverse-charge setting included); a rate that cannot be resolved never matches.
-  const expectedTypes = binding.lineTypes.map((type, index): string | null => (type !== null ? type : binding.lineRateIds[index] !== null ? 'UNRESOLVED' : null))
-  const shippingTypes = binding.shippingTypes.map((type) => type ?? 'UNRESOLVED')
-  const taxDifference = heldUntreatedTaxDifference(held.accountingPayload, expectedTypes, shippingTypes)
+  const taxDifference = heldUntreatedTaxDifference(held.accountingPayload, currentInvoiceTypes)
   if (taxDifference !== null) return await refuseChanged(taxDifference)
   const { [EU_VAT_TREATMENT_PAYLOAD_KEY]: _marker, ...untreated } = held.accountingPayload
   void _marker
   const outcome = await treatImportedSalesInvoice({
-    orderId, wcOrder, payload: untreated, mappedLines, connector: chart, taxBindingDeps: bindingDeps, accounts, storeCreditForeign: coupons.storeCreditForeign, now: new Date(),
+    orderId, wcOrder, payload: untreated, mappedLines, connector: chart, taxBindingDeps: { reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, invoiceTypes: currentInvoiceTypes }, accounts, storeCreditForeign: coupons.storeCreditForeign, now: new Date(),
   })
   if (outcome.kind === 'refused') return await refuse(`the EU IOSS/VOEC/DDP treatment refused it: ${outcome.reason}. Fix that, then re-import the order from WooCommerce to try again`)
   if (outcome.kind === 'skipped') return { outcome: 'not-needed' }
@@ -2698,121 +2882,8 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     //    server-side including shipping-country logic).
     // 2. Otherwise, fall back to the IMS resolver on (productCategory,
     //    shippingCountry, SALES).
-    const distinctWcRateIds = Array.from(new Set([
-      ...mappedLines.map((l) => l.externalTaxRateId).filter((x): x is number => typeof x === 'number'),
-      ...wcOrder.tax_lines.map((line) => line.rate_id).filter((x): x is number => typeof x === 'number'),
-      // o3d-cyn r2: the SHIPPING line's own rate ids. They normally also appear in `tax_lines`, but
-      // the shipping tax type is now resolved from them directly, and a rate this map does not hold
-      // cannot be resolved at all.
-      ...wcOrder.shipping_lines.flatMap((line) => (line.taxes ?? []).map((tax) => tax.id))
-        .filter((x): x is number => typeof x === 'number'),
-    ]))
-    const wcResolvedById = new Map<
-      number,
-      { taxRateId: string | null; taxRateName: string | null; taxRateValue: number; accountingTaxType: string | null; reverseCharge: boolean; active?: boolean; source?: 'mapped' | 'default' }
-    >()
-    for (const id of distinctWcRateIds) {
-      wcResolvedById.set(id, await resolveWcTaxRateById(id))
-    }
-
-    const orderLevelRates = wcOrder.tax_lines
-      .map((line) => wcResolvedById.get(line.rate_id))
-      .filter((rate): rate is NonNullable<typeof rate> => rate != null)
-    const resolvedOrderDefault =
-      orderLevelRates.find((rate) => /standard/i.test(rate.taxRateName ?? ''))
-      ?? [...orderLevelRates].sort((a, b) => b.taxRateValue - a.taxRateValue)[0]
-      ?? [...wcResolvedById.values()].sort((a, b) => b.taxRateValue - a.taxRateValue)[0]
-      ?? await resolveWcTaxRateById(null)
-    const {
-      taxRateId: orderDefaultTaxRateId,
-      taxRateName,
-      taxRateValue,
-      accountingTaxType,
-    } = resolvedOrderDefault
-
-    // Load product categories for lines that need the resolver fallback.
-    const productIds = Array.from(
-      new Set(mappedLines.map((l) => l.productId).filter((x): x is string => typeof x === 'string')),
-    )
-    const productRows = productIds.length
-      ? await db.product.findMany({
-          where: { id: { in: productIds } },
-          select: { id: true, taxCategory: true },
-        })
-      : []
-    const productCategoryById = new Map<string, TaxCategory>(
-      productRows.map((p) => [p.id, p.taxCategory]),
-    )
-
-    const destCountry = wcOrder.shipping?.country
-      ? wcOrder.shipping.country.toLowerCase()
-      : wcOrder.billing?.country
-      ? wcOrder.billing.country.toLowerCase()
-      : null
-
-    const orderDefaultCtx = {
-      id: orderDefaultTaxRateId,
-      name: taxRateName,
-      rate: taxRateValue,
-      accountingTaxType,
-    }
-    const needsResolver = mappedLines
-      .map((l, idx) => ({
-        id: String(idx),
-        productCategory: (l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory),
-        hasMappedWc: l.externalTaxRateId != null && wcResolvedById.get(l.externalTaxRateId)?.source === 'mapped',
-      }))
-      .filter((l) => !l.hasMappedWc)
-    const resolverMap = await resolveLineTaxRateBatch(
-      needsResolver.map((l) => ({ id: l.id, productCategory: l.productCategory })),
-      { destinationCountry: destCountry, usedFor: 'SALES', orderDefault: orderDefaultCtx },
-    )
-    const expectedDestinationRates = await loadExpectedDestinationSalesTaxRates(
-      needsResolver.map((line) => line.productCategory),
-      destCountry,
-    )
-
-    const taxFallbackLines: WcTaxRateFallbackLine[] = []
-    const lineTaxResolved = mappedLines.map((l, idx) => {
-      if (l.forceNoTax) {
-        return {
-          taxRateId: null,
-          taxRateName: null,
-          taxRateValue: 0,
-          accountingTaxType: null,
-          // Tax-exempt lines are never reverse-charged — keeps the union uniform
-          // so the accounting-payload swap reads a real flag, not an absent one.
-          reverseCharge: false,
-        }
-      }
-      if (l.externalTaxRateId != null) {
-        const wc = wcResolvedById.get(l.externalTaxRateId)
-        if (wc?.source === 'mapped') return wc
-      }
-      const resolved = resolverMap.get(String(idx)) ?? {
-        taxRateId: orderDefaultTaxRateId,
-        taxRateName,
-        taxRateValue,
-        accountingTaxType,
-        isCompound: false,
-        reverseCharge: false,
-        reportingCategory: null,
-        components: [],
-        matched: 'fallback' as const,
-        warning: `No configured sales rate for ${destCountry ? destCountry.toUpperCase() : 'unknown country'} / ${l.taxCategoryFallback ?? 'STANDARD'}. Using order default.`,
-      }
-      if (resolved.matched === 'fallback') {
-        taxFallbackLines.push({
-          sku: l.sku,
-          productCategory: (l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory),
-          externalTaxRateId: l.externalTaxRateId ?? null,
-          taxRateValue: resolved.taxRateValue,
-          expectedTaxRateValue: expectedDestinationRates.get((l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory)) ?? null,
-          warning: resolved.warning,
-        })
-      }
-      return resolved
-    })
+    const taxResolution = await resolveWcOrderTaxResolution(wcOrder, mappedLines)
+    const { wcResolvedById, orderDefaultTaxRateId, taxRateName, taxRateValue, accountingTaxType, destCountry, taxFallbackLines, lineTaxResolved } = taxResolution
     if (shouldBlockWcTaxRateFallback(taxFallbackLines)) {
       const description = `Blocked WooCommerce order ${wcOrder.number} import because ${taxFallbackLines.length} line(s) would use the order default tax rate.`
       await logActivity({
@@ -3537,7 +3608,11 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       const lineRateNow = (idx: number) => (lineData[idx]?.taxRateId ? ratesNow.get(lineData[idx]!.taxRateId!) : undefined)
       const shippingRateNow = shippingTax.taxRateId ? ratesNow.get(shippingTax.taxRateId) : undefined
       const defaultRateNow = orderDefaultTaxRateId ? ratesNow.get(orderDefaultTaxRateId) : undefined
-      const shippingTypeNow = shippingRateNow ? (shippingRateNow.accountingTaxType ?? undefined) : (shippingTax.taxType ?? accountingTaxType ?? undefined)
+      // Every line's and the shipping's posted tax type come from the ONE function the check before a held invoice's release also calls (resolveWcInvoiceTaxTypes), so what is compared there is what is sent here.
+      const invoiceTaxTypes = await resolveWcInvoiceTaxTypes({
+        wcOrder, mappedLines, resolution: taxResolution, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, shippingForeign, currency,
+      })
+      const shippingTypeNow = invoiceTaxTypes.shipping.type ?? undefined
       const accountingPayload: Record<string, unknown> = {
           contactName: customerName,
           contactEmail: payloadAnonymised ? undefined : (wcOrder.billing.email || undefined),
@@ -3549,13 +3624,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           reference: orderNumber,
           lines: lineData.map((l, idx) => {
             const rateNow = lineRateNow(idx)
-            const lineTaxType = resolveWcLineAccountingTaxType({
-              // FEE lines only: goods and shipping resolve exactly as before.
-              forceNoTax: mappedLines[idx]?.isFeeLine === true ? mappedLines[idx]?.forceNoTax : undefined,
-              baseTaxType: rateNow?.accountingTaxType ?? lineTaxResolved[idx]?.accountingTaxType ?? accountingTaxType,
-              reverseCharge: rateNow?.reverseCharge ?? lineTaxResolved[idx]?.reverseCharge,
-              reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
-            })
+            const lineTaxType = invoiceTaxTypes.lines[idx]!.type ?? undefined
             return {
             itemCode: l.productId ? (l.sku || undefined) : undefined,
             description: l.description ?? l.sku ?? 'Item',
@@ -3641,7 +3710,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
         payload: accountingPayload,
         mappedLines,
         connector: settings.connector,
-        taxBindingDeps: { reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, lineType: resolveWcLineAccountingTaxType },
+        taxBindingDeps: { reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, invoiceTypes: invoiceTaxTypes },
         accounts: { ioss: settings.euVatIossAccount, ddp: settings.euVatDdpAccount, fee: settings.euFeeAccount, rounding: settings.roundingDifferenceAccount },
         storeCreditForeign,
         now: new Date(),

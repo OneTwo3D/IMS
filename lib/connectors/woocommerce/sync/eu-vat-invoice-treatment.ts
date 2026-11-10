@@ -22,7 +22,7 @@ import {
   applyEuVatTreatment, EU_VAT_TREATMENT_PAYLOAD_KEY, lineKindsOf, routeFor, type EuVatTreatmentPlan, type TreatablePayload,
 } from '@/lib/domain/accounting/eu-vat-treatment'
 import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
-import { currentWcTaxBinding, recordWcTaxBinding, type LineTypeRule, type WcTaxBinding } from './wc-tax-binding'
+import { currentWcTaxBinding, recordWcTaxBinding, type InvoiceTaxTypesInput, type WcTaxBinding } from './wc-tax-binding'
 import { buildEuVatRegimeInput, readEuVatRegimeMode } from './eu-vat-facts'
 import type { MappedLine } from './field-mapping'
 import type { WcFullOrder } from './types'
@@ -44,8 +44,8 @@ export async function treatImportedSalesInvoice(params: {
   mappedLines: ReadonlyArray<Pick<MappedLine, 'isFeeLine' | 'wclcFeeKind' | 'forceNoTax' | 'taxForeign'> & { externalTaxRateId?: number | null }>
   /** The accounting connector whose chart the payload's account codes came from. */
   connector: string | null
-  /** What the tax binding needs from the importer: the reverse-charge sales setting and the builder's own line rule (`resolveWcLineAccountingTaxType`). */
-  taxBindingDeps: { reverseChargeSalesTaxType: string | null | undefined; lineType: LineTypeRule }
+  /** What the tax binding needs from the importer: the reverse-charge sales setting and the output of the builder's own function (`resolveWcInvoiceTaxTypes`). */
+  taxBindingDeps: { reverseChargeSalesTaxType: string | null | undefined; invoiceTypes: InvoiceTaxTypesInput }
   accounts: EuVatTreatmentAccounts
   storeCreditForeign: { gt(value: number): boolean }
   now: Date

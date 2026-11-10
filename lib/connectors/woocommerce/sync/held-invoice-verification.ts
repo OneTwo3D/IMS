@@ -89,10 +89,21 @@ export function heldTaxBindingDifference(recorded: unknown, current: unknown): s
   if (typeof recorded !== 'object' || recorded === null) return 'the tax binding of the parked invoice was not recorded, so its tax cannot be verified'
   const r = recorded as Record<string, unknown>
   const c = current as Record<string, unknown>
-  if (!Array.isArray(r.lineRateIds) || !Array.isArray(r.shippingRateIds) || typeof r.rates !== 'object' || r.rates === null || !Array.isArray(r.lineTypes) || !Array.isArray(r.shippingTypes) || typeof r.reverseChargeSalesTaxType !== 'string') {
+  if (!Array.isArray(r.lineRateIds) || !Array.isArray(r.shippingRateIds) || typeof r.rates !== 'object' || r.rates === null || !Array.isArray(r.lines) || typeof r.shipping !== 'object' || r.shipping === null || typeof r.reverseChargeSalesTaxType !== 'string') {
     return 'the recorded tax binding of the parked invoice is unreadable'
   }
-  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
+  // Key order is not part of the value: the recorded binding comes back from a jsonb column, which orders keys by length.
+  const canon = (v: unknown): string => JSON.stringify(v, (_k, val) => (val !== null && typeof val === 'object' && !Array.isArray(val) ? Object.fromEntries(Object.entries(val as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : val))
+  const same = (a: unknown, b: unknown) => canon(a) === canon(b)
+  // THE OUTPUTS FIRST: what the invoice builder's own function resolves each line and the shipping to (the rate, where it came from, the posted type). Any difference, or a line that no longer resolves where it did, is a change.
+  const wasLines = r.lines as Array<unknown>
+  const nowLines = (Array.isArray(c.lines) ? c.lines : []) as Array<unknown>
+  if (wasLines.length !== nowLines.length) return `the invoice now has ${nowLines.length} lines, the hold ${wasLines.length}`
+  for (const [index, was] of wasLines.entries()) {
+    if (!same(was, nowLines[index])) return `line ${index + 1}: the resolved tax rate and type changed from ${JSON.stringify(was)} to ${JSON.stringify(nowLines[index])}`
+  }
+  if (!same(r.shipping, c.shipping)) return `the shipping's resolved tax rate and type changed from ${JSON.stringify(r.shipping)} to ${JSON.stringify(c.shipping)}`
+  // Then the inputs, which say why.
   if (!same(r.lineRateIds, c.lineRateIds)) return 'the tax rates on the order\u2019s lines changed (for example two lines exchanged tax classes)'
   if (!same(r.shippingRateIds, c.shippingRateIds)) return 'the tax rates on the order\u2019s shipping changed'
   if (r.reverseChargeSalesTaxType !== c.reverseChargeSalesTaxType) return `the reverse-charge sales tax type setting changed from "${r.reverseChargeSalesTaxType}" to "${String(c.reverseChargeSalesTaxType)}"`
@@ -105,29 +116,27 @@ export function heldTaxBindingDifference(recorded: unknown, current: unknown): s
       if (!same(was[key], now[key])) return `WooCommerce tax rate ${id}: ${key} changed from ${JSON.stringify(was[key])} to ${JSON.stringify(now[key])}`
     }
   }
-  if (!same(r.lineTypes, c.lineTypes)) return 'the tax type of a line changed'
-  if (!same(r.shippingTypes, c.shippingTypes)) return 'the tax type of the shipping changed'
   return null
 }
 
 /**
- * The tax types of an UNTREATED hold against the order now: each parked line's tax type must be the effective type the order's line resolves to now (`expected[i]`, from the binding computed with every input, the reverse-charge setting included;
- * null = a line that names no tax rate, nothing to verify; 'UNRESOLVED' never matches), and the parked shipping type must be one the shipping's rates resolve to.
+ * The tax types of an UNTREATED hold against the order now: each parked line's tax type must be exactly the effective type the invoice builder's own function resolves for the line now (every input, the reverse-charge setting and the category/default
+ * selection included), and the parked shipping type the one it resolves for the shipping.
  */
 export function heldUntreatedTaxDifference(
   parked: Record<string, unknown>,
-  expected: ReadonlyArray<string | null>,
-  shippingTypes: readonly string[],
+  current: { lines: ReadonlyArray<{ type: string | null }>; shipping: { type: string | null } },
 ): string | null {
-  const lines = Array.isArray(parked.lines) ? (parked.lines as Array<Record<string, unknown> | null>) : []
-  for (const [index, want] of expected.entries()) {
-    if (want === null) continue
-    const taxType = lines[index]?.taxType
-    if (typeof taxType !== 'string' || taxType.trim().toUpperCase() !== want.trim().toUpperCase()) return `line ${index + 1}: the parked tax type is ${String(taxType)}, the order's line now resolves to ${want}`
+  const parkedLines = Array.isArray(parked.lines) ? (parked.lines as Array<Record<string, unknown> | null>) : []
+  const norm = (value: unknown): string | null => (typeof value === 'string' && value.trim() !== '' ? value.trim().toUpperCase() : null)
+  // NO SKIPS: a line the order's function resolves to no type must have been parked with none, and one it resolves to a type must carry that type.
+  for (const [index, want] of current.lines.entries()) {
+    const parkedType = norm(parkedLines[index]?.taxType)
+    if (parkedType !== norm(want.type)) return `line ${index + 1}: the parked tax type is ${parkedType ?? '(none)'}, the order's line now resolves to ${norm(want.type) ?? '(none)'}`
   }
-  if (shippingTypes.length > 0 && Number(parked.shippingAmount ?? 0) > 0) {
-    const shipping = typeof parked.shippingTaxType === 'string' ? parked.shippingTaxType.trim().toUpperCase() : ''
-    if (!shippingTypes.some((t) => t.trim().toUpperCase() === shipping)) return `the parked shipping tax type is ${shipping || '(none)'}, the order's shipping now resolves to ${shippingTypes.join(' or ')}`
+  // The shipping line is sent only with a positive amount; then its parked type must be the one the order's shipping resolves to now.
+  if (Number(parked.shippingAmount ?? 0) > 0 && norm(parked.shippingTaxType) !== norm(current.shipping.type)) {
+    return `the parked shipping tax type is ${norm(parked.shippingTaxType) ?? '(none)'}, the order's shipping now resolves to ${norm(current.shipping.type) ?? '(none)'}`
   }
   return null
 }

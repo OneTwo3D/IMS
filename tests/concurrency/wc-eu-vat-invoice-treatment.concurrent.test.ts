@@ -207,13 +207,14 @@ test('[eu vat] switch ON, IOSS: zero-rated goods and shipping, fee on 232, one V
   assert.equal(total(invoice), 135.66, 'the invoice totals the order')
   assert.equal(invoice._taxUnreconciled, undefined)
   assert.equal(invoice._registerPayment, true)
-  const { taxBinding, ...marker } = invoice._euVatTreatment as Record<string, unknown> & { taxBinding: { lineRateIds: unknown[]; shippingRateIds: unknown[]; rates: Record<string, { accountingTaxType: string; reverseCharge: boolean }>; lineTypes: unknown[] } }
+  const { taxBinding, ...marker } = invoice._euVatTreatment as Record<string, unknown> & { taxBinding: { lineRateIds: unknown[]; shippingRateIds: unknown[]; rates: Record<string, { accountingTaxType: string; reverseCharge: boolean }>; lines: Array<{ rateId: string | null; source: string; type: string | null }>; shipping: { rateId: string | null; type: string | null } } }
   assert.deepEqual(marker, { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', orderTotal: '135.66', vatAccount: '821', feesRecoded: 1, roundingAdjustment: null })
   // The tax binding recorded BEFORE the treatment re-typed the lines: both lines and the shipping on the one WooCommerce rate, which resolved to the charged code.
   assert.equal(taxBinding.lineRateIds.length, 2)
   assert.equal(taxBinding.shippingRateIds.length, 1)
   assert.deepEqual(Object.values(taxBinding.rates).map((r) => [r.accountingTaxType, r.reverseCharge]), [['DE_CHARGED', false]])
-  assert.deepEqual(taxBinding.lineTypes, ['DE_CHARGED', 'DE_CHARGED'], 'the effective pre-treatment types')
+  assert.deepEqual(taxBinding.lines.map((l) => [l.source, l.type]), [['woo-rate', 'DE_CHARGED'], ['woo-rate', 'DE_CHARGED']], 'the resolved source and effective pre-treatment type of each line')
+  assert.equal(taxBinding.shipping.type, 'DE_CHARGED')
   assert.equal(order.euVatRegime, 'IOSS')
   assert.equal(order.euVatLineAccount, '821')
   assert.ok(order.euVatRegimeStampedAt)
@@ -334,7 +335,7 @@ test('[eu vat] a stamped IOSS order whose facts now decide DDP is refused, not t
   const invoice = (await db.accountingSyncLog.findFirstOrThrow({ where: { type: 'SALES_INVOICE', referenceId: orderId } })).payload as unknown as Record<string, unknown>
   const base = { orderId, payload: { currency: 'GBP', lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: 'DE_CHARGED' }, { description: 'EU Customs Fee', quantity: 1, unitAmount: 4, accountCode: '200', taxType: 'DE_CHARGED' }], shippingAmount: 10, shippingAccountCode: '260', shippingTaxType: 'DE_CHARGED' } as Record<string, unknown>,
     mappedLines: [{ isFeeLine: false, wclcFeeKind: null, forceNoTax: false, taxForeign: 19 }, { isFeeLine: true, wclcFeeKind: 'uhf' as const, forceNoTax: false, taxForeign: 0.76 }],
-    connector: 'xero', taxBindingDeps: { reverseChargeSalesTaxType: '', lineType: ({ forceNoTax, baseTaxType }: { forceNoTax: boolean | undefined; baseTaxType: string | null | undefined }) => (forceNoTax ? 'NONE' : baseTaxType ?? undefined) }, accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' }, storeCreditForeign: { gt: () => false }, now: new Date() }
+    connector: 'xero', taxBindingDeps: { reverseChargeSalesTaxType: '', invoiceTypes: { lines: [{ rateId: null, source: 'woo-rate', type: 'DE_CHARGED' }, { rateId: null, source: 'woo-rate', type: 'DE_CHARGED' }], shipping: { rateId: null, type: 'DE_CHARGED' } } }, accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' }, storeCreditForeign: { gt: () => false }, now: new Date() }
   void invoice
   // The same facts: still IOSS, treated.
   const same = await treatImportedSalesInvoice({ ...base, wcOrder: payload(externalId, wcRateId, [num, ...PLUGIN('821')]) as never })
@@ -747,7 +748,7 @@ test('[eu vat] equal-value lines exchange taxable and zero-rated status (total u
   const { after, rows } = await twoLineHold(t, { parkOn: true, swap: true })
   assert.equal(rows.length, 0, 'nothing was queued')
   assert.equal(after.status, 'PENDING')
-  assert.match(after.errorMessage ?? '', /the order changed after it was held \(the tax rates on the order.s lines changed \(for example two lines exchanged tax classes\)\) and needs its invoice rebuilt/)
+  assert.match(after.errorMessage ?? '', /the order changed after it was held \(line 1: the resolved tax rate and type changed from .*(OUTPUT2|ZERORATEDOUTPUT).* to .*(OUTPUT2|ZERORATEDOUTPUT).*\) and needs its invoice rebuilt/)
   assert.deepEqual(((after.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment), { applied: false, reason: 'order_changed' })
 })
 
@@ -771,7 +772,7 @@ test('[eu vat] the reverse-charge flag flips with a reverse-charge setting in fo
   const { after, rows } = await domesticHold(t, false, async (db, rateId) => { await db.taxRate.update({ where: { id: rateId }, data: { reverseCharge: true } }) }, 'ECOUTPUTSERVICES')
   assert.equal(rows.length, 0)
   assert.equal(after.status, 'PENDING')
-  assert.match(after.errorMessage ?? '', /reverseCharge changed from false to true/)
+  assert.match(after.errorMessage ?? '', /line 1: the resolved tax rate and type changed from .*OUTPUT2.* to .*ECOUTPUTSERVICES/)
 })
 
 test('[eu vat] the reverse-charge SALES tax type SETTING changes while the hold waits: refused', { skip }, async (t) => {
@@ -792,7 +793,7 @@ test('[eu vat] the mapped rate\'s accounting tax type or its percentage changes 
   const { after, rows } = await domesticHold(t, false, async (db, rateId) => { await db.taxRate.update({ where: { id: rateId }, data: { accountingTaxType: 'OUTPUT3', rate: 0.25 } }) })
   assert.equal(rows.length, 0)
   assert.equal(after.status, 'PENDING')
-  assert.match(after.errorMessage ?? '', /WooCommerce tax rate \d+: (accountingTaxType|rate|nowAccountingTaxType) changed/)
+  assert.match(after.errorMessage ?? '', /line 1: the resolved tax rate and type changed from .*OUTPUT2.* to .*OUTPUT3/)
 })
 
 test('[eu vat] an UNTREATED hold: the reverse-charge setting and flag change so the line\'s effective type changes: refused', { skip }, async (t) => {
@@ -819,4 +820,96 @@ test('[eu vat] an UNTREATED hold: the reverse-charge setting and flag change so 
   const after = await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } })
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /line 1: the parked tax type is OUTPUT2, the order's line now resolves to ECOUTPUTSERVICES/)
+})
+
+// ---- a line that names NO WooCommerce rate still resolves to a rate (category resolver, else the order default): that selection is compared too ----
+const ZZ_ADDRESS = { ...ADDRESS, city: 'Zed', postcode: '00000', country: 'ZZ' }
+type ZzRate = { id: string }
+async function zzHold(t: test.TestContext, kind: 'category' | 'default', change: null | ((db: Awaited<ReturnType<typeof loadDb>>, rates: { main: ZzRate; wcMain: number; wcExtra: number; track: (id: string) => void }) => Promise<void>)) {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = true
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const wcMain = 900_000 + Math.floor(Math.random() * 40_000)
+  const wcExtra = 940_000 + Math.floor(Math.random() * 40_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const created: string[] = []
+  const warehouse = await db.warehouse.create({ data: { code: `EZZ-${randomUUID().slice(0, 8)}`, name: 'Rate-less line test warehouse', syncToStore: true, availableForSale: true } })
+  const mk = async (data: { name: string; rate: number; type: string; category: 'STANDARD' | 'ZERO' | 'REDUCED'; wc?: number }) => {
+    const rate = await db.taxRate.create({ data: { name: `${data.name} ${randomUUID()}`, rate: data.rate, usedFor: 'SALES', accountingTaxType: data.type, countryCode: 'zz', taxCategory: data.category, active: true } })
+    created.push(rate.id)
+    if (data.wc !== undefined) await db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: String(data.wc), externalName: data.name, externalCountry: 'ZZ', externalRatePct: data.rate * 100, taxRateId: rate.id } })
+    return rate
+  }
+  // category: the only STANDARD rate for zz is the 20% one the order's tax line names; default: the order's tax line names a 0% rate (ZERO category), so a rate-less STANDARD line finds no category rate and takes the order default.
+  const main = kind === 'category' ? await mk({ name: 'ZZ VAT', rate: 0.2, type: 'OUTPUT2', category: 'STANDARD', wc: wcMain }) : await mk({ name: 'ZZ Zero', rate: 0, type: 'ZERORATEDOUTPUT', category: 'ZERO', wc: wcMain })
+  t.after(async () => {
+    switchOn = false
+    const orderId = (await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } }))?.orderId
+    if (orderId) {
+      await db.accountingSyncLog.deleteMany({ where: { referenceId: orderId } })
+      await db.activityLog.deleteMany({ where: { entityId: orderId } })
+      await db.payment.deleteMany({ where: { orderId } })
+      await db.salesOrderLine.deleteMany({ where: { orderId } })
+      await db.salesOrder.deleteMany({ where: { id: orderId } })
+    }
+    await db.shoppingSyncLog.deleteMany({ where: { externalId: String(externalId) } })
+    await db.shoppingOrderLink.deleteMany({ where: { connector: 'woocommerce', externalOrderId: String(externalId) } })
+    await db.shoppingTaxRateMapping.deleteMany({ where: { taxRateId: { in: created } } })
+    await db.warehouse.deleteMany({ where: { id: warehouse.id } })
+    await db.taxRate.deleteMany({ where: { id: { in: created } } })
+  })
+  const taxed = kind === 'category'
+  const order = (meta: Meta, extraTaxLine: boolean) => ({
+    ...payload(externalId, wcMain, meta), billing: ZZ_ADDRESS, shipping: ZZ_ADDRESS,
+    line_items: [{ id: 1, name: 'Widget', product_id: 1, variation_id: 0, quantity: 1, tax_class: '', subtotal: '100.00', subtotal_tax: taxed ? '20.00' : '0.00', total: '100.00', total_tax: taxed ? '20.00' : '0.00', sku: `NOSKU-${externalId}`, price: 100, taxes: [], meta_data: [] }],
+    fee_lines: [], shipping_lines: [], shipping_total: '0.00', shipping_tax: '0.00',
+    tax_lines: [{ id: 21, rate_code: 'ZZ-1', rate_id: wcMain, label: 'VAT', compound: false, tax_total: taxed ? '20.00' : '0.00', shipping_tax_total: '0.00', meta_data: [] }, ...(extraTaxLine ? [{ id: 22, rate_code: 'ZZ-2', rate_id: wcExtra, label: 'Standard', compound: false, tax_total: '0.00', shipping_tax_total: '0.00', meta_data: [] }] : [])],
+    total: taxed ? '120.00' : '100.00', total_tax: taxed ? '20.00' : '0.00',
+  })
+  const extra: Meta = [{ id: 2, key: 'is_vat_exempt', value: 'no' }]
+  assert.equal((await importWcOrder(order(extra, false) as never)).success, true, 'the parked import succeeded')
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  const marker = (held.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment as { taxBinding: { lines: Array<{ rateId: string | null; source: string; type: string | null }> } }
+  assert.deepEqual(marker.taxBinding.lines.map((l) => [l.source, l.type, l.rateId === main.id]), [[kind === 'category' ? 'category' : 'default', taxed ? 'OUTPUT2' : 'ZERORATEDOUTPUT', true]], 'the rate-less line\'s resolved rate, source and type were recorded')
+  if (change) await change(db, { main, wcMain, wcExtra, track: (id) => { created.push(id) } })
+  await importWcOrder(order([{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...extra], kind === 'default' && change !== null) as never)
+  return { after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }), rows: await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId } }) }
+}
+
+test('[eu vat] CONTROL: an unchanged hold whose line names no WooCommerce rate (category-resolved) is released', { skip }, async (t) => {
+  const { rows } = await zzHold(t, 'category', null)
+  assert.equal(rows.length, 1, 'released')
+  assert.deepEqual((rows[0]!.payload as unknown as Invoice).lines.map((l) => l.taxType), ['OUTPUT2'])
+})
+
+test('[eu vat] a rate-less line whose CATEGORY resolver selection changes to a different tax type at the SAME percentage is refused', { skip }, async (t) => {
+  const { after, rows } = await zzHold(t, 'category', async (db, { main, track }) => {
+    // Another active 20% zz STANDARD rate on a different Xero type; the original is retired, so the resolver now selects the new one.
+    const other = await db.taxRate.create({ data: { name: `ZZ VAT B ${randomUUID()}`, rate: 0.2, usedFor: 'SALES', accountingTaxType: 'OUTPUT3', countryCode: 'zz', taxCategory: 'STANDARD', active: true } })
+    await db.taxRate.update({ where: { id: main.id }, data: { active: false } })
+    track(other.id)
+  })
+  assert.equal(rows.length, 0, 'nothing was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /the order changed after it was held \(line 1: the resolved tax rate and type changed from .*OUTPUT2.* to .*OUTPUT3.*\) and needs its invoice rebuilt/)
+})
+
+test('[eu vat] CONTROL: an unchanged hold whose line takes the ORDER DEFAULT is released', { skip }, async (t) => {
+  const { rows } = await zzHold(t, 'default', null)
+  assert.equal(rows.length, 1, 'released')
+  assert.deepEqual((rows[0]!.payload as unknown as Invoice).lines.map((l) => l.taxType), ['ZERORATEDOUTPUT'])
+})
+
+test('[eu vat] the ORDER DEFAULT changes (the order now names a "Standard" rate on another Xero type): a rate-less line that took the default is refused', { skip }, async (t) => {
+  const { after, rows } = await zzHold(t, 'default', async (db, { wcExtra, track }) => {
+    const standard = await db.taxRate.create({ data: { name: `ZZ Standard ${randomUUID()}`, rate: 0, usedFor: 'SALES', accountingTaxType: 'EXEMPTOUTPUT', countryCode: 'zz', taxCategory: 'REDUCED', active: true } })
+    track(standard.id)
+    await db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: String(wcExtra), externalName: 'Standard', externalCountry: 'ZZ', externalRatePct: 0, taxRateId: standard.id } })
+  })
+  assert.equal(rows.length, 0)
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /line 1: the resolved tax rate and type changed from .*ZERORATEDOUTPUT.* to .*EXEMPTOUTPUT/)
 })
