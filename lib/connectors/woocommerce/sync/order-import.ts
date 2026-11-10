@@ -3155,9 +3155,10 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       })
     }
 
-    // Auto-allocate stock (skip for terminal statuses)
+    // Auto-allocate stock (skip for terminal statuses, and for an order written as a DRAFT: a status the operator mapped to Draft holds no stock — allocation
+    // declines a draft, it is allocated and invoiced when the order is finalised — and the import is acknowledged as completed without it)
     const TERMINAL_STATUSES = ['CANCELLED']
-    if (!TERMINAL_STATUSES.includes(imsStatus)) {
+    if (!TERMINAL_STATUSES.includes(imsStatus) && lifecycleStatus !== 'DRAFT') {
       const { autoAllocateOrder } = await import('@/app/actions/allocation')
       const allocation = await autoAllocateOrder(so.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
       if (!allocation.success && allocation.error !== 'No stock available for allocation') {

@@ -137,6 +137,14 @@ enum StoreCreditAssessment {
   REVIEW_REQUIRED
 }
 
+/// The EU consumer VAT regime an order's VAT was collected under, decided once and stamped on the order (SalesOrder.euVatRegime).
+/// IOSS = EU destination at or under EUR 150; VOEC = Norway at or under NOK 3000; DDP = over the threshold, VAT collected by the seller as delivered-duty-paid.
+enum EuVatRegime {
+  IOSS
+  VOEC
+  DDP
+}
+
 enum ShipmentStatus {
   PENDING
   PICKING
@@ -1817,6 +1825,17 @@ model SalesOrder {
   // DELETES the sync log, so all three can vanish while a real Xero invoice stands. This column is
   // the only statement about that moment that nothing prunes.
   discountRestatement Json?         @map("discount_restatement")
+  /// THE EU VAT REGIME STAMP (lib/domain/accounting/eu-vat-regime-stamp.ts). Decided once, from the facts and the order-date exchange rate, and never re-derived: a credit note
+  /// reads these columns instead of deciding again, so a later rate cannot move an order from one regime to the other.
+  /// `euVatRegimeStampedAt` is set by every successful decision and is the "decided" marker; the regime is NULL on an order that was decided to be outside the scheme
+  /// (the account is NULL with it; the database refuses a regime without an account and a marker). Written by a compare-and-set that matches only an unstamped order. NULL stampedAt = never decided (an order that predates the stamp, or one whose
+  /// decision was a refusal, which stamps nothing). `euVatLineAccount` is the account CODE the one VAT line posts to (821 or 232 in the live chart), in the same form as the storefront
+  /// plugin's `_o3d_ioss_vat_account` order meta so that a credit note on an order the plugin handled can use either.
+  /// `euVatRegimeBasis` records what the decision rested on (threshold, value, rates, warnings); no personal data.
+  euVatRegime       EuVatRegime? @map("eu_vat_regime")
+  euVatLineAccount  String?    @map("eu_vat_line_account")
+  euVatRegimeStampedAt DateTime? @map("eu_vat_regime_stamped_at")
+  euVatRegimeBasis  Json?      @map("eu_vat_regime_basis")
   invoiceNumber     String?    // generated invoice reference
   invoicedAt        DateTime?
   paymentDueAt      DateTime?
@@ -4098,6 +4117,10 @@ model ExternalWmsBinding {
   discrepancyThresholds Json?
   reportRecipients     String[]               @default([])
   alignmentConfirmedAt DateTime?
+  /// When this binding was last pointed at a different IMS warehouse, Mintsoft warehouse or
+  /// connection (or created). A dry run only counts as evidence for the pairing if it STARTED after
+  /// this instant, so evidence from an earlier pairing is never reused, even after pointing back.
+  pairingChangedAt     DateTime               @default(now())
   /// q66in.4.6: when the watchdog last alerted that this binding's stock sync
   /// is stale (dedupe); cleared by the next successful sync.
   staleSyncAlertedAt   DateTime?

@@ -523,7 +523,9 @@ test('a partial refusal is not reported as plain success (o3d-0m56)', async () =
     const source = await readFile(path.join(process.cwd(), file), 'utf8')
     assert.match(source, pattern, `${file} must carry refused through`)
   }
-  for (const file of ['app/(dashboard)/sync/xero-client.tsx', 'app/(dashboard)/sync/failed-sync-banner.tsx']) {
+  // Both bulk entry points (banner and sync-log button) render the outcome through the one shared
+  // confirmation dialog, so that is the file that must carry it.
+  for (const file of ['app/(dashboard)/sync/retry-all-failed-dialog.tsx']) {
     const source = await readFile(path.join(process.cwd(), file), 'utf8')
     assert.match(source, /result\.refused|res\.refused/, `${file} must render the refused count`)
     assert.match(source, /could post a /, `${file} must say WHY they were not re-queued`)

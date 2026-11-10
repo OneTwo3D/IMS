@@ -18,6 +18,7 @@ import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { ProductLink } from '@/components/inventory/product-link'
 import { formatCountryDisplay, toIsoCountryCode } from '@/lib/countries'
 import { formatMoney } from '@/lib/utils'
+import { INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE, inclusivePricesWithoutOrderRate } from '@/lib/domain/sales/sales-order-vat-basis'
 import type { TaxCategory } from '@/app/generated/prisma/client'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 
@@ -478,6 +479,11 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
     setError('')
     if (!customerId && !customerName.trim()) { setError('Select or enter a customer'); return }
     if (!lines.length) { setError('Add at least one product'); return }
+    // The server refuses this too; saying so here saves the round trip (see lib/domain/sales/sales-order-vat-basis.ts).
+    if (inclusivePricesWithoutOrderRate({ pricesIncludeVat, orderRate: vatRate, anyLineCarriesVat: lines.some((l) => l.taxRateValue > 0) })) {
+      setError(INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE)
+      return
+    }
 
     startTransition(async () => {
       const resolvedName = customerName || allCustomers.find((c) => c.id === customerId)?.fullName || ''
@@ -602,12 +608,11 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                       <option key={t.id} value={t.id}>{t.name} ({(t.rate * 100).toFixed(0)}%)</option>
                     ))}
                   </select>
-                  {taxRateId && (
-                    <label className="flex items-center gap-1.5 text-sm whitespace-nowrap cursor-pointer">
-                      <input type="checkbox" checked={pricesIncludeVat} onChange={(e) => toggleIncludeVat(e.target.checked)} className="rounded border-input" />
-                      Incl. VAT
-                    </label>
-                  )}
+                  {/* Always shown: with "No VAT" it used to be hidden while the (default) ticked state still applied, so the prices were read as gross with no way to see or change that. */}
+                  <label className="flex items-center gap-1.5 text-sm whitespace-nowrap cursor-pointer">
+                    <input type="checkbox" checked={pricesIncludeVat} onChange={(e) => toggleIncludeVat(e.target.checked)} className="rounded border-input" />
+                    Incl. VAT
+                  </label>
                 </div>
               </div>
               <div className="space-y-1.5">

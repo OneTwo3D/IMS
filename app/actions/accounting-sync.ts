@@ -19,6 +19,7 @@ import {
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
 import { freshAuthFailureResult, requireInternalUser, requirePermission, requireRole } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
+import { type BulkRetryConfirmation } from '@/lib/typed-confirmation'
 import { probeLedgerSettlement } from '@/lib/connectors/accounting-settlement-probe'
 import {
   classifyLedgerSettlement,
@@ -206,6 +207,8 @@ export type FailedAccountingSyncSummary = {
   connector: string | null
   /** Terminally-FAILED rows (retries exhausted) on the active connector. */
   failedCount: number
+  /** The ids behind failedCount: what a bulk retry is confirmed against. */
+  failedRowIds?: string[]
 }
 
 /**
@@ -218,11 +221,12 @@ export type FailedAccountingSyncSummary = {
 export async function getFailedAccountingSyncSummary(): Promise<FailedAccountingSyncSummary> {
   await requireInternalUser()
   const connector = await getActiveConnector()
-  if (!connector) return { connector: null, failedCount: 0 }
-  const failedCount = await db.accountingSyncLog.count({
+  if (!connector) return { connector: null, failedCount: 0, failedRowIds: [] }
+  const failedRows = await db.accountingSyncLog.findMany({
     where: { connector, status: 'FAILED' },
+    select: { id: true },
   })
-  return { connector, failedCount }
+  return { connector, failedCount: failedRows.length, failedRowIds: failedRows.map((row) => row.id) }
 }
 
 
@@ -758,10 +762,12 @@ export async function triggerAccountingSync(): Promise<{ success: boolean; resul
 export async function retryFailedAccountingSync(
   entryId?: string,
   expectedAttemptRevision?: number,
-): Promise<{ success: boolean; reset: number; refused?: number; error?: string }> {
+  bulkConfirmation?: BulkRetryConfirmation,
+): Promise<{ success: boolean; reset: number; refused?: number; error?: string; code?: string }> {
   await requirePermission('sync')
+  // The bulk confirmation is enforced inside the connector's retry, which every caller reaches.
   const connector = await getActiveAccountingConnector()
-  return (connector ?? getAccountingConnector('xero')).retryFailedSync(entryId, expectedAttemptRevision)
+  return (connector ?? getAccountingConnector('xero')).retryFailedSync(entryId, expectedAttemptRevision, bulkConfirmation)
 }
 
 /**

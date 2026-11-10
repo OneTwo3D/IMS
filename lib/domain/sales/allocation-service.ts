@@ -129,6 +129,8 @@ export type AllocationServiceClient = Prisma.TransactionClient | typeof db
 
 export type AllocateSalesOrderInput = {
   orderId: string
+  /** The client passed is the caller's open transaction: run the allocation in it (no nested transaction). */
+  runInCallerTransaction?: boolean
   refuseIfShipmentsExist?: boolean
   /**
    * o3d-4kfh r5 (Codex finding 4): the NARROWER refusal — decline only when a COMMITTED
@@ -3394,6 +3396,19 @@ export async function allocateSalesOrder(
     // owns. Skipped BEFORE the first write (resetAllocationAccountingIfStaged) so the no-op is total.
     // zeroDemand is exempt on purpose — see requireStatusUnderLock's doc comment: releasing a
     // cancelled/fully-refunded order's reservations is always correct, so it must not be short-circuited.
+    // A DRAFT is not allocated here, whoever asks. A draft holds no stock and queues no invoice; it becomes live only through
+    // updateSalesOrderStatus, which moves it off DRAFT first and THEN allocates and queues the sales invoice. Allocating a draft
+    // used to promote it to ALLOCATED right here, which skipped that finalisation: the order shipped with no invoice ever queued
+    // (a clone, a CSV-imported draft, or the detail page's "Allocated" button on a draft). Read UNDER the lock, like every status
+    // decision in this transaction, and before the first write, so the refusal is total.
+    if (!zeroDemand && lockedStatus === 'DRAFT') {
+      return {
+        nextAllocations: [],
+        syncProductIds: [],
+        refused: false as const,
+        skippedStatus: lockedStatus,
+      }
+    }
     if (
       !zeroDemand &&
       input.requireStatusUnderLock &&
@@ -4104,7 +4119,7 @@ export async function allocateSalesOrder(
     // is how a concurrent PROCESSING→ON_HOLD (or →CANCELLED) got resumed to ALLOCATED off a value
     // that was no longer true (o3d-2s8, Codex review of #496). ON_HOLD/CANCELLED are not in the set,
     // so a held or cancelled order keeps its status; it is simply not un-paused by allocation.
-    if (nextAllocations.length > 0 && ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING'].includes(lockedStatus)) {
+    if (nextAllocations.length > 0 && ['PENDING_PAYMENT', 'PROCESSING'].includes(lockedStatus)) {
       const transition = validateSalesOrderStatusTransition(lockedStatus, 'ALLOCATED')
       if (!transition.success) throw new Error(transition.error)
       await tx.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
@@ -4194,9 +4209,12 @@ export async function allocateSalesOrder(
     }
   }
 
-  const allocationResult = canRunTransaction(client)
+  // `runInCallerTransaction`: the client IS the caller's open interactive transaction. An interactive transaction client still exposes `$transaction` (Prisma nests it
+  // as a savepoint on a stack shared by the whole client), and nesting there left the stack holding the finished transaction, so the NEXT transaction on the client
+  // tried to start inside a committed one. The allocation joins the caller's transaction instead: no nesting, one commit.
+  const allocationResult = canRunTransaction(client) && !input.runInCallerTransaction
     ? await client.$transaction(runAllocation, ALLOCATION_TX_OPTIONS)
-    : await runAllocation(client)
+    : await runAllocation(client as Prisma.TransactionClient)
 
   // o3d-6ab: the under-lock status no longer satisfied requireStatusUnderLock. Nothing was written and
   // the transaction is a no-op, so this is neither a success nor a failure — `error` stays undefined so
@@ -4205,6 +4223,9 @@ export async function allocateSalesOrder(
   if (allocationResult.skippedStatus) {
     return {
       success: false,
+      // Only a DRAFT carries a message: a stale-status skip of a batch caller is deliberately silent (o3d-6ab), but an operator
+      // who asked to allocate a draft must be told why nothing happened.
+      ...(allocationResult.skippedStatus === 'DRAFT' ? { error: 'A draft order is not allocated. Finalise the order (move it out of Draft) and stock is allocated and the invoice queued then.' } : {}),
       syncProductIds: [],
       allocationCount: 0,
       unallocatedLines: [],

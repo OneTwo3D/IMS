@@ -6,6 +6,7 @@ import { freshAuthFailureResult, requireAdmin, requireFreshAdmin } from '@/lib/a
 import { logActivity } from '@/lib/activity-log'
 import { getBackupDir } from '@/lib/backup-storage'
 import { backupManifestPath } from '@/lib/backup-manifest'
+import { CONFIRMATION_REQUIRED_CODE, isExplicitlyConfirmed, typedConfirmationMatches, type ActionConfirmation } from '@/lib/typed-confirmation'
 
 const BACKUP_DIR = getBackupDir()
 
@@ -43,7 +44,7 @@ export async function listBackups(): Promise<BackupEntry[]> {
   }
 }
 
-export async function deleteBackup(filename: string): Promise<{ success: boolean; error?: string; code?: string; reason?: string }> {
+export async function deleteBackup(filename: string, confirmation?: ActionConfirmation): Promise<{ success: boolean; error?: string; code?: string; reason?: string }> {
   try {
     await requireFreshAdmin()
   } catch (error) {
@@ -55,6 +56,17 @@ export async function deleteBackup(filename: string): Promise<{ success: boolean
   // Prevent path traversal
   const safe = path.basename(filename)
   if (!safe.endsWith('.sql') && !safe.endsWith('.dump')) return { success: false, error: 'Invalid file' }
+
+  // Deleting a backup is irreversible, so the caller must say it was confirmed AND name the file.
+  // Checked after the permission/step-up gate (so an unauthorised caller learns nothing) and before
+  // any file is touched.
+  if (!isExplicitlyConfirmed(confirmation) || !typedConfirmationMatches(confirmation.typedName, safe)) {
+    return {
+      success: false,
+      code: CONFIRMATION_REQUIRED_CODE,
+      error: 'Deleting a backup needs an explicit confirmation that names the file. Nothing was deleted.',
+    }
+  }
 
   try {
     const backupPath = path.join(BACKUP_DIR, safe)
