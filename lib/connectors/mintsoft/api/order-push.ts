@@ -41,6 +41,17 @@ const MINTSOFT_STATUS_ON_BACKORDER = 9
 /** Order/Search returns at most this many rows; a response this size may have been cut short. */
 const MINTSOFT_SEARCH_PAGE = 10
 
+/**
+ * THE ONE STATUS PREDICATE for "may IMS treat this Mintsoft order as the live one?", shared by the read-back before binding, the by-id
+ * verification and the by-reference verification so they cannot drift apart: a PRESENT status that is not CANCELLED is live; CANCELLED is
+ * dead; an absent status proves nothing.
+ */
+function orderLiveness(row: RawOrder): 'live' | 'cancelled' | 'unknown' {
+  const status = orderStatusId(row)
+  if (status === null) return 'unknown'
+  return status === MINTSOFT_STATUS_CANCELLED ? 'cancelled' : 'live'
+}
+
 function orderStatusId(row: RawOrder): number | null {
   const value = row.OrderStatusId
   const n = typeof value === 'number' ? value : Number.parseInt(toStr(value) ?? '', 10)
@@ -216,9 +227,9 @@ async function readBackLiveOrder(id: string, clientId: number, identity: { order
   if (toStr(row.OrderNumber) !== identity.orderNumber || !identity.externalReference || toStr(row.ExternalOrderReference) !== identity.externalReference) {
     return { ok: false, kind: 'unconfirmed', reason: 'Mintsoft holds an order under this number but the read-back does not carry this order\'s own number and reference, so it was not linked' }
   }
-  const status = orderStatusId(row)
-  if (status === null) return { ok: false, kind: 'unconfirmed', reason: 'Mintsoft holds this order but its status could not be read, so it was not linked' }
-  if (status === MINTSOFT_STATUS_CANCELLED) {
+  const liveness = orderLiveness(row)
+  if (liveness === 'unknown') return { ok: false, kind: 'unconfirmed', reason: 'Mintsoft holds this order but its status could not be read, so it was not linked' }
+  if (liveness === 'cancelled') {
     return { ok: false, kind: 'cancelled', reason: 'Mintsoft holds this order but it is CANCELLED there (a cancelled order keeps its number), so it was not linked' }
   }
   return { ok: true }
@@ -563,9 +574,9 @@ export async function verifyMintsoftPushedOrder(
       if (rowId && rowId === externalOrderId) {
         // BOTH have to agree: the tenant AND the order. Tenant alone says only
         // "we may touch this row", not "this row is the order we created".
-        // An order that is already CANCELLED is never proved ours: a link must not become SYNCED against a dead order. It stays unproven
-        // (retried, then quarantined for an operator).
-        if (rowClient === String(clientId) && identifies(row)) return orderStatusId(row) === MINTSOFT_STATUS_CANCELLED ? 'unknown' : 'ours'
+        // Only a PRESENT, non-CANCELLED status proves a live order ours: a link must not become SYNCED against a dead one, nor on a row that
+        // says nothing about its status. Otherwise it stays unproven (retried, then quarantined for an operator).
+        if (rowClient === String(clientId) && identifies(row)) return orderLiveness(row) === 'live' ? 'ours' : 'unknown'
         if (rowClient && rowClient !== String(clientId)) return 'foreign'
         if (rowClient === String(clientId)) {
           // Ours to touch, but it is somebody else's ORDER. Not 'foreign' in the
@@ -590,7 +601,7 @@ export async function verifyMintsoftPushedOrder(
           .map((row) => assertMintsoftOrderClient(row, clientId, 'Mintsoft Order/Search (push verify)'))
           .filter(identifies)
           // Only a row whose status is KNOWN and not CANCELLED proves a live order (an absent status proves nothing).
-          .filter((row) => { const st = orderStatusId(row); return st !== null && st !== MINTSOFT_STATUS_CANCELLED })
+          .filter((row) => orderLiveness(row) === 'live')
         if (rows.some((row) => toStr(row.ID ?? row.Id ?? row.id) === externalOrderId)) return 'ours'
       }
     } catch {

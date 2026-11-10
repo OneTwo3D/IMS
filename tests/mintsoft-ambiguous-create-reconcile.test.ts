@@ -415,3 +415,14 @@ test('R8: the read-back itself checks identity - a detail row with another numbe
     assert.match((result as { reason: string }).reason, /own number and reference/)
   }
 })
+
+test('R9: a matching detail row with NO OrderStatusId is never proved ours (it must not reach SYNCED)', async () => {
+  reset()
+  const { verifyMintsoftPushedOrder } = await push()
+  const ref = { orderNumber: 'WC-1001', externalReference: 'REF-1001' }
+  details.set('555', { ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT })
+  searchRows = [{ ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT }]
+  assert.equal(await verifyMintsoftPushedOrder('555', ref), 'unknown', 'by id and by reference, a missing status proves nothing')
+  details.set('555', { ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 })
+  assert.equal(await verifyMintsoftPushedOrder('555', ref), 'ours', 'control: a present, live status verifies')
+})
