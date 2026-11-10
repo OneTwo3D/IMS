@@ -42,6 +42,11 @@ export function isPurchaseOrderEditableStatus(status: string): boolean {
 export const PO_EDIT_REFUSED_STATUS_MESSAGE =
   'This purchase order can no longer be edited. Only orders from Draft through Part-received can be changed.'
 
+export const PO_COST_LINES_PART_RECEIVED_MESSAGE =
+  'This order has freight or other cost lines spread across all of its lines, and part of it has been received. '
+  + 'Changing quantities, prices or discounts, or adding or removing lines, would change the cost of goods already in stock. '
+  + 'Close the unreceived balance and raise a new order for any extra goods.'
+
 export type PoEditLineFact = {
   id: string
   productId: string
@@ -274,12 +279,7 @@ export function planLineAmend(facts: PoEditFacts, requested: readonly RequestedE
       return { ok: false, error: 'This edit would leave nothing outstanding on the order. To drop the unreceived balance, use Close instead.' }
     }
     if (facts.hasCostLines && (keep.some((k) => k.qtyChanged) || create.length > 0 || removed.length > 0)) {
-      return {
-        ok: false,
-        error: 'This order has freight or other cost lines spread across all of its lines, and part of it has been received. '
-          + 'Changing quantities or adding or removing lines would change the cost of goods already in stock. '
-          + 'Close the unreceived balance and raise a new order for any extra goods.',
-      }
+      return { ok: false, error: PO_COST_LINES_PART_RECEIVED_MESSAGE }
     }
   }
 

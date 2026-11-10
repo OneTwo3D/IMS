@@ -172,3 +172,8 @@ test('cost-line comparison ignores order, zero lines and blank descriptions', ()
   ])
   assert.deepEqual(a, b)
 })
+
+test('the part-received cost-line refusal message names prices as well as quantities', async () => {
+  const { PO_COST_LINES_PART_RECEIVED_MESSAGE } = await import('@/lib/domain/purchasing/po-edit-plan')
+  assert.match(PO_COST_LINES_PART_RECEIVED_MESSAGE, /quantities, prices or discounts/)
+})

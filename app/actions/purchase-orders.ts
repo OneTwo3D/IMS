@@ -111,6 +111,7 @@ import {
   isPurchaseOrderEditableStatus,
   normaliseCostLinesForCompare,
   planLineAmend,
+  PO_COST_LINES_PART_RECEIVED_MESSAGE,
   PO_EDIT_REFUSED_STATUS_MESSAGE,
   readPoEditFacts,
   unitCostMatchesStored,
@@ -1775,6 +1776,12 @@ export async function updatePurchaseOrder(
               })
               finalRows.push(scaled)
             } else {
+              // A price or discount change moves this line's value, which is the allocation basis of BY_VALUE freight. Once any
+              // quantity has landed and the order carries contributing costs, that would change the cost of goods already in
+              // stock (nothing revalues them), exactly as a quantity or line-set change would.
+              if (editFacts.anyLanded && editFacts.hasCostLines && !unitCostMatchesStored(row.unitCostForeign, k.fact.unitCostForeign)) {
+                return { refused: PO_COST_LINES_PART_RECEIVED_MESSAGE }
+              }
               const { poId: _poId, ...rowData } = row
               lineUpdates.push({ id: k.fact.id, data: rowData })
               finalRows.push(row)

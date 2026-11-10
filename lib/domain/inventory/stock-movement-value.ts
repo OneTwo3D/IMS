@@ -90,12 +90,12 @@ export function buildStockMovementValueFields(params: {
  * (`NegativeCostSnapshotEntryError` in lib/domain/inventory/transfer-cost-layer-recreation.ts).
  *
  * THIS FUNCTION IS NOT A CHOKE POINT for every costed movement, and must not be described
- * as one. It is one of TWO builders. The sibling above is called directly by THIRTEEN
- * production writers that never reach this one — opening stock, purchase receipt, PO
- * cancellation reversal, customer-return inbound, the positive half of a stock adjustment,
+ * as one. It is one of TWO builders. The sibling above is called directly by TWELVE
+ * production writers that never reach this one — opening stock, purchase receipt,
+ * customer-return inbound, the positive half of a stock adjustment,
  * the adjustment-edit addition branch, the WooCommerce and CSV historical imports, the
  * WMS stock-sync allocation path, and three WMS booked-in paths. Negative-basis cover comes from
- * BOTH builders refusing (25 production call sites between them), not from this one being a
+ * BOTH builders refusing (24 production call sites between them), not from this one being a
  * funnel. The TWELVE call sites that do reach here — five direct, seven via
  * `buildStockMovementValueFieldsFromConsumed` — are the FIFO-consumption and
  * snapshot-valued paths the transfer helper never covered: sales dispatch, TRANSFER_OUT,
