@@ -183,7 +183,7 @@ test('a wrapped job refused for want of a secret reports FAILURE to the wrapper;
     // A stub o3d-hc with the real contract: ping start, run, ping the exit code, exit with it.
     writeFileSync(path.join(bin, 'o3d-hc'), `#!/bin/sh\nslug=$1; shift 2\necho "start $slug" >> "${dir}/pings"\n"$@"\nrc=$?\necho "end $slug $rc" >> "${dir}/pings"\nexit $rc\n`, { mode: 0o755 })
     const block = (hb: typeof ON | null) => {
-      const out = buildOtiCrontabBlock({ jobs: [JOBS[0]!], settings: new Map(), secretRef: { kind: 'env-file', envFilePath: path.join(dir, 'missing.env') }, baseUrl: 'http://x', logPath: path.join(dir, 'cron.log'), heartbeats: hb })
+      const out = buildOtiCrontabBlock({ jobs: [JOBS[0]!], settings: new Map(), secretRef: { kind: 'env-file', envFilePath: path.join(dir, 'missing.env') }, baseUrl: 'http://127.0.0.1', logPath: path.join(dir, 'cron.log'), heartbeats: hb })
       assert.ok(out.ok)
       return out.lines.find((l) => l.startsWith('25 * * * *'))!.replace(/^25 \* \* \* \* {2}/, '').replace('/usr/local/bin/o3d-hc', path.join(bin, 'o3d-hc'))
     }

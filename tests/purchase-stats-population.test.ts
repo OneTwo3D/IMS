@@ -12,7 +12,7 @@ import {
 // still-incoming statuses so a terminal PO carries no phantom balance.
 
 mock.module('@/lib/auth/server', {
-  namedExports: { requirePermission: async () => ({ user: { id: 'u1' } }) },
+  namedExports: { requirePermission: async () => ({ user: { id: 'u1', role: 'ADMIN' } }) },
 })
 
 // A minimal, faithful evaluator of the WHERE the action actually passes, so the test exercises the

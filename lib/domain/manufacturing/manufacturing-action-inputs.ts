@@ -88,3 +88,25 @@ export function parseManufacturingCostLines(
 
   return { success: true, lines: parsed }
 }
+
+/**
+ * The first cost line whose account override is not the configured Manufacturing Overhead account, or null.
+ * Lines with no override (the default applies) and the configured code itself pass.
+ */
+export function findDisallowedOverheadOverride(
+  lines: ReadonlyArray<{ description: string; accountCode?: string | null }>,
+  configuredOverheadAccount: string | null | undefined,
+): { description: string; accountCode: string } | null {
+  const configured = configuredOverheadAccount?.trim() ?? ''
+  for (const line of lines) {
+    const code = line.accountCode?.trim()
+    if (code && code !== configured) return { description: line.description, accountCode: code }
+  }
+  return null
+}
+
+export function overheadOverrideRefusal(line: { description: string; accountCode: string }, configuredOverheadAccount: string | null | undefined): string {
+  const configured = configuredOverheadAccount?.trim()
+  return `cost line "${line.description}" is set to account ${line.accountCode}, which is not the Manufacturing Overhead account configured in Settings`
+    + `${configured ? ` (${configured})` : ' (none is configured)'}. Nothing was posted.`
+}

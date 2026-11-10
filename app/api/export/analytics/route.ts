@@ -6,6 +6,7 @@ import { generateForecasts } from '@/app/actions/forecasting'
 import { toCsv, csvResponseFor } from '@/lib/csv'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
+import { canAccessPurchasingAnalytics } from '@/lib/security/purchasing-analytics-access'
 import {
   SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED,
   SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS,
@@ -19,6 +20,9 @@ export async function GET(req: NextRequest) {
 
   const type = req.nextUrl.searchParams.get('type') ?? 'products'
   if (!hasPermission(session.user.role, 'analytics')) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  }
+  if (type.startsWith('po_') && !canAccessPurchasingAnalytics(session.user.role)) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
   const dateFrom = req.nextUrl.searchParams.get('from') ?? undefined
