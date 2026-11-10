@@ -8,7 +8,7 @@ import { getFxSourceRegime, type FxSourceRegime } from '@/lib/currencies/fx-sour
 import { multiplyMoney, roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
-import { INVOICED_ORDER_WHERE, invoicedInPeriodWhere, invoicedPeriodDateIsApproximate } from '@/lib/domain/sales/invoiced-revenue-basis'
+import { invoicedInPeriodWhere, invoicedPeriodDate, invoicedPeriodDateIsApproximate } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 
 const DEFAULT_PAGE_SIZE = 100
@@ -688,8 +688,10 @@ export async function getArAgingReport(
   const orders = await client.salesOrder.findMany({
     where: {
       archived: false,
-      // Invoiced basis (shared with the revenue reports). Owed from the invoice date, else the order date (not paidAt: a since-paid invoice was still owed before payment).
-      AND: [INVOICED_ORDER_WHERE, { OR: [{ invoicedAt: { lt: asOfExclusive } }, { invoicedAt: null, createdAt: { lt: asOfExclusive } }] }, { OR: [{ paidAt: null }, { paidAt: { gte: asOfExclusive } }, { payments: { some: { refundId: null, paidAt: { lt: asOfExclusive } } } }] }],
+      // Invoiced basis (shared with the revenue reports), dated by the same invoice date as the period
+      // reports (invoicedAt, else paidAt, else the order date): an order is in AR at the cutoff only if
+      // that date is on or before it and the order is not yet paid at it.
+      AND: [invoicedInPeriodWhere({ lt: asOfExclusive }), { OR: [{ paidAt: null }, { paidAt: { gte: asOfExclusive } }, { payments: { some: { refundId: null, paidAt: { lt: asOfExclusive } } } }] }],
     },
     select: {
       id: true,
@@ -748,7 +750,7 @@ export async function getArAgingReport(
       }
       byCustomer.set(key, row)
     }
-    const dueDate = order.paymentDueAt ?? order.invoicedAt ?? order.createdAt
+    const dueDate = order.paymentDueAt ?? invoicedPeriodDate(order)
     const bucket = bucketAmount(ageDays(asOf, dueDate), outstanding, buckets)
     row.current = row.current.add(bucket.current)
     row.bucket1 = row.bucket1.add(bucket.bucket1)
@@ -779,12 +781,11 @@ export async function getArAgingReport(
     bucket2Days: String(buckets[1]),
     bucket3Days: String(buckets[2]),
   }, [
-    `AR aging is as of ${dateOnly(asOf)}. Outstanding balance is SalesOrder.totalBase minus non-refund payments and refund payments paid on or before that date; due date is paymentDueAt, falling back to invoicedAt and then createdAt.`,
+    `AR aging is as of ${dateOnly(asOf)}. Outstanding balance is SalesOrder.totalBase minus non-refund payments and refund payments paid on or before that date; due date is paymentDueAt, falling back to the invoice date: invoicedAt, else paidAt, else createdAt (shown as approximate).`,
     'Customer credit balances are excluded from aging buckets and surfaced in totals.creditBalanceBase.',
     `Bucket boundaries are configurable through bucket1Days/bucket2Days/bucket3Days and currently use ${buckets[0]}/${buckets[1]}/${buckets[2]} days.`,
     ...bucketResult.notices,
-    // Receivable from the invoice date, else from the order date: an invoice that has since been paid was still owed before it was paid, so paidAt cannot stand in here.
-    ...approximateDateNotice(orders.map((o) => ({ invoicedAt: (o as { invoicedAt?: Date | null }).invoicedAt, paidAt: null }))),
+    ...approximateDateNotice(orders as Array<{ invoicedAt?: Date | null; paidAt?: Date | null }>),
   ], options.paginate !== false)
 }
 

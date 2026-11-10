@@ -157,7 +157,7 @@ The Gross Margin and COGS reports use the same invoiced orders for revenue and c
 | Report | What it shows |
 |---|---|
 | **VAT** | Output and input VAT by side / reporting category / jurisdiction / tax rate, for invoiced non-cancelled sales orders and purchase-invoice lines in the selected period. |
-| **AR Aging** | Outstanding balances on invoiced sales orders (the same invoiced basis as the revenue reports, so drafts, cancelled orders and orders with no invoice are not receivables) by customer and aging bucket (Current / 1–30 / 31–60 / 61–90 / 90+). |
+| **AR Aging** | Outstanding balances on invoiced sales orders (the same invoiced basis and invoice date as the revenue reports, so drafts, cancelled orders and orders with no invoice are not receivables) by customer and aging bucket (Current / 1–30 / 31–60 / 61–90 / 90+). |
 | **AP Aging** | Outstanding purchase-invoice balances by supplier and aging bucket. |
 | **FX Gain/Loss** | Booked versus settlement FX delta for multi-currency transactions using IMS FX-rate semantics (realised + unrealised). |
 

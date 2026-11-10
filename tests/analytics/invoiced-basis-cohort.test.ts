@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import { Prisma, SalesOrderStatus } from '@/app/generated/prisma/client'
-import { getCurrencySummaryReport, type FinanceAnalyticsClient } from '@/lib/domain/finance/finance-period-analytics'
+import { getArAgingReport, getCurrencySummaryReport, type FinanceAnalyticsClient } from '@/lib/domain/finance/finance-period-analytics'
 import { getMarginAnalyticsReport, type SalesFulfillmentAnalyticsClient } from '@/lib/domain/sales/sales-fulfillment-analytics'
 import { invoicedPeriodDate, isInvoicedOrder } from '@/lib/domain/sales/invoiced-revenue-basis'
 
@@ -221,6 +221,31 @@ test('an unpaid Xeroom-era order with no invoice date is dated by the order date
   const client = { salesOrder: { findMany: async (args?: { where?: Row }) => INVOICE_ORDERS.filter((o) => matches(o, args?.where)) }, salesOrderLine: none, payment: none, purchaseInvoice: none, fxRate: none } as FinanceAnalyticsClient
   const may = await getCurrencySummaryReport({ dateFrom: '2026-05-01', dateTo: '2026-05-31' }, { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z'), baseCurrency: async () => 'GBP' } })
   assert.ok(may.notices.some((n) => /approximate/.test(n)), 'the report says some orders are dated approximately')
+})
+
+function arReport(orders: Row[], dateTo: string) {
+  const client = { salesOrder: { findMany: async (args?: { where?: Row }) => orders.filter((o) => matches(o, args?.where)) }, salesOrderLine: none, payment: none, purchaseInvoice: none, fxRate: none } as FinanceAnalyticsClient
+  return getArAgingReport({ dateTo }, { deps: { client, now: () => new Date(`${dateTo}T12:00:00.000Z`), baseCurrency: async () => 'GBP' } })
+}
+
+test('AR as-of: a Xeroom order created in October and paid in November is not October AR, nor November AR after payment', async () => {
+  // No invoicedAt: Xeroom invoices as the order is paid, so the invoice date is the paid date (2 Nov).
+  const paid = new Date('2026-11-02T09:00:00.000Z')
+  const order = salesOrder('arx', {
+    invoiceNumber: 'INV-130', createdAt: new Date('2026-10-31T22:00:00.000Z'), paidAt: paid,
+    payments: [{ amount: D(40), paidAt: paid, refundId: null, currency: 'GBP' }], totalBase: D(40), totalForeign: D(40),
+  })
+  assert.equal(Number((await arReport([order], '2026-10-31')).totals.outstandingBase), 0, 'no invoice yet on 31 Oct')
+  assert.equal(Number((await arReport([order], '2026-11-30')).totals.outstandingBase), 0, 'paid on 2 Nov, so nothing owed on 30 Nov')
+})
+
+test('AR as-of: an unpaid Xeroom order with no invoice date is owed from its order date, with the approximate notice', async () => {
+  const order = salesOrder('aru', { invoiceNumber: 'INV-131', createdAt: new Date('2026-10-10T12:00:00.000Z'), totalBase: D(70), totalForeign: D(70), payments: [] })
+  const report = await arReport([order], '2026-10-31')
+  assert.equal(Number(report.totals.outstandingBase), 70)
+  assert.ok(report.notices.some((n) => /approximate/.test(n)))
+  // And it is not owed before it existed.
+  assert.equal(Number((await arReport([order], '2026-10-05')).totals.outstandingBase), 0)
 })
 
 test('an IMS-minted invoice number with no posted invoice is not an invoiced order', () => {
