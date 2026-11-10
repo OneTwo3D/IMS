@@ -19,6 +19,7 @@
 import { createHash } from 'node:crypto'
 import { imsPercent as effectiveImsPercent } from '@/lib/reconciliation-pack/vat-set-identity'
 import type { TaxComponentRateRow, TaxRateRow } from '@/lib/reconciliation-pack/ims-readers'
+import { WOO_TAX_RATE_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { Prisma } from '@/app/generated/prisma/client'
 import { EU_ISO_CODES, VOEC_ISO_CODES } from '@/lib/connectors/xero/tax-rate-report-type'
 import type { XeroConnectionStamp } from '@/lib/connectors/xero/connection-fence'
@@ -392,7 +393,7 @@ export function planEuVatSeedApply(input: PreflightInput): SeedApplyPlan {
   return { seedVersion: input.seed.seedVersion, storeIdentity: input.storeIdentity, changes, unchanged, skipped, digest }
 }
 
-export const EU_VAT_SEED_REFUSAL_CODES = ['CONFIRM_REQUIRED', 'XERO_LIST_NOT_PROVEN', 'XERO_CONNECTION_CHANGED', 'WOO_STORE_CHANGED', 'DIGEST_MISMATCH', 'NOTHING_TO_APPLY', 'RATE_CHANGED_DURING_APPLY', 'RATE_REPLACED'] as const
+export const EU_VAT_SEED_REFUSAL_CODES = ['CONFIRM_REQUIRED', 'XERO_LIST_NOT_PROVEN', 'XERO_CONNECTION_CHANGED', 'WOO_STORE_CHANGED', 'MAPPING_WRITERS_BUSY', 'DIGEST_MISMATCH', 'NOTHING_TO_APPLY', 'RATE_CHANGED_DURING_APPLY', 'RATE_REPLACED'] as const
 export type EuVatSeedRefusalCode = (typeof EU_VAT_SEED_REFUSAL_CODES)[number]
 export type EuVatSeedApplyResult =
   | { applied: false; plan: SeedApplyPlan; refusal: { code: EuVatSeedRefusalCode; detail: string } | null }
@@ -402,6 +403,7 @@ const DIGEST_RE = /^[0-9a-f]{64}$/
 
 class SeedRaceError extends Error {}
 class WooStoreChangedError extends Error {}
+class MappingWritersBusyError extends Error {}
 
 /**
  * The write. In ONE transaction: the plan is rebuilt from the rows as they are now (a different digest writes nothing), then each change is a compare-and-set on the two columns it read, under
@@ -439,6 +441,15 @@ export async function applyEuVatSeed(db: { $transaction: <T>(fn: (tx: Client) =>
       const credentials = resolveWcCredentialsFromRows(credentialRows)
       const storeNow = credentials === null ? null : normaliseStoreIdentity(credentials.url)
       if (storeNow !== ctx.storeIdentity) throw new WooStoreChangedError('the WooCommerce store configured now is not the one this plan was made for')
+      // THE LOCK EVERY WRITER OF THE MAPPING TABLE TAKES (SHARED: lockStorefrontMappingWrites; the tax-rate writer's apply holds it EXCLUSIVE), taken EXCLUSIVE here and held to commit, BEFORE the mapping set is read: a
+      // row lock on a rate does not stop a mapping from being inserted or re-pointed at it (that takes only a key-share), so this is what makes the set the plan rests on the set that is committed. Order: Xero
+      // mapping-selection lock, WooCommerce credential lock, this one (the order the re-key and the credential save already follow). Tried, not waited for: a running tax-rate apply holds it for a whole network run.
+      let gotWriteLock = false
+      for (let attempt = 0; attempt < 10 && !gotWriteLock; attempt += 1) {
+        gotWriteLock = (await tx.$queryRaw<Array<{ ok: boolean }>>`SELECT pg_try_advisory_xact_lock(${WOO_TAX_RATE_WRITE_LOCK_KEY}::bigint) AS ok`)[0]?.ok === true
+        if (!gotWriteLock) await new Promise((resolve) => setTimeout(resolve, 150))
+      }
+      if (!gotWriteLock) throw new MappingWritersBusyError('a WooCommerce tax-rate apply or a mapping writer holds the mapping write lock; run the apply again')
       const plan = await snapshot(tx)
       if (plan.skipped.some((s) => s.reason === 'XERO_LIST_NOT_PROVEN')) return { applied: false, plan, refusal: { code: 'XERO_LIST_NOT_PROVEN', detail: plan.skipped[0]!.detail } }
       if (plan.digest !== confirm) return { applied: false, plan, refusal: { code: 'DIGEST_MISMATCH', detail: 'the plan changed since the dry run (or this is not its digest); run the dry run again' } }
@@ -483,6 +494,7 @@ export async function applyEuVatSeed(db: { $transaction: <T>(fn: (tx: Client) =>
       return { applied: true, plan, written: plan.changes.length }
     })
   } catch (error) {
+    if (error instanceof MappingWritersBusyError) return { applied: false, plan: await db.$transaction((tx) => snapshot(tx)), refusal: { code: 'MAPPING_WRITERS_BUSY', detail: error.message } }
     if (error instanceof WooStoreChangedError) return { applied: false, plan: await db.$transaction((tx) => snapshot(tx)), refusal: { code: 'WOO_STORE_CHANGED', detail: error.message } }
     if (error instanceof XeroConnectionChangedError) return { applied: false, plan: await db.$transaction((tx) => snapshot(tx)), refusal: { code: 'XERO_CONNECTION_CHANGED', detail: error.message } }
     if (error instanceof SeedRaceError) return { applied: false, plan: await db.$transaction((tx) => snapshot(tx)), refusal: { code: 'RATE_CHANGED_DURING_APPLY', detail: error.message } }

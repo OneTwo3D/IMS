@@ -41,7 +41,7 @@ export default async function SupplierRfqsPage() {
                 </TableCell>
                 <TableCell className="px-4">
                   <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">
-                    {r.status === 'RFQ_SENT' ? 'Awaiting Quote' : 'Draft'}
+                    Awaiting Quote
                   </span>
                 </TableCell>
                 <TableCell className="px-4 text-muted-foreground">{r.lineCount}</TableCell>
