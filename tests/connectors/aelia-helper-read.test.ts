@@ -88,8 +88,8 @@ function phpFunction(name: string): string {
   return PHP.slice(start, next > 0 ? next : undefined)
 }
 
-test('plugin source: version 1.3.0', () => {
-  assert.match(PHP, /^\s*\*\s*Version:\s+1\.3\.0\s*$/m)
+test('plugin source: version 1.3.1', () => {
+  assert.match(PHP, /^\s*\*\s*Version:\s+1\.3\.1\s*$/m)
 })
 
 test('plugin source: the route is /aelia-rates, GET only, authenticated by the same signature check as the other signed routes', () => {

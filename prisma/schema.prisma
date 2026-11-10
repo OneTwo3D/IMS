@@ -3595,6 +3595,11 @@ model ShoppingWebhookEvent {
   originAttestation String    @default("unproven:legacy-writer")
   status          String
   attempts        Int       @default(0)
+  /// Counts every claim of this row and is NEVER reset (unlike `attempts`, which an operator replay
+  /// restarts). The claim returns it; the terminal writes (processed / failed / dead-letter) match
+  /// on it and on status PROCESSING, so a worker whose claim expired and was taken over cannot
+  /// overwrite what the newer claim, a dead-letter or a replay has since done to the row.
+  claimGeneration Int       @default(0)
   nextAttemptAt   DateTime?
   processedAt     DateTime?
   lastError       String?
