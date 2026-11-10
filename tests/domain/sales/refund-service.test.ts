@@ -1414,12 +1414,36 @@ test('two lines of the same product cannot lend each other units: a line is refu
   assert.equal(state.refunds.length, 1)
 })
 
+// [mutation: the caller's productId kept on a validated line, or a differing value accepted]
+test('a public refund line takes its product from the locked order line; a forged productId is refused', async () => {
+  const flags = refundSafeguards({ isInternal: false })
+  for (const forged of [null, 'product-9']) {
+    const state = baseState()
+    const refused = await createSalesOrderRefund(createClient(state), {
+      orderId: 'order-1',
+      lines: [{ lineId: 'line-1', productId: forged, description: 'Product 1', qty: 1, totalForeign: 50, totalBase: 50, lineKind: 'sale' }],
+      reason: 'forged product', creditNotePrefix: 'CN-', ...flags,
+    })
+    assert.equal(refused.success, false, String(forged))
+    assert.match(refused.success === false ? refused.error : '', /different product/)
+    assert.equal(state.refunds.length, 0)
+  }
+  const ok = baseState()
+  const accepted = await createSalesOrderRefund(createClient(ok), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalForeign: 50, totalBase: 50, lineKind: 'sale' }],
+    reason: 'honest', creditNotePrefix: 'CN-', ...flags,
+  })
+  assert.equal(accepted.success, true, accepted.success ? '' : accepted.error)
+  assert.equal(ok.refundLines[0].productId, 'product-1')
+})
+
 test('a price-only refund above the line\'s stored net is refused when the per-target cap is on (public refunds)', async () => {
   const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 100, taxBase: 0 }] })
   state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget', qty: 2, totalBase: 50, totalForeign: 50 }
   const over = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
-    lines: [{ lineId: 'line-1', productId: null, description: 'Widget', qty: 0, totalForeign: 60, totalBase: 60, lineKind: 'sale' }],
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Widget', qty: 0, totalForeign: 60, totalBase: 60, lineKind: 'sale' }],
     reason: 'inflated',
     creditNotePrefix: 'CN-',
     enforcePerTargetBalances: true,

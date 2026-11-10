@@ -92,6 +92,7 @@ test(
 
       const extra = await refundOne(101)
       assert.equal(extra.success, false, 'the 101st unit does not exist')
+      assert.match(extra.success === false ? extra.error : '', /exceeds the 0 still refundable on that line/, 'refused by the line\'s own remaining quantity')
       const overCeiling = await createSalesOrderRefund(db, {
         orderId: order.id,
         lines: [{ lineId, productId: null, description: 'Tiny', qty: 0, totalForeign: 0.1, totalBase: 0.1, lineKind: 'sale' }],
@@ -101,7 +102,7 @@ test(
         deriveSaleLineNetsFromStoredBalance: true,
       })
       assert.equal(overCeiling.success, false)
-      assert.match(overCeiling.success === false ? overCeiling.error : '', /more than it has left to refund|exceed/)
+      assert.match(overCeiling.success === false ? overCeiling.error : '', /more than the 0\.50 it was paid/, 'refused on the grossed-up credit note against what the line was paid')
       assert.equal(await db.salesOrderRefundLine.count({ where: { refund: { orderId: order.id } } }), 100, 'nothing was written by the refusals')
     } finally {
       if (orderId) {

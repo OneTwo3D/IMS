@@ -241,10 +241,14 @@ export function creditNoteAmounts(
   order: { taxRatePercent: number | null; lines: ReadonlyArray<MoneyViewLine & { id: string }> },
   refund: { lines: ReadonlyArray<CreditNoteLineFacts> },
 ): { perLine: RefundAmounts[]; total: RefundAmounts } {
-  const perLine = refund.lines.map((rl) => {
+  const rateOf = (rl: CreditNoteLineFacts): number => {
     const orderLine = rl.salesOrderLineId ? order.lines.find((l) => l.id === rl.salesOrderLineId) : undefined
-    const rate = rl.vatRate ?? (orderLine ? lineVatRate(orderLine, order.taxRatePercent) : Number(order.taxRatePercent ?? 0))
-    return creditAmounts(round2(rl.postedNet), rate)
-  })
-  return { perLine, total: sumRefundAmounts(perLine) }
+    return rl.vatRate ?? (orderLine ? lineVatRate(orderLine, order.taxRatePercent) : Number(order.taxRatePercent ?? 0))
+  }
+  // Per-line figures are for display (each rounded to the minor unit); the TOTAL is summed from the unrounded 4 dp amounts and rounded once, so
+  // many tiny lines do not drift by a rounding error each.
+  const perLine = refund.lines.map((rl) => creditAmounts(round2(rl.postedNet), rateOf(rl)))
+  const rawNet = refund.lines.reduce((s, rl) => s + rl.postedNet, 0)
+  const rawVat = refund.lines.reduce((s, rl) => s + rl.postedNet * rateOf(rl), 0)
+  return { perLine, total: { net: round2(rawNet), vat: round2(rawVat), gross: round2(rawNet + rawVat) } }
 }

@@ -304,3 +304,12 @@ test('shipping/discount VAT joins the order default rate row, or prints as its o
   // One rate and no header: still adjustment-free when there is no residue.
   assert.deepEqual(documentVatRows({ taxRateName: null, taxRatePercent: null, taxForeign: 5, lines: [{ taxRatePercent: 0.05, taxForeign: 5 }] }), [{ label: 'VAT', amount: 5 }])
 })
+
+// [mutation: round each line before summing]
+test('a credit note total is summed from the unrounded amounts and rounded once', () => {
+  const order: Fixture = { ...manualExclusive20, taxRatePercent: 0, lines: [line('a', 'A', 1, 0.005, 0.005, 0, 0), line('b', 'B', 1, 0.005, 0.005, 0, 0)] }
+  const cn = creditNoteAmounts(order, { lines: [{ salesOrderLineId: 'a', postedNet: 0.005, vatRate: 0 }, { salesOrderLineId: 'b', postedNet: 0.005, vatRate: 0 }] })
+  assert.equal(cn.total.net, 0.01)
+  assert.equal(cn.total.gross, 0.01)
+  assert.equal(cn.perLine.length, 2)
+})

@@ -3795,6 +3795,17 @@ export async function createSalesOrderRefund(
     // Done before anything reads a line's amount or the refund's total. The caller's own figures are not read again: re-running on a
     // transaction retry re-derives the same cut from the same inputs.
     if (input.deriveSaleLineNetsFromStoredBalance) {
+      // The product a refund line names is the LOCKED order line's own: stock return and COGS key on it, so a caller cannot send null (or another
+      // product) to take a line's money and quantity without its stock. Any supplied value that differs is refused.
+      for (const [index, refundLine] of refundLines.entries()) {
+        if (!refundLine.lineId || (refundLine.lineKind ?? 'sale') !== 'sale') continue
+        const orderLine = so.lines.find((l) => l.id === refundLine.lineId)
+        if (!orderLine) continue // refused below / by the per-target check
+        if ((refundLine.productId ?? null) !== (orderLine.productId ?? null)) {
+          return { error: `Refund line "${refundLine.description}" names a different product from the order line it refunds.` } as const
+        }
+        refundLines[index] = { ...refundLine, productId: orderLine.productId ?? null }
+      }
       const linkedIds = [...new Set(refundLines.filter((l) => l.lineId && l.qty > 0 && (l.lineKind ?? 'sale') === 'sale').map((l) => l.lineId as string))]
       if (linkedIds.length) {
         const priorRows = await tx.salesOrderRefundLine.findMany({
