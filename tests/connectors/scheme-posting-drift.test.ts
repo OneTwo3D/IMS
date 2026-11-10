@@ -115,3 +115,11 @@ test('without the scheme check the sweep is what it was', async () => {
   const result = await sweepTaxRateDrift({ loadImsProfiles: async () => [], fetchXeroTaxRates: async () => [], recordDrift: async () => undefined })
   assert.deepEqual(result, { checked: 0, drifted: 0, items: [] })
 })
+
+test('an instance the declaration has not touched (no declared rate mapped, no scheme posting type anywhere) has nothing to drift from', () => {
+  const untouched = [{ taxRateId: 'x', name: 'X', active: true, accountingTaxType: 'OUTPUT2', reportingCategory: null, schemePostingTaxType: null }]
+  assert.deepEqual(computeSchemePostingDrift({ declared, mappings: [], rates: untouched, storeIdentity: null, xero: XERO }), [])
+  assert.deepEqual(computeSchemePostingDrift({ declared, mappings: [], rates: untouched, storeIdentity: STORE, xero: XERO }), [])
+  assert.notDeepEqual(computeSchemePostingDrift({ declared, mappings: [mapping(220)], rates: untouched, storeIdentity: STORE, xero: XERO }), [], 'one declared mapping engages it')
+  assert.notDeepEqual(computeSchemePostingDrift({ declared, mappings: [], rates: [{ ...untouched[0]!, schemePostingTaxType: 'TAX131' }], storeIdentity: STORE, xero: XERO }), [], 'one scheme posting type engages it')
+})

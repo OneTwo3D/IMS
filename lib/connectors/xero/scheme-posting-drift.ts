@@ -35,6 +35,9 @@ export function computeSchemePostingDrift(input: {
   const add = (id: string, line: string): void => { const lines = linesBy.get(id) ?? []; if (!lines.includes(line)) lines.push(line); linesBy.set(id, lines) }
   const issue = (line: string): void => add(MAPPING_ISSUES_ID, line)
   const named = new Set<string>()
+  // An instance the declaration has not touched at all (no declared WooCommerce rate mapped, no rate carrying a scheme posting type) has nothing to drift from.
+  const engaged = input.rates.some((r) => r.schemePostingTaxType !== null) || input.declared.some((d) => mappingBy.has(String(d.wooId)))
+  if (!engaged) return []
   if (input.storeIdentity === null) issue('No usable WooCommerce store is configured, so no declared mapping can be shown to belong to it and no scheme posting type is judged')
   for (const declared of input.declared) {
     if (input.storeIdentity === null) break
