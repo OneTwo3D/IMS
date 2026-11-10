@@ -8,7 +8,7 @@ import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { eraseCustomerPersonalData } from '@/lib/domain/erasure/erase-personal-data'
 import { openWarehouseOrdersWarning } from '@/lib/domain/erasure/warehouse-obligations'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
-import { orderTurnoverBase } from '@/lib/domain/sales/customer-turnover'
+import { orderTurnoverBase, REFUND_TURNOVER_SELECT } from '@/lib/domain/sales/customer-turnover'
 import { toIsoCountryCode } from '@/lib/countries'
 import {
   createCsvImportExecutionResult,
@@ -110,15 +110,6 @@ function normalizeAddress(address: AddressData | null | undefined): AddressData 
 
   return Object.keys(normalized).length > 0 ? normalized : Prisma.JsonNull
 }
-
-/** What `orderTurnoverBase` needs of each refund: its basis and total, and each line's stored tax. */
-const REFUND_TURNOVER_SELECT = {
-  select: {
-    totalBase: true,
-    totalsBasis: true,
-    lines: { select: { totalBase: true, salesOrderLine: { select: { totalBase: true, taxBase: true } } } },
-  },
-} as const
 
 type TurnoverOrderInput = Parameters<typeof orderTurnoverBase>[0]
 

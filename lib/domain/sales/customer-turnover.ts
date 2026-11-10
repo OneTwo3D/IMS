@@ -63,6 +63,41 @@ function netCreditAsGross(refund: TurnoverRefund): number | null {
  */
 export type TurnoverBound = 'exact' | 'upper' | 'indeterminate'
 
+/** What `refundCreditsAsGross` needs of each refund: its basis and total, and each line's stored net and tax. */
+export const REFUND_TURNOVER_SELECT = {
+  select: {
+    totalBase: true,
+    totalsBasis: true,
+    lines: { select: { totalBase: true, salesOrderLine: { select: { totalBase: true, taxBase: true } } } },
+  },
+} as const
+
+/**
+ * The credit an order's refunds represent in VAT-INCLUSIVE terms, and how far to trust it:
+ * `credit` is the sum of the credits that could be placed exactly, `bound` is `exact` when all were,
+ * `upper` when the unplaced ones are all positive (the true credit is at least `credit`, so what is
+ * owed or earned is at most the figure shown), and `indeterminate` otherwise. Shared by customer
+ * turnover and the aging reports so every screen reads a credit the same way.
+ */
+export function refundCreditsAsGross(refunds: TurnoverRefund[] | undefined): { credit: number; bound: TurnoverBound } {
+  let credit = 0
+  let bound: TurnoverBound = 'exact'
+  for (const refund of refunds ?? []) {
+    const placed = refund.totalsBasis === 'GROSS'
+      ? Number(refund.totalBase)
+      : refund.totalsBasis === 'NET' ? netCreditAsGross(refund) : null
+    if (placed == null) {
+      // Unplaced: a positive credit leaves the figure too high (upper bound); anything else could move it either way.
+      // A credit with any negative line is mixed-sign, so even a positive total proves nothing about its gross value.
+      const total = Number(refund.totalBase)
+      const mixed = (refund.lines ?? []).some((l) => !(Number(l.totalBase) >= 0))
+      if (!(Number.isFinite(total) && total > 0) || mixed) bound = 'indeterminate'
+      else if (bound === 'exact') bound = 'upper'
+    } else credit += placed
+  }
+  return { credit: round2(credit), bound }
+}
+
 export function orderTurnoverBase(order: {
   status: string
   invoiceNumber?: string | null
@@ -72,20 +107,6 @@ export function orderTurnoverBase(order: {
   refunds?: TurnoverRefund[]
 }): { value: number; complete: boolean; bound: TurnoverBound } | null {
   if (!isInvoicedOrder(order)) return null
-  let value = Number(order.totalBase)
-  let bound: TurnoverBound = 'exact'
-  for (const refund of order.refunds ?? []) {
-    const credit = refund.totalsBasis === 'GROSS'
-      ? Number(refund.totalBase)
-      : refund.totalsBasis === 'NET' ? netCreditAsGross(refund) : null
-    if (credit == null) {
-      // Unplaced: a positive credit leaves the figure too high (upper bound); anything else could move it either way.
-      // A credit with any negative line is mixed-sign, so even a positive total proves nothing about its gross value.
-      const total = Number(refund.totalBase)
-      const mixed = (refund.lines ?? []).some((l) => !(Number(l.totalBase) >= 0))
-      if (!(Number.isFinite(total) && total > 0) || mixed) bound = 'indeterminate'
-      else if (bound === 'exact') bound = 'upper'
-    } else value -= credit
-  }
-  return { value: round2(value), complete: bound === 'exact', bound }
+  const { credit, bound } = refundCreditsAsGross(order.refunds)
+  return { value: round2(Number(order.totalBase) - credit), complete: bound === 'exact', bound }
 }

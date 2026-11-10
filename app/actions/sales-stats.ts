@@ -5,6 +5,7 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
+import { refundCreditsAsGross, REFUND_TURNOVER_SELECT, type TurnoverBound } from '@/lib/domain/sales/customer-turnover'
 import { INVOICED_ORDER_WHERE, invoicedInPeriodWhere, invoicedPeriodDate, invoicedPeriodDateIsApproximate } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
@@ -467,7 +468,9 @@ export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promi
   const rows: InvoiceRow[] = []
   for (const o of orders) {
     const paid = o.payments.reduce((s, p) => s + Number(p.amount), 0)
-    const balance = Math.round((Number(o.totalBase) - paid) * 100) / 100
+    // Held as paid (`paidAt` set) means nothing is owed even when no Payment row exists (markSalesOrderPaid, the importer);
+    // otherwise Payment rows decide, so a partial payment still shows.
+    const balance = o.paidAt ? 0 : Math.round((Number(o.totalBase) - paid) * 100) / 100
     for (const l of o.lines) {
       rows.push({
         orderId: o.id, orderNumber: getSalesOrderReference(o),
@@ -596,6 +599,8 @@ export type CustomerAgingRow = {
    */
   netTotalBasis: RefundSetBasis
   dueAmount: number
+  /** `exact`, or `upper`/`indeterminate` when a credit's basis could not be established, so what is owed is at most / only roughly the figure shown. */
+  dueBound: TurnoverBound
   avgDso: number
   overdue0_30: number
   overdue31_60: number
@@ -615,7 +620,7 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
       shipFromWarehouse: { select: { code: true } },
       payments: { where: { refundId: null }, select: { amount: true } },
       // o3d-iigc: the basis was not fetched before, so the report could not have respected it.
-      refunds: { select: { totalBase: true, totalsBasis: true } },
+      refunds: REFUND_TURNOVER_SELECT,
     },
     orderBy: { createdAt: 'desc' },
   })
@@ -629,7 +634,10 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
     // is the same unit as the VAT-inclusive invoice total. Only the net-of-credits figure below has
     // a basis question, because a credit's stored total does not.
     const credits = netOfRefunds(o, o.refunds)
-    const balance = Math.max(0, total - paid)
+    // What is owed: the gross total less cash received AND credits raised, the credits read exactly as
+    // customer turnover reads them. A credit whose basis cannot be proven comes off nothing and the row is flagged.
+    const { credit, bound: dueBound } = refundCreditsAsGross(o.refunds)
+    const balance = Math.max(0, total - paid - credit)
     const ageDays = Math.round((now - invoicedPeriodDate(o).getTime()) / 86400000)
     let o0 = 0, o31 = 0, o61 = 0, o91 = 0
     if (balance > 0.01) {
@@ -647,7 +655,7 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
       refundsTotal: credits.refundsTotal,
       netTotal: credits.netTotal,
       netTotalBasis: credits.basis,
-      dueAmount: Math.round(balance * 100) / 100, avgDso: ageDays,
+      dueAmount: Math.round(balance * 100) / 100, dueBound, avgDso: ageDays,
       overdue0_30: Math.round(o0 * 100) / 100, overdue31_60: Math.round(o31 * 100) / 100,
       overdue61_90: Math.round(o61 * 100) / 100, overdue91plus: Math.round(o91 * 100) / 100,
     }

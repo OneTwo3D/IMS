@@ -669,7 +669,7 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
         : <span className="tabular-nums text-xs font-mono font-medium" title={row.netTotalBasis === 'NET' ? 'Ex-VAT: this order\u2019s credits are on the NET basis, so the figure is the ex-VAT order total less them' : row.netTotalBasis === 'GROSS' ? 'VAT-inclusive: this order\u2019s credits are on the GROSS basis' : undefined}>{fmtBase(v)}</span>
       if (key === 'netTotalBasis') return <span className="text-xs text-muted-foreground">{v}</span>
       if (key === 'refundsTotal') return <span className="tabular-nums text-xs font-mono text-orange-600">{v > 0 ? fmtBase(v) : '—'}</span>
-      if (key === 'dueAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0.01 ? 'text-orange-600 font-medium' : ''}`}>{v > 0.01 ? fmtBase(v) : '—'}</span>
+      if (key === 'dueAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0.01 ? 'text-orange-600 font-medium' : ''}`}>{v > 0.01 ? `${row.dueBound === 'indeterminate' ? '≈ ' : row.dueBound === 'upper' ? '≤ ' : ''}${fmtBase(v)}` : '—'}</span>
       if (key === 'avgDso') return <span className="tabular-nums text-xs text-muted-foreground">{v > 0 ? `${v}d` : '—'}</span>
       if (key === 'overdue0_30') return <span className="tabular-nums text-xs font-mono">{v > 0 ? fmtBase(v) : '—'}</span>
       if (key === 'overdue31_60') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-orange-600' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>

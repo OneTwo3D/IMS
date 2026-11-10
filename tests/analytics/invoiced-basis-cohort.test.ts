@@ -275,6 +275,16 @@ test('AR ageing runs from the invoice date, not the order date', async () => {
   assert.equal(Number(row.bucket1), 60, 'aged 28 days (1-30 bucket)')
 })
 
+test('AR Aging nets credits: a fully credited unpaid invoice is not outstanding, a part-credited one owes the rest, an unprovable one is flagged', async () => {
+  const mk = (id: string, total: number, refund: Row) => salesOrder(id, { invoiceNumber: `INV-${id}`, createdAt: new Date('2026-10-10T12:00:00.000Z'), totalBase: D(total), totalForeign: D(total), payments: [], refunds: [refund] })
+  const gross = (n: number): Row => ({ totalBase: D(n), totalsBasis: 'GROSS', lines: [] })
+  assert.equal(Number((await arReport([mk('f', 80, gross(80))], '2026-10-31')).totals.outstandingBase), 0)
+  assert.equal(Number((await arReport([mk('g', 100, gross(30))], '2026-10-31')).totals.outstandingBase), 70)
+  const unproven = await arReport([mk('h', 60, { totalBase: D(10), totalsBasis: null, lines: [] })], '2026-10-31')
+  assert.equal(Number(unproven.totals.outstandingBase), 60)
+  assert.ok(unproven.notices.some((n) => /upper bound/.test(n)), 'the report flags the unplaceable credit')
+})
+
 test('an IMS-minted invoice number with no posted invoice is not an invoiced order', () => {
   assert.equal(isInvoicedOrder({ status: 'SHIPPED', invoiceNumber: 'INV-1', shoppingLinks: [] }), false)
   assert.equal(isInvoicedOrder({ status: 'SHIPPED', invoiceNumber: 'INV-1', shoppingLinks: [{ connector: 'woocommerce' }] }), true)

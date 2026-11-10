@@ -8,6 +8,7 @@ import { getFxSourceRegime, type FxSourceRegime } from '@/lib/currencies/fx-sour
 import { multiplyMoney, roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
+import { refundCreditsAsGross, REFUND_TURNOVER_SELECT, type TurnoverRefund } from '@/lib/domain/sales/customer-turnover'
 import { invoicedInPeriodWhere, invoicedPeriodDate, invoicedPeriodDateIsApproximate } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 
@@ -221,6 +222,8 @@ type SalesOrderAgingRow = {
   paidAt: Date | null
   totalBase: DecimalInput
   payments: Array<{ amount: DecimalInput; paidAt: Date; refundId: string | null }>
+  /** Credits raised before the as-of date, with their lines, so they can be read as the customer pages read them. */
+  refunds?: TurnoverRefund[]
 }
 
 type SalesOrderCurrencyRow = {
@@ -704,6 +707,7 @@ export async function getArAgingReport(
       paidAt: true,
       totalBase: true,
       payments: { select: { amount: true, paidAt: true, refundId: true } },
+      refunds: { where: { refundedAt: { lt: asOfExclusive } }, ...REFUND_TURNOVER_SELECT },
     },
     take: SOURCE_ROW_LIMIT + 1,
   }) as SalesOrderAgingRow[]
@@ -722,6 +726,7 @@ export async function getArAgingReport(
     outstandingBase: Prisma.Decimal
     lastPaymentDate: Date | null
   }>()
+  let unplacedCreditOrders = 0
   for (const order of orders) {
     const paidBase = order.payments
       .filter((payment) => payment.refundId == null && payment.paidAt.getTime() < asOfExclusive.getTime())
@@ -729,7 +734,11 @@ export async function getArAgingReport(
     const refundedBase = order.payments
       .filter((payment) => payment.refundId != null && payment.paidAt.getTime() < asOfExclusive.getTime())
       .reduce((total, payment) => total.add(toDecimal(payment.amount).abs()), new Prisma.Decimal(0))
-    const rawOutstanding = toDecimal(order.totalBase).sub(paidBase).sub(refundedBase)
+    // Credits raised by the as-of date come off too (read exactly as customer turnover reads them); a refund that
+    // was paid out in cash is already in `refundedBase`, so the larger of the two comes off, never both.
+    const credits = refundCreditsAsGross(order.refunds)
+    if (credits.bound !== 'exact') unplacedCreditOrders += 1
+    const rawOutstanding = toDecimal(order.totalBase).sub(paidBase).sub(Prisma.Decimal.max(refundedBase, toDecimal(credits.credit)))
     const outstanding = Prisma.Decimal.max(new Prisma.Decimal(0), rawOutstanding)
     if (outstanding.lte(0)) continue
     const key = order.customerId ?? order.customerEmail ?? order.customerName ?? 'unknown'
@@ -771,7 +780,7 @@ export async function getArAgingReport(
     const refundedBase = order.payments
       .filter((payment) => payment.refundId != null && payment.paidAt.getTime() < asOfExclusive.getTime())
       .reduce((sum, payment) => sum.add(toDecimal(payment.amount).abs()), new Prisma.Decimal(0))
-    const rawOutstanding = toDecimal(order.totalBase).sub(paidBase).sub(refundedBase)
+    const rawOutstanding = toDecimal(order.totalBase).sub(paidBase).sub(Prisma.Decimal.max(refundedBase, toDecimal(refundCreditsAsGross(order.refunds).credit)))
     return rawOutstanding.lt(0) ? total.add(rawOutstanding.abs()) : total
   }, new Prisma.Decimal(0))
   return report(rows, filters, window, generatedAt, {
@@ -781,11 +790,12 @@ export async function getArAgingReport(
     bucket2Days: String(buckets[1]),
     bucket3Days: String(buckets[2]),
   }, [
-    `AR aging is as of ${dateOnly(asOf)}. Outstanding balance is SalesOrder.totalBase minus non-refund payments and refund payments paid on or before that date; due date is paymentDueAt, falling back to the invoice date: invoicedAt, else paidAt, else createdAt (shown as approximate).`,
+    `AR aging is as of ${dateOnly(asOf)}. Outstanding balance is SalesOrder.totalBase minus non-refund payments and refund payments paid on or before that date and credits raised by it (the larger of a credit and the cash refunded against it); due date is paymentDueAt, falling back to the invoice date: invoicedAt, else paidAt, else createdAt (shown as approximate).`,
     'Customer credit balances are excluded from aging buckets and surfaced in totals.creditBalanceBase.',
     `Bucket boundaries are configurable through bucket1Days/bucket2Days/bucket3Days and currently use ${buckets[0]}/${buckets[1]}/${buckets[2]} days.`,
     ...bucketResult.notices,
     ...approximateDateNotice(orders as Array<{ invoicedAt?: Date | null; paidAt?: Date | null }>),
+    ...(unplacedCreditOrders > 0 ? [`${unplacedCreditOrders} order${unplacedCreditOrders === 1 ? ' carries a credit' : 's carry credits'} whose basis or amount could not be established exactly; ${unplacedCreditOrders === 1 ? 'its' : 'their'} outstanding balance is an upper bound or only approximate.`] : []),
   ], options.paginate !== false)
 }
 

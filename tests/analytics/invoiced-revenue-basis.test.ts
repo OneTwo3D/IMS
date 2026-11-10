@@ -294,3 +294,48 @@ test('an order held as paid (paidAt set) with no Payment rows is not in Customer
     assert.ok(!csv.includes(',P,') && !/^P,/m.test(csv), 'absent from the CSV')
   } finally { ORDERS.pop() }
 })
+
+test('Customer Aging nets credits: fully credited is absent, partly credited shows the reduced due, an unprovable credit is flagged', async () => {
+  const gross = (n: number) => ({ totalBase: D(n), totalsBasis: 'GROSS', lines: [] })
+  ORDERS.push(
+    row('F', 80, { invoiceNumber: 'INV-F', refunds: [gross(80)] }),
+    row('G', 100, { invoiceNumber: 'INV-G', refunds: [gross(30)] }),
+    row('H', 60, { invoiceNumber: 'INV-H', refunds: [{ totalBase: D(10), totalsBasis: null, lines: [] }] }),
+  )
+  try {
+    const { getCustomerAging } = await import('@/app/actions/sales-stats')
+    const rows = new Map((await getCustomerAging()).map((r) => [r.orderNumber, r]))
+    assert.ok(!rows.has('F'), 'a fully credited unpaid invoice owes nothing')
+    assert.equal(rows.get('G')!.dueAmount, 70)
+    assert.equal(rows.get('G')!.dueBound, 'exact')
+    assert.equal(rows.get('H')!.dueAmount, 60, 'an unplaceable credit comes off nothing')
+    assert.equal(rows.get('H')!.dueBound, 'upper', 'and the row says so')
+
+    const { GET } = await import('@/app/api/export/analytics/route')
+    const csv = await (await GET(new NextRequest('http://localhost/api/export/analytics?type=aging'))).text()
+    const lines = csv.trim().split(/\r?\n/)
+    const cols = lines[0]!.split(',')
+    const cell = (order: string, col: string) => lines.slice(1).find((l) => l.split(',')[0] === order)?.split(',')[cols.indexOf(col)]
+    assert.equal(cell('F', 'dueAmount'), undefined, 'absent from the CSV')
+    assert.equal(cell('G', 'dueAmount'), '70.00')
+    assert.equal(cell('H', 'dueBound'), 'upper')
+  } finally { ORDERS.length -= 3 }
+})
+
+test('Invoices tab: an order held as paid with no Payment rows shows balance 0, and a part-paid one still shows its balance', async () => {
+  ORDERS.push(
+    row('P2', 40, { invoiceNumber: 'INV-P2', paidAt: TODAY_NOON, payments: [] }),
+    row('Q2', 90, { invoiceNumber: 'INV-Q2', payments: [{ amount: D(25), paidAt: TODAY_NOON, refundId: null }] }),
+  )
+  try {
+    const { getInvoiceStats } = await import('@/app/actions/sales-stats')
+    const rows = await getInvoiceStats()
+    assert.equal(rows.find((r) => r.orderNumber === 'P2')!.balance, 0)
+    assert.equal(rows.find((r) => r.orderNumber === 'Q2')!.balance, 65)
+    const { GET } = await import('@/app/api/export/analytics/route')
+    const csv = await (await GET(new NextRequest('http://localhost/api/export/analytics?type=invoices'))).text()
+    const lines = csv.trim().split(/\r?\n/); const cols = lines[0]!.split(',')
+    const p2 = lines.slice(1).find((l) => l.split(',')[cols.indexOf('orderNumber')] === 'P2')!
+    assert.equal(p2.split(',')[cols.indexOf('balance')], '0.00')
+  } finally { ORDERS.length -= 2 }
+})
