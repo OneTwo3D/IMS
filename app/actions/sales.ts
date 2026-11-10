@@ -1295,9 +1295,31 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
     // allocation happens when the draft is finalised so the draft can still
     // be freely edited without holding stock.
     if (!input.isDraft) {
+      // DESIGN: the order and its invoice are created atomically (above); allocation is a SEPARATE step and may legitimately leave the order unallocated or
+      // short (a backorder), exactly as a WooCommerce import is invoiced before it is allocated. What must not happen is for that to be silent. The allocator never
+      // throws (it returns its answer), so the answer is read here: a shortfall or a failure is returned to the form as a warning (shown to the operator), and the
+      // allocator's own activity entry ('allocation_failed' / 'backorder_recorded', on the order's activity log) records it; where the allocator wrote none
+      // (it bailed before its transaction, or its transaction failed) an entry is written here so the order is never left unallocated without a trace.
       try {
         const { autoAllocateOrder } = await import('./allocation')
-        await autoAllocateOrder(so.id)
+        const allocation = await autoAllocateOrder(so.id)
+        if (!allocation.success) {
+          const reason = allocation.error ?? 'no stock was available'
+          postCommitWarnings.push(`stock was NOT allocated to the order (${reason}); the order stays unallocated and waits for stock`)
+          if (allocation.committed !== true) {
+            await logActivity({
+              entityType: 'SALES_ORDER',
+              entityId: so.id,
+              action: 'allocation_failed',
+              tag: 'sales',
+              level: 'WARNING',
+              description: `Stock allocation did not complete for newly created order ${getSalesOrderReference(so)}: ${reason}`,
+              metadata: { orderNumber: getSalesOrderReference(so), error: reason },
+            })
+          }
+        } else if ((allocation.unallocatedQty ?? 0) > 0) {
+          postCommitWarnings.push(`${allocation.unallocatedQty} unit(s) could not be allocated and are on backorder`)
+        }
       } catch (allocationError) {
         postCommitWarnings.push(`stock was NOT allocated to the order (${String(allocationError)})`)
       }

@@ -511,6 +511,21 @@ test('SO-H2: a WooCommerce draft flagged inclusive with NO header rate but VAT o
   assert.equal((await invoiceRows(draft.id)).length, 0, 'no invoice for a finalisation that did not happen')
 })
 
+// [mutation: drop the returned-allocation reading in createSalesOrder (the failure is silent again)]
+test('design: a live order with NO stock to allocate is created WITH its invoice, stays unallocated, and the operator is told (a warning on the result and an activity entry)', async () => {
+  const { createSalesOrder } = await import('@/app/actions/sales')
+  const bare = await s.db.product.create({ data: { sku: `AUD-BO-${++seq}`, name: 'backorder', type: 'SIMPLE', oversellAllowed: false }, select: { id: true, sku: true } })
+  const r = await createSalesOrder({ customerName: `Cust ${seq}`, currency: 'GBP', pricesIncludeVat: false, taxRateName: 'AUD Sales 20', taxRateValue: 0.2, lines: [{ productId: bare.id, sku: bare.sku, description: 'x', qty: 1, unitPriceForeign: 100, taxRateId: vat20Id }] } as never)
+  assert.equal(r.success, true, r.error)
+  assert.ok((r.postCommitWarnings ?? []).some((w) => /stock was NOT allocated/.test(w)), JSON.stringify(r.postCommitWarnings))
+  const so = await s.db.salesOrder.findUniqueOrThrow({ where: { id: r.order!.id } })
+  assert.equal(so.status, 'PENDING_PAYMENT', 'live, unallocated')
+  assert.equal(await s.db.orderAllocation.count({ where: { orderId: so.id } }), 0)
+  assert.equal((await invoiceRows(so.id)).length, 1, 'the invoice does not wait for allocation')
+  const logged = await s.db.activityLog.count({ where: { entityId: so.id, action: { in: ['allocation_failed', 'backorder_recorded'] } } })
+  assert.ok(logged >= 1, 'the shortfall is on the order\'s activity log')
+})
+
 test('SO-H2: the reconciliation also refuses a stored order whose amounts are net but flagged gross, and lets every consistent order through', async () => {
   const { updateSalesOrderStatus } = await import('@/app/actions/sales')
   const mk = (flag: boolean, unit: string, total: string) => s.db.salesOrder.create({
