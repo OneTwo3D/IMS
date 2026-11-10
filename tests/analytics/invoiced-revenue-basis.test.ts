@@ -29,7 +29,10 @@ import { getCustomerAnalyticsReport, getSalesAnalyticsReport, type SalesFulfillm
  */
 
 mock.module('@/lib/auth/server', {
-  namedExports: { requirePermission: async () => ({ user: { id: 'u1' } }) },
+  namedExports: {
+    requirePermission: async () => ({ user: { id: 'u1' } }),
+    requireInternalUser: async () => ({ user: { id: 'u1' } }),
+  },
 })
 mock.module('@/app/actions/settings', {
   namedExports: { getSetting: async () => '04-06' },
@@ -108,6 +111,15 @@ function matches(record: Row, where: Record<string, unknown> | undefined): boole
   })
 }
 
+function customerRecord() {
+  return {
+    id: 'cust-1', firstName: 'Ada', lastName: 'Buyer', email: null, phone: null, company: null, taxNumber: null,
+    billingAddress: null, shippingAddress: null, notes: null, active: true, createdAt: TODAY_NOON,
+    gdprAnonymisedAt: null, _count: { salesOrders: ORDERS.length },
+    salesOrders: ORDERS.map((o) => ({ ...o, _count: { lines: 1 } })),
+  }
+}
+
 const findOrders = async (args?: { where?: Record<string, unknown> }) => ORDERS.filter((o) => matches(o, args?.where))
 const none = { findMany: async () => [] }
 
@@ -123,6 +135,10 @@ mock.module('@/lib/db', {
       },
       purchaseOrder: none,
       costLayer: none,
+      customer: {
+        findMany: async () => [customerRecord()],
+        findUnique: async () => customerRecord(),
+      },
       salesOrderRefund: {
         findMany: async (args: { where?: { order?: Record<string, unknown> } }) =>
           ORDERS.filter((o) => (o.refunds as unknown[]).length > 0 && matches(o, args.where?.order)).map((o) => ({ totalBase: D(20), order: o })),
@@ -204,4 +220,17 @@ test('currency summary sales total is the invoiced basis', async () => {
     { deps: { client: financeClient(), now: () => TODAY_NOON, baseCurrency: async () => 'GBP' } },
   )
   assert.equal(Number(report.totals.salesBase), EXPECTED_REVENUE)
+})
+
+test('customer lifetime value and the customer page turnover use the invoiced basis with refunds netted', async () => {
+  // A 50 + B 70 + C 100 + D (200 less its 20 NET credit; no tax on the fixture, so the NET and gross totals agree) = 400.
+  const { getCustomers, getCustomerDetail } = await import('@/app/actions/customers')
+  const [customer] = await getCustomers()
+  assert.equal(customer!.lifetimeValueBase, 400)
+  assert.equal(customer!.currentYearSalesBase, 400)
+  assert.equal(customer!.lifetimeValueUpperBound, false)
+  const detail = await getCustomerDetail('cust-1')
+  assert.equal(detail!.totalTurnoverBase, 400)
+  assert.equal(detail!.annualTurnoverBase[String(TODAY_NOON.getFullYear())], 400)
+  assert.equal(detail!.orders.length, ORDERS.length, 'the order list still shows every order')
 })

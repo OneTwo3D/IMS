@@ -32,7 +32,7 @@ mock.module('@/components/providers/timezone-provider', {
 const CUSTOMER = {
   id: 'c1', firstName: 'Test', lastName: 'Customer', fullName: 'Test Customer', email: 'test@example.test',
   phone: null, company: 'Example Co', taxNumber: null, billingAddress: null, shippingAddress: null,
-  notes: null, active: true, orderCount: 3, lifetimeValueBase: 100, currentYearSalesBase: 50,
+  notes: null, active: true, orderCount: 3, lifetimeValueBase: 100, currentYearSalesBase: 50, lifetimeValueUpperBound: false,
   lastOrderAt: null, createdAt: '2026-01-01T00:00:00.000Z', gdprAnonymisedAt: null,
 }
 

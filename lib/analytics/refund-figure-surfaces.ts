@@ -256,9 +256,9 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   {
     file: 'app/(dashboard)/sales/contacts/[id]/customer-detail-client.tsx',
     figures: ['annualTurnoverBase', 'totalTurnoverBase'],
-    treatment: 'refund-blind',
+    treatment: 'basis-aware',
     reason:
-      'Customer turnover: a GROSS, VAT-inclusive lifetime sales figure that excludes fully-refunded orders by status. Deliberately gross-sales, which is legitimately refund-blind; partial credits are not netted and the label says turnover, not net.',
+      'Customer turnover: invoiced orders only, refunds netted per order by stamped basis (customer-turnover.ts). Where a credit\u2019s basis is unproven or mixed the card shows \u2264 via lifetimeValueUpperBound.',
   },
   {
     file: 'app/(dashboard)/sales/so-list-client.tsx',
@@ -298,9 +298,16 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   {
     file: 'app/actions/customers.ts',
     figures: ['annualTurnoverBase', 'revenueOrders', 'totalTurnoverBase'],
-    treatment: 'refund-blind',
+    treatment: 'basis-aware',
     reason:
-      'Customer turnover producer — see the customer detail client. Gross, by label and by design.',
+      'Customer lifetime value and turnover count only invoiced orders (invoiced-revenue-basis.ts) and net each order\u2019s refunds through customer-turnover.ts, which subtracts only a credit on one proven basis and otherwise leaves the order total and sets lifetimeValueUpperBound so the screens show \u2264.',
+  },
+  {
+    file: 'lib/domain/sales/customer-turnover.ts',
+    figures: ['netTotal', 'orderTurnoverBase'],
+    treatment: 'basis-aware',
+    reason:
+      'The per-order turnover helper behind the customer figures: netOfRefunds buckets the order\u2019s credits by stamped basis; an unproven or mixed set returns the unrefunded total flagged incomplete.',
   },
   {
     file: 'app/actions/dashboard.ts',

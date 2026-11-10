@@ -197,17 +197,17 @@ export function CustomerDetailClient({ customer }: Props) {
 
         {/* Turnover */}
         <Card className="p-5">
-          <h2 className="text-sm font-semibold mb-3">Turnover ({baseCurrency.code})</h2>
+          <h2 className="text-sm font-semibold mb-3" title="Invoiced orders only (cancelled, draft and un-invoiced orders excluded), refunds netted">Invoiced turnover ({baseCurrency.code})</h2>
           <div className="space-y-2">
             <div className="flex justify-between items-baseline">
               <span className="text-xs text-muted-foreground">All time</span>
-              <span className="text-lg font-semibold tabular-nums">{fmtBase(customer.totalTurnoverBase)}</span>
+              <span className="text-lg font-semibold tabular-nums">{customer.lifetimeValueUpperBound ? '≤ ' : ''}{fmtBase(customer.totalTurnoverBase)}</span>
             </div>
             <div className="border-t pt-2 space-y-1">
               {recentYears.map((year) => (
                 <div key={year} className="flex justify-between items-baseline">
                   <span className="text-xs text-muted-foreground">{year}</span>
-                  <span className="text-sm font-medium tabular-nums">{fmtBase(customer.annualTurnoverBase[year] ?? 0)}</span>
+                  <span className="text-sm font-medium tabular-nums">{customer.lifetimeValueUpperBound ? '≤ ' : ''}{fmtBase(customer.annualTurnoverBase[year] ?? 0)}</span>
                 </div>
               ))}
             </div>
