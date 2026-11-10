@@ -8,6 +8,8 @@ export type AppRelease = {
   userMessage: string
   userHighlights: string[]
   technicalHighlights: string[]
+  // Things an operator must do before or after deploying this release. Optional: older releases have none.
+  operatorActions?: string[]
 }
 
 export const RELEASES: AppRelease[] = [
@@ -18,7 +20,7 @@ export const RELEASES: AppRelease[] = [
     summary: 'Catch-up release covering everything landed since 2.0.0 (about 1,800 commits). Sales documents and payments are stricter about what they will post, purchase orders can be edited, closed and cancelled at every stage, WooCommerce deliveries are judged on which store sent them, and the VAT/IOSS, Aelia exchange-rate and reconciliation work is built but mostly switched off. It is numbered 3.0.0 because several changes need operator action before or after deploying: see the Operator actions list at the top of the 3.0.0 section of CHANGELOG.md.',
     userMessage: 'IMS 3.0 is a large catch-up release: purchase orders can now be edited, closed and cancelled at every stage, and invoices and payments are stricter about what they will post. Administrators should read the operator actions in the release notes before relying on scheduled jobs, product push and CSV exports.',
     userHighlights: [
-      'Sales and refunds: a manual order with VAT-inclusive prices no longer posts its VAT twice, and a draft is finalised only when its invoice would book to the order total. Finalising and creating a live order are now one step with the invoice, so you never get a live order with no invoice.',
+      'Sales and refunds: a manual order with VAT-inclusive prices no longer posts its VAT twice, and a draft is finalised only when its invoice would book to the order total. Finalising and creating a live order are now one step with the invoice, so a newly created or finalised order is either saved with its invoice queued or not saved. Clones that were already shipped before the fix have no invoice and need one raising by hand.',
       'Sales and refunds: a sales invoice or credit note line with no tax type, or an order paid on an unmapped or inactive tax rate, is refused and shown as a failed row on the Sync page instead of posting on "No VAT".',
       'Payments: a balance recorded after a deposit that has already posted is no longer refused, and several payments on one invoice are told apart by their receipt.',
       'Purchasing: a purchase order can be edited from Draft to Part-received, and Close and Cancel are available at every stage. Cancelling a part-received order now closes it short: received stock and its costs stay, and freight is re-spread over the units that arrived.',
@@ -49,6 +51,26 @@ export const RELEASES: AppRelease[] = [
       'Landed cost: a late freight change posts the in-transit share (DR Inventory / CR Stock in Transit) and the revaluation audit lists inTransitResidue.',
       'Retired and removed: the Kit and KitItem tables (migration refuses if rows exist) and the Shopify and QuickBooks connectors (archived under archive/connectors with tags; generic registries unchanged).',
       'Migrations are forward-only and additive apart from the Kit drop (new columns such as claimGeneration, manualQtyBaseline, euVatRegime stamp fields, cancelled_at; new tables invoice_store_publications and migration_verification_passes).',
+    ],
+    operatorActions: [
+      'Move `DEPLOY_ADMIN_DATABASE_URL` out of the application `.env` into `/etc/ims-db-admin/deploy-admin.env` (root:root 0600) before deploying: a copy left in `.env` is refused before anything is stopped. Make sure the `<application role>_migrator` migration role exists (`fence-db-connections.mjs --ensure-migration-role` for an external database).',
+      'Open Settings > System > Scheduler and use Save & Apply once after deploy, so the new `mintsoft-dispatch-sync` job (every 15 minutes) and the hourly `wc-reconcile` schedule reach an existing crontab. Use a fixed Mintsoft API key for the unattended poll. Then run `npm run read-sync:status` as the application user and confirm it exits 0. Any other exit code is a problem: run `npm run --silent read-sync:status -- --json` and check its scheduler section shows `examined: true`, `unreadable` and `blockProblem` null, and empty `unscheduled` and `disabled` lists (a stale feed exits 1 before a missing or disabled job is reported).',
+      'Check the Public App URL setting: it must now be an `https://` URL (`http://` only for localhost or 127.0.0.1) with no whitespace, credentials, query or fragment; a value that fails refuses the crontab write.',
+      'Set the shipping and discount accounts under Settings > Accounting before raising orders with shipping or a discount: such an order is now refused at creation and at finalisation when the account is missing.',
+      'Cloned orders already shipped before the fix have no invoice and need one raising by hand; a draft stored as VAT-inclusive with no default rate is not finalised.',
+      'Map every WooCommerce tax rate and give every sales line a tax type: a sales invoice or credit note line with no tax type, and a WooCommerce order that moved money on an unmapped or inactive rate, is now refused (a failed row on /sync) instead of posting on "No VAT". Use Settings > Accounting > Tax > Import purchase tax rates from Xero where rates are missing.',
+      'Set `wc_sync_product_enabled` and `wc_sync_product_direction` (`to_wc` or `both`) if IMS should push products to WooCommerce: the default (`from_wc`), a missing value or an unreadable setting now pushes nothing.',
+      'A staging clone or previous store that still posts signed webhooks is now ignored (logged `wc_order_webhook_foreign_store` / `wc_refund_webhook_foreign_store`), and a delivery that names no store is refused; confirm the saved store URL is the live store. Saved WooCommerce credentials are only used with the saved URL, so type the key and secret again when changing the URL.',
+      'Deploy helper plugin 1.3.1 to the store to get the partial-shipment status rule (1.3.0 for the Aelia rates endpoint before `fx_rate_source` can be switched to Aelia); neither plugin is deployed by this release.',
+      'Report CSV consumers: exports are data rows only by default. Append `?metadata=1` to get the trailing `# IMS export metadata` rows back, or read the `X-IMS-Export-Metadata` / `X-IMS-Export-Notices` response headers.',
+      'Fix products CSV `components` cells to `SKU:qty` with a plain positive quantity of at most 4 decimals: `1,5`, `2 units` or a part with no `:` now refuses the row\'s whole recipe. The transfers import also accepts an optional `dispatchedAt` column and invalidates a whole `transferKey` group on a bad row.',
+      'The migration drops the `kits` and `kit_items` tables and refuses to run if either holds rows; inventory aging filtered to type KIT is empty (age the component SKUs instead). Shopify and QuickBooks cards and their `SHOPIFY_*` / `QUICKBOOKS_*` environment variables are gone.',
+      'Purchasing analytics and Purchase Statistics are now Admin, Manager and Finance only, and a manufacturing cost line whose account override is not the configured Manufacturing Overhead account is refused until cleared.',
+      'A manual purchase-order receipt is refused while the line has an open warehouse ASN, and a purchase order with an open ASN cannot be closed or cancelled until the ASN is booked in or retired; cancelling a part-received order is now "close short" and no longer reverses the received stock.',
+      'Deploy gates that call `/api/admin/rollout-readiness` now get HTTP 412 for a PARTIAL, FAILED, running or unrecognised newest reconciliation run, even with `?allowWarnings=true`; let a COMPLETED run land first.',
+      'First load: every supplier default tax rate is held to Xero\'s stored row, and the manifest\'s `maxPurchaseTaxRate` is required whenever a suppliers file is supplied; run the purchase-rate import first.',
+      'Switched-off features need a deliberate decision, not an upgrade step: `wc_invoice_document_enabled` (customer invoice in My Account), `fx_rate_source` (Aelia, default ECB), `eu_vat_regime_mode` (default `adopt_plugin`) and the EU IOSS/VOEC declaration (`npm run eu-vat:preflight`, `eu-vat:seed`) change nothing until set.',
+      'Forward migrations apply on deploy (additive columns and tables, plus the Kit table drop above); take the usual backup first.',
     ],
   },
   {
