@@ -27,3 +27,5 @@ bb4e9ee6f7a56110612dc1402384317f821f3495:tests/ops/reconciliation-pack-schedule-
 2635012e0186d3d7f48dc25bc1b7d7f0e7f9508f:tests/concurrency/mintsoft-courier-key-import.concurrent.test.ts:generic-api-key:69
 # Fake WooCommerce order-key fixture in the erasure raw-payload test (asserts the key is removed); not a credential.
 6d060c0fa0a9eacf0a002919ec7dc805404b5631:tests/concurrency/erasure-raw-payloads.concurrent.test.ts:generic-api-key:161
+# Reviewed false positive: the NAME of a settings row ("eu_vat_refund182_held_count") in the EU VAT declaration, not a credential.
+655f95b69cdd6306e356546fbe08674ac6a7b4be:lib/tax/eu-vat-seed.json:generic-api-key:52

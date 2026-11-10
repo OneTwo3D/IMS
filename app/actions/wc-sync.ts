@@ -766,6 +766,8 @@ export async function updateShoppingTaxRateMapping(
   await requireSyncPermission()
   // A rate a tax re-key retired follows its replacement; a plainly inactive one is refused (lib/tax/writable-tax-rate.ts).
   await db.$transaction(async (tx) => {
+  // The shared mapping-write lock FIRST, before the rate row is locked by the resolution below (one global order: mapping lock, then rate rows).
+  await lockStorefrontMappingWrites(tx)
   const writableTaxRateId = (await resolveWritableTaxRateId(tx, taxRateId)) ?? taxRateId
   // Re-pointing a mapped rate at another IMS rate ends any ownership stamp on the row (lib/tax/storefront-mapping-write.ts); re-mapping to the same rate keeps it.
   await repointStorefrontTaxMapping(tx, { connector: 'woocommerce', externalTaxRateId }, writableTaxRateId)

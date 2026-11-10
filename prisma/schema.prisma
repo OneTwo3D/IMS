@@ -563,7 +563,10 @@ model TaxRate {
   countryCode String?     // ISO 3166-1 alpha-2, null = applies globally
   isCompound  Boolean     @default(false) @map("is_compound")
   reverseCharge Boolean   @default(false) @map("reverse_charge")
-  reportingCategory String? @map("reporting_category") // e.g. DOMESTIC, REVERSE_CHARGE, EC_SALES, OSS
+  reportingCategory String? @map("reporting_category") // e.g. DOMESTIC, REVERSE_CHARGE, EC_SALES, OSS; IOSS or VOEC mark a rate sold under that scheme
+  /// The zero-rated Xero TaxType a scheme (IOSS/VOEC) sale's goods, shipping and discount lines are posted on instead of this rate's own accountingTaxType, which stays the charged percentage (for example TAX131 for DE VAT 19%).
+  /// NULL on every rate that is not sold under a scheme. Declared in lib/tax/eu-vat-seed.json and applied only by an operator command (npm run eu-vat:seed); nothing reads it to post a line yet.
+  schemePostingTaxType String? @map("scheme_posting_tax_type")
   active      Boolean     @default(true)
   isDefault   Boolean     @default(false)
   /// Set by a tax re-key (lib/tax/tax-rekey.ts) on the row it deactivated: the id of the row that replaced it (same name, percentage, sides and components, the live Xero code).

@@ -1603,6 +1603,52 @@ real accounting tax type, then re-import the order.
 Xero tax type, affected invoices and credit notes will sit as failed rows on /sync instead of posting. That is the intended behaviour; keep the
 Sales Invoices sync type switched off until the mappings are in place, then enable it.
 
+### EU IOSS / VOEC rate configuration (declaration, preflight and seed)
+
+An IOSS or VOEC sale (an EU member state, Monaco or Norway, VAT collected at the till under the scheme) is posted to Xero on the destination's **zero-rated** Xero type
+(for example `DE IOSS VAT`, `TAX131`) with one extra line carrying the collected VAT, not on the rate the customer was charged. IMS therefore keeps **two** Xero types for such a rate:
+its own `accountingTaxType` stays the charged rate (DE VAT 19%), and the new rate field **`schemePostingTaxType`** holds the zero-rated type its goods, shipping and discount lines
+will post on. The existing reporting category carries the marker: `IOSS` for the EU states and Monaco, `VOEC` for Norway (this moves the rate from the "other foreign VAT" bucket of the
+VAT difference report to the IOSS or VOEC one). **This change adds configuration only: nothing reads `schemePostingTaxType` to build a document yet, so no posted line changes and the
+Sales Invoices switch is untouched.** The treatment itself arrives in later changes, behind that switch.
+
+**The declaration** is `lib/tax/eu-vat-seed.json`, versioned and reviewed in the repository, with no secret in it: for each of the 65 live WooCommerce tax rates, the IMS rate that stands
+for it (one IMS rate per Xero rate: WooCommerce rates that post on the same Xero type share one IMS rate, so the 33 rates on `ZERORATEDOUTPUT`, 182 included, are one rate named *Zero Rated Income*), the Xero type it posts on and the byte-exact Xero names (`AT IOSS  VAT` has two spaces, `No VAT` and `NO VAT`
+are different types). The charged rate's Xero code is left open (`null`) where Xero numbers it per organisation: it is found by name from the stored Xero list, by `npm run tax:rekey`,
+never declared. The declaration is **only a declaration**: nothing writes a tax rate to Xero from it, and nothing applies it by itself. The measured table it was made from is pinned in
+`tests/fixtures/eu-vat-parity.json`, and `tests/tax/eu-vat-parity.test.ts` fails if either file disagrees with Xeroom's resolution of any of the 65 rows, or if a rate is added to one file and not the other.
+
+```
+npm run eu-vat:preflight               # read only: what is missing or mismatched (add --json for the machine-readable form)
+npm run eu-vat:seed                    # DRY RUN: the rates it would set, and the plan's digest
+npm run eu-vat:seed -- --apply --confirm <digest>    # write exactly the plan the dry run printed
+```
+
+- **Order at setup** (before Sales Invoices is enabled): connect the Xero organisation and let the tax-rate list be stored; import the WooCommerce rates and adopt them; run `npm run tax:rekey`;
+  run `npm run eu-vat:seed` and, after reading it, apply it; then `npm run eu-vat:preflight` must report no error.
+- **The preflight** reads the database and the **stored** copy of Xero's list (the proven one; a missing, stale or other-organisation list refuses with exit 2 and nothing is judged). It
+  never calls Xero or WooCommerce and never writes. Per declared WooCommerce rate: mapped (and the mapping's record of the store rate equals the declaration's, or it was made against another store);
+  the IMS rate active, for sales, not shared with another WooCommerce rate, at the declared percentage and country; the charged code an ACTIVE Xero type of the declared name and percentage, never
+  `NONE`; the scheme posting type and category set; the posting type an ACTIVE Xero type, effective rate exactly 0, named byte-exactly. Then: every EU-27 state, Monaco and Norway has a complete scheme
+  rate; accounts 821, 232, 813, 816, 860 exist in the cached chart (821 *Non-UK VAT* and 860 *Rounding* by name too); the three EU account settings and the rounding setting hold the declared codes;
+  the refund-hold settings are sane. An **error** blocks readiness (exit 1); an **advisory** (a differing IMS name) is listed and does not (exit 0). Per rate, the mapping must be stamped for the store configured NOW (an unstamped or other-store mapping is refused, as the adoption step does).
+  the preflight errors `SHARED_IMS_ROW` (an IMS rate that stands for WooCommerce rates the declaration does not declare to be the same Xero rate) and `XERO_TYPE_ON_TWO_IMS_RATES`
+  (two IMS rates on one Xero type) enforce one IMS rate per Xero rate. The set-identity report (R13) accepts the declared sharing (it reads the declaration, and skips the per-rate country and tax-category comparison on it) and still
+  reports `DUPLICATE_MAPPING` for any other sharing and for two IMS rates on one type.
+- **The seed** sets `schemePostingTaxType` and `reportingCategory` and nothing else. It creates no rate, edits no mapping or account setting, and never calls Xero or WooCommerce. A rate is
+  reached only through the WooCommerce mappings that name it, stamped for the configured store and recording the declared store rate, and only if the preflight finds nothing wrong with it but the two fields (country, percentage, name, charged code and the scheme type against the proven stored Xero list); anything else is skipped and listed. A shared rate is one change. It is a
+  dry run unless `--apply --confirm <digest>` (the digest the dry run printed) is given; the apply opens by taking the Xero mapping-selection lock and asserting the captured Xero connection unchanged (a rebind waits for it, a changed connection refuses with `XERO_CONNECTION_CHANGED`), rebuilds the plan inside the transaction (a different digest writes nothing), takes the row lock
+  every rate editor takes (a rate a re-key replaced is refused), row-locks the mappings the plan rests on and compares every declared mapping field (external id, country, percentage, class, store, rate), and writes each rate as a compare-and-set on the facts it was judged on. Exit codes: 0 nothing to do or applied, 1 a dry run that lists work, 2 refused, 3 internal.
+  Run as root or the checkout's owner; the environment is replaced by the `vat:diff` whitelist.
+- **An organisation change clears it.** Both Xero codes of a rate (the charged type and the scheme posting type) are the organisation's, so a bind to a different organisation clears `schemePostingTaxType` with the other tax types, and a rate holding only a scheme posting type counts as a mapping.
+- **A re-key keeps it.** `npm run tax:rekey` copies `schemePostingTaxType` to the replacement rate with the other posting fields (and it is part of the digest).
+- **Drift.** The hourly tax-rate sweep also checks, from the declared mappings, every rate's `schemePostingTaxType` and category against the declaration, and the type **by code** against the stored list: cleared or swapped for another type, IOSS turned into VOEC, no longer in the list, no longer ACTIVE, no longer at exactly 0%,
+  named differently from the declaration, carried without an IOSS or VOEC marker, or equal to the rate's own charged code, shows as drift on the rate (the same /sync alert and activity-log entry as a rate that drifted by name).
+- **Settings.** Three account roles join the Xero account mappings: *EU IOSS/VOEC VAT collected* (`xero_eu_vat_ioss_account`, 821 *Non-UK VAT*), *EU DDP charges collected* (`xero_eu_vat_ddp_account`, 232) and
+  *EU landed-cost fees* (`xero_eu_fee_account`, 232). They are owned by the connected organisation like every account mapping (cleared and re-confirmed on a change of organisation). Rounding posts to 860 *Rounding*
+  (`xero_rounding_difference_account`), not 821. Two further settings are read by the credit-note work to come: `eu_vat_refund182_hold_threshold` (default 10) and `eu_vat_refund182_held_count`
+  (a persisted counter): refund VAT booked on WooCommerce rate 182 is to be posted to the order's VAT account, with the first N such credit notes held for a person to check. Nothing uses them yet.
+
 ## Invoice PDF & Email
 
 When a sales invoice is synced to Xero and payment is registered:

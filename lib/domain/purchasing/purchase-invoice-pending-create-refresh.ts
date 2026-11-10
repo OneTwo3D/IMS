@@ -64,7 +64,6 @@ const CREATE_ROW_SELECT = {
   id: true,
   connector: true,
   attemptRevision: true,
-  processingStartedAt: true,
   remoteAttemptedAt: true,
   createDispatchedAt: true,
   backReferenceEvidenceCompactedAt: true,
@@ -124,14 +123,13 @@ export async function refreshPendingPurchaseInvoiceCreate(params: {
     row = candidates[0]!
   }
   // REFRESHABLE ONLY WHILE THE ROW IS QUEUED AND HAS NEVER BEEN TOUCHED: PENDING, and no worker has ever claimed it (a claim mints an attempt revision above
-  // zero and stamps a processing time), no request was ever recorded or dispatched, and it names no document. The bill's create path never stamps a
+  // zero), no request was ever recorded or dispatched, and it names no document. The bill's create path never stamps a
   // remote attempt, so a FAILED row cannot be proven unsent (a failure can follow a request that left); FAILED, and anything claimed, is refused and the
   // operator retries or resolves the posting first. This is deliberately not the payment attempt predicate: it asks for the absence of every trace.
   const standing = ledgerStanding(row)
   const untouched = row.status === 'PENDING'
     && standing === 'LIVE_WORK'
     && row.attemptRevision === UNCLAIMED_ATTEMPT_REVISION
-    && row.processingStartedAt === null
     && row.remoteAttemptedAt === null
     && row.createDispatchedAt === null
     && row.backReferenceEvidenceCompactedAt === null

@@ -10,7 +10,7 @@
  */
 
 import { resolveWritableTaxRateId } from '@/lib/tax/writable-tax-rate'
-import { upsertStorefrontTaxMapping } from '@/lib/tax/storefront-mapping-write'
+import { lockStorefrontMappingWrites, upsertStorefrontTaxMapping } from '@/lib/tax/storefront-mapping-write'
 import { db } from '@/lib/db'
 import { wcFetch } from '../api'
 
@@ -119,6 +119,8 @@ export async function importWcTaxRates(): Promise<ImportWcTaxResult> {
     const ratePct = parseFloat(wcRate.rate) || 0
     // Resolved in the write's transaction under the row share lock (lib/tax/writable-tax-rate.ts), so a re-key apply cannot commit between the resolution and the upsert.
     await db.$transaction(async (tx) => {
+    // The shared mapping-write lock FIRST, before the rate row is locked by the resolution below: the one global order is mapping lock, then rate rows (tests/tax/storefront-mapping-lock-order-census.test.ts).
+    await lockStorefrontMappingWrites(tx)
     const mappedTaxRateId = (await resolveWritableTaxRateId(tx, imsTaxRateId, { lenient: true })) ?? imsTaxRateId
     // The ownership stamp of a row survives this write only if the row still means what it was stamped for (same IMS rate, same name, country, percent and class);
     // a new row is born unstamped (lib/tax/storefront-mapping-write.ts).

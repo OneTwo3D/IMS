@@ -379,6 +379,7 @@ test('the digest binds every copied, posting-relevant rate and component field: 
   assert.notEqual(digestWith({ isCompound: true }), base, 'isCompound')
   assert.notEqual(digestWith({ taxCategory: 'ZERO' }), base, 'taxCategory')
   assert.notEqual(digestWith({ type: 'GST' }), base, 'type')
+  assert.notEqual(digestWith({ schemePostingTaxType: 'TAX131' }), base, 'schemePostingTaxType (the zero-rated type an IOSS or VOEC sale posts on)')
   assert.notEqual(digestWith({}, [comp({ name: 'Other' })]), base, 'component name')
   assert.notEqual(digestWith({}, [comp({ accountingTaxType: 'TAX004' })]), base, 'component code (a live one, so no cleared-component entry carries the change)')
   assert.notEqual(digestWith({}, [comp({ accountingTaxType: null })]), base, 'component code cleared')
@@ -393,8 +394,8 @@ test('the digest binds every copied, posting-relevant rate and component field: 
   assert.notEqual(digestWith({}, [comp(), inactive({ rate: '0.0600' })]), withInactive, 'a later component\'s rate')
   assert.notEqual(digestWith({}, [comp(), inactive({ name: 'Renamed' })]), withInactive, 'a later component\'s name')
   assert.notEqual(digestWith({}, [comp({ rate: '0.2000' })]), base, 'component rate')
-  const row = match(DEMO.map((r) => (r.id === 'cy' ? { ...r, reverseCharge: true, isCompound: true, taxCategory: 'ZERO', reportingCategory: 'EC_SALES', components: [comp()] } : r)), LIVE).rows.find((r) => r.imsRateId === 'cy')!
-  assert.deepEqual(row.copied, { type: null, taxCategory: 'ZERO', isCompound: true, reverseCharge: true, reportingCategory: 'EC_SALES', components: [{ sortOrder: 0, name: 'VAT', rate: '0.1900', compoundOnPrevious: false, accountingTaxType: 'TAX005', active: true }] })
+  const row = match(DEMO.map((r) => (r.id === 'cy' ? { ...r, reverseCharge: true, isCompound: true, taxCategory: 'ZERO', reportingCategory: 'EC_SALES', schemePostingTaxType: 'TAX131', components: [comp()] } : r)), LIVE).rows.find((r) => r.imsRateId === 'cy')!
+  assert.deepEqual(row.copied, { type: null, taxCategory: 'ZERO', isCompound: true, reverseCharge: true, reportingCategory: 'EC_SALES', schemePostingTaxType: 'TAX131', components: [{ sortOrder: 0, name: 'VAT', rate: '0.1900', compoundOnPrevious: false, accountingTaxType: 'TAX005', active: true }] })
 })
 
 // [mutation: any one check dropped from applyRefusal -> that arm fails]

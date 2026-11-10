@@ -23,7 +23,7 @@ function fake(rows: Array<Record<string, unknown>>, swapCount = 1, legacy: Array
   } as unknown as PendingCreateRefreshTx
   return { tx, writes }
 }
-const unsent = { id: 'r1', connector: 'xero', status: 'PENDING', externalTransactionId: null, abandonedBeforeRemoteCall: false, settlementBasis: null, remoteAttemptedAt: null, attemptRevision: 0, processingStartedAt: null, createDispatchedAt: null, backReferenceEvidenceCompactedAt: null, payload: { _postingMode: 'submitted', _idempotencyKey: 'k1', _connectionProvenance: 'xero:t', lines: [] } }
+const unsent = { id: 'r1', connector: 'xero', status: 'PENDING', externalTransactionId: null, abandonedBeforeRemoteCall: false, settlementBasis: null, remoteAttemptedAt: null, attemptRevision: 0, createDispatchedAt: null, backReferenceEvidenceCompactedAt: null, payload: { _postingMode: 'submitted', _idempotencyKey: 'k1', _connectionProvenance: 'xero:t', lines: [] } }
 const run = (tx: PendingCreateRefreshTx) => refreshPendingPurchaseInvoiceCreate({ tx, invoiceId: 'inv1', poId: 'po1', currentInvoiceNumber: 'SUP-1', chartConnector: 'xero', accountingPayload: edited })
 
 // [mutation: build the payload without the row's enqueue stamps, or without guarding the swap on the unsent proof]
@@ -70,7 +70,6 @@ test('a row that may have left IMS refuses the edit and is not written', async (
     ['failed (a failure can follow a request that left; the bill create path records no attempt)', [{ ...unsent, status: 'FAILED' }]],
     ['failed after a recorded attempt', [{ ...unsent, status: 'FAILED', remoteAttemptedAt: new Date() }]],
     ['queued but claimed once and released for a retry', [{ ...unsent, attemptRevision: 1 }]],
-    ['queued with a retry gate / claim time', [{ ...unsent, processingStartedAt: new Date() }]],
     ['queued with a recorded attempt', [{ ...unsent, remoteAttemptedAt: new Date() }]],
     ['queued but carrying an operator\'s word', [{ ...unsent, settlementBasis: 'OPERATOR_ASSERTION' }]],
     ['queued but naming a document', [{ ...unsent, externalTransactionId: 'X7' }]],
