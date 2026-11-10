@@ -65,6 +65,7 @@ function makeFakeRepo(store: FakeStore, connector: ShoppingWebhookEventConnector
         payloadJson: input.payload,
         status: WC_WEBHOOK_EVENT_STATUS.pending,
         attempts: 0,
+        claimGeneration: 0,
         nextAttemptAt: null,
         processedAt: null,
         lastError: null,
@@ -89,29 +90,33 @@ function makeFakeRepo(store: FakeStore, connector: ShoppingWebhookEventConnector
       const r = store.rows.get(id)
       if (!r || r.connector !== connector || !isDue(r, now, staleProcessingBefore)) return null
       r.attempts += 1
+      r.claimGeneration += 1
       r.status = WC_WEBHOOK_EVENT_STATUS.processing
       r.nextAttemptAt = null
       r.updatedAt = now
       return r
     },
-    async markProcessed(id, now) {
+    async markProcessed(id, now, claimGeneration) {
       const r = store.rows.get(id)!
+      if (r.status !== WC_WEBHOOK_EVENT_STATUS.processing || r.claimGeneration !== claimGeneration) return false
       r.status = WC_WEBHOOK_EVENT_STATUS.processed
       r.processedAt = now
-      return r
+      return true
     },
-    async markFailed({ id, error, nextAttemptAt }) {
+    async markFailed({ id, error, nextAttemptAt, claimGeneration }) {
       const r = store.rows.get(id)!
+      if (r.status !== WC_WEBHOOK_EVENT_STATUS.processing || r.claimGeneration !== claimGeneration) return false
       r.status = WC_WEBHOOK_EVENT_STATUS.failed
       r.lastError = error
       r.nextAttemptAt = nextAttemptAt
-      return r
+      return true
     },
-    async markDeadLetter({ id, error }) {
+    async markDeadLetter({ id, error, claimGeneration }) {
       const r = store.rows.get(id)!
+      if (r.status !== WC_WEBHOOK_EVENT_STATUS.processing || r.claimGeneration !== claimGeneration) return false
       r.status = WC_WEBHOOK_EVENT_STATUS.deadLetter
       r.lastError = error
-      return r
+      return true
     },
   }
 }
@@ -246,7 +251,7 @@ test('process core dead-letters an unsupported resource without retry (fi70j)', 
   // A row with a resource the core does not handle (orders/products/refunds only).
   store.rows.set('evt-x', {
     id: 'evt-x', connector: 'newshop', resource: 'customers', externalEventId: null, topic: null,
-    payloadHash: 'h', payloadJson: {}, originAttestation: 'unproven:not-applicable', status: WC_WEBHOOK_EVENT_STATUS.pending, attempts: 0,
+    payloadHash: 'h', payloadJson: {}, originAttestation: 'unproven:not-applicable', status: WC_WEBHOOK_EVENT_STATUS.pending, attempts: 0, claimGeneration: 0,
     nextAttemptAt: null, processedAt: null, lastError: null, receivedAt: NOW, updatedAt: NOW,
   })
   let dispatched = false

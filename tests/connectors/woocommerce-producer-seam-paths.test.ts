@@ -121,7 +121,7 @@ function reset() {
   settings.clear()
   for (const [key, value] of Object.entries({
     wc_url: ORIGIN, wc_consumer_key: 'ck_x', wc_consumer_secret: 'cs_x', wc_webhook_secret: 's', wc_fx_push_enabled: 'true',
-    wc_stock_sync_enabled: 'true',
+    wc_stock_sync_enabled: 'true', wc_sync_product_enabled: 'true', wc_sync_product_direction: 'to_wc',
   })) settings.set(key, value)
 }
 const writes = () => transport.filter((entry) => !entry.startsWith('GET '))
@@ -423,4 +423,25 @@ test('DISPATCH: a split order whose part push was shadowed is pending and unreso
   let seen: Date | null | undefined
   await run(async (input) => { seen = input.despatchedAt; return { ok: true } })
   assert.equal(seen?.toISOString(), '2026-06-01T10:00:00.000Z')
+})
+
+test('FACADE, product metadata: settings that forbid the push stop it BEFORE the seam, so no shadow is recorded', async () => {
+  const connectorCalls: string[] = []
+  productPush = async (id: string) => { connectorCalls.push(id); return { success: true } }
+  const { pushProductMetadata } = await import('@/lib/shopping')
+  for (const forbid of [
+    { wc_sync_product_enabled: 'false' },
+    { wc_sync_product_direction: 'from_wc' },
+  ]) {
+    reset()
+    for (const [key, value] of Object.entries(forbid)) settings.set(key, value)
+    await withEnv(SEAM_ON, async () => {
+      assert.deepEqual(await pushProductMetadata('p-1'), { success: true, skipped: true })
+    })
+    await withEnv({}, async () => {
+      assert.deepEqual(await pushProductMetadata('p-1'), { success: true, skipped: true })
+    })
+  }
+  assert.deepEqual(connectorCalls, [])
+  assert.deepEqual(shadows, [])
 })

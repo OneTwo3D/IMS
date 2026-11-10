@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
-import { WEBHOOK_ORIGIN_NOT_APPLICABLE } from '@/lib/connectors/webhook-origin'
 
 // o3d-tj6v r3: the "Import order statuses" selection reaches the ORDER WEBHOOK.
 //
@@ -45,6 +44,7 @@ mock.module('@/lib/db', {
       setting: {
         findUnique: async ({ where }: { where: { key: string } }) => {
           if (where.key === 'wc_initial_import_completed') return { value: 'true' }
+          if (where.key === 'wc_url') return { value: 'https://shop.example.com' }
           if (where.key === 'wc_sync_order_statuses') {
             return statusSettingValue === null ? null : { value: statusSettingValue }
           }
@@ -192,7 +192,7 @@ async function pushOrder(order: ReturnType<typeof wcOrder>, topic = 'order.creat
     resource: 'orders',
     topic,
     payload: order,
-    originAttestation: WEBHOOK_ORIGIN_NOT_APPLICABLE,
+    originAttestation: 'store:shop.example.com',
   })
 }
 

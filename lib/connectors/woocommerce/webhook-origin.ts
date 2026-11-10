@@ -1,4 +1,4 @@
-import { attestWebhookOrigin, attestWebhookOriginUnder } from '@/lib/connectors/webhook-origin'
+import { attestWebhookOrigin, attestWebhookOriginFromUnsignedHeader, attestWebhookOriginUnder } from '@/lib/connectors/webhook-origin'
 
 /** WooCommerce builds every REST link as `<site root>/wp-json/<namespace>/...`. */
 const REST_ROOT_MARKER = '/wp-json/'
@@ -33,8 +33,18 @@ const REST_ROOT_MARKER = '/wp-json/'
  * entirely contained in what the store sent, which is the property that makes it survive a
  * rebind that happens later.
  */
-export function readWcDeliveryOrigin(request: Request, payload: unknown): string {
-  const restRoot = readPayloadRestRoot(payload)
+export function readWcDeliveryOrigin(
+  request: Request,
+  payload: unknown,
+  /**
+   * Orders and refunds pass `'header-unsigned'`, which also lets a plain-permalink `?rest_route=` self-link
+   * yield the exact site root (products keep recording it as containment): they move money, and a header outside the HMAC is
+   * not proof of the sender, so header-only evidence is recorded as such (`store-header:`) and the
+   * handler holds it. Products keep the plain `store:` encoding they always had.
+   */
+  headerEvidence: 'trusted' | 'header-unsigned' = 'trusted',
+): string {
+  const restRoot = readPayloadRestRoot(payload, headerEvidence === 'header-unsigned')
   if (restRoot) {
     const fromRestRoot = attestWebhookOrigin(restRoot)
     if (!fromRestRoot.startsWith('unproven:')) return fromRestRoot
@@ -46,23 +56,48 @@ export function readWcDeliveryOrigin(request: Request, payload: unknown): string
     if (!fromPermalink.startsWith('unproven:')) return fromPermalink
   }
 
-  return attestWebhookOrigin(request.headers.get('x-wc-webhook-source'))
+  const header = request.headers.get('x-wc-webhook-source')
+  return headerEvidence === 'header-unsigned' ? attestWebhookOriginFromUnsignedHeader(header) : attestWebhookOrigin(header)
 }
 
 /**
  * The site root a REST self-link implies.
  *
  * With pretty permalinks the link is `<root>/wp-json/wc/v3/...`, so everything before the
- * marker is the root exactly. Without them WordPress emits `<root>/?rest_route=/wc/v3/...`,
- * which has no marker to cut at — that form is left to the permalink/containment path rather
- * than guessed at, since a link whose shape is unrecognised proves nothing exactly.
+ * marker is the root exactly. Without them WordPress emits `<root>/?rest_route=/wc/v3/...` (or
+ * `<root>/index.php?rest_route=/wc/v3/...`), and the root is the URL's own path with a trailing
+ * `index.php` and slashes removed — see `restRouteSiteRoot`. Any other shape proves nothing
+ * exactly and is left to the permalink/containment path.
  */
-function readPayloadRestRoot(payload: unknown): string | null {
+function readPayloadRestRoot(payload: unknown, allowRestRoute: boolean): string | null {
   const href = readPayloadSelfHref(payload)
   if (!href) return null
   const markerAt = href.indexOf(REST_ROOT_MARKER)
-  if (markerAt <= 0) return null
-  return href.slice(0, markerAt)
+  if (markerAt > 0) return href.slice(0, markerAt)
+  return allowRestRoute ? restRouteSiteRoot(href) : null
+}
+
+/**
+ * The exact site root of a plain-permalink REST link, or `null` when the link is not strictly
+ * that shape: an absolute http(s) URL with no credentials or fragment, exactly one `rest_route`
+ * query parameter that is an absolute REST path (`/wc/...`), and a path that is the site path
+ * optionally followed by `index.php`. The query and `index.php` are dropped; scheme, host and
+ * the site path are kept (the comparison itself ignores scheme and port, as for every origin).
+ */
+export function restRouteSiteRoot(href: string): string | null {
+  let url: URL
+  try {
+    url = new URL(href)
+  } catch {
+    return null
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
+  if (url.username || url.password || url.hash) return null
+  const routes = url.searchParams.getAll('rest_route')
+  if (routes.length !== 1 || !/^\/wc\/[^\s]*$/.test(routes[0]!)) return null
+  const path = url.pathname.replace(/\/index\.php$/i, '').replace(/\/+$/, '')
+  if (/\.php$/i.test(path)) return null
+  return `${url.protocol}//${url.host}${path}`
 }
 
 function readPayloadSelfHref(payload: unknown): string | null {

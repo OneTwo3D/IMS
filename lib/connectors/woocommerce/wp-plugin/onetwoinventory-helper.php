@@ -6,7 +6,7 @@
  *              buttons to WooCommerce, and accepts FX rate pushes from IMS so
  *              the storefront's multi-currency display matches the rates used
  *              in IMS and Xero.
- * Version:     1.3.0
+ * Version:     1.3.1
  * Author:      One Two Enterprises Ltd
  * Requires PHP: 7.4
  * Requires at least: 6.0
@@ -440,13 +440,40 @@ if (!function_exists('oti_ps_parts_done')) {
     }
 }
 
+if (!function_exists('oti_ps_status_eligible')) {
+    /**
+     * May the partial-shipment route CHANGE this order's status? (1.3.1)
+     *
+     * Moving an order to completed / partial-shipped is a promotion that fires the store's
+     * customer email and download machinery, so it is right only for an order the store still
+     * holds as in flight: processing, or partial-shipped (our own status from an earlier part).
+     * Anything else, cancelled, refunded, on-hold, pending, failed, or an order an operator
+     * completed by hand, is left exactly where it is. Fails closed: an unrecognised custom
+     * status is NOT eligible. A store that runs a custom in-flight status (for example
+     * ready-to-ship) opts it in through the `oti_partial_shipment_status_eligible` filter.
+     * Slug is the WooCommerce slug with or without its `wc-` prefix.
+     */
+    function oti_ps_status_eligible($status): bool
+    {
+        $slug = strtolower(trim((string) $status));
+        if (strpos($slug, 'wc-') === 0) {
+            $slug = substr($slug, 3);
+        }
+        $eligible = in_array($slug, ['processing', 'partial-shipped'], true);
+        // Strictly boolean true: a filter returning the string 'false', '0', 1 or null must not opt in.
+        return apply_filters('oti_partial_shipment_status_eligible', $eligible, $slug) === true;
+    }
+}
+
 if (!function_exists('oti_handle_partial_shipment')) {
     /**
      * WMS-neutral partial-shipment writeback. IMS posts each despatched part of a
      * split fulfilment here (Mintsoft or any future WMS — the route does not care
      * which WMS produced it). We mirror the part into the wphub-partial-shipment
      * tables (the storefront's partial-shipment UI + customer emails), stamp split
-     * metadata, and transition the WC order to partial-shipped / completed.
+     * metadata, and transition the WC order to partial-shipped / completed
+     * ONLY while the order is still in flight (see oti_ps_status_eligible); a cancelled,
+     * refunded, on-hold or hand-completed order keeps its status.
      *
      * Body: { part:int, total_parts:int, tracking_number?:str, shipment_num?:str,
      *         items:[{ sku:str, qty:int }] }
@@ -584,7 +611,23 @@ if (!function_exists('oti_handle_partial_shipment')) {
                 $all_done ? ' — all parts despatched.' : ''
             ));
 
-            if ($all_done) {
+            // The shipment rows and parts_done above are a record of what the warehouse
+            // despatched, and stay. Changing the ORDER STATUS is a separate decision: it is
+            // made only for an order still in flight, read here, inside the lock.
+            $current_status = (string) $order->get_status();
+            $status_eligible = oti_ps_status_eligible($current_status);
+
+            if (!$status_eligible) {
+                $order->add_order_note(sprintf(
+                    'WMS: Part %d/%d despatched, but the order is "%s" so its status was left unchanged.',
+                    $part, $total, $current_status
+                ));
+                $order->save();
+                error_log(sprintf(
+                    '[OTI] partial-shipment Part %d/%d recorded for WC %d; status "%s" is not eligible, status left unchanged.',
+                    $part, $total, $order_id, $current_status
+                ));
+            } elseif ($all_done) {
                 // Skip the partial-shipped intermediate when this part closes the order.
                 $order->update_status('completed', sprintf('WMS: all %d split parts despatched.', $total));
             } elseif (has_action('wphub_partial_shipment_status')) {
@@ -618,6 +661,7 @@ if (!function_exists('oti_handle_partial_shipment')) {
                 'part'        => $part,
                 'all_done'    => $all_done,
                 'shipment_id' => $next_shipment_id,
+                'status_changed' => $status_eligible,
             ], 200);
         } finally {
             $wpdb->query($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock_name));

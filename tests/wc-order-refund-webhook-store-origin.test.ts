@@ -1,0 +1,343 @@
+import assert from 'node:assert/strict'
+import test, { mock } from 'node:test'
+import { createHmac } from 'node:crypto'
+
+/**
+ * Order and refund deliveries are judged on the store that sent them, as products are
+ * (tests/wc-product-webhook-store-origin.test.ts). A staging clone copies the webhook secret and
+ * delivery URL, so a signature alone does not say which store an order came from.
+ */
+
+const WC_WEBHOOK_SECRET = 'wc-secret'
+
+const state = {
+  /** Every argument list `syncWcProductToIms` was called with. */
+  syncCalls: [] as unknown[][],
+  syncResult: { success: true } as Record<string, unknown>,
+  stockSyncCalls: [] as unknown[],
+  activity: [] as Array<Record<string, unknown>>,
+  settings: new Map<string, string>(),
+  /** Every settings key the handler read, so a version-based decision cannot hide. */
+  settingReads: [] as string[],
+}
+
+mock.module('@/lib/activity-log', {
+  namedExports: { logActivity: async (entry: Record<string, unknown>) => { state.activity.push(entry) } },
+})
+mock.module('@/lib/maintenance-mode', { namedExports: { getMaintenanceModeResponse: async () => null } })
+mock.module('@/lib/integration-plugins', { namedExports: { isIntegrationPluginEnabled: async () => true } })
+mock.module('@/lib/jobs/shopping/drain-inbox', { namedExports: { scheduleInboxDrain: () => {} } })
+mock.module('@/lib/connectors/woocommerce/sync/webhook-verify', {
+  namedExports: {
+    verifyWcWebhook: async (body: string, signature: string | null) =>
+      signature === createHmac('sha256', WC_WEBHOOK_SECRET).update(body).digest('base64'),
+  },
+})
+mock.module('@/lib/connectors/woocommerce/sync/product-sync', {
+  namedExports: {
+    syncWcProductToIms: async (...args: unknown[]) => {
+      state.syncCalls.push(args)
+      return state.syncResult
+    },
+  },
+})
+mock.module('@/lib/connectors/woocommerce/sync/stock-sync-jobs', {
+  namedExports: {
+    enqueueAndProcessImmediateWcStockSync: async (...args: unknown[]) => { state.stockSyncCalls.push(args) },
+    recordIncomingWcWebhook: async () => {},
+    shouldSuppressWcWebhookEcho: async () => false,
+  },
+})
+mock.module('@/lib/db', {
+  namedExports: {
+    db: {
+      setting: {
+        findUnique: async ({ where }: { where: { key: string } }) => {
+          state.settingReads.push(where.key)
+          const value = state.settings.get(where.key)
+          return value === undefined ? null : { key: where.key, value }
+        },
+        upsert: async () => ({}),
+      },
+      // Reached only if a refused delivery wrongly falls through to the stock correction.
+      product: { findFirst: async () => ({ id: 'ims-1', sku: 'SKU-1' }) },
+    },
+  },
+})
+
+
+type Row = Record<string, unknown>
+
+const STORE_A = 'https://store-a.example.com'
+
+function reset() {
+  state.activity = []
+  state.settings = new Map([['wc_sync_enabled', 'true'], ['wc_url', STORE_A]])
+}
+
+function spies() {
+  const calls = { order: [] as unknown[], refund: [] as unknown[] }
+  const dependencies = {
+    handleOrderWebhook: async (payload: unknown) => { calls.order.push(payload); return Response.json({ ok: true, imported: true }) },
+    handleRefundWebhook: async (payload: unknown) => { calls.refund.push(payload); return Response.json({ ok: true, imported: true }) },
+    handleProductWebhook: async () => Response.json({ ok: true }),
+  }
+  return { calls, dependencies }
+}
+
+async function dispatch(
+  resource: 'orders' | 'refunds',
+  originAttestation: string,
+  payload: unknown,
+  dependencies: ReturnType<typeof spies>['dependencies'],
+) {
+  const { processWcWebhookPayload } = await import('@/lib/connectors/woocommerce/webhooks')
+  return processWcWebhookPayload(
+    { resource, topic: resource === 'orders' ? 'order.created' : 'order.refunded', payload, originAttestation },
+    dependencies,
+  )
+}
+
+const ORDER = { id: 9001, status: 'processing' }
+const REFUND = { id: 77, order_id: 9001 }
+
+for (const [resource, payload, key] of [
+  ['orders', ORDER, 'order'],
+  ['refunds', REFUND, 'refund'],
+] as const) {
+  test(`${key}: a delivery from another store is refused, logged and acknowledged, never imported`, async () => {
+    reset()
+    const { calls, dependencies } = spies()
+
+    const response = await dispatch(resource, 'store:store-b.example.com', payload, dependencies)
+
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), { ok: true, foreignStore: true, verdict: 'foreign-store' })
+    assert.deepEqual(calls[key], [], 'nothing may be imported from a store we are not bound to')
+    const logged = state.activity.find((entry) => entry.action === `wc_${key}_webhook_foreign_store`)
+    assert.ok(logged, 'the refusal must be visible in the activity log')
+    assert.equal(logged.level, 'ERROR')
+    assert.equal((logged.metadata as Row).deliveryStore, 'store-b.example.com')
+    assert.equal((logged.metadata as Row).boundStore, 'store-a.example.com')
+  })
+
+  test(`${key}: a delivery that does not say which store sent it is refused`, async () => {
+    reset()
+    const { calls, dependencies } = spies()
+
+    const response = await dispatch(resource, 'unproven:not-stated', payload, dependencies)
+
+    assert.deepEqual(await response.json(), { ok: true, foreignStore: true, verdict: 'unproven' })
+    assert.deepEqual(calls[key], [])
+    assert.ok(state.activity.some((entry) => entry.action === `wc_${key}_webhook_foreign_store`))
+  })
+
+  test(`${key}: a delivery from the bound store is imported (www. and scheme differences are the same store)`, async () => {
+    reset()
+    state.settings.set('wc_url', 'http://www.store-a.example.com/')
+    const { calls, dependencies } = spies()
+
+    const response = await dispatch(resource, 'store:store-a.example.com', payload, dependencies)
+
+    assert.deepEqual(await response.json(), { ok: true, imported: true })
+    assert.equal(calls[key].length, 1)
+    assert.deepEqual(state.activity, [])
+  })
+
+  test(`${key}: an unreadable binding HOLDS the delivery (503, retried, visible), neither importing nor dropping it`, async () => {
+    reset()
+    state.settings.delete('wc_url')
+    const { calls, dependencies } = spies()
+
+    const response = await dispatch(resource, 'store:store-a.example.com', payload, dependencies)
+
+    assert.equal(response.status, 503, 'a retryable status: the inbox retries, then dead-letters visibly')
+    assert.equal((await response.json() as Row).held, true)
+    assert.deepEqual(calls[key], [])
+    const logged = state.activity.find((entry) => entry.action === `wc_${key}_webhook_held`)
+    assert.ok(logged, 'the hold must be visible to an operator')
+    assert.equal(logged.level, 'ERROR')
+    assert.equal((logged.metadata as Row).verdict, 'binding-unreadable')
+  })
+
+  test(`${key}: evidence of only a location UNDER the store (permalink/self-link) is held, not accepted`, async () => {
+    reset()
+    const { calls, dependencies } = spies()
+
+    const response = await dispatch(resource, 'store-under:store-a.example.com/shop/order/9001', payload, dependencies)
+
+    assert.equal(response.status, 503)
+    assert.deepEqual(calls[key], [])
+    const logged = state.activity.find((entry) => entry.action === `wc_${key}_webhook_held`)
+    assert.ok(logged)
+    assert.equal((logged.metadata as Row).originScope, 'under')
+  })
+}
+
+// --- receipt: a header outside the signature is not proof for money-moving resources -----------
+
+async function receive(resource: 'orders' | 'refunds' | 'products', body: string, headers: Record<string, string>) {
+  const { handleWcWebhook } = await import('@/lib/connectors/woocommerce/webhooks')
+  const persisted: Row[] = []
+  const response = await handleWcWebhook(
+    resource,
+    new Request(`https://ims.example.com/api/webhooks/woocommerce/${resource}`, {
+      method: 'POST',
+      headers: { 'x-wc-webhook-topic': 'order.updated', 'x-wc-webhook-signature': 'sig', ...headers },
+      body,
+    }),
+    body,
+    {
+      getMaintenanceModeResponse: async () => null,
+      verifyWebhook: async () => true, // a VALID signature: the body is genuinely store-signed
+      recordWebhookReceipt: async () => {},
+      getWebhookProcessingGate: async () => ({ enabled: true }),
+      persistWebhookEvent: async (_repository, input) => {
+        persisted.push(input as unknown as Row)
+        return { status: 'created', event: { id: 'evt-1' } as never }
+      },
+      webhookEventRepository: {} as never,
+      handleOrderWebhook: async () => new Response(null, { status: 200 }),
+      handleProductWebhook: async () => new Response(null, { status: 200 }),
+      handleRefundWebhook: async () => new Response(null, { status: 200 }),
+    },
+  )
+  assert.equal(response.status, 202)
+  return persisted[0].originAttestation as string
+}
+
+for (const resource of ['orders', 'refunds'] as const) {
+  test(`${resource}: a valid signature with a FORGED source header and no signed store evidence is held, not imported`, async () => {
+    reset()
+    const body = JSON.stringify({ id: 9001, order_id: 9001 })
+    const attestation = await receive(resource, body, { 'x-wc-webhook-source': `${STORE_A}/` })
+    assert.equal(attestation, 'store-header:store-a.example.com', 'header-only evidence is recorded as unsigned')
+
+    const { calls, dependencies } = spies()
+    const response = await dispatch(resource, attestation, JSON.parse(body), dependencies)
+
+    assert.equal(response.status, 503)
+    assert.deepEqual(calls[resource === 'orders' ? 'order' : 'refund'], [])
+    const logged = state.activity.find((entry) => String(entry.action).endsWith('_webhook_held'))
+    assert.ok(logged)
+    assert.equal((logged.metadata as Row).originScope, 'header')
+  })
+
+  test(`${resource}: signed body evidence still outranks a header, and is accepted as exact`, async () => {
+    reset()
+    const body = JSON.stringify({ id: 9001, order_id: 9001, _links: { self: [{ href: `${STORE_A}/wp-json/wc/v3/orders/9001` }] } })
+    const attestation = await receive(resource, body, { 'x-wc-webhook-source': 'https://forged.example.com/' })
+    assert.equal(attestation, 'store:store-a.example.com')
+  })
+}
+
+test('products keep the plain store: encoding for header-only evidence (unchanged behaviour)', async () => {
+  reset()
+  const attestation = await receive('products', JSON.stringify({ id: 1, sku: 'S' }), { 'x-wc-webhook-source': `${STORE_A}/` })
+  assert.equal(attestation, 'store:store-a.example.com')
+})
+
+// --- an unreadable binding is checked BEFORE the evidence is judged ---------------------------------
+
+for (const [resource, payload, key] of [['orders', ORDER, 'order'], ['refunds', REFUND, 'refund']] as const) {
+  for (const attestation of ['unproven:not-stated', 'unproven:pre-attestation', 'store:store-b.example.com']) {
+    test(`${key}: wc_url missing AND evidence "${attestation}": held (503), never acknowledged and lost`, async () => {
+      reset()
+      state.settings.delete('wc_url')
+      const { calls, dependencies } = spies()
+
+      const response = await dispatch(resource, attestation, payload, dependencies)
+
+      assert.equal(response.status, 503)
+      assert.deepEqual(calls[key], [])
+      assert.ok(state.activity.some((entry) => entry.action === `wc_${key}_webhook_held`))
+      assert.equal(state.activity.some((entry) => entry.action === `wc_${key}_webhook_foreign_store`), false)
+    })
+  }
+}
+
+// --- plain permalinks: `?rest_route=` self-links ----------------------------------------------------
+
+test('restRouteSiteRoot derives the exact site root from a plain-permalink REST link, and refuses odd shapes', async () => {
+  const { restRouteSiteRoot } = await import('@/lib/connectors/woocommerce/webhook-origin')
+  assert.equal(restRouteSiteRoot('https://store-a.example.com/?rest_route=/wc/v3/orders/9001'), 'https://store-a.example.com')
+  assert.equal(restRouteSiteRoot('https://store-a.example.com/index.php?rest_route=/wc/v3/orders/9001'), 'https://store-a.example.com')
+  assert.equal(restRouteSiteRoot('https://store-a.example.com:8443/shop/?rest_route=/wc/v3/orders/9001'), 'https://store-a.example.com:8443/shop')
+  assert.equal(restRouteSiteRoot('https://store-a.example.com/shop/index.php?rest_route=%2Fwc%2Fv3%2Forders%2F9001'), 'https://store-a.example.com/shop')
+  for (const bad of [
+    'https://store-a.example.com/?rest_route=/wp/v2/posts', // not a WooCommerce route
+    'https://store-a.example.com/?rest_route=/wc/v3/a&rest_route=/wc/v3/b', // ambiguous
+    'https://store-a.example.com/other.php?rest_route=/wc/v3/orders/1', // not index.php
+    'https://u:p@store-a.example.com/?rest_route=/wc/v3/orders/1',
+    'ftp://store-a.example.com/?rest_route=/wc/v3/orders/1',
+    'https://store-a.example.com/product/widget',
+    'not a url',
+  ]) assert.equal(restRouteSiteRoot(bad), null, bad)
+})
+
+for (const resource of ['orders', 'refunds'] as const) {
+  const key = resource === 'orders' ? 'order' : 'refund'
+  const bodyFor = (href: string) => JSON.stringify({ id: 9001, order_id: 9001, _links: { self: [{ href }] } })
+
+  test(`${resource}: a signed ?rest_route= self-link is recorded as the EXACT site root and the bound store's delivery imports`, async () => {
+    reset()
+    const attestation = await receive(resource, bodyFor(`${STORE_A}/?rest_route=/wc/v3/orders/9001`), { 'x-wc-webhook-source': 'https://forged.example.com/' })
+    assert.equal(attestation, 'store:store-a.example.com')
+
+    const { calls, dependencies } = spies()
+    const response = await dispatch(resource, attestation, JSON.parse(bodyFor(`${STORE_A}/?rest_route=/wc/v3/orders/9001`)), dependencies)
+    assert.deepEqual(await response.json(), { ok: true, imported: true })
+    assert.equal(calls[key].length, 1)
+  })
+
+  test(`${resource}: a ?rest_route= self-link from ANOTHER store is refused as foreign, not held for ever`, async () => {
+    reset()
+    const attestation = await receive(resource, bodyFor('https://store-b.example.com/index.php?rest_route=/wc/v3/orders/9001'), {})
+    assert.equal(attestation, 'store:store-b.example.com')
+
+    const { calls, dependencies } = spies()
+    const response = await dispatch(resource, attestation, {}, dependencies)
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), { ok: true, foreignStore: true, verdict: 'foreign-store' })
+    assert.deepEqual(calls[key], [])
+  })
+
+  test(`${resource}: a ?rest_route= link under a sub-path of a root binding is a different store`, async () => {
+    reset()
+    const attestation = await receive(resource, bodyFor(`${STORE_A}/shop/?rest_route=/wc/v3/orders/9001`), {})
+    assert.equal(attestation, 'store:store-a.example.com/shop')
+    const { calls, dependencies } = spies()
+    const response = await dispatch(resource, attestation, {}, dependencies)
+    assert.deepEqual(await response.json(), { ok: true, foreignStore: true, verdict: 'foreign-store' })
+    assert.deepEqual(calls[key], [])
+  })
+}
+
+// --- mutation-pass additions ---------------------------------------------------------------------
+
+for (const [resource, payload, key] of [['orders', ORDER, 'order'], ['refunds', REFUND, 'refund']] as const) {
+  test(`${key}: header-only evidence naming ANOTHER store is held (unsigned, so not proof of foreignness either)`, async () => {
+    reset()
+    const { calls, dependencies } = spies()
+    const response = await dispatch(resource, 'store-header:store-b.example.com', payload, dependencies)
+    assert.equal(response.status, 503)
+    assert.deepEqual(calls[key], [])
+    assert.equal(state.activity.some((entry) => entry.action === `wc_${key}_webhook_foreign_store`), false)
+    assert.equal((state.activity.find((entry) => entry.action === `wc_${key}_webhook_held`)?.metadata as Row).originScope, 'header')
+  })
+}
+
+test('a refund hold names the order from order_id, or from parent_id when order_id is absent', async () => {
+  for (const [payload, expected] of [[{ id: 77, order_id: 9001 }, 9001], [{ id: 77, parent_id: 9002 }, 9002]] as const) {
+    reset()
+    state.settings.delete('wc_url')
+    const { dependencies } = spies()
+    await dispatch('refunds', 'store:store-a.example.com', payload, dependencies)
+    assert.equal((state.activity.find((entry) => entry.action === 'wc_refund_webhook_held')?.metadata as Row).externalId, expected)
+  }
+})
+
+test('restRouteSiteRoot refuses a link with a fragment', async () => {
+  const { restRouteSiteRoot } = await import('@/lib/connectors/woocommerce/webhook-origin')
+  assert.equal(restRouteSiteRoot('https://store-a.example.com/?rest_route=/wc/v3/orders/1#frag'), null)
+})

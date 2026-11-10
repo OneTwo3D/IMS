@@ -68,6 +68,7 @@ import {
   type MarkHandledResult,
 } from '@/lib/domain/accounting/posting-mark-handled'
 import { claimLogDescription, handPostInstruction, handPostOrderFor, markLogDescription, markNotice, releaseLogDescription, releaseNotice, withHandPostSafety } from '@/lib/domain/accounting/hand-post-instruction'
+import { DEAD_SHOPPING_WEBHOOK_WHERE, buildDeadShoppingWebhookReplayData, buildDeadShoppingWebhookReplayWhere } from '@/lib/domain/shopping-webhook-exception'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   IntegrationOutboxAdminError,
@@ -389,9 +390,9 @@ export type DeadReceiptEventRow = {
   id: string
   connector: string
   /** booked-in = wms_inbound_receipt_events (ASN goods-in); webhook = wms_webhook_events (order/inventory). */
-  kind: 'booked-in' | 'webhook'
+  kind: 'booked-in' | 'webhook' | 'shopping-webhook'
   externalEventId: string
-  /** ASN id for booked-in rows; the event type for webhook rows. */
+  /** ASN id for booked-in rows; the event type for webhook rows; resource and topic for store deliveries. */
   reference: string | null
   processingAttempts: number
   lastError: string | null
@@ -1047,7 +1048,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
   // host's. Read before the batch because the predicate is built from it; `null` (unreadable clock)
   // means no grace at all, which lists every marked row — noise in the safe direction.
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
-  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents, accountingFollowUpObligations, outstandingPostingRefusals, unconfirmedPostingRefusals, handPostClaims] = await Promise.all([
+  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, deadShoppingWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents, accountingFollowUpObligations, outstandingPostingRefusals, unconfirmedPostingRefusals, handPostClaims] = await Promise.all([
     // o3d-92fu / o3d-2k5r: the count is over EVERY blocked push state, not DEAD_LETTER alone — a
     // VALIDATION_FAILED or AMBIGUOUS_CREATE order reaches the warehouse only via a human, so it
     // belongs in the same total. Kept through the merge with o3d-0bfh's follow-up obligations.
@@ -1055,6 +1056,9 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     db.integrationOutbox.count({ where: { status: { in: OUTBOX_FAILURE_STATUSES } } }),
     db.wmsInboundReceiptEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
     db.wmsWebhookEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
+    // Store (WooCommerce) deliveries that ran out of retries, including order and refund deliveries held because
+    // the sending store could not be proven: they dead-letter in shopping_webhook_events, not the WMS tables.
+    db.shoppingWebhookEvent.count({ where: DEAD_SHOPPING_WEBHOOK_WHERE }),
     db.shoppingSyncLog.count({ where: REFUND_PARK_WHERE }),
     db.wmsOrderPushLink.count({ where: { totalMismatchPence: { not: null } } }),
     countStuckDispatches(),
@@ -1083,7 +1087,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
   ])
 
   const maintenanceRecovery = countMaintenanceRecovery(await loadMaintenanceRecoveryState())
-  const deadReceiptEvents = deadReceipts + deadWebhooks
+  const deadReceiptEvents = deadReceipts + deadWebhooks + deadShoppingWebhooks
   return {
     maintenanceRecovery,
     wmsPushDeadLetters,
@@ -1177,7 +1181,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   // threaded through, because the two loads are independent reads and a cutoff a few milliseconds
   // apart cannot change which side of a five-minute grace a row falls on.
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
-  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents, followUpObligationRows, postingRefusalRows] = await Promise.all([
+  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, deadShoppingWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents, followUpObligationRows, postingRefusalRows] = await Promise.all([
     db.wmsOrderPushLink.findMany({
       where: { state: { in: [...BLOCKED_WMS_PUSH_STATES] } },
       orderBy: { lastAttemptAt: 'desc' },
@@ -1232,6 +1236,21 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         processingAttempts: true,
         lastError: true,
         deadLetteredAt: true,
+      },
+    }),
+    db.shoppingWebhookEvent.findMany({
+      where: DEAD_SHOPPING_WEBHOOK_WHERE,
+      orderBy: { updatedAt: 'desc' },
+      take: SECTION_LIMIT,
+      select: {
+        id: true,
+        connector: true,
+        resource: true,
+        topic: true,
+        externalEventId: true,
+        attempts: true,
+        lastError: true,
+        updatedAt: true,
       },
     }),
     db.shoppingSyncLog.findMany({
@@ -1579,6 +1598,16 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         processingAttempts: event.processingAttempts,
         lastError: event.lastError,
         deadLetteredAt: event.deadLetteredAt?.toISOString() ?? null,
+      })),
+      ...deadShoppingWebhookRows.map((event) => ({
+        id: event.id,
+        connector: event.connector,
+        kind: 'shopping-webhook' as const,
+        externalEventId: event.externalEventId ?? event.id,
+        reference: [event.resource, event.topic].filter(Boolean).join(' '),
+        processingAttempts: event.attempts,
+        lastError: event.lastError,
+        deadLetteredAt: event.updatedAt.toISOString(),
       })),
     ]
       .sort((left, right) => (right.deadLetteredAt ?? '').localeCompare(left.deadLetteredAt ?? ''))
@@ -2419,6 +2448,39 @@ export async function replayDeadWebhookEvent(id: string): Promise<MutationResult
       tag: 'sync',
       action: 'wms_webhook_event_replay',
       description: 'Re-queued a dead-lettered WMS webhook event via the exception inbox',
+      metadata: { webhookEventId: id, userId: session.user.id },
+    })
+    revalidatePath('/sync/exceptions')
+    return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * Replay a DEAD store (WooCommerce) webhook delivery (shopping_webhook_events): the same
+ * compare-and-set reset as the WMS replays. The inbox drain re-processes the ORIGINAL payload
+ * under the origin recorded at receipt, so a delivery held for an unreadable store URL imports
+ * once the URL is fixed, and one that is held again says so again.
+ */
+export async function replayDeadShoppingWebhookEvent(id: string): Promise<MutationResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    const updated = await db.shoppingWebhookEvent.updateMany({
+      where: buildDeadShoppingWebhookReplayWhere(id),
+      data: buildDeadShoppingWebhookReplayData(),
+    })
+    if (updated.count === 0) {
+      return { success: false, error: 'The webhook delivery is no longer dead-lettered (already replayed or processed).' }
+    }
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: id,
+      tag: 'sync',
+      action: 'shopping_webhook_event_replay',
+      description: 'Re-queued a dead-lettered store webhook delivery via the exception inbox',
       metadata: { webhookEventId: id, userId: session.user.id },
     })
     revalidatePath('/sync/exceptions')
