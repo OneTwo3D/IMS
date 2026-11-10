@@ -215,6 +215,11 @@ export async function pushProductMetadata(productId: string): Promise<PushProduc
   const results = await Promise.all(connectors.map(async (connector) => {
     switch (connector) {
       case 'woocommerce': {
+        // Before the seam, so a push the settings forbid records no obligation either. A read
+        // failure throws out of this callback and fails the push: unreadable is not consent.
+        const { readWcProductPushDecision } = await import('@/lib/connectors/woocommerce/sync/product-push-gate')
+        const decision = await readWcProductPushDecision()
+        if (!decision.allowed) return { connector, result: { success: true, skipped: true, error: decision.message } }
         // The producer seam: with the hold enforced and the decision SHADOW, record it and send nothing.
         const seam = await wooProducerSeam({ operation: 'product.meta', subjectType: 'Product', subjectId: productId, payload: { productId } })
         if (!seam.proceed) return { connector, result: shadowedPush(seam) }
@@ -233,6 +238,7 @@ export async function pushProductMetadata(productId: string): Promise<PushProduc
   }
   const shadowed = results.find((entry) => 'shadowed' in entry.result && entry.result.shadowed)
   if (shadowed) return { success: false, shadowed: true, error: 'error' in shadowed.result ? shadowed.result.error : undefined }
+  if (results.every((entry) => 'skipped' in entry.result && entry.result.skipped)) return { success: true, skipped: true }
 
   return { success: true }
 }

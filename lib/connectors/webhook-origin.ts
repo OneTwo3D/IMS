@@ -48,12 +48,21 @@
  * `/store-b` subsite's product `widget`, or the root site's product at a path that begins
  * `store-b`, and nothing in the URL says which. An `exact` statement never has that problem.
  */
-export type WebhookOriginScope = 'exact' | 'under'
+export type WebhookOriginScope = 'exact' | 'under' | 'header'
+/**
+ * `header` — the value is the site root, but it was read from a header that sits OUTSIDE the
+ * delivery's signature, so anyone who can replay a signed body can choose it. Compared for
+ * equality like `exact` (so the product path, which records it as plain `store:`, is not
+ * affected), but a caller that moves money on the strength of the delivery treats it as
+ * unproven. Recorded only for the resources that ask for it.
+ */
 
 /** Prefix for a PROVEN site root: `store:<host>[/<path>]`. */
 const STORE_PREFIX = 'store:'
 /** Prefix for a PROVEN URL at-or-under the site root: `store-under:<host>[/<path>]`. */
 const STORE_UNDER_PREFIX = 'store-under:'
+/** Prefix for a site root known only from an UNSIGNED header: `store-header:<host>[/<path>]`. */
+const STORE_HEADER_PREFIX = 'store-header:'
 
 /**
  * The four ways a row can positively record that it has no proven origin.
@@ -148,6 +157,12 @@ export function attestWebhookOriginUnder(rawUrl: string | null | undefined): str
   return identity ? `${STORE_UNDER_PREFIX}${identity}` : WEBHOOK_ORIGIN_NOT_STATED
 }
 
+/** Like `attestWebhookOrigin`, for a site root that came from a header outside the signature. */
+export function attestWebhookOriginFromUnsignedHeader(rawUrl: string | null | undefined): string {
+  const identity = normaliseStoreIdentity(rawUrl)
+  return identity ? `${STORE_HEADER_PREFIX}${identity}` : WEBHOOK_ORIGIN_NOT_STATED
+}
+
 export type AttestedOrigin = { identity: string; scope: WebhookOriginScope }
 
 /** What a stored attestation proves, or `null` for any `unproven:*` marker. */
@@ -159,6 +174,10 @@ export function attestedOrigin(attestation: string): AttestedOrigin | null {
   if (attestation.startsWith(STORE_UNDER_PREFIX)) {
     const identity = attestation.slice(STORE_UNDER_PREFIX.length)
     return identity ? { identity, scope: 'under' } : null
+  }
+  if (attestation.startsWith(STORE_HEADER_PREFIX)) {
+    const identity = attestation.slice(STORE_HEADER_PREFIX.length)
+    return identity ? { identity, scope: 'header' } : null
   }
   return null
 }

@@ -141,13 +141,17 @@ export async function processShoppingWebhookEvent(
       originAttestation: claimed.originAttestation,
     })
     await assertSuccessfulResponse(response, options.connectorLabel)
-    await options.repository.markProcessed(claimed.id, now)
+    if (!(await options.repository.markProcessed(claimed.id, now, claimed.claimGeneration))) {
+      return staleClaim(options, claimed, 'processed')
+    }
     return { status: 'processed', eventId: claimed.id }
   } catch (error) {
     const message = normalizeWcWebhookError(error)
     const maxAttempts = getWcWebhookMaxAttempts(options.env)
     if (!isRetryableProcessingError(error) || claimed.attempts >= maxAttempts) {
-      await options.repository.markDeadLetter({ id: claimed.id, now, error: message })
+      if (!(await options.repository.markDeadLetter({ id: claimed.id, now, error: message, claimGeneration: claimed.claimGeneration }))) {
+        return staleClaim(options, claimed, 'dead_letter')
+      }
       console.warn(`${options.logPrefix} event dead-lettered`, {
         eventId: claimed.id,
         attempts: claimed.attempts,
@@ -157,12 +161,15 @@ export async function processShoppingWebhookEvent(
     }
 
     const nextAttemptAt = nextRetryAt({ attempts: claimed.attempts, now, eventId: claimed.id })
-    await options.repository.markFailed({
+    if (!(await options.repository.markFailed({
       id: claimed.id,
       now,
       error: message,
       nextAttemptAt,
-    })
+      claimGeneration: claimed.claimGeneration,
+    }))) {
+      return staleClaim(options, claimed, 'failed')
+    }
     console.warn(`${options.logPrefix} event processing failed`, {
       eventId: claimed.id,
       attempts: claimed.attempts,
@@ -170,6 +177,42 @@ export async function processShoppingWebhookEvent(
     })
     return { status: 'failed', eventId: claimed.id, error: message, nextAttemptAt }
   }
+}
+
+/**
+ * This worker's claim was lost while it was working (it expired and the row was claimed again, or
+ * dead-lettered, or replayed): its result is DISCARDED and the row is left exactly as the newer
+ * state made it. Logged, because the side effects of the work may already have happened; the
+ * import paths are idempotent by external id, which is what makes the newer claim's rerun safe.
+ */
+async function staleClaim(
+  options: ShoppingWebhookProcessorOptions,
+  claimed: ShoppingWebhookEventRow,
+  wouldHaveRecorded: 'processed' | 'failed' | 'dead_letter',
+): Promise<ProcessShoppingWebhookEventResult> {
+  console.warn(`${options.logPrefix} stale claim: result discarded`, {
+    eventId: claimed.id,
+    claimGeneration: claimed.claimGeneration,
+    wouldHaveRecorded,
+  })
+  try {
+    const { logActivity } = await import('@/lib/activity-log')
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: claimed.id,
+      tag: 'sync',
+      action: 'shopping_webhook_stale_claim',
+      level: 'WARNING',
+      description: `A ${options.connectorLabel} webhook worker finished after its claim had expired and been taken over `
+        + `(it would have recorded: ${wouldHaveRecorded}). Its result was discarded and the row was left as the newer `
+        + 'claim, dead-letter or replay made it.',
+      metadata: { eventId: claimed.id, claimGeneration: claimed.claimGeneration, wouldHaveRecorded },
+      resolveUser: false,
+    })
+  } catch (e) {
+    console.error(`${options.logPrefix} failed to log a stale claim`, e)
+  }
+  return { status: 'skipped', eventId: claimed.id, reason: 'claim_lost' }
 }
 
 export async function processPendingShoppingWebhookEvents(
