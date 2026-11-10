@@ -34,7 +34,7 @@ import { headerDiscountedReturnCreditBase } from '@/lib/domain/purchasing/return
  */
 
 mock.module('@/lib/auth/server', {
-  namedExports: { requirePermission: async () => ({ user: { id: 'u1' } }) },
+  namedExports: { requirePermission: async () => ({ user: { id: 'u1', role: 'ADMIN' } }) },
 })
 
 type PoOpts = {

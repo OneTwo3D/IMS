@@ -1,4 +1,5 @@
 import type { PurchasePriceVarianceReportRow } from '@/lib/domain/purchasing/purchasing-analytics'
+import { requirePurchasingAnalyticsAccess } from '@/lib/security/purchasing-analytics-page-access'
 import { PurchasingAnalyticsReportPage, type PurchasingAnalyticsColumn } from '../_components/purchasing-analytics-report'
 import { loadPurchasePriceVarianceReportForPage, purchasingAnalyticsFiltersForUi, purchasingAnalyticsFiltersFromSearch, type PurchasingAnalyticsSearchParams } from '../_components/purchasing-analytics-page-utils'
 
@@ -20,6 +21,7 @@ const columns: Array<PurchasingAnalyticsColumn<PurchasePriceVarianceReportRow>> 
 ]
 
 export default async function PurchasePriceVarianceAnalyticsPage({ searchParams }: Props) {
+  await requirePurchasingAnalyticsAccess()
   const filters = purchasingAnalyticsFiltersFromSearch(await searchParams)
   const report = await loadPurchasePriceVarianceReportForPage(filters)
   return (

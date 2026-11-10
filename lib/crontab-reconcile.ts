@@ -19,6 +19,7 @@ import {
 } from '@/lib/crontab-sync'
 import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
 import { getPublicAppUrl } from '@/lib/public-app-url'
+import { isSafePublicBaseUrl } from '@/lib/domain/settings/public-app-url-input'
 import { heartbeatWrapperProblem, resolveHeartbeatsFromEnv } from '@/lib/ops/cron-heartbeats'
 import { HOST_CRON_PENDING_MESSAGE } from '@/lib/ops/host-cron-constants'
 import { isContainerSchedulerMode } from '@/lib/ops/host-cron'
@@ -185,6 +186,11 @@ async function applyCrontabFromSettings(
   const baseUrl = await getPublicAppUrl()
   if (!baseUrl) {
     return { success: false, error: 'Public app URL is not configured.' }
+  }
+  // The stored setting is administrator-typed text and receives the cron secret on every job, so the strict
+  // public rule applies here too: a bad value that is already stored stops the crontab being written.
+  if (!isSafePublicBaseUrl(baseUrl)) {
+    return { success: false, error: 'The saved Public App URL is not a plain https URL (https only, no spaces, credentials, query, fragment or shell characters), so the crontab was NOT written. The Public App URL in Settings needs a valid value.' }
   }
   const { jobs, settings } = await readCronJobsAndSettings()
 

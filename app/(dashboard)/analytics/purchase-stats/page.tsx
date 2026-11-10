@@ -1,11 +1,13 @@
 import type { Metadata } from 'next'
 import { getPurchaseProductStats, getReceivedGoods, getPurchaseBills, getSupplierAging, getPurchaseDetails } from '@/app/actions/purchase-stats'
 import { getSavedViews } from '@/app/actions/sales-stats'
+import { requirePurchasingAnalyticsAccess } from '@/lib/security/purchasing-analytics-page-access'
 import { PurchaseStatsClient } from './purchase-stats-client'
 
 export const metadata: Metadata = { title: 'Purchase Statistics' }
 
 export default async function PurchaseStatsPage() {
+  await requirePurchasingAnalyticsAccess()
   const [products, received, bills, aging, details, savedViews] = await Promise.all([
     getPurchaseProductStats(),
     getReceivedGoods(),

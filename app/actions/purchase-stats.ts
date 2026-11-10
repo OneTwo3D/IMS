@@ -2,6 +2,7 @@
 
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
+import { assertPurchasingAnalyticsAccess } from '@/lib/security/purchasing-analytics-access'
 import { COMMITTED_PURCHASE_ORDER_WHERE, INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { headerDiscountedReturnCreditBase } from '@/lib/domain/purchasing/return-credit-basis'
 import { hasPaymentMarker } from '@/lib/domain/purchasing/supplier-payment-basis'
@@ -35,7 +36,7 @@ export type PurchaseProductRow = {
 }
 
 export async function getPurchaseProductStats(dateFrom?: string, dateTo?: string): Promise<PurchaseProductRow[]> {
-  await requirePermission('analytics')
+  assertPurchasingAnalyticsAccess((await requirePermission('analytics')).user.role)
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -142,7 +143,7 @@ export type ReceivedGoodsRow = {
 }
 
 export async function getReceivedGoods(dateFrom?: string, dateTo?: string): Promise<ReceivedGoodsRow[]> {
-  await requirePermission('analytics')
+  assertPurchasingAnalyticsAccess((await requirePermission('analytics')).user.role)
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -208,7 +209,7 @@ export type BillRow = {
 }
 
 export async function getPurchaseBills(dateFrom?: string, dateTo?: string): Promise<BillRow[]> {
-  await requirePermission('analytics')
+  assertPurchasingAnalyticsAccess((await requirePermission('analytics')).user.role)
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -332,7 +333,7 @@ export type SupplierAgingRow = {
 }
 
 export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
-  await requirePermission('analytics')
+  assertPurchasingAnalyticsAccess((await requirePermission('analytics')).user.role)
   const suppliers = await db.supplier.findMany({
     where: { active: true },
     select: {
@@ -531,7 +532,7 @@ export type PurchaseDetailRow = {
 }
 
 export async function getPurchaseDetails(dateFrom?: string, dateTo?: string): Promise<PurchaseDetailRow[]> {
-  await requirePermission('analytics')
+  assertPurchasingAnalyticsAccess((await requirePermission('analytics')).user.role)
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
