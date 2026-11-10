@@ -165,7 +165,7 @@ test('SO-H2: allocating a DRAFT directly does not promote it (the server action 
 })
 
 // What the ledger would book for a queued sales invoice, from its payload alone (every line, the shipping and the discount at the one 20% rate).
-type FullPayload = InvoicePayload & { lines: Array<{ quantity: number; unitAmount: number; discountAmount?: number }>; shippingAmount?: number; discountAmount?: number }
+type FullPayload = { lineAmountsIncludeTax: boolean; lines: Array<{ quantity: number; unitAmount: number; discountAmount?: number }>; shippingAmount?: number; discountAmount?: number }
 const ledgerTotal = (p: FullPayload) => {
   const lines = p.lines.reduce((t, l) => t + l.quantity * l.unitAmount - (l.discountAmount ?? 0), 0)
   const net = lines + (p.shippingAmount ?? 0) - (p.discountAmount ?? 0)
