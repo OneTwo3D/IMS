@@ -606,7 +606,9 @@ export type CustomerAgingRow = {
 export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
   await requirePermission('analytics')
   const orders = await db.salesOrder.findMany({
-    where: INVOICED_ORDER_WHERE,
+    // Held as paid (`paidAt` set) means nothing is owed, whether or not a local Payment row exists:
+    // markSalesOrderPaid and the importer set paidAt without one. Same rule AR Aging applies.
+    where: { ...INVOICED_ORDER_WHERE, paidAt: null },
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, customerId: true, customerName: true, salesRep: true,
       currency: true, totalBase: true, taxBase: true, invoicedAt: true, paidAt: true, createdAt: true,

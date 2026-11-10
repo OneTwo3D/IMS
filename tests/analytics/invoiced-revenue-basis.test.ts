@@ -282,3 +282,15 @@ test('customer figures carry the right marker: upper bound for a positive unplac
     assert.equal(approx!.lifetimeValueUpperBound, false)
   } finally { ORDERS.pop() }
 })
+
+test('an order held as paid (paidAt set) with no Payment rows is not in Customer Aging or its CSV', async () => {
+  // markSalesOrderPaid and the importer set paidAt without a Payment row; subtracting Payment rows alone would leave the full amount due.
+  ORDERS.push(row('P', 55, { invoiceNumber: 'INV-P', paidAt: TODAY_NOON, payments: [] }))
+  try {
+    const { getCustomerAging } = await import('@/app/actions/sales-stats')
+    assert.ok(!(await getCustomerAging()).some((r) => r.orderNumber === 'P'), 'absent from the screen rows')
+    const { GET } = await import('@/app/api/export/analytics/route')
+    const csv = await (await GET(new NextRequest('http://localhost/api/export/analytics?type=aging'))).text()
+    assert.ok(!csv.includes(',P,') && !/^P,/m.test(csv), 'absent from the CSV')
+  } finally { ORDERS.pop() }
+})
