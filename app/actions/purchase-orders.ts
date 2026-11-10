@@ -1500,8 +1500,13 @@ function checkAmendHeader(
   const nameDiffers = input.taxRateName !== undefined && (input.taxRateName || null) !== (locked.taxRateName || null)
   const valueDiffers = input.taxRateValue !== undefined && Math.abs(input.taxRateValue - Number(locked.taxRatePercent ?? 0)) > 1e-6
   if (nameDiffers || valueDiffers) return billed ? PO_BILLED_FIGURES_EDIT_MESSAGE : AMEND_HEADER_FROZEN_MESSAGE
-  if (billed && input.orderDiscountForeign !== undefined && Math.abs(input.orderDiscountForeign - Number(locked.discountAmount ?? 0)) > 0.005) {
-    return PO_BILLED_FIGURES_EDIT_MESSAGE
+  // Frozen as soon as anything has landed or been billed: the header discount moves the order totals while the received cost
+  // layers and the bills stay put. Compared on the amount (a % discount recomputes when quantities change, which is a change).
+  if ((billed || facts.anyLanded) && input.orderDiscountForeign !== undefined
+    && Math.abs(input.orderDiscountForeign - Number(locked.discountAmount ?? 0)) > 0.005) {
+    return billed
+      ? PO_BILLED_FIGURES_EDIT_MESSAGE
+      : 'Goods have already been received, so the order discount cannot be changed. Use a fixed amount rather than a percentage if quantities on the order still need to change.'
   }
   if (input.additionalCosts !== undefined && (billed || facts.anyLanded)) {
     const requested = normaliseCostLinesForCompare(input.additionalCosts)
@@ -1574,6 +1579,7 @@ export async function updatePurchaseOrder(
           fxRateToBase: true,
           taxRateName: true,
           taxRatePercent: true,
+          discountStr: true,
           discountAmount: true,
           destinationWarehouseId: true,
           subtotalForeign: true,
@@ -1601,6 +1607,9 @@ export async function updatePurchaseOrder(
             ...requestedEdit,
             taxRateName: requestedEdit.taxRateName ?? locked.taxRateName ?? undefined,
             taxRateValue: requestedEdit.taxRateValue ?? Number(locked.taxRatePercent ?? 0),
+            // A line save that omits the order discount keeps the stored one; it never defaults to zero.
+            orderDiscountForeign: requestedEdit.orderDiscountForeign ?? Number(locked.discountAmount ?? 0),
+            orderDiscountStr: requestedEdit.orderDiscountStr !== undefined ? requestedEdit.orderDiscountStr : locked.discountStr,
           }
         : requestedEdit
 
@@ -1891,7 +1900,8 @@ export async function updatePurchaseOrder(
         // Persist the VAT convention actually used to recompute these totals + the header discount, so a
         // later supplier requote reapplies the discount in the same convention (o3d-lx1). Kept aligned with
         // the recalculation: an edit that recomputes as net stores false, inclusive stores true.
-        updates.pricesIncludeVat = inclVat
+        // An amend keeps the stored VAT convention: the receipts, bills and ASNs were costed under it.
+        if (!amend) updates.pricesIncludeVat = inclVat
       }
 
       const po = rateOnlyFxRefresh

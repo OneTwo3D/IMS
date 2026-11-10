@@ -603,3 +603,63 @@ test('an order stranded in PARTIALLY_RETURNED by an older return can be closed o
   assert.equal(after.status, 'CLOSED')
   assert.equal(after.stock, 4, 'the received stock stays')
 })
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// HEADER DISCOUNT
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+
+test('a received-but-unbilled order: the header discount cannot be changed, and a line save that omits it keeps it', SKIP, async () => {
+  const { updatePurchaseOrder } = await actions()
+  const { db } = await import('@/lib/db')
+  const po = await seedPo('ed-disc-recv', [100, 20])
+  await db.purchaseOrder.update({ where: { id: po.poId }, data: { discountAmount: 10, discountStr: '10' } })
+  assert.equal((await receive(po, po.lines[0]!, 60)).success, true)
+  const read = () => db.purchaseOrder.findUniqueOrThrow({ where: { id: po.poId }, select: { discountAmount: true, discountStr: true, totalForeign: true } })
+  const before = await read()
+
+  const changed = await updatePurchaseOrder(po.poId, editFor(po, [{ qty: 100 }, { qty: 20 }], { orderDiscountForeign: 25, orderDiscountStr: '25' }))
+  assert.equal(changed.success, false)
+  assert.match(changed.error ?? '', /order discount cannot be changed/)
+  assert.deepEqual(await read(), before, 'a refused edit changes nothing')
+
+  // Omitted: the stored discount is kept, not defaulted to zero, and the total reflects it.
+  const omitted = await updatePurchaseOrder(po.poId, editFor(po, [{ qty: 100 }, { qty: 25 }]))
+  assert.equal(omitted.success, true, String(omitted.error))
+  const after = await read()
+  assert.equal(Number(after.discountAmount), 10)
+  assert.equal(after.discountStr, '10')
+  assert.equal(Number(after.totalForeign), 100 * 5 + 25 * 5 - 10)
+})
+
+test('a billed order: a line edit that omits the order discount keeps it; changing it is refused', SKIP, async () => {
+  const { updatePurchaseOrder } = await actions()
+  const { db } = await import('@/lib/db')
+  const { PO_BILLED_FIGURES_EDIT_MESSAGE } = await import('@/lib/domain/purchasing/purchase-invoice-edit')
+  const po = await seedPo('ed-disc-bill', [10, 10])
+  await db.purchaseOrder.update({ where: { id: po.poId }, data: { discountAmount: 5, discountStr: '5' } })
+  await db.purchaseInvoice.create({
+    data: {
+      poId: po.poId, invoiceDate: new Date(), subtotalForeign: 40, subtotalBase: 40, totalForeign: 40, totalBase: 40, fxRateToBase: 1,
+      lines: { create: [{ poLineId: po.lines[0]!.poLineId, qtyBilled: 8, unitCostForeign: 5, totalForeign: 40, totalBase: 40 }] },
+    },
+  })
+  const changed = await updatePurchaseOrder(po.poId, editFor(po, [{ qty: 10 }, { qty: 10 }], { orderDiscountForeign: 0 }))
+  assert.equal(changed.success, false)
+  assert.equal(changed.error, PO_BILLED_FIGURES_EDIT_MESSAGE)
+  const ok = await updatePurchaseOrder(po.poId, editFor(po, [{ qty: 10 }, { qty: 12 }]))
+  assert.equal(ok.success, true, String(ok.error))
+  const row = await db.purchaseOrder.findUniqueOrThrow({ where: { id: po.poId }, select: { discountAmount: true, discountStr: true } })
+  assert.equal(Number(row.discountAmount), 5)
+  assert.equal(row.discountStr, '5')
+})
+
+test('cancel is refused on a fully received order (it can only be closed)', SKIP, async () => {
+  const { cancelPurchaseOrder, advancePoStatus } = await actions()
+  const po = await seedPo('lc-cancel-received', [4])
+  assert.equal((await receive(po, po.lines[0]!, 4)).success, true)
+  assert.equal((await poState(po)).status, 'RECEIVED')
+  const cancel = await cancelPurchaseOrder(po.poId)
+  assert.equal(cancel.success, false)
+  assert.equal((await poState(po)).status, 'RECEIVED')
+  assert.equal((await advancePoStatus(po.poId, 'CLOSED')).success, true)
+})
