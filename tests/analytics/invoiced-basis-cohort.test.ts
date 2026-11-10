@@ -156,6 +156,40 @@ test('currency summary places a Xeroom-era order in the period of its order date
   assert.equal(Number(june.totals.salesBase), 200)
 })
 
+test('an order invoiced in July but created in June is a July order, not a June one', async () => {
+  // invoicedAt present and outside the window: the order date must NOT pull it back in.
+  INVOICE_ORDERS.push(salesOrder('july', {
+    invoiceNumber: 'INV-80', invoicedAt: new Date('2026-07-05T12:00:00.000Z'), createdAt: new Date('2026-06-25T12:00:00.000Z'),
+    payments: [], refunds: [], orderNumber: 'SO-4', externalOrderNumber: null, salesRep: null,
+  }))
+  try {
+    const { getInvoiceStats } = await import('@/app/actions/sales-stats')
+    assert.ok(!(await getInvoiceStats('2026-06-01', '2026-06-30')).some((r) => r.orderId === 'july'))
+    assert.ok((await getInvoiceStats('2026-07-01', '2026-07-31')).some((r) => r.orderId === 'july'))
+    const client = { salesOrder: { findMany: async (args?: { where?: Row }) => INVOICE_ORDERS.filter((o) => matches(o, args?.where)) }, salesOrderLine: none, payment: none, purchaseInvoice: none, fxRate: none } as FinanceAnalyticsClient
+    const deps = { client, now: () => new Date('2026-07-31T00:00:00.000Z'), baseCurrency: async () => 'GBP' }
+    const june = await getCurrencySummaryReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, { deps })
+    assert.equal(Number(june.totals.salesBase), 200, 'july (100) is not in June')
+  } finally {
+    INVOICE_ORDERS.pop()
+  }
+})
+
+test('customer aging ages a Xeroom-era order from its order date', async () => {
+  const old = new Date(Date.now() - 100 * 86400000)
+  INVOICE_ORDERS.push(salesOrder('aged', {
+    invoiceNumber: 'INV-90', createdAt: old, payments: [], refunds: [], taxBase: D(0), shipFromWarehouse: { code: 'W1' },
+    orderNumber: 'SO-5', externalOrderNumber: null, salesRep: null,
+  }))
+  try {
+    const { getCustomerAging } = await import('@/app/actions/sales-stats')
+    const row = (await getCustomerAging()).find((r) => r.orderNumber === 'SO-5')!
+    assert.equal(row.overdue91plus, 100, 'unpaid 100, 100 days old')
+  } finally {
+    INVOICE_ORDERS.pop()
+  }
+})
+
 test('invoicedPeriodDate prefers invoicedAt and falls back to the order date', () => {
   const created = new Date('2026-01-01T00:00:00.000Z')
   assert.equal(invoicedPeriodDate({ invoicedAt: null, createdAt: created }), created)

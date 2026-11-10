@@ -30,7 +30,7 @@ WooCommerce orders always enter the IMS as **Processing**. When WooCommerce mark
 
 ## Customer Turnover
 
-A customer's lifetime value, this-year sales and the Invoiced turnover card on the customer page use the same invoiced basis as the dashboard and reports: only orders that have an invoice count (an IMS-posted Xero invoice or, during the parallel phase, the Xeroom invoice number), paid or not, excluding cancelled and draft orders, with refunds netted. Where a refund's basis cannot be proven the figure is marked **≤** (at most).
+A customer's lifetime value, this-year sales and the Invoiced turnover card on the customer page use the same invoiced basis as the dashboard and reports: only orders that have an invoice count (an IMS-posted Xero invoice or, during the parallel phase, the Xeroom invoice number), paid or not, excluding cancelled and draft orders, with refunds netted in VAT-inclusive terms (a refund recorded ex-VAT is converted at its lines' own tax rates). Where a refund cannot be converted exactly the figure is marked **≤** (at most).
 
 ## Order Statuses
 

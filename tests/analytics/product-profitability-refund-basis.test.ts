@@ -61,8 +61,10 @@ mock.module('@/lib/db', {
       },
       costLayer: { findMany: async () => [] },
       salesOrder: {
-        findMany: async (args: { where: { createdAt: { gte: Date } } }) =>
-          (args.where.createdAt.gte.getFullYear() === CURRENT_FY_YEAR ? CURRENT_FY_ORDERS : PREVIOUS_FY_ORDERS),
+        // Honours the invoiced-basis clause: a fixture marked `uninvoiced` is dropped when the query carries it.
+        findMany: async (args: { where: { createdAt: { gte: Date }; OR?: unknown } }) =>
+          (args.where.createdAt.gte.getFullYear() === CURRENT_FY_YEAR ? CURRENT_FY_ORDERS : PREVIOUS_FY_ORDERS)
+            .filter((o) => !(args.where.OR && (o as { uninvoiced?: boolean }).uninvoiced)),
       },
     },
   },
@@ -547,4 +549,15 @@ test('two subsets with the same verdicts have different widths, which only the e
   assert.equal(linear.classifyLinearFigureBound(wide), 'upper')
   assert.equal(linear.linearFigureBoundWidth(narrow), 5)
   assert.equal(linear.linearFigureBoundWidth(wide), 302)
+})
+
+test('an order that is not invoiced is not in product revenue, in either FY column (invoiced basis)', async () => {
+  const invoiced = order({ lines: [{ productId: 'p1', qty: 1, totalBase: 100, cogsBase: 40 }], refunds: [] })
+  const uninvoiced = { ...order({ lines: [{ productId: 'p1', qty: 1, totalBase: 50, cogsBase: 20 }], refunds: [] }), uninvoiced: true }
+  CURRENT_FY_ORDERS = [invoiced, uninvoiced]
+  PREVIOUS_FY_ORDERS = [invoiced, uninvoiced]
+  const { bySku } = await rowsBySku()
+  const r = bySku.get('SKU-1')!
+  assert.equal(r.currentFy.revenue, 100)
+  assert.equal(r.previousFy.revenue, 100)
 })

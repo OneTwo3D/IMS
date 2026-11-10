@@ -47,3 +47,8 @@ test('drafts, cancelled and un-invoiced orders contribute nothing', () => {
   assert.equal(orderTurnoverBase(order([], { status: 'CANCELLED' })), null)
   assert.equal(orderTurnoverBase(order([], { invoiceNumber: null })), null)
 })
+
+test('a negative tax rate is not a rate: the credit is left out and flagged', () => {
+  const t = orderTurnoverBase(order([{ totalBase: 10, totalsBasis: 'NET', lines: [line(10, -0.2, 0)] }]))
+  assert.deepEqual(t, { value: 120, complete: false })
+})

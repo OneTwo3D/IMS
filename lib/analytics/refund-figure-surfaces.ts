@@ -258,7 +258,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
     figures: ['annualTurnoverBase', 'totalTurnoverBase'],
     treatment: 'basis-aware',
     reason:
-      'Customer turnover: invoiced orders only, refunds netted per order by stamped basis (customer-turnover.ts). Where a credit\u2019s basis is unproven or mixed the card shows \u2264 via lifetimeValueUpperBound.',
+      'Customer turnover: invoiced orders only, VAT-inclusive, refunds netted per order in gross terms (customer-turnover.ts). Where a credit cannot be placed exactly the card shows \u2264 via lifetimeValueUpperBound.',
   },
   {
     file: 'app/(dashboard)/sales/so-list-client.tsx',
@@ -304,10 +304,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/domain/sales/customer-turnover.ts',
-    figures: ['netTotal', 'orderTurnoverBase'],
+    figures: ['orderTurnoverBase', 'turnover'],
     treatment: 'basis-aware',
     reason:
-      'The per-order turnover helper behind the customer figures: netOfRefunds buckets the order\u2019s credits by stamped basis; an unproven or mixed set returns the unrefunded total flagged incomplete.',
+      'The per-order turnover helper behind the customer figures, VAT-inclusive throughout: a GROSS credit comes off as it stands, a NET credit comes off as its gross equivalent only when every credit line names a sales line with a known rate and the lines add up to the credit, and anything else comes off nothing and flags the sum as an upper bound.',
   },
   {
     file: 'app/actions/dashboard.ts',

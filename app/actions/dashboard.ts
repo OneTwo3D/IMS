@@ -309,8 +309,7 @@ export async function getDashboardData(
       select: { totalBase: true },
     }),
     db.salesOrderRefund.findMany({
-      // Only credit against orders that count as invoiced revenue, so the refunds tile nets against the same set.
-      where: { refundedAt: { gte: periodFrom, lte: periodTo }, order: INVOICED_ORDER_WHERE },
+      where: { refundedAt: { gte: periodFrom, lte: periodTo } },
       select: { totalBase: true },
     }),
     db.costLayer.findMany({
