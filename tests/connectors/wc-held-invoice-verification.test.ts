@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { heldInvoiceDifference, type ExpectedHeldInvoice } from '../../lib/connectors/woocommerce/sync/held-invoice-verification'
+import { heldInvoiceDifference, heldTaxBindingDifference, heldUntreatedTaxDifference, type ExpectedHeldInvoice } from '../../lib/connectors/woocommerce/sync/held-invoice-verification'
 
 /**
  * A held invoice is compared with the order as it is now: any difference keeps it from being released or treated, and anything that cannot be read does not match.
@@ -82,4 +82,27 @@ test('the landed-cost fee marker is checked apart from the no-tax status: a mark
   // An untreated hold never carries the marker.
   const r = untreated(); (r.lines[1] as Record<string, unknown>).euFeeMarked = true
   assert.match(heldInvoiceDifference(r, expected, false) ?? '', /landed-cost fee marker differs/)
+})
+
+
+const recorded = { lineRateIds: [10, 11, null], shippingRateIds: [10], resolved: { '10': 'OUTPUT2', '11': 'ZERORATEDOUTPUT' } }
+const nowSame = { lineRateIds: [10, 11, null], shippingRateIds: [10], resolved: { '10': { type: 'OUTPUT2', mapped: true }, '11': { type: 'ZERORATEDOUTPUT', mapped: true } } }
+
+test('the recorded tax binding of a treated hold: unchanged matches; swapped rates, shipping, a re-mapped rate, an unmapped rate and an unrecorded binding are differences', () => {
+  assert.equal(heldTaxBindingDifference(recorded, nowSame), null)
+  assert.match(heldTaxBindingDifference(recorded, { ...nowSame, lineRateIds: [11, 10, null] }) ?? '', /lines changed \(for example two lines exchanged tax classes\)/)
+  assert.match(heldTaxBindingDifference(recorded, { ...nowSame, shippingRateIds: [11] }) ?? '', /shipping changed/)
+  assert.match(heldTaxBindingDifference(recorded, { ...nowSame, resolved: { ...nowSame.resolved, '11': { type: 'OUTPUT2', mapped: true } } }) ?? '', /rate 11 now posts on OUTPUT2, not ZERORATEDOUTPUT/)
+  assert.match(heldTaxBindingDifference(recorded, { ...nowSame, resolved: { ...nowSame.resolved, '10': { type: 'OUTPUT2', mapped: false } } }) ?? '', /rate 10 can no longer be resolved/)
+  assert.match(heldTaxBindingDifference(undefined, nowSame) ?? '', /not recorded/)
+  assert.match(heldTaxBindingDifference({ lineRateIds: 'x' }, nowSame) ?? '', /unreadable/)
+})
+
+test('an untreated hold: each parked line type must be the one the line resolves to now; a null expectation is skipped; the shipping type must be one of its rates\' types', () => {
+  const parked = { lines: [{ taxType: 'OUTPUT2' }, { taxType: 'ZERORATEDOUTPUT' }], shippingAmount: 10, shippingTaxType: 'OUTPUT2' }
+  assert.equal(heldUntreatedTaxDifference(parked, ['OUTPUT2', 'ZERORATEDOUTPUT'], ['OUTPUT2']), null)
+  assert.equal(heldUntreatedTaxDifference(parked, ['OUTPUT2', null], ['OUTPUT2']), null)
+  assert.match(heldUntreatedTaxDifference(parked, ['ZERORATEDOUTPUT', 'OUTPUT2'], ['OUTPUT2']) ?? '', /line 1: the parked tax type is OUTPUT2, the order's line now resolves to ZERORATEDOUTPUT/)
+  assert.match(heldUntreatedTaxDifference(parked, ['OUTPUT2', 'UNRESOLVED'], ['OUTPUT2']) ?? '', /line 2/)
+  assert.match(heldUntreatedTaxDifference(parked, ['OUTPUT2', 'ZERORATEDOUTPUT'], ['ZERORATEDOUTPUT']) ?? '', /shipping tax type is OUTPUT2/)
 })

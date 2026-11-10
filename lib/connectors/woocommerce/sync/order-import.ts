@@ -56,7 +56,8 @@ import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { rateBinding, resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { treatImportedSalesInvoice } from './eu-vat-invoice-treatment'
-import { heldInvoiceDifference, type ExpectedHeldInvoice } from './held-invoice-verification'
+import { heldInvoiceDifference, heldTaxBindingDifference, heldUntreatedTaxDifference, type ExpectedHeldInvoice } from './held-invoice-verification'
+import { currentWcTaxBinding, recordWcTaxBinding } from './wc-tax-binding'
 import { buildEuVatRegimeInput, readEuVatRegimeMode } from './eu-vat-facts'
 import { resolveEuVatRegime } from '@/lib/domain/accounting/eu-vat-regime'
 import { readEuVatRegimeStamp } from '@/lib/domain/accounting/eu-vat-regime-stamp'
@@ -1672,7 +1673,7 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   const row = await db.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
   if (!row || !isHeldSalesInvoicePayload(row.payload)) return { outcome: 'not-needed' }
   const held: HeldSalesInvoicePayload = row.payload
-  type Marker = { applied?: unknown; reason?: unknown; route?: unknown; regime?: unknown; vatAccount?: unknown; schemePostingTaxType?: unknown; orderTotal?: unknown }
+  type Marker = { applied?: unknown; reason?: unknown; route?: unknown; regime?: unknown; vatAccount?: unknown; schemePostingTaxType?: unknown; orderTotal?: unknown; taxBinding?: unknown }
   const markerOf = (payload: Record<string, unknown>) => payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as Marker | null | undefined
   const marker = markerOf(held.accountingPayload)
   if (marker?.reason === 'store_credit') return { outcome: 'not-needed' }
@@ -1693,6 +1694,8 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   const currency = readWcOrderCurrency(wcOrder)
   if (currency === null) return await refuseChanged('the order\u2019s currency is missing or unreadable')
   const mappedLines = [...(await mapWcLineItems(wcOrder.line_items, 1)), ...mapWcFeeLines(wcOrder.fee_lines)]
+  // The tax binding of the order now (each line's and the shipping's WooCommerce rate, resolved through the invoice builder's own mapping), compared with the hold's before anything is released.
+  const binding = await currentWcTaxBinding(wcOrder, mappedLines)
   const lineDiscountTotal = mappedLines.reduce((sum, line) => addMoney(sum, toDecimal(line.discountAmount)), toDecimal(0))
   const coupons = planWcOrderCoupons({
     couponLines: wcOrder.coupon_lines, orderMeta: wcOrder.meta_data, feeLines: wcOrder.fee_lines, lineDiscountTotalForeign: lineDiscountTotal, currency,
@@ -1717,6 +1720,9 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     const zeroTax = parkedMarker.route === 'scheme' || parkedMarker.route === 'b2b_zero_rate'
     const difference = heldInvoiceDifference(parked.accountingPayload, expected, true, zeroTax)
     if (difference !== null) return difference
+    // Re-resolved on every call (the release's own re-check included), so a mapping changed in between is seen.
+    const taxDifference = heldTaxBindingDifference(parkedMarker.taxBinding, await currentWcTaxBinding(wcOrder, mappedLines))
+    if (taxDifference !== null) return taxDifference
     if (!zeroTax) {
       const parkedTotal = typeof parkedMarker.orderTotal === 'string' ? parkedMarker.orderTotal.trim() : ''
       if (!/^-?\d+(\.\d+)?$/.test(parkedTotal) || !toDecimal(parkedTotal).eq(toDecimal(expected.orderTotal))) return `the order total was ${parkedTotal || '(not recorded)'} when the invoice was held and is ${expected.orderTotal} now`
@@ -1760,6 +1766,18 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   // An UNTREATED hold: the parked lines must be the order's lines before the treatment is put on them.
   const difference = heldInvoiceDifference(held.accountingPayload, expected, false)
   if (difference !== null) return await refuseChanged(difference)
+  // Each parked line's tax type must be the one the order's line resolves to now (the invoice builder's own resolution of the line), and the shipping's likewise; a rate that cannot be resolved never matches.
+  const expectedTypes = mappedLines.map((l, index): string | null => {
+    if (l.isFeeLine === true && l.forceNoTax === true) return 'NONE'
+    const id = binding.lineRateIds[index]
+    if (id === null || id === undefined) return null
+    const resolved = binding.resolved[String(id)]
+    if (!resolved || !resolved.mapped) return 'UNRESOLVED'
+    return resolveWcLineAccountingTaxType({ forceNoTax: undefined, baseTaxType: resolved.type, reverseCharge: resolved.reverseCharge, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }) ?? 'UNRESOLVED'
+  })
+  const shippingTypes = binding.shippingRateIds.map((id) => binding.resolved[String(id)]).map((r) => (r && r.mapped && r.type ? r.type : 'UNRESOLVED'))
+  const taxDifference = heldUntreatedTaxDifference(held.accountingPayload, expectedTypes, shippingTypes)
+  if (taxDifference !== null) return await refuseChanged(taxDifference)
   const { [EU_VAT_TREATMENT_PAYLOAD_KEY]: _marker, ...untreated } = held.accountingPayload
   void _marker
   const outcome = await treatImportedSalesInvoice({
@@ -1769,7 +1787,7 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   if (outcome.kind === 'skipped') return { outcome: 'not-needed' }
   const treated = outcome.payload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
     ? outcome.payload
-    : { ...outcome.payload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? '') } }
+    : { ...outcome.payload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? ''), taxBinding: recordWcTaxBinding(binding) } }
   const written = await db.$transaction(async (tx) => {
     await lockSalesOrder(tx, orderId)
     const current = await tx.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
@@ -3708,6 +3726,8 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           })
         }
       } else {
+        // Recorded only when the treatment ran (switch on): the tax rates the lines and shipping carry, for the check before release.
+        const heldTaxBinding = euVatOutcome.kind === 'treated' ? recordWcTaxBinding(await currentWcTaxBinding(wcOrder, mappedLines)) : null
         await holdWcSalesInvoiceForMissingNumber({
           salesOrderId: so.id,
           wcOrder,
@@ -3724,7 +3744,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
             ? (euVatOutcome.why === 'store_credit' ? { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'store_credit' } } : invoicePayload)
             : invoicePayload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
               ? invoicePayload
-              : { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? '') } },
+              : { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? ''), taxBinding: heldTaxBinding } },
           // o3d-j625: the same chart read that produced every account code in `accountingPayload`,
           // parked alongside them — the release can be days later and must not re-resolve it.
           chartConnector: settings.connector,

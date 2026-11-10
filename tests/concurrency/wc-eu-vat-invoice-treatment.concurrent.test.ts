@@ -205,7 +205,12 @@ test('[eu vat] switch ON, IOSS: zero-rated goods and shipping, fee on 232, one V
   assert.equal(total(invoice), 135.66, 'the invoice totals the order')
   assert.equal(invoice._taxUnreconciled, undefined)
   assert.equal(invoice._registerPayment, true)
-  assert.deepEqual(invoice._euVatTreatment, { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', orderTotal: '135.66', vatAccount: '821', feesRecoded: 1, roundingAdjustment: null })
+  const { taxBinding, ...marker } = invoice._euVatTreatment as Record<string, unknown> & { taxBinding: { lineRateIds: unknown[]; shippingRateIds: unknown[]; resolved: Record<string, string> } }
+  assert.deepEqual(marker, { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', orderTotal: '135.66', vatAccount: '821', feesRecoded: 1, roundingAdjustment: null })
+  // The tax binding recorded BEFORE the treatment re-typed the lines: both lines and the shipping on the one WooCommerce rate, which resolved to the charged code.
+  assert.equal(taxBinding.lineRateIds.length, 2)
+  assert.equal(taxBinding.shippingRateIds.length, 1)
+  assert.deepEqual(Object.values(taxBinding.resolved), ['DE_CHARGED'])
   assert.equal(order.euVatRegime, 'IOSS')
   assert.equal(order.euVatLineAccount, '821')
   assert.ok(order.euVatRegimeStampedAt)
@@ -688,4 +693,62 @@ test('[eu vat] the same refused hold with the cause NOT fixed stays PENDING with
   assert.equal(rows.length, 0)
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /treatment refused it: .*plugin_account_missing/)
+})
+
+// ---- two equal-value lines that exchange taxable and zero-rated status ----
+function twoLinePayload(externalId: number, rate20: number, rate0: number, meta: Meta, swap: boolean) {
+  const taxed = (id: number, name: string, rate: number) => ({ id, name, product_id: id, variation_id: 0, quantity: 1, tax_class: '', subtotal: '50.00', subtotal_tax: '10.00', total: '50.00', total_tax: '10.00', sku: `NOSKU-${externalId}-${id}`, price: 50, taxes: [{ id: rate, total: '10.00', subtotal: '10.00' }], meta_data: [] })
+  const zero = (id: number, name: string, rate: number) => ({ ...taxed(id, name, rate), subtotal_tax: '0.00', total_tax: '0.00', taxes: [{ id: rate, total: '0.00', subtotal: '0.00' }] })
+  const base = domesticPayload(externalId, rate20, meta)
+  return {
+    ...base,
+    line_items: swap ? [zero(1, 'Widget A', rate0), taxed(2, 'Widget B', rate20)] : [taxed(1, 'Widget A', rate20), zero(2, 'Widget B', rate0)],
+    shipping_lines: [], shipping_total: '0.00', shipping_tax: '0.00',
+    tax_lines: [{ id: 21, rate_code: 'GB-VAT-1', rate_id: rate20, label: 'VAT', compound: false, tax_total: '10.00', shipping_tax_total: '0.00', meta_data: [] }, { id: 22, rate_code: 'GB-ZERO-1', rate_id: rate0, label: 'Zero', compound: false, tax_total: '0.00', shipping_tax_total: '0.00', meta_data: [] }],
+    total: '110.00', total_tax: '10.00',
+  }
+}
+async function twoLineHold(t: test.TestContext, opts: { parkOn: boolean; swap: boolean }) {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = opts.parkOn
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const rate20 = 900_000 + Math.floor(Math.random() * 40_000)
+  const rate0 = 940_000 + Math.floor(Math.random() * 40_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seedDomestic(db, rate20)
+  const zeroRate = await db.taxRate.create({ data: { name: `GB Zero ${randomUUID()}`, rate: 0, usedFor: 'SALES', accountingTaxType: 'ZERORATEDOUTPUT', countryCode: 'GB', taxCategory: 'ZERO', active: true } })
+  await db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: String(rate0), externalName: 'Zero Rated', externalCountry: 'GB', externalRatePct: 0, taxRateId: zeroRate.id } })
+  t.after(async () => { switchOn = false; await db.shoppingTaxRateMapping.deleteMany({ where: { taxRateId: zeroRate.id } }); await cleanup(db, externalId, ctx); await db.taxRate.deleteMany({ where: { id: zeroRate.id } }) })
+  const extra: Meta = [{ id: 2, key: 'is_vat_exempt', value: 'no' }]
+  assert.equal((await importWcOrder(twoLinePayload(externalId, rate20, rate0, extra, false) as never)).success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  switchOn = true
+  await importWcOrder(twoLinePayload(externalId, rate20, rate0, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...extra], opts.swap) as never)
+  return { held, after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }), rows: await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId } }) }
+}
+
+test('[eu vat] CONTROL: an unchanged two-line hold (one taxable, one zero-rated) is released on re-import', { skip }, async (t) => {
+  const { held, rows } = await twoLineHold(t, { parkOn: true, swap: false })
+  const binding = ((held.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment as { taxBinding?: { lineRateIds: unknown[] } }).taxBinding
+  assert.equal(binding?.lineRateIds.length, 2, 'the parked marker recorded the tax binding')
+  assert.equal(rows.length, 1, 'released')
+  assert.deepEqual((rows[0]!.payload as unknown as Invoice).lines.map((l) => l.taxType), ['OUTPUT2', 'ZERORATEDOUTPUT'])
+})
+
+test('[eu vat] equal-value lines exchange taxable and zero-rated status (total unchanged): a TREATED hold stays PENDING', { skip }, async (t) => {
+  const { after, rows } = await twoLineHold(t, { parkOn: true, swap: true })
+  assert.equal(rows.length, 0, 'nothing was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /the order changed after it was held \(the tax rates on the order.s lines changed \(for example two lines exchanged tax classes\)\) and needs its invoice rebuilt/)
+  assert.deepEqual(((after.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment), { applied: false, reason: 'order_changed' })
+})
+
+test('[eu vat] the same exchange on an UNTREATED hold (parked with the switch off) is refused too', { skip }, async (t) => {
+  const { after, rows } = await twoLineHold(t, { parkOn: false, swap: true })
+  assert.equal(rows.length, 0)
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /the order changed after it was held \(line 1: the parked tax type is OUTPUT2, the order's line now resolves to ZERORATEDOUTPUT\)/)
 })

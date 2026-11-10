@@ -22,6 +22,7 @@ import {
   applyEuVatTreatment, EU_VAT_TREATMENT_PAYLOAD_KEY, lineKindsOf, routeFor, type EuVatTreatmentPlan, type TreatablePayload,
 } from '@/lib/domain/accounting/eu-vat-treatment'
 import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
+import { currentWcTaxBinding, recordWcTaxBinding } from './wc-tax-binding'
 import { buildEuVatRegimeInput, readEuVatRegimeMode } from './eu-vat-facts'
 import type { MappedLine } from './field-mapping'
 import type { WcFullOrder } from './types'
@@ -40,7 +41,7 @@ export async function treatImportedSalesInvoice(params: {
   orderId: string
   wcOrder: WcFullOrder
   payload: Record<string, unknown>
-  mappedLines: ReadonlyArray<Pick<MappedLine, 'isFeeLine' | 'wclcFeeKind' | 'forceNoTax' | 'taxForeign'>>
+  mappedLines: ReadonlyArray<Pick<MappedLine, 'isFeeLine' | 'wclcFeeKind' | 'forceNoTax' | 'taxForeign'> & { externalTaxRateId?: number | null }>
   /** The accounting connector whose chart the payload's account codes came from. */
   connector: string | null
   accounts: EuVatTreatmentAccounts
@@ -101,6 +102,8 @@ export async function treatImportedSalesInvoice(params: {
         route: treated.applied.route,
         regime: treated.applied.regime,
         orderTotal: String(params.wcOrder.total ?? ''),
+        // The tax rates the lines and shipping carried BEFORE the treatment re-typed them (and what each resolves to): a held invoice is compared with the order's binding before release.
+        taxBinding: recordWcTaxBinding(await currentWcTaxBinding(params.wcOrder, params.mappedLines)),
         schemePostingTaxType: routed.route.kind === 'scheme' ? routed.route.schemePostingTaxType : null,
         vatAccount: routed.route.kind === 'scheme' ? routed.route.vatAccount : null,
         feesRecoded: treated.applied.feesRecoded,
