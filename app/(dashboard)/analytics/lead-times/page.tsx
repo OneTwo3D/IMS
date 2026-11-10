@@ -1,4 +1,5 @@
 import type { LeadTimeReportRow } from '@/lib/domain/purchasing/purchasing-analytics'
+import { requirePurchasingAnalyticsAccess } from '@/lib/security/purchasing-analytics-page-access'
 import { PurchasingAnalyticsReportPage, type PurchasingAnalyticsColumn } from '../_components/purchasing-analytics-report'
 import { loadLeadTimeReportForPage, purchasingAnalyticsFiltersForUi, purchasingAnalyticsFiltersFromSearch, type PurchasingAnalyticsSearchParams } from '../_components/purchasing-analytics-page-utils'
 
@@ -19,6 +20,7 @@ const columns: Array<PurchasingAnalyticsColumn<LeadTimeReportRow>> = [
 ]
 
 export default async function LeadTimeAnalyticsPage({ searchParams }: Props) {
+  await requirePurchasingAnalyticsAccess()
   const filters = purchasingAnalyticsFiltersFromSearch(await searchParams)
   const report = await loadLeadTimeReportForPage(filters)
   return (

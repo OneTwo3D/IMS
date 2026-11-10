@@ -136,6 +136,8 @@ The **Returns** report shows each credit on its own recorded basis. Where a row 
 
 ## Purchasing and Supplier Analytics
 
+These reports, **Purchase Statistics** (page, data and the `po_*` CSV exports) and the purchasing CSV export are open to Admin, Manager and Finance users only; any other role is sent back to the dashboard.
+
 | Report | What it shows |
 |---|---|
 | **Open POs** | Purchase orders not fully received, including expected dates, overdue flag, outstanding quantity/value, supplier, and days since sent. |
