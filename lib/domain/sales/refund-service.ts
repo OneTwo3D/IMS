@@ -4782,7 +4782,14 @@ export async function createSalesOrderRefund(
       if (!aggregate.ok) return refuse(aggregate.reason)
     }
 
-    const totalForeign = Math.round(totalBase * fxRate * 10000) / 10000
+    // The header carries what its LINES carry, in each column: the credit note posts every line's persisted foreign amount, so converting the base
+    // sum back at the rate would drift by the per-line base rounding (100 lines of 0.01 at rate 3 give 0.99 against lines totalling 1.00).
+    const round4Sum = (n: number) => Math.round(n * 10000) / 10000
+    const totalForeign = round4Sum(refundLines.reduce(
+      (sum, line) => sum + (line.totalForeign != null ? round4Sum(line.totalForeign) : round4Sum(line.totalBase * fxRate)),
+      0,
+    ))
+    const headerTotalBase = round4Sum(refundLines.reduce((sum, line) => sum + round4Sum(line.totalBase), 0))
     const creditNoteNumber = await nextCreditNoteNumber(tx, {
       prefix: input.creditNotePrefix,
     })
@@ -4809,7 +4816,7 @@ export async function createSalesOrderRefund(
         stockCorrectionRequired: storefrontRefund && refundLines.some((line) => line.qty > 0 && Boolean(line.productId)),
         reason: input.reason || null,
         totalForeign,
-        totalBase,
+        totalBase: headerTotalBase,
         totalsBasis: 'NET',
         source: refundSource,
         returnWarehouseId: restockWarehouseId || null,

@@ -1670,6 +1670,19 @@ test('no caller, internal included, may write a negative quantity; internal amou
   assert.equal(ok.success, true, ok.success ? '' : ok.error)
 })
 
+// [mutation: the header's foreign total converted back from the base sum]
+test('the refund header carries the sum of its lines in both columns: 100 lines of 0.01 at rate 3 total 1.00, not 0.99', async () => {
+  const state = baseState({ orders: [{ ...baseState().orders[0], currency: 'EUR', fxRateToBase: 3, totalBase: 1, totalForeign: 3, taxBase: 0, taxForeign: 0 }] })
+  state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Tiny', qty: 1, totalBase: 1, totalForeign: 3 }
+  const rows = Array.from({ length: 100 }, () => ({ lineId: 'line-1', productId: null, description: 'Tiny', qty: 0, totalForeign: 0.01, totalBase: 0.0033, lineKind: 'sale' as const }))
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', lines: rows, reason: 'many small', creditNotePrefix: 'CN-' })
+  assert.equal(result.success, true, result.success ? '' : result.error)
+  const sum = (key: 'totalForeign' | 'totalBase') => Math.round(state.refundLines.reduce((acc, l) => acc + Number(l[key]), 0) * 10000) / 10000
+  assert.equal(sum('totalForeign'), 1)
+  assert.equal(Number(state.refunds[0].totalForeign), sum('totalForeign'), 'header foreign = sum of the lines the credit note posts')
+  assert.equal(Number(state.refunds[0].totalBase), sum('totalBase'), 'header base = sum of the line bases')
+})
+
 test('two lines of the same product cannot lend each other units: a line is refunded only up to its own remaining quantity', async () => {
   const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 20, taxBase: 0 }] })
   state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget A', qty: 1, totalBase: 10, totalForeign: 10 }
