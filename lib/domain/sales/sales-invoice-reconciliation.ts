@@ -102,3 +102,13 @@ export class SalesInvoiceNotQueuedError extends Error {
     this.name = 'SalesInvoiceNotQueuedError'
   }
 }
+
+/**
+ * The answer of an in-transaction invoice enqueue, turned into the decision the transaction needs: a queued row, a recorded shadow (the producer-side hold) and a
+ * type that is not configured to post owe the ledger nothing; anything else (a refusal) throws so the order's transaction rolls back.
+ */
+export function assertInvoiceQueuedOrNotOwed(outcome: { queued: boolean; reason?: string }): void {
+  if (outcome.queued) return
+  if (outcome.reason === 'not-configured' || outcome.reason === 'shadowed') return
+  throw new SalesInvoiceNotQueuedError(outcome.reason ?? 'refused')
+}

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { invoiceReconciliationProblem, reconciliationBound, type ReconcilableInvoice } from '@/lib/domain/sales/sales-invoice-reconciliation'
+import { SalesInvoiceNotQueuedError, assertInvoiceQueuedOrNotOwed, invoiceReconciliationProblem, reconciliationBound, type ReconcilableInvoice } from '@/lib/domain/sales/sales-invoice-reconciliation'
 
 const exclusive = (storedTax: number, extra: Partial<ReconcilableInvoice> = {}): ReconcilableInvoice => ({
   lineAmountsIncludeTax: false, headerRate: 0.2, lines: [{ quantity: 1, unitAmount: 100, rate: 0.2, storedTax }], ...extra,
@@ -64,4 +64,14 @@ test('a many-line order whose total differs from the invoice by more than roundi
 test('a legitimate many-line rounding case passes: 100 lines whose tax was rounded up a fraction of a penny each (0.40 in total, bound 0.53)', () => {
   // Each line: 33.33 + tax 6.666 = 39.996 at the ledger; the order stored 33.33 + 6.67 = 40.00 a line, so 4000.00 against 3999.60.
   assert.equal(invoiceReconciliationProblem(many(100, 0.2, 6.67), 4000), null)
+})
+
+// [mutation: treat a refusal as owed nothing, or a shadow as a refusal]
+test('an in-transaction invoice enqueue is accepted when queued, shadowed or not configured, and a refusal throws so the transaction rolls back', () => {
+  assertInvoiceQueuedOrNotOwed({ queued: true })
+  assertInvoiceQueuedOrNotOwed({ queued: false, reason: 'shadowed' })
+  assertInvoiceQueuedOrNotOwed({ queued: false, reason: 'not-configured' })
+  for (const reason of ['refused', 'hand-post-deferred', undefined]) {
+    assert.throws(() => assertInvoiceQueuedOrNotOwed({ queued: false, reason }), SalesInvoiceNotQueuedError, String(reason))
+  }
 })

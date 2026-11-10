@@ -479,6 +479,38 @@ test('SO-H2: an enqueue the accounting queue REFUSES (a retired tax code) rolls 
   }
 })
 
+// [mutation: the finalisation guard reads the display flag instead of the stored-amount basis; or an allocation failure is not thrown inside the finalisation transaction]
+test('SO-H2: a WooCommerce draft flagged inclusive with NO header rate but VAT on its lines is net, so it finalises; a draft with no stock to allocate is refused and stays a draft', async () => {
+  const { updateSalesOrderStatus } = await import('@/app/actions/sales')
+  const syncedWh = await s.db.warehouse.create({ data: { code: `AUD-WH-${++seq}-${Date.now()}`, name: 'AUD storefront wh 2', type: 'STANDARD', availableForSale: true, syncToStore: true }, select: { id: true } })
+  await s.db.stockLevel.create({ data: { productId, warehouseId: syncedWh.id, quantity: '50', reservedQty: '0' } })
+  const woo = await s.db.salesOrder.create({
+    data: {
+      orderNumber: `WOO-NH-${seq}`, customerName: 'Woo', currency: 'GBP', fxRateToBase: 1, status: 'DRAFT', pricesIncludeVat: true,
+      subtotalForeign: '100', taxForeign: '20', totalForeign: '120', subtotalBase: '100', taxBase: '20', totalBase: '120',
+      shoppingLinks: { create: { connector: 'woocommerce', externalOrderId: `wc-nh-${seq}` } },
+      lines: { create: [{ productId, sku: 'AUD-1', description: 'x', qty: 1, unitPriceForeign: '100', unitPriceBase: '100', taxForeign: '20', taxBase: '20', totalForeign: '100', totalBase: '100', taxRateId: vat20Id }] },
+    } as never,
+    select: { id: true },
+  })
+  const r = await updateSalesOrderStatus(woo.id, 'PENDING_PAYMENT')
+  assert.equal(r.success, true, r.error)
+  // No stock: a product with no stock level anywhere.
+  const bare = (await s.db.product.create({ data: { sku: `AUD-NOSTOCK-${seq}`, name: 'no stock', type: 'SIMPLE' }, select: { id: true } })).id
+  const draft = await s.db.salesOrder.create({
+    data: {
+      orderNumber: `NOSTK-${seq}`, customerName: 'None', currency: 'GBP', fxRateToBase: 1, status: 'DRAFT', pricesIncludeVat: false, taxRateName: 'AUD Sales 20', taxRatePercent: '0.2',
+      subtotalForeign: '100', taxForeign: '20', totalForeign: '120', subtotalBase: '100', taxBase: '20', totalBase: '120',
+      lines: { create: [{ productId: bare, sku: `AUD-NOSTOCK-${seq}`, description: 'x', qty: 1, unitPriceForeign: '100', unitPriceBase: '100', taxForeign: '20', taxBase: '20', totalForeign: '100', totalBase: '100', taxRateId: vat20Id }] },
+    } as never,
+    select: { id: true },
+  })
+  const refused = await updateSalesOrderStatus(draft.id, 'PENDING_PAYMENT')
+  assert.equal(refused.success, false)
+  assert.equal((await s.db.salesOrder.findUniqueOrThrow({ where: { id: draft.id } })).status, 'DRAFT')
+  assert.equal((await invoiceRows(draft.id)).length, 0, 'no invoice for a finalisation that did not happen')
+})
+
 test('SO-H2: the reconciliation also refuses a stored order whose amounts are net but flagged gross, and lets every consistent order through', async () => {
   const { updateSalesOrderStatus } = await import('@/app/actions/sales')
   const mk = (flag: boolean, unit: string, total: string) => s.db.salesOrder.create({

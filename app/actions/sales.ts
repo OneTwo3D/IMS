@@ -126,7 +126,7 @@ import {
 } from '@/lib/domain/sales/sales-order-tax-validation'
 import { NO_TAX_TYPE, connectorEmitsDiscount, connectorEmitsShipping, droppedExtraMapping, isNoTaxType } from '@/lib/domain/accounting/sales-document-tax-types'
 import { describeAllocationAttempt } from '@/lib/domain/sales/allocation-activity'
-import { SalesInvoiceDoesNotReconcileError, SalesInvoiceExtraNotMappedError, SalesInvoiceNotQueuedError, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
+import { SalesInvoiceDoesNotReconcileError, SalesInvoiceExtraNotMappedError, SalesInvoiceNotQueuedError, assertInvoiceQueuedOrNotOwed, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
 import {
   INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
   STORED_INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
@@ -1563,7 +1563,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     })
     // A refusal (the chart was retired, the connector moved, ...) rolls the whole transaction back; a shadow recorded by the producer-side hold, and a
     // type that is not configured to post, owe the ledger nothing and are not refusals.
-    if (postingIsOwed(outcome)) throw new SalesInvoiceNotQueuedError(outcome.reason ?? 'refused')
+    assertInvoiceQueuedOrNotOwed(outcome)
     return
   }
 
