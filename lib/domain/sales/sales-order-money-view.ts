@@ -23,6 +23,7 @@
  *
  * Pure numbers, no database or Decimal runtime: the order page (a client component), the PDFs and the refund dialog all read this.
  */
+import { refundableNet } from '@/lib/domain/sales/refund-line-net'
 import { storedAmountsIncludeVat } from '@/lib/domain/sales/sales-order-vat-basis'
 
 // decimal-boundary-ok: display-only (these are rendering figures, rounded to the minor unit; the stored Decimals are never written back from them)
@@ -147,14 +148,28 @@ export function lineVatRate(line: Pick<MoneyViewLine, 'totalForeign' | 'taxForei
   return Number(orderRate ?? 0)
 }
 
-/** What refunding `qty` units of an order line credits: the line's stored net pro rata (discount included), its VAT, the sum. */
+/** An earlier refund line against an order line, as stored. */
+export type PriorRefundLine = { salesOrderLineId: string | null; qty: number; totalForeign: number; totalBase: number }
+
+/**
+ * What refunding `qty` units of an order line credits: cut from what the line has LEFT (the same function the refund service runs under
+ * the order lock, lib/domain/sales/refund-line-net.ts), so the figures shown are the ones that will be written unless another refund lands first.
+ */
 export function refundLineAmounts(
-  line: Pick<MoneyViewLine, 'qty' | 'totalForeign' | 'taxForeign' | 'taxRatePercent'>,
+  line: Pick<MoneyViewLine, 'qty' | 'totalForeign' | 'taxForeign' | 'taxRatePercent'> & { id?: string },
   qty: number,
   orderRate: number | null,
+  priorRefundLines: ReadonlyArray<PriorRefundLine> = [],
+  minorUnits = 2,
 ): RefundAmounts {
-  if (!(qty > 0) || !(line.qty > 0)) return { net: 0, vat: 0, gross: 0 }
-  const net = round2((line.totalForeign * Math.min(qty, line.qty)) / line.qty)
+  // (a non-positive qty, or a line with nothing left, is cut to 0 by refundableNet)
+  const prior = priorRefundLines.filter((p) => line.id != null && p.salesOrderLineId === line.id)
+  const net = refundableNet({
+    line: { qty: line.qty, net: line.totalForeign },
+    prior: { qty: prior.reduce((s, p) => s + p.qty, 0), net: prior.reduce((s, p) => s + p.totalForeign, 0) },
+    qty,
+    minorUnits,
+  })
   return creditAmounts(net, lineVatRate(line, orderRate))
 }
 
@@ -173,11 +188,17 @@ export function sumRefundAmounts(parts: ReadonlyArray<RefundAmounts>): RefundAmo
 export type RefundSelection = { lineId: string; qty: number }
 
 /**
- * The refund dialog's lines AS SENT to createRefund, and the figures it shows. One computation: what is displayed is what is sent,
- * and what is sent is what the credit note posts (net lines, VAT added by the ledger at each line's rate).
+ * The refund dialog's lines AS SENT to createRefund, and the figures it shows. What is sent is a PREVIEW: the server cuts each line again
+ * from what the order line has left, under the order lock, with the same function. What is displayed is what is sent.
  */
 export function buildRefundRequest(
-  order: { taxRatePercent: number | null; fxRateToBase: number; lines: ReadonlyArray<MoneyViewLine & { id: string; productId: string | null; description: string }> },
+  order: {
+    taxRatePercent: number | null
+    fxRateToBase: number
+    currencyMinorUnits?: number
+    priorRefundLines?: ReadonlyArray<PriorRefundLine>
+    lines: ReadonlyArray<MoneyViewLine & { id: string; productId: string | null; description: string; totalBase?: number }>
+  },
   selections: ReadonlyArray<RefundSelection>,
 ): {
   lines: { lineId: string; productId: string | null; description: string; qty: number; totalForeign: number; totalBase: number }[]
@@ -189,7 +210,7 @@ export function buildRefundRequest(
   for (const sel of selections) {
     const line = order.lines.find((l) => l.id === sel.lineId)
     if (!line) continue
-    const amounts = refundLineAmounts(line, sel.qty, order.taxRatePercent)
+    const amounts = refundLineAmounts(line, sel.qty, order.taxRatePercent, order.priorRefundLines ?? [], order.currencyMinorUnits ?? 2)
     perLine[line.id] = amounts
     if (!(sel.qty > 0)) continue
     lines.push({
@@ -205,17 +226,25 @@ export function buildRefundRequest(
 }
 
 /**
- * A recorded refund as its credit note carries it: each stored (net) refund line with the VAT the ledger adds at the rate of the
- * order line it refunds (the order's default rate for a line that links to none, such as a shipping refund).
+ * A recorded refund line as its credit note posts it, resolved on the SERVER from what is persisted (see credit-note-display.ts):
+ * `postedNet` is the column the credit note actually carries (the base column on a base-currency order, the foreign one otherwise) and
+ * `vatRate` the rate of the tax code the line was snapshotted under, or null when that code cannot be priced.
+ */
+export type CreditNoteLineFacts = { salesOrderLineId: string | null; postedNet: number; vatRate: number | null }
+
+/**
+ * A recorded refund as its credit note carries it: the posted net of each line with the VAT the ledger adds at the rate of its persisted
+ * posting tax code. A line whose code cannot be priced falls back to the refunded order line's own rate (the order's default rate for a
+ * line that links to none, such as a shipping refund).
  */
 export function creditNoteAmounts(
   order: { taxRatePercent: number | null; lines: ReadonlyArray<MoneyViewLine & { id: string }> },
-  refund: { lines: ReadonlyArray<{ salesOrderLineId: string | null; totalForeign: number }> },
+  refund: { lines: ReadonlyArray<CreditNoteLineFacts> },
 ): { perLine: RefundAmounts[]; total: RefundAmounts } {
   const perLine = refund.lines.map((rl) => {
     const orderLine = rl.salesOrderLineId ? order.lines.find((l) => l.id === rl.salesOrderLineId) : undefined
-    const rate = orderLine ? lineVatRate(orderLine, order.taxRatePercent) : Number(order.taxRatePercent ?? 0)
-    return creditAmounts(round2(rl.totalForeign), rate)
+    const rate = rl.vatRate ?? (orderLine ? lineVatRate(orderLine, order.taxRatePercent) : Number(order.taxRatePercent ?? 0))
+    return creditAmounts(round2(rl.postedNet), rate)
   })
   return { perLine, total: sumRefundAmounts(perLine) }
 }

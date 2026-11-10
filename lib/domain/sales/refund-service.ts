@@ -17,7 +17,7 @@ import {
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
-import { addMoney, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, currencyMinorUnits, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
@@ -29,6 +29,7 @@ import {
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
 import { findOverAllocatedRefundTarget, overAllocatedRefundTargetMessage } from '@/lib/domain/sales/refund-target-balances'
+import { refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
 import {
   RATE_EPSILON,
   buildTaxTypeRateIndex,
@@ -3627,6 +3628,14 @@ export async function createSalesOrderRefund(
      */
     enforcePerTargetBalances?: boolean
     /**
+     * Cut every itemised SALE line (a line with an order-line id and a quantity) from that order line's REMAINING stored value, under this
+     * transaction's order lock, instead of trusting the amount the caller states: the stated amount is only a preview of it. Each refund takes
+     * the share of what is left for its units and the refund that takes the last remaining unit takes exactly the remainder, so partial
+     * refunds of one line can never add up to more than the line's stored net (lib/domain/sales/refund-line-net.ts). Set for every
+     * operator-typed refund; storefront and chargeback refunds state their own amounts and are not re-cut.
+     */
+    deriveSaleLineNetsFromStoredBalance?: boolean
+    /**
      * o3d-w00 (Codex r4 #2): the accounting tax identity each target was CONVERTED at by the caller,
      * re-checked here against the identity this transaction will actually post it under.
      *
@@ -3660,7 +3669,7 @@ export async function createSalesOrderRefund(
   // operator-entered refund keeps its explicit "return this stock" contract and its refusals.
   const storefrontRefund = input.externalRefundId != null && !input.chargeback
 
-  const totalBase = refundLines.reduce((sum, line) => sum + line.totalBase, 0)
+  let totalBase = refundLines.reduce((sum, line) => sum + line.totalBase, 0)
   const txResult = await runInTransaction(client, async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(${REFUND_ACCOUNTING_LOCK_KEY})`
     // o3d-ee9: serialize this refund CREATE against the park CREATE for the SAME external refund id
@@ -3743,6 +3752,7 @@ export async function createSalesOrderRefund(
             description: true,
             qty: true,
             totalForeign: true,
+            totalBase: true,
             // The VAT this line actually bore, as the order recorded it once at creation/import.
             taxForeign: true,
             taxRate: { select: { accountingTaxType: true, reverseCharge: true } },
@@ -3774,6 +3784,57 @@ export async function createSalesOrderRefund(
         return { error: `Refund not created: ${error.message}`, quarantine: true as const }
       }
       throw error
+    }
+
+    // The itemised sale lines are cut from what each order line has LEFT, here, under the order lock (see deriveSaleLineNetsFromStoredBalance).
+    // Done before anything reads a line's amount or the refund's total. The caller's own figures are not read again: re-running on a
+    // transaction retry re-derives the same cut from the same inputs.
+    if (input.deriveSaleLineNetsFromStoredBalance) {
+      const linkedIds = [...new Set(refundLines.filter((l) => l.lineId && l.qty > 0 && (l.lineKind ?? 'sale') === 'sale').map((l) => l.lineId as string))]
+      if (linkedIds.length) {
+        const priorRows = await tx.salesOrderRefundLine.findMany({
+          where: { refund: { orderId: input.orderId }, salesOrderLineId: { in: linkedIds } },
+          select: { salesOrderLineId: true, qty: true, totalForeign: true, totalBase: true },
+        })
+        const takenQty = new Map<string, number>()
+        const takenForeign = new Map<string, number>()
+        const takenBase = new Map<string, number>()
+        for (const row of priorRows) {
+          const id = row.salesOrderLineId as string
+          takenQty.set(id, (takenQty.get(id) ?? 0) + refundBoundaryNumber(row.qty))
+          takenForeign.set(id, (takenForeign.get(id) ?? 0) + refundBoundaryNumber(row.totalForeign))
+          takenBase.set(id, (takenBase.get(id) ?? 0) + refundBoundaryNumber(row.totalBase))
+        }
+        const minorUnits = currencyMinorUnits(so.currency)
+        refundLines.forEach((refundLine, index) => {
+          if (!refundLine.lineId || !(refundLine.qty > 0) || (refundLine.lineKind ?? 'sale') !== 'sale') return
+          const orderLine = so.lines.find((l) => l.id === refundLine.lineId)
+          if (!orderLine) return // "not on this order" is refused later
+          const id = orderLine.id
+          const qty = refundBoundaryNumber(orderLine.qty)
+          const foreign = refundableNet({
+            line: { qty, net: refundBoundaryNumber(orderLine.totalForeign) },
+            prior: { qty: takenQty.get(id) ?? 0, net: takenForeign.get(id) ?? 0 },
+            qty: refundLine.qty,
+            minorUnits,
+          })
+          const base = refundableBase({
+            line: { qty, net: refundBoundaryNumber(orderLine.totalBase) },
+            prior: { qty: takenQty.get(id) ?? 0, net: takenBase.get(id) ?? 0 },
+            qty: refundLine.qty,
+            foreignNet: foreign,
+            fxRateToBase: fxRate,
+            minorUnits,
+          })
+          // Nothing left to cut from (all units already refunded): leave the stated figures so the quantity and per-target checks refuse it by name.
+          if (qty - (takenQty.get(id) ?? 0) <= 1e-9) return
+          takenQty.set(id, (takenQty.get(id) ?? 0) + refundLine.qty)
+          takenForeign.set(id, (takenForeign.get(id) ?? 0) + foreign)
+          takenBase.set(id, (takenBase.get(id) ?? 0) + base)
+          refundLines[index] = { ...refundLine, totalForeign: foreign, totalBase: base }
+        })
+        totalBase = refundLines.reduce((sum, line) => sum + line.totalBase, 0)
+      }
     }
 
     // Snapshot each refund line's VAT identity at creation, resolved EXACTLY as the invoice did

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import { documentVatRows } from '@/lib/pdf'
@@ -140,7 +141,11 @@ test('a store credit is its own printed line, so the rows still add up to the To
  */
 function creditNoteAsPosted(order: Fixture, request: ReturnType<typeof buildRefundRequest>) {
   const storedRefund = {
-    lines: request.lines.map((l) => ({ salesOrderLineId: l.lineId, qty: l.qty, totalForeign: l.totalForeign, unitPriceForeign: l.totalForeign / l.qty })),
+    lines: request.lines.map((l) => ({
+      salesOrderLineId: l.lineId, qty: l.qty, totalForeign: l.totalForeign, unitPriceForeign: l.totalForeign / l.qty,
+      // as getSalesOrder resolves them from what is persisted: the posted column and the rate of the snapshotted code
+      postedNet: l.totalForeign, vatRate: order.lines.find((o) => o.id === l.lineId)!.taxRatePercent ?? null,
+    })),
   }
   let ledgerGross = 0
   for (const rl of storedRefund.lines) {
@@ -188,7 +193,95 @@ test('a refund line carries the line discount and the base amount, and a quantit
 })
 
 test('a shipping refund (no order line) is credited at the order default rate', () => {
-  const cn = creditNoteAmounts(manualExclusive20, { lines: [{ salesOrderLineId: null, totalForeign: 4.95 }] })
+  const cn = creditNoteAmounts(manualExclusive20, { lines: [{ salesOrderLineId: null, postedNet: 4.95, vatRate: null }] })
   near(cn.total.vat, 0.99, 'VAT')
   near(cn.total.gross, 5.94, 'gross')
+})
+
+// [mutation: price the credit note at the order line's rate instead of its persisted code, or read the foreign column on a base-currency order]
+test('a credit note line is shown at the rate of its persisted tax code, on the column that posts', () => {
+  // The order line says 20%, the snapshot the credit note posts under says 5%: the displayed VAT is the posted one.
+  const cn = creditNoteAmounts(manualExclusive20, { lines: [{ salesOrderLineId: 'a', postedNet: 100, vatRate: 0.05 }] })
+  near(cn.total.vat, 5, 'VAT at the snapshot rate')
+  near(cn.total.gross, 105, 'gross')
+  // An unpriceable code falls back to the refunded order line's own rate.
+  near(creditNoteAmounts(manualExclusive20, { lines: [{ salesOrderLineId: 'a', postedNet: 100, vatRate: null }] }).total.vat, 20, 'fallback to the order line rate')
+})
+
+// [mutation: the 100th partial refund of a line takes its pro-rata share instead of the remainder; the preview ignores earlier refunds]
+test('the dialog preview is cut from what the line has left, so 100 single-unit refunds of a 0.50 line add up to exactly 0.50', () => {
+  const order: Fixture = {
+    ...manualExclusive20, taxRatePercent: 0, taxForeign: 0, totalForeign: 0.5, subtotalForeign: 0.5, discountAmount: 0, shippingForeign: 0,
+    lines: [line('x', 'Tiny', 100, 0.005, 0.5, 0, 0)],
+  }
+  const prior: { salesOrderLineId: string; qty: number; totalForeign: number; totalBase: number }[] = []
+  let credited = 0
+  for (let i = 0; i < 100; i += 1) {
+    const r = buildRefundRequest({ ...order, priorRefundLines: prior }, [{ lineId: 'x', qty: 1 }])
+    const net = r.lines[0].totalForeign
+    credited = Math.round((credited + net) * 10000) / 10000
+    prior.push({ salesOrderLineId: 'x', qty: 1, totalForeign: net, totalBase: net })
+  }
+  assert.equal(credited, 0.5)
+  assert.equal(buildRefundRequest({ ...order, priorRefundLines: prior }, [{ lineId: 'x', qty: 1 }]).lines[0].totalForeign, 0, 'nothing left to refund')
+})
+
+// [mutation: clamp the shipping/fees residue at zero, drop the zero guard, or collapse a mixed-rate order to one row]
+test('printed VAT rows add up to the stored VAT on a mixed-rate order whose discount VAT exceeds its shipping VAT', () => {
+  const rows = documentVatRows({
+    taxRateName: 'VAT', taxRatePercent: 0.2, taxForeign: 21.9,
+    lines: [{ taxRatePercent: 0.2, taxForeign: 20 }, { taxRatePercent: 0.05, taxForeign: 2.5 }],
+  })
+  assert.ok(rows.length >= 2, 'one row per rate')
+  near(rows.reduce((s, r) => s + r.amount, 0), 21.9, 'rows add up to the stored VAT (shipping/fees residue is -0.6)')
+  assert.deepEqual(documentVatRows({ taxRateName: 'VAT', taxRatePercent: 0.2, taxForeign: 0, lines: [{ taxRatePercent: 0.2, taxForeign: 0 }] }), [])
+  const single = documentVatRows({ taxRateName: 'VAT', taxRatePercent: 0.2, taxForeign: 22.536, lines: [{ taxRatePercent: 0.2, taxForeign: 22.68 }] })
+  assert.deepEqual(single, [{ label: 'VAT (20%)', amount: 22.536 }])
+})
+
+// [mutation: a route prints the raw stored line total, or stops using the shared totals block]
+test('both customer PDFs print the shared view and totals block', () => {
+  for (const file of ['app/api/sales-order/[id]/route.ts', 'app/api/invoice/[id]/route.ts']) {
+    const src = readFileSync(file, 'utf8')
+    assert.match(src, /view\.lines\[i\]\.total\.toFixed\(2\)/, `${file}: lines come from the view`)
+    assert.ok(src.includes('shoppingLinks: so.shoppingLinks,'), `${file}: the basis sees the order's links (WooCommerce is net)`)
+    assert.match(src, /documentTotalsRows\(view, documentVatRows\(/, `${file}: totals come from the shared block`)
+    assert.match(src, /storeCreditForeign: Number\(so\.storeCreditForeign \?\? 0\)/, `${file}: the credit reaches the view`)
+    assert.match(src, /doc\.text\(money\(row\.amount\)/, `${file}: every row's amount is printed`)
+    assert.match(src, /Price \$\{view\.basisLabel\}/, `${file}: the price column is labelled`)
+    assert.match(src, /Total \$\{view\.basisLabel\}/, `${file}: the total column is labelled`)
+  }
+})
+
+// [mutation: tolerance of a whole unit; per-line gross without VAT; VAT unrounded; prior refunds of OTHER lines counted; minor units ignored]
+test('refund line figures: per-line VAT rounded to the minor unit, prior refunds only count against their own line, zero-decimal currencies', () => {
+  const order: Fixture = {
+    ...manualExclusive20, taxRatePercent: 0.2, totalForeign: 0,
+    lines: [line('p', 'Thirds', 3, 10, 25, 5, 0.2), line('q', 'Other', 1, 1000, 1000, 200, 0.2)],
+  }
+  const first = buildRefundRequest(order, [{ lineId: 'p', qty: 1 }])
+  near(first.perLine.p.net, 8.33, 'net')
+  assert.equal(first.perLine.p.vat, 1.67, 'VAT rounded per line (1.666 -> 1.67)')
+  near(first.perLine.p.gross, 10, 'per-line gross is net + VAT')
+  // An earlier refund of ANOTHER line does not shrink this one.
+  const withOther = buildRefundRequest({ ...order, priorRefundLines: [{ salesOrderLineId: 'q', qty: 1, totalForeign: 1000, totalBase: 1000 }] }, [{ lineId: 'p', qty: 1 }])
+  near(withOther.perLine.p.net, 8.33, 'prior refund of another line ignored')
+  // A zero-decimal currency rounds to the unit.
+  const yen = buildRefundRequest({ ...order, currencyMinorUnits: 0, lines: [line('y', 'Yen', 3, 1000, 1000, 200, 0.2)] }, [{ lineId: 'y', qty: 1 }])
+  assert.equal(yen.perLine.y.net, 333)
+  // A line with no stored rate is credited at what it was actually charged; its own rate wins when it has one.
+  const noRate = buildRefundRequest({ ...order, lines: [{ ...line('n', 'NoRate', 1, 100, 100, 10, 0), taxRatePercent: null }] }, [{ lineId: 'n', qty: 1 }])
+  near(noRate.perLine.n.vat, 10, 'derived from the line tax')
+  const ownRate = buildRefundRequest({ ...order, lines: [{ ...line('o', 'Own', 1, 100, 100, 0, 0.05) }] }, [{ lineId: 'o', qty: 1 }])
+  near(ownRate.perLine.o.vat, 5, 'the line\'s own rate wins over its stored tax')
+})
+
+test('a credit note line with no priced code falls back to its order line\'s own rate, not the header rate', () => {
+  const order: Fixture = { ...manualExclusive20, taxRatePercent: 0.2, lines: [line('a', 'A', 1, 100, 100, 5, 0.05)] }
+  near(creditNoteAmounts(order, { lines: [{ salesOrderLineId: 'a', postedNet: 100, vatRate: null }] }).total.vat, 5, 'order line 5%, header 20%')
+})
+
+test('a difference of two pence is not "reconciled"', () => {
+  assert.equal(salesOrderMoneyView({ ...manualInclusive20, totalForeign: 112.7 }).reconciles, false)
+  assert.equal(salesOrderMoneyView({ ...manualInclusive20, totalForeign: 112.683 }).reconciles, true, 'rounding noise is tolerated')
 })

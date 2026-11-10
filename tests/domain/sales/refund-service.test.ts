@@ -543,6 +543,7 @@ function createClient(state: State): RefundServiceClient {
                 qty: line.qty,
                 // Defaults to the base total, i.e. an fx-1 order — the fixtures that care set it.
                 totalForeign: line.totalForeign ?? line.totalBase,
+                totalBase: line.totalBase,
                 taxForeign: line.taxForeign ?? 0,
                 taxRate: line.taxRate ?? null,
               })),
@@ -720,6 +721,7 @@ function createClient(state: State): RefundServiceClient {
             salesOrderLineId: line.salesOrderLineId ?? null,
             lineKind: line.lineKind ?? null,
             totalForeign: line.totalForeign,
+            totalBase: line.totalBase,
           }))
       },
       create: async ({ data }: { data: Omit<RefundLine, 'id'> }) => {
@@ -1289,6 +1291,109 @@ test('one order line cannot absorb money that came off another, under the refund
     enforcePerTargetBalances: true,
   })
   assert.equal(allowed.success, true)
+})
+
+// [mutation: derive from the line's original net instead of what is left, drop the remainder branch, or leave the public cap off]
+test('an operator-typed refund is cut from the line\'s remaining value: 100 single-unit refunds of a 0.50 line credit exactly 0.50, the 101st is refused', async () => {
+  const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 0.5, taxBase: 0 }] })
+  state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Tiny', qty: 100, totalBase: 0.5, totalForeign: 0.5 }
+  const client = createClient(state)
+  for (let i = 0; i < 100; i += 1) {
+    // The caller states a wildly different figure each time: it is only a preview.
+    const result = await createSalesOrderRefund(client, {
+      orderId: 'order-1',
+      lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Tiny', qty: 1, totalForeign: i === 0 ? 99 : 0.01, totalBase: i === 0 ? 99 : 0.01, lineKind: 'sale' }],
+      reason: `partial ${i}`,
+      creditNotePrefix: 'CN-',
+      enforcePerTargetBalances: true,
+      deriveSaleLineNetsFromStoredBalance: true,
+    })
+    assert.equal(result.success, true, `refund ${i + 1}: ${result.success ? '' : result.error}`)
+  }
+  const sum = (key: 'totalForeign' | 'totalBase') => Math.round(state.refundLines.reduce((acc, l) => acc + Number(l[key]), 0) * 10000) / 10000
+  assert.equal(state.refundLines.length, 100)
+  assert.equal(sum('totalForeign'), 0.5, 'foreign column sums to the line\'s stored net exactly')
+  assert.equal(sum('totalBase'), 0.5, 'base column too')
+  assert.ok(state.refundLines.every((l) => Number(l.totalForeign) <= 0.01 + 1e-9), 'the stated 99 was not trusted')
+  const hundredAndFirst = await createSalesOrderRefund(client, {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Tiny', qty: 1, totalForeign: 0.01, totalBase: 0.01, lineKind: 'sale' }],
+    reason: 'one too many',
+    creditNotePrefix: 'CN-',
+    enforcePerTargetBalances: true,
+    deriveSaleLineNetsFromStoredBalance: true,
+  })
+  assert.equal(hundredAndFirst.success, false)
+  assert.equal(state.refundLines.length, 100, 'nothing was written')
+})
+
+// [mutation: the in-request tally is not kept, a shipping row is re-cut, a zero-decimal currency is cut at the wrong precision, an unknown line throws]
+test('rows of one request against one line are cut in turn, so together they take exactly the line\'s net', async () => {
+  const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 10, taxBase: 0 }] })
+  state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Thirds', qty: 3, totalBase: 10, totalForeign: 10 }
+  const row = { lineId: 'line-1', productId: 'product-1', description: 'Thirds', qty: 1, totalForeign: 50, totalBase: 50, lineKind: 'sale' as const }
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1', lines: [row, row, row], reason: 'three rows', creditNotePrefix: 'CN-',
+    enforcePerTargetBalances: true, deriveSaleLineNetsFromStoredBalance: true,
+  })
+  assert.equal(result.success, true, result.success ? '' : result.error)
+  assert.deepEqual(state.refundLines.map((l) => Number(l.totalForeign)), [3.33, 3.34, 3.33])
+  assert.equal(Math.round(state.refundLines.reduce((acc, l) => acc + Number(l.totalForeign), 0) * 100) / 100, 10)
+  assert.equal(Math.round(state.refundLines.reduce((acc, l) => acc + Number(l.totalBase), 0) * 100) / 100, 10)
+})
+
+test('only itemised SALE lines are re-cut: a shipping row keeps its stated amount beside a sale row that is', async () => {
+  const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 100, taxBase: 0, shippingForeign: 5 }] })
+  state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget', qty: 2, totalBase: 100, totalForeign: 100 }
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [
+      { lineId: 'line-1', productId: 'product-1', description: 'Widget', qty: 1, totalForeign: 60, totalBase: 60, lineKind: 'sale' },
+      { lineId: 'line-1', productId: null, description: 'Shipping', qty: 1, totalForeign: 2, totalBase: 2, lineKind: 'shipping' },
+    ],
+    reason: 'sale and shipping', creditNotePrefix: 'CN-', enforcePerTargetBalances: true, deriveSaleLineNetsFromStoredBalance: true,
+  })
+  assert.equal(result.success, true, result.success ? '' : result.error)
+  assert.deepEqual(state.refundLines.map((l) => Number(l.totalForeign)), [50, 2])
+})
+
+test('a zero-decimal currency is cut to whole units', async () => {
+  const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 1000, taxBase: 0, currency: 'JPY' }] })
+  state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Yen', qty: 3, totalBase: 1000, totalForeign: 1000 }
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Yen', qty: 1, totalForeign: 1, totalBase: 1, lineKind: 'sale' }],
+    reason: 'yen', creditNotePrefix: 'CN-', enforcePerTargetBalances: true, deriveSaleLineNetsFromStoredBalance: true,
+  })
+  assert.equal(result.success, true, result.success ? '' : result.error)
+  assert.equal(Number(state.refundLines[0].totalForeign), 333)
+})
+
+test('a line that is not on the order is left for the later refusal, never thrown from the re-cut', async () => {
+  const state = baseState()
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'no-such-line', productId: 'product-1', description: 'Ghost', qty: 1, totalForeign: 5, totalBase: 5, lineKind: 'sale' }],
+    reason: 'ghost', creditNotePrefix: 'CN-', enforcePerTargetBalances: true, deriveSaleLineNetsFromStoredBalance: true,
+  })
+  assert.equal(typeof result.success, 'boolean')
+  assert.equal(state.refunds.length === 0 || result.success === true, true)
+})
+
+test('a price-only refund above the line\'s stored net is refused when the per-target cap is on (public refunds)', async () => {
+  const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 100, taxBase: 0 }] })
+  state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget', qty: 2, totalBase: 50, totalForeign: 50 }
+  const over = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: null, description: 'Widget', qty: 0, totalForeign: 60, totalBase: 60, lineKind: 'sale' }],
+    reason: 'inflated',
+    creditNotePrefix: 'CN-',
+    enforcePerTargetBalances: true,
+    deriveSaleLineNetsFromStoredBalance: true,
+  })
+  assert.equal(over.success, false)
+  assert.match(over.success === false ? over.error : '', /more than it has left to refund/)
+  assert.equal(state.refunds.length, 0)
 })
 
 test('the shipping charge is a capped target too, and two rows for one target are summed (o3d-w00 Codex r3 #2)', async () => {

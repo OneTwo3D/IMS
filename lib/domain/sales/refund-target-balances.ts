@@ -118,3 +118,19 @@ export function overAllocatedRefundTargetMessage(over: OverAllocatedRefundTarget
     'Split the refund across the parts it actually covered.'
   )
 }
+
+/**
+ * WHICH SAFEGUARDS A REFUND CALLER GETS. A refund from the public action (an operator in the UI) is always capped per target and has its
+ * itemised sale lines cut from what each order line has left; both only ever REFUSE or REDUCE, so they need no internal capability.
+ * An internal caller (storefront sync, chargeback poller, exception-inbox hand recording) states its own reconciled amounts and keeps the
+ * caps opt-in: the per-target cap by option, the re-cut never.
+ */
+export function refundSafeguards(input: { isInternal: boolean; requestedPerTargetCap?: boolean }): {
+  enforcePerTargetBalances: boolean
+  deriveSaleLineNetsFromStoredBalance: boolean
+} {
+  return {
+    enforcePerTargetBalances: !input.isInternal || input.requestedPerTargetCap === true,
+    deriveSaleLineNetsFromStoredBalance: !input.isInternal,
+  }
+}
