@@ -158,6 +158,51 @@ test('SO-H2: allocating a DRAFT directly does not promote it (the server action 
   assert.equal(await s.db.orderAllocation.count({ where: { orderId: d.order!.id } }), 0)
 })
 
+// What the ledger would book for a queued sales invoice, from its payload alone (every line, the shipping and the discount at the one 20% rate).
+type FullPayload = InvoicePayload & { lines: Array<{ quantity: number; unitAmount: number; discountAmount?: number }>; shippingAmount?: number; discountAmount?: number }
+const ledgerTotal = (p: FullPayload) => {
+  const lines = p.lines.reduce((t, l) => t + l.quantity * l.unitAmount - (l.discountAmount ?? 0), 0)
+  const net = lines + (p.shippingAmount ?? 0) - (p.discountAmount ?? 0)
+  return Math.round((p.lineAmountsIncludeTax ? net : net * 1.2) * 100) / 100
+}
+
+async function wooSource(pricesIncludeVat: boolean) {
+  // The shape the WooCommerce importer stores whatever the store's display setting says: every amount NET, header rate 20%, 100 + 10 shipping - 5 discount, VAT 21.
+  const so = await s.db.salesOrder.create({
+    data: {
+      orderNumber: `WOO-${++seq}`, customerName: 'Woo', currency: 'GBP', fxRateToBase: 1, status: 'PROCESSING', pricesIncludeVat,
+      taxRateName: 'AUD Sales 20', taxRatePercent: '0.2', discountAmount: '5',
+      subtotalForeign: '100', shippingForeign: '10', taxForeign: '21', totalForeign: '126', subtotalBase: '100', shippingBase: '10', taxBase: '21', totalBase: '126',
+      shoppingLinks: { create: { connector: 'woocommerce', externalOrderId: `wc-${seq}` } },
+      lines: { create: [{ productId, sku: 'AUD-1', description: 'x', qty: 1, unitPriceForeign: '100', unitPriceBase: '100', taxForeign: '20', taxBase: '20', totalForeign: '100', totalBase: '100', taxRateId: vat20Id }] },
+    } as never,
+    select: { id: true },
+  })
+  return so.id
+}
+
+// [mutation: copy so.pricesIncludeVat unconditionally, or drop the WooCommerce test in cloneSalesOrder]
+for (const [label, source] of [
+  ['manual, prices including VAT', async () => (await (await import('@/app/actions/sales')).createSalesOrder(orderInput({ pricesIncludeVat: true, taxRateName: 'AUD Sales 20', taxRateValue: 0.2, shippingForeign: 12, orderDiscountForeign: 6 }) as never)).order!.id],
+  ['manual, prices excluding VAT', async () => (await (await import('@/app/actions/sales')).createSalesOrder(orderInput({ pricesIncludeVat: false, lines: [line(100)], taxRateName: 'AUD Sales 20', taxRateValue: 0.2, shippingForeign: 10, orderDiscountForeign: 5 }) as never)).order!.id],
+  ['WooCommerce, store shows prices including tax', () => wooSource(true)],
+  ['WooCommerce, store shows prices excluding tax', () => wooSource(false)],
+] as const) {
+  test(`SO-H2: a clone of a ${label} source (with shipping and an order discount) is invoiced at exactly the clone's stored total`, async () => {
+    const { cloneSalesOrder, updateSalesOrderStatus } = await import('@/app/actions/sales')
+    const sourceId = await source()
+    const cloned = await cloneSalesOrder(sourceId)
+    assert.equal(cloned.success, true, cloned.error)
+    const done = await updateSalesOrderStatus(cloned.newId!, 'PENDING_PAYMENT')
+    assert.equal(done.success, true, done.error)
+    const clone = await s.db.salesOrder.findUniqueOrThrow({ where: { id: cloned.newId! } })
+    assert.equal(Number(clone.totalForeign), 126, 'the clone carries the source total')
+    const rows = await invoiceRows(clone.id)
+    assert.equal(rows.length, 1)
+    assert.equal(ledgerTotal(rows[0]!.payload as FullPayload), Number(clone.totalForeign), 'the invoice the ledger would book equals the order')
+  })
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // 3. A bill edited before its first posting
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------

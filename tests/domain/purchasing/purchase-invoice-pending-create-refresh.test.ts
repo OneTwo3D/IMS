@@ -70,6 +70,13 @@ test('a row that may have left IMS refuses the edit and is not written', async (
     await assert.rejects(run(tx), PurchaseBillFirstPostingInFlightError, label)
     assert.equal(writes.length, 0, label)
   }
+  for (const [label, row] of [['compacted evidence', { ...unsent, backReferenceEvidenceCompactedAt: new Date() }], ['legacy row with a settlement basis', { ...unsent, settlementBasis: 'OPERATOR_ASSERTION' }]] as const) {
+    const f = fake([row])
+    await assert.rejects(run(f.tx), PurchaseBillFirstPostingInFlightError, label)
+    assert.equal(f.writes.length, 0, label)
+  }
+  const noChart = fake([unsent])
+  await assert.rejects(refreshPendingPurchaseInvoiceCreate({ tx: noChart.tx, invoiceId: 'inv1', chartConnector: null, accountingPayload: edited }), PurchaseBillFirstPostingInFlightError, 'no chart connector')
   const { tx } = fake([{ ...unsent, connector: 'quickbooks' }])
   await assert.rejects(run(tx), PurchaseBillFirstPostingInFlightError, 'a row of another connector than the chart')
 })

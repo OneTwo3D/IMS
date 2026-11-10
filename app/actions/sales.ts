@@ -3332,9 +3332,18 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     await requirePermission('sales.create')
     const so = await db.salesOrder.findUnique({
       where: { id },
-      include: { lines: true },
+      include: { lines: true, shoppingLinks: { select: { connector: true } } },
     })
     if (!so) return { success: false, error: 'Order not found' }
+    // THE BASIS THE SOURCE'S AMOUNTS ARE STORED IN decides the clone's flag, because the clone copies the amounts as they are.
+    //  manual order, prices incl. VAT  unit prices and discounts GROSS (shipping stored net)   flag true  - the manual invoice builder grosses shipping up
+    //  manual order, prices excl. VAT  everything NET                                          flag false
+    //  CSV import                      goes through createSalesOrder: one of the two above
+    //  WooCommerce import              unit prices, shipping and discounts are NET even when the store shows prices incl. tax (order-import.ts),
+    //                                  so the flag on the source describes the storefront's display, not the stored amounts
+    // The flag therefore passes through for a manual source and is FALSE for a WooCommerce one (net amounts + header rate post as an exclusive
+    // invoice, which is what the Woo importer's own invoice sends). Copying a true flag onto net amounts posted them as the gross total.
+    const sourceAmountsAreNet = so.shoppingLinks.some((link) => link.connector === 'woocommerce')
 
     const ref = `SO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
     // A CLONE IS A NEW DOCUMENT: its rate is the table rate NOW (as createSalesOrder), never the source order's (which may be a legacy typed or 1:1 rate), and every base amount is
@@ -3380,9 +3389,9 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
         discountAmount: so.discountAmount,
         taxRateName: so.taxRateName,
         taxRatePercent: so.taxRatePercent,
-        // The unit prices and discount below are copied as typed, so the clone must read them the way the source did (gross or net): left
-        // to the column default it read an inclusive order's gross prices as net, and the invoice it now queues added the VAT twice.
-        pricesIncludeVat: so.pricesIncludeVat,
+        // The amounts below are copied as stored, so the clone must read them the way the source did (see sourceAmountsAreNet above): left to
+        // the column default it read an inclusive manual order's gross prices as net, and the invoice it now queues added the VAT twice.
+        pricesIncludeVat: sourceAmountsAreNet ? false : so.pricesIncludeVat,
         notes: so.notes,
         internalNotes: so.internalNotes,
         lines: {
