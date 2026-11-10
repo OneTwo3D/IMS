@@ -17,6 +17,7 @@ import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatCountryDisplay } from '@/lib/countries'
 import { formatMoney } from '@/lib/utils'
+import { resolveColumnVisibility } from './column-visibility'
 
 // ---------------------------------------------------------------------------
 // Column definitions
@@ -285,12 +286,10 @@ export function ContactsClient({ initialCustomers }: Props) {
 
   // Column visibility (lazy init from localStorage)
   const [visible, setVisible] = useState<Record<ColKey, boolean>>(() => {
-    if (typeof window === 'undefined') return defaultVisibility
-    try {
-      const stored = localStorage.getItem(LS_KEY)
-      if (stored) return JSON.parse(stored)
-    } catch { /* ignore */ }
-    return defaultVisibility
+    if (typeof window === 'undefined') return defaultVisibility()
+    let stored: string | null = null
+    try { stored = localStorage.getItem(LS_KEY) } catch { /* ignore */ }
+    return resolveColumnVisibility(defaultVisibility(), stored)
   })
   const [pickerOpen, setPickerOpen] = useState(false)
   const pickerRef = useRef<HTMLDivElement>(null)

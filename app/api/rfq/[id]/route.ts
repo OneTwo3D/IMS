@@ -3,6 +3,7 @@ import { requireApiAuth, type AuthSession } from '@/lib/auth/server'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { hasPermission } from '@/lib/permissions'
 import { db } from '@/lib/db'
+import { supplierSentPurchaseOrderWhere } from '@/lib/domain/purchasing/supplier-portal-visibility'
 import {
   getBranding,
   createPdfDocument,
@@ -61,7 +62,7 @@ const defaultRfqRouteDependencies: RfqRouteDependencies = {
   hasPermission,
   findSupplierOwnedPurchaseOrder(id, supplierId) {
     return db.purchaseOrder.findFirst({
-      where: { id, supplierId },
+      where: { id, supplierId, ...supplierSentPurchaseOrderWhere() },
       select: { id: true },
     })
   },

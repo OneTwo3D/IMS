@@ -8,6 +8,13 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Supplier portal drafts, supplier landing, customer list columns
+
+- **Fixed: the supplier portal no longer shows a buyer's unsent draft purchase orders.** The RFQ list, the RFQ detail page, quote submission and the RFQ PDF route all accepted a DRAFT order, so a supplier could see (and quote on) quantities and products the buyer had not sent. Suppliers now see an order as an RFQ only from RFQ Sent; the Purchase Orders list also hides drafts and cancelled orders that were never sent. All supplier-facing reads share one definition (`lib/domain/purchasing/supplier-portal-visibility.ts`).
+- **Fixed: submitting a quote no longer ends on a 404.** The order moves to Quote Received on submit, and the detail page 404'd for that status. A quoted RFQ now opens read-only with a "Quote submitted" confirmation.
+- **Fixed: a supplier logging in lands on the supplier portal, not an error screen.** `/` and `/dashboard` send a SUPPLIER to `/supplier/rfqs`; the dashboard query no longer runs for a supplier.
+- **Fixed: the customers list showed only the Name column.** The default column set was returned as a function instead of being called. Saved column preferences are now merged over the defaults, so a partial saved preference no longer hides every other column.
+
 ### No tax type, no sales document
 
 - **Changed: a sales invoice or credit note line with no tax type is refused instead of posting on "No VAT".** The Xero connector no longer defaults a missing `TaxType` to `NONE` on sales invoices, sales invoice updates or credit notes (supplier bills and supplier credit notes are unchanged). The refusal is an ordinary failed sync row on /sync, raised at the head of the poster case and again in the connector, before any contact, item or document request. An explicit `NONE` is refused too unless the line names an allowed kind; the only one today is a WooCommerce fee the shop charged no tax on. Shipping and the order discount can never be on `NONE`.
