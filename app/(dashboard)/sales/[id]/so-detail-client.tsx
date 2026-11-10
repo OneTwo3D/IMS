@@ -160,7 +160,7 @@ const ACCOUNTING_SYNC_TYPE_LABEL: Record<RejectedAccountingDocumentUpdateWarning
 }
 
 /** The order as the money view reads it: the amounts as stored, on the basis they are stored in (SoRow.amountsIncludeVat). */
-function moneyViewOrderOf(so: SoDetail): MoneyViewOrder & { fxRateToBase: number; currencyMinorUnits: number; priorRefundLines: SoDetail['refunds'][number]['lines']; lines: (SoDetail['lines'][number])[] } {
+function moneyViewOrderOf(so: SoDetail): MoneyViewOrder & { fxRateToBase: number; currencyMinorUnits: number; priorRefundLines: SoDetail['refunds'][number]['lines']; discount: { amount: number; amountsIncludeVat: boolean }; lines: (SoDetail['lines'][number])[] } {
   return {
     pricesIncludeVat: so.amountsIncludeVat,
     taxRatePercent: so.taxRatePercent,
@@ -173,6 +173,7 @@ function moneyViewOrderOf(so: SoDetail): MoneyViewOrder & { fxRateToBase: number
     fxRateToBase: so.fxRateToBase,
     currencyMinorUnits: so.currencyMinorUnits,
     priorRefundLines: so.refunds.flatMap((r) => r.lines),
+    discount: { amount: so.discountAmount, amountsIncludeVat: so.amountsIncludeVat },
     lines: so.lines,
   }
 }
@@ -202,8 +203,11 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
       const result = await createRefund(order.id, request.lines, reason, returnWhId || undefined)
       if (result.success) {
         router.refresh()
-        if (result.warning) {
-          setWarning(result.warning)
+        // The server cuts the refund again under the order lock; if what it recorded differs from this preview, show the server's figure.
+        const drift = result.recordedNetForeign != null && Math.abs(result.recordedNetForeign - request.total.net) > 0.005
+        const driftNote = drift ? `The refund was recorded at ${formatMoney(result.recordedNetForeign!, sym)} net, not the ${formatMoney(request.total.net, sym)} previewed (an earlier refund landed first). The credit note shows the recorded figures.` : ''
+        if (result.warning || drift) {
+          setWarning([driftNote, result.warning].filter(Boolean).join(' '))
         } else {
           onClose()
         }
@@ -240,6 +244,9 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
           </TableRow>))}
         </TableBody></Table>
         <div className="flex flex-col items-end gap-0.5 text-sm">
+          {request.discountReversal.net !== 0 && (
+            <span className="text-xs text-muted-foreground">Order discount reversed: {formatMoney(request.discountReversal.gross, sym)} incl. VAT (net {formatMoney(request.discountReversal.net, sym)}), added by the server</span>
+          )}
           <span className="text-xs text-muted-foreground">Net {formatMoney(totalRefund.net, sym)} + VAT {formatMoney(totalRefund.vat, sym)}</span>
           <span className="font-medium">Credit note total (incl. VAT): {formatMoney(totalRefund.gross, sym)}</span>
         </div>

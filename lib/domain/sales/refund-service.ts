@@ -29,7 +29,7 @@ import {
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
 import { findGrossOverPaidBalance, findOverAllocatedRefundTarget, nonSaleRowRefusal, overAllocatedRefundTargetMessage, publicRefundLineRefusal } from '@/lib/domain/sales/refund-target-balances'
-import { refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
+import { orderDiscountReversal, refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
 import { storedAmountsIncludeVat } from '@/lib/domain/sales/sales-order-vat-basis'
 import {
   RATE_EPSILON,
@@ -3891,10 +3891,7 @@ export async function createSalesOrderRefund(
         if (so.discountRestatement != null) {
           return { error: 'This order\'s discount was restated after it was invoiced, so its reversal cannot be worked out automatically, and no refund was created.' } as const
         }
-        const round4 = (n: number) => Math.round((n + Number.EPSILON * Math.sign(n)) * 10000) / 10000
         const vatPct = Number(so.taxRatePercent ?? 0)
-        // The invoice sends `discountAmount` in the order's own convention; the credit note posts NET, so strip VAT when the amounts include it.
-        const discountNet = round4(storedAmountsIncludeVat(so) && vatPct > 0 ? rawDiscount / (1 + vatPct) : rawDiscount)
         const priorDiscountRows = await tx.salesOrderRefundLine.findMany({
           where: { refund: { orderId: input.orderId } },
           select: { salesOrderLineId: true, lineKind: true, totalForeign: true, totalBase: true },
@@ -3910,17 +3907,18 @@ export async function createSalesOrderRefund(
             priorSaleNet += refundBoundaryNumber(row.totalForeign)
           }
         }
-        const orderSaleNet = so.lines.reduce((sum, l) => sum + refundBoundaryNumber(l.totalForeign), 0)
-        const remainingForeign = Math.max(0, round4(discountNet - priorDiscountForeign))
-        const remainingBase = Math.max(0, round4((fxRate === 1 ? discountNet : discountNet / (fxRate || 1)) - priorDiscountBase))
-        const completesOrder = priorSaleNet + refundedSaleNet >= orderSaleNet - 0.005
-        const minorUnits = currencyMinorUnits(so.currency)
-        const shareForeign = completesOrder || !(orderSaleNet > 0)
-          ? remainingForeign
-          : Math.min(remainingForeign, refundableNet({ line: { qty: 1, net: discountNet }, prior: { qty: 0, net: 0 }, qty: refundedSaleNet / orderSaleNet, minorUnits }))
-        const shareBase = completesOrder || !(orderSaleNet > 0)
-          ? remainingBase
-          : Math.min(remainingBase, fxRate === 1 ? shareForeign : round4(shareForeign / (fxRate || 1)))
+        const { foreign: shareForeign, base: shareBase } = orderDiscountReversal({
+          discountAmount: rawDiscount,
+          amountsIncludeVat: storedAmountsIncludeVat(so),
+          vatRate: vatPct,
+          orderSaleNet: so.lines.reduce((sum, l) => sum + refundBoundaryNumber(l.totalForeign), 0),
+          priorSaleNet,
+          priorDiscountForeign,
+          priorDiscountBase,
+          refundedSaleNet,
+          fxRateToBase: fxRate,
+          minorUnits: currencyMinorUnits(so.currency),
+        })
         if (shareForeign > 0 || shareBase > 0) {
           refundLines.push({
             lineId: null,
@@ -3951,6 +3949,8 @@ export async function createSalesOrderRefund(
 
     // A public refund's credit note, GROSSED UP at the rate it posts under, must stay within what the customer paid for each line.
     let publicGrossRateOf: ((lineId: string | null) => number) | null = null
+    // The rate an EARLIER refund line was actually posted at: its persisted tax code (else the code the credit note falls back to), priced like the payload; null when it cannot be.
+    let publicPriorRateOf: ((row: { salesOrderLineId: string | null; accountingTaxType: string | null }) => number | null) | null = null
     if (input.deriveSaleLineNetsFromStoredBalance) {
       const salesRates = buildTaxTypeRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }))
       const taxTypeOfLine = creditNoteLineTaxTypeResolver({ orderLines: so.lines, reverseChargeSalesTaxType, orderDefaultTaxType })
@@ -3979,6 +3979,11 @@ export async function createSalesOrderRefund(
       // The rate each row is grossed up at in the cumulative foreign check below: a sale row at the higher of its charged and posted rate;
       // shipping at the order default's posted rate, else the order's own rate.
       const orderRate = Number(so.taxRatePercent ?? 0)
+      publicPriorRateOf = (row) => {
+        const type = taxTypeOfLine({ accountingTaxType: row.accountingTaxType, lineId: row.salesOrderLineId })
+        const priced = type ? priceSnapshottedTaxIdentity({ accountingTaxType: type, rateByTaxType: salesRates, label: 'earlier refund line' }) : null
+        return priced?.ok ? priced.rate.toNumber() : null
+      }
       publicGrossRateOf = (lineId) => {
         if (!lineId) {
           const type = orderDefaultTaxType
@@ -4379,12 +4384,12 @@ export async function createSalesOrderRefund(
 
     const existingRefundLines = await tx.salesOrderRefundLine.findMany({
       where: { refund: { orderId: input.orderId } },
-      select: { productId: true, qty: true, salesOrderLineId: true, lineKind: true, totalForeign: true },
+      select: { productId: true, qty: true, salesOrderLineId: true, lineKind: true, totalForeign: true, accountingTaxType: true },
     })
 
     // THE CURRENCY THE CREDIT NOTE POSTS IN. The ceiling above sums BASE; a foreign-currency credit note posts the FOREIGN column. So a public refund's
     // cumulative foreign net, and that net grossed up at the rate each row posts under, are each held to what the order was paid in its own currency.
-    if (input.deriveSaleLineNetsFromStoredBalance && publicGrossRateOf) {
+    if (input.deriveSaleLineNetsFromStoredBalance && publicGrossRateOf && publicPriorRateOf) {
       const paidForeign = refundBoundaryNumber(so.totalForeign)
       const netPaidForeign = Math.max(0, paidForeign - refundBoundaryNumber(so.taxForeign))
       const storedForeign = (line: RefundRequestLine) => line.totalForeign ?? Math.round(line.totalBase * fxRate * 10000) / 10000
@@ -4393,10 +4398,24 @@ export async function createSalesOrderRefund(
       if (priorNetForeign + newNetForeign > netPaidForeign + 0.005) {
         return { error: 'Refund total would exceed what the order was paid in its own currency.' } as const
       }
+      // Earlier refunds are valued line by line at the rate each was posted at. A line whose rate cannot be established is valued conservatively:
+      // a positive credit at the HIGHER of the blended rate and the order's highest line rate, a reversal (negative) at no VAT at all.
       const blendedRate = netPaidForeign > 0 ? refundBoundaryNumber(so.taxForeign) / netPaidForeign : 0
+      const maxLineRate = so.lines.reduce((m, l) => {
+        const net = refundBoundaryNumber(l.totalForeign)
+        return Math.max(m, net > 0 ? refundBoundaryNumber(l.taxForeign) / net : 0)
+      }, Number(so.taxRatePercent ?? 0))
+      let usedFallbackRate = false
+      const priorGrossForeign = existingRefundLines.reduce((sum, line) => {
+        const net = refundBoundaryNumber(line.totalForeign)
+        const posted = publicPriorRateOf!({ salesOrderLineId: line.salesOrderLineId ?? null, accountingTaxType: line.accountingTaxType ?? null })
+        if (posted != null) return sum + net * (1 + posted)
+        usedFallbackRate = true
+        return sum + net * (1 + (net >= 0 ? Math.max(blendedRate, maxLineRate) : 0))
+      }, 0)
       const newGrossForeign = refundLines.reduce((sum, line) => sum + storedForeign(line) * (1 + publicGrossRateOf!(line.lineId ?? null)), 0)
-      if (priorNetForeign * (1 + blendedRate) + newGrossForeign > paidForeign + 0.005) {
-        return { error: 'The credit note, including VAT, would exceed what the order was paid in its own currency.' } as const
+      if (priorGrossForeign + newGrossForeign > paidForeign + 0.005) {
+        return { error: `The credit note, including VAT, would exceed what the order was paid in its own currency.${usedFallbackRate ? ' (An earlier refund\'s VAT rate could not be established, so it was counted at the highest rate on the order.)' : ''}` } as const
       }
     }
 

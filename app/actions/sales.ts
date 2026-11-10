@@ -303,6 +303,7 @@ export type SoDetail = SoRow & {
       unitPriceForeign: number
       totalForeign: number
       totalBase: number
+      lineKind: string | null
       /** The net the credit note carries for this line (its base column on a base-currency order, else its foreign one). */
       postedNet: number
       /** The rate of the tax code the line posts under (its persisted snapshot), or null when that code cannot be priced. */
@@ -846,7 +847,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
           id: true, creditNoteNumber: true, reason: true, totalForeign: true, totalBase: true, refundedAt: true,
           accountingRetryRequired: true,
           lines: {
-            select: { id: true, salesOrderLineId: true, productId: true, description: true, qty: true, unitPriceForeign: true, totalForeign: true, totalBase: true, accountingTaxType: true },
+            select: { id: true, salesOrderLineId: true, productId: true, description: true, qty: true, unitPriceForeign: true, totalForeign: true, totalBase: true, accountingTaxType: true, lineKind: true },
           },
           payments: {
             select: { id: true, amount: true, currency: true, method: true, reference: true, notes: true, paidAt: true },
@@ -952,6 +953,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
         unitPriceForeign: Number(rl.unitPriceForeign),
         totalForeign: Number(rl.totalForeign),
         totalBase: Number(rl.totalBase),
+        lineKind: rl.lineKind,
         postedNet: creditFactsByRefund.get(r.id)![index].postedNet,
         vatRate: creditFactsByRefund.get(r.id)![index].vatRate,
       })),
@@ -2559,6 +2561,8 @@ export async function createRefund(
   success: boolean
   error?: string
   warning?: string
+  /** The NET the server recorded (sum of the refund's lines in the order currency, discount reversal included), for the dialog to compare with its preview. */
+  recordedNetForeign?: number
   conflict?: RefundCreationConflict
   quarantine?: true
 }> {
@@ -2924,7 +2928,11 @@ export async function createRefund(
       }
     }
 
-    return { success: true, warning: accountingWarning }
+    return {
+      success: true,
+      warning: accountingWarning,
+      recordedNetForeign: Math.round(refundResult.createdRefundLines.reduce((sum, line) => sum + line.totalForeign, 0) * 10000) / 10000,
+    }
   } catch (e) {
     if (options?.externalRefundId && isExternalRefundIdUniqueConflict(e)) {
       // o3d-7yf: externalRefundId is globally unique, so this conflict may be a CROSS-ORDER race — the

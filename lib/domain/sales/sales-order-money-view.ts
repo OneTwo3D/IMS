@@ -23,7 +23,7 @@
  *
  * Pure numbers, no database or Decimal runtime: the order page (a client component), the PDFs and the refund dialog all read this.
  */
-import { refundableNet } from '@/lib/domain/sales/refund-line-net'
+import { orderDiscountReversal, refundableNet } from '@/lib/domain/sales/refund-line-net'
 import { storedAmountsIncludeVat } from '@/lib/domain/sales/sales-order-vat-basis'
 
 // decimal-boundary-ok: display-only (these are rendering figures, rounded to the minor unit; the stored Decimals are never written back from them)
@@ -149,7 +149,7 @@ export function lineVatRate(line: Pick<MoneyViewLine, 'totalForeign' | 'taxForei
 }
 
 /** An earlier refund line against an order line, as stored. */
-export type PriorRefundLine = { salesOrderLineId: string | null; qty: number; totalForeign: number; totalBase: number }
+export type PriorRefundLine = { salesOrderLineId: string | null; qty: number; totalForeign: number; totalBase: number; lineKind?: string | null }
 
 /**
  * What refunding `qty` units of an order line credits: cut from what the line has LEFT (the same function the refund service runs under
@@ -197,12 +197,16 @@ export function buildRefundRequest(
     fxRateToBase: number
     currencyMinorUnits?: number
     priorRefundLines?: ReadonlyArray<PriorRefundLine>
+    /** The order's discount (its own convention) so the preview includes the share the server reverses. */
+    discount?: { amount: number; amountsIncludeVat: boolean }
     lines: ReadonlyArray<MoneyViewLine & { id: string; productId: string | null; description: string; totalBase?: number }>
   },
   selections: ReadonlyArray<RefundSelection>,
 ): {
   lines: { lineId: string; productId: string | null; description: string; qty: number; totalForeign: number; totalBase: number }[]
   perLine: Record<string, RefundAmounts>
+  /** The order discount the server adds back (negative amounts), at the order's default rate; zeros when there is none. */
+  discountReversal: RefundAmounts
   total: RefundAmounts
 } {
   const perLine: Record<string, RefundAmounts> = {}
@@ -222,7 +226,28 @@ export function buildRefundRequest(
       totalBase: round4(amounts.net / (order.fxRateToBase || 1)),
     })
   }
-  return { lines, perLine, total: sumRefundAmounts(Object.values(perLine)) }
+  // The share of the order discount the server reverses, from the same function it uses under the lock.
+  let discountReversal: RefundAmounts = { net: 0, vat: 0, gross: 0 }
+  if (order.discount && order.discount.amount > 0) {
+    const prior = order.priorRefundLines ?? []
+    const reversal = orderDiscountReversal({
+      discountAmount: order.discount.amount,
+      amountsIncludeVat: order.discount.amountsIncludeVat,
+      vatRate: Number(order.taxRatePercent ?? 0),
+      orderSaleNet: order.lines.reduce((sum, l) => sum + l.totalForeign, 0),
+      priorSaleNet: prior.filter((p) => p.lineKind !== 'discount' && p.lineKind !== 'shipping' && p.salesOrderLineId).reduce((sum, p) => sum + p.totalForeign, 0),
+      priorDiscountForeign: -prior.filter((p) => p.lineKind === 'discount').reduce((sum, p) => sum + p.totalForeign, 0),
+      priorDiscountBase: -prior.filter((p) => p.lineKind === 'discount').reduce((sum, p) => sum + p.totalBase, 0),
+      refundedSaleNet: lines.reduce((sum, l) => sum + l.totalForeign, 0),
+      fxRateToBase: order.fxRateToBase,
+      minorUnits: order.currencyMinorUnits ?? 2,
+    })
+    if (reversal.foreign > 0) {
+      const credit = creditAmounts(reversal.foreign, Number(order.taxRatePercent ?? 0))
+      discountReversal = { net: -credit.net, vat: -credit.vat, gross: -credit.gross }
+    }
+  }
+  return { lines, perLine, discountReversal, total: sumRefundAmounts([...Object.values(perLine), discountReversal]) }
 }
 
 /**
