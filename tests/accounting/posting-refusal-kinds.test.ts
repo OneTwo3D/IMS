@@ -306,7 +306,7 @@ test('[o3d-j625 r7] every kind that is not AUTO is markable, and no AUTO kind is
  */
 const MANUAL_PRODUCERS: Record<string, Record<string, number>> = {
   sales_invoice_order: { 'app/actions/sales.ts': 2, 'lib/connectors/woocommerce/sync/order-import.ts': 2 },
-  sales_invoice_import: { 'app/actions/sales.ts': 1, 'lib/connectors/woocommerce/sync/order-import.ts': 2 },
+  sales_invoice_import: { 'app/actions/sales.ts': 2, 'lib/connectors/woocommerce/sync/order-import.ts': 2 },
   stock_adjustment_journal: { 'lib/domain/inventory/stock-adjustment-apply.ts': 1 },
   purchase_order_cancellation_reversal: { 'lib/domain/purchasing/cancellation-service.ts': 1 },
   supplier_return_reversal: { 'app/actions/purchase-orders.ts': 1 },
