@@ -399,7 +399,8 @@ export async function getDetails(dateFrom?: string, dateTo?: string): Promise<De
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
 
   const orders = await db.salesOrder.findMany({
-    where: Object.keys(dateFilter).length ? { createdAt: dateFilter } : undefined,
+    // Invoiced sales details: the same basis as every revenue figure, so drafts, cancelled and un-invoiced orders are not listed.
+    where: { ...INVOICED_ORDER_WHERE, ...(Object.keys(dateFilter).length ? { createdAt: dateFilter } : {}) },
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, status: true, customerName: true, customerEmail: true, salesRep: true, createdAt: true,
       lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true, product: { select: { barcode: true, mpn: true, type: true } } } },

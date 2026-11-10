@@ -96,7 +96,7 @@ export async function GET(req: NextRequest) {
         customerName: r.customerName, salesRep: r.salesRep, status: r.status,
         qty: r.qty, totalBase: r.totalBase.toFixed(2), createdAt: r.createdAt.slice(0, 10),
       }))
-      return csvResponseFor(req, toCsv(data, ['productName', 'sku', 'barcode', 'mpn', 'customerName', 'salesRep', 'status', 'qty', 'totalBase', 'createdAt']), `sales-details-${date}.csv`)
+      return csvResponseFor(req, toCsv(data, ['productName', 'sku', 'barcode', 'mpn', 'customerName', 'salesRep', 'status', 'qty', 'totalBase', 'createdAt']), `invoiced-sales-details-${date}.csv`)
     }
 
     case 'invoices': {

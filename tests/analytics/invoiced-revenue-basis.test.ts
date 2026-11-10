@@ -78,7 +78,7 @@ const ORDERS: Row[] = [
   row('C', 100, { ...PAID, status: SalesOrderStatus.SHIPPED, invoiceNumber: 'INV-3' }),
   row('D', 200, {
     ...PAID, status: SalesOrderStatus.COMPLETED, invoiceNumber: 'INV-4', refundStatus: 'PARTIAL',
-    refunds: [{ totalsBasis: 'NET', totalBase: D(20), lines: [{ productId: 'p1', qty: D(1), totalBase: D(20) }] }],
+    refunds: [{ totalsBasis: 'NET', totalBase: D(20), lines: [{ productId: 'p1', qty: D(1), totalBase: D(20), salesOrderLine: { taxBase: D(0), taxRate: { rate: 0 } } }] }],
   }),
   row('X', 11, { status: SalesOrderStatus.DRAFT, invoiceNumber: 'INV-5' }),
   row('Y', 13, { status: SalesOrderStatus.PENDING_PAYMENT }),
@@ -233,4 +233,11 @@ test('customer lifetime value and the customer page turnover use the invoiced ba
   assert.equal(detail!.totalTurnoverBase, 400)
   assert.equal(detail!.annualTurnoverBase[String(TODAY_NOON.getFullYear())], 400)
   assert.equal(detail!.orders.length, ORDERS.length, 'the order list still shows every order')
+})
+
+test('Details tab and its export list only invoiced orders', async () => {
+  const { getDetails } = await import('@/app/actions/sales-stats')
+  const rows = await getDetails()
+  assert.deepEqual([...new Set(rows.map((r) => r.orderNumber))].sort(), COUNTED)
+  assert.equal(rows.reduce((s, r) => s + r.totalBase, 0), EXPECTED_REVENUE)
 })

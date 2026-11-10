@@ -35,7 +35,7 @@ type Props = {
 const TABS: { key: Tab; label: string }[] = [
   { key: 'products', label: 'Products' },
   { key: 'shipments', label: 'Shipments' },
-  { key: 'details', label: 'Details' },
+  { key: 'details', label: 'Invoiced sales details' },
   { key: 'invoices', label: 'Invoices' },
   { key: 'refunds', label: 'Refunds' },
   { key: 'aging', label: 'Customer Aging' },
@@ -830,7 +830,7 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
 
       {/* Other tabs — generic filterable/sortable tables */}
       {tab === 'shipments' && renderGenericTable(filteredShipments, 'shipments', 'No shipments found.')}
-      {tab === 'details' && renderGenericTable(filteredDetails, 'details', 'No details found.')}
+      {tab === 'details' && renderGenericTable(filteredDetails, 'details', 'No invoiced sales details found.')}
       {tab === 'invoices' && renderGenericTable(filteredInvoices, 'invoices', 'No invoices found.')}
       {tab === 'refunds' && renderGenericTable(filteredRefunds, 'refunds', 'No refunds found.')}
       {tab === 'aging' && renderGenericTable(filteredAging, 'aging', 'No invoice data found.')}

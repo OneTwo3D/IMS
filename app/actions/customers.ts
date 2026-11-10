@@ -109,6 +109,15 @@ function normalizeAddress(address: AddressData | null | undefined): AddressData 
   return Object.keys(normalized).length > 0 ? normalized : Prisma.JsonNull
 }
 
+/** What `orderTurnoverBase` needs of each refund: its basis and total, and each line's own tax rate. */
+const REFUND_TURNOVER_SELECT = {
+  select: {
+    totalBase: true,
+    totalsBasis: true,
+    lines: { select: { totalBase: true, salesOrderLine: { select: { taxBase: true, taxRate: { select: { rate: true } } } } } },
+  },
+} as const
+
 type TurnoverOrderInput = Parameters<typeof orderTurnoverBase>[0]
 
 function mapCustomer(c: {
@@ -175,8 +184,8 @@ export async function getCustomers(activeOnly = true): Promise<CustomerRow[]> {
       _count: { select: { salesOrders: true } },
       salesOrders: {
         select: {
-          status: true, invoiceNumber: true, accountingInvoiceId: true, totalBase: true, taxBase: true, createdAt: true,
-          refunds: { select: { totalBase: true, totalsBasis: true } },
+          status: true, invoiceNumber: true, accountingInvoiceId: true, totalBase: true, createdAt: true,
+          refunds: REFUND_TURNOVER_SELECT,
         },
       },
     },
@@ -226,8 +235,7 @@ export async function getCustomerDetail(id: string): Promise<CustomerDetail | nu
           refundStatus: true,
           invoiceNumber: true,
           accountingInvoiceId: true,
-          taxBase: true,
-          refunds: { select: { totalBase: true, totalsBasis: true } },
+          refunds: REFUND_TURNOVER_SELECT,
           currency: true,
           totalForeign: true,
           totalBase: true,
