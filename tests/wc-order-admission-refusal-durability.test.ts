@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
-import { WEBHOOK_ORIGIN_NOT_APPLICABLE } from '@/lib/connectors/webhook-origin'
 
 /**
  * o3d-batch-ret r14 (Codex HIGH): THE 200 IS CONDITIONAL ON THE ROW.
@@ -221,7 +220,7 @@ async function pushOrder(order: ReturnType<typeof wcOrder>, topic = 'order.creat
     resource: 'orders',
     topic,
     payload: order,
-    originAttestation: WEBHOOK_ORIGIN_NOT_APPLICABLE,
+    originAttestation: 'store:shop.example.com',
   })
 }
 
@@ -252,6 +251,7 @@ function reset() {
   store.statusMappings = [{ externalStatus: 'processing', imsStatus: 'PROCESSING' }]
   store.settings = new Map([
     ['wc_initial_import_completed', 'true'],
+    ['wc_url', 'https://shop.example.com'],
     ['wc_sync_order_statuses', JSON.stringify(['processing'])],
   ])
 }

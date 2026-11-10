@@ -31,6 +31,7 @@ function makeRow(overrides: Partial<WcWebhookEventRow> = {}): WcWebhookEventRow 
     originAttestation: 'unproven:not-applicable',
     status: WC_WEBHOOK_EVENT_STATUS.pending,
     attempts: 0,
+    claimGeneration: 0,
     nextAttemptAt: null,
     processedAt: null,
     lastError: null,
@@ -115,38 +116,42 @@ function makeRepository(initialRows: WcWebhookEventRow[] = []): {
       if (!row) return null
       row.status = WC_WEBHOOK_EVENT_STATUS.processing
       row.attempts += 1
+      row.claimGeneration += 1
       row.nextAttemptAt = null
       row.lastError = null
       row.updatedAt = now
       return { ...row }
     },
-    async markProcessed(id, now) {
+    async markProcessed(id, now, claimGeneration) {
       const row = rows.find((candidate) => candidate.id === id)
       assert.ok(row)
+      if (row.status !== WC_WEBHOOK_EVENT_STATUS.processing || row.claimGeneration !== claimGeneration) return false
       row.status = WC_WEBHOOK_EVENT_STATUS.processed
       row.processedAt = now
       row.nextAttemptAt = null
       row.lastError = null
       row.updatedAt = now
-      return { ...row }
+      return true
     },
     async markFailed(input) {
       const row = rows.find((candidate) => candidate.id === input.id)
       assert.ok(row)
+      if (row.status !== WC_WEBHOOK_EVENT_STATUS.processing || row.claimGeneration !== input.claimGeneration) return false
       row.status = WC_WEBHOOK_EVENT_STATUS.failed
       row.lastError = input.error
       row.nextAttemptAt = input.nextAttemptAt
       row.updatedAt = input.now
-      return { ...row }
+      return true
     },
     async markDeadLetter(input) {
       const row = rows.find((candidate) => candidate.id === input.id)
       assert.ok(row)
+      if (row.status !== WC_WEBHOOK_EVENT_STATUS.processing || row.claimGeneration !== input.claimGeneration) return false
       row.status = WC_WEBHOOK_EVENT_STATUS.deadLetter
       row.lastError = input.error
       row.nextAttemptAt = null
       row.updatedAt = input.now
-      return { ...row }
+      return true
     },
   }
 

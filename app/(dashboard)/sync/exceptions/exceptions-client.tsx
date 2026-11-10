@@ -58,6 +58,7 @@ import {
   runPostMaintenanceRecheckNow,
   replayDeadReceiptEvent,
   replayDeadWebhookEvent,
+  replayDeadShoppingWebhookEvent,
   replayOutboxException,
   isolateUnresolvedDriftCohort,
   replayStuckDispatch,
@@ -534,7 +535,7 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`WMS inbound events — dead-lettered (${data.summary.deadReceiptEvents})`}
-            detail="Booked-in and order/inventory webhooks that exhausted their retries. Their effect has NOT been applied; replay re-queues the original event for the webhook sweeper."
+            detail="Booked-in and order/inventory webhooks, and store (WooCommerce) deliveries including order and refund deliveries held because the sending store could not be proven, that exhausted their retries. Their effect has NOT been applied; replay re-queues the original event for the webhook sweeper."
             shown={data.deadReceiptEvents.length}
             total={data.summary.deadReceiptEvents}
           />
@@ -543,7 +544,7 @@ export function ExceptionsClient({ data }: Props) {
               <TableRow>
                 <TableHead>Event</TableHead>
                 <TableHead>Kind</TableHead>
-                <TableHead>ASN / type</TableHead>
+                <TableHead>ASN / type / resource</TableHead>
                 <TableHead>Attempts</TableHead>
                 <TableHead>Last error</TableHead>
                 <TableHead>Dead-lettered</TableHead>
@@ -566,7 +567,7 @@ export function ExceptionsClient({ data }: Props) {
                       size="sm"
                       disabled={isPending}
                       onClick={() => runAction(
-                        () => (row.kind === 'booked-in' ? replayDeadReceiptEvent(row.id) : replayDeadWebhookEvent(row.id)),
+                        () => (row.kind === 'booked-in' ? replayDeadReceiptEvent(row.id) : row.kind === 'shopping-webhook' ? replayDeadShoppingWebhookEvent(row.id) : replayDeadWebhookEvent(row.id)),
                         'Event re-queued for the sweeper.',
                       )}
                     >

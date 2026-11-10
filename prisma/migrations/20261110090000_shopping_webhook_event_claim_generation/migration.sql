@@ -1,0 +1,12 @@
+-- A fence for the shopping webhook inbox's terminal writes.
+--
+-- A worker's PROCESSING claim expires after a while and the row is then claimed again. The first
+-- worker can still finish later, and its id-only markProcessed / markFailed / markDeadLetter would
+-- overwrite whatever happened since: a dead-letter, an operator replay, the newer claim's result.
+-- Every claim now increments this counter, which nothing resets (`attempts` is reset by a replay,
+-- so it cannot tell two claims apart), and the terminal writes match on it and on status
+-- PROCESSING: a stale finisher matches no row.
+--
+-- Existing rows start at 0; a row claimed by the previous build mid-deploy is simply finished by
+-- that build's id-only write, as before.
+ALTER TABLE "shopping_webhook_events" ADD COLUMN "claimGeneration" INTEGER NOT NULL DEFAULT 0;

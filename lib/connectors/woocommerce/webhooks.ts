@@ -743,6 +743,109 @@ async function judgeWcDeliveryOrigin(originAttestation: string): Promise<Webhook
   return judgeWebhookOrigin(originAttestation, await getSettingValue('wc_url'))
 }
 
+/**
+ * Order and refund deliveries get the same store fence as products (o3d-wgl6): a delivery is
+ * imported only when it proves it was sent by the store this installation is bound to.
+ *
+ * A WordPress staging clone copies the webhook definitions together with the delivery URL and
+ * secret, so a second store keeps posting correctly-signed deliveries to this installation, and
+ * WooCommerce order ids collide between a clone and its source. The signature proves only that
+ * the sender holds the secret, not which store it is.
+ *
+ * Refused deliveries are ACKNOWLEDGED rather than retried (the stored body is frozen, so no
+ * retry can change the verdict), and logged at ERROR so a store that should have been
+ * disconnected announces itself. Unlike products, an order or refund is also HELD (503, so the
+ * inbox retries and then dead-letters visibly, replayable) when the binding is unreadable or the
+ * delivery proved only a location under the store, never passed and never dropped.
+ */
+async function refuseNonBoundStoreDelivery(
+  kind: 'order' | 'refund',
+  payload: unknown,
+  originAttestation: string,
+): Promise<Response | null> {
+  const origin = await judgeWcDeliveryOrigin(originAttestation)
+  const body = (payload ?? {}) as { id?: unknown; order_id?: unknown; parent_id?: unknown }
+  const externalId = kind === 'order' ? body.id : (body.order_id ?? body.parent_id)
+  const ref = kind === 'order' ? `order ${String(externalId)}` : `refund (for order ${String(externalId)})`
+
+  // HELD, not passed and not dropped. An order or refund changes money on whichever IMS order has
+  // the matching external id, so unlike a product it must not run on weaker evidence than "this
+  // exact store sent it":
+  //   - `binding-unreadable`: our own `wc_url` is missing or malformed, so there is nothing to
+  //     compare against. 503 makes the inbox retry (and dead-letter visibly under Sync >
+  //     Exceptions, where it can be replayed) once the operator repairs the URL.
+  //   - an `under` statement (a permalink or a self-link below the root): on a root-installed
+  //     binding it proves only "somewhere on this host", so a multisite subsite or a clone on
+  //     the same host would pass. Only an exact store identity is accepted.
+  //   - `unproven` or `foreign-store` evidence is judged only AFTER the binding is known to be readable: with
+  //     `wc_url` missing the comparison cannot be made, and a delivery refused (acknowledged) then would be lost
+  //     for good although it may be perfectly valid once the URL is repaired.
+  //   - header-only evidence (`store-header:`): X-WC-Webhook-Source sits outside the HMAC, so a signed body
+  //     replayed with a forged header would otherwise look like it came from the bound store.
+  const held = origin.verdict === 'binding-unreadable'
+    || origin.boundStore === null
+    || (origin.verdict === 'same-store' && origin.scope !== 'exact')
+    || (origin.verdict === 'foreign-store' && origin.scope === 'header')
+  if (held) {
+    try {
+      await logActivity({
+        entityType: 'SYNC',
+        action: `wc_${kind}_webhook_held`,
+        tag: 'sync',
+        level: 'ERROR',
+        description: origin.verdict === 'binding-unreadable'
+          ? `WooCommerce ${ref} webhook is held: the store URL this installation is bound to is missing or unreadable, `
+            + 'so the sender cannot be checked. Nothing was imported. It is retried and, if the URL is not repaired, '
+            + 'appears under Sync > Exceptions where it can be replayed.'
+          : origin.scope === 'header'
+            ? `WooCommerce ${ref} webhook is held: the only thing naming its store is the X-WC-Webhook-Source header, `
+              + 'which is not covered by the signature, so it does not prove who sent it. Nothing was imported. It is '
+              + 'retried and then appears under Sync > Exceptions.'
+            : `WooCommerce ${ref} webhook is held: it only showed it came from somewhere under ${origin.deliveryStore} `
+              + `(${origin.attestation}), not from exactly ${origin.boundStore}. Nothing was imported. It is retried and `
+              + 'then appears under Sync > Exceptions where it can be replayed.',
+        metadata: {
+          externalId: externalId ?? null,
+          verdict: origin.verdict,
+          originAttestation: origin.attestation,
+          deliveryStore: origin.deliveryStore,
+          boundStore: origin.boundStore,
+          originScope: origin.scope,
+        },
+      })
+    } catch (e) {
+      console.error(`failed to log a held ${kind} webhook`, e)
+    }
+    return NextResponse.json({ ok: false, held: true, error: 'Delivery held: sending store could not be proven exactly' }, { status: 503 })
+  }
+  if (origin.verdict !== 'foreign-store' && origin.verdict !== 'unproven') return null
+  try {
+    await logActivity({
+      entityType: 'SYNC',
+      action: `wc_${kind}_webhook_foreign_store`,
+      tag: 'sync',
+      level: 'ERROR',
+      description: origin.verdict === 'foreign-store'
+        ? `WooCommerce ${ref} webhook was sent by ${origin.deliveryStore}, which is not the store this `
+          + `installation is bound to (${origin.boundStore}). Nothing was imported; the delivery is acknowledged `
+          + 'rather than retried against a store it does not describe.'
+        : `WooCommerce ${ref} webhook did not say which store sent it (${origin.attestation}), so it cannot be `
+          + 'shown to describe the store this installation is bound to. Nothing was imported.',
+      metadata: {
+        externalId: externalId ?? null,
+        verdict: origin.verdict,
+        originAttestation: origin.attestation,
+        deliveryStore: origin.deliveryStore,
+        boundStore: origin.boundStore,
+        originScope: origin.scope,
+      },
+    })
+  } catch (e) {
+    console.error(`failed to log a refused ${kind} webhook from a store that is not the bound one`, e)
+  }
+  return NextResponse.json({ ok: true, foreignStore: true, verdict: origin.verdict })
+}
+
 async function handleProductWebhook(payload: unknown, originAttestation: string) {
   const productPayload = payload as Partial<WcFullProduct> & { stock_quantity?: number | null }
 
@@ -978,12 +1081,18 @@ export async function processWcWebhookPayload(
   dependencies: Pick<WcWebhookDependencies, 'handleOrderWebhook' | 'handleProductWebhook' | 'handleRefundWebhook'> = defaultDependencies,
 ) {
   switch (input.resource) {
-    case 'orders':
+    case 'orders': {
+      const refused = await refuseNonBoundStoreDelivery('order', input.payload, input.originAttestation)
+      if (refused) return refused
       return dependencies.handleOrderWebhook(input.payload, input.topic)
+    }
     case 'products':
       return dependencies.handleProductWebhook(input.payload, input.originAttestation)
-    case 'refunds':
+    case 'refunds': {
+      const refused = await refuseNonBoundStoreDelivery('refund', input.payload, input.originAttestation)
+      if (refused) return refused
       return dependencies.handleRefundWebhook(input.payload)
+    }
   }
 }
 
@@ -1042,7 +1151,11 @@ export async function handleWcWebhook(
   // the inbox, and by the time a retry runs, the headers are long gone and every setting has
   // moved on. No database read: the answer is entirely the store's own statement, which is what
   // makes it survive a rebind that happens afterwards.
-  const originAttestation = readWcDeliveryOrigin(request, parsed.value)
+  const originAttestation = readWcDeliveryOrigin(
+    request,
+    parsed.value,
+    resource === 'products' ? 'trusted' : 'header-unsigned',
+  )
 
   const result: PersistWcWebhookEventResult = await dependencies.persistWebhookEvent(
     dependencies.webhookEventRepository,
