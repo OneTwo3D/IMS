@@ -580,6 +580,11 @@ test('sharing stays refused where the types differ: an undeclared WooCommerce ra
   assert.ok(reasonsOf(compareVatSetIdentity(other), 'woo', '215').includes('DUPLICATE_MAPPING'), 'Woo 215 is declared as AT VAT, not as the zero-rated rate')
   assert.ok(reasonsOf(compareVatSetIdentity(other), 'woo', '150').includes('DUPLICATE_MAPPING'))
 
+  const otherType = zeroShared()
+  otherType.woo = [...otherType.woo, woo('112', { name: 'Zero Rated Income', country: 'GB', rate: '0.0000', class: 'zero-rate' })]
+  otherType.mappings = [...otherType.mappings, { ...map('112', 'rZ'), externalClass: 'zero-rate' }]
+  assert.ok(reasonsOf(compareVatSetIdentity(otherType), 'woo', '150').includes('DUPLICATE_MAPPING'), 'Woo 112 is declared on OUTPUT2, a plain rate with no scheme type like the zero-rated ones: only the charged type tells them apart')
+
   const wrongType = zeroShared()
   wrongType.rates = [ims('rZ', 'TAX999', { name: 'Zero Rated Income', rate: '0.0000', countryCode: null, taxCategory: 'ZERO' })]
   wrongType.xero = [xero('TAX999', { name: 'Zero Rated Income', reportTaxType: 'OUTPUT', effectiveRate: '0.000000', displayTaxRate: '0.000000' })]
