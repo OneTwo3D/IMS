@@ -28,7 +28,6 @@ test('every finding code has a description, and a seeded failure for each check 
   expectError((w) => { setIms(w, 112, { active: false }) }, 'IMS_RATE_INACTIVE')
   expectError((w) => { setIms(w, 112, { usedFor: 'PURCHASE' }) }, 'IMS_RATE_NOT_SALES')
   expectError((w) => { setIms(w, 112, { reverseCharge: true }) }, 'IMS_RATE_NOT_SALES')
-  expectError((w) => { w.mappings.set(151, { ...w.mappings.get(151)!, taxRateId: 'ims-150' }) }, 'IMS_COUNTRY_DIFFERS', 'SHARED_IMS_ROW')
   expectError((w) => { setIms(w, 220, { rate: '0.2100' }) }, 'IMS_PERCENT_DIFFERS')
   expectError((w) => { setIms(w, 220, { countryCode: 'AT' }) }, 'IMS_COUNTRY_DIFFERS')
   expectError((w) => { setIms(w, 220, { accountingTaxType: null }) }, 'CHARGED_TYPE_MISSING')
@@ -51,6 +50,15 @@ test('every finding code has a description, and a seeded failure for each check 
   expectError((w) => { w.xero.set('TAX131', { ...xeroType('TAX131', 'DE IOSS VAT', '0.0000'), effectiveRate: null, displayTaxRate: null }) }, 'SCHEME_NOT_ZERO')
   expectError((w) => { w.ims.set(9999, { id: 'ims-x', name: 'Stray', rate: '0.2000', usedFor: 'SALES', active: true, reverseCharge: false, countryCode: 'DE', accountingTaxType: null, reportingCategory: 'IOSS', schemePostingTaxType: 'TAX131' }) }, 'SCHEME_FIELD_ON_UNDECLARED_RATE')
   assert.ok(Object.keys(PREFLIGHT_CODES).length >= 30)
+})
+
+test('WooCommerce rates declared to be one Xero rate share one IMS rate without a finding; a rate declared as a different Xero rate on it is a SHARED_IMS_ROW error', () => {
+  assert.deepEqual(codesOf(perfectWorld().input), [])
+  const stranger = codesOf(withWorld((w) => { w.mappings.set(220, { ...w.mappings.get(220)!, taxRateId: 'ims-139' }) }))
+  assert.ok(stranger.includes('SHARED_IMS_ROW'))
+  const second = codesOf(withWorld((w) => { w.ims.set(9998, { ...w.ims.get(150)!, id: 'ims-other', name: 'Another zero rate' }); w.mappings.set(150, { ...w.mappings.get(150)!, taxRateId: 'ims-other' }) }))
+  assert.ok(second.includes('XERO_TYPE_ON_TWO_IMS_RATES'), 'two IMS rates on one Xero type are refused')
+  assert.ok(second.includes('SHARED_IMS_ROW') === false)
 })
 
 test('"No VAT" and "NO VAT" stay distinct: Norway\'s charged type must be the one named exactly "NO VAT", never NONE', () => {
@@ -127,12 +135,12 @@ test('rates that cannot be touched are skipped with the preflight\'s reason, and
     w.mappings.set(216, { ...w.mappings.get(216)!, externalCountry: 'FR' })
     setIms(w, 217, { active: false })
     setIms(w, 218, { usedFor: 'PURCHASE' })
-    w.mappings.set(152, { ...w.mappings.get(152)!, taxRateId: 'ims-151' })
+    w.mappings.set(220, { ...w.mappings.get(220)!, taxRateId: 'ims-139' })
     w.mappings.set(219, { ...w.mappings.get(219)!, taxRateId: 'nowhere' })
   }))
   const reasons = Object.fromEntries(plan.skipped.map((s) => [s.wooId, s.reason]))
-  assert.deepEqual(reasons, { 215: 'WOO_UNMAPPED', 216: 'MAPPING_DIFFERS', 217: 'IMS_RATE_INACTIVE', 218: 'IMS_RATE_NOT_SALES', 219: 'IMS_RATE_MISSING', 151: 'SHARED_IMS_ROW', 152: 'SHARED_IMS_ROW' })
-  assert.equal(plan.changes.some((c) => [215, 216, 217, 218, 219].includes(c.wooId)), false)
+  assert.deepEqual([215, 216, 217, 218, 219, 220].map((id) => reasons[id]), ['WOO_UNMAPPED', 'MAPPING_DIFFERS', 'IMS_RATE_INACTIVE', 'IMS_RATE_NOT_SALES', 'IMS_RATE_MISSING', 'SHARED_IMS_ROW'])
+  assert.equal(plan.changes.some((c) => [215, 216, 217, 218, 219, 220].includes(c.wooId)), false)
 })
 
 test('a foreign, unstamped or unidentifiable store never enters the plan or passes the preflight, and the store is bound into the digest', () => {
@@ -200,4 +208,20 @@ test('the identity facts the plan judged are in the digest even where the row st
   const ids = reversed.changes.map((c) => c.taxRateId)
   assert.equal(ids.length, 30)
   assert.deepEqual(ids, [...ids].sort())
+})
+
+test('a shared IMS rate is ONE change that carries the facts of every mapping that names it; each mapping fact is in the digest', () => {
+  const stale = (mutate: (w: World) => void = () => undefined): ReturnType<typeof planEuVatSeedApply> => planEuVatSeedApply(withWorld((w) => { setIms(w, 139, { reportingCategory: 'IOSS' }); mutate(w) }))
+  const plan = stale()
+  const change = plan.changes.find((c) => c.taxRateId === 'ims-139')
+  assert.ok(change, 'the shared rate is planned once')
+  assert.equal(plan.changes.filter((c) => c.taxRateId === 'ims-139').length, 1)
+  assert.equal(change.identity.mappings.length, 33)
+  assert.deepEqual(change.identity.mappings.map((m) => m.id), [...change.identity.mappings.map((m) => m.id)].sort())
+  assert.deepEqual([change.from.reportingCategory, change.to.reportingCategory], ['IOSS', null])
+  const d = plan.digest
+  // A mapping that still passes every check but records a different (equal-meaning) class spelling, or has another id, moves the digest.
+  assert.notEqual(stale((w) => { w.mappings.set(150, { ...w.mappings.get(150)!, id: 'swapped' }) }).digest, d)
+  assert.notEqual(stale((w) => { w.mappings.set(150, { ...w.mappings.get(150)!, externalClass: ' Zero-Rate ' }) }).digest, d)
+  assert.equal(stale((w) => { w.mappings.set(150, { ...w.mappings.get(150)!, externalRatePct: '0.00' }) }).digest, d, 'the percentage is judged and bound by value (four decimals): an equal value keeps the digest')
 })

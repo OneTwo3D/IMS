@@ -334,3 +334,24 @@ test('o3d-6thk1 (real tables): EVERY branch x EVERY store, table-driven', { skip
   console.log(`# o3d-6thk1 branch x store: ${results.length} branches\n${results.map((r) => `#   ${r.name}: ${r.kind} -> ${JSON.stringify(r.post)}`).join('\n')}`)
   assert.equal(results.length, BRANCHES.length)
 })
+
+test('a rate that holds ONLY a scheme posting type (no charged type) is an organisation-owned mapping and is cleared on a change of organisation', { skip }, async () => {
+  const run = randomUUID().slice(0, 8)
+  const observed = await withRollback(async (tx) => {
+    await lockAccountingMappingSelection(tx, 'xero')
+    await tx.setting.deleteMany({ where: { key: { in: [...XERO_ACCOUNT_MAPPING_KEYS, ...DERIVED, 'xero_sync_enabled', XERO_ACCOUNT_MAPPING_TENANT_KEY] } } })
+    await tx.accountingToken.deleteMany({ where: { connector: 'xero' } })
+    await tx.taxRate.updateMany({ data: { accountingTaxType: null, schemePostingTaxType: null } })
+    await tx.taxRateComponent.updateMany({ data: { accountingTaxType: null } })
+    await tx.accountingAccount.deleteMany({ where: { connector: 'xero' } })
+    await tx.setting.create({ data: { key: XERO_ACCOUNT_MAPPING_TENANT_KEY, value: `tenant-A-${run}` } })
+    const rate = await tx.taxRate.create({ data: { name: `s-${run}`, rate: '0.2', schemePostingTaxType: `TAXA-${run}`, reportingCategory: 'IOSS' } })
+    const previous = await readPreviousMappingOrganisation(tx, 'xero')
+    const outcome = await resetAccountMappingForOrganisationChange(tx, { previous, newTenantId: `tenant-B-${run}`, connector: 'xero' })
+    const after = await tx.taxRate.findUnique({ where: { id: rate.id } })
+    return { outcome, after }
+  })
+  assert.equal(observed.outcome.kind, 'cleared', 'a scheme posting type alone is a mapping')
+  assert.equal(observed.after.schemePostingTaxType, null)
+  assert.equal(observed.after.reportingCategory, 'IOSS', 'the marker is not an organisation code and stays')
+})

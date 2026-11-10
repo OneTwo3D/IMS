@@ -89,17 +89,20 @@ test('every EU-27 member state, Monaco and Norway has a declared scheme rate; Po
   assert.deepEqual(seed.rates.filter((r) => r.country === 'PT' && isSchemeRate(r)).map((r) => r.schemePostingTaxType).sort(), ['TAX149', 'TAX150'])
 })
 
-test('no declared rate shares its IMS name with another: one IMS rate per WooCommerce rate, no shared zero-rated row (ruling Q2)', () => {
-  assert.equal(new Set(seed.rates.map((r) => r.imsName)).size, 65)
+test('one IMS rate per Xero rate (ruling Q2, option A): only rates on the same Xero type share an IMS rate, and the 33 on ZERORATEDOUTPUT (182 included) are one', () => {
+  assert.equal(new Set(seed.rates.map((r) => r.imsName)).size, 33, '32 rates of their own and the one shared zero-rated rate')
+  const shared = seed.rates.filter((r) => r.imsName === 'Zero Rated Income')
+  assert.deepEqual(shared.map((r) => r.wooId), fixture.rows.filter((r) => r.xeroomTaxType === 'ZERORATEDOUTPUT').map((r) => r.wooId))
+  assert.equal(shared.length, 33)
+  assert.ok(shared.some((r) => r.wooId === 182))
+  for (const r of shared) { assert.equal(r.accountingTaxType, 'ZERORATEDOUTPUT'); assert.equal(r.imsCountry, null); assert.equal(r.taxCategory, 'ZERO') }
+  for (const r of seed.rates.filter((x) => x.imsName !== 'Zero Rated Income')) assert.equal(seed.rates.filter((o) => o.imsName === r.imsName).length, 1, `${r.imsName} stands alone`)
 })
 
-test('a world in which everything is as declared passes the preflight; the only listing is that many IMS rates share one Xero type, which R13 reports and is not exempted', () => {
+test('a world in which everything is as declared passes the preflight with no finding at all', () => {
   const result = evaluateEuVatPreflight(perfectWorld().input)
   assert.equal(result.status, 'checked')
   if (result.status !== 'checked') return
-  assert.deepEqual(result.findings.filter((f) => f.severity === 'error'), [])
+  assert.deepEqual(result.findings, [])
   assert.equal(result.ready, true)
-  assert.deepEqual([...new Set(result.findings.map((f) => f.code))], ['XERO_TYPE_SHARED_BY_RATES'])
-  assert.deepEqual(result.findings.map((f) => f.subject), ['Xero type ZERORATEDOUTPUT'])
-  assert.match(result.findings[0]!.detail, /^33 rates /)
 })

@@ -7,7 +7,8 @@
  *   - `reportingCategory`: IOSS or VOEC on those rates (the marker lib/tax/vat-scheme.ts already accepts), null elsewhere.
  * Nothing here posts anything: no document builder reads the file or the column it fills, and nothing writes a tax rate to Xero.
  *
- * ONE IMS RATE PER WOOCOMMERCE RATE (owner ruling): there is no shared zero-rated row and no exemption in the set-identity report (R13) for the zero-rated class.
+ * ONE IMS RATE PER XERO RATE (owner ruling Q2, option A): WooCommerce rates that post on the same Xero type share one IMS rate (the 33 on ZERORATEDOUTPUT), as in Xero. Rates that share one carry the
+ * same `imsName` and are declared identically; the set-identity report (R13) accepts exactly that sharing (it reads this declaration) and still refuses sharing where the types differ.
  */
 import seedFile from './eu-vat-seed.json'
 
@@ -24,6 +25,8 @@ export type EuVatSeedRate = {
   wooClass: string
   /** The IMS rate's name: the WooCommerce label, prefixed with the country where the label alone would repeat. */
   imsName: string
+  /** The IMS rate's country: the Woo country, or null on an IMS rate shared by several WooCommerce rates (it spans countries). */
+  imsCountry: string | null
   taxCategory: 'STANDARD' | 'ZERO'
   accountingTaxType: string | null
   /** The charged type's Xero name, byte-exact (for a rate posting on a built-in type, the name Xeroom's association gives it). */
@@ -58,14 +61,21 @@ export function validateEuVatSeed(seed: EuVatSeed): SeedProblem[] {
   if (seed.schemaVersion !== EU_VAT_SEED_SCHEMA_VERSION) add('SCHEMA_VERSION', `schemaVersion ${String(seed.schemaVersion)} is not ${EU_VAT_SEED_SCHEMA_VERSION}`)
   if (!/^\d{4}-\d{2}-\d{2}\.\d+$/.test(seed.seedVersion)) add('SEED_VERSION', `seedVersion "${seed.seedVersion}" is not YYYY-MM-DD.n`)
   const ids = new Set<number>()
-  const imsNames = new Set<string>()
+  const imsNames = new Map<string, EuVatSeedRate>()
   for (const rate of seed.rates) {
     const where = `Woo rate ${rate.wooId}`
     if (!Number.isInteger(rate.wooId) || rate.wooId <= 0) add('WOO_ID', `${where}: not a positive integer`)
     if (ids.has(rate.wooId)) add('DUPLICATE_WOO_ID', `${where}: declared twice`)
     ids.add(rate.wooId)
-    if (imsNames.has(rate.imsName)) add('DUPLICATE_IMS_NAME', `${where}: the IMS name "${rate.imsName}" is declared for another rate (one IMS rate per WooCommerce rate, each with its own name)`)
-    imsNames.add(rate.imsName)
+    const sharer = imsNames.get(rate.imsName)
+    if (sharer !== undefined) {
+      // Sharing one IMS rate is allowed only for rates declared to be the same Xero rate in every respect.
+      const same = (['accountingTaxType', 'accountingXeroName', 'schemePostingTaxType', 'schemePostingXeroName', 'reportingCategory', 'taxCategory', 'imsCountry', 'ratePercent'] as const).filter((f) => sharer[f] !== rate[f])
+      if (same.length > 0) add('SHARED_IMS_NAME_DIFFERS', `${where}: shares the IMS rate "${rate.imsName}" with Woo ${sharer.wooId} but differs in ${same.join(', ')}`)
+      if (rate.accountingTaxType === null) add('SHARED_WITHOUT_CODE', `${where}: a shared IMS rate declares the Xero type it stands for`)
+      if (rate.imsCountry !== null) add('SHARED_WITH_COUNTRY', `${where}: a shared IMS rate spans countries, so its imsCountry is null`)
+    } else imsNames.set(rate.imsName, rate)
+    if (rate.imsCountry !== null && rate.imsCountry !== rate.country) add('IMS_COUNTRY', `${where}: imsCountry "${rate.imsCountry}" is neither null nor the country`)
     if (!/^\d{1,3}\.\d{4}$/.test(rate.ratePercent)) add('RATE_PERCENT', `${where}: ratePercent "${rate.ratePercent}" is not a percentage with four decimals`)
     for (const [field, value] of [['accountingTaxType', rate.accountingTaxType], ['schemePostingTaxType', rate.schemePostingTaxType]] as const) {
       if (value !== null && !TAX_TYPE_RE.test(value)) add('TAX_TYPE_SHAPE', `${where}: ${field} "${value}" is not a Xero tax type`)
@@ -104,4 +114,9 @@ export function seedPostingTaxType(rate: EuVatSeedRate): string | null {
 
 export function isSchemeRate(rate: Pick<EuVatSeedRate, 'schemePostingTaxType'>): boolean {
   return rate.schemePostingTaxType !== null
+}
+
+/** The declared WooCommerce rates that share this rate's IMS rate (itself included); one element for a rate that stands alone. */
+export function seedSharers(seed: Pick<EuVatSeed, 'rates'>, rate: Pick<EuVatSeedRate, 'imsName'>): EuVatSeedRate[] {
+  return seed.rates.filter((r) => r.imsName === rate.imsName)
 }

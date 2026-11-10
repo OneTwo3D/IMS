@@ -32,6 +32,7 @@ import type { TaxComponentRateRow, TaxMappingRow, TaxRateRow } from '@/lib/recon
 import { knownWcTaxClassCategory } from '@/lib/connectors/woocommerce/sync/tax-class-category'
 import type { WooTaxRateDetail } from '@/lib/reconciliation-pack/woo-source'
 import { comparableName, nameRegion, normaliseCountryCode, regionToken, xeroNameCountry } from '@/lib/tax/tax-country'
+import { loadEuVatSeed } from '@/lib/tax/eu-vat-seed'
 import { componentMeaningDifference } from '@/lib/tax/tax-rekey'
 import { effectiveTaxRateFromComponents } from '@/lib/tax/tax-rate-components'
 import { XERO_BUILT_IN_TAX_TYPES } from '@/lib/tax/xero-built-in-tax-types'
@@ -39,9 +40,23 @@ import { XERO_BUILT_IN_TAX_TYPES } from '@/lib/tax/xero-built-in-tax-types'
 const Decimal = Prisma.Decimal
 type Decimal = InstanceType<typeof Prisma.Decimal>
 
+/**
+ * SHARING ONE IMS RATE (owner ruling Q2, option A: one IMS rate per Xero rate). Several WooCommerce rates may map to one IMS rate when the EU VAT declaration (lib/tax/eu-vat-seed.json) declares every one of them
+ * to be the SAME Xero rate (same imsName and charged Xero type) and the IMS rate carries that type. Anything else stays a DUPLICATE_MAPPING: an undeclared WooCommerce rate on the rate, rates declared as different
+ * Xero rates, or a shared IMS rate that carries another type. On an accepted sharing the per-rate country and tax-category comparisons are not made (the rate spans the countries and classes of its WooCommerce rates).
+ */
+function declaredSharing(wooIds: ReadonlySet<string>, ims: TaxRateRow): boolean {
+  if (wooIds.size < 2) return false
+  const seed = loadEuVatSeed().rates
+  const declared = [...wooIds].map((id) => seed.find((r) => String(r.wooId) === id))
+  const first = declared[0]
+  if (first === undefined || first.accountingTaxType === null) return false
+  return declared.every((r) => r !== undefined && r.imsName === first.imsName && r.accountingTaxType === first.accountingTaxType && r.schemePostingTaxType === first.schemePostingTaxType) && ims.accountingTaxType === first.accountingTaxType
+}
+
 export const VAT_SET_REASONS = {
   WOO_UNMAPPED: 'a WooCommerce tax rate has no IMS mapping of the storefront connector',
-  DUPLICATE_MAPPING: 'the counterpart is not unique: two or more WooCommerce rates (whatever their scope, equal or different) map to one IMS rate, or two active IMS sales rates carry one Xero tax type',
+  DUPLICATE_MAPPING: 'the counterpart is not unique: two or more WooCommerce rates (whatever their scope, equal or different) map to one IMS rate unless the EU VAT declaration declares them to be the same Xero rate as the IMS rate\'s own type, or two active IMS sales rates carry one Xero tax type',
   IMS_RATE_NOT_ACTIVE_SALES: 'the IMS rate a WooCommerce rate maps to is inactive, purchase-only or a reverse-charge rate',
   IMS_NOT_IN_XERO: 'an in-scope IMS sales rate carries no Xero tax type, or a type that is not an ACTIVE type of the stored Xero list',
   XERO_NOT_SALES_TYPE: 'the Xero type an IMS sales rate carries cannot be applied to revenue',
@@ -189,17 +204,18 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
     if (target === undefined || ims === undefined) reasons.add('WOO_UNMAPPED')
     else {
       if (!imsInScopeIds.has(ims.id)) reasons.add('IMS_RATE_NOT_ACTIVE_SALES')
-      if ((wooIdsByIms.get(ims.id)?.size ?? 0) > 1) reasons.add('DUPLICATE_MAPPING')
+      const sharing = declaredSharing(wooIdsByIms.get(ims.id) ?? new Set(), ims)
+      if ((wooIdsByIms.get(ims.id)?.size ?? 0) > 1 && !sharing) reasons.add('DUPLICATE_MAPPING')
       const wooPercent = exact(woo.rate)
       const imsValue = imsPercent(ims, input.componentRates)
       if (wooPercent === null || imsValue === null || !wooPercent.eq(imsValue)) reasons.add('PERCENT_DIFFERS')
       const imsCountry = ims.countryCode === null ? '' : normaliseCountryCode(ims.countryCode)
-      if (normaliseCountryCode(woo.country) !== imsCountry) reasons.add('COUNTRY_DIFFERS')
+      if (!sharing && normaliseCountryCode(woo.country) !== imsCountry) reasons.add('COUNTRY_DIFFERS')
       if (normaliseClass(woo.class) !== mappedClass.get(woo.id)) reasons.add('CLASS_DIFFERS')
       if (woo.compound !== ims.isCompound) reasons.add('COMPOUND_DIFFERS')
       const wooCategory = knownWcTaxClassCategory(woo.class)
       if (wooCategory === null) reasons.add('CATEGORY_UNVERIFIED')
-      else if (wooCategory !== ims.taxCategory) reasons.add('CATEGORY_DIFFERS')
+      else if (!sharing && wooCategory !== ims.taxCategory) reasons.add('CATEGORY_DIFFERS')
       if (comparableName(woo.name) !== comparableName(ims.name)) { reasons.add('WOO_NAME_DIFFERS'); nameDifferences.set(`woo|${woo.id}`, { ims: ims.name, woo: woo.name }) }
       // REGION: IMS records a region only in the rate name. A recorded region must equal the Woo state (and Woo then has no postcode or city IMS could not hold); where IMS records none, a Woo rate that is regional, or shares country and class with another region, cannot be confirmed.
       const wooCountry = normaliseCountryCode(woo.country)

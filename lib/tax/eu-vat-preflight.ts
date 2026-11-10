@@ -11,15 +11,15 @@
  * the store rate (country, percentage, class) must equal the declaration's, or the mapping was made against another store and nothing is written through it. The apply never creates a rate, never
  * edits a mapping and never edits an account mapping: the rates come from the tax import and the re-key, the accounts from the settings form.
  *
- * ONE IMS RATE PER WOOCOMMERCE RATE (owner ruling): an IMS rate named by two declared WooCommerce rates is an ERROR (SHARED_IMS_ROW). The set-identity report (R13) is not changed and not exempted:
- * where the declaration has several IMS rates on ONE Xero type (all the zero-rated rows are ZERORATEDOUTPUT, as in Xeroom) it will keep reporting that, and the preflight lists those as ADVISORY so
- * nobody is surprised by it.
+ * ONE IMS RATE PER XERO RATE (owner ruling Q2, option A): WooCommerce rates declared to be the same Xero rate (the 33 on ZERORATEDOUTPUT) share one IMS rate. An IMS rate named by declared WooCommerce
+ * rates that are NOT declared the same (SHARED_IMS_ROW), or two IMS rates on one Xero type (XERO_TYPE_ON_TWO_IMS_RATES), is an ERROR. The set-identity report (R13) accepts the declared sharing too.
  *
  * SEVERITY. `error` blocks readiness; `advisory` is listed and does not.
  */
 import { createHash } from 'node:crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import { EU_ISO_CODES, VOEC_ISO_CODES } from '@/lib/connectors/xero/tax-rate-report-type'
+import type { XeroConnectionStamp } from '@/lib/connectors/xero/connection-fence'
 import type { NormalisedXeroTaxRate } from '@/lib/connectors/xero/tax-rate-list'
 import { readStoredXeroList, type Client } from '@/lib/tax/purchase-tax-import'
 import { lockTaxRateForEdit, TaxRateReplacedError } from '@/lib/tax/tax-rate-replaced'
@@ -71,7 +71,7 @@ export const PREFLIGHT_CODES = {
   IMS_RATE_MISSING: 'the mapping names an IMS rate that does not exist',
   IMS_RATE_INACTIVE: 'the IMS rate is inactive',
   IMS_RATE_NOT_SALES: 'the IMS rate is purchase-only or a reverse-charge rate',
-  SHARED_IMS_ROW: 'one IMS rate stands for more than one declared WooCommerce rate (the ruling is one IMS rate per WooCommerce rate)',
+  SHARED_IMS_ROW: 'one IMS rate stands for WooCommerce rates the declaration does not declare to be the same Xero rate (only rates on the same Xero type may share an IMS rate)',
   IMS_PERCENT_DIFFERS: 'the IMS rate is not the percentage the declaration states',
   IMS_COUNTRY_DIFFERS: 'the IMS rate is for another country than the declaration states',
   IMS_NAME_DIFFERS: 'the IMS rate has another name than the declaration states (trimmed, whitespace collapsed, case ignored)',
@@ -96,11 +96,11 @@ export const PREFLIGHT_CODES = {
   ACCOUNT_SETTING_NOT_SET: 'the account setting is blank',
   ACCOUNT_SETTING_DIFFERS: 'the account setting is not the declared account',
   HOLD_SETTING_INVALID: 'a refund-hold setting is not a non-negative whole number',
-  XERO_TYPE_SHARED_BY_RATES: 'several IMS rates post on one Xero type, so the set-identity report (R13) reports them as DUPLICATE_MAPPING; it is not exempted (owner ruling), so this stays until Xero has a type each',
+  XERO_TYPE_ON_TWO_IMS_RATES: 'two different IMS rates carry one Xero type (the ruling is one IMS rate per Xero rate); the set-identity report reports it as DUPLICATE_MAPPING',
 } as const
 export type PreflightCode = keyof typeof PREFLIGHT_CODES
 export type Severity = 'error' | 'advisory'
-const ADVISORY: ReadonlySet<PreflightCode> = new Set<PreflightCode>(['IMS_NAME_DIFFERS', 'XERO_TYPE_SHARED_BY_RATES'])
+const ADVISORY: ReadonlySet<PreflightCode> = new Set<PreflightCode>(['IMS_NAME_DIFFERS'])
 
 export type PreflightFinding = { severity: Severity; code: PreflightCode; /** The declared WooCommerce rate, or null for a finding about the whole configuration. */ wooId: number | null; subject: string; detail: string }
 
@@ -146,7 +146,7 @@ export function evaluateEuVatPreflight(input: PreflightInput): PreflightResult {
   const wooIdsByIms = new Map<string, number[]>()
   for (const r of resolved) if (r.ims !== null) wooIdsByIms.set(r.ims.id, [...(wooIdsByIms.get(r.ims.id) ?? []), r.rate.wooId])
   const fullyConfigured = new Set<number>()
-  const codeCarriers = new Map<string, number[]>()
+  const codeCarriers = new Map<string, Set<string>>()
 
   for (const { rate, mapping, mappingMatches, ims } of resolved) {
     const subject = `Woo ${rate.wooId} ${rate.country || '(no country)'} "${rate.wooName}" ${rate.ratePercent}%`
@@ -159,12 +159,13 @@ export function evaluateEuVatPreflight(input: PreflightInput): PreflightResult {
     if (!mappingMatches) { err('MAPPING_DIFFERS', `the mapping records "${mapping.externalName}", country "${mapping.externalCountry ?? ''}", ${mapping.externalRatePct}%, class "${mapping.externalClass ?? ''}"`); continue }
     if (ims === null) { err('IMS_RATE_MISSING', `mapping ${mapping.externalTaxRateId} names rate ${mapping.taxRateId}`); continue }
     const shared = wooIdsByIms.get(ims.id) ?? []
-    if (shared.length > 1) err('SHARED_IMS_ROW', `IMS rate "${ims.name}" also stands for Woo ${shared.filter((id) => id !== rate.wooId).join(', ')}`)
+    const strangers = shared.filter((id) => input.seed.rates.find((x) => x.wooId === id)?.imsName !== rate.imsName)
+    if (strangers.length > 0) err('SHARED_IMS_ROW', `IMS rate "${ims.name}" also stands for Woo ${strangers.join(', ')}, which are not declared to be the same Xero rate`)
     if (!ims.active) err('IMS_RATE_INACTIVE', `"${ims.name}"`)
     else if (!isActiveSalesRate(ims)) err('IMS_RATE_NOT_SALES', `"${ims.name}" is used for ${ims.usedFor}${ims.reverseCharge ? ', reverse charge' : ''}`)
     const imsPercent = exactDec(ims.rate)?.mul(100) ?? null
     if (imsPercent === null || !imsPercent.eq(new Dec(rate.ratePercent))) err('IMS_PERCENT_DIFFERS', `IMS ${imsPercent === null ? 'unreadable' : imsPercent.toFixed()}%, declared ${rate.ratePercent}%`)
-    if (normaliseCountryCode(ims.countryCode ?? '') !== normaliseCountryCode(rate.country)) err('IMS_COUNTRY_DIFFERS', `IMS "${ims.countryCode ?? ''}", declared "${rate.country}"`)
+    if (rate.imsCountry !== null && normaliseCountryCode(ims.countryCode ?? '') !== normaliseCountryCode(rate.imsCountry)) err('IMS_COUNTRY_DIFFERS', `IMS "${ims.countryCode ?? ''}", declared "${rate.imsCountry}"`)
     if (!sameName(ims.name, rate.imsName)) err('IMS_NAME_DIFFERS', `IMS "${ims.name}", declared "${rate.imsName}"`)
 
     // The charged type.
@@ -172,7 +173,7 @@ export function evaluateEuVatPreflight(input: PreflightInput): PreflightResult {
     if (code === '') err('CHARGED_TYPE_MISSING', `"${ims.name}"`)
     else if (code.toUpperCase() === NO_VAT_TAX_TYPE) err('CHARGED_TYPE_NONE', `"${ims.name}" carries ${code}`)
     else {
-      codeCarriers.set(code, [...(codeCarriers.get(code) ?? []), rate.wooId])
+      codeCarriers.set(code, new Set([...(codeCarriers.get(code) ?? []), ims.id]))
       const live = xeroByType.get(code)
       if (live === undefined || live.status !== 'ACTIVE') err('CHARGED_TYPE_NOT_IN_XERO', `${code} ${live === undefined ? 'is not in the list' : `is ${live.status}`}`)
       else {
@@ -240,9 +241,9 @@ export function evaluateEuVatPreflight(input: PreflightInput): PreflightResult {
     if (parsed.state === 'invalid') add('HOLD_SETTING_INVALID', null, key, `"${parsed.raw}"`)
   }
 
-  // R13 consequence, stated rather than hidden: several declared rates on one Xero type.
-  for (const [code, woo] of codeCarriers) {
-    if (woo.length > 1) add('XERO_TYPE_SHARED_BY_RATES', null, `Xero type ${code}`, `${woo.length} rates (Woo ${woo.join(', ')})`)
+  // One IMS rate per Xero rate: a Xero type carried by two different IMS rates.
+  for (const [code, imsIds] of codeCarriers) {
+    if (imsIds.size > 1) add('XERO_TYPE_ON_TWO_IMS_RATES', null, `Xero type ${code}`, `${imsIds.size} IMS rates`)
   }
 
   const errors = findings.filter((f) => f.severity === 'error').length
@@ -288,9 +289,11 @@ export async function readEuVatPreflightInput(client: Client, seed: EuVatSeed, n
 // The apply
 // ---------------------------------------------------------------------------
 
+export type SeedMappingFacts = { id: string; externalTaxRateId: string; externalCountry: string | null; externalRatePct: string; externalClass: string | null }
 export type SeedChangeIdentity = {
   storeIdentity: string
-  mappingId: string
+  /** Every mapping that names the rate (several WooCommerce rates may share it), in id order, with the store-rate facts the declaration was matched on. */
+  mappings: SeedMappingFacts[]
   name: string
   /** Fraction text, Decimal(5,4). */
   rate: string
@@ -332,8 +335,11 @@ export function planEuVatSeedApply(input: PreflightInput): SeedApplyPlan {
         const live = xeroByType.get(code)
         return { code, xeroName: live?.name ?? '', xeroPercent: (live === undefined ? null : xeroPercent(live))?.toFixed() ?? '' }
       }
+      const facts: SeedMappingFacts = { id: mapping.id, externalTaxRateId: mapping.externalTaxRateId, externalCountry: mapping.externalCountry, externalRatePct: new Dec(mapping.externalRatePct).toFixed(4), externalClass: mapping.externalClass }
+      const existing = changes.find((c) => c.taxRateId === ims.id)
+      if (existing !== undefined) { existing.identity.mappings.push(facts); existing.identity.mappings.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)); continue }
       const identity: SeedChangeIdentity = {
-        storeIdentity: input.storeIdentity, mappingId: mapping.id, name: ims.name, rate: ims.rate, country: ims.countryCode, usedFor: ims.usedFor,
+        storeIdentity: input.storeIdentity, mappings: [facts], name: ims.name, rate: ims.rate, country: ims.countryCode, usedFor: ims.usedFor,
         charged: fact(ims.accountingTaxType ?? ''), scheme: rate.schemePostingTaxType === null ? null : fact(rate.schemePostingTaxType),
       }
       changes.push({ taxRateId: ims.id, imsName: ims.name, wooId: rate.wooId, identity, from, to })
@@ -344,7 +350,7 @@ export function planEuVatSeedApply(input: PreflightInput): SeedApplyPlan {
   return { seedVersion: input.seed.seedVersion, storeIdentity: input.storeIdentity, changes, unchanged, skipped, digest }
 }
 
-export const EU_VAT_SEED_REFUSAL_CODES = ['CONFIRM_REQUIRED', 'XERO_LIST_NOT_PROVEN', 'DIGEST_MISMATCH', 'NOTHING_TO_APPLY', 'RATE_CHANGED_DURING_APPLY', 'RATE_REPLACED'] as const
+export const EU_VAT_SEED_REFUSAL_CODES = ['CONFIRM_REQUIRED', 'XERO_LIST_NOT_PROVEN', 'XERO_CONNECTION_CHANGED', 'DIGEST_MISMATCH', 'NOTHING_TO_APPLY', 'RATE_CHANGED_DURING_APPLY', 'RATE_REPLACED'] as const
 export type EuVatSeedRefusalCode = (typeof EU_VAT_SEED_REFUSAL_CODES)[number]
 export type EuVatSeedApplyResult =
   | { applied: false; plan: SeedApplyPlan; refusal: { code: EuVatSeedRefusalCode; detail: string } | null }
@@ -359,25 +365,45 @@ class SeedRaceError extends Error {}
  * the row lock every editor of a rate takes (lockTaxRateForEdit, which also refuses a rate a re-key replaced), in ascending id order. A row that moved since the plan rolls the whole apply back.
  * It writes IMS only: no Xero call, no WooCommerce call, no mapping, no rate creation, no account setting.
  */
-/** What the run must be told from outside the database: the organisation connected now and the normalised URL of the WooCommerce store configured now (null = none). */
-export type EuVatSeedContext = { connectedTenantId: string | null; storeIdentity: string | null; now?: Date }
+/**
+ * What the run must be told from outside the database: the Xero connection captured BEFORE the plan was read (null = none; its tenant is the organisation the stored list must belong to) and the
+ * normalised URL of the WooCommerce store configured now (null = none).
+ */
+export type EuVatSeedContext = { connection: XeroConnectionStamp | null; storeIdentity: string | null; now?: Date }
 
 /** Read-only: the plan, built from the full snapshot (IMS rows, mappings, the proven stored Xero list). The dry run is this. */
 export async function readEuVatSeedPlan(client: Client, seed: EuVatSeed, ctx: EuVatSeedContext): Promise<SeedApplyPlan> {
-  return planEuVatSeedApply(await readEuVatPreflightInput(client, seed, ctx.now ?? new Date(), ctx.connectedTenantId, ctx.storeIdentity))
+  return planEuVatSeedApply(await readEuVatPreflightInput(client, seed, ctx.now ?? new Date(), ctx.connection?.tenantId ?? null, ctx.storeIdentity))
 }
 
 export async function applyEuVatSeed(db: { $transaction: <T>(fn: (tx: Client) => Promise<T>) => Promise<T> }, seed: EuVatSeed, confirm: string, ctx: EuVatSeedContext): Promise<EuVatSeedApplyResult> {
   const snapshot = (client: Client) => readEuVatSeedPlan(client, seed, ctx)
   if (!DIGEST_RE.test(confirm)) return { applied: false, plan: await db.$transaction((tx) => snapshot(tx)), refusal: { code: 'CONFIRM_REQUIRED', detail: 'an apply needs the exact 64-character digest of the plan the dry run printed' } }
+  // Loaded when an apply runs, not when the module is: the fence module opens the application's database client.
+  const { assertXeroConnectionUnchanged, XeroConnectionChangedError } = await import('@/lib/connectors/xero/connection-fence')
   try {
     return await db.$transaction(async (tx): Promise<EuVatSeedApplyResult> => {
+      // FIRST, before anything is read: the Xero mapping-selection lock, held to commit, and the connection must still be the one the stored list was read for. A rebind of the organisation
+      // cannot interleave with this transaction, so the list the plan was judged against is the list of the organisation connected for the whole write.
+      await assertXeroConnectionUnchanged(tx as never, ctx.connection)
       const plan = await snapshot(tx)
       if (plan.skipped.some((s) => s.reason === 'XERO_LIST_NOT_PROVEN')) return { applied: false, plan, refusal: { code: 'XERO_LIST_NOT_PROVEN', detail: plan.skipped[0]!.detail } }
       if (plan.digest !== confirm) return { applied: false, plan, refusal: { code: 'DIGEST_MISMATCH', detail: 'the plan changed since the dry run (or this is not its digest); run the dry run again' } }
       if (plan.changes.length === 0) return { applied: false, plan, refusal: { code: 'NOTHING_TO_APPLY', detail: 'every declared rate that can be set already is' } }
+      // The rate rows, in ascending id (the order every editor and the re-key use), then the mapping rows that named them.
+      for (const change of plan.changes) await lockTaxRateForEdit(tx, change.taxRateId, { schemePostingTaxType: change.to.schemePostingTaxType, reportingCategory: change.to.reportingCategory })
+      const wanted = plan.changes.flatMap((c) => c.identity.mappings.map((m) => ({ change: c, facts: m }))).sort((a, b) => (a.facts.id < b.facts.id ? -1 : a.facts.id > b.facts.id ? 1 : 0))
+      // Row-locked (FOR SHARE: a writer of a mapping row waits for this commit) and compared on every declared field, so a mapping edited, re-pointed, re-stamped or deleted since the plan was read rolls the whole apply back.
+      const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM shopping_tax_rate_mappings WHERE id = ANY(${wanted.map((w) => w.facts.id)}::text[]) ORDER BY id FOR SHARE`
+      if (locked.length !== wanted.length) throw new SeedRaceError('a storefront mapping the plan rests on was removed since the plan was read')
+      const rows = new Map((await tx.shoppingTaxRateMapping.findMany({ where: { id: { in: wanted.map((w) => w.facts.id) } } })).map((r) => [r.id, r]))
+      for (const { change, facts } of wanted) {
+        const row = rows.get(facts.id)
+        const same = row !== undefined && row.connector === 'woocommerce' && row.externalTaxRateId === facts.externalTaxRateId && row.taxRateId === change.taxRateId && row.storeIdentity === change.identity.storeIdentity
+          && (row.externalCountry ?? null) === facts.externalCountry && row.externalRatePct.toFixed(4) === facts.externalRatePct && (row.externalClass ?? null) === facts.externalClass
+        if (!same) throw new SeedRaceError(`the mapping of Woo rate ${facts.externalTaxRateId} changed since the plan was read`)
+      }
       for (const change of plan.changes) {
-        await lockTaxRateForEdit(tx, change.taxRateId, { schemePostingTaxType: change.to.schemePostingTaxType, reportingCategory: change.to.reportingCategory })
         // Under the row lock: the row must STILL be what the plan judged (identity, charged code, flags) and what it will change from, or the whole apply rolls back.
         const id = change.identity
         const done = await tx.taxRate.updateMany({
@@ -388,13 +414,11 @@ export async function applyEuVatSeed(db: { $transaction: <T>(fn: (tx: Client) =>
           data: { schemePostingTaxType: change.to.schemePostingTaxType, reportingCategory: change.to.reportingCategory },
         })
         if (done.count !== 1) throw new SeedRaceError(`tax rate ${change.taxRateId} changed since the plan was read`)
-        // The mapping that named it must still name it, for the same store (mapping writers do not take the rate row lock).
-        const mapping = await tx.shoppingTaxRateMapping.count({ where: { id: id.mappingId, connector: 'woocommerce', taxRateId: change.taxRateId, storeIdentity: id.storeIdentity } })
-        if (mapping !== 1) throw new SeedRaceError(`the mapping of tax rate ${change.taxRateId} changed since the plan was read`)
       }
       return { applied: true, plan, written: plan.changes.length }
     })
   } catch (error) {
+    if (error instanceof XeroConnectionChangedError) return { applied: false, plan: await db.$transaction((tx) => snapshot(tx)), refusal: { code: 'XERO_CONNECTION_CHANGED', detail: error.message } }
     if (error instanceof SeedRaceError) return { applied: false, plan: await db.$transaction((tx) => snapshot(tx)), refusal: { code: 'RATE_CHANGED_DURING_APPLY', detail: error.message } }
     if (error instanceof TaxRateReplacedError) return { applied: false, plan: await db.$transaction((tx) => snapshot(tx)), refusal: { code: 'RATE_REPLACED', detail: error.message } }
     throw error

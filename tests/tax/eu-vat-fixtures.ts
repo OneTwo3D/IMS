@@ -18,17 +18,28 @@ export const syntheticChargedCode = (wooId: number): string => `TAXC${wooId}`
 
 export type World = { input: PreflightInput; ims: Map<number, PreflightImsRate>; mappings: Map<number, PreflightMapping>; xero: Map<string, NormalisedXeroTaxRate> }
 
+/** One entry per IMS rate: the members of a shared rate map to the same id, and the first entry of the id (its group's first WooCommerce rate) is the one a test edits. */
+function uniqueRates(ims: Map<number, PreflightImsRate>): PreflightImsRate[] {
+  const seen = new Map<string, PreflightImsRate>()
+  for (const rate of ims.values()) if (!seen.has(rate.id)) seen.set(rate.id, rate)
+  return [...seen.values()]
+}
+
 export function perfectWorld(seed: EuVatSeed = loadEuVatSeed()): World {
   const ims = new Map<number, PreflightImsRate>()
   const mappings = new Map<number, PreflightMapping>()
   const xero = new Map<string, NormalisedXeroTaxRate>()
+  const byName = new Map<string, PreflightImsRate>()
   for (const r of seed.rates) {
     const code = r.accountingTaxType ?? syntheticChargedCode(r.wooId)
-    ims.set(r.wooId, {
-      id: `ims-${r.wooId}`, name: r.imsName, rate: (Number(r.ratePercent) / 100).toFixed(4), usedFor: 'SALES', active: true, reverseCharge: false, countryCode: r.country === '' ? null : r.country,
+    // WooCommerce rates declared to be one Xero rate share one IMS rate (ruling Q2, option A): the first of the group stands for it, and `ims` holds that one object for every member.
+    const rate = byName.get(r.imsName) ?? {
+      id: `ims-${r.wooId}`, name: r.imsName, rate: (Number(r.ratePercent) / 100).toFixed(4), usedFor: 'SALES', active: true, reverseCharge: false, countryCode: r.imsCountry,
       accountingTaxType: code, reportingCategory: r.reportingCategory, schemePostingTaxType: r.schemePostingTaxType,
-    })
-    mappings.set(r.wooId, { id: `map-${r.wooId}`, storeIdentity: STORE, externalTaxRateId: String(r.wooId), externalName: r.wooName, externalCountry: r.country === '' ? null : r.country, externalRatePct: r.ratePercent, externalClass: r.wooClass, taxRateId: `ims-${r.wooId}` })
+    }
+    byName.set(r.imsName, rate)
+    ims.set(r.wooId, rate)
+    mappings.set(r.wooId, { id: `map-${r.wooId}`, storeIdentity: STORE, externalTaxRateId: String(r.wooId), externalName: r.wooName, externalCountry: r.country === '' ? null : r.country, externalRatePct: r.ratePercent, externalClass: r.wooClass, taxRateId: rate.id })
     if (!xero.has(code)) xero.set(code, xeroType(code, r.accountingXeroName ?? r.imsName, r.ratePercent))
     if (r.schemePostingTaxType !== null && !xero.has(r.schemePostingTaxType)) xero.set(r.schemePostingTaxType, xeroType(r.schemePostingTaxType, r.schemePostingXeroName!, '0.0000'))
   }
@@ -38,7 +49,7 @@ export function perfectWorld(seed: EuVatSeed = loadEuVatSeed()): World {
     seed,
     storeIdentity: STORE,
     xero: { proven: true, fetchedAt: '2026-11-09T14:00:00.000Z', rows: [...xero.values()] },
-    imsRates: [...ims.values()],
+    imsRates: uniqueRates(ims),
     mappings: [...mappings.values()],
     accounts: seed.accounts.map((a) => ({ code: a.code, name: a.name ?? `Account ${a.code}` })),
     settings,
@@ -50,5 +61,5 @@ export function perfectWorld(seed: EuVatSeed = loadEuVatSeed()): World {
 export function withWorld(mutate: (world: World) => void, seed: EuVatSeed = loadEuVatSeed()): PreflightInput {
   const world = perfectWorld(seed)
   mutate(world)
-  return { ...world.input, imsRates: [...world.ims.values()], mappings: [...world.mappings.values()], xero: { proven: true, fetchedAt: '2026-11-09T14:00:00.000Z', rows: [...world.xero.values()] } }
+  return { ...world.input, imsRates: uniqueRates(world.ims), mappings: [...world.mappings.values()], xero: { proven: true, fetchedAt: '2026-11-09T14:00:00.000Z', rows: [...world.xero.values()] } }
 }

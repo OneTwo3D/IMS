@@ -125,6 +125,13 @@ export const DERIVED_ORG_KEYED_KEYS = [
 ] as const
 
 /** The part of a Prisma transaction client this module uses. */
+/**
+ * A tax rate holds an organisation's Xero tax type in TWO columns: the charged type (accountingTaxType) and, on a rate sold under IOSS or VOEC, the zero-rated type its lines post on
+ * (schemePostingTaxType, e.g. TAX131). Both are that organisation's codes, so both are counted as a mapping and both are cleared when the organisation changes.
+ */
+export type TaxRateTypeHeld = { OR: [{ accountingTaxType: { not: null } }, { schemePostingTaxType: { not: null } }] }
+export const TAX_RATE_TYPE_HELD: TaxRateTypeHeld = { OR: [{ accountingTaxType: { not: null } }, { schemePostingTaxType: { not: null } }] }
+
 export type AccountMappingRebindTx = {
   setting: {
     findUnique(args: { where: { key: string } }): Promise<{ value: string } | null>
@@ -137,8 +144,8 @@ export type AccountMappingRebindTx = {
     findUnique(args: { where: { connector: string }; select: { tenantId: true; tenantName?: true } }): Promise<{ tenantId: string | null; tenantName?: string | null } | null>
   }
   taxRate: {
-    count(args: { where: { accountingTaxType: { not: null } } }): Promise<number>
-    updateMany(args: { where: { accountingTaxType: { not: null } }; data: { accountingTaxType: null } }): Promise<{ count: number }>
+    count(args: { where: TaxRateTypeHeld }): Promise<number>
+    updateMany(args: { where: TaxRateTypeHeld; data: { accountingTaxType: null; schemePostingTaxType: null } }): Promise<{ count: number }>
   }
   taxRateComponent: {
     count(args: { where: { accountingTaxType: { not: null } } }): Promise<number>
@@ -183,7 +190,7 @@ export async function readMappingPresence(tx: AccountMappingRebindTx): Promise<M
   const rows = await tx.setting.findMany({ where: { key: { in: [...XERO_ACCOUNT_MAPPING_KEYS] } } })
   const settingKeys = rows.filter((row) => holdsMapping(row.key, row.value)).map((row) => row.key)
   const [taxRates, taxRateComponents] = await Promise.all([
-    tx.taxRate.count({ where: { accountingTaxType: { not: null } } }),
+    tx.taxRate.count({ where: TAX_RATE_TYPE_HELD }),
     tx.taxRateComponent.count({ where: { accountingTaxType: { not: null } } }),
   ])
   return { settingKeys, taxRates, taxRateComponents, any: settingKeys.length > 0 || taxRates > 0 || taxRateComponents > 0 }
@@ -277,7 +284,7 @@ export async function resetAccountMappingForOrganisationChange(
   // deleting is the clear.
   await tx.setting.deleteMany({ where: { key: { in: [...presence.settingKeys, SYNC_ENABLED_KEY] } } })
   const [taxRates, taxRateComponents] = await Promise.all([
-    tx.taxRate.updateMany({ where: { accountingTaxType: { not: null } }, data: { accountingTaxType: null } }),
+    tx.taxRate.updateMany({ where: TAX_RATE_TYPE_HELD, data: { accountingTaxType: null, schemePostingTaxType: null } }),
     tx.taxRateComponent.updateMany({ where: { accountingTaxType: { not: null } }, data: { accountingTaxType: null } }),
   ])
   await writeStamp(tx, newTenantId)

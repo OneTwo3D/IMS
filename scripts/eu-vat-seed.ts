@@ -49,7 +49,7 @@ async function defaultDeps(): Promise<EuVatSeedDeps> {
       const seed = loadEuVatSeed()
       const connection = await captureXeroConnection()
       const creds = await getWcCredentials().catch(() => null)
-      const ctx = { connectedTenantId: connection?.tenantId ?? null, storeIdentity: creds === null ? null : normaliseStoreIdentity(creds.url) }
+      const ctx = { connection, storeIdentity: creds === null ? null : normaliseStoreIdentity(creds.url) }
       if (apply && confirm !== null) return applyEuVatSeed(db as unknown as Parameters<typeof applyEuVatSeed>[0], seed, confirm, ctx)
       // The dry run: read only.
       const plan = await readEuVatSeedPlan(db as unknown as Parameters<typeof readEuVatSeedPlan>[0], seed, ctx)
