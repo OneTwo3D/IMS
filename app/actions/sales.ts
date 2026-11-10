@@ -1224,7 +1224,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
       await resolveLinesTaxRates(tx, lineData)
       // An erased customer is never linked to a new order (lock + re-read; see lib/domain/erasure/customer-link.ts).
       await lockCustomerForOrderLink(tx, input.customerId)
-      const written = await tx.salesOrder.create({
+      return tx.salesOrder.create({
         data: {
           externalOrderNumber,
           orderNumber,
@@ -1258,18 +1258,19 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
           lines: { create: lineData },
         },
         select: SO_SELECT,
-      })
-      // A LIVE order is invoiced the moment it is created, and nothing downstream can repair an invoice that does not book to the order. So the invoice
-      // that will be queued is built from the rows just written, INSIDE this transaction, and reconciled to the order's total before anything is
-      // committed or allocated: a mismatch throws, the order is rolled back and nothing is saved. (A draft is checked when it is finalised.)
-      if (!input.isDraft) {
-        try {
-          await queueSalesInvoiceForOrder(written.id, { checkOnly: true, client: tx as unknown as typeof db })
-        } catch (checkError) {
-          if (checkError instanceof SalesInvoiceDoesNotReconcileError) throw checkError
+      }).then(async (written) => {
+        // A LIVE order is invoiced the moment it is created, and nothing downstream can repair an invoice that does not book to the order. So the invoice
+        // that will be queued is built from the rows just written, INSIDE this transaction, and reconciled to the order's total before anything is
+        // committed or allocated: a mismatch throws, the order is rolled back and nothing is saved. (A draft is checked when it is finalised.)
+        if (!input.isDraft) {
+          try {
+            await queueSalesInvoiceForOrder(written.id, { checkOnly: true, client: tx as unknown as typeof db })
+          } catch (checkError) {
+            if (checkError instanceof SalesInvoiceDoesNotReconcileError) throw checkError
+          }
         }
-      }
-      return written
+        return written
+      })
     }, STOCK_TX_OPTIONS)
 
     const postCommitWarnings: string[] = []
