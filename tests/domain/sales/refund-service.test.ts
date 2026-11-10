@@ -1683,6 +1683,25 @@ test('the refund header carries the sum of its lines in both columns: 100 lines 
   assert.equal(Number(state.refunds[0].totalBase), sum('totalBase'), 'header base = sum of the line bases')
 })
 
+// [mutation: the row-shape checks run on the filtered rows again]
+test('a negative-quantity, zero-amount row beside a valid row refuses the whole request; nothing is written', async () => {
+  for (const flags of [refundSafeguards({ isInternal: false }), {}]) {
+    const state = baseState()
+    const result = await createSalesOrderRefund(createClient(state), {
+      orderId: 'order-1',
+      lines: [
+        { lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 },
+        { lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: -1, totalBase: 0 },
+      ],
+      reason: 'mixed rows', creditNotePrefix: 'CN-', ...flags,
+    })
+    assert.equal(result.success, false)
+    assert.match(result.success === false ? result.error : '', /quantity must be zero or more/)
+    assert.equal(state.refunds.length, 0)
+    assert.equal(state.refundLines.length, 0)
+  }
+})
+
 test('two lines of the same product cannot lend each other units: a line is refunded only up to its own remaining quantity', async () => {
   const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 20, taxBase: 0 }] })
   state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget A', qty: 1, totalBase: 10, totalForeign: 10 }

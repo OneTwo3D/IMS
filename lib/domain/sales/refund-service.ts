@@ -3654,25 +3654,27 @@ export async function createSalesOrderRefund(
     expectedTaxIdentities?: RefundExpectedTaxIdentity[]
   },
 ): Promise<CreateSalesOrderRefundResult> {
-  // Keep discount lines (negative totalBase, qty 0) which the qty>0/totalBase>0 filter
-  // would otherwise drop — a chargeback mirrors the invoice's order-discount line.
-  const refundLines = input.lines.filter((line) => line.qty > 0 || line.totalBase > 0 || line.lineKind === 'discount')
-  if (!refundLines.length) return { success: false, error: 'Select at least one line to refund' }
+  // THE ROW-SHAPE CHECKS RUN ON THE REQUEST AS SENT, before any filtering: a row the filter below would drop (a negative quantity with no money)
+  // must refuse the whole request, never be silently discarded while the valid rows beside it are recorded.
   // No caller may write a negative or non-numeric quantity.
   {
-    const refusal = invalidQuantityRefusal(refundLines)
+    const refusal = invalidQuantityRefusal(input.lines)
     if (refusal) return { success: false, error: refusal }
   }
   // Shipping and discount rows are money only, for EVERY caller: nothing but a sale line may return stock or move a quantity.
   {
-    const refusal = nonSaleRowRefusal(refundLines)
+    const refusal = nonSaleRowRefusal(input.lines)
     if (refusal) return { success: false, error: refusal }
   }
   // An operator-typed refund carries order lines only: no discount line and no amount attributed to no order line (see publicRefundLineRefusal).
   if (input.deriveSaleLineNetsFromStoredBalance) {
-    const refusal = publicRefundLineRefusal(refundLines)
+    const refusal = publicRefundLineRefusal(input.lines)
     if (refusal) return { success: false, error: refusal }
   }
+  // Keep discount lines (negative totalBase, qty 0) which the qty>0/totalBase>0 filter
+  // would otherwise drop — a chargeback mirrors the invoice's order-discount line.
+  const refundLines = input.lines.filter((line) => line.qty > 0 || line.totalBase > 0 || line.lineKind === 'discount')
+  if (!refundLines.length) return { success: false, error: 'Select at least one line to refund' }
 
   // scjz.70: a chargeback never restocks (customer keeps the goods), so neutralise
   // the return warehouse entirely — this skips the pre-shipment return guard, the
