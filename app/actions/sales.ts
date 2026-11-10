@@ -1676,6 +1676,8 @@ export async function applySalesOrderStatusTransition(
   // `permanent: true` marks a failure a stable business rule refused, so a caller driving this from a
   // retrying transport (the Woo webhook inbox) can acknowledge it instead of retrying forever (o3d-bx9).
 ): Promise<{ success: boolean; error?: string; permanent?: boolean }> {
+  // What a draft finalisation's allocation answered (declared here so the failure path below can report the attempt; reset at the start of every transaction attempt).
+  let finalisationAllocation: Awaited<ReturnType<typeof allocateSalesOrder>> | null = null
   try {
     // INTERNAL_STATUS_TRANSITION_BYPASS skips BOTH the permission check and the
     // state-machine guard — for external systems (WooCommerce) that may
@@ -1887,12 +1889,8 @@ export async function applySalesOrderStatusTransition(
 
     const pushStatusToShopping = ownsStorefrontStatus && so.shoppingLinks.length > 0
     let storefrontCompletionKey: string | null = null
-    // What the draft finalisation's allocation answered (kept out of the transaction callback so a retried callback cannot inherit an aborted attempt's).
-    let finalisationAllocation: Awaited<ReturnType<typeof allocateSalesOrder>> | null = null
     if (!orderUpdated) {
-      let transitionResult: { previousStatus: string }
-      try {
-      transitionResult = await db.$transaction(async (tx) => {
+      const transitionResult = await db.$transaction(async (tx) => {
         storefrontCompletionKey = null // a retried callback must not inherit an aborted attempt's key
         storefrontStatusPush = null
         finalisationAllocation = null
@@ -1988,37 +1986,6 @@ export async function applySalesOrderStatusTransition(
         }
         return moved
       }, STOCK_TX_OPTIONS)
-      } catch (finalisationError) {
-        if (!isDraftFinalization) throw finalisationError
-        const attempted = finalisationAllocation as Awaited<ReturnType<typeof allocateSalesOrder>> | null
-        const activity = attempted ? describeAllocationAttempt(attempted) : null
-        if (activity) await logActivity({ entityType: 'SALES_ORDER', entityId: id, tag: 'sales', ...activity }).catch(() => undefined)
-        if (finalisationError instanceof DraftFinalisationAllocationError) {
-          await logActivity({
-            entityType: 'SALES_ORDER',
-            entityId: id,
-            action: 'draft_finalization_allocation_failed',
-            tag: 'sales',
-            level: 'WARNING',
-            description: `Did not finalise order ${getSalesOrderReference(so)} because stock allocation failed: ${finalisationError.message}`,
-            metadata: { orderNumber: getSalesOrderReference(so), targetStatus, error: finalisationError.message },
-          })
-          return { success: false, error: finalisationError.message }
-        }
-        if (finalisationError instanceof SalesInvoiceDoesNotReconcileError || finalisationError instanceof SalesInvoiceNotQueuedError) {
-          await logActivity({
-            entityType: 'SALES_ORDER',
-            entityId: id,
-            action: 'draft_finalization_accounting_queue_failed',
-            tag: 'accounting',
-            level: 'WARNING',
-            description: `Did not finalise order ${getSalesOrderReference(so)}: its sales invoice could not be queued (${finalisationError.name})`,
-            metadata: { orderNumber: getSalesOrderReference(so), targetStatus, errorName: finalisationError.name },
-          })
-          return { success: false, error: finalisationError.message }
-        }
-        throw finalisationError
-      }
       previousStatusForLog = transitionResult.previousStatus
       orderUpdated = true
       if (isDraftFinalization && finalisationAllocation) {
@@ -2087,6 +2054,25 @@ export async function applySalesOrderStatusTransition(
     return { success: true }
   } catch (e) {
     const errorMessage = e instanceof Error ? e.message : String(e)
+    // A draft finalisation is one transaction: these three mean it rolled back whole (still a draft, nothing allocated, nothing queued).
+    if (e instanceof DraftFinalisationAllocationError || e instanceof SalesInvoiceDoesNotReconcileError || e instanceof SalesInvoiceNotQueuedError) {
+      const attempted = finalisationAllocation as Awaited<ReturnType<typeof allocateSalesOrder>> | null
+      const attempt = attempted ? describeAllocationAttempt(attempted) : null
+      if (attempt) await logActivity({ entityType: 'SALES_ORDER', entityId: id, tag: 'sales', ...attempt }).catch(() => undefined)
+      const allocationFailed = e instanceof DraftFinalisationAllocationError
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: id,
+        action: allocationFailed ? 'draft_finalization_allocation_failed' : 'draft_finalization_accounting_queue_failed',
+        tag: allocationFailed ? 'sales' : 'accounting',
+        level: 'WARNING',
+        description: allocationFailed
+          ? `Did not finalise the order because stock allocation failed: ${errorMessage}`
+          : `Did not finalise the order: its sales invoice could not be queued (${e.name})`,
+        metadata: { targetStatus, error: errorMessage },
+      })
+      return { success: false, error: errorMessage }
+    }
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: id,

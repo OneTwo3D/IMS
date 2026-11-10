@@ -496,7 +496,7 @@ test('SO-H2: a WooCommerce draft flagged inclusive with NO header rate but VAT o
   const r = await updateSalesOrderStatus(woo.id, 'PENDING_PAYMENT')
   assert.equal(r.success, true, r.error)
   // No stock: a product with no stock level anywhere.
-  const bare = (await s.db.product.create({ data: { sku: `AUD-NOSTOCK-${seq}`, name: 'no stock', type: 'SIMPLE' }, select: { id: true } })).id
+  const bare = (await s.db.product.create({ data: { sku: `AUD-NOSTOCK-${seq}`, name: 'no stock', type: 'SIMPLE', oversellAllowed: false }, select: { id: true } })).id
   const draft = await s.db.salesOrder.create({
     data: {
       orderNumber: `NOSTK-${seq}`, customerName: 'None', currency: 'GBP', fxRateToBase: 1, status: 'DRAFT', pricesIncludeVat: false, taxRateName: 'AUD Sales 20', taxRatePercent: '0.2',
