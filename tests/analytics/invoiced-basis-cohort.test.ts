@@ -264,11 +264,12 @@ test('invoicedAt beats paidAt: invoiced 28 Oct and paid 2 Nov is an October orde
 })
 
 test('AR ageing runs from the invoice date, not the order date', async () => {
-  // Created 1 Oct, invoice date (paidAt, no invoicedAt) 2 Nov, part-paid: 60 still owed on 30 Nov, aged 28 days, not 60.
-  const paid = new Date('2026-11-02T09:00:00.000Z')
+  // Created 1 Oct, invoiced 2 Nov, part-paid: 60 still owed on 30 Nov, aged 28 days (1-30 bucket), not 60.
+  // (A paidAt-dated order is settled from that date, so paidAt can never be the ageing date of an open receivable.)
+  const invoiced = new Date('2026-11-02T09:00:00.000Z')
   const order = salesOrder('arage', {
-    invoiceNumber: 'INV-150', createdAt: new Date('2026-10-01T12:00:00.000Z'), paidAt: paid, totalBase: D(100), totalForeign: D(100),
-    payments: [{ amount: D(40), paidAt: paid, refundId: null, currency: 'GBP' }],
+    invoiceNumber: 'INV-150', createdAt: new Date('2026-10-01T12:00:00.000Z'), invoicedAt: invoiced, totalBase: D(100), totalForeign: D(100),
+    payments: [{ amount: D(40), paidAt: invoiced, refundId: null, currency: 'GBP' }],
   })
   const row = (await arReport([order], '2026-11-30')).rows[0]!
   assert.equal(Number(row.outstandingBase), 60)
@@ -291,6 +292,21 @@ test('AR as-of: a payment at exactly midnight after the as-of day is not counted
     payments: [{ amount: D(70), currency: 'GBP', paidAt: new Date('2026-11-01T00:00:00.000Z'), refundId: null }],
   })
   assert.equal(Number((await arReport([order], '2026-10-31')).totals.outstandingBase), 70, 'paid in November, so still owed on 31 Oct')
+})
+
+test('a 100 invoice with a 30 credit is 70 owed in both the Currency Summary and AR Aging (base, and foreign at the booked ratio)', async () => {
+  const gross = { totalBase: D(30), totalsBasis: 'GROSS', lines: [], refundedAt: new Date('2026-10-15T12:00:00.000Z') }
+  const order = salesOrder('cs', {
+    invoiceNumber: 'INV-170', createdAt: new Date('2026-10-10T12:00:00.000Z'), invoicedAt: new Date('2026-10-10T12:00:00.000Z'),
+    currency: 'USD', totalBase: D(100), totalForeign: D(125), payments: [], refunds: [gross],
+  })
+  const client = { salesOrder: { findMany: async (args?: { where?: Row }) => [order].filter((o) => matches(o, args?.where)) }, salesOrderLine: none, payment: none, purchaseInvoice: none, fxRate: none } as FinanceAnalyticsClient
+  const deps = { client, now: () => new Date('2026-10-31T00:00:00.000Z'), baseCurrency: async () => 'GBP' }
+  const summary = await getCurrencySummaryReport({ dateFrom: '2026-10-01', dateTo: '2026-10-31' }, { deps })
+  assert.equal(Number(summary.totals.arOutstandingBase), 70)
+  assert.equal(Number(summary.rows.find((r) => r.currency === 'USD')!.arOutstandingForeign), 87.5, '70 x 125/100')
+  const ar = await arReport([order], '2026-10-31')
+  assert.equal(Number(ar.totals.outstandingBase), 70)
 })
 
 test('an IMS-minted invoice number with no posted invoice is not an invoiced order', () => {

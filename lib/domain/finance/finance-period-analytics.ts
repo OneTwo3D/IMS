@@ -235,7 +235,8 @@ type SalesOrderCurrencyRow = {
   totalForeign: DecimalInput
   totalBase: DecimalInput
   paidAt: Date | null
-  payments: Array<{ amount: DecimalInput; currency: string; paidAt: Date; refundId: string | null }>
+  payments: Array<{ amount: DecimalInput; currency: string; paidAt: Date; refundId: string | null; settlementRateToBase?: DecimalInput | null }>
+  refunds?: Array<TurnoverRefund & { refundedAt?: Date | null }>
 }
 
 type PurchaseInvoiceAgingRow = {
@@ -903,7 +904,8 @@ export async function getCurrencySummaryReport(
         totalBase: true,
         invoicedAt: true,
         paidAt: true,
-        payments: { select: { amount: true, currency: true, paidAt: true, refundId: true } },
+        payments: { select: { amount: true, currency: true, paidAt: true, refundId: true, settlementRateToBase: true } },
+        refunds: { where: { refundedAt: { lt: window.dateToExclusive } }, select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
       },
       take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<SalesOrderCurrencyRow[]>,
@@ -966,15 +968,14 @@ export async function getCurrencySummaryReport(
     const totalBase = toDecimal(order.totalBase)
     row.salesForeign = row.salesForeign.add(totalForeign)
     row.salesBase = row.salesBase.add(totalBase)
-    const paidForeign = order.payments
-      .filter((payment) => payment.refundId == null && payment.currency === row.currency)
-      .reduce((sum, payment) => sum.add(toDecimal(payment.amount)), new Prisma.Decimal(0))
-    const outstandingForeign = Prisma.Decimal.max(new Prisma.Decimal(0), totalForeign.sub(paidForeign))
-    if (!order.paidAt && outstandingForeign.gt(0)) {
-      row.arOutstandingForeign = row.arOutstandingForeign.add(outstandingForeign)
-      row.arOutstandingBase = row.arOutstandingBase.add(
-        totalForeign.gt(0) ? totalBase.mul(outstandingForeign).div(totalForeign) : new Prisma.Decimal(0),
-      )
+    // Receivable at the end of the window, by the ONE arithmetic every receivables screen uses (receivable-balance.ts).
+    // The base figure is that balance. The foreign figure is derived from it with one stated rule: the base
+    // balance times the order's booked foreign/base ratio (totalForeign / totalBase).
+    const result = receivableBalance(order, new Date(window.dateToExclusive.getTime() - 1))
+    if (result.status === 'outstanding') {
+      const balance = toDecimal(result.balance)
+      row.arOutstandingBase = row.arOutstandingBase.add(balance)
+      row.arOutstandingForeign = row.arOutstandingForeign.add(totalBase.gt(0) ? balance.mul(totalForeign).div(totalBase) : new Prisma.Decimal(0))
     }
   }
 

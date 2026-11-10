@@ -19,9 +19,15 @@ import { refundCreditsAsGross, type TurnoverBound, type TurnoverRefund } from '@
  *    totalForeign) when the payment is in the order's currency. A payment in another currency with
  *    no settlement rate cannot be converted: it is counted at the booked rate and `bound` becomes
  *    `indeterminate`.
- *  - HELD AS PAID: when `paidAt` is on or before `asOf` and there is no customer payment row on or
- *    before it, receipts start from `invoiceGross` (settled with no local receipt: markSalesOrderPaid
- *    and the importer set paidAt without a Payment row), then cash paid out is subtracted as usual.
+ *    DIRECTION OF THE RATE: `Payment.settlementRateToBase` is "1 base = X receipt currency" (schema
+ *    comment on the column), i.e. FOREIGN units per ONE BASE unit, and lib/accounting-fx.ts converts
+ *    with `amountForeign / settlementRate`. So base = amount / rate: $100 at 1.25 is 80, not 125.
+ *  - HELD AS PAID: when `paidAt` is on or before `asOf` the order is settled. markSalesOrderPaid and the
+ *    importer set `paidAt` with no (or only a part) Payment row, and nothing stored says whether a
+ *    receipt is missing or the paid state was set off-ledger (`unregisteredPaidAt` records only that no
+ *    LEDGER receipt is registered), so the uncovered remainder is treated as received off-ledger at
+ *    `paidAt`: receipts = max(customer receipts in base, invoiceGross). Cash paid out is then
+ *    subtracted as usual, and an over-payment stays an over-payment.
  *
  * `balance > 0.01` is a receivable, `balance < -0.01` a customer credit balance, otherwise settled.
  * A payment, refund or credit with no date counts as already happened (real rows always have one).
@@ -72,7 +78,7 @@ export function receivableBalance(order: ReceivableOrder, asOf: Date): Receivabl
   const toBase = (p: ReceivablePayment): number => {
     const amount = Number(p.amount)
     const settlement = p.settlementRateToBase == null ? NaN : Number(p.settlementRateToBase)
-    if (Number.isFinite(settlement) && settlement > 0) return amount * settlement
+    if (Number.isFinite(settlement) && settlement > 0) return amount / settlement
     if (p.currency && order.currency && p.currency !== order.currency) bound = 'indeterminate'
     return amount * bookedRate
   }
@@ -82,7 +88,7 @@ export function receivableBalance(order: ReceivableOrder, asOf: Date): Receivabl
   const cashOut = inRange.filter((p) => p.refundId != null)
 
   let receipts = customerPayments.reduce((sum, p) => sum + toBase(p), 0)
-  if (customerPayments.length === 0 && order.paidAt != null && onOrBefore(order.paidAt)) receipts = invoiceGross
+  if (order.paidAt != null && onOrBefore(order.paidAt)) receipts = Math.max(receipts, invoiceGross)
   receipts -= cashOut.reduce((sum, p) => sum + Math.abs(toBase(p)), 0)
 
   const balance = round2(invoiceGross - creditResult.credit - receipts)
