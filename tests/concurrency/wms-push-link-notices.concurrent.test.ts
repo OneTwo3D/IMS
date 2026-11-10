@@ -175,3 +175,25 @@ test('REAL DISPATCH DEPS: a despatch is NEVER applied to an order IMS has cancel
   assert.equal((await d.db.salesOrder.findUniqueOrThrow({ where: { id: s.orderId } })).status, 'CANCELLED')
   assert.equal(await d.db.shipment.count({ where: { orderId: s.orderId } }), 0)
 })
+
+test('REAL PORT: every link the cancel pass notices is listed by the inbox predicate - including a FULLY REFUNDED, still-active order', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `inb${randomUUID().slice(0, 8)}`
+  const refunded = await seed(d, `${tag}r`, 'PROCESSING')
+  const plain = await seed(d, `${tag}p`, 'PROCESSING')
+  const cancelled = await seed(d, `${tag}c`, 'CANCELLED')
+  t.after(async () => { for (const s of [refunded, plain, cancelled]) await cleanup(d, s) })
+  await d.db.salesOrder.update({ where: { id: refunded.orderId }, data: { refundStatus: 'FULL' } })
+  const base = { connector: 'mintsoft', state: 'SYNCED' as const, externalOrderNumber: 'MS-I', cancelNoticeAt: new Date() }
+  await d.db.wmsOrderPushLink.create({ data: { ...base, orderId: refunded.orderId, externalOrderId: 'i-1' } })
+  await d.db.wmsOrderPushLink.create({ data: { ...base, orderId: plain.orderId, externalOrderId: 'i-2' } })
+  await d.db.wmsOrderPushLink.create({ data: { ...base, orderId: cancelled.orderId, externalOrderId: 'i-3' } })
+  const noticed = await d.db.wmsOrderPushLink.findMany({
+    where: { orderId: { in: [refunded.orderId, plain.orderId, cancelled.orderId] }, cancelNoticeAt: { not: null }, order: d.sweep.WMS_CANCELLABLE_ORDER_WHERE },
+    select: { orderId: true },
+  })
+  assert.deepEqual(noticed.map((l) => l.orderId).sort(), [refunded.orderId, cancelled.orderId].sort(), 'the plain active order is not cancellable, so never noticed')
+  // ...and the cancel pass selects exactly the same orders.
+  const cancellable = (await d.sweep.createPrismaWmsOrderPushPort().cancellableLinks('mintsoft', 500)).filter((l) => [refunded.orderId, plain.orderId, cancelled.orderId].includes(l.orderId))
+  assert.equal(cancellable.length, 0, 'already noticed, so the pass does not retry them')
+})

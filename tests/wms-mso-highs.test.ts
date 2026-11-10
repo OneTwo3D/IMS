@@ -7,6 +7,8 @@ import {
   type WmsPushCandidate,
   type WmsPushLinkRef,
 } from '../lib/domain/wms/order-push-sweep.ts'
+import { runWmsDispatchSweepCore, type WmsDispatchSweepDeps } from '../lib/domain/wms/dispatch-sweep.ts'
+import type { WmsOrderPart, WmsOrderStatus } from '../lib/connectors/wms/types.ts'
 import type { WmsAmbiguousCreateResolution, WmsOrderCancelResult, WmsOrderPushInput, WmsOrderPushResult } from '../lib/connectors/wms/types.ts'
 import type { WmsMutationEventInput } from '../lib/domain/wms/mutation-audit.ts'
 
@@ -38,6 +40,8 @@ type Seed = {
   cancellable?: WmsPushLinkRef[]
   /** The Nth (1-based) upsertByOrder call throws, as a database fault between the remote create and the writeback would. */
   failUpsertCall?: number
+  /** The link as it is NOW, for the conditional notice write: a link that moved on since it was read matches nothing. */
+  linkNow?: { state: string; externalOrderId: string }
 }
 
 function makePort(seed: Seed) {
@@ -64,6 +68,15 @@ function makePort(seed: Seed) {
     },
     updateLink: async (id, data) => { updates.push({ id, data }) },
     updateLinkIfState: async (id, fromState, data) => { updates.push({ id, data, ifState: fromState }); return true },
+    ...(seed.linkNow
+      ? {
+        updateLinkIfLinked: async (id: string, expect: { state: string; externalOrderId: string }, data: Record<string, unknown>) => {
+          if (seed.linkNow!.state !== expect.state || seed.linkNow!.externalOrderId !== expect.externalOrderId) return false
+          updates.push({ id, data })
+          return true
+        },
+      }
+      : {}),
     recordEvent: async (event) => { events.push(event) },
   }
   return { port, upserts, updates, events }
@@ -282,4 +295,117 @@ test('H4/H2: a live link carrying a hold or cancel notice reaches the inbox as w
   // A dead letter that carries an id is still the unverified-link row it always was.
   const dead = buildBlockedWmsPushRow({ ...base, state: 'DEAD_LETTER' })
   assert.equal(dead.why, 'Linked, unverified')
+})
+
+// ---------------------------------------------------------------- review round: cancelled split, inbox predicate, stale notice ----
+
+const dstatus = (partial: Partial<WmsOrderStatus>): WmsOrderStatus => ({
+  externalOrderId: 'M-1', externalOrderNumber: 'WC-1001', status: 'DESPATCHED', statusLabel: 'Despatched', isSplit: false, partCount: null, isMerged: false,
+  mergedOrderNumbers: [], deepLinkUrl: null, tracking: [{ trackingNumber: 'TN1', carrier: 'DPD', despatchedAt: '2026-08-19T10:00:00Z' }], dispatched: true, raw: null,
+  ...partial,
+})
+const dpart = (partial: Partial<WmsOrderPart>): WmsOrderPart => ({ externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', dispatched: true, tracking: [], ...partial })
+function dispatchDeps(overrides: Partial<WmsDispatchSweepDeps>): WmsDispatchSweepDeps {
+  return {
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+    fetchOrderStatus: async () => null,
+    applyDispatch: async () => ({ success: true }),
+    partsSupported: true,
+    fetchOrderParts: async () => [],
+    fetchPartItems: async () => [],
+    pushPartialShipment: async () => ({ ok: true }),
+    repointLink: async () => {},
+    recordDispatchError: async () => ({ deadLettered: false }),
+    clearDispatchFailures: async () => {},
+    countLinksByOrderNumber: async (numbers) => new Map(numbers.map((n) => [n, 1])),
+    ...overrides,
+  }
+}
+
+test('R1: a despatched SPLIT order IMS has cancelled makes NO partial-shipment (storefront) call and no apply: it is a dispatch error', async () => {
+  const partials: string[] = []
+  const applied: string[] = []
+  const errors: string[] = []
+  const { counters } = await runWmsDispatchSweepCore(dispatchDeps({
+    fetchOrderStatus: async () => dstatus({ isSplit: true, partCount: 2 }),
+    fetchOrderParts: async () => [dpart({ externalId: 'a', partNumber: 1 }), dpart({ externalId: 'b', partNumber: 2, dispatched: false })],
+    fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+    pushPartialShipment: async (orderId) => { partials.push(orderId); return { ok: true } },
+    applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
+    orderCancelledInIms: async () => true,
+    recordDispatchError: async (_c, reason) => { errors.push(reason); return { deadLettered: false } },
+  }))
+  assert.deepEqual(partials, [], 'no WooCommerce write for a cancelled order')
+  assert.deepEqual(applied, [])
+  assert.equal(counters.errors, 1)
+  assert.match(errors[0], /after IMS cancelled it/)
+})
+
+test('R1: a cancelled order that is not despatched stays pending (no error, no write)', async () => {
+  const partials: string[] = []
+  const { counters } = await runWmsDispatchSweepCore(dispatchDeps({
+    fetchOrderStatus: async () => dstatus({ isSplit: true, partCount: 2, dispatched: false, status: 'PICKED' }),
+    fetchOrderParts: async () => [dpart({ dispatched: false }), dpart({ externalId: 'b', partNumber: 2, dispatched: false })],
+    pushPartialShipment: async (orderId) => { partials.push(orderId); return { ok: true } },
+    orderCancelledInIms: async () => true,
+  }))
+  assert.deepEqual(partials, [])
+  assert.equal(counters.errors, 0)
+  assert.equal(counters.pending, 1)
+})
+
+test('R1 control: the same split order for a live (not cancelled) IMS order still pushes its parts', async () => {
+  const partials: string[] = []
+  await runWmsDispatchSweepCore(dispatchDeps({
+    fetchOrderStatus: async () => dstatus({ isSplit: true, partCount: 2 }),
+    fetchOrderParts: async () => [dpart({ externalId: 'a', partNumber: 1 }), dpart({ externalId: 'b', partNumber: 2 })],
+    fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+    pushPartialShipment: async (orderId) => { partials.push(orderId); return { ok: true } },
+    orderCancelledInIms: async () => false,
+  }))
+  assert.ok(partials.length >= 1)
+})
+
+test('R3: a notice is written only while the link is still the state and warehouse order that was read', async () => {
+  const stale = makePort({
+    cancellable: [{ id: 'link-1', orderId: 'so-2', externalOrderId: 'old-1' }],
+    linkNow: { state: 'MERGED', externalOrderId: 'survivor-9' },
+  })
+  const wms = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), comments: [] })
+  const r = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', stale.port, { now: NOW }))
+  assert.equal(r.operatorNotices, undefined, 'the link was re-pointed between the read and the write: nothing is recorded')
+  assert.deepEqual(stale.updates, [])
+  const live = makePort({
+    cancellable: [{ id: 'link-1', orderId: 'so-2', externalOrderId: 'old-1' }],
+    linkNow: { state: 'SYNCED', externalOrderId: 'old-1' },
+  })
+  const r2 = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', live.port, { now: NOW }))
+  assert.equal(r2.operatorNotices, 1)
+})
+
+test('R3: NOT_FOUND, then the dispatch sweep re-points the link to the survivor: the old notice is cleared so the survivor is judged afresh', async () => {
+  // The re-point is the real dispatch dependency; this pins that it writes both notice columns to null.
+  const source = (await import('node:fs')).readFileSync(new URL('../lib/domain/wms/dispatch-sweep.ts', import.meta.url), 'utf8')
+  const repoint = source.slice(source.indexOf('async repointLink('), source.indexOf('async screenWithdrawnOrders'))
+  assert.match(repoint, /holdNoticeAt: null/)
+  assert.match(repoint, /cancelNoticeAt: null/)
+})
+
+test('R4: the warehouse note and the notice texts carry no status or error text from the warehouse', async () => {
+  const comments: Array<{ externalOrderId: string; comment: string }> = []
+  const { port, updates } = makePort({ holdable: [{ id: 'link-1', orderId: 'so-3', externalOrderId: 'wms-3' }] })
+  const wms = connector({ cancelOrder: async () => ({ cancelled: false, status: 'ZZ-SENTINEL-STATUS' }), comments })
+  await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
+  assert.equal(comments.length, 1)
+  assert.equal(comments[0].comment.includes('ZZ-SENTINEL-STATUS'), false)
+  assert.equal(updates.length, 1)
+})
+
+test('R2: the exception inbox lists a cancel notice by the cancel pass\'s OWN order predicate, not a copy of it', async () => {
+  const { readFileSync } = await import('node:fs')
+  const inbox = readFileSync(new URL('../app/actions/sync-exceptions.ts', import.meta.url), 'utf8')
+  assert.match(inbox, /cancelNoticeAt: \{ not: null \}, order: WMS_CANCELLABLE_ORDER_WHERE/)
+  assert.doesNotMatch(inbox, /cancelNoticeAt: \{ not: null \}, order: \{ status: 'CANCELLED'/)
+  const sweep = readFileSync(new URL('../lib/domain/wms/order-push-sweep.ts', import.meta.url), 'utf8')
+  assert.match(sweep, /order: WMS_CANCELLABLE_ORDER_WHERE,/, 'and the port selects on the same constant')
 })

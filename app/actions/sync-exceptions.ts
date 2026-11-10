@@ -28,7 +28,7 @@ import {
   decideWmsMissingRepush,
 } from '@/lib/domain/wms/push-recovery-affordance'
 import { wmsCreateIneligibleRefusal } from '@/lib/domain/wms/create-eligibility'
-import { isWmsCreateEligibleForUpdate, wmsCreateEligibleOrderIds, wmsPushOrderReference } from '@/lib/domain/wms/order-push-sweep'
+import { isWmsCreateEligibleForUpdate, wmsCreateEligibleOrderIds, wmsPushOrderReference, WMS_CANCELLABLE_ORDER_WHERE } from '@/lib/domain/wms/order-push-sweep'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugins'
 import {
   buildFollowUpObligationBacklogOrderBy,
@@ -368,7 +368,7 @@ const BLOCKED_WMS_PUSH_STATES = ['DEAD_LETTER', 'VALIDATION_FAILED', 'AMBIGUOUS_
  * Links that are LIVE but carry an operator notice: IMS asked the warehouse to hold / cancel the order and it could not (already past
  * NEW, not found, a merged survivor). They stay SYNCED/MERGED so a despatch is still recorded, which is exactly why they are not in
  * BLOCKED_WMS_PUSH_STATES and need their own clause here. A hold notice matters only while the order is still ON_HOLD; a cancel notice
- * until the dispatch sweep has parked or quarantined the link (those have their own sections). NOT EXPORTED: 'use server' module.
+ * (the cancel pass's own order predicate, shared) until the dispatch sweep has parked or quarantined the link (those have their own sections). NOT EXPORTED: 'use server' module.
  */
 const WMS_PUSH_NOTICE_WHERE = {
   state: { in: ['SYNCED', 'MERGED'] as Array<'SYNCED' | 'MERGED'> },
@@ -376,7 +376,7 @@ const WMS_PUSH_NOTICE_WHERE = {
   dispatchUnresolvedAt: null,
   OR: [
     { holdNoticeAt: { not: null }, order: { status: 'ON_HOLD' as const } },
-    { cancelNoticeAt: { not: null }, order: { status: 'CANCELLED' as const } },
+    { cancelNoticeAt: { not: null }, order: WMS_CANCELLABLE_ORDER_WHERE },
   ],
 }
 const WMS_PUSH_INBOX_WHERE = { OR: [{ state: { in: [...BLOCKED_WMS_PUSH_STATES] } }, WMS_PUSH_NOTICE_WHERE] }

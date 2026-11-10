@@ -805,6 +805,19 @@ export type WmsPushRevalidateLink = {
  */
 export type WmsPushAmbiguousCreateLink = WmsPushRevalidateLink
 
+/**
+ * Which ORDERS the cancel pass pulls from the warehouse: cancelled in IMS, or fully refunded and not yet despatched. ONE definition:
+ * the pass selects on it and the exception inbox lists a cancel notice by it, so a link the pass has noticed is always listed.
+ */
+export const WMS_CANCELLABLE_ORDER_WHERE = {
+  OR: [
+    { status: 'CANCELLED' as const },
+    // A fully-refunded order that has not yet dispatched must be pulled from the WMS too; it keeps its lifecycle status under the
+    // orthogonal refund model, so refundStatus (not status) is what flags it for cancellation.
+    { refundStatus: 'FULL' as const, status: { notIn: [...POST_DISPATCH_STATUSES, 'CANCELLED' as const] } },
+  ],
+}
+
 export type WmsPushLinkRef = {
   id: string
   orderId: string
@@ -989,6 +1002,13 @@ export interface WmsOrderPushPort {
   updateLinkByOrder?(orderId: string, data: LinkWrite): Promise<void>
   updateLink(id: string, data: LinkWrite): Promise<void>
   /**
+   * Apply `data` ONLY while the link is still in `state` AND still points at `externalOrderId`; false when it has moved on (re-pointed
+   * at a merged survivor, released, re-created). A notice is a statement about ONE warehouse order, so it is written under that
+   * predicate and a stale one can never land on a link that now means something else. Optional so existing test ports keep
+   * compiling; when absent the write is the plain `updateLink`.
+   */
+  updateLinkIfLinked?(id: string, expect: { state: PushState; externalOrderId: string }, data: LinkWrite): Promise<boolean>
+  /**
    * o3d-2k5r r2 — apply `data` ONLY while the link is still in `fromState`; false when it has
    * moved on. The convention already exists in order-reconcile-sweep (its per-attempt CAS), and
    * it exists for this reason.
@@ -1159,23 +1179,31 @@ export async function runWmsOrderPushSweepCore(
     link: WmsPushLinkRef,
     intent: 'HOLD' | 'CANCEL',
     reason: string,
-    detail: { wmsStatus: string; summary: string; comment: string | null },
+    spec: { wmsStatus: string; summary: string; comment: string | null },
     ts: Date,
   ) => {
-    await port.updateLink(link.id, {
+    const noticeWrite = {
       ...(intent === 'HOLD' ? { holdNoticeAt: ts } : { cancelNoticeAt: ts }),
       lastError: reason,
       lastAttemptAt: ts,
-    })
+    }
+    if (port.updateLinkIfLinked && link.externalOrderId) {
+      // The link moved on since it was read (re-pointed at a merged survivor, released, re-created): this statement is about an order it
+      // no longer names, so nothing is written, counted, audited or posted. The next sweep judges the link as it now is.
+      const written = await port.updateLinkIfLinked(link.id, { state: link.state ?? 'SYNCED', externalOrderId: link.externalOrderId }, noticeWrite)
+      if (!written) return
+    } else {
+      await port.updateLink(link.id, noticeWrite)
+    }
     operatorNoticeCount += 1
     await audit({
       action: intent === 'HOLD' ? 'order_hold' : 'order_cancel', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
-      summary: detail.summary,
+      summary: spec.summary,
       before: { state: link.state ?? 'SYNCED', externalOrderId: link.externalOrderId },
-      after: { state: link.state ?? 'SYNCED', wmsStatus: detail.wmsStatus, operatorNotice: intent },
+      after: { state: link.state ?? 'SYNCED', wmsStatus: spec.wmsStatus, operatorNotice: intent },
       error: reason,
     })
-    if (detail.comment && link.externalOrderId) await postConflictComment(link.externalOrderId, detail.comment, link.orderId)
+    if (spec.comment && link.externalOrderId) await postConflictComment(link.externalOrderId, spec.comment, link.orderId)
   }
 
   /**
@@ -2761,7 +2789,7 @@ export async function runWmsOrderPushSweepCore(
             {
               wmsStatus: cancel.status,
               summary: 'IMS hold could not cancel the WMS order (past NEW) — link kept live, operator notified',
-              comment: `IMS: This order has been placed ON HOLD in IMS but is already being fulfilled here (status ${cancel.status}) and could not be auto-cancelled. Please pause it if possible, or raise a cancellation query.`,
+              comment: 'IMS: This order has been placed ON HOLD in IMS but is already being fulfilled here and could not be auto-cancelled. Please pause it if possible, or raise a cancellation query.',
             }, ts)
         }
       } catch (error) {
@@ -2838,7 +2866,7 @@ export async function runWmsOrderPushSweepCore(
             {
               wmsStatus: cancel.status,
               summary: 'IMS cancel could not cancel the WMS order (past NEW) — link kept live, operator notified',
-              comment: `IMS: This order has been cancelled / fully refunded in IMS but is already being fulfilled here (status ${cancel.status}) and could not be auto-cancelled. Please raise a cancellation query.`,
+              comment: 'IMS: This order has been cancelled / fully refunded in IMS but is already being fulfilled here and could not be auto-cancelled. Please raise a cancellation query.',
             }, ts)
         }
       } catch (error) {
@@ -3344,15 +3372,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           state: { in: ['SYNCED', 'MERGED'] },
           cancelNoticeAt: null,
           externalOrderId: { not: null },
-          order: {
-            OR: [
-              { status: 'CANCELLED' },
-              // A fully-refunded order that has not yet dispatched must be pulled from the
-              // WMS too; it keeps its lifecycle status under the orthogonal refund model,
-              // so refundStatus (not status) is what flags it for cancellation.
-              { refundStatus: 'FULL', status: { notIn: [...POST_DISPATCH_STATUSES, 'CANCELLED'] } },
-            ],
-          },
+          order: WMS_CANCELLABLE_ORDER_WHERE,
         },
         select: { id: true, orderId: true, externalOrderId: true, state: true },
         take: limit,
@@ -3400,6 +3420,13 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     async updateLinkIfCreateClaimOwned(orderId, stamp, data) {
       const { count } = await db.wmsOrderPushLink.updateMany({
         where: { orderId, state: 'PENDING_CREATE', lastAttemptAt: stamp },
+        data,
+      })
+      return count > 0
+    },
+    async updateLinkIfLinked(id, expect, data) {
+      const { count } = await db.wmsOrderPushLink.updateMany({
+        where: { id, state: expect.state as never, externalOrderId: expect.externalOrderId },
         data,
       })
       return count > 0

@@ -55,7 +55,7 @@ const WRITERS: Record<string, Record<string, number>> = {
   wmsOrderStatusSnapshot: { 'lib/domain/wms/order-status-sweep.ts': 3 },
   wmsOrderPushLink: {
     'app/actions/sync-exceptions.ts': 6, 'app/actions/wms-order-push.ts': 2, 'lib/domain/outbound-shadow/retire-held-backlog.ts': 1,
-    'lib/domain/wms/dispatch-sweep.ts': 10, 'lib/domain/wms/order-push-sweep.ts': 8, 'lib/domain/wms/order-reconcile-sweep.ts': 1,
+    'lib/domain/wms/dispatch-sweep.ts': 10, 'lib/domain/wms/order-push-sweep.ts': 9, 'lib/domain/wms/order-reconcile-sweep.ts': 1,
   },
   wmsOrderDiscrepancy: { 'app/actions/sync-exceptions.ts': 2, 'lib/domain/wms/order-reconcile-sweep.ts': 11 },
   wmsReturnsInbox: { 'app/actions/mintsoft-sync.ts': 2, 'lib/connectors/mintsoft/sync/returns-sync.ts': 1 },

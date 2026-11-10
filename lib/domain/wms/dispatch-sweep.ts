@@ -128,6 +128,12 @@ export const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CAN
  * cancel notice (the warehouse could not honour the cancel, so the goods may still ship). The second arm exists so that a despatch
  * after an IMS cancel is SEEN and raised for a person; `applyDispatch` never applies it to the cancelled order.
  */
+/** What a person is told when the warehouse despatched an order IMS had cancelled. Fixed wording: no caught error text. */
+export function cancelledOrderDespatchedReason(orderNumber: string | null | undefined): string {
+  return `The warehouse despatched order ${orderNumber ?? 'unknown'} after IMS cancelled it, so IMS has not recorded the shipment. `
+    + 'The goods and the order need a decision from a person with the warehouse.'
+}
+
 export const DISPATCH_POLLED_ORDER_WHERE = [
   { order: { status: { notIn: [...POST_DISPATCH_STATUSES] } } },
   { cancelNoticeAt: { not: null }, order: { status: 'CANCELLED' as const } },
@@ -463,6 +469,11 @@ export type WmsDispatchSweepDeps = {
   // false, a split order is surfaced as a clear "unsupported" pending rather than silently
   // stalling as "no parts visible".
   partsSupported: boolean
+  /**
+   * Is this IMS order CANCELLED? A despatch is never applied to a cancelled order, and nothing is written for one (no split-part
+   * storefront push, no shipment): reconcileOneOrder asks BEFORE the split and dispatched branches. Absent: not asked.
+   */
+  orderCancelledInIms?(orderId: string): Promise<boolean>
   // Split-order reconciliation: fetch every part, its line items, and push each despatched
   // part to the storefront as a partial shipment.
   fetchOrderParts(orderNumber: string): Promise<import('@/lib/connectors/wms/types').WmsOrderPart[]>
@@ -1209,6 +1220,22 @@ export async function reconcileOneOrder(
     })
   }
   const effectiveOrderNumber = status.externalOrderNumber || candidate.externalOrderNumber
+
+  // AN ORDER IMS HAS CANCELLED IS NEVER FULFILLED FROM HERE, and nothing is written for it. This sits ahead of the split branch on
+  // purpose: a split order pushes each despatched part to the storefront (a WooCommerce write) before anything else can refuse it.
+  // Only READS happen below this line for a cancelled order. A despatch (any part of a split) is an error for a person, which is the
+  // ordinary dispatch failure path; an order not yet despatched stays pending.
+  if (deps.orderCancelledInIms && (!status.isSplit || deps.partsSupported) && await deps.orderCancelledInIms(candidate.orderId)) {
+    const despatched = status.isSplit
+      ? status.dispatched || (await deps.fetchOrderParts(effectiveOrderNumber)).some((part) => part.dispatched)
+      : status.dispatched
+    if (despatched) return { action: 'error', reason: cancelledOrderDespatchedReason(null) }
+    return {
+      action: 'pending',
+      reason: `Cancelled in IMS; not dispatched (status ${status.status || 'Unknown'})`,
+      unresolved: requireResolution && !dispatchStateEstablished(status),
+    }
+  }
 
   // A split order's primary row can read dispatched while only some parts have shipped (or
   // the reverse), so handle split BEFORE the dispatched gate and reconcile per part.
@@ -2732,8 +2759,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       if (orderBefore?.status === 'CANCELLED') {
         return {
           success: false,
-          error: `The warehouse despatched order ${orderBefore.orderNumber ?? orderId} after IMS cancelled it. IMS has not recorded the shipment: `
-            + 'decide with the warehouse whether the goods are recalled or the order is reinstated, then record it by hand.',
+          error: cancelledOrderDespatchedReason(orderBefore.orderNumber ?? orderId),
           refusal: 'shipment_status_transition_failed',
           permanent: false,
         }
@@ -2758,6 +2784,9 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       return result
     },
     partsSupported: Boolean(connector.fetchOrderParts),
+    async orderCancelledInIms(orderId) {
+      return (await db.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } }))?.status === 'CANCELLED'
+    },
     fetchOrderParts(orderNumber) {
       return connector.fetchOrderParts ? connector.fetchOrderParts(orderNumber) : Promise.resolve([])
     },
@@ -2800,6 +2829,10 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           dispatchUnresolvedAt: null,
           // The survivor is a DIFFERENT WMS order — reconcile recency resets too.
           reconcileCheckedAt: null,
+          // A hold / cancel notice was a statement about the OLD order (a 404 there is exactly what a merge looks like). Cleared, so the
+          // hold and cancel passes judge the survivor afresh and raise the MERGED notice for it.
+          holdNoticeAt: null,
+          cancelNoticeAt: null,
         },
       })
     },
