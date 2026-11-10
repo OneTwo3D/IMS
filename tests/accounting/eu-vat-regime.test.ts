@@ -357,7 +357,7 @@ test('adopt: the value test is a cross-check that warns on disagreement and neve
   const agree = resolveEuVatRegime(adopt({ pluginVatAccount: '821' }))
   assert.ok(!warningCodes(agree).includes('adopted_regime_differs'))
   // 149.00 is inside the band: decide mode warns, adopt mode does not.
-  const nearEdge = { goodsLines: [{ total: '149.00', voucher: 'no' }] }
+  const nearEdge: Partial<EuVatRegimeInput> = { goodsLines: [{ total: '149.00', voucher: 'no' }] }
   assert.ok(warningCodes(resolveEuVatRegime(order(nearEdge))).includes('threshold_band'))
   assert.ok(!warningCodes(resolveEuVatRegime(adopt(nearEdge))).includes('threshold_band'))
 })
