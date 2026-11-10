@@ -509,3 +509,37 @@ test('[eu vat] the order changes AFTER the first verification and BEFORE the rel
   assert.match(after.errorMessage ?? '', /the order changed after it was held \(.*stamped DDP on account 232.*\) and needs its invoice rebuilt/)
   assert.deepEqual(((after.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment), { applied: false, reason: 'order_changed' })
 })
+
+test('[eu vat] a SWEEP that read the hold, then a re-import that marks it order_changed under the lock, then the sweep\'s release: nothing is queued', { skip }, async (t) => {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = true
+  const { importWcOrder, retryHeldWcSalesInvoiceReleases } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seed(db, wcRateId)
+  t.after(async () => { switchOn = false; betweenHook.armed = false; betweenHook.verified = false; betweenHook.run = null; await cleanup(db, externalId, ctx) })
+  assert.equal((await importWcOrder(payload(externalId, wcRateId, PLUGIN('821')) as never)).success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  assert.equal(((held.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment as { applied: boolean }).applied, true)
+  // The order now has its number, so the sweep will pick the hold up.
+  await db.salesOrder.update({ where: { id: orderId }, data: { invoiceNumber: `INV-${externalId}` } })
+  // The sweep has read the hold (applied:true) and reaches the release's order lock; just before it takes it, a RE-IMPORT of a changed order (goods changed) runs and marks the hold order_changed.
+  betweenHook.verified = true
+  betweenHook.armed = true
+  betweenHook.run = async () => {
+    const changed = payload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...PLUGIN('821')])
+    changed.line_items[0]!.subtotal = '110.00'; changed.line_items[0]!.total = '110.00'; changed.line_items[0]!.total_tax = '20.90'
+    changed.line_items[0]!.taxes = [{ id: changed.line_items[0]!.taxes[0]!.id, total: '20.90', subtotal: '20.90' }]
+    changed.tax_lines[0]!.tax_total = '21.66'; changed.total = '147.56'; changed.total_tax = '23.56'
+    await importWcOrder(changed as never)
+  }
+  await retryHeldWcSalesInvoiceReleases()
+  assert.equal(betweenHook.run, null, 'the re-import really ran between the sweep\'s read and its release lock')
+  assert.equal(await db.accountingSyncLog.count({ where: { type: 'SALES_INVOICE', referenceId: orderId } }), 0, 'the sweep queued nothing')
+  const after = await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } })
+  assert.equal(after.status, 'PENDING')
+  assert.deepEqual(((after.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment), { applied: false, reason: 'order_changed' })
+})

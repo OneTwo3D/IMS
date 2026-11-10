@@ -1637,7 +1637,8 @@ async function noteHeldReleaseFailure(rowId: string, message: string): Promise<v
 /** Re-checks a treated hold against the order INSIDE the release's own order-locked transaction, immediately before it enqueues; the hold it returns is the one that is released. */
 type HeldRecheck = (tx: Prisma.TransactionClient) => Promise<{ ok: true; held: HeldSalesInvoicePayload } | { ok: false; reason: string }>
 class HeldRecheckRefusal extends Error {
-  constructor(readonly reason: string) { super(reason) }
+  /** `mark`: the order changed (mark the hold order_changed); otherwise the hold is already marked, gone or replaced and is left as it is. */
+  constructor(readonly reason: string, readonly mark: boolean) { super(reason) }
 }
 
 /** The order changed after the invoice was held: mark the hold so nothing releases or re-treats it, and say what is needed. */
@@ -1895,14 +1896,24 @@ async function releaseHeldWcSalesInvoice(
     // inside it. The erasure takes the same lock, so there is no interleaving: it either committed first (and this sees it) or
     // runs after this commits (and scrubs the row this queued). Any failure rolls the whole thing back: the hold stays PENDING
     // and the sweep retries it. There is no after-the-fact scrub.
-    const { queueAccountingSyncTxWithOutcome } = await import('@/lib/accounting')
+    const { queueAccountingSyncTxWithOutcome, isAccountingSyncTypeEnabledFor } = await import('@/lib/accounting')
     enqueueOutcome.outcome = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
-      // A re-import's treated hold is verified AGAIN here, under this same lock and immediately before the enqueue: the hold is re-read and the order's facts re-resolved, and what is released is the hold as re-read.
-      let heldNow = held
+      // EVERY RELEASE PATH (the re-import's and the sweep's) re-reads the hold HERE, under the order lock, and releases what it re-read, never what was read before the lock: a concurrent re-import can have marked the hold order_changed in between. It must be the
+      // same row, still PENDING (the queue predicate), carry its chart, and not be marked order_changed; with the Sales Invoices switch on it must still be marked applied:true (an untreated hold is never queued). With the switch off the enqueue is a no-op as ever.
+      const current = await tx.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
+      if (!current || current.id !== row.id || !isHeldSalesInvoicePayload(current.payload)) throw new HeldRecheckRefusal('the held invoice changed while it was being released', false)
+      let heldNow: HeldSalesInvoicePayload = current.payload
+      if (heldSalesInvoiceChartConnector(heldNow) !== heldChartConnector) throw new HeldRecheckRefusal('the held invoice\u2019s chart changed while it was being released', false)
+      const nowMarker = heldNow.accountingPayload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown; reason?: unknown } | null | undefined
+      if (nowMarker?.reason === 'order_changed') throw new HeldRecheckRefusal('the order changed after the invoice was held', false)
+      if (nowMarker?.applied !== true && heldChartConnector !== null && (await isAccountingSyncTypeEnabledFor(heldChartConnector, 'SALES_INVOICE'))) {
+        throw new HeldRecheckRefusal('the held invoice was parked without the EU IOSS/VOEC/DDP treatment', false)
+      }
+      // A re-import's treated hold is verified AGAIN here against the order, on top of the above: the order's facts re-resolved under this same lock, and what is released is the hold as re-read.
       if (options?.recheck) {
         const rechecked = await options.recheck(tx)
-        if (!rechecked.ok) throw new HeldRecheckRefusal(rechecked.reason)
+        if (!rechecked.ok) throw new HeldRecheckRefusal(rechecked.reason, true)
         heldNow = rechecked.held
       }
       const subject = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, customer: { select: { gdprAnonymisedAt: true } } } })
@@ -1923,8 +1934,8 @@ async function releaseHeldWcSalesInvoice(
     }, { maxWait: 5_000, timeout: 20_000 })
   } catch (error) {
     if (error instanceof HeldRecheckRefusal) {
-      // The order or the hold changed between the check and the release: nothing was queued (the transaction rolled back); the hold is marked so nothing releases it.
-      await markHeldInvoiceOrderChanged(orderId, row.id, error.reason).catch((markError) => { console.error(`[wc-import] could not mark the held sales invoice ${row.id} as changed:`, markError) })
+      // The order or the hold changed between the check and the release: nothing was queued (the transaction rolled back). An order that changed is marked on the hold so nothing releases it; a hold already marked, gone or replaced is left as it is.
+      if (error.mark) await markHeldInvoiceOrderChanged(orderId, row.id, error.reason).catch((markError) => { console.error(`[wc-import] could not mark the held sales invoice ${row.id} as changed:`, markError) })
       return 'not-queued'
     }
     // Left PENDING on purpose — the release sweep retries it (see retryHeldWcSalesInvoiceReleases).
