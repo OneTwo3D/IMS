@@ -75,6 +75,16 @@ export function computeSchemePostingDrift(input: {
       if (rate.accountingTaxType !== null && rate.accountingTaxType === expectedType) add(rate.taxRateId, `Its charged code is its scheme posting type ${expectedType}: a scheme line would post on the charged rate`)
     }
   }
+  // A mapping onto a declared rate from a WooCommerce rate the declaration does not declare the same Xero rate (or does not declare at all) is a sharer nobody judged.
+  for (const rateId of named) {
+    const declaredImsName = (id: string) => input.declared.find((d) => String(d.wooId) === id)?.imsName
+    const owners = new Set(input.declared.filter((d) => mappingBy.get(String(d.wooId))?.taxRateId === rateId).map((d) => d.imsName))
+    for (const m of input.mappings) {
+      if (m.taxRateId !== rateId) continue
+      const theirs = declaredImsName(m.externalTaxRateId)
+      if (theirs === undefined || owners.size > 1) add(rateId, `Woo rate ${m.externalTaxRateId} is mapped to this rate but the declaration ${theirs === undefined ? 'does not declare it' : 'declares it as another Xero rate'}`)
+    }
+  }
   for (const rate of input.rates) {
     if (input.storeIdentity !== null && rate.active && rate.schemePostingTaxType !== null && !named.has(rate.taxRateId)) add(rate.taxRateId, `Carries scheme posting type ${rate.schemePostingTaxType} but no declared WooCommerce mapping names it`)
   }

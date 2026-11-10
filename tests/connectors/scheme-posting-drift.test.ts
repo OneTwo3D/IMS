@@ -123,3 +123,12 @@ test('an instance the declaration has not touched (no declared rate mapped, no s
   assert.notDeepEqual(computeSchemePostingDrift({ declared, mappings: [mapping(220)], rates: untouched, storeIdentity: STORE, xero: XERO }), [], 'one declared mapping engages it')
   assert.notDeepEqual(computeSchemePostingDrift({ declared, mappings: [], rates: [{ ...untouched[0]!, schemePostingTaxType: 'TAX131' }], storeIdentity: STORE, xero: XERO }), [], 'one scheme posting type engages it')
 })
+
+test('an undeclared WooCommerce rate mapped to a declared rate, or a declared one mapped to a rate of another Xero rate, is reported as a sharer', () => {
+  const stray: SchemeDriftMapping = { externalTaxRateId: '88888', taxRateId: 'r220', storeIdentity: STORE, externalCountry: 'DE', externalRatePct: '19.0000', externalClass: 'standard' }
+  const lines = computeSchemePostingDrift({ declared, mappings: [mapping(220), mapping(239), mapping(112), stray], rates: good(), storeIdentity: STORE, xero: XERO }).flatMap((d) => d.lines)
+  assert.match(lines.join(' | '), /Woo rate 88888 is mapped to this rate but the declaration does not declare it/)
+  const other = computeSchemePostingDrift({ declared, mappings: [mapping(220), mapping(239), mapping(112, { taxRateId: 'r220' })], rates: good(), storeIdentity: STORE, xero: XERO }).flatMap((d) => d.lines)
+  assert.match(other.join(' | '), /Woo rate 112 is mapped to this rate but the declaration declares it as another Xero rate/)
+  assert.deepEqual(run(good()), [], 'control: the declared mappings alone are clean')
+})

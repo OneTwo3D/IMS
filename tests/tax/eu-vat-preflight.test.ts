@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { evaluateEuVatPreflight, planEuVatSeedApply, PREFLIGHT_CODES, type PreflightCode, type PreflightInput } from '@/lib/tax/eu-vat-preflight'
-import { perfectWorld, syntheticChargedCode, withWorld, xeroType, type World } from './eu-vat-fixtures'
+import { STORE, perfectWorld, syntheticChargedCode, withWorld, xeroType, type World } from './eu-vat-fixtures'
 
 const codesOf = (input: PreflightInput): string[] => {
   const result = evaluateEuVatPreflight(input)
@@ -224,4 +224,35 @@ test('a shared IMS rate is ONE change that carries the facts of every mapping th
   assert.notEqual(stale((w) => { w.mappings.set(150, { ...w.mappings.get(150)!, id: 'swapped' }) }).digest, d)
   assert.notEqual(stale((w) => { w.mappings.set(150, { ...w.mappings.get(150)!, externalClass: ' Zero-Rate ' }) }).digest, d)
   assert.equal(stale((w) => { w.mappings.set(150, { ...w.mappings.get(150)!, externalRatePct: '0.00' }) }).digest, d, 'the percentage is judged and bound by value (four decimals): an equal value keeps the digest')
+})
+
+test('a type sales lines cannot use (canApply.revenue not true) is an error for the charged and the scheme type, and the rate is not planned', () => {
+  const noRevenue = (code: string) => (w: World): void => { w.xero.set(code, { ...w.xero.get(code)!, canApply: { assets: false, equity: false, expenses: true, liabilities: false, revenue: false } }) }
+  expectError(noRevenue('TAX131'), 'XERO_NOT_SALES_TYPE')
+  expectError(noRevenue(syntheticChargedCode(220)), 'XERO_NOT_SALES_TYPE')
+  expectError((w) => { w.xero.set('TAX131', { ...w.xero.get('TAX131')!, canApply: { assets: null, equity: null, expenses: null, liabilities: null, revenue: null } }) }, 'XERO_NOT_SALES_TYPE')
+  const clear = (w: World): void => { for (const [id, r] of w.ims) w.ims.set(id, { ...r, schemePostingTaxType: null, reportingCategory: null }) }
+  for (const code of ['TAX131', syntheticChargedCode(220)]) {
+    const plan = planEuVatSeedApply(withWorld((w) => { clear(w); noRevenue(code)(w) }))
+    assert.equal(plan.changes.some((c) => c.wooId === 220), false, code)
+    assert.equal(plan.skipped.find((s) => s.wooId === 220)?.reason, 'XERO_NOT_SALES_TYPE', code)
+  }
+})
+
+test('an UNDECLARED WooCommerce mapping onto a declared rate (scheme or shared) is a sharer the check sees: preflight error, the rate is not planned, and the mapping set is bound into the digest', () => {
+  const stray = (target: string) => (w: World): void => { w.mappings.set(88888, { id: 'map-stray', externalTaxRateId: '88888', externalName: 'Stray', externalCountry: 'DE', externalRatePct: '19.0000', externalClass: 'standard', taxRateId: target, storeIdentity: STORE }) }
+  expectError(stray('ims-220'), 'SHARED_IMS_ROW')
+  expectError(stray('ims-139'), 'SHARED_IMS_ROW')
+  const clear = (w: World): void => { for (const [id, r] of w.ims) w.ims.set(id, { ...r, schemePostingTaxType: null, reportingCategory: null }) }
+  const plan = planEuVatSeedApply(withWorld((w) => { clear(w); stray('ims-220')(w) }))
+  assert.equal(plan.changes.some((c) => c.wooId === 220), false)
+  assert.equal(plan.skipped.find((s) => s.wooId === 220)?.reason, 'SHARED_IMS_ROW')
+  const base = planEuVatSeedApply(withWorld(clear))
+  assert.deepEqual(base.changes.find((c) => c.wooId === 220)!.identity.allMappingIds, ['map-220'])
+  // A declared sharer whose own mapping is unusable does not make the shared rate unplannable, but its mapping is part of the bound set.
+  const withBadSharer = planEuVatSeedApply(withWorld((w) => { clear(w); setIms(w, 139, { reportingCategory: 'IOSS' }); w.mappings.set(151, { ...w.mappings.get(151)!, externalCountry: 'DE' }) }))
+  const zero = withBadSharer.changes.find((c) => c.taxRateId === 'ims-139')
+  assert.ok(zero)
+  assert.equal(zero.identity.allMappingIds.length, 33)
+  assert.equal(zero.identity.mappings.length, 32)
 })

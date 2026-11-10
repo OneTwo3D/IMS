@@ -71,6 +71,7 @@ export const PREFLIGHT_CODES = {
   IMS_RATE_MISSING: 'the mapping names an IMS rate that does not exist',
   IMS_RATE_INACTIVE: 'the IMS rate is inactive',
   IMS_RATE_NOT_SALES: 'the IMS rate is purchase-only or a reverse-charge rate',
+  XERO_NOT_SALES_TYPE: 'the Xero type cannot be applied to revenue (canApply.revenue is not true; the set-identity report\'s XERO_NOT_SALES_TYPE), so sales lines cannot use it',
   SHARED_IMS_ROW: 'one IMS rate stands for WooCommerce rates the declaration does not declare to be the same Xero rate (only rates on the same Xero type may share an IMS rate)',
   IMS_PERCENT_DIFFERS: 'the IMS rate is not the percentage the declaration states',
   IMS_COUNTRY_DIFFERS: 'the IMS rate is for another country than the declaration states',
@@ -119,6 +120,13 @@ const sameName = (a: string, b: string): boolean => collapseName(a).toLowerCase(
 
 type Resolved = { rate: EuVatSeedRate; mapping: PreflightMapping | null; mappingMatches: boolean; ims: PreflightImsRate | null }
 
+/** Every WooCommerce mapping to each IMS rate, as the store's rate ids (declared or not). */
+function mappingsByImsRate(mappings: readonly PreflightMapping[]): Map<string, string[]> {
+  const out = new Map<string, string[]>()
+  for (const m of mappings) out.set(m.taxRateId, [...(out.get(m.taxRateId) ?? []), m.externalTaxRateId])
+  return out
+}
+
 function resolveRates(input: PreflightInput): Resolved[] {
   const mappingBy = new Map(input.mappings.map((m) => [m.externalTaxRateId, m]))
   const imsBy = new Map(input.imsRates.map((r) => [r.id, r]))
@@ -143,8 +151,8 @@ export function evaluateEuVatPreflight(input: PreflightInput): PreflightResult {
   const add = (code: PreflightCode, wooId: number | null, subject: string, detail: string): void => { findings.push({ severity: ADVISORY.has(code) ? 'advisory' : 'error', code, wooId, subject, detail }) }
 
   const resolved = resolveRates(input)
-  const wooIdsByIms = new Map<string, number[]>()
-  for (const r of resolved) if (r.ims !== null) wooIdsByIms.set(r.ims.id, [...(wooIdsByIms.get(r.ims.id) ?? []), r.rate.wooId])
+  // EVERY WooCommerce mapping, declared or not, to each IMS rate: an undeclared mapping onto a declared rate is a sharer the check must see.
+  const wooIdsByIms = mappingsByImsRate(input.mappings)
   const fullyConfigured = new Set<number>()
   const codeCarriers = new Map<string, Set<string>>()
 
@@ -159,8 +167,8 @@ export function evaluateEuVatPreflight(input: PreflightInput): PreflightResult {
     if (!mappingMatches) { err('MAPPING_DIFFERS', `the mapping records "${mapping.externalName}", country "${mapping.externalCountry ?? ''}", ${mapping.externalRatePct}%, class "${mapping.externalClass ?? ''}"`); continue }
     if (ims === null) { err('IMS_RATE_MISSING', `mapping ${mapping.externalTaxRateId} names rate ${mapping.taxRateId}`); continue }
     const shared = wooIdsByIms.get(ims.id) ?? []
-    const strangers = shared.filter((id) => input.seed.rates.find((x) => x.wooId === id)?.imsName !== rate.imsName)
-    if (strangers.length > 0) err('SHARED_IMS_ROW', `IMS rate "${ims.name}" also stands for Woo ${strangers.join(', ')}, which are not declared to be the same Xero rate`)
+    const strangers = shared.filter((id) => input.seed.rates.find((x) => String(x.wooId) === id)?.imsName !== rate.imsName)
+    if (strangers.length > 0) err('SHARED_IMS_ROW', `IMS rate "${ims.name}" also stands for Woo ${strangers.join(', ')}, which are not declared to be the same Xero rate (an undeclared mapping counts)`)
     if (!ims.active) err('IMS_RATE_INACTIVE', `"${ims.name}"`)
     else if (!isActiveSalesRate(ims)) err('IMS_RATE_NOT_SALES', `"${ims.name}" is used for ${ims.usedFor}${ims.reverseCharge ? ', reverse charge' : ''}`)
     const imsPercent = exactDec(ims.rate)?.mul(100) ?? null
@@ -177,6 +185,7 @@ export function evaluateEuVatPreflight(input: PreflightInput): PreflightResult {
       const live = xeroByType.get(code)
       if (live === undefined || live.status !== 'ACTIVE') err('CHARGED_TYPE_NOT_IN_XERO', `${code} ${live === undefined ? 'is not in the list' : `is ${live.status}`}`)
       else {
+        if (live.canApply.revenue !== true) err('XERO_NOT_SALES_TYPE', `${code} cannot be applied to revenue in Xero`)
         if (rate.accountingXeroName !== null && live.name !== rate.accountingXeroName) err('CHARGED_NAME_DIFFERS', `${code} is "${live.name}" in Xero, declared "${rate.accountingXeroName}"`)
         const livePercent = xeroPercent(live)
         if (livePercent === null || !livePercent.eq(new Dec(rate.ratePercent))) err('CHARGED_PERCENT_DIFFERS', `${code} is ${livePercent === null ? 'unstated' : livePercent.toFixed()}% in Xero, declared ${rate.ratePercent}%`)
@@ -201,6 +210,7 @@ export function evaluateEuVatPreflight(input: PreflightInput): PreflightResult {
       const live = xeroByType.get(rate.schemePostingTaxType)
       if (live === undefined || live.status !== 'ACTIVE') err('SCHEME_TYPE_NOT_IN_XERO', `${rate.schemePostingTaxType} ${live === undefined ? 'is not in the list' : `is ${live.status}`}`)
       else {
+        if (live.canApply.revenue !== true) err('XERO_NOT_SALES_TYPE', `${rate.schemePostingTaxType} cannot be applied to revenue in Xero`)
         if (live.name !== rate.schemePostingXeroName) err('SCHEME_NAME_DIFFERS', `${rate.schemePostingTaxType} is "${live.name}" in Xero, declared "${rate.schemePostingXeroName ?? ''}"`)
         const livePercent = xeroPercent(live)
         if (livePercent === null || !livePercent.isZero()) err('SCHEME_NOT_ZERO', `${rate.schemePostingTaxType} is ${livePercent === null ? 'unstated' : `${livePercent.toFixed()}%`} in Xero`)
@@ -294,6 +304,8 @@ export type SeedChangeIdentity = {
   storeIdentity: string
   /** Every mapping that names the rate (several WooCommerce rates may share it), in id order, with the store-rate facts the declaration was matched on. */
   mappings: SeedMappingFacts[]
+  /** The ids of EVERY mapping row that names the rate, declared or not, in id order: the apply row-locks this whole set and refuses if it has grown or shrunk. */
+  allMappingIds: string[]
   name: string
   /** Fraction text, Decimal(5,4). */
   rate: string
@@ -339,7 +351,7 @@ export function planEuVatSeedApply(input: PreflightInput): SeedApplyPlan {
       const existing = changes.find((c) => c.taxRateId === ims.id)
       if (existing !== undefined) { existing.identity.mappings.push(facts); existing.identity.mappings.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)); continue }
       const identity: SeedChangeIdentity = {
-        storeIdentity: input.storeIdentity, mappings: [facts], name: ims.name, rate: ims.rate, country: ims.countryCode, usedFor: ims.usedFor,
+        storeIdentity: input.storeIdentity, mappings: [facts], allMappingIds: input.mappings.filter((m) => m.taxRateId === ims.id).map((m) => m.id).sort(), name: ims.name, rate: ims.rate, country: ims.countryCode, usedFor: ims.usedFor,
         charged: fact(ims.accountingTaxType ?? ''), scheme: rate.schemePostingTaxType === null ? null : fact(rate.schemePostingTaxType),
       }
       changes.push({ taxRateId: ims.id, imsName: ims.name, wooId: rate.wooId, identity, from, to })
@@ -394,7 +406,14 @@ export async function applyEuVatSeed(db: { $transaction: <T>(fn: (tx: Client) =>
       for (const change of plan.changes) await lockTaxRateForEdit(tx, change.taxRateId, { schemePostingTaxType: change.to.schemePostingTaxType, reportingCategory: change.to.reportingCategory })
       const wanted = plan.changes.flatMap((c) => c.identity.mappings.map((m) => ({ change: c, facts: m }))).sort((a, b) => (a.facts.id < b.facts.id ? -1 : a.facts.id > b.facts.id ? 1 : 0))
       // Row-locked (FOR SHARE: a writer of a mapping row waits for this commit) and compared on every declared field, so a mapping edited, re-pointed, re-stamped or deleted (a row that is gone is not found below) since the plan was read rolls the whole apply back.
-      await tx.$queryRaw`SELECT id FROM shopping_tax_rate_mappings WHERE id = ANY(${wanted.map((w) => w.facts.id)}::text[]) ORDER BY id FOR SHARE`
+      const completeIds = [...new Set(plan.changes.flatMap((c) => c.identity.allMappingIds))].sort()
+      await tx.$queryRaw`SELECT id FROM shopping_tax_rate_mappings WHERE id = ANY(${[...new Set([...wanted.map((w) => w.facts.id), ...completeIds])].sort()}::text[]) ORDER BY id FOR SHARE`
+      // The COMPLETE mapping set of every rate the plan writes (declared or not): a mapping that arrived or left since the plan was read, or that is not a declared sharer, rolls the apply back.
+      const current = await tx.shoppingTaxRateMapping.findMany({ where: { connector: 'woocommerce', taxRateId: { in: plan.changes.map((c) => c.taxRateId) } }, select: { id: true, taxRateId: true } })
+      for (const change of plan.changes) {
+        const now = current.filter((m) => m.taxRateId === change.taxRateId).map((m) => m.id).sort()
+        if (now.length !== change.identity.allMappingIds.length || now.some((id, i) => id !== change.identity.allMappingIds[i])) throw new SeedRaceError(`the set of mappings that name tax rate ${change.taxRateId} changed since the plan was read`)
+      }
       const rows = new Map((await tx.shoppingTaxRateMapping.findMany({ where: { id: { in: wanted.map((w) => w.facts.id) } } })).map((r) => [r.id, r]))
       for (const { change, facts } of wanted) {
         const row = rows.get(facts.id)

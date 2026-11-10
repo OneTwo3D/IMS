@@ -246,6 +246,8 @@ test('a rate edited in the instant between the plan read and the row lock fails 
     () => d.db.shoppingTaxRateMapping.update({ where: { id: zMapping }, data: { taxRateId: de } }),
     () => d.db.shoppingTaxRateMapping.update({ where: { id: zMapping }, data: { externalTaxRateId: '99151' } }),
     () => d.db.shoppingTaxRateMapping.delete({ where: { id: zMapping } }),
+    // A mapping nobody declared arrives on the German rate between the plan read and the lock.
+    () => d.db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: '88888', externalName: 'Stray', externalCountry: 'DE', externalRatePct: '19.0000', externalClass: 'standard', taxRateId: de, storeIdentity: STORE } }),
   ]
   for (const edit of edits) {
     let fired = false
@@ -270,6 +272,7 @@ test('a rate edited in the instant between the plan read and the row lock fails 
       await d.db.shoppingTaxRateMapping.update({ where: { id: ids.mappings[1]! }, data: { storeIdentity: STORE, taxRateId: de } })
       const fields = { connector: origMapping.connector, externalTaxRateId: origMapping.externalTaxRateId, externalName: origMapping.externalName, externalCountry: origMapping.externalCountry, externalRatePct: origMapping.externalRatePct, externalClass: origMapping.externalClass, taxRateId: origMapping.taxRateId, storeIdentity: origMapping.storeIdentity }
       await d.db.shoppingTaxRateMapping.upsert({ where: { id: zMapping }, create: origMapping, update: fields })
+      await d.db.shoppingTaxRateMapping.deleteMany({ where: { connector: 'woocommerce', externalTaxRateId: '88888' } })
     }
   }
   await d.db.taxRate.update({ where: { id: ids.rates[3]! }, data: { reportingCategory: null } })
@@ -339,10 +342,19 @@ test('the apply takes the Xero mapping-selection lock first: a rebind that holds
   }
 })
 
-test('the apply row-locks the mappings its plan rests on: a writer of one of them waits for the apply to commit', { skip }, async () => {
+for (const scenario of ['a planned mapping', 'the unusable mapping of a sharer of a planned rate'] as const) test(`the apply row-locks the COMPLETE mapping set its plan rests on (${scenario}): a writer of one of them waits for the apply to commit`, { skip }, async () => {
   for (const id of ids.rates) await d.db.taxRate.update({ where: { id }, data: { schemePostingTaxType: null, reportingCategory: null } })
+  const second = scenario !== 'a planned mapping'
+  const zero = ids.rates[3]!
+  const z2 = ids.mappings[4]!
+  const z2Original = await d.db.shoppingTaxRateMapping.findUniqueOrThrow({ where: { id: z2 } })
+  if (second) {
+    // The shared zero-rated rate has a stale marker, so it is planned; one sharer's mapping records another country, so it is declared but unusable: in the rate's mapping set, not in the plan's facts.
+    await d.db.taxRate.update({ where: { id: zero }, data: { reportingCategory: 'IOSS' } })
+    await d.db.shoppingTaxRateMapping.update({ where: { id: z2 }, data: { externalCountry: 'DE' } })
+  }
   const { digest } = await plan()
-  const zMapping = ids.mappings[1]! // the German rate's mapping: DE is one of the rates this plan writes
+  const zMapping = second ? z2 : ids.mappings[1]! // the German rate's mapping: DE is one of the rates this plan writes
   let writerDone = false
   let writer: Promise<unknown> = Promise.resolve()
   let heldWhileApplying = false
@@ -377,5 +389,26 @@ test('the apply row-locks the mappings its plan rests on: a writer of one of the
     assert.equal(writerDone, true, 'and it went through once the apply had committed')
   } finally {
     await d.db.shoppingTaxRateMapping.update({ where: { id: zMapping }, data: { externalName: original.externalName } })
+    if (second) {
+      await d.db.shoppingTaxRateMapping.update({ where: { id: z2 }, data: { externalCountry: z2Original.externalCountry } })
+      await d.db.taxRate.update({ where: { id: zero }, data: { reportingCategory: null } })
+    }
+  }
+})
+
+test('an undeclared mapping onto a declared rate after the dry run is a different plan (the rate is no longer planned) and the apply refuses', { skip }, async () => {
+  for (const id of ids.rates) await d.db.taxRate.update({ where: { id }, data: { schemePostingTaxType: null, reportingCategory: null } })
+  const { digest } = await plan()
+  const de = ids.rates[1]!
+  const stray = await d.db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: '88888', externalName: 'Stray', externalCountry: 'DE', externalRatePct: '19.0000', externalClass: 'standard', taxRateId: de, storeIdentity: STORE } })
+  try {
+    const p = await plan()
+    assert.equal(p.skipped.find((s) => s.wooId === 220)?.reason, 'SHARED_IMS_ROW')
+    const before = await snapshotRates()
+    const result = await apply(digest)
+    assert.equal(result.applied === false && result.refusal?.code, 'DIGEST_MISMATCH')
+    assert.deepEqual(await snapshotRates(), before)
+  } finally {
+    await d.db.shoppingTaxRateMapping.delete({ where: { id: stray.id } })
   }
 })
