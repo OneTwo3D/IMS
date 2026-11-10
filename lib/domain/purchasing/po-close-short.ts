@@ -148,6 +148,19 @@ export async function retirePurchaseOrderLocked(
   await assertNoLiveAsnForRetirement(tx, po.reference, intent, po.lines.map((l) => l.id))
 
   const landedByLine = await loadPurchaseOrderLineLandedQty(tx, po.lines.map((l) => ({ id: l.id, qtyReceived: l.qtyReceived })))
+  // Landed units the warehouse alignment brought into stock but that have not been folded into the line's received quantity
+  // (`qtyReceived`) are real stock that the supplier-return flow cannot yet return: it validates `qtyReceived` only, and a closed
+  // order refuses returns. Closing now would strand them (and would spread freight over units no return can reach), so the close
+  // waits until the warehouse receipt has been reconciled into the order.
+  const unreconciled = po.lines.filter((l) => (landedByLine.get(l.id)?.fromUnabsorbedWmsSnapshot.toNumber() ?? 0) > PO_LANDED_QTY_EPSILON)
+  if (unreconciled.length > 0) {
+    const names = unreconciled.map((l) => `${l.product?.sku ?? l.id} (${landedByLine.get(l.id)!.fromUnabsorbedWmsSnapshot.toNumber()})`).join(', ')
+    throw new Error(
+      `Cannot ${intent === 'cancel' ? 'cancel' : 'close'} ${po.reference}: ${names} ${unreconciled.length === 1 ? 'has' : 'have'} stock the warehouse sync brought in that is not yet booked into this order, `
+      + 'so it cannot be returned to the supplier from here. Reconcile the warehouse receipt first (use Recheck booked-in on the order once the warehouse has booked the goods in), then close the order.',
+    )
+  }
+
   let landedQty = 0
   let droppedQty = 0
   const lineLanded = po.lines.map((line) => {

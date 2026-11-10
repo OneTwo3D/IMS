@@ -832,3 +832,41 @@ test('a discounted received line whose quantity is raised: the stored discount s
   assert.ok(exportedRow, 'the order is in the export')
   assert.ok(exportedRow!.includes('80.0000') && exportedRow!.includes('10%'), `export line discount follows: ${exportedRow}`)
 })
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// WMS SNAPSHOT-LANDED STOCK NOT YET BOOKED INTO THE ORDER
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+
+for (const how of ['close', 'cancel'] as const) {
+  test(`a retired, credited ASN with qtyReceived 0: ${how} is refused until the warehouse receipt is reconciled; then a return works and ${how} works`, SKIP, async () => {
+    const { advancePoStatus, cancelPurchaseOrder, returnPurchaseOrder } = await actions()
+    const { db } = await import('@/lib/db')
+    const po = await seedPo(`snap-${how}`, [10])
+    const line = po.lines[0]!
+    // What the alignment left behind: 4 units in stock with a cost layer, credited on an ASN line that has since been retired,
+    // and nothing in the line's received quantity.
+    await db.costLayer.create({ data: { productId: line.productId, warehouseId: po.warehouseId, receivedQty: 4, remainingQty: 4, unitCostBase: 5, receivedAt: new Date(), poLineId: line.poLineId } })
+    await db.stockLevel.update({ where: { productId_warehouseId: { productId: line.productId, warehouseId: po.warehouseId } }, data: { quantity: 4 } })
+    const asn = await addAsn(po, line, { expectedQty: 10, status: 'OPEN', closed: true, viaSnapshot: 4 })
+    const act = () => (how === 'close' ? advancePoStatus(po.poId, 'CLOSED') : cancelPurchaseOrder(po.poId))
+
+    const refused = await act()
+    assert.equal(refused.success, false)
+    assert.match(refused.error ?? '', /stock the warehouse sync brought in that is not yet booked into this order/)
+    assert.match(refused.error ?? '', /Recheck booked-in/)
+    assert.equal((await poState(po)).status, 'PO_SENT', 'nothing was written')
+    // The same stock cannot be returned from here yet: the return flow reads the received quantity.
+    const early = await returnPurchaseOrder(po.poId, [{ poLineId: line.poLineId, qtyReturned: 1, warehouseId: po.warehouseId }], 'damaged')
+    assert.equal(early.success, false)
+
+    // Reconciliation, as the book-in folds it: the credit becomes receipt quantity.
+    await db.wmsAsnLineMap.update({ where: { id: asn.asnLineMapId }, data: { qtyAccountedViaReceipt: 4 } })
+    await db.purchaseOrderLine.update({ where: { id: line.poLineId }, data: { qtyReceived: 4 } })
+    const returned = await returnPurchaseOrder(po.poId, [{ poLineId: line.poLineId, qtyReturned: 1, warehouseId: po.warehouseId }], 'damaged')
+    assert.equal(returned.success, true, String(returned.error))
+    const ok = await act()
+    assert.equal(ok.success, true, String(ok.error))
+    assert.equal((await poState(po)).status, 'CLOSED')
+    assert.equal((await poState(po)).stock, 3, 'the returned unit left stock; the rest stays')
+  })
+}
