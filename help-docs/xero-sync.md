@@ -1611,8 +1611,7 @@ An IOSS or VOEC sale (an EU member state, Monaco or Norway, VAT collected at the
 (for example `DE IOSS VAT`, `TAX131`) with one extra line carrying the collected VAT, not on the rate the customer was charged. IMS therefore keeps **two** Xero types for such a rate:
 its own `accountingTaxType` stays the charged rate (DE VAT 19%), and the new rate field **`schemePostingTaxType`** holds the zero-rated type its goods, shipping and discount lines
 will post on. The existing reporting category carries the marker: `IOSS` for the EU states and Monaco, `VOEC` for Norway (this moves the rate from the "other foreign VAT" bucket of the
-VAT difference report to the IOSS or VOEC one). **This change adds configuration only: nothing reads `schemePostingTaxType` to build a document yet, so no posted line changes and the
-Sales Invoices switch is untouched.** The treatment itself arrives in later changes, behind that switch.
+VAT difference report to the IOSS or VOEC one). The invoice treatment (below, *EU IOSS / VOEC / DDP invoice treatment*) reads `schemePostingTaxType` to build the document, behind the Sales Invoices switch; the credit-note treatment follows.
 
 **The declaration** is `lib/tax/eu-vat-seed.json`, versioned and reviewed in the repository, with no secret in it: for each of the 65 live WooCommerce tax rates, the IMS rate that stands
 for it (one IMS rate per Xero rate: WooCommerce rates that post on the same Xero type share one IMS rate, so the 33 rates on `ZERORATEDOUTPUT`, 182 included, are one rate named *Zero Rated Income*), the Xero type it posts on and the byte-exact Xero names (`AT IOSS  VAT` has two spaces, `No VAT` and `NO VAT`
@@ -1654,8 +1653,7 @@ npm run eu-vat:seed -- --apply --confirm <digest>    # write exactly the plan th
 ### EU VAT regime: how an order is classified, and the stamp (decision only)
 
 For an order destined to an EU member state, Monaco or Norway, IMS decides which consumer VAT regime its VAT was collected under, from facts on the order, and records the answer **once** on the sales order.
-**This change decides and records; nothing builds a document from the stamp yet, so no posted line, invoice total or credit note changes, and the Sales Invoices switch is untouched.** (The stamp
-is written by `stampEuVatRegime`, which the invoice treatment will call; until that follows, no order carries one.)
+The stamp is written by `stampEuVatRegime`, which the invoice treatment calls (below) while the Sales Invoices switch is on; with the switch off no order is stamped. Credit notes do not read the stamp yet.
 
 - **Who decides: the setting `eu_vat_regime_mode`.** `adopt_plugin` (the default, and what an unset value means) is the parallel phase while the storefront plugin still posts: IMS **adopts the plugin's decision** instead of re-making
   it. The account the plugin recorded on the order (`_o3d_ioss_vat_account`) determines the regime: the *EU IOSS/VOEC VAT collected* account is IOSS (VOEC for Norway), the *EU DDP charges collected* account is DDP; any other value
@@ -1694,6 +1692,28 @@ is written by `stampEuVatRegime`, which the invoice treatment will call; until t
   the order's row lock, so two builders agree on whichever wrote first, and a stamped order is **never re-derived**: a later exchange rate cannot move it between regimes. The database refuses a regime without an account and a
   marker. The VAT accounts come from the *EU IOSS/VOEC VAT collected* and *EU DDP charges collected* account roles.
 - **Orders that predate the stamp** carry none. A credit note on a scheme order with no stamp must come from the plugin's recorded account or go to the exceptions queue (the credit-note change).
+
+### EU IOSS / VOEC / DDP invoice treatment
+
+For a WooCommerce order, IMS builds the sales invoice the way the storefront plugin (o3d-ioss-xero) posts it today. **Everything here happens only while the Sales Invoices switch is on** (the Xero master switch and the *Sales invoices* sync type not off, the same
+verdict the queue gives). While it is off the importer does not read a fact, write a stamp or touch the payload: the invoice it builds is exactly what it was before this change. It applies to invoices built from a WooCommerce order; a manual (native) sales order has none of the facts it needs
+and is not treated.
+
+- **Order of work.** The importer builds the invoice payload, then, before it is queued or parked for a missing invoice number, decides and stamps the order's regime once under the order lock (`stampEuVatRegime`), then applies the treatment. A refusal of the regime
+  (nothing stamped) refuses the invoice through the existing path: the document is marked (`_taxUnreconciled`) so the poster refuses it with the reason, no payment is registered, the row shows on /sync, and the activity log has *wc_invoice_eu_vat_treatment_refused*. Fix what it names and re-import the order.
+- **Scheme orders (IOSS, VOEC, DDP).** Goods, shipping and the order discount are sent on the scheme's **zero-rated** type (`schemePostingTaxType`, for example `DE IOSS VAT`), never on the charged rate; the accounts are unchanged. A landed-cost fee (marked `_wclc_fee`) is posted **net on the EU landed-cost fees account (232) on No VAT**. **One extra line** carries all the VAT the customer paid
+  (items, shipping and fees), on the stamped account (821 *Non-UK VAT* for IOSS and VOEC, 232 for DDP) on No VAT, described as, for example, "IOSS VAT collected — DE 19%". VAT collected is not turnover, so it stays out of the VAT return. No line carries a tax amount: Xero derives tax from the type, and every line is on a zero-rated type or No VAT.
+  For DDP the VAT line and the fees both sit on 232; for IOSS and VOEC the VAT line is the only line on 821.
+- **The total equals the order total, exactly.** Before the invoice is queued its total (the sum of its lines, to the currency's minor unit) is compared with WooCommerce's order total. A difference of at most a few minor units (one per priced component, at most ten) is rounding and is posted as one line, **"Rounding adjustment", on the rounding account (860 *Rounding*, the setting `xero_rounding_difference_account`) on No VAT**,
+  so the invoice then totals the order exactly; nothing goes to 821. Any larger difference, a rounding difference with no rounding account configured, an unreadable figure, a landed-cost fee with no fee account, or a second line already on the VAT account refuses the invoice.
+- **Every order (not only scheme orders).** A landed-cost fee marked `_wclc_fee` is re-coded to the fee account on No VAT. A marked fee that carries VAT on an order that is not on the scheme cannot be (the VAT would leave the document), so it refuses.
+- **EU business sales (B2B).** An EU-27 order WooCommerce charged no VAT on, flagged `is_vat_exempt`, has goods, shipping and the order discount sent on `ZERORATEDOUTPUT` (as the storefront mu-plugin does). Norway and Monaco are not treated this way.
+- **Named No VAT lines.** The Sales Invoices check accepts No VAT only on a line that names why: `fee-no-tax` (a fee), `eu-vat-recovery` (the one VAT line) and `rounding-difference` (the rounding line). Shipping and the discount can never be No VAT.
+- **Store credit.** An order carrying store credit is neither stamped nor treated; its invoice stays refused whole until the store-credit lines exist.
+- **Gift cards.** A gift-card line is not given its own treatment yet: on a scheme order it is sent with the goods on the zero-rated type (it counts in the invoice total like any line); the sold-credit account for gift cards arrives with the store-credit work.
+- **A stamped order is never re-derived.** The regime and VAT account come from the stamp; only the VAT amount and the zero-rated type are read from the order's own rates again. A stamp and facts that now contradict each other (stamped outside the scheme but a scheme rate is now charged, or the reverse) refuse.
+- **Draft or live is not decided here.** The status Xero receives follows the *Sales invoices* posting mode (`xero_sync_sales_invoice`): `draft` creates DRAFT invoices, `submitted` creates authorised ones. In the parallel phase, while Xeroom posts the live invoices, set it to `draft`; the treatment does not read or change it. Writes to Xero also still need the producer-side hold lifted for the tenant.
+- **A hold parked while the switch is off.** An invoice held for a missing invoice number while the switch is off is parked without the treatment and marked so. When the number arrives with the switch on, the release leaves it PENDING with a note instead of posting it untreated; re-import the order to rebuild it.
 
 ## Invoice PDF & Email
 

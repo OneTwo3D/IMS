@@ -55,6 +55,8 @@ import {
 import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { rateBinding, resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
+import { treatImportedSalesInvoice } from './eu-vat-invoice-treatment'
+import { EU_VAT_TREATMENT_PAYLOAD_KEY } from '@/lib/domain/accounting/eu-vat-treatment'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { directCreateMarker, isFulfilmentStatus, resolveDirectCreateMarker } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
@@ -1708,6 +1710,20 @@ async function releaseHeldWcSalesInvoice(
         resolveUser: false,
       }).catch(() => {})
     }
+    return 'not-queued'
+  }
+  // A HOLD PARKED WHILE THE SALES INVOICES SWITCH WAS OFF was built without the EU IOSS/VOEC/DDP treatment (the import skips it while the switch is off). Released now that the switch is on, it would
+  // post a scheme sale on its charged rate. It stays PENDING with the reason; re-importing the order rebuilds the payload with the treatment and replaces the parked one. With the switch still off nothing
+  // changes: the release is not-configured as ever.
+  if (held.accountingPayload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
+    && (held.accountingPayload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown } | null)?.applied === false
+    && heldChartConnector !== null
+    && (await (await import('@/lib/accounting')).isAccountingSyncTypeEnabledFor(heldChartConnector, 'SALES_INVOICE'))) {
+    await noteHeldReleaseFailure(
+      row.id,
+      `WooCommerce numbered this invoice ${invoiceNumber}, but this hold was parked while the Sales Invoices switch was off, so it was built without the EU IOSS/VOEC/DDP treatment. `
+      + 'NOTHING was queued: re-import the order from WooCommerce to rebuild the invoice, which then releases.',
+    )
     return 'not-queued'
   }
   // o3d-j625 r3 (Codex HIGH 1 family): the outcome is CAPTURED, not because the row re-read below is
@@ -3427,6 +3443,44 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
             : {}),
       }
 
+      // THE EU IOSS / VOEC / DDP TREATMENT (lib/domain/accounting/eu-vat-treatment.ts), applied to the finished payload BEFORE it is queued or parked for a missing invoice number, so a
+      // released hold carries the same lines a queued one does. While the Sales Invoices switch is OFF this is skipped before it reads or writes anything and the payload is exactly what it was.
+      // A refusal stamps the document with the reason (the existing `_taxUnreconciled` path): the poster refuses it, no payment is registered, and the row is visible on /sync.
+      const euVatOutcome = await treatImportedSalesInvoice({
+        orderId: so.id,
+        wcOrder,
+        payload: accountingPayload,
+        mappedLines,
+        connector: settings.connector,
+        accounts: { ioss: settings.euVatIossAccount, ddp: settings.euVatDdpAccount, fee: settings.euFeeAccount, rounding: settings.roundingDifferenceAccount },
+        storeCreditForeign,
+        now: new Date(),
+      })
+      // What is queued, or parked, from here on: `accountingPayload` as built, or the treated copy of it (or the refused one).
+      let invoicePayload: Record<string, unknown> = accountingPayload
+      if (euVatOutcome.kind === 'treated') {
+        invoicePayload = euVatOutcome.payload
+      } else if (euVatOutcome.kind === 'refused') {
+        const euVatReason =
+          `The EU IOSS/VOEC/DDP treatment of WooCommerce order ${wcOrder.number} refused the invoice: ${euVatOutcome.reason}. `
+          + 'Nothing was sent and no payment was registered; fix what is named above and re-import the order.'
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: so.id,
+          action: 'wc_invoice_eu_vat_treatment_refused',
+          tag: 'accounting',
+          level: 'ERROR',
+          description: euVatReason,
+          metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), externalOrderNumber: wcOrder.number, orderTotal: wcOrder.total, documentPosted: false },
+        })
+        invoicePayload = {
+          ...accountingPayload,
+          _registerPayment: false,
+          _paymentAmount: resolveWcInvoicePaymentAmount(wcOrder, { totalsToTheOrder: false }),
+          [UNRECONCILED_TAX_PAYLOAD_KEY]: buildUnreconciledTaxMarker([unreconciledReason, euVatReason].filter((r): r is string => r !== null).join(' ')),
+        }
+      }
+
       if (invoiceNumberResolution.ok) {
         // ONE ORDER-LOCKED TRANSACTION (as the held release): the erasure marker is read under the order lock, the contact block is the
         // real one or the placeholder accordingly, and the row is inserted, all inside it. An erasure that commits between the order
@@ -3435,7 +3489,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
         const enqueued = await db.$transaction(async (tx) => {
           await lockSalesOrder(tx, so.id)
           const erased = await orderIsErasedInTx(tx, so.id)
-          const postable = erased ? scrubContactInAccountingPayload(accountingPayload) : accountingPayload
+          const postable = erased ? scrubContactInAccountingPayload(invoicePayload) : invoicePayload
           return queueAccountingSyncTxWithOutcome(tx, {
             type: 'SALES_INVOICE',
             referenceType: 'SalesOrder',
@@ -3482,7 +3536,10 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           wcOrder,
           orderNumber,
           metaKey: invoiceNumberResolution.metaKey,
-          accountingPayload,
+          // A hold parked while the Sales Invoices switch is off carries the EU VAT treatment's absence on it, so a later release (switch on) does not post it untreated.
+          accountingPayload: euVatOutcome.kind === 'skipped' && euVatOutcome.why === 'switch_off'
+            ? { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'sales_invoices_switch_off' } }
+            : invoicePayload,
           // o3d-j625: the same chart read that produced every account code in `accountingPayload`,
           // parked alongside them — the release can be days later and must not re-resolve it.
           chartConnector: settings.connector,
