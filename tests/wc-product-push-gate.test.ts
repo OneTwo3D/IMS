@@ -15,6 +15,8 @@ const state = {
   /** The credentials that actually went out on the wire, decoded from the Basic auth header. */
   wireCalls: [] as Array<{ url: string; method: string; body: string }>,
   settingsReadFails: false,
+  /** Runs on every wire call, to change a setting while a push is in flight. */
+  onWire: null as null | (() => void),
 }
 
 function setSettings(rows: Row[]) {
@@ -85,6 +87,7 @@ mock.module('@/lib/security/connector-fetch', {
   namedExports: {
     connectorFetch: async (url: URL | string, init?: { method?: string; body?: string }) => {
       state.wireCalls.push({ url: String(url), method: init?.method ?? 'GET', body: String(init?.body ?? '') })
+      state.onWire?.()
       return new Response(JSON.stringify({ id: 4242, sku: 'SKU-1' }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
@@ -101,6 +104,7 @@ const BASE: Row[] = [
 ]
 
 async function push(extra: Row[], opts: { unreadable?: boolean } = {}) {
+  state.onWire = null
   setSettings([...BASE, ...extra])
   state.wireCalls.length = 0
   state.settingsReadFails = opts.unreadable === true
@@ -160,3 +164,28 @@ for (const direction of ['to_wc', 'both']) {
     assert.equal(writes()[0].method, 'PUT')
   })
 }
+
+test('turned off (or switched to from_wc) while the push is in flight: the final write is not sent', async () => {
+  for (const change of [
+    { key: 'wc_sync_product_enabled', value: 'false' },
+    { key: 'wc_sync_product_direction', value: 'from_wc' },
+  ]) {
+    const result = await push([{ key: 'wc_sync_product_enabled', value: 'true' }, { key: 'wc_sync_product_direction', value: 'to_wc' }])
+    assert.equal(result.success, true, 'CONTROL: the same push goes out when nothing changes')
+    assert.equal(writes().length, 1)
+
+    setSettings([...BASE, { key: 'wc_sync_product_enabled', value: 'true' }, { key: 'wc_sync_product_direction', value: 'to_wc' }])
+    state.wireCalls.length = 0
+    // the operator saves the Sync page while the push is reading the WooCommerce product
+    state.onWire = () => {
+      state.onWire = null
+      setSettings([...BASE, { key: 'wc_sync_product_enabled', value: 'true' }, { key: 'wc_sync_product_direction', value: 'to_wc' }].map((row) => (row.key === change.key ? change : row)))
+    }
+    const { pushImsProductToWc } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+    const raced = await pushImsProductToWc('ims-1')
+    state.onWire = null
+    assert.equal(raced.skipped, true)
+    assert.ok(state.wireCalls.length > 0, 'the push had started')
+    assert.deepEqual(writes(), [], 'nothing may be written after the setting was turned off')
+  }
+})

@@ -44,6 +44,7 @@ mock.module('@/lib/db', {
       setting: {
         findUnique: async ({ where }: { where: { key: string } }) => {
           if (where.key === 'wc_initial_import_completed') return { value: 'true' }
+          if (where.key === 'wc_url') return { value: 'https://shop.example.com' }
           if (where.key === 'wc_sync_order_statuses') {
             return statusSettingValue === null ? null : { value: statusSettingValue }
           }

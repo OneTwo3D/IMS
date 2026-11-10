@@ -2208,6 +2208,13 @@ export async function pushImsProductToWc(
       }
     }
 
+    // The settings were read at the start, before a run of WooCommerce reads. Saving the Sync page
+    // does not bump `wc_settings_version`, so the version check above cannot see it turned off
+    // meanwhile: read both settings again immediately before the write. A failed read throws to
+    // the catch below and refuses the push.
+    const lastLook = await readWcProductPushDecision()
+    if (!lastLook.allowed) return { success: true, skipped: true, error: lastLook.message }
+
     const { error: putError } = await wcPut(putPath, updateData, creds)
     if (putError) return { success: false, error: putError }
 

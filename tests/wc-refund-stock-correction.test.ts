@@ -27,7 +27,7 @@ mock.module('@/lib/db', {
     db: {
       setting: {
         findUnique: async ({ where }: { where: { key: string } }) => (
-          where.key === 'wc_initial_import_completed' ? { value: 'true' } : null
+          where.key === 'wc_initial_import_completed' ? { value: 'true' } : where.key === 'wc_url' ? { value: 'https://shop.example.com' } : null
         ),
         upsert: async () => ({}),
       },

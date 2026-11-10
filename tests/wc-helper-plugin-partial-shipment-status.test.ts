@@ -48,11 +48,11 @@ test('plugin source: every status write in the route is behind the eligibility c
 const php = spawnSync('php', ['-v'])
 const phpAvailable = php.status === 0
 
-function eligible(status: string, filterReturns: boolean | null = null): boolean {
+function eligible(status: string, filterReturns: string | null = null): boolean {
   // the slice ends with the closing brace of the `if (!function_exists(...))` wrapper: drop it
   const fn = phpFunction('oti_ps_status_eligible').trimEnd().replace(/\}$/, '')
   const code = `
-function apply_filters($tag, $value, ...$args) { return ${filterReturns === null ? '$value' : String(filterReturns)}; }
+function apply_filters($tag, $value, ...$args) { return ${filterReturns === null ? '$value' : filterReturns}; }
 ${fn}
 echo oti_ps_status_eligible($argv[1]) ? 'yes' : 'no';`
   const run = spawnSync('php', ['-d', 'display_errors=1', '-r', code, '--', status], { encoding: 'utf8' })
@@ -73,5 +73,13 @@ test('oti_ps_status_eligible: cancelled, refunded, on-hold, completed and the re
 })
 
 test('oti_ps_status_eligible: a store can opt a custom in-flight status in through the filter', { skip: !phpAvailable && 'php not installed' }, () => {
-  assert.equal(eligible('ready-to-ship', true), true)
+  assert.equal(eligible('ready-to-ship', 'true'), true)
+})
+
+test('oti_ps_status_eligible: only a strict boolean true opts in; string/number/null filter returns do not', { skip: !phpAvailable && 'php not installed' }, () => {
+  for (const returned of ["'false'", "'0'", "'1'", "'true'", '1', '0', 'null', "''", '[]']) {
+    assert.equal(eligible('cancelled', returned), false, `filter returned ${returned}`)
+  }
+  assert.equal(eligible('processing', 'false'), false)
+  assert.equal(eligible('processing', "'false'"), false, 'the string false must not leave processing eligible by truthiness')
 })

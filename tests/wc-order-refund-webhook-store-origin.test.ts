@@ -144,13 +144,32 @@ for (const [resource, payload, key] of [
     assert.deepEqual(state.activity, [])
   })
 
-  test(`${key}: an unreadable binding does not discard a delivery that names a store`, async () => {
+  test(`${key}: an unreadable binding HOLDS the delivery (503, retried, visible), neither importing nor dropping it`, async () => {
     reset()
     state.settings.delete('wc_url')
     const { calls, dependencies } = spies()
 
-    await dispatch(resource, 'store:store-a.example.com', payload, dependencies)
+    const response = await dispatch(resource, 'store:store-a.example.com', payload, dependencies)
 
-    assert.equal(calls[key].length, 1)
+    assert.equal(response.status, 503, 'a retryable status: the inbox retries, then dead-letters visibly')
+    assert.equal((await response.json() as Row).held, true)
+    assert.deepEqual(calls[key], [])
+    const logged = state.activity.find((entry) => entry.action === `wc_${key}_webhook_held`)
+    assert.ok(logged, 'the hold must be visible to an operator')
+    assert.equal(logged.level, 'ERROR')
+    assert.equal((logged.metadata as Row).verdict, 'binding-unreadable')
+  })
+
+  test(`${key}: evidence of only a location UNDER the store (permalink/self-link) is held, not accepted`, async () => {
+    reset()
+    const { calls, dependencies } = spies()
+
+    const response = await dispatch(resource, 'store-under:store-a.example.com/shop/order/9001', payload, dependencies)
+
+    assert.equal(response.status, 503)
+    assert.deepEqual(calls[key], [])
+    const logged = state.activity.find((entry) => entry.action === `wc_${key}_webhook_held`)
+    assert.ok(logged)
+    assert.equal((logged.metadata as Row).originScope, 'under')
   })
 }

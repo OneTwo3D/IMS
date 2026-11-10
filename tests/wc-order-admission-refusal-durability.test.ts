@@ -251,6 +251,7 @@ function reset() {
   store.statusMappings = [{ externalStatus: 'processing', imsStatus: 'PROCESSING' }]
   store.settings = new Map([
     ['wc_initial_import_completed', 'true'],
+    ['wc_url', 'https://shop.example.com'],
     ['wc_sync_order_statuses', JSON.stringify(['processing'])],
   ])
 }

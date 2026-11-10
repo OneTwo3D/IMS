@@ -460,7 +460,8 @@ if (!function_exists('oti_ps_status_eligible')) {
             $slug = substr($slug, 3);
         }
         $eligible = in_array($slug, ['processing', 'partial-shipped'], true);
-        return (bool) apply_filters('oti_partial_shipment_status_eligible', $eligible, $slug);
+        // Strictly boolean true: a filter returning the string 'false', '0', 1 or null must not opt in.
+        return apply_filters('oti_partial_shipment_status_eligible', $eligible, $slug) === true;
     }
 }
 
