@@ -3390,7 +3390,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         where: { connector, state: 'PENDING_VERIFY', externalOrderId: { not: null } },
         select: {
           id: true, orderId: true, externalOrderId: true, attempts: true, courierPending: true,
-          order: { select: { orderNumber: true, shippingService: true } },
+          order: { select: { orderNumber: true, externalOrderNumber: true, shippingService: true } },
         },
         take: limit,
         // Least-recently-ATTEMPTED first (o3d-bjc.8). An `unknown` verdict leaves
@@ -3404,7 +3404,8 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         id: row.id,
         orderId: row.orderId,
         externalOrderId: row.externalOrderId,
-        orderNumber: row.order?.orderNumber ?? null,
+        // What buildPushInput sent as OrderNumber (wmsPushOrderReference), so the order verified is the one created.
+        orderNumber: row.order ? wmsPushOrderReference({ id: row.orderId, orderNumber: row.order.orderNumber, externalOrderNumber: row.order.externalOrderNumber }) : null,
         // What buildPushInput sends as ExternalOrderReference.
         externalReference: row.orderId,
         verifyAttempts: row.attempts,

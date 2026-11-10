@@ -502,3 +502,34 @@ test('R10b: verify by REFERENCE (the by-id read failed) never proves a cancelled
   searchRows = [{ ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 }]
   assert.equal(await verifyMintsoftPushedOrder('555', ref), 'ours', 'control')
 })
+
+test('R11: the expected REFERENCE under a DIFFERENT NUMBER never verifies - by id and by reference', async () => {
+  reset()
+  const { verifyMintsoftPushedOrder } = await push()
+  const ref = { orderNumber: 'WC-1001', externalReference: 'REF-1001' }
+  // by id: another same-client order carrying our reused reference under its own number
+  details.set('777', { ID: 777, OrderNumber: 'OTHER-77', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 })
+  searchRows = []
+  assert.notEqual(await verifyMintsoftPushedOrder('777', ref), 'ours', 'by id')
+  // by reference (the by-id read fails): the search finds the look-alike under the id the link recorded
+  details.clear()
+  searchRows = [{ ID: 777, OrderNumber: 'OTHER-77', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 }]
+  assert.equal(await verifyMintsoftPushedOrder('777', ref), 'unknown', 'by reference')
+  // and the reverse: our number under a different reference
+  details.set('778', { ID: 778, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-OTHER', ClientId: CLIENT, OrderStatusId: 1 })
+  assert.notEqual(await verifyMintsoftPushedOrder('778', ref), 'ours')
+})
+
+test('R11: an order that does not echo one of the two fields is UNVERIFIED (unknown), never accepted; both fields present still verify', async () => {
+  reset()
+  const { verifyMintsoftPushedOrder } = await push()
+  const ref = { orderNumber: 'WC-1001', externalReference: 'REF-1001' }
+  details.set('555', { ID: 555, OrderNumber: 'WC-1001', ClientId: CLIENT, OrderStatusId: 1 })
+  searchRows = [{ ID: 555, OrderNumber: 'WC-1001', ClientId: CLIENT, OrderStatusId: 1 }]
+  assert.equal(await verifyMintsoftPushedOrder('555', ref), 'unknown', 'no reference echoed')
+  details.set('555', { ID: 555, ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 })
+  assert.equal(await verifyMintsoftPushedOrder('555', ref), 'unknown', 'no number echoed')
+  assert.equal(await verifyMintsoftPushedOrder('555', { orderNumber: 'WC-1001', externalReference: null }), 'unknown', 'nothing to match the reference against')
+  details.set('555', { ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 })
+  assert.equal(await verifyMintsoftPushedOrder('555', ref), 'ours', 'control')
+})

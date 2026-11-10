@@ -52,6 +52,19 @@ function orderLiveness(row: RawOrder): 'live' | 'cancelled' | 'unknown' {
   return status === MINTSOFT_STATUS_CANCELLED ? 'cancelled' : 'live'
 }
 
+/**
+ * THE ONE IDENTITY PREDICATE, shared by the read-back before binding and both verification routes: an order is OURS only if it carries
+ * BOTH this order's OrderNumber AND its own ExternalOrderReference, exactly. `incomplete` (a field is absent, nothing contradicts) proves
+ * nothing either way and stays unverified; `mismatch` (a present field differs) is somebody else's order.
+ */
+function orderIdentity(row: RawOrder, identity: { orderNumber: string | null; externalReference: string | null }): 'match' | 'mismatch' | 'incomplete' {
+  if (!identity.orderNumber || !identity.externalReference) return 'incomplete'
+  const number = toStr(row.OrderNumber)
+  const ref = toStr(row.ExternalOrderReference)
+  if ((number !== null && number !== identity.orderNumber) || (ref !== null && ref !== identity.externalReference)) return 'mismatch'
+  return number === null || ref === null ? 'incomplete' : 'match'
+}
+
 function orderStatusId(row: RawOrder): number | null {
   const value = row.OrderStatusId
   const n = typeof value === 'number' ? value : Number.parseInt(toStr(value) ?? '', 10)
@@ -224,7 +237,7 @@ async function readBackLiveOrder(id: string, clientId: number, identity: { order
     return { ok: false, kind: 'unconfirmed', reason: 'Mintsoft holds this order but the read-back did not confirm it is ours, so it was not linked' }
   }
   // IDENTITY: the order read back must carry BOTH this order's number and its own reference, exactly. A missing field is a mismatch.
-  if (toStr(row.OrderNumber) !== identity.orderNumber || !identity.externalReference || toStr(row.ExternalOrderReference) !== identity.externalReference) {
+  if (orderIdentity(row, identity) !== 'match') {
     return { ok: false, kind: 'unconfirmed', reason: 'Mintsoft holds an order under this number but the read-back does not carry this order\'s own number and reference, so it was not linked' }
   }
   const liveness = orderLiveness(row)
@@ -556,15 +569,9 @@ export async function verifyMintsoftPushedOrder(
   // response said. A create that answered with some other order's id would
   // otherwise verify perfectly — same tenant, same id — and the link would go
   // SYNCED pointing at another customer's order while ours stayed orphaned.
-  const identifies = (row: RawOrder): boolean => {
-    const number = toStr(row.OrderNumber)
-    const ref = toStr(row.ExternalOrderReference)
-    if (wantNumber && number === wantNumber) return true
-    if (wantReference && ref === wantReference) return true
-    return false
-  }
-  if (!wantNumber && !wantReference) {
-    // Nothing to check identity against: refuse to claim either way.
+  const want = { orderNumber: wantNumber, externalReference: wantReference }
+  if (!wantNumber || !wantReference) {
+    // BOTH are needed to say an order is ours (a reused reference under another number is another order): refuse to claim either way.
     return 'unknown'
   }
 
@@ -582,7 +589,12 @@ export async function verifyMintsoftPushedOrder(
         // "we may touch this row", not "this row is the order we created".
         // Only a PRESENT, non-CANCELLED status proves a live order ours: a link must not become SYNCED against a dead one, nor on a row that
         // says nothing about its status. Otherwise it stays unproven (retried, then quarantined for an operator).
-        if (rowClient === String(clientId) && identifies(row)) return orderLiveness(row) === 'live' ? 'ours' : 'unknown'
+        if (rowClient === String(clientId)) {
+          const identity = orderIdentity(row, want)
+          if (identity === 'match') return orderLiveness(row) === 'live' ? 'ours' : 'unknown'
+          // A field the order does not echo proves nothing: unverified (retried, then quarantined for an operator), never accepted.
+          if (identity === 'incomplete') return 'unknown'
+        }
         if (rowClient && rowClient !== String(clientId)) return 'foreign'
         if (rowClient === String(clientId)) {
           // Ours to touch, but it is somebody else's ORDER. Not 'foreign' in the
@@ -598,14 +610,14 @@ export async function verifyMintsoftPushedOrder(
 
   // 2. By reference. If the create landed but the id we recorded is wrong, our
   //    own order number still finds it under our own tenant.
-  if (wantNumber) {
+  {
     try {
       const query = new URLSearchParams({ OrderNumber: wantNumber, ClientId: String(clientId) })
       const search = await mintsoftRequest<unknown>(`/api/Order/Search?${query.toString()}`)
       if (!search.error) {
         const rows = extractMintsoftArrayPayloadStrict(search.data, 'Order/Search (push verify)')
           .map((row) => assertMintsoftOrderClient(row, clientId, 'Mintsoft Order/Search (push verify)'))
-          .filter(identifies)
+          .filter((row) => orderIdentity(row, want) === 'match')
           // Only a row whose status is KNOWN and not CANCELLED proves a live order (an absent status proves nothing).
           .filter((row) => orderLiveness(row) === 'live')
         if (rows.some((row) => toStr(row.ID ?? row.Id ?? row.id) === externalOrderId)) return 'ours'
