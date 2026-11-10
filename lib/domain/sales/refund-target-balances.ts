@@ -118,3 +118,107 @@ export function overAllocatedRefundTargetMessage(over: OverAllocatedRefundTarget
     'Split the refund across the parts it actually covered.'
   )
 }
+
+/**
+ * WHICH SAFEGUARDS A REFUND CALLER GETS. A refund from the public action (an operator in the UI) is always capped per target and has its
+ * itemised sale lines cut from what each order line has left; both only ever REFUSE or REDUCE, so they need no internal capability.
+ * An internal caller (storefront sync, chargeback poller, exception-inbox hand recording) states its own reconciled amounts and keeps the
+ * caps opt-in: the per-target cap by option, the re-cut never.
+ */
+export function refundSafeguards(input: { isInternal: boolean; requestedPerTargetCap?: boolean }): {
+  enforcePerTargetBalances: boolean
+  deriveSaleLineNetsFromStoredBalance: boolean
+} {
+  return {
+    enforcePerTargetBalances: !input.isInternal || input.requestedPerTargetCap === true,
+    deriveSaleLineNetsFromStoredBalance: !input.isInternal,
+  }
+}
+
+/**
+ * A REFUND QUANTITY IS NEVER NEGATIVE OR NOT A NUMBER, for any caller. Every internal builder sends the absolute quantity (WooCommerce's negative
+ * refund quantities are made positive at the boundary); a negative or non-finite one would be written as is and later offset a real refund in the
+ * quantity history (-1 then +2 passes a 1-unit line).
+ */
+export function invalidQuantityRefusal(lines: readonly { qty: number }[]): string | null {
+  return lines.some((line) => !Number.isFinite(line.qty) || line.qty < 0)
+    ? 'A refund quantity must be zero or more.'
+    : null
+}
+
+/**
+ * A SHIPPING OR DISCOUNT ROW IS MONEY ONLY: no product and no quantity. Stock return, COGS reversal and the quantity caps all key on a
+ * row's productId and qty, so a shipping row carrying a product and a quantity (with a return warehouse) would restock that product while the
+ * sale line's money was never refunded. Every caller that builds such rows (chargeback, storefront sync, the inbox) already sends productId
+ * null and qty 0; this holds for every caller.
+ */
+export function nonSaleRowRefusal(lines: readonly { productId?: string | null; qty: number; lineKind?: 'sale' | 'shipping' | 'discount' | null }[]): string | null {
+  const bad = lines.find((line) => (line.lineKind === 'shipping' || line.lineKind === 'discount') && (line.productId || line.qty > 0))
+  return bad
+    ? `A ${bad.lineKind} refund row carries money only: it cannot name a product or a quantity (stock is returned only through sale lines).`
+    : null
+}
+
+/**
+ * WHAT A PUBLIC (operator-typed) REFUND MAY CONTAIN. Itemised order lines only: the refund dialog sends nothing else. A mirrored order
+ * discount line (negative money) or a monetary line attributed to no order line would let a caller offset the ceiling, e.g. an unlinked
+ * +100 sale line beside a -100 discount line records a refund of 0 while the credit note posts the grossed-up sale line. Storefront
+ * sync, the chargeback poller and the exception inbox do send such lines and are not subject to this.
+ */
+export function publicRefundLineRefusal(lines: readonly { lineId?: string | null; qty: number; lineKind?: 'sale' | 'shipping' | 'discount' | null }[]): string | null {
+  if (lines.some((line) => line.lineKind === 'discount')) {
+    return 'A refund entered by hand cannot carry a discount line. Refund the order lines themselves.'
+  }
+  // Each accepted line's kind must match its target: a sale line is an order line (it has an id); shipping is the order's shipping charge (it has none).
+  if (lines.some((line) => line.lineKind === 'shipping' && line.lineId)) {
+    return 'A shipping refund is against the order\'s shipping charge, not an order line.'
+  }
+  // A line-linked sale row refunds units: amount-only (quantity 0) rows skip the locked quantity derivation and checks, so they are for internal paths only
+  // (storefront sync, the inbox's hand recording); a price-only change by an operator would need its own validated route.
+  if (lines.some((line) => (line.lineKind ?? 'sale') === 'sale' && !(line.qty > 0))) {
+    return 'Every refunded order line needs a quantity above zero.'
+  }
+  if (lines.some((line) => !line.lineId && line.lineKind !== 'shipping')) {
+    return 'Every refunded line must be a line of the order. An amount attributed to no order line cannot be refunded here.'
+  }
+  return null
+}
+
+/**
+ * The first order line whose refunds, once the credit note is GROSSED UP, would exceed what the customer paid for it (its stored net plus
+ * its stored VAT). The grossing rate is the higher of the line's own charged rate and the rate of the tax code the credit note posts it
+ * under (`postedRate`, null when that code cannot be priced), so a code worth more than the line was charged at cannot return more than
+ * was paid. Net refunds are already capped per line; this closes the gap a differing posting rate would open.
+ */
+export function findGrossOverPaidBalance(input: {
+  orderLines: readonly { id: string; description?: string | null; totalForeign?: DecimalInput; taxForeign?: DecimalInput }[]
+  priorRefundLines: readonly PriorRefundTargetLine[]
+  allocations: readonly RefundTargetAllocation[]
+  postedRate: (lineId: string) => number | null
+  epsilon?: number
+}): { label: string; refundedGross: Decimal; paidGross: Decimal } | null {
+  const epsilon = toDecimal(input.epsilon ?? REFUND_TARGET_BALANCE_EPSILON)
+  const net = new Map<string, Decimal>()
+  const add = (id: string, value: DecimalInput) => net.set(id, (net.get(id) ?? toDecimal(0)).add(toDecimal(value)))
+  for (const prior of input.priorRefundLines) if (prior.salesOrderLineId && prior.lineKind !== 'discount') add(prior.salesOrderLineId, prior.totalForeign ?? 0)
+  const touched = new Set<string>()
+  for (const allocation of input.allocations) {
+    if (!allocation.lineId || allocation.lineKind === 'discount') continue
+    add(allocation.lineId, allocation.netForeign)
+    touched.add(allocation.lineId)
+  }
+  for (const line of input.orderLines) {
+    if (!touched.has(line.id)) continue
+    const chargedNet = toDecimal(line.totalForeign ?? 0)
+    const chargedTax = toDecimal(line.taxForeign ?? 0)
+    const ownRate = chargedNet.gt(0) ? chargedTax.div(chargedNet) : toDecimal(0)
+    const posted = input.postedRate(line.id)
+    const rate = posted != null && toDecimal(posted).gt(ownRate) ? toDecimal(posted) : ownRate
+    const refundedGross = (net.get(line.id) ?? toDecimal(0)).mul(toDecimal(1).add(rate))
+    const paidGross = chargedNet.add(chargedTax)
+    if (refundedGross.sub(paidGross).gt(epsilon)) {
+      return { label: line.description || `line ${line.id}`, refundedGross, paidGross }
+    }
+  }
+  return null
+}
