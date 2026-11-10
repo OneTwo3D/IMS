@@ -87,6 +87,8 @@ export type ShipmentTransitionResult =
       stockSyncProductIds: string[]
       /** Present only for a dispatch asked to promote the order in its own transaction (`input.completion`). */
       reconciliation?: ShipmentReconciliationResult
+      /** The order status found under the lock when a warehouse-reported dispatch was recorded against an unreleased order. */
+      despatchedWhileNotReady?: string
     }
 
 /**
@@ -1105,11 +1107,12 @@ export async function transitionShipmentStatus(
      */
     completion?: OrderPromotionOptions
     /**
-     * A WAREHOUSE-reported dispatch (the goods have already physically left): record it even though the order is
-     * DRAFT / ON_HOLD / PENDING_PAYMENT. The caller must not also pass `completion` — the order is left exactly as
-     * it is. Never set by an in-app dispatch, which refuses those statuses.
+     * A WAREHOUSE-reported dispatch (the goods have already physically left): when, UNDER THE ORDER LOCK, the order is
+     * found DRAFT / ON_HOLD / PENDING_PAYMENT, record the dispatch but leave the order exactly as it is (no promotion,
+     * and `despatchedWhileNotReady` is returned for the caller's review event). Any other status promotes normally via
+     * `completion`. Never set by an in-app dispatch, which refuses those statuses.
      */
-    recordDespatchOnly?: boolean
+    allowRecordWhenNotReady?: boolean
   },
 ): Promise<ShipmentTransitionResult> {
   const { shipmentId, targetStatus, extra } = input
@@ -1205,7 +1208,8 @@ export async function transitionShipmentStatus(
 
       // An IN-APP dispatch of an order that is not ready to ship is refused here, under the order lock and before
       // any stock, FIFO or COGS work: it would otherwise silently finalise a draft, clear a hold or bypass payment.
-      if (withdrawn && !input.recordDespatchOnly && ORDER_STATUSES_NOT_READY_TO_DISPATCH.has(String(withdrawn.status))) {
+      const lockedNotReady = !!withdrawn && ORDER_STATUSES_NOT_READY_TO_DISPATCH.has(String(withdrawn.status))
+      if (withdrawn && lockedNotReady && !input.allowRecordWhenNotReady) {
         return {
           success: false as const,
           error: orderNotReadyToDispatchMessage(String(withdrawn.status)),
@@ -1411,7 +1415,7 @@ export async function transitionShipmentStatus(
       // dispatch always leaves a valid order. Run after the COGS refresh so the shortfall read sees the
       // shipment as SHIPPED. Invoice trigger setting is read on the same client.
       let reconciliation: ShipmentReconciliationResult | undefined
-      if (input.completion) {
+      if (input.completion && !lockedNotReady) {
         const outcome = await promoteOrderIfFulfilledInTx(
           tx, lockedShipment.orderId, extra, input.completion,
         )
@@ -1423,6 +1427,7 @@ export async function transitionShipmentStatus(
         shipment: updatedShipment,
         stockSyncProductIds: lockedProductIds,
         reconciliation,
+        despatchedWhileNotReady: lockedNotReady && withdrawn ? String(withdrawn.status) : undefined,
       }
     })
 
@@ -1439,6 +1444,7 @@ export async function transitionShipmentStatus(
       previousStatus: shipment.status,
       stockSyncProductIds: dispatchResult.stockSyncProductIds,
       ...(dispatchResult.reconciliation ? { reconciliation: dispatchResult.reconciliation } : {}),
+      ...(dispatchResult.despatchedWhileNotReady ? { despatchedWhileNotReady: dispatchResult.despatchedWhileNotReady } : {}),
     }
   }
 

@@ -24,6 +24,9 @@ const state = {
   notifications: [] as Row[],
   /** Activity rows already persisted (what `db.activityLog.findFirst` sees). */
   persistedActivity: [] as Row[],
+  /** The status the dispatch transaction finds UNDER THE LOCK; null means it is promotable. */
+  lockedStatus: null as string | null,
+  notifyOk: true,
 }
 
 mock.module('@/lib/activity-log', {
@@ -55,13 +58,19 @@ mock.module('@/app/actions/allocation', {
     confirmAllocations: async () => ({ success: true }),
     updateShipmentStatus: async (_id: string, target: string, _extra: unknown, options: Row | undefined) => {
       state.transitions.push({ target, options })
-      return { success: true }
+      return state.lockedStatus ? { success: true, despatchedWhileNotReady: state.lockedStatus } : { success: true }
     },
   },
 })
 
 mock.module('@/lib/notifications', {
-  namedExports: { notify: async (entry: Row) => { state.notifications.push(entry) } },
+  namedExports: {
+    notifyPersisted: async (entry: Row) => {
+      if (!state.notifyOk) return false
+      state.notifications.push(entry)
+      return true
+    },
+  },
 })
 
 mock.module('@/lib/domain/sales/shipment-service', {
@@ -83,6 +92,8 @@ function reset() {
   state.transitions = []
   state.notifications = []
   state.persistedActivity = []
+  state.lockedStatus = null
+  state.notifyOk = true
 }
 
 async function apply(extra: Row = {}) {
@@ -138,15 +149,15 @@ for (const held of ['ON_HOLD', 'PENDING_PAYMENT']) {
     reset()
     state.orderStatus = held
     state.openShipments = [{ id: 'shp-1', status: 'PACKED' }]
+    state.lockedStatus = held
 
     const result = await apply()
 
     assert.deepEqual(result, { success: true, despatchedWhileNotReady: held })
     assert.equal(state.transitions.length, 1)
     assert.equal(state.transitions[0].target, 'SHIPPED')
-    assert.equal(state.transitions[0].options?.recordDespatchOnly, true)
-    assert.equal(state.transitions[0].options?.storefrontCompletion, false, 'no storefront completion is queued')
-    assert.equal(state.transitions[0].options?.skipStorefrontPush, true)
+    assert.equal(state.transitions[0].options?.allowRecordWhenNotReady, true)
+    // The decision is the transaction's, under the order lock; it enqueues the completion only if it promotes.
     assert.equal(state.reconcileCalls.length, 0, 'the order is not reconciled or promoted')
     assert.ok(state.activity.some((row) => row.action === 'external_despatch_recorded_order_not_ready' && row.level === 'WARNING'))
     assert.equal(state.notifications.length, 1)
@@ -214,6 +225,54 @@ test('SHP-H1: a WMS despatch for a PROCESSING order still promotes it', async ()
   const result = await apply()
 
   assert.deepEqual(result, { success: true })
-  assert.equal(state.transitions[0].options?.recordDespatchOnly, undefined)
+  assert.equal(state.transitions[0].options?.allowRecordWhenNotReady, true, 'the decision is made under the lock, not on the pre-read')
   assert.equal(state.transitions[0].options?.storefrontCompletion, true)
+})
+
+test('SHP-H1: a held order released between the pre-read and the dispatch lock is promoted normally, with no review event', async () => {
+  reset()
+  state.orderStatus = 'ON_HOLD' // the pre-read
+  state.openShipments = [{ id: 'shp-1', status: 'PACKED' }]
+  state.lockedStatus = null // under the lock it was already released
+
+  const result = await apply()
+
+  assert.deepEqual(result, { success: true })
+  assert.equal(state.notifications.length, 0)
+  assert.equal(state.persistedActivity.some((row) => row.action === 'external_despatch_recorded_order_not_ready'), false)
+})
+
+test('SHP-H1: an order that looked ready but is on hold under the lock is recorded without promotion and reviewed', async () => {
+  reset()
+  state.orderStatus = 'PROCESSING' // the pre-read
+  state.openShipments = [{ id: 'shp-1', status: 'PACKED' }]
+  state.lockedStatus = 'ON_HOLD'
+
+  const result = await apply()
+
+  assert.deepEqual(result, { success: true, despatchedWhileNotReady: 'ON_HOLD' })
+  assert.equal(state.notifications.length, 1)
+})
+
+test('SHP-H1: a failed bell notice leaves no marker, so the next tick raises the event again', async () => {
+  reset()
+  state.orderStatus = 'ON_HOLD'
+  state.openShipments = [{ id: 'shp-1', status: 'PACKED' }]
+  state.lockedStatus = 'ON_HOLD'
+  state.notifyOk = false
+
+  const first = await apply()
+
+  assert.deepEqual(first, { success: true, despatchedWhileNotReady: 'ON_HOLD' })
+  assert.equal(state.persistedActivity.some((row) => row.action === 'external_despatch_recorded_order_not_ready'), false, 'no marker while the notice is unwritten')
+
+  // Next tick: the shipment is recorded, nothing left to transition; the bell now works.
+  state.openShipments = []
+  state.lockedStatus = null
+  state.notifyOk = true
+  const second = await apply()
+
+  assert.deepEqual(second, { success: true, despatchedWhileNotReady: 'ON_HOLD' })
+  assert.equal(state.notifications.length, 1)
+  assert.equal(state.persistedActivity.some((row) => row.action === 'external_despatch_recorded_order_not_ready'), true)
 })

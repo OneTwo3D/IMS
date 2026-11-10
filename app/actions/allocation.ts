@@ -1575,19 +1575,20 @@ export async function updateShipmentStatus(
     /** Re-checked under the order lock inside the SHIPPED transaction; a non-null answer refuses the dispatch. */
     shipFence?: (tx: ShipmentServiceClient) => Promise<string | null>
     /**
-     * A warehouse-reported dispatch of an order that is DRAFT / ON_HOLD / PENDING_PAYMENT: the goods have left, so
-     * the shipment, stock, FIFO and COGS are recorded, but the order is NOT promoted and nothing is pushed to the
-     * storefront. Only `applyExternalFulfillmentUpdate` sets it.
+     * A warehouse-reported dispatch: if the order is found DRAFT / ON_HOLD / PENDING_PAYMENT under the order lock, the
+     * goods have left, so the shipment, stock, FIFO and COGS are recorded, but the order is NOT promoted and nothing is
+     * pushed to the storefront (`despatchedWhileNotReady` is returned). Any other status promotes as usual. Honoured only
+     * for the internal caller (`applyExternalFulfillmentUpdate`).
      */
-    recordDespatchOnly?: boolean
+    allowRecordWhenNotReady?: boolean
   },
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; despatchedWhileNotReady?: string }> {
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.process')
     }
     // Honoured only for the internal (system) caller: an operator's dispatch can never record on a held order.
-    const recordDespatchOnly = options?.recordDespatchOnly === true && options?.internalBypassToken === INTERNAL_ACTION_BYPASS
+    const allowRecordWhenNotReady = options?.allowRecordWhenNotReady === true && options?.internalBypassToken === INTERNAL_ACTION_BYPASS
     const completionAuthority = options?.completionAuthority ?? 'IMS'
     const completion = {
       completionAuthority,
@@ -1601,8 +1602,8 @@ export async function updateShipmentStatus(
       targetStatus,
       extra,
       ...(targetStatus === 'SHIPPED' && options?.shipFence ? { fence: options.shipFence } : {}),
-      ...(targetStatus === 'SHIPPED' && !recordDespatchOnly ? { completion } : {}),
-      ...(recordDespatchOnly ? { recordDespatchOnly: true } : {}),
+      ...(targetStatus === 'SHIPPED' ? { completion } : {}),
+      ...(allowRecordWhenNotReady ? { allowRecordWhenNotReady: true } : {}),
     })
     if (!result.success) {
       try {
@@ -1620,7 +1621,7 @@ export async function updateShipmentStatus(
       // Already reconciled in the dispatch transaction when this call did the dispatch; a re-run against an
       // already-SHIPPED shipment (retry, crashed post-commit step) reconciles here instead.
       const reconciliation = result.reconciliation
-        ?? (recordDespatchOnly
+        ?? (result.despatchedWhileNotReady
           ? { shouldGenerateInvoice: false, orderId: result.shipment.orderId }
           : await reconcileOrderAfterShipment(db, result.shipment, extra, completion))
       // The shipments shipped (the goods left) but the order was NOT flipped: the verification no longer holds. Everything below still
@@ -1711,7 +1712,7 @@ export async function updateShipmentStatus(
       // is the immediate post-commit attempt — tracking first, then the status, never failing the shipment
       // (o3d-zvec.15). Without a key (partial shipment, EXTERNAL authority with no storefrontCompletion, an
       // unlinked order) only the tracking goes.
-      if (options?.skipStorefrontPush !== true) {
+      if (options?.skipStorefrontPush !== true && !result.despatchedWhileNotReady) {
         await pushShipmentCompletionToShopping({
           orderId: result.shipment.orderId,
           completionKey: storefrontCompletionKey,
@@ -1726,7 +1727,9 @@ export async function updateShipmentStatus(
         console.error(syncError)
       }
     }
-    return fenceRefusal === null ? { success: true } : { success: false, error: fenceRefusal }
+    return fenceRefusal === null
+      ? { success: true, ...(result.despatchedWhileNotReady ? { despatchedWhileNotReady: result.despatchedWhileNotReady } : {}) }
+      : { success: false, error: fenceRefusal }
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e)
     try {

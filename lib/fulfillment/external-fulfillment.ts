@@ -741,6 +741,8 @@ export async function applyExternalFulfillmentUpdate(
     orderBy: { createdAt: 'asc' },
   })
 
+  // The unreleased status the dispatch transaction itself found under the order lock (set only when it recorded without promoting).
+  let lockedNotReadyStatus: string | null = null
   for (let index = 0; index < shipments.length; index++) {
     const shipment = shipments[index]
     const transitions = statusesToApply(shipment.status as ExternalShipmentStatus, update.targetShipmentStatus)
@@ -780,16 +782,21 @@ export async function applyExternalFulfillmentUpdate(
           // customer despatch email it exists to fire), and raise a `shipped_short` WARNING on
           // every external dispatch. See `OrderCompletionAuthority`.
           completionAuthority: 'EXTERNAL',
-          ...(orderNotReady ? { recordDespatchOnly: true } : {}),
+          // The goods have already left: if the order is found unreleased UNDER THE ORDER LOCK the dispatch is recorded
+          // without promotion (and reported back); if it was released meanwhile it promotes normally. The pre-read above
+          // only decides whether IMS may allocate / create shipments, never whether the order is promoted.
+          allowRecordWhenNotReady: true,
           // o3d-zvec.15: a WMS dispatch is the thing that completes the storefront order, so the
           // durable completion job is enqueued WITH the flip (tracking first, then the status; retried
           // by the cron; held for orders WooCommerce no longer has in flight). A storefront-sourced
           // completion must never push back, as it would only echo.
-          storefrontCompletion: !orderNotReady && isWmsConnectorId(update.source) && update.storefrontAlreadyCompleted !== true,
-          skipStorefrontPush: orderNotReady || update.storefrontAlreadyCompleted === true,
+          storefrontCompletion: isWmsConnectorId(update.source) && update.storefrontAlreadyCompleted !== true,
+          skipStorefrontPush: update.storefrontAlreadyCompleted === true,
           ...(update.storefrontAlreadyCompleted === true && update.shipFence ? { shipFence: update.shipFence } : {}),
         },
       )
+
+      if (result.success && result.despatchedWhileNotReady) lockedNotReadyStatus = result.despatchedWhileNotReady
 
       if (!result.success) {
         await logActivity({
@@ -842,45 +849,53 @@ export async function applyExternalFulfillmentUpdate(
     }
   }
 
-  if (orderNotReady) {
+  // Which status to review: the one the dispatch transaction found under the lock, else (a retry with nothing left to
+  // transition) the pre-read one.
+  const reviewStatus = lockedNotReadyStatus ?? (orderNotReady && shipments.length === 0 ? String(order.status) : null)
+  if (reviewStatus) {
     // The review event is ENSURED, not just written: this runs after the despatch committed, so a crash between the
     // commit and the notice would otherwise leave the retry (no open shipment left) reporting a quiet success with
-    // nobody told. The marker is the activity row, written LAST; the retry raises the event again unless the row exists.
-    const alreadyRaised = shipments.length === 0
+    // nobody told. The marker is the activity row, written LAST and ONLY once every notice has persisted; the retry
+    // raises the event again unless the row exists.
+    const alreadyRaised = lockedNotReadyStatus === null
       ? await db.activityLog.findFirst({
         where: { entityType: 'SALES_ORDER', entityId: order.id, action: NOT_READY_DESPATCH_ACTION },
         select: { id: true },
       })
       : null
-    if (shipments.length > 0 || !alreadyRaised) {
-      const notice = `${update.source} despatched order ${orderRef} while IMS holds it as ${String(order.status)}. The despatch, stock and`
+    if (!alreadyRaised) {
+      const notice = `${update.source} despatched order ${orderRef} while IMS holds it as ${reviewStatus}. The despatch, stock and`
         + ' cost have been recorded, but the order has NOT been marked shipped, its status is unchanged and no completion was sent to the'
         + ' storefront. Review the order: finalise or release it, then set it to Shipped if it should be closed.'
+      let noticesPersisted = false
       try {
-        const { notify } = await import('@/lib/notifications')
+        const { notifyPersisted } = await import('@/lib/notifications')
         const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
-        await Promise.all(admins.map((admin) => notify({
+        const persisted = await Promise.all(admins.map((admin) => notifyPersisted({
           userId: admin.id,
           type: 'error',
           title: 'Despatch on an order that is not ready to ship',
           message: notice,
           actionUrl: `/sales/${order.id}`,
         })))
+        noticesPersisted = persisted.every(Boolean)
       } catch (noticeError) {
         console.error('[external-fulfillment] not-ready despatch notice failed:', noticeError)
       }
-      await logActivity({
-        entityType: 'SALES_ORDER',
-        entityId: order.id,
-        action: NOT_READY_DESPATCH_ACTION,
-        tag: 'sync',
-        level: 'WARNING',
-        description: notice,
-        metadata: { source: update.source, orderStatus: order.status, shipmentsProcessed: shipments.length },
-        resolveUser: false,
-      })
+      if (noticesPersisted) {
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: order.id,
+          action: NOT_READY_DESPATCH_ACTION,
+          tag: 'sync',
+          level: 'WARNING',
+          description: notice,
+          metadata: { source: update.source, orderStatus: reviewStatus, shipmentsProcessed: shipments.length },
+          resolveUser: false,
+        })
+      }
     }
-    return { success: true, despatchedWhileNotReady: String(order.status) }
+    return { success: true, despatchedWhileNotReady: reviewStatus }
   }
 
   await logActivity({

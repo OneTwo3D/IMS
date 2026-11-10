@@ -3183,10 +3183,12 @@ for (const [parked, wording] of [['DRAFT', /still a draft.*Finalise the draft/],
     const result = await transitionShipmentStatus(createClient(state), {
       shipmentId: 'shipment-1',
       targetStatus: 'SHIPPED',
-      recordDespatchOnly: true,
+      allowRecordWhenNotReady: true,
+      completion: { completionAuthority: 'EXTERNAL' },
     })
 
     assert.equal(result.success, true)
+    assert.equal(result.success && result.despatchedWhileNotReady, parked, 'the locked decision is returned')
     assert.equal(state.shipments[0].status, 'SHIPPED')
     assert.equal(state.stockLevels[0].quantity, 0)
     assert.equal(state.movements.length, 1)
@@ -3204,6 +3206,26 @@ for (const [parked, wording] of [['DRAFT', /still a draft.*Finalise the draft/],
     assert.equal(result.orderReachedShipped, undefined)
   })
 }
+
+test('SHP-H1: a warehouse dispatch is decided on the status read UNDER the order lock: an order released since the pre-read is promoted normally', async () => {
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'PROCESSING' }], // was ON_HOLD when the caller looked
+    shipments: [{ ...PACKED_SHIPMENT }],
+    shipmentLines: [{ ...FULL_SHIPMENT_LINE }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+    allowRecordWhenNotReady: true,
+    completion: { completionAuthority: 'EXTERNAL' },
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(result.success && result.despatchedWhileNotReady, undefined)
+  assert.equal(state.orders[0].status, 'SHIPPED')
+  assert.equal(result.success && result.reconciliation?.orderReachedShipped, true)
+})
 
 test('SHP-H1: a promotion that cannot be made rolls the whole dispatch back, stock included', async () => {
   const state = baseState({
