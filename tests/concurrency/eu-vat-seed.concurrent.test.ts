@@ -257,7 +257,7 @@ test('a rate edited in the instant between the plan read and the row lock fails 
     try {
       // Rows are locked in ascending id order, so make the edited rate's lock the first one the apply takes.
       const result = await apply(digest, hooked as never)
-      assert.equal(fired, true)
+      assert.equal(fired, true, `edit #${edits.indexOf(edit)} never fired; result=${JSON.stringify(result.applied ? 'applied' : result.refusal)}`)
       assert.equal(result.applied, false)
       assert.equal(result.applied === false && result.refusal?.code, 'RATE_CHANGED_DURING_APPLY')
       const after = await snapshotRates()
@@ -268,11 +268,11 @@ test('a rate edited in the instant between the plan read and the row lock fails 
     } finally {
       await d.db.taxRate.update({ where: { id: de }, data: { rate: original.rate, name: original.name, countryCode: original.countryCode, accountingTaxType: original.accountingTaxType, usedFor: original.usedFor, reverseCharge: original.reverseCharge, reportingCategory: null, schemePostingTaxType: null } })
       await d.db.shoppingTaxRateMapping.update({ where: { id: ids.mappings[1]! }, data: { storeIdentity: STORE, taxRateId: de } })
-      const { id: _id, createdAt: _c, updatedAt: _u, ...fields } = origMapping
+      const fields = { connector: origMapping.connector, externalTaxRateId: origMapping.externalTaxRateId, externalName: origMapping.externalName, externalCountry: origMapping.externalCountry, externalRatePct: origMapping.externalRatePct, externalClass: origMapping.externalClass, taxRateId: origMapping.taxRateId, storeIdentity: origMapping.storeIdentity }
       await d.db.shoppingTaxRateMapping.upsert({ where: { id: zMapping }, create: origMapping, update: fields })
-      await d.db.taxRate.update({ where: { id: ids.rates[3]! }, data: { reportingCategory: null } })
     }
   }
+  await d.db.taxRate.update({ where: { id: ids.rates[3]! }, data: { reportingCategory: null } })
 })
 
 test('a shared IMS rate is one change with every mapping that names it; the apply writes it once and leaves the mappings alone', { skip }, async () => {
