@@ -7,7 +7,7 @@ import {
 import { updateMintsoftProductContent } from './api/product-content'
 import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 import { fetchMintsoftOrderList, fetchMintsoftOrderStatus, fetchMintsoftOrderParts, fetchMintsoftPartItems, probeMintsoftOrderPresence } from './api/orders'
-import { addMintsoftOrderComment, cancelMintsoftOrder, pushMintsoftOrder, reconcileMintsoftAmbiguousCreate, updateMintsoftOrder, verifyMintsoftPushedOrder } from './api/order-push'
+import { addMintsoftOrderComment, cancelMintsoftOrder, findMintsoftMergedSurvivor, pushMintsoftOrder, reconcileMintsoftAmbiguousCreate, updateMintsoftOrder, verifyMintsoftPushedOrder } from './api/order-push'
 import { parseMintsoftPositiveId } from './settings/schema'
 import { getSettingValue } from '@/lib/settings-store'
 
@@ -164,6 +164,11 @@ export class MintsoftConnector implements WmsConnector {
   /** A READ. Resolves a create whose outcome was never recorded; mutates nothing. */
   async reconcileAmbiguousCreate(reference: { orderNumber: string; externalReference: string }): Promise<WmsAmbiguousCreateResolution> {
     return reconcileMintsoftAmbiguousCreate(reference)
+  }
+
+  /** A READ. Was this order merged into another? Mutates nothing. */
+  async findMergedSurvivor(orderNumber: string): Promise<{ externalOrderId: string; externalOrderNumber: string } | null> {
+    return findMintsoftMergedSurvivor(orderNumber)
   }
 
   async updateOrder(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult> {

@@ -256,3 +256,45 @@ test('reconcile: an unconfigured tenant fails closed before any request', async 
   await assert.rejects(() => reconcileMintsoftAmbiguousCreate(REF))
   assert.deepEqual(calls, [])
 })
+
+// ---- merged survivor lookup: shapes from a live manual merge (B merged into C; no personal data) -------------------------------------
+
+const MERGED = { Name: 'MergedOrder', Value: 'True' }
+const survivorRow = (over: Record<string, unknown> = {}) => ({
+  ID: 2001, OrderNumber: 'ORD-C+ORD-B', ExternalOrderReference: 'REF-C', ClientId: CLIENT, OrderStatusId: 9, OrderNameValues: [MERGED], ...over,
+})
+
+test('merged survivor: found from the ABSORBED number (second part) and from the absorbing number (first part)', async () => {
+  reset()
+  const { findMintsoftMergedSurvivor } = await push()
+  searchRows = [survivorRow()]
+  assert.deepEqual(await findMintsoftMergedSurvivor('ORD-B'), { externalOrderId: '2001', externalOrderNumber: 'ORD-C+ORD-B' })
+  assert.deepEqual(await findMintsoftMergedSurvivor('ORD-C'), { externalOrderId: '2001', externalOrderNumber: 'ORD-C+ORD-B' })
+  assert.deepEqual(writes, [])
+  assert.ok(calls.every((c) => c.startsWith('/api/Order/Search')), 'only the search read')
+})
+
+test('merged survivor: refused without the MergedOrder flag, for a partial part, a foreign client, two candidates or a full page', async () => {
+  reset()
+  const { findMintsoftMergedSurvivor } = await push()
+  searchRows = [survivorRow({ OrderNameValues: [] })]
+  assert.equal(await findMintsoftMergedSurvivor('ORD-B'), null, 'no flag')
+  searchRows = [survivorRow({ OrderNameValues: [{ Name: 'MergedOrder', Value: 'False' }] })]
+  assert.equal(await findMintsoftMergedSurvivor('ORD-B'), null, 'flag false')
+  searchRows = [survivorRow()]
+  assert.equal(await findMintsoftMergedSurvivor('ORD'), null, 'a prefix of a part is not a part')
+  assert.equal(await findMintsoftMergedSurvivor('ORD-B+ORD'), null)
+  searchRows = [survivorRow({ ClientId: 99 })]
+  assert.equal(await findMintsoftMergedSurvivor('ORD-B'), null, 'foreign client')
+  searchRows = [survivorRow(), survivorRow({ ID: 2002, OrderNumber: 'ORD-X+ORD-B' })]
+  assert.equal(await findMintsoftMergedSurvivor('ORD-B'), null, 'two candidates')
+  searchRows = Array.from({ length: 10 }, (_, i) => survivorRow({ ID: 3000 + i, OrderNumber: i === 0 ? 'ORD-C+ORD-B' : `Z-${i}`, OrderNameValues: i === 0 ? [MERGED] : [] }))
+  assert.equal(await findMintsoftMergedSurvivor('ORD-B'), null, 'a full page may be truncated')
+})
+
+test('merged parts: the number is recognised in ANY position', async () => {
+  const { mergedParts } = await import('@/lib/connectors/mintsoft/api/orders')
+  assert.deepEqual(mergedParts('ORD-C+ORD-B'), ['ORD-C', 'ORD-B'])
+  assert.ok(mergedParts('ORD-C+ORD-B').includes('ORD-B'))
+  assert.ok(mergedParts('ORD-C+ORD-B+ORD-D').includes('ORD-B'))
+})

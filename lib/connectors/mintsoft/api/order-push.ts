@@ -11,7 +11,7 @@ import { WmsOrderUpdatePartialError, legacyCourierFormInput } from '@/lib/connec
 import { roundTransmittedMoney } from '@/lib/connectors/wms/transmitted-money'
 import { extractMintsoftArrayPayload, extractMintsoftArrayPayloadStrict, extractMintsoftObjectPayload } from './normalizers'
 import { mintsoftRequest } from './client'
-import { assertMintsoftOrderClient, requireMintsoftClientId } from './orders'
+import { assertMintsoftOrderClient, mergedParts as mintsoftMergedParts, requireMintsoftClientId } from './orders'
 import { getMintsoftSettings, parseMintsoftPositiveId } from '../settings/schema'
 
 /**
@@ -245,6 +245,35 @@ export async function reconcileMintsoftAmbiguousCreate(
       ? `Mintsoft holds ${matches.length} orders that match (${seen}), so none can be proved to be this order`
       : `Mintsoft holds order ${seen} under this number, but it does not carry this order's own reference, so it cannot be proved to be this order`,
   }
+}
+
+/**
+ * READ-ONLY (live-confirmed): when order B is merged into C the survivor keeps C's id, its OrderNumber becomes "<absorbing>+<absorbed>"
+ * (so this order's number can be ANY part), its ExternalOrderReference stays the absorbing order's, and it gains the order name/value
+ * MergedOrder=True; B itself then 404s like a deletion. Order/Search by either original number returns the survivor. Adopted as the
+ * survivor only when: our ClientId, a full-page-free search, the number is one exact "+" part, the MergedOrder flag is set, and exactly
+ * one order qualifies.
+ */
+export async function findMintsoftMergedSurvivor(orderNumber: string): Promise<{ externalOrderId: string; externalOrderNumber: string } | null> {
+  const clientId = await getPushClientId('Mintsoft merged-survivor lookup')
+  const wanted = orderNumber.trim()
+  if (!wanted) return null
+  const raw = await fetchSearchRows(wanted, clientId)
+  if (raw.length >= MINTSOFT_SEARCH_PAGE) return null
+  const survivors = raw.filter((row) => {
+    if (toStr(row.ClientId ?? row.clientId) !== String(clientId)) return false
+    const parts = mintsoftMergedParts(toStr(row.OrderNumber))
+    if (!parts.includes(wanted)) return false
+    const values = Array.isArray(row.OrderNameValues) ? (row.OrderNameValues as unknown[]) : []
+    return values.some((entry) => {
+      const nv = entry as Record<string, unknown> | null
+      return nv !== null && typeof nv === 'object' && toStr(nv.Name) === 'MergedOrder' && toStr(nv.Value)?.toLowerCase() === 'true'
+    })
+  })
+  if (survivors.length !== 1) return null
+  const id = toStr(survivors[0].ID ?? survivors[0].Id ?? survivors[0].id)
+  const number = toStr(survivors[0].OrderNumber)
+  return id && number ? { externalOrderId: id, externalOrderNumber: number } : null
 }
 
 async function createOrder(payload: Record<string, unknown>): Promise<{ ok: boolean; data: RawOrder | null; message: string | null }> {

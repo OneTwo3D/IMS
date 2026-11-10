@@ -634,6 +634,12 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
   reconcileAmbiguousCreate?(
     reference: { orderNumber: string; externalReference: string },
   ): Promise<WmsAmbiguousCreateResolution>
+  /**
+   * READ-ONLY. When a hold or cancel finds the WMS order gone (a 404), ask whether it was MERGED into another order: the order
+   * with this number as one part of a combined number AND flagged as a merge. Exactly one such order is returned; anything else
+   * (none, several, an incomplete search page) is null, and the caller treats the order as simply not found.
+   */
+  findMergedSurvivor?(orderNumber: string): Promise<{ externalOrderId: string; externalOrderNumber: string } | null>
   /** Amend an already-pushed WMS order; a no-op (updated=false) if past NEW. */
   updateOrder?(externalOrderId: string, input: WmsOrderPushInput, clearance: WmsWriteClearance<'order.amend'>): Promise<WmsOrderUpdateResult>
   /** Cancel a WMS order by its external id; a no-op (success) if past NEW. */

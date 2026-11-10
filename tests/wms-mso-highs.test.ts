@@ -78,6 +78,9 @@ function makePort(seed: Seed) {
         updateLinkIfLinked: async (id: string, expect: { state: string; externalOrderId: string }, data: Record<string, unknown>) => {
           if (seed.linkNow!.state !== expect.state || seed.linkNow!.externalOrderId !== expect.externalOrderId) return false
           updates.push({ id, data })
+          // The write lands, so the link now IS what it was written as.
+          if (typeof data.state === 'string') seed.linkNow!.state = data.state
+          if (typeof data.externalOrderId === 'string') seed.linkNow!.externalOrderId = data.externalOrderId
           return true
         },
       }
@@ -100,6 +103,7 @@ function connector(overrides: {
   cancelOrder?: (id: string) => Promise<WmsOrderCancelResult>
   reconcile?: (reference: { orderNumber: string; externalReference: string }) => Promise<WmsAmbiguousCreateResolution>
   probe?: () => Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'>
+  findMergedSurvivor?: (orderNumber: string) => Promise<{ externalOrderId: string; externalOrderNumber: string } | null>
   comments?: Array<{ externalOrderId: string; comment: string }>
 } = {}) {
   const calls = { push: 0, cancel: [] as string[], reconcile: [] as Array<{ orderNumber: string; externalReference: string }> }
@@ -114,6 +118,7 @@ function connector(overrides: {
         : undefined,
       verifyPushedOrder: async () => 'ours' as const,
       probeOrderPresence: overrides.probe ?? (async () => 'FOUND' as const),
+      ...(overrides.findMergedSurvivor ? { findMergedSurvivor: overrides.findMergedSurvivor } : {}),
       ...(overrides.reconcile
         ? { reconcileAmbiguousCreate: async (reference: { orderNumber: string; externalReference: string }) => { calls.reconcile.push(reference); return overrides.reconcile!(reference) } }
         : {}),
@@ -495,4 +500,66 @@ test('live: an ALREADY_CANCELLED Mintsoft order satisfies the cancel pass (CANCE
   assert.equal(r2.operatorNotices, 1)
   assert.notEqual(hold.updates[0].data.state, 'HELD')
   assert.equal(hold.updates[0].data.cancelledAt, undefined)
+})
+
+// ---------------------------------------------------------------- live merge: a 404 that is really a merge -------------------------
+
+test('merge: a hold that 404s but whose number sits inside a merged survivor re-points the link (MERGED) and raises the MERGED notice', async () => {
+  const comments: Array<{ externalOrderId: string; comment: string }> = []
+  const asked: string[] = []
+  const { port, updates } = makePort({
+    holdable: [{ id: 'link-1', orderId: 'so-2', externalOrderId: 'old-1', externalOrderNumber: 'ORD-B' }],
+    linkNow: { state: 'SYNCED', externalOrderId: 'old-1' },
+  })
+  const wms = connector({
+    cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), comments,
+    findMergedSurvivor: async (number) => { asked.push(number); return { externalOrderId: 'surv-1', externalOrderNumber: 'ORD-C+ORD-B' } },
+  })
+  const r = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
+  assert.deepEqual(asked, ['ORD-B'])
+  assert.equal(r.held, 0)
+  assert.equal(r.operatorNotices, 1)
+  assert.equal(updates[0].data.state, 'MERGED')
+  assert.equal(updates[0].data.externalOrderId, 'surv-1')
+  assert.equal(updates[0].data.externalOrderNumber, 'ORD-C+ORD-B')
+  assert.match(String(updates[1].data.lastError), /MERGED order that also holds other orders' goods/)
+  assert.ok(updates[1].data.holdNoticeAt)
+  assert.deepEqual(comments.map((c) => c.externalOrderId), ['surv-1'], 'the note goes to the SURVIVOR')
+  assert.deepEqual(wms.calls.cancel, ['old-1'], 'the survivor itself is never cancelled')
+})
+
+test('merge: the same for a cancel; and with no survivor (a deletion) the plain not-found notice is raised and the link is not moved', async () => {
+  const merged = makePort({
+    cancellable: [{ id: 'link-1', orderId: 'so-2', externalOrderId: 'old-1', externalOrderNumber: 'ORD-B' }],
+    linkNow: { state: 'SYNCED', externalOrderId: 'old-1' },
+  })
+  const m = connector({
+    cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), comments: [],
+    findMergedSurvivor: async () => ({ externalOrderId: 'surv-1', externalOrderNumber: 'ORD-B+ORD-C' }),
+  })
+  await quiet(() => runWmsOrderPushSweepCore(m.connector, 'mintsoft', merged.port, { now: NOW }))
+  assert.equal(merged.updates[0].data.state, 'MERGED')
+  assert.ok(merged.updates[1].data.cancelNoticeAt)
+  assert.notEqual(merged.updates[1].data.state, 'CANCELLED')
+
+  const gone = makePort({ cancellable: [{ id: 'link-1', orderId: 'so-2', externalOrderId: 'old-1', externalOrderNumber: 'ORD-B' }] })
+  const g = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), findMergedSurvivor: async () => null })
+  await quiet(() => runWmsOrderPushSweepCore(g.connector, 'mintsoft', gone.port, { now: NOW }))
+  assert.equal(gone.updates.length, 1)
+  assert.equal(gone.updates[0].data.state, undefined)
+  assert.match(String(gone.updates[0].data.lastError), /was not found/)
+})
+
+test('merge: a link that moved on before the re-point matches nothing - no notice, no note', async () => {
+  const { port, updates } = makePort({
+    holdable: [{ id: 'link-1', orderId: 'so-2', externalOrderId: 'old-1', externalOrderNumber: 'ORD-B' }],
+    linkNow: { state: 'MERGED', externalOrderId: 'surv-1' },
+  })
+  const wms = connector({
+    cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), comments: [],
+    findMergedSurvivor: async () => ({ externalOrderId: 'surv-1', externalOrderNumber: 'ORD-C+ORD-B' }),
+  })
+  const r = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
+  assert.equal(r.operatorNotices, undefined)
+  assert.deepEqual(updates, [])
 })
