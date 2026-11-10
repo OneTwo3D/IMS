@@ -26,6 +26,7 @@ import {
   marginFigureBoundExact,
   netLinearFigureBoundExact,
 } from '@/lib/domain/sales/refund-basis-analytics'
+import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { refundLinesRaisedInPeriodWhere } from '@/lib/domain/sales/refund-credit-buckets'
 
 const DEFAULT_PAGE_SIZE = 100
@@ -1583,6 +1584,8 @@ function revenueKey(input: RevenueKey): string {
 }
 
 async function loadRevenueByOrderProduct(orderIds: string[]): Promise<{
+  /** The orders among `orderIds` that count as invoiced revenue (invoiced-revenue-basis.ts). */
+  invoicedOrderIds: Set<string>
   revenueByOrderProduct: Map<string, Decimal>
   orderMetaById: Map<string, { customerName: string | null; channel: string | null }>
 }> {
@@ -1597,6 +1600,16 @@ async function loadRevenueByOrderProduct(orderIds: string[]): Promise<{
           lines: { select: { productId: true, totalBase: true } },
         },
       })
+  // The revenue cohort. A dispatch of any other order keeps its COST in this report but gets no
+  // revenue, so its row reads Unmatched instead of a margin set against revenue the other reports
+  // do not count.
+  const invoicedRows: Array<{ id: string }> = orderIds.length === 0
+    ? []
+    : await db.salesOrder.findMany({
+        where: { id: { in: [...new Set(orderIds)] }, ...INVOICED_ORDER_WHERE },
+        select: { id: true },
+      })
+  const invoicedOrderIds = new Set(invoicedRows.map((row) => row.id))
   // Summed EXACTLY and handed on as a Decimal holding every digit (a Decimal constructor does not round;
   // only Decimal arithmetic does). `.add` here would round a sum past twenty significant digits.
   const exactRevenueByOrderProduct = new Map<string, ExactFigure>()
@@ -1610,6 +1623,7 @@ async function loadRevenueByOrderProduct(orderIds: string[]): Promise<{
       customerName: order.customerName,
       channel: channel || 'manual',
     })
+    if (!invoicedOrderIds.has(order.id)) continue
     for (const line of order.lines) {
       if (!line.productId) continue
       const key = revenueKey({ orderId: order.id, productId: line.productId })
@@ -1617,7 +1631,7 @@ async function loadRevenueByOrderProduct(orderIds: string[]): Promise<{
     }
   }
   for (const [key, sum] of exactRevenueByOrderProduct) revenueByOrderProduct.set(key, toDecimal(sum.exactString()))
-  return { revenueByOrderProduct, orderMetaById }
+  return { invoicedOrderIds, revenueByOrderProduct, orderMetaById }
 }
 
 export type CogsRevenueRowInput = {
@@ -1791,7 +1805,7 @@ type CogsRefundLineRow = {
  */
 async function loadCogsRefundLines(from: Date, toExclusive: Date): Promise<CogsRefundLineRow[]> {
   const rows = await db.salesOrderRefundLine.findMany({
-    where: refundLinesRaisedInPeriodWhere(from, toExclusive),
+    where: { AND: [refundLinesRaisedInPeriodWhere(from, toExclusive), { refund: { order: INVOICED_ORDER_WHERE } }] },
     select: {
       totalBase: true,
       productId: true,
@@ -1910,10 +1924,11 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
   const sourceOrderIds = rows
     .map((row) => row.movement.referenceType === 'SalesOrder' ? row.movement.referenceId : null)
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
-  const { revenueByOrderProduct, orderMetaById } = await loadRevenueByOrderProduct(sourceOrderIds)
+  const { invoicedOrderIds, revenueByOrderProduct, orderMetaById } = await loadRevenueByOrderProduct(sourceOrderIds)
   const resolvedRevenue = resolveCogsRevenueKeys(
     rows.map((row) => ({
-      orderId: row.movement.referenceType === 'SalesOrder' ? row.movement.referenceId : null,
+      // Revenue (including the shipment-line link, which carries its own line total) only for invoiced orders.
+      orderId: row.movement.referenceType === 'SalesOrder' && row.movement.referenceId != null && invoicedOrderIds.has(row.movement.referenceId) ? row.movement.referenceId : null,
       productId: row.movement.product.id,
       shipmentLine: row.movement.shipmentLine
         ? {

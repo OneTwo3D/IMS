@@ -35,7 +35,7 @@ type Props = {
 const TABS: { key: Tab; label: string }[] = [
   { key: 'products', label: 'Products' },
   { key: 'shipments', label: 'Shipments' },
-  { key: 'details', label: 'Details' },
+  { key: 'details', label: 'Invoiced sales details' },
   { key: 'invoices', label: 'Invoices' },
   { key: 'refunds', label: 'Refunds' },
   { key: 'aging', label: 'Customer Aging' },
@@ -638,9 +638,10 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
     if (tabKey === 'invoices') {
       if (key === 'productName') return row.productId ? <ProductLink productId={row.productId} sku="" name={row.productName} /> : <span className="truncate max-w-40 block text-xs">{row.productName}</span>
       if (key === 'orderNumber') return <Link href={`/sales/${row.orderId}`} className="hover:underline font-mono text-xs">{row.orderNumber}</Link>
-      if (key === 'invoicedAt') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
+      if (key === 'invoicedAt') return <span className="text-xs text-muted-foreground" title={row.invoicedAtApproximate ? 'Approximate: no invoice or paid date is stored, so this is the order date' : undefined}>{row.invoicedAtApproximate ? '≈ ' : ''}{fmtDate(v)}</span>
       if (key === 'status') return row.paidAt ? <StatusBadge status="Paid" /> : <StatusBadge status="Unpaid" />
-      if (key === 'totalBase' || key === 'balance') return <span className="tabular-nums text-xs font-mono">{fmtBase(v)}</span>
+      if (key === 'balance') return <span className="tabular-nums text-xs font-mono">{row.balanceBound === 'indeterminate' ? '≈ ' : row.balanceBound === 'upper' ? '≤ ' : ''}{fmtBase(v)}</span>
+      if (key === 'totalBase') return <span className="tabular-nums text-xs font-mono">{fmtBase(v)}</span>
       if (key === 'qty') return <span className="tabular-nums text-xs">{v}</span>
     }
     if (tabKey === 'refunds') {
@@ -669,7 +670,7 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
         : <span className="tabular-nums text-xs font-mono font-medium" title={row.netTotalBasis === 'NET' ? 'Ex-VAT: this order\u2019s credits are on the NET basis, so the figure is the ex-VAT order total less them' : row.netTotalBasis === 'GROSS' ? 'VAT-inclusive: this order\u2019s credits are on the GROSS basis' : undefined}>{fmtBase(v)}</span>
       if (key === 'netTotalBasis') return <span className="text-xs text-muted-foreground">{v}</span>
       if (key === 'refundsTotal') return <span className="tabular-nums text-xs font-mono text-orange-600">{v > 0 ? fmtBase(v) : '—'}</span>
-      if (key === 'dueAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0.01 ? 'text-orange-600 font-medium' : ''}`}>{v > 0.01 ? fmtBase(v) : '—'}</span>
+      if (key === 'dueAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0.01 ? 'text-orange-600 font-medium' : ''}`}>{v > 0.01 ? `${row.dueBound === 'indeterminate' ? '≈ ' : row.dueBound === 'upper' ? '≤ ' : ''}${fmtBase(v)}` : '—'}</span>
       if (key === 'avgDso') return <span className="tabular-nums text-xs text-muted-foreground">{v > 0 ? `${v}d` : '—'}</span>
       if (key === 'overdue0_30') return <span className="tabular-nums text-xs font-mono">{v > 0 ? fmtBase(v) : '—'}</span>
       if (key === 'overdue31_60') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-orange-600' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>
@@ -830,7 +831,7 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
 
       {/* Other tabs — generic filterable/sortable tables */}
       {tab === 'shipments' && renderGenericTable(filteredShipments, 'shipments', 'No shipments found.')}
-      {tab === 'details' && renderGenericTable(filteredDetails, 'details', 'No details found.')}
+      {tab === 'details' && renderGenericTable(filteredDetails, 'details', 'No invoiced sales details found.')}
       {tab === 'invoices' && renderGenericTable(filteredInvoices, 'invoices', 'No invoices found.')}
       {tab === 'refunds' && renderGenericTable(filteredRefunds, 'refunds', 'No refunds found.')}
       {tab === 'aging' && renderGenericTable(filteredAging, 'aging', 'No invoice data found.')}

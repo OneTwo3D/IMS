@@ -5,13 +5,16 @@ import { financeAnalyticsFiltersForUi, financeAnalyticsFiltersFromSearch, loadCu
 
 type Props = { searchParams: Promise<FinanceAnalyticsSearchParams> }
 
+/** The marker for a receivable figure that is only a bound: ≤ at most, ≈ approximate. */
+const boundMark = (bound: string) => (bound === 'indeterminate' ? '≈ ' : bound === 'upper' ? '≤ ' : '')
+
 const columns: Array<FinanceAnalyticsColumn<CurrencySummaryReportRow>> = [
   { key: 'currency', label: 'Currency', render: (row) => row.currency },
   { key: 'salesCount', label: 'Sales docs', align: 'right', render: (row) => row.salesDocumentCount },
   { key: 'salesForeign', label: 'Sales foreign', align: 'right', render: (row) => row.salesForeign },
   { key: 'salesBase', label: 'Sales base', align: 'right', render: (row) => row.salesBase },
-  { key: 'arForeign', label: 'AR foreign', align: 'right', render: (row) => row.arOutstandingForeign },
-  { key: 'arBase', label: 'AR base', align: 'right', render: (row) => row.arOutstandingBase },
+  { key: 'arForeign', label: 'AR foreign', align: 'right', render: (row) => `${boundMark(row.arOutstandingBound)}${row.arOutstandingForeign}` },
+  { key: 'arBase', label: 'AR base', align: 'right', render: (row) => `${boundMark(row.arOutstandingBound)}${row.arOutstandingBase}` },
   { key: 'purchaseCount', label: 'Purchase docs', align: 'right', render: (row) => row.purchaseDocumentCount },
   { key: 'purchasesForeign', label: 'Purchases foreign', align: 'right', render: (row) => row.purchasesForeign },
   { key: 'purchasesBase', label: 'Purchases base', align: 'right', render: (row) => row.purchasesBase },
@@ -35,7 +38,7 @@ export default async function CurrencySummaryAnalyticsPage({ searchParams }: Pro
       columns={columns}
       summary={[
         { label: 'Sales base', value: report.totals.salesBase ?? '0' },
-        { label: 'AR base', value: report.totals.arOutstandingBase ?? '0' },
+        { label: 'AR base', value: `${boundMark(report.totals.arOutstandingBound ?? 'exact')}${report.totals.arOutstandingBase ?? '0'}` },
         { label: 'Purchases base', value: report.totals.purchasesBase ?? '0' },
         { label: 'AP base', value: report.totals.apOutstandingBase ?? '0' },
       ]}

@@ -34,6 +34,10 @@ When WooCommerce sync is configured, orders are imported automatically into the 
 
 WooCommerce orders always enter the IMS as **Processing**. When WooCommerce marks an order as **completed**, the IMS treats that as the external dispatch signal: it auto-allocates stock, creates shipment rows if needed, advances those shipments through the internal `PICKING -> PACKED -> SHIPPED` workflow, and stores any tracking information received from WooCommerce. See the **WooCommerce Integration** guide for details on sync configuration.
 
+## Customer Turnover
+
+A customer's lifetime value, this-year sales and the Invoiced turnover card on the customer page use the same invoiced basis as the dashboard and reports: only orders that have an invoice count (an IMS-posted Xero invoice or, during the parallel phase, the Xeroom invoice number), paid or not, excluding cancelled and draft orders, with refunds netted in VAT-inclusive terms (a refund recorded ex-VAT is converted from its lines' stored tax). Where a refund cannot be converted exactly the figure is marked **≤** (at most), or **≈** (approximate, could be higher or lower) when the credit that could not be placed is zero, negative or mixed-sign.
+
 ## Order Statuses
 
 Sales orders use the canonical sales order workflow documented in `docs/workflows.md`. User-facing order stages include:

@@ -96,18 +96,18 @@ export async function GET(req: NextRequest) {
         customerName: r.customerName, salesRep: r.salesRep, status: r.status,
         qty: r.qty, totalBase: r.totalBase.toFixed(2), createdAt: r.createdAt.slice(0, 10),
       }))
-      return csvResponseFor(req, toCsv(data, ['productName', 'sku', 'barcode', 'mpn', 'customerName', 'salesRep', 'status', 'qty', 'totalBase', 'createdAt']), `sales-details-${date}.csv`)
+      return csvResponseFor(req, toCsv(data, ['productName', 'sku', 'barcode', 'mpn', 'customerName', 'salesRep', 'status', 'qty', 'totalBase', 'createdAt']), `invoiced-sales-details-${date}.csv`)
     }
 
     case 'invoices': {
       const rows = await getInvoiceStats(dateFrom, dateTo)
       const data = rows.map((r) => ({
         productName: r.productName, orderNumber: r.orderNumber, invoiceNumber: r.invoiceNumber,
-        invoicedAt: r.invoicedAt.slice(0, 10), sku: r.sku, customerName: r.customerName,
+        invoicedAt: r.invoicedAt.slice(0, 10), dateApproximate: r.invoicedAtApproximate ? 'yes' : '', sku: r.sku, customerName: r.customerName,
         salesRep: r.salesRep, status: r.paidAt ? 'Paid' : 'Unpaid', qty: r.qty,
-        totalBase: r.totalBase.toFixed(2), balance: r.balance.toFixed(2),
+        totalBase: r.totalBase.toFixed(2), balance: r.balance.toFixed(2), balanceBound: r.balanceBound,
       }))
-      return csvResponseFor(req, toCsv(data, ['productName', 'orderNumber', 'invoiceNumber', 'invoicedAt', 'sku', 'customerName', 'salesRep', 'status', 'qty', 'totalBase', 'balance']), `invoices-${date}.csv`)
+      return csvResponseFor(req, toCsv(data, ['productName', 'orderNumber', 'invoiceNumber', 'invoicedAt', 'dateApproximate', 'sku', 'customerName', 'salesRep', 'status', 'qty', 'totalBase', 'balance', 'balanceBound']), `invoices-${date}.csv`)
     }
 
     case 'refunds': {
@@ -138,11 +138,11 @@ export async function GET(req: NextRequest) {
         // (o3d-lvk called this column `refundsBasis`; it is the same fact, and `netTotalBasis` is
         // the better name because it says which figure the basis qualifies.)
         netTotal: r.netTotal?.toFixed(2) ?? '', netTotalBasis: r.netTotalBasis,
-        dueAmount: r.dueAmount.toFixed(2), avgDso: r.avgDso,
+        dueAmount: r.dueAmount.toFixed(2), dueBound: r.dueBound, avgDso: r.avgDso,
         overdue0_30: r.overdue0_30.toFixed(2), overdue31_60: r.overdue31_60.toFixed(2),
         overdue61_90: r.overdue61_90.toFixed(2), overdue91plus: r.overdue91plus.toFixed(2),
       }))
-      return csvResponseFor(req, toCsv(data, ['orderNumber', 'customerName', 'salesRep', 'warehouse', 'createdAt', 'salesTotal', 'refundsTotal', 'netTotal', 'netTotalBasis', 'dueAmount', 'avgDso', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus']), `customer-aging-${date}.csv`)
+      return csvResponseFor(req, toCsv(data, ['orderNumber', 'customerName', 'salesRep', 'warehouse', 'createdAt', 'salesTotal', 'refundsTotal', 'netTotal', 'netTotalBasis', 'dueAmount', 'dueBound', 'avgDso', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus']), `customer-aging-${date}.csv`)
     }
 
     case 'forecast': {

@@ -8,6 +8,7 @@ import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { eraseCustomerPersonalData } from '@/lib/domain/erasure/erase-personal-data'
 import { openWarehouseOrdersWarning } from '@/lib/domain/erasure/warehouse-obligations'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
+import { orderTurnoverBase, REFUND_TURNOVER_SELECT } from '@/lib/domain/sales/customer-turnover'
 import { toIsoCountryCode } from '@/lib/countries'
 import {
   createCsvImportExecutionResult,
@@ -46,6 +47,10 @@ export type CustomerRow = {
   active: boolean
   orderCount: number
   lifetimeValueBase: number
+  /** False when some invoiced order has refunds on an unproven or mixed basis, so turnover is an upper bound. */
+  lifetimeValueUpperBound: boolean
+  /** True when an unplaced credit is zero or negative, so the figure could be higher or lower (shown as \u2248). */
+  lifetimeValueIndeterminate: boolean
   currentYearSalesBase: number
   lastOrderAt: string | null
   createdAt: string
@@ -106,7 +111,7 @@ function normalizeAddress(address: AddressData | null | undefined): AddressData 
   return Object.keys(normalized).length > 0 ? normalized : Prisma.JsonNull
 }
 
-const REVENUE_STATUSES = new Set(['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED'])
+type TurnoverOrderInput = Parameters<typeof orderTurnoverBase>[0]
 
 function mapCustomer(c: {
   id: string
@@ -123,10 +128,14 @@ function mapCustomer(c: {
   createdAt: Date
   gdprAnonymisedAt: Date | null
   _count: { salesOrders: number }
-  salesOrders?: { status: string; refundStatus: string; totalBase: unknown; createdAt: Date }[]
+  salesOrders?: (TurnoverOrderInput & { createdAt: Date })[]
 }): CustomerRow {
   const currentYear = new Date().getFullYear()
-  const revenueOrders = (c.salesOrders ?? []).filter((o) => REVENUE_STATUSES.has(o.status) && o.refundStatus !== 'FULL')
+  // Turnover: the shared invoiced basis, refunds netted (customer-turnover.ts).
+  const revenueOrders = (c.salesOrders ?? []).flatMap((o) => {
+    const t = orderTurnoverBase(o)
+    return t ? [{ createdAt: o.createdAt, value: t.value, bound: t.bound }] : []
+  })
   const lastOrder = c.salesOrders?.length
     ? c.salesOrders.reduce((latest, o) => (o.createdAt > latest ? o.createdAt : latest), c.salesOrders[0].createdAt)
     : null
@@ -145,10 +154,12 @@ function mapCustomer(c: {
     notes: c.notes,
     active: c.active,
     orderCount: c._count.salesOrders,
-    lifetimeValueBase: revenueOrders.reduce((sum, o) => sum + Number(o.totalBase), 0),
+    lifetimeValueBase: revenueOrders.reduce((sum, o) => sum + o.value, 0),
+    lifetimeValueUpperBound: revenueOrders.some((o) => o.bound === 'upper') && !revenueOrders.some((o) => o.bound === 'indeterminate'),
+    lifetimeValueIndeterminate: revenueOrders.some((o) => o.bound === 'indeterminate'),
     currentYearSalesBase: revenueOrders
       .filter((o) => o.createdAt.getFullYear() === currentYear)
-      .reduce((sum, o) => sum + Number(o.totalBase), 0),
+      .reduce((sum, o) => sum + o.value, 0),
     lastOrderAt: lastOrder?.toISOString() ?? null,
     createdAt: c.createdAt.toISOString(),
     gdprAnonymisedAt: c.gdprAnonymisedAt?.toISOString() ?? null,
@@ -166,7 +177,10 @@ export async function getCustomers(activeOnly = true): Promise<CustomerRow[]> {
     include: {
       _count: { select: { salesOrders: true } },
       salesOrders: {
-        select: { status: true, refundStatus: true, totalBase: true, createdAt: true },
+        select: {
+          status: true, invoiceNumber: true, accountingInvoiceId: true, shoppingLinks: { select: { connector: true } }, totalBase: true, createdAt: true,
+          refunds: REFUND_TURNOVER_SELECT,
+        },
       },
     },
   })
@@ -213,6 +227,10 @@ export async function getCustomerDetail(id: string): Promise<CustomerDetail | nu
           externalOrderNumber: true,
           status: true,
           refundStatus: true,
+          invoiceNumber: true,
+          accountingInvoiceId: true,
+          shoppingLinks: { select: { connector: true } },
+          refunds: REFUND_TURNOVER_SELECT,
           currency: true,
           totalForeign: true,
           totalBase: true,
@@ -237,16 +255,16 @@ export async function getCustomerDetail(id: string): Promise<CustomerDetail | nu
     lineCount: so._count.lines,
   }))
 
-  // Exclude cancelled/refunded from turnover calculations
-  const REVENUE_STATUSES = new Set(['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED'])
-  const revenueOrders = orders.filter((o) => REVENUE_STATUSES.has(o.status) && o.refundStatus !== 'FULL')
-
-  const totalTurnoverBase = revenueOrders.reduce((sum, o) => sum + o.totalBase, 0)
-
+  // Turnover: the shared invoiced basis with refunds netted (customer-turnover.ts); drafts, cancelled
+  // and un-invoiced orders are listed above but do not count.
+  let totalTurnoverBase = 0
   const annualTurnoverBase: Record<string, number> = {}
-  for (const o of revenueOrders) {
-    const year = new Date(o.createdAt).getFullYear().toString()
-    annualTurnoverBase[year] = (annualTurnoverBase[year] ?? 0) + o.totalBase
+  for (const so of c.salesOrders) {
+    const t = orderTurnoverBase(so)
+    if (!t) continue
+    totalTurnoverBase += t.value
+    const year = so.createdAt.getFullYear().toString()
+    annualTurnoverBase[year] = (annualTurnoverBase[year] ?? 0) + t.value
   }
 
   return {

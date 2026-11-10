@@ -17,7 +17,7 @@ export default async function SalesAnalyticsPage({ searchParams }: { searchParam
     { key: 'currency', label: 'Currency', render: (row) => row.currency },
     { key: 'orders', label: 'Orders', align: 'right', render: (row) => row.orderCount.toLocaleString() },
     { key: 'lines', label: 'Lines', align: 'right', render: (row) => row.lineCount.toLocaleString() },
-    { key: 'revenue', label: 'Revenue (invoiced)', align: 'right', render: (row) => row.revenue, footer: report.totals.revenue },
+    { key: 'revenue', label: 'Invoiced revenue', align: 'right', render: (row) => row.revenue, footer: report.totals.revenue },
     // o3d-kyey: the refund-aware figure sits BESIDE the invoiced one rather than replacing it — this
     // report's contract is that its totals reconcile to SalesOrder totals, and a figure net of credit
     // notes cannot also do that. `≤` means the true figure is at most the one shown.
@@ -41,7 +41,7 @@ export default async function SalesAnalyticsPage({ searchParams }: { searchParam
       rowKey={(row) => row.key}
       columns={columns}
       summary={[
-        { label: 'Revenue (invoiced)', value: report.totals.revenue },
+        { label: 'Invoiced revenue', value: report.totals.revenue },
         { label: 'Net revenue', value: `${report.totals.netRevenue}${bound(report.totals.netRevenueBound)}` },
         { label: 'Tax', value: report.totals.tax },
         { label: 'Shipping', value: report.totals.shipping },

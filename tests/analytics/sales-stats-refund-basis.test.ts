@@ -96,10 +96,10 @@ mock.module('@/lib/db', {
   namedExports: {
     db: {
       salesOrder: {
-        // getCustomerAging is the only caller filtering on invoiceNumber; getProductSalesStats
-        // filters on status/refundStatus. That is what the fixture db dispatches on.
-        findMany: async (args: { where?: Record<string, unknown> }) =>
-          args?.where && 'invoiceNumber' in args.where ? AGING_ORDERS : PRODUCT_ORDERS,
+        // getCustomerAging is the only caller selecting `payments`; getProductSalesStats does not.
+        // That is what the fixture db dispatches on (both now share the invoiced-basis where).
+        findMany: async (args: { select?: Record<string, unknown> }) =>
+          args?.select && 'payments' in args.select ? AGING_ORDERS : PRODUCT_ORDERS,
       },
       product: {
         findMany: async () => [{
@@ -215,7 +215,7 @@ test('products: an EXACTLY-zero unstamped credit line does not spoil the row (o3
 // ---------------------------------------------------------------------------
 
 test('aging: a NET credit is measured against the EX-VAT invoice total — £0.00, not £20.00 (o3d-iigc)', async () => {
-  AGING_ORDERS = [agingOrder({ id: 'SO-1', totalBase: 120, taxBase: 20, paid: 120, refunds: [{ totalBase: 100, totalsBasis: 'NET' }] })]
+  AGING_ORDERS = [agingOrder({ id: 'SO-1', totalBase: 120, taxBase: 20, paid: 0, refunds: [{ totalBase: 100, totalsBasis: 'NET' }] })]
   const byRef = await aging()
   const r = byRef.get('SO-1')!
 

@@ -8,6 +8,9 @@ import { getFxSourceRegime, type FxSourceRegime } from '@/lib/currencies/fx-sour
 import { multiplyMoney, roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
+import { REFUND_TURNOVER_SELECT, type TurnoverRefund } from '@/lib/domain/sales/customer-turnover'
+import { receivableBalance } from '@/lib/domain/sales/receivable-balance'
+import { invoicedInPeriodWhere, invoicedPeriodDate, invoicedPeriodDateIsApproximate } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 
 const DEFAULT_PAGE_SIZE = 100
@@ -85,6 +88,8 @@ export type CurrencySummaryReportTotals = {
   arOutstandingBase: string
   purchasesBase: string
   apOutstandingBase: string
+  /** `exact`, `upper` (≤) or `indeterminate` (≈): the weakest bound of any receivable included in `arOutstandingBase`. */
+  arOutstandingBound: string
 }
 
 export type FxGainLossReportTotals = {
@@ -100,7 +105,7 @@ export const FINANCE_ANALYTICS_EMPTY_TOTALS = {
   vat: { taxableBase: '0', salesTaxBase: '0', purchaseTaxBase: '0', taxBase: '0' } satisfies VatReportTotals,
   arAging: { outstandingBase: '0', creditBalanceBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' } satisfies ArAgingReportTotals,
   apAging: { outstandingBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' } satisfies ApAgingReportTotals,
-  currencySummary: { salesBase: '0', arOutstandingBase: '0', purchasesBase: '0', apOutstandingBase: '0' } satisfies CurrencySummaryReportTotals,
+  currencySummary: { salesBase: '0', arOutstandingBase: '0', purchasesBase: '0', apOutstandingBase: '0', arOutstandingBound: 'exact' } satisfies CurrencySummaryReportTotals,
   fxGainLoss: { gainLossBase: '0', gainsBase: '0', lossesBase: '0', rowCount: '0', unconvertedCount: '0' } satisfies FxGainLossReportTotals,
 } as const
 
@@ -159,6 +164,8 @@ export type CurrencySummaryReportRow = {
   salesBase: string
   arOutstandingForeign: string
   arOutstandingBase: string
+  /** `exact`, `upper` (≤) or `indeterminate` (≈): the weakest bound of any receivable in the two AR figures. */
+  arOutstandingBound: 'exact' | 'upper' | 'indeterminate'
   purchaseDocumentCount: number
   purchasesForeign: string
   purchasesBase: string
@@ -219,7 +226,11 @@ type SalesOrderAgingRow = {
   paymentDueAt: Date | null
   paidAt: Date | null
   totalBase: DecimalInput
-  payments: Array<{ amount: DecimalInput; paidAt: Date; refundId: string | null }>
+  totalForeign?: DecimalInput
+  currency?: string | null
+  payments: Array<{ amount: DecimalInput; currency?: string | null; paidAt: Date; refundId: string | null; settlementRateToBase?: DecimalInput | null }>
+  /** Credits raised before the as-of date, with their lines, so they can be read as the customer pages read them. */
+  refunds?: Array<TurnoverRefund & { refundedAt?: Date | null }>
 }
 
 type SalesOrderCurrencyRow = {
@@ -228,7 +239,8 @@ type SalesOrderCurrencyRow = {
   totalForeign: DecimalInput
   totalBase: DecimalInput
   paidAt: Date | null
-  payments: Array<{ amount: DecimalInput; currency: string; paidAt: Date; refundId: string | null }>
+  payments: Array<{ amount: DecimalInput; currency: string; paidAt: Date; refundId: string | null; settlementRateToBase?: DecimalInput | null }>
+  refunds?: Array<TurnoverRefund & { refundedAt?: Date | null }>
 }
 
 type PurchaseInvoiceAgingRow = {
@@ -686,13 +698,12 @@ export async function getArAgingReport(
   const asOfExclusive = window.dateToExclusive
   const orders = await client.salesOrder.findMany({
     where: {
-      status: { not: SalesOrderStatus.CANCELLED },
-      archived: false,
-      OR: [
-        { invoicedAt: { lt: asOfExclusive } },
-        { invoicedAt: null, createdAt: { lt: asOfExclusive } },
-      ],
-      AND: [{ OR: [{ paidAt: null }, { paidAt: { gte: asOfExclusive } }, { payments: { some: { refundId: null, paidAt: { lt: asOfExclusive } } } }] }],
+      // No `archived` condition: archiving only hides orders from operational lists (see INVOICED_ORDER_WHERE).
+      // Invoiced basis (shared with the revenue reports), dated by the same invoice date as the period
+      // reports (invoicedAt, else paidAt, else the order date): an order is in AR at the cutoff only if
+      // that date is on or before it.
+      // Paid orders are NOT excluded: receivableBalance decides, and a paid-and-credited order is a customer credit balance.
+      AND: [invoicedInPeriodWhere({ lt: asOfExclusive })],
     },
     select: {
       id: true,
@@ -704,7 +715,10 @@ export async function getArAgingReport(
       paymentDueAt: true,
       paidAt: true,
       totalBase: true,
-      payments: { select: { amount: true, paidAt: true, refundId: true } },
+      totalForeign: true,
+      currency: true,
+      payments: { select: { amount: true, currency: true, paidAt: true, refundId: true, settlementRateToBase: true } },
+      refunds: { where: { refundedAt: { lt: asOfExclusive } }, select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
     },
     take: SOURCE_ROW_LIMIT + 1,
   }) as SalesOrderAgingRow[]
@@ -723,16 +737,16 @@ export async function getArAgingReport(
     outstandingBase: Prisma.Decimal
     lastPaymentDate: Date | null
   }>()
+  let unplacedCreditOrders = 0
+  const asOfInclusive = new Date(asOfExclusive.getTime() - 1)
+  const balances = new Map<string, ReturnType<typeof receivableBalance>>()
   for (const order of orders) {
-    const paidBase = order.payments
-      .filter((payment) => payment.refundId == null && payment.paidAt.getTime() < asOfExclusive.getTime())
-      .reduce((total, payment) => total.add(toDecimal(payment.amount)), new Prisma.Decimal(0))
-    const refundedBase = order.payments
-      .filter((payment) => payment.refundId != null && payment.paidAt.getTime() < asOfExclusive.getTime())
-      .reduce((total, payment) => total.add(toDecimal(payment.amount).abs()), new Prisma.Decimal(0))
-    const rawOutstanding = toDecimal(order.totalBase).sub(paidBase).sub(refundedBase)
-    const outstanding = Prisma.Decimal.max(new Prisma.Decimal(0), rawOutstanding)
-    if (outstanding.lte(0)) continue
+    // ONE arithmetic for every receivables screen: see receivable-balance.ts.
+    const result = receivableBalance(order, asOfInclusive)
+    balances.set(order.id, result)
+    if (result.bound !== 'exact') unplacedCreditOrders += 1
+    if (result.status !== 'outstanding') continue
+    const outstanding = toDecimal(result.balance)
     const key = order.customerId ?? order.customerEmail ?? order.customerName ?? 'unknown'
     let row = byCustomer.get(key)
     if (!row) {
@@ -751,7 +765,7 @@ export async function getArAgingReport(
       }
       byCustomer.set(key, row)
     }
-    const dueDate = order.paymentDueAt ?? order.invoicedAt ?? order.createdAt
+    const dueDate = order.paymentDueAt ?? invoicedPeriodDate(order)
     const bucket = bucketAmount(ageDays(asOf, dueDate), outstanding, buckets)
     row.current = row.current.add(bucket.current)
     row.bucket1 = row.bucket1.add(bucket.bucket1)
@@ -766,14 +780,8 @@ export async function getArAgingReport(
   const rows = agingRowsFromAccumulators(byCustomer, baseCurrency)
   const outstandingBase = rows.reduce((total, row) => total.add(row.outstandingBase), new Prisma.Decimal(0))
   const creditBalanceBase = orders.reduce((total, order) => {
-    const paidBase = order.payments
-      .filter((payment) => payment.refundId == null && payment.paidAt.getTime() < asOfExclusive.getTime())
-      .reduce((sum, payment) => sum.add(toDecimal(payment.amount)), new Prisma.Decimal(0))
-    const refundedBase = order.payments
-      .filter((payment) => payment.refundId != null && payment.paidAt.getTime() < asOfExclusive.getTime())
-      .reduce((sum, payment) => sum.add(toDecimal(payment.amount).abs()), new Prisma.Decimal(0))
-    const rawOutstanding = toDecimal(order.totalBase).sub(paidBase).sub(refundedBase)
-    return rawOutstanding.lt(0) ? total.add(rawOutstanding.abs()) : total
+    const result = balances.get(order.id)!
+    return result.status === 'credit' ? total.add(toDecimal(result.balance).abs()) : total
   }, new Prisma.Decimal(0))
   return report(rows, filters, window, generatedAt, {
     outstandingBase: moneyString(outstandingBase, baseCurrency),
@@ -782,10 +790,12 @@ export async function getArAgingReport(
     bucket2Days: String(buckets[1]),
     bucket3Days: String(buckets[2]),
   }, [
-    `AR aging is as of ${dateOnly(asOf)}. Outstanding balance is SalesOrder.totalBase minus non-refund payments and refund payments paid on or before that date; due date is paymentDueAt, falling back to invoicedAt and then createdAt.`,
+    `AR aging is as of ${dateOnly(asOf)}. Outstanding balance is SalesOrder.totalBase minus non-refund payments and refund payments paid on or before that date and credits raised by it, all in base currency by one shared arithmetic (invoice less credits less receipts, an order held as paid counting as settled); due date is paymentDueAt, falling back to the invoice date: invoicedAt, else paidAt, else createdAt (shown as approximate).`,
     'Customer credit balances are excluded from aging buckets and surfaced in totals.creditBalanceBase.',
     `Bucket boundaries are configurable through bucket1Days/bucket2Days/bucket3Days and currently use ${buckets[0]}/${buckets[1]}/${buckets[2]} days.`,
     ...bucketResult.notices,
+    ...approximateDateNotice(orders as Array<{ invoicedAt?: Date | null; paidAt?: Date | null }>),
+    ...(unplacedCreditOrders > 0 ? [`${unplacedCreditOrders} order${unplacedCreditOrders === 1 ? ' carries a credit' : 's carry credits'} whose basis or amount could not be established exactly; ${unplacedCreditOrders === 1 ? 'its' : 'their'} outstanding balance is an upper bound or only approximate.`] : []),
   ], options.paginate !== false)
 }
 
@@ -887,17 +897,19 @@ export async function getCurrencySummaryReport(
   const [salesOrders, purchaseInvoices] = await Promise.all([
     client.salesOrder.findMany({
       where: {
-        status: { not: SalesOrderStatus.CANCELLED },
-        archived: false,
-        invoicedAt: { gte: window.dateFrom, lt: window.dateToExclusive },
+        // Dated by invoicedPeriodDate: invoicedAt, else the order date for Xeroom-era orders.
+        // No `archived` condition: archiving only hides orders from operational lists (see INVOICED_ORDER_WHERE).
+        ...invoicedInPeriodWhere({ gte: window.dateFrom, lt: window.dateToExclusive }),
       },
       select: {
         id: true,
         currency: true,
         totalForeign: true,
         totalBase: true,
+        invoicedAt: true,
         paidAt: true,
-        payments: { select: { amount: true, currency: true, paidAt: true, refundId: true } },
+        payments: { select: { amount: true, currency: true, paidAt: true, refundId: true, settlementRateToBase: true } },
+        refunds: { where: { refundedAt: { lt: window.dateToExclusive } }, select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
       },
       take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<SalesOrderCurrencyRow[]>,
@@ -924,6 +936,7 @@ export async function getCurrencySummaryReport(
     salesBase: Prisma.Decimal
     arOutstandingForeign: Prisma.Decimal
     arOutstandingBase: Prisma.Decimal
+    arOutstandingBound: 'exact' | 'upper' | 'indeterminate'
     purchaseDocumentIds: Set<string>
     purchasesForeign: Prisma.Decimal
     purchasesBase: Prisma.Decimal
@@ -942,6 +955,7 @@ export async function getCurrencySummaryReport(
         salesBase: new Prisma.Decimal(0),
         arOutstandingForeign: new Prisma.Decimal(0),
         arOutstandingBase: new Prisma.Decimal(0),
+        arOutstandingBound: 'exact',
         purchaseDocumentIds: new Set(),
         purchasesForeign: new Prisma.Decimal(0),
         purchasesBase: new Prisma.Decimal(0),
@@ -953,6 +967,7 @@ export async function getCurrencySummaryReport(
     return row
   }
 
+  let boundedOrders = 0
   for (const order of salesOrders) {
     const row = getRow(order.currency)
     row.salesDocumentIds.add(order.id)
@@ -960,15 +975,19 @@ export async function getCurrencySummaryReport(
     const totalBase = toDecimal(order.totalBase)
     row.salesForeign = row.salesForeign.add(totalForeign)
     row.salesBase = row.salesBase.add(totalBase)
-    const paidForeign = order.payments
-      .filter((payment) => payment.refundId == null && payment.currency === row.currency)
-      .reduce((sum, payment) => sum.add(toDecimal(payment.amount)), new Prisma.Decimal(0))
-    const outstandingForeign = Prisma.Decimal.max(new Prisma.Decimal(0), totalForeign.sub(paidForeign))
-    if (!order.paidAt && outstandingForeign.gt(0)) {
-      row.arOutstandingForeign = row.arOutstandingForeign.add(outstandingForeign)
-      row.arOutstandingBase = row.arOutstandingBase.add(
-        totalForeign.gt(0) ? totalBase.mul(outstandingForeign).div(totalForeign) : new Prisma.Decimal(0),
-      )
+    // Receivable at the end of the window, by the ONE arithmetic every receivables screen uses (receivable-balance.ts).
+    // The base figure is that balance. The foreign figure is derived from it with one stated rule: the base
+    // balance times the order's booked foreign/base ratio (totalForeign / totalBase).
+    const result = receivableBalance(order, new Date(window.dateToExclusive.getTime() - 1))
+    if (result.status === 'outstanding') {
+      const balance = toDecimal(result.balance)
+      row.arOutstandingBase = row.arOutstandingBase.add(balance)
+      if (result.bound !== 'exact') {
+        boundedOrders += 1
+        // Weakest wins: indeterminate (≈) over upper (≤) over exact.
+        if (result.bound === 'indeterminate' || row.arOutstandingBound === 'exact') row.arOutstandingBound = result.bound
+      }
+      row.arOutstandingForeign = row.arOutstandingForeign.add(totalBase.gt(0) ? balance.mul(totalForeign).div(totalBase) : new Prisma.Decimal(0))
     }
   }
 
@@ -992,6 +1011,7 @@ export async function getCurrencySummaryReport(
     salesBase: moneyString(row.salesBase, baseCurrency),
     arOutstandingForeign: moneyString(row.arOutstandingForeign, row.currency),
     arOutstandingBase: moneyString(row.arOutstandingBase, baseCurrency),
+    arOutstandingBound: row.arOutstandingBound,
     purchaseDocumentCount: row.purchaseDocumentIds.size,
     purchasesForeign: moneyString(row.purchasesForeign, row.currency),
     purchasesBase: moneyString(row.purchasesBase, baseCurrency),
@@ -1016,10 +1036,19 @@ export async function getCurrencySummaryReport(
     arOutstandingBase: moneyString(totals.arOutstandingBase, baseCurrency),
     purchasesBase: moneyString(totals.purchasesBase, baseCurrency),
     apOutstandingBase: moneyString(totals.apOutstandingBase, baseCurrency),
+    arOutstandingBound: rows.some((r) => r.arOutstandingBound === 'indeterminate') ? 'indeterminate' : rows.some((r) => r.arOutstandingBound === 'upper') ? 'upper' : 'exact',
   }, [
     'Currency summary groups invoiced sales orders and purchase invoices by their document currency, preserving foreign-currency totals alongside base equivalents.',
     'AR outstanding is estimated per sales order from same-currency non-refund payments; AP outstanding is full invoice value until PurchaseInvoice.paidAt because supplier partial payments are not modelled.',
+    ...approximateDateNotice(salesOrders as Array<{ invoicedAt?: Date | null; paidAt?: Date | null }>),
+    ...(boundedOrders > 0 ? [`${boundedOrders} receivable${boundedOrders === 1 ? '' : 's'} in AR carr${boundedOrders === 1 ? 'ies a credit' : 'y credits'} that could not be placed exactly or a payment that could not be converted; the AR figures including ${boundedOrders === 1 ? 'it are' : 'them are'} marked ≤ (at most) or ≈ (approximate).`] : []),
   ], options.paginate !== false)
+}
+
+/** A notice when some invoiced orders are dated by their order date because no invoice or paid date is stored. */
+function approximateDateNotice(orders: Array<{ invoicedAt?: Date | null; paidAt?: Date | null }>): string[] {
+  const count = orders.filter(invoicedPeriodDateIsApproximate).length
+  return count === 0 ? [] : [`${count} invoiced order${count === 1 ? ' is' : 's are'} dated by the order date because no invoice date or paid date is stored for ${count === 1 ? 'it' : 'them'}; the period they fall in is approximate.`]
 }
 
 async function loadFxRegime(client: FinanceAnalyticsClient): Promise<FxSourceRegime> {
