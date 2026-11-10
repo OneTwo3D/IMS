@@ -62,7 +62,16 @@ mock.module('@/lib/auth/server', {
 })
 
 async function loadRetry() {
-  return (await import('@/app/actions/xero-sync')).retryFailedXeroSync
+  const impl = (await import('@/app/actions/xero-sync')).retryFailedXeroSync
+  // The bulk form needs the operator's confirmation of the rows reviewed; supply the rows that are
+  // FAILED right now, which is what the confirmation dialog would have listed.
+  return async (entryId?: string, expectedAttemptRevision?: number) => impl(
+    entryId,
+    expectedAttemptRevision,
+    entryId === undefined
+      ? { confirmed: true, rowIds: store.rows.filter((row) => row.status === 'FAILED' && row.connector === 'xero').map((row) => row.id) }
+      : undefined,
+  )
 }
 
 function reset(rows: Parameters<typeof createSyncLogStore>[0]) {

@@ -26,6 +26,7 @@ import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { Button } from '@/components/ui/button'
 import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import { Card } from '@/components/ui/card'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import {
   Dialog,
   DialogContent,
@@ -153,6 +154,10 @@ export function MintsoftClient({ data, configured }: Props) {
   const defaultExternalWarehouseId = data.externalWarehouses[0]?.externalId ?? ''
   const [isConnectionDialogOpen, setIsConnectionDialogOpen] = useState(false)
   const [isBindingDialogOpen, setIsBindingDialogOpen] = useState(false)
+  // Confirmation for the two row actions that change what a warehouse does: going live with stock
+  // corrections, and deactivating the binding.
+  const [bindingDialog, setBindingDialog] = useState<{ kind: 'go-live' | 'deactivate'; binding: MintsoftBindingRow } | null>(null)
+  const [bindingDialogError, setBindingDialogError] = useState<string | null>(null)
   const [isRestockDialogOpen, setIsRestockDialogOpen] = useState(false)
   const [label, setLabel] = useState(data.connection.label)
   const [baseUrl, setBaseUrl] = useState(data.connection.baseUrl)
@@ -360,29 +365,36 @@ export function MintsoftClient({ data, configured }: Props) {
     })
   }
 
+  function openBindingDialog(kind: 'go-live' | 'deactivate', binding: MintsoftBindingRow) {
+    setBindingDialogError(null)
+    setBindingDialog({ kind, binding })
+  }
+
   function handleDeleteBinding(id: string) {
     setError('')
     startTransition(async () => {
       const result = await deleteMintsoftBinding(id)
       if (!result.success) {
-        setError(result.error ?? 'Failed to deactivate Mintsoft binding')
+        setBindingDialogError(result.error ?? 'Failed to deactivate Mintsoft binding')
         return
       }
 
+      setBindingDialog(null)
       flashSaved('Mintsoft binding deactivated')
       router.refresh()
     })
   }
 
-  function handleConfirmAlignment(bindingId: string) {
+  function handleConfirmAlignment(bindingId: string, typedWarehouseCode: string) {
     setError('')
     startTransition(async () => {
-      const result = await confirmMintsoftAlignmentMode(bindingId)
+      const result = await confirmMintsoftAlignmentMode(bindingId, { confirmed: true, typedName: typedWarehouseCode })
       if (!result.success) {
-        setError(result.error ?? 'Failed to confirm alignment mode')
+        setBindingDialogError(result.error ?? 'Failed to confirm alignment mode')
         return
       }
 
+      setBindingDialog(null)
       router.refresh()
       flashSaved('Mintsoft alignment mode confirmed')
     })
@@ -584,6 +596,11 @@ export function MintsoftClient({ data, configured }: Props) {
             Add Binding
           </Button>
         </div>
+        {saved || error ? (
+          <p role="status" className={`text-sm ${error ? 'text-destructive' : 'text-green-600'}`}>
+            {error || feedbackMessage}
+          </p>
+        ) : null}
 
         <Table containerClassName="rounded-lg border max-h-[40vh]" className="min-w-[900px]">
           <TableHeader className="bg-muted/40">
@@ -650,30 +667,37 @@ export function MintsoftClient({ data, configured }: Props) {
                     <div className="flex justify-end gap-1">
                       <Button
                         type="button"
-                        variant="ghost"
+                        variant="outline"
                         size="sm"
-                        onClick={() => handleConfirmAlignment(binding.id)}
+                        onClick={() => openBindingDialog('go-live', binding)}
                         disabled={isPending || !binding.active || binding.stockSyncMode !== 'ALIGN_TO_WMS' || !!binding.alignmentConfirmedAt || !binding.alignmentDryRunReady}
+                        aria-label={`Go live with stock corrections for ${binding.warehouseCode}`}
                       >
-                        <Check className="h-4 w-4" />
+                        <Check className="h-4 w-4" aria-hidden="true" />
+                        Go live…
                       </Button>
                       <Button
                         type="button"
-                        variant="ghost"
+                        variant="outline"
                         size="sm"
                         onClick={() => handleRunSyncNow(binding.id)}
                         disabled={isPending || !binding.active || binding.stockSyncMode === 'DISABLED'}
+                        aria-label={`Sync stock now for ${binding.warehouseCode}`}
                       >
-                        <RefreshCw className="h-4 w-4" />
+                        <RefreshCw className="h-4 w-4" aria-hidden="true" />
+                        Sync now
                       </Button>
                       <Button
                         type="button"
                         variant="ghost"
                         size="sm"
-                        onClick={() => handleDeleteBinding(binding.id)}
+                        className="text-destructive"
+                        onClick={() => openBindingDialog('deactivate', binding)}
                         disabled={isPending || !binding.active}
+                        aria-label={`Deactivate binding for ${binding.warehouseCode}`}
                       >
-                        <Trash2 className="h-4 w-4" />
+                        <Trash2 className="h-4 w-4" aria-hidden="true" />
+                        Deactivate…
                       </Button>
                     </div>
                   </TableCell>
@@ -1014,6 +1038,51 @@ export function MintsoftClient({ data, configured }: Props) {
         </span>
       ) : null}
       {error ? <p className="text-sm text-destructive">{error}</p> : null}
+
+      <ConfirmDialog
+        open={bindingDialog?.kind === 'go-live'}
+        onOpenChange={(open) => { if (!open) setBindingDialog(null) }}
+        title={`Go live with stock corrections for ${bindingDialog?.binding.warehouseCode ?? ''}`}
+        destructive
+        confirmLabel="Go live"
+        typedConfirmation={bindingDialog ? { expected: bindingDialog.binding.warehouseCode, prompt: 'Type the warehouse code' } : undefined}
+        pending={isPending}
+        error={bindingDialogError}
+        onConfirm={(typed) => { if (bindingDialog) handleConfirmAlignment(bindingDialog.binding.id, typed) }}
+        description={bindingDialog ? (
+          <>
+            <p>
+              Warehouse <strong>{bindingDialog.binding.warehouseCode}</strong> ({bindingDialog.binding.warehouseName}) is
+              currently in a dry run: IMS compares its stock with Mintsoft and only reports the differences.
+            </p>
+            <p>
+              Going live turns on <strong>live stock corrections</strong>: on each sync, where Mintsoft holds more of a
+              product than IMS, IMS stock is raised to match and a stock adjustment is booked.
+              {bindingDialog.binding.alignDownReasonId
+                ? ' Where Mintsoft holds less, IMS stock is lowered the same way, using the align-down reason set on this binding.'
+                : ' Where Mintsoft holds less, nothing is changed automatically; the difference is left for manual review.'}
+            </p>
+            <p>These corrections change your recorded inventory quantities.</p>
+          </>
+        ) : null}
+      />
+
+      <ConfirmDialog
+        open={bindingDialog?.kind === 'deactivate'}
+        onOpenChange={(open) => { if (!open) setBindingDialog(null) }}
+        title={`Deactivate binding for ${bindingDialog?.binding.warehouseCode ?? ''}`}
+        destructive
+        confirmLabel="Deactivate binding"
+        pending={isPending}
+        error={bindingDialogError}
+        onConfirm={() => { if (bindingDialog) handleDeleteBinding(bindingDialog.binding.id) }}
+        description={bindingDialog ? (
+          <p>
+            Stock sync for warehouse <strong>{bindingDialog.binding.warehouseCode}</strong> ({bindingDialog.binding.warehouseName})
+            will stop: the binding is switched to disabled with IMS as stock master. You can set it up again with Add Binding.
+          </p>
+        ) : null}
+      />
 
       <Dialog open={isConnectionDialogOpen} onOpenChange={handleConnectionDialogOpenChange}>
         <DialogContent className="sm:max-w-2xl">

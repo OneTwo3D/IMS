@@ -4098,6 +4098,10 @@ model ExternalWmsBinding {
   discrepancyThresholds Json?
   reportRecipients     String[]               @default([])
   alignmentConfirmedAt DateTime?
+  /// When this binding was last pointed at a different IMS warehouse, Mintsoft warehouse or
+  /// connection (or created). A dry run only counts as evidence for the pairing if it STARTED after
+  /// this instant, so evidence from an earlier pairing is never reused, even after pointing back.
+  pairingChangedAt     DateTime               @default(now())
   /// q66in.4.6: when the watchdog last alerted that this binding's stock sync
   /// is stale (dedupe); cleared by the next successful sync.
   staleSyncAlertedAt   DateTime?

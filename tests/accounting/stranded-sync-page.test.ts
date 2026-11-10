@@ -455,73 +455,76 @@ async function mountFailedSyncBannerFromPage(summary: Record<string, unknown> = 
   return Object.assign(banner, { props })
 }
 
-test('the Retry control re-queues EVERY failed row — it sends no entry id (o3d-aouf)', async () => {
-  // retryFailedAccountingSync(entryId) scopes the reset to ONE row; called with nothing it resets
-  // every FAILED row on the active connector. This banner is the "all" control, so the ABSENCE of
-  // the argument is the thing under test — a control that quietly sent one would re-queue a single
-  // row while reporting the whole backlog re-queued.
-  const banner = await mountFailedSyncBannerFromPage()
-  const { controls } = banner.render()
+/** Find an element of the given component name anywhere in a rendered tree (the harness does not expand children). */
+function findByTypeName(node: unknown, name: string): { type: unknown; props: Record<string, unknown> } | null {
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const hit = findByTypeName(child, name)
+      if (hit) return hit
+    }
+    return null
+  }
+  if (!node || typeof node !== 'object') return null
+  const element = node as { type?: unknown; props?: Record<string, unknown> }
+  if (typeof element.type === 'function' && (element.type as { name?: string }).name === name) {
+    return element as { type: unknown; props: Record<string, unknown> }
+  }
+  return element.props ? findByTypeName(element.props.children, name) : null
+}
 
-  assert.deepEqual(controls.map((c) => c.label), ['Retry all failed'], 'one control, and it has a handler')
+test('the Retry control only OPENS the confirmation dialog — it calls no action itself', async () => {
+  // Re-queueing every failed row can post a second document for each. The banner's button must not
+  // do that on one click; the call lives behind RetryAllFailedDialog's confirm button.
+  const banner = await mountFailedSyncBannerFromPage()
+  const { controls, tree } = banner.render()
+
+  assert.deepEqual(controls.map((c) => c.label), ['Retry all failed…'], 'one control, and it has a handler')
+  assert.equal(findByTypeName(tree, 'RetryAllFailedDialog')?.props.open, false, 'PRECONDITION: closed before the click')
 
   await banner.click(controls[0])
 
-  assert.deepEqual(state.retry.calls, [[]], 'called once, with no entry id at all')
+  assert.deepEqual(state.retry.calls, [], 'clicking called no retry action at all')
+  const dialog = findByTypeName(banner.render().tree, 'RetryAllFailedDialog')
+  assert.equal(dialog?.props.open, true, 'the dialog is now open')
+  assert.equal(dialog?.props.connector, 'xero', 'and it is told which connector the rows belong to')
 })
 
-test('a successful retry says how many rows moved and re-reads the page (o3d-aouf)', async () => {
+test('a finished retry shows its outcome and re-reads the page (o3d-aouf)', async () => {
   // The banner hides itself on `failedCount === 0`, which only works if the server summary is
   // re-read. Without router.refresh() the alert sits there after a successful retry, describing a
   // backlog that no longer exists.
-  state.retry.result = { success: true, reset: 3 }
   const banner = await mountFailedSyncBannerFromPage()
+  await banner.click(banner.render().controls.find((c) => c.label === 'Retry all failed…'))
 
-  await banner.click(banner.render().controls.find((c) => c.label === 'Retry all failed'))
+  const dialog = findByTypeName(banner.render().tree, 'RetryAllFailedDialog')
+  ;(dialog!.props.onDone as (text: string, success: boolean) => void)('Re-queued 3 failed row(s) — they will retry on the next sync.', true)
 
   assert.equal(state.refreshes, 1, 'the summary is re-read from the server')
-  assert.match(banner.render().html, /Re-queued 3 failed row\(s\)/, 'and the count comes from the ACTION, not the props')
+  assert.match(banner.render().html, /Re-queued 3 failed row\(s\)/)
 })
 
-test('a failed retry explains itself and does NOT refresh (o3d-aouf)', async () => {
-  // Swallowing the error leaves a button that visibly does nothing, and refreshing on a failure
-  // re-reads a summary that cannot have changed.
-  state.retry.result = { success: false, reset: 0, error: 'You do not have permission to retry sync rows.' }
-  const banner = await mountFailedSyncBannerFromPage()
-
-  await banner.click(banner.render().controls.find((c) => c.label === 'Retry all failed'))
-
-  assert.equal(state.refreshes, 0, 'nothing changed, so there is nothing new to read')
-  assert.match(banner.render().html, /You do not have permission to retry sync rows\./)
-  assert.ok(!banner.render().html.includes('Re-queued'), 'and it does not also claim success')
-})
-
-test('a failure with no reason still says something the operator can act on (o3d-aouf)', async () => {
-  state.retry.result = { success: false, reset: 0 }
-  const banner = await mountFailedSyncBannerFromPage()
-
-  await banner.click(banner.render().controls.find((c) => c.label === 'Retry all failed'))
-
-  assert.match(banner.render().html, /Failed to re-queue the failed rows\./)
-  assert.equal(state.refreshes, 0)
-})
-
-test('the retry control states what a retry COSTS on Xero, and claims nothing elsewhere (o3d-wahn)', async () => {
+test('the confirmation dialog states what a retry COSTS on Xero, counts nothing it cannot know, and claims nothing elsewhere (o3d-wahn)', async () => {
   // Xero keeps an Idempotency-Key for six minutes; a row is only FAILED after its automatic
   // retries are exhausted, so this control is always past the window and a re-post is a NEW
   // request. That is not enforceable — refusing every aged row would remove the only remedy — so
-  // it has to be SAID, at the control.
-  const xero = await mountFailedSyncBannerFromPage({ connector: 'xero' })
-  const xeroHtml = xero.render().html
-  assert.match(xeroHtml, /only 6 minutes/, 'the window, quoted')
-  assert.match(xeroHtml, /SECOND document/, 'the consequence in the ledger')
-  assert.match(xeroHtml, /Check Xero/, 'and the check to make first')
+  // it is SAID in the dialog body, and the operator must tick that they checked the ledger.
+  const { RetryAllFailedDialog } = await import('@/app/(dashboard)/sync/retry-all-failed-dialog')
+  const props = { open: true, onOpenChange: () => {}, onDone: () => {} }
+
+  const xero = mountClientComponent(RetryAllFailedDialog as never, { ...props, connector: 'xero' } as never).render()
+  const confirm = findByTypeName(xero.tree, 'ConfirmDialog')
+  assert.ok(confirm, 'the dialog is a ConfirmDialog')
+  const body = (await import('react-dom/server')).renderToStaticMarkup(confirm!.props.description as never)
+  assert.match(body, /only 6 minutes/, 'the window, quoted')
+  assert.match(body, /SECOND document/, 'the consequence in the ledger')
+  assert.match(body, /Check Xero/, 'and the check to make first')
+  assert.match(String(confirm!.props.acknowledgement), /I have checked Xero and none of these documents already exist there/, 'the operator must tick it')
+  assert.equal(confirm!.props.destructive, true)
 
   // QuickBooks' RequestId window is unestablished, so no caution is shown rather than a guessed one.
-  const quickbooks = await mountFailedSyncBannerFromPage({ connector: 'quickbooks' })
-  const quickbooksHtml = quickbooks.render().html
-  assert.ok(!quickbooksHtml.includes('6 minutes'), 'a window nobody verified is not quoted at another connector')
-  assert.match(quickbooksHtml, /Retry all failed/, 'the control itself is unchanged')
+  const quickbooks = mountClientComponent(RetryAllFailedDialog as never, { ...props, connector: 'quickbooks' } as never).render()
+  const qbBody = (await import('react-dom/server')).renderToStaticMarkup(findByTypeName(quickbooks.tree, 'ConfirmDialog')!.props.description as never)
+  assert.ok(!qbBody.includes('6 minutes'), 'a window nobody verified is not quoted at another connector')
 })
 
 // ---------------------------------------------------------------------------

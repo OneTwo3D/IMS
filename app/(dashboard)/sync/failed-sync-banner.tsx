@@ -1,10 +1,10 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { AlertTriangle, Loader2, RotateCcw } from 'lucide-react'
+import { AlertTriangle, RotateCcw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { retryFailedAccountingSync } from '@/app/actions/accounting-sync'
+import { RetryAllFailedDialog } from './retry-all-failed-dialog'
 import { accountingRetryDuplicateCaution } from '@/lib/domain/accounting/idempotency-retention'
 import type { FailedAccountingSyncSummary } from '@/app/actions/accounting-sync'
 
@@ -15,12 +15,12 @@ const CONNECTOR_LABELS: Record<string, string> = { xero: 'Xero', quickbooks: 'Qu
  * their retries and gone FAILED. The sync-log table already lists them with
  * per-row + Retry-All controls; this surfaces the count at the top of the page
  * (next to the connector-orphan banner) so an admin notices without scrolling,
- * and offers a one-click "Retry all failed".
+ * and offers a "Retry all failed" (behind a confirmation dialog).
  */
 export function FailedSyncBanner({ summary }: { summary: FailedAccountingSyncSummary }) {
   const router = useRouter()
-  const [pending, startTransition] = useTransition()
   const [message, setMessage] = useState<string | null>(null)
+  const [dialogOpen, setDialogOpen] = useState(false)
 
   // The server summary is the source of truth: router.refresh() re-fetches it
   // after a retry, so the banner hides (or shows the remainder) on its own.
@@ -31,28 +31,6 @@ export function FailedSyncBanner({ summary }: { summary: FailedAccountingSyncSum
   // control exists the key has expired and a re-post is a new request. Stated here rather than
   // enforced, because refusing every aged row would remove the only remedy the operator has.
   const duplicateCaution = accountingRetryDuplicateCaution(summary.connector)
-
-  function retryAll() {
-    setMessage(null)
-    startTransition(async () => {
-      const res = await retryFailedAccountingSync()
-      if (res.success) {
-        // A partial refusal must not read as plain success: the guard can allow some rows and
-        // refuse others in one call, and the refused ones stay FAILED (o3d-0m56).
-        setMessage(
-          res.refused
-            ? `Re-queued ${res.reset} failed row(s). ${res.refused} row(s) were NOT re-queued — `
-              + 'each has a recorded reason in the sync warnings. Either retrying them could post a '
-              + 'second payment (check the ledger before acting), or another entry for the same '
-              + 'document is already queued and they can be retried after it finishes.'
-            : `Re-queued ${res.reset} failed row(s) — they will retry on the next sync.`,
-        )
-        router.refresh()
-      } else {
-        setMessage(res.error ?? 'Failed to re-queue the failed rows.')
-      }
-    })
-  }
 
   return (
     <div className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-950 dark:border-red-800 dark:bg-red-950/30 dark:text-red-100">
@@ -66,10 +44,16 @@ export function FailedSyncBanner({ summary }: { summary: FailedAccountingSyncSum
           </p>
           {duplicateCaution && <p className="text-xs">{duplicateCaution}</p>}
           {message && <p className="text-xs" role="alert">{message}</p>}
-          <Button variant="outline" size="sm" onClick={retryAll} disabled={pending}>
-            {pending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RotateCcw className="h-3 w-3 mr-1" />}
-            Retry all failed
+          <Button variant="outline" size="sm" onClick={() => { setMessage(null); setDialogOpen(true) }}>
+            <RotateCcw className="h-3 w-3 mr-1" />
+            Retry all failed…
           </Button>
+          <RetryAllFailedDialog
+            open={dialogOpen}
+            onOpenChange={setDialogOpen}
+            connector={summary.connector}
+            onDone={(text) => { setMessage(text); router.refresh() }}
+          />
         </div>
       </div>
     </div>

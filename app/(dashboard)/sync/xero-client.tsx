@@ -32,6 +32,7 @@ import {
   type AccountingSyncReadiness,
 } from '@/app/actions/accounting-sync'
 import { accountingRetryDuplicateCaution } from '@/lib/domain/accounting/idempotency-retention'
+import { RetryAllFailedDialog } from './retry-all-failed-dialog'
 import {
   refreshAccountingBatchPreview,
   type AccountingBatchPreview,
@@ -182,7 +183,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [tab, setTab] = useState<XeroTabId>('connection')
   const [logPage, setLogPage] = useState(0)
   const [retryingId, setRetryingId] = useState<string | null>(null)
-  const [retryingAll, setRetryingAll] = useState(false)
+  const [retryAllOpen, setRetryAllOpen] = useState(false)
   const [reconcilingId, setReconcilingId] = useState<string | null>(null)
   /** o3d-psvi: the row whose sale is being re-checked. */
   const [releasingId, setReleasingId] = useState<string | null>(null)
@@ -503,29 +504,6 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     setRetryingId(null)
     if (result.success) {
       setRetryMsg(`Reset ${result.reset} entry for retry.`)
-      router.refresh()
-    } else {
-      setRetryMsg(`Retry failed: ${result.error}`)
-    }
-  }
-
-  async function handleRetryAll() {
-    setRetryMsg(null)
-    setRetryingAll(true)
-    const result = await retryFailedAccountingSync()
-    setRetryingAll(false)
-    if (result.success) {
-      // "Retry All" is the worst case for the o3d-0m56 guard — it can allow some rows and
-      // refuse others in one call. Reporting only the reset count made a partial refusal read
-      // as a clean success, and the refused rows silently stayed FAILED.
-      setRetryMsg(
-        result.refused
-          ? `Reset ${result.reset} failed entry/entries. ${result.refused} were NOT reset — each has `
-            + 'a recorded reason in the sync warnings. Either retrying them could post a second '
-            + 'payment (check the ledger before acting), or another entry for the same document is '
-            + 'already queued and they can be retried after it finishes.'
-          : `Reset ${result.reset} failed entry/entries for retry.`,
-      )
       router.refresh()
     } else {
       setRetryMsg(`Retry failed: ${result.error}`)
@@ -1127,9 +1105,9 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
               <h3 className="text-base font-semibold">Sync Log</h3>
               <div className="flex items-center gap-2">
                 {hasFailedEntries && (
-                  <Button variant="outline" size="sm" onClick={handleRetryAll} disabled={retryingAll}>
-                    {retryingAll ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RotateCcw className="h-3 w-3 mr-1" />}
-                    Retry All Failed
+                  <Button variant="outline" size="sm" onClick={() => { setRetryMsg(null); setRetryAllOpen(true) }}>
+                    <RotateCcw className="h-3 w-3 mr-1" />
+                    Retry All Failed…
                   </Button>
                 )}
                 <Button size="sm" variant="outline" onClick={handleManualSync} disabled={isPending || !connected || s[syncEnabledKey] !== 'true'}>
@@ -1144,6 +1122,12 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
               <p className="text-xs text-muted-foreground">{accountingRetryDuplicateCaution('xero')}</p>
             )}
             {retryMsg && <p className="text-xs text-muted-foreground">{retryMsg}</p>}
+            <RetryAllFailedDialog
+              open={retryAllOpen}
+              onOpenChange={setRetryAllOpen}
+              connector="xero"
+              onDone={(text) => { setRetryMsg(text); router.refresh() }}
+            />
             {logs.length === 0 ? (
               <p className="text-sm text-muted-foreground">No sync entries yet.</p>
             ) : (

@@ -660,12 +660,12 @@ export async function purgeExpiredData(): Promise<{
     const cutoff = monthsAgo(wmsJobMonths)
     const pendingAlignmentBindings = await db.externalWmsBinding.findMany({
       where: { stockSyncMode: 'ALIGN_TO_WMS', alignmentConfirmedAt: null },
-      select: { connector: true, warehouseId: true },
+      select: { connector: true, warehouseId: true, externalWarehouseId: true, connectionId: true, pairingChangedAt: true },
     })
     // Deduplicated on the SCOPE the query keys on, so two bindings of one connector on one warehouse
     // resolve the same single job once.
     const scopes = new Map(
-      pendingAlignmentBindings.map((row) => [`${row.connector}:${row.warehouseId}`, row] as const),
+      pendingAlignmentBindings.map((row) => [`${row.connector}:${row.warehouseId}:${row.externalWarehouseId}:${row.connectionId}`, row] as const),
     )
     const protectedJobIds: string[] = []
     for (const scope of scopes.values()) {
