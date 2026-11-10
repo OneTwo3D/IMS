@@ -239,12 +239,15 @@ export type SoRow = {
   customerName: string | null
   customerEmail: string | null
   subtotalForeign: number
+  storeCreditForeign: number
   shippingService: string | null
   shippingForeign: number
   taxRateName: string | null
   taxRatePercent: number | null
   taxForeign: number
   pricesIncludeVat: boolean
+  /** Whether the stored unit prices and discounts include VAT (storedAmountsIncludeVat): a WooCommerce order is net whatever `pricesIncludeVat` says. */
+  amountsIncludeVat: boolean
   totalForeign: number
   totalBase: number
   shipFromWarehouseId: string | null
@@ -491,6 +494,7 @@ const SO_SELECT = {
   customerName: true,
   customerEmail: true,
   subtotalForeign: true,
+  storeCreditForeign: true,
   shippingService: true,
   shippingForeign: true,
   taxRateName: true,
@@ -553,6 +557,7 @@ function mapSoRow(so: {
   customerName: string | null
   customerEmail: string | null
   subtotalForeign: unknown
+  storeCreditForeign: unknown
   shippingService: string | null
   shippingForeign: unknown
   taxRateName: string | null
@@ -652,12 +657,15 @@ function mapSoRow(so: {
     customerName: so.customerName,
     customerEmail: so.customerEmail,
     subtotalForeign: Number(so.subtotalForeign),
+    storeCreditForeign: Number(so.storeCreditForeign ?? 0),
     shippingService: so.shippingService,
     shippingForeign: Number(so.shippingForeign),
     taxRateName: so.taxRateName,
     taxRatePercent: so.taxRatePercent != null ? Number(so.taxRatePercent) : null,
     taxForeign: Number(so.taxForeign),
     pricesIncludeVat: !!so.pricesIncludeVat,
+    // The basis the STORED amounts (unit prices, discount) are in: what the order page, the PDFs and the refund dialog read, never the display flag above.
+    amountsIncludeVat: storedAmountsIncludeVat(so),
     totalForeign: Number(so.totalForeign),
     totalBase: Number(so.totalBase),
     shipFromWarehouseId: so.shipFromWarehouseId,

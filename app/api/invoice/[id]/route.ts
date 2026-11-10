@@ -5,7 +5,8 @@ import { hasPermission } from '@/lib/permissions'
 import { db } from '@/lib/db'
 import { formatCountryDisplay } from '@/lib/countries'
 import { currentInvoiceIsWithdrawn, loadCurrentInvoicePdf } from '@/lib/domain/invoice-documents/current-document'
-import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, groupVatBreakdown, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
+import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, documentVatRows, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
+import { documentTotalsRows, salesOrderMoneyView } from '@/lib/domain/sales/sales-order-money-view'
 import { formatMoney } from '@/lib/utils'
 import { getBaseCurrencyDisplay } from '@/lib/base-currency'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
@@ -25,6 +26,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const so = await db.salesOrder.findUnique({
     where: { id },
     include: {
+      shoppingLinks: { select: { connector: true } },
       lines: {
         select: {
           description: true, sku: true, qty: true, unitPriceForeign: true, discountAmount: true, totalForeign: true, taxForeign: true,
@@ -101,18 +103,34 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const baseMoney = (n: number) => formatMoney(n, base.symbol, base.symbolPosition)
   // Show base-currency equivalents (VAT + total) when the order is in a foreign currency.
   const showBaseEquivalent = so.currency !== base.code
+  // ONE basis for every figure on the document (lib/domain/sales/sales-order-money-view.ts), labelled, and reconciling with the stored total.
+  const view = salesOrderMoneyView({
+    pricesIncludeVat: so.pricesIncludeVat,
+    shoppingLinks: so.shoppingLinks,
+    taxRatePercent: so.taxRatePercent != null ? Number(so.taxRatePercent) : null,
+    subtotalForeign: Number(so.subtotalForeign),
+    discountAmount: Number(so.discountAmount),
+    shippingForeign: Number(so.shippingForeign),
+    taxForeign: Number(so.taxForeign),
+    totalForeign: Number(so.totalForeign),
+    storeCreditForeign: Number(so.storeCreditForeign ?? 0),
+    lines: so.lines.map((l) => ({
+      qty: Number(l.qty), unitPriceForeign: Number(l.unitPriceForeign), discountAmount: Number(l.discountAmount ?? 0),
+      totalForeign: Number(l.totalForeign), taxForeign: Number(l.taxForeign ?? 0),
+    })),
+  })
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'Description', width: 230, wrap: true },
     { label: 'Qty', width: 40, align: 'right' },
-    { label: `Price (${sym})`, width: 65, align: 'right' },
-    { label: `Tax (${sym})`, width: 55, align: 'right' },
-    { label: `Total (${sym})`, width: 75, align: 'right' },
+    { label: `Price ${view.basisLabel} (${sym})`, width: 65, align: 'right' },
+    { label: `${view.vatIsAdditional ? 'VAT' : 'incl. VAT'} (${sym})`, width: 55, align: 'right' },
+    { label: `Total ${view.basisLabel} (${sym})`, width: 75, align: 'right' },
   ]
 
   const rows = so.lines.map((l, i) => [
     String(i + 1), l.description + (l.sku ? ` (${l.sku})` : ''), String(Number(l.qty)),
-    Number(l.unitPriceForeign).toFixed(2), Number(l.taxForeign).toFixed(2), Number(l.totalForeign).toFixed(2),
+    Number(l.unitPriceForeign).toFixed(2), Number(l.taxForeign).toFixed(2), view.lines[i].total.toFixed(2),
   ])
 
   drawTable(doc, columns, rows, branding)
@@ -127,41 +145,18 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const lW = 80
   const lX = tableRight - vW - lW
   doc.font('Helvetica').fontSize(9).fillColor('#666')
-  doc.text('Subtotal:', lX, doc.y, { width: lW, align: 'right' })
-  doc.text(money(Number(so.subtotalForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-  if (Number(so.discountAmount) > 0) {
-    doc.text('Discount:', lX, doc.y, { width: lW, align: 'right' })
-    doc.text(`-${money(Number(so.discountAmount))}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+  const totalsRows = documentTotalsRows(view, documentVatRows({
+    taxRateName: so.taxRateName,
+    taxRatePercent: so.taxRatePercent != null ? Number(so.taxRatePercent) : null,
+    taxForeign: Number(so.taxForeign),
+    lines: so.lines.map((l) => ({ taxRatePercent: l.taxRate?.rate != null ? Number(l.taxRate.rate) : null, taxForeign: Number(l.taxForeign || 0) })),
+  }))
+  for (const row of totalsRows) {
+    if (row.strong) doc.font('Helvetica-Bold').fontSize(10).fillColor('#000')
+    else doc.font('Helvetica').fontSize(9).fillColor('#666')
+    doc.text(`${row.label}:`, lX - 40, doc.y + (row.strong ? 3 : 0), { width: lW + 40, align: 'right' })
+    doc.text(money(row.amount), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
   }
-  if (Number(so.shippingForeign) > 0) {
-    doc.text('Shipping:', lX, doc.y, { width: lW, align: 'right' })
-    doc.text(money(Number(so.shippingForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-  }
-  if (Number(so.taxForeign) > 0) {
-    // Build per-rate VAT breakdown. Shipping/fees VAT is tracked on the
-    // order, not on lines, so fold it into the default bucket via `extra`.
-    const shippingFeeVat = Math.max(0, Number(so.taxForeign) - so.lines.reduce((s, l) => s + Number(l.taxForeign || 0), 0))
-    const vatBreakdown = groupVatBreakdown(
-      so.lines.map((l) => ({
-        taxRatePercent: l.taxRate?.rate != null ? Number(l.taxRate.rate) : (so.taxRatePercent != null ? Number(so.taxRatePercent) : null),
-        taxForeign: Number(l.taxForeign || 0),
-      })),
-      shippingFeeVat > 0 ? [{ label: 'Shipping/Fees', amount: shippingFeeVat }] : undefined,
-    )
-    if (vatBreakdown.length <= 1) {
-      const taxLabel = (so.taxRateName ?? 'Tax') + (so.taxRatePercent != null ? ` (${(Number(so.taxRatePercent) * 100).toFixed(0)}%)` : '') + ':'
-      doc.text(taxLabel, lX, doc.y, { width: lW, align: 'right' })
-      doc.text(money(Number(so.taxForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-    } else {
-      for (const row of vatBreakdown) {
-        doc.text(`${row.label}:`, lX, doc.y, { width: lW, align: 'right' })
-        doc.text(money(row.amount), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-      }
-    }
-  }
-  doc.font('Helvetica-Bold').fontSize(10).fillColor('#000')
-  doc.text('Total:', lX, doc.y + 3, { width: lW, align: 'right' })
-  doc.text(money(Number(so.totalForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
 
   if (showBaseEquivalent) {
     // Total + VAT in the base currency on one line, e.g. "(GBP equivalent £80.73, 20% VAT £13.46)".

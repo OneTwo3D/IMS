@@ -8,6 +8,12 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Sales order, refund dialog and PDF figures: one basis, reconciling
+
+- **Fixed: the order page no longer grosses its figures up a second time.** Line totals, subtotal and shipping were multiplied by the order's header rate whenever the display flag said "prices include VAT", so a WooCommerce order (stored net) or an order whose lines carry a different rate (for example 0%) showed a subtotal larger than its total. The page now follows the basis the amounts are stored in (`storedAmountsIncludeVat`), takes each line's own VAT, grosses shipping up exactly as the invoice is sent, labels every column and total "incl. VAT" or "excl. VAT", and says so on screen if the figures do not add up to the stored total.
+- **Fixed: the refund dialog now shows, and sends, the credit note.** It used to send quantity x the typed unit price as the NET refund, so on a VAT-inclusive order the credit note added VAT to a gross price (28.80 confirmed, 34.56 credited). It now sends the refunded line's stored net pro rata and shows net, VAT and the credit-note total incl. VAT before Confirm; the Refunds panel and the invoice dialog show the same credit-note figure from the same helper.
+- **Fixed: the sales order and invoice PDFs print one basis.** Lines, subtotal, discount and shipping are all gross or all net (labelled), the VAT rows reconcile with the Total, and a gross-basis document states the VAT it includes after the Total.
+
 ### Manual orders and bills: three posting defects
 
 - **Fixed: a manual order with VAT-inclusive prices and "No VAT" as its default rate no longer posts its VAT twice.** The stored amounts cut each line's net out of the typed gross at the line's own rate, but the invoice was sent inclusive or exclusive from the header rate alone, so a £120 line at 20% reached the ledger as £120 net + £24 VAT. That combination (Incl. VAT with no default rate while a line carries VAT) is now refused when the order is saved, in the form and in `createSalesOrder`; with the default rate chosen the order is stored and posted inclusive at the prices typed. The Incl. VAT box is shown even when the rate is "No VAT". A draft already stored that way is not finalised and no invoice is queued for it. Orders already queued or posted are not changed.

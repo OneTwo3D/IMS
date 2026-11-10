@@ -395,6 +395,31 @@ export function groupVatBreakdown(
 }
 
 /**
+ * The VAT rows of a printed order document: one row for the order's single rate, or one per rate when the lines carry different
+ * ones. The amounts add up to the order's stored VAT (the shipping/fees share, which can be negative once the VAT inside an order
+ * discount is taken off, is the residue after the lines), so the rows reconcile with the Total whatever the basis.
+ */
+export function documentVatRows(order: {
+  taxRateName: string | null
+  taxRatePercent: number | null
+  taxForeign: number
+  lines: { taxRatePercent: number | null; taxForeign: number }[]
+}): { label: string; amount: number }[] {
+  if (Math.abs(order.taxForeign) < 0.00005) return []
+  const lineVat = order.lines.reduce((s, l) => s + (Number(l.taxForeign) || 0), 0)
+  const shippingFeeVat = Math.round((order.taxForeign - lineVat) * 10000) / 10000
+  const breakdown = groupVatBreakdown(
+    order.lines.map((l) => ({ taxRatePercent: l.taxRatePercent ?? order.taxRatePercent, taxForeign: Number(l.taxForeign || 0) })),
+    Math.abs(shippingFeeVat) >= 0.00005 ? [{ label: 'Shipping/Fees', amount: shippingFeeVat }] : undefined,
+  )
+  if (breakdown.length <= 1) {
+    const label = (order.taxRateName ?? 'VAT') + (order.taxRatePercent != null ? ` (${(order.taxRatePercent * 100).toFixed(0)}%)` : '')
+    return [{ label, amount: order.taxForeign }]
+  }
+  return breakdown
+}
+
+/**
  * Draw header/footer notes from a document template.
  * Shared by the preview route and all real PDF routes.
  */

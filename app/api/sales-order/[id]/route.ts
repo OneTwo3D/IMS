@@ -3,7 +3,8 @@ import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { db } from '@/lib/db'
 import { formatCountryDisplay } from '@/lib/countries'
-import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, groupVatBreakdown, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
+import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, documentVatRows, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
+import { documentTotalsRows, salesOrderMoneyView } from '@/lib/domain/sales/sales-order-money-view'
 import { formatMoney } from '@/lib/utils'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { formatDateTime } from '@/lib/format-datetime'
@@ -18,6 +19,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     where: { id },
     include: {
       shipFromWarehouse: { select: { name: true } },
+      shoppingLinks: { select: { connector: true } },
       lines: {
         select: {
           description: true, sku: true, qty: true, unitPriceForeign: true, discountAmount: true, totalForeign: true, taxForeign: true,
@@ -66,21 +68,37 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const sym = currencyRow?.symbol ?? (so.currency === 'GBP' ? '£' : so.currency)
   const symPos: 'PREFIX' | 'POSTFIX' = currencyRow?.symbolPosition ?? 'PREFIX'
   const money = (n: number) => formatMoney(n, sym, symPos)
+  // ONE basis for every figure on the document (lib/domain/sales/sales-order-money-view.ts), labelled, and reconciling with the stored total.
+  const view = salesOrderMoneyView({
+    pricesIncludeVat: so.pricesIncludeVat,
+    shoppingLinks: so.shoppingLinks,
+    taxRatePercent: so.taxRatePercent != null ? Number(so.taxRatePercent) : null,
+    subtotalForeign: Number(so.subtotalForeign),
+    discountAmount: Number(so.discountAmount),
+    shippingForeign: Number(so.shippingForeign),
+    taxForeign: Number(so.taxForeign),
+    totalForeign: Number(so.totalForeign),
+    storeCreditForeign: Number(so.storeCreditForeign ?? 0),
+    lines: so.lines.map((l) => ({
+      qty: Number(l.qty), unitPriceForeign: Number(l.unitPriceForeign), discountAmount: Number(l.discountAmount ?? 0),
+      totalForeign: Number(l.totalForeign), taxForeign: Number(l.taxForeign ?? 0),
+    })),
+  })
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 70 },
     { label: 'Description', width: 195, wrap: true },
     { label: 'Qty', width: 40, align: 'right' },
-    { label: `Price (${sym})`, width: 65, align: 'right' },
+    { label: `Price ${view.basisLabel} (${sym})`, width: 65, align: 'right' },
     { label: 'Discount', width: 50, align: 'right' },
-    { label: `Total (${sym})`, width: 65, align: 'right' },
+    { label: `Total ${view.basisLabel} (${sym})`, width: 65, align: 'right' },
   ]
 
   const rows = so.lines.map((l, i) => [
     String(i + 1), l.sku ?? '', l.description, String(Number(l.qty)),
     Number(l.unitPriceForeign).toFixed(2),
     Number(l.discountAmount) > 0 ? `-${Number(l.discountAmount).toFixed(2)}` : '',
-    Number(l.totalForeign).toFixed(2),
+    view.lines[i].total.toFixed(2),
   ])
 
   drawTable(doc, columns, rows, branding)
@@ -92,44 +110,18 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const lW = 80
   const lX = tableRight - vW - lW
   doc.font('Helvetica').fontSize(9).fillColor('#666')
-  doc.text('Subtotal:', lX, doc.y, { width: lW, align: 'right' })
-  doc.text(money(Number(so.subtotalForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-  if (Number(so.discountAmount) > 0) {
-    doc.text('Discount:', lX, doc.y, { width: lW, align: 'right' })
-    doc.text(`-${money(Number(so.discountAmount))}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+  const totalsRows = documentTotalsRows(view, documentVatRows({
+    taxRateName: so.taxRateName,
+    taxRatePercent: so.taxRatePercent != null ? Number(so.taxRatePercent) : null,
+    taxForeign: Number(so.taxForeign),
+    lines: so.lines.map((l) => ({ taxRatePercent: l.taxRate?.rate != null ? Number(l.taxRate.rate) : null, taxForeign: Number(l.taxForeign || 0) })),
+  }))
+  for (const row of totalsRows) {
+    if (row.strong) doc.font('Helvetica-Bold').fontSize(10).fillColor('#000')
+    else doc.font('Helvetica').fontSize(9).fillColor('#666')
+    doc.text(`${row.label}:`, lX - 40, doc.y + (row.strong ? 3 : 0), { width: lW + 40, align: 'right' })
+    doc.text(money(row.amount), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
   }
-  if (Number(so.shippingForeign) > 0) {
-    doc.text('Shipping:', lX, doc.y, { width: lW, align: 'right' })
-    doc.text(money(Number(so.shippingForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-  }
-  if (Number(so.taxForeign) > 0) {
-    const shippingFeeVat = Math.max(0, Number(so.taxForeign) - so.lines.reduce((s, l) => s + Number(l.taxForeign || 0), 0))
-    const vatBreakdown = groupVatBreakdown(
-      so.lines.map((l) => ({
-        taxRatePercent: l.taxRate?.rate != null ? Number(l.taxRate.rate) : (so.taxRatePercent != null ? Number(so.taxRatePercent) : null),
-        taxForeign: Number(l.taxForeign || 0),
-      })),
-      shippingFeeVat > 0 ? [{ label: 'Shipping/Fees', amount: shippingFeeVat }] : undefined,
-    )
-    if (vatBreakdown.length <= 1) {
-      const taxLabel = (so.taxRateName ?? 'Tax') + (so.taxRatePercent != null ? ` (${(Number(so.taxRatePercent) * 100).toFixed(0)}%)` : '') + ':'
-      doc.text(taxLabel, lX, doc.y, { width: lW, align: 'right' })
-      doc.text(money(Number(so.taxForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-    } else {
-      for (const row of vatBreakdown) {
-        doc.text(`${row.label}:`, lX, doc.y, { width: lW, align: 'right' })
-        doc.text(money(row.amount), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-      }
-    }
-  }
-  // Store credit is a payment: its own line, so the figures above add up to the Total below.
-  if (Number(so.storeCreditForeign ?? 0) > 0) {
-    doc.text('Store credit:', lX, doc.y, { width: lW, align: 'right' })
-    doc.text(`-${money(Number(so.storeCreditForeign))}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-  }
-  doc.font('Helvetica-Bold').fontSize(10).fillColor('#000')
-  doc.text('Total:', lX, doc.y + 3, { width: lW, align: 'right' })
-  doc.text(money(Number(so.totalForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
 
   // Footer note from template
   if (tpl?.footerNote) {
