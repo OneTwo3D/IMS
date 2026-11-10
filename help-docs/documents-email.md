@@ -51,14 +51,14 @@ A token issued on one network cannot be replayed from another, and tokens cannot
 
 ### WooCommerce customer-facing PDF download
 
-WooCommerce customers can download their invoice PDF from their Order page in the WC storefront. The flow is:
+Once invoice publication is switched on (see below), WooCommerce customers can download their invoice PDF from their Order page in the WC storefront. The flow is:
 
 1. The customer clicks "Download Invoice" on the WC order page.
 2. The WordPress helper plugin (`wc-invoice-handoff`) calls IMS with a customer-scoped token.
 3. IMS verifies the WC order maps to a real IMS invoice and that the requesting customer owns it.
 4. The PDF is streamed back to the customer through the WC storefront.
 
-This download works for orders that have an invoice. Showing the stored invoice in the customer's **My Account** page automatically is **not yet switched on**; see [WooCommerce](woocommerce.md#invoice-note-rules).
+Showing the stored invoice in the customer's **My Account** page is **not yet switched on**. The customer's Invoice button appears only on orders IMS has published, so while publication is off customers do not see it; email the invoice instead. See [WooCommerce](woocommerce.md#invoice-note-rules).
 
 No IMS login is required for the customer — authorisation comes from the WC session plus the order-ownership check on the IMS side. The handoff token is single-use and short-lived.
 

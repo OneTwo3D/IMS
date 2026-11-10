@@ -83,6 +83,14 @@ Effects you will notice in other screens:
 
 **Integrations > Exceptions** is the inbox for items the warehouse link could not finish. Sections include a maintenance window, blocked order pushes, dead inbound events, despatches that could not be reconciled, unreadable records, order-level drift and order-total mismatches. Each row has **Replay** (try again safely) and **Dismiss**, or **Mark as handled** once you have fixed it by hand. A despatch for an order under a withdrawal hold is held back again when replayed. Unreadable records can be isolated so that one bad record does not stop the rest.
 
+### Holds, cancels and merged orders
+
+- **A hold or cancel Mintsoft cannot honour.** If the order is already picking, packing or despatched, or Mintsoft merged it into another order, IMS cannot cancel it there. It stays live, shows under Exceptions as **Hold not honoured** or **Cancel not honoured**, and the warehouse gets one note. A despatch after a hold is recorded as normal. A despatch after a cancel, or after a full refund while the order was still undespatched, is not recorded automatically: it appears as a stuck despatch for you to decide what happens to the goods.
+- **Merged orders.** IMS never cancels a combined (merged) Mintsoft order on behalf of one of the orders in it. When it finds the merge, the order link points to the combined order and the notice tells you to take that order's items out in Mintsoft. IMS does not remove items for you.
+- **Not found.** If Mintsoft no longer returns the order after a hold or cancel, IMS checks whether it was merged. If the check cannot settle it, it retries for 5 sweeps and then raises a notice. It never records an order as cancelled or held because Mintsoft returned "not found".
+- **Create outcome unknown.** IMS links the order to one Mintsoft already holds only when it matches this order's number and IMS's own reference exactly and is live; **Replay** does the same check. Otherwise the row says why: it is cancelled in Mintsoft (a cancelled order keeps its number), there are several matches, or it was merged into another order. For a merged one the row names the combined order and tells you not to cancel it.
+- **Notices clear themselves** when the IMS order leaves the held or cancelled state. A warehouse note that failed to send is retried automatically.
+
 Also see:
 
 - Overdue ASNs and stale stock syncs raise a warning on their own (the `wms-watchdog` job, on by default).
