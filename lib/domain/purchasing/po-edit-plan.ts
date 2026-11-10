@@ -58,6 +58,8 @@ export type PoEditLineFact = {
   totalBase: number
   taxForeign: number
   taxBase: number
+  discountAmount: number
+  discountStr: string | null
   landedQty: number
   billedQty: number
   returnedQty: number
@@ -121,6 +123,8 @@ export async function readPoEditFacts(tx: Prisma.TransactionClient, id: string):
           totalBase: true,
           taxForeign: true,
           taxBase: true,
+          discountAmount: true,
+          discountStr: true,
           product: { select: { sku: true } },
           _count: { select: { receiptLines: true } },
           invoiceLines: { select: { qtyBilled: true } },
@@ -158,6 +162,8 @@ export async function readPoEditFacts(tx: Prisma.TransactionClient, id: string):
     totalBase: Number(l.totalBase),
     taxForeign: Number(l.taxForeign),
     taxBase: Number(l.taxBase),
+    discountAmount: Number(l.discountAmount),
+    discountStr: l.discountStr,
     landedQty: landed.get(l.id)?.qtyNumber ?? Number(l.qtyReceived),
     billedQty: l.invoiceLines.reduce((sum, il) => sum + Number(il.qtyBilled), 0),
     returnedQty: Number(l.qtyReturned),
@@ -298,4 +304,21 @@ export function normaliseCostLinesForCompare(
     .filter((l) => l.amountForeign > 0)
     .map((l) => `${(l.description || 'Additional cost').trim()}|${(Math.round(l.amountForeign * 100) / 100).toFixed(2)}|${l.vatable ? 1 : 0}|${l.distributionMethod}`)
     .sort()
+}
+
+/**
+ * A touched line keeps its stored NET unit price when its quantity changes, so its line discount must scale with the quantity too:
+ * the edit form rebuilds the entered price as `net + discount / qty`, and a discount left at the old quantity's amount would
+ * rebuild a different price and make the next save look like a price change. Linear, so a percentage stays the same percentage
+ * of the new gross and a fixed amount keeps the same discount per unit. A percentage string is kept as typed; an amount string
+ * is rewritten to the scaled amount so the stored string and amount agree.
+ */
+export function scaleLineDiscountForQty(
+  line: Pick<PoEditLineFact, 'qty' | 'discountAmount' | 'discountStr'>,
+  newQty: number,
+): { discountAmount: number; discountStr: string | null } {
+  if (!(line.qty > 0) || !(line.discountAmount > 0)) return { discountAmount: line.discountAmount, discountStr: line.discountStr }
+  const discountAmount = Math.round((line.discountAmount / line.qty) * newQty * 10000) / 10000
+  const isPercent = line.discountStr != null && line.discountStr.trim().endsWith('%')
+  return { discountAmount, discountStr: line.discountStr == null || isPercent ? line.discountStr : String(discountAmount) }
 }

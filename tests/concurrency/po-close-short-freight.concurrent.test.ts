@@ -263,3 +263,67 @@ test('credit floor: a freight credit that only fits the full order is floored at
   assert.deepEqual(posted.map((j) => j.type), ['STOCK_IN_TRANSIT'])
   near(posted[0]!.credit[0]!.amount, 60, 0.011, 'inventory decreased by 60 x 1.00 (CR Inventory)')
 })
+
+test('two lines that both landed: BY_VALUE follows landed VALUE (a partly landed line carries less than its ordered share)', SKIP, async () => {
+  const { db } = await import('@/lib/db')
+  const po = await seedPo('csf-bothlanded', [100, 100])
+  await addDirectFreight(po, 60)
+  assert.equal((await receive(po, po.lines[0]!, 50)).success, true)
+  assert.equal((await receive(po, po.lines[1]!, 100)).success, true)
+  assert.equal((await close(po, 'close')).success, true)
+  const unit = async (i: number) => Number((await db.costLayer.findFirstOrThrow({ where: { poLineId: po.lines[i]!.poLineId }, select: { unitCostBase: true } })).unitCostBase)
+  // Landed value: A 250, B 500. Freight 60 -> A 20 over 50 units, B 40 over 100 units: both 5.40. (Unscaled value would give 5.60 / 5.30.)
+  near(await unit(0), 5.4, 0.000001, 'line A')
+  near(await unit(1), 5.4, 0.000001, 'line B')
+})
+
+test('the credit-floor activity and the sold units\' COGS correction are written to the activity log', SKIP, async () => {
+  const { db } = await import('@/lib/db')
+  const floor = await seedPo('csf-floor-log', [100])
+  await db.freightCostLine.create({ data: { poId: floor.poId, description: 'Supplier credit', amountForeign: -400, amountBase: -400, vatable: false, distributionMethod: 'BY_VALUE', sortOrder: 0 } })
+  assert.equal((await receive(floor, floor.lines[0]!, 60)).success, true)
+  assert.equal((await close(floor, 'close')).success, true)
+  assert.ok(await db.activityLog.count({ where: { entityId: floor.poId, action: 'landed_cost_credit_floored' } }) > 0, 'floor WARNING in the activity log')
+
+  const sold = await seedPo('csf-sold-log', [100])
+  await addDirectFreight(sold)
+  assert.equal((await receive(sold, sold.lines[0]!, 60)).success, true)
+  const layer = await db.costLayer.findFirstOrThrow({ where: { poLineId: sold.lines[0]!.poLineId }, select: { id: true } })
+  await db.costLayer.update({ where: { id: layer.id }, data: { remainingQty: 50 } })
+  assert.equal((await close(sold, 'close')).success, true)
+  assert.ok(await db.activityLog.count({ where: { entityId: sold.poId, action: 'cogs_adjusted' } }) > 0, 'COGS correction logged')
+})
+
+for (const how of ['close', 'cancel'] as const) {
+  test(`${how} short takes the revaluation scope lock first: with a cost layer held by someone else it waits on the scope's layer statement`, SKIP, async () => {
+    const { db } = await import('@/lib/db')
+    const { default: pg } = await import('pg')
+    const po = await seedPo(`csf-lock-${how}`, [100])
+    await addDirectFreight(po)
+    assert.equal((await receive(po, po.lines[0]!, 60)).success, true)
+    const layer = await db.costLayer.findFirstOrThrow({ where: { poLineId: po.lines[0]!.poLineId }, select: { id: true } })
+    const holder = new pg.Client({ connectionString: process.env.DATABASE_URL })
+    const probe = new pg.Client({ connectionString: process.env.DATABASE_URL })
+    await holder.connect(); await probe.connect()
+    try {
+      await holder.query('BEGIN')
+      await holder.query('SELECT id FROM cost_layers WHERE id = $1 FOR UPDATE', [layer.id])
+      const action = close(po, how)
+      const deadline = Date.now() + 20_000
+      let seen = ''
+      while (Date.now() < deadline) {
+        const { rows } = await probe.query(
+          `SELECT query FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()`)
+        seen = rows.map((r) => String(r.query)).find((q) => /cost_layers/.test(q) && /FOR NO KEY UPDATE/.test(q)) ?? ''
+        if (seen) break
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      assert.ok(seen, 'the close waits on the scope lock\'s cost-layer statement (step 6), not on a later layer write')
+      await holder.query('COMMIT')
+      assert.equal((await action).success, true)
+    } finally {
+      await holder.query('ROLLBACK').catch(() => {})
+      await Promise.all([holder.end(), probe.end()])
+    }
+  })
+}

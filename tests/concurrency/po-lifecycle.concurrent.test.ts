@@ -22,6 +22,7 @@ mock.module('@/lib/auth/server', {
     requirePermission: async () => ({ user: { id: 'test-user', role: 'ADMIN' } }),
     requireInternalUser: async () => ({ user: { id: 'test-user', role: 'ADMIN' } }),
     requireRole: async () => ({ user: { id: 'test-user', role: 'ADMIN' } }),
+    requireApiAuth: async () => ({ user: { id: 'test-user', role: 'ADMIN' } }),
   },
 })
 mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {} } })
@@ -774,4 +775,60 @@ test('an unchanged save of a VAT-inclusive, header-discounted order after receip
     assert.equal(result.success, true, String(result.error))
     assert.equal(await money(), before, 'every stored money field, header and line, is unchanged by an unchanged save')
   }
+})
+
+test('a discounted received line whose quantity is raised: the stored discount scales, the reloaded form price is the entered one, an unchanged re-save is accepted, and the export shows the scaled discount', SKIP, async () => {
+  const { updatePurchaseOrder, getPurchaseOrder } = await actions()
+  const { db } = await import('@/lib/db')
+  const po = await seedPo('ed-linedisc', [100])
+  // 100 x 10.00 with a 10% line discount: stored discount 100.00, net unit 9.00.
+  const made = await updatePurchaseOrder(po.poId, {
+    currency: 'GBP', pricesIncludeVat: false, taxRateValue: 0,
+    lines: [{ productId: po.lines[0]!.productId, sku: po.lines[0]!.sku, productName: 'disc', qty: 100, unitCostForeign: 10, discountStr: '10%', discountAmount: 100 }],
+  } as Edit)
+  assert.equal(made.success, true, String(made.error))
+  const lineRow = await db.purchaseOrderLine.findFirstOrThrow({ where: { poId: po.poId }, select: { id: true } })
+  const line = { ...po.lines[0]!, poLineId: lineRow.id }
+  assert.equal((await receive({ ...po, lines: [line] }, line, 60)).success, true)
+
+  const request = (qty: number): Edit => ({
+    currency: 'GBP', pricesIncludeVat: false, taxRateValue: 0,
+    lines: [{ poLineId: line.poLineId, productId: line.productId, sku: line.sku, productName: 'disc', qty, unitCostForeign: 10, discountStr: '10%', discountAmount: qty * 10 * 0.1 }],
+  } as Edit)
+  const raised = await updatePurchaseOrder(po.poId, request(120))
+  assert.equal(raised.success, true, String(raised.error))
+  const stored = async () => {
+    const row = await db.purchaseOrderLine.findUniqueOrThrow({ where: { id: line.poLineId }, select: { qty: true, unitCostForeign: true, discountAmount: true, discountStr: true, totalForeign: true, totalBase: true, taxForeign: true } })
+    const header = await db.purchaseOrder.findUniqueOrThrow({ where: { id: po.poId }, select: { subtotalForeign: true, totalForeign: true, subtotalBase: true, totalBase: true } })
+    return JSON.stringify({ row, header })
+  }
+  const afterRaise = JSON.parse(await stored()) as { row: { discountAmount: string; discountStr: string; unitCostForeign: string; totalForeign: string } }
+  assert.equal(Number(afterRaise.row.discountAmount), 120, 'the discount scaled with the quantity (100 -> 120)')
+  assert.equal(afterRaise.row.discountStr, '10%')
+  assert.equal(Number(afterRaise.row.unitCostForeign), 9)
+  assert.equal(Number(afterRaise.row.totalForeign), 1080)
+
+  // What the form rebuilds from the reloaded order: net unit + discount / qty = the price that was entered.
+  const reloaded = await getPurchaseOrder(po.poId)
+  const rl = reloaded!.lines[0]!
+  assert.equal(Math.round((rl.unitCostForeign + rl.discountAmount / rl.qty) * 10000) / 10000, 10)
+
+  const before = await stored()
+  const again = await updatePurchaseOrder(po.poId, request(120))
+  assert.equal(again.success, true, `an unchanged re-save is accepted: ${again.error}`)
+  assert.equal(await stored(), before, 'and every money field is stable')
+
+  // Lowering it scales the other way.
+  const lowered = await updatePurchaseOrder(po.poId, request(80))
+  assert.equal(lowered.success, true, String(lowered.error))
+  assert.equal(Number((await db.purchaseOrderLine.findUniqueOrThrow({ where: { id: line.poLineId }, select: { discountAmount: true } })).discountAmount), 80)
+
+  // The PO export carries the scaled discount for the line.
+  const { GET } = await import('@/app/api/export/purchase-orders/route')
+  const res = await GET({ nextUrl: new URL('http://localhost/api/export/purchase-orders') } as never)
+  const csv = await res.text()
+  const reference = (await db.purchaseOrder.findUniqueOrThrow({ where: { id: po.poId }, select: { reference: true } })).reference
+  const exportedRow = csv.split('\n').find((l) => l.includes(reference))
+  assert.ok(exportedRow, 'the order is in the export')
+  assert.ok(exportedRow!.includes('80.0000') && exportedRow!.includes('10%'), `export line discount follows: ${exportedRow}`)
 })

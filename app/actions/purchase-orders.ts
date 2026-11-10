@@ -114,6 +114,7 @@ import {
   PO_COST_LINES_PART_RECEIVED_MESSAGE,
   PO_EDIT_REFUSED_STATUS_MESSAGE,
   readPoEditFacts,
+  scaleLineDiscountForQty,
   unitCostMatchesStored,
   type PoEditFacts,
 } from '@/lib/domain/purchasing/po-edit-plan'
@@ -1790,7 +1791,7 @@ export async function updatePurchaseOrder(
                 data: {
                   qty: req.qty,
                   ...scaled,
-                  ...(k.qtyChanged ? { purchaseUnitQty: row.purchaseUnitQty } : {}),
+                  ...(k.qtyChanged ? { purchaseUnitQty: row.purchaseUnitQty, ...scaleLineDiscountForQty(k.fact, req.qty) } : {}),
                   description: row.description,
                   sortOrder: row.sortOrder,
                 },

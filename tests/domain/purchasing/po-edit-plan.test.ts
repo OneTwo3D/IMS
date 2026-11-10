@@ -7,6 +7,7 @@ import {
   lineQtyFloor,
   normaliseCostLinesForCompare,
   planLineAmend,
+  scaleLineDiscountForQty,
   unitCostMatchesStored,
   type PoEditFacts,
   type PoEditLineFact,
@@ -23,6 +24,8 @@ function line(over: Partial<PoEditLineFact> & { id: string }): PoEditLineFact {
     totalBase: 500,
     taxForeign: 0,
     taxBase: 0,
+    discountAmount: 0,
+    discountStr: null,
     landedQty: 0,
     billedQty: 0,
     returnedQty: 0,
@@ -187,4 +190,12 @@ test('mutation gaps: the product-swap refusal, and removal of an untouched line 
   const removeUntouched = planLineAmend(facts([a, b], { hasCostLines: true }), [req(a)])
   assert.equal(removeUntouched.ok, false)
   assert.match(removeUntouched.ok ? '' : removeUntouched.error, /freight or other cost lines/)
+})
+
+test('a line discount scales with the quantity: a percentage stays a percentage, an amount keeps its per-unit value and its string follows', () => {
+  assert.deepEqual(scaleLineDiscountForQty({ qty: 100, discountAmount: 100, discountStr: '10%' }, 120), { discountAmount: 120, discountStr: '10%' })
+  assert.deepEqual(scaleLineDiscountForQty({ qty: 100, discountAmount: 50, discountStr: '50' }, 60), { discountAmount: 30, discountStr: '30' })
+  assert.deepEqual(scaleLineDiscountForQty({ qty: 100, discountAmount: 50, discountStr: null }, 60), { discountAmount: 30, discountStr: null })
+  assert.deepEqual(scaleLineDiscountForQty({ qty: 100, discountAmount: 0, discountStr: null }, 60), { discountAmount: 0, discountStr: null })
+  assert.deepEqual(scaleLineDiscountForQty({ qty: 3, discountAmount: 1, discountStr: '1' }, 4), { discountAmount: 1.3333, discountStr: '1.3333' })
 })
