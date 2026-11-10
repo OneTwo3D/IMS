@@ -166,16 +166,18 @@ test("adopt mode stamps the plugin's decision with its conversion record in the 
   const adopted = await seedOrder(db)
   const bare = await seedOrder(db)
   try {
-    const fx = { state: 'present' as const, rate: '1.1500', pair: 'EUR>EUR', thresholdValue: '149.50' }
-    const a = await db.$transaction((tx) => stampEuVatRegime(tx, adopted, () => input('100.00', { mode: 'adopt_plugin', pluginVatAccount: '232', pluginFx: fx }), NOW))
+    const fx = { state: 'present' as const, rate: '1', pair: 'EUR>EUR', thresholdValue: '200.00' }
+    const a = await db.$transaction((tx) => stampEuVatRegime(tx, adopted, () => input('200.00', { mode: 'adopt_plugin', pluginVatAccount: '232', pluginFx: fx }), NOW))
     assert.deepEqual(a.kind === 'stamped' && a.stamp, { regime: 'DDP', vatAccount: '232', stampedAt: NOW })
     const row = await db.salesOrder.findUniqueOrThrow({ where: { id: adopted }, select: { euVatRegimeBasis: true } })
     const basis = row.euVatRegimeBasis as { scheme: { source: string; pluginFx: unknown } }
     assert.equal(basis.scheme.source, 'plugin')
-    assert.deepEqual(basis.scheme.pluginFx, { recorded: true, rate: '1.1500', pair: 'EUR>EUR', thresholdValue: '149.50' })
+    assert.deepEqual(basis.scheme.pluginFx, { recorded: true, rate: '1', pair: 'EUR>EUR', thresholdValue: '200.00' })
     const b = await db.$transaction((tx) => stampEuVatRegime(tx, bare, () => input('100.00', { mode: 'adopt_plugin', pluginVatAccount: null }), NOW))
     assert.equal(b.kind === 'refused' && b.code, 'plugin_account_missing')
     const wrongPair = await db.$transaction((tx) => stampEuVatRegime(tx, bare, () => input('100.00', { mode: 'adopt_plugin', pluginVatAccount: '821', pluginFx: { ...fx, pair: 'USD>EUR' } }), NOW))
+    const contradicts = await db.$transaction((tx) => stampEuVatRegime(tx, bare, () => input('100.00', { mode: 'adopt_plugin', pluginVatAccount: '232', pluginFx: { ...fx, thresholdValue: '100.00' } }), NOW))
+    assert.equal(contradicts.kind === 'refused' && contradicts.code, 'plugin_evidence_contradicts')
     assert.equal(wrongPair.kind === 'refused' && wrongPair.code, 'plugin_fx_conflict')
     const unreadable = await db.$transaction((tx) => stampEuVatRegime(tx, bare, () => input('100.00', { unreadable: ['order tax unreadable'] }), NOW))
     assert.equal(unreadable.kind === 'refused' && unreadable.code, 'order_figure_unreadable')
