@@ -12,7 +12,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import type { NormalisedXeroTaxRate } from './tax-rate-list'
 import type { EuVatSeedRate } from '@/lib/tax/eu-vat-seed'
 
-export type SchemeDriftRate = { taxRateId: string; name: string; active: boolean; accountingTaxType: string | null; reportingCategory: string | null; schemePostingTaxType: string | null }
+export type SchemeDriftRate = { taxRateId: string; name: string; active: boolean; usedFor: string; reverseCharge: boolean; accountingTaxType: string | null; reportingCategory: string | null; schemePostingTaxType: string | null }
 export type SchemeDriftMapping = { externalTaxRateId: string; taxRateId: string; storeIdentity: string | null; externalCountry: string | null; externalRatePct: string; externalClass: string | null }
 
 /** The one drift item that carries the declared mappings that are missing or invalid (they belong to no rate). */
@@ -52,6 +52,8 @@ export function computeSchemePostingDrift(input: {
     const rate = ratesById.get(mapping.taxRateId)
     if (rate === undefined) { issue(`${label}: its mapping names a tax rate that does not exist`); continue }
     if (!rate.active) { issue(`${label}: its mapping names an inactive tax rate`); continue }
+    if (rate.usedFor !== 'SALES' && rate.usedFor !== 'BOTH') { issue(`${label}: its mapping names a tax rate that is not used for sales (${rate.usedFor})`); continue }
+    if (rate.reverseCharge) { issue(`${label}: its mapping names a reverse-charge tax rate`); continue }
     // Only a rate named by a mapping that passed every check above counts as declared.
     named.add(rate.taxRateId)
     // The CHARGED code against the declared Xero type: the IMS rate must carry the declared code (or, where the declaration leaves it to the live list, the one ACTIVE type of the declared name), and that type

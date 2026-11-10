@@ -200,13 +200,13 @@ export async function runXeroTaxRateDriftSweep(): Promise<TaxRateDriftSweepResul
       const [{ getWcCredentials }, { normaliseStoreIdentity }] = await Promise.all([import('@/lib/connectors/woocommerce/api'), import('@/lib/connectors/woocommerce/tax-rate-plan')])
       const creds = await getWcCredentials().catch(() => null)
       const [rates, mappings] = await Promise.all([
-        db.taxRate.findMany({ select: { id: true, name: true, active: true, schemePostingTaxType: true, reportingCategory: true, accountingTaxType: true } }),
+        db.taxRate.findMany({ select: { id: true, name: true, active: true, usedFor: true, reverseCharge: true, schemePostingTaxType: true, reportingCategory: true, accountingTaxType: true } }),
         db.shoppingTaxRateMapping.findMany({ where: { connector: 'woocommerce' }, select: { externalTaxRateId: true, taxRateId: true, storeIdentity: true, externalCountry: true, externalRatePct: true, externalClass: true } }),
       ])
       return computeSchemePostingDrift({
         declared: loadEuVatSeed().rates,
         mappings: mappings.map((m) => ({ ...m, externalRatePct: m.externalRatePct.toFixed() })),
-        rates: rates.map((r) => ({ taxRateId: r.id, name: r.name, active: r.active, accountingTaxType: r.accountingTaxType, reportingCategory: r.reportingCategory, schemePostingTaxType: r.schemePostingTaxType })),
+        rates: rates.map((r) => ({ taxRateId: r.id, name: r.name, active: r.active, usedFor: r.usedFor, reverseCharge: r.reverseCharge, accountingTaxType: r.accountingTaxType, reportingCategory: r.reportingCategory, schemePostingTaxType: r.schemePostingTaxType })),
         storeIdentity: creds === null ? null : normaliseStoreIdentity(creds.url),
         xero: fetchedRows,
       })

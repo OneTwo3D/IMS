@@ -14,7 +14,7 @@ const mapping = (wooId: number, over: Partial<SchemeDriftMapping> = {}): SchemeD
 }
 const rate = (wooId: number, over: Partial<SchemeDriftRate> = {}): SchemeDriftRate => {
   const r = seed.rates.find((x) => x.wooId === wooId)!
-  return { taxRateId: `r${wooId}`, name: r.imsName, active: true, accountingTaxType: r.accountingTaxType ?? `C${wooId}`, reportingCategory: r.reportingCategory, schemePostingTaxType: r.schemePostingTaxType, ...over }
+  return { taxRateId: `r${wooId}`, name: r.imsName, active: true, usedFor: 'SALES', reverseCharge: false, accountingTaxType: r.accountingTaxType ?? `C${wooId}`, reportingCategory: r.reportingCategory, schemePostingTaxType: r.schemePostingTaxType, ...over }
 }
 const CHARGED = [xeroType('C220', 'DE VAT', '19.0000'), xeroType('TAX124', 'NO VAT', '25.0000'), xeroType('OUTPUT2', 'GB VAT (Income)', '20.0000')]
 const XERO = [xeroType('TAX131', 'DE IOSS VAT', '0.0000'), xeroType('TAX122', 'NO VOEC VAT', '0.0000'), xeroType('TAX999', 'XX IOSS VAT', '0.0000'), ...CHARGED]
@@ -59,7 +59,7 @@ test('the declared type itself drifting in Xero is reported by code: gone, not A
 })
 
 test('a type carried by a rate no declared mapping names is drift', () => {
-  const stray = { taxRateId: 'stray', name: 'Stray', active: true, accountingTaxType: null, reportingCategory: 'IOSS', schemePostingTaxType: 'TAX131' }
+  const stray = { taxRateId: 'stray', name: 'Stray', active: true, usedFor: 'SALES', reverseCharge: false, accountingTaxType: null, reportingCategory: 'IOSS', schemePostingTaxType: 'TAX131' }
   assert.match(run([...good(), stray]).join(' | '), /no declared WooCommerce mapping names it/)
 })
 
@@ -74,6 +74,9 @@ test('a declared mapping that is missing, never adopted, made against another st
   assert.match(issues([mapping(220, { externalClass: 'zero-rate' }), mapping(239), mapping(112)])[0]!, /another country, percentage or class/)
   assert.match(issues([mapping(220, { taxRateId: 'gone' }), mapping(239), mapping(112)])[0]!, /names a tax rate that does not exist/)
   assert.match(issues([mapping(220), mapping(239), mapping(112)], [rate(220, { active: false }), rate(239), rate(112)])[0]!, /inactive tax rate/)
+  assert.match(issues([mapping(220), mapping(239), mapping(112)], [rate(220, { usedFor: 'PURCHASE' }), rate(239), rate(112)])[0]!, /not used for sales \(PURCHASE\)/)
+  assert.match(issues([mapping(220), mapping(239), mapping(112)], [rate(220, { reverseCharge: true }), rate(239), rate(112)])[0]!, /reverse-charge tax rate/)
+  assert.deepEqual(issues([mapping(220), mapping(239), mapping(112)], [rate(220, { usedFor: 'BOTH' }), rate(239), rate(112)]), [], 'BOTH is a sales rate')
   assert.match(issues([mapping(220), mapping(239), mapping(112)], good(), null)[0]!, /No usable WooCommerce store/)
   const item = computeSchemePostingDrift({ declared, mappings: [mapping(220, { storeIdentity: null })], rates: good(), storeIdentity: STORE, xero: XERO }).find((d) => d.taxRateId === MAPPING_ISSUES_ID)
   assert.equal(item?.name, 'EU VAT declaration: storefront mappings')
@@ -120,7 +123,7 @@ test('without the scheme check the sweep is what it was', async () => {
 })
 
 test('an instance the declaration has not touched (no declared rate mapped, no scheme posting type anywhere) has nothing to drift from', () => {
-  const untouched = [{ taxRateId: 'x', name: 'X', active: true, accountingTaxType: 'OUTPUT2', reportingCategory: null, schemePostingTaxType: null }]
+  const untouched = [{ taxRateId: 'x', name: 'X', active: true, usedFor: 'SALES', reverseCharge: false, accountingTaxType: 'OUTPUT2', reportingCategory: null, schemePostingTaxType: null }]
   assert.deepEqual(computeSchemePostingDrift({ declared, mappings: [], rates: untouched, storeIdentity: null, xero: XERO }), [])
   assert.deepEqual(computeSchemePostingDrift({ declared, mappings: [], rates: untouched, storeIdentity: STORE, xero: XERO }), [])
   assert.notDeepEqual(computeSchemePostingDrift({ declared, mappings: [mapping(220)], rates: untouched, storeIdentity: STORE, xero: XERO }), [], 'one declared mapping engages it')

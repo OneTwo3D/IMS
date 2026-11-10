@@ -449,7 +449,7 @@ export async function applyEuVatSeed(db: { $transaction: <T>(fn: (tx: Client) =>
         gotWriteLock = (await tx.$queryRaw<Array<{ ok: boolean }>>`SELECT pg_try_advisory_xact_lock(${WOO_TAX_RATE_WRITE_LOCK_KEY}::bigint) AS ok`)[0]?.ok === true
         if (!gotWriteLock) await new Promise((resolve) => setTimeout(resolve, 150))
       }
-      if (!gotWriteLock) throw new MappingWritersBusyError('a WooCommerce tax-rate apply or a mapping writer holds the mapping write lock; run the apply again')
+      if (!gotWriteLock) throw new MappingWritersBusyError('a WooCommerce tax-rate apply or a mapping writer holds the mapping write lock, so nothing was written')
       const plan = await snapshot(tx)
       if (plan.skipped.some((s) => s.reason === 'XERO_LIST_NOT_PROVEN')) return { applied: false, plan, refusal: { code: 'XERO_LIST_NOT_PROVEN', detail: plan.skipped[0]!.detail } }
       if (plan.digest !== confirm) return { applied: false, plan, refusal: { code: 'DIGEST_MISMATCH', detail: 'the plan changed since the dry run (or this is not its digest); run the dry run again' } }

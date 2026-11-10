@@ -545,3 +545,48 @@ test('while another session holds the mapping write lock (a running tax-rate app
   }
   assert.equal((await apply(digest)).applied, true, 'and with the lock free it applies')
 })
+
+for (const order of ['mapping lock first (the order every writer follows)', 'rate row first (the INVERTED order, as a control)'] as const) {
+  test(`one global lock order: the apply racing a mapping writer that takes ${order} ${order.startsWith('mapping') ? 'never deadlocks' : 'is a deadlock the test can see'}`, { skip }, async () => {
+    const inverted = !order.startsWith('mapping')
+    const { lockStorefrontMappingWrites, repointStorefrontTaxMapping } = await import('../../lib/tax/storefront-mapping-write.ts')
+    const { resolveWritableTaxRateId } = await import('../../lib/tax/writable-tax-rate.ts')
+    const isDeadlock = (error: unknown): boolean => /deadlock detected|40P01/.test(String((error as { message?: unknown })?.message ?? '') + String((error as { code?: unknown })?.code ?? '') + JSON.stringify((error as { meta?: unknown })?.meta ?? ''))
+    const de = ids.rates[1]!
+    const uk = ids.rates[0]!
+    let deadlocks = 0
+    for (let round = 0; round < (inverted ? 1 : 3); round += 1) {
+      for (const id of ids.rates) await d.db.taxRate.update({ where: { id }, data: { schemePostingTaxType: null, reportingCategory: null } })
+      const { digest } = await plan()
+      let writer: Promise<unknown> = Promise.resolve()
+      let fired = false
+      const hooked = { $transaction: <T>(fn: (tx: never) => Promise<T>) => (d.db as never as { $transaction: (f: (tx: Record<string | symbol, unknown>) => Promise<T>, o?: object) => Promise<T> }).$transaction(async (tx) => fn(new Proxy(tx, { get(target, prop) {
+        const value = target[prop]
+        if (prop === '$queryRaw') return async (...args: unknown[]) => {
+          // The apply holds the mapping lock and is about to lock its first rate row: start the writer now.
+          if (!fired && Array.from(args[0] as ArrayLike<string>).join('').includes('FROM tax_rates')) {
+            fired = true
+            writer = d.db.$transaction(async (w) => {
+              if (inverted) await resolveWritableTaxRateId(w, de)
+              await lockStorefrontMappingWrites(w)
+              if (!inverted) await resolveWritableTaxRateId(w, de)
+              await repointStorefrontTaxMapping(w, { connector: 'woocommerce', externalTaxRateId: '112' }, uk)
+            }, { timeout: 30_000 }).catch((error: unknown) => { if (isDeadlock(error)) deadlocks += 1; else throw error })
+            await new Promise((resolve) => setTimeout(resolve, 400))
+          }
+          return (value as (...a: unknown[]) => Promise<unknown>).apply(target, args)
+        }
+        return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value
+      } }) as never), { timeout: 30_000 }) }
+      try {
+        await apply(digest, hooked as never)
+      } catch (error) {
+        if (isDeadlock(error)) deadlocks += 1
+        else throw error
+      }
+      await writer
+    }
+    if (inverted) assert.ok(deadlocks >= 1, 'the inverted order deadlocks and Postgres reports it: the race can see a deadlock')
+    else assert.equal(deadlocks, 0, 'with the mapping lock first there is no deadlock')
+  })
+}
