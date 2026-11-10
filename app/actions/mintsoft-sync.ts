@@ -2353,6 +2353,7 @@ export async function saveMintsoftBinding(
         select: {
           id: true,
           warehouseId: true,
+          connectionId: true,
           active: true,
           stockSyncMode: true,
           alignmentConfirmedAt: true,
@@ -2396,13 +2397,22 @@ export async function saveMintsoftBinding(
         )
       }
 
+      // The dry run and the typed confirmation were given for ONE warehouse pairing. Re-pointing the
+      // binding at another IMS warehouse, another Mintsoft warehouse or another connection makes
+      // them evidence about something else, so live corrections are switched off until a fresh dry
+      // run is reviewed and confirmed.
+      const pointsAtSameTarget = (
+        existingBinding.warehouseId === bindingData.warehouseId
+        && existingBinding.externalWarehouseId === bindingData.externalWarehouseId
+        && existingBinding.connectionId === bindingData.connectionId
+      )
       const binding = await db.externalWmsBinding.update({
         where: { id: existingBinding.id },
         data: {
           ...bindingData,
           alignmentConfirmedAt: bindingData.stockSyncMode === 'ALIGN_TO_WMS'
             ? (
-                existingBinding.stockSyncMode === 'ALIGN_TO_WMS'
+                existingBinding.stockSyncMode === 'ALIGN_TO_WMS' && pointsAtSameTarget
                   ? existingBinding.alignmentConfirmedAt
                   : null
               )

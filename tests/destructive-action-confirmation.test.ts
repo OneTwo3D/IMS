@@ -56,13 +56,21 @@ mock.module('@/lib/activity-log', {
   },
 })
 
-let failedRows = 0
-const retryCalls: unknown[][] = []
+let failedIds: string[] = []
+const candidateQueries: Array<Record<string, unknown>> = []
 let bindingRow: Record<string, unknown> | null = null
 let dryRun: { id: string } | null = { id: 'job-1' }
 const bindingUpdates: unknown[] = []
 const db = {
-  accountingSyncLog: { count: async () => failedRows },
+  accountingSyncLog: {
+    // The confirmation check reads ids only; the candidate query carries an `id: { in }` filter or a row id.
+    findMany: async (args: { where: Record<string, unknown>; select: Record<string, unknown> }) => {
+      if (Object.keys(args.select).length === 1 && args.select.id === true) return failedIds.map((id) => ({ id }))
+      candidateQueries.push(args.where)
+      return []
+    },
+    findUnique: async () => null,
+  },
   externalWmsBinding: {
     findFirst: async () => bindingRow,
     updateMany: async (args: unknown) => { bindingUpdates.push(args); return { count: 1 } },
@@ -70,16 +78,6 @@ const db = {
   wmsSyncJob: { findFirst: async () => dryRun },
 }
 mock.module('@/lib/db', { namedExports: { db } })
-mock.module('@/lib/connectors/accounting-registry', {
-  namedExports: {
-    ACCOUNTING_CONNECTORS: [{ id: 'xero' }],
-    getAccountingConnector: () => ({
-      retryFailedSync: async (...args: unknown[]) => { retryCalls.push(args); return { success: true, reset: failedRows } },
-    }),
-    getAccountingConnectorDefinition: () => ({ id: 'xero' }),
-  },
-})
-
 mock.module('@/lib/integration-plugins', { namedExports: { isIntegrationPluginEnabled: async (id: string) => id === 'xero' } })
 
 let backupDir = ''
@@ -89,9 +87,9 @@ function reset() {
   gates.length = 0
   denyAll = false
   logs.length = 0
-  retryCalls.length = 0
+  candidateQueries.length = 0
   bindingUpdates.length = 0
-  failedRows = 0
+  failedIds = []
   bindingRow = null
   dryRun = { id: 'job-1' }
 }
@@ -154,55 +152,86 @@ test('deleteBackup still checks the admin gate first: an unauthorised caller is 
 })
 
 // ---------------------------------------------------------------------------------------------
-// Xero "Retry all failed"
+// Xero "Retry all failed": enforced in the retry implementation, so EVERY entry point is covered
 // ---------------------------------------------------------------------------------------------
-test('retryFailedAccountingSync (bulk) refuses without a confirmation and re-queues nothing', async () => {
-  const { retryFailedAccountingSync } = await import('@/app/actions/accounting-sync')
+type Retry = (entryId?: string, rev?: number, confirmation?: never) => Promise<{ success: boolean; reset: number; error?: string; code?: string }>
+async function entryPoints(): Promise<Array<[string, Retry]>> {
+  const wrapper = (await import('@/app/actions/accounting-sync')).retryFailedAccountingSync as unknown as Retry
+  const direct = (await import('@/app/actions/xero-sync')).retryFailedXeroSync as unknown as Retry
+  const { getAccountingConnector } = await import('@/lib/connectors/accounting-registry')
+  const viaRegistry: Retry = (...args) => getAccountingConnector('xero').retryFailedSync(...(args as [never])) as never
+  return [['retryFailedAccountingSync', wrapper], ['retryFailedXeroSync (exported action)', direct], ['connector registry retryFailedSync', viaRegistry]]
+}
+
+test('every bulk entry point refuses without a confirmation of the reviewed rows, and re-queues nothing', async () => {
   reset()
-  failedRows = 4
-  for (const confirmation of [undefined, { confirmed: true }, { confirmed: false, expectedCount: 4 }]) {
-    const result = await retryFailedAccountingSync(undefined, undefined, confirmation as never)
-    assert.equal(result.success, false)
-    assert.equal(result.code, CONFIRMATION_REQUIRED_CODE)
-    assert.equal(result.reset, 0)
+  failedIds = ['a', 'b']
+  for (const [name, retry] of await entryPoints()) {
+    for (const confirmation of [undefined, { confirmed: true }, { confirmed: false, rowIds: ['a', 'b'] }, { confirmed: true, rowIds: 'a,b' }, { confirmed: true, rowIds: ['a', ''] }]) {
+      const result = await retry(undefined, undefined, confirmation as never)
+      assert.equal(result.success, false, `${name} ${JSON.stringify(confirmation)}`)
+      assert.equal(result.code, CONFIRMATION_REQUIRED_CODE, name)
+    }
   }
-  assert.deepEqual(retryCalls, [], 'the connector was never asked to retry')
+  assert.deepEqual(candidateQueries, [], 'no candidate was ever selected for re-queueing')
 })
 
-test('retryFailedAccountingSync (bulk) refuses when the failed-row count changed since the operator confirmed', async () => {
-  const { retryFailedAccountingSync } = await import('@/app/actions/accounting-sync')
+test('a blank or whitespace row id is not a bulk request and not a row: every entry point refuses it', async () => {
   reset()
-  failedRows = 6
-  const result = await retryFailedAccountingSync(undefined, undefined, { confirmed: true, expectedCount: 4 })
-  assert.equal(result.success, false)
-  assert.match(result.error ?? '', /changed from 4 to 6/)
-  assert.deepEqual(retryCalls, [])
+  failedIds = ['a', 'b']
+  for (const [name, retry] of await entryPoints()) {
+    for (const blank of ['', '   ', '\t']) {
+      const result = await retry(blank, 1)
+      assert.equal(result.success, false, `${name} ${JSON.stringify(blank)}`)
+      assert.match(result.error ?? '', /id of the row/, name)
+    }
+  }
+  assert.deepEqual(candidateQueries, [])
 })
 
-test('retryFailedAccountingSync (bulk) proceeds with a matching confirmation; the permission gate ran first', async () => {
-  const { retryFailedAccountingSync } = await import('@/app/actions/accounting-sync')
+test('the confirmation is bound to the reviewed ROWS: a swap between read and retry is refused', async () => {
   reset()
-  failedRows = 4
-  const result = await retryFailedAccountingSync(undefined, undefined, { confirmed: true, expectedCount: 4 })
-  assert.equal(result.success, true)
-  assert.deepEqual(retryCalls, [[undefined, undefined]])
-  assert.deepEqual(gates[0], { kind: 'permission', arg: 'sync' })
+  // Same COUNT as the review, one row replaced — a count check would have let this through.
+  failedIds = ['a', 'c']
+  for (const [name, retry] of await entryPoints()) {
+    const result = await retry(undefined, undefined, { confirmed: true, rowIds: ['a', 'b'] } as never)
+    assert.equal(result.success, false, name)
+    assert.match(result.error ?? '', /changed since you reviewed/, name)
+  }
+  // A row that failed after the review is also a change.
+  failedIds = ['a', 'b', 'c']
+  const [, direct] = (await entryPoints())[1]!
+  assert.equal((await direct(undefined, undefined, { confirmed: true, rowIds: ['a', 'b'] } as never)).success, false)
+  assert.deepEqual(candidateQueries, [])
 })
 
-test('retryFailedAccountingSync (bulk) with no permission is refused before the confirmation is even read', async () => {
-  const { retryFailedAccountingSync } = await import('@/app/actions/accounting-sync')
+test('a matching confirmation proceeds, scoped to exactly the confirmed ids; the permission gate ran first', async () => {
+  reset()
+  failedIds = ['a', 'b']
+  for (const [name, retry] of await entryPoints()) {
+    candidateQueries.length = 0
+    gates.length = 0
+    const result = await retry(undefined, undefined, { confirmed: true, rowIds: ['b', 'a'] } as never)
+    assert.equal(result.success, true, name)
+    assert.deepEqual(gates[0], { kind: 'permission', arg: 'sync' }, name)
+    assert.equal(candidateQueries.length, 1, name)
+    assert.deepEqual((candidateQueries[0]!.id as { in: string[] }).in.slice().sort(), ['a', 'b'], name)
+  }
+})
+
+test('with no permission every bulk entry point is refused before the confirmation is read', async () => {
   reset()
   denyAll = true
-  await assert.rejects(() => retryFailedAccountingSync(undefined, undefined, { confirmed: true, expectedCount: 0 }), /Forbidden/)
-  assert.deepEqual(retryCalls, [])
-})
-
-test('a per-row retry is unchanged: it needs no bulk confirmation', async () => {
-  const { retryFailedAccountingSync } = await import('@/app/actions/accounting-sync')
-  reset()
-  const result = await retryFailedAccountingSync('row-1', 2)
-  assert.equal(result.success, true)
-  assert.deepEqual(retryCalls, [['row-1', 2]])
+  for (const [name, retry] of await entryPoints()) {
+    // The accounting wrapper lets the denial throw; the Xero action reports it as a failed result.
+    const outcome = await retry(undefined, undefined, { confirmed: true, rowIds: [] } as never).then((r) => r, (e: Error) => e)
+    if (outcome instanceof Error) assert.match(outcome.message, /Forbidden/, name)
+    else {
+      assert.equal(outcome.success, false, name)
+      assert.notEqual(outcome.code, CONFIRMATION_REQUIRED_CODE, `${name}: denied on permission, not on confirmation`)
+    }
+  }
+  assert.deepEqual(candidateQueries, [])
 })
 
 // ---------------------------------------------------------------------------------------------

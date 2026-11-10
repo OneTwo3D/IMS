@@ -506,3 +506,50 @@ test('creating a binding is audited as created, with an empty before half', asyn
   assert.equal((entry.metadata?.after as Record<string, unknown>).externalWarehouseId, '9')
   assert.equal(entry.metadata?.warehouseId, 'wh-2')
 })
+
+// ---------------------------------------------------------------------------
+// A live-corrections confirmation belongs to ONE warehouse pairing. Re-pointing the binding must
+// drop it, so a fresh dry run and a fresh typed confirmation are needed.
+// ---------------------------------------------------------------------------
+
+const CONFIRMED_ALIGN = {
+  ...BASE_BINDING,
+  connectionId: 'conn-1',
+  stockSyncMode: 'ALIGN_TO_WMS',
+  alignmentConfirmedAt: new Date('2026-11-01T00:00:00Z'),
+}
+const alignSave = (over: Record<string, unknown>) => ({
+  id: 'bind-1',
+  warehouseId: 'wh-1',
+  externalWarehouseId: '7',
+  active: true,
+  stockSyncMode: 'ALIGN_TO_WMS' as const,
+  ...over,
+})
+
+test('re-pointing a confirmed ALIGN_TO_WMS binding clears the confirmation; an unrelated edit keeps it', async () => {
+  const { saveMintsoftBinding } = await loadActions()
+  for (const [name, over, cleared] of [
+    ['same target (control)', { syncFrequencyMinutes: 15 }, false],
+    ['other IMS warehouse', { warehouseId: 'wh-9' }, true],
+    ['other Mintsoft warehouse id', { externalWarehouseId: '8' }, true],
+  ] as const) {
+    reset()
+    existingBindingRow = { ...CONFIRMED_ALIGN }
+    const result = await saveMintsoftBinding(alignSave(over))
+    assert.equal(result.success, true, name)
+    const written = bindingUpdates.at(-1)
+    assert.ok(written, `${name}: the binding was updated`)
+    if (cleared) assert.equal(written.alignmentConfirmedAt, null, `${name}: confirmation cleared`)
+    else assert.ok(written.alignmentConfirmedAt instanceof Date, `${name}: confirmation kept`)
+  }
+})
+
+test('a different connection also clears the confirmation', async () => {
+  const { saveMintsoftBinding } = await loadActions()
+  reset()
+  existingBindingRow = { ...CONFIRMED_ALIGN, connectionId: 'conn-other' }
+  const result = await saveMintsoftBinding(alignSave({}))
+  assert.equal(result.success, true)
+  assert.equal(bindingUpdates.at(-1)?.alignmentConfirmedAt, null)
+})

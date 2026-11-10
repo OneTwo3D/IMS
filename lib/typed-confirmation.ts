@@ -13,8 +13,8 @@ export type ActionConfirmation = {
   typedName?: string
 }
 
-/** Bulk retry: the operator confirmed this many FAILED rows. */
-export type BulkRetryConfirmation = ActionConfirmation & { expectedCount: number }
+/** Bulk retry: the operator reviewed and confirmed exactly this set of FAILED rows. */
+export type BulkRetryConfirmation = ActionConfirmation & { rowIds: string[] }
 
 export const CONFIRMATION_REQUIRED_CODE = 'confirmation_required'
 

@@ -60,6 +60,6 @@ test('Retry all failed: both entry points open the shared dialog and never call 
     assert.doesNotMatch(src, /retryFailedAccountingSync\(\)/, `${path} no longer calls the bulk retry with no confirmation`)
   }
   const dialog = read('app/(dashboard)/sync/retry-all-failed-dialog.tsx')
-  assert.match(dialog, /retryFailedAccountingSync\(undefined, undefined, \{ confirmed: true, expectedCount: count \}\)/)
+  assert.match(dialog, /retryFailedAccountingSync\(undefined, undefined, \{ confirmed: true, rowIds \}\)/)
   assert.match(dialog, /acknowledgement=/)
 })

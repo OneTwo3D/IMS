@@ -35,7 +35,8 @@ export function RetryAllFailedDialog({
   connector: string | null
   onDone: (message: string, success: boolean) => void
 }) {
-  const [count, setCount] = useState<number | null>(null)
+  const [rowIds, setRowIds] = useState<string[] | null>(null)
+  const count = rowIds === null ? null : rowIds.length
   const [loadError, setLoadError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
@@ -43,11 +44,11 @@ export function RetryAllFailedDialog({
   useEffect(() => {
     if (!open) return
     let cancelled = false
-    setCount(null)
+    setRowIds(null)
     setLoadError(null)
     setError(null)
     getFailedAccountingSyncSummary()
-      .then((summary) => { if (!cancelled) setCount(summary.failedCount) })
+      .then((summary) => { if (!cancelled) setRowIds(summary.failedRowIds ?? []) })
       .catch(() => { if (!cancelled) setLoadError('Could not load the number of failed rows. Close this dialog and try again.') })
     return () => { cancelled = true }
   }, [open])
@@ -56,11 +57,11 @@ export function RetryAllFailedDialog({
   const caution = accountingRetryDuplicateCaution(connector)
 
   async function confirm() {
-    if (count === null) return
+    if (rowIds === null) return
     setPending(true)
     setError(null)
     try {
-      const result = await retryFailedAccountingSync(undefined, undefined, { confirmed: true, expectedCount: count })
+      const result = await retryFailedAccountingSync(undefined, undefined, { confirmed: true, rowIds })
       if (result.success) {
         onOpenChange(false)
         onDone(describeRetryAllOutcome(result), true)
