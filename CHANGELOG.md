@@ -40,6 +40,15 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 - **Fixed: a credit note is shown on the column and at the VAT rate it posts.** On a base-currency order the base column posts (a refund line may carry money in only that one), and the VAT is read from the tax code persisted on the refund line, using the same definitions the credit-note payload uses.
 - **Fixed: the sales order and invoice PDFs print one basis.** Lines, subtotal, discount and shipping are all gross or all net (labelled), the VAT rows reconcile with the Total, and a gross-basis document states the VAT it includes after the Total.
 
+### One invoiced-revenue basis across the revenue and receivables reports
+
+- **Changed: revenue is what has been invoiced, on every report.** An order counts if it is not cancelled and not a draft, paid or not, and it has an IMS-posted Xero invoice or, during the parallel phase, the invoice number Xeroom generated for a WooCommerce order (an invoice number IMS generated itself does not count until the invoice is posted). The dashboard, Sales Statistics (including the Details tab, now "Invoiced sales details"), Sales Analytics, Customer Mix, Gross Margin, the COGS report, product profitability, the forecast ABC ranking, Currency Summary and customer turnover all use the one definition (`lib/domain/sales/invoiced-revenue-basis.ts`). The Xero daily batch and the VAT report keep their own bases on purpose.
+- **Changed: reports bounded by invoice date use one date.** The invoice date, else the paid date, else the order date, with the order-date fallback flagged as approximate (notice, marker and CSV column). Nothing writes `invoicedAt` for Xeroom orders, so the VAT tax point is untouched.
+- **Changed: AR Aging, Customer Aging, the Invoices tab balance and the Currency Summary receivable share one balance** (`lib/domain/sales/receivable-balance.ts`): invoice total less credit notes less receipts, in the base currency, as of the report date. An order marked paid counts as settled, cash refunded out goes back on the receivable, a paid and credited order shows as a customer credit balance, own-currency payments reduce the receivable at the order's booked rate (exchange differences are FX gain or loss, not receivable), and a figure that includes a credit or payment that could not be placed exactly is marked less-than-or-equal or approximate, on screen and in the CSV.
+- **Changed: customer lifetime value and turnover are VAT-inclusive on the invoiced basis with refunds netted**, converting an ex-VAT credit at the refunded line's stored tax, and marked when a credit could not be placed.
+- **Changed: archived orders are included in every revenue and receivables report.** The retention job only hides old completed orders from operational lists; AR Aging, the Currency Summary and Sales Analytics no longer drop them, so every screen shows the same figures for the same period.
+- **Note: during the parallel phase an order with a WooCommerce (Xeroom) invoice number counts as invoiced; IMS does not check that Xeroom's post to Xero succeeded.**
+
 ## 3.0.0 - 2026-11-10
 
 ### Operator actions (breaking)

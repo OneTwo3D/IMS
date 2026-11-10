@@ -78,7 +78,7 @@ export async function GET(req: NextRequest) {
       const report = await getCurrencySummaryReport({ ...filters, pageSize: FINANCE_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['currency', 'salesDocumentCount', 'salesForeign', 'salesBase', 'arOutstandingForeign', 'arOutstandingBase', 'purchaseDocumentCount', 'purchasesForeign', 'purchasesBase', 'apOutstandingForeign', 'apOutstandingBase']), `currency-summary-${date}.csv`)
+      return csvResponse(toCsv(report.rows, ['currency', 'salesDocumentCount', 'salesForeign', 'salesBase', 'arOutstandingForeign', 'arOutstandingBase', 'arOutstandingBound', 'purchaseDocumentCount', 'purchasesForeign', 'purchasesBase', 'apOutstandingForeign', 'apOutstandingBase']), `currency-summary-${date}.csv`)
     }
     case 'fx-gain-loss': {
       const report = await getFxGainLossReport({ ...filters, pageSize: FINANCE_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })

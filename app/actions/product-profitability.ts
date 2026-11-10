@@ -4,6 +4,7 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
+import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { refundLineBucket } from '@/lib/domain/sales/refund-basis-analytics'
 import {
   linearFigureBoundFromUnplacedCredit,
@@ -176,11 +177,10 @@ export async function getProductProfitability(): Promise<{
     }
   }
 
-  // 4. Sales data — fulfilled orders in both FY windows
-  const FULFILLED = ['SHIPPED', 'COMPLETED', 'DELIVERED'] as const
+  // 4. Sales data — invoiced orders (shared invoiced-revenue basis) in both FY windows
   const [currentFyOrders, previousFyOrders] = await Promise.all([
     db.salesOrder.findMany({
-      where: { status: { in: [...FULFILLED] }, createdAt: { gte: currentFyStart, lt: currentFyEnd } },
+      where: { ...INVOICED_ORDER_WHERE, createdAt: { gte: currentFyStart, lt: currentFyEnd } },
       select: {
         fxRateToBase: true, discountAmount: true, pricesIncludeVat: true, taxRatePercent: true,
         shoppingLinks: { select: { connector: true } },
@@ -189,7 +189,7 @@ export async function getProductProfitability(): Promise<{
       },
     }),
     db.salesOrder.findMany({
-      where: { status: { in: [...FULFILLED] }, createdAt: { gte: previousFyStart, lt: previousFyEnd } },
+      where: { ...INVOICED_ORDER_WHERE, createdAt: { gte: previousFyStart, lt: previousFyEnd } },
       select: {
         fxRateToBase: true, discountAmount: true, pricesIncludeVat: true, taxRatePercent: true,
         shoppingLinks: { select: { connector: true } },

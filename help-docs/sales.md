@@ -44,6 +44,10 @@ WooCommerce orders always enter the IMS as **Processing**. When WooCommerce mark
 
 **EU withdrawal requests.** If your store uses the EU order-withdrawal button plugin, a customer's request puts the order **On Hold** in IMS and shows a **Withdrawal hold** badge on the order. While it is held, IMS does not send the order to the warehouse. If the request is approved the order is cancelled. If it is rejected, the hold is deliberately **kept**, because a rejection only moves the storefront order back to its earlier status, and releasing it automatically would put goods back on the pick line. When you are satisfied, use **Release withdrawal hold** on the order (it asks you to confirm); the order stays On Hold, and moving it back to Processing then sends it to the warehouse again. Once an order has shipped, a withdrawal is a return, not a hold. See [WooCommerce](woocommerce.md#eu-withdrawal-requests).
 
+## Customer Turnover
+
+A customer's lifetime value, this-year sales and the Invoiced turnover card on the customer page use the same invoiced basis as the dashboard and reports: only orders that have an invoice count (an IMS-posted Xero invoice or, during the parallel phase, the Xeroom invoice number), paid or not, excluding cancelled and draft orders, with refunds netted in VAT-inclusive terms (a refund recorded ex-VAT is converted from its lines' stored tax). Where a refund cannot be converted exactly the figure is marked **≤** (at most), or **≈** (approximate, could be higher or lower) when the credit that could not be placed is zero, negative or mixed-sign.
+
 ## Order Statuses
 
 Sales orders use the canonical sales order workflow documented in `docs/workflows.md`. User-facing order stages include:
