@@ -1621,13 +1621,13 @@ be refused once: edit and save the bill to rebuild it.
 The VAT IMS records on a supplier bill is the sum of each billed line's **own** rate on its own net: a goods line at its rate, a vatable cost
 line (freight, duty, handling) at the order's VAT rate, a non-vatable cost line at none. It used to be the order's total VAT divided by the order's goods
 subtotal, which counts freight VAT in the rate without counting freight in the base (goods 100 at 20% plus vatable freight 50 made a "30%" rate
-and recorded 45 of VAT instead of 30) and is wrong for any order mixing rates that is billed in part. A goods line posts on its own rate's Xero tax type. A **vatable cost line**
+and recorded 45 of VAT instead of 30) and is wrong for any order mixing rates that is billed in part. A goods line posts on its own rate's Xero tax type, and its VAT uses that rate's effective rate (for a compound rate, worked out from its components, the same way the sales side does it). A **vatable cost line**
 (and a goods line with no rate of its own) posts on the Xero tax type of the rate **the order was charged at**, not on the supplier's *current* default:
 IMS finds the active purchase rate whose percentage equals the order's recorded VAT rate (narrowed by the recorded rate name, the supplier's own default
 winning a tie). An order overridden to 5% under a 20% supplier default therefore posts its freight on the 5% type and records 5% VAT. If no rate at that
 percentage has a mapped Xero tax type, or two different types share it, the line is **left without a type and the bill is refused** (*NOTHING WAS SENT*, naming
 the line) rather than guessed: map the rate, then edit and save the bill again. An order with **no** recorded VAT bills no VAT and needs exactly one 0%
-purchase type; the supplier's taxable default is never borrowed for it. With that, the VAT IMS records on the bill (and so its total and base figures) agrees
+purchase type; the supplier's taxable default is never borrowed for it. Before a bill is saved, every line's tax type is also checked against the Xero tax-rate list IMS already holds: a line whose type charges a different rate in Xero than IMS taxed it at (beyond rounding) refuses the bill (*The bill was not saved: ...*) instead of recording VAT Xero will not charge; a type whose rate is not in the stored list is not checked. The supplier's default rate is only used when it is active, usable for purchases, not compound and not reverse charge. With that, the VAT IMS records on the bill (and so its total and base figures) agrees
 with what Xero computes from the types sent.
 
 For **WooCommerce orders** the import also refuses, at import time, an order that moved money on a tax rate IMS cannot post under: a
@@ -1644,9 +1644,10 @@ Sales Invoices sync type switched off until the mappings are in place, then enab
 ### Paid invoices whose payment date Xero does not give
 
 If Xero reports an invoice or bill **PAID** but its payment date is missing or unreadable, the payment poll does **not** mark it paid with a guessed date: it logs a
-WARNING (*payment_date_unreadable* / *bill_payment_date_unreadable*) and **remembers the document** (a small list in settings, per kind, deduplicated, newest 200).
-Every poll then re-reads the remembered documents by id and applies each one whose date has become readable, even though Xero has not modified it since; a document
-that is no longer PAID, or has been handled, is forgotten. The poll's position is never held for this.
+WARNING (*payment_date_unreadable* / *bill_payment_date_unreadable*) and **remembers the document** in its own table (one row per document, never evicted, no limit).
+Remembering is part of the poll step: if it cannot be saved the poll **holds its position** for that batch (the poll shows an error) so the document comes back, rather
+than being forgotten. Every poll then re-reads up to 200 remembered documents by id (the least recently checked first, so one that stays unreadable cannot starve the rest)
+and applies each whose date has become readable, even though Xero has not modified it since; a document that is no longer PAID, or has been handled, is forgotten.
 
 ### EU IOSS / VOEC rate configuration (declaration, preflight and seed)
 

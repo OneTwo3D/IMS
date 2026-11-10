@@ -23,8 +23,10 @@ type LoggedActivity = {
   metadata?: Record<string, unknown>
 }
 
-/** Settings other than the poll cursor, so a remembered id survives from one poll to the next. */
-const settingStore: Record<string, string> = {}
+/** The xero_payment_date_pending table, so a remembered id survives from one poll to the next. */
+const pendingRows: Array<{ kind: string; xeroInvoiceId: string; firstSeenAt: number; lastCheckedAt: number | null }> = []
+let pendingClock = 1
+let pendingWriteFails = false
 
 const state = {
   invoices: [] as XeroInvoice[],
@@ -116,7 +118,8 @@ async function withHostClockSkew<T>(skewMs: number, fn: () => Promise<T>): Promi
 }
 
 function reset(): void {
-  for (const key of Object.keys(settingStore)) delete settingStore[key]
+  pendingRows.length = 0
+  pendingWriteFails = false
   state.invoices = []
   state.salesOrders = []
   state.purchaseInvoices = []
@@ -370,11 +373,27 @@ const dbDouble: Record<string, unknown> = {
     },
   },
   setting: {
-    findUnique: async ({ where }: { where: { key: string } }) =>
-      where.key in settingStore ? { key: where.key, value: settingStore[where.key] } : { key: 'xero_last_payment_poll', value: new Date(Date.now() - 60_000).toISOString() },
-    upsert: async (args: { where: { key: string }; update: { value: string } }) => {
-      state.settingUpserts.push(args)
-      if (args.where.key !== 'xero_last_payment_poll') settingStore[args.where.key] = args.update.value
+    findUnique: async () => ({ key: 'xero_last_payment_poll', value: new Date(Date.now() - 60_000).toISOString() }),
+    upsert: async (args: unknown) => { state.settingUpserts.push(args); return {} },
+  },
+  xeroPaymentDatePending: {
+    upsert: async ({ create }: { create: { kind: string; xeroInvoiceId: string } }) => {
+      if (pendingWriteFails) throw new Error('connection terminated unexpectedly')
+      if (!pendingRows.some((r) => r.kind === create.kind && r.xeroInvoiceId === create.xeroInvoiceId)) {
+        pendingRows.push({ kind: create.kind, xeroInvoiceId: create.xeroInvoiceId, firstSeenAt: pendingClock++, lastCheckedAt: null })
+      }
+      return {}
+    },
+    findMany: async ({ take }: { take: number }) =>
+      [...pendingRows].sort((a, b) => (a.lastCheckedAt ?? -1) - (b.lastCheckedAt ?? -1) || a.firstSeenAt - b.firstSeenAt).slice(0, take).map((r) => ({ kind: r.kind, xeroInvoiceId: r.xeroInvoiceId })),
+    deleteMany: async ({ where }: { where: { kind: string; xeroInvoiceId: string } }) => {
+      const i = pendingRows.findIndex((r) => r.kind === where.kind && r.xeroInvoiceId === where.xeroInvoiceId)
+      if (i >= 0) pendingRows.splice(i, 1)
+      return {}
+    },
+    updateMany: async ({ where }: { where: { kind: string; xeroInvoiceId: string } }) => {
+      const row = pendingRows.find((r) => r.kind === where.kind && r.xeroInvoiceId === where.xeroInvoiceId)
+      if (row) row.lastCheckedAt = pendingClock++
       return {}
     },
   },
@@ -535,7 +554,7 @@ test('payment reconcile reads the same formats: .NET form and zone-less ISO (UTC
 
 // --- a skipped document is revisited (no new modification event needed) -------------------------------------------------------------
 
-const PENDING = 'xero_payment_date_pending'
+const ids = (kind: string) => pendingRows.filter((r) => r.kind === kind).map((r) => r.xeroInvoiceId)
 
 test('a bill PAID with no date is remembered, and a LATER poll with an empty delta applies it once the date is readable', async () => {
   reset()
@@ -545,7 +564,7 @@ test('a bill PAID with no date is remembered, and a LATER poll with an empty del
   const first = await poll()
   assert.equal(first.billsPaid, 0)
   assert.equal(state.purchaseInvoiceUpdates.length, 0)
-  assert.deepEqual(JSON.parse(settingStore[PENDING]), { sales: [], bills: ['XB1'] })
+  assert.deepEqual(ids('BILL'), ['XB1'])
   assert.ok(state.activity.some((a) => a.action === 'bill_payment_date_unreadable' && a.level === 'WARNING'), 'the WARNING is kept')
 
   // Xero has not modified the document since: the delta is empty. It is simply readable now, by id.
@@ -555,7 +574,7 @@ test('a bill PAID with no date is remembered, and a LATER poll with an empty del
   assert.deepEqual(second.errors, [])
   assert.equal(second.billsPaid, 1)
   assert.equal((state.purchaseInvoiceUpdates[0].data.paidAt as Date).toISOString(), '2026-07-01T00:00:00.000Z')
-  assert.deepEqual(JSON.parse(settingStore[PENDING]), { sales: [], bills: [] }, 'and forgotten')
+  assert.deepEqual(ids('BILL'), [], 'and forgotten')
 })
 
 test('a sales order PAID with no date is remembered and applied by a later poll', async () => {
@@ -565,7 +584,7 @@ test('a sales order PAID with no date is remembered and applied by a later poll'
   state.salesOrders = [UNPAID_ORDER()]
   await poll()
   assert.equal(state.salesOrderUpdates.length, 0)
-  assert.deepEqual(JSON.parse(settingStore[PENDING]), { sales: ['XS1'], bills: [] })
+  assert.deepEqual(ids('SALES'), ['XS1'])
 
   state.invoices = []
   state.recheckInvoices = [paidSale(ISO_NO_ZONE)]
@@ -574,7 +593,7 @@ test('a sales order PAID with no date is remembered and applied by a later poll'
   const write = state.salesOrderUpdates.find((u) => u.data.paidAt !== undefined)
   assert.ok(write)
   assert.equal((write.data.paidAt as Date).toISOString(), '2026-07-01T00:00:00.000Z')
-  assert.deepEqual(JSON.parse(settingStore[PENDING]), { sales: [], bills: [] })
+  assert.deepEqual(ids('SALES'), [])
 })
 
 test('a document still unreadable stays remembered, quietly (no second WARNING, no write); one that is no longer PAID is forgotten; the list is deduplicated', async () => {
@@ -591,30 +610,49 @@ test('a document still unreadable stays remembered, quietly (no second WARNING, 
   await poll()
   assert.equal(warnings(), 1)
   assert.equal(state.purchaseInvoiceUpdates.length, 0)
-  assert.deepEqual(JSON.parse(settingStore[PENDING]).bills, ['XB1'])
+  assert.deepEqual(ids('BILL'), ['XB1'])
 
   // The same document skipped again by the delta is not listed twice.
   state.invoices = [paidBill(undefined)]
   state.recheckInvoices = [paidBill(undefined)]
   await poll()
-  assert.deepEqual(JSON.parse(settingStore[PENDING]).bills, ['XB1'])
+  assert.deepEqual(ids('BILL'), ['XB1'])
 
   state.invoices = []
   state.recheckInvoices = [{ ...paidBill(undefined), Status: 'AUTHORISED' } as XeroInvoice]
   await poll()
-  assert.deepEqual(JSON.parse(settingStore[PENDING]).bills, [])
+  assert.deepEqual(ids('BILL'), [])
 })
 
-test('the remembered list is capped to the newest 200 per kind', async () => {
+test('a failure to REMEMBER the skipped document holds the cursor, so the document comes back through the delta', async () => {
   reset()
-  settingStore[PENDING] = JSON.stringify({ sales: [], bills: Array.from({ length: 200 }, (_, i) => `OLD${i}`) })
   state.invoices = [paidBill(undefined)]
   state.purchaseInvoices = [UNPAID_BILL()]
-  // The old ids are not found in Xero, so the retry forgets them: seed them as found-and-unreadable to keep them.
-  state.recheckInvoices = [...Array.from({ length: 200 }, (_, i) => ({ InvoiceID: `OLD${i}`, Type: 'ACCPAY', Status: 'PAID' }) as XeroInvoice), paidBill(undefined)]
+  pendingWriteFails = true
+  const failed = await poll()
+  assert.ok(failed.errors.some((e) => /Could not remember the PAID bill XB1/.test(e)), failed.errors.join('|'))
+  assert.equal(state.settingUpserts.length, 0, 'the cursor did NOT advance past the chunk')
+  assert.deepEqual(ids('BILL'), [])
+
+  // Next poll, the write works: the same chunk is read again, the document is remembered, and only now does the cursor move.
+  pendingWriteFails = false
+  state.recheckInvoices = [paidBill(undefined)]
+  const ok = await poll()
+  assert.deepEqual(ok.errors, [])
+  assert.deepEqual(ids('BILL'), ['XB1'])
+  assert.equal(state.settingUpserts.length, 1)
+})
+
+test('nothing is evicted: more than 200 remembered documents are all kept, and each poll re-reads the least recently checked 200', async () => {
+  reset()
+  for (let i = 0; i < 250; i++) pendingRows.push({ kind: 'BILL', xeroInvoiceId: `OLD${i}`, firstSeenAt: pendingClock++, lastCheckedAt: null })
+  state.invoices = []
+  // Xero still reports every one of them PAID with no date.
+  state.recheckInvoices = Array.from({ length: 250 }, (_, i) => ({ InvoiceID: `OLD${i}`, Type: 'ACCPAY', Status: 'PAID' }) as XeroInvoice)
   await poll()
-  const bills: string[] = JSON.parse(settingStore[PENDING]).bills
-  assert.equal(bills.length, 200)
-  assert.equal(bills.at(-1), 'XB1')
-  assert.equal(bills[0], 'OLD1')
+  assert.equal(pendingRows.length, 250, 'none dropped')
+  assert.equal(pendingRows.filter((r) => r.lastCheckedAt !== null).length, 200)
+  await poll()
+  assert.equal(pendingRows.length, 250)
+  assert.ok(pendingRows.every((r) => r.lastCheckedAt !== null), 'the second poll reached the 50 that were waiting')
 })

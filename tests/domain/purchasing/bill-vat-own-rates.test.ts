@@ -15,10 +15,10 @@ import { calculatePurchaseInvoice, type PurchaseInvoiceCostLine, type PurchaseIn
 const legacy = (subtotal: number, tax: number) => ({ poSubtotalForeign: subtotal, poTaxForeign: tax })
 
 const poLines = new Map<string, PurchaseInvoicePoLine>([
-  ['std', { id: 'std', qty: 10, product: { sku: 'STD' }, taxRate: { accountingTaxType: 'INPUT2', rate: '0.2' }, totalForeign: 100, taxForeign: 20 }],
-  ['low', { id: 'low', qty: 10, product: { sku: 'LOW' }, taxRate: { accountingTaxType: 'INPUT5', rate: '0.05' }, totalForeign: 100, taxForeign: 5 }],
-  ['zero', { id: 'zero', qty: 10, product: { sku: 'ZERO' }, taxRate: { accountingTaxType: 'ZERORATEDINPUT', rate: '0' }, totalForeign: 100, taxForeign: 0 }],
-  ['compound', { id: 'compound', qty: 10, product: { sku: 'CMP' }, taxRate: { accountingTaxType: 'INPUT2', rate: '0.1', isCompound: true, components: [{ id: 'c1' }] }, totalForeign: 100, taxForeign: 21 }],
+  ['std', { id: 'std', qty: 10, product: { sku: 'STD' }, taxRate: { accountingTaxType: 'INPUT2', rate: '0.2' } }],
+  ['low', { id: 'low', qty: 10, product: { sku: 'LOW' }, taxRate: { accountingTaxType: 'INPUT5', rate: '0.05' } }],
+  ['zero', { id: 'zero', qty: 10, product: { sku: 'ZERO' }, taxRate: { accountingTaxType: 'ZERORATEDINPUT', rate: '0' } }],
+  ['compound', { id: 'compound', qty: 10, product: { sku: 'CMP' }, taxRate: { accountingTaxType: 'INPUT2', rate: '0.1', isCompound: true, components: [{ rate: '0.1' }, { rate: '0.1', compoundOnPrevious: true }] } }],
 ])
 const costLines = new Map<string, PurchaseInvoiceCostLine>([
   ['freight', { id: 'freight', description: 'Freight', amountForeign: 50, vatable: true }],
@@ -64,8 +64,13 @@ test('a non-vatable cost line carries no VAT; a vatable one takes the order\'s r
   assert.equal(bill([cost('freight')], { poType: 'GOODS', poTaxRatePercent: null, ...legacy(100, 20) }).taxForeign, 0)
 })
 
-test('a compound rate uses the line\'s own recorded effective rate (21%), not its stored 10%', () => {
+test('a compound rate takes its effective rate (21%) from its components, not from its stored 10% and not from a line\'s rounded tax over its net', () => {
   assert.equal(bill([goods('compound')], { poType: 'GOODS', poTaxRatePercent: '0.2', ...legacy(100, 21) }).taxForeign, 21)
+  // A small line: 4-dp tax over net (0.0023 / 0.0111) would give 20.72%; the components give exactly 21%.
+  const small = bill([goods('compound', 0.0111)], { poType: 'GOODS', poTaxRatePercent: '0.2', ...legacy(0.0111, 0.0023) })
+  assert.equal(small.lineTaxRates[0].rate, 0.21)
+  assert.equal(small.taxForeign, 0.0023)
+  assert.equal(bill([goods('compound', 1000)], { poType: 'GOODS', poTaxRatePercent: '0.2', ...legacy(1000, 210) }).taxForeign, 210)
 })
 
 test('a goods line with no rate row takes the order rate; a FREIGHT order taxes every line at its recorded rate', () => {

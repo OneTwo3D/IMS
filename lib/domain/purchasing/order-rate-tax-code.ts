@@ -43,10 +43,14 @@ export function resolveOrderRateTaxCode(params: {
   supplierDefault?: OrderRateCandidate | null
 }): OrderRateTaxCode | null {
   const recorded = toDecimal(params.recordedRate == null ? 0 : String(params.recordedRate)).toDecimalPlaces(4)
-  const supplierDefaultId = params.supplierDefault?.id
   const seen = new Set<string>()
   let pool: OrderRateCandidate[] = []
-  for (const row of [params.supplierDefault, ...params.candidates]) {
+  // The supplier's default is held to the same eligibility as every candidate, and it must STATE it: a default read without its active / usedFor /
+  // compound / reverse-charge fields is not known to be eligible, so it does not count (a default that is inactive, sales-only, compound or reverse-charge never wins).
+  const eligibleDefault = params.supplierDefault && params.supplierDefault.active === true && params.supplierDefault.usedFor != null
+    && params.supplierDefault.isCompound === false && params.supplierDefault.reverseCharge === false ? params.supplierDefault : null
+  const supplierDefaultId = eligibleDefault?.id
+  for (const row of [eligibleDefault, ...params.candidates]) {
     if (!row || seen.has(row.id)) continue
     seen.add(row.id)
     if (row.active === false || row.isCompound || row.reverseCharge) continue
@@ -66,4 +70,34 @@ export function resolveOrderRateTaxCode(params: {
   const codes = new Set(pool.map((row) => (row.accountingTaxType as string).trim().toUpperCase()))
   if (codes.size !== 1) return null
   return { taxType: pool[0].accountingTaxType as string, taxRateId: pool[0].id }
+}
+
+/**
+ * DOES THE CODE A BILL LINE POSTS ON CHARGE THE RATE IMS TAXED IT AT?
+ *
+ * The bill's VAT, total and base are IMS's own sum of each line's rate on its net, and the ledger computes VAT from the line's tax CODE. They only agree when the
+ * code's ledger rate is the rate IMS used. `ledgerRatePercentByCode` is the code's effective rate in the ledger as a percentage (20 = 20%), from the stored
+ * tax-rate list; a code whose rate is not known is not checked (the tax-rate drift sweeper is what keeps the list known). A difference beyond rounding
+ * (0.01 percentage points) is a disagreement, and the bill is refused before it is saved or posted. Reverse-charge lines are not checked.
+ */
+export function billTaxCodeDisagreements(
+  lines: ReadonlyArray<{ description: string; taxType: string | undefined; rate: number; checkable: boolean }>,
+  ledgerRatePercentByCode: ReadonlyMap<string, number | null>,
+): string[] {
+  const out: string[] = []
+  for (const line of lines) {
+    if (!line.checkable || !line.taxType || line.taxType.trim() === '') continue
+    const ledger = ledgerRatePercentByCode.get(line.taxType)
+    if (ledger == null || !Number.isFinite(ledger)) continue
+    const imsPercent = toDecimal(line.rate).times(100)
+    if (imsPercent.minus(ledger).abs().gt(0.01)) {
+      out.push(`"${line.description}" is taxed at ${imsPercent.toDecimalPlaces(4).toString()}% in IMS but posts on ${line.taxType}, which charges ${toDecimal(ledger).toDecimalPlaces(4).toString()}% in the ledger`)
+    }
+  }
+  return out
+}
+
+export function billTaxCodeDisagreementMessage(disagreements: ReadonlyArray<string>): string {
+  return `The bill was not saved: the VAT IMS would record does not agree with the tax type it would post on - ${disagreements.join('; ')}. `
+    + 'Correct the purchase order line rate or map the rate to the tax type that charges it, then try again.'
 }

@@ -2800,6 +2800,22 @@ model XeroTaxRate {
   @@map("xero_tax_rates")
 }
 
+/// PAID Xero documents the payment poll skipped because their FullyPaidOnDate was missing or unreadable (ACC-H5). The delta poll only re-reads a
+/// document when Xero modifies it, so a skip that is not remembered is never revisited. Written in the same step as the skip (a failed write holds
+/// the poll's cursor), re-read by id on every poll, and deleted once the document is applied, no longer PAID, or gone. Ids only: no personal data.
+model XeroPaymentDatePending {
+  /// SALES (an ACCREC invoice) or BILL (an ACCPAY bill).
+  kind          String
+  xeroInvoiceId String
+  firstSeenAt   DateTime  @default(now())
+  /// When the poll last re-read this document by id; NULL = never. Oldest-checked first, so a document that stays unreadable cannot starve the others.
+  lastCheckedAt DateTime?
+
+  @@id([kind, xeroInvoiceId])
+  @@index([lastCheckedAt])
+  @@map("xero_payment_date_pending")
+}
+
 /// The proof that the xero_tax_rates rows of one organisation are ONE complete read: when it was read, how many rows
 /// it held and a digest of them. Replaced in the same transaction as the rows (and the read-sync last-success stamp).
 model XeroTaxRateList {

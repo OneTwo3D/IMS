@@ -763,62 +763,52 @@ export async function readSalesResidualVerdicts(
  * PAID DOCUMENTS WHOSE `FullyPaidOnDate` COULD NOT BE READ (ACC-H5 follow-up).
  *
  * A PAID document with a missing or unreadable settlement date is skipped (never stamped with an Invalid Date or "now"). The delta poll
- * only re-reads a document when Xero MODIFIES it, so a skip that is not remembered would never be revisited even once the date is
- * readable. The skipped Xero invoice ids are therefore kept, per kind (sales or bill), in one small Setting (deduplicated, capped to the
- * newest PENDING_DATE_CAP per kind), and every poll re-fetches them by id (`Invoices?IDs=`) and applies those whose date is now readable.
- * The cursor is never held for this.
+ * only re-reads a document when Xero MODIFIES it, so a skip that is not remembered would never be revisited even once the date is readable.
+ * The skipped Xero invoice ids are therefore kept in `xero_payment_date_pending` (per kind, one row per document, never evicted) and every
+ * poll re-fetches them by id (`Invoices?IDs=`) and applies those whose date is now readable.
+ *
+ * REMEMBERING IS A CONDITION OF CHECKPOINTING. The write happens in the same pass as the skip, and a failed write is an ERROR on the poll
+ * result, which holds the cursor for the chunk (the same rule as every other undone pass), so the document comes back through the delta
+ * instead of being forgotten. The list is not capped: a cap that drops the oldest id is a silent loss of a payment. At most
+ * PENDING_DATE_RETRY_BATCH documents are re-read per poll, least recently checked first, so a document that stays unreadable cannot starve
+ * the others and the Xero allowance is bounded; the rest wait their turn.
  */
-const PENDING_DATE_KEY = 'xero_payment_date_pending'
-const PENDING_DATE_CAP = 200
-type PendingPaidDates = { sales: string[]; bills: string[] }
+const PENDING_DATE_RETRY_BATCH = 200
+type PendingKind = 'SALES' | 'BILL'
 
-async function readPendingPaidDates(): Promise<PendingPaidDates> {
-  const empty: PendingPaidDates = { sales: [], bills: [] }
-  try {
-    const row = await db.setting.findUnique({ where: { key: PENDING_DATE_KEY } })
-    if (!row?.value) return empty
-    const parsed: unknown = JSON.parse(row.value)
-    const list = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x !== '') : [])
-    const record = (parsed ?? {}) as { sales?: unknown; bills?: unknown }
-    return { sales: list(record.sales), bills: list(record.bills) }
-  } catch {
-    return empty
-  }
-}
-
-async function writePendingPaidDates(pending: PendingPaidDates): Promise<void> {
-  const value = JSON.stringify({ sales: pending.sales.slice(-PENDING_DATE_CAP), bills: pending.bills.slice(-PENDING_DATE_CAP) })
-  await db.setting.upsert({ where: { key: PENDING_DATE_KEY }, create: { key: PENDING_DATE_KEY, value }, update: { value } })
-}
-
-async function rememberUnreadablePaidDate(kind: 'sales' | 'bills', invoiceId: string | null | undefined): Promise<void> {
+async function rememberUnreadablePaidDate(result: PollResult, kind: PendingKind, invoiceId: string | null | undefined): Promise<void> {
   if (!invoiceId) return
   try {
-    const pending = await readPendingPaidDates()
-    if (pending[kind].includes(invoiceId)) return
-    pending[kind] = [...pending[kind], invoiceId]
-    await writePendingPaidDates(pending)
+    await db.xeroPaymentDatePending.upsert({
+      where: { kind_xeroInvoiceId: { kind, xeroInvoiceId: invoiceId } },
+      create: { kind, xeroInvoiceId: invoiceId },
+      update: {},
+    })
   } catch (e) {
-    console.warn(`[xero] could not remember the PAID document ${invoiceId} with an unreadable date: ${String(e)}`)
+    result.errors.push(`Could not remember the PAID ${kind === 'SALES' ? 'invoice' : 'bill'} ${invoiceId} whose payment date is unreadable (so the poll position is held and it comes back): ${String(e)}`)
   }
 }
 
-/** Re-fetch every remembered document by id and apply the ones whose date has become readable; forget the ones that no longer need it. */
+/** Re-fetch the least recently checked remembered documents by id and apply the ones whose date has become readable; forget the ones that no longer need it. */
 async function retryUnreadablePaidDates(
   result: PollResult,
   windowStart: Date,
   ledgerObservedBefore: LedgerReadFence | null,
 ): Promise<void> {
-  const pending = await readPendingPaidDates()
-  const wanted = [...new Set([...pending.sales, ...pending.bills])]
-  if (wanted.length === 0) return
+  const pending = await db.xeroPaymentDatePending.findMany({
+    orderBy: [{ lastCheckedAt: { sort: 'asc', nulls: 'first' } }, { firstSeenAt: 'asc' }],
+    take: PENDING_DATE_RETRY_BATCH,
+    select: { kind: true, xeroInvoiceId: true },
+  })
+  if (pending.length === 0) return
+  const wanted = [...new Set(pending.map((row) => row.xeroInvoiceId))]
 
   const fetched = new Map<string, XeroInvoice>()
   for (let i = 0; i < wanted.length; i += WITHHELD_RECHECK_BATCH) {
     const batch = wanted.slice(i, i + WITHHELD_RECHECK_BATCH)
     const res = await xeroGet<XeroInvoicesResponse>(`Invoices?IDs=${batch.join(',')}`)
     if (!res.ok) {
-      // Nothing is forgotten: the list is asked again next poll.
+      // Nothing is forgotten: they are asked again next poll.
       console.warn(`[xero] unreadable-paid-date retry could not read Xero: ${res.error ?? `HTTP ${res.status}`}`)
       return
     }
@@ -830,17 +820,16 @@ async function retryUnreadablePaidDates(
   if (ready.length > 0) {
     const errorsBefore = result.errors.length
     await processDeltaChunk(ready, result, { windowStart, ledgerObservedBefore })
-    // A pass that errored may have left some of them undone: keep the whole list for the next poll.
+    // A pass that errored may have left some of them undone: keep them all for the next poll.
     if (result.errors.length > errorsBefore) return
   }
 
-  // Forget a document that was not found, is no longer PAID (the delta poll handles whatever it became), or has just been handled.
-  const keep = (id: string): boolean => {
-    const invoice = fetched.get(id)
-    return invoice !== undefined && stillUnreadable(invoice)
-  }
-  const next = { sales: pending.sales.filter(keep), bills: pending.bills.filter(keep) }
-  if (next.sales.length !== pending.sales.length || next.bills.length !== pending.bills.length) await writePendingPaidDates(next)
+  // Forget a document that was not found, is no longer PAID (the delta poll handles whatever it became), or has just been handled; stamp the rest as checked.
+  const forget = pending.filter((row) => { const invoice = fetched.get(row.xeroInvoiceId); return invoice === undefined || !stillUnreadable(invoice) })
+  const keep = pending.filter((row) => !forget.includes(row))
+  for (const row of forget) await db.xeroPaymentDatePending.deleteMany({ where: { kind: row.kind, xeroInvoiceId: row.xeroInvoiceId } })
+  const checkedAt = new Date()
+  for (const row of keep) await db.xeroPaymentDatePending.updateMany({ where: { kind: row.kind, xeroInvoiceId: row.xeroInvoiceId }, data: { lastCheckedAt: checkedAt } })
 }
 
 /**
@@ -976,7 +965,7 @@ async function processDeltaChunk(
           description: `Xero reports the invoice for order ${order.orderNumber ?? order.externalOrderNumber} PAID but its FullyPaidOnDate is missing or unparseable; paidAt was NOT set. It is re-read by id on every poll and applied once the date is readable (the payment reconcile sweep also lists it).`,
           resolveUser: false,
         })
-        await rememberUnreadablePaidDate('sales', order.accountingInvoiceId)
+        await rememberUnreadablePaidDate(result, 'SALES', order.accountingInvoiceId)
         continue
       }
 
@@ -1205,7 +1194,7 @@ async function processDeltaChunk(
           description: `Xero reports the bill for PO ${bill.po.reference} PAID but its FullyPaidOnDate is missing or unparseable; paidAt was NOT set. It is re-read by id on every poll and applied once the date is readable (the payment reconcile sweep also lists it).`,
           resolveUser: false,
         })
-        await rememberUnreadablePaidDate('bills', bill.accountingInvoiceId)
+        await rememberUnreadablePaidDate(result, 'BILL', bill.accountingInvoiceId)
         continue
       }
 

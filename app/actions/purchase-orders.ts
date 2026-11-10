@@ -2,7 +2,7 @@
 
 import { assertNoLiveAsnForReceipt, ManualReceiptRefusedByLiveAsnError } from '@/lib/domain/wms/po-receipt-asn-guard'
 import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
-import { resolveOrderRateTaxCode } from '@/lib/domain/purchasing/order-rate-tax-code'
+import { billTaxCodeDisagreementMessage, billTaxCodeDisagreements, resolveOrderRateTaxCode } from '@/lib/domain/purchasing/order-rate-tax-code'
 import { taxTypeForBasis } from '@/lib/accounting/reverse-charge'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { revalidatePath } from 'next/cache'
@@ -3471,6 +3471,24 @@ export type InvoiceRow = {
   }[]
 }
 
+/**
+ * The refusal, or null: does every billed line's tax code charge, in the ledger, the rate IMS taxed that line at? Reads the stored Xero tax-rate list of the
+ * connected organisation (no live call); a code whose rate is not stored is not checked. Only asked when bills are being sent to the ledger.
+ */
+async function billTaxCodeRefusal(lineTaxRates: ReadonlyArray<{ description: string; taxType: string | undefined; rate: number; checkable: boolean }>): Promise<string | null> {
+  const codes = [...new Set(lineTaxRates.filter((l) => l.checkable && l.taxType).map((l) => l.taxType as string))]
+  if (codes.length === 0) return null
+  const token = await db.accountingToken.findUnique({ where: { connector: 'xero' }, select: { tenantId: true } })
+  if (!token) return null
+  const rows = await db.xeroTaxRate.findMany({
+    where: { connector: 'xero', tenantId: token.tenantId, status: 'ACTIVE', taxType: { in: codes } },
+    select: { taxType: true, effectiveRate: true },
+  })
+  const ledgerRates = new Map(rows.map((row) => [row.taxType, row.effectiveRate == null ? null : Number(row.effectiveRate)] as const))
+  const disagreements = billTaxCodeDisagreements(lineTaxRates, ledgerRates)
+  return disagreements.length > 0 ? billTaxCodeDisagreementMessage(disagreements) : null
+}
+
 export async function createInvoice(
   poId: string,
   input: CreateInvoiceInput,
@@ -3496,8 +3514,6 @@ export async function createInvoice(
             qty: true,
             qtyReceived: true,
             qtyReturned: true,
-            taxForeign: true,
-            totalForeign: true,
             product: { select: { sku: true } },
             taxRate: {
               select: {
@@ -3507,7 +3523,7 @@ export async function createInvoice(
                 rate: true,
                 name: true,
                 isCompound: true,
-                components: { where: { active: true }, select: { id: true }, take: 1 },
+                components: { where: { active: true }, orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }], select: { rate: true, compoundOnPrevious: true } },
               },
             },
           },
@@ -3563,7 +3579,7 @@ export async function createInvoice(
       getAccountingSettings(),
       db.purchaseOrder.findUnique({
         where: { id: poId },
-        select: { supplier: { select: { name: true, taxRate: { select: { id: true, name: true, rate: true, accountingTaxType: true } } } }, currency: true },
+        select: { supplier: { select: { name: true, taxRate: { select: { id: true, name: true, rate: true, accountingTaxType: true, active: true, usedFor: true, isCompound: true, reverseCharge: true } } } }, currency: true },
       }),
     ])
     // The code of the rate the ORDER was charged at, never the supplier's current default (which may be another rate).
@@ -3604,6 +3620,10 @@ export async function createInvoice(
       poLineById,
       costLineById,
     })
+    if (accountingSettings.syncEnabled) {
+      const disagreement = await billTaxCodeRefusal(invoiceCalculation.lineTaxRates)
+      if (disagreement) return { success: false, error: disagreement }
+    }
     const accountingPayload = buildPurchaseInvoiceAccountingPayload({
       poReference: po.reference,
       contactName: supplierData?.supplier?.name,
@@ -3901,7 +3921,7 @@ export async function updateInvoice(
                 name: true,
                 email: true,
                 prepaid: true,
-                taxRate: { select: { id: true, name: true, rate: true, accountingTaxType: true } },
+                taxRate: { select: { id: true, name: true, rate: true, accountingTaxType: true, active: true, usedFor: true, isCompound: true, reverseCharge: true } },
               },
             },
             lines: {
@@ -3910,8 +3930,6 @@ export async function updateInvoice(
                 qty: true,
                 qtyReceived: true,
                 qtyReturned: true,
-                taxForeign: true,
-                totalForeign: true,
                 product: { select: { sku: true } },
                 taxRate: {
                   select: {
@@ -3921,7 +3939,7 @@ export async function updateInvoice(
                     rate: true,
                     name: true,
                     isCompound: true,
-                    components: { where: { active: true }, select: { id: true }, take: 1 },
+                    components: { where: { active: true }, orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }], select: { rate: true, compoundOnPrevious: true } },
                   },
                 },
               },
@@ -4039,6 +4057,10 @@ export async function updateInvoice(
       })
     } catch (error) {
       return { success: false, error: String(error instanceof Error ? error.message : error) }
+    }
+    if (accountingSettings.syncEnabled) {
+      const disagreement = await billTaxCodeRefusal(invoiceCalculation.lineTaxRates)
+      if (disagreement) return { success: false, error: disagreement }
     }
     const lineUpdates = invoiceCalculation.lineData
 

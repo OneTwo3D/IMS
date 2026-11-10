@@ -3,6 +3,7 @@ import { rateBinding, resolvePurchaseLineTaxType } from '@/lib/accounting/revers
 import { usableStoredFxRate } from '@/lib/currencies/stored-document-rate'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { noVatRateKind, type PurchaseNoTaxLineKind } from '@/lib/domain/accounting/purchase-document-tax-types'
+import { effectiveTaxRateFromComponents } from '@/lib/tax/tax-rate-components'
 
 export type PurchaseInvoiceEditHeader = {
   invoiceNumber: string | null
@@ -39,13 +40,10 @@ export type PurchaseInvoicePoLine = {
   qtyReturned?: unknown
   product: { sku: string }
   /**
-   * The line's own rate. `rate` is the stored fraction (0.2 = 20%); `isCompound`/active `components` say it is a compound rate whose
-   * effective percentage is not `rate`, in which case the line's own recorded tax over its recorded net is used instead.
+   * The line's own rate. `rate` is the stored fraction (0.2 = 20%). A compound rate has active `components`, and ITS effective rate is derived from
+   * them with the compound-rate maths the sales side and the tax-rate code use (lib/tax/tax-rate-components.ts), never from a line's rounded tax over its net.
    */
-  taxRate?: { id?: string; accountingTaxType: string | null; reverseCharge?: boolean; rate?: unknown; isCompound?: boolean; components?: readonly unknown[] } | null
-  /** The line's recorded tax and net, from the order: the line's OWN effective rate when its stored rate cannot state it. */
-  taxForeign?: unknown
-  totalForeign?: unknown
+  taxRate?: { id?: string; accountingTaxType: string | null; reverseCharge?: boolean; rate?: unknown; isCompound?: boolean; components?: ReadonlyArray<{ rate: unknown; compoundOnPrevious?: boolean }> } | null
 }
 
 export type PurchaseInvoiceCostLine = {
@@ -96,9 +94,20 @@ export type PurchaseInvoiceAccountingLine = {
   taxRateBasis?: string
 }
 
+/** The VAT rate each accounting line was taxed at in IMS, aligned with `accountingLines`, so it can be checked against the rate its tax code charges. */
+export type PurchaseInvoiceLineTaxRate = {
+  description: string
+  taxType: string | undefined
+  /** Fraction (0.2 = 20%). */
+  rate: number
+  /** False for a reverse-charge line, whose code is a self-accounting one whose ledger rate is not the supplier's charge. */
+  checkable: boolean
+}
+
 export type PurchaseInvoiceCalculation = {
   lineData: PurchaseInvoiceLineDraft[]
   accountingLines: PurchaseInvoiceAccountingLine[]
+  lineTaxRates: PurchaseInvoiceLineTaxRate[]
   subtotalForeign: number
   subtotalBase: number
   taxForeign: number
@@ -158,20 +167,19 @@ function assertPositiveFxRate(fxRate: number): void {
 }
 
 /**
- * A goods line's OWN VAT rate, as a fraction. A simple stored rate is used as it is. A compound rate (or one with active components) has an
- * effective percentage the stored `rate` does not state, so the line's recorded tax over its recorded net is used (rounded to the
- * four places a rate is stored in). A line with no rate row takes the order's rate. On a FREIGHT order every line is taxed at the order's
- * recorded rate.
+ * A goods line's OWN VAT rate, as a fraction. A rate with active components takes its effective rate from them (the existing compound-rate maths); a simple
+ * rate is its stored value; a line with no rate row takes the order's rate. On a FREIGHT order every line is taxed at the order's recorded rate.
  */
 function purchaseLineOwnRate(poLine: PurchaseInvoicePoLine, orderRate: Decimal, freightOrder: boolean): Decimal {
   if (freightOrder) return orderRate
   const rate = poLine.taxRate
   if (!rate) return orderRate
-  const net = toDecimal(String(poLine.totalForeign ?? 0))
-  const recordedTax = toDecimal(String(poLine.taxForeign ?? 0))
-  if ((rate.isCompound || (rate.components?.length ?? 0) > 0) && net.gt(0)) return recordedTax.div(net).toDecimalPlaces(4)
-  if (rate.rate != null) return toDecimal(String(rate.rate))
-  return net.gt(0) && poLine.taxForeign != null ? recordedTax.div(net).toDecimalPlaces(4) : orderRate
+  const components = (rate.components ?? []).map((component) => ({ rate: Number(component.rate), compoundOnPrevious: component.compoundOnPrevious === true }))
+  if (components.length > 0) {
+    const effective = effectiveTaxRateFromComponents(components)
+    if (effective != null) return toDecimal(effective)
+  }
+  return rate.rate != null ? toDecimal(String(rate.rate)) : orderRate
 }
 
 export function calculatePurchaseInvoice(params: {
@@ -217,6 +225,7 @@ export function calculatePurchaseInvoice(params: {
   const orderRate = toDecimal(params.poTaxRatePercent ?? 0)
   const lineData: PurchaseInvoiceLineDraft[] = []
   const accountingLines: PurchaseInvoiceAccountingLine[] = []
+  const lineTaxRates: PurchaseInvoiceLineTaxRate[] = []
 
   for (const line of params.lines) {
     if (line.kind === 'product') {
@@ -233,7 +242,8 @@ export function calculatePurchaseInvoice(params: {
       const totalBase = rounded4(toDecimal(totalForeign).div(params.fxRateToBase))
       subtotalForeign = addMoney(subtotalForeign, totalForeign)
       subtotalBase = addMoney(subtotalBase, totalBase)
-      taxForeignSum = addMoney(taxForeignSum, multiplyMoney(totalForeign, purchaseLineOwnRate(poLine, orderRate, params.poType === 'FREIGHT')))
+      const lineRate = purchaseLineOwnRate(poLine, orderRate, params.poType === 'FREIGHT')
+      taxForeignSum = addMoney(taxForeignSum, multiplyMoney(totalForeign, lineRate))
 
       lineData.push({
         id: line.id,
@@ -253,6 +263,7 @@ export function calculatePurchaseInvoice(params: {
         reverseCharge: poLine.taxRate?.reverseCharge,
         reverseChargePurchaseTaxType: params.reverseChargeTaxType,
       })
+      lineTaxRates.push({ description: `PO ${params.poReference} line`, taxType: productTaxType, rate: lineRate.toNumber(), checkable: !poLine.taxRate?.reverseCharge })
       accountingLines.push({
         description: `PO ${params.poReference} line`,
         quantity: line.qtyBilled,
@@ -291,6 +302,7 @@ export function calculatePurchaseInvoice(params: {
       totalForeign,
       totalBase,
     })
+    lineTaxRates.push({ description, taxType: costLine.vatable ? params.fallbackTaxType : 'NONE', rate: costLine.vatable ? orderRate.toNumber() : 0, checkable: true })
     accountingLines.push({
       description,
       quantity: 1,
@@ -313,6 +325,7 @@ export function calculatePurchaseInvoice(params: {
   return {
     lineData,
     accountingLines,
+    lineTaxRates,
     subtotalForeign: rounded4(subtotalForeign),
     subtotalBase: rounded4(subtotalBase),
     taxForeign,
