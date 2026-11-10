@@ -12,27 +12,27 @@ const line = (totalBase: number, lineNet: number | null, lineTax: number | null)
 
 test('a 10 NET credit on a 120 order at 20% takes 12 off in gross terms: 108', () => {
   const t = orderTurnoverBase(order([{ totalBase: 10, totalsBasis: 'NET', lines: [line(10, 100, 20)] }]))
-  assert.deepEqual(t, { value: 108, complete: true })
+  assert.deepEqual(t, { value: 108, complete: true, bound: 'exact' })
 })
 
 test('a GROSS credit comes off as it stands', () => {
-  assert.deepEqual(orderTurnoverBase(order([{ totalBase: 12, totalsBasis: 'GROSS', lines: [] }])), { value: 108, complete: true })
+  assert.deepEqual(orderTurnoverBase(order([{ totalBase: 12, totalsBasis: 'GROSS', lines: [] }])), { value: 108, complete: true, bound: 'exact' })
 })
 
 test('mixed-rate NET credit converts line by line: 10 at 20% + 10 at 0% = 22 gross', () => {
   const t = orderTurnoverBase(order([{ totalBase: 20, totalsBasis: 'NET', lines: [line(10, 100, 20), line(10, 50, 0)] }]))
-  assert.deepEqual(t, { value: 98, complete: true })
+  assert.deepEqual(t, { value: 98, complete: true, bound: 'exact' })
 })
 
 test('a NET credit that cannot be converted exactly stays out and flags an upper bound', () => {
   // no lines
-  assert.deepEqual(orderTurnoverBase(order([{ totalBase: 10, totalsBasis: 'NET' }])), { value: 120, complete: false })
+  assert.deepEqual(orderTurnoverBase(order([{ totalBase: 10, totalsBasis: 'NET' }])), { value: 120, complete: false, bound: 'upper' })
   // line with no known rate (taxed, but no rate row)
-  assert.deepEqual(orderTurnoverBase(order([{ totalBase: 10, totalsBasis: 'NET', lines: [line(10, null, null)] }])), { value: 120, complete: false })
+  assert.deepEqual(orderTurnoverBase(order([{ totalBase: 10, totalsBasis: 'NET', lines: [line(10, null, null)] }])), { value: 120, complete: false, bound: 'upper' })
   // lines do not add up to the header
-  assert.deepEqual(orderTurnoverBase(order([{ totalBase: 10, totalsBasis: 'NET', lines: [line(8, 100, 20)] }])), { value: 120, complete: false })
+  assert.deepEqual(orderTurnoverBase(order([{ totalBase: 10, totalsBasis: 'NET', lines: [line(8, 100, 20)] }])), { value: 120, complete: false, bound: 'upper' })
   // unproven basis
-  assert.deepEqual(orderTurnoverBase(order([{ totalBase: 10, totalsBasis: null, lines: [line(10, 100, 20)] }])), { value: 120, complete: false })
+  assert.deepEqual(orderTurnoverBase(order([{ totalBase: 10, totalsBasis: null, lines: [line(10, 100, 20)] }])), { value: 120, complete: false, bound: 'upper' })
 })
 
 test('exact credits still come off when another credit on the same order cannot be placed', () => {
@@ -40,7 +40,7 @@ test('exact credits still come off when another credit on the same order cannot 
     { totalBase: 10, totalsBasis: 'NET', lines: [line(10, 100, 20)] },
     { totalBase: 5, totalsBasis: null },
   ]))
-  assert.deepEqual(t, { value: 108, complete: false })
+  assert.deepEqual(t, { value: 108, complete: false, bound: 'upper' })
 })
 
 test('drafts, cancelled and un-invoiced orders contribute nothing', () => {
@@ -56,7 +56,7 @@ test('the charged rate is read from the line\u2019s stored net and tax, not from
     totalBase: 10, totalsBasis: 'NET',
     lines: [{ totalBase: 10, salesOrderLine: { totalBase: 100, taxBase: 20, taxRate: { rate: 0.05 } } }],
   }
-  assert.deepEqual(orderTurnoverBase(order([credit])), { value: 108, complete: true })
+  assert.deepEqual(orderTurnoverBase(order([credit])), { value: 108, complete: true, bound: 'exact' })
 })
 
 test('stored amounts that cannot give an exact rate leave the credit unplaced and flagged', () => {
@@ -69,6 +69,30 @@ test('stored amounts that cannot give an exact rate leave the credit unplaced an
   ]
   for (const c of cases) {
     const total = (c as { totalBase: number }).totalBase
-    assert.deepEqual(orderTurnoverBase(order([{ totalBase: total, totalsBasis: 'NET', lines: [c] }])), { value: 120, complete: false })
+    assert.deepEqual(orderTurnoverBase(order([{ totalBase: total, totalsBasis: 'NET', lines: [c] }])), { value: 120, complete: false, bound: 'upper' })
   }
+})
+
+test('a negative discount line against a negative sales line is placed in gross terms, not skipped', () => {
+  // Sales discount line: net -50, stored tax -10 (20%). A credit of -5 NET against it is -6 gross, which RAISES turnover by 6.
+  const t = orderTurnoverBase(order([{ totalBase: -5, totalsBasis: 'NET', lines: [line(-5, -50, -10)] }]))
+  assert.deepEqual(t, { value: 126, complete: true, bound: 'exact' })
+})
+
+test('a mixed-sign NET credit is placed line by line: +10 at 20% and -4 at 20% = 6 net, 7.20 gross', () => {
+  const t = orderTurnoverBase(order([{ totalBase: 6, totalsBasis: 'NET', lines: [line(10, 100, 20), line(-4, -40, -8)] }]))
+  assert.deepEqual(t, { value: 112.8, complete: true, bound: 'exact' })
+})
+
+test('an unplaced credit that is negative, zero or mixed-sign makes the figure indeterminate, not an upper bound', () => {
+  // negative total, line cannot be placed
+  assert.equal(orderTurnoverBase(order([{ totalBase: -5, totalsBasis: 'NET', lines: [line(-5, null, null)] }]))!.bound, 'indeterminate')
+  // zero total
+  assert.equal(orderTurnoverBase(order([{ totalBase: 0, totalsBasis: null }]))!.bound, 'indeterminate')
+  // positive total but one line negative and unplaceable: mixed, so no bound can be proved
+  assert.equal(orderTurnoverBase(order([{ totalBase: 6, totalsBasis: 'NET', lines: [line(10, 100, 20), line(-4, null, null)] }]))!.bound, 'indeterminate')
+  // positive and unplaced stays an upper bound
+  assert.equal(orderTurnoverBase(order([{ totalBase: 10, totalsBasis: null }]))!.bound, 'upper')
+  // indeterminate wins over an upper bound on the same order
+  assert.equal(orderTurnoverBase(order([{ totalBase: 10, totalsBasis: null }, { totalBase: -2, totalsBasis: null }]))!.bound, 'indeterminate')
 })

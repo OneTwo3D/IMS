@@ -232,6 +232,7 @@ test('customer lifetime value and the customer page turnover use the invoiced ba
   assert.equal(customer!.lifetimeValueBase, 400)
   assert.equal(customer!.currentYearSalesBase, 400)
   assert.equal(customer!.lifetimeValueUpperBound, false)
+  assert.equal(customer!.lifetimeValueIndeterminate, false)
   const detail = await getCustomerDetail('cust-1')
   assert.equal(detail!.totalTurnoverBase, 400)
   assert.equal(detail!.annualTurnoverBase[String(TODAY_NOON.getFullYear())], 400)

@@ -146,6 +146,8 @@ These reports, **Purchase Statistics** (page, data and the `po_*` CSV exports) a
 | **Spend** | Received purchase-order spend by supplier, category, and month. |
 | **Lead Times** | Actual receipt lead-time distribution and P50/P95 metrics that feed reorder planning when supplier lead time is missing. |
 
+During the parallel phase an order with a WooCommerce (Xeroom) invoice number counts as invoiced; IMS does not check that Xeroom's post to Xero succeeded.
+
 Reports that are bounded by invoice date (the Sales Statistics invoice list, the currency summary and AR Aging) date an order by its invoice date when IMS has one, otherwise by the date it was paid, and only then by the order date (shown as approximate, with a notice on the report and a column in the CSV). Orders invoiced by Xeroom carry an invoice number but no invoice date in IMS; Xeroom issues the invoice as the order is paid, so the paid date is the closest date IMS holds. The VAT report is not affected: it keeps its own invoice-date tax point.
 
 The Gross Margin and COGS reports use the same invoiced orders for revenue and credit. A dispatch of an order that has no invoice yet keeps its cost, but no revenue or credit is counted against it, and its COGS row reads Unmatched.

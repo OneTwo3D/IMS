@@ -49,6 +49,8 @@ export type CustomerRow = {
   lifetimeValueBase: number
   /** False when some invoiced order has refunds on an unproven or mixed basis, so turnover is an upper bound. */
   lifetimeValueUpperBound: boolean
+  /** True when an unplaced credit is zero or negative, so the figure could be higher or lower (shown as \u2248). */
+  lifetimeValueIndeterminate: boolean
   currentYearSalesBase: number
   lastOrderAt: string | null
   createdAt: string
@@ -141,7 +143,7 @@ function mapCustomer(c: {
   // Turnover: the shared invoiced basis, refunds netted (customer-turnover.ts).
   const revenueOrders = (c.salesOrders ?? []).flatMap((o) => {
     const t = orderTurnoverBase(o)
-    return t ? [{ createdAt: o.createdAt, value: t.value, complete: t.complete }] : []
+    return t ? [{ createdAt: o.createdAt, value: t.value, bound: t.bound }] : []
   })
   const lastOrder = c.salesOrders?.length
     ? c.salesOrders.reduce((latest, o) => (o.createdAt > latest ? o.createdAt : latest), c.salesOrders[0].createdAt)
@@ -162,7 +164,8 @@ function mapCustomer(c: {
     active: c.active,
     orderCount: c._count.salesOrders,
     lifetimeValueBase: revenueOrders.reduce((sum, o) => sum + o.value, 0),
-    lifetimeValueUpperBound: !revenueOrders.every((o) => o.complete),
+    lifetimeValueUpperBound: revenueOrders.some((o) => o.bound === 'upper') && !revenueOrders.some((o) => o.bound === 'indeterminate'),
+    lifetimeValueIndeterminate: revenueOrders.some((o) => o.bound === 'indeterminate'),
     currentYearSalesBase: revenueOrders
       .filter((o) => o.createdAt.getFullYear() === currentYear)
       .reduce((sum, o) => sum + o.value, 0),

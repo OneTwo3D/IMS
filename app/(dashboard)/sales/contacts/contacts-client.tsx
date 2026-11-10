@@ -348,8 +348,8 @@ export function ContactsClient({ initialCustomers }: Props) {
       case 'billingAddress': return formatAddr(c.billingAddress)
       case 'shippingAddress': return formatAddr(c.shippingAddress)
       case 'orders': return c.orderCount
-      case 'lifetimeValue': return c.lifetimeValueBase > 0 ? `${c.lifetimeValueUpperBound ? '≤ ' : ''}${fmtBase(c.lifetimeValueBase)}` : '—'
-      case 'currentYearSales': return c.currentYearSalesBase > 0 ? `${c.lifetimeValueUpperBound ? '≤ ' : ''}${fmtBase(c.currentYearSalesBase)}` : '—'
+      case 'lifetimeValue': return c.lifetimeValueBase > 0 ? `${c.lifetimeValueIndeterminate ? '≈ ' : c.lifetimeValueUpperBound ? '≤ ' : ''}${fmtBase(c.lifetimeValueBase)}` : '—'
+      case 'currentYearSales': return c.currentYearSalesBase > 0 ? `${c.lifetimeValueIndeterminate ? '≈ ' : c.lifetimeValueUpperBound ? '≤ ' : ''}${fmtBase(c.currentYearSalesBase)}` : '—'
       case 'lastOrder': return fmtDate(c.lastOrderAt)
       case 'status':
         return (

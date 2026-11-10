@@ -42,13 +42,26 @@ function netCreditAsGross(refund: TurnoverRefund): number | null {
     const lineTax = Number(sales.taxBase)
     const amount = Number(line.totalBase)
     if (!Number.isFinite(lineNet) || !Number.isFinite(lineTax) || !Number.isFinite(amount)) return null
-    if (lineNet <= 0 || lineTax < 0 || amount < 0 || amount > lineNet + 0.005) return null
+    // A line is placeable when it reverses a non-zero stored net, the stored tax has the same sign as
+    // that net, and the credit is a share of it (0 to 100%). That includes a negative line against a
+    // negative (discount) sales line, which is what makes a mixed-sign credit placeable line by line.
+    if (lineNet === 0 || lineTax * lineNet < 0) return null
+    const share = amount / lineNet
+    if (share < 0 || share > 1.0001) return null
     net += amount
     gross += (amount * (lineNet + lineTax)) / lineNet
   }
   if (Math.abs(net - Number(refund.totalBase)) > 0.005) return null
   return round2(gross)
 }
+
+/**
+ * What the published figure is relative to the truth:
+ *  - `exact`: every credit was placed;
+ *  - `upper`: some credit could not be placed, and every such credit is positive, so the true figure is at most the one shown;
+ *  - `indeterminate`: an unplaced credit is zero, negative or not a number, so the true figure could be higher OR lower.
+ */
+export type TurnoverBound = 'exact' | 'upper' | 'indeterminate'
 
 export function orderTurnoverBase(order: {
   status: string
@@ -57,16 +70,22 @@ export function orderTurnoverBase(order: {
   shoppingLinks?: ReadonlyArray<{ connector: string }>
   totalBase: unknown
   refunds?: TurnoverRefund[]
-}): { value: number; complete: boolean } | null {
+}): { value: number; complete: boolean; bound: TurnoverBound } | null {
   if (!isInvoicedOrder(order)) return null
   let value = Number(order.totalBase)
-  let complete = true
+  let bound: TurnoverBound = 'exact'
   for (const refund of order.refunds ?? []) {
     const credit = refund.totalsBasis === 'GROSS'
       ? Number(refund.totalBase)
       : refund.totalsBasis === 'NET' ? netCreditAsGross(refund) : null
-    if (credit == null) complete = false
-    else value -= credit
+    if (credit == null) {
+      // Unplaced: a positive credit leaves the figure too high (upper bound); anything else could move it either way.
+      // A credit with any negative line is mixed-sign, so even a positive total proves nothing about its gross value.
+      const total = Number(refund.totalBase)
+      const mixed = (refund.lines ?? []).some((l) => !(Number(l.totalBase) >= 0))
+      if (!(Number.isFinite(total) && total > 0) || mixed) bound = 'indeterminate'
+      else if (bound === 'exact') bound = 'upper'
+    } else value -= credit
   }
-  return { value: round2(value), complete }
+  return { value: round2(value), complete: bound === 'exact', bound }
 }
