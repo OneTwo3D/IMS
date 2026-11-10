@@ -3924,6 +3924,8 @@ export async function updateInvoice(
         const refresh = await refreshPendingPurchaseInvoiceCreate({
           tx,
           invoiceId: invoice.id,
+          poId: invoice.poId,
+          currentInvoiceNumber: invoice.invoiceNumber ?? null,
           chartConnector: accountingSettings.connector,
           accountingPayload,
         })

@@ -1,4 +1,4 @@
-import { LEDGER_STANDING_SELECT, ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
+import { LEDGER_STANDING_SELECT, ledgerStanding, namesADocument } from '@/lib/domain/accounting/ledger-standing'
 import { ATTEMPT_PROVEN_NEVER_MADE_WHERE, attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
 import type { Prisma } from '@/app/generated/prisma/client'
 import type { PurchaseInvoiceAccountingPayload } from '@/lib/domain/purchasing/purchase-invoice-edit'
@@ -41,7 +41,7 @@ export type PendingCreateRefreshOutcome =
   /** No create row exists for this bill (sync off, a hold recorded it as a shadow, or it was never queued): nothing is owed to a ledger document. */
   | { kind: 'no-create-row' }
 
-export type PendingCreateRefreshTx = Pick<Prisma.TransactionClient, 'accountingSyncLog'>
+export type PendingCreateRefreshTx = Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'purchaseInvoice'>
 
 /** The keys the enqueue stamped on the row (`_postingMode`, `_idempotencyKey`, the connection stamp): the row's identity, never the document. */
 function enqueueStamps(payload: unknown): Record<string, unknown> {
@@ -49,9 +49,35 @@ function enqueueStamps(payload: unknown): Record<string, unknown> {
   return Object.fromEntries(Object.entries(payload as Record<string, unknown>).filter(([key]) => key.startsWith('_')))
 }
 
+const CREATE_ROW_SELECT = {
+  ...LEDGER_STANDING_SELECT,
+  id: true,
+  connector: true,
+  remoteAttemptedAt: true,
+  attemptStampingCustodyAt: true,
+  backReferenceEvidenceCompactedAt: true,
+  payload: true,
+} as const
+
+/** A shadow IMS recorded instead of queuing, and an attempt proven never sent that was then retired, are not postings: nothing is owed to the ledger for them. */
+function isPosting(row: Parameters<typeof ledgerStanding>[0]): boolean {
+  const standing = ledgerStanding(row)
+  return standing !== 'SHADOW_NOT_SENT_BY_IMS' && standing !== 'PROVEN_NOT_POSTED'
+}
+
+function payloadInvoiceNumber(payload: unknown): string | null {
+  if (typeof payload !== 'object' || payload === null) return null
+  const value = (payload as Record<string, unknown>).invoiceNumber
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : null
+}
+
 export async function refreshPendingPurchaseInvoiceCreate(params: {
   tx: PendingCreateRefreshTx
   invoiceId: string
+  /** The bill's purchase order (locked by the caller): legacy create rows are keyed to it, not to the bill. */
+  poId: string
+  /** The bill's supplier invoice number as saved BEFORE this edit: what a legacy row (which names no bill) is matched on. */
+  currentInvoiceNumber: string | null
   /** The connector whose chart `accountingPayload` was built from; the row must belong to it. */
   chartConnector: string | null
   /** The edited bill, built exactly as the create builds it (no ledger document id). */
@@ -59,26 +85,32 @@ export async function refreshPendingPurchaseInvoiceCreate(params: {
 }): Promise<PendingCreateRefreshOutcome> {
   const rows = await params.tx.accountingSyncLog.findMany({
     where: { type: 'PURCHASE_INVOICE', referenceType: 'PurchaseInvoice', referenceId: params.invoiceId },
-    select: {
-      ...LEDGER_STANDING_SELECT,
-      id: true,
-      connector: true,
-      remoteAttemptedAt: true,
-      attemptStampingCustodyAt: true,
-      backReferenceEvidenceCompactedAt: true,
-      payload: true,
-    },
+    select: CREATE_ROW_SELECT,
   })
-  // What each row says about the ledger is the ledger-standing module's to say. A shadow IMS recorded instead of queuing, and an attempt
-  // proven never to have been sent that was then retired, are not postings: nothing is owed to the ledger for them.
-  const postings = rows.filter((row) => {
-    const standing = ledgerStanding(row)
-    return standing !== 'SHADOW_NOT_SENT_BY_IMS' && standing !== 'PROVEN_NOT_POSTED'
-  })
-  if (postings.length === 0) return { kind: 'no-create-row' }
+  const postings = rows.filter(isPosting)
   // Two live create rows for one bill cannot be told apart.
   if (postings.length > 1) throw new PurchaseBillFirstPostingInFlightError()
-  const row = postings[0]!
+  let row = postings[0]
+  if (row === undefined) {
+    // LEGACY CREATE ROWS are keyed to the PURCHASE ORDER and name no bill (before the key moved to the bill). One of them may be this bill's first
+    // posting, and nothing in the row says so: it is taken as this bill's only when the order has no OTHER bill still waiting for a document, no other
+    // live legacy row, and the supplier invoice number it carries is this bill's. Anything else is ambiguous and the edit is refused until posting settles.
+    const legacy = await params.tx.accountingSyncLog.findMany({
+      where: { type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: params.poId },
+      select: { ...CREATE_ROW_SELECT, externalTransactionId: true },
+    })
+    const siblings = await params.tx.purchaseInvoice.findMany({ where: { poId: params.poId }, select: { id: true, accountingInvoiceId: true } })
+    const linkedElsewhere = new Set(siblings.filter((b) => b.id !== params.invoiceId && b.accountingInvoiceId !== null).map((b) => b.accountingInvoiceId))
+    const candidates = legacy.filter((r) => isPosting(r) && !(namesADocument(r) && linkedElsewhere.has(r.externalTransactionId)))
+    if (candidates.length === 0) return { kind: 'no-create-row' }
+    const waiting = siblings.filter((b) => b.accountingInvoiceId === null)
+    const attributable = candidates.length === 1
+      && waiting.length === 1
+      && waiting[0]!.id === params.invoiceId
+      && payloadInvoiceNumber(candidates[0]!.payload) === (params.currentInvoiceNumber?.trim() || null)
+    if (!attributable) throw new PurchaseBillFirstPostingInFlightError()
+    row = candidates[0]!
+  }
   // Refreshable only while the row is queued (or failed) and PROVEN never to have made a request: a claim, an attempt, a posted-but-unlinked
   // document or a row nobody can vouch for are all "may have left".
   // The standing is read with the proof of "never sent" the row itself carries: queued work is LIVE_WORK, and a failure is PROVEN_NOT_POSTED only

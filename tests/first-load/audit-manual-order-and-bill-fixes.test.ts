@@ -209,6 +209,53 @@ for (const [label, source] of [
   })
 }
 
+// [mutation: delete the reconciliation refusal in updateSalesOrderStatus / queueSalesInvoiceForOrder]
+test('SO-H2: a WooCommerce order whose shipping is ZERO-RATED on a 20% order cannot be cloned into a mis-taxed invoice: finalisation is refused, nothing moves, nothing is queued', async () => {
+  const { cloneSalesOrder, updateSalesOrderStatus } = await import('@/app/actions/sales')
+  // 100 net at 20% + 10 shipping at 0%: the order is 130, but the invoice's shipping takes the order's 20% type (the importer's own invoice sends shipping with its own rate, which the order does not store).
+  const src = await s.db.salesOrder.create({
+    data: {
+      orderNumber: `WOO-ZS-${++seq}`, customerName: 'Woo', currency: 'GBP', fxRateToBase: 1, status: 'PROCESSING', pricesIncludeVat: true,
+      taxRateName: 'AUD Sales 20', taxRatePercent: '0.2',
+      subtotalForeign: '100', shippingForeign: '10', taxForeign: '20', totalForeign: '130', subtotalBase: '100', shippingBase: '10', taxBase: '20', totalBase: '130',
+      shoppingLinks: { create: { connector: 'woocommerce', externalOrderId: `wc-zs-${seq}` } },
+      lines: { create: [{ productId, sku: 'AUD-1', description: 'x', qty: 1, unitPriceForeign: '100', unitPriceBase: '100', taxForeign: '20', taxBase: '20', totalForeign: '100', totalBase: '100', taxRateId: vat20Id }] },
+    } as never,
+    select: { id: true },
+  })
+  const cloned = await cloneSalesOrder(src.id)
+  assert.equal(cloned.success, true, cloned.error)
+  const refused = await updateSalesOrderStatus(cloned.newId!, 'PENDING_PAYMENT')
+  assert.equal(refused.success, false)
+  assert.match(String(refused.error), /would total 132\.00 GBP but the order totals 130\.00 GBP/)
+  assert.equal((await s.db.salesOrder.findUniqueOrThrow({ where: { id: cloned.newId! } })).status, 'DRAFT', 'the clone did not move')
+  assert.equal((await invoiceRows(cloned.newId!)).length, 0)
+  assert.equal(await s.db.orderAllocation.count({ where: { orderId: cloned.newId! } }), 0)
+})
+
+test('SO-H2: the reconciliation also refuses a stored order whose amounts are net but flagged gross, and lets every consistent order through', async () => {
+  const { updateSalesOrderStatus } = await import('@/app/actions/sales')
+  const mk = (flag: boolean, unit: string, total: string) => s.db.salesOrder.create({
+    data: {
+      orderNumber: `REC-${++seq}`, customerName: 'Rec', currency: 'GBP', fxRateToBase: 1, status: 'DRAFT', pricesIncludeVat: flag, taxRateName: 'AUD Sales 20', taxRatePercent: '0.2',
+      subtotalForeign: '100', taxForeign: '20', totalForeign: total, subtotalBase: '100', taxBase: '20', totalBase: total,
+      lines: { create: [{ productId, sku: 'AUD-1', description: 'x', qty: 1, unitPriceForeign: unit, unitPriceBase: unit, taxForeign: '20', taxBase: '20', totalForeign: '100', totalBase: '100', taxRateId: vat20Id }] },
+    } as never,
+    select: { id: true },
+  })
+  const bad = await mk(true, '100', '120') // net 100 stored under a gross flag: the invoice would book 100
+  const refused = await updateSalesOrderStatus(bad.id, 'PENDING_PAYMENT')
+  assert.equal(refused.success, false)
+  assert.match(String(refused.error), /would total 100\.00 GBP but the order totals 120\.00 GBP/)
+  assert.equal((await s.db.salesOrder.findUniqueOrThrow({ where: { id: bad.id } })).status, 'DRAFT')
+  for (const [flag, unit] of [[true, '120'], [false, '100']] as const) {
+    const good = await mk(flag, unit, '120')
+    const ok = await updateSalesOrderStatus(good.id, 'PENDING_PAYMENT')
+    assert.equal(ok.success, true, `${flag}: ${ok.error}`)
+    assert.equal((await invoiceRows(good.id)).length, 1)
+  }
+})
+
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // 3. A bill edited before its first posting
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -306,5 +353,39 @@ test('PO-H3: an edit that would put a retired tax code into the unsent first pos
     assert.equal(Number((await s.db.purchaseInvoice.findUniqueOrThrow({ where: { id: invoice.id } })).subtotalForeign), 120)
   } finally {
     await s.db.setting.deleteMany({ where: { key: 'tax_rekey_retired_codes' } })
+  }
+})
+
+// ---- legacy create rows (keyed to the purchase order, naming no bill)
+async function legacyKeyed(invoiceId: string, poId: string) {
+  const [row] = await createRows(invoiceId)
+  await s.db.accountingSyncLog.update({ where: { id: row!.id }, data: { referenceType: 'PurchaseOrder', referenceId: poId } })
+  return row!.id
+}
+const legacyRowPayload = (id: string) => s.db.accountingSyncLog.findUniqueOrThrow({ where: { id }, select: { payload: true, referenceType: true } })
+
+// [mutation: skip the legacy lookup in refreshPendingPurchaseInvoiceCreate]
+test('PO-H3: a LEGACY purchase-order-keyed create row that is this bill\'s and unsent carries the edit; one that may have left refuses it', async () => {
+  const { updateInvoice } = await import('@/app/actions/purchase-orders')
+  const edit = (invoice: { id: string; lines: Array<{ id: string }> }) => updateInvoice(invoice.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-1', lines: [{ id: invoice.lines[0]!.id, qtyBilled: 10, unitCostForeign: 10 }] } as never)
+  {
+    const { poId, invoice } = await seedBill()
+    const rowId = await legacyKeyed(invoice.id, poId)
+    const r = await edit(invoice)
+    assert.equal(r.success, true, r.error)
+    const row = await legacyRowPayload(rowId)
+    assert.equal(row.referenceType, 'PurchaseOrder')
+    assert.equal((row.payload as BillPayload).lines.reduce((t, l) => t + l.quantity * l.unitAmount, 0), 100, 'the legacy row now carries 100')
+    assert.equal(await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_INVOICE_UPDATE', referenceId: poId } }), 0)
+  }
+  {
+    const { poId, invoice } = await seedBill()
+    const rowId = await legacyKeyed(invoice.id, poId)
+    await s.db.accountingSyncLog.update({ where: { id: rowId }, data: { status: 'PROCESSING' } })
+    const r = await edit(invoice)
+    assert.equal(r.success, false)
+    assert.match(String(r.error), /Nothing was saved/)
+    assert.equal(Number((await s.db.purchaseInvoice.findUniqueOrThrow({ where: { id: invoice.id } })).subtotalForeign), 120)
+    assert.equal((await legacyRowPayload(rowId) as unknown as { payload: BillPayload }).payload.lines.reduce((t, l) => t + l.quantity * l.unitAmount, 0), 120)
   }
 })

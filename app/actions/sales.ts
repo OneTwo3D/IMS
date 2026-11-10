@@ -124,6 +124,7 @@ import {
   expectedSalesOrderLineTaxForeign,
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
+import { SalesInvoiceDoesNotReconcileError, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
 import {
   INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
   STORED_INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
@@ -1368,7 +1369,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
  * invoice id, IMS cannot mutate that accounting document through this create
  * queue; attempts are logged so post-push changes are not silently dropped.
  */
-async function queueSalesInvoiceForOrder(id: string): Promise<void> {
+async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boolean }): Promise<void> {
   const so = await db.salesOrder.findUnique({
     where: { id },
     select: {
@@ -1385,6 +1386,7 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       taxRatePercent: true,
       pricesIncludeVat: true,
       discountAmount: true,
+      totalForeign: true,
       accountingInvoiceId: true,
       // o3d-j625 r3 (Codex HIGH 2): and whose invoice it is, for the UPDATE arm below — the id survives a
       // connector switch and the chart cannot speak for it.
@@ -1399,6 +1401,7 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
           unitPriceForeign: true,
           discountAmount: true,
           totalForeign: true,
+          taxForeign: true,
           taxRateId: true,
           taxRate: {
             select: {
@@ -1417,7 +1420,7 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
   const settings = await getAccountingSettings()
   if (!settings.syncEnabled) return
   const multiComponentRateNames = multiComponentTaxRateNames(so.lines)
-  if (multiComponentRateNames.length > 0) {
+  if (multiComponentRateNames.length > 0 && !options?.checkOnly) {
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: so.id,
@@ -1513,6 +1516,17 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
     ...rateBinding(orderDefaultRate?.id, 'plain', 'discount'),
     lineAmountsIncludeTax,
   }
+
+  // The invoice must book to the order's own total (lib/domain/sales/sales-invoice-reconciliation.ts): refused here rather than queued.
+  const reconciliation = invoiceReconciliationProblem({
+    lineAmountsIncludeTax,
+    headerRate: vatPct,
+    lines: payload.lines.map((l, idx) => ({ quantity: l.quantity, unitAmount: l.unitAmount, discountAmount: l.discountAmount, storedTax: Number(so.lines[idx]?.taxForeign ?? 0) })),
+    shippingAmount: payload.shippingAmount,
+    discountAmount: payload.discountAmount,
+  }, Number(so.totalForeign))
+  if (reconciliation) throw new SalesInvoiceDoesNotReconcileError(reconciliation, so.currency)
+  if (options?.checkOnly) return
 
   if (so.accountingInvoiceId) {
     const updatePayload = {
@@ -1716,6 +1730,16 @@ export async function applySalesOrderStatusTransition(
     })) {
       return { success: false, error: STORED_INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE }
     }
+    // The invoice that finalisation will queue is built and reconciled to the order's total BEFORE anything moves; a mismatch refuses the
+    // finalisation (any other failure of the dry build surfaces where the invoice is really queued, as it always did).
+    if (isDraftFinalization) {
+      try {
+        await queueSalesInvoiceForOrder(id, { checkOnly: true })
+      } catch (checkError) {
+        if (checkError instanceof SalesInvoiceDoesNotReconcileError) return { success: false, error: checkError.message }
+      }
+    }
+
 
     // o3d-zvec.15 / o3d-6ldlj: whether this transition owns the storefront status push (false for a WooCommerce-driven
     // transition, which would only echo). Decided before the transactions so the SHIPPED / CANCELLED / ON_HOLD
