@@ -142,7 +142,8 @@ test('the changed endpoint behaviour is stated in the docs block AND the changel
   assert.ok(block, 'precondition: the endpoint block is in the docs')
   for (const phrase of ['HTTP 412', '?allowWarnings=true', 'PARTIAL', 'FAILED', 'Changed behaviour', 'same instant']) assert.ok(block.body.includes(phrase), `docs block names ${phrase}`)
   const changelog = readFileSync(join(ROOT, 'CHANGELOG.md'), 'utf8')
-  const unreleased = changelog.slice(changelog.indexOf('## Unreleased'), changelog.indexOf('\n## ', changelog.indexOf('## Unreleased') + 5) === -1 ? undefined : changelog.indexOf('\n## ', changelog.indexOf('## Unreleased') + 5))
-  console.log(`precondition: changelog Unreleased section is ${unreleased.length} characters`)
+  // The text since 2.0.0: it sits under "## Unreleased" until a release is cut, then under that release's heading.
+  const unreleased = changelog.slice(changelog.indexOf('## Unreleased'), changelog.indexOf('\n## 2.0.0'))
+  console.log(`precondition: changelog section since 2.0.0 is ${unreleased.length} characters`)
   for (const phrase of ['/api/admin/rollout-readiness', 'PARTIAL', 'BLOCKS', '412', 'allowWarnings=true']) assert.ok(unreleased.includes(phrase), `changelog names ${phrase}`)
 })
