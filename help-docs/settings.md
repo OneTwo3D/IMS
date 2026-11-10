@@ -145,7 +145,7 @@ The page has four tabs: **Financial Year**, **Tax**, **Currencies** and **FX Rat
 - **VAT rates** (Tax tab) — manage VAT rate profiles (see below)
 - **Currencies** (Currencies tab) — add and manage the currencies you trade in. The base currency cannot be removed.
 - **FX Rates** (FX Rates tab) — the current exchange rate per currency (pin a **manual override** with the pencil icon, clear it to go back to the fetched rate), the log of recent pushes to the store, and an **Integration health** card (last fetch, last fetch attempt, last WooCommerce push, currencies under manual override, and a **Probe helper plugin** button that checks the onetwoInventory Helper plugin is reachable).
-- **Exchange-rate source** (FX Rates tab) — `ECB (frankfurter)` is the default and what you should leave selected: IMS fetches the daily European Central Bank rates and may push them to the store. An `Aelia` option (read the rates from the store's currency switcher instead) exists on the same card but is **not yet switched on**: it needs the onetwoInventory Helper plugin 1.3.0 or later deployed on the store first and the owner's go-ahead, so do not choose it until you are told to. The card asks you to confirm before it switches.
+- **Exchange-rate source** (FX Rates tab) — `ECB (frankfurter)` is the default and what you should leave selected: IMS fetches the daily European Central Bank rates for its own use. It does not push them to the store: helper plugin 1.3.0 refuses rate pushes, and the store's currency switcher owns the storefront rates. An `Aelia` option (read the rates from the store's currency switcher instead) exists on the same card but is **not yet switched on**: it needs the onetwoInventory Helper plugin 1.3.0 or later deployed on the store first and the owner's go-ahead, so do not choose it until you are told to. The card asks you to confirm before it switches.
 - **FX rate schedule** (Currencies tab) — shows when rates were last updated and has the **Update Now** button for an immediate update. Whether the automatic update runs, and when, is set on the **FX Rate Update** job in **Settings > System > Scheduler** (daily at 07:00 by default).
 - **Reverse-charge accounting tax types** — connector-specific tax codes that IMS swaps in for any line whose `TaxRate.reverseCharge` is true. Configure `accounting_reverse_charge_sales_tax_type` (typical Xero: `ECOUTPUTSERVICES`) and `accounting_reverse_charge_purchase_tax_type` (typical Xero: `REVERSECHARGES`). Empty values disable the swap — the line posts with the parent `TaxRate.accountingTaxType` and is not flagged as reverse-charge on the VAT return.
 
@@ -455,7 +455,7 @@ Defaults are what the Scheduler shows until you change them. "On" means switched
 | `/api/cron/email-outbox` | Send queued emails | Hourly | Not in the Scheduler list; schedule it from the server's own cron |
 | `/api/cron/hs-classify` | Background HS-code classification sweep | Every 15-30 min | Not in the Scheduler list; schedule it from the server's own cron |
 
-The Mintsoft and WMS jobs are explained on [Warehouse (Mintsoft)](warehouse-mintsoft.md); the push, status and reconcile jobs only matter once you have bound a warehouse to the WMS.
+The Mintsoft and WMS jobs are explained on [Warehouse (Mintsoft)](warehouse.md); the push, status and reconcile jobs only matter once you have bound a warehouse to the WMS.
 
 ### Cron rate limits
 

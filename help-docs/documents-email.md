@@ -228,6 +228,6 @@ Administrators get in-app notifications (the bell in the top bar; see [Getting S
 - **Invariant warnings need attention** — the daily integrity check tells admins about a short list of standing problems, but **only when one newly appears or its count rises** since the previous complete run, so you are not told the same thing every day. The list: stock above the remaining cost layers (unlayered stock), goods stranded in transit, an accounting posting that failed and is held, a refund whose credit note has not reached the ledger, a refund whose stock or revenue reversal has not reached the ledger, and a refund that still owes accounting and has to be decided by hand. Critical findings always notify. If the check hits its row limit, a separate **Invariant report was truncated** notice says the warnings were not evaluated that run.
 - **A paid WooCommerce order that IMS cannot match** — after 60 retries the administrators are notified (see [WooCommerce](woocommerce.md)).
 - **Pending exchange-rate orders** — an admin notification when more than 5 WooCommerce orders are queued waiting for an exchange rate.
-- **Warehouse stock differences** when Mintsoft stock sync is in notification-only mode (see [Warehouse (Mintsoft)](warehouse-mintsoft.md)).
+- **Warehouse stock differences** when Mintsoft stock sync is in notification-only mode (see [Warehouse (Mintsoft)](warehouse.md)).
 
 Individual problems are also written to the **Activity** log, and failed postings and held deliveries are listed under **Sync > Exceptions**.

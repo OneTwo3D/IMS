@@ -91,7 +91,7 @@ If you use Xero for accounting:
 
 ### Warehouse (WMS)
 
-If you use a warehouse management connector (Mintsoft), switch it on and enter its connection details (**Base URL**, **Username**, **Password**, **Webhook Secret**, and an **Order Lookup Connector** if you also run WooCommerce), then **Save & Test Connection**; the save runs a live test so the gate is satisfied at once. Only one WMS connector can be on at a time. Warehouse bindings, courier mapping and the order push are set up after the wizard: see [Warehouse (Mintsoft)](warehouse-mintsoft.md).
+If you use a warehouse management connector (Mintsoft), switch it on and enter its connection details (**Base URL**, **Username**, **Password**, **Webhook Secret**, and an **Order Lookup Connector** if you also run WooCommerce), then **Save & Test Connection**; the save runs a live test so the gate is satisfied at once. Only one WMS connector can be on at a time. Warehouse bindings, courier mapping and the order push are set up after the wizard: see [Warehouse (Mintsoft)](warehouse.md).
 
 The step ends with a **Production readiness** reminder: set the server's `CRON_SECRET`, apply the scheduler settings, and set up backups with a remote target (see below).
 

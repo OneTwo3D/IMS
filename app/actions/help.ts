@@ -22,7 +22,7 @@ const HELP_DOCS = [
   { slug: 'purchasing', title: 'Purchasing' },
   { slug: 'sales', title: 'Sales Orders' },
   { slug: 'manufacturing', title: 'Manufacturing' },
-  { slug: 'warehouse-mintsoft', title: 'Warehouse (Mintsoft)' },
+  { slug: 'warehouse', title: 'Warehouse' },
   { slug: 'analytics', title: 'Analytics & Reports' },
   { slug: 'settings', title: 'Settings' },
   { slug: 'user-management', title: 'User Management & Security' },

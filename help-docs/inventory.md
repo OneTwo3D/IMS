@@ -339,7 +339,7 @@ Before a product is pushed to the warehouse (Mintsoft), its HS code is checked: 
 - an open **INVALID_HS_CODE** discrepancy is raised for the product, with a message saying the code is not a declarable 2026 CN8;
 - the discrepancy clears itself the next time the product syncs with a valid code.
 
-Fix it by correcting the code on the product (or by approving a valid proposal, below). See [Warehouse (Mintsoft)](warehouse-mintsoft.md).
+Fix it by correcting the code on the product (or by approving a valid proposal, below). See [Warehouse (Mintsoft)](warehouse.md).
 
 ### HS Code Review
 

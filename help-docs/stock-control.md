@@ -63,7 +63,7 @@ Posting is a two-step check so a count is never booked against stock that has si
 1. **Reconcile** stamps, for every counted line, the on-hand figure the count is being reconciled against and refreshes the line's book quantity and variance to it. Nothing is booked.
 2. **Authorise and post variances** re-reads on-hand under the stock lock. If any counted product's on-hand is no longer the figure it was reconciled against (a receipt landed, an order shipped, the warehouse stock sync ran), or the line was never reconciled, or its counted figure changed after the reconcile, nothing is posted. A table lists each affected product with its earlier on-hand (or "not reconciled"), current on-hand, counted quantity and revised variance, and your counts are kept. Reconcile again to accept the current figures, then authorise again, or investigate first.
 
-Counts under a warehouse that mirrors the warehouse system in **Align To WMS** mode are blocked, because the stock sync would overwrite them. A warehouse in notification-only mode asks you to confirm ("Post anyway?") before posting. See [Warehouse (Mintsoft)](warehouse-mintsoft.md).
+Counts under a warehouse that mirrors the warehouse system in **Align To WMS** mode are blocked, because the stock sync would overwrite them. A warehouse in notification-only mode asks you to confirm ("Post anyway?") before posting. See [Warehouse (Mintsoft)](warehouse.md).
 
 ## Warehouse Transfers
 
@@ -100,7 +100,7 @@ An in-transit transfer has two ways to receive:
 - **Mark Received** books everything still outstanding into the destination warehouse and completes the transfer.
 - **Receive Partial** opens a dialog listing each line's **Remaining** quantity, with a **Receive now** box for each (it starts at the full remaining amount). Enter what has physically arrived and click **Receive selected**. You cannot receive more than remains on a line, and at least one line needs a quantity. The transfer **stays in transit** until every line is fully received, and the **Received** column on each line shows progress. Use this when a shipment arrives in parts.
 
-Stock the warehouse system has already brought in (through its stock sync) counts as arrived, so a transfer it has fully accounted for shows nothing outstanding. An in-transit transfer also has a button to create the warehouse's goods-in notice (ASN) where a warehouse integration is connected; see [Warehouse (Mintsoft)](warehouse-mintsoft.md).
+Stock the warehouse system has already brought in (through its stock sync) counts as arrived, so a transfer it has fully accounted for shows nothing outstanding. An in-transit transfer also has a button to create the warehouse's goods-in notice (ASN) where a warehouse integration is connected; see [Warehouse (Mintsoft)](warehouse.md).
 
 ### Cancelling
 

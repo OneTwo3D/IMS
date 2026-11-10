@@ -361,7 +361,7 @@ The **Products** tab controls bidirectional product synchronisation.
 - **Categories** — the WC product-category tree is mirrored into IMS. Each WC category becomes an IMS reporting category with its WC parent chain preserved (so `Apparel > T-Shirts > V-Neck` arrives as a 3-level path). If the store marks a **primary category** (the SEO plugins Yoast and Rank Math record one), the product is linked to that category, provided it is one of the product's own categories and has been mirrored; otherwise it is linked to its **deepest** WC category. Variations take the category of their parent product. The mirror is cached for 5 minutes so per-product webhooks do not re-fetch the whole tree. If the WC categories endpoint is unreachable — or the category list cannot be read to its end — the product's existing category link is left alone rather than wiped or linked to a partial tree.
 - Variable products: all variations are synced as child VARIANT products linked to the parent
 
-**Product content.** The short description, the long description and the pictures are kept in a separate hub copy beside each product (one row per product or variation), as plain text and as picture *references* — an address, the picture's WooCommerce id and last-modified stamp, and a checksum of the reference; the picture bytes are never copied. A re-import of unchanged content writes nothing, and a change is detected field by field. **A field WooCommerce sends empty is kept, not cleared**, so an emptied description in the store does not erase the copy IMS holds (the same rule as the trade fields); removing a description on purpose has to be done in IMS's copy once the editing screen exists. A WooCommerce variation has only a description and one picture, so its short description stays empty. From the hub copy the content goes on to Mintsoft; see [Warehouse (Mintsoft)](warehouse-mintsoft.md).
+**Product content.** The short description, the long description and the pictures are kept in a separate hub copy beside each product (one row per product or variation), as plain text and as picture *references* — an address, the picture's WooCommerce id and last-modified stamp, and a checksum of the reference; the picture bytes are never copied. A re-import of unchanged content writes nothing, and a change is detected field by field. **A field WooCommerce sends empty is kept, not cleared**, so an emptied description in the store does not erase the copy IMS holds (the same rule as the trade fields); removing a description on purpose has to be done in IMS's copy once the editing screen exists. A WooCommerce variation has only a description and one picture, so its short description stays empty. From the hub copy the content goes on to Mintsoft; see [Warehouse (Mintsoft)](warehouse.md).
 
 - Variation attributes are synced for the options panel
 
@@ -658,15 +658,15 @@ Owner ruling 2026-10-26: Aelia, the WooCommerce currency switcher, is the exchan
 2. In WordPress admin, go to **Plugins → Add New → Upload Plugin**, choose the zip, and click **Install Now**.
 3. Activate the plugin.
 4. In WordPress admin go to **Settings → onetwoInventory** and paste the same shared secret used for WC webhooks (visible in the IMS Sync → WooCommerce → Orders tab).
-5. Back in IMS, on the same Connection page, tick **Push FX rates daily** and click **Push Now** to verify connectivity (not applicable while the FX source is Aelia: Aelia is read instead, see above).
+5. Back in IMS, on the same Connection page, click **Check helper plugin** to verify the connection. Do not rely on **Push FX rates daily** or **Push Now**: helper plugin 1.3.0 refuses every rate push (see above), so they only record a skipped row.
 
 ### Aelia Currency Switcher
 
-If you use Aelia, you do not need to register a custom rate provider — the helper plugin's filter takes effect automatically as soon as IMS has pushed at least one set of rates. Aelia's transient cache is invalidated on each push so new rates take effect immediately. Aelia per-currency markups still apply on top of the IMS rate; only the *base* rate is overridden. (With the Aelia FX source the direction is reversed: Aelia's own pre-markup rate is read into IMS and IMS pushes nothing.)
+The store (Aelia) owns the exchange rates. IMS cannot push rates to the store: helper plugin 1.3.0 refuses every push and no longer overrides Aelia's rate, so Aelia's own rates and markups apply on the storefront exactly as you set them in Aelia. Reading Aelia's rates into IMS is built but **not yet switched on** (the Exchange-rate source setting stays on ECB until you are told otherwise); until then IMS takes its rates from the daily ECB fetch.
 
 ### Other multi-currency plugins
 
-The helper plugin only ships with the Aelia filter today. If you use a different multi-currency plugin (CURCY, WPML, etc.) the rates are still stored in WP options and exposed via `get_option('oti_fx_rates')` — write a small adapter in your theme's `functions.php` to feed them into your plugin's rate model.
+Helper plugin 1.3.0 does not feed exchange rates to any currency plugin on the store, so no adapter is needed or possible. Set rates in your multi-currency plugin (Aelia, CURCY and so on) as usual; IMS does not write to them.
 
 ## Sync Log
 

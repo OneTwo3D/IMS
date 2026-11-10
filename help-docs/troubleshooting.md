@@ -164,7 +164,7 @@ When something goes wrong, three places hold the information you need:
 - For an invoice or bill, a zero or null rate leaves `CurrencyRate` off and Xero applies its daily rate (logged as a fallback case); ensure the order had a valid rate at creation time. A refund or credit note does not do this: a foreign order with no usable stored rate is refused by name (nothing is created at 1). Correct the order's exchange rate and retry. A payment, or a month-end revaluation, with no `fx_rates` row for its date is refused or skipped by name: get the rate with **Update Now** (Settings > Accounting > Currencies) or pin one on **Settings > Accounting > FX Rates**.
 
 ### Mintsoft webhook signature mismatch
-- The shared secret must match between IMS and Mintsoft. Re-paste it from Integrations > Mintsoft (see [Warehouse (Mintsoft)](warehouse-mintsoft.md)).
+- The shared secret must match between IMS and Mintsoft. Re-paste it from Integrations > Mintsoft (see [Warehouse (Mintsoft)](warehouse.md)).
 - Mintsoft webhook signatures bind the freshness timestamp into the HMAC; body-only signatures are rejected.
 
 

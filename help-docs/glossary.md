@@ -163,7 +163,7 @@ The button on Settings > System > Scheduler that writes the schedule to the serv
 A "Confirm it's you" prompt shown before a sensitive action when you have not signed in recently.
 
 **ASN — Advance Shipping Notice**
-A document that tells the warehouse what stock to expect from a supplier and when. Used in the WMS integration to reconcile booked-in stock against expected. See [Warehouse (Mintsoft)](warehouse-mintsoft.md).
+A document that tells the warehouse what stock to expect from a supplier and when. Used in the WMS integration to reconcile booked-in stock against expected. See [Warehouse (Mintsoft)](warehouse.md).
 
 
 ## Security
