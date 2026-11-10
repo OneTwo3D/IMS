@@ -272,7 +272,12 @@ export function evaluateEuVatPreflight(input: PreflightInput): PreflightResult {
     const carriers = salesByCode.get(code) ?? []
     if (carriers.length > 1) {
       const undeclared = carriers.filter((r) => !declaredImsIds.has(r.id)).map((r) => `"${r.name}"`)
-      add('XERO_TYPE_ON_TWO_IMS_RATES', null, `Xero type ${code}`, `${carriers.length} IMS rates${undeclared.length > 0 ? `, undeclared: ${undeclared.join(', ')}` : ''}`)
+      const detail = `${carriers.length} IMS rates${undeclared.length > 0 ? `, undeclared: ${undeclared.join(', ')}` : ''}`
+      add('XERO_TYPE_ON_TWO_IMS_RATES', null, `Xero type ${code}`, detail)
+      // ALSO on every declared rate that carries the type, so the plan skips each of them (and the dry run lists them as skipped) rather than writing through a duplicated Xero type.
+      for (const r of resolved) {
+        if (r.ims !== null && (r.ims.accountingTaxType ?? '').trim() === code) add('XERO_TYPE_ON_TWO_IMS_RATES', r.rate.wooId, `Woo ${r.rate.wooId} ${r.rate.country || '(no country)'} "${r.rate.wooName}"`, detail)
+      }
     }
   }
 

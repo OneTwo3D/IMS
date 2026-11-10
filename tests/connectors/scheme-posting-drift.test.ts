@@ -16,7 +16,8 @@ const rate = (wooId: number, over: Partial<SchemeDriftRate> = {}): SchemeDriftRa
   const r = seed.rates.find((x) => x.wooId === wooId)!
   return { taxRateId: `r${wooId}`, name: r.imsName, active: true, accountingTaxType: r.accountingTaxType ?? `C${wooId}`, reportingCategory: r.reportingCategory, schemePostingTaxType: r.schemePostingTaxType, ...over }
 }
-const XERO = [xeroType('TAX131', 'DE IOSS VAT', '0.0000'), xeroType('TAX122', 'NO VOEC VAT', '0.0000'), xeroType('TAX999', 'XX IOSS VAT', '0.0000')]
+const CHARGED = [xeroType('C220', 'DE VAT', '19.0000'), xeroType('TAX124', 'NO VAT', '25.0000'), xeroType('OUTPUT2', 'GB VAT (Income)', '20.0000')]
+const XERO = [xeroType('TAX131', 'DE IOSS VAT', '0.0000'), xeroType('TAX122', 'NO VOEC VAT', '0.0000'), xeroType('TAX999', 'XX IOSS VAT', '0.0000'), ...CHARGED]
 const run = (rates: SchemeDriftRate[], xero = XERO, over: { storeIdentity?: string | null; mappings?: SchemeDriftMapping[] } = {}): string[] => computeSchemePostingDrift({
   declared, mappings: over.mappings ?? [mapping(220), mapping(239), mapping(112)], rates, storeIdentity: over.storeIdentity === undefined ? STORE : over.storeIdentity, xero,
 }).flatMap((d) => d.lines)
@@ -47,13 +48,13 @@ test('IOSS turned into VOEC (or the reverse, or cleared) is drift; a marker on a
 
 test('the declared type itself drifting in Xero is reported by code: gone, not ACTIVE, not 0, no rate, renamed; and on the charged code', () => {
   const lines = (xero: ReturnType<typeof xeroType>[], rates = good()): string => run(rates, xero).join(' | ')
-  assert.match(lines([XERO[1]!]), /TAX131 is not in the Xero tax-rate list/)
-  assert.match(lines([xeroType('TAX131', 'DE IOSS VAT', '0.0000', 'ARCHIVED'), XERO[1]!]), /ARCHIVED in Xero, not ACTIVE/)
-  assert.match(lines([{ ...xeroType('TAX131', 'DE IOSS VAT', '0.0000'), canApply: { assets: false, equity: false, expenses: true, liabilities: false, revenue: false } }, XERO[1]!]), /cannot be applied to revenue in Xero/)
-  assert.match(lines([{ ...xeroType('TAX131', 'DE IOSS VAT', '0.0000'), canApply: { assets: null, equity: null, expenses: null, liabilities: null, revenue: null } }, XERO[1]!]), /cannot be applied to revenue in Xero/)
-  assert.match(lines([xeroType('TAX131', 'DE IOSS VAT', '19.0000'), XERO[1]!]), /19% in Xero, not 0%/)
-  assert.match(lines([{ ...xeroType('TAX131', 'DE IOSS VAT', '0.0000'), effectiveRate: null, displayTaxRate: null }, XERO[1]!]), /states no rate/)
-  assert.match(lines([xeroType('TAX131', 'DE IOSS  VAT', '0.0000'), XERO[1]!]), /named "DE IOSS  VAT" in Xero, declared "DE IOSS VAT"/)
+  assert.match(lines(XERO.filter((x) => x.taxType !== 'TAX131')), /TAX131 is not in the Xero tax-rate list/)
+  assert.match(lines([xeroType('TAX131', 'DE IOSS VAT', '0.0000', 'ARCHIVED'), ...XERO.filter((x) => x.taxType !== 'TAX131')]), /ARCHIVED in Xero, not ACTIVE/)
+  assert.match(lines([{ ...xeroType('TAX131', 'DE IOSS VAT', '0.0000'), canApply: { assets: false, equity: false, expenses: true, liabilities: false, revenue: false } }, ...XERO.filter((x) => x.taxType !== 'TAX131')]), /cannot be applied to revenue in Xero/)
+  assert.match(lines([{ ...xeroType('TAX131', 'DE IOSS VAT', '0.0000'), canApply: { assets: null, equity: null, expenses: null, liabilities: null, revenue: null } }, ...XERO.filter((x) => x.taxType !== 'TAX131')]), /cannot be applied to revenue in Xero/)
+  assert.match(lines([xeroType('TAX131', 'DE IOSS VAT', '19.0000'), ...XERO.filter((x) => x.taxType !== 'TAX131')]), /19% in Xero, not 0%/)
+  assert.match(lines([{ ...xeroType('TAX131', 'DE IOSS VAT', '0.0000'), effectiveRate: null, displayTaxRate: null }, ...XERO.filter((x) => x.taxType !== 'TAX131')]), /states no rate/)
+  assert.match(lines([xeroType('TAX131', 'DE IOSS  VAT', '0.0000'), ...XERO.filter((x) => x.taxType !== 'TAX131')]), /named "DE IOSS  VAT" in Xero, declared "DE IOSS VAT"/)
   assert.match(lines(XERO, [rate(220, { accountingTaxType: 'TAX131' }), rate(239), rate(112)]), /post on the charged rate/)
 })
 
@@ -133,4 +134,21 @@ test('an undeclared WooCommerce rate mapped to a declared rate, or a declared on
   const other = computeSchemePostingDrift({ declared, mappings: [mapping(220), mapping(239), mapping(112, { taxRateId: 'r220' })], rates: good(), storeIdentity: STORE, xero: XERO }).flatMap((d) => d.lines)
   assert.match(other.join(' | '), /Woo rate 112 is mapped to this rate but the declaration declares it as another Xero rate/)
   assert.deepEqual(run(good()), [], 'control: the declared mappings alone are clean')
+})
+
+test('the CHARGED code of each declared rate is judged against its declared Xero type: code, existence, status, name, percentage and revenue use (no components needed)', () => {
+  const lines = (xero: ReturnType<typeof xeroType>[], rates = good()): string => run(rates, xero).join(' | ')
+  const without = (code: string) => XERO.filter((x) => x.taxType !== code)
+  assert.deepEqual(run(good()), [], 'control')
+  assert.match(lines(XERO, [rate(220, { accountingTaxType: 'OTHER' }), rate(239), rate(112)]), /Charged tax type is OTHER, declared C220 for Woo rate 220/, 'declared by name, resolved from the list')
+  assert.match(lines(XERO, [rate(220), rate(239, { accountingTaxType: 'TAX001' }), rate(112)]), /Charged tax type is TAX001, declared TAX124 for Woo rate 239/, 'a declared code')
+  assert.match(lines(XERO, [rate(220), rate(239, { accountingTaxType: null }), rate(112)]), /Charged tax type is not set, declared TAX124/)
+  assert.match(lines(without('TAX124')), /Charged tax type TAX124 is not in the Xero tax-rate list/)
+  assert.match(lines([...without('TAX124'), xeroType('TAX124', 'NO VAT', '25.0000', 'ARCHIVED')]), /Charged tax type TAX124 is ARCHIVED in Xero, not ACTIVE/)
+  assert.match(lines([...without('TAX124'), xeroType('TAX124', 'No VAT', '25.0000')]), /Charged tax type TAX124 is named "No VAT" in Xero, declared "NO VAT"/)
+  assert.match(lines([...without('TAX124'), xeroType('TAX124', 'NO VAT', '20.0000')]), /Charged tax type TAX124 is 20% in Xero, declared 25%/)
+  assert.match(lines([...without('TAX124'), { ...xeroType('TAX124', 'NO VAT', '25.0000'), effectiveRate: null, displayTaxRate: null }]), /is unstated in Xero, declared 25%/)
+  assert.match(lines([...without('TAX124'), { ...xeroType('TAX124', 'NO VAT', '25.0000'), canApply: { assets: false, equity: false, expenses: true, liabilities: false, revenue: false } }]), /Charged tax type TAX124 cannot be applied to revenue in Xero/)
+  assert.match(lines([...XERO, xeroType('C220B', 'DE VAT', '19.0000')]), /No single ACTIVE Xero type is named "DE VAT" \(2 found\)/)
+  assert.match(lines(without('C220')), /No single ACTIVE Xero type is named "DE VAT" \(0 found\)/)
 })

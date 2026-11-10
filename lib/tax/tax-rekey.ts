@@ -600,7 +600,9 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
     const fresh = await tx.taxRate.create({
       data: {
         name: old.name, rate: old.rate, type: old.type, taxCategory: old.taxCategory, usedFor: old.usedFor, accountingTaxType: toCode, countryCode: old.countryCode,
-        isCompound: old.isCompound, reverseCharge: old.reverseCharge, reportingCategory: old.reportingCategory, schemePostingTaxType: old.schemePostingTaxType, active: true, isDefault: old.isDefault,
+        isCompound: old.isCompound, reverseCharge: old.reverseCharge, // A CLEAR replacement has NO tax code, and the scheme posting type is the same organisation's code (and IOSS/VOEC means something only with that type): it carries neither.
+        reportingCategory: row.outcome === 'CLEAR' && ['IOSS', 'VOEC'].includes((old.reportingCategory ?? '').trim().toUpperCase()) ? null : old.reportingCategory,
+        schemePostingTaxType: row.outcome === 'CLEAR' ? null : old.schemePostingTaxType, active: true, isDefault: old.isDefault,
         components: old.components.length === 0 ? undefined : {
           create: old.components.map((c) => ({ name: c.name, rate: c.rate, compoundOnPrevious: c.compoundOnPrevious, accountingTaxType: row.outcome === 'CLEAR' ? null : row.clearedComponents.some((x) => x.sortOrder === c.sortOrder && x.taxType === c.accountingTaxType) ? null : c.accountingTaxType, sortOrder: c.sortOrder, active: c.active })),
         },

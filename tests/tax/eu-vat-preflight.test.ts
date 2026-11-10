@@ -292,3 +292,18 @@ test('an UNDECLARED active IMS sales rate on a declared Xero type is a second IM
   const result = evaluateEuVatPreflight(withWorld(extra('ZERORATEDOUTPUT')))
   assert.equal(result.status === 'checked' && result.findings.find((f) => f.code === 'XERO_TYPE_ON_TWO_IMS_RATES')?.detail, '2 IMS rates, undeclared: "Stray rate"')
 })
+
+test('XERO_TYPE_ON_TWO_IMS_RATES is attached to every declared rate carrying the type, so the plan skips each and the dry run lists them', () => {
+  const clear = (w: World): void => { for (const [id, r] of w.ims) w.ims.set(id, { ...r, schemePostingTaxType: null, reportingCategory: null }) }
+  const dup = (code: string) => (w: World): void => { clear(w); w.ims.set(9999, { id: 'ims-undeclared', name: 'Stray rate', rate: '0.1900', usedFor: 'SALES', active: true, reverseCharge: false, countryCode: 'DE', accountingTaxType: code, reportingCategory: null, schemePostingTaxType: null }) }
+  const plan = planEuVatSeedApply(withWorld(dup(syntheticChargedCode(220))))
+  assert.equal(plan.skipped.find((s) => s.wooId === 220)?.reason, 'XERO_TYPE_ON_TWO_IMS_RATES')
+  assert.equal(plan.changes.some((c) => c.wooId === 220), false)
+  assert.equal(plan.changes.some((c) => c.wooId === 239), true, 'rates on other types are still planned')
+  const shared = planEuVatSeedApply(withWorld((w) => { dup('ZERORATEDOUTPUT')(w); setIms(w, 139, { reportingCategory: 'IOSS' }) }))
+  assert.equal(shared.changes.some((c) => c.taxRateId === 'ims-139'), false, 'the shared rate is not written through a duplicated type')
+  assert.equal(shared.skipped.filter((s) => s.reason === 'XERO_TYPE_ON_TWO_IMS_RATES').length, 33)
+  const result = evaluateEuVatPreflight(withWorld(dup(syntheticChargedCode(220))))
+  assert.equal(result.status === 'checked' && result.findings.filter((f) => f.code === 'XERO_TYPE_ON_TWO_IMS_RATES' && f.wooId === 220).length, 1)
+  assert.equal(result.status === 'checked' && result.findings.filter((f) => f.code === 'XERO_TYPE_ON_TWO_IMS_RATES' && f.wooId === null).length, 1, 'and the whole-configuration finding stays')
+})

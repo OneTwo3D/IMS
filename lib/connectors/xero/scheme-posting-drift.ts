@@ -54,6 +54,21 @@ export function computeSchemePostingDrift(input: {
     if (!rate.active) { issue(`${label}: its mapping names an inactive tax rate`); continue }
     // Only a rate named by a mapping that passed every check above counts as declared.
     named.add(rate.taxRateId)
+    // The CHARGED code against the declared Xero type: the IMS rate must carry the declared code (or, where the declaration leaves it to the live list, the one ACTIVE type of the declared name), and that type
+    // must still be ACTIVE, named and priced as declared and usable on sales. Judged for every declared rate, with or without active components (the by-name sweep never sees one without).
+    const chargedCode = (rate.accountingTaxType ?? '').trim()
+    const byName = declared.accountingTaxType === null && declared.accountingXeroName !== null ? input.xero.filter((x) => x.status === 'ACTIVE' && x.name === declared.accountingXeroName) : []
+    const expectedCharged = declared.accountingTaxType ?? (byName.length === 1 ? byName[0]!.taxType : null)
+    if (declared.accountingTaxType === null && declared.accountingXeroName !== null && byName.length !== 1) add(rate.taxRateId, `No single ACTIVE Xero type is named "${declared.accountingXeroName}" (${byName.length} found), so the charged code of Woo rate ${declared.wooId} cannot be confirmed`)
+    if (expectedCharged !== null && chargedCode !== expectedCharged) add(rate.taxRateId, `Charged tax type is ${chargedCode === '' ? 'not set' : chargedCode}, declared ${expectedCharged} for Woo rate ${declared.wooId}`)
+    const liveCharged = chargedCode === '' ? undefined : byType.get(chargedCode)
+    if (chargedCode !== '' && (liveCharged === undefined || liveCharged.status !== 'ACTIVE')) add(rate.taxRateId, `Charged tax type ${chargedCode} ${liveCharged === undefined ? 'is not in the Xero tax-rate list' : `is ${liveCharged.status} in Xero, not ACTIVE`}`)
+    else if (liveCharged !== undefined) {
+      if (declared.accountingXeroName !== null && liveCharged.name !== declared.accountingXeroName) add(rate.taxRateId, `Charged tax type ${chargedCode} is named "${liveCharged.name}" in Xero, declared "${declared.accountingXeroName}"`)
+      const chargedStated = liveCharged.effectiveRate ?? liveCharged.displayTaxRate
+      if (chargedStated === null || !new Prisma.Decimal(chargedStated).eq(new Prisma.Decimal(declared.ratePercent))) add(rate.taxRateId, `Charged tax type ${chargedCode} is ${chargedStated === null ? 'unstated' : `${Number(chargedStated)}%`} in Xero, declared ${Number(declared.ratePercent)}%`)
+      if (liveCharged.canApply.revenue !== true) add(rate.taxRateId, `Charged tax type ${chargedCode} cannot be applied to revenue in Xero`)
+    }
     const expectedType = declared.schemePostingTaxType
     if ((rate.schemePostingTaxType ?? null) !== expectedType) {
       add(rate.taxRateId, expectedType === null ? `Carries scheme posting type ${rate.schemePostingTaxType ?? ''}, but the declaration has none for Woo rate ${declared.wooId}` : `Scheme posting type is ${rate.schemePostingTaxType ?? 'not set'}, declared ${expectedType} for Woo rate ${declared.wooId}`)

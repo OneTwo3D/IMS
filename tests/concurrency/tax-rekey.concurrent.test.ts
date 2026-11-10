@@ -132,10 +132,10 @@ async function seedWorld(d: Deps, unresolved = false) {
   const { db } = d
   await wipeOwn(d)
   await seedXero(d)
-  const rate = async (key: string, name: string, fraction: string, oldCode: string, over: { usedFor?: string; isDefault?: boolean; components?: boolean } = {}) => {
+  const rate = async (key: string, name: string, fraction: string, oldCode: string, over: { usedFor?: string; isDefault?: boolean; components?: boolean; scheme?: boolean } = {}) => {
     const row = await db.taxRate.create({
       data: {
-        name: `${TAG}${name}`, rate: fraction, usedFor: over.usedFor ?? 'SALES', accountingTaxType: oldCode, countryCode: null, isDefault: over.isDefault ?? false, reportingCategory: 'EC_SALES', isCompound: false,
+        name: `${TAG}${name}`, rate: fraction, usedFor: over.usedFor ?? 'SALES', accountingTaxType: oldCode, countryCode: null, isDefault: over.isDefault ?? false, reportingCategory: over.scheme === true ? 'IOSS' : 'EC_SALES', schemePostingTaxType: over.scheme === true ? code('SCHEMETYPE') : null, isCompound: false,
         components: over.components === false ? undefined : { create: [{ name: 'VAT', rate: fraction, sortOrder: 0, accountingTaxType: key === 'cy' ? code('DEMO') : key === 'gr' ? 'OUTPUT2' : null }] },
       },
     })
@@ -150,7 +150,7 @@ async function seedWorld(d: Deps, unresolved = false) {
     ...(unresolved ? [
       await rate('amb', 'AMB VAT', '0.0500', code('OLD2')),
       await rate('pct', 'PCT VAT', '0.1200', code('OLD3')),
-      await rate('nope', 'NOPE VAT', '0.0700', code('OLD4')),
+      await rate('nope', 'NOPE VAT', '0.0700', code('OLD4'), { scheme: true }),
     ] : []),
   ]) as Record<'cy' | 'gr' | 'be' | 'bg' | 'amb' | 'pct' | 'nope', string>
   const supplier = async (name: string, taxRateId: string) => { const s = await db.supplier.create({ data: { name: `${TAG}${name}`, taxRateId } }); created.suppliers.push(s.id); return s.id }
@@ -887,6 +887,9 @@ test('NO PARTIAL APPLY: a rate with no resolved live type refuses the apply unle
   const oldNope = await db.taxRate.findUniqueOrThrow({ where: { id: w.ids.nope } })
   assert.deepEqual([oldNope.active, oldNope.accountingTaxType], [false, code('OLD4')])
   const newNope = await db.taxRate.findUniqueOrThrow({ where: { id: oldNope.replacedById! }, include: { components: true } })
+  // The scheme posting type is an organisation's code too: a CLEARED rate keeps neither it nor the scheme marker (it would otherwise post a zero-rated type under a charged rate that has no code).
+  assert.deepEqual([oldNope.schemePostingTaxType, oldNope.reportingCategory], [code('SCHEMETYPE'), 'IOSS'], 'precondition: the retired row keeps what it had')
+  assert.deepEqual([newNope.schemePostingTaxType, newNope.reportingCategory], [null, null], 'the CLEAR replacement carries no scheme posting type and no IOSS/VOEC marker')
   assert.deepEqual([newNope.active, newNope.accountingTaxType, newNope.name, newNope.rate.toFixed(4), newNope.components.every((c) => c.accountingTaxType === null)], [true, null, `${TAG}NOPE VAT`, '0.0700', true])
   assert.equal((await db.taxRate.findUniqueOrThrow({ where: { id: w.ids.cy } })).active, false)
 
