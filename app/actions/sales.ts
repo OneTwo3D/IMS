@@ -93,8 +93,10 @@ import {
 import { INTERNAL_STATUS_TRANSITION_BYPASS, INTERNAL_STATUS_TRANSITION_AUTH_ONLY } from '@/lib/sales/status-transition-bypass'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { creditNoteLineFacts } from '@/lib/domain/sales/credit-note-display'
+import { refundSafeguards } from '@/lib/domain/sales/refund-target-balances'
 import { decimalToNumber } from '@/lib/decimal'
-import { addMoney, compareDecimal, ledgerAmountEpsilon, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, compareDecimal, currencyMinorUnits, ledgerAmountEpsilon, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { validateManualSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import {
   buildRealisedFxJournal,
@@ -239,12 +241,17 @@ export type SoRow = {
   customerName: string | null
   customerEmail: string | null
   subtotalForeign: number
+  storeCreditForeign: number
   shippingService: string | null
   shippingForeign: number
   taxRateName: string | null
   taxRatePercent: number | null
   taxForeign: number
   pricesIncludeVat: boolean
+  /** Whether the stored unit prices and discounts include VAT (storedAmountsIncludeVat): a WooCommerce order is net whatever `pricesIncludeVat` says. */
+  amountsIncludeVat: boolean
+  /** Decimal places of the order's currency (the refund dialog's rounding unit). */
+  currencyMinorUnits: number
   totalForeign: number
   totalBase: number
   shipFromWarehouseId: string | null
@@ -296,6 +303,11 @@ export type SoDetail = SoRow & {
       unitPriceForeign: number
       totalForeign: number
       totalBase: number
+      lineKind: string | null
+      /** The net the credit note carries for this line (its base column on a base-currency order, else its foreign one). */
+      postedNet: number
+      /** The rate of the tax code the line posts under (its persisted snapshot), or null when that code cannot be priced. */
+      vatRate: number | null
     }[]
   }[]
   payments: PaymentRow[]
@@ -491,6 +503,7 @@ const SO_SELECT = {
   customerName: true,
   customerEmail: true,
   subtotalForeign: true,
+  storeCreditForeign: true,
   shippingService: true,
   shippingForeign: true,
   taxRateName: true,
@@ -553,6 +566,7 @@ function mapSoRow(so: {
   customerName: string | null
   customerEmail: string | null
   subtotalForeign: unknown
+  storeCreditForeign: unknown
   shippingService: string | null
   shippingForeign: unknown
   taxRateName: string | null
@@ -652,12 +666,16 @@ function mapSoRow(so: {
     customerName: so.customerName,
     customerEmail: so.customerEmail,
     subtotalForeign: Number(so.subtotalForeign),
+    storeCreditForeign: Number(so.storeCreditForeign ?? 0),
     shippingService: so.shippingService,
     shippingForeign: Number(so.shippingForeign),
     taxRateName: so.taxRateName,
     taxRatePercent: so.taxRatePercent != null ? Number(so.taxRatePercent) : null,
     taxForeign: Number(so.taxForeign),
     pricesIncludeVat: !!so.pricesIncludeVat,
+    // The basis the STORED amounts (unit prices, discount) are in: what the order page, the PDFs and the refund dialog read, never the display flag above.
+    amountsIncludeVat: storedAmountsIncludeVat(so),
+    currencyMinorUnits: currencyMinorUnits(so.currency),
     totalForeign: Number(so.totalForeign),
     totalBase: Number(so.totalBase),
     shipFromWarehouseId: so.shipFromWarehouseId,
@@ -820,7 +838,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
           taxForeign: true, taxBase: true, totalForeign: true, totalBase: true,
           cogsBase: true,
           taxRateId: true,
-          taxRate: { select: { id: true, name: true, rate: true, taxCategory: true } },
+          taxRate: { select: { id: true, name: true, rate: true, taxCategory: true, accountingTaxType: true, reverseCharge: true } },
           product: { select: { imageUrl: true, type: true, oversellAllowed: true, parent: { select: { imageUrl: true } } } },
         },
       },
@@ -829,7 +847,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
           id: true, creditNoteNumber: true, reason: true, totalForeign: true, totalBase: true, refundedAt: true,
           accountingRetryRequired: true,
           lines: {
-            select: { id: true, salesOrderLineId: true, productId: true, description: true, qty: true, unitPriceForeign: true, totalForeign: true, totalBase: true },
+            select: { id: true, salesOrderLineId: true, productId: true, description: true, qty: true, unitPriceForeign: true, totalForeign: true, totalBase: true, accountingTaxType: true, lineKind: true },
           },
           payments: {
             select: { id: true, amount: true, currency: true, method: true, reference: true, notes: true, paidAt: true },
@@ -891,6 +909,23 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
     currency: so.currency,
   })
 
+  // What each credit note line POSTS, from what is persisted and by the definitions the credit-note payload uses (credit-note-display.ts).
+  const [baseCurrencyCode, accountingSettingsForCn, salesTaxRates, orderDefaultCn] = await Promise.all([
+    getBaseCurrencyCode(),
+    getAccountingSettings().catch(() => null),
+    db.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }),
+    so.taxRateName ? db.taxRate.findFirst({ where: { name: so.taxRateName, active: true }, select: { accountingTaxType: true } }) : Promise.resolve(null),
+  ])
+  const creditFactsByRefund = new Map(so.refunds.map((r) => [r.id, creditNoteLineFacts({
+    orderCurrency: so.currency,
+    baseCurrency: baseCurrencyCode,
+    orderLines: so.lines,
+    reverseChargeSalesTaxType: accountingSettingsForCn?.reverseChargeSalesTaxType,
+    orderDefaultTaxType: orderDefaultCn?.accountingTaxType ?? null,
+    taxRates: salesTaxRates,
+    refundLines: r.lines,
+  })]))
+
   return {
     ...mapSoRow(so),
     settlement,
@@ -909,7 +944,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
         id: p.id, refundId: r.id, creditNoteNumber: r.creditNoteNumber,
         amount: Number(p.amount), currency: p.currency, method: p.method, reference: p.reference, notes: p.notes, paidAt: p.paidAt.toISOString(),
       })),
-      lines: r.lines.map((rl) => ({
+      lines: r.lines.map((rl, index) => ({
         id: rl.id,
         salesOrderLineId: rl.salesOrderLineId,
         productId: rl.productId,
@@ -918,6 +953,9 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
         unitPriceForeign: Number(rl.unitPriceForeign),
         totalForeign: Number(rl.totalForeign),
         totalBase: Number(rl.totalBase),
+        lineKind: rl.lineKind,
+        postedNet: creditFactsByRefund.get(r.id)![index].postedNet,
+        vatRate: creditFactsByRefund.get(r.id)![index].vatRate,
       })),
     })),
     payments: so.payments.map((p) => ({
@@ -2523,6 +2561,8 @@ export async function createRefund(
   success: boolean
   error?: string
   warning?: string
+  /** The NET the server recorded (sum of the refund's lines in the order currency, discount reversal included), for the dialog to compare with its preview. */
+  recordedNetForeign?: number
   conflict?: RefundCreationConflict
   quarantine?: true
 }> {
@@ -2543,7 +2583,8 @@ export async function createRefund(
     // o3d-w00 (Codex r3 #2): the per-target cap is a TIGHTENING, so a forged `true` cannot over-refund —
     // but a forged `false` from a public caller could turn it off for the hand-recording path, so it is
     // read only from an internal caller.
-    const enforcePerTargetBalances = isInternal && options?.enforcePerTargetBalances === true
+    // A PUBLIC caller is always capped per target (never above a line's stored net) and has its itemised lines re-cut from what each order line has left.
+    const { enforcePerTargetBalances, deriveSaleLineNetsFromStoredBalance } = refundSafeguards({ isInternal, requestedPerTargetCap: options?.enforcePerTargetBalances })
 
     const { getNumberingFormats } = await import('./company')
     const [numbering, accountingSettings] = await Promise.all([
@@ -2598,6 +2639,7 @@ export async function createRefund(
         // disarmed the posted-VAT fence on exactly the runs where least is known.
         : true,
       enforcePerTargetBalances,
+      deriveSaleLineNetsFromStoredBalance,
       // o3d-w00 (Codex r4 #2): like enforcePerTargetBalances this is a tightening, but a forged EMPTY
       // list from a public caller would switch the fence off for the hand-recording path, so it is read
       // only from an internal caller.
@@ -2886,7 +2928,11 @@ export async function createRefund(
       }
     }
 
-    return { success: true, warning: accountingWarning }
+    return {
+      success: true,
+      warning: accountingWarning,
+      recordedNetForeign: Math.round(refundResult.createdRefundLines.reduce((sum, line) => sum + line.totalForeign, 0) * 10000) / 10000,
+    }
   } catch (e) {
     if (options?.externalRefundId && isExternalRefundIdUniqueConflict(e)) {
       // o3d-7yf: externalRefundId is globally unique, so this conflict may be a CROSS-ORDER race — the

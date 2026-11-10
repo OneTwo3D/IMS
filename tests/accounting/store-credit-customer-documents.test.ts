@@ -38,7 +38,7 @@ test('CENSUS 1: every file that RENDERS a PDF document is classified', () => {
   const table: Record<string, Verdict> = {
     'lib/order-email.ts': GUARDED('assertNoStoreCreditInvoiceDocument(so)'),
     'app/api/invoice/[id]/route.ts': GUARDED('storeCreditInvoiceDocumentRefusal(creditBlock)'),
-    'app/api/sales-order/[id]/route.ts': GUARDED("doc.text('Store credit:'"),
+    'app/api/sales-order/[id]/route.ts': GUARDED('storeCreditForeign: Number(so.storeCreditForeign ?? 0)'),
     'lib/pdf.ts': EXEMPT('the createPdfDocument definition; renders nothing itself'),
     'app/api/packing-slip/[id]/route.ts': EXEMPT('packing slip: lines and quantities, no money totals'),
     'app/api/preview/document/route.ts': EXEMPT('template preview with sample data, not an order'),
@@ -101,14 +101,22 @@ test('the on-the-fly invoice download refuses AFTER the stored accounting PDF br
 })
 
 test('the order documents show the credit beside the Total, so their figures add up', () => {
-  for (const file of ['lib/order-email.ts', 'app/api/sales-order/[id]/route.ts']) {
-    const src = read(file)
-    const row = src.indexOf("'Store credit:'")
-    const total = src.indexOf("'Total:'", row)
-    precondition(`credit row ${file}`, { row, total })
-    assert.ok(row > 0 && total > row, `${file}: a Store credit row precedes the Total row`)
-    assert.match(src, /if \(Number\(so\.storeCreditForeign \?\? 0\) > 0\) \{\s*doc\.text\('Store credit:'/, `${file}: the row is drawn whenever the order has credit`)
-  }
+  const email = read('lib/order-email.ts')
+  const emailRow = email.indexOf("'Store credit:'")
+  const emailTotal = email.indexOf("'Total:'", emailRow)
+  precondition('credit row lib/order-email.ts', { row: emailRow, total: emailTotal })
+  assert.ok(emailRow > 0 && emailTotal > emailRow, 'lib/order-email.ts: a Store credit row precedes the Total row')
+  assert.match(email, /if \(Number\(so\.storeCreditForeign \?\? 0\) > 0\) \{\s*doc\.text\('Store credit:'/, 'lib/order-email.ts: the row is drawn whenever the order has credit')
+  // The sales order PDF prints its totals from the shared totals block, which draws the credit row whenever the order has credit, before the Total.
+  const route = read('app/api/sales-order/[id]/route.ts')
+  assert.ok(route.includes('documentTotalsRows(view'), 'the sales order PDF prints the shared totals block')
+  assert.ok(route.includes('storeCreditForeign: Number(so.storeCreditForeign ?? 0)'), 'the sales order PDF hands the order credit to it')
+  const block = read('lib/domain/sales/sales-order-money-view.ts')
+  const row = block.indexOf("label: 'Store credit'")
+  const total = block.indexOf("label: 'Total'", row)
+  precondition('credit row totals block', { row, total })
+  assert.ok(row > 0 && total > row, 'a Store credit row precedes the Total row')
+  assert.match(block, /if \(view\.storeCredit > 0\) rows\.push\(\{ label: 'Store credit'/, 'the row is drawn whenever the order has credit')
 })
 
 // ---------------------------------------------------------------------------------------------------

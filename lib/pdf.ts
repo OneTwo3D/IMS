@@ -395,6 +395,34 @@ export function groupVatBreakdown(
 }
 
 /**
+ * The VAT rows of a printed order document: one row for the order's single rate, or one per rate when the lines carry different
+ * ones. The amounts add up to the order's stored VAT (the shipping/fees share, which can be negative once the VAT inside an order
+ * discount is taken off, is the residue after the lines), so the rows reconcile with the Total whatever the basis.
+ */
+export function documentVatRows(order: {
+  taxRateName: string | null
+  taxRatePercent: number | null
+  taxForeign: number
+  lines: { taxRatePercent: number | null; taxForeign: number }[]
+}): { label: string; amount: number }[] {
+  if (Math.abs(order.taxForeign) < 0.00005) return []
+  const lineVat = order.lines.reduce((s, l) => s + (Number(l.taxForeign) || 0), 0)
+  // The VAT that sits on no line (shipping and fees, less the VAT inside an order discount) belongs to the ORDER's default rate: it joins that
+  // rate's row. An order with no default rate prints it as its own "VAT adjustment" row, so a line's rate is never blamed for it.
+  const residue = Math.round((order.taxForeign - lineVat) * 10000) / 10000
+  const hasResidue = Math.abs(residue) >= 0.00005
+  const lineRows = order.lines.map((l) => ({ taxRatePercent: l.taxRatePercent ?? order.taxRatePercent, taxForeign: Number(l.taxForeign || 0) }))
+  const headerKnown = order.taxRatePercent != null
+  const breakdown = groupVatBreakdown(hasResidue && headerKnown ? [...lineRows, { taxRatePercent: order.taxRatePercent, taxForeign: residue }] : lineRows)
+  const adjustment = hasResidue && !headerKnown ? [{ label: 'VAT adjustment', amount: residue }] : []
+  if (breakdown.length <= 1 && adjustment.length === 0) {
+    const label = (order.taxRateName ?? 'VAT') + (order.taxRatePercent != null ? ` (${(order.taxRatePercent * 100).toFixed(0)}%)` : '')
+    return [{ label, amount: order.taxForeign }]
+  }
+  return [...breakdown, ...adjustment]
+}
+
+/**
  * Draw header/footer notes from a document template.
  * Shared by the preview route and all real PDF routes.
  */
