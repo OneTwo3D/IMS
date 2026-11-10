@@ -276,4 +276,8 @@ test('the percentage is the one tax is computed at: the active components\' effe
   assert.deepEqual(a.changes.find((x) => x.wooId === 220)!.identity.components, [{ rate: '0.1900', compoundOnPrevious: false, sortOrder: 0 }])
   assert.notEqual(a.digest, b.digest)
   assert.notEqual(a.digest, c.digest)
+  // Only ACTIVE components are bound, in sort order whatever order they were read in.
+  const mixed = planEuVatSeedApply(unseeded([comp('ims-220', '0.2100', { active: false, sortOrder: 5 }), comp('ims-220', '0.0000', { sortOrder: 2 }), comp('ims-220', '0.1900', { sortOrder: 1 })]))
+  assert.equal(mixed.changes.some((x) => x.wooId === 220), true, 'a zero component after the 19% one adds nothing')
+  assert.deepEqual(mixed.changes.find((x) => x.wooId === 220)!.identity.components.map((x) => [x.sortOrder, x.rate]), [[1, '0.1900'], [2, '0.0000']])
 })
