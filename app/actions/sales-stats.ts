@@ -5,6 +5,9 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
+import { REFUND_TURNOVER_SELECT, type TurnoverBound } from '@/lib/domain/sales/customer-turnover'
+import { receivableBalance } from '@/lib/domain/sales/receivable-balance'
+import { INVOICED_ORDER_WHERE, invoicedInPeriodWhere, invoicedPeriodDate, invoicedPeriodDateIsApproximate } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
 import { marginFigureBound, netLinearFigureBound, netOfRefunds, refundLineBucket, refundPctOfSale, refundTotalsBasis, unplacedCreditBoundFromParts, type DerivedFigureBound, type RefundSetBasis, type RefundTotalsBasis } from '@/lib/domain/sales/refund-basis-analytics'
@@ -114,11 +117,8 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
 
   const orders = await db.salesOrder.findMany({
     where: {
-      // Shipped/completed sales plus any refunded order (refund state is orthogonal now).
-      OR: [
-        { status: { in: ['SHIPPED', 'COMPLETED'] } },
-        { refundStatus: { not: 'NONE' } },
-      ],
+      // Invoiced revenue basis, shared with the dashboard, Sales Analytics and AR Aging.
+      ...INVOICED_ORDER_WHERE,
       ...(hasDateFilter ? { createdAt: dateFilter } : {}),
     },
     select: {
@@ -401,7 +401,8 @@ export async function getDetails(dateFrom?: string, dateTo?: string): Promise<De
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
 
   const orders = await db.salesOrder.findMany({
-    where: Object.keys(dateFilter).length ? { createdAt: dateFilter } : undefined,
+    // Invoiced sales details: the same basis as every revenue figure, so drafts, cancelled and un-invoiced orders are not listed.
+    where: { ...INVOICED_ORDER_WHERE, ...(Object.keys(dateFilter).length ? { createdAt: dateFilter } : {}) },
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, status: true, customerName: true, customerEmail: true, salesRep: true, createdAt: true,
       lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true, product: { select: { barcode: true, mpn: true, type: true } } } },
@@ -439,11 +440,16 @@ export type InvoiceRow = {
   customerName: string
   salesRep: string | null
   invoicedAt: string
+  /** True when `invoicedAt` is the order date because the order has neither an invoice date nor a paid date. */
+  invoicedAtApproximate: boolean
   status: string
   qty: number
   totalBase: number
   paidAt: string | null
+  /** Signed: positive owed to us, negative a customer credit balance. The same figure Customer Aging and AR Aging use. */
   balance: number
+  /** `exact`, or `upper`/`indeterminate` when a credit or payment could not be placed exactly. */
+  balanceBound: TurnoverBound
 }
 
 export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promise<InvoiceRow[]> {
@@ -453,32 +459,37 @@ export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promi
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
 
   const orders = await db.salesOrder.findMany({
-    where: { invoiceNumber: { not: null }, ...(Object.keys(dateFilter).length ? { invoicedAt: dateFilter } : {}) },
+    // Dated by invoicedPeriodDate (invoicedAt, else the order date), so Xeroom-era orders land in a period.
+    where: Object.keys(dateFilter).length ? invoicedInPeriodWhere(dateFilter as { gte?: Date; lte?: Date }) : INVOICED_ORDER_WHERE,
     select: {
-      id: true, orderNumber: true, externalOrderNumber: true, invoiceNumber: true, customerName: true, salesRep: true,
-      invoicedAt: true, status: true, totalBase: true, paidAt: true,
+      id: true, orderNumber: true, externalOrderNumber: true, invoiceNumber: true, accountingInvoiceId: true, customerName: true, salesRep: true,
+      invoicedAt: true, createdAt: true, status: true, totalBase: true, totalForeign: true, currency: true, paidAt: true,
       lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true } },
-      payments: { where: { refundId: null }, select: { amount: true } },
+      payments: { select: { amount: true, currency: true, paidAt: true, refundId: true, settlementRateToBase: true } },
+      refunds: { select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
     },
-    orderBy: { invoicedAt: 'desc' },
   })
 
   const rows: InvoiceRow[] = []
   for (const o of orders) {
-    const paid = o.payments.reduce((s, p) => s + Number(p.amount), 0)
-    const balance = Math.round((Number(o.totalBase) - paid) * 100) / 100
+    // One receivables arithmetic for every screen (receivable-balance.ts): invoice less credits less receipts, in base,
+    // an order held as paid counting as settled even with no Payment row.
+    const { balance, bound: balanceBound } = receivableBalance(o, new Date())
     for (const l of o.lines) {
       rows.push({
         orderId: o.id, orderNumber: getSalesOrderReference(o),
-        invoiceNumber: o.invoiceNumber!, productId: l.productId, sku: l.sku ?? '',
+        // An order can be invoiced by an IMS-posted Xero invoice with no invoice number: show the
+        // Xero id, or a dash when neither exists, rather than a blank or a crash.
+        invoiceNumber: o.invoiceNumber ?? o.accountingInvoiceId ?? '—', productId: l.productId, sku: l.sku ?? '',
         productName: l.description, customerName: o.customerName ?? '—', salesRep: o.salesRep,
-        invoicedAt: o.invoicedAt!.toISOString(), status: o.status,
+        invoicedAt: invoicedPeriodDate(o).toISOString(), invoicedAtApproximate: invoicedPeriodDateIsApproximate(o), status: o.status,
         qty: Number(l.qty), totalBase: Number(l.totalBase),
-        paidAt: o.paidAt?.toISOString() ?? null, balance,
+        paidAt: o.paidAt?.toISOString() ?? null, balance, balanceBound,
       })
     }
   }
-  return rows
+  // Newest first by the report date. The date is never null (it falls back to the order date), so no row sorts oddly.
+  return rows.sort((a, b) => b.invoicedAt.localeCompare(a.invoicedAt))
 }
 
 // ---------------------------------------------------------------------------
@@ -592,6 +603,8 @@ export type CustomerAgingRow = {
    */
   netTotalBasis: RefundSetBasis
   dueAmount: number
+  /** `exact`, or `upper`/`indeterminate` when a credit's basis could not be established, so what is owed is at most / only roughly the figure shown. */
+  dueBound: TurnoverBound
   avgDso: number
   overdue0_30: number
   overdue31_60: number
@@ -602,28 +615,28 @@ export type CustomerAgingRow = {
 export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
   await requirePermission('analytics')
   const orders = await db.salesOrder.findMany({
-    where: { invoiceNumber: { not: null } },
+    // Paid orders are not excluded in the query: receivableBalance (one arithmetic shared with AR Aging and the
+    // Invoices tab) decides what is still owed, including orders held as paid with no Payment row.
+    where: INVOICED_ORDER_WHERE,
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, customerId: true, customerName: true, salesRep: true,
-      currency: true, totalBase: true, taxBase: true, invoicedAt: true, paidAt: true, createdAt: true,
+      currency: true, totalBase: true, totalForeign: true, taxBase: true, invoicedAt: true, paidAt: true, createdAt: true,
       shipFromWarehouse: { select: { code: true } },
-      payments: { where: { refundId: null }, select: { amount: true } },
+      payments: { select: { amount: true, currency: true, paidAt: true, refundId: true, settlementRateToBase: true } },
       // o3d-iigc: the basis was not fetched before, so the report could not have respected it.
-      refunds: { select: { totalBase: true, totalsBasis: true } },
+      refunds: { select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
     },
     orderBy: { createdAt: 'desc' },
   })
 
   const now = Date.now()
+  // The shared invoiced filter admits paid orders; aging lists only what is still owed (same 0.01 tolerance as the buckets).
   return orders.map((o) => {
     const total = Number(o.totalBase)
-    const paid = o.payments.reduce((s, p) => s + Number(p.amount), 0)
-    // `balance` stays GROSS-on-GROSS and is untouched: Payment.amount is cash actually moved, which
-    // is the same unit as the VAT-inclusive invoice total. Only the net-of-credits figure below has
-    // a basis question, because a credit's stored total does not.
     const credits = netOfRefunds(o, o.refunds)
-    const balance = Math.max(0, total - paid)
-    const ageDays = o.invoicedAt ? Math.round((now - o.invoicedAt.getTime()) / 86400000) : 0
+    const { balance: signedBalance, bound: dueBound } = receivableBalance(o, new Date(now))
+    const balance = Math.max(0, signedBalance)
+    const ageDays = Math.round((now - invoicedPeriodDate(o).getTime()) / 86400000)
     let o0 = 0, o31 = 0, o61 = 0, o91 = 0
     if (balance > 0.01) {
       if (ageDays > 90) o91 = balance
@@ -640,11 +653,11 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
       refundsTotal: credits.refundsTotal,
       netTotal: credits.netTotal,
       netTotalBasis: credits.basis,
-      dueAmount: Math.round(balance * 100) / 100, avgDso: ageDays,
+      dueAmount: Math.round(balance * 100) / 100, dueBound, avgDso: ageDays,
       overdue0_30: Math.round(o0 * 100) / 100, overdue31_60: Math.round(o31 * 100) / 100,
       overdue61_90: Math.round(o61 * 100) / 100, overdue91plus: Math.round(o91 * 100) / 100,
     }
-  })
+  }).filter((row) => row.dueAmount > 0.01)
 }
 
 // ---------------------------------------------------------------------------

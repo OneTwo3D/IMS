@@ -1,6 +1,7 @@
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { WMS_CANCELLABLE_ORDER_WHERE } from '@/lib/domain/wms/order-push-sweep'
 import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
@@ -124,6 +125,33 @@ export function formatCursorInTimeZone(instant: Date, timeZone?: string | null):
 export const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'] as const
 
 /**
+ * Which orders' links are polled for despatch: an order that has not left the poll set, OR an IMS-CANCELLED order whose link carries a
+ * cancel notice (the warehouse could not honour the cancel, so the goods may still ship). The second arm exists so that a despatch
+ * after an IMS cancel is SEEN and raised for a person; `applyDispatch` never applies it to the cancelled order.
+ */
+/** What a person is told when the warehouse despatched an order IMS had cancelled. Fixed wording: no caught error text. */
+/**
+ * Does IMS intend this order NOT to ship, RIGHT NOW? Judged on the order's CURRENT state alone, in one read: cancelled, or fully refunded
+ * and not yet despatched (WMS_CANCELLABLE_ORDER_WHERE, the cancel pass's own predicate). A cancel notice on the link is NOT consulted: it
+ * is only a record that the warehouse refused a cancel, and it outlives a cancel that IMS has since reversed (only the push sweep clears
+ * it), so honouring it would refuse a real shipment. A despatch for an order that is cancelled now is never applied: no shipment, no
+ * stock movement, no storefront write.
+ */
+async function cancelIntendedForOrder(orderId: string): Promise<boolean> {
+  return (await db.salesOrder.count({ where: { id: orderId, ...WMS_CANCELLABLE_ORDER_WHERE } })) > 0
+}
+
+export function cancelledOrderDespatchedReason(orderNumber: string | null | undefined): string {
+  return `The warehouse despatched order ${orderNumber ?? 'unknown'} after IMS cancelled or fully refunded it, so IMS has not recorded the shipment. `
+    + 'The goods and the order need a decision from a person with the warehouse.'
+}
+
+export const DISPATCH_POLLED_ORDER_WHERE = [
+  { order: { status: { notIn: [...POST_DISPATCH_STATUSES] } } },
+  { cancelNoticeAt: { not: null }, order: { status: 'CANCELLED' as const } },
+]
+
+/**
  * What makes a link a dispatch candidate — the ONE definition (o3d-0gzr).
  *
  * The operator-facing isolate path has to quarantine exactly the set the sweep
@@ -151,7 +179,7 @@ export function dispatchCandidateWhere(connectorId: string) {
     // dead-lettered one is — its record cannot be read, so re-polling it every
     // tick only pins the watermark. It comes back when an operator acts.
     dispatchUnresolvedAt: null,
-    order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
+    OR: DISPATCH_POLLED_ORDER_WHERE,
   }
 }
 
@@ -453,6 +481,11 @@ export type WmsDispatchSweepDeps = {
   // false, a split order is surfaced as a clear "unsupported" pending rather than silently
   // stalling as "no parts visible".
   partsSupported: boolean
+  /**
+   * Does IMS intend this order not to ship (cancelled, fully refunded, or fully refunded)? A despatch is never applied to a cancelled order, and nothing is written for one (no split-part
+   * storefront push, no shipment): reconcileOneOrder asks BEFORE the split and dispatched branches. Absent: not asked.
+   */
+  cancelIntendedForOrder?(orderId: string): Promise<boolean>
   // Split-order reconciliation: fetch every part, its line items, and push each despatched
   // part to the storefront as a partial shipment.
   fetchOrderParts(orderNumber: string): Promise<import('@/lib/connectors/wms/types').WmsOrderPart[]>
@@ -1000,6 +1033,12 @@ async function reconcileSplitOrder(
         allRecorded = false
         continue
       }
+      // The cancel intent is re-read IMMEDIATELY BEFORE each storefront write, so a cancel or refund that committed since the check at the
+      // top of this order is honoured for every part not yet pushed. What remains is the window between this read and the POST itself: an
+      // inter-system limit that cannot be closed from inside IMS (see docs/mintsoft.md).
+      if (deps.cancelIntendedForOrder && await deps.cancelIntendedForOrder(candidate.orderId)) {
+        return { action: 'error', reason: cancelledOrderDespatchedReason(null) }
+      }
       const push = await deps.pushPartialShipment(candidate.orderId, {
         part: part.partNumber,
         totalParts,
@@ -1199,6 +1238,22 @@ export async function reconcileOneOrder(
     })
   }
   const effectiveOrderNumber = status.externalOrderNumber || candidate.externalOrderNumber
+
+  // AN ORDER IMS HAS CANCELLED IS NEVER FULFILLED FROM HERE, and nothing is written for it. This sits ahead of the split branch on
+  // purpose: a split order pushes each despatched part to the storefront (a WooCommerce write) before anything else can refuse it.
+  // Only READS happen below this line for a cancelled order. A despatch (any part of a split) is an error for a person, which is the
+  // ordinary dispatch failure path; an order not yet despatched stays pending.
+  if (deps.cancelIntendedForOrder && (!status.isSplit || deps.partsSupported) && await deps.cancelIntendedForOrder(candidate.orderId)) {
+    const despatched = status.isSplit
+      ? status.dispatched || (await deps.fetchOrderParts(effectiveOrderNumber)).some((part) => part.dispatched)
+      : status.dispatched
+    if (despatched) return { action: 'error', reason: cancelledOrderDespatchedReason(null) }
+    return {
+      action: 'pending',
+      reason: `Cancelled in IMS; not dispatched (status ${status.status || 'Unknown'})`,
+      unresolved: requireResolution && !dispatchStateEstablished(status),
+    }
+  }
 
   // A split order's primary row can read dispatched while only some parts have shipped (or
   // the reverse), so handle split BEFORE the dispatched gate and reconcile per part.
@@ -2581,7 +2636,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
             // dead-lettered one is — its record cannot be read, so re-polling it every
             // tick only pins the watermark. It comes back when an operator acts.
             dispatchUnresolvedAt: null,
-            order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
+            OR: DISPATCH_POLLED_ORDER_WHERE,
           },
           select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
         })
@@ -2611,7 +2666,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
             // dead-lettered one is — its record cannot be read, so re-polling it every
             // tick only pins the watermark. It comes back when an operator acts.
             dispatchUnresolvedAt: null,
-            order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
+            OR: DISPATCH_POLLED_ORDER_WHERE,
           },
           select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
         })
@@ -2716,6 +2771,17 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       // q66in.4.6 audit timeline: capture the order status pre-image so the
       // dispatch event carries a real before/after, not just the target state.
       const orderBefore = await db.salesOrder.findUnique({ where: { id: orderId }, select: { status: true, orderNumber: true } }).catch(() => null)
+      // NEVER applied to an order IMS has cancelled. Its stock was released and its money settled on the footing that nothing would ship;
+      // applying a despatch would re-allocate and ship it on its own. The warehouse despatched it anyway (the cancel arrived too late),
+      // which is a stock-and-refund decision for a person: refuse, and the ordinary dispatch failure path puts it in the inbox.
+      if (await cancelIntendedForOrder(orderId)) {
+        return {
+          success: false,
+          error: cancelledOrderDespatchedReason(orderBefore?.orderNumber ?? orderId),
+          refusal: 'shipment_status_transition_failed',
+          permanent: false,
+        }
+      }
       const result = await applyExternalFulfillmentUpdate({
         source: connectorId,
         lookup: { orderId },
@@ -2736,6 +2802,9 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       return result
     },
     partsSupported: Boolean(connector.fetchOrderParts),
+    async cancelIntendedForOrder(orderId) {
+      return cancelIntendedForOrder(orderId)
+    },
     fetchOrderParts(orderNumber) {
       return connector.fetchOrderParts ? connector.fetchOrderParts(orderNumber) : Promise.resolve([])
     },
@@ -2778,6 +2847,12 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           dispatchUnresolvedAt: null,
           // The survivor is a DIFFERENT WMS order — reconcile recency resets too.
           reconcileCheckedAt: null,
+          // A hold / cancel notice was a statement about the OLD order (a 404 there is exactly what a merge looks like). Cleared, so the
+          // hold and cancel passes judge the survivor afresh and raise the MERGED notice for it.
+          holdNoticeAt: null,
+          cancelNoticeAt: null,
+          holdNoticeCommentAt: null,
+          cancelNoticeCommentAt: null,
         },
       })
     },

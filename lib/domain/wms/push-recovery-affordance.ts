@@ -149,7 +149,9 @@ export function decideWmsPushReplay(
  * disagreed: an AMBIGUOUS_CREATE row was labelled "Push failed", which is precisely wrong — nothing
  * is known to have failed, and the danger is that it SUCCEEDED and IMS never heard.
  */
-export function describeBlockedWmsPush(link: WmsPushReplayEvidence): string {
+export function describeBlockedWmsPush(link: WmsPushReplayEvidence & WmsPushNoticeEvidence): string {
+  if (link.holdNoticeAt && (link.state === 'SYNCED' || link.state === 'MERGED')) return 'Hold not honoured by the warehouse'
+  if (link.cancelNoticeAt && (link.state === 'SYNCED' || link.state === 'MERGED')) return 'Cancel not honoured by the warehouse'
   if (link.state === 'VALIDATION_FAILED') return 'Payload invalid'
   if (link.externalOrderId) return 'Linked, unverified'
   if (link.state === 'AMBIGUOUS_CREATE') return 'Create outcome unknown'
@@ -224,13 +226,27 @@ export function decideWmsMissingRepush(input: {
  * no test can reach — which is how the client came to be deciding this for itself in the first
  * place. Built here, "the row says what the action would do" is one assertion.
  */
-export type BlockedWmsPushRowInput = WmsPushReplayEvidence & {
+/** A live link the warehouse could not hold / cancel for: see WMS_PUSH_NOTICE_WHERE in the exception inbox. */
+export type WmsPushNoticeEvidence = { holdNoticeAt?: Date | null; cancelNoticeAt?: Date | null }
+
+export type BlockedWmsPushRowInput = WmsPushReplayEvidence & WmsPushNoticeEvidence & {
   orderId: string
   /** The order's paid time, for the producer floor. Absent reads as "paid before it" only when a floor is in force. */
   orderPaidAt?: Date | null
   lastError: string | null
   lastAttemptAt: Date | null
   order: { id: string; orderNumber: string | null; externalOrderNumber: string | null; paidAt?: Date | null }
+}
+
+/**
+ * What a person does about a live link that carries a hold / cancel notice. There is nothing to replay (the link is healthy and
+ * stays polled for despatch), so the refusal slot carries the instruction instead of the "only dead letters" boilerplate.
+ */
+function noticeGuidance(link: WmsPushReplayEvidence & WmsPushNoticeEvidence): string | null {
+  if (link.state !== 'SYNCED' && link.state !== 'MERGED') return null
+  if (link.holdNoticeAt) return 'IMS could not hold this order in the warehouse. The link is still live, so a despatch is still recorded. Ask the warehouse to pause it, or leave it to ship.'
+  if (link.cancelNoticeAt) return 'IMS could not cancel this order in the warehouse. The link is still live; a despatch that follows is raised here for you, never applied to the cancelled order. Raise a cancellation query in the warehouse.'
+  return null
 }
 
 export function buildBlockedWmsPushRow(link: BlockedWmsPushRowInput) {
@@ -244,7 +260,7 @@ export function buildBlockedWmsPushRow(link: BlockedWmsPushRowInput) {
     lastError: link.lastError,
     lastAttemptAt: link.lastAttemptAt?.toISOString() ?? null,
     replayable: decision.replayable,
-    replayRefusal: decision.replayable ? null : decision.guidance,
+    replayRefusal: decision.replayable ? null : noticeGuidance(link) ?? decision.guidance,
     why: describeBlockedWmsPush(link),
   }
 }

@@ -1,5 +1,6 @@
 'use server'
 
+import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
@@ -239,9 +240,11 @@ export async function generateForecasts(options: GenerateForecastOptions = {}): 
     }
   }
 
-  // 4. Total revenue by product for ABC classification
+  // 4. Invoiced revenue by product for ABC classification (shared invoiced basis). This ranks
+  // products by revenue, so it uses the revenue basis; it is not the demand history, which
+  // lives in the velocity and replenishment readers and counts units, not turnover.
   const salesLines = await db.salesOrderLine.findMany({
-    where: { order: { status: { in: ['SHIPPED', 'COMPLETED'] } } },
+    where: { order: INVOICED_ORDER_WHERE },
     select: { productId: true, totalBase: true },
   })
   const revenueByProduct = new Map<string, number>()

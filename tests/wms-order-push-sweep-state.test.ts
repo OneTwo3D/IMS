@@ -1147,14 +1147,17 @@ test('hold: an ON_HOLD pushed order is cancelled in the WMS and parked HELD', as
   assert.equal(updates[0].data.state, 'HELD')
 })
 
-test('hold: a no-longer-cancellable WMS order becomes a dead-letter conflict + posts a warehouse comment', async () => {
+test('hold: a no-longer-cancellable WMS order keeps its link LIVE with an operator notice + posts a warehouse comment', async () => {
   const comments: Array<{ externalOrderId: string; comment: string }> = []
   const dispatched = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }), comments })
   const { port, updates } = makePort({ holdable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-1' }] })
   const r = await runWmsOrderPushSweepCore(dispatched, 'mintsoft', port, { now: NOW })
-  assert.equal(r.deadLettered, 1)
+  assert.equal(r.deadLettered, 0)
   assert.equal(r.held, 0)
-  assert.equal(updates[0].data.state, 'DEAD_LETTER')
+  assert.equal(r.operatorNotices, 1)
+  // NOT dead-lettered: a dead letter leaves dispatch polling, and the despatch that follows would never be recorded.
+  assert.equal(updates[0].data.state, undefined)
+  assert.ok(updates[0].data.holdNoticeAt)
   assert.equal(comments.length, 1)
   assert.equal(comments[0].externalOrderId, 'wms-1')
   assert.match(comments[0].comment, /ON HOLD/)
@@ -1168,15 +1171,16 @@ test('hold: a successful (NEW) cancel does not post a warehouse comment', async 
   assert.equal(comments.length, 0)
 })
 
-test('hold: a thrown addOrderComment does not break the dead-letter path', async () => {
+test('hold: a thrown addOrderComment does not break the operator-notice path', async () => {
   const dispatched = connector({
     cancelOrder: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }),
     addOrderComment: async () => { throw new Error('comments endpoint down') },
   })
   const { port, updates } = makePort({ holdable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-1' }] })
   const r = await runWmsOrderPushSweepCore(dispatched, 'mintsoft', port, { now: NOW })
-  assert.equal(r.deadLettered, 1)
-  assert.equal(updates[0].data.state, 'DEAD_LETTER')
+  assert.equal(r.deadLettered, 0)
+  assert.equal(r.operatorNotices, 1)
+  assert.ok(updates[0].data.holdNoticeAt)
 })
 
 test('cancel: an IMS-cancelled pushed order is cancelled in the WMS', async () => {
@@ -1186,22 +1190,26 @@ test('cancel: an IMS-cancelled pushed order is cancelled in the WMS', async () =
   assert.equal(updates[0].data.state, 'CANCELLED')
 })
 
-test('cancel: a WMS order already gone (NOT_FOUND) is treated as cancelled', async () => {
+test('cancel: a WMS order that 404s is NOT treated as cancelled (it may be merged away) - an operator notice instead', async () => {
   const gone = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }) })
   const { port, updates } = makePort({ cancellable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-1' }] })
   const r = await runWmsOrderPushSweepCore(gone, 'mintsoft', port, { now: NOW })
-  assert.equal(r.cancelled, 1)
-  assert.equal(updates[0].data.state, 'CANCELLED')
+  assert.equal(r.cancelled, 0)
+  assert.equal(r.operatorNotices, 1)
+  assert.equal(updates[0].data.state, undefined)
+  assert.ok(updates[0].data.cancelNoticeAt)
 })
 
-test('cancel: a past-NEW order (full refund or IMS cancel) dead-letters with a raise-a-query signal + warehouse comment', async () => {
+test('cancel: a past-NEW order (full refund or IMS cancel) keeps its link live with a raise-a-query notice + warehouse comment', async () => {
   const comments: Array<{ externalOrderId: string; comment: string }> = []
   const dispatched = connector({ cancelOrder: async () => ({ cancelled: false, status: 'PROCESSING' }), comments })
   const { port, updates } = makePort({ cancellable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-1' }] })
   const r = await runWmsOrderPushSweepCore(dispatched, 'mintsoft', port, { now: NOW })
-  assert.equal(r.deadLettered, 1)
+  assert.equal(r.deadLettered, 0)
   assert.equal(r.cancelled, 0)
-  assert.equal(updates[0].data.state, 'DEAD_LETTER')
+  assert.equal(r.operatorNotices, 1)
+  assert.equal(updates[0].data.state, undefined, 'still polled for despatch')
+  assert.ok(updates[0].data.cancelNoticeAt)
   assert.match(String(updates[0].data.lastError), /raise a cancellation query/i)
   assert.equal(comments.length, 1)
   assert.match(comments[0].comment, /cancelled \/ fully refunded/i)

@@ -192,9 +192,10 @@ test('AR aging subtracts non-refund payments and uses configurable buckets', asy
     { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } },
   )
 
-  assert.equal(report.rows[0]?.bucket3, '95')
-  assert.equal(report.rows[0]?.outstandingBase, '95')
-  assert.equal(report.totals.outstandingBase, '95')
+  // As of 1 Jun: 120 - receipts (20 on 5 May, less 5 cash paid back out on 6 May = 15); the 5 Jun payment is after the cutoff.
+  assert.equal(report.rows[0]?.bucket3, '105')
+  assert.equal(report.rows[0]?.outstandingBase, '105')
+  assert.equal(report.totals.outstandingBase, '105')
   assert.equal(report.totals.bucket1Days, '10')
 })
 
@@ -241,8 +242,9 @@ test('AR aging uses paymentDueAt and separates customer credit balances', async 
     { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } },
   )
 
-  assert.equal(report.rows[0]?.bucket1, '500')
-  assert.equal(report.rows[0]?.outstandingBase, '500')
+  // 1000 - receipts (300 paid, less 200 cash paid back out = 100) = 900: a cash refund-out puts money back on the receivable.
+  assert.equal(report.rows[0]?.bucket1, '900')
+  assert.equal(report.rows[0]?.outstandingBase, '900')
   assert.equal(
     decimal(report.rows[0]?.current ?? 0)
       .add(report.rows[0]?.bucket1 ?? 0)

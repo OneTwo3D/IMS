@@ -55,13 +55,13 @@ import {
   RETURNS_MIXED_BASIS_MARKER,
   RETURNS_MIXED_BASIS_NOTICE,
 } from '@/lib/analytics/refund-figure-surfaces'
+import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
 const MAX_PAGE_SIZE = 500
 const SOURCE_ROW_LIMIT = 50000
 const DEFAULT_PERIOD_DAYS = 30
-const ACTIVE_ORDER_STATUSES = Object.values(SalesOrderStatus).filter((status) => status !== SalesOrderStatus.CANCELLED)
 
 type FindManyDelegate = {
   findMany(args?: unknown): Promise<unknown[]>
@@ -608,9 +608,8 @@ function currencyMode(filters: SalesAnalyticsFilters): SalesCurrencyMode {
 async function loadSalesOrders(client: SalesFulfillmentAnalyticsClient, filters: SalesAnalyticsFilters, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }): Promise<SalesOrderRow[]> {
   return client.salesOrder.findMany({
     where: {
-      status: { in: ACTIVE_ORDER_STATUSES },
+      ...INVOICED_ORDER_WHERE,
       createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
-      archived: false,
     },
     select: {
       id: true,
@@ -661,7 +660,7 @@ async function loadSalesOrdersByIds(client: SalesFulfillmentAnalyticsClient, ord
   return client.salesOrder.findMany({
     where: {
       id: { in: [...new Set(orderIds)] },
-      archived: false,
+      ...INVOICED_ORDER_WHERE,
     },
     select: {
       id: true,
@@ -1933,7 +1932,7 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
   const generatedAt = nowFromDeps(deps)
   const baseCurrency = await baseCurrencyFromDeps(deps)
   const window = period(filters, generatedAt)
-  const cogsRows = await client.cogsEntry.findMany({
+  const allCogsRows = await client.cogsEntry.findMany({
     where: { createdAt: { gte: window.dateFrom, lt: window.dateToExclusive }, movement: { type: StockMovementType.SALE_DISPATCH } },
     select: {
       id: true,
@@ -1963,12 +1962,18 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
     },
     take: SOURCE_ROW_LIMIT + 1,
   }) as CogsEntryRow[]
-  assertSourceLimit(cogsRows.length, SOURCE_ROW_LIMIT, 'Margin analytics COGS source rows')
-  const cogsOrderIds = cogsRows
+  assertSourceLimit(allCogsRows.length, SOURCE_ROW_LIMIT, 'Margin analytics COGS source rows')
+  const cogsOrderIds = allCogsRows
     .map((row) => row.movement.referenceType === 'SalesOrder' ? row.movement.referenceId : null)
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
-  const cogsProductIds = new Set(cogsRows.map((row) => marginCogsBucket(row).productId))
+  // ONE COHORT FOR REVENUE, COST AND CREDIT: only invoiced orders (invoiced-revenue-basis.ts).
+  // `loadSalesOrdersByIds` already applies the basis, so its ids ARE the cohort; a dispatch of any
+  // other sales order is dropped here, so its cost cannot be set against revenue that was never
+  // counted. The refund lines below are restricted to the same orders.
   const orders = await loadSalesOrdersByIds(client, cogsOrderIds)
+  const invoicedOrderIds = new Set(orders.map((order) => order.id))
+  const cogsRows = allCogsRows.filter((row) => row.movement.referenceType !== 'SalesOrder' || (row.movement.referenceId != null && invoicedOrderIds.has(row.movement.referenceId)))
+  const cogsProductIds = new Set(cogsRows.map((row) => marginCogsBucket(row).productId))
   // o3d-kyey: the credit RAISED IN THE WINDOW, which is the period this report already measures —
   // it is anchored to CogsEntry.createdAt and prorates revenue to the quantity dispatched inside the
   // window, so it is a DISPATCH-PERIOD report, not an order cohort. A credit note therefore belongs
@@ -1978,7 +1983,7 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
   const marginRefundLines = await client.salesOrderRefundLine.findMany({
     // The shared period clause (`refund-credit-buckets.ts`), so this report and the COGS report cannot
     // drift on which period a credit belongs to. o3d-rv4a r2 is what that drift looks like.
-    where: refundLinesRaisedInPeriodWhere(window.dateFrom, window.dateToExclusive),
+    where: { AND: [refundLinesRaisedInPeriodWhere(window.dateFrom, window.dateToExclusive), { refund: { order: INVOICED_ORDER_WHERE } }] },
     select: {
       productId: true,
       totalBase: true,

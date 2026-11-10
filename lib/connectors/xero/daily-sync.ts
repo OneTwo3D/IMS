@@ -1392,6 +1392,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     // so from that moment another batch — or a refund, which shares this domain
     // — can start while we are still writing. Stop instead.
     batchLock.assertHeld('Group A1 (revenue deferral)')
+    // DELIBERATELY NOT the shared invoiced-revenue basis (lib/domain/sales/invoiced-revenue-basis.ts).
+    // The reports count an order once it carries an invoice, paid or not, and accept a Xeroom-era
+    // invoice number. This batch decides what IMS itself must post, so it needs a PAID order whose
+    // invoice IMS posted (accountingInvoiceId). The two differ on purpose; do not unify them.
     const orderWindow = takeDailyBatchWindow(await db.salesOrder.findMany({
       where: {
         paidAt: { not: null },

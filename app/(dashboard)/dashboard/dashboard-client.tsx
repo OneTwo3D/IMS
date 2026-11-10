@@ -377,7 +377,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
         <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
-            <p className="text-xs text-muted-foreground">Gross Sales</p>
+            <p className="text-xs text-muted-foreground">Invoiced revenue (gross)</p>
             <ChangeBadge current={kpi.grossSalesCurrent} previous={kpi.grossSalesComparison} />
           </div>
           <p className="text-xl sm:text-2xl font-bold mt-1">{fmtBase(kpi.grossSalesCurrent)}</p>
