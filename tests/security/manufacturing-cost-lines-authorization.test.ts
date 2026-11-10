@@ -30,7 +30,7 @@ const recorder = createRecordingDb(({ model, op }: QueryContext) => {
 })
 mock.module('@/lib/db', { namedExports: { db: recorder.db } })
 
-const WRITES = /\.(create|createMany|update|updateMany|upsert|delete|deleteMany)$|^\$transaction$/
+const WRITES = /\.(create|createMany|update|updateMany|upsert|delete|deleteMany)$/
 
 before(async () => {
   currentRole = 'MANAGER'
@@ -56,4 +56,17 @@ test('a MANAGER cannot choose an arbitrary account code for a cost line', async 
   assert.equal(result.success, false)
   assert.match(result.error ?? '', /Manufacturing Overhead account/)
   assert.deepEqual(recorder.calls.filter((call) => WRITES.test(call)), [], 'nothing was written or queued')
+})
+
+test('the override is checked inside the transaction, against the settings read there, and rolls back', async () => {
+  currentRole = 'MANAGER'
+  recorder.reset()
+  const { updateManufacturingCostLines } = await import('@/app/actions/manufacturing')
+  const result = await updateManufacturingCostLines('po1', [{ description: 'Labour', amountForeign: 100, accountCode: '9999-CALLER-CHOSEN' }])
+  assert.equal(result.success, false)
+  const tx = recorder.calls.indexOf('$transaction')
+  assert.ok(tx !== -1, 'the check ran outside any transaction')
+  const firstSettingRead = recorder.calls.findIndex((call) => call.startsWith('setting.'))
+  assert.ok(firstSettingRead > tx, 'the account mapping was read before the transaction, not the one the reclass uses')
+  assert.deepEqual(recorder.calls.filter((call) => WRITES.test(call)), [])
 })

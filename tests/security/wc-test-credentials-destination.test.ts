@@ -36,10 +36,15 @@ mock.module('@/lib/db', {
         if (typeof model !== 'string' || model === 'then') return undefined
         if (model.startsWith('$')) return async () => null
         return new Proxy({}, {
-          get: (_t2, op) => async (args?: { where?: { key?: string } }) => {
+          get: (_t2, op) => async (args?: { where?: { key?: string | { in: string[] } } }) => {
+            if (model === 'setting' && op === 'updateMany') return { count: 0 }
             if (model === 'setting' && op === 'findUnique') {
-              const key = args?.where?.key ?? ''
+              const key = typeof args?.where?.key === 'string' ? args.where.key : ''
               return key in SETTINGS ? { key, value: SETTINGS[key] } : null
+            }
+            if (model === 'setting' && op === 'findMany') {
+              const keys = (args?.where?.key as { in: string[] } | undefined)?.in ?? []
+              return keys.filter((k) => k in SETTINGS).map((key) => ({ key, value: SETTINGS[key] }))
             }
             return op === 'findMany' ? [] : null
           },

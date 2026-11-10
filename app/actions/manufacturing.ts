@@ -1822,19 +1822,6 @@ export async function updateManufacturingCostLines(
     if (!parsed.success) return { success: false, error: parsed.error }
     const cleaned = parsed.lines
 
-    // A per-line account override is credited by the reclass journal, so it is not a free-text field:
-    // it must be the Manufacturing Overhead account the accounting settings configure.
-    if (cleaned.some((line) => line.accountCode)) {
-      const configuredOverhead = (await getAccountingSettings()).manufacturingOverheadAccount?.trim() ?? ''
-      const refused = cleaned.find((line) => line.accountCode && line.accountCode !== configuredOverhead)
-      if (refused) {
-        return {
-          success: false,
-          error: 'A cost-line account override must be the Manufacturing Overhead account configured in Settings. Clear the override to use the default.',
-        }
-      }
-    }
-
     let cogsDeltaBase = 0
     let inventoryDeltaBase = 0
     let oldTotal = 0
@@ -1858,6 +1845,17 @@ export async function updateManufacturingCostLines(
       // o3d-j625 r4 (SWEEP 1): chart first, verdict asked OF IT — see the completion journal above. A
       // retired chart is recorded as a refusal and reported after the commit.
       const reclassChart = po.status === 'COMPLETED' ? await getAccountingSettings() : null
+      // A per-line account override is credited by the reclass journal, so it is not a free-text field: it must
+      // be the Manufacturing Overhead account the accounting settings configure. Checked HERE, against the same
+      // chart the reclass below is built from (a mapping read before the transaction could differ from it), and
+      // by throwing so the cost-line write rolls back with it.
+      if (cleaned.some((line) => line.accountCode)) {
+        const overrideChart = reclassChart ?? await getAccountingSettings()
+        const configuredOverhead = overrideChart.manufacturingOverheadAccount?.trim() ?? ''
+        if (cleaned.some((line) => line.accountCode && line.accountCode !== configuredOverhead)) {
+          throw new Error('A cost-line account override must be the Manufacturing Overhead account configured in Settings. Clear the override to use the default.')
+        }
+      }
       const reclassVerdict = reclassChart
         ? await accountingPostingVerdictForChart(reclassChart.connector, 'MANUFACTURING_RECLASS')
         : null

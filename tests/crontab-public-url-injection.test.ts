@@ -24,6 +24,10 @@ const INJECTED = [
   'https://ims.example.com/a\\b',
   'http://ims.example.com',
   'ftp://ims.example.com',
+  'https:example.com',
+  'https:/example.com',
+  'https:///example.com',
+  'https:\\\\example.com',
 ]
 
 test('the write-side rule refuses every injected or unsafe Public App URL', () => {
@@ -59,4 +63,16 @@ test('a saved schedule carrying a newline cannot reach the crontab', () => {
   assert.equal(validateCronSchedule('*/5 * * * *\n* * * * * id').ok, false)
   assert.equal(validateCronSchedule('* * * * *\n').ok, false)
   assert.equal(validateCronSchedule('*/5 * * * * id').ok, false)
+})
+
+test('the parser-tolerant forms `https:example.com` and `https:/example.com` are refused on write and at render', () => {
+  for (const value of ['https:example.com', 'https:/example.com', 'http:127.0.0.1:3000', 'http:/localhost']) {
+    assert.equal(normalizePublicAppUrl(value).ok, false, value)
+    assert.equal(isSafePublicBaseUrl(value), false, value)
+  }
+})
+
+test('the stored form is the parser canonical form, not the raw text', () => {
+  const result = normalizePublicAppUrl('  HTTPS://IMS.Example.com/app/./x/../  ')
+  assert.deepEqual(result, { ok: true, url: 'https://ims.example.com/app' })
 })

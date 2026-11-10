@@ -25,6 +25,9 @@ const SAFE_URL_CHARS = /^[A-Za-z0-9\-._~:/[\]]+$/
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
 
 export function isSafePublicBaseUrl(value: string): boolean {
+  // The WHATWG parser accepts `https:example.com` and `https:/example.com` and rewrites them to a full URL, so
+  // the raw text must itself carry the `scheme://` form: the text is what a stored value is checked against.
+  if (!/^https?:\/\/[^/]/i.test(value)) return false
   if (!SAFE_URL_CHARS.test(value)) return false
   let parsed: URL
   try {
@@ -56,5 +59,6 @@ export function normalizePublicAppUrl(value: string): PublicAppUrlNormalization 
       error: 'URL must be an https:// address (http:// only for localhost) with no spaces, credentials, query, fragment or special characters.',
     }
   }
-  return { ok: true, url: normalized }
+  // Store the parser's canonical form (lower-case scheme and host, dot segments resolved), not the raw text.
+  return { ok: true, url: `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, '') }
 }

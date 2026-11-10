@@ -428,6 +428,12 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     const prevSecret = existingMap.get('wc_consumer_secret')
       ? decryptSettingValue('wc_consumer_secret', existingMap.get('wc_consumer_secret')!)
       : ''
+    // The credentials were validated against the URL read before this transaction. If this save reuses
+    // stored credentials, the stored URL read here, under the lock, must still be the URL being saved,
+    // or a concurrent save has re-pointed the store and the reuse would pair the wrong credentials.
+    if ((incomingKeyIsMasked || shouldReuseStoredSecret) && prevUrl !== validatedUrl.normalizedUrl) {
+      return { credentialsMismatch: true as const }
+    }
     const effectiveKey = incomingKeyIsMasked ? prevKey : nextKey
     const effectiveSecret = shouldReuseStoredSecret ? prevSecret : nextSecret
 
@@ -520,6 +526,13 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     return { isRebind, wipedMappings: wiped.count }
   })
 
+  if ('credentialsMismatch' in saveOutcome) {
+    return {
+      success: false,
+      wipedMappings: 0,
+      error: 'The saved WooCommerce connection changed while this was being saved. Enter the consumer key and secret and save again.',
+    }
+  }
   if ('blocked' in saveOutcome && saveOutcome.blocked) {
     // One phrase per family, so an operator counting three "unresolved refunds" that are actually
     // two refunds and an invoice hold is told which is which and where each one is resolved. The
@@ -632,15 +645,18 @@ async function resolveWcCredentialsForUrl(
   const reuseSecret = isMaskedSecret(nextSecret) || !nextSecret
   if (!reuseKey && !reuseSecret) return { ok: true, key: nextKey, secret: nextSecret }
 
-  const storedUrl = await getSettingValue('wc_url')
+  // ONE query for all three, so the URL and the credentials come from the same snapshot: separate reads
+  // let a concurrent save pair store B's credentials with store A's URL.
+  const stored = await getSettingValues(['wc_url', 'wc_consumer_key', 'wc_consumer_secret'])
+  const storedUrl = stored.get('wc_url')
   const storedValidated = storedUrl ? validateWooCommerceBaseUrl(storedUrl) : null
   if (!storedValidated || !storedValidated.ok || storedValidated.normalizedUrl !== normalizedUrl) {
     return { ok: false, error: 'Enter the consumer key and secret to use a store URL other than the saved one. Saved credentials are only used with the saved URL.' }
   }
   return {
     ok: true,
-    key: reuseKey ? ((await getSettingValue('wc_consumer_key')) ?? '') : nextKey,
-    secret: reuseSecret ? ((await getSettingValue('wc_consumer_secret')) ?? '') : nextSecret,
+    key: reuseKey ? (stored.get('wc_consumer_key') ?? '') : nextKey,
+    secret: reuseSecret ? (stored.get('wc_consumer_secret') ?? '') : nextSecret,
   }
 }
 
