@@ -1507,7 +1507,8 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
         taxType,
         // The rate this line's code was read from (never sent), bound whenever the line has one, with the basis the code was derived on (a sales goods line): the enqueue guard checks a retired code is
         // still that rate's code and, for a rate a re-key cleared, that the type sent is the one this same derivation gives now. lib/tax/retired-tax-code-guard.ts.
-        ...(isNoTaxFee ? { noTaxKind: 'fee-no-tax' as const } : rateBinding(l.taxRateId, 'sales_line')),
+        ...rateBinding(l.taxRateId, 'sales_line'),
+        ...(isNoTaxFee ? { noTaxKind: 'fee-no-tax' as const } : {}),
         discountAmount: discForeign > 0 ? discForeign : undefined,
       }
     }),
