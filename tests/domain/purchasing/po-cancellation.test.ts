@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { Prisma, type PurchaseOrderStatus } from '@/app/generated/prisma/client'
+import type { PurchaseOrderStatus } from '@/app/generated/prisma/client'
 import {
   cancelPurchaseOrderService,
   type CancelPurchaseOrderServiceDeps,
@@ -9,234 +9,8 @@ import {
 import {
   assertPurchaseOrderCancellationHasNoInvoices,
   isPurchaseOrderCancellationNoop,
-  reversePurchaseOrderCostLayersForCancellation,
-  summarizeConsumedCostLayers,
 } from '@/lib/domain/purchasing/po-cancellation'
-
-type CostLayerRow = {
-  id: string
-  poLineId: string | null
-  productId: string
-  warehouseId: string
-  remainingQty: Prisma.Decimal
-  unitCostBase: Prisma.Decimal
-}
-
-type StockLevelRow = {
-  productId: string
-  warehouseId: string
-  quantity: Prisma.Decimal
-  reservedQty: Prisma.Decimal
-}
-
-function createTx(state: {
-  costLayers: CostLayerRow[]
-  stockLevels: StockLevelRow[]
-}) {
-  const movements: unknown[] = []
-  const cogsEntries: unknown[] = []
-  const costLayerUpdates: Array<{ where: { id: string }; data: { remainingQty: number } }> = []
-  const stockLevelUpdates: Array<{
-    where: { productId_warehouseId: { productId: string; warehouseId: string } }
-    data: { quantity: { decrement: number } }
-  }> = []
-  const lockedStockLevels: unknown[] = []
-
-  const tx = {
-    $queryRaw: async (_strings: TemplateStringsArray, ...values: unknown[]) => {
-      if (Array.isArray(values[0])) {
-        const lineIds = values[0] as string[]
-        return state.costLayers
-          .filter((layer) => layer.poLineId && lineIds.includes(layer.poLineId))
-          .filter((layer) => layer.remainingQty.gt(0))
-      }
-      const [productId, warehouseId] = values as [string, string]
-      lockedStockLevels.push({ productId, warehouseId })
-      return []
-    },
-    stockMovement: {
-      create: async (args: { data: unknown }) => {
-        movements.push(args.data)
-        return { id: `movement-${movements.length}` }
-      },
-    },
-    cogsEntry: {
-      create: async (args: { data: unknown }) => {
-        cogsEntries.push(args.data)
-      },
-    },
-    stockLevel: {
-      findUnique: async ({ where }: { where: { productId_warehouseId: { productId: string; warehouseId: string } } }) => (
-        state.stockLevels.find((level) => (
-          level.productId === where.productId_warehouseId.productId &&
-          level.warehouseId === where.productId_warehouseId.warehouseId
-        )) ?? null
-      ),
-      update: async (args: {
-        where: { productId_warehouseId: { productId: string; warehouseId: string } }
-        data: { quantity: { decrement: number } }
-      }) => {
-        stockLevelUpdates.push(args)
-        const row = state.stockLevels.find((level) => (
-          level.productId === args.where.productId_warehouseId.productId &&
-          level.warehouseId === args.where.productId_warehouseId.warehouseId
-        ))
-        if (row) row.quantity = row.quantity.sub(args.data.quantity.decrement)
-      },
-    },
-    costLayer: {
-      update: async (args: { where: { id: string }; data: { remainingQty: number } }) => {
-        costLayerUpdates.push(args)
-        const row = state.costLayers.find((layer) => layer.id === args.where.id)
-        if (row) row.remainingQty = new Prisma.Decimal(args.data.remainingQty)
-      },
-    },
-  }
-
-  return { tx, movements, cogsEntries, costLayerUpdates, stockLevelUpdates, lockedStockLevels }
-}
-
-test('reversePurchaseOrderCostLayersForCancellation reverses remaining PO cost layers', async () => {
-  const state = {
-    costLayers: [
-      {
-        id: 'layer-1',
-        poLineId: 'po-line-1',
-        productId: 'product-1',
-        warehouseId: 'warehouse-1',
-        remainingQty: new Prisma.Decimal('2'),
-        unitCostBase: new Prisma.Decimal('5.25'),
-      },
-      {
-        id: 'layer-2',
-        poLineId: 'po-line-2',
-        productId: 'product-2',
-        warehouseId: 'warehouse-1',
-        remainingQty: new Prisma.Decimal('3'),
-        unitCostBase: new Prisma.Decimal('4'),
-      },
-      {
-        id: 'consumed-layer',
-        poLineId: 'po-line-2',
-        productId: 'product-2',
-        warehouseId: 'warehouse-1',
-        remainingQty: new Prisma.Decimal('0'),
-        unitCostBase: new Prisma.Decimal('4'),
-      },
-    ],
-    stockLevels: [
-      {
-        productId: 'product-1',
-        warehouseId: 'warehouse-1',
-        quantity: new Prisma.Decimal('10'),
-        reservedQty: new Prisma.Decimal('1'),
-      },
-      {
-        productId: 'product-2',
-        warehouseId: 'warehouse-1',
-        quantity: new Prisma.Decimal('8'),
-        reservedQty: new Prisma.Decimal('0'),
-      },
-    ],
-  }
-  const { tx, movements, cogsEntries, costLayerUpdates, stockLevelUpdates, lockedStockLevels } = createTx(state)
-
-  const result = await reversePurchaseOrderCostLayersForCancellation(tx as never, {
-    poId: 'po-1',
-    poReference: 'PO-1',
-    poLineIds: ['po-line-1', 'po-line-2'],
-  })
-
-  assert.deepEqual(result.productIds.sort(), ['product-1', 'product-2'])
-  assert.equal(result.totalReversalValueBase.toString(), '22.5')
-  assert.deepEqual(result.reversedLayers.map((layer) => ({
-    costLayerId: layer.costLayerId,
-    qty: layer.qty,
-    unitCostBase: layer.unitCostBase,
-    totalValueBase: layer.totalValueBase,
-  })), [
-    { costLayerId: 'layer-1', qty: '2', unitCostBase: '5.25', totalValueBase: '10.5' },
-    { costLayerId: 'layer-2', qty: '3', unitCostBase: '4', totalValueBase: '12' },
-  ])
-  assert.equal(state.costLayers[0].remainingQty.toString(), '0')
-  assert.equal(state.costLayers[1].remainingQty.toString(), '0')
-  assert.equal(state.stockLevels[0].quantity.toString(), '8')
-  assert.equal(state.stockLevels[1].quantity.toString(), '5')
-  assert.deepEqual(lockedStockLevels, [
-    { productId: 'product-1', warehouseId: 'warehouse-1' },
-    { productId: 'product-2', warehouseId: 'warehouse-1' },
-  ])
-  assert.deepEqual(costLayerUpdates.map((args) => args.where.id), ['layer-1', 'layer-2'])
-  assert.deepEqual(stockLevelUpdates.map((args) => args.data.quantity.decrement), [2, 3])
-  assert.deepEqual(movements.map((movement) => ({
-    type: (movement as { type: string }).type,
-    productId: (movement as { productId: string }).productId,
-    fromWarehouseId: (movement as { fromWarehouseId: string }).fromWarehouseId,
-    qty: (movement as { qty: number }).qty,
-    unitCostBase: (movement as { unitCostBase: string }).unitCostBase,
-    totalValueBase: (movement as { totalValueBase: string }).totalValueBase,
-    referenceType: (movement as { referenceType: string }).referenceType,
-    referenceId: (movement as { referenceId: string }).referenceId,
-  })), [
-    {
-      type: 'PURCHASE_REVERSAL',
-      productId: 'product-1',
-      fromWarehouseId: 'warehouse-1',
-      qty: 2,
-      unitCostBase: '5.250000',
-      totalValueBase: '10.500000',
-      referenceType: 'PurchaseOrder',
-      referenceId: 'po-1',
-    },
-    {
-      type: 'PURCHASE_REVERSAL',
-      productId: 'product-2',
-      fromWarehouseId: 'warehouse-1',
-      qty: 3,
-      unitCostBase: '4.000000',
-      totalValueBase: '12.000000',
-      referenceType: 'PurchaseOrder',
-      referenceId: 'po-1',
-    },
-  ])
-  assert.deepEqual(cogsEntries.map((entry) => ({
-    costLayerId: (entry as { costLayerId: string }).costLayerId,
-    movementId: (entry as { movementId: string }).movementId,
-    qty: (entry as { qty: string }).qty,
-    totalCostBase: (entry as { totalCostBase: string }).totalCostBase,
-  })), [
-    { costLayerId: 'layer-1', movementId: 'movement-1', qty: '2.000000', totalCostBase: '10.500000' },
-    { costLayerId: 'layer-2', movementId: 'movement-2', qty: '3.000000', totalCostBase: '12.000000' },
-  ])
-})
-
-test('reversePurchaseOrderCostLayersForCancellation rejects reserved stock that cannot be reversed', async () => {
-  const { tx } = createTx({
-    costLayers: [{
-      id: 'layer-1',
-      poLineId: 'po-line-1',
-      productId: 'product-1',
-      warehouseId: 'warehouse-1',
-      remainingQty: new Prisma.Decimal('4'),
-      unitCostBase: new Prisma.Decimal('5'),
-    }],
-    stockLevels: [{
-      productId: 'product-1',
-      warehouseId: 'warehouse-1',
-      quantity: new Prisma.Decimal('5'),
-      reservedQty: new Prisma.Decimal('2'),
-    }],
-  })
-
-  await assert.rejects(
-    () => reversePurchaseOrderCostLayersForCancellation(tx as never, {
-      poId: 'po-1',
-      poReference: 'PO-1',
-      poLineIds: ['po-line-1'],
-    }),
-    /stock is reserved and cannot be reversed automatically/,
-  )
-})
+import type { RetireOutcome } from '@/lib/domain/purchasing/po-close-short'
 
 test('assertPurchaseOrderCancellationHasNoInvoices rejects billed purchase orders', () => {
   assert.doesNotThrow(() => assertPurchaseOrderCancellationHasNoInvoices(0))
@@ -252,196 +26,175 @@ test('isPurchaseOrderCancellationNoop treats already cancelled purchase orders a
   assert.equal(isPurchaseOrderCancellationNoop('RECEIVED'), false)
 })
 
-test('cancelPurchaseOrderService is idempotent when called twice', async () => {
-  const po: { status: PurchaseOrderStatus; reference: string } = { status: 'PARTIALLY_RECEIVED', reference: 'PO-1' }
-  const logs: Array<{ action: string; description: string }> = []
-  const accountingSyncs: unknown[] = []
-  const stockSyncs: Array<{ productIds: string[]; reason: string }> = []
-  let transactionCalls = 0
-  let reversalCalls = 0
+type Po = {
+  status: PurchaseOrderStatus
+  reference: string
+  type?: 'GOODS' | 'FREIGHT'
+  invoices?: Array<{ id: string; totalBase: number }>
+  creditNotes?: unknown[]
+}
 
+type UpdatableTx = { purchaseOrder: { update: (args: { data: { status: PurchaseOrderStatus } }) => Promise<unknown> } }
+
+function makeDeps(po: Po, overrides: Partial<CancelPurchaseOrderServiceDeps> = {}) {
+  const logs: Array<{ action: string; description: string; entityId?: string | null; metadata?: unknown; level?: string }> = []
+  const calls = { transactions: 0, retire: 0, recalc: 0 }
   const tx = {
     $queryRaw: async () => [],
     purchaseOrder: {
       findUnique: async () => ({
         status: po.status,
         reference: po.reference,
-        lines: [{ id: 'po-line-1' }],
-        invoices: [],
-        supplierCreditNotes: [],
+        type: po.type ?? 'GOODS',
+        invoices: po.invoices ?? [],
+        supplierCreditNotes: po.creditNotes ?? [],
       }),
-      update: async ({ data }: { data: { status: typeof po.status } }) => {
+      update: async ({ data }: { data: { status: PurchaseOrderStatus } }) => {
         po.status = data.status
-        return { id: 'po-1' }
+        return { id: 'po' }
       },
     },
   }
   const deps: CancelPurchaseOrderServiceDeps = {
     findPurchaseOrderFast: async () => ({ status: po.status, reference: po.reference }),
     transaction: async (fn) => {
-      transactionCalls += 1
+      calls.transactions += 1
       return fn(tx as never)
     },
     logActivity: async (input) => {
-      logs.push({ action: input.action, description: input.description })
+      logs.push({ action: input.action, description: input.description, entityId: input.entityId, metadata: input.metadata, level: input.level })
     },
-    enqueueStockSync: async (productIds, reason) => {
-      stockSyncs.push({ productIds, reason })
-    },
-    getAccountingSettings: async () => ({
-      syncEnabled: true,
-      transitAccount: '140',
-      inventoryAccount: '120',
-    }) as never,
-    queueAccountingSyncTx: async (_tx, input) => {
-      accountingSyncs.push(input)
-      return { id: `sync-${accountingSyncs.length}` } as never
-    },
-    recordTransitSubledgerMovement: async () => {},
-    reversePurchaseOrderCostLayersForCancellation: async () => {
-      reversalCalls += 1
+    // Nothing landed, no billed-ahead: runs the caller's gate, then writes CANCELLED like the real function.
+    retirePurchaseOrderLocked: async (txArg, _id, _intent, beforeWrite) => {
+      calls.retire += 1
+      beforeWrite?.({ keptReceivedStock: false })
+      await (txArg as unknown as UpdatableTx).purchaseOrder.update({ data: { status: 'CANCELLED' } })
       return {
-        reversedLayers: [{
-          costLayerId: 'layer-1',
-          poLineId: 'po-line-1',
-          productId: 'product-1',
-          warehouseId: 'warehouse-1',
-          qty: '2.000000',
-          unitCostBase: '5.000000',
-          totalValueBase: '10.000000',
-        }],
-        productIds: ['product-1'],
-        totalReversalValueBase: new Prisma.Decimal('10'),
-      }
+        reference: po.reference,
+        previousStatus: 'DRAFT',
+        newStatus: 'CANCELLED',
+        keptReceivedStock: false,
+        landedQty: 0,
+        droppedQty: 5,
+        billedAhead: [],
+      } satisfies RetireOutcome
     },
-    readPurchaseOrderConsumedCostForCancellation: async () => ({
-      consumedQty: '0',
-      consumedValueBase: '0',
-      layers: [],
-    }),
-    // Not invoked for GOODS POs (type !== 'FREIGHT'); stub satisfies the type.
-    recalculateLandedCosts: async () => ({} as never),
+    // Not invoked for GOODS POs (type !== 'FREIGHT'); counts so a test can prove it.
+    recalculateLandedCosts: (async () => { calls.recalc += 1; return {} as never }) as never,
     queueLandedCostAdjustmentJournals: async () => ({ owed: 0 }),
+    ...overrides,
   }
+  return { deps, logs, calls }
+}
 
-  assert.deepEqual(await cancelPurchaseOrderService('po-1', deps), {
-    success: true,
-    reversedCostLayers: [{
-      costLayerId: 'layer-1',
-      poLineId: 'po-line-1',
-      productId: 'product-1',
-      warehouseId: 'warehouse-1',
-      qty: '2.000000',
-      unitCostBase: '5.000000',
-      totalValueBase: '10.000000',
-    }],
-    consumedCost: { consumedQty: '0', consumedValueBase: '0', layers: [] },
-    notice: 'Cancelled PO and reversed 1 remaining receipt cost layer(s).',
-  })
+function closeShortRetire(outcome: Partial<RetireOutcome> & { reference: string }): CancelPurchaseOrderServiceDeps['retirePurchaseOrderLocked'] {
+  return async (txArg, _id, _intent, beforeWrite) => {
+    beforeWrite?.({ keptReceivedStock: true })
+    await (txArg as unknown as UpdatableTx).purchaseOrder.update({ data: { status: 'CLOSED' } })
+    return {
+      previousStatus: 'PARTIALLY_RECEIVED',
+      newStatus: 'CLOSED',
+      keptReceivedStock: true,
+      landedQty: 60,
+      droppedQty: 40,
+      billedAhead: [],
+      ...outcome,
+    } satisfies RetireOutcome
+  }
+}
+
+test('cancelPurchaseOrderService is idempotent when called twice', async () => {
+  const po: Po = { status: 'DRAFT', reference: 'PO-1' }
+  const { deps, logs, calls } = makeDeps(po)
+
+  const first = await cancelPurchaseOrderService('po-1', deps)
+  assert.equal(first.success, true)
   assert.equal(po.status, 'CANCELLED')
+  assert.equal(first.closedShort, undefined)
 
   assert.deepEqual(await cancelPurchaseOrderService('po-1', deps), { success: true })
 
-  assert.equal(transactionCalls, 1)
-  assert.equal(reversalCalls, 1)
-  assert.equal(accountingSyncs.length, 1)
-  assert.deepEqual(stockSyncs, [{ productIds: ['product-1'], reason: 'IMS_CHANGE' }])
+  assert.equal(calls.transactions, 1)
+  assert.equal(calls.retire, 1)
   assert.deepEqual(logs.map((log) => log.action), ['cancelled', 'cancelled_noop'])
-  assert.equal(logs.filter((log) => log.action === 'cancelled').length, 1)
 })
 
-test('summarizeConsumedCostLayers totals consumed (received − remaining) value and skips fully-remaining layers', () => {
-  const summary = summarizeConsumedCostLayers([
-    // 70 of 100 consumed @ £5 => £350
-    { id: 'l1', poLineId: 'pol-1', productId: 'p1', receivedQty: '100', remainingQty: '30', unitCostBase: '5' },
-    // nothing consumed yet — excluded
-    { id: 'l2', poLineId: 'pol-1', productId: 'p1', receivedQty: '40', remainingQty: '40', unitCostBase: '5' },
-    // 10 of 10 consumed @ £2.5 => £25
-    { id: 'l3', poLineId: 'pol-2', productId: 'p2', receivedQty: '10', remainingQty: '0', unitCostBase: '2.5' },
-  ])
-  assert.equal(summary.consumedQty, '80')
-  assert.equal(summary.consumedValueBase, '375')
-  assert.equal(summary.layers.length, 2)
-  assert.deepEqual(summary.layers.map((l) => l.costLayerId), ['l1', 'l3'])
-})
-
-test('cancelPurchaseOrderService flags already-consumed COGS with a WARNING and returns consumedCost', async () => {
-  const po: { status: PurchaseOrderStatus; reference: string } = { status: 'PARTIALLY_RECEIVED', reference: 'PO-9' }
-  const logs: Array<{ action: string; level?: string; metadata?: unknown }> = []
-
-  const tx = {
-    $queryRaw: async () => [],
-    purchaseOrder: {
-      findUnique: async () => ({
-        status: po.status,
-        reference: po.reference,
-        lines: [{ id: 'po-line-1' }],
-        invoices: [],
-        supplierCreditNotes: [],
-      }),
-      update: async ({ data }: { data: { status: typeof po.status } }) => {
-        po.status = data.status
-        return { id: 'po-9' }
-      },
-    },
-  }
-  let consumedReadBeforeReversal = false
-  let reversalRan = false
-  const deps: CancelPurchaseOrderServiceDeps = {
-    findPurchaseOrderFast: async () => ({ status: po.status, reference: po.reference }),
-    transaction: async (fn) => fn(tx as never),
-    logActivity: async (input) => { logs.push({ action: input.action, level: input.level, metadata: input.metadata }) },
-    enqueueStockSync: async () => {},
-    getAccountingSettings: async () => ({ syncEnabled: false, transitAccount: '140', inventoryAccount: '120' }) as never,
-    queueAccountingSyncTx: async () => ({ id: 'sync-1' }) as never,
-    readPurchaseOrderConsumedCostForCancellation: async () => {
-      // Must be read before the reversal zeroes remaining quantities.
-      consumedReadBeforeReversal = !reversalRan
-      return { consumedQty: '70', consumedValueBase: '350', layers: [{ costLayerId: 'l1', poLineId: 'po-line-1', productId: 'p1', consumedQty: '70', unitCostBase: '5', consumedValueBase: '350' }] }
-    },
-    recordTransitSubledgerMovement: async () => {},
-    reversePurchaseOrderCostLayersForCancellation: async () => {
-      reversalRan = true
-      return { reversedLayers: [], productIds: [], totalReversalValueBase: new Prisma.Decimal('0') }
-    },
-    recalculateLandedCosts: async () => ({} as never),
-    queueLandedCostAdjustmentJournals: async () => ({ owed: 0 }),
-  }
-
+test('cancelling a part-received PO closes it short: the order ends CLOSED, the result says so, nothing is reversed or posted', async () => {
+  const po: Po = { status: 'PARTIALLY_RECEIVED', reference: 'PO-9' }
+  const { deps, logs } = makeDeps(po, { retirePurchaseOrderLocked: closeShortRetire({ reference: 'PO-9' }) })
   const result = await cancelPurchaseOrderService('po-9', deps)
   assert.equal(result.success, true)
-  assert.deepEqual(result.consumedCost, {
-    consumedQty: '70',
-    consumedValueBase: '350',
-    layers: [{ costLayerId: 'l1', poLineId: 'po-line-1', productId: 'p1', consumedQty: '70', unitCostBase: '5', consumedValueBase: '350' }],
+  assert.equal(result.closedShort, true)
+  assert.equal(po.status, 'CLOSED')
+  assert.match(result.notice ?? '', /closed short/)
+  assert.match(result.notice ?? '', /40 unit\(s\) still due were dropped/)
+  assert.match(result.notice ?? '', /60 unit\(s\) received stay in stock/)
+  assert.equal('reversedCostLayers' in result, false)
+  const log = logs.find((l) => l.action === 'cancelled_closed_short')
+  assert.ok(log, 'the close-short is logged under its own action')
+  assert.equal((log!.metadata as { keptReceivedStock: boolean }).keptReceivedStock, true)
+})
+
+test('the supplier-bill gate applies only when nothing landed: a billed order with nothing received is refused, a billed part-received one closes short', async () => {
+  const billed = [{ id: 'inv-1', totalBase: 100 }]
+  const nothingLanded: Po = { status: 'PO_SENT', reference: 'PO-B1', invoices: billed }
+  const refused = await cancelPurchaseOrderService('po-b1', makeDeps(nothingLanded, {
+    retirePurchaseOrderLocked: async (_tx, _id, _intent, beforeWrite) => {
+      beforeWrite?.({ keptReceivedStock: false })
+      throw new Error('the bill gate did not throw')
+    },
+  }).deps)
+  assert.equal(refused.success, false)
+  assert.match(refused.error ?? '', /Cannot cancel a purchase order after supplier invoices have been recorded/)
+  assert.equal(nothingLanded.status, 'PO_SENT')
+
+  const partReceived: Po = { status: 'PARTIALLY_RECEIVED', reference: 'PO-B2', invoices: billed }
+  const ok = await cancelPurchaseOrderService('po-b2', makeDeps(partReceived, {
+    retirePurchaseOrderLocked: closeShortRetire({ reference: 'PO-B2', landedQty: 3, droppedQty: 2 }),
+  }).deps)
+  assert.equal(ok.success, true)
+  assert.equal(partReceived.status, 'CLOSED')
+})
+
+test('a billed-ahead-of-receipt close warns and logs a WARNING, and does not refuse', async () => {
+  const po: Po = { status: 'PARTIALLY_RECEIVED', reference: 'PO-W' }
+  const { deps, logs } = makeDeps(po, {
+    retirePurchaseOrderLocked: closeShortRetire({
+      reference: 'PO-W',
+      billedAhead: [{ poLineId: 'l1', sku: 'SKU-1', billedQty: 100, landedQty: 60, excessQty: 40, excessValueBase: 200 }],
+    }),
   })
-  assert.equal(consumedReadBeforeReversal, true)
-  const warning = logs.find((log) => log.action === 'cancelled_consumed_cogs_standing')
-  assert.ok(warning, 'expected a consumed-COGS WARNING activity log')
-  assert.equal(warning?.level, 'WARNING')
-  assert.deepEqual((warning?.metadata as { consumedValueBase: string }).consumedValueBase, '350')
+  const result = await cancelPurchaseOrderService('po-w', deps)
+  assert.equal(result.success, true)
+  assert.equal(result.warnings?.length, 1)
+  assert.match(result.warnings![0]!, /SKU-1: billed 100, received 60/)
+  assert.equal(logs.find((l) => l.action === 'closed_billed_ahead_of_receipt')?.level, 'WARNING')
+})
+
+test('a refusal from the retire step (live ASN) is returned and nothing is logged as cancelled', async () => {
+  const po: Po = { status: 'PO_SENT', reference: 'PO-A' }
+  const { deps, logs } = makeDeps(po, {
+    retirePurchaseOrderLocked: async () => { throw new Error('Cannot cancel PO-A: SKU-1 (ASN 55, OPEN) has an open warehouse ASN.') },
+  })
+  const result = await cancelPurchaseOrderService('po-a', deps)
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /open warehouse ASN/)
+  assert.equal(po.status, 'PO_SENT')
+  assert.deepEqual(logs.map((l) => `${l.action}:${l.level}`), ['cancelled:ERROR'])
 })
 
 test('audit-C3: cancelling a FREIGHT PO recalculates landed costs and surfaces the COGS corrections', async () => {
-  const po: { status: PurchaseOrderStatus; reference: string } = { status: 'DRAFT', reference: 'FRT-1' }
-  const logs: Array<{ action: string; entityId: string | null | undefined; metadata?: unknown }> = []
+  const po: Po = { status: 'DRAFT', reference: 'FRT-1', type: 'FREIGHT' }
   let recalcCalledWithFreightPoId: string | null = null
   let recalcRanAfterStatusFlip = false
   let statusFlipped = false
   let journalsQueued = false
-
-  const tx = {
+  const base = makeDeps(po)
+  const flipTx = {
     $queryRaw: async () => [],
     purchaseOrder: {
-      findUnique: async () => ({
-        status: po.status,
-        reference: po.reference,
-        type: 'FREIGHT',
-        lines: [],
-        invoices: [],
-        supplierCreditNotes: [],
-      }),
-      update: async ({ data }: { data: { status: typeof po.status } }) => {
+      findUnique: async () => ({ status: po.status, reference: po.reference, type: 'FREIGHT', invoices: [], supplierCreditNotes: [] }),
+      update: async ({ data }: { data: { status: PurchaseOrderStatus } }) => {
         po.status = data.status
         statusFlipped = true
         return { id: 'frt-1' }
@@ -449,15 +202,8 @@ test('audit-C3: cancelling a FREIGHT PO recalculates landed costs and surfaces t
     },
   }
   const deps: CancelPurchaseOrderServiceDeps = {
-    findPurchaseOrderFast: async () => ({ status: po.status, reference: po.reference }),
-    transaction: async (fn) => fn(tx as never),
-    logActivity: async (input) => { logs.push({ action: input.action, entityId: input.entityId, metadata: input.metadata }) },
-    enqueueStockSync: async () => {},
-    getAccountingSettings: async () => ({ syncEnabled: false, transitAccount: '140', inventoryAccount: '120' }) as never,
-    queueAccountingSyncTx: async () => ({ id: 'sync-1' }) as never,
-    readPurchaseOrderConsumedCostForCancellation: async () => ({ consumedQty: '0', consumedValueBase: '0', layers: [] }),
-    recordTransitSubledgerMovement: async () => {},
-    reversePurchaseOrderCostLayersForCancellation: async () => ({ reversedLayers: [], productIds: [], totalReversalValueBase: new Prisma.Decimal('0') }),
+    ...base.deps,
+    transaction: async (fn) => fn(flipTx as never),
     recalculateLandedCosts: (async (_tx: unknown, freightPoId: string) => {
       recalcCalledWithFreightPoId = freightPoId
       recalcRanAfterStatusFlip = statusFlipped
@@ -474,133 +220,55 @@ test('audit-C3: cancelling a FREIGHT PO recalculates landed costs and surfaces t
 
   const result = await cancelPurchaseOrderService('frt-1', deps)
   assert.equal(result.success, true)
-  // Recalc was invoked for the freight PO, AFTER its status was flipped to CANCELLED
-  // (so the recalc excludes it).
+  // Recalc was invoked for the freight PO, AFTER its status was flipped to CANCELLED (so the recalc excludes it).
   assert.equal(recalcCalledWithFreightPoId, 'frt-1')
   assert.equal(recalcRanAfterStatusFlip, true)
   assert.ok(result.landedCostRecalc, 'expected landedCostRecalc on the result')
   assert.equal(result.landedCostRecalc?.cogsAdjustments.length, 1)
   assert.equal(journalsQueued, true)
-  // A cogs_adjusted activity log was written against the affected primary PO.
-  const cogsLog = logs.find((log) => log.action === 'cogs_adjusted')
+  const cogsLog = base.logs.find((log) => log.action === 'cogs_adjusted')
   assert.ok(cogsLog, 'expected a cogs_adjusted log for the primary PO')
   assert.equal(cogsLog?.entityId, 'primary-1')
+  // The goods-order retire step is never used for a freight order.
+  assert.equal(base.calls.retire, 0)
 })
 
 test('audit-C3: cancelling a GOODS PO does NOT trigger a landed-cost recalc', async () => {
-  const po: { status: PurchaseOrderStatus; reference: string } = { status: 'DRAFT', reference: 'PO-2' }
-  let recalcCalled = false
-  const tx = {
-    $queryRaw: async () => [],
-    purchaseOrder: {
-      findUnique: async () => ({ status: po.status, reference: po.reference, type: 'GOODS', lines: [], invoices: [], supplierCreditNotes: [] }),
-      update: async ({ data }: { data: { status: typeof po.status } }) => { po.status = data.status; return { id: 'po-2' } },
-    },
-  }
-  const deps: CancelPurchaseOrderServiceDeps = {
-    findPurchaseOrderFast: async () => ({ status: po.status, reference: po.reference }),
-    transaction: async (fn) => fn(tx as never),
-    logActivity: async () => {},
-    enqueueStockSync: async () => {},
-    getAccountingSettings: async () => ({ syncEnabled: false, transitAccount: '140', inventoryAccount: '120' }) as never,
-    queueAccountingSyncTx: async () => ({ id: 'sync-1' }) as never,
-    readPurchaseOrderConsumedCostForCancellation: async () => ({ consumedQty: '0', consumedValueBase: '0', layers: [] }),
-    recordTransitSubledgerMovement: async () => {},
-    reversePurchaseOrderCostLayersForCancellation: async () => ({ reversedLayers: [], productIds: [], totalReversalValueBase: new Prisma.Decimal('0') }),
-    recalculateLandedCosts: (async () => { recalcCalled = true; return {} as never }) as never,
-    queueLandedCostAdjustmentJournals: async () => ({ owed: 0 }),
-  }
+  const po: Po = { status: 'DRAFT', reference: 'PO-2' }
+  const { deps, calls } = makeDeps(po)
   const result = await cancelPurchaseOrderService('po-2', deps)
   assert.equal(result.success, true)
-  assert.equal(recalcCalled, false)
+  assert.equal(calls.recalc, 0)
   assert.equal(result.landedCostRecalc, undefined)
 })
 
 test('audit-g5u2.4: an invoiced FREIGHT PO fully offset by POSTED credit notes can be cancelled; uncredited is blocked', async () => {
   const mk = (creditBase: number) => {
-    const po: { status: PurchaseOrderStatus; reference: string } = { status: 'PARTIALLY_RECEIVED', reference: 'FRT-CN' }
-    const tx = {
-      $queryRaw: async () => [],
-      purchaseOrder: {
-        findUnique: async () => ({
-          status: po.status,
-          reference: po.reference,
-          type: 'FREIGHT',
-          lines: [],
-          invoices: [{ id: 'inv-1', totalBase: 100 }],
-          supplierCreditNotes: creditBase > 0 ? [{ purchaseInvoiceId: 'inv-1', amountBase: creditBase }] : [],
-        }),
-        update: async ({ data }: { data: { status: typeof po.status } }) => { po.status = data.status; return { id: 'frt-cn' } },
-      },
+    const po: Po = {
+      status: 'PARTIALLY_RECEIVED',
+      reference: 'FRT-CN',
+      type: 'FREIGHT',
+      invoices: [{ id: 'inv-1', totalBase: 100 }],
+      creditNotes: creditBase > 0 ? [{ purchaseInvoiceId: 'inv-1', amountBase: creditBase }] : [],
     }
-    const deps: CancelPurchaseOrderServiceDeps = {
-      findPurchaseOrderFast: async () => ({ status: po.status, reference: po.reference }),
-      transaction: async (fn) => fn(tx as never),
-      logActivity: async () => {},
-      enqueueStockSync: async () => {},
-      getAccountingSettings: async () => ({ syncEnabled: false, transitAccount: '140', inventoryAccount: '120' }) as never,
-      queueAccountingSyncTx: async () => ({ id: 'sync-1' }) as never,
-      readPurchaseOrderConsumedCostForCancellation: async () => ({ consumedQty: '0', consumedValueBase: '0', layers: [] }),
-      recordTransitSubledgerMovement: async () => {},
-      reversePurchaseOrderCostLayersForCancellation: async () => ({ reversedLayers: [], productIds: [], totalReversalValueBase: new Prisma.Decimal('0') }),
-      recalculateLandedCosts: (async () => ({ revalidatePoIds: [], auditRunIds: [], cogsAdjustments: [], inventoryTransitAdjustments: [], warnings: [] })) as never,
-      queueLandedCostAdjustmentJournals: async () => ({ owed: 0 }),
+    return {
+      po,
+      ...makeDeps(po, {
+        recalculateLandedCosts: (async () => ({ revalidatePoIds: [], auditRunIds: [], cogsAdjustments: [], inventoryTransitAdjustments: [], warnings: [] })) as never,
+      }),
     }
-    return { po, deps }
   }
 
-  // Fully credited (100 base == bill 100 base) → cancel allowed.
+  // Fully credited (100 base == bill 100 base) -> cancel allowed.
   const credited = mk(100)
   const ok = await cancelPurchaseOrderService('frt-cn', credited.deps)
   assert.equal(ok.success, true)
   assert.equal(credited.po.status, 'CANCELLED')
 
-  // Uncredited freight bill → blocked (service catches and returns success:false).
+  // Uncredited freight bill -> blocked (service catches and returns success:false).
   const uncredited = mk(0)
   const blocked = await cancelPurchaseOrderService('frt-cn', uncredited.deps)
   assert.equal(blocked.success, false)
   assert.match(blocked.error ?? '', /not fully offset by posted credit notes/)
   assert.equal(uncredited.po.status, 'PARTIALLY_RECEIVED') // unchanged
-})
-
-test('cancelPurchaseOrderService records a +transit subledger row (DR transit / CR inventory reversal) — 6oyu.4', async () => {
-  const po: { status: PurchaseOrderStatus; reference: string } = { status: 'PARTIALLY_RECEIVED', reference: 'PO-T' }
-  const transitRows: Array<{ sourceType: string; sourceRef: string; idempotencyKey: string; baseDelta: number }> = []
-  const tx = {
-    $queryRaw: async () => [],
-    purchaseOrder: {
-      findUnique: async () => ({
-        status: po.status, reference: po.reference,
-        lines: [{ id: 'po-line-1' }], invoices: [], supplierCreditNotes: [],
-      }),
-      update: async ({ data }: { data: { status: typeof po.status } }) => { po.status = data.status; return { id: 'po-1' } },
-    },
-  }
-  const deps: CancelPurchaseOrderServiceDeps = {
-    findPurchaseOrderFast: async () => ({ status: po.status, reference: po.reference }),
-    transaction: async (fn) => fn(tx as never),
-    logActivity: async () => {},
-    enqueueStockSync: async () => {},
-    getAccountingSettings: async () => ({ syncEnabled: true, transitAccount: '140', inventoryAccount: '120' }) as never,
-    queueAccountingSyncTx: async () => true as never,
-    recordTransitSubledgerMovement: async (_tx, input) => {
-      transitRows.push({ sourceType: input.sourceType, sourceRef: input.sourceRef, idempotencyKey: input.idempotencyKey, baseDelta: Number(input.baseDelta) })
-    },
-    reversePurchaseOrderCostLayersForCancellation: async () => ({
-      reversedLayers: [{ costLayerId: 'layer-1', poLineId: 'po-line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: '2.000000', unitCostBase: '5.000000', totalValueBase: '10.000000' }],
-      productIds: ['product-1'],
-      totalReversalValueBase: new Prisma.Decimal('10'),
-    }),
-    readPurchaseOrderConsumedCostForCancellation: async () => ({ consumedQty: '0', consumedValueBase: '0', layers: [] }),
-    recalculateLandedCosts: async () => ({} as never),
-    queueLandedCostAdjustmentJournals: async () => ({ owed: 0 }),
-  }
-
-  await cancelPurchaseOrderService('po-1', deps)
-
-  assert.equal(transitRows.length, 1)
-  assert.equal(transitRows[0]!.sourceType, 'PURCHASE_ORDER_CANCEL')
-  assert.equal(transitRows[0]!.sourceRef, 'po-1')
-  // DR transit → positive (reversing received inventory back into transit); magnitude = reversal value.
-  assert.equal(transitRows[0]!.baseDelta, 10)
 })

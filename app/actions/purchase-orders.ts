@@ -33,6 +33,7 @@ import {
   derivePurchaseOrderReceiptStatus,
   loadPurchaseOrderLineLandedQty,
   loadPurchaseOrderLineOutstandingQty,
+  PO_LANDED_QTY_EPSILON,
   requirePoLineLandedQty,
   requirePoLineOutstandingQty,
 } from '@/lib/domain/inventory/po-line-landed-quantity'
@@ -106,6 +107,21 @@ import {
 import { describeFlooredLandedCredit, type FlooredLandedCreditEntry } from '@/lib/domain/purchasing/landed-cost-floor-text'
 import { logFlooredLandedCredit } from '@/lib/domain/purchasing/landed-cost-floor-activity'
 import type { CancelPurchaseOrderResult } from '@/lib/domain/purchasing/cancellation-service'
+import {
+  isPurchaseOrderEditableStatus,
+  normaliseCostLinesForCompare,
+  planLineAmend,
+  PO_EDIT_REFUSED_STATUS_MESSAGE,
+  readPoEditFacts,
+  unitCostMatchesStored,
+  type PoEditFacts,
+} from '@/lib/domain/purchasing/po-edit-plan'
+import {
+  describeBilledAhead,
+  describeRetireOutcome,
+  retirePurchaseOrderLocked,
+  type RetireOutcome,
+} from '@/lib/domain/purchasing/po-close-short'
 import { assertFinitePurchaseReceiptUnitCost } from '@/lib/domain/purchasing/purchase-receipt-cost'
 import { sumReceiptQtyByPoLine } from '@/lib/domain/purchasing/receipt-quantities'
 import { computePurchaseOrderOverBilling, type PurchaseOrderOverBillingSummary } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
@@ -293,6 +309,8 @@ export type PoDetail = PoRow & {
 }
 
 export type PoLineInput = {
+  /** The id of the existing order line this row edits. Omitted for a new line. Used by an in-place amend (the order has had goods, a bill or an ASN). */
+  poLineId?: string | null
   productId: string
   sku: string
   productName: string
@@ -1454,11 +1472,61 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
  * A draft edit. There is no rate input: the stored rate is kept, and re-read from fx_rates (at "now") only when the currency changes or `refreshFxRate` is true.
  * `fxRateAsOf` is not an edit field.
  */
+const AMEND_HEADER_FROZEN_MESSAGE =
+  'This order has been received against, billed or booked with a warehouse, so its supplier, currency, exchange rate and VAT cannot be changed. '
+  + 'Return or close it and raise a new order.'
+
+/**
+ * AMEND mode (lib/domain/purchasing/po-edit-plan.ts): the header money of an order that goods, a bill or an ASN have touched is
+ * frozen — receipts, bills and ASNs were costed and posted in them. A field that is sent unchanged passes. Returns the refusal, or null.
+ */
+function checkAmendHeader(
+  input: UpdatePoInput,
+  locked: {
+    supplierId: string
+    currency: string
+    taxRateName: string | null
+    taxRatePercent: unknown
+    discountAmount: unknown
+    destinationWarehouseId: string | null
+  },
+  facts: PoEditFacts,
+): string | null {
+  const billed = facts.billCount > 0
+  if (input.supplierId !== undefined && input.supplierId !== locked.supplierId) return AMEND_HEADER_FROZEN_MESSAGE
+  if (input.currency !== undefined && input.currency !== locked.currency) return AMEND_HEADER_FROZEN_MESSAGE
+  if (input.refreshFxRate === true) return AMEND_HEADER_FROZEN_MESSAGE
+  const nameDiffers = input.taxRateName !== undefined && (input.taxRateName || null) !== (locked.taxRateName || null)
+  const valueDiffers = input.taxRateValue !== undefined && Math.abs(input.taxRateValue - Number(locked.taxRatePercent ?? 0)) > 1e-6
+  if (nameDiffers || valueDiffers) return billed ? PO_BILLED_FIGURES_EDIT_MESSAGE : AMEND_HEADER_FROZEN_MESSAGE
+  if (billed && input.orderDiscountForeign !== undefined && Math.abs(input.orderDiscountForeign - Number(locked.discountAmount ?? 0)) > 0.005) {
+    return PO_BILLED_FIGURES_EDIT_MESSAGE
+  }
+  if (input.additionalCosts !== undefined && (billed || facts.anyLanded)) {
+    const requested = normaliseCostLinesForCompare(input.additionalCosts)
+    const stored = normaliseCostLinesForCompare(facts.costLines)
+    if (requested.length !== stored.length || requested.some((entry, i) => entry !== stored[i])) {
+      return billed
+        ? PO_BILLED_FIGURES_EDIT_MESSAGE
+        : 'Goods have already been received, so the order\'s freight and other cost lines are part of the cost of the stock and cannot be changed.'
+    }
+  }
+  if (
+    input.destinationWarehouseId !== undefined
+    && (input.destinationWarehouseId || null) !== (locked.destinationWarehouseId || null)
+    && facts.anyLiveAsn
+  ) {
+    const asn = facts.lines.flatMap((l) => l.liveAsn).map((b) => `${b.externalAsnId}, ${b.status}`)
+    return `The destination warehouse cannot be changed while a warehouse ASN is open (${[...new Set(asn)].join('; ')}). Book the goods in through the ASN or retire it first.`
+  }
+  return null
+}
+
 export type UpdatePoInput = Partial<Omit<CreatePoInput, 'fxRateAsOf' | 'expectedFxRate'>> & { refreshFxRate?: boolean }
 
 export async function updatePurchaseOrder(
   id: string,
-  input: UpdatePoInput,
+  requestedEdit: UpdatePoInput,
 ): Promise<{ success: boolean; po?: PoRow; error?: string }> {
   try {
     const session = await requirePermission('purchasing.create')
@@ -1476,7 +1544,7 @@ export async function updatePurchaseOrder(
       },
     })
     if (!existing) return { success: false, error: 'PO not found' }
-    if (existing.status !== 'DRAFT') return { success: false, error: 'Only DRAFT POs can be edited' }
+    if (!isPurchaseOrderEditableStatus(existing.status)) return { success: false, error: PO_EDIT_REFUSED_STATUS_MESSAGE }
 
     // ─── o3d-fgu3: THE WHOLE DRAFT EDIT IS ONE TRANSACTION, PARENT FIRST ───
     //
@@ -1491,14 +1559,22 @@ export async function updatePurchaseOrder(
     // pool-size concurrent edits would exhaust the pool and time out holding locks (Codex HIGH, o3d-fgu3).
     // lock. It touches no cost layer and no stock row, so it is not a participant in the cost_layers vs
     // stock_levels order (o3d-chs1h). A refusal returns before any write; any throw rolls the lot back.
+    // A HOLDER, not a bare `let`: assigned inside the transaction callback (the idiom this file uses for the same reason).
+    const amendOutcome: { amended?: boolean; summary?: { changed: number; added: number; removed: number } } = {}
     const edit = await db.$transaction(async (tx) => {
       await lockPurchaseOrdersWithCostRows(tx, [id])
       const locked = await tx.purchaseOrder.findUnique({
         where: { id },
         select: {
           status: true,
+          type: true,
+          supplierId: true,
           currency: true,
           fxRateToBase: true,
+          taxRateName: true,
+          taxRatePercent: true,
+          discountAmount: true,
+          destinationWarehouseId: true,
           subtotalForeign: true,
           taxForeign: true,
           totalForeign: true,
@@ -1507,13 +1583,38 @@ export async function updatePurchaseOrder(
         },
       })
       if (!locked) return { refused: 'PO not found' }
-      if (locked.status !== 'DRAFT') return { refused: 'Only DRAFT POs can be edited' }
-      // A bill already exists: this edit would recompute the order's totals, VAT or exchange rate and leave the bill
-      // on the old figures. Header-only edits (notes, delivery date, references) are unaffected.
-      const changesBilledFigures = input.lines !== undefined || input.additionalCosts !== undefined || input.taxRateId !== undefined
-        || input.taxRateName !== undefined || input.taxRateValue !== undefined || input.currency !== undefined || input.refreshFxRate === true
-      if (changesBilledFigures && (await tx.purchaseInvoice.count({ where: { poId: id } })) > 0) {
-        return { refused: PO_BILLED_FIGURES_EDIT_MESSAGE }
+      if (!isPurchaseOrderEditableStatus(locked.status)) return { refused: PO_EDIT_REFUSED_STATUS_MESSAGE }
+      // A freight order is edited through its own cost editor once it has left Draft (it has no goods lines to amend).
+      if (locked.type === 'FREIGHT' && locked.status !== 'DRAFT') return { refused: PO_EDIT_REFUSED_STATUS_MESSAGE }
+
+      // WHICH EDIT THIS IS, decided from facts read under the lock (lib/domain/purchasing/po-edit-plan.ts). A PRISTINE order
+      // — no receipt, bill, return, landed quantity or ASN row of any state — gets the full edit below in every editable
+      // status. Anything else is AMENDED IN PLACE: line ids are kept, touched lines keep their price, header money is frozen.
+      const editFacts = await readPoEditFacts(tx, id)
+      if (!editFacts) return { refused: 'PO not found' }
+      const amend = !editFacts.pristine
+      amendOutcome.amended = amend
+      // In AMEND mode the header VAT is frozen at the stored values: a request that omits it (or sends the same) keeps it.
+      const input: UpdatePoInput = amend
+        ? {
+            ...requestedEdit,
+            taxRateName: requestedEdit.taxRateName ?? locked.taxRateName ?? undefined,
+            taxRateValue: requestedEdit.taxRateValue ?? Number(locked.taxRatePercent ?? 0),
+          }
+        : requestedEdit
+
+      if (amend) {
+        const frozen = checkAmendHeader(requestedEdit, locked, editFacts)
+        if (frozen) return { refused: frozen }
+      } else {
+        // A bill already exists: this edit would recompute the order's totals, VAT or exchange rate and leave the bill
+        // on the old figures. Header-only edits (notes, delivery date, references) are unaffected. (A pristine order has
+        // no bill; the guard stays as the backstop for the full edit.)
+        const changesBilledFigures = input.lines !== undefined || input.additionalCosts !== undefined || input.taxRateId !== undefined
+          || input.taxRateName !== undefined || input.taxRateValue !== undefined || input.currency !== undefined || input.refreshFxRate === true
+        if (changesBilledFigures && (await tx.purchaseInvoice.count({ where: { poId: id } })) > 0) {
+          return { refused: PO_BILLED_FIGURES_EDIT_MESSAGE }
+        }
       }
       const shouldRefreshFxRate = (input.currency !== undefined && input.currency !== locked.currency) || input.refreshFxRate === true
       const rateOnlyFxRefresh = shouldRefreshFxRate && input.lines === undefined && input.additionalCosts === undefined
@@ -1565,7 +1666,12 @@ export async function updatePurchaseOrder(
         }
 
         // Validate every line's product is purchasable.
-        const productIdsForTax = Array.from(new Set(input.lines.map((l) => l.productId).filter(Boolean)))
+        // (An amend checks only lines that are NEW to the order: an existing line keeps its product, and a product archived since
+        // it was ordered must not block editing the rest of the order.)
+        const productIdsForTax = Array.from(new Set(
+          input.lines.filter((l) => !amend || !l.poLineId || !editFacts.lines.some((f) => f.id === l.poLineId && f.productId === l.productId))
+            .map((l) => l.productId).filter(Boolean),
+        ))
         if (productIdsForTax.length) {
           const productRows = await tx.product.findMany({
             where: { id: { in: productIdsForTax } },
@@ -1581,8 +1687,8 @@ export async function updatePurchaseOrder(
         const priorLineRates = new Set((await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { taxRateId: true } })).map((l) => l.taxRateId))
         const lineResolved = await resolvePurchaseLineTaxRates(input.lines, orderDefaultCtx, tx, priorLineRates)
 
-        // Delete existing lines and recreate
-        await tx.purchaseOrderLine.deleteMany({ where: { poId: id } })
+        // FULL edit: delete existing lines and recreate. AMEND: lines are reconciled in place further down (ids are kept).
+        if (!amend) await tx.purchaseOrderLine.deleteMany({ where: { poId: id } })
         // Also clear any pre-existing purchase-unit aggregate data on the PO
         // line level — the edit form currently operates in stock-unit terms
         // (purchaseUnitId is not edited inline), so we preserve only what
@@ -1633,7 +1739,60 @@ export async function updatePurchaseOrder(
             sortOrder: l.sortOrder ?? i,
           }
         })
-        await tx.purchaseOrderLine.createMany({ data: lineData })
+        if (!amend) {
+          await tx.purchaseOrderLine.createMany({ data: lineData })
+        } else {
+          const plan = planLineAmend(editFacts, input.lines.map((l) => ({ poLineId: l.poLineId, productId: l.productId, qty: l.qty })))
+          if (!plan.ok) return { refused: plan.error }
+          const round4 = (n: number) => Math.round(n * 10000) / 10000
+          const finalRows: Array<{ totalForeign: number; totalBase: number; taxForeign: number; taxBase: number }> = []
+          const lineUpdates: Array<{ id: string; data: Record<string, unknown> }> = []
+          for (const k of plan.keep) {
+            const req = input.lines[k.requestIndex]!
+            const row = lineData[k.requestIndex]!
+            if (k.touched) {
+              // Received, billed or returned: the cost layers and the bill carry this price, so it is not editable here.
+              if (!unitCostMatchesStored(row.unitCostForeign, k.fact.unitCostForeign)) {
+                return { refused: `${k.fact.sku ?? k.fact.id}: the price is locked because this line has been received, billed or returned. Correct it on the supplier bill or with a credit note.` }
+              }
+              const scaled = k.qtyChanged
+                ? {
+                    totalForeign: round4(req.qty * k.fact.unitCostForeign),
+                    totalBase: round4(req.qty * k.fact.unitCostBase),
+                    taxForeign: round4(k.fact.qty > 0 ? (k.fact.taxForeign / k.fact.qty) * req.qty : 0),
+                    taxBase: round4(k.fact.qty > 0 ? (k.fact.taxBase / k.fact.qty) * req.qty : 0),
+                  }
+                : { totalForeign: k.fact.totalForeign, totalBase: k.fact.totalBase, taxForeign: k.fact.taxForeign, taxBase: k.fact.taxBase }
+              lineUpdates.push({
+                id: k.fact.id,
+                data: {
+                  qty: req.qty,
+                  ...scaled,
+                  ...(k.qtyChanged ? { purchaseUnitQty: row.purchaseUnitQty } : {}),
+                  description: row.description,
+                  sortOrder: row.sortOrder,
+                },
+              })
+              finalRows.push(scaled)
+            } else {
+              const { poId: _poId, ...rowData } = row
+              lineUpdates.push({ id: k.fact.id, data: rowData })
+              finalRows.push(row)
+            }
+          }
+          for (const index of plan.create) finalRows.push(lineData[index]!)
+          if (plan.remove.length > 0) {
+            await tx.purchaseOrderLine.deleteMany({ where: { poId: id, id: { in: plan.remove.map((l) => l.id) } } })
+          }
+          for (const u of lineUpdates) await tx.purchaseOrderLine.update({ where: { id: u.id }, data: u.data })
+          if (plan.create.length > 0) await tx.purchaseOrderLine.createMany({ data: plan.create.map((index) => lineData[index]!) })
+          // The totals are those of the lines that remain, with untouched-and-unchanged lines at their stored figures.
+          subtotalForeign = finalRows.reduce((sum, r) => sum + r.totalForeign, 0)
+          subtotalBase = finalRows.reduce((sum, r) => sum + r.totalBase, 0)
+          totalTaxForeign = finalRows.reduce((sum, r) => sum + r.taxForeign, 0)
+          totalTaxBase = finalRows.reduce((sum, r) => sum + r.taxBase, 0)
+          amendOutcome.summary = { changed: plan.keep.filter((k) => k.qtyChanged || !k.touched).length, added: plan.create.length, removed: plan.remove.length }
+        }
 
         // Order-level discount (mirrors createPurchaseOrder exactly). Split
         // proportionally across net subtotal and line VAT using the pre-
@@ -1661,7 +1820,18 @@ export async function updatePurchaseOrder(
         // createPurchaseOrder exactly: replace all freightCostLines, rebuild
         // directFreight aggregates, and fold VAT on vatable costs into the
         // order tax totals.
-        if (input.additionalCosts !== undefined) {
+        const costsFrozen = amend && (editFacts.billCount > 0 || editFacts.anyLanded)
+        const costsRewritten = input.additionalCosts !== undefined && !costsFrozen
+        if (amend && !costsRewritten) {
+          // The stored cost lines stay (a billed or received-against cost line is referenced by id); their VAT is folded in
+          // from the stored rows so the header tax does not lose it.
+          const storedVatBase = editFacts.costLines
+            .filter((c) => c.vatable && vatRate > 0)
+            .reduce((sum, c) => sum + Math.round(c.amountForeign * vatRate * 10000) / 10000, 0)
+          totalTaxForeign += storedVatBase
+          totalTaxBase += Math.round((storedVatBase / fxRate) * 10000) / 10000
+        }
+        if (costsRewritten) {
           await tx.freightCostLine.deleteMany({ where: { poId: id } })
           let directFreightForeign = 0
           let additionalCostVatForeign = 0
@@ -1772,8 +1942,10 @@ export async function updatePurchaseOrder(
       action: 'updated',
       tag: 'purchase',
       level: 'INFO',
-      description: `Updated PO ${mapped.reference}`,
-      metadata: { reference: mapped.reference },
+      description: amendOutcome.amended
+        ? `Amended PO ${mapped.reference} in place${amendOutcome.summary ? ` (${amendOutcome.summary.changed} line(s) changed, ${amendOutcome.summary.added} added, ${amendOutcome.summary.removed} removed)` : ''}`
+        : `Updated PO ${mapped.reference}`,
+      metadata: { reference: mapped.reference, status: existing.status, ...(amendOutcome.amended ? { amended: true, ...amendOutcome.summary } : {}) },
     })
     return { success: true, po: mapped }
   } catch (e) {
@@ -1794,7 +1966,7 @@ export async function advancePoStatus(
   id: string,
   targetStatus: 'PO_SENT' | 'RFQ_SENT' | 'QUOTE_RECEIVED' | 'SHIPPED' | 'CLOSED',
   payload?: { trackingNumber?: string; shippingProvider?: string },
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; notice?: string; warnings?: string[]; closedShort?: boolean }> {
   try {
     await requirePermission('purchasing.create')
     const result = await db.$transaction(async (tx) => {
@@ -1802,10 +1974,18 @@ export async function advancePoStatus(
       const existing = await tx.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
       if (!existing) throw new Error('PO not found')
       if (existing.status === targetStatus) {
-        return { existing, changed: false, preferredSupplierUpdate: { productIds: [], updatedCount: 0 } }
+        return { existing, changed: false, preferredSupplierUpdate: { productIds: [], updatedCount: 0 }, retired: null as RetireOutcome | null }
       }
       const transition = validatePurchaseOrderStatusTransition(existing.status, targetStatus)
       if (!transition.success) throw new Error(transition.error)
+
+      // Close: one operation at every stage. Nothing landed -> the order is retired; something landed -> close-short (the
+      // received stock and its cost stay, the unreceived balance is dropped). A live warehouse ASN refuses. Read and written
+      // under the row lock taken above, so a receipt cannot land between the facts and the status write.
+      if (targetStatus === 'CLOSED') {
+        const retired = await retirePurchaseOrderLocked(tx, id, 'close')
+        return { existing, changed: true, preferredSupplierUpdate: { productIds: [], updatedCount: 0 }, retired }
+      }
 
       const now = new Date()
       const data: Record<string, unknown> = { status: targetStatus }
@@ -1820,29 +2000,55 @@ export async function advancePoStatus(
       const preferredSupplierUpdate = targetStatus === 'PO_SENT'
         ? await updatePreferredSuppliersForPlacedPurchaseOrder(tx, id, now)
         : { productIds: [], updatedCount: 0 }
-      return { existing, changed: true, preferredSupplierUpdate }
+      return { existing, changed: true, preferredSupplierUpdate, retired: null as RetireOutcome | null }
     }, STOCK_TX_OPTIONS)
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
+    const warnings: string[] = []
     if (result.changed) {
       await logActivity({
         entityType: 'PURCHASE_ORDER',
         entityId: id,
-        action: 'status_changed',
+        action: result.retired?.keptReceivedStock ? 'closed_short' : 'status_changed',
         tag: 'purchase',
         level: 'INFO',
-        description: `Advanced PO ${result.existing.reference} to ${targetStatus}`,
+        description: result.retired
+          ? describeRetireOutcome(result.retired, 'close')
+          : `Advanced PO ${result.existing.reference} to ${targetStatus}`,
         metadata: {
           reference: result.existing.reference,
           previousStatus: result.existing.status,
           newStatus: targetStatus,
           preferredSupplierUpdatedCount: result.preferredSupplierUpdate.updatedCount,
           preferredSupplierCandidateCount: result.preferredSupplierUpdate.productIds.length,
+          ...(result.retired ? { keptReceivedStock: result.retired.keptReceivedStock, receivedQty: result.retired.landedQty, droppedQty: result.retired.droppedQty } : {}),
         },
       })
+      const billedAheadWarning = result.retired ? describeBilledAhead(result.retired.billedAhead) : null
+      if (billedAheadWarning && result.retired) {
+        warnings.push(billedAheadWarning)
+        try {
+          await logActivity({
+            entityType: 'PURCHASE_ORDER',
+            entityId: id,
+            action: 'closed_billed_ahead_of_receipt',
+            tag: 'purchase',
+            level: 'WARNING',
+            description: `${result.retired.reference}: ${billedAheadWarning}`,
+            metadata: { reference: result.retired.reference, lines: result.retired.billedAhead },
+          })
+        } catch (logError) {
+          console.error('Failed to log billed-ahead warning:', logError)
+        }
+      }
     }
 
-    return { success: true }
+    return {
+      success: true,
+      ...(result.retired ? { notice: describeRetireOutcome(result.retired, 'close') } : {}),
+      ...(result.retired?.keptReceivedStock ? { closedShort: true } : {}),
+      ...(warnings.length > 0 ? { warnings } : {}),
+    }
   } catch (e) {
     await logActivity({
       entityType: 'PURCHASE_ORDER',
@@ -2148,7 +2354,9 @@ export async function receivePurchaseOrder(
       )
       for (const [poLineId, totalQty] of sumReceiptQtyByPoLine(linesWithQty)) {
         const poLine = lockedLineMap.get(poLineId)
-        if (!poLine) throw new Error('Invalid PO line')
+        // An edit that committed between the page load and this lock can have rebuilt the line set (an edit before the first
+        // receipt does): the receipt is refused plainly, with nothing written.
+        if (!poLine) throw new Error('Invalid PO line: this order was changed while you were receiving. Reload the page and try again.')
         const outstanding = requirePoLineOutstandingQty(lockedOutstanding, poLineId).qty
         if (roundQuantity(totalQty, 6).greaterThan(roundQuantity(outstanding, 6))) {
           throw new Error(`Cannot receive more than outstanding qty (${roundQuantity(outstanding, 6).toNumber()}) for line ${poLineId}`)
@@ -2664,6 +2872,14 @@ export async function returnPurchaseOrder(
       // return and the receipt take {stock_levels, purchase_order_lines} in the SAME order. The gate this
       // needs is the parent; the line locks stay exactly where audit-18s1 put them.
       await lockPurchaseOrders(tx, [id])
+      // The status gate above read the order UNLOCKED. A close or cancel that committed in between would otherwise be
+      // overwritten by the status write below (a CLOSED order flipping back to PARTIALLY_RETURNED), so it is re-read here,
+      // under the lock, and the return is refused. Close and return serialise on this row.
+      const lockedStatusRow = await tx.purchaseOrder.findUnique({ where: { id }, select: { status: true } })
+      if (!lockedStatusRow || !returnable.includes(lockedStatusRow.status as PoStatus)) {
+        throw new Error('Cannot return from a PO in this status')
+      }
+      const statusBeforeReturn = lockedStatusRow.status as PoStatus
 
       // audit-18s1: acquire locks in the SAME order the goods-receipt path uses
       // (stock_levels first, then PO lines) to avoid an AB/BA deadlock — receipt
@@ -2805,17 +3021,28 @@ export async function returnPurchaseOrder(
       }
       const updatedLines = await tx.purchaseOrderLine.findMany({
         where: { poId: id },
-        select: { qtyReceived: true, qtyReturned: true },
+        select: { id: true, qty: true, qtyReceived: true, qtyReturned: true },
       })
       const anyReturned = updatedLines.some((line) => Number(line.qtyReturned) > 0)
       const allReceivedReturned = updatedLines
         .filter((line) => Number(line.qtyReceived) > 0)
         .every((line) => Number(line.qtyReturned) >= Number(line.qtyReceived) - 1e-6)
       if (anyReturned) {
-        await tx.purchaseOrder.update({
-          where: { id },
-          data: { status: allReceivedReturned ? 'RETURNED' : 'PARTIALLY_RETURNED' },
-        })
+        // A return is a stock event; it must not strand the unreceived balance. While any line still has quantity
+        // outstanding (ordered minus LANDED, the same definition receipt and book-in use) the order stays open for
+        // receipt, edit, close and cancel: PARTIALLY_RECEIVED. Only an order with nothing left to receive moves to
+        // PARTIALLY_RETURNED / RETURNED. A RECEIVED / INVOICED order has nothing outstanding by definition.
+        const landedAfterReturn = await loadPurchaseOrderLineLandedQty(tx, updatedLines)
+        const hasOutstanding = ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'PARTIALLY_RETURNED'].includes(statusBeforeReturn)
+          && updatedLines.some((line) => Number(line.qty) - requirePoLineLandedQty(landedAfterReturn, line.id).qtyNumber > PO_LANDED_QTY_EPSILON)
+        const statusAfterReturn: PoStatus = hasOutstanding
+          ? (statusBeforeReturn === 'PO_SENT' || statusBeforeReturn === 'SHIPPED' ? statusBeforeReturn : 'PARTIALLY_RECEIVED')
+          : (allReceivedReturned ? 'RETURNED' : 'PARTIALLY_RETURNED')
+        if (statusAfterReturn !== statusBeforeReturn) {
+          const returnTransition = validatePurchaseOrderStatusTransition(statusBeforeReturn, statusAfterReturn)
+          if (!returnTransition.success) throw new Error(returnTransition.error)
+          await tx.purchaseOrder.update({ where: { id }, data: { status: statusAfterReturn } })
+        }
       }
 
       // audit-C4: compute over-billing inside the tx so qtyReturned reflects

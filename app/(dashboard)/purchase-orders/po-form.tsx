@@ -41,13 +41,19 @@ type Props = {
   /**
    * When set, the dialog opens in **edit mode** — prefilled with the saved
    * PO and wired to call `updatePurchaseOrder` on save instead of creating
-   * a new PO. Only DRAFT POs can be edited.
+   * a new PO. Orders from Draft through Part-received can be edited; once goods, a bill or an ASN touch the order the edit is limited.
    */
   existingPo?: PoDetail | null
 }
 
 type LineItem = {
   key: string
+  /** The order line this row edits (omitted for a line added in this session). */
+  poLineId?: string
+  /** Lowest quantity allowed: what has been received, billed or returned (in the line's display unit's stock terms). 0 = free. */
+  floorQty?: number
+  /** Received, billed or returned: the cost layers and the bill carry the price, so price, discount, VAT and removal are locked. */
+  locked?: boolean
   productId: string
   sku: string
   productName: string
@@ -170,6 +176,12 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   const [isPending, startTransition] = useTransition()
   const isEditMode = !!existingPo
   const baseCurrency = useBaseCurrency()
+  // AMEND: goods, a bill or an ASN have touched the order. The server decides (it also sees ASN rows); this mirrors the part the
+  // page can see so the locked fields are greyed out instead of refused on save. Supplier, currency, rate and VAT are frozen; lines that
+  // were received, billed or returned keep their price and cannot be removed; cost lines are frozen once goods or a bill exist.
+  const touchedLines = existingPo ? existingPo.lines.filter((l) => l.qtyReceived > 0 || l.qtyBilled > 0 || l.qtyReturned > 0) : []
+  const amendMode = isEditMode && (touchedLines.length > 0 || !!existingPo?.isInvoiced)
+  const costsFrozen = isEditMode && (touchedLines.length > 0 || !!existingPo?.isInvoiced)
 
   // When editing, the PO HEADER carries the supplier's Default VAT Rate (the
   // order-level rate that is authoritative for every line). Match it from the
@@ -312,8 +324,12 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
       const displayQty = purchaseUnitId && l.purchaseUnitQty != null ? Number(l.purchaseUnitQty) : l.qty
       const displayUnitCost = purchaseUnitId ? preUnitCost * puFactor : preUnitCost
       const product = products.find((p) => p.id === l.productId)
+      const floorQty = Math.max(l.qtyReceived, l.qtyBilled, l.qtyReturned, 0)
       return {
         key: makeKey(),
+        poLineId: l.id,
+        floorQty,
+        locked: floorQty > 0,
         productId: l.productId,
         sku: l.sku,
         productName: l.productName,
@@ -677,6 +693,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
         const gross = l.qty * l.unitCostForeign
         const discAmount = parseDiscount(l.discount, gross)
         return {
+          poLineId: l.poLineId,
           productId: l.productId,
           sku: l.sku,
           productName: l.productName,
@@ -726,6 +743,18 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
       <DialogTitle>{isEditMode ? `Edit Purchase Order — ${existingPo?.reference ?? ''}` : 'New Purchase Order'}</DialogTitle>
     </DialogHeader>
     <div className="space-y-6">
+      {amendMode && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100 space-y-1">
+          <p className="font-medium">Part of this order has already been received, billed or returned.</p>
+          <ul className="list-disc pl-5 text-xs space-y-0.5">
+            <li>Supplier, currency, exchange rate and VAT are fixed. To change them, return or close this order and raise a new one.</li>
+            <li>Lines that have been received, billed or returned keep their price and cannot be removed. Their quantity cannot go below what has arrived.</li>
+            <li>To drop the quantity still due on a line, set it to the quantity received. To drop everything still due, use Close.</li>
+            <li>Freight and other cost lines are fixed once goods are in stock or a bill exists, and quantities cannot change on an order that carries them.</li>
+            <li>A line with an open warehouse ASN cannot be reduced or removed until the ASN is booked in or retired.</li>
+          </ul>
+        </div>
+      )}
       {/* Header fields */}
       <div className="rounded-md border p-4 space-y-4">
         <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">PO Details</h2>
@@ -739,6 +768,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                   id="supplier"
                   value={supplierId}
                   onChange={(e) => handleSupplierChange(e.target.value)}
+                  disabled={amendMode}
                   className="flex-1 min-w-0 h-9 rounded-md border border-input bg-background px-3 text-sm"
                 >
                   <option value="">Select supplier…</option>
@@ -786,6 +816,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
               <select
                 value={currency}
                 onChange={(e) => setCurrencyAndRate(e.target.value)}
+                disabled={amendMode}
                 className="w-28 h-9 rounded-md border border-input bg-background px-3 text-sm font-mono"
               >
                 <option value={baseCurrency.code}>{baseCurrency.code} {baseCurrency.symbol}</option>
@@ -815,6 +846,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
               <select
                 value={taxRateId}
                 onChange={(e) => handleTaxRateChange(e.target.value)}
+                disabled={amendMode}
                 className="flex-1 h-9 rounded-md border border-input bg-background px-3 text-sm"
               >
                 <option value="">No VAT</option>
@@ -827,6 +859,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                   <input
                     type="checkbox"
                     checked={pricesIncludeVat}
+                    disabled={amendMode}
                     onChange={(e) => toggleIncludeVat(e.target.checked)}
                     className="rounded border-input"
                   />
@@ -952,7 +985,8 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                     )}
                     <TableCell>
                       <Input
-                        type="number" min="1" step="1" value={line.qty}
+                        type="number" min={line.floorQty && line.floorQty > 0 ? line.floorQty : 1} step="1" value={line.qty}
+                        title={line.floorQty && line.floorQty > 0 ? `At least ${line.floorQty}: that much has been received, billed or returned` : undefined}
                         onChange={(e) => updateLine(line.key, 'qty', Number(e.target.value) || 0)}
                         className="h-7 text-sm text-right w-20 ml-auto"
                       />
@@ -969,6 +1003,8 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                     <TableCell>
                       <Input
                         type="number" min="0" step="0.01" value={line.unitCostForeign}
+                        disabled={line.locked}
+                        title={line.locked ? 'Locked: this line has been received, billed or returned' : undefined}
                         onChange={(e) => updateLine(line.key, 'unitCostForeign', Number(e.target.value) || 0)}
                         className="h-7 text-sm text-right w-32 ml-auto font-mono"
                       />
@@ -976,6 +1012,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                     <TableCell>
                       <Input
                         value={line.discount}
+                        disabled={line.locked}
                         onChange={(e) => setLines((p) => p.map((l) => l.key === line.key ? { ...l, discount: e.target.value } : l))}
                         placeholder={`${sym} or %`}
                         className={`h-7 text-sm text-right w-24 ml-auto font-mono ${parseDiscount(line.discount, line.qty * line.unitCostForeign) > 0 ? 'text-destructive' : ''}`}
@@ -990,6 +1027,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                         )}
                         <select
                           value={line.taxRateAutoResolved ? 'auto' : (line.taxRateId ?? '')}
+                          disabled={line.locked || amendMode}
                           onChange={(e) => setLineTaxRate(line.key, e.target.value as string)}
                           className="h-7 text-xs rounded-md border border-input bg-background px-1.5 font-mono w-28"
                           title={line.taxRateWarning ?? 'Follows the order/supplier VAT rate'}
@@ -1003,9 +1041,11 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                     </TableCell>
                     <TableCell className="text-right font-mono text-xs">{money(netForeign)}</TableCell>
                     <TableCell>
-                      <button type="button" onClick={() => setLines((p) => p.filter((l) => l.key !== line.key))} className="text-muted-foreground hover:text-destructive">
-                        <X className="h-4 w-4" />
-                      </button>
+                      {!line.locked && (
+                        <button type="button" onClick={() => setLines((p) => p.filter((l) => l.key !== line.key))} className="text-muted-foreground hover:text-destructive">
+                          <X className="h-4 w-4" />
+                        </button>
+                      )}
                     </TableCell>
                   </TableRow>
                 )
@@ -1054,7 +1094,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
       </div>
 
       {/* Additional Costs (Landed Cost) */}
-      <div className="rounded-md border p-4 space-y-3">
+      <fieldset disabled={costsFrozen} className="rounded-md border p-4 space-y-3 min-w-0">
         <div className="flex items-center justify-between">
           <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">Additional Costs</h2>
           <Button
@@ -1113,7 +1153,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
             ))}
           </div>
         )}
-      </div>
+      </fieldset>
 
       {/* Totals */}
       {lines.length > 0 && (

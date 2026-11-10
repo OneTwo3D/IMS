@@ -47,13 +47,13 @@ rules.
 | `DRAFT` | `RFQ_SENT`, `PO_SENT`, `CANCELLED` | - |
 | `INVOICED` | `PARTIALLY_RETURNED`, `RETURNED`, `CLOSED` | - |
 | `PARTIALLY_RECEIVED` | `RECEIVED`, `PARTIALLY_RETURNED`, `RETURNED`, `CLOSED`, `CANCELLED` | - |
-| `PARTIALLY_RETURNED` | `RETURNED` | - |
-| `PO_SENT` | `SHIPPED`, `PARTIALLY_RECEIVED`, `RECEIVED`, `PARTIALLY_RETURNED`, `RETURNED`, `CLOSED` | - |
-| `QUOTE_RECEIVED` | `PO_SENT`, `CLOSED` | - |
+| `PARTIALLY_RETURNED` | `RETURNED`, `PARTIALLY_RECEIVED`, `CLOSED`, `CANCELLED` | - |
+| `PO_SENT` | `SHIPPED`, `PARTIALLY_RECEIVED`, `RECEIVED`, `PARTIALLY_RETURNED`, `RETURNED`, `CLOSED`, `CANCELLED` | - |
+| `QUOTE_RECEIVED` | `PO_SENT`, `CLOSED`, `CANCELLED` | - |
 | `RECEIVED` | `INVOICED`, `PARTIALLY_RETURNED`, `RETURNED`, `CLOSED` | - |
 | `RETURNED` | None | Terminal. |
-| `RFQ_SENT` | `QUOTE_RECEIVED`, `PO_SENT`, `CLOSED` | - |
-| `SHIPPED` | `PARTIALLY_RECEIVED`, `RECEIVED`, `CLOSED` | - |
+| `RFQ_SENT` | `QUOTE_RECEIVED`, `PO_SENT`, `CLOSED`, `CANCELLED` | - |
+| `SHIPPED` | `PARTIALLY_RECEIVED`, `RECEIVED`, `CLOSED`, `CANCELLED` | - |
 
 ### Refunds
 
@@ -105,13 +105,24 @@ return leaves a line billed for more than the quantity now kept
 over-billed amount). Reducing the AP liability is a manual step — raise a
 supplier credit; IMS does not yet post a credit memo automatically (audit-C4).
 
-**Cancellation and already-consumed cost.** Cancelling a PO reverses the
-remaining (still-on-hand) receipt cost layers. Units already sold or used keep
-their COGS booked against the cancelled receipt. When that consumed quantity is
-non-zero, cancellation emits a `cancelled_consumed_cogs_standing` WARNING and the
-UI surfaces the consumed units and value for finance review — IMS does not
-reverse COGS for stock that has already left (audit-H8). Cancellation remains
-blocked entirely once a supplier invoice exists.
+**Closing, cancelling and close-short.** Close and Cancel are open at every stage from RFQ
+Sent to Partially Received (a Draft can only be cancelled; Received can only be closed). With
+nothing received, Close ends `CLOSED` and Cancel ends `CANCELLED`, and neither touches stock or the
+ledger. With goods received, Cancel and Close are the **same operation, close-short**: the
+unreceived balance is dropped, the received stock, `qtyReceived`, FIFO cost layers and journals are
+left exactly as they are, and the order ends `CLOSED` (activity `closed_short` /
+`cancelled_closed_short`). Nothing is reversed: taking received goods back out is the supplier-return
+flow's job, and a return no longer strands the order (while any line has quantity outstanding the
+order stays `PARTIALLY_RECEIVED`). An order with an open warehouse ASN is refused. A cancel with
+nothing received is still refused once a supplier bill exists; a close-short is not (nothing is
+orphaned). A bill raised for more than was received produces a `closed_billed_ahead_of_receipt`
+WARNING rather than a refusal.
+
+**Editing.** Orders are editable from `DRAFT` to `PARTIALLY_RECEIVED`. An order nothing has touched
+(no receipt, bill, return, landed quantity or ASN row) gets the full draft edit; any other order is
+amended in place (line ids kept; received, billed or returned lines keep their price and cannot be
+removed; quantity floors at received/billed/returned; supplier, currency, FX and VAT are fixed;
+quantity and line-set changes are refused on a part-received order that carries cost lines).
 
 ### Refunds
 

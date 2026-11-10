@@ -52,7 +52,7 @@ Purchase orders use the canonical purchase workflow documented in `docs/workflow
 
 | Status | Meaning |
 |---|---|
-| **Draft** | The PO has been created but not yet sent. Lines can still be edited. |
+| **Draft** | The PO has been created but not yet sent. Everything can still be edited. |
 | **RFQ Sent** | A request for quotation has been sent to the supplier. |
 | **Quote Received** | A supplier quote has been received and can be converted to a purchase order. |
 | **PO Sent** | The purchase order has been confirmed and sent to the supplier. |
@@ -62,8 +62,32 @@ Purchase orders use the canonical purchase workflow documented in `docs/workflow
 | **Invoiced** | A supplier invoice has been recorded for the PO. |
 | **Partially Returned** | Some received goods have been returned to the supplier. |
 | **Returned** | Received goods have been fully returned to the supplier. |
-| **Closed** | The PO has been closed. |
-| **Cancelled** | The PO has been cancelled. |
+| **Closed** | The PO is finished. If it is marked **Closed short**, part of it was never delivered: the unreceived balance was dropped and the goods that did arrive stay in stock. |
+| **Cancelled** | The PO was cancelled before anything was received. |
+
+
+## Editing a Purchase Order
+
+An order can be edited from **Draft** through **Partially Received**: click **Edit** on the PO page. What you can change depends on whether anything has touched the order yet.
+
+**Nothing has touched it yet** (no goods received, no supplier bill, no return and no warehouse ASN, at any status from Draft to Shipped). The whole order is open: supplier, currency, lines, prices, quantities, VAT, freight and other cost lines, the destination warehouse and the notes. This is how you enter the quoted prices at **Quote Received**, or correct a quantity, price or warehouse after the PO has been sent.
+
+**Goods, a bill or a warehouse ASN have touched it.** The order is amended in place:
+
+| What | Rule |
+|---|---|
+| Notes, supplier reference, expected delivery | Always editable. |
+| Destination warehouse | Editable unless a warehouse ASN is open (book it in or retire it first). |
+| Supplier, currency, exchange rate, VAT rate | Fixed. Receipts, bills and ASNs were costed and posted in them. To change them, return or close the order and raise a new one. |
+| A line that has been received, billed or returned | Keeps its price, discount and VAT, and cannot be removed. Its quantity cannot go below what was received, billed or returned. |
+| Quantity on any other line | Editable (an increase is always allowed). To drop the quantity still due on a part-received line, set it to the quantity received. |
+| A line with an open warehouse ASN | Its quantity cannot be reduced and it cannot be removed until the ASN is booked in or retired. |
+| Adding or removing an untouched line | Allowed. |
+| Freight and other cost lines | Fixed once goods are in stock or a bill exists. |
+| Quantities, prices or lines on a part-received order that has freight or cost lines | Refused. Freight is spread over all lines, so changing them would change the cost of goods already in stock. Close the unreceived balance and raise a new order for any extra goods. |
+| An edit that leaves nothing outstanding | Refused: use **Close** to drop the whole unreceived balance. |
+
+A price correction on goods already received is a supplier bill or credit note matter, not a PO edit. An order that is **Received**, **Closed**, **Cancelled** or **Returned** cannot be edited.
 
 
 ## PDF Documents
@@ -92,37 +116,52 @@ When stock is received:
 The unit cost is validated as finite and non-negative before stock movements are written. A landed-cost recalculation that produces a NaN or infinite cost is rejected at the receipt boundary, before any stock or cost layer is created.
 
 
-## Cancelling a Purchase Order
+## Closing and Cancelling a Purchase Order
 
-POs in DRAFT, RFQ_SENT, QUOTE_RECEIVED, PO_SENT, SHIPPED, or PARTIALLY_RECEIVED status can be cancelled.
+**Close** and **Cancel** are available at every stage from RFQ Sent to Partially Received (a Draft can only be cancelled; a fully **Received** order can only be closed). Which one you use depends on what you want the order to say, not on what happens to stock:
 
-### Cost-layer reversal on cancellation
+| Situation | Close | Cancel PO |
+|---|---|---|
+| **Nothing received** (RFQ Sent, Quote Received, PO Sent, Shipped) | Order ends **Closed**. Use it when the supplier will not deliver and you want it off the "incoming" figures. | Order ends **Cancelled**. Use it when the order was a mistake or was withdrawn. Refused if a supplier bill exists: credit the bill first. |
+| **Part-received** | **Close short**: the unreceived balance is dropped. | **Cancel balance**: exactly the same as Close short. |
 
-If the PO has been partially received before cancellation, the system reverses every remaining cost layer created from that PO:
+### Close short (a part-received order)
 
-- Each cost layer's `remainingQty` is set to zero
-- Reversing stock movements are created
-- COGS reversal entries are written
-- Stock-on-hand at the destination warehouse is decremented
-- An inventory-adjustment journal is queued for Xero (if accounting sync is enabled)
-- The PO is marked Cancelled
-- The activity log records the reversed layers and total reversal value
+Closing or cancelling a part-received order **drops the quantity still due and keeps what you received**:
 
-This means cancelling a PARTIALLY_RECEIVED PO undoes the inventory impact cleanly. If you don't want to undo the inventory — for example, if you've already sold some of the received stock — return the received goods first, then cancel.
+- The goods already received stay in stock, with their quantities and FIFO cost layers unchanged.
+- No stock is reversed and no accounting entry is made. An unreceived balance has no ledger entry to undo.
+- The order ends **Closed** (both buttons), shown as **Closed short: received 60 of 100**. The ordered quantities are kept as the record of what was ordered.
+- The dropped quantity stops counting as incoming and in open-PO and replenishment figures.
+- Received goods that have not been billed yet can still be billed afterwards.
+
+**To take received goods back out of stock, use Return Items first** (a supplier return), then close the order. Returning goods does not close or cancel the order and does not stop you receiving the rest: while quantity is still due, the order stays open after a return. A closed order cannot have goods returned against it.
+
+If the supplier was billed for more than was received (a prepaid supplier), closing still works, but a warning names the lines and the amount billed ahead of receipt. Goods-in-transit keeps a debit for those goods until the supplier issues a credit note.
+
+### Warehouse ASNs
+
+An order whose lines have an **open warehouse ASN** (being created, open, partly booked in, or booked in but not yet reconciled) cannot be closed or cancelled. The message names the SKUs and ASN numbers. Book the goods in through the ASN (**Recheck booked-in**) or retire the ASN first, then close the order. This keeps the warehouse from receiving goods against an order that no longer expects them.
 
 ### Idempotent cancellation
 
-Cancelling a PO that is already CANCELLED is a no-op — the system returns success without writing duplicate activity log entries or accounting journals. This means it's safe to retry a cancellation if a transient error occurred.
+Cancelling a PO that is already CANCELLED is a no-op: the system returns success without writing duplicate activity log entries. It is safe to retry a cancellation after a transient error.
+
+### Concurrent receipts
+
+Receiving, closing, cancelling, editing and returning all take the same lock on the order. If a receipt and a close happen at the same moment, one waits for the other: a receipt that lands first is kept (the order then closes short); a close that lands first makes the receipt fail with "cannot be received in its current status", and nothing is written.
 
 
 ## Refused Cancellations
 
-The system refuses to cancel a PO when supplier invoices have already been recorded against it (INVOICED state). Process a purchase return first, then handle the cancellation manually.
+The system refuses to cancel a PO that has had nothing received but already has a supplier bill recorded against it. Credit or reverse the bill first. A part-received order is not subject to this rule, because closing it short reverses nothing.
 
 
 ## Purchase Returns
 
 If goods need to be sent back to the supplier, create a purchase return against the original PO. The return reduces stock at the relevant warehouse and records the adjustment.
+
+A return does not strand the rest of the order. While quantity is still due on any line, the order stays **Partially Received** after a return: you can still receive the balance, edit, close or cancel it, and the balance stays in the incoming figures. The order moves to **Partially Returned** or **Returned** only when nothing is left to receive.
 
 
 ## Purchase Invoicing

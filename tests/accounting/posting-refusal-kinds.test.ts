@@ -308,7 +308,9 @@ const MANUAL_PRODUCERS: Record<string, Record<string, number>> = {
   sales_invoice_order: { 'app/actions/sales.ts': 1, 'lib/connectors/woocommerce/sync/order-import.ts': 2 },
   sales_invoice_import: { 'app/actions/sales.ts': 1, 'lib/connectors/woocommerce/sync/order-import.ts': 2 },
   stock_adjustment_journal: { 'lib/domain/inventory/stock-adjustment-apply.ts': 1 },
-  purchase_order_cancellation_reversal: { 'lib/domain/purchasing/cancellation-service.ts': 1 },
+  // RETIRED: cancelling a part-received order no longer reverses stock or queues a journal (it closes short), so nothing
+  // raises INVENTORY_ADJUSTMENT/PurchaseOrder any more. The kind stays declared so a row already in the inbox is still markable.
+  purchase_order_cancellation_reversal: {},
   supplier_return_reversal: { 'app/actions/purchase-orders.ts': 1 },
   /**
    * o3d-j625 r32 (merge with o3d-8f0p6 #713) — A SECOND SITE RAISES THIS POSTING, AND THE KIND STAYS `manual`.
@@ -371,6 +373,11 @@ test('[o3d-j625 r6/r7 H4] every MANUAL kind\'s posting is raised only by the cal
   for (const kind of manualKinds) {
     const spec = POSTING_REFUSAL_KINDS[kind]
     const found = producerCounts(sites, spec.type, spec.referenceType)
+    if (Object.keys(MANUAL_PRODUCERS[kind]!).length === 0) {
+      // A retired kind: the guard is the other way round — NOTHING may raise its posting any more.
+      assert.deepEqual(nonZero(found), {}, `${kind}: retired, but a call site raises ${spec.type}/${spec.referenceType} again`)
+      continue
+    }
     assert.ok(Object.keys(found).length > 0, `${kind}: PRECONDITION — its producing call site was found`)
     assert.deepEqual(nonZero(found), nonZero(MANUAL_PRODUCERS[kind]!),
       `${kind}: the call sites raising ${spec.type}/${spec.referenceType} changed. If a new one raises the SAME `

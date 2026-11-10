@@ -1,20 +1,16 @@
 import { Prisma, type PurchaseOrderStatus } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { getAccountingSettings, queueAccountingSyncTx } from '@/lib/accounting'
-import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
-import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
-import { accountingPayloadKey } from '@/lib/accounting/payload-key'
-import { enqueueStockSync } from '@/lib/shopping'
-import { roundQuantity } from '@/lib/domain/math/decimal'
 import {
   evaluatePurchaseOrderCancellationInvoiceGate,
   isPurchaseOrderCancellationNoop,
-  readPurchaseOrderConsumedCostForCancellation,
-  reversePurchaseOrderCostLayersForCancellation,
-  type PurchaseOrderConsumedCostSummary,
-  type PurchaseOrderCostLayerReversal,
 } from '@/lib/domain/purchasing/po-cancellation'
+import {
+  describeBilledAhead,
+  describeRetireOutcome,
+  retirePurchaseOrderLocked,
+  type RetireOutcome,
+} from '@/lib/domain/purchasing/po-close-short'
 import {
   recalculateLandedCosts,
   queueLandedCostAdjustmentJournals,
@@ -31,13 +27,13 @@ export type CancelPurchaseOrderResult = {
   success: boolean
   error?: string
   notice?: string
-  reversedCostLayers?: PurchaseOrderCostLayerReversal[]
   /**
-   * Cost of units already consumed (sold/used) from this PO before cancellation.
-   * Their COGS stays booked against the cancelled receipt — surfaced so finance
-   * can decide whether a correction is needed (audit-H8).
+   * True when the order had received goods: the cancel closed it short (status CLOSED), the unreceived balance was dropped and
+   * the received stock, its quantities and its cost layers were left alone.
    */
-  consumedCost?: PurchaseOrderConsumedCostSummary
+  closedShort?: boolean
+  /** Non-blocking finance warnings (e.g. billed ahead of receipt). */
+  warnings?: string[]
   /**
    * When a FREIGHT PO is cancelled, the landed-cost uplift it applied to linked
    * primary POs is reverted (line landedUnitCostBase + cost layers recalculated
@@ -54,12 +50,8 @@ export type CancelPurchaseOrderServiceDeps = {
     options: typeof PURCHASE_ORDER_CANCELLATION_TX_OPTIONS,
   ): Promise<T>
   logActivity: typeof logActivity
-  enqueueStockSync: typeof enqueueStockSync
-  getAccountingSettings: typeof getAccountingSettings
-  queueAccountingSyncTx: typeof queueAccountingSyncTx
-  recordTransitSubledgerMovement: typeof recordTransitSubledgerMovement
-  reversePurchaseOrderCostLayersForCancellation: typeof reversePurchaseOrderCostLayersForCancellation
-  readPurchaseOrderConsumedCostForCancellation: typeof readPurchaseOrderConsumedCostForCancellation
+  /** GOODS orders: drop the unreceived balance under the already-held PO lock (po-close-short.ts). */
+  retirePurchaseOrderLocked: typeof retirePurchaseOrderLocked
   recalculateLandedCosts: typeof recalculateLandedCosts
   queueLandedCostAdjustmentJournals: typeof queueLandedCostAdjustmentJournals
   /** o3d-nrl4 PR A: the freight-cancellation scope lock. Optional so a fake-tx unit test need not name it. */
@@ -75,12 +67,7 @@ const defaultCancelPurchaseOrderServiceDeps: CancelPurchaseOrderServiceDeps = {
   }),
   transaction: (fn, options) => db.$transaction(fn, options),
   logActivity,
-  enqueueStockSync,
-  getAccountingSettings,
-  queueAccountingSyncTx,
-  recordTransitSubledgerMovement,
-  reversePurchaseOrderCostLayersForCancellation,
-  readPurchaseOrderConsumedCostForCancellation,
+  retirePurchaseOrderLocked,
   recalculateLandedCosts,
   queueLandedCostAdjustmentJournals,
   lockLandedCostRevaluationScope,
@@ -121,8 +108,6 @@ export async function cancelPurchaseOrderService(
   deps: CancelPurchaseOrderServiceDeps = defaultCancelPurchaseOrderServiceDeps,
 ): Promise<CancelPurchaseOrderResult> {
   try {
-    const cancellationDate = new Date().toISOString().slice(0, 10)
-
     const fastExisting = await deps.findPurchaseOrderFast(id)
     if (!fastExisting) throw new Error('PO not found')
     if (isPurchaseOrderCancellationNoop(fastExisting.status)) {
@@ -130,18 +115,13 @@ export async function cancelPurchaseOrderService(
       return { success: true }
     }
 
-    // o3d-j625 r3 (Codex HIGH 1 family): a HOLDER, not a bare `let` — TypeScript narrows a `let` by the
-    // assignments it can see, and this one is assigned inside a callback it cannot, which collapses the
-    // variable to `never` and silently makes every later read of it unable to observe anything.
-    const reversalPostingOutcome: { outcome?: EnqueueOutcomeLike } = {}
-    // review M-3: carried out of the transaction so the report can name the chart the journal was built
-    // from, rather than leaving the inbox to render an absence as "none".
-    const cancellationChartConnector: { connector: string | null } = { connector: null }
     const cancellation = await deps.transaction(async (tx) => {
       // audit-g5u2.4 (Codex review): lock the PO before reading the invoice/credit
       // gate state so a concurrent bill create/credit-note post can't change the
-      // predicate between the read and the CANCELLED write. createInvoice takes the
-      // same row lock, so the two serialise.
+      // predicate between the read and the status write. createInvoice takes the
+      // same row lock, so the two serialise. The same lock orders this against a receipt: whichever takes the row
+      // first, the other re-reads under it (a receipt after a cancel is refused by its in-transaction status check; a
+      // cancel after a receipt sees the landed quantity and closes short).
       //
       // o3d-nrl4 PR A (closes o3d-t3mbr for this caller): a FREIGHT cancellation runs
       // `recalculateLandedCosts` below, which rewrites every linked primary's lines, cost layers and
@@ -162,7 +142,6 @@ export async function cancelPurchaseOrderService(
           status: true,
           reference: true,
           type: true,
-          lines: { select: { id: true } },
           // Base-currency totals are the GL predicate; per-bill credit attribution
           // prevents a credit for one bill satisfying another (Codex review).
           invoices: { select: { id: true, totalBase: true } },
@@ -178,34 +157,39 @@ export async function cancelPurchaseOrderService(
       }
       const transition = validatePurchaseOrderStatusTransition(existing.status, 'CANCELLED')
       if (!transition.success) throw new Error(transition.error)
+
       // audit-g5u2.4: allow cancelling a FREIGHT PO whose bills are EACH fully offset
       // by POSTED supplier credit notes linked to that bill; otherwise the gate blocks.
-      const creditedBaseByInvoice = new Map<string, number>()
-      for (const cn of existing.supplierCreditNotes) {
-        if (!cn.purchaseInvoiceId) continue // unattributed credits don't offset a specific bill
-        creditedBaseByInvoice.set(cn.purchaseInvoiceId, (creditedBaseByInvoice.get(cn.purchaseInvoiceId) ?? 0) + creditNoteBaseForGate(cn))
+      const runInvoiceGate = () => {
+        const creditedBaseByInvoice = new Map<string, number>()
+        for (const cn of existing.supplierCreditNotes) {
+          if (!cn.purchaseInvoiceId) continue // unattributed credits don't offset a specific bill
+          creditedBaseByInvoice.set(cn.purchaseInvoiceId, (creditedBaseByInvoice.get(cn.purchaseInvoiceId) ?? 0) + creditNoteBaseForGate(cn))
+        }
+        const invoiceGate = evaluatePurchaseOrderCancellationInvoiceGate({
+          isFreight: existing.type === 'FREIGHT',
+          invoices: existing.invoices.map((inv) => ({
+            totalBase: Number(inv.totalBase),
+            creditedBase: creditedBaseByInvoice.get(inv.id) ?? 0,
+          })),
+        })
+        if (!invoiceGate.allowed) throw new Error(invoiceGate.reason ?? 'Cannot cancel this purchase order.')
       }
-      const invoiceGate = evaluatePurchaseOrderCancellationInvoiceGate({
-        isFreight: existing.type === 'FREIGHT',
-        invoices: existing.invoices.map((inv) => ({
-          totalBase: Number(inv.totalBase),
-          creditedBase: creditedBaseByInvoice.get(inv.id) ?? 0,
-        })),
-      })
-      if (!invoiceGate.allowed) throw new Error(invoiceGate.reason ?? 'Cannot cancel this purchase order.')
 
-      const poLineIds = existing.lines.map((line) => line.id)
+      if (existing.type !== 'FREIGHT') {
+        // GOODS. Nothing landed: a plain cancel (CANCELLED), refused while a supplier bill exists. Something landed: the
+        // owner's ruling is that cancel behaves like close-short — the unreceived balance is dropped, the received stock
+        // and its cost stay, the order ends CLOSED, and nothing is reversed, so no bill is orphaned and the gate does not
+        // apply. A live warehouse ASN refuses either way.
+        const retired = await deps.retirePurchaseOrderLocked(tx, id, 'cancel', ({ keptReceivedStock }) => {
+          if (!keptReceivedStock) runInvoiceGate()
+        })
+        return { alreadyCancelled: false as const, existing, retired, landedCostRecalc: null as LandedCostRecalcResult | null }
+      }
 
-      // Read consumed cost BEFORE the reversal, otherwise the remaining quantity
-      // it is about to zero out would be miscounted as already-consumed.
-      const consumedCost = await deps.readPurchaseOrderConsumedCostForCancellation(tx, poLineIds)
-
-      const reversal = await deps.reversePurchaseOrderCostLayersForCancellation(tx, {
-        poId: id,
-        poReference: existing.reference,
-        poLineIds,
-      })
-
+      // FREIGHT. Nothing to keep or drop on the order itself; the cancel reverts the landed-cost uplift it applied to its
+      // linked primary orders.
+      runInvoiceGate()
       await tx.purchaseOrder.update({ where: { id }, data: { status: 'CANCELLED' } })
 
       // audit-C3: cancelling a FREIGHT PO must revert the landed-cost uplift it
@@ -214,139 +198,65 @@ export async function cancelPurchaseOrderService(
       // primary's landedUnitCostBase + cost layers WITHOUT this freight, and
       // returns COGS deltas for already-consumed quantities. It throws if a
       // linked primary is in a locked (CLOSED) status — blocking the cancel.
-      let landedCostRecalc: LandedCostRecalcResult | null = null
-      if (existing.type === 'FREIGHT') {
-        landedCostRecalc = await deps.recalculateLandedCosts(tx, id, undefined, {
-          triggeredById: null,
-          reason: 'freight_purchase_order_cancelled',
-          scheduleAdjustmentJournals: true, // audit-grob durable backstop
-        })
-      }
-
-      if (reversal.totalReversalValueBase.gt(0.000001)) {
-        const accountingSettings = await deps.getAccountingSettings()
-        // review M-3: carried out of the transaction so the post-commit report can NAME the chart this
-        // journal was built from. r4 reported `chartConnector: null` and the inbox rendered "none", which
-        // reads as "no connector was on" — an inference from an absence.
-        cancellationChartConnector.connector = accountingSettings.connector
-        const amount = roundQuantity(reversal.totalReversalValueBase, 2).toNumber()
-        if (accountingSettings.syncEnabled) {
-          const payload = {
-            date: cancellationDate,
-            reference: `Cancel: ${existing.reference}`,
-            narration: `Reverse received inventory for cancelled PO ${existing.reference}`,
-            lines: [
-              {
-                accountCode: accountingSettings.transitAccount,
-                description: `Reverse cancelled PO receipt ${existing.reference}`,
-                debit: amount,
-              },
-              {
-                accountCode: accountingSettings.inventoryAccount,
-                description: `Reverse cancelled PO inventory ${existing.reference}`,
-                credit: amount,
-              },
-            ],
-          }
-          const cancelIdempotencyKey = accountingPayloadKey(`purchase-order-cancel:${id}:cost-layer-reversal`, payload)
-          const queued = await deps.queueAccountingSyncTx(tx, {
-            type: 'INVENTORY_ADJUSTMENT',
-            referenceType: 'PurchaseOrder',
-            referenceId: id,
-            payload,
-            idempotencyKey: cancelIdempotencyKey,
-            // o3d-j625 r2: `payload`'s two lines are `accountingSettings.transitAccount` and
-            // `accountingSettings.inventoryAccount`, read a few statements above inside this same
-            // cancellation transaction — but that transaction has already reversed every cost layer and
-            // recalculated landed cost on the linked goods PO, so the read is not adjacent to the write.
-            chartConnector: accountingSettings.connector,
-            // o3d-j625 r3 (Codex HIGH 1 family): the whole answer, so a DECLINE is reported after the
-            // commit. `queued` gated the subledger row and nothing else: the PO was cancelled, every
-            // remaining cost layer reversed, an INFO log written saying so, and the reversing journal
-            // silently absent from the ledger.
-            reportOutcome: (outcome) => { reversalPostingOutcome.outcome = outcome },
-          })
-          // 6oyu.4 (khdw): this reversal DR transit / CR inventory, so it DEBITS the
-          // transit clearing account (+amount). Record the transit subledger row
-          // atomically with the queued journal, keyed the same, only when queued.
-          if (queued) {
-            await deps.recordTransitSubledgerMovement(tx, {
-              sourceType: 'PURCHASE_ORDER_CANCEL',
-              sourceRef: id,
-              idempotencyKey: cancelIdempotencyKey,
-              baseDelta: amount,
-              journalDate: cancellationDate,
-            })
-          }
-        }
-      }
-
-      return { alreadyCancelled: false as const, existing, reversal, consumedCost, landedCostRecalc }
-    }, PURCHASE_ORDER_CANCELLATION_TX_OPTIONS)
-
-    // o3d-j625 r3 (Codex HIGH 1 family): reported after the commit, so a rolled-back cancellation never
-    // leaves a report of a divergence that did not happen.
-    if (reversalPostingOutcome.outcome && postingIsOwed(reversalPostingOutcome.outcome)) {
-      await reportPostingNotQueued({
-        entityType: 'PURCHASE_ORDER',
-        entityId: id,
-        action: 'purchase_order_cancel_journal_not_queued',
-        // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
-        kind: 'purchase_order_cancellation_reversal',
-        posting: `the cost-layer reversal journal for cancelled purchase order ${id}`,
-        committed: 'the PO is cancelled and its remaining cost layers are reversed in IMS',
-        remedy:
-          'Inventory has been reduced in IMS with no reversing journal in the ledger, so inventory and '
-          + 'goods-in-transit are overstated there. Post the reversal by hand.',
-        outcome: reversalPostingOutcome.outcome,
-        // review M-3: `accountingSettings` was read in this very transaction and was not recorded.
-        metadata: { chartConnector: cancellationChartConnector.connector, purchaseOrderId: id },
+      const landedCostRecalc = await deps.recalculateLandedCosts(tx, id, undefined, {
+        triggeredById: null,
+        reason: 'freight_purchase_order_cancelled',
+        scheduleAdjustmentJournals: true, // audit-grob durable backstop
       })
-    }
+      return { alreadyCancelled: false as const, existing, retired: null as RetireOutcome | null, landedCostRecalc }
+    }, PURCHASE_ORDER_CANCELLATION_TX_OPTIONS)
 
     if (cancellation.alreadyCancelled) {
       await logPurchaseOrderCancellationNoop(deps, id, cancellation.reference)
       return { success: true }
     }
 
-    await deps.logActivity({
-      entityType: 'PURCHASE_ORDER',
-      entityId: id,
-      action: 'cancelled',
-      tag: 'purchase',
-      level: 'INFO',
-      description: cancellation.reversal.reversedLayers.length > 0
-        ? `Cancelled PO ${cancellation.existing.reference} and reversed ${cancellation.reversal.reversedLayers.length} remaining cost layer(s)`
-        : `Cancelled PO ${cancellation.existing.reference}`,
-      metadata: {
-        reference: cancellation.existing.reference,
-        reversedCostLayers: cancellation.reversal.reversedLayers,
-        totalReversalValueBase: roundQuantity(cancellation.reversal.totalReversalValueBase, 6).toString(),
-      },
-    })
-
-    const consumedCost = cancellation.consumedCost
-    if (Number(consumedCost.consumedQty) > 0) {
-      // Isolate from the success path: the PO is already cancelled and committed,
-      // so a log failure must not turn a successful cancellation into an error.
-      try {
-        await deps.logActivity({
-          entityType: 'PURCHASE_ORDER',
-          entityId: id,
-          action: 'cancelled_consumed_cogs_standing',
-          tag: 'purchase',
-          level: 'WARNING',
-          description: `Cancelled PO ${cancellation.existing.reference} with ${consumedCost.consumedQty} unit(s) already sold/used — ${consumedCost.consumedValueBase} of COGS (base currency) remains booked against the cancelled receipt. Review with finance.`,
-          metadata: {
-            reference: cancellation.existing.reference,
-            consumedQty: consumedCost.consumedQty,
-            consumedValueBase: consumedCost.consumedValueBase,
-            consumedLayers: consumedCost.layers,
-          },
-        })
-      } catch (consumedLogError) {
-        console.error('Failed to log consumed-COGS warning:', consumedLogError)
+    const retired = cancellation.retired
+    const warnings: string[] = []
+    if (retired) {
+      const billedAheadWarning = describeBilledAhead(retired.billedAhead)
+      if (billedAheadWarning) warnings.push(billedAheadWarning)
+      await deps.logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: id,
+        action: retired.keptReceivedStock ? 'cancelled_closed_short' : 'cancelled',
+        tag: 'purchase',
+        level: 'INFO',
+        description: describeRetireOutcome(retired, 'cancel'),
+        metadata: {
+          reference: retired.reference,
+          previousStatus: retired.previousStatus,
+          newStatus: retired.newStatus,
+          keptReceivedStock: retired.keptReceivedStock,
+          receivedQty: retired.landedQty,
+          droppedQty: retired.droppedQty,
+        },
+      })
+      if (billedAheadWarning) {
+        try {
+          await deps.logActivity({
+            entityType: 'PURCHASE_ORDER',
+            entityId: id,
+            action: 'closed_billed_ahead_of_receipt',
+            tag: 'purchase',
+            level: 'WARNING',
+            description: `${retired.reference}: ${billedAheadWarning}`,
+            metadata: { reference: retired.reference, lines: retired.billedAhead },
+          })
+        } catch (logError) {
+          console.error('Failed to log billed-ahead warning:', logError)
+        }
       }
+    } else {
+      await deps.logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: id,
+        action: 'cancelled',
+        tag: 'purchase',
+        level: 'INFO',
+        description: `Cancelled PO ${cancellation.existing.reference}`,
+        metadata: { reference: cancellation.existing.reference },
+      })
     }
 
     // audit-C3: queue the COGS-correction journals + log the per-primary
@@ -378,43 +288,16 @@ export async function cancelPurchaseOrderService(
       }
     }
 
-    if (cancellation.reversal.productIds.length > 0) {
-      try {
-        await deps.enqueueStockSync(cancellation.reversal.productIds, 'IMS_CHANGE')
-      } catch (syncError) {
-        const syncMessage = syncError instanceof Error ? syncError.message : String(syncError)
-        console.error(syncError)
-        await deps.logActivity({
-          entityType: 'PURCHASE_ORDER',
-          entityId: id,
-          action: 'stock_sync_enqueue_failed',
-          tag: 'sync',
-          level: 'WARNING',
-          description: `Cancelled PO ${cancellation.existing.reference}, but stock sync enqueue failed: ${syncMessage}`,
-          metadata: {
-            reference: cancellation.existing.reference,
-            productIds: cancellation.reversal.productIds,
-            error: syncMessage,
-          },
-        })
-      }
-    }
-
     const landedNotice = landedCostRecalc && landedCostRecalc.cogsAdjustments.length > 0
       ? `Reverted landed-cost uplift on ${landedCostRecalc.cogsAdjustments.length} linked PO(s) and queued COGS corrections.`
       : landedCostRecalc
         ? 'Reverted landed-cost uplift on linked PO(s).'
         : undefined
-    const reversalNotice = cancellation.reversal.reversedLayers.length > 0
-      ? `Cancelled PO and reversed ${cancellation.reversal.reversedLayers.length} remaining receipt cost layer(s).`
-      : undefined
-    // Combine both notices: a freight PO normally has no goods layers, but if it
-    // somehow does, neither notice should be silently dropped.
-    const notice = [reversalNotice, landedNotice].filter(Boolean).join(' ') || undefined
+    const notice = [retired ? describeRetireOutcome(retired, 'cancel') : undefined, landedNotice].filter(Boolean).join(' ') || undefined
     return {
       success: true,
-      reversedCostLayers: cancellation.reversal.reversedLayers,
-      consumedCost,
+      ...(retired?.keptReceivedStock ? { closedShort: true } : {}),
+      ...(warnings.length > 0 ? { warnings } : {}),
       ...(landedCostRecalc ? { landedCostRecalc } : {}),
       notice,
     }
