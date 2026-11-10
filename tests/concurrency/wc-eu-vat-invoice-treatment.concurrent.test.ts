@@ -543,3 +543,22 @@ test('[eu vat] a SWEEP that read the hold, then a re-import that marks it order_
   assert.equal(after.status, 'PENDING')
   assert.deepEqual(((after.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment), { applied: false, reason: 'order_changed' })
 })
+
+test('[eu vat] a treated hold whose order\'s fee lost its landed-cost marker while held stays PENDING (the marker is checked apart from no-tax status)', { skip }, async (t) => {
+  const { after, rows } = await parkThenChange(t, true, PLUGIN('821'), (p) => {
+    // The fee becomes an ordinary untaxed fee: still on no tax, no longer the landed-cost fee.
+    p.fee_lines[0]!.meta_data = []; p.fee_lines[0]!.total_tax = '0.00'; p.fee_lines[0]!.taxes = []
+    p.tax_lines[0]!.tax_total = '19.00'; p.total = '134.90'; p.total_tax = '20.90'
+  })
+  assert.equal(rows.length, 0, 'nothing was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /the order changed after it was held .*landed-cost fee marker differs.*needs its invoice rebuilt/)
+  assert.deepEqual(((after.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment), { applied: false, reason: 'order_changed' })
+})
+
+test('[eu vat] a held invoice whose order changed currency while held is not released in the old currency', { skip }, async (t) => {
+  const { after, rows } = await parkThenChange(t, true, PLUGIN('821'), (p) => { p.currency = 'EUR' })
+  assert.equal(rows.length, 0, 'nothing was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /the order changed after it was held \(the parked invoice is in GBP but the order is now in EUR\) and needs its invoice rebuilt/)
+})

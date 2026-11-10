@@ -35,6 +35,9 @@ const NAMED_EXTRA_KINDS = ['eu-vat-recovery', 'rounding-difference']
 
 /** null when the parked payload still matches the order; otherwise the first difference, as a sentence fragment. */
 export function heldInvoiceDifference(parked: Record<string, unknown>, expected: ExpectedHeldInvoice, treated: boolean): string | null {
+  // The currency every parked figure is in must be the order's currency now: a held invoice never releases in a currency the order has left.
+  const parkedCurrency = typeof parked.currency === 'string' ? parked.currency.trim().toUpperCase() : ''
+  if (parkedCurrency !== expected.currency.trim().toUpperCase()) return `the parked invoice is in ${parkedCurrency === '' ? '(no currency)' : parkedCurrency} but the order is now in ${expected.currency}`
   const lines = parked.lines
   if (!Array.isArray(lines)) return 'the parked payload has no readable lines'
   if (lines.length < expected.lines.length) return `the parked invoice has ${lines.length} line(s) but the order has ${expected.lines.length}`
@@ -49,6 +52,8 @@ export function heldInvoiceDifference(parked: Record<string, unknown>, expected:
     const noTax = line.noTaxKind === 'fee-no-tax'
     const wantNoTax = want.untaxedFee || (treated && want.markedFee)
     if (noTax !== wantNoTax) return `${label}: its no-tax fee marking differs from the order's`
+    // The landed-cost fee marker is its own identity, apart from the no-tax status: a fee whose marker was removed from the order while held must not be released on the fee account (the treatment records the marker on the line).
+    if ((line.euFeeMarked === true) !== (treated && want.markedFee)) return `${label}: its landed-cost fee marker differs from the order's`
   }
   const extras = lines.slice(expected.lines.length) as Array<Record<string, unknown> | null>
   if (!treated && extras.length > 0) return `the parked invoice has ${extras.length} line(s) the order does not`

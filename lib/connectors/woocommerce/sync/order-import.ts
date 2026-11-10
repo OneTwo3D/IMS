@@ -1690,7 +1690,8 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   }
   if (marker?.reason === 'order_changed') return await refuseChanged('it was already found to have changed')
 
-  const currency = (wcOrder.currency ?? '').toString().trim().toUpperCase()
+  const currency = readWcOrderCurrency(wcOrder)
+  if (currency === null) return await refuseChanged('the order\u2019s currency is missing or unreadable')
   const mappedLines = [...(await mapWcLineItems(wcOrder.line_items, 1)), ...mapWcFeeLines(wcOrder.fee_lines)]
   const lineDiscountTotal = mappedLines.reduce((sum, line) => addMoney(sum, toDecimal(line.discountAmount)), toDecimal(0))
   const coupons = planWcOrderCoupons({

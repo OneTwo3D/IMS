@@ -23,7 +23,7 @@ const untreated = () => ({
 }) as Record<string, unknown> & { lines: Array<Record<string, unknown>> }
 const treated = () => {
   const p = untreated()
-  p.lines[1] = { description: 'EU Customs Fee', quantity: 1, unitAmount: 4, accountCode: '232', taxType: 'NONE', noTaxKind: 'fee-no-tax' }
+  p.lines[1] = { description: 'EU Customs Fee', quantity: 1, unitAmount: 4, accountCode: '232', taxType: 'NONE', noTaxKind: 'fee-no-tax', euFeeMarked: true }
   p.lines.push({ description: 'IOSS VAT collected', quantity: 1, unitAmount: 0, accountCode: '821', taxType: 'NONE', noTaxKind: 'eu-vat-recovery' })
   return p
 }
@@ -39,6 +39,8 @@ test('each kind of change is a difference: description, quantity, unit amount, d
     ['unit amount (a changed split with the same total)', (p) => { p.lines[0]!.unitAmount = 47; p.lines[1]!.unitAmount = 6 }, /unit amount is 47/],
     ['discount', (p) => { p.lines[0]!.discountAmount = 5 }, /discount is 5/],
     ['fee marking', (p) => { p.lines[1]!.noTaxKind = 'fee-no-tax' }, /no-tax fee marking differs/],
+    ['currency', (p) => { p.currency = 'EUR' }, /parked invoice is in EUR but the order is now in GBP/],
+    ['no currency', (p) => { delete p.currency }, /\(no currency\)/],
     ['shipping', (p) => { p.shippingAmount = 12 }, /shipping is 12/],
     ['order discount', (p) => { p.discountAmount = 1 }, /order discount is 1/],
     ['a missing line', (p) => { p.lines.pop() }, /has 1 line\(s\) but the order has 2/],
@@ -66,4 +68,18 @@ test('a treated hold: matches when the document still totals the order; the orde
   assert.match(heldInvoiceDifference(twice, expected, true) ?? '', /not the treatment.s VAT or rounding line/)
   const split = treated(); split.lines[0]!.unitAmount = 47
   assert.match(heldInvoiceDifference(split, expected, true) ?? '', /unit amount is 47/)
+})
+
+test('the landed-cost fee marker is checked apart from the no-tax status: a marker removed (or added) on the order while held is a difference', () => {
+  // Parked treated with the fee marked; the order now says the fee is NOT marked (an untaxed fee: still no-tax, no longer the landed-cost fee).
+  const unmarked: ExpectedHeldInvoice = { ...expected, lines: [expected.lines[0]!, { ...expected.lines[1]!, markedFee: false, untaxedFee: true }] }
+  const p = treated()
+  ;(p.lines[2] as Record<string, unknown>).unitAmount = 0
+  assert.match(heldInvoiceDifference(p, unmarked, true) ?? '', /landed-cost fee marker differs/)
+  // The reverse: the order marks the fee but the parked line carries no marker.
+  const q = treated(); delete (q.lines[1] as Record<string, unknown>).euFeeMarked
+  assert.match(heldInvoiceDifference(q, expected, true) ?? '', /landed-cost fee marker differs/)
+  // An untreated hold never carries the marker.
+  const r = untreated(); (r.lines[1] as Record<string, unknown>).euFeeMarked = true
+  assert.match(heldInvoiceDifference(r, expected, false) ?? '', /landed-cost fee marker differs/)
 })

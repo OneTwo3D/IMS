@@ -191,7 +191,7 @@ export function applyEuVatTreatment<P extends TreatablePayload>(payload: P, plan
   const lines: TreatableLine[] = payload.lines.map((line, index) => {
     const kind = plan.lineKinds[index]!
     if (kind === 'marked-fee') {
-      return { ...withoutKeys(line, BINDING_KEYS.line), accountCode: plan.feeAccount!.trim(), taxType: NO_TAX, noTaxKind: 'fee-no-tax' }
+      return { ...withoutKeys(line, BINDING_KEYS.line), accountCode: plan.feeAccount!.trim(), taxType: NO_TAX, noTaxKind: 'fee-no-tax', euFeeMarked: true }
     }
     if (kind === 'untaxed-fee') return line
     if (route.kind === 'scheme') return { ...withoutKeys(line, BINDING_KEYS.line), taxType: route.schemePostingTaxType }
