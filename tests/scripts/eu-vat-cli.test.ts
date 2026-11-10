@@ -77,7 +77,7 @@ test('nothing in the preflight, the seed or their commands can reach Xero, WooCo
   const files = ['lib/tax/eu-vat-seed.ts', 'lib/tax/eu-vat-preflight.ts', 'lib/tax/eu-vat-cli.ts', 'scripts/eu-vat-preflight.ts', 'scripts/eu-vat-seed.ts', 'lib/connectors/xero/scheme-posting-drift.ts', 'lib/domain/accounting/eu-vat-settings.ts']
   const bareFetch = /\bfetch\s*\(|wcFetch|xeroFetch|node:https?|node:net\b|axios|undici/
   // Xero: the pure list shape, the report-type helper and the connection read. WooCommerce: only the stored-settings reader and the pure URL normaliser (no request is made by either).
-  const allowedImports: Record<string, Set<string>> = { xero: new Set(['tax-rate-list', 'tax-rate-report-type', 'connection-fence']), woocommerce: new Set(['api', 'tax-rate-plan']) }
+  const allowedImports: Record<string, Set<string>> = { xero: new Set(['tax-rate-list', 'tax-rate-report-type', 'connection-fence']), woocommerce: new Set(['api', 'tax-rate-plan', 'credentials', 'sync-lock']) }
   for (const file of files) {
     const source = readFileSync(new URL(`../../${file}`, import.meta.url), 'utf8')
     assert.doesNotMatch(source, bareFetch, `${file} makes no request`)

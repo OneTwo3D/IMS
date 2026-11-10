@@ -262,8 +262,18 @@ export function evaluateEuVatPreflight(input: PreflightInput): PreflightResult {
   }
 
   // One IMS rate per Xero rate: a Xero type carried by two different IMS rates.
-  for (const [code, imsIds] of codeCarriers) {
-    if (imsIds.size > 1) add('XERO_TYPE_ON_TWO_IMS_RATES', null, `Xero type ${code}`, `${imsIds.size} IMS rates`)
+  // Counted over ALL active IMS sales rates, not only the declared ones: an undeclared rate on a declared Xero type is a second IMS rate on it.
+  const salesByCode = new Map<string, PreflightImsRate[]>()
+  for (const r of input.imsRates) {
+    const carried = (r.accountingTaxType ?? '').trim()
+    if (isActiveSalesRate(r) && carried !== '') salesByCode.set(carried, [...(salesByCode.get(carried) ?? []), r])
+  }
+  for (const code of codeCarriers.keys()) {
+    const carriers = salesByCode.get(code) ?? []
+    if (carriers.length > 1) {
+      const undeclared = carriers.filter((r) => !declaredImsIds.has(r.id)).map((r) => `"${r.name}"`)
+      add('XERO_TYPE_ON_TWO_IMS_RATES', null, `Xero type ${code}`, `${carriers.length} IMS rates${undeclared.length > 0 ? `, undeclared: ${undeclared.join(', ')}` : ''}`)
+    }
   }
 
   const errors = findings.filter((f) => f.severity === 'error').length
@@ -377,7 +387,7 @@ export function planEuVatSeedApply(input: PreflightInput): SeedApplyPlan {
   return { seedVersion: input.seed.seedVersion, storeIdentity: input.storeIdentity, changes, unchanged, skipped, digest }
 }
 
-export const EU_VAT_SEED_REFUSAL_CODES = ['CONFIRM_REQUIRED', 'XERO_LIST_NOT_PROVEN', 'XERO_CONNECTION_CHANGED', 'DIGEST_MISMATCH', 'NOTHING_TO_APPLY', 'RATE_CHANGED_DURING_APPLY', 'RATE_REPLACED'] as const
+export const EU_VAT_SEED_REFUSAL_CODES = ['CONFIRM_REQUIRED', 'XERO_LIST_NOT_PROVEN', 'XERO_CONNECTION_CHANGED', 'WOO_STORE_CHANGED', 'DIGEST_MISMATCH', 'NOTHING_TO_APPLY', 'RATE_CHANGED_DURING_APPLY', 'RATE_REPLACED'] as const
 export type EuVatSeedRefusalCode = (typeof EU_VAT_SEED_REFUSAL_CODES)[number]
 export type EuVatSeedApplyResult =
   | { applied: false; plan: SeedApplyPlan; refusal: { code: EuVatSeedRefusalCode; detail: string } | null }
@@ -386,6 +396,7 @@ export type EuVatSeedApplyResult =
 const DIGEST_RE = /^[0-9a-f]{64}$/
 
 class SeedRaceError extends Error {}
+class WooStoreChangedError extends Error {}
 
 /**
  * The write. In ONE transaction: the plan is rebuilt from the rows as they are now (a different digest writes nothing), then each change is a compare-and-set on the two columns it read, under
@@ -408,11 +419,21 @@ export async function applyEuVatSeed(db: { $transaction: <T>(fn: (tx: Client) =>
   if (!DIGEST_RE.test(confirm)) return { applied: false, plan: await db.$transaction((tx) => snapshot(tx)), refusal: { code: 'CONFIRM_REQUIRED', detail: 'an apply needs the exact 64-character digest of the plan the dry run printed' } }
   // Loaded when an apply runs, not when the module is: the fence module opens the application's database client.
   const { assertXeroConnectionUnchanged, XeroConnectionChangedError } = await import('@/lib/connectors/xero/connection-fence')
+  // Settings reads and a URL normaliser: no request is made by any of these.
+  const [{ WC_SYNC_ADVISORY_LOCK_KEY }, { WC_CREDENTIAL_SETTING_KEYS, resolveWcCredentialsFromRows }, { normaliseStoreIdentity }] = await Promise.all([
+    import('@/lib/connectors/woocommerce/sync-lock'), import('@/lib/connectors/woocommerce/credentials'), import('@/lib/connectors/woocommerce/tax-rate-plan'),
+  ])
   try {
     return await db.$transaction(async (tx): Promise<EuVatSeedApplyResult> => {
       // FIRST, before anything is read: the Xero mapping-selection lock, held to commit, and the connection must still be the one the stored list was read for. A rebind of the organisation
       // cannot interleave with this transaction, so the list the plan was judged against is the list of the organisation connected for the whole write.
       await assertXeroConnectionUnchanged(tx as never, ctx.connection)
+      // The WooCommerce store: the lock a credential save takes (so a save waits for this commit), then the store configured NOW, read inside this transaction. A switch since the plan was made refuses.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
+      const credentialRows = await tx.setting.findMany({ where: { key: { in: [...WC_CREDENTIAL_SETTING_KEYS] } }, select: { key: true, value: true } })
+      const credentials = resolveWcCredentialsFromRows(credentialRows)
+      const storeNow = credentials === null ? null : normaliseStoreIdentity(credentials.url)
+      if (storeNow !== ctx.storeIdentity) throw new WooStoreChangedError('the WooCommerce store configured now is not the one this plan was made for')
       const plan = await snapshot(tx)
       if (plan.skipped.some((s) => s.reason === 'XERO_LIST_NOT_PROVEN')) return { applied: false, plan, refusal: { code: 'XERO_LIST_NOT_PROVEN', detail: plan.skipped[0]!.detail } }
       if (plan.digest !== confirm) return { applied: false, plan, refusal: { code: 'DIGEST_MISMATCH', detail: 'the plan changed since the dry run (or this is not its digest); run the dry run again' } }
@@ -457,6 +478,7 @@ export async function applyEuVatSeed(db: { $transaction: <T>(fn: (tx: Client) =>
       return { applied: true, plan, written: plan.changes.length }
     })
   } catch (error) {
+    if (error instanceof WooStoreChangedError) return { applied: false, plan: await db.$transaction((tx) => snapshot(tx)), refusal: { code: 'WOO_STORE_CHANGED', detail: error.message } }
     if (error instanceof XeroConnectionChangedError) return { applied: false, plan: await db.$transaction((tx) => snapshot(tx)), refusal: { code: 'XERO_CONNECTION_CHANGED', detail: error.message } }
     if (error instanceof SeedRaceError) return { applied: false, plan: await db.$transaction((tx) => snapshot(tx)), refusal: { code: 'RATE_CHANGED_DURING_APPLY', detail: error.message } }
     if (error instanceof TaxRateReplacedError) return { applied: false, plan: await db.$transaction((tx) => snapshot(tx)), refusal: { code: 'RATE_REPLACED', detail: error.message } }

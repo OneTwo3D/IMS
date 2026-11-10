@@ -49,6 +49,8 @@ before(async () => {
   d = await loadDeps()
   const foreign = { xeroTokens: await d.db.accountingToken.count({ where: { connector: 'xero' } }), xeroRates: await d.db.xeroTaxRate.count(), xeroLists: await d.db.xeroTaxRateList.count(), stamp: await d.db.setting.count({ where: { key: d.drift.TAX_RATE_DRIFT_LAST_CHECKED_SETTING } }) }
   assert.deepEqual(foreign, { xeroTokens: 0, xeroRates: 0, xeroLists: 0, stamp: 0 }, 'PRECONDITION: this scratch database holds a Xero tax-rate store this test did not create; it will not delete it. Use a database with an empty Xero store.')
+  assert.equal(await d.db.setting.count({ where: { key: { in: ['wc_url', 'wc_consumer_key', 'wc_consumer_secret'] } } }), 0, 'PRECONDITION: the scratch database already holds WooCommerce credentials; refusing before any write')
+  for (const [key, value] of [['wc_url', STORE], ['wc_consumer_key', 'ck_test'], ['wc_consumer_secret', 'cs_test']] as const) await d.db.setting.create({ data: { key, value } })
   const clash = await d.db.shoppingTaxRateMapping.count({ where: { connector: 'woocommerce', externalTaxRateId: { in: Object.values(WOO).map(String) } } })
   assert.equal(clash, 0, 'the database already holds a mapping for a declared WooCommerce rate id: refusing before any write')
   const make = async (key: keyof typeof WOO, over: { name: string; rate: string; country: string; code: string }) => {
@@ -85,6 +87,7 @@ after(async () => {
   await d.db.xeroTaxRateList.deleteMany({ where: { tenantId: TENANT } })
   await d.db.xeroTaxRate.deleteMany({ where: { tenantId: TENANT } })
   await d.db.accountingToken.deleteMany({ where: { connector: 'xero', tenantId: TENANT } })
+  await d.db.setting.deleteMany({ where: { key: { in: ['wc_url', 'wc_consumer_key', 'wc_consumer_secret'] } } })
   await d.db.$disconnect()
 })
 
@@ -430,4 +433,42 @@ test('an active component added after the dry run changes the percentage tax is 
   } finally {
     await d.db.taxRateComponent.delete({ where: { id: component.id } })
   }
+})
+
+test('the WooCommerce store is re-read inside the write transaction: a switch of store after the plan refuses, and the apply holds the credential-save lock while it writes', { skip }, async () => {
+  for (const id of ids.rates) await d.db.taxRate.update({ where: { id }, data: { schemePostingTaxType: null, reportingCategory: null } })
+  const { digest } = await plan()
+  const before = await snapshotRates()
+  await d.db.setting.update({ where: { key: 'wc_url' }, data: { value: 'https://other.example' } })
+  try {
+    const result = await apply(digest)
+    assert.equal(result.applied === false && result.refusal?.code, 'WOO_STORE_CHANGED')
+    assert.deepEqual(await snapshotRates(), before)
+  } finally {
+    await d.db.setting.update({ where: { key: 'wc_url' }, data: { value: STORE } })
+  }
+  // The lock a credential save takes (WC_SYNC_ADVISORY_LOCK_KEY) is held by the apply's transaction while it writes.
+  const { WC_SYNC_ADVISORY_LOCK_KEY } = await import('../../lib/connectors/woocommerce/sync-lock.ts')
+  let tried: boolean | null = null
+  let fired = false
+  const hooked = { $transaction: <T>(fn: (tx: never) => Promise<T>) => (d.db as never as { $transaction: (f: (tx: Record<string | symbol, unknown>) => Promise<T>) => Promise<T> }).$transaction((tx) => fn(new Proxy(tx, { get(target, prop) {
+    const value = target[prop]
+    if (prop === 'taxRate') {
+      return new Proxy(value as object, { get(rates, name) {
+        const method = (rates as Record<string | symbol, unknown>)[name]
+        if (name === 'updateMany') return async (...args: unknown[]) => {
+          if (!fired) {
+            fired = true
+            tried = await d.db.$transaction(async (other) => ((await other.$queryRaw<Array<{ ok: boolean }>>`SELECT pg_try_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY}) AS ok`)[0]!.ok))
+          }
+          return (method as (...a: unknown[]) => Promise<unknown>).apply(rates, args)
+        }
+        return typeof method === 'function' ? (method as (...a: unknown[]) => unknown).bind(rates) : method
+      } })
+    }
+    return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value
+  } }) as never)) }
+  const result = await apply(digest, hooked as never)
+  assert.equal(result.applied, true)
+  assert.equal(tried, false, 'a credential save (which takes the same lock) could not get it while the apply wrote')
 })

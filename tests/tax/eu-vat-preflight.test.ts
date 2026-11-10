@@ -281,3 +281,14 @@ test('the percentage is the one tax is computed at: the active components\' effe
   assert.equal(mixed.changes.some((x) => x.wooId === 220), true, 'a zero component after the 19% one adds nothing')
   assert.deepEqual(mixed.changes.find((x) => x.wooId === 220)!.identity.components.map((x) => [x.sortOrder, x.rate]), [[1, '0.1900'], [2, '0.0000']])
 })
+
+test('an UNDECLARED active IMS sales rate on a declared Xero type is a second IMS rate on it: error, counted over all rates, not only the declared ones', () => {
+  const extra = (code: string, patch: Record<string, unknown> = {}) => (w: World): void => { w.ims.set(9999, { id: 'ims-undeclared', name: 'Stray rate', rate: '0.1900', usedFor: 'SALES', active: true, reverseCharge: false, countryCode: 'DE', accountingTaxType: code, reportingCategory: null, schemePostingTaxType: null, ...patch }) }
+  assert.deepEqual(codesOf(withWorld(extra('ZERORATEDOUTPUT'))), ['XERO_TYPE_ON_TWO_IMS_RATES'])
+  assert.deepEqual(codesOf(withWorld(extra(syntheticChargedCode(220)))), ['XERO_TYPE_ON_TWO_IMS_RATES'])
+  assert.deepEqual(codesOf(withWorld(extra('ZERORATEDOUTPUT', { active: false }))), [], 'an inactive rate is not a carrier')
+  assert.deepEqual(codesOf(withWorld(extra('ZERORATEDOUTPUT', { usedFor: 'PURCHASE' }))), [], 'a purchase-only rate is not a sales carrier')
+  assert.deepEqual(codesOf(withWorld(extra('TAX000UNRELATED'))), [], 'a rate on a type the declaration does not name is not this check\'s business')
+  const result = evaluateEuVatPreflight(withWorld(extra('ZERORATEDOUTPUT')))
+  assert.equal(result.status === 'checked' && result.findings.find((f) => f.code === 'XERO_TYPE_ON_TWO_IMS_RATES')?.detail, '2 IMS rates, undeclared: "Stray rate"')
+})
