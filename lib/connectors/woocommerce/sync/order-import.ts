@@ -3716,7 +3716,11 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           // A hold parked while the Sales Invoices switch is off carries the EU VAT treatment's absence on it, so a later release (switch on) does not post it untreated.
           // With the switch ON every parked payload says whether the treatment ran on it (applied:true, even where it left the lines alone; applied:false for a store-credit order). With the switch OFF the original payload is parked exactly as built, with no marker:
           // an absent marker is an untreated hold, which the release and the re-import already treat as such.
-          accountingPayload: euVatOutcome.kind === 'skipped'
+          // A treatment REFUSAL parks the ORIGINAL payload marked applied:false with the refusal's reason, never applied:true: it is an untreated hold, so the sweep never releases it, and a later fixed re-import verifies it against the order, retries the
+          // treatment and releases only when that succeeds (a cause not fixed leaves it PENDING with the reason).
+          accountingPayload: euVatOutcome.kind === 'refused'
+            ? { ...accountingPayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'treatment_refused', refusal: euVatOutcome.reason } }
+            : euVatOutcome.kind === 'skipped'
             ? (euVatOutcome.why === 'store_credit' ? { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'store_credit' } } : invoicePayload)
             : invoicePayload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
               ? invoicePayload

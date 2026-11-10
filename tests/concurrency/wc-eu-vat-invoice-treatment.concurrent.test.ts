@@ -645,3 +645,47 @@ test('[eu vat] a hold parked with the switch OFF is parked byte for byte as the 
   assert.deepEqual(parked.lines.map(strip), built.lines.map(strip), 'the same lines')
   for (const key of ['shippingAmount', 'shippingTaxType', 'shippingAccountCode', 'currency', 'lineAmountsIncludeTax', '_registerPayment']) assert.deepEqual(parked[key], built[key], key)
 })
+
+/** Park a scheme invoice whose treatment REFUSES (the plugin recorded no VAT account) with no invoice number, then deliver the order again with a number and `fixedMeta`. */
+async function parkRefusedThenReimport(t: test.TestContext, fixedMeta: Meta) {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = true
+  const { importWcOrder, retryHeldWcSalesInvoiceReleases } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seed(db, wcRateId)
+  t.after(async () => { switchOn = false; await cleanup(db, externalId, ctx) })
+  assert.equal((await importWcOrder(payload(externalId, wcRateId, [{ id: 2, key: 'is_vat_exempt', value: 'no' }]) as never)).success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  const parked = (held.payload as unknown as { accountingPayload: Invoice }).accountingPayload
+  // Parked as an UNTREATED hold carrying the refusal's reason, never applied:true; the original payload (no stamp).
+  assert.deepEqual([parked._euVatTreatment?.applied, parked._euVatTreatment?.reason], [false, 'treatment_refused'])
+  assert.match(String(parked._euVatTreatment?.refusal), /plugin_account_missing/)
+  assert.equal(parked._taxUnreconciled, undefined)
+  // The numbered order is delivered again, switch on. (The sweep first: it must never release an applied:false hold.)
+  await db.salesOrder.update({ where: { id: orderId }, data: { invoiceNumber: `INV-${externalId}` } })
+  await retryHeldWcSalesInvoiceReleases()
+  assert.equal(await db.accountingSyncLog.count({ where: { type: 'SALES_INVOICE', referenceId: orderId } }), 0, 'the sweep did not release the refused hold')
+  await importWcOrder(payload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, { id: 2, key: 'is_vat_exempt', value: 'no' }, ...fixedMeta]) as never)
+  return { after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }), rows: await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId } }), order: await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { euVatRegime: true } }) }
+}
+
+test('[eu vat] a scheme invoice parked with a treatment REFUSAL and no number: the cause fixed, the re-import treats it and releases it', { skip }, async (t) => {
+  const { after, rows, order } = await parkRefusedThenReimport(t, [{ id: 1, key: '_o3d_ioss_vat_account', value: '821' }])
+  assert.equal(rows.length, 1, 'released')
+  assert.equal(after.status, 'SYNCED')
+  const invoice = rows[0]!.payload as unknown as Invoice
+  assert.deepEqual(invoice.lines.map((l) => [l.accountCode, l.taxType, l.noTaxKind ?? null]), [['200', 'TAX131', null], ['232', 'NONE', 'fee-no-tax'], ['821', 'NONE', 'eu-vat-recovery']])
+  assert.equal(total(invoice), 135.66)
+  assert.equal(order.euVatRegime, 'IOSS')
+})
+
+test('[eu vat] the same refused hold with the cause NOT fixed stays PENDING with the refusal reason and queues nothing', { skip }, async (t) => {
+  const { after, rows } = await parkRefusedThenReimport(t, [])
+  assert.equal(rows.length, 0)
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /treatment refused it: .*plugin_account_missing/)
+})
