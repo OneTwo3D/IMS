@@ -3,7 +3,7 @@
  *
  * Two halves.
  *  - `readWcEuVatFacts` is pure: the order's destination, goods lines (with the gift-card flag), tax per rate id, the B2B exemption flag, the EU VAT Compliance record, the EAS cross-check figure,
- *    the plugin's recorded VAT account and the over-threshold duty fee, all from the order payload.
+ *    the plugin's recorded VAT account and its conversion record (`_o3d_ioss_fx_rate`, `_o3d_ioss_fx_pair`, `_o3d_ioss_threshold_value`) and the over-threshold duty fee, all from the order payload.
  *  - `buildEuVatRegimeInput` adds what only the database knows: the IMS rate each WooCommerce rate id is mapped to (loaded by id, never by label), the order-date exchange rate for the
  *    threshold, and the configured VAT accounts.
  *
@@ -14,15 +14,17 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { getFxRatesToBase, type FxLookupClient } from '@/lib/currencies/fx-lookup'
 import type {
-  EasFact, EuVatRegimeInput, GoodsLineFact, RateFact, RateMappingFact, ThresholdFxFact, VatRecordFact,
+  EasFact, EuVatRegimeInput, EuVatRegimeMode, GoodsLineFact, PluginFxFact, RateFact, RateMappingFact, ThresholdFxFact, VatRecordFact,
 } from '@/lib/domain/accounting/eu-vat-regime'
 import { normaliseDestination } from '@/lib/domain/accounting/eu-vat-regime'
+import { EU_VAT_REGIME_MODE_SETTING, parseRegimeMode } from '@/lib/domain/accounting/eu-vat-settings'
+import { getSettingValues } from '@/lib/settings-store'
 import { readWclcFeeKind, wcMetaFlag } from './field-mapping'
 import { parseWcGmtInstant } from './receipt-settlement-rate'
 import type { WcFullOrder, WcMeta } from './types'
 
 /** What the pure half reads; everything the database adds is separate. */
-export type WcEuVatFacts = Omit<EuVatRegimeInput, 'rates' | 'thresholdFx' | 'accounts'> & {
+export type WcEuVatFacts = Omit<EuVatRegimeInput, 'rates' | 'thresholdFx' | 'accounts' | 'mode'> & {
   /** WooCommerce rate ids that carry a non-zero tax amount, with the tax summed over items, shipping and fees, in the order currency. */
   rateTax: Array<{ wooRateId: number; tax: string }>
 }
@@ -72,11 +74,21 @@ export function readEasFact(order: Pick<WcFullOrder, 'meta_data'>): EasFact {
   return { state: 'present', merchandiseVatExcl: merchandise, currency: currencyText(payload.payment_currency) }
 }
 
+/** The plugin's own conversion record. Present only when the rate and the pair are both readable; the threshold value is carried when readable. */
+export function readPluginFx(order: Pick<WcFullOrder, 'meta_data'>): PluginFxFact {
+  const rate = decimalText(metaValue(order.meta_data, '_o3d_ioss_fx_rate'))
+  const pairRaw = metaValue(order.meta_data, '_o3d_ioss_fx_pair')
+  const pair = typeof pairRaw === 'string' && /^[A-Za-z]{3}>[A-Za-z]{3}$/.test(pairRaw.trim()) ? pairRaw.trim().toUpperCase() : null
+  if (rate === null || pair === null || !D(rate).gt(0)) return { state: 'absent' }
+  return { state: 'present', rate, pair, thresholdValue: decimalText(metaValue(order.meta_data, '_o3d_ioss_threshold_value')) }
+}
+
 export function readGoodsLines(order: Pick<WcFullOrder, 'line_items'>): GoodsLineFact[] {
   return order.line_items.map((line) => {
     const flag = (line.meta_data ?? []).find((entry) => entry.key === '_o3d_is_voucher')
     const total = decimalText(line.total) ?? '0'
-    return { total, voucher: flag === undefined ? 'unknown' : wcMetaFlag(flag.value) ? 'yes' : 'no' }
+    // Only the line's own flag is read. The product-level marker (`_coupon_title`) is not on the order and IMS imports no product meta, so an unflagged gift card is goods here.
+    return { total, voucher: flag !== undefined && wcMetaFlag(flag.value) }
   })
 }
 
@@ -104,6 +116,7 @@ export function readWcEuVatFacts(order: WcFullOrder): WcEuVatFacts {
     vatExempt: exempt !== undefined && wcMetaFlag(exempt),
     vatRecord: readVatRecord(order),
     eas: readEasFact(order),
+    pluginFx: readPluginFx(order),
     pluginVatAccount: accountText === '' ? null : accountText,
     overThresholdDutyFee: (order.fee_lines ?? []).some((fee) => readWclcFeeKind(fee) === 'duty_fee' && D(decimalText(fee.total) ?? '0').abs().gt(0)),
   }
@@ -160,6 +173,12 @@ export async function resolveThresholdFx(
   }
 }
 
+/** The mode in force, read from the setting. A stored value that is neither mode reads as null: the caller refuses rather than guesses. */
+export async function readEuVatRegimeMode(): Promise<EuVatRegimeMode | null> {
+  const values = await getSettingValues([EU_VAT_REGIME_MODE_SETTING])
+  return parseRegimeMode(values.get(EU_VAT_REGIME_MODE_SETTING))
+}
+
 export type EuVatRegimeInputClient = MappingClient & FxLookupClient
 
 /** The resolver's whole input for a WooCommerce order. `accounts` are the configured VAT account codes (Xero account roles). */
@@ -167,7 +186,7 @@ export async function buildEuVatRegimeInput(
   client: EuVatRegimeInputClient,
   order: WcFullOrder,
   accounts: { ioss: string | null; ddp: string | null },
-  options: { baseCurrency?: string } = {},
+  options: { baseCurrency?: string; mode?: EuVatRegimeMode } = {},
 ): Promise<EuVatRegimeInput> {
   const facts = readWcEuVatFacts(order)
   const mappings = await loadRateMappings(client, facts.rateTax.map((r) => r.wooRateId))
@@ -179,5 +198,5 @@ export async function buildEuVatRegimeInput(
     : await resolveThresholdFx(client, { currency: facts.currency, destination, orderedAt, baseCurrency: options.baseCurrency })
   const { rateTax: _rateTax, ...rest } = facts
   void _rateTax
-  return { ...rest, rates, thresholdFx, accounts }
+  return { ...rest, mode: options.mode ?? 'adopt_plugin', rates, thresholdFx, accounts }
 }

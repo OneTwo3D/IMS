@@ -29,3 +29,17 @@ export function refundHoldThreshold(raw: string | null | undefined): number | nu
   if (parsed.state === 'unset') return EU_VAT_REFUND_HOLD_DEFAULT_THRESHOLD
   return parsed.state === 'ok' ? parsed.value : null
 }
+
+/**
+ * WHO DECIDES THE EU VAT REGIME (`eu_vat_regime_mode`). `adopt_plugin` (the default, and what an unset value means) is the parallel phase while the storefront plugin still posts: IMS adopts the plugin's decision,
+ * read from the account it recorded on the order, and refuses an order with scheme VAT that carries none. `decide` is the state after the switchover: IMS decides by value with its own order-date rates.
+ * A stored value that is neither is NOT coerced: it reads as null and the caller must refuse rather than guess which mode was meant.
+ */
+export const EU_VAT_REGIME_MODE_SETTING = 'eu_vat_regime_mode'
+export const EU_VAT_REGIME_MODE_DEFAULT = 'adopt_plugin'
+
+export function parseRegimeMode(raw: string | null | undefined): 'adopt_plugin' | 'decide' | null {
+  if (raw === null || raw === undefined || raw.trim() === '') return EU_VAT_REGIME_MODE_DEFAULT
+  const text = raw.trim()
+  return text === 'adopt_plugin' || text === 'decide' ? text : null
+}
