@@ -131,16 +131,13 @@ export const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CAN
  */
 /** What a person is told when the warehouse despatched an order IMS had cancelled. Fixed wording: no caught error text. */
 /**
- * Does IMS intend this order NOT to ship? The cancel pass's own predicate, so the two cannot disagree: cancelled, or fully refunded and
- * not yet despatched (WMS_CANCELLABLE_ORDER_WHERE), or its link carries a cancel notice (the warehouse refused the cancel). A despatch
- * for such an order is never applied: no shipment, no stock movement, no storefront write.
+ * Does IMS intend this order NOT to ship, RIGHT NOW? Judged on the order's CURRENT state alone, in one read: cancelled, or fully refunded
+ * and not yet despatched (WMS_CANCELLABLE_ORDER_WHERE, the cancel pass's own predicate). A cancel notice on the link is NOT consulted: it
+ * is only a record that the warehouse refused a cancel, and it outlives a cancel that IMS has since reversed (only the push sweep clears
+ * it), so honouring it would refuse a real shipment. A despatch for an order that is cancelled now is never applied: no shipment, no
+ * stock movement, no storefront write.
  */
 async function cancelIntendedForOrder(orderId: string): Promise<boolean> {
-  const hit = await db.wmsOrderPushLink.count({
-    where: { orderId, OR: [{ cancelNoticeAt: { not: null } }, { order: WMS_CANCELLABLE_ORDER_WHERE }] },
-  })
-  if (hit > 0) return true
-  // An order with no link at all is judged on the order alone.
   return (await db.salesOrder.count({ where: { id: orderId, ...WMS_CANCELLABLE_ORDER_WHERE } })) > 0
 }
 
@@ -485,7 +482,7 @@ export type WmsDispatchSweepDeps = {
   // stalling as "no parts visible".
   partsSupported: boolean
   /**
-   * Does IMS intend this order not to ship (cancelled, fully refunded, or a refused cancel on record)? A despatch is never applied to a cancelled order, and nothing is written for one (no split-part
+   * Does IMS intend this order not to ship (cancelled, fully refunded, or fully refunded)? A despatch is never applied to a cancelled order, and nothing is written for one (no split-part
    * storefront push, no shipment): reconcileOneOrder asks BEFORE the split and dispatched branches. Absent: not asked.
    */
   cancelIntendedForOrder?(orderId: string): Promise<boolean>

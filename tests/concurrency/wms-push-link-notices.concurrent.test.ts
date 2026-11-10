@@ -287,17 +287,26 @@ test('REAL PORT: the delivery stamp is a compare-and-set on the notice, the stat
   assert.ok((await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })).holdNoticeCommentAt)
 })
 
-test('REAL DISPATCH DEPS: each arm of the cancel-intent guard stands on its own (a refused cancel alone; a full refund alone)', { skip }, async (t) => {
+test('REAL DISPATCH DEPS: the guard reads the order\'s CURRENT state - a cancel that was reversed leaves a stale notice that must not refuse a real shipment', { skip }, async (t) => {
   const d = await deps()
-  const tag = `arm${randomUUID().slice(0, 8)}`
-  const noticeOnly = await seed(d, `${tag}n`, 'PROCESSING')
+  const tag = `rev${randomUUID().slice(0, 8)}`
+  const reversed = await seed(d, `${tag}c`, 'CANCELLED')
   const refundOnly = await seed(d, `${tag}f`, 'PROCESSING')
-  t.after(async () => { for (const s of [noticeOnly, refundOnly]) await cleanup(d, s) })
+  const refundReversed = await seed(d, `${tag}r`, 'PROCESSING')
+  t.after(async () => { for (const s of [reversed, refundOnly, refundReversed]) await cleanup(d, s) })
   await d.db.salesOrder.update({ where: { id: refundOnly.orderId }, data: { refundStatus: 'FULL' } })
-  const base = { connector: 'mintsoft', state: 'SYNCED' as const, externalOrderNumber: 'MS-A' }
-  await d.db.wmsOrderPushLink.create({ data: { ...base, orderId: noticeOnly.orderId, externalOrderId: 'a-1', cancelNoticeAt: new Date() } })
-  await d.db.wmsOrderPushLink.create({ data: { ...base, orderId: refundOnly.orderId, externalOrderId: 'a-2' } })
+  const base = { connector: 'mintsoft', state: 'SYNCED' as const, externalOrderNumber: 'MS-V', cancelNoticeAt: new Date() }
+  await d.db.wmsOrderPushLink.create({ data: { ...base, orderId: reversed.orderId, externalOrderId: 'v-1' } })
+  await d.db.wmsOrderPushLink.create({ data: { ...base, orderId: refundOnly.orderId, externalOrderId: 'v-2' } })
+  await d.db.wmsOrderPushLink.create({ data: { ...base, orderId: refundReversed.orderId, externalOrderId: 'v-3' } })
   const deps2 = d.dispatch.createPrismaDispatchDeps('mintsoft', connector().connector as never)
-  assert.equal(await deps2.cancelIntendedForOrder!(noticeOnly.orderId), true, 'a link carrying a cancel notice, though the order is not otherwise cancellable')
-  assert.equal(await deps2.cancelIntendedForOrder!(refundOnly.orderId), true, 'a fully refunded, undespatched order with no notice yet')
+  assert.equal(await deps2.cancelIntendedForOrder!(reversed.orderId), true, 'cancelled now: refused')
+  assert.equal(await deps2.cancelIntendedForOrder!(refundOnly.orderId), true, 'fully refunded and undespatched: refused')
+  // The cancel is REVERSED (the order is live again) while the push sweep has not yet cleared the notice.
+  await d.db.salesOrder.update({ where: { id: reversed.orderId }, data: { status: 'PROCESSING' } })
+  assert.equal(await deps2.cancelIntendedForOrder!(reversed.orderId), false, 'the stale notice no longer refuses a shipment')
+  const applied = await deps2.applyDispatch(reversed.orderId, [{ trackingNumber: 'TRK-V', shippingService: 'DPD' }] as never)
+  assert.doesNotMatch(String((applied as { error?: string }).error ?? ''), /cancelled or fully refunded/, 'the dispatch reaches the ordinary path instead of the cancel refusal')
+  // A full refund that was reversed behaves the same.
+  assert.equal(await deps2.cancelIntendedForOrder!(refundReversed.orderId), false)
 })
