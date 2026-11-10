@@ -1,12 +1,12 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import Link from 'next/link'
 import { useRouter, usePathname, useSearchParams } from 'next/navigation'
 import type { SoListResult, SoRow, SoStatus } from '@/app/actions/sales'
 import { PaginationBar } from '@/components/ui/pagination-bar'
 import { ArchivedBadge, OrderListSummary } from '@/components/lists/order-list-summary'
-import { orderListHref, type OrderListUrlState } from '@/lib/domain/lists/order-list-url'
+import { orderListHref, shouldResyncSearchInput, withSearchQuery, type OrderListUrlState } from '@/lib/domain/lists/order-list-url'
 import { WmsOrderStatusChip } from '@/components/sales/wms-order-status-chip'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -183,23 +183,34 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
   }
   const statusFilters = new Set(urlState.statuses as SoStatus[])
   const [search, setSearch] = useState(urlState.q)
-  const lastPushedQ = useRef(urlState.q)
+  const [lastPushedQ, setLastPushedQ] = useState(urlState.q)
+  const [seenUrlQ, setSeenUrlQ] = useState(urlState.q)
 
   function navigate(patch: Partial<OrderListUrlState>) {
     router.push(orderListHref(pathname, { ...urlState, page: 1, ...patch }))
   }
 
-  // Debounced: push the search to the URL so the server queries every order.
+  // Back/Forward (or a link) changed the address's q: show it in the box. Done during render (not in
+  // an effect) and only for a change we did not make ourselves, so typing is never overwritten.
+  if (urlState.q !== seenUrlQ) {
+    setSeenUrlQ(urlState.q)
+    if (shouldResyncSearchInput(urlState.q, lastPushedQ)) {
+      setLastPushedQ(urlState.q)
+      setSearch(urlState.q)
+    }
+  }
+
+  // Debounced: push the search to the address so the server queries every order. The address is built
+  // from the live query string when the timer fires, so a filter changed meanwhile is kept.
   useEffect(() => {
     const q = search.trim()
-    if (q === lastPushedQ.current) return
+    if (q === lastPushedQ) return
     const t = setTimeout(() => {
-      lastPushedQ.current = q
-      router.push(orderListHref(pathname, { ...urlState, q, page: 1 }))
+      setLastPushedQ(q)
+      router.push(withSearchQuery(pathname, window.location.search, q))
     }, 400)
     return () => clearTimeout(t)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search])
+  }, [search, lastPushedQ, router, pathname])
 
   // Column visibility
   const [visibleCols, setVisibleCols] = useState<ColKey[]>(loadCols)

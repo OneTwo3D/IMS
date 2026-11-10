@@ -10,14 +10,13 @@ import {
   getInventoryTurnoverReport,
   getInventoryValuationReport,
   getLandedCostReport,
-  InventoryTurnoverSourceLimitError,
   inventoryCostingFiltersFromSearch,
   INVENTORY_COSTING_CSV_ROW_LIMIT,
   type InventoryCostingSearchParams,
   type InventoryCostingReportType,
 } from '@/lib/domain/inventory/inventory-costing-reports'
 import { inventoryCostingApiAccessDenied } from '@/lib/security/inventory-costing-access'
-import { sourceLimitExportBody } from '@/lib/security/source-scan-error'
+import { SourceScanTooLargeError, isSourceScanTooLargeError, sourceLimitExportBody } from '@/lib/security/source-scan-error'
 
 export const INVENTORY_VALUATION_CSV_HEADERS = ['sku', 'mpn', 'productName', 'categoryName', 'supplierNames', 'warehouseCode', 'warehouseName', 'qty', 'stockUnit', 'unitCostBase', 'totalValueBase', 'glBalanceBase', 'glVarianceBase']
 
@@ -98,7 +97,11 @@ export async function getInventoryCostingExportResponse(
     }
 
     case 'cogs': {
-      const report = await resolvedDeps.getCogsReport(filters, { paginate: false })
+      const report = await resolvedDeps.getCogsReport(filters, { paginate: false }).catch((error: unknown) => {
+        if (isSourceScanTooLargeError(error)) return error
+        throw error
+      })
+      if (report instanceof SourceScanTooLargeError) return NextResponse.json(sourceLimitExportBody(report), { status: 413 })
       const tooLarge = exportTooLarge(report.pageInfo.totalRows)
       if (tooLarge) return tooLarge
       const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((row) => row.productId))
@@ -196,10 +199,10 @@ export async function getInventoryCostingExportResponse(
 
     case 'inventory-turnover': {
       const report = await resolvedDeps.getInventoryTurnoverReport(filters, { paginate: false }).catch((error: unknown) => {
-        if (error instanceof InventoryTurnoverSourceLimitError) return error
+        if (isSourceScanTooLargeError(error)) return error
         throw error
       })
-      if (report instanceof InventoryTurnoverSourceLimitError) {
+      if (report instanceof SourceScanTooLargeError) {
         return NextResponse.json(sourceLimitExportBody(report), { status: 413 })
       }
       const tooLarge = exportTooLarge(report.pageInfo.totalRows)

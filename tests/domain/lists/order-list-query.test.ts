@@ -99,3 +99,13 @@ test('a 1-2 character search is not a substring scan: exact number match only, a
   assert.ok(!po.includes('contains') && po.includes('"equals":"ab"'))
   assert.ok(json(buildSalesOrderListWhere({ q: 'abc' })).includes('contains'))
 })
+
+test('debounced search keeps a filter changed during the debounce, and resyncs only on outside navigation', async () => {
+  const { withSearchQuery, shouldResyncSearchInput } = await import('@/lib/domain/lists/order-list-url')
+  // The status was ticked after the timer started: the live query string already has it.
+  assert.equal(withSearchQuery('/sales', '?status=SHIPPED&completed=1&page=4', 'smith'), '/sales?status=SHIPPED&completed=1&q=smith')
+  assert.equal(withSearchQuery('/sales', '?q=old&archived=1', ''), '/sales?archived=1')
+  assert.equal(withSearchQuery('/sales', '', 'x y'), '/sales?q=x+y')
+  assert.equal(shouldResyncSearchInput('back-q', 'typed'), true, 'Back changed q')
+  assert.equal(shouldResyncSearchInput('typed', 'typed'), false, 'our own push does not clobber the box')
+})

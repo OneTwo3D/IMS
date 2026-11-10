@@ -33,3 +33,24 @@ export function orderListRangeLabel(page: number, pageSize: number, total: numbe
   const to = Math.min(total, page * pageSize)
   return `Showing ${from.toLocaleString('en-GB')}–${to.toLocaleString('en-GB')} of ${total.toLocaleString('en-GB')} ${noun}`
 }
+
+/**
+ * The address to go to when the debounced search fires: the CURRENT address with only `q` replaced
+ * and the page reset. Built from the live query string at fire time, never from a value captured when
+ * the timer was started, so a status or toggle change made during the debounce is not undone.
+ */
+export function withSearchQuery(pathname: string, currentSearch: string, q: string): string {
+  const p = new URLSearchParams(currentSearch.startsWith('?') ? currentSearch.slice(1) : currentSearch)
+  if (q) p.set('q', q); else p.delete('q')
+  p.delete('page')
+  const qs = p.toString()
+  return qs ? `${pathname}?${qs}` : pathname
+}
+
+/**
+ * Whether the typed text should be replaced by the address's `q`: only when the address changed
+ * for a reason other than our own push (Back/Forward, a link), never while the user is mid-type.
+ */
+export function shouldResyncSearchInput(urlQ: string, lastPushedQ: string): boolean {
+  return urlQ !== lastPushedQ
+}
