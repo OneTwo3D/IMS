@@ -472,3 +472,76 @@ test('the WooCommerce store is re-read inside the write transaction: a switch of
   assert.equal(result.applied, true)
   assert.equal(tried, false, 'a credential save (which takes the same lock) could not get it while the apply wrote')
 })
+
+test('the apply holds the mapping write lock (the one every mapping writer takes shared): a mapping inserted after the set was read waits for the commit, so nothing is applied through a now-shared rate', { skip }, async () => {
+  for (const id of ids.rates) await d.db.taxRate.update({ where: { id }, data: { schemePostingTaxType: null, reportingCategory: null } })
+  const { digest } = await plan()
+  const de = ids.rates[1]!
+  const { lockStorefrontMappingWrites } = await import('../../lib/tax/storefront-mapping-write.ts')
+  let writerDone = false
+  let writer: Promise<unknown> = Promise.resolve()
+  let heldWhileApplying = false
+  let fired = false
+  const hooked = { $transaction: <T>(fn: (tx: never) => Promise<T>) => (d.db as never as { $transaction: (f: (tx: Record<string | symbol, unknown>) => Promise<T>) => Promise<T> }).$transaction((tx) => fn(new Proxy(tx, { get(target, prop) {
+    const value = target[prop]
+    if (prop === 'taxRate') {
+      return new Proxy(value as object, { get(rates, name) {
+        const method = (rates as Record<string | symbol, unknown>)[name]
+        if (name === 'updateMany') return async (...args: unknown[]) => {
+          if (!fired) {
+            fired = true
+            // A writer exactly as the real ones are: the shared mapping write lock, then the write.
+            writer = d.db.$transaction(async (w) => {
+              await lockStorefrontMappingWrites(w)
+              await w.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: '88889', externalName: 'Late', externalCountry: 'DE', externalRatePct: '19.0000', externalClass: 'standard', taxRateId: de } })
+            }).then(() => { writerDone = true })
+            await new Promise((resolve) => setTimeout(resolve, 700))
+            heldWhileApplying = !writerDone
+          }
+          return (method as (...a: unknown[]) => Promise<unknown>).apply(rates, args)
+        }
+        return typeof method === 'function' ? (method as (...a: unknown[]) => unknown).bind(rates) : method
+      } })
+    }
+    return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value
+  } }) as never)) }
+  try {
+    const result = await apply(digest, hooked as never)
+    assert.equal(result.applied, true)
+    assert.equal(heldWhileApplying, true, 'the mapping writer was still waiting while the apply held the lock')
+    await writer
+    assert.equal(writerDone, true, 'and it went through once the apply had committed')
+    assert.equal((await d.db.taxRate.findUniqueOrThrow({ where: { id: de } })).schemePostingTaxType, 'TAX131', 'the apply wrote the rate it had planned, before the mapping existed')
+  } finally {
+    await writer.catch(() => undefined)
+    await d.db.shoppingTaxRateMapping.deleteMany({ where: { externalTaxRateId: '88889' } })
+  }
+})
+
+test('while another session holds the mapping write lock (a running tax-rate apply, exclusive, or a mapping writer in flight, shared) the apply is refused as busy and writes nothing', { skip }, async () => {
+  for (const id of ids.rates) await d.db.taxRate.update({ where: { id }, data: { schemePostingTaxType: null, reportingCategory: null } })
+  const { digest } = await plan()
+  const { WOO_TAX_RATE_WRITE_LOCK_KEY } = await import('../../lib/db/advisory-locks.ts')
+  for (const mode of ['pg_advisory_xact_lock', 'pg_advisory_xact_lock_shared'] as const) {
+    const before = await snapshotRates()
+    let release: () => void = () => undefined
+    const hold = new Promise<void>((resolve) => { release = resolve })
+    let held: () => void = () => undefined
+    const holding = new Promise<void>((resolve) => { held = resolve })
+    const holder = d.db.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe(`SELECT ${mode}(${WOO_TAX_RATE_WRITE_LOCK_KEY}::bigint)`)
+      held()
+      await hold
+    }, { timeout: 30_000 })
+    await holding
+    try {
+      const result = await apply(digest)
+      assert.equal(result.applied === false && result.refusal?.code, 'MAPPING_WRITERS_BUSY', mode)
+      assert.deepEqual(await snapshotRates(), before)
+    } finally {
+      release()
+      await holder
+    }
+  }
+  assert.equal((await apply(digest)).applied, true, 'and with the lock free it applies')
+})
