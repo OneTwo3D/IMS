@@ -26,6 +26,10 @@ All PDF routes now correctly load and render the full set of template fields:
 - **Department email** — each document type shows the relevant contact email in the footer. Sales-related documents (invoices, sales orders) display the sales email. Purchase-related documents (purchase orders, RFQs) display the purchases email.
 - **Custom page footer** — configurable per document type, printed at the bottom of every page. Use this for your registered address, company number, VAT number, or other legal text.
 
+### Dates and time zone
+
+Dates printed on PDF documents and in the emails sent with them (order date, invoice date and so on) are shown in your organisation's time zone, set under **Settings > Company** (Timezone). It defaults to Europe/London if none is set. Changing it changes how later documents and emails show their dates.
+
 ### Layout
 
 - Totals are right-aligned with the last column of the line items table for a clean, professional appearance.
@@ -47,12 +51,14 @@ A token issued on one network cannot be replayed from another, and tokens cannot
 
 ### WooCommerce customer-facing PDF download
 
-WooCommerce customers can download their invoice PDF from their Order page in the WC storefront. The flow is:
+Once invoice publication is switched on (see below), WooCommerce customers can download their invoice PDF from their Order page in the WC storefront. The flow is:
 
 1. The customer clicks "Download Invoice" on the WC order page.
 2. The WordPress helper plugin (`wc-invoice-handoff`) calls IMS with a customer-scoped token.
 3. IMS verifies the WC order maps to a real IMS invoice and that the requesting customer owns it.
 4. The PDF is streamed back to the customer through the WC storefront.
+
+Showing the stored invoice in the customer's **My Account** page is **not yet switched on**. The customer's Invoice button appears only on orders IMS has published, so while publication is off customers do not see it; email the invoice instead. See [WooCommerce](woocommerce.md#invoice-note-rules).
 
 No IMS login is required for the customer — authorisation comes from the WC session plus the order-ownership check on the IMS side. The handoff token is single-use and short-lived.
 
@@ -188,6 +194,10 @@ the job's next run, not immediately.
   never grants another take-back. (Ordinary retries after an SMTP error still apply, up to five
   attempts in total.)
 
+### Invoice email after posting
+
+When a sales invoice has been posted to the accounting system, IMS queues the invoice email to the customer through the same outbox. It follows the rules above (one undelivered copy per order, retries, suppression). It is **not** queued for a **cancelled order**, and one that was queued before the cancellation is dropped as Cancelled when it comes to run, with the reason in the activity log; the invoice PDF copy is still saved. It is also refused for an order carrying store credit, until that is supported. The same applies to the invoice note written on the WooCommerce order.
+
 ### Dispatch Email (direct orders)
 
 Direct (non-storefront) sales orders can optionally email the customer a branded dispatch notification when the order ships. Storefront orders are always excluded — the storefront (e.g. WooCommerce) sends its own dispatch email once IMS pushes tracking back, so customers are never emailed twice.
@@ -209,3 +219,15 @@ Direct (non-storefront) sales orders can optionally email the customer a branded
 ### Branding
 
 Email templates use the same branding configuration as PDF documents — your logo, accent colours, and company details are applied consistently across both formats.
+
+
+## Notifications administrators receive
+
+Administrators get in-app notifications (the bell in the top bar; see [Getting Started](getting-started.md)) for conditions that need a decision. The ones that come from the scheduled checks are:
+
+- **Invariant warnings need attention** — the daily integrity check tells admins about a short list of standing problems, but **only when one newly appears or its count rises** since the previous complete run, so you are not told the same thing every day. The list: stock above the remaining cost layers (unlayered stock), goods stranded in transit, an accounting posting that failed and is held, a refund whose credit note has not reached the ledger, a refund whose stock or revenue reversal has not reached the ledger, and a refund that still owes accounting and has to be decided by hand. Critical findings always notify. If the check hits its row limit, a separate **Invariant report was truncated** notice says the warnings were not evaluated that run.
+- **A paid WooCommerce order that IMS cannot match** — after 60 retries the administrators are notified (see [WooCommerce](woocommerce.md)).
+- **Pending exchange-rate orders** — an admin notification when more than 5 WooCommerce orders are queued waiting for an exchange rate.
+- **Warehouse stock differences** when Mintsoft stock sync is in notification-only mode (see [Warehouse (Mintsoft)](warehouse.md)).
+
+Individual problems are also written to the **Activity** log, and failed postings and held deliveries are listed under **Sync > Exceptions**.

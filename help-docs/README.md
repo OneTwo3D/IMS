@@ -24,6 +24,7 @@ The overlapping user manuals in `docs/` should be symlinks back to this director
 - [Sales Orders](sales.md) — order workflow, allocation, shipments, refunds
 - [Purchasing](purchasing.md) — purchase orders, receiving, suppliers
 - [Manufacturing](manufacturing.md) — build orders and BOMs
+- [Warehouse (Mintsoft)](warehouse.md) — orders, despatch, ASNs, stock sync and exceptions with the Mintsoft warehouse
 - [Analytics](analytics.md) — reports and forecasting
 - [Documents & Email](documents-email.md) — PDF generation and notifications
 - [Activity Log](activity-log.md) — audit trail

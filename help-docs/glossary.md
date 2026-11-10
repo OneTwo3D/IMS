@@ -144,8 +144,26 @@ A push notification from an external system. When WooCommerce creates an order, 
 **Connection test gate**
 A check the system runs before activating an integration. Requires you to successfully test the credentials AND not change them after testing. If credentials change, you must re-test. Prevents the situation where sync silently fails because the credentials were wrong from the start.
 
+**Landed quantity**
+The units of a purchase-order or transfer line that have actually arrived in stock, by any route: a manual receipt, a warehouse book-in, or a warehouse stock-sync alignment. A line cannot be received by hand beyond what is still outstanding after the landed units.
+
+**Close short**
+Closing a part-received purchase order: the unreceived balance is dropped, received stock stays, and the order ends Closed (for example "Closed short: received 60 of 100"). Cancel and Close do the same on a part-received order.
+
+**Refund status**
+A second badge on a sales order showing whether it has been refunded, separate from its order status. An order can be Shipped and Partially refunded at the same time.
+
+**HS code / CN8**
+The customs commodity code for a product. The warehouse push needs a declarable 8-digit 2026 CN8 code; the HS Code Review queue (Inventory > HS Code Review) is where suggested codes are approved.
+
+**Save & Apply**
+The button on Settings > System > Scheduler that writes the schedule to the server. Use it once after an upgrade that adds or changes a scheduled job.
+
+**Step-up re-authentication**
+A "Confirm it's you" prompt shown before a sensitive action when you have not signed in recently.
+
 **ASN — Advance Shipping Notice**
-A document that tells the warehouse what stock to expect from a supplier and when. Used in the WMS integration to reconcile booked-in stock against expected.
+A document that tells the warehouse what stock to expect from a supplier and when. Used in the WMS integration to reconcile booked-in stock against expected. See [Warehouse (Mintsoft)](warehouse.md).
 
 
 ## Security

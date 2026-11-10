@@ -21,11 +21,11 @@ Whether you manage a single warehouse or multiple locations, One Two Inventory g
 
 ### 1. Log In
 
-Use the credentials provided by your administrator. If you are the first user, follow the setup wizard at `/onboarding` to configure the system.
+Use the credentials provided by your administrator. If you have forgotten your password, click **Forgot password?** on the login page (see [User Management & Security](user-management.md#forgotten-password)). If you are the first user, follow the **Setup Wizard** (`/onboarding`) to configure the system.
 
 ### 2. Set Up Company Details
 
-Navigate to **Settings > Company** and enter your business name, address, base currency, and financial year start date.
+Navigate to **Settings > Company** and enter your business name, address, timezone and base currency; set the financial year start date in **Settings > Accounting** (the Setup Wizard has a step for each).
 
 Set the base currency carefully. It becomes the system's reporting and valuation currency and is intended to be chosen once for a fresh installation. Changing it later requires a database reset.
 
@@ -35,11 +35,11 @@ Go to **Settings > Inventory** and create at least one warehouse. Each warehouse
 
 ### 4. Connect Integrations (optional)
 
-If you use WooCommerce, Xero, or Mintsoft, connect them now from **Integrations**. After entering credentials, you must **click "Test Connection"** before sync activates — this is the system's safety net against silently running with bad credentials. See the [Setup Wizard Walkthrough](onboarding-walkthrough.md) for connector-specific instructions.
+If you use WooCommerce, Xero, or Mintsoft, switch them on in **Settings > System > Plugins** (the **Integrations** item then appears in the sidebar) and connect them from **Integrations**. After entering credentials, you must **click "Test Connection"** before sync activates — this is the system's safety net against silently running with bad credentials. Only one warehouse (WMS) connector can be on at a time. See the [Setup Wizard Walkthrough](onboarding-walkthrough.md) for connector-specific instructions.
 
 ### 5. Add Products
 
-Head to **Inventory** and click **New Product**. Fill in the SKU, name, product type, lifecycle status, and pricing. You can add products one at a time or import them in bulk via CSV.
+Open **Inventory > Products** and click **New Product**. Fill in the SKU, name, product type, lifecycle status, and pricing. You can add products one at a time or import them in bulk via CSV.
 
 For new products that aren't ready for sale yet, set **lifecycle status to Draft** — they can still be purchased but won't be sellable until you flip them to Active. See the [Glossary](glossary.md#lifecycle-status) for the full lifecycle.
 
@@ -55,6 +55,8 @@ The notification bell in the top bar shows system alerts and updates. Notificati
 
 Unread notifications are indicated by a badge on the bell icon. Click a notification to view its details or navigate to the relevant page.
 
+Administrators also receive alerts from the scheduled checks (for example failed accounting postings, goods stranded in transit, or a data feed that has stopped updating). See [Troubleshooting](troubleshooting.md).
+
 
 ## Navigation
 
@@ -63,14 +65,18 @@ The sidebar organises the system into sections:
 | Section | Purpose |
 |---|---|
 | **Dashboard** | KPIs, charts, and operational summaries |
-| **Inventory** | Product catalogue, stock levels, and product details |
-| **Stock Control** | Adjustments and warehouse transfers |
-| **Purchasing** | Purchase orders, suppliers, and receiving |
-| **Sales** | Sales orders, allocation, shipments, and fulfilment |
+| **Inventory** | **Products** (the catalogue, stock levels and product details) and **HS Code Review** (customs-code suggestions to approve; needs permission to edit products) |
+| **Stock Control** | **Stock Adjustments**, **Warehouse Transfers** and **Stock Counts** |
+| **Purchases** | **Purchase Orders** and **Suppliers** |
+| **Sales** | **Sales Orders** and **Customers** (allocation, shipments and fulfilment are on the order) |
+| **Analytics** | Sales, purchasing, and inventory reports (the reports you see depend on your role) |
 | **Manufacturing** | Build orders for BOM products |
-| **Integrations** | External shopping and accounting connectors. This section only appears when at least one integration plugin is enabled. |
-| **Analytics** | Sales, purchasing, and inventory reports |
-| **Settings** | Company, inventory, users, backup, system, and configuration |
+| **Integrations** | External shopping, accounting and warehouse connectors, plus sync problems and the exception inbox. This item only appears when at least one integration plugin is enabled |
+| **Activity** | The activity log: who did what, and when |
+| **Help** | These articles |
+| **Settings** | **Company**, **Inventory**, **Sales**, **Purchasing**, **Accounting** (only with an accounting integration), **Users**, **Backup & Restore**, **Erasure records** and **System** |
+
+You only see the sections your role allows (for example Settings is for administrators); see [User Management & Security](user-management.md).
 
 
 ## Key Concepts
@@ -124,6 +130,8 @@ The system auto-archives EOL products once stock and incoming supply hit zero. S
 | Sales workflows | [Sales Orders](sales.md) |
 | Purchasing workflows | [Purchasing](purchasing.md) |
 | Settings | [Settings](settings.md) |
+| Activity log | [Activity Log](activity-log.md) |
+| Personal-data erasure | [Personal-data erasure](erasure.md) |
 | WooCommerce integration | [WooCommerce Integration](woocommerce.md) |
 | Xero accounting sync | [Xero Accounting Sync](xero-sync.md) |
 | User roles & security | [User Management & Security](user-management.md) |

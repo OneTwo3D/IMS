@@ -483,6 +483,12 @@ Disconnect) is ignored and re-resolved rather than used against a ledger that ne
 | Allocated Inventory | Asset | Stock reserved for paid orders awaiting dispatch |
 | Cost of Goods Sold | Direct Cost | COGS booked when goods ship |
 | Unearned Revenue | Liability | Revenue deferred until goods ship |
+| Manufacturing Overhead | Profit and loss | Overhead absorbed into manufactured stock cost (optional) |
+| Inventory Revaluation | Profit and loss | Offset for retrospective cost corrections on goods already sold (optional) |
+| Rounding Difference | Profit and loss | Absorbs sub-penny rounding so the inventory sub-ledger ties to the ledger (optional) |
+| Accounts Receivable / Accounts Payable | Your control accounts | Control accounts for the foreign-exchange journals |
+| Realised and Unrealised FX Gain/Loss | Profit and loss | Settlement-rate variances and period revaluation |
+| EU IOSS/VOEC VAT collected, EU DDP charges collected, EU landed-cost fees | See the EU sections below | Three roles for the EU VAT treatment. Configuration only and **not yet switched on**: leave them blank until told otherwise (see the EU sections below) |
 
 ## How Sync Works — Flowchart
 
@@ -866,7 +872,7 @@ CurrencyRate sent on Invoice / Bill / CreditNote API call
 
 **Connector-agnostic design:** the optional `currencyRateToBase` field is on the generic `InvoiceData` / `BillData` / `CreditNoteData` types (`lib/connectors/types.ts`). Each accounting connector decides how to translate it. Xero sends the inverse form (`1 / x`) as `CurrencyRate`; QuickBooks also inverts the IMS rate before setting `ExchangeRate`, rounded to the connector's supported precision.
 
-**Downstream push to WooCommerce.** *(Only with the default ECB FX source. When the FX source is **Aelia** — Settings → Accounting → FX Rates → Exchange-rate source, default OFF — this push is disabled: Aelia, the store's currency switcher, owns the rates, IMS reads Aelia's rate **before its markup** into `fx_rates` (`source = aelia`, dated by Aelia's own update time; never rate + markup) and writes nothing to the store. Xero's `CurrencyRate` is then taken from those rows. The Aelia read needs the helper plugin 1.3.0 or later deployed, owner-approved, before the flag can be switched on; see `docs/woocommerce.md` § Aelia as the FX master.)* With the **onetwoInventory Helper** WordPress plugin installed and "Push FX rates daily" enabled in the IMS WC sync page, the same rates are also pushed to the WC store after each daily fetch. Aelia Currency Switcher (and any plugin reading the `wc_aelia_currencyswitcher_exchange_rate` filter) then converts cart prices using the IMS rate, so the storefront, IMS, and Xero all see the same exchange rate on the same order. See `docs/woocommerce.md` § onetwoInventory Helper WordPress plugin for installation steps.
+**Downstream push to WooCommerce (retired).** IMS no longer pushes exchange rates to the store: the onetwoInventory Helper plugin 1.3.0 refuses every rate push and no longer overrides Aelia's rate, so Aelia, the store's currency switcher, owns the storefront rates. A push attempt is recorded as a skipped row in the push log. IMS takes its rates from the daily ECB fetch; reading Aelia's rates into IMS (setting `fx_rate_source`, default ECB) is built but **not yet switched on**. See `docs/woocommerce.md` for the plugin.
 
 **A purchase order's rate is the table rate, never a typed one** (owner ruling 2026-10-25). `createPurchaseOrder`, the draft edit, the replenishment PO generator, the purchase-order CSV importer and the form all take the rate from the one lookup (`resolvePurchaseOrderFxRateToBase`, which calls `getFxRateToBase`); the former 2% override band (`PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE`) is gone. A PO is priced at the moment it is saved (the first load prices its orders at the end of their created day). A bill pushed to Xero therefore carries a `CurrencyRate` that IS an `fx_rates` row. An admin who needs another rate pins a manual override row (below); a stored PO rate is never rewritten.
 
@@ -2173,15 +2179,15 @@ settles expire normally.
 | Endpoint | Schedule | Purpose |
 |---|---|---|
 | `/api/cron/accounting-sync` | Every 5 min | Settle any held ("unconfirmed") posting refusals — which happens on every run, whether or not an accounting connector is enabled — then process pending accounting sync entries (invoices, journals) for whichever accounting connector is active, then, for Xero only, run the back-reference repair sweep |
-| `/api/cron/accounting-daily-batch` | Daily (midnight) | Run sub-ledger Groups A1, A2, B |
+| `/api/cron/accounting-daily-batch` | Daily (02:00 by default) | Run sub-ledger Groups A1, A2, B |
 | `/api/cron/accounting-payment-poll` | Every 15 min | Detect paid invoices and bills in the active accounting connector |
 | `/api/cron/accounting-payment-reconcile` | Daily (03:00) | Backlog sweep: check every locally-linked invoice/bill against its current Xero status by id (report-only unless `xero_payment_reconcile_apply`) |
 | `/api/cron/accounting-fx-revaluation` | Daily | Periodic unrealised FX revaluation of open AR/AP balances |
-| `/api/cron/xero-chart-sync` | Daily | Refresh the stored Xero chart of accounts (read-only) before the balance snapshot |
-| `/api/cron/account-balance-snapshot` | Daily | Snapshot Xero account balances for period reporting |
+| `/api/cron/xero-chart-sync` | Daily (00:30 by default) | Refresh the stored Xero chart of accounts (read-only) before the balance snapshot |
+| `/api/cron/account-balance-snapshot` | Daily (01:00 by default) | Snapshot Xero account balances for period reporting |
 | `/api/cron/xero-tax-rate-drift` | Hourly | Read the full Xero tax-rate list into the tax-rate master store (rows, header and read-sync stamp in one transaction) and record IMS-vs-Xero tax-rate drift |
 
-All cron endpoints require the `CRON_SECRET` bearer header in production.
+All cron endpoints require the `CRON_SECRET` bearer header in production. These jobs are switched on and timed on **Settings > System > Scheduler**; after an upgrade that adds or retimes one (the chart refresh is new, the tax-rate drift check is hourly), press **Save & Apply** there once so it reaches the crontab. See [Settings](settings.md#cron-jobs).
 
 
 ### Account balance snapshots (Trial Balance)

@@ -7,7 +7,7 @@ Every action in the system is recorded in the activity log with a timestamp, the
 
 ## Viewing the Activity Log
 
-Navigate to `/activity` to access the activity log page.
+Open **Activity** in the sidebar (`/activity`). It is available to Administrators and Managers.
 
 ### Filtering by Level
 
@@ -28,9 +28,9 @@ Click the tag filter buttons to show only entries from a specific area:
 | purchase | Purchase orders, receiving, returns, invoicing |
 | inventory | Product creation and updates, bulk operations, component changes |
 | stock | Adjustments, transfers (dispatch and receive), manufacturing production in/out, reservations |
-| sync | WooCommerce and Xero synchronisation events |
+| sync | WooCommerce, Xero and warehouse synchronisation events |
 | settings | All configuration changes |
-| auth | Profile updates, password changes, passkey registration and deletion |
+| auth | Profile updates, password changes and resets, user changes, passkey registration and deletion |
 | import | CSV imports with record counts |
 | manufacturing | Production orders and assembly operations |
 | system | Database reset, backup create/restore/upload/delete, scheduled tasks |
@@ -88,6 +88,7 @@ The activity log displays 50 entries per page. Use the pagination controls to na
 - Profile updates (name, email, avatar)
 - Password changes
 - Passkey registration and deletion
+- Password reset requested, and password reset completed via the emailed link
 - User creation, update, and deletion (admin)
 - Role changes
 
@@ -97,7 +98,9 @@ The activity log displays 50 entries per page. Use the pagination controls to na
 ### System
 - Database reset
 - Backup creation, restoration, upload, and deletion
-- Scheduled task execution
+- Scheduled task execution (including each scheduled reconciliation-pack run, refusal and failure)
+- Scheduled check results: the daily invariant check findings, read-sync liveness and warehouse watchdog alerts (the same problems also notify administrators through the bell icon)
+- Erasure of personal data (the erasure record itself is on **Settings > Erasure records**; log rows about the erased person are themselves erased, see [Personal-data erasure](erasure.md))
 - Cost-layer snapshot revaluation events (when retrospective landed costs rewrite historical FIFO layers)
 - Connection-test fingerprint events (a SHA256 fingerprint of credentials, recorded each time a "Test Connection" is run for WC/Xero/Mintsoft — useful for spotting silent credential rotation)
 - Cron rate-limit hits (when a per-route cron quota is exceeded, the rejection is logged so you can spot misconfigured schedules)
@@ -119,7 +122,7 @@ In metadata, these values are replaced with `[REDACTED]` plus a length hint wher
 
 ## Retention
 
-Activity log retention is configurable per level in **System Settings**. Entries older than the configured period are automatically deleted.
+Activity log retention is configurable per level on **Settings > System > Data Retention** (Activity Log Retention). Entries older than the configured period are automatically deleted.
 
 | Level | Default Retention |
 |---|---|
@@ -151,4 +154,4 @@ affected by the retention period you set.
 
 ## Automatic Cleanup
 
-A daily cron job calls `/api/cron/activity-cleanup` at 03:00 to purge entries that have exceeded their retention period. No manual intervention is required.
+A daily scheduled job (**Activity Log Cleanup**, `/api/cron/activity-cleanup`, 03:00 by default, on **Settings > System > Scheduler**) purges entries that have exceeded their retention period. No manual intervention is required.

@@ -9,7 +9,7 @@ The main purchasing page shows all purchase orders in a searchable table.
 
 - **Search** -- Find POs by number, supplier name, or reference.
 - **Filter by Status** -- Narrow the list to a specific status.
-- **Export** -- Download the current filtered list as a CSV file.
+- **Export** -- Download the list as a CSV file (the CSV bar on the page also imports purchase orders from CSV).
 
 
 ## Creating a Purchase Order
@@ -58,7 +58,7 @@ Purchase orders use the canonical purchase workflow documented in `docs/workflow
 | **PO Sent** | The purchase order has been confirmed and sent to the supplier. |
 | **Shipped** | The supplier has shipped the goods. |
 | **Partially Received** | Some lines have been received but the PO is not yet complete. |
-| **Received** | All expected lines have been received. |
+| **Received** | Every line has landed in stock. A line counts as **landed** when its goods have arrived by any route: a manual receipt, a warehouse (WMS) book-in, or a warehouse stock-sync alignment that raised stock without a receipt on the line. An order the warehouse accounted for entirely therefore becomes Received without a manual receipt. |
 | **Invoiced** | A supplier invoice has been recorded for the PO. |
 | **Partially Returned** | Some received goods have been returned to the supplier. |
 | **Returned** | Received goods have been fully returned to the supplier. |
@@ -103,22 +103,22 @@ Generate a purchase order PDF to send to the supplier. The PO PDF includes produ
 
 ## Receiving a Purchase Order
 
-When goods arrive, open the PO and click **Receive**. You can receive all lines at once or partially receive individual lines.
+When goods arrive, open the PO and click **Receive Goods**. You can receive all lines at once or partially receive individual lines. You cannot receive more than the line's ordered quantity less what has already landed (including anything the warehouse has booked in or aligned).
 
-**Lines with an open warehouse ASN are booked in through the ASN, not by hand.** If a line's Mintsoft (warehouse) ASN is still open, partly booked in, or being created, **Receive** refuses that line and names the SKU and the ASN. Use **Recheck booked-in** on the order once the warehouse has booked the goods, so the stock is added once. Other lines of the same order, and lines whose ASN is fully booked in or closed, can still be received here.
+**Lines with an open warehouse ASN are booked in through the ASN, not by hand.** If a line's Mintsoft (warehouse) ASN is still open, partly booked in, or being created, **Receive Goods** refuses that line and names the SKU and the ASN. Use **Recheck booked-in** on the order once the warehouse has booked the goods, so the stock is added once. Other lines of the same order, and lines whose ASN is fully booked in or closed, can still be received here.
 
 When stock is received:
 
 - A **FIFO cost layer** is created for each line, recording the quantity and unit cost.
 - **Stock levels** at the destination warehouse are updated immediately.
-- The PO status moves to **Partially Received** or **Fully Received** accordingly.
+- The PO status moves to **Partially Received** or **Received** accordingly.
 
 The unit cost is validated as finite and non-negative before stock movements are written. A landed-cost recalculation that produces a NaN or infinite cost is rejected at the receipt boundary, before any stock or cost layer is created.
 
 
 ## Closing and Cancelling a Purchase Order
 
-**Close** and **Cancel** are available at every stage from RFQ Sent to Partially Received (a Draft can only be cancelled; a fully **Received** order can only be closed). Which one you use depends on what you want the order to say, not on what happens to stock:
+**Close PO** and **Cancel PO** are available at every stage from RFQ Sent to Partially Received (a Draft can only be cancelled; a fully **Received** or **Invoiced** order can only be closed; an order in **Partially Returned** can be closed or cancelled). On a part-received order the buttons read **Close short** and **Cancel balance**. A confirmation dialog states exactly what will happen, with the quantities. Which one you use depends on what you want the order to say, not on what happens to stock:
 
 | Situation | Close | Cancel PO |
 |---|---|---|
@@ -142,7 +142,7 @@ If the supplier was billed for more than was received (a prepaid supplier), clos
 
 ### Warehouse ASNs
 
-An order whose lines have an **open warehouse ASN** (being created, open, partly booked in, or booked in but not yet reconciled) cannot be closed or cancelled. The message names the SKUs and ASN numbers. Book the goods in through the ASN (**Recheck booked-in**) or retire the ASN first, then close the order. This keeps the warehouse from receiving goods against an order that no longer expects them.
+An order whose lines have an **open warehouse ASN** (being created, open, partly booked in, or booked in but not yet reconciled) cannot be closed or cancelled. The message names the SKUs and ASN numbers. Book the goods in through the ASN (**Recheck booked-in**) or retire the ASN first, then close the order. This keeps the warehouse from receiving goods against an order that no longer expects them. Warehouse (Mintsoft) ASN handling is described in [Warehouse (Mintsoft)](warehouse.md).
 
 ### Idempotent cancellation
 
@@ -177,7 +177,7 @@ the goods receipt, so a supplier can never be paid for goods that haven't arrive
 defective goods already sent back.
 
 For **prepaid / deposit suppliers**, tick **Prepaid / deposit supplier** on the supplier record
-(Purchase Orders > Suppliers > Edit). Bills for that supplier's POs may then be raised up to the
+(Purchases > Suppliers > Edit). Bills for that supplier's POs may then be raised up to the
 full **ordered** quantity before anything is received — the deposit / pro-forma flow. The ordered
 quantity remains a hard cap either way.
 
@@ -215,6 +215,17 @@ message. See the Xero sync docs for retry semantics.
 
 Paid bills cannot be edited. Reverse the payment first if a correction is required.
 
+
+### Supplier credit notes
+
+The **Supplier credit notes** card at the bottom of a PO that has a bill lists every credit note recorded against the order, each marked **DRAFT** or **POSTED**.
+
+- **Automatic draft on a return.** Returning goods that were already billed (**Return Items**) raises a **DRAFT** supplier credit note for the over-billed value. Repeated returns top the credit up to the over-billed total; they never credit the same goods twice. A banner at the top of the PO says how many units are billed but were returned and reminds you to review the draft.
+- **Record one by hand.** Click **Record credit note** (shown once the order has a bill), enter the amount in the order's currency, optionally the supplier's credit note number and a reason, and click **Record (draft)**. The amount cannot exceed what is left to credit on the bill.
+- **Post it.** Click **Post** on a draft. When the accounting connector is Xero and syncing is on, the credit note is queued to Xero as a supplier credit note and allocated against the bill it offsets; it is converted to your base currency at the bill's exchange rate (see the credit-note conversion note under [Landed Cost Distribution](#landed-cost-distribution)). If the accounting connector has changed since the credit note was prepared, it stays a draft with an explanation and you post it again once the connector selection has settled. Posting needs the invoicing permission.
+- A posted credit note that fully offsets the bill is what lets you cancel an invoiced freight PO.
+
+A supplier return on a part-received order does not change the order's status while quantity is still due (see [Purchase Returns](#purchase-returns)).
 
 ## Freight Purchase Orders
 
@@ -306,11 +317,12 @@ Each landed-cost adjustment carries the `freightPoId` of the triggering freight 
 
 ## Supplier Management
 
-Navigate to **Purchasing > Suppliers** to manage your supplier list. Each supplier record includes:
+Navigate to **Purchases > Suppliers** in the sidebar to manage your supplier list. Each supplier record includes:
 
 - **Contact details** -- Name, email, phone, and address.
 - **Currency** -- The supplier's default trading currency.
-- **Tax Rate** -- The default tax rate applied to POs for this supplier.
+- **Default VAT Rate** -- The default tax rate applied to POs for this supplier. When a PO file or import names the rate by name instead of choosing it, only active rates usable for purchases (Purchases or Both) can match; names are compared ignoring case and extra spaces. If two rates still match, the one spelled exactly is used, otherwise the order is refused with "choose the rate by id". A name that matches nothing leaves the order with no rate. Choosing the rate from the list always wins.
+- **VAT Number**, **Account Number** and **Delivery Time (days)** -- delivery time shows the average from your PO history beside the figure you enter.
 - **Payment Terms** -- The agreed payment terms (e.g. Net 30, Net 60).
 
 ### Importing suppliers from CSV
@@ -351,23 +363,24 @@ If a PO is later cancelled or fully returned, the preferred-supplier update is N
 
 ## Supplier-Scoped Reorder Drafts
 
-From Analytics > Reorder Forecast, you can generate a **draft purchase order** for a specific supplier.
+From **Analytics > Reorder Planning** (the standalone Reorder Forecast page has been retired and folded into it, see [Analytics](analytics.md#inventory-health-and-demand-planning)), you can generate **draft purchase orders** from the suggestions.
 
-1. Open the reorder forecast and filter by supplier (uses the preferred supplier field).
-2. The forecast shows reorder-eligible products for that supplier with suggested quantities.
-3. Click **Generate Draft PO** to create a PO scoped to that supplier with one line per product.
+1. Open Reorder Planning and filter as needed (supplier uses the preferred supplier field).
+2. Tick the rows you want, or leave all unticked to act on every visible row (a confirmation names the row count).
+3. Click **Generate from selection** (or **Generate POs + draft MOs for all visible rows**). One draft PO is created per supplier with one line per product; manufactured (BOM) rows get a draft production order instead.
 4. Each line carries **reorder evidence** — forecast metadata (stock at forecast time, demand rate, lead time, days of cover) stored on the line for later audit.
-5. Review and adjust quantities, then send the PO normally.
+5. A supplier that already received a reorder draft within the last few minutes is skipped (the result names how many), so a double click does not create duplicates.
+6. Review and adjust quantities, then send the PO normally.
 
-Lifecycle exclusions apply: EOL and Archived products are skipped, even if the forecast would suggest a reorder.
+Lifecycle exclusions apply: only Draft and Active products are planned. EOL and Archived products are skipped.
 
 
 ## Supplier Portal
 
 Suppliers with user accounts (SUPPLIER role) can access a dedicated portal to:
 
-- **View RFQs** addressed to their company and **submit quotes** with prices, quantities, PO number, delivery date, and shipping details. An RFQ appears only once you have marked it **RFQ Sent**; a purchase order still in Draft is never visible to the supplier (not in the list, by direct link, or as an RFQ PDF). After a quote is submitted the supplier sees a read-only confirmation, and the order moves to **Quote Received** for your review.
+- **View RFQs** addressed to their company and **submit quotes** with prices, quantities, PO number, delivery date, and shipping details. An RFQ appears only once you have marked it **RFQ Sent**; a purchase order still in Draft is never visible to the supplier (not in the list, by direct link, or as an RFQ PDF). After a quote is submitted the supplier sees a read-only **Quote Submitted** confirmation (the RFQ stays open on screen but cannot be edited), and the order moves to **Quote Received** for your review.
 - **View Purchase Orders** for their company (sent orders only; drafts, and cancelled orders that were never sent, are hidden)
 - **View their products** linked to the supplier (without financial data such as sell prices, margins, or COGS)
 
-Supplier users land on the RFQ list after login (they have no dashboard) and see a separate navigation with only the sections relevant to them. All supplier actions are verified server-side to ensure suppliers can only access their own data.
+Supplier users land on the RFQ list (**RFQs**, `/supplier/rfqs`) after login (they have no dashboard) and see a separate navigation with only the sections relevant to them. All supplier actions are verified server-side to ensure suppliers can only access their own data.
