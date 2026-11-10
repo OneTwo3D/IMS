@@ -1574,12 +1574,20 @@ export async function updateShipmentStatus(
     skipStorefrontPush?: boolean
     /** Re-checked under the order lock inside the SHIPPED transaction; a non-null answer refuses the dispatch. */
     shipFence?: (tx: ShipmentServiceClient) => Promise<string | null>
+    /**
+     * A warehouse-reported dispatch of an order that is DRAFT / ON_HOLD / PENDING_PAYMENT: the goods have left, so
+     * the shipment, stock, FIFO and COGS are recorded, but the order is NOT promoted and nothing is pushed to the
+     * storefront. Only `applyExternalFulfillmentUpdate` sets it.
+     */
+    recordDespatchOnly?: boolean
   },
 ): Promise<{ success: boolean; error?: string }> {
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.process')
     }
+    // Honoured only for the internal (system) caller: an operator's dispatch can never record on a held order.
+    const recordDespatchOnly = options?.recordDespatchOnly === true && options?.internalBypassToken === INTERNAL_ACTION_BYPASS
     const completionAuthority = options?.completionAuthority ?? 'IMS'
     const completion = {
       completionAuthority,
@@ -1593,7 +1601,8 @@ export async function updateShipmentStatus(
       targetStatus,
       extra,
       ...(targetStatus === 'SHIPPED' && options?.shipFence ? { fence: options.shipFence } : {}),
-      ...(targetStatus === 'SHIPPED' ? { completion } : {}),
+      ...(targetStatus === 'SHIPPED' && !recordDespatchOnly ? { completion } : {}),
+      ...(recordDespatchOnly ? { recordDespatchOnly: true } : {}),
     })
     if (!result.success) {
       try {
@@ -1611,7 +1620,9 @@ export async function updateShipmentStatus(
       // Already reconciled in the dispatch transaction when this call did the dispatch; a re-run against an
       // already-SHIPPED shipment (retry, crashed post-commit step) reconciles here instead.
       const reconciliation = result.reconciliation
-        ?? await reconcileOrderAfterShipment(db, result.shipment, extra, completion)
+        ?? (recordDespatchOnly
+          ? { shouldGenerateInvoice: false, orderId: result.shipment.orderId }
+          : await reconcileOrderAfterShipment(db, result.shipment, extra, completion))
       // The shipments shipped (the goods left) but the order was NOT flipped: the verification no longer holds. Everything below still
       // runs (logs, stock sync); the refusal is reported at the end so the order stays pending and is verified again, then completed,
       // on the next sweep.

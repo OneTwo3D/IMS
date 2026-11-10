@@ -7,7 +7,11 @@ import {
   validateSalesOrderStatusTransition,
   validateShipmentStatusTransition,
 } from '@/lib/domain/workflows/action-guards'
-import { resolveShippedPromotion } from '@/lib/domain/workflows/sales-order-state'
+import {
+  ORDER_STATUSES_NOT_READY_TO_DISPATCH,
+  orderNotReadyToDispatchMessage,
+  resolveShippedPromotion,
+} from '@/lib/domain/workflows/sales-order-state'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import {
   lockSalesOrder,
@@ -1100,6 +1104,12 @@ export async function transitionShipmentStatus(
      * left to run `reconcileOrderAfterShipment` afterwards, in a separate transaction that can fail alone.
      */
     completion?: OrderPromotionOptions
+    /**
+     * A WAREHOUSE-reported dispatch (the goods have already physically left): record it even though the order is
+     * DRAFT / ON_HOLD / PENDING_PAYMENT. The caller must not also pass `completion` — the order is left exactly as
+     * it is. Never set by an in-app dispatch, which refuses those statuses.
+     */
+    recordDespatchOnly?: boolean
   },
 ): Promise<ShipmentTransitionResult> {
   const { shipmentId, targetStatus, extra } = input
@@ -1190,6 +1200,15 @@ export async function transitionShipmentStatus(
         return {
           success: false as const,
           error: terminalOrderTransitionError(String(withdrawn.status)),
+        }
+      }
+
+      // An IN-APP dispatch of an order that is not ready to ship is refused here, under the order lock and before
+      // any stock, FIFO or COGS work: it would otherwise silently finalise a draft, clear a hold or bypass payment.
+      if (withdrawn && !input.recordDespatchOnly && ORDER_STATUSES_NOT_READY_TO_DISPATCH.has(String(withdrawn.status))) {
+        return {
+          success: false as const,
+          error: orderNotReadyToDispatchMessage(String(withdrawn.status)),
         }
       }
 
@@ -1537,6 +1556,10 @@ export async function promoteOrderIfFulfilledInTx(
     })
     if (!currentOrder) return null
     if (['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'].includes(currentOrder.status)) return null
+    // A draft, a held order or one awaiting payment is never promoted by a dispatch: that would finalise it,
+    // clear the hold or stand in for the payment. (A warehouse-reported dispatch on such an order is recorded
+    // without promotion; an in-app dispatch is refused before it gets here.)
+    if (ORDER_STATUSES_NOT_READY_TO_DISPATCH.has(currentOrder.status)) return null
 
     // Re-derived UNDER the order lock: a caller's earlier unlocked read can be stale, and when this
     // runs inside the dispatch transaction the shipment just marked SHIPPED is only visible here.

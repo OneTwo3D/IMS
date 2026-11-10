@@ -1,3 +1,4 @@
+import { ORDER_STATUSES_NOT_READY_TO_DISPATCH } from '@/lib/domain/workflows/sales-order-state'
 import type { ShipmentServiceClient } from '@/lib/domain/sales/shipment-service'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
@@ -71,10 +72,18 @@ export type ExternalFulfillmentRefusal =
   | 'insufficient_physical_stock'
   | 'shipment_creation_failed'
   | 'coverage_shortfall'
+  | 'order_not_ready_to_ship'
   | 'shipment_status_transition_failed'
 
 export type ExternalFulfillmentOutcome =
-  | { success: true }
+  | {
+      success: true
+      /**
+       * Set when the warehouse's despatch was RECORDED against an order that is DRAFT / ON_HOLD / PENDING_PAYMENT: the
+       * shipment, stock and COGS are booked, but the order was left as it was and no storefront completion was queued.
+       */
+      despatchedWhileNotReady?: string
+    }
   | {
       success: false
       error: string
@@ -631,8 +640,36 @@ export async function applyExternalFulfillmentUpdate(
 
   const { autoAllocateOrder, confirmAllocations, updateShipmentStatus } = await import('@/app/actions/allocation')
 
+  // A WAREHOUSE DESPATCH FOR AN ORDER IMS HAS NOT RELEASED (DRAFT / ON_HOLD / PENDING_PAYMENT). The goods have physically
+  // left, so a despatch that can be recorded exactly is recorded (shipment, stock, FIFO, COGS) - but the order is left
+  // as it is: not promoted, hold not cleared, no storefront completion. Allocating or creating shipments here would
+  // finalise a draft or lift the hold as a side effect, so when the order has no shipment yet there is nothing IMS can
+  // record without doing that, and the despatch is refused as an unreconciled despatch for an operator (the ordinary
+  // stuck-despatch path: retried, then dead-lettered into the exception inbox with a bell notice).
+  const orderNotReady = update.targetShipmentStatus === 'SHIPPED' && ORDER_STATUSES_NOT_READY_TO_DISPATCH.has(String(order.status))
+  const orderRef = order.externalOrderNumber ?? order.orderNumber ?? order.id
+  if (orderNotReady) {
+    const existingShipments = await db.shipment.count({ where: { orderId: order.id } })
+    if (order.status === 'DRAFT' || existingShipments === 0) {
+      const error = `${update.source} despatched order ${orderRef} but IMS has not released it (${String(order.status)})`
+        + ' and holds no shipment for it, so the despatch was not recorded. It is listed under Sync > Exceptions: finalise or release the order'
+        + ' there first, then replay the despatch.'
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: order.id,
+        action: 'external_fulfillment_order_not_ready',
+        tag: 'sync',
+        level: 'WARNING',
+        description: error,
+        metadata: { source: update.source, orderStatus: order.status, shipments: existingShipments },
+        resolveUser: false,
+      })
+      return refuseExternalFulfillment('order_not_ready_to_ship', error)
+    }
+  }
+
   const allocationCount = await db.orderAllocation.count({ where: { orderId: order.id } })
-  if (allocationCount === 0) {
+  if (allocationCount === 0 && !orderNotReady) {
     const result = await autoAllocateOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
     if (!result.success) {
       return refuseExternalFulfillment('auto_allocation_failed', result.error ?? 'Auto-allocation failed')
@@ -659,7 +696,7 @@ export async function applyExternalFulfillmentUpdate(
   }
 
   const shipmentCount = await db.shipment.count({ where: { orderId: order.id } })
-  if (shipmentCount === 0) {
+  if (shipmentCount === 0 && !orderNotReady) {
     const result = await confirmAllocations(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
     if (!result.success) {
       return refuseExternalFulfillment('shipment_creation_failed', result.error ?? 'Shipment creation failed')
@@ -740,12 +777,13 @@ export async function applyExternalFulfillmentUpdate(
           // customer despatch email it exists to fire), and raise a `shipped_short` WARNING on
           // every external dispatch. See `OrderCompletionAuthority`.
           completionAuthority: 'EXTERNAL',
+          ...(orderNotReady ? { recordDespatchOnly: true } : {}),
           // o3d-zvec.15: a WMS dispatch is the thing that completes the storefront order, so the
           // durable completion job is enqueued WITH the flip (tracking first, then the status; retried
           // by the cron; held for orders WooCommerce no longer has in flight). A storefront-sourced
           // completion must never push back, as it would only echo.
-          storefrontCompletion: isWmsConnectorId(update.source) && update.storefrontAlreadyCompleted !== true,
-          skipStorefrontPush: update.storefrontAlreadyCompleted === true,
+          storefrontCompletion: !orderNotReady && isWmsConnectorId(update.source) && update.storefrontAlreadyCompleted !== true,
+          skipStorefrontPush: orderNotReady || update.storefrontAlreadyCompleted === true,
           ...(update.storefrontAlreadyCompleted === true && update.shipFence ? { shipFence: update.shipFence } : {}),
         },
       )
@@ -776,7 +814,7 @@ export async function applyExternalFulfillmentUpdate(
   // FRESH fence when there is one, with no shipment transition and no stock work. Success is reported only once the order is
   // flipped or already complete; a refusal is an apply error and the next sweep tries again. This applies to the unfenced WMS
   // path too: it used to log success on every tick for an order that never reached SHIPPED.
-  if (update.targetShipmentStatus === 'SHIPPED' && shipments.length === 0) {
+  if (update.targetShipmentStatus === 'SHIPPED' && shipments.length === 0 && !orderNotReady) {
     const { reconcileOrderAfterShipment } = await import('@/lib/domain/sales/shipment-service')
     const fencedRetry = update.storefrontAlreadyCompleted === true && !!update.shipFence
     const reconciliation = await reconcileOrderAfterShipment(db, { orderId: order.id }, undefined, {
@@ -799,6 +837,38 @@ export async function applyExternalFulfillmentUpdate(
         )
       }
     }
+  }
+
+  if (orderNotReady) {
+    // Every shipment is already recorded (an earlier pass): nothing new, so no second notice and no loop.
+    if (shipments.length === 0) return { success: true, despatchedWhileNotReady: String(order.status) }
+    const notice = `${update.source} despatched order ${orderRef} while IMS holds it as ${String(order.status)}. The despatch, stock and`
+      + ' cost have been recorded, but the order has NOT been marked shipped, its status is unchanged and no completion was sent to the'
+      + ' storefront. Review the order: finalise or release it, then set it to Shipped if it should be closed.'
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: order.id,
+      action: 'external_fulfillment_order_not_ready',
+      tag: 'sync',
+      level: 'WARNING',
+      description: notice,
+      metadata: { source: update.source, orderStatus: order.status, shipmentsProcessed: shipments.length },
+      resolveUser: false,
+    })
+    try {
+      const { notify } = await import('@/lib/notifications')
+      const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
+      await Promise.all(admins.map((admin) => notify({
+        userId: admin.id,
+        type: 'error',
+        title: 'Despatch on an order that is not ready to ship',
+        message: notice,
+        actionUrl: `/sales/${order.id}`,
+      })))
+    } catch (noticeError) {
+      console.error('[external-fulfillment] not-ready despatch notice failed:', noticeError)
+    }
+    return { success: true, despatchedWhileNotReady: String(order.status) }
   }
 
   await logActivity({

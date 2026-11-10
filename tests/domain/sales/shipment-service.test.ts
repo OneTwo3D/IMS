@@ -3112,7 +3112,7 @@ const PACKED_SHIPMENT: Shipment = {
 }
 const FULL_SHIPMENT_LINE: ShipmentLine = { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }
 
-for (const parked of ['ON_HOLD', 'PROCESSING', 'DRAFT', 'PENDING_PAYMENT']) {
+for (const parked of ['PROCESSING']) {
   test(`SHP-H1: dispatching the last shipment of a ${parked} order promotes it to SHIPPED in the dispatch transaction`, async () => {
     const state = baseState({
       orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: parked }],
@@ -3149,6 +3149,62 @@ for (const parked of ['ON_HOLD', 'PROCESSING', 'DRAFT', 'PENDING_PAYMENT']) {
   })
 }
 
+for (const [parked, wording] of [['DRAFT', /still a draft.*Finalise the draft/], ['ON_HOLD', /on hold.*Release the hold/], ['PENDING_PAYMENT', /waiting for payment.*Record the payment/]] as const) {
+  test(`SHP-H1: an in-app dispatch of a ${parked} order is refused with nothing written`, async () => {
+    const state = baseState({
+      orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: parked }],
+      shipments: [{ ...PACKED_SHIPMENT }],
+      shipmentLines: [{ ...FULL_SHIPMENT_LINE }],
+    })
+
+    const result = await transitionShipmentStatus(createClient(state), {
+      shipmentId: 'shipment-1',
+      targetStatus: 'SHIPPED',
+      completion: { completionAuthority: 'IMS' },
+    })
+
+    assert.equal(result.success, false)
+    assert.match(result.success ? '' : result.error, wording)
+    assert.equal(state.shipments[0].status, 'PACKED')
+    assert.equal(state.stockLevels[0].quantity, 2)
+    assert.equal(state.stockLevels[0].reservedQty, 2)
+    assert.equal(state.movements.length, 0)
+    assert.equal(state.cogsEntries.length, 0)
+    assert.equal(state.orders[0].status, parked)
+  })
+
+  test(`SHP-H1: a warehouse-reported dispatch of a ${parked} order is recorded without touching the order`, async () => {
+    const state = baseState({
+      orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: parked }],
+      shipments: [{ ...PACKED_SHIPMENT }],
+      shipmentLines: [{ ...FULL_SHIPMENT_LINE }],
+    })
+
+    const result = await transitionShipmentStatus(createClient(state), {
+      shipmentId: 'shipment-1',
+      targetStatus: 'SHIPPED',
+      recordDespatchOnly: true,
+    })
+
+    assert.equal(result.success, true)
+    assert.equal(state.shipments[0].status, 'SHIPPED')
+    assert.equal(state.stockLevels[0].quantity, 0)
+    assert.equal(state.movements.length, 1)
+    assert.equal(state.orders[0].status, parked, 'not promoted, hold not cleared')
+  })
+
+  test(`SHP-H1: reconcile never promotes a ${parked} order`, async () => {
+    const state = baseState({
+      orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: parked }],
+      shipments: [{ ...PACKED_SHIPMENT, status: 'SHIPPED', trackingNumber: 'T' }],
+      shipmentLines: [{ ...FULL_SHIPMENT_LINE }],
+    })
+    const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
+    assert.equal(state.orders[0].status, parked)
+    assert.equal(result.orderReachedShipped, undefined)
+  })
+}
+
 test('SHP-H1: a promotion that cannot be made rolls the whole dispatch back, stock included', async () => {
   const state = baseState({
     orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'MYSTERY' }],
@@ -3174,7 +3230,7 @@ test('SHP-H1: a promotion that cannot be made rolls the whole dispatch back, sto
 
 test('SHP-H1: a partial dispatch inside the transaction leaves the order and the invoice trigger alone', async () => {
   const state = baseState({
-    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ON_HOLD' }],
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'PROCESSING' }],
     shipments: [
       { ...PACKED_SHIPMENT },
       { id: 'shipment-2', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PENDING', trackingNumber: null, shippingService: null },
@@ -3190,7 +3246,7 @@ test('SHP-H1: a partial dispatch inside the transaction leaves the order and the
     completion: { completionAuthority: 'IMS' },
   })
 
-  assert.equal(state.orders[0].status, 'ON_HOLD')
+  assert.equal(state.orders[0].status, 'PROCESSING')
   assert.deepEqual(result.success && result.reconciliation, { shouldGenerateInvoice: false, orderId: 'order-1' })
 })
 
