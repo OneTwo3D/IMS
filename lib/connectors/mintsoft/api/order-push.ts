@@ -176,7 +176,7 @@ async function fetchSearchRows(orderNumber: string, clientId: number): Promise<R
   const query = new URLSearchParams({ OrderNumber: orderNumber, ClientId: String(clientId) })
   const result = await mintsoftRequest<unknown>(`/api/Order/Search?${query.toString()}`)
   if (result.error) throw new Error(result.error)
-  return extractMintsoftArrayPayloadStrict(result.data, 'Order/Search (push dedupe)')
+  return extractMintsoftArrayPayloadStrict(result.data, 'Order/Search (push dedupe)') as RawOrder[]
 }
 
 /** The scoped Order/Search for an order's number: every row ClientId-asserted, merged survivors dropped, then the number/reference match. */
