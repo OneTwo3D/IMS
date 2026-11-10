@@ -59,7 +59,10 @@ mock.module('@/lib/activity-log', {
 let failedIds: string[] = []
 const candidateQueries: Array<Record<string, unknown>> = []
 let bindingRow: Record<string, unknown> | null = null
-let dryRun: { id: string } | null = { id: 'job-1' }
+type DryRunJob = { id: string; startedAt: Date; summary: Record<string, unknown> }
+let dryRuns: DryRunJob[] = []
+/** Runs between the approval's reads and its write — where a concurrent re-point lands. */
+let betweenReadAndWrite: (() => void) | null = null
 const bindingUpdates: unknown[] = []
 const db = {
   accountingSyncLog: {
@@ -72,10 +75,24 @@ const db = {
     findUnique: async () => null,
   },
   externalWmsBinding: {
-    findFirst: async () => bindingRow,
-    updateMany: async (args: unknown) => { bindingUpdates.push(args); return { count: 1 } },
+    findFirst: async () => (bindingRow ? { ...bindingRow } : null),
+    // Honours the compare-and-set: matches only while every field in `where` still equals the row.
+    updateMany: async (args: { where: Record<string, unknown> }) => {
+      betweenReadAndWrite?.()
+      const row = bindingRow ?? {}
+      const matches = Object.entries(args.where).every(([key, want]) => (want instanceof Date ? (row[key] as Date)?.getTime() === want.getTime() : row[key] === want))
+      if (!matches) return { count: 0 }
+      bindingUpdates.push(args)
+      return { count: 1 }
+    },
   },
-  wmsSyncJob: { findFirst: async () => dryRun },
+  // Evaluates the REAL evidence query: start time after the pairing change and the summary stamps.
+  wmsSyncJob: {
+    findFirst: async (args: { where: { startedAt: { gt: Date }; AND: Array<{ summary: { path: string[]; equals: unknown } }> } }) => {
+      return dryRuns.find((job) => job.startedAt > args.where.startedAt.gt
+        && args.where.AND.every((clause) => job.summary[clause.summary.path[0]!] === clause.summary.equals)) ?? null
+    },
+  },
 }
 mock.module('@/lib/db', { namedExports: { db } })
 mock.module('@/lib/integration-plugins', { namedExports: { isIntegrationPluginEnabled: async (id: string) => id === 'xero' } })
@@ -91,7 +108,8 @@ function reset() {
   bindingUpdates.length = 0
   failedIds = []
   bindingRow = null
-  dryRun = { id: 'job-1' }
+  dryRuns = [freshDryRun()]
+  betweenReadAndWrite = null
 }
 
 test('PRECONDITION: the helpers accept only a literal true and an exact typed value', () => {
@@ -237,13 +255,26 @@ test('with no permission every bulk entry point is refused before the confirmati
 // ---------------------------------------------------------------------------------------------
 // Mintsoft go-live
 // ---------------------------------------------------------------------------------------------
+const PAIRED_AT = new Date('2026-11-01T00:00:00Z')
 const alignBinding = () => ({
   id: 'bind-1',
+  connector: 'mintsoft',
   warehouseId: 'wh-1',
+  externalWarehouseId: 'ext-1',
+  connectionId: 'conn-1',
+  pairingChangedAt: PAIRED_AT,
   stockSyncMode: 'ALIGN_TO_WMS',
   alignmentConfirmedAt: null,
   warehouse: { code: 'MIL1' },
 })
+function freshDryRun(over: Partial<DryRunJob> & { summary?: Record<string, unknown> } = {}): DryRunJob {
+  return {
+    id: 'job-1',
+    startedAt: new Date('2026-11-02T00:00:00Z'),
+    ...over,
+    summary: { dryRun: true, externalWarehouseId: 'ext-1', connectionId: 'conn-1', ...over.summary },
+  }
+}
 
 test('confirmMintsoftAlignmentMode refuses without a confirmation or with the wrong warehouse code, and arms nothing', async () => {
   const { confirmMintsoftAlignmentMode } = await import('@/app/actions/mintsoft-sync')
@@ -278,9 +309,59 @@ test('confirmMintsoftAlignmentMode still requires a completed dry run even with 
   const { confirmMintsoftAlignmentMode } = await import('@/app/actions/mintsoft-sync')
   reset()
   bindingRow = alignBinding()
-  dryRun = null
+  dryRuns = []
   const result = await confirmMintsoftAlignmentMode('bind-1', { confirmed: true, typedName: 'MIL1' })
   assert.equal(result.success, false)
   assert.match(result.error ?? '', /dry run/)
   assert.deepEqual(bindingUpdates, [])
+})
+
+test('a concurrent re-point between approval and write refuses the confirmation: the new pairing is never armed', async () => {
+  const { confirmMintsoftAlignmentMode } = await import('@/app/actions/mintsoft-sync')
+  reset()
+  bindingRow = alignBinding()
+  betweenReadAndWrite = () => {
+    // Another admin re-points the binding after the typed code and the dry run were checked.
+    bindingRow = { ...bindingRow!, externalWarehouseId: 'ext-2', pairingChangedAt: new Date('2026-11-03T00:00:00Z'), alignmentConfirmedAt: null }
+  }
+  const result = await confirmMintsoftAlignmentMode('bind-1', { confirmed: true, typedName: 'MIL1' })
+  assert.equal(result.success, false)
+  assert.equal(result.code, CONFIRMATION_REQUIRED_CODE)
+  assert.match(result.error ?? '', /changed while you were confirming/)
+  assert.deepEqual(bindingUpdates, [], 'nothing was written')
+  assert.equal(bindingRow!.alignmentConfirmedAt, null)
+  assert.deepEqual(logs, [])
+})
+
+test('dry-run evidence from before a re-point, for another external warehouse or connection, or with no connection stamp is rejected', async () => {
+  const { confirmMintsoftAlignmentMode } = await import('@/app/actions/mintsoft-sync')
+  const stale: Array<[string, DryRunJob]> = [
+    ['started before the binding was last re-pointed', freshDryRun({ startedAt: new Date('2026-10-31T00:00:00Z') })],
+    ['ran against another Mintsoft warehouse', freshDryRun({ summary: { externalWarehouseId: 'ext-OLD' } })],
+    ['ran against another connection', freshDryRun({ summary: { connectionId: 'conn-OLD' } })],
+    ['recorded before the connection was stamped', freshDryRun({ summary: { connectionId: undefined } })],
+  ]
+  for (const [name, job] of stale) {
+    reset()
+    bindingRow = alignBinding()
+    dryRuns = [job]
+    const result = await confirmMintsoftAlignmentMode('bind-1', { confirmed: true, typedName: 'MIL1' })
+    assert.equal(result.success, false, name)
+    assert.match(result.error ?? '', /dry run/, name)
+    assert.deepEqual(bindingUpdates, [], name)
+  }
+})
+
+test('a fresh dry run for the new pairing is accepted after a re-point', async () => {
+  const { confirmMintsoftAlignmentMode } = await import('@/app/actions/mintsoft-sync')
+  reset()
+  bindingRow = { ...alignBinding(), externalWarehouseId: 'ext-2', pairingChangedAt: new Date('2026-11-03T00:00:00Z') }
+  // The old run still exists but belongs to ext-1; the new one started after the re-point.
+  dryRuns = [
+    freshDryRun({ id: 'old' }),
+    freshDryRun({ id: 'new', startedAt: new Date('2026-11-04T00:00:00Z'), summary: { externalWarehouseId: 'ext-2' } }),
+  ]
+  const result = await confirmMintsoftAlignmentMode('bind-1', { confirmed: true, typedName: 'MIL1' })
+  assert.deepEqual(result, { success: true })
+  assert.equal(bindingUpdates.length, 1)
 })

@@ -540,6 +540,8 @@ test('re-pointing a confirmed ALIGN_TO_WMS binding clears the confirmation; an u
     assert.equal(result.success, true, name)
     const written = bindingUpdates.at(-1)
     assert.ok(written, `${name}: the binding was updated`)
+    // Evidence is only valid if it started after this instant, so a re-point must move it and an unrelated edit must not.
+    assert.equal('pairingChangedAt' in written, cleared, `${name}: pairingChangedAt ${cleared ? 'restamped' : 'untouched'}`)
     if (cleared) assert.equal(written.alignmentConfirmedAt, null, `${name}: confirmation cleared`)
     else assert.ok(written.alignmentConfirmedAt instanceof Date, `${name}: confirmation kept`)
   }

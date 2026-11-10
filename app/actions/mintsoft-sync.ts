@@ -128,6 +128,8 @@ type MintsoftBindingSelect = {
   id: true
   warehouseId: true
   externalWarehouseId: true
+  connectionId: true
+  pairingChangedAt: true
   active: true
   stockSyncMode: true
   stockMasterSystem: true
@@ -159,6 +161,8 @@ const mintsoftBindingSelect = {
   id: true,
   warehouseId: true,
   externalWarehouseId: true,
+  connectionId: true,
+  pairingChangedAt: true,
   active: true,
   stockSyncMode: true,
   stockMasterSystem: true,
@@ -739,6 +743,8 @@ function mapMintsoftBinding(row: {
   id: string
   warehouseId: string
   externalWarehouseId: string
+  connectionId: string
+  pairingChangedAt: Date
   active: boolean
   stockSyncMode: string
   stockMasterSystem: string
@@ -1341,7 +1347,7 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
     processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.requiresReview,
   }
 
-  const [connection, settings, connectionTest, warehouses, bindings, recentStockSyncJobs, dryRunReadyJobs, openDiscrepancies, bundleLinks, returnsInbox, receiptReviewEventCount, receiptReviewEvents, pluginState] = await Promise.all([
+  const [connection, settings, connectionTest, warehouses, bindings, recentStockSyncJobs, openDiscrepancies, bundleLinks, returnsInbox, receiptReviewEventCount, receiptReviewEvents, pluginState] = await Promise.all([
     db.wmsConnection.findFirst({
       where: { connector: 'mintsoft' },
       orderBy: [{ createdAt: 'asc' }],
@@ -1398,23 +1404,6 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
             code: true,
           },
         },
-      },
-    }),
-    db.wmsSyncJob.findMany({
-      where: {
-        connector: 'mintsoft',
-        type: 'STOCK_SYNC',
-        status: {
-          in: ['SUCCEEDED', 'PARTIAL'],
-        },
-        finishedAt: {
-          not: null,
-        },
-        AND: [{ summary: { path: ['dryRun'], equals: true } }],
-      },
-      orderBy: [{ finishedAt: 'desc' }],
-      select: {
-        warehouseId: true,
       },
     }),
     db.wmsStockDiscrepancy.findMany({
@@ -1529,11 +1518,23 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
     select: { id: true, name: true, accountCode: true },
   })
   const availableOrderLookupConnectors = getAvailableOrderLookupConnectors(pluginState)
-  const alignmentDryRunReadyWarehouseIds = new Set(
-    dryRunReadyJobs
-      .map((job) => job.warehouseId)
-      .filter((warehouseId): warehouseId is string => Boolean(warehouseId)),
-  )
+  // Ready means the SAME thing the confirm action requires: a finished dry run for this binding's
+  // CURRENT pairing, started after it was last re-pointed.
+  const alignmentDryRunReadyBindingIds = new Set<string>()
+  for (const binding of bindings) {
+    if (binding.stockSyncMode !== 'ALIGN_TO_WMS' || binding.alignmentConfirmedAt) continue
+    const evidence = await db.wmsSyncJob.findFirst({
+      ...alignmentDryRunEvidenceQuery({
+        connector: 'mintsoft',
+        warehouseId: binding.warehouseId,
+        externalWarehouseId: binding.externalWarehouseId,
+        connectionId: binding.connectionId,
+        pairingChangedAt: binding.pairingChangedAt,
+      }),
+      select: { id: true },
+    })
+    if (evidence) alignmentDryRunReadyBindingIds.add(binding.id)
+  }
 
   const lastStockSyncAt = bindings
     .map((binding) => binding.lastStockSyncAt)
@@ -1576,7 +1577,7 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
       lastStockSyncAt: lastStockSyncAt?.toISOString() ?? null,
     },
     bindings: bindings.map((binding) => mapMintsoftBinding(binding, {
-      alignmentDryRunReady: alignmentDryRunReadyWarehouseIds.has(binding.warehouseId),
+      alignmentDryRunReady: alignmentDryRunReadyBindingIds.has(binding.id),
     })),
     warehouses,
     externalWarehouses,
@@ -2410,6 +2411,7 @@ export async function saveMintsoftBinding(
         where: { id: existingBinding.id },
         data: {
           ...bindingData,
+          ...(pointsAtSameTarget ? {} : { pairingChangedAt: new Date() }),
           alignmentConfirmedAt: bindingData.stockSyncMode === 'ALIGN_TO_WMS'
             ? (
                 existingBinding.stockSyncMode === 'ALIGN_TO_WMS' && pointsAtSameTarget
@@ -2492,6 +2494,10 @@ export async function confirmMintsoftAlignmentMode(
       warehouseId: true,
       stockSyncMode: true,
       alignmentConfirmedAt: true,
+      // The pairing the approval is being given for; the write below is a compare-and-set on it.
+      externalWarehouseId: true,
+      connectionId: true,
+      pairingChangedAt: true,
       warehouse: { select: { code: true } },
     },
   })
@@ -2517,14 +2523,20 @@ export async function confirmMintsoftAlignmentMode(
   // this finds from deletion, so the two asking different questions would either delete the evidence
   // an operator is about to be asked for, or exempt far more than the decision needs.
   const latestDryRun = await db.wmsSyncJob.findFirst({
-    ...alignmentDryRunEvidenceQuery({ connector: 'mintsoft', warehouseId: binding.warehouseId }),
+    ...alignmentDryRunEvidenceQuery({
+      connector: 'mintsoft',
+      warehouseId: binding.warehouseId,
+      externalWarehouseId: binding.externalWarehouseId,
+      connectionId: binding.connectionId,
+      pairingChangedAt: binding.pairingChangedAt,
+    }),
     select: {
       id: true,
     },
   })
 
   if (!latestDryRun) {
-    return { success: false, error: 'Run and review a Mintsoft alignment dry run before confirming live corrections.' }
+    return { success: false, error: 'Run and review a Mintsoft alignment dry run for this warehouse pairing before confirming live corrections. A dry run from before the binding was last re-pointed does not count.' }
   }
 
   const confirmed = await db.externalWmsBinding.updateMany({
@@ -2533,6 +2545,12 @@ export async function confirmMintsoftAlignmentMode(
       connector: 'mintsoft',
       stockSyncMode: 'ALIGN_TO_WMS',
       alignmentConfirmedAt: null,
+      // Compare-and-set on the pairing the typed code and the dry run were checked against: a
+      // concurrent re-point makes this match nothing instead of arming the new pairing.
+      warehouseId: binding.warehouseId,
+      externalWarehouseId: binding.externalWarehouseId,
+      connectionId: binding.connectionId,
+      pairingChangedAt: binding.pairingChangedAt,
     },
     data: {
       alignmentConfirmedAt: new Date(),
@@ -2540,7 +2558,22 @@ export async function confirmMintsoftAlignmentMode(
   })
 
   if (confirmed.count === 0) {
-    return { success: true }
+    // Nothing matched: either someone already confirmed this very pairing, or the binding moved.
+    const now = await db.externalWmsBinding.findFirst({
+      where: { id: binding.id, connector: 'mintsoft' },
+      select: { alignmentConfirmedAt: true, warehouseId: true, externalWarehouseId: true, connectionId: true, pairingChangedAt: true, stockSyncMode: true },
+    })
+    const samePairing = Boolean(now)
+      && now!.warehouseId === binding.warehouseId
+      && now!.externalWarehouseId === binding.externalWarehouseId
+      && now!.connectionId === binding.connectionId
+      && now!.pairingChangedAt.getTime() === binding.pairingChangedAt.getTime()
+    if (samePairing && now!.stockSyncMode === 'ALIGN_TO_WMS' && now!.alignmentConfirmedAt) return { success: true }
+    return {
+      success: false,
+      code: CONFIRMATION_REQUIRED_CODE,
+      error: 'The binding changed while you were confirming, so live corrections were NOT switched on. Review the binding and confirm again.',
+    }
   }
 
   await logActivity({

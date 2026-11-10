@@ -29,6 +29,11 @@ import type { WmsSyncJobStatus } from '@/app/generated/prisma/client'
 export type AlignmentDryRunScope = {
   connector: string
   warehouseId: string
+  /** The Mintsoft warehouse and connection the binding points at NOW. */
+  externalWarehouseId: string
+  connectionId: string
+  /** When the binding was last re-pointed; the evidence must have started after it. */
+  pairingChangedAt: Date
 }
 
 /**
@@ -45,7 +50,15 @@ export function alignmentDryRunEvidenceQuery(scope: AlignmentDryRunScope) {
       warehouseId: scope.warehouseId,
       status: { in: ['SUCCEEDED', 'PARTIAL'] as WmsSyncJobStatus[] },
       finishedAt: { not: null },
-      AND: [{ summary: { path: ['dryRun'], equals: true } }],
+      // Evidence belongs to ONE pairing: it must have started after the binding was last re-pointed
+      // and must record the external warehouse and connection the binding points at now. Runs
+      // recorded before the connection was stamped carry no connectionId and so never match.
+      startedAt: { gt: scope.pairingChangedAt },
+      AND: [
+        { summary: { path: ['dryRun'], equals: true } },
+        { summary: { path: ['externalWarehouseId'], equals: scope.externalWarehouseId } },
+        { summary: { path: ['connectionId'], equals: scope.connectionId } },
+      ],
     },
     orderBy: [{ finishedAt: 'desc' as const }],
   }

@@ -111,6 +111,7 @@ type SyncBinding = {
   connector: string
   active: boolean
   externalWarehouseId: string
+  connectionId: string
   stockSyncMode: 'DISABLED' | 'NOTIFICATION_ONLY' | 'ALIGN_TO_WMS'
   syncFrequencyMinutes: number
   discrepancyThresholds: Prisma.JsonValue | null
@@ -131,6 +132,8 @@ type SyncBinding = {
 
 type SyncSummary = {
   externalWarehouseId: string
+  /** Stamped so dry-run evidence can be matched to the connection it ran against. */
+  connectionId: string
   thresholdBreaches: number
   notifiedUsers: number
   dryRun?: boolean
@@ -196,6 +199,7 @@ async function getSyncBinding(bindingId: string): Promise<SyncBinding | null> {
       connector: true,
       active: true,
       externalWarehouseId: true,
+      connectionId: true,
       stockSyncMode: true,
       syncFrequencyMinutes: true,
       discrepancyThresholds: true,
@@ -291,6 +295,7 @@ async function reserveStockSyncJob(
         connector: true,
         active: true,
         externalWarehouseId: true,
+        connectionId: true,
         stockSyncMode: true,
         syncFrequencyMinutes: true,
         discrepancyThresholds: true,
@@ -3038,6 +3043,7 @@ export async function runStockSyncForBinding(
     const status: 'SUCCEEDED' | 'PARTIAL' = counters.errors > 0 ? 'PARTIAL' : 'SUCCEEDED'
     const summary: SyncSummary = {
       externalWarehouseId: binding.externalWarehouseId,
+      connectionId: binding.connectionId,
       thresholdBreaches,
       notifiedUsers,
       dryRun: alignmentDryRun,
@@ -3086,6 +3092,7 @@ export async function runStockSyncForBinding(
 
     await completeJob(job.id, 'FAILED', counters, {
       externalWarehouseId: binding.externalWarehouseId,
+      connectionId: binding.connectionId,
       thresholdBreaches: 0,
       notifiedUsers: 0,
       dryRun: alignmentDryRun,
