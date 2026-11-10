@@ -1007,7 +1007,7 @@ export interface WmsOrderPushPort {
    * predicate and a stale one can never land on a link that now means something else. Optional so existing test ports keep
    * compiling; when absent the write is the plain `updateLink`.
    */
-  updateLinkIfLinked?(id: string, expect: { state: PushState; externalOrderId: string }, data: LinkWrite): Promise<boolean>
+  updateLinkIfLinked?(id: string, expect: { state: 'SYNCED' | 'MERGED'; externalOrderId: string }, data: LinkWrite): Promise<boolean>
   /**
    * o3d-2k5r r2 — apply `data` ONLY while the link is still in `fromState`; false when it has
    * moved on. The convention already exists in order-reconcile-sweep (its per-attempt CAS), and

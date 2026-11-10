@@ -232,6 +232,7 @@ test('H2: a 404 on hold is NOT recorded as held (a held order is later re-create
   assert.equal(r.held, 0)
   assert.equal(r.operatorNotices, 1)
   assert.notEqual(updates[0].data.state, 'HELD')
+  assert.match(String(updates[0].data.lastError), /was not found/, 'and it says WHY: a 404, not a past-NEW order')
   assert.equal(updates[0].data.cancelledAt, undefined, 'no cancellation stamp: nobody confirmed one')
   assert.ok(updates[0].data.holdNoticeAt)
 })
@@ -408,4 +409,19 @@ test('R2: the exception inbox lists a cancel notice by the cancel pass\'s OWN or
   assert.doesNotMatch(inbox, /cancelNoticeAt: \{ not: null \}, order: \{ status: 'CANCELLED'/)
   const sweep = readFileSync(new URL('../lib/domain/wms/order-push-sweep.ts', import.meta.url), 'utf8')
   assert.match(sweep, /order: WMS_CANCELLABLE_ORDER_WHERE,/, 'and the port selects on the same constant')
+})
+
+test('R1: a cancelled split order whose PRIMARY row reads not-despatched but whose part HAS shipped is still an error, with no storefront write', async () => {
+  const partials: string[] = []
+  const errors: string[] = []
+  const { counters } = await runWmsDispatchSweepCore(dispatchDeps({
+    fetchOrderStatus: async () => dstatus({ isSplit: true, partCount: 2, dispatched: false, status: 'PART_DESPATCHED' }),
+    fetchOrderParts: async () => [dpart({ externalId: 'a', partNumber: 1 }), dpart({ externalId: 'b', partNumber: 2, dispatched: false })],
+    pushPartialShipment: async (orderId) => { partials.push(orderId); return { ok: true } },
+    orderCancelledInIms: async () => true,
+    recordDispatchError: async (_c, reason) => { errors.push(reason); return { deadLettered: false } },
+  }))
+  assert.deepEqual(partials, [])
+  assert.equal(counters.errors, 1)
+  assert.match(errors[0], /after IMS cancelled it/)
 })
