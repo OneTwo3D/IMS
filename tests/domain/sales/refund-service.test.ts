@@ -1350,7 +1350,7 @@ test('only itemised SALE lines are re-cut: a shipping row keeps its stated amoun
     orderId: 'order-1',
     lines: [
       { lineId: 'line-1', productId: 'product-1', description: 'Widget', qty: 1, totalForeign: 60, totalBase: 60, lineKind: 'sale' },
-      { lineId: null, productId: null, description: 'Shipping', qty: 1, totalForeign: 2, totalBase: 2, lineKind: 'shipping' },
+      { lineId: null, productId: null, description: 'Shipping', qty: 0, totalForeign: 2, totalBase: 2, lineKind: 'shipping' },
     ],
     reason: 'sale and shipping', creditNotePrefix: 'CN-', enforcePerTargetBalances: true, deriveSaleLineNetsFromStoredBalance: true,
   })
@@ -1387,12 +1387,31 @@ test('a public shipping row that names an order line is refused: kind must match
   const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 100, taxBase: 0, shippingForeign: 5 }] })
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
-    lines: [{ lineId: 'line-1', productId: null, description: 'Shipping', qty: 1, totalForeign: 80, totalBase: 80, lineKind: 'shipping' }],
+    lines: [{ lineId: 'line-1', productId: null, description: 'Shipping', qty: 0, totalForeign: 80, totalBase: 80, lineKind: 'shipping' }],
     reason: 'forged shipping', creditNotePrefix: 'CN-', ...refundSafeguards({ isInternal: false }),
   })
   assert.equal(result.success, false)
   assert.match(result.success === false ? result.error : '', /shipping charge, not an order line/)
   assert.equal(state.refunds.length, 0)
+})
+
+// [mutation: a shipping row may carry a product and a quantity again; stock return not limited to sale lines]
+test('a shipping row naming an order product with a quantity and a return warehouse is refused; no refund, stock or accounting rows are written', async () => {
+  for (const flags of [refundSafeguards({ isInternal: false }), {}]) {
+    const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 100, taxBase: 0, shippingForeign: 5 }], stockLevels: [] })
+    const result = await createSalesOrderRefund(createClient(state), {
+      orderId: 'order-1',
+      lines: [{ lineId: null, productId: 'product-1', description: 'Shipping', qty: 1, totalForeign: 2, totalBase: 2, lineKind: 'shipping' }],
+      reason: 'forged shipping restock', creditNotePrefix: 'CN-', returnWarehouseId: 'wh-1', ...flags,
+    })
+    assert.equal(result.success, false)
+    assert.match(result.success === false ? result.error : '', /money only/)
+    assert.equal(state.refunds.length, 0)
+    assert.equal(state.refundLines.length, 0)
+    assert.equal(state.movements.length, 0, 'no stock movement')
+    assert.equal(state.cogsEntries.length, 0)
+    assert.equal(state.accountingSyncLogs?.length ?? 0, 0, 'no accounting row')
+  }
 })
 
 test('two lines of the same product cannot lend each other units: a line is refunded only up to its own remaining quantity', async () => {

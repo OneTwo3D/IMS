@@ -136,6 +136,19 @@ export function refundSafeguards(input: { isInternal: boolean; requestedPerTarge
 }
 
 /**
+ * A SHIPPING OR DISCOUNT ROW IS MONEY ONLY: no product and no quantity. Stock return, COGS reversal and the quantity caps all key on a
+ * row's productId and qty, so a shipping row carrying a product and a quantity (with a return warehouse) would restock that product while the
+ * sale line's money was never refunded. Every caller that builds such rows (chargeback, storefront sync, the inbox) already sends productId
+ * null and qty 0; this holds for every caller.
+ */
+export function nonSaleRowRefusal(lines: readonly { productId?: string | null; qty: number; lineKind?: 'sale' | 'shipping' | 'discount' | null }[]): string | null {
+  const bad = lines.find((line) => (line.lineKind === 'shipping' || line.lineKind === 'discount') && (line.productId || line.qty > 0))
+  return bad
+    ? `A ${bad.lineKind} refund row carries money only: it cannot name a product or a quantity (stock is returned only through sale lines).`
+    : null
+}
+
+/**
  * WHAT A PUBLIC (operator-typed) REFUND MAY CONTAIN. Itemised order lines only: the refund dialog sends nothing else. A mirrored order
  * discount line (negative money) or a monetary line attributed to no order line would let a caller offset the ceiling, e.g. an unlinked
  * +100 sale line beside a -100 discount line records a refund of 0 while the credit note posts the grossed-up sale line. Storefront

@@ -28,7 +28,7 @@ import {
 } from '@/lib/domain/sales/refund-reversal-record'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
-import { findGrossOverPaidBalance, findOverAllocatedRefundTarget, overAllocatedRefundTargetMessage, publicRefundLineRefusal } from '@/lib/domain/sales/refund-target-balances'
+import { findGrossOverPaidBalance, findOverAllocatedRefundTarget, nonSaleRowRefusal, overAllocatedRefundTargetMessage, publicRefundLineRefusal } from '@/lib/domain/sales/refund-target-balances'
 import { refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
 import {
   RATE_EPSILON,
@@ -913,7 +913,8 @@ async function buildRefundFallbackReturnRows(
   }
 
   return lines.flatMap((line) => {
-    if (!line.productId || line.qty <= 0) return []
+    // Only a SALE line returns stock (a shipping or discount row is money only).
+    if (!line.productId || line.qty <= 0 || (line.lineKind ?? 'sale') !== 'sale') return []
     const refundLineId = 'id' in line ? line.id : null
 
     const candidate = {
@@ -3656,6 +3657,11 @@ export async function createSalesOrderRefund(
   // would otherwise drop — a chargeback mirrors the invoice's order-discount line.
   const refundLines = input.lines.filter((line) => line.qty > 0 || line.totalBase > 0 || line.lineKind === 'discount')
   if (!refundLines.length) return { success: false, error: 'Select at least one line to refund' }
+  // Shipping and discount rows are money only, for EVERY caller: nothing but a sale line may return stock or move a quantity.
+  {
+    const refusal = nonSaleRowRefusal(refundLines)
+    if (refusal) return { success: false, error: refusal }
+  }
   // An operator-typed refund carries order lines only: no discount line and no amount attributed to no order line (see publicRefundLineRefusal).
   if (input.deriveSaleLineNetsFromStoredBalance) {
     const refusal = publicRefundLineRefusal(refundLines)
