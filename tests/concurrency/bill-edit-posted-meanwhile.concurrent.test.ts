@@ -68,7 +68,7 @@ test('the bill is posted and written back between the read and the lock: the edi
     const invoice = await db.purchaseInvoice.findFirstOrThrow({ where: { poId: po.id }, select: { id: true, lines: { select: { id: true } } } })
 
     betweenReadAndLock = async () => {
-      await db.purchaseInvoice.update({ where: { id: invoice.id }, data: { accountingInvoiceId: 'XERO-BILL-POSTED-MEANWHILE' } })
+      await db.purchaseInvoice.update({ where: { id: invoice.id }, data: { accountingInvoiceId: `XERO-BILL-${tag}` } })
     }
     const result = await updateInvoice(invoice.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-1', lines: [{ id: invoice.lines[0]!.id, qtyBilled: 10, unitCostForeign: 10 }] } as never)
     assert.equal(betweenReadAndLock, null, 'the write-back really ran between the read and the lock')
