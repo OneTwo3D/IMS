@@ -393,9 +393,8 @@ export async function applyEuVatSeed(db: { $transaction: <T>(fn: (tx: Client) =>
       // The rate rows, in ascending id (the order every editor and the re-key use), then the mapping rows that named them.
       for (const change of plan.changes) await lockTaxRateForEdit(tx, change.taxRateId, { schemePostingTaxType: change.to.schemePostingTaxType, reportingCategory: change.to.reportingCategory })
       const wanted = plan.changes.flatMap((c) => c.identity.mappings.map((m) => ({ change: c, facts: m }))).sort((a, b) => (a.facts.id < b.facts.id ? -1 : a.facts.id > b.facts.id ? 1 : 0))
-      // Row-locked (FOR SHARE: a writer of a mapping row waits for this commit) and compared on every declared field, so a mapping edited, re-pointed, re-stamped or deleted since the plan was read rolls the whole apply back.
-      const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM shopping_tax_rate_mappings WHERE id = ANY(${wanted.map((w) => w.facts.id)}::text[]) ORDER BY id FOR SHARE`
-      if (locked.length !== wanted.length) throw new SeedRaceError('a storefront mapping the plan rests on was removed since the plan was read')
+      // Row-locked (FOR SHARE: a writer of a mapping row waits for this commit) and compared on every declared field, so a mapping edited, re-pointed, re-stamped or deleted (a row that is gone is not found below) since the plan was read rolls the whole apply back.
+      await tx.$queryRaw`SELECT id FROM shopping_tax_rate_mappings WHERE id = ANY(${wanted.map((w) => w.facts.id)}::text[]) ORDER BY id FOR SHARE`
       const rows = new Map((await tx.shoppingTaxRateMapping.findMany({ where: { id: { in: wanted.map((w) => w.facts.id) } } })).map((r) => [r.id, r]))
       for (const { change, facts } of wanted) {
         const row = rows.get(facts.id)

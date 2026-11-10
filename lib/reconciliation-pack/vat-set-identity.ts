@@ -42,7 +42,7 @@ type Decimal = InstanceType<typeof Prisma.Decimal>
 
 /**
  * SHARING ONE IMS RATE (owner ruling Q2, option A: one IMS rate per Xero rate). Several WooCommerce rates may map to one IMS rate when the EU VAT declaration (lib/tax/eu-vat-seed.json) declares every one of them
- * to be the SAME Xero rate (same imsName and charged Xero type) and the IMS rate carries that type. Anything else stays a DUPLICATE_MAPPING: an undeclared WooCommerce rate on the rate, rates declared as different
+ * to be the SAME Xero rate (same charged Xero type) and the IMS rate carries that type. Anything else stays a DUPLICATE_MAPPING: an undeclared WooCommerce rate on the rate, rates declared as different
  * Xero rates, or a shared IMS rate that carries another type. On an accepted sharing the per-rate country and tax-category comparisons are not made (the rate spans the countries and classes of its WooCommerce rates).
  */
 function declaredSharing(wooIds: ReadonlySet<string>, ims: TaxRateRow): boolean {
@@ -51,7 +51,7 @@ function declaredSharing(wooIds: ReadonlySet<string>, ims: TaxRateRow): boolean 
   const declared = [...wooIds].map((id) => seed.find((r) => String(r.wooId) === id))
   const first = declared[0]
   if (first === undefined || first.accountingTaxType === null) return false
-  return declared.every((r) => r !== undefined && r.imsName === first.imsName && r.accountingTaxType === first.accountingTaxType && r.schemePostingTaxType === first.schemePostingTaxType) && ims.accountingTaxType === first.accountingTaxType
+  return declared.every((r) => r !== undefined && r.accountingTaxType === first.accountingTaxType && r.schemePostingTaxType === first.schemePostingTaxType) && ims.accountingTaxType === first.accountingTaxType
 }
 
 export const VAT_SET_REASONS = {

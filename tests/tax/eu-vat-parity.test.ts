@@ -106,3 +106,15 @@ test('a world in which everything is as declared passes the preflight with no fi
   assert.deepEqual(result.findings, [])
   assert.equal(result.ready, true)
 })
+
+test('the declaration refuses an IMS rate shared by rates that are not declared identically (and a shared rate with a country or without a code)', () => {
+  const clone = (mutate: (rates: typeof seed.rates) => void) => { const rates = seed.rates.map((r) => ({ ...r })); mutate(rates); return validateEuVatSeed({ ...seed, rates }).map((p) => p.code) }
+  assert.deepEqual(clone(() => undefined), [])
+  assert.ok(clone((rates) => { rates.find((r) => r.wooId === 151)!.taxCategory = 'STANDARD' }).includes('SHARED_IMS_NAME_DIFFERS'))
+  assert.ok(clone((rates) => { rates.find((r) => r.wooId === 151)!.accountingTaxType = 'TAX001' }).includes('SHARED_IMS_NAME_DIFFERS'))
+  assert.ok(clone((rates) => { rates.find((r) => r.wooId === 151)!.ratePercent = '1.0000' }).includes('SHARED_IMS_NAME_DIFFERS'))
+  assert.ok(clone((rates) => { const a = rates.find((r) => r.wooId === 220)!; a.imsName = 'AT VAT' }).includes('SHARED_IMS_NAME_DIFFERS'), 'two scheme rates cannot share a name')
+  assert.ok(clone((rates) => { for (const r of rates.filter((x) => x.imsName === 'Zero Rated Income')) r.imsCountry = 'AT' }).includes('SHARED_WITH_COUNTRY'))
+  assert.ok(clone((rates) => { for (const r of rates.filter((x) => x.imsName === 'Zero Rated Income')) r.accountingTaxType = null }).includes('SHARED_WITHOUT_CODE'))
+  assert.ok(clone((rates) => { rates.find((r) => r.wooId === 220)!.imsCountry = 'AT' }).includes('IMS_COUNTRY'))
+})

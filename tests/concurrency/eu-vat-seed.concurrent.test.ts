@@ -338,3 +338,44 @@ test('the apply takes the Xero mapping-selection lock first: a rebind that holds
     await d.db.accountingToken.update({ where: { connector: 'xero' }, data: { connectionGeneration: GENERATION } })
   }
 })
+
+test('the apply row-locks the mappings its plan rests on: a writer of one of them waits for the apply to commit', { skip }, async () => {
+  for (const id of ids.rates) await d.db.taxRate.update({ where: { id }, data: { schemePostingTaxType: null, reportingCategory: null } })
+  const { digest } = await plan()
+  const zMapping = ids.mappings[1]! // the German rate's mapping: DE is one of the rates this plan writes
+  let writerDone = false
+  let writer: Promise<unknown> = Promise.resolve()
+  let heldWhileApplying = false
+  let fired = false
+  const hooked = { $transaction: <T>(fn: (tx: never) => Promise<T>) => (d.db as never as { $transaction: (f: (tx: Record<string | symbol, unknown>) => Promise<T>) => Promise<T> }).$transaction((tx) => fn(new Proxy(tx, { get(target, prop) {
+    const value = target[prop]
+    if (prop === 'taxRate') {
+      // The first write of the apply comes after the mapping rows were locked: a writer started now must still be waiting.
+      return new Proxy(value as object, { get(rates, name) {
+        const method = (rates as Record<string | symbol, unknown>)[name]
+        if (name === 'updateMany') return async (...args: unknown[]) => {
+          if (!fired) {
+            fired = true
+            writer = d.db.shoppingTaxRateMapping.update({ where: { id: zMapping }, data: { externalName: 'edited by a writer' } }).then(() => { writerDone = true })
+            await new Promise((resolve) => setTimeout(resolve, 700))
+            heldWhileApplying = !writerDone
+          }
+          return (method as (...a: unknown[]) => Promise<unknown>).apply(rates, args)
+        }
+        return typeof method === 'function' ? (method as (...a: unknown[]) => unknown).bind(rates) : method
+      } })
+    }
+    return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value
+  } }) as never)) }
+  const original = await d.db.shoppingTaxRateMapping.findUniqueOrThrow({ where: { id: zMapping } })
+  try {
+    const result = await apply(digest, hooked as never)
+    assert.equal(result.applied, true)
+    assert.equal(fired, true)
+    assert.equal(heldWhileApplying, true, 'the mapping writer was still waiting while the apply held its row lock')
+    await writer
+    assert.equal(writerDone, true, 'and it went through once the apply had committed')
+  } finally {
+    await d.db.shoppingTaxRateMapping.update({ where: { id: zMapping }, data: { externalName: original.externalName } })
+  }
+})

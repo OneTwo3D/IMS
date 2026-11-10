@@ -284,7 +284,7 @@ export async function resetAccountMappingForOrganisationChange(
   // deleting is the clear.
   await tx.setting.deleteMany({ where: { key: { in: [...presence.settingKeys, SYNC_ENABLED_KEY] } } })
   const [taxRates, taxRateComponents] = await Promise.all([
-    tx.taxRate.updateMany({ where: TAX_RATE_TYPE_HELD, data: { accountingTaxType: null, schemePostingTaxType: undefined as never } }),
+    tx.taxRate.updateMany({ where: TAX_RATE_TYPE_HELD, data: { accountingTaxType: null, schemePostingTaxType: null } }),
     tx.taxRateComponent.updateMany({ where: { accountingTaxType: { not: null } }, data: { accountingTaxType: null } }),
   ])
   await writeStamp(tx, newTenantId)
