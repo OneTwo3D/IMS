@@ -80,3 +80,25 @@ test('a normal empty report still says "No rows" and shows its figures', async (
   assert.match(html, /No rows for the selected filters/)
   assert.ok(html.includes('>0.00<'))
 })
+
+mock.module('@/app/(dashboard)/analytics/_components/stock-position-filter-combobox', {
+  namedExports: { StockPositionFilterCombobox: () => null },
+})
+
+test('a not-computed stock-position report (aging, dead stock) shows dashes, not zero totals, in numeric footers', async () => {
+  const { StockPositionReportPage } = await import('@/app/(dashboard)/analytics/_components/stock-position-report')
+  const render = (notices: string[]) => renderToStaticMarkup(
+    React.createElement(StockPositionReportPage<{ key: string }>, {
+      title: 'Inventory Aging', description: 'd', reportKey: 'inventory-aging', filters: {},
+      filterOptions: { warehouses: [], categories: [], suppliers: [], productTypes: [] } as never,
+      pageInfo: { page: 1, pageSize: 100, totalRows: 0, totalPages: 1, hasNextPage: false, hasPreviousPage: false },
+      rows: [], rowKey: (r) => r.key, dateMode: 'none', notices,
+      columns: [{ key: 'v', label: 'Value', align: 'right', render: () => null, footer: '0.00' }],
+      summary: [],
+    }),
+  )
+  const limited = render([sourceLimitNotice(error)])
+  assert.ok(!limited.includes('0.00'), 'no zero footer when not computed')
+  assert.match(limited, /Report not computed/)
+  assert.ok(render([]).includes('0.00'), 'a computed report still shows its footer')
+})

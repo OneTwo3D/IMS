@@ -173,7 +173,7 @@ import { findSalesOrderDeleteBlocker } from '@/lib/domain/sales/order-delete-gua
 import { queueSalesInvoiceUpdateForExistingAccountingInvoice } from '@/lib/domain/sales/sales-invoice-update-sync'
 import { Prisma, type ProductType, type TaxCategory } from '@/app/generated/prisma/client'
 import {
-  ORDER_LIST_PAGE_SIZE, SO_COMPLETED_STATUSES, SO_STATUSES, buildListPage, buildSalesOrderListWhere,
+  ORDER_LIST_PAGE_SIZE, isShortListQuery, SO_COMPLETED_STATUSES, SO_STATUSES, buildListPage, buildSalesOrderListWhere,
   normaliseListQuery, normalisePage, normaliseStatuses, soListHides,
   type ListPage, type SoListFilter, type SoListHidden,
 } from '@/lib/domain/lists/order-list-query'
@@ -777,6 +777,8 @@ export type SoListResult = ListPage & {
   /** How many orders those hidden groups hold, so the page can say "N completed orders hidden". */
   hiddenCompletedCount: number
   hiddenArchivedCount: number
+  /** The search text was too short for a substring search; only exact order numbers matched. */
+  queryTooShort: boolean
 }
 
 /**
@@ -830,7 +832,7 @@ export async function getSalesOrders(params: SoListParams = {}): Promise<SoListR
     }
     return row
   })
-  return { ...buildListPage(page, pageSize, total), rows, hides, hiddenCompletedCount, hiddenArchivedCount }
+  return { ...buildListPage(page, pageSize, total), rows, hides, hiddenCompletedCount, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q) }
 }
 
 /**

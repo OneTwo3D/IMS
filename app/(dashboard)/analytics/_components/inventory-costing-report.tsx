@@ -238,7 +238,7 @@ export function InventoryCostingReportPage<Row>({
               <tr>
                 {columns.map((column) => (
                   <td key={column.key} className={`px-3 py-2 text-sm ${column.align === 'right' ? 'text-right tabular-nums' : ''}`}>
-                    {column.footer ?? null}
+                    {notComputed ? (column.footer != null ? '—' : null) : (column.footer ?? null)}
                   </td>
                 ))}
               </tr>

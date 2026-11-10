@@ -186,7 +186,7 @@ export function FinanceAnalyticsReportPage<Row>({
             {rows.length > 0 && columns.some((column) => column.footer != null) && (
               <TableRow className="bg-muted/30 font-medium">
                 {columns.map((column) => (
-                  <TableCell key={column.key} className={column.align === 'right' ? 'text-right tabular-nums' : ''}>{column.footer ?? null}</TableCell>
+                  <TableCell key={column.key} className={column.align === 'right' ? 'text-right tabular-nums' : ''}>{notComputed ? (column.footer != null ? '—' : null) : (column.footer ?? null)}</TableCell>
                 ))}
               </TableRow>
             )}

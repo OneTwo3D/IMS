@@ -19,6 +19,17 @@ import type { Prisma } from '@/app/generated/prisma/client'
 export const ORDER_LIST_PAGE_SIZE = 50
 /** Longest search text sent to the database. */
 export const ORDER_LIST_MAX_QUERY_LENGTH = 100
+/**
+ * Below this length a search is NOT a substring scan (one or two characters would fan out into many
+ * case-insensitive scans over every order). Shorter input only matches an order number or reference
+ * exactly, and the page asks for more characters.
+ */
+export const ORDER_LIST_MIN_SUBSTRING_LENGTH = 3
+
+export function isShortListQuery(q: string | null | undefined): boolean {
+  const n = normaliseListQuery(q).length
+  return n > 0 && n < ORDER_LIST_MIN_SUBSTRING_LENGTH
+}
 
 export const SO_STATUSES = [
   'DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING',
@@ -55,6 +66,7 @@ export function buildListPage(page: number, pageSize: number, total: number): Li
   return { page, pageSize, total, pageCount: Math.max(1, Math.ceil(total / pageSize)) }
 }
 
+const eq = (value: string) => ({ equals: value, mode: 'insensitive' as const })
 const ci = (value: string) => ({ contains: value, mode: 'insensitive' as const })
 
 export type SoListFilter = {
@@ -88,7 +100,9 @@ export function buildSalesOrderListWhere(filter: SoListFilter): Prisma.SalesOrde
   if (filter.statuses && filter.statuses.length > 0) and.push({ status: { in: filter.statuses } })
   else if (hides.completed) and.push({ status: { notIn: [...SO_COMPLETED_STATUSES] } })
 
-  if (q) {
+  if (q && q.length < ORDER_LIST_MIN_SUBSTRING_LENGTH) {
+    and.push({ OR: [{ orderNumber: eq(q) }, { externalOrderNumber: eq(q) }] })
+  } else if (q) {
     and.push({
       OR: [
         { orderNumber: ci(q) },
@@ -126,7 +140,9 @@ export function buildPurchaseOrderListWhere(filter: PoListFilter): Prisma.Purcha
   if (filter.invoiced) and.push({ invoices: { some: {} } })
   if (filter.returned) and.push({ lines: { some: { qtyReturned: { gt: 0 } } } })
 
-  if (q) {
+  if (q && q.length < ORDER_LIST_MIN_SUBSTRING_LENGTH) {
+    and.push({ reference: eq(q) })
+  } else if (q) {
     and.push({
       OR: [
         { reference: ci(q) },

@@ -157,7 +157,7 @@ import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
 import { isMissingStoredFxRateError, resolveStoredFxRateToBase } from '@/lib/currencies/stored-document-rate'
 import { Prisma } from '@/app/generated/prisma/client'
 import {
-  ORDER_LIST_PAGE_SIZE, PO_STATUSES, buildListPage, buildPurchaseOrderListWhere, normaliseListQuery,
+  ORDER_LIST_PAGE_SIZE, isShortListQuery, PO_STATUSES, buildListPage, buildPurchaseOrderListWhere, normaliseListQuery,
   normalisePage, normaliseStatuses, poListHidesArchived, type ListPage, type PoListFilter,
 } from '@/lib/domain/lists/order-list-query'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
@@ -643,6 +643,8 @@ export type PoListResult = ListPage & {
   rows: PoRow[]
   hidesArchived: boolean
   hiddenArchivedCount: number
+  /** The search text was too short for a substring search; only exact references matched. */
+  queryTooShort: boolean
 }
 
 /**
@@ -687,7 +689,7 @@ export async function getPurchaseOrders(params: PoListParams = {}): Promise<PoLi
     skip: (page - 1) * pageSize,
     take: pageSize,
   })
-  return { ...buildListPage(page, pageSize, total), rows: pos.map(mapPoRow), hidesArchived, hiddenArchivedCount }
+  return { ...buildListPage(page, pageSize, total), rows: pos.map(mapPoRow), hidesArchived, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q) }
 }
 
 /**

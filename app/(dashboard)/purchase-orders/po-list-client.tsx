@@ -221,6 +221,7 @@ export function PoListClient({ list, currencySymbols = {}, currencyPositions = {
   const filtered = list.rows
   const searching = urlState.q.trim().length > 0
   const hideNotices: string[] = []
+  if (list.queryTooShort) hideNotices.push('Type at least 3 characters to search. Shorter text only matches an exact order number.')
   if (list.hidesArchived && list.hiddenArchivedCount > 0) {
     hideNotices.push(`${list.hiddenArchivedCount.toLocaleString('en-GB')} archived purchase orders are hidden. Tick "Include archived" to see them. Searching always includes them.`)
   }

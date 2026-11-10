@@ -241,6 +241,7 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
   const filtered = list.rows
   const searching = urlState.q.trim().length > 0
   const hideNotices: string[] = []
+  if (list.queryTooShort) hideNotices.push('Type at least 3 characters to search. Shorter text only matches an exact order number.')
   if (list.hides.completed && list.hiddenCompletedCount > 0) {
     hideNotices.push(`${list.hiddenCompletedCount.toLocaleString('en-GB')} completed and delivered orders are hidden. Untick "Hide completed" to see them. Searching always includes them.`)
   }

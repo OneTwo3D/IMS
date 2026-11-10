@@ -125,3 +125,16 @@ test('getPurchaseOrders still refuses a SUPPLIER session before reading any orde
   await assert.rejects(() => getPurchaseOrders({ q: 'x' }), /Forbidden: missing permission purchasing/)
   recorder.assertNoReads('SUPPLIER searching purchase orders')
 })
+
+test('a 1-character search runs no substring scan and tells the page the text is too short', async () => {
+  currentRole = 'ADMIN'
+  queries.length = 0
+  countResult = 0
+  const { getSalesOrders } = await import('@/app/actions/sales')
+  const { getPurchaseOrders } = await import('@/app/actions/purchase-orders')
+  const so = await getSalesOrders({ q: 'a' })
+  const po = await getPurchaseOrders({ q: 'a' })
+  assert.equal(so.queryTooShort, true)
+  assert.equal(po.queryTooShort, true)
+  for (const q of queries) assert.ok(!JSON.stringify(q.args).includes('contains'), `${q.model}.${q.op} has no substring scan`)
+})
