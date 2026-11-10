@@ -1,0 +1,173 @@
+import { LEDGER_STANDING_SELECT, ledgerStanding, namesADocument } from '@/lib/domain/accounting/ledger-standing'
+import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
+import type { Prisma } from '@/app/generated/prisma/client'
+import type { PurchaseInvoiceAccountingPayload } from '@/lib/domain/purchasing/purchase-invoice-edit'
+
+/**
+ * EDITING A BILL BEFORE ITS FIRST POSTING HAS REACHED THE LEDGER.
+ *
+ * A bill edit queues a PURCHASE_INVOICE_UPDATE against the ledger document, and that needs the document's id. Until the
+ * bill's first posting (the PURCHASE_INVOICE row) has been written back there is none, so the edit was saved in IMS and
+ * nothing at all was queued: the create row still carried the PRE-edit figures and posted them, and the ledger and IMS
+ * disagreed for good (AP, VAT and the transit clearing leg all wrong, and a later payment settling a bill the ledger holds
+ * at a different total).
+ *
+ * The first posting is therefore made to carry the edit. While the create row has not left IMS (queued and never claimed; a failure is never
+ * proof of that, because the bill's create path does not record an attempt) its payload is replaced with the edited bill's, in the same transaction as the edit, and the
+ * single posting that goes out is the latest version: one document, no update, nothing posted twice. The processor reads a
+ * row's payload AFTER it claims it (lib/domain/accounting/claimed-sync-payload.ts), and this write is a compare-and-swap on
+ * the row still being unsent, so a worker either has not claimed the row (and posts the new payload) or has (and the swap
+ * matches nothing).
+ *
+ * Where the create row HAS been, or may have been, sent (claimed, posted but not yet linked back, or failed after a request
+ * left) the bill cannot be rewritten in place and no update can be addressed to a document nobody has an id for. The edit is
+ * REFUSED, so IMS never holds a version the ledger will not receive; the operator is told to edit once the posting has settled.
+ */
+
+export const PURCHASE_BILL_FIRST_POSTING_IN_FLIGHT_MESSAGE =
+  'This bill is being posted to the accounting system for the first time, or has been posted and not yet linked back, '
+  + 'so an edit could not reach the ledger. Nothing was saved. Wait until its posting has finished (Sync), then edit the bill.'
+
+export class PurchaseBillFirstPostingInFlightError extends Error {
+  constructor() {
+    super(PURCHASE_BILL_FIRST_POSTING_IN_FLIGHT_MESSAGE)
+    this.name = 'PurchaseBillFirstPostingInFlightError'
+  }
+}
+
+export const PURCHASE_BILL_EDITED_MEANWHILE_MESSAGE =
+  'This bill was changed by another edit while you were editing it, so your edit was not saved. Reload the bill and edit it again.'
+
+export class PurchaseBillEditedMeanwhileError extends Error {
+  constructor() {
+    super(PURCHASE_BILL_EDITED_MEANWHILE_MESSAGE)
+    this.name = 'PurchaseBillEditedMeanwhileError'
+  }
+}
+
+export type PendingCreateRefreshOutcome =
+  /** The unsent create row now carries the edited bill; the first posting will be the edited version. */
+  | { kind: 'refreshed'; syncLogId: string }
+  /** No create row exists for this bill (sync off, a hold recorded it as a shadow, or it was never queued): nothing is owed to a ledger document. */
+  | { kind: 'no-create-row' }
+
+export type PendingCreateRefreshTx = Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'purchaseInvoice'>
+
+/** The keys the enqueue stamped on the row (`_postingMode`, `_idempotencyKey`, the connection stamp): the row's identity, never the document. */
+function enqueueStamps(payload: unknown): Record<string, unknown> {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return {}
+  return Object.fromEntries(Object.entries(payload as Record<string, unknown>).filter(([key]) => key.startsWith('_')))
+}
+
+const CREATE_ROW_SELECT = {
+  ...LEDGER_STANDING_SELECT,
+  id: true,
+  connector: true,
+  attemptRevision: true,
+  remoteAttemptedAt: true,
+  createDispatchedAt: true,
+  backReferenceEvidenceCompactedAt: true,
+  payload: true,
+} as const
+
+/** A shadow IMS recorded instead of queuing, and an attempt proven never sent that was then retired, are not postings: nothing is owed to the ledger for them. */
+function isPosting(row: Parameters<typeof ledgerStanding>[0]): boolean {
+  const standing = ledgerStanding(row)
+  return standing !== 'SHADOW_NOT_SENT_BY_IMS' && standing !== 'PROVEN_NOT_POSTED'
+}
+
+function payloadInvoiceNumber(payload: unknown): string | null {
+  if (typeof payload !== 'object' || payload === null) return null
+  const value = (payload as Record<string, unknown>).invoiceNumber
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : null
+}
+
+export async function refreshPendingPurchaseInvoiceCreate(params: {
+  tx: PendingCreateRefreshTx
+  invoiceId: string
+  /** The bill's purchase order (locked by the caller): legacy create rows are keyed to it, not to the bill. */
+  poId: string
+  /** The bill's supplier invoice number as saved BEFORE this edit: what a legacy row (which names no bill) is matched on. */
+  currentInvoiceNumber: string | null
+  /** The connector whose chart `accountingPayload` was built from; the row must belong to it. */
+  chartConnector: string | null
+  /** The edited bill, built exactly as the create builds it (no ledger document id). */
+  accountingPayload: PurchaseInvoiceAccountingPayload
+}): Promise<PendingCreateRefreshOutcome> {
+  const rows = await params.tx.accountingSyncLog.findMany({
+    where: { type: 'PURCHASE_INVOICE', referenceType: 'PurchaseInvoice', referenceId: params.invoiceId },
+    select: CREATE_ROW_SELECT,
+  })
+  const postings = rows.filter(isPosting)
+  // Two live create rows for one bill cannot be told apart.
+  if (postings.length > 1) throw new PurchaseBillFirstPostingInFlightError()
+  let row = postings[0]
+  if (row === undefined) {
+    // LEGACY CREATE ROWS are keyed to the PURCHASE ORDER and name no bill (before the key moved to the bill). One of them may be this bill's first
+    // posting, and nothing in the row says so: it is taken as this bill's only when the order has no OTHER bill still waiting for a document, no other
+    // live legacy row, and the supplier invoice number it carries is this bill's. Anything else is ambiguous and the edit is refused until posting settles.
+    const legacy = await params.tx.accountingSyncLog.findMany({
+      where: { type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: params.poId },
+      select: { ...CREATE_ROW_SELECT, externalTransactionId: true },
+    })
+    const siblings = await params.tx.purchaseInvoice.findMany({ where: { poId: params.poId }, select: { id: true, accountingInvoiceId: true } })
+    const linkedElsewhere = new Set(siblings.filter((b) => b.id !== params.invoiceId && b.accountingInvoiceId !== null).map((b) => b.accountingInvoiceId))
+    const candidates = legacy.filter((r) => isPosting(r) && !(namesADocument(r) && linkedElsewhere.has(r.externalTransactionId)))
+    if (candidates.length === 0) return { kind: 'no-create-row' }
+    const waiting = siblings.filter((b) => b.accountingInvoiceId === null)
+    const attributable = candidates.length === 1
+      && waiting.length === 1
+      && waiting[0]!.id === params.invoiceId
+      && payloadInvoiceNumber(candidates[0]!.payload) === (params.currentInvoiceNumber?.trim() || null)
+    if (!attributable) throw new PurchaseBillFirstPostingInFlightError()
+    row = candidates[0]!
+  }
+  // REFRESHABLE ONLY WHILE THE ROW IS QUEUED AND HAS NEVER BEEN TOUCHED: PENDING, and no worker has ever claimed it (a claim mints an attempt revision above
+  // zero), no request was ever recorded or dispatched, and it names no document. The bill's create path never stamps a
+  // remote attempt, so a FAILED row cannot be proven unsent (a failure can follow a request that left); FAILED, and anything claimed, is refused and the
+  // operator retries or resolves the posting first. This is deliberately not the payment attempt predicate: it asks for the absence of every trace.
+  const standing = ledgerStanding(row)
+  const untouched = row.status === 'PENDING'
+    && standing === 'LIVE_WORK'
+    && row.attemptRevision === UNCLAIMED_ATTEMPT_REVISION
+    && row.remoteAttemptedAt === null
+    && row.createDispatchedAt === null
+    && row.backReferenceEvidenceCompactedAt === null
+    && row.connector === params.chartConnector
+  if (!untouched) throw new PurchaseBillFirstPostingInFlightError()
+
+  const payload = { ...params.accountingPayload, accountingInvoiceId: undefined, ...enqueueStamps(row.payload) }
+  // The swap names every fact the read relied on, so a claim that lands between the read and here matches nothing.
+  const swapped = await params.tx.accountingSyncLog.updateMany({
+    where: {
+      id: row.id,
+      status: 'PENDING',
+      attemptRevision: UNCLAIMED_ATTEMPT_REVISION,
+      processingStartedAt: null,
+      remoteAttemptedAt: null,
+      createDispatchedAt: null,
+    },
+    data: { payload: payload as never },
+  })
+  // A worker claimed it between the read and the swap: it holds the pre-edit payload's attempt, and may be on the wire.
+  if (swapped.count !== 1) throw new PurchaseBillFirstPostingInFlightError()
+  return { kind: 'refreshed', syncLogId: row.id }
+}
+
+export type BillEditSnapshot = {
+  header: { invoiceNumber: string | null; invoiceDate: string | null; dueDate: string | null; notes: string | null; supplierInvoiceUrl: string | null }
+  lines: ReadonlyArray<{ id: string; description: string | null; qtyBilled: number; unitCostForeign: number; totalForeign: number }>
+  subtotalForeign: number
+  taxForeign: number
+  totalForeign: number
+}
+
+/** True when the bill under the lock is not the bill the edit was calculated from: any edited source field or any total differs. Lines are compared by id. */
+export function billChangedSinceRead(read: BillEditSnapshot, locked: BillEditSnapshot): boolean {
+  const byId = (lines: BillEditSnapshot['lines']) => JSON.stringify([...lines].sort((a, b) => a.id.localeCompare(b.id)))
+  return JSON.stringify(read.header) !== JSON.stringify(locked.header)
+    || byId(read.lines) !== byId(locked.lines)
+    || read.subtotalForeign !== locked.subtotalForeign
+    || read.taxForeign !== locked.taxForeign
+    || read.totalForeign !== locked.totalForeign
+}
