@@ -16,7 +16,6 @@ import {
   HelpCircle,
   ChevronLeft,
   ChevronRight,
-  BadgeCheck,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { NavItem } from './nav-item'
@@ -25,6 +24,7 @@ import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import { hasPermission, type Permission } from '@/lib/permissions'
 import { getSidebarAnalyticsChildren } from '@/lib/sidebar/analytics-access'
+import { getInventoryChildren } from '@/lib/sidebar/inventory-children'
 
 const STOCK_CONTROL_CHILDREN = [
   { href: '/stock-control/stock-adjustments', label: 'Stock Adjustments' },
@@ -153,8 +153,9 @@ export function Sidebar({
       {/* Navigation */}
       <nav className="flex flex-1 flex-col gap-1 overflow-y-auto p-2">
         {can('dashboard') && <NavItem href="/dashboard" label="Dashboard" icon={LayoutDashboard} collapsed={collapsed} onNavigate={onNavigate} />}
-        {can('inventory') && <NavItem href="/inventory" label="Inventory" icon={Package} collapsed={collapsed} onNavigate={onNavigate} />}
-        {can('inventory.edit') && <NavItem href="/trade/hs-code-review" label="HS Code Review" icon={BadgeCheck} collapsed={collapsed} onNavigate={onNavigate} />}
+        {can('inventory') && (
+          <NavGroup label="Inventory" icon={Package} items={getInventoryChildren(can('inventory.edit'))} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
+        )}
         {can('stock_control') && (
           <NavGroup label="Stock Control" icon={Warehouse} items={STOCK_CONTROL_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}

@@ -28,6 +28,16 @@ For GitHub Actions trigger or gating changes, validate both the static workflow 
 
 Inventory and accounting behavior changes must include focused tests. Keep server actions thin: use them for auth, input parsing, adapter work, revalidation, and redirects; put reusable business rules in `lib/domain/**` or `lib/jobs/**`. Do not commit secrets, credentials, OAuth tokens, webhook secrets, or private keys.
 
+## Cut a release
+
+Every stage or production deploy cuts a version. Before deploying, open a small PR against `development` that:
+
+1. Turns the `## Unreleased` section of `CHANGELOG.md` into `## x.y.z - YYYY-MM-DD` and leaves a fresh empty `## Unreleased` above it. Choose the version by the scheme in the changelog header: `x` for a breaking change (anything an operator must act on), `y` for user-facing non-breaking changes, `z` for backend-only changes. For a breaking release, add a short `### Operator actions (breaking)` list directly under the heading.
+2. Adds a `RELEASES[0]` entry in `lib/releases.ts` (version, date, title, summary, `userMessage`, `userHighlights`, `technicalHighlights`), following the previous entry's shape. Say "built, switched off" for anything behind a flag. Keep customer names and other personal data out of the notes.
+3. Sets the same version in `package.json` and in both places in `package-lock.json` (the top-level `version` and `packages[""].version`), by hand rather than with `npm install`.
+
+Run `npx tsx --test tests/ops/releases.test.ts tests/ops/readiness-gate-docs.test.ts` with the usual gates, merge, then deploy that merged commit. System > Releases reads `RELEASES`, so the new version shows there after the deploy.
+
 ## Documentation Updates
 
 Keep documentation in the same PR as the behavior it describes. When changing a feature, check the affected documentation surfaces and update every one that would become stale:
