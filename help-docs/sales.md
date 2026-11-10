@@ -9,7 +9,9 @@ The sales order list provides a searchable, sortable overview of all orders.
 - **Search** by order reference, customer name, or other fields
 - **Filter by status** to focus on orders at a specific stage
 - **Export to CSV** for reporting or use in external tools
-- **WMS status** — when an order ships from a warehouse bound to a WMS (e.g. Mintsoft), a chip shows the WMS's fulfilment state (e.g. new, picking, dispatched, cancelled). The order detail page refreshes it live and deep-links to the order in the WMS admin; the list shows the most recent cached value. An order only pushes to the WMS once it is paid and ready to fulfil and dispatch push is enabled (see Settings → System → Scheduler). On an installation that is not yet allowed to write to the warehouse (the producer-side hold is switched on for it), nothing is pushed: the order stays as it is, the **Replay** and **Re-push** buttons say "Not sent by IMS: writes to Mintsoft are held on this installation" and change nothing, and IMS keeps only a record of what it would have sent. That record does not say whether the warehouse already holds the order (another system may have created it), so check the warehouse before acting.
+- **Columns** — the **Status** column shows the order's stage. Use the column picker to add more, for example **Invoice** (Pending, Invoiced, Paid, or the refund state), **Stock Status**, **WMS Status** and **WMS Dispatch**. Your choice is remembered in your browser.
+- **Refund state** — an order's refund state is separate from its stage (see [Order Statuses](#order-statuses)). On the list it shows in the **Invoice** column as **Part. Refunded** or **Refunded**.
+- **WMS status** — when an order ships from a warehouse bound to a WMS (e.g. Mintsoft), a chip shows the WMS's fulfilment state (e.g. new, picking, dispatched, cancelled). The order detail page refreshes it live and deep-links to the order in the WMS admin; the list shows the most recent cached value. An order only pushes to the WMS once it is paid and ready to fulfil and dispatch push is enabled (see Settings → System → Scheduler). On an installation that is not yet allowed to write to the warehouse (the producer-side hold is switched on for it), nothing is pushed: the order stays as it is, the **Replay** and **Re-push** buttons say "Not sent by IMS: writes to Mintsoft are held on this installation" and change nothing, and IMS keeps only a record of what it would have sent. That record does not say whether the warehouse already holds the order (another system may have created it), so check the warehouse before acting. The **WMS Dispatch** column shows whether IMS has sent the order to the warehouse (Queued, Pushed, Held, Cancelling, Cancelled, Failed or Payload invalid). See [Warehouse (Mintsoft)](warehouse-mintsoft.md) for how the warehouse connection works.
 
 ## Creating a Sales Order
 
@@ -22,17 +24,25 @@ To create a new order manually:
 5. Add notes if needed
 6. Save the order
 
-**VAT and "Incl. VAT".** The order has one default VAT rate and one setting for whether the prices you type include VAT. If prices include VAT, choose the order's default VAT rate: the VAT is taken out of the prices you typed, the order totals are what you typed, and the invoice goes to the accounting system as VAT-inclusive at those same prices. Ticking **Incl. VAT** while the default rate is **No VAT** and a line carries VAT (from its product's tax category or a rate you chose on the line) is refused, because the prices could be read two ways: choose the default rate, or untick **Incl. VAT** and enter net prices. A draft saved earlier in that state cannot be moved out of Draft; cancel it and create a new order.
+The **Ship From** warehouse is pre-selected with your default warehouse (the first warehouse if none is marked default); change it if the order ships from elsewhere. The stock figures beside each product are for the selected warehouse.
+
+**VAT and "Incl. VAT".** The order has one default VAT rate and one setting for whether the prices you type include VAT. If prices include VAT, choose the order's default VAT rate: the VAT is taken out of the prices you typed, the order totals are what you typed, and the invoice goes to the accounting system as VAT-inclusive at those same prices. Ticking **Incl. VAT** while the default rate is **No VAT** and a line carries VAT (from its product's tax category or a rate you chose on the line) is refused, because the prices could be read two ways: choose the default rate, or untick **Incl. VAT** and enter net prices. The **Incl. VAT** box is always shown, even when the rate is **No VAT**. A draft saved earlier in that state cannot be moved out of Draft; cancel it and create a new order. Clones made and shipped before this was fixed have no invoice and need one raising by hand.
+
+**Shipping and discount accounts must be set.** An order with shipping, or with an order discount, can only be saved or finalised once the matching account is set under **Settings > Accounting**. Otherwise the invoice would leave that amount out and not match the order total, so IMS refuses with a message such as "This order has shipping of ... but the shipping account is not set in the accounting settings" (or "... order discount ... the discount account is not set ..."). Nothing is saved, allocated or queued. Set the account and try again.
+
+**An invoice that would not match the order is refused.** When a live order is created, IMS builds the invoice it would send and checks that it totals the same as the order (within a few pence of rounding). If it does not, the order is not saved and the message shows both totals.
 
 **Design note: the invoice and the allocation are separate.** Creating a live order saves the order and queues its sales invoice in one step: either both exist or neither does. Allocating stock is a separate step after that and may legitimately leave the order unallocated or short (a backorder), exactly as a WooCommerce order is invoiced when it is imported, before any stock is allocated. When that happens IMS tells you: the create screen shows "The order was created, but: stock was NOT allocated ..." (or how many units are on backorder), the order's activity log carries an `allocation_failed` or `backorder_recorded` entry, and the order's allocation panel shows what is unallocated. The order is picked up again when stock arrives or when it is paid and moves to Processing (the backorder allocation and the reallocation sweep).
 
-**Cloning.** **Clone** makes a new **Draft** with the same lines, prices and VAT basis. A draft holds no stock and has no invoice; move it out of Draft (for example to Pending Payment or Processing) when it is ready and stock is allocated and the sales invoice is queued then, exactly as for any new order. Allocating a Draft directly is refused. Finalising a draft also checks that the invoice that would be sent totals the same as the order (within a few pence of rounding); if it does not, for example because shipping is taxed at a different rate from the order's default rate, the draft is not finalised and the message shows both totals. A clone of a WooCommerce order whose shipping has its own rate hits this, because the order does not store the shipping rate.
+**Cloning.** **Clone** makes a new **Draft** with the same lines, prices and VAT basis. A draft holds no stock and has no invoice; move it out of Draft (for example to Pending Payment or Processing) when it is ready and stock is allocated and the sales invoice is queued then, exactly as for any new order. Allocating a Draft directly is refused. Finalising a draft is **one step**: the status change, the stock allocation and the queued sales invoice all succeed together or none of them does, so a failure (no stock, an invoice that does not match the order, a missing shipping or discount account) leaves the order as the draft it was. It also checks that the invoice that would be sent totals the same as the order (within a few pence of rounding); if it does not, for example because shipping is taxed at a different rate from the order's default rate, the draft is not finalised and the message shows both totals. A clone of a WooCommerce order whose shipping has its own rate hits this, because the order does not store the shipping rate. A clone of a WooCommerce order is always treated as an exclusive (net) document, because WooCommerce orders are stored net whatever the store displays; a clone of a manual order keeps its **Incl. VAT** setting.
 
 ### WooCommerce Integration
 
 When WooCommerce sync is configured, orders are imported automatically into the system. These orders display a **WooCommerce link** that takes you directly to the order in your WC admin panel. This link only appears for orders that were synced from WooCommerce (i.e. those with a WC Order ID).
 
 WooCommerce orders always enter the IMS as **Processing**. When WooCommerce marks an order as **completed**, the IMS treats that as the external dispatch signal: it auto-allocates stock, creates shipment rows if needed, advances those shipments through the internal `PICKING -> PACKED -> SHIPPED` workflow, and stores any tracking information received from WooCommerce. See the **WooCommerce Integration** guide for details on sync configuration.
+
+**EU withdrawal requests.** If your store uses the EU order-withdrawal button plugin, a customer's request puts the order **On Hold** in IMS and shows a **Withdrawal hold** badge on the order. While it is held, IMS does not send the order to the warehouse. If the request is approved the order is cancelled. If it is rejected, the hold is deliberately **kept**, because a rejection only moves the storefront order back to its earlier status, and releasing it automatically would put goods back on the pick line. When you are satisfied, use **Release withdrawal hold** on the order (it asks you to confirm); the order stays On Hold, and moving it back to Processing then sends it to the warehouse again. Once an order has shipped, a withdrawal is a return, not a hold. See [WooCommerce](woocommerce.md#eu-withdrawal-requests).
 
 ## Order Statuses
 
@@ -51,8 +61,8 @@ Sales orders use the canonical sales order workflow documented in `docs/workflow
 | **Completed** | Order fulfilled and closed |
 | **Delivered** | Order confirmed as delivered (requires delivery tracking module) |
 | **Cancelled** | Order cancelled, stock reservations released |
-| **Partially Refunded** | Order has one or more refunds but is not fully refunded |
-| **Refunded** | Order has been fully refunded |
+
+**Refund state is shown separately.** Refunds no longer change an order's stage. An order that has been refunded keeps its stage (for example **Delivered**) and carries a second badge beside it: **Partially refunded** (orange) or **Fully refunded** (red). So the order detail page can show two badges, the order status and the refund status. Orders that used to read "Partially Refunded" or "Refunded" now show their real stage plus the refund badge, and the stage filter on the list has no refund entries. A fully refunded order takes no further payments.
 
 The exact allowed transitions are kept in the canonical workflow reference so UI help does not drift from the enforced state-machine rules.
 
@@ -110,6 +120,8 @@ The order detail page includes an allocation panel that shows:
 - **Allocations grouped by warehouse** -- see which warehouse fulfils which lines
 - **Backorder items** -- lines where insufficient stock is available (shows remaining qty, not full order qty, when partial shipments exist)
 - **Manual edit** -- override allocations manually if needed
+
+The panel is **refund-aware**: units that have been refunded are no longer outstanding demand, so a refunded line is not offered for allocation and does not show as a backorder.
 
 The allocation panel reappears whenever there are unfulfilled order lines, even after some shipments have already been created or shipped. This enables the partial fulfillment workflow described below.
 
@@ -278,6 +290,8 @@ below what has shipped or what a picked or packed shipment still covers, and shi
 records are left alone. Running it again changes nothing. Previously such a release was refused and left the reserved
 stock held until someone reconciled it by hand.
 
+A refund of units that never shipped only releases the demand: the stock was never taken out of the warehouse, so there is nothing to put back and no stock is returned for those units. The refund button is available once an order has shipped, or to top up an order that is already partly refunded.
+
 ### Refund-time cost revaluation
 
 When a refund processes returned stock, the system uses the **current** cost-layer unit cost — not the snapshot recorded at shipment time. This means if a landed-cost revaluation has changed the unit cost since the original shipment, the refund's COGS reversal uses the up-to-date value. The returned stock is also valued at the current cost.
@@ -306,6 +320,11 @@ You can record payments against a sales order:
 - **Delete a payment** if it was recorded in error
 
 Payment records help you track outstanding balances on each order.
+
+- **Several payments on one invoice.** You can record a deposit and then a balance, or any number of part payments. Each receipt is registered in the accounting system on its own, so a payment you record by hand on an order that is already paid by a WooCommerce receipt is registered normally. Only a repeat of the same receipt is refused.
+- **A payment above what is outstanding is refused**, as the accounting system would refuse it too.
+- **Paid WooCommerce orders** arrive with their payment already recorded.
+- **Receipts on a cancelled order.** You can record a payment against a cancelled order. If it is dated **after** the cancellation it is **held**: it stays recorded here, nothing is sent to the accounting system, and a warning says so, because the accounting system would treat that money as an overpayment, which IMS does not create. Record it there by hand. A payment dated at or before the cancellation registers as normal.
 
 ### Deleting a payment the accounting system already holds
 
@@ -388,6 +407,13 @@ ordinary unpaid document. It is not the same as "the ledger rejected it" and not
 here to match it. Check the invoice there before recording or registering another payment against
 it.
 
+## Invoices the accounting system will not take
+
+Two cases are refused instead of posting wrongly. Both show as a failed entry under **Sync > Xero**, with a message that names the cause, and nothing is sent to the accounting system:
+
+- **A line with no tax type.** A sales invoice or credit note line that has no tax type is refused rather than posted as "No VAT". Fix the product's or line's tax rate and retry. (The one allowed exception is a WooCommerce fee the shop charged no tax on.)
+- **A WooCommerce order that used a tax rate IMS does not map, or maps to an inactive rate.** The invoice is refused and no payment is registered. Map the WooCommerce tax rate (see [WooCommerce](woocommerce.md)), then re-import the order.
+
 ## Invoice Generation
 
 Invoices can be generated either manually or automatically. The trigger for automatic invoice generation is configurable in **Settings > Sales Settings**. Options include:
@@ -455,6 +481,14 @@ The VAT report (Analytics > VAT) correctly handles both modes:
 - **Tax-inclusive orders** — `taxableBase = totalBase - taxBase`.
 
 This means the taxable base column in the report shows the net amount in both cases, comparable across tenants regardless of pricing mode.
+
+## Customers
+
+**Sales > Customers** lists every customer. Search by name, company or email, add a customer with **New Customer**, or use the CSV buttons to export, download a template and import.
+
+- **Columns.** The list opens with Name, Company, Email, Tax Number, Billing Address, Orders, Lifetime Value and the current year's sales. The column picker (the settings icon beside the search box) also offers Phone, Shipping Address, Last Order, Status, Created and Notes. Your choice is remembered in your browser. If you saved a choice earlier, any column it does not mention keeps its default, so an older or partial saved choice never hides the rest.
+- **Row actions.** Edit a customer, make one inactive or active again, or use **GDPR Anonymise** (see [Erasure](erasure.md)). Inactive customers are shown faded.
+- **Customer page.** Open a customer to see their contact details, their turnover in your base currency and a list of their orders. An order that has been refunded shows a **Part. Refunded** or **Refunded** badge beside its stage.
 
 ## Documents
 

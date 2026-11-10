@@ -10,39 +10,42 @@ The main inventory page displays all products in a searchable, filterable table.
 ### Search and Filter
 
 - **Search** -- Type a SKU, product name, or barcode to find products instantly.
-- **Filter by Type** -- Narrow the list to a specific product type (Simple, Variable, Variant, Kit, BOM, Non-Inventory).
+- **Filter by Type** -- Narrow the list to a specific product type (Simple, Variable, Kit / Bundle, Bill of Materials, Non-Inventory). The **Type** column also tells you where a product sits: **Variant parent** (a Variable product), **Variant child** (an ordinary variant), **Variant child (Kit)** or **Variant child (BOM)** (a Kit or BOM generated under a Variable parent), and plain **Kit** or **BOM** for a standalone bundle or manufactured product.
+- **Filter by Category** -- Show only products in one reporting category.
 - **Filter by Lifecycle Status** -- Show products in a specific lifecycle state: **Draft**, **Active**, **EOL** (end of life), or **Archived**. See [Lifecycle Status](#lifecycle-status) below for what each state means.
 - **Filter by Preferred Supplier** -- Show only products linked to a specific supplier. Useful for supplier-scoped reorder planning.
 
 ### Bulk Actions
 
-Select multiple products using the checkboxes, then choose a bulk action:
+Select multiple products using the checkboxes, then choose a bulk action from the bar that appears:
 
-- **Delete** -- Permanently remove the selected products. Only available for products with no transactional history.
-- **Set lifecycle** -- Change the lifecycle status of selected products in bulk (e.g. mark a discontinued line as EOL). See [Lifecycle Status](#lifecycle-status).
+- **Deactivate** -- Marks the selected products as **EOL** (end of life) so they stop being re-ordered and are sold down. See [Lifecycle Status](#lifecycle-status). To set any other status, change it on the product page.
+- **Delete** -- Permanently remove the selected products. Products with order, stock or other activity, or with variants, are skipped, and the bar lists the SKUs that were skipped.
+- **Clear** -- Clear the selection.
 
 ### Column Visibility
 
 Click the **Columns** button to show or hide table columns. Your selection is saved in the browser so it persists between sessions. Available columns include:
 
-- **SKU**, **Name**, **Type**, **Lifecycle Status** — visible by default
+- **SKU**, **Name**, **Type**, **Status** (the lifecycle status) — visible by default
 - **Parent SKU**, **Barcode**, **MPN**, **Category**, **Dimensions**, **Weight** — hidden by default
 - **Preferred Supplier** — the supplier auto-recorded from the most recent purchase order (hidden by default; see [Preferred Supplier](#preferred-supplier))
-- **Regular Price**, **Sale Price**, **Tax Incl.** — pricing columns
+- **Regular Price** (visible by default), **Sale Price**, **Tax Incl.** — pricing columns
 - **Stock** — total on-hand quantity (visible by default)
-- **Allocated** — quantity reserved by active sales or manufacturing orders (amber when > 0)
-- **Available** — on hand minus allocated (red when negative)
-- **Incoming** — quantity expected from open purchase orders, in-transit transfers, manufacturing outputs, or WMS ASN evidence (blue).
+- **Allocated** — quantity reserved by active sales or manufacturing orders (amber when > 0; hidden by default)
+- **Available** — on hand minus allocated (red when negative; hidden by default)
+- **Incoming** — quantity expected from open purchase orders, in-transit transfers, manufacturing outputs, or WMS ASN evidence (blue; hidden by default).
+  A purchase order line counts by what is still **outstanding** on it — quantity that has already landed (received, or booked in by the warehouse) is not counted again.
   An in-transit transfer line is counted once, at what has **not** arrived yet — and "arrived"
   includes units the WMS stock-sync alignment brought in, which raise stock and lay cost layers
   without recording a receipt against the transfer line. A transfer the WMS has fully accounted
   for therefore shows nothing incoming, and its own ASN is not added a second time on top.
-- **COGS Value** — total inventory value from FIFO cost layers
+- **COGS Value** — total inventory value from FIFO cost layers (visible by default)
 - **Variants**, **Created**, **Updated** — additional metadata columns
 
 ### CSV Export
 
-Click **Export** to download the current filtered product list as a CSV file.
+The buttons above the list are **Template** (a blank import file with the guidance row), **Export CSV** (the current filtered product list), **Import CSV** and **New Product**.
 
 
 ## CSV Templates & Import Rules
@@ -174,7 +177,7 @@ Repair in every case is the same: re-import the affected products through the pr
 
 ## Creating a Product
 
-Click **New Product** to open the product form. The following fields are available:
+Click **New Product** to open the product form. (On an existing product the **Save Product** button sits in the page header, next to the product name, so it stays in view however far down the form you are.) The following fields are available:
 
 | Field | Description |
 |---|---|
@@ -183,8 +186,9 @@ Click **New Product** to open the product form. The following fields are availab
 | **Category** | Reporting category as a path with `>` as the nesting separator (e.g. `Apparel > T-Shirts`). Pick from the dropdown — it lists every known category as a full path — or type a new path and the system creates each missing segment on save. Two leaves with the same name under different parents (`Apparel > T-Shirts` vs `Promo > T-Shirts`) are distinct. Manage the full tree in **Settings > Inventory**. |
 | **Type** | The product type (see below). |
 | **Barcode** | An optional barcode or EAN for scanning. |
-| **HS Code** | The Harmonised System code for customs declarations. |
-| **Country of Origin** | The 2-letter ISO country code where the product is manufactured. |
+| **HS Code** | The Harmonised System / EU Combined Nomenclature code for customs declarations. For a code that reaches the warehouse it must be a declarable 8-digit 2026 EU CN code (see [HS Code Review](#hs-code-review)). |
+| **Country of Origin** | Pick the country where the product is manufactured from the list. Left blank, it is **not** stored as blank downstream: customs and the warehouse are sent **China (CN)** as the default, and the field says so. Choose a country to declare the true origin. |
+| **Customs Description** | A short goods description for customs paperwork. The warehouse accepts at most 50 characters, so longer text is shortened at a word boundary when it is sent. Use a plain product phrase, not a brand name or a word such as "parts". |
 | **Weight** | Product weight in kg, used for shipping and landed cost calculations. |
 | **Dimensions** | Width, height, and depth in cm. |
 | **Cost Price** | The default purchase cost (overridden by FIFO layers once stock is received). |
@@ -224,7 +228,9 @@ Bundle handling is component-driven:
 - nested kits are expanded to their leaf components for fulfillment coverage
 - allocations, shipment lines, dispatch, refunds, and stock returns all operate on the underlying components rather than on virtual kit stock
 
-To set up a Kit, use the component search to add products and specify the quantity of each component required per Kit.
+To set up a Kit, use the **Kit Components** editor on the product page: search for a product, add it, and enter the quantity of each component required per Kit. The quantity box steps in whole numbers (minimum 0); a line with a blank or zero quantity is ignored when you click **Save Kit Components**. A product can only appear once in the list. If another Kit or BOM already has exactly the same components and quantities, an amber **Duplicate component configuration** notice names it, which helps catch an accidentally copied recipe; it is a warning and does not stop you saving.
+
+A Kit's recipe is simply its component list. There is no separate stored "Kit" record, so nothing else needs maintaining; the older Kit tables have been removed. One visible consequence: the **Inventory Aging** report filtered to Type **Kit** is now empty and shows a notice saying virtual Kit SKUs hold no cost layers of their own. Age the component SKUs instead.
 
 **Kit components cannot be changed while sales orders are still in flight against them.** Allocation,
 shipment drafts, dispatch checks and stock reporting all read the kit's *current* component list, so
@@ -272,7 +278,7 @@ Two limits worth knowing:
 
 A product that is manufactured from components. Unlike a Kit, a BOM product holds its own stock. Components are consumed during a build order, and the finished product's stock increases.
 
-Use the component search to define the bill of materials, specifying the quantity of each component consumed per unit produced. To load recipes in bulk, use the products CSV's `components` column — see
+Use the **Bill of Materials** editor on the product page to define the recipe (same whole-number quantity box and **Save Bill of Materials** button as for Kits), specifying the quantity of each component consumed per unit produced. To load recipes in bulk, use the products CSV's `components` column — see
 **Importing manufacturing recipes (BOM)** above.
 
 **A BOM's component list can be edited at any time**, regardless of open sales orders. Fulfilment
@@ -289,8 +295,13 @@ A product that appears in sales and purchase orders but is not tracked in stock.
 
 Click any product to open its detail page. From here you can:
 
-- **Edit details** -- Update any of the product fields.
+- **Edit details** -- Update any of the product fields, then click **Save Product** in the page header.
+- **HS Code Classification** -- Approve, edit or reject the proposed customs code in place (Simple, Variant, Kit and BOM products). See [HS Code Review](#hs-code-review).
 - **View stock levels** -- See on hand, allocated, available, and incoming quantities per warehouse.
+- **Adjust stock** -- Use the **Stock Adjustment** card to correct a quantity; see [Stock Control](stock-control.md).
+- **Stock Flow** -- The Stock Flow button beside the product name lists every stock movement for the product (date, type, warehouse, reference, note) with links back to the order, transfer or build order, and can be filtered.
+- **View in Store** -- Opens the product on the connected online store, when one is connected.
+- **Replenishment** -- Shows the lead time used for reorder planning, and whether it is set by hand, derived automatically from purchase order history, or the 14-day default. Set it with **Lead time (days)** in the product form; leave blank to use the automatic value.
 
 ### Product Type Changes
 
@@ -308,6 +319,56 @@ The system blocks a type change if the product still has any of the following at
 This is especially important when changing a Bundle or BOM back to a Simple product. Clear the attached stock and operational documents first, then change the type.
 
 Variable parents and Non-Inventory products cannot be converted through the standard product editor.
+
+
+## Customs Data and HS Code Review
+
+Every product can carry three customs fields: **HS Code**, **Country of Origin** and **Customs Description**. They are sent to the warehouse so shipments leave with the right paperwork.
+
+### Where the customs fields come from
+
+- **Variants inherit from their parent.** When you generate variants (or Kit/BOM children) from a Variable product, each new child starts with the parent's HS code, country of origin and customs description. Change them on an individual variant afterwards if it differs. Children created earlier are not changed retroactively.
+- **WooCommerce import.** When the store supplies an HS code, country of origin or customs description for a product, the store's value wins and replaces the one in IMS if it differs. When the store leaves one blank, IMS keeps what it has. A customs description longer than 50 characters is shortened.
+- **Country of origin.** The field is a country picker. Blank means China is declared by default. If an old record holds an origin that is not a real country, the product form shows it as "invalid — choose a country" and will not save until you pick a real one. A bad origin that reaches the warehouse push is declared as China and raised as an open discrepancy until corrected.
+
+### CN8 check before the warehouse push
+
+Before a product is pushed to the warehouse (Mintsoft), its HS code is checked: it must be exactly **8 digits** and be a current 2026 EU CN code. Punctuation such as `3926.9090` is stripped before the check. If the code fails:
+
+- the product is still pushed, but **without** the commodity code;
+- an open **INVALID_HS_CODE** discrepancy is raised for the product, with a message saying the code is not a declarable 2026 CN8;
+- the discrepancy clears itself the next time the product syncs with a valid code.
+
+Fix it by correcting the code on the product (or by approving a valid proposal, below). See [Warehouse (Mintsoft)](warehouse-mintsoft.md).
+
+### HS Code Review
+
+**Inventory > HS Code Review** is the queue of HS codes proposed by the AI classifier, waiting for a person to approve them. The menu item appears only for roles that can edit products (Admin, Manager and Warehouse); Finance and Read-only users do not see it.
+
+How proposals arise:
+
+- A product with no HS code and no earlier proposal is classified in the background (Simple, Variant, Kit and BOM products that are not archived). The background sweep takes a small batch at a time, and each product is proposed at most once, so a proposal you rejected does not come back by itself. The sweep runs only when your administrator has scheduled it; it is not part of the built-in job list.
+- If the AI service is not reachable, or no key is configured, a simpler keyword-based suggestion is used instead, so the product still gets a proposal. The **Source** column shows which was used.
+- If a product's name, description or category changes while its proposal is still pending, the stale proposal is dropped and the product is re-classified later.
+- You can ask for a fresh classification at any time with **Re-classify** (queue) or **Classify** / **Re-classify** (product page).
+
+The queue lists pending proposals, least confident first:
+
+| Column | Meaning |
+|---|---|
+| **Product** | SKU and name. |
+| **Proposed code** | The suggested 8-digit CN code. A red **not declarable** badge means it is not a valid current 2026 CN8. |
+| **Confidence** | A band (**high** 85 and over, **medium** 60 to 84, **low** below 60) and a 0 to 100 score. The score is IMS's own check of the code against the CN list, the product's category and its description, not just the AI's self-reported confidence. |
+| **Flags** | Why the score is what it is, for example an invalid format, a code not in the 2026 list, a superseded code, a category that does not match the code's heading, or a brand-only description. |
+| **Source** | Which classifier produced it (AI, escalated AI, or keyword fallback). |
+
+Click **Review** to open a proposal. Read the reasoning, edit the code if needed, add an optional review note, then choose **Approve** or **Reject**.
+
+- **Approve** writes the code to the product's HS Code. It is refused (with a message) unless the code you are approving, after your edit, is a declarable 8-digit 2026 CN8 with no blocking flag (invalid format, not in 2026, or superseded). Approving only sets the HS code; it does not change the customs description.
+- **Reject** leaves the product untouched and closes the proposal.
+- If someone else reviewed the same proposal first, you are told it was already reviewed.
+
+The same proposal also appears in the **HS Code Classification** card on the product page, with **Approve**, **Reject** and **Re-classify** buttons. A product with no proposal shows a **Classify** button. Read-only roles can see the card but cannot act on it.
 
 
 ## Stock Levels
@@ -340,7 +401,7 @@ Every product has a lifecycle status that controls whether it can be sold, purch
 
 ### Automatic transitions
 
-- **EOL → Archived (auto)** — when an EOL product has zero stock across every warehouse AND no incoming supply (no open PO lines, no in-transit transfers, no in-progress manufacturing for it, no WMS ASN evidence), a daily cron job auto-archives it. The activity log records the transition with the incoming-stock breakdown at archive time.
+- **EOL → Archived (auto)** — when an EOL product has zero stock across every warehouse AND no incoming supply (no open PO lines with quantity still outstanding, no in-transit transfers, no in-progress manufacturing for it, no WMS ASN evidence), a daily cron job auto-archives it. A purchase order line counts by what has not yet landed, so a fully received line no longer holds the product back. The activity log records the transition with the incoming-stock breakdown at archive time.
 
 ### When to use each state
 
@@ -392,7 +453,15 @@ When pricing a new PO, the system pre-fills the unit cost from the catalogue ent
 
 ## Variable Products -- Options and Variants
 
-When editing a Variable product, you define **options** (e.g. Size with values S, M, L and Colour with values Red, Blue). The system can then **generate variants** for every combination automatically. Each generated child SKU inherits the parent's details and can be customised individually.
+When editing a Variable product, you define **options** (e.g. Size with values S, M, L and Colour with values Red, Blue). The system can then **generate variants** for every combination automatically. Each generated child SKU inherits the parent's weight, dimensions and customs fields (HS code, country of origin, customs description) and can be customised individually.
+
+Save the options first, then use the **Generate as** selector next to **Generate Variants** to choose what the children are:
+
+- **Variant** (the default) -- ordinary stocked children.
+- **Kit / Bundle (virtual)** -- every child is created as a Kit.
+- **BOM (manufactured)** -- every child is created as a manufactured BOM product.
+
+Kit and BOM children are created **without components**. Open each child's own page and add its components in the Kit Components or Bill of Materials editor; until you do, it has no recipe. Combinations that already exist are skipped, so running the generator again only adds the missing ones. In the products list, these children are labelled **Variant child (Kit)** or **Variant child (BOM)**, to tell them apart from a standalone Kit or BOM.
 
 The child table on a Variable product's detail page shows each variant with its thumbnail, SKU, name, stock, allocated, available, incoming, price, and status. Click any child SKU to open its detail page.
 

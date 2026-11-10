@@ -5,7 +5,7 @@ This page says what an erasure removes, what it keeps, and where it **cannot** r
 ## When an erasure happens
 
 - **WooCommerce first, IMS mirrors it.** When WooCommerce anonymises an order (a customer's request, or WooCommerce's own scheduled anonymisation), IMS detects it and erases the same order. IMS has **no separate schedule** of its own: it erases when WooCommerce does. The record shows the trigger as *mirrored from storefront*.
-- **On request in IMS.** **GDPR Anonymise** on a contact (Sales > Contacts) erases the customer and every order linked to them. The record shows the trigger as *on request*. This does **not** touch the storefront: erase it in WooCommerce too.
+- **On request in IMS.** **GDPR Anonymise** on a contact (Sales > Customers) erases the customer and every order linked to them. The record shows the trigger as *on request*. This does **not** touch the storefront: erase it in WooCommerce too.
 - An order that arrives *after* its customer was erased is created already erased.
 - An erasure is all or nothing. If any part cannot be completed it is rolled back and reported, so there is never a half-erased order.
 

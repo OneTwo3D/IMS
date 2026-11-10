@@ -483,6 +483,12 @@ Disconnect) is ignored and re-resolved rather than used against a ledger that ne
 | Allocated Inventory | Asset | Stock reserved for paid orders awaiting dispatch |
 | Cost of Goods Sold | Direct Cost | COGS booked when goods ship |
 | Unearned Revenue | Liability | Revenue deferred until goods ship |
+| Manufacturing Overhead | Profit and loss | Overhead absorbed into manufactured stock cost (optional) |
+| Inventory Revaluation | Profit and loss | Offset for retrospective cost corrections on goods already sold (optional) |
+| Rounding Difference | Profit and loss | Absorbs sub-penny rounding so the inventory sub-ledger ties to the ledger (optional) |
+| Accounts Receivable / Accounts Payable | Your control accounts | Control accounts for the foreign-exchange journals |
+| Realised and Unrealised FX Gain/Loss | Profit and loss | Settlement-rate variances and period revaluation |
+| EU IOSS/VOEC VAT collected, EU DDP charges collected, EU landed-cost fees | See the EU sections below | Three roles for the EU VAT treatment. Configuration only and **not yet switched on**: leave them blank until told otherwise (see the EU sections below) |
 
 ## How Sync Works — Flowchart
 
@@ -2173,15 +2179,15 @@ settles expire normally.
 | Endpoint | Schedule | Purpose |
 |---|---|---|
 | `/api/cron/accounting-sync` | Every 5 min | Settle any held ("unconfirmed") posting refusals — which happens on every run, whether or not an accounting connector is enabled — then process pending accounting sync entries (invoices, journals) for whichever accounting connector is active, then, for Xero only, run the back-reference repair sweep |
-| `/api/cron/accounting-daily-batch` | Daily (midnight) | Run sub-ledger Groups A1, A2, B |
+| `/api/cron/accounting-daily-batch` | Daily (02:00 by default) | Run sub-ledger Groups A1, A2, B |
 | `/api/cron/accounting-payment-poll` | Every 15 min | Detect paid invoices and bills in the active accounting connector |
 | `/api/cron/accounting-payment-reconcile` | Daily (03:00) | Backlog sweep: check every locally-linked invoice/bill against its current Xero status by id (report-only unless `xero_payment_reconcile_apply`) |
 | `/api/cron/accounting-fx-revaluation` | Daily | Periodic unrealised FX revaluation of open AR/AP balances |
-| `/api/cron/xero-chart-sync` | Daily | Refresh the stored Xero chart of accounts (read-only) before the balance snapshot |
-| `/api/cron/account-balance-snapshot` | Daily | Snapshot Xero account balances for period reporting |
+| `/api/cron/xero-chart-sync` | Daily (00:30 by default) | Refresh the stored Xero chart of accounts (read-only) before the balance snapshot |
+| `/api/cron/account-balance-snapshot` | Daily (01:00 by default) | Snapshot Xero account balances for period reporting |
 | `/api/cron/xero-tax-rate-drift` | Hourly | Read the full Xero tax-rate list into the tax-rate master store (rows, header and read-sync stamp in one transaction) and record IMS-vs-Xero tax-rate drift |
 
-All cron endpoints require the `CRON_SECRET` bearer header in production.
+All cron endpoints require the `CRON_SECRET` bearer header in production. These jobs are switched on and timed on **Settings > System > Scheduler**; after an upgrade that adds or retimes one (the chart refresh is new, the tax-rate drift check is hourly), press **Save & Apply** there once so it reaches the crontab. See [Settings](settings.md#cron-jobs).
 
 
 ### Account balance snapshots (Trial Balance)
