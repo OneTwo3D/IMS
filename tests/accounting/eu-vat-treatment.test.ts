@@ -330,3 +330,29 @@ test('a scheme order whose posting type is not proven zero-rated refuses, and th
   const ukPlan = { ...route(ukBuilt).plan, lineKinds: ['goods', 'untaxed-fee'] as TreatedLineKind[], schemePostingTypeProblem: 'irrelevant' }
   assert.ok(applyEuVatTreatment(ukBuilt.payload, ukPlan).ok)
 })
+
+test('a positive shipping or order-discount amount with no account code refuses BEFORE any rounding allowance can absorb it', () => {
+  const plan = (orderTotal: string): EuVatTreatmentPlan => ({
+    route: { kind: 'scheme', regime: 'IOSS', vatAccount: '821', vatAmount: '19.00', schemePostingTaxType: 'TAX131', vatDescription: 'IOSS VAT collected — DE 19%' },
+    lineKinds: ['goods'], feeAccount: '232', roundingAccount: '860', orderTotal, lineTax: ['19.00'], schemePostingTypeProblem: null,
+  })
+  const base = (): TreatablePayload => ({ currency: 'EUR', lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: 'X' }], lineAmountsIncludeTax: false })
+  // Control: with the account set, shipping 0.02 is part of the document and nothing is rounded.
+  const withAccount = applyEuVatTreatment({ ...base(), shippingAmount: 0.02, shippingAccountCode: '260', shippingTaxType: 'X' }, plan('119.02'))
+  assert.ok(withAccount.ok)
+  assert.equal(withAccount.payload.lines.some((l) => l.noTaxKind === 'rounding-difference'), false)
+  // Shipping with no account: the connector would drop it. 0.02 would have been taken for rounding; it is refused instead.
+  for (const accountCode of ['', undefined]) {
+    const dropped = applyEuVatTreatment({ ...base(), shippingAmount: 0.02, shippingAccountCode: accountCode, shippingTaxType: 'X' }, plan('119.02'))
+    assert.equal(dropped.ok, false)
+    assert.match(dropped.ok ? '' : dropped.reason, /positive shipping amount but no shipping account is set/)
+  }
+  assert.equal(applyEuVatTreatment({ ...base(), shippingAmount: 10, shippingAccountCode: '', shippingTaxType: 'X' }, plan('129.00')).ok, false)
+  // The order discount likewise (total 118.98 = 100 + 19 - 0.02).
+  const noDiscountAccount = applyEuVatTreatment({ ...base(), discountAmount: 0.02, discountAccountCode: '', discountTaxType: 'X' }, plan('118.98'))
+  assert.equal(noDiscountAccount.ok, false)
+  assert.match(noDiscountAccount.ok ? '' : noDiscountAccount.reason, /positive discount amount but no discount account is set/)
+  assert.ok(applyEuVatTreatment({ ...base(), discountAmount: 0.02, discountAccountCode: '270', discountTaxType: 'X' }, plan('118.98')).ok)
+  // A zero amount with no account is nothing to drop.
+  assert.ok(applyEuVatTreatment({ ...base(), shippingAmount: 0, shippingAccountCode: '', shippingTaxType: 'X' }, plan('119.00')).ok)
+})

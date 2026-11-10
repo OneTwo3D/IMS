@@ -20,6 +20,7 @@
  * Every line that is re-typed also loses its rate binding (`taxRateId`, `shippingTaxRateId`, `discountTaxRateId` and their bases): the binding says "this code was read from that rate", which is no longer true.
  */
 import { currencyMinorUnits, roundMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import { droppedExtraMapping } from './sales-document-tax-types'
 import type { EuVatRegimeDecision, EuVatRegimeInput } from './eu-vat-regime'
 import type { StampedRegime } from './eu-vat-regime-stamp'
 
@@ -211,6 +212,10 @@ export function applyEuVatTreatment<P extends TreatablePayload>(payload: P, plan
   if (route.kind === 'none') {
     return { ok: true, payload: next, applied: { route: 'none', regime: null, feesRecoded: marked.length, roundingAdjustment: null } }
   }
+
+  // A positive shipping or order-discount amount with no account code is never sent by the connector. The document's total would then miss that money, and a small amount could be taken for rounding below, so it refuses BEFORE any rounding allowance applies.
+  const dropped = droppedExtraMapping(next)
+  if (dropped !== null) return refuse(`the order has a positive ${dropped} amount but no ${dropped} account is set in the accounting settings, so the invoice would leave it out and not total the order`)
 
   // 2. The scheme's one VAT line.
   const currency = payload.currency

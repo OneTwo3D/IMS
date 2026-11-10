@@ -2070,10 +2070,14 @@ async function releaseHeldWcSalesInvoice(
   if ((held.accountingPayload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown } | null | undefined)?.applied !== true
     && heldChartConnector !== null
     && (await (await import('@/lib/accounting')).isAccountingSyncTypeEnabledFor(heldChartConnector, 'SALES_INVOICE'))) {
+    const refusedMarker = held.accountingPayload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { reason?: unknown; refusal?: unknown } | null | undefined
     await noteHeldReleaseFailure(
       row.id,
-      `WooCommerce numbered this invoice ${invoiceNumber}, but this hold was parked before the EU IOSS/VOEC/DDP treatment ran on it (before it existed, or while the Sales Invoices switch was off), so it was built without the EU IOSS/VOEC/DDP treatment. `
-      + 'NOTHING was queued: re-import the order from WooCommerce: the re-import applies the treatment to this hold and releases it (a refusal, if any, is written here).',
+      refusedMarker?.reason === 'treatment_refused'
+        // A refused hold keeps its refusal's reason (the sweep must not replace it with the generic note).
+        ? `This held invoice was not released: the EU IOSS/VOEC/DDP treatment refused it: ${String(refusedMarker.refusal ?? 'no reason recorded')}. NOTHING was queued. Fix that, then re-import the order from WooCommerce to try again.`
+        : `WooCommerce numbered this invoice ${invoiceNumber}, but this hold was parked before the EU IOSS/VOEC/DDP treatment ran on it (before it existed, or while the Sales Invoices switch was off), so it was built without the EU IOSS/VOEC/DDP treatment. `
+          + 'NOTHING was queued: re-import the order from WooCommerce: the re-import applies the treatment to this hold and releases it (a refusal, if any, is written here).',
     )
     return 'not-queued'
   }
@@ -3740,7 +3744,9 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
         }
       }
 
-      if (invoiceNumberResolution.ok) {
+      // A TREATMENT REFUSAL IS NEVER QUEUED, NUMBERED OR NOT: the poster always refuses the stamped payload, and a re-import of an existing order only reconciles HELD invoices, so a queued refused invoice would never be rebuilt.
+      // It is parked as a hold instead (applied:false, reason treatment_refused, the original payload), which the re-import repair path recovers once the cause is fixed: verify against the order, retry the treatment, release only on success.
+      if (invoiceNumberResolution.ok && euVatOutcome.kind !== 'refused') {
         // ONE ORDER-LOCKED TRANSACTION (as the held release): the erasure marker is read under the order lock, the contact block is the
         // real one or the placeholder accordingly, and the row is inserted, all inside it. An erasure that commits between the order
         // create and this enqueue is therefore seen; one that runs after it finds the row and scrubs it. A failure rolls back and is

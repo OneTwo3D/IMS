@@ -229,13 +229,15 @@ test('[eu vat] switch ON, DDP (the plugin recorded 232): the VAT line is on 232,
   assert.equal(order.euVatLineAccount, '232')
 })
 
-test('[eu vat] switch ON, the plugin recorded no account: the document is stamped so the poster refuses it, no payment is registered, nothing is stamped on the order', { skip }, async (t) => {
+test('[eu vat] switch ON, the plugin recorded no account: the NUMBERED invoice is parked (never queued) with the refusal\'s reason, nothing is stamped on the order', { skip }, async (t) => {
   const { invoice, order, db, orderId } = await run(t, [{ id: 2, key: 'is_vat_exempt', value: 'no' }], true)
-  assert.ok(invoice)
-  assert.match(invoice._taxUnreconciled?.reason ?? '', /EU IOSS\/VOEC\/DDP treatment .* refused the invoice: .*plugin_account_missing/)
-  assert.equal(invoice._registerPayment, false)
-  assert.equal(invoice.lines[0]!.taxType, 'DE_CHARGED', 'the lines are left as built: the document will not post')
-  assert.equal(invoice._euVatTreatment, undefined)
+  assert.equal(invoice, null, 'a treatment refusal is not queued: the poster would always refuse it')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const held = (await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })).payload as unknown as { accountingPayload: Invoice }
+  assert.deepEqual([held.accountingPayload._euVatTreatment?.applied, held.accountingPayload._euVatTreatment?.reason], [false, 'treatment_refused'])
+  assert.match(String(held.accountingPayload._euVatTreatment?.refusal), /plugin_account_missing/)
+  assert.equal(held.accountingPayload.lines[0]!.taxType, 'DE_CHARGED', 'the original payload, as built')
+  assert.equal(held.accountingPayload._taxUnreconciled, undefined)
   assert.deepEqual(order, { euVatRegime: null, euVatLineAccount: null, euVatRegimeStampedAt: null })
   const logged = await db.activityLog.findFirst({ where: { entityId: orderId, action: 'wc_invoice_eu_vat_treatment_refused' } })
   assert.ok(logged, 'the refusal is on the activity log')
@@ -353,12 +355,13 @@ const REFUSED_LISTS: Array<{ label: string; list: Record<string, string>; expect
 ]
 for (const scenario of REFUSED_LISTS) {
   test(`[eu vat] ${scenario.label}: the invoice is refused, not built on it`, { skip }, async (t) => {
-    const { invoice, order } = await run(t, PLUGIN('821'), true, scenario.list)
-    assert.ok(invoice)
-    assert.match(invoice._taxUnreconciled?.reason ?? '', scenario.expect)
-    assert.equal(invoice._registerPayment, false)
-    assert.equal(invoice.lines.some((l) => l.noTaxKind === 'eu-vat-recovery'), false)
-    void order
+    const { invoice, db, orderId } = await run(t, PLUGIN('821'), true, scenario.list)
+    assert.equal(invoice, null, 'not queued')
+    const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+    const held = (await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })).payload as unknown as { accountingPayload: Invoice }
+    assert.equal(held.accountingPayload._euVatTreatment?.reason, 'treatment_refused')
+    assert.match(String(held.accountingPayload._euVatTreatment?.refusal), scenario.expect)
+    assert.equal(held.accountingPayload.lines.some((l) => l.noTaxKind === 'eu-vat-recovery'), false)
   })
 }
 
@@ -658,7 +661,7 @@ test('[eu vat] a hold parked with the switch OFF is parked byte for byte as the 
 })
 
 /** Park a scheme invoice whose treatment REFUSES (the plugin recorded no VAT account) with no invoice number, then deliver the order again with a number and `fixedMeta`. */
-async function parkRefusedThenReimport(t: test.TestContext, fixedMeta: Meta) {
+async function parkRefusedThenReimport(t: test.TestContext, fixedMeta: Meta, numbered = false) {
   const db = await loadDb()
   await mockAccounting()
   switchOn = true
@@ -668,8 +671,10 @@ async function parkRefusedThenReimport(t: test.TestContext, fixedMeta: Meta) {
   const externalId = Math.floor(Math.random() * 2_000_000_000)
   const ctx = await seed(db, wcRateId)
   t.after(async () => { switchOn = false; await cleanup(db, externalId, ctx) })
-  assert.equal((await importWcOrder(payload(externalId, wcRateId, [{ id: 2, key: 'is_vat_exempt', value: 'no' }]) as never)).success, true)
+  const numberMeta: Meta = numbered ? [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }] : []
+  assert.equal((await importWcOrder(payload(externalId, wcRateId, [...numberMeta, { id: 2, key: 'is_vat_exempt', value: 'no' }]) as never)).success, true)
   const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  assert.equal(await db.accountingSyncLog.count({ where: { type: 'SALES_INVOICE', referenceId: orderId } }), 0, numbered ? 'a numbered treatment refusal queued nothing (the poster would always refuse it)' : 'nothing queued')
   const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
   const parked = (held.payload as unknown as { accountingPayload: Invoice }).accountingPayload
   // Parked as an UNTREATED hold carrying the refusal's reason, never applied:true; the original payload (no stamp).
@@ -677,9 +682,10 @@ async function parkRefusedThenReimport(t: test.TestContext, fixedMeta: Meta) {
   assert.match(String(parked._euVatTreatment?.refusal), /plugin_account_missing/)
   assert.equal(parked._taxUnreconciled, undefined)
   // The numbered order is delivered again, switch on. (The sweep first: it must never release an applied:false hold.)
-  await db.salesOrder.update({ where: { id: orderId }, data: { invoiceNumber: `INV-${externalId}` } })
+  if (!numbered) await db.salesOrder.update({ where: { id: orderId }, data: { invoiceNumber: `INV-${externalId}` } })
   await retryHeldWcSalesInvoiceReleases()
   assert.equal(await db.accountingSyncLog.count({ where: { type: 'SALES_INVOICE', referenceId: orderId } }), 0, 'the sweep did not release the refused hold')
+  assert.match((await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } })).errorMessage ?? '', numbered ? /treatment refused it: .*plugin_account_missing/ : /^$|.*/)
   await importWcOrder(payload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, { id: 2, key: 'is_vat_exempt', value: 'no' }, ...fixedMeta]) as never)
   return { after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }), rows: await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId } }), order: await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { euVatRegime: true } }) }
 }
@@ -912,4 +918,22 @@ test('[eu vat] the ORDER DEFAULT changes (the order now names a "Standard" rate 
   assert.equal(rows.length, 0)
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /line 1: the resolved tax rate and type changed from .*ZERORATEDOUTPUT.* to .*EXEMPTOUTPUT/)
+})
+
+test('[eu vat] a NUMBERED invoice whose treatment refuses is parked, not queued; the cause fixed, the re-import treats and queues it', { skip }, async (t) => {
+  const { after, rows, order } = await parkRefusedThenReimport(t, [{ id: 1, key: '_o3d_ioss_vat_account', value: '821' }], true)
+  assert.equal(rows.length, 1, 'queued once the treatment succeeded')
+  assert.equal(after.status, 'SYNCED')
+  const invoice = rows[0]!.payload as unknown as Invoice
+  assert.equal(invoice._taxUnreconciled, undefined, 'the queued invoice is the treated one, not a stamped refusal')
+  assert.deepEqual(invoice.lines.map((l) => [l.accountCode, l.taxType, l.noTaxKind ?? null]), [['200', 'TAX131', null], ['232', 'NONE', 'fee-no-tax'], ['821', 'NONE', 'eu-vat-recovery']])
+  assert.equal(total(invoice), 135.66)
+  assert.equal(order.euVatRegime, 'IOSS')
+})
+
+test('[eu vat] the same numbered refusal with the cause NOT fixed stays held with the refusal reason', { skip }, async (t) => {
+  const { after, rows } = await parkRefusedThenReimport(t, [], true)
+  assert.equal(rows.length, 0)
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /treatment refused it: .*plugin_account_missing/)
 })
