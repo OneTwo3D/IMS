@@ -134,3 +134,58 @@ export function refundSafeguards(input: { isInternal: boolean; requestedPerTarge
     deriveSaleLineNetsFromStoredBalance: !input.isInternal,
   }
 }
+
+/**
+ * WHAT A PUBLIC (operator-typed) REFUND MAY CONTAIN. Itemised order lines only: the refund dialog sends nothing else. A mirrored order
+ * discount line (negative money) or a monetary line attributed to no order line would let a caller offset the ceiling, e.g. an unlinked
+ * +100 sale line beside a -100 discount line records a refund of 0 while the credit note posts the grossed-up sale line. Storefront
+ * sync, the chargeback poller and the exception inbox do send such lines and are not subject to this.
+ */
+export function publicRefundLineRefusal(lines: readonly { lineId?: string | null; lineKind?: 'sale' | 'shipping' | 'discount' | null }[]): string | null {
+  if (lines.some((line) => line.lineKind === 'discount')) {
+    return 'A refund entered by hand cannot carry a discount line. Refund the order lines themselves.'
+  }
+  if (lines.some((line) => !line.lineId && line.lineKind !== 'shipping')) {
+    return 'Every refunded line must be a line of the order. An amount attributed to no order line cannot be refunded here.'
+  }
+  return null
+}
+
+/**
+ * The first order line whose refunds, once the credit note is GROSSED UP, would exceed what the customer paid for it (its stored net plus
+ * its stored VAT). The grossing rate is the higher of the line's own charged rate and the rate of the tax code the credit note posts it
+ * under (`postedRate`, null when that code cannot be priced), so a code worth more than the line was charged at cannot return more than
+ * was paid. Net refunds are already capped per line; this closes the gap a differing posting rate would open.
+ */
+export function findGrossOverPaidBalance(input: {
+  orderLines: readonly { id: string; description?: string | null; totalForeign?: DecimalInput; taxForeign?: DecimalInput }[]
+  priorRefundLines: readonly PriorRefundTargetLine[]
+  allocations: readonly RefundTargetAllocation[]
+  postedRate: (lineId: string) => number | null
+  epsilon?: number
+}): { label: string; refundedGross: Decimal; paidGross: Decimal } | null {
+  const epsilon = toDecimal(input.epsilon ?? REFUND_TARGET_BALANCE_EPSILON)
+  const net = new Map<string, Decimal>()
+  const add = (id: string, value: DecimalInput) => net.set(id, (net.get(id) ?? toDecimal(0)).add(toDecimal(value)))
+  for (const prior of input.priorRefundLines) if (prior.salesOrderLineId && prior.lineKind !== 'discount') add(prior.salesOrderLineId, prior.totalForeign ?? 0)
+  const touched = new Set<string>()
+  for (const allocation of input.allocations) {
+    if (!allocation.lineId || allocation.lineKind === 'discount') continue
+    add(allocation.lineId, allocation.netForeign)
+    touched.add(allocation.lineId)
+  }
+  for (const line of input.orderLines) {
+    if (!touched.has(line.id)) continue
+    const chargedNet = toDecimal(line.totalForeign ?? 0)
+    const chargedTax = toDecimal(line.taxForeign ?? 0)
+    const ownRate = chargedNet.gt(0) ? chargedTax.div(chargedNet) : toDecimal(0)
+    const posted = input.postedRate(line.id)
+    const rate = posted != null && toDecimal(posted).gt(ownRate) ? toDecimal(posted) : ownRate
+    const refundedGross = (net.get(line.id) ?? toDecimal(0)).mul(toDecimal(1).add(rate))
+    const paidGross = chargedNet.add(chargedTax)
+    if (refundedGross.sub(paidGross).gt(epsilon)) {
+      return { label: line.description || `line ${line.id}`, refundedGross, paidGross }
+    }
+  }
+  return null
+}

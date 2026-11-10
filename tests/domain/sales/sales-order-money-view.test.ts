@@ -285,3 +285,22 @@ test('a difference of two pence is not "reconciled"', () => {
   assert.equal(salesOrderMoneyView({ ...manualInclusive20, totalForeign: 112.7 }).reconciles, false)
   assert.equal(salesOrderMoneyView({ ...manualInclusive20, totalForeign: 112.683 }).reconciles, true, 'rounding noise is tolerated')
 })
+
+// [mutation: the residue joins the first line's bucket, or an unknown header rate folds it into a line's rate]
+test('shipping/discount VAT joins the order default rate row, or prints as its own adjustment; rows always sum to the stored VAT', () => {
+  // 5% line listed FIRST, header 20%, header discount: the -0.6 residue belongs to the 20% row, not to the first line's 5% row.
+  const rows = documentVatRows({
+    taxRateName: 'VAT', taxRatePercent: 0.2, taxForeign: 21.9,
+    lines: [{ taxRatePercent: 0.05, taxForeign: 2.5 }, { taxRatePercent: 0.2, taxForeign: 20 }],
+  })
+  assert.deepEqual(rows.map((r) => [r.label, r.amount]), [['VAT @ 20%', 19.4], ['VAT @ 5%', 2.5]])
+  // No default rate: the residue is its own row.
+  const noHeader = documentVatRows({
+    taxRateName: null, taxRatePercent: null, taxForeign: 21.9,
+    lines: [{ taxRatePercent: 0.05, taxForeign: 2.5 }, { taxRatePercent: 0.2, taxForeign: 20 }],
+  })
+  assert.deepEqual(noHeader.map((r) => [r.label, r.amount]), [['VAT @ 20%', 20], ['VAT @ 5%', 2.5], ['VAT adjustment', -0.6]])
+  near(noHeader.reduce((s, r) => s + r.amount, 0), 21.9, 'rows sum to the stored VAT')
+  // One rate and no header: still adjustment-free when there is no residue.
+  assert.deepEqual(documentVatRows({ taxRateName: null, taxRatePercent: null, taxForeign: 5, lines: [{ taxRatePercent: 0.05, taxForeign: 5 }] }), [{ label: 'VAT', amount: 5 }])
+})

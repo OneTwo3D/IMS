@@ -407,16 +407,19 @@ export function documentVatRows(order: {
 }): { label: string; amount: number }[] {
   if (Math.abs(order.taxForeign) < 0.00005) return []
   const lineVat = order.lines.reduce((s, l) => s + (Number(l.taxForeign) || 0), 0)
-  const shippingFeeVat = Math.round((order.taxForeign - lineVat) * 10000) / 10000
-  const breakdown = groupVatBreakdown(
-    order.lines.map((l) => ({ taxRatePercent: l.taxRatePercent ?? order.taxRatePercent, taxForeign: Number(l.taxForeign || 0) })),
-    Math.abs(shippingFeeVat) >= 0.00005 ? [{ label: 'Shipping/Fees', amount: shippingFeeVat }] : undefined,
-  )
-  if (breakdown.length <= 1) {
+  // The VAT that sits on no line (shipping and fees, less the VAT inside an order discount) belongs to the ORDER's default rate: it joins that
+  // rate's row. An order with no default rate prints it as its own "VAT adjustment" row, so a line's rate is never blamed for it.
+  const residue = Math.round((order.taxForeign - lineVat) * 10000) / 10000
+  const hasResidue = Math.abs(residue) >= 0.00005
+  const lineRows = order.lines.map((l) => ({ taxRatePercent: l.taxRatePercent ?? order.taxRatePercent, taxForeign: Number(l.taxForeign || 0) }))
+  const headerKnown = order.taxRatePercent != null
+  const breakdown = groupVatBreakdown(hasResidue && headerKnown ? [...lineRows, { taxRatePercent: order.taxRatePercent, taxForeign: residue }] : lineRows)
+  const adjustment = hasResidue && !headerKnown ? [{ label: 'VAT adjustment', amount: residue }] : []
+  if (breakdown.length <= 1 && adjustment.length === 0) {
     const label = (order.taxRateName ?? 'VAT') + (order.taxRatePercent != null ? ` (${(order.taxRatePercent * 100).toFixed(0)}%)` : '')
     return [{ label, amount: order.taxForeign }]
   }
-  return breakdown
+  return [...breakdown, ...adjustment]
 }
 
 /**

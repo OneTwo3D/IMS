@@ -28,7 +28,7 @@ import {
 } from '@/lib/domain/sales/refund-reversal-record'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
-import { findOverAllocatedRefundTarget, overAllocatedRefundTargetMessage } from '@/lib/domain/sales/refund-target-balances'
+import { findGrossOverPaidBalance, findOverAllocatedRefundTarget, overAllocatedRefundTargetMessage, publicRefundLineRefusal } from '@/lib/domain/sales/refund-target-balances'
 import { refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
 import {
   RATE_EPSILON,
@@ -3656,6 +3656,11 @@ export async function createSalesOrderRefund(
   // would otherwise drop — a chargeback mirrors the invoice's order-discount line.
   const refundLines = input.lines.filter((line) => line.qty > 0 || line.totalBase > 0 || line.lineKind === 'discount')
   if (!refundLines.length) return { success: false, error: 'Select at least one line to refund' }
+  // An operator-typed refund carries order lines only: no discount line and no amount attributed to no order line (see publicRefundLineRefusal).
+  if (input.deriveSaleLineNetsFromStoredBalance) {
+    const refusal = publicRefundLineRefusal(refundLines)
+    if (refusal) return { success: false, error: refusal }
+  }
 
   // scjz.70: a chargeback never restocks (customer keeps the goods), so neutralise
   // the return warehouse entirely — this skips the pre-shipment return guard, the
@@ -3849,6 +3854,33 @@ export async function createSalesOrderRefund(
       : null
     const salesLineTaxById = new Map(so.lines.map((line) => [line.id, line.taxRate]))
     const reverseChargeSalesTaxType = input.accountingSettings?.reverseChargeSalesTaxType
+
+    // A public refund's credit note, GROSSED UP at the rate it posts under, must stay within what the customer paid for each line.
+    if (input.deriveSaleLineNetsFromStoredBalance) {
+      const salesRates = buildTaxTypeRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }))
+      const taxTypeOfLine = creditNoteLineTaxTypeResolver({ orderLines: so.lines, reverseChargeSalesTaxType, orderDefaultTaxType })
+      const priorForGross = await tx.salesOrderRefundLine.findMany({
+        where: { refund: { orderId: input.orderId } },
+        select: { salesOrderLineId: true, lineKind: true, totalForeign: true },
+      })
+      const overGross = findGrossOverPaidBalance({
+        orderLines: so.lines,
+        priorRefundLines: priorForGross,
+        allocations: refundLines.map((refundLine) => ({
+          lineId: refundLine.lineId ?? null,
+          lineKind: refundLine.lineKind ?? (refundLine.lineId ? 'sale' : null),
+          netForeign: refundLine.totalForeign ?? Math.round(refundLine.totalBase * fxRate * 10000) / 10000,
+        })),
+        postedRate: (lineId) => {
+          const taxType = taxTypeOfLine({ accountingTaxType: null, lineId })
+          const priced = taxType ? priceSnapshottedTaxIdentity({ accountingTaxType: taxType, rateByTaxType: salesRates, label: 'refund line' }) : null
+          return priced?.ok ? priced.rate.toNumber() : null
+        },
+      })
+      if (overGross) {
+        return { error: `The credit note for ${overGross.label} would be ${overGross.refundedGross.toFixed(2)} including VAT, more than the ${overGross.paidGross.toFixed(2)} it was paid.` } as const
+      }
+    }
 
     // Order tax uniformity, resolved from the LINES via the relation (active-independent, so a rate
     // deactivated after the sale still counts) — o3d-w00 #5. Only a uniformly taxed order can carry a
