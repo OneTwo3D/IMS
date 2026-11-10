@@ -128,7 +128,14 @@ mock.module('@/lib/db', {
   namedExports: {
     db: {
       cogsEntry: { findMany: async () => COGS_ROWS },
-      salesOrder: { findMany: async () => ORDERS },
+      salesOrder: {
+        // Honours the invoiced-basis `where` where the fixture says an order is not invoiced: the
+        // cohort query (select id only) returns just the invoiced ones, as Postgres would.
+        findMany: async (args?: { where?: Record<string, unknown>; select?: Record<string, unknown> }) => {
+          const cohort = args?.where && 'OR' in args.where
+          return cohort ? (ORDERS as Array<{ uninvoiced?: boolean }>).filter((o) => !o.uninvoiced) : ORDERS
+        },
+      },
       salesOrderRefundLine: {
         /**
          * THE STAND-IN HONOURS THE `WHERE` IT IS GIVEN, because the defect under test is IN the where.
@@ -140,6 +147,11 @@ mock.module('@/lib/db', {
          */
         findMany: async (args?: { where?: Record<string, unknown> }) => {
           CREDIT_WHERE = args?.where ?? null
+          // The invoiced-basis clause (`refund.order`): drop credit against an order the fixture marks uninvoiced.
+          const clauses = (args?.where as { AND?: Array<{ refund?: { order?: unknown } }> } | undefined)?.AND ?? []
+          if (clauses.some((c) => c.refund?.order)) {
+            return (CREDIT_LINES as Array<{ refund: { uninvoicedOrder?: boolean } }>).filter((l) => !l.refund.uninvoicedOrder)
+          }
           const scope = (args?.where as { refund?: { orderId?: { in?: string[] } } } | undefined)?.refund?.orderId?.in
           if (!scope) return CREDIT_LINES
           return (CREDIT_LINES as Array<{ refund: { orderId: string } }>).filter((line) => scope.includes(line.refund.orderId))
@@ -589,9 +601,12 @@ test('the credit window is the refund date, and nothing else narrows the query (
   // listing the keys that happen to be present today.
   workedExample([creditAgainstLine('L1', 'O1', 'p1', '100', 'NET')])
   await report()
-  const where = CREDIT_WHERE as { refund: { refundedAt: { gte: Date; lt: Date } } }
-  assert.deepEqual(Object.keys(where), ['refund'], 'the refund-line query carries the period clause and nothing else')
-  assert.deepEqual(Object.keys(where.refund), ['refundedAt'])
+  // The period clause is entry 0 of an AND; entry 1 is the invoiced-basis cohort (`refund.order`).
+  const clauses = (CREDIT_WHERE as { AND: Array<{ refund: Record<string, unknown> }> }).AND
+  assert.equal(clauses.length, 2)
+  assert.deepEqual(Object.keys(clauses[0]!.refund), ['refundedAt'])
+  assert.deepEqual(Object.keys(clauses[1]!.refund), ['order'])
+  const where = clauses[0] as unknown as { refund: { refundedAt: { gte: Date; lt: Date } } }
   assert.equal(where.refund.refundedAt.gte.toISOString(), '2026-06-01T00:00:00.000Z')
   assert.equal(where.refund.refundedAt.lt.toISOString(), '2026-07-01T00:00:00.000Z')
 })
@@ -638,7 +653,7 @@ test('a filtered-out sibling product’s credit does not pollute the filtered to
   assert.deepEqual(PRODUCT_WHERE, { OR: [{ sku: { contains: 'Widget', mode: 'insensitive' } }, { name: { contains: 'Widget', mode: 'insensitive' } }] })
   assert.equal(totals.refundsOutsideReportNetBasis.exactString(), '0', 'p2 is outside the FILTER, not outside the report')
   assert.equal(totals.refundsUnattributedNetBasis.exactString(), '0')
-  assert.equal(totals.refundsNetBasis.exactString(), '0')
+  assert.equal(totals.revenueBaseBound, 'exact', 'no credit is left over: the uninvoiced order\u2019s credit was never loaded')
   assert.equal(totals.revenueBase!.exactString(), '100')
   assert.equal(totals.revenueBaseBound, 'exact', 'nothing this view publishes is missing a credit')
   assert.equal(totals.grossMarginBaseBound, 'exact')
@@ -1624,4 +1639,23 @@ test('a quantity share refuses a negative or empty share rather than inverting t
   // And a legitimate share is exact: a third of 100, three times, is 100.
   const third = ExactFigure.share('100', '1', '3')
   assert.equal(ExactFigure.sum([third, third, third]).exactString(), '100')
+})
+
+test('an order that is not invoiced keeps its cost but gets no revenue and no credit (invoiced basis)', async () => {
+  // O1 is invoiced: revenue 100, cost 40. O2 shipped but was never invoiced: cost 30 stays (it is real
+  // cost), but its 100 of line revenue is not counted and its 25 credit does not come off anything.
+  COGS_ROWS = [
+    cogsEntry({ id: 'c1', orderId: 'O1', productId: 'p1', qty: '1', cost: '40', line: { id: 'L1', productId: 'p1', totalBase: '100' } }),
+    cogsEntry({ id: 'c2', orderId: 'O2', productId: 'p2', qty: '1', cost: '30', line: { id: 'L2', productId: 'p2', totalBase: '100' } }),
+  ]
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: '100' }]), { ...order('O2', [{ productId: 'p2', totalBase: '100' }]), uninvoiced: true }]
+  CREDIT_LINES = [{ ...creditAgainstLine('L2', 'O2', 'p2', '25', 'NET'), refund: { orderId: 'O2', totalsBasis: 'NET', uninvoicedOrder: true } }]
+  FILTER_PRODUCT_IDS = [...ALL_FIXTURE_PRODUCTS]
+  const { rows, totals } = await report()
+  const byProduct = new Map(rows.map((r) => [r.productId, r]))
+  // Separate products so the uninvoiced one cannot hide the invoiced one inside a single Unmatched row.
+  assert.equal(byProduct.get('p1')!.revenueBase!.exactString(), '100')
+  assert.equal(byProduct.get('p2')!.revenueBase, null, 'cost kept, revenue not counted: the row reads Unmatched')
+  assert.equal(byProduct.get('p2')!.cogsBase.exactString(), '30')
+  assert.equal(totals.revenueBaseBound, 'exact', 'no credit is left over: the uninvoiced order\u2019s credit was never loaded')
 })

@@ -5,7 +5,7 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
-import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
+import { INVOICED_ORDER_WHERE, invoicedInPeriodWhere, invoicedPeriodDate } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
 import { marginFigureBound, netLinearFigureBound, netOfRefunds, refundLineBucket, refundPctOfSale, refundTotalsBasis, unplacedCreditBoundFromParts, type DerivedFigureBound, type RefundSetBasis, type RefundTotalsBasis } from '@/lib/domain/sales/refund-basis-analytics'
@@ -451,14 +451,14 @@ export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promi
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
 
   const orders = await db.salesOrder.findMany({
-    where: { ...INVOICED_ORDER_WHERE, ...(Object.keys(dateFilter).length ? { invoicedAt: dateFilter } : {}) },
+    // Dated by invoicedPeriodDate (invoicedAt, else the order date), so Xeroom-era orders land in a period.
+    where: Object.keys(dateFilter).length ? invoicedInPeriodWhere(dateFilter as { gte?: Date; lte?: Date }) : INVOICED_ORDER_WHERE,
     select: {
-      id: true, orderNumber: true, externalOrderNumber: true, invoiceNumber: true, customerName: true, salesRep: true,
-      invoicedAt: true, status: true, totalBase: true, paidAt: true,
+      id: true, orderNumber: true, externalOrderNumber: true, invoiceNumber: true, accountingInvoiceId: true, customerName: true, salesRep: true,
+      invoicedAt: true, createdAt: true, status: true, totalBase: true, paidAt: true,
       lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true } },
       payments: { where: { refundId: null }, select: { amount: true } },
     },
-    orderBy: { invoicedAt: 'desc' },
   })
 
   const rows: InvoiceRow[] = []
@@ -468,15 +468,18 @@ export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promi
     for (const l of o.lines) {
       rows.push({
         orderId: o.id, orderNumber: getSalesOrderReference(o),
-        invoiceNumber: o.invoiceNumber!, productId: l.productId, sku: l.sku ?? '',
+        // An order can be invoiced by an IMS-posted Xero invoice with no invoice number: show the
+        // Xero id, or a dash when neither exists, rather than a blank or a crash.
+        invoiceNumber: o.invoiceNumber ?? o.accountingInvoiceId ?? '—', productId: l.productId, sku: l.sku ?? '',
         productName: l.description, customerName: o.customerName ?? '—', salesRep: o.salesRep,
-        invoicedAt: o.invoicedAt!.toISOString(), status: o.status,
+        invoicedAt: invoicedPeriodDate(o).toISOString(), status: o.status,
         qty: Number(l.qty), totalBase: Number(l.totalBase),
         paidAt: o.paidAt?.toISOString() ?? null, balance,
       })
     }
   }
-  return rows
+  // Newest first by the report date. The date is never null (it falls back to the order date), so no row sorts oddly.
+  return rows.sort((a, b) => b.invoicedAt.localeCompare(a.invoicedAt))
 }
 
 // ---------------------------------------------------------------------------
@@ -621,7 +624,7 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
     // a basis question, because a credit's stored total does not.
     const credits = netOfRefunds(o, o.refunds)
     const balance = Math.max(0, total - paid)
-    const ageDays = o.invoicedAt ? Math.round((now - o.invoicedAt.getTime()) / 86400000) : 0
+    const ageDays = Math.round((now - invoicedPeriodDate(o).getTime()) / 86400000)
     let o0 = 0, o31 = 0, o61 = 0, o91 = 0
     if (balance > 0.01) {
       if (ageDays > 90) o91 = balance

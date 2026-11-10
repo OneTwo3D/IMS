@@ -52,6 +52,34 @@ export function isInvoicedOrder(order: {
   return Boolean(order.accountingInvoiceId) || Boolean(order.invoiceNumber)
 }
 
+/**
+ * THE ONE PERIOD DATE FOR INVOICED-REVENUE REPORTS THAT ARE BOUNDED BY INVOICE DATE.
+ *
+ * `invoicedAt` when IMS has it; otherwise the order date (`createdAt`). Xeroom-era orders carry an
+ * invoice number but no `invoicedAt`, and IMS does not store the WooCommerce PDF invoice date
+ * (`_wcpdf_invoice_date` is never imported), so the order date is the nearest date IMS holds. This
+ * is a REPORTING date only: nothing writes `invoicedAt` for these orders, because it is the tax
+ * point the VAT report reads. Reports bounded by order date (dashboard, Sales Stats products, Sales
+ * Analytics, Customer Mix) already use `createdAt` and are unaffected.
+ */
+export function invoicedPeriodDate(order: { invoicedAt?: Date | null; createdAt: Date }): Date {
+  return order.invoicedAt ?? order.createdAt
+}
+
+/**
+ * Prisma `where` for "invoiced AND dated inside the window" using `invoicedPeriodDate`: the order's
+ * `invoicedAt` is in the window, or it has none and `createdAt` is. Safe to spread: the result owns
+ * only `AND`, so put other conditions beside it, and put other `AND` entries through it, not over it.
+ */
+export function invoicedInPeriodWhere(window: { gte?: Date; lt?: Date; lte?: Date }): Prisma.SalesOrderWhereInput {
+  return {
+    AND: [
+      INVOICED_ORDER_WHERE,
+      { OR: [{ invoicedAt: window }, { invoicedAt: null, createdAt: window }] },
+    ],
+  }
+}
+
 /** The one-sentence definition, for help text and report subtitles. */
 export const INVOICED_BASIS_SENTENCE =
   'Invoiced revenue counts every order that has an invoice (an IMS-posted Xero invoice, or the Xeroom invoice number during the parallel phase), paid or not, excluding cancelled and draft orders.'

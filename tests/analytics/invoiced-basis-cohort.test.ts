@@ -1,0 +1,164 @@
+import assert from 'node:assert/strict'
+import test, { mock } from 'node:test'
+import { Prisma, SalesOrderStatus } from '@/app/generated/prisma/client'
+import { getCurrencySummaryReport, type FinanceAnalyticsClient } from '@/lib/domain/finance/finance-period-analytics'
+import { getMarginAnalyticsReport, type SalesFulfillmentAnalyticsClient } from '@/lib/domain/sales/sales-fulfillment-analytics'
+import { invoicedPeriodDate } from '@/lib/domain/sales/invoiced-revenue-basis'
+
+/**
+ * Three follow-ups to the shared invoiced basis:
+ *   1. margin revenue, COGS and credit come from ONE cohort of invoiced orders;
+ *   2. an order invoiced only by an IMS-posted Xero invoice (no number, no invoicedAt) does not break
+ *      the invoice list;
+ *   3. a Xeroom-era order (number, no invoicedAt) is placed in a period by its order date.
+ */
+
+mock.module('@/lib/auth/server', { namedExports: { requirePermission: async () => ({ user: { id: 'u1' } }) } })
+
+const D = (v: string | number) => new Prisma.Decimal(v)
+type Row = Record<string, unknown>
+const OPS = new Set(['in', 'notIn', 'not', 'gte', 'lte', 'lt', 'some'])
+
+/** A just-enough Prisma `where` evaluator, including nested relation filters. Unknown operators throw. */
+function matches(record: Row | undefined | null, where: Row | undefined): boolean {
+  if (!where) return true
+  return Object.entries(where).every(([key, cond]) => {
+    if (key === 'AND') return (cond as Row[]).every((c) => matches(record, c))
+    if (key === 'OR') return (cond as Row[]).some((c) => matches(record, c))
+    const value = record?.[key]
+    if (cond === null || typeof cond !== 'object' || cond instanceof Date) return value === cond
+    const c = cond as Row
+    const keys = Object.keys(c)
+    if (keys.length > 0 && !keys.every((k) => OPS.has(k))) return matches(value as Row, c)
+    const cmp = (x: unknown) => (x instanceof Date ? x.getTime() : x) as number
+    return keys.every((op) => {
+      const arg = c[op]
+      switch (op) {
+        case 'in': return (arg as unknown[]).includes(value)
+        case 'notIn': return !(arg as unknown[]).includes(value)
+        case 'not': return arg === null ? value != null : value !== arg
+        case 'gte': return value != null && cmp(value) >= cmp(arg)
+        case 'lte': return value != null && cmp(value) <= cmp(arg)
+        case 'lt': return value != null && cmp(value) < cmp(arg)
+        default: throw new Error(`unsupported operator ${op}`)
+      }
+    })
+  })
+}
+
+const none = { findMany: async () => [] }
+const DAY = new Date('2026-06-10T00:00:00.000Z')
+
+// ---------------------------------------------------------------------------------------------
+// 1. Margin: one cohort for revenue, cost and credit
+// ---------------------------------------------------------------------------------------------
+
+function salesOrder(id: string, over: Row): Row {
+  return {
+    id, status: SalesOrderStatus.SHIPPED, invoiceNumber: null, accountingInvoiceId: null, archived: false,
+    currency: 'GBP', customerId: 'c1', customerName: 'Acme', customerEmail: null, createdAt: DAY, invoicedAt: null,
+    expectedDelivery: null, paidAt: null,
+    totalForeign: D(100), totalBase: D(100), taxForeign: D(0), taxBase: D(0), shippingForeign: D(0), shippingBase: D(0), discountAmount: D(0),
+    shoppingLinks: [],
+    lines: [{
+      id: `${id}-l`, productId: 'p1', sku: 'P1', description: 'Widget', qty: D(1), totalForeign: D(100), totalBase: D(100),
+      taxForeign: D(0), taxBase: D(0), discountAmount: D(0),
+      product: { id: 'p1', sku: 'P1', type: 'SIMPLE', name: 'Widget', category: { name: 'Cat' } },
+    }],
+    ...over,
+  }
+}
+
+const MARGIN_ORDERS = [
+  salesOrder('inv', { invoiceNumber: 'INV-1' }),
+  salesOrder('unp', {}), // shipped, never invoiced
+]
+const productRef = { sku: 'P1', name: 'Widget', category: { name: 'Cat' } }
+const cogs = (orderId: string, cost: string) => ({
+  id: `cogs-${orderId}`, totalCostBase: D(cost), qty: D(1), createdAt: DAY,
+  movement: {
+    id: `mv-${orderId}`, referenceType: 'SalesOrder', referenceId: orderId, productId: 'p1', createdAt: DAY, product: productRef,
+    shipmentLine: { line: { productId: 'p1', product: productRef } },
+  },
+})
+const refundLine = (orderId: string, total: string) => ({
+  productId: 'p1', totalBase: D(total), salesOrderLine: { productId: 'p1' },
+  refund: { totalsBasis: 'NET', refundedAt: DAY, order: MARGIN_ORDERS.find((o) => o.id === orderId) },
+})
+
+test('margin: a dispatched order that is not invoiced, and its refund, contribute to neither revenue, cost nor credit', async () => {
+  const client: SalesFulfillmentAnalyticsClient = {
+    product: { findMany: async (args?: unknown) => (args as { where: { id: { in: string[] } } }).where.id.in.map((id) => ({ id, type: 'SIMPLE', productComponents: [] })) },
+    salesOrder: { findMany: async (args?: unknown) => MARGIN_ORDERS.filter((o) => matches(o, (args as { where?: Row }).where)) },
+    salesOrderRefund: none,
+    salesOrderRefundLine: {
+      findMany: async (args?: unknown) => [refundLine('inv', '10'), refundLine('unp', '25')].filter((l) => matches(l, (args as { where?: Row }).where)),
+    },
+    cogsEntry: { findMany: async () => [cogs('inv', '40'), cogs('unp', '30')] },
+    stockMovement: {
+      findMany: async () => MARGIN_ORDERS.map((o) => ({ qty: D(1), referenceId: o.id, productId: 'p1', shipmentLine: { lineId: `${String(o.id)}-l` } })),
+    },
+    shipment: none, activityLog: none,
+  }
+  const report = await getMarginAnalyticsReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, { client, now: () => new Date('2026-06-30T00:00:00.000Z') })
+  const row = report.rows[0]!
+  // Invoiced order only: revenue 100 less its 10 NET credit = 90, cost 40, profit 50.
+  // Old code: revenue 100 (only the invoiced order was loaded) but cost 70 and credit 35, so 100 - 35 - 70 = -5.
+  assert.equal(row.revenueBase, '90')
+  assert.equal(row.cogsBase, '40')
+  assert.equal(row.grossProfitBase, '50')
+  assert.equal(row.refundsNetBasis, '10')
+})
+
+// ---------------------------------------------------------------------------------------------
+// 2 + 3. Xeroom-era and Xero-id-only orders
+// ---------------------------------------------------------------------------------------------
+
+const INVOICE_ORDERS: Row[] = [
+  // Invoiced by an IMS-posted Xero invoice only: no number, no invoicedAt.
+  salesOrder('xero-only', { accountingInvoiceId: 'xero-1', createdAt: new Date('2026-06-10T12:00:00.000Z'), payments: [], refunds: [], orderNumber: 'SO-1', externalOrderNumber: null, salesRep: null }),
+  // Xeroom-era: number, no invoicedAt, order date in May.
+  salesOrder('xeroom', { invoiceNumber: 'INV-77', createdAt: new Date('2026-05-10T12:00:00.000Z'), payments: [], refunds: [], orderNumber: 'SO-2', externalOrderNumber: null, salesRep: null, totalBase: D(70), totalForeign: D(70) }),
+  // IMS-numbered, with invoicedAt.
+  salesOrder('dated', { invoiceNumber: 'INV-9', invoicedAt: new Date('2026-06-20T12:00:00.000Z'), createdAt: new Date('2026-06-01T12:00:00.000Z'), payments: [], refunds: [], orderNumber: 'SO-3', externalOrderNumber: null, salesRep: null }),
+]
+
+mock.module('@/lib/db', {
+  namedExports: { db: { salesOrder: { findMany: async (args?: { where?: Row }) => INVOICE_ORDERS.filter((o) => matches(o, args?.where)) } } },
+})
+
+test('invoice list: an order with a Xero id but no invoice number or date does not crash and is dated by its order date', async () => {
+  const { getInvoiceStats } = await import('@/app/actions/sales-stats')
+  const rows = await getInvoiceStats()
+  const byOrder = new Map(rows.map((r) => [r.orderId, r]))
+  const xero = byOrder.get('xero-only')!
+  assert.equal(xero.invoiceNumber, 'xero-1', 'the Xero id stands in for the missing number')
+  assert.equal(xero.invoicedAt, '2026-06-10T12:00:00.000Z', 'dated by the order date')
+  assert.equal(byOrder.get('xeroom')!.invoiceNumber, 'INV-77')
+  // Newest first by the report date: dated (20 Jun), xero-only (10 Jun), xeroom (10 May).
+  assert.deepEqual(rows.map((r) => r.orderId), ['dated', 'xero-only', 'xeroom'])
+})
+
+test('invoice list: a Xeroom-era order appears in the period of its order date, and only there', async () => {
+  const { getInvoiceStats } = await import('@/app/actions/sales-stats')
+  const may = await getInvoiceStats('2026-05-01', '2026-05-31')
+  assert.deepEqual(may.map((r) => r.orderId), ['xeroom'])
+  const june = await getInvoiceStats('2026-06-01', '2026-06-30')
+  assert.deepEqual(june.map((r) => r.orderId).sort(), ['dated', 'xero-only'])
+})
+
+test('currency summary places a Xeroom-era order in the period of its order date', async () => {
+  const client = { salesOrder: { findMany: async (args?: { where?: Row }) => INVOICE_ORDERS.filter((o) => matches(o, args?.where)) }, salesOrderLine: none, payment: none, purchaseInvoice: none, fxRate: none } as FinanceAnalyticsClient
+  const deps = { client, now: () => new Date('2026-06-30T00:00:00.000Z'), baseCurrency: async () => 'GBP' }
+  const may = await getCurrencySummaryReport({ dateFrom: '2026-05-01', dateTo: '2026-05-31' }, { deps })
+  assert.equal(Number(may.totals.salesBase), 70)
+  const june = await getCurrencySummaryReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, { deps })
+  assert.equal(Number(june.totals.salesBase), 200)
+})
+
+test('invoicedPeriodDate prefers invoicedAt and falls back to the order date', () => {
+  const created = new Date('2026-01-01T00:00:00.000Z')
+  assert.equal(invoicedPeriodDate({ invoicedAt: null, createdAt: created }), created)
+  const inv = new Date('2026-02-01T00:00:00.000Z')
+  assert.equal(invoicedPeriodDate({ invoicedAt: inv, createdAt: created }), inv)
+})
