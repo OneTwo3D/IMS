@@ -180,22 +180,6 @@ async function fetchSearchRows(orderNumber: string, clientId: number): Promise<R
   return extractMintsoftArrayPayloadStrict(result.data, 'Order/Search (push dedupe)') as RawOrder[]
 }
 
-/** The scoped Order/Search for an order's number: every row ClientId-asserted, merged survivors dropped, then the number/reference match. */
-async function searchExistingByReference(input: Pick<WmsOrderPushInput, 'orderNumber' | 'externalReference'>, clientId: number): Promise<RawOrder[]> {
-  // o3d-bjc.6: assert every returned row echoes our ClientId. Without this, a cross-client order-number collision on the shared tenant
-  // would bind our push link to a FOREIGN order — after which our own update and cancel calls would mutate someone else's order. A row
-  // that cannot be verified (no ClientId) or that is foreign rejects the whole response rather than being quietly filtered out, so a
-  // silently-ignored filter can't look like "no match".
-  return (await fetchSearchRows(input.orderNumber, clientId))
-    .map((row) => assertMintsoftOrderClient(row, clientId, 'Mintsoft Order/Search (push dedupe)'))
-    .filter((row) => {
-      const number = toStr(row.OrderNumber)
-      if (number && number.includes('+')) return false // skip merged survivors
-      const ref = toStr(row.ExternalOrderReference)
-      return number === input.orderNumber || ref === input.externalReference
-    })
-}
-
 /**
  * The existing order a duplicate-number refusal points at. Resolves ONLY when the search page is complete (a full page may have cut the
  * real order off) and exactly one same-client, non-merged row carries BOTH this order's OrderNumber AND its own ExternalOrderReference,
