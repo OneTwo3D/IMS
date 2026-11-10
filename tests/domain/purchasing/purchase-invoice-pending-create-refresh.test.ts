@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  billChangedSinceRead,
+  type BillEditSnapshot,
   PurchaseBillFirstPostingInFlightError,
   refreshPendingPurchaseInvoiceCreate,
   type PendingCreateRefreshTx,
@@ -139,4 +141,32 @@ test('legacy rows that belong to OTHER bills (their document is linked there), s
 test('a bill that has its own create row ignores the legacy ones', async () => {
   const { tx } = fake([unsent], 1, [{ ...legacyRow, id: 'L9', status: 'PROCESSING' }])
   assert.deepEqual(await run(tx), { kind: 'refreshed', syncLogId: 'r1' })
+})
+
+// ---- a bill edited since it was read
+const readBill: BillEditSnapshot = {
+  header: { invoiceNumber: 'SUP-1', invoiceDate: '2026-11-01', dueDate: null, notes: null, supplierInvoiceUrl: null },
+  lines: [{ id: 'b', description: null, qtyBilled: 1, unitCostForeign: 5, totalForeign: 5 }, { id: 'a', description: 'Duty', qtyBilled: 10, unitCostForeign: 12, totalForeign: 120 }],
+  subtotalForeign: 125, taxForeign: 0, totalForeign: 125,
+}
+
+// [mutation: drop any one comparison in billChangedSinceRead]
+test('an unchanged bill is not stale (line order is irrelevant) and every edited field or total makes it stale', () => {
+  assert.equal(billChangedSinceRead(readBill, { ...readBill, lines: [...readBill.lines].reverse() }), false)
+  const changed: Array<[string, BillEditSnapshot]> = [
+    ['invoice number', { ...readBill, header: { ...readBill.header, invoiceNumber: 'SUP-2' } }],
+    ['invoice date', { ...readBill, header: { ...readBill.header, invoiceDate: '2026-11-02' } }],
+    ['due date', { ...readBill, header: { ...readBill.header, dueDate: '2026-12-01' } }],
+    ['notes', { ...readBill, header: { ...readBill.header, notes: 'n' } }],
+    ['supplier invoice url', { ...readBill, header: { ...readBill.header, supplierInvoiceUrl: 'u' } }],
+    ['line description', { ...readBill, lines: [readBill.lines[0]!, { ...readBill.lines[1]!, description: 'Handling' }] }],
+    ['line quantity', { ...readBill, lines: [readBill.lines[0]!, { ...readBill.lines[1]!, qtyBilled: 9 }] }],
+    ['line unit cost', { ...readBill, lines: [readBill.lines[0]!, { ...readBill.lines[1]!, unitCostForeign: 11 }] }],
+    ['line total', { ...readBill, lines: [readBill.lines[0]!, { ...readBill.lines[1]!, totalForeign: 119 }] }],
+    ['a line gone', { ...readBill, lines: [readBill.lines[0]!] }],
+    ['subtotal', { ...readBill, subtotalForeign: 124 }],
+    ['tax', { ...readBill, taxForeign: 1 }],
+    ['total', { ...readBill, totalForeign: 126 }],
+  ]
+  for (const [label, locked] of changed) assert.equal(billChangedSinceRead(readBill, locked), true, label)
 })

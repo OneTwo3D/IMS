@@ -35,6 +35,16 @@ export class PurchaseBillFirstPostingInFlightError extends Error {
   }
 }
 
+export const PURCHASE_BILL_EDITED_MEANWHILE_MESSAGE =
+  'This bill was changed by another edit while you were editing it, so your edit was not saved. Reload the bill and edit it again.'
+
+export class PurchaseBillEditedMeanwhileError extends Error {
+  constructor() {
+    super(PURCHASE_BILL_EDITED_MEANWHILE_MESSAGE)
+    this.name = 'PurchaseBillEditedMeanwhileError'
+  }
+}
+
 export type PendingCreateRefreshOutcome =
   /** The unsent create row now carries the edited bill; the first posting will be the edited version. */
   | { kind: 'refreshed'; syncLogId: string }
@@ -135,4 +145,22 @@ export async function refreshPendingPurchaseInvoiceCreate(params: {
   // A worker claimed it between the read and the swap: it holds the pre-edit payload's attempt, and may be on the wire.
   if (swapped.count !== 1) throw new PurchaseBillFirstPostingInFlightError()
   return { kind: 'refreshed', syncLogId: row.id }
+}
+
+export type BillEditSnapshot = {
+  header: { invoiceNumber: string | null; invoiceDate: string | null; dueDate: string | null; notes: string | null; supplierInvoiceUrl: string | null }
+  lines: ReadonlyArray<{ id: string; description: string | null; qtyBilled: number; unitCostForeign: number; totalForeign: number }>
+  subtotalForeign: number
+  taxForeign: number
+  totalForeign: number
+}
+
+/** True when the bill under the lock is not the bill the edit was calculated from: any edited source field or any total differs. Lines are compared by id. */
+export function billChangedSinceRead(read: BillEditSnapshot, locked: BillEditSnapshot): boolean {
+  const byId = (lines: BillEditSnapshot['lines']) => JSON.stringify([...lines].sort((a, b) => a.id.localeCompare(b.id)))
+  return JSON.stringify(read.header) !== JSON.stringify(locked.header)
+    || byId(read.lines) !== byId(locked.lines)
+    || read.subtotalForeign !== locked.subtotalForeign
+    || read.taxForeign !== locked.taxForeign
+    || read.totalForeign !== locked.totalForeign
 }

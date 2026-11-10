@@ -81,6 +81,9 @@ import {
 } from '@/lib/domain/purchasing/purchase-invoice-edit'
 import { maybeQueuePurchaseInvoiceUpdate, purchaseInvoiceUpdateIsOwed, purchaseInvoiceUpdatePostingKey } from '@/lib/domain/purchasing/purchase-invoice-update-sync'
 import {
+  billChangedSinceRead,
+  type BillEditSnapshot,
+  PurchaseBillEditedMeanwhileError,
   PurchaseBillFirstPostingInFlightError,
   refreshPendingPurchaseInvoiceCreate,
 } from '@/lib/domain/purchasing/purchase-invoice-pending-create-refresh'
@@ -3798,14 +3801,48 @@ export async function updateInvoice(
           paidAt: true,
           // 6oyu.4 (khdw): the pre-edit NET subtotal, to record the transit delta.
           subtotalBase: true,
+          // The bill as it stands under the lock, to refuse an edit made from a copy another edit has since replaced.
+          invoiceNumber: true,
+          invoiceDate: true,
+          dueDate: true,
+          notes: true,
+          supplierInvoiceUrl: true,
+          subtotalForeign: true,
+          totalForeign: true,
+          taxForeign: true,
           // The id the edit's payload was built against, re-read under the lock: a first posting that was written back since the unlocked read
           // makes a payload built without it the wrong kind (a refresh of a create that no longer exists, rather than an update).
           accountingInvoiceId: true,
-          lines: { select: { poLineId: true, qtyBilled: true } },
+          lines: { select: { id: true, poLineId: true, qtyBilled: true, description: true, unitCostForeign: true, totalForeign: true } },
         },
       })
       if (!lockedInvoice) throw new Error('Bill not found')
       assertPurchaseInvoiceEditable(lockedInvoice)
+      // LOST UPDATE: every figure of this edit (totals, tax, the payload, the transit delta) was calculated from the bill as it was READ, before
+      // the lock. Another edit that committed in between has replaced that bill; saving this one over it would silently drop the other. The bill
+      // under the lock must still be the bill that was read.
+      const asSnapshot = (header: BillEditSnapshot['header'], lines: BillEditSnapshot['lines'], bill: { subtotalForeign: unknown; taxForeign: unknown; totalForeign: unknown }): BillEditSnapshot => ({
+        header, lines, subtotalForeign: Number(bill.subtotalForeign), taxForeign: Number(bill.taxForeign), totalForeign: Number(bill.totalForeign),
+      })
+      const readSnapshot = asSnapshot(existingHeader, existingLines, invoice)
+      const lockedSnapshot = asSnapshot(
+        {
+          invoiceNumber: optionalText(lockedInvoice.invoiceNumber),
+          invoiceDate: dateKey(lockedInvoice.invoiceDate),
+          dueDate: dateKey(lockedInvoice.dueDate),
+          notes: optionalText(lockedInvoice.notes),
+          supplierInvoiceUrl: optionalText(lockedInvoice.supplierInvoiceUrl),
+        },
+        lockedInvoice.lines.map((line) => ({
+          id: line.id,
+          description: optionalText(line.description),
+          qtyBilled: Number(line.qtyBilled),
+          unitCostForeign: Number(line.unitCostForeign),
+          totalForeign: Number(line.totalForeign),
+        })),
+        lockedInvoice,
+      )
+      if (billChangedSinceRead(readSnapshot, lockedSnapshot)) throw new PurchaseBillEditedMeanwhileError()
       if ((lockedInvoice.accountingInvoiceId ?? null) !== (invoice.accountingInvoiceId ?? null)) {
         throw new Error('This bill was posted to the accounting system while it was being edited, so the edit was not saved. Reload the bill and edit it again.')
       }
@@ -4068,7 +4105,7 @@ export async function updateInvoice(
       description: `Failed to update bill ${invoiceId}: ${String(e)}`,
       metadata: { invoiceId },
     })
-    if (e instanceof PurchaseInvoiceInputsChangedError || e instanceof PurchaseBillFirstPostingInFlightError) return { success: false, error: e.message }
+    if (e instanceof PurchaseInvoiceInputsChangedError || e instanceof PurchaseBillFirstPostingInFlightError || e instanceof PurchaseBillEditedMeanwhileError) return { success: false, error: e.message }
     return { success: false, error: String(e) }
   }
 }

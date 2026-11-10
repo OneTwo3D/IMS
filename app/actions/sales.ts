@@ -124,6 +124,7 @@ import {
   expectedSalesOrderLineTaxForeign,
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
+import { NO_TAX_TYPE, isNoTaxType } from '@/lib/domain/accounting/sales-document-tax-types'
 import { SalesInvoiceDoesNotReconcileError, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
 import {
   INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
@@ -1402,6 +1403,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
           discountAmount: true,
           totalForeign: true,
           taxForeign: true,
+          productId: true,
           taxRateId: true,
           taxRate: {
             select: {
@@ -1487,7 +1489,11 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
       // Reverse-charge B2B: customer self-accounts, so we swap to the
       // configured reverse-charge accounting tax type (shared helper, same
       // logic as the credit-note path — see resolveSalesLineTaxType).
-      const taxType = resolveSalesLineTaxType({
+      // A FEE the shop charged no tax on is stored as a line with no product, no tax rate and no VAT (the WooCommerce importer's forced no-tax fee).
+      // It is sent on the explicit no-tax code, naming why, as the importer's own invoice sends it: left to the fall-through it takes the order's TAXABLE
+      // default code and the ledger adds VAT to a fee nobody charged VAT on. Derived from the stored line, so a clone carries it with the line.
+      const isNoTaxFee = !l.productId && !l.taxRateId && Number(l.taxForeign ?? 0) === 0
+      const taxType = isNoTaxFee ? NO_TAX_TYPE : resolveSalesLineTaxType({
         baseTaxType: l.taxRate?.accountingTaxType ?? orderDefaultTaxType,
         reverseCharge: l.taxRate?.reverseCharge,
         reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
@@ -1501,7 +1507,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
         taxType,
         // The rate this line's code was read from (never sent), bound whenever the line has one, with the basis the code was derived on (a sales goods line): the enqueue guard checks a retired code is
         // still that rate's code and, for a rate a re-key cleared, that the type sent is the one this same derivation gives now. lib/tax/retired-tax-code-guard.ts.
-        ...rateBinding(l.taxRateId, 'sales_line'),
+        ...(isNoTaxFee ? { noTaxKind: 'fee-no-tax' as const } : rateBinding(l.taxRateId, 'sales_line')),
         discountAmount: discForeign > 0 ? discForeign : undefined,
       }
     }),
@@ -1517,11 +1523,23 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     lineAmountsIncludeTax,
   }
 
+  const sentCodes = [...new Set([...payload.lines.map((l) => l.taxType), payload.shippingTaxType, payload.discountTaxType].filter((c): c is string => typeof c === 'string' && c.trim() !== '' && !isNoTaxType(c)))]
+  const codeRates = sentCodes.length ? await db.taxRate.findMany({ where: { accountingTaxType: { in: sentCodes }, active: true }, select: { accountingTaxType: true, rate: true } }) : []
+  const rateOfSentCode = (code: string | null | undefined): number | null => {
+    if (typeof code !== 'string' || code.trim() === '') return null
+    if (isNoTaxType(code)) return 0
+    const rates = new Set(codeRates.filter((r) => r.accountingTaxType === code).map((r) => Number(r.rate)))
+    return rates.size === 1 ? [...rates][0]! : null
+  }
   // The invoice must book to the order's own total (lib/domain/sales/sales-invoice-reconciliation.ts): refused here rather than queued.
   const reconciliation = invoiceReconciliationProblem({
     lineAmountsIncludeTax,
     headerRate: vatPct,
-    lines: payload.lines.map((l, idx) => ({ quantity: l.quantity, unitAmount: l.unitAmount, discountAmount: l.discountAmount, storedTax: Number(so.lines[idx]?.taxForeign ?? 0) })),
+    // The VAT of an exclusive document is what the ledger computes from the code each part is SENT on, so each code is priced here (a no-tax code is 0;
+    // a code no active rate carries falls back to the line's stored VAT, and shipping / the discount to the header rate).
+    lines: payload.lines.map((l, idx) => ({ quantity: l.quantity, unitAmount: l.unitAmount, discountAmount: l.discountAmount, rate: rateOfSentCode(l.taxType), storedTax: Number(so.lines[idx]?.taxForeign ?? 0) })),
+    shippingRate: rateOfSentCode(payload.shippingTaxType),
+    discountRate: rateOfSentCode(payload.discountTaxType),
     shippingAmount: payload.shippingAmount,
     discountAmount: payload.discountAmount,
   }, Number(so.totalForeign))

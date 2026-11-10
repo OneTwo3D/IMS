@@ -10,9 +10,24 @@
 
 export type ReconcilableInvoice = {
   lineAmountsIncludeTax: boolean
-  /** The header's default rate as a fraction; shipping and the order discount are taxed at it. */
+  /** The header's default rate as a fraction: what shipping and the order discount are taxed at when their own code names no rate. */
   headerRate: number
-  lines: ReadonlyArray<{ quantity: number; unitAmount: number; discountAmount?: number | null; storedTax: number }>
+  lines: ReadonlyArray<{
+    quantity: number
+    unitAmount: number
+    discountAmount?: number | null
+    /**
+     * The rate of the tax code the line will be SENT on (0 for a no-tax code), or null when no rate is known for that code. Tax on an exclusive
+     * document is whatever the ledger computes from the code it is sent, so this, not the VAT IMS stored for the line, is what is reconciled;
+     * `storedTax` stands in only for a code nobody can price.
+     */
+    rate: number | null
+    storedTax: number
+  }>
+  /** The rate of the code shipping is sent on, or null when unknown (the header rate then). */
+  shippingRate?: number | null
+  /** The rate of the code the order discount is sent on, or null when unknown (the header rate then). */
+  discountRate?: number | null
   /** As sent: gross when `lineAmountsIncludeTax`, else net. */
   shippingAmount?: number | null
   discountAmount?: number | null
@@ -21,11 +36,13 @@ export type ReconcilableInvoice = {
 export const RECONCILIATION_TOLERANCE_PER_PART = 0.01
 
 export function expectedLedgerTotal(invoice: ReconcilableInvoice): number {
-  const lines = invoice.lines.reduce((t, l) => t + l.quantity * l.unitAmount - Number(l.discountAmount ?? 0), 0)
-  const shippingAndDiscount = Number(invoice.shippingAmount ?? 0) - Number(invoice.discountAmount ?? 0)
-  if (invoice.lineAmountsIncludeTax) return lines + shippingAndDiscount
-  const lineTax = invoice.lines.reduce((t, l) => t + l.storedTax, 0)
-  return lines + lineTax + shippingAndDiscount * (1 + invoice.headerRate)
+  const shipping = Number(invoice.shippingAmount ?? 0)
+  const discount = Number(invoice.discountAmount ?? 0)
+  const netLines = invoice.lines.map((l) => l.quantity * l.unitAmount - Number(l.discountAmount ?? 0))
+  // Inclusive: every amount already carries its tax, so the document books to the sum of what it sends whatever the codes are.
+  if (invoice.lineAmountsIncludeTax) return netLines.reduce((t, n) => t + n, 0) + shipping - discount
+  const lines = invoice.lines.reduce((t, l, i) => t + netLines[i]! + (l.rate === null ? l.storedTax : netLines[i]! * l.rate), 0)
+  return lines + shipping * (1 + (invoice.shippingRate ?? invoice.headerRate)) - discount * (1 + (invoice.discountRate ?? invoice.headerRate))
 }
 
 /** null when the invoice reconciles to the order total; otherwise the figures, for the refusal. */

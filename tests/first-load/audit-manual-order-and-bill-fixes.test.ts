@@ -165,11 +165,14 @@ test('SO-H2: allocating a DRAFT directly does not promote it (the server action 
 })
 
 // What the ledger would book for a queued sales invoice, from its payload alone (every line, the shipping and the discount at the one 20% rate).
-type FullPayload = { lineAmountsIncludeTax: boolean; lines: Array<{ quantity: number; unitAmount: number; discountAmount?: number }>; shippingAmount?: number; discountAmount?: number }
+type FullPayload = { lineAmountsIncludeTax: boolean; lines: Array<{ quantity: number; unitAmount: number; discountAmount?: number; taxType?: string }>; shippingAmount?: number; discountAmount?: number }
 const ledgerTotal = (p: FullPayload) => {
-  const lines = p.lines.reduce((t, l) => t + l.quantity * l.unitAmount - (l.discountAmount ?? 0), 0)
-  const net = lines + (p.shippingAmount ?? 0) - (p.discountAmount ?? 0)
-  return Math.round((p.lineAmountsIncludeTax ? net : net * 1.2) * 100) / 100
+  // Priced from the code each part is sent on: NONE is 0%, every other code in this file is the 20% one.
+  const net = p.lines.map((l) => l.quantity * l.unitAmount - (l.discountAmount ?? 0))
+  const sum = p.lineAmountsIncludeTax
+    ? net.reduce((t, n) => t + n, 0) + (p.shippingAmount ?? 0) - (p.discountAmount ?? 0)
+    : net.reduce((t, n, i) => t + n * (p.lines[i]!.taxType === 'NONE' ? 1 : 1.2), 0) + ((p.shippingAmount ?? 0) - (p.discountAmount ?? 0)) * 1.2
+  return Math.round(sum * 100) / 100
 }
 
 async function wooSource(pricesIncludeVat: boolean) {
@@ -231,6 +234,67 @@ test('SO-H2: a WooCommerce order whose shipping is ZERO-RATED on a 20% order can
   assert.equal((await s.db.salesOrder.findUniqueOrThrow({ where: { id: cloned.newId! } })).status, 'DRAFT', 'the clone did not move')
   assert.equal((await invoiceRows(cloned.newId!)).length, 0)
   assert.equal(await s.db.orderAllocation.count({ where: { orderId: cloned.newId! } }), 0)
+})
+
+// 100 net at 20% + a 10 fee the shop charged NO tax on (what the importer stores for a forced no-tax fee: no product, no rate, no VAT) = 130.
+async function wooFeeSource(stripMarker: boolean) {
+  const so = await s.db.salesOrder.create({
+    data: {
+      orderNumber: `WOO-FEE-${++seq}`, customerName: 'Woo', currency: 'GBP', fxRateToBase: 1, status: 'PROCESSING', pricesIncludeVat: false,
+      taxRateName: 'AUD Sales 20', taxRatePercent: '0.2',
+      subtotalForeign: '110', shippingForeign: '0', taxForeign: '20', totalForeign: '130', subtotalBase: '110', shippingBase: '0', taxBase: '20', totalBase: '130',
+      shoppingLinks: { create: { connector: 'woocommerce', externalOrderId: `wc-fee-${seq}` } },
+      lines: { create: [
+        { productId, sku: 'AUD-1', description: 'x', qty: 1, unitPriceForeign: '100', unitPriceBase: '100', taxForeign: '20', taxBase: '20', totalForeign: '100', totalBase: '100', taxRateId: vat20Id },
+        { productId: stripMarker ? productId : null, sku: null, description: 'Import Duty', qty: 1, unitPriceForeign: '10', unitPriceBase: '10', taxForeign: '0', taxBase: '0', totalForeign: '10', totalBase: '10', taxRateId: null },
+      ] },
+    } as never,
+    select: { id: true },
+  })
+  return so.id
+}
+
+// [mutation: drop the isNoTaxFee identity in the invoice builder, or price the lines from stored VAT in the reconciliation]
+test('SO-H2: a WooCommerce order with a no-tax fee (100 + 20% + 10 exempt = 130) clones, finalises and posts 130 with the fee on the no-tax code', async () => {
+  const { cloneSalesOrder, updateSalesOrderStatus } = await import('@/app/actions/sales')
+  const cloned = await cloneSalesOrder(await wooFeeSource(false))
+  assert.equal(cloned.success, true, cloned.error)
+  const done = await updateSalesOrderStatus(cloned.newId!, 'PENDING_PAYMENT')
+  assert.equal(done.success, true, done.error)
+  const rows = await invoiceRows(cloned.newId!)
+  assert.equal(rows.length, 1)
+  const p = rows[0]!.payload as FullPayload & { lines: Array<{ taxType?: string; noTaxKind?: string }> }
+  assert.equal(p.lines[0]!.taxType, 'OUTPUT2')
+  assert.equal(p.lines[1]!.taxType, 'NONE')
+  assert.equal(p.lines[1]!.noTaxKind, 'fee-no-tax')
+  assert.equal(ledgerTotal(p), 130)
+  assert.equal(Number((await s.db.salesOrder.findUniqueOrThrow({ where: { id: cloned.newId! } })).totalForeign), 130)
+})
+
+test('SO-H2: the same fee with its no-tax identity stripped (a product on the line) would be sent on the taxable code and is refused, not posted at 132', async () => {
+  const { cloneSalesOrder, updateSalesOrderStatus } = await import('@/app/actions/sales')
+  const cloned = await cloneSalesOrder(await wooFeeSource(true))
+  assert.equal(cloned.success, true, cloned.error)
+  const refused = await updateSalesOrderStatus(cloned.newId!, 'PENDING_PAYMENT')
+  assert.equal(refused.success, false)
+  assert.match(String(refused.error), /would total 132\.00 GBP but the order totals 130\.00 GBP/)
+  assert.equal((await invoiceRows(cloned.newId!)).length, 0)
+})
+
+// [mutation: stop passing the shipping / discount code's rate to the reconciliation (it then falls back to the stored header percent)]
+test('SO-H2: shipping and the order discount are priced from the code they are sent on, not the stored header percent', async () => {
+  const { updateSalesOrderStatus } = await import('@/app/actions/sales')
+  // No stored header percent, but the header names the 20% code: shipping 10 and a discount 5 are sent on it. 100 + 20 VAT + 12 - 6 = 126.
+  const so = await s.db.salesOrder.create({
+    data: {
+      orderNumber: `RATE-${++seq}`, customerName: 'Rate', currency: 'GBP', fxRateToBase: 1, status: 'DRAFT', pricesIncludeVat: false, taxRateName: 'AUD Sales 20', discountAmount: '5',
+      subtotalForeign: '100', shippingForeign: '10', taxForeign: '21', totalForeign: '126', subtotalBase: '100', shippingBase: '10', taxBase: '21', totalBase: '126',
+      lines: { create: [{ productId, sku: 'AUD-1', description: 'x', qty: 1, unitPriceForeign: '100', unitPriceBase: '100', taxForeign: '20', taxBase: '20', totalForeign: '100', totalBase: '100', taxRateId: vat20Id }] },
+    } as never,
+    select: { id: true },
+  })
+  const r = await updateSalesOrderStatus(so.id, 'PENDING_PAYMENT')
+  assert.equal(r.success, true, r.error)
 })
 
 test('SO-H2: the reconciliation also refuses a stored order whose amounts are net but flagged gross, and lets every consistent order through', async () => {
