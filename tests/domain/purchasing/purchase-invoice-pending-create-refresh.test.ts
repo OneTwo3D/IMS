@@ -23,7 +23,7 @@ function fake(rows: Array<Record<string, unknown>>, swapCount = 1, legacy: Array
   } as unknown as PendingCreateRefreshTx
   return { tx, writes }
 }
-const unsent = { id: 'r1', connector: 'xero', status: 'PENDING', externalTransactionId: null, abandonedBeforeRemoteCall: false, settlementBasis: null, remoteAttemptedAt: null, attemptStampingCustodyAt: new Date(), backReferenceEvidenceCompactedAt: null, payload: { _postingMode: 'submitted', _idempotencyKey: 'k1', _connectionProvenance: 'xero:t', lines: [] } }
+const unsent = { id: 'r1', connector: 'xero', status: 'PENDING', externalTransactionId: null, abandonedBeforeRemoteCall: false, settlementBasis: null, remoteAttemptedAt: null, attemptRevision: 0, processingStartedAt: null, createDispatchedAt: null, backReferenceEvidenceCompactedAt: null, payload: { _postingMode: 'submitted', _idempotencyKey: 'k1', _connectionProvenance: 'xero:t', lines: [] } }
 const run = (tx: PendingCreateRefreshTx) => refreshPendingPurchaseInvoiceCreate({ tx, invoiceId: 'inv1', poId: 'po1', currentInvoiceNumber: 'SUP-1', chartConnector: 'xero', accountingPayload: edited })
 
 // [mutation: build the payload without the row's enqueue stamps, or without guarding the swap on the unsent proof]
@@ -37,14 +37,11 @@ test('an unsent create row takes the edited document and keeps its own stamps', 
   assert.equal(payload._connectionProvenance, 'xero:t')
   assert.equal(payload.accountingInvoiceId, undefined)
   assert.equal((payload.lines as Array<{ unitAmount: number }>)[0]!.unitAmount, 10)
-  assert.deepEqual(writes[0]!.where.status, { in: ['PENDING', 'FAILED'] })
+  assert.equal(writes[0]!.where.status, 'PENDING')
+  assert.equal(writes[0]!.where.attemptRevision, 0)
+  assert.equal(writes[0]!.where.processingStartedAt, null)
   assert.equal(writes[0]!.where.remoteAttemptedAt, null)
-})
-
-test('a create row that FAILED before any request was made is refreshed too (a retry would otherwise post the old bill)', async () => {
-  const { tx, writes } = fake([{ ...unsent, status: 'FAILED' }])
-  assert.deepEqual(await run(tx), { kind: 'refreshed', syncLogId: 'r1' })
-  assert.equal(writes.length, 1)
+  assert.equal(writes[0]!.where.createDispatchedAt, null)
 })
 
 test('no create row: nothing is owed and nothing is written', async () => {
@@ -70,8 +67,14 @@ test('a row that may have left IMS refuses the edit and is not written', async (
   const cases: Array<[string, Record<string, unknown>[]]> = [
     ['claimed', [{ ...unsent, status: 'PROCESSING' }]],
     ['posted', [{ ...unsent, status: 'SYNCED', externalTransactionId: 'X1' }]],
-    ['attempted', [{ ...unsent, status: 'FAILED', remoteAttemptedAt: new Date() }]],
-    ['no custody proof', [{ ...unsent, attemptStampingCustodyAt: null }]],
+    ['failed (a failure can follow a request that left; the bill create path records no attempt)', [{ ...unsent, status: 'FAILED' }]],
+    ['failed after a recorded attempt', [{ ...unsent, status: 'FAILED', remoteAttemptedAt: new Date() }]],
+    ['queued but claimed once and released for a retry', [{ ...unsent, attemptRevision: 1 }]],
+    ['queued with a retry gate / claim time', [{ ...unsent, processingStartedAt: new Date() }]],
+    ['queued with a recorded attempt', [{ ...unsent, remoteAttemptedAt: new Date() }]],
+    ['queued but carrying an operator\'s word', [{ ...unsent, settlementBasis: 'OPERATOR_ASSERTION' }]],
+    ['queued but naming a document', [{ ...unsent, externalTransactionId: 'X7' }]],
+    ['queued with a recorded create dispatch', [{ ...unsent, createDispatchedAt: new Date() }]],
     ['two rows', [unsent, { ...unsent, id: 'r2' }]],
   ]
   for (const [label, rows] of cases) {

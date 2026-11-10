@@ -1,5 +1,5 @@
 import { LEDGER_STANDING_SELECT, ledgerStanding, namesADocument } from '@/lib/domain/accounting/ledger-standing'
-import { ATTEMPT_PROVEN_NEVER_MADE_WHERE, attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
+import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
 import type { Prisma } from '@/app/generated/prisma/client'
 import type { PurchaseInvoiceAccountingPayload } from '@/lib/domain/purchasing/purchase-invoice-edit'
 
@@ -12,8 +12,8 @@ import type { PurchaseInvoiceAccountingPayload } from '@/lib/domain/purchasing/p
  * disagreed for good (AP, VAT and the transit clearing leg all wrong, and a later payment settling a bill the ledger holds
  * at a different total).
  *
- * The first posting is therefore made to carry the edit. While the create row has not left IMS (queued, or failed before
- * any request was made) its payload is replaced with the edited bill's, in the same transaction as the edit, and the
+ * The first posting is therefore made to carry the edit. While the create row has not left IMS (queued and never claimed; a failure is never
+ * proof of that, because the bill's create path does not record an attempt) its payload is replaced with the edited bill's, in the same transaction as the edit, and the
  * single posting that goes out is the latest version: one document, no update, nothing posted twice. The processor reads a
  * row's payload AFTER it claims it (lib/domain/accounting/claimed-sync-payload.ts), and this write is a compare-and-swap on
  * the row still being unsent, so a worker either has not claimed the row (and posts the new payload) or has (and the swap
@@ -63,8 +63,10 @@ const CREATE_ROW_SELECT = {
   ...LEDGER_STANDING_SELECT,
   id: true,
   connector: true,
+  attemptRevision: true,
+  processingStartedAt: true,
   remoteAttemptedAt: true,
-  attemptStampingCustodyAt: true,
+  createDispatchedAt: true,
   backReferenceEvidenceCompactedAt: true,
   payload: true,
 } as const
@@ -121,24 +123,31 @@ export async function refreshPendingPurchaseInvoiceCreate(params: {
     if (!attributable) throw new PurchaseBillFirstPostingInFlightError()
     row = candidates[0]!
   }
-  // Refreshable only while the row is queued (or failed) and PROVEN never to have made a request: a claim, an attempt, a posted-but-unlinked
-  // document or a row nobody can vouch for are all "may have left".
-  // The standing is read with the proof of "never sent" the row itself carries: queued work is LIVE_WORK, and a failure is PROVEN_NOT_POSTED only
-  // when no request ever left. Anything else (a document id, an operator's word, a basis this build does not write, a claim) is not refreshable.
-  const standing = ledgerStanding(row, { couldHaveReachedLedger: !attemptProvenNeverMade(row) })
-  const unsent = (row.status === 'PENDING' || row.status === 'FAILED')
-    && (standing === 'LIVE_WORK' || standing === 'PROVEN_NOT_POSTED')
-    && attemptProvenNeverMade(row)
+  // REFRESHABLE ONLY WHILE THE ROW IS QUEUED AND HAS NEVER BEEN TOUCHED: PENDING, and no worker has ever claimed it (a claim mints an attempt revision above
+  // zero and stamps a processing time), no request was ever recorded or dispatched, and it names no document. The bill's create path never stamps a
+  // remote attempt, so a FAILED row cannot be proven unsent (a failure can follow a request that left); FAILED, and anything claimed, is refused and the
+  // operator retries or resolves the posting first. This is deliberately not the payment attempt predicate: it asks for the absence of every trace.
+  const standing = ledgerStanding(row)
+  const untouched = row.status === 'PENDING'
+    && standing === 'LIVE_WORK'
+    && row.attemptRevision === UNCLAIMED_ATTEMPT_REVISION
+    && row.processingStartedAt === null
+    && row.remoteAttemptedAt === null
+    && row.createDispatchedAt === null
     && row.backReferenceEvidenceCompactedAt === null
     && row.connector === params.chartConnector
-  if (!unsent) throw new PurchaseBillFirstPostingInFlightError()
+  if (!untouched) throw new PurchaseBillFirstPostingInFlightError()
 
   const payload = { ...params.accountingPayload, accountingInvoiceId: undefined, ...enqueueStamps(row.payload) }
+  // The swap names every fact the read relied on, so a claim that lands between the read and here matches nothing.
   const swapped = await params.tx.accountingSyncLog.updateMany({
     where: {
       id: row.id,
-      status: { in: ['PENDING', 'FAILED'] },
-      ...ATTEMPT_PROVEN_NEVER_MADE_WHERE,
+      status: 'PENDING',
+      attemptRevision: UNCLAIMED_ATTEMPT_REVISION,
+      processingStartedAt: null,
+      remoteAttemptedAt: null,
+      createDispatchedAt: null,
     },
     data: { payload: payload as never },
   })

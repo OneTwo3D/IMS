@@ -478,7 +478,9 @@ test('PO-H3: once the first posting may have left (claimed, attempted, or posted
   const { updateInvoice } = await import('@/app/actions/purchase-orders')
   for (const [label, patch] of [
     ['claimed', { status: 'PROCESSING' }],
+    ['failed (never provable unsent)', { status: 'FAILED' }],
     ['attempted then failed', { status: 'FAILED', remoteAttemptedAt: new Date() }],
+    ['claimed once and released', { attemptRevision: 1 }],
     ['posted but not linked back', { status: 'SYNCED', externalTransactionId: 'XERO-BILL-ORPHAN' }],
   ] as const) {
     const { invoice } = await seedBill()
