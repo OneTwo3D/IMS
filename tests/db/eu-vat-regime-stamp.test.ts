@@ -185,3 +185,69 @@ test("adopt mode stamps the plugin's decision with its conversion record in the 
     await db.salesOrder.deleteMany({ where: { id: { in: [adopted, bare] } } })
   }
 })
+
+test('a stale read cannot overwrite: if the order is stamped between the read and the write, the write matches nothing and the stamp stands', { skip }, async () => {
+  const { db, stampEuVatRegime } = await setup()
+  const id = await seedOrder(db)
+  try {
+    const first = await db.$transaction((tx) => stampEuVatRegime(tx, id, () => input('100.00'), NOW))
+    assert.equal(first.kind, 'stamped')
+    // A transaction whose first read of the order still sees it unstamped (a stale read), as it would if another builder committed in between.
+    const later = await db.$transaction(async (tx) => {
+      let served = false
+      const stale = new Proxy(tx, {
+        get(target, prop, receiver) {
+          if (prop !== 'salesOrder') return Reflect.get(target, prop, receiver)
+          return new Proxy(target.salesOrder, {
+            get(model, method, r) {
+              if (method === 'findUnique') {
+                return async (args: unknown) => {
+                  if (served) return (model.findUnique as (a: unknown) => Promise<unknown>)(args)
+                  served = true
+                  return { euVatRegime: null, euVatLineAccount: null, euVatRegimeStampedAt: null }
+                }
+              }
+              return Reflect.get(model, method, r)
+            },
+          })
+        },
+      }) as typeof tx
+      return stampEuVatRegime(stale, id, () => input('200.00'), new Date('2026-11-09T00:00:00.000Z'))
+    })
+    assert.equal(later.kind, 'already_stamped')
+    assert.deepEqual(later.kind === 'already_stamped' && later.stamp, { regime: 'IOSS', vatAccount: '821', stampedAt: NOW })
+    const row = await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { euVatRegime: true, euVatRegimeStampedAt: true } })
+    assert.deepEqual([row.euVatRegime, row.euVatRegimeStampedAt], ['IOSS', NOW])
+  } finally {
+    await db.salesOrder.delete({ where: { id } })
+  }
+})
+
+test('the stamp waits for the order row lock: it does not decide while another transaction holds the order', { skip }, async () => {
+  const { db, stampEuVatRegime } = await setup()
+  const id = await seedOrder(db)
+  try {
+    let release!: () => void
+    const held = new Promise<void>((resolve) => { release = resolve })
+    let locked!: () => void
+    const lockTaken = new Promise<void>((resolve) => { locked = resolve })
+    const holder = db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "sales_orders" WHERE id = ${id} FOR UPDATE`
+      locked()
+      await held
+    })
+    await lockTaken
+    let gathered = false
+    let done = false
+    const stamping = db.$transaction((tx) => stampEuVatRegime(tx, id, () => { gathered = true; return input('100.00') }, NOW)).then((r) => { done = true; return r })
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    assert.equal(done, false)
+    assert.equal(gathered, false)
+    release()
+    await holder
+    const outcome = await stamping
+    assert.equal(outcome.kind, 'stamped')
+  } finally {
+    await db.salesOrder.delete({ where: { id } })
+  }
+})

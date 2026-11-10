@@ -469,3 +469,32 @@ test("adopt: the plugin's FX record - incomplete or conflicting refuses; none at
   // decide mode ignores an incomplete or conflicting record
   assert.equal(resolveEuVatRegime(order({ pluginFx: { state: 'incomplete', detail: 'x' }, pluginFxConflict: true })).kind, 'SCHEME')
 })
+
+// ---- each half of the tax reconciliation, alone (found by the mutation pass) -------------------------------------------------------------------------------------------
+test('tax reconciliation: money on a non-scheme rate refuses even when the order tax equals the scheme total', () => {
+  const rates: RateFact[] = [{ wooRateId: 216, tax: '19.00', mapping: schemeRate('DE') }, { wooRateId: 300, tax: '6.00', mapping: plainRate('US', '0.0600') }]
+  assert.equal(refused(resolveEuVatRegime(order({ rates, orderTax: '19.00' }))).code, 'tax_not_explained_by_scheme_rates')
+  // and the same for a UK-territory rate on its own territory beside a scheme rate (a GB order cannot carry a scheme rate, so use the IM/GB pair on a DE order: domestic_rate_abroad wins)
+  const ukRates: RateFact[] = [{ wooRateId: 216, tax: '19.00', mapping: schemeRate('DE') }, { wooRateId: 112, tax: '0.00', mapping: plainRate('GB') }]
+  assert.equal(resolveEuVatRegime(order({ rates: ukRates })).kind, 'SCHEME')
+})
+
+test('tax reconciliation: an order tax above the scheme total by more than 0.02 refuses on its own; 0.02 is rounding', () => {
+  assert.equal(refused(resolveEuVatRegime(order({ orderTax: '19.50' }))).code, 'tax_not_explained_by_scheme_rates')
+  assert.equal(refused(resolveEuVatRegime(order({ orderTax: '18.50' }))).code, 'tax_not_explained_by_scheme_rates')
+  assert.equal(resolveEuVatRegime(order({ orderTax: '19.02' })).kind, 'SCHEME')
+  assert.equal(resolveEuVatRegime(order({ orderTax: '18.98' })).kind, 'SCHEME')
+})
+
+test('tax to a covered destination with no scheme rate refuses from 0.01 up, not only for large amounts', () => {
+  for (const tax of ['0.01', '1.00', '-1.00']) assert.equal(refused(resolveEuVatRegime(order({ rates: [], orderTax: tax }))).code, 'tax_without_scheme_rate', tax)
+  assert.equal(resolveEuVatRegime(order({ rates: [], orderTax: '0.004', vatExempt: 'no' })).kind, 'SKIP')
+})
+
+test('the WooCommerce rate ids in the basis are sorted as numbers', () => {
+  const d = scheme(resolveEuVatRegime(order({
+    shippingCountry: 'PT', billingCountry: 'PT', orderTax: '13.00',
+    rates: [{ wooRateId: 100, tax: '3.00', mapping: schemeRate('PT', { imsRateId: 'pt-b' }) }, { wooRateId: 9, tax: '10.00', mapping: schemeRate('PT', { imsRateId: 'pt-a' }) }],
+  })))
+  assert.deepEqual(d.basis.wooRateIds, [9, 100])
+})
