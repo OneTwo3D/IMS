@@ -129,6 +129,8 @@ export type AllocationServiceClient = Prisma.TransactionClient | typeof db
 
 export type AllocateSalesOrderInput = {
   orderId: string
+  /** The client passed is the caller's open transaction: run the allocation in it (no nested transaction). */
+  runInCallerTransaction?: boolean
   refuseIfShipmentsExist?: boolean
   /**
    * o3d-4kfh r5 (Codex finding 4): the NARROWER refusal — decline only when a COMMITTED
@@ -4207,9 +4209,12 @@ export async function allocateSalesOrder(
     }
   }
 
-  const allocationResult = canRunTransaction(client)
+  // `runInCallerTransaction`: the client IS the caller's open interactive transaction. An interactive transaction client still exposes `$transaction` (Prisma nests it
+  // as a savepoint on a stack shared by the whole client), and nesting there left the stack holding the finished transaction, so the NEXT transaction on the client
+  // tried to start inside a committed one. The allocation joins the caller's transaction instead: no nesting, one commit.
+  const allocationResult = canRunTransaction(client) && !input.runInCallerTransaction
     ? await client.$transaction(runAllocation, ALLOCATION_TX_OPTIONS)
-    : await runAllocation(client)
+    : await runAllocation(client as Prisma.TransactionClient)
 
   // o3d-6ab: the under-lock status no longer satisfied requireStatusUnderLock. Nothing was written and
   // the transaction is a no-op, so this is neither a success nor a failure — `error` stays undefined so

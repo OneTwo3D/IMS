@@ -35,3 +35,19 @@ export function inclusivePricesWithoutOrderRate(input: {
   const orderRate = Number(input.orderRate ?? 0)
   return input.pricesIncludeVat && !(orderRate > 0) && input.anyLineCarriesVat
 }
+
+/**
+ * WHAT BASIS ARE THIS ORDER'S STORED AMOUNTS IN? One answer, for the invoice builder, the reconciliation, the clone and every reader of the flag.
+ *
+ *  manual order, prices incl. VAT   unit prices and discounts GROSS (shipping is stored net and grossed up when sent)     -> amounts include VAT
+ *  manual order, prices excl. VAT   everything NET                                                                       -> net
+ *  CSV import                       goes through the manual creator: one of the two above
+ *  WooCommerce order                unit prices, shipping and discounts are NET whatever the store displays (order-import.ts): its
+ *                                   `pricesIncludeVat` is the storefront's display setting, not the basis of the stored amounts          -> net
+ *
+ * `pricesIncludeVat` alone is therefore not the basis. A WooCommerce-linked order is always net; any other order follows its flag.
+ */
+export function storedAmountsIncludeVat(order: { pricesIncludeVat: boolean | null | undefined; shoppingLinks?: ReadonlyArray<{ connector: string }> | null }): boolean {
+  if (order.shoppingLinks?.some((link) => link.connector === 'woocommerce')) return false
+  return !!order.pricesIncludeVat
+}

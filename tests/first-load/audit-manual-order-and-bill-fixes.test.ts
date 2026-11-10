@@ -399,6 +399,86 @@ test('SO-H2: shipping or an order discount whose account is not mapped would be 
   }
 })
 
+// [mutation: read the display flag again instead of storedAmountsIncludeVat in the invoice builder]
+test('SO-H2: an INCLUSIVE WooCommerce draft (stored net 100 + 20 VAT, display flag true) finalises through invoice enqueue as a 120 invoice, not a 100 one', async () => {
+  const { updateSalesOrderStatus } = await import('@/app/actions/sales')
+  // A storefront order allocates only from storefront-synced warehouses.
+  const syncedWh = await s.db.warehouse.create({ data: { code: `AUD-WS-${seq}-${Date.now()}`, name: 'AUD storefront wh', type: 'STANDARD', availableForSale: true, syncToStore: true }, select: { id: true } })
+  await s.db.stockLevel.create({ data: { productId, warehouseId: syncedWh.id, quantity: '50', reservedQty: '0' } })
+  const so = await s.db.salesOrder.create({
+    data: {
+      orderNumber: `WOO-INC-${++seq}`, customerName: 'Woo', currency: 'GBP', fxRateToBase: 1, status: 'DRAFT', pricesIncludeVat: true, taxRateName: 'AUD Sales 20', taxRatePercent: '0.2',
+      subtotalForeign: '100', taxForeign: '20', totalForeign: '120', subtotalBase: '100', taxBase: '20', totalBase: '120',
+      shoppingLinks: { create: { connector: 'woocommerce', externalOrderId: `wc-inc-${seq}` } },
+      lines: { create: [{ productId, sku: 'AUD-1', description: 'x', qty: 1, unitPriceForeign: '100', unitPriceBase: '100', taxForeign: '20', taxBase: '20', totalForeign: '100', totalBase: '100', taxRateId: vat20Id }] },
+    } as never,
+    select: { id: true },
+  })
+  const r = await updateSalesOrderStatus(so.id, 'PENDING_PAYMENT')
+  assert.equal(r.success, true, r.error)
+  const rows = await invoiceRows(so.id)
+  assert.equal(rows.length, 1)
+  const p = rows[0]!.payload as FullPayload
+  assert.equal(p.lineAmountsIncludeTax, false, 'net amounts are sent as net')
+  assert.equal(p.lines[0]!.unitAmount, 100)
+  assert.equal(ledgerTotal(p), 120)
+})
+
+// [mutation: queue the invoice after the commit again (swallowing a failure), or allocate outside the finalisation transaction]
+test('SO-H2: draft finalisation is ONE transaction: a failed invoice enqueue leaves the draft a draft, with no reservation and no invoice row; live creation likewise saves nothing', async () => {
+  const { createSalesOrder, updateSalesOrderStatus } = await import('@/app/actions/sales')
+  const draft = await createSalesOrder(orderInput({ isDraft: true, pricesIncludeVat: false, lines: [line(100)], taxRateName: 'AUD Sales 20', taxRateValue: 0.2 }) as never)
+  assert.equal(draft.success, true, draft.error)
+  const reserved = async () => Number((await s.db.stockLevel.findFirstOrThrow({ where: { productId, warehouseId }, select: { reservedQty: true } })).reservedQty)
+  const reservedBefore = await reserved()
+  await s.sql(`create or replace function aud_block_sync() returns trigger language plpgsql as $$ begin raise exception 'forced enqueue failure'; end $$`)
+  await s.sql('create trigger aud_block_sync before insert on accounting_sync_logs for each row execute function aud_block_sync()')
+  try {
+    const failed = await updateSalesOrderStatus(draft.order!.id, 'PENDING_PAYMENT')
+    assert.equal(failed.success, false)
+    assert.equal((await s.db.salesOrder.findUniqueOrThrow({ where: { id: draft.order!.id } })).status, 'DRAFT', 'the status did not move')
+    assert.equal(await s.db.orderAllocation.count({ where: { orderId: draft.order!.id } }), 0, 'nothing is allocated')
+    assert.equal(await reserved(), reservedBefore, 'no stock is reserved')
+    assert.equal((await invoiceRows(draft.order!.id)).length, 0)
+    const orders = await s.db.salesOrder.count()
+    const live = await createSalesOrder(orderInput({ pricesIncludeVat: false, lines: [line(100)], taxRateName: 'AUD Sales 20', taxRateValue: 0.2 }) as never)
+    assert.equal(live.success, false)
+    assert.equal(await s.db.salesOrder.count(), orders, 'the live order was not saved')
+  } finally {
+    await s.sql('drop trigger if exists aud_block_sync on accounting_sync_logs')
+  }
+  const ok = await updateSalesOrderStatus(draft.order!.id, 'PENDING_PAYMENT')
+  assert.equal(ok.success, true, ok.error)
+  assert.equal((await invoiceRows(draft.order!.id)).length, 1)
+  assert.ok(await reserved() > reservedBefore, 'finalised: stock is reserved')
+})
+
+// [mutation: ignore a refused enqueue inside the finalisation transaction (postingIsOwed)]
+test('SO-H2: an enqueue the accounting queue REFUSES (a retired tax code) rolls the finalisation back: the draft stays a draft with nothing allocated', async () => {
+  const { updateSalesOrderStatus } = await import('@/app/actions/sales')
+  const retiring = await s.db.taxRate.create({ data: { name: `AUD Retiring ${++seq}`, rate: '0.2', usedFor: 'SALES', accountingTaxType: 'RETIREDOUT', active: true }, select: { id: true } })
+  const so = await s.db.salesOrder.create({
+    data: {
+      orderNumber: `RET-${seq}`, customerName: 'Ret', currency: 'GBP', fxRateToBase: 1, status: 'DRAFT', pricesIncludeVat: false, taxRateName: 'AUD Retiring ' + seq, taxRatePercent: '0.2',
+      subtotalForeign: '100', taxForeign: '20', totalForeign: '120', subtotalBase: '100', taxBase: '20', totalBase: '120',
+      lines: { create: [{ productId, sku: 'AUD-1', description: 'x', qty: 1, unitPriceForeign: '100', unitPriceBase: '100', taxForeign: '20', taxBase: '20', totalForeign: '100', totalBase: '100', taxRateId: retiring.id }] },
+    } as never,
+    select: { id: true },
+  })
+  const retired = JSON.stringify({ RETIREDOUT: { rateId: retiring.id, newCode: 'OUTPUT3', at: new Date().toISOString() } })
+  await s.db.taxRate.update({ where: { id: retiring.id }, data: { active: false } })
+  await s.db.setting.upsert({ where: { key: 'tax_rekey_retired_codes' }, create: { key: 'tax_rekey_retired_codes', value: retired }, update: { value: retired } })
+  try {
+    const r = await updateSalesOrderStatus(so.id, 'PENDING_PAYMENT')
+    assert.equal(r.success, false, 'a refused enqueue refuses the finalisation')
+    assert.equal((await s.db.salesOrder.findUniqueOrThrow({ where: { id: so.id } })).status, 'DRAFT')
+    assert.equal(await s.db.orderAllocation.count({ where: { orderId: so.id } }), 0)
+    assert.equal((await invoiceRows(so.id)).length, 0)
+  } finally {
+    await s.db.setting.deleteMany({ where: { key: 'tax_rekey_retired_codes' } })
+  }
+})
+
 test('SO-H2: the reconciliation also refuses a stored order whose amounts are net but flagged gross, and lets every consistent order through', async () => {
   const { updateSalesOrderStatus } = await import('@/app/actions/sales')
   const mk = (flag: boolean, unit: string, total: string) => s.db.salesOrder.create({

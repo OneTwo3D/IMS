@@ -125,11 +125,13 @@ import {
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
 import { NO_TAX_TYPE, connectorEmitsDiscount, connectorEmitsShipping, droppedExtraMapping, isNoTaxType } from '@/lib/domain/accounting/sales-document-tax-types'
-import { SalesInvoiceDoesNotReconcileError, SalesInvoiceExtraNotMappedError, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
+import { describeAllocationAttempt } from '@/lib/domain/sales/allocation-activity'
+import { SalesInvoiceDoesNotReconcileError, SalesInvoiceExtraNotMappedError, SalesInvoiceNotQueuedError, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
 import {
   INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
   STORED_INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
   inclusivePricesWithoutOrderRate,
+  storedAmountsIncludeVat,
 } from '@/lib/domain/sales/sales-order-vat-basis'
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import { decideChargebackOrderDiscount, resolvePostedOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
@@ -157,6 +159,7 @@ import { isPaymentStatusMismatch } from '@/lib/domain/sales/o2c-guards'
 import { CustomerAnonymisedError, lockCustomerForOrderLink } from '@/lib/domain/erasure/customer-link'
 import { paymentNotesForOrder } from '@/lib/domain/erasure/order-state'
 import {
+  allocateSalesOrder,
   cancelSalesOrderFulfillmentState,
   lockSalesOrder,
   releaseOrderAllocationsInTx,
@@ -1259,15 +1262,12 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
         },
         select: SO_SELECT,
       }).then(async (written) => {
-        // A LIVE order is invoiced the moment it is created, and nothing downstream can repair an invoice that does not book to the order. So the invoice
-        // that will be queued is built from the rows just written, INSIDE this transaction, and reconciled to the order's total before anything is
-        // committed or allocated: a mismatch throws, the order is rolled back and nothing is saved. (A draft is checked when it is finalised.)
+        // A LIVE order is invoiced the moment it is created, and nothing downstream can repair an order that is live with no invoice. So the invoice is built from the
+        // rows just written and QUEUED INSIDE this transaction: it is reconciled to the order's total, and a mismatch, an unmapped account or a refused enqueue throws,
+        // the order is rolled back and nothing is saved. (A draft is invoiced when it is finalised, in the same way.)
         if (!input.isDraft) {
-          try {
-            await queueSalesInvoiceForOrder(written.id, { checkOnly: true, client: tx as unknown as typeof db })
-          } catch (checkError) {
-            if (checkError instanceof SalesInvoiceDoesNotReconcileError) throw checkError
-          }
+          await lockSalesOrder(tx, written.id)
+          await queueSalesInvoiceForOrder(written.id, { client: tx as unknown as typeof db, enqueueInTx: true })
         }
         return written
       })
@@ -1303,28 +1303,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
       }
     }
 
-    // Queue accounting sales invoice (DRAFT — manual orders have no payment yet).
-    // Skipped entirely for DRAFT orders — drafts are not posted to accounting
-    // until they are finalised via updateSalesOrderStatus.
-    if (!input.isDraft) {
-      try {
-        await queueSalesInvoiceForOrder(so.id)
-      } catch (accountingError) {
-        postCommitWarnings.push('the accounting sales invoice was NOT queued')
-        await logActivity({
-          entityType: 'SALES_ORDER',
-          entityId: so.id,
-          action: 'sales_invoice_accounting_queue_failed',
-          tag: 'accounting',
-          level: 'WARNING',
-          description: `Failed to queue sales invoice for order ${getSalesOrderReference(so)} after creation`,
-          metadata: {
-            orderNumber: getSalesOrderReference(so),
-            errorName: accountingError instanceof Error ? accountingError.name : typeof accountingError,
-          },
-        })
-      }
-    }
+    // (The accounting sales invoice of a live order was queued inside the creating transaction above; a draft is invoiced when it is finalised.)
 
     // Aggregated warning when any line fell back to the order default.
     const fallbackLines = lineResolved
@@ -1360,7 +1339,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
     return postCommitWarnings.length > 0 ? { success: true, order: mapped, postCommitWarnings } : { success: true, order: mapped }
   } catch (e) {
     if (e instanceof CustomerAnonymisedError) return { success: false, error: e.message }
-    if (e instanceof SalesInvoiceDoesNotReconcileError) return { success: false, error: e.message }
+    if (e instanceof SalesInvoiceDoesNotReconcileError || e instanceof SalesInvoiceNotQueuedError) return { success: false, error: e.message }
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: null,
@@ -1383,7 +1362,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
  * invoice id, IMS cannot mutate that accounting document through this create
  * queue; attempts are logged so post-push changes are not silently dropped.
  */
-async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boolean; client?: typeof db }): Promise<void> {
+async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boolean; client?: typeof db; enqueueInTx?: boolean }): Promise<void> {
   // `client` is the creating transaction when the order is not committed yet (the pre-commit reconciliation of a live order).
   const reader = options?.client ?? db
   const so = await reader.salesOrder.findUnique({
@@ -1401,6 +1380,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
       taxRateName: true,
       taxRatePercent: true,
       pricesIncludeVat: true,
+      shoppingLinks: { select: { connector: true } },
       discountAmount: true,
       totalForeign: true,
       accountingInvoiceId: true,
@@ -1464,7 +1444,8 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
 
   const vatPct = Number(so.taxRatePercent ?? 0)
   // (An order whose gross prices have no header rate never gets here: createSalesOrder refuses it and updateSalesOrderStatus refuses to finalise a stored one.)
-  const lineAmountsIncludeTax = !!so.pricesIncludeVat && vatPct > 0
+  // The basis of the stored amounts, not the display flag (see storedAmountsIncludeVat): a WooCommerce order is net whatever the store shows.
+  const lineAmountsIncludeTax = storedAmountsIncludeVat(so) && vatPct > 0
 
   // Shipping is stored NET on the SalesOrder. Reconstruct gross when
   // sending inclusive so Xero calculates the correct tax.
@@ -1567,6 +1548,25 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   if (reconciliation) throw new SalesInvoiceDoesNotReconcileError(reconciliation, so.currency)
   if (options?.checkOnly) return
 
+  if (options?.enqueueInTx) {
+    // The invoice is queued INSIDE the caller's transaction (live creation, draft finalisation): it commits with the order and the status, or none of them does.
+    // The caller holds the order row lock (this enqueue asserts it) and a first invoice is the only thing queued this way.
+    if (!options.client) throw new Error('queueSalesInvoiceForOrder: enqueueInTx needs the transaction')
+    if (so.accountingInvoiceId) throw new Error('queueSalesInvoiceForOrder: an order that already has an accounting invoice is updated, not created, in a transaction')
+    const outcome = await queueAccountingSyncTxWithOutcome(options.client as unknown as Prisma.TransactionClient, {
+      type: 'SALES_INVOICE',
+      referenceType: 'SalesOrder',
+      referenceId: so.id,
+      payload,
+      idempotencyKey: accountingPayloadKey(`sales-invoice:${so.id}`, payload),
+      chartConnector: settings.connector,
+    })
+    // A refusal (the chart was retired, the connector moved, ...) rolls the whole transaction back; a shadow recorded by the producer-side hold, and a
+    // type that is not configured to post, owe the ledger nothing and are not refusals.
+    if (postingIsOwed(outcome)) throw new SalesInvoiceNotQueuedError(outcome.reason ?? 'refused')
+    return
+  }
+
   if (so.accountingInvoiceId) {
     const updatePayload = {
       ...payload,
@@ -1642,6 +1642,14 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   }
 }
 
+/** The stock allocation inside a draft finalisation did not succeed: thrown to roll the whole finalisation back. */
+class DraftFinalisationAllocationError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'DraftFinalisationAllocationError'
+  }
+}
+
 export async function updateSalesOrderStatus(
   id: string,
   targetStatus: SoStatus,
@@ -1683,8 +1691,10 @@ export async function applySalesOrderStatusTransition(
     // the Server Action boundary. (o3d-e1yb)
     const bypassPermission = options?.internalBypassToken === INTERNAL_STATUS_TRANSITION_BYPASS
     const authOnly = options?.internalBypassToken === INTERNAL_STATUS_TRANSITION_AUTH_ONLY
+    let actingUserId: string | null = null
     if (!bypassPermission && !authOnly) {
-      await requirePermission('sales.process')
+      const session = await requirePermission('sales.process')
+      actingUserId = session.user.id ?? null
     }
     const so = await db.salesOrder.findUnique({
       where: { id },
@@ -1704,7 +1714,7 @@ export async function applySalesOrderStatusTransition(
         withdrawalApprovedAt: true,
         // b8i6.1: detect a shopping order via ANY connector (not just WooCommerce)
         // so an order linked to any registered storefront also gets its IMS status pushed back.
-        shoppingLinks: { select: { id: true }, take: 1 },
+        shoppingLinks: { select: { id: true, connector: true }, take: 1 },
         // The VAT basis a draft's invoice will be built from (see lib/domain/sales/sales-order-vat-basis.ts).
         pricesIncludeVat: true,
         taxRatePercent: true,
@@ -1763,7 +1773,7 @@ export async function applySalesOrderStatusTransition(
     // A draft whose stored amounts could only reach the ledger with its VAT added twice is not finalised: the invoice is queued at
     // finalisation, and a finalised order cannot be finalised again, so refusing here (before anything moves) is the only clean place.
     if (isDraftFinalization && inclusivePricesWithoutOrderRate({
-      pricesIncludeVat: !!so.pricesIncludeVat,
+      pricesIncludeVat: storedAmountsIncludeVat(so),
       orderRate: Number(so.taxRatePercent ?? 0),
       anyLineCarriesVat: so.lines.some((l) => Number(l.taxForeign ?? 0) > 0),
     })) {
@@ -1877,11 +1887,16 @@ export async function applySalesOrderStatusTransition(
 
     const pushStatusToShopping = ownsStorefrontStatus && so.shoppingLinks.length > 0
     let storefrontCompletionKey: string | null = null
+    // What the draft finalisation's allocation answered (kept out of the transaction callback so a retried callback cannot inherit an aborted attempt's).
+    let finalisationAllocation: Awaited<ReturnType<typeof allocateSalesOrder>> | null = null
     if (!orderUpdated) {
-      const transitionResult = await db.$transaction(async (tx) => {
+      let transitionResult: { previousStatus: string }
+      try {
+      transitionResult = await db.$transaction(async (tx) => {
         storefrontCompletionKey = null // a retried callback must not inherit an aborted attempt's key
         storefrontStatusPush = null
-        return updateSalesOrderStatusUnderLock(tx, {
+        finalisationAllocation = null
+        const moved = await updateSalesOrderStatusUnderLock(tx, {
           orderId: id,
           targetStatus,
           data,
@@ -1961,50 +1976,67 @@ export async function applySalesOrderStatusTransition(
             }
           },
         })
+        // DRAFT FINALISATION IS ONE TRANSACTION: the status flip, the stock allocation and the sales invoice commit together or not at all. The allocation runs
+        // on this transaction (under the order lock the flip took), the invoice is built from the flipped order and reconciled to its total, and it is queued
+        // here; a failure of any of the three (no stock, an invoice that does not reconcile or has an unmapped account, a declined enqueue) throws and the
+        // order is still the draft it was, with no reservation and nothing queued.
+        if (isDraftFinalization) {
+          const allocation = await allocateSalesOrder(tx as never, { orderId: id, userId: actingUserId, runInCallerTransaction: true })
+          finalisationAllocation = allocation
+          if (!allocation.success) throw new DraftFinalisationAllocationError(allocation.error ?? 'Could not allocate stock for this order')
+          await queueSalesInvoiceForOrder(id, { client: tx as unknown as typeof db, enqueueInTx: true })
+        }
+        return moved
       }, STOCK_TX_OPTIONS)
+      } catch (finalisationError) {
+        if (!isDraftFinalization) throw finalisationError
+        const attempted = finalisationAllocation as Awaited<ReturnType<typeof allocateSalesOrder>> | null
+        const activity = attempted ? describeAllocationAttempt(attempted) : null
+        if (activity) await logActivity({ entityType: 'SALES_ORDER', entityId: id, tag: 'sales', ...activity }).catch(() => undefined)
+        if (finalisationError instanceof DraftFinalisationAllocationError) {
+          await logActivity({
+            entityType: 'SALES_ORDER',
+            entityId: id,
+            action: 'draft_finalization_allocation_failed',
+            tag: 'sales',
+            level: 'WARNING',
+            description: `Did not finalise order ${getSalesOrderReference(so)} because stock allocation failed: ${finalisationError.message}`,
+            metadata: { orderNumber: getSalesOrderReference(so), targetStatus, error: finalisationError.message },
+          })
+          return { success: false, error: finalisationError.message }
+        }
+        if (finalisationError instanceof SalesInvoiceDoesNotReconcileError || finalisationError instanceof SalesInvoiceNotQueuedError) {
+          await logActivity({
+            entityType: 'SALES_ORDER',
+            entityId: id,
+            action: 'draft_finalization_accounting_queue_failed',
+            tag: 'accounting',
+            level: 'WARNING',
+            description: `Did not finalise order ${getSalesOrderReference(so)}: its sales invoice could not be queued (${finalisationError.name})`,
+            metadata: { orderNumber: getSalesOrderReference(so), targetStatus, errorName: finalisationError.name },
+          })
+          return { success: false, error: finalisationError.message }
+        }
+        throw finalisationError
+      }
       previousStatusForLog = transitionResult.previousStatus
       orderUpdated = true
+      if (isDraftFinalization && finalisationAllocation) {
+        // After the commit: the activity of the allocation attempt and the storefront stock sync it owes (as autoAllocateOrder does).
+        const committedAllocation = finalisationAllocation as Awaited<ReturnType<typeof allocateSalesOrder>>
+        const activity = describeAllocationAttempt(committedAllocation)
+        if (activity) await logActivity({ entityType: 'SALES_ORDER', entityId: id, tag: 'sales', ...activity }).catch(() => undefined)
+        if (committedAllocation.syncProductIds.length > 0) {
+          try {
+            await enqueueStockSync(committedAllocation.syncProductIds, 'IMS_CHANGE')
+          } catch (syncError) {
+            console.error(syncError)
+          }
+        }
+      }
     }
 
-    // Draft finalisation: when a DRAFT is moved to any non-cancelled status,
-    // allocate stock and queue the sales invoice for accounting sync.
-    if (isDraftFinalization) {
-      const { autoAllocateOrder, deallocateOrder } = await import('./allocation')
-      const allocation = await autoAllocateOrder(id)
-      if (!allocation.success) {
-        if ((allocation.allocationCount ?? 0) > 0) {
-          await deallocateOrder(id)
-        }
-        await db.salesOrder.update({ where: { id }, data: { status: 'DRAFT' } })
-        await logActivity({
-          entityType: 'SALES_ORDER',
-          entityId: id,
-          action: 'draft_finalization_allocation_failed',
-          tag: 'sales',
-          level: 'WARNING',
-          description: `Reverted finalizing order ${getSalesOrderReference(so)} because stock allocation failed: ${allocation.error ?? 'unknown allocation error'}`,
-          metadata: { orderNumber: getSalesOrderReference(so), targetStatus, error: allocation.error ?? null },
-        })
-        return { success: false, error: allocation.error ?? 'Could not allocate stock for this order' }
-      }
-      try {
-        await queueSalesInvoiceForOrder(id)
-      } catch (accountingError) {
-        await logActivity({
-          entityType: 'SALES_ORDER',
-          entityId: id,
-          action: 'draft_finalization_accounting_queue_failed',
-          tag: 'accounting',
-          level: 'WARNING',
-          description: `Failed to queue sales invoice for order ${getSalesOrderReference(so)} after status change`,
-          metadata: {
-            orderNumber: getSalesOrderReference(so),
-            targetStatus,
-            errorName: accountingError instanceof Error ? accountingError.name : typeof accountingError,
-          },
-        })
-      }
-    }
+    // (Draft finalisation — allocation and the sales invoice — committed with the status flip above.)
 
     // Auto-generate invoice on ship if configured (skip its own log —
     // the status_changed entry below covers both actions)
@@ -2939,6 +2971,7 @@ export async function raiseChargebackForReversedOrder(
       accountingInvoiceId: true,
       fxRateToBase: true,
       pricesIncludeVat: true,
+      shoppingLinks: { select: { connector: true } },
       taxRatePercent: true,
       orderNumber: true,
       externalOrderNumber: true,
@@ -3147,7 +3180,7 @@ export async function raiseChargebackForReversedOrder(
     // built from `SalesOrder.discountAmount` verbatim (queueSalesInvoiceForOrder), in the order's
     // currency and its inclusive/exclusive convention — so only the number changes here, never the
     // arithmetic applied to it.
-    const discountForeignNet = order.pricesIncludeVat && vatPct > 0
+    const discountForeignNet = storedAmountsIncludeVat(order) && vatPct > 0
       ? mirroredDiscount / (1 + vatPct)
       : mirroredDiscount
     discountInput = { totalBase: discountForeignNet / fxRate }
@@ -3392,15 +3425,8 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
       include: { lines: true, shoppingLinks: { select: { connector: true } } },
     })
     if (!so) return { success: false, error: 'Order not found' }
-    // THE BASIS THE SOURCE'S AMOUNTS ARE STORED IN decides the clone's flag, because the clone copies the amounts as they are.
-    //  manual order, prices incl. VAT  unit prices and discounts GROSS (shipping stored net)   flag true  - the manual invoice builder grosses shipping up
-    //  manual order, prices excl. VAT  everything NET                                          flag false
-    //  CSV import                      goes through createSalesOrder: one of the two above
-    //  WooCommerce import              unit prices, shipping and discounts are NET even when the store shows prices incl. tax (order-import.ts),
-    //                                  so the flag on the source describes the storefront's display, not the stored amounts
-    // The flag therefore passes through for a manual source and is FALSE for a WooCommerce one (net amounts + header rate post as an exclusive
-    // invoice, which is what the Woo importer's own invoice sends). Copying a true flag onto net amounts posted them as the gross total.
-    const sourceAmountsAreNet = so.shoppingLinks.some((link) => link.connector === 'woocommerce')
+    // The clone copies the amounts as stored, so its flag is the BASIS those amounts are stored in (storedAmountsIncludeVat): net for a WooCommerce source whatever
+    // its display flag says, the order's own flag otherwise.
 
     const ref = `SO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
     // A CLONE IS A NEW DOCUMENT: its rate is the table rate NOW (as createSalesOrder), never the source order's (which may be a legacy typed or 1:1 rate), and every base amount is
@@ -3446,9 +3472,9 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
         discountAmount: so.discountAmount,
         taxRateName: so.taxRateName,
         taxRatePercent: so.taxRatePercent,
-        // The amounts below are copied as stored, so the clone must read them the way the source did (see sourceAmountsAreNet above): left to
+        // The amounts below are copied as stored, so the clone must read them the way the source did (see storedAmountsIncludeVat): left to
         // the column default it read an inclusive manual order's gross prices as net, and the invoice it now queues added the VAT twice.
-        pricesIncludeVat: sourceAmountsAreNet ? false : so.pricesIncludeVat,
+        pricesIncludeVat: storedAmountsIncludeVat(so),
         notes: so.notes,
         internalNotes: so.internalNotes,
         lines: {

@@ -94,3 +94,11 @@ export class SalesInvoiceExtraNotMappedError extends SalesInvoiceDoesNotReconcil
     this.name = 'SalesInvoiceExtraNotMappedError'
   }
 }
+
+/** The accounting queue declined the invoice (`reason`): inside the transaction that moves the order this rolls everything back. Not a reconciliation mismatch, so not a subclass. */
+export class SalesInvoiceNotQueuedError extends Error {
+  constructor(public readonly reason: string) {
+    super(`The sales invoice for this order could not be queued (the accounting queue declined it: ${reason}), so nothing was saved and the order was not moved.`)
+    this.name = 'SalesInvoiceNotQueuedError'
+  }
+}
