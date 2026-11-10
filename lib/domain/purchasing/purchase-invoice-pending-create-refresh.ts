@@ -1,4 +1,5 @@
-import { ATTEMPT_PROVEN_NEVER_MADE_WHERE } from '@/lib/domain/accounting/money-attempt-provenance'
+import { LEDGER_STANDING_SELECT, ledgerStanding, namesADocument } from '@/lib/domain/accounting/ledger-standing'
+import { ATTEMPT_PROVEN_NEVER_MADE_WHERE, attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
 import type { Prisma } from '@/app/generated/prisma/client'
 import type { PurchaseInvoiceAccountingPayload } from '@/lib/domain/purchasing/purchase-invoice-edit'
 
@@ -57,32 +58,32 @@ export async function refreshPendingPurchaseInvoiceCreate(params: {
   accountingPayload: PurchaseInvoiceAccountingPayload
 }): Promise<PendingCreateRefreshOutcome> {
   const rows = await params.tx.accountingSyncLog.findMany({
-    where: {
-      type: 'PURCHASE_INVOICE',
-      referenceType: 'PurchaseInvoice',
-      referenceId: params.invoiceId,
-      status: { not: 'CANCELLED' },
-    },
+    where: { type: 'PURCHASE_INVOICE', referenceType: 'PurchaseInvoice', referenceId: params.invoiceId },
     select: {
+      ...LEDGER_STANDING_SELECT,
       id: true,
       connector: true,
-      status: true,
-      externalTransactionId: true,
       remoteAttemptedAt: true,
       attemptStampingCustodyAt: true,
       backReferenceEvidenceCompactedAt: true,
       payload: true,
     },
   })
-  if (rows.length === 0) return { kind: 'no-create-row' }
-  // Two live create rows for one bill cannot be told apart; a posted one (SYNCED, or carrying a document id) means the document exists
-  // in the ledger while the bill is still unlinked.
-  if (rows.length > 1) throw new PurchaseBillFirstPostingInFlightError()
-  const row = rows[0]!
+  // What each row says about the ledger is the ledger-standing module's to say. A shadow IMS recorded instead of queuing, and an attempt
+  // proven never to have been sent that was then retired, are not postings: nothing is owed to the ledger for them.
+  const postings = rows.filter((row) => {
+    const standing = ledgerStanding(row)
+    return standing !== 'SHADOW_NOT_SENT_BY_IMS' && standing !== 'PROVEN_NOT_POSTED'
+  })
+  if (postings.length === 0) return { kind: 'no-create-row' }
+  // Two live create rows for one bill cannot be told apart.
+  if (postings.length > 1) throw new PurchaseBillFirstPostingInFlightError()
+  const row = postings[0]!
+  // Refreshable only while the row is queued (or failed) and PROVEN never to have made a request: a claim, an attempt, a posted-but-unlinked
+  // document or a row nobody can vouch for are all "may have left".
   const unsent = (row.status === 'PENDING' || row.status === 'FAILED')
-    && row.externalTransactionId === null
-    && row.remoteAttemptedAt === null
-    && row.attemptStampingCustodyAt !== null
+    && !namesADocument(row)
+    && attemptProvenNeverMade(row)
     && row.backReferenceEvidenceCompactedAt === null
     && params.chartConnector !== null
     && row.connector === params.chartConnector
@@ -93,7 +94,6 @@ export async function refreshPendingPurchaseInvoiceCreate(params: {
     where: {
       id: row.id,
       status: { in: ['PENDING', 'FAILED'] },
-      externalTransactionId: null,
       ...ATTEMPT_PROVEN_NEVER_MADE_WHERE,
     },
     data: { payload: payload as never },

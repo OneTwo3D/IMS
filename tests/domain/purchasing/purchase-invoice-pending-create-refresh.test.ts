@@ -20,7 +20,7 @@ function fake(rows: Array<Record<string, unknown>>, swapCount = 1) {
   } as unknown as PendingCreateRefreshTx
   return { tx, writes }
 }
-const unsent = { id: 'r1', connector: 'xero', status: 'PENDING', externalTransactionId: null, remoteAttemptedAt: null, attemptStampingCustodyAt: new Date(), backReferenceEvidenceCompactedAt: null, payload: { _postingMode: 'submitted', _idempotencyKey: 'k1', _connectionProvenance: 'xero:t', lines: [] } }
+const unsent = { id: 'r1', connector: 'xero', status: 'PENDING', externalTransactionId: null, abandonedBeforeRemoteCall: false, settlementBasis: null, remoteAttemptedAt: null, attemptStampingCustodyAt: new Date(), backReferenceEvidenceCompactedAt: null, payload: { _postingMode: 'submitted', _idempotencyKey: 'k1', _connectionProvenance: 'xero:t', lines: [] } }
 const run = (tx: PendingCreateRefreshTx) => refreshPendingPurchaseInvoiceCreate({ tx, invoiceId: 'inv1', chartConnector: 'xero', accountingPayload: edited })
 
 // [mutation: build the payload without the row's enqueue stamps, or without guarding the swap on the unsent proof]
@@ -42,6 +42,19 @@ test('no create row: nothing is owed and nothing is written', async () => {
   const { tx, writes } = fake([])
   assert.deepEqual(await run(tx), { kind: 'no-create-row' })
   assert.equal(writes.length, 0)
+})
+
+test('a recorded shadow and a retired never-sent attempt are not postings: nothing is owed, nothing is written', async () => {
+  const shadow = { ...unsent, id: 's1', status: 'CANCELLED', settlementBasis: 'HELD_SHADOW' }
+  const retired = { ...unsent, id: 's2', status: 'CANCELLED', abandonedBeforeRemoteCall: true }
+  for (const rows of [[shadow], [retired], [shadow, retired]]) {
+    const { tx, writes } = fake(rows)
+    assert.deepEqual(await run(tx), { kind: 'no-create-row' })
+    assert.equal(writes.length, 0)
+  }
+  const { tx, writes } = fake([retired, unsent])
+  assert.deepEqual(await run(tx), { kind: 'refreshed', syncLogId: 'r1' }, 'a retired attempt beside a live one does not make it ambiguous')
+  assert.equal(writes.length, 1)
 })
 
 test('a row that may have left IMS refuses the edit and is not written', async () => {

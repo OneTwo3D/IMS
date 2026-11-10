@@ -22,7 +22,7 @@ export const INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE =
 export const STORED_INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE =
   'This order is marked as having VAT-inclusive prices but has no default VAT rate, while its lines carry VAT, so '
   + 'the invoice would reach the accounting system with the VAT added a second time. It was not queued and the order '
-  + 'was not moved. Cancel it and raise it again with the order\'s default VAT rate chosen (or with net prices).'
+  + 'was not moved. This draft has to be cancelled and a new order created with the order\'s default VAT rate chosen (or with net prices).'
 
 /** True when the order's VAT basis is contradictory in the way described above. */
 export function inclusivePricesWithoutOrderRate(input: {
