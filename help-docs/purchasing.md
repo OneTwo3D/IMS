@@ -155,6 +155,7 @@ original PO FX rate and is wrapped in a single transaction that:
   and save will abort the edit).
 - Checks overbilling against the **other** bills on the same PO so the combined billed quantity
   never exceeds the PO quantity, and the combined freight amount never exceeds the cost line.
+- Refuses the save if the bill changed (another edit committed) after the form was loaded, asking for a reload, so two edits never overwrite each other.
 - Persists the new header and line values.
 - Queues a `PURCHASE_INVOICE_UPDATE` accounting sync (if the bill has already been synced) using a
   payload-derived idempotency key. Saving without any content change short-circuits with a

@@ -297,6 +297,49 @@ test('SO-H2: shipping and the order discount are priced from the code they are s
   assert.equal(r.success, true, r.error)
 })
 
+// [mutation: widen the no-tax fee identity (ignore the rate id, or the stored VAT)]
+test('SO-H2: only a line with NO product, NO rate and NO VAT is a no-tax fee: a productless line with a rate keeps its own code, one with VAT takes the order\'s', async () => {
+  const { updateSalesOrderStatus } = await import('@/app/actions/sales')
+  const mk = (extraLine: Record<string, unknown>, total: string, tax: string) => s.db.salesOrder.create({
+    data: {
+      orderNumber: `FEE-${++seq}`, customerName: 'Fee', currency: 'GBP', fxRateToBase: 1, status: 'DRAFT', pricesIncludeVat: false, taxRateName: 'AUD Sales 20', taxRatePercent: '0.2',
+      subtotalForeign: '110', taxForeign: tax, totalForeign: total, subtotalBase: '110', taxBase: tax, totalBase: total,
+      lines: { create: [
+        { productId, sku: 'AUD-1', description: 'x', qty: 1, unitPriceForeign: '100', unitPriceBase: '100', taxForeign: '20', taxBase: '20', totalForeign: '100', totalBase: '100', taxRateId: vat20Id },
+        { productId: null, sku: null, description: 'Fee', qty: 1, unitPriceForeign: '10', unitPriceBase: '10', totalForeign: '10', totalBase: '10', ...extraLine },
+      ] },
+    } as never,
+    select: { id: true },
+  })
+  const zeroRated = await mk({ taxRateId: zeroId, taxForeign: '0', taxBase: '0' }, '130', '20')
+  assert.equal((await updateSalesOrderStatus(zeroRated.id, 'PENDING_PAYMENT')).success, true)
+  const zl = ((await invoiceRows(zeroRated.id))[0]!.payload as { lines: Array<{ taxType?: string; noTaxKind?: string }> }).lines[1]!
+  assert.equal(zl.taxType, 'ZEROOUT', 'a zero-rated fee keeps its rate\'s code')
+  assert.equal(zl.noTaxKind, undefined)
+  const taxed = await mk({ taxRateId: null, taxForeign: '2', taxBase: '2' }, '132', '22')
+  assert.equal((await updateSalesOrderStatus(taxed.id, 'PENDING_PAYMENT')).success, true)
+  const tl = ((await invoiceRows(taxed.id))[0]!.payload as { lines: Array<{ taxType?: string; noTaxKind?: string }> }).lines[1]!
+  assert.equal(tl.taxType, 'OUTPUT2', 'a fee that carries VAT takes the order\'s taxable code')
+  assert.equal(tl.noTaxKind, undefined)
+})
+
+// [mutation: price an ambiguous code from the first rate that carries it]
+test('SO-H2: a code carried by two active rates with different values is not priced from either: the line\'s stored VAT stands', async () => {
+  const { updateSalesOrderStatus } = await import('@/app/actions/sales')
+  await s.db.taxRate.create({ data: { name: 'AUD Dual 20', rate: '0.2', usedFor: 'SALES', accountingTaxType: 'DUALOUT', active: true } })
+  const dual10 = await s.db.taxRate.create({ data: { name: 'AUD Dual 10', rate: '0.1', usedFor: 'SALES', accountingTaxType: 'DUALOUT', active: true }, select: { id: true } })
+  const so = await s.db.salesOrder.create({
+    data: {
+      orderNumber: `DUAL-${++seq}`, customerName: 'Dual', currency: 'GBP', fxRateToBase: 1, status: 'DRAFT', pricesIncludeVat: false, taxRateName: 'AUD Dual 10', taxRatePercent: '0.1',
+      subtotalForeign: '100', taxForeign: '10', totalForeign: '110', subtotalBase: '100', taxBase: '10', totalBase: '110',
+      lines: { create: [{ productId, sku: 'AUD-1', description: 'x', qty: 1, unitPriceForeign: '100', unitPriceBase: '100', taxForeign: '10', taxBase: '10', totalForeign: '100', totalBase: '100', taxRateId: dual10.id }] },
+    } as never,
+    select: { id: true },
+  })
+  const r = await updateSalesOrderStatus(so.id, 'PENDING_PAYMENT')
+  assert.equal(r.success, true, r.error)
+})
+
 test('SO-H2: the reconciliation also refuses a stored order whose amounts are net but flagged gross, and lets every consistent order through', async () => {
   const { updateSalesOrderStatus } = await import('@/app/actions/sales')
   const mk = (flag: boolean, unit: string, total: string) => s.db.salesOrder.create({
