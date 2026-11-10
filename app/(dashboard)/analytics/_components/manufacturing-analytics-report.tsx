@@ -118,8 +118,8 @@ export function ManufacturingAnalyticsReportPage<Row>({
 
       <div className="rounded-md border">
         <div className="flex items-center justify-between border-b bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-          <span>{pageInfo.totalRows.toLocaleString()} rows</span>
-          <span>Page {pageInfo.page} of {pageInfo.totalPages}</span>
+          <span>{notComputed ? 'Report not computed' : `${pageInfo.totalRows.toLocaleString()} rows`}</span>
+          {!notComputed && <span>Page {pageInfo.page} of {pageInfo.totalPages}</span>}
         </div>
         <Table containerClassName="max-h-[calc(100vh-22rem)]">
           <TableHeader className="bg-muted/50">

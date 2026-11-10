@@ -63,6 +63,7 @@ test('a sales report that hit the limit renders an alert, dashes and "not comput
   assert.match(html, /Report not computed/)
   assert.ok(!html.includes('No rows for the selected filters'), 'no "No rows" claim')
   assert.ok(!html.includes('>0.00<'), 'no zero revenue tile')
+  assert.ok(!/>0 rows</.test(html) && !/Page \d+ of/.test(html), 'no row or page count')
   assert.match(html, />—</, 'the tile shows a dash')
 })
 
@@ -99,6 +100,7 @@ test('a not-computed stock-position report (aging, dead stock) shows dashes, not
   )
   const limited = render([sourceLimitNotice(error)])
   assert.ok(!limited.includes('0.00'), 'no zero footer when not computed')
+  assert.ok(!/>0 rows</.test(limited) && !/Page \d+ of/.test(limited), 'no row or page count when not computed')
   assert.match(limited, /Report not computed/)
   assert.ok(render([]).includes('0.00'), 'a computed report still shows its footer')
 })
