@@ -828,6 +828,8 @@ For full Proxmox + Cloudflare + OpenLiteSpeed tenant rollout, see [Automated Ten
 
 ### Re-running the installer over an existing installation
 
+Before each stage or production deploy, cut a release first (changelog, `lib/releases.ts`, `package.json`): see "Cut a release" in [development.md](development.md#cut-a-release). Deploy the merged release commit.
+
 This is supported and expected — the installer reads back the `.env` a previous run wrote, preserves
 the secrets it cannot re-mint (`SETTINGS_ENCRYPTION_KEY`, `AUTH_SECRET`, `CRON_SECRET`) and keeps a
 working `REDIS_URL`. Because it is an upgrade entrypoint, it applies **the same cutover sequence as
