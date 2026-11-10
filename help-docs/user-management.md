@@ -80,7 +80,7 @@ Risky or irreversible actions open a confirmation dialog instead of acting at on
 - **Type the name to confirm** — for example the backup file name before **Delete backup**, or the word the screen shows before a restore. The action button stays disabled until you type it exactly.
 - **A tick box** — for example "I have checked Xero and none of these documents already exist there" before **Retry all failed rows**. The button stays disabled until it is ticked.
 
-While the action is running the dialog cannot be dismissed. If the action fails, the reason is shown in the dialog and nothing is half-done.
+While the action is running the dialog cannot be dismissed. If the action fails, the reason is shown in the dialog. A failure does not always mean nothing happened: actions that write to another system item by item (for example generating missing tax rates in Xero) keep the items that were created before the failure. Read the per-item result the action shows, and check the other system (for example Xero) before you retry.
 
 
 ## Two-Factor Authentication (TOTP)
