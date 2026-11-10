@@ -151,6 +151,10 @@ When not all products are in stock, you can ship what's available now and fulfil
 6. **Re-allocate** the remaining items and confirm to create new shipments
 7. **Ship** the final shipments — the order auto-transitions to **Shipped** once all shipments are shipped
 
+Services and fees on an order (a delivery charge, for example) never need a shipment, so they never hold an order back: the order moves to **Shipped** once every physical item has shipped.
+
+If the last shipment is dispatched while the order is **On Hold**, **Processing**, **Draft** or **Pending payment**, the goods have left, so the order is moved to **Shipped** in the same step as the dispatch and an "Order shipped from a non-fulfilment status" warning is added to the order's activity log. If the order cannot be moved, the dispatch is not recorded at all (no stock is taken), rather than being recorded with the order left behind.
+
 This flow works seamlessly with the multi-shipment system. Each round of allocation and confirmation creates new shipments without affecting previously shipped items.
 
 ## Multi-Shipment System

@@ -769,17 +769,21 @@ export async function applyExternalFulfillmentUpdate(
     }
   }
 
-  // RETRY OF A FENCED COMPLETION. Every shipment may already be SHIPPED while the order itself was left unflipped (a verification
-  // fence refused at the order flip after the shipment committed). No shipment is left to transition, so `updateShipmentStatus`
-  // (the only other place the order is reconciled) is never reached: reconcile the order here instead, under the order lock and with
-  // the FRESH fence, with no shipment transition and no stock work. Success is reported only once the order is flipped or already
-  // complete; a refusal is an apply error and the next sweep tries again. (The unfenced path is unchanged.)
-  if (update.targetShipmentStatus === 'SHIPPED' && update.storefrontAlreadyCompleted === true && update.shipFence && shipments.length === 0) {
+  // RETRY OF A COMPLETION THAT LEFT THE ORDER UNFLIPPED. Every shipment may already be SHIPPED while the order itself was not
+  // promoted: a verification fence refused at the order flip after the shipment committed, or (SHP-H1) the promotion failed or
+  // was interrupted after the dispatch had committed. No shipment is left to transition, so `updateShipmentStatus` (the only
+  // other place the order is reconciled) is never reached: reconcile the order here instead, under the order lock and with the
+  // FRESH fence when there is one, with no shipment transition and no stock work. Success is reported only once the order is
+  // flipped or already complete; a refusal is an apply error and the next sweep tries again. This applies to the unfenced WMS
+  // path too: it used to log success on every tick for an order that never reached SHIPPED.
+  if (update.targetShipmentStatus === 'SHIPPED' && shipments.length === 0) {
     const { reconcileOrderAfterShipment } = await import('@/lib/domain/sales/shipment-service')
+    const fencedRetry = update.storefrontAlreadyCompleted === true && !!update.shipFence
     const reconciliation = await reconcileOrderAfterShipment(db, { orderId: order.id }, undefined, {
       completionAuthority: 'EXTERNAL',
-      storefrontCompletion: false,
-      fence: update.shipFence,
+      // The durable storefront-completion job is enqueued WITH the flip, exactly as the first dispatch would have done.
+      storefrontCompletion: !fencedRetry && isWmsConnectorId(update.source) && update.storefrontAlreadyCompleted !== true,
+      ...(fencedRetry && update.shipFence ? { fence: update.shipFence } : {}),
     })
     if (reconciliation.fenceRefused) {
       return refuseExternalFulfillment('shipment_status_transition_failed', reconciliation.fenceRefused)

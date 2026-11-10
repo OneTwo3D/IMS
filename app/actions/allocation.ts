@@ -1580,11 +1580,20 @@ export async function updateShipmentStatus(
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.process')
     }
+    const completionAuthority = options?.completionAuthority ?? 'IMS'
+    const completion = {
+      completionAuthority,
+      storefrontCompletion: options?.storefrontCompletion ?? completionAuthority === 'IMS',
+      ...(options?.shipFence ? { fence: options.shipFence } : {}),
+    }
+    // SHP-H1: for a dispatch the order promotion runs INSIDE the dispatch transaction (`completion`), so a
+    // committed dispatch can never leave the order unpromoted or the operator with a failure for goods that left.
     const result = await transitionShipmentStatus(db, {
       shipmentId,
       targetStatus,
       extra,
       ...(targetStatus === 'SHIPPED' && options?.shipFence ? { fence: options.shipFence } : {}),
+      ...(targetStatus === 'SHIPPED' ? { completion } : {}),
     })
     if (!result.success) {
       try {
@@ -1598,13 +1607,11 @@ export async function updateShipmentStatus(
     // o3d-zvec.15: set by the reconciliation below ONLY when this call moved the order to SHIPPED.
     let storefrontCompletionKey: string | null = null
     let fenceRefusal: string | null = null
-    const completionAuthority = options?.completionAuthority ?? 'IMS'
     if (targetStatus === 'SHIPPED') {
-      const reconciliation = await reconcileOrderAfterShipment(db, result.shipment, extra, {
-        completionAuthority,
-        storefrontCompletion: options?.storefrontCompletion ?? completionAuthority === 'IMS',
-        ...(options?.shipFence ? { fence: options.shipFence } : {}),
-      })
+      // Already reconciled in the dispatch transaction when this call did the dispatch; a re-run against an
+      // already-SHIPPED shipment (retry, crashed post-commit step) reconciles here instead.
+      const reconciliation = result.reconciliation
+        ?? await reconcileOrderAfterShipment(db, result.shipment, extra, completion)
       // The shipments shipped (the goods left) but the order was NOT flipped: the verification no longer holds. Everything below still
       // runs (logs, stock sync); the refusal is reported at the end so the order stays pending and is verified again, then completed,
       // on the next sweep.
@@ -1633,6 +1640,19 @@ export async function updateShipmentStatus(
           description: `Order ${orderRef} has despatched every shipment raised against it but is still short: ${outstandingSummary}. `
             + 'It has NOT been marked SHIPPED. Allocate and ship the remainder, or set the order to SHIPPED explicitly to close it short.',
           metadata: { orderNumber: orderRef, shortfall: reconciliation.shortfall },
+        })
+      }
+      if (reconciliation.promotedFromStatus) {
+        const orderRef = result.shipment.order.orderNumber ?? result.shipment.order.externalOrderNumber
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: reconciliation.orderId,
+          action: 'order_shipped_from_non_fulfilment_status',
+          tag: 'sales',
+          level: 'WARNING',
+          description: `Order ${orderRef} was ${reconciliation.promotedFromStatus} when its last shipment was despatched. `
+            + 'The goods have left, so the order has been marked SHIPPED.',
+          metadata: { orderNumber: orderRef, previousStatus: reconciliation.promotedFromStatus },
         })
       }
       if (reconciliation.shouldGenerateInvoice) {

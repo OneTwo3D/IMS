@@ -10,6 +10,14 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### Dispatch completion: orders always follow the dispatch, and services no longer hold an order open
+
+- **Fixed: dispatching the last shipment of an On Hold, Processing, Draft or Pending payment order no longer fails after the goods have left.** The order promotion used to run in a second transaction after the dispatch had committed and threw because those statuses have no direct step to Shipped; the operator saw a failure for a dispatch that had happened, the activity rows, storefront push, invoice trigger, despatch email and stock sync were skipped, and every retry failed the same way. The promotion now runs inside the dispatch transaction: the stock decrement, FIFO/COGS and the order flip commit together or roll back together. An order parked in one of those statuses is moved to Shipped by the same legal route an operator would take (through Allocated) and an "Order shipped from a non-fulfilment status" warning is logged.
+- **Fixed: a warehouse (WMS) dispatch retry now promotes the order.** When every shipment was already shipped but the order was not (the promotion failed or was interrupted after the dispatch committed), the sweep logged success on every tick and the order never reached Shipped, so no storefront completion, despatch email or on-shipped invoice followed. The retry now reconciles the order under its lock and reports success only once the order is Shipped.
+- **Fixed: a service, fee or delivery-charge line no longer keeps an order in Allocated for ever.** The in-app completion check counted these lines as outstanding although they can never be allocated or shipped; it now excludes them, as the warehouse path and the backorder report already did. Orders with such a line complete, invoice on shipment and push the storefront completion like any other.
+- **Not changed:** the order state table (manual transitions are unchanged), whether On Hold stops fulfilment from starting, and partial shipments (the order still waits for the rest).
+- **No migration.**
+
 ### Mintsoft order push: landed creates, merged orders, holds and cancels the warehouse cannot honour
 
 - **A create that timed out or lost its link write is no longer parked for good.** The sweep (and **Replay** on the "Create outcome unknown" row) now looks the order up in Mintsoft by read only, and links it only when exactly one live order of this client carries this order's own number AND its own reference, read back by id. Anything else (another reference, several matches, a full 10-row result page, a cancelled order, a read that fails) stays parked with the reason on the row. The same rule applies when Mintsoft answers a create with "Order Number already exists!": a cancelled order keeps its number, and IMS no longer links to it. A create that landed but whose link write failed keeps the id Mintsoft returned instead of discarding it.

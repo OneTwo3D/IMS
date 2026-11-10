@@ -32,3 +32,26 @@ export function assertSalesOrderTransition(
 ): void {
   assertTransition('sales order', SALES_ORDER_TRANSITIONS, from, to)
 }
+
+/**
+ * How an order whose every shipment has left the building reaches SHIPPED.
+ *
+ * `SALES_ORDER_TRANSITIONS` has a direct ->SHIPPED edge only from ALLOCATED, PICKING and PACKING. An
+ * order parked in ON_HOLD, PROCESSING, DRAFT or PENDING_PAYMENT can still have a shipment dispatched
+ * (shipment transitions do not look at those statuses), and when it does the goods are gone: the
+ * only truthful outcome is SHIPPED, reached by the same legal route an operator would take, through
+ * ALLOCATED. `viaAllocated` says the direct edge was absent so the caller can leave a trace.
+ * Anything with no route at all (an unknown status) is refused.
+ */
+export function resolveShippedPromotion(
+  from: SalesOrderStatus,
+): { success: true; viaAllocated: boolean } | { success: false; error: string } {
+  if (!(from in SALES_ORDER_TRANSITIONS)) {
+    return { success: false, error: `Cannot transition sales order from ${from} to SHIPPED` }
+  }
+  if (canTransitionSalesOrder(from, 'SHIPPED')) return { success: true, viaAllocated: false }
+  if (canTransitionSalesOrder(from, 'ALLOCATED') && canTransitionSalesOrder('ALLOCATED', 'SHIPPED')) {
+    return { success: true, viaAllocated: true }
+  }
+  return { success: false, error: `Cannot transition sales order from ${from} to SHIPPED` }
+}
