@@ -232,7 +232,7 @@ export const WCLC_FEE_KINDS = ['duty_flat', 'uhf', 'duty_fee'] as const
 export type WclcFeeKind = (typeof WCLC_FEE_KINDS)[number]
 
 /** Truthiness of a WooCommerce meta value as the plugin writes it ('1', 1, true, 'yes'); anything else is not a marker. */
-function wcMetaFlag(value: unknown): boolean {
+export function wcMetaFlag(value: unknown): boolean {
   if (value === true || value === 1) return true
   if (typeof value !== 'string') return false
   return ['1', 'true', 'yes'].includes(value.trim().toLowerCase())

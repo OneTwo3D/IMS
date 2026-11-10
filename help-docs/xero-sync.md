@@ -1350,6 +1350,8 @@ creating a second payment. A deposit and a balance (different receipts) carry di
 post. A row that records no receipt (an imported or older row) or no usable amount keeps its own
 token. Reference marks and the ledger fence are unchanged.
 
+"Retry all failed" (the red banner at the top of the Sync page and the button in the Sync Log) opens a confirmation dialog first. It shows how many failed rows will be re-queued, repeats the duplicate-document caution, and enables **Retry** only after you tick that you have checked Xero and none of the documents already exist there. The confirmation names the exact rows you reviewed: the retry code itself (so every route to it, not just the button) refuses the bulk retry unless the call carries that list, and refuses if the set of failed rows has changed in any way since, even with the same count. A blank row id is refused rather than treated as "all". The per-row retry is unchanged.
+
 The retry controls (the failed-sync banner, "Retry All Failed", and the per-row retry in the sync
 log) all state this. Before re-queueing an aged row, search Xero for the document. IMS deliberately
 does not block the retry: it is the only remedy for a row whose cause has since been fixed, and
@@ -1602,6 +1604,96 @@ real accounting tax type, then re-import the order.
 **What to expect while mappings are incomplete.** Until every WooCommerce rate in use is mapped to an active IMS rate that carries a real
 Xero tax type, affected invoices and credit notes will sit as failed rows on /sync instead of posting. That is the intended behaviour; keep the
 Sales Invoices sync type switched off until the mappings are in place, then enable it.
+
+### EU IOSS / VOEC rate configuration (declaration, preflight and seed)
+
+An IOSS or VOEC sale (an EU member state, Monaco or Norway, VAT collected at the till under the scheme) is posted to Xero on the destination's **zero-rated** Xero type
+(for example `DE IOSS VAT`, `TAX131`) with one extra line carrying the collected VAT, not on the rate the customer was charged. IMS therefore keeps **two** Xero types for such a rate:
+its own `accountingTaxType` stays the charged rate (DE VAT 19%), and the new rate field **`schemePostingTaxType`** holds the zero-rated type its goods, shipping and discount lines
+will post on. The existing reporting category carries the marker: `IOSS` for the EU states and Monaco, `VOEC` for Norway (this moves the rate from the "other foreign VAT" bucket of the
+VAT difference report to the IOSS or VOEC one). **This change adds configuration only: nothing reads `schemePostingTaxType` to build a document yet, so no posted line changes and the
+Sales Invoices switch is untouched.** The treatment itself arrives in later changes, behind that switch.
+
+**The declaration** is `lib/tax/eu-vat-seed.json`, versioned and reviewed in the repository, with no secret in it: for each of the 65 live WooCommerce tax rates, the IMS rate that stands
+for it (one IMS rate per Xero rate: WooCommerce rates that post on the same Xero type share one IMS rate, so the 33 rates on `ZERORATEDOUTPUT`, 182 included, are one rate named *Zero Rated Income*), the Xero type it posts on and the byte-exact Xero names (`AT IOSS  VAT` has two spaces, `No VAT` and `NO VAT`
+are different types). The charged rate's Xero code is left open (`null`) where Xero numbers it per organisation: it is found by name from the stored Xero list, by `npm run tax:rekey`,
+never declared. The declaration is **only a declaration**: nothing writes a tax rate to Xero from it, and nothing applies it by itself. The measured table it was made from is pinned in
+`tests/fixtures/eu-vat-parity.json`, and `tests/tax/eu-vat-parity.test.ts` fails if either file disagrees with Xeroom's resolution of any of the 65 rows, or if a rate is added to one file and not the other.
+
+```
+npm run eu-vat:preflight               # read only: what is missing or mismatched (add --json for the machine-readable form)
+npm run eu-vat:seed                    # DRY RUN: the rates it would set, and the plan's digest
+npm run eu-vat:seed -- --apply --confirm <digest>    # write exactly the plan the dry run printed
+```
+
+- **Order at setup** (before Sales Invoices is enabled): connect the Xero organisation and let the tax-rate list be stored; import the WooCommerce rates and adopt them; run `npm run tax:rekey`;
+  run `npm run eu-vat:seed` and, after reading it, apply it; then `npm run eu-vat:preflight` must report no error.
+- **The preflight** reads the database and the **stored** copy of Xero's list (the proven one; a missing, stale or other-organisation list refuses with exit 2 and nothing is judged). It
+  never calls Xero or WooCommerce and never writes. Per declared WooCommerce rate: mapped (and the mapping's record of the store rate equals the declaration's, or it was made against another store);
+  the IMS rate active, for sales, not shared with another WooCommerce rate, at the declared percentage and country; the charged code an ACTIVE Xero type of the declared name and percentage, never
+  `NONE`; the scheme posting type and category set; the posting type an ACTIVE Xero type, effective rate exactly 0, named byte-exactly. Then: every EU-27 state, Monaco and Norway has a complete scheme
+  rate; accounts 821, 232, 813, 816, 860 exist in the cached chart (821 *Non-UK VAT* and 860 *Rounding* by name too); the three EU account settings and the rounding setting hold the declared codes;
+  the refund-hold settings are sane. An **error** blocks readiness (exit 1); an **advisory** (a differing IMS name) is listed and does not (exit 0). Per rate, the mapping must be stamped for the store configured NOW (an unstamped or other-store mapping is refused, as the adoption step does).
+  the preflight errors `SHARED_IMS_ROW` (an IMS rate that stands for WooCommerce rates the declaration does not declare to be the same Xero rate) and `XERO_TYPE_ON_TWO_IMS_RATES`
+  (two IMS rates on one Xero type) enforce one IMS rate per Xero rate. The set-identity report (R13) accepts the declared sharing (it reads the declaration, and skips the per-rate country and tax-category comparison on it) and still
+  reports `DUPLICATE_MAPPING` for any other sharing and for two IMS rates on one type.
+- **The seed** sets `schemePostingTaxType` and `reportingCategory` and nothing else. It creates no rate, edits no mapping or account setting, and never calls Xero or WooCommerce. A rate is
+  reached only through the WooCommerce mappings that name it, stamped for the configured store and recording the declared store rate, and only if the preflight finds nothing wrong with it but the two fields (country, percentage, name, charged code and the scheme type against the proven stored Xero list); anything else is skipped and listed. A shared rate is one change. It is a
+  dry run unless `--apply --confirm <digest>` (the digest the dry run printed) is given; the apply opens by taking the Xero mapping-selection lock and asserting the captured Xero connection unchanged (a rebind waits for it, a changed connection refuses with `XERO_CONNECTION_CHANGED`), rebuilds the plan inside the transaction (a different digest writes nothing), takes the row lock
+  every rate editor takes (a rate a re-key replaced is refused), row-locks the mappings the plan rests on and compares every declared mapping field (external id, country, percentage, class, store, rate), and writes each rate as a compare-and-set on the facts it was judged on. Exit codes: 0 nothing to do or applied, 1 a dry run that lists work, 2 refused, 3 internal.
+  Run as root or the checkout's owner; the environment is replaced by the `vat:diff` whitelist.
+- **An organisation change clears it.** Both Xero codes of a rate (the charged type and the scheme posting type) are the organisation's, so a bind to a different organisation clears `schemePostingTaxType` with the other tax types, and a rate holding only a scheme posting type counts as a mapping.
+- **A re-key keeps it.** `npm run tax:rekey` copies `schemePostingTaxType` to the replacement rate with the other posting fields (and it is part of the digest).
+- **Drift.** The hourly tax-rate sweep also checks, from the declared mappings, every rate's `schemePostingTaxType` and category against the declaration, and the type **by code** against the stored list: cleared or swapped for another type, IOSS turned into VOEC, no longer in the list, no longer ACTIVE, no longer at exactly 0%,
+  named differently from the declaration, carried without an IOSS or VOEC marker, or equal to the rate's own charged code, shows as drift on the rate (the same /sync alert and activity-log entry as a rate that drifted by name).
+- **Settings.** Three account roles join the Xero account mappings: *EU IOSS/VOEC VAT collected* (`xero_eu_vat_ioss_account`, 821 *Non-UK VAT*), *EU DDP charges collected* (`xero_eu_vat_ddp_account`, 232) and
+  *EU landed-cost fees* (`xero_eu_fee_account`, 232). They are owned by the connected organisation like every account mapping (cleared and re-confirmed on a change of organisation). Rounding posts to 860 *Rounding*
+  (`xero_rounding_difference_account`), not 821. Two further settings are read by the credit-note work to come: `eu_vat_refund182_hold_threshold` (default 10) and `eu_vat_refund182_held_count`
+  (a persisted counter): refund VAT booked on WooCommerce rate 182 is to be posted to the order's VAT account, with the first N such credit notes held for a person to check. Nothing uses them yet.
+
+### EU VAT regime: how an order is classified, and the stamp (decision only)
+
+For an order destined to an EU member state, Monaco or Norway, IMS decides which consumer VAT regime its VAT was collected under, from facts on the order, and records the answer **once** on the sales order.
+**This change decides and records; nothing builds a document from the stamp yet, so no posted line, invoice total or credit note changes, and the Sales Invoices switch is untouched.** (The stamp
+is written by `stampEuVatRegime`, which the invoice treatment will call; until that follows, no order carries one.)
+
+- **Who decides: the setting `eu_vat_regime_mode`.** `adopt_plugin` (the default, and what an unset value means) is the parallel phase while the storefront plugin still posts: IMS **adopts the plugin's decision** instead of re-making
+  it. The account the plugin recorded on the order (`_o3d_ioss_vat_account`) determines the regime: the *EU IOSS/VOEC VAT collected* account is IOSS (VOEC for Norway), the *EU DDP charges collected* account is DDP; any other value
+  refuses. An order **with scheme VAT and no such meta refuses**; IMS does not guess (an order with no scheme VAT, such as a UK sale, needs none). The plugin's conversion is recorded in the stamp's basis from three order metas it
+  will write: `_o3d_ioss_fx_rate` (threshold-currency units per one order-currency unit), `_o3d_ioss_fx_pair` (for example `GBP>EUR`) and `_o3d_ioss_threshold_value`. IMS's own value test still runs as a cross-check and a disagreement
+  is the warning `adopted_regime_differs` (never a refusal). With the account present, a conversion record that is **incomplete or unreadable** (the rate, pair and threshold value are written together; the rate must be a positive
+  decimal, the pair like `GBP>EUR`), or an `_o3d_ioss_reason` carrying the plugin's "FX meta already present and different from this decision; left unchanged" marker, **refuses** (`plugin_fx_incomplete`, `plugin_fx_conflict`).
+  With a complete conversion record the plugin's evidence must also agree with itself and with the order, or the order refuses (`plugin_evidence_contradicts`): the recorded goods value selects the recorded account as the plugin compares
+  (at the minor unit, strictly above EUR 150 / NOK 3000 is the DDP account, otherwise the IOSS/VOEC account), and the plugin's rate applied to the goods IMS sees must give the recorded value within 0.02 in the threshold currency (unflagged goods lines may be
+  gift cards the plugin left out, so the recorded value may lie anywhere between the known goods alone and all the goods). A conversion field that is present but unreadable is an unreadable figure of the order and refuses first in both modes.
+  An order with the account and **no** conversion record at all (from before the plugin wrote it) is a deliberate exception: it is stamped from the account and the basis records `pluginFx` as "not recorded by the plugin", so historic orders still work; a pair other than the order's refuses; the 5% band is not raised in this mode. `decide` is the state after the switchover: IMS decides by value with
+  its own order-date rates, as below. A stored value that is neither mode is not coerced; it reads as invalid and the caller refuses.
+- **The regimes (decide mode).** **IOSS**: an EU member state or Monaco, goods at or under EUR 150. **VOEC**: Norway, goods at or under NOK 3000. **DDP**: over the threshold, VAT collected by the seller as delivered-duty-paid.
+  The thresholds are constants, not settings. Over means **strictly** over, compared at the minor unit: exactly 150.00 is IOSS, 150.01 is DDP, and 150.004 rounds to 150.00.
+- **The value tested** is the sum of the goods lines after coupons, excluding VAT, shipping and fees, with gift cards left out. A gift card is a line carrying the order-line flag `_o3d_is_voucher` (yes). The product-level marker
+  (`_coupon_title`) is not on the order and IMS imports no product meta (that would need a product column, a product-sync change and a lookup), so a line with no readable flag is **unknown**, not goods and not a gift card. In decide
+  mode an order **refuses** (`voucher_status_unknown`) when taking its unknown lines out would change the regime; unknown lines that cannot change it do not matter. Note what this means in practice: until the storefront writes the
+  flag (yes or no) on every goods line, a decide-mode order over the threshold refuses. Adopt mode does not use it. The value is converted to EUR (NOK for Norway) at the **order date** with IMS's own rates (the Aelia-fed `fx_rates`), through
+  the base currency. In decide mode no rate for the day refuses the order; nothing is defaulted. Because the plugin converts with its live rate at send time, a boundary order can decide differently from the plugin (owner ruling): in
+  decide mode any value within 5% of the threshold, either side, carries the warning `threshold_band`, and the stamp records the rate used.
+- **How a rate is recognised.** By WooCommerce rate id through the mapping, never by label. A scheme rate is an IMS rate with a `reportingCategory` of IOSS (Norway: VOEC) **and** a `schemePostingTaxType`; one without the other is
+  misconfigured and refuses. The destination is the shipping country, else the billing country; only EU-27, Monaco and Norway can be on the scheme.
+- **What refuses** (nothing is posted for it and nothing is stamped; it is decided afresh once fixed): a rate that charged money and is unmapped or mapped to an inactive IMS rate; a rate of an EU country, Monaco or Norway that
+  charged money and is **not** on the scheme (no goods ship from EU stock, so it is never treated as OSS); UK or Isle of Man VAT charged outside its own territory; a scheme rate on a destination outside the allowlist or of another
+  country (or the wrong scheme for Norway); more than one scheme posting type on an order; tax charged to a covered destination with no scheme rate identified; scheme VAT on an order flagged VAT-exempt; an EU VAT Compliance
+  record that is present and non-empty but disagrees with the tax lines by more than 0.02 or is in another currency (an absent or empty record never refuses); tax that moved on a rate other than the scheme rates, or a WooCommerce order tax that is not the scheme total by more than 0.02; no usable exchange rate (decide mode); no account configured for the VAT line; in adopt mode, no plugin account on an order with scheme VAT, or one that is neither configured account.
+- **Unreadable is named, never zero.** A goods total, a tax line amount or rate id, the order tax, the order currency, the over-threshold duty fee total, or the plugin's account or reason that is present but cannot be read refuses the whole order
+  before anything is decided (`order_figure_unreadable`, the reason lists each). A non-empty EU VAT record whose total, currency or shape cannot be read refuses a scheme order (`vat_record_unreadable`); an empty one (no rates) is absent and
+  never refuses. An unreadable EAS payload only warns (`eas_unreadable`). In adopt mode the plugin's conversion pair must be the order's own (order currency > EUR, or > NOK for Norway); any other pair refuses as `plugin_fx_conflict`.
+- **What is skipped.** An order with no scheme VAT is left alone. An EU-27 business sale flagged `is_vat_exempt` with no tax is recorded as a skip that says so, for the zero-rating that follows; Norway and Monaco are not treated that way. A zero-tax EU-27 order whose `is_vat_exempt` is missing or unreadable is **not** skipped: it refuses (`vat_exempt_status_unknown`) until its B2B status is known.
+- **Warnings, never refusals.** `threshold_band` (decide mode), `adopted_regime_differs` (adopt mode), `eas_unreadable`, `eas_disagrees` (the EAS merchandise figure, same currency, differs from the goods value by more than 0.02; EAS never decides, and Norway has none), `plugin_account_differs` (decide mode: the plugin recorded another VAT account on the order than IMS resolves) and `label_regime_disagrees` (accounting resolves by value, the customs label by the presence of the over-threshold duty fee;
+  accounting follows value, and a label that disagrees is a separate fix in the label service. Norway is not compared).
+- **The stamp** is four columns on the sales order. `euVatRegime` (IOSS, VOEC or DDP; NULL on an order decided to be outside the scheme), `euVatLineAccount` (the account code the one VAT line will post to, 821 or 232 in the live chart;
+  the same form as the plugin's `_o3d_ioss_vat_account`, so a credit note on an order the plugin handled before cut-over can use either), `euVatRegimeStampedAt` (set by every successful decision; NULL means never decided) and
+  `euVatRegimeBasis` (threshold, goods value, converted value, the exchange rate and its date, the rates and the warnings; no personal data). It is written by a compare-and-set that matches only an unstamped order, under
+  the order's row lock, so two builders agree on whichever wrote first, and a stamped order is **never re-derived**: a later exchange rate cannot move it between regimes. The database refuses a regime without an account and a
+  marker. The VAT accounts come from the *EU IOSS/VOEC VAT collected* and *EU DDP charges collected* account roles.
+- **Orders that predate the stamp** carry none. A credit note on a scheme order with no stamp must come from the plugin's recorded account or go to the exceptions queue (the credit-note change).
 
 ## Invoice PDF & Email
 
@@ -2648,7 +2740,7 @@ Three things about those rows:
 | `sales_invoice_order` (SALES_INVOICE / SalesOrder) | The invoice is queued once, when the order is created or finalised, and nothing queues it again. |
 | `sales_invoice_import` (SALES_INVOICE / SalesOrder) | The invoice is queued once, when the WooCommerce order is imported, and nothing queues it again. |
 | `stock_adjustment_journal` (INVENTORY_ADJUSTMENT / StockMovement) | The journal is queued once, with the stock movement; nothing queues it again for that movement. |
-| `purchase_order_cancellation_reversal` (INVENTORY_ADJUSTMENT / PurchaseOrder) | The reversal is queued once, when the purchase order is cancelled, which cannot happen twice. |
+| `purchase_order_cancellation_reversal` (INVENTORY_ADJUSTMENT / PurchaseOrder) | Retired. Cancelling a part-received purchase order now closes it short and queues no reversal, so nothing raises this posting any more; the kind stays so a row already in the inbox can still be marked handled. |
 | `supplier_return_reversal` (INVENTORY_ADJUSTMENT / PurchaseReturn) | The reversal is queued once, with the return; raising the return again would be a second return. |
 | `stock_receipt_journal` (STOCK_RECEIPT / PurchaseOrder) | The journal is queued once, with the receipt; receiving again is a different receipt. |
 | `purchase_invoice` (PURCHASE_INVOICE / PurchaseInvoice) | The bill is queued once, when it is created; creating it again would be a second bill. |
@@ -2718,7 +2810,7 @@ cannot be queued, the IMS action still completes where that is the right thing t
 still received, a bill is still recorded), but the posting is listed as outstanding on **Sync →
 Exceptions** (above) and an **ERROR** is written to the activity log naming what
 stands in IMS, what the ledger is missing, and what to do — for example `stock_receipt_journal_not_queued`,
-`purchase_invoice_not_queued`, `supplier_return_journal_not_queued`, `purchase_order_cancel_journal_not_queued`,
+`purchase_invoice_not_queued`, `supplier_return_journal_not_queued`,
 `landed_cost_reclass_not_queued`, `landed_cost_cogs_journal_not_queued`, `manufacturing_journal_not_queued`,
 `manufacturing_reclass_not_queued`, `inventory_adjustment_journal_not_queued`, `sales_invoice_not_queued`,
 `realised_fx_journal_not_queued` and `tax_rate_sync_not_queued`. Where marking something done would be

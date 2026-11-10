@@ -310,16 +310,13 @@ async function expectPoStatus(page: Page, label: string): Promise<void> {
  */
 export async function cancelPurchaseOrder(page: Page, opts: { expectStatus?: string } = {}): Promise<void> {
   const expectStatus = opts.expectStatus ?? 'Cancelled'
-  const accept = (d: { accept: () => Promise<void> }) => { void d.accept() }
-  page.on('dialog', accept)
-  try {
-    await page.getByRole('button', { name: /^Cancel PO$/ }).click()
-    await expectPoStatus(page, expectStatus)
-  } finally {
-    page.off('dialog', accept)
-  }
+  // The action button is "Cancel PO" (nothing received) or "Cancel balance" (part-received); both open a confirmation dialog
+  // (a Radix dialog, not a native confirm) whose confirm button is "Cancel order" or "Drop the balance".
+  await page.getByRole('button', { name: /^(Cancel PO|Cancel balance)$/ }).click()
+  await page.getByRole('button', { name: /^(Cancel order|Drop the balance)$/ }).click()
+  await expectPoStatus(page, expectStatus)
 
-  // Same reason as receiveGoods: handleCancel fires router.refresh() WITHOUT awaiting it (:1991),
+  // Same reason as receiveGoods: the dialog's completion fires router.refresh() WITHOUT awaiting it,
   // so the caller needs a page that has actually re-read the server.
   await page.reload()
   await expectPoStatus(page, expectStatus)

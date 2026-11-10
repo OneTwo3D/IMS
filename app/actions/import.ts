@@ -1972,6 +1972,8 @@ async function importSalesOrdersCsvLocked(formData: FormData, fxGuard: FxTableGu
         currentSaved = true
         const warnings = [...(created.postCommitWarnings ?? [])]
         try {
+          // The order is a DRAFT, and allocation declines a draft (it is allocated, and its invoice queued, when it is finalised); this
+          // only ever acts for a caller that created the order live.
           await autoAllocateOrder(created.order.id)
         } catch (allocationError) {
           warnings.push(`stock was NOT allocated to the order (${String(allocationError)})`)

@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { listBackups, deleteBackup, type BackupEntry } from '@/app/actions/backup'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { useStepUpReauth, isFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
@@ -34,6 +35,8 @@ export function BackupRestore() {
   const [uploading, setUploading] = useState<string | null>(null)
   const [showRestore, setShowRestore] = useState<{ filename: string } | null>(null)
   const [showUploadRestore, setShowUploadRestore] = useState(false)
+  const [showDelete, setShowDelete] = useState<BackupEntry | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
   const [restoreConfirm, setRestoreConfirm] = useState('')
   const [restoreToken, setRestoreToken] = useState('')
   const [restoreTokenStatus, setRestoreTokenStatus] = useState<string | null>(null)
@@ -165,17 +168,21 @@ export function BackupRestore() {
     }
   }
 
-  async function handleDelete(filename: string) {
+  async function handleDelete(filename: string, typedName: string) {
     startTransition(async () => {
       setMsg(null)
-      let result = await deleteBackup(filename)
+      setDeleteError(null)
+      const confirmation = { confirmed: true, typedName } as const
+      let result = await deleteBackup(filename, confirmation)
       if (isFreshAuthFailure(result) && (await promptReauth())) {
-        result = await deleteBackup(filename)
+        result = await deleteBackup(filename, confirmation)
       }
       if (!result.success) {
-        setMsg({ text: result.error ?? 'Failed to delete backup.', isError: true })
+        setDeleteError(result.error ?? 'Failed to delete backup.')
         return
       }
+      setShowDelete(null)
+      setMsg({ text: `Deleted backup ${filename}.`, isError: false })
       await refreshList()
     })
   }
@@ -284,24 +291,53 @@ export function BackupRestore() {
                     void sendRestoreTokenEmail()
                   }}
                   title="Restore this backup"
+                  aria-label={`Restore ${b.filename}`}
                 >
                   <RefreshCw className="h-3 w-3" />
                 </Button>
+              </div>
+              {/* Delete is labelled, separated from the restore icon by a divider and a gap, and confirmed in a dialog. */}
+              <div className="ml-4 border-l pl-4">
                 <Button
                   variant="ghost"
                   size="sm"
                   className="h-7 text-xs text-destructive"
-                  onClick={() => handleDelete(b.filename)}
+                  onClick={() => { setDeleteError(null); setShowDelete(b) }}
                   disabled={isPending}
-                  title="Delete backup"
+                  aria-label={`Delete ${b.filename}`}
                 >
-                  <Trash2 className="h-3 w-3" />
+                  <Trash2 className="mr-1 h-3 w-3" aria-hidden="true" />
+                  Delete
                 </Button>
               </div>
             </div>
           ))}
         </div>
       )}
+
+      <ConfirmDialog
+        open={showDelete !== null}
+        onOpenChange={(open) => { if (!open) setShowDelete(null) }}
+        title="Delete backup"
+        destructive
+        confirmLabel="Delete backup"
+        typedConfirmation={showDelete ? { expected: showDelete.filename, prompt: 'Type the backup name' } : undefined}
+        pending={isPending}
+        error={deleteError}
+        onConfirm={(typed) => { if (showDelete) void handleDelete(showDelete.filename, typed) }}
+        description={showDelete ? (
+          <>
+            <p>
+              This permanently deletes the backup file <code className="rounded bg-muted px-1 text-xs">{showDelete.filename}</code> ({fmtSize(showDelete.size)},
+              created {fmtDate(showDelete.createdAt)}) from this server, together with its manifest file if it has one.
+            </p>
+            <p>
+              Copies already uploaded to S3 or SFTP are not touched. If this is the only copy, it cannot be recovered.
+              {backups[0]?.filename === showDelete.filename ? ' This is the newest backup.' : ''}
+            </p>
+          </>
+        ) : null}
+      />
 
       {/* Restore from existing backup dialog */}
       {showRestore && (

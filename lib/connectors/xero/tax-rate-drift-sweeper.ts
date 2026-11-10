@@ -33,6 +33,11 @@ export type TaxRateDriftSweepDeps = {
   fetchXeroTaxRates: () => Promise<XeroTaxRate[]>
   /** Record a single drifted rate (e.g. write an ActivityLog WARNING). */
   recordDrift: (item: DriftSweepItem) => Promise<void>
+  /**
+   * The by-CODE check of the scheme posting types (scheme-posting-drift.ts). Runs on every sweep, before the by-name comparison's early return, because a rate with no components is never in the
+   * profiles and its posting type is a different Xero rate from the one it is named for. Its items are recorded like any other drift.
+   */
+  checkSchemePosting?: () => Promise<Array<{ taxRateId: string; name: string; lines: string[] }>>
   /** Stamp the last-checked time so the UI can show "checked N ago". */
   recordCheckedAt?: (at: Date) => Promise<void>
   now?: () => Date
@@ -53,6 +58,13 @@ export async function sweepTaxRateDrift(deps: TaxRateDriftSweepDeps): Promise<Ta
   //
   // (This holds for the DI sweep itself. The cron wiring, runXeroTaxRateDriftSweep, reads the list once up front because
   // Xero is now the tax-rate master and the stored list must be kept current whether or not IMS has anything to compare.)
+  const schemeItems: DriftSweepItem[] = []
+  for (const found of (await deps.checkSchemePosting?.()) ?? []) {
+    const result: TaxRateDriftResult = { status: 'mismatch', changes: [] }
+    const item: DriftSweepItem = { taxRateId: found.taxRateId, name: found.name, result, lines: found.lines }
+    schemeItems.push(item)
+    await deps.recordDrift(item)
+  }
   const imsProfiles = await deps.loadImsProfiles()
   if (imsProfiles.length === 0) {
     // Still stamp the check: "we looked and there was nothing to compare" is a successful sweep,
@@ -60,15 +72,15 @@ export async function sweepTaxRateDrift(deps: TaxRateDriftSweepDeps): Promise<Ta
     if (deps.recordCheckedAt) {
       await deps.recordCheckedAt(deps.now ? deps.now() : new Date())
     }
-    return { checked: 0, drifted: 0, items: [] }
+    return { checked: 0, drifted: schemeItems.length, items: schemeItems }
   }
 
   const xeroRates = await deps.fetchXeroTaxRates()
   const xeroByName = new Map<string, XeroTaxRate>()
   for (const rate of xeroRates) xeroByName.set(nameKey(rate.Name), rate)
 
-  const items: DriftSweepItem[] = []
-  let drifted = 0
+  const items: DriftSweepItem[] = [...schemeItems]
+  let drifted = schemeItems.length
   for (const { taxRateId, profile } of imsProfiles) {
     const xeroRate = xeroByName.get(nameKey(profile.name)) ?? null
     const result = computeTaxRateDrift(profile, xeroRate)
@@ -103,7 +115,10 @@ export function buildDriftSnapshot(result: TaxRateDriftSweepResult): TaxRateDrif
   const entries: TaxRateDriftSnapshotEntry[] = []
   for (const item of result.items) {
     if (item.result.status === 'mismatch' || item.result.status === 'missing-on-xero') {
-      entries.push({ taxRateId: item.taxRateId, name: item.name, status: item.result.status, lines: item.lines })
+      // One entry per rate: a rate can drift by name (the comparison above) and by its scheme posting code (scheme-posting-drift.ts); the reader keeps the first entry of a rate.
+      const same = entries.find((entry) => entry.taxRateId === item.taxRateId)
+      if (same) same.lines.push(...item.lines)
+      else entries.push({ taxRateId: item.taxRateId, name: item.name, status: item.result.status, lines: [...item.lines] })
     }
   }
   return entries
@@ -177,7 +192,27 @@ export async function runXeroTaxRateDriftSweep(): Promise<TaxRateDriftSweepResul
     }
   }
 
+  const { loadEuVatSeed } = await import('@/lib/tax/eu-vat-seed')
+  const { computeSchemePostingDrift } = await import('./scheme-posting-drift')
   const result = await sweepTaxRateDrift({
+    async checkSchemePosting() {
+      // Only settings are read (no request): the store configured now, to match the declared mappings against.
+      const [{ getWcCredentials }, { normaliseStoreIdentity }] = await Promise.all([import('@/lib/connectors/woocommerce/api'), import('@/lib/connectors/woocommerce/tax-rate-plan')])
+      const creds = await getWcCredentials().catch(() => null)
+      const [components, rates, mappings] = await Promise.all([
+        db.taxRateComponent.findMany({ select: { taxRateId: true, rate: true, compoundOnPrevious: true, active: true, sortOrder: true } }),
+        db.taxRate.findMany({ select: { id: true, name: true, rate: true, countryCode: true, taxCategory: true, active: true, usedFor: true, reverseCharge: true, schemePostingTaxType: true, reportingCategory: true, accountingTaxType: true } }),
+        db.shoppingTaxRateMapping.findMany({ where: { connector: 'woocommerce' }, select: { externalTaxRateId: true, taxRateId: true, storeIdentity: true, externalCountry: true, externalRatePct: true, externalClass: true } }),
+      ])
+      return computeSchemePostingDrift({
+        declared: loadEuVatSeed().rates,
+        mappings: mappings.map((m) => ({ ...m, externalRatePct: m.externalRatePct.toFixed() })),
+        rates: rates.map((r) => ({ taxRateId: r.id, name: r.name, rate: r.rate.toFixed(), countryCode: r.countryCode, taxCategory: r.taxCategory, active: r.active, usedFor: r.usedFor, reverseCharge: r.reverseCharge, accountingTaxType: r.accountingTaxType, reportingCategory: r.reportingCategory, schemePostingTaxType: r.schemePostingTaxType })),
+        storeIdentity: creds === null ? null : normaliseStoreIdentity(creds.url),
+        xero: fetchedRows,
+        componentRates: components.map((c) => ({ ...c, rate: c.rate.toFixed() })),
+      })
+    },
     async loadImsProfiles() {
       const rows = await db.taxRate.findMany({
         where: { active: true, components: { some: { active: true } } },

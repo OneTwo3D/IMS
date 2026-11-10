@@ -111,6 +111,7 @@ type SyncBinding = {
   connector: string
   active: boolean
   externalWarehouseId: string
+  connectionId: string
   stockSyncMode: 'DISABLED' | 'NOTIFICATION_ONLY' | 'ALIGN_TO_WMS'
   syncFrequencyMinutes: number
   discrepancyThresholds: Prisma.JsonValue | null
@@ -131,6 +132,8 @@ type SyncBinding = {
 
 type SyncSummary = {
   externalWarehouseId: string
+  /** Stamped so dry-run evidence can be matched to the connection it ran against. */
+  connectionId: string
   thresholdBreaches: number
   notifiedUsers: number
   dryRun?: boolean
@@ -196,6 +199,7 @@ async function getSyncBinding(bindingId: string): Promise<SyncBinding | null> {
       connector: true,
       active: true,
       externalWarehouseId: true,
+      connectionId: true,
       stockSyncMode: true,
       syncFrequencyMinutes: true,
       discrepancyThresholds: true,
@@ -274,6 +278,26 @@ async function heartbeatStockSyncJob(jobId: string, binding: SyncBinding, leaseT
   return updated.count === 1
 }
 
+/**
+ * A stock sync that is running for this IMS warehouse RIGHT NOW: RUNNING and still heartbeating (a job
+ * whose heartbeat is older than the reclaim window is dead and does not count — the reservation reclaims
+ * it the same way). Used to refuse re-pointing a binding underneath a run that keeps its start-time
+ * snapshot of the pairing and the dry-run flag.
+ */
+export async function findLiveStockSyncForWarehouse(
+  client: { wmsSyncJob: { findFirst: typeof db.wmsSyncJob.findFirst } },
+  warehouseId: string,
+): Promise<{ id: string } | null> {
+  const running = await client.wmsSyncJob.findFirst({
+    where: { connector: 'mintsoft', type: 'STOCK_SYNC', warehouseId, status: 'RUNNING' },
+    select: { id: true, startedAt: true, summary: true },
+    orderBy: { startedAt: 'desc' },
+  })
+  if (!running) return null
+  const lastHeartbeatAt = parseRunningHeartbeat(running.summary) ?? running.startedAt
+  return lastHeartbeatAt < new Date(Date.now() - STALE_RUNNING_STOCK_SYNC_MS) ? null : { id: running.id }
+}
+
 async function reserveStockSyncJob(
   bindingId: string,
   triggeredBy: string,
@@ -291,6 +315,7 @@ async function reserveStockSyncJob(
         connector: true,
         active: true,
         externalWarehouseId: true,
+        connectionId: true,
         stockSyncMode: true,
         syncFrequencyMinutes: true,
         discrepancyThresholds: true,
@@ -3038,6 +3063,7 @@ export async function runStockSyncForBinding(
     const status: 'SUCCEEDED' | 'PARTIAL' = counters.errors > 0 ? 'PARTIAL' : 'SUCCEEDED'
     const summary: SyncSummary = {
       externalWarehouseId: binding.externalWarehouseId,
+      connectionId: binding.connectionId,
       thresholdBreaches,
       notifiedUsers,
       dryRun: alignmentDryRun,
@@ -3086,6 +3112,7 @@ export async function runStockSyncForBinding(
 
     await completeJob(job.id, 'FAILED', counters, {
       externalWarehouseId: binding.externalWarehouseId,
+      connectionId: binding.connectionId,
       thresholdBreaches: 0,
       notifiedUsers: 0,
       dryRun: alignmentDryRun,
@@ -3128,21 +3155,26 @@ export async function runStockSyncForBinding(
   }
 }
 
-export async function createMintsoftBindingHandover(
-  bindingId: string,
-  triggeredBy: string,
-): Promise<string | null> {
-  const binding = await getSyncBinding(bindingId)
-  if (!binding) return null
+type HandoverClient = Pick<Prisma.TransactionClient, 'wmsStockSnapshot' | 'wmsStockDiscrepancy' | 'wmsSyncJob' | 'externalWmsBinding'>
 
+/**
+ * Records the handover (a SUCCEEDED stock-sync job plus the binding's last-sync stamps) on `client`.
+ * Callers that save the binding at the same time pass their transaction, so a refused save leaves no
+ * handover behind.
+ */
+export async function writeMintsoftBindingHandover(
+  client: HandoverClient,
+  binding: { id: string; warehouseId: string },
+  triggeredBy: string,
+): Promise<string> {
   const [snapshotCount, discrepancyCount] = await Promise.all([
-    db.wmsStockSnapshot.count({
+    client.wmsStockSnapshot.count({
       where: {
         connector: 'mintsoft',
         warehouseId: binding.warehouseId,
       },
     }),
-    db.wmsStockDiscrepancy.count({
+    client.wmsStockDiscrepancy.count({
       where: {
         connector: 'mintsoft',
         warehouseId: binding.warehouseId,
@@ -3151,7 +3183,7 @@ export async function createMintsoftBindingHandover(
     }),
   ])
 
-  const job = await db.wmsSyncJob.create({
+  const job = await client.wmsSyncJob.create({
     data: {
       connector: 'mintsoft',
       type: 'STOCK_SYNC',
@@ -3169,7 +3201,7 @@ export async function createMintsoftBindingHandover(
     select: { id: true },
   })
 
-  await db.externalWmsBinding.update({
+  await client.externalWmsBinding.update({
     where: { id: binding.id },
     data: {
       lastStockSyncAt: new Date(),
@@ -3184,6 +3216,15 @@ export async function createMintsoftBindingHandover(
   })
 
   return job.id
+}
+
+export async function createMintsoftBindingHandover(
+  bindingId: string,
+  triggeredBy: string,
+): Promise<string | null> {
+  const binding = await getSyncBinding(bindingId)
+  if (!binding) return null
+  return writeMintsoftBindingHandover(db, binding, triggeredBy)
 }
 
 export async function clearMintsoftAlignmentCreditsForBinding(bindingId: string): Promise<{

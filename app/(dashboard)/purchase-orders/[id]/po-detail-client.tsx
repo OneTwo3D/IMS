@@ -44,7 +44,6 @@ import type { AccountingBankAccount } from '@/lib/accounting'
 import type { RejectedAccountingDocumentUpdateWarning } from '@/lib/domain/accounting/rejected-sync-warnings'
 import type { PurchaseOrderOverBillingSummary } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
 import type { PrepaidReconciliationSummary } from '@/lib/domain/purchasing/prepaid-reconciliation'
-import type { PurchaseOrderConsumedCostSummary } from '@/lib/domain/purchasing/po-cancellation'
 import type { SupplierRow } from '@/app/actions/suppliers'
 import type { ProductRow } from '@/app/actions/products'
 import type { CurrencyRow } from '@/app/actions/currencies'
@@ -1945,6 +1944,88 @@ function ShipDialog({
 }
 
 // ---------------------------------------------------------------------------
+// Close / cancel confirmation. Says what will happen, with the numbers on the page.
+// ---------------------------------------------------------------------------
+
+function RetirePoDialog({
+  po,
+  intent,
+  onClose,
+  onDone,
+}: {
+  po: PoDetail
+  intent: 'close' | 'cancel'
+  onClose: () => void
+  onDone: (result: { notice?: string; warnings?: string[] }) => void
+}) {
+  const [isPending, startTransition] = useTransition()
+  const [error, setError] = useState('')
+  const received = po.lines.reduce((sum, l) => sum + l.qtyReceived, 0)
+  const ordered = po.lines.reduce((sum, l) => sum + l.qty, 0)
+  const due = po.lines.reduce((sum, l) => sum + Math.max(0, l.qty - l.qtyReceived), 0)
+  const hasReceived = received > 0
+  const fullyReceived = hasReceived && due <= 0.0001
+
+  const title = hasReceived && !fullyReceived
+    ? (intent === 'close' ? 'Close short' : 'Cancel the unreceived balance')
+    : (intent === 'close' ? 'Close this purchase order' : 'Cancel this purchase order')
+
+  function confirm() {
+    setError('')
+    startTransition(async () => {
+      const result = intent === 'close' ? await advancePoStatus(po.id, 'CLOSED') : await cancelPurchaseOrder(po.id)
+      if (result.success) onDone({ notice: result.notice, warnings: result.warnings })
+      else setError(result.error ?? 'Failed')
+    })
+  }
+
+  return (
+    <Dialog open onOpenChange={() => {}}>
+      <DialogContent showCloseButton={false} className="max-w-lg sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{title} — {po.reference}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-3 text-sm">
+          {hasReceived && !fullyReceived ? (
+            <>
+              <p>
+                Received <span className="font-medium">{received}</span> of <span className="font-medium">{ordered}</span> units.
+                The <span className="font-medium">{due}</span> still due will be dropped and no longer counted as incoming.
+              </p>
+              <p>
+                The <span className="font-medium">{received}</span> already received <span className="font-medium">stay in stock at their cost</span>.
+                Nothing is taken out of stock and no accounting entry is made. {intent === 'cancel' ? 'Cancel and Close do the same thing on a part-received order, and the order ends as Closed.' : ''}
+              </p>
+              <p className="text-muted-foreground">
+                To take received goods back out of stock, use <span className="font-medium">Return Items</span> first (a return keeps the order open), then close it.
+                Received goods that are not billed yet can still be billed afterwards.
+              </p>
+            </>
+          ) : fullyReceived ? (
+            <p>Close this purchase order? Everything ordered has been received. Nothing else is expected, and a closed order cannot be reopened or have goods returned against it.</p>
+          ) : intent === 'cancel' ? (
+            <p>Cancel this purchase order? Nothing has been received, so stock and accounts are unchanged. An order with a supplier bill cannot be cancelled; credit the bill first.</p>
+          ) : (
+            <p>Close this purchase order? Nothing has been received, so stock and accounts are unchanged. The order stops counting as incoming and cannot be reopened.</p>
+          )}
+          <p className="text-xs text-muted-foreground">
+            If the warehouse has an open ASN for this order, book it in or retire it first; the order cannot be {intent === 'cancel' ? 'cancelled' : 'closed'} while it is open.
+          </p>
+          {error && <p className="text-sm text-destructive">{error}</p>}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={isPending}>Keep order open</Button>
+          <Button variant={intent === 'cancel' ? 'destructive' : 'default'} onClick={confirm} disabled={isPending}>
+            {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+            {hasReceived && !fullyReceived ? 'Drop the balance' : (intent === 'close' ? 'Close order' : 'Cancel order')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Main detail component
 // ---------------------------------------------------------------------------
 
@@ -1982,21 +2063,30 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const [editBillFor, setEditBillFor] = useState<InvoiceRow | null>(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
-  const [cancelConsumedCost, setCancelConsumedCost] = useState<PurchaseOrderConsumedCostSummary | null>(null)
+  const [warnings, setWarnings] = useState<string[]>([])
+  const [retireIntent, setRetireIntent] = useState<'close' | 'cancel' | null>(null)
 
-  const canEdit = po.status === 'DRAFT'
+  // Edit / Close / Cancel at every stage (lib/domain/workflows/purchase-order-state.ts is the server's table). Edit: Draft through
+  // Part-received (a freight order keeps its own Edit Costs and is only editable here as a draft). Close and Cancel: while unreceived and
+  // when part-received. On a part-received order both drop the balance and keep the received stock.
+  const canEdit = po.type === 'FREIGHT'
+    ? po.status === 'DRAFT'
+    : ['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED', 'PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'].includes(po.status)
   const canRfq = po.status === 'DRAFT' || po.status === 'RFQ_SENT'
   const canAdvanceToQuoteReceived = po.status === 'RFQ_SENT'
   const canAdvanceToOrdered = po.status === 'DRAFT' || po.status === 'QUOTE_RECEIVED'
   const canShip = po.status === 'PO_SENT'
   const canReceive = ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'].includes(po.status)
   const canReturn = ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RECEIVED', 'INVOICED', 'PARTIALLY_RETURNED'].includes(po.status)
-  const canClose = po.status === 'RECEIVED'
+  const canClose = ['RFQ_SENT', 'QUOTE_RECEIVED', 'PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'PARTIALLY_RETURNED', 'RECEIVED', 'INVOICED'].includes(po.status)
   const hasBillableProduct = po.lines.some((l) => l.qty - l.qtyBilled > 0)
   const hasBillableCost = po.freightCostLines.some((c) => c.amountForeign - c.amountBilled > 0)
   const hasBillableItems = hasBillableProduct || hasBillableCost
   const canBill = ['PO_SENT', 'SHIPPED', 'RFQ_SENT', 'PARTIALLY_RECEIVED', 'RECEIVED', 'PARTIALLY_RETURNED'].includes(po.status) && hasBillableItems
-  const canCancel = po.status === 'DRAFT' || po.status === 'PARTIALLY_RECEIVED'
+  const canCancel = ['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED', 'PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'PARTIALLY_RETURNED'].includes(po.status)
+  const receivedQtyTotal = po.lines.reduce((sum, l) => sum + l.qtyReceived, 0)
+  const orderedQtyTotal = po.lines.reduce((sum, l) => sum + l.qty, 0)
+  const closedShort = po.status === 'CLOSED' && receivedQtyTotal > 0 && po.lines.some((l) => l.qty - l.qtyReceived > 0.0001)
   const hasRemaining = po.lines.some((l) => l.qtyToReceive > 0)
   const hasReturnable = po.lines.some((l) => l.qtyReceived - l.qtyReturned > 0)
 
@@ -2027,16 +2117,6 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
     })
   }
 
-  function handleClose() {
-    if (!confirm('Close this purchase order? This is a terminal status.')) return
-    setError('')
-    startTransition(async () => {
-      const result = await advancePoStatus(po.id, 'CLOSED')
-      if (result.success) router.refresh()
-      else setError(result.error ?? 'Failed')
-    })
-  }
-
   function getRfqMailtoLink() {
     const email = supplier?.email
     if (!email) return null
@@ -2051,24 +2131,6 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
     return `mailto:${email}?subject=${subject}&body=${body}`
   }
 
-  function handleCancel() {
-    if (!confirm('Cancel this purchase order?')) return
-    setError('')
-    setNotice('')
-    setCancelConsumedCost(null)
-    startTransition(async () => {
-      const result = await cancelPurchaseOrder(po.id)
-      if (result.success) {
-        if (result.notice) setNotice(result.notice)
-        if (result.consumedCost && Number(result.consumedCost.consumedQty) > 0) {
-          setCancelConsumedCost(result.consumedCost)
-        }
-        router.refresh()
-      }
-      else setError(result.error ?? 'Failed')
-    })
-  }
-
   const supplier = suppliers.find((s) => s.id === po.supplierId)
 
   return (
@@ -2078,6 +2140,14 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
         <span className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${STATUS_CLASS[po.status]}`}>
           {STATUS_LABELS[po.status]}
         </span>
+        {closedShort && (
+          <span
+            className="inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium bg-amber-100 text-amber-900 dark:bg-amber-900 dark:text-amber-100 border-amber-200"
+            title="The unreceived balance was dropped. The goods received stay in stock at their cost."
+          >
+            Closed short: received {receivedQtyTotal} of {orderedQtyTotal}
+          </span>
+        )}
         {po.isInvoiced && po.status !== 'INVOICED' && (
           <span className="inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200 border-purple-200">
             Invoiced
@@ -2166,14 +2236,13 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             </Button>
           )}
           {canClose && !editing && (
-            <Button variant="secondary" size="sm" onClick={handleClose} disabled={isPending}>
-              {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <CheckCircle2 className="h-4 w-4 mr-1" />}
-              Close PO
+            <Button variant="secondary" size="sm" onClick={() => setRetireIntent('close')} disabled={isPending}>
+              <CheckCircle2 className="h-4 w-4 mr-1" />{receivedQtyTotal > 0 && hasRemaining ? 'Close short' : 'Close PO'}
             </Button>
           )}
           {canCancel && !editing && (
-            <Button variant="outline" size="sm" className="text-destructive hover:text-destructive" onClick={handleCancel} disabled={isPending}>
-              <Ban className="h-4 w-4 mr-1" />Cancel PO
+            <Button variant="outline" size="sm" className="text-destructive hover:text-destructive" onClick={() => setRetireIntent('cancel')} disabled={isPending}>
+              <Ban className="h-4 w-4 mr-1" />{receivedQtyTotal > 0 ? 'Cancel balance' : 'Cancel PO'}
             </Button>
           )}
         </div>
@@ -2242,16 +2311,12 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
           </p>
         </div>
       )}
-      {cancelConsumedCost && (
+      {warnings.length > 0 && (
         <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
           <div className="flex gap-2">
             <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
             <div className="space-y-1">
-              <p className="font-medium">
-                {cancelConsumedCost.consumedQty} unit(s) had already been sold or used from this PO before cancellation.
-                {' '}{formatMoney(Number(cancelConsumedCost.consumedValueBase), baseCurrency.symbol, baseCurrency.symbolPosition)} of COGS
-                remains booked against the now-cancelled receipt. Review with finance — IMS does not reverse COGS for units that have left stock.
-              </p>
+              {warnings.map((w) => <p key={w}>{w}</p>)}
             </div>
           </div>
         </div>
@@ -2361,6 +2426,21 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             </div>
           )}
         </div>
+
+      {retireIntent && (
+        <RetirePoDialog
+          po={po}
+          intent={retireIntent}
+          onClose={() => setRetireIntent(null)}
+          onDone={(result) => {
+            setRetireIntent(null)
+            setError('')
+            setNotice(result.notice ?? '')
+            setWarnings(result.warnings ?? [])
+            router.refresh()
+          }}
+        />
+      )}
 
       {/* Edit dialog — reuses the New PO dialog in edit mode */}
       {editing && (

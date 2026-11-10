@@ -339,13 +339,14 @@ one. It is one of **two** builders:
 - **12 call sites reach the from-total form** (5 direct, 7 via
   `buildStockMovementValueFieldsFromConsumed`). These are the FIFO-consumption and snapshot-valued
   paths the transfer refusal never touched, enumerated in §2.
-- **13 call sites go to the sibling `buildStockMovementValueFields` directly and never reach the
-  from-total form at all**: opening stock, purchase receipt, PO cancellation reversal,
+- **12 call sites go to the sibling `buildStockMovementValueFields` directly and never reach the
+  from-total form at all**: opening stock, purchase receipt (the PO cancellation reversal that was a
+  thirteenth is removed: cancelling a part-received order now closes it short),
   customer-return inbound, the positive branch of a stock adjustment, the adjustment-edit addition
   branch, the WooCommerce and CSV historical imports, the Mintsoft allocation sync, and three WMS
   booked-in paths.
 
-Negative-basis cover therefore comes from **both builders refusing** — 25 production call sites
+Negative-basis cover therefore comes from **both builders refusing** — 24 production call sites
 between them, and every costed-movement writer in `app/` and `lib/` routes through one of the two —
 not from this one function being a funnel.
 

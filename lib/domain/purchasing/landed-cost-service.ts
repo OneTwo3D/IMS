@@ -106,6 +106,7 @@ export const LANDED_COST_REVALUATION_REASONS = [
   'freight_purchase_order_created',
   'freight_purchase_order_costs_updated',
   'freight_purchase_order_cancelled',
+  'purchase_order_closed_short',
 ] as const
 
 export type LandedCostRevaluationReason = typeof LANDED_COST_REVALUATION_REASONS[number]
@@ -119,6 +120,13 @@ export type LandedCostRevaluationOptions = {
    * queueLandedCostAdjustmentJournals call). Only the journaling callers pass it.
    */
   scheduleAdjustmentJournals?: boolean
+  /**
+   * Close-short (recalculateDirectLandedCosts only): the allocation basis for an order whose unreceived balance has been
+   * dropped. Per PO line id, the LANDED quantity. When given, every line is allocated over that quantity (and over
+   * `totalBase x landed / qty` for the value basis), so the whole freight is carried by the units that arrived. A line
+   * missing from the map is treated as landed 0.
+   */
+  landedQtyBasis?: ReadonlyMap<string, DecimalInput>
 }
 
 type DecimalInput = Prisma.Decimal | number | string
@@ -1678,13 +1686,21 @@ export async function recalculateDirectLandedCosts(
   // receipt-side writer. Source rank 0 = this PO's own cost lines, 1 = its linked freight POs'.
   const runWarnings: LandedCostRevaluationWarning[] = []
   const allocation = allocateLandedCost(
-    po.lines.map((line) => ({
-      id: line.id,
-      qty: line.qty,
-      unitCostBase: line.unitCostBase,
-      totalBase: line.totalBase,
-      weight: line.product?.weight ?? null,
-    })),
+    po.lines.map((line) => {
+      const basis = options.landedQtyBasis
+      if (!basis) {
+        return { id: line.id, qty: line.qty, unitCostBase: line.unitCostBase, totalBase: line.totalBase, weight: line.product?.weight ?? null }
+      }
+      const landed = decimal(basis.get(line.id) ?? 0)
+      const ordered = decimal(line.qty)
+      return {
+        id: line.id,
+        qty: landed,
+        unitCostBase: line.unitCostBase,
+        totalBase: ordered.gt(0) ? decimal(line.totalBase).mul(landed).div(ordered) : new Prisma.Decimal(0),
+        weight: line.product?.weight ?? null,
+      }
+    }),
     [
       ...po.freightCostLines.map((costLine) => ({ ...costLine, sourceRank: 0 as const })),
       ...po.landedCostLinks.flatMap((link) => link.freightPO.freightCostLines.map((costLine) => ({ ...costLine, sourceRank: 1 as const }))),
