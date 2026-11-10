@@ -5,6 +5,7 @@ import { outstandingPoValueBase } from '@/lib/domain/purchasing/outstanding-po-v
 import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { getSetting } from '@/app/actions/settings'
 import { requirePermission } from '@/lib/auth/server'
+import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { normalizeLineDiscountBase, normalizeOrderDiscountBase } from '@/lib/sales-currency'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
@@ -237,9 +238,6 @@ function getComparisonRange(from: Date, to: Date, mode: CompareMode, fyMonth: nu
   }
 }
 
-// "Completed" sales for dashboard metrics: shipped/completed orders, plus any
-// refunded order (refund state is orthogonal to the lifecycle status now).
-const COMPLETED_LIFECYCLE_STATUSES: ('SHIPPED' | 'COMPLETED')[] = ['SHIPPED', 'COMPLETED']
 const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 // ---------------------------------------------------------------------------
@@ -276,10 +274,8 @@ export async function getDashboardData(
     db.salesOrder.findMany({
       where: {
         createdAt: { gte: fetchFrom },
-        OR: [
-          { status: { in: COMPLETED_LIFECYCLE_STATUSES } },
-          { refundStatus: { not: 'NONE' } },
-        ],
+        // Invoiced revenue basis, shared with Sales Stats, Sales Analytics and AR Aging.
+        ...INVOICED_ORDER_WHERE,
       },
       select: {
         id: true, externalOrderNumber: true, customerName: true, status: true, createdAt: true,
@@ -313,7 +309,8 @@ export async function getDashboardData(
       select: { totalBase: true },
     }),
     db.salesOrderRefund.findMany({
-      where: { refundedAt: { gte: periodFrom, lte: periodTo } },
+      // Only credit against orders that count as invoiced revenue, so the refunds tile nets against the same set.
+      where: { refundedAt: { gte: periodFrom, lte: periodTo }, order: INVOICED_ORDER_WHERE },
       select: { totalBase: true },
     }),
     db.costLayer.findMany({

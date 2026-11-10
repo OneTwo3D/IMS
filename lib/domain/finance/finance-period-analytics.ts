@@ -8,6 +8,7 @@ import { getFxSourceRegime, type FxSourceRegime } from '@/lib/currencies/fx-sour
 import { multiplyMoney, roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
+import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 
 const DEFAULT_PAGE_SIZE = 100
@@ -686,13 +687,13 @@ export async function getArAgingReport(
   const asOfExclusive = window.dateToExclusive
   const orders = await client.salesOrder.findMany({
     where: {
-      status: { not: SalesOrderStatus.CANCELLED },
+      // Invoiced basis (shared with the revenue reports): not cancelled, not draft, has an invoice.
+      ...INVOICED_ORDER_WHERE,
       archived: false,
-      OR: [
+      AND: [{ OR: [
         { invoicedAt: { lt: asOfExclusive } },
         { invoicedAt: null, createdAt: { lt: asOfExclusive } },
-      ],
-      AND: [{ OR: [{ paidAt: null }, { paidAt: { gte: asOfExclusive } }, { payments: { some: { refundId: null, paidAt: { lt: asOfExclusive } } } }] }],
+      ] }, { OR: [{ paidAt: null }, { paidAt: { gte: asOfExclusive } }, { payments: { some: { refundId: null, paidAt: { lt: asOfExclusive } } } }] }],
     },
     select: {
       id: true,
@@ -887,7 +888,7 @@ export async function getCurrencySummaryReport(
   const [salesOrders, purchaseInvoices] = await Promise.all([
     client.salesOrder.findMany({
       where: {
-        status: { not: SalesOrderStatus.CANCELLED },
+        ...INVOICED_ORDER_WHERE,
         archived: false,
         invoicedAt: { gte: window.dateFrom, lt: window.dateToExclusive },
       },

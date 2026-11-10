@@ -55,13 +55,13 @@ import {
   RETURNS_MIXED_BASIS_MARKER,
   RETURNS_MIXED_BASIS_NOTICE,
 } from '@/lib/analytics/refund-figure-surfaces'
+import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
 const MAX_PAGE_SIZE = 500
 const SOURCE_ROW_LIMIT = 50000
 const DEFAULT_PERIOD_DAYS = 30
-const ACTIVE_ORDER_STATUSES = Object.values(SalesOrderStatus).filter((status) => status !== SalesOrderStatus.CANCELLED)
 
 type FindManyDelegate = {
   findMany(args?: unknown): Promise<unknown[]>
@@ -608,7 +608,7 @@ function currencyMode(filters: SalesAnalyticsFilters): SalesCurrencyMode {
 async function loadSalesOrders(client: SalesFulfillmentAnalyticsClient, filters: SalesAnalyticsFilters, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }): Promise<SalesOrderRow[]> {
   return client.salesOrder.findMany({
     where: {
-      status: { in: ACTIVE_ORDER_STATUSES },
+      ...INVOICED_ORDER_WHERE,
       createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
       archived: false,
     },
@@ -661,6 +661,7 @@ async function loadSalesOrdersByIds(client: SalesFulfillmentAnalyticsClient, ord
   return client.salesOrder.findMany({
     where: {
       id: { in: [...new Set(orderIds)] },
+      ...INVOICED_ORDER_WHERE,
       archived: false,
     },
     select: {

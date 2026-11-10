@@ -5,6 +5,7 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
+import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
 import { marginFigureBound, netLinearFigureBound, netOfRefunds, refundLineBucket, refundPctOfSale, refundTotalsBasis, unplacedCreditBoundFromParts, type DerivedFigureBound, type RefundSetBasis, type RefundTotalsBasis } from '@/lib/domain/sales/refund-basis-analytics'
@@ -114,11 +115,8 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
 
   const orders = await db.salesOrder.findMany({
     where: {
-      // Shipped/completed sales plus any refunded order (refund state is orthogonal now).
-      OR: [
-        { status: { in: ['SHIPPED', 'COMPLETED'] } },
-        { refundStatus: { not: 'NONE' } },
-      ],
+      // Invoiced revenue basis, shared with the dashboard, Sales Analytics and AR Aging.
+      ...INVOICED_ORDER_WHERE,
       ...(hasDateFilter ? { createdAt: dateFilter } : {}),
     },
     select: {
@@ -453,7 +451,7 @@ export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promi
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
 
   const orders = await db.salesOrder.findMany({
-    where: { invoiceNumber: { not: null }, ...(Object.keys(dateFilter).length ? { invoicedAt: dateFilter } : {}) },
+    where: { ...INVOICED_ORDER_WHERE, ...(Object.keys(dateFilter).length ? { invoicedAt: dateFilter } : {}) },
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, invoiceNumber: true, customerName: true, salesRep: true,
       invoicedAt: true, status: true, totalBase: true, paidAt: true,
@@ -602,7 +600,7 @@ export type CustomerAgingRow = {
 export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
   await requirePermission('analytics')
   const orders = await db.salesOrder.findMany({
-    where: { invoiceNumber: { not: null } },
+    where: INVOICED_ORDER_WHERE,
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, customerId: true, customerName: true, salesRep: true,
       currency: true, totalBase: true, taxBase: true, invoicedAt: true, paidAt: true, createdAt: true,

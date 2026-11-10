@@ -96,10 +96,10 @@ mock.module('@/lib/db', {
   namedExports: {
     db: {
       salesOrder: {
-        // getCustomerAging is the only caller filtering on invoiceNumber; getProductSalesStats
-        // filters on status/refundStatus. That is what the fixture db dispatches on.
-        findMany: async (args: { where?: Record<string, unknown> }) =>
-          args?.where && 'invoiceNumber' in args.where ? AGING_ORDERS : PRODUCT_ORDERS,
+        // getCustomerAging is the only caller selecting `payments`; getProductSalesStats does not.
+        // That is what the fixture db dispatches on (both now share the invoiced-basis where).
+        findMany: async (args: { select?: Record<string, unknown> }) =>
+          args?.select && 'payments' in args.select ? AGING_ORDERS : PRODUCT_ORDERS,
       },
       product: {
         findMany: async () => [{

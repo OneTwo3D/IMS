@@ -20,7 +20,7 @@ export default async function CustomerAnalyticsPage({ searchParams }: { searchPa
     { key: 'customer', label: 'Customer', render: (row) => row.customerName, footer: 'Totals' },
     { key: 'email', label: 'Email', render: (row) => row.customerEmail ?? '' },
     { key: 'orders', label: 'Orders', align: 'right', render: (row) => row.orderCount.toLocaleString() },
-    { key: 'revenue', label: 'Revenue (invoiced)', align: 'right', render: (row) => row.revenueBase, footer: report.totals.revenueBase },
+    { key: 'revenue', label: 'Invoiced revenue', align: 'right', render: (row) => row.revenueBase, footer: report.totals.revenueBase },
     { key: 'netRevenue', label: 'Net revenue', align: 'right', render: (row) => `${row.netRevenueBase}${boundSuffix(row.netRevenueBaseBound)}`, footer: `${report.totals.netRevenueBase}${bound(report.totals.netRevenueBaseBound)}` },
     { key: 'netRevenueExVat', label: 'Net revenue (ex VAT)', align: 'right', render: (row) => `${row.netRevenueExVatBase}${boundSuffix(row.netRevenueExVatBaseBound)}`, footer: report.totals.netRevenueExVatBase },
     // A WITHHELD FIGURE MUST NOT LOOK LIKE A MEASURED ZERO (o3d-8u4h): the word, not a dash, and
@@ -59,7 +59,7 @@ export default async function CustomerAnalyticsPage({ searchParams }: { searchPa
       rowKey={(row) => row.groupToken}
       columns={columns}
       summary={[
-        { label: 'Revenue (invoiced)', value: report.totals.revenueBase },
+        { label: 'Invoiced revenue', value: report.totals.revenueBase },
         { label: 'Net revenue', value: `${report.totals.netRevenueBase}${bound(report.totals.netRevenueBaseBound)}` },
         { label: 'Gross profit', value: `${report.totals.grossProfitBase}${bound(report.totals.grossProfitBaseBound)}` },
         { label: 'Costed customers', value: `${report.totals.costCapturedRows ?? '0'}/${report.pageInfo.totalRows.toLocaleString()}` },

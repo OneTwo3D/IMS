@@ -9,7 +9,7 @@ Four headline figures appear at the top of the dashboard:
 
 | KPI | What It Measures |
 |---|---|
-| **Gross Sales** | Total invoiced revenue before any deductions. |
+| **Invoiced revenue (gross sales)** | Total invoiced revenue before any deductions. Invoiced revenue counts every order that has an invoice, paid or not, excluding cancelled and draft orders: an order has an invoice when IMS has posted a Xero invoice for it or, during the parallel phase while Xeroom raises the Xero invoices, when it carries the Xeroom invoice number; after the switchover IMS posts the invoices itself and the same rule applies. |
 | **Net Sales** | Gross sales minus discounts and returns, where the return is recorded excluding VAT. |
 | **COGS** | Cost of goods sold, calculated from FIFO cost layers. |
 | **Margin** | Net sales minus COGS, shown as both a value and a percentage. |

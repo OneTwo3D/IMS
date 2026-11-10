@@ -105,7 +105,7 @@ Products without a preferred supplier are listed under "Unassigned" and require 
 
 | Report | What it shows |
 |---|---|
-| **Sales Analytics** | Invoiced sales totals by product, category, customer or channel, with net revenue after credit beside them. Cancelled orders are excluded. |
+| **Sales Analytics** | Invoiced sales totals by product, category, customer or channel, with net revenue after credit beside them. The basis is the same on the dashboard, Sales Statistics, Customer Mix, AR Aging and the CSV exports: invoiced revenue counts every order that has an invoice, paid or not, excluding cancelled and draft orders: an order has an invoice when IMS has posted a Xero invoice for it or, during the parallel phase while Xeroom raises the Xero invoices, when it carries the Xeroom invoice number; after the switchover IMS posts the invoices itself and the same rule applies. |
 | **Customer Mix** | Invoiced and net revenue, gross profit, AR exposure, and concentration by customer. |
 | **Gross Margin** | Product margin using posted COGS entries rather than recalculating FIFO, with revenue net of the period's credit. |
 | **Returns** | Refund and return activity by SKU, customer, and reason, with same-period shipment context. |
@@ -151,7 +151,7 @@ These reports, **Purchase Statistics** (page, data and the `po_*` CSV exports) a
 | Report | What it shows |
 |---|---|
 | **VAT** | Output and input VAT by side / reporting category / jurisdiction / tax rate, for invoiced non-cancelled sales orders and purchase-invoice lines in the selected period. |
-| **AR Aging** | Outstanding sales-order balances by customer and aging bucket (Current / 1–30 / 31–60 / 61–90 / 90+). |
+| **AR Aging** | Outstanding balances on invoiced sales orders (the same invoiced basis as the revenue reports, so drafts, cancelled orders and orders with no invoice are not receivables) by customer and aging bucket (Current / 1–30 / 31–60 / 61–90 / 90+). |
 | **AP Aging** | Outstanding purchase-invoice balances by supplier and aging bucket. |
 | **FX Gain/Loss** | Booked versus settlement FX delta for multi-currency transactions using IMS FX-rate semantics (realised + unrealised). |
 
