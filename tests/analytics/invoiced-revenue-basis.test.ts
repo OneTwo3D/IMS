@@ -21,6 +21,7 @@ import { getCustomerAnalyticsReport, getSalesAnalyticsReport, type SalesFulfillm
  *             C  shipped, invoiced, paid ........................... 100
  *             D  refunded (part), invoiced, paid ................... 200
  *   excluded  M  IMS-minted number on a manual order, never posted .. 19
+ *             W  WooCommerce order with no number and no invoice ..... 21
  *             X  DRAFT, carries an invoice number ................... 11
  *             Y  PENDING_PAYMENT, never invoiced .................... 13
  *             Z  CANCELLED, carries an invoice ...................... 17
@@ -87,6 +88,8 @@ const ORDERS: Row[] = [
   row('Y', 13, { status: SalesOrderStatus.PENDING_PAYMENT }),
   // IMS-minted number on a manual order (no WooCommerce link), never posted: not proof of an invoice.
   row('M', 19, { status: SalesOrderStatus.SHIPPED, invoiceNumber: 'INV-IMS-1', shoppingLinks: [] }),
+  // Linked to WooCommerce but carrying no invoice number and no posted invoice: nothing proves an invoice.
+  row('W', 21, { status: SalesOrderStatus.PROCESSING, shoppingLinks: [{ connector: 'woocommerce' }] }),
   row('Z', 17, { status: SalesOrderStatus.CANCELLED, invoiceNumber: 'INV-6', accountingInvoiceId: 'xero-z' }),
 ]
 const COUNTED = ['A', 'B', 'C', 'D']
@@ -261,4 +264,21 @@ test('Customer Aging and its CSV list only orders with an outstanding balance, n
   const dataRows = csv.trim().split('\n').slice(1)
   assert.equal(dataRows.length, 2)
   assert.ok(!/(^|,)"?[CD]"?,/.test(dataRows.join('\n')), 'no paid order in the CSV')
+})
+
+test('customer figures carry the right marker: upper bound for a positive unplaced credit, approximate for a non-positive one', async () => {
+  const { getCustomers } = await import('@/app/actions/customers')
+  const q = (refunds: unknown[]) => row('Q', 30, { invoiceNumber: 'INV-Q', refunds })
+  ORDERS.push(q([{ totalsBasis: null, totalBase: D(5), lines: [] }]))
+  try {
+    const [upper] = await getCustomers()
+    assert.equal(upper!.lifetimeValueUpperBound, true)
+    assert.equal(upper!.lifetimeValueIndeterminate, false)
+  } finally { ORDERS.pop() }
+  ORDERS.push(q([{ totalsBasis: null, totalBase: D(-2), lines: [] }]))
+  try {
+    const [approx] = await getCustomers()
+    assert.equal(approx!.lifetimeValueIndeterminate, true)
+    assert.equal(approx!.lifetimeValueUpperBound, false)
+  } finally { ORDERS.pop() }
 })

@@ -96,3 +96,25 @@ test('an unplaced credit that is negative, zero or mixed-sign makes the figure i
   // indeterminate wins over an upper bound on the same order
   assert.equal(orderTurnoverBase(order([{ totalBase: 10, totalsBasis: null }, { totalBase: -2, totalsBasis: null }]))!.bound, 'indeterminate')
 })
+
+test('degenerate NET credits are left unplaced, not placed as zero or NaN', () => {
+  // zero-net sales line with a zero credit
+  const zero = orderTurnoverBase(order([{ totalBase: 0, totalsBasis: 'NET', lines: [line(0, 0, 0)] }]))!
+  assert.equal(zero.value, 120)
+  assert.equal(zero.bound, 'indeterminate')
+  // NET credit with no lines and a zero total
+  const none = orderTurnoverBase(order([{ totalBase: 0, totalsBasis: 'NET' }]))!
+  assert.equal(none.bound, 'indeterminate')
+  // credit line with no sales line at all
+  const orphan = orderTurnoverBase(order([{ totalBase: 10, totalsBasis: 'NET', lines: [{ totalBase: 10, salesOrderLine: null }] }]))!
+  assert.deepEqual(orphan, { value: 120, complete: false, bound: 'upper' })
+  // a negative credit against a positive sales line is not a share of it
+  const neg = orderTurnoverBase(order([{ totalBase: -5, totalsBasis: 'NET', lines: [line(-5, 100, 20)] }]))!
+  assert.equal(neg.value, 120)
+  assert.equal(neg.bound, 'indeterminate')
+})
+
+test('an indeterminate credit stays indeterminate whichever order the credits arrive in', () => {
+  assert.equal(orderTurnoverBase(order([{ totalBase: -2, totalsBasis: null }, { totalBase: 10, totalsBasis: null }]))!.bound, 'indeterminate')
+  assert.equal(orderTurnoverBase(order([{ totalBase: 10, totalsBasis: null }, { totalBase: -2, totalsBasis: null }]))!.bound, 'indeterminate')
+})

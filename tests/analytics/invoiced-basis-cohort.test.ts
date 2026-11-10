@@ -243,9 +243,36 @@ test('AR as-of: an unpaid Xeroom order with no invoice date is owed from its ord
   const order = salesOrder('aru', { invoiceNumber: 'INV-131', createdAt: new Date('2026-10-10T12:00:00.000Z'), totalBase: D(70), totalForeign: D(70), payments: [] })
   const report = await arReport([order], '2026-10-31')
   assert.equal(Number(report.totals.outstandingBase), 70)
-  assert.ok(report.notices.some((n) => /approximate/.test(n)))
+  assert.ok(report.notices.some((n) => /dated by the order date/.test(n)), 'the AR report carries its own approximate-date notice')
   // And it is not owed before it existed.
   assert.equal(Number((await arReport([order], '2026-10-05')).totals.outstandingBase), 0)
+})
+
+test('invoicedAt beats paidAt: invoiced 28 Oct and paid 2 Nov is an October order', async () => {
+  INVOICE_ORDERS.push(salesOrder('both', {
+    invoiceNumber: 'INV-140', invoicedAt: new Date('2026-10-28T12:00:00.000Z'), paidAt: new Date('2026-11-02T09:00:00.000Z'),
+    createdAt: new Date('2026-10-20T12:00:00.000Z'), payments: [], refunds: [], orderNumber: 'SO-7', externalOrderNumber: null, salesRep: null,
+  }))
+  try {
+    const { getInvoiceStats } = await import('@/app/actions/sales-stats')
+    const oct = (await getInvoiceStats('2026-10-01', '2026-10-31')).find((r) => r.orderId === 'both')
+    assert.equal(oct?.invoicedAt, '2026-10-28T12:00:00.000Z')
+    assert.ok(!(await getInvoiceStats('2026-11-01', '2026-11-30')).some((r) => r.orderId === 'both'), 'its paid date must not pull it into November')
+  } finally {
+    INVOICE_ORDERS.pop()
+  }
+})
+
+test('AR ageing runs from the invoice date, not the order date', async () => {
+  // Created 1 Oct, invoice date (paidAt, no invoicedAt) 2 Nov, part-paid: 60 still owed on 30 Nov, aged 28 days, not 60.
+  const paid = new Date('2026-11-02T09:00:00.000Z')
+  const order = salesOrder('arage', {
+    invoiceNumber: 'INV-150', createdAt: new Date('2026-10-01T12:00:00.000Z'), paidAt: paid, totalBase: D(100), totalForeign: D(100),
+    payments: [{ amount: D(40), paidAt: paid, refundId: null, currency: 'GBP' }],
+  })
+  const row = (await arReport([order], '2026-11-30')).rows[0]!
+  assert.equal(Number(row.outstandingBase), 60)
+  assert.equal(Number(row.bucket1), 60, 'aged 28 days (1-30 bucket)')
 })
 
 test('an IMS-minted invoice number with no posted invoice is not an invoiced order', () => {
