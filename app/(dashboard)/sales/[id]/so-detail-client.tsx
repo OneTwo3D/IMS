@@ -1039,6 +1039,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const vatRate = so.taxRatePercent ?? 0
   const moneyOrder = moneyViewOrderOf(so)
   const view = salesOrderMoneyView(moneyOrder)
+  // A recorded credit note's VAT and gross are not stored: they are priced from the tax code the line posts under at TODAY's rate.
+  const ESTIMATE_NOTE = 'VAT estimated at the current tax rate; the accounting system holds the posted figure'
   const hasLineVat = view.lines.some((l) => l.vat !== 0) || vatRate > 0
 
   const hasShipments = shipments.length > 0
@@ -1956,7 +1958,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                   {r.creditNoteNumber && <span className="font-mono text-xs font-medium">{r.creditNoteNumber}</span>}
                   <span className="text-muted-foreground text-xs">{formatDateTime(r.refundedAt, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
                 </div>
-                <span className="font-mono font-medium text-destructive" title="Credit note total incl. VAT">-{money(creditNoteAmounts(moneyOrder, r).total.gross)}</span>
+                <span className="font-mono font-medium text-destructive" title={ESTIMATE_NOTE}>≈ -{money(creditNoteAmounts(moneyOrder, r).total.gross)}</span>
               </div>
               {r.reason && <p className="text-xs"><span className="text-muted-foreground">Reason:</span> {r.reason}</p>}
               <Table className="text-xs">
@@ -1965,8 +1967,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                     <TableHead className="py-1 pr-4 text-xs">Item</TableHead>
                     <TableHead className="py-1 pr-4 text-xs text-right">Qty</TableHead>
                     <TableHead className="py-1 pr-4 text-xs text-right">Unit Price excl. VAT</TableHead>
-                    <TableHead className="py-1 pr-4 text-xs text-right">VAT</TableHead>
-                    <TableHead className="py-1 text-xs text-right">Total incl. VAT</TableHead>
+                    <TableHead className="py-1 pr-4 text-xs text-right">VAT (est.)</TableHead>
+                    <TableHead className="py-1 text-xs text-right">Total incl. VAT (est.)</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>{r.lines.map((rl, rlIdx) => (
@@ -1974,8 +1976,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                     <TableCell className="py-1 pr-4">{rl.description}</TableCell>
                     <TableCell className="py-1 pr-4 text-right tabular-nums">{rl.qty > 0 ? rl.qty : '—'}</TableCell>
                     <TableCell className="py-1 pr-4 text-right font-mono tabular-nums">{rl.qty > 0 ? money(rl.unitPriceForeign) : '—'}</TableCell>
-                    <TableCell className="py-1 pr-4 text-right font-mono tabular-nums text-muted-foreground">{money(creditNoteAmounts(moneyOrder, r).perLine[rlIdx].vat)}</TableCell>
-                    <TableCell className="py-1 text-right font-mono tabular-nums">{money(creditNoteAmounts(moneyOrder, r).perLine[rlIdx].gross)}</TableCell>
+                    <TableCell className="py-1 pr-4 text-right font-mono tabular-nums text-muted-foreground" title={ESTIMATE_NOTE}>≈ {money(creditNoteAmounts(moneyOrder, r).perLine[rlIdx].vat)}</TableCell>
+                    <TableCell className="py-1 text-right font-mono tabular-nums" title={ESTIMATE_NOTE}>≈ {money(creditNoteAmounts(moneyOrder, r).perLine[rlIdx].gross)}</TableCell>
                   </TableRow>
                 ))}</TableBody>
               </Table>
@@ -2118,7 +2120,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                         {r.creditNoteNumber && <span className="font-mono text-xs font-medium">{r.creditNoteNumber}</span>}
                         <span className="text-muted-foreground text-xs">{formatDateTime(r.refundedAt, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
                       </div>
-                      <span className="font-mono font-medium text-destructive" title="Credit note total incl. VAT">-{money(creditNoteAmounts(moneyOrder, r).total.gross)}</span>
+                      <span className="font-mono font-medium text-destructive" title={ESTIMATE_NOTE}>≈ -{money(creditNoteAmounts(moneyOrder, r).total.gross)}</span>
                     </div>
                     {r.reason && <p className="text-xs text-muted-foreground">{r.reason}</p>}
                     {r.lines.map((rl) => (

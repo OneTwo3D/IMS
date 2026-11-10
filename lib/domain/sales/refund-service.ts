@@ -3811,12 +3811,18 @@ export async function createSalesOrderRefund(
           takenBase.set(id, (takenBase.get(id) ?? 0) + refundBoundaryNumber(row.totalBase))
         }
         const minorUnits = currencyMinorUnits(so.currency)
-        refundLines.forEach((refundLine, index) => {
-          if (!refundLine.lineId || !(refundLine.qty > 0) || (refundLine.lineKind ?? 'sale') !== 'sale') return
+        for (const [index, refundLine] of refundLines.entries()) {
+          if (!refundLine.lineId || !(refundLine.qty > 0) || (refundLine.lineKind ?? 'sale') !== 'sale') continue
           const orderLine = so.lines.find((l) => l.id === refundLine.lineId)
-          if (!orderLine) return // "not on this order" is refused later
+          if (!orderLine) return { error: `Refund line "${refundLine.description}" is not a line of this order.` } as const
           const id = orderLine.id
           const qty = refundBoundaryNumber(orderLine.qty)
+          // THIS line's own remaining quantity (sold less earlier refunds of it, and earlier rows of this request): the product-level quantity
+          // check cannot tell two lines of one product apart, so a line is never refunded above its own units.
+          const remainingQty = qty - (takenQty.get(id) ?? 0)
+          if (refundLine.qty > remainingQty + 1e-9) {
+            return { error: `Refund qty ${refundLine.qty} for "${orderLine.description}" exceeds the ${Math.max(0, remainingQty)} still refundable on that line.` } as const
+          }
           const foreign = refundableNet({
             line: { qty, net: refundBoundaryNumber(orderLine.totalForeign) },
             prior: { qty: takenQty.get(id) ?? 0, net: takenForeign.get(id) ?? 0 },
@@ -3831,13 +3837,11 @@ export async function createSalesOrderRefund(
             fxRateToBase: fxRate,
             minorUnits,
           })
-          // Nothing left to cut from (all units already refunded): leave the stated figures so the quantity and per-target checks refuse it by name.
-          if (qty - (takenQty.get(id) ?? 0) <= 1e-9) return
           takenQty.set(id, (takenQty.get(id) ?? 0) + refundLine.qty)
           takenForeign.set(id, (takenForeign.get(id) ?? 0) + foreign)
           takenBase.set(id, (takenBase.get(id) ?? 0) + base)
           refundLines[index] = { ...refundLine, totalForeign: foreign, totalBase: base }
-        })
+        }
         totalBase = refundLines.reduce((sum, line) => sum + line.totalBase, 0)
       }
     }

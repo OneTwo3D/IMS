@@ -145,6 +145,10 @@ export function publicRefundLineRefusal(lines: readonly { lineId?: string | null
   if (lines.some((line) => line.lineKind === 'discount')) {
     return 'A refund entered by hand cannot carry a discount line. Refund the order lines themselves.'
   }
+  // Each accepted line's kind must match its target: a sale line is an order line (it has an id); shipping is the order's shipping charge (it has none).
+  if (lines.some((line) => line.lineKind === 'shipping' && line.lineId)) {
+    return 'A shipping refund is against the order\'s shipping charge, not an order line.'
+  }
   if (lines.some((line) => !line.lineId && line.lineKind !== 'shipping')) {
     return 'Every refunded line must be a line of the order. An amount attributed to no order line cannot be refunded here.'
   }

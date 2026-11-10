@@ -1350,7 +1350,7 @@ test('only itemised SALE lines are re-cut: a shipping row keeps its stated amoun
     orderId: 'order-1',
     lines: [
       { lineId: 'line-1', productId: 'product-1', description: 'Widget', qty: 1, totalForeign: 60, totalBase: 60, lineKind: 'sale' },
-      { lineId: 'line-1', productId: null, description: 'Shipping', qty: 1, totalForeign: 2, totalBase: 2, lineKind: 'shipping' },
+      { lineId: null, productId: null, description: 'Shipping', qty: 1, totalForeign: 2, totalBase: 2, lineKind: 'shipping' },
     ],
     reason: 'sale and shipping', creditNotePrefix: 'CN-', enforcePerTargetBalances: true, deriveSaleLineNetsFromStoredBalance: true,
   })
@@ -1370,64 +1370,48 @@ test('a zero-decimal currency is cut to whole units', async () => {
   assert.equal(Number(state.refundLines[0].totalForeign), 333)
 })
 
-test('a line that is not on the order is left for the later refusal, never thrown from the re-cut', async () => {
+test('a public refund line that is not a line of the order is refused', async () => {
   const state = baseState()
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
     lines: [{ lineId: 'no-such-line', productId: 'product-1', description: 'Ghost', qty: 1, totalForeign: 5, totalBase: 5, lineKind: 'sale' }],
     reason: 'ghost', creditNotePrefix: 'CN-', enforcePerTargetBalances: true, deriveSaleLineNetsFromStoredBalance: true,
   })
-  assert.equal(typeof result.success, 'boolean')
-  assert.equal(state.refunds.length === 0 || result.success === true, true)
-})
-
-// [mutation: public refunds may carry discount / unattributed lines again, or the grossed-up check is dropped]
-test('a public refund cannot offset the ceiling with an unlinked sale line and a negative discount line', async () => {
-  const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxForeign: 20 }] })
-  state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget', qty: 1, totalBase: 100, totalForeign: 100, taxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false } }
-  const flags = refundSafeguards({ isInternal: false })
-  const forged = await createSalesOrderRefund(createClient(state), {
-    orderId: 'order-1',
-    lines: [
-      { lineId: null, productId: null, description: 'Unattributed', qty: 0, totalForeign: 100, totalBase: 100, lineKind: 'sale' },
-      { lineId: null, productId: null, description: 'Discount', qty: 0, totalForeign: -100, totalBase: -100, lineKind: 'discount' },
-    ],
-    reason: 'forged', creditNotePrefix: 'CN-', ...flags,
-  })
-  assert.equal(forged.success, false)
-  assert.match(forged.success === false ? forged.error : '', /discount line/)
+  assert.equal(result.success, false)
+  assert.match(result.success === false ? result.error : '', /not a line of this order/)
   assert.equal(state.refunds.length, 0)
-  const unattributed = await createSalesOrderRefund(createClient(state), {
-    orderId: 'order-1',
-    lines: [{ lineId: null, productId: null, description: 'Unattributed', qty: 0, totalForeign: 10, totalBase: 10, lineKind: 'sale' }],
-    reason: 'unattributed', creditNotePrefix: 'CN-', ...flags,
-  })
-  assert.equal(unattributed.success, false)
-  assert.match(unattributed.success === false ? unattributed.error : '', /line of the order/)
-  // The internal path (storefront sync, chargeback) still sends a mirrored discount line.
-  const internal = await createSalesOrderRefund(createClient(baseState()), {
-    orderId: 'order-1',
-    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }, { lineId: null, productId: null, description: 'Discount', qty: 0, totalForeign: -10, totalBase: -10, lineKind: 'discount' }],
-    reason: 'internal', creditNotePrefix: 'CN-', ...refundSafeguards({ isInternal: true }),
-  })
-  assert.equal(internal.success, true, internal.success ? '' : internal.error)
 })
 
-test('a public refund whose posting code is worth more than the line was charged at is refused on its grossed-up amount', async () => {
-  // The line was charged at 0% (net 100, tax 0) but its tax code posts at 20%: refunding the 100 net would credit 120.
-  const state = baseState({
-    orders: [{ ...baseState().orders[0], totalBase: 100, taxBase: 0, taxForeign: 0, taxRateName: 'Standard' }],
-    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.2 }],
-  })
-  state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget', qty: 1, totalBase: 100, totalForeign: 100, taxForeign: 0, taxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false } }
+// [mutation: shipping rows with an order-line id accepted again; the per-line quantity check removed]
+test('a public shipping row that names an order line is refused: kind must match target', async () => {
+  const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 100, taxBase: 0, shippingForeign: 5 }] })
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
-    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Widget', qty: 1, totalForeign: 100, totalBase: 100, lineKind: 'sale' }],
-    reason: 'grossed up', creditNotePrefix: 'CN-', ...refundSafeguards({ isInternal: false }),
+    lines: [{ lineId: 'line-1', productId: null, description: 'Shipping', qty: 1, totalForeign: 80, totalBase: 80, lineKind: 'shipping' }],
+    reason: 'forged shipping', creditNotePrefix: 'CN-', ...refundSafeguards({ isInternal: false }),
   })
   assert.equal(result.success, false)
-  assert.match(result.success === false ? result.error : '', /including VAT, more than the 100.00 it was paid/)
+  assert.match(result.success === false ? result.error : '', /shipping charge, not an order line/)
   assert.equal(state.refunds.length, 0)
+})
+
+test('two lines of the same product cannot lend each other units: a line is refunded only up to its own remaining quantity', async () => {
+  const state = baseState({ orders: [{ ...baseState().orders[0], totalBase: 20, taxBase: 0 }] })
+  state.lines[0] = { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget A', qty: 1, totalBase: 10, totalForeign: 10 }
+  state.lines.push({ id: 'line-2', orderId: 'order-1', productId: 'product-1', description: 'Widget B', qty: 1, totalBase: 10, totalForeign: 10 })
+  const flags = refundSafeguards({ isInternal: false })
+  const row = { lineId: 'line-1', productId: 'product-1', description: 'Widget A', qty: 1, totalForeign: 10, totalBase: 10, lineKind: 'sale' as const }
+  // Two units against the 1-unit line, in one request.
+  const twice = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', lines: [row, row], reason: 'twice', creditNotePrefix: 'CN-', ...flags })
+  assert.equal(twice.success, false)
+  assert.match(twice.success === false ? twice.error : '', /still refundable on that line/)
+  assert.equal(state.refunds.length, 0)
+  // And across requests: the line's own earlier refund counts against it, whatever the other line has left.
+  const first = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', lines: [row], reason: 'first', creditNotePrefix: 'CN-', ...flags })
+  assert.equal(first.success, true, first.success ? '' : first.error)
+  const again = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', lines: [row], reason: 'again', creditNotePrefix: 'CN-', ...flags })
+  assert.equal(again.success, false)
+  assert.equal(state.refunds.length, 1)
 })
 
 test('a price-only refund above the line\'s stored net is refused when the per-target cap is on (public refunds)', async () => {
