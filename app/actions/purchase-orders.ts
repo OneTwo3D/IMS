@@ -2,6 +2,7 @@
 
 import { assertNoLiveAsnForReceipt, ManualReceiptRefusedByLiveAsnError } from '@/lib/domain/wms/po-receipt-asn-guard'
 import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
+import { resolveOrderRateTaxCode } from '@/lib/domain/purchasing/order-rate-tax-code'
 import { taxTypeForBasis } from '@/lib/accounting/reverse-charge'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { revalidatePath } from 'next/cache'
@@ -3486,6 +3487,7 @@ export async function createInvoice(
         fxRateToBase: true,
         type: true,
         taxRatePercent: true,
+        taxRateName: true,
         taxForeign: true,
         subtotalForeign: true,
         lines: {
@@ -3561,11 +3563,21 @@ export async function createInvoice(
       getAccountingSettings(),
       db.purchaseOrder.findUnique({
         where: { id: poId },
-        select: { supplier: { select: { name: true, taxRate: { select: { id: true, accountingTaxType: true } } } }, currency: true },
+        select: { supplier: { select: { name: true, taxRate: { select: { id: true, name: true, rate: true, accountingTaxType: true } } } }, currency: true },
       }),
     ])
-    const fallbackTaxType = supplierData?.supplier?.taxRate?.accountingTaxType ?? undefined
-    const fallbackTaxRateId = supplierData?.supplier?.taxRate?.id
+    // The code of the rate the ORDER was charged at, never the supplier's current default (which may be another rate).
+    const orderRateCode = resolveOrderRateTaxCode({
+      recordedRate: po.taxRatePercent,
+      recordedName: po.taxRateName,
+      candidates: await db.taxRate.findMany({
+        where: { active: true, usedFor: { in: ['PURCHASE', 'BOTH'] }, isCompound: false, reverseCharge: false },
+        select: { id: true, name: true, rate: true, accountingTaxType: true },
+      }),
+      supplierDefault: supplierData?.supplier?.taxRate,
+    })
+    const fallbackTaxType = orderRateCode?.taxType
+    const fallbackTaxRateId = orderRateCode?.taxRateId
     const invoiceCalculation = calculatePurchaseInvoice({
       lines: [
         ...productInputs.map((l): PurchaseInvoiceInputLine => ({
@@ -3881,6 +3893,7 @@ export async function updateInvoice(
             fxRateToBase: true,
             type: true,
             taxRatePercent: true,
+            taxRateName: true,
             taxForeign: true,
             subtotalForeign: true,
             supplier: {
@@ -3888,7 +3901,7 @@ export async function updateInvoice(
                 name: true,
                 email: true,
                 prepaid: true,
-                taxRate: { select: { id: true, accountingTaxType: true } },
+                taxRate: { select: { id: true, name: true, rate: true, accountingTaxType: true } },
               },
             },
             lines: {
@@ -3968,8 +3981,18 @@ export async function updateInvoice(
     const baseCurrency = await getBaseCurrencyCode()
     const poLineById = new Map(invoice.po.lines.map((line) => [line.id, line]))
     const costLineById = new Map(invoice.po.freightCostLines.map((line) => [line.id, line]))
-    const fallbackTaxType = invoice.po.supplier.taxRate?.accountingTaxType ?? undefined
-    const fallbackTaxRateId = invoice.po.supplier.taxRate?.id
+    // The code of the rate the ORDER was charged at, never the supplier's current default (which may be another rate).
+    const orderRateCode = resolveOrderRateTaxCode({
+      recordedRate: invoice.po.taxRatePercent,
+      recordedName: invoice.po.taxRateName,
+      candidates: await db.taxRate.findMany({
+        where: { active: true, usedFor: { in: ['PURCHASE', 'BOTH'] }, isCompound: false, reverseCharge: false },
+        select: { id: true, name: true, rate: true, accountingTaxType: true },
+      }),
+      supplierDefault: invoice.po.supplier.taxRate,
+    })
+    const fallbackTaxType = orderRateCode?.taxType
+    const fallbackTaxRateId = orderRateCode?.taxRateId
     const accountingSettings = await getAccountingSettings()
     const invoiceInputLines: PurchaseInvoiceInputLine[] = []
     for (const existingLine of invoice.lines) {

@@ -23,6 +23,9 @@ type LoggedActivity = {
   metadata?: Record<string, unknown>
 }
 
+/** Settings other than the poll cursor, so a remembered id survives from one poll to the next. */
+const settingStore: Record<string, string> = {}
+
 const state = {
   invoices: [] as XeroInvoice[],
   salesOrders: [] as Row[],
@@ -113,6 +116,7 @@ async function withHostClockSkew<T>(skewMs: number, fn: () => Promise<T>): Promi
 }
 
 function reset(): void {
+  for (const key of Object.keys(settingStore)) delete settingStore[key]
   state.invoices = []
   state.salesOrders = []
   state.purchaseInvoices = []
@@ -366,8 +370,13 @@ const dbDouble: Record<string, unknown> = {
     },
   },
   setting: {
-    findUnique: async () => ({ key: 'xero_last_payment_poll', value: new Date(Date.now() - 60_000).toISOString() }),
-    upsert: async (args: unknown) => { state.settingUpserts.push(args); return {} },
+    findUnique: async ({ where }: { where: { key: string } }) =>
+      where.key in settingStore ? { key: where.key, value: settingStore[where.key] } : { key: 'xero_last_payment_poll', value: new Date(Date.now() - 60_000).toISOString() },
+    upsert: async (args: { where: { key: string }; update: { value: string } }) => {
+      state.settingUpserts.push(args)
+      if (args.where.key !== 'xero_last_payment_poll') settingStore[args.where.key] = args.update.value
+      return {}
+    },
   },
   user: { findMany: async () => [{ id: 'admin_1' }] },
   salesOrderRefund: { findFirst: async () => null },
@@ -511,7 +520,7 @@ test('a sales order PAID with a garbage FullyPaidOnDate is skipped with a logged
   state.invoices = [paidSale('garbage')]
   state.salesOrders = [UNPAID_ORDER()]
   const result = await poll()
-  assert.deepEqual(state.salesOrderUpdates, [])
+  assert.equal(state.salesOrderUpdates.length, 0)
   assert.deepEqual(result.errors, [])
   assert.ok(state.activity.some((a) => a.action === 'payment_date_unreadable' && a.level === 'WARNING'))
 })
@@ -522,4 +531,90 @@ test('payment reconcile reads the same formats: .NET form and zone-less ISO (UTC
   assert.equal(parseSettlementDate(ISO_NO_ZONE)?.toISOString(), '2026-07-01T00:00:00.000Z')
   assert.equal(parseSettlementDate('2026-07-01T00:00:00Z')?.toISOString(), '2026-07-01T00:00:00.000Z')
   for (const bad of ['garbage', '/Date(abc)/', '', undefined]) assert.equal(parseSettlementDate(bad), null)
+})
+
+// --- a skipped document is revisited (no new modification event needed) -------------------------------------------------------------
+
+const PENDING = 'xero_payment_date_pending'
+
+test('a bill PAID with no date is remembered, and a LATER poll with an empty delta applies it once the date is readable', async () => {
+  reset()
+  state.invoices = [paidBill(undefined)]
+  state.recheckInvoices = [paidBill(undefined)] // what Xero returns when asked for it by id
+  state.purchaseInvoices = [UNPAID_BILL()]
+  const first = await poll()
+  assert.equal(first.billsPaid, 0)
+  assert.equal(state.purchaseInvoiceUpdates.length, 0)
+  assert.deepEqual(JSON.parse(settingStore[PENDING]), { sales: [], bills: ['XB1'] })
+  assert.ok(state.activity.some((a) => a.action === 'bill_payment_date_unreadable' && a.level === 'WARNING'), 'the WARNING is kept')
+
+  // Xero has not modified the document since: the delta is empty. It is simply readable now, by id.
+  state.invoices = []
+  state.recheckInvoices = [paidBill(DOT_NET)]
+  const second = await poll()
+  assert.deepEqual(second.errors, [])
+  assert.equal(second.billsPaid, 1)
+  assert.equal((state.purchaseInvoiceUpdates[0].data.paidAt as Date).toISOString(), '2026-07-01T00:00:00.000Z')
+  assert.deepEqual(JSON.parse(settingStore[PENDING]), { sales: [], bills: [] }, 'and forgotten')
+})
+
+test('a sales order PAID with no date is remembered and applied by a later poll', async () => {
+  reset()
+  state.invoices = [paidSale(undefined)]
+  state.recheckInvoices = [paidSale(undefined)]
+  state.salesOrders = [UNPAID_ORDER()]
+  await poll()
+  assert.equal(state.salesOrderUpdates.length, 0)
+  assert.deepEqual(JSON.parse(settingStore[PENDING]), { sales: ['XS1'], bills: [] })
+
+  state.invoices = []
+  state.recheckInvoices = [paidSale(ISO_NO_ZONE)]
+  const second = await poll()
+  assert.deepEqual(second.errors, [])
+  const write = state.salesOrderUpdates.find((u) => u.data.paidAt !== undefined)
+  assert.ok(write)
+  assert.equal((write.data.paidAt as Date).toISOString(), '2026-07-01T00:00:00.000Z')
+  assert.deepEqual(JSON.parse(settingStore[PENDING]), { sales: [], bills: [] })
+})
+
+test('a document still unreadable stays remembered, quietly (no second WARNING, no write); one that is no longer PAID is forgotten; the list is deduplicated', async () => {
+  reset()
+  state.invoices = [paidBill(undefined)]
+  state.recheckInvoices = [paidBill(undefined)]
+  state.purchaseInvoices = [UNPAID_BILL()]
+  await poll()
+  const warnings = () => state.activity.filter((a) => a.action === 'bill_payment_date_unreadable').length
+  assert.equal(warnings(), 1)
+
+  state.invoices = []
+  state.recheckInvoices = [paidBill('garbage')]
+  await poll()
+  assert.equal(warnings(), 1)
+  assert.equal(state.purchaseInvoiceUpdates.length, 0)
+  assert.deepEqual(JSON.parse(settingStore[PENDING]).bills, ['XB1'])
+
+  // The same document skipped again by the delta is not listed twice.
+  state.invoices = [paidBill(undefined)]
+  state.recheckInvoices = [paidBill(undefined)]
+  await poll()
+  assert.deepEqual(JSON.parse(settingStore[PENDING]).bills, ['XB1'])
+
+  state.invoices = []
+  state.recheckInvoices = [{ ...paidBill(undefined), Status: 'AUTHORISED' } as XeroInvoice]
+  await poll()
+  assert.deepEqual(JSON.parse(settingStore[PENDING]).bills, [])
+})
+
+test('the remembered list is capped to the newest 200 per kind', async () => {
+  reset()
+  settingStore[PENDING] = JSON.stringify({ sales: [], bills: Array.from({ length: 200 }, (_, i) => `OLD${i}`) })
+  state.invoices = [paidBill(undefined)]
+  state.purchaseInvoices = [UNPAID_BILL()]
+  // The old ids are not found in Xero, so the retry forgets them: seed them as found-and-unreadable to keep them.
+  state.recheckInvoices = [...Array.from({ length: 200 }, (_, i) => ({ InvoiceID: `OLD${i}`, Type: 'ACCPAY', Status: 'PAID' }) as XeroInvoice), paidBill(undefined)]
+  await poll()
+  const bills: string[] = JSON.parse(settingStore[PENDING]).bills
+  assert.equal(bills.length, 200)
+  assert.equal(bills.at(-1), 'XB1')
+  assert.equal(bills[0], 'OLD1')
 })

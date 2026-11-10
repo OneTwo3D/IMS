@@ -188,8 +188,13 @@ export function calculatePurchaseInvoice(params: {
   poType?: string
   poTaxRatePercent?: number | string | null
   transitAccount: string
+  /**
+   * The tax type of the rate the ORDER was charged at (lib/domain/purchasing/order-rate-tax-code.ts), NOT the supplier's current default: it
+   * is the code of every vatable cost line and of a goods line with no rate row, whose VAT is taken at `poTaxRatePercent`. Undefined when no
+   * code can be shown to agree with that rate, which leaves those lines without a type (refused downstream).
+   */
   fallbackTaxType?: string
-  /** The rate `fallbackTaxType` was read from (the supplier's default), bound beside the code for the enqueue guard (lib/tax/retired-tax-code-guard.ts). */
+  /** The rate `fallbackTaxType` was read from, bound beside the code for the enqueue guard (lib/tax/retired-tax-code-guard.ts). */
   fallbackTaxRateId?: string
   /**
    * Accounting tax type to use when a line's resolved TaxRate has
@@ -240,7 +245,9 @@ export function calculatePurchaseInvoice(params: {
         totalForeign,
         totalBase,
       })
-      const baseTaxType = poLine.taxRate?.accountingTaxType ?? params.fallbackTaxType
+      // A line with its own rate posts on that rate's code (blank when unmapped: refused downstream). Only a line with NO rate row follows the order's
+      // recorded rate, and so its code - never an unmapped own rate falling back to a code of a different rate.
+      const baseTaxType = poLine.taxRate ? poLine.taxRate.accountingTaxType : params.fallbackTaxType
       const productTaxType = resolvePurchaseLineTaxType({
         baseTaxType,
         reverseCharge: poLine.taxRate?.reverseCharge,
