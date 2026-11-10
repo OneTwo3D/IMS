@@ -30,6 +30,7 @@ import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
 import { findGrossOverPaidBalance, findOverAllocatedRefundTarget, nonSaleRowRefusal, overAllocatedRefundTargetMessage, publicRefundLineRefusal } from '@/lib/domain/sales/refund-target-balances'
 import { refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
+import { storedAmountsIncludeVat } from '@/lib/domain/sales/sales-order-vat-basis'
 import {
   RATE_EPSILON,
   buildTaxTypeRateIndex,
@@ -3737,6 +3738,7 @@ export async function createSalesOrderRefund(
         totalForeign: true,
         taxRatePercent: true,
         pricesIncludeVat: true,
+        discountRestatement: true,
         revenueDeferredDate: true,
         unearnedRevenueAmount: true,
         inventoryAllocatedDate: true,
@@ -3871,6 +3873,64 @@ export async function createSalesOrderRefund(
           takenForeign.set(id, (takenForeign.get(id) ?? 0) + foreign)
           takenBase.set(id, (takenBase.get(id) ?? 0) + base)
           refundLines[index] = { ...refundLine, totalForeign: foreign, totalBase: base }
+        }
+        totalBase = refundLines.reduce((sum, line) => sum + line.totalBase, 0)
+      }
+
+      // THE ORDER DISCOUNT, REVERSED BY THE SERVER. The invoice posts an order-level discount as its own negative line (discount account, order
+      // default tax type) and the sale lines at their pre-discount nets, so a full refund must reverse the refunded share of that discount or it
+      // credits more than was paid. Never caller-supplied (a caller's discount line is refused above): the share is -(order discount, net) x
+      // (refunded sale-line net / the order's sale-line net), less what earlier refunds already reversed; the refund that completes the order's
+      // sale lines takes exactly the remainder. It is the same mirrored 'discount' line a chargeback raises, so it posts under the same identity.
+      for (let i = refundLines.length - 1; i >= 0; i -= 1) if (refundLines[i].lineKind === 'discount') refundLines.splice(i, 1) // (a transaction retry re-derives it)
+      const rawDiscount = refundBoundaryNumber(so.discountAmount)
+      const refundedSaleNet = refundLines
+        .filter((l) => l.lineId && l.qty > 0 && (l.lineKind ?? 'sale') === 'sale')
+        .reduce((sum, l) => sum + (l.totalForeign ?? 0), 0)
+      if (rawDiscount > 0 && refundedSaleNet > 0) {
+        if (so.discountRestatement != null) {
+          return { error: 'This order\'s discount was restated after it was invoiced, so its reversal cannot be worked out automatically, and no refund was created.' } as const
+        }
+        const round4 = (n: number) => Math.round((n + Number.EPSILON * Math.sign(n)) * 10000) / 10000
+        const vatPct = Number(so.taxRatePercent ?? 0)
+        // The invoice sends `discountAmount` in the order's own convention; the credit note posts NET, so strip VAT when the amounts include it.
+        const discountNet = round4(storedAmountsIncludeVat(so) && vatPct > 0 ? rawDiscount / (1 + vatPct) : rawDiscount)
+        const priorDiscountRows = await tx.salesOrderRefundLine.findMany({
+          where: { refund: { orderId: input.orderId } },
+          select: { salesOrderLineId: true, lineKind: true, totalForeign: true, totalBase: true },
+        })
+        let priorSaleNet = 0
+        let priorDiscountForeign = 0
+        let priorDiscountBase = 0
+        for (const row of priorDiscountRows) {
+          if (row.lineKind === 'discount') {
+            priorDiscountForeign -= refundBoundaryNumber(row.totalForeign)
+            priorDiscountBase -= refundBoundaryNumber(row.totalBase)
+          } else if (row.lineKind !== 'shipping' && row.salesOrderLineId) {
+            priorSaleNet += refundBoundaryNumber(row.totalForeign)
+          }
+        }
+        const orderSaleNet = so.lines.reduce((sum, l) => sum + refundBoundaryNumber(l.totalForeign), 0)
+        const remainingForeign = Math.max(0, round4(discountNet - priorDiscountForeign))
+        const remainingBase = Math.max(0, round4((fxRate === 1 ? discountNet : discountNet / (fxRate || 1)) - priorDiscountBase))
+        const completesOrder = priorSaleNet + refundedSaleNet >= orderSaleNet - 0.005
+        const minorUnits = currencyMinorUnits(so.currency)
+        const shareForeign = completesOrder || !(orderSaleNet > 0)
+          ? remainingForeign
+          : Math.min(remainingForeign, refundableNet({ line: { qty: 1, net: discountNet }, prior: { qty: 0, net: 0 }, qty: refundedSaleNet / orderSaleNet, minorUnits }))
+        const shareBase = completesOrder || !(orderSaleNet > 0)
+          ? remainingBase
+          : Math.min(remainingBase, fxRate === 1 ? shareForeign : round4(shareForeign / (fxRate || 1)))
+        if (shareForeign > 0 || shareBase > 0) {
+          refundLines.push({
+            lineId: null,
+            productId: null,
+            description: 'Order discount',
+            qty: 0,
+            totalForeign: -shareForeign,
+            totalBase: -shareBase,
+            lineKind: 'discount',
+          })
         }
         totalBase = refundLines.reduce((sum, line) => sum + line.totalBase, 0)
       }
