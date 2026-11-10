@@ -112,6 +112,7 @@ import {
   recordIntegrationConnectionTest,
   type IntegrationConnectionTestState,
 } from '@/lib/integration-connection-test-gate'
+import { CONFIRMATION_REQUIRED_CODE, isExplicitlyConfirmed, typedConfirmationMatches, type ActionConfirmation } from '@/lib/typed-confirmation'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import type { WmsAsnPackagingType, WmsAsnRef } from '@/lib/connectors/wms/types'
 import type {
@@ -2452,8 +2453,19 @@ export async function saveMintsoftBinding(
 
 export async function confirmMintsoftAlignmentMode(
   bindingId: string,
-): Promise<{ success: boolean; error?: string }> {
+  confirmation?: ActionConfirmation,
+): Promise<{ success: boolean; error?: string; code?: string }> {
   await requireMintsoftWriteAccess()
+
+  // Going live lets Mintsoft stock levels write inventory corrections into IMS, so the caller must
+  // say it was confirmed; the warehouse code it typed is checked below, once the binding is known.
+  if (!isExplicitlyConfirmed(confirmation)) {
+    return {
+      success: false,
+      code: CONFIRMATION_REQUIRED_CODE,
+      error: 'Switching a warehouse to live stock corrections needs an explicit confirmation. Nothing was changed.',
+    }
+  }
 
   const parsedId = MintsoftBindingDeleteSchema.safeParse(bindingId)
   if (!parsedId.success) {
@@ -2470,6 +2482,7 @@ export async function confirmMintsoftAlignmentMode(
       warehouseId: true,
       stockSyncMode: true,
       alignmentConfirmedAt: true,
+      warehouse: { select: { code: true } },
     },
   })
 
@@ -2478,6 +2491,13 @@ export async function confirmMintsoftAlignmentMode(
   }
   if (binding.stockSyncMode !== 'ALIGN_TO_WMS') {
     return { success: false, error: 'This binding is not configured for Align To WMS.' }
+  }
+  if (!typedConfirmationMatches(confirmation.typedName, binding.warehouse.code)) {
+    return {
+      success: false,
+      code: CONFIRMATION_REQUIRED_CODE,
+      error: 'The warehouse code typed does not match this binding. Nothing was changed.',
+    }
   }
   if (binding.alignmentConfirmedAt) {
     return { success: true }

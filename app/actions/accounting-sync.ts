@@ -19,6 +19,7 @@ import {
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
 import { freshAuthFailureResult, requireInternalUser, requirePermission, requireRole } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
+import { CONFIRMATION_REQUIRED_CODE, isExplicitlyConfirmed, type BulkRetryConfirmation } from '@/lib/typed-confirmation'
 import { probeLedgerSettlement } from '@/lib/connectors/accounting-settlement-probe'
 import {
   classifyLedgerSettlement,
@@ -758,8 +759,35 @@ export async function triggerAccountingSync(): Promise<{ success: boolean; resul
 export async function retryFailedAccountingSync(
   entryId?: string,
   expectedAttemptRevision?: number,
-): Promise<{ success: boolean; reset: number; refused?: number; error?: string }> {
+  bulkConfirmation?: BulkRetryConfirmation,
+): Promise<{ success: boolean; reset: number; refused?: number; error?: string; code?: string }> {
   await requirePermission('sync')
+  // Re-queueing EVERY failed row can post a second document for each one the first attempt already
+  // landed (the connector's idempotency key has expired by then). The bulk form therefore refuses
+  // unless the caller says it was shown, and confirmed, how many rows it covers.
+  if (entryId === undefined) {
+    if (!isExplicitlyConfirmed(bulkConfirmation) || !Number.isInteger(bulkConfirmation.expectedCount)) {
+      return {
+        success: false,
+        reset: 0,
+        code: CONFIRMATION_REQUIRED_CODE,
+        error: 'Re-queueing all failed rows needs an explicit confirmation. Nothing was re-queued.',
+      }
+    }
+    const activeConnector = await getActiveConnector()
+    const failedNow = activeConnector
+      ? await db.accountingSyncLog.count({ where: { connector: activeConnector, status: 'FAILED' } })
+      : 0
+    if (failedNow !== bulkConfirmation.expectedCount) {
+      return {
+        success: false,
+        reset: 0,
+        code: CONFIRMATION_REQUIRED_CODE,
+        error: `The number of failed rows changed from ${bulkConfirmation.expectedCount} to ${failedNow} since you confirmed. `
+          + 'Nothing was re-queued; review the list and confirm again.',
+      }
+    }
+  }
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).retryFailedSync(entryId, expectedAttemptRevision)
 }

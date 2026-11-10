@@ -263,7 +263,7 @@ Each backup in the list offers the following actions:
 - **Upload to S3** — push the backup to your configured S3 storage
 - **Upload via SFTP** — push the backup to your configured SFTP server
 - **Restore** — restore the system from this backup
-- **Delete** — remove the backup from the server
+- **Delete** — remove the backup from the server. Delete is a labelled button, set apart from Restore. It opens a confirmation that names the file, its size and date, says whether it is the newest backup, and requires you to type the backup file name before **Delete backup** enables. The server action refuses the call unless it carries that confirmation and the typed name matches, so a stale page or a direct call cannot delete a backup without it. Copies already uploaded to S3 or SFTP are not touched.
 
 Remote upload and delete actions apply to both the SQL backup and the `.manifest.json` sidecar. If a remote manifest upload fails after the SQL file uploaded, IMS attempts to delete the orphan SQL artifact and logs the cleanup result.
 

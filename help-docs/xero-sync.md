@@ -1350,6 +1350,8 @@ creating a second payment. A deposit and a balance (different receipts) carry di
 post. A row that records no receipt (an imported or older row) or no usable amount keeps its own
 token. Reference marks and the ledger fence are unchanged.
 
+"Retry all failed" (the red banner at the top of the Sync page and the button in the Sync Log) opens a confirmation dialog first. It shows how many failed rows will be re-queued, repeats the duplicate-document caution, and enables **Retry** only after you tick that you have checked Xero and none of the documents already exist there. The server refuses the bulk retry unless the call carries that confirmation and the same row count, and refuses if the count changed in the meantime. The per-row retry is unchanged.
+
 The retry controls (the failed-sync banner, "Retry All Failed", and the per-row retry in the sync
 log) all state this. Before re-queueing an aged row, search Xero for the document. IMS deliberately
 does not block the retry: it is the only remedy for a row whose cause has since been fixed, and
