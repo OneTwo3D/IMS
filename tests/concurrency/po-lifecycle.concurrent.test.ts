@@ -663,3 +663,70 @@ test('cancel is refused on a fully received order (it can only be closed)', SKIP
   assert.equal((await poState(po)).status, 'RECEIVED')
   assert.equal((await advancePoStatus(po.poId, 'CLOSED')).success, true)
 })
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// MUTATION-PASS GAPS
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+
+test('a bill with no product lines still makes the order non-pristine: an edit amends in place (ids kept) instead of rebuilding', SKIP, async () => {
+  const { updatePurchaseOrder } = await actions()
+  const { db } = await import('@/lib/db')
+  const po = await seedPo('ed-linelessbill', [10, 10])
+  await db.purchaseInvoice.create({ data: { poId: po.poId, invoiceDate: new Date(), subtotalForeign: 5, subtotalBase: 5, totalForeign: 5, totalBase: 5, fxRateToBase: 1 } })
+  const ok = await updatePurchaseOrder(po.poId, editFor(po, [{ qty: 12 }, { qty: 10 }]))
+  assert.equal(ok.success, true, String(ok.error))
+  const after = await poState(po)
+  assert.deepEqual(after.lines.map((l) => l.id).sort(), po.lines.map((l) => l.poLineId).sort(), 'line ids survive')
+  assert.equal((await updatePurchaseOrder(po.poId, editFor(po, [{ qty: 12 }, { qty: 10 }], { currency: 'USD' }))).success, false, 'currency is fixed once a bill exists')
+})
+
+test('an amend refuses a currency change and keeps the stored VAT convention', SKIP, async () => {
+  const { updatePurchaseOrder } = await actions()
+  const { db } = await import('@/lib/db')
+  const po = await seedPo('ed-currency', [100, 10])
+  await db.purchaseOrder.update({ where: { id: po.poId }, data: { pricesIncludeVat: true } })
+  assert.equal((await receive(po, po.lines[0]!, 10)).success, true)
+  const currency = await updatePurchaseOrder(po.poId, editFor(po, [{ qty: 100 }, { qty: 10 }], { currency: 'USD' }))
+  assert.equal(currency.success, false)
+  assert.match(currency.error ?? '', /supplier, currency, exchange rate and VAT cannot be changed/)
+  const ok = await updatePurchaseOrder(po.poId, editFor(po, [{ qty: 100 }, { qty: 12 }], { pricesIncludeVat: false }))
+  assert.equal(ok.success, true, String(ok.error))
+  const row = await db.purchaseOrder.findUniqueOrThrow({ where: { id: po.poId }, select: { pricesIncludeVat: true } })
+  assert.equal(row.pricesIncludeVat, true, 'the VAT convention the receipts were costed under is not rewritten by an amend')
+})
+
+test('a freight order cannot be edited after Draft (it has its own cost editor)', SKIP, async () => {
+  const { updatePurchaseOrder } = await actions()
+  const { db } = await import('@/lib/db')
+  const po = await seedPo('ed-freightpo', [3])
+  await db.purchaseOrder.update({ where: { id: po.poId }, data: { type: 'FREIGHT' } })
+  const result = await updatePurchaseOrder(po.poId, editFor(po, [{ qty: 9 }]))
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /can no longer be edited/)
+  assert.equal((await poState(po)).lines[0]!.qty, 3)
+})
+
+test('linked freight counts as cost lines: a part-received order with a linked freight order refuses a quantity edit', SKIP, async () => {
+  const { updatePurchaseOrder } = await actions()
+  const { db } = await import('@/lib/db')
+  const po = await seedPo('ed-linkedfreight', [100, 20])
+  const freight = await seedPo('ed-linkedfreight-f', [1])
+  await db.purchaseOrder.update({ where: { id: freight.poId }, data: { type: 'FREIGHT' } })
+  await db.freightCostLine.create({ data: { poId: freight.poId, description: 'Sea freight', amountForeign: 40, amountBase: 40, vatable: false, distributionMethod: 'BY_VALUE', sortOrder: 0 } })
+  await db.landedCostLink.create({ data: { primaryPoId: po.poId, freightPoId: freight.poId } })
+  assert.equal((await receive(po, po.lines[0]!, 60)).success, true)
+  const refused = await updatePurchaseOrder(po.poId, editFor(po, [{ qty: 100 }, { qty: 15 }]))
+  assert.equal(refused.success, false)
+  assert.match(refused.error ?? '', /freight or other cost lines/)
+})
+
+test('a return on an order stranded in PARTIALLY_RETURNED by an older return reopens it while quantity is still due', SKIP, async () => {
+  const { returnPurchaseOrder } = await actions()
+  const po = await seedPo('ret-strand-reopen', [10])
+  const line = po.lines[0]!
+  assert.equal((await receive(po, line, 5)).success, true)
+  await setStatus(po.poId, 'PARTIALLY_RETURNED')
+  const result = await returnPurchaseOrder(po.poId, [{ poLineId: line.poLineId, qtyReturned: 1, warehouseId: po.warehouseId }], 'damaged')
+  assert.equal(result.success, true, String(result.error))
+  assert.equal((await poState(po)).status, 'PARTIALLY_RECEIVED')
+})

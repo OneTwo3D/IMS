@@ -177,3 +177,14 @@ test('the part-received cost-line refusal message names prices as well as quanti
   const { PO_COST_LINES_PART_RECEIVED_MESSAGE } = await import('@/lib/domain/purchasing/po-edit-plan')
   assert.match(PO_COST_LINES_PART_RECEIVED_MESSAGE, /quantities, prices or discounts/)
 })
+
+test('mutation gaps: the product-swap refusal, and removal of an untouched line under cost lines, are refused with their own reasons', () => {
+  const a = line({ id: 'a', landedQty: 60, receiptLineCount: 1 })
+  const b = line({ id: 'b' })
+  const swap = planLineAmend(facts([a, b]), [{ poLineId: 'a', productId: 'other', qty: 60 }, req(b)])
+  assert.equal(swap.ok, false)
+  assert.match(swap.ok ? '' : swap.error, /its product cannot be changed/)
+  const removeUntouched = planLineAmend(facts([a, b], { hasCostLines: true }), [req(a)])
+  assert.equal(removeUntouched.ok, false)
+  assert.match(removeUntouched.ok ? '' : removeUntouched.error, /freight or other cost lines/)
+})
