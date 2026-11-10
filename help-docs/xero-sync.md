@@ -1597,8 +1597,32 @@ An **explicit** `NONE` is refused too, unless the line says why it carries no ta
 shop charged no tax on and named no rate for (for example the over-threshold import duty). A tax rate whose own Xero tax type is `NONE`
 (WooCommerce rate 182, *Taxes & Duties*, is mapped that way) therefore refuses any ordinary line it lands on; map it to a real,
 active tax type. Shipping and the order discount can never be on `NONE`. The check runs at the head of the sales invoice, sales invoice
-update and credit note cases of the poster, and again in the connector as the last word. Supplier bills and supplier credit notes are not
-covered yet.
+update and credit note cases of the poster, and again in the connector as the last word. Supplier bills and supplier credit notes follow
+the same rule (next section).
+
+### Supplier bills and supplier credit notes: no tax type, no document
+
+A supplier **bill** (create and update) or **supplier credit note** line with no tax type is **refused**: nothing is sent to Xero (no
+contact is created either) and the row fails on **/sync** with an error that begins *NOTHING WAS SENT* and names the line. IMS used to send
+Xero's `NONE` ("No VAT") for such a line, so input VAT recorded in IMS was silently not claimed in Xero. A line is left without a type when
+a vatable cost line (freight, duty) has no **supplier default VAT rate**, when a goods line's own rate has no Xero tax type, or when a
+goods line has neither a rate nor a supplier default; a supplier credit note is left without one when the bill it offsets carried VAT but
+the supplier has no mapped tax type.
+
+`NONE` is still posted where IMS **decided** it: a cost line the order marks **not vatable**, a goods line whose own (or the supplier's
+default) rate is itself `No VAT`, and a supplier credit note against a bill that carried no VAT. An explicit `NONE` on any other line is
+refused too. **To fix a refused bill:** give the supplier a default VAT rate (or the purchase order line its own rate) that is mapped to a
+real Xero tax type, then edit and save the bill again so it is queued with the corrected type. A refused supplier credit note is fixed the
+same way, then raised again from the credit note. Bills already queued before this change with a non-vatable cost line carry no type and will
+be refused once: edit and save the bill to rebuild it.
+
+### Bill VAT: each line's own rate
+
+The VAT IMS records on a supplier bill is the sum of each billed line's **own** rate on its own net: a goods line at its rate, a vatable cost
+line (freight, duty, handling) at the order's VAT rate, a non-vatable cost line at none. It used to be the order's total VAT divided by the order's goods
+subtotal, which counts freight VAT in the rate without counting freight in the base (goods 100 at 20% plus vatable freight 50 made a "30%" rate
+and recorded 45 of VAT instead of 30) and is wrong for any order mixing rates that is billed in part. The tax types sent to Xero are unchanged;
+only the VAT IMS records on the bill (and so its total and base figures) now agrees with what Xero computes from those types.
 
 For **WooCommerce orders** the import also refuses, at import time, an order that moved money on a tax rate IMS cannot post under: a
 WooCommerce rate id with **no mapping** (IMS used to substitute the default rate with a warning), or one mapped to an **inactive** IMS

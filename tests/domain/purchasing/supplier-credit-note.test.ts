@@ -131,9 +131,9 @@ test('sync payload carries allocation hints when the bill has an external id (au
 test('credit-note tax type mirrors the bill: supplier tax type when the bill had VAT, else NONE', () => {
   assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: 'INPUT2' }), 'INPUT2')
   assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: 'INPUT2' }), 'NONE')
-  // Bill had VAT but the supplier has no mapped tax type → fall back to NONE (defensive).
-  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: null }), 'NONE')
-  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: undefined }), 'NONE')
+  // Bill had VAT but the supplier has no mapped tax type → UNDECIDED, never NONE: the poster refuses it (ACC-H3).
+  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: null }), undefined)
+  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: undefined }), undefined)
 })
 
 test('credit-note tax type: reverse-charge goods credit reverses on the RC tax type, not NONE', () => {
@@ -154,10 +154,10 @@ test('credit-note tax type: reverse-charge goods credit reverses on the RC tax t
     resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: 'INPUT2', isReverseCharge: true, reverseChargeTaxType: '' }),
     'INPUT2',
   )
-  // RC, no RC tax type AND no line tax type → NONE (nothing to mirror).
+  // RC, no RC tax type AND no line tax type → UNDECIDED, not NONE: the poster refuses it (ACC-H3).
   assert.equal(
     resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: null, isReverseCharge: true, reverseChargeTaxType: '' }),
-    'NONE',
+    undefined,
   )
   // Not reverse-charge → unchanged behaviour (RC tax type ignored).
   assert.equal(

@@ -50,6 +50,7 @@ import {
   withheldEntityKey,
   WITHHELD_RECHECK_BATCH,
 } from '@/lib/domain/accounting/withheld-reversal-markers'
+import { parseXeroDateOrNull } from './xero-date'
 import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
 
 import {
@@ -876,7 +877,23 @@ async function processDeltaChunk(
 
     for (const order of unpaidManualOrders) {
       const paidInvoice = order.accountingInvoiceId ? invoiceById.get(order.accountingInvoiceId) : undefined
-      const paidDate = paidInvoice?.FullyPaidOnDate ? new Date(paidInvoice.FullyPaidOnDate) : new Date()
+      // ACC-H5: Xero's `/Date(ms)/` form is an Invalid Date to `new Date()`, and a missing date used to
+      // become "now". Neither may stamp a payment: skip with a logged reason (the cursor is NOT held —
+      // an error here would stall the poll forever on one bad document; the reconcile sweep reports
+      // the still-unpaid document for a human).
+      const paidDate = parseXeroDateOrNull(paidInvoice?.FullyPaidOnDate)
+      if (!paidDate) {
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: order.id,
+          action: 'payment_date_unreadable',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `Xero reports the invoice for order ${order.orderNumber ?? order.externalOrderNumber} PAID but its FullyPaidOnDate is missing or unparseable; paidAt was NOT set. Review manually (the payment reconcile sweep will list it).`,
+          resolveUser: false,
+        })
+        continue
+      }
 
       // TWO independent guarded writes, not one, so a concurrent lifecycle move can neither drop the
       // payment nor be overwritten (o3d-2s8, Codex review of #496).
@@ -1088,7 +1105,23 @@ async function processDeltaChunk(
 
     for (const bill of unpaidBills) {
       const paidInvoice = bill.accountingInvoiceId ? invoiceById.get(bill.accountingInvoiceId) : undefined
-      const paidDate = paidInvoice?.FullyPaidOnDate ? new Date(paidInvoice.FullyPaidOnDate) : new Date()
+      // ACC-H5: Xero's `/Date(ms)/` form is an Invalid Date to `new Date()`, and a missing date used to
+      // become "now". Neither may stamp a payment: skip with a logged reason (the cursor is NOT held —
+      // an error here would stall the poll forever on one bad document; the reconcile sweep reports
+      // the still-unpaid document for a human).
+      const paidDate = parseXeroDateOrNull(paidInvoice?.FullyPaidOnDate)
+      if (!paidDate) {
+        await logActivity({
+          entityType: 'PURCHASE_ORDER',
+          entityId: bill.poId,
+          action: 'bill_payment_date_unreadable',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `Xero reports the bill for PO ${bill.po.reference} PAID but its FullyPaidOnDate is missing or unparseable; paidAt was NOT set. Review manually (the payment reconcile sweep will list it).`,
+          resolveUser: false,
+        })
+        continue
+      }
 
       await db.purchaseInvoice.update({
         where: { id: bill.id },

@@ -22,8 +22,6 @@ const base = (over: Record<string, unknown> = {}) => calculatePurchaseInvoice({
   lines: [{ kind: 'cost', costLineId: 'vat', amountForeign: 100 }],
   fxRateToBase: 1,
   poReference: 'F-1',
-  poSubtotalForeign: 200,
-  poTaxForeign: 20,
   transitAccount: '631',
   poLineById: new Map(),
   costLineById: costLines,
@@ -41,12 +39,11 @@ test('freight bill: partial bill of the vatable line records 20 (the order rate)
   assert.equal(base({ poType: 'FREIGHT', poTaxRatePercent: '0.2', lines: [{ kind: 'cost', costLineId: 'vat', amountForeign: 100 }, { kind: 'cost', costLineId: 'exempt', amountForeign: 100 }] }).taxForeign, 20)
 })
 
-test('non-freight order and a freight order with no recorded rate keep the blended rate (unchanged behaviour)', () => {
+test('no blended rate: a goods order bills its vatable cost line at the order rate, and an order with no recorded rate bills no VAT', () => {
   const goods = base({ poType: 'GOODS', poTaxRatePercent: '0.2' })
-  const legacyFreight = base({ poType: 'FREIGHT', poTaxRatePercent: null })
-  console.log(`unchanged PRECONDITION: GOODS with a rate -> tax ${goods.taxForeign}; FREIGHT with no recorded rate -> tax ${legacyFreight.taxForeign}`)
-  assert.equal(goods.taxForeign, 10)
-  assert.equal(legacyFreight.taxForeign, 10)
+  const noRate = base({ poType: 'FREIGHT', poTaxRatePercent: null })
+  assert.equal(goods.taxForeign, 20)
+  assert.equal(noRate.taxForeign, 0)
 })
 
 const snapshot = (over: Partial<PurchaseInvoiceTaxInputs> = {}): PurchaseInvoiceTaxInputs => ({

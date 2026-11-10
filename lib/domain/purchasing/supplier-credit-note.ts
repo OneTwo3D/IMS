@@ -1,4 +1,5 @@
 import { rateBinding, type TaxBindingBasis } from '@/lib/accounting/reverse-charge'
+import { noVatRateKind } from '@/lib/domain/accounting/purchase-document-tax-types'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 // ---------------------------------------------------------------------------
 // Supplier credit-note domain logic (audit-g5u2)
@@ -86,7 +87,10 @@ export function validateRecordSupplierCreditNote(params: {
  *
  * Otherwise: if the offset bill carried tax, reverse with the supplier's tax
  * type; else NONE (conservative — won't fabricate a VAT reversal without a bill
- * signal to mirror).
+ * signal to mirror). A bill that DID carry tax but whose supplier type is blank
+ * returns `undefined`, NOT NONE: the credit would silently leave the input VAT
+ * claimed in the ledger, so the poster refuses it instead
+ * (lib/domain/accounting/purchase-document-tax-types.ts).
  *
  * Scope: the credit note is a single amount, so this uses a bill/PO-level tax
  * signal (uniform tax treatment — the normal case). Per-line tax bases on a
@@ -99,15 +103,16 @@ export function resolveSupplierCreditNoteTaxType(params: {
   isReverseCharge?: boolean
   /** The configured reverse-charge purchase tax type (accounting settings). */
   reverseChargeTaxType?: string | null
-}): string {
+}): string | undefined {
   if (params.isReverseCharge) {
     // Mirror the bill poster exactly: the configured RC tax type when set, else
     // the line's own accounting tax type (baseTaxType) — NOT NONE, so an RC
     // purchase with no RC tax type configured still posts on the line's tax type
     // just as the bill did.
-    return params.reverseChargeTaxType || params.supplierTaxType || 'NONE'
+    // Neither a configured reverse-charge type nor a line type: undecided, refused downstream - not NONE.
+    return params.reverseChargeTaxType || params.supplierTaxType || undefined
   }
-  if (params.billHadTax && params.supplierTaxType) return params.supplierTaxType
+  if (params.billHadTax) return params.supplierTaxType || undefined
   return 'NONE'
 }
 
@@ -233,7 +238,8 @@ export function buildSupplierCreditNoteSyncPayload(params: {
   fxRateToBase: number
   amountForeign: number
   transitAccount: string
-  taxType: string
+  /** Undefined when the type could not be decided: the line then carries none and the poster refuses it. */
+  taxType: string | undefined
   /** The rate `taxType` was read from; never sent (lib/tax/retired-tax-code-guard.ts binds the code to it). */
   taxRateId?: string
   /** How `taxType` was derived from that rate (lib/accounting/reverse-charge.ts TaxBindingBasis); required with `taxRateId`. */
@@ -263,6 +269,8 @@ export function buildSupplierCreditNoteSyncPayload(params: {
         unitAmount: params.amountForeign,
         accountCode: params.transitAccount,
         taxType: params.taxType,
+        // A NONE here is a decision (the offset bill carried no VAT, or the supplier's rate is itself No VAT), so it names its kind.
+        ...(noVatRateKind(params.taxType) ? { noTaxKind: noVatRateKind(params.taxType) } : {}),
         ...(params.taxRateBasis ? rateBinding(params.taxRateId, params.taxRateBasis) : {}),
       },
     ],

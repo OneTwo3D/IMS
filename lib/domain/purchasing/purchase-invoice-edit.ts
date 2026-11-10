@@ -1,7 +1,8 @@
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { rateBinding, resolvePurchaseLineTaxType } from '@/lib/accounting/reverse-charge'
 import { usableStoredFxRate } from '@/lib/currencies/stored-document-rate'
-import { addMoney, multiplyMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { noVatRateKind, type PurchaseNoTaxLineKind } from '@/lib/domain/accounting/purchase-document-tax-types'
 
 export type PurchaseInvoiceEditHeader = {
   invoiceNumber: string | null
@@ -37,7 +38,14 @@ export type PurchaseInvoicePoLine = {
    */
   qtyReturned?: unknown
   product: { sku: string }
-  taxRate?: { id?: string; accountingTaxType: string | null; reverseCharge?: boolean } | null
+  /**
+   * The line's own rate. `rate` is the stored fraction (0.2 = 20%); `isCompound`/active `components` say it is a compound rate whose
+   * effective percentage is not `rate`, in which case the line's own recorded tax over its recorded net is used instead.
+   */
+  taxRate?: { id?: string; accountingTaxType: string | null; reverseCharge?: boolean; rate?: unknown; isCompound?: boolean; components?: readonly unknown[] } | null
+  /** The line's recorded tax and net, from the order: the line's OWN effective rate when its stored rate cannot state it. */
+  taxForeign?: unknown
+  totalForeign?: unknown
 }
 
 export type PurchaseInvoiceCostLine = {
@@ -80,6 +88,8 @@ export type PurchaseInvoiceAccountingLine = {
   unitAmount: number
   accountCode: string
   taxType?: string
+  /** Why this line may carry NONE (lib/domain/accounting/purchase-document-tax-types.ts); never sent to the ledger. */
+  noTaxKind?: PurchaseNoTaxLineKind
   /** The rate `taxType` was read from; never sent (the enqueue guard binds the code to it, lib/tax/retired-tax-code-guard.ts). */
   taxRateId?: string
   /** How `taxType` was derived from that rate (lib/accounting/reverse-charge.ts TaxBindingBasis); never sent. */
@@ -147,16 +157,33 @@ function assertPositiveFxRate(fxRate: number): void {
   }
 }
 
+/**
+ * A goods line's OWN VAT rate, as a fraction. A simple stored rate is used as it is. A compound rate (or one with active components) has an
+ * effective percentage the stored `rate` does not state, so the line's recorded tax over its recorded net is used (rounded to the
+ * four places a rate is stored in). A line with no rate row takes the order's rate. On a FREIGHT order every line is taxed at the order's
+ * recorded rate.
+ */
+function purchaseLineOwnRate(poLine: PurchaseInvoicePoLine, orderRate: Decimal, freightOrder: boolean): Decimal {
+  if (freightOrder) return orderRate
+  const rate = poLine.taxRate
+  if (!rate) return orderRate
+  const net = toDecimal(String(poLine.totalForeign ?? 0))
+  const recordedTax = toDecimal(String(poLine.taxForeign ?? 0))
+  if ((rate.isCompound || (rate.components?.length ?? 0) > 0) && net.gt(0)) return recordedTax.div(net).toDecimalPlaces(4)
+  if (rate.rate != null) return toDecimal(String(rate.rate))
+  return net.gt(0) && poLine.taxForeign != null ? recordedTax.div(net).toDecimalPlaces(4) : orderRate
+}
+
 export function calculatePurchaseInvoice(params: {
   lines: PurchaseInvoiceInputLine[]
   fxRateToBase: number
   poReference: string
-  poSubtotalForeign: number
-  poTaxForeign: number
   /**
-   * A FREIGHT order's recorded VAT rate (a fraction). When given for a freight order the bill's VAT is this rate on the
-   * vatable cost lines billed, NOT the blended `poTax / wholePoSubtotal` (which understates VAT whenever the order mixes
-   * vatable and exempt lines: 100 vatable + 100 exempt at 20% has a blended 10%). Goods orders keep the blended rate.
+   * The order's recorded VAT rate (a fraction; null = none). It is the rate its vatable cost lines (freight, duty, handling) were
+   * charged at, and what a FREIGHT order's lines are all taxed at. THERE IS NO BLENDED RATE: the bill's VAT is each billed line's
+   * own rate on its own net (a goods line its rate, a vatable cost line this one), never `order tax / order subtotal` - the order's tax
+   * includes the cost lines' VAT while its subtotal does not (100 of goods at 20% plus 50 of vatable freight is a blended 30%, 45 of
+   * VAT instead of 30), and a part-billed mixed-rate order has no single rate at all.
    */
   poType?: string
   poTaxRatePercent?: number | string | null
@@ -181,7 +208,8 @@ export function calculatePurchaseInvoice(params: {
   // `+=` accumulation could drift the header a penny from its lines.
   let subtotalForeign = toDecimal(0)
   let subtotalBase = toDecimal(0)
-  let taxBaseForeign = toDecimal(0)
+  let taxForeignSum = toDecimal(0)
+  const orderRate = toDecimal(params.poTaxRatePercent ?? 0)
   const lineData: PurchaseInvoiceLineDraft[] = []
   const accountingLines: PurchaseInvoiceAccountingLine[] = []
 
@@ -200,7 +228,7 @@ export function calculatePurchaseInvoice(params: {
       const totalBase = rounded4(toDecimal(totalForeign).div(params.fxRateToBase))
       subtotalForeign = addMoney(subtotalForeign, totalForeign)
       subtotalBase = addMoney(subtotalBase, totalBase)
-      taxBaseForeign = addMoney(taxBaseForeign, totalForeign)
+      taxForeignSum = addMoney(taxForeignSum, multiplyMoney(totalForeign, purchaseLineOwnRate(poLine, orderRate, params.poType === 'FREIGHT')))
 
       lineData.push({
         id: line.id,
@@ -224,6 +252,9 @@ export function calculatePurchaseInvoice(params: {
         unitAmount: rounded4(line.unitCostForeign),
         accountCode: params.transitAccount,
         taxType: productTaxType,
+        // A NONE that came out of the line's own (or the supplier's default) rate is that rate's decision, so it names its kind; a blank
+        // is left blank and refused by the poster.
+        ...(noVatRateKind(productTaxType) ? { noTaxKind: noVatRateKind(productTaxType) } : {}),
         // The rate that code was read from (never sent), with the basis it was derived on: the line's own rate is a purchase goods line (reverse-charge swap), the supplier default is plain.
         ...(poLine.taxRate?.id ? rateBinding(poLine.taxRate.id, 'purchase_line') : rateBinding(params.fallbackTaxRateId, 'plain')),
       })
@@ -241,7 +272,7 @@ export function calculatePurchaseInvoice(params: {
     const totalBase = rounded4(toDecimal(totalForeign).div(params.fxRateToBase))
     subtotalForeign = addMoney(subtotalForeign, totalForeign)
     subtotalBase = addMoney(subtotalBase, totalBase)
-    if (costLine.vatable) taxBaseForeign = addMoney(taxBaseForeign, totalForeign)
+    if (costLine.vatable) taxForeignSum = addMoney(taxForeignSum, multiplyMoney(totalForeign, orderRate))
 
     lineData.push({
       id: line.id,
@@ -258,18 +289,18 @@ export function calculatePurchaseInvoice(params: {
       quantity: 1,
       unitAmount: totalForeign,
       accountCode: params.transitAccount,
-      taxType: costLine.vatable ? params.fallbackTaxType : undefined,
+      // A vatable cost line takes the supplier's default type, and REFUSES downstream when there is none; a cost line the order flags as
+      // not vatable is a decided No VAT. Neither is a default.
+      taxType: costLine.vatable ? params.fallbackTaxType : 'NONE',
+      ...(costLine.vatable
+        ? (noVatRateKind(params.fallbackTaxType) ? { noTaxKind: noVatRateKind(params.fallbackTaxType) } : {})
+        : { noTaxKind: 'cost-not-vatable' as const }),
       ...rateBinding(costLine.vatable ? params.fallbackTaxRateId : undefined, 'plain'),
     })
   }
 
-  const freightRecordedRate = params.poType === 'FREIGHT' && params.poTaxRatePercent != null
-    ? toDecimal(params.poTaxRatePercent)
-    : null
-  const taxRate = freightRecordedRate ?? (params.poSubtotalForeign > 0
-    ? toDecimal(params.poTaxForeign).div(params.poSubtotalForeign)
-    : toDecimal(0))
-  const taxForeign = rounded4(multiplyMoney(taxBaseForeign, taxRate))
+  // The header tax is the sum of each billed line's own tax, rounded once to the four places the stored figures use.
+  const taxForeign = rounded4(taxForeignSum)
   const taxBase = rounded4(toDecimal(taxForeign).div(params.fxRateToBase))
 
   return {

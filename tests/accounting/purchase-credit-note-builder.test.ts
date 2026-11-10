@@ -14,7 +14,7 @@ const base: CreditNoteData = {
   currency: 'EUR',
   currencyRateToBase: 0.85,
   lines: [
-    { description: 'Duplicate freight bill credit', quantity: 1, unitAmount: 120, accountCode: '6200', taxType: 'NONE' },
+    { description: 'Duplicate freight bill credit', quantity: 1, unitAmount: 120, accountCode: '6200', taxType: 'NONE', noTaxKind: 'no-vat-rate' },
   ],
   reference: 'PO-FREIGHT-9',
 }
@@ -40,15 +40,13 @@ test('maps line items with the expense account code + tax type', () => {
   assert.equal(body.LineAmountTypes, 'Exclusive') // lineAmountsIncludeTax omitted
 })
 
-test('defaults a missing line tax type to NONE (Xero mandates TaxType)', () => {
-  const body = buildXeroPurchaseCreditNote(
+test('a missing line tax type is REFUSED, not defaulted to NONE (ACC-H3)', () => {
+  assert.throws(() => buildXeroPurchaseCreditNote(
     { ...base, lines: [{ description: 'x', quantity: 1, unitAmount: 10, accountCode: '6200' }] },
     'AUTHORISED',
     'c1',
     'GBP',
-  )
-  const lines = body.LineItems as Array<Record<string, unknown>>
-  assert.equal(lines[0].TaxType, 'NONE')
+  ), /NOTHING WAS SENT\. Supplier credit note SCN-001 was refused: no tax type on line 1 "x"/)
 })
 
 test('stamps the IMS FX rate and omits Reference when absent', () => {
