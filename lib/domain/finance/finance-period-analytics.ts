@@ -698,7 +698,7 @@ export async function getArAgingReport(
   const asOfExclusive = window.dateToExclusive
   const orders = await client.salesOrder.findMany({
     where: {
-      archived: false,
+      // No `archived` condition: archiving only hides orders from operational lists (see INVOICED_ORDER_WHERE).
       // Invoiced basis (shared with the revenue reports), dated by the same invoice date as the period
       // reports (invoicedAt, else paidAt, else the order date): an order is in AR at the cutoff only if
       // that date is on or before it.
@@ -898,8 +898,8 @@ export async function getCurrencySummaryReport(
     client.salesOrder.findMany({
       where: {
         // Dated by invoicedPeriodDate: invoicedAt, else the order date for Xeroom-era orders.
+        // No `archived` condition: archiving only hides orders from operational lists (see INVOICED_ORDER_WHERE).
         ...invoicedInPeriodWhere({ gte: window.dateFrom, lt: window.dateToExclusive }),
-        archived: false,
       },
       select: {
         id: true,

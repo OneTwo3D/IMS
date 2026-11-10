@@ -400,3 +400,23 @@ test('an own-currency part payment at a different settlement rate owes the same 
     assert.equal(Number(summary.totals.arOutstandingBase), 160)
   } finally { ORDERS.pop() }
 })
+
+test('an archived, invoiced, completed order is counted the same on every revenue and receivables screen', async () => {
+  // Retention archives old completed orders and touches nothing else; archiving only hides an order from operational lists.
+  ORDERS.push(row('R', 33, { status: SalesOrderStatus.COMPLETED, invoiceNumber: 'INV-R', archived: true }))
+  try {
+    const expected = EXPECTED_REVENUE + 33
+    const { getDashboardData } = await import('@/app/actions/dashboard')
+    assert.equal((await getDashboardData('today', 'previous_period')).kpi.grossSalesCurrent, expected, 'dashboard')
+    const { getProductSalesStats } = await import('@/app/actions/sales-stats')
+    assert.equal((await getProductSalesStats()).summary.totalGrossRevenue, expected, 'Sales Statistics')
+    const filters = { dateFrom: TODAY, dateTo: TODAY }
+    const sales = await getSalesAnalyticsReport(filters, { client: analyticsClient(), now: () => TODAY_NOON })
+    assert.equal(Number(sales.totals.revenue), expected, 'Sales Analytics')
+    const deps = { client: financeClient(), now: () => TODAY_NOON, baseCurrency: async () => 'GBP' }
+    assert.equal(Number((await getArAgingReport({ dateTo: TODAY }, { deps })).totals.outstandingBase), 120 + 33, 'AR Aging')
+    const summary = await getCurrencySummaryReport({ dateFrom: TODAY, dateTo: TODAY }, { deps })
+    assert.equal(Number(summary.totals.salesBase), expected, 'Currency Summary sales')
+    assert.equal(Number(summary.totals.arOutstandingBase), 120 + 33, 'Currency Summary AR')
+  } finally { ORDERS.pop() }
+})

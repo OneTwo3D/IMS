@@ -610,7 +610,6 @@ async function loadSalesOrders(client: SalesFulfillmentAnalyticsClient, filters:
     where: {
       ...INVOICED_ORDER_WHERE,
       createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
-      archived: false,
     },
     select: {
       id: true,
@@ -662,7 +661,6 @@ async function loadSalesOrdersByIds(client: SalesFulfillmentAnalyticsClient, ord
     where: {
       id: { in: [...new Set(orderIds)] },
       ...INVOICED_ORDER_WHERE,
-      archived: false,
     },
     select: {
       id: true,

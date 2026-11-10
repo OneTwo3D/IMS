@@ -33,6 +33,11 @@ export const INVOICED_BASIS_EXCLUDED_STATUSES = ['CANCELLED', 'DRAFT'] as const 
  * Prisma `where` fragment for `SalesOrder`. Spread it, or put it in an `AND`, because it owns
  * the `status` and `OR` keys. For a relation filter use `{ order: INVOICED_ORDER_WHERE }`.
  *
+ * ARCHIVED ORDERS COUNT. The retention job soft-archives old completed and delivered orders (`archived`
+ * = true) and touches nothing else: their invoices, payments and credits stand. Archiving only hides an
+ * order from operational lists, so no financial query built on this fragment (every revenue and receivables
+ * report and CSV) filters on `archived`, and one must not be added. Operational lists keep their own filter.
+ *
  * WHICH `invoiceNumber` COUNTS. Only a number that came from OUTSIDE IMS: the WooCommerce import
  * writes `_wcpdf_invoice_number` (the number Xeroom pushes to Xero) and, by the guard in
  * `generateInvoiceNumber`, IMS never mints a number for an order linked to such a connector
