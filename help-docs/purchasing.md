@@ -5,10 +5,11 @@ The Purchasing section manages your purchase orders, supplier relationships, and
 
 ## Purchase Order List
 
-The main purchasing page shows all purchase orders in a searchable table.
+The main purchasing page shows purchase orders in a searchable table, 50 per page. The line above the table says "Showing 1-50 of N purchase orders", and the search, filters and page number are in the address.
 
-- **Search** -- Find POs by number, supplier name, or reference.
-- **Filter by Status** -- Narrow the list to a specific status.
+- **Search** -- Find POs by reference, supplier name, the supplier's own reference, tracking number or the SKU of a line. It looks across **every** purchase order, not just the newest, and always includes archived orders (marked with an **Archived** badge).
+- **Include archived** -- Shows archived purchase orders in the everyday list. When some are hidden, the line above the table says how many.
+- **Filter by Status** -- Narrow the list to a specific status. The **Invoiced** and **Returned** filters are applied to the whole list, not only the page you are on.
 - **Export** -- Download the list as a CSV file (the CSV bar on the page also imports purchase orders from CSV).
 
 

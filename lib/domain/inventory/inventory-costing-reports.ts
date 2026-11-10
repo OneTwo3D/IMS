@@ -15,7 +15,7 @@ import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { calculateInventoryTurnover, normalizeVelocityWindow } from '@/lib/domain/inventory/velocity'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly as utcDateOnly, exclusiveEndOfUtcDay, parseDateOnly as parseUtcDateOnly, subtractUtcDays } from '@/lib/domain/math/date-window'
-import { assertSourceLimit, SourceScanTooLargeError } from '@/lib/security/source-scan-error'
+import { assertSourceLimit, SourceScanTooLargeError, sourceLimitNotice } from '@/lib/security/source-scan-error'
 import { getActiveAccountingConnectorInfo, syncAccountingAccountBalanceSnapshots, getAccountingSettingsFor } from '@/lib/accounting'
 import { cache } from 'react'
 import { DISPLAY_ROUNDING_NOTICE_COGS, REFUND_BASIS_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
@@ -2077,7 +2077,7 @@ export function emptyInventoryTurnoverReportForSourceLimit(filters: InventoryCos
       cogsEntryCount: 0,
       snapshotDayCount: 0,
     },
-    notices: [error.message],
+    notices: [sourceLimitNotice(error)],
   }
 }
 

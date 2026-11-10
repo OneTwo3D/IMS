@@ -15,7 +15,7 @@ import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stoc
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { HISTORICAL_IMPORT_REFERENCE_TYPES } from '@/lib/domain/inventory/stock-movement-value'
 import { exclusiveEndOfUtcDay, subtractUtcDays } from '@/lib/domain/math/date-window'
-import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
+import { SourceScanTooLargeError, sourceLimitNotice } from '@/lib/security/source-scan-error'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -515,7 +515,7 @@ export function emptyInventoryAgingReportForSourceLimit(
     pageInfo: pageInfo(0, 1, clampPageSize(filters.pageSize)),
     totals: { qty: '0', valueBase: '0' },
     bucketSummary: [],
-    notices: [error.message],
+    notices: [sourceLimitNotice(error)],
   }
 }
 
@@ -929,6 +929,6 @@ export function emptyDeadStockReportForSourceLimit(
     rows: [],
     pageInfo: pageInfo(0, 1, clampPageSize(filters.pageSize)),
     totals: { qty: '0', valueBase: '0', neverSoldRows: 0 },
-    notices: [error.message],
+    notices: [sourceLimitNotice(error)],
   }
 }

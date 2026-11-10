@@ -17,6 +17,7 @@ import {
   type InventoryCostingReportType,
 } from '@/lib/domain/inventory/inventory-costing-reports'
 import { inventoryCostingApiAccessDenied } from '@/lib/security/inventory-costing-access'
+import { sourceLimitExportBody } from '@/lib/security/source-scan-error'
 
 export const INVENTORY_VALUATION_CSV_HEADERS = ['sku', 'mpn', 'productName', 'categoryName', 'supplierNames', 'warehouseCode', 'warehouseName', 'qty', 'stockUnit', 'unitCostBase', 'totalValueBase', 'glBalanceBase', 'glVarianceBase']
 
@@ -199,7 +200,7 @@ export async function getInventoryCostingExportResponse(
         throw error
       })
       if (report instanceof InventoryTurnoverSourceLimitError) {
-        return NextResponse.json({ error: report.message }, { status: 413 })
+        return NextResponse.json(sourceLimitExportBody(report), { status: 413 })
       }
       const tooLarge = exportTooLarge(report.pageInfo.totalRows)
       if (tooLarge) return tooLarge
