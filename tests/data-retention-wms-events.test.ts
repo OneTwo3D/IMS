@@ -13,6 +13,7 @@ import {
 
 type ManyArgs = { where: Record<string, unknown>; data?: Record<string, unknown> }
 
+const PAIRING = { externalWarehouseId: 'ext-1', connectionId: 'conn-1', pairingChangedAt: new Date('2026-11-01T00:00:00Z') }
 const capture: {
   settingRows: Array<{ key: string; value: string }>
   receiptUpdate?: ManyArgs
@@ -20,7 +21,7 @@ const capture: {
   jobDelete?: ManyArgs
   bindingQuery?: ManyArgs
   dryRunQueries: ManyArgs[]
-  pendingAlignmentWarehouses: Array<{ connector: string; warehouseId: string }>
+  pendingAlignmentWarehouses: Array<{ connector: string; warehouseId: string; externalWarehouseId: string; connectionId: string; pairingChangedAt: Date }>
   /** Keyed `connector:warehouseId` — the dry-run job id that scope's confirmation would read. */
   dryRunEvidence: Map<string, string>
   receiptCount: number
@@ -218,9 +219,9 @@ test('the ONE dry run a pending ALIGN_TO_WMS confirmation depends on is NOT dele
     { key: 'retention_wms_sync_jobs_months', value: '12' },
   ]
   capture.pendingAlignmentWarehouses = [
-    { connector: 'mintsoft', warehouseId: 'wh-1' },
-    { connector: 'mintsoft', warehouseId: 'wh-2' },
-    { connector: 'mintsoft', warehouseId: 'wh-1' },
+    { connector: 'mintsoft', warehouseId: 'wh-1', ...PAIRING },
+    { connector: 'mintsoft', warehouseId: 'wh-2', ...PAIRING },
+    { connector: 'mintsoft', warehouseId: 'wh-1', ...PAIRING },
   ]
   capture.dryRunEvidence = new Map([
     ['mintsoft:wh-1', 'job-dry-1'],
@@ -252,7 +253,12 @@ test('the ONE dry run a pending ALIGN_TO_WMS confirmation depends on is NOT dele
   assert.equal(dryRun.where.type, 'STOCK_SYNC')
   assert.deepEqual(dryRun.where.status, { in: ['SUCCEEDED', 'PARTIAL'] })
   assert.deepEqual(dryRun.where.finishedAt, { not: null })
-  assert.deepEqual(dryRun.where.AND, [{ summary: { path: ['dryRun'], equals: true } }])
+  assert.deepEqual(dryRun.where.AND, [
+    { summary: { path: ['dryRun'], equals: true } },
+    { summary: { path: ['externalWarehouseId'], equals: 'ext-1' } },
+    { summary: { path: ['connectionId'], equals: 'conn-1' } },
+  ])
+  assert.deepEqual(dryRun.where.startedAt, { gt: PAIRING.pairingChangedAt }, 'only evidence the confirm action would accept is protected')
 })
 
 test('an unconfirmed binding with NO dry run protects nothing', async () => {
@@ -262,7 +268,7 @@ test('an unconfirmed binding with NO dry run protects nothing', async () => {
     { key: 'retention_wms_events_months', value: '0' },
     { key: 'retention_wms_sync_jobs_months', value: '12' },
   ]
-  capture.pendingAlignmentWarehouses = [{ connector: 'mintsoft', warehouseId: 'wh-1' }]
+  capture.pendingAlignmentWarehouses = [{ connector: 'mintsoft', warehouseId: 'wh-1', ...PAIRING }]
   capture.dryRunEvidence = new Map()
   capture.jobCount = 5
 

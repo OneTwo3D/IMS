@@ -1,3 +1,4 @@
+import type { BulkRetryConfirmation } from '@/lib/typed-confirmation'
 import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
 import type { MissingTaxRatePreviewResult, MissingTaxRateGenerateResult } from '@/lib/tax/generate-missing-tax-rates'
 
@@ -153,7 +154,8 @@ export type AccountingConnector = AccountingConnectorDef & {
   retryFailedSync(
     entryId?: string,
     expectedAttemptRevision?: number,
-  ): Promise<{ success: boolean; reset: number; refused?: number; error?: string }>
+    bulkConfirmation?: BulkRetryConfirmation,
+  ): Promise<{ success: boolean; reset: number; refused?: number; error?: string; code?: string }>
   getSyncReadiness(): Promise<AccountingSyncReadiness>
 }
 
@@ -303,9 +305,9 @@ const ACCOUNTING_CONNECTOR_FACTORIES: {
       const { triggerXeroSync } = await import('@/app/actions/xero-sync')
       return triggerXeroSync()
     },
-    async retryFailedSync(entryId, expectedAttemptRevision) {
+    async retryFailedSync(entryId, expectedAttemptRevision, bulkConfirmation) {
       const { retryFailedXeroSync } = await import('@/app/actions/xero-sync')
-      return retryFailedXeroSync(entryId, expectedAttemptRevision)
+      return retryFailedXeroSync(entryId, expectedAttemptRevision, bulkConfirmation)
     },
     async getSyncReadiness() {
       const { getXeroSyncReadiness } = await import('@/app/actions/xero-sync')

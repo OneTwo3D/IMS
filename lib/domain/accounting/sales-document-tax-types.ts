@@ -88,6 +88,28 @@ function lineLabel(line: TaxTypedLine, index: number): string {
  * is not sent has no code to get wrong. A credit note has neither field and is covered by
  * the same function.
  */
+/**
+ * WHICH OF A SALES DOCUMENT'S SHIPPING AND DISCOUNT LINES THE CONNECTOR WILL ACTUALLY SEND. One decision, used by the Xero builder when it assembles the
+ * lines, by the tax-type check below and by the invoice-to-order reconciliation, so what is checked is exactly what goes out: an amount with no account
+ * code is dropped by the builder, and a reconciliation that counted it would pass an invoice short of that money.
+ */
+export type SalesDocumentExtras = Pick<SalesDocumentTaxTypeInput, 'shippingAmount' | 'shippingAccountCode' | 'discountAmount' | 'discountAccountCode'>
+
+export function connectorEmitsShipping<T extends SalesDocumentExtras>(doc: T): doc is T & { shippingAmount: number; shippingAccountCode: string } {
+  return isPositive(doc.shippingAmount) && !isBlank(doc.shippingAccountCode)
+}
+
+export function connectorEmitsDiscount<T extends SalesDocumentExtras>(doc: T): doc is T & { discountAmount: number; discountAccountCode: string } {
+  return isPositive(doc.discountAmount) && !isBlank(doc.discountAccountCode)
+}
+
+/** The mapping setting an amount is waiting on when the connector would drop it (a positive amount with no account code), else null. */
+export function droppedExtraMapping(doc: SalesDocumentExtras): 'shipping' | 'discount' | null {
+  if (isPositive(doc.shippingAmount) && !connectorEmitsShipping(doc)) return 'shipping'
+  if (isPositive(doc.discountAmount) && !connectorEmitsDiscount(doc)) return 'discount'
+  return null
+}
+
 export function findSalesDocumentTaxTypeProblems(doc: SalesDocumentTaxTypeInput): SalesDocumentTaxTypeProblem[] {
   const problems: SalesDocumentTaxTypeProblem[] = []
   const lines = Array.isArray(doc.lines) ? doc.lines : []
@@ -98,11 +120,11 @@ export function findSalesDocumentTaxTypeProblems(doc: SalesDocumentTaxTypeInput)
       problems.push({ where: lineLabel(line, index), kind: 'explicit-none' })
     }
   })
-  for (const [where, amount, accountCode, taxType] of [
-    ['shipping', doc.shippingAmount, doc.shippingAccountCode, doc.shippingTaxType],
-    ['order discount', doc.discountAmount, doc.discountAccountCode, doc.discountTaxType],
+  for (const [where, emitted, taxType] of [
+    ['shipping', connectorEmitsShipping(doc), doc.shippingTaxType],
+    ['order discount', connectorEmitsDiscount(doc), doc.discountTaxType],
   ] as const) {
-    if (!isPositive(amount) || isBlank(accountCode)) continue
+    if (!emitted) continue
     if (isBlank(taxType)) problems.push({ where, kind: 'missing' })
     else if (isNoTaxType(taxType as string)) problems.push({ where, kind: 'explicit-none' })
   }

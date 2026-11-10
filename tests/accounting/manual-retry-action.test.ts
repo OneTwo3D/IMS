@@ -262,10 +262,15 @@ type RetryFn = (entryId?: string) => Promise<{ success: boolean; reset: number; 
  */
 async function load(action: (typeof ACTIONS)[number]): Promise<RetryFn> {
   const mod = await import(action.module) as Record<string, unknown>
-  const impl = mod[action.fn] as (entryId?: string, expectedAttemptRevision?: number) => ReturnType<RetryFn>
+  const impl = mod[action.fn] as (entryId?: string, expectedAttemptRevision?: number, bulk?: { confirmed: true; rowIds: string[] }) => ReturnType<RetryFn>
+  // The bulk form now needs the operator's confirmation of the rows reviewed; the wrapper supplies
+  // exactly the rows that are FAILED at call time, which is what the confirmation dialog would show.
   return (entryId?: string) => impl(
     entryId,
     entryId === undefined ? undefined : state.rows.find((row) => row.id === entryId)?.attemptRevision,
+    entryId === undefined
+      ? { confirmed: true, rowIds: state.rows.filter((row) => row.status === 'FAILED' && row.connector === action.connector).map((row) => row.id) }
+      : undefined,
   )
 }
 

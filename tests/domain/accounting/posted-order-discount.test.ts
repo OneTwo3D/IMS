@@ -442,9 +442,13 @@ test('the adapter rules this derivation replays are pinned to the adapters thems
   const { join } = await import('node:path')
 
   const xero = readFileSync(join(process.cwd(), 'lib/connectors/xero/invoices.ts'), 'utf8')
+  // The rule is the shared emit decision (one definition for the builder, the tax-type check and the invoice reconciliation): the builder must
+  // still ask it, and it must still require a positive amount AND an account code.
+  assert.match(xero, /if \(connectorEmitsDiscount\(data\)\) \{/, 'Xero must still ask the shared decision before adding the order-discount line')
+  const shared = readFileSync(join(process.cwd(), 'lib/domain/accounting/sales-document-tax-types.ts'), 'utf8')
   assert.match(
-    xero,
-    /if \(data\.discountAmount && data\.discountAmount > 0 && data\.discountAccountCode\) \{/,
+    shared,
+    /return isPositive\(doc\.discountAmount\) && !isBlank\(doc\.discountAccountCode\)/,
     'Xero must still omit the order-discount line when no discount account code is supplied',
   )
 

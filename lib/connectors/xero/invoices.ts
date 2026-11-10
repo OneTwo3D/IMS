@@ -12,7 +12,7 @@ import {
   withAccountingEgressAuthorization,
   type AccountingEgressRequest,
 } from '@/lib/connectors/accounting-egress-authorization'
-import { salesDocumentTaxTypeRefusal } from '@/lib/domain/accounting/sales-document-tax-types'
+import { connectorEmitsDiscount, connectorEmitsShipping, salesDocumentTaxTypeRefusal } from '@/lib/domain/accounting/sales-document-tax-types'
 import type { InvoiceData, InvoiceLine } from '../types'
 
 /**
@@ -168,7 +168,7 @@ export function buildSalesInvoicePayload(
   // Add shipping as separate line item. When the caller supplies a
   // shippingTaxType (e.g. the order has a VAT rate), use it so shipping is
   // taxed at the same rate as the products. There is no fallback: no type refuses (above).
-  if (data.shippingAmount && data.shippingAmount > 0 && data.shippingAccountCode) {
+  if (connectorEmitsShipping(data)) {
     lineItems.push({
       Description: data.shippingDescription ?? 'Shipping',
       Quantity: 1,
@@ -181,7 +181,7 @@ export function buildSalesInvoicePayload(
   // Add order-level discount as negative line item. Use the caller-supplied
   // tax type (matching the order's VAT rate) so the discount reduces the
   // taxable base correctly. No fallback: an omitted type refuses (above).
-  if (data.discountAmount && data.discountAmount > 0 && data.discountAccountCode) {
+  if (connectorEmitsDiscount(data)) {
     lineItems.push({
       Description: 'Order discount',
       Quantity: 1,

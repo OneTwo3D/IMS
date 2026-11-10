@@ -5,6 +5,8 @@ import { freshAuthFailureResult, requireFreshPermission, requirePermission, requ
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
+import { checkBulkRetryConfirmation, isUsableEntryId } from '@/lib/domain/accounting/bulk-retry-confirmation'
+import type { BulkRetryConfirmation } from '@/lib/typed-confirmation'
 import { logActivity } from '@/lib/activity-log'
 import {
   deferredRevivalReason,
@@ -688,9 +690,24 @@ async function logAttemptFenceRefusal(
 export async function retryFailedXeroSync(
   entryId?: string,
   expectedAttemptRevision?: number,
-): Promise<{ success: boolean; reset: number; refused?: number; error?: string }> {
+  bulkConfirmation?: BulkRetryConfirmation,
+): Promise<{ success: boolean; reset: number; refused?: number; error?: string; code?: string }> {
   try {
     await requireSyncPermission()
+
+    // BULK means no row id at all. A blank or whitespace id is neither a row nor a bulk request and
+    // is refused, so it cannot slip past the bulk confirmation by looking like "a row".
+    if (entryId !== undefined && entryId !== null && !isUsableEntryId(entryId)) {
+      return { success: false, reset: 0, error: 'A retry needs the id of the row to retry. Nothing was re-queued.' }
+    }
+    // The bulk form re-sends every failed document, so it is allowed only for the exact rows the
+    // operator reviewed. Enforced HERE, in the implementation every caller reaches.
+    let confirmedRowIds: string[] | undefined
+    if (entryId === undefined || entryId === null) {
+      const check = await checkBulkRetryConfirmation(db, 'xero', bulkConfirmation)
+      if (!check.ok) return { success: false, reset: 0, code: check.code, error: check.error }
+      confirmedRowIds = check.rowIds
+    }
 
     // o3d-e2mz PREFLIGHT, before the o3d-0m56 machinery: both are cheap point reads, and a request
     // that cannot name its attempt is refused without probing a ledger on its behalf.
@@ -733,7 +750,7 @@ export async function retryFailedXeroSync(
     const candidates = await db.accountingSyncLog.findMany({
       where: entryId
         ? { id: entryId, connector: 'xero', status: 'FAILED' as const }
-        : { connector: 'xero', status: 'FAILED' as const },
+        : { connector: 'xero', status: 'FAILED' as const, id: { in: confirmedRowIds ?? [] } },
       select: { id: true, type: true, referenceType: true, referenceId: true, payload: true, createdAt: true },
       // OLDEST FIRST, and load-bearing: when only one row of a scope may be revived,
       // selectRevivableCandidates keeps the oldest postable one — the request a shared token

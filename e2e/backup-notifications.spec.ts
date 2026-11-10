@@ -24,7 +24,12 @@ test.describe('backup and notification workflows', () => {
     const backupRow = page.locator('div.flex.items-center.justify-between').filter({ hasText: filename }).first()
     await expect(backupRow).toBeVisible()
 
-    await backupRow.locator('button[title="Delete backup"]').click()
+    await backupRow.getByRole('button', { name: `Delete ${filename}` }).click()
+    const deleteDialog = page.getByRole('dialog', { name: 'Delete backup' })
+    const confirmDelete = deleteDialog.getByRole('button', { name: 'Delete backup' })
+    await expect(confirmDelete).toBeDisabled()
+    await deleteDialog.getByLabel(/type the backup name/i).fill(filename)
+    await confirmDelete.click()
 
     await expect
       .poll(async () => await backupRow.count())

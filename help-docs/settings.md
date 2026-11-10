@@ -275,6 +275,10 @@ Backups can be auto-uploaded to remote storage to keep them off the application 
 
 If you have manual backups that should also go to remote storage, click **Upload to remote** on the backup row.
 
+### Deleting a backup
+
+Each backup row ends with a **Delete** button, kept apart from the Restore icon. Deleting is permanent and does not touch copies already uploaded to S3 or SFTP, so it asks you to confirm: the dialog names the backup file, its size and date, tells you if it is the newest backup, and enables **Delete backup** only after you type the backup file name exactly.
+
 ### Restore
 
 Restoring is a destructive operation — it overwrites the current database with the contents of the backup file. The system protects this with several gates:
