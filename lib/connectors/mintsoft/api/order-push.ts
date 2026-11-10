@@ -232,11 +232,23 @@ export async function reconcileMintsoftAmbiguousCreate(
   const ownReference = reference.externalReference.trim()
   const exact = ownReference ? matches.filter((row) => toStr(row.ExternalOrderReference) === ownReference && toStr(row.OrderNumber) === reference.orderNumber) : []
   if (matches.length === 1 && exact.length === 1) {
-    if (orderStatusId(exact[0]) === MINTSOFT_STATUS_CANCELLED) {
-      return { kind: 'UNRESOLVED', reason: 'Mintsoft holds this order but it is CANCELLED there (a cancelled order keeps its number), so it was not linked' }
-    }
     const id = toStr(exact[0].ID ?? exact[0].Id ?? exact[0].id)
-    if (id) return { kind: 'ADOPT', externalOrderId: id, externalOrderNumber: toStr(exact[0].OrderNumber) ?? reference.orderNumber }
+    if (id) {
+      // THE SEARCH ROW'S STATUS IS NOT TRUSTED (it can be absent). The order is read by id and its status taken from THAT: adopted only
+      // while the read succeeds, is ours, and carries a status that is not CANCELLED. Anything else leaves the link parked, visibly.
+      const detail = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(id)}?ClientId=${clientId}`)
+      const row = !detail.error && detail.data && typeof detail.data === 'object' && !Array.isArray(detail.data) ? (detail.data as RawOrder) : null
+      if (!row) return { kind: 'UNRESOLVED', reason: 'Mintsoft holds this order but it could not be read back to check its status, so it was not linked' }
+      if (toStr(row.ClientId ?? row.clientId) !== String(clientId) || toStr(row.ID ?? row.Id ?? row.id) !== id) {
+        return { kind: 'UNRESOLVED', reason: 'Mintsoft holds this order but the read-back did not confirm it is ours, so it was not linked' }
+      }
+      const status = orderStatusId(row)
+      if (status === null) return { kind: 'UNRESOLVED', reason: 'Mintsoft holds this order but its status could not be read, so it was not linked' }
+      if (status === MINTSOFT_STATUS_CANCELLED) {
+        return { kind: 'UNRESOLVED', reason: 'Mintsoft holds this order but it is CANCELLED there (a cancelled order keeps its number), so it was not linked' }
+      }
+      return { kind: 'ADOPT', externalOrderId: id, externalOrderNumber: toStr(exact[0].OrderNumber) ?? reference.orderNumber }
+    }
   }
   const seen = matches.map((row) => toStr(row.OrderNumber) ?? '?').join(', ')
   return {
@@ -533,7 +545,9 @@ export async function verifyMintsoftPushedOrder(
       if (rowId && rowId === externalOrderId) {
         // BOTH have to agree: the tenant AND the order. Tenant alone says only
         // "we may touch this row", not "this row is the order we created".
-        if (rowClient === String(clientId) && identifies(row)) return 'ours'
+        // An order that is already CANCELLED is never proved ours: a link must not become SYNCED against a dead order. It stays unproven
+        // (retried, then quarantined for an operator).
+        if (rowClient === String(clientId) && identifies(row)) return orderStatusId(row) === MINTSOFT_STATUS_CANCELLED ? 'unknown' : 'ours'
         if (rowClient && rowClient !== String(clientId)) return 'foreign'
         if (rowClient === String(clientId)) {
           // Ours to touch, but it is somebody else's ORDER. Not 'foreign' in the
@@ -557,6 +571,8 @@ export async function verifyMintsoftPushedOrder(
         const rows = extractMintsoftArrayPayloadStrict(search.data, 'Order/Search (push verify)')
           .map((row) => assertMintsoftOrderClient(row, clientId, 'Mintsoft Order/Search (push verify)'))
           .filter(identifies)
+          // Only a row whose status is KNOWN and not CANCELLED proves a live order (an absent status proves nothing).
+          .filter((row) => { const st = orderStatusId(row); return st !== null && st !== MINTSOFT_STATUS_CANCELLED })
         if (rows.some((row) => toStr(row.ID ?? row.Id ?? row.id) === externalOrderId)) return 'ours'
       }
     } catch {

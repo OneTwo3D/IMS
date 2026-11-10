@@ -112,8 +112,10 @@ test('reconcile: the order the timed-out create left behind is ADOPTED, by one s
   reset()
   const { reconcileMintsoftAmbiguousCreate } = await push()
   searchRows = [{ ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT }]
+  details.set('555', { ID: 555, OrderNumber: 'WC-1001', ClientId: CLIENT, OrderStatusId: 1 })
   assert.deepEqual(await reconcileMintsoftAmbiguousCreate(REF), { kind: 'ADOPT', externalOrderId: '555', externalOrderNumber: 'WC-1001' })
-  assert.equal(calls.length, 1)
+  assert.equal(calls.length, 2, 'the search, then the read-back of the matched order')
+  assert.ok(calls[1].startsWith('/api/Order/555?'))
   const query = new URLSearchParams(calls[0].split('?')[1])
   assert.equal(calls[0].split('?')[0], '/api/Order/Search')
   assert.equal(query.get('ClientId'), String(CLIENT))
@@ -162,6 +164,7 @@ test('reconcile: Order/Search is a term search, so another client\'s row is DROP
     { ID: 1, OrderNumber: 'X-1', ExternalOrderReference: 'REF-1001', ClientId: 99 },
     { ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT },
   ]
+  details.set('555', { ID: 555, OrderNumber: 'WC-1001', ClientId: CLIENT, OrderStatusId: 1 })
   assert.deepEqual(await reconcileMintsoftAmbiguousCreate(REF), { kind: 'ADOPT', externalOrderId: '555', externalOrderNumber: 'WC-1001' })
 })
 
@@ -179,6 +182,7 @@ test('reconcile: a FULL page of 10 results may be truncated - held, even when on
   const result = await reconcileMintsoftAmbiguousCreate(REF)
   assert.equal(result.kind, 'UNRESOLVED')
   searchRows = (searchRows as unknown[]).slice(0, 9)
+  details.set('600', { ID: 600, OrderNumber: 'WC-1001', ClientId: CLIENT, OrderStatusId: 1 })
   assert.equal((await reconcileMintsoftAmbiguousCreate(REF)).kind, 'ADOPT', 'control: nine rows is a complete answer')
 })
 
@@ -186,9 +190,47 @@ test('reconcile: the order is there but CANCELLED (status 3) - never adopted', a
   reset()
   const { reconcileMintsoftAmbiguousCreate } = await push()
   searchRows = [{ ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 3 }]
+  details.set('555', { ID: 555, OrderNumber: 'WC-1001', ClientId: CLIENT, OrderStatusId: 3 })
   const result = await reconcileMintsoftAmbiguousCreate(REF)
   assert.equal(result.kind, 'UNRESOLVED')
   assert.match((result as { reason: string }).reason, /CANCELLED/)
+})
+
+test('reconcile: a search row with NO status is not trusted - the read-back says CANCELLED, so it is not adopted', async () => {
+  reset()
+  const { reconcileMintsoftAmbiguousCreate } = await push()
+  searchRows = [{ ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: null }]
+  details.set('555', { ID: 555, OrderNumber: 'WC-1001', ClientId: CLIENT, OrderStatusId: 3 })
+  const result = await reconcileMintsoftAmbiguousCreate(REF)
+  assert.equal(result.kind, 'UNRESOLVED')
+  assert.match((result as { reason: string }).reason, /CANCELLED/)
+})
+
+test('reconcile: if the read-back fails, has no status, or is not ours, nothing is adopted', async () => {
+  reset()
+  const { reconcileMintsoftAmbiguousCreate } = await push()
+  searchRows = [{ ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT }]
+  // 404: nothing to read back
+  assert.match(((await reconcileMintsoftAmbiguousCreate(REF)) as { reason: string }).reason, /could not be read back/)
+  // no status on the detail either
+  details.set('555', { ID: 555, OrderNumber: 'WC-1001', ClientId: CLIENT })
+  assert.match(((await reconcileMintsoftAmbiguousCreate(REF)) as { reason: string }).reason, /status could not be read/)
+  // another client / another id
+  details.set('555', { ID: 555, ClientId: 99, OrderStatusId: 1 })
+  assert.match(((await reconcileMintsoftAmbiguousCreate(REF)) as { reason: string }).reason, /did not confirm it is ours/)
+  details.set('555', { ID: 556, ClientId: CLIENT, OrderStatusId: 1 })
+  assert.match(((await reconcileMintsoftAmbiguousCreate(REF)) as { reason: string }).reason, /did not confirm it is ours/)
+})
+
+test('verify: an order that is already CANCELLED is never proved ours (the link must not go SYNCED against a dead order)', async () => {
+  reset()
+  const { verifyMintsoftPushedOrder } = await push()
+  const ref = { orderNumber: 'WC-1001', externalReference: 'REF-1001' }
+  details.set('555', { ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 3 })
+  searchRows = [{ ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 3 }]
+  assert.equal(await verifyMintsoftPushedOrder('555', ref), 'unknown')
+  details.set('555', { ID: 555, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 9 })
+  assert.equal(await verifyMintsoftPushedOrder('555', ref), 'ours', 'control: a live (backordered) order still verifies')
 })
 
 // ---- the live duplicate-create answer and the cancel answers (shapes taken from a live API test; no personal data) -----------------
