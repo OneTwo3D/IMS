@@ -2,7 +2,7 @@
 
 Inventory Management System — built with Next.js 16, TypeScript, Prisma 7, PostgreSQL, and Shadcn/UI.
 
-**Current release: v2.0.0** (2026-06-12) — major release covering VAT/tax profiles, bidirectional Xero invoice & TaxRate sync, manufacturing-aware reorder planning, end-to-end Decimal precision across landed cost / allocation / refund / COGS, and hardened cron + webhook authentication. See [CHANGELOG.md](CHANGELOG.md) and [GitHub Releases](https://github.com/OneTwo3D/IMS/releases) for the full delta; the in-app **Settings > System** page shows the same notes.
+**Current release: v3.0.0** (2026-11-10) — catch-up release since 2.0.0: stricter sales posting and payments, purchase orders editable, closable and cancellable at every stage, a WooCommerce store fence, VAT/IOSS, Aelia and reconciliation groundwork (built, mostly switched off), and deploy and scheduler hardening. It needs operator action: see the Operator actions list in [CHANGELOG.md](CHANGELOG.md). [GitHub Releases](https://github.com/OneTwo3D/IMS/releases) has the full delta; the in-app **Settings > System** page shows the same notes.
 
 ## Features
 
