@@ -255,3 +255,60 @@ for (const [resource, payload, key] of [['orders', ORDER, 'order'], ['refunds', 
     })
   }
 }
+
+// --- plain permalinks: `?rest_route=` self-links ----------------------------------------------------
+
+test('restRouteSiteRoot derives the exact site root from a plain-permalink REST link, and refuses odd shapes', async () => {
+  const { restRouteSiteRoot } = await import('@/lib/connectors/woocommerce/webhook-origin')
+  assert.equal(restRouteSiteRoot('https://store-a.example.com/?rest_route=/wc/v3/orders/9001'), 'https://store-a.example.com')
+  assert.equal(restRouteSiteRoot('https://store-a.example.com/index.php?rest_route=/wc/v3/orders/9001'), 'https://store-a.example.com')
+  assert.equal(restRouteSiteRoot('https://store-a.example.com:8443/shop/?rest_route=/wc/v3/orders/9001'), 'https://store-a.example.com:8443/shop')
+  assert.equal(restRouteSiteRoot('https://store-a.example.com/shop/index.php?rest_route=%2Fwc%2Fv3%2Forders%2F9001'), 'https://store-a.example.com/shop')
+  for (const bad of [
+    'https://store-a.example.com/?rest_route=/wp/v2/posts', // not a WooCommerce route
+    'https://store-a.example.com/?rest_route=/wc/v3/a&rest_route=/wc/v3/b', // ambiguous
+    'https://store-a.example.com/other.php?rest_route=/wc/v3/orders/1', // not index.php
+    'https://u:p@store-a.example.com/?rest_route=/wc/v3/orders/1',
+    'ftp://store-a.example.com/?rest_route=/wc/v3/orders/1',
+    'https://store-a.example.com/product/widget',
+    'not a url',
+  ]) assert.equal(restRouteSiteRoot(bad), null, bad)
+})
+
+for (const resource of ['orders', 'refunds'] as const) {
+  const key = resource === 'orders' ? 'order' : 'refund'
+  const bodyFor = (href: string) => JSON.stringify({ id: 9001, order_id: 9001, _links: { self: [{ href }] } })
+
+  test(`${resource}: a signed ?rest_route= self-link is recorded as the EXACT site root and the bound store's delivery imports`, async () => {
+    reset()
+    const attestation = await receive(resource, bodyFor(`${STORE_A}/?rest_route=/wc/v3/orders/9001`), { 'x-wc-webhook-source': 'https://forged.example.com/' })
+    assert.equal(attestation, 'store:store-a.example.com')
+
+    const { calls, dependencies } = spies()
+    const response = await dispatch(resource, attestation, JSON.parse(bodyFor(`${STORE_A}/?rest_route=/wc/v3/orders/9001`)), dependencies)
+    assert.deepEqual(await response.json(), { ok: true, imported: true })
+    assert.equal(calls[key].length, 1)
+  })
+
+  test(`${resource}: a ?rest_route= self-link from ANOTHER store is refused as foreign, not held for ever`, async () => {
+    reset()
+    const attestation = await receive(resource, bodyFor('https://store-b.example.com/index.php?rest_route=/wc/v3/orders/9001'), {})
+    assert.equal(attestation, 'store:store-b.example.com')
+
+    const { calls, dependencies } = spies()
+    const response = await dispatch(resource, attestation, {}, dependencies)
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), { ok: true, foreignStore: true, verdict: 'foreign-store' })
+    assert.deepEqual(calls[key], [])
+  })
+
+  test(`${resource}: a ?rest_route= link under a sub-path of a root binding is a different store`, async () => {
+    reset()
+    const attestation = await receive(resource, bodyFor(`${STORE_A}/shop/?rest_route=/wc/v3/orders/9001`), {})
+    assert.equal(attestation, 'store:store-a.example.com/shop')
+    const { calls, dependencies } = spies()
+    const response = await dispatch(resource, attestation, {}, dependencies)
+    assert.deepEqual(await response.json(), { ok: true, foreignStore: true, verdict: 'foreign-store' })
+    assert.deepEqual(calls[key], [])
+  })
+}
