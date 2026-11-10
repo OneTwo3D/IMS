@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
-import { WEBHOOK_ORIGIN_NOT_APPLICABLE } from '@/lib/connectors/webhook-origin'
 
 /**
  * o3d-xnwu round 5 (Codex HIGH) — A TERMINALLY UNAPPLIABLE REFUND MUST NOT HOLD THE DELIVERY.
@@ -227,7 +226,7 @@ async function deliverCompletedOrder() {
       line_items: [],
       meta_data: [],
     },
-    originAttestation: WEBHOOK_ORIGIN_NOT_APPLICABLE,
+    originAttestation: 'store:shop.example.com',
   })
 }
 

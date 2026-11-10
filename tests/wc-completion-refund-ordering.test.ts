@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
-import { WEBHOOK_ORIGIN_NOT_APPLICABLE } from '@/lib/connectors/webhook-origin'
 
 /**
  * o3d-xnwu round 2 (Codex HIGH) — A COVERAGE SHORTFALL JUDGED BEFORE THE DELIVERY'S OWN REFUNDS
@@ -166,7 +165,7 @@ async function pushCompletedOrder() {
       line_items: [],
       meta_data: [],
     },
-    originAttestation: WEBHOOK_ORIGIN_NOT_APPLICABLE,
+    originAttestation: 'store:shop.example.com',
   })
 }
 

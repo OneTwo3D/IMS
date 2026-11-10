@@ -2,6 +2,7 @@
  * Bidirectional product sync between WooCommerce and IMS.
  */
 
+import { readWcProductPushDecision } from './product-push-gate'
 import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
@@ -2096,8 +2097,15 @@ export function buildImsToWcProductPayload(product: {
   return updateData
 }
 
-export async function pushImsProductToWc(productId: string): Promise<{ success: boolean; error?: string }> {
+export async function pushImsProductToWc(
+  productId: string,
+): Promise<{ success: boolean; error?: string; skipped?: boolean }> {
   try {
+    // The writer re-checks on its own, whatever the caller did: `wc_sync_product_enabled` and
+    // `wc_sync_product_direction` decide whether IMS may write to the live product at all. A read
+    // that throws is caught below and refuses the push.
+    const decision = await readWcProductPushDecision()
+    if (!decision.allowed) return { success: true, skipped: true, error: decision.message }
     const { creds, syncVersion } = await snapshotProductSyncContext()
     if (!creds) {
       return { success: false, error: 'WooCommerce not configured. Set wc_url, wc_consumer_key, wc_consumer_secret in Settings.' }

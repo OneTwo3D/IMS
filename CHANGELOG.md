@@ -8,6 +8,12 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Store fence on orders, product push gating, split-shipment status rule
+
+- **Fixed: order and refund webhooks are now judged on which store sent them, as product webhooks already were.** A staging clone (or the previous store) that still posts correctly signed deliveries is acknowledged, logged at ERROR as `wc_order_webhook_foreign_store` / `wc_refund_webhook_foreign_store`, and imports nothing. A delivery that names no store is refused too; an unreadable store URL setting does not discard deliveries.
+- **Fixed: the IMS to WooCommerce product push honours `wc_sync_product_enabled` and `wc_sync_product_direction`.** It pushes only when sync is enabled and the direction is `to_wc` or `both`; the default (`from_wc`), a missing value or an unreadable setting pushes nothing. This covers product create, edit, variant changes, deactivation and CSV import. The check runs before the producer seam as well as in the writer.
+- **Fixed (helper plugin 1.3.1, not deployed by this change): the partial-shipment route no longer changes the status of an order that is not in flight.** Parts are still recorded, but the status moves only from `processing` or `partial-shipped`; a cancelled, refunded, on-hold or completed order is left alone with an order note. Custom in-flight statuses opt in with the `oti_partial_shipment_status_eligible` filter. The store keeps the old behaviour until plugin 1.3.1 is installed.
+
 ### No tax type, no sales document
 
 - **Changed: a sales invoice or credit note line with no tax type is refused instead of posting on "No VAT".** The Xero connector no longer defaults a missing `TaxType` to `NONE` on sales invoices, sales invoice updates or credit notes (supplier bills and supplier credit notes are unchanged). The refusal is an ordinary failed sync row on /sync, raised at the head of the poster case and again in the connector, before any contact, item or document request. An explicit `NONE` is refused too unless the line names an allowed kind; the only one today is a WooCommerce fee the shop charged no tax on. Shipping and the order discount can never be on `NONE`.

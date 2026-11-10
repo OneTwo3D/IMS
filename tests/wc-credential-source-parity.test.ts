@@ -148,6 +148,8 @@ test('the order-import resolver and the product-sync advisory-lock snapshot pin 
     { key: 'wc_url', value: STORE_URL },
     { key: 'wc_consumer_key', value: 'ck_settings' },
     { key: 'wc_consumer_secret', value: 'cs_settings' },
+    { key: 'wc_sync_product_enabled', value: 'true' },
+    { key: 'wc_sync_product_direction', value: 'to_wc' },
     { key: 'wc_settings_version', value: '7' },
   ])
   state.wireCalls.length = 0

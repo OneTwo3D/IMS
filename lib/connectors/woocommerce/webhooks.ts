@@ -743,6 +743,59 @@ async function judgeWcDeliveryOrigin(originAttestation: string): Promise<Webhook
   return judgeWebhookOrigin(originAttestation, await getSettingValue('wc_url'))
 }
 
+/**
+ * Order and refund deliveries get the same store fence as products (o3d-wgl6): a delivery is
+ * imported only when it proves it was sent by the store this installation is bound to.
+ *
+ * A WordPress staging clone copies the webhook definitions together with the delivery URL and
+ * secret, so a second store keeps posting correctly-signed deliveries to this installation, and
+ * WooCommerce order ids collide between a clone and its source. The signature proves only that
+ * the sender holds the secret, not which store it is.
+ *
+ * Refused deliveries are ACKNOWLEDGED rather than retried (the stored body is frozen, so no
+ * retry can change the verdict), and logged at ERROR so a store that should have been
+ * disconnected announces itself. `binding-unreadable` falls through, as for products: that is
+ * our own `wc_url` being missing or malformed, which an operator repairs, and which must not
+ * make us discard deliveries that are valid once it is.
+ */
+async function refuseNonBoundStoreDelivery(
+  kind: 'order' | 'refund',
+  payload: unknown,
+  originAttestation: string,
+): Promise<Response | null> {
+  const origin = await judgeWcDeliveryOrigin(originAttestation)
+  if (origin.verdict !== 'foreign-store' && origin.verdict !== 'unproven') return null
+  const body = (payload ?? {}) as { id?: unknown; order_id?: unknown; parent_id?: unknown }
+  const externalId = kind === 'order' ? body.id : (body.order_id ?? body.parent_id)
+  const what = kind === 'order' ? 'order' : 'refund (for order'
+  const ref = kind === 'order' ? `${what} ${String(externalId)}` : `${what} ${String(externalId)})`
+  try {
+    await logActivity({
+      entityType: 'SYNC',
+      action: `wc_${kind}_webhook_foreign_store`,
+      tag: 'sync',
+      level: 'ERROR',
+      description: origin.verdict === 'foreign-store'
+        ? `WooCommerce ${ref} webhook was sent by ${origin.deliveryStore}, which is not the store this `
+          + `installation is bound to (${origin.boundStore}). Nothing was imported; the delivery is acknowledged `
+          + 'rather than retried against a store it does not describe.'
+        : `WooCommerce ${ref} webhook did not say which store sent it (${origin.attestation}), so it cannot be `
+          + 'shown to describe the store this installation is bound to. Nothing was imported.',
+      metadata: {
+        externalId: externalId ?? null,
+        verdict: origin.verdict,
+        originAttestation: origin.attestation,
+        deliveryStore: origin.deliveryStore,
+        boundStore: origin.boundStore,
+        originScope: origin.scope,
+      },
+    })
+  } catch (e) {
+    console.error(`failed to log a refused ${kind} webhook from a store that is not the bound one`, e)
+  }
+  return NextResponse.json({ ok: true, foreignStore: true, verdict: origin.verdict })
+}
+
 async function handleProductWebhook(payload: unknown, originAttestation: string) {
   const productPayload = payload as Partial<WcFullProduct> & { stock_quantity?: number | null }
 
@@ -978,12 +1031,18 @@ export async function processWcWebhookPayload(
   dependencies: Pick<WcWebhookDependencies, 'handleOrderWebhook' | 'handleProductWebhook' | 'handleRefundWebhook'> = defaultDependencies,
 ) {
   switch (input.resource) {
-    case 'orders':
+    case 'orders': {
+      const refused = await refuseNonBoundStoreDelivery('order', input.payload, input.originAttestation)
+      if (refused) return refused
       return dependencies.handleOrderWebhook(input.payload, input.topic)
+    }
     case 'products':
       return dependencies.handleProductWebhook(input.payload, input.originAttestation)
-    case 'refunds':
+    case 'refunds': {
+      const refused = await refuseNonBoundStoreDelivery('refund', input.payload, input.originAttestation)
+      if (refused) return refused
       return dependencies.handleRefundWebhook(input.payload)
+    }
   }
 }
 

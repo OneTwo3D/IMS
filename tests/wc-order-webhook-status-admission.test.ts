@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
-import { WEBHOOK_ORIGIN_NOT_APPLICABLE } from '@/lib/connectors/webhook-origin'
 
 // o3d-tj6v r3: the "Import order statuses" selection reaches the ORDER WEBHOOK.
 //
@@ -192,7 +191,7 @@ async function pushOrder(order: ReturnType<typeof wcOrder>, topic = 'order.creat
     resource: 'orders',
     topic,
     payload: order,
-    originAttestation: WEBHOOK_ORIGIN_NOT_APPLICABLE,
+    originAttestation: 'store:shop.example.com',
   })
 }
 

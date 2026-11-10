@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
-import { WEBHOOK_ORIGIN_NOT_APPLICABLE } from '@/lib/connectors/webhook-origin'
 
 /**
  * o3d-tj6v r4/r5: the admission boundary is enforced INSIDE `importWcOrder`, by default, at the ONE
@@ -271,7 +270,7 @@ async function pushOrder(order: ReturnType<typeof wcOrder>, topic = 'order.updat
     resource: 'orders',
     topic,
     payload: order,
-    originAttestation: WEBHOOK_ORIGIN_NOT_APPLICABLE,
+    originAttestation: 'store:shop.example.com',
   })
 }
 

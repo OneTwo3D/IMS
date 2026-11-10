@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
-import { WEBHOOK_ORIGIN_NOT_APPLICABLE } from '@/lib/connectors/webhook-origin'
 
 /**
  * WooCommerce raises its own stock for a refunded line inside the refund request, before IMS hears of it, so IMS owes the
@@ -116,7 +115,7 @@ async function deliver() {
       line_items: [],
       meta_data: [],
     },
-    originAttestation: WEBHOOK_ORIGIN_NOT_APPLICABLE,
+    originAttestation: 'store:shop.example.com',
   })
 }
 
