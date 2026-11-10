@@ -88,6 +88,8 @@ export type CurrencySummaryReportTotals = {
   arOutstandingBase: string
   purchasesBase: string
   apOutstandingBase: string
+  /** `exact`, `upper` (≤) or `indeterminate` (≈): the weakest bound of any receivable included in `arOutstandingBase`. */
+  arOutstandingBound: string
 }
 
 export type FxGainLossReportTotals = {
@@ -103,7 +105,7 @@ export const FINANCE_ANALYTICS_EMPTY_TOTALS = {
   vat: { taxableBase: '0', salesTaxBase: '0', purchaseTaxBase: '0', taxBase: '0' } satisfies VatReportTotals,
   arAging: { outstandingBase: '0', creditBalanceBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' } satisfies ArAgingReportTotals,
   apAging: { outstandingBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' } satisfies ApAgingReportTotals,
-  currencySummary: { salesBase: '0', arOutstandingBase: '0', purchasesBase: '0', apOutstandingBase: '0' } satisfies CurrencySummaryReportTotals,
+  currencySummary: { salesBase: '0', arOutstandingBase: '0', purchasesBase: '0', apOutstandingBase: '0', arOutstandingBound: 'exact' } satisfies CurrencySummaryReportTotals,
   fxGainLoss: { gainLossBase: '0', gainsBase: '0', lossesBase: '0', rowCount: '0', unconvertedCount: '0' } satisfies FxGainLossReportTotals,
 } as const
 
@@ -162,6 +164,8 @@ export type CurrencySummaryReportRow = {
   salesBase: string
   arOutstandingForeign: string
   arOutstandingBase: string
+  /** `exact`, `upper` (≤) or `indeterminate` (≈): the weakest bound of any receivable in the two AR figures. */
+  arOutstandingBound: 'exact' | 'upper' | 'indeterminate'
   purchaseDocumentCount: number
   purchasesForeign: string
   purchasesBase: string
@@ -932,6 +936,7 @@ export async function getCurrencySummaryReport(
     salesBase: Prisma.Decimal
     arOutstandingForeign: Prisma.Decimal
     arOutstandingBase: Prisma.Decimal
+    arOutstandingBound: 'exact' | 'upper' | 'indeterminate'
     purchaseDocumentIds: Set<string>
     purchasesForeign: Prisma.Decimal
     purchasesBase: Prisma.Decimal
@@ -950,6 +955,7 @@ export async function getCurrencySummaryReport(
         salesBase: new Prisma.Decimal(0),
         arOutstandingForeign: new Prisma.Decimal(0),
         arOutstandingBase: new Prisma.Decimal(0),
+        arOutstandingBound: 'exact',
         purchaseDocumentIds: new Set(),
         purchasesForeign: new Prisma.Decimal(0),
         purchasesBase: new Prisma.Decimal(0),
@@ -961,6 +967,7 @@ export async function getCurrencySummaryReport(
     return row
   }
 
+  let boundedOrders = 0
   for (const order of salesOrders) {
     const row = getRow(order.currency)
     row.salesDocumentIds.add(order.id)
@@ -975,6 +982,11 @@ export async function getCurrencySummaryReport(
     if (result.status === 'outstanding') {
       const balance = toDecimal(result.balance)
       row.arOutstandingBase = row.arOutstandingBase.add(balance)
+      if (result.bound !== 'exact') {
+        boundedOrders += 1
+        // Weakest wins: indeterminate (≈) over upper (≤) over exact.
+        if (result.bound === 'indeterminate' || row.arOutstandingBound === 'exact') row.arOutstandingBound = result.bound
+      }
       row.arOutstandingForeign = row.arOutstandingForeign.add(totalBase.gt(0) ? balance.mul(totalForeign).div(totalBase) : new Prisma.Decimal(0))
     }
   }
@@ -999,6 +1011,7 @@ export async function getCurrencySummaryReport(
     salesBase: moneyString(row.salesBase, baseCurrency),
     arOutstandingForeign: moneyString(row.arOutstandingForeign, row.currency),
     arOutstandingBase: moneyString(row.arOutstandingBase, baseCurrency),
+    arOutstandingBound: row.arOutstandingBound,
     purchaseDocumentCount: row.purchaseDocumentIds.size,
     purchasesForeign: moneyString(row.purchasesForeign, row.currency),
     purchasesBase: moneyString(row.purchasesBase, baseCurrency),
@@ -1023,10 +1036,12 @@ export async function getCurrencySummaryReport(
     arOutstandingBase: moneyString(totals.arOutstandingBase, baseCurrency),
     purchasesBase: moneyString(totals.purchasesBase, baseCurrency),
     apOutstandingBase: moneyString(totals.apOutstandingBase, baseCurrency),
+    arOutstandingBound: rows.some((r) => r.arOutstandingBound === 'indeterminate') ? 'indeterminate' : rows.some((r) => r.arOutstandingBound === 'upper') ? 'upper' : 'exact',
   }, [
     'Currency summary groups invoiced sales orders and purchase invoices by their document currency, preserving foreign-currency totals alongside base equivalents.',
     'AR outstanding is estimated per sales order from same-currency non-refund payments; AP outstanding is full invoice value until PurchaseInvoice.paidAt because supplier partial payments are not modelled.',
     ...approximateDateNotice(salesOrders as Array<{ invoicedAt?: Date | null; paidAt?: Date | null }>),
+    ...(boundedOrders > 0 ? [`${boundedOrders} receivable${boundedOrders === 1 ? '' : 's'} in AR carr${boundedOrders === 1 ? 'ies a credit' : 'y credits'} that could not be placed exactly or a payment that could not be converted; the AR figures including ${boundedOrders === 1 ? 'it are' : 'them are'} marked ≤ (at most) or ≈ (approximate).`] : []),
   ], options.paginate !== false)
 }
 

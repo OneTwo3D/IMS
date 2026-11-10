@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
+import { toCsv } from '@/lib/csv'
 import { Prisma, SalesOrderStatus } from '@/app/generated/prisma/client'
 import { getArAgingReport, getCurrencySummaryReport, type FinanceAnalyticsClient } from '@/lib/domain/finance/finance-period-analytics'
 import { getMarginAnalyticsReport, type SalesFulfillmentAnalyticsClient } from '@/lib/domain/sales/sales-fulfillment-analytics'
@@ -307,6 +310,29 @@ test('a 100 invoice with a 30 credit is 70 owed in both the Currency Summary and
   assert.equal(Number(summary.rows.find((r) => r.currency === 'USD')!.arOutstandingForeign), 87.5, '70 x 125/100')
   const ar = await arReport([order], '2026-10-31')
   assert.equal(Number(ar.totals.outstandingBase), 70)
+})
+
+test('Currency Summary carries the bound of an unplaceable credit in the row, the total, the notice and the CSV', async () => {
+  const order = salesOrder('csb', {
+    invoiceNumber: 'INV-180', createdAt: new Date('2026-10-10T12:00:00.000Z'), invoicedAt: new Date('2026-10-10T12:00:00.000Z'),
+    totalBase: D(100), totalForeign: D(100), payments: [],
+    refunds: [{ totalBase: D(100), totalsBasis: null, lines: [], refundedAt: new Date('2026-10-15T12:00:00.000Z') }],
+  })
+  const client = { salesOrder: { findMany: async (args?: { where?: Row }) => [order].filter((o) => matches(o, args?.where)) }, salesOrderLine: none, payment: none, purchaseInvoice: none, fxRate: none } as FinanceAnalyticsClient
+  const report = await getCurrencySummaryReport({ dateFrom: '2026-10-01', dateTo: '2026-10-31' }, { deps: { client, now: () => new Date('2026-10-31T00:00:00.000Z'), baseCurrency: async () => 'GBP' } })
+  // The 100 credit cannot be placed (no basis), so nothing comes off: 100 owed, at most.
+  assert.equal(Number(report.totals.arOutstandingBase), 100)
+  assert.equal(report.rows[0]!.arOutstandingBound, 'upper')
+  assert.equal(report.totals.arOutstandingBound, 'upper')
+  assert.ok(report.notices.some((n) => /1 receivable.*could not be placed/.test(n)))
+  // The CSV: the export route's own column list (read from its source, since the route needs the real db) applied to the rows.
+  const routeSource = readFileSync(path.join(process.cwd(), 'app/api/export/finance-analytics/route.ts'), 'utf8')
+  const listed = /case 'currency-summary': \{[\s\S]*?toCsv\(report\.rows, \[([^\]]*)\]/.exec(routeSource)?.[1]
+  assert.ok(listed, 'found the currency-summary column list in the export route')
+  const columns = listed!.split(',').map((c) => c.trim().replace(/'/g, ''))
+  assert.ok(columns.includes('arOutstandingBound'), 'the export lists the bound column')
+  const csvLines = toCsv(report.rows, columns).trim().split(/\r?\n/)
+  assert.equal(csvLines[1]!.split(',')[csvLines[0]!.split(',').indexOf('arOutstandingBound')], 'upper')
 })
 
 test('an IMS-minted invoice number with no posted invoice is not an invoiced order', () => {
