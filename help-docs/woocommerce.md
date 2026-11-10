@@ -29,7 +29,7 @@ The Consumer Key and Consumer Secret are generated inside your WooCommerce store
 
 Official guide: <https://woocommerce.com/document/woocommerce-rest-api/>
 
-> **Note:** The consumer secret is masked after saving. To change it, enter the full new value — the system detects and ignores the masked placeholder.
+> **Note:** The consumer secret is masked after saving. To change it, enter the full new value — the system detects and ignores the masked placeholder. The saved key and secret are only ever used with the saved store URL: to test or save a different store URL you must type the consumer key and secret in the same request.
 >
 > **Settings own the credentials.** `WC_STORE_URL`, `WC_CONSUMER_KEY` and `WC_CONSUMER_SECRET` in `.env` are used **once**, at install time, to seed these fields. After that the connection form is the only place that changes them, and editing the `.env` values has no effect. Rotate the key here, not in the file.
 >

@@ -30,7 +30,7 @@ import test, { mock } from 'node:test'
  */
 
 mock.module('@/lib/auth/server', {
-  namedExports: { requirePermission: async () => ({ user: { id: 'u1' } }) },
+  namedExports: { requirePermission: async () => ({ user: { id: 'u1', role: 'ADMIN' } }) },
 })
 
 type ReturnLine = { qtyReturned: number; unitCostBase: number }

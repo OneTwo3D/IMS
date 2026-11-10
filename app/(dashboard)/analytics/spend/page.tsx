@@ -1,4 +1,5 @@
 import type { SpendReportRow } from '@/lib/domain/purchasing/purchasing-analytics'
+import { requirePurchasingAnalyticsAccess } from '@/lib/security/purchasing-analytics-page-access'
 import { PurchasingAnalyticsReportPage, type PurchasingAnalyticsColumn } from '../_components/purchasing-analytics-report'
 import { loadSpendReportForPage, purchasingAnalyticsFiltersForUi, purchasingAnalyticsFiltersFromSearch, type PurchasingAnalyticsSearchParams } from '../_components/purchasing-analytics-page-utils'
 
@@ -15,6 +16,7 @@ const columns: Array<PurchasingAnalyticsColumn<SpendReportRow>> = [
 ]
 
 export default async function SpendAnalyticsPage({ searchParams }: Props) {
+  await requirePurchasingAnalyticsAccess()
   const filters = purchasingAnalyticsFiltersFromSearch(await searchParams)
   const report = await loadSpendReportForPage(filters)
   return (
