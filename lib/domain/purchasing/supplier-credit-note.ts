@@ -74,46 +74,42 @@ export function validateRecordSupplierCreditNote(params: {
 }
 
 /**
- * audit-oy5p / reverse-charge: resolve the ACCPAYCREDIT line's tax type so the
- * credit MIRRORS the bill it offsets.
+ * THE TAX TREATMENT OF A SUPPLIER CREDIT NOTE COMES FROM THE BILL IT CREDITS, never from the supplier's current default.
  *
- * Reverse charge first: a reverse-charge purchase carries NO supplier VAT
- * (billHadTax is false because taxForeign is 0), but the goods ARE vatable — the
- * buyer self-accounts the notional input+output VAT under the reverse-charge tax
- * type. The bill posts those lines on `reverseChargeTaxType` (see purchase-
- * invoice-edit.ts), so the credit MUST reverse on that same tax type, NOT NONE,
- * or the notional VAT is never reversed. Callers set `isReverseCharge` only for
- * the purchase that actually carries it (a goods PO); freight credits never do.
- *
- * Otherwise: if the offset bill carried tax, reverse with the supplier's tax
- * type; else NONE (conservative — won't fabricate a VAT reversal without a bill
- * signal to mirror). A bill that DID carry tax but whose supplier type is blank
- * returns `undefined`, NOT NONE: the credit would silently leave the input VAT
- * claimed in the ledger, so the poster refuses it instead
- * (lib/domain/accounting/purchase-document-tax-types.ts).
- *
- * Scope: the credit note is a single amount, so this uses a bill/PO-level tax
- * signal (uniform tax treatment — the normal case). Per-line tax bases on a
- * mixed bill remain out of scope for a single-amount credit.
+ * `billLines` are the SELECTED bill's booked lines: the tax type and rate each was posted with (`billLineTaxTreatments`). The credit is one amount, so it
+ * mirrors the bill's VAT-bearing treatment:
+ *   - reverse charge (a goods order whose lines are all reverse-charge): the configured reverse-charge type, else the type the bill's lines posted on;
+ *   - the bill carried VAT: the ONE tax code its VAT-bearing lines posted on. A NONE credit against a bill that carried VAT is never produced - there is no
+ *     per-line credit to show the credited amount was a non-vatable line - and two different VAT codes cannot be mirrored by one amount, so both give
+ *     `undefined`, which the poster refuses (lib/domain/accounting/purchase-document-tax-types.ts) instead of leaving input VAT claimed;
+ *   - the bill carried no VAT at all: NONE, a named decision (`no-vat-rate`).
+ * `taxRateId` is the rate the code was read from, for the retired-code guard binding.
  */
 export function resolveSupplierCreditNoteTaxType(params: {
   billHadTax: boolean
-  supplierTaxType: string | null | undefined
+  billLines: ReadonlyArray<{ taxType: string | undefined; rate: number; taxRateId?: string }>
   /** True only when the offset purchase is reverse-charge (a goods PO). */
   isReverseCharge?: boolean
   /** The configured reverse-charge purchase tax type (accounting settings). */
   reverseChargeTaxType?: string | null
-}): string | undefined {
+}): { taxType: string | undefined; taxRateId?: string } {
+  const decided = params.billLines.filter((l) => l.taxType && l.taxType.trim() !== '')
   if (params.isReverseCharge) {
-    // Mirror the bill poster exactly: the configured RC tax type when set, else
-    // the line's own accounting tax type (baseTaxType) — NOT NONE, so an RC
-    // purchase with no RC tax type configured still posts on the line's tax type
-    // just as the bill did.
-    // Neither a configured reverse-charge type nor a line type: undecided, refused downstream - not NONE.
-    return params.reverseChargeTaxType || params.supplierTaxType || undefined
+    if (params.reverseChargeTaxType) return { taxType: params.reverseChargeTaxType }
+    const own = decided.find((l) => l.taxType!.trim().toUpperCase() !== 'NONE') ?? decided[0]
+    return { taxType: own?.taxType, taxRateId: own?.taxRateId }
   }
-  if (params.billHadTax) return params.supplierTaxType || undefined
-  return 'NONE'
+  const taxed = params.billLines.filter((l) => l.rate > 0)
+  if (params.billHadTax || taxed.length > 0) {
+    const codes = new Map<string, { taxType: string; taxRateId?: string }>()
+    for (const l of taxed) {
+      if (!l.taxType || l.taxType.trim() === '' || l.taxType.trim().toUpperCase() === 'NONE') return { taxType: undefined }
+      if (!codes.has(l.taxType)) codes.set(l.taxType, { taxType: l.taxType, taxRateId: l.taxRateId })
+    }
+    if (codes.size !== 1) return { taxType: undefined }
+    return [...codes.values()][0]
+  }
+  return { taxType: 'NONE' }
 }
 
 /**

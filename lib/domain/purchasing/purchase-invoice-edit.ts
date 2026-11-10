@@ -1,7 +1,7 @@
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { rateBinding, resolvePurchaseLineTaxType } from '@/lib/accounting/reverse-charge'
 import { usableStoredFxRate } from '@/lib/currencies/stored-document-rate'
-import { addMoney, multiplyMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, roundMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { noVatRateKind, type PurchaseNoTaxLineKind } from '@/lib/domain/accounting/purchase-document-tax-types'
 import { effectiveTaxRateFromComponents } from '@/lib/tax/tax-rate-components'
 
@@ -170,7 +170,7 @@ function assertPositiveFxRate(fxRate: number): void {
  * A goods line's OWN VAT rate, as a fraction. A rate with active components takes its effective rate from them (the existing compound-rate maths); a simple
  * rate is its stored value; a line with no rate row takes the order's rate. On a FREIGHT order every line is taxed at the order's recorded rate.
  */
-function purchaseLineOwnRate(poLine: PurchaseInvoicePoLine, orderRate: Decimal, freightOrder: boolean): Decimal {
+export function purchaseLineOwnRate(poLine: PurchaseInvoicePoLine, orderRate: Decimal, freightOrder: boolean): Decimal {
   if (freightOrder) return orderRate
   const rate = poLine.taxRate
   if (!rate) return orderRate
@@ -185,6 +185,11 @@ function purchaseLineOwnRate(poLine: PurchaseInvoicePoLine, orderRate: Decimal, 
 export function calculatePurchaseInvoice(params: {
   lines: PurchaseInvoiceInputLine[]
   fxRateToBase: number
+  /**
+   * The bill's currency. VAT is worked out PER LINE and rounded to this currency's minor unit, the way the ledger computes tax on an exclusive line, and the
+   * header tax is the sum of those rounded line amounts (three lines of 0.03 at 20% are 0.01 each, 0.03, not 0.018). Defaults to a two-decimal currency.
+   */
+  currency?: string
   poReference: string
   /**
    * The order's recorded VAT rate (a fraction; null = none). It is the rate its vatable cost lines (freight, duty, handling) were
@@ -223,6 +228,7 @@ export function calculatePurchaseInvoice(params: {
   let subtotalBase = toDecimal(0)
   let taxForeignSum = toDecimal(0)
   const orderRate = toDecimal(params.poTaxRatePercent ?? 0)
+  const currency = params.currency ?? 'GBP'
   const lineData: PurchaseInvoiceLineDraft[] = []
   const accountingLines: PurchaseInvoiceAccountingLine[] = []
   const lineTaxRates: PurchaseInvoiceLineTaxRate[] = []
@@ -243,7 +249,7 @@ export function calculatePurchaseInvoice(params: {
       subtotalForeign = addMoney(subtotalForeign, totalForeign)
       subtotalBase = addMoney(subtotalBase, totalBase)
       const lineRate = purchaseLineOwnRate(poLine, orderRate, params.poType === 'FREIGHT')
-      taxForeignSum = addMoney(taxForeignSum, multiplyMoney(totalForeign, lineRate))
+      taxForeignSum = addMoney(taxForeignSum, roundMoney(multiplyMoney(totalForeign, lineRate), currency))
 
       lineData.push({
         id: line.id,
@@ -290,7 +296,7 @@ export function calculatePurchaseInvoice(params: {
     const totalBase = rounded4(toDecimal(totalForeign).div(params.fxRateToBase))
     subtotalForeign = addMoney(subtotalForeign, totalForeign)
     subtotalBase = addMoney(subtotalBase, totalBase)
-    if (costLine.vatable) taxForeignSum = addMoney(taxForeignSum, multiplyMoney(totalForeign, orderRate))
+    if (costLine.vatable) taxForeignSum = addMoney(taxForeignSum, roundMoney(multiplyMoney(totalForeign, orderRate), currency))
 
     lineData.push({
       id: line.id,
@@ -318,7 +324,8 @@ export function calculatePurchaseInvoice(params: {
     })
   }
 
-  // The header tax is the sum of each billed line's own tax, rounded once to the four places the stored figures use.
+  // The header tax is the sum of each billed line's own tax, each already rounded to the currency's minor unit (as the ledger does), so the header, the
+  // total and the base figure are all recomputed from the rounded lines.
   const taxForeign = rounded4(taxForeignSum)
   const taxBase = rounded4(toDecimal(taxForeign).div(params.fxRateToBase))
 
@@ -565,3 +572,40 @@ export function assertPurchaseInvoiceInputsUnchanged(before: PurchaseInvoiceTaxI
 /** Refusal for an edit that would recompute an order's lines, totals, VAT or exchange rate while a bill exists against it. */
 export const PO_BILLED_FIGURES_EDIT_MESSAGE =
   'This purchase order already has a bill, so its lines, costs, VAT or exchange rate cannot be changed: the bill would keep the old figures. Correct or credit the bill first.'
+
+
+/**
+ * THE TAX TREATMENT EACH LINE OF AN EXISTING BILL WAS BOOKED WITH: the same code and rate `calculatePurchaseInvoice` gave it (a goods line its own
+ * rate row's code and rate, a line with no rate row the order's recorded rate and its code, a vatable cost line the order's rate and code, a non-vatable
+ * cost line No VAT). A supplier credit note against the bill mirrors THESE, never the supplier's current default type.
+ */
+export type BilledLineTaxTreatment = { taxType: string | undefined; rate: number; taxRateId?: string; reverseCharge: boolean }
+
+export function billLineTaxTreatments(params: {
+  billLines: ReadonlyArray<{ poLineId: string | null; costLineId: string | null }>
+  poLineById: Map<string, PurchaseInvoicePoLine>
+  costLineById: Map<string, { vatable: boolean }>
+  poType?: string
+  poTaxRatePercent?: number | string | null
+  /** The code (and its rate id) of the rate the order was charged at (lib/domain/purchasing/order-rate-tax-code.ts). */
+  orderRateTaxType?: string
+  orderRateTaxRateId?: string
+}): BilledLineTaxTreatment[] {
+  const orderRate = toDecimal(params.poTaxRatePercent ?? 0)
+  return params.billLines.map((line) => {
+    if (line.poLineId) {
+      const poLine = params.poLineById.get(line.poLineId)
+      if (!poLine) return { taxType: undefined, rate: 0, reverseCharge: false }
+      return {
+        taxType: poLine.taxRate ? poLine.taxRate.accountingTaxType ?? undefined : params.orderRateTaxType,
+        rate: purchaseLineOwnRate(poLine, orderRate, params.poType === 'FREIGHT').toNumber(),
+        taxRateId: poLine.taxRate ? poLine.taxRate.id : params.orderRateTaxRateId,
+        reverseCharge: !!poLine.taxRate?.reverseCharge,
+      }
+    }
+    const vatable = line.costLineId ? params.costLineById.get(line.costLineId)?.vatable === true : false
+    return vatable
+      ? { taxType: params.orderRateTaxType, rate: orderRate.toNumber(), taxRateId: params.orderRateTaxRateId, reverseCharge: false }
+      : { taxType: 'NONE', rate: 0, reverseCharge: false }
+  })
+}

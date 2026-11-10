@@ -69,7 +69,7 @@ test('a compound rate takes its effective rate (21%) from its components, not fr
   // A small line: 4-dp tax over net (0.0023 / 0.0111) would give 20.72%; the components give exactly 21%.
   const small = bill([goods('compound', 0.0111)], { poType: 'GOODS', poTaxRatePercent: '0.2', ...legacy(0.0111, 0.0023) })
   assert.equal(small.lineTaxRates[0].rate, 0.21)
-  assert.equal(small.taxForeign, 0.0023)
+  assert.equal(small.taxForeign, 0) // 0.0111 * 21% = 0.0023, which rounds to 0.00 in a two-decimal currency
   assert.equal(bill([goods('compound', 1000)], { poType: 'GOODS', poTaxRatePercent: '0.2', ...legacy(1000, 210) }).taxForeign, 210)
 })
 
@@ -77,4 +77,23 @@ test('a goods line with no rate row takes the order rate; a FREIGHT order taxes 
   const noRate = new Map<string, PurchaseInvoicePoLine>([['none', { id: 'none', qty: 1, product: { sku: 'N' }, taxRate: null }]])
   assert.equal(bill([goods('none')], { poType: 'GOODS', poTaxRatePercent: '0.2', poLineById: noRate, ...legacy(100, 20) }).taxForeign, 20)
   assert.equal(bill([goods('low')], { poType: 'FREIGHT', poTaxRatePercent: '0.2', ...legacy(100, 20) }).taxForeign, 20)
+})
+
+test('VAT is rounded PER LINE to the currency minor unit, as the ledger does, then summed: three lines of 0.03 at 20% are 0.03 of VAT, not 0.018', () => {
+  const three = bill([goods('std', 0.03), goods('std', 0.03), goods('std', 0.03)], { poType: 'GOODS', poTaxRatePercent: '0.2', ...legacy(0.09, 0.018) })
+  assert.equal(three.subtotalForeign, 0.09)
+  assert.equal(three.taxForeign, 0.03)
+  assert.equal(three.totalForeign, 0.12)
+  assert.equal(three.taxBase, 0.03)
+  assert.equal(three.totalBase, 0.12)
+  // Mixed lines and a cost line: each is rounded, then summed (0.0125 -> 0.01, 0.0124 -> 0.01, 0.025 -> 0.03 half up).
+  const mixed = bill([goods('std', 0.0625), goods('std', 0.062), cost('freight', 0.125)], { poType: 'GOODS', poTaxRatePercent: '0.2', ...legacy(0.25, 0.05) })
+  assert.equal(mixed.taxForeign, 0.05)
+})
+
+test('rounding follows the currency: a zero-decimal currency rounds each line to whole units, a three-decimal one to the thousandth', () => {
+  const jpy = bill([goods('std', 12), goods('std', 12)], { poType: 'GOODS', poTaxRatePercent: '0.2', currency: 'JPY', ...legacy(24, 4.8) })
+  assert.equal(jpy.taxForeign, 4) // 2.4 -> 2 each
+  const kwd = bill([goods('std', 0.0125)], { poType: 'GOODS', poTaxRatePercent: '0.2', currency: 'KWD', ...legacy(0.0125, 0.0025) })
+  assert.equal(kwd.taxForeign, 0.003) // 0.0025 -> 0.003 half up
 })

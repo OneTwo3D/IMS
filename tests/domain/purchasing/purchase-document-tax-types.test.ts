@@ -56,16 +56,13 @@ test('producer: a vatable cost line with no supplier default is blank; a non-vat
   assert.deepEqual(findPurchaseDocumentTaxTypeProblems({ lines: withDefault.accountingLines }), [])
 })
 
-test('supplier credit note: a bill that carried VAT with no supplier tax type is UNDECIDED (not NONE) and the payload line carries none; a bill with no VAT is a named NONE', () => {
-  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: null }), undefined)
-  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: '' }), undefined)
-  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: 'INPUT2', isReverseCharge: true, reverseChargeTaxType: null }), 'INPUT2')
-  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, isReverseCharge: true, supplierTaxType: null }), undefined)
+test('supplier credit note: a bill that carried VAT with no code to mirror is UNDECIDED (not NONE) and the payload line carries none; a bill with no VAT is a named NONE', () => {
+  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, billLines: [] }).taxType, undefined)
   const common = { creditNoteId: 'c1', creditNoteNumber: null, reference: null, reason: null, supplierName: 'S', supplierId: 's1', currency: 'GBP', fxRateToBase: 1, amountForeign: 10, transitAccount: '631', date: '2026-11-02' }
   const undecided = buildSupplierCreditNoteSyncPayload({ ...common, taxType: undefined }) as { lines: Array<Record<string, unknown>> }
   assert.notEqual(undecided.lines[0].taxType, 'NONE')
   assert.equal(findPurchaseDocumentTaxTypeProblems({ lines: undecided.lines as never }).length, 1)
-  const untaxed = buildSupplierCreditNoteSyncPayload({ ...common, taxType: resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: 'INPUT2' }) }) as { lines: Array<Record<string, unknown>> }
+  const untaxed = buildSupplierCreditNoteSyncPayload({ ...common, taxType: resolveSupplierCreditNoteTaxType({ billHadTax: false, billLines: [] }).taxType }) as { lines: Array<Record<string, unknown>> }
   assert.deepEqual([untaxed.lines[0].taxType, untaxed.lines[0].noTaxKind], ['NONE', 'no-vat-rate'])
   assert.deepEqual(findPurchaseDocumentTaxTypeProblems({ lines: untaxed.lines as never }), [])
 })

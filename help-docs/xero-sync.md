@@ -1641,6 +1641,15 @@ real accounting tax type, then re-import the order.
 Xero tax type, affected invoices and credit notes will sit as failed rows on /sync instead of posting. That is the intended behaviour; keep the
 Sales Invoices sync type switched off until the mappings are in place, then enable it.
 
+**Rounding.** Xero works tax out per line and rounds each line's tax to the currency's minor unit, so IMS does the same: each billed line's VAT is rounded to the
+bill currency's minor unit (two decimals for GBP, none for JPY, three for KWD) and the bill's VAT is the sum of those rounded amounts, with the total and the base-currency
+figures recomputed from them. Three lines of 0.03 at 20% record 0.03 of VAT (0.01 each), as Xero does, not 0.018.
+
+**Supplier credit notes copy the bill they credit.** The tax type of a supplier credit note comes from the **selected bill's booked lines** (the type and rate each line
+was posted with), never from the supplier's current default. A bill that carried VAT is credited on the one VAT type its taxed lines used; if its taxed lines used
+two different types (one amount cannot mirror both), or no type can be found, the credit note is refused (*NOTHING WAS SENT*) rather than posted on "No VAT". A bill that carried no VAT
+at all (for example one made only of non-vatable cost lines) is credited on "No VAT".
+
 ### Paid invoices whose payment date Xero does not give
 
 If Xero reports an invoice or bill **PAID** but its payment date is missing or unreadable, the payment poll does **not** mark it paid with a guessed date: it logs a

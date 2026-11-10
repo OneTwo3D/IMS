@@ -128,42 +128,32 @@ test('sync payload carries allocation hints when the bill has an external id (au
   assert.equal(noBill.allocateAmount, undefined)
 })
 
-test('credit-note tax type mirrors the bill: supplier tax type when the bill had VAT, else NONE', () => {
-  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: 'INPUT2' }), 'INPUT2')
-  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: 'INPUT2' }), 'NONE')
-  // Bill had VAT but the supplier has no mapped tax type → UNDECIDED, never NONE: the poster refuses it (ACC-H3).
-  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: null }), undefined)
-  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: undefined }), undefined)
+const taxedLine = { taxType: 'INPUT2', rate: 0.2, taxRateId: 'r-std' }
+const exemptLine = { taxType: 'NONE', rate: 0 }
+const tax = (p: Parameters<typeof resolveSupplierCreditNoteTaxType>[0]) => resolveSupplierCreditNoteTaxType(p).taxType
+
+test('credit-note tax type mirrors the SELECTED BILL\'s booked lines: the code its VAT-bearing lines posted on, NONE only when the bill carried no VAT', () => {
+  assert.deepEqual(resolveSupplierCreditNoteTaxType({ billHadTax: true, billLines: [taxedLine] }), { taxType: 'INPUT2', taxRateId: 'r-std' })
+  // A taxable bill is credited on the bill's code even when the supplier's CURRENT default is NONE (the resolver never sees the supplier).
+  assert.equal(tax({ billHadTax: true, billLines: [taxedLine, exemptLine] }), 'INPUT2', 'a non-vatable line on a taxable bill does not turn the credit into NONE')
+  assert.equal(tax({ billHadTax: false, billLines: [exemptLine] }), 'NONE', 'a bill with only non-vatable lines: NONE')
+  assert.equal(tax({ billHadTax: false, billLines: [] }), 'NONE')
+  // Bill carried VAT but nothing shows what code: UNDECIDED, never NONE (the poster refuses it).
+  assert.equal(tax({ billHadTax: true, billLines: [] }), undefined)
+  assert.equal(tax({ billHadTax: true, billLines: [{ taxType: undefined, rate: 0.2 }] }), undefined)
+  assert.equal(tax({ billHadTax: true, billLines: [{ taxType: 'NONE', rate: 0.2 }] }), undefined, 'a NONE line that carried a rate is not a decided credit')
+  // One amount cannot mirror two VAT codes.
+  assert.equal(tax({ billHadTax: true, billLines: [taxedLine, { taxType: 'INPUT5', rate: 0.05 }] }), undefined)
+  assert.equal(tax({ billHadTax: true, billLines: [taxedLine, { taxType: 'INPUT2', rate: 0.2 }] }), 'INPUT2', 'two lines on one code are one code')
 })
 
 test('credit-note tax type: reverse-charge goods credit reverses on the RC tax type, not NONE', () => {
-  // RC purchase: no supplier VAT on the bill (billHadTax false), but the credit
-  // must reverse the notional VAT on the configured RC tax type.
-  assert.equal(
-    resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: 'INPUT2', isReverseCharge: true, reverseChargeTaxType: 'REVERSECHARGES' }),
-    'REVERSECHARGES',
-  )
-  // RC takes precedence even if the bill also somehow carried tax.
-  assert.equal(
-    resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: 'INPUT2', isReverseCharge: true, reverseChargeTaxType: 'REVERSECHARGES' }),
-    'REVERSECHARGES',
-  )
-  // RC but no configured RC tax type → fall back to the line's own tax type
-  // (NOT NONE), mirroring the bill poster's baseTaxType fallback.
-  assert.equal(
-    resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: 'INPUT2', isReverseCharge: true, reverseChargeTaxType: '' }),
-    'INPUT2',
-  )
-  // RC, no RC tax type AND no line tax type → UNDECIDED, not NONE: the poster refuses it (ACC-H3).
-  assert.equal(
-    resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: null, isReverseCharge: true, reverseChargeTaxType: '' }),
-    undefined,
-  )
-  // Not reverse-charge → unchanged behaviour (RC tax type ignored).
-  assert.equal(
-    resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: 'INPUT2', isReverseCharge: false, reverseChargeTaxType: 'REVERSECHARGES' }),
-    'INPUT2',
-  )
+  assert.equal(tax({ billHadTax: false, billLines: [taxedLine], isReverseCharge: true, reverseChargeTaxType: 'REVERSECHARGES' }), 'REVERSECHARGES')
+  assert.equal(tax({ billHadTax: true, billLines: [taxedLine], isReverseCharge: true, reverseChargeTaxType: 'REVERSECHARGES' }), 'REVERSECHARGES')
+  // RC but no configured RC tax type: the type the bill's lines posted on (NOT NONE).
+  assert.equal(tax({ billHadTax: false, billLines: [taxedLine], isReverseCharge: true, reverseChargeTaxType: '' }), 'INPUT2')
+  // RC, no RC tax type and nothing the bill posted on: undecided.
+  assert.equal(tax({ billHadTax: false, billLines: [], isReverseCharge: true, reverseChargeTaxType: '' }), undefined)
 })
 
 test('sync payload posts EXCLUSIVE for reverse-charge (net amount), INCLUSIVE otherwise', () => {
@@ -253,4 +243,11 @@ test('the withdrawn "unique number makes the retry converge" claim stays withdra
   )
   assert.match(builderDoc, /RECOGNISABILITY|recognisab/i,
     'what the minted number actually buys is that a document under it can only be THIS credit note')
+})
+
+test('wiring: the supplier credit note poster reads the SELECTED bill\'s lines and treatment, not the supplier default type', async () => {
+  const { readFileSync } = await import('node:fs')
+  const source = readFileSync('app/actions/purchase-orders.ts', 'utf8')
+  assert.match(source, /billLineTaxTreatments\(\{\s*billLines: billLinesBooked/)
+  assert.doesNotMatch(source, /supplierTaxType: baseTaxType/)
 })

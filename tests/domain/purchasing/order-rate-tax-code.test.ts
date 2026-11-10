@@ -118,6 +118,7 @@ test('both callers refuse a disagreeing bill before it is saved (wiring)', () =>
 
 test('both bill callers take the cost-line code from the order\'s recorded rate, not the supplier default (wiring)', () => {
   const source = readFileSync('app/actions/purchase-orders.ts', 'utf8')
-  assert.equal((source.match(/resolveOrderRateTaxCode\(/g) ?? []).length, 2)
+  assert.equal((source.match(/await orderRateTaxCodeFor\(/g) ?? []).length, 3, 'create, edit and the supplier credit note')
+  assert.equal((source.match(/resolveOrderRateTaxCode\(/g) ?? []).length, 1, 'one helper, no inline copy')
   assert.doesNotMatch(source, /fallbackTaxType = [^\n]*supplier[^\n]*taxRate\?\.accountingTaxType/)
 })
