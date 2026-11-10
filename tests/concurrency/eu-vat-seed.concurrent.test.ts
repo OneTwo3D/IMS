@@ -207,7 +207,7 @@ test('a rate edited after the dry run (percentage, country, name, charged code) 
   for (const id of ids.rates) await d.db.taxRate.update({ where: { id }, data: { schemePostingTaxType: null, reportingCategory: null } })
   const de = ids.rates[1]!
   const original = await d.db.taxRate.findUniqueOrThrow({ where: { id: de } })
-  for (const edit of [{ rate: '0.2000' }, { countryCode: 'AT' }, { name: 'DE VAT x' }, { accountingTaxType: 'TAX124' }]) {
+  for (const edit of [{ rate: '0.2000' }, { countryCode: 'AT' }, { name: 'DE VAT x' }, { accountingTaxType: 'TAX124' }, { taxCategory: 'ZERO' as const }]) {
     const stale = (await plan()).digest
     await d.db.taxRate.update({ where: { id: de }, data: edit })
     try {
@@ -216,7 +216,7 @@ test('a rate edited after the dry run (percentage, country, name, charged code) 
       assert.equal(result.applied === false && result.refusal?.code, 'DIGEST_MISMATCH', JSON.stringify(edit))
       assert.deepEqual(await snapshotRates(), before)
     } finally {
-      await d.db.taxRate.update({ where: { id: de }, data: { rate: original.rate, countryCode: original.countryCode, name: original.name, accountingTaxType: original.accountingTaxType } })
+      await d.db.taxRate.update({ where: { id: de }, data: { rate: original.rate, countryCode: original.countryCode, name: original.name, accountingTaxType: original.accountingTaxType, taxCategory: original.taxCategory } })
     }
   }
 })
@@ -236,6 +236,7 @@ test('a rate edited in the instant between the plan read and the row lock fails 
     () => d.db.taxRate.update({ where: { id: de }, data: { countryCode: 'AT' } }),
     () => d.db.taxRate.update({ where: { id: de }, data: { accountingTaxType: 'TAX124' } }),
     () => d.db.taxRate.update({ where: { id: de }, data: { usedFor: 'BOTH' } }),
+    () => d.db.taxRate.update({ where: { id: de }, data: { taxCategory: 'ZERO' } }),
     () => d.db.taxRate.update({ where: { id: de }, data: { reverseCharge: true } }),
     () => d.db.taxRate.update({ where: { id: de }, data: { reportingCategory: 'OSS' } }),
     () => d.db.taxRate.update({ where: { id: de }, data: { schemePostingTaxType: 'TAX122' } }),
@@ -273,7 +274,7 @@ test('a rate edited in the instant between the plan read and the row lock fails 
       assert.equal(after.filter((r) => r.id !== zeroId).some((r) => r.schemePostingTaxType === 'TAX131' || r.reportingCategory === 'IOSS' || r.reportingCategory === 'VOEC'), false, 'nothing the plan would set was written, the other rate included')
       assert.deepEqual(after.filter((r) => r.id !== de && r.id !== zeroId).map((r) => [r.schemePostingTaxType, r.reportingCategory]), [[null, null], [null, null]])
     } finally {
-      await d.db.taxRate.update({ where: { id: de }, data: { rate: original.rate, name: original.name, countryCode: original.countryCode, accountingTaxType: original.accountingTaxType, usedFor: original.usedFor, reverseCharge: original.reverseCharge, reportingCategory: null, schemePostingTaxType: null } })
+      await d.db.taxRate.update({ where: { id: de }, data: { rate: original.rate, name: original.name, countryCode: original.countryCode, accountingTaxType: original.accountingTaxType, usedFor: original.usedFor, reverseCharge: original.reverseCharge, taxCategory: original.taxCategory, reportingCategory: null, schemePostingTaxType: null } })
       await d.db.shoppingTaxRateMapping.update({ where: { id: ids.mappings[1]! }, data: { storeIdentity: STORE, taxRateId: de } })
       const fields = { connector: origMapping.connector, externalTaxRateId: origMapping.externalTaxRateId, externalName: origMapping.externalName, externalCountry: origMapping.externalCountry, externalRatePct: origMapping.externalRatePct, externalClass: origMapping.externalClass, taxRateId: origMapping.taxRateId, storeIdentity: origMapping.storeIdentity }
       await d.db.shoppingTaxRateMapping.upsert({ where: { id: zMapping }, create: origMapping, update: fields })

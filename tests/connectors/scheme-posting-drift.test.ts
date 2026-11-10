@@ -14,7 +14,7 @@ const mapping = (wooId: number, over: Partial<SchemeDriftMapping> = {}): SchemeD
 }
 const rate = (wooId: number, over: Partial<SchemeDriftRate> = {}): SchemeDriftRate => {
   const r = seed.rates.find((x) => x.wooId === wooId)!
-  return { taxRateId: `r${wooId}`, name: r.imsName, active: true, usedFor: 'SALES', reverseCharge: false, accountingTaxType: r.accountingTaxType ?? `C${wooId}`, reportingCategory: r.reportingCategory, schemePostingTaxType: r.schemePostingTaxType, ...over }
+  return { taxRateId: `r${wooId}`, name: r.imsName, rate: (Number(r.ratePercent) / 100).toFixed(4), countryCode: r.imsCountry, taxCategory: r.taxCategory, active: true, usedFor: 'SALES', reverseCharge: false, accountingTaxType: r.accountingTaxType ?? `C${wooId}`, reportingCategory: r.reportingCategory, schemePostingTaxType: r.schemePostingTaxType, ...over }
 }
 const CHARGED = [xeroType('C220', 'DE VAT', '19.0000'), xeroType('TAX124', 'NO VAT', '25.0000'), xeroType('OUTPUT2', 'GB VAT (Income)', '20.0000')]
 const XERO = [xeroType('TAX131', 'DE IOSS VAT', '0.0000'), xeroType('TAX122', 'NO VOEC VAT', '0.0000'), xeroType('TAX999', 'XX IOSS VAT', '0.0000'), ...CHARGED]
@@ -59,7 +59,7 @@ test('the declared type itself drifting in Xero is reported by code: gone, not A
 })
 
 test('a type carried by a rate no declared mapping names is drift', () => {
-  const stray = { taxRateId: 'stray', name: 'Stray', active: true, usedFor: 'SALES', reverseCharge: false, accountingTaxType: null, reportingCategory: 'IOSS', schemePostingTaxType: 'TAX131' }
+  const stray = { taxRateId: 'stray', name: 'Stray', rate: '0.1900', countryCode: 'DE', taxCategory: 'STANDARD', active: true, usedFor: 'SALES', reverseCharge: false, accountingTaxType: null, reportingCategory: 'IOSS', schemePostingTaxType: 'TAX131' }
   assert.match(run([...good(), stray]).join(' | '), /no declared WooCommerce mapping names it/)
 })
 
@@ -123,7 +123,7 @@ test('without the scheme check the sweep is what it was', async () => {
 })
 
 test('an instance the declaration has not touched (no declared rate mapped, no scheme posting type anywhere) has nothing to drift from', () => {
-  const untouched = [{ taxRateId: 'x', name: 'X', active: true, usedFor: 'SALES', reverseCharge: false, accountingTaxType: 'OUTPUT2', reportingCategory: null, schemePostingTaxType: null }]
+  const untouched = [{ taxRateId: 'x', name: 'X', rate: '0.2000', countryCode: 'GB', taxCategory: 'STANDARD', active: true, usedFor: 'SALES', reverseCharge: false, accountingTaxType: 'OUTPUT2', reportingCategory: null, schemePostingTaxType: null }]
   assert.deepEqual(computeSchemePostingDrift({ declared, mappings: [], rates: untouched, storeIdentity: null, xero: XERO }), [])
   assert.deepEqual(computeSchemePostingDrift({ declared, mappings: [], rates: untouched, storeIdentity: STORE, xero: XERO }), [])
   assert.notDeepEqual(computeSchemePostingDrift({ declared, mappings: [mapping(220)], rates: untouched, storeIdentity: STORE, xero: XERO }), [], 'one declared mapping engages it')
@@ -154,4 +154,18 @@ test('the CHARGED code of each declared rate is judged against its declared Xero
   assert.match(lines([...without('TAX124'), { ...xeroType('TAX124', 'NO VAT', '25.0000'), canApply: { assets: false, equity: false, expenses: true, liabilities: false, revenue: false } }]), /Charged tax type TAX124 cannot be applied to revenue in Xero/)
   assert.match(lines([...XERO, xeroType('C220B', 'DE VAT', '19.0000')]), /No single ACTIVE Xero type is named "DE VAT" \(2 found\)/)
   assert.match(lines(without('C220')), /No single ACTIVE Xero type is named "DE VAT" \(0 found\)/)
+})
+
+test('the rate\'s own identity is judged against the declaration: name, country, tax category and the percentage tax is computed at (components or the column), with or without components', () => {
+  const comp = (rateId: string, rate: string, over: Partial<{ active: boolean; compoundOnPrevious: boolean; sortOrder: number }> = {}) => ({ taxRateId: rateId, rate, compoundOnPrevious: false, active: true, sortOrder: 0, ...over })
+  const lines = (rates: SchemeDriftRate[], componentRates: ReturnType<typeof comp>[] = []): string => computeSchemePostingDrift({ declared, mappings: [mapping(220), mapping(239), mapping(112)], rates, storeIdentity: STORE, xero: XERO, componentRates }).flatMap((d) => d.lines).join(' | ')
+  assert.equal(lines(good()), '', 'control')
+  assert.match(lines([rate(220, { name: 'Germany VAT' }), rate(239), rate(112)]), /Named "Germany VAT", declared "DE VAT" for Woo rate 220/)
+  assert.equal(lines([rate(220, { name: '  de   vat ' }), rate(239), rate(112)]), '', 'case and whitespace are not drift')
+  assert.match(lines([rate(220, { countryCode: 'AT' }), rate(239), rate(112)]), /Country is "AT", declared DE/)
+  assert.match(lines([rate(220), rate(239), rate(112, { taxCategory: 'ZERO' })]), /Tax category is ZERO, declared STANDARD for Woo rate 112/)
+  assert.match(lines([rate(220, { rate: '0.2100' }), rate(239), rate(112)]), /Tax is computed at 21%, declared 19% for Woo rate 220/, 'the column alone, no components')
+  assert.match(lines(good(), [comp('r220', '0.2100')]), /Tax is computed at 21%, declared 19%/, 'an active component that differs from the column')
+  assert.equal(lines(good(), [comp('r220', '0.2100', { active: false })]), '', 'an inactive component is ignored')
+  assert.equal(lines(good(), [comp('r220', '0.1900')]), '')
 })

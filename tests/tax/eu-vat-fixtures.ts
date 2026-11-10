@@ -34,7 +34,7 @@ export function perfectWorld(seed: EuVatSeed = loadEuVatSeed()): World {
     const code = r.accountingTaxType ?? syntheticChargedCode(r.wooId)
     // WooCommerce rates declared to be one Xero rate share one IMS rate (ruling Q2, option A): the first of the group stands for it, and `ims` holds that one object for every member.
     const rate = byName.get(r.imsName) ?? {
-      id: `ims-${r.wooId}`, name: r.imsName, rate: (Number(r.ratePercent) / 100).toFixed(4), usedFor: 'SALES', active: true, reverseCharge: false, countryCode: r.imsCountry,
+      id: `ims-${r.wooId}`, name: r.imsName, taxCategory: r.taxCategory, rate: (Number(r.ratePercent) / 100).toFixed(4), usedFor: 'SALES', active: true, reverseCharge: false, countryCode: r.imsCountry,
       accountingTaxType: code, reportingCategory: r.reportingCategory, schemePostingTaxType: r.schemePostingTaxType,
     }
     byName.set(r.imsName, rate)

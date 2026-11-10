@@ -48,7 +48,7 @@ test('every finding code has a description, and a seeded failure for each check 
   expectError((w) => { w.xero.set('TAX131', xeroType('TAX131', 'DE IOSS  VAT', '0.0000')) }, 'SCHEME_NAME_DIFFERS')
   expectError((w) => { w.xero.set('TAX131', xeroType('TAX131', 'DE IOSS VAT', '19.0000')) }, 'SCHEME_NOT_ZERO')
   expectError((w) => { w.xero.set('TAX131', { ...xeroType('TAX131', 'DE IOSS VAT', '0.0000'), effectiveRate: null, displayTaxRate: null }) }, 'SCHEME_NOT_ZERO')
-  expectError((w) => { w.ims.set(9999, { id: 'ims-x', name: 'Stray', rate: '0.2000', usedFor: 'SALES', active: true, reverseCharge: false, countryCode: 'DE', accountingTaxType: null, reportingCategory: 'IOSS', schemePostingTaxType: 'TAX131' }) }, 'SCHEME_FIELD_ON_UNDECLARED_RATE')
+  expectError((w) => { w.ims.set(9999, { id: 'ims-x', name: 'Stray', taxCategory: 'STANDARD', rate: '0.2000', usedFor: 'SALES', active: true, reverseCharge: false, countryCode: 'DE', accountingTaxType: null, reportingCategory: 'IOSS', schemePostingTaxType: 'TAX131' }) }, 'SCHEME_FIELD_ON_UNDECLARED_RATE')
   assert.ok(Object.keys(PREFLIGHT_CODES).length >= 30)
 })
 
@@ -283,7 +283,7 @@ test('the percentage is the one tax is computed at: the active components\' effe
 })
 
 test('an UNDECLARED active IMS sales rate on a declared Xero type is a second IMS rate on it: error, counted over all rates, not only the declared ones', () => {
-  const extra = (code: string, patch: Record<string, unknown> = {}) => (w: World): void => { w.ims.set(9999, { id: 'ims-undeclared', name: 'Stray rate', rate: '0.1900', usedFor: 'SALES', active: true, reverseCharge: false, countryCode: 'DE', accountingTaxType: code, reportingCategory: null, schemePostingTaxType: null, ...patch }) }
+  const extra = (code: string, patch: Record<string, unknown> = {}) => (w: World): void => { w.ims.set(9999, { id: 'ims-undeclared', name: 'Stray rate', taxCategory: 'STANDARD', rate: '0.1900', usedFor: 'SALES', active: true, reverseCharge: false, countryCode: 'DE', accountingTaxType: code, reportingCategory: null, schemePostingTaxType: null, ...patch }) }
   assert.deepEqual(codesOf(withWorld(extra('ZERORATEDOUTPUT'))), ['XERO_TYPE_ON_TWO_IMS_RATES'])
   assert.deepEqual(codesOf(withWorld(extra(syntheticChargedCode(220)))), ['XERO_TYPE_ON_TWO_IMS_RATES'])
   assert.deepEqual(codesOf(withWorld(extra('ZERORATEDOUTPUT', { active: false }))), [], 'an inactive rate is not a carrier')
@@ -295,7 +295,7 @@ test('an UNDECLARED active IMS sales rate on a declared Xero type is a second IM
 
 test('XERO_TYPE_ON_TWO_IMS_RATES is attached to every declared rate carrying the type, so the plan skips each and the dry run lists them', () => {
   const clear = (w: World): void => { for (const [id, r] of w.ims) w.ims.set(id, { ...r, schemePostingTaxType: null, reportingCategory: null }) }
-  const dup = (code: string) => (w: World): void => { clear(w); w.ims.set(9999, { id: 'ims-undeclared', name: 'Stray rate', rate: '0.1900', usedFor: 'SALES', active: true, reverseCharge: false, countryCode: 'DE', accountingTaxType: code, reportingCategory: null, schemePostingTaxType: null }) }
+  const dup = (code: string) => (w: World): void => { clear(w); w.ims.set(9999, { id: 'ims-undeclared', name: 'Stray rate', taxCategory: 'STANDARD', rate: '0.1900', usedFor: 'SALES', active: true, reverseCharge: false, countryCode: 'DE', accountingTaxType: code, reportingCategory: null, schemePostingTaxType: null }) }
   const plan = planEuVatSeedApply(withWorld(dup(syntheticChargedCode(220))))
   assert.equal(plan.skipped.find((s) => s.wooId === 220)?.reason, 'XERO_TYPE_ON_TWO_IMS_RATES')
   assert.equal(plan.changes.some((c) => c.wooId === 220), false)
@@ -306,4 +306,14 @@ test('XERO_TYPE_ON_TWO_IMS_RATES is attached to every declared rate carrying the
   const result = evaluateEuVatPreflight(withWorld(dup(syntheticChargedCode(220))))
   assert.equal(result.status === 'checked' && result.findings.filter((f) => f.code === 'XERO_TYPE_ON_TWO_IMS_RATES' && f.wooId === 220).length, 1)
   assert.equal(result.status === 'checked' && result.findings.filter((f) => f.code === 'XERO_TYPE_ON_TWO_IMS_RATES' && f.wooId === null).length, 1, 'and the whole-configuration finding stays')
+})
+
+test('the IMS tax category must be the declared one (IMS picks the order tax rate by it): preflight error, the rate is not planned, and it is in the bound identity', () => {
+  expectError((w) => { setIms(w, 220, { taxCategory: 'ZERO' }) }, 'IMS_CATEGORY_DIFFERS')
+  expectError((w) => { setIms(w, 139, { taxCategory: 'STANDARD' }) }, 'IMS_CATEGORY_DIFFERS')
+  const clear = (w: World): void => { for (const [id, r] of w.ims) w.ims.set(id, { ...r, schemePostingTaxType: null, reportingCategory: null }) }
+  const plan = planEuVatSeedApply(withWorld((w) => { clear(w); setIms(w, 220, { taxCategory: 'ZERO' }) }))
+  assert.equal(plan.skipped.find((s) => s.wooId === 220)?.reason, 'IMS_CATEGORY_DIFFERS')
+  assert.equal(plan.changes.some((c) => c.wooId === 220), false)
+  assert.equal(planEuVatSeedApply(withWorld(clear)).changes.find((c) => c.wooId === 220)!.identity.taxCategory, 'STANDARD')
 })

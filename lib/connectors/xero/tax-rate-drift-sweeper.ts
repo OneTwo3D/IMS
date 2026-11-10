@@ -199,16 +199,18 @@ export async function runXeroTaxRateDriftSweep(): Promise<TaxRateDriftSweepResul
       // Only settings are read (no request): the store configured now, to match the declared mappings against.
       const [{ getWcCredentials }, { normaliseStoreIdentity }] = await Promise.all([import('@/lib/connectors/woocommerce/api'), import('@/lib/connectors/woocommerce/tax-rate-plan')])
       const creds = await getWcCredentials().catch(() => null)
-      const [rates, mappings] = await Promise.all([
-        db.taxRate.findMany({ select: { id: true, name: true, active: true, usedFor: true, reverseCharge: true, schemePostingTaxType: true, reportingCategory: true, accountingTaxType: true } }),
+      const [components, rates, mappings] = await Promise.all([
+        db.taxRateComponent.findMany({ select: { taxRateId: true, rate: true, compoundOnPrevious: true, active: true, sortOrder: true } }),
+        db.taxRate.findMany({ select: { id: true, name: true, rate: true, countryCode: true, taxCategory: true, active: true, usedFor: true, reverseCharge: true, schemePostingTaxType: true, reportingCategory: true, accountingTaxType: true } }),
         db.shoppingTaxRateMapping.findMany({ where: { connector: 'woocommerce' }, select: { externalTaxRateId: true, taxRateId: true, storeIdentity: true, externalCountry: true, externalRatePct: true, externalClass: true } }),
       ])
       return computeSchemePostingDrift({
         declared: loadEuVatSeed().rates,
         mappings: mappings.map((m) => ({ ...m, externalRatePct: m.externalRatePct.toFixed() })),
-        rates: rates.map((r) => ({ taxRateId: r.id, name: r.name, active: r.active, usedFor: r.usedFor, reverseCharge: r.reverseCharge, accountingTaxType: r.accountingTaxType, reportingCategory: r.reportingCategory, schemePostingTaxType: r.schemePostingTaxType })),
+        rates: rates.map((r) => ({ taxRateId: r.id, name: r.name, rate: r.rate.toFixed(), countryCode: r.countryCode, taxCategory: r.taxCategory, active: r.active, usedFor: r.usedFor, reverseCharge: r.reverseCharge, accountingTaxType: r.accountingTaxType, reportingCategory: r.reportingCategory, schemePostingTaxType: r.schemePostingTaxType })),
         storeIdentity: creds === null ? null : normaliseStoreIdentity(creds.url),
         xero: fetchedRows,
+        componentRates: components.map((c) => ({ ...c, rate: c.rate.toFixed() })),
       })
     },
     async loadImsProfiles() {

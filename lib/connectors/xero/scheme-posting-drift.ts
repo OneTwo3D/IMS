@@ -11,8 +11,10 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import type { NormalisedXeroTaxRate } from './tax-rate-list'
 import type { EuVatSeedRate } from '@/lib/tax/eu-vat-seed'
+import { imsPercent } from '@/lib/reconciliation-pack/vat-set-identity'
+import type { TaxComponentRateRow, TaxRateRow } from '@/lib/reconciliation-pack/ims-readers'
 
-export type SchemeDriftRate = { taxRateId: string; name: string; active: boolean; usedFor: string; reverseCharge: boolean; accountingTaxType: string | null; reportingCategory: string | null; schemePostingTaxType: string | null }
+export type SchemeDriftRate = { taxRateId: string; name: string; /** Fraction text (the rate column). */ rate: string; countryCode: string | null; taxCategory: string; active: boolean; usedFor: string; reverseCharge: boolean; accountingTaxType: string | null; reportingCategory: string | null; schemePostingTaxType: string | null }
 export type SchemeDriftMapping = { externalTaxRateId: string; taxRateId: string; storeIdentity: string | null; externalCountry: string | null; externalRatePct: string; externalClass: string | null }
 
 /** The one drift item that carries the declared mappings that are missing or invalid (they belong to no rate). */
@@ -27,6 +29,8 @@ export function computeSchemePostingDrift(input: {
   /** The normalised URL of the WooCommerce store configured now; null = none, and no mapping can be matched (nothing is judged). */
   storeIdentity: string | null
   xero: readonly NormalisedXeroTaxRate[]
+  /** The tax components of the IMS rates (all rows): the active ones decide the percentage tax is computed at, as in the set-identity report. */
+  componentRates?: readonly TaxComponentRateRow[]
 }): Array<{ taxRateId: string; name: string; lines: string[] }> {
   const byType = new Map(input.xero.map((row) => [row.taxType, row]))
   const ratesById = new Map(input.rates.map((r) => [r.taxRateId, r]))
@@ -56,6 +60,12 @@ export function computeSchemePostingDrift(input: {
     if (rate.reverseCharge) { issue(`${label}: its mapping names a reverse-charge tax rate`); continue }
     // Only a rate named by a mapping that passed every check above counts as declared.
     named.add(rate.taxRateId)
+    // The rate's own identity against the declaration: name, country, tax category and the percentage tax is computed at (the active components' effective rate, else the column), with or without components.
+    if (rate.name.trim().replace(/\s+/g, ' ').toLowerCase() !== declared.imsName.trim().replace(/\s+/g, ' ').toLowerCase()) add(rate.taxRateId, `Named "${rate.name}", declared "${declared.imsName}" for Woo rate ${declared.wooId}`)
+    if (declared.imsCountry !== null && (rate.countryCode ?? '').trim().toUpperCase() !== declared.imsCountry) add(rate.taxRateId, `Country is "${rate.countryCode ?? ''}", declared ${declared.imsCountry} for Woo rate ${declared.wooId}`)
+    if (rate.taxCategory !== declared.taxCategory) add(rate.taxRateId, `Tax category is ${rate.taxCategory}, declared ${declared.taxCategory} for Woo rate ${declared.wooId}`)
+    const computed = imsPercent({ id: rate.taxRateId, rate: rate.rate } as TaxRateRow, input.componentRates ?? [])
+    if (computed === null || !computed.eq(new Prisma.Decimal(declared.ratePercent))) add(rate.taxRateId, `Tax is computed at ${computed === null ? 'an unreadable rate' : `${computed.toFixed()}%`}, declared ${Number(declared.ratePercent)}% for Woo rate ${declared.wooId}`)
     // The CHARGED code against the declared Xero type: the IMS rate must carry the declared code (or, where the declaration leaves it to the live list, the one ACTIVE type of the declared name), and that type
     // must still be ACTIVE, named and priced as declared and usable on sales. Judged for every declared rate, with or without active components (the by-name sweep never sees one without).
     const chargedCode = (rate.accountingTaxType ?? '').trim()

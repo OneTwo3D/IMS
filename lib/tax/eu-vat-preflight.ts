@@ -39,6 +39,8 @@ export const SCHEME_COUNTRIES: readonly string[] = [...[...EU_ISO_CODES].filter(
 export type PreflightImsRate = {
   id: string
   name: string
+  /** STANDARD, ZERO, ...: IMS picks the order tax rate by this, so it must be the declared one. */
+  taxCategory: string
   /** Fraction text, Decimal(5,4). */
   rate: string
   usedFor: string
@@ -80,6 +82,7 @@ export const PREFLIGHT_CODES = {
   SHARED_IMS_ROW: 'one IMS rate stands for WooCommerce rates the declaration does not declare to be the same Xero rate (only rates on the same Xero type may share an IMS rate)',
   IMS_PERCENT_DIFFERS: 'the IMS rate is not the percentage the declaration states',
   IMS_COUNTRY_DIFFERS: 'the IMS rate is for another country than the declaration states',
+  IMS_CATEGORY_DIFFERS: 'the IMS rate has another tax category than the declaration states (IMS picks the order tax rate by it)',
   IMS_NAME_DIFFERS: 'the IMS rate has another name than the declaration states (trimmed, whitespace collapsed, case ignored)',
   CHARGED_TYPE_MISSING: 'the IMS rate carries no accounting tax type',
   CHARGED_TYPE_NONE: 'the IMS rate carries NONE; a rate never posts on "No VAT"',
@@ -184,6 +187,7 @@ export function evaluateEuVatPreflight(input: PreflightInput): PreflightResult {
     // The percentage IMS computes tax at: the active components' effective rate when it has any, else the rate column (the set-identity report's own function).
     const imsPercent = effectiveImsPercent({ id: ims.id, rate: ims.rate } as TaxRateRow, input.componentRates)
     if (imsPercent === null || !imsPercent.eq(new Dec(rate.ratePercent))) err('IMS_PERCENT_DIFFERS', `IMS ${imsPercent === null ? 'unreadable' : imsPercent.toFixed()}%, declared ${rate.ratePercent}%`)
+    if (ims.taxCategory !== rate.taxCategory) err('IMS_CATEGORY_DIFFERS', `IMS ${ims.taxCategory}, declared ${rate.taxCategory}`)
     if (rate.imsCountry !== null && normaliseCountryCode(ims.countryCode ?? '') !== normaliseCountryCode(rate.imsCountry)) err('IMS_COUNTRY_DIFFERS', `IMS "${ims.countryCode ?? ''}", declared "${rate.imsCountry}"`)
     if (!sameName(ims.name, rate.imsName)) err('IMS_NAME_DIFFERS', `IMS "${ims.name}", declared "${rate.imsName}"`)
 
@@ -293,7 +297,7 @@ export function evaluateEuVatPreflight(input: PreflightInput): PreflightResult {
 /** Read-only: the IMS rows and the WooCommerce mappings (all the apply needs). */
 export async function readEuVatImsSide(client: Client): Promise<Pick<PreflightInput, 'imsRates' | 'mappings' | 'componentRates'>> {
   const [rates, mappings, components] = await Promise.all([
-    client.taxRate.findMany({ select: { id: true, name: true, rate: true, usedFor: true, active: true, reverseCharge: true, countryCode: true, accountingTaxType: true, reportingCategory: true, schemePostingTaxType: true }, orderBy: { id: 'asc' } }),
+    client.taxRate.findMany({ select: { id: true, name: true, taxCategory: true, rate: true, usedFor: true, active: true, reverseCharge: true, countryCode: true, accountingTaxType: true, reportingCategory: true, schemePostingTaxType: true }, orderBy: { id: 'asc' } }),
     client.shoppingTaxRateMapping.findMany({ where: { connector: 'woocommerce' }, select: { id: true, externalTaxRateId: true, externalName: true, externalCountry: true, externalRatePct: true, externalClass: true, taxRateId: true, storeIdentity: true }, orderBy: { externalTaxRateId: 'asc' } }),
     client.taxRateComponent.findMany({ select: { taxRateId: true, rate: true, compoundOnPrevious: true, active: true, sortOrder: true }, orderBy: [{ taxRateId: 'asc' }, { sortOrder: 'asc' }, { id: 'asc' }] }),
   ])
@@ -338,6 +342,7 @@ export type SeedChangeIdentity = {
   /** Fraction text, Decimal(5,4). */
   rate: string
   country: string | null
+  taxCategory: string
   usedFor: string
   charged: { code: string; xeroName: string; xeroPercent: string }
   scheme: { code: string; xeroName: string; xeroPercent: string } | null
@@ -381,7 +386,7 @@ export function planEuVatSeedApply(input: PreflightInput): SeedApplyPlan {
       const existing = changes.find((c) => c.taxRateId === ims.id)
       if (existing !== undefined) { existing.identity.mappings.push(facts); existing.identity.mappings.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)); continue }
       const identity: SeedChangeIdentity = {
-        storeIdentity: input.storeIdentity, mappings: [facts], allMappingIds: input.mappings.filter((m) => m.taxRateId === ims.id).map((m) => m.id).sort(), name: ims.name, rate: ims.rate, country: ims.countryCode, usedFor: ims.usedFor,
+        storeIdentity: input.storeIdentity, mappings: [facts], allMappingIds: input.mappings.filter((m) => m.taxRateId === ims.id).map((m) => m.id).sort(), name: ims.name, rate: ims.rate, country: ims.countryCode, usedFor: ims.usedFor, taxCategory: ims.taxCategory,
         components: activeComponents(input.componentRates, ims.id),
         charged: fact(ims.accountingTaxType ?? ''), scheme: rate.schemePostingTaxType === null ? null : fact(rate.schemePostingTaxType),
       }
@@ -484,7 +489,7 @@ export async function applyEuVatSeed(db: { $transaction: <T>(fn: (tx: Client) =>
         const id = change.identity
         const done = await tx.taxRate.updateMany({
           where: {
-            id: change.taxRateId, active: true, reverseCharge: false, name: id.name, rate: new Prisma.Decimal(id.rate), countryCode: id.country, usedFor: id.usedFor, accountingTaxType: id.charged.code,
+            id: change.taxRateId, active: true, reverseCharge: false, name: id.name, rate: new Prisma.Decimal(id.rate), countryCode: id.country, usedFor: id.usedFor, taxCategory: id.taxCategory as never, accountingTaxType: id.charged.code,
             schemePostingTaxType: change.from.schemePostingTaxType, reportingCategory: change.from.reportingCategory,
           },
           data: { schemePostingTaxType: change.to.schemePostingTaxType, reportingCategory: change.to.reportingCategory },
