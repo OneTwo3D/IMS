@@ -20,6 +20,8 @@ const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const skip = !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1'
 
 let switchOn = false
+/** The reverse-charge sales tax type setting the mocked accounting settings return; a test sets it and puts it back. */
+let rcSetting = ''
 /** The OFF case needs to see what the importer built; the real queue would write nothing. Only that case sets it. */
 let recordWhenOff = false
 let accountingMocked = false
@@ -58,7 +60,7 @@ async function mockAccounting() {
     namedExports: {
       ...actual,
       getAccountingSettings: async () => ({
-        connector: 'xero', salesAccount: '200', shippingAccount: '260', discountAccount: '270', reverseChargeSalesTaxType: '',
+        connector: 'xero', salesAccount: '200', shippingAccount: '260', discountAccount: '270', reverseChargeSalesTaxType: rcSetting,
         euVatIossAccount: '821', euVatDdpAccount: '232', euFeeAccount: '232', roundingDifferenceAccount: '860',
       }),
       isAccountingSyncTypeEnabledFor: async () => switchOn,
@@ -205,12 +207,13 @@ test('[eu vat] switch ON, IOSS: zero-rated goods and shipping, fee on 232, one V
   assert.equal(total(invoice), 135.66, 'the invoice totals the order')
   assert.equal(invoice._taxUnreconciled, undefined)
   assert.equal(invoice._registerPayment, true)
-  const { taxBinding, ...marker } = invoice._euVatTreatment as Record<string, unknown> & { taxBinding: { lineRateIds: unknown[]; shippingRateIds: unknown[]; resolved: Record<string, string> } }
+  const { taxBinding, ...marker } = invoice._euVatTreatment as Record<string, unknown> & { taxBinding: { lineRateIds: unknown[]; shippingRateIds: unknown[]; rates: Record<string, { accountingTaxType: string; reverseCharge: boolean }>; lineTypes: unknown[] } }
   assert.deepEqual(marker, { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', orderTotal: '135.66', vatAccount: '821', feesRecoded: 1, roundingAdjustment: null })
   // The tax binding recorded BEFORE the treatment re-typed the lines: both lines and the shipping on the one WooCommerce rate, which resolved to the charged code.
   assert.equal(taxBinding.lineRateIds.length, 2)
   assert.equal(taxBinding.shippingRateIds.length, 1)
-  assert.deepEqual(Object.values(taxBinding.resolved), ['DE_CHARGED'])
+  assert.deepEqual(Object.values(taxBinding.rates).map((r) => [r.accountingTaxType, r.reverseCharge]), [['DE_CHARGED', false]])
+  assert.deepEqual(taxBinding.lineTypes, ['DE_CHARGED', 'DE_CHARGED'], 'the effective pre-treatment types')
   assert.equal(order.euVatRegime, 'IOSS')
   assert.equal(order.euVatLineAccount, '821')
   assert.ok(order.euVatRegimeStampedAt)
@@ -331,7 +334,7 @@ test('[eu vat] a stamped IOSS order whose facts now decide DDP is refused, not t
   const invoice = (await db.accountingSyncLog.findFirstOrThrow({ where: { type: 'SALES_INVOICE', referenceId: orderId } })).payload as unknown as Record<string, unknown>
   const base = { orderId, payload: { currency: 'GBP', lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: 'DE_CHARGED' }, { description: 'EU Customs Fee', quantity: 1, unitAmount: 4, accountCode: '200', taxType: 'DE_CHARGED' }], shippingAmount: 10, shippingAccountCode: '260', shippingTaxType: 'DE_CHARGED' } as Record<string, unknown>,
     mappedLines: [{ isFeeLine: false, wclcFeeKind: null, forceNoTax: false, taxForeign: 19 }, { isFeeLine: true, wclcFeeKind: 'uhf' as const, forceNoTax: false, taxForeign: 0.76 }],
-    connector: 'xero', accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' }, storeCreditForeign: { gt: () => false }, now: new Date() }
+    connector: 'xero', taxBindingDeps: { reverseChargeSalesTaxType: '', lineType: ({ forceNoTax, baseTaxType }: { forceNoTax: boolean | undefined; baseTaxType: string | null | undefined }) => (forceNoTax ? 'NONE' : baseTaxType ?? undefined) }, accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' }, storeCreditForeign: { gt: () => false }, now: new Date() }
   void invoice
   // The same facts: still IOSS, treated.
   const same = await treatImportedSalesInvoice({ ...base, wcOrder: payload(externalId, wcRateId, [num, ...PLUGIN('821')]) as never })
@@ -586,7 +589,7 @@ async function seedDomestic(db: Awaited<ReturnType<typeof loadDb>>, wcRateId: nu
   const warehouse = await db.warehouse.create({ data: { code: `EUD-${randomUUID().slice(0, 8)}`, name: 'Domestic hold test warehouse', syncToStore: true, availableForSale: true } })
   return { rate, warehouse }
 }
-async function domesticHold(t: test.TestContext, changeTotal: boolean) {
+async function domesticHold(t: test.TestContext, changeTotal: boolean, between?: (db: Awaited<ReturnType<typeof loadDb>>, rateId: string) => Promise<void>, parkSetting = '') {
   const db = await loadDb()
   await mockAccounting()
   switchOn = true
@@ -595,13 +598,15 @@ async function domesticHold(t: test.TestContext, changeTotal: boolean) {
   const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
   const externalId = Math.floor(Math.random() * 2_000_000_000)
   const ctx = await seedDomestic(db, wcRateId)
-  t.after(async () => { switchOn = false; await cleanup(db, externalId, ctx) })
+  t.after(async () => { switchOn = false; rcSetting = ''; await cleanup(db, externalId, ctx) })
   const extra: Meta = [{ id: 2, key: 'is_vat_exempt', value: 'no' }]
+  rcSetting = parkSetting
   assert.equal((await importWcOrder(domesticPayload(externalId, wcRateId, extra) as never)).success, true)
   const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
   const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
   const marker = (held.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment as Record<string, unknown>
   assert.deepEqual([marker.applied, marker.route, marker.orderTotal], [true, 'none', '132.00'])
+  if (between) await between(db, ctx.rate.id)
   const again = domesticPayload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...extra])
   if (changeTotal) { again.shipping_lines[0]!.total_tax = '3.00'; again.tax_lines[0]!.shipping_tax_total = '3.00'; again.total = '133.00'; again.total_tax = '23.00' }
   await importWcOrder(again as never)
@@ -751,4 +756,67 @@ test('[eu vat] the same exchange on an UNTREATED hold (parked with the switch of
   assert.equal(rows.length, 0)
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /the order changed after it was held \(line 1: the parked tax type is OUTPUT2, the order's line now resolves to ZERORATEDOUTPUT\)/)
+})
+
+// ---- every input that decides a posted tax type is recorded and compared ----
+test('[eu vat] the reverse-charge FLAG flips on the mapped rate (same id, same base type, empty setting so the posted type does not change): the hold is refused', { skip }, async (t) => {
+  const { after, rows } = await domesticHold(t, false, async (db, rateId) => { await db.taxRate.update({ where: { id: rateId }, data: { reverseCharge: true } }) })
+  assert.equal(rows.length, 0, 'nothing was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /WooCommerce tax rate \d+: reverseCharge changed from false to true/)
+  assert.match(after.errorMessage ?? '', /needs its invoice rebuilt/)
+})
+
+test('[eu vat] the reverse-charge flag flips with a reverse-charge setting in force (the posted type swaps): refused', { skip }, async (t) => {
+  const { after, rows } = await domesticHold(t, false, async (db, rateId) => { await db.taxRate.update({ where: { id: rateId }, data: { reverseCharge: true } }) }, 'ECOUTPUTSERVICES')
+  assert.equal(rows.length, 0)
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /reverseCharge changed from false to true/)
+})
+
+test('[eu vat] the reverse-charge SALES tax type SETTING changes while the hold waits: refused', { skip }, async (t) => {
+  const { after, rows } = await domesticHold(t, false, async () => { rcSetting = 'ECOUTPUTSERVICES' })
+  assert.equal(rows.length, 0)
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /the reverse-charge sales tax type setting changed from "" to "ECOUTPUTSERVICES"/)
+})
+
+test('[eu vat] the mapped rate is made INACTIVE (archived) while the hold waits: refused', { skip }, async (t) => {
+  const { after, rows } = await domesticHold(t, false, async (db, rateId) => { await db.taxRate.update({ where: { id: rateId }, data: { active: false } }) })
+  assert.equal(rows.length, 0)
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /WooCommerce tax rate \d+: active changed from true to false/)
+})
+
+test('[eu vat] the mapped rate\'s accounting tax type or its percentage changes while the hold waits: refused', { skip }, async (t) => {
+  const { after, rows } = await domesticHold(t, false, async (db, rateId) => { await db.taxRate.update({ where: { id: rateId }, data: { accountingTaxType: 'OUTPUT3', rate: 0.25 } }) })
+  assert.equal(rows.length, 0)
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /WooCommerce tax rate \d+: (accountingTaxType|rate|nowAccountingTaxType) changed/)
+})
+
+test('[eu vat] an UNTREATED hold: the reverse-charge setting and flag change so the line\'s effective type changes: refused', { skip }, async (t) => {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = false
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seedDomestic(db, wcRateId)
+  t.after(async () => { switchOn = false; rcSetting = ''; await cleanup(db, externalId, ctx) })
+  const extra: Meta = [{ id: 2, key: 'is_vat_exempt', value: 'no' }]
+  assert.equal((await importWcOrder(domesticPayload(externalId, wcRateId, extra) as never)).success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  assert.equal('_euVatTreatment' in (held.payload as unknown as { accountingPayload: Invoice }).accountingPayload, false)
+  // The switch comes on, the rate becomes reverse-charge and the setting is configured: the line now resolves to the reverse-charge type, not the parked OUTPUT2.
+  await db.taxRate.update({ where: { id: ctx.rate.id }, data: { reverseCharge: true } })
+  rcSetting = 'ECOUTPUTSERVICES'
+  switchOn = true
+  await importWcOrder(domesticPayload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...extra]) as never)
+  assert.equal(await db.accountingSyncLog.count({ where: { type: 'SALES_INVOICE', referenceId: orderId } }), 0)
+  const after = await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } })
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /line 1: the parked tax type is OUTPUT2, the order's line now resolves to ECOUTPUTSERVICES/)
 })

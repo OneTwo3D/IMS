@@ -85,17 +85,39 @@ test('the landed-cost fee marker is checked apart from the no-tax status: a mark
 })
 
 
-const recorded = { lineRateIds: [10, 11, null], shippingRateIds: [10], resolved: { '10': 'OUTPUT2', '11': 'ZERORATEDOUTPUT' } }
-const nowSame = { lineRateIds: [10, 11, null], shippingRateIds: [10], resolved: { '10': { type: 'OUTPUT2', mapped: true }, '11': { type: 'ZERORATEDOUTPUT', mapped: true } } }
+const rate = (over: Record<string, unknown> = {}) => ({
+  mapped: true, imsRateId: 'r10', accountingTaxType: 'OUTPUT2', reverseCharge: false, active: true, rate: '0.2', isCompound: false, schemePostingTaxType: null, reportingCategory: null, countryCode: 'GB',
+  replacedById: null, components: '[]', nowRateId: 'r10', nowAccountingTaxType: 'OUTPUT2', nowReverseCharge: false, ...over,
+})
+const binding = (over: Record<string, unknown> = {}) => ({
+  lineRateIds: [10, 11, null], shippingRateIds: [10], reverseChargeSalesTaxType: '',
+  rates: { '10': rate(), '11': rate({ imsRateId: 'r11', accountingTaxType: 'ZERORATEDOUTPUT', rate: '0', nowRateId: 'r11', nowAccountingTaxType: 'ZERORATEDOUTPUT' }) },
+  lineTypes: ['OUTPUT2', 'ZERORATEDOUTPUT', null], shippingTypes: ['OUTPUT2'], ...over,
+})
 
-test('the recorded tax binding of a treated hold: unchanged matches; swapped rates, shipping, a re-mapped rate, an unmapped rate and an unrecorded binding are differences', () => {
-  assert.equal(heldTaxBindingDifference(recorded, nowSame), null)
-  assert.match(heldTaxBindingDifference(recorded, { ...nowSame, lineRateIds: [11, 10, null] }) ?? '', /lines changed \(for example two lines exchanged tax classes\)/)
-  assert.match(heldTaxBindingDifference(recorded, { ...nowSame, shippingRateIds: [11] }) ?? '', /shipping changed/)
-  assert.match(heldTaxBindingDifference(recorded, { ...nowSame, resolved: { ...nowSame.resolved, '11': { type: 'OUTPUT2', mapped: true } } }) ?? '', /rate 11 now posts on OUTPUT2, not ZERORATEDOUTPUT/)
-  assert.match(heldTaxBindingDifference(recorded, { ...nowSame, resolved: { ...nowSame.resolved, '10': { type: 'OUTPUT2', mapped: false } } }) ?? '', /rate 10 can no longer be resolved/)
-  assert.match(heldTaxBindingDifference(undefined, nowSame) ?? '', /not recorded/)
-  assert.match(heldTaxBindingDifference({ lineRateIds: 'x' }, nowSame) ?? '', /unreadable/)
+test('the recorded tax binding of a treated hold: unchanged matches; EVERY recorded input is compared (rate ids, mapping, type, reverse-charge flag and setting, active, rate, compound, scheme fields, replacement, components, the rate as it stands now) and so are the effective types', () => {
+  assert.equal(heldTaxBindingDifference(binding(), binding()), null)
+  assert.match(heldTaxBindingDifference(binding(), binding({ lineRateIds: [11, 10, null] })) ?? '', /lines changed \(for example two lines exchanged tax classes\)/)
+  assert.match(heldTaxBindingDifference(binding(), binding({ shippingRateIds: [11] })) ?? '', /shipping changed/)
+  assert.match(heldTaxBindingDifference(binding(), binding({ reverseChargeSalesTaxType: 'ECOUTPUTSERVICES' })) ?? '', /reverse-charge sales tax type setting changed from "" to "ECOUTPUTSERVICES"/)
+  const keys: Array<[string, unknown, RegExp]> = [
+    ['imsRateId', 'other', /imsRateId changed/], ['accountingTaxType', 'OUTPUT', /accountingTaxType changed/], ['reverseCharge', true, /reverseCharge changed from false to true/], ['active', false, /active changed from true to false/],
+    ['rate', '0.25', /rate changed/], ['isCompound', true, /isCompound changed/], ['schemePostingTaxType', 'TAX131', /schemePostingTaxType changed/], ['reportingCategory', 'IOSS', /reportingCategory changed/],
+    ['countryCode', 'DE', /countryCode changed/], ['replacedById', 'r99', /replacedById changed/], ['components', '[["0.2",false,null,0]]', /components changed/], ['nowRateId', 'r99', /nowRateId changed/],
+    ['nowAccountingTaxType', 'OUTPUT', /nowAccountingTaxType changed/], ['nowReverseCharge', true, /nowReverseCharge changed/],
+  ]
+  for (const [key, value, pattern] of keys) {
+    const now = binding(); ;(now.rates['10'] as Record<string, unknown>)[key] = value
+    assert.match(heldTaxBindingDifference(binding(), now) ?? '', pattern, key)
+  }
+  assert.match(heldTaxBindingDifference(binding(), binding({ lineTypes: ['ZERORATEDOUTPUT', 'OUTPUT2', null] })) ?? '', /tax type of a line changed/)
+  assert.match(heldTaxBindingDifference(binding(), binding({ shippingTypes: ['ZERORATEDOUTPUT'] })) ?? '', /tax type of the shipping changed/)
+  const unmapped = binding(); unmapped.rates['10'] = rate({ mapped: false })
+  assert.match(heldTaxBindingDifference(binding(), unmapped) ?? '', /can no longer be resolved to an IMS rate/)
+  const gone = binding(); delete (gone.rates as Record<string, unknown>)['10']
+  assert.match(heldTaxBindingDifference(binding(), gone) ?? '', /can no longer be resolved/)
+  assert.match(heldTaxBindingDifference(undefined, binding()) ?? '', /not recorded/)
+  assert.match(heldTaxBindingDifference({ lineRateIds: 'x' }, binding()) ?? '', /unreadable/)
 })
 
 test('an untreated hold: each parked line type must be the one the line resolves to now; a null expectation is skipped; the shipping type must be one of its rates\' types', () => {

@@ -82,30 +82,37 @@ export function heldInvoiceDifference(
 }
 
 /**
- * The tax binding of a TREATED hold against the order now: the WooCommerce rate id of every line and of the shipping, and the accounting tax type each rate resolves to, must be what was recorded when the invoice was parked (before the treatment re-typed
- * any line). Equal-value lines that exchange tax classes change the ids; a re-mapped rate changes the type. A marker that recorded nothing (or a rate that is no longer mapped) cannot be verified and does not match.
+ * The tax binding of a TREATED hold against the order now: EVERY input recorded when it was parked (lib/connectors/woocommerce/sync/wc-tax-binding.ts lists them) must be what the order resolves to now, and so must each line's and the shipping's
+ * effective tax type. A marker that recorded nothing, a rate no longer mapped, or anything unreadable cannot be verified and does not match.
  */
-export function heldTaxBindingDifference(
-  recorded: unknown,
-  current: { lineRateIds: ReadonlyArray<number | null>; shippingRateIds: readonly number[]; resolved: Readonly<Record<string, { type: string | null; mapped: boolean }>> },
-): string | null {
+export function heldTaxBindingDifference(recorded: unknown, current: unknown): string | null {
   if (typeof recorded !== 'object' || recorded === null) return 'the tax binding of the parked invoice was not recorded, so its tax cannot be verified'
-  const r = recorded as { lineRateIds?: unknown; shippingRateIds?: unknown; resolved?: unknown }
-  if (!Array.isArray(r.lineRateIds) || !Array.isArray(r.shippingRateIds) || typeof r.resolved !== 'object' || r.resolved === null) return 'the recorded tax binding of the parked invoice is unreadable'
-  const sameList = (a: readonly unknown[], b: readonly unknown[]) => a.length === b.length && a.every((v, i) => v === b[i])
-  if (!sameList(r.lineRateIds, current.lineRateIds)) return 'the tax rates on the order\u2019s lines changed (for example two lines exchanged tax classes)'
-  if (!sameList(r.shippingRateIds, current.shippingRateIds)) return 'the tax rates on the order\u2019s shipping changed'
-  for (const [id, type] of Object.entries(r.resolved as Record<string, unknown>)) {
-    const now = current.resolved[id]
-    if (now === undefined || !now.mapped) return `WooCommerce tax rate ${id} can no longer be resolved to an IMS rate`
-    if (now.type !== type) return `WooCommerce tax rate ${id} now posts on ${String(now.type)}, not ${String(type)} as when the invoice was held`
+  const r = recorded as Record<string, unknown>
+  const c = current as Record<string, unknown>
+  if (!Array.isArray(r.lineRateIds) || !Array.isArray(r.shippingRateIds) || typeof r.rates !== 'object' || r.rates === null || !Array.isArray(r.lineTypes) || !Array.isArray(r.shippingTypes) || typeof r.reverseChargeSalesTaxType !== 'string') {
+    return 'the recorded tax binding of the parked invoice is unreadable'
   }
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
+  if (!same(r.lineRateIds, c.lineRateIds)) return 'the tax rates on the order\u2019s lines changed (for example two lines exchanged tax classes)'
+  if (!same(r.shippingRateIds, c.shippingRateIds)) return 'the tax rates on the order\u2019s shipping changed'
+  if (r.reverseChargeSalesTaxType !== c.reverseChargeSalesTaxType) return `the reverse-charge sales tax type setting changed from "${r.reverseChargeSalesTaxType}" to "${String(c.reverseChargeSalesTaxType)}"`
+  const nowRates = (c.rates ?? {}) as Record<string, Record<string, unknown>>
+  for (const [id, was] of Object.entries(r.rates as Record<string, Record<string, unknown>>)) {
+    const now = nowRates[id]
+    if (now === undefined) return `WooCommerce tax rate ${id} can no longer be resolved`
+    if (now.mapped !== true) return `WooCommerce tax rate ${id} can no longer be resolved to an IMS rate`
+    for (const key of new Set([...Object.keys(was), ...Object.keys(now)])) {
+      if (!same(was[key], now[key])) return `WooCommerce tax rate ${id}: ${key} changed from ${JSON.stringify(was[key])} to ${JSON.stringify(now[key])}`
+    }
+  }
+  if (!same(r.lineTypes, c.lineTypes)) return 'the tax type of a line changed'
+  if (!same(r.shippingTypes, c.shippingTypes)) return 'the tax type of the shipping changed'
   return null
 }
 
 /**
- * The tax types of an UNTREATED hold against the order now: each parked line's tax type must be the one the order's line resolves to (`expected[i]`, computed by the caller with the invoice builder's own resolution; null = not verifiable, such as a line naming
- * no tax rate), and the parked shipping type must be one the shipping's rates resolve to.
+ * The tax types of an UNTREATED hold against the order now: each parked line's tax type must be the effective type the order's line resolves to now (`expected[i]`, from the binding computed with every input, the reverse-charge setting included;
+ * null = a line that names no tax rate, nothing to verify; 'UNRESOLVED' never matches), and the parked shipping type must be one the shipping's rates resolve to.
  */
 export function heldUntreatedTaxDifference(
   parked: Record<string, unknown>,

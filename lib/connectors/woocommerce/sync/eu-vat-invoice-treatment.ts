@@ -22,7 +22,7 @@ import {
   applyEuVatTreatment, EU_VAT_TREATMENT_PAYLOAD_KEY, lineKindsOf, routeFor, type EuVatTreatmentPlan, type TreatablePayload,
 } from '@/lib/domain/accounting/eu-vat-treatment'
 import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
-import { currentWcTaxBinding, recordWcTaxBinding } from './wc-tax-binding'
+import { currentWcTaxBinding, recordWcTaxBinding, type LineTypeRule, type WcTaxBinding } from './wc-tax-binding'
 import { buildEuVatRegimeInput, readEuVatRegimeMode } from './eu-vat-facts'
 import type { MappedLine } from './field-mapping'
 import type { WcFullOrder } from './types'
@@ -33,7 +33,7 @@ export type TreatedInvoiceOutcome =
   /** Nothing was read or written: the switch is off, the connector is not Xero, or the order carries store credit. */
   | { kind: 'skipped'; why: 'switch_off' | 'store_credit' }
   /** The payload with the treatment applied, and what it did. */
-  | { kind: 'treated'; payload: Record<string, unknown>; warnings: RegimeWarning[] }
+  | { kind: 'treated'; payload: Record<string, unknown>; warnings: RegimeWarning[]; /** The order's tax binding as it was when the treatment ran (recorded in the marker). */ taxBinding: WcTaxBinding }
   /** The order cannot be invoiced as it is: the reason is the operator-facing sentence the document is stamped with. */
   | { kind: 'refused'; reason: string }
 
@@ -44,6 +44,8 @@ export async function treatImportedSalesInvoice(params: {
   mappedLines: ReadonlyArray<Pick<MappedLine, 'isFeeLine' | 'wclcFeeKind' | 'forceNoTax' | 'taxForeign'> & { externalTaxRateId?: number | null }>
   /** The accounting connector whose chart the payload's account codes came from. */
   connector: string | null
+  /** What the tax binding needs from the importer: the reverse-charge sales setting and the builder's own line rule (`resolveWcLineAccountingTaxType`). */
+  taxBindingDeps: { reverseChargeSalesTaxType: string | null | undefined; lineType: LineTypeRule }
   accounts: EuVatTreatmentAccounts
   storeCreditForeign: { gt(value: number): boolean }
   now: Date
@@ -54,6 +56,8 @@ export async function treatImportedSalesInvoice(params: {
   // A store-credit invoice is refused whole by its own fence until the store-credit lines exist; it is neither stamped nor re-typed here.
   if (params.storeCreditForeign.gt(0)) return { kind: 'skipped', why: 'store_credit' }
 
+  // Every input that decides a line's and the shipping's posted tax type, as the order resolves them now: recorded in the marker, so a held invoice can be compared with the order before it is released.
+  const taxBinding = await currentWcTaxBinding(params.wcOrder, params.mappedLines, params.taxBindingDeps)
   const mode = await readEuVatRegimeMode()
   if (mode === null) return { kind: 'refused', reason: 'the setting "eu_vat_regime_mode" holds a value that is neither adopt_plugin nor decide, so IMS cannot tell who decides the EU VAT regime' }
   const input = await buildEuVatRegimeInput(db, params.wcOrder, { ioss: params.accounts.ioss, ddp: params.accounts.ddp }, { mode })
@@ -92,7 +96,7 @@ export async function treatImportedSalesInvoice(params: {
   if (!treated.ok) return { kind: 'refused', reason: treated.reason }
   const warnings = outcome.kind === 'stamped' ? outcome.warnings : []
   // An order the treatment left exactly as it was (no scheme, no B2B, no fee) keeps its payload byte for byte.
-  if (treated.applied.route === 'none' && treated.applied.feesRecoded === 0) return { kind: 'treated', payload: params.payload, warnings }
+  if (treated.applied.route === 'none' && treated.applied.feesRecoded === 0) return { kind: 'treated', payload: params.payload, warnings, taxBinding }
   return {
     kind: 'treated',
     payload: {
@@ -103,7 +107,7 @@ export async function treatImportedSalesInvoice(params: {
         regime: treated.applied.regime,
         orderTotal: String(params.wcOrder.total ?? ''),
         // The tax rates the lines and shipping carried BEFORE the treatment re-typed them (and what each resolves to): a held invoice is compared with the order's binding before release.
-        taxBinding: recordWcTaxBinding(await currentWcTaxBinding(params.wcOrder, params.mappedLines)),
+        taxBinding: recordWcTaxBinding(taxBinding),
         schemePostingTaxType: routed.route.kind === 'scheme' ? routed.route.schemePostingTaxType : null,
         vatAccount: routed.route.kind === 'scheme' ? routed.route.vatAccount : null,
         feesRecoded: treated.applied.feesRecoded,
@@ -111,5 +115,6 @@ export async function treatImportedSalesInvoice(params: {
       },
     },
     warnings,
+    taxBinding,
   }
 }
