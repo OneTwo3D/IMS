@@ -89,7 +89,7 @@ export function heldTaxBindingDifference(recorded: unknown, current: unknown): s
   if (typeof recorded !== 'object' || recorded === null) return 'the tax binding of the parked invoice was not recorded, so its tax cannot be verified'
   const r = recorded as Record<string, unknown>
   const c = current as Record<string, unknown>
-  if (!Array.isArray(r.lineRateIds) || !Array.isArray(r.shippingRateIds) || typeof r.rates !== 'object' || r.rates === null || !Array.isArray(r.lines) || typeof r.shipping !== 'object' || r.shipping === null || typeof r.reverseChargeSalesTaxType !== 'string') {
+  if (!Array.isArray(r.lineRateIds) || !Array.isArray(r.shippingRateIds) || typeof r.rates !== 'object' || r.rates === null || !Array.isArray(r.lines) || typeof r.shipping !== 'object' || r.shipping === null || typeof r.discount !== 'object' || r.discount === null || typeof r.reverseChargeSalesTaxType !== 'string') {
     return 'the recorded tax binding of the parked invoice is unreadable'
   }
   // Key order is not part of the value: the recorded binding comes back from a jsonb column, which orders keys by length.
@@ -103,6 +103,7 @@ export function heldTaxBindingDifference(recorded: unknown, current: unknown): s
     if (!same(was, nowLines[index])) return `line ${index + 1}: the resolved tax rate and type changed from ${JSON.stringify(was)} to ${JSON.stringify(nowLines[index])}`
   }
   if (!same(r.shipping, c.shipping)) return `the shipping's resolved tax rate and type changed from ${JSON.stringify(r.shipping)} to ${JSON.stringify(c.shipping)}`
+  if (!same(r.discount, c.discount)) return `the order discount's resolved tax rate and type changed from ${JSON.stringify(r.discount)} to ${JSON.stringify(c.discount)}`
   // Then the inputs, which say why.
   if (!same(r.lineRateIds, c.lineRateIds)) return 'the tax rates on the order\u2019s lines changed (for example two lines exchanged tax classes)'
   if (!same(r.shippingRateIds, c.shippingRateIds)) return 'the tax rates on the order\u2019s shipping changed'
@@ -125,7 +126,7 @@ export function heldTaxBindingDifference(recorded: unknown, current: unknown): s
  */
 export function heldUntreatedTaxDifference(
   parked: Record<string, unknown>,
-  current: { lines: ReadonlyArray<{ type: string | null }>; shipping: { type: string | null } },
+  current: { lines: ReadonlyArray<{ type: string | null }>; shipping: { type: string | null }; discount: { type: string | null } },
 ): string | null {
   const parkedLines = Array.isArray(parked.lines) ? (parked.lines as Array<Record<string, unknown> | null>) : []
   const norm = (value: unknown): string | null => (typeof value === 'string' && value.trim() !== '' ? value.trim().toUpperCase() : null)
@@ -137,6 +138,10 @@ export function heldUntreatedTaxDifference(
   // The shipping line is sent only with a positive amount; then its parked type must be the one the order's shipping resolves to now.
   if (Number(parked.shippingAmount ?? 0) > 0 && norm(parked.shippingTaxType) !== norm(current.shipping.type)) {
     return `the parked shipping tax type is ${norm(parked.shippingTaxType) ?? '(none)'}, the order's shipping now resolves to ${norm(current.shipping.type) ?? '(none)'}`
+  }
+  // The order-level discount is sent only with a positive amount; then its parked type must be the one the order default resolves to now.
+  if (Number(parked.discountAmount ?? 0) > 0 && norm(parked.discountTaxType) !== norm(current.discount.type)) {
+    return `the parked discount tax type is ${norm(parked.discountTaxType) ?? '(none)'}, the order's discount now resolves to ${norm(current.discount.type) ?? '(none)'}`
   }
   return null
 }

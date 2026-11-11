@@ -796,7 +796,7 @@ export async function resolveWcOrderTaxResolution(wcOrder: WcFullOrder, mappedLi
     }
     return resolved
   })
-  return { wcResolvedById, orderDefaultTaxRateId, taxRateName, taxRateValue, accountingTaxType, destCountry, taxFallbackLines, lineTaxResolved, lineSources }
+  return { wcResolvedById, orderDefaultTaxRateId, orderDefaultSource: (resolvedOrderDefault.source ?? 'default') as 'mapped' | 'default', taxRateName, taxRateValue, accountingTaxType, destCountry, taxFallbackLines, lineTaxResolved, lineSources }
 }
 
 export type WcOrderTaxResolution = Awaited<ReturnType<typeof resolveWcOrderTaxResolution>>
@@ -805,6 +805,8 @@ export type WcOrderTaxResolution = Awaited<ReturnType<typeof resolveWcOrderTaxRe
 export type WcInvoiceTaxTypes = {
   lines: Array<{ rateId: string | null; source: WcLineRateSource; type: string | null }>
   shipping: { rateId: string | null; type: string | null }
+  /** The order default rate (the rate the order-level discount is posted on) and where it came from (`mapped`: a WooCommerce rate id the mapping resolves; `default`: the IMS default rate), with the effective discount tax type. */
+  discount: { rateId: string | null; source: 'mapped' | 'default'; type: string | null }
 }
 
 /**
@@ -843,7 +845,14 @@ export async function resolveWcInvoiceTaxTypes(params: {
   })
   const shippingRateNow = shippingTax.taxRateId ? ratesNow.get(shippingTax.taxRateId) : undefined
   const shippingType = shippingRateNow ? (shippingRateNow.accountingTaxType ?? undefined) : (shippingTax.taxType ?? accountingTaxType ?? undefined)
-  return { lines, shipping: { rateId: shippingTax.taxRateId ?? null, type: shippingType ?? null } }
+  // The order-level discount posts on the ORDER DEFAULT rate (as it stands now), else the default's own type: the same expression the invoice build sends as `discountTaxType`.
+  const defaultRateNow = orderDefaultTaxRateId ? ratesNow.get(orderDefaultTaxRateId) : undefined
+  const discountType = defaultRateNow ? (defaultRateNow.accountingTaxType ?? undefined) : (accountingTaxType ?? undefined)
+  return {
+    lines,
+    shipping: { rateId: shippingTax.taxRateId ?? null, type: shippingType ?? null },
+    discount: { rateId: orderDefaultTaxRateId ?? null, source: resolution.orderDefaultSource, type: discountType ?? null },
+  }
 }
 
 export function reconcileWcDocumentTax(
@@ -3669,7 +3678,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           // discount line. Sending both deducted it twice (o3d-y14).
           discountAmount: orderLevelDiscountAmount,
           discountAccountCode: settings.discountAccount || undefined,
-          discountTaxType: defaultRateNow ? (defaultRateNow.accountingTaxType ?? undefined) : (accountingTaxType ?? undefined),
+          discountTaxType: invoiceTaxTypes.discount.type ?? undefined,
           ...rateBinding(defaultRateNow?.id, 'plain', 'discount'),
           lineAmountsIncludeTax,
           _postingMode: 'submitted',

@@ -25,7 +25,7 @@ const params = (over: Record<string, unknown> = {}) => ({
   payload: { currency: 'EUR', lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: 'OUTPUT2' }] } as Record<string, unknown>,
   mappedLines: [{ isFeeLine: false, wclcFeeKind: null, forceNoTax: false, taxForeign: 0 }],
   connector: 'xero' as string | null,
-  taxBindingDeps: { reverseChargeSalesTaxType: '', invoiceTypes: { lines: [], shipping: { rateId: null, type: null } } },
+  taxBindingDeps: { reverseChargeSalesTaxType: '', invoiceTypes: { lines: [], shipping: { rateId: null, type: null }, discount: { rateId: null, source: 'mapped', type: null } } },
   accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' },
   storeCreditForeign: { gt: () => false },
   now: new Date('2026-11-10T00:00:00Z'),

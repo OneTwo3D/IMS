@@ -93,7 +93,7 @@ const binding = (over: Record<string, unknown> = {}) => ({
   lineRateIds: [10, 11, null], shippingRateIds: [10], reverseChargeSalesTaxType: '',
   rates: { '10': rate(), '11': rate({ imsRateId: 'r11', accountingTaxType: 'ZERORATEDOUTPUT', rate: '0', nowRateId: 'r11', nowAccountingTaxType: 'ZERORATEDOUTPUT' }) },
   lines: [{ rateId: 'r10', source: 'woo-rate', type: 'OUTPUT2' }, { rateId: 'r11', source: 'woo-rate', type: 'ZERORATEDOUTPUT' }, { rateId: 'rc', source: 'category', type: 'OUTPUT2' }],
-  shipping: { rateId: 'r10', type: 'OUTPUT2' }, ...over,
+  shipping: { rateId: 'r10', type: 'OUTPUT2' }, discount: { rateId: 'r10', source: 'mapped', type: 'OUTPUT2' }, ...over,
 })
 
 test('the recorded tax binding of a treated hold: unchanged matches; EVERY recorded input is compared (rate ids, mapping, type, reverse-charge flag and setting, active, rate, compound, scheme fields, replacement, components, the rate as it stands now) and so are the effective types', () => {
@@ -120,6 +120,12 @@ test('the recorded tax binding of a treated hold: unchanged matches; EVERY recor
   assert.equal(heldTaxBindingDifference(binding({ lines: [{ rateId: null, source: 'category', type: null }] , lineRateIds: [null]}), binding({ lines: [{ rateId: null, source: 'category', type: null }], lineRateIds: [null] })), null, 'a line that resolves to no rate both times matches exactly')
   assert.match(heldTaxBindingDifference(binding(), binding({ lines: binding().lines.slice(0, 2) })) ?? '', /now has 2 lines, the hold 3/)
   assert.match(heldTaxBindingDifference(binding(), binding({ shipping: { rateId: 'r10', type: 'ZERORATEDOUTPUT' } })) ?? '', /shipping's resolved tax rate and type changed/)
+  // The order-level discount posts on the order default rate: its rate, source and effective type are outputs too.
+  assert.match(heldTaxBindingDifference(binding(), binding({ discount: { rateId: 'r10', source: 'mapped', type: 'OUTPUT3' } })) ?? '', /order discount's resolved tax rate and type changed/)
+  assert.match(heldTaxBindingDifference(binding(), binding({ discount: { rateId: 'r99', source: 'mapped', type: 'OUTPUT2' } })) ?? '', /order discount's resolved/)
+  assert.match(heldTaxBindingDifference(binding(), binding({ discount: { rateId: 'r10', source: 'default', type: 'OUTPUT2' } })) ?? '', /order discount's resolved/)
+  const noDiscount = binding(); delete (noDiscount as Record<string, unknown>).discount
+  assert.match(heldTaxBindingDifference(noDiscount, binding()) ?? '', /unreadable/, 'a marker that recorded no discount binding cannot be verified')
   const unmapped = binding(); unmapped.rates['10'] = rate({ mapped: false })
   assert.match(heldTaxBindingDifference(binding(), unmapped) ?? '', /can no longer be resolved to an IMS rate/)
   const gone = binding(); delete (gone.rates as Record<string, unknown>)['10']
@@ -129,12 +135,14 @@ test('the recorded tax binding of a treated hold: unchanged matches; EVERY recor
 })
 
 test('an untreated hold: each parked line type must be EXACTLY the effective type the builder resolves now, with no skip for null; the shipping type likewise', () => {
-  const parked = { lines: [{ taxType: 'OUTPUT2' }, { taxType: 'ZERORATEDOUTPUT' }, {}], shippingAmount: 10, shippingTaxType: 'OUTPUT2' }
-  const now = (types: Array<string | null>, shipping: string | null = 'OUTPUT2') => ({ lines: types.map((type) => ({ type })), shipping: { type: shipping } })
+  const parked = { lines: [{ taxType: 'OUTPUT2' }, { taxType: 'ZERORATEDOUTPUT' }, {}], shippingAmount: 10, shippingTaxType: 'OUTPUT2', discountAmount: 5, discountTaxType: 'OUTPUT2' }
+  const now = (types: Array<string | null>, shipping: string | null = 'OUTPUT2', discount: string | null = 'OUTPUT2') => ({ lines: types.map((type) => ({ type })), shipping: { type: shipping }, discount: { type: discount } })
   assert.equal(heldUntreatedTaxDifference(parked, now(['OUTPUT2', 'ZERORATEDOUTPUT', null])), null, 'a line parked with no type that still resolves to none matches')
   assert.match(heldUntreatedTaxDifference(parked, now(['ZERORATEDOUTPUT', 'ZERORATEDOUTPUT', null])) ?? '', /line 1: the parked tax type is OUTPUT2, the order's line now resolves to ZERORATEDOUTPUT/)
   assert.match(heldUntreatedTaxDifference(parked, now(['OUTPUT2', 'ZERORATEDOUTPUT', 'OUTPUT2'])) ?? '', /line 3: the parked tax type is \(none\), the order's line now resolves to OUTPUT2/)
   assert.match(heldUntreatedTaxDifference(parked, now(['OUTPUT2', null, null])) ?? '', /line 2: the parked tax type is ZERORATEDOUTPUT, the order's line now resolves to \(none\)/)
   assert.match(heldUntreatedTaxDifference(parked, now(['OUTPUT2', 'ZERORATEDOUTPUT', null], 'ZERORATEDOUTPUT')) ?? '', /shipping tax type is OUTPUT2, the order's shipping now resolves to ZERORATEDOUTPUT/)
+  assert.match(heldUntreatedTaxDifference(parked, now(['OUTPUT2', 'ZERORATEDOUTPUT', null], 'OUTPUT2', 'OUTPUT3')) ?? '', /discount tax type is OUTPUT2, the order's discount now resolves to OUTPUT3/)
+  assert.equal(heldUntreatedTaxDifference({ ...parked, discountAmount: 0 }, now(['OUTPUT2', 'ZERORATEDOUTPUT', null], 'OUTPUT2', 'OUTPUT3')), null, 'the discount is only sent with a positive amount')
   assert.equal(heldUntreatedTaxDifference({ ...parked, shippingAmount: 0 }, now(['OUTPUT2', 'ZERORATEDOUTPUT', null], 'ZERORATEDOUTPUT')), null, 'shipping is only sent with a positive amount')
 })

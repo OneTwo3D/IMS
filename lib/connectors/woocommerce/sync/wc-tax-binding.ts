@@ -39,6 +39,7 @@ export type WcRateInputs = {
 export type InvoiceTaxTypesInput = {
   lines: Array<{ rateId: string | null; source: string; type: string | null }>
   shipping: { rateId: string | null; type: string | null }
+  discount: { rateId: string | null; source: string; type: string | null }
 }
 
 export type WcTaxBinding = {
@@ -50,6 +51,8 @@ export type WcTaxBinding = {
   lines: Array<{ rateId: string | null; source: string; type: string | null }>
   /** THE COMPARED OUTPUT for the shipping. */
   shipping: { rateId: string | null; type: string | null }
+  /** THE COMPARED OUTPUT for the order-level discount: the order default rate it posts on, where that came from and the effective type. */
+  discount: { rateId: string | null; source: string; type: string | null }
 }
 
 const UNMAPPED: WcRateInputs = {
@@ -90,6 +93,7 @@ export async function currentWcTaxBinding(
     lineRateIds, shippingRateIds, rates, reverseChargeSalesTaxType: (deps.reverseChargeSalesTaxType ?? '').trim(),
     lines: deps.invoiceTypes.lines.map((l) => ({ rateId: l.rateId, source: l.source, type: l.type })),
     shipping: { rateId: deps.invoiceTypes.shipping.rateId, type: deps.invoiceTypes.shipping.type },
+    discount: { rateId: deps.invoiceTypes.discount.rateId, source: deps.invoiceTypes.discount.source, type: deps.invoiceTypes.discount.type },
   }
 }
 

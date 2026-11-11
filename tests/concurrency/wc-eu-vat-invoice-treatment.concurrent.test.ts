@@ -337,7 +337,7 @@ test('[eu vat] a stamped IOSS order whose facts now decide DDP is refused, not t
   const invoice = (await db.accountingSyncLog.findFirstOrThrow({ where: { type: 'SALES_INVOICE', referenceId: orderId } })).payload as unknown as Record<string, unknown>
   const base = { orderId, payload: { currency: 'GBP', lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: 'DE_CHARGED' }, { description: 'EU Customs Fee', quantity: 1, unitAmount: 4, accountCode: '200', taxType: 'DE_CHARGED' }], shippingAmount: 10, shippingAccountCode: '260', shippingTaxType: 'DE_CHARGED' } as Record<string, unknown>,
     mappedLines: [{ isFeeLine: false, wclcFeeKind: null, forceNoTax: false, taxForeign: 19 }, { isFeeLine: true, wclcFeeKind: 'uhf' as const, forceNoTax: false, taxForeign: 0.76 }],
-    connector: 'xero', taxBindingDeps: { reverseChargeSalesTaxType: '', invoiceTypes: { lines: [{ rateId: null, source: 'woo-rate', type: 'DE_CHARGED' }, { rateId: null, source: 'woo-rate', type: 'DE_CHARGED' }], shipping: { rateId: null, type: 'DE_CHARGED' } } }, accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' }, storeCreditForeign: { gt: () => false }, now: new Date() }
+    connector: 'xero', taxBindingDeps: { reverseChargeSalesTaxType: '', invoiceTypes: { lines: [{ rateId: null, source: 'woo-rate', type: 'DE_CHARGED' }, { rateId: null, source: 'woo-rate', type: 'DE_CHARGED' }], shipping: { rateId: null, type: 'DE_CHARGED' }, discount: { rateId: null, source: 'mapped', type: 'DE_CHARGED' } } }, accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' }, storeCreditForeign: { gt: () => false }, now: new Date() }
   void invoice
   // The same facts: still IOSS, treated.
   const same = await treatImportedSalesInvoice({ ...base, wcOrder: payload(externalId, wcRateId, [num, ...PLUGIN('821')]) as never })
@@ -936,4 +936,78 @@ test('[eu vat] the same numbered refusal with the cause NOT fixed stays held wit
   assert.equal(rows.length, 0)
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /treatment refused it: .*plugin_account_missing/)
+})
+
+// ---- the order-level discount posts on the ORDER DEFAULT rate; its mapping is part of the compared outputs ----
+async function discountHold(t: test.TestContext, change: null | ((db: Awaited<ReturnType<typeof loadDb>>, defaultRateId: string) => Promise<void>)) {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = true
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const wcLine = 900_000 + Math.floor(Math.random() * 40_000)
+  const wcDefault = 940_000 + Math.floor(Math.random() * 40_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const created: string[] = []
+  const warehouse = await db.warehouse.create({ data: { code: `EDS-${randomUUID().slice(0, 8)}`, name: 'Discount hold test warehouse', syncToStore: true, availableForSale: true } })
+  const mk = async (name: string, rate: number, type: string, category: 'STANDARD' | 'ZERO', wc: number) => {
+    const row = await db.taxRate.create({ data: { name: `${name} ${randomUUID()}`, rate, usedFor: 'SALES', accountingTaxType: type, countryCode: 'gb', taxCategory: category, active: true } })
+    created.push(row.id)
+    await db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: String(wc), externalName: name, externalCountry: 'GB', externalRatePct: rate * 100, taxRateId: row.id } })
+    return row
+  }
+  // The line and the shipping are zero-rated on their own rate; the order also names a "Standard" rate (the order default, by name) that only the order-level discount posts on.
+  const lineRate = await mk('GB Zero', 0, 'ZERORATEDOUTPUT', 'ZERO', wcLine)
+  const defaultRate = await mk('GB Standard', 0.2, 'OUTPUT2', 'STANDARD', wcDefault)
+  void lineRate
+  t.after(async () => {
+    switchOn = false
+    const orderId = (await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } }))?.orderId
+    if (orderId) {
+      await db.accountingSyncLog.deleteMany({ where: { referenceId: orderId } })
+      await db.activityLog.deleteMany({ where: { entityId: orderId } })
+      await db.payment.deleteMany({ where: { orderId } })
+      await db.salesOrderLine.deleteMany({ where: { orderId } })
+      await db.salesOrder.deleteMany({ where: { id: orderId } })
+    }
+    await db.shoppingSyncLog.deleteMany({ where: { externalId: String(externalId) } })
+    await db.shoppingOrderLink.deleteMany({ where: { connector: 'woocommerce', externalOrderId: String(externalId) } })
+    await db.shoppingTaxRateMapping.deleteMany({ where: { taxRateId: { in: created } } })
+    await db.warehouse.deleteMany({ where: { id: warehouse.id } })
+    await db.taxRate.deleteMany({ where: { id: { in: created } } })
+  })
+  const order = (meta: Meta) => ({
+    ...payload(externalId, wcLine, meta), billing: GB_ADDRESS, shipping: GB_ADDRESS,
+    line_items: [{ id: 1, name: 'Widget', product_id: 1, variation_id: 0, quantity: 1, tax_class: '', subtotal: '100.00', subtotal_tax: '0.00', total: '100.00', total_tax: '0.00', sku: `NOSKU-${externalId}`, price: 100, taxes: [{ id: wcLine, total: '0.00', subtotal: '0.00' }], meta_data: [] }],
+    fee_lines: [], shipping_lines: [{ id: 51, method_title: 'Post', method_id: 'flat_rate', total: '10.00', total_tax: '0.00', taxes: [{ id: wcLine, total: '0.00' }], meta_data: [] }], shipping_total: '10.00', shipping_tax: '0.00',
+    coupon_lines: [{ id: 41, code: 'SAVE5', discount: '5.00', discount_tax: '0.00', meta_data: [{ id: 1, key: 'coupon_data', value: JSON.stringify({ discount_type: 'fixed_cart' }) }] }],
+    tax_lines: [{ id: 21, rate_code: 'GB-0', rate_id: wcLine, label: 'Zero', compound: false, tax_total: '0.00', shipping_tax_total: '0.00', meta_data: [] }, { id: 22, rate_code: 'GB-S', rate_id: wcDefault, label: 'Standard', compound: false, tax_total: '0.00', shipping_tax_total: '0.00', meta_data: [] }],
+    total: '105.00', total_tax: '0.00', discount_total: '5.00', discount_tax: '0.00',
+  })
+  const extra: Meta = [{ id: 2, key: 'is_vat_exempt', value: 'no' }]
+  const first = await importWcOrder(order(extra) as never)
+  assert.equal(first.success, true, `the parked import succeeded: ${JSON.stringify(first)}`)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  const parked = (held.payload as unknown as { accountingPayload: Invoice & { discountAmount?: number; discountTaxType?: string } }).accountingPayload
+  assert.equal(parked.discountAmount, 5, 'the order carries a positive order-level discount')
+  assert.equal(parked.discountTaxType, 'OUTPUT2', 'posted on the order default rate')
+  const binding = (parked._euVatTreatment as { taxBinding: { discount: { rateId: string | null; source: string; type: string | null } } }).taxBinding
+  assert.deepEqual([binding.discount.rateId === defaultRate.id, binding.discount.source, binding.discount.type], [true, 'mapped', 'OUTPUT2'], 'the order default rate, its source and the discount type were recorded')
+  if (change) await change(db, defaultRate.id)
+  await importWcOrder(order([{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...extra]) as never)
+  return { after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }), rows: await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId } }) }
+}
+
+test('[eu vat] CONTROL: an unchanged hold with a positive order-level discount is released', { skip }, async (t) => {
+  const { rows } = await discountHold(t, null)
+  assert.equal(rows.length, 1, 'released')
+  assert.equal((rows[0]!.payload as unknown as { discountTaxType?: string }).discountTaxType, 'OUTPUT2')
+})
+
+test('[eu vat] a hold with a positive discount where ONLY the order default rate\'s mapping changes (the lines are untouched) is refused', { skip }, async (t) => {
+  const { after, rows } = await discountHold(t, async (db, defaultRateId) => { await db.taxRate.update({ where: { id: defaultRateId }, data: { accountingTaxType: 'OUTPUT3' } }) })
+  assert.equal(rows.length, 0, 'nothing was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /the order changed after it was held \(the order discount's resolved tax rate and type changed from .*OUTPUT2.* to .*OUTPUT3.*\) and needs its invoice rebuilt/)
 })
