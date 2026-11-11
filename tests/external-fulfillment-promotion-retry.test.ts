@@ -27,6 +27,11 @@ const state = {
   /** The status the dispatch transaction finds UNDER THE LOCK; null means it is promotable. */
   lockedStatus: null as string | null,
   notifyOk: true,
+  /** Which admins the bell reaches (ids absent from the list fail to persist). */
+  admins: ['admin-1'] as string[],
+  failingAdmins: [] as string[],
+  allocationCount: 1,
+  autoAllocations: 0,
 }
 
 mock.module('@/lib/activity-log', {
@@ -39,13 +44,13 @@ mock.module('@/lib/db', {
       salesOrder: {
         findUnique: async () => ({ id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1', status: state.orderStatus }),
       },
-      user: { findMany: async () => [{ id: 'admin-1' }] },
+      user: { findMany: async () => state.admins.map((id) => ({ id })) },
       activityLog: { findFirst: async ({ where }: { where: Row }) => state.persistedActivity.find((row) => row.action === where.action) ?? null },
       salesOrderLine: { findMany: async () => [] },
       shipmentLine: { findMany: async () => [] },
       salesOrderRefundLine: { findMany: async () => [] },
       stockMovement: { findMany: async () => [] },
-      orderAllocation: { count: async () => 1 },
+      orderAllocation: { count: async () => state.allocationCount },
       // Every shipment is already SHIPPED, so none is `not: SHIPPED`.
       shipment: { count: async () => state.totalShipments, findMany: async () => state.openShipments },
     },
@@ -54,7 +59,7 @@ mock.module('@/lib/db', {
 
 mock.module('@/app/actions/allocation', {
   namedExports: {
-    autoAllocateOrder: async () => ({ success: true, allocationCount: 1, unallocatedQty: 0 }),
+    autoAllocateOrder: async () => { state.autoAllocations += 1; return { success: true, allocationCount: 1, unallocatedQty: 0 } },
     confirmAllocations: async () => ({ success: true }),
     updateShipmentStatus: async (_id: string, target: string, _extra: unknown, options: Row | undefined) => {
       state.transitions.push({ target, options })
@@ -66,7 +71,7 @@ mock.module('@/app/actions/allocation', {
 mock.module('@/lib/notifications', {
   namedExports: {
     notifyPersisted: async (entry: Row) => {
-      if (!state.notifyOk) return false
+      if (!state.notifyOk || state.failingAdmins.includes(String(entry.userId))) return false
       state.notifications.push(entry)
       return true
     },
@@ -94,6 +99,10 @@ function reset() {
   state.persistedActivity = []
   state.lockedStatus = null
   state.notifyOk = true
+  state.admins = ['admin-1']
+  state.failingAdmins = []
+  state.allocationCount = 1
+  state.autoAllocations = 0
 }
 
 async function apply(extra: Row = {}) {
@@ -275,4 +284,41 @@ test('SHP-H1: a failed bell notice leaves no marker, so the next tick raises the
   assert.deepEqual(second, { success: true, despatchedWhileNotReady: 'ON_HOLD' })
   assert.equal(state.notifications.length, 1)
   assert.equal(state.persistedActivity.some((row) => row.action === 'external_despatch_recorded_order_not_ready'), true)
+})
+
+test('SHP-H1: the review marker is written only when EVERY admin notice persisted', async () => {
+  reset()
+  state.orderStatus = 'ON_HOLD'
+  state.openShipments = [{ id: 'shp-1', status: 'PACKED' }]
+  state.lockedStatus = 'ON_HOLD'
+  state.admins = ['admin-1', 'admin-2']
+  state.failingAdmins = ['admin-2']
+
+  await apply()
+
+  assert.equal(state.notifications.length, 1, 'one notice persisted, one did not')
+  assert.equal(state.persistedActivity.some((row) => row.action === 'external_despatch_recorded_order_not_ready'), false, 'so the retry must raise it again')
+})
+
+test('SHP-H1: a held order with no allocation row is not auto-allocated (that would lift the hold)', async () => {
+  reset()
+  state.orderStatus = 'ON_HOLD'
+  state.allocationCount = 0
+  state.openShipments = [{ id: 'shp-1', status: 'PACKED' }]
+  state.lockedStatus = 'ON_HOLD'
+
+  await apply()
+
+  assert.equal(state.autoAllocations, 0)
+  assert.equal(state.transitions.length, 1)
+})
+
+test('SHP-H1: a despatch the storefront already completed enqueues no completion even for a WMS source', async () => {
+  reset()
+  state.orderStatus = 'PROCESSING'
+  state.openShipments = [{ id: 'shp-1', status: 'PACKED' }]
+
+  await apply({ storefrontAlreadyCompleted: true })
+
+  assert.equal(state.transitions[0].options?.storefrontCompletion, false)
 })
