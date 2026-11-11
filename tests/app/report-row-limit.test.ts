@@ -112,7 +112,7 @@ test('a not-computed inventory-costing report (COGS, turnover) shows dashes in f
       title: 'COGS', description: 'd', reportKey: 'cogs', filters: {},
       filterOptions: { warehouses: [], categories: [], suppliers: [], productTypes: [] } as never,
       pageInfo: { page: 1, pageSize: 100, totalRows: 0, totalPages: 1, hasNextPage: false, hasPreviousPage: false },
-      rows: [], rowKey: (r) => r.key, dateMode: 'range', notices,
+      rows: [], rowKey: (r) => r.key, dateMode: 'period', notices,
       columns: [{ key: 'v', label: 'Value', align: 'right', render: () => null, footer: '0.00' }],
       summary: [],
     }),
