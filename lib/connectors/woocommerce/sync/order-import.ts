@@ -63,6 +63,7 @@ import { buildEuVatRegimeInput, readEuVatRegimeMode } from './eu-vat-facts'
 import { resolveEuVatRegime } from '@/lib/domain/accounting/eu-vat-regime'
 import { readEuVatRegimeStamp } from '@/lib/domain/accounting/eu-vat-regime-stamp'
 import { EU_VAT_TREATMENT_PAYLOAD_KEY, routeFor } from '@/lib/domain/accounting/eu-vat-treatment'
+import { invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { directCreateMarker, isFulfilmentStatus, resolveDirectCreateMarker } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
@@ -1858,6 +1859,44 @@ async function markHeldInvoiceOrderChanged(orderId: string, rowId: string, what:
  * A difference or a refusal leaves the hold PENDING with the reason and the release is not attempted. A hold whose order changed is marked (applied:false, reason order_changed), so neither the sweep nor a later re-import releases or re-treats it: an invoice built from an order that has changed
  * has to be rebuilt, and there is no automatic rebuild of a held invoice. Store-credit orders are left alone. The held-release sweep has no WooCommerce order in hand, so it does not compare; it only refuses holds that are not marked applied:true.
  */
+/**
+ * An untreated hold's document total, computed from the payload alone (`invoiceReconciliationProblem`, lib/domain/sales/sales-invoice-reconciliation.ts), against the order's total now;
+ * and the payment the payload would register against the same total. A fee on the no-tax kind and a reverse-charge line are priced at 0, every other line, the shipping and the discount at the
+ * rate of the order's own resolution now (their tax types were already compared with what is parked). Null when the payload still totals to the order. A payload the poster refuses anyway
+ * (`_taxUnreconciled`) is not asked: it never posts and the treatment refuses it itself.
+ */
+async function heldUntreatedTotalDifference(payload: Record<string, unknown>, wcOrder: WcFullOrder, mappedLines: Awaited<ReturnType<typeof mapWcLineItems>>, currency: string): Promise<string | null> {
+  if (payload._taxUnreconciled !== undefined) return null
+  const lines = payload.lines
+  if (!Array.isArray(lines) || lines.length !== mappedLines.length) return 'the parked invoice\u2019s lines can no longer be matched to the order'
+  const orderTotal = Number(wcOrder.total)
+  if (!Number.isFinite(orderTotal)) return 'the order total is missing or unreadable'
+  const resolution = await resolveWcOrderTaxResolution(wcOrder, mappedLines)
+  const shippingTax = resolveWcShippingTaxRate({
+    shippingLines: wcOrder.shipping_lines, shippingNetForeign: mapWcShipping(wcOrder).shippingForeign, rateById: resolution.wcResolvedById,
+    orderDefault: { accountingTaxType: resolution.accountingTaxType, taxRateValue: resolution.taxRateValue, taxRateId: resolution.orderDefaultTaxRateId }, currency,
+  })
+  const num = (v: unknown): number => (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && Number.isFinite(Number(v)) ? Number(v) : Number.NaN
+  const reconcilable = lines.map((raw, idx) => {
+    const l = raw as Record<string, unknown>
+    const rate = l.noTaxKind === 'fee-no-tax' || resolution.lineTaxResolved[idx]?.reverseCharge ? 0 : Number(resolution.lineTaxResolved[idx]?.taxRateValue ?? 0)
+    return { quantity: num(l.quantity), unitAmount: num(l.unitAmount), discountAmount: l.discountAmount === undefined || l.discountAmount === null ? 0 : num(l.discountAmount), rate, storedTax: 0 }
+  })
+  const shippingAmount = payload.shippingAmount === undefined || payload.shippingAmount === null ? 0 : num(payload.shippingAmount)
+  const discountAmount = payload.discountAmount === undefined || payload.discountAmount === null ? 0 : num(payload.discountAmount)
+  if ([...reconcilable.flatMap((l) => [l.quantity, l.unitAmount, l.discountAmount]), shippingAmount, discountAmount].some((n) => Number.isNaN(n))) return 'the parked invoice carries a figure that cannot be read'
+  const problem = invoiceReconciliationProblem({
+    lineAmountsIncludeTax: payload.lineAmountsIncludeTax === true, headerRate: Number(resolution.taxRateValue ?? 0), lines: reconcilable,
+    shippingRate: shippingTax.resolved ? Number(shippingTax.rateValue) : null, discountRate: Number(resolution.taxRateValue ?? 0), shippingAmount, discountAmount,
+  }, orderTotal)
+  if (problem !== null) return `the parked invoice totals ${problem.expected.toFixed(2)} and the order total is ${orderTotal.toFixed(2)} now`
+  if (payload._paymentAmount !== undefined && payload._paymentAmount !== null) {
+    const paid = num(payload._paymentAmount)
+    if (Number.isNaN(paid) || Math.abs(paid - orderTotal) > 0.005 + 1e-9) return `the payment the parked invoice would register (${String(payload._paymentAmount)}) is not the order total (${orderTotal.toFixed(2)}) now`
+  }
+  return null
+}
+
 async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder): Promise<{ outcome: 'not-needed' | 'treated' | 'refused'; recheck?: HeldRecheck }> {
   const row = await db.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
   if (!row || !isHeldSalesInvoicePayload(row.payload)) return { outcome: 'not-needed' }
@@ -1965,6 +2004,10 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   // Each parked line's tax type must be the effective type the order's line resolves to now, with every input (the reverse-charge setting included); a rate that cannot be resolved never matches.
   const taxDifference = heldUntreatedTaxDifference(held.accountingPayload, currentInvoiceTypes)
   if (taxDifference !== null) return await refuseChanged(taxDifference)
+  // The parked payload must still PRODUCE the order's total: its document total, computed from its own lines, tax codes, shipping and discount by the invoice-to-order reconciliation (the allowance the importer uses), is compared with the order's total now, and the payment it would register with the same total.
+  // Net lines and tax types can stand while WooCommerce changes only the tax charged and the total; the treatment must never stamp a payload with a total it does not produce.
+  const totalDifference = await heldUntreatedTotalDifference(held.accountingPayload, wcOrder, mappedLines, currency)
+  if (totalDifference !== null) return await refuseChanged(totalDifference)
   const { [EU_VAT_TREATMENT_PAYLOAD_KEY]: _marker, ...untreated } = held.accountingPayload
   void _marker
   const outcome = await treatImportedSalesInvoice({

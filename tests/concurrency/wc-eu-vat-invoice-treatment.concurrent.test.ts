@@ -1011,3 +1011,45 @@ test('[eu vat] a hold with a positive discount where ONLY the order default rate
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /the order changed after it was held \(the order discount's resolved tax rate and type changed from .*OUTPUT2.* to .*OUTPUT3.*\) and needs its invoice rebuilt/)
 })
+
+// A LEGACY hold: parked with the switch OFF (no treatment marker), then the switch comes on and the order is delivered again.
+async function legacyDomesticHold(t: test.TestContext, changeTotal: boolean) {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = false
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seedDomestic(db, wcRateId)
+  t.after(async () => { switchOn = false; await cleanup(db, externalId, ctx) })
+  const extra: Meta = [{ id: 2, key: 'is_vat_exempt', value: 'no' }]
+  assert.equal((await importWcOrder(domesticPayload(externalId, wcRateId, extra) as never)).success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  const parked = (held.payload as unknown as { accountingPayload: Invoice }).accountingPayload
+  assert.equal('_euVatTreatment' in parked, false, 'parked with no marker')
+  switchOn = true
+  const again = domesticPayload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...extra])
+  // Only the tax charged and the order total move: the net lines, the shipping and every tax type are as they were.
+  if (changeTotal) { again.shipping_lines[0]!.total_tax = '3.00'; again.tax_lines[0]!.shipping_tax_total = '3.00'; again.total = '133.00'; again.total_tax = '23.00' }
+  await importWcOrder(again as never)
+  return { after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }), rows: await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId } }) }
+}
+
+test('[eu vat] CONTROL: an unchanged LEGACY domestic hold is treated and released (its total is what the order says)', { skip }, async (t) => {
+  const { after, rows } = await legacyDomesticHold(t, false)
+  assert.equal(rows.length, 1, 'released')
+  assert.equal(after.status, 'SYNCED')
+  const marker = (rows[0]!.payload as unknown as Invoice)._euVatTreatment as Record<string, unknown>
+  assert.deepEqual([marker.applied, marker.orderTotal], [true, '132.00'])
+})
+
+test('[eu vat] a LEGACY hold where ONLY the tax charged and the order total change (net lines and types unchanged) is refused, never stamped with the new total', { skip }, async (t) => {
+  const { after, rows } = await legacyDomesticHold(t, true)
+  assert.equal(rows.length, 0, 'nothing was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /the order changed after it was held \(the parked invoice totals 132\.00 and the order total is 133\.00 now\)/)
+  const parked = (after.payload as unknown as { accountingPayload: Invoice }).accountingPayload
+  assert.notEqual((parked._euVatTreatment as { applied?: boolean } | undefined)?.applied, true, 'not stamped applied')
+})
