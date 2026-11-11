@@ -1,9 +1,12 @@
 'use client'
 
-import { useState, useTransition, useEffect } from 'react'
+import { useState, useEffect } from 'react'
 import Link from 'next/link'
-import type { SoRow, SoStatus } from '@/app/actions/sales'
-import { getSalesOrders } from '@/app/actions/sales'
+import { useRouter, usePathname, useSearchParams } from 'next/navigation'
+import type { SoListResult, SoRow, SoStatus } from '@/app/actions/sales'
+import { PaginationBar } from '@/components/ui/pagination-bar'
+import { ArchivedBadge, OrderListSummary } from '@/components/lists/order-list-summary'
+import { orderListHref, shouldResyncSearchInput, withSearchQuery, type OrderListUrlState } from '@/lib/domain/lists/order-list-url'
 import { WmsOrderStatusChip } from '@/components/sales/wms-order-status-chip'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -152,14 +155,12 @@ function stockStatus(status: SoStatus): string {
 // ---------------------------------------------------------------------------
 
 type Props = {
-  initialOrders: SoRow[]
+  list: SoListResult
   currencySymbols?: Record<string, string>
   currencyPositions?: Record<string, 'PREFIX' | 'POSTFIX'>
 }
 
-const COMPLETED_STATUSES: SoStatus[] = ['COMPLETED', 'DELIVERED']
-
-export function SoListClient({ initialOrders, currencySymbols = {}, currencyPositions = {} }: Props) {
+export function SoListClient({ list, currencySymbols = {}, currencyPositions = {} }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const fmtDate = (iso: string | null) => (iso ? formatDateTime(iso, { day: 'numeric', month: 'short', year: 'numeric' }) : '—')
@@ -167,10 +168,49 @@ export function SoListClient({ initialOrders, currencySymbols = {}, currencyPosi
   const symPos = (code: string) => currencyPositions[code] ?? (code === baseCurrency.code ? baseCurrency.symbolPosition : undefined)
   const fmtForeign = (value: number, code: string) => formatMoney(value, sym(code), symPos(code))
   const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
-  const [search, setSearch] = useState('')
-  const [statusFilters, setStatusFilters] = useState<Set<SoStatus>>(new Set())
-  const [completedOrders, setCompletedOrders] = useState<SoRow[] | null>(null)
-  const [fetching, startFetch] = useTransition()
+  // Search, status filter and page live in the URL and run in the database (all orders, not the newest 200).
+  const router = useRouter()
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  const urlState: OrderListUrlState = {
+    q: searchParams.get('q') ?? '',
+    statuses: (searchParams.get('status') ?? '').split(',').filter(Boolean),
+    page: list.page,
+    showCompleted: searchParams.get('completed') === '1',
+    includeArchived: searchParams.get('archived') === '1',
+    invoiced: false,
+    returned: false,
+  }
+  const statusFilters = new Set(urlState.statuses as SoStatus[])
+  const [search, setSearch] = useState(urlState.q)
+  const [lastPushedQ, setLastPushedQ] = useState(urlState.q)
+  const [seenUrlQ, setSeenUrlQ] = useState(urlState.q)
+
+  function navigate(patch: Partial<OrderListUrlState>) {
+    router.push(orderListHref(pathname, { ...urlState, page: 1, ...patch }))
+  }
+
+  // Back/Forward (or a link) changed the address's q: show it in the box. Done during render (not in
+  // an effect) and only for a change we did not make ourselves, so typing is never overwritten.
+  if (urlState.q !== seenUrlQ) {
+    setSeenUrlQ(urlState.q)
+    if (shouldResyncSearchInput(urlState.q, lastPushedQ)) {
+      setLastPushedQ(urlState.q)
+      setSearch(urlState.q)
+    }
+  }
+
+  // Debounced: push the search to the address so the server queries every order. The address is built
+  // from the live query string when the timer fires, so a filter changed meanwhile is kept.
+  useEffect(() => {
+    const q = search.trim()
+    if (q === lastPushedQ) return
+    const t = setTimeout(() => {
+      setLastPushedQ(q)
+      router.push(withSearchQuery(pathname, window.location.search, q))
+    }, 400)
+    return () => clearTimeout(t)
+  }, [search, lastPushedQ, router, pathname])
 
   // Column visibility
   const [visibleCols, setVisibleCols] = useState<ColKey[]>(loadCols)
@@ -204,37 +244,22 @@ export function SoListClient({ initialOrders, currencySymbols = {}, currencyPosi
   }
 
   function toggleStatus(s: SoStatus) {
-    setStatusFilters((prev) => {
-      const n = new Set(prev)
-      if (n.has(s)) n.delete(s); else n.add(s)
-      return n
-    })
-    // Lazy-fetch completed/delivered on first request
-    if (COMPLETED_STATUSES.includes(s) && completedOrders === null) {
-      startFetch(async () => {
-        const all = await getSalesOrders(200, { includeCompleted: true })
-        setCompletedOrders(all.filter((o) => COMPLETED_STATUSES.includes(o.status as SoStatus)))
-      })
-    }
+    const next = new Set(statusFilters)
+    if (next.has(s)) next.delete(s); else next.add(s)
+    navigate({ statuses: [...next] })
   }
 
-  const needsCompleted = COMPLETED_STATUSES.some((s) => statusFilters.has(s))
-  const orders = needsCompleted && statusFilters.size > 0
-    ? [...initialOrders, ...(completedOrders ?? [])].filter((o, i, arr) => arr.findIndex((x) => x.id === o.id) === i)
-    : initialOrders
-
-  const filtered = orders.filter((so) => {
-    if (statusFilters.size > 0 && !statusFilters.has(so.status)) return false
-    if (search) {
-      const q = search.toLowerCase()
-      return (
-        so.displayOrderNumber.toLowerCase().includes(q) ||
-        (so.customerName ?? '').toLowerCase().includes(q) ||
-        (so.customerEmail ?? '').toLowerCase().includes(q)
-      )
-    }
-    return true
-  })
+  const filtered = list.rows
+  const searching = urlState.q.trim().length > 0
+  const hideNotices: string[] = []
+  if (list.queryTooShort) hideNotices.push('Type at least 3 characters to search. Shorter text only matches an exact order number.')
+  if (list.hides.completed && list.hiddenCompletedCount > 0) {
+    hideNotices.push(`${list.hiddenCompletedCount.toLocaleString('en-GB')} completed and delivered orders are hidden. Untick "Hide completed" to see them. Searching always includes them.`)
+  }
+  if (list.hides.archived && list.hiddenArchivedCount > 0) {
+    hideNotices.push(`${list.hiddenArchivedCount.toLocaleString('en-GB')} archived orders are hidden. Tick "Include archived" to see them. Searching always includes them.`)
+  }
+  const buildHref = (p: number) => orderListHref(pathname, { ...urlState, page: p })
 
   // ---------------------------------------------------------------------------
   // Cell renderers
@@ -248,6 +273,7 @@ export function SoListClient({ initialOrders, currencySymbols = {}, currencyPosi
             <Link href={`/sales/${so.id}`} className="hover:underline">
               {so.displayOrderNumber}
             </Link>
+            {so.archived && <ArchivedBadge />}
           </TableCell>
         )
       case 'customer':
@@ -375,7 +401,8 @@ export function SoListClient({ initialOrders, currencySymbols = {}, currencyPosi
         <div className="relative flex-1 min-w-48 max-w-xs">
           <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
           <Input
-            placeholder="Search order, customer…"
+            placeholder="Search order, customer, SKU, tracking…"
+            aria-label="Search sales orders"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="pl-8 h-8 text-sm"
@@ -394,15 +421,40 @@ export function SoListClient({ initialOrders, currencySymbols = {}, currencyPosi
             ))}
           </DropdownMenuContent>
         </DropdownMenu>
+        <label
+          className="flex items-center gap-1.5 text-xs"
+          title={searching || statusFilters.size > 0 ? 'A search or status pick always includes completed orders' : undefined}
+        >
+          <input
+            type="checkbox"
+            className="accent-primary h-3.5 w-3.5"
+            checked={!urlState.showCompleted && !searching && statusFilters.size === 0}
+            disabled={searching || statusFilters.size > 0}
+            onChange={(e) => navigate({ showCompleted: !e.target.checked })}
+          />
+          Hide completed
+        </label>
+        <label className="flex items-center gap-1.5 text-xs" title={searching ? 'A search always includes archived orders' : undefined}>
+          <input
+            type="checkbox"
+            className="accent-primary h-3.5 w-3.5"
+            checked={searching || urlState.includeArchived}
+            disabled={searching}
+            onChange={(e) => navigate({ includeArchived: e.target.checked })}
+          />
+          Include archived
+        </label>
         <Button variant="outline" size="sm" className="hidden h-8 md:inline-flex" onClick={openColPicker} title="Column settings">
           <Settings2 className="h-4 w-4" />
         </Button>
       </div>
 
-      {fetching && completedOrders === null ? (
-        <p className="text-sm text-muted-foreground py-8 text-center">Loading orders…</p>
-      ) : filtered.length === 0 ? (
-        <p className="text-sm text-muted-foreground py-8 text-center">No sales orders found.</p>
+      <OrderListSummary page={list.page} pageSize={list.pageSize} total={list.total} noun="sales orders" notices={hideNotices} />
+
+      {filtered.length === 0 ? (
+        <p className="text-sm text-muted-foreground py-8 text-center">
+          {searching ? `No sales orders match "${urlState.q.trim()}" in any order, including completed and archived.` : 'No sales orders found.'}
+        </p>
       ) : (
         <ResponsiveTableLayout
           mobile={(
@@ -416,6 +468,7 @@ export function SoListClient({ initialOrders, currencySymbols = {}, currencyPosi
                         <Link href={`/sales/${so.id}`} className="font-mono text-sm font-medium text-primary hover:underline">
                           {so.displayOrderNumber}
                         </Link>
+                        {so.archived && <ArchivedBadge />}
                         <p className="mt-1 text-sm font-medium leading-tight">{so.customerName ?? '—'}</p>
                         {so.customerEmail && (
                           <p className="mt-0.5 text-xs text-muted-foreground break-all">{so.customerEmail}</p>
@@ -482,6 +535,8 @@ export function SoListClient({ initialOrders, currencySymbols = {}, currencyPosi
           )}
         />
       )}
+
+      <PaginationBar page={list.page} totalPages={list.pageCount} buildHref={buildHref} />
 
       {/* Column picker dialog */}
       <Dialog open={showColPicker} onOpenChange={setShowColPicker}>

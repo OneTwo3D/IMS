@@ -4,9 +4,12 @@ Sales orders track customer purchases from creation through to allocation, multi
 
 ## Sales Order List
 
-The sales order list provides a searchable, sortable overview of all orders.
+The sales order list is a paged overview of all orders (50 per page). Search, the status filter and the page number are in the address, so a filtered view can be bookmarked or shared, and the line above the table says "Showing 1-50 of N sales orders".
 
-- **Search** by order reference, customer name, or other fields
+- **Search** looks across **every** order in the database, not just the newest ones: order number, the storefront's order number, customer name, customer email, tracking number (on the order or any shipment) and the SKU of any line. Press nothing; the list updates a moment after you stop typing.
+- **A search always includes Completed, Delivered and archived orders.** An archived order carries an **Archived** badge.
+- **Hide completed** (ticked by default) keeps finished work out of the everyday list, and the line above the table says how many Completed and Delivered orders that hides. Untick it to see them. Choosing **Completed** or **Delivered** in the status filter shows them too.
+- **Include archived** shows orders that data retention has archived (old Completed and Delivered orders). Archiving only hides an order from the default list; it is still searchable, and it changes nothing a report counts.
 - **Filter by status** to focus on orders at a specific stage
 - **Export to CSV** for reporting or use in external tools
 - **Columns** — the **Status** column shows the order's stage. Use the column picker to add more, for example **Invoice** (Pending, Invoiced, Paid, or the refund state), **Stock Status**, **WMS Status** and **WMS Dispatch**. Your choice is remembered in your browser.

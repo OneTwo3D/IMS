@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { Plus, Ship } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import type { PoRow } from '@/app/actions/purchase-orders'
+import type { PoListResult } from '@/app/actions/purchase-orders'
 import type { SupplierRow } from '@/app/actions/suppliers'
 import type { ProductRow } from '@/app/actions/products'
 import type { CurrencyRow } from '@/app/actions/currencies'
@@ -19,7 +19,7 @@ type Warehouse = { id: string; code: string; name: string; country?: string | nu
 type GoodsPo = { id: string; reference: string; supplierName: string; totalForeign: number; currency: string }
 
 type Props = {
-  initialPos: PoRow[]
+  list: PoListResult
   suppliers: SupplierRow[]
   products: ProductRow[]
   warehouses: Warehouse[]
@@ -30,7 +30,7 @@ type Props = {
   companyHomeCountry?: string | null
 }
 
-export function PurchaseOrdersClient({ initialPos, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, goodsPos, companyHomeCountry }: Props) {
+export function PurchaseOrdersClient({ list, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, goodsPos, companyHomeCountry }: Props) {
   const baseCurrency = useBaseCurrency()
   const [showCreate, setShowCreate] = useState(false)
   const [showFreight, setShowFreight] = useState(false)
@@ -55,7 +55,7 @@ export function PurchaseOrdersClient({ initialPos, suppliers, products, warehous
           </Button>
         </div>
       </div>
-      <PoListClient initialPos={initialPos} currencySymbols={currencySymbols} currencyPositions={currencyPositions} />
+      <PoListClient list={list} currencySymbols={currencySymbols} currencyPositions={currencyPositions} />
       {showCreate && (
         <PoFormDialog
           suppliers={suppliers}

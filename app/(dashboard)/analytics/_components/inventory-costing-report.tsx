@@ -11,6 +11,8 @@ import type { PageInfo, StockPositionFilterOptions } from '@/lib/domain/inventor
 import { COMBOBOX_THRESHOLD } from '@/lib/ui/select-policy'
 import { cn } from '@/lib/utils'
 import { ReportPageTitle } from './report-page-title'
+import { ReportRowLimitAlert, REPORT_NOT_COMPUTED_TEXT } from './report-row-limit-alert'
+import { hasSourceLimitNotice, withoutSourceLimitNotices } from '@/lib/security/source-scan-error'
 import { StockPositionFilterCombobox } from './stock-position-filter-combobox'
 import { appendParams, currentParams, toneClass, type SummaryTone, reportCsvHref } from './report-utils'
 
@@ -72,11 +74,12 @@ export function InventoryCostingReportPage<Row>({
   const previousHref = `?${appendParams(params, { page: pageInfo.page - 1 })}`
   const nextHref = `?${appendParams(params, { page: pageInfo.page + 1 })}`
 
+  const notComputed = hasSourceLimitNotice(notices)
   return (
     <div className="space-y-4">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <ReportPageTitle title={title} description={description} notices={notices} />
+          <ReportPageTitle title={title} description={description} notices={withoutSourceLimitNotices(notices)} />
         </div>
         <a href={csvHref} className={cn(buttonVariants({ variant: 'outline', size: 'sm' }), 'w-fit')}>
           <Download className="mr-2 h-4 w-4" />
@@ -84,11 +87,13 @@ export function InventoryCostingReportPage<Row>({
         </a>
       </div>
 
+      <ReportRowLimitAlert notices={notices} />
+
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         {summary.map((item) => (
           <div key={item.label} className="rounded-md border p-3">
             <p className="text-xs text-muted-foreground">{item.label}</p>
-            <p className={`mt-1 text-xl font-semibold tabular-nums ${toneClass(item.tone)}`}>{item.value}</p>
+            <p className={`mt-1 text-xl font-semibold tabular-nums ${toneClass(item.tone)}`}>{notComputed ? '—' : item.value}</p>
           </div>
         ))}
       </div>
@@ -201,8 +206,8 @@ export function InventoryCostingReportPage<Row>({
 
       <div className="rounded-md border">
         <div className="flex items-center justify-between border-b bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-          <span>{pageInfo.totalRows.toLocaleString()} rows</span>
-          <span>Page {pageInfo.page} of {pageInfo.totalPages}</span>
+          <span>{notComputed ? 'Report not computed' : `${pageInfo.totalRows.toLocaleString()} rows`}</span>
+          {!notComputed && <span>Page {pageInfo.page} of {pageInfo.totalPages}</span>}
         </div>
         <Table containerClassName="max-h-[calc(100vh-22rem)]">
           <TableHeader className="bg-muted/50">
@@ -224,7 +229,7 @@ export function InventoryCostingReportPage<Row>({
             ))}
             {rows.length === 0 && (
               <TableRow>
-                <TableCell colSpan={columns.length} className="py-10 text-center text-sm text-muted-foreground">No rows match the current filters.</TableCell>
+                <TableCell colSpan={columns.length} className="py-10 text-center text-sm text-muted-foreground">{notComputed ? REPORT_NOT_COMPUTED_TEXT : 'No rows match the current filters.'}</TableCell>
               </TableRow>
             )}
           </TableBody>
@@ -233,7 +238,7 @@ export function InventoryCostingReportPage<Row>({
               <tr>
                 {columns.map((column) => (
                   <td key={column.key} className={`px-3 py-2 text-sm ${column.align === 'right' ? 'text-right tabular-nums' : ''}`}>
-                    {column.footer ?? null}
+                    {notComputed ? (column.footer != null ? '—' : null) : (column.footer ?? null)}
                   </td>
                 ))}
               </tr>

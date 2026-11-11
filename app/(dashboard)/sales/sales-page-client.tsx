@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { Plus } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import type { SoRow } from '@/app/actions/sales'
+import type { SoListResult } from '@/app/actions/sales'
 import type { ProductRow } from '@/app/actions/products'
 import type { CurrencyRow } from '@/app/actions/currencies'
 import type { TaxRateRow } from '@/app/actions/settings'
@@ -19,7 +19,7 @@ import { SoFormDialog } from './so-form'
 type Warehouse = { id: string; code: string; name: string; isDefault?: boolean }
 
 type Props = {
-  initialOrders: SoRow[]
+  list: SoListResult
   products: ProductRow[]
   warehouses: Warehouse[]
   currencies: CurrencyRow[]
@@ -32,7 +32,7 @@ type Props = {
   companyHomeCountry?: string | null
 }
 
-export function SalesPageClient({ initialOrders, products, warehouses, currencies, taxRates, customers, stockLevels, avgCogs, users, currentUserName, companyHomeCountry }: Props) {
+export function SalesPageClient({ list, products, warehouses, currencies, taxRates, customers, stockLevels, avgCogs, users, currentUserName, companyHomeCountry }: Props) {
   const baseCurrency = useBaseCurrency()
   const [showCreate, setShowCreate] = useState(false)
 
@@ -52,7 +52,7 @@ export function SalesPageClient({ initialOrders, products, warehouses, currencie
           </Button>
         </div>
       </div>
-      <SoListClient initialOrders={initialOrders} currencySymbols={currencySymbols} currencyPositions={currencyPositions} />
+      <SoListClient list={list} currencySymbols={currencySymbols} currencyPositions={currencyPositions} />
       {showCreate && (
         <SoFormDialog
           products={products}
