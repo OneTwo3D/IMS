@@ -776,12 +776,21 @@ export async function readSalesResidualVerdicts(
 const PENDING_DATE_RETRY_BATCH = 200
 type PendingKind = 'SALES' | 'BILL'
 
+/** The Xero organisation this install is connected to, or null when none is. The remembered rows are scoped to it. */
+async function connectedXeroTenantId(): Promise<string | null> {
+  const token = await db.accountingToken.findUnique({ where: { connector: 'xero' }, select: { tenantId: true } })
+  const tenantId = token?.tenantId
+  return typeof tenantId === 'string' && tenantId.trim() !== '' ? tenantId : null
+}
+
 async function rememberUnreadablePaidDate(result: PollResult, kind: PendingKind, invoiceId: string | null | undefined): Promise<void> {
   if (!invoiceId) return
   try {
+    const tenantId = await connectedXeroTenantId()
+    if (tenantId === null) throw new Error('no Xero organisation is connected, so the document cannot be scoped to one')
     await db.xeroPaymentDatePending.upsert({
-      where: { kind_xeroInvoiceId: { kind, xeroInvoiceId: invoiceId } },
-      create: { kind, xeroInvoiceId: invoiceId },
+      where: { tenantId_kind_xeroInvoiceId: { tenantId, kind, xeroInvoiceId: invoiceId } },
+      create: { tenantId, kind, xeroInvoiceId: invoiceId },
       update: {},
     })
   } catch (e) {
@@ -789,16 +798,27 @@ async function rememberUnreadablePaidDate(result: PollResult, kind: PendingKind,
   }
 }
 
-/** Re-fetch the least recently checked remembered documents by id and apply the ones whose date has become readable; forget the ones that no longer need it. */
+/**
+ * Re-fetch the least recently checked remembered documents of the CONNECTED organisation by id and apply the ones whose date has become readable.
+ *
+ * A row is deleted only when the response VERIFIES a state that makes the retry unnecessary: the document came back and is no longer PAID (the delta poll
+ * handles whatever it became), or came back with a readable date and was applied. A document the response OMITS proves nothing (a paged, filtered or partial
+ * answer looks the same as a deleted document), so it stays remembered and is asked again; so does one that came back still unreadable. Rows of another
+ * organisation are never read, fetched or changed.
+ */
 async function retryUnreadablePaidDates(
   result: PollResult,
   windowStart: Date,
   ledgerObservedBefore: LedgerReadFence | null,
 ): Promise<void> {
+  const tenantId = await connectedXeroTenantId()
+  if (tenantId === null) return
   const pending = await db.xeroPaymentDatePending.findMany({
+    // '' is a row written before the column existed: read as this organisation's.
+    where: { tenantId: { in: [tenantId, ''] } },
     orderBy: [{ lastCheckedAt: { sort: 'asc', nulls: 'first' } }, { firstSeenAt: 'asc' }],
     take: PENDING_DATE_RETRY_BATCH,
-    select: { kind: true, xeroInvoiceId: true },
+    select: { tenantId: true, kind: true, xeroInvoiceId: true },
   })
   if (pending.length === 0) return
   const wanted = [...new Set(pending.map((row) => row.xeroInvoiceId))]
@@ -824,12 +844,12 @@ async function retryUnreadablePaidDates(
     if (result.errors.length > errorsBefore) return
   }
 
-  // Forget a document that was not found, is no longer PAID (the delta poll handles whatever it became), or has just been handled; stamp the rest as checked.
-  const forget = pending.filter((row) => { const invoice = fetched.get(row.xeroInvoiceId); return invoice === undefined || !stillUnreadable(invoice) })
+  // Forget ONLY a document the response returned in a state that needs no retry (no longer PAID, or applied just now); an omitted or still-unreadable one stays.
+  const forget = pending.filter((row) => { const invoice = fetched.get(row.xeroInvoiceId); return invoice !== undefined && !stillUnreadable(invoice) })
   const keep = pending.filter((row) => !forget.includes(row))
-  for (const row of forget) await db.xeroPaymentDatePending.deleteMany({ where: { kind: row.kind, xeroInvoiceId: row.xeroInvoiceId } })
+  for (const row of forget) await db.xeroPaymentDatePending.deleteMany({ where: { tenantId: row.tenantId, kind: row.kind, xeroInvoiceId: row.xeroInvoiceId } })
   const checkedAt = new Date()
-  for (const row of keep) await db.xeroPaymentDatePending.updateMany({ where: { kind: row.kind, xeroInvoiceId: row.xeroInvoiceId }, data: { lastCheckedAt: checkedAt } })
+  for (const row of keep) await db.xeroPaymentDatePending.updateMany({ where: { tenantId: row.tenantId, kind: row.kind, xeroInvoiceId: row.xeroInvoiceId }, data: { lastCheckedAt: checkedAt } })
 }
 
 /**

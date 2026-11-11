@@ -2804,6 +2804,9 @@ model XeroTaxRate {
 /// document when Xero modifies it, so a skip that is not remembered is never revisited. Written in the same step as the skip (a failed write holds
 /// the poll's cursor), re-read by id on every poll, and deleted once the document is applied, no longer PAID, or gone. Ids only: no personal data.
 model XeroPaymentDatePending {
+  /// The Xero organisation the document belongs to: a poll only reads and changes the rows of the organisation it is connected to. '' = a row written before
+  /// the column existed, read as the connected organisation's and left as it is.
+  tenantId      String    @default("")
   /// SALES (an ACCREC invoice) or BILL (an ACCPAY bill).
   kind          String
   xeroInvoiceId String
@@ -2811,7 +2814,7 @@ model XeroPaymentDatePending {
   /// When the poll last re-read this document by id; NULL = never. Oldest-checked first, so a document that stays unreadable cannot starve the others.
   lastCheckedAt DateTime?
 
-  @@id([kind, xeroInvoiceId])
+  @@id([tenantId, kind, xeroInvoiceId])
   @@index([lastCheckedAt])
   @@map("xero_payment_date_pending")
 }

@@ -73,16 +73,23 @@ export function validateRecordSupplierCreditNote(params: {
   return null
 }
 
+/** Shown to the operator when a supplier credit note is raised against a bill whose lines carry more than one VAT treatment. */
+export const SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE = withLedgerCheck(
+  'This bill mixes VAT treatments (for example taxable and exempt lines, or two VAT codes), and one credit amount cannot mirror them: raise the credit in Xero by line, '
+  + 'or credit each line separately. The credit note was not posted and is still a draft.',
+)
+
 /**
  * THE TAX TREATMENT OF A SUPPLIER CREDIT NOTE COMES FROM THE BILL IT CREDITS, never from the supplier's current default.
  *
- * `billLines` are the SELECTED bill's booked lines: the tax type and rate each was posted with (`billLineTaxTreatments`). The credit is one amount, so it
- * mirrors the bill's VAT-bearing treatment:
- *   - reverse charge (a goods order whose lines are all reverse-charge): the configured reverse-charge type, else the type the bill's lines posted on;
- *   - the bill carried VAT: the ONE tax code its VAT-bearing lines posted on. A NONE credit against a bill that carried VAT is never produced - there is no
- *     per-line credit to show the credited amount was a non-vatable line - and two different VAT codes cannot be mirrored by one amount, so both give
- *     `undefined`, which the poster refuses (lib/domain/accounting/purchase-document-tax-types.ts) instead of leaving input VAT claimed;
- *   - the bill carried no VAT at all: NONE, a named decision (`no-vat-rate`).
+ * `billLines` are the SELECTED bill's booked lines: the tax type and rate each was posted with (`billLineTaxTreatments`). The credit is ONE amount, so it can only
+ * mirror a bill whose lines all carry ONE tax treatment (one tax code):
+ *   - one treatment: that code (a taxed bill's VAT code, or NONE / a zero-rated code when nothing on the bill carried VAT). A NONE code on a bill that carried VAT is
+ *     inconsistent and gives `undefined`, never a NONE credit;
+ *   - more than one treatment (taxable plus exempt/NONE, or two codes): `mixed`, and the caller REFUSES the credit (SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE) rather
+ *     than credit the whole amount as taxable or as exempt. Per-line credits are a follow-up;
+ *   - a VAT-bearing line with no code, or no line at all on a bill that carried VAT: `undefined`, refused by the poster (lib/domain/accounting/purchase-document-tax-types.ts);
+ *   - reverse charge (a goods order whose lines are all reverse-charge): the configured reverse-charge type, else the type the bill's lines posted on.
  * `taxRateId` is the rate the code was read from, for the retired-code guard binding.
  */
 export function resolveSupplierCreditNoteTaxType(params: {
@@ -92,24 +99,27 @@ export function resolveSupplierCreditNoteTaxType(params: {
   isReverseCharge?: boolean
   /** The configured reverse-charge purchase tax type (accounting settings). */
   reverseChargeTaxType?: string | null
-}): { taxType: string | undefined; taxRateId?: string } {
-  const decided = params.billLines.filter((l) => l.taxType && l.taxType.trim() !== '')
+}): { taxType: string | undefined; taxRateId?: string; mixed?: true } {
+  const typed = params.billLines.filter((l) => l.taxType && l.taxType.trim() !== '')
   if (params.isReverseCharge) {
     if (params.reverseChargeTaxType) return { taxType: params.reverseChargeTaxType }
-    const own = decided.find((l) => l.taxType!.trim().toUpperCase() !== 'NONE') ?? decided[0]
+    const own = typed.find((l) => l.taxType!.trim().toUpperCase() !== 'NONE') ?? typed[0]
     return { taxType: own?.taxType, taxRateId: own?.taxRateId }
   }
-  const taxed = params.billLines.filter((l) => l.rate > 0)
-  if (params.billHadTax || taxed.length > 0) {
-    const codes = new Map<string, { taxType: string; taxRateId?: string }>()
-    for (const l of taxed) {
-      if (!l.taxType || l.taxType.trim() === '' || l.taxType.trim().toUpperCase() === 'NONE') return { taxType: undefined }
-      if (!codes.has(l.taxType)) codes.set(l.taxType, { taxType: l.taxType, taxRateId: l.taxRateId })
-    }
-    if (codes.size !== 1) return { taxType: undefined }
-    return [...codes.values()][0]
+  const hadTax = params.billHadTax || params.billLines.some((l) => l.rate > 0)
+  if (params.billLines.some((l) => (!l.taxType || l.taxType.trim() === '') && l.rate > 0)) return { taxType: undefined }
+  const treatments = new Map<string, { taxType: string; taxRateId?: string }>()
+  for (const l of typed) {
+    const key = l.taxType!.trim().toUpperCase()
+    if (!treatments.has(key)) treatments.set(key, { taxType: l.taxType!, taxRateId: l.taxRateId })
   }
-  return { taxType: 'NONE' }
+  if (treatments.size > 1) return { taxType: undefined, mixed: true }
+  if (treatments.size === 1) {
+    const [key, only] = [...treatments.entries()][0]
+    if (key === 'NONE' && hadTax) return { taxType: undefined }
+    return only
+  }
+  return hadTax ? { taxType: undefined } : { taxType: 'NONE' }
 }
 
 /**

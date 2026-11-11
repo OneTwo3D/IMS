@@ -5,6 +5,7 @@ import {
   validateRecordSupplierCreditNote,
   buildSupplierCreditNoteSyncPayload,
   resolveSupplierCreditNoteTaxType,
+  SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE,
   resolveSupplierCreditNoteTransitBase,
 } from '@/lib/domain/purchasing/supplier-credit-note'
 
@@ -132,19 +133,31 @@ const taxedLine = { taxType: 'INPUT2', rate: 0.2, taxRateId: 'r-std' }
 const exemptLine = { taxType: 'NONE', rate: 0 }
 const tax = (p: Parameters<typeof resolveSupplierCreditNoteTaxType>[0]) => resolveSupplierCreditNoteTaxType(p).taxType
 
-test('credit-note tax type mirrors the SELECTED BILL\'s booked lines: the code its VAT-bearing lines posted on, NONE only when the bill carried no VAT', () => {
+test('credit-note tax type mirrors the SELECTED BILL\'s booked lines: one treatment is credited on its code, NONE only when the bill carried no VAT', () => {
   assert.deepEqual(resolveSupplierCreditNoteTaxType({ billHadTax: true, billLines: [taxedLine] }), { taxType: 'INPUT2', taxRateId: 'r-std' })
-  // A taxable bill is credited on the bill's code even when the supplier's CURRENT default is NONE (the resolver never sees the supplier).
-  assert.equal(tax({ billHadTax: true, billLines: [taxedLine, exemptLine] }), 'INPUT2', 'a non-vatable line on a taxable bill does not turn the credit into NONE')
-  assert.equal(tax({ billHadTax: false, billLines: [exemptLine] }), 'NONE', 'a bill with only non-vatable lines: NONE')
+  assert.deepEqual(resolveSupplierCreditNoteTaxType({ billHadTax: true, billLines: [taxedLine, { taxType: 'input2', rate: 0.2 }] }), { taxType: 'INPUT2', taxRateId: 'r-std' }, 'two lines on one code are one treatment')
+  assert.equal(tax({ billHadTax: false, billLines: [exemptLine] }), 'NONE', 'a single exempt bill: NONE')
+  assert.equal(tax({ billHadTax: false, billLines: [exemptLine, exemptLine] }), 'NONE')
+  assert.equal(tax({ billHadTax: false, billLines: [{ taxType: 'ZERORATEDINPUT', rate: 0 }] }), 'ZERORATEDINPUT', 'a single zero-rated bill keeps its own code')
   assert.equal(tax({ billHadTax: false, billLines: [] }), 'NONE')
   // Bill carried VAT but nothing shows what code: UNDECIDED, never NONE (the poster refuses it).
   assert.equal(tax({ billHadTax: true, billLines: [] }), undefined)
   assert.equal(tax({ billHadTax: true, billLines: [{ taxType: undefined, rate: 0.2 }] }), undefined)
   assert.equal(tax({ billHadTax: true, billLines: [{ taxType: 'NONE', rate: 0.2 }] }), undefined, 'a NONE line that carried a rate is not a decided credit')
-  // One amount cannot mirror two VAT codes.
-  assert.equal(tax({ billHadTax: true, billLines: [taxedLine, { taxType: 'INPUT5', rate: 0.05 }] }), undefined)
-  assert.equal(tax({ billHadTax: true, billLines: [taxedLine, { taxType: 'INPUT2', rate: 0.2 }] }), 'INPUT2', 'two lines on one code are one code')
+})
+
+test('a bill that MIXES VAT treatments is refused (mixed), never credited as one taxable or one exempt line', () => {
+  for (const lines of [
+    [taxedLine, exemptLine],
+    [exemptLine, taxedLine],
+    [taxedLine, { taxType: 'INPUT5', rate: 0.05 }],
+    [taxedLine, { taxType: 'ZERORATEDINPUT', rate: 0 }],
+    [exemptLine, { taxType: 'ZERORATEDINPUT', rate: 0 }],
+  ]) {
+    const r = resolveSupplierCreditNoteTaxType({ billHadTax: true, billLines: lines })
+    assert.deepEqual([r.taxType, r.mixed], [undefined, true], JSON.stringify(lines))
+  }
+  assert.match(SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, /mixes VAT treatments.*raise the credit in Xero by line, or credit each line separately/)
 })
 
 test('credit-note tax type: reverse-charge goods credit reverses on the RC tax type, not NONE', () => {
@@ -250,4 +263,10 @@ test('wiring: the supplier credit note poster reads the SELECTED bill\'s lines a
   const source = readFileSync('app/actions/purchase-orders.ts', 'utf8')
   assert.match(source, /billLineTaxTreatments\(\{\s*billLines: billLinesBooked/)
   assert.doesNotMatch(source, /supplierTaxType: baseTaxType/)
+})
+
+test('wiring: a mixed bill is refused before anything is claimed, only when the credit would be sent to the ledger', async () => {
+  const { readFileSync } = await import('node:fs')
+  const source = readFileSync('app/actions/purchase-orders.ts', 'utf8')
+  assert.match(source, /if \(shouldQueueXero && creditNoteTreatment\.mixed\) return \{ success: false, error: SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE \}/)
 })

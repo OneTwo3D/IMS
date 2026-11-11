@@ -24,7 +24,9 @@ type LoggedActivity = {
 }
 
 /** The xero_payment_date_pending table, so a remembered id survives from one poll to the next. */
-const pendingRows: Array<{ kind: string; xeroInvoiceId: string; firstSeenAt: number; lastCheckedAt: number | null }> = []
+const pendingRows: Array<{ tenantId: string; kind: string; xeroInvoiceId: string; firstSeenAt: number; lastCheckedAt: number | null }> = []
+const TENANT = 'tenant-A'
+let connectedTenant: string | null = TENANT
 let pendingClock = 1
 let pendingWriteFails = false
 
@@ -120,6 +122,7 @@ async function withHostClockSkew<T>(skewMs: number, fn: () => Promise<T>): Promi
 function reset(): void {
   pendingRows.length = 0
   pendingWriteFails = false
+  connectedTenant = TENANT
   state.invoices = []
   state.salesOrders = []
   state.purchaseInvoices = []
@@ -376,23 +379,26 @@ const dbDouble: Record<string, unknown> = {
     findUnique: async () => ({ key: 'xero_last_payment_poll', value: new Date(Date.now() - 60_000).toISOString() }),
     upsert: async (args: unknown) => { state.settingUpserts.push(args); return {} },
   },
+  accountingToken: { findUnique: async () => (connectedTenant === null ? null : { tenantId: connectedTenant }) },
   xeroPaymentDatePending: {
-    upsert: async ({ create }: { create: { kind: string; xeroInvoiceId: string } }) => {
+    upsert: async ({ create }: { create: { tenantId: string; kind: string; xeroInvoiceId: string } }) => {
       if (pendingWriteFails) throw new Error('connection terminated unexpectedly')
-      if (!pendingRows.some((r) => r.kind === create.kind && r.xeroInvoiceId === create.xeroInvoiceId)) {
-        pendingRows.push({ kind: create.kind, xeroInvoiceId: create.xeroInvoiceId, firstSeenAt: pendingClock++, lastCheckedAt: null })
+      if (!pendingRows.some((r) => r.tenantId === create.tenantId && r.kind === create.kind && r.xeroInvoiceId === create.xeroInvoiceId)) {
+        pendingRows.push({ tenantId: create.tenantId, kind: create.kind, xeroInvoiceId: create.xeroInvoiceId, firstSeenAt: pendingClock++, lastCheckedAt: null })
       }
       return {}
     },
-    findMany: async ({ take }: { take: number }) =>
-      [...pendingRows].sort((a, b) => (a.lastCheckedAt ?? -1) - (b.lastCheckedAt ?? -1) || a.firstSeenAt - b.firstSeenAt).slice(0, take).map((r) => ({ kind: r.kind, xeroInvoiceId: r.xeroInvoiceId })),
-    deleteMany: async ({ where }: { where: { kind: string; xeroInvoiceId: string } }) => {
-      const i = pendingRows.findIndex((r) => r.kind === where.kind && r.xeroInvoiceId === where.xeroInvoiceId)
+    findMany: async ({ where, take }: { where: { tenantId: { in: string[] } }; take: number }) =>
+      pendingRows.filter((r) => where.tenantId.in.includes(r.tenantId))
+        .sort((a, b) => (a.lastCheckedAt ?? -1) - (b.lastCheckedAt ?? -1) || a.firstSeenAt - b.firstSeenAt).slice(0, take)
+        .map((r) => ({ tenantId: r.tenantId, kind: r.kind, xeroInvoiceId: r.xeroInvoiceId })),
+    deleteMany: async ({ where }: { where: { tenantId: string; kind: string; xeroInvoiceId: string } }) => {
+      const i = pendingRows.findIndex((r) => r.tenantId === where.tenantId && r.kind === where.kind && r.xeroInvoiceId === where.xeroInvoiceId)
       if (i >= 0) pendingRows.splice(i, 1)
       return {}
     },
-    updateMany: async ({ where }: { where: { kind: string; xeroInvoiceId: string } }) => {
-      const row = pendingRows.find((r) => r.kind === where.kind && r.xeroInvoiceId === where.xeroInvoiceId)
+    updateMany: async ({ where }: { where: { tenantId: string; kind: string; xeroInvoiceId: string } }) => {
+      const row = pendingRows.find((r) => r.tenantId === where.tenantId && r.kind === where.kind && r.xeroInvoiceId === where.xeroInvoiceId)
       if (row) row.lastCheckedAt = pendingClock++
       return {}
     },
@@ -645,7 +651,7 @@ test('a failure to REMEMBER the skipped document holds the cursor, so the docume
 
 test('nothing is evicted: more than 200 remembered documents are all kept, and each poll re-reads the least recently checked 200', async () => {
   reset()
-  for (let i = 0; i < 250; i++) pendingRows.push({ kind: 'BILL', xeroInvoiceId: `OLD${i}`, firstSeenAt: pendingClock++, lastCheckedAt: null })
+  for (let i = 0; i < 250; i++) pendingRows.push({ tenantId: TENANT, kind: 'BILL', xeroInvoiceId: `OLD${i}`, firstSeenAt: pendingClock++, lastCheckedAt: null })
   state.invoices = []
   // Xero still reports every one of them PAID with no date.
   state.recheckInvoices = Array.from({ length: 250 }, (_, i) => ({ InvoiceID: `OLD${i}`, Type: 'ACCPAY', Status: 'PAID' }) as XeroInvoice)
@@ -655,4 +661,52 @@ test('nothing is evicted: more than 200 remembered documents are all kept, and e
   await poll()
   assert.equal(pendingRows.length, 250)
   assert.ok(pendingRows.every((r) => r.lastCheckedAt !== null), 'the second poll reached the 50 that were waiting')
+})
+
+test('a document the Xero response OMITS stays remembered (an omission proves nothing); only a returned document that needs no retry is forgotten', async () => {
+  reset()
+  pendingRows.push({ tenantId: TENANT, kind: 'BILL', xeroInvoiceId: 'GONE', firstSeenAt: pendingClock++, lastCheckedAt: null })
+  pendingRows.push({ tenantId: TENANT, kind: 'BILL', xeroInvoiceId: 'VOIDED', firstSeenAt: pendingClock++, lastCheckedAt: null })
+  pendingRows.push({ tenantId: TENANT, kind: 'BILL', xeroInvoiceId: 'STILL', firstSeenAt: pendingClock++, lastCheckedAt: null })
+  state.invoices = []
+  // A successful answer that leaves one of the three out.
+  state.recheckInvoices = [
+    { InvoiceID: 'VOIDED', Type: 'ACCPAY', Status: 'VOIDED' } as XeroInvoice,
+    { InvoiceID: 'STILL', Type: 'ACCPAY', Status: 'PAID' } as XeroInvoice,
+  ]
+  const result = await poll()
+  assert.deepEqual(result.errors, [])
+  assert.deepEqual(pendingRows.map((r) => r.xeroInvoiceId).sort(), ['GONE', 'STILL'], 'GONE (omitted) and STILL (unreadable) stay; VOIDED (returned, no longer PAID) is forgotten')
+})
+
+test('rows of ANOTHER Xero organisation are neither fetched nor changed, and a new row is stamped with the connected organisation', async () => {
+  reset()
+  pendingRows.push({ tenantId: 'tenant-B', kind: 'BILL', xeroInvoiceId: 'OTHER', firstSeenAt: pendingClock++, lastCheckedAt: null })
+  pendingRows.push({ tenantId: TENANT, kind: 'BILL', xeroInvoiceId: 'MINE', firstSeenAt: pendingClock++, lastCheckedAt: null })
+  state.invoices = []
+  state.recheckInvoices = [
+    { InvoiceID: 'OTHER', Type: 'ACCPAY', Status: 'VOIDED' } as XeroInvoice,
+    { InvoiceID: 'MINE', Type: 'ACCPAY', Status: 'VOIDED' } as XeroInvoice,
+  ]
+  await poll()
+  assert.deepEqual(state.recheckFetches.map((p) => p.replace('Invoices?IDs=', '')), ['MINE'], 'only this organisation\'s ids were asked for')
+  assert.deepEqual(pendingRows.map((r) => `${r.tenantId}/${r.xeroInvoiceId}`), ['tenant-B/OTHER'], 'the other organisation\'s row is untouched')
+
+  reset()
+  state.invoices = [paidBill(undefined)]
+  state.recheckInvoices = [paidBill(undefined)]
+  state.purchaseInvoices = [UNPAID_BILL()]
+  await poll()
+  assert.deepEqual(pendingRows.map((r) => `${r.tenantId}/${r.xeroInvoiceId}`), [`${TENANT}/XB1`])
+})
+
+test('with no Xero organisation connected the skipped document cannot be scoped: the poll holds its cursor instead of remembering it unscoped', async () => {
+  reset()
+  connectedTenant = null
+  state.invoices = [paidBill(undefined)]
+  state.purchaseInvoices = [UNPAID_BILL()]
+  const result = await poll()
+  assert.ok(result.errors.some((e) => /no Xero organisation is connected/.test(e)))
+  assert.equal(state.settingUpserts.length, 0)
+  assert.equal(pendingRows.length, 0)
 })

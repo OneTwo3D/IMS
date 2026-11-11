@@ -1646,17 +1646,19 @@ bill currency's minor unit (two decimals for GBP, none for JPY, three for KWD) a
 figures recomputed from them. Three lines of 0.03 at 20% record 0.03 of VAT (0.01 each), as Xero does, not 0.018.
 
 **Supplier credit notes copy the bill they credit.** The tax type of a supplier credit note comes from the **selected bill's booked lines** (the type and rate each line
-was posted with), never from the supplier's current default. A bill that carried VAT is credited on the one VAT type its taxed lines used; if its taxed lines used
-two different types (one amount cannot mirror both), or no type can be found, the credit note is refused (*NOTHING WAS SENT*) rather than posted on "No VAT". A bill that carried no VAT
-at all (for example one made only of non-vatable cost lines) is credited on "No VAT".
+was posted with), never from the supplier's current default. One credit amount can only mirror a bill whose lines all carry **one** tax treatment, and then it is credited
+on that type (a bill that carried VAT on its one VAT type; a bill with no VAT, such as one made only of non-vatable cost lines, on "No VAT"; a zero-rated bill on its zero-rated type).
+A bill that **mixes treatments** (taxable plus exempt, or two VAT types) is **refused**, before anything is posted, with *this bill mixes VAT treatments ... raise the credit in
+Xero by line, or credit each line separately*; the credit note stays a draft. Per-line credits are a follow-up. If no type can be found for a bill that carried VAT,
+the credit is refused by the poster (*NOTHING WAS SENT*) rather than posted on "No VAT"
 
 ### Paid invoices whose payment date Xero does not give
 
 If Xero reports an invoice or bill **PAID** but its payment date is missing or unreadable, the payment poll does **not** mark it paid with a guessed date: it logs a
-WARNING (*payment_date_unreadable* / *bill_payment_date_unreadable*) and **remembers the document** in its own table (one row per document, never evicted, no limit).
+WARNING (*payment_date_unreadable* / *bill_payment_date_unreadable*) and **remembers the document** in its own table (one row per document and Xero organisation, never evicted, no limit).
 Remembering is part of the poll step: if it cannot be saved the poll **holds its position** for that batch (the poll shows an error) so the document comes back, rather
 than being forgotten. Every poll then re-reads up to 200 remembered documents by id (the least recently checked first, so one that stays unreadable cannot starve the rest)
-and applies each whose date has become readable, even though Xero has not modified it since; a document that is no longer PAID, or has been handled, is forgotten.
+and applies each whose date has become readable, even though Xero has not modified it since; a row is forgotten only when Xero's answer shows the retry is unnecessary (the document is applied, or is no longer PAID): a document Xero's answer simply leaves out, or that is still unreadable, stays and is asked again. Only the connected organisation's rows are read or changed.
 
 ### EU IOSS / VOEC rate configuration (declaration, preflight and seed)
 

@@ -51,7 +51,7 @@ import {
 import { getBaseCurrencyCode, resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purchase-order-action'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
-import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SupplierCreditNoteEnqueueDeclined } from '@/lib/domain/purchasing/supplier-credit-note'
+import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, SupplierCreditNoteEnqueueDeclined } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
 import { readPayloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
@@ -5162,6 +5162,8 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     // new verdict function did not close it. It is not an outstanding DEBT — there is no ACCPAYCREDIT
     // poster for QuickBooks, so no posting is ever coming — so it is not an inbox row; it is a WARNING that
     // says plainly what the ledger will not receive.
+    // One credit amount cannot mirror a bill that mixes VAT treatments: refused BEFORE anything is claimed (the credit stays a draft). Per-line credits are a follow-up.
+    if (shouldQueueXero && creditNoteTreatment.mixed) return { success: false, error: SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE }
     const postsLocallyOnly = creditNotePosting.verdict === 'post' && !shouldQueueXero && settings.syncEnabled
     if (postsLocallyOnly) {
       await logActivity({
