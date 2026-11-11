@@ -11,9 +11,12 @@ import { PurchaseOrdersClient } from './po-page-client'
 
 export const metadata: Metadata = { title: 'Purchase Orders' }
 
-export default async function PurchaseOrdersPage() {
-  const [pos, suppliers, productsResult, warehouses, currencies, taxRates, purchaseUnits, goodsPos, organisation] = await Promise.all([
-    getPurchaseOrders(),
+type SearchParams = { q?: string; status?: string; page?: string; invoiced?: string; returned?: string; archived?: string }
+
+export default async function PurchaseOrdersPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
+  const sp = await searchParams
+  const [list, suppliers, productsResult, warehouses, currencies, taxRates, purchaseUnits, goodsPos, organisation] = await Promise.all([
+    getPurchaseOrders({ q: sp.q, status: sp.status, page: sp.page, invoiced: sp.invoiced === '1', returned: sp.returned === '1', includeArchived: sp.archived === '1' }),
     getSuppliers(),
     listProducts({ pageSize: 1000, type: 'ALL', active: 'true' }),
     getWarehouses(),
@@ -30,7 +33,7 @@ export default async function PurchaseOrdersPage() {
 
   return (
     <PurchaseOrdersClient
-      initialPos={pos}
+      list={list}
       suppliers={suppliers}
       products={products}
       warehouses={warehouses}

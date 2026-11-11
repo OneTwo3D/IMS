@@ -64,7 +64,8 @@ test('finance analytics page loaders return typed empty reports for source scan 
   assert.deepEqual(report.rows, [])
   assert.deepEqual(report.totals, financeAnalyticsEmptyTotals.vat)
   assert.equal(report.pageInfo.totalRows, 0)
-  assert.equal(report.notices[0], 'VAT report source rows exceed 50,000; Narrow the filters and retry.')
+  assert.match(report.notices[0], /^This report hit its row limit \(50,000 rows\); narrow the date range or filters\./)
+  assert.ok(report.notices[0].includes('VAT report source rows exceed 50,000'))
 })
 
 test('finance empty totals keys match report totals types', () => {
@@ -85,7 +86,8 @@ test('sales analytics page loaders return typed empty reports for source scan li
 
   assert.deepEqual(report.rows, [])
   assert.deepEqual(report.totals, salesAnalyticsEmptyTotals.sales)
-  assert.equal(report.notices[0], 'Sales analytics source orders exceed 50,000; Narrow the filters and retry.')
+  assert.match(report.notices[0], /^This report hit its row limit/)
+  assert.ok(report.notices[0].includes('Sales analytics source orders exceed 50,000'))
 })
 
 test('purchasing analytics page loaders return typed empty reports for source scan limits', async () => {
@@ -98,7 +100,8 @@ test('purchasing analytics page loaders return typed empty reports for source sc
 
   assert.deepEqual(report.rows, [])
   assert.deepEqual(report.totals, purchasingAnalyticsEmptyTotals.openPurchaseOrders)
-  assert.equal(report.notices[0], 'Open purchase order source rows exceed 50,000; Narrow the filters and retry.')
+  assert.match(report.notices[0], /^This report hit its row limit/)
+  assert.ok(report.notices[0].includes('Open purchase order source rows exceed 50,000'))
 })
 
 test('analytics page loaders rethrow non-source-limit errors', async () => {

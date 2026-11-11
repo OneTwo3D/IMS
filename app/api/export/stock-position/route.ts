@@ -10,6 +10,7 @@ import {
 } from '@/lib/domain/inventory/stock-position-reports'
 import { getDeadStockReport, getInventoryAgingReport, InventoryHealthSourceLimitError } from '@/lib/domain/inventory/inventory-health-reports'
 import { stockPositionApiAccessDenied } from '@/lib/security/stock-position-access'
+import { sourceLimitExportBody } from '@/lib/security/source-scan-error'
 
 const STOCK_POSITION_CSV_ROW_LIMIT = 50000
 export const STOCK_ON_HAND_CSV_HEADERS = ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'quantity', 'reservedQty', 'availableQty', 'unitCostBase', 'totalValueBase', 'reservationQtySource', 'reservationSnapshotDate', 'reservationSourceCount']
@@ -187,7 +188,7 @@ export async function getStockPositionExportResponse(
         throw error
       })
       if (report instanceof InventoryHealthSourceLimitError) {
-        return NextResponse.json({ error: report.message }, { status: 413 })
+        return NextResponse.json(sourceLimitExportBody(report), { status: 413 })
       }
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
@@ -218,7 +219,7 @@ export async function getStockPositionExportResponse(
         throw error
       })
       if (report instanceof InventoryHealthSourceLimitError) {
-        return NextResponse.json({ error: report.message }, { status: 413 })
+        return NextResponse.json(sourceLimitExportBody(report), { status: 413 })
       }
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
