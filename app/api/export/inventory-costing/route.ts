@@ -16,7 +16,13 @@ import {
   type InventoryCostingReportType,
 } from '@/lib/domain/inventory/inventory-costing-reports'
 import { inventoryCostingApiAccessDenied } from '@/lib/security/inventory-costing-access'
-import { SourceScanTooLargeError, isSourceScanTooLargeError, sourceLimitExportBody } from '@/lib/security/source-scan-error'
+import { sourceLimitCsvResponse } from '@/lib/csv-source-limit'
+import { SourceScanTooLargeError, isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
+
+const EXPORT_COLUMNS: Record<string, string[]> = {
+  'cogs': ['groupLabel', 'sku', 'mpn', 'categoryName', 'warehouseCode', 'customerName', 'channel', 'qty', 'cogsBase', 'revenueBase', 'revenueBaseBound', 'grossMarginBase', 'grossMarginBaseBound', 'grossMarginPct', 'grossMarginPctBound', 'refundsNetBasis', 'refundsGrossBasis', 'refundsUnknownBasis', 'movementCount', 'revenueCaptured'],
+  'inventory-turnover': ['groupLabel', 'sku', 'mpn', 'categoryName', 'warehouseCode', 'supplierName', 'cogsBase', 'averageInventoryValueBase', 'turnoverRatio', 'daysInventoryOutstanding', 'cogsEntryCount', 'snapshotDayCount'],
+}
 
 export const INVENTORY_VALUATION_CSV_HEADERS = ['sku', 'mpn', 'productName', 'categoryName', 'supplierNames', 'warehouseCode', 'warehouseName', 'qty', 'stockUnit', 'unitCostBase', 'totalValueBase', 'glBalanceBase', 'glVarianceBase']
 
@@ -101,7 +107,7 @@ export async function getInventoryCostingExportResponse(
         if (isSourceScanTooLargeError(error)) return error
         throw error
       })
-      if (report instanceof SourceScanTooLargeError) return NextResponse.json(sourceLimitExportBody(report), { status: 413 })
+      if (report instanceof SourceScanTooLargeError) return sourceLimitCsvResponse(report, EXPORT_COLUMNS['cogs'], `cogs-${date}.csv`)
       const tooLarge = exportTooLarge(report.pageInfo.totalRows)
       if (tooLarge) return tooLarge
       const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((row) => row.productId))
@@ -140,7 +146,7 @@ export async function getInventoryCostingExportResponse(
       }))
       return csvBufferedStreamResponseFor(req, 
         rows,
-        ['groupLabel', 'sku', 'mpn', 'categoryName', 'warehouseCode', 'customerName', 'channel', 'qty', 'cogsBase', 'revenueBase', 'revenueBaseBound', 'grossMarginBase', 'grossMarginBaseBound', 'grossMarginPct', 'grossMarginPctBound', 'refundsNetBasis', 'refundsGrossBasis', 'refundsUnknownBasis', 'movementCount', 'revenueCaptured'],
+        EXPORT_COLUMNS['cogs'],
         `cogs-${date}.csv`,
         // A FILE READER HAS NO TOOLTIP. The repo's own CSV metadata channel turns this into `#`
         // comment rows at the foot of the file (only when the request carries `?metadata=1`; the default
@@ -203,7 +209,7 @@ export async function getInventoryCostingExportResponse(
         throw error
       })
       if (report instanceof SourceScanTooLargeError) {
-        return NextResponse.json(sourceLimitExportBody(report), { status: 413 })
+        return sourceLimitCsvResponse(report, EXPORT_COLUMNS['inventory-turnover'], `inventory-turnover-${date}.csv`)
       }
       const tooLarge = exportTooLarge(report.pageInfo.totalRows)
       if (tooLarge) return tooLarge
@@ -222,7 +228,7 @@ export async function getInventoryCostingExportResponse(
         cogsEntryCount: row.cogsEntryCount,
         snapshotDayCount: row.snapshotDayCount,
       }))
-      return csvBufferedStreamResponseFor(req, rows, ['groupLabel', 'sku', 'mpn', 'categoryName', 'warehouseCode', 'supplierName', 'cogsBase', 'averageInventoryValueBase', 'turnoverRatio', 'daysInventoryOutstanding', 'cogsEntryCount', 'snapshotDayCount'], `inventory-turnover-${date}.csv`)
+      return csvBufferedStreamResponseFor(req, rows, EXPORT_COLUMNS['inventory-turnover'], `inventory-turnover-${date}.csv`)
     }
   }
 }

@@ -66,8 +66,3 @@ export function hasSourceLimitNotice(notices: readonly string[] | undefined): bo
 export function withoutSourceLimitNotices(notices: readonly string[] | undefined): string[] {
   return (notices ?? []).filter((n) => !isSourceLimitNotice(n))
 }
-
-/** The CSV side: exports refuse (HTTP 413) rather than emit a file, and say so in the same words. */
-export function sourceLimitExportBody(error: SourceScanTooLargeError): { error: string; rowLimit: number; reportNotComputed: true } {
-  return { error: sourceLimitNotice(error), rowLimit: error.limit, reportNotComputed: true }
-}

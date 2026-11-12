@@ -31,6 +31,14 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 - **Fixed (review follow-up): a PAID document skipped for an unreadable payment date is revisited, and never lost.** It is remembered in a new table `xero_payment_date_pending` (migrations `20261110180000_xero_payment_date_pending` and `20261111100000_xero_payment_date_pending_tenant`, additive, ids only, scoped to the connected Xero organisation) and re-read by id on every poll (200 at a time, least recently checked first) and applied once the date is readable. A row is forgotten only when Xero's answer shows the retry is unnecessary; a document Xero leaves out of the answer stays. Remembering is a condition of the poll moving on: if the save fails the poll holds its position. Nothing is evicted. The WARNING stays.
 - Help: *Xero sync*, "Supplier bills and supplier credit notes: no tax type, no document" and "Bill VAT: each line's own rate".
 
+### EU VAT regime: an explicit gift-card flag on every order line, required after a cut-in date
+
+- **Added: the setting `eu_vat_gift_card_flag_cut_in` (default unset).** The storefront plugin writes `_o3d_is_voucher` (yes/no) on every order line. With the setting set to a date or an ISO instant, an order created at or after it whose goods lines do not ALL carry a readable flag is refused by the EU VAT regime resolver (`gift_card_flag_missing`), in both modes and for any destination; an unreadable setting refuses every order (`gift_card_cut_in_unreadable`). Unset, or an order before the cut-in, behaves as before. Nothing is inferred from coupon titles or product flags. No schema change; the resolver is not yet called by a posting path, so no document changes. See help-docs/xero-sync.md, "EU VAT regime".
+
+### Report CSV exports that hit the source-row limit return a notice file
+
+- **Changed: a report CSV export that hits its source-row limit now downloads a CSV instead of failing with HTTP 413.** The file has the report's normal column headings and one row whose first cell reads `REPORT NOT COMPUTED` with the row-limit notice in the next cell: no data rows and no totals, so it can never be read as a report of zeros. The response is HTTP 200 with the usual filename and carries `X-IMS-Report-Not-Computed: 1`, `X-IMS-Report-Row-Limit` and the existing `X-IMS-Export-Metadata` header, so scripts can detect it. Applies to the sales, purchasing, finance, replenishment, manufacturing, stock-position (aging, dead stock) and inventory-costing (COGS, turnover) exports. The separate CSV row cap (the file itself too large) still returns 413.
+
 ## 3.1.0 - 2026-11-12
 
 No operator action is required: there is no configuration change, and the two migrations are additive and nullable. Behaviour changes to know about before relying on the screens:

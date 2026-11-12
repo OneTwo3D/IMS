@@ -10,7 +10,16 @@ import {
   type FinanceAnalyticsFilters,
 } from '@/lib/domain/finance/finance-period-analytics'
 import { canAccessFinanceAnalytics } from '@/lib/security/finance-analytics-access'
-import { isSourceScanTooLargeError, sourceLimitExportBody } from '@/lib/security/source-scan-error'
+import { sourceLimitCsvResponse } from '@/lib/csv-source-limit'
+import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
+
+const EXPORT_COLUMNS: Record<string, string[]> = {
+  'vat': ['side', 'jurisdiction', 'taxRateName', 'accountingTaxType', 'ratePct', 'lineCount', 'taxableBase', 'taxBase'],
+  'ar-aging': ['partyName', 'contact', 'documentCount', 'current', 'bucket1', 'bucket2', 'bucket3', 'bucket4', 'outstandingBase', 'lastPaymentDate'],
+  'ap-aging': ['partyName', 'contact', 'documentCount', 'current', 'bucket1', 'bucket2', 'bucket3', 'bucket4', 'outstandingBase', 'lastPaymentDate'],
+  'currency-summary': ['currency', 'salesDocumentCount', 'salesForeign', 'salesBase', 'arOutstandingForeign', 'arOutstandingBase', 'arOutstandingBound', 'purchaseDocumentCount', 'purchasesForeign', 'purchasesBase', 'apOutstandingForeign', 'apOutstandingBase'],
+  'fx-gain-loss': ['side', 'settlementId', 'documentId', 'reference', 'partyName', 'currency', 'paidAt', 'amountForeign', 'bookedRateToBase', 'settlementRateToBase', 'bookedBase', 'settlementBase', 'gainLossBase', 'outcome', 'notComputableReason', 'controlAccount', 'fxGainLossAccount'],
+}
 
 const FINANCE_ANALYTICS_CSV_ROW_LIMIT = 50000
 
@@ -60,37 +69,37 @@ export async function GET(req: NextRequest) {
       const report = await getVatReport({ ...filters, pageSize: FINANCE_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['side', 'jurisdiction', 'taxRateName', 'accountingTaxType', 'ratePct', 'lineCount', 'taxableBase', 'taxBase']), `vat-${date}.csv`)
+      return csvResponse(toCsv(report.rows, EXPORT_COLUMNS['vat']), `vat-${date}.csv`)
     }
     case 'ar-aging': {
       const report = await getArAgingReport({ ...filters, pageSize: FINANCE_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['partyName', 'contact', 'documentCount', 'current', 'bucket1', 'bucket2', 'bucket3', 'bucket4', 'outstandingBase', 'lastPaymentDate']), `ar-aging-${date}.csv`)
+      return csvResponse(toCsv(report.rows, EXPORT_COLUMNS['ar-aging']), `ar-aging-${date}.csv`)
     }
     case 'ap-aging': {
       const report = await getApAgingReport({ ...filters, pageSize: FINANCE_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['partyName', 'contact', 'documentCount', 'current', 'bucket1', 'bucket2', 'bucket3', 'bucket4', 'outstandingBase', 'lastPaymentDate']), `ap-aging-${date}.csv`)
+      return csvResponse(toCsv(report.rows, EXPORT_COLUMNS['ap-aging']), `ap-aging-${date}.csv`)
     }
     case 'currency-summary': {
       const report = await getCurrencySummaryReport({ ...filters, pageSize: FINANCE_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['currency', 'salesDocumentCount', 'salesForeign', 'salesBase', 'arOutstandingForeign', 'arOutstandingBase', 'arOutstandingBound', 'purchaseDocumentCount', 'purchasesForeign', 'purchasesBase', 'apOutstandingForeign', 'apOutstandingBase']), `currency-summary-${date}.csv`)
+      return csvResponse(toCsv(report.rows, EXPORT_COLUMNS['currency-summary']), `currency-summary-${date}.csv`)
     }
     case 'fx-gain-loss': {
       const report = await getFxGainLossReport({ ...filters, pageSize: FINANCE_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['side', 'settlementId', 'documentId', 'reference', 'partyName', 'currency', 'paidAt', 'amountForeign', 'bookedRateToBase', 'settlementRateToBase', 'bookedBase', 'settlementBase', 'gainLossBase', 'outcome', 'notComputableReason', 'controlAccount', 'fxGainLossAccount']), `fx-gain-loss-${date}.csv`)
+      return csvResponse(toCsv(report.rows, EXPORT_COLUMNS['fx-gain-loss']), `fx-gain-loss-${date}.csv`)
     }
     default:
       return NextResponse.json({ error: 'Unknown finance analytics export type' }, { status: 400 })
     }
   } catch (error) {
-    if (isSourceScanTooLargeError(error)) return NextResponse.json(sourceLimitExportBody(error), { status: 413 })
+    if (isSourceScanTooLargeError(error)) return sourceLimitCsvResponse(error, EXPORT_COLUMNS[reportType] ?? [], `${reportType}-${date}.csv`)
     throw error
   }
 }
