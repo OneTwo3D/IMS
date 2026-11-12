@@ -1648,9 +1648,11 @@ figures recomputed from them. Three lines of 0.03 at 20% record 0.03 of VAT (0.0
 **A bill line keeps the tax treatment it was booked with.** When a bill is created or edited, each line stores the tax type it was sent on, its effective rate, the IMS rate it
 was read from and whether it was reverse charge. Changing the purchase order's VAT rate afterwards does **not** re-price the bill: editing the bill (quantities, amounts,
 dates, notes) and raising a supplier credit note both reproduce what was booked. A bill booked before this was recorded has no stored treatment: it is worked out from the order's
-**current** rates, and that is accepted only where it reproduces the VAT the bill recorded. If it does not (the order's rate has changed since), a supplier credit is refused
+**current** rates, and that is accepted only where it reproduces the VAT the bill recorded **to within one minor unit in total** (not a unit per line, so a long bill cannot accept a different rate) **and**, for each goods line, the rate its order line recorded when it was priced. If it does not (the order's rate has changed since), a supplier credit is refused
 (*This bill was booked before its tax treatment was recorded ... Re-save the bill*), and **re-saving the bill** (Edit bill, then Save) re-prices it at the order's current rates and records
 its treatment, after which the credit can be raised. (There is no separate tax-choice control yet: the re-save is the explicit step.)
+
+**A supplier credit is checked against the ledger's rate for its code.** Before a credit that is going to Xero is posted, the booked code's rate in the stored Xero tax-rate list is compared with the rate the bill line was booked at (as a bill is); a difference beyond rounding refuses the credit (*The credit note was not posted (it is still a draft) ...*). A code whose rate is not in the stored list is not checked.
 
 **Inactive rates are refused.** A new bill, an edit of a bill, and a supplier credit note that would be sent to Xero are refused (nothing saved or posted) when a line is priced on a
 VAT rate that is **inactive**: the line's own rate, the rate the order was charged at, or the rate a booked line was booked on. Re-activate the rate, or move the order's lines to an active

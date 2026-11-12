@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFileSync } from 'node:fs'
 
-import { inactiveBillRatesMessage, inactiveOrderRateMessage, inactiveOrderRateName, type OrderRateCandidate } from '@/lib/domain/purchasing/order-rate-tax-code'
+import { billTaxCodeDisagreementMessage, billTaxCodeDisagreements, inactiveBillRatesMessage, inactiveOrderRateMessage, inactiveOrderRateName, type OrderRateCandidate } from '@/lib/domain/purchasing/order-rate-tax-code'
 import {
   billLineTaxTreatments,
   bookedTaxFromLine,
@@ -104,4 +104,57 @@ test('wiring: create and edit refuse inactive rates and store/keep the snapshot;
   assert.equal((source.match(/booked: bookedTaxFromLine\(existingLine\)/g) ?? []).length, 2, 'an edit passes the booked treatment back for product and cost lines')
   assert.match(source, /if \(legacyTreatmentsAmbiguous\) return \{ success: false, error: LEGACY_BILL_TAX_AMBIGUOUS_MESSAGE \}/)
   assert.match(source, /where: \{ id: \{ in: ids \}, active: false, replacedById: null \}/, 'a rate a re-key retired is not "inactive"')
+})
+
+// ---- the legacy reconstruction is judged at DOCUMENT level (one minor unit in total), and per line where the order line recorded its tax --------------------
+const hundredLines = (rate: number, recorded?: { tax: number; net: number }) => {
+  const map = new Map<string, PurchaseInvoicePoLine>([['p', { id: 'p', qty: 1, product: { sku: 'A' }, taxRate: { id: 'r', accountingTaxType: 'INPUT', rate: String(rate) }, ...(recorded ? { taxForeign: recorded.tax, totalForeign: recorded.net } : {}) }]])
+  const lines = Array.from({ length: 100 }, () => ({ poLineId: 'p', costLineId: null, totalForeign: 0.05 }))
+  return billLineTaxTreatments({ billLines: lines, poLineById: map, costLineById: new Map(), poTaxRatePercent: rate })
+}
+
+test('100 lines of 0.05 booked at 20% (VAT 1.00) are NOT reproduced by an order rate that is now 5%: one minor unit in TOTAL, not per line', () => {
+  assert.equal(legacyTreatmentsReproduceBillTax({ treatments: hundredLines(0.05), billTaxForeign: 1.0, currency: 'GBP' }), false, 'rate changed: refused (a per-line allowance of 0.01 x 100 would have accepted it)')
+  assert.equal(legacyTreatmentsReproduceBillTax({ treatments: hundredLines(0.2), billTaxForeign: 1.0, currency: 'GBP' }), true, 'a legitimate legacy bill still passes')
+  assert.equal(legacyTreatmentsReproduceBillTax({ treatments: hundredLines(0.2), billTaxForeign: 1.01, currency: 'GBP' }), true, 'within one minor unit in total')
+  assert.equal(legacyTreatmentsReproduceBillTax({ treatments: hundredLines(0.2), billTaxForeign: 1.02, currency: 'GBP' }), false)
+})
+
+test('a reconstructed goods line must also reproduce the rate its order line RECORDED; a coincidentally matching header does not save it; no recorded tax relies on the header', () => {
+  const poLines = new Map<string, PurchaseInvoicePoLine>([
+    // booked at 20% (recorded 20 on 100) but the rate is now 5%
+    ['a', { id: 'a', qty: 1, product: { sku: 'A' }, taxRate: { id: 'ra', accountingTaxType: 'INPUT', rate: '0.05' }, taxForeign: 20, totalForeign: 100 }],
+    // booked at 5% (recorded 5 on 100) but the rate is now 20%
+    ['b', { id: 'b', qty: 1, product: { sku: 'B' }, taxRate: { id: 'rb', accountingTaxType: 'INPUT', rate: '0.2' }, taxForeign: 5, totalForeign: 100 }],
+  ])
+  const lines = [{ poLineId: 'a', costLineId: null, totalForeign: 100 }, { poLineId: 'b', costLineId: null, totalForeign: 100 }]
+  const t = billLineTaxTreatments({ billLines: lines, poLineById: poLines, costLineById: new Map(), poTaxRatePercent: 0.2 })
+  assert.deepEqual(t.map((x) => x.recordedRate), [0.2, 0.05])
+  // Header 25 = 5 + 20 at today's rates: the totals match by coincidence, the per-line rates do not.
+  assert.equal(legacyTreatmentsReproduceBillTax({ treatments: t, billTaxForeign: 25, currency: 'GBP' }), false)
+  // The same lines with today's rates equal to the recorded ones pass.
+  const same = new Map(poLines)
+  same.set('a', { ...poLines.get('a')!, taxRate: { id: 'ra', accountingTaxType: 'INPUT', rate: '0.2' } })
+  same.set('b', { ...poLines.get('b')!, taxRate: { id: 'rb', accountingTaxType: 'INPUT', rate: '0.05' } })
+  assert.equal(legacyTreatmentsReproduceBillTax({ treatments: billLineTaxTreatments({ billLines: lines, poLineById: same, costLineById: new Map(), poTaxRatePercent: 0.2 }), billTaxForeign: 25, currency: 'GBP' }), true)
+  // A line with no recorded tax (or a net too small to state a rate) relies on the header check alone.
+  const noRecorded = new Map(poLines)
+  noRecorded.set('a', { ...poLines.get('a')!, taxForeign: undefined, totalForeign: undefined })
+  noRecorded.set('b', { ...poLines.get('b')!, taxForeign: 0.01, totalForeign: 0.05 })
+  const lenient = billLineTaxTreatments({ billLines: lines, poLineById: noRecorded, costLineById: new Map(), poTaxRatePercent: 0.2 })
+  assert.deepEqual(lenient.map((x) => x.recordedRate), [undefined, undefined])
+  assert.equal(legacyTreatmentsReproduceBillTax({ treatments: lenient, billTaxForeign: 25, currency: 'GBP' }), true)
+})
+
+test('a credit is checked against the stored Xero rate of its BOOKED code: a mismatch is refused (credit-note wording), a match or an unknown code passes', () => {
+  const ledger = new Map<string, number | null>([['INPUT2', 20], ['UNKNOWN', null]])
+  const line = (taxType: string, rate: number, checkable = true) => ({ description: 'bill line 1', taxType, rate, checkable })
+  const bad = billTaxCodeDisagreements([line('INPUT2', 0.05)], ledger)
+  assert.equal(bad.length, 1)
+  assert.match(billTaxCodeDisagreementMessage(bad, 'credit note'), /The credit note was not posted \(it is still a draft\).*taxed at 5% in IMS but posts on INPUT2, which charges 20%/)
+  assert.deepEqual(billTaxCodeDisagreements([line('INPUT2', 0.2), line('UNKNOWN', 0.2), line('INPUT2', 0.05, false)], ledger), [])
+  assert.match(billTaxCodeDisagreementMessage(bad), /The bill was not saved/)
+  const source = readFileSync('app/actions/purchase-orders.ts', 'utf8')
+  assert.match(source, /const disagreement = await billTaxCodeRefusal\(billTreatments\.map\(/, 'the credit runs the same agreement check')
+  assert.match(source, /'credit note'\)\s*\n\s*if \(disagreement\) return/)
 })

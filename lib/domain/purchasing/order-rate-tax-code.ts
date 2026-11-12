@@ -97,9 +97,14 @@ export function billTaxCodeDisagreements(
   return out
 }
 
-export function billTaxCodeDisagreementMessage(disagreements: ReadonlyArray<string>): string {
-  return `The bill was not saved: the VAT IMS would record does not agree with the tax type it would post on - ${disagreements.join('; ')}. `
-    + 'Correct the purchase order line rate or map the rate to the tax type that charges it, then try again.'
+export function billTaxCodeDisagreementMessage(disagreements: ReadonlyArray<string>, subject: 'bill' | 'credit note' = 'bill'): string {
+  const lead = subject === 'bill'
+    ? 'The bill was not saved: the VAT IMS would record does not agree with the tax type it would post on - '
+    : 'The credit note was not posted (it is still a draft): the VAT of the bill it credits does not agree with the tax type the credit would post on - '
+  return `${lead}${disagreements.join('; ')}. `
+    + (subject === 'bill'
+      ? 'Correct the purchase order line rate or map the rate to the tax type that charges it, then try again.'
+      : 'Map the rate to the tax type that charges it, or correct the bill, then try again.')
 }
 
 /**

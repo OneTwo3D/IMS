@@ -3556,7 +3556,7 @@ async function inactiveRatesRefusal(rateIds: ReadonlyArray<string | null | undef
  * The refusal, or null: does every billed line's tax code charge, in the ledger, the rate IMS taxed that line at? Reads the stored Xero tax-rate list of the
  * connected organisation (no live call); a code whose rate is not stored is not checked. Only asked when bills are being sent to the ledger.
  */
-async function billTaxCodeRefusal(lineTaxRates: ReadonlyArray<{ description: string; taxType: string | undefined; rate: number; checkable: boolean }>): Promise<string | null> {
+async function billTaxCodeRefusal(lineTaxRates: ReadonlyArray<{ description: string; taxType: string | undefined; rate: number; checkable: boolean }>, subject: 'bill' | 'credit note' = 'bill'): Promise<string | null> {
   const codes = [...new Set(lineTaxRates.filter((l) => l.checkable && l.taxType).map((l) => l.taxType as string))]
   if (codes.length === 0) return null
   const token = await db.accountingToken.findUnique({ where: { connector: 'xero' }, select: { tenantId: true } })
@@ -3567,7 +3567,7 @@ async function billTaxCodeRefusal(lineTaxRates: ReadonlyArray<{ description: str
   })
   const ledgerRates = new Map(rows.map((row) => [row.taxType, row.effectiveRate == null ? null : Number(row.effectiveRate)] as const))
   const disagreements = billTaxCodeDisagreements(lineTaxRates, ledgerRates)
-  return disagreements.length > 0 ? billTaxCodeDisagreementMessage(disagreements) : null
+  return disagreements.length > 0 ? billTaxCodeDisagreementMessage(disagreements, subject) : null
 }
 
 export async function createInvoice(
@@ -5135,6 +5135,9 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
             lines: {
               select: {
                 id: true,
+                // What the order line recorded when it was priced: checks a reconstruction of a bill line booked before the snapshot existed.
+                taxForeign: true,
+                totalForeign: true,
                 taxRate: {
                   select: {
                     id: true, accountingTaxType: true, reverseCharge: true, rate: true, isCompound: true,
@@ -5170,7 +5173,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     const orderRate = anyLegacyLine ? await orderRateTaxCodeFor(cn.po, supplierRate) : { code: null, inactiveName: null }
     const billTreatments = billLineTaxTreatments({
       billLines: billLinesBooked,
-      poLineById: new Map(cn.po.lines.map((l) => [l.id, { id: l.id, qty: 0, product: { sku: '' }, taxRate: l.taxRate }])),
+      poLineById: new Map(cn.po.lines.map((l) => [l.id, { id: l.id, qty: 0, product: { sku: '' }, taxRate: l.taxRate, taxForeign: l.taxForeign, totalForeign: l.totalForeign }])),
       costLineById: new Map(cn.po.freightCostLines.map((c) => [c.id, c])),
       poType: cn.po.type,
       poTaxRatePercent: cn.po.taxRatePercent != null ? cn.po.taxRatePercent.toString() : null,
@@ -5244,6 +5247,9 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       if (legacyTreatmentsAmbiguous) return { success: false, error: LEGACY_BILL_TAX_AMBIGUOUS_MESSAGE }
       const inactiveRate = await inactiveRatesRefusal(billTreatments.map((t) => t.taxRateId))
       if (inactiveRate) return { success: false, error: inactiveRate }
+      // The code the credit would post on is the bill's BOOKED code: it must still charge, in the ledger, the rate the line was booked at (the same agreement check as a bill's).
+      const disagreement = await billTaxCodeRefusal(billTreatments.map((t, i) => ({ description: `bill line ${i + 1}`, taxType: t.taxType, rate: t.rate, checkable: !t.reverseCharge })), 'credit note')
+      if (disagreement) return { success: false, error: disagreement }
     }
     const postsLocallyOnly = creditNotePosting.verdict === 'post' && !shouldQueueXero && settings.syncEnabled
     if (postsLocallyOnly) {

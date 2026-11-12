@@ -45,6 +45,9 @@ export type PurchaseInvoicePoLine = {
    * them with the compound-rate maths the sales side and the tax-rate code use (lib/tax/tax-rate-components.ts), never from a line's rounded tax over its net.
    */
   taxRate?: { id?: string; accountingTaxType: string | null; reverseCharge?: boolean; rate?: unknown; isCompound?: boolean; components?: ReadonlyArray<{ rate: unknown; compoundOnPrevious?: boolean }> } | null
+  /** What the order line recorded when it was priced (stored tax and net), used only to check a reconstruction of a legacy bill line (see `BilledLineTaxTreatment.recordedRate`). */
+  taxForeign?: unknown
+  totalForeign?: unknown
 }
 
 export type PurchaseInvoiceCostLine = {
@@ -630,6 +633,12 @@ export type BilledLineTaxTreatment = {
   net: number
   /** True when the treatment was RECONSTRUCTED from the order's current rates (a line booked before the snapshot existed), false when it is the booked snapshot. */
   legacy: boolean
+  /**
+   * The rate the order line RECORDED when it was priced (its stored tax over its stored net, a fraction), for a reconstructed goods line whose stored net is large enough
+   * to state it. The order's stored line tax is not refreshed when a rate is changed on a non-draft order, so it is the rate the line was booked at: a reconstruction that
+   * disagrees with it is on a rate that has changed since.
+   */
+  recordedRate?: number
 }
 
 /** What the bill line row stores of its booked treatment (the five snapshot columns). */
@@ -674,7 +683,12 @@ export function billLineTaxTreatments(params: {
     if (line.poLineId) {
       const poLine = params.poLineById.get(line.poLineId)
       if (!poLine) return { taxType: undefined, rate: 0, reverseCharge: false, net, legacy: true }
+      const recordedNet = Number(poLine.totalForeign ?? 0)
+      const recordedRate = poLine.totalForeign != null && poLine.taxForeign != null && recordedNet >= RECORDED_RATE_MIN_NET
+        ? toDecimal(String(poLine.taxForeign)).div(recordedNet).toNumber()
+        : undefined
       return {
+        recordedRate,
         taxType: poLine.taxRate
           ? resolvePurchaseLineTaxType({ baseTaxType: poLine.taxRate.accountingTaxType, reverseCharge: poLine.taxRate.reverseCharge, reverseChargePurchaseTaxType: params.reverseChargeTaxType })
           : params.orderRateTaxType,
@@ -692,16 +706,25 @@ export function billLineTaxTreatments(params: {
   })
 }
 
+/** A stored line tax is rounded to four places, so it only states a rate once the line's net is at least this large (a smaller line would put the rate within rounding noise). */
+const RECORDED_RATE_MIN_NET = 1
+/** A rate read back from a line's stored tax over its stored net is accepted within this (four-place rounding of the tax on a net of at least RECORDED_RATE_MIN_NET, plus a margin). */
+const RECORDED_RATE_TOLERANCE = 0.0002
+
 /**
  * DOES A RECONSTRUCTION REPRODUCE WHAT THE BILL RECORDED? A line booked before the snapshot existed can only be re-derived from the order's CURRENT rates, which may have
- * changed since. The reconstruction is accepted only when, priced line by line the way the bill is (each line's VAT rounded to the currency's minor unit), it adds up to
- * the VAT the bill's header recorded (within a minor unit a line). Otherwise it is ambiguous and the caller refuses.
+ * changed since. The reconstruction is accepted only when BOTH hold; otherwise the original treatment cannot be established and the caller refuses:
+ *   1. DOCUMENT LEVEL: priced line by line the way the bill is (each line's VAT rounded to the currency's minor unit), it adds up to the VAT the bill's header recorded within
+ *      ONE minor unit IN TOTAL, not a unit per line (a per-line allowance would let a hundred-line bill accept a completely different rate);
+ *   2. LINE LEVEL, where the line states it: a reconstructed goods line's rate must reproduce the rate its order line RECORDED when it was priced (`recordedRate`).
+ * A line with no recorded tax relies on the header check alone.
  */
 export function legacyTreatmentsReproduceBillTax(params: { treatments: ReadonlyArray<BilledLineTaxTreatment>; billTaxForeign: DecimalInput; currency: string }): boolean {
   let sum = toDecimal(0)
   for (const t of params.treatments) sum = addMoney(sum, roundMoney(multiplyMoney(t.net, t.rate), params.currency))
   const unit = toDecimal(1).div(toDecimal(10).pow(currencyMinorUnitsOf(params.currency)))
-  return sum.minus(toDecimal(params.billTaxForeign)).abs().lte(unit.times(Math.max(1, params.treatments.length)))
+  if (sum.minus(toDecimal(params.billTaxForeign)).abs().gt(unit)) return false
+  return params.treatments.every((t) => t.recordedRate === undefined || Math.abs(t.rate - t.recordedRate) <= RECORDED_RATE_TOLERANCE)
 }
 
 function currencyMinorUnitsOf(currency: string): number {
