@@ -1276,3 +1276,64 @@ test('[eu vat] the SWEEP never releases a treated hold that carries the not-tota
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /does not total the order/)
 })
+
+// THE TREATMENT AND THE IMPORT'S HELD-INVOICE CHECK DECIDE THE REGIME FROM THE SAME SETTINGS-DERIVED INPUT, the gift-card flag cut-in included.
+const GIFT_CARD_CUT_IN = 'eu_vat_gift_card_flag_cut_in'
+async function giftCardHold(t: test.TestContext, cutIn: { atPark: string | null; atRelease: string | null }) {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = true
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seed(db, wcRateId)
+  const setCutIn = async (value: string | null) => {
+    if (value === null) await db.setting.deleteMany({ where: { key: GIFT_CARD_CUT_IN } })
+    else await db.setting.upsert({ where: { key: GIFT_CARD_CUT_IN }, create: { key: GIFT_CARD_CUT_IN, value }, update: { value } })
+  }
+  t.after(async () => { switchOn = false; await setCutIn(null); await cleanup(db, externalId, ctx) })
+  // The order carries a gift-card line with NO flag (the plugin did not write one): lenient before the cut-in, a refusal from it on. It was created 2026-11-02.
+  const unflagged = (m: Meta) => { const p = payload(externalId, wcRateId, m); p.line_items[0]!.meta_data = []; return p }
+  await setCutIn(cutIn.atPark)
+  const first = await importWcOrder(unflagged(PLUGIN('821')) as never)
+  assert.equal(first.success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  const parkedMarker = (held.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment as Record<string, unknown>
+  const stampedAtPark = (await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { euVatRegime: true } })).euVatRegime
+  await setCutIn(cutIn.atRelease)
+  await importWcOrder(unflagged([{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...PLUGIN('821')]) as never)
+  return {
+    parkedMarker, stampedAtPark,
+    after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }),
+    rows: await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId } }),
+  }
+}
+
+test('[eu vat] gift-card line with no flag, cut-in AFTER the order (lenient): the treatment stamps IOSS and the held-invoice check agrees, so the hold is released', { skip }, async (t) => {
+  const { parkedMarker, stampedAtPark, rows, after } = await giftCardHold(t, { atPark: '2026-12-01', atRelease: '2026-12-01' })
+  assert.equal(parkedMarker.applied, true)
+  assert.equal(stampedAtPark, 'IOSS')
+  assert.equal(rows.length, 1, 'released')
+  assert.equal(after.status, 'SYNCED')
+})
+
+test('[eu vat] gift-card line with no flag, cut-in BEFORE the order (required): the treatment refuses it by the flag, stamps nothing, and the re-import refuses it for the same reason', { skip }, async (t) => {
+  const { parkedMarker, stampedAtPark, rows, after } = await giftCardHold(t, { atPark: '2026-11-01', atRelease: '2026-11-01' })
+  assert.deepEqual([parkedMarker.applied, parkedMarker.reason], [false, 'treatment_refused'])
+  assert.match(String(parkedMarker.refusal), /gift-card flag/)
+  assert.equal(stampedAtPark, null, 'nothing was stamped')
+  assert.equal(rows.length, 0)
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /gift-card flag/)
+})
+
+test('[eu vat] the cut-in passes between parking and release: the treated hold is refused by the held-invoice check with the same gift-card reason', { skip }, async (t) => {
+  const { parkedMarker, stampedAtPark, rows, after } = await giftCardHold(t, { atPark: '2026-12-01', atRelease: '2026-11-01' })
+  assert.equal(parkedMarker.applied, true)
+  assert.equal(stampedAtPark, 'IOSS')
+  assert.equal(rows.length, 0, 'nothing queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /gift-card flag/)
+})

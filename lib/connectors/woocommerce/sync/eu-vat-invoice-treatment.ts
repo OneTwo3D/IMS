@@ -25,7 +25,7 @@ import {
 } from '@/lib/domain/accounting/eu-vat-treatment'
 import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
 import { currentWcTaxBinding, recordWcTaxBinding, type InvoiceTaxTypesInput, type WcTaxBinding } from './wc-tax-binding'
-import { buildEuVatRegimeInput, readEuVatRegimeMode } from './eu-vat-facts'
+import { buildEuVatRegimeInputFromSettings, readEuVatRegimeMode } from './eu-vat-facts'
 import type { MappedLine } from './field-mapping'
 import type { WcFullOrder } from './types'
 
@@ -64,7 +64,7 @@ export async function treatImportedSalesInvoice(params: {
   const taxBinding = await currentWcTaxBinding(params.wcOrder, params.mappedLines, params.taxBindingDeps)
   const mode = await readEuVatRegimeMode()
   if (mode === null) return { kind: 'refused', reason: 'the setting "eu_vat_regime_mode" holds a value that is neither adopt_plugin nor decide, so IMS cannot tell who decides the EU VAT regime' }
-  const input = await buildEuVatRegimeInput(db, params.wcOrder, { ioss: params.accounts.ioss, ddp: params.accounts.ddp }, { mode })
+  const input = await buildEuVatRegimeInputFromSettings(db, params.wcOrder, { ioss: params.accounts.ioss, ddp: params.accounts.ddp }, { mode })
   const decision = resolveEuVatRegime(input)
   const outcome = await db.$transaction((tx) => stampEuVatRegime(tx, params.orderId, () => input, params.now), { maxWait: 5_000, timeout: 20_000 })
   if (outcome.kind === 'refused') return { kind: 'refused', reason: `the order's EU VAT regime cannot be established (${outcome.code}): ${outcome.reason}` }
@@ -139,7 +139,7 @@ export async function previewTreatedSalesInvoice(client: Prisma.TransactionClien
   const taxBinding = await currentWcTaxBinding(params.wcOrder, params.mappedLines, params.taxBindingDeps)
   const mode = await readEuVatRegimeMode()
   if (mode === null) return { kind: 'refused', reason: 'the setting "eu_vat_regime_mode" holds a value that is neither adopt_plugin nor decide, so IMS cannot tell who decides the EU VAT regime' }
-  const input = await buildEuVatRegimeInput(client, params.wcOrder, { ioss: params.accounts.ioss, ddp: params.accounts.ddp }, { mode })
+  const input = await buildEuVatRegimeInputFromSettings(client, params.wcOrder, { ioss: params.accounts.ioss, ddp: params.accounts.ddp }, { mode })
   const stamp = await readEuVatRegimeStamp(client, params.orderId)
   if (stamp === null) return { kind: 'refused', reason: 'the order carries no EU VAT regime stamp' }
   return completeTreatment(params, stamp, resolveEuVatRegime(input), input, [], taxBinding)

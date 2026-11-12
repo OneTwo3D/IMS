@@ -59,7 +59,7 @@ import { rateBinding, resolveSalesLineTaxType } from '@/lib/accounting/reverse-c
 import { previewTreatedSalesInvoice, treatImportedSalesInvoice } from './eu-vat-invoice-treatment'
 import { heldFreshBuildDifference, heldInvoiceDifference, heldTaxBindingDifference, heldUntreatedTaxDifference, type ExpectedHeldInvoice } from './held-invoice-verification'
 import { currentWcTaxBinding, recordWcTaxBinding } from './wc-tax-binding'
-import { buildEuVatRegimeInput, readEuVatRegimeMode } from './eu-vat-facts'
+import { buildEuVatRegimeInputFromSettings, readEuVatRegimeMode } from './eu-vat-facts'
 import { resolveEuVatRegime } from '@/lib/domain/accounting/eu-vat-regime'
 import { readEuVatRegimeStamp } from '@/lib/domain/accounting/eu-vat-regime-stamp'
 import { EU_VAT_TREATMENT_PAYLOAD_KEY, routeFor } from '@/lib/domain/accounting/eu-vat-treatment'
@@ -2159,7 +2159,7 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     }
     const mode = await readEuVatRegimeMode()
     if (mode === null) return 'the EU VAT regime mode setting is unreadable'
-    const input = await buildEuVatRegimeInput(client, wcOrder, { ioss: accounts.ioss, ddp: accounts.ddp }, { mode })
+    const input = await buildEuVatRegimeInputFromSettings(client, wcOrder, { ioss: accounts.ioss, ddp: accounts.ddp }, { mode })
     const stamp = await readEuVatRegimeStamp(client, orderId)
     if (stamp === null) return 'the order carries no EU VAT regime stamp'
     const routed = routeFor(stamp, resolveEuVatRegime(input), input)

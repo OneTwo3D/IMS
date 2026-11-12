@@ -63,7 +63,7 @@ function build(row: FixtureRow, opts: { goodsSubtotal: string; destination?: str
       }]
   const nok = destination === 'NO'
   const input: EuVatRegimeInput = {
-    unreadable: [], mode: 'decide', pluginFx: { state: 'absent' }, pluginFxConflict: false,
+    unreadable: [], mode: 'decide', giftCardFlag: 'off', pluginFx: { state: 'absent' }, pluginFxConflict: false,
     shippingCountry: destination || 'GB', billingCountry: destination || 'GB', currency: opts.currency ?? (nok ? 'NOK' : 'EUR'),
     goodsLines: [{ total: goodsNet.toString(), voucher: 'no' }], rates, orderTax: vat.toString(),
     vatExempt: opts.exempt ?? 'no', vatRecord: { state: 'absent' }, eas: { state: 'absent' },
