@@ -3,7 +3,7 @@
  * Each entry represents one IMS transaction → one Xero API call.
  */
 
-import { euSchemePostingRefusal, regimePolicyLastCheck } from './scheme-posting-check'
+import { composeFinalBeforePost, euSchemePostingRefusal } from './scheme-posting-check'
 import { holdInvoiceOnRegimePolicyChange, REGIME_POLICY_BLOCKED_REFUSAL } from '@/lib/connectors/woocommerce/sync/regime-policy-hold'
 import { resolveSalesPostContact } from '@/lib/domain/erasure/accounting-contact'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
@@ -6247,7 +6247,7 @@ export async function processClaimedEntry(
         // o3d-k26m.5 round 5/6: the number fence's LAST word. Handed in here, scoped around the
         // create by pushSalesInvoice, and evaluated inside the HTTP client on every attempt as the
         // last statement before the socket. Nothing is sent if it refuses.
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId, beforePost: async (request) => { const lastPolicy = await regimePolicyLastCheck(payload as Record<string, unknown>, 'create')(request); return lastPolicy.ok ? numberFence.beforePost(request) : lastPolicy }, contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) })
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId, beforePost: composeFinalBeforePost(numberFence.beforePost, payload as Record<string, unknown>, 'create'), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) })
       return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, externalRevisionAt: invoiceResult.externalRevisionAt, error: invoiceResult.error }
     }
 
@@ -6294,7 +6294,7 @@ export async function processClaimedEntry(
         discountTaxType: payload.discountTaxType as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId, beforePost: regimePolicyLastCheck(payload as Record<string, unknown>, 'update'), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) })
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId, beforePost: composeFinalBeforePost(null, payload as Record<string, unknown>, 'update'), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) })
       return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, externalRevisionAt: invoiceResult.externalRevisionAt, error: invoiceResult.error }
     }
 

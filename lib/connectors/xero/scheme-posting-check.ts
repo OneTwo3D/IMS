@@ -43,23 +43,46 @@ export async function euSchemePostingRefusal(payload: Record<string, unknown>, n
   return `NOTHING WAS SENT. Sales invoice ${String(payload.invoiceNumber ?? '(no number)')} was refused: ${problem}. The invoice was built for an IOSS, VOEC or DDP order on a zero-rated type and would not total the order on any other. Fix the Xero tax type or the IMS rate's scheme posting type, then re-import the order.`
 }
 
+/** The scheme posting-type proof of a treated scheme payload (the stored Xero list, read now); null for every other payload or when the type is proven zero-rated and active. */
+async function schemeTypeProblem(payload: Record<string, unknown>, now: Date = new Date()): Promise<string | null> {
+  const marker = payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown; route?: unknown; schemePostingTaxType?: unknown } | null | undefined
+  if (typeof marker !== 'object' || marker === null || marker.applied !== true || marker.route !== 'scheme') return null
+  const type = typeof marker.schemePostingTaxType === 'string' ? marker.schemePostingTaxType.trim() : ''
+  return type === '' ? 'the treatment marker names no scheme posting type' : storedSchemePostingTypeProblem(type, now)
+}
+
 /**
- * THE REGIME POLICY AT THE LAST POINT BEFORE THE SOCKET. The early check (`euSchemePostingRefusal`, and the supersede-and-park beside it) runs before the number lookup, the payload preparation and the remote-write fence, and a setting can change in that time. This is the
- * authorization the HTTP client runs as the LAST statement before the request leaves (`beforePost`, composed with the number fence on a create, alone on an update): a treated payload whose recorded policy is missing or differs is refused here and nothing is sent.
- * It only ever REFUSES, never supersedes: by now this attempt's dispatch marker has been minted, so the row is not provably unsent and the refusal says to check Xero first. What changes after this check, while the request is on the wire, cannot be checked by anything.
+ * THE FINAL CHECK BEFORE THE SOCKET: the scheme posting-type proof, then the recorded regime policy, in ONE function so the order is structural. It is the LAST thing the pre-socket authorization (`beforePost`, the callback the HTTP client runs as its final statement before
+ * the request leaves) does, after the number fence on a create: the early check (`euSchemePostingRefusal`, with the supersede-and-park beside it) runs before the number lookup, the payload preparation and the remote-write fence, and the stored Xero list or a setting can change in
+ * that time. The policy compare is the last awaited step, and the function returns straight after it: nothing is awaited between the compare and the return.
+ * It only ever REFUSES, never supersedes: this attempt's dispatch marker has been minted by now, so the row is not provably unsent and the refusal says to check Xero first. What changes after this, while the request is on the wire, cannot be checked by anything.
  */
-export function regimePolicyLastCheck(payload: Record<string, unknown>, kind: 'create' | 'update'): BeforeRemoteWrite {
+export function finalSchemeAndPolicyCheck(payload: Record<string, unknown>, kind: 'create' | 'update'): BeforeRemoteWrite {
   return async () => {
+    const number = String(payload.invoiceNumber ?? '(no number)')
+    const typeProblem = await schemeTypeProblem(payload)
+    if (typeProblem !== null) {
+      return { ok: false, error: `NOTHING WAS SENT. Sales invoice ${number} ${kind === 'update' ? 'update ' : ''}was refused immediately before it left: ${typeProblem}. The invoice was built for an IOSS, VOEC or DDP order on a zero-rated type and would not total the order on any other. The dispatch for this row was already recorded, so check Xero for invoice ${number} first; fix the Xero tax type, then re-import the order.` }
+    }
     const marker = payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown; regimePolicy?: unknown } | null | undefined
     if (typeof marker !== 'object' || marker === null || marker.applied !== true) return { ok: true }
-    const problem = await regimePolicyProblem(marker.regimePolicy)
-    if (problem === null) return { ok: true }
-    const number = String(payload.invoiceNumber ?? '(no number)')
-    return {
-      ok: false,
-      error: kind === 'create'
-        ? REGIME_POLICY_BLOCKED_REFUSAL(number, problem)
-        : `NOTHING WAS SENT. The update of sales invoice ${number} was refused immediately before it left: ${problem}. The invoice in Xero was not changed. Check Xero for invoice ${number} first, then re-import the order.`,
+    const policyProblem = await regimePolicyProblem(marker.regimePolicy)
+    return policyProblem === null
+      ? { ok: true }
+      : { ok: false, error: kind === 'create'
+        ? REGIME_POLICY_BLOCKED_REFUSAL(number, policyProblem)
+        : `NOTHING WAS SENT. The update of sales invoice ${number} was refused immediately before it left: ${policyProblem}. The invoice in Xero was not changed. Check Xero for invoice ${number} first, then re-import the order.` }
+  }
+}
+
+/** The pre-socket authorization of a sales-invoice post: the number fence FIRST (a create; its transaction can take time), then the final scheme and policy check, last. An update has no number fence. */
+export function composeFinalBeforePost(numberFence: BeforeRemoteWrite | null, payload: Record<string, unknown>, kind: 'create' | 'update'): BeforeRemoteWrite {
+  const last = finalSchemeAndPolicyCheck(payload, kind)
+  return async (request) => {
+    if (numberFence !== null) {
+      const fenced = await numberFence(request)
+      if (!fenced.ok) return fenced
     }
+    return last(request)
   }
 }
