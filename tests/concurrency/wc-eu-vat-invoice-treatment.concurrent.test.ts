@@ -1108,7 +1108,7 @@ test('[eu vat] a treated hold where the per-line tax split shifts (a marked fee 
   assert.notEqual(after.status, 'SYNCED')
 })
 
-async function domesticHoldMutated(t: test.TestContext, mutate: ((p: ReturnType<typeof domesticPayload>) => void) | null) {
+async function domesticHoldMutated(t: test.TestContext, mutate: ((p: ReturnType<typeof domesticPayload>) => void) | null, between?: (db: Awaited<ReturnType<typeof loadDb>>, orderId: string) => Promise<void>) {
   const db = await loadDb()
   await mockAccounting()
   switchOn = true
@@ -1124,6 +1124,7 @@ async function domesticHoldMutated(t: test.TestContext, mutate: ((p: ReturnType<
   const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
   const again = domesticPayload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...extra])
   if (mutate) mutate(again)
+  if (between) await between(db, orderId)
   await importWcOrder(again as never)
   return { after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }), rows: await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId } }) }
 }
@@ -1142,4 +1143,19 @@ test('[eu vat] a domestic treated hold where WooCommerce moves tax from the ship
   assert.equal(rows.length, 0, 'nothing was queued')
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /the order changed after it was held \(.+\) and needs its invoice rebuilt|does not total the order/)
+})
+
+// WHAT XERO ALSO READS: the payment method picks the payment account, the settlement rate drives the payment follow-up.
+test('[eu vat] a PAID held order whose payment method changes before numbering is refused', { skip }, async (t) => {
+  const { after, rows } = await domesticHoldMutated(t, (p) => { p.payment_method = 'stripe' })
+  assert.equal(rows.length, 0, 'nothing was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /the order changed after it was held \(the parked invoice differs from the invoice the order produces now at _paymentMethod\)/)
+})
+
+test('[eu vat] a PAID held order whose receipt\'s settlement rate changes before numbering is refused', { skip }, async (t) => {
+  const { after, rows } = await domesticHoldMutated(t, null, async (db, orderId) => { await db.payment.updateMany({ where: { orderId }, data: { settlementRateToBase: 1.2 } }) })
+  assert.equal(rows.length, 0, 'nothing was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /at _paymentSettlementRateToBase\)/)
 })

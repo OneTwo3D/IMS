@@ -308,8 +308,10 @@ test('importWcOrder: classifies before it writes, refuses before the create, and
   }
   assert.match(body, /discountAmount: orderLevelDiscountForeign,\s*\/\/[^\n]*\n\s*storeCreditForeign,/, 'the create writes the credit to its own column right beside the discount')
   assert.doesNotMatch(body, /mapWcOrderDiscount\(wcOrder\.coupon_lines\)/, 'the sum-every-coupon mapping is gone from the import')
-  assert.match(body, /_registerPayment: !!wcOrder\.date_paid_gmt && documentTotalsToTheOrder && !hasStoreCredit/)
-  assert.match(body, /totalsToTheOrder: documentTotalsToTheOrder && !hasStoreCredit/)
+  // The payment legs are built in buildWcInvoiceCore (the pure core shared with the held-invoice check); the import must hand it the store-credit verdict and the reconciliation verdict.
+  assert.match(src, /_registerPayment: !!wcOrder\.date_paid_gmt && documentTotalsToTheOrder && !hasStoreCredit/)
+  assert.match(src, /totalsToTheOrder: documentTotalsToTheOrder && !hasStoreCredit/)
+  assert.match(body, /buildWcInvoiceCore\(\{[\s\S]*?documentTotalsToTheOrder, hasStoreCredit, unreconciledReason/, 'importWcOrder gives the invoice core the store-credit and reconciliation verdicts')
   assert.match(body, /action: STORE_CREDIT_INVOICE_WITHHELD_ACTION/)
   assert.match(body, /subtotalForeign: reported\.goodsNet,\s*taxForeign: reported\.tax,\s*shippingForeign: reported\.shipping,/, 'the reconciliation is fed WooCommerce\'s own reported amounts')
   assert.match(body, /storeCreditAssessment: 'ASSESSED',/, 'the creating write is the only place the credit-aware provenance is written')

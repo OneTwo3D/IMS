@@ -155,7 +155,14 @@ export type { TreatableLine }
  * tax types, the treatment, the payment legs) and the result is compared with the parked payload on EVERY field, so an input nobody listed cannot slip through. Only identity and timing fields are left out: the contact, dates and
  * reference, the FX stamp and the receipt's identity. The treatment marker is left out too (its facts are checked above and its effects are in the lines). Returns the path of the first difference, or null when they are the same.
  */
-const FRESH_COMPARE_EXCLUDED = new Set(['contactName', 'contactEmail', 'date', 'reference', 'currencyRateToBase', 'invoiceNumber', '_postingMode', '_paymentMethod', '_paymentDate', '_paymentSettlementRateToBase', '_paymentId', '_euVatTreatment'])
+// TRUE IDENTITY ONLY. Everything else Xero reads is compared (the invoice date, the exchange-rate stamp, the payment method, date, settlement rate and receipt id, the posting mode), each against the value derived from the current order and its stored rows.
+//  contactName, contactEmail: the customer's own details; an erasure scrubs them in a parked payload, and the contact is matched by the connector, not by these fields staying equal.
+//  reference: the order number as the shop prefixes it, an identity label that decides no amount, account or date.
+//  invoiceNumber: given by WooCommerce when the hold is released; it is not in a parked payload until then.
+//  _euVatTreatment: the treatment marker; its facts are compared by the checks that read it and its effects are the lines compared here.
+const FRESH_COMPARE_EXCLUDED = new Set(['contactName', 'contactEmail', 'reference', 'invoiceNumber', '_euVatTreatment'])
+// Stored to eight places: an exchange rate that has more places than the column holds is the same rate.
+const RATE_KEYS = ['currencyRateToBase', '_paymentSettlementRateToBase'] as const
 
 const canonical = (value: unknown): unknown => {
   if (Array.isArray(value)) return value.map(canonical)
@@ -194,7 +201,7 @@ const firstDifference = (parked: unknown, fresh: unknown, path: string): string 
 export function heldFreshBuildDifference(parked: Record<string, unknown>, fresh: Record<string, unknown>): string | null {
   const keep = (payload: Record<string, unknown>): Record<string, unknown> => {
     const out: Record<string, unknown> = {}
-    for (const [key, value] of Object.entries(payload)) if (!FRESH_COMPARE_EXCLUDED.has(key)) out[key] = value
+    for (const [key, value] of Object.entries(payload)) if (!FRESH_COMPARE_EXCLUDED.has(key)) out[key] = (RATE_KEYS as readonly string[]).includes(key) && typeof value === 'number' ? Math.round(value * 1e8) / 1e8 : value
     return canonical(JSON.parse(JSON.stringify(out))) as Record<string, unknown>
   }
   const path = firstDifference(keep(parked), keep(fresh), '')

@@ -2113,10 +2113,26 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     const rec = reconcileWcDocumentWithOrder(wcOrder, mappedLines, resolution, shippingForeign, currency)
     const types = await resolveWcInvoiceTaxTypes({ wcOrder, mappedLines, resolution, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, shippingForeign, currency })
     const ratesNow = await currentTaxRates(db, [...resolution.lineTaxResolved.map((r) => r.taxRateId), rec.shippingTax.taxRateId, resolution.orderDefaultTaxRateId])
-    const core = { currency, ...buildWcInvoiceCore({
+    // What Xero also reads, derived as the importer derives it: the invoice date and the payment method and date from the order; the exchange-rate stamp from the order's STORED rate, and the receipt's identity and settlement rate from the receipt
+    // row the import wrote (never from today's FX tables: a hold waiting for its number must not be refused because a rate moved).
+    const stored = await client.salesOrder.findUnique({ where: { id: orderId }, select: { fxRateToBase: true } })
+    const receipt = wcOrder.date_paid_gmt
+      ? await client.payment.findFirst({ where: { orderId, refundId: null, notes: WC_RECEIPT_NOTE_IMPORTED_PAID }, orderBy: { createdAt: 'asc' }, select: { id: true, settlementRateToBase: true } })
+      : null
+    const core = {
+      currency,
+      date: parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created).toISOString().slice(0, 10),
+      currencyRateToBase: usableStoredFxRate(stored?.fxRateToBase)?.toNumber(),
+      _postingMode: 'submitted',
+      _paymentMethod: wcOrder.payment_method || undefined,
+      _paymentDate: wcOrder.date_paid_gmt || undefined,
+      ...(receipt?.settlementRateToBase != null ? { _paymentSettlementRateToBase: Math.round(Number(receipt.settlementRateToBase) * 1e8) / 1e8 } : {}),
+      ...(receipt ? { _paymentId: receipt.id } : {}),
+      ...buildWcInvoiceCore({
       wcOrder, mappedLines, lineRateIds: resolution.lineTaxResolved.map((r) => r.taxRateId), ratesNow, invoiceTaxTypes: types, shippingRateId: rec.shippingTax.taxRateId, orderDefaultTaxRateId: resolution.orderDefaultTaxRateId, settings,
       amounts: { lineAmountsIncludeTax: amounts.lineAmountsIncludeTax, shippingAmount: amounts.shippingAmount, orderLevelDiscountAmount: amounts.discountAmount }, documentTotalsToTheOrder: rec.documentTotalsToTheOrder, hasStoreCredit: false, unreconciledReason: rec.unreconciledReason,
-    }) }
+    }),
+    }
     if (!withTreatment) return { ok: true, payload: core }
     if (rec.unreconciledReason !== null) return { ok: false, reason: `the document does not total the order: ${rec.unreconciledReason}` }
     const outcome = await previewTreatedSalesInvoice(client, {

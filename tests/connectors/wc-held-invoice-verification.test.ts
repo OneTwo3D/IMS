@@ -149,14 +149,18 @@ test('an untreated hold: each parked line type must be EXACTLY the effective typ
 
 // THE FRESH-BUILD COMPARISON (pure): every accounting field, identity and timing excluded.
 const freshDoc = () => ({
-  contactName: 'A', contactEmail: 'a@example.test', date: '2026-11-02', reference: 'WC-1', currencyRateToBase: 1, currency: 'GBP', invoiceNumber: 'INV-1',
+  contactName: 'A', contactEmail: 'a@example.test', date: '2026-11-02', reference: 'WC-1', currencyRateToBase: 1.25, currency: 'GBP', invoiceNumber: 'INV-1', _postingMode: 'submitted',
+  _paymentMethod: 'bacs', _paymentDate: '2026-11-02T09:05:00', _paymentSettlementRateToBase: 1.25, _paymentId: 'p1',
   lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: 'OUTPUT2', discountAmount: undefined }, { description: 'Fee', quantity: 1, unitAmount: 4, accountCode: '232', taxType: 'NONE', noTaxKind: 'fee-no-tax' }],
   shippingAmount: 10, shippingTaxType: 'OUTPUT2', discountAmount: 5, discountTaxType: 'OUTPUT2', lineAmountsIncludeTax: false, _registerPayment: true, _paymentAmount: 132,
 })
-test('[fresh build] the same document, with different identity and timing, is not different', () => {
-  const parked = { ...freshDoc(), _euVatTreatment: { applied: true }, _paymentDate: 'x', _paymentId: 'p1', _postingMode: 'submitted' }
-  const fresh = { ...freshDoc(), contactName: 'B', date: '2026-11-09', reference: 'WC-2', invoiceNumber: undefined, _paymentId: undefined }
+test('[fresh build] the same document, with different contact, reference and invoice number only, is not different', () => {
+  const parked = { ...freshDoc(), _euVatTreatment: { applied: true } }
+  const fresh = { ...freshDoc(), contactName: 'B', contactEmail: undefined, reference: 'WC-2', invoiceNumber: undefined }
   assert.equal(heldFreshBuildDifference(parked, fresh), null)
+})
+test('[fresh build] an exchange rate that differs only beyond eight places is the same rate', () => {
+  assert.equal(heldFreshBuildDifference(freshDoc(), { ...freshDoc(), currencyRateToBase: 1.250000000004, _paymentSettlementRateToBase: 1.2500000000049 }), null)
 })
 test('[fresh build] any accounting field that differs names its path', () => {
   const parked = freshDoc() as Record<string, unknown>
@@ -168,5 +172,12 @@ test('[fresh build] any accounting field that differs names its path', () => {
   t((d) => { d.discountTaxType = 'ZERORATEDOUTPUT' }, 'discountTaxType')
   t((d) => { d._paymentAmount = 131 }, '_paymentAmount')
   t((d) => { d.currency = 'EUR' }, 'currency')
+  t((d) => { d.date = '2026-11-03' }, 'date')
+  t((d) => { d._paymentMethod = 'stripe' }, '_paymentMethod')
+  t((d) => { d._paymentDate = '2026-11-03T09:05:00' }, '_paymentDate')
+  t((d) => { d._paymentSettlementRateToBase = 1.3 }, '_paymentSettlementRateToBase')
+  t((d) => { d._paymentId = 'p2' }, '_paymentId')
+  t((d) => { d.currencyRateToBase = 1.3 }, 'currencyRateToBase')
+  t((d) => { d._postingMode = 'draft' }, '_postingMode')
   t((d) => { d.lines.push({ description: 'x', quantity: 1, unitAmount: 1, accountCode: '200', taxType: 'NONE', discountAmount: undefined }) }, 'lines \\(2 entries parked, 3 now\\)')
 })
