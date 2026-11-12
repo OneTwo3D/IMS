@@ -10,7 +10,12 @@ import {
 } from '@/lib/domain/inventory/stock-position-reports'
 import { getDeadStockReport, getInventoryAgingReport, InventoryHealthSourceLimitError } from '@/lib/domain/inventory/inventory-health-reports'
 import { stockPositionApiAccessDenied } from '@/lib/security/stock-position-access'
-import { sourceLimitExportBody } from '@/lib/security/source-scan-error'
+import { sourceLimitCsvResponse } from '@/lib/csv-source-limit'
+
+const EXPORT_COLUMNS: Record<string, string[]> = {
+  'inventory-aging': ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'bucket', 'minAgeDays', 'maxAgeDays', 'qty', 'valueBase', 'source'],
+  'dead-stock': ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'qty', 'valueBase', 'daysSinceLastSale', 'lastSaleAt', 'firstStockedAt'],
+}
 
 const STOCK_POSITION_CSV_ROW_LIMIT = 50000
 export const STOCK_ON_HAND_CSV_HEADERS = ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'quantity', 'reservedQty', 'availableQty', 'unitCostBase', 'totalValueBase', 'reservationQtySource', 'reservationSnapshotDate', 'reservationSourceCount']
@@ -188,7 +193,7 @@ export async function getStockPositionExportResponse(
         throw error
       })
       if (report instanceof InventoryHealthSourceLimitError) {
-        return NextResponse.json(sourceLimitExportBody(report), { status: 413 })
+        return sourceLimitCsvResponse(report, EXPORT_COLUMNS['inventory-aging'], `inventory-aging-${date}.csv`)
       }
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
@@ -210,7 +215,7 @@ export async function getStockPositionExportResponse(
         valueBase: r.valueBase,
         source: r.source,
       }))
-      return csvResponseFor(req, toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'bucket', 'minAgeDays', 'maxAgeDays', 'qty', 'valueBase', 'source']), `inventory-aging-${date}.csv`)
+      return csvResponseFor(req, toCsv(data, EXPORT_COLUMNS['inventory-aging']), `inventory-aging-${date}.csv`)
     }
 
     case 'dead-stock': {
@@ -219,7 +224,7 @@ export async function getStockPositionExportResponse(
         throw error
       })
       if (report instanceof InventoryHealthSourceLimitError) {
-        return NextResponse.json(sourceLimitExportBody(report), { status: 413 })
+        return sourceLimitCsvResponse(report, EXPORT_COLUMNS['dead-stock'], `dead-stock-${date}.csv`)
       }
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
@@ -240,7 +245,7 @@ export async function getStockPositionExportResponse(
         lastSaleAt: r.lastSaleAt ?? '',
         firstStockedAt: r.firstStockedAt ?? '',
       }))
-      return csvResponseFor(req, toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'qty', 'valueBase', 'daysSinceLastSale', 'lastSaleAt', 'firstStockedAt']), `dead-stock-${date}.csv`)
+      return csvResponseFor(req, toCsv(data, EXPORT_COLUMNS['dead-stock']), `dead-stock-${date}.csv`)
     }
 
     default:
