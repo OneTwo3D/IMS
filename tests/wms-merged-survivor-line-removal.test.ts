@@ -811,3 +811,56 @@ test('AMENDMENT with a verified re-read REPLACES the snapshot (control)', async 
     assert.deepEqual(store.items, fresh)
   })
 })
+
+// ---------------------------------------------------------------- 10. review round 3 -----------------------------------------------
+
+test('CRASH BOUNDARY: the snapshot is replaced BEFORE the link advances; a crash on the link write leaves the amendment due and the snapshot already current', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const { h, store } = snapshotPort(storedD)
+    const order: string[] = []
+    const replace = h.port.replaceOrderItems!
+    h.port.replaceOrderItems = async (o, e, items) => { order.push('snapshot'); await replace(o, e, items) }
+    h.port.updateLink = async (_id, data) => { order.push('link'); if ('pushedAt' in data) throw new Error('crash') }
+    const fresh = [{ externalItemId: '55', sku: 'A', quantity: 1 }]
+    await sweep(h.port, { updateOrder: async () => ({ updated: true, status: 'NEW', items: fresh }) })
+    assert.equal(order[0], 'snapshot', 'the snapshot write is first')
+    assert.deepEqual(store.items, fresh, 'the crash on the link write did not leave the old snapshot behind')
+  })
+})
+
+test('CRASH BOUNDARY: when even the deletion of a stale snapshot cannot be written, the link is NOT advanced (the amendment stays due)', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const { h } = snapshotPort(storedD)
+    h.port.replaceOrderItems = async () => { throw new Error('database unavailable') }
+    await sweep(h.port)
+    assert.equal(h.writes.some((w) => 'pushedAt' in w.data), false)
+  })
+})
+
+test('LAST-LINES CANCEL with the merge flag MISSING on the fresh read and a line added after ONLY_LINES_LEFT: nothing is cancelled, a notice is raised', async () => {
+  await withEnv(OFF, async () => {
+    resetFake()
+    fake.orders.set(SURVIVOR, { status: 9, number: 'IMSTEST-E+IMSTEST-D', items: D_LINES.map((l) => ({ ...l })), merged: false })
+    fake.addLineAfterItemRead = 1
+    const h = makePort({ cancellable: [mergedLinkRef()], items: storedD })
+    const result = await sweep(h.port)
+    assert.equal(fake.orders.get(SURVIVOR)!.status, 9)
+    assert.equal(fake.requests.some((r) => r.path.endsWith('/Cancel')), false)
+    assert.equal(result.operatorNotices, 1)
+  })
+})
+
+test('LAST-LINES CANCEL, unflagged, the re-read FAILS: nothing is sent to /Cancel and the cancel stays retryable', async () => {
+  await withEnv(OFF, async () => {
+    resetFake()
+    fake.orders.set(SURVIVOR, { status: 9, number: 'IMSTEST-E+IMSTEST-D', items: D_LINES.map((l) => ({ ...l })), merged: false })
+    fake.itemsReadFailsAfterDeletes = 0
+    const h = makePort({ cancellable: [mergedLinkRef()], items: storedD })
+    const result = await sweep(h.port)
+    assert.equal(fake.requests.some((r) => r.path.endsWith('/Cancel')), false)
+    assert.equal(h.writes.some((w) => w.data.state === 'CANCELLED'), false)
+    assert.ok((result.failed ?? 0) + (result.operatorNotices ?? 0) >= 1)
+  })
+})

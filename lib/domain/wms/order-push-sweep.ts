@@ -2955,6 +2955,23 @@ export async function runWmsOrderPushSweepCore(
         }
         const input = applyLinkCourierForm(buildPushInput(amendOrder, externalWarehouseId), link)
         update = await connector.updateOrder(link.externalOrderId, input, amendSeam.clearance)
+        // WRITTEN BEFORE THE LINK ADVANCES (pushedAt below): a crash between the two writes then leaves the amendment still due (it is
+        // re-run and the snapshot re-read), never a current-looking link over a stale snapshot.
+        // The amendment may have replaced, added or consolidated lines (new warehouse line ids). The recorded ids are replaced by a verified
+        // re-read, and when that cannot be had (the read-back failed, was not exactly what IMS sent, or could not be written) the OLD
+        // snapshot is DELETED: a stale one would let a later merged-order removal delete the old lines and miss an added one. With no
+        // snapshot the removal falls back to the operator notice.
+        if (update.updated) {
+          const orderId = link.order.id
+          const externalOrderId = link.externalOrderId
+          try {
+            await port.replaceOrderItems?.(orderId, externalOrderId, update.items ?? [])
+          } catch (e) {
+            console.error(`[wms-order-push] could not refresh the WMS line ids for ${orderId}: ${scrubWmsError(e, 'write failed')}`)
+            // If even the deletion cannot be written, this throws: the link is NOT advanced, so the amendment stays due.
+            await port.replaceOrderItems?.(orderId, externalOrderId, [])
+          }
+        }
         // What the accepted order post did to the courier is settled here (form recorded, review flag, warehouse note); the same
         // settlement runs when the item reconcile fails AFTER the post was accepted (see the catch below).
         const settled = await settleAmendedCourier(link, update.updated ? update : {})
@@ -2967,20 +2984,6 @@ export async function runWmsOrderPushSweepCore(
           ...settled.linkFields,
         })
         if (update.updated) result.updated += 1
-        // The amendment may have replaced, added or consolidated lines (new warehouse line ids). The recorded ids are replaced by a verified
-        // re-read, and when that cannot be had (the read-back failed, was not exactly what IMS sent, or could not be written) the OLD
-        // snapshot is DELETED: a stale one would let a later merged-order removal delete the old lines and miss an added one. With no
-        // snapshot the removal falls back to the operator notice.
-        if (update.updated) {
-          const orderId = link.order.id
-          const externalOrderId = link.externalOrderId
-          try {
-            await port.replaceOrderItems?.(orderId, externalOrderId, update.items ?? [])
-          } catch (e) {
-            console.error(`[wms-order-push] could not refresh the WMS line ids for ${orderId}: ${scrubWmsError(e, 'write failed')}`)
-            await port.replaceOrderItems?.(orderId, externalOrderId, []).catch(() => {})
-          }
-        }
         await audit({
           action: 'order_update', outcome: update.updated ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,
           summary: update.updated

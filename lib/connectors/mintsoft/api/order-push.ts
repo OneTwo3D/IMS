@@ -1001,10 +1001,11 @@ export async function cancelMintsoftOrder(externalOrderId: string, options?: { o
   // order keeps the survivor's id, so its link can still name it as a plain order). The caller removes only that order's own lines.
   if (merged && !options?.onlyLines) return { cancelled: false, status: 'MERGED_SURVIVOR', ...(orderNumber ? { mergedSurvivorNumber: orderNumber } : {}) }
   if (statusId !== MINTSOFT_STATUS_NEW && statusId !== MINTSOFT_STATUS_ON_BACKORDER) return { cancelled: false, status: 'NOT_CANCELLABLE' }
-  // A merged order may be cancelled only while it still holds EXACTLY the lines of the order being cancelled: re-read them immediately
+  // Whenever the caller names the lines it is cancelling (whatever the merge flag says on this read), the order may be cancelled only
+  // while it still holds EXACTLY those lines: a strict re-read immediately
   // before /Cancel. (Mintsoft has no conditional cancel, so a line added between this read and the call is an accepted inter-system
   // race limit.)
-  if (merged && options?.onlyLines) {
+  if (options?.onlyLines) {
     const now = await fetchMintsoftOrderItemsStrict(externalOrderId, clientId)
     const mine = options.onlyLines
     const same = now.length === mine.length && mine.every((m) => now.some((n) => sameRef(n, m)))
