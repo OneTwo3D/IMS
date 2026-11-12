@@ -1597,8 +1597,38 @@ An **explicit** `NONE` is refused too, unless the line says why it carries no ta
 shop charged no tax on and named no rate for (for example the over-threshold import duty). A tax rate whose own Xero tax type is `NONE`
 (WooCommerce rate 182, *Taxes & Duties*, is mapped that way) therefore refuses any ordinary line it lands on; map it to a real,
 active tax type. Shipping and the order discount can never be on `NONE`. The check runs at the head of the sales invoice, sales invoice
-update and credit note cases of the poster, and again in the connector as the last word. Supplier bills and supplier credit notes are not
-covered yet.
+update and credit note cases of the poster, and again in the connector as the last word. Supplier bills and supplier credit notes follow
+the same rule (next section).
+
+### Supplier bills and supplier credit notes: no tax type, no document
+
+A supplier **bill** (create and update) or **supplier credit note** line with no tax type is **refused**: nothing is sent to Xero (no
+contact is created either) and the row fails on **/sync** with an error that begins *NOTHING WAS SENT* and names the line. IMS used to send
+Xero's `NONE` ("No VAT") for such a line, so input VAT recorded in IMS was silently not claimed in Xero. A line is left without a type when
+a vatable cost line (freight, duty) has no **supplier default VAT rate**, when a goods line's own rate has no Xero tax type, or when a
+goods line has neither a rate nor a supplier default; a supplier credit note is left without one when the bill it offsets carried VAT but
+the supplier has no mapped tax type.
+
+`NONE` is still posted where IMS **decided** it: a cost line the order marks **not vatable**, a goods line whose own (or the supplier's
+default) rate is itself `No VAT`, and a supplier credit note against a bill that carried no VAT. An explicit `NONE` on any other line is
+refused too. **To fix a refused bill:** give the supplier a default VAT rate (or the purchase order line its own rate) that is mapped to a
+real Xero tax type, then edit and save the bill again so it is queued with the corrected type. A refused supplier credit note is fixed the
+same way, then raised again from the credit note. Bills already queued before this change with a non-vatable cost line carry no type and will
+be refused once: edit and save the bill to rebuild it.
+
+### Bill VAT: each line's own rate
+
+The VAT IMS records on a supplier bill is the sum of each billed line's **own** rate on its own net: a goods line at its rate, a vatable cost
+line (freight, duty, handling) at the order's VAT rate, a non-vatable cost line at none. It used to be the order's total VAT divided by the order's goods
+subtotal, which counts freight VAT in the rate without counting freight in the base (goods 100 at 20% plus vatable freight 50 made a "30%" rate
+and recorded 45 of VAT instead of 30) and is wrong for any order mixing rates that is billed in part. A goods line posts on its own rate's Xero tax type, and its VAT uses that rate's effective rate (for a compound rate, worked out from its components, the same way the sales side does it). A **vatable cost line**
+(and a goods line with no rate of its own) posts on the Xero tax type of the rate **the order was charged at**, not on the supplier's *current* default:
+IMS finds the active purchase rate whose percentage equals the order's recorded VAT rate (narrowed by the recorded rate name, the supplier's own default
+winning a tie). An order overridden to 5% under a 20% supplier default therefore posts its freight on the 5% type and records 5% VAT. If no rate at that
+percentage has a mapped Xero tax type, or two different types share it, the line is **left without a type and the bill is refused** (*NOTHING WAS SENT*, naming
+the line) rather than guessed: map the rate, then edit and save the bill again. An order with **no** recorded VAT bills no VAT and needs exactly one 0%
+purchase type; the supplier's taxable default is never borrowed for it. Before a bill is saved, every line's tax type is also checked against the Xero tax-rate list IMS already holds: a line whose type charges a different rate in Xero than IMS taxed it at (beyond rounding) refuses the bill (*The bill was not saved: ...*) instead of recording VAT Xero will not charge; a type whose rate is not in the stored list is not checked. The supplier's default rate is only used when it is active, usable for purchases, not compound and not reverse charge. With that, the VAT IMS records on the bill (and so its total and base figures) agrees
+with what Xero computes from the types sent.
 
 For **WooCommerce orders** the import also refuses, at import time, an order that moved money on a tax rate IMS cannot post under: a
 WooCommerce rate id with **no mapping** (IMS used to substitute the default rate with a warning), or one mapped to an **inactive** IMS
@@ -1610,6 +1640,54 @@ real accounting tax type, then re-import the order.
 **What to expect while mappings are incomplete.** Until every WooCommerce rate in use is mapped to an active IMS rate that carries a real
 Xero tax type, affected invoices and credit notes will sit as failed rows on /sync instead of posting. That is the intended behaviour; keep the
 Sales Invoices sync type switched off until the mappings are in place, then enable it.
+
+**Rounding.** Xero works tax out per line and rounds each line's tax to the currency's minor unit, so IMS does the same: each billed line's VAT is rounded to the
+bill currency's minor unit (two decimals for GBP, none for JPY, three for KWD) and the bill's VAT is the sum of those rounded amounts, with the total and the base-currency
+figures recomputed from them. Three lines of 0.03 at 20% record 0.03 of VAT (0.01 each), as Xero does, not 0.018.
+
+**A new bill bills a goods line at the rate its order line was recorded at.** The tax rate editor refreshes the order lines of **draft** orders only, so on an order that has moved on a line can be
+recorded at 20% while its linked rate now says 5%. A new bill therefore compares the linked rate's current value with the rate the line recorded (its stored tax over its stored net). Where they differ
+the line is billed at the **recorded** rate, on the Xero tax type of an active purchase rate at that percentage; if there is none (or the line is reverse charge or compound), the bill is
+refused (*The VAT rate on the purchase order line for ... has changed since the order was raised*) and the order line's tax rate needs correcting. For a line whose net is under 1 the ratio cannot
+state a rate, so the current rate is accepted only if its tax reproduces the recorded tax within a minor unit.
+
+**A bill line keeps the tax treatment it was booked with.** When a bill is created or edited, each line stores the tax type it was sent on, its effective rate, the IMS rate it
+was read from and whether it was reverse charge. Changing the purchase order's VAT rate afterwards does **not** re-price the bill: editing the bill (quantities, amounts,
+dates, notes) and raising a supplier credit note both reproduce what was booked. A bill booked before this was recorded has no stored treatment: it is worked out from the order's
+**current** rates, and that is accepted only where it reproduces the VAT the bill recorded **to within one minor unit in total** (not a unit per line, so a long bill cannot accept a different rate) **and**, for each goods line, the rate its order line recorded when it was priced. If it does not (the order's rate has changed since), a supplier credit is refused
+(*This bill was booked before its tax treatment was recorded ... Re-save the bill*), and **re-saving the bill** (Edit bill, then Save) re-prices it at the order's current rates and records
+its treatment, after which the credit can be raised. (There is no separate tax-choice control yet: the re-save is the explicit step.)
+
+**A supplier credit is checked against the ledger's rate for its code.** Before a credit that is going to Xero is posted, the booked code's rate in the stored Xero tax-rate list is compared with the rate the bill line was booked at (as a bill is); a difference beyond rounding refuses the credit (*The credit note was not posted (it is still a draft) ...*). A code whose rate is not in the stored list is not checked.
+
+**Supplier credits against reverse-charge bills are not posted from IMS yet.** A supplier credit note that would be sent to Xero against a bill with **any reverse-charge line** is refused before anything is
+claimed (*Supplier credits against reverse-charge bills are not posted from IMS yet: raise this credit in Xero directly*); the credit note stays a draft. IMS records a reverse-charge bill gross (net plus the
+self-accounted VAT) while Xero holds its net, so a credit from IMS could not agree with the Xero bill. A credit with sync off (nothing goes to Xero) is not affected, nor is a credit against a bill without
+reverse-charge lines. A proper reverse-charge credit is separate work.
+
+**A bill with an undecided tax type is not saved.** When bills are being sent to Xero, a new bill or a bill edit in which any line has no tax type (an unmapped rate, or no rate and no matching default) is refused with
+*The bill was not saved: no tax type on line N*, and nothing is written or queued. Map the rate (or give the supplier a default VAT rate) and save again: the same save then goes through and books the code. A bill that
+froze a blank type before this check existed is treated as **not booked**: editing and saving it (even without changing anything) re-derives its tax from the corrected mapping, records it and carries the
+corrected type on the queued first posting. (A first posting that has already been attempted or failed cannot be rewritten in place; see the first-posting rule for bill edits.)
+
+**Inactive rates are refused.** A new bill, an edit of a bill, and a supplier credit note that would be sent to Xero are refused (nothing saved or posted) when a line is priced on a
+VAT rate that is **inactive**: the line's own rate, the rate the order was charged at, or the rate a booked line was booked on. Re-activate the rate, or move the order's lines to an active
+rate. A rate a tax **re-key** retired (it names its replacement) is not counted as inactive; the retired-code guard decides whether its type may still be sent.
+
+**Supplier credit notes copy the bill they credit.** (A credit whose tax type cannot be decided, for example a bill line booked before the tax treatment was recorded that reproduces the right VAT but has no mapped tax type, is refused **before it is claimed**: it stays a draft, nothing is queued, and once the rate is mapped it can be posted again.) The tax type of a supplier credit note comes from the **selected bill's booked lines** (the type, rate and reverse-charge status each line
+was booked with; a bill is credited as reverse charge only when **every** one of its lines is reverse charge, and a reverse-charge line together with any other treatment, such as a non-vatable cost line, is a mixed bill), never from the supplier's current default. One credit amount can only mirror a bill whose lines all carry **one** tax treatment, and then it is credited
+on that type (a bill that carried VAT on its one VAT type; a bill with no VAT, such as one made only of non-vatable cost lines, on "No VAT"; a zero-rated bill on its zero-rated type).
+A bill that **mixes treatments** (taxable plus exempt, or two VAT types) is **refused**, before anything is posted, with *this bill mixes VAT treatments ... raise the credit in
+Xero by line, or credit each line separately*; the credit note stays a draft. Per-line credits are a follow-up. If no type can be found for a bill that carried VAT,
+the credit is refused by the poster (*NOTHING WAS SENT*) rather than posted on "No VAT"
+
+### Paid invoices whose payment date Xero does not give
+
+If Xero reports an invoice or bill **PAID** but its payment date is missing or unreadable, the payment poll does **not** mark it paid with a guessed date: it logs a
+WARNING (*payment_date_unreadable* / *bill_payment_date_unreadable*) and **remembers the document** in its own table (one row per document and Xero organisation, never evicted, no limit).
+Remembering is part of the poll step: if it cannot be saved the poll **holds its position** for that batch (the poll shows an error) so the document comes back, rather
+than being forgotten. Every poll then re-reads up to 200 remembered documents by id (the least recently checked first, so one that stays unreadable cannot starve the rest)
+and applies each whose date has become readable, even though Xero has not modified it since; a row is forgotten only when Xero's answer shows the retry is unnecessary (the document is applied, or is no longer PAID): a document Xero's answer simply leaves out, or that is still unreadable, stays and is asked again. Only the connected organisation's rows are read or changed.
 
 ### EU IOSS / VOEC rate configuration (declaration, preflight and seed)
 

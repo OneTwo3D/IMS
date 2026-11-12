@@ -95,8 +95,7 @@ test('a fully typed document posts, with the type it was given; the line-kind na
   for (const l of [...invoiceLines, ...creditLines]) assert.equal('noTaxKind' in l, false)
 })
 
-test('a SUPPLIER credit note keeps its own default: the floor is sales documents only (bills are filed separately)', async () => {
+test('a SUPPLIER credit note line with no tax type is refused too (ACC-H3), not defaulted to NONE', async () => {
   const { buildXeroPurchaseCreditNote } = await import('@/lib/connectors/xero/credit-notes')
-  const built = buildXeroPurchaseCreditNote(credit({ lines: [{ ...line, taxType: undefined }] }), 'AUTHORISED', 'c1', 'GBP')
-  assert.equal((built.LineItems as Array<Record<string, unknown>>)[0].TaxType, 'NONE')
+  assert.throws(() => buildXeroPurchaseCreditNote(credit({ lines: [{ ...line, taxType: undefined }] }), 'AUTHORISED', 'c1', 'GBP'), /NOTHING WAS SENT[\s\S]*no tax type on line 1/)
 })

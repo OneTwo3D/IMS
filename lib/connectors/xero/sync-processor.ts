@@ -61,6 +61,7 @@ import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { refuseUnreconciledDocument } from '@/lib/domain/accounting/document-tax-reconciliation'
+import { purchaseDocumentTaxTypeRefusal } from '@/lib/domain/accounting/purchase-document-tax-types'
 import { salesDocumentTaxTypeRefusal, type SalesDocumentTaxTypeInput, type SalesNoTaxLineKind } from '@/lib/domain/accounting/sales-document-tax-types'
 import { storeCreditBlock, type StoreCreditBlock, storeCreditCreditNotePosterError, storeCreditFollowUpPosterError, storeCreditInvoicePosterError } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import {
@@ -6300,6 +6301,10 @@ export async function processClaimedEntry(
     }
 
     case 'PURCHASE_INVOICE': {
+      // A line with no decided tax type (or a NONE that names no reason) is refused here with the document's own words, at the head of the
+      // case before any read or claim, and again by the connector as the last word (lib/domain/accounting/purchase-document-tax-types.ts).
+      const untypedBill = purchaseDocumentTaxTypeRefusal(`Purchase bill ${String(payload.invoiceNumber ?? '(no number)')}`, payload as { lines?: ReadonlyArray<{ taxType?: unknown }> })
+      if (untypedBill) return { success: false, error: untypedBill }
       const supplier = referenceType === 'PurchaseOrder'
         ? await db.purchaseOrder.findUnique({
             where: { id: referenceId },
@@ -6323,6 +6328,9 @@ export async function processClaimedEntry(
     }
 
     case 'PURCHASE_INVOICE_UPDATE': {
+      // As the create: an update must not overwrite a good bill with one carrying an undecided tax type.
+      const untypedBillUpdate = purchaseDocumentTaxTypeRefusal(`Purchase bill ${String(payload.invoiceNumber ?? '(no number)')}`, payload as { lines?: ReadonlyArray<{ taxType?: unknown }> })
+      if (untypedBillUpdate) return { success: false, error: untypedBillUpdate }
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       if (!accountingInvoiceId) {
         return { success: false, error: 'Missing accountingInvoiceId for PURCHASE_INVOICE_UPDATE' }
@@ -6726,6 +6734,8 @@ export async function processClaimedEntry(
     }
 
     case 'PURCHASE_CREDIT_NOTE': {
+      const untypedSupplierCredit = purchaseDocumentTaxTypeRefusal(`Supplier credit note ${String(payload.creditNoteNumber ?? '(no number)')}`, payload as { lines?: ReadonlyArray<{ taxType?: unknown }> })
+      if (untypedSupplierCredit) return { success: false, error: untypedSupplierCredit }
       // audit-g5u2: supplier credit note (ACCPAYCREDIT) — e.g. crediting a
       // duplicate freight bill. The payload carries the supplier contact + the
       // expense-account lines (built by recordSupplierFreightCreditNote, g5u2.3).

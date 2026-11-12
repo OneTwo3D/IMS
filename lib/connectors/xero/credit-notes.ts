@@ -10,6 +10,7 @@ import { findOrCreateContact } from './contacts'
 import { foreignCurrencyRateProblem, xeroCurrencyRateOrRefuse } from './fx'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { salesDocumentTaxTypeRefusal } from '@/lib/domain/accounting/sales-document-tax-types'
+import { purchaseDocumentTaxTypeRefusal } from '@/lib/domain/accounting/purchase-document-tax-types'
 import type { CreditNoteData, InvoiceLine } from '../types'
 import { PAGE_SIZE } from './invoice-delta'
 import { readAllocatedToInvoiceCents, readSingleXeroDocument, readXeroBalance } from './single-document'
@@ -160,7 +161,9 @@ export function buildXeroPurchaseCreditNote(
   /** The organisation's base currency. REQUIRED: whether a missing CurrencyRate is allowed depends on it (o3d-q0x56.3). */
   baseCurrency: string,
 ): Record<string, unknown> {
-  const DEFAULT_TAX_TYPE = 'NONE'
+  // No default tax type: a line with none is refused, an explicit NONE only where the line names why (lib/domain/accounting/purchase-document-tax-types.ts).
+  const taxTypeRefusal = purchaseDocumentTaxTypeRefusal(`Supplier credit note ${data.creditNoteNumber ?? '(no number)'}`, data)
+  if (taxTypeRefusal) throw new Error(taxTypeRefusal)
   // o3d-q0x56.3: decided FIRST. A foreign supplier credit note with no usable IMS rate THROWS; a base-currency one with none omits the field.
   const xeroCurrencyRate = xeroCurrencyRateOrRefuse({
     currency: data.currency, baseCurrency, rateToBase: data.currencyRateToBase, what: `Supplier credit note ${data.creditNoteNumber ?? '(no number)'}`,
@@ -176,7 +179,7 @@ export function buildXeroPurchaseCreditNote(
         Quantity: line.quantity,
         UnitAmount: line.unitAmount,
         AccountCode: line.accountCode,
-        TaxType: line.taxType || DEFAULT_TAX_TYPE,
+        TaxType: line.taxType,
       }
       if (line.itemCode) xeroLine.ItemCode = line.itemCode
       return xeroLine
@@ -412,6 +415,10 @@ export async function pushPurchaseCreditNote(
     referenceId: opts.creditNote.referenceId,
   })
   if (!minted.ok) return { success: false, error: minted.reason }
+
+  // A line with no decided tax type is refused BEFORE the contact round trip: nothing is created in the ledger.
+  const taxTypeRefusal = purchaseDocumentTaxTypeRefusal(`Supplier credit note ${data.creditNoteNumber ?? '(no number)'}`, data)
+  if (taxTypeRefusal) return { success: false, error: taxTypeRefusal }
 
   // o3d-q0x56.3: before the contact round trip and the ledger lookup. A foreign supplier credit note with no usable rate leaves no trace.
   const baseCurrency = await getBaseCurrencyCode()

@@ -50,6 +50,7 @@ import {
   withheldEntityKey,
   WITHHELD_RECHECK_BATCH,
 } from '@/lib/domain/accounting/withheld-reversal-markers'
+import { parseXeroDateOrNull } from './xero-date'
 import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
 
 import {
@@ -759,6 +760,99 @@ export async function readSalesResidualVerdicts(
  * chunk may be checkpointed.
  */
 /**
+ * PAID DOCUMENTS WHOSE `FullyPaidOnDate` COULD NOT BE READ (ACC-H5 follow-up).
+ *
+ * A PAID document with a missing or unreadable settlement date is skipped (never stamped with an Invalid Date or "now"). The delta poll
+ * only re-reads a document when Xero MODIFIES it, so a skip that is not remembered would never be revisited even once the date is readable.
+ * The skipped Xero invoice ids are therefore kept in `xero_payment_date_pending` (per kind, one row per document, never evicted) and every
+ * poll re-fetches them by id (`Invoices?IDs=`) and applies those whose date is now readable.
+ *
+ * REMEMBERING IS A CONDITION OF CHECKPOINTING. The write happens in the same pass as the skip, and a failed write is an ERROR on the poll
+ * result, which holds the cursor for the chunk (the same rule as every other undone pass), so the document comes back through the delta
+ * instead of being forgotten. The list is not capped: a cap that drops the oldest id is a silent loss of a payment. At most
+ * PENDING_DATE_RETRY_BATCH documents are re-read per poll, least recently checked first, so a document that stays unreadable cannot starve
+ * the others and the Xero allowance is bounded; the rest wait their turn.
+ */
+const PENDING_DATE_RETRY_BATCH = 200
+type PendingKind = 'SALES' | 'BILL'
+
+/** The Xero organisation this install is connected to, or null when none is. The remembered rows are scoped to it. */
+async function connectedXeroTenantId(): Promise<string | null> {
+  const token = await db.accountingToken.findUnique({ where: { connector: 'xero' }, select: { tenantId: true } })
+  const tenantId = token?.tenantId
+  return typeof tenantId === 'string' && tenantId.trim() !== '' ? tenantId : null
+}
+
+async function rememberUnreadablePaidDate(result: PollResult, kind: PendingKind, invoiceId: string | null | undefined): Promise<void> {
+  if (!invoiceId) return
+  try {
+    const tenantId = await connectedXeroTenantId()
+    if (tenantId === null) throw new Error('no Xero organisation is connected, so the document cannot be scoped to one')
+    await db.xeroPaymentDatePending.upsert({
+      where: { tenantId_kind_xeroInvoiceId: { tenantId, kind, xeroInvoiceId: invoiceId } },
+      create: { tenantId, kind, xeroInvoiceId: invoiceId },
+      update: {},
+    })
+  } catch (e) {
+    result.errors.push(`Could not remember the PAID ${kind === 'SALES' ? 'invoice' : 'bill'} ${invoiceId} whose payment date is unreadable (so the poll position is held and it comes back): ${String(e)}`)
+  }
+}
+
+/**
+ * Re-fetch the least recently checked remembered documents of the CONNECTED organisation by id and apply the ones whose date has become readable.
+ *
+ * A row is deleted only when the response VERIFIES a state that makes the retry unnecessary: the document came back and is no longer PAID (the delta poll
+ * handles whatever it became), or came back with a readable date and was applied. A document the response OMITS proves nothing (a paged, filtered or partial
+ * answer looks the same as a deleted document), so it stays remembered and is asked again; so does one that came back still unreadable. Rows of another
+ * organisation are never read, fetched or changed.
+ */
+async function retryUnreadablePaidDates(
+  result: PollResult,
+  windowStart: Date,
+  ledgerObservedBefore: LedgerReadFence | null,
+): Promise<void> {
+  const tenantId = await connectedXeroTenantId()
+  if (tenantId === null) return
+  const pending = await db.xeroPaymentDatePending.findMany({
+    // '' is a row written before the column existed: read as this organisation's.
+    where: { tenantId: { in: [tenantId, ''] } },
+    orderBy: [{ lastCheckedAt: { sort: 'asc', nulls: 'first' } }, { firstSeenAt: 'asc' }],
+    take: PENDING_DATE_RETRY_BATCH,
+    select: { tenantId: true, kind: true, xeroInvoiceId: true },
+  })
+  if (pending.length === 0) return
+  const wanted = [...new Set(pending.map((row) => row.xeroInvoiceId))]
+
+  const fetched = new Map<string, XeroInvoice>()
+  for (let i = 0; i < wanted.length; i += WITHHELD_RECHECK_BATCH) {
+    const batch = wanted.slice(i, i + WITHHELD_RECHECK_BATCH)
+    const res = await xeroGet<XeroInvoicesResponse>(`Invoices?IDs=${batch.join(',')}`)
+    if (!res.ok) {
+      // Nothing is forgotten: they are asked again next poll.
+      console.warn(`[xero] unreadable-paid-date retry could not read Xero: ${res.error ?? `HTTP ${res.status}`}`)
+      return
+    }
+    for (const invoice of res.data?.Invoices ?? []) fetched.set(invoice.InvoiceID, invoice)
+  }
+
+  const stillUnreadable = (invoice: XeroInvoice): boolean => invoice.Status === 'PAID' && parseXeroDateOrNull(invoice.FullyPaidOnDate) === null
+  const ready = [...fetched.values()].filter((invoice) => invoice.Status === 'PAID' && !stillUnreadable(invoice))
+  if (ready.length > 0) {
+    const errorsBefore = result.errors.length
+    await processDeltaChunk(ready, result, { windowStart, ledgerObservedBefore })
+    // A pass that errored may have left some of them undone: keep them all for the next poll.
+    if (result.errors.length > errorsBefore) return
+  }
+
+  // Forget ONLY a document the response returned in a state that needs no retry (no longer PAID, or applied just now); an omitted or still-unreadable one stays.
+  const forget = pending.filter((row) => { const invoice = fetched.get(row.xeroInvoiceId); return invoice !== undefined && !stillUnreadable(invoice) })
+  const keep = pending.filter((row) => !forget.includes(row))
+  for (const row of forget) await db.xeroPaymentDatePending.deleteMany({ where: { tenantId: row.tenantId, kind: row.kind, xeroInvoiceId: row.xeroInvoiceId } })
+  const checkedAt = new Date()
+  for (const row of keep) await db.xeroPaymentDatePending.updateMany({ where: { tenantId: row.tenantId, kind: row.kind, xeroInvoiceId: row.xeroInvoiceId }, data: { lastCheckedAt: checkedAt } })
+}
+
+/**
  * TWO TIMESTAMPS, NOT ONE (Codex round 4 #2).
  *
  * Round 3 handed `lastPollDate` to this function under the single name `windowStart` and used it for
@@ -876,7 +970,24 @@ async function processDeltaChunk(
 
     for (const order of unpaidManualOrders) {
       const paidInvoice = order.accountingInvoiceId ? invoiceById.get(order.accountingInvoiceId) : undefined
-      const paidDate = paidInvoice?.FullyPaidOnDate ? new Date(paidInvoice.FullyPaidOnDate) : new Date()
+      // ACC-H5: Xero's `/Date(ms)/` form is an Invalid Date to `new Date()`, and a missing date used to
+      // become "now". Neither may stamp a payment: skip with a logged reason (the cursor is NOT held —
+      // an error here would stall the poll forever on one bad document; the reconcile sweep reports
+      // the still-unpaid document for a human).
+      const paidDate = parseXeroDateOrNull(paidInvoice?.FullyPaidOnDate)
+      if (!paidDate) {
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: order.id,
+          action: 'payment_date_unreadable',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `Xero reports the invoice for order ${order.orderNumber ?? order.externalOrderNumber} PAID but its FullyPaidOnDate is missing or unparseable; paidAt was NOT set. It is re-read by id on every poll and applied once the date is readable (the payment reconcile sweep also lists it).`,
+          resolveUser: false,
+        })
+        await rememberUnreadablePaidDate(result, 'SALES', order.accountingInvoiceId)
+        continue
+      }
 
       // TWO independent guarded writes, not one, so a concurrent lifecycle move can neither drop the
       // payment nor be overwritten (o3d-2s8, Codex review of #496).
@@ -1088,7 +1199,24 @@ async function processDeltaChunk(
 
     for (const bill of unpaidBills) {
       const paidInvoice = bill.accountingInvoiceId ? invoiceById.get(bill.accountingInvoiceId) : undefined
-      const paidDate = paidInvoice?.FullyPaidOnDate ? new Date(paidInvoice.FullyPaidOnDate) : new Date()
+      // ACC-H5: Xero's `/Date(ms)/` form is an Invalid Date to `new Date()`, and a missing date used to
+      // become "now". Neither may stamp a payment: skip with a logged reason (the cursor is NOT held —
+      // an error here would stall the poll forever on one bad document; the reconcile sweep reports
+      // the still-unpaid document for a human).
+      const paidDate = parseXeroDateOrNull(paidInvoice?.FullyPaidOnDate)
+      if (!paidDate) {
+        await logActivity({
+          entityType: 'PURCHASE_ORDER',
+          entityId: bill.poId,
+          action: 'bill_payment_date_unreadable',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `Xero reports the bill for PO ${bill.po.reference} PAID but its FullyPaidOnDate is missing or unparseable; paidAt was NOT set. It is re-read by id on every poll and applied once the date is readable (the payment reconcile sweep also lists it).`,
+          resolveUser: false,
+        })
+        await rememberUnreadablePaidDate(result, 'BILL', bill.accountingInvoiceId)
+        continue
+      }
 
       await db.purchaseInvoice.update({
         where: { id: bill.id },
@@ -1550,6 +1678,16 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
   )
 
   if (!drain.ok) result.errors.push(`Xero invoice fetch failed: ${drain.error}`)
+
+  // PAID documents skipped earlier for an unreadable settlement date: re-read by id, never holding the cursor. Only when Xero answered the
+  // delta, so an outage is not asked twice.
+  if (drain.ok) {
+    try {
+      await retryUnreadablePaidDates(result, lastPollDate, ledgerObservedBefore)
+    } catch (e) {
+      console.warn(`[xero] unreadable-paid-date retry failed: ${String(e)}`)
+    }
+  }
 
   if (result.errors.length > 0) {
     await logActivity({

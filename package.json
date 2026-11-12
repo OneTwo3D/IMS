@@ -18,7 +18,7 @@
     "check:migration-conventions": "node scripts/check-migration-conventions.mjs",
     "check:documented-env-vars": "node scripts/check-documented-env-vars.mjs",
     "check:wc-sync-row-predicates": "node scripts/check-wc-sync-row-predicates.mjs",
-    "check:ledger-standing-readers": "node --max-old-space-size=3072 scripts/check-ledger-standing-readers.mjs",
+    "check:ledger-standing-readers": "node --max-old-space-size=5632 scripts/check-ledger-standing-readers.mjs",
     "check:producer-census": "tsx scripts/check-producer-census.ts",
     "check:shadow-readers": "tsx scripts/check-shadow-readers.ts",
     "check:fulfillment-requirement-seam": "node scripts/check-fulfillment-requirement-seam.mjs",

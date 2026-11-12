@@ -19,6 +19,7 @@ import {
 } from '@/lib/domain/math/decimal'
 
 import type { XeroResponse } from './api'
+import { parseXeroDate } from './xero-date'
 
 export type XeroInvoice = {
   InvoiceID: string
@@ -281,16 +282,7 @@ type WalkOutcome =
   | { status: 'overflow' }
   | { status: 'error'; error: string }
 
-/**
- * Xero serialises dates as `/Date(1750000000000+0000)/`. Returns NaN for anything unparseable, so
- * the caller can fail closed rather than treat an unreadable cursor as zero.
- */
-export function parseXeroDate(value: string | undefined): number {
-  if (!value) return NaN
-  const dotNet = /^\/Date\((-?\d+)([+-]\d{4})?\)\/$/.exec(value)
-  if (dotNet) return Number(dotNet[1])
-  return Date.parse(value)
-}
+export { parseXeroDate }
 
 function keysetPath(cursor: Date, upper: Date): string {
   const where = `${lowerBoundWhere(cursor)}&&${upperBoundWhere(upper)}`
