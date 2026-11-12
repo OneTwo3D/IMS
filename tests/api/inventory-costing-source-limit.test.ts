@@ -12,16 +12,19 @@ const deps = {
 }
 const limitError = new SourceScanTooLargeError('COGS report refund source rows', 100000, { rowCount: 100001 })
 
-test('the COGS export refuses a source-limit hit with 413 and the row-limit body, not a 500', async () => {
+test('the COGS export returns a REPORT NOT COMPUTED CSV on a source-limit hit, not a 413 or a 500', async () => {
   const response = await getInventoryCostingExportResponse(
     new NextRequest('http://localhost/api/export/inventory-costing?report=cogs'),
     { ...deps, getCogsReport: async () => { throw limitError } },
   )
-  assert.equal(response.status, 413)
-  const body = await response.json() as { error: string; rowLimit: number; reportNotComputed: boolean }
-  assert.match(body.error, /^This report hit its row limit \(100,000 rows\)/)
-  assert.equal(body.rowLimit, 100000)
-  assert.equal(body.reportNotComputed, true)
+  assert.equal(response.status, 200)
+  assert.match(response.headers.get('Content-Type') ?? '', /^text\/csv/)
+  assert.equal(response.headers.get('X-IMS-Report-Not-Computed'), '1')
+  assert.equal(response.headers.get('X-IMS-Report-Row-Limit'), '100000')
+  const lines = (await response.text()).split('\r\n')
+  assert.equal(lines.length, 2)
+  assert.ok(lines[0].startsWith('groupLabel,sku,mpn,'))
+  assert.match(lines[1], /^REPORT NOT COMPUTED,"?This report hit its row limit \(100,000 rows\)/)
 })
 
 test('the COGS export still rethrows an unrelated failure', async () => {
@@ -31,12 +34,17 @@ test('the COGS export still rethrows an unrelated failure', async () => {
   ), /database unavailable/)
 })
 
-test('the turnover export also refuses any source-limit error with 413', async () => {
+test('the turnover export also returns a REPORT NOT COMPUTED CSV for any source-limit error', async () => {
   const response = await getInventoryCostingExportResponse(
     new NextRequest('http://localhost/api/export/inventory-costing?report=inventory-turnover'),
     { ...deps, getInventoryTurnoverReport: async () => { throw limitError } },
   )
-  assert.equal(response.status, 413)
+  assert.equal(response.status, 200)
+  assert.equal(response.headers.get('X-IMS-Report-Not-Computed'), '1')
+  const lines = (await response.text()).split('\r\n')
+  assert.equal(lines.length, 2)
+  assert.ok(lines[0].startsWith('groupLabel,sku,mpn,'))
+  assert.ok(lines[1].startsWith('REPORT NOT COMPUTED,'))
 })
 
 test('the COGS and turnover page fallbacks are not-computed reports carrying the row-limit notice', () => {

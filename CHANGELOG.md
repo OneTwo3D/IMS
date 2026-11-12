@@ -10,6 +10,10 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### Report CSV exports that hit the source-row limit return a notice file
+
+- **Changed: a report CSV export that hits its source-row limit now downloads a CSV instead of failing with HTTP 413.** The file has the report's normal column headings and one row whose first cell reads `REPORT NOT COMPUTED` with the row-limit notice in the next cell: no data rows and no totals, so it can never be read as a report of zeros. The response is HTTP 200 with the usual filename and carries `X-IMS-Report-Not-Computed: 1`, `X-IMS-Report-Row-Limit` and the existing `X-IMS-Export-Metadata` header, so scripts can detect it. Applies to the sales, purchasing, finance, replenishment, manufacturing, stock-position (aging, dead stock) and inventory-costing (COGS, turnover) exports. The separate CSV row cap (the file itself too large) still returns 413.
+
 ### Dispatch completion: orders always follow the dispatch, and services no longer hold an order open
 
 - **Fixed: dispatching the last shipment of an On Hold, Processing, Draft or Pending payment order no longer fails after the goods have left.** The order promotion used to run in a second transaction after the dispatch had committed and threw because those statuses have no direct step to Shipped; the operator saw a failure for a dispatch that had happened, the activity rows, storefront push, invoice trigger, despatch email and stock sync were skipped, and every retry failed the same way. The promotion now runs inside the dispatch transaction: the stock decrement, FIFO/COGS and the order flip commit together or roll back together. An order still in Processing is moved to Shipped through Allocated, and an "Order shipped from a non-fulfilment status" warning is logged.

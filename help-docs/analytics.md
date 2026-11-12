@@ -36,7 +36,7 @@ A role that is not allowed a report does not see it in the Analytics menu and is
 
 ### Source-row cap (50,000 rows)
 
-To keep large reports responsive, the underlying data fetch is capped at **50,000 source rows** per report. If your date range or filters select more than that, the report is **not computed**. A red banner at the top of the page says "This report hit its row limit (50,000 rows); narrow the date range or filters", the summary tiles show a dash instead of a figure, and the table says "Report not computed". It never shows zeros or "No rows" for a report that was refused. The CSV button gives the same refusal (a `413 Payload Too Large` response carrying the same message, with no file) rather than a file of zeros.
+To keep large reports responsive, the underlying data fetch is capped at **50,000 source rows** per report. If your date range or filters select more than that, the report is **not computed**. A red banner at the top of the page says "This report hit its row limit (50,000 rows); narrow the date range or filters", the summary tiles show a dash instead of a figure, and the table says "Report not computed". It never shows zeros or "No rows" for a report that was refused. The CSV button gives the same refusal as a file, not an error: a normal download (HTTP 200) with the report's usual column headings and one row whose first cell reads `REPORT NOT COMPUTED` and whose next cell carries the same message, with no data rows and no totals. It is never a file of zeros. Scripts can detect it from the `X-IMS-Report-Not-Computed: 1` response header (the row limit is in `X-IMS-Report-Row-Limit` and in the `X-IMS-Export-Metadata` header).
 
 The cap applies before any aggregation, so a report that displays "120 supplier rows" might still hit it if those 120 rows roll up from millions of PO lines — narrow by date in that case.
 
@@ -245,7 +245,8 @@ Historical demand can still be imported for forecasting, from the **Import histo
 
 | Problem | Where to look |
 |---|---|
-| Report returns 413 Payload Too Large | Narrow date range or apply more filters — see [Source-row cap](#source-row-cap-50000-rows) |
+| Report CSV contains only a `REPORT NOT COMPUTED` row | The report hit its source-row cap. Narrow date range or apply more filters — see [Source-row cap](#source-row-cap-50000-rows) |
+| CSV export returns 413 Payload Too Large | The export is over its CSV row cap (a different, smaller limit than the source-row cap). Narrow date range or apply more filters |
 | Revenue doesn't match invoice total | Check the order's `Tax Inclusive` flag |
 | Reorder planning missing a product | Check lifecycle status (EOL/Archived are always excluded), and whether it is below its reorder point; tick **Show all products** to list the rest |
 | Draft PO has wrong supplier | A preferred supplier was auto-updated by a recent PO; edit on the product page |

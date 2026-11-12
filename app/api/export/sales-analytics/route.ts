@@ -19,7 +19,8 @@ import {
   RETURNS_MIXED_BASIS_NOTICE,
 } from '@/lib/analytics/refund-figure-surfaces'
 import { canAccessSalesAnalytics } from '@/lib/security/sales-analytics-access'
-import { isSourceScanTooLargeError, sourceLimitExportBody } from '@/lib/security/source-scan-error'
+import { sourceLimitCsvResponse } from '@/lib/csv-source-limit'
+import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
 const SALES_ANALYTICS_CSV_ROW_LIMIT = 50000
 
@@ -215,7 +216,7 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: 'Unknown sales analytics export type' }, { status: 400 })
     }
   } catch (error) {
-    if (isSourceScanTooLargeError(error)) return NextResponse.json(sourceLimitExportBody(error), { status: 413 })
+    if (isSourceScanTooLargeError(error)) return sourceLimitCsvResponse(error, SALES_ANALYTICS_EXPORTS[reportType as SalesAnalyticsExportType]?.columns ?? [], `${SALES_ANALYTICS_EXPORTS[reportType as SalesAnalyticsExportType]?.filename ?? reportType}-${date}.csv`)
     throw error
   }
 }
