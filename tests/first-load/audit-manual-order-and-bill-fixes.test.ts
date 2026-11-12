@@ -632,7 +632,9 @@ test('PO-H3: an edit that would put a retired tax code into the unsent first pos
   assert.equal(created.success, true, String(created.error))
   const po = await s.db.purchaseOrder.findUniqueOrThrow({ where: { reference: ref }, select: { id: true, lines: { select: { id: true } } } })
   await s.db.purchaseOrder.update({ where: { id: po.id }, data: { status: 'PO_SENT' } })
-  await s.db.purchaseOrderLine.updateMany({ where: { poId: po.id }, data: { taxRateId: rate.id } })
+  // The line is recorded at the rate's 20% (tax 24 on the net 120), as a line priced at that rate is: a new bill bills at the RECORDED rate, so a line left recorded at 0% would be billed on a 0% code and
+  // never carry TAX003 (which is what this arm needs to retire).
+  await s.db.purchaseOrderLine.updateMany({ where: { poId: po.id }, data: { taxRateId: rate.id, taxForeign: '24' } })
   const bill = await createInvoice(po.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-RC', lines: [{ kind: 'product', poLineId: po.lines[0]!.id, qtyBilled: 10, unitCostForeign: 12 }] } as never)
   assert.equal(bill.success, true, String(bill.error))
   const invoice = await s.db.purchaseInvoice.findFirstOrThrow({ where: { poId: po.id }, select: { id: true, lines: { select: { id: true } } } })
@@ -649,6 +651,69 @@ test('PO-H3: an edit that would put a retired tax code into the unsent first pos
   } finally {
     await s.db.setting.deleteMany({ where: { key: 'tax_rekey_retired_codes' } })
   }
+})
+
+// A bill with an UNDECIDED tax type is not saved, and a blank booked snapshot is not a booking.
+// [mutation: save the bill with the blank type -> the first arm finds a bill and a queued create; mutation: freeze a blank snapshot -> the second arm keeps the blank]
+async function poOnRate(rateId: string, label: string) {
+  const { createPurchaseOrder } = await import('@/app/actions/purchase-orders')
+  const supplierRow = await s.db.supplier.create({ data: { name: `AUD ${label} supplier ${++seq}`, currency: 'GBP', prepaid: true, taxRateId: rateId }, select: { id: true } })
+  const ref = `AUD-PO-${label}-${seq}-${Date.now()}`
+  const created = await createPurchaseOrder({ reference: ref, supplierId: supplierRow.id, currency: 'GBP', destinationWarehouseId: warehouseId, pricesIncludeVat: false, taxRateValue: 0, lines: [{ productId, sku: 'AUD-1', productName: 'AUD 1', qty: 10, unitCostForeign: 12 }] } as never)
+  assert.equal(created.success, true, String(created.error))
+  const po = await s.db.purchaseOrder.findUniqueOrThrow({ where: { reference: ref }, select: { id: true, lines: { select: { id: true } } } })
+  await s.db.purchaseOrder.update({ where: { id: po.id }, data: { status: 'PO_SENT' } })
+  // The line is recorded at the rate's 20% (tax 24 on the net 120), as a line priced at that rate is.
+  await s.db.purchaseOrderLine.updateMany({ where: { poId: po.id }, data: { taxRateId: rateId, taxForeign: '24' } })
+  return po
+}
+
+test('PO-H3 recovery: a new bill on an UNMAPPED rate is refused and nothing is saved; map the rate and the same create saves with the code', async () => {
+  const { createInvoice } = await import('@/app/actions/purchase-orders')
+  const rate = await s.db.taxRate.create({ data: { name: `AUD Unmapped ${++seq}`, rate: '0.2', usedFor: 'PURCHASE', accountingTaxType: null, active: true }, select: { id: true } })
+  const po = await poOnRate(rate.id, 'UM')
+  const input = { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-UM', lines: [{ kind: 'product', poLineId: po.lines[0]!.id, qtyBilled: 10, unitCostForeign: 12 }] } as never
+  const queuedBefore = await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_INVOICE' } })
+  const refused = await createInvoice(po.id, input)
+  assert.equal(refused.success, false)
+  assert.match(String(refused.error), /The bill was not saved: no tax type on line 1/)
+  assert.equal(await s.db.purchaseInvoice.count({ where: { poId: po.id } }), 0, 'no bill saved')
+  assert.equal(await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_INVOICE' } }), queuedBefore, 'nothing queued')
+
+  await s.db.taxRate.update({ where: { id: rate.id }, data: { accountingTaxType: 'TAX007' } })
+  const saved = await createInvoice(po.id, input)
+  assert.equal(saved.success, true, String(saved.error))
+  const invoice = await s.db.purchaseInvoice.findFirstOrThrow({ where: { poId: po.id }, select: { id: true, lines: { select: { taxType: true, taxBookedAt: true, taxRateId: true } } } })
+  assert.equal(invoice.lines[0]!.taxType, 'TAX007')
+  assert.ok(invoice.lines[0]!.taxBookedAt)
+  const payload = (await createRows(invoice.id))[0]!.payload as { lines: Array<{ taxType?: string }> }
+  assert.equal(payload.lines[0]!.taxType, 'TAX007')
+})
+
+test('PO-H3 recovery: a bill whose snapshot froze a BLANK type is re-derived by an UNCHANGED save after the rate is mapped, and its queued create carries the corrected type', async () => {
+  const { createInvoice, updateInvoice } = await import('@/app/actions/purchase-orders')
+  const rate = await s.db.taxRate.create({ data: { name: `AUD Frozen ${++seq}`, rate: '0.2', usedFor: 'PURCHASE', accountingTaxType: 'TAX007', active: true }, select: { id: true } })
+  const po = await poOnRate(rate.id, 'FZ')
+  const made = await createInvoice(po.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-FZ', lines: [{ kind: 'product', poLineId: po.lines[0]!.id, qtyBilled: 10, unitCostForeign: 12 }] } as never)
+  assert.equal(made.success, true, String(made.error))
+  const invoice = await s.db.purchaseInvoice.findFirstOrThrow({ where: { poId: po.id }, select: { id: true, lines: { select: { id: true } } } })
+  // A legacy bill whose booked snapshot froze "undecided", and whose queued create still carries the blank; the rate is then mapped to the CORRECT code.
+  await s.db.purchaseInvoiceLine.updateMany({ where: { invoiceId: invoice.id }, data: { taxType: null, taxRateValue: '0.2', taxRateId: rate.id, taxReverseCharge: false, taxBookedAt: new Date() } })
+  const [row] = await createRows(invoice.id)
+  const blanked = row!.payload as { lines: Array<Record<string, unknown>> }
+  await s.db.accountingSyncLog.update({ where: { id: row!.id }, data: { payload: { ...blanked, lines: blanked.lines.map(({ taxType: _t, ...rest }) => rest) } as never } })
+  await s.db.taxRate.update({ where: { id: rate.id }, data: { accountingTaxType: 'TAX008' } })
+
+  const saved = await updateInvoice(invoice.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-FZ', lines: [{ id: invoice.lines[0]!.id, qtyBilled: 10, unitCostForeign: 12 }] } as never)
+  assert.equal(saved.success, true, String(saved.error))
+  assert.equal((saved as { notice?: string }).notice, undefined, 'an unchanged save is NOT an early "no changes" exit when a line has no booked treatment')
+  const line = await s.db.purchaseInvoiceLine.findFirstOrThrow({ where: { invoiceId: invoice.id }, select: { taxType: true, taxBookedAt: true } })
+  assert.equal(line.taxType, 'TAX008', 'the corrected mapping is booked')
+  assert.ok(line.taxBookedAt)
+  const rows = await createRows(invoice.id)
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0]!.status, 'PENDING')
+  assert.equal((rows[0]!.payload as { lines: Array<{ taxType?: string }> }).lines[0]!.taxType, 'TAX008', 'the queued create carries the corrected type')
 })
 
 // ---- legacy create rows (keyed to the purchase order, naming no bill)

@@ -4,6 +4,7 @@ import { assertNoLiveAsnForReceipt, ManualReceiptRefusedByLiveAsnError } from '@
 import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
 import { billTaxCodeDisagreementMessage, billTaxCodeDisagreements, inactiveBillRatesMessage, inactiveOrderRateMessage, inactiveOrderRateName, resolveOrderRateTaxCode, type OrderRateCandidate } from '@/lib/domain/purchasing/order-rate-tax-code'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
+import { purchaseBillNotSavedRefusal } from '@/lib/domain/accounting/purchase-document-tax-types'
 import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
@@ -3708,6 +3709,11 @@ export async function createInvoice(
     // A bill is not priced on an INACTIVE rate (the sales side refuses an order on one).
     const inactiveRate = await inactiveRatesRefusal(invoiceCalculation.lineTaxRates.map((l) => l.taxRateId))
     if (inactiveRate) return { success: false, error: inactiveRate }
+    // A bill that is going to the ledger is not SAVED with an undecided tax type (the poster would refuse it, and its booked treatment would freeze the blank): nothing is written.
+    if (accountingSettings.syncEnabled) {
+      const undecided = purchaseBillNotSavedRefusal(invoiceCalculation.accountingLines)
+      if (undecided) return { success: false, error: undecided }
+    }
     if (accountingSettings.syncEnabled) {
       const disagreement = await billTaxCodeRefusal(invoiceCalculation.lineTaxRates)
       if (disagreement) return { success: false, error: disagreement }
@@ -4157,6 +4163,10 @@ export async function updateInvoice(
     }
     const inactiveRate = await inactiveRatesRefusal(invoiceCalculation.lineTaxRates.map((l) => l.taxRateId))
     if (inactiveRate) return { success: false, error: inactiveRate }
+    if (accountingSettings.syncEnabled) {
+      const undecided = purchaseBillNotSavedRefusal(invoiceCalculation.accountingLines)
+      if (undecided) return { success: false, error: undecided }
+    }
     const bookedAt = new Date()
     if (accountingSettings.syncEnabled) {
       const disagreement = await billTaxCodeRefusal(invoiceCalculation.lineTaxRates)
@@ -4192,7 +4202,10 @@ export async function updateInvoice(
       existingLines,
       nextLines,
     })
-    if (!hasChanges) {
+    // An unchanged save is NOT a no-op for a bill with a line that has no booked tax treatment (a legacy line, or one that froze a blank): it re-derives the treatment from the
+    // current mapping, records it and re-queues the corrected posting.
+    const hasUnbookedLine = invoice.lines.some((line) => !bookedTaxFromLine(line))
+    if (!hasChanges && !hasUnbookedLine) {
       return { success: true, notice: 'No bill changes to save' }
     }
 
@@ -4384,7 +4397,7 @@ export async function updateInvoice(
             totalForeign: line.totalForeign,
             totalBase: line.totalBase,
             // Booked lines keep their snapshot (and its booking time); a legacy line is booked now.
-            ...(booked?.taxBookedAt ? {} : snapshotColumnsFor(invoiceCalculation.lineTaxRates[index], bookedAt)),
+            ...(booked && bookedTaxFromLine(booked) ? {} : snapshotColumnsFor(invoiceCalculation.lineTaxRates[index], bookedAt)),
           },
         })
       }

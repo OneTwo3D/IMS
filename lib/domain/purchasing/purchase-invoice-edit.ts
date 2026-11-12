@@ -710,11 +710,15 @@ export type BilledLineSnapshotColumns = {
 /** The booked treatment of a stored bill line, or null for a line booked before the snapshot existed. */
 export function bookedTaxFromLine(line: BilledLineSnapshotColumns): BookedLineTax | null {
   if (!line.taxBookedAt) return null
+  // A blank booked type is NOT booked (a snapshot that froze "undecided"): the line is re-derived from today's mapping on the next edit or credit.
+  if (!line.taxType || line.taxType.trim() === '') return null
   return { taxType: line.taxType ?? null, rate: line.taxRateValue == null ? 0 : String(line.taxRateValue), taxRateId: line.taxRateId ?? null, reverseCharge: line.taxReverseCharge === true }
 }
 
 /** The snapshot columns to write for a booked line (`lineTaxRates` of `calculatePurchaseInvoice`, one entry per line). */
-export function snapshotColumnsFor(line: PurchaseInvoiceLineTaxRate, bookedAt: Date): { taxType: string | null; taxRateValue: number; taxRateId: string | null; taxReverseCharge: boolean; taxBookedAt: Date } {
+export function snapshotColumnsFor(line: PurchaseInvoiceLineTaxRate, bookedAt: Date): { taxType: string | null; taxRateValue: number | null; taxRateId: string | null; taxReverseCharge: boolean | null; taxBookedAt: Date | null } {
+  // NEVER store a blank snapshot: a line whose type is undecided is left unbooked, so a later edit re-derives it.
+  if (!line.taxType || line.taxType.trim() === '') return { taxType: null, taxRateValue: null, taxRateId: null, taxReverseCharge: null, taxBookedAt: null }
   return { taxType: line.taxType ?? null, taxRateValue: line.rate, taxRateId: line.taxRateId ?? null, taxReverseCharge: line.reverseCharge, taxBookedAt: bookedAt }
 }
 

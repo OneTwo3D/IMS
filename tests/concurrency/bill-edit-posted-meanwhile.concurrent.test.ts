@@ -55,7 +55,10 @@ test('the bill is posted and written back between the read and the lock: the edi
   try {
     const product = await db.product.create({ data: { sku: tag, name: 'bpm', type: 'SIMPLE' }, select: { id: true } })
     const warehouse = await db.warehouse.create({ data: { code: `${uid()}-W`, name: `${tag} wh`, type: 'STANDARD' }, select: { id: true } })
-    const supplier = await db.supplier.create({ data: { name: `${tag} supplier`, currency: 'GBP', prepaid: true }, select: { id: true } })
+    // A bill going to the ledger is not saved with an undecided tax type: this order bills at no VAT, so its supplier's default is a mapped 0% purchase rate (the supplier's own default is what
+    // decides among several 0% rates in a shared scratch database).
+    const zeroRate = await db.taxRate.create({ data: { name: `${tag} zero`, rate: '0', usedFor: 'PURCHASE', accountingTaxType: 'ZERORATEDINPUT', active: true }, select: { id: true } })
+    const supplier = await db.supplier.create({ data: { name: `${tag} supplier`, currency: 'GBP', prepaid: true, taxRateId: zeroRate.id }, select: { id: true } })
     const created = await createPurchaseOrder({
       reference: tag, supplierId: supplier.id, currency: 'GBP', destinationWarehouseId: warehouse.id, pricesIncludeVat: false, taxRateValue: 0,
       lines: [{ productId: product.id, sku: tag, productName: 'bpm', qty: 10, unitCostForeign: 12 }],

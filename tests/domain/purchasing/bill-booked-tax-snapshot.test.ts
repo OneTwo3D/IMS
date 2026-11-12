@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFileSync } from 'node:fs'
 
+import { purchaseBillNotSavedRefusal } from '@/lib/domain/accounting/purchase-document-tax-types'
 import { billTaxCodeDisagreementMessage, billTaxCodeDisagreements, inactiveBillRatesMessage, inactiveOrderRateMessage, inactiveOrderRateName, type OrderRateCandidate } from '@/lib/domain/purchasing/order-rate-tax-code'
 import {
   billLineTaxTreatments,
@@ -53,8 +54,8 @@ test('the snapshot columns written for a line round-trip to the booked treatment
   assert.deepEqual(columns, { taxType: 'INPUT5', taxRateValue: 0.05, taxRateId: 'r-new', taxReverseCharge: false, taxBookedAt: at })
   assert.deepEqual(bookedTaxFromLine(columns), { taxType: 'INPUT5', rate: '0.05', taxRateId: 'r-new', reverseCharge: false })
   assert.equal(bookedTaxFromLine({ taxBookedAt: null, taxType: 'X' }), null, 'no marker = a legacy line')
-  // A booked line that could not be given a code stays "booked, no code" (never NONE).
-  assert.deepEqual(bookedTaxFromLine({ taxBookedAt: at, taxType: null, taxRateValue: '0.2', taxRateId: null, taxReverseCharge: false }), { taxType: null, rate: '0.2', taxRateId: null, reverseCharge: false })
+  // A blank booked type is not a booking (a snapshot that froze "undecided" is re-derived), and is never NONE.
+  assert.equal(bookedTaxFromLine({ taxBookedAt: at, taxType: null, taxRateValue: '0.2', taxRateId: null, taxReverseCharge: false }), null)
 })
 
 const costLinesNone = new Map<string, { vatable: boolean }>()
@@ -157,4 +158,23 @@ test('a credit is checked against the stored Xero rate of its BOOKED code: a mis
   const source = readFileSync('app/actions/purchase-orders.ts', 'utf8')
   assert.match(source, /const disagreement = await billTaxCodeRefusal\(billTreatments\.map\(/, 'the credit runs the same agreement check')
   assert.match(source, /'credit note'\)\s*\n\s*if \(disagreement\) return/)
+})
+
+test('an UNDECIDED line is never stored as a booking, and a blank booked snapshot reads as NOT booked; the save-time refusal names the line', () => {
+  const at = new Date('2026-11-12T10:00:00.000Z')
+  const blank = calc([{ kind: 'product', poLineId: 'p', qtyBilled: 1, unitCostForeign: 100 }], { poLineById: new Map([['p', { id: 'p', qty: 1, product: { sku: 'A' }, taxRate: { id: 'r', accountingTaxType: null, rate: '0.2' } }]]) })
+  assert.equal(blank.lineTaxRates[0].taxType, undefined)
+  assert.deepEqual(snapshotColumnsFor(blank.lineTaxRates[0], at), { taxType: null, taxRateValue: null, taxRateId: null, taxReverseCharge: null, taxBookedAt: null })
+  // A legacy row that froze a blank: not booked, so it is re-derived from today's mapping.
+  assert.equal(bookedTaxFromLine({ taxBookedAt: at, taxType: null, taxRateValue: '0.2', taxRateId: 'r', taxReverseCharge: false }), null)
+  assert.equal(bookedTaxFromLine({ taxBookedAt: at, taxType: '  ', taxRateValue: '0.2' }), null)
+  assert.equal(purchaseBillNotSavedRefusal(blank.accountingLines)?.startsWith('The bill was not saved: no tax type on line 1'), true)
+  assert.equal(purchaseBillNotSavedRefusal([{ description: 'x', taxType: 'INPUT2' }, { description: 'Freight', taxType: 'NONE' }]), null)
+  assert.match(purchaseBillNotSavedRefusal([{ description: 'x', taxType: 'INPUT2' }, { description: 'Freight', taxType: ' ' }])!, /no tax type on line 2 "Freight"/)
+})
+
+test('wiring: create and edit refuse an undecided bill before writing (sync on), and an unchanged save with an unbooked line is not an early exit', () => {
+  const source = readFileSync('app/actions/purchase-orders.ts', 'utf8')
+  assert.equal((source.match(/purchaseBillNotSavedRefusal\(invoiceCalculation\.accountingLines\)/g) ?? []).length, 2)
+  assert.match(source, /if \(!hasChanges && !hasUnbookedLine\)/)
 })

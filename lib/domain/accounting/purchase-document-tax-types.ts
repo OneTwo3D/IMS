@@ -83,3 +83,14 @@ export function purchaseDocumentTaxTypeRefusal(document: string, doc: { lines?: 
 export function noVatRateKind(taxType: string | null | undefined): PurchaseNoTaxLineKind | undefined {
   return isNoTaxType(taxType) ? 'no-vat-rate' : undefined
 }
+
+/**
+ * A BILL WITH A LINE WHOSE TAX TYPE IS UNDECIDED IS NOT SAVED. The poster would refuse it ("NOTHING WAS SENT") but the bill would already be saved, queued and its booked
+ * treatment frozen with the blank, so mapping the rate afterwards could never get it into the ledger. Refused at create and at edit instead, with nothing written, when the bill
+ * is going to be sent to the ledger; the operator maps the rate and saves again. Names each line (the same wording as the poster's) or `null` when every line has a type.
+ */
+export function purchaseBillNotSavedRefusal(lines: ReadonlyArray<{ description?: unknown; taxType?: unknown }>): string | null {
+  const missing = findPurchaseDocumentTaxTypeProblems({ lines }).filter((p) => p.kind === 'missing').map((p) => p.where)
+  if (missing.length === 0) return null
+  return `The bill was not saved: no tax type on ${missing.join(', ')}. Give the supplier a default VAT rate (or the purchase order line its own rate) that is mapped to a real accounting tax type, then try again.`
+}

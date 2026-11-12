@@ -1665,6 +1665,11 @@ claimed (*Supplier credits against reverse-charge bills are not posted from IMS 
 self-accounted VAT) while Xero holds its net, so a credit from IMS could not agree with the Xero bill. A credit with sync off (nothing goes to Xero) is not affected, nor is a credit against a bill without
 reverse-charge lines. A proper reverse-charge credit is separate work.
 
+**A bill with an undecided tax type is not saved.** When bills are being sent to Xero, a new bill or a bill edit in which any line has no tax type (an unmapped rate, or no rate and no matching default) is refused with
+*The bill was not saved: no tax type on line N*, and nothing is written or queued. Map the rate (or give the supplier a default VAT rate) and save again: the same save then goes through and books the code. A bill that
+froze a blank type before this check existed is treated as **not booked**: editing and saving it (even without changing anything) re-derives its tax from the corrected mapping, records it and carries the
+corrected type on the queued first posting. (A first posting that has already been attempted or failed cannot be rewritten in place; see the first-posting rule for bill edits.)
+
 **Inactive rates are refused.** A new bill, an edit of a bill, and a supplier credit note that would be sent to Xero are refused (nothing saved or posted) when a line is priced on a
 VAT rate that is **inactive**: the line's own rate, the rate the order was charged at, or the rate a booked line was booked on. Re-activate the rate, or move the order's lines to an active
 rate. A rate a tax **re-key** retired (it names its replacement) is not counted as inactive; the retired-code guard decides whether its type may still be sent.
