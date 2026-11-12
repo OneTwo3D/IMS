@@ -179,6 +179,10 @@ export class MintsoftConnector implements WmsConnector {
     return cancelMintsoftOrder(externalOrderId)
   }
 
+  async cancelMergedOrder(externalOrderId: string): Promise<WmsOrderCancelResult> {
+    return cancelMintsoftOrder(externalOrderId, { allowMerged: true })
+  }
+
   async removeOrderItems(externalOrderId: string, items: WmsOrderItemRef[]): Promise<WmsMergedItemRemoval> {
     return removeMintsoftOrderItems(externalOrderId, items)
   }

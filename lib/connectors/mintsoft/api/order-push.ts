@@ -664,7 +664,7 @@ export async function verifyMintsoftPushedOrder(
 async function fetchMintsoftOrderStatusId(
   externalOrderId: string,
   clientId: number,
-): Promise<{ found: boolean; isNew: boolean; statusId: number | null }> {
+): Promise<{ found: boolean; isNew: boolean; statusId: number | null; merged: boolean; orderNumber: string | null }> {
   const current = await mintsoftRequest<unknown>(
     `/api/Order/${encodeURIComponent(externalOrderId)}?ClientId=${clientId}`,
   )
@@ -673,7 +673,7 @@ async function fetchMintsoftOrderStatusId(
   // client renders a 204 as `data: null`, and reporting that as NOT_FOUND would
   // tell the push sweep the remote cancellation succeeded — moving the local link
   // to CANCELLED/HELD while the warehouse carries on fulfilling the order.
-  if (current.status === 404) return { found: false, isNew: false, statusId: null }
+  if (current.status === 404) return { found: false, isNew: false, statusId: null, merged: false, orderNumber: null }
   if (current.error) throw new Error(current.error)
   const raw = extractMintsoftObjectPayload(current.data)
   if (raw === null) {
@@ -684,7 +684,15 @@ async function fetchMintsoftOrderStatusId(
   }
   const order = assertMintsoftOrderClient(raw, clientId, 'Mintsoft Order detail (push gate)')
   const statusId = orderStatusId(order)
-  return { found: true, isNew: statusId === MINTSOFT_STATUS_NEW, statusId }
+  // A merged survivor: flagged MergedOrder=True, or a combined "a+b" number. Either is enough, because wrongly calling an order merged
+  // only ever withholds a cancel (the caller falls back to line removal or a notice), whereas missing it cancels other orders' goods.
+  const orderNumber = toStr(order.OrderNumber)
+  const flagged = Array.isArray(order.OrderNameValues) && (order.OrderNameValues as unknown[]).some((entry) => {
+    const nv = entry as Record<string, unknown> | null
+    return nv !== null && typeof nv === 'object' && toStr(nv.Name) === 'MergedOrder' && toStr(nv.Value)?.toLowerCase() === 'true'
+  })
+  const merged = flagged || mintsoftMergedParts(orderNumber).length > 0
+  return { found: true, isNew: statusId === MINTSOFT_STATUS_NEW, statusId, merged, orderNumber }
 }
 
 type MintsoftOrderItem = { ID: number; SKU: string | null; Quantity: number }
@@ -949,16 +957,19 @@ export async function addMintsoftOrderComment(externalOrderId: string, comment: 
   if (result.error) throw new Error(result.error)
 }
 
-export async function cancelMintsoftOrder(externalOrderId: string): Promise<WmsOrderCancelResult> {
+export async function cancelMintsoftOrder(externalOrderId: string, options?: { allowMerged?: boolean }): Promise<WmsOrderCancelResult> {
   // Only a NEW or a BACKORDERED order is cancellable (both confirmed live); anything further along is a no-op.
   // The gate also proves the order is OURS before we cancel it (o3d-bjc.6).
   const clientId = await getPushClientId('Mintsoft order cancel')
-  const { found, statusId } = await fetchMintsoftOrderStatusId(externalOrderId, clientId)
+  const { found, statusId, merged, orderNumber } = await fetchMintsoftOrderStatusId(externalOrderId, clientId)
   if (!found) return { cancelled: false, status: 'NOT_FOUND' }
   // Already cancelled (by the warehouse, or by an earlier attempt whose answer was lost): Mintsoft answers /Cancel with Success: true
   // either way, so Success alone cannot tell this apart from a cancellation IMS just made. It is reported as its own status and /Cancel
   // is not called.
   if (statusId === MINTSOFT_STATUS_CANCELLED) return { cancelled: false, status: 'ALREADY_CANCELLED' }
+  // A MERGED order holds other orders' goods: it is never cancelled here, whichever of its orders the call was made for (the absorbing
+  // order keeps the survivor's id, so its link can still name it as a plain order). The caller removes only that order's own lines.
+  if (merged && options?.allowMerged !== true) return { cancelled: false, status: 'MERGED_SURVIVOR', ...(orderNumber ? { mergedSurvivorNumber: orderNumber } : {}) }
   if (statusId !== MINTSOFT_STATUS_NEW && statusId !== MINTSOFT_STATUS_ON_BACKORDER) return { cancelled: false, status: 'NOT_CANCELLABLE' }
 
   const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/Cancel`)

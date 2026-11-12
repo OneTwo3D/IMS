@@ -511,6 +511,11 @@ export type WmsOrderCancelResult = {
   cancelled: boolean
   /** WMS status observed; a non-cancellable order is left as-is. ALREADY_CANCELLED: the WMS order was cancelled before this call (not a cancellation this call made). */
   status: string
+  /**
+   * Set with status MERGED_SURVIVOR: the order the call named IS a merged order (it also holds other orders' goods), so it was NOT
+   * cancelled. This is the warehouse's own number for it. The caller re-points the link as merged and removes only its own lines.
+   */
+  mergedSurvivorNumber?: string
 }
 
 export type WmsOrderUpdateResult = {
@@ -681,6 +686,11 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
   updateOrder?(externalOrderId: string, input: WmsOrderPushInput, clearance: WmsWriteClearance<'order.amend'>): Promise<WmsOrderUpdateResult>
   /** Cancel a WMS order by its external id; a no-op (success) if past NEW. */
   cancelOrder?(externalOrderId: string, clearance: WmsWriteClearance<'order.cancel' | 'order.hold'>): Promise<WmsOrderCancelResult>
+  /**
+   * Cancel a MERGED order. Only for a caller that has just proved the order holds nothing but the lines of the order being cancelled
+   * (see removeOrderItems, ONLY_LINES_LEFT). `cancelOrder` refuses a merged order (status MERGED_SURVIVOR) because it holds other orders' goods.
+   */
+  cancelMergedOrder?(externalOrderId: string, clearance: WmsWriteClearance<'order.cancel'>): Promise<WmsOrderCancelResult>
   /**
    * Take the given lines (one IMS order's, by the warehouse's own line ids) out of a MERGED warehouse order, and nothing else. Only
    * while the warehouse order can still be changed; every line is checked (present, same SKU, same quantity) BEFORE anything is

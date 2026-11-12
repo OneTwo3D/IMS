@@ -66,7 +66,7 @@ export const MINT_SEAM_DEFINITION_FILES = [
 ] as const
 /** The warehouse write methods of the connector contract. Each takes a clearance as its last argument. */
 export const MINT_WRITE_METHODS = [
-  'pushOrder', 'updateOrder', 'cancelOrder', 'removeOrderItems', 'addOrderComment', 'upsertProduct', 'createBundle', 'createAsn', 'updateProductContent',
+  'pushOrder', 'updateOrder', 'cancelOrder', 'removeOrderItems', 'cancelMergedOrder', 'addOrderComment', 'upsertProduct', 'createBundle', 'createAsn', 'updateProductContent',
 ] as const
 export const CLEARANCE_MINT_FILE = 'lib/connectors/wms/clearance.ts'
 export const CLEARANCE_MINT_FUNCTION = 'mintWmsWriteClearance'

@@ -151,6 +151,7 @@ export const PRIMITIVES: Readonly<Record<string, Primitive>> = {
   updateOrder: { family: 'mintsoft-write', memberOnly: true },
   cancelOrder: { family: 'mintsoft-write', memberOnly: true },
   removeOrderItems: { family: 'mintsoft-write', memberOnly: true },
+  cancelMergedOrder: { family: 'mintsoft-write', memberOnly: true },
   addOrderComment: { family: 'mintsoft-write', memberOnly: true },
   upsertProduct: { family: 'mintsoft-write', memberOnly: true },
   updateProductContent: { family: 'mintsoft-write', memberOnly: true },

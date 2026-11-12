@@ -46,6 +46,8 @@ const fake = {
   deletes: 0,
   /** After the Nth delete, the quantity of this line changes behind IMS's back. */
   tamperAfterDelete: null as { afterDeletes: number; itemId: number; quantity: number } | null,
+  /** The order detail read answers a server error. */
+  detailFails: false,
 }
 function resetFake() {
   fake.orders = new Map()
@@ -56,6 +58,7 @@ function resetFake() {
   fake.itemsReadFailsAfterDeletes = null
   fake.deletes = 0
   fake.tamperAfterDelete = null
+  fake.detailFails = false
 }
 const D_LINES: FakeLine[] = [{ ID: 3603106, SKU: '243632999', Quantity: 2 }, { ID: 3603107, SKU: '923663020', Quantity: 1 }]
 const E_LINES: FakeLine[] = [{ ID: 3603108, SKU: '243632999', Quantity: 1 }, { ID: 3603109, SKU: '849293203', Quantity: 1 }]
@@ -130,9 +133,10 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
       }
       const detailMatch = pathname.match(/^\/api\/Order\/([^/]+)$/)
       if (detailMatch && method === 'GET') {
+        if (fake.detailFails) return { data: null, error: 'Mintsoft request failed with status 500', status: 500 }
         const order = fake.orders.get(detailMatch[1])
         if (!order) return { data: null, error: 'Mintsoft request failed with status 404', status: 404 }
-        return { data: { ID: Number(detailMatch[1]), ClientId: CLIENT, OrderNumber: order.number, OrderStatusId: order.status }, status: 200 }
+        return { data: { ID: Number(detailMatch[1]), ClientId: CLIENT, OrderNumber: order.number, OrderStatusId: order.status, OrderNameValues: order.merged ? [{ Name: 'MergedOrder', Value: 'True' }] : [] }, status: 200 }
       }
       if (pathname === '/api/Order' && method === 'PUT') {
         const id = '999001'
@@ -224,6 +228,7 @@ async function sweep(port: WmsOrderPushPort) {
     pushOrder: async () => { throw new Error('not used') },
     updateOrder: async () => ({ updated: true, status: 'NEW' }),
     cancelOrder: async (id: string) => orderPush.cancelMintsoftOrder(id),
+    cancelMergedOrder: async (id: string) => orderPush.cancelMintsoftOrder(id, { allowMerged: true }),
     addOrderComment: async (id: string, comment: string) => orderPush.addMintsoftOrderComment(id, comment),
     removeOrderItems: async (id: string, items: WmsOrderItemRef[]) => orderPush.removeMintsoftOrderItems(id, items),
     findMergedSurvivor: async (number: string) => orderPush.findMintsoftMergedSurvivor(number),
@@ -240,6 +245,10 @@ async function sweep(port: WmsOrderPushPort) {
 const mergedLinkRef = (): WmsPushLinkRef => ({ id: 'link-d', orderId: 'so-d', orderNumber: 'IMSTEST-D', externalOrderId: SURVIVOR, externalOrderNumber: 'IMSTEST-E+IMSTEST-D', state: 'MERGED' })
 /** D's link while it still names the absorbed order (404s): the cancel pass finds the merge itself. */
 const absorbedLinkRef = (): WmsPushLinkRef => ({ id: 'link-d', orderId: 'so-d', orderNumber: 'IMSTEST-D', externalOrderId: ABSORBED, externalOrderNumber: 'IMSTEST-D', state: 'SYNCED' })
+
+/** E's link (the ABSORBING order, which keeps the survivor's id): the dispatch sweep has not yet re-pointed it, so it still reads as a plain SYNCED order. */
+const absorbingLinkRef = (): WmsPushLinkRef => ({ id: 'link-e', orderId: 'so-e', orderNumber: 'IMSTEST-E', externalOrderId: SURVIVOR, externalOrderNumber: 'IMSTEST-E', state: 'SYNCED' })
+const storedE: WmsOrderItemRef[] = E_LINES.map((l) => ({ externalItemId: String(l.ID), sku: l.SKU, quantity: l.Quantity }))
 
 const deletedIds = () => fake.requests.filter((r) => r.method === 'DELETE').map((r) => r.path.split('/').pop())
 
@@ -572,4 +581,73 @@ test('SWEEP: the ids the connector read back are recorded against the order afte
       if (!failRecord) assert.deepEqual(h.recordedItems, [{ orderId: 'so-1', externalOrderId: 'wms-1', items }])
     })
   }
+})
+
+// ---------------------------------------------------------------- 7. the ABSORBING order, link still plain SYNCED ---------------
+
+test('ABSORBING ORDER cancelled while its link is still SYNCED and the survivor holds both orders\' lines: the link is re-pointed MERGED, ONLY this order\'s lines are removed, the survivor is NOT cancelled', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const h = makePort({ cancellable: [absorbingLinkRef()], items: storedE })
+    const result = await sweep(h.port)
+    assert.deepEqual(deletedIds(), ['3603108', '3603109'])
+    assert.deepEqual(survivorItems(), D_LINES, 'the other order\'s lines are untouched')
+    assert.equal(fake.orders.get(SURVIVOR)!.status, 9)
+    assert.equal(fake.requests.some((r) => r.path.endsWith('/Cancel')), false, 'no /Cancel of the survivor')
+    assert.ok(h.writes.some((w) => w.data.state === 'MERGED'), 'the link was marked MERGED first')
+    assert.ok(h.writes.some((w) => w.data.state === 'CANCELLED'))
+    assert.equal(result.cancelled, 1)
+    assert.equal(fake.comments.length, 1)
+  })
+})
+
+test('ABSORBING ORDER, only its own lines remain on the survivor: the survivor is cancelled normally', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged(9, E_LINES)
+    const h = makePort({ cancellable: [absorbingLinkRef()], items: storedE })
+    const result = await sweep(h.port)
+    assert.deepEqual(deletedIds(), [])
+    assert.equal(fake.orders.get(SURVIVOR)!.status, 3)
+    assert.ok(h.writes.some((w) => w.data.state === 'CANCELLED'))
+    assert.equal(result.cancelled, 1)
+  })
+})
+
+test('ABSORBING ORDER, stored ids missing: nothing cancelled, nothing deleted, a notice', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const h = makePort({ cancellable: [absorbingLinkRef()], items: null })
+    const result = await sweep(h.port)
+    assert.equal(fake.requests.some((r) => r.method === 'DELETE' || r.path.endsWith('/Cancel')), false)
+    assert.equal(result.operatorNotices, 1)
+  })
+})
+
+test('ABSORBING ORDER, the order read fails: nothing is sent, the link stays SYNCED and retryable (no notice stamped)', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    fake.detailFails = true
+    const h = makePort({ cancellable: [absorbingLinkRef()], items: storedE })
+    const result = await sweep(h.port)
+    assert.equal(writeRequests().length, 0)
+    assert.equal(result.failed, 1)
+    assert.equal(h.link.state, 'SYNCED')
+    assert.equal(h.writes.some((w) => w.data.state !== undefined || w.data.cancelNoticeAt !== undefined), false)
+    assert.ok(h.writes.some((w) => typeof w.data.lastError === 'string'), 'the error is recorded; the next sweep tries again')
+  })
+})
+
+test('ABSORBING ORDER held in IMS: the survivor is not cancelled either; the link is marked MERGED and a notice is raised', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const h = makePort({ cancellable: [], items: storedE })
+    h.port.holdableLinks = async () => [absorbingLinkRef()]
+    h.link.state = 'SYNCED'
+    h.link.externalOrderId = SURVIVOR
+    const result = await sweep(h.port)
+    assert.equal(fake.requests.some((r) => r.method === 'DELETE' || r.path.endsWith('/Cancel')), false)
+    assert.equal(fake.orders.get(SURVIVOR)!.status, 9)
+    assert.equal(result.operatorNotices, 1)
+    assert.ok(h.writes.some((w) => w.data.state === 'MERGED'))
+  })
 })

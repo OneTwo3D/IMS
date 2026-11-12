@@ -1138,7 +1138,7 @@ type PushConnector = Pick<
   // revalidation pass needs before it may re-open a create whose outcome is unknown. Tri-state on
   // purpose: only MISSING means "verifiably no such order", and a merged/ambiguous match must
   // never be reported as MISSING.
-  'pushOrder' | 'updateOrder' | 'cancelOrder' | 'addOrderComment' | 'verifyPushedOrder' | 'probeOrderPresence' | 'reconcileAmbiguousCreate' | 'findMergedSurvivor' | 'removeOrderItems'
+  'pushOrder' | 'updateOrder' | 'cancelOrder' | 'addOrderComment' | 'verifyPushedOrder' | 'probeOrderPresence' | 'reconcileAmbiguousCreate' | 'findMergedSurvivor' | 'removeOrderItems' | 'cancelMergedOrder'
 >
 
 /**
@@ -1337,7 +1337,7 @@ export async function runWmsOrderPushSweepCore(
    */
   const handleMergedCancel = async (link: WmsPushLinkRef, ts: Date) => {
     const survivorId = link.externalOrderId
-    if (!survivorId || !connector.removeOrderItems || !connector.cancelOrder || !port.readOrderItems) {
+    if (!survivorId || !connector.removeOrderItems || !connector.cancelMergedOrder || !port.readOrderItems) {
       await raiseMergedNotice(link, 'CANCEL', ts)
       return
     }
@@ -1389,7 +1389,7 @@ export async function runWmsOrderPushSweepCore(
     if (removal.kind === 'ONLY_LINES_LEFT') {
       // The merged order holds nothing but this order's lines (the other order's were taken out, or it was cancelled before): it is
       // cancelled like any order, through the same clearance.
-      const cancel = await connector.cancelOrder(survivorId, seam.clearance)
+      const cancel = await connector.cancelMergedOrder!(survivorId, seam.clearance)
       if (cancel.cancelled || cancel.status === 'ALREADY_CANCELLED') {
         await settleCancelled()
         await audit({
@@ -1418,6 +1418,24 @@ export async function runWmsOrderPushSweepCore(
       removal.removed.length > 0
         ? 'IMS removed some of the cancelled order\'s lines from the merged WMS order and could not finish — left for an operator'
         : 'IMS could not remove the cancelled order\'s lines from the merged WMS order — left for an operator')
+  }
+
+  /**
+   * The warehouse answered a hold or cancel by saying the order the link names is itself a MERGED order (the ABSORBING order keeps the
+   * survivor's id, so its link can still read as a plain SYNCED order until the dispatch sweep notices). Nothing was cancelled. The
+   * link is re-pointed as MERGED (compare-and-set on the link as read), then a cancel removes only this order's own lines and a hold
+   * raises the notice.
+   */
+  const handleMergedSurvivorFound = async (link: WmsPushLinkRef, intent: 'HOLD' | 'CANCEL', number: string | undefined, ts: Date) => {
+    if (!link.externalOrderId) return
+    const repoint = { state: 'MERGED' as const, ...(number ? { externalOrderNumber: number } : {}), ...RESET_DISPATCH_FAILURES }
+    const moved = port.updateLinkIfLinked
+      ? await port.updateLinkIfLinked(link.id, { state: link.state ?? 'SYNCED', externalOrderId: link.externalOrderId }, repoint)
+      : (await port.updateLink(link.id, repoint), true)
+    if (!moved) return
+    const repointed = { ...link, state: 'MERGED' as const, ...(number ? { externalOrderNumber: number } : {}) }
+    if (intent === 'CANCEL') await handleMergedCancel(repointed, ts)
+    else await raiseMergedNotice(repointed, intent, ts)
   }
 
   /**
@@ -3030,6 +3048,10 @@ export async function runWmsOrderPushSweepCore(
             'IMS hold could not be confirmed: the WMS order was not found — left for an operator', ts)
           continue
         }
+        if (cancel.status === 'MERGED_SURVIVOR') {
+          await handleMergedSurvivorFound(link, 'HOLD', cancel.mergedSurvivorNumber, ts)
+          continue
+        }
         // Already cancelled in Mintsoft (by the warehouse, or an earlier attempt). Not a cancellation IMS made, and a cancelled order keeps
         // its number so the release pass could never re-create it: a person has to decide.
         if (cancel.status === 'ALREADY_CANCELLED') {
@@ -3137,6 +3159,10 @@ export async function runWmsOrderPushSweepCore(
             `Cancelled in IMS, but WMS order ${link.externalOrderId} was not found (it may have been merged into another order or removed). `
             + 'IMS has NOT recorded it as cancelled in the WMS — find the order in the WMS and make sure it does not ship.',
             'IMS cancel could not be confirmed: the WMS order was not found — left for an operator', ts)
+          continue
+        }
+        if (cancel.status === 'MERGED_SURVIVOR') {
+          await handleMergedSurvivorFound(link, 'CANCEL', cancel.mergedSurvivorNumber, ts)
           continue
         }
         if (cancel.cancelled || cancel.status === 'ALREADY_CANCELLED') {
