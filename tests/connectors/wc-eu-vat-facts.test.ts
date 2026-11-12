@@ -347,6 +347,23 @@ test('stamping: an unflagged order after the cut-in is refused and NOTHING is st
   assert.equal(writes.length, 1)
 })
 
+test('gift-card cut-in: a zone-less date_created_gmt is UTC whatever the process timezone; calendar rollovers are refused', () => {
+  const saved = process.env.TZ
+  try {
+    for (const tz of ['UTC', 'America/New_York', 'Pacific/Auckland']) {
+      process.env.TZ = tz
+      assert.equal(giftCardOrderedAt({ date_created_gmt: '2026-11-01T10:00:00' }).toISOString(), '2026-11-01T10:00:00.000Z', tz)
+    }
+  } finally {
+    if (saved === undefined) delete process.env.TZ
+    else process.env.TZ = saved
+  }
+  for (const bad of ['2026-04-31T10:00:00', '2026-02-29T10:00:00', '2026-02-30T00:00:00', '2025-02-29T00:00:00', '2026-00-10T00:00:00', '2026-12-00T00:00:00']) {
+    assert.ok(Number.isNaN(giftCardOrderedAt({ date_created_gmt: bad }).getTime()), bad)
+  }
+  assert.equal(giftCardOrderedAt({ date_created_gmt: '2028-02-29T10:00:00' }).toISOString(), '2028-02-29T10:00:00.000Z', 'a real leap day is accepted')
+})
+
 // ---- unreadable figures are named, never defaulted to 0 -------------------------------------------------------------------------------------------------------------
 test('well-formed figures report nothing unreadable', () => {
   assert.deepEqual(readWcEuVatFacts(wcOrder()).unreadable, [])
