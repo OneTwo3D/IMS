@@ -3,6 +3,8 @@
  * Each entry represents one IMS transaction → one Xero API call.
  */
 
+import { composeFinalBeforePost, euSchemePostingRefusal } from './scheme-posting-check'
+import { holdInvoiceOnRegimePolicyChange, REGIME_ACCOUNT_CHANGED_REFUSAL, REGIME_POLICY_BLOCKED_REFUSAL } from '@/lib/connectors/woocommerce/sync/regime-policy-hold'
 import { resolveSalesPostContact } from '@/lib/domain/erasure/accounting-contact'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { getRateLimitBackoffMs, isRateLimitError } from './deferral'
@@ -6201,6 +6203,14 @@ export async function processClaimedEntry(
       // words - at the head of the case, before any read or claim - and again by the connector as the last word.
       const untypedInvoice = salesDocumentTaxTypeRefusal(`Sales invoice ${String(payload.invoiceNumber ?? '(no number)')}`, payload as SalesDocumentTaxTypeInput)
       if (untypedInvoice) return { success: false, error: untypedInvoice }
+      // An EU-treated scheme invoice was built on a zero-rated type: the stored Xero list must still show that type ACTIVE and 0% now, before anything is sent.
+      // A treated invoice decided under regime settings that have changed since is superseded and moved back to a held invoice (one fenced transaction); nothing is sent, and a re-import rebuilds it under the settings now in force.
+      const policyHold = await holdInvoiceOnRegimePolicyChange({ attempt, held: lease, referenceType, referenceId, payload: payload as Record<string, unknown> })
+      if (policyHold.kind === 'held' || policyHold.kind === 'lost') return { success: true, skipped: true }
+      if (policyHold.kind === 'account_changed') return { success: false, error: REGIME_ACCOUNT_CHANGED_REFUSAL(String(payload.invoiceNumber ?? '(no number)'), policyHold.accounts) }
+      if (policyHold.kind === 'blocked') return { success: false, error: REGIME_POLICY_BLOCKED_REFUSAL(String(payload.invoiceNumber ?? '(no number)'), policyHold.problem) }
+      const schemeRefusal = await euSchemePostingRefusal(payload as Record<string, unknown>)
+      if (schemeRefusal) return { success: false, error: schemeRefusal }
       const guard = await guardCancelledSalesOrderInvoice(attempt, referenceType, referenceId, lease)
       if (!guard.post) return guard.result
       const customerId = guard.customerId
@@ -6239,7 +6249,7 @@ export async function processClaimedEntry(
         // o3d-k26m.5 round 5/6: the number fence's LAST word. Handed in here, scoped around the
         // create by pushSalesInvoice, and evaluated inside the HTTP client on every attempt as the
         // last statement before the socket. Nothing is sent if it refuses.
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId, beforePost: numberFence.beforePost, contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) })
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId, beforePost: composeFinalBeforePost(numberFence.beforePost, payload as Record<string, unknown>, 'create'), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) })
       return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, externalRevisionAt: invoiceResult.externalRevisionAt, error: invoiceResult.error }
     }
 
@@ -6251,6 +6261,8 @@ export async function processClaimedEntry(
       // As the create: an update must not overwrite a good document with one carrying an undecided tax type.
       const untypedUpdate = salesDocumentTaxTypeRefusal(`Sales invoice ${String(payload.invoiceNumber ?? '(no number)')}`, payload as SalesDocumentTaxTypeInput)
       if (untypedUpdate) return { success: false, error: untypedUpdate }
+      const schemeRefusalUpdate = await euSchemePostingRefusal(payload as Record<string, unknown>)
+      if (schemeRefusalUpdate) return { success: false, error: schemeRefusalUpdate }
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       if (!accountingInvoiceId) {
         return { success: false, error: 'Missing accountingInvoiceId for SALES_INVOICE_UPDATE' }
@@ -6284,7 +6296,7 @@ export async function processClaimedEntry(
         discountTaxType: payload.discountTaxType as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId, contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) })
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId, beforePost: composeFinalBeforePost(null, payload as Record<string, unknown>, 'update'), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) })
       return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, externalRevisionAt: invoiceResult.externalRevisionAt, error: invoiceResult.error }
     }
 

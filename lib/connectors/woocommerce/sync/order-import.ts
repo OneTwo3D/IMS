@@ -34,6 +34,7 @@ import {
   mapWcAddress, upsertCustomer, mapWcLineItems,
   mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, getFxRateToBase, isMissingFxRateError,
   readWcCustomerVat, resolveWcOrderLevelDiscount,
+  type MappedLine,
 } from './field-mapping'
 import { assertNoOrderPostingInFlightForReview } from '@/lib/domain/accounting/store-credit-posting-fence'
 import { checkWcStoreCreditReconciles, classifyWcCouponLines, describeWcCouponRefusal, planWcOrderCoupons, wcReportedOrderAmounts, wcUpdateNeedsStoreCreditReview } from './coupon-classification'
@@ -55,11 +56,20 @@ import {
 import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { rateBinding, resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
+import { previewTreatedSalesInvoice, treatImportedSalesInvoice } from './eu-vat-invoice-treatment'
+import { regimePolicyDifference, type RegimePolicy } from '@/lib/domain/accounting/eu-vat-regime-policy'
+import { heldFreshBuildDifference, heldInvoiceDifference, heldTaxBindingDifference, heldUntreatedTaxDifference, type ExpectedHeldInvoice } from './held-invoice-verification'
+import { currentWcTaxBinding, recordWcTaxBinding } from './wc-tax-binding'
+import { buildEuVatRegimeInputFromSettings, readEuVatRegimeMode } from './eu-vat-facts'
+import { resolveEuVatRegime } from '@/lib/domain/accounting/eu-vat-regime'
+import { readEuVatRegimeStamp } from '@/lib/domain/accounting/eu-vat-regime-stamp'
+import { EU_VAT_TREATMENT_PAYLOAD_KEY, routeFor } from '@/lib/domain/accounting/eu-vat-treatment'
+import { invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { directCreateMarker, isFulfilmentStatus, resolveDirectCreateMarker } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
-import { addMoney, currencyMinorUnits, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, currencyMinorUnits, roundMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
 import { WC_ORDER_SWEEP_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
 import {
@@ -657,6 +667,198 @@ export function resolveWcLineAccountingTaxType(params: {
 }): string | undefined {
   if (params.forceNoTax) return WC_NO_TAX_ACCOUNTING_TYPE
   return resolveSalesLineTaxType(params)
+}
+
+/** Where a line's tax rate came from: the WooCommerce rate id it names, the product-category resolver, the order default, or (a fee WooCommerce charged no tax on) the no-tax rule. */
+export type WcLineRateSource = 'woo-rate' | 'category' | 'default' | 'no-tax'
+
+/**
+ * THE ONE RESOLUTION OF AN ORDER'S TAX RATES, shared by the importer's invoice build and by the check a held invoice undergoes before release, so the two cannot drift: each WooCommerce rate id is resolved through the mapping; the order default is picked from
+ * the order's own tax lines; each line takes the rate its WooCommerce id names, else the product-category resolver's, else the order default (and a fee WooCommerce charged no tax on takes none).
+ */
+export async function resolveWcOrderTaxResolution(wcOrder: WcFullOrder, mappedLines: MappedLine[]) {
+  const distinctWcRateIds = Array.from(new Set([
+    ...mappedLines.map((l) => l.externalTaxRateId).filter((x): x is number => typeof x === 'number'),
+    ...wcOrder.tax_lines.map((line) => line.rate_id).filter((x): x is number => typeof x === 'number'),
+    // o3d-cyn r2: the SHIPPING line's own rate ids. They normally also appear in `tax_lines`, but
+    // the shipping tax type is now resolved from them directly, and a rate this map does not hold
+    // cannot be resolved at all.
+    ...wcOrder.shipping_lines.flatMap((line) => (line.taxes ?? []).map((tax) => tax.id))
+      .filter((x): x is number => typeof x === 'number'),
+  ]))
+  const wcResolvedById = new Map<
+    number,
+    { taxRateId: string | null; taxRateName: string | null; taxRateValue: number; accountingTaxType: string | null; reverseCharge: boolean; active?: boolean; source?: 'mapped' | 'default' }
+  >()
+  for (const id of distinctWcRateIds) {
+    wcResolvedById.set(id, await resolveWcTaxRateById(id))
+  }
+
+  const orderLevelRates = wcOrder.tax_lines
+    .map((line) => wcResolvedById.get(line.rate_id))
+    .filter((rate): rate is NonNullable<typeof rate> => rate != null)
+  const resolvedOrderDefault =
+    orderLevelRates.find((rate) => /standard/i.test(rate.taxRateName ?? ''))
+    ?? [...orderLevelRates].sort((a, b) => b.taxRateValue - a.taxRateValue)[0]
+    ?? [...wcResolvedById.values()].sort((a, b) => b.taxRateValue - a.taxRateValue)[0]
+    ?? await resolveWcTaxRateById(null)
+  const {
+    taxRateId: orderDefaultTaxRateId,
+    taxRateName,
+    taxRateValue,
+    accountingTaxType,
+  } = resolvedOrderDefault
+
+  // Load product categories for lines that need the resolver fallback.
+  const productIds = Array.from(
+    new Set(mappedLines.map((l) => l.productId).filter((x): x is string => typeof x === 'string')),
+  )
+  const productRows = productIds.length
+    ? await db.product.findMany({
+        where: { id: { in: productIds } },
+        select: { id: true, taxCategory: true },
+      })
+    : []
+  const productCategoryById = new Map<string, TaxCategory>(
+    productRows.map((p) => [p.id, p.taxCategory]),
+  )
+
+  const destCountry = wcOrder.shipping?.country
+    ? wcOrder.shipping.country.toLowerCase()
+    : wcOrder.billing?.country
+    ? wcOrder.billing.country.toLowerCase()
+    : null
+
+  const orderDefaultCtx = {
+    id: orderDefaultTaxRateId,
+    name: taxRateName,
+    rate: taxRateValue,
+    accountingTaxType,
+  }
+  const needsResolver = mappedLines
+    .map((l, idx) => ({
+      id: String(idx),
+      productCategory: (l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory),
+      hasMappedWc: l.externalTaxRateId != null && wcResolvedById.get(l.externalTaxRateId)?.source === 'mapped',
+    }))
+    .filter((l) => !l.hasMappedWc)
+  const resolverMap = await resolveLineTaxRateBatch(
+    needsResolver.map((l) => ({ id: l.id, productCategory: l.productCategory })),
+    { destinationCountry: destCountry, usedFor: 'SALES', orderDefault: orderDefaultCtx },
+  )
+  const expectedDestinationRates = await loadExpectedDestinationSalesTaxRates(
+    needsResolver.map((line) => line.productCategory),
+    destCountry,
+  )
+
+  const taxFallbackLines: WcTaxRateFallbackLine[] = []
+  const lineSources: WcLineRateSource[] = []
+  const lineTaxResolved = mappedLines.map((l, idx) => {
+    if (l.forceNoTax) {
+      lineSources.push('no-tax')
+      return {
+        taxRateId: null,
+        taxRateName: null,
+        taxRateValue: 0,
+        accountingTaxType: null,
+        // Tax-exempt lines are never reverse-charged — keeps the union uniform
+        // so the accounting-payload swap reads a real flag, not an absent one.
+        reverseCharge: false,
+      }
+    }
+    if (l.externalTaxRateId != null) {
+      const wc = wcResolvedById.get(l.externalTaxRateId)
+      if (wc?.source === 'mapped') {
+        lineSources.push('woo-rate')
+        return wc
+      }
+    }
+    const resolved = resolverMap.get(String(idx)) ?? {
+      taxRateId: orderDefaultTaxRateId,
+      taxRateName,
+      taxRateValue,
+      accountingTaxType,
+      isCompound: false,
+      reverseCharge: false,
+      reportingCategory: null,
+      components: [],
+      matched: 'fallback' as const,
+      warning: `No configured sales rate for ${destCountry ? destCountry.toUpperCase() : 'unknown country'} / ${l.taxCategoryFallback ?? 'STANDARD'}. Using order default.`,
+    }
+    lineSources.push(resolved.matched === 'fallback' ? 'default' : 'category')
+    if (resolved.matched === 'fallback') {
+      taxFallbackLines.push({
+        sku: l.sku,
+        productCategory: (l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory),
+        externalTaxRateId: l.externalTaxRateId ?? null,
+        taxRateValue: resolved.taxRateValue,
+        expectedTaxRateValue: expectedDestinationRates.get((l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory)) ?? null,
+        warning: resolved.warning,
+      })
+    }
+    return resolved
+  })
+  return { wcResolvedById, orderDefaultTaxRateId, orderDefaultSource: (resolvedOrderDefault.source ?? 'default') as 'mapped' | 'default', taxRateName, taxRateValue, accountingTaxType, destCountry, taxFallbackLines, lineTaxResolved, lineSources }
+}
+
+export type WcOrderTaxResolution = Awaited<ReturnType<typeof resolveWcOrderTaxResolution>>
+
+/** The resolved IMS rate and the effective posted tax type of every invoice line and of the shipping, as the importer's invoice builder sends them. */
+export type WcInvoiceTaxTypes = {
+  lines: Array<{ rateId: string | null; source: WcLineRateSource; type: string | null }>
+  shipping: { rateId: string | null; type: string | null }
+  /** The order default rate (the rate the order-level discount is posted on) and where it came from (`mapped`: a WooCommerce rate id the mapping resolves; `default`: the IMS default rate), with the effective discount tax type. */
+  discount: { rateId: string | null; source: 'mapped' | 'default'; type: string | null }
+}
+
+/**
+ * THE ONE DECISION OF A LINE'S (AND THE SHIPPING'S) POSTED TAX TYPE: the resolved rate above, followed to its current row (a tax re-key's replacement), then the reverse-charge swap and the fee no-tax rule
+ * (`resolveWcLineAccountingTaxType`); the shipping's from `resolveWcShippingTaxRate`, never swapped. The invoice build in `importWcOrder` takes every line's and the shipping's type from here, and the check before a held invoice is released
+ * calls this same function on the order as it is now, so what is compared is what would be sent.
+ */
+export async function resolveWcInvoiceTaxTypes(params: {
+  wcOrder: WcFullOrder
+  mappedLines: MappedLine[]
+  resolution: WcOrderTaxResolution
+  reverseChargeSalesTaxType: string | null | undefined
+  shippingForeign: number
+  currency: string
+  /** The rate ids the lines are PERSISTED with, after a tax re-key's redirect (`lineData[].taxRateId`): the posted type and the recorded rate id come from THESE, as the invoice build always read them. Absent: the resolution's own ids, which `currentTaxRates` follows to the same replacement. */
+  lineRateIds?: ReadonlyArray<string | null | undefined>
+}): Promise<WcInvoiceTaxTypes> {
+  const { wcOrder, mappedLines, resolution } = params
+  const { wcResolvedById, orderDefaultTaxRateId, taxRateValue, accountingTaxType, lineTaxResolved, lineSources } = resolution
+  const shippingTax = resolveWcShippingTaxRate({
+    shippingLines: wcOrder.shipping_lines,
+    shippingNetForeign: params.shippingForeign,
+    rateById: wcResolvedById,
+    orderDefault: { accountingTaxType, taxRateValue, taxRateId: orderDefaultTaxRateId },
+    currency: params.currency,
+  })
+  const lineIds = mappedLines.map((_, idx) => params.lineRateIds?.[idx] ?? lineTaxResolved[idx]?.taxRateId)
+  const ratesNow = await currentTaxRates(db, [...lineIds, shippingTax.taxRateId, orderDefaultTaxRateId])
+  const lines = mappedLines.map((l, idx) => {
+    const resolved = lineTaxResolved[idx]
+    const rateNow = lineIds[idx] ? ratesNow.get(lineIds[idx]!) : undefined
+    const type = resolveWcLineAccountingTaxType({
+      forceNoTax: l.isFeeLine === true ? l.forceNoTax : undefined,
+      baseTaxType: rateNow?.accountingTaxType ?? resolved?.accountingTaxType ?? accountingTaxType,
+      reverseCharge: rateNow?.reverseCharge ?? resolved?.reverseCharge,
+      reverseChargeSalesTaxType: params.reverseChargeSalesTaxType,
+    })
+    // The rate the line stands on NOW (a re-key's replacement, not the id the resolution made before the redirect).
+    return { rateId: rateNow?.id ?? lineIds[idx] ?? null, source: lineSources[idx]!, type: type ?? null }
+  })
+  const shippingRateNow = shippingTax.taxRateId ? ratesNow.get(shippingTax.taxRateId) : undefined
+  const shippingType = shippingRateNow ? (shippingRateNow.accountingTaxType ?? undefined) : (shippingTax.taxType ?? accountingTaxType ?? undefined)
+  // The order-level discount posts on the ORDER DEFAULT rate (as it stands now), else the default's own type: the same expression the invoice build sends as `discountTaxType`.
+  const defaultRateNow = orderDefaultTaxRateId ? ratesNow.get(orderDefaultTaxRateId) : undefined
+  const discountType = defaultRateNow ? (defaultRateNow.accountingTaxType ?? undefined) : (accountingTaxType ?? undefined)
+  return {
+    lines,
+    shipping: { rateId: shippingTax.taxRateId ?? null, type: shippingType ?? null },
+    discount: { rateId: orderDefaultTaxRateId ?? null, source: resolution.orderDefaultSource, type: discountType ?? null },
+  }
 }
 
 export function reconcileWcDocumentTax(
@@ -1375,7 +1577,11 @@ async function updateExistingWcOrderCore(
   // ever queued. Skipping here also refuses, structurally, to release an invoice for an order that
   // has already been invoiced.
   if (so.accountingInvoiceId) return
-  await releaseHeldWcSalesInvoice(orderId, { externalOrderId: String(wcOrder.id), externalOrderNumber: wcOrder.number }, usableInvoiceNumber)
+  // With the switch on, a held invoice is checked against the order (and an untreated one treated) before the release looks at it; a difference or refusal keeps it PENDING with its reason and nothing is released.
+  const reconciled = await reconcileHeldWcSalesInvoice(orderId, wcOrder).catch((error) => { console.error(`[wc-import] could not treat the held sales invoice for ${orderId}:`, error); return { outcome: 'refused' as const } })
+  if (reconciled.outcome === 'refused') return
+  // The release re-verifies a treated hold under its own order lock, immediately before it enqueues (`recheck`).
+  await releaseHeldWcSalesInvoice(orderId, { externalOrderId: String(wcOrder.id), externalOrderNumber: wcOrder.number }, usableInvoiceNumber, { recheck: reconciled.recheck })
 }
 
 /**
@@ -1624,11 +1830,462 @@ async function noteHeldReleaseFailure(rowId: string, message: string): Promise<v
   })
 }
 
+/** Re-checks a treated hold against the order INSIDE the release's own order-locked transaction, immediately before it enqueues; the hold it returns is the one that is released. */
+type HeldRecheck = (tx: Prisma.TransactionClient) => Promise<{ ok: true; held: HeldSalesInvoicePayload } | { ok: false; reason: string }>
+/**
+ * THE REGIME POLICY A TREATED HOLD WAS PARKED UNDER: every setting `buildEuVatRegimeInputFromSettings` and the treatment read to decide the regime (the regime mode, the gift-card flag cut-in, the IOSS and DDP accounts), recorded on the hold's treatment marker.
+ * The scheduled sweep has no WooCommerce order and cannot re-verify, so it fails closed: it releases a treated hold only if the policy now in force equals the recorded one, otherwise the hold stays PENDING and a re-import (which re-verifies against the order) decides.
+ */
+/** Records the policy the treatment DECIDED under (its one read, carried on the outcome) on a treated hold's marker. It reads no setting. With no snapshot nothing is recorded, and the sweep then refuses the hold (fail closed). */
+function withRegimePolicy(payload: Record<string, unknown>, policy: RegimePolicy | undefined): Record<string, unknown> {
+  const marker = payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as Record<string, unknown> | null | undefined
+  if (marker?.applied !== true || policy === undefined) return payload
+  return { ...payload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { ...marker, regimePolicy: policy } }
+}
+/** Null when the policy in force equals the one the hold was parked under; otherwise why the sweep must not release it, and which ACCOUNT settings changed (those a re-import cannot adopt: the regime stamp is write-once and the treated lines carry their accounts). */
+async function regimePolicyChange(payload: Record<string, unknown>): Promise<{ problem: string; accountsChanged: string[] } | null> {
+  const difference = await regimePolicyDifference((payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { regimePolicy?: unknown } | null | undefined)?.regimePolicy)
+  return difference === null ? null : { problem: difference.problem.replace('since it was prepared', 'since it was parked').replace('it was prepared before', 'it was parked before'), accountsChanged: difference.accountsChanged }
+}
+
+class HeldRecheckRefusal extends Error {
+  /** `mark`: the order changed (mark the hold order_changed); otherwise the hold is already marked, gone or replaced and is left as it is. */
+  constructor(readonly reason: string, readonly mark: boolean) { super(reason) }
+}
+
+/** The order changed after the invoice was held: mark the hold so nothing releases or re-treats it, and say what is needed. */
+async function markHeldInvoiceOrderChanged(orderId: string, rowId: string, what: string): Promise<void> {
+  await db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, orderId)
+    const current = await tx.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
+    if (!current || current.id !== rowId || !isHeldSalesInvoicePayload(current.payload)) return
+    const currentHeld: HeldSalesInvoicePayload = current.payload
+    await tx.shoppingSyncLog.update({
+      where: { id: rowId },
+      data: {
+        payload: { ...currentHeld, accountingPayload: { ...currentHeld.accountingPayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'order_changed' } } } as unknown as Prisma.InputJsonValue,
+        errorMessage: `This held invoice was NOT released: the order changed after it was held (${what}) and needs its invoice rebuilt. NOTHING was queued.`,
+        syncedAt: null,
+      },
+    })
+  })
+}
+
+/**
+ * A HELD INVOICE IS CHECKED AGAINST THE ORDER ON RE-IMPORT, BEFORE ANYTHING IS RELEASED (switch on only; with it off nothing here runs).
+ *
+ *   TREATED HOLD (marker applied:true). WooCommerce can change the order between the hold and the number. The parked payload is compared with the order as it is now (lines, discounts, shipping, fees, the document total: lib/connectors/woocommerce/sync/held-invoice-verification.ts) and the
+ *   treatment is re-resolved from the current facts (the regime, VAT account, zero-rated type and VAT amount) and compared with what was parked and with the order's stamp, in one order-locked transaction. Any difference keeps the hold PENDING.
+ *   UNTREATED HOLD (no marker, applied:false). The parked lines are first verified against the order the same way, then the treatment is applied to the parked payload (only the treatment is added, as only the number is on release) and the payload replaced under the order lock.
+ * A difference or a refusal leaves the hold PENDING with the reason and the release is not attempted. A hold whose order changed is marked (applied:false, reason order_changed), so neither the sweep nor a later re-import releases or re-treats it: an invoice built from an order that has changed
+ * has to be rebuilt, and there is no automatic rebuild of a held invoice. Store-credit orders are left alone. The held-release sweep has no WooCommerce order in hand, so it does not compare; it only refuses holds that are not marked applied:true.
+ */
+/**
+ * The importer's own reconciliation of the document it builds with the order: the shipping tax resolved, every component's tax compared with what WooCommerce charged, and rates that moved money but are unmapped or inactive.
+ * ONE function for the import and for the re-evaluation of a held invoice stamped `_taxUnreconciled`, so a hold is only released when the very test that stamped it now passes.
+ */
+function reconcileWcDocumentWithOrder(
+  wcOrder: WcFullOrder,
+  mappedLines: Awaited<ReturnType<typeof mapWcLineItems>>,
+  resolution: Awaited<ReturnType<typeof resolveWcOrderTaxResolution>>,
+  shippingForeign: ReturnType<typeof mapWcShipping>['shippingForeign'],
+  currency: string,
+) {
+  const { wcResolvedById, lineTaxResolved, accountingTaxType, taxRateValue, orderDefaultTaxRateId } = resolution
+  const orderMoneyDigits = currencyMinorUnits(currency)
+  const shippingTax = resolveWcShippingTaxRate({
+    shippingLines: wcOrder.shipping_lines,
+    shippingNetForeign: shippingForeign,
+    rateById: wcResolvedById,
+    orderDefault: { accountingTaxType, taxRateValue, taxRateId: orderDefaultTaxRateId },
+    currency,
+  })
+  const documentTaxReconciliation = reconcileWcDocumentTax([
+    ...mappedLines.map((l, idx) => ({
+      label: l.sku || l.description || `line ${idx + 1}`,
+      netForeign: toDecimal(l.qty).mul(toDecimal(l.unitPriceForeign)).sub(toDecimal(l.discountAmount)),
+      // A reverse-charge sales line carries NO tax on the invoice — the notional VAT nets to zero,
+      // which is why Woo reports none on it either. Modelling it at the mapped rate would invent a
+      // disagreement on every RC order.
+      rateValue: lineTaxResolved[idx]?.reverseCharge ? 0 : (lineTaxResolved[idx]?.taxRateValue ?? 0),
+      reportedTaxForeign: l.taxForeign,
+    })),
+    {
+      label: 'Shipping',
+      netForeign: shippingForeign,
+      rateValue: shippingTax.rateValue,
+      reportedTaxForeign: wcOrder.shipping_lines.reduce<Decimal>(
+        (sum, line) => addMoney(sum, toDecimal(line.total_tax ?? 0)),
+        toDecimal(0),
+      ),
+    },
+  ], currency)
+  // A rate that moved money and is unmapped or inactive (lib/domain/accounting/wc-rate-money-refusal.ts) stamps the document as surely as a tax
+  // mismatch does: same refusal at the poster, and no payment registered against a document that will not post.
+  const rateMoneyRefusal = describeWcRateMoneyRefusal(String(wcOrder.number), findWcRateMoneyProblems(wcOrder, wcResolvedById))
+  const taxMismatchReason = !shippingTax.resolved || !documentTaxReconciliation.reconciles
+    ? `The tax the accounting document would produce does not match the tax WooCommerce charged on order `
+      + `${wcOrder.number}, so the invoice would not total the order's ${wcOrder.total}. `
+      + (shippingTax.resolved ? '' : `${shippingTax.reason} `)
+      + documentTaxReconciliation.disagreements
+        // Figures at the ORDER currency's own precision (o3d-cyn r4): `toFixed(2)` printed a
+        // whole-yen tax as "101.00" and a three-decimal one as "5.00", hiding the fils the
+        // disagreement is actually in.
+        .map((d) => `${d.label}: document ${d.modelledTax.toFixed(orderMoneyDigits)} vs WooCommerce ${d.reportedTax.toFixed(orderMoneyDigits)}`)
+        .join('; ')
+    : null
+  const unreconciledReason = [taxMismatchReason, rateMoneyRefusal].filter((r): r is string => r !== null).join(' ') || null
+  const documentTotalsToTheOrder = shippingTax.resolved && documentTaxReconciliation.reconciles && rateMoneyRefusal === null
+  return { shippingTax, documentTaxReconciliation, rateMoneyRefusal, documentTotalsToTheOrder, taxMismatchReason, unreconciledReason }
+}
+
+
+/**
+ * THE ACCOUNTING-RELEVANT CORE OF THE INVOICE THE IMPORTER BUILDS FOR A WOOCOMMERCE ORDER, as a pure function of the order, its resolved tax types and the settings: lines (description, quantity, unit amount, tax type, account, discount, kind),
+ * shipping and the order-level discount (amount, account, type), the amount basis, the payment legs and the not-reconciled stamp. The import wraps it with identity and timing (contact, dates, reference, receipt ids), and a held invoice is compared
+ * with a FRESH call of it on the current order before it is released, so what is compared is what would be sent, not a list of facts someone remembered to check.
+ */
+function buildWcInvoiceCore(p: {
+  wcOrder: WcFullOrder
+  mappedLines: Awaited<ReturnType<typeof mapWcLineItems>>
+  lineRateIds: ReadonlyArray<string | null | undefined>
+  ratesNow: Awaited<ReturnType<typeof currentTaxRates>>
+  invoiceTaxTypes: WcInvoiceTaxTypes
+  shippingRateId: string | null | undefined
+  orderDefaultTaxRateId: string | null | undefined
+  settings: { salesAccount: string; shippingAccount?: string | null; discountAccount?: string | null }
+  amounts: { lineAmountsIncludeTax: boolean; shippingAmount: number | undefined; orderLevelDiscountAmount: number | undefined }
+  documentTotalsToTheOrder: boolean
+  hasStoreCredit: boolean
+  unreconciledReason: string | null
+}): Record<string, unknown> {
+  const { wcOrder, mappedLines, ratesNow, invoiceTaxTypes, settings, documentTotalsToTheOrder, hasStoreCredit, unreconciledReason } = p
+  const { lineAmountsIncludeTax, shippingAmount, orderLevelDiscountAmount } = p.amounts
+  const lineRateNow = (idx: number) => (p.lineRateIds[idx] ? ratesNow.get(p.lineRateIds[idx]!) : undefined)
+  const shippingRateNow = p.shippingRateId ? ratesNow.get(p.shippingRateId) : undefined
+  const defaultRateNow = p.orderDefaultTaxRateId ? ratesNow.get(p.orderDefaultTaxRateId) : undefined
+  const shippingTypeNow = invoiceTaxTypes.shipping.type ?? undefined
+  return {
+    lines: mappedLines.map((l, idx) => {
+      const rateNow = lineRateNow(idx)
+      const lineTaxType = invoiceTaxTypes.lines[idx]!.type ?? undefined
+      return {
+      itemCode: l.productId ? (l.sku || undefined) : undefined,
+      description: l.description ?? l.sku ?? 'Item',
+      quantity: l.qty,
+      unitAmount: l.unitPriceForeign,
+      accountCode: settings.salesAccount,
+      // audit-H1b: swap reverse-charge LINE items to the RC tax code, same
+      // as the native invoice push (resolveSalesLineTaxType), so a WC
+      // reverse-charge order's goods lines post on the RC VAT boxes — not
+      // the standard code. Every resolution path (resolver-derived, mapped
+      // WC rate, forceNoTax) now carries a real reverseCharge flag.
+      taxType: lineTaxType,
+      // The rate that code was read from (never sent), with the basis the code was derived on (a sales goods line, lib/accounting/reverse-charge.ts): the guard recomputes the type from the rate as
+      // it is now. A forced no-tax fee line has no rate-derived code and is not bound.
+      ...(mappedLines[idx]?.isFeeLine === true && mappedLines[idx]?.forceNoTax ? {} : rateBinding(rateNow?.id, 'sales_line')),
+      // The ONE line kind this importer may post on NONE: it says why, so the connector accepts it (lib/domain/accounting/sales-document-tax-types.ts).
+      // Any other line that resolves to NONE - a mapped rate whose own code is NONE, such as WooCommerce rate 182 - is refused.
+      ...(mappedLines[idx]?.isFeeLine === true && mappedLines[idx]?.forceNoTax ? { noTaxKind: 'fee-no-tax' as const } : {}),
+      discountAmount: l.discountAmount > 0 ? roundDecimalNumber(l.discountAmount, 4) : undefined,
+      }
+    }),
+    shippingAmount,
+    shippingDescription: 'Shipping',
+    shippingAccountCode: settings.shippingAccount || undefined,
+    // audit-H1b: shipping & discount stay off the REVERSE-CHARGE swap (NOT swapped), matching
+    // the native invoice push + credit-note builder (the H1 rule — only goods lines carry the
+    // reverse charge).
+    //
+    // o3d-cyn r2: but the RATE is shipping's own, not the goods'. `resolveWcShippingTaxRate`
+    // picks the tax type that reproduces the tax Woo actually charged on shipping, falling back
+    // to the order default when that is the one that does — so a single-rate order is unchanged
+    // and a zero-rated-postage order stops being taxed at the goods' rate.
+    shippingTaxType: shippingTypeNow,
+    // Bound (plain: shipping is never reverse-charge swapped) only to the rate whose own code is the one sent.
+    ...(((shippingRateNow ?? defaultRateNow)?.accountingTaxType ?? undefined) === shippingTypeNow ? rateBinding((shippingRateNow ?? defaultRateNow)?.id, 'plain', 'shipping') : {}),
+    // Only the residual — the coupon itself is already on the lines above as a per-line
+    // discountAmount, which the connector sends as a Xero DiscountRate / QuickBooks
+    // discount line. Sending both deducted it twice (o3d-y14).
+    discountAmount: orderLevelDiscountAmount,
+    discountAccountCode: settings.discountAccount || undefined,
+    discountTaxType: invoiceTaxTypes.discount.type ?? undefined,
+    ...rateBinding(defaultRateNow?.id, 'plain', 'discount'),
+    lineAmountsIncludeTax,
+    // NOT `!!wcOrder.date_paid_gmt` alone (o3d-cyn r2): registering the net fallback against a
+    // document that will not total to the order is the same wrong settlement one figure down.
+    // Carried onto the HELD payload too (development's invoice-number branch below): a document
+    // that does not total to the order must not register a payment whether it is queued now or
+    // released later.
+    //
+    // A store-credit order's document is at the FULL goods value, so it does not total to
+    // `wcOrder.total` either: no payment is registered for it (the invoice is refused anyway; see
+    // lib/domain/accounting/store-credit-invoice-refusal.ts).
+    _registerPayment: !!wcOrder.date_paid_gmt && documentTotalsToTheOrder && !hasStoreCredit,
+    _paymentAmount: resolveWcInvoicePaymentAmount(wcOrder, { totalsToTheOrder: documentTotalsToTheOrder && !hasStoreCredit }),
+    // o3d-cyn r3: the stamp that stops this document at the poster. Present ONLY when the
+    // document will not total to the order — an ordinary order's payload is byte-for-byte what
+    // it was. The row is still queued deliberately: a refusal that leaves a FAILED sync row
+    // naming the reason is something an operator can find, where queueing nothing leaves an
+    // order that simply never reaches the ledger and no record of why.
+    //
+    // It sits INSIDE `accountingPayload`, so it reaches the HELD path below as well as the
+    // queued one (development's invoice-number branch): a document that will not total to the
+    // order must carry its reason whether it is queued now or released later.
+    ...(unreconciledReason
+      ? { [UNRECONCILED_TAX_PAYLOAD_KEY]: buildUnreconciledTaxMarker(unreconciledReason) }
+      : {}),
+  }
+}
+
+/**
+ * An untreated hold's document total, computed from the payload alone (`invoiceReconciliationProblem`, lib/domain/sales/sales-invoice-reconciliation.ts), against the order's total now;
+ * and the payment the payload would register against the same total. A fee on the no-tax kind and a reverse-charge line are priced at 0, every other line, the shipping and the discount at the
+ * rate of the order's own resolution now (their tax types were already compared with what is parked). Null when the payload still totals to the order.
+ */
+async function heldUntreatedTotalDifference(payload: Record<string, unknown>, wcOrder: WcFullOrder, mappedLines: Awaited<ReturnType<typeof mapWcLineItems>>, currency: string): Promise<string | null> {
+  const lines = payload.lines
+  if (!Array.isArray(lines) || lines.length !== mappedLines.length) return 'the parked invoice\u2019s lines can no longer be matched to the order'
+  const orderTotal = Number(wcOrder.total)
+  if (!Number.isFinite(orderTotal)) return 'the order total is missing or unreadable'
+  const resolution = await resolveWcOrderTaxResolution(wcOrder, mappedLines)
+  const shippingTax = resolveWcShippingTaxRate({
+    shippingLines: wcOrder.shipping_lines, shippingNetForeign: mapWcShipping(wcOrder).shippingForeign, rateById: resolution.wcResolvedById,
+    orderDefault: { accountingTaxType: resolution.accountingTaxType, taxRateValue: resolution.taxRateValue, taxRateId: resolution.orderDefaultTaxRateId }, currency,
+  })
+  const num = (v: unknown): number => (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && Number.isFinite(Number(v)) ? Number(v) : Number.NaN
+  const reconcilable = lines.map((raw, idx) => {
+    const l = raw as Record<string, unknown>
+    const rate = l.noTaxKind === 'fee-no-tax' || resolution.lineTaxResolved[idx]?.reverseCharge ? 0 : Number(resolution.lineTaxResolved[idx]?.taxRateValue ?? 0)
+    return { quantity: num(l.quantity), unitAmount: num(l.unitAmount), discountAmount: l.discountAmount === undefined || l.discountAmount === null ? 0 : num(l.discountAmount), rate, storedTax: 0 }
+  })
+  const shippingAmount = payload.shippingAmount === undefined || payload.shippingAmount === null ? 0 : num(payload.shippingAmount)
+  const discountAmount = payload.discountAmount === undefined || payload.discountAmount === null ? 0 : num(payload.discountAmount)
+  if ([...reconcilable.flatMap((l) => [l.quantity, l.unitAmount, l.discountAmount]), shippingAmount, discountAmount].some((n) => Number.isNaN(n))) return 'the parked invoice carries a figure that cannot be read'
+  const problem = invoiceReconciliationProblem({
+    lineAmountsIncludeTax: payload.lineAmountsIncludeTax === true, headerRate: Number(resolution.taxRateValue ?? 0), lines: reconcilable,
+    shippingRate: shippingTax.resolved ? Number(shippingTax.rateValue) : null, discountRate: Number(resolution.taxRateValue ?? 0), shippingAmount, discountAmount,
+  }, orderTotal)
+  if (problem !== null) return `the parked invoice totals ${problem.expected.toFixed(2)} and the order total is ${orderTotal.toFixed(2)} now`
+  if (payload._paymentAmount !== undefined && payload._paymentAmount !== null) {
+    const paid = num(payload._paymentAmount)
+    if (Number.isNaN(paid) || Math.abs(paid - orderTotal) > 0.005 + 1e-9) return `the payment the parked invoice would register (${String(payload._paymentAmount)}) is not the order total (${orderTotal.toFixed(2)}) now`
+  }
+  return null
+}
+
+async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder): Promise<{ outcome: 'not-needed' | 'treated' | 'refused'; recheck?: HeldRecheck }> {
+  const row = await db.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
+  if (!row || !isHeldSalesInvoicePayload(row.payload)) return { outcome: 'not-needed' }
+  const held: HeldSalesInvoicePayload = row.payload
+  type Marker = { applied?: unknown; reason?: unknown; route?: unknown; regime?: unknown; vatAccount?: unknown; schemePostingTaxType?: unknown; orderTotal?: unknown; taxBinding?: unknown }
+  const markerOf = (payload: Record<string, unknown>) => payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as Marker | null | undefined
+  const marker = markerOf(held.accountingPayload)
+  if (marker?.reason === 'store_credit') return { outcome: 'not-needed' }
+  const chart = heldSalesInvoiceChartConnector(held)
+  if (!chart) return { outcome: 'not-needed' }
+  const { isAccountingSyncTypeEnabledFor, getAccountingSettings } = await import('@/lib/accounting')
+  if (!(await isAccountingSyncTypeEnabledFor(chart, 'SALES_INVOICE'))) return { outcome: 'not-needed' }
+  const refuse = async (reason: string): Promise<{ outcome: 'refused' }> => {
+    await noteHeldReleaseFailure(row.id, `This held invoice was not released: ${reason}. NOTHING was queued.`)
+    return { outcome: 'refused' }
+  }
+  const refuseChanged = async (what: string): Promise<{ outcome: 'refused' }> => {
+    await markHeldInvoiceOrderChanged(orderId, row.id, what)
+    return { outcome: 'refused' }
+  }
+  if (marker?.reason === 'order_changed') return await refuseChanged('it was already found to have changed')
+
+  const currency = readWcOrderCurrency(wcOrder)
+  if (currency === null) return await refuseChanged('the order\u2019s currency is missing or unreadable')
+  const mappedLines = [...(await mapWcLineItems(wcOrder.line_items, 1)), ...mapWcFeeLines(wcOrder.fee_lines)]
+  const lineDiscountTotal = mappedLines.reduce((sum, line) => addMoney(sum, toDecimal(line.discountAmount)), toDecimal(0))
+  const coupons = planWcOrderCoupons({
+    couponLines: wcOrder.coupon_lines, orderMeta: wcOrder.meta_data, feeLines: wcOrder.fee_lines, lineDiscountTotalForeign: lineDiscountTotal, currency,
+    resolveResidual: ({ couponTotalForeign, lineDiscountTotalForeign: lineTotal, currency: cur }) => resolveWcOrderLevelDiscount({ couponTotalForeign, lineDiscountTotalForeign: lineTotal, currency: cur }),
+  })
+  // Store credit on the order NOW (a hold parked as a store-credit hold, marker `store_credit`, is already withheld by the release): any other hold, treated or not, is an order that changed after it was parked, and 'not-needed' would let the caller release it unchecked.
+  if (coupons.storeCreditForeign.gt(0)) return await refuseChanged('the order now carries store credit, which its parked invoice does not account for')
+  if (coupons.refusal) return await refuseChanged('its coupons can no longer be classified')
+  const amounts = resolveWcAccountingAmountConvention({ pricesIncludeVat: wcOrder.prices_include_tax, shippingForeign: mapWcShipping(wcOrder).shippingForeign, orderLevelDiscountForeign: coupons.orderLevelDiscount })
+  const expected: ExpectedHeldInvoice = {
+    lines: mappedLines.map((l) => ({
+      description: l.description, quantity: l.qty, unitAmount: l.unitPriceForeign, discountAmount: l.discountAmount > 0 ? roundDecimalNumber(l.discountAmount, 4) : 0,
+      untaxedFee: l.isFeeLine === true && l.forceNoTax === true, markedFee: l.isFeeLine === true && l.wclcFeeKind != null,
+    })),
+    shippingAmount: amounts.shippingAmount, discountAmount: amounts.discountAmount, orderTotal: String(wcOrder.total ?? ''), currency,
+  }
+  const settings = await getAccountingSettings()
+  const accounts = { ioss: settings.euVatIossAccount, ddp: settings.euVatDdpAccount, fee: settings.euFeeAccount, rounding: settings.roundingDifferenceAccount }
+  // Every input that decides the posted tax types, resolved now (wc-tax-binding.ts lists them), compared with what the hold recorded before anything is released.
+  // The order's tax resolution NOW, by the very functions the invoice build uses (resolveWcOrderTaxResolution, resolveWcInvoiceTaxTypes): per line and for the shipping, the resolved rate, its source and the effective posted type, plus the inputs.
+  const computeBinding = async () => {
+    const invoiceTypes = await resolveWcInvoiceTaxTypes({
+      wcOrder, mappedLines, resolution: await resolveWcOrderTaxResolution(wcOrder, mappedLines), reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, shippingForeign: mapWcShipping(wcOrder).shippingForeign, currency,
+    })
+    return { invoiceTypes, binding: await currentWcTaxBinding(wcOrder, mappedLines, { reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, invoiceTypes }) }
+  }
+  const { invoiceTypes: currentInvoiceTypes } = await computeBinding()
+
+  // A FRESH BUILD of the document from the order as it is now, by the importer's own pieces (the shared tax resolution, `reconcileWcDocumentWithOrder`, `buildWcInvoiceCore`) and, for a treated hold, the treatment's read-only preview (the order's existing stamp
+  // is used only if it still agrees with the fresh decision). Nothing is written. A refusal of any of them is the hold's reason; otherwise the parked payload is compared with it on every accounting-relevant field, and that comparison is the authority.
+  const buildFresh = async (client: Prisma.TransactionClient, withTreatment: boolean): Promise<{ ok: true; payload: Record<string, unknown>; policy?: RegimePolicy } | { ok: false; reason: string }> => {
+    const resolution = await resolveWcOrderTaxResolution(wcOrder, mappedLines)
+    const shippingForeign = mapWcShipping(wcOrder).shippingForeign
+    const rec = reconcileWcDocumentWithOrder(wcOrder, mappedLines, resolution, shippingForeign, currency)
+    const types = await resolveWcInvoiceTaxTypes({ wcOrder, mappedLines, resolution, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, shippingForeign, currency })
+    const ratesNow = await currentTaxRates(db, [...resolution.lineTaxResolved.map((r) => r.taxRateId), rec.shippingTax.taxRateId, resolution.orderDefaultTaxRateId])
+    // What Xero also reads, derived as the importer derives it: the invoice date and the payment method and date from the order; the exchange-rate stamp from the order's STORED rate, and the receipt's identity and settlement rate from the receipt
+    // row the import wrote (never from today's FX tables: a hold waiting for its number must not be refused because a rate moved).
+    const stored = await client.salesOrder.findUnique({ where: { id: orderId }, select: { fxRateToBase: true } })
+    const receipt = wcOrder.date_paid_gmt
+      ? await client.payment.findFirst({ where: { orderId, refundId: null, notes: WC_RECEIPT_NOTE_IMPORTED_PAID }, orderBy: { createdAt: 'asc' }, select: { id: true, settlementRateToBase: true } })
+      : null
+    const core = {
+      currency,
+      date: parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created).toISOString().slice(0, 10),
+      currencyRateToBase: usableStoredFxRate(stored?.fxRateToBase)?.toNumber(),
+      _postingMode: 'submitted',
+      _paymentMethod: wcOrder.payment_method || undefined,
+      _paymentDate: wcOrder.date_paid_gmt || undefined,
+      ...(receipt?.settlementRateToBase != null ? { _paymentSettlementRateToBase: Math.round(Number(receipt.settlementRateToBase) * 1e8) / 1e8 } : {}),
+      ...(receipt ? { _paymentId: receipt.id } : {}),
+      ...buildWcInvoiceCore({
+      wcOrder, mappedLines, lineRateIds: resolution.lineTaxResolved.map((r) => r.taxRateId), ratesNow, invoiceTaxTypes: types, shippingRateId: rec.shippingTax.taxRateId, orderDefaultTaxRateId: resolution.orderDefaultTaxRateId, settings,
+      amounts: { lineAmountsIncludeTax: amounts.lineAmountsIncludeTax, shippingAmount: amounts.shippingAmount, orderLevelDiscountAmount: amounts.discountAmount }, documentTotalsToTheOrder: rec.documentTotalsToTheOrder, hasStoreCredit: false, unreconciledReason: rec.unreconciledReason,
+    }),
+    }
+    if (!withTreatment) return { ok: true, payload: core }
+    if (rec.unreconciledReason !== null) return { ok: false, reason: `the document does not total the order: ${rec.unreconciledReason}` }
+    const outcome = await previewTreatedSalesInvoice(client, {
+      orderId, wcOrder, payload: core, mappedLines, connector: chart, taxBindingDeps: { reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, invoiceTypes: types }, accounts, storeCreditForeign: coupons.storeCreditForeign, now: new Date(),
+    })
+    if (outcome.kind === 'refused') return { ok: false, reason: `the EU IOSS/VOEC/DDP treatment refuses it now: ${outcome.reason}` }
+    return { ok: true, payload: outcome.kind === 'treated' ? outcome.payload : core, ...(outcome.kind === 'treated' ? { policy: outcome.regimePolicy } : {}) }
+  }
+
+  // The whole check of a TREATED hold, reading through `client` (the caller's order-locked transaction): the parked payload against the order, and the regime re-resolved from the current facts against what was parked and the order's stamp.
+  const verifiedPolicy: { value?: RegimePolicy } = {}
+  const verifyTreated = async (client: Prisma.TransactionClient, parked: HeldSalesInvoicePayload, parkedMarker: Marker): Promise<string | null> => {
+    // Zero-tax routes (scheme, B2B) sum to the order's total; an ordinary taxed invoice (route none) does not, so its total is compared as the order total recorded when it was parked.
+    const zeroTax = parkedMarker.route === 'scheme' || parkedMarker.route === 'b2b_zero_rate'
+    if (coupons.storeCreditForeign.gt(0)) return 'the order now carries store credit, which its parked invoice does not account for'
+    const difference = heldInvoiceDifference(parked.accountingPayload, expected, true, zeroTax)
+    if (difference !== null) return difference
+    // Re-resolved on every call (the release's own re-check included), so a mapping changed in between is seen.
+    const taxDifference = heldTaxBindingDifference(parkedMarker.taxBinding, (await computeBinding()).binding)
+    if (taxDifference !== null) return taxDifference
+    if (!zeroTax) {
+      const parkedTotal = typeof parkedMarker.orderTotal === 'string' ? parkedMarker.orderTotal.trim() : ''
+      if (!/^-?\d+(\.\d+)?$/.test(parkedTotal) || !toDecimal(parkedTotal).eq(toDecimal(expected.orderTotal))) return `the order total was ${parkedTotal || '(not recorded)'} when the invoice was held and is ${expected.orderTotal} now`
+    }
+    const mode = await readEuVatRegimeMode()
+    if (mode === null) return 'the EU VAT regime mode setting is unreadable'
+    const input = await buildEuVatRegimeInputFromSettings(client, wcOrder, { ioss: accounts.ioss, ddp: accounts.ddp }, { mode })
+    const stamp = await readEuVatRegimeStamp(client, orderId)
+    if (stamp === null) return 'the order carries no EU VAT regime stamp'
+    const routed = routeFor(stamp, resolveEuVatRegime(input), input)
+    if (!routed.ok) return routed.reason
+    if (routed.route.kind !== parkedMarker.route) return `the order is now on the ${routed.route.kind} route, the hold was treated on ${String(parkedMarker.route)}`
+    if (routed.route.kind === 'scheme') {
+      const vatLines = (parked.accountingPayload.lines as Array<Record<string, unknown>>).filter((l) => l.noTaxKind === 'eu-vat-recovery')
+      if (routed.route.regime !== parkedMarker.regime) return `the order now decides ${routed.route.regime}, the hold was treated as ${String(parkedMarker.regime)}`
+      if (routed.route.vatAccount !== parkedMarker.vatAccount) return `the order's VAT account is now ${routed.route.vatAccount}, the hold was treated on ${String(parkedMarker.vatAccount)}`
+      if (routed.route.schemePostingTaxType !== parkedMarker.schemePostingTaxType) return 'the order\u2019s zero-rated posting type changed'
+      if (vatLines.length !== 1 || !roundMoney(Number(vatLines[0]!.unitAmount), currency).eq(roundMoney(routed.route.vatAmount, currency))) return 'the VAT charged on the order changed'
+    }
+    // THE AUTHORITY: the parked payload against a fresh build of the same document from the order as it is now, treatment included (see buildFresh). The checks above are diagnostics for the common causes.
+    const fresh = await buildFresh(client, true)
+    if (!fresh.ok) return fresh.reason
+    const freshDifference = heldFreshBuildDifference(parked.accountingPayload, fresh.payload)
+    // The policy the verified decision was just made under (the fresh build's one settings read): the release records it, so the payload carries the settings in force and the poster's check passes.
+    if (freshDifference === null) verifiedPolicy.value = fresh.policy
+    return freshDifference
+  }
+  // The release runs this AGAIN inside its own order-locked transaction, immediately before it enqueues: re-reading the hold and the order's facts there closes the gap between this check and the release.
+  const recheck: HeldRecheck = async (tx) => {
+    const current = await tx.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
+    if (!current || current.id !== row.id || !isHeldSalesInvoicePayload(current.payload)) return { ok: false, reason: 'the held invoice changed while it was being released' }
+    const currentHeld: HeldSalesInvoicePayload = current.payload
+    const currentMarker = markerOf(currentHeld.accountingPayload)
+    if (currentMarker?.applied !== true) return { ok: false, reason: 'the held invoice is no longer marked as treated' }
+    verifiedPolicy.value = undefined
+    const why = await verifyTreated(tx, currentHeld, currentMarker)
+    if (why !== null) return { ok: false, reason: why }
+    const policy = verifiedPolicy.value
+    return { ok: true, held: policy === undefined ? currentHeld : { ...currentHeld, accountingPayload: { ...currentHeld.accountingPayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { ...currentMarker, regimePolicy: policy } } } }
+  }
+
+  if (marker?.applied === true && UNRECONCILED_TAX_PAYLOAD_KEY in held.accountingPayload) {
+    const now = reconcileWcDocumentWithOrder(wcOrder, mappedLines, await resolveWcOrderTaxResolution(wcOrder, mappedLines), mapWcShipping(wcOrder).shippingForeign, currency)
+    return now.unreconciledReason !== null ? await refuse(`the document still does not total the order: ${now.unreconciledReason}`) : await refuseChanged('it was held and treated while its tax did not reconcile, and now does')
+  }
+  if (marker?.applied === true) {
+    const verdict = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
+      return await verifyTreated(tx, held, marker)
+    })
+    return verdict === null ? { outcome: 'not-needed', recheck } : await refuseChanged(verdict)
+  }
+
+  // A hold stamped `_taxUnreconciled` was built for a document the importer found would not total the order, and the poster refuses it. It stays PENDING with the reason unless the importer's OWN reconciliation (reconcileWcDocumentWithOrder) now passes on the current order;
+  // then the stamp is removed and the payment legs are rebuilt as the importer builds them for a document that totals the order, and the checks and the treatment below run on that payload. A marker is never carried into a release.
+  let parkedPayload: Record<string, unknown> = held.accountingPayload
+  if (UNRECONCILED_TAX_PAYLOAD_KEY in held.accountingPayload) {
+    const now = reconcileWcDocumentWithOrder(wcOrder, mappedLines, await resolveWcOrderTaxResolution(wcOrder, mappedLines), mapWcShipping(wcOrder).shippingForeign, currency)
+    if (now.unreconciledReason !== null) return await refuse(`the document still does not total the order: ${now.unreconciledReason}`)
+    // A hold treated while it carried the stamp cannot be un-treated: it needs its invoice rebuilt.
+    if (marker?.applied === true) return await refuseChanged('it was held and treated while its tax did not reconcile, and now does')
+    const { [UNRECONCILED_TAX_PAYLOAD_KEY]: _stamp, ...clean } = held.accountingPayload
+    void _stamp
+    parkedPayload = { ...clean, _registerPayment: !!wcOrder.date_paid_gmt, _paymentAmount: resolveWcInvoicePaymentAmount(wcOrder, { totalsToTheOrder: true }) }
+  }
+  // An UNTREATED hold: the parked lines must be the order's lines before the treatment is put on them.
+  const difference = heldInvoiceDifference(parkedPayload, expected, false)
+  if (difference !== null) return await refuseChanged(difference)
+  // Each parked line's tax type must be the effective type the order's line resolves to now, with every input (the reverse-charge setting included); a rate that cannot be resolved never matches.
+  const taxDifference = heldUntreatedTaxDifference(parkedPayload, currentInvoiceTypes)
+  if (taxDifference !== null) return await refuseChanged(taxDifference)
+  // The parked payload must still PRODUCE the order's total: its document total, computed from its own lines, tax codes, shipping and discount by the invoice-to-order reconciliation (the allowance the importer uses), is compared with the order's total now, and the payment it would register with the same total.
+  // Net lines and tax types can stand while WooCommerce changes only the tax charged and the total; the treatment must never stamp a payload with a total it does not produce.
+  const totalDifference = await heldUntreatedTotalDifference(parkedPayload, wcOrder, mappedLines, currency)
+  if (totalDifference !== null) return await refuseChanged(totalDifference)
+  // The authority for an untreated hold: the parked payload against a fresh build of the document (before the treatment) from the order as it is now.
+  const freshUntreated = await buildFresh(db, false)
+  if (!freshUntreated.ok) return await refuse(freshUntreated.reason)
+  const freshDifference = heldFreshBuildDifference(parkedPayload, freshUntreated.payload)
+  if (freshDifference !== null) return await refuseChanged(freshDifference)
+  const { [EU_VAT_TREATMENT_PAYLOAD_KEY]: _marker, ...untreated } = parkedPayload
+  void _marker
+  const outcome = await treatImportedSalesInvoice({
+    orderId, wcOrder, payload: untreated, mappedLines, connector: chart, taxBindingDeps: { reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, invoiceTypes: currentInvoiceTypes }, accounts, storeCreditForeign: coupons.storeCreditForeign, now: new Date(),
+  })
+  if (outcome.kind === 'refused') return await refuse(`the EU IOSS/VOEC/DDP treatment refused it: ${outcome.reason}. Fix that, then re-import the order from WooCommerce to try again`)
+  if (outcome.kind === 'skipped') return await refuse(`the EU IOSS/VOEC/DDP treatment was skipped (${outcome.why}) on a hold that needs it`)
+  const treated = withRegimePolicy(outcome.payload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
+    ? outcome.payload
+    : { ...outcome.payload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? ''), taxBinding: recordWcTaxBinding(outcome.taxBinding) } }, outcome.regimePolicy)
+  const written = await db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, orderId)
+    const current = await tx.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
+    if (!current || current.id !== row.id || !isHeldSalesInvoicePayload(current.payload)) return 'not-needed' as const
+    const currentHeld: HeldSalesInvoicePayload = current.payload
+    // COMPARE-AND-SWAP: the hold is replaced only if it is still exactly the version that was verified above. A concurrent import that marked it order_changed (or treated it, or rewrote it) in between is never overwritten with a payload verified against this import's older snapshot.
+    const currentMarker = markerOf(currentHeld.accountingPayload)
+    if (currentMarker?.applied === true || currentMarker?.reason === 'order_changed') return 'not-needed' as const
+    if (JSON.stringify(current.payload) !== JSON.stringify(row.payload)) return 'not-needed' as const
+    await tx.shoppingSyncLog.update({ where: { id: row.id }, data: { payload: { ...currentHeld, accountingPayload: treated } as unknown as Prisma.InputJsonValue, errorMessage: null } })
+    return 'treated' as const
+  }, { maxWait: 5_000, timeout: 20_000 })
+  // Even when the hold changed under the lock, the release re-reads it and runs the recheck: 'not-needed' never means 'release unchecked'.
+  return written === 'treated' ? { outcome: 'treated', recheck } : { outcome: 'not-needed', recheck }
+}
+
 async function releaseHeldWcSalesInvoice(
   orderId: string,
   wcOrder: HeldReleaseOrderRef,
   invoiceNumber: string,
-  options?: { logFailure?: boolean },
+  options?: { logFailure?: boolean; recheck?: HeldRecheck },
 ): Promise<HeldSalesInvoiceReleaseOutcome> {
   const logFailure = options?.logFailure ?? true
   let row: { id: string; payload: Prisma.JsonValue | null } | null = null
@@ -1710,6 +2367,41 @@ async function releaseHeldWcSalesInvoice(
     }
     return 'not-queued'
   }
+  // NEVER RELEASE A DOCUMENT STAMPED `_taxUnreconciled`: the poster refuses it, so releasing it would mark the hold SYNCED over an invoice that never posts. It stays PENDING with the stamp's reason until a re-import re-evaluates it.
+  if (UNRECONCILED_TAX_PAYLOAD_KEY in held.accountingPayload) {
+    const stamp = held.accountingPayload[UNRECONCILED_TAX_PAYLOAD_KEY] as { reason?: unknown } | null | undefined
+    await noteHeldReleaseFailure(row.id, `WooCommerce numbered this invoice ${invoiceNumber}, but the document does not total the order (${String(stamp?.reason ?? 'no reason recorded')}). NOTHING was queued. Fix what is named, then re-import the order from WooCommerce: the re-import re-checks the document and releases it once it totals the order.`)
+    return 'not-queued'
+  }
+  // A HOLD WITH NO TREATMENT MARKER (parked before the treatment existed) OR PARKED WHILE THE SALES INVOICES SWITCH WAS OFF was built without the EU IOSS/VOEC/DDP treatment (the import skips it while the switch is off; every hold the treatment ran on carries applied:true). Released now that the switch is on, it would
+  // post a scheme sale on its charged rate. It stays PENDING with the reason; re-importing the order rebuilds the payload with the treatment and replaces the parked one. With the switch still off nothing
+  // changes: the release is not-configured as ever.
+  if ((held.accountingPayload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown } | null | undefined)?.applied !== true
+    && heldChartConnector !== null
+    && (await (await import('@/lib/accounting')).isAccountingSyncTypeEnabledFor(heldChartConnector, 'SALES_INVOICE'))) {
+    const refusedMarker = held.accountingPayload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { reason?: unknown; refusal?: unknown } | null | undefined
+    await noteHeldReleaseFailure(
+      row.id,
+      refusedMarker?.reason === 'treatment_refused'
+        // A refused hold keeps its refusal's reason (the sweep must not replace it with the generic note).
+        ? `This held invoice was not released: the EU IOSS/VOEC/DDP treatment refused it: ${String(refusedMarker.refusal ?? 'no reason recorded')}. NOTHING was queued. Fix that, then re-import the order from WooCommerce to try again.`
+        : `WooCommerce numbered this invoice ${invoiceNumber}, but this hold was parked before the EU IOSS/VOEC/DDP treatment ran on it (before it existed, or while the Sales Invoices switch was off), so it was built without the EU IOSS/VOEC/DDP treatment. `
+          + 'NOTHING was queued: re-import the order from WooCommerce: the re-import applies the treatment to this hold and releases it (a refusal, if any, is written here).',
+    )
+    return 'not-queued'
+  }
+  // THE SWEEP FAILS CLOSED ON A REGIME-POLICY CHANGE: it has no WooCommerce order to re-verify with, so a treated hold is released only under the regime settings (mode, gift-card cut-in, IOSS/DDP accounts) it was parked under. A re-import (which passes `recheck`) verifies against the order instead.
+  if (!options?.recheck && heldChartConnector !== null && (held.accountingPayload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown } | null | undefined)?.applied === true
+    && (await (await import('@/lib/accounting')).isAccountingSyncTypeEnabledFor(heldChartConnector, 'SALES_INVOICE'))) {
+    const change = await regimePolicyChange(held.accountingPayload)
+    if (change !== null) {
+      await noteHeldReleaseFailure(row.id, change.accountsChanged.length > 0
+        // regime_account_changed: the stamped regime still applies and the lines carry the old accounts, so a re-import alone is refused by the stamp.
+        ? `WooCommerce numbered this invoice ${invoiceNumber}, but the EU VAT account setting(s) changed since it was parked (${change.accountsChanged.join(', ')}), so the sweep did not release it. NOTHING was queued. The regime stamped on the order still applies and the held invoice carries the old accounts, so re-importing the order alone will not release it: restore the previous account setting(s) in Settings > Accounting, then re-import the order from WooCommerce.`
+        : `WooCommerce numbered this invoice ${invoiceNumber}, but ${change.problem}, so the sweep did not release it. NOTHING was queued. Re-import the order from WooCommerce: the re-import checks the held invoice against the order under the current settings and releases it if it still holds.`)
+      return 'not-queued'
+    }
+  }
   // o3d-j625 r3 (Codex HIGH 1 family): the outcome is CAPTURED, not because the row re-read below is
   // insufficient — it is the stronger check and it stays — but because the re-read cannot say WHY there
   // is no row, and the message written when there is none asserted the wrong reason ("the connector is
@@ -1732,12 +2424,33 @@ async function releaseHeldWcSalesInvoice(
     // inside it. The erasure takes the same lock, so there is no interleaving: it either committed first (and this sees it) or
     // runs after this commits (and scrubs the row this queued). Any failure rolls the whole thing back: the hold stays PENDING
     // and the sweep retries it. There is no after-the-fact scrub.
-    const { queueAccountingSyncTxWithOutcome } = await import('@/lib/accounting')
+    const { queueAccountingSyncTxWithOutcome, isAccountingSyncTypeEnabledFor } = await import('@/lib/accounting')
     enqueueOutcome.outcome = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
+      // EVERY RELEASE PATH (the re-import's and the sweep's) re-reads the hold HERE, under the order lock, and releases what it re-read, never what was read before the lock: a concurrent re-import can have marked the hold order_changed in between. It must be the
+      // same row, still PENDING (the queue predicate), carry its chart, and not be marked order_changed; with the Sales Invoices switch on it must still be marked applied:true (an untreated hold is never queued). With the switch off the enqueue is a no-op as ever.
+      const current = await tx.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
+      if (!current || current.id !== row.id || !isHeldSalesInvoicePayload(current.payload)) throw new HeldRecheckRefusal('the held invoice changed while it was being released', false)
+      let heldNow: HeldSalesInvoicePayload = current.payload
+      if (heldSalesInvoiceChartConnector(heldNow) !== heldChartConnector) throw new HeldRecheckRefusal('the held invoice\u2019s chart changed while it was being released', false)
+      const nowMarker = heldNow.accountingPayload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown; reason?: unknown } | null | undefined
+      if (nowMarker?.reason === 'order_changed') throw new HeldRecheckRefusal('the order changed after the invoice was held', false)
+      if (nowMarker?.applied !== true && heldChartConnector !== null && (await isAccountingSyncTypeEnabledFor(heldChartConnector, 'SALES_INVOICE'))) {
+        throw new HeldRecheckRefusal('the held invoice was parked without the EU IOSS/VOEC/DDP treatment', false)
+      }
+      if (!options?.recheck && nowMarker?.applied === true && heldChartConnector !== null && (await isAccountingSyncTypeEnabledFor(heldChartConnector, 'SALES_INVOICE'))) {
+        const change = await regimePolicyChange(heldNow.accountingPayload)
+        if (change !== null) throw new HeldRecheckRefusal(change.problem, false)
+      }
+      // A re-import's treated hold is verified AGAIN here against the order, on top of the above: the order's facts re-resolved under this same lock, and what is released is the hold as re-read.
+      if (options?.recheck) {
+        const rechecked = await options.recheck(tx)
+        if (!rechecked.ok) throw new HeldRecheckRefusal(rechecked.reason, true)
+        heldNow = rechecked.held
+      }
       const subject = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, customer: { select: { gdprAnonymisedAt: true } } } })
       const erased = Boolean(subject?.erasedAt || subject?.customer?.gdprAnonymisedAt)
-      const releasable = erased ? { ...held, accountingPayload: scrubContactInAccountingPayload(held.accountingPayload) } : held
+      const releasable = erased ? { ...heldNow, accountingPayload: scrubContactInAccountingPayload(heldNow.accountingPayload) } : heldNow
       return queueAccountingSyncTxWithOutcome(tx, {
         type: 'SALES_INVOICE',
         referenceType: 'SalesOrder',
@@ -1752,6 +2465,11 @@ async function releaseHeldWcSalesInvoice(
       })
     }, { maxWait: 5_000, timeout: 20_000 })
   } catch (error) {
+    if (error instanceof HeldRecheckRefusal) {
+      // The order or the hold changed between the check and the release: nothing was queued (the transaction rolled back). An order that changed is marked on the hold so nothing releases it; a hold already marked, gone or replaced is left as it is.
+      if (error.mark) await markHeldInvoiceOrderChanged(orderId, row.id, error.reason).catch((markError) => { console.error(`[wc-import] could not mark the held sales invoice ${row.id} as changed:`, markError) })
+      return 'not-queued'
+    }
     // Left PENDING on purpose — the release sweep retries it (see retryHeldWcSalesInvoiceReleases).
     await noteHeldReleaseFailure(
       row.id,
@@ -2493,121 +3211,8 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     //    server-side including shipping-country logic).
     // 2. Otherwise, fall back to the IMS resolver on (productCategory,
     //    shippingCountry, SALES).
-    const distinctWcRateIds = Array.from(new Set([
-      ...mappedLines.map((l) => l.externalTaxRateId).filter((x): x is number => typeof x === 'number'),
-      ...wcOrder.tax_lines.map((line) => line.rate_id).filter((x): x is number => typeof x === 'number'),
-      // o3d-cyn r2: the SHIPPING line's own rate ids. They normally also appear in `tax_lines`, but
-      // the shipping tax type is now resolved from them directly, and a rate this map does not hold
-      // cannot be resolved at all.
-      ...wcOrder.shipping_lines.flatMap((line) => (line.taxes ?? []).map((tax) => tax.id))
-        .filter((x): x is number => typeof x === 'number'),
-    ]))
-    const wcResolvedById = new Map<
-      number,
-      { taxRateId: string | null; taxRateName: string | null; taxRateValue: number; accountingTaxType: string | null; reverseCharge: boolean; active?: boolean; source?: 'mapped' | 'default' }
-    >()
-    for (const id of distinctWcRateIds) {
-      wcResolvedById.set(id, await resolveWcTaxRateById(id))
-    }
-
-    const orderLevelRates = wcOrder.tax_lines
-      .map((line) => wcResolvedById.get(line.rate_id))
-      .filter((rate): rate is NonNullable<typeof rate> => rate != null)
-    const resolvedOrderDefault =
-      orderLevelRates.find((rate) => /standard/i.test(rate.taxRateName ?? ''))
-      ?? [...orderLevelRates].sort((a, b) => b.taxRateValue - a.taxRateValue)[0]
-      ?? [...wcResolvedById.values()].sort((a, b) => b.taxRateValue - a.taxRateValue)[0]
-      ?? await resolveWcTaxRateById(null)
-    const {
-      taxRateId: orderDefaultTaxRateId,
-      taxRateName,
-      taxRateValue,
-      accountingTaxType,
-    } = resolvedOrderDefault
-
-    // Load product categories for lines that need the resolver fallback.
-    const productIds = Array.from(
-      new Set(mappedLines.map((l) => l.productId).filter((x): x is string => typeof x === 'string')),
-    )
-    const productRows = productIds.length
-      ? await db.product.findMany({
-          where: { id: { in: productIds } },
-          select: { id: true, taxCategory: true },
-        })
-      : []
-    const productCategoryById = new Map<string, TaxCategory>(
-      productRows.map((p) => [p.id, p.taxCategory]),
-    )
-
-    const destCountry = wcOrder.shipping?.country
-      ? wcOrder.shipping.country.toLowerCase()
-      : wcOrder.billing?.country
-      ? wcOrder.billing.country.toLowerCase()
-      : null
-
-    const orderDefaultCtx = {
-      id: orderDefaultTaxRateId,
-      name: taxRateName,
-      rate: taxRateValue,
-      accountingTaxType,
-    }
-    const needsResolver = mappedLines
-      .map((l, idx) => ({
-        id: String(idx),
-        productCategory: (l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory),
-        hasMappedWc: l.externalTaxRateId != null && wcResolvedById.get(l.externalTaxRateId)?.source === 'mapped',
-      }))
-      .filter((l) => !l.hasMappedWc)
-    const resolverMap = await resolveLineTaxRateBatch(
-      needsResolver.map((l) => ({ id: l.id, productCategory: l.productCategory })),
-      { destinationCountry: destCountry, usedFor: 'SALES', orderDefault: orderDefaultCtx },
-    )
-    const expectedDestinationRates = await loadExpectedDestinationSalesTaxRates(
-      needsResolver.map((line) => line.productCategory),
-      destCountry,
-    )
-
-    const taxFallbackLines: WcTaxRateFallbackLine[] = []
-    const lineTaxResolved = mappedLines.map((l, idx) => {
-      if (l.forceNoTax) {
-        return {
-          taxRateId: null,
-          taxRateName: null,
-          taxRateValue: 0,
-          accountingTaxType: null,
-          // Tax-exempt lines are never reverse-charged — keeps the union uniform
-          // so the accounting-payload swap reads a real flag, not an absent one.
-          reverseCharge: false,
-        }
-      }
-      if (l.externalTaxRateId != null) {
-        const wc = wcResolvedById.get(l.externalTaxRateId)
-        if (wc?.source === 'mapped') return wc
-      }
-      const resolved = resolverMap.get(String(idx)) ?? {
-        taxRateId: orderDefaultTaxRateId,
-        taxRateName,
-        taxRateValue,
-        accountingTaxType,
-        isCompound: false,
-        reverseCharge: false,
-        reportingCategory: null,
-        components: [],
-        matched: 'fallback' as const,
-        warning: `No configured sales rate for ${destCountry ? destCountry.toUpperCase() : 'unknown country'} / ${l.taxCategoryFallback ?? 'STANDARD'}. Using order default.`,
-      }
-      if (resolved.matched === 'fallback') {
-        taxFallbackLines.push({
-          sku: l.sku,
-          productCategory: (l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory),
-          externalTaxRateId: l.externalTaxRateId ?? null,
-          taxRateValue: resolved.taxRateValue,
-          expectedTaxRateValue: expectedDestinationRates.get((l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory)) ?? null,
-          warning: resolved.warning,
-        })
-      }
-      return resolved
-    })
+    const taxResolution = await resolveWcOrderTaxResolution(wcOrder, mappedLines)
+    const { orderDefaultTaxRateId, taxRateName, taxRateValue, destCountry, taxFallbackLines, lineTaxResolved } = taxResolution
     if (shouldBlockWcTaxRateFallback(taxFallbackLines)) {
       const description = `Blocked WooCommerce order ${wcOrder.number} import because ${taxFallbackLines.length} line(s) would use the order default tax rate.`
       await logActivity({
@@ -2793,37 +3398,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     // one, and an absent field threw a bare TypeError out of `currencyMinorUnits` here rather than
     // refusing anywhere an operator could see it.
     const orderMoneyDigits = currencyMinorUnits(currency)
-    const shippingTax = resolveWcShippingTaxRate({
-      shippingLines: wcOrder.shipping_lines,
-      shippingNetForeign: shippingForeign,
-      rateById: wcResolvedById,
-      orderDefault: { accountingTaxType, taxRateValue, taxRateId: orderDefaultTaxRateId },
-      currency,
-    })
-    const documentTaxReconciliation = reconcileWcDocumentTax([
-      ...mappedLines.map((l, idx) => ({
-        label: l.sku || l.description || `line ${idx + 1}`,
-        netForeign: toDecimal(l.qty).mul(toDecimal(l.unitPriceForeign)).sub(toDecimal(l.discountAmount)),
-        // A reverse-charge sales line carries NO tax on the invoice — the notional VAT nets to zero,
-        // which is why Woo reports none on it either. Modelling it at the mapped rate would invent a
-        // disagreement on every RC order.
-        rateValue: lineTaxResolved[idx]?.reverseCharge ? 0 : (lineTaxResolved[idx]?.taxRateValue ?? 0),
-        reportedTaxForeign: l.taxForeign,
-      })),
-      {
-        label: 'Shipping',
-        netForeign: shippingForeign,
-        rateValue: shippingTax.rateValue,
-        reportedTaxForeign: wcOrder.shipping_lines.reduce<Decimal>(
-          (sum, line) => addMoney(sum, toDecimal(line.total_tax ?? 0)),
-          toDecimal(0),
-        ),
-      },
-    ], currency)
-    // A rate that moved money and is unmapped or inactive (lib/domain/accounting/wc-rate-money-refusal.ts) stamps the document as surely as a tax
-    // mismatch does: same refusal at the poster, and no payment registered against a document that will not post.
-    const rateMoneyRefusal = describeWcRateMoneyRefusal(String(wcOrder.number), findWcRateMoneyProblems(wcOrder, wcResolvedById))
-    const documentTotalsToTheOrder = shippingTax.resolved && documentTaxReconciliation.reconciles && rateMoneyRefusal === null
+    const { shippingTax, documentTaxReconciliation, rateMoneyRefusal, documentTotalsToTheOrder, unreconciledReason } = reconcileWcDocumentWithOrder(wcOrder, mappedLines, taxResolution, shippingForeign, currency)
 
     // GBP conversions
     const subtotalBase = divideRoundedNumber(subtotalForeign, fxRate, 4)
@@ -3281,18 +3856,6 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           },
         })
       }
-      const taxMismatchReason = !shippingTax.resolved || !documentTaxReconciliation.reconciles
-        ? `The tax the accounting document would produce does not match the tax WooCommerce charged on order `
-          + `${wcOrder.number}, so the invoice would not total the order's ${wcOrder.total}. `
-          + (shippingTax.resolved ? '' : `${shippingTax.reason} `)
-          + documentTaxReconciliation.disagreements
-            // Figures at the ORDER currency's own precision (o3d-cyn r4): `toFixed(2)` printed a
-            // whole-yen tax as "101.00" and a three-decimal one as "5.00", hiding the fils the
-            // disagreement is actually in.
-            .map((d) => `${d.label}: document ${d.modelledTax.toFixed(orderMoneyDigits)} vs WooCommerce ${d.reportedTax.toFixed(orderMoneyDigits)}`)
-            .join('; ')
-        : null
-      const unreconciledReason = [taxMismatchReason, rateMoneyRefusal].filter((r): r is string => r !== null).join(' ') || null
       if (unreconciledReason) {
         await logActivity({
           entityType: 'SALES_ORDER',
@@ -3329,10 +3892,16 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       // THE TAX CODES COME FROM THE ROWS THE LINES ARE PERSISTED WITH (lineData[].taxRateId, redirected above to a re-keyed replacement), read now - not from the resolution made before the write -
       // and each is bound to its rate for the enqueue guard (lib/tax/retired-tax-code-guard.ts).
       const ratesNow = await currentTaxRates(db, [...lineData.map((l) => l.taxRateId), shippingTax.taxRateId, orderDefaultTaxRateId])
-      const lineRateNow = (idx: number) => (lineData[idx]?.taxRateId ? ratesNow.get(lineData[idx]!.taxRateId!) : undefined)
-      const shippingRateNow = shippingTax.taxRateId ? ratesNow.get(shippingTax.taxRateId) : undefined
-      const defaultRateNow = orderDefaultTaxRateId ? ratesNow.get(orderDefaultTaxRateId) : undefined
-      const shippingTypeNow = shippingRateNow ? (shippingRateNow.accountingTaxType ?? undefined) : (shippingTax.taxType ?? accountingTaxType ?? undefined)
+      // Every line's and the shipping's posted tax type come from the ONE function the check before a held invoice's release also calls (resolveWcInvoiceTaxTypes), so what is compared there is what is sent here.
+      const invoiceTaxTypes = await resolveWcInvoiceTaxTypes({
+        wcOrder, mappedLines, resolution: taxResolution, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, shippingForeign, currency, lineRateIds: lineData.map((l) => l.taxRateId),
+      })
+      const invoiceCore = buildWcInvoiceCore({
+            wcOrder, mappedLines, lineRateIds: lineData.map((l) => l.taxRateId), ratesNow, invoiceTaxTypes, shippingRateId: shippingTax.taxRateId, orderDefaultTaxRateId, settings,
+            amounts: { lineAmountsIncludeTax, shippingAmount, orderLevelDiscountAmount }, documentTotalsToTheOrder, hasStoreCredit, unreconciledReason,
+      })
+      // The key order the importer has always built (the core's payment legs and stamp sit AFTER the posting mode, method and date, around the receipt's own keys).
+      const { _registerPayment, _paymentAmount, [UNRECONCILED_TAX_PAYLOAD_KEY]: unreconciledStamp, ...invoiceCoreBody } = invoiceCore
       const accountingPayload: Record<string, unknown> = {
           contactName: customerName,
           contactEmail: payloadAnonymised ? undefined : (wcOrder.billing.email || undefined),
@@ -3342,92 +3911,62 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           // imported WC orders — keeping WC, IMS, and Xero numerically aligned.
           currencyRateToBase: usableStoredFxRate(fxRate)?.toNumber(),
           reference: orderNumber,
-          lines: lineData.map((l, idx) => {
-            const rateNow = lineRateNow(idx)
-            const lineTaxType = resolveWcLineAccountingTaxType({
-              // FEE lines only: goods and shipping resolve exactly as before.
-              forceNoTax: mappedLines[idx]?.isFeeLine === true ? mappedLines[idx]?.forceNoTax : undefined,
-              baseTaxType: rateNow?.accountingTaxType ?? lineTaxResolved[idx]?.accountingTaxType ?? accountingTaxType,
-              reverseCharge: rateNow?.reverseCharge ?? lineTaxResolved[idx]?.reverseCharge,
-              reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
-            })
-            return {
-            itemCode: l.productId ? (l.sku || undefined) : undefined,
-            description: l.description ?? l.sku ?? 'Item',
-            quantity: l.qty,
-            unitAmount: l.unitPriceForeign,
-            accountCode: settings.salesAccount,
-            // audit-H1b: swap reverse-charge LINE items to the RC tax code, same
-            // as the native invoice push (resolveSalesLineTaxType), so a WC
-            // reverse-charge order's goods lines post on the RC VAT boxes — not
-            // the standard code. Every resolution path (resolver-derived, mapped
-            // WC rate, forceNoTax) now carries a real reverseCharge flag.
-            taxType: lineTaxType,
-            // The rate that code was read from (never sent), with the basis the code was derived on (a sales goods line, lib/accounting/reverse-charge.ts): the guard recomputes the type from the rate as
-            // it is now. A forced no-tax fee line has no rate-derived code and is not bound.
-            ...(mappedLines[idx]?.isFeeLine === true && mappedLines[idx]?.forceNoTax ? {} : rateBinding(rateNow?.id, 'sales_line')),
-            // The ONE line kind this importer may post on NONE: it says why, so the connector accepts it (lib/domain/accounting/sales-document-tax-types.ts).
-            // Any other line that resolves to NONE - a mapped rate whose own code is NONE, such as WooCommerce rate 182 - is refused.
-            ...(mappedLines[idx]?.isFeeLine === true && mappedLines[idx]?.forceNoTax ? { noTaxKind: 'fee-no-tax' as const } : {}),
-            discountAmount: l.discountAmount > 0 ? roundDecimalNumber(l.discountAmount, 4) : undefined,
-            }
-          }),
-          shippingAmount,
-          shippingDescription: 'Shipping',
-          shippingAccountCode: settings.shippingAccount || undefined,
-          // audit-H1b: shipping & discount stay off the REVERSE-CHARGE swap (NOT swapped), matching
-          // the native invoice push + credit-note builder (the H1 rule — only goods lines carry the
-          // reverse charge).
-          //
-          // o3d-cyn r2: but the RATE is shipping's own, not the goods'. `resolveWcShippingTaxRate`
-          // picks the tax type that reproduces the tax Woo actually charged on shipping, falling back
-          // to the order default when that is the one that does — so a single-rate order is unchanged
-          // and a zero-rated-postage order stops being taxed at the goods' rate.
-          shippingTaxType: shippingTypeNow,
-          // Bound (plain: shipping is never reverse-charge swapped) only to the rate whose own code is the one sent.
-          ...(((shippingRateNow ?? defaultRateNow)?.accountingTaxType ?? undefined) === shippingTypeNow ? rateBinding((shippingRateNow ?? defaultRateNow)?.id, 'plain', 'shipping') : {}),
-          // Only the residual — the coupon itself is already on the lines above as a per-line
-          // discountAmount, which the connector sends as a Xero DiscountRate / QuickBooks
-          // discount line. Sending both deducted it twice (o3d-y14).
-          discountAmount: orderLevelDiscountAmount,
-          discountAccountCode: settings.discountAccount || undefined,
-          discountTaxType: defaultRateNow ? (defaultRateNow.accountingTaxType ?? undefined) : (accountingTaxType ?? undefined),
-          ...rateBinding(defaultRateNow?.id, 'plain', 'discount'),
-          lineAmountsIncludeTax,
+          ...invoiceCoreBody,
           _postingMode: 'submitted',
           _paymentMethod: wcOrder.payment_method || undefined,
           _paymentDate: wcOrder.date_paid_gmt || undefined,
-          // NOT `!!wcOrder.date_paid_gmt` alone (o3d-cyn r2): registering the net fallback against a
-          // document that will not total to the order is the same wrong settlement one figure down.
-          // Carried onto the HELD payload too (development's invoice-number branch below): a document
-          // that does not total to the order must not register a payment whether it is queued now or
-          // released later.
-          //
-          // A store-credit order's document is at the FULL goods value, so it does not total to
-          // `wcOrder.total` either: no payment is registered for it (the invoice is refused anyway; see
-          // lib/domain/accounting/store-credit-invoice-refusal.ts).
-          _registerPayment: !!wcOrder.date_paid_gmt && documentTotalsToTheOrder && !hasStoreCredit,
+          _registerPayment,
           // o3d-q0x56.19: the rate of THIS payment (the payment date's, or the order's on the same day). Never inferred from currencyRateToBase.
           ...(importedReceiptSettlementRate !== null ? { _paymentSettlementRateToBase: Math.round(importedReceiptSettlementRate * 1e8) / 1e8 } : {}),
           // The local receipt this payment is (see the Payment row written with the order). Present only
           // where there is one; the poster carries it onto the INVOICE_PAYMENT as its identity.
           ...(importedReceiptRef.id ? { _paymentId: importedReceiptRef.id } : {}),
-          _paymentAmount: resolveWcInvoicePaymentAmount(wcOrder, { totalsToTheOrder: documentTotalsToTheOrder && !hasStoreCredit }),
-          // o3d-cyn r3: the stamp that stops this document at the poster. Present ONLY when the
-          // document will not total to the order — an ordinary order's payload is byte-for-byte what
-          // it was. The row is still queued deliberately: a refusal that leaves a FAILED sync row
-          // naming the reason is something an operator can find, where queueing nothing leaves an
-          // order that simply never reaches the ledger and no record of why.
-          //
-          // It sits INSIDE `accountingPayload`, so it reaches the HELD path below as well as the
-          // queued one (development's invoice-number branch): a document that will not total to the
-          // order must carry its reason whether it is queued now or released later.
-          ...(unreconciledReason
-            ? { [UNRECONCILED_TAX_PAYLOAD_KEY]: buildUnreconciledTaxMarker(unreconciledReason) }
-            : {}),
+          _paymentAmount,
+          ...(unreconciledStamp === undefined ? {} : { [UNRECONCILED_TAX_PAYLOAD_KEY]: unreconciledStamp }),
       }
 
-      if (invoiceNumberResolution.ok) {
+      // THE EU IOSS / VOEC / DDP TREATMENT (lib/domain/accounting/eu-vat-treatment.ts), applied to the finished payload BEFORE it is queued or parked for a missing invoice number, so a
+      // released hold carries the same lines a queued one does. While the Sales Invoices switch is OFF this is skipped before it reads or writes anything and the payload is exactly what it was.
+      // A refusal is never queued: the original payload is parked below as a held invoice (applied:false, reason treatment_refused) and the activity log records the refusal; a re-import after the cause is fixed retries the treatment and releases it.
+      const euVatOutcome = await treatImportedSalesInvoice({
+        orderId: so.id,
+        wcOrder,
+        payload: accountingPayload,
+        mappedLines,
+        connector: settings.connector,
+        taxBindingDeps: { reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, invoiceTypes: invoiceTaxTypes },
+        accounts: { ioss: settings.euVatIossAccount, ddp: settings.euVatDdpAccount, fee: settings.euFeeAccount, rounding: settings.roundingDifferenceAccount },
+        storeCreditForeign,
+        now: new Date(),
+      })
+      // What is queued, or parked, from here on: `accountingPayload` as built, or the treated copy of it (or the refused one).
+      let invoicePayload: Record<string, unknown> = accountingPayload
+      if (euVatOutcome.kind === 'treated') {
+        invoicePayload = euVatOutcome.payload
+      } else if (euVatOutcome.kind === 'refused') {
+        const euVatReason =
+          `The EU IOSS/VOEC/DDP treatment of WooCommerce order ${wcOrder.number} refused the invoice: ${euVatOutcome.reason}. `
+          + 'Nothing was sent and no payment was registered; fix what is named above and re-import the order.'
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: so.id,
+          action: 'wc_invoice_eu_vat_treatment_refused',
+          tag: 'accounting',
+          level: 'ERROR',
+          description: euVatReason,
+          metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), externalOrderNumber: wcOrder.number, orderTotal: wcOrder.total, documentPosted: false },
+        })
+        invoicePayload = {
+          ...accountingPayload,
+          _registerPayment: false,
+          _paymentAmount: resolveWcInvoicePaymentAmount(wcOrder, { totalsToTheOrder: false }),
+          [UNRECONCILED_TAX_PAYLOAD_KEY]: buildUnreconciledTaxMarker([unreconciledReason, euVatReason].filter((r): r is string => r !== null).join(' ')),
+        }
+      }
+
+      // A TREATMENT REFUSAL IS NEVER QUEUED, NUMBERED OR NOT: the poster always refuses the stamped payload, and a re-import of an existing order only reconciles HELD invoices, so a queued refused invoice would never be rebuilt.
+      // It is parked as a hold instead (applied:false, reason treatment_refused, the original payload), which the re-import repair path recovers once the cause is fixed: verify against the order, retry the treatment, release only on success.
+      if (invoiceNumberResolution.ok && euVatOutcome.kind !== 'refused') {
         // ONE ORDER-LOCKED TRANSACTION (as the held release): the erasure marker is read under the order lock, the contact block is the
         // real one or the placeholder accordingly, and the row is inserted, all inside it. An erasure that commits between the order
         // create and this enqueue is therefore seen; one that runs after it finds the row and scrubs it. A failure rolls back and is
@@ -3435,7 +3974,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
         const enqueued = await db.$transaction(async (tx) => {
           await lockSalesOrder(tx, so.id)
           const erased = await orderIsErasedInTx(tx, so.id)
-          const postable = erased ? scrubContactInAccountingPayload(accountingPayload) : accountingPayload
+          const postable = erased ? scrubContactInAccountingPayload(invoicePayload) : invoicePayload
           return queueAccountingSyncTxWithOutcome(tx, {
             type: 'SALES_INVOICE',
             referenceType: 'SalesOrder',
@@ -3482,7 +4021,18 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           wcOrder,
           orderNumber,
           metaKey: invoiceNumberResolution.metaKey,
-          accountingPayload,
+          // A hold parked while the Sales Invoices switch is off carries the EU VAT treatment's absence on it, so a later release (switch on) does not post it untreated.
+          // With the switch ON every parked payload says whether the treatment ran on it (applied:true, even where it left the lines alone; applied:false for a store-credit order). With the switch OFF the original payload is parked exactly as built, with no marker:
+          // an absent marker is an untreated hold, which the release and the re-import already treat as such.
+          // A treatment REFUSAL parks the ORIGINAL payload marked applied:false with the refusal's reason, never applied:true: it is an untreated hold, so the sweep never releases it, and a later fixed re-import verifies it against the order, retries the
+          // treatment and releases only when that succeeds (a cause not fixed leaves it PENDING with the reason).
+          accountingPayload: withRegimePolicy(euVatOutcome.kind === 'refused'
+            ? { ...accountingPayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'treatment_refused', refusal: euVatOutcome.reason } }
+            : euVatOutcome.kind === 'skipped'
+            ? (euVatOutcome.why === 'store_credit' ? { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'store_credit' } } : invoicePayload)
+            : invoicePayload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
+              ? invoicePayload
+              : { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? ''), taxBinding: euVatOutcome.kind === 'treated' ? recordWcTaxBinding(euVatOutcome.taxBinding) : null } }, euVatOutcome.kind === 'treated' ? euVatOutcome.regimePolicy : undefined),
           // o3d-j625: the same chart read that produced every account code in `accountingPayload`,
           // parked alongside them — the release can be days later and must not re-resolve it.
           chartConnector: settings.connector,

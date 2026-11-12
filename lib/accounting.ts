@@ -60,13 +60,15 @@ export type AccountingSettings = {
   unrealisedFxGainLossAccount: string
   manufacturingOverheadAccount: string
   /**
-   * EU IOSS / VOEC / DDP treatment (configuration only until the invoice treatment reads it): the account the single recovered-VAT line of a
+   * EU IOSS / VOEC / DDP treatment (read by the sales-invoice treatment, lib/domain/accounting/eu-vat-treatment.ts): the account the single recovered-VAT line of a
    * scheme sale posts to under IOSS or VOEC (Xero "Non-UK VAT", 821 in the OneTwo3D chart), the account it posts to under DDP, and the account a
    * marked landed-cost fee posts to. Empty = not configured; whoever needs one refuses rather than guessing.
    */
   euVatIossAccount: string
   euVatDdpAccount: string
   euFeeAccount: string
+  /** The account a rounding difference on an EU-treated sales invoice posts to ("Rounding", 860 in the OneTwo3D chart; the Xero setting `xero_rounding_difference_account`). Empty = not configured. */
+  roundingDifferenceAccount: string
   paymentAccountMap: string
   invoiceUrlTemplate: string
   billUrlTemplate: string
@@ -153,6 +155,7 @@ const DEFAULT_ACCOUNTING_SETTINGS: AccountingSettings = {
   euVatIossAccount: '',
   euVatDdpAccount: '',
   euFeeAccount: '',
+  roundingDifferenceAccount: '',
   paymentAccountMap: '{}',
   invoiceUrlTemplate: '',
   billUrlTemplate: '',
@@ -1978,6 +1981,7 @@ export async function getAccountingSettingsFor(
         euVatIossAccount: xs.xero_eu_vat_ioss_account,
         euVatDdpAccount: xs.xero_eu_vat_ddp_account,
         euFeeAccount: xs.xero_eu_fee_account,
+        roundingDifferenceAccount: xs.xero_rounding_difference_account,
         paymentAccountMap: paymentMapSetting?.value ?? '{}',
         invoiceUrlTemplate: invoiceUrlSetting?.value ?? '',
         billUrlTemplate: billUrlSetting?.value ?? '',

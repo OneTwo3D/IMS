@@ -59,7 +59,7 @@ test('no number means NO accounting post — the importer must not invent one', 
   const body = importWcOrderBody()
   // The enqueue is reachable ONLY through the resolution's ok branch; the other branch parks the
   // payload (o3d-k26m.6) instead of sending it.
-  const branch = body.indexOf('if (invoiceNumberResolution.ok) {')
+  const branch = body.indexOf("if (invoiceNumberResolution.ok && euVatOutcome.kind !== 'refused') {")
   // The enqueue runs inside the order-locked transaction (erasure gate): the in-transaction variant, still inside the ok branch.
   const enqueue = body.indexOf('queueAccountingSyncTxWithOutcome(tx, {')
   const hold = body.indexOf('await holdWcSalesInvoiceForMissingNumber({')
@@ -113,7 +113,7 @@ test('a redelivery captures the number, may correct it before anything posts, an
   // numbered, PROCESSING and permanently un-invoiced.
   assert.ok(
     body.includes(
-      'await releaseHeldWcSalesInvoice(orderId, { externalOrderId: String(wcOrder.id), externalOrderNumber: wcOrder.number }, usableInvoiceNumber)',
+      'await releaseHeldWcSalesInvoice(orderId, { externalOrderId: String(wcOrder.id), externalOrderNumber: wcOrder.number }, usableInvoiceNumber',
     ),
     'capturing the number must RELEASE the invoice that was held back for it',
   )

@@ -71,8 +71,10 @@ test('explicit NONE on shipping and the order discount is refused: those can nev
 })
 
 test('NONE is accepted only on a line naming an allowed kind; an unknown kind does not unlock it', () => {
-  assert.deepEqual(SALES_NO_TAX_LINE_KINDS, ['fee-no-tax'])
-  assert.deepEqual(findSalesDocumentTaxTypeProblems({ lines: [{ ...good, taxType: 'NONE', noTaxKind: 'fee-no-tax' }] }), [])
+  assert.deepEqual(SALES_NO_TAX_LINE_KINDS, ['fee-no-tax', 'eu-vat-recovery', 'rounding-difference'])
+  for (const kind of SALES_NO_TAX_LINE_KINDS) {
+    assert.deepEqual(findSalesDocumentTaxTypeProblems({ lines: [{ ...good, taxType: 'NONE', noTaxKind: kind }] }), [], kind)
+  }
   for (const noTaxKind of ['other', '', undefined, null, true, 'FEE-NO-TAX']) {
     assert.deepEqual(
       findSalesDocumentTaxTypeProblems({ lines: [{ ...good, taxType: 'NONE', noTaxKind }] }),

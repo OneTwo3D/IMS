@@ -138,7 +138,7 @@ test('the WooCommerce import is refused (nothing saved) when the deactivation of
   loadEnv()
   const db = await loadDb()
   const actual = await import('@/lib/accounting')
-  mock.module('@/lib/accounting', { namedExports: { ...actual, getAccountingSettings: async () => ({ connector: 'xero', salesAccount: '200', shippingAccount: '260', discountAccount: '270', reverseChargeSalesTaxType: '' }), queueAccountingSync: async () => ({ queued: true }) } })
+  mock.module('@/lib/accounting', { namedExports: { ...actual, getAccountingSettings: async () => ({ connector: 'xero', salesAccount: '200', shippingAccount: '260', discountAccount: '270', reverseChargeSalesTaxType: '' }), isAccountingSyncTypeEnabledFor: async () => false, queueAccountingSync: async () => ({ queued: true }) } })
   const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
   const tag = uid()
   const wcRateId = 800_000 + Math.floor(Math.random() * 90_000)

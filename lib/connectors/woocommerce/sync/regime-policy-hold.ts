@@ -1,0 +1,142 @@
+/**
+ * A QUEUED TREATED INVOICE WHOSE REGIME POLICY CHANGED GOES BACK TO BEING A HELD INVOICE.
+ *
+ * The Xero poster refuses a treated payload whose recorded regime settings (mode, gift-card cut-in, IOSS/DDP accounts) differ from the ones in force (lib/domain/accounting/eu-vat-regime-policy.ts). A refused FAILED row can only be retried
+ * as the same payload, which would be refused again for ever, and a re-import only reconciles HELD invoices. So, before anything is sent, a refused SALES_INVOICE is superseded (its queued row retired, fenced on the claim and the attempt, exactly as a cancelled
+ * order's is) and the same invoice is parked as a held invoice (the hold the importer uses), with the invoice number it was queued under still on the order. The re-import then verifies it through the existing treated-hold path, a fresh build under the CURRENT
+ * policy, and releases it with the current policy recorded, or refuses it with the reason. One transaction, under the order lock: a concurrent post or retry that moved the row on makes the compare-and-set fail and nothing is parked.
+ */
+import type { Prisma } from '@/app/generated/prisma/client'
+import { db } from '@/lib/db'
+import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
+import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain/erasure/erase-personal-data'
+import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
+import { regimePolicyDifference } from '@/lib/domain/accounting/eu-vat-regime-policy'
+import { EU_VAT_TREATMENT_PAYLOAD_KEY } from '@/lib/domain/accounting/eu-vat-treatment'
+import type { AttemptRef } from '@/lib/domain/accounting/sync-log-attempt'
+import type { HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
+import { buildHeldSalesInvoicePayload, heldSalesInvoiceQueueWhere, HELD_SALES_INVOICE_RECORD_KIND } from './held-sales-invoice'
+
+/**
+ * What the operator is told when an ACCOUNT setting changed. The regime stamp is write-once and the treated lines carry their accounts, so a re-import cannot adopt the new account and would only mark the hold order-changed: re-import alone does not fix this. Two things work:
+ * restore the previous account setting (Settings > Accounting) and retry this row on /sync (`retryFailedAccountingSync`, app/actions/accounting-sync.ts:762), or post the invoice by hand in Xero and record it on this row with the per-row settlement action on /sync
+ * (`settleAccountingSyncRow`, app/actions/accounting-settlement.ts:360).
+ */
+export const REGIME_ACCOUNT_CHANGED_REFUSAL = (invoiceNumber: string, accounts: string[]): string =>
+  withLedgerCheck(`NOTHING WAS SENT. Sales invoice ${invoiceNumber} was refused: the EU VAT account setting(s) changed since it was prepared (${accounts.join(', ')}). The regime stamped on the order still applies and this invoice was built on the accounts it was prepared with, so re-importing the order will not fix it. Either restore the previous account setting(s) in Settings > Accounting and retry this row on /sync, or post the invoice by hand in Xero and record it on this row with the settle action on /sync.`)
+
+/** What the operator is told when the invoice cannot be superseded because an earlier attempt may already have created it. */
+export const REGIME_POLICY_BLOCKED_REFUSAL = (invoiceNumber: string, problem: string): string =>
+  `NOTHING WAS SENT. Sales invoice ${invoiceNumber} was refused: ${problem}, and an earlier attempt on this row may already have created the invoice in Xero, so IMS cannot rebuild it. This row is left refused. Resolve it on /sync: check Xero for invoice ${invoiceNumber} first, and record it on the row if it exists there. Do not re-import the order until that is settled.`
+
+const SALES_INVOICE_SYNC_TYPES = ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] as const
+
+export const REGIME_POLICY_SUPERSEDED_NOTE = 'Superseded: the EU VAT regime settings changed since this invoice was prepared, so it was moved back to a held invoice; re-import the order from WooCommerce to rebuild and release it under the settings now in force.'
+
+/** The hold's own note (the sweep keeps it until a re-import decides). */
+export const REGIME_POLICY_HOLD_NOTE = (invoiceNumber: string): string =>
+  `Invoice ${invoiceNumber} was moved back to a held invoice: the EU VAT regime settings changed since it was prepared and nothing was sent. Re-import the order from WooCommerce: the re-import checks it against the order under the settings now in force and releases it, or says why not.`
+
+export type RegimePolicyHoldOutcome =
+  | { kind: 'unaffected' }                          // not a treated payload, or its policy still matches
+  | { kind: 'held' }                                // superseded and parked as a held invoice
+  | { kind: 'lost' }                                // the claim or attempt moved on: nothing was changed
+  | { kind: 'refuse'; problem: string }             // changed, but it cannot be parked (not a WooCommerce order): the poster refuses it
+  | { kind: 'account_changed'; problem: string; accounts: string[] }  // an ACCOUNT setting changed: the stamped regime and the treated lines keep their old accounts, so a re-import cannot adopt it; not superseded, refused with steps that work
+  | { kind: 'blocked'; problem: string }            // changed, but an earlier attempt may have created the invoice in Xero: never superseded, left refused for ledger reconciliation
+
+/**
+ * NEVER CLAIMED, from a row alone. This is the proof that nothing can have been sent for a SALES_INVOICE row, and it is deliberately NOT the money stamps: `remoteAttemptedAt` is written only for money types and the sales-invoice poster mints no create-dispatch record
+ * (its replay protection is the number fence: `CREATE_REPLAY_POLICY.SALES_INVOICE = 'number-fenced'`, create-dispatch-record.ts:172), so for an invoice those fields prove nothing. What does prove it is the claim itself: a request is only ever sent by a worker holding a claim, and every
+ * claim by a fence-aware processor bumps the attempt revision (sync-processor.ts:4119 `nextAttemptRevision(entry.attemptRevision)`; the first claim makes it 1, sync-log-attempt.ts:32-38), while a claim by a binary that does not know the column forfeits custody
+ * (`attemptStampingCustodyAt`, money-attempt-provenance.ts header, enforced by a database trigger). So: revision 0 with custody still present means no processor of any kind has ever claimed the row. No document id and no dispatch marker or key are required as well.
+ */
+function neverClaimed(row: { attemptRevision: number; createDispatchedAt: Date | null; createDispatchIdempotencyKey: string | null; remoteAttemptedAt: Date | null; attemptStampingCustodyAt: Date | null; externalTransactionId: string | null }): boolean {
+  return row.attemptRevision === 0 && row.attemptStampingCustodyAt !== null && row.remoteAttemptedAt === null && row.externalTransactionId === null && row.createDispatchedAt === null && row.createDispatchIdempotencyKey === null
+}
+
+/**
+ * THE CURRENT ROW: the claim THIS worker holds is the first claim the row has ever had (revision 1, custody present, so no earlier claim by any processor), no document id and no dispatch marker or key. The supersede runs at the head of the poster case, before the number fence and the
+ * remote-write fence of this claim, so nothing has left in it yet. A retry (revision >= 2), or a row a non-stamping binary ever claimed (custody gone), is never provably unsent.
+ *
+ * ACCEPTED LIMIT, documented rather than closed with new machinery: a binary OLDER than this change claims and sends without bumping the revision, its claim clears custody, and if the response is lost the current binary's claim bumps 0 to 1 and restores custody, so this proof
+ * cannot tell that row from a clean one. (The retry count and error note above catch a row that recorded its failure, not one that never wrote it.) It needs a row last claimed by a pre-revision binary, and the deployment facts rule that out: production is installed fresh (no
+ * pre-existing rows), the stage's Xero outbound is held (no stage invoice has ever been sent), and a deploy stops the service before starting the new one, so old and new binaries never run side by side.
+ */
+function firstClaimNothingSent(row: { retryCount: number; errorMessage: string | null; attemptRevision: number; createDispatchedAt: Date | null; createDispatchIdempotencyKey: string | null; remoteAttemptedAt: Date | null; attemptStampingCustodyAt: Date | null; externalTransactionId: string | null }): boolean {
+  // Belt and braces on existing columns: a row that has ever failed carries a retry count and an error note, so a first claim with either is not a clean first claim.
+  return row.retryCount === 0 && row.errorMessage === null && row.attemptRevision === 1 && row.attemptStampingCustodyAt !== null && row.remoteAttemptedAt === null && row.externalTransactionId === null && row.createDispatchedAt === null && row.createDispatchIdempotencyKey === null
+}
+
+export async function holdInvoiceOnRegimePolicyChange(params: {
+  attempt: AttemptRef
+  held: HeldClaim
+  referenceType: string
+  referenceId: string
+  payload: Record<string, unknown>
+}): Promise<RegimePolicyHoldOutcome> {
+  const marker = params.payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown; regimePolicy?: unknown } | null | undefined
+  if (typeof marker !== 'object' || marker === null || marker.applied !== true) return { kind: 'unaffected' }
+  const difference = await regimePolicyDifference(marker.regimePolicy)
+  if (difference === null) return { kind: 'unaffected' }
+  const problem = difference.problem
+  // An account setting (IOSS, DDP, fee, rounding) is baked into the stamp (write-once) and the treated lines, so rebuilding under the new account is refused by the stamp and would only end in an order-changed hold: nothing is superseded, the row stays refused (FAILED, retryable) and the operator is told what works.
+  if (difference.accountsChanged.length > 0) return { kind: 'account_changed', problem, accounts: difference.accountsChanged }
+  if (params.referenceType !== 'SalesOrder') return { kind: 'refuse', problem }
+  const invoiceNumber = typeof params.payload.invoiceNumber === 'string' ? params.payload.invoiceNumber : ''
+  return db.$transaction(async (tx): Promise<RegimePolicyHoldOutcome> => {
+    await lockSalesOrder(tx, params.referenceId)
+    const link = await tx.shoppingOrderLink.findFirst({ where: { orderId: params.referenceId, connector: 'woocommerce' }, select: { externalOrderId: true, externalOrderNumber: true } })
+    if (!link) return { kind: 'refuse', problem }
+    // Retire the queued row first: fenced on the claim and the attempt, so a concurrent post or retry makes this fail and nothing is parked.
+    // DURABLE PROOF THAT NO CREATE WAS EVER DISPATCHED FOR THIS ROW, or nothing is superseded: a superseded row is replaced by a release under a NEW idempotency key, which a prior attempt's evidence (scoped to the old key) would not stop, so a create that
+    // landed unrecorded would be created twice. The proof is positive and from the row itself: this is its first claim ever (revision 1); no dispatch marker (`createDispatchedAt`, write-once and trigger-protected, minted inside the claim fence before the
+    // socket) and no dispatch key; no remote-attempt stamp under custody (`attemptProvenNeverMade`); no document id; and no other live or posted sales-invoice row for the order. Anything else is ambiguous and is left refused for ledger reconciliation.
+    const row = await tx.accountingSyncLog.findUnique({
+      where: { id: params.attempt.id },
+      select: { retryCount: true, errorMessage: true, attemptRevision: true, createDispatchedAt: true, createDispatchIdempotencyKey: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true, externalTransactionId: true },
+    })
+    // EVERY other sales-invoice row for the order, in any status: unless it was NEVER CLAIMED (see neverClaimed: the money stamps prove nothing for an invoice), it is ambiguous, whatever its fields say. A FAILED row with no document id, after a lost response, is exactly that: a rebuilt
+    // invoice released under a new idempotency key would be created again beside it. A row this flow superseded earlier was claimed too, so it blocks a later supersede as well: conservative, and a person reconciles it.
+    const siblingRows = await tx.accountingSyncLog.findMany({
+      where: { id: { not: params.attempt.id }, referenceType: 'SalesOrder', referenceId: params.referenceId, type: { in: [...SALES_INVOICE_SYNC_TYPES] } },
+      select: { attemptRevision: true, createDispatchedAt: true, createDispatchIdempotencyKey: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true, externalTransactionId: true },
+    })
+    const ambiguousSibling = siblingRows.some((sibling) => !neverClaimed(sibling))
+    const neverDispatched = row !== null && params.attempt.attemptRevision === 1 && firstClaimNothingSent(row) && !ambiguousSibling
+    if (!neverDispatched) return { kind: 'blocked', problem }
+    // Superseded as an ATTEMPT (its mirrored event is voided revivably), never as a cancelled sale.
+    const retired = await retireSalesInvoiceForCancelledOrder(tx, params.attempt, params.referenceId, params.held, REGIME_POLICY_SUPERSEDED_NOTE, true)
+    if (!retired) return { kind: 'lost' }
+    const erased = await orderIsErasedInTx(tx, params.referenceId)
+    // What the queue adds is not part of the held payload: the number comes back from the order at release, and the release builds its own idempotency key.
+    const { invoiceNumber: _number, _idempotencyKey: _key, ...built } = params.payload
+    void _number; void _key
+    const heldPayload = buildHeldSalesInvoicePayload({
+      externalOrderId: link.externalOrderId,
+      externalOrderNumber: link.externalOrderNumber ?? String(params.payload.reference ?? ''),
+      salesOrderId: params.referenceId,
+      orderNumber: String(params.payload.reference ?? ''),
+      metaKey: '_wcpdf_invoice_number',
+      accountingPayload: erased ? scrubContactInAccountingPayload(built) : built,
+      chartConnector: 'xero',
+    })
+    const data = {
+      connector: 'woocommerce',
+      direction: 'FROM_CONNECTOR' as const,
+      status: 'PENDING' as const,
+      entityType: 'SalesOrder',
+      entityId: params.referenceId,
+      externalId: link.externalOrderId,
+      recordKind: HELD_SALES_INVOICE_RECORD_KIND,
+      payload: JSON.parse(JSON.stringify(heldPayload)) as Prisma.InputJsonValue,
+      errorMessage: REGIME_POLICY_HOLD_NOTE(invoiceNumber || '(no number)'),
+      syncedAt: null,
+    }
+    const existing = await tx.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: params.referenceId }), orderBy: { createdAt: 'desc' }, select: { id: true } })
+    if (existing) await tx.shoppingSyncLog.update({ where: { id: existing.id }, data })
+    else await tx.shoppingSyncLog.create({ data })
+    return { kind: 'held' }
+  }, { maxWait: 5_000, timeout: 20_000 })
+}

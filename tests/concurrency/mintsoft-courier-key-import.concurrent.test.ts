@@ -24,6 +24,8 @@ async function mockAccounting() {
     namedExports: {
       ...actual,
       getAccountingSettings: async () => ({ connector: 'xero', salesAccount: '200', shippingAccount: '260', discountAccount: '270', reverseChargeSalesTaxType: '' }),
+      // The EU VAT invoice treatment is gated on the real Sales Invoices switch, which other tests in the shared CI database may leave on: pinned off here, this test is about the untreated payload.
+      isAccountingSyncTypeEnabledFor: async () => false,
       queueAccountingSync: async () => ({ queued: true }),
     },
   })

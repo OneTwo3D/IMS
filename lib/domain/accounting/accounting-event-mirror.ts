@@ -19,7 +19,7 @@ import {
   isMirrorableJournalAccountingSyncType,
 } from './mirrored-sync-types'
 import type { MirroredAccountingSyncType } from './mirrored-sync-types'
-import { REVIVABLE_VOID_BASES, SOURCE_CANCELLED_VOID_BASIS } from './accounting-event-void-basis'
+import { ATTEMPT_SETTLED_VOID_BASIS, REVIVABLE_VOID_BASES, SOURCE_CANCELLED_VOID_BASIS } from './accounting-event-void-basis'
 import {
   CONNECTOR_POST_BASIS,
   OPERATOR_ASSERTION_POST_BASIS,
@@ -1641,7 +1641,7 @@ export async function resetMirroredAccountingEventsToPending(
  */
 export async function voidMirroredAccountingEventsForOrder(
   client: AccountingEventMirrorTransactionClient,
-  params: { types: string[]; referenceType: string; referenceId: string; reason?: string },
+  params: { types: string[]; referenceType: string; referenceId: string; reason?: string; /** The void retires ONE ATTEMPT, not the document (a later live attempt may take the event back): the basis is revivable. Default: the source order was cancelled, never revivable. */ attemptOnly?: boolean },
 ): Promise<void> {
   const types = params.types.filter(isMirrorableAccountingSyncType)
   if (types.length === 0 || !params.referenceId.trim()) return
@@ -1669,7 +1669,7 @@ export async function voidMirroredAccountingEventsForOrder(
     // that if the row says so. Recorded here rather than inferred from the audit action below,
     // because `accounting_event_logs.createdAt` is transaction-start time and cannot order two
     // entries written in one transaction.
-    data: { status: 'VOID', externalId: null, voidBasis: SOURCE_CANCELLED_VOID_BASIS, postBasis: null },
+    data: { status: 'VOID', externalId: null, voidBasis: params.attemptOnly ? ATTEMPT_SETTLED_VOID_BASIS : SOURCE_CANCELLED_VOID_BASIS, postBasis: null },
   })
   if (updated.count === 0) return
 
@@ -1681,7 +1681,7 @@ export async function voidMirroredAccountingEventsForOrder(
   await client.accountingEventLog.createMany({
     data: voided.map((event) => buildAccountingEventLog({
       accountingEventId: event.id,
-      action: 'voided_source_cancelled',
+      action: params.attemptOnly ? 'failed_from_sync_log' : 'voided_source_cancelled',
       metadata: {
         syncType: event.type,
         referenceType: event.sourceEntityType,

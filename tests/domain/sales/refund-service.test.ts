@@ -364,6 +364,7 @@ const accountingSettings: AccountingSettings = {
   euVatIossAccount: '',
   euVatDdpAccount: '',
   euFeeAccount: '',
+  roundingDifferenceAccount: '',
   paymentAccountMap: '{}',
   invoiceUrlTemplate: '',
   billUrlTemplate: '',

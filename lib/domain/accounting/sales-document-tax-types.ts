@@ -17,8 +17,8 @@
  * WHAT A NAMED KIND IS. A line kind whose accounting treatment IS "outside the VAT return" by design, decided
  * by the code that builds the line - never inferred from the rate. A kind is added here only together with the
  * producer that sets it, so the list is exactly the set of lines IMS can currently emit on `NONE`. The EU
- * IOSS/VOEC/DDP work adds its own (the recovered-VAT line, marked landed-cost fees, store-credit and gift-card
- * lines) in the changes that start producing those lines.
+ * IOSS/VOEC/DDP invoice treatment (lib/domain/accounting/eu-vat-treatment.ts) added the recovered-VAT line and the
+ * rounding line; the store-credit and gift-card lines join in the changes that start producing them.
  *
  * Shipping and the order-level discount can never be a named kind: they must carry a real tax type.
  *
@@ -35,9 +35,15 @@ export const NO_TAX_TYPE = 'NONE'
  *   - `fee-no-tax`: a WooCommerce FEE line the shop charged no tax on and named no tax rate for (a legacy untaxed
  *     fee, or the over-threshold non-taxable import duty). Left to the order default it would pick up the
  *     order's taxable code and Xero would add VAT to a line the shop charged none on, so the importer decides
- *     it and says so (resolveWcLineAccountingTaxType `forceNoTax`).
+ *     it and says so (resolveWcLineAccountingTaxType `forceNoTax`). Marked landed-cost fees of the EU treatment
+ *     (posted on the fee account, net, their VAT carried by the one VAT line) are the same kind.
+ *   - `eu-vat-recovery`: THE ONE LINE of an IOSS, VOEC or DDP invoice that carries all the VAT the customer paid, on
+ *     the stamped VAT account (821, or 232 for DDP). VAT collected is not turnover and must stay out of the VAT return.
+ *   - `rounding-difference`: the line that carries a rounding difference between the EU-treated document and the
+ *     order total, on the rounding account (860). Bounded by the treatment (a few minor units), never a way to absorb
+ *     a real difference.
  */
-export const SALES_NO_TAX_LINE_KINDS = ['fee-no-tax'] as const
+export const SALES_NO_TAX_LINE_KINDS = ['fee-no-tax', 'eu-vat-recovery', 'rounding-difference'] as const
 export type SalesNoTaxLineKind = (typeof SALES_NO_TAX_LINE_KINDS)[number]
 
 export function isSalesNoTaxLineKind(value: unknown): value is SalesNoTaxLineKind {
