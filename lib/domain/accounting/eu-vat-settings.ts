@@ -45,7 +45,7 @@ export function parseRegimeMode(raw: string | null | undefined): 'adopt_plugin' 
 }
 
 /**
- * THE GIFT-CARD LINE FLAG CUT-IN (`eu_vat_gift_card_flag_cut_in`). From the storefront plugin's cut-in the store writes an explicit yes/no gift-card flag (`_o3d_is_voucher`) on EVERY order line. Unset (the default)
+ * THE GIFT-CARD LINE FLAG CUT-IN (`eu_vat_gift_card_flag_cut_in`). From the storefront plugin's cut-in the store writes an explicit yes/no gift-card flag (`_o3d_is_voucher`) on EVERY order line. Unset (no stored row, the default)
  * keeps the lenient reading: a line with no flag is "unknown" and only refuses when it could decide the regime. Set to a date (`YYYY-MM-DD`, the start of that day UTC) or an instant (ISO 8601 with a zone, e.g.
  * `2026-12-01T00:00:00Z`): an order created AT OR AFTER it must carry the flag on every line, or the regime resolver refuses it (`gift_card_flag_missing`). A stored value that is not a date is NOT coerced: it reads as
  * `invalid` and every order refuses (`gift_card_cut_in_unreadable`), because guessing the date would either wave unflagged orders through or hold flagged ones.
@@ -74,7 +74,8 @@ export function parseStrictIsoInstant(raw: string, options: { dateOnly: boolean;
 }
 
 export function parseGiftCardCutIn(raw: string | null | undefined): GiftCardCutIn {
-  if (raw === null || raw === undefined || raw.trim() === '') return { state: 'unset' }
+  // Only NO ROW (null / undefined) is unset. A stored blank or whitespace value is a setting someone saved wrongly: reading it as unset would silently switch enforcement off, so it is invalid and refuses.
+  if (raw === null || raw === undefined) return { state: 'unset' }
   const at = parseStrictIsoInstant(raw, { dateOnly: true, assumeUtc: false })
   return at === null ? { state: 'invalid', raw: raw.trim().slice(0, 40) } : { state: 'ok', at }
 }

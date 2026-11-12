@@ -6,6 +6,7 @@ import { resolveEuVatRegime } from '@/lib/domain/accounting/eu-vat-regime'
 import {
   buildEuVatRegimeInput, buildEuVatRegimeInputFromSettings, giftCardFlagPolicy, giftCardOrderedAt, loadRateMappings, readPluginFx, readEasFact, readGoodsLines, readRateTax, readVatRecord, readWcEuVatFacts, resolveThresholdFx, type EuVatRegimeInputClient,
 } from '@/lib/connectors/woocommerce/sync/eu-vat-facts'
+import { parseGiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
 import type { WcFullOrder, WcMeta } from '@/lib/connectors/woocommerce/sync/types'
 
 const meta = (key: string, value: unknown): WcMeta => ({ id: 1, key, value })
@@ -296,6 +297,30 @@ test('gift-card cut-in: date_created_gmt is validated strictly; rollover and out
   const client = fakeClient({ mappings: [mappingRow(216, {})] })
   const r = await buildEuVatRegimeInputFromSettings(client, wcOrder({ date_created_gmt: '2026-02-31T10:00:00' }), { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide' }, async () => ({ state: 'ok', at: new Date('2026-10-01T00:00:00Z') }))
   assert.equal(r.giftCardFlag, 'setting_unreadable')
+})
+
+test('gift-card cut-in: the settings reader treats only a missing row as unset; a stored blank refuses as unreadable', async () => {
+  const client = fakeClient({ mappings: [mappingRow(216, {})] })
+  const order = wcOrder({ line_items: [{ id: 1, total: '100.00', meta_data: [meta('_o3d_is_voucher', 'no')] }] as never })
+  const through = (stored: string | undefined) => buildEuVatRegimeInputFromSettings(client, order, { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide' }, async () => parseGiftCardCutIn(stored))
+  assert.equal((await through(undefined)).giftCardFlag, 'off')
+  for (const blank of ['', '   ']) {
+    const input = await through(blank)
+    assert.equal(input.giftCardFlag, 'setting_unreadable', JSON.stringify(blank))
+    assert.equal((resolveEuVatRegime(input) as { code?: string }).code, 'gift_card_cut_in_unreadable')
+  }
+})
+
+test('gift-card flag: every _o3d_is_voucher entry is read; conflicting or mixed entries are unknown in both the strict and the lenient reading', () => {
+  const lines = readGoodsLines(wcOrder({
+    line_items: [
+      { id: 1, total: '1.00', meta_data: [meta('_o3d_is_voucher', 'yes'), meta('_o3d_is_voucher', 'no')] },
+      { id: 2, total: '1.00', meta_data: [meta('_o3d_is_voucher', 'no'), meta('_o3d_is_voucher', 'yes')] },
+      { id: 3, total: '1.00', meta_data: [meta('_o3d_is_voucher', 'yes'), meta('_o3d_is_voucher', 'yes')] },
+      { id: 4, total: '1.00', meta_data: [meta('_o3d_is_voucher', 'no'), meta('_o3d_is_voucher', 'banana')] },
+    ] as never,
+  }))
+  assert.deepEqual(lines.map((l) => [l.voucher, l.voucherStrict]), [['unknown', 'unknown'], ['unknown', 'unknown'], ['yes', 'yes'], ['unknown', 'unknown']])
 })
 
 // ---- unreadable figures are named, never defaulted to 0 -------------------------------------------------------------------------------------------------------------

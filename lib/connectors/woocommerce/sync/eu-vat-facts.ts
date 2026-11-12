@@ -140,11 +140,14 @@ function readStrictFlag(value: unknown): 'yes' | 'no' | 'unknown' {
 
 export function readGoodsLines(order: Pick<WcFullOrder, 'line_items'>, problems: string[] = []): GoodsLineFact[] {
   return order.line_items.map((line, index) => {
-    const flag = (line.meta_data ?? []).find((entry) => entry.key === '_o3d_is_voucher')
+    // EVERY entry for the key is read: WooCommerce meta may hold the key more than once. Entries that read differently (yes and no, or a readable one beside an unreadable one) make the flag unknown, never first-wins.
+    const entries = (line.meta_data ?? []).filter((entry) => entry.key === '_o3d_is_voucher')
+    const lenient = (value: unknown): 'yes' | 'no' | 'unknown' => (wcMetaFlag(value) ? 'yes' : readFalsyFlag(value) ? 'no' : 'unknown')
+    const agree = (readings: Array<'yes' | 'no' | 'unknown'>): 'yes' | 'no' | 'unknown' => (readings.length > 0 && readings.every((r) => r === readings[0]) ? readings[0]! : 'unknown')
     const total = decimalText(line.total)
     if (total === null) problems.push(`goods line ${index + 1} (id ${String(line.id)}) has an unreadable total`)
     // Only the line's own flag is read. The product-level marker (`_coupon_title`) is not on the order and IMS imports no product meta, so a line with no (or an unreadable) flag is unknown and the resolver decides what that means.
-    return { total: total ?? '0', voucherStrict: readStrictFlag(flag?.value), voucher: flag === undefined ? 'unknown' : wcMetaFlag(flag.value) ? 'yes' : readFalsyFlag(flag.value) ? 'no' : 'unknown' }
+    return { total: total ?? '0', voucherStrict: agree(entries.map((e) => readStrictFlag(e.value))), voucher: agree(entries.map((e) => lenient(e.value))) }
   })
 }
 

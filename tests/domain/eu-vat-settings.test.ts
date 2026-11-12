@@ -47,7 +47,8 @@ test('the regime mode defaults to adopting the plugin, takes either named mode, 
 
 test('the gift-card flag cut-in is unset by default, takes a date (start of day UTC) or a zoned instant, and is invalid (refuse, do not guess) for anything else', () => {
   assert.deepEqual(parseGiftCardCutIn(undefined), { state: 'unset' })
-  assert.deepEqual(parseGiftCardCutIn(' '), { state: 'unset' })
+  assert.deepEqual(parseGiftCardCutIn(null), { state: 'unset' })
+  for (const blank of ['', ' ', '\t\n']) assert.equal(parseGiftCardCutIn(blank).state, 'invalid', `blank ${JSON.stringify(blank)} is a saved-wrongly value, not unset`)
   const day = parseGiftCardCutIn('2026-12-01')
   assert.ok(day.state === 'ok' && day.at.toISOString() === '2026-12-01T00:00:00.000Z')
   const inst = parseGiftCardCutIn('2026-12-01T10:30:00+01:00')
