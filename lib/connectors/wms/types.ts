@@ -687,10 +687,10 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
   /** Cancel a WMS order by its external id; a no-op (success) if past NEW. */
   cancelOrder?(externalOrderId: string, clearance: WmsWriteClearance<'order.cancel' | 'order.hold'>): Promise<WmsOrderCancelResult>
   /**
-   * Cancel a MERGED order. Only for a caller that has just proved the order holds nothing but the lines of the order being cancelled
-   * (see removeOrderItems, ONLY_LINES_LEFT). `cancelOrder` refuses a merged order (status MERGED_SURVIVOR) because it holds other orders' goods.
+   * Cancel a MERGED order, but only while it still holds EXACTLY `items` (the lines of the order being cancelled; the connector re-reads
+   * them immediately before the cancel and answers status MERGED_LINES_CHANGED, cancelling nothing, when they differ). `cancelOrder` refuses a merged order (status MERGED_SURVIVOR) because it holds other orders' goods.
    */
-  cancelMergedOrder?(externalOrderId: string, clearance: WmsWriteClearance<'order.cancel'>): Promise<WmsOrderCancelResult>
+  cancelMergedOrder?(externalOrderId: string, items: WmsOrderItemRef[], clearance: WmsWriteClearance<'order.cancel'>): Promise<WmsOrderCancelResult>
   /**
    * Take the given lines (one IMS order's, by the warehouse's own line ids) out of a MERGED warehouse order, and nothing else. Only
    * while the warehouse order can still be changed; every line is checked (present, same SKU, same quantity) BEFORE anything is

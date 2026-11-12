@@ -1389,7 +1389,7 @@ export async function runWmsOrderPushSweepCore(
     if (removal.kind === 'ONLY_LINES_LEFT') {
       // The merged order holds nothing but this order's lines (the other order's were taken out, or it was cancelled before): it is
       // cancelled like any order, through the same clearance.
-      const cancel = await connector.cancelMergedOrder!(survivorId, seam.clearance)
+      const cancel = await connector.cancelMergedOrder!(survivorId, items, seam.clearance)
       if (cancel.cancelled || cancel.status === 'ALREADY_CANCELLED') {
         await settleCancelled()
         await audit({
@@ -1397,6 +1397,9 @@ export async function runWmsOrderPushSweepCore(
           summary: 'IMS-cancelled/fully-refunded order was the only one left on the merged WMS order, which was cancelled',
           before, after: { state: 'CANCELLED', wmsCancelStatus: cancel.status },
         })
+      } else if (cancel.status === 'MERGED_LINES_CHANGED') {
+        await notice('When IMS was about to cancel it, the merged order held lines other than this order\'s (another line appeared after IMS checked), so IMS cancelled nothing. Take this order\'s items out of it in the WMS before it ships.',
+          'IMS cancel not propagated: the merged WMS order changed while it was being cancelled — left for an operator')
       } else if (cancel.status === 'NOT_FOUND') {
         await notice(`The merged order is no longer returned by the WMS (${survivorLabel}) — find it there and make sure it does not ship.`,
           'IMS cancel could not be confirmed: the merged WMS order was not found — left for an operator')

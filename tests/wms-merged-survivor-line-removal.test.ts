@@ -48,6 +48,14 @@ const fake = {
   tamperAfterDelete: null as { afterDeletes: number; itemId: number; quantity: number } | null,
   /** The order detail read answers a server error. */
   detailFails: false,
+  /** After the Nth read of the survivor's lines, another order's line appears on it. */
+  addLineAfterItemRead: null as number | null,
+  itemReads: 0,
+  /** The create lands, and a merge (or an extra unflagged line) happens before the read-back. */
+  putMerges: false,
+  putExtraLine: false,
+  /** Flagged merged but the lines still match what was sent. */
+  putFlagOnly: false,
 }
 function resetFake() {
   fake.orders = new Map()
@@ -59,6 +67,11 @@ function resetFake() {
   fake.deletes = 0
   fake.tamperAfterDelete = null
   fake.detailFails = false
+  fake.addLineAfterItemRead = null
+  fake.itemReads = 0
+  fake.putMerges = false
+  fake.putExtraLine = false
+  fake.putFlagOnly = false
 }
 const D_LINES: FakeLine[] = [{ ID: 3603106, SKU: '243632999', Quantity: 2 }, { ID: 3603107, SKU: '923663020', Quantity: 1 }]
 const E_LINES: FakeLine[] = [{ ID: 3603108, SKU: '243632999', Quantity: 1 }, { ID: 3603109, SKU: '849293203', Quantity: 1 }]
@@ -117,7 +130,10 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
           return { data: { ID: 0, Success: true, Message: `OrderItem: ${line.SKU} removed from Order` }, status: 200 }
         }
         if (fake.itemsReadFailsAfterDeletes !== null && fake.deletes >= fake.itemsReadFailsAfterDeletes) return { data: null, error: 'Mintsoft request failed with status 500', status: 500 }
-        return { data: order.items.map((l) => ({ ...l })), status: 200 }
+        const snapshot = order.items.map((l) => ({ ...l }))
+        fake.itemReads += 1
+        if (fake.addLineAfterItemRead === fake.itemReads) order.items.push({ ID: 9999, SKU: 'LATE', Quantity: 1 })
+        return { data: snapshot, status: 200 }
       }
       const cancelMatch = pathname.match(/^\/api\/Order\/([^/]+)\/Cancel$/)
       if (cancelMatch) {
@@ -140,7 +156,10 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
       }
       if (pathname === '/api/Order' && method === 'PUT') {
         const id = '999001'
-        fake.orders.set(id, { status: 9, number: 'WC-1001', items: [{ ID: 7001, SKU: 'SKU-1', Quantity: 1 }, { ID: 7002, SKU: 'SKU-1', Quantity: 3 }], merged: false })
+        const lines = [{ ID: 7001, SKU: 'SKU-1', Quantity: 1 }, { ID: 7002, SKU: 'SKU-1', Quantity: 3 }]
+        if (fake.putMerges) lines.push({ ID: 7101, SKU: 'OTHER-ORDER', Quantity: 2 })
+        if (fake.putExtraLine) lines.push({ ID: 7102, SKU: 'EXTRA', Quantity: 1 })
+        fake.orders.set(id, { status: 9, number: fake.putMerges ? 'WC-1001+WC-2002' : 'WC-1001', items: lines, merged: fake.putMerges || fake.putFlagOnly })
         return { data: [{ Success: true, OrderId: Number(id), OrderNumber: 'WC-1001' }], status: 200 }
       }
       throw new Error(`Unexpected Mintsoft request: ${method} ${path}`)
@@ -228,7 +247,7 @@ async function sweep(port: WmsOrderPushPort) {
     pushOrder: async () => { throw new Error('not used') },
     updateOrder: async () => ({ updated: true, status: 'NEW' }),
     cancelOrder: async (id: string) => orderPush.cancelMintsoftOrder(id),
-    cancelMergedOrder: async (id: string) => orderPush.cancelMintsoftOrder(id, { allowMerged: true }),
+    cancelMergedOrder: async (id: string, items: WmsOrderItemRef[]) => orderPush.cancelMintsoftOrder(id, { onlyLines: items }),
     addOrderComment: async (id: string, comment: string) => orderPush.addMintsoftOrderComment(id, comment),
     removeOrderItems: async (id: string, items: WmsOrderItemRef[]) => orderPush.removeMintsoftOrderItems(id, items),
     findMergedSurvivor: async (number: string) => orderPush.findMintsoftMergedSurvivor(number),
@@ -649,5 +668,74 @@ test('ABSORBING ORDER held in IMS: the survivor is not cancelled either; the lin
     assert.equal(fake.orders.get(SURVIVOR)!.status, 9)
     assert.equal(result.operatorNotices, 1)
     assert.ok(h.writes.some((w) => w.data.state === 'MERGED'))
+  })
+})
+
+// ---------------------------------------------------------------- 8. review round 1 -----------------------------------------------
+
+test('SNAPSHOT: a merge between the create and the read-back stores NO line ids, and a later cancel raises the notice', async () => {
+  await withEnv(OFF, async () => {
+    resetFake()
+    fake.putMerges = true
+    const { pushMintsoftOrder } = await import('../lib/connectors/mintsoft/api/order-push.ts')
+    const quiet = console.warn
+    console.warn = () => {}
+    const pushed = await pushMintsoftOrder(INPUT).finally(() => { console.warn = quiet })
+    assert.equal(pushed.items, undefined, 'both orders\' lines are on the order: nothing is attributed to this one')
+    const h = makePort({ cancellable: [{ ...absorbingLinkRef(), externalOrderId: pushed.externalOrderId }], items: pushed.items ?? null })
+    const result = await sweep(h.port)
+    assert.equal(fake.requests.some((r) => r.method === 'DELETE' || r.path.endsWith('/Cancel')), false)
+    assert.equal(result.operatorNotices, 1)
+  })
+})
+
+test('SNAPSHOT: an order flagged as merged records nothing even when its lines happen to match what IMS sent', async () => {
+  await withEnv(OFF, async () => {
+    resetFake()
+    fake.putFlagOnly = true
+    const { pushMintsoftOrder } = await import('../lib/connectors/mintsoft/api/order-push.ts')
+    const quiet = console.warn
+    console.warn = () => {}
+    const pushed = await pushMintsoftOrder(INPUT).finally(() => { console.warn = quiet })
+    assert.equal(pushed.items, undefined)
+  })
+})
+
+test('SNAPSHOT: lines that are not exactly what IMS sent (an extra line, though unflagged) are not recorded', async () => {
+  await withEnv(OFF, async () => {
+    resetFake()
+    fake.putExtraLine = true
+    const { pushMintsoftOrder } = await import('../lib/connectors/mintsoft/api/order-push.ts')
+    const quiet = console.warn
+    console.warn = () => {}
+    const pushed = await pushMintsoftOrder(INPUT).finally(() => { console.warn = quiet })
+    assert.equal(pushed.items, undefined)
+  })
+})
+
+test('LINE ADDED between the only-lines check and the cancel: nothing is cancelled and a notice is raised', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged(9, D_LINES)
+    fake.addLineAfterItemRead = 1
+    const h = makePort({ cancellable: [mergedLinkRef()], items: storedD })
+    const result = await sweep(h.port)
+    assert.equal(fake.orders.get(SURVIVOR)!.status, 9, 'the survivor was NOT cancelled')
+    assert.equal(fake.requests.some((r) => r.path.endsWith('/Cancel')), false)
+    assert.equal(result.operatorNotices, 1)
+    assert.match(String(h.writes.find((w) => typeof w.data.lastError === 'string')!.data.lastError), /another line appeared/)
+    assert.equal(h.writes.some((w) => w.data.state === 'CANCELLED'), false)
+  })
+})
+
+test('AN UNFLAGGED "+" NUMBER IS AN ORDINARY ORDER: it is cancelled normally, not treated as a merged survivor', async () => {
+  await withEnv(OFF, async () => {
+    resetFake()
+    fake.orders.set(SURVIVOR, { status: 9, number: 'A+B', items: [...D_LINES], merged: false })
+    const h = makePort({ cancellable: [absorbingLinkRef()], items: storedD })
+    const result = await sweep(h.port)
+    assert.equal(fake.orders.get(SURVIVOR)!.status, 3)
+    assert.deepEqual(deletedIds(), [])
+    assert.equal(result.cancelled, 1)
+    assert.equal(h.writes.some((w) => w.data.state === 'MERGED'), false)
   })
 })

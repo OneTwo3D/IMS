@@ -182,15 +182,18 @@ test('[o3d-bjc.6] a clean create binds the minted id with exactly one request to
   reset()
   const { pushMintsoftOrder } = await push()
   createResult = [{ Success: true, OrderId: 700, OrderNumber: 'WC-1001' }]
+  details.set('700', { ID: 700, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', OrderStatusId: 1, ClientId: CLIENT })
+  itemRows = [{ ID: 21, SKU: 'SKU-1', Quantity: 1 }]
 
   const result = await pushMintsoftOrder(INPUT)
   assert.equal(result.externalOrderId, '700')
+  assert.deepEqual(result.items, [{ externalItemId: '21', sku: 'SKU-1', quantity: 1 }])
   // No read-back FOR BINDING (o3d-bjc.8): the create already happened, so a verification failure
   // would leave only bad options — bind unverified, or throw and let the sweep re-PUT
   // and duplicate a real warehouse order. Ownership is re-proven on every mutation.
   // The one extra request is a best-effort read of the order's LINES (their ids are recorded for a later
   // merged-order removal); it decides nothing and its failure never fails the push.
-  assert.deepEqual(calls, ['/api/Order', '/api/Order/700/Items?ClientId=5'])
+  assert.deepEqual(calls, ['/api/Order', '/api/Order/700?ClientId=5', '/api/Order/700/Items?ClientId=5'])
 })
 
 test('[o3d-bjc.6] even a minted id cannot be MUTATED without proving ownership', async () => {
@@ -320,8 +323,9 @@ test('[o3d-bjc.6] an owned NEW order amends its items and posts the update — t
   ]
 
   const result = await updateMintsoftOrder('900', INPUT)
-  // The amendment re-reads the lines so the recorded warehouse line ids stay current (best effort).
-  assert.deepEqual(result, { updated: true, status: 'NEW', items: [{ externalItemId: '11', sku: 'SKU-1', quantity: 5 }, { externalItemId: '12', sku: 'SKU-GONE', quantity: 2 }] })
+  // The amendment re-reads the lines to keep the recorded ids current, but records them only when they are exactly what IMS sent;
+  // this fixture's static lines are not, so nothing is recorded.
+  assert.deepEqual(result, { updated: true, status: 'NEW' })
   // The ownership gate is the FIRST call, before any mutation.
   assert.ok(calls[0].startsWith('/api/Order/900?'), `gate ran first (was ${calls[0]})`)
   assert.ok(writes.length > 0, 'item + order writes happened')
