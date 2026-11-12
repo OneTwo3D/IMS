@@ -823,6 +823,8 @@ export async function resolveWcInvoiceTaxTypes(params: {
   reverseChargeSalesTaxType: string | null | undefined
   shippingForeign: number
   currency: string
+  /** The rate ids the lines are PERSISTED with, after a tax re-key's redirect (`lineData[].taxRateId`): the posted type and the recorded rate id come from THESE, as the invoice build always read them. Absent: the resolution's own ids, which `currentTaxRates` follows to the same replacement. */
+  lineRateIds?: ReadonlyArray<string | null | undefined>
 }): Promise<WcInvoiceTaxTypes> {
   const { wcOrder, mappedLines, resolution } = params
   const { wcResolvedById, orderDefaultTaxRateId, taxRateValue, accountingTaxType, lineTaxResolved, lineSources } = resolution
@@ -833,17 +835,19 @@ export async function resolveWcInvoiceTaxTypes(params: {
     orderDefault: { accountingTaxType, taxRateValue, taxRateId: orderDefaultTaxRateId },
     currency: params.currency,
   })
-  const ratesNow = await currentTaxRates(db, [...lineTaxResolved.map((r) => r.taxRateId), shippingTax.taxRateId, orderDefaultTaxRateId])
+  const lineIds = mappedLines.map((_, idx) => params.lineRateIds?.[idx] ?? lineTaxResolved[idx]?.taxRateId)
+  const ratesNow = await currentTaxRates(db, [...lineIds, shippingTax.taxRateId, orderDefaultTaxRateId])
   const lines = mappedLines.map((l, idx) => {
     const resolved = lineTaxResolved[idx]
-    const rateNow = resolved?.taxRateId ? ratesNow.get(resolved.taxRateId) : undefined
+    const rateNow = lineIds[idx] ? ratesNow.get(lineIds[idx]!) : undefined
     const type = resolveWcLineAccountingTaxType({
       forceNoTax: l.isFeeLine === true ? l.forceNoTax : undefined,
       baseTaxType: rateNow?.accountingTaxType ?? resolved?.accountingTaxType ?? accountingTaxType,
       reverseCharge: rateNow?.reverseCharge ?? resolved?.reverseCharge,
       reverseChargeSalesTaxType: params.reverseChargeSalesTaxType,
     })
-    return { rateId: resolved?.taxRateId ?? null, source: lineSources[idx]!, type: type ?? null }
+    // The rate the line stands on NOW (a re-key's replacement, not the id the resolution made before the redirect).
+    return { rateId: rateNow?.id ?? lineIds[idx] ?? null, source: lineSources[idx]!, type: type ?? null }
   })
   const shippingRateNow = shippingTax.taxRateId ? ratesNow.get(shippingTax.taxRateId) : undefined
   const shippingType = shippingRateNow ? (shippingRateNow.accountingTaxType ?? undefined) : (shippingTax.taxType ?? accountingTaxType ?? undefined)
@@ -3890,8 +3894,14 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       const ratesNow = await currentTaxRates(db, [...lineData.map((l) => l.taxRateId), shippingTax.taxRateId, orderDefaultTaxRateId])
       // Every line's and the shipping's posted tax type come from the ONE function the check before a held invoice's release also calls (resolveWcInvoiceTaxTypes), so what is compared there is what is sent here.
       const invoiceTaxTypes = await resolveWcInvoiceTaxTypes({
-        wcOrder, mappedLines, resolution: taxResolution, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, shippingForeign, currency,
+        wcOrder, mappedLines, resolution: taxResolution, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, shippingForeign, currency, lineRateIds: lineData.map((l) => l.taxRateId),
       })
+      const invoiceCore = buildWcInvoiceCore({
+            wcOrder, mappedLines, lineRateIds: lineData.map((l) => l.taxRateId), ratesNow, invoiceTaxTypes, shippingRateId: shippingTax.taxRateId, orderDefaultTaxRateId, settings,
+            amounts: { lineAmountsIncludeTax, shippingAmount, orderLevelDiscountAmount }, documentTotalsToTheOrder, hasStoreCredit, unreconciledReason,
+      })
+      // The key order the importer has always built (the core's payment legs and stamp sit AFTER the posting mode, method and date, around the receipt's own keys).
+      const { _registerPayment, _paymentAmount, [UNRECONCILED_TAX_PAYLOAD_KEY]: unreconciledStamp, ...invoiceCoreBody } = invoiceCore
       const accountingPayload: Record<string, unknown> = {
           contactName: customerName,
           contactEmail: payloadAnonymised ? undefined : (wcOrder.billing.email || undefined),
@@ -3901,18 +3911,18 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           // imported WC orders — keeping WC, IMS, and Xero numerically aligned.
           currencyRateToBase: usableStoredFxRate(fxRate)?.toNumber(),
           reference: orderNumber,
-          ...buildWcInvoiceCore({
-            wcOrder, mappedLines, lineRateIds: lineData.map((l) => l.taxRateId), ratesNow, invoiceTaxTypes, shippingRateId: shippingTax.taxRateId, orderDefaultTaxRateId, settings,
-            amounts: { lineAmountsIncludeTax, shippingAmount, orderLevelDiscountAmount }, documentTotalsToTheOrder, hasStoreCredit, unreconciledReason,
-          }),
+          ...invoiceCoreBody,
           _postingMode: 'submitted',
           _paymentMethod: wcOrder.payment_method || undefined,
           _paymentDate: wcOrder.date_paid_gmt || undefined,
+          _registerPayment,
           // o3d-q0x56.19: the rate of THIS payment (the payment date's, or the order's on the same day). Never inferred from currencyRateToBase.
           ...(importedReceiptSettlementRate !== null ? { _paymentSettlementRateToBase: Math.round(importedReceiptSettlementRate * 1e8) / 1e8 } : {}),
           // The local receipt this payment is (see the Payment row written with the order). Present only
           // where there is one; the poster carries it onto the INVOICE_PAYMENT as its identity.
           ...(importedReceiptRef.id ? { _paymentId: importedReceiptRef.id } : {}),
+          _paymentAmount,
+          ...(unreconciledStamp === undefined ? {} : { [UNRECONCILED_TAX_PAYLOAD_KEY]: unreconciledStamp }),
       }
 
       // THE EU IOSS / VOEC / DDP TREATMENT (lib/domain/accounting/eu-vat-treatment.ts), applied to the finished payload BEFORE it is queued or parked for a missing invoice number, so a
