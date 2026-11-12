@@ -14,6 +14,16 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 - **Added: the setting `eu_vat_gift_card_flag_cut_in` (default unset).** The storefront plugin writes `_o3d_is_voucher` (yes/no) on every order line. With the setting set to a date or an ISO instant, an order created at or after it whose goods lines do not ALL carry a readable flag is refused by the EU VAT regime resolver (`gift_card_flag_missing`), in both modes and for any destination; an unreadable setting refuses every order (`gift_card_cut_in_unreadable`). Unset, or an order before the cut-in, behaves as before. Nothing is inferred from coupon titles or product flags. No schema change; the resolver is not yet called by a posting path, so no document changes. See help-docs/xero-sync.md, "EU VAT regime".
 
+## 3.1.0 - 2026-11-12
+
+No operator action is required: there is no configuration change, and the two migrations are additive and nullable. Behaviour changes to know about before relying on the screens:
+
+- An in-app dispatch of a Draft, On Hold or Pending payment order is now refused. A warehouse despatch of an On Hold or Pending payment order that already has a shipment is recorded without promoting the order (administrators get a notice); a warehouse despatch of a Draft order, or of a held order with no shipment, is held as a stuck despatch on Sync > Exceptions.
+- Financial reports (revenue, AR Aging, Customer Aging, Currency Summary, Sales Analytics) now count archived orders and use one invoiced-revenue basis, so figures for a past period can differ from what was shown before.
+- A refund entered by hand is now strictly bounded by what the order line and the customer paid, and the refund dialog sends the credit-note figure it shows.
+- A despatch from the warehouse for an order cancelled or fully refunded in IMS is not applied; it shows as a stuck despatch for a person to decide.
+- A report that hits its row limit now says so instead of showing zeros.
+
 ### Dispatch completion: orders always follow the dispatch, and services no longer hold an order open
 
 - **Fixed: dispatching the last shipment of an On Hold, Processing, Draft or Pending payment order no longer fails after the goods have left.** The order promotion used to run in a second transaction after the dispatch had committed and threw because those statuses have no direct step to Shipped; the operator saw a failure for a dispatch that had happened, the activity rows, storefront push, invoice trigger, despatch email and stock sync were skipped, and every retry failed the same way. The promotion now runs inside the dispatch transaction: the stock decrement, FIFO/COGS and the order flip commit together or roll back together. An order still in Processing is moved to Shipped through Allocated, and an "Order shipped from a non-fulfilment status" warning is logged.

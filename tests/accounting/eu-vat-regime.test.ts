@@ -27,6 +27,7 @@ function order(over: Partial<EuVatRegimeInput> = {}): EuVatRegimeInput {
     orderTax: '19.00', vatExempt: 'no', vatRecord: { state: 'absent' }, eas: { state: 'absent' },
     thresholdFx: { state: 'ok', rate: '1', sameCurrency: true, asOf: '2026-11-01T00:00:00.000Z', source: 'same currency' },
     accounts: { ioss: '821', ddp: '232' }, pluginVatAccount: null, overThresholdDutyFee: false,
+    giftCardFlag: 'off',
     ...over,
   }
 }

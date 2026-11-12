@@ -147,10 +147,10 @@ export type EuVatRegimeInput = {
   /** The account the storefront plugin recorded on the order (`_o3d_ioss_vat_account`), when it handled the order. Only cross-checked here. */
   pluginVatAccount: string | null
   /**
-   * The gift-card flag cut-in (`eu_vat_gift_card_flag_cut_in`), already compared with the order's creation date by the caller. `off` (the default, and absent): today's lenient reading. `required`: the order was created
+   * REQUIRED, so every builder must decide it. The gift-card flag cut-in (`eu_vat_gift_card_flag_cut_in`), already compared with the order's creation date by the caller. `off` (the default, and absent): today's lenient reading. `required`: the order was created
    * at or after the cut-in, so EVERY line must carry the flag. `setting_unreadable`: the cut-in is set to something that is not a date (or the order date cannot be read), so nothing can be decided.
    */
-  giftCardFlag?: 'off' | 'required' | 'setting_unreadable'
+  giftCardFlag: 'off' | 'required' | 'setting_unreadable'
   /** The customs label's evidence: a non-zero over-threshold duty fee line (`_wclc_fee_kind` duty_fee) is on the order. */
   overThresholdDutyFee: boolean
 }

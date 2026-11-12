@@ -323,6 +323,30 @@ test('gift-card flag: every _o3d_is_voucher entry is read; conflicting or mixed 
   assert.deepEqual(lines.map((l) => [l.voucher, l.voucherStrict]), [['unknown', 'unknown'], ['unknown', 'unknown'], ['yes', 'yes'], ['unknown', 'unknown']])
 })
 
+test('stamping: an unflagged order after the cut-in is refused and NOTHING is stamped; a flagged one stamps', async () => {
+  const { stampEuVatRegime } = await import('@/lib/domain/accounting/eu-vat-regime-stamp')
+  const writes: unknown[] = []
+  const fakeTx = {
+    $queryRaw: async () => [],
+    salesOrder: {
+      findUnique: async () => ({ euVatRegime: null, euVatLineAccount: null, euVatRegimeStampedAt: null }),
+      updateMany: async (args: unknown) => { writes.push(args); return { count: 1 } },
+    },
+  } as never
+  const client = fakeClient({ mappings: [mappingRow(216, {})] })
+  const afterCutIn = async () => ({ state: 'ok' as const, at: new Date('2026-10-01T00:00:00Z') })
+  const build = (order: WcFullOrder) => () => buildEuVatRegimeInputFromSettings(client, order, { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide' }, afterCutIn)
+  const unflagged = wcOrder({ line_items: [{ id: 1, total: '100.00', meta_data: [] }] as never })
+  const refused = await stampEuVatRegime(fakeTx, 'o1', build(unflagged), new Date('2026-11-01T10:00:00Z'))
+  assert.equal(refused.kind, 'refused')
+  assert.equal(refused.kind === 'refused' && refused.code, 'gift_card_flag_missing')
+  assert.equal(writes.length, 0, 'nothing is written for a refusal')
+  const flagged = wcOrder({ line_items: [{ id: 1, total: '100.00', meta_data: [meta('_o3d_is_voucher', 'no')] }] as never })
+  const ok = await stampEuVatRegime(fakeTx, 'o1', build(flagged), new Date('2026-11-01T10:00:00Z'))
+  assert.equal(ok.kind, 'stamped')
+  assert.equal(writes.length, 1)
+})
+
 // ---- unreadable figures are named, never defaulted to 0 -------------------------------------------------------------------------------------------------------------
 test('well-formed figures report nothing unreadable', () => {
   assert.deepEqual(readWcEuVatFacts(wcOrder()).unreadable, [])

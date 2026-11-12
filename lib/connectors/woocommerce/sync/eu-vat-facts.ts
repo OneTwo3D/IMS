@@ -25,7 +25,7 @@ import { parseWcGmtInstant } from './receipt-settlement-rate'
 import type { WcFullOrder, WcMeta } from './types'
 
 /** What the pure half reads; everything the database adds is separate. */
-export type WcEuVatFacts = Omit<EuVatRegimeInput, 'rates' | 'thresholdFx' | 'accounts' | 'mode'> & {
+export type WcEuVatFacts = Omit<EuVatRegimeInput, 'rates' | 'thresholdFx' | 'accounts' | 'mode' | 'giftCardFlag'> & {
   /** WooCommerce rate ids that carry a non-zero tax amount, with the tax summed over items, shipping and fees, in the order currency. */
   rateTax: Array<{ wooRateId: number; tax: string }>
 }
