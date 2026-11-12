@@ -14,7 +14,7 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 No operator action is required: there is no configuration change, and the two migrations are additive and nullable. Behaviour changes to know about before relying on the screens:
 
-- An in-app dispatch of a Draft, On Hold or Pending payment order is now refused, and a warehouse despatch of such an order is recorded without promoting it (administrators get a notice).
+- An in-app dispatch of a Draft, On Hold or Pending payment order is now refused. A warehouse despatch of an On Hold or Pending payment order that already has a shipment is recorded without promoting the order (administrators get a notice); a warehouse despatch of a Draft order, or of a held order with no shipment, is held as a stuck despatch on Sync > Exceptions.
 - Financial reports (revenue, AR Aging, Customer Aging, Currency Summary, Sales Analytics) now count archived orders and use one invoiced-revenue basis, so figures for a past period can differ from what was shown before.
 - A refund entered by hand is now strictly bounded by what the order line and the customer paid, and the refund dialog sends the credit-note figure it shows.
 - A despatch from the warehouse for an order cancelled or fully refunded in IMS is not applied; it shows as a stuck despatch for a person to decide.
