@@ -732,3 +732,34 @@ test('REAL DISPATCH DEPS: the re-point is a compare-and-set on a LIVE link on th
   assert.equal(row.state, 'MERGED')
   assert.equal(row.externalOrderId, 'surv-1')
 })
+
+test('MUTATION PASS (real PG): a stale owner cannot release another owner\'s lease; the removal\'s lease alone makes the ids read as none; a marked or empty record is UNTRUSTED for the removal', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `mut${randomUUID().slice(0, 8)}`
+  const s = await seed(d, tag)
+  t.after(() => cleanup(d, s))
+  const link = await d.db.wmsOrderPushLink.create({ data: { orderId: s.orderId, connector: 'mintsoft', state: 'MERGED', externalOrderId: 'surv-m', externalOrderNumber: 'MS-E+MS-M', pushedAt: new Date() } })
+  const port = d.sweep.createPrismaWmsOrderPushPort()
+  const ids = [{ externalItemId: '1', sku: 'A', quantity: 1 }]
+
+  // An EMPTY record is untrusted for the removal (no lease taken).
+  assert.equal((await port.claimLineIdsForRemoval!(link.id)).kind, 'UNTRUSTED')
+  assert.equal((await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })).amendLeaseOwner, null)
+
+  await createSnapshot(port, s.orderId, ids)
+  // The removal's lease ALONE (no mark): the ids read as none while it is live.
+  const claim = await port.claimLineIdsForRemoval!(link.id)
+  assert.equal(claim.kind, 'CLAIMED')
+  if (claim.kind !== 'CLAIMED') return
+  assert.deepEqual(await port.readOrderItems!(link.id), [], 'a live lease alone makes the ids untrusted')
+  // A stale or foreign release does not release it.
+  await port.releaseAmendLease!(link.id, 'not-the-owner')
+  assert.equal((await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })).amendLeaseOwner, claim.token)
+  await port.releaseAmendLease!(link.id, claim.token)
+  assert.equal((await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })).amendLeaseOwner, null)
+  assert.deepEqual(await port.readOrderItems!(link.id), ids)
+
+  // A MARKED record (no lease) is untrusted for the removal.
+  await d.db.wmsOrderPushLink.update({ where: { id: link.id }, data: { lineSnapshotUnsafeAt: new Date() } })
+  assert.equal((await port.claimLineIdsForRemoval!(link.id)).kind, 'UNTRUSTED')
+})

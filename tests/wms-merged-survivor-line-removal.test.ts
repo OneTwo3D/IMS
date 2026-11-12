@@ -61,6 +61,8 @@ const fake = {
   omitNumber: false,
   /** The order detail is flagged merged from this many detail reads on (a merge done in the warehouse mid-amendment). */
   mergeFromDetailRead: null as number | null,
+  /** The order detail answers 404 from this many detail reads on (the order vanished). */
+  vanishFromDetailRead: null as number | null,
   detailReads: 0,
   /** The first header POST is refused for its courier (the legacy fallback would follow); optionally the order is merged right after it. */
   rejectFirstHeaderPost: false,
@@ -84,6 +86,7 @@ function resetFake() {
   fake.putFlagOnly = false
   fake.omitNumber = false
   fake.mergeFromDetailRead = null
+  fake.vanishFromDetailRead = null
   fake.detailReads = 0
   fake.rejectFirstHeaderPost = false
   fake.mergeAfterFirstHeaderPost = false
@@ -175,6 +178,7 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
       }
       if (detailMatch && method === 'GET') {
         fake.detailReads += 1
+        if (fake.vanishFromDetailRead !== null && fake.detailReads >= fake.vanishFromDetailRead) return { data: null, error: 'Mintsoft request failed with status 404', status: 404 }
         if (fake.mergeFromDetailRead !== null && fake.detailReads >= fake.mergeFromDetailRead) { const o = fake.orders.get(detailMatch[1]); if (o) o.merged = true }
         if (fake.detailFails) return { data: null, error: 'Mintsoft request failed with status 500', status: 500 }
         const order = fake.orders.get(detailMatch[1])
@@ -1468,5 +1472,57 @@ test('LINEAGE: a genuine merge (every recorded id present with its SKU and quant
     await sweep(h.port)
     assert.ok(h.writes.some((w) => w.data.state === 'MERGED' && w.data.externalOrderId === SURVIVOR))
     assert.deepEqual(survivorItems(), E_LINES)
+  })
+})
+
+// ---------------------------------------------------------------- 23. mutation pass: survivors that matter -----------------------
+
+test('MUTATION PASS: the order VANISHES between the early read and the order POST: NOT_FOUND is returned and no POST is sent', async () => {
+  await withEnv(OFF, async () => {
+    resetFake()
+    fake.orders.set('4242', { status: 1, number: 'WC-1001', items: [{ ID: 7001, SKU: 'SKU-1', Quantity: 1 }, { ID: 7002, SKU: 'SKU-1', Quantity: 3 }], merged: false })
+    fake.vanishFromDetailRead = 2
+    const { updateMintsoftOrder } = await import('../lib/connectors/mintsoft/api/order-push.ts')
+    const result = await updateMintsoftOrder('4242', INPUT)
+    assert.deepEqual(result, { updated: false, status: 'NOT_FOUND' })
+    assert.deepEqual(writeRequests(), [])
+  })
+})
+
+test('MUTATION PASS: the create read-back with the same SKUs but a DIFFERENT QUANTITY is not recorded', async () => {
+  await withEnv(OFF, async () => {
+    resetFake()
+    const { pushMintsoftOrder } = await import('../lib/connectors/mintsoft/api/order-push.ts')
+    // The fake create holds SKU-1 x1 and SKU-1 x3; IMS sent SKU-1 x1 and SKU-1 x2.
+    const quiet = console.warn
+    console.warn = () => {}
+    const pushed = await pushMintsoftOrder({ ...INPUT, lines: [INPUT.lines[0], { ...INPUT.lines[1], quantity: 2 }] }).finally(() => { console.warn = quiet })
+    assert.equal(pushed.items, undefined)
+  })
+})
+
+test('MUTATION PASS (lineage): a candidate that holds a recorded line id but with a different SKU or quantity is NOT proven', async () => {
+  const { proveMergeLineage } = await import('../lib/domain/wms/merge-lineage.ts')
+  const stored = [{ externalItemId: '1', sku: 'A', quantity: 2 }]
+  const holds = (items: WmsOrderItemRef[]) => ({ fetchOrderItemRefs: async () => items })
+  assert.equal((await proveMergeLineage(holds([{ externalItemId: '1', sku: 'A', quantity: 2 }]), 'S', stored)).proven, true)
+  assert.equal((await proveMergeLineage(holds([{ externalItemId: '1', sku: 'B', quantity: 2 }]), 'S', stored)).proven, false, 'different SKU')
+  assert.equal((await proveMergeLineage(holds([{ externalItemId: '1', sku: 'A', quantity: 3 }]), 'S', stored)).proven, false, 'different quantity')
+  assert.equal((await proveMergeLineage(holds([]), 'S', stored)).proven, false, 'absent id')
+})
+
+test('MUTATION PASS: the mismatch notice is a compare-and-set on the link still being SYNCED: a link a cancel already moved on is not written to', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    fake.orders.get(SURVIVOR)!.merged = false
+    fake.orders.get(SURVIVOR)!.number = 'IMSTEST-E+IMSTEST-D'
+    const { h } = snapshotPort(storedE)
+    h.link.state = 'CANCELLED' as never // the cancel pass got there first
+    h.link.externalOrderId = SURVIVOR
+    h.port.updatableLinks = async () => [{ ...updatableLink(), externalOrderId: SURVIVOR }] as never
+    const orderPush = await import('../lib/connectors/mintsoft/api/order-push.ts')
+    await sweep(h.port, { updateOrder: async (id: string, input: never) => orderPush.updateMintsoftOrder(id, input) })
+    assert.equal(h.writes.some((w) => w.data.amendNoticeAt instanceof Date), false)
+    assert.equal(h.link.state, 'CANCELLED')
   })
 })
