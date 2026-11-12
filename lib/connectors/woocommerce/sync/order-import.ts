@@ -59,7 +59,7 @@ import { rateBinding, resolveSalesLineTaxType } from '@/lib/accounting/reverse-c
 import { previewTreatedSalesInvoice, treatImportedSalesInvoice } from './eu-vat-invoice-treatment'
 import { heldFreshBuildDifference, heldInvoiceDifference, heldTaxBindingDifference, heldUntreatedTaxDifference, type ExpectedHeldInvoice } from './held-invoice-verification'
 import { currentWcTaxBinding, recordWcTaxBinding } from './wc-tax-binding'
-import { buildEuVatRegimeInputFromSettings, readEuVatRegimeMode } from './eu-vat-facts'
+import { buildEuVatRegimeInputFromSettings, readEuVatRegimeMode, readGiftCardFlagCutIn } from './eu-vat-facts'
 import { resolveEuVatRegime } from '@/lib/domain/accounting/eu-vat-regime'
 import { readEuVatRegimeStamp } from '@/lib/domain/accounting/eu-vat-regime-stamp'
 import { EU_VAT_TREATMENT_PAYLOAD_KEY, routeFor } from '@/lib/domain/accounting/eu-vat-treatment'
@@ -1827,6 +1827,39 @@ async function noteHeldReleaseFailure(rowId: string, message: string): Promise<v
 
 /** Re-checks a treated hold against the order INSIDE the release's own order-locked transaction, immediately before it enqueues; the hold it returns is the one that is released. */
 type HeldRecheck = (tx: Prisma.TransactionClient) => Promise<{ ok: true; held: HeldSalesInvoicePayload } | { ok: false; reason: string }>
+/**
+ * THE REGIME POLICY A TREATED HOLD WAS PARKED UNDER: every setting `buildEuVatRegimeInputFromSettings` and the treatment read to decide the regime (the regime mode, the gift-card flag cut-in, the IOSS and DDP accounts), recorded on the hold's treatment marker.
+ * The scheduled sweep has no WooCommerce order and cannot re-verify, so it fails closed: it releases a treated hold only if the policy now in force equals the recorded one, otherwise the hold stays PENDING and a re-import (which re-verifies against the order) decides.
+ */
+async function currentRegimePolicy(): Promise<Record<string, string>> {
+  const { getAccountingSettings } = await import('@/lib/accounting')
+  const [mode, cutIn, settings] = await Promise.all([
+    readEuVatRegimeMode().catch(() => null),
+    readGiftCardFlagCutIn().catch(() => ({ state: 'invalid' as const, raw: 'setting could not be read' })),
+    getAccountingSettings(),
+  ])
+  return {
+    mode: mode ?? 'unreadable',
+    cutIn: cutIn.state === 'ok' ? cutIn.at.toISOString() : cutIn.state === 'unset' ? 'unset' : `invalid:${cutIn.raw}`,
+    ioss: String(settings.euVatIossAccount ?? ''),
+    ddp: String(settings.euVatDdpAccount ?? ''),
+  }
+}
+async function withRegimePolicy(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const marker = payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as Record<string, unknown> | null | undefined
+  if (marker?.applied !== true) return payload
+  return { ...payload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { ...marker, regimePolicy: await currentRegimePolicy() } }
+}
+/** Null when the policy in force equals the one the hold was parked under; otherwise the reason the sweep must not release it. */
+async function regimePolicyChange(payload: Record<string, unknown>): Promise<string | null> {
+  const recorded = (payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { regimePolicy?: unknown } | null | undefined)?.regimePolicy
+  if (typeof recorded !== 'object' || recorded === null) return 'it was parked before the regime settings it was decided under were recorded'
+  const now = await currentRegimePolicy()
+  const was = recorded as Record<string, unknown>
+  const differing = Object.keys(now).filter((key) => was[key] !== now[key])
+  return differing.length === 0 ? null : `the EU VAT regime settings changed since it was parked (${differing.join(', ')})`
+}
+
 class HeldRecheckRefusal extends Error {
   /** `mark`: the order changed (mark the hold order_changed); otherwise the hold is already marked, gone or replaced and is left as it is. */
   constructor(readonly reason: string, readonly mark: boolean) { super(reason) }
@@ -2234,9 +2267,9 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   })
   if (outcome.kind === 'refused') return await refuse(`the EU IOSS/VOEC/DDP treatment refused it: ${outcome.reason}. Fix that, then re-import the order from WooCommerce to try again`)
   if (outcome.kind === 'skipped') return await refuse(`the EU IOSS/VOEC/DDP treatment was skipped (${outcome.why}) on a hold that needs it`)
-  const treated = outcome.payload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
+  const treated = await withRegimePolicy(outcome.payload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
     ? outcome.payload
-    : { ...outcome.payload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? ''), taxBinding: recordWcTaxBinding(outcome.taxBinding) } }
+    : { ...outcome.payload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? ''), taxBinding: recordWcTaxBinding(outcome.taxBinding) } })
   const written = await db.$transaction(async (tx) => {
     await lockSalesOrder(tx, orderId)
     const current = await tx.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
@@ -2362,6 +2395,15 @@ async function releaseHeldWcSalesInvoice(
     )
     return 'not-queued'
   }
+  // THE SWEEP FAILS CLOSED ON A REGIME-POLICY CHANGE: it has no WooCommerce order to re-verify with, so a treated hold is released only under the regime settings (mode, gift-card cut-in, IOSS/DDP accounts) it was parked under. A re-import (which passes `recheck`) verifies against the order instead.
+  if (!options?.recheck && heldChartConnector !== null && (held.accountingPayload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown } | null | undefined)?.applied === true
+    && (await (await import('@/lib/accounting')).isAccountingSyncTypeEnabledFor(heldChartConnector, 'SALES_INVOICE'))) {
+    const change = await regimePolicyChange(held.accountingPayload)
+    if (change !== null) {
+      await noteHeldReleaseFailure(row.id, `WooCommerce numbered this invoice ${invoiceNumber}, but ${change}, so the sweep did not release it. NOTHING was queued. Re-import the order from WooCommerce: the re-import checks the held invoice against the order under the current settings and releases it if it still holds.`)
+      return 'not-queued'
+    }
+  }
   // o3d-j625 r3 (Codex HIGH 1 family): the outcome is CAPTURED, not because the row re-read below is
   // insufficient — it is the stronger check and it stays — but because the re-read cannot say WHY there
   // is no row, and the message written when there is none asserted the wrong reason ("the connector is
@@ -2397,6 +2439,10 @@ async function releaseHeldWcSalesInvoice(
       if (nowMarker?.reason === 'order_changed') throw new HeldRecheckRefusal('the order changed after the invoice was held', false)
       if (nowMarker?.applied !== true && heldChartConnector !== null && (await isAccountingSyncTypeEnabledFor(heldChartConnector, 'SALES_INVOICE'))) {
         throw new HeldRecheckRefusal('the held invoice was parked without the EU IOSS/VOEC/DDP treatment', false)
+      }
+      if (!options?.recheck && nowMarker?.applied === true && heldChartConnector !== null && (await isAccountingSyncTypeEnabledFor(heldChartConnector, 'SALES_INVOICE'))) {
+        const change = await regimePolicyChange(heldNow.accountingPayload)
+        if (change !== null) throw new HeldRecheckRefusal(`${change}`, false)
       }
       // A re-import's treated hold is verified AGAIN here against the order, on top of the above: the order's facts re-resolved under this same lock, and what is released is the hold as re-read.
       if (options?.recheck) {
@@ -3976,13 +4022,13 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           // an absent marker is an untreated hold, which the release and the re-import already treat as such.
           // A treatment REFUSAL parks the ORIGINAL payload marked applied:false with the refusal's reason, never applied:true: it is an untreated hold, so the sweep never releases it, and a later fixed re-import verifies it against the order, retries the
           // treatment and releases only when that succeeds (a cause not fixed leaves it PENDING with the reason).
-          accountingPayload: euVatOutcome.kind === 'refused'
+          accountingPayload: await withRegimePolicy(euVatOutcome.kind === 'refused'
             ? { ...accountingPayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'treatment_refused', refusal: euVatOutcome.reason } }
             : euVatOutcome.kind === 'skipped'
             ? (euVatOutcome.why === 'store_credit' ? { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'store_credit' } } : invoicePayload)
             : invoicePayload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
               ? invoicePayload
-              : { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? ''), taxBinding: euVatOutcome.kind === 'treated' ? recordWcTaxBinding(euVatOutcome.taxBinding) : null } },
+              : { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? ''), taxBinding: euVatOutcome.kind === 'treated' ? recordWcTaxBinding(euVatOutcome.taxBinding) : null } }),
           // o3d-j625: the same chart read that produced every account code in `accountingPayload`,
           // parked alongside them — the release can be days later and must not re-resolve it.
           chartConnector: settings.connector,

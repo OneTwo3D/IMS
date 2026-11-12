@@ -1337,3 +1337,43 @@ test('[eu vat] the cut-in passes between parking and release: the treated hold i
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /gift-card flag/)
 })
+
+// THE SWEEP FAILS CLOSED when the regime settings changed since a treated hold was parked (it has no order to re-verify with).
+async function sweepAfterSettingChange(t: test.TestContext, change: ((setCutIn: (v: string | null) => Promise<void>) => Promise<void>) | null) {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = true
+  const { importWcOrder, retryHeldWcSalesInvoiceReleases } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seed(db, wcRateId)
+  const setCutIn = async (value: string | null) => {
+    if (value === null) await db.setting.deleteMany({ where: { key: 'eu_vat_gift_card_flag_cut_in' } })
+    else await db.setting.upsert({ where: { key: 'eu_vat_gift_card_flag_cut_in' }, create: { key: 'eu_vat_gift_card_flag_cut_in', value }, update: { value } })
+  }
+  t.after(async () => { switchOn = false; await setCutIn(null); await cleanup(db, externalId, ctx) })
+  assert.equal((await importWcOrder(payload(externalId, wcRateId, PLUGIN('821')) as never)).success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  const marker = (held.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment as Record<string, unknown>
+  assert.equal(marker.applied, true)
+  assert.deepEqual(marker.regimePolicy, { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232' }, 'the policy the hold was decided under is recorded')
+  if (change) await change(setCutIn)
+  await db.salesOrder.update({ where: { id: orderId }, data: { invoiceNumber: `INV-${externalId}` } })
+  await retryHeldWcSalesInvoiceReleases()
+  return { after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }), rows: await db.accountingSyncLog.count({ where: { type: 'SALES_INVOICE', referenceId: orderId } }) }
+}
+
+test('[eu vat] CONTROL: the sweep releases a treated hold when the regime settings are unchanged', { skip }, async (t) => {
+  const { after, rows } = await sweepAfterSettingChange(t, null)
+  assert.equal(rows, 1)
+  assert.equal(after.status, 'SYNCED')
+})
+
+test('[eu vat] the gift-card cut-in changes between parking and the SWEEP: nothing is queued and the hold stays PENDING with the reason', { skip }, async (t) => {
+  const { after, rows } = await sweepAfterSettingChange(t, async (setCutIn) => { await setCutIn('2026-12-01') })
+  assert.equal(rows, 0, 'nothing was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /the EU VAT regime settings changed since it was parked \(cutIn\).*NOTHING was queued.*Re-import the order/)
+})

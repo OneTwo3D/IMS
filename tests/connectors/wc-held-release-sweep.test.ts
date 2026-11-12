@@ -66,7 +66,7 @@ function heldRow(overrides: Partial<HeldRow> & { id: string; entityId: string })
       salesOrderId: overrides.entityId,
       orderNumber: 'WC-164981',
       metaKey: '_wcpdf_invoice_number',
-      accountingPayload: { contactName: 'A Customer', date: '2026-08-01', currency: 'GBP', lines: [], _euVatTreatment: { applied: true, route: 'none' } },
+      accountingPayload: { contactName: 'A Customer', date: '2026-08-01', currency: 'GBP', lines: [], _euVatTreatment: { applied: true, route: 'none', regimePolicy: { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232' } } },
       // o3d-j625: whose chart the frozen account codes are. Present on every hold this build parks, and
       // the release REFUSES a hold that cannot name one (o3d-j625 r2) — see the legacy-hold test below.
       chartConnector: 'xero',
@@ -170,8 +170,18 @@ mock.module('@/lib/activity-log', {
   },
 })
 const queueDouble = async (params: { referenceId: string; idempotencyKey: string; payload: Record<string, unknown> }) => queueAccountingSyncDouble(params)
+// The regime settings the sweep compares a treated hold's recorded policy with (unchanged here; the changed case is in the concurrency tier).
+mock.module('@/lib/connectors/woocommerce/sync/eu-vat-facts', {
+  namedExports: {
+    buildEuVatRegimeInputFromSettings: async () => { throw new Error('the sweep does not build a regime input') },
+    readEuVatRegimeMode: async () => 'adopt_plugin',
+    readGiftCardFlagCutIn: async () => ({ state: 'unset' }),
+  },
+})
 mock.module('@/lib/accounting', {
   namedExports: {
+    isAccountingSyncTypeEnabledFor: async () => true,
+    getAccountingSettings: async () => ({ euVatIossAccount: '821', euVatDdpAccount: '232' }),
     // The release enqueues inside its order-locked transaction, through the in-transaction variant; the double is the same.
     queueAccountingSyncTxWithOutcome: async (_tx: unknown, params: { referenceId: string; idempotencyKey: string; payload: Record<string, unknown> }) => queueDouble(params),
     queueAccountingSync: async (params: { referenceId: string; idempotencyKey: string; payload: Record<string, unknown> }) => queueAccountingSyncDouble(params),
