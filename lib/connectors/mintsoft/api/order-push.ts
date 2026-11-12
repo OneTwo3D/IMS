@@ -907,6 +907,18 @@ async function reconcileMintsoftOrderItems(externalOrderId: string, input: WmsOr
   }
 }
 
+/**
+ * THE GATE CALL BEFORE EVERY HEADER WRITE of an amendment: read the order and verify its identity, answering the refusal outcome (null
+ * when the order is verified OK). It is called immediately before EACH header POST, the first and every courier fallback, so no retry is
+ * sent to an order whose identity has not just been verified. (The source test pins that every write to an existing order is directly
+ * preceded by this call or by the identity read of fetchMintsoftOrderStatusId.)
+ */
+async function identityRefusalBeforeWrite(externalOrderId: string, clientId: number, expectedOrderNumber: string): Promise<WmsOrderUpdateResult | null> {
+  const read = await fetchMintsoftOrderStatusId(externalOrderId, clientId, expectedOrderNumber)
+  if (!read.found) return { updated: false, status: 'NOT_FOUND' }
+  return amendmentIdentityRefusal(read.identity, read.orderNumber)
+}
+
 /** The amendment's refusal for an identity other than OK (one mapping, used by the first check and the re-check before the item writes). */
 function amendmentIdentityRefusal(identity: WarehouseOrderIdentity, orderNumber: string | null): WmsOrderUpdateResult | null {
   if (identity === 'MERGED') return { updated: false, status: 'MERGED_SURVIVOR', ...(orderNumber ? { mergedSurvivorNumber: orderNumber } : {}) }
@@ -949,7 +961,14 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
       : 'Mintsoft order amendment not sent: the order has no courier service name and no default CourierServiceId is configured; refusing to amend without a courier')
   }
 
-  const post = async (body: Record<string, unknown>) => {
+  /** The result of one gated header POST: the refusal (nothing was sent) or the decoded answer. */
+  type GatedPost = { refusal: WmsOrderUpdateResult } | { refusal: null; data: RawOrder | null }
+  const post = async (body: Record<string, unknown>): Promise<GatedPost> => {
+    // THE GATE, immediately before this POST (the first and every courier fallback). ACCEPTED INTER-SYSTEM LIMIT: IMS verifies the warehouse
+    // order's identity immediately before each write phase (header POST, item changes, cancel/hold, removal); a merge performed in Mintsoft
+    // within the single request round-trip between a verification and its write cannot be detected.
+    const refusal = await identityRefusalBeforeWrite(externalOrderId, clientId, input.orderNumber)
+    if (refusal) return { refusal }
     const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -957,27 +976,23 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
     })
     if (result.error) throw new Error(result.error)
     const raw = result.data
-    return Array.isArray(raw) ? ((raw[0] as RawOrder) ?? null) : (extractMintsoftObjectPayload(raw) as RawOrder | null)
+    return { refusal: null, data: Array.isArray(raw) ? ((raw[0] as RawOrder) ?? null) : (extractMintsoftObjectPayload(raw) as RawOrder | null) }
   }
   const courierFormName = input.courierService
   let form: 'NAME' | 'LEGACY' | 'PLACEHOLDER' = input.courierPlaceholder || firstCourier.kind === 'defaultId' ? 'PLACEHOLDER' : 'NAME'
-  // THE GATING READ FOR THE HEADER WRITE: the identity is verified immediately before the order POST (settings, the courier choice and the
-  // body are all prepared first; nothing else is awaited between this read and the POST). The earlier read above only decides
-  // NOT_FOUND / NOT_NEW and the first refusal. IMS verifies the warehouse order's identity immediately before EACH write phase (header POST,
-  // item changes, cancel/hold, removal). ACCEPTED INTER-SYSTEM LIMIT: a merge performed in Mintsoft within the single request round-trip
-  // between a verification and its write cannot be detected by IMS.
-  const firstBody = buildPushPayload(input, firstCourier, false)
-  const preWrite = await fetchMintsoftOrderStatusId(externalOrderId, clientId, input.orderNumber)
-  if (!preWrite.found) return { updated: false, status: 'NOT_FOUND' }
-  const preWriteRefusal = amendmentIdentityRefusal(preWrite.identity, preWrite.orderNumber)
-  if (preWriteRefusal) return preWriteRefusal
-  let data = await post(firstBody)
+  // Each header POST below is preceded by its own identity read (see `post`). The earlier read above only decides NOT_FOUND / NOT_NEW and
+  // the first refusal.
+  const firstPost = await post(buildPushPayload(input, firstCourier, false))
+  if (firstPost.refusal) return firstPost.refusal
+  let data = firstPost.data
   // The same rule as the create (one shared helper). An order the create already moved to the legacy form arrives with no
   // key left, so there is nothing further to retry.
   const retry = data?.Success === false ? legacyCourierRetry(input, courierMap, data, toStr(data.Message)) : null
   if (retry) {
     form = 'LEGACY'
-    data = await post(buildPushPayload(retry.input, retry.courier, false))
+    const legacyPost = await post(buildPushPayload(retry.input, retry.courier, false))
+    if (legacyPost.refusal) return legacyPost.refusal
+    data = legacyPost.data
   }
   // A link that does not know its order's courier form selects like a fresh create, so after the key (and its one legacy
   // retry) a definitive courier rejection falls to the configured default id, exactly as the create does.
@@ -986,7 +1001,9 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
     && data?.Success === false && /courierservice/i.test(toStr(data.Message) ?? '')
   ) {
     form = 'PLACEHOLDER'
-    data = await post(buildPushPayload(input, { kind: 'defaultId', courierServiceId: defaultId }, false))
+    const defaultPost = await post(buildPushPayload(input, { kind: 'defaultId', courierServiceId: defaultId }, false))
+    if (defaultPost.refusal) return defaultPost.refusal
+    data = defaultPost.data
   }
   // A decoded Success: true on EVERY post of the chain, as the create requires: an answer that carries an OrderId but says
   // Success: false (or does not say Success: true) is a failure, not an amendment.
@@ -1007,9 +1024,7 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
     // Mintsoft since the first read would make the item diff delete the other order's lines. Only OK proceeds; anything else is the same
     // refusal as above with NO item write. ACCEPTED INTER-SYSTEM LIMIT: a merge performed in Mintsoft within the single request round-trip between
     // this verification and the item writes cannot be detected by IMS (see the header write above).
-    const recheck = await fetchMintsoftOrderStatusId(externalOrderId, clientId, input.orderNumber)
-    if (!recheck.found) return { updated: false, status: 'NOT_FOUND' }
-    const lateRefusal = amendmentIdentityRefusal(recheck.identity, recheck.orderNumber)
+    const lateRefusal = await identityRefusalBeforeWrite(externalOrderId, clientId, input.orderNumber)
     if (lateRefusal) return lateRefusal
     try {
       await reconcileMintsoftOrderItems(externalOrderId, input, clientId)

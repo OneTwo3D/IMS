@@ -62,6 +62,10 @@ const fake = {
   /** The order detail is flagged merged from this many detail reads on (a merge done in the warehouse mid-amendment). */
   mergeFromDetailRead: null as number | null,
   detailReads: 0,
+  /** The first header POST is refused for its courier (the legacy fallback would follow); optionally the order is merged right after it. */
+  rejectFirstHeaderPost: false,
+  mergeAfterFirstHeaderPost: false,
+  headerPosts: 0,
 }
 function resetFake() {
   fake.orders = new Map()
@@ -81,6 +85,9 @@ function resetFake() {
   fake.omitNumber = false
   fake.mergeFromDetailRead = null
   fake.detailReads = 0
+  fake.rejectFirstHeaderPost = false
+  fake.mergeAfterFirstHeaderPost = false
+  fake.headerPosts = 0
 }
 const D_LINES: FakeLine[] = [{ ID: 3603106, SKU: '243632999', Quantity: 2 }, { ID: 3603107, SKU: '923663020', Quantity: 1 }]
 const E_LINES: FakeLine[] = [{ ID: 3603108, SKU: '243632999', Quantity: 1 }, { ID: 3603109, SKU: '849293203', Quantity: 1 }]
@@ -158,7 +165,14 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
         return { data: { Success: true }, status: 200 }
       }
       const detailMatch = pathname.match(/^\/api\/Order\/([^/]+)$/)
-      if (detailMatch && method === 'POST') return { data: { ID: 0, Success: true, Message: 'ok' }, status: 200 }
+      if (detailMatch && method === 'POST') {
+        fake.headerPosts += 1
+        if (fake.rejectFirstHeaderPost && fake.headerPosts === 1) {
+          if (fake.mergeAfterFirstHeaderPost) { const o = fake.orders.get(detailMatch[1]); if (o) o.merged = true }
+          return { data: { ID: 0, Success: false, Message: 'Unable to Find CourierService' }, status: 200 }
+        }
+        return { data: { ID: 0, Success: true, Message: 'ok' }, status: 200 }
+      }
       if (detailMatch && method === 'GET') {
         fake.detailReads += 1
         if (fake.mergeFromDetailRead !== null && fake.detailReads >= fake.mergeFromDetailRead) { const o = fake.orders.get(detailMatch[1]); if (o) o.merged = true }
@@ -1262,43 +1276,75 @@ test('CANCEL with a verified identity (an unflagged order that carries exactly t
   })
 })
 
-test('SOURCE CENSUS: every write to an EXISTING Mintsoft order goes through the identity gate (one gate, no bypass)', async () => {
+test('SOURCE CENSUS (structural): EVERY write call site on an existing Mintsoft order is directly preceded by the identity gate, with no other request between them', async () => {
   const { readFileSync } = await import('node:fs')
   const ts = (await import('typescript')).default
   const source = readFileSync(new URL('../lib/connectors/mintsoft/api/order-push.ts', import.meta.url), 'utf8')
   const sf = ts.createSourceFile('order-push.ts', source, ts.ScriptTarget.Latest, true)
-  const writers = new Map<string, { calls: string[]; text: string }>()
-  const visitTop = (node: tsTypes.Node) => {
-    if (ts.isFunctionDeclaration(node) && node.name && node.body) {
-      const calls: string[] = []
-      const text = node.getText(sf)
-      const walk = (n: tsTypes.Node) => {
-        if (ts.isCallExpression(n) && ts.isIdentifier(n.expression)) calls.push(n.expression.text)
-        ts.forEachChild(n, walk)
-      }
-      walk(node.body)
-      writers.set(node.name.text, { calls, text })
+
+  const isFn = (n: tsTypes.Node): n is tsTypes.FunctionDeclaration | tsTypes.ArrowFunction | tsTypes.FunctionExpression =>
+    ts.isFunctionDeclaration(n) || ts.isArrowFunction(n) || ts.isFunctionExpression(n)
+  const nameOf = (n: tsTypes.Node): string | null => {
+    if (ts.isFunctionDeclaration(n)) return n.name?.text ?? null
+    const parent = n.parent
+    return parent && ts.isVariableDeclaration(parent) && ts.isIdentifier(parent.name) ? parent.name.text : null
+  }
+  type Call = { name: string; pos: number; text: string }
+  /** The identifier-callee calls of a function in source order, NOT descending into nested functions (a closure is its own unit). */
+  const callsOf = (fn: tsTypes.Node): Call[] => {
+    const out: Call[] = []
+    const walk = (n: tsTypes.Node) => {
+      if (isFn(n) && n !== fn) return
+      if (ts.isCallExpression(n) && ts.isIdentifier(n.expression)) out.push({ name: n.expression.text, pos: n.getStart(sf), text: n.getText(sf) })
+      ts.forEachChild(n, walk)
+    }
+    ts.forEachChild(fn, walk)
+    return out.sort((x, y) => x.pos - y.pos)
+  }
+  const fns: Array<{ name: string; node: tsTypes.Node; calls: Call[] }> = []
+  const collect = (n: tsTypes.Node) => {
+    if (isFn(n)) { const name = nameOf(n); if (name) fns.push({ name, node: n, calls: callsOf(n) }) }
+    ts.forEachChild(n, collect)
+  }
+  collect(sf)
+
+  const GATES = new Set(['fetchMintsoftOrderStatusId', 'identityRefusalBeforeWrite'])
+  const READS = new Set(['fetchMintsoftOrderItemsStrict'])
+  const NETWORK = new Set(['mintsoftRequest', 'fetchMintsoftOrderStatusId', 'fetchMintsoftOrderItemsStrict', 'fetchMintsoftOrderItems', 'identityRefusalBeforeWrite', 'reconcileMintsoftOrderItems', 'post'])
+  const isWrite = (c: Call) => c.name === 'mintsoftRequest' && (/method: '(POST|PUT|DELETE)'/.test(c.text) || /\/Cancel`/.test(c.text))
+  // The create is not a write to an EXISTING order; the comment is the one documented exemption (additive note, and the merged-order
+  // notices go to a survivor whose number is by definition not IMS's); the item helper is checked through its only caller below.
+  const EXEMPT = new Set(['createOrder', 'addMintsoftOrderComment', 'reconcileMintsoftOrderItems'])
+
+  const gated: string[] = []
+  for (const fn of fns) {
+    const network = fn.calls.filter((c) => NETWORK.has(c.name))
+    for (const [i, call] of network.entries()) {
+      if (!isWrite(call) || EXEMPT.has(fn.name)) continue
+      gated.push(fn.name)
+      // Walk back over read-only item fetches to the nearest other request: it must be the gate.
+      let j = i - 1
+      while (j >= 0 && READS.has(network[j].name)) j -= 1
+      assert.ok(j >= 0 && GATES.has(network[j].name), `${fn.name}: the write at offset ${call.pos} is not directly preceded by the identity gate (found ${j >= 0 ? network[j].name : 'nothing'})`)
     }
   }
-  sf.forEachChild(visitTop)
-  // A function that sends a non-GET request or /Cancel to an order.
-  const sendsWrite = (text: string) => /method: '(POST|PUT|DELETE)'/.test(text) || /\/Cancel`/.test(text)
-  const writing = [...writers].filter(([, f]) => f.calls.includes('mintsoftRequest') && sendsWrite(f.text)).map(([name]) => name).sort()
-  // The create is not a write to an EXISTING order; the comment is the one deliberate, documented exemption (additive note, and the
-  // merged-order notices are posted to a survivor whose number is by definition not IMS's); the item helper runs only under updateMintsoftOrder.
-  const exempt = new Set(['createOrder', 'addMintsoftOrderComment'])
-  const gated = writing.filter((name) => !exempt.has(name))
-  assert.deepEqual(gated, ['cancelMintsoftOrder', 'reconcileMintsoftOrderItems', 'removeMintsoftOrderItems', 'updateMintsoftOrder'], 'a NEW write path to an existing order must be added here AND call the gate')
-  for (const name of ['cancelMintsoftOrder', 'removeMintsoftOrderItems', 'updateMintsoftOrder']) {
-    assert.ok(writers.get(name)!.calls.includes('fetchMintsoftOrderStatusId'), `${name} reads the order through the gate`)
-    assert.match(writers.get(name)!.text, /identity/, `${name} acts on the gate's answer`)
-  }
-  assert.ok(writers.get('fetchMintsoftOrderStatusId')!.calls.includes('verifyWarehouseOrderIdentity'), 'the read calls THE gate')
-  // The item helper is reachable only from the amendment, which has passed the gate.
-  const callers = [...writers].filter(([, f]) => f.calls.includes('reconcileMintsoftOrderItems')).map(([name]) => name)
-  assert.deepEqual(callers, ['updateMintsoftOrder'])
-  // The comment is the only caller that passes no expected number, and it says why.
-  assert.match(writers.get('addMintsoftOrderComment')!.text, /NOT identity-gated, on purpose/)
+  assert.deepEqual([...new Set(gated)].sort(), ['cancelMintsoftOrder', 'post', 'removeMintsoftOrderItems'], 'a NEW write path to an existing order must appear here AND be gated')
+
+  // The header POSTs are the closure `post`: updateMintsoftOrder itself sends no write, and the gate inside `post` is the identity read.
+  const update = fns.find((f) => f.name === 'updateMintsoftOrder')!
+  assert.equal(update.calls.some(isWrite), false, 'updateMintsoftOrder sends no write itself')
+  // Every call of `post` and of the item helper in the amendment is inside a gated unit; the item helper's caller must have the gate
+  // directly before it.
+  const updateNetwork = update.calls.filter((c) => NETWORK.has(c.name))
+  const items = updateNetwork.findIndex((c) => c.name === 'reconcileMintsoftOrderItems')
+  assert.ok(items > 0 && updateNetwork[items - 1].name === 'identityRefusalBeforeWrite', 'the item reconcile is directly preceded by the identity gate')
+  const callersOfItems = fns.filter((f) => f.calls.some((c) => c.name === 'reconcileMintsoftOrderItems')).map((f) => f.name)
+  assert.deepEqual(callersOfItems, ['updateMintsoftOrder'])
+  // The gate helper itself reads through THE identity gate.
+  assert.ok(fns.find((f) => f.name === 'fetchMintsoftOrderStatusId')!.calls.some((c) => c.name === 'verifyWarehouseOrderIdentity'))
+  assert.ok(fns.find((f) => f.name === 'identityRefusalBeforeWrite')!.calls.some((c) => c.name === 'fetchMintsoftOrderStatusId'))
+  // The comment is the one deliberate exemption, and says why.
+  assert.match(source.slice(source.indexOf('export async function addMintsoftOrderComment')), /NOT identity-gated, on purpose/)
 })
 
 // ---------------------------------------------------------------- 19. review round 14 -----------------------------------------------
@@ -1355,5 +1401,40 @@ test('AMEND: the gating read is the one adjacent to the POST (no request between
     const post = seq.indexOf('POST /api/Order/4242')
     assert.ok(post > 0)
     assert.equal(seq[post - 1], 'GET /api/Order/4242', 'the request immediately before the header POST is the identity read')
+  })
+})
+
+// ---------------------------------------------------------------- 21. review round 16 -----------------------------------------------
+
+test('AMEND, the courier is rejected and the order is MERGED before the fallback: the fallback header POST is NOT sent (each POST has its own identity read) and the refusal is returned', async () => {
+  await withEnv(OFF, async () => {
+    resetFake()
+    fake.orders.set('4242', { status: 1, number: 'WC-1001', items: [{ ID: 7001, SKU: 'SKU-1', Quantity: 1 }, { ID: 7002, SKU: 'SKU-1', Quantity: 3 }, { ID: 7101, SKU: 'OTHER-ORDER', Quantity: 2 }], merged: false })
+    fake.rejectFirstHeaderPost = true
+    fake.mergeAfterFirstHeaderPost = true
+    const { updateMintsoftOrder } = await import('../lib/connectors/mintsoft/api/order-push.ts')
+    const result = await updateMintsoftOrder('4242', { ...INPUT, courierServiceLegacy: '1:DPD Next Day' })
+    assert.equal(result.updated, false)
+    assert.equal(result.status, 'MERGED_SURVIVOR')
+    assert.equal(fake.headerPosts, 1, 'only the first header POST was sent; no fallback POST')
+    assert.equal(fake.requests.some((r) => r.path.includes('/Items') && r.method !== 'GET'), false)
+  })
+})
+
+test('AMEND CONTROL: the courier is rejected, the order is still verified, and the legacy fallback POST IS sent (a second identity read precedes it)', async () => {
+  await withEnv(OFF, async () => {
+    resetFake()
+    fake.orders.set('4242', { status: 1, number: 'WC-1001', items: [{ ID: 7001, SKU: 'SKU-1', Quantity: 1 }, { ID: 7002, SKU: 'SKU-1', Quantity: 3 }], merged: false })
+    fake.rejectFirstHeaderPost = true
+    const { updateMintsoftOrder } = await import('../lib/connectors/mintsoft/api/order-push.ts')
+    const result = await updateMintsoftOrder('4242', { ...INPUT, courierServiceLegacy: '1:DPD Next Day' })
+    assert.equal(result.updated, true)
+    assert.equal(fake.headerPosts, 2)
+    const seq = fake.requests.map((r) => `${r.method} ${r.path}`)
+    let posts = 0
+    for (let i = 0; i < seq.length; i += 1) {
+      if (seq[i] === 'POST /api/Order/4242') { posts += 1; assert.equal(seq[i - 1], 'GET /api/Order/4242', `header POST #${posts} is directly preceded by an identity read`) }
+    }
+    assert.equal(posts, 2)
   })
 })
