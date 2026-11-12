@@ -907,6 +907,14 @@ async function reconcileMintsoftOrderItems(externalOrderId: string, input: WmsOr
   }
 }
 
+/** The amendment's refusal for an identity other than OK (one mapping, used by the first check and the re-check before the item writes). */
+function amendmentIdentityRefusal(identity: WarehouseOrderIdentity, orderNumber: string | null): WmsOrderUpdateResult | null {
+  if (identity === 'MERGED') return { updated: false, status: 'MERGED_SURVIVOR', ...(orderNumber ? { mergedSurvivorNumber: orderNumber } : {}) }
+  if (identity === 'MISMATCH') return { updated: false, status: 'ORDER_NUMBER_MISMATCH', ...(orderNumber ? { observedOrderNumber: orderNumber } : {}) }
+  if (identity === 'UNVERIFIABLE') return { updated: false, status: 'ORDER_UNVERIFIABLE' }
+  return null
+}
+
 export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult> {
   const clientId = await getPushClientId('Mintsoft order update')
   const { found, isNew, orderNumber, identity } = await fetchMintsoftOrderStatusId(externalOrderId, clientId, input.orderNumber)
@@ -916,11 +924,8 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
   // order's, so the link is handed to the merged paths. MISMATCH / UNVERIFIABLE (not flagged, but the number is not the one IMS pushed, or
   // is missing: a merge whose flag is missing, a rename, an incomplete detail): the same safety, but it proves nothing about a merge, so
   // the link is NOT moved to MERGED; the caller raises a durable notice and leaves the amendment due. Only OK amends.
-  if (identity === 'MERGED') {
-    return { updated: false, status: 'MERGED_SURVIVOR', ...(orderNumber ? { mergedSurvivorNumber: orderNumber } : {}) }
-  }
-  if (identity === 'MISMATCH') return { updated: false, status: 'ORDER_NUMBER_MISMATCH', ...(orderNumber ? { observedOrderNumber: orderNumber } : {}) }
-  if (identity === 'UNVERIFIABLE') return { updated: false, status: 'ORDER_UNVERIFIABLE' }
+  const refusal = amendmentIdentityRefusal(identity, orderNumber)
+  if (refusal) return refusal
   if (!isNew) return { updated: false, status: 'NOT_NEW' }
 
   const settings = await getMintsoftSettings()
@@ -988,6 +993,14 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
     // is the part of an amendment that can be refused (and retried), and deciding it first means a courier failure never
     // leaves the items half-amended. If the items then fail, the courier is already changed on the WMS order, so the error
     // carries what the accepted post did (see WmsOrderUpdatePartialError) and the order stays due for the items to be redone.
+    // RE-CHECK THE IDENTITY immediately before the items are planned (after the order post and the courier retries): a merge done in
+    // Mintsoft since the first read would make the item diff delete the other order's lines. Only OK proceeds; anything else is the same
+    // refusal as above with NO item write. ACCEPTED LIMIT: a merge performed in Mintsoft between THIS read and the item writes (about one
+    // request round-trip) cannot be detected by IMS; it is not re-checked before every single item write.
+    const recheck = await fetchMintsoftOrderStatusId(externalOrderId, clientId, input.orderNumber)
+    if (!recheck.found) return { updated: false, status: 'NOT_FOUND' }
+    const lateRefusal = amendmentIdentityRefusal(recheck.identity, recheck.orderNumber)
+    if (lateRefusal) return lateRefusal
     try {
       await reconcileMintsoftOrderItems(externalOrderId, input, clientId)
     } catch (error) {

@@ -59,6 +59,9 @@ const fake = {
   putFlagOnly: false,
   /** The order detail carries no OrderNumber at all. */
   omitNumber: false,
+  /** The order detail is flagged merged from this many detail reads on (a merge done in the warehouse mid-amendment). */
+  mergeFromDetailRead: null as number | null,
+  detailReads: 0,
 }
 function resetFake() {
   fake.orders = new Map()
@@ -76,6 +79,8 @@ function resetFake() {
   fake.putExtraLine = false
   fake.putFlagOnly = false
   fake.omitNumber = false
+  fake.mergeFromDetailRead = null
+  fake.detailReads = 0
 }
 const D_LINES: FakeLine[] = [{ ID: 3603106, SKU: '243632999', Quantity: 2 }, { ID: 3603107, SKU: '923663020', Quantity: 1 }]
 const E_LINES: FakeLine[] = [{ ID: 3603108, SKU: '243632999', Quantity: 1 }, { ID: 3603109, SKU: '849293203', Quantity: 1 }]
@@ -120,6 +125,7 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
       if (itemMatch) {
         const order = fake.orders.get(itemMatch[1])
         if (!order) return { data: null, error: 'Mintsoft request failed with status 404', status: 404 }
+        if (method === 'POST' || method === 'PUT') return { data: { ID: 0, Success: true, Message: 'ok' }, status: 200 }
         if (method === 'DELETE') {
           const itemId = Number(itemMatch[2])
           if (fake.failDeleteOf.has(itemId)) return { data: { ID: 0, Success: false, Message: 'OrderItem could not be removed' }, status: 200 }
@@ -152,7 +158,10 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
         return { data: { Success: true }, status: 200 }
       }
       const detailMatch = pathname.match(/^\/api\/Order\/([^/]+)$/)
+      if (detailMatch && method === 'POST') return { data: { ID: 0, Success: true, Message: 'ok' }, status: 200 }
       if (detailMatch && method === 'GET') {
+        fake.detailReads += 1
+        if (fake.mergeFromDetailRead !== null && fake.detailReads >= fake.mergeFromDetailRead) { const o = fake.orders.get(detailMatch[1]); if (o) o.merged = true }
         if (fake.detailFails) return { data: null, error: 'Mintsoft request failed with status 500', status: 500 }
         const order = fake.orders.get(detailMatch[1])
         if (!order) return { data: null, error: 'Mintsoft request failed with status 404', status: 404 }
@@ -1290,4 +1299,32 @@ test('SOURCE CENSUS: every write to an EXISTING Mintsoft order goes through the 
   assert.deepEqual(callers, ['updateMintsoftOrder'])
   // The comment is the only caller that passes no expected number, and it says why.
   assert.match(writers.get('addMintsoftOrderComment')!.text, /NOT identity-gated, on purpose/)
+})
+
+// ---------------------------------------------------------------- 19. review round 14 -----------------------------------------------
+
+test('AMEND, a merge done in the warehouse AFTER the order post: the identity is re-checked before the items are planned, so there are NO item writes and the refusal is returned', async () => {
+  await withEnv(OFF, async () => {
+    resetFake()
+    fake.orders.set('4242', { status: 1, number: 'WC-1001', items: [{ ID: 7001, SKU: 'SKU-1', Quantity: 1 }, { ID: 7002, SKU: 'SKU-1', Quantity: 3 }, { ID: 7101, SKU: 'OTHER-ORDER', Quantity: 2 }], merged: false })
+    fake.mergeFromDetailRead = 2 // the first read (the gate) is clean; the re-check sees the flag
+    const { updateMintsoftOrder } = await import('../lib/connectors/mintsoft/api/order-push.ts')
+    const result = await updateMintsoftOrder('4242', INPUT)
+    assert.equal(result.updated, false)
+    assert.equal(result.status, 'MERGED_SURVIVOR')
+    assert.ok(fake.requests.some((r) => r.method === 'POST' && r.path === '/api/Order/4242'), 'the order post happened before the re-check')
+    assert.equal(fake.requests.some((r) => r.path.includes('/Items') && r.method !== 'GET'), false, 'NO item write')
+    assert.equal(fake.orders.get('4242')!.items.length, 3, 'the other order\'s line is untouched')
+  })
+})
+
+test('AMEND CONTROL: with no merge the re-check passes and the item reconcile runs', async () => {
+  await withEnv(OFF, async () => {
+    resetFake()
+    fake.orders.set('4242', { status: 1, number: 'WC-1001', items: [{ ID: 7001, SKU: 'SKU-1', Quantity: 1 }, { ID: 7002, SKU: 'SKU-1', Quantity: 3 }], merged: false })
+    const { updateMintsoftOrder } = await import('../lib/connectors/mintsoft/api/order-push.ts')
+    const result = await updateMintsoftOrder('4242', INPUT)
+    assert.equal(result.updated, true)
+    assert.ok(fake.requests.some((r) => r.path.includes('/Items') && r.method !== 'GET'), 'the duplicate lines were consolidated')
+  })
 })
