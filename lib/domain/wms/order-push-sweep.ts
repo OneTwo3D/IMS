@@ -1039,11 +1039,14 @@ export interface WmsOrderPushPort {
   replaceOrderItems?(orderId: string, externalOrderId: string, items: WmsOrderItemRef[], token?: string): Promise<void>
   /**
    * `unsafe` true: take the link's AMENDMENT LEASE by compare-and-set (free, expired or already ours) and mark its recorded line ids
-   * untrustworthy under a NEW generation token, which is returned; null when another owner's lease is live (the caller skips the link).
-   * `unsafe` false: clear the mark and the lease ONLY while the link still holds `token` (a stale owner's call is a no-op).
+   * untrustworthy under a NEW generation token. Returns the token and `wasUnsafe` (whether the mark was ALREADY set before this
+   * acquisition, e.g. by an interrupted earlier amendment); null when another owner's lease is live (the caller skips the link).
+   * `unsafe` false: clear the mark and the lease ONLY while the link still holds `token` (a stale owner's call is a no-op). The caller
+   * must not clear a mark that was already set (`wasUnsafe`): that is cleared only by a verified replacement snapshot or by deleting the
+   * stored ids.
    * While marked or leased, readOrderItems answers none.
    */
-  setLineIdsUnsafe?(linkId: string, unsafe: boolean, token?: string): Promise<string | null>
+  setLineIdsUnsafe?(linkId: string, unsafe: boolean, token?: string): Promise<{ token: string; wasUnsafe: boolean } | null>
   /** Release the lease held under `token` WITHOUT clearing the mark (an amendment that failed: the ids stay untrusted). */
   releaseAmendLease?(linkId: string, token: string): Promise<void>
   /** Forget these recorded line ids (lines IMS removed from a merged order). */
@@ -2986,9 +2989,15 @@ export async function runWmsOrderPushSweepCore(
         const acquired = await port.setLineIdsUnsafe?.(link.id, true)
         // Another sweep holds this link's amendment lease: the link stays due and is neither amended, stamped nor noticed here.
         if (acquired === null) continue
-        lineToken = acquired
+        lineToken = acquired?.token
+        const markWasAlreadySet = acquired?.wasUnsafe === true
         update = await connector.updateOrder(link.externalOrderId, input, amendSeam.clearance)
-        if (!update.updated) await port.setLineIdsUnsafe?.(link.id, false, lineToken).catch(() => {}) // nothing was written: the ids still describe the order
+        // Nothing was written by THIS attempt. The mark is cleared only if this acquisition set it; a mark that was already set (an earlier
+        // amendment was interrupted after changing lines but before its snapshot) stays until a verified replacement or a deletion of the ids.
+        if (!update.updated && lineToken) {
+          if (markWasAlreadySet) await port.releaseAmendLease?.(link.id, lineToken).catch(() => {})
+          else await port.setLineIdsUnsafe?.(link.id, false, lineToken).catch(() => {})
+        }
         // The warehouse order is a MERGED order (the absorbing order keeps the survivor's id, so this link can still name it as a plain
         // order): nothing was written. The link is re-pointed as MERGED so no later pass amends it, and the change is left for a person.
         if (update.status === 'MERGED_SURVIVOR') {
@@ -3800,17 +3809,25 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       if (unsafe) {
         const fresh = randomUUID()
         const now = new Date()
+        const current = await db.wmsOrderPushLink.findUnique({ where: { id: linkId }, select: { lineSnapshotUnsafeAt: true } })
+        if (!current) return null
+        const wasUnsafe = current.lineSnapshotUnsafeAt !== null
+        // The compare-and-set includes the mark as read, so `wasUnsafe` is what the row held at the instant the lease was won.
         const won = await db.wmsOrderPushLink.updateMany({
-          where: { id: linkId, OR: [{ amendLeaseExpiresAt: null }, { amendLeaseExpiresAt: { lt: now } }] },
-          data: { lineSnapshotUnsafeAt: now, lineSnapshotToken: fresh, amendLeaseOwner: fresh, amendLeaseExpiresAt: new Date(now.getTime() + AMEND_LEASE_TTL_MS) },
+          where: {
+            id: linkId,
+            OR: [{ amendLeaseExpiresAt: null }, { amendLeaseExpiresAt: { lt: now } }],
+            lineSnapshotUnsafeAt: wasUnsafe ? current.lineSnapshotUnsafeAt : null,
+          },
+          data: { lineSnapshotUnsafeAt: wasUnsafe ? current.lineSnapshotUnsafeAt : now, lineSnapshotToken: fresh, amendLeaseOwner: fresh, amendLeaseExpiresAt: new Date(now.getTime() + AMEND_LEASE_TTL_MS) },
         })
-        return won.count === 1 ? fresh : null
+        return won.count === 1 ? { token: fresh, wasUnsafe } : null
       }
       await db.wmsOrderPushLink.updateMany({
         where: { id: linkId, lineSnapshotToken: token ?? '' },
         data: { lineSnapshotUnsafeAt: null, lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null },
       })
-      return token ?? ''
+      return { token: token ?? '', wasUnsafe: false }
     },
     async releaseAmendLease(linkId, token) {
       await db.wmsOrderPushLink.updateMany({ where: { id: linkId, amendLeaseOwner: token }, data: { amendLeaseOwner: null, amendLeaseExpiresAt: null } })

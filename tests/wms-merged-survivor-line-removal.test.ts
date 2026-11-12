@@ -754,14 +754,15 @@ const updatableLink = () => ({
 })
 
 /** A port whose recorded line ids live in a small in-memory store, so the amend pass and the later cancel see the same snapshot. */
-function snapshotPort(initial: WmsOrderItemRef[]) {
-  const store = { items: [...initial], unsafe: false, marks: [] as boolean[], tokens: [] as string[] }
+function snapshotPort(initial: WmsOrderItemRef[], initialUnsafe = false) {
+  const store = { items: [...initial], unsafe: initialUnsafe, marks: [] as boolean[], tokens: [] as string[] }
   const h = makePort({ cancellable: [], items: null })
   h.port.updatableLinks = async () => [updatableLink()] as never
   // Like the real port: a link whose ids are marked untrustworthy has no usable record.
   h.port.readOrderItems = async () => (store.unsafe ? [] : [...store.items])
   h.port.replaceOrderItems = async (_orderId, _ext, items, token) => { store.tokens.push(`replace:${token}`); store.items = [...items]; store.unsafe = false }
-  h.port.setLineIdsUnsafe = async (_id, unsafe, token) => { store.marks.push(unsafe); store.unsafe = unsafe; store.tokens.push(token ?? 'new'); return 'tok-1' }
+  h.port.setLineIdsUnsafe = async (_id, unsafe, token) => { const was = store.unsafe; store.marks.push(unsafe); store.unsafe = unsafe; store.tokens.push(token ?? 'new'); return { token: 'tok-1', wasUnsafe: unsafe ? was : false } }
+  h.port.releaseAmendLease = async (_id, token) => { store.tokens.push(`release:${token}`) }
   return { h, store }
 }
 
@@ -1008,5 +1009,40 @@ test('LEASE: a failed amendment releases the lease but leaves the ids untrusted 
     await sweep(h.port, { updateOrder: async () => { throw new Error('mintsoft down') } })
     assert.deepEqual(released, ['tok-1'])
     assert.equal(store.unsafe, true)
+  })
+})
+
+// ---------------------------------------------------------------- 15. review round 8 -----------------------------------------------
+
+for (const [label, answer] of [['NOT_NEW', { updated: false, status: 'NOT_NEW' }], ['MERGED_SURVIVOR', { updated: false, status: 'MERGED_SURVIVOR' }]] as const) {
+  test(`INTERRUPTED AMENDMENT (a line was added, no snapshot replace, the mark left set): a retry that answers ${label} and writes nothing does NOT clear the mark; the merged cancel removes nothing and raises a notice`, async () => {
+    await withEnv(OFF, async () => {
+      seedMerged()
+      const { h, store } = snapshotPort(storedD, true)
+      await sweep(h.port, { updateOrder: async () => answer })
+      assert.equal(store.unsafe, true, 'the pre-existing mark is still set')
+      assert.deepEqual(store.marks, [true], 'it was never cleared by the no-op')
+      assert.ok(store.tokens.includes('release:tok-1'), 'the lease is released')
+      assert.deepEqual(await h.port.readOrderItems!('link-d'), [], 'no trusted ids')
+      h.port.updatableLinks = async () => []
+      h.port.cancellableLinks = async () => [mergedLinkRef()]
+      h.link.state = 'MERGED'
+      h.link.externalOrderId = SURVIVOR
+      const result = await sweep(h.port)
+      assert.equal(fake.requests.some((r) => r.method === 'DELETE' || r.path.endsWith('/Cancel')), false)
+      assert.equal(result.operatorNotices, 1)
+      assert.equal(h.writes.some((w) => w.data.state === 'CANCELLED'), false)
+      assert.equal(survivorItems().length, 4)
+    })
+  })
+}
+
+test('CONTROL: a no-op retry that itself set the mark (nothing was set before) still clears it', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const { h, store } = snapshotPort(storedD, false)
+    await sweep(h.port, { updateOrder: async () => ({ updated: false, status: 'NOT_NEW' }) })
+    assert.deepEqual(store.marks, [true, false])
+    assert.equal(store.unsafe, false)
   })
 })

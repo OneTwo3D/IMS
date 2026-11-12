@@ -449,9 +449,9 @@ test('REAL PORT, TWO AMENDMENTS OVERLAP: the older one finishing late cannot sto
     const old = [{ externalItemId: '1', sku: 'A', quantity: 1 }]
     await port.replaceOrderItems!(s.orderId, 'o-g', old)
     // A starts and verifies its read-back; B starts after it, changes lines and fails partway.
-    const tokenA = await port.setLineIdsUnsafe!(link.id, true)
+    const tokenA = (await port.setLineIdsUnsafe!(link.id, true))?.token
     await d.db.wmsOrderPushLink.update({ where: { id: link.id }, data: { amendLeaseExpiresAt: new Date(Date.now() - 1000) } }) // A's lease expired (it stalled)
-    const tokenB = await port.setLineIdsUnsafe!(link.id, true)
+    const tokenB = (await port.setLineIdsUnsafe!(link.id, true))?.token
     assert.ok(tokenA && tokenB && tokenA !== tokenB)
     assert.equal(await port.setLineIdsUnsafe!(link.id, true), null, 'a live lease refuses a third owner')
     if (bCleansUp) await port.replaceOrderItems!(s.orderId, "o-g", [], tokenB!) // B's cleanup succeeds: no snapshot
@@ -520,12 +520,32 @@ test('REAL PORT, LEASE: a second sweep cannot amend a link while the first holds
   assert.deepEqual((await port.readOrderItems!(link.id)).map((r) => r.externalItemId), ['2'])
 
   // An EXPIRED lease is taken over: the mark is set again for the new owner, and the old owner's late write is a no-op.
-  const tokenOld = await port.setLineIdsUnsafe!(link.id, true)
+  const tokenOld = (await port.setLineIdsUnsafe!(link.id, true))?.token
   assert.ok(tokenOld)
   await d.db.wmsOrderPushLink.update({ where: { id: link.id }, data: { amendLeaseExpiresAt: new Date(Date.now() - 1000) } })
-  const tokenNew = await port.setLineIdsUnsafe!(link.id, true)
+  const tokenNew = (await port.setLineIdsUnsafe!(link.id, true))?.token
   assert.ok(tokenNew && tokenNew !== tokenOld)
   await port.replaceOrderItems!(s.orderId, 'o-l', old, tokenOld!)
   assert.deepEqual(await port.readOrderItems!(link.id), [], 'the stale owner changed nothing; the new owner\'s mark stands')
   assert.ok((await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })).lineSnapshotUnsafeAt)
+})
+
+test('REAL PORT: a second acquisition reports that the mark was ALREADY set; the first reports it was not', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `was${randomUUID().slice(0, 8)}`
+  const s = await seed(d, tag)
+  t.after(() => cleanup(d, s))
+  const link = await d.db.wmsOrderPushLink.create({ data: { orderId: s.orderId, connector: 'mintsoft', state: 'SYNCED', externalOrderId: 'o-w', pushedAt: new Date() } })
+  const port = d.sweep.createPrismaWmsOrderPushPort()
+  const first = await port.setLineIdsUnsafe!(link.id, true)
+  assert.equal(first!.wasUnsafe, false)
+  // The first amendment is interrupted: its lease expires with the mark still set.
+  await d.db.wmsOrderPushLink.update({ where: { id: link.id }, data: { amendLeaseExpiresAt: new Date(Date.now() - 1000) } })
+  const second = await port.setLineIdsUnsafe!(link.id, true)
+  assert.equal(second!.wasUnsafe, true, 'the earlier mark is reported, so a no-op retry must not clear it')
+  await port.releaseAmendLease!(link.id, second!.token)
+  const row = await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })
+  assert.ok(row.lineSnapshotUnsafeAt, 'releasing the lease leaves the mark set')
+  assert.equal(row.amendLeaseOwner, null)
+  assert.deepEqual(await port.readOrderItems!(link.id), [])
 })
