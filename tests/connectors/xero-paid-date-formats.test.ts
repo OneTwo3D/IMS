@@ -29,6 +29,7 @@ const TENANT = 'tenant-A'
 let connectedTenant: string | null = TENANT
 let pendingClock = 1
 let pendingWriteFails = false
+let purchaseInvoiceReadFails = false
 
 const state = {
   invoices: [] as XeroInvoice[],
@@ -122,6 +123,7 @@ async function withHostClockSkew<T>(skewMs: number, fn: () => Promise<T>): Promi
 function reset(): void {
   pendingRows.length = 0
   pendingWriteFails = false
+  purchaseInvoiceReadFails = false
   connectedTenant = TENANT
   state.invoices = []
   state.salesOrders = []
@@ -446,7 +448,10 @@ const dbDouble: Record<string, unknown> = {
     findMany: async ({ where }: { where: Row }) => state.payments.filter((r) => rowMatches(r, where)),
   },
   purchaseInvoice: {
-    findMany: async ({ where }: { where: Row }) => state.purchaseInvoices.filter((r) => rowMatches(r, where)),
+    findMany: async ({ where }: { where: Row }) => {
+      if (purchaseInvoiceReadFails) throw new Error('connection terminated unexpectedly')
+      return state.purchaseInvoices.filter((r) => rowMatches(r, where))
+    },
     update: async ({ where, data }: { where: { id: unknown }; data: Row }) => {
       state.purchaseInvoiceUpdates.push({ id: where.id, data })
       return {}
@@ -709,4 +714,37 @@ test('with no Xero organisation connected the skipped document cannot be scoped:
   assert.ok(result.errors.some((e) => /no Xero organisation is connected/.test(e)))
   assert.equal(state.settingUpserts.length, 0)
   assert.equal(pendingRows.length, 0)
+})
+
+test('a zone-less ISO date is UTC whatever the host\'s zone (the date parser never reads it in local time)', () => {
+  const was = process.env.TZ
+  try {
+    for (const zone of ['America/New_York', 'Pacific/Auckland', 'UTC']) {
+      process.env.TZ = zone
+      assert.equal(parseXeroDate(ISO_NO_ZONE), Date.UTC(2026, 6, 1), zone)
+      assert.equal(parseXeroDateOrNull('2026-07-01T12:30:00')?.toISOString(), '2026-07-01T12:30:00.000Z', zone)
+    }
+  } finally {
+    if (was === undefined) delete process.env.TZ
+    else process.env.TZ = was
+  }
+})
+
+test('a retry whose apply pass ERRORS forgets nothing: the remembered rows stay for the next poll', async () => {
+  reset()
+  pendingRows.push({ tenantId: TENANT, kind: 'BILL', xeroInvoiceId: 'XB1', firstSeenAt: pendingClock++, lastCheckedAt: null })
+  state.invoices = []
+  state.recheckInvoices = [paidBill(DOT_NET)]
+  state.purchaseInvoices = [UNPAID_BILL()]
+  purchaseInvoiceReadFails = true
+  const result = await poll()
+  assert.ok(result.errors.length > 0, 'the apply pass recorded its failure')
+  assert.deepEqual(pendingRows.map((r) => r.xeroInvoiceId), ['XB1'], 'the row stays')
+  assert.equal(state.purchaseInvoiceUpdates.length, 0)
+  // The next poll, the read works: applied and forgotten.
+  purchaseInvoiceReadFails = false
+  const again = await poll()
+  assert.deepEqual(again.errors, [])
+  assert.equal(again.billsPaid, 1)
+  assert.deepEqual(pendingRows, [])
 })

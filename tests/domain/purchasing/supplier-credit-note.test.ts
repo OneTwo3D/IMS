@@ -180,6 +180,14 @@ test('a reverse-charge bill that ALSO has any other treatment (a non-vatable cos
   }
 })
 
+test('a bill with a reverse-charge line and a NON-reverse-charge line on the SAME code is still mixed (reverse charge is its own treatment)', () => {
+  const same = { taxType: 'REVERSECHARGES', rate: 0.2, taxRateId: 'r-rc', reverseCharge: false }
+  for (const lines of [[rcLine, same], [same, rcLine]]) {
+    const r = resolveSupplierCreditNoteTaxType({ billHadTax: false, billLines: lines })
+    assert.deepEqual([r.taxType, r.mixed], [undefined, true], JSON.stringify(lines))
+  }
+})
+
 test('sync payload posts EXCLUSIVE for reverse-charge (net amount), INCLUSIVE otherwise', () => {
   const base = {
     creditNoteId: 'scn-rc', creditNoteNumber: 'CN-RC', reference: 'PO-RC', reason: 'RC return',

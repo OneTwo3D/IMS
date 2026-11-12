@@ -75,7 +75,11 @@ mock.module('@/lib/domain/accounting/followup-scope-lock', { namedExports: { loc
 mock.module('@/lib/db/savepoint', { namedExports: { withSavepoint: async <T>(_tx: unknown, fn: () => Promise<T>): Promise<T> => fn() } })
 mock.module('@/lib/domain/accounting/transit-subledger-movement', { namedExports: { recordTransitSubledgerMovement: async () => undefined } })
 
-const committed = { posted: 0, syncRows: [] as Array<{ connector: string; type: string }> }
+const committed = { posted: 0, syncRows: [] as Array<{ connector: string; type: string }>, payloads: [] as Array<Record<string, unknown>> }
+// What the stored rate rows and the connected organisation say (the credit's checks read them).
+let inactiveRateRows: Array<{ id: string; name: string }> = []
+let ledgerTenant: string | null = null
+let ledgerRates: Array<{ taxType: string; effectiveRate: number }> = []
 
 let CREDIT_NOTE: Record<string, unknown> = {
   id: 'cn-1', poId: 'po-1', supplierId: 'sup-1', currency: 'GBP', fxRateToBase: new Prisma.Decimal('1'),
@@ -95,8 +99,8 @@ function transactionClient(pending: Array<() => void>) {
     accountingSyncLog: {
       findMany: async () => [],
       findFirst: async () => null,
-      create: async ({ data }: { data: { connector: string; type: string } }) => {
-        pending.push(() => committed.syncRows.push({ connector: data.connector, type: data.type }))
+      create: async ({ data }: { data: { connector: string; type: string; payload?: Record<string, unknown> } }) => {
+        pending.push(() => { committed.syncRows.push({ connector: data.connector, type: data.type }); committed.payloads.push(data.payload ?? {}) })
         return { id: 'log-1', ...data }
       },
     },
@@ -117,7 +121,9 @@ function transactionClient(pending: Array<() => void>) {
 const dbModelled: Record<string, unknown> = {
   supplierCreditNote: { findUnique: async () => CREDIT_NOTE },
   setting: { findUnique: async () => null },
-  accountingToken: { findFirst: async () => null, findUnique: async () => null },
+  accountingToken: { findFirst: async () => null, findUnique: async () => (ledgerTenant === null ? null : { tenantId: ledgerTenant }) },
+  taxRate: { findMany: async ({ where }: { where: { id?: { in: string[] }; active?: boolean } }) => (where.id ? inactiveRateRows.filter((r) => where.id!.in.includes(r.id)) : []) },
+  xeroTaxRate: { findMany: async () => ledgerRates },
   $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
     const pending: Array<() => void> = []
     const result = await fn(transactionClient(pending))
@@ -153,6 +159,10 @@ function reset() {
   xeroSync = 'true'
   committed.posted = 0
   committed.syncRows = []
+  committed.payloads = []
+  inactiveRateRows = []
+  ledgerTenant = null
+  ledgerRates = []
   activity.length = 0
 }
 
@@ -212,4 +222,68 @@ test('a LEGACY bill line that reconstructs the right VAT but has NO mapped tax t
   assert.match(String(result.error), /^NOTHING WAS SENT\. Supplier credit note CN-1 was refused: no tax type on line 1/)
   assert.equal(committed.posted, 0, 'the credit note was NOT claimed DRAFT->POSTED')
   assert.equal(committed.syncRows.length, 0, 'nothing was queued')
+})
+
+test('CONTROL: the payload that is queued is the one that was validated (the booked code, never a substitute)', async () => {
+  reset()
+  CREDIT_NOTE = baseCredit('120', [snapshot({})])
+  const result = await post()
+  assert.equal(result.success, true, JSON.stringify(result))
+  const line = (committed.payloads[0]!.lines as Array<Record<string, unknown>>)[0]!
+  assert.deepEqual([line.taxType, line.taxRateId, line.taxRateBasis], ['INPUT2', 'r-std', 'plain'])
+})
+
+test('a Xero-bound credit against a bill booked on an INACTIVE rate is refused before anything is claimed; a local-only credit is not', async () => {
+  reset()
+  CREDIT_NOTE = baseCredit('120', [snapshot({ taxRateId: 'r-old' })])
+  inactiveRateRows = [{ id: 'r-old', name: 'Old 20' }]
+  const refused = await post()
+  assert.equal(refused.success, false)
+  assert.match(String(refused.error), /priced on a VAT rate that is inactive \("Old 20"\)/)
+  assert.equal(committed.posted, 0)
+  assert.equal(committed.syncRows.length, 0)
+
+  reset()
+  xeroSync = 'false'
+  CREDIT_NOTE = baseCredit('120', [snapshot({ taxRateId: 'r-old' })])
+  inactiveRateRows = [{ id: 'r-old', name: 'Old 20' }]
+  const local = await post()
+  assert.doesNotMatch(String(local.error ?? ''), /inactive/)
+})
+
+test('a LEGACY bill whose reconstruction no longer reproduces the recorded VAT is refused before anything is claimed', async () => {
+  reset()
+  // Booked at 20% (VAT 20 on 100), but the order line\'s rate now says 5%: today\'s rate does not reproduce the bill.
+  const legacy = { poLineId: 'pl1', costLineId: null, totalForeign: new Prisma.Decimal('100'), taxBookedAt: null, taxType: null, taxRateValue: null, taxRateId: null, taxReverseCharge: null }
+  const credit = baseCredit('30', [legacy], '20') as Record<string, unknown> & { po: Record<string, unknown> }
+  credit.po = { ...credit.po, lines: [{ id: 'pl1', taxForeign: new Prisma.Decimal('20'), totalForeign: new Prisma.Decimal('100'), taxRate: { id: 'r-now', accountingTaxType: 'INPUT5', reverseCharge: false, rate: new Prisma.Decimal('0.05'), isCompound: false, components: [] } }] }
+  CREDIT_NOTE = credit
+  const result = await post()
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /booked before its tax treatment was recorded/)
+  assert.equal(committed.posted, 0)
+  assert.equal(committed.syncRows.length, 0)
+})
+
+test('a credit whose BOOKED code now charges another rate in the ledger is refused before anything is claimed', async () => {
+  reset()
+  CREDIT_NOTE = baseCredit('120', [snapshot({ taxRateValue: new Prisma.Decimal('0.05') })], '5')
+  ledgerTenant = 'tenant-1'
+  ledgerRates = [{ taxType: 'INPUT2', effectiveRate: 20 }]
+  const result = await post()
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /The credit note was not posted \(it is still a draft\).*taxed at 5% in IMS but posts on INPUT2, which charges 20%/)
+  assert.equal(committed.posted, 0)
+  assert.equal(committed.syncRows.length, 0)
+})
+
+test('a LOCAL-ONLY credit with an undecided tax type is not refused for it (nothing goes to Xero)', async () => {
+  reset()
+  xeroSync = 'false'
+  const legacy = { poLineId: 'pl1', costLineId: null, totalForeign: new Prisma.Decimal('100'), taxBookedAt: null, taxType: null, taxRateValue: null, taxRateId: null, taxReverseCharge: null }
+  const credit = baseCredit('30', [legacy], '20') as Record<string, unknown> & { po: Record<string, unknown> }
+  credit.po = { ...credit.po, lines: [{ id: 'pl1', taxForeign: new Prisma.Decimal('20'), totalForeign: new Prisma.Decimal('100'), taxRate: { id: 'r-unmapped', accountingTaxType: null, reverseCharge: false, rate: new Prisma.Decimal('0.2'), isCompound: false, components: [] } }] }
+  CREDIT_NOTE = credit
+  const result = await post()
+  assert.doesNotMatch(String(result.error ?? ''), /no tax type on line/)
 })

@@ -73,6 +73,12 @@ test('a supplier default that is inactive, sales-only, compound, reverse-charge,
     assert.equal(resolveOrderRateTaxCode({ recordedRate: 0.2, candidates: [other, r('third', 0.2, 'INPUT20C')], supplierDefault }), null, `${label}: it does not break a tie`)
     assert.equal(resolveOrderRateTaxCode({ recordedRate: 0.2, candidates: [], supplierDefault }), null, `${label}: and is no candidate on its own`)
   }
+  // Each eligibility field must be STATED: a default read without just one of them is not known to be eligible.
+  for (const missing of ['active', 'usedFor', 'isCompound', 'reverseCharge'] as const) {
+    const partial: OrderRateCandidate = { ...r('std', 0.2, 'INPUT2') }
+    delete (partial as Record<string, unknown>)[missing]
+    assert.equal(resolveOrderRateTaxCode({ recordedRate: 0.2, candidates: [other], supplierDefault: partial })?.taxRateId, 'other', `${missing} not read: the default does not win`)
+  }
   assert.equal(resolveOrderRateTaxCode({ recordedRate: 0.2, candidates: [other], supplierDefault: r('std', 0.2, 'INPUT2') })?.taxRateId, 'std', 'control: an eligible default wins')
 })
 

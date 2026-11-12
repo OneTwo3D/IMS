@@ -716,6 +716,63 @@ test('PO-H3 recovery: a bill whose snapshot froze a BLANK type is re-derived by 
   assert.equal((rows[0]!.payload as { lines: Array<{ taxType?: string }> }).lines[0]!.taxType, 'TAX008', 'the queued create carries the corrected type')
 })
 
+// Inactive rates are refused; a booking is not re-priced by an edit; an undecided edit is refused (mutation pass of the PR).
+test('PO-H3 inactive: a new bill priced on an INACTIVE rate is refused with nothing saved; so is an edit of a bill booked on a rate that is since inactive (a re-key\'s retired rate is not)', async () => {
+  const { createInvoice, updateInvoice } = await import('@/app/actions/purchase-orders')
+  const dead = await s.db.taxRate.create({ data: { name: `AUD Dead ${++seq}`, rate: '0.2', usedFor: 'PURCHASE', accountingTaxType: 'TAX009', active: false }, select: { id: true } })
+  const poDead = await poOnRate(dead.id, 'DD')
+  const queuedBefore = await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_INVOICE' } })
+  const refused = await createInvoice(poDead.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-DD', lines: [{ kind: 'product', poLineId: poDead.lines[0]!.id, qtyBilled: 10, unitCostForeign: 12 }] } as never)
+  assert.equal(refused.success, false)
+  assert.match(String(refused.error), /priced on a VAT rate that is inactive/)
+  assert.equal(await s.db.purchaseInvoice.count({ where: { poId: poDead.id } }), 0)
+  assert.equal(await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_INVOICE' } }), queuedBefore)
+
+  const live = await s.db.taxRate.create({ data: { name: `AUD Live ${++seq}`, rate: '0.2', usedFor: 'PURCHASE', accountingTaxType: 'TAX010', active: true }, select: { id: true } })
+  const po = await poOnRate(live.id, 'LV')
+  const made = await createInvoice(po.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-LV', lines: [{ kind: 'product', poLineId: po.lines[0]!.id, qtyBilled: 10, unitCostForeign: 12 }] } as never)
+  assert.equal(made.success, true, String(made.error))
+  const invoice = await s.db.purchaseInvoice.findFirstOrThrow({ where: { poId: po.id }, select: { id: true, lines: { select: { id: true } } } })
+  await s.db.taxRate.update({ where: { id: live.id }, data: { active: false } })
+  const edit = { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-LV', lines: [{ id: invoice.lines[0]!.id, qtyBilled: 10, unitCostForeign: 10 }] } as never
+  const editRefused = await updateInvoice(invoice.id, edit)
+  assert.equal(editRefused.success, false)
+  assert.match(String(editRefused.error), /priced on a VAT rate that is inactive/)
+  assert.equal(Number((await s.db.purchaseInvoice.findUniqueOrThrow({ where: { id: invoice.id } })).subtotalForeign), 120, 'nothing saved')
+  // A rate a tax re-key RETIRED (it names its replacement) is not "inactive": the edit goes through.
+  const replacement = await s.db.taxRate.create({ data: { name: `AUD Repl ${++seq}`, rate: '0.2', usedFor: 'PURCHASE', accountingTaxType: 'TAX011', active: true }, select: { id: true } })
+  await s.db.taxRate.update({ where: { id: live.id }, data: { replacedById: replacement.id } })
+  const editOk = await updateInvoice(invoice.id, edit)
+  assert.equal(editOk.success, true, String(editOk.error))
+})
+
+test('PO-H3 booked: an edit keeps the BOOKED code and rate after the rate row changed; an edit of a bill with an unbooked, undecided line is refused with nothing saved', async () => {
+  const { createInvoice, updateInvoice } = await import('@/app/actions/purchase-orders')
+  const rate = await s.db.taxRate.create({ data: { name: `AUD Booked ${++seq}`, rate: '0.2', usedFor: 'PURCHASE', accountingTaxType: 'TAX007', active: true }, select: { id: true } })
+  const po = await poOnRate(rate.id, 'BK')
+  const made = await createInvoice(po.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-BK', lines: [{ kind: 'product', poLineId: po.lines[0]!.id, qtyBilled: 10, unitCostForeign: 12 }] } as never)
+  assert.equal(made.success, true, String(made.error))
+  const invoice = await s.db.purchaseInvoice.findFirstOrThrow({ where: { poId: po.id }, select: { id: true, lines: { select: { id: true } } } })
+  const bookedAt = (await s.db.purchaseInvoiceLine.findFirstOrThrow({ where: { invoiceId: invoice.id }, select: { taxBookedAt: true } })).taxBookedAt
+  // The rate row changes AFTER booking (a non-draft order is not refreshed): the edit must keep the booked treatment.
+  await s.db.taxRate.update({ where: { id: rate.id }, data: { rate: '0.05', accountingTaxType: 'TAX008' } })
+  const edited = await updateInvoice(invoice.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-BK', lines: [{ id: invoice.lines[0]!.id, qtyBilled: 10, unitCostForeign: 10 }] } as never)
+  assert.equal(edited.success, true, String(edited.error))
+  const line = await s.db.purchaseInvoiceLine.findFirstOrThrow({ where: { invoiceId: invoice.id }, select: { taxType: true, taxRateValue: true } })
+  assert.deepEqual([line.taxType, Number(line.taxRateValue)], ['TAX007', 0.2], 'the booking stands')
+  assert.equal((await s.db.purchaseInvoiceLine.findFirstOrThrow({ where: { invoiceId: invoice.id }, select: { taxBookedAt: true } })).taxBookedAt?.getTime(), bookedAt?.getTime(), 'and is not re-booked by the edit')
+  assert.equal(Number((await s.db.purchaseInvoice.findUniqueOrThrow({ where: { id: invoice.id } })).taxForeign), 20, 'VAT at the booked 20% on 100')
+  assert.equal(((await createRows(invoice.id))[0]!.payload as { lines: Array<{ taxType?: string }> }).lines[0]!.taxType, 'TAX007')
+
+  // A bill whose snapshot froze a blank, with the rate still UNMAPPED: the edit is refused and nothing is saved.
+  await s.db.purchaseInvoiceLine.updateMany({ where: { invoiceId: invoice.id }, data: { taxType: null, taxBookedAt: new Date() } })
+  await s.db.taxRate.update({ where: { id: rate.id }, data: { rate: '0.2', accountingTaxType: null } })
+  const refused = await updateInvoice(invoice.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-BK', lines: [{ id: invoice.lines[0]!.id, qtyBilled: 10, unitCostForeign: 9 }] } as never)
+  assert.equal(refused.success, false)
+  assert.match(String(refused.error), /The bill was not saved: no tax type on line 1/)
+  assert.equal(Number((await s.db.purchaseInvoice.findUniqueOrThrow({ where: { id: invoice.id } })).subtotalForeign), 100, 'nothing saved')
+})
+
 // ---- legacy create rows (keyed to the purchase order, naming no bill)
 async function legacyKeyed(invoiceId: string, poId: string) {
   const [row] = await createRows(invoiceId)
