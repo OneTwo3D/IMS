@@ -1470,7 +1470,6 @@ async function queuedThenPolicyChange(t: test.TestContext, afterHold: 'releases'
   const event = await db.accountingEvent.create({ data: { type: 'SALES_INVOICE', sourceEntityType: 'SalesOrder', sourceEntityId: orderId, businessDate: new Date(), idempotencyKey: `mirror-${externalId}`, linesJson: [], currency: 'GBP' } })
   t.after(async () => { await db.accountingEventLog.deleteMany({ where: { accountingEventId: event.id } }); await db.accountingEvent.deleteMany({ where: { id: event.id } }) })
   const startedAt = new Date()
-  const revision = history === 'retried' ? 2 : history === 'staleAttempt' ? 1 : 1
   const rowRevision = history === 'retried' || history === 'staleAttempt' ? 2 : 1
   const attemptRevisionGiven = history === 'attemptAhead' ? 2 : history === 'retried' ? 2 : 1
   await db.accountingSyncLog.update({ where: { id: queued.id }, data: { status: 'PROCESSING', processingStartedAt: startedAt, attemptStampingCustodyAt: startedAt, attemptRevision: rowRevision, ...(history === 'retryCounted' ? { retryCount: 1 } : {}), ...(history === 'errored' ? { errorMessage: 'an earlier failure' } : {}), ...(history === 'dispatched' ? { createDispatchedAt: new Date(), createDispatchIdempotencyKey: 'k-prior' } : {}), ...(history === 'attempted' ? { remoteAttemptedAt: new Date() } : {}) } })
