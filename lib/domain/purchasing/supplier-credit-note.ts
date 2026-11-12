@@ -73,6 +73,15 @@ export function validateRecordSupplierCreditNote(params: {
   return null
 }
 
+/**
+ * A Xero-bound supplier credit against a bill with REVERSE-CHARGE lines is refused. The IMS credit amount is the bill's gross (net plus the self-accounted VAT) while Xero holds the
+ * bill's net, and the transit movement is taken from the VAT ratio: the figures disagree and a full credit could exceed the Xero bill. The proper design (net payable cap, the same amount on
+ * the Xero line, the allocation and the transit movement) is separate work; until then the credit is raised in Xero directly. Local-only credits (nothing goes to Xero) are unaffected.
+ */
+export const SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_MESSAGE = withLedgerCheck(
+  'Supplier credits against reverse-charge bills are not posted from IMS yet: raise this credit in Xero directly. The credit note was not posted and is still a draft.',
+)
+
 /** Shown to the operator when a supplier credit note is raised against a bill whose lines carry more than one VAT treatment. */
 export const SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE = withLedgerCheck(
   'This bill mixes VAT treatments (for example taxable and exempt lines, reverse-charge and any other treatment, or two VAT codes), and one credit amount cannot mirror them: raise the credit in Xero by line, '

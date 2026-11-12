@@ -1660,6 +1660,11 @@ its treatment, after which the credit can be raised. (There is no separate tax-c
 
 **A supplier credit is checked against the ledger's rate for its code.** Before a credit that is going to Xero is posted, the booked code's rate in the stored Xero tax-rate list is compared with the rate the bill line was booked at (as a bill is); a difference beyond rounding refuses the credit (*The credit note was not posted (it is still a draft) ...*). A code whose rate is not in the stored list is not checked.
 
+**Supplier credits against reverse-charge bills are not posted from IMS yet.** A supplier credit note that would be sent to Xero against a bill with **any reverse-charge line** is refused before anything is
+claimed (*Supplier credits against reverse-charge bills are not posted from IMS yet: raise this credit in Xero directly*); the credit note stays a draft. IMS records a reverse-charge bill gross (net plus the
+self-accounted VAT) while Xero holds its net, so a credit from IMS could not agree with the Xero bill. A credit with sync off (nothing goes to Xero) is not affected, nor is a credit against a bill without
+reverse-charge lines. A proper reverse-charge credit is separate work.
+
 **Inactive rates are refused.** A new bill, an edit of a bill, and a supplier credit note that would be sent to Xero are refused (nothing saved or posted) when a line is priced on a
 VAT rate that is **inactive**: the line's own rate, the rate the order was charged at, or the rate a booked line was booked on. Re-activate the rate, or move the order's lines to an active
 rate. A rate a tax **re-key** retired (it names its replacement) is not counted as inactive; the retired-code guard decides whether its type may still be sent.

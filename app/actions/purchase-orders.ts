@@ -50,7 +50,7 @@ import {
 import { getBaseCurrencyCode, resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purchase-order-action'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
-import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, SupplierCreditNoteEnqueueDeclined } from '@/lib/domain/purchasing/supplier-credit-note'
+import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_MESSAGE, SupplierCreditNoteEnqueueDeclined } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
 import { readPayloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
@@ -5248,6 +5248,8 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     // poster for QuickBooks, so no posting is ever coming — so it is not an inbox row; it is a WARNING that
     // says plainly what the ledger will not receive.
     // One credit amount cannot mirror a bill that mixes VAT treatments: refused BEFORE anything is claimed (the credit stays a draft). Per-line credits are a follow-up.
+    // A Xero-bound credit against a bill with ANY reverse-charge line is refused before anything is claimed (its figures cannot agree yet); the credit stays a draft. Local-only credits are unaffected.
+    if (shouldQueueXero && billTreatments.some((t) => t.reverseCharge)) return { success: false, error: SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_MESSAGE }
     if (shouldQueueXero && creditNoteTreatment.mixed) return { success: false, error: SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE }
     // A credit that would be sent to the ledger is not priced on an inactive rate, and not on a treatment that cannot be told: refused before anything is claimed.
     if (shouldQueueXero) {
