@@ -755,11 +755,13 @@ const updatableLink = () => ({
 
 /** A port whose recorded line ids live in a small in-memory store, so the amend pass and the later cancel see the same snapshot. */
 function snapshotPort(initial: WmsOrderItemRef[]) {
-  const store = { items: [...initial] }
+  const store = { items: [...initial], unsafe: false, marks: [] as boolean[] }
   const h = makePort({ cancellable: [], items: null })
   h.port.updatableLinks = async () => [updatableLink()] as never
-  h.port.readOrderItems = async () => [...store.items]
-  h.port.replaceOrderItems = async (_orderId, _ext, items) => { store.items = [...items] }
+  // Like the real port: a link whose ids are marked untrustworthy has no usable record.
+  h.port.readOrderItems = async () => (store.unsafe ? [] : [...store.items])
+  h.port.replaceOrderItems = async (_orderId, _ext, items) => { store.items = [...items]; store.unsafe = false }
+  h.port.setLineIdsUnsafe = async (_id, unsafe) => { store.marks.push(unsafe); store.unsafe = unsafe }
   return { h, store }
 }
 
@@ -900,5 +902,70 @@ test('ABSORBING ORDER, merge flag absent but the number is now a combined "a+b" 
     assert.deepEqual(writeRequests(), [])
     assert.equal(survivorItems().length, 4)
     assert.ok(h.writes.some((w) => w.data.state === 'MERGED'))
+  })
+})
+
+// ---------------------------------------------------------------- 12. review round 5 -----------------------------------------------
+
+test('FAILED CLEANUP: an accepted amendment whose snapshot replacement AND deletion both fail leaves the ids MARKED untrustworthy; the merged cancel then removes nothing, cancels nothing and raises a notice', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const { h, store } = snapshotPort(storedD)
+    h.port.replaceOrderItems = async () => { throw new Error('database unavailable') }
+    await sweep(h.port, { updateOrder: async () => ({ updated: true, status: 'NEW', items: [{ externalItemId: '55', sku: 'A', quantity: 1 }] }) })
+    assert.equal(store.unsafe, true, 'the mark set before the amendment is still set')
+    h.port.updatableLinks = async () => []
+    h.port.cancellableLinks = async () => [mergedLinkRef()]
+    h.link.state = 'MERGED'
+    h.link.externalOrderId = SURVIVOR
+    const result = await sweep(h.port)
+    assert.equal(fake.requests.some((r) => r.method === 'DELETE' || r.path.endsWith('/Cancel')), false)
+    assert.equal(result.operatorNotices, 1)
+    assert.equal(h.writes.some((w) => w.data.state === 'CANCELLED'), false)
+    assert.equal(survivorItems().length, 4)
+  })
+})
+
+test('PARTIAL AMENDMENT whose cleanup also fails: the ids stay marked untrustworthy (the mark was written before anything was sent)', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const { h, store } = snapshotPort(storedD)
+    h.port.replaceOrderItems = async () => { throw new Error('database unavailable') }
+    const { WmsOrderUpdatePartialError } = await import('../lib/connectors/wms/courier-form.ts')
+    await sweep(h.port, { updateOrder: async () => { throw new WmsOrderUpdatePartialError('items failed', {}) } })
+    assert.equal(store.unsafe, true)
+    assert.deepEqual(store.marks, [true])
+  })
+})
+
+test('THE MARK IS WRITTEN BEFORE ANYTHING IS SENT and NOTHING is sent when it cannot be written', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const { h } = snapshotPort(storedD)
+    h.port.setLineIdsUnsafe = async () => { throw new Error('database unavailable') }
+    let sent = 0
+    await sweep(h.port, { updateOrder: async () => { sent += 1; return { updated: true, status: 'NEW' } } })
+    assert.equal(sent, 0)
+  })
+})
+
+test('AN AMENDMENT THAT CHANGED NOTHING (not NEW) un-marks the ids; a verified replacement clears the mark too', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const a = snapshotPort(storedD)
+    await sweep(a.h.port, { updateOrder: async () => ({ updated: false, status: 'NOT_NEW' }) })
+    assert.deepEqual(a.store.marks, [true, false])
+    assert.equal(a.store.unsafe, false)
+    const b = snapshotPort(storedD)
+    await sweep(b.h.port, { updateOrder: async () => ({ updated: true, status: 'NEW', items: [{ externalItemId: '1', sku: 'A', quantity: 1 }] }) })
+    assert.equal(b.store.unsafe, false)
+  })
+})
+
+test('REFUSED AMENDMENT of a merged order writes the durable amendment notice (amendNoticeAt) on the link', async () => {
+  await withEnv(OFF, async () => {
+    const { h } = await amendAbsorbing(true)
+    const moved = h.writes.find((w) => w.data.state === 'MERGED')
+    assert.ok(moved!.data.amendNoticeAt instanceof Date)
   })
 })

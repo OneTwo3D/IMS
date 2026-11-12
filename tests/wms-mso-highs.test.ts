@@ -416,7 +416,7 @@ test('R4: the warehouse note and the notice texts carry no status or error text 
 
 test('R2: the exception inbox lists a cancel notice by the cancel pass\'s OWN order predicate, not a copy of it', async () => {
   const { readFileSync } = await import('node:fs')
-  const inbox = readFileSync(new URL('../app/actions/sync-exceptions.ts', import.meta.url), 'utf8')
+  const inbox = readFileSync(new URL('../lib/domain/wms/push-recovery-affordance.ts', import.meta.url), 'utf8')
   assert.match(inbox, /cancelNoticeAt: \{ not: null \}, order: WMS_CANCELLABLE_ORDER_WHERE/)
   assert.doesNotMatch(inbox, /cancelNoticeAt: \{ not: null \}, order: \{ status: 'CANCELLED'/)
   const sweep = readFileSync(new URL('../lib/domain/wms/order-push-sweep.ts', import.meta.url), 'utf8')

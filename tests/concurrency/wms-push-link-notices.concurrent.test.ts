@@ -403,3 +403,37 @@ test('REAL PORT: a refused removal raises the notice with what was removed and w
   assert.match(String(after.lastError), /STILL ON THE MERGED ORDER[^]*1 x B \(line 2\)/)
   assert.deepEqual((await d.db.wmsOrderPushItem.findMany({ where: { linkId: link.id } })).map((r) => r.externalItemId), ['2'], 'the removed line is forgotten')
 })
+
+test('REAL PORT: ids marked untrustworthy read as none until a verified replacement clears the mark in the same write', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `uns${randomUUID().slice(0, 8)}`
+  const s = await seed(d, tag)
+  t.after(() => cleanup(d, s))
+  const link = await d.db.wmsOrderPushLink.create({ data: { orderId: s.orderId, connector: 'mintsoft', state: 'SYNCED', externalOrderId: 'o-u', pushedAt: new Date() } })
+  const port = d.sweep.createPrismaWmsOrderPushPort()
+  const ids = [{ externalItemId: '71', sku: 'A', quantity: 1 }]
+  await port.replaceOrderItems!(s.orderId, 'o-u', ids)
+  assert.deepEqual(await port.readOrderItems!(link.id), ids)
+  await port.setLineIdsUnsafe!(link.id, true)
+  assert.deepEqual(await port.readOrderItems!(link.id), [], 'marked: the stored rows are not trusted')
+  assert.equal(await d.db.wmsOrderPushItem.count({ where: { linkId: link.id } }), 1, 'the rows are still there; only the trust is gone')
+  await port.replaceOrderItems!(s.orderId, 'o-u', [{ externalItemId: '72', sku: 'B', quantity: 2 }])
+  assert.deepEqual((await port.readOrderItems!(link.id)).map((r) => r.externalItemId), ['72'])
+  assert.equal((await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })).lineSnapshotUnsafeAt, null)
+})
+
+test('REAL INBOX SELECTION: a live link with an amendment notice is listed, and is gone once the notice is cleared', { skip }, async (t) => {
+  const d = await deps()
+  const { WMS_PUSH_INBOX_WHERE } = await import('@/lib/domain/wms/push-recovery-affordance')
+  const tag = `inb${randomUUID().slice(0, 8)}`
+  const withNotice = await seed(d, `${tag}a`)
+  const without = await seed(d, `${tag}b`)
+  t.after(async () => { for (const s of [withNotice, without]) await cleanup(d, s) })
+  const base = { connector: 'mintsoft', state: 'MERGED' as const, externalOrderId: 'surv-i' }
+  await d.db.wmsOrderPushLink.create({ data: { ...base, orderId: withNotice.orderId, amendNoticeAt: new Date() } })
+  await d.db.wmsOrderPushLink.create({ data: { ...base, orderId: without.orderId } })
+  const listed = async () => (await d.db.wmsOrderPushLink.findMany({ where: { AND: [WMS_PUSH_INBOX_WHERE, { orderId: { in: [withNotice.orderId, without.orderId] } }] } })).map((l) => l.orderId)
+  assert.deepEqual(await listed(), [withNotice.orderId])
+  await d.db.wmsOrderPushLink.updateMany({ where: { orderId: withNotice.orderId, amendNoticeAt: { not: null } }, data: { amendNoticeAt: null } })
+  assert.deepEqual(await listed(), [])
+})

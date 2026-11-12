@@ -758,6 +758,10 @@ type LinkWrite = {
   /** When the warehouse-visible note for that notice was DELIVERED. Null while undelivered (retried by the sweep). */
   holdNoticeCommentAt?: Date | null
   cancelNoticeCommentAt?: Date | null
+  /** An amendment of a merged warehouse order was refused and has to be applied by hand (cleared by an operator's acknowledgement). */
+  amendNoticeAt?: Date | null
+  /** Set while the recorded line ids cannot be trusted (an amendment of the lines may have changed them). */
+  lineSnapshotUnsafeAt?: Date | null
 }
 
 /**
@@ -1021,6 +1025,8 @@ export interface WmsOrderPushPort {
   readOrderItems?(linkId: string): Promise<WmsOrderItemRef[]>
   /** Replace the recorded line ids of the order with this set, read from warehouse order `externalOrderId`. An empty set clears them. */
   replaceOrderItems?(orderId: string, externalOrderId: string, items: WmsOrderItemRef[]): Promise<void>
+  /** Mark (or unmark) the link's recorded line ids as untrustworthy. While marked, readOrderItems answers none. Best effort to unmark, required to mark. */
+  setLineIdsUnsafe?(linkId: string, unsafe: boolean): Promise<void>
   /** Forget these recorded line ids (lines IMS removed from a merged order). */
   dropOrderItems?(linkId: string, externalItemIds: string[]): Promise<void>
   /** SYNCED links whose order is ON_HOLD. */
@@ -1351,7 +1357,7 @@ export async function runWmsOrderPushSweepCore(
     const items = await port.readOrderItems(link.id)
     if (items.length === 0) {
       await notice(
-        'IMS holds no record of the WMS line ids of this order (it was pushed before IMS recorded them, or they could not be read), so it cannot tell which lines are this order\'s. Take this order\'s items out of it in the WMS before it ships.',
+        'IMS holds no record of the WMS line ids of this order (it was pushed before IMS recorded them, they could not be read, or an amendment left them untrustworthy), so it cannot tell which lines are this order\'s. Take this order\'s items out of it in the WMS before it ships.',
         'IMS cancel not propagated: the order was merged into another WMS order and its line ids are not recorded — left for an operator')
       return
     }
@@ -2954,13 +2960,18 @@ export async function runWmsOrderPushSweepCore(
           amendOrder = { ...link.order, ...current } as typeof link.order
         }
         const input = applyLinkCourierForm(buildPushInput(amendOrder, externalWarehouseId), link)
+        // FAIL CLOSED: the recorded line ids are marked untrustworthy BEFORE anything is sent. They are trusted again only when a verified
+        // fresh snapshot is stored below (replaceOrderItems clears the mark) or the amendment provably changed nothing. A crash, a partial
+        // amendment or a failed cleanup therefore always leaves them untrusted. If the mark cannot be written, nothing is sent.
+        await port.setLineIdsUnsafe?.(link.id, true)
         update = await connector.updateOrder(link.externalOrderId, input, amendSeam.clearance)
+        if (!update.updated) await port.setLineIdsUnsafe?.(link.id, false).catch(() => {}) // nothing was written: the ids still describe the order
         // The warehouse order is a MERGED order (the absorbing order keeps the survivor's id, so this link can still name it as a plain
         // order): nothing was written. The link is re-pointed as MERGED so no later pass amends it, and the change is left for a person.
         if (update.status === 'MERGED_SURVIVOR') {
           const moved = port.updateLinkIfLinked
-            ? await port.updateLinkIfLinked(link.id, { state: 'SYNCED', externalOrderId: link.externalOrderId }, { state: 'MERGED', ...(update.mergedSurvivorNumber ? { externalOrderNumber: update.mergedSurvivorNumber } : {}), ...RESET_DISPATCH_FAILURES, lastAttemptAt: ts, lastError: 'This order\'s change was NOT sent to the WMS: the WMS order is a MERGED order that also holds other orders\' goods, so IMS did not amend it. Apply the change in the WMS by hand.' })
-            : (await port.updateLink(link.id, { state: 'MERGED', ...RESET_DISPATCH_FAILURES, lastAttemptAt: ts, lastError: 'This order\'s change was NOT sent to the WMS: the WMS order is a MERGED order that also holds other orders\' goods, so IMS did not amend it. Apply the change in the WMS by hand.' }), true)
+            ? await port.updateLinkIfLinked(link.id, { state: 'SYNCED', externalOrderId: link.externalOrderId }, { state: 'MERGED', amendNoticeAt: ts, ...(update.mergedSurvivorNumber ? { externalOrderNumber: update.mergedSurvivorNumber } : {}), ...RESET_DISPATCH_FAILURES, lastAttemptAt: ts, lastError: 'This order\'s change was NOT sent to the WMS: the WMS order is a MERGED order that also holds other orders\' goods, so IMS did not amend it. Apply the change in the WMS by hand.' })
+            : (await port.updateLink(link.id, { state: 'MERGED', amendNoticeAt: ts, ...RESET_DISPATCH_FAILURES, lastAttemptAt: ts, lastError: 'This order\'s change was NOT sent to the WMS: the WMS order is a MERGED order that also holds other orders\' goods, so IMS did not amend it. Apply the change in the WMS by hand.' }), true)
           await audit({
             action: 'order_update', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,
             summary: `Order ${link.order.orderNumber ?? link.order.id} amendment NOT propagated — the WMS order is a merged order${moved ? '; link marked merged' : ''}`,
@@ -3731,6 +3742,9 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         take: limit,
       }).then((rows) => rows.map(({ order, ...link }) => ({ ...link, orderNumber: order.orderNumber })) as WmsPushLinkRef[]),
     async readOrderItems(linkId) {
+      // A link whose ids are marked untrustworthy has no usable record: the merged-order removal then falls back to the notice.
+      const mark = await db.wmsOrderPushLink.findUnique({ where: { id: linkId }, select: { lineSnapshotUnsafeAt: true } })
+      if (!mark || mark.lineSnapshotUnsafeAt) return []
       const rows = await db.wmsOrderPushItem.findMany({ where: { linkId }, orderBy: { createdAt: 'asc' } })
       return rows.map((row) => ({ externalItemId: row.externalItemId, sku: row.sku, quantity: row.quantity }))
     },
@@ -3739,6 +3753,8 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         const link = await tx.wmsOrderPushLink.findUnique({ where: { orderId }, select: { id: true } })
         if (!link) return
         await tx.wmsOrderPushItem.deleteMany({ where: { linkId: link.id } })
+        // A verified replacement (or an explicit empty set) makes the record trustworthy again, in the SAME transaction.
+        await tx.wmsOrderPushLink.update({ where: { id: link.id }, data: { lineSnapshotUnsafeAt: null } })
         if (items.length > 0) {
           await tx.wmsOrderPushItem.createMany({
             data: items.map((item) => ({ linkId: link.id, externalOrderId, externalItemId: item.externalItemId, sku: item.sku, quantity: item.quantity })),
@@ -3746,6 +3762,9 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           })
         }
       })
+    },
+    async setLineIdsUnsafe(linkId, unsafe) {
+      await db.wmsOrderPushLink.update({ where: { id: linkId }, data: { lineSnapshotUnsafeAt: unsafe ? new Date() : null } })
     },
     async dropOrderItems(linkId, externalItemIds) {
       await db.wmsOrderPushItem.deleteMany({ where: { linkId, externalItemId: { in: externalItemIds } } })

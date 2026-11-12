@@ -49,6 +49,7 @@ import { replayWmsOrderPush } from '@/app/actions/wms-order-push'
 import {
   clearPennyMismatchFlag,
   dismissWithdrawnDispatch,
+  acknowledgeWmsAmendNotice,
   claimAccountingPostingRefusalForHandPostingAction,
   listAccountingHandPostClaimsAction,
   markAccountingPostingRefusalHandledAction,
@@ -465,7 +466,20 @@ export function ExceptionsClient({ data }: Props) {
                         Where there is no button there is the
                         manual reconciliation instead, so the row still tells the operator what to
                         do. */}
-                    {row.replayable ? (
+                    {row.acknowledgeable ? (
+                      <div className="space-y-1">
+                        <span className="text-xs text-muted-foreground block text-left whitespace-normal">{row.replayRefusal}</span>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled={isPending}
+                          onClick={() => runAction(() => acknowledgeWmsAmendNotice(row.orderId), `Acknowledged the change notice for ${row.orderNumber ?? row.orderId}.`)}
+                        >
+                          Acknowledge
+                        </Button>
+                      </div>
+                    ) : row.replayable ? (
                       <Button
                         type="button"
                         variant="outline"

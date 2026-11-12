@@ -6,7 +6,7 @@ import {
 } from './create-replay-policy'
 import { wmsCreateIneligibleRefusal, wmsPaidBeforeCreateFloor, WMS_PRE_CUTOVER_NOTICE } from './create-eligibility'
 import { wmsCreateObligationFloor, wmsProducerHold } from '@/lib/connectors/wms/producer-seam'
-import { wmsCreateOutcomeIsAmbiguous, wmsPushOrderReference } from './order-push-sweep'
+import { wmsCreateOutcomeIsAmbiguous, wmsPushOrderReference, WMS_CANCELLABLE_ORDER_WHERE } from './order-push-sweep'
 
 /**
  * ONE READER FOR "MAY THIS PUSH BE RE-OPENED?", SHARED BY THE CONTROL AND THE ACTION (o3d-2k5r r5).
@@ -152,6 +152,7 @@ export function decideWmsPushReplay(
 export function describeBlockedWmsPush(link: WmsPushReplayEvidence & WmsPushNoticeEvidence): string {
   if (link.holdNoticeAt && (link.state === 'SYNCED' || link.state === 'MERGED')) return 'Hold not honoured by the warehouse'
   if (link.cancelNoticeAt && (link.state === 'SYNCED' || link.state === 'MERGED')) return 'Cancel not honoured by the warehouse'
+  if (link.amendNoticeAt && (link.state === 'SYNCED' || link.state === 'MERGED')) return 'Change not sent to the warehouse (merged order)'
   if (link.state === 'VALIDATION_FAILED') return 'Payload invalid'
   if (link.externalOrderId) return 'Linked, unverified'
   if (link.state === 'AMBIGUOUS_CREATE') return 'Create outcome unknown'
@@ -227,7 +228,7 @@ export function decideWmsMissingRepush(input: {
  * place. Built here, "the row says what the action would do" is one assertion.
  */
 /** A live link the warehouse could not hold / cancel for: see WMS_PUSH_NOTICE_WHERE in the exception inbox. */
-export type WmsPushNoticeEvidence = { holdNoticeAt?: Date | null; cancelNoticeAt?: Date | null }
+export type WmsPushNoticeEvidence = { holdNoticeAt?: Date | null; cancelNoticeAt?: Date | null; amendNoticeAt?: Date | null }
 
 export type BlockedWmsPushRowInput = WmsPushReplayEvidence & WmsPushNoticeEvidence & {
   orderId: string
@@ -246,6 +247,7 @@ function noticeGuidance(link: WmsPushReplayEvidence & WmsPushNoticeEvidence): st
   if (link.state !== 'SYNCED' && link.state !== 'MERGED') return null
   if (link.holdNoticeAt) return 'IMS could not hold this order in the warehouse. The link is still live, so a despatch is still recorded. Ask the warehouse to pause it, or leave it to ship.'
   if (link.cancelNoticeAt) return 'IMS could not cancel this order in the warehouse. The link is still live; a despatch that follows is raised here for you, never applied to the cancelled order. Raise a cancellation query in the warehouse.'
+  if (link.amendNoticeAt) return 'IMS did not send this order\'s latest change to the warehouse because the warehouse merged it into another order and amending it would alter the other order\'s lines. Apply the change in the warehouse by hand, then acknowledge it here.'
   return null
 }
 
@@ -262,6 +264,8 @@ export function buildBlockedWmsPushRow(link: BlockedWmsPushRowInput) {
     replayable: decision.replayable,
     replayRefusal: decision.replayable ? null : noticeGuidance(link) ?? decision.guidance,
     why: describeBlockedWmsPush(link),
+    /** A live-link amendment notice: the row offers Acknowledge (which clears it) instead of Replay. */
+    acknowledgeable: Boolean(link.amendNoticeAt) && (link.state === 'SYNCED' || link.state === 'MERGED'),
   }
 }
 
@@ -304,3 +308,25 @@ export function buildOrderReconcileDriftRow(row: OrderReconcileDriftRowInput) {
     repushRefusal: decision && !decision.repushable ? decision.guidance : null,
   }
 }
+
+/** The exception inbox's selection of warehouse push links (blocked states, live links with a hold / cancel / amendment notice). */
+export const BLOCKED_WMS_PUSH_STATES = ['DEAD_LETTER', 'VALIDATION_FAILED', 'AMBIGUOUS_CREATE'] as const
+
+/**
+ * Links that are LIVE but carry an operator notice: IMS asked the warehouse to hold / cancel the order and it could not (already past
+ * NEW, not found, a merged survivor). They stay SYNCED/MERGED so a despatch is still recorded, which is exactly why they are not in
+ * BLOCKED_WMS_PUSH_STATES and need their own clause here. A hold notice matters only while the order is still ON_HOLD; a cancel notice
+ * (the cancel pass's own order predicate, shared) until the dispatch sweep has parked or quarantined the link (those have their own sections). (Exported so a database test can run the real selection.)
+ */
+export const WMS_PUSH_NOTICE_WHERE = {
+  state: { in: ['SYNCED', 'MERGED'] as Array<'SYNCED' | 'MERGED'> },
+  dispatchDeadLetteredAt: null,
+  dispatchUnresolvedAt: null,
+  OR: [
+    { holdNoticeAt: { not: null }, order: { status: 'ON_HOLD' as const } },
+    { cancelNoticeAt: { not: null }, order: WMS_CANCELLABLE_ORDER_WHERE },
+    // A change IMS could not send to a merged warehouse order: stays until an operator acknowledges it.
+    { amendNoticeAt: { not: null } },
+  ],
+}
+export const WMS_PUSH_INBOX_WHERE = { OR: [{ state: { in: [...BLOCKED_WMS_PUSH_STATES] } }, WMS_PUSH_NOTICE_WHERE] }

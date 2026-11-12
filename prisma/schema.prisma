@@ -3961,6 +3961,13 @@ model WmsOrderPushLink {
   holdNoticeAt        DateTime? @map("hold_notice_at")
   cancelNoticeAt      DateTime? @map("cancel_notice_at")
   /// When the warehouse-visible note for that notice was actually posted. Null while undelivered: the push sweep retries it.
+  /// IMS changed an order the warehouse had already merged into another order and did NOT amend the merged order (that would delete or
+  /// consolidate the other order's lines): the change has to be applied there by hand. Live link, listed in the exception inbox until
+  /// an operator acknowledges it (which clears this).
+  amendNoticeAt         DateTime? @map("amend_notice_at")
+  /// Set before IMS amends the warehouse order's lines and cleared only when a verified fresh snapshot of its line ids is stored (or the
+  /// amendment provably changed nothing). While set, the recorded line ids cannot be trusted and a merged-order line removal refuses.
+  lineSnapshotUnsafeAt  DateTime? @map("line_snapshot_unsafe_at")
   holdNoticeCommentAt   DateTime? @map("hold_notice_comment_at")
   cancelNoticeCommentAt DateTime? @map("cancel_notice_comment_at")
   createdAt           DateTime          @default(now())
