@@ -38,6 +38,7 @@ import { getSettingValue } from '@/lib/settings-store'
 import type { ShipmentServiceClient } from '@/lib/domain/sales/shipment-service'
 import { scrubWmsError } from './error-scrub'
 import { recordWmsMutationEvent } from './mutation-audit'
+import { proveMergeLineage, type MergeLineageProof } from './merge-lineage'
 
 /**
  * Connector-agnostic WMS dispatch sweep (q66in.1.1/1.5 + G2, hoisted to the generic
@@ -496,6 +497,11 @@ export type WmsDispatchSweepDeps = {
   ): Promise<{ ok: boolean; error?: string; shadowed?: boolean; shadowReason?: string }>
   // Merge handling: repoint the push link to the surviving WMS order when this order was
   // merged into another (its own WMS order is destroyed).
+  /**
+   * Whether the candidate survivor really absorbed this order (its lines hold every recorded line id of it). Optional so existing test
+   * doubles keep compiling; absent, no proof is asked (production always supplies it).
+   */
+  proveMergeLineage?(linkId: string, survivorExternalId: string): Promise<MergeLineageProof>
   repointLink(linkId: string, to: { externalOrderId: string; externalOrderNumber: string }): Promise<void>
   // 6oyu.2: consecutive-failure tracking. recordDispatchError increments the link's
   // failure count (dead-lettering at DISPATCH_MAX_CONSECUTIVE_FAILURES — the link then
@@ -1232,6 +1238,15 @@ export async function reconcileOneOrder(
   // Merge: the WMS merged this order into a survivor (combined "a+b" number); our original
   // WMS order is gone. Repoint the link to the survivor, then process under its number.
   if (status.isMerged && status.externalOrderNumber !== candidate.externalOrderNumber) {
+    // THE COMBINED NUMBER ONLY NAMES ITS PARTS: it is a candidate filter, not proof that this survivor absorbed OUR order ("A+B+C" lists B
+    // too). The link is re-pointed, and the survivor's despatch applied to this order, only when the survivor's lines contain every
+    // recorded line id of this order. Otherwise the link is left as it is, unresolved, for a person.
+    if (deps.proveMergeLineage) {
+      const proof = await deps.proveMergeLineage(candidate.linkId, status.externalOrderId)
+      if (!proof.proven) {
+        return { action: 'pending', reason: `A merge into WMS order ${status.externalOrderNumber} could not be proven (${proof.reason}); check it in the WMS`, unresolved: true }
+      }
+    }
     await deps.repointLink(candidate.linkId, {
       externalOrderId: status.externalOrderId,
       externalOrderNumber: status.externalOrderNumber,
@@ -2826,6 +2841,13 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         ...(result.shadowed === true ? { shadowed: true } : {}),
         ...(result.shadowed === true && result.shadowReason ? { shadowReason: result.shadowReason } : {}),
       }
+    },
+    async proveMergeLineage(linkId, survivorExternalId) {
+      // Only a TRUSTWORTHY record counts: the ids are ignored while marked untrustworthy or under a live amendment lease.
+      const mark = await db.wmsOrderPushLink.findUnique({ where: { id: linkId }, select: { lineSnapshotUnsafeAt: true, amendLeaseExpiresAt: true } })
+      const trusted = mark !== null && mark.lineSnapshotUnsafeAt === null && !(mark.amendLeaseExpiresAt && mark.amendLeaseExpiresAt > new Date())
+      const rows = trusted ? await db.wmsOrderPushItem.findMany({ where: { linkId } }) : []
+      return proveMergeLineage(connector, survivorExternalId, rows.map((row) => ({ externalItemId: row.externalItemId, sku: row.sku, quantity: row.quantity })))
     },
     async repointLink(linkId, to) {
       // Park as MERGED so the push-sweep's SYNCED-filtered passes skip it (no dual-sync

@@ -832,6 +832,17 @@ async function fetchMintsoftOrderItemsStrict(externalOrderId: string, clientId: 
 }
 
 /**
+ * READ-ONLY. The lines of an order, read strictly, after the ownership gate (our client). Used to PROVE a merge before a link is re-pointed.
+ * Throws when the order is not found or its lines are unreadable; never answers "fewer lines".
+ */
+export async function readMintsoftOrderItemRefs(externalOrderId: string): Promise<WmsOrderItemRef[]> {
+  const clientId = await getPushClientId('Mintsoft order lines read')
+  const gate = await fetchMintsoftOrderStatusId(externalOrderId, clientId, null)
+  if (!gate.found) throw new Error(`Mintsoft order ${externalOrderId} not found`)
+  return fetchMintsoftOrderItemsStrict(externalOrderId, clientId)
+}
+
+/**
  * The lines of an order IMS has just created or amended, as the warehouse numbers them. BEST EFFORT and never throws: the order exists
  * already, so a failed read must not fail the push (a retry would duplicate it). The create response carries no lines (live), so this is
  * a read-back of the order just created.

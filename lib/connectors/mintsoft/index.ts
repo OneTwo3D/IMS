@@ -7,7 +7,7 @@ import {
 import { updateMintsoftProductContent } from './api/product-content'
 import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 import { fetchMintsoftOrderList, fetchMintsoftOrderStatus, fetchMintsoftOrderParts, fetchMintsoftPartItems, probeMintsoftOrderPresence } from './api/orders'
-import { addMintsoftOrderComment, cancelMintsoftOrder, findMintsoftMergedSurvivor, pushMintsoftOrder, removeMintsoftOrderItems, reconcileMintsoftAmbiguousCreate, updateMintsoftOrder, verifyMintsoftPushedOrder } from './api/order-push'
+import { addMintsoftOrderComment, readMintsoftOrderItemRefs, cancelMintsoftOrder, findMintsoftMergedSurvivor, pushMintsoftOrder, removeMintsoftOrderItems, reconcileMintsoftAmbiguousCreate, updateMintsoftOrder, verifyMintsoftPushedOrder } from './api/order-push'
 import { parseMintsoftPositiveId } from './settings/schema'
 import { getSettingValue } from '@/lib/settings-store'
 
@@ -173,6 +173,10 @@ export class MintsoftConnector implements WmsConnector {
 
   async updateOrder(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult> {
     return updateMintsoftOrder(externalOrderId, input)
+  }
+
+  async fetchOrderItemRefs(externalOrderId: string): Promise<WmsOrderItemRef[]> {
+    return readMintsoftOrderItemRefs(externalOrderId)
   }
 
   async cancelOrder(externalOrderId: string, expected: WmsExpectedOrder): Promise<WmsOrderCancelResult> {

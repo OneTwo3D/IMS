@@ -280,6 +280,7 @@ async function sweep(port: WmsOrderPushPort, overrides: Record<string, unknown> 
     addOrderComment: async (id: string, comment: string) => orderPush.addMintsoftOrderComment(id, comment),
     removeOrderItems: async (id: string, expected: { orderNumber: string | null }, items: WmsOrderItemRef[]) => orderPush.removeMintsoftOrderItems(id, expected.orderNumber, items),
     findMergedSurvivor: async (number: string) => orderPush.findMintsoftMergedSurvivor(number),
+    fetchOrderItemRefs: async (id: string) => orderPush.readMintsoftOrderItemRefs(id),
     verifyPushedOrder: async () => 'ours' as const,
     probeOrderPresence: async () => 'FOUND' as const,
     ...overrides,
@@ -1436,5 +1437,31 @@ test('AMEND CONTROL: the courier is rejected, the order is still verified, and t
       if (seq[i] === 'POST /api/Order/4242') { posts += 1; assert.equal(seq[i - 1], 'GET /api/Order/4242', `header POST #${posts} is directly preceded by an identity read`) }
     }
     assert.equal(posts, 2)
+  })
+})
+
+// ---------------------------------------------------------------- 22. review round 17: lineage before re-pointing -------------------
+
+test('LINEAGE: B\'s id 404s and the number search finds a flagged survivor "A+B+C" that merely LISTS B but holds none of B\'s recorded lines: no re-point, no removal, no cancel, a notice', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    fake.orders.get(SURVIVOR)!.number = 'IMSTEST-A+IMSTEST-D+IMSTEST-C' // lists D (the absorbed link's number) but D's lines 3603106/7 are not on it
+    fake.orders.get(SURVIVOR)!.items = [...E_LINES, { ID: 4000001, SKU: 'C-ONLY', Quantity: 5 }]
+    const h = makePort({ cancellable: [absorbedLinkRef()], items: storedD })
+    const result = await sweep(h.port)
+    assert.equal(h.writes.some((w) => w.data.state === 'MERGED' || w.data.externalOrderId === SURVIVOR), false, 'the link was not re-pointed')
+    assert.equal(fake.requests.some((r) => r.method !== 'GET' || r.path.endsWith('/Cancel')), false)
+    assert.equal(result.operatorNotices, 1)
+    assert.match(String(h.writes.find((w) => typeof w.data.lastError === 'string')!.data.lastError), /could not be proven/)
+  })
+})
+
+test('LINEAGE: a genuine merge (every recorded id present with its SKU and quantity) is re-pointed and handled exactly as before', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const h = makePort({ cancellable: [absorbedLinkRef()], items: storedD })
+    await sweep(h.port)
+    assert.ok(h.writes.some((w) => w.data.state === 'MERGED' && w.data.externalOrderId === SURVIVOR))
+    assert.deepEqual(survivorItems(), E_LINES)
   })
 })

@@ -694,6 +694,12 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
    * (none, several, an incomplete search page) is null, and the caller treats the order as simply not found.
    */
   findMergedSurvivor?(orderNumber: string): Promise<WmsMergedSurvivorLookup>
+  /**
+   * READ-ONLY. The lines of a warehouse order as the warehouse itself numbers them (id, SKU, whole quantity), read strictly: it THROWS
+   * rather than answering fewer lines when the response is unreadable. Used to PROVE a merge (the candidate survivor must hold every
+   * recorded line id of the order) before a link is re-pointed at it.
+   */
+  fetchOrderItemRefs?(externalOrderId: string): Promise<WmsOrderItemRef[]>
   /** Amend an already-pushed WMS order; a no-op (updated=false) if past NEW. */
   updateOrder?(externalOrderId: string, input: WmsOrderPushInput, clearance: WmsWriteClearance<'order.amend'>): Promise<WmsOrderUpdateResult>
   /** Cancel a WMS order by its external id; a no-op (success) if past NEW. */

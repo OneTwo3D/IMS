@@ -19,6 +19,7 @@ import type { WmsConnector, WmsOrderAddress, WmsOrderItemRef, WmsOrderPushInput,
 import { decideWmsHeldRelease, wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal, wmsCreateReplayPolicy, type WmsCreateReplayPolicySource } from './create-replay-policy'
 import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere, wmsPaidBeforeCreateFloor } from './create-eligibility'
 import { scrubWmsError } from './error-scrub'
+import { proveMergeLineage } from './merge-lineage'
 import { recordWmsMutationEvent, type WmsMutationEventInput } from './mutation-audit'
 import {
   createWmsPushStateSchemaGate,
@@ -1183,7 +1184,7 @@ type PushConnector = Pick<
   // revalidation pass needs before it may re-open a create whose outcome is unknown. Tri-state on
   // purpose: only MISSING means "verifiably no such order", and a merged/ambiguous match must
   // never be reported as MISSING.
-  'pushOrder' | 'updateOrder' | 'cancelOrder' | 'addOrderComment' | 'verifyPushedOrder' | 'probeOrderPresence' | 'reconcileAmbiguousCreate' | 'findMergedSurvivor' | 'removeOrderItems' | 'cancelMergedOrder'
+  'pushOrder' | 'updateOrder' | 'cancelOrder' | 'addOrderComment' | 'verifyPushedOrder' | 'probeOrderPresence' | 'reconcileAmbiguousCreate' | 'findMergedSurvivor' | 'removeOrderItems' | 'cancelMergedOrder' | 'fetchOrderItemRefs'
 >
 
 /**
@@ -1550,7 +1551,21 @@ export async function runWmsOrderPushSweepCore(
       } catch (error) {
         lookup = { kind: 'INCONCLUSIVE', reason: scrubWmsError(error, 'the merge lookup failed') }
       }
-      if (lookup.kind === 'FOUND') survivor = { externalOrderId: lookup.externalOrderId, externalOrderNumber: lookup.externalOrderNumber }
+      if (lookup.kind === 'FOUND') {
+        // THE NUMBER IS ONLY A CANDIDATE FILTER, never proof: a survivor "A+B+C" lists B too and may be someone else's. The candidate is
+        // persisted on this link only when its lines, read fresh, contain EVERY recorded line id of this order with the recorded SKU and
+        // quantity. Otherwise the link is left exactly as it was and an operator is told.
+        const stored = (await port.readOrderItems?.(link.id).catch(() => [])) ?? []
+        const proof = await proveMergeLineage(connector, lookup.externalOrderId, stored)
+        if (!proof.proven) {
+          await raiseWmsRefusalNotice(link, intent,
+            `${intent === 'HOLD' ? 'Held' : 'Cancelled'} in IMS, but WMS order ${link.externalOrderId} was not found, and a possible merge into WMS order ${lookup.externalOrderId} could not be proven (${scrubWmsError(proof.reason, 'not proven')}). `
+            + `IMS did not re-point this order or ${intent === 'HOLD' ? 'record it as held' : 'record it as cancelled in the WMS'} — check it in the WMS.`,
+            { wmsStatus: 'NOT_FOUND', summary: `IMS ${intent === 'HOLD' ? 'hold' : 'cancel'} could not be confirmed: the WMS order was not found and a possible merge could not be proven — left for an operator`, comment: null }, ts)
+          return
+        }
+        survivor = { externalOrderId: lookup.externalOrderId, externalOrderNumber: lookup.externalOrderNumber }
+      }
       if (lookup.kind === 'INCONCLUSIVE') {
         // An INCONCLUSIVE lookup (an error, a full page, several candidates) is not "no survivor". The final not-found notice would take
         // the link out of the hold/cancel passes for good, so nothing is stamped: the link stays retryable with the transient reason on
