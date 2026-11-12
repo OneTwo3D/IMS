@@ -4,7 +4,7 @@ import test from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
 import { resolveEuVatRegime } from '@/lib/domain/accounting/eu-vat-regime'
 import {
-  buildEuVatRegimeInput, loadRateMappings, readPluginFx, readEasFact, readGoodsLines, readRateTax, readVatRecord, readWcEuVatFacts, resolveThresholdFx, type EuVatRegimeInputClient,
+  buildEuVatRegimeInput, giftCardFlagPolicy, loadRateMappings, readPluginFx, readEasFact, readGoodsLines, readRateTax, readVatRecord, readWcEuVatFacts, resolveThresholdFx, type EuVatRegimeInputClient,
 } from '@/lib/connectors/woocommerce/sync/eu-vat-facts'
 import type { WcFullOrder, WcMeta } from '@/lib/connectors/woocommerce/sync/types'
 
@@ -210,6 +210,28 @@ test('adopt mode end to end (the default): the plugin account decides and its co
   const decide = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder(), { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide' })
   assert.equal(decide.mode, 'decide')
   assert.equal(resolveEuVatRegime(decide).kind === 'SCHEME' && (resolveEuVatRegime(decide) as { regime: string }).regime, 'IOSS')
+})
+
+test('gift-card cut-in: unset is off; an order at or after the cut-in needs a flag on every line; before it is lenient; an invalid setting refuses', async () => {
+  const cutIn = { state: 'ok' as const, at: new Date('2026-11-01T10:00:00Z') }
+  assert.equal(giftCardFlagPolicy({ state: 'unset' }, new Date('2030-01-01T00:00:00Z')), 'off')
+  assert.equal(giftCardFlagPolicy(cutIn, new Date('2026-11-01T09:59:59Z')), 'off')
+  assert.equal(giftCardFlagPolicy(cutIn, new Date('2026-11-01T10:00:00Z')), 'required')
+  assert.equal(giftCardFlagPolicy({ state: 'invalid', raw: 'x' }, new Date('2026-01-01T00:00:00Z')), 'setting_unreadable')
+  assert.equal(giftCardFlagPolicy(cutIn, new Date('nope')), 'setting_unreadable')
+  const client = fakeClient({ mappings: [mappingRow(216, {})] })
+  const unflagged = wcOrder({ line_items: [{ id: 1, total: '100.00', meta_data: [meta('_o3d_is_voucher', 'no')] }, { id: 2, total: '5.00', meta_data: [] }] as never })
+  const after = await buildEuVatRegimeInput(client, unflagged, { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide', giftCardCutIn: { state: 'ok', at: new Date('2026-10-01T00:00:00Z') } })
+  assert.equal(after.giftCardFlag, 'required')
+  assert.equal((resolveEuVatRegime(after) as { code?: string }).code, 'gift_card_flag_missing')
+  const before = await buildEuVatRegimeInput(client, unflagged, { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide', giftCardCutIn: { state: 'ok', at: new Date('2026-12-01T00:00:00Z') } })
+  assert.equal(before.giftCardFlag, 'off')
+  assert.equal(resolveEuVatRegime(before).kind, 'SCHEME')
+  const flagged = wcOrder({ line_items: [{ id: 1, total: '100.00', meta_data: [meta('_o3d_is_voucher', 'no')] }, { id: 2, total: '5.00', meta_data: [meta('_o3d_is_voucher', 'yes')] }] as never })
+  const ok = await buildEuVatRegimeInput(client, flagged, { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide', giftCardCutIn: { state: 'ok', at: new Date('2026-10-01T00:00:00Z') } })
+  assert.equal(resolveEuVatRegime(ok).kind, 'SCHEME')
+  const unset = await buildEuVatRegimeInput(client, unflagged, { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide' })
+  assert.equal(unset.giftCardFlag, 'off')
 })
 
 // ---- unreadable figures are named, never defaulted to 0 -------------------------------------------------------------------------------------------------------------

@@ -18,7 +18,7 @@ import type {
   EasFact, EuVatRegimeInput, EuVatRegimeMode, GoodsLineFact, PluginFxFact, RateFact, RateMappingFact, ThresholdFxFact, VatRecordFact,
 } from '@/lib/domain/accounting/eu-vat-regime'
 import { normaliseDestination } from '@/lib/domain/accounting/eu-vat-regime'
-import { EU_VAT_REGIME_MODE_SETTING, parseRegimeMode } from '@/lib/domain/accounting/eu-vat-settings'
+import { EU_VAT_GIFT_CARD_CUT_IN_SETTING, EU_VAT_REGIME_MODE_SETTING, parseGiftCardCutIn, parseRegimeMode, type GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
 import { getSettingValues } from '@/lib/settings-store'
 import { readWclcFeeKind, wcMetaFlag } from './field-mapping'
 import { parseWcGmtInstant } from './receipt-settlement-rate'
@@ -257,6 +257,19 @@ export async function readEuVatRegimeMode(): Promise<EuVatRegimeMode | null> {
   return parseRegimeMode(values.get(EU_VAT_REGIME_MODE_SETTING))
 }
 
+/** The gift-card flag cut-in as stored: unset, a date, or invalid (never coerced). */
+export async function readGiftCardFlagCutIn(): Promise<GiftCardCutIn> {
+  const values = await getSettingValues([EU_VAT_GIFT_CARD_CUT_IN_SETTING])
+  return parseGiftCardCutIn(values.get(EU_VAT_GIFT_CARD_CUT_IN_SETTING))
+}
+
+/** Whether the order must carry the gift-card flag on every line: it was created at or after the cut-in. An unset cut-in is `off`; an invalid one, or a set one with no readable order date, is `setting_unreadable`. */
+export function giftCardFlagPolicy(cutIn: GiftCardCutIn, orderedAt: Date): 'off' | 'required' | 'setting_unreadable' {
+  if (cutIn.state === 'unset') return 'off'
+  if (cutIn.state === 'invalid' || Number.isNaN(orderedAt.getTime())) return 'setting_unreadable'
+  return orderedAt.getTime() >= cutIn.at.getTime() ? 'required' : 'off'
+}
+
 export type EuVatRegimeInputClient = MappingClient & FxLookupClient
 
 /** The resolver's whole input for a WooCommerce order. `accounts` are the configured VAT account codes (Xero account roles). */
@@ -264,7 +277,7 @@ export async function buildEuVatRegimeInput(
   client: EuVatRegimeInputClient,
   order: WcFullOrder,
   accounts: { ioss: string | null; ddp: string | null },
-  options: { baseCurrency?: string; mode?: EuVatRegimeMode } = {},
+  options: { baseCurrency?: string; mode?: EuVatRegimeMode; giftCardCutIn?: GiftCardCutIn } = {},
 ): Promise<EuVatRegimeInput> {
   const facts = readWcEuVatFacts(order)
   const mappings = await loadRateMappings(client, facts.rateTax.map((r) => r.wooRateId))
@@ -276,5 +289,5 @@ export async function buildEuVatRegimeInput(
     : await resolveThresholdFx(client, { currency: facts.currency, destination, orderedAt, baseCurrency: options.baseCurrency })
   const { rateTax: _rateTax, ...rest } = facts
   void _rateTax
-  return { ...rest, mode: options.mode ?? 'adopt_plugin', rates, thresholdFx, accounts }
+  return { ...rest, mode: options.mode ?? 'adopt_plugin', rates, thresholdFx, accounts, giftCardFlag: giftCardFlagPolicy(options.giftCardCutIn ?? { state: 'unset' }, orderedAt) }
 }

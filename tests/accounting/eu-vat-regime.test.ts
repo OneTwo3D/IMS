@@ -186,6 +186,8 @@ const refusalRows: Array<[string, EuVatRegimeInput, (typeof REFUSAL_CODES)[numbe
   ['adopt: the plugin left differing FX meta unchanged', order({ mode: 'adopt_plugin', pluginVatAccount: '821', pluginFxConflict: true }), 'plugin_fx_conflict'],
   ['tax on a rate that is not a scheme rate beside scheme VAT', order({ orderTax: '25.00' }), 'tax_not_explained_by_scheme_rates'],
   ['an unflagged line decides DDP', order({ goodsLines: [{ total: '400.00', voucher: 'unknown' }] }), 'voucher_status_unknown'],
+  ['after the gift-card cut-in a line has no flag', order({ giftCardFlag: 'required', goodsLines: [{ total: '100.00', voucher: 'no' }, { total: '5.00', voucher: 'unknown' }] }), 'gift_card_flag_missing'],
+  ['the gift-card cut-in setting is unreadable', order({ giftCardFlag: 'setting_unreadable' }), 'gift_card_cut_in_unreadable'],
   ['a zero-tax EU order with the exempt flag unknown', order({ vatExempt: 'unknown', rates: [], orderTax: '0' }), 'vat_exempt_status_unknown'],
   ['no DDP account configured on a DDP order', eurOrderOf('200.00', { accounts: { ioss: '821', ddp: '' } }), 'vat_account_not_configured'],
 ]
@@ -549,4 +551,19 @@ test('adopt evidence: unflagged lines may be gift cards the plugin left out, so 
 test('adopt evidence: an order with no conversion record is exempt (before the plugin wrote one); decide mode never reads it', () => {
   assert.equal(resolveEuVatRegime(adopt({ pluginVatAccount: '232', pluginFx: { state: 'absent' } })).kind, 'SCHEME')
   assert.equal(resolveEuVatRegime(order({ pluginFx: { state: 'present', rate: '1', pair: 'EUR>EUR', thresholdValue: '900.00' } })).kind, 'SCHEME')
+})
+
+test('gift-card cut-in: required refuses ANY unflagged line in either mode and for any destination; flagged lines, off and absent keep today\'s behaviour', () => {
+  const lines = [{ total: '100.00', voucher: 'no' as const }, { total: '3.00', voucher: 'unknown' as const }]
+  for (const mode of ['decide', 'adopt_plugin'] as const) {
+    assert.equal(refused(resolveEuVatRegime(order({ mode, giftCardFlag: 'required', goodsLines: lines }))).code, 'gift_card_flag_missing', mode)
+  }
+  // a non-scheme (UK) order is refused too: the rule is on the order's lines, not on the regime
+  const uk = order({ giftCardFlag: 'required', shippingCountry: 'GB', billingCountry: 'GB', rates: [], orderTax: '0.00', goodsLines: lines })
+  assert.equal(refused(resolveEuVatRegime(uk)).code, 'gift_card_flag_missing')
+  // every line flagged (yes or no): resolves
+  assert.equal(resolveEuVatRegime(order({ giftCardFlag: 'required', goodsLines: [{ total: '100.00', voucher: 'no' }, { total: '3.00', voucher: 'yes' }] })).kind, 'SCHEME')
+  // off / absent: a small unflagged line that cannot change the regime still resolves, as before
+  assert.equal(resolveEuVatRegime(order({ giftCardFlag: 'off', goodsLines: lines })).kind, 'SCHEME')
+  assert.equal(resolveEuVatRegime(order({ goodsLines: lines })).kind, 'SCHEME')
 })
