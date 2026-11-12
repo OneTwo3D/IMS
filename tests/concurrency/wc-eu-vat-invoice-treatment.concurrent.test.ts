@@ -1126,7 +1126,7 @@ async function domesticHoldMutated(t: test.TestContext, mutate: ((p: ReturnType<
   if (mutate) mutate(again)
   if (between) await between(db, orderId)
   await importWcOrder(again as never)
-  return { after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }), rows: await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId } }) }
+  return { all: await db.accountingSyncLog.findMany({ where: { referenceId: orderId } }), after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }), rows: await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId } }) }
 }
 
 test('[eu vat] CONTROL: the same domestic hold, unchanged, is released (the fresh build equals the parked payload)', { skip }, async (t) => {
@@ -1158,4 +1158,16 @@ test('[eu vat] a PAID held order whose receipt\'s settlement rate changes before
   assert.equal(rows.length, 0, 'nothing was queued')
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /at _paymentSettlementRateToBase\)/)
+})
+
+// STORE CREDIT ADDED AFTER PARKING: neither the invoice nor the payment may be queued.
+test('[eu vat] store credit added to the order after a treated hold was parked: the hold is order_changed, nothing is queued', { skip }, async (t) => {
+  const { after, rows, all } = await domesticHoldMutated(t, (p) => {
+    p.coupon_lines = [{ id: 41, code: 'sc', discount: '5.00', discount_tax: '0.00', meta_data: [{ id: 9, key: 'coupon_info', value: '[1,"sc","smart_coupon","50"]' }] }] as never
+    p.total = '127.00'; p.discount_total = '5.00' as never
+  })
+  assert.equal(rows.length + all.length, 0, 'no invoice and no payment follow-up was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /store credit/)
+  assert.deepEqual(((after.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment), { applied: false, reason: 'order_changed' })
 })

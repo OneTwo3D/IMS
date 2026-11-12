@@ -2083,7 +2083,8 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     couponLines: wcOrder.coupon_lines, orderMeta: wcOrder.meta_data, feeLines: wcOrder.fee_lines, lineDiscountTotalForeign: lineDiscountTotal, currency,
     resolveResidual: ({ couponTotalForeign, lineDiscountTotalForeign: lineTotal, currency: cur }) => resolveWcOrderLevelDiscount({ couponTotalForeign, lineDiscountTotalForeign: lineTotal, currency: cur }),
   })
-  if (coupons.storeCreditForeign.gt(0)) return { outcome: 'not-needed' }
+  // Store credit on the order NOW (a hold parked as a store-credit hold, marker `store_credit`, is already withheld by the release): any other hold, treated or not, is an order that changed after it was parked, and 'not-needed' would let the caller release it unchecked.
+  if (coupons.storeCreditForeign.gt(0)) return await refuseChanged('the order now carries store credit, which its parked invoice does not account for')
   if (coupons.refusal) return await refuseChanged('its coupons can no longer be classified')
   const amounts = resolveWcAccountingAmountConvention({ pricesIncludeVat: wcOrder.prices_include_tax, shippingForeign: mapWcShipping(wcOrder).shippingForeign, orderLevelDiscountForeign: coupons.orderLevelDiscount })
   const expected: ExpectedHeldInvoice = {
@@ -2146,6 +2147,7 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   const verifyTreated = async (client: Prisma.TransactionClient, parked: HeldSalesInvoicePayload, parkedMarker: Marker): Promise<string | null> => {
     // Zero-tax routes (scheme, B2B) sum to the order's total; an ordinary taxed invoice (route none) does not, so its total is compared as the order total recorded when it was parked.
     const zeroTax = parkedMarker.route === 'scheme' || parkedMarker.route === 'b2b_zero_rate'
+    if (coupons.storeCreditForeign.gt(0)) return 'the order now carries store credit, which its parked invoice does not account for'
     const difference = heldInvoiceDifference(parked.accountingPayload, expected, true, zeroTax)
     if (difference !== null) return difference
     // Re-resolved on every call (the release's own re-check included), so a mapping changed in between is seen.
@@ -2231,7 +2233,7 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     orderId, wcOrder, payload: untreated, mappedLines, connector: chart, taxBindingDeps: { reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, invoiceTypes: currentInvoiceTypes }, accounts, storeCreditForeign: coupons.storeCreditForeign, now: new Date(),
   })
   if (outcome.kind === 'refused') return await refuse(`the EU IOSS/VOEC/DDP treatment refused it: ${outcome.reason}. Fix that, then re-import the order from WooCommerce to try again`)
-  if (outcome.kind === 'skipped') return { outcome: 'not-needed' }
+  if (outcome.kind === 'skipped') return await refuse(`the EU IOSS/VOEC/DDP treatment was skipped (${outcome.why}) on a hold that needs it`)
   const treated = outcome.payload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
     ? outcome.payload
     : { ...outcome.payload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? ''), taxBinding: recordWcTaxBinding(outcome.taxBinding) } }
@@ -2244,7 +2246,8 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     await tx.shoppingSyncLog.update({ where: { id: row.id }, data: { payload: { ...currentHeld, accountingPayload: treated } as unknown as Prisma.InputJsonValue, errorMessage: null } })
     return 'treated' as const
   }, { maxWait: 5_000, timeout: 20_000 })
-  return written === 'treated' ? { outcome: 'treated', recheck } : { outcome: 'not-needed' }
+  // Even when the hold changed under the lock, the release re-reads it and runs the recheck: 'not-needed' never means 'release unchecked'.
+  return written === 'treated' ? { outcome: 'treated', recheck } : { outcome: 'not-needed', recheck }
 }
 
 async function releaseHeldWcSalesInvoice(
