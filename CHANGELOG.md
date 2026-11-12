@@ -28,6 +28,16 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 - **Fixed (review follow-up): a PAID document skipped for an unreadable payment date is revisited, and never lost.** It is remembered in a new table `xero_payment_date_pending` (migrations `20261110180000_xero_payment_date_pending` and `20261111100000_xero_payment_date_pending_tenant`, additive, ids only, scoped to the connected Xero organisation) and re-read by id on every poll (200 at a time, least recently checked first) and applied once the date is readable. A row is forgotten only when Xero's answer shows the retry is unnecessary; a document Xero leaves out of the answer stays. Remembering is a condition of the poll moving on: if the save fails the poll holds its position. Nothing is evicted. The WARNING stays.
 - Help: *Xero sync*, "Supplier bills and supplier credit notes: no tax type, no document" and "Bill VAT: each line's own rate".
 
+## 3.1.0 - 2026-11-12
+
+No operator action is required: there is no configuration change, and the two migrations are additive and nullable. Behaviour changes to know about before relying on the screens:
+
+- An in-app dispatch of a Draft, On Hold or Pending payment order is now refused. A warehouse despatch of an On Hold or Pending payment order that already has a shipment is recorded without promoting the order (administrators get a notice); a warehouse despatch of a Draft order, or of a held order with no shipment, is held as a stuck despatch on Sync > Exceptions.
+- Financial reports (revenue, AR Aging, Customer Aging, Currency Summary, Sales Analytics) now count archived orders and use one invoiced-revenue basis, so figures for a past period can differ from what was shown before.
+- A refund entered by hand is now strictly bounded by what the order line and the customer paid, and the refund dialog sends the credit-note figure it shows.
+- A despatch from the warehouse for an order cancelled or fully refunded in IMS is not applied; it shows as a stuck despatch for a person to decide.
+- A report that hits its row limit now says so instead of showing zeros.
+
 ### Dispatch completion: orders always follow the dispatch, and services no longer hold an order open
 
 - **Fixed: dispatching the last shipment of an On Hold, Processing, Draft or Pending payment order no longer fails after the goods have left.** The order promotion used to run in a second transaction after the dispatch had committed and threw because those statuses have no direct step to Shipped; the operator saw a failure for a dispatch that had happened, the activity rows, storefront push, invoice trigger, despatch email and stock sync were skipped, and every retry failed the same way. The promotion now runs inside the dispatch transaction: the stock decrement, FIFO/COGS and the order flip commit together or roll back together. An order still in Processing is moved to Shipped through Allocated, and an "Order shipped from a non-fulfilment status" warning is logged.
