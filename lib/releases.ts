@@ -14,6 +14,31 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
+    version: '3.1.0',
+    date: '2026-11-12',
+    title: 'Dispatch completion, searchable order lists, Mintsoft push hardening, reconciling refund and PDF figures, one revenue basis',
+    summary: 'User-facing, non-breaking release on top of 3.0.0. Dispatching the last shipment now moves a ready order on in the same step, IMS refuses to dispatch a Draft, On Hold or Pending payment order, and a warehouse despatch of such an order is either recorded without moving the order on or held on Sync > Exceptions, the Sales and Purchase Order lists search every order, the Mintsoft order push recovers from lost creates, merged orders and holds or cancels the warehouse cannot honour, refunds entered by hand are strictly bounded and the order page, refund dialog and PDFs reconcile, and every revenue and receivables report uses one invoiced basis that includes archived orders. Everything in it is live: nothing is behind a flag. The two migrations are additive and nullable, and no operator action is required.',
+    userMessage: 'IMS 3.1 makes dispatch and refunds safer and the order lists complete: you can search every sales and purchase order, a Draft, On Hold or Pending payment order can no longer be dispatched from IMS by mistake (a warehouse despatch of one is recorded or held for review, never silently completed), refunds entered by hand cannot exceed what was paid, and financial reports now include archived orders so their totals match across screens.',
+    userHighlights: [
+      'Dispatch: dispatching the last shipment of an order now moves the order on in the same step, so it no longer fails after the goods have left. Dispatching a Draft, On Hold or Pending payment order from IMS is refused with a message naming the next step. When the warehouse reports a despatch for an On Hold or Pending payment order that already has a shipment, the despatch and stock are recorded but the order is not moved on and administrators get a notice; a warehouse despatch for a Draft order, or for a held order with no shipment, is held as a stuck despatch on Sync > Exceptions. Also, a service, fee or delivery-charge line no longer keeps an order in Allocated.',
+      'Orders: the Sales Orders and Purchase Orders lists search every order, 50 per page, with the result count shown. Completed and archived orders can be shown with the Hide completed and Include archived ticks, and a search always includes them.',
+      'Reports: a report that hits its row limit now says so with a red banner, dashes and "Report not computed" instead of showing zeros, and its CSV export is refused rather than downloaded as zeros.',
+      'Refunds: the amount of a refund entered by hand is limited to what the order line has left and what the customer paid, its product always matches the line it refunds, and a full refund includes its share of the order discount. The refund dialog shows and sends the credit note, and credit-note VAT and totals are marked as estimates.',
+      'Orders and PDFs: the order page and the sales order and invoice PDFs print one basis (all gross or all net), with VAT rows that add up to the Total.',
+      'Reports: revenue is what has been invoiced, on every report, and archived orders are included, so AR Aging, Customer Aging, Currency Summary and Sales Analytics agree. Figures for a past period can differ from before.',
+      'Mintsoft: a create that timed out is looked up and linked instead of being parked, merged orders are detected, holds and cancels the warehouse cannot honour show on Sync > Exceptions, and a despatch for an order cancelled or fully refunded in IMS is held for a person to decide.',
+    ],
+    technicalHighlights: [
+      'Dispatch: the order promotion runs inside the dispatch transaction under the order lock, an in-app dispatch of DRAFT, ON_HOLD or PENDING_PAYMENT is refused before any stock or cost work, a warehouse despatch for an ON_HOLD or PENDING_PAYMENT order that already has a shipment is booked without touching the order and raises a notice, while a warehouse despatch for a DRAFT order or a held order with no shipment is not recorded and becomes a stuck despatch on Sync > Exceptions, and a WMS dispatch retry reconciles the order under its lock. Service lines are excluded from the completion check.',
+      'Order lists: search, status filter and paging run in the database over the existing tables ordered by the createdAt index (no new index); searches under 3 characters match an order number or reference exactly. Row-limit refusals carry a reportNotComputed flag and the CSV export still returns HTTP 413.',
+      'Mintsoft push: read-only lookup of a landed create linked only on exactly one live order carrying the order number and its own reference, read back by id; merged-order detection by one read-only search; hold and cancel 404s are no longer recorded as success; a despatch is refused for an order IMS no longer intends to ship.',
+      'Migrations (additive, nullable, no backfill): 20261110100000_wms_push_link_operator_notices and 20261110120000_wms_push_link_notice_comment_delivery add notice columns to wms_order_push_links.',
+      'Refunds: the manual-refund ceiling is enforced on the server under the order lock per line, per currency column and cumulatively at the rate each row posts under; the header total is the sum of its lines per currency column; the discount reversal is one shared function used by the server and the dialog.',
+      'Reports: one invoiced-revenue basis, one report date (invoice date, else paid date, else order date, flagged approximate), and one receivable balance in lib/domain/sales/receivable-balance.ts shared by AR Aging, Customer Aging, the Invoices tab and the Currency Summary. Archived orders are included; the retention job only hides them from operational lists.',
+      'Live versus switched off: all of the above is live. Nothing new is behind a flag, and the 3.0.0 switched-off items (customer invoice publish, Aelia rate source, EU VAT regime) are unchanged.',
+    ],
+  },
+  {
     version: '3.0.0',
     date: '2026-11-10',
     title: 'Catch-up release: posting safeguards, purchase-order lifecycle, WooCommerce store fence, VAT/IOSS groundwork, scheduler and deploy hardening',
