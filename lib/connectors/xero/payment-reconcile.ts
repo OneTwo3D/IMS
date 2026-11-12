@@ -32,6 +32,7 @@ import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
 import type { XeroResponse } from './api'
 import { readSingleXeroDocument } from './single-document'
+import { parseXeroDateOrNull } from './xero-date'
 
 export type XeroReconcileInvoice = {
   InvoiceID: string
@@ -109,9 +110,7 @@ export function classifyDoc(doc: LinkedDoc, xero: XeroReconcileInvoice | undefin
 
 /** Parse a Xero settlement date, or null if absent/unparseable — never fabricate one. */
 export function parseSettlementDate(value: string | undefined): Date | null {
-  if (!value) return null
-  const d = new Date(value)
-  return Number.isFinite(d.getTime()) ? d : null
+  return parseXeroDateOrNull(value)
 }
 
 export type ApplyOutcome = { applied: boolean; paidDate?: string; reason?: string }

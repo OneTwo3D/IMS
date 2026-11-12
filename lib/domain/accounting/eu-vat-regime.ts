@@ -29,6 +29,9 @@
  * PLUGIN CONVERSION RECORD (adopt mode). With the account present: a conversion record that is incomplete or unreadable, or a reason text saying the plugin left differing FX meta unchanged, REFUSES; no conversion record at all
  * (an order from before the plugin wrote it) is stamped from the account and recorded as "not recorded by the plugin" (a deliberate exception so historic orders still work).
  *
+ * GIFT-CARD FLAG CUT-IN. When the setting `eu_vat_gift_card_flag_cut_in` is set and the order was created at or after it, a goods line whose flag is missing or unreadable refuses the order (`gift_card_flag_missing`) in both modes
+ * and whatever the destination; an unreadable setting refuses everything (`gift_card_cut_in_unreadable`). Unset keeps the reading above.
+ *
  * INTRINSIC VALUE = the sum of the goods lines' totals (after coupons, excluding VAT, shipping and fees), gift cards excluded. A gift card is a line flagged `_o3d_is_voucher`; the product-level marker
  * (`_coupon_title`) is not on the order and IMS does not import product meta, so an unflagged gift card counts as goods. That limit only matters in `decide` mode.
  *
@@ -93,6 +96,8 @@ export type GoodsLineFact = {
   total: string
   /** The gift-card flag (`_o3d_is_voucher`): yes and no were read from the line; unknown means the line carried none and the product-level marker (`_coupon_title`) is not imported to settle it. */
   voucher: 'yes' | 'no' | 'unknown'
+  /** The same flag read STRICTLY: only exactly `yes` or `no` count (an empty, blank or other value, and a missing key, are `unknown`). The cut-in rule reads this one; absent here is treated as `unknown` (fail closed). */
+  voucherStrict?: 'yes' | 'no' | 'unknown'
 }
 
 export type EuVatRegimeMode = 'adopt_plugin' | 'decide'
@@ -141,6 +146,11 @@ export type EuVatRegimeInput = {
   accounts: { ioss: string | null; ddp: string | null }
   /** The account the storefront plugin recorded on the order (`_o3d_ioss_vat_account`), when it handled the order. Only cross-checked here. */
   pluginVatAccount: string | null
+  /**
+   * REQUIRED, so every builder must decide it. The gift-card flag cut-in (`eu_vat_gift_card_flag_cut_in`), already compared with the order's creation date by the caller. `off` (the default, and absent): today's lenient reading. `required`: the order was created
+   * at or after the cut-in, so EVERY line must carry the flag. `setting_unreadable`: the cut-in is set to something that is not a date (or the order date cannot be read), so nothing can be decided.
+   */
+  giftCardFlag: 'off' | 'required' | 'setting_unreadable'
   /** The customs label's evidence: a non-zero over-threshold duty fee line (`_wclc_fee_kind` duty_fee) is on the order. */
   overThresholdDutyFee: boolean
 }
@@ -170,6 +180,8 @@ export const REFUSAL_CODES = [
   'vat_record_unreadable',
   'tax_not_explained_by_scheme_rates',
   'voucher_status_unknown',
+  'gift_card_flag_missing',
+  'gift_card_cut_in_unreadable',
   'vat_exempt_status_unknown',
 ] as const
 export type RefusalCode = (typeof REFUSAL_CODES)[number]
@@ -228,6 +240,11 @@ const roundMinor = (value: Decimal): Decimal => value.toDecimalPlaces(2, Prisma.
 
 export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision {
   if (input.unreadable.length > 0) return refuse('order_figure_unreadable', `the order carries figures that cannot be read, so nothing can be decided: ${input.unreadable.join('; ')}`)
+  if (input.giftCardFlag === 'setting_unreadable') return refuse('gift_card_cut_in_unreadable', 'the gift-card flag cut-in setting (or the order creation date) cannot be read, so it is not known whether this order must carry a gift-card flag on every line')
+  if (input.giftCardFlag === 'required') {
+    const missing = input.goodsLines.flatMap((line, index) => (line.voucherStrict === 'yes' || line.voucherStrict === 'no' ? [] : [index + 1]))
+    if (missing.length > 0) return refuse('gift_card_flag_missing', `the order was created after the gift-card flag cut-in but line(s) ${missing.join(', ')} carry no readable gift-card flag (_o3d_is_voucher yes/no)`)
+  }
   const destination = normaliseDestination(input.shippingCountry) || normaliseDestination(input.billingCountry)
   const covered = SCHEME_DESTINATIONS.has(destination)
   const where = destination === '' ? '(nowhere)' : destination

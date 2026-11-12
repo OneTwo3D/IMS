@@ -1,10 +1,11 @@
+import { Buffer } from 'node:buffer'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
 import {
-  SourceScanTooLargeError, hasSourceLimitNotice, isSourceLimitNotice, sourceLimitExportBody, sourceLimitNotice, withoutSourceLimitNotices,
+  SourceScanTooLargeError, hasSourceLimitNotice, isSourceLimitNotice, sourceLimitNotice, withoutSourceLimitNotices,
 } from '@/lib/security/source-scan-error'
 
 mock.module('next/link', {
@@ -31,11 +32,22 @@ test('the row-limit notice says what happened and what to do, and is recognisabl
   assert.deepEqual(withoutSourceLimitNotices(['a', notice]), ['a'])
 })
 
-test('CSV exports refuse a limit-hit report with a row-limit body instead of emitting zeros', () => {
-  const body = sourceLimitExportBody(error)
-  assert.equal(body.reportNotComputed, true)
-  assert.equal(body.rowLimit, 50000)
-  assert.match(body.error, /^This report hit its row limit/)
+test('CSV exports of a limit-hit report carry the notice row and headers instead of emitting zeros', async () => {
+  const { sourceLimitCsvResponse } = await import('@/lib/csv-source-limit')
+  const response = sourceLimitCsvResponse(error, ['a', 'b', 'c'], 'x.csv')
+  assert.equal(response.status, 200)
+  assert.equal(response.headers.get('X-IMS-Report-Not-Computed'), '1')
+  assert.equal(response.headers.get('X-IMS-Report-Row-Limit'), '50000')
+  const meta = JSON.parse(Buffer.from(response.headers.get('X-IMS-Export-Metadata') ?? '', 'base64url').toString('utf8')) as { reportNotComputed: boolean; rowLimit: number }
+  assert.equal(meta.reportNotComputed, true)
+  assert.equal(meta.rowLimit, 50000)
+  const exposed = (response.headers.get('Access-Control-Expose-Headers') ?? '').split(', ')
+  assert.ok(exposed.includes('X-IMS-Report-Not-Computed') && exposed.includes('X-IMS-Report-Row-Limit'), 'scripts in a browser can read the headers')
+  const lines = (await response.text()).split('\r\n')
+  assert.equal(lines[0], 'a,b,c')
+  assert.equal(lines.length, 2)
+  assert.ok(lines[1].startsWith('REPORT NOT COMPUTED,'))
+  assert.ok(lines[1].includes(sourceLimitNotice(error)))
 })
 
 test('a sales report that hit the limit renders an alert, dashes and "not computed", never zeros or "No rows"', async () => {

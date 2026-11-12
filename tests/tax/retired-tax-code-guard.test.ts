@@ -113,9 +113,10 @@ const PRODUCERS: Array<[string, RegExp, string]> = [
   ['lib/connectors/woocommerce/sync/order-import.ts', /rateBinding\(defaultRateNow\?\.id, 'plain', 'discount'\)/, 'WooCommerce import: discount rate'],
   ['lib/connectors/woocommerce/sync/order-import.ts', /currentTaxRates\(db, \[\.\.\.lineData\.map/, 'WooCommerce import: codes read from the rate rows now'],
   ['lib/domain/purchasing/purchase-invoice-edit.ts', /rateBinding\(poLine\.taxRate\.id, 'purchase_line'\) : rateBinding\(params\.fallbackTaxRateId, 'plain'\)/, 'purchase bill / update: PO line codes'],
-  ['lib/domain/purchasing/purchase-invoice-edit.ts', /rateBinding\(costLine\.vatable \? params\.fallbackTaxRateId : undefined, 'plain'\)/, 'purchase bill / update: cost-line (freight) codes'],
+  ['lib/domain/purchasing/purchase-invoice-edit.ts', /const costRateId = line\.booked \? \(line\.booked\.taxRateId \?\? undefined\) : costLine\.vatable \? params\.fallbackTaxRateId : undefined[\s\S]*\.\.\.rateBinding\(costRateId, 'plain'\)/, 'purchase bill / update: cost-line (freight) codes'],
+  ['lib/domain/purchasing/purchase-invoice-edit.ts', /rateBinding\(line\.booked\.taxRateId, 'purchase_line'\)/, 'purchase bill update: a booked line keeps its booked rate binding'],
   ['lib/domain/purchasing/supplier-credit-note.ts', /rateBinding\(params\.taxRateId, params\.taxRateBasis\)/, 'supplier credit note'],
-  ['app/actions/purchase-orders.ts', /taxRateBasis: baseRate\?\.id/, 'supplier credit note: the rate the type was read from'],
+  ['app/actions/purchase-orders.ts', /taxRateBasis: creditNoteTreatment\.taxRateId \? \(isReverseCharge \? 'purchase_line' : 'plain'\)/, 'supplier credit note: the booked bill line\'s rate the type was read from'],
 ]
 // [mutation: any one binding removed from its producer -> that census row fails]
 // [mutation: a producer derives its type inline instead of through the shared function -> its row fails; mutation: the shared call removed]
@@ -125,7 +126,7 @@ const SHARED: Array<[string, RegExp, string]> = [
   ['lib/domain/sales/refund-posted-tax-identity.ts', /resolveSalesLineTaxType\(\{/, 'credit note line type resolver'],
   ['lib/connectors/woocommerce/sync/order-import.ts', /resolveSalesLineTaxType\(params\)/, 'WooCommerce import line type'],
   ['lib/domain/purchasing/purchase-invoice-edit.ts', /resolvePurchaseLineTaxType\(\{/, 'purchase bill line type'],
-  ['app/actions/purchase-orders.ts', /taxTypeForBasis\('purchase_line'/, 'supplier credit note basis'],
+  ['lib/domain/purchasing/purchase-invoice-edit.ts', /resolvePurchaseLineTaxType\(\{[\s\S]*resolvePurchaseLineTaxType\(\{/, 'supplier credit note: a legacy bill line\'s reconstructed type (billLineTaxTreatments) beside the bill line type'],
 ]
 // An inline reverse-charge swap anywhere in a producer is a second derivation the guard cannot know about.
 const INLINE_SWAP = /reverseCharge\s*&&\s*(?:params\.|settings\.|accountingSettings\.)?reverseCharge(?:Sales|Purchase)?TaxType|reverseCharge\s*&&\s*params\.reverseChargeTaxType/

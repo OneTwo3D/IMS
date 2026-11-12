@@ -5,6 +5,7 @@ import {
   validateRecordSupplierCreditNote,
   buildSupplierCreditNoteSyncPayload,
   resolveSupplierCreditNoteTaxType,
+  SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE,
   resolveSupplierCreditNoteTransitBase,
 } from '@/lib/domain/purchasing/supplier-credit-note'
 
@@ -128,42 +129,63 @@ test('sync payload carries allocation hints when the bill has an external id (au
   assert.equal(noBill.allocateAmount, undefined)
 })
 
-test('credit-note tax type mirrors the bill: supplier tax type when the bill had VAT, else NONE', () => {
-  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: 'INPUT2' }), 'INPUT2')
-  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: 'INPUT2' }), 'NONE')
-  // Bill had VAT but the supplier has no mapped tax type → fall back to NONE (defensive).
-  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: null }), 'NONE')
-  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: undefined }), 'NONE')
+const taxedLine = { taxType: 'INPUT2', rate: 0.2, taxRateId: 'r-std' }
+const exemptLine = { taxType: 'NONE', rate: 0 }
+const tax = (p: Parameters<typeof resolveSupplierCreditNoteTaxType>[0]) => resolveSupplierCreditNoteTaxType(p).taxType
+
+test('credit-note tax type mirrors the SELECTED BILL\'s booked lines: one treatment is credited on its code, NONE only when the bill carried no VAT', () => {
+  assert.deepEqual(resolveSupplierCreditNoteTaxType({ billHadTax: true, billLines: [taxedLine] }), { taxType: 'INPUT2', taxRateId: 'r-std' })
+  assert.deepEqual(resolveSupplierCreditNoteTaxType({ billHadTax: true, billLines: [taxedLine, { taxType: 'input2', rate: 0.2 }] }), { taxType: 'INPUT2', taxRateId: 'r-std' }, 'two lines on one code are one treatment')
+  assert.equal(tax({ billHadTax: false, billLines: [exemptLine] }), 'NONE', 'a single exempt bill: NONE')
+  assert.equal(tax({ billHadTax: false, billLines: [exemptLine, exemptLine] }), 'NONE')
+  assert.equal(tax({ billHadTax: false, billLines: [{ taxType: 'ZERORATEDINPUT', rate: 0 }] }), 'ZERORATEDINPUT', 'a single zero-rated bill keeps its own code')
+  assert.equal(tax({ billHadTax: false, billLines: [] }), 'NONE')
+  // Bill carried VAT but nothing shows what code: UNDECIDED, never NONE (the poster refuses it).
+  assert.equal(tax({ billHadTax: true, billLines: [] }), undefined)
+  assert.equal(tax({ billHadTax: true, billLines: [{ taxType: undefined, rate: 0.2 }] }), undefined)
+  assert.equal(tax({ billHadTax: true, billLines: [{ taxType: 'NONE', rate: 0.2 }] }), undefined, 'a NONE line that carried a rate is not a decided credit')
 })
 
-test('credit-note tax type: reverse-charge goods credit reverses on the RC tax type, not NONE', () => {
-  // RC purchase: no supplier VAT on the bill (billHadTax false), but the credit
-  // must reverse the notional VAT on the configured RC tax type.
-  assert.equal(
-    resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: 'INPUT2', isReverseCharge: true, reverseChargeTaxType: 'REVERSECHARGES' }),
-    'REVERSECHARGES',
-  )
-  // RC takes precedence even if the bill also somehow carried tax.
-  assert.equal(
-    resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: 'INPUT2', isReverseCharge: true, reverseChargeTaxType: 'REVERSECHARGES' }),
-    'REVERSECHARGES',
-  )
-  // RC but no configured RC tax type → fall back to the line's own tax type
-  // (NOT NONE), mirroring the bill poster's baseTaxType fallback.
-  assert.equal(
-    resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: 'INPUT2', isReverseCharge: true, reverseChargeTaxType: '' }),
-    'INPUT2',
-  )
-  // RC, no RC tax type AND no line tax type → NONE (nothing to mirror).
-  assert.equal(
-    resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: null, isReverseCharge: true, reverseChargeTaxType: '' }),
-    'NONE',
-  )
-  // Not reverse-charge → unchanged behaviour (RC tax type ignored).
-  assert.equal(
-    resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: 'INPUT2', isReverseCharge: false, reverseChargeTaxType: 'REVERSECHARGES' }),
-    'INPUT2',
-  )
+test('a bill that MIXES VAT treatments is refused (mixed), never credited as one taxable or one exempt line', () => {
+  for (const lines of [
+    [taxedLine, exemptLine],
+    [exemptLine, taxedLine],
+    [taxedLine, { taxType: 'INPUT5', rate: 0.05 }],
+    [taxedLine, { taxType: 'ZERORATEDINPUT', rate: 0 }],
+    [exemptLine, { taxType: 'ZERORATEDINPUT', rate: 0 }],
+  ]) {
+    const r = resolveSupplierCreditNoteTaxType({ billHadTax: true, billLines: lines })
+    assert.deepEqual([r.taxType, r.mixed], [undefined, true], JSON.stringify(lines))
+  }
+  assert.match(SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, /mixes VAT treatments.*raise the credit in Xero by line, or credit each line separately/)
+})
+
+const rcLine = { taxType: 'REVERSECHARGES', rate: 0.2, taxRateId: 'r-rc', reverseCharge: true }
+
+test('reverse charge is derived from the SELECTED BILL\'s lines: a bill whose lines are ALL reverse charge is credited on the code they were booked on, as reverse charge', () => {
+  assert.deepEqual(resolveSupplierCreditNoteTaxType({ billHadTax: false, billLines: [rcLine] }), { taxType: 'REVERSECHARGES', taxRateId: 'r-rc', reverseCharge: true })
+  assert.deepEqual(resolveSupplierCreditNoteTaxType({ billHadTax: false, billLines: [rcLine, { ...rcLine }] }).reverseCharge, true)
+  // Never NONE: all reverse charge but nothing to mirror is undecided.
+  assert.deepEqual(resolveSupplierCreditNoteTaxType({ billHadTax: false, billLines: [{ taxType: undefined, rate: 0, reverseCharge: true }] }), { taxType: undefined, reverseCharge: true })
+  // A bill that is not reverse charge is not credited as one.
+  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, billLines: [taxedLine] }).reverseCharge, undefined)
+})
+
+test('a reverse-charge bill that ALSO has any other treatment (a non-vatable cost line, a taxed line, a zero-rated line) is mixed: refused, never credited entirely as reverse charge', () => {
+  for (const other of [exemptLine, taxedLine, { taxType: 'ZERORATEDINPUT', rate: 0 }]) {
+    for (const lines of [[rcLine, other], [other, rcLine]]) {
+      const r = resolveSupplierCreditNoteTaxType({ billHadTax: false, billLines: lines })
+      assert.deepEqual([r.taxType, r.mixed], [undefined, true], JSON.stringify(lines))
+    }
+  }
+})
+
+test('a bill with a reverse-charge line and a NON-reverse-charge line on the SAME code is still mixed (reverse charge is its own treatment)', () => {
+  const same = { taxType: 'REVERSECHARGES', rate: 0.2, taxRateId: 'r-rc', reverseCharge: false }
+  for (const lines of [[rcLine, same], [same, rcLine]]) {
+    const r = resolveSupplierCreditNoteTaxType({ billHadTax: false, billLines: lines })
+    assert.deepEqual([r.taxType, r.mixed], [undefined, true], JSON.stringify(lines))
+  }
 })
 
 test('sync payload posts EXCLUSIVE for reverse-charge (net amount), INCLUSIVE otherwise', () => {
@@ -253,4 +275,17 @@ test('the withdrawn "unique number makes the retry converge" claim stays withdra
   )
   assert.match(builderDoc, /RECOGNISABILITY|recognisab/i,
     'what the minted number actually buys is that a document under it can only be THIS credit note')
+})
+
+test('wiring: the supplier credit note poster reads the SELECTED bill\'s lines and treatment, not the supplier default type', async () => {
+  const { readFileSync } = await import('node:fs')
+  const source = readFileSync('app/actions/purchase-orders.ts', 'utf8')
+  assert.match(source, /billLineTaxTreatments\(\{\s*billLines: billLinesBooked/)
+  assert.doesNotMatch(source, /supplierTaxType: baseTaxType/)
+})
+
+test('wiring: a mixed bill is refused before anything is claimed, only when the credit would be sent to the ledger', async () => {
+  const { readFileSync } = await import('node:fs')
+  const source = readFileSync('app/actions/purchase-orders.ts', 'utf8')
+  assert.match(source, /if \(shouldQueueXero && creditNoteTreatment\.mixed\) return \{ success: false, error: SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE \}/)
 })

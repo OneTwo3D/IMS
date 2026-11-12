@@ -9,7 +9,14 @@ import {
 } from '@/lib/domain/inventory/replenishment-reports'
 import type { StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { canAccessReplenishmentReports } from '@/lib/security/replenishment-report-access'
-import { isSourceScanTooLargeError, sourceLimitExportBody } from '@/lib/security/source-scan-error'
+import { sourceLimitCsvResponse } from '@/lib/csv-source-limit'
+import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
+
+const EXPORT_COLUMNS: Record<string, string[]> = {
+  'reorder': ['sku', 'mpn', 'productName', 'productType', 'category', 'supplierName', 'supplierSku', 'neededFor', 'stockUnit', 'availableQty', 'warehouseAvailabilityBreakdown', 'inboundOpenPoQty', 'averageDailyDemand', 'leadTimeDays', 'safetyStockQty', 'reorderPoint', 'configuredReorderQty', 'suggestedReorderQty', 'abcClass', 'urgency'],
+  'backorder': ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'stockUnit', 'orderCount', 'orderedQty', 'committedQty', 'allocatedQty', 'backorderQty', 'inboundOpenPoQty', 'projectedFillDate', 'oldestOrderAt'],
+  'component-shortage': ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'productionOrderCount', 'requiredQty', 'availableQty', 'inboundOpenPoQty', 'shortageQty', 'earliestScheduledAt', 'outputProducts'],
+}
 
 const REPLENISHMENT_CSV_ROW_LIMIT = 50000
 
@@ -115,7 +122,7 @@ export async function GET(req: NextRequest) {
         abcClass: row.abcClass ?? '',
         urgency: row.urgency,
       }))
-      return csvResponseWithNotices(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'supplierName', 'supplierSku', 'neededFor', 'stockUnit', 'availableQty', 'warehouseAvailabilityBreakdown', 'inboundOpenPoQty', 'averageDailyDemand', 'leadTimeDays', 'safetyStockQty', 'reorderPoint', 'configuredReorderQty', 'suggestedReorderQty', 'abcClass', 'urgency']), `reorder-${date}.csv`, report.notices, { includeInBody })
+      return csvResponseWithNotices(toCsv(data, EXPORT_COLUMNS['reorder']), `reorder-${date}.csv`, report.notices, { includeInBody })
     }
 
     case 'backorder': {
@@ -140,7 +147,7 @@ export async function GET(req: NextRequest) {
         projectedFillDate: row.projectedFillDate ?? '',
         oldestOrderAt: row.oldestOrderAt,
       }))
-      return csvResponseWithNotices(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'stockUnit', 'orderCount', 'orderedQty', 'committedQty', 'allocatedQty', 'backorderQty', 'inboundOpenPoQty', 'projectedFillDate', 'oldestOrderAt']), `backorder-${date}.csv`, report.notices, { includeInBody })
+      return csvResponseWithNotices(toCsv(data, EXPORT_COLUMNS['backorder']), `backorder-${date}.csv`, report.notices, { includeInBody })
     }
 
     case 'component-shortage': {
@@ -166,14 +173,14 @@ export async function GET(req: NextRequest) {
         earliestScheduledAt: row.earliestScheduledAt ?? '',
         outputProducts: row.outputProducts.join('; '),
       }))
-      return csvResponseWithNotices(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'productionOrderCount', 'requiredQty', 'availableQty', 'inboundOpenPoQty', 'shortageQty', 'earliestScheduledAt', 'outputProducts']), `component-shortage-${date}.csv`, report.notices, { includeInBody })
+      return csvResponseWithNotices(toCsv(data, EXPORT_COLUMNS['component-shortage']), `component-shortage-${date}.csv`, report.notices, { includeInBody })
     }
 
     default:
       return NextResponse.json({ error: 'Unknown replenishment export type' }, { status: 400 })
     }
   } catch (error) {
-    if (isSourceScanTooLargeError(error)) return NextResponse.json(sourceLimitExportBody(error), { status: 413 })
+    if (isSourceScanTooLargeError(error)) return sourceLimitCsvResponse(error, EXPORT_COLUMNS[type] ?? [], `${type}-${date}.csv`)
     throw error
   }
 }
