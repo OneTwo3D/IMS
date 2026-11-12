@@ -107,17 +107,22 @@ test('current release notification updates existing drifted rows only', async ()
   })
 })
 
-test('the current release carries its operator actions, and releases without the field stay valid', async () => {
+test('the current release mirrors its changelog operator actions when it has any, and releases without the field stay valid', async () => {
   const { RELEASES } = await import('../../lib/releases.ts')
   const { readFileSync } = await import('node:fs')
-  assert.ok(CURRENT_RELEASE.operatorActions && CURRENT_RELEASE.operatorActions.length > 0)
-  for (const item of CURRENT_RELEASE.operatorActions) assert.ok(item.trim().length > 0 && !item.includes('**'))
   const changelog = readFileSync(new URL('../../CHANGELOG.md', import.meta.url), 'utf8')
   const start = changelog.indexOf(`## ${CURRENT_RELEASE.version} - `)
+  assert.ok(start >= 0, 'the changelog has a section for the current release')
   const section = changelog.slice(start, changelog.indexOf('\n## ', start + 5))
-  const ops = section.slice(section.indexOf('### Operator actions (breaking)'), section.indexOf('\n### ', section.indexOf('### Operator actions (breaking)') + 5))
-  const bullets = ops.split('\n').filter((l) => l.startsWith('- '))
-  assert.equal(CURRENT_RELEASE.operatorActions.length, bullets.length, 'operatorActions mirrors the changelog list')
+  const heading = section.indexOf('### Operator actions (breaking)')
+  if (!CURRENT_RELEASE.operatorActions || CURRENT_RELEASE.operatorActions.length === 0) {
+    assert.equal(heading, -1, 'a release with no operatorActions has no breaking operator list in the changelog')
+  } else {
+    for (const item of CURRENT_RELEASE.operatorActions) assert.ok(item.trim().length > 0 && !item.includes('**'))
+    const ops = section.slice(heading, section.indexOf('\n### ', heading + 5))
+    const bullets = ops.split('\n').filter((l) => l.startsWith('- '))
+    assert.equal(CURRENT_RELEASE.operatorActions.length, bullets.length, 'operatorActions mirrors the changelog list')
+  }
   const older = RELEASES.find((r) => r.version === '2.0.0')
   assert.ok(older && older.operatorActions === undefined)
 })
