@@ -56,7 +56,7 @@ import {
 import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { rateBinding, resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
-import { previewTreatedSalesInvoice, treatImportedSalesInvoice } from './eu-vat-invoice-treatment'
+import { previewTreatedSalesInvoice, regimePolicyOf, treatImportedSalesInvoice, type RegimePolicy } from './eu-vat-invoice-treatment'
 import { heldFreshBuildDifference, heldInvoiceDifference, heldTaxBindingDifference, heldUntreatedTaxDifference, type ExpectedHeldInvoice } from './held-invoice-verification'
 import { currentWcTaxBinding, recordWcTaxBinding } from './wc-tax-binding'
 import { buildEuVatRegimeInputFromSettings, readEuVatRegimeMode, readGiftCardFlagCutIn } from './eu-vat-facts'
@@ -1831,24 +1831,20 @@ type HeldRecheck = (tx: Prisma.TransactionClient) => Promise<{ ok: true; held: H
  * THE REGIME POLICY A TREATED HOLD WAS PARKED UNDER: every setting `buildEuVatRegimeInputFromSettings` and the treatment read to decide the regime (the regime mode, the gift-card flag cut-in, the IOSS and DDP accounts), recorded on the hold's treatment marker.
  * The scheduled sweep has no WooCommerce order and cannot re-verify, so it fails closed: it releases a treated hold only if the policy now in force equals the recorded one, otherwise the hold stays PENDING and a re-import (which re-verifies against the order) decides.
  */
-async function currentRegimePolicy(): Promise<Record<string, string>> {
+async function currentRegimePolicy(): Promise<RegimePolicy> {
   const { getAccountingSettings } = await import('@/lib/accounting')
   const [mode, cutIn, settings] = await Promise.all([
     readEuVatRegimeMode().catch(() => null),
     readGiftCardFlagCutIn().catch(() => ({ state: 'invalid' as const, raw: 'setting could not be read' })),
     getAccountingSettings(),
   ])
-  return {
-    mode: mode ?? 'unreadable',
-    cutIn: cutIn.state === 'ok' ? cutIn.at.toISOString() : cutIn.state === 'unset' ? 'unset' : `invalid:${cutIn.raw}`,
-    ioss: String(settings.euVatIossAccount ?? ''),
-    ddp: String(settings.euVatDdpAccount ?? ''),
-  }
+  return regimePolicyOf(mode, cutIn, settings.euVatIossAccount ?? null, settings.euVatDdpAccount ?? null)
 }
-async function withRegimePolicy(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+/** Records the policy the treatment DECIDED under (its one read, carried on the outcome) on a treated hold's marker. It reads no setting. With no snapshot nothing is recorded, and the sweep then refuses the hold (fail closed). */
+function withRegimePolicy(payload: Record<string, unknown>, policy: RegimePolicy | undefined): Record<string, unknown> {
   const marker = payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as Record<string, unknown> | null | undefined
-  if (marker?.applied !== true) return payload
-  return { ...payload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { ...marker, regimePolicy: await currentRegimePolicy() } }
+  if (marker?.applied !== true || policy === undefined) return payload
+  return { ...payload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { ...marker, regimePolicy: policy } }
 }
 /** Null when the policy in force equals the one the hold was parked under; otherwise the reason the sweep must not release it. */
 async function regimePolicyChange(payload: Record<string, unknown>): Promise<string | null> {
@@ -2267,9 +2263,9 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   })
   if (outcome.kind === 'refused') return await refuse(`the EU IOSS/VOEC/DDP treatment refused it: ${outcome.reason}. Fix that, then re-import the order from WooCommerce to try again`)
   if (outcome.kind === 'skipped') return await refuse(`the EU IOSS/VOEC/DDP treatment was skipped (${outcome.why}) on a hold that needs it`)
-  const treated = await withRegimePolicy(outcome.payload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
+  const treated = withRegimePolicy(outcome.payload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
     ? outcome.payload
-    : { ...outcome.payload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? ''), taxBinding: recordWcTaxBinding(outcome.taxBinding) } })
+    : { ...outcome.payload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? ''), taxBinding: recordWcTaxBinding(outcome.taxBinding) } }, outcome.regimePolicy)
   const written = await db.$transaction(async (tx) => {
     await lockSalesOrder(tx, orderId)
     const current = await tx.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
@@ -4022,13 +4018,13 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           // an absent marker is an untreated hold, which the release and the re-import already treat as such.
           // A treatment REFUSAL parks the ORIGINAL payload marked applied:false with the refusal's reason, never applied:true: it is an untreated hold, so the sweep never releases it, and a later fixed re-import verifies it against the order, retries the
           // treatment and releases only when that succeeds (a cause not fixed leaves it PENDING with the reason).
-          accountingPayload: await withRegimePolicy(euVatOutcome.kind === 'refused'
+          accountingPayload: withRegimePolicy(euVatOutcome.kind === 'refused'
             ? { ...accountingPayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'treatment_refused', refusal: euVatOutcome.reason } }
             : euVatOutcome.kind === 'skipped'
             ? (euVatOutcome.why === 'store_credit' ? { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'store_credit' } } : invoicePayload)
             : invoicePayload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
               ? invoicePayload
-              : { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? ''), taxBinding: euVatOutcome.kind === 'treated' ? recordWcTaxBinding(euVatOutcome.taxBinding) : null } }),
+              : { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? ''), taxBinding: euVatOutcome.kind === 'treated' ? recordWcTaxBinding(euVatOutcome.taxBinding) : null } }, euVatOutcome.kind === 'treated' ? euVatOutcome.regimePolicy : undefined),
           // o3d-j625: the same chart read that produced every account code in `accountingPayload`,
           // parked alongside them — the release can be days later and must not re-resolve it.
           chartConnector: settings.connector,

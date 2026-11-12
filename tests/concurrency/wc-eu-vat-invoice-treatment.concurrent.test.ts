@@ -27,6 +27,8 @@ let recordWhenOff = false
 let accountingMocked = false
 /** A change made between the importer's first verification of a held invoice and its release's own order lock (the release re-verifies under that lock). Armed by one test. */
 const betweenHook: { armed: boolean; verified: boolean; run: null | (() => Promise<void>) } = { armed: false, verified: false, run: null }
+// Runs once, right after the treatment's read of the gift-card cut-in returns (to change the setting between the read and the parking write).
+const cutInHook: { run: null | (() => Promise<void>) } = { run: null }
 async function mockAccounting() {
   if (accountingMocked) return
   const verification = await import('@/lib/connectors/woocommerce/sync/held-invoice-verification')
@@ -37,6 +39,17 @@ async function mockAccounting() {
         const difference = verification.heldInvoiceDifference(...args)
         if (betweenHook.armed && difference === null) betweenHook.verified = true
         return difference
+      },
+    },
+  })
+  const facts = await import('@/lib/connectors/woocommerce/sync/eu-vat-facts')
+  mock.module('@/lib/connectors/woocommerce/sync/eu-vat-facts', {
+    namedExports: {
+      ...facts,
+      readGiftCardFlagCutIn: async () => {
+        const read = await facts.readGiftCardFlagCutIn()
+        if (cutInHook.run) { const run = cutInHook.run; cutInHook.run = null; await run() }
+        return read
       },
     },
   })
@@ -208,7 +221,7 @@ test('[eu vat] switch ON, IOSS: zero-rated goods and shipping, fee on 232, one V
   assert.equal(invoice._taxUnreconciled, undefined)
   assert.equal(invoice._registerPayment, true)
   const { taxBinding, ...marker } = invoice._euVatTreatment as Record<string, unknown> & { taxBinding: { lineRateIds: unknown[]; shippingRateIds: unknown[]; rates: Record<string, { accountingTaxType: string; reverseCharge: boolean }>; lines: Array<{ rateId: string | null; source: string; type: string | null }>; shipping: { rateId: string | null; type: string | null } } }
-  assert.deepEqual(marker, { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', orderTotal: '135.66', vatAccount: '821', feesRecoded: 1, roundingAdjustment: null })
+  assert.deepEqual(marker, { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', orderTotal: '135.66', vatAccount: '821', feesRecoded: 1, roundingAdjustment: null, regimePolicy: { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232' } })
   // The tax binding recorded BEFORE the treatment re-typed the lines: both lines and the shipping on the one WooCommerce rate, which resolved to the charged code.
   assert.equal(taxBinding.lineRateIds.length, 2)
   assert.equal(taxBinding.shippingRateIds.length, 1)
@@ -1339,7 +1352,7 @@ test('[eu vat] the cut-in passes between parking and release: the treated hold i
 })
 
 // THE SWEEP FAILS CLOSED when the regime settings changed since a treated hold was parked (it has no order to re-verify with).
-async function sweepAfterSettingChange(t: test.TestContext, change: ((setCutIn: (v: string | null) => Promise<void>) => Promise<void>) | null) {
+async function sweepAfterSettingChange(t: test.TestContext, change: ((setCutIn: (v: string | null) => Promise<void>) => Promise<void>) | null, changeAfterRead = false) {
   const db = await loadDb()
   await mockAccounting()
   switchOn = true
@@ -1353,6 +1366,7 @@ async function sweepAfterSettingChange(t: test.TestContext, change: ((setCutIn: 
     else await db.setting.upsert({ where: { key: 'eu_vat_gift_card_flag_cut_in' }, create: { key: 'eu_vat_gift_card_flag_cut_in', value }, update: { value } })
   }
   t.after(async () => { switchOn = false; await setCutIn(null); await cleanup(db, externalId, ctx) })
+  if (changeAfterRead) cutInHook.run = async () => { await setCutIn('2026-12-01') }
   assert.equal((await importWcOrder(payload(externalId, wcRateId, PLUGIN('821')) as never)).success, true)
   const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
   const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
@@ -1376,4 +1390,12 @@ test('[eu vat] the gift-card cut-in changes between parking and the SWEEP: nothi
   assert.equal(rows, 0, 'nothing was queued')
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /the EU VAT regime settings changed since it was parked \(cutIn\).*NOTHING was queued.*Re-import the order/)
+})
+
+test('[eu vat] the cut-in changes BETWEEN the treatment\'s read and the parking write: the hold records the policy it was decided under, so the sweep leaves it PENDING', { skip }, async (t) => {
+  const { after, rows } = await sweepAfterSettingChange(t, null, true)
+  assert.equal(cutInHook.run, null, 'the setting really changed between the read and the park')
+  assert.equal(rows, 0, 'nothing was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /the EU VAT regime settings changed since it was parked \(cutIn\)/)
 })

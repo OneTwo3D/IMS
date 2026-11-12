@@ -25,9 +25,36 @@ import {
 } from '@/lib/domain/accounting/eu-vat-treatment'
 import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
 import { currentWcTaxBinding, recordWcTaxBinding, type InvoiceTaxTypesInput, type WcTaxBinding } from './wc-tax-binding'
-import { buildEuVatRegimeInputFromSettings, readEuVatRegimeMode } from './eu-vat-facts'
+import { buildEuVatRegimeInputFromSettings, readEuVatRegimeMode, readGiftCardFlagCutIn } from './eu-vat-facts'
+import type { GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
 import type { MappedLine } from './field-mapping'
 import type { WcFullOrder } from './types'
+
+/** The regime settings one decision was made under (the mode, the gift-card cut-in, the IOSS and DDP accounts), as a comparable record. */
+export type RegimePolicy = Record<string, string>
+export function regimePolicyOf(mode: string | null, cutIn: GiftCardCutIn, ioss: string | null, ddp: string | null): RegimePolicy {
+  return {
+    mode: mode ?? 'unreadable',
+    cutIn: cutIn.state === 'ok' ? cutIn.at.toISOString() : cutIn.state === 'unset' ? 'unset' : `invalid:${cutIn.raw}`,
+    ioss: String(ioss ?? ''),
+    ddp: String(ddp ?? ''),
+  }
+}
+
+/**
+ * THE REGIME SETTINGS ARE READ ONCE: the mode and the gift-card cut-in are read here, the SAME values build the regime input the decision is made on, and the policy record is made from those same values. Nothing that records the policy reads a setting again, so a setting changed
+ * while a treatment runs can never be recorded as the policy of a decision made under the old value.
+ */
+async function readRegimeInputOnce(
+  client: Parameters<typeof buildEuVatRegimeInputFromSettings>[0], order: WcFullOrder, accounts: { ioss: string | null; ddp: string | null },
+): Promise<{ ok: true; input: Awaited<ReturnType<typeof buildEuVatRegimeInputFromSettings>>; policy: RegimePolicy } | { ok: false; reason: string }> {
+  const mode = await readEuVatRegimeMode()
+  if (mode === null) return { ok: false, reason: 'the setting "eu_vat_regime_mode" holds a value that is neither adopt_plugin nor decide, so IMS cannot tell who decides the EU VAT regime' }
+  let cutIn: GiftCardCutIn
+  try { cutIn = await readGiftCardFlagCutIn() } catch { cutIn = { state: 'invalid', raw: 'setting could not be read' } }
+  const input = await buildEuVatRegimeInputFromSettings(client, order, accounts, { mode }, async () => cutIn)
+  return { ok: true, input, policy: regimePolicyOf(mode, cutIn, accounts.ioss, accounts.ddp) }
+}
 
 export type EuVatTreatmentAccounts = { ioss: string | null; ddp: string | null; fee: string | null; rounding: string | null }
 
@@ -35,7 +62,7 @@ export type TreatedInvoiceOutcome =
   /** Nothing was read or written: the switch is off, the connector is not Xero, or the order carries store credit. */
   | { kind: 'skipped'; why: 'switch_off' | 'store_credit' | 'unreconciled' }
   /** The payload with the treatment applied, and what it did. */
-  | { kind: 'treated'; payload: Record<string, unknown>; warnings: RegimeWarning[]; /** The order's tax binding as it was when the treatment ran (recorded in the marker). */ taxBinding: WcTaxBinding }
+  | { kind: 'treated'; payload: Record<string, unknown>; warnings: RegimeWarning[]; /** The order's tax binding as it was when the treatment ran (recorded in the marker). */ taxBinding: WcTaxBinding; /** The regime settings the decision was made under, from the one read (recorded on the hold). */ regimePolicy: RegimePolicy }
   /** The order cannot be invoiced as it is: the reason is the operator-facing sentence the document is stamped with. */
   | { kind: 'refused'; reason: string }
 
@@ -62,9 +89,9 @@ export async function treatImportedSalesInvoice(params: {
 
   // Every input that decides a line's and the shipping's posted tax type, as the order resolves them now: recorded in the marker, so a held invoice can be compared with the order before it is released.
   const taxBinding = await currentWcTaxBinding(params.wcOrder, params.mappedLines, params.taxBindingDeps)
-  const mode = await readEuVatRegimeMode()
-  if (mode === null) return { kind: 'refused', reason: 'the setting "eu_vat_regime_mode" holds a value that is neither adopt_plugin nor decide, so IMS cannot tell who decides the EU VAT regime' }
-  const input = await buildEuVatRegimeInputFromSettings(db, params.wcOrder, { ioss: params.accounts.ioss, ddp: params.accounts.ddp }, { mode })
+  const read = await readRegimeInputOnce(db, params.wcOrder, { ioss: params.accounts.ioss, ddp: params.accounts.ddp })
+  if (!read.ok) return { kind: 'refused', reason: read.reason }
+  const { input, policy } = read
   const decision = resolveEuVatRegime(input)
   const outcome = await db.$transaction((tx) => stampEuVatRegime(tx, params.orderId, () => input, params.now), { maxWait: 5_000, timeout: 20_000 })
   if (outcome.kind === 'refused') return { kind: 'refused', reason: `the order's EU VAT regime cannot be established (${outcome.code}): ${outcome.reason}` }
@@ -83,11 +110,11 @@ export async function treatImportedSalesInvoice(params: {
   }
 
   const stamp = outcome.stamp
-  return completeTreatment(params, stamp, decision, input, outcome.kind === 'stamped' ? outcome.warnings : [], taxBinding)
+  return completeTreatment(params, stamp, decision, input, outcome.kind === 'stamped' ? outcome.warnings : [], taxBinding, policy)
 }
 
 /** The route, the plan and the pure treatment, from a stamp already in hand: shared by the import (which stamps) and the held-invoice preview (which only reads the stamp). */
-async function completeTreatment(params: Parameters<typeof treatImportedSalesInvoice>[0], stamp: Parameters<typeof routeFor>[0], decision: Parameters<typeof routeFor>[1], input: Parameters<typeof routeFor>[2], warnings: RegimeWarning[], taxBinding: WcTaxBinding): Promise<TreatedInvoiceOutcome> {
+async function completeTreatment(params: Parameters<typeof treatImportedSalesInvoice>[0], stamp: Parameters<typeof routeFor>[0], decision: Parameters<typeof routeFor>[1], input: Parameters<typeof routeFor>[2], warnings: RegimeWarning[], taxBinding: WcTaxBinding, policy: RegimePolicy): Promise<TreatedInvoiceOutcome> {
   const routed = routeFor(stamp, decision, input)
   if (!routed.ok) return { kind: 'refused', reason: routed.reason }
 
@@ -104,7 +131,7 @@ async function completeTreatment(params: Parameters<typeof treatImportedSalesInv
   const treated = applyEuVatTreatment(params.payload as TreatablePayload, plan)
   if (!treated.ok) return { kind: 'refused', reason: treated.reason }
   // An order the treatment left exactly as it was (no scheme, no B2B, no fee) keeps its payload byte for byte.
-  if (treated.applied.route === 'none' && treated.applied.feesRecoded === 0) return { kind: 'treated', payload: params.payload, warnings, taxBinding }
+  if (treated.applied.route === 'none' && treated.applied.feesRecoded === 0) return { kind: 'treated', payload: params.payload, warnings, taxBinding, regimePolicy: policy }
   return {
     kind: 'treated',
     payload: {
@@ -120,10 +147,12 @@ async function completeTreatment(params: Parameters<typeof treatImportedSalesInv
         vatAccount: routed.route.kind === 'scheme' ? routed.route.vatAccount : null,
         feesRecoded: treated.applied.feesRecoded,
         roundingAdjustment: treated.applied.roundingAdjustment,
+        regimePolicy: policy,
       },
     },
     warnings,
     taxBinding,
+    regimePolicy: policy,
   }
 }
 
@@ -137,10 +166,10 @@ export async function previewTreatedSalesInvoice(client: Prisma.TransactionClien
   if (params.storeCreditForeign.gt(0)) return { kind: 'skipped', why: 'store_credit' }
   if (EU_UNRECONCILED_KEY in params.payload) return { kind: 'skipped', why: 'unreconciled' }
   const taxBinding = await currentWcTaxBinding(params.wcOrder, params.mappedLines, params.taxBindingDeps)
-  const mode = await readEuVatRegimeMode()
-  if (mode === null) return { kind: 'refused', reason: 'the setting "eu_vat_regime_mode" holds a value that is neither adopt_plugin nor decide, so IMS cannot tell who decides the EU VAT regime' }
-  const input = await buildEuVatRegimeInputFromSettings(client, params.wcOrder, { ioss: params.accounts.ioss, ddp: params.accounts.ddp }, { mode })
+  const read = await readRegimeInputOnce(client, params.wcOrder, { ioss: params.accounts.ioss, ddp: params.accounts.ddp })
+  if (!read.ok) return { kind: 'refused', reason: read.reason }
+  const { input, policy } = read
   const stamp = await readEuVatRegimeStamp(client, params.orderId)
   if (stamp === null) return { kind: 'refused', reason: 'the order carries no EU VAT regime stamp' }
-  return completeTreatment(params, stamp, resolveEuVatRegime(input), input, [], taxBinding)
+  return completeTreatment(params, stamp, resolveEuVatRegime(input), input, [], taxBinding, policy)
 }
