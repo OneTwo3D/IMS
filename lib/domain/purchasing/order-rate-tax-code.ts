@@ -101,3 +101,33 @@ export function billTaxCodeDisagreementMessage(disagreements: ReadonlyArray<stri
   return `The bill was not saved: the VAT IMS would record does not agree with the tax type it would post on - ${disagreements.join('; ')}. `
     + 'Correct the purchase order line rate or map the rate to the tax type that charges it, then try again.'
 }
+
+/**
+ * IS THE RATE THE ORDER WAS CHARGED AT INACTIVE? When no ACTIVE usable rate carries the order's recorded percentage (resolveOrderRateTaxCode finds nothing) but an
+ * INACTIVE purchase rate does (and, when the order recorded a name, carries that name), the order's rate has been switched off: the name of that rate, else null. The
+ * purchase side refuses a bill priced on an inactive rate, as the sales side refuses an order on one.
+ */
+export function inactiveOrderRateName(params: {
+  recordedRate: unknown
+  recordedName?: string | null
+  candidates: ReadonlyArray<OrderRateCandidate>
+}): string | null {
+  const recorded = toDecimal(params.recordedRate == null ? 0 : String(params.recordedRate)).toDecimalPlaces(4)
+  const wanted = normalised(params.recordedName)
+  for (const row of params.candidates) {
+    if (row.active !== false || row.isCompound || row.reverseCharge) continue
+    if (row.usedFor != null && row.usedFor !== 'PURCHASE' && row.usedFor !== 'BOTH') continue
+    if (!toDecimal(String(row.rate)).toDecimalPlaces(4).eq(recorded)) continue
+    if (wanted && normalised(row.name) !== wanted) continue
+    return row.name ?? row.id
+  }
+  return null
+}
+
+export function inactiveOrderRateMessage(name: string): string {
+  return `The VAT rate "${name}" this purchase order was charged at is inactive, so the bill cannot be priced on it. Re-activate the rate, or move the order's lines to an active rate, then try again.`
+}
+
+export function inactiveBillRatesMessage(names: ReadonlyArray<string>): string {
+  return `The bill is priced on a VAT rate that is inactive (${names.map((n) => `"${n}"`).join(', ')}), so it was not processed. Re-activate the rate, or move the order's lines to an active rate, then try again.`
+}

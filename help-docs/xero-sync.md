@@ -1645,8 +1645,19 @@ Sales Invoices sync type switched off until the mappings are in place, then enab
 bill currency's minor unit (two decimals for GBP, none for JPY, three for KWD) and the bill's VAT is the sum of those rounded amounts, with the total and the base-currency
 figures recomputed from them. Three lines of 0.03 at 20% record 0.03 of VAT (0.01 each), as Xero does, not 0.018.
 
-**Supplier credit notes copy the bill they credit.** The tax type of a supplier credit note comes from the **selected bill's booked lines** (the type and rate each line
-was posted with), never from the supplier's current default. One credit amount can only mirror a bill whose lines all carry **one** tax treatment, and then it is credited
+**A bill line keeps the tax treatment it was booked with.** When a bill is created or edited, each line stores the tax type it was sent on, its effective rate, the IMS rate it
+was read from and whether it was reverse charge. Changing the purchase order's VAT rate afterwards does **not** re-price the bill: editing the bill (quantities, amounts,
+dates, notes) and raising a supplier credit note both reproduce what was booked. A bill booked before this was recorded has no stored treatment: it is worked out from the order's
+**current** rates, and that is accepted only where it reproduces the VAT the bill recorded. If it does not (the order's rate has changed since), a supplier credit is refused
+(*This bill was booked before its tax treatment was recorded ... Re-save the bill*), and **re-saving the bill** (Edit bill, then Save) re-prices it at the order's current rates and records
+its treatment, after which the credit can be raised. (There is no separate tax-choice control yet: the re-save is the explicit step.)
+
+**Inactive rates are refused.** A new bill, an edit of a bill, and a supplier credit note that would be sent to Xero are refused (nothing saved or posted) when a line is priced on a
+VAT rate that is **inactive**: the line's own rate, the rate the order was charged at, or the rate a booked line was booked on. Re-activate the rate, or move the order's lines to an active
+rate. A rate a tax **re-key** retired (it names its replacement) is not counted as inactive; the retired-code guard decides whether its type may still be sent.
+
+**Supplier credit notes copy the bill they credit.** The tax type of a supplier credit note comes from the **selected bill's booked lines** (the type, rate and reverse-charge status each line
+was booked with; a bill is credited as reverse charge only when **every** one of its lines is reverse charge, and a reverse-charge line together with any other treatment, such as a non-vatable cost line, is a mixed bill), never from the supplier's current default. One credit amount can only mirror a bill whose lines all carry **one** tax treatment, and then it is credited
 on that type (a bill that carried VAT on its one VAT type; a bill with no VAT, such as one made only of non-vatable cost lines, on "No VAT"; a zero-rated bill on its zero-rated type).
 A bill that **mixes treatments** (taxable plus exempt, or two VAT types) is **refused**, before anything is posted, with *this bill mixes VAT treatments ... raise the credit in
 Xero by line, or credit each line separately*; the credit note stays a draft. Per-line credits are a follow-up. If no type can be found for a bill that carried VAT,

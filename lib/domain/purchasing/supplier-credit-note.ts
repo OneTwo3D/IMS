@@ -75,39 +75,36 @@ export function validateRecordSupplierCreditNote(params: {
 
 /** Shown to the operator when a supplier credit note is raised against a bill whose lines carry more than one VAT treatment. */
 export const SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE = withLedgerCheck(
-  'This bill mixes VAT treatments (for example taxable and exempt lines, or two VAT codes), and one credit amount cannot mirror them: raise the credit in Xero by line, '
+  'This bill mixes VAT treatments (for example taxable and exempt lines, reverse-charge and any other treatment, or two VAT codes), and one credit amount cannot mirror them: raise the credit in Xero by line, '
   + 'or credit each line separately. The credit note was not posted and is still a draft.',
 )
 
 /**
- * THE TAX TREATMENT OF A SUPPLIER CREDIT NOTE COMES FROM THE BILL IT CREDITS, never from the supplier's current default.
+ * THE TAX TREATMENT OF A SUPPLIER CREDIT NOTE COMES FROM THE BILL IT CREDITS, never from the supplier's current default and never from the order's current rate.
  *
- * `billLines` are the SELECTED bill's booked lines: the tax type and rate each was posted with (`billLineTaxTreatments`). The credit is ONE amount, so it can only
- * mirror a bill whose lines all carry ONE tax treatment (one tax code):
- *   - one treatment: that code (a taxed bill's VAT code, or NONE / a zero-rated code when nothing on the bill carried VAT). A NONE code on a bill that carried VAT is
- *     inconsistent and gives `undefined`, never a NONE credit;
- *   - more than one treatment (taxable plus exempt/NONE, or two codes): `mixed`, and the caller REFUSES the credit (SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE) rather
- *     than credit the whole amount as taxable or as exempt. Per-line credits are a follow-up;
- *   - a VAT-bearing line with no code, or no line at all on a bill that carried VAT: `undefined`, refused by the poster (lib/domain/accounting/purchase-document-tax-types.ts);
- *   - reverse charge (a goods order whose lines are all reverse-charge): the configured reverse-charge type, else the type the bill's lines posted on.
- * `taxRateId` is the rate the code was read from, for the retired-code guard binding.
+ * `billLines` are the SELECTED bill's lines with the treatment each was BOOKED with (`billLineTaxTreatments`: the snapshot stored on the line, else a reconstruction the
+ * caller has checked against the bill's recorded VAT). The credit is ONE amount, so it can only mirror a bill whose lines all carry ONE treatment (one tax code, and the same
+ * reverse-charge status):
+ *   - one treatment: that code (a taxed bill's VAT code, NONE / a zero-rated code when nothing on the bill carried VAT, the reverse-charge code when EVERY line was
+ *     reverse charge, which is then credited net and exclusive). A NONE code on a bill that carried VAT is inconsistent and gives `undefined`, never a NONE credit;
+ *   - more than one treatment (taxable plus exempt/NONE, two codes, or reverse charge together with ANY other treatment, such as a non-vatable cost line on a
+ *     reverse-charge order): `mixed`, and the caller REFUSES the credit (SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE) rather than credit the whole amount as one treatment.
+ *     Per-line credits are a follow-up;
+ *   - a VAT-bearing line with no code, or no line at all on a bill that carried VAT: `undefined`, refused by the poster (lib/domain/accounting/purchase-document-tax-types.ts).
+ * `reverseCharge` says the (single) treatment is reverse charge; `taxRateId` is the rate the code was read from, for the retired-code guard binding.
  */
 export function resolveSupplierCreditNoteTaxType(params: {
   billHadTax: boolean
-  billLines: ReadonlyArray<{ taxType: string | undefined; rate: number; taxRateId?: string }>
-  /** True only when the offset purchase is reverse-charge (a goods PO). */
-  isReverseCharge?: boolean
-  /** The configured reverse-charge purchase tax type (accounting settings). */
-  reverseChargeTaxType?: string | null
-}): { taxType: string | undefined; taxRateId?: string; mixed?: true } {
-  const typed = params.billLines.filter((l) => l.taxType && l.taxType.trim() !== '')
-  if (params.isReverseCharge) {
-    if (params.reverseChargeTaxType) return { taxType: params.reverseChargeTaxType }
-    const own = typed.find((l) => l.taxType!.trim().toUpperCase() !== 'NONE') ?? typed[0]
-    return { taxType: own?.taxType, taxRateId: own?.taxRateId }
-  }
-  const hadTax = params.billHadTax || params.billLines.some((l) => l.rate > 0)
-  if (params.billLines.some((l) => (!l.taxType || l.taxType.trim() === '') && l.rate > 0)) return { taxType: undefined }
+  billLines: ReadonlyArray<{ taxType: string | undefined; rate: number; taxRateId?: string; reverseCharge?: boolean }>
+}): { taxType: string | undefined; taxRateId?: string; mixed?: true; reverseCharge?: boolean } {
+  const lines = params.billLines
+  const reverseCount = lines.filter((l) => l.reverseCharge === true).length
+  if (reverseCount > 0 && reverseCount < lines.length) return { taxType: undefined, mixed: true }
+  const reverseCharge = reverseCount > 0
+  const typed = lines.filter((l) => l.taxType && l.taxType.trim() !== '')
+  const hadTax = params.billHadTax || lines.some((l) => l.rate > 0)
+  // A reverse-charge bill carries no supplier VAT: it is its own treatment, decided by the code its lines were booked on.
+  if (!reverseCharge && lines.some((l) => (!l.taxType || l.taxType.trim() === '') && l.rate > 0)) return { taxType: undefined }
   const treatments = new Map<string, { taxType: string; taxRateId?: string }>()
   for (const l of typed) {
     const key = l.taxType!.trim().toUpperCase()
@@ -116,9 +113,10 @@ export function resolveSupplierCreditNoteTaxType(params: {
   if (treatments.size > 1) return { taxType: undefined, mixed: true }
   if (treatments.size === 1) {
     const [key, only] = [...treatments.entries()][0]
-    if (key === 'NONE' && hadTax) return { taxType: undefined }
-    return only
+    if (key === 'NONE' && hadTax && !reverseCharge) return { taxType: undefined }
+    return { ...only, ...(reverseCharge ? { reverseCharge: true } : {}) }
   }
+  if (reverseCharge) return { taxType: undefined, reverseCharge: true }
   return hadTax ? { taxType: undefined } : { taxType: 'NONE' }
 }
 

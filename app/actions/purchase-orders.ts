@@ -2,8 +2,7 @@
 
 import { assertNoLiveAsnForReceipt, ManualReceiptRefusedByLiveAsnError } from '@/lib/domain/wms/po-receipt-asn-guard'
 import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
-import { billTaxCodeDisagreementMessage, billTaxCodeDisagreements, resolveOrderRateTaxCode } from '@/lib/domain/purchasing/order-rate-tax-code'
-import { taxTypeForBasis } from '@/lib/accounting/reverse-charge'
+import { billTaxCodeDisagreementMessage, billTaxCodeDisagreements, inactiveBillRatesMessage, inactiveOrderRateMessage, inactiveOrderRateName, resolveOrderRateTaxCode } from '@/lib/domain/purchasing/order-rate-tax-code'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
@@ -71,7 +70,12 @@ import {
   buildPurchaseInvoiceAccountingPayload,
   buildPurchaseInvoiceUpdateIdempotencyKey,
   billLineTaxTreatments,
+  bookedTaxFromLine,
   calculatePurchaseInvoice,
+  legacyTreatmentsReproduceBillTax,
+  LEGACY_BILL_TAX_AMBIGUOUS_MESSAGE,
+  PurchaseBillTaxRefusal,
+  snapshotColumnsFor,
   PurchaseInvoiceInputsChangedError,
   assertPurchaseInvoiceInputsUnchanged,
   PO_BILLED_FIGURES_EDIT_MESSAGE,
@@ -3521,20 +3525,31 @@ export type InvoiceRow = {
   }[]
 }
 
-/** The code (and its rate id) of the rate an order was charged at, never the supplier's current default (lib/domain/purchasing/order-rate-tax-code.ts). */
+/**
+ * The code (and its rate id) of the rate an order was charged at, never the supplier's current default (lib/domain/purchasing/order-rate-tax-code.ts), and, when no
+ * active rate carries the order's recorded rate but an INACTIVE one does, that rate's name: the bill is then refused (the purchase side's inactive-rate floor).
+ */
 async function orderRateTaxCodeFor(
   po: { taxRatePercent: unknown; taxRateName: string | null },
   supplierDefault: Parameters<typeof resolveOrderRateTaxCode>[0]['supplierDefault'],
-): Promise<ReturnType<typeof resolveOrderRateTaxCode>> {
-  return resolveOrderRateTaxCode({
-    recordedRate: po.taxRatePercent,
-    recordedName: po.taxRateName,
-    candidates: await db.taxRate.findMany({
-      where: { active: true, usedFor: { in: ['PURCHASE', 'BOTH'] }, isCompound: false, reverseCharge: false },
-      select: { id: true, name: true, rate: true, accountingTaxType: true },
-    }),
-    supplierDefault,
+): Promise<{ code: ReturnType<typeof resolveOrderRateTaxCode>; inactiveName: string | null }> {
+  const candidates = await db.taxRate.findMany({
+    where: { usedFor: { in: ['PURCHASE', 'BOTH'] }, isCompound: false, reverseCharge: false },
+    select: { id: true, name: true, rate: true, accountingTaxType: true, active: true, usedFor: true, isCompound: true, reverseCharge: true },
   })
+  const code = resolveOrderRateTaxCode({ recordedRate: po.taxRatePercent, recordedName: po.taxRateName, candidates, supplierDefault })
+  return { code, inactiveName: code ? null : inactiveOrderRateName({ recordedRate: po.taxRatePercent, recordedName: po.taxRateName, candidates }) }
+}
+
+/**
+ * The refusal, or null: is any of these IMS rates INACTIVE? A bill or supplier credit is not priced on a rate that has been switched off. A rate a tax re-key RETIRED
+ * (it names its replacement) is not "inactive" here: the re-key replaced it, the booked code stays valid and the retired-code guard decides whether it may still be sent.
+ */
+async function inactiveRatesRefusal(rateIds: ReadonlyArray<string | null | undefined>): Promise<string | null> {
+  const ids = [...new Set(rateIds.filter((id): id is string => typeof id === 'string' && id !== ''))]
+  if (ids.length === 0) return null
+  const rows = await db.taxRate.findMany({ where: { id: { in: ids }, active: false, replacedById: null }, select: { name: true } })
+  return rows.length > 0 ? inactiveBillRatesMessage(rows.map((r) => r.name)) : null
 }
 
 /**
@@ -3649,10 +3664,12 @@ export async function createInvoice(
       }),
     ])
     // The code of the rate the ORDER was charged at, never the supplier's current default (which may be another rate).
-    const orderRateCode = await orderRateTaxCodeFor(po, supplierData?.supplier?.taxRate)
-    const fallbackTaxType = orderRateCode?.taxType
-    const fallbackTaxRateId = orderRateCode?.taxRateId
-    const invoiceCalculation = calculatePurchaseInvoice({
+    const orderRate = await orderRateTaxCodeFor(po, supplierData?.supplier?.taxRate)
+    const fallbackTaxType = orderRate.code?.taxType
+    const fallbackTaxRateId = orderRate.code?.taxRateId
+    let invoiceCalculation: ReturnType<typeof calculatePurchaseInvoice>
+    try {
+      invoiceCalculation = calculatePurchaseInvoice({
       lines: [
         ...productInputs.map((l): PurchaseInvoiceInputLine => ({
           kind: 'product',
@@ -3675,14 +3692,24 @@ export async function createInvoice(
       transitAccount: accountingSettings.transitAccount,
       fallbackTaxType,
       fallbackTaxRateId,
+      orderRateProblem: orderRate.inactiveName ? inactiveOrderRateMessage(orderRate.inactiveName) : undefined,
       reverseChargeTaxType: accountingSettings.reverseChargePurchaseTaxType || undefined,
       poLineById,
       costLineById,
     })
+    } catch (error) {
+      if (error instanceof PurchaseBillTaxRefusal) return { success: false, error: error.message }
+      throw error
+    }
+    // A bill is not priced on an INACTIVE rate (the sales side refuses an order on one).
+    const inactiveRate = await inactiveRatesRefusal(invoiceCalculation.lineTaxRates.map((l) => l.taxRateId))
+    if (inactiveRate) return { success: false, error: inactiveRate }
     if (accountingSettings.syncEnabled) {
       const disagreement = await billTaxCodeRefusal(invoiceCalculation.lineTaxRates)
       if (disagreement) return { success: false, error: disagreement }
     }
+    // The tax treatment each line is BOOKED with, stored on the line: later edits and supplier credits reproduce it instead of re-deriving it from the order's then-current rate.
+    const bookedAt = new Date()
     const accountingPayload = buildPurchaseInvoiceAccountingPayload({
       poReference: po.reference,
       contactName: supplierData?.supplier?.name,
@@ -3787,7 +3814,7 @@ export async function createInvoice(
           notes: input.notes || null,
           supplierInvoiceUrl: input.supplierInvoiceUrl || null,
           lines: {
-            create: invoiceCalculation.lineData.map((line) => ({
+            create: invoiceCalculation.lineData.map((line, index) => ({
               poLineId: line.poLineId,
               costLineId: line.costLineId,
               description: line.description,
@@ -3795,6 +3822,7 @@ export async function createInvoice(
               unitCostForeign: line.unitCostForeign,
               totalForeign: line.totalForeign,
               totalBase: line.totalBase,
+              ...snapshotColumnsFor(invoiceCalculation.lineTaxRates[index], bookedAt),
             })),
           },
         },
@@ -4023,6 +4051,11 @@ export async function updateInvoice(
             unitCostForeign: true,
             totalForeign: true,
             totalBase: true,
+            taxType: true,
+            taxRateValue: true,
+            taxRateId: true,
+            taxReverseCharge: true,
+            taxBookedAt: true,
           },
         },
       },
@@ -4059,9 +4092,9 @@ export async function updateInvoice(
     const poLineById = new Map(invoice.po.lines.map((line) => [line.id, line]))
     const costLineById = new Map(invoice.po.freightCostLines.map((line) => [line.id, line]))
     // The code of the rate the ORDER was charged at, never the supplier's current default (which may be another rate).
-    const orderRateCode = await orderRateTaxCodeFor(invoice.po, invoice.po.supplier.taxRate)
-    const fallbackTaxType = orderRateCode?.taxType
-    const fallbackTaxRateId = orderRateCode?.taxRateId
+    const orderRate = await orderRateTaxCodeFor(invoice.po, invoice.po.supplier.taxRate)
+    const fallbackTaxType = orderRate.code?.taxType
+    const fallbackTaxRateId = orderRate.code?.taxRateId
     const accountingSettings = await getAccountingSettings()
     const invoiceInputLines: PurchaseInvoiceInputLine[] = []
     for (const existingLine of invoice.lines) {
@@ -4075,6 +4108,9 @@ export async function updateInvoice(
           poLineId: existingLine.poLineId,
           qtyBilled: Number(lineInput.qtyBilled ?? existingLine.qtyBilled),
           unitCostForeign: Number(lineInput.unitCostForeign ?? existingLine.unitCostForeign),
+          // An edit does not change the tax: a line that was booked keeps its booked treatment however the order's rate has changed since. A line booked before the
+          // snapshot existed is re-derived at the order's current rates, and this save records them (that save is the explicit re-pricing).
+          booked: bookedTaxFromLine(existingLine),
         })
       } else if (existingLine.costLineId) {
         const costLine = costLineById.get(existingLine.costLineId)
@@ -4085,6 +4121,7 @@ export async function updateInvoice(
           costLineId: existingLine.costLineId,
           description: optionalText(lineInput.description ?? existingLine.description ?? costLine.description) ?? costLine.description,
           amountForeign: Number(lineInput.amountForeign ?? lineInput.unitCostForeign ?? existingLine.totalForeign),
+          booked: bookedTaxFromLine(existingLine),
         })
       } else {
         return { success: false, error: `Bill line ${existingLine.id} is not linked to a PO or cost line` }
@@ -4103,6 +4140,7 @@ export async function updateInvoice(
         transitAccount: accountingSettings.transitAccount,
         fallbackTaxType,
         fallbackTaxRateId,
+        orderRateProblem: orderRate.inactiveName ? inactiveOrderRateMessage(orderRate.inactiveName) : undefined,
         reverseChargeTaxType: accountingSettings.reverseChargePurchaseTaxType || undefined,
         poLineById,
         costLineById,
@@ -4110,6 +4148,9 @@ export async function updateInvoice(
     } catch (error) {
       return { success: false, error: String(error instanceof Error ? error.message : error) }
     }
+    const inactiveRate = await inactiveRatesRefusal(invoiceCalculation.lineTaxRates.map((l) => l.taxRateId))
+    if (inactiveRate) return { success: false, error: inactiveRate }
+    const bookedAt = new Date()
     if (accountingSettings.syncEnabled) {
       const disagreement = await billTaxCodeRefusal(invoiceCalculation.lineTaxRates)
       if (disagreement) return { success: false, error: disagreement }
@@ -4324,8 +4365,9 @@ export async function updateInvoice(
       })
       // Interactive Prisma transactions run on one connection; keep these
       // small line updates sequential so errors surface at the exact row.
-      for (const line of lineUpdates) {
+      for (const [index, line] of lineUpdates.entries()) {
         if (!line.id) throw new Error('Bill line update is missing an id')
+        const booked = invoice.lines.find((existing) => existing.id === line.id)
         await tx.purchaseInvoiceLine.update({
           where: { id: line.id },
           data: {
@@ -4334,6 +4376,8 @@ export async function updateInvoice(
             unitCostForeign: line.unitCostForeign,
             totalForeign: line.totalForeign,
             totalBase: line.totalBase,
+            // Booked lines keep their snapshot (and its booking time); a legacy line is booked now.
+            ...(booked?.taxBookedAt ? {} : snapshotColumnsFor(invoiceCalculation.lineTaxRates[index], bookedAt)),
           },
         })
       }
@@ -5081,7 +5125,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         // `allocateToInvoiceId` — the BILL the credit is allocated against in the ledger — so whose
         // bill it is has to come with it.
         // The selected bill's booked lines: the credit mirrors THEIR tax treatment, not the supplier's current default.
-        purchaseInvoice: { select: { subtotalForeign: true, taxForeign: true, accountingInvoiceId: true, accountingInvoiceConnector: true, lines: { select: { poLineId: true, costLineId: true } } } },
+        purchaseInvoice: { select: { subtotalForeign: true, taxForeign: true, accountingInvoiceId: true, accountingInvoiceConnector: true, lines: { select: { poLineId: true, costLineId: true, totalForeign: true, taxType: true, taxRateValue: true, taxRateId: true, taxReverseCharge: true, taxBookedAt: true } } } },
         po: {
           select: {
             reference: true, type: true, taxRatePercent: true, taxRateName: true,
@@ -5117,48 +5161,30 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     // came from, and it is now what the gate reads and what routes the row.
     const settings = await getAccountingSettings()
 
-    // Mirror the bill's tax treatment, derived from the PO LINES' effective tax
-    // rates (a null line rate follows the supplier default) rather than the
-    // supplier default alone, so per-line overrides are respected. Reverse charge
-    // only when GOODS lines are UNIFORMLY reverse-charge (a single-amount credit
-    // can't represent a mixed-tax bill).
+    // THE SELECTED BILL'S BOOKED TAX TREATMENT, line by line: the code, rate, rate id and reverse-charge flag each of its lines was booked with (stored on the line
+    // when the bill was created or edited), never re-derived from the order's CURRENT rate and never the supplier's default. A line booked before the snapshot existed
+    // is reconstructed from the order's current rates, accepted only when that reproduces the VAT the bill recorded (else the credit is refused, below).
     const supplierRate = cn.po.supplier.taxRate
-    // Effective rate per GOODS line: the line's own rate, else the supplier
-    // default (possibly null when the supplier has no rate). Do NOT drop null
-    // effective rates — a line with no rate is NOT reverse-charge, so it must
-    // count against uniform-RC rather than being filtered out (which would let
-    // other RC lines misclassify the whole credit as RC).
-    const goodsLineRates = cn.po.type === 'GOODS'
-      ? cn.po.lines.map((l) => l.taxRate ?? supplierRate)
-      : []
-    const isReverseCharge = goodsLineRates.length > 0 && goodsLineRates.every((r) => !!r?.reverseCharge)
-    // Base rate for the reverse-charge binding below (the line rate where overridden, else the supplier default).
-    const baseRate = cn.po.lines.find((l) => l.taxRate)?.taxRate ?? supplierRate
-    const baseTaxType = baseRate?.accountingTaxType
-    // THE SELECTED BILL'S BOOKED TAX TREATMENT, line by line: the code and rate each of its lines was posted with (the order's recorded rate for a line with no
-    // rate row or a vatable cost line), never the supplier's current default.
     const billLinesBooked = cn.purchaseInvoice?.lines ?? []
-    const orderRateCode = billLinesBooked.length > 0 ? await orderRateTaxCodeFor(cn.po, supplierRate) : null
+    const anyLegacyLine = billLinesBooked.some((l) => !l.taxBookedAt)
+    const orderRate = anyLegacyLine ? await orderRateTaxCodeFor(cn.po, supplierRate) : { code: null, inactiveName: null }
     const billTreatments = billLineTaxTreatments({
       billLines: billLinesBooked,
       poLineById: new Map(cn.po.lines.map((l) => [l.id, { id: l.id, qty: 0, product: { sku: '' }, taxRate: l.taxRate }])),
       costLineById: new Map(cn.po.freightCostLines.map((c) => [c.id, c])),
       poType: cn.po.type,
       poTaxRatePercent: cn.po.taxRatePercent != null ? cn.po.taxRatePercent.toString() : null,
-      orderRateTaxType: orderRateCode?.taxType,
-      orderRateTaxRateId: orderRateCode?.taxRateId,
+      orderRateTaxType: orderRate.code?.taxType,
+      orderRateTaxRateId: orderRate.code?.taxRateId,
+      reverseChargeTaxType: settings.reverseChargePurchaseTaxType || null,
     })
-
-    // A reverse-charge goods PO carries no supplier VAT (taxForeign 0) but its bill
-    // posts on the reverse-charge tax type, so the credit must reverse on that SAME
-    // type (not NONE) to unwind the notional VAT. Otherwise: the line/supplier tax
-    // type when the bill carried VAT, else NONE.
+    const legacyTreatmentsAmbiguous = anyLegacyLine
+      && !legacyTreatmentsReproduceBillTax({ treatments: billTreatments, billTaxForeign: cn.purchaseInvoice?.taxForeign ?? 0, currency: cn.currency })
     const creditNoteTreatment = resolveSupplierCreditNoteTaxType({
       billHadTax: Number(cn.purchaseInvoice?.taxForeign ?? 0) > 0,
       billLines: billTreatments,
-      isReverseCharge,
-      reverseChargeTaxType: settings.reverseChargePurchaseTaxType || null,
     })
+    const isReverseCharge = creditNoteTreatment.reverseCharge === true
     const creditNoteTaxType = creditNoteTreatment.taxType
     // Xero-only: the ACCPAYCREDIT poster exists for Xero. For other connectors the
     // credit note still records as POSTED in IMS (consistent with sync being off).
@@ -5213,6 +5239,12 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     // says plainly what the ledger will not receive.
     // One credit amount cannot mirror a bill that mixes VAT treatments: refused BEFORE anything is claimed (the credit stays a draft). Per-line credits are a follow-up.
     if (shouldQueueXero && creditNoteTreatment.mixed) return { success: false, error: SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE }
+    // A credit that would be sent to the ledger is not priced on an inactive rate, and not on a treatment that cannot be told: refused before anything is claimed.
+    if (shouldQueueXero) {
+      if (legacyTreatmentsAmbiguous) return { success: false, error: LEGACY_BILL_TAX_AMBIGUOUS_MESSAGE }
+      const inactiveRate = await inactiveRatesRefusal(billTreatments.map((t) => t.taxRateId))
+      if (inactiveRate) return { success: false, error: inactiveRate }
+    }
     const postsLocallyOnly = creditNotePosting.verdict === 'post' && !shouldQueueXero && settings.syncEnabled
     if (postsLocallyOnly) {
       await logActivity({
@@ -5271,15 +5303,9 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
             transitAccount: settings.transitAccount,
             taxType: creditNoteTaxType,
             // The rate that code was read from and how (lib/accounting/reverse-charge.ts): bound only when the type IS that rate's derivation (a purchase goods line, else its own code); a NONE or mixed-bill type that is neither stays unbound.
-            // Reverse charge: bound to the base rate on the goods-line basis, as the bill was. Otherwise: bound, on the plain basis, to the rate of the bill line the code was read from.
-            taxRateId: isReverseCharge ? baseRate?.id : creditNoteTreatment.taxRateId,
-            taxRateBasis: isReverseCharge
-              ? (baseRate?.id
-                ? (creditNoteTaxType === taxTypeForBasis('purchase_line', { baseTaxType: baseTaxType, reverseCharge: baseRate.reverseCharge, reverseChargePurchaseTaxType: settings.reverseChargePurchaseTaxType })
-                  ? 'purchase_line'
-                  : (baseTaxType == null || creditNoteTaxType === baseTaxType) ? 'plain' : undefined)
-                : undefined)
-              : (creditNoteTreatment.taxRateId ? 'plain' : undefined),
+            // The rate the code was read from (the bill line's booked rate id): bound on the goods-line basis for a reverse-charge credit, plain otherwise.
+            taxRateId: creditNoteTreatment.taxRateId,
+            taxRateBasis: creditNoteTreatment.taxRateId ? (isReverseCharge ? 'purchase_line' : 'plain') : undefined,
             // Reverse-charge credits carry a NET amount → post EXCLUSIVE so Xero
             // adds the notional VAT (mirroring the net/exclusive RC bill); all
             // others carry a GROSS amount → INCLUSIVE.

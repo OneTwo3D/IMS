@@ -1554,6 +1554,15 @@ model PurchaseInvoiceLine {
   totalForeign    Decimal   @db.Decimal(18, 4)
   totalBase        Decimal   @db.Decimal(18, 4)
 
+  /// THE TAX TREATMENT THIS LINE WAS BOOKED WITH, written when the bill is created or edited and never re-derived from the purchase order's CURRENT rate (which can
+  /// change after booking): the tax code sent to the ledger (null = none could be decided), the effective rate (a fraction), the IMS rate it was read from (no foreign
+  /// key: a pointer, the rate may be retired) and whether it was reverse charge. `taxBookedAt` is the marker: NULL = a line booked before the snapshot existed (legacy).
+  taxType          String?
+  taxRateValue     Decimal?  @db.Decimal(9, 6)
+  taxRateId        String?
+  taxReverseCharge Boolean?
+  taxBookedAt      DateTime?
+
   invoice         PurchaseInvoice    @relation(fields: [invoiceId], references: [id])
   poLine          PurchaseOrderLine? @relation(fields: [poLineId], references: [id])
   costLine        FreightCostLine?   @relation(fields: [costLineId], references: [id])

@@ -160,13 +160,24 @@ test('a bill that MIXES VAT treatments is refused (mixed), never credited as one
   assert.match(SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, /mixes VAT treatments.*raise the credit in Xero by line, or credit each line separately/)
 })
 
-test('credit-note tax type: reverse-charge goods credit reverses on the RC tax type, not NONE', () => {
-  assert.equal(tax({ billHadTax: false, billLines: [taxedLine], isReverseCharge: true, reverseChargeTaxType: 'REVERSECHARGES' }), 'REVERSECHARGES')
-  assert.equal(tax({ billHadTax: true, billLines: [taxedLine], isReverseCharge: true, reverseChargeTaxType: 'REVERSECHARGES' }), 'REVERSECHARGES')
-  // RC but no configured RC tax type: the type the bill's lines posted on (NOT NONE).
-  assert.equal(tax({ billHadTax: false, billLines: [taxedLine], isReverseCharge: true, reverseChargeTaxType: '' }), 'INPUT2')
-  // RC, no RC tax type and nothing the bill posted on: undecided.
-  assert.equal(tax({ billHadTax: false, billLines: [], isReverseCharge: true, reverseChargeTaxType: '' }), undefined)
+const rcLine = { taxType: 'REVERSECHARGES', rate: 0.2, taxRateId: 'r-rc', reverseCharge: true }
+
+test('reverse charge is derived from the SELECTED BILL\'s lines: a bill whose lines are ALL reverse charge is credited on the code they were booked on, as reverse charge', () => {
+  assert.deepEqual(resolveSupplierCreditNoteTaxType({ billHadTax: false, billLines: [rcLine] }), { taxType: 'REVERSECHARGES', taxRateId: 'r-rc', reverseCharge: true })
+  assert.deepEqual(resolveSupplierCreditNoteTaxType({ billHadTax: false, billLines: [rcLine, { ...rcLine }] }).reverseCharge, true)
+  // Never NONE: all reverse charge but nothing to mirror is undecided.
+  assert.deepEqual(resolveSupplierCreditNoteTaxType({ billHadTax: false, billLines: [{ taxType: undefined, rate: 0, reverseCharge: true }] }), { taxType: undefined, reverseCharge: true })
+  // A bill that is not reverse charge is not credited as one.
+  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, billLines: [taxedLine] }).reverseCharge, undefined)
+})
+
+test('a reverse-charge bill that ALSO has any other treatment (a non-vatable cost line, a taxed line, a zero-rated line) is mixed: refused, never credited entirely as reverse charge', () => {
+  for (const other of [exemptLine, taxedLine, { taxType: 'ZERORATEDINPUT', rate: 0 }]) {
+    for (const lines of [[rcLine, other], [other, rcLine]]) {
+      const r = resolveSupplierCreditNoteTaxType({ billHadTax: false, billLines: lines })
+      assert.deepEqual([r.taxType, r.mixed], [undefined, true], JSON.stringify(lines))
+    }
+  }
 })
 
 test('sync payload posts EXCLUSIVE for reverse-charge (net amount), INCLUSIVE otherwise', () => {
