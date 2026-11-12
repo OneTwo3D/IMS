@@ -18,7 +18,7 @@ import type {
   EasFact, EuVatRegimeInput, EuVatRegimeMode, GoodsLineFact, PluginFxFact, RateFact, RateMappingFact, ThresholdFxFact, VatRecordFact,
 } from '@/lib/domain/accounting/eu-vat-regime'
 import { normaliseDestination } from '@/lib/domain/accounting/eu-vat-regime'
-import { EU_VAT_GIFT_CARD_CUT_IN_SETTING, EU_VAT_REGIME_MODE_SETTING, parseGiftCardCutIn, parseRegimeMode, type GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
+import { EU_VAT_GIFT_CARD_CUT_IN_SETTING, EU_VAT_REGIME_MODE_SETTING, parseGiftCardCutIn, parseRegimeMode, parseStrictIsoInstant, type GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
 import { getSettingValues } from '@/lib/settings-store'
 import { readWclcFeeKind, wcMetaFlag } from './field-mapping'
 import { parseWcGmtInstant } from './receipt-settlement-rate'
@@ -133,13 +133,18 @@ function readFalsyFlag(value: unknown): boolean {
   return typeof value === 'string' && ['no', '0', 'false', ''].includes(value.trim().toLowerCase())
 }
 
+/** The gift-card flag read STRICTLY: exactly the text `yes` or `no`, nothing else (not empty, not whitespace, not 0/false/1, not a boolean). Used for the cut-in; the lenient reading above is kept for orders before it. */
+function readStrictFlag(value: unknown): 'yes' | 'no' | 'unknown' {
+  return value === 'yes' ? 'yes' : value === 'no' ? 'no' : 'unknown'
+}
+
 export function readGoodsLines(order: Pick<WcFullOrder, 'line_items'>, problems: string[] = []): GoodsLineFact[] {
   return order.line_items.map((line, index) => {
     const flag = (line.meta_data ?? []).find((entry) => entry.key === '_o3d_is_voucher')
     const total = decimalText(line.total)
     if (total === null) problems.push(`goods line ${index + 1} (id ${String(line.id)}) has an unreadable total`)
     // Only the line's own flag is read. The product-level marker (`_coupon_title`) is not on the order and IMS imports no product meta, so a line with no (or an unreadable) flag is unknown and the resolver decides what that means.
-    return { total: total ?? '0', voucher: flag === undefined ? 'unknown' : wcMetaFlag(flag.value) ? 'yes' : readFalsyFlag(flag.value) ? 'no' : 'unknown' }
+    return { total: total ?? '0', voucherStrict: readStrictFlag(flag?.value), voucher: flag === undefined ? 'unknown' : wcMetaFlag(flag.value) ? 'yes' : readFalsyFlag(flag.value) ? 'no' : 'unknown' }
   })
 }
 
@@ -269,7 +274,7 @@ export async function readGiftCardFlagCutIn(): Promise<GiftCardCutIn> {
  */
 export function giftCardOrderedAt(order: Pick<WcFullOrder, 'date_created_gmt'>): Date {
   const gmt = (order.date_created_gmt ?? '').toString().trim()
-  return gmt === '' ? new Date(Number.NaN) : parseWcGmtInstant(gmt)
+  return parseStrictIsoInstant(gmt, { dateOnly: false, assumeUtc: true }) ?? new Date(Number.NaN)
 }
 
 /** Whether the order must carry the gift-card flag on every line: it was created at or after the cut-in. An unset cut-in is `off`; an invalid one, or a set one with no readable order date, is `setting_unreadable`. */

@@ -54,19 +54,27 @@ export const EU_VAT_GIFT_CARD_CUT_IN_SETTING = 'eu_vat_gift_card_flag_cut_in'
 
 export type GiftCardCutIn = { state: 'unset' } | { state: 'ok'; at: Date } | { state: 'invalid'; raw: string }
 
-export function parseGiftCardCutIn(raw: string | null | undefined): GiftCardCutIn {
-  if (raw === null || raw === undefined || raw.trim() === '') return { state: 'unset' }
+/**
+ * A strict ISO 8601 instant: `YYYY-MM-DD` (date-only, start of day UTC, when `dateOnly`), or `YYYY-MM-DDTHH:MM[:SS[.fff]]` with a zone (`Z` or `+HH:MM`), or WITHOUT a zone when `assumeUtc` (the WooCommerce `*_gmt` fields).
+ * Every calendar and clock component is range-checked (no 2026-02-31, no hour 24, no minute 60); a value that would roll over is NOT an instant. Null when it is not one.
+ */
+export function parseStrictIsoInstant(raw: string, options: { dateOnly: boolean; assumeUtc: boolean }): Date | null {
   const text = raw.trim()
-  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(text)
-  const instant = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/.test(text)
-  if (!dateOnly && !instant) return { state: 'invalid', raw: text.slice(0, 40) }
-  // Validate the calendar and clock components of BOTH forms: Date silently rolls 2026-02-31 over (or rejects it only in some forms), so the guess would move the cut-in.
-  const m = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d{1,3})?(?:Z|[+-](\d{2}):(\d{2})))?$/.exec(text)!
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d{1,3})?(Z|[+-](\d{2}):(\d{2}))?)?$/.exec(text)
+  if (m === null) return null
+  const hasTime = m[4] !== undefined
+  if (!hasTime && !options.dateOnly) return null
+  if (hasTime && m[7] === undefined && !options.assumeUtc) return null
   const [year, month, day] = [Number(m[1]), Number(m[2]), Number(m[3])]
   const probe = new Date(Date.UTC(year, month - 1, day))
-  if (probe.getUTCFullYear() !== year || probe.getUTCMonth() !== month - 1 || probe.getUTCDate() !== day) return { state: 'invalid', raw: text.slice(0, 40) }
-  if (instant && (Number(m[4]) > 23 || Number(m[5]) > 59 || (m[6] !== undefined && Number(m[6]) > 59) || (m[7] !== undefined && (Number(m[7]) > 23 || Number(m[8]) > 59)))) return { state: 'invalid', raw: text.slice(0, 40) }
-  const at = new Date(dateOnly ? `${text}T00:00:00Z` : text)
-  if (Number.isNaN(at.getTime())) return { state: 'invalid', raw: text.slice(0, 40) }
-  return { state: 'ok', at }
+  if (probe.getUTCFullYear() !== year || probe.getUTCMonth() !== month - 1 || probe.getUTCDate() !== day) return null
+  if (hasTime && (Number(m[4]) > 23 || Number(m[5]) > 59 || (m[6] !== undefined && Number(m[6]) > 59) || (m[8] !== undefined && (Number(m[8]) > 23 || Number(m[9]) > 59)))) return null
+  const at = new Date(!hasTime ? `${text}T00:00:00Z` : m[7] === undefined ? `${text}Z` : text)
+  return Number.isNaN(at.getTime()) ? null : at
+}
+
+export function parseGiftCardCutIn(raw: string | null | undefined): GiftCardCutIn {
+  if (raw === null || raw === undefined || raw.trim() === '') return { state: 'unset' }
+  const at = parseStrictIsoInstant(raw, { dateOnly: true, assumeUtc: false })
+  return at === null ? { state: 'invalid', raw: raw.trim().slice(0, 40) } : { state: 'ok', at }
 }

@@ -51,7 +51,8 @@ test('gift-card detection: yes and no are read from the line; a line with no fla
     ] as never,
   }))
   assert.deepEqual(lines, [
-    { total: '10.00', voucher: 'yes' }, { total: '20.00', voucher: 'no' }, { total: '30.00', voucher: 'no' }, { total: '40.00', voucher: 'unknown' }, { total: '0', voucher: 'unknown' },
+    { total: '10.00', voucher: 'yes', voucherStrict: 'yes' }, { total: '20.00', voucher: 'no', voucherStrict: 'no' }, { total: '30.00', voucher: 'no', voucherStrict: 'unknown' },
+    { total: '40.00', voucher: 'unknown', voucherStrict: 'unknown' }, { total: '0', voucher: 'unknown', voucherStrict: 'unknown' },
   ])
 })
 
@@ -259,6 +260,42 @@ test('gift-card cut-in: an "unknown" flag value is missing; the comparison uses 
   const at = (g: string) => giftCardFlagPolicy({ state: 'ok', at: new Date('2026-11-01T10:00:00Z') }, giftCardOrderedAt({ date_created_gmt: g }))
   assert.equal(at('2026-11-01T09:59:59'), 'off')
   assert.equal(at('2026-11-01T10:00:00'), 'required')
+})
+
+test('gift-card cut-in: only exactly "yes" or "no" count after the cut-in (empty, blank, 0, false, Yes, booleans and a missing key are unknown); before it the lenient reading stays', async () => {
+  const client = fakeClient({ mappings: [mappingRow(216, {})] })
+  const acc = { ioss: '821', ddp: '232' }
+  const cutIn = async () => ({ state: 'ok' as const, at: new Date('2026-10-01T00:00:00Z') })
+  for (const bad of ['', ' ', ' no', 'No', 'YES', '0', 'false', 'true', 1, false, null]) {
+    const o = wcOrder({ line_items: [{ id: 1, total: '100.00', meta_data: [meta('_o3d_is_voucher', bad)] }] as never })
+    const input = await buildEuVatRegimeInputFromSettings(client, o, acc, { baseCurrency: 'GBP', mode: 'decide' }, cutIn)
+    assert.equal(input.goodsLines[0]!.voucherStrict, 'unknown', JSON.stringify(bad))
+    assert.equal((resolveEuVatRegime(input) as { code?: string }).code, 'gift_card_flag_missing', JSON.stringify(bad))
+  }
+  const none = wcOrder({ line_items: [{ id: 1, total: '100.00', meta_data: [] }] as never })
+  assert.equal(readGoodsLines(none)[0]!.voucherStrict, 'unknown')
+  for (const good of ['yes', 'no']) {
+    const o = wcOrder({ line_items: [{ id: 1, total: '100.00', meta_data: [meta('_o3d_is_voucher', good)] }] as never })
+    const input = await buildEuVatRegimeInputFromSettings(client, o, acc, { baseCurrency: 'GBP', mode: 'decide' }, cutIn)
+    assert.equal(input.goodsLines[0]!.voucherStrict, good)
+    assert.equal(resolveEuVatRegime(input).kind, 'SCHEME')
+  }
+  // before the cut-in / unset: the lenient reading is unchanged (empty is no)
+  const empty = wcOrder({ line_items: [{ id: 1, total: '100.00', meta_data: [meta('_o3d_is_voucher', '')] }] as never })
+  assert.equal(readGoodsLines(empty)[0]!.voucher, 'no')
+  const before = await buildEuVatRegimeInputFromSettings(client, empty, acc, { baseCurrency: 'GBP', mode: 'decide' }, async () => ({ state: 'ok', at: new Date('2026-12-01T00:00:00Z') }))
+  assert.equal(resolveEuVatRegime(before).kind, 'SCHEME')
+})
+
+test('gift-card cut-in: date_created_gmt is validated strictly; rollover and out-of-range dates are unreadable, not shifted', async () => {
+  for (const bad of ['2026-02-31T10:00:00', '2026-11-01T24:00:00', '2026-11-31T00:00:00', '2026-11-01T10:60:00', '2026-11-01T10:00:60', '2026-13-01T00:00:00', 'not a date', '2026-11-01']) {
+    assert.ok(Number.isNaN(giftCardOrderedAt({ date_created_gmt: bad }).getTime()), bad)
+  }
+  assert.equal(giftCardOrderedAt({ date_created_gmt: '2026-11-01T23:59:59' }).toISOString(), '2026-11-01T23:59:59.000Z')
+  assert.equal(giftCardOrderedAt({ date_created_gmt: '2026-11-01T10:00:00Z' }).toISOString(), '2026-11-01T10:00:00.000Z')
+  const client = fakeClient({ mappings: [mappingRow(216, {})] })
+  const r = await buildEuVatRegimeInputFromSettings(client, wcOrder({ date_created_gmt: '2026-02-31T10:00:00' }), { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide' }, async () => ({ state: 'ok', at: new Date('2026-10-01T00:00:00Z') }))
+  assert.equal(r.giftCardFlag, 'setting_unreadable')
 })
 
 // ---- unreadable figures are named, never defaulted to 0 -------------------------------------------------------------------------------------------------------------

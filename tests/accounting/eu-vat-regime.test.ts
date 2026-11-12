@@ -562,7 +562,10 @@ test('gift-card cut-in: required refuses ANY unflagged line in either mode and f
   const uk = order({ giftCardFlag: 'required', shippingCountry: 'GB', billingCountry: 'GB', rates: [], orderTax: '0.00', goodsLines: lines })
   assert.equal(refused(resolveEuVatRegime(uk)).code, 'gift_card_flag_missing')
   // every line flagged (yes or no): resolves
-  assert.equal(resolveEuVatRegime(order({ giftCardFlag: 'required', goodsLines: [{ total: '100.00', voucher: 'no' }, { total: '3.00', voucher: 'yes' }] })).kind, 'SCHEME')
+  assert.equal(resolveEuVatRegime(order({ giftCardFlag: 'required', goodsLines: [{ total: '100.00', voucher: 'no', voucherStrict: 'no' }, { total: '3.00', voucher: 'yes', voucherStrict: 'yes' }] })).kind, 'SCHEME')
+  // the strict reading decides: a lenient 'no' whose strict reading is unknown (an empty flag) refuses, and an absent strict reading fails closed
+  assert.equal(refused(resolveEuVatRegime(order({ giftCardFlag: 'required', goodsLines: [{ total: '100.00', voucher: 'no', voucherStrict: 'unknown' }] }))).code, 'gift_card_flag_missing')
+  assert.equal(refused(resolveEuVatRegime(order({ giftCardFlag: 'required', goodsLines: [{ total: '100.00', voucher: 'no' }] }))).code, 'gift_card_flag_missing')
   // off / absent: a small unflagged line that cannot change the regime still resolves, as before
   assert.equal(resolveEuVatRegime(order({ giftCardFlag: 'off', goodsLines: lines })).kind, 'SCHEME')
   assert.equal(resolveEuVatRegime(order({ goodsLines: lines })).kind, 'SCHEME')

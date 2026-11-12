@@ -96,6 +96,8 @@ export type GoodsLineFact = {
   total: string
   /** The gift-card flag (`_o3d_is_voucher`): yes and no were read from the line; unknown means the line carried none and the product-level marker (`_coupon_title`) is not imported to settle it. */
   voucher: 'yes' | 'no' | 'unknown'
+  /** The same flag read STRICTLY: only exactly `yes` or `no` count (an empty, blank or other value, and a missing key, are `unknown`). The cut-in rule reads this one; absent here is treated as `unknown` (fail closed). */
+  voucherStrict?: 'yes' | 'no' | 'unknown'
 }
 
 export type EuVatRegimeMode = 'adopt_plugin' | 'decide'
@@ -240,7 +242,7 @@ export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision
   if (input.unreadable.length > 0) return refuse('order_figure_unreadable', `the order carries figures that cannot be read, so nothing can be decided: ${input.unreadable.join('; ')}`)
   if (input.giftCardFlag === 'setting_unreadable') return refuse('gift_card_cut_in_unreadable', 'the gift-card flag cut-in setting (or the order creation date) cannot be read, so it is not known whether this order must carry a gift-card flag on every line')
   if (input.giftCardFlag === 'required') {
-    const missing = input.goodsLines.flatMap((line, index) => (line.voucher === 'unknown' ? [index + 1] : []))
+    const missing = input.goodsLines.flatMap((line, index) => (line.voucherStrict === 'yes' || line.voucherStrict === 'no' ? [] : [index + 1]))
     if (missing.length > 0) return refuse('gift_card_flag_missing', `the order was created after the gift-card flag cut-in but line(s) ${missing.join(', ')} carry no readable gift-card flag (_o3d_is_voucher yes/no)`)
   }
   const destination = normaliseDestination(input.shippingCountry) || normaliseDestination(input.billingCountry)
