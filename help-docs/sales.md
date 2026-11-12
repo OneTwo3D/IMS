@@ -4,9 +4,12 @@ Sales orders track customer purchases from creation through to allocation, multi
 
 ## Sales Order List
 
-The sales order list provides a searchable, sortable overview of all orders.
+The sales order list is a paged overview of all orders (50 per page). Search, the status filter and the page number are in the address, so a filtered view can be bookmarked or shared, and the line above the table says "Showing 1-50 of N sales orders".
 
-- **Search** by order reference, customer name, or other fields
+- **Search** looks across **every** order in the database, not just the newest ones: order number, the storefront's order number, customer name, customer email, tracking number (on the order or any shipment) and the SKU of any line. Press nothing; the list updates a moment after you stop typing.
+- **A search always includes Completed, Delivered and archived orders.** An archived order carries an **Archived** badge.
+- **Hide completed** (ticked by default) keeps finished work out of the everyday list, and the line above the table says how many Completed and Delivered orders that hides. Untick it to see them. Choosing **Completed** or **Delivered** in the status filter shows them too.
+- **Include archived** shows orders that data retention has archived (old Completed and Delivered orders). Archiving only hides an order from the default list; it is still searchable, and it changes nothing a report counts.
 - **Filter by status** to focus on orders at a specific stage
 - **Export to CSV** for reporting or use in external tools
 - **Columns** — the **Status** column shows the order's stage. Use the column picker to add more, for example **Invoice** (Pending, Invoiced, Paid, or the refund state), **Stock Status**, **WMS Status** and **WMS Dispatch**. Your choice is remembered in your browser.
@@ -150,6 +153,12 @@ When not all products are in stock, you can ship what's available now and fulfil
 5. When new stock arrives, the **allocation panel reappears** for the remaining lines
 6. **Re-allocate** the remaining items and confirm to create new shipments
 7. **Ship** the final shipments — the order auto-transitions to **Shipped** once all shipments are shipped
+
+Services and fees on an order (a delivery charge, for example) never need a shipment, so they never hold an order back: the order moves to **Shipped** once every physical item has shipped.
+
+**Dispatching from the app.** A shipment of an order that is still a **Draft**, **On Hold** (for any reason) or **Pending payment** cannot be dispatched: nothing is recorded and no stock is taken, and the message tells you what to do next (finalise the draft, release the hold, or record the payment). If the order is **Processing**, dispatching the last shipment moves the order to **Shipped** in the same step, and an "Order shipped from a non-fulfilment status" warning is added to its activity log. The dispatch and the order change are saved together: if the order cannot be moved, the dispatch is not recorded at all.
+
+**Despatches reported by the warehouse (Mintsoft).** The goods have already left, so IMS records what it can. If the order is **On Hold** or **Pending payment** and already has shipments, the shipments are marked shipped and stock and cost are booked as normal, but the order itself is left exactly as it is (it is not marked Shipped, the hold is not released, nothing is sent to the storefront), and an administrator gets a "Despatch on an order that is not ready to ship" notice and an activity-log warning. Review the order, release or finalise it, then set it to Shipped if it should be closed. If the order is a **Draft**, or has no shipment yet, IMS does not record the despatch (doing so would finalise the draft or lift the hold): it appears as a stuck despatch under **Sync > Exceptions** for you to decide what to do.
 
 This flow works seamlessly with the multi-shipment system. Each round of allocation and confirmation creates new shipments without affecting previously shipped items.
 

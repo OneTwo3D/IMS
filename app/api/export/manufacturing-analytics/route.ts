@@ -8,6 +8,7 @@ import {
   type ManufacturingAnalyticsFilters,
 } from '@/lib/domain/manufacturing/manufacturing-analytics'
 import { canAccessManufacturingAnalytics } from '@/lib/security/manufacturing-analytics-access'
+import { sourceLimitExportBody } from '@/lib/security/source-scan-error'
 
 const MANUFACTURING_ANALYTICS_CSV_ROW_LIMIT = 50000
 
@@ -69,7 +70,7 @@ export async function GET(req: NextRequest) {
     }
   } catch (error) {
     if (error instanceof ManufacturingAnalyticsSourceLimitError) {
-      return NextResponse.json({ error: error.message }, { status: 413 })
+      return NextResponse.json(sourceLimitExportBody(error), { status: 413 })
     }
     throw error
   }

@@ -34,6 +34,10 @@ const state = {
   activity: [] as Array<Record<string, unknown>>,
   /** How the post-commit attempt behaves: resolves, rejects, or never settles. */
   attemptBehaviour: 'ok' as 'ok' | 'reject' | 'hang',
+  /** What the transition double was asked to do, in order. */
+  transitionInputs: [] as Array<Record<string, unknown>>,
+  /** When set, the transition double reports the order was found unreleased under the lock. */
+  notReady: null as string | null,
 }
 
 mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
@@ -72,6 +76,7 @@ mock.module('@/lib/domain/sales/shipment-service', {
   namedExports: {
     // Flips the shipment row; reports `transitioned: false` for a repeat, exactly like the real one.
     transitionShipmentStatus: async (_client: unknown, input: { shipmentId: string; targetStatus: string }) => {
+      state.transitionInputs.push(input as Record<string, unknown>)
       const row = state.shipments.find((s) => s.id === input.shipmentId)
       if (!row) return { success: false, error: 'Shipment not found' }
       const transitioned = row.status !== input.targetStatus
@@ -84,6 +89,7 @@ mock.module('@/lib/domain/sales/shipment-service', {
         previousStatus,
         targetStatus: input.targetStatus,
         stockSyncProductIds: ['prod-1'],
+        ...(state.notReady ? { despatchedWhileNotReady: state.notReady } : {}),
         shipment: {
           id: row.id,
           orderId: row.orderId,
@@ -146,6 +152,8 @@ function seed(orderStatus: string, shipmentStatuses: string[]) {
   state.reconcileOptions.length = 0
   state.activity.length = 0
   state.attemptBehaviour = 'ok'
+  state.transitionInputs.length = 0
+  state.notReady = null
 }
 
 beforeEach(() => seed('ALLOCATED', ['PACKED']))
@@ -281,4 +289,43 @@ test('o3d-zvec.15 (g): an EXTERNAL-authority dispatch asks for the durable compl
     evaluated++
   }
   assert.equal(evaluated, 3)
+})
+
+test('SHP-H1: an in-app dispatch asks the dispatch transaction to promote the order, and never to record on an unreleased one', async () => {
+  seed('ALLOCATED', ['PACKED'])
+  await ship('ship-1')
+  await settle()
+
+  const input = state.transitionInputs[0] as { completion?: Record<string, unknown>; allowRecordWhenNotReady?: boolean }
+  assert.equal(input.completion?.completionAuthority, 'IMS', 'the promotion is requested INSIDE the dispatch transaction')
+  assert.equal(input.completion?.storefrontCompletion, true)
+  assert.equal(input.allowRecordWhenNotReady, undefined)
+})
+
+test('SHP-H1: the record-when-unreleased switch is honoured only for the internal caller', async () => {
+  const { INTERNAL_ACTION_BYPASS } = await import('@/lib/internal-action-bypass')
+
+  seed('ALLOCATED', ['PACKED'])
+  await ship('ship-1', { allowRecordWhenNotReady: true }) // an operator session cannot ask for it
+  assert.equal((state.transitionInputs[0] as { allowRecordWhenNotReady?: boolean }).allowRecordWhenNotReady, undefined)
+
+  seed('ALLOCATED', ['PACKED'])
+  await ship('ship-1', { internalBypassToken: INTERNAL_ACTION_BYPASS, allowRecordWhenNotReady: true })
+  assert.equal((state.transitionInputs[0] as { allowRecordWhenNotReady?: boolean }).allowRecordWhenNotReady, true)
+})
+
+test('SHP-H1: a despatch recorded against an unreleased order is reported back, pushes nothing to the storefront and is not reconciled', async () => {
+  const { INTERNAL_ACTION_BYPASS } = await import('@/lib/internal-action-bypass')
+  seed('ON_HOLD', ['PACKED'])
+  state.notReady = 'ON_HOLD'
+
+  const result = await ship('ship-1', { internalBypassToken: INTERNAL_ACTION_BYPASS, allowRecordWhenNotReady: true, completionAuthority: 'EXTERNAL', storefrontCompletion: true })
+  await settle()
+
+  assert.equal(result.success, true)
+  assert.equal((result as { despatchedWhileNotReady?: string }).despatchedWhileNotReady, 'ON_HOLD')
+  assert.equal(state.reconcileResults.length, 0, 'the order is not reconciled')
+  assert.deepEqual(TRACKING(state.calls), [], 'no tracking push')
+  assert.deepEqual(ATTEMPTS(state.calls), [], 'no completion attempt')
+  assert.equal(state.orderStatus, 'ON_HOLD')
 })

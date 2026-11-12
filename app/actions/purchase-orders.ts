@@ -158,6 +158,10 @@ import {
 import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
 import { isMissingStoredFxRateError, resolveStoredFxRateToBase } from '@/lib/currencies/stored-document-rate'
 import { Prisma } from '@/app/generated/prisma/client'
+import {
+  ORDER_LIST_PAGE_SIZE, isShortListQuery, PO_STATUSES, buildListPage, buildPurchaseOrderListWhere, normaliseListQuery,
+  normalisePage, normaliseStatuses, poListHidesArchived, type ListPage, type PoListFilter,
+} from '@/lib/domain/lists/order-list-query'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import { supplierCreditNoteAmountBase } from '@/lib/domain/purchasing/supplier-credit-note-amount'
 import {
@@ -211,6 +215,8 @@ export type PoRow = {
   reference: string
   type: 'GOODS' | 'FREIGHT'
   status: PoStatus
+  /// Hidden from the default list by data retention; still searchable.
+  archived: boolean
   supplierId: string
   supplierName: string
   supplierPrepaid: boolean
@@ -418,6 +424,7 @@ async function makeReference(): Promise<string> {
 
 const PO_SELECT = {
   id: true,
+  archived: true,
   reference: true,
   type: true,
   status: true,
@@ -479,6 +486,7 @@ const PO_SELECT = {
 } as const
 
 function mapPoRow(po: {
+  archived: boolean
   id: string
   reference: string
   type: string
@@ -524,6 +532,7 @@ function mapPoRow(po: {
     reference: po.reference,
     type: po.type as 'GOODS' | 'FREIGHT',
     status: po.status as PoStatus,
+    archived: po.archived,
     supplierId: po.supplierId,
     supplierName: po.supplier.name,
     supplierPrepaid: po.supplier.prepaid,
@@ -621,7 +630,31 @@ function mapLine(l: {
 // Queries
 // ---------------------------------------------------------------------------
 
-export async function getPurchaseOrders(limit = 200): Promise<PoRow[]> {
+export type PoListParams = {
+  q?: string
+  /** Comma-separated string (from the URL) or a list. Unknown values are ignored. */
+  status?: string | string[]
+  page?: number | string
+  invoiced?: boolean
+  returned?: boolean
+  /** Include archived orders in the default view. Search always includes them. */
+  includeArchived?: boolean
+}
+
+export type PoListResult = ListPage & {
+  rows: PoRow[]
+  hidesArchived: boolean
+  hiddenArchivedCount: number
+  /** The search text was too short for a substring search; only exact references matched. */
+  queryTooShort: boolean
+}
+
+/**
+ * One page of purchase orders, searched and filtered IN THE DATABASE across every order. A search
+ * covers reference, supplier name, supplier reference, tracking number and line SKU, and always
+ * includes archived orders.
+ */
+export async function getPurchaseOrders(params: PoListParams = {}): Promise<PoListResult> {
   // o3d-512h round 3 — SUPPLIER ISOLATION. `requireAuth` only asks whether someone
   // is signed in, and SUPPLIER sessions are signed in: this export enumerated EVERY
   // supplier's purchase orders — references, currencies, totals and supplier names —
@@ -636,13 +669,29 @@ export async function getPurchaseOrders(limit = 200): Promise<PoRow[]> {
   // supplier-portal permissions, so holding one proves nothing about whose rows
   // these are.
   await requirePermission('purchasing')
+  const filter: PoListFilter = {
+    q: normaliseListQuery(params.q),
+    statuses: normaliseStatuses(params.status, PO_STATUSES),
+    invoiced: params.invoiced === true,
+    returned: params.returned === true,
+    includeArchived: params.includeArchived === true,
+  }
+  const where = buildPurchaseOrderListWhere(filter)
+  const hidesArchived = poListHidesArchived(filter)
+  const pageSize = ORDER_LIST_PAGE_SIZE
+  const [total, hiddenArchivedCount] = await Promise.all([
+    db.purchaseOrder.count({ where }),
+    hidesArchived ? db.purchaseOrder.count({ where: { archived: true } }) : Promise.resolve(0),
+  ])
+  const page = Math.min(normalisePage(params.page), buildListPage(1, pageSize, total).pageCount)
   const pos = await db.purchaseOrder.findMany({
-    where: { archived: { not: true } },
+    where,
     select: PO_SELECT,
-    orderBy: { createdAt: 'desc' },
-    take: limit,
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    skip: (page - 1) * pageSize,
+    take: pageSize,
   })
-  return pos.map(mapPoRow)
+  return { ...buildListPage(page, pageSize, total), rows: pos.map(mapPoRow), hidesArchived, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q) }
 }
 
 /**

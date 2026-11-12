@@ -8,7 +8,7 @@ import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stoc
 import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { CLAIMED_BOM_SELECT, CLAIMED_BOM_WHERE, claimedBomItems } from '@/lib/products/claimed-bom'
 import { parseProductionOrderComponentSnapshot } from '@/lib/domain/manufacturing/component-consumption'
-import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
+import { SourceScanTooLargeError, assertSourceLimit, sourceLimitNotice } from '@/lib/security/source-scan-error'
 import {
   calculateDecimalCoverageByLine,
   type DecimalFulfillmentRequirement,
@@ -387,7 +387,7 @@ export function emptyReorderReportForSourceLimit(
     rows: [],
     pageInfo: pageInfo(0, filters.page, clampPageSize(filters.pageSize)),
     totals: { availableQty: '0', inboundOpenPoQty: '0', suggestedReorderQty: '0' },
-    notices: [error.message],
+    notices: [sourceLimitNotice(error)],
   }
 }
 
@@ -401,7 +401,7 @@ export function emptyBackorderDemandReportForSourceLimit(
     rows: [],
     pageInfo: pageInfo(0, filters.page, clampPageSize(filters.pageSize)),
     totals: { orderedQty: '0', committedQty: '0', allocatedQty: '0', backorderQty: '0' },
-    notices: [error.message],
+    notices: [sourceLimitNotice(error)],
   }
 }
 
@@ -415,7 +415,7 @@ export function emptyComponentShortageReportForSourceLimit(
     rows: [],
     pageInfo: pageInfo(0, filters.page, clampPageSize(filters.pageSize)),
     totals: { requiredQty: '0', availableQty: '0', inboundOpenPoQty: '0', shortageQty: '0' },
-    notices: [error.message],
+    notices: [sourceLimitNotice(error)],
   }
 }
 

@@ -11,7 +11,7 @@ import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { REFUND_TURNOVER_SELECT, type TurnoverRefund } from '@/lib/domain/sales/customer-turnover'
 import { receivableBalance } from '@/lib/domain/sales/receivable-balance'
 import { invoicedInPeriodWhere, invoicedPeriodDate, invoicedPeriodDateIsApproximate } from '@/lib/domain/sales/invoiced-revenue-basis'
-import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
+import { SourceScanTooLargeError, assertSourceLimit, sourceLimitNotice } from '@/lib/security/source-scan-error'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -365,7 +365,7 @@ export function emptyFinanceAnalyticsReportForSourceLimit<Row, Totals extends Re
     rows: [],
     pageInfo: pageInfo(0, filters.page, pageSize),
     totals,
-    notices: [error.message],
+    notices: [sourceLimitNotice(error)],
   }
 }
 

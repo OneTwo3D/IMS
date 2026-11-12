@@ -91,6 +91,7 @@ const recorder = createRecordingDb((ctx: QueryContext) => {
     }
   }
   if (ctx.op === 'findUnique' || ctx.op === 'findFirst') return null
+  if (ctx.op === 'count') return 0
   return []
 })
 mock.module('@/lib/db', { namedExports: { db: recorder.db } })
@@ -98,7 +99,7 @@ mock.module('@/lib/db', { namedExports: { db: recorder.db } })
 before(async () => {
   currentRole = 'ADMIN'
   const { getPurchaseOrders } = await import('@/app/actions/purchase-orders')
-  await recorder.prove(() => getPurchaseOrders(1))
+  await recorder.prove(() => getPurchaseOrders())
 })
 
 // ---------------------------------------------------------------------------
@@ -174,7 +175,7 @@ for (const role of ['ADMIN', 'MANAGER', 'WAREHOUSE', 'FINANCE', 'READONLY'] as c
     // purchase orders, and neither holds 'purchasing.create'.
     currentRole = role
     const { getPurchaseOrders } = await import('@/app/actions/purchase-orders')
-    assert.deepEqual(await getPurchaseOrders(5), [])
+    assert.deepEqual((await getPurchaseOrders()).rows, [])
   })
 }
 

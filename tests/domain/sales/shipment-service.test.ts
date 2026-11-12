@@ -5,6 +5,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import {
   confirmSalesOrderShipments,
   discardCancelledOrderShipmentsInTx,
+  findOrderShipmentShortfall,
   reconcileOrderAfterShipment,
   reopenShipmentForRepack,
   transitionShipmentStatus,
@@ -52,6 +53,8 @@ type OrderLine = {
   cogsBase?: number | null
   /** o3d-kouj: the line's PINNED fulfilment recipe; undefined is the NULL of a never-allocated line. */
   fulfillmentRequirements?: unknown
+  /** The product's type; omitted reads as an unreadable type (treated as stock-tracked). */
+  productType?: string
 }
 type Allocation = {
   id?: string
@@ -250,6 +253,7 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
           // line to a recipe the catalogue no longer has.
           fulfillmentRequirements: line.fulfillmentRequirements ?? null,
           product: {
+            type: line.productType,
             fulfillmentGraphVersion:
               state.lineProductGraphVersions?.[line.productId] ?? state.graphVersions?.[line.productId] ?? 0,
           },
@@ -3099,4 +3103,207 @@ test('o3d-2k5r r8: the widened fence still does not outlive the recovery — a C
   assert.equal(result.success, true)
   assert.equal(state.shipments[1].status, 'SHIPPED')
   assert.equal(state.movements.length, 1)
+})
+
+// --- SHP-H1: a dispatch that commits must leave the order valid, in the SAME transaction -----------
+
+const PACKED_SHIPMENT: Shipment = {
+  id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null,
+}
+const FULL_SHIPMENT_LINE: ShipmentLine = { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }
+
+for (const parked of ['PROCESSING']) {
+  test(`SHP-H1: dispatching the last shipment of a ${parked} order promotes it to SHIPPED in the dispatch transaction`, async () => {
+    const state = baseState({
+      orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: parked }],
+      shipments: [{ ...PACKED_SHIPMENT }],
+      shipmentLines: [{ ...FULL_SHIPMENT_LINE }],
+    })
+
+    const result = await transitionShipmentStatus(createClient(state), {
+      shipmentId: 'shipment-1',
+      targetStatus: 'SHIPPED',
+      completion: { completionAuthority: 'IMS' },
+    })
+
+    assert.equal(result.success, true)
+    assert.equal(state.shipments[0].status, 'SHIPPED')
+    assert.equal(state.stockLevels[0].quantity, 0, 'the goods left, so stock is decremented')
+    assert.equal(state.orders[0].status, 'SHIPPED', 'and the order is consistent with that')
+    assert.ok(result.success && result.reconciliation?.orderReachedShipped)
+    assert.equal(result.success && result.reconciliation?.promotedFromStatus, parked)
+  })
+
+  test(`SHP-H1: reconcileOrderAfterShipment no longer throws for a ${parked} order whose shipments have all shipped`, async () => {
+    const state = baseState({
+      orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: parked }],
+      shipments: [{ ...PACKED_SHIPMENT, status: 'SHIPPED', trackingNumber: 'TRACK-1' }],
+      shipmentLines: [{ ...FULL_SHIPMENT_LINE }],
+    })
+
+    const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
+
+    assert.equal(state.orders[0].status, 'SHIPPED')
+    assert.equal(result.orderReachedShipped, true)
+    assert.equal(result.promotedFromStatus, parked)
+  })
+}
+
+for (const [parked, wording] of [['DRAFT', /still a draft.*Finalise the draft/], ['ON_HOLD', /on hold.*Release the hold/], ['PENDING_PAYMENT', /waiting for payment.*Record the payment/]] as const) {
+  test(`SHP-H1: an in-app dispatch of a ${parked} order is refused with nothing written`, async () => {
+    const state = baseState({
+      orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: parked }],
+      shipments: [{ ...PACKED_SHIPMENT }],
+      shipmentLines: [{ ...FULL_SHIPMENT_LINE }],
+    })
+
+    const result = await transitionShipmentStatus(createClient(state), {
+      shipmentId: 'shipment-1',
+      targetStatus: 'SHIPPED',
+      completion: { completionAuthority: 'IMS' },
+    })
+
+    assert.equal(result.success, false)
+    assert.match(result.success ? '' : result.error, wording)
+    assert.equal(state.shipments[0].status, 'PACKED')
+    assert.equal(state.stockLevels[0].quantity, 2)
+    assert.equal(state.stockLevels[0].reservedQty, 2)
+    assert.equal(state.movements.length, 0)
+    assert.equal(state.cogsEntries.length, 0)
+    assert.equal(state.orders[0].status, parked)
+  })
+
+  test(`SHP-H1: a warehouse-reported dispatch of a ${parked} order is recorded without touching the order`, async () => {
+    const state = baseState({
+      orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: parked }],
+      shipments: [{ ...PACKED_SHIPMENT }],
+      shipmentLines: [{ ...FULL_SHIPMENT_LINE }],
+    })
+
+    const result = await transitionShipmentStatus(createClient(state), {
+      shipmentId: 'shipment-1',
+      targetStatus: 'SHIPPED',
+      allowRecordWhenNotReady: true,
+      completion: { completionAuthority: 'EXTERNAL' },
+    })
+
+    assert.equal(result.success, true)
+    assert.equal(result.success && result.despatchedWhileNotReady, parked, 'the locked decision is returned')
+    assert.equal(state.shipments[0].status, 'SHIPPED')
+    assert.equal(state.stockLevels[0].quantity, 0)
+    assert.equal(state.movements.length, 1)
+    assert.equal(state.orders[0].status, parked, 'not promoted, hold not cleared')
+  })
+
+  test(`SHP-H1: reconcile never promotes a ${parked} order`, async () => {
+    const state = baseState({
+      orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: parked }],
+      shipments: [{ ...PACKED_SHIPMENT, status: 'SHIPPED', trackingNumber: 'T' }],
+      shipmentLines: [{ ...FULL_SHIPMENT_LINE }],
+    })
+    const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
+    assert.equal(state.orders[0].status, parked)
+    assert.equal(result.orderReachedShipped, undefined)
+  })
+}
+
+test('SHP-H1: a warehouse dispatch is decided on the status read UNDER the order lock: an order released since the pre-read is promoted normally', async () => {
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'PROCESSING' }], // was ON_HOLD when the caller looked
+    shipments: [{ ...PACKED_SHIPMENT }],
+    shipmentLines: [{ ...FULL_SHIPMENT_LINE }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+    allowRecordWhenNotReady: true,
+    completion: { completionAuthority: 'EXTERNAL' },
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(result.success && result.despatchedWhileNotReady, undefined)
+  assert.equal(state.orders[0].status, 'SHIPPED')
+  assert.equal(result.success && result.reconciliation?.orderReachedShipped, true)
+})
+
+test('SHP-H1: a promotion that cannot be made rolls the whole dispatch back, stock included', async () => {
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'MYSTERY' }],
+    shipments: [{ ...PACKED_SHIPMENT }],
+    shipmentLines: [{ ...FULL_SHIPMENT_LINE }],
+  })
+
+  await assert.rejects(
+    transitionShipmentStatus(createClient(state), {
+      shipmentId: 'shipment-1',
+      targetStatus: 'SHIPPED',
+      completion: { completionAuthority: 'IMS' },
+    }),
+    /Cannot transition sales order from MYSTERY to SHIPPED/,
+  )
+
+  assert.equal(state.shipments[0].status, 'PACKED', 'the shipment is not left dispatched')
+  assert.equal(state.stockLevels[0].quantity, 2, 'stock is not left decremented')
+  assert.equal(state.movements.length, 0, 'no SALE_DISPATCH movement survives')
+  assert.equal(state.cogsEntries.length, 0)
+  assert.equal(state.orders[0].status, 'MYSTERY')
+})
+
+test('SHP-H1: a partial dispatch inside the transaction leaves the order and the invoice trigger alone', async () => {
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'PROCESSING' }],
+    shipments: [
+      { ...PACKED_SHIPMENT },
+      { id: 'shipment-2', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PENDING', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [{ ...FULL_SHIPMENT_LINE, qty: 1 }, { id: 'shipment-line-2', shipmentId: 'shipment-2', lineId: 'line-1', productId: 'product-1', qty: 1 }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 }],
+    settings: { invoice_trigger: 'on_shipped' },
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+    completion: { completionAuthority: 'IMS' },
+  })
+
+  assert.equal(state.orders[0].status, 'PROCESSING')
+  assert.deepEqual(result.success && result.reconciliation, { shouldGenerateInvoice: false, orderId: 'order-1' })
+})
+
+// --- SHP-H2: services and fees are not something a dispatch can leave outstanding ------------------
+
+test('SHP-H2: an order with a NON_INVENTORY delivery line is completed once its stock lines have shipped', async () => {
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ALLOCATED' }],
+    lines: [
+      { id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 2, sku: 'SKU-1', description: 'Product 1', productType: 'SIMPLE' },
+      { id: 'line-2', orderId: 'order-1', productId: 'product-fee', qty: 1, sku: 'DELIVERY', description: 'Delivery charge', productType: 'NON_INVENTORY' },
+    ],
+    shipments: [{ ...PACKED_SHIPMENT, status: 'SHIPPED', trackingNumber: 'TRACK-1' }],
+    shipmentLines: [{ ...FULL_SHIPMENT_LINE }],
+  })
+
+  assert.equal(await findOrderShipmentShortfall(createClient(state), 'order-1'), null)
+  const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
+  assert.equal(result.shortfall, undefined)
+  assert.equal(state.orders[0].status, 'SHIPPED')
+})
+
+test('SHP-H2: a stock-tracked line that has not shipped still holds the order short', async () => {
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ALLOCATED' }],
+    lines: [
+      { id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 5, sku: 'SKU-1', description: 'Product 1', productType: 'SIMPLE' },
+      { id: 'line-2', orderId: 'order-1', productId: 'product-fee', qty: 1, sku: 'DELIVERY', description: 'Delivery charge', productType: 'NON_INVENTORY' },
+    ],
+    shipments: [{ ...PACKED_SHIPMENT, status: 'SHIPPED', trackingNumber: 'TRACK-1' }],
+    shipmentLines: [{ ...FULL_SHIPMENT_LINE }],
+  })
+
+  const shortfall = await findOrderShipmentShortfall(createClient(state), 'order-1')
+  assert.equal(shortfall?.length, 1)
+  assert.equal(shortfall?.[0].label, 'SKU-1', 'only the stock line is outstanding, not the delivery charge')
+  assert.equal(shortfall?.[0].outstandingQty, 3)
 })

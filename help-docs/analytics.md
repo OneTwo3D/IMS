@@ -36,7 +36,7 @@ A role that is not allowed a report does not see it in the Analytics menu and is
 
 ### Source-row cap (50,000 rows)
 
-To keep large reports responsive, the underlying data fetch is capped at **50,000 source rows** per report. If your date range or filters select more than that, the report returns a `413 Payload Too Large` error and asks you to narrow the range or apply more filters.
+To keep large reports responsive, the underlying data fetch is capped at **50,000 source rows** per report. If your date range or filters select more than that, the report is **not computed**. A red banner at the top of the page says "This report hit its row limit (50,000 rows); narrow the date range or filters", the summary tiles show a dash instead of a figure, and the table says "Report not computed". It never shows zeros or "No rows" for a report that was refused. The CSV button gives the same refusal (a `413 Payload Too Large` response carrying the same message, with no file) rather than a file of zeros.
 
 The cap applies before any aggregation, so a report that displays "120 supplier rows" might still hit it if those 120 rows roll up from millions of PO lines — narrow by date in that case.
 

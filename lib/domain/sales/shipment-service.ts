@@ -7,6 +7,11 @@ import {
   validateSalesOrderStatusTransition,
   validateShipmentStatusTransition,
 } from '@/lib/domain/workflows/action-guards'
+import {
+  ORDER_STATUSES_NOT_READY_TO_DISPATCH,
+  orderNotReadyToDispatchMessage,
+  resolveShippedPromotion,
+} from '@/lib/domain/workflows/sales-order-state'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import {
   lockSalesOrder,
@@ -32,6 +37,7 @@ import {
 } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { UNCOMMITTED_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
 import { withSavepoint } from '@/lib/db/savepoint'
+import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 
 export const SHIPMENT_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 const SHIPMENT_QTY_EPSILON_DECIMAL = new Prisma.Decimal('0.000001')
@@ -79,6 +85,10 @@ export type ShipmentTransitionResult =
       targetStatus: string
       previousStatus: string
       stockSyncProductIds: string[]
+      /** Present only for a dispatch asked to promote the order in its own transaction (`input.completion`). */
+      reconciliation?: ShipmentReconciliationResult
+      /** The order status found under the lock when a warehouse-reported dispatch was recorded against an unreleased order. */
+      despatchedWhileNotReady?: string
     }
 
 /**
@@ -138,6 +148,11 @@ export type ShipmentReconciliationResult = {
    * order, for an order some other path had already promoted, and for a retry that finds it done.
    */
   orderReachedShipped?: true
+  /**
+   * Present only when the flip had to go through ALLOCATED because the order was ON_HOLD, PROCESSING,
+   * DRAFT or PENDING_PAYMENT when its last shipment left. Carries the status it was promoted from.
+   */
+  promotedFromStatus?: string
   /**
    * o3d-zvec.15: the idempotency key of the durable WooCommerce completion job enqueued IN the flip's own
    * transaction — present only when the call flipped the order, asked for `storefrontCompletion`, and the
@@ -207,6 +222,11 @@ function hasSameShipmentLines(
 type OrderLeafQuantities = {
   /** Order line id -> the SKU/description an operator will recognise. */
   lineLabelById: Map<string, string>
+  /**
+   * Order lines whose product is not stock-tracked (a service, a fee, a delivery charge). They can
+   * never be allocated or put on a shipment, so they are never "outstanding" for completion.
+   */
+  untrackedLineIds: Set<string>
   orderedByLeaf: Map<string, Prisma.Decimal>
   refundedByLeaf: Map<string, Prisma.Decimal>
   /** Leaf qty on SHIPPED shipments — historical, and the only thing that counts as fulfilled. */
@@ -235,6 +255,7 @@ async function loadOrderLeafQuantities(
         sku: true,
         description: true,
         fulfillmentRequirements: true,
+        product: { select: { type: true } },
       },
     }),
     client.shipmentLine.findMany({
@@ -289,10 +310,13 @@ async function loadOrderLeafQuantities(
 
   const orderLineById = new Map(orderLines.map((line) => [line.id, line]))
   const lineLabelById = new Map<string, string>()
+  const untrackedLineIds = new Set<string>()
   const orderedByLeaf = new Map<string, Prisma.Decimal>()
   for (const line of orderLines) {
     lineLabelById.set(line.id, line.sku ?? line.description ?? line.id)
-    if (!line.productId) continue // a description-only line has no product to ship
+    if (!line.productId) continue
+    // An unreadable type is treated as tracked: the safe direction is to hold an order open, not to complete it.
+    if (line.product?.type && !isStockTrackedProductType(line.product.type)) untrackedLineIds.add(line.id) // a description-only line has no product to ship
     for (const [componentId, componentQty] of lineFulfillmentRequirementQuantities(line, toDecimal(line.qty), graph)) {
       const key = `${line.id}|${componentId}`
       orderedByLeaf.set(key, (orderedByLeaf.get(key) ?? new Prisma.Decimal(0)).add(componentQty))
@@ -332,7 +356,7 @@ async function loadOrderLeafQuantities(
     }
   }
 
-  return { lineLabelById, orderedByLeaf, refundedByLeaf, shippedByLeaf, plannedByLeaf }
+  return { lineLabelById, untrackedLineIds, orderedByLeaf, refundedByLeaf, shippedByLeaf, plannedByLeaf }
 }
 
 async function validateActiveShipmentTotalsWithinOrder(
@@ -431,7 +455,7 @@ export async function findOrderShipmentShortfall(
   })
   if (order?.refundStatus === 'FULL') return null
 
-  const { lineLabelById, orderedByLeaf, refundedByLeaf, shippedByLeaf } =
+  const { lineLabelById, untrackedLineIds, orderedByLeaf, refundedByLeaf, shippedByLeaf } =
     await loadOrderLeafQuantities(client, orderId)
 
   const shortfall: OrderShipmentShortfallLine[] = []
@@ -439,6 +463,11 @@ export async function findOrderShipmentShortfall(
     const separator = key.lastIndexOf('|')
     const lineId = key.slice(0, separator)
     const productId = key.slice(separator + 1)
+    // A service / fee / delivery line is never stock-tracked, never allocated and never on a
+    // shipment, so it is not something a dispatch can leave outstanding. The external-fulfilment
+    // check and the backorder report exclude the same lines; without this exclusion an order with a
+    // delivery charge was held short for ever after its last in-app dispatch.
+    if (untrackedLineIds.has(lineId)) continue
     const refundedQty = refundedByLeaf.get(key) ?? new Prisma.Decimal(0)
     const shippedQty = shippedByLeaf.get(key) ?? new Prisma.Decimal(0)
     // Quantised to the Decimal(12,4) boundary the shipment rows persist at, and rounded AFTER the
@@ -1071,6 +1100,19 @@ export async function transitionShipmentStatus(
     extra?: { trackingNumber?: string; shippingService?: string }
     /** Run under the order lock inside the SHIPPED transaction: a non-null answer refuses the transition with that reason. */
     fence?: (tx: ShipmentServiceClient) => Promise<string | null>
+    /**
+     * SHP-H1: promote the ORDER inside the dispatch transaction, so the stock decrement, FIFO/COGS and the
+     * order flip (with its outbox row) commit together or roll back together. Without it the caller is
+     * left to run `reconcileOrderAfterShipment` afterwards, in a separate transaction that can fail alone.
+     */
+    completion?: OrderPromotionOptions
+    /**
+     * A WAREHOUSE-reported dispatch (the goods have already physically left): when, UNDER THE ORDER LOCK, the order is
+     * found DRAFT / ON_HOLD / PENDING_PAYMENT, record the dispatch but leave the order exactly as it is (no promotion,
+     * and `despatchedWhileNotReady` is returned for the caller's review event). Any other status promotes normally via
+     * `completion`. Never set by an in-app dispatch, which refuses those statuses.
+     */
+    allowRecordWhenNotReady?: boolean
   },
 ): Promise<ShipmentTransitionResult> {
   const { shipmentId, targetStatus, extra } = input
@@ -1161,6 +1203,16 @@ export async function transitionShipmentStatus(
         return {
           success: false as const,
           error: terminalOrderTransitionError(String(withdrawn.status)),
+        }
+      }
+
+      // An IN-APP dispatch of an order that is not ready to ship is refused here, under the order lock and before
+      // any stock, FIFO or COGS work: it would otherwise silently finalise a draft, clear a hold or bypass payment.
+      const lockedNotReady = !!withdrawn && ORDER_STATUSES_NOT_READY_TO_DISPATCH.has(String(withdrawn.status))
+      if (withdrawn && lockedNotReady && !input.allowRecordWhenNotReady) {
+        return {
+          success: false as const,
+          error: orderNotReadyToDispatchMessage(String(withdrawn.status)),
         }
       }
 
@@ -1358,10 +1410,24 @@ export async function transitionShipmentStatus(
         lockedShipment.lines.map((line) => line.lineId),
       )
 
+      // SHP-H1: the order promotion is part of THIS transaction. Everything that can refuse it (an unfixable
+      // status) throws, which rolls the stock movement, FIFO and COGS back with it, so a committed
+      // dispatch always leaves a valid order. Run after the COGS refresh so the shortfall read sees the
+      // shipment as SHIPPED. Invoice trigger setting is read on the same client.
+      let reconciliation: ShipmentReconciliationResult | undefined
+      if (input.completion && !lockedNotReady) {
+        const outcome = await promoteOrderIfFulfilledInTx(
+          tx, lockedShipment.orderId, extra, input.completion,
+        )
+        reconciliation = await reconciliationResultFor(tx, lockedShipment.orderId, outcome)
+      }
+
       return {
         success: true as const,
         shipment: updatedShipment,
         stockSyncProductIds: lockedProductIds,
+        reconciliation,
+        despatchedWhileNotReady: lockedNotReady && withdrawn ? String(withdrawn.status) : undefined,
       }
     })
 
@@ -1377,6 +1443,8 @@ export async function transitionShipmentStatus(
       targetStatus,
       previousStatus: shipment.status,
       stockSyncProductIds: dispatchResult.stockSyncProductIds,
+      ...(dispatchResult.reconciliation ? { reconciliation: dispatchResult.reconciliation } : {}),
+      ...(dispatchResult.despatchedWhileNotReady ? { despatchedWhileNotReady: dispatchResult.despatchedWhileNotReady } : {}),
     }
   }
 
@@ -1451,61 +1519,72 @@ export async function transitionShipmentStatus(
   }
 }
 
-export async function reconcileOrderAfterShipment(
-  client: ShipmentServiceClient,
-  shipment: { orderId: string },
-  extra?: { trackingNumber?: string },
-  options?: {
-    /**
-     * Who owns the "is this order fulfilled?" decision — see `OrderCompletionAuthority`.
-     * Defaults to `IMS`, which is the path every in-app dispatch takes; only
-     * `applyExternalFulfillmentUpdate` declares `EXTERNAL`.
-     */
-    completionAuthority?: OrderCompletionAuthority
-    /**
-     * o3d-zvec.15: also enqueue the durable storefront-completion job inside the flip's transaction.
-     * Default false: only a caller that owns the storefront status asks for it.
-     */
-    storefrontCompletion?: boolean
-    /** Re-checked under the order lock, immediately before the order flip; a non-null answer leaves the order unflipped. */
-    fence?: (tx: ShipmentServiceClient) => Promise<string | null>
-  },
-): Promise<ShipmentReconciliationResult> {
+type OrderPromotionOutcome = {
+  shortfall: OrderShipmentShortfallLine[] | null
+  fenceRefused: string | null
+  orderReachedShipped: boolean
+  storefrontCompletionKey: string | null
+  /** Set when the order was promoted past a status with no direct ->SHIPPED edge (ON_HOLD, PROCESSING, DRAFT, PENDING_PAYMENT). */
+  promotedFromStatus: string | null
+  /** True when the order's shipments are not all SHIPPED (checked under the lock): nothing was decided. */
+  notAllShipped: boolean
+}
+
+type OrderPromotionOptions = {
+  completionAuthority?: OrderCompletionAuthority
+  storefrontCompletion?: boolean
+  fence?: (tx: ShipmentServiceClient) => Promise<string | null>
+}
+
+/**
+ * The locked body of the order promotion, runnable on ANY transaction client: `reconcileOrderAfterShipment`
+ * runs it in its own transaction (retries, the external path), and `transitionShipmentStatus` runs it
+ * inside the dispatch transaction itself, so the stock decrement and the order flip commit together or
+ * not at all (SHP-H1).
+ */
+export async function promoteOrderIfFulfilledInTx(
+  tx: ShipmentServiceClient,
+  orderId: string,
+  extra: { trackingNumber?: string } | undefined,
+  options: OrderPromotionOptions | undefined,
+): Promise<OrderPromotionOutcome> {
   const completionAuthority: OrderCompletionAuthority = options?.completionAuthority ?? 'IMS'
-  const allShipments = await client.shipment.findMany({
-    where: { orderId: shipment.orderId },
-    select: { id: true, status: true },
-  })
-  const allShipped = allShipments.every((row) => row.status === 'SHIPPED')
-  if (!allShipped) {
-    return { shouldGenerateInvoice: false, orderId: shipment.orderId }
-  }
-
-  const shippedShipments = await client.shipment.findMany({
-    where: { orderId: shipment.orderId },
-    select: { trackingNumber: true },
-  })
-  const trackingNumbers = shippedShipments
-    .map((row) => row.trackingNumber)
-    .filter(Boolean)
-    .join(', ')
-
-  // Set only inside the committed callback below, by the one statement that flips the status; read
-  // only after `runInTransaction` returned, i.e. after the commit (a rollback throws past the read).
   let orderReachedShipped = false
   let storefrontCompletionKey: string | null = null
   let fenceRefused: string | null = null
-  const shortfall = await runInTransaction(client, async (tx) => {
-    orderReachedShipped = false // a retried callback must not inherit an aborted attempt's flip
-    storefrontCompletionKey = null
-    fenceRefused = null
-    await lockSalesOrder(tx, shipment.orderId)
+  let promotedFromStatus: string | null = null
+  let notAllShipped = false
+  const shortfall = await (async (): Promise<OrderShipmentShortfallLine[] | null> => {
+    await lockSalesOrder(tx, orderId)
     const currentOrder = await tx.salesOrder.findUnique({
-      where: { id: shipment.orderId },
+      where: { id: orderId },
       select: { status: true },
     })
     if (!currentOrder) return null
     if (['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'].includes(currentOrder.status)) return null
+    // A draft, a held order or one awaiting payment is never promoted by a dispatch: that would finalise it,
+    // clear the hold or stand in for the payment. (A warehouse-reported dispatch on such an order is recorded
+    // without promotion; an in-app dispatch is refused before it gets here.)
+    if (ORDER_STATUSES_NOT_READY_TO_DISPATCH.has(currentOrder.status)) return null
+
+    // Re-derived UNDER the order lock: a caller's earlier unlocked read can be stale, and when this
+    // runs inside the dispatch transaction the shipment just marked SHIPPED is only visible here.
+    const lockedShipments = await tx.shipment.findMany({
+      where: { orderId },
+      select: { id: true, status: true },
+    })
+    if (!lockedShipments.every((row) => row.status === 'SHIPPED')) {
+      notAllShipped = true
+      return null
+    }
+    const shippedShipments = await tx.shipment.findMany({
+      where: { orderId },
+      select: { trackingNumber: true },
+    })
+    const trackingNumbers = shippedShipments
+      .map((row) => row.trackingNumber)
+      .filter(Boolean)
+      .join(', ')
 
     // o3d-0i5y: DO NOT let "all known shipments shipped" silently mean "order complete".
     //
@@ -1541,7 +1620,7 @@ export async function reconcileOrderAfterShipment(
     // second-guess the owner and report a correctly-fulfilled order as short. See
     // `OrderCompletionAuthority`.
     const outstanding = completionAuthority === 'IMS'
-      ? await findOrderShipmentShortfall(tx, shipment.orderId)
+      ? await findOrderShipmentShortfall(tx, orderId)
       : null
     if (outstanding) return outstanding
 
@@ -1552,11 +1631,16 @@ export async function reconcileOrderAfterShipment(
       if (refused !== null) { fenceRefused = refused; return null }
     }
 
-    const transition = validateSalesOrderStatusTransition(currentOrder.status, 'SHIPPED')
-    if (!transition.success) throw new Error(transition.error)
+    // Every shipment has left, so the order IS shipped whatever it was parked as. The state table has no
+    // direct ->SHIPPED edge from ON_HOLD / PROCESSING / DRAFT / PENDING_PAYMENT (the manual route goes via
+    // ALLOCATED), and throwing here rolled back or — before this ran in the dispatch transaction —
+    // stranded a dispatch that had already happened (SHP-H1). Walk the same legal edges instead.
+    const promotion = resolveShippedPromotion(currentOrder.status as SalesOrderStatus)
+    if (!promotion.success) throw new Error(promotion.error)
+    if (promotion.viaAllocated) promotedFromStatus = currentOrder.status
     const shippedAt = new Date()
     await tx.salesOrder.update({
-      where: { id: shipment.orderId },
+      where: { id: orderId },
       data: {
         status: 'SHIPPED',
         shippedAt,
@@ -1569,21 +1653,68 @@ export async function reconcileOrderAfterShipment(
     // (see the lock-order note on the PR). No WooCommerce I/O here: the push happens after the commit.
     if (options?.storefrontCompletion) {
       const { scheduleShoppingOrderCompletion } = await import('@/lib/shopping')
-      storefrontCompletionKey = await scheduleShoppingOrderCompletion(tx as never, { orderId: shipment.orderId, shippedAt })
+      storefrontCompletionKey = await scheduleShoppingOrderCompletion(tx as never, { orderId, shippedAt })
     }
     orderReachedShipped = true
     return null
-  })
+  })()
+  return { shortfall, fenceRefused, orderReachedShipped, storefrontCompletionKey, promotedFromStatus, notAllShipped }
+}
 
+export async function reconcileOrderAfterShipment(
+  client: ShipmentServiceClient,
+  shipment: { orderId: string },
+  extra?: { trackingNumber?: string },
+  options?: {
+    /**
+     * Who owns the "is this order fulfilled?" decision — see `OrderCompletionAuthority`.
+     * Defaults to `IMS`, which is the path every in-app dispatch takes; only
+     * `applyExternalFulfillmentUpdate` declares `EXTERNAL`.
+     */
+    completionAuthority?: OrderCompletionAuthority
+    /**
+     * o3d-zvec.15: also enqueue the durable storefront-completion job inside the flip's transaction.
+     * Default false: only a caller that owns the storefront status asks for it.
+     */
+    storefrontCompletion?: boolean
+    /** Re-checked under the order lock, immediately before the order flip; a non-null answer leaves the order unflipped. */
+    fence?: (tx: ShipmentServiceClient) => Promise<string | null>
+  },
+): Promise<ShipmentReconciliationResult> {
+  const allShipments = await client.shipment.findMany({
+    where: { orderId: shipment.orderId },
+    select: { id: true, status: true },
+  })
+  const allShipped = allShipments.every((row) => row.status === 'SHIPPED')
+  if (!allShipped) {
+    return { shouldGenerateInvoice: false, orderId: shipment.orderId }
+  }
+
+  // Set only inside the committed callback below; read only after `runInTransaction` returned, i.e. after
+  // the commit (a rollback throws past the read). A retried callback overwrites it wholesale.
+  const outcome = await runInTransaction(client, (tx) =>
+    promoteOrderIfFulfilledInTx(tx, shipment.orderId, extra, options))
+
+  return reconciliationResultFor(client, shipment.orderId, outcome)
+}
+
+async function reconciliationResultFor(
+  client: ShipmentServiceClient,
+  orderId: string,
+  outcome: OrderPromotionOutcome,
+): Promise<ShipmentReconciliationResult> {
+  const { shortfall, fenceRefused, orderReachedShipped, storefrontCompletionKey, promotedFromStatus, notAllShipped } = outcome
+  if (notAllShipped) return { shouldGenerateInvoice: false, orderId }
   const trigger = await client.setting.findUnique({ where: { key: 'invoice_trigger' } })
   return {
     // An order held short is not shipped, so the on_shipped invoice trigger must not fire for it:
     // invoicing it would bill the customer for units that have not left and are still owed.
     shouldGenerateInvoice: !shortfall && !fenceRefused && trigger?.value === 'on_shipped',
-    orderId: shipment.orderId,
+    orderId,
     ...(shortfall ? { shortfall } : {}),
     ...(fenceRefused ? { fenceRefused } : {}),
     ...(orderReachedShipped ? { orderReachedShipped: true as const } : {}),
+    ...(promotedFromStatus ? { promotedFromStatus } : {}),
     ...(orderReachedShipped && storefrontCompletionKey ? { storefrontCompletionKey } : {}),
   }
 }
