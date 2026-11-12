@@ -10,6 +10,10 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### CI: validate job type-check heap
+
+- **Fixed: `tsc --noEmit` in the CI `validate` job ran out of memory** at Node's default heap (about 4 GB). The job now sets `NODE_OPTIONS=--max-old-space-size=5632`, as the production-readiness job below it already does. CI only; no behaviour change.
+
 ### CI: ledger standing-reader check heap
 
 - **Fixed: `check:ledger-standing-readers` ran out of memory.** The scan grew past its 3 GB V8 heap cap and aborted (exit 134) in CI and in `check:all`. The cap is now 5632 MB, the same as the production-readiness job. Backend/CI only; no behaviour change.
