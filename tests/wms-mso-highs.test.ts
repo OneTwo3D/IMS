@@ -780,3 +780,19 @@ test('R17: the dispatch sweep does not re-point a link at a survivor that lists 
   await run(true)
   assert.deepEqual(repoints, ['surv-abc'], 'CONTROL: a proven survivor is adopted')
 })
+
+test('R18: the dispatch sweep\'s re-point is a compare-and-set: the proof passes, a cancel marks the link CANCELLED, the re-point is REFUSED, nothing is applied and the link is not flipped back', async () => {
+  const status = { externalOrderId: 'surv-1', externalOrderNumber: 'ORD-A+ORD-B', status: 'DESPATCHED', statusLabel: 'Despatched', isSplit: false, partCount: null, isMerged: true, mergedOrderNumbers: ['ORD-A', 'ORD-B'], deepLinkUrl: null, tracking: [], dispatched: true, raw: null }
+  const applied: string[] = []
+  const calls: string[] = []
+  await runWmsDispatchSweepCore({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'ORD-B', externalOrderId: 'b-old' }],
+    fetchOrderStatus: async () => status as never,
+    applyDispatch: async () => { applied.push('applied'); return { success: true } },
+    proveMergeLineage: async () => { calls.push('proof'); return { proven: true as const } },
+    // The link was cancelled after the candidate was read: the compare-and-set matches nothing.
+    repointLink: async () => { calls.push('repoint'); return false },
+  } as never)
+  assert.deepEqual(calls, ['proof', 'repoint'])
+  assert.deepEqual(applied, [], 'no despatch applied')
+})

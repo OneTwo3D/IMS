@@ -251,7 +251,12 @@ function makePort(options: { cancellable: WmsPushLinkRef[]; items: WmsOrderItemR
     cancellableLinks: async () => options.cancellable,
     upsertByOrder: async (_o, create, update) => { upserts.push({ create, update }) },
     updateLink: async (id, data) => { writes.push({ id, data }); if (typeof data.state === 'string') link.state = data.state as never; if (typeof data.externalOrderId === 'string') link.externalOrderId = data.externalOrderId },
-    updateLinkIfState: async () => true,
+    updateLinkIfState: async (id, fromState, data) => {
+      if (link.state !== fromState) return false
+      writes.push({ id, data })
+      if (typeof data.state === 'string') link.state = data.state as never
+      return true
+    },
     clearStaleNotices: async () => 0,
     noticesAwaitingComment: async () => [],
     updateLinkIfLinked: async (id, expect, data) => {

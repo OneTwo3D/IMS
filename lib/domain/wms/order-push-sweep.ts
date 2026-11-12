@@ -3084,7 +3084,8 @@ export async function runWmsOrderPushSweepCore(
         // the amendment stays due, so once the number matches again or the flag appears the normal paths take over.
         if (update.status === 'ORDER_NUMBER_MISMATCH' || update.status === 'ORDER_UNVERIFIABLE') {
           if (!link.amendNoticeAt) {
-            await port.updateLink(link.id, {
+            // Compare-and-set on the link still being SYNCED (a concurrent cancel / re-point must not be overwritten).
+            await port.updateLinkIfState(link.id, 'SYNCED', {
               amendNoticeAt: ts, lastAttemptAt: ts,
               lastError: update.status === 'ORDER_UNVERIFIABLE'
                 ? 'The warehouse order could not be verified as this order (its number or id could not be read); this order\'s change was NOT sent. Check the order in the warehouse and apply the change there by hand.'

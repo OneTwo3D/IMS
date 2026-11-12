@@ -502,7 +502,12 @@ export type WmsDispatchSweepDeps = {
    * doubles keep compiling; absent, no proof is asked (production always supplies it).
    */
   proveMergeLineage?(linkId: string, survivorExternalId: string): Promise<MergeLineageProof>
-  repointLink(linkId: string, to: { externalOrderId: string; externalOrderNumber: string }): Promise<void>
+  /**
+   * Re-point the link at the survivor, as a COMPARE-AND-SET on the link still being what the candidate was read as (a live SYNCED /
+   * MERGED link on the same warehouse order id). Answers false when it had moved on (cancelled, released, already re-pointed): nothing is
+   * written and the caller applies nothing this pass. (A double that returns nothing is taken as having re-pointed.)
+   */
+  repointLink(linkId: string, to: { externalOrderId: string; externalOrderNumber: string }, from?: { externalOrderId?: string | null }): Promise<boolean | void>
   // 6oyu.2: consecutive-failure tracking. recordDispatchError increments the link's
   // failure count (dead-lettering at DISPATCH_MAX_CONSECUTIVE_FAILURES — the link then
   // leaves listCandidates); clearDispatchFailures resets it on a success/pending outcome
@@ -1247,10 +1252,15 @@ export async function reconcileOneOrder(
         return { action: 'pending', reason: `A merge into WMS order ${status.externalOrderNumber} could not be proven (${proof.reason}); check it in the WMS`, unresolved: true }
       }
     }
-    await deps.repointLink(candidate.linkId, {
+    const moved = await deps.repointLink(candidate.linkId, {
       externalOrderId: status.externalOrderId,
       externalOrderNumber: status.externalOrderNumber,
-    })
+    }, { externalOrderId: candidate.externalOrderId ?? null })
+    if (moved === false) {
+      // The link changed between the read and the write (a cancel marked it CANCELLED, it was released or re-pointed): it is NOT flipped
+      // back, nothing is applied from the survivor this pass, and the next sweep judges the link as it now is.
+      return { action: 'pending', reason: 'The link changed while the merge was being followed (it was cancelled, released or re-pointed); nothing was applied this pass', unresolved: true }
+    }
   }
   const effectiveOrderNumber = status.externalOrderNumber || candidate.externalOrderNumber
 
@@ -2849,12 +2859,18 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       const rows = trusted ? await db.wmsOrderPushItem.findMany({ where: { linkId } }) : []
       return proveMergeLineage(connector, survivorExternalId, rows.map((row) => ({ externalItemId: row.externalItemId, sku: row.sku, quantity: row.quantity })))
     },
-    async repointLink(linkId, to) {
+    async repointLink(linkId, to, from) {
       // Park as MERGED so the push-sweep's SYNCED-filtered passes skip it (no dual-sync
       // amending the survivor with this order's lines); the dispatch sweep still polls it.
       // The failure streak belonged to the OLD WMS order — the survivor starts clean.
-      await db.wmsOrderPushLink.update({
-        where: { id: linkId },
+      // COMPARE-AND-SET: only a link that is still live (SYNCED / MERGED, the states the candidate list reads) and, when the candidate
+      // carried it, still on the same warehouse order id. A cancel that marked it CANCELLED in between is not flipped back.
+      const moved = await db.wmsOrderPushLink.updateMany({
+        where: {
+          id: linkId,
+          state: { in: ['SYNCED', 'MERGED'] },
+          ...(from?.externalOrderId ? { externalOrderId: from.externalOrderId } : {}),
+        },
         data: {
           externalOrderId: to.externalOrderId,
           externalOrderNumber: to.externalOrderNumber,
@@ -2877,6 +2893,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           cancelNoticeCommentAt: null,
         },
       })
+      return moved.count > 0
     },
     /**
      * o3d-rbyg: the durable withdrawal evidence for a batch of orders, read LOCALLY — the IMS

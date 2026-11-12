@@ -708,3 +708,27 @@ test('REAL PORT, CREATE: the transactional write replaces a stale mark and stale
   assert.equal(row.amendLeaseOwner, null)
   assert.deepEqual(await port.readOrderItems!(link.id), ids, 'the stale row of the earlier order is gone')
 })
+
+test('REAL DISPATCH DEPS: the re-point is a compare-and-set on a LIVE link on the same warehouse order id; a link a cancel has marked CANCELLED is not flipped back to MERGED', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `rpt${randomUUID().slice(0, 8)}`
+  const s = await seed(d, tag)
+  t.after(() => cleanup(d, s))
+  const link = await d.db.wmsOrderPushLink.create({ data: { orderId: s.orderId, connector: 'mintsoft', state: 'SYNCED', externalOrderId: 'b-old', externalOrderNumber: 'ORD-B', pushedAt: new Date() } })
+  const dispatchDeps = d.dispatch.createPrismaDispatchDeps('mintsoft' as never, {} as never)
+  const to = { externalOrderId: 'surv-1', externalOrderNumber: 'ORD-A+ORD-B' }
+  // A different old id: refused.
+  assert.equal(await dispatchDeps.repointLink(link.id, to, { externalOrderId: 'someone-else' }), false)
+  // The cancel pass marks the link CANCELLED after the proof: refused, and not flipped back.
+  await d.db.wmsOrderPushLink.update({ where: { id: link.id }, data: { state: 'CANCELLED', cancelledAt: new Date() } })
+  assert.equal(await dispatchDeps.repointLink(link.id, to, { externalOrderId: 'b-old' }), false)
+  let row = await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })
+  assert.equal(row.state, 'CANCELLED')
+  assert.equal(row.externalOrderId, 'b-old')
+  // CONTROL: a live link on the same id is re-pointed.
+  await d.db.wmsOrderPushLink.update({ where: { id: link.id }, data: { state: 'SYNCED', cancelledAt: null } })
+  assert.equal(await dispatchDeps.repointLink(link.id, to, { externalOrderId: 'b-old' }), true)
+  row = await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })
+  assert.equal(row.state, 'MERGED')
+  assert.equal(row.externalOrderId, 'surv-1')
+})
