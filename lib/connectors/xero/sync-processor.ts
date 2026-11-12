@@ -4,6 +4,7 @@
  */
 
 import { euSchemePostingRefusal } from './scheme-posting-check'
+import { holdInvoiceOnRegimePolicyChange } from '@/lib/connectors/woocommerce/sync/regime-policy-hold'
 import { resolveSalesPostContact } from '@/lib/domain/erasure/accounting-contact'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { getRateLimitBackoffMs, isRateLimitError } from './deferral'
@@ -6202,6 +6203,9 @@ export async function processClaimedEntry(
       const untypedInvoice = salesDocumentTaxTypeRefusal(`Sales invoice ${String(payload.invoiceNumber ?? '(no number)')}`, payload as SalesDocumentTaxTypeInput)
       if (untypedInvoice) return { success: false, error: untypedInvoice }
       // An EU-treated scheme invoice was built on a zero-rated type: the stored Xero list must still show that type ACTIVE and 0% now, before anything is sent.
+      // A treated invoice decided under regime settings that have changed since is superseded and moved back to a held invoice (one fenced transaction); nothing is sent, and a re-import rebuilds it under the settings now in force.
+      const policyHold = await holdInvoiceOnRegimePolicyChange({ attempt, held: lease, referenceType, referenceId, payload: payload as Record<string, unknown> })
+      if (policyHold.kind === 'held' || policyHold.kind === 'lost') return { success: true, skipped: true }
       const schemeRefusal = await euSchemePostingRefusal(payload as Record<string, unknown>)
       if (schemeRefusal) return { success: false, error: schemeRefusal }
       const guard = await guardCancelledSalesOrderInvoice(attempt, referenceType, referenceId, lease)

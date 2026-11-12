@@ -1431,4 +1431,78 @@ test('[eu vat] the poster refuses a treated payload whose recorded regime policy
 test('[eu vat] BOTH sales-invoice posting cases call the poster gate before anything is sent', () => {
   const src = readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8')
   assert.equal((src.match(/await euSchemePostingRefusal\(payload as Record<string, unknown>\)/g) ?? []).length, 2, 'SALES_INVOICE and SALES_INVOICE_UPDATE')
+  const hold = src.indexOf('await holdInvoiceOnRegimePolicyChange({ attempt, held: lease')
+  assert.ok(hold > 0 && hold < src.indexOf('await euSchemePostingRefusal(payload as Record<string, unknown>)'), 'the SALES_INVOICE create supersedes a policy-changed invoice into a held invoice before the refusal gate')
+})
+
+// THE ROUND TRIP OF A QUEUED TREATED INVOICE WHOSE REGIME POLICY CHANGED: queued, cut-in changed, the poster's gate supersedes it into a held invoice (nothing sent), a re-import rebuilds and releases it under the current policy, or refuses it with the reason.
+async function queuedThenPolicyChange(t: test.TestContext, afterHold: 'releases' | 'refuses') {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = true
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { holdInvoiceOnRegimePolicyChange } = await import('@/lib/connectors/woocommerce/sync/regime-policy-hold')
+  const { euSchemePostingRefusal } = await import('@/lib/connectors/xero/scheme-posting-check')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seed(db, wcRateId)
+  t.after(async () => {
+    switchOn = false
+    await db.setting.deleteMany({ where: { key: 'eu_vat_gift_card_flag_cut_in' } })
+    const o = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })
+    if (o) await db.accountingSyncLog.deleteMany({ where: { referenceId: o.orderId } })
+    await cleanup(db, externalId, ctx)
+  })
+  const number: Meta = [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...PLUGIN('821')]
+  assert.equal((await importWcOrder(payload(externalId, wcRateId, number) as never)).success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const queued = await db.accountingSyncLog.findFirstOrThrow({ where: { type: 'SALES_INVOICE', referenceId: orderId } })
+  assert.equal(queued.status, 'PENDING')
+  const policyAtQueue = ((queued.payload as unknown as Invoice)._euVatTreatment as { regimePolicy: Record<string, string> }).regimePolicy
+  assert.equal(policyAtQueue.cutIn, 'unset')
+  // The cut-in is changed while the row waits; the poster then claims it.
+  await db.setting.upsert({ where: { key: 'eu_vat_gift_card_flag_cut_in' }, create: { key: 'eu_vat_gift_card_flag_cut_in', value: afterHold === 'releases' ? '2026-12-01' : '2026-11-01' }, update: { value: afterHold === 'releases' ? '2026-12-01' : '2026-11-01' } })
+  const startedAt = new Date()
+  await db.accountingSyncLog.update({ where: { id: queued.id }, data: { status: 'PROCESSING', processingStartedAt: startedAt, attemptRevision: 1 } })
+  const args = { attempt: { id: queued.id, attemptRevision: 1 }, held: { heldFrom: () => startedAt }, referenceType: 'SalesOrder', referenceId: orderId, payload: queued.payload as unknown as Record<string, unknown> }
+  const first = await holdInvoiceOnRegimePolicyChange(args as never)
+  const second = await holdInvoiceOnRegimePolicyChange(args as never)
+  const retired = await db.accountingSyncLog.findUniqueOrThrow({ where: { id: queued.id } })
+  const hold = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  const parked = (hold.payload as unknown as { accountingPayload: Record<string, unknown> }).accountingPayload
+  const afterPark = { first, second, retired, parkedMarker: parked._euVatTreatment as Record<string, unknown>, parkedHasNumber: 'invoiceNumber' in parked, queuedRows: await db.accountingSyncLog.count({ where: { type: 'SALES_INVOICE', referenceId: orderId } }), holdMessage: hold.errorMessage }
+  // The re-import (with the number) rebuilds under the policy now in force.
+  const again = payload(externalId, wcRateId, number)
+  if (afterHold === 'refuses') again.line_items[0]!.meta_data = []
+  await importWcOrder(again as never)
+  const rows = await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId, status: 'PENDING' } })
+  const holdAfter = await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: hold.id } })
+  return { afterPark, rows, holdAfter, gate: rows[0] ? await euSchemePostingRefusal(rows[0].payload as unknown as Record<string, unknown>) : undefined }
+}
+
+test('[eu vat] ROUND TRIP: a queued treated invoice whose cut-in changed is superseded into a held invoice (nothing sent), and the re-import releases it under the current policy, which the poster gate then accepts', { skip }, async (t) => {
+  const { afterPark, rows, holdAfter, gate } = await queuedThenPolicyChange(t, 'releases')
+  assert.equal(afterPark.first.kind, 'held')
+  assert.equal(afterPark.second.kind, 'lost', 'a second handling of the same attempt finds the row already moved on and changes nothing')
+  assert.equal(afterPark.retired.status, 'CANCELLED')
+  assert.match(afterPark.retired.errorMessage ?? '', /^Superseded: the EU VAT regime settings changed since this invoice was prepared.*re-import the order from WooCommerce/)
+  assert.equal(afterPark.queuedRows, 1, 'only the superseded row exists: nothing new was queued while it was held')
+  assert.deepEqual([afterPark.parkedMarker.applied, (afterPark.parkedMarker.regimePolicy as Record<string, string>).cutIn], [true, 'unset'], 'the hold keeps the policy it was decided under, so the sweep cannot release it')
+  assert.equal(afterPark.parkedHasNumber, false)
+  assert.match(afterPark.holdMessage ?? '', /moved back to a held invoice.*Re-import the order from WooCommerce/)
+  assert.equal(rows.length, 1, 'the re-import released it')
+  const released = rows[0]!.payload as unknown as Invoice & { invoiceNumber?: string }
+  assert.match(String(released.invoiceNumber), /^INV-/)
+  assert.equal(((released._euVatTreatment as { regimePolicy: Record<string, string> }).regimePolicy).cutIn, new Date('2026-12-01').toISOString(), 'released under the policy now in force')
+  assert.equal(gate, null, 'the poster gate accepts it')
+  assert.equal(holdAfter.status, 'SYNCED')
+})
+
+test('[eu vat] ROUND TRIP: the same superseded invoice, re-imported under a cut-in that now requires a flag its line lacks, is refused with the reason and nothing is queued', { skip }, async (t) => {
+  const { afterPark, rows, holdAfter } = await queuedThenPolicyChange(t, 'refuses')
+  assert.equal(afterPark.first.kind, 'held')
+  assert.equal(rows.length, 0, 'nothing was queued')
+  assert.equal(holdAfter.status, 'PENDING')
+  assert.match(holdAfter.errorMessage ?? '', /gift-card flag/)
 })

@@ -2125,7 +2125,7 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
 
   // A FRESH BUILD of the document from the order as it is now, by the importer's own pieces (the shared tax resolution, `reconcileWcDocumentWithOrder`, `buildWcInvoiceCore`) and, for a treated hold, the treatment's read-only preview (the order's existing stamp
   // is used only if it still agrees with the fresh decision). Nothing is written. A refusal of any of them is the hold's reason; otherwise the parked payload is compared with it on every accounting-relevant field, and that comparison is the authority.
-  const buildFresh = async (client: Prisma.TransactionClient, withTreatment: boolean): Promise<{ ok: true; payload: Record<string, unknown> } | { ok: false; reason: string }> => {
+  const buildFresh = async (client: Prisma.TransactionClient, withTreatment: boolean): Promise<{ ok: true; payload: Record<string, unknown>; policy?: RegimePolicy } | { ok: false; reason: string }> => {
     const resolution = await resolveWcOrderTaxResolution(wcOrder, mappedLines)
     const shippingForeign = mapWcShipping(wcOrder).shippingForeign
     const rec = reconcileWcDocumentWithOrder(wcOrder, mappedLines, resolution, shippingForeign, currency)
@@ -2157,10 +2157,11 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
       orderId, wcOrder, payload: core, mappedLines, connector: chart, taxBindingDeps: { reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, invoiceTypes: types }, accounts, storeCreditForeign: coupons.storeCreditForeign, now: new Date(),
     })
     if (outcome.kind === 'refused') return { ok: false, reason: `the EU IOSS/VOEC/DDP treatment refuses it now: ${outcome.reason}` }
-    return { ok: true, payload: outcome.kind === 'treated' ? outcome.payload : core }
+    return { ok: true, payload: outcome.kind === 'treated' ? outcome.payload : core, ...(outcome.kind === 'treated' ? { policy: outcome.regimePolicy } : {}) }
   }
 
   // The whole check of a TREATED hold, reading through `client` (the caller's order-locked transaction): the parked payload against the order, and the regime re-resolved from the current facts against what was parked and the order's stamp.
+  const verifiedPolicy: { value?: RegimePolicy } = {}
   const verifyTreated = async (client: Prisma.TransactionClient, parked: HeldSalesInvoicePayload, parkedMarker: Marker): Promise<string | null> => {
     // Zero-tax routes (scheme, B2B) sum to the order's total; an ordinary taxed invoice (route none) does not, so its total is compared as the order total recorded when it was parked.
     const zeroTax = parkedMarker.route === 'scheme' || parkedMarker.route === 'b2b_zero_rate'
@@ -2192,7 +2193,10 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     // THE AUTHORITY: the parked payload against a fresh build of the same document from the order as it is now, treatment included (see buildFresh). The checks above are diagnostics for the common causes.
     const fresh = await buildFresh(client, true)
     if (!fresh.ok) return fresh.reason
-    return heldFreshBuildDifference(parked.accountingPayload, fresh.payload)
+    const freshDifference = heldFreshBuildDifference(parked.accountingPayload, fresh.payload)
+    // The policy the verified decision was just made under (the fresh build's one settings read): the release records it, so the payload carries the settings in force and the poster's check passes.
+    if (freshDifference === null) verifiedPolicy.value = fresh.policy
+    return freshDifference
   }
   // The release runs this AGAIN inside its own order-locked transaction, immediately before it enqueues: re-reading the hold and the order's facts there closes the gap between this check and the release.
   const recheck: HeldRecheck = async (tx) => {
@@ -2201,8 +2205,11 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     const currentHeld: HeldSalesInvoicePayload = current.payload
     const currentMarker = markerOf(currentHeld.accountingPayload)
     if (currentMarker?.applied !== true) return { ok: false, reason: 'the held invoice is no longer marked as treated' }
+    verifiedPolicy.value = undefined
     const why = await verifyTreated(tx, currentHeld, currentMarker)
-    return why === null ? { ok: true, held: currentHeld } : { ok: false, reason: why }
+    if (why !== null) return { ok: false, reason: why }
+    const policy = verifiedPolicy.value
+    return { ok: true, held: policy === undefined ? currentHeld : { ...currentHeld, accountingPayload: { ...currentHeld.accountingPayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { ...currentMarker, regimePolicy: policy } } } }
   }
 
   if (marker?.applied === true && UNRECONCILED_TAX_PAYLOAD_KEY in held.accountingPayload) {
