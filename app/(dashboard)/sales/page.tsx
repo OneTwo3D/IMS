@@ -11,9 +11,12 @@ import { SalesPageClient } from './sales-page-client'
 
 export const metadata: Metadata = { title: 'Sales Orders' }
 
-export default async function SalesPage() {
-  const [orders, { products }, warehouses, currencies, taxRates, customers, avgCogs, users, session, organisation] = await Promise.all([
-    getSalesOrders(),
+type SearchParams = { q?: string; status?: string; page?: string; completed?: string; archived?: string }
+
+export default async function SalesPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
+  const sp = await searchParams
+  const [list, { products }, warehouses, currencies, taxRates, customers, avgCogs, users, session, organisation] = await Promise.all([
+    getSalesOrders({ q: sp.q, status: sp.status, page: sp.page, showCompleted: sp.completed === '1', includeArchived: sp.archived === '1' }),
     listProducts({ pageSize: 1000, type: 'ALL', active: 'true' }),
     getWarehouses(),
     getCurrencies(true),
@@ -35,7 +38,7 @@ export default async function SalesPage() {
 
   return (
     <SalesPageClient
-      initialOrders={orders}
+      list={list}
       products={stockable}
       warehouses={warehouses}
       currencies={currencies}

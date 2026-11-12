@@ -446,7 +446,7 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Internal: raises an operator warning about an unmatched refund.'),
   d('lib/domain/sales/sales-invoice-update-sync.ts::queueSalesInvoiceUpdateForExistingAccountingInvoice::queueAccountingSync#1', 'xero', 'sales.invoice-update', 'queue-producer', 'required',
     'Queues SALES_INVOICE_UPDATE for a posted invoice; xeroom owns this operation, so IMS shadows it.'),
-  d('lib/domain/sales/shipment-service.ts::reconcileOrderAfterShipment::scheduleShoppingOrderCompletion#1', 'woocommerce', 'order.status', 'queue-producer', 'required',
+  d('lib/domain/sales/shipment-service.ts::promoteOrderIfFulfilledInTx::scheduleShoppingOrderCompletion#1', 'woocommerce', 'order.status', 'queue-producer', 'required',
     'Schedules the storefront completion of a shipped order.'),
   d('lib/domain/sales/return-expectation-receipt.ts::clearTransitInLedger::queueAccountingSyncTxWithOutcome#1', 'xero', 'inventory.journals', 'queue-producer', 'required',
     'Queues STOCK_RECEIPT (DR Inventory / CR Stock in Transit) when a returned parcel clears its refund\'s return expectation.'),

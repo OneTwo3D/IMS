@@ -2,7 +2,11 @@
 
 import { useState, useEffect } from 'react'
 import Link from 'next/link'
-import type { PoRow, PoStatus } from '@/app/actions/purchase-orders'
+import { useRouter, usePathname, useSearchParams } from 'next/navigation'
+import type { PoListResult, PoRow, PoStatus } from '@/app/actions/purchase-orders'
+import { PaginationBar } from '@/components/ui/pagination-bar'
+import { ArchivedBadge, OrderListSummary } from '@/components/lists/order-list-summary'
+import { orderListHref, shouldResyncSearchInput, withSearchQuery, type OrderListUrlState } from '@/lib/domain/lists/order-list-url'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
@@ -131,12 +135,12 @@ function landedCostLabel(method: string): string {
 // ---------------------------------------------------------------------------
 
 type Props = {
-  initialPos: PoRow[]
+  list: PoListResult
   currencySymbols?: Record<string, string>
   currencyPositions?: Record<string, 'PREFIX' | 'POSTFIX'>
 }
 
-export function PoListClient({ initialPos, currencySymbols = {}, currencyPositions = {} }: Props) {
+export function PoListClient({ list, currencySymbols = {}, currencyPositions = {} }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const fmtDate = (iso: string | null) => (iso ? formatDateTime(iso, { day: 'numeric', month: 'short', year: 'numeric' }) : '—')
@@ -144,17 +148,56 @@ export function PoListClient({ initialPos, currencySymbols = {}, currencyPositio
   const symPos = (code: string) => currencyPositions[code] ?? (code === baseCurrency.code ? baseCurrency.symbolPosition : undefined)
   const fmtForeign = (value: number, code: string) => formatMoney(value, sym(code), symPos(code))
   const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
-  const [search, setSearch] = useState('')
-  const [statusFilters, setStatusFilters] = useState<Set<PoStatus>>(new Set())
-  const [invoicedFilter, setInvoicedFilter] = useState(false)
-  const [returnedFilter, setReturnedFilter] = useState(false)
+  // Search, filters and page live in the URL and run in the database (all orders, not the newest 200).
+  const router = useRouter()
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  const urlState: OrderListUrlState = {
+    q: searchParams.get('q') ?? '',
+    statuses: (searchParams.get('status') ?? '').split(',').filter(Boolean),
+    page: list.page,
+    showCompleted: false,
+    includeArchived: searchParams.get('archived') === '1',
+    invoiced: searchParams.get('invoiced') === '1',
+    returned: searchParams.get('returned') === '1',
+  }
+  const statusFilters = new Set(urlState.statuses as PoStatus[])
+  const invoicedFilter = urlState.invoiced
+  const returnedFilter = urlState.returned
+  const [search, setSearch] = useState(urlState.q)
+  const [lastPushedQ, setLastPushedQ] = useState(urlState.q)
+  const [seenUrlQ, setSeenUrlQ] = useState(urlState.q)
+
+  function navigate(patch: Partial<OrderListUrlState>) {
+    router.push(orderListHref(pathname, { ...urlState, page: 1, ...patch }))
+  }
+
+  // Back/Forward (or a link) changed the address's q: show it in the box. Done during render (not in
+  // an effect) and only for a change we did not make ourselves, so typing is never overwritten.
+  if (urlState.q !== seenUrlQ) {
+    setSeenUrlQ(urlState.q)
+    if (shouldResyncSearchInput(urlState.q, lastPushedQ)) {
+      setLastPushedQ(urlState.q)
+      setSearch(urlState.q)
+    }
+  }
+
+  // Debounced: push the search to the address so the server queries every order. The address is built
+  // from the live query string when the timer fires, so a filter changed meanwhile is kept.
+  useEffect(() => {
+    const q = search.trim()
+    if (q === lastPushedQ) return
+    const t = setTimeout(() => {
+      setLastPushedQ(q)
+      router.push(withSearchQuery(pathname, window.location.search, q))
+    }, 400)
+    return () => clearTimeout(t)
+  }, [search, lastPushedQ, router, pathname])
 
   function toggleStatus(s: PoStatus) {
-    setStatusFilters((prev) => {
-      const n = new Set(prev)
-      if (n.has(s)) n.delete(s); else n.add(s)
-      return n
-    })
+    const next = new Set(statusFilters)
+    if (next.has(s)) next.delete(s); else next.add(s)
+    navigate({ statuses: [...next] })
   }
 
   // Column visibility
@@ -187,20 +230,14 @@ export function PoListClient({ initialPos, currencySymbols = {}, currencyPositio
     })
   }
 
-  const filtered = initialPos.filter((po) => {
-    if (statusFilters.size > 0 && !statusFilters.has(po.status)) return false
-    if (invoicedFilter && !po.isInvoiced) return false
-    if (returnedFilter && !(po.isPartiallyReturned || po.isFullyReturned)) return false
-    if (search) {
-      const q = search.toLowerCase()
-      return (
-        po.reference.toLowerCase().includes(q) ||
-        po.supplierName.toLowerCase().includes(q) ||
-        (po.supplierRef ?? '').toLowerCase().includes(q)
-      )
-    }
-    return true
-  })
+  const filtered = list.rows
+  const searching = urlState.q.trim().length > 0
+  const hideNotices: string[] = []
+  if (list.queryTooShort) hideNotices.push('Type at least 3 characters to search. Shorter text only matches an exact order number.')
+  if (list.hidesArchived && list.hiddenArchivedCount > 0) {
+    hideNotices.push(`${list.hiddenArchivedCount.toLocaleString('en-GB')} archived purchase orders are hidden. Tick "Include archived" to see them. Searching always includes them.`)
+  }
+  const buildHref = (p: number) => orderListHref(pathname, { ...urlState, page: p })
 
   // ---------------------------------------------------------------------------
   // Cell renderers
@@ -214,6 +251,7 @@ export function PoListClient({ initialPos, currencySymbols = {}, currencyPositio
             <Link href={`/purchase-orders/${po.id}`} className="hover:underline">
               {po.reference}
             </Link>
+            {po.archived && <ArchivedBadge />}
             {po.type === 'FREIGHT' && (
               <span className="ml-1.5 inline-flex items-center rounded px-1 py-0.5 text-[10px] font-medium bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200">
                 LC
@@ -323,7 +361,8 @@ export function PoListClient({ initialPos, currencySymbols = {}, currencyPositio
         <div className="relative flex-1 min-w-48 max-w-xs">
           <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
           <Input
-            placeholder="Search reference, supplier…"
+            placeholder="Search reference, supplier, SKU, tracking…"
+            aria-label="Search purchase orders"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="pl-8 h-8 text-sm"
@@ -347,22 +386,36 @@ export function PoListClient({ initialPos, currencySymbols = {}, currencyPositio
               </DropdownMenuCheckboxItem>
             ))}
             <DropdownMenuSeparator />
-            <DropdownMenuCheckboxItem checked={invoicedFilter} onCheckedChange={(v) => setInvoicedFilter(!!v)}>
+            <DropdownMenuCheckboxItem checked={invoicedFilter} onCheckedChange={(v) => navigate({ invoiced: !!v })}>
               Invoiced
             </DropdownMenuCheckboxItem>
-            <DropdownMenuCheckboxItem checked={returnedFilter} onCheckedChange={(v) => setReturnedFilter(!!v)}>
+            <DropdownMenuCheckboxItem checked={returnedFilter} onCheckedChange={(v) => navigate({ returned: !!v })}>
               Returned
             </DropdownMenuCheckboxItem>
           </DropdownMenuContent>
         </DropdownMenu>
+        <label className="flex items-center gap-1.5 text-xs" title={searching ? 'A search always includes archived orders' : undefined}>
+          <input
+            type="checkbox"
+            className="accent-primary h-3.5 w-3.5"
+            checked={searching || urlState.includeArchived}
+            disabled={searching}
+            onChange={(e) => navigate({ includeArchived: e.target.checked })}
+          />
+          Include archived
+        </label>
         <Button variant="outline" size="sm" className="hidden h-8 md:inline-flex" onClick={openColPicker} title="Column settings">
           <Settings2 className="h-4 w-4" />
         </Button>
       </div>
 
+      <OrderListSummary page={list.page} pageSize={list.pageSize} total={list.total} noun="purchase orders" notices={hideNotices} />
+
       {/* Table */}
       {filtered.length === 0 ? (
-        <p className="text-sm text-muted-foreground py-8 text-center">No purchase orders found.</p>
+        <p className="text-sm text-muted-foreground py-8 text-center">
+          {searching ? `No purchase orders match "${urlState.q.trim()}", including archived.` : 'No purchase orders found.'}
+        </p>
       ) : (
         <ResponsiveTableLayout
           mobile={(
@@ -376,6 +429,7 @@ export function PoListClient({ initialPos, currencySymbols = {}, currencyPositio
                         <Link href={`/purchase-orders/${po.id}`} className="font-mono text-sm font-medium text-primary hover:underline">
                           {po.reference}
                         </Link>
+                        {po.archived && <ArchivedBadge />}
                         <p className="mt-1 text-sm font-medium leading-tight">{po.supplierName}</p>
                         {po.supplierRef && (
                           <p className="mt-0.5 text-xs text-muted-foreground font-mono">{po.supplierRef}</p>
@@ -446,6 +500,8 @@ export function PoListClient({ initialPos, currencySymbols = {}, currencyPositio
           )}
         />
       )}
+
+      <PaginationBar page={list.page} totalPages={list.pageCount} buildHref={buildHref} />
 
       {/* Column picker dialog */}
       <Dialog open={showColPicker} onOpenChange={setShowColPicker}>

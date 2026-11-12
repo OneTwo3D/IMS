@@ -1,3 +1,4 @@
+import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import type { Metadata } from 'next'
 import { ProductLink } from '@/components/inventory/product-link'
 import { getOrganisation } from '@/app/actions/company'
@@ -5,7 +6,6 @@ import {
   emptyInventoryTurnoverReportForSourceLimit,
   getInventoryTurnoverReport,
   INVENTORY_TURNOVER_GROUP_OPTIONS,
-  InventoryTurnoverSourceLimitError,
   inventoryCostingFiltersForUi,
   inventoryCostingFiltersFromSearch,
   type InventoryCostingSearchParams,
@@ -30,7 +30,7 @@ export default async function InventoryTurnoverPage({ searchParams }: { searchPa
   const filters = inventoryCostingFiltersFromSearch(resolvedSearchParams)
   const [rawReport, filterOptions, organisation] = await Promise.all([
     getInventoryTurnoverReport(filters).catch((error: unknown) => {
-      if (error instanceof InventoryTurnoverSourceLimitError) return emptyInventoryTurnoverReportForSourceLimit(filters, error)
+      if (isSourceScanTooLargeError(error)) return emptyInventoryTurnoverReportForSourceLimit(filters, error)
       throw error
     }),
     getStockPositionFilterOptions(stockPositionSelectedFilterOptionInputs(filters)),

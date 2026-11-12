@@ -1,6 +1,8 @@
 # Dashboard
 
-The dashboard gives you a real-time snapshot of business performance. It combines financial KPIs, trend charts, and operational summaries on a single page.
+The dashboard gives you a real-time snapshot of business performance. It combines financial KPIs, trend charts, and operational summaries on a single page. It opens on **This Month** compared with the **Previous Period**. Dates and times on it are shown in the organisation's time zone (Settings > Company), so everyone sees the same day boundaries.
+
+Administrators who have not finished or dismissed the guided setup also see a **Welcome** banner at the top; see the [Onboarding Walkthrough](onboarding-walkthrough.md). Supplier users never see the dashboard: they land on the supplier portal.
 
 
 ## KPI Cards
@@ -49,21 +51,23 @@ Choose which period the dashboard reports on. The following options are availabl
 - This Month
 - This Quarter
 - This Year
-- This Financial Year
+- Financial Year
 - Last 7 Days
 - Last 30 Days
 - Last 90 Days
 - Last 365 Days
-- Custom date range
+- Custom Range (choose a start and end date and click **Apply**)
 
 
 ## Comparison Periods
 
 Compare the selected period against a prior period to spot trends:
 
-- **Previous Period** -- The equivalent duration immediately before the selected period.
-- **Previous Year** -- The same dates one calendar year earlier.
-- **Previous Financial Year** -- The same dates one financial year earlier.
+Pick the comparison from the second selector:
+
+- **vs Previous Period** -- The equivalent duration immediately before the selected period.
+- **vs Previous Year** -- The same dates one calendar year earlier.
+- **vs Previous FY** -- The same dates one financial year earlier.
 
 
 ## Charts
@@ -78,12 +82,12 @@ Three time-series charts track net sales, cost of goods sold, and margin percent
 
 ### Cash Bridge
 
-A waterfall chart showing how cash flows from opening balance through inflows and outflows to the closing balance. This helps you understand where money is coming from and where it is going.
+A bar chart that walks from sales to profit for the selected period: **Gross Sales**, less **Discounts**, less **Refunds**, giving **Net Sales**, less **COGS**, leaving **Margin** (the profit in money, not the percentage). It is a sales-to-margin bridge, not a bank balance: it does not show cash held. The Net Sales and Margin bars carry the same `<=` and `?` marks as the KPI cards when a return could not be subtracted.
 
 
 ## Best Sellers
 
-A ranked list of your top-selling products for the selected period, showing quantity sold net of returns and the revenue generated.
+A ranked list of your top five selling products for the selected period, showing quantity sold net of returns, the product's margin percentage and the revenue generated. **View all** opens the full sales statistics report.
 
 Revenue here is net of returns on the same terms as the KPI cards: a credit recorded ex-VAT is subtracted, and a credit recorded VAT-inclusive or with no recorded basis is *not* -- subtracting it would remove VAT from a figure that never contained any. Where that happens the amount carries a `≤` and hovering it names the credit that was left out. Because the list is ranked by that same figure, the **order** carries the bound too: a product can sit above another purely on credit that could not be placed, and the tooltip says so.
 
@@ -92,32 +96,33 @@ Quantity is not affected by any of this -- a returned unit is a returned unit wh
 
 ## Incoming Purchase Orders
 
-A summary of open purchase orders that have stock on the way, so you can see what is due to arrive.
+The next five open purchase orders that have stock on the way, soonest expected delivery first, each with its supplier, number of lines, total and expected delivery date. A date in the past is marked **(late)** in red, one within three days is shown in orange, and an order with no date shows **No ETA**. **View all** opens the purchase order list. Shipped orders stay on this card until they are received.
 
 
 ## Operational KPIs
 
-Quick-reference metrics covering:
+A row of six small tiles under the charts:
 
-- Total products in catalogue
-- Low-stock alerts
-- Orders awaiting fulfilment
-- Purchase orders awaiting receipt
-
+| Tile | What it shows |
+|---|---|
+| **Open Orders** | Sales orders still being worked (draft, pending payment, processing, allocated, picking or packing) and their value. |
+| **Open POs** | Purchase orders with stock still to arrive, and the value of what is outstanding on them. |
+| **Inventory Value** | Value of stock on hand from FIFO cost layers, and the number of active products. |
+| **Low Stock** | Products with 1 to 5 units available, and beneath it how many are out of stock. |
+| **Shipping** | Shipping charged in the selected period. |
+| **Comp. Orders** | The number of orders in the comparison period, with its net sales beneath (marked when a return could not be subtracted). |
 
 ## Recent Orders
 
-A feed of the latest sales orders, showing order number, customer, total, and status. Click any order to open its detail page.
+A feed of the ten latest sales orders, showing order number, customer, total, status and date. Click any order to open its detail page; **View all** opens the sales order list.
 
 
-## System Health Card
+## Checking integration and system health
 
-A live health indicator visible to administrators only. It surfaces:
+The dashboard has no health card. Look in these places instead:
 
-- **Integration status** — green/amber/red for WooCommerce, Xero, Mintsoft, and SMTP. Amber means the connection-test gate has not been satisfied (credentials saved but never verified); red means the last sync failed.
-- **Cron status** — last run timestamp and result for each scheduled job (FX rates, WC sync, Xero daily batch, backup, activity cleanup). A job that hasn't run within its expected interval is flagged red.
-- **Backup status** — date and size of the most recent successful backup, plus a warning if the manifest sidecar is missing or stale.
-- **Invariant check** — count of any open inventory invariant findings (negative stock, cost-layer integrity, allocation drift). Click through to the full report under **Settings > System**.
-- **Pending FX queue** — number of WooCommerce orders waiting for a missing FX rate before they can be synced to Xero.
+- **Integrations** (sidebar) shows the state of each connected service (the online store, accounting, the warehouse), with banners for failed syncs and a sync exceptions queue. This is where to check whether a connection test has passed or the last sync failed.
+- **Activity** (sidebar) lists the errors and warnings raised by syncs and background work.
+- **Settings > Accounting > FX Rates** shows the exchange-rate refresh status.
 
-When the card is fully green, day-to-day operations are healthy. Any non-green status is a prompt to investigate before it cascades — see [Troubleshooting](troubleshooting.md) for first-stop fixes.
+When something looks wrong, see [Troubleshooting](troubleshooting.md) for first-stop fixes.

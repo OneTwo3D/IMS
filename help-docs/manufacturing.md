@@ -5,12 +5,6 @@ Manufacturing orders let you assemble finished products from their components or
 BOM products can be either standalone SKUs or BOM child variants under a Variable parent. Manufacturing always runs against the BOM SKU itself, not the Variable parent.
 
 ## Where a recipe comes from
-**If the product changes while you are raising a build order**, the order is refused rather than
-raised against stale information: IMS re-reads the product's type and components at the moment it
-takes its lock, so a recipe edited in that instant is used in its *new* form, and a product converted
-away from BOM in that instant is refused with a message saying so. Nothing is part-created.
-
-
 A recipe can be entered on the product page or loaded in bulk through the products CSV's
 `components` column — see [Importing manufacturing recipes](inventory.md#importing-manufacturing-recipes-bom).
 
@@ -31,7 +25,7 @@ Variance reporting works the other way round: it reads the recipe **frozen onto 
 it was started**, so re-importing or editing a recipe later does not change the variance of orders that
 have already run. A started or completed order that has no frozen recipe (it started before recipes
 were frozen) is left out of the variance report and named in a note under it, rather than being
-measured against whatever the recipe is today.
+measured against whatever the recipe is today. These notes appear on screen only; the CSV download of the report contains data rows and no notes, so check the screen before relying on the export.
 
 They can still fall out of step for recipes created before this was true, or edited directly in the
 database. The symptom is quiet: the product builds fine one order at a time, but the reorder report
@@ -50,13 +44,31 @@ written** — you are told which of these happened:
 - its recipe is circular (some product in the recipe eventually consumes the product being built);
 - another user claimed the recipe at the same moment — retry.
 
-In every case no build order is created and the recipe is left exactly as it was. A refusal never
+A recipe edited in that same instant is used in its new form. In every case no build order is created and the recipe is left exactly as it was. A refusal never
 leaves a half-applied change behind.
 
 **Starting an order re-checks it too.** A build order can sit in draft for days, so the recipe is
 checked again at the moment you start it — before any stock is reserved. Starting is refused if the
 product is no longer a manufactured (BOM) product, or if its components have been removed. Nothing is
 reserved and the order stays in draft, so you can fix the recipe and start it again.
+
+## Build orders created from the reorder report
+
+On **Analytics > Reorder**, the **Generate from selection** button (or, with nothing ticked, **Generate POs + draft MOs for all visible rows**) creates draft purchase orders for bought-in products and **draft manufacturing orders** for BOM products that need building (one draft assembly order per product, for the suggested quantity). A manufacturing order created this way:
+
+- uses the product's **claimed** recipe (the one maintained by the product form and the products CSV), not whichever recipe was edited last;
+- takes its warehouse and manufacturer from the product's most recent manufacturing order, or the first warehouse by code if there is none;
+- is not created twice if you click Generate again within about ten minutes.
+
+Products that are skipped are listed in the result message with a reason, and also recorded in the activity log as a warning:
+
+| Reason shown | Meaning and what to do |
+|---|---|
+| **no active bom** | The product has no claimed, active recipe, so there is nothing to build from. Import or enter its recipe (see [Where a recipe comes from](#where-a-recipe-comes-from)), then generate again. |
+| **no warehouse** | No warehouse could be chosen for the order. Create a warehouse in Settings or raise the order by hand. |
+| **recent draft exists** | A reorder-created draft for this product was made in the last few minutes; review that draft instead. |
+
+Drafts are still drafts: review the quantity and manufacturer, then use **Start Production** as normal.
 
 ## Lifecycle status and manufacturing
 
@@ -114,9 +126,11 @@ Draft ──> In Progress ──> Completed
 
 ### Draft to In Progress
 
-A stock check is performed. If sufficient stock is available, components are **allocated** — their reserved quantity is increased to prevent other orders from claiming the same stock.
+Click **Start Production**. A stock check is performed. If sufficient stock is available, components are **allocated** — their reserved quantity is increased to prevent other orders from claiming the same stock.
 
 ### In Progress to Completed
+
+Click **Mark Completed**. For an assembly a dialog asks for the **Quantity produced (good units)**, starting at the planned quantity. It must be more than 0 and cannot exceed the planned quantity. Completing always consumes the full planned recipe, so a lower figure is treated as **yield loss** (defective or scrapped output): the whole run cost is spread over fewer good units and their unit cost rises. If production was stopped early and components were not used, cancel the order or leave it In Progress instead; do not complete it with a reduced quantity.
 
 Stock movements are created automatically:
 
@@ -169,7 +183,7 @@ Each line records:
 
 - **Description** (e.g. "Labour", "Machine time")
 - **Amount** in the order's currency
-- **Account override** (optional) — leave blank to credit the default Manufacturing Overhead account from Settings; an override must be the Manufacturing Overhead account configured in Settings, so in practice leave it blank (any other code is refused). When the order is completed, or a completed order's costs are edited, and accounting posting is on, a line whose override differs from the configured account stops the posting with a message naming the line. Editing cost lines needs the cost-price permission (Admin, Manager or Finance), not the warehouse role
+- **Account override** (optional) — leave blank to credit the default Manufacturing Overhead account from Settings; an override must be the Manufacturing Overhead account configured in Settings, so in practice leave it blank (any other code is refused). When the order is completed, or a completed order's costs are edited, and accounting posting is on, a line whose override differs from the configured account stops the posting with a message naming the line. Editing cost lines needs the cost-price permission **in addition to** access to Manufacturing, so in practice only Admin and Manager can do it; warehouse staff can run the order but cannot add, change or remove cost lines, and Finance (which has cost prices but no Manufacturing access) cannot reach the order
 
 ### How costs are capitalised
 

@@ -4,14 +4,16 @@ First-stop reference for common errors and unexpected behavior. Organised by whe
 
 For setup-specific issues, see the [Setup Wizard Walkthrough](onboarding-walkthrough.md). For terminology, see the [Glossary](glossary.md).
 
+**Finding the integration screens.** Connectors live under **Integrations** in the sidebar (the page at `/sync`; the item only appears once at least one integration is switched on in **Settings > System > Plugins**). Where this guide says "Integrations > Xero", open **Integrations** and then the **Xero** card; the same goes for **WooCommerce** and **Mintsoft**. Integrations are not under Settings.
+
 
 ## Where to look first
 
 When something goes wrong, three places hold the information you need:
 
 1. **Activity Log** (`/activity`) — every state change is recorded. Filter by tag (e.g. `sync`, `inventory`) to narrow down. Errors are shown with red badges.
-2. **Sync Log** — under each integration (Sync > WooCommerce, Sync > Xero, Sync > Mintsoft). Shows the last 100 sync events with status (SYNCED / FAILED / PENDING / SKIPPED) and the error if any.
-3. **Notifications** (bell icon, top bar) — admin-facing alerts for critical issues (failed cron, integration outage, restore confirmation, etc.).
+2. **Integrations** (sidebar) — red and amber banners at the top say at once when something needs attention (failed accounting rows, sync exceptions, tax-rate drift). Below them, the **Sync Log** of each integration (WooCommerce and Xero cards; Mintsoft has its own panel) shows recent sync events with status (SYNCED / FAILED / PENDING / SKIPPED) and the error if any. See [Sync failures and the exception inbox](#sync-failures-and-the-exception-inbox) below.
+3. **Notifications** (bell icon, top bar) — admin-facing alerts for problems: failed accounting postings, stranded goods, a read feed that stopped updating, an overdue warehouse receipt, a failed cron, and so on.
 
 
 ## Login and authentication
@@ -19,17 +21,27 @@ When something goes wrong, three places hold the information you need:
 ### "Invalid credentials" but the password is correct
 - Caps lock?
 - Did you set the email or username field? Some installations use email-only.
-- Account may be locked after repeated failures. Wait 15 minutes or have an admin unlock.
+- Repeated failed attempts for the same email from the same address are blocked for 15 minutes, and the screen does not say so; wait and try again. (An administrator cannot lift this early.)
+- The account may have been deactivated (Settings > Users shows it as Inactive).
+- A line above the form saying your session ended means you were signed out by a change to your account or because the session expired; just sign in again.
 - Have you been migrated to passkey-only? The login screen will show a passkey prompt instead of a password field.
 
 ### TOTP code rejected
 - Confirm the device clock is synced to network time (NTP). TOTP fails if device time drifts > ~30 seconds.
 - The 6-digit code rotates every 30 seconds; type quickly and submit before the next rotation.
-- If you've reset your authenticator app or lost your device, an admin can disable 2FA on your account from Settings > Users.
+- If you've reset your authenticator app or lost your device, you cannot disable 2FA yourself without a code, and **Settings > Users** has no button to disable it for you (its 2FA column only shows whether it is on). Ask your system administrator to reset your two-factor setting. If you can still produce a code, use **Disable 2FA** on your profile.
 
 ### Forgotten password
-- Use the **Forgot password?** link on the login page. The reset email goes to your registered address — make sure SMTP is working.
-- Admin users can reset other users' passwords from Settings > Users.
+- Use the **Forgot password?** link on the login page and click **Send reset link**. The page says "If an account exists for that email, a password reset link is on its way" whether or not the address is registered. The email goes to your registered address — if nothing arrives, check spam and make sure SMTP works (**Settings > Company > Email > Test SMTP**).
+- The link works once and **expires after 60 minutes**. "This reset link is invalid or has expired" means request a new one with **Request a new link**.
+- Administrators can set a new password for another user from **Settings > Users** (Edit > New Password).
+- See [User Management & Security](user-management.md#forgotten-password) for the full flow.
+
+### A "Confirm it's you" box appears
+- It is the re-authentication prompt for a sensitive action (users, backups, connector credentials, database reset). Enter your password (and authenticator code if you use 2FA) and click **Confirm**. A wrong password says "Re-authentication failed." and the action is not carried out. See [User Management & Security](user-management.md#confirming-its-you-re-authentication).
+
+### A confirmation dialog will not let me click the button
+- The action button stays disabled until you type the name the dialog asks for exactly (for example the backup file name) or tick its acknowledgement box. Cancel closes it without doing anything.
 
 ### "Password is too common" / "must include a symbol"
 - The password policy requires at least 12 characters, one uppercase, one number, one symbol, and the password must not be in the deny-list of common passwords (`password123`, etc.).
@@ -90,9 +102,9 @@ When something goes wrong, three places hold the information you need:
 - A CSV import row whose `fxRateToBase` is not exactly the table rate is refused; leave the column blank.
 
 ### "Missing GBP FX rate for EUR" (or similar)
-- The FX rate cron hasn't fetched today's rate. Click **Update Now** in Settings > Accounting > FX Rates.
-- If the fetch keeps failing, check **Settings > System > Health** for FX sync status. The frankfurter.dev API outage will surface here.
-- With the **Aelia** FX source, a failure names its cause: HTTP 404 from the store means the helper plugin 1.3.0+ is not deployed or the shared secret is not set; `base_mismatch`, `no_update_time`, `missing_rate`, `non_positive_rate`, `rate_precision`, `unknown_currency` or `not_listed_by_aelia` name the rate Aelia gave that IMS refuses. Nothing is substituted; fix Aelia or the currency list, or switch the source back to ECB.
+- The FX rate cron hasn't fetched today's rate. Click **Update Now** in **Settings > Accounting > Currencies** (FX Rate Schedule). Check the **FX Rate Update** job is switched on in **Settings > System > Scheduler**.
+- If the fetch keeps failing, look at the **Integration health** card on **Settings > Accounting > FX Rates** (last fetch, last fetch attempt and any error). A frankfurter.dev outage shows here.
+- The **Aelia** FX source is **not yet switched on**; leave the source on ECB (frankfurter). If it has been switched on for you, a failure names its cause: HTTP 404 from the store means the helper plugin 1.3.0+ is not deployed or the shared secret is not set; `base_mismatch`, `no_update_time`, `missing_rate`, `non_positive_rate`, `rate_precision`, `unknown_currency` or `not_listed_by_aelia` name the rate Aelia gave that IMS refuses. Nothing is substituted; fix Aelia or the currency list, or switch the source back to ECB (**Settings > Accounting > FX Rates > Exchange-rate source**).
 
 ### PO cancellation refused
 - POs in PARTIALLY_RECEIVED state can be cancelled, but the system will reverse all received cost layers and stock. Confirm the cancellation if you're sure.
@@ -111,38 +123,80 @@ When something goes wrong, three places hold the information you need:
 ## Integrations
 
 ### WooCommerce orders not importing
-1. Check that order sync is enabled in Sync > WooCommerce > Orders.
+1. Check that order sync is enabled in Integrations > WooCommerce > Orders.
 2. Verify the initial import has completed (one-time, must finish before ongoing sync starts).
 3. Confirm the relevant WC order statuses are selected in the status filter.
 4. Check Sync Log for FAILED entries — the error message is usually specific (auth failure, network timeout, tax rate mismatch).
-5. **If webhooks are configured:** verify the webhook secret matches in both systems. The WC plugin's settings page must have the same secret pasted as Sync > WooCommerce > Orders > Webhook Secret.
+5. **If webhooks are configured:** verify the webhook secret matches in both systems. The WC plugin's settings page must have the same secret pasted as Integrations > WooCommerce > Orders > Webhook Secret.
 
 ### WooCommerce order import blocked: "no FX rate"
 - The order's currency has no FX rate stored for the order's date. The system queues the order in the FX retry queue rather than failing.
-- Run **Update Now** in Settings > Accounting > FX Rates. The retry queue drains automatically after a successful fetch.
+- Run **Update Now** in **Settings > Accounting > Currencies**. The retry queue drains automatically after a successful fetch.
 - If the queue grows beyond 5 entries, an admin notification is sent.
 
 ### "Blocked WooCommerce order ... tax rate fallback"
 - A line item's tax rate couldn't be mapped to an IMS tax rate, and the fallback would have used a non-zero default rate.
-- Fix: import tax rates from WC (Sync > WooCommerce > Tax Rates > Import from WooCommerce), then re-process the blocked order.
+- Fix: import tax rates from WC (Integrations > WooCommerce > Tax Rates > Import from WooCommerce), then re-process the blocked order. **Settings > Sales > Recent Tax Rate Fallbacks** lists the recent events and the rates involved.
 - The blocking is intentional — preserving incorrect VAT silently is worse than blocking and asking.
 
-### Xero "Test the connection successfully before enabling it"
-- The connection test gate (added in PR #152) requires a successful test before sync can be activated.
-- Visit Sync > Xero, click Test Connection. If the test passes, the gate clears.
+### "Test the Xero connection successfully before enabling it"
+- The connection test gate requires a successful test before an integration's sync can be activated. The same gate covers WooCommerce, Xero, Mintsoft and outbound email.
+- Open Integrations > Xero (Connection tab) and click **Test Connection**. If the test passes, the gate clears. In the setup wizard, **Connect & Verify Xero** and **Save & Test Connection** do the test for you.
 - If you've rotated the Xero client secret recently, the saved fingerprint is stale — re-test.
 
-### "Connection settings changed" error after rotating a secret
+### "Retest the ... connection because the saved connection settings changed"
 - The connection test gate detects when saved credentials differ from what was tested. Re-test after any credential change.
-- The fingerprint comparison includes URL, key, secret (where relevant). The connection test gate's gate is per-integration.
+- The fingerprint comparison includes URL, key, secret (where relevant). The gate is per integration.
+
+### Xero: "REQUIRES RECONNECT" or a "Reconnect required" warning
+- Xero grants permissions when you connect and a later release can need one an old connection never granted (for example the trial-balance permission used by the account balance snapshot). IMS checks the recorded permissions and refuses with a message that names the missing permission and says nothing was sent, instead of a vague 401.
+- Fix: Integrations > Xero > Connection tab > **Reconnect**, approve the consent screen, then retry the failed rows. See [Xero Accounting Sync](xero-sync.md).
+
+### Xero: a document is refused with "NOTHING WAS SENT" and a missing tax type
+- A sales invoice or credit note line with **no tax type** is refused and nothing is sent to Xero; IMS never falls back to "No VAT". The error names each part with no type (a product line, shipping, the discount).
+- Fix: open **Settings > Accounting > Tax** and give the rate a real Xero tax type (or use **Generate missing rates** / **Import purchase tax rates from Xero**), then retry the row. An explicit "No VAT" type is also refused unless the line says why it carries no tax. For a WooCommerce order whose tax rate is unmapped or mapped to an inactive IMS rate, map the rate (Integrations > WooCommerce > Tax Rates) and re-import the order. See [Xero Accounting Sync](xero-sync.md).
+
+### "N tax rates differ from the live Xero definition" (amber banner)
+- Someone edited a rate in Xero (or IMS) so the two no longer match. The next invoice would post with the IMS-side numbers, so fix it before then: click **Review VAT rates**, see the **Xero drift** chip on the rate, and correct whichever side is wrong. **Compare VAT rates** (Settings > Accounting > Tax) also compares IMS, Xero and WooCommerce and explains each difference.
 
 ### Xero invoice CurrencyRate looks wrong
 - IMS stores `1 base = X foreign`; Xero expects `1 foreign = X base`. The connector inverts and rounds to 6dp. If you see a substantially wrong rate, check `SalesOrder.fxRateToBase` on the source order.
-- For an invoice or bill, a zero or null rate leaves `CurrencyRate` off and Xero applies its daily rate (logged as a fallback case); ensure the order had a valid rate at creation time. A refund or credit note does not do this: a foreign order with no usable stored rate is refused by name (nothing is created at 1). Correct the order's exchange rate and retry. A payment, or a month-end revaluation, with no `fx_rates` row for its date is refused or skipped by name: add the rate in Settings → Currencies.
+- A foreign invoice, bill, refund or credit note whose stored exchange rate is missing, zero or unusable is **not sent**: IMS will not let Xero apply its own daily rate. The posting stays owed and appears in the exception inbox (Integrations > Exceptions) with the reason `foreign_document_missing_rate`; nothing is created at 1. Correct the document's exchange rate (a positive rate), then raise the posting again. A payment, or a month-end revaluation, with no `fx_rates` row for its date is refused or skipped by name: get the rate with **Update Now** (Settings > Accounting > Currencies) or pin one on **Settings > Accounting > FX Rates**.
 
 ### Mintsoft webhook signature mismatch
-- The shared secret must match between IMS and Mintsoft. Re-paste from Settings > Integrations > Mintsoft.
+- The shared secret must match between IMS and Mintsoft. Re-paste it from Integrations > Mintsoft (see [Warehouse (Mintsoft)](warehouse.md)).
 - Mintsoft webhook signatures bind the freshness timestamp into the HMAC; body-only signatures are rejected.
+
+
+## Sync failures and the exception inbox
+
+The **Integrations** page puts problems where you will see them. Banners appear at the top only when there is something to act on:
+
+- **"N sync exception(s) need attention"** (amber) with **Open the exception inbox** — dead-lettered or parked sync work across connectors.
+- **A connector-orphan banner** — accounting rows left behind by switching the accounting connector (administrators can cancel them there).
+- **"N accounting sync row(s) failed after exhausting retries"** (red) with **Retry all failed...** — see below.
+- **"N tax rates differ from the live Xero definition"** (amber) with **Review VAT rates**.
+
+### Retry all failed (accounting)
+
+**Retry all failed...** opens a confirmation dialog that counts the failed rows, repeats a warning that a retry can create a duplicate document, and asks you to tick "I have checked Xero and none of these documents already exist there" before **Retry N failed rows** is enabled. Failed rows were already retried automatically, and Xero's own duplicate protection lasts only minutes, so **check Xero first** (search by the document reference); a retry of a document that is already there makes a second one. If the count changed while the box was open the retry is refused; reopen it. After the retry the banner says how many rows were re-queued; rows IMS recognises as unsafe to repeat (a repeat could send a second payment, or another entry for the same document is already queued) are **not** re-queued and each has a recorded reason in the sync warnings. The same per-row controls are in the Sync Log: **Retry**, **Settle sync row** (record that a row did or did not post, when IMS cannot tell: you give the Xero document id you read) and **Checked the ledger** (for a receipt held back because Xero holds a payment IMS cannot read). Settle and Checked the ledger record **your assertion**, logged against your account, so only use them after looking in Xero. The full rules are in [Xero Accounting Sync](xero-sync.md).
+
+### Sync Exceptions (the exception inbox)
+
+Open it from the banner, or go to `/sync/exceptions` (**Integrations > Open the exception inbox**). It lists dead-lettered and parked work in sections, each with a count: blocked warehouse order pushes, permanently failed integration outbox rows, dead warehouse inbound events, parked WooCommerce refunds, dispatch reconciliations that gave up, order-total mismatches, accounting postings IMS refused to queue (with **Mark as handled** once you have posted it by hand), and WooCommerce product structure conflicts. When every queue is empty it says "No open sync exceptions".
+
+- **Replay** re-attempts the original work with its original payload and idempotency keys preserved. A replay of an order that has a withdrawal standing against it runs the same check and holds it back again.
+- **Dismiss** clears an exception IMS cannot or should not retry (for example a cancelled order that was never dispatched). Read the row's hint first; anything already despatched is handled as a return.
+- Replay and similar actions may ask you to **Confirm it's you**.
+- Items that stay in the inbox are real unfinished work. Do not clear them just to empty the list.
+
+### Event Timeline
+
+The **Event Timeline** button at the top of Integrations opens `/sync/events` (**WMS Event Timeline**): a record of every change made to the warehouse connector (settings, bindings and similar), with filters for connector, direction (outbound IMS to the warehouse, inbound the other way), action and outcome. Expand a row for its **Before** and **After** values and any error. Secrets are masked. Use it to answer "who changed the connector settings and when".
+
+### Daily batch preview warnings
+
+On the Xero connector's **Daily Batch** tab, an amber box above the preview figures says "N orders netted against a reversal the IMS cannot vouch for" and lists one line per order. It means the revenue deferral for those orders rests on records nobody has checked in the ledger. The figures are unchanged and the batch still runs; check the listed orders in Xero if the totals look wrong.
 
 
 ## Reports and analytics
@@ -150,10 +204,9 @@ When something goes wrong, three places hold the information you need:
 ### Forecast shows no products
 - All products in the catalogue may be `EOL` or `ARCHIVED`, both of which are excluded from reorder forecasts.
 - Forecasts also require sufficient sales history. New products with no sales movement aren't suggested for reorder.
-- Check that velocity is being computed — Settings > System > Health > Velocity status.
 
 ### VAT report numbers don't tie to Xero
-- VAT report uses inclusive vs exclusive pricing per order (added in PR #136). Tax-inclusive orders subtract tax from `totalBase` to get taxable base.
+- VAT report uses inclusive vs exclusive pricing per order. Tax-inclusive orders subtract tax from `totalBase` to get taxable base.
 - The Xero comparison should be against Xero's VAT report, not Xero's totals. Slight rounding (under £1 typically) is normal.
 
 ### "Source rows exceed 50,000; narrow the filters and retry"
@@ -171,16 +224,30 @@ When something goes wrong, three places hold the information you need:
 - The system checks that the manifest's recorded filename matches the file you're restoring. Manual file renames break this check.
 - Fix: rename the backup file to match the manifest, OR regenerate the manifest by running a fresh backup.
 
+### Scheduled backups are not appearing
+- Open **Settings > Backup & Restore > Scheduler** and check **Enable scheduled backups** is on and saved. The time of day is the **Database Backup** job on **Settings > System > Scheduler** (daily at 01:00 by default); both switches are the same setting.
+- If **Auto-upload** is S3 or SFTP, check the **Storage** tab details. For SFTP the **Host Fingerprint** is required.
+- Backups older than the retention days, or beyond the maximum count, are deleted automatically.
+
 ### Restore email code never arrives
 - Restore tokens have a 2-minute TTL. By the time you check email and type, the code may have expired.
-- Each restore attempt invalidates previous tokens. If a code is rejected, request a new one.
+- Each restore attempt invalidates previous tokens. If a code is rejected, click **Resend code**.
 - The token is bound to your session and IP — opening the restore page from a different network or after re-auth invalidates the previous token.
 
 
 ## Cron jobs
 
+### A scheduled job does not run, or a new job is missing
+- Jobs are scheduled from **Settings > System > Scheduler**. After an upgrade, open it and press **Save & Apply** once: a job that is new (for example the Mintsoft despatch poll every 15 minutes or the daily Xero chart refresh at 00:30) or whose frequency changed (the WooCommerce reconcile is now hourly) only reaches an existing crontab when you save.
+- A red **"Scheduler crontab needs attention"** box at the top of the Scheduler tab says the crontab is missing, was hand-edited, or has a stale secret (every job then fails with a silent 401). **Save & Apply** rewrites it. On a containerised install the host owns the crontab and the tab says so.
+- Check the job's switch is on. Several are off by default: scheduled backups, the WMS order push, status and reconcile jobs, and most Mintsoft stock and verification jobs.
+- A message after saving such as "saved, but the scheduler is behind" means the setting is stored but the crontab was not updated; save again or ask your system administrator.
+
+### "Public App URL" is refused
+- It must be an `https://` address (`http://` only for `localhost`, `127.0.0.1` or `[::1]`) with no spaces, credentials (`user:password@`), query (`?...`), fragment (`#...`) or special characters (quotes, `$`, backticks). Use just the site address, for example `https://ims.example.com`. A bad value that is already stored stops the crontab being written until it is corrected.
+
 ### "Cron job rate limited" (429)
-- Each cron route has a per-hour quota. Most are 1/hour (daily jobs); high-frequency jobs are 4/hour, 12/hour, or 60/hour. Defaults match expected cadence.
+- Each cron route has a rate limit derived from its schedule: daily and hourly jobs allow three runs per period; more frequent jobs allow their scheduled runs per hour plus a few spare.
 - If your cron daemon retries on transient errors AND the underlying issue resolves itself, the legitimate next-tick run can be denied. Check the cron daemon retry policy.
 - For one-off testing, set `RATE_LIMIT_BACKEND=memory` and restart the app — counters reset.
 
@@ -194,8 +261,9 @@ When something goes wrong, three places hold the information you need:
 
 ## When all else fails
 
-1. Check the **System Health** page — Settings > System > Health. It surfaces FX sync status, WooCommerce sync status, Xero sync status, integration outbox depth, cron last-run timestamps, and recent error rates.
-2. Run the **invariant preflight** locally: `npm run invariant-check:preflight`. It scans inventory, accounting, and sales invariants and reports any drift.
-3. Check the **activity log** with `level=ERROR` filter for the last 24 hours.
-4. If the issue is sync-related, retry the failed entry from the Sync Log.
-5. Capture the error message, the activity-log entry ID, and the affected entity (order ID, product SKU, etc.) before opening a support ticket.
+1. Check the **Integrations** page: the banners and the **Sync Exceptions** inbox show failed and stuck sync work, and the notification bell shows administrator alerts (failed postings, stranded goods, a feed that stopped updating, an overdue warehouse receipt).
+2. Check **Settings > Accounting > FX Rates** (Integration health card) for exchange-rate problems.
+3. Check the **activity log** with the `Error` level filter for the last 24 hours.
+4. The daily invariant check also scans inventory, accounting and sales for drift; ask your system administrator to run it by hand if you suspect a data problem.
+5. If the issue is sync-related, retry the failed entry from the Sync Log, after checking the other system (see above).
+6. Capture the error message, the activity-log entry ID, and the affected entity (order ID, product SKU, etc.) before opening a support ticket.

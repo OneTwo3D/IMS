@@ -11,7 +11,7 @@ import { roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/d
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
-import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
+import { SourceScanTooLargeError, assertSourceLimit, sourceLimitNotice } from '@/lib/security/source-scan-error'
 import {
   calculateDecimalCoverageByLine,
   type DecimalFulfillmentRequirement,
@@ -562,7 +562,7 @@ export function emptySalesAnalyticsReportForSourceLimit<Row>(
     rows: [],
     pageInfo: pageInfo(0, filters.page, pageSize),
     totals,
-    notices: [error.message],
+    notices: [sourceLimitNotice(error)],
   }
 }
 

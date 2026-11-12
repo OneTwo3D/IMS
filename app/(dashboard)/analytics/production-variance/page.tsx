@@ -1,3 +1,4 @@
+import { sourceLimitNotice } from '@/lib/security/source-scan-error'
 import Link from 'next/link'
 import type { Metadata } from 'next'
 import { ProductLink } from '@/components/inventory/product-link'
@@ -61,7 +62,7 @@ export default async function ProductionVariancePage({ searchParams }: Props) {
       rows: [],
       pageInfo: { page: 1, pageSize: filters.pageSize ?? 100, totalRows: 0, totalPages: 1, hasNextPage: false, hasPreviousPage: false },
       totals: {},
-      notices: [error.message],
+      notices: [sourceLimitNotice(error)],
     }
   }
   return (

@@ -14,10 +14,29 @@ Most current reports provide:
 - **Summary tiles** for report-level totals
 - **CSV export** for the filtered result set
 - **Drill-through links** to source products, orders, shipments, purchase orders, or production orders where the source document is available
+- **An (i) icon beside the report title.** The report's description and its methodology notices (what the figures include, rounding, estimated lead times, products that could not be planned, and so on) are in that tooltip. Hover over it or tab to it with the keyboard to read them; there is no separate notices box on the page.
+
+### CSV exports
+
+The **CSV** button on a report downloads the filtered result as **data rows only**, so the file opens cleanly in a spreadsheet or parser. Report-level totals and disclosures (period totals, rounding and refund-basis notices) are normally not appended to the file. They are added as trailing `#` comment rows only when the export address carries `?metadata=1`. The CSV links on the report pages themselves (stock position, replenishment, inventory ledger, inventory costing, sales analytics, manufacturing and the Purchase Statistics tabs) add it for you, so a download from the page still carries them. A direct call to the export address, and the CSV links on Sales Statistics, Inventory Report and the finance and purchasing reports, give data rows only. Notices for the replenishment (reorder, backorder, component shortage) and manufacturing (production variance, WIP) exports follow the data as `# notice` rows under the same rule; they can also be requested with `?notices=1`.
+
+### Who can open which report
+
+| Report group | Roles |
+|---|---|
+| Sales Statistics, Product Profitability, Inventory Report | Admin, Manager, Finance, Read-only |
+| Purchase Statistics (page, data and its CSV exports) and the Purchasing reports (Open POs, Supplier Performance, Purchase Price Variance, Spend, Lead Times) | Admin, Manager, Finance |
+| Stock Position reports | Admin, Manager, Finance, Read-only, Warehouse |
+| Stock Movement Ledger, Stock Adjustments, Stock Transfers, Stock Counts | Admin, Manager, Finance, Warehouse |
+| Inventory Valuation, COGS Report, Landed Cost Analysis, Inventory Turnover | Admin, Manager, Finance |
+| Replenishment (Reorder Planning, Backorders, Component Shortages), Sales reports, Manufacturing reports | Admin, Manager, Finance |
+| Finance period-end reports | Admin, Finance |
+
+A role that is not allowed a report does not see it in the Analytics menu and is sent back to the dashboard if it opens the address.
 
 ### Source-row cap (50,000 rows)
 
-To keep large reports responsive, the underlying data fetch is capped at **50,000 source rows** per report. If your date range or filters select more than that, the report returns a `413 Payload Too Large` error and asks you to narrow the range or apply more filters.
+To keep large reports responsive, the underlying data fetch is capped at **50,000 source rows** per report. If your date range or filters select more than that, the report is **not computed**. A red banner at the top of the page says "This report hit its row limit (50,000 rows); narrow the date range or filters", the summary tiles show a dash instead of a figure, and the table says "Report not computed". It never shows zeros or "No rows" for a report that was refused. The CSV button gives the same refusal (a `413 Payload Too Large` response carrying the same message, with no file) rather than a file of zeros.
 
 The cap applies before any aggregation, so a report that displays "120 supplier rows" might still hit it if those 120 rows roll up from millions of PO lines — narrow by date in that case.
 
@@ -26,7 +45,7 @@ The cap applies before any aggregation, so a report that displays "120 supplier 
 | Report | What it shows |
 |---|---|
 | **Stock on Hand** | Current or as-of stock quantity, reserved quantity, available quantity, unit cost, total value, and reservation evidence. |
-| **Inventory Aging** | FIFO cost-layer quantity and value by age bucket. BOM products age from their production layers; KIT rows use component-based semantics when filtered to KIT. |
+| **Inventory Aging** | FIFO cost-layer quantity and value by age bucket. BOM products age from their production layers. Virtual KIT products hold no cost layers of their own, so they are left out of the list; if you filter to Type KIT the report is empty and says so, and you age the component SKUs instead. |
 | **Dead Stock** | Current positive-stock SKUs with no recent sales-dispatch demand inside the selected threshold. Recent never-sold SKUs can be treated separately from dead stock. |
 | **Stock Allocations** | Reserved stock by source, including sales, manufacturing, and unattributed reservation drift. |
 | **Negative Stock** | Current negative stock rows and products that went negative during the selected movement window. |
@@ -39,8 +58,8 @@ Warehouse users can access the stock-position report family. Broader analytics r
 |---|---|
 | **Stock Movement Ledger** | Full movement history with opening and closing quantity/value reconciliation. |
 | **Stock Adjustments** | Adjustment movements grouped by reason, product, user, and value impact. |
-| **Stock Transfers** | Transfer dispatch, receipt, in-transit, overdue, and drift evidence. **Received** is what has come to rest by any route — a manual receipt, a WMS book-in, or a WMS stock-sync alignment (which raises stock without recording a receipt on the line) — so **Drift** is requested less that figure. A transfer the WMS accounted for entirely no longer reports as 100% drift. |
-| **Stock Counts** | Stocktake/count variance, book versus counted quantity/value, and resulting adjustment links. |
+| **Stock Transfers** | Transfer dispatch, receipt, in-transit, overdue, and drift evidence (columns: status, from, to, dispatched, received, days, sent qty, received qty, drift, movement value; the summary shows in-transit and overdue counts). **Received** is what has come to rest by any route — a manual receipt, a WMS book-in, or a WMS stock-sync alignment (which raises stock without recording a receipt on the line) — so **Drift** is requested less that figure. A transfer the WMS accounted for entirely no longer reports as 100% drift. |
+| **Stock Counts** | One row per SKU on each count: book qty, counted qty (an uncounted line reads **Open**), variance, and the value of the linked adjustment (**No evidence** where no adjustment movement is linked back to the count). The summary shows total variance, linked value, the number of rows missing adjustment evidence (also named in a notice) and repeat-offender SKUs. |
 | **Inventory Valuation** | IMS stock value by product, category, warehouse, and as-of date. When accounting balance snapshots exist, the report shows GL variance. |
 | **COGS Report** | COGS from `CogsEntry` rows, with revenue net of the period's net-basis credit and gross margin where sales-order-line links are available. |
 | **Landed Cost Analysis** | Purchase-order landed cost uplift, allocation method, revaluation run evidence, and effective unit cost impact. |
@@ -64,11 +83,26 @@ A row reads **Unmatched** for revenue and margin when any of its dispatches cann
 |---|---|
 | **Velocity Rankings** | Top and bottom movers by sales velocity over the selected window. |
 | **ABC Analysis** | Pareto classification by COGS or revenue contribution. |
-| **Reorder Planning** | Suggested reorder quantity using reorder point, reorder quantity, safety stock, supplier lead time, sales velocity, available stock, and inbound open purchase orders. |
+| **Reorder Planning** | Suggested reorder quantity using reorder point, reorder quantity, safety stock, lead time, sales velocity, available stock, and inbound open purchase orders. This page also carries the tools of the old Reorder Forecast (ABC, status and search filters, historical-sales import). See [Reorder Planning](#reorder-planning) below. |
 | **Backorders** | Non-cancelled sales-order demand not covered by committed shipments or allocations, with expected inbound quantity and projected fill date. |
 | **Component Shortages** | BOM component demand from draft and in-progress production orders compared with available plus inbound stock. |
 
 Reorder suggestions are never negative. They are planning guidance and should be reviewed before creating supplier documents.
+
+### Reorder Planning
+
+The old **Reorder Forecast** page has been retired; its address now opens Reorder Planning, which took over its filters and the historical-sales import. Reorder Planning is under **Analytics > Replenishment**.
+
+- **Filters.** Warehouse, category, supplier, product type, **Demand window** (days of sales history, default 90), **Status** (Critical, Reorder, Watch), **ABC class**, a **Search** box (SKU, name or supplier) and **Weeks of supply** (default 8, from 1 to 52). **Show all products (incl. zero reorder)** lists every candidate product, including those with nothing to order; the CSV export always includes all products.
+- **Sort order.** Highest suggested reorder quantity first, then by status and SKU.
+- **Whole numbers.** Available, inbound, reorder point and suggested quantities are shown and exported as whole units; the suggested quantity is rounded up.
+- **Suggested quantity (order up to N weeks).** A product is suggested only once its available stock plus inbound open POs has dropped below its reorder point. The order then brings it back up to the reorder point plus **Weeks of supply** worth of forecast demand. A reorder quantity set on the product acts as a minimum lot size, and a reorder quantity of 0 opts the product out. Where a product has no demand the suggestion simply tops it up to the reorder point.
+- **ABC class** is worked out from units sold in the demand window (a Pareto split: the products making up the first 80% of units are A, the next 15% B, the rest and anything with no movement C). It does not read the ABC field stored on the product.
+- **Lead time** is taken in this order: the manual lead time on the product; otherwise the lead time worked out automatically from your purchase order receipts (the P95 of actual receipt times); otherwise, for a product with no purchase history, the median lead time of its supplier, then of its category; and only if none of those exist a flat 14 days. A notice names the SKUs that use a peer median or the 14-day default.
+- **Needed for** shows why a row is there (direct sales, a parent BOM, or stock policy). Manufactured products show **Manufactured by** a named manufacturer or **Manufactured in-house** instead of Unassigned.
+- **No claimed recipe.** If a manufactured product needs building but has no claimed recipe, a notice reads "No claimed recipe: component demand not planned for ..." and names the products. Import or claim a recipe for them; their components' demand is not included until you do.
+- **Selecting rows and generating drafts.** Each row has a checkbox, with a select-all box in the header (the keyboard shortcut **a** toggles all rows, **Enter** generates). With rows ticked the button reads **Generate from selection**; with none ticked it reads **Generate POs + draft MOs for all visible rows** and asks you to confirm the row count first. Purchased products become one draft purchase order per supplier; manufactured products become draft production orders. The selection is cleared when you change filters or page. See [Purchasing](purchasing.md#supplier-scoped-reorder-drafts).
+- **Import history.** Admin and Manager users see an **Import history** button on the page header. It opens the historical-sales import (see [Training Data for Forecasting](#training-data-for-forecasting)).
 
 ### Warehouse filtering
 
@@ -93,7 +127,7 @@ attributed per warehouse, it has to come from dispatches recorded in IMS.
 
 ### Lifecycle filtering
 
-Only **Draft** and **Active** products appear in reorder planning by default. **EOL** and **Archived** products are excluded — you should be running them down, not reordering them. To see EOL products too, toggle the "Include EOL" filter.
+Only **Draft** and **Active** products appear in reorder planning. **EOL** and **Archived** products are always excluded — you should be running them down, not reordering them.
 
 ### Preferred supplier scoping
 
@@ -132,6 +166,8 @@ Non-stock lines are the exception, and deliberately so. A service, a fee or a de
 
 All of this is stated in each report's own notices and repeated in the CSV export's metadata rows; every bound marker also has its own column in the CSV, and every report-level total — including the bounds on the period figures and the Gross Margin credit that reached no product row — travels with the file as `totals.<name>` metadata rows, because a figure that exists only on the page is a disclosure the file reader never sees. The **COGS Report** carries the same treatment and the same markers (see above); **Inventory Turnover** is a COGS-over-inventory-value ratio that no refund can move.
 
+**Sales Statistics and Product Profitability** use the same rule, so a refunded sale no longer overstates revenue there. In **Sales Statistics**, the **Net Revenue** column and cards deduct the credit that is on the same ex-VAT basis; revenue, tax, shipping and discount stay as invoiced. In **Product Profitability**, the current and previous financial-year revenue and profit are net of that credit. Credit that could not be deducted is shown in the optional **Refunds (gross)** (VAT-inclusive credit) and **Refunds (basis ?)** (basis not recorded) columns, and the affected figure carries **≤**, **≥** or **?** with a tooltip explaining which way it can be wrong. The Product Profitability unit-margin figures (list price against latest cost) are not affected by refunds.
+
 The **Returns** report shows each credit on its own recorded basis. Where a row -- or the period -- mixes ex-VAT and VAT-inclusive credits, no single total is shown, because adding the two gives an amount on neither basis; the net-basis, gross-basis and unproven-basis columns carry the whole credit instead, and rows with no single stated value sort last rather than among the zeroes.
 
 ## Purchasing and Supplier Analytics
@@ -161,6 +197,7 @@ The Gross Margin and COGS reports use the same invoiced orders for revenue and c
 | **VAT** | Output and input VAT by side / reporting category / jurisdiction / tax rate, for invoiced non-cancelled sales orders and purchase-invoice lines in the selected period. |
 | **AR Aging** | Outstanding balances on invoiced sales orders (the same invoiced basis and invoice date as the revenue reports, so drafts, cancelled orders and orders with no invoice are not receivables) by customer and aging bucket (Current / 1–30 / 31–60 / 61–90 / 90+). |
 | **AP Aging** | Outstanding purchase-invoice balances by supplier and aging bucket. |
+| **Currency Summary** | Sales, purchases, AR and AP grouped by document currency, with foreign and base-currency totals. |
 | **FX Gain/Loss** | Booked versus settlement FX delta for multi-currency transactions using IMS FX-rate semantics (realised + unrealised). |
 
 Finance period-end reports are limited to finance and admin roles.
@@ -190,16 +227,18 @@ Some legacy analytics pages remain available for continuity:
 - **Purchase Statistics**
 - **Product Profitability**
 - **Inventory Report**
-- **Reorder Forecast**
+
+The **Reorder Forecast** page has been retired; use [Reorder Planning](#reorder-planning).
 
 New report families under `/analytics/*` are the preferred source for production-readiness reporting because they expose clearer provenance, RBAC, CSV exports, and reconciliation notices.
 
 ## Training Data for Forecasting
 
-Historical demand can still be imported for forecasting:
+Historical demand can still be imported for forecasting, from the **Import history** button on Reorder Planning (Admin and Manager). The import creates demand records only and does not change stock levels; it runs in the background, so you can close the dialog and carry on.
 
 - **WooCommerce import** — bulk import past WooCommerce orders by date range. A progress indicator shows real-time import status including pages processed and orders imported.
-- **CSV import** — upload historical sales data for products not covered by WooCommerce.
+- **CSV import** — upload historical sales data (columns `sku, qty, date`, date as YYYY-MM-DD, one row per line item sold) for products not covered by WooCommerce.
+- **Data retention** — demand records older than the retention period (months) set in the same dialog are purged automatically.
 
 
 ## Troubleshooting
@@ -208,7 +247,7 @@ Historical demand can still be imported for forecasting:
 |---|---|
 | Report returns 413 Payload Too Large | Narrow date range or apply more filters — see [Source-row cap](#source-row-cap-50000-rows) |
 | Revenue doesn't match invoice total | Check the order's `Tax Inclusive` flag |
-| Reorder planning missing a product | Check lifecycle status — EOL/Archived are excluded by default |
+| Reorder planning missing a product | Check lifecycle status (EOL/Archived are always excluded), and whether it is below its reorder point; tick **Show all products** to list the rest |
 | Draft PO has wrong supplier | A preferred supplier was auto-updated by a recent PO; edit on the product page |
 | Inventory valuation shows no GL variance | Account-balance snapshots haven't been ingested from the accounting connector yet |
 | FX rate looks stale | FX rates auto-fetch via cron — see [Troubleshooting](troubleshooting.md) for cron status |

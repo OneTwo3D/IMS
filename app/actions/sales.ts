@@ -172,6 +172,11 @@ import { WMS_PRE_CUTOVER_NOTICE, WMS_PRE_CUTOVER_PUSH_STATE, wmsPushIsPreCutover
 import { findSalesOrderDeleteBlocker } from '@/lib/domain/sales/order-delete-guard'
 import { queueSalesInvoiceUpdateForExistingAccountingInvoice } from '@/lib/domain/sales/sales-invoice-update-sync'
 import { Prisma, type ProductType, type TaxCategory } from '@/app/generated/prisma/client'
+import {
+  ORDER_LIST_PAGE_SIZE, isShortListQuery, SO_COMPLETED_STATUSES, SO_STATUSES, buildListPage, buildSalesOrderListWhere,
+  normaliseListQuery, normalisePage, normaliseStatuses, soListHides,
+  type ListPage, type SoListFilter, type SoListHidden,
+} from '@/lib/domain/lists/order-list-query'
 import { resolveFxRateToBase } from '@/lib/domain/sales/draft-fx-rate'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -230,6 +235,8 @@ export type SoRow = {
   hasExternalSource: boolean
   externalOrderDate: string | null
   status: SoStatus
+  /// Hidden from the default operational list by data retention; still searchable and still counted by reports.
+  archived: boolean
   refundStatus: 'NONE' | 'PARTIAL' | 'FULL'
   /// o3d-e1yb [wdraw]: set while an EU withdrawal request holds this order.
   withdrawalHoldAt: string | null
@@ -487,6 +494,7 @@ async function refreshDraftOrderFxAtFinalization(
 
 const SO_SELECT = {
   id: true,
+  archived: true,
   externalOrderNumber: true,
   shoppingLinks: {
     select: { connector: true, externalOrderId: true },
@@ -554,6 +562,7 @@ const SO_SELECT = {
 
 function mapSoRow(so: {
   id: string
+  archived: boolean
   externalOrderNumber: string | null
   shoppingLinks: { connector: string; externalOrderId: string }[]
   orderNumber: string | null
@@ -658,6 +667,7 @@ function mapSoRow(so: {
     hasExternalSource,
     externalOrderDate: so.externalCreatedAt?.toISOString() ?? null,
     status: so.status as SoStatus,
+    archived: so.archived,
     refundStatus: so.refundStatus as 'NONE' | 'PARTIAL' | 'FULL',
     withdrawalHoldAt: so.withdrawalHoldAt ? so.withdrawalHoldAt.toISOString() : null,
     withdrawalHoldGeneration: so.withdrawalHoldGeneration,
@@ -749,28 +759,70 @@ function mapLine(l: {
 // Queries
 // ---------------------------------------------------------------------------
 
-export async function getSalesOrders(
-  limit = 200,
-  opts?: { includeCompleted?: boolean }
-): Promise<SoRow[]> {
+export type SoListParams = {
+  q?: string
+  /** Comma-separated string (from the URL) or a list. Unknown values are ignored. */
+  status?: string | string[]
+  page?: number | string
+  /** Include COMPLETED / DELIVERED in the default view. */
+  showCompleted?: boolean
+  /** Include archived orders in the default view. */
+  includeArchived?: boolean
+}
+
+export type SoListResult = ListPage & {
+  rows: SoRow[]
+  /** What the current view is hiding by default; search and explicit status picks lift it. */
+  hides: SoListHidden
+  /** How many orders those hidden groups hold, so the page can say "N completed orders hidden". */
+  hiddenCompletedCount: number
+  hiddenArchivedCount: number
+  /** The search text was too short for a substring search; only exact order numbers matched. */
+  queryTooShort: boolean
+}
+
+/**
+ * One page of sales orders, searched and filtered IN THE DATABASE across every order.
+ * A search covers order number, external order number, customer name and email, tracking number
+ * and line SKU, and always includes completed and archived orders.
+ */
+export async function getSalesOrders(params: SoListParams = {}): Promise<SoListResult> {
   await requireInternalUser()
-  const where: Prisma.SalesOrderWhereInput = { archived: { not: true } }
-  if (!opts?.includeCompleted) {
-    where.status = { notIn: ['COMPLETED', 'DELIVERED'] }
+  const filter: SoListFilter = {
+    q: normaliseListQuery(params.q),
+    statuses: normaliseStatuses(params.status, SO_STATUSES),
+    showCompleted: params.showCompleted === true,
+    includeArchived: params.includeArchived === true,
   }
+  const where = buildSalesOrderListWhere(filter)
+  const hides = soListHides(filter)
+  const pageSize = ORDER_LIST_PAGE_SIZE
+  const requestedPage = normalisePage(params.page)
+  const [total, hiddenCompletedCount, hiddenArchivedCount] = await Promise.all([
+    db.salesOrder.count({ where }),
+    // Disjoint groups: archived orders are counted as archived, everything else hidden as completed.
+    hides.completed
+      ? db.salesOrder.count({
+          where: { status: { in: [...SO_COMPLETED_STATUSES] }, ...(hides.archived ? { archived: { not: true } } : {}) },
+        })
+      : Promise.resolve(0),
+    hides.archived ? db.salesOrder.count({ where: { archived: true } }) : Promise.resolve(0),
+  ])
+  const page = Math.min(requestedPage, buildListPage(1, pageSize, total).pageCount)
   const [orders, pluginState] = await Promise.all([
     db.salesOrder.findMany({
       where,
       select: SO_SELECT,
-      orderBy: { createdAt: 'desc' },
-      take: limit,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      skip: (page - 1) * pageSize,
+      take: pageSize,
     }),
     getIntegrationPluginState(),
   ])
   // Round 10, Codex HIGH 1 — `null` on a contradictory enabled set too, which clears every cached
   // chip. Showing a chip attributed to a guessed connector is worse than showing none.
   const activeWmsConnector = enabledWmsConnectorId(pluginState)
-  return orders.map((order) => {
+  const rows = orders.map((order) => {
     const row = mapSoRow(order)
     // Only surface a cached chip from the currently-active WMS connector, so
     // disabling/switching the connector clears stale chips (matching the live
@@ -780,6 +832,7 @@ export async function getSalesOrders(
     }
     return row
   })
+  return { ...buildListPage(page, pageSize, total), rows, hides, hiddenCompletedCount, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q) }
 }
 
 /**

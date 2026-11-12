@@ -2,6 +2,7 @@ import type { Metadata } from 'next'
 import { ProductLink } from '@/components/inventory/product-link'
 import { getOrganisation } from '@/app/actions/company'
 import {
+  emptyCogsReportForSourceLimit,
   getCogsReport,
   inventoryCostingFiltersForUi,
   inventoryCostingFiltersFromSearch,
@@ -17,6 +18,7 @@ import {
   boundSuffix,
   type DerivedFigureBound,
 } from '@/lib/domain/sales/derived-figure-bound'
+import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import { requireInventoryCostingReportAccess } from '@/lib/security/inventory-costing-access'
 import { formatMoneyCodeExact, moneyCodeFractionDigits } from '@/lib/utils'
 import {
@@ -88,7 +90,10 @@ export default async function CogsPage({ searchParams }: { searchParams: Promise
   const resolvedSearchParams = await searchParams
   const filters = inventoryCostingFiltersFromSearch(resolvedSearchParams)
   const [report, filterOptions, organisation] = await Promise.all([
-    getCogsReport(filters),
+    getCogsReport(filters).catch((error: unknown) => {
+      if (isSourceScanTooLargeError(error)) return emptyCogsReportForSourceLimit(filters, error)
+      throw error
+    }),
     getStockPositionFilterOptions(stockPositionSelectedFilterOptionInputs(filters)),
     getOrganisation(),
   ])

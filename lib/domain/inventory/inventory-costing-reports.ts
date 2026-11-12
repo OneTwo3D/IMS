@@ -15,7 +15,7 @@ import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { calculateInventoryTurnover, normalizeVelocityWindow } from '@/lib/domain/inventory/velocity'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly as utcDateOnly, exclusiveEndOfUtcDay, parseDateOnly as parseUtcDateOnly, subtractUtcDays } from '@/lib/domain/math/date-window'
-import { assertSourceLimit, SourceScanTooLargeError } from '@/lib/security/source-scan-error'
+import { assertSourceLimit, SourceScanTooLargeError, sourceLimitNotice } from '@/lib/security/source-scan-error'
 import { getActiveAccountingConnectorInfo, syncAccountingAccountBalanceSnapshots, getAccountingSettingsFor } from '@/lib/accounting'
 import { cache } from 'react'
 import { DISPLAY_ROUNDING_NOTICE_COGS, REFUND_BASIS_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
@@ -1852,6 +1852,30 @@ async function cogsRefundProductScope(filters: InventoryCostingFilters): Promise
   return new Set(rows.map((row) => row.id))
 }
 
+/**
+ * The COGS report when its refund-line or product-scope scan hit the row limit. Not a report of
+ * zeros: it carries the row-limit notice, which makes every layout show dashes and "not computed".
+ */
+export function emptyCogsReportForSourceLimit(filters: InventoryCostingFilters, error: SourceScanTooLargeError): CogsReport {
+  const zero = ExactFigure.zero()
+  return {
+    dateFrom: filters.dateFrom ?? daysAgo(30),
+    dateTo: filters.dateTo ?? today(),
+    generatedAt: new Date().toISOString(),
+    groupBy: isCogsGroupBy(filters.groupBy) ? filters.groupBy : 'product',
+    rows: [],
+    pageInfo: { page: 1, pageSize: filters.pageSize ?? DEFAULT_PAGE_SIZE, totalRows: 0, totalPages: 1, hasNextPage: false, hasPreviousPage: false },
+    totals: {
+      qty: zero, cogsBase: zero, revenueBase: zero, revenueBaseBound: 'exact', grossMarginBase: zero, grossMarginBaseBound: 'exact',
+      refundsNetBasis: zero, refundsGrossBasis: zero, refundsUnknownBasis: zero,
+      refundsUnattributedNetBasis: zero, refundsUnattributedGrossBasis: zero, refundsUnattributedUnknownBasis: zero,
+      refundsOutsideReportNetBasis: zero, refundsOutsideReportGrossBasis: zero, refundsOutsideReportUnknownBasis: zero,
+      revenueCapturedRows: 0, glBalanceBase: null, glVarianceBase: null,
+    },
+    notices: [sourceLimitNotice(error)],
+  }
+}
+
 export async function getCogsReport(filters: InventoryCostingFilters = {}, options: ReportOptions = {}): Promise<CogsReport> {
   const dateFrom = filters.dateFrom ?? daysAgo(30)
   const dateTo = filters.dateTo ?? today()
@@ -2050,7 +2074,7 @@ export function assertInventoryTurnoverSourceLimit(rowCount: number, limit: numb
   throw new InventoryTurnoverSourceLimitError(source, rowCount, limit)
 }
 
-export function emptyInventoryTurnoverReportForSourceLimit(filters: InventoryCostingFilters, error: InventoryTurnoverSourceLimitError): InventoryTurnoverReport {
+export function emptyInventoryTurnoverReportForSourceLimit(filters: InventoryCostingFilters, error: SourceScanTooLargeError): InventoryTurnoverReport {
   const dateFrom = filters.dateFrom ?? daysAgo(90)
   const dateTo = filters.dateTo ?? today()
   const window = normalizeVelocityWindow({ dateFrom, dateTo })
@@ -2077,7 +2101,7 @@ export function emptyInventoryTurnoverReportForSourceLimit(filters: InventoryCos
       cogsEntryCount: 0,
       snapshotDayCount: 0,
     },
-    notices: [error.message],
+    notices: [sourceLimitNotice(error)],
   }
 }
 

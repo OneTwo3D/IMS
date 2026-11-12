@@ -5,7 +5,7 @@ import { db } from '@/lib/db'
 import { roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, elapsedDaysDecimal, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay, subtractUtcDays } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
-import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
+import { SourceScanTooLargeError, assertSourceLimit, sourceLimitNotice } from '@/lib/security/source-scan-error'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -301,7 +301,7 @@ export function emptyPurchasingAnalyticsReportForSourceLimit<Row>(
     rows: [],
     pageInfo: pageInfo(0, filters.page, pageSize),
     totals,
-    notices: [error.message],
+    notices: [sourceLimitNotice(error)],
   }
 }
 
