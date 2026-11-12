@@ -1307,7 +1307,7 @@ test('AMEND, a merge done in the warehouse AFTER the order post: the identity is
   await withEnv(OFF, async () => {
     resetFake()
     fake.orders.set('4242', { status: 1, number: 'WC-1001', items: [{ ID: 7001, SKU: 'SKU-1', Quantity: 1 }, { ID: 7002, SKU: 'SKU-1', Quantity: 3 }, { ID: 7101, SKU: 'OTHER-ORDER', Quantity: 2 }], merged: false })
-    fake.mergeFromDetailRead = 2 // the first read (the gate) is clean; the re-check sees the flag
+    fake.mergeFromDetailRead = 3 // reads 1 (early) and 2 (just before the POST) are clean; the re-check before the items sees the flag
     const { updateMintsoftOrder } = await import('../lib/connectors/mintsoft/api/order-push.ts')
     const result = await updateMintsoftOrder('4242', INPUT)
     assert.equal(result.updated, false)
@@ -1326,5 +1326,34 @@ test('AMEND CONTROL: with no merge the re-check passes and the item reconcile ru
     const result = await updateMintsoftOrder('4242', INPUT)
     assert.equal(result.updated, true)
     assert.ok(fake.requests.some((r) => r.path.includes('/Items') && r.method !== 'GET'), 'the duplicate lines were consolidated')
+  })
+})
+
+// ---------------------------------------------------------------- 20. review round 15 -----------------------------------------------
+
+test('AMEND, a merge done in the warehouse BETWEEN the early read and the order POST: the gating read adjacent to the POST sees it, so there is NO header write and NO item write, and the refusal is returned', async () => {
+  await withEnv(OFF, async () => {
+    resetFake()
+    fake.orders.set('4242', { status: 1, number: 'WC-1001', items: [{ ID: 7001, SKU: 'SKU-1', Quantity: 1 }, { ID: 7002, SKU: 'SKU-1', Quantity: 3 }, { ID: 7101, SKU: 'OTHER-ORDER', Quantity: 2 }], merged: false })
+    fake.mergeFromDetailRead = 2 // the early read is clean; the read adjacent to the POST sees the flag
+    const { updateMintsoftOrder } = await import('../lib/connectors/mintsoft/api/order-push.ts')
+    const result = await updateMintsoftOrder('4242', INPUT)
+    assert.equal(result.updated, false)
+    assert.equal(result.status, 'MERGED_SURVIVOR')
+    assert.deepEqual(writeRequests(), [], 'no header write and no item write of any kind')
+    assert.equal(fake.orders.get('4242')!.items.length, 3)
+  })
+})
+
+test('AMEND: the gating read is the one adjacent to the POST (no request between the read and the POST)', async () => {
+  await withEnv(OFF, async () => {
+    resetFake()
+    fake.orders.set('4242', { status: 1, number: 'WC-1001', items: [{ ID: 7001, SKU: 'SKU-1', Quantity: 1 }, { ID: 7002, SKU: 'SKU-1', Quantity: 3 }], merged: false })
+    const { updateMintsoftOrder } = await import('../lib/connectors/mintsoft/api/order-push.ts')
+    await updateMintsoftOrder('4242', INPUT)
+    const seq = fake.requests.map((r) => `${r.method} ${r.path}`)
+    const post = seq.indexOf('POST /api/Order/4242')
+    assert.ok(post > 0)
+    assert.equal(seq[post - 1], 'GET /api/Order/4242', 'the request immediately before the header POST is the identity read')
   })
 })

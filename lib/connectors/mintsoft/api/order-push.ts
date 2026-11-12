@@ -961,7 +961,17 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
   }
   const courierFormName = input.courierService
   let form: 'NAME' | 'LEGACY' | 'PLACEHOLDER' = input.courierPlaceholder || firstCourier.kind === 'defaultId' ? 'PLACEHOLDER' : 'NAME'
-  let data = await post(buildPushPayload(input, firstCourier, false))
+  // THE GATING READ FOR THE HEADER WRITE: the identity is verified immediately before the order POST (settings, the courier choice and the
+  // body are all prepared first; nothing else is awaited between this read and the POST). The earlier read above only decides
+  // NOT_FOUND / NOT_NEW and the first refusal. IMS verifies the warehouse order's identity immediately before EACH write phase (header POST,
+  // item changes, cancel/hold, removal). ACCEPTED INTER-SYSTEM LIMIT: a merge performed in Mintsoft within the single request round-trip
+  // between a verification and its write cannot be detected by IMS.
+  const firstBody = buildPushPayload(input, firstCourier, false)
+  const preWrite = await fetchMintsoftOrderStatusId(externalOrderId, clientId, input.orderNumber)
+  if (!preWrite.found) return { updated: false, status: 'NOT_FOUND' }
+  const preWriteRefusal = amendmentIdentityRefusal(preWrite.identity, preWrite.orderNumber)
+  if (preWriteRefusal) return preWriteRefusal
+  let data = await post(firstBody)
   // The same rule as the create (one shared helper). An order the create already moved to the legacy form arrives with no
   // key left, so there is nothing further to retry.
   const retry = data?.Success === false ? legacyCourierRetry(input, courierMap, data, toStr(data.Message)) : null
@@ -995,8 +1005,8 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
     // carries what the accepted post did (see WmsOrderUpdatePartialError) and the order stays due for the items to be redone.
     // RE-CHECK THE IDENTITY immediately before the items are planned (after the order post and the courier retries): a merge done in
     // Mintsoft since the first read would make the item diff delete the other order's lines. Only OK proceeds; anything else is the same
-    // refusal as above with NO item write. ACCEPTED LIMIT: a merge performed in Mintsoft between THIS read and the item writes (about one
-    // request round-trip) cannot be detected by IMS; it is not re-checked before every single item write.
+    // refusal as above with NO item write. ACCEPTED INTER-SYSTEM LIMIT: a merge performed in Mintsoft within the single request round-trip between
+    // this verification and the item writes cannot be detected by IMS (see the header write above).
     const recheck = await fetchMintsoftOrderStatusId(externalOrderId, clientId, input.orderNumber)
     if (!recheck.found) return { updated: false, status: 'NOT_FOUND' }
     const lateRefusal = amendmentIdentityRefusal(recheck.identity, recheck.orderNumber)
