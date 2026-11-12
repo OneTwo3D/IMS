@@ -1013,7 +1013,7 @@ test('[eu vat] a hold with a positive discount where ONLY the order default rate
 })
 
 // A LEGACY hold: parked with the switch OFF (no treatment marker), then the switch comes on and the order is delivered again.
-async function legacyDomesticHold(t: test.TestContext, changeTotal: boolean) {
+async function legacyDomesticHold(t: test.TestContext, changeTotal: boolean, mutate?: (p: ReturnType<typeof domesticPayload>) => void) {
   const db = await loadDb()
   await mockAccounting()
   switchOn = false
@@ -1033,6 +1033,7 @@ async function legacyDomesticHold(t: test.TestContext, changeTotal: boolean) {
   const again = domesticPayload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...extra])
   // Only the tax charged and the order total move: the net lines, the shipping and every tax type are as they were.
   if (changeTotal) { again.shipping_lines[0]!.total_tax = '3.00'; again.tax_lines[0]!.shipping_tax_total = '3.00'; again.total = '133.00'; again.total_tax = '23.00' }
+  if (mutate) mutate(again)
   await importWcOrder(again as never)
   return { after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }), rows: await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId } }) }
 }
@@ -1201,4 +1202,77 @@ test('[eu vat] an UNTREATED hold marked order_changed by a concurrent import bet
   const after = await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } })
   assert.equal(after.status, 'PENDING')
   assert.deepEqual(((after.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment), { applied: false, reason: 'order_changed' }, 'the order_changed marker was not overwritten')
+})
+
+// MUTATION-PASS SURVIVORS KILLED.
+test('[eu vat] a LEGACY (untreated) hold where only the payment method changes (nothing the per-fact checks list) is refused by the fresh build', { skip }, async (t) => {
+  const { after, rows } = await legacyDomesticHold(t, false, (p) => { p.payment_method = 'stripe' })
+  assert.equal(rows.length, 0)
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /at _paymentMethod/)
+})
+
+test('[eu vat] a hold already marked order_changed stays order_changed and is not released even when the order is back to what was parked', { skip }, async (t) => {
+  const { after, rows } = await domesticHoldMutated(t, null, async (db, orderId) => {
+    const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+    const row = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+    const p = row.payload as unknown as { accountingPayload: Record<string, unknown> }
+    await db.shoppingSyncLog.update({ where: { id: row.id }, data: { payload: { ...p, accountingPayload: { ...p.accountingPayload, _euVatTreatment: { applied: false, reason: 'order_changed' } } } as never, errorMessage: 'the order changed after it was held' } })
+  })
+  assert.equal(rows.length, 0, 'nothing was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.deepEqual(((after.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment), { applied: false, reason: 'order_changed' })
+})
+
+test('[eu vat] RACE: a concurrent rewrite of the untreated hold that does NOT mark it (here its payment method) is not overwritten by the replacement and nothing is queued', { skip }, async (t) => {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = false
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seed(db, wcRateId)
+  t.after(async () => { switchOn = false; betweenHook.armed = false; betweenHook.verified = false; betweenHook.run = null; await cleanup(db, externalId, ctx) })
+  assert.equal((await importWcOrder(payload(externalId, wcRateId, PLUGIN('821')) as never)).success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  switchOn = true
+  betweenHook.verified = false
+  betweenHook.armed = true
+  betweenHook.run = async () => {
+    const current = await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } })
+    const p = current.payload as unknown as { accountingPayload: Record<string, unknown> }
+    await db.shoppingSyncLog.update({ where: { id: held.id }, data: { payload: { ...p, accountingPayload: { ...p.accountingPayload, _paymentMethod: 'stripe' } } as never } })
+  }
+  await importWcOrder(payload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...PLUGIN('821')]) as never)
+  assert.equal(betweenHook.run, null, 'the concurrent write happened between the verification and the replacement')
+  assert.equal(await db.accountingSyncLog.count({ where: { type: 'SALES_INVOICE', referenceId: orderId } }), 0, 'nothing was enqueued')
+  const after = await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } })
+  assert.equal(after.status, 'PENDING')
+  assert.equal((after.payload as unknown as { accountingPayload: Record<string, unknown> }).accountingPayload._paymentMethod, 'stripe', 'the concurrent version was not replaced')
+})
+
+test('[eu vat] the SWEEP never releases a treated hold that carries the not-totalling stamp', { skip }, async (t) => {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = true
+  const { importWcOrder, retryHeldWcSalesInvoiceReleases } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seed(db, wcRateId)
+  t.after(async () => { switchOn = false; await cleanup(db, externalId, ctx) })
+  assert.equal((await importWcOrder(payload(externalId, wcRateId, PLUGIN('821')) as never)).success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  const p = held.payload as unknown as { accountingPayload: Record<string, unknown> }
+  assert.equal((p.accountingPayload._euVatTreatment as { applied: boolean }).applied, true)
+  await db.shoppingSyncLog.update({ where: { id: held.id }, data: { payload: { ...p, accountingPayload: { ...p.accountingPayload, _taxUnreconciled: { reason: 'a stamped hold' } } } as never } })
+  await db.salesOrder.update({ where: { id: orderId }, data: { invoiceNumber: `INV-${externalId}` } })
+  await retryHeldWcSalesInvoiceReleases()
+  assert.equal(await db.accountingSyncLog.count({ where: { type: 'SALES_INVOICE', referenceId: orderId } }), 0, 'nothing was queued')
+  const after = await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } })
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /does not total the order/)
 })

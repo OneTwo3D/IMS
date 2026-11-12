@@ -356,3 +356,38 @@ test('a positive shipping or order-discount amount with no account code refuses 
   // A zero amount with no account is nothing to drop.
   assert.ok(applyEuVatTreatment({ ...base(), shippingAmount: 0, shippingAccountCode: '', shippingTaxType: 'X' }, plan('119.00')).ok)
 })
+
+// MUTATION-PASS SURVIVORS KILLED: the rounding allowance is exactly one minor unit per component, capped at ten, and a refused regime is refused by name.
+test('rounding allowance: exactly the component count is accepted, one minor unit more is refused', () => {
+  const de = schemeRows.find((r) => r.country === 'DE')!
+  const built = build(de, { goodsSubtotal: '100.00' })
+  const { plan } = route(built)
+  // goods + fee + the VAT line, shipping and discount: five components, so 0.05 is the most rounding can explain.
+  const at = applyEuVatTreatment(built.payload, { ...plan, orderTotal: D(plan.orderTotal).plus('0.05').toString() })
+  assert.ok(at.ok, at.ok ? '' : at.reason)
+  const over = applyEuVatTreatment(built.payload, { ...plan, orderTotal: D(plan.orderTotal).plus('0.06').toString() })
+  assert.equal(over.ok, false)
+  assert.match(over.ok ? '' : over.reason, /more than rounding explains/)
+})
+
+test('rounding allowance: capped at ten minor units however many lines there are', () => {
+  const de = schemeRows.find((r) => r.country === 'DE')!
+  const built = build(de, { goodsSubtotal: '100.00' })
+  const { plan } = route(built)
+  const extra = Array.from({ length: 8 }, (_, i) => ({ description: `Free item ${i}`, quantity: 1, unitAmount: 0, accountCode: '200', taxType: CHARGED, taxRateId: 'ims-rate', taxRateBasis: 'sales_line' }) as TreatableLine)
+  const payload = { ...built.payload, lines: [...built.payload.lines, ...extra] }
+  const many = { ...plan, lineKinds: [...plan.lineKinds, ...extra.map(() => 'goods' as TreatedLineKind)], lineTax: [...plan.lineTax, ...extra.map(() => '0')] }
+  const ten = applyEuVatTreatment(payload, { ...many, orderTotal: D(plan.orderTotal).plus('0.10').toString() })
+  assert.ok(ten.ok, ten.ok ? '' : ten.reason)
+  const eleven = applyEuVatTreatment(payload, { ...many, orderTotal: D(plan.orderTotal).plus('0.11').toString() })
+  assert.equal(eleven.ok, false, 'thirteen components would allow 0.13 without the cap')
+  assert.match(eleven.ok ? '' : eleven.reason, /more than rounding explains/)
+})
+
+test('a regime decision of REFUSE is refused by its own reason, not by the generic scheme mismatch', () => {
+  const de = schemeRows.find((r) => r.country === 'DE')!
+  const built = build(de, { goodsSubtotal: '100.00' })
+  const routed = routeFor({ regime: null, vatAccount: null, stampedAt: new Date('2026-11-01T00:00:00Z') }, { kind: 'REFUSE', reason: 'the facts conflict', code: 'x' } as never, built.input)
+  assert.equal(routed.ok, false)
+  assert.match(routed.ok ? '' : routed.reason, /EU VAT regime cannot be established: the facts conflict/)
+})
