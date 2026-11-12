@@ -3877,7 +3877,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
 
       // THE EU IOSS / VOEC / DDP TREATMENT (lib/domain/accounting/eu-vat-treatment.ts), applied to the finished payload BEFORE it is queued or parked for a missing invoice number, so a
       // released hold carries the same lines a queued one does. While the Sales Invoices switch is OFF this is skipped before it reads or writes anything and the payload is exactly what it was.
-      // A refusal stamps the document with the reason (the existing `_taxUnreconciled` path): the poster refuses it, no payment is registered, and the row is visible on /sync.
+      // A refusal is never queued: the original payload is parked below as a held invoice (applied:false, reason treatment_refused) and the activity log records the refusal; a re-import after the cause is fixed retries the treatment and releases it.
       const euVatOutcome = await treatImportedSalesInvoice({
         orderId: so.id,
         wcOrder,

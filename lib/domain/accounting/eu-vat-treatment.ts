@@ -14,8 +14,8 @@
  *
  * THE INVARIANT. On the scheme and B2B routes every line is on a zero-rated type or on NONE, so Xero adds no tax and the document's total is exactly the sum of its lines. That total must equal the
  * order's total to the minor unit. A difference within a few minor units is rounding and posts to the rounding account (860 "Rounding", owner ruling Q7) as one line named `rounding-difference`; any other
- * difference, a missing account, an unreadable figure, or a second line on the VAT account refuses. A refusal returns the reason; the caller stamps the document with it (`_taxUnreconciled`) so the poster
- * refuses it on the existing path. Nothing here sends a tax amount: no line carries one.
+ * difference, a missing account, an unreadable figure, or a second line on the VAT account refuses. A refusal returns the reason; the importer never queues the invoice: it parks the original payload as a held invoice
+ * with the reason, and a re-import after the cause is fixed retries the treatment and releases it. Nothing here sends a tax amount: no line carries one.
  *
  * Every line that is re-typed also loses its rate binding (`taxRateId`, `shippingTaxRateId`, `discountTaxRateId` and their bases): the binding says "this code was read from that rate", which is no longer true.
  */
