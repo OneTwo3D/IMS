@@ -325,9 +325,9 @@ test('Currency Summary carries the bound of an unplaceable credit in the row, th
   assert.equal(report.rows[0]!.arOutstandingBound, 'upper')
   assert.equal(report.totals.arOutstandingBound, 'upper')
   assert.ok(report.notices.some((n) => /1 receivable.*could not be placed/.test(n)))
-  // The CSV: the export route's own column list (read from its source, since the route needs the real db) applied to the rows.
+  // The CSV: the export route's own column list (the EXPORT_COLUMNS entry, read from its source, since the route needs the real db) applied to the rows.
   const routeSource = readFileSync(path.join(process.cwd(), 'app/api/export/finance-analytics/route.ts'), 'utf8')
-  const listed = /case 'currency-summary': \{[\s\S]*?toCsv\(report\.rows, \[([^\]]*)\]/.exec(routeSource)?.[1]
+  const listed = /EXPORT_COLUMNS[^=]*=\s*\{[\s\S]*?'currency-summary': \[([^\]]*)\]/.exec(routeSource)?.[1]
   assert.ok(listed, 'found the currency-summary column list in the export route')
   const columns = listed!.split(',').map((c) => c.trim().replace(/'/g, ''))
   assert.ok(columns.includes('arOutstandingBound'), 'the export lists the bound column')

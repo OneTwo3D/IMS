@@ -10,7 +10,16 @@ import {
   type PurchasingAnalyticsFilters,
 } from '@/lib/domain/purchasing/purchasing-analytics'
 import { canAccessPurchasingAnalytics } from '@/lib/security/purchasing-analytics-access'
-import { isSourceScanTooLargeError, sourceLimitExportBody } from '@/lib/security/source-scan-error'
+import { sourceLimitCsvResponse } from '@/lib/csv-source-limit'
+import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
+
+const EXPORT_COLUMNS: Record<string, string[]> = {
+  'open-pos': ['reference', 'supplierName', 'status', 'poSentAt', 'expectedDelivery', 'overdue', 'daysSinceSent', 'outstandingQty', 'outstandingValueBase'],
+  'supplier-performance': ['supplierName', 'receiptCount', 'onTimeReceiptCount', 'expectedReceiptCount', 'onTimeRatePct', 'orderedQty', 'receivedQty', 'qtyVariance', 'qtyVariancePct', 'returnedQty', 'returnRatePct', 'averageActualLeadTimeDays', 'averageConfiguredLeadTimeDays', 'averageRfqResponseDays'],
+  'ppv': ['supplierName', 'sku', 'productName', 'categoryName', 'poReference', 'receivedAt', 'qty', 'actualLandedUnitCostBase', 'referenceUnitCostBase', 'variancePerUnitBase', 'varianceTotalBase', 'variancePct', 'referencePriceSource'],
+  'spend': ['period', 'supplierName', 'categoryName', 'poCount', 'spendBase'],
+  'lead-times': ['supplierName', 'sku', 'productName', 'receiptCount', 'averageLeadTimeDays', 'p50LeadTimeDays', 'p95LeadTimeDays', 'configuredLeadTimeDays', 'latestReceiptAt'],
+}
 
 const PURCHASING_ANALYTICS_CSV_ROW_LIMIT = 50000
 
@@ -57,37 +66,37 @@ export async function GET(req: NextRequest) {
       const report = await getOpenPurchaseOrdersReport({ ...filters, pageSize: PURCHASING_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['reference', 'supplierName', 'status', 'poSentAt', 'expectedDelivery', 'overdue', 'daysSinceSent', 'outstandingQty', 'outstandingValueBase']), `open-pos-${date}.csv`)
+      return csvResponse(toCsv(report.rows, EXPORT_COLUMNS['open-pos']), `open-pos-${date}.csv`)
     }
     case 'supplier-performance': {
       const report = await getSupplierPerformanceReport({ ...filters, pageSize: PURCHASING_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['supplierName', 'receiptCount', 'onTimeReceiptCount', 'expectedReceiptCount', 'onTimeRatePct', 'orderedQty', 'receivedQty', 'qtyVariance', 'qtyVariancePct', 'returnedQty', 'returnRatePct', 'averageActualLeadTimeDays', 'averageConfiguredLeadTimeDays', 'averageRfqResponseDays']), `supplier-performance-${date}.csv`)
+      return csvResponse(toCsv(report.rows, EXPORT_COLUMNS['supplier-performance']), `supplier-performance-${date}.csv`)
     }
     case 'ppv': {
       const report = await getPurchasePriceVarianceReport({ ...filters, pageSize: PURCHASING_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['supplierName', 'sku', 'productName', 'categoryName', 'poReference', 'receivedAt', 'qty', 'actualLandedUnitCostBase', 'referenceUnitCostBase', 'variancePerUnitBase', 'varianceTotalBase', 'variancePct', 'referencePriceSource']), `ppv-${date}.csv`)
+      return csvResponse(toCsv(report.rows, EXPORT_COLUMNS['ppv']), `ppv-${date}.csv`)
     }
     case 'spend': {
       const report = await getSpendReport({ ...filters, pageSize: PURCHASING_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['period', 'supplierName', 'categoryName', 'poCount', 'spendBase']), `spend-${date}.csv`)
+      return csvResponse(toCsv(report.rows, EXPORT_COLUMNS['spend']), `spend-${date}.csv`)
     }
     case 'lead-times': {
       const report = await getLeadTimeReport({ ...filters, pageSize: PURCHASING_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['supplierName', 'sku', 'productName', 'receiptCount', 'averageLeadTimeDays', 'p50LeadTimeDays', 'p95LeadTimeDays', 'configuredLeadTimeDays', 'latestReceiptAt']), `lead-times-${date}.csv`)
+      return csvResponse(toCsv(report.rows, EXPORT_COLUMNS['lead-times']), `lead-times-${date}.csv`)
     }
     default:
       return NextResponse.json({ error: 'Unknown purchasing analytics export type' }, { status: 400 })
     }
   } catch (error) {
-    if (isSourceScanTooLargeError(error)) return NextResponse.json(sourceLimitExportBody(error), { status: 413 })
+    if (isSourceScanTooLargeError(error)) return sourceLimitCsvResponse(error, EXPORT_COLUMNS[reportType] ?? [], `${reportType}-${date}.csv`)
     throw error
   }
 }

@@ -42,7 +42,7 @@ function input(goods: string, over: Partial<EuVatRegimeInput> = {}): EuVatRegime
     rates: [{ wooRateId: 216, tax: '19.00', mapping: { state: 'mapped', imsRateId: 'r', name: 'DE VAT', active: true, countryCode: 'DE', rate: '0.19', reportingCategory: 'IOSS', schemePostingTaxType: 'TAX131' } }],
     orderTax: '19.00', vatExempt: 'no', vatRecord: { state: 'absent' }, eas: { state: 'absent' },
     thresholdFx: { state: 'ok', rate: '1', sameCurrency: true, asOf: '2026-11-01T00:00:00.000Z', source: 'same currency' },
-    accounts: { ioss: '821', ddp: '232' }, pluginVatAccount: null, overThresholdDutyFee: false, ...over,
+    accounts: { ioss: '821', ddp: '232' }, pluginVatAccount: null, overThresholdDutyFee: false, giftCardFlag: 'off', ...over,
   }
 }
 
@@ -117,6 +117,19 @@ test('a refusal stamps nothing, and the order is decided afresh once what it lac
     assert.deepEqual([untouched.euVatRegime, untouched.euVatLineAccount, untouched.euVatRegimeStampedAt, untouched.euVatRegimeBasis], [null, null, null, null])
     const ok = await db.$transaction((tx) => stampEuVatRegime(tx, id, () => input('100.00'), NOW))
     assert.equal(ok.kind, 'stamped')
+  } finally {
+    await db.salesOrder.delete({ where: { id } })
+  }
+})
+
+test('after the gift-card cut-in an unflagged order is refused and nothing is stamped', { skip }, async () => {
+  const { db, stampEuVatRegime } = await setup()
+  const id = await seedOrder(db)
+  try {
+    const refused = await db.$transaction((tx) => stampEuVatRegime(tx, id, () => input('100.00', { giftCardFlag: 'required', goodsLines: [{ total: '100.00', voucher: 'no', voucherStrict: 'unknown' }] }), NOW))
+    assert.equal(refused.kind === 'refused' && refused.code, 'gift_card_flag_missing')
+    const row = await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { euVatRegime: true, euVatLineAccount: true, euVatRegimeStampedAt: true, euVatRegimeBasis: true } })
+    assert.deepEqual([row.euVatRegime, row.euVatLineAccount, row.euVatRegimeStampedAt, row.euVatRegimeBasis], [null, null, null, null])
   } finally {
     await db.salesOrder.delete({ where: { id } })
   }

@@ -18,14 +18,14 @@ import type {
   EasFact, EuVatRegimeInput, EuVatRegimeMode, GoodsLineFact, PluginFxFact, RateFact, RateMappingFact, ThresholdFxFact, VatRecordFact,
 } from '@/lib/domain/accounting/eu-vat-regime'
 import { normaliseDestination } from '@/lib/domain/accounting/eu-vat-regime'
-import { EU_VAT_REGIME_MODE_SETTING, parseRegimeMode } from '@/lib/domain/accounting/eu-vat-settings'
+import { EU_VAT_GIFT_CARD_CUT_IN_SETTING, EU_VAT_REGIME_MODE_SETTING, parseGiftCardCutIn, parseRegimeMode, parseStrictIsoInstant, type GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
 import { getSettingValues } from '@/lib/settings-store'
 import { readWclcFeeKind, wcMetaFlag } from './field-mapping'
 import { parseWcGmtInstant } from './receipt-settlement-rate'
 import type { WcFullOrder, WcMeta } from './types'
 
 /** What the pure half reads; everything the database adds is separate. */
-export type WcEuVatFacts = Omit<EuVatRegimeInput, 'rates' | 'thresholdFx' | 'accounts' | 'mode'> & {
+export type WcEuVatFacts = Omit<EuVatRegimeInput, 'rates' | 'thresholdFx' | 'accounts' | 'mode' | 'giftCardFlag'> & {
   /** WooCommerce rate ids that carry a non-zero tax amount, with the tax summed over items, shipping and fees, in the order currency. */
   rateTax: Array<{ wooRateId: number; tax: string }>
 }
@@ -133,13 +133,21 @@ function readFalsyFlag(value: unknown): boolean {
   return typeof value === 'string' && ['no', '0', 'false', ''].includes(value.trim().toLowerCase())
 }
 
+/** The gift-card flag read STRICTLY: exactly the text `yes` or `no`, nothing else (not empty, not whitespace, not 0/false/1, not a boolean). Used for the cut-in; the lenient reading above is kept for orders before it. */
+function readStrictFlag(value: unknown): 'yes' | 'no' | 'unknown' {
+  return value === 'yes' ? 'yes' : value === 'no' ? 'no' : 'unknown'
+}
+
 export function readGoodsLines(order: Pick<WcFullOrder, 'line_items'>, problems: string[] = []): GoodsLineFact[] {
   return order.line_items.map((line, index) => {
-    const flag = (line.meta_data ?? []).find((entry) => entry.key === '_o3d_is_voucher')
+    // EVERY entry for the key is read: WooCommerce meta may hold the key more than once. Entries that read differently (yes and no, or a readable one beside an unreadable one) make the flag unknown, never first-wins.
+    const entries = (line.meta_data ?? []).filter((entry) => entry.key === '_o3d_is_voucher')
+    const lenient = (value: unknown): 'yes' | 'no' | 'unknown' => (wcMetaFlag(value) ? 'yes' : readFalsyFlag(value) ? 'no' : 'unknown')
+    const agree = (readings: Array<'yes' | 'no' | 'unknown'>): 'yes' | 'no' | 'unknown' => (readings.length > 0 && readings.every((r) => r === readings[0]) ? readings[0]! : 'unknown')
     const total = decimalText(line.total)
     if (total === null) problems.push(`goods line ${index + 1} (id ${String(line.id)}) has an unreadable total`)
     // Only the line's own flag is read. The product-level marker (`_coupon_title`) is not on the order and IMS imports no product meta, so a line with no (or an unreadable) flag is unknown and the resolver decides what that means.
-    return { total: total ?? '0', voucher: flag === undefined ? 'unknown' : wcMetaFlag(flag.value) ? 'yes' : readFalsyFlag(flag.value) ? 'no' : 'unknown' }
+    return { total: total ?? '0', voucherStrict: agree(entries.map((e) => readStrictFlag(e.value))), voucher: agree(entries.map((e) => lenient(e.value))) }
   })
 }
 
@@ -257,6 +265,28 @@ export async function readEuVatRegimeMode(): Promise<EuVatRegimeMode | null> {
   return parseRegimeMode(values.get(EU_VAT_REGIME_MODE_SETTING))
 }
 
+/** The gift-card flag cut-in as stored: unset, a date, or invalid (never coerced). */
+export async function readGiftCardFlagCutIn(): Promise<GiftCardCutIn> {
+  const values = await getSettingValues([EU_VAT_GIFT_CARD_CUT_IN_SETTING])
+  return parseGiftCardCutIn(values.get(EU_VAT_GIFT_CARD_CUT_IN_SETTING))
+}
+
+/**
+ * The instant the cut-in is compared with: `date_created_gmt` ONLY. `date_created` is in the store's local time and IMS does not store the store timezone, so it is never converted or guessed: with no
+ * readable GMT date the result is an invalid Date, which `giftCardFlagPolicy` turns into `setting_unreadable` (a refusal) when a cut-in is set.
+ */
+export function giftCardOrderedAt(order: Pick<WcFullOrder, 'date_created_gmt'>): Date {
+  const gmt = (order.date_created_gmt ?? '').toString().trim()
+  return parseStrictIsoInstant(gmt, { dateOnly: false, assumeUtc: true }) ?? new Date(Number.NaN)
+}
+
+/** Whether the order must carry the gift-card flag on every line: it was created at or after the cut-in. An unset cut-in is `off`; an invalid one, or a set one with no readable order date, is `setting_unreadable`. */
+export function giftCardFlagPolicy(cutIn: GiftCardCutIn, orderedAt: Date): 'off' | 'required' | 'setting_unreadable' {
+  if (cutIn.state === 'unset') return 'off'
+  if (cutIn.state === 'invalid' || Number.isNaN(orderedAt.getTime())) return 'setting_unreadable'
+  return orderedAt.getTime() >= cutIn.at.getTime() ? 'required' : 'off'
+}
+
 export type EuVatRegimeInputClient = MappingClient & FxLookupClient
 
 /** The resolver's whole input for a WooCommerce order. `accounts` are the configured VAT account codes (Xero account roles). */
@@ -264,7 +294,7 @@ export async function buildEuVatRegimeInput(
   client: EuVatRegimeInputClient,
   order: WcFullOrder,
   accounts: { ioss: string | null; ddp: string | null },
-  options: { baseCurrency?: string; mode?: EuVatRegimeMode } = {},
+  options: { baseCurrency?: string; mode?: EuVatRegimeMode; giftCardCutIn: GiftCardCutIn },
 ): Promise<EuVatRegimeInput> {
   const facts = readWcEuVatFacts(order)
   const mappings = await loadRateMappings(client, facts.rateTax.map((r) => r.wooRateId))
@@ -276,5 +306,25 @@ export async function buildEuVatRegimeInput(
     : await resolveThresholdFx(client, { currency: facts.currency, destination, orderedAt, baseCurrency: options.baseCurrency })
   const { rateTax: _rateTax, ...rest } = facts
   void _rateTax
-  return { ...rest, mode: options.mode ?? 'adopt_plugin', rates, thresholdFx, accounts }
+  return { ...rest, mode: options.mode ?? 'adopt_plugin', rates, thresholdFx, accounts, giftCardFlag: giftCardFlagPolicy(options.giftCardCutIn, giftCardOrderedAt(order)) }
+}
+
+/**
+ * The production entry: reads the gift-card cut-in setting itself and passes its parsed state to `buildEuVatRegimeInput` explicitly. A setting that cannot be read (the read throws) is an invalid cut-in, which refuses the order
+ * (`gift_card_cut_in_unreadable`); it is never treated as unset.
+ */
+export async function buildEuVatRegimeInputFromSettings(
+  client: EuVatRegimeInputClient,
+  order: WcFullOrder,
+  accounts: { ioss: string | null; ddp: string | null },
+  options: { baseCurrency?: string; mode?: EuVatRegimeMode } = {},
+  readCutIn: () => Promise<GiftCardCutIn> = readGiftCardFlagCutIn,
+): Promise<EuVatRegimeInput> {
+  let giftCardCutIn: GiftCardCutIn
+  try {
+    giftCardCutIn = await readCutIn()
+  } catch {
+    giftCardCutIn = { state: 'invalid', raw: 'setting could not be read' }
+  }
+  return buildEuVatRegimeInput(client, order, accounts, { ...options, giftCardCutIn })
 }
