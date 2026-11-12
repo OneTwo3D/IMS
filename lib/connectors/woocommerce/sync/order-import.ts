@@ -56,10 +56,11 @@ import {
 import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { rateBinding, resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
-import { previewTreatedSalesInvoice, regimePolicyOf, treatImportedSalesInvoice, type RegimePolicy } from './eu-vat-invoice-treatment'
+import { previewTreatedSalesInvoice, treatImportedSalesInvoice } from './eu-vat-invoice-treatment'
+import { regimePolicyProblem, type RegimePolicy } from '@/lib/domain/accounting/eu-vat-regime-policy'
 import { heldFreshBuildDifference, heldInvoiceDifference, heldTaxBindingDifference, heldUntreatedTaxDifference, type ExpectedHeldInvoice } from './held-invoice-verification'
 import { currentWcTaxBinding, recordWcTaxBinding } from './wc-tax-binding'
-import { buildEuVatRegimeInputFromSettings, readEuVatRegimeMode, readGiftCardFlagCutIn } from './eu-vat-facts'
+import { buildEuVatRegimeInputFromSettings, readEuVatRegimeMode } from './eu-vat-facts'
 import { resolveEuVatRegime } from '@/lib/domain/accounting/eu-vat-regime'
 import { readEuVatRegimeStamp } from '@/lib/domain/accounting/eu-vat-regime-stamp'
 import { EU_VAT_TREATMENT_PAYLOAD_KEY, routeFor } from '@/lib/domain/accounting/eu-vat-treatment'
@@ -1831,15 +1832,6 @@ type HeldRecheck = (tx: Prisma.TransactionClient) => Promise<{ ok: true; held: H
  * THE REGIME POLICY A TREATED HOLD WAS PARKED UNDER: every setting `buildEuVatRegimeInputFromSettings` and the treatment read to decide the regime (the regime mode, the gift-card flag cut-in, the IOSS and DDP accounts), recorded on the hold's treatment marker.
  * The scheduled sweep has no WooCommerce order and cannot re-verify, so it fails closed: it releases a treated hold only if the policy now in force equals the recorded one, otherwise the hold stays PENDING and a re-import (which re-verifies against the order) decides.
  */
-async function currentRegimePolicy(): Promise<RegimePolicy> {
-  const { getAccountingSettings } = await import('@/lib/accounting')
-  const [mode, cutIn, settings] = await Promise.all([
-    readEuVatRegimeMode().catch(() => null),
-    readGiftCardFlagCutIn().catch(() => ({ state: 'invalid' as const, raw: 'setting could not be read' })),
-    getAccountingSettings(),
-  ])
-  return regimePolicyOf(mode, cutIn, settings.euVatIossAccount ?? null, settings.euVatDdpAccount ?? null)
-}
 /** Records the policy the treatment DECIDED under (its one read, carried on the outcome) on a treated hold's marker. It reads no setting. With no snapshot nothing is recorded, and the sweep then refuses the hold (fail closed). */
 function withRegimePolicy(payload: Record<string, unknown>, policy: RegimePolicy | undefined): Record<string, unknown> {
   const marker = payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as Record<string, unknown> | null | undefined
@@ -1848,12 +1840,8 @@ function withRegimePolicy(payload: Record<string, unknown>, policy: RegimePolicy
 }
 /** Null when the policy in force equals the one the hold was parked under; otherwise the reason the sweep must not release it. */
 async function regimePolicyChange(payload: Record<string, unknown>): Promise<string | null> {
-  const recorded = (payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { regimePolicy?: unknown } | null | undefined)?.regimePolicy
-  if (typeof recorded !== 'object' || recorded === null) return 'it was parked before the regime settings it was decided under were recorded'
-  const now = await currentRegimePolicy()
-  const was = recorded as Record<string, unknown>
-  const differing = Object.keys(now).filter((key) => was[key] !== now[key])
-  return differing.length === 0 ? null : `the EU VAT regime settings changed since it was parked (${differing.join(', ')})`
+  const problem = await regimePolicyProblem((payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { regimePolicy?: unknown } | null | undefined)?.regimePolicy)
+  return problem === null ? null : problem.replace('since it was prepared', 'since it was parked').replace('it was prepared before', 'it was parked before')
 }
 
 class HeldRecheckRefusal extends Error {

@@ -10,6 +10,7 @@
 import { db } from '@/lib/db'
 import { schemePostingTypeProblem, EU_VAT_TREATMENT_PAYLOAD_KEY } from '@/lib/domain/accounting/eu-vat-treatment'
 import { readStoredXeroList, type Client } from '@/lib/tax/purchase-tax-import'
+import { regimePolicyProblem } from '@/lib/domain/accounting/eu-vat-regime-policy'
 
 /** Null when `taxType` is shown to be a known, ACTIVE, revenue, exactly 0% type by the proven stored list; otherwise the reason. */
 export async function storedSchemePostingTypeProblem(taxType: string, now: Date = new Date(), client: Client = db as unknown as Client): Promise<string | null> {
@@ -26,8 +27,14 @@ export async function storedSchemePostingTypeProblem(taxType: string, now: Date 
 export async function euSchemePostingRefusal(payload: Record<string, unknown>, now: Date = new Date()): Promise<string | null> {
   const marker = payload[EU_VAT_TREATMENT_PAYLOAD_KEY]
   if (typeof marker !== 'object' || marker === null) return null
-  const m = marker as { applied?: unknown; route?: unknown; schemePostingTaxType?: unknown }
-  if (m.applied !== true || m.route !== 'scheme') return null
+  const m = marker as { applied?: unknown; route?: unknown; schemePostingTaxType?: unknown; regimePolicy?: unknown }
+  if (m.applied !== true) return null
+  // A treated payload was decided under the regime settings recorded on it (the mode, the gift-card cut-in, the IOSS and DDP accounts). If they differ now, or none were recorded, the decision is not the one in force: nothing is sent and the order is re-imported.
+  const policyProblem = await regimePolicyProblem(m.regimePolicy)
+  if (policyProblem !== null) {
+    return `NOTHING WAS SENT. Sales invoice ${String(payload.invoiceNumber ?? '(no number)')} was refused: ${policyProblem}; re-import the order. This row is refused, not posted.`
+  }
+  if (m.route !== 'scheme') return null
   const type = typeof m.schemePostingTaxType === 'string' ? m.schemePostingTaxType.trim() : ''
   const problem = type === '' ? 'the treatment marker names no scheme posting type' : await storedSchemePostingTypeProblem(type, now)
   if (problem === null) return null

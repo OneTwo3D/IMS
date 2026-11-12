@@ -27,19 +27,11 @@ import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-pos
 import { currentWcTaxBinding, recordWcTaxBinding, type InvoiceTaxTypesInput, type WcTaxBinding } from './wc-tax-binding'
 import { buildEuVatRegimeInputFromSettings, readEuVatRegimeMode, readGiftCardFlagCutIn } from './eu-vat-facts'
 import type { GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
+import { regimePolicyOf, type RegimePolicy } from '@/lib/domain/accounting/eu-vat-regime-policy'
 import type { MappedLine } from './field-mapping'
 import type { WcFullOrder } from './types'
 
-/** The regime settings one decision was made under (the mode, the gift-card cut-in, the IOSS and DDP accounts), as a comparable record. */
-export type RegimePolicy = Record<string, string>
-export function regimePolicyOf(mode: string | null, cutIn: GiftCardCutIn, ioss: string | null, ddp: string | null): RegimePolicy {
-  return {
-    mode: mode ?? 'unreadable',
-    cutIn: cutIn.state === 'ok' ? cutIn.at.toISOString() : cutIn.state === 'unset' ? 'unset' : `invalid:${cutIn.raw}`,
-    ioss: String(ioss ?? ''),
-    ddp: String(ddp ?? ''),
-  }
-}
+export { regimePolicyOf, type RegimePolicy }
 
 /**
  * THE REGIME SETTINGS ARE READ ONCE: the mode and the gift-card cut-in are read here, the SAME values build the regime input the decision is made on, and the policy record is made from those same values. Nothing that records the policy reads a setting again, so a setting changed

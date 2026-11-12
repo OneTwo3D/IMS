@@ -170,14 +170,8 @@ mock.module('@/lib/activity-log', {
   },
 })
 const queueDouble = async (params: { referenceId: string; idempotencyKey: string; payload: Record<string, unknown> }) => queueAccountingSyncDouble(params)
-// The regime settings the sweep compares a treated hold's recorded policy with (unchanged here; the changed case is in the concurrency tier).
-mock.module('@/lib/connectors/woocommerce/sync/eu-vat-facts', {
-  namedExports: {
-    buildEuVatRegimeInputFromSettings: async () => { throw new Error('the sweep does not build a regime input') },
-    readEuVatRegimeMode: async () => 'adopt_plugin',
-    readGiftCardFlagCutIn: async () => ({ state: 'unset' }),
-  },
-})
+// The regime settings the sweep compares a treated hold's recorded policy with (none stored here: mode and cut-in at their defaults, so unchanged; the changed case is in the concurrency tier).
+mock.module('@/lib/settings-store', { namedExports: { getSettingValues: async () => new Map<string, string>() } })
 mock.module('@/lib/accounting', {
   namedExports: {
     isAccountingSyncTypeEnabledFor: async () => true,

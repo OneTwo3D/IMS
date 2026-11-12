@@ -1,5 +1,6 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import test, { mock } from 'node:test'
 import { config } from 'dotenv'
@@ -386,10 +387,10 @@ test('[eu vat] the poster re-checks the scheme posting type: proven zero-rated p
   const externalId = Math.floor(Math.random() * 2_000_000_000)
   const ctx = await seed(db, wcRateId)
   t.after(async () => { await cleanup(db, externalId, ctx) })
-  const treated = { invoiceNumber: 'INV-1', _euVatTreatment: { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', vatAccount: '821' } }
+  const treated = { invoiceNumber: 'INV-1', _euVatTreatment: { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', vatAccount: '821', regimePolicy: { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232' } } }
   assert.equal(await euSchemePostingRefusal(treated), null)
   assert.equal(await euSchemePostingRefusal({ invoiceNumber: 'INV-2' }), null)
-  assert.equal(await euSchemePostingRefusal({ invoiceNumber: 'INV-3', _euVatTreatment: { applied: true, route: 'none' } }), null)
+  assert.equal(await euSchemePostingRefusal({ invoiceNumber: 'INV-3', _euVatTreatment: { applied: true, route: 'none', regimePolicy: { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232' } } }), null)
   await seedXeroList(db, { TAX131: '20.000000' })
   assert.match((await euSchemePostingRefusal(treated)) ?? '', /^NOTHING WAS SENT\. Sales invoice INV-1 was refused: .*20.*% in Xero, not zero-rated/)
   await seedXeroList(db, { TAX999: '0.000000' })
@@ -1398,4 +1399,36 @@ test('[eu vat] the cut-in changes BETWEEN the treatment\'s read and the parking 
   assert.equal(rows, 0, 'nothing was queued')
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /the EU VAT regime settings changed since it was parked \(cutIn\)/)
+})
+
+// THE POSTER'S LAST LOOK AT THE REGIME POLICY (the gate both SALES_INVOICE and SALES_INVOICE_UPDATE call before anything is sent).
+test('[eu vat] the poster refuses a treated payload whose recorded regime policy no longer matches the settings in force (nothing is sent), and still passes an unchanged one', { skip }, async (t) => {
+  const db = await loadDb()
+  await mockAccounting()
+  const { euSchemePostingRefusal } = await import('@/lib/connectors/xero/scheme-posting-check')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seed(db, wcRateId)
+  t.after(async () => { await db.setting.deleteMany({ where: { key: 'eu_vat_gift_card_flag_cut_in' } }); await db.xeroTaxRateList.deleteMany({ where: { connector: 'xero' } }); await cleanup(db, externalId, ctx) })
+  await seedXeroList(db, { TAX131: '0.000000' })
+  const policy = { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232' }
+  const treated = (over: Record<string, unknown> = {}) => ({ invoiceNumber: 'INV-P', _euVatTreatment: { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', vatAccount: '821', regimePolicy: policy, ...over } })
+  assert.equal(await euSchemePostingRefusal(treated()), null, 'unchanged policy: posts')
+  assert.equal(await euSchemePostingRefusal({ invoiceNumber: 'INV-U' }), null, 'an untreated payload is untouched')
+  // The cut-in is changed while the row waits.
+  await db.setting.upsert({ where: { key: 'eu_vat_gift_card_flag_cut_in' }, create: { key: 'eu_vat_gift_card_flag_cut_in', value: '2026-12-01' }, update: { value: '2026-12-01' } })
+  const refused = (await euSchemePostingRefusal(treated())) ?? ''
+  assert.match(refused, /^NOTHING WAS SENT\. Sales invoice INV-P was refused: the EU VAT regime settings changed since it was prepared \(cutIn\); re-import the order\./)
+  // Also a route-none treated payload, and one with no recorded policy.
+  assert.match((await euSchemePostingRefusal({ invoiceNumber: 'INV-N', _euVatTreatment: { applied: true, route: 'none', regimePolicy: policy } })) ?? '', /settings changed since it was prepared/)
+  assert.match((await euSchemePostingRefusal(treated({ regimePolicy: undefined }))) ?? '', /before the regime settings it was decided under were recorded/)
+  // A different IOSS account is a changed policy too.
+  await db.setting.deleteMany({ where: { key: 'eu_vat_gift_card_flag_cut_in' } })
+  assert.equal(await euSchemePostingRefusal(treated()), null)
+  assert.match((await euSchemePostingRefusal(treated({ regimePolicy: { ...policy, ioss: '999' } }))) ?? '', /\(ioss\)/)
+})
+
+test('[eu vat] BOTH sales-invoice posting cases call the poster gate before anything is sent', () => {
+  const src = readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8')
+  assert.equal((src.match(/await euSchemePostingRefusal\(payload as Record<string, unknown>\)/g) ?? []).length, 2, 'SALES_INVOICE and SALES_INVOICE_UPDATE')
 })
