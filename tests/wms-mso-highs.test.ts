@@ -43,6 +43,8 @@ type Seed = {
   /** The link as it is NOW, for the conditional notice write: a link that moved on since it was read matches nothing. */
   linkNow?: { state: string; externalOrderId: string; holdNoticeAt?: Date; cancelNoticeAt?: Date }
   /** Notices whose warehouse note was never delivered, as the real port would list them. */
+  /** The recorded warehouse line ids of the link's order (default: the order's one line). */
+  storedItems?: Array<{ externalItemId: string; sku: string; quantity: number }>
   pendingNotices?: Array<{ id: string; orderId: string; externalOrderId: string; state: 'SYNCED' | 'MERGED'; intent: 'HOLD' | 'CANCEL'; noticeAt: Date }>
 }
 
@@ -73,6 +75,7 @@ function makePort(seed: Seed) {
     updateLinkIfState: async (id, fromState, data) => { updates.push({ id, data, ifState: fromState }); return true },
     clearStaleNotices: async () => { cleared.count += 1; return 0 },
     noticesAwaitingComment: async () => seed.pendingNotices ?? [],
+    readOrderItems: async () => seed.storedItems === undefined ? ORIGINAL_LINES : seed.storedItems,
     ...(seed.linkNow
       ? {
         updateLinkIfLinked: async (id: string, expect: { state: string; externalOrderId: string; holdNoticeAt?: Date; cancelNoticeAt?: Date }, data: Record<string, unknown>) => {
@@ -106,6 +109,8 @@ function connector(overrides: {
   reconcile?: (reference: { orderNumber: string; externalReference: string }) => Promise<WmsAmbiguousCreateResolution>
   probe?: () => Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'>
   findMergedSurvivor?: (orderNumber: string) => Promise<WmsMergedSurvivorLookup>
+  /** The candidate survivor's lines (default: it holds the order's recorded line, i.e. a genuine merge). */
+  itemRefs?: () => Promise<Array<{ externalItemId: string; sku: string; quantity: number }>>
   comments?: Array<{ externalOrderId: string; comment: string }>
 } = {}) {
   const calls = { push: 0, cancel: [] as string[], reconcile: [] as Array<{ orderNumber: string; externalReference: string }> }
@@ -121,12 +126,16 @@ function connector(overrides: {
       verifyPushedOrder: async () => 'ours' as const,
       probeOrderPresence: overrides.probe ?? (async () => 'FOUND' as const),
       ...(overrides.findMergedSurvivor ? { findMergedSurvivor: overrides.findMergedSurvivor } : {}),
+      fetchOrderItemRefs: overrides.itemRefs ?? (async () => [...ORIGINAL_LINES, { externalItemId: '900', sku: 'OTHER', quantity: 2 }]),
       ...(overrides.reconcile
         ? { reconcileAmbiguousCreate: async (reference: { orderNumber: string; externalReference: string }) => { calls.reconcile.push(reference); return overrides.reconcile!(reference) } }
         : {}),
     },
   }
 }
+
+/** The order's recorded line, and what a genuine survivor then holds. */
+const ORIGINAL_LINES = [{ externalItemId: '501', sku: 'A', quantity: 1 }]
 
 const quiet = async <T>(run: () => Promise<T>): Promise<T> => {
   const warn = console.warn
@@ -416,7 +425,7 @@ test('R4: the warehouse note and the notice texts carry no status or error text 
 
 test('R2: the exception inbox lists a cancel notice by the cancel pass\'s OWN order predicate, not a copy of it', async () => {
   const { readFileSync } = await import('node:fs')
-  const inbox = readFileSync(new URL('../app/actions/sync-exceptions.ts', import.meta.url), 'utf8')
+  const inbox = readFileSync(new URL('../lib/domain/wms/push-recovery-affordance.ts', import.meta.url), 'utf8')
   assert.match(inbox, /cancelNoticeAt: \{ not: null \}, order: WMS_CANCELLABLE_ORDER_WHERE/)
   assert.doesNotMatch(inbox, /cancelNoticeAt: \{ not: null \}, order: \{ status: 'CANCELLED'/)
   const sweep = readFileSync(new URL('../lib/domain/wms/order-push-sweep.ts', import.meta.url), 'utf8')
@@ -713,4 +722,77 @@ test('R12: the merged-order guidance reaches the parked link verbatim, and the g
   assert.equal(updates.length, 1)
   assert.match(String(updates[0].data.lastError), /merged this order with another into order WC-1001\+WC-1002 \(id 777\)/)
   assert.doesNotMatch(String(updates[0].data.lastError), /cancel it in the WMS/i)
+})
+
+// ---------------------------------------------------------------- R17: a combined number is a candidate filter, never proof ----
+
+test('R17: B 404s, a survivor "A+B+C" (an unrelated merge that merely lists B) is found by the number search, but it does NOT hold B\'s recorded line ids: no re-point, the link is left as it was and a notice is raised', async () => {
+  for (const intent of ['cancel', 'hold'] as const) {
+    const ref = { id: 'link-1', orderId: 'so-b', externalOrderId: 'b-gone', externalOrderNumber: 'ORD-B', state: 'SYNCED' as const }
+    const { port, updates } = makePort({ [intent === 'cancel' ? 'cancellable' : 'holdable']: [ref], linkNow: { state: 'SYNCED', externalOrderId: 'b-gone' } })
+    const comments: Array<{ externalOrderId: string; comment: string }> = []
+    const g = connector({
+      cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }),
+      findMergedSurvivor: async () => ({ kind: 'FOUND' as const, externalOrderId: 'surv-abc', externalOrderNumber: 'ORD-A+ORD-B+ORD-C' }),
+      itemRefs: async () => [{ externalItemId: '1', sku: 'A', quantity: 1 }, { externalItemId: '2', sku: 'C', quantity: 3 }], // A's and C's lines; B's line 501 is NOT there
+      comments,
+    })
+    const result = await runWmsOrderPushSweepCore(g.connector as never, 'mintsoft', port, { now: NOW })
+    assert.equal(updates.some((u) => u.data.state === 'MERGED' || u.data.externalOrderId === 'surv-abc'), false, `${intent}: the link was NOT re-pointed`)
+    assert.equal(result.operatorNotices, 1)
+    assert.match(String(updates.find((u) => typeof u.data.lastError === 'string')!.data.lastError), /possible merge into WMS order surv-abc could not be proven.*does not hold this order's recorded lines.*check it in the WMS/)
+    assert.deepEqual(comments, [], 'no note is posted on the unproven survivor')
+  }
+})
+
+test('R17: with no trustworthy record of the order\'s line ids (legacy push, or untrusted) a candidate survivor is never adopted either', async () => {
+  const ref = { id: 'link-1', orderId: 'so-b', externalOrderId: 'b-gone', externalOrderNumber: 'ORD-B', state: 'SYNCED' as const }
+  const { port, updates } = makePort({ cancellable: [ref], linkNow: { state: 'SYNCED', externalOrderId: 'b-gone' }, storedItems: [] })
+  const g = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), findMergedSurvivor: async () => ({ kind: 'FOUND' as const, externalOrderId: 'surv-1', externalOrderNumber: 'ORD-C+ORD-B' }) })
+  const result = await runWmsOrderPushSweepCore(g.connector as never, 'mintsoft', port, { now: NOW })
+  assert.equal(updates.some((u) => u.data.state === 'MERGED'), false)
+  assert.equal(result.operatorNotices, 1)
+  assert.match(String(updates.find((u) => typeof u.data.lastError === 'string')!.data.lastError), /no trustworthy record of this order's WMS line ids/)
+})
+
+test('R17: an unreadable candidate (its lines cannot be read) is not adopted', async () => {
+  const ref = { id: 'link-1', orderId: 'so-b', externalOrderId: 'b-gone', externalOrderNumber: 'ORD-B', state: 'SYNCED' as const }
+  const { port, updates } = makePort({ cancellable: [ref], linkNow: { state: 'SYNCED', externalOrderId: 'b-gone' } })
+  const g = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), findMergedSurvivor: async () => ({ kind: 'FOUND' as const, externalOrderId: 'surv-1', externalOrderNumber: 'ORD-C+ORD-B' }), itemRefs: async () => { throw new Error('boom') } })
+  await runWmsOrderPushSweepCore(g.connector as never, 'mintsoft', port, { now: NOW })
+  assert.equal(updates.some((u) => u.data.state === 'MERGED'), false)
+})
+
+test('R17: the dispatch sweep does not re-point a link at a survivor that lists its number but does not hold its lines (and applies no despatch from it)', async () => {
+  const repoints: string[] = []
+  const status = { externalOrderId: 'surv-abc', externalOrderNumber: 'ORD-A+ORD-B+ORD-C', status: 'DESPATCHED', statusLabel: 'Despatched', isSplit: false, partCount: null, isMerged: true, mergedOrderNumbers: ['ORD-A', 'ORD-B', 'ORD-C'], deepLinkUrl: null, tracking: [], dispatched: true, raw: null }
+  const applied: string[] = []
+  const run = async (proven: boolean) => runWmsDispatchSweepCore({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'ORD-B' }],
+    fetchOrderStatus: async () => status as never,
+    applyDispatch: async () => { applied.push('applied'); return { success: true } },
+    repointLink: async (_id: string, to: { externalOrderId: string }) => { repoints.push(to.externalOrderId) },
+    proveMergeLineage: async () => (proven ? { proven: true as const } : { proven: false as const, reason: 'the candidate merged order surv-abc does not hold this order\'s recorded lines' }),
+  } as never)
+  await run(false)
+  assert.deepEqual(repoints, [], 'not re-pointed')
+  assert.deepEqual(applied, [], 'no despatch applied from the unproven survivor')
+  await run(true)
+  assert.deepEqual(repoints, ['surv-abc'], 'CONTROL: a proven survivor is adopted')
+})
+
+test('R18: the dispatch sweep\'s re-point is a compare-and-set: the proof passes, a cancel marks the link CANCELLED, the re-point is REFUSED, nothing is applied and the link is not flipped back', async () => {
+  const status = { externalOrderId: 'surv-1', externalOrderNumber: 'ORD-A+ORD-B', status: 'DESPATCHED', statusLabel: 'Despatched', isSplit: false, partCount: null, isMerged: true, mergedOrderNumbers: ['ORD-A', 'ORD-B'], deepLinkUrl: null, tracking: [], dispatched: true, raw: null }
+  const applied: string[] = []
+  const calls: string[] = []
+  await runWmsDispatchSweepCore({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'ORD-B', externalOrderId: 'b-old' }],
+    fetchOrderStatus: async () => status as never,
+    applyDispatch: async () => { applied.push('applied'); return { success: true } },
+    proveMergeLineage: async () => { calls.push('proof'); return { proven: true as const } },
+    // The link was cancelled after the candidate was read: the compare-and-set matches nothing.
+    repointLink: async () => { calls.push('repoint'); return false },
+  } as never)
+  assert.deepEqual(calls, ['proof', 'repoint'])
+  assert.deepEqual(applied, [], 'no despatch applied')
 })

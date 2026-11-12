@@ -308,7 +308,7 @@ test('cancel: a BACKORDERED order (status 9) is cancellable, and the answer is a
   reset()
   const { cancelMintsoftOrder } = await push()
   details.set('900', { ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 9 })
-  assert.deepEqual(await cancelMintsoftOrder('900'), { cancelled: true, status: 'CANCELLED' })
+  assert.deepEqual(await cancelMintsoftOrder('900', { expectedOrderNumber: 'WC-1001' }), { cancelled: true, status: 'CANCELLED' })
   assert.equal(writes.filter((w) => w.method === 'CANCEL').length, 1)
 })
 
@@ -316,7 +316,7 @@ test('cancel: an already CANCELLED order (status 3) is ALREADY_CANCELLED - disti
   reset()
   const { cancelMintsoftOrder } = await push()
   details.set('900', { ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 3 })
-  assert.deepEqual(await cancelMintsoftOrder('900'), { cancelled: false, status: 'ALREADY_CANCELLED' })
+  assert.deepEqual(await cancelMintsoftOrder('900', { expectedOrderNumber: 'WC-1001' }), { cancelled: false, status: 'ALREADY_CANCELLED' })
   assert.deepEqual(writes, [])
 })
 
@@ -325,14 +325,14 @@ test('cancel: a cancel that races an earlier one (Success:true "was already canc
   const { cancelMintsoftOrder } = await push()
   details.set('900', { ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 1 })
   cancelResponse = { ID: 0, Success: true, Message: 'Order: 1 was already cancelled' }
-  assert.deepEqual(await cancelMintsoftOrder('900'), { cancelled: false, status: 'ALREADY_CANCELLED' })
+  assert.deepEqual(await cancelMintsoftOrder('900', { expectedOrderNumber: 'WC-1001' }), { cancelled: false, status: 'ALREADY_CANCELLED' })
 })
 
 test('cancel: any other status is still NOT_CANCELLABLE and nothing is sent', async () => {
   reset()
   const { cancelMintsoftOrder } = await push()
   details.set('900', { ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT, OrderStatusId: 5 })
-  assert.deepEqual(await cancelMintsoftOrder('900'), { cancelled: false, status: 'NOT_CANCELLABLE' })
+  assert.deepEqual(await cancelMintsoftOrder('900', { expectedOrderNumber: 'WC-1001' }), { cancelled: false, status: 'NOT_CANCELLABLE' })
   assert.deepEqual(writes, [])
 })
 

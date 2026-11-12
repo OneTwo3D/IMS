@@ -3989,11 +3989,27 @@ model WmsOrderPushLink {
   holdNoticeAt        DateTime? @map("hold_notice_at")
   cancelNoticeAt      DateTime? @map("cancel_notice_at")
   /// When the warehouse-visible note for that notice was actually posted. Null while undelivered: the push sweep retries it.
+  /// IMS changed an order the warehouse had already merged into another order and did NOT amend the merged order (that would delete or
+  /// consolidate the other order's lines): the change has to be applied there by hand. Live link, listed in the exception inbox until
+  /// an operator acknowledges it (which clears this).
+  amendNoticeAt         DateTime? @map("amend_notice_at")
+  /// Set before IMS amends the warehouse order's lines and cleared only when a verified fresh snapshot of its line ids is stored (or the
+  /// amendment provably changed nothing). While set, the recorded line ids cannot be trusted and a merged-order line removal refuses.
+  lineSnapshotUnsafeAt  DateTime? @map("line_snapshot_unsafe_at")
+  /// The generation of the amendment that set the mark above. Only the amendment holding the CURRENT token may store a replacement snapshot
+  /// or clear the mark (compare-and-set), so an older amendment finishing late cannot make a newer one's stale state look trustworthy.
+  lineSnapshotToken     String?   @map("line_snapshot_token")
+  /// A durable lease on the amendment of this link's warehouse order: set (compare-and-set) before the remote call, released after the
+  /// snapshot write. While another owner's lease is live the link is skipped; an expired lease leaves the unsafe mark set. The owner is the
+  /// same generation token as above.
+  amendLeaseOwner       String?   @map("amend_lease_owner")
+  amendLeaseExpiresAt   DateTime? @map("amend_lease_expires_at")
   holdNoticeCommentAt   DateTime? @map("hold_notice_comment_at")
   cancelNoticeCommentAt DateTime? @map("cancel_notice_comment_at")
   createdAt           DateTime          @default(now())
   updatedAt           DateTime          @updatedAt
 
+  items               WmsOrderPushItem[]
   order               SalesOrder        @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
   @@index([connector, state])
@@ -4002,6 +4018,27 @@ model WmsOrderPushLink {
   @@index([connector, dispatchReconcileCheckedAt])
   @@index([connector, dispatchUnresolvedAt])
   @@map("wms_order_push_links")
+}
+
+/// The warehouse's own line ids for the order IMS pushed, read back right after the create (and after an amendment): one row per
+/// warehouse order line, with the SKU and quantity it carried then. Merging two warehouse orders keeps every original line under its
+/// original id, so these rows are how IMS finds exactly one order's lines on a merged survivor. Snapshot of what the warehouse held,
+/// never of what IMS wants; replaced as a set, deleted with the link.
+model WmsOrderPushItem {
+  id              String   @id @default(cuid())
+  linkId          String   @map("link_id")
+  /// The warehouse order these lines were read from (the id the link had when the snapshot was taken).
+  externalOrderId String   @map("external_order_id")
+  externalItemId  String   @map("external_item_id")
+  sku             String
+  quantity        Int
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  link            WmsOrderPushLink @relation(fields: [linkId], references: [id], onDelete: Cascade)
+
+  @@unique([linkId, externalItemId])
+  @@index([linkId])
+  @@map("wms_order_push_items")
 }
 
 // ---------------------------------------------------------------------------

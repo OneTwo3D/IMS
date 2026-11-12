@@ -28,7 +28,8 @@ import {
   decideWmsMissingRepush,
 } from '@/lib/domain/wms/push-recovery-affordance'
 import { wmsCreateIneligibleRefusal } from '@/lib/domain/wms/create-eligibility'
-import { isWmsCreateEligibleForUpdate, wmsCreateEligibleOrderIds, wmsPushOrderReference, WMS_CANCELLABLE_ORDER_WHERE } from '@/lib/domain/wms/order-push-sweep'
+import { isWmsCreateEligibleForUpdate, wmsCreateEligibleOrderIds, wmsPushOrderReference } from '@/lib/domain/wms/order-push-sweep'
+import { WMS_PUSH_INBOX_WHERE } from '@/lib/domain/wms/push-recovery-affordance'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugins'
 import {
   buildFollowUpObligationBacklogOrderBy,
@@ -325,6 +326,8 @@ export type WmsPushDeadLetterRow = {
   attempts: number
   lastError: string | null
   lastAttemptAt: string | null
+  /** A live-link amendment notice: the row offers Acknowledge instead of Replay. */
+  acknowledgeable: boolean
   /**
    * o3d-2k5r r5 — the affordance, DERIVED ON THE SERVER from `decideWmsPushReplay`: the same call
    * `replayWmsOrderPush` refuses on. The table used to render Replay for every state except
@@ -358,28 +361,10 @@ export type WmsPushDeadLetterRow = {
  * someone fixes the data. Left out of this inbox it would be a silent, permanent non-delivery,
  * which is the same class of invisible drop the dead-letter section exists to prevent.
  *
- * NOT EXPORTED. This is a `'use server'` module: every export of one is a server action, so a
- * non-function export both fails the repo's server-action guard-coverage test and is a shape
- * `next build` rejects (a plain type-check does not see it). It is only read in this file.
+ * The selection itself (BLOCKED_WMS_PUSH_STATES, WMS_PUSH_INBOX_WHERE) is NOT declared here: this is a `'use server'` module, where every
+ * export is a server action and a non-function export fails the guard-coverage test and `next build`.
  */
-const BLOCKED_WMS_PUSH_STATES = ['DEAD_LETTER', 'VALIDATION_FAILED', 'AMBIGUOUS_CREATE'] as const
-
-/**
- * Links that are LIVE but carry an operator notice: IMS asked the warehouse to hold / cancel the order and it could not (already past
- * NEW, not found, a merged survivor). They stay SYNCED/MERGED so a despatch is still recorded, which is exactly why they are not in
- * BLOCKED_WMS_PUSH_STATES and need their own clause here. A hold notice matters only while the order is still ON_HOLD; a cancel notice
- * (the cancel pass's own order predicate, shared) until the dispatch sweep has parked or quarantined the link (those have their own sections). NOT EXPORTED: 'use server' module.
- */
-const WMS_PUSH_NOTICE_WHERE = {
-  state: { in: ['SYNCED', 'MERGED'] as Array<'SYNCED' | 'MERGED'> },
-  dispatchDeadLetteredAt: null,
-  dispatchUnresolvedAt: null,
-  OR: [
-    { holdNoticeAt: { not: null }, order: { status: 'ON_HOLD' as const } },
-    { cancelNoticeAt: { not: null }, order: WMS_CANCELLABLE_ORDER_WHERE },
-  ],
-}
-const WMS_PUSH_INBOX_WHERE = { OR: [{ state: { in: [...BLOCKED_WMS_PUSH_STATES] } }, WMS_PUSH_NOTICE_WHERE] }
+// The inbox's link selection lives in lib/domain/wms/push-recovery-affordance.ts (WMS_PUSH_INBOX_WHERE) so a database test can run it.
 
 export type PennyMismatchRow = {
   orderId: string
@@ -1206,6 +1191,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       select: {
         holdNoticeAt: true,
         cancelNoticeAt: true,
+        amendNoticeAt: true,
         orderId: true,
         connector: true,
         state: true,
@@ -4054,6 +4040,42 @@ export async function dismissWithdrawnDispatch(orderId: string): Promise<Mutatio
       description: `Operator dismissed the withheld dispatch for cancelled order ${link.order.orderNumber ?? orderId} `
         + `(WMS ${link.externalOrderNumber ?? '—'}). The order stays CANCELLED and IMS records no shipment for it; `
         + 'anything the warehouse despatched is handled as a return, and this clears only the exception row.',
+      metadata: { orderId, userId: session.user.id },
+      resolveUser: false,
+    })
+    revalidatePath('/sync/exceptions')
+    return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * Acknowledge the "change not sent to the warehouse (merged order)" notice: the operator has applied the change in the warehouse by hand
+ * (or decided it does not matter). Clears ONLY the inbox row; compare-and-set on the notice still being set.
+ */
+export async function acknowledgeWmsAmendNotice(orderId: string): Promise<MutationResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    const link = await db.wmsOrderPushLink.findUnique({
+      where: { orderId },
+      select: { id: true, externalOrderNumber: true, order: { select: { orderNumber: true } } },
+    })
+    if (!link) return { success: false, error: 'This order has no WMS link.' }
+    const cleared = await db.wmsOrderPushLink.updateMany({
+      where: { id: link.id, amendNoticeAt: { not: null } },
+      data: { amendNoticeAt: null },
+    })
+    if (cleared.count === 0) return { success: false, error: 'This notice is already cleared.' }
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      tag: 'sync',
+      action: 'wms_amend_notice_acknowledged',
+      level: 'INFO',
+      description: `Operator acknowledged that the change to order ${link.order.orderNumber ?? orderId} was not sent to the merged WMS order ${link.externalOrderNumber ?? '—'}. This clears only the exception row.`,
       metadata: { orderId, userId: session.user.id },
       resolveUser: false,
     })
