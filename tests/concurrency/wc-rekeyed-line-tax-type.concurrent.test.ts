@@ -89,5 +89,14 @@ test('[re-key] a line whose rate was re-keyed is built on the REPLACEMENT (its X
   const skipKeys = new Set(['contactName', 'contactEmail', 'date', 'reference', 'currencyRateToBase', '_paymentId', '_paymentDate', '_idempotencyKey', 'invoiceNumber'])
   const normalise = JSON.stringify(raw, (key, value) => (skipKeys.has(key) ? undefined : value)).split(replacement.id).join('NEW').split(old.id).join('OLD')
   if (process.env.DUMP === '1') console.log(`GOLDEN-BEGIN${normalise}GOLDEN-END`)
+  // The tax types the invoice build and the held-invoice check share: the line stands on the replacement, and says so.
+  const { resolveWcOrderTaxResolution, resolveWcInvoiceTaxTypes } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { mapWcLineItems } = await import('@/lib/connectors/woocommerce/sync/field-mapping')
+  const wc = order(externalId, wcRateId) as never as Parameters<typeof resolveWcOrderTaxResolution>[0]
+  const mapped = await mapWcLineItems((wc as unknown as { line_items: never }).line_items, 1)
+  const types = await resolveWcInvoiceTaxTypes({ wcOrder: wc, mappedLines: mapped, resolution: await resolveWcOrderTaxResolution(wc, mapped), reverseChargeSalesTaxType: 'RCSALES', shippingForeign: 10, currency: 'GBP' })
+  assert.deepEqual([types.lines[0]!.rateId, types.lines[0]!.type], [replacement.id, 'RCSALES'], 'the recorded rate id is the replacement the line stands on, not the pre-redirect id')
+  const viaPersisted = await resolveWcInvoiceTaxTypes({ wcOrder: wc, mappedLines: mapped, resolution: await resolveWcOrderTaxResolution(wc, mapped), reverseChargeSalesTaxType: 'RCSALES', shippingForeign: 10, currency: 'GBP', lineRateIds: [replacement.id] })
+  assert.deepEqual(viaPersisted.lines, types.lines, 'the post-redirect ids give the same answer')
   if (GOLDEN !== null) assert.equal(normalise, GOLDEN, 'byte-identical to what origin/development builds for this order')
 })
