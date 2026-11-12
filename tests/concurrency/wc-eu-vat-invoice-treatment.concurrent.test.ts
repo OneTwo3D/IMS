@@ -1439,7 +1439,7 @@ test('[eu vat] BOTH sales-invoice posting cases call the poster gate before anyt
 
 // THE ROUND TRIP OF A QUEUED TREATED INVOICE WHOSE REGIME POLICY CHANGED: queued, cut-in changed, the poster's gate supersedes it into a held invoice (nothing sent), a re-import rebuilds and releases it under the current policy, or refuses it with the reason.
 type BlockedInfo = { first: { kind: string; problem?: string }; second: { kind: string }; stillQueued: { status: string }; holds: number; ev: { status: string; voidBasis: string | null } }
-async function queuedThenPolicyChange(t: test.TestContext, afterHold: 'releases' | 'refuses', history: 'clean' | 'retried' | 'dispatched' | 'attempted' | 'sibling' = 'clean') {
+async function queuedThenPolicyChange(t: test.TestContext, afterHold: 'releases' | 'refuses', history: 'clean' | 'retried' | 'dispatched' | 'attempted' | 'sibling' | 'failedSiblingNoId' | 'failedSiblingDispatched' | 'failedSiblingUnproven' | 'provenSibling' = 'clean') {
   const db = await loadDb()
   await mockAccounting()
   switchOn = true
@@ -1472,12 +1472,21 @@ async function queuedThenPolicyChange(t: test.TestContext, afterHold: 'releases'
   const revision = history === 'retried' ? 2 : 1
   await db.accountingSyncLog.update({ where: { id: queued.id }, data: { status: 'PROCESSING', processingStartedAt: startedAt, attemptStampingCustodyAt: startedAt, attemptRevision: revision, ...(history === 'dispatched' ? { createDispatchedAt: new Date(), createDispatchIdempotencyKey: 'k-prior' } : {}), ...(history === 'attempted' ? { remoteAttemptedAt: new Date() } : {}) } })
   if (history === 'sibling') await db.accountingSyncLog.create({ data: { type: 'SALES_INVOICE', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: orderId, externalTransactionId: 'xero-inv-1', attemptStampingCustodyAt: new Date(), payload: {} } })
+  // Siblings: other sales-invoice rows for the order in ANY status. A FAILED one with no document id is ambiguous unless its own record proves nothing ever left it.
+  const sibling = async (data: Record<string, unknown>, after: Record<string, unknown> = {}) => {
+    const row = await db.accountingSyncLog.create({ data: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: orderId, payload: {}, ...data } as never })
+    if (Object.keys(after).length > 0) await db.accountingSyncLog.update({ where: { id: row.id }, data: after as never })
+  }
+  if (history === 'failedSiblingNoId') await sibling({ status: 'FAILED', errorMessage: 'response lost' })               // no custody: nothing proves it never left
+  if (history === 'failedSiblingUnproven') await sibling({ status: 'FAILED', errorMessage: 'response lost' })
+  if (history === 'failedSiblingDispatched') await sibling({ status: 'FAILED', attemptStampingCustodyAt: new Date(), errorMessage: 'response lost' }, { createDispatchedAt: new Date(), createDispatchIdempotencyKey: 'k-sibling' })
+  if (history === 'provenSibling') await sibling({ status: 'FAILED', attemptStampingCustodyAt: new Date(), errorMessage: 'refused before anything was sent' })
   const args = { attempt: { id: queued.id, attemptRevision: revision }, held: { heldFrom: () => startedAt }, referenceType: 'SalesOrder', referenceId: orderId, payload: queued.payload as unknown as Record<string, unknown> }
   const first = await holdInvoiceOnRegimePolicyChange(args as never)
   const second = await holdInvoiceOnRegimePolicyChange(args as never)
   const retired = await db.accountingSyncLog.findUniqueOrThrow({ where: { id: queued.id } })
   const hold = await db.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
-  if (history !== 'clean') {
+  if (history !== 'clean' && history !== 'provenSibling') {
     const stillQueued = await db.accountingSyncLog.findUniqueOrThrow({ where: { id: queued.id } })
     const ev = await db.accountingEvent.findUniqueOrThrow({ where: { id: event.id }, select: { status: true, voidBasis: true } })
     return { blocked: { first, second, stillQueued, holds: hold === null ? 0 : 1, ev } as BlockedInfo | null, afterPark: null as never, rows: [] as Array<{ payload: unknown }>, holdAfter: null as never, gate: undefined as string | null | undefined }
@@ -1523,7 +1532,7 @@ test('[eu vat] ROUND TRIP: the same superseded invoice, re-imported under a cut-
 })
 
 // NOTHING IS SUPERSEDED WITHOUT DURABLE PROOF THAT NO CREATE WAS EVER DISPATCHED: a row whose earlier attempt may have created the invoice in Xero is left refused for ledger reconciliation (a release under a new idempotency key would bypass the prior-attempt check).
-for (const history of ['retried', 'dispatched', 'attempted', 'sibling'] as const) {
+for (const history of ['retried', 'dispatched', 'attempted', 'sibling', 'failedSiblingNoId', 'failedSiblingDispatched', 'failedSiblingUnproven'] as const) {
   test(`[eu vat] a policy change on a row with prior history (${history}) is NOT superseded: no hold, the row and its mirror are untouched, and the refusal says to reconcile with Xero first`, { skip }, async (t) => {
     const { blocked: found } = await queuedThenPolicyChange(t, 'releases', history)
     const blocked = found!
@@ -1640,4 +1649,10 @@ test('[eu vat] the SWEEP gives a held invoice whose ACCOUNT setting changed the 
   assert.equal(rows, 0, 'nothing was queued')
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /account setting\(s\) changed since it was parked \(ioss\).*re-importing the order alone will not release it: restore the previous account setting\(s\) in Settings > Accounting, then re-import/)
+})
+
+test('[eu vat] a FAILED sibling row PROVEN never to have reached Xero (custody, no stamp, no dispatch record, no id) does NOT block the supersede', { skip }, async (t) => {
+  const result = await queuedThenPolicyChange(t, 'releases', 'provenSibling')
+  assert.equal(result.afterPark.first.kind, 'held', 'superseded and parked: the sibling is proven unsent')
+  assert.equal(result.rows.length, 1, 'and the re-import released it')
 })

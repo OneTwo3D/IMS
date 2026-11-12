@@ -17,7 +17,6 @@ import type { AttemptRef } from '@/lib/domain/accounting/sync-log-attempt'
 import type { HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
-import { PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR } from '@/lib/domain/accounting/prior-posting-evidence'
 import { buildHeldSalesInvoicePayload, heldSalesInvoiceQueueWhere, HELD_SALES_INVOICE_RECORD_KIND } from './held-sales-invoice'
 
 /**
@@ -48,6 +47,11 @@ export type RegimePolicyHoldOutcome =
   | { kind: 'account_changed'; problem: string; accounts: string[] }  // an ACCOUNT setting changed: the stamped regime and the treated lines keep their old accounts, so a re-import cannot adopt it; not superseded, refused with steps that work
   | { kind: 'blocked'; problem: string }            // changed, but an earlier attempt may have created the invoice in Xero: never superseded, left refused for ledger reconciliation
 
+/** The durable proof, from a row alone, that no create ever left it: no document id, no create-dispatch marker or key, and the canonical never-attempted record (`attemptProvenNeverMade`: custody present, no remote-attempt stamp). One definition for the current row and every sibling. */
+function neverMade(row: { createDispatchedAt: Date | null; createDispatchIdempotencyKey: string | null; remoteAttemptedAt: Date | null; attemptStampingCustodyAt: Date | null; externalTransactionId: string | null }): boolean {
+  return row.externalTransactionId === null && row.createDispatchedAt === null && row.createDispatchIdempotencyKey === null && attemptProvenNeverMade(row)
+}
+
 export async function holdInvoiceOnRegimePolicyChange(params: {
   attempt: AttemptRef
   held: HeldClaim
@@ -76,15 +80,16 @@ export async function holdInvoiceOnRegimePolicyChange(params: {
       where: { id: params.attempt.id },
       select: { createDispatchedAt: true, createDispatchIdempotencyKey: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true, externalTransactionId: true },
     })
-    const siblings = await tx.accountingSyncLog.count({
-      where: { id: { not: params.attempt.id }, referenceType: 'SalesOrder', referenceId: params.referenceId, type: { in: [...SALES_INVOICE_SYNC_TYPES] }, OR: PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR },
+    // EVERY other sales-invoice row for the order, in any status: one that is not itself PROVEN never to have reached Xero (the same never-made proof as the current row's: custody present and no remote-attempt stamp, no create-dispatch marker or key, no document id) is ambiguous, whatever its status. A FAILED row with no document id, after a lost response, is exactly that: a rebuilt invoice released under a new idempotency key would be created again beside it.
+    const siblingRows = await tx.accountingSyncLog.findMany({
+      where: { id: { not: params.attempt.id }, referenceType: 'SalesOrder', referenceId: params.referenceId, type: { in: [...SALES_INVOICE_SYNC_TYPES] } },
+      select: { createDispatchedAt: true, createDispatchIdempotencyKey: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true, externalTransactionId: true },
     })
+    const ambiguousSibling = siblingRows.some((sibling) => !(neverMade(sibling)))
     const neverDispatched = row !== null
       && params.attempt.attemptRevision === 1
-      && row.createDispatchedAt === null && row.createDispatchIdempotencyKey === null
-      && row.externalTransactionId === null
-      && attemptProvenNeverMade(row)
-      && siblings === 0
+      && neverMade(row)
+      && !ambiguousSibling
     if (!neverDispatched) return { kind: 'blocked', problem }
     // Superseded as an ATTEMPT (its mirrored event is voided revivably), never as a cancelled sale.
     const retired = await retireSalesInvoiceForCancelledOrder(tx, params.attempt, params.referenceId, params.held, REGIME_POLICY_SUPERSEDED_NOTE, true)
