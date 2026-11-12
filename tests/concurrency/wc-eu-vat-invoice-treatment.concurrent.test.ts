@@ -1095,3 +1095,51 @@ test('[eu vat] a hold stamped _taxUnreconciled whose cause is STILL broken stays
   assert.match(after.errorMessage ?? '', /does not (still )?total the order|still does not total the order/)
   assert.notEqual(after.status, 'SYNCED')
 })
+
+// THE FRESH-BUILD COMPARISON: facts nobody listed. Prices, rate ids, tax types and the order total all stay as parked; only WooCommerce's per-line tax split moves.
+test('[eu vat] a treated hold where the per-line tax split shifts (a marked fee loses its tax to the goods line, total unchanged) is refused', { skip }, async (t) => {
+  const { after, rows } = await parkThenChange(t, true, PLUGIN('821'), (p) => {
+    p.fee_lines[0]!.total_tax = '0.00'; p.fee_lines[0]!.taxes = [{ id: p.fee_lines[0]!.taxes[0]!.id, total: '0.00' }]
+    p.line_items[0]!.total_tax = '19.76'; p.line_items[0]!.taxes = [{ id: p.line_items[0]!.taxes[0]!.id, total: '19.76', subtotal: '19.76' }]
+  })
+  assert.equal(rows.length, 0, 'nothing was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /the order changed after it was held \(.+\) and needs its invoice rebuilt|refuses it now|does not total the order/)
+  assert.notEqual(after.status, 'SYNCED')
+})
+
+async function domesticHoldMutated(t: test.TestContext, mutate: ((p: ReturnType<typeof domesticPayload>) => void) | null) {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = true
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seedDomestic(db, wcRateId)
+  t.after(async () => { switchOn = false; await cleanup(db, externalId, ctx) })
+  const extra: Meta = [{ id: 2, key: 'is_vat_exempt', value: 'no' }]
+  assert.equal((await importWcOrder(domesticPayload(externalId, wcRateId, extra) as never)).success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  const again = domesticPayload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...extra])
+  if (mutate) mutate(again)
+  await importWcOrder(again as never)
+  return { after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }), rows: await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId } }) }
+}
+
+test('[eu vat] CONTROL: the same domestic hold, unchanged, is released (the fresh build equals the parked payload)', { skip }, async (t) => {
+  const { after, rows } = await domesticHoldMutated(t, null)
+  assert.equal(rows.length, 1)
+  assert.equal(after.status, 'SYNCED')
+})
+
+test('[eu vat] a domestic treated hold where WooCommerce moves tax from the shipping to the goods line (prices, rate ids and the total unchanged) is refused', { skip }, async (t) => {
+  const { after, rows } = await domesticHoldMutated(t, (p) => {
+    p.shipping_lines[0]!.total_tax = '0.00'; p.shipping_lines[0]!.taxes = [{ id: p.shipping_lines[0]!.taxes[0]!.id, total: '0.00' }]; p.tax_lines[0]!.shipping_tax_total = '0.00'
+    p.line_items[0]!.total_tax = '22.00'; p.line_items[0]!.taxes = [{ id: p.line_items[0]!.taxes[0]!.id, total: '22.00', subtotal: '22.00' }]; p.tax_lines[0]!.tax_total = '22.00'
+  })
+  assert.equal(rows.length, 0, 'nothing was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /the order changed after it was held \(.+\) and needs its invoice rebuilt|does not total the order/)
+})

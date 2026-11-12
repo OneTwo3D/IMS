@@ -147,3 +147,56 @@ export function heldUntreatedTaxDifference(
 }
 
 export type { TreatableLine }
+
+/**
+ * THE AUTHORITY: A PARKED INVOICE AGAINST A FRESH BUILD OF THE SAME DOCUMENT FROM THE CURRENT ORDER (pure).
+ *
+ * The per-fact checks above name what they were written to catch; a document has more inputs than any list remembers. The importer's own builder is run again on the order as it is now (lines, shipping, discount, fees,
+ * tax types, the treatment, the payment legs) and the result is compared with the parked payload on EVERY field, so an input nobody listed cannot slip through. Only identity and timing fields are left out: the contact, dates and
+ * reference, the FX stamp and the receipt's identity. The treatment marker is left out too (its facts are checked above and its effects are in the lines). Returns the path of the first difference, or null when they are the same.
+ */
+const FRESH_COMPARE_EXCLUDED = new Set(['contactName', 'contactEmail', 'date', 'reference', 'currencyRateToBase', 'invoiceNumber', '_postingMode', '_paymentMethod', '_paymentDate', '_paymentSettlementRateToBase', '_paymentId', '_euVatTreatment'])
+
+const canonical = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(canonical)
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      const v = (value as Record<string, unknown>)[key]
+      if (v !== undefined) out[key] = canonical(v)
+    }
+    return out
+  }
+  return typeof value === 'number' && !Number.isFinite(value) ? String(value) : value
+}
+
+const firstDifference = (parked: unknown, fresh: unknown, path: string): string | null => {
+  if (Array.isArray(parked) || Array.isArray(fresh)) {
+    if (!Array.isArray(parked) || !Array.isArray(fresh)) return path
+    if (parked.length !== fresh.length) return `${path} (${parked.length} entries parked, ${fresh.length} now)`
+    for (let i = 0; i < parked.length; i++) {
+      const d = firstDifference(parked[i], fresh[i], `${path}[${i}]`)
+      if (d !== null) return d
+    }
+    return null
+  }
+  if (parked !== null && fresh !== null && typeof parked === 'object' && typeof fresh === 'object') {
+    const keys = [...new Set([...Object.keys(parked as object), ...Object.keys(fresh as object)])].sort()
+    for (const key of keys) {
+      const d = firstDifference((parked as Record<string, unknown>)[key], (fresh as Record<string, unknown>)[key], path === '' ? key : `${path}.${key}`)
+      if (d !== null) return d
+    }
+    return null
+  }
+  return parked === fresh ? null : path
+}
+
+export function heldFreshBuildDifference(parked: Record<string, unknown>, fresh: Record<string, unknown>): string | null {
+  const keep = (payload: Record<string, unknown>): Record<string, unknown> => {
+    const out: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(payload)) if (!FRESH_COMPARE_EXCLUDED.has(key)) out[key] = value
+    return canonical(JSON.parse(JSON.stringify(out))) as Record<string, unknown>
+  }
+  const path = firstDifference(keep(parked), keep(fresh), '')
+  return path === null ? null : `the parked invoice differs from the invoice the order produces now at ${path}`
+}

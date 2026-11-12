@@ -18,7 +18,8 @@ import { db } from '@/lib/db'
 import { UNRECONCILED_TAX_PAYLOAD_KEY as EU_UNRECONCILED_KEY } from '@/lib/domain/accounting/document-tax-reconciliation'
 import { logActivity } from '@/lib/activity-log'
 import { resolveEuVatRegime, type RegimeWarning } from '@/lib/domain/accounting/eu-vat-regime'
-import { stampEuVatRegime } from '@/lib/domain/accounting/eu-vat-regime-stamp'
+import { readEuVatRegimeStamp, stampEuVatRegime } from '@/lib/domain/accounting/eu-vat-regime-stamp'
+import type { Prisma } from '@/app/generated/prisma/client'
 import {
   applyEuVatTreatment, EU_VAT_TREATMENT_PAYLOAD_KEY, lineKindsOf, routeFor, type EuVatTreatmentPlan, type TreatablePayload,
 } from '@/lib/domain/accounting/eu-vat-treatment'
@@ -82,6 +83,11 @@ export async function treatImportedSalesInvoice(params: {
   }
 
   const stamp = outcome.stamp
+  return completeTreatment(params, stamp, decision, input, outcome.kind === 'stamped' ? outcome.warnings : [], taxBinding)
+}
+
+/** The route, the plan and the pure treatment, from a stamp already in hand: shared by the import (which stamps) and the held-invoice preview (which only reads the stamp). */
+async function completeTreatment(params: Parameters<typeof treatImportedSalesInvoice>[0], stamp: Parameters<typeof routeFor>[0], decision: Parameters<typeof routeFor>[1], input: Parameters<typeof routeFor>[2], warnings: RegimeWarning[], taxBinding: WcTaxBinding): Promise<TreatedInvoiceOutcome> {
   const routed = routeFor(stamp, decision, input)
   if (!routed.ok) return { kind: 'refused', reason: routed.reason }
 
@@ -97,7 +103,6 @@ export async function treatImportedSalesInvoice(params: {
   }
   const treated = applyEuVatTreatment(params.payload as TreatablePayload, plan)
   if (!treated.ok) return { kind: 'refused', reason: treated.reason }
-  const warnings = outcome.kind === 'stamped' ? outcome.warnings : []
   // An order the treatment left exactly as it was (no scheme, no B2B, no fee) keeps its payload byte for byte.
   if (treated.applied.route === 'none' && treated.applied.feesRecoded === 0) return { kind: 'treated', payload: params.payload, warnings, taxBinding }
   return {
@@ -120,4 +125,22 @@ export async function treatImportedSalesInvoice(params: {
     warnings,
     taxBinding,
   }
+}
+
+/**
+ * THE TREATMENT AS IT WOULD BE APPLIED NOW, WRITING NOTHING: the same mode, regime input, route and pure treatment as `treatImportedSalesInvoice`, but the order's EXISTING stamp is read (through `client`) instead of written, and is used only if it still agrees
+ * with the fresh decision (`routeFor` refuses otherwise). A held invoice is compared with this before it is released.
+ */
+export async function previewTreatedSalesInvoice(client: Prisma.TransactionClient, params: Parameters<typeof treatImportedSalesInvoice>[0]): Promise<TreatedInvoiceOutcome> {
+  const { isAccountingSyncTypeEnabledFor } = await import('@/lib/accounting')
+  if (params.connector !== 'xero' || !(await isAccountingSyncTypeEnabledFor(params.connector, 'SALES_INVOICE'))) return { kind: 'skipped', why: 'switch_off' }
+  if (params.storeCreditForeign.gt(0)) return { kind: 'skipped', why: 'store_credit' }
+  if (EU_UNRECONCILED_KEY in params.payload) return { kind: 'skipped', why: 'unreconciled' }
+  const taxBinding = await currentWcTaxBinding(params.wcOrder, params.mappedLines, params.taxBindingDeps)
+  const mode = await readEuVatRegimeMode()
+  if (mode === null) return { kind: 'refused', reason: 'the setting "eu_vat_regime_mode" holds a value that is neither adopt_plugin nor decide, so IMS cannot tell who decides the EU VAT regime' }
+  const input = await buildEuVatRegimeInput(client, params.wcOrder, { ioss: params.accounts.ioss, ddp: params.accounts.ddp }, { mode })
+  const stamp = await readEuVatRegimeStamp(client, params.orderId)
+  if (stamp === null) return { kind: 'refused', reason: 'the order carries no EU VAT regime stamp' }
+  return completeTreatment(params, stamp, resolveEuVatRegime(input), input, [], taxBinding)
 }
