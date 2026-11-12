@@ -4,7 +4,7 @@ import { assertNoLiveAsnForReceipt, ManualReceiptRefusedByLiveAsnError } from '@
 import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
 import { billTaxCodeDisagreementMessage, billTaxCodeDisagreements, inactiveBillRatesMessage, inactiveOrderRateMessage, inactiveOrderRateName, resolveOrderRateTaxCode, type OrderRateCandidate } from '@/lib/domain/purchasing/order-rate-tax-code'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
-import { purchaseBillNotSavedRefusal } from '@/lib/domain/accounting/purchase-document-tax-types'
+import { purchaseBillNotSavedRefusal, purchaseDocumentTaxTypeRefusal } from '@/lib/domain/accounting/purchase-document-tax-types'
 import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
@@ -5273,6 +5273,40 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       const disagreement = await billTaxCodeRefusal(billTreatments.map((t, i) => ({ description: `bill line ${i + 1}`, taxType: t.taxType, rate: t.rate, checkable: !t.reverseCharge })), 'credit note')
       if (disagreement) return { success: false, error: disagreement }
     }
+    // The credit's payload is built BEFORE the claim so an undecided tax type is refused while the credit is still a DRAFT: claiming first would leave it POSTED, refused by the poster with
+    // no Xero credit and no way back (posting requires DRAFT). A legacy bill line can reconstruct the right VAT and still have no mapped tax type.
+    // Single date for both the journal and its subledger row (they must share the GL date dimension the reconciliation windows on).
+    const creditNoteDate = new Date().toISOString().slice(0, 10)
+    const creditNotePayload = shouldQueueXero ? buildSupplierCreditNoteSyncPayload({
+      creditNoteId: cn.id,
+      creditNoteNumber: cn.creditNoteNumber,
+      reference: cn.reference,
+      reason: cn.reason,
+      supplierName: cn.po.supplier.name,
+      supplierId: cn.supplierId,
+      currency: cn.currency,
+      fxRateToBase: Number(cn.fxRateToBase),
+      amountForeign: Number(cn.amountForeign),
+      transitAccount: settings.transitAccount,
+      taxType: creditNoteTaxType,
+      // The rate that code was read from and how (lib/accounting/reverse-charge.ts): bound only when the type IS that rate's derivation (a purchase goods line, else its own code); a NONE or mixed-bill type that is neither stays unbound.
+      // The rate the code was read from (the bill line's booked rate id): bound on the goods-line basis for a reverse-charge credit, plain otherwise.
+      taxRateId: creditNoteTreatment.taxRateId,
+      taxRateBasis: creditNoteTreatment.taxRateId ? (isReverseCharge ? 'purchase_line' : 'plain') : undefined,
+      // Reverse-charge credits carry a NET amount → post EXCLUSIVE so Xero
+      // adds the notional VAT (mirroring the net/exclusive RC bill); all
+      // others carry a GROSS amount → INCLUSIVE.
+      lineAmountsIncludeTax: !isReverseCharge,
+      date: creditNoteDate,
+      // audit-v08m: allocate the credit to the bill once both have posted to
+      // Xero. Skipped when the bill has no external id yet (allocation needs it).
+      allocateToInvoiceId: cn.purchaseInvoice?.accountingInvoiceId ?? null,
+      allocateAmount: Number(cn.amountForeign),
+    }) : null
+    if (shouldQueueXero && creditNotePayload) {
+      const undecidedType = purchaseDocumentTaxTypeRefusal(`Supplier credit note ${cn.creditNoteNumber ?? cn.id}`, creditNotePayload as { lines?: ReadonlyArray<{ taxType?: unknown }> })
+      if (undecidedType) return { success: false, error: undecidedType }
+    }
     const postsLocallyOnly = creditNotePosting.verdict === 'post' && !shouldQueueXero && settings.syncEnabled
     if (postsLocallyOnly) {
       await logActivity({
@@ -5311,39 +5345,11 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       })
       if (claimed.count === 0) return false
       if (shouldQueueXero) {
-        // Single date for both the journal and its subledger row (they must share the
-        // GL date dimension the reconciliation windows on).
-        const creditNoteDate = new Date().toISOString().slice(0, 10)
         const queued = await queueAccountingSyncTx(tx, {
           type: 'PURCHASE_CREDIT_NOTE',
           referenceType: 'SupplierCreditNote',
           referenceId: cn.id,
-          payload: buildSupplierCreditNoteSyncPayload({
-            creditNoteId: cn.id,
-            creditNoteNumber: cn.creditNoteNumber,
-            reference: cn.reference,
-            reason: cn.reason,
-            supplierName: cn.po.supplier.name,
-            supplierId: cn.supplierId,
-            currency: cn.currency,
-            fxRateToBase: Number(cn.fxRateToBase),
-            amountForeign: Number(cn.amountForeign),
-            transitAccount: settings.transitAccount,
-            taxType: creditNoteTaxType,
-            // The rate that code was read from and how (lib/accounting/reverse-charge.ts): bound only when the type IS that rate's derivation (a purchase goods line, else its own code); a NONE or mixed-bill type that is neither stays unbound.
-            // The rate the code was read from (the bill line's booked rate id): bound on the goods-line basis for a reverse-charge credit, plain otherwise.
-            taxRateId: creditNoteTreatment.taxRateId,
-            taxRateBasis: creditNoteTreatment.taxRateId ? (isReverseCharge ? 'purchase_line' : 'plain') : undefined,
-            // Reverse-charge credits carry a NET amount → post EXCLUSIVE so Xero
-            // adds the notional VAT (mirroring the net/exclusive RC bill); all
-            // others carry a GROSS amount → INCLUSIVE.
-            lineAmountsIncludeTax: !isReverseCharge,
-            date: creditNoteDate,
-            // audit-v08m: allocate the credit to the bill once both have posted to
-            // Xero. Skipped when the bill has no external id yet (allocation needs it).
-            allocateToInvoiceId: cn.purchaseInvoice?.accountingInvoiceId ?? null,
-            allocateAmount: Number(cn.amountForeign),
-          }),
+          payload: creditNotePayload as Record<string, unknown>,
           idempotencyKey: `supplier-credit-note:${cn.id}`,
           // o3d-j625 r2: `settings.transitAccount` is on every line of the payload above and
           // `settings.reverseChargePurchaseTaxType` decides its tax code, so the row is routed by that

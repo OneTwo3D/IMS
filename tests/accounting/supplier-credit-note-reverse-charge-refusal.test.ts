@@ -199,3 +199,17 @@ test('CONTROL: a LOCAL-ONLY credit (Xero sync off, nothing goes to Xero) against
   assert.doesNotMatch(String(result.error ?? ''), /reverse-charge bills are not posted from IMS yet/)
   assert.equal(committed.syncRows.length, 0, 'nothing goes to Xero')
 })
+
+test('a LEGACY bill line that reconstructs the right VAT but has NO mapped tax type: the credit stays DRAFT, nothing is claimed or queued, and the refusal is returned', async () => {
+  reset()
+  const legacyLine = { poLineId: 'pl1', costLineId: null, totalForeign: new Prisma.Decimal('100'), taxBookedAt: null, taxType: null, taxRateValue: null, taxRateId: null, taxReverseCharge: null }
+  const credit = baseCredit('30', [legacyLine], '20') as Record<string, unknown> & { po: Record<string, unknown> }
+  // The order line is priced at 20% (tax 20 on net 100), so the legacy reconstruction reproduces the bill's VAT; its rate has no mapped accounting tax type.
+  credit.po = { ...credit.po, lines: [{ id: 'pl1', taxForeign: new Prisma.Decimal('20'), totalForeign: new Prisma.Decimal('100'), taxRate: { id: 'r-unmapped', accountingTaxType: null, reverseCharge: false, rate: new Prisma.Decimal('0.2'), isCompound: false, components: [] } }] }
+  CREDIT_NOTE = credit
+  const result = await post()
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /^NOTHING WAS SENT\. Supplier credit note CN-1 was refused: no tax type on line 1/)
+  assert.equal(committed.posted, 0, 'the credit note was NOT claimed DRAFT->POSTED')
+  assert.equal(committed.syncRows.length, 0, 'nothing was queued')
+})
