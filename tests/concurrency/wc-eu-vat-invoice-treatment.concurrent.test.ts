@@ -1535,3 +1535,39 @@ for (const history of ['retried', 'dispatched', 'attempted', 'sibling'] as const
     assert.match(message, /^NOTHING WAS SENT\. Sales invoice INV-1 was refused: the EU VAT regime settings changed since it was prepared.*may already have created the invoice in Xero.*check Xero for invoice INV-1 first.*Do not re-import the order until that is settled\./)
   })
 }
+
+// THE LAST WORD BEFORE THE SOCKET: the regime policy is re-checked by the callback the HTTP client runs as its last statement (beforePost), for both a create and an update.
+for (const kind of ['create', 'update'] as const) {
+  test(`[eu vat] the regime policy changes AFTER the early check but BEFORE the request leaves: the ${kind}'s last-word check refuses it and nothing is sent`, { skip }, async (t) => {
+    const db = await loadDb()
+    await mockAccounting()
+    const { euSchemePostingRefusal, regimePolicyLastCheck } = await import('@/lib/connectors/xero/scheme-posting-check')
+    const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+    const externalId = Math.floor(Math.random() * 2_000_000_000)
+    const ctx = await seed(db, wcRateId)
+    t.after(async () => { await db.setting.deleteMany({ where: { key: 'eu_vat_gift_card_flag_cut_in' } }); await cleanup(db, externalId, ctx) })
+    await seedXeroList(db, { TAX131: '0.000000' })
+    const policy = { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232' }
+    const payloadNow = { invoiceNumber: 'INV-L', _euVatTreatment: { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', vatAccount: '821', regimePolicy: policy } }
+    const request = {} as never
+    const last = regimePolicyLastCheck(payloadNow, kind)
+    // The early check passes and so does the last word while the settings are as recorded.
+    assert.equal(await euSchemePostingRefusal(payloadNow), null)
+    assert.deepEqual(await last(request), { ok: true })
+    // The cut-in is changed in the window between the early check and the socket (the number lookup, the preparation, the fence).
+    await db.setting.upsert({ where: { key: 'eu_vat_gift_card_flag_cut_in' }, create: { key: 'eu_vat_gift_card_flag_cut_in', value: '2026-12-01' }, update: { value: '2026-12-01' } })
+    const refused = await last(request)
+    assert.equal(refused.ok, false)
+    assert.match((refused as { error: string }).error, kind === 'create'
+      ? /^NOTHING WAS SENT\. Sales invoice INV-L was refused: the EU VAT regime settings changed since it was prepared \(cutIn\).*check Xero for invoice INV-L first/
+      : /^NOTHING WAS SENT\. The update of sales invoice INV-L was refused immediately before it left: the EU VAT regime settings changed since it was prepared \(cutIn\).*The invoice in Xero was not changed\./)
+    // An untreated payload is not checked.
+    assert.deepEqual(await regimePolicyLastCheck({ invoiceNumber: 'INV-U' }, kind)(request), { ok: true })
+  })
+}
+
+test('[eu vat] both posting cases hand the regime-policy last word to the HTTP client as its pre-socket authorization', () => {
+  const src = readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8')
+  assert.match(src, /beforePost: async \(request\) => \{ const lastPolicy = await regimePolicyLastCheck\(payload as Record<string, unknown>, 'create'\)\(request\); return lastPolicy\.ok \? numberFence\.beforePost\(request\) : lastPolicy \}/, 'the create composes it before the number fence')
+  assert.match(src, /beforePost: regimePolicyLastCheck\(payload as Record<string, unknown>, 'update'\)/, 'the update passes it as its beforePost')
+})
