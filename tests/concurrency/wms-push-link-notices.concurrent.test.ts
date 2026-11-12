@@ -480,7 +480,9 @@ test('REAL PORT, TWO AMENDMENTS OVERLAP: the older one finishing late cannot sto
     }
     const result = await d.sweep.runWmsOrderPushSweepCore(double as never, 'mintsoft', port, { batchSize: 500 })
     assert.equal(calls.removed + calls.cancelled, 0)
-    assert.ok((result.operatorNotices ?? 0) >= 1)
+    // B's lease is still live in the first variant (the removal is skipped and stays due); in the second B cleaned up, so there are no ids.
+    if (bCleansUp) assert.ok((result.operatorNotices ?? 0) >= 1)
+    else assert.equal(result.operatorNotices ?? 0, 0)
   }
 })
 
@@ -548,4 +550,59 @@ test('REAL PORT: a second acquisition reports that the mark was ALREADY set; the
   assert.ok(row.lineSnapshotUnsafeAt, 'releasing the lease leaves the mark set')
   assert.equal(row.amendLeaseOwner, null)
   assert.deepEqual(await port.readOrderItems!(link.id), [])
+})
+
+test('REAL PORT, REMOVAL vs AMENDMENT share ONE lease: the removal holds it and an amendment is refused; an amendment holds it and the removal is skipped; no destructive call uses stale ids', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `rml${randomUUID().slice(0, 8)}`
+  const s = await seed(d, tag, 'PROCESSING')
+  t.after(() => cleanup(d, s))
+  const link = await d.db.wmsOrderPushLink.create({ data: { orderId: s.orderId, connector: 'mintsoft', state: 'MERGED', externalOrderId: 'surv-r', externalOrderNumber: 'MS-E+MS-D', pushedAt: new Date() } })
+  const ids = [{ externalItemId: '1', sku: 'A', quantity: 1 }]
+  const port = d.sweep.createPrismaWmsOrderPushPort()
+  await port.replaceOrderItems!(s.orderId, 'o-r', ids)
+
+  // 1. The removal claims the lease: an amendment's acquisition is refused while it is held.
+  const claim = await port.claimLineIdsForRemoval!(link.id)
+  assert.equal(claim.kind, 'CLAIMED')
+  if (claim.kind !== 'CLAIMED') return
+  assert.deepEqual(claim.items, ids)
+  assert.equal(await port.setLineIdsUnsafe!(link.id, true), null, 'the amendment is refused while the removal holds the lease')
+  assert.deepEqual((await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })).lineSnapshotUnsafeAt, null, 'and it did not mark the ids')
+  assert.equal((await port.claimLineIdsForRemoval!(link.id)).kind, 'LEASED', 'two removals do not overlap either')
+  await port.releaseAmendLease!(link.id, claim.token)
+
+  // 2. An amendment holds the lease (and has marked the ids): the removal is skipped, so it can never act on the old ids.
+  const amend = await port.setLineIdsUnsafe!(link.id, true)
+  assert.ok(amend)
+  assert.equal((await port.claimLineIdsForRemoval!(link.id)).kind, 'LEASED')
+
+  // 3. Through the sweep: the cancel of the merged order does nothing while the amendment's lease is live.
+  await d.db.salesOrder.update({ where: { id: s.orderId }, data: { status: 'CANCELLED' } })
+  const calls = { removed: 0, cancelled: 0 }
+  const double = {
+    pushOrder: async () => { throw new Error('must not create') },
+    updateOrder: async () => ({ updated: true, status: 'NEW' }),
+    cancelOrder: async () => { calls.cancelled += 1; return { cancelled: true, status: 'CANCELLED' } },
+    cancelMergedOrder: async () => { calls.cancelled += 1; return { cancelled: true, status: 'CANCELLED' } },
+    removeOrderItems: async () => { calls.removed += 1; return { kind: 'REMOVED' as const, removed: ids } },
+    addOrderComment: async () => {},
+    verifyPushedOrder: async () => 'ours' as const,
+    probeOrderPresence: async () => 'FOUND' as const,
+  }
+  const result = await d.sweep.runWmsOrderPushSweepCore(double as never, 'mintsoft', port, { batchSize: 500 })
+  assert.equal(calls.removed + calls.cancelled, 0, 'no destructive call while the amendment holds the lease')
+  assert.equal(result.operatorNotices ?? 0, 0, 'skipped, not noticed')
+  assert.equal((await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })).state, 'MERGED')
+
+  // 4. The amendment finishes with a verified snapshot; the removal then runs, under the lease, with the FRESH ids.
+  const fresh = [{ externalItemId: '9', sku: 'A', quantity: 1 }]
+  await port.replaceOrderItems!(s.orderId, 'o-r', fresh, amend!.token)
+  let seen: unknown = null
+  ;(double as { removeOrderItems: unknown }).removeOrderItems = async (_id: string, items: unknown) => { seen = items; return { kind: 'REMOVED' as const, removed: items as typeof ids } }
+  await d.sweep.runWmsOrderPushSweepCore(double as never, 'mintsoft', port, { batchSize: 500 })
+  assert.deepEqual(seen, fresh, 'the removal used the fresh ids')
+  const after = await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })
+  assert.equal(after.state, 'CANCELLED')
+  assert.equal(after.amendLeaseOwner, null, 'the lease was released after the settlement')
 })

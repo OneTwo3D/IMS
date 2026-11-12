@@ -1047,6 +1047,12 @@ export interface WmsOrderPushPort {
    * While marked or leased, readOrderItems answers none.
    */
   setLineIdsUnsafe?(linkId: string, unsafe: boolean, token?: string): Promise<{ token: string; wasUnsafe: boolean } | null>
+  /**
+   * For the merged-order removal: in ONE transaction (the link row locked), take the amendment lease and read the recorded line ids.
+   * LEASED: another owner's lease is live (skip, stay due). UNTRUSTED: the ids are marked untrustworthy or none are recorded (no lease
+   * taken; the caller raises the notice). CLAIMED: the lease is held under `token` (release it with releaseAmendLease) and `items` are the ids.
+   */
+  claimLineIdsForRemoval?(linkId: string): Promise<{ kind: 'LEASED' } | { kind: 'UNTRUSTED' } | { kind: 'CLAIMED'; token: string; items: WmsOrderItemRef[] }>
   /** Release the lease held under `token` WITHOUT clearing the mark (an amendment that failed: the ids stay untrusted). */
   releaseAmendLease?(linkId: string, token: string): Promise<void>
   /** Forget these recorded line ids (lines IMS removed from a merged order). */
@@ -1363,7 +1369,7 @@ export async function runWmsOrderPushSweepCore(
    * operator notice, which now says exactly what was removed and what remains: nothing partial happens silently. A hold is never
    * handled here (only the cancel intent removes lines).
    */
-  const handleMergedCancel = async (link: WmsPushLinkRef, ts: Date) => {
+  const handleMergedCancelWithItems = async (link: WmsPushLinkRef, ts: Date, items: WmsOrderItemRef[]) => {
     const survivorId = link.externalOrderId
     if (!survivorId || !connector.removeOrderItems || !connector.cancelMergedOrder || !port.readOrderItems) {
       await raiseMergedNotice(link, 'CANCEL', ts)
@@ -1376,7 +1382,6 @@ export async function runWmsOrderPushSweepCore(
         `Cancelled in IMS, but ${survivorLabel} is a MERGED order that also holds other orders' goods, so IMS did not cancel it. ${detail} IMS has NOT recorded this order as cancelled in the WMS.`,
         { wmsStatus: 'MERGED', summary, comment: wmsNoticeComment('CANCEL', true) }, ts)
     }
-    const items = await port.readOrderItems(link.id)
     if (items.length === 0) {
       await notice(
         'IMS holds no record of the WMS line ids of this order (it was pushed before IMS recorded them, they could not be read, or an amendment left them untrustworthy), so it cannot tell which lines are this order\'s. Take this order\'s items out of it in the WMS before it ships.',
@@ -1449,6 +1454,35 @@ export async function runWmsOrderPushSweepCore(
       removal.removed.length > 0
         ? 'IMS removed some of the cancelled order\'s lines from the merged WMS order and could not finish — left for an operator'
         : 'IMS could not remove the cancelled order\'s lines from the merged WMS order — left for an operator')
+  }
+
+  /**
+   * The merged-order removal and settlement, under the link's AMENDMENT LEASE (the same lease an amendment takes, so the two are mutually
+   * exclusive). The lease, the mark and the line ids are claimed in ONE transaction (the real port locks the link row), the lease is held
+   * through the remote removal, the /Cancel and the link settlement, and released afterwards. While another owner's lease is live the link
+   * is skipped: it stays due and nothing is written or noticed. (A lease that expires mid-removal is the documented accepted limit.)
+   */
+  const handleMergedCancel = async (link: WmsPushLinkRef, ts: Date) => {
+    // (A connector without the removal methods is handled inside handleMergedCancelWithItems: it raises the plain notice.)
+    if (!link.externalOrderId || !port.readOrderItems) {
+      await raiseMergedNotice(link, 'CANCEL', ts)
+      return
+    }
+    if (!port.claimLineIdsForRemoval) {
+      await handleMergedCancelWithItems(link, ts, await port.readOrderItems(link.id))
+      return
+    }
+    const claim = await port.claimLineIdsForRemoval(link.id)
+    if (claim.kind === 'LEASED') return
+    if (claim.kind === 'UNTRUSTED') {
+      await handleMergedCancelWithItems(link, ts, [])
+      return
+    }
+    try {
+      await handleMergedCancelWithItems(link, ts, claim.items)
+    } finally {
+      await port.releaseAmendLease?.(link.id, claim.token).catch(() => {})
+    }
   }
 
   /**
@@ -3828,6 +3862,23 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         data: { lineSnapshotUnsafeAt: null, lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null },
       })
       return { token: token ?? '', wasUnsafe: false }
+    },
+    async claimLineIdsForRemoval(linkId) {
+      return db.$transaction(async (tx) => {
+        // The link row is locked first, so an amendment taking the lease (a compare-and-set on the same row) is serialised with this claim.
+        const rows = await tx.$queryRaw<Array<{ unsafe_at: Date | null; lease_expires_at: Date | null }>>`
+          SELECT line_snapshot_unsafe_at AS unsafe_at, amend_lease_expires_at AS lease_expires_at FROM wms_order_push_links WHERE id = ${linkId} FOR UPDATE`
+        const row = rows[0]
+        if (!row) return { kind: 'UNTRUSTED' as const }
+        const now = new Date()
+        if (row.lease_expires_at && row.lease_expires_at > now) return { kind: 'LEASED' as const }
+        if (row.unsafe_at) return { kind: 'UNTRUSTED' as const }
+        const stored = await tx.wmsOrderPushItem.findMany({ where: { linkId }, orderBy: { createdAt: 'asc' } })
+        if (stored.length === 0) return { kind: 'UNTRUSTED' as const }
+        const token = randomUUID()
+        await tx.wmsOrderPushLink.update({ where: { id: linkId }, data: { amendLeaseOwner: token, amendLeaseExpiresAt: new Date(now.getTime() + AMEND_LEASE_TTL_MS) } })
+        return { kind: 'CLAIMED' as const, token, items: stored.map((r) => ({ externalItemId: r.externalItemId, sku: r.sku, quantity: r.quantity })) }
+      })
     },
     async releaseAmendLease(linkId, token) {
       await db.wmsOrderPushLink.updateMany({ where: { id: linkId, amendLeaseOwner: token }, data: { amendLeaseOwner: null, amendLeaseExpiresAt: null } })

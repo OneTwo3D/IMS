@@ -1046,3 +1046,60 @@ test('CONTROL: a no-op retry that itself set the mark (nothing was set before) s
     assert.equal(store.unsafe, false)
   })
 })
+
+// ---------------------------------------------------------------- 16. review round 9 -----------------------------------------------
+
+function claimPort(claim: Awaited<ReturnType<NonNullable<WmsOrderPushPort['claimLineIdsForRemoval']>>>) {
+  const h = makePort({ cancellable: [mergedLinkRef()], items: null })
+  const released: string[] = []
+  h.port.claimLineIdsForRemoval = async () => claim
+  h.port.releaseAmendLease = async (_id, token) => { released.push(token) }
+  return { h, released }
+}
+
+test('REMOVAL LEASE: while another owner\'s lease is live the removal is skipped: nothing sent, nothing written, no notice, the link stays due', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const { h, released } = claimPort({ kind: 'LEASED' })
+    const result = await sweep(h.port)
+    assert.deepEqual(fake.requests, [])
+    assert.deepEqual(h.writes, [])
+    assert.equal(result.operatorNotices, undefined)
+    assert.deepEqual(released, [])
+  })
+})
+
+test('REMOVAL LEASE: the lease is held through the removal and the settlement, then released', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const { h, released } = claimPort({ kind: 'CLAIMED', token: 'lease-1', items: storedD })
+    const order: string[] = []
+    const upd = h.port.updateLinkIfLinked!
+    h.port.updateLinkIfLinked = async (id, expect, data) => { if (data.state === 'CANCELLED') order.push(`settle(released so far: ${released.length})`); return upd(id, expect, data) }
+    await sweep(h.port)
+    assert.deepEqual(survivorItems(), E_LINES)
+    assert.deepEqual(released, ['lease-1'])
+    assert.deepEqual(order, ['settle(released so far: 0)'], 'the link was settled BEFORE the lease was released')
+  })
+})
+
+test('REMOVAL LEASE: released even when the producer seam shadows the work (nothing sent)', async () => {
+  await withEnv(HELD, async () => {
+    seedMerged()
+    const { h, released } = claimPort({ kind: 'CLAIMED', token: 'lease-2', items: storedD })
+    await sweep(h.port)
+    assert.deepEqual(fake.requests, [])
+    assert.deepEqual(released, ['lease-2'])
+  })
+})
+
+test('REMOVAL LEASE: UNTRUSTED ids take no lease and raise the notice', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const { h, released } = claimPort({ kind: 'UNTRUSTED' })
+    const result = await sweep(h.port)
+    assert.equal(fake.requests.some((r) => r.method === 'DELETE' || r.path.endsWith('/Cancel')), false)
+    assert.equal(result.operatorNotices, 1)
+    assert.deepEqual(released, [])
+  })
+})
