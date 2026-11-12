@@ -303,6 +303,8 @@ export async function retireSalesInvoiceForCancelledOrder(
   held: HeldClaim,
   /** The note the retired row carries. Defaults to the cancelled-order one; a caller retiring the row for another reason (the invoice moved back to a held invoice) says so. */
   reason: string = 'Cancelled: order cancelled before this invoice posted (no revenue to recognise).',
+  /** The row is retired because THIS ATTEMPT is superseded, not because the sale is gone: its mirrored event is voided revivably, so the replacement attempt can take the document up. */
+  attemptOnly = false,
 ): Promise<boolean> {
   const fenced = attempt.attemptRevision !== UNCLAIMED_ATTEMPT_REVISION
   // BOTH claim identities in the predicate, and the retirement ADVANCES the one that is an identity.
@@ -341,6 +343,7 @@ export async function retireSalesInvoiceForCancelledOrder(
     referenceType: 'SalesOrder',
     referenceId: orderId,
     reason,
+    ...(attemptOnly ? { attemptOnly: true } : {}),
   })
   return true
 }

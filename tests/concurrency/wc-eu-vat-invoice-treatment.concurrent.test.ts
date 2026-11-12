@@ -80,7 +80,7 @@ async function mockAccounting() {
       isAccountingSyncTypeEnabledFor: async () => switchOn,
       queueAccountingSyncTxWithOutcome: async (tx: { accountingSyncLog: { create(args: unknown): Promise<unknown> } }, params: { type: string; referenceType: string; referenceId: string; payload: Record<string, unknown>; idempotencyKey?: string }) => {
         if (!switchOn && !recordWhenOff) return { queued: false, reason: 'not-configured' }
-        await tx.accountingSyncLog.create({ data: { type: params.type, status: 'PENDING', referenceType: params.referenceType, referenceId: params.referenceId, payload: { ...params.payload, _idempotencyKey: params.idempotencyKey } } })
+        await tx.accountingSyncLog.create({ data: { type: params.type, status: 'PENDING', referenceType: params.referenceType, referenceId: params.referenceId, attemptStampingCustodyAt: new Date(), payload: { ...params.payload, _idempotencyKey: params.idempotencyKey } } })
         return switchOn ? { queued: true, connector: 'xero' } : { queued: false, reason: 'not-configured' }
       },
     },
@@ -1436,7 +1436,8 @@ test('[eu vat] BOTH sales-invoice posting cases call the poster gate before anyt
 })
 
 // THE ROUND TRIP OF A QUEUED TREATED INVOICE WHOSE REGIME POLICY CHANGED: queued, cut-in changed, the poster's gate supersedes it into a held invoice (nothing sent), a re-import rebuilds and releases it under the current policy, or refuses it with the reason.
-async function queuedThenPolicyChange(t: test.TestContext, afterHold: 'releases' | 'refuses') {
+type BlockedInfo = { first: { kind: string; problem?: string }; second: { kind: string }; stillQueued: { status: string }; holds: number; ev: { status: string; voidBasis: string | null } }
+async function queuedThenPolicyChange(t: test.TestContext, afterHold: 'releases' | 'refuses', history: 'clean' | 'retried' | 'dispatched' | 'attempted' | 'sibling' = 'clean') {
   const db = await loadDb()
   await mockAccounting()
   switchOn = true
@@ -1463,27 +1464,39 @@ async function queuedThenPolicyChange(t: test.TestContext, afterHold: 'releases'
   assert.equal(policyAtQueue.cutIn, 'unset')
   // The cut-in is changed while the row waits; the poster then claims it.
   await db.setting.upsert({ where: { key: 'eu_vat_gift_card_flag_cut_in' }, create: { key: 'eu_vat_gift_card_flag_cut_in', value: afterHold === 'releases' ? '2026-12-01' : '2026-11-01' }, update: { value: afterHold === 'releases' ? '2026-12-01' : '2026-11-01' } })
+  const event = await db.accountingEvent.create({ data: { type: 'SALES_INVOICE', sourceEntityType: 'SalesOrder', sourceEntityId: orderId, businessDate: new Date(), idempotencyKey: `mirror-${externalId}`, linesJson: [], currency: 'GBP' } })
+  t.after(async () => { await db.accountingEventLog.deleteMany({ where: { accountingEventId: event.id } }); await db.accountingEvent.deleteMany({ where: { id: event.id } }) })
   const startedAt = new Date()
-  await db.accountingSyncLog.update({ where: { id: queued.id }, data: { status: 'PROCESSING', processingStartedAt: startedAt, attemptRevision: 1 } })
-  const args = { attempt: { id: queued.id, attemptRevision: 1 }, held: { heldFrom: () => startedAt }, referenceType: 'SalesOrder', referenceId: orderId, payload: queued.payload as unknown as Record<string, unknown> }
+  const revision = history === 'retried' ? 2 : 1
+  await db.accountingSyncLog.update({ where: { id: queued.id }, data: { status: 'PROCESSING', processingStartedAt: startedAt, attemptStampingCustodyAt: startedAt, attemptRevision: revision, ...(history === 'dispatched' ? { createDispatchedAt: new Date(), createDispatchIdempotencyKey: 'k-prior' } : {}), ...(history === 'attempted' ? { remoteAttemptedAt: new Date() } : {}) } })
+  if (history === 'sibling') await db.accountingSyncLog.create({ data: { type: 'SALES_INVOICE', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: orderId, externalTransactionId: 'xero-inv-1', attemptStampingCustodyAt: new Date(), payload: {} } })
+  const args = { attempt: { id: queued.id, attemptRevision: revision }, held: { heldFrom: () => startedAt }, referenceType: 'SalesOrder', referenceId: orderId, payload: queued.payload as unknown as Record<string, unknown> }
   const first = await holdInvoiceOnRegimePolicyChange(args as never)
   const second = await holdInvoiceOnRegimePolicyChange(args as never)
   const retired = await db.accountingSyncLog.findUniqueOrThrow({ where: { id: queued.id } })
-  const hold = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
-  const parked = (hold.payload as unknown as { accountingPayload: Record<string, unknown> }).accountingPayload
-  const afterPark = { first, second, retired, parkedMarker: parked._euVatTreatment as Record<string, unknown>, parkedHasNumber: 'invoiceNumber' in parked, queuedRows: await db.accountingSyncLog.count({ where: { type: 'SALES_INVOICE', referenceId: orderId } }), holdMessage: hold.errorMessage }
+  const hold = await db.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  if (history !== 'clean') {
+    const stillQueued = await db.accountingSyncLog.findUniqueOrThrow({ where: { id: queued.id } })
+    const ev = await db.accountingEvent.findUniqueOrThrow({ where: { id: event.id }, select: { status: true, voidBasis: true } })
+    return { blocked: { first, second, stillQueued, holds: hold === null ? 0 : 1, ev } as BlockedInfo | null, afterPark: null as never, rows: [] as Array<{ payload: unknown }>, holdAfter: null as never, gate: undefined as string | null | undefined }
+  }
+  const parked = (hold!.payload as unknown as { accountingPayload: Record<string, unknown> }).accountingPayload
+  const eventAfterPark = await db.accountingEvent.findUniqueOrThrow({ where: { id: event.id }, select: { status: true, voidBasis: true } })
+  const holdCount = await db.shoppingSyncLog.count({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  const afterPark = { eventAfterPark, holdCount, first, second, retired, parkedMarker: parked._euVatTreatment as Record<string, unknown>, parkedHasNumber: 'invoiceNumber' in parked, queuedRows: await db.accountingSyncLog.count({ where: { type: 'SALES_INVOICE', referenceId: orderId } }), holdMessage: hold!.errorMessage }
   // The re-import (with the number) rebuilds under the policy now in force.
   const again = payload(externalId, wcRateId, number)
   if (afterHold === 'refuses') again.line_items[0]!.meta_data = []
   await importWcOrder(again as never)
   const rows = await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId, status: 'PENDING' } })
-  const holdAfter = await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: hold.id } })
-  return { afterPark, rows, holdAfter, gate: rows[0] ? await euSchemePostingRefusal(rows[0].payload as unknown as Record<string, unknown>) : undefined }
+  const holdAfter = await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: hold!.id } })
+  return { blocked: null as BlockedInfo | null, afterPark, rows, holdAfter, gate: rows[0] ? await euSchemePostingRefusal(rows[0].payload as unknown as Record<string, unknown>) : undefined }
 }
 
 test('[eu vat] ROUND TRIP: a queued treated invoice whose cut-in changed is superseded into a held invoice (nothing sent), and the re-import releases it under the current policy, which the poster gate then accepts', { skip }, async (t) => {
   const { afterPark, rows, holdAfter, gate } = await queuedThenPolicyChange(t, 'releases')
   assert.equal(afterPark.first.kind, 'held')
+  assert.deepEqual([afterPark.eventAfterPark.status, afterPark.eventAfterPark.voidBasis], ['VOID', 'attempt_settled_not_posted'], 'the mirrored event is voided as a retired ATTEMPT (revivable), never as a cancelled sale')
   assert.equal(afterPark.second.kind, 'lost', 'a second handling of the same attempt finds the row already moved on and changes nothing')
   assert.equal(afterPark.retired.status, 'CANCELLED')
   assert.match(afterPark.retired.errorMessage ?? '', /^Superseded: the EU VAT regime settings changed since this invoice was prepared.*re-import the order from WooCommerce/)
@@ -1506,3 +1519,19 @@ test('[eu vat] ROUND TRIP: the same superseded invoice, re-imported under a cut-
   assert.equal(holdAfter.status, 'PENDING')
   assert.match(holdAfter.errorMessage ?? '', /gift-card flag/)
 })
+
+// NOTHING IS SUPERSEDED WITHOUT DURABLE PROOF THAT NO CREATE WAS EVER DISPATCHED: a row whose earlier attempt may have created the invoice in Xero is left refused for ledger reconciliation (a release under a new idempotency key would bypass the prior-attempt check).
+for (const history of ['retried', 'dispatched', 'attempted', 'sibling'] as const) {
+  test(`[eu vat] a policy change on a row with prior history (${history}) is NOT superseded: no hold, the row and its mirror are untouched, and the refusal says to reconcile with Xero first`, { skip }, async (t) => {
+    const { blocked: found } = await queuedThenPolicyChange(t, 'releases', history)
+    const blocked = found!
+    assert.equal(blocked.first.kind, 'blocked')
+    assert.equal(blocked.second.kind, 'blocked')
+    assert.equal(blocked.stillQueued.status, 'PROCESSING', 'the row was not retired')
+    assert.equal(blocked.holds, 0, 'no held invoice was created')
+    assert.deepEqual([blocked.ev.status, blocked.ev.voidBasis], ['PENDING', null], 'the mirrored event was not touched')
+    const { REGIME_POLICY_BLOCKED_REFUSAL } = await import('@/lib/connectors/woocommerce/sync/regime-policy-hold')
+    const message = REGIME_POLICY_BLOCKED_REFUSAL('INV-1', blocked.first.problem ?? '')
+    assert.match(message, /^NOTHING WAS SENT\. Sales invoice INV-1 was refused: the EU VAT regime settings changed since it was prepared.*may already have created the invoice in Xero.*check Xero for invoice INV-1 first.*Do not re-import the order until that is settled\./)
+  })
+}

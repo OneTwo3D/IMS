@@ -15,7 +15,15 @@ import { regimePolicyProblem } from '@/lib/domain/accounting/eu-vat-regime-polic
 import { EU_VAT_TREATMENT_PAYLOAD_KEY } from '@/lib/domain/accounting/eu-vat-treatment'
 import type { AttemptRef } from '@/lib/domain/accounting/sync-log-attempt'
 import type { HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
+import { attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
+import { PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR } from '@/lib/domain/accounting/prior-posting-evidence'
 import { buildHeldSalesInvoicePayload, heldSalesInvoiceQueueWhere, HELD_SALES_INVOICE_RECORD_KIND } from './held-sales-invoice'
+
+/** What the operator is told when the invoice cannot be superseded because an earlier attempt may already have created it. */
+export const REGIME_POLICY_BLOCKED_REFUSAL = (invoiceNumber: string, problem: string): string =>
+  `NOTHING WAS SENT. Sales invoice ${invoiceNumber} was refused: ${problem}, and an earlier attempt on this row may already have created the invoice in Xero, so IMS cannot rebuild it. This row is left refused. Resolve it on /sync: check Xero for invoice ${invoiceNumber} first, and record it on the row if it exists there. Do not re-import the order until that is settled.`
+
+const SALES_INVOICE_SYNC_TYPES = ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] as const
 
 export const REGIME_POLICY_SUPERSEDED_NOTE = 'Superseded: the EU VAT regime settings changed since this invoice was prepared, so it was moved back to a held invoice; re-import the order from WooCommerce to rebuild and release it under the settings now in force.'
 
@@ -28,6 +36,7 @@ export type RegimePolicyHoldOutcome =
   | { kind: 'held' }                                // superseded and parked as a held invoice
   | { kind: 'lost' }                                // the claim or attempt moved on: nothing was changed
   | { kind: 'refuse'; problem: string }             // changed, but it cannot be parked (not a WooCommerce order): the poster refuses it
+  | { kind: 'blocked'; problem: string }            // changed, but an earlier attempt may have created the invoice in Xero: never superseded, left refused for ledger reconciliation
 
 export async function holdInvoiceOnRegimePolicyChange(params: {
   attempt: AttemptRef
@@ -47,7 +56,25 @@ export async function holdInvoiceOnRegimePolicyChange(params: {
     const link = await tx.shoppingOrderLink.findFirst({ where: { orderId: params.referenceId, connector: 'woocommerce' }, select: { externalOrderId: true, externalOrderNumber: true } })
     if (!link) return { kind: 'refuse', problem }
     // Retire the queued row first: fenced on the claim and the attempt, so a concurrent post or retry makes this fail and nothing is parked.
-    const retired = await retireSalesInvoiceForCancelledOrder(tx, params.attempt, params.referenceId, params.held, REGIME_POLICY_SUPERSEDED_NOTE)
+    // DURABLE PROOF THAT NO CREATE WAS EVER DISPATCHED FOR THIS ROW, or nothing is superseded: a superseded row is replaced by a release under a NEW idempotency key, which a prior attempt's evidence (scoped to the old key) would not stop, so a create that
+    // landed unrecorded would be created twice. The proof is positive and from the row itself: this is its first claim ever (revision 1); no dispatch marker (`createDispatchedAt`, write-once and trigger-protected, minted inside the claim fence before the
+    // socket) and no dispatch key; no remote-attempt stamp under custody (`attemptProvenNeverMade`); no document id; and no other live or posted sales-invoice row for the order. Anything else is ambiguous and is left refused for ledger reconciliation.
+    const row = await tx.accountingSyncLog.findUnique({
+      where: { id: params.attempt.id },
+      select: { createDispatchedAt: true, createDispatchIdempotencyKey: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true, externalTransactionId: true },
+    })
+    const siblings = await tx.accountingSyncLog.count({
+      where: { id: { not: params.attempt.id }, referenceType: 'SalesOrder', referenceId: params.referenceId, type: { in: [...SALES_INVOICE_SYNC_TYPES] }, OR: PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR },
+    })
+    const neverDispatched = row !== null
+      && params.attempt.attemptRevision === 1
+      && row.createDispatchedAt === null && row.createDispatchIdempotencyKey === null
+      && row.externalTransactionId === null
+      && attemptProvenNeverMade(row)
+      && siblings === 0
+    if (!neverDispatched) return { kind: 'blocked', problem }
+    // Superseded as an ATTEMPT (its mirrored event is voided revivably), never as a cancelled sale.
+    const retired = await retireSalesInvoiceForCancelledOrder(tx, params.attempt, params.referenceId, params.held, REGIME_POLICY_SUPERSEDED_NOTE, true)
     if (!retired) return { kind: 'lost' }
     const erased = await orderIsErasedInTx(tx, params.referenceId)
     // What the queue adds is not part of the held payload: the number comes back from the order at release, and the release builds its own idempotency key.
