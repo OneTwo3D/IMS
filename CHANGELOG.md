@@ -10,6 +10,10 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### CI: ledger standing-reader check heap
+
+- **Fixed: `check:ledger-standing-readers` ran out of memory.** The scan grew past its 3 GB V8 heap cap and aborted (exit 134) in CI and in `check:all`. The cap is now 5632 MB, the same as the production-readiness job. Backend/CI only; no behaviour change.
+
 ### Xero accounting audit fixes: bill VAT, supplier-document tax types and payment dates
 
 - **Fixed: bill VAT uses each line's own rate.** IMS recorded a bill's VAT as the order's total VAT divided by its goods subtotal, so goods 100 at 20% plus vatable freight 50 recorded 45 of VAT (a "30%" rate) instead of 30, and a mixed-rate order billed in part was wrong too. The bill's VAT is now the sum of each billed line's own rate on its own net (a vatable cost line at the order's rate, a non-vatable one at none), so its total agrees with what Xero computes from the tax types. Tax types sent to Xero are unchanged.
