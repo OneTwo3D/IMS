@@ -4,7 +4,7 @@ import test from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
 import { resolveEuVatRegime } from '@/lib/domain/accounting/eu-vat-regime'
 import {
-  buildEuVatRegimeInput, giftCardFlagPolicy, loadRateMappings, readPluginFx, readEasFact, readGoodsLines, readRateTax, readVatRecord, readWcEuVatFacts, resolveThresholdFx, type EuVatRegimeInputClient,
+  buildEuVatRegimeInput, buildEuVatRegimeInputFromSettings, giftCardFlagPolicy, giftCardOrderedAt, loadRateMappings, readPluginFx, readEasFact, readGoodsLines, readRateTax, readVatRecord, readWcEuVatFacts, resolveThresholdFx, type EuVatRegimeInputClient,
 } from '@/lib/connectors/woocommerce/sync/eu-vat-facts'
 import type { WcFullOrder, WcMeta } from '@/lib/connectors/woocommerce/sync/types'
 
@@ -177,14 +177,14 @@ test('threshold FX: a missing rate is unavailable, never defaulted, and the reso
   const at = new Date('2026-11-01T10:00:00Z')
   const missing = await resolveThresholdFx(fakeClient({ fxRows: [{ toCurrency: 'USD', rate: '1.25' }] }), { currency: 'USD', destination: 'DE', orderedAt: at, baseCurrency: 'GBP' })
   assert.equal(missing.state, 'unavailable')
-  const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder({ currency: 'USD' }), { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide' })
+  const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder({ currency: 'USD' }), { ioss: '821', ddp: '232' }, { giftCardCutIn: { state: 'unset' }, baseCurrency: 'GBP', mode: 'decide' })
   assert.equal(input.thresholdFx.state, 'unavailable')
   const decision = resolveEuVatRegime(input)
   assert.equal(decision.kind === 'REFUSE' && decision.code, 'threshold_value_unavailable')
 })
 
 test('a whole order reads into a decision: DE, EUR 100 plus 19 VAT on the mapped scheme rate is IOSS on 821', async () => {
-  const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder(), { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide' })
+  const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder(), { ioss: '821', ddp: '232' }, { giftCardCutIn: { state: 'unset' }, baseCurrency: 'GBP', mode: 'decide' })
   assert.deepEqual(input.rates, [{ wooRateId: 216, tax: '19', mapping: await loadRateMappings(fakeClient({ mappings: [mappingRow(216, {})] }), [216]).then((m) => m.get(216)!) }])
   const decision = resolveEuVatRegime(input)
   assert.equal(decision.kind, 'SCHEME')
@@ -193,21 +193,21 @@ test('a whole order reads into a decision: DE, EUR 100 plus 19 VAT on the mapped
 })
 
 test('an order with no creation date cannot be valued: the threshold fact is unavailable', async () => {
-  const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder({ date_created_gmt: '', date_created: 'not a date' }), { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP' })
+  const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder({ date_created_gmt: '', date_created: 'not a date' }), { ioss: '821', ddp: '232' }, { giftCardCutIn: { state: 'unset' }, baseCurrency: 'GBP' })
   assert.equal(input.thresholdFx.state, 'unavailable')
 })
 
 test('adopt mode end to end (the default): the plugin account decides and its conversion record lands in the basis', async () => {
   const withMeta = wcOrder({ line_items: [{ id: 1, total: '200.00', meta_data: [] }] as never, meta_data: [meta('_o3d_ioss_vat_account', '232'), meta('_o3d_ioss_fx_rate', '1'), meta('_o3d_ioss_fx_pair', 'EUR>EUR'), meta('_o3d_ioss_threshold_value', '200.00')] })
-  const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), withMeta, { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP' })
+  const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), withMeta, { ioss: '821', ddp: '232' }, { giftCardCutIn: { state: 'unset' }, baseCurrency: 'GBP' })
   assert.equal(input.mode, 'adopt_plugin')
   const d = resolveEuVatRegime(input)
   assert.equal(d.kind === 'SCHEME' && d.regime, 'DDP')
   assert.equal(d.kind === 'SCHEME' && d.basis.pluginFx.recorded && d.basis.pluginFx.rate, '1')
   // the same order without the account refuses; in decide mode it decides by value
-  const bare = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder(), { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP' })
+  const bare = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder(), { ioss: '821', ddp: '232' }, { giftCardCutIn: { state: 'unset' }, baseCurrency: 'GBP' })
   assert.equal(resolveEuVatRegime(bare).kind === 'REFUSE' && (resolveEuVatRegime(bare) as { code: string }).code, 'plugin_account_missing')
-  const decide = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder(), { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide' })
+  const decide = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder(), { ioss: '821', ddp: '232' }, { giftCardCutIn: { state: 'unset' }, baseCurrency: 'GBP', mode: 'decide' })
   assert.equal(decide.mode, 'decide')
   assert.equal(resolveEuVatRegime(decide).kind === 'SCHEME' && (resolveEuVatRegime(decide) as { regime: string }).regime, 'IOSS')
 })
@@ -230,8 +230,35 @@ test('gift-card cut-in: unset is off; an order at or after the cut-in needs a fl
   const flagged = wcOrder({ line_items: [{ id: 1, total: '100.00', meta_data: [meta('_o3d_is_voucher', 'no')] }, { id: 2, total: '5.00', meta_data: [meta('_o3d_is_voucher', 'yes')] }] as never })
   const ok = await buildEuVatRegimeInput(client, flagged, { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide', giftCardCutIn: { state: 'ok', at: new Date('2026-10-01T00:00:00Z') } })
   assert.equal(resolveEuVatRegime(ok).kind, 'SCHEME')
-  const unset = await buildEuVatRegimeInput(client, unflagged, { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide' })
+  const unset = await buildEuVatRegimeInput(client, unflagged, { ioss: '821', ddp: '232' }, { giftCardCutIn: { state: 'unset' }, baseCurrency: 'GBP', mode: 'decide' })
   assert.equal(unset.giftCardFlag, 'off')
+})
+
+test('gift-card cut-in: an "unknown" flag value is missing; the comparison uses date_created_gmt only; the setting is read in the production path and fails closed', async () => {
+  const client = fakeClient({ mappings: [mappingRow(216, {})] })
+  const acc = { ioss: '821', ddp: '232' }
+  const cutIn = async () => ({ state: 'ok' as const, at: new Date('2026-10-01T00:00:00Z') })
+  const withUnknown = wcOrder({ line_items: [{ id: 1, total: '100.00', meta_data: [meta('_o3d_is_voucher', 'no')] }, { id: 2, total: '5.00', meta_data: [meta('_o3d_is_voucher', 'unknown')] }] as never })
+  const r = await buildEuVatRegimeInputFromSettings(client, withUnknown, acc, { baseCurrency: 'GBP', mode: 'decide' }, cutIn)
+  assert.equal(r.goodsLines[1]!.voucher, 'unknown')
+  assert.equal((resolveEuVatRegime(r) as { code?: string }).code, 'gift_card_flag_missing')
+  // production path with the setting unset: lenient
+  const unset = await buildEuVatRegimeInputFromSettings(client, withUnknown, acc, { baseCurrency: 'GBP', mode: 'decide' }, async () => ({ state: 'unset' }))
+  assert.equal(unset.giftCardFlag, 'off')
+  // a setting read that throws, or an invalid stored value, refuses
+  for (const reader of [async () => { throw new Error('db down') }, async () => ({ state: 'invalid' as const, raw: 'x' })]) {
+    const bad = await buildEuVatRegimeInputFromSettings(client, withUnknown, acc, { baseCurrency: 'GBP', mode: 'decide' }, reader)
+    assert.equal(bad.giftCardFlag, 'setting_unreadable')
+    assert.equal((resolveEuVatRegime(bad) as { code?: string }).code, 'gift_card_cut_in_unreadable')
+  }
+  // no GMT date: date_created (store-local, timezone not stored) is never used for the cut-in
+  assert.ok(Number.isNaN(giftCardOrderedAt({ date_created_gmt: '' }).getTime()))
+  const noGmt = await buildEuVatRegimeInputFromSettings(client, wcOrder({ date_created_gmt: '', date_created: '2026-11-01T10:00:00' }), acc, { baseCurrency: 'GBP', mode: 'decide' }, cutIn)
+  assert.equal(noGmt.giftCardFlag, 'setting_unreadable')
+  // exact boundary on the GMT date
+  const at = (g: string) => giftCardFlagPolicy({ state: 'ok', at: new Date('2026-11-01T10:00:00Z') }, giftCardOrderedAt({ date_created_gmt: g }))
+  assert.equal(at('2026-11-01T09:59:59'), 'off')
+  assert.equal(at('2026-11-01T10:00:00'), 'required')
 })
 
 // ---- unreadable figures are named, never defaulted to 0 -------------------------------------------------------------------------------------------------------------
@@ -268,7 +295,7 @@ test('every malformed figure refuses the order end to end, before it is resolved
     ['order tax', { total_tax: 'n/a' }],
   ]
   for (const [name, over] of bad) {
-    const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder(over), { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode: 'decide' })
+    const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), wcOrder(over), { ioss: '821', ddp: '232' }, { giftCardCutIn: { state: 'unset' }, baseCurrency: 'GBP', mode: 'decide' })
     const d = resolveEuVatRegime(input)
     assert.equal(d.kind === 'REFUSE' && d.code, 'order_figure_unreadable', name)
   }
@@ -293,7 +320,7 @@ test('a plugin FX field that is present but unreadable is an unreadable figure (
   // end to end: both modes refuse first with order_figure_unreadable, before any adopt-mode FX check
   for (const mode of ['adopt_plugin', 'decide'] as const) {
     const order = withFx([['_o3d_ioss_vat_account', '821'], ['_o3d_ioss_fx_rate', 'abc'], good[1]!, good[2]!])
-    const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), order, { ioss: '821', ddp: '232' }, { baseCurrency: 'GBP', mode })
+    const input = await buildEuVatRegimeInput(fakeClient({ mappings: [mappingRow(216, {})] }), order, { ioss: '821', ddp: '232' }, { giftCardCutIn: { state: 'unset' }, baseCurrency: 'GBP', mode })
     const d = resolveEuVatRegime(input)
     assert.equal(d.kind === 'REFUSE' && d.code, 'order_figure_unreadable', mode)
   }

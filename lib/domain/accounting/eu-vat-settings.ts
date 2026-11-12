@@ -60,8 +60,13 @@ export function parseGiftCardCutIn(raw: string | null | undefined): GiftCardCutI
   const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(text)
   const instant = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/.test(text)
   if (!dateOnly && !instant) return { state: 'invalid', raw: text.slice(0, 40) }
+  // Validate the calendar and clock components of BOTH forms: Date silently rolls 2026-02-31 over (or rejects it only in some forms), so the guess would move the cut-in.
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d{1,3})?(?:Z|[+-](\d{2}):(\d{2})))?$/.exec(text)!
+  const [year, month, day] = [Number(m[1]), Number(m[2]), Number(m[3])]
+  const probe = new Date(Date.UTC(year, month - 1, day))
+  if (probe.getUTCFullYear() !== year || probe.getUTCMonth() !== month - 1 || probe.getUTCDate() !== day) return { state: 'invalid', raw: text.slice(0, 40) }
+  if (instant && (Number(m[4]) > 23 || Number(m[5]) > 59 || (m[6] !== undefined && Number(m[6]) > 59) || (m[7] !== undefined && (Number(m[7]) > 23 || Number(m[8]) > 59)))) return { state: 'invalid', raw: text.slice(0, 40) }
   const at = new Date(dateOnly ? `${text}T00:00:00Z` : text)
-  // Date rolls invalid calendar days (2026-02-31) over silently in some forms; require the date part to survive the round trip when it is date-only.
-  if (Number.isNaN(at.getTime()) || (dateOnly && at.toISOString().slice(0, 10) !== text)) return { state: 'invalid', raw: text.slice(0, 40) }
+  if (Number.isNaN(at.getTime())) return { state: 'invalid', raw: text.slice(0, 40) }
   return { state: 'ok', at }
 }

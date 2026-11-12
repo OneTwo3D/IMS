@@ -52,5 +52,5 @@ test('the gift-card flag cut-in is unset by default, takes a date (start of day 
   assert.ok(day.state === 'ok' && day.at.toISOString() === '2026-12-01T00:00:00.000Z')
   const inst = parseGiftCardCutIn('2026-12-01T10:30:00+01:00')
   assert.ok(inst.state === 'ok' && inst.at.toISOString() === '2026-12-01T09:30:00.000Z')
-  for (const bad of ['01/12/2026', '2026-13-01', '2026-02-31', 'soon', '2026-12-01T10:00:00', '1764547200']) assert.equal(parseGiftCardCutIn(bad).state, 'invalid', bad)
+  for (const bad of ['01/12/2026', '2026-13-01', '2026-02-31', '2026-02-31T10:00:00Z', '2026-04-31T10:00:00+01:00', '2026-12-01T24:00:00Z', '2026-12-01T10:60:00Z', '2026-12-01T10:00:00+25:00', 'soon', '2026-12-01T10:00:00', '1764547200']) assert.equal(parseGiftCardCutIn(bad).state, 'invalid', bad)
 })

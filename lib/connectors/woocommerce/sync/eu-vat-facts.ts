@@ -263,6 +263,15 @@ export async function readGiftCardFlagCutIn(): Promise<GiftCardCutIn> {
   return parseGiftCardCutIn(values.get(EU_VAT_GIFT_CARD_CUT_IN_SETTING))
 }
 
+/**
+ * The instant the cut-in is compared with: `date_created_gmt` ONLY. `date_created` is in the store's local time and IMS does not store the store timezone, so it is never converted or guessed: with no
+ * readable GMT date the result is an invalid Date, which `giftCardFlagPolicy` turns into `setting_unreadable` (a refusal) when a cut-in is set.
+ */
+export function giftCardOrderedAt(order: Pick<WcFullOrder, 'date_created_gmt'>): Date {
+  const gmt = (order.date_created_gmt ?? '').toString().trim()
+  return gmt === '' ? new Date(Number.NaN) : parseWcGmtInstant(gmt)
+}
+
 /** Whether the order must carry the gift-card flag on every line: it was created at or after the cut-in. An unset cut-in is `off`; an invalid one, or a set one with no readable order date, is `setting_unreadable`. */
 export function giftCardFlagPolicy(cutIn: GiftCardCutIn, orderedAt: Date): 'off' | 'required' | 'setting_unreadable' {
   if (cutIn.state === 'unset') return 'off'
@@ -277,7 +286,7 @@ export async function buildEuVatRegimeInput(
   client: EuVatRegimeInputClient,
   order: WcFullOrder,
   accounts: { ioss: string | null; ddp: string | null },
-  options: { baseCurrency?: string; mode?: EuVatRegimeMode; giftCardCutIn?: GiftCardCutIn } = {},
+  options: { baseCurrency?: string; mode?: EuVatRegimeMode; giftCardCutIn: GiftCardCutIn },
 ): Promise<EuVatRegimeInput> {
   const facts = readWcEuVatFacts(order)
   const mappings = await loadRateMappings(client, facts.rateTax.map((r) => r.wooRateId))
@@ -289,5 +298,25 @@ export async function buildEuVatRegimeInput(
     : await resolveThresholdFx(client, { currency: facts.currency, destination, orderedAt, baseCurrency: options.baseCurrency })
   const { rateTax: _rateTax, ...rest } = facts
   void _rateTax
-  return { ...rest, mode: options.mode ?? 'adopt_plugin', rates, thresholdFx, accounts, giftCardFlag: giftCardFlagPolicy(options.giftCardCutIn ?? { state: 'unset' }, orderedAt) }
+  return { ...rest, mode: options.mode ?? 'adopt_plugin', rates, thresholdFx, accounts, giftCardFlag: giftCardFlagPolicy(options.giftCardCutIn, giftCardOrderedAt(order)) }
+}
+
+/**
+ * The production entry: reads the gift-card cut-in setting itself and passes its parsed state to `buildEuVatRegimeInput` explicitly. A setting that cannot be read (the read throws) is an invalid cut-in, which refuses the order
+ * (`gift_card_cut_in_unreadable`); it is never treated as unset.
+ */
+export async function buildEuVatRegimeInputFromSettings(
+  client: EuVatRegimeInputClient,
+  order: WcFullOrder,
+  accounts: { ioss: string | null; ddp: string | null },
+  options: { baseCurrency?: string; mode?: EuVatRegimeMode } = {},
+  readCutIn: () => Promise<GiftCardCutIn> = readGiftCardFlagCutIn,
+): Promise<EuVatRegimeInput> {
+  let giftCardCutIn: GiftCardCutIn
+  try {
+    giftCardCutIn = await readCutIn()
+  } catch {
+    giftCardCutIn = { state: 'invalid', raw: 'setting could not be read' }
+  }
+  return buildEuVatRegimeInput(client, order, accounts, { ...options, giftCardCutIn })
 }
