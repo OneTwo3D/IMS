@@ -10,6 +10,10 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### Report CSV exports that hit the source-row limit return a notice file
+
+- **Changed: a report CSV export that hits its source-row limit now downloads a CSV instead of failing with HTTP 413.** The file has the report's normal column headings and one row whose first cell reads `REPORT NOT COMPUTED` with the row-limit notice in the next cell: no data rows and no totals, so it can never be read as a report of zeros. The response is HTTP 200 with the usual filename and carries `X-IMS-Report-Not-Computed: 1`, `X-IMS-Report-Row-Limit` and the existing `X-IMS-Export-Metadata` header, so scripts can detect it. Applies to the sales, purchasing, finance, replenishment, manufacturing, stock-position (aging, dead stock) and inventory-costing (COGS, turnover) exports. The separate CSV row cap (the file itself too large) still returns 413.
+
 ## 3.1.0 - 2026-11-12
 
 No operator action is required: there is no configuration change, and the two migrations are additive and nullable. Behaviour changes to know about before relying on the screens:
