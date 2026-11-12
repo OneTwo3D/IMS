@@ -2,7 +2,7 @@
 
 import { assertNoLiveAsnForReceipt, ManualReceiptRefusedByLiveAsnError } from '@/lib/domain/wms/po-receipt-asn-guard'
 import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
-import { billTaxCodeDisagreementMessage, billTaxCodeDisagreements, inactiveBillRatesMessage, inactiveOrderRateMessage, inactiveOrderRateName, resolveOrderRateTaxCode } from '@/lib/domain/purchasing/order-rate-tax-code'
+import { billTaxCodeDisagreementMessage, billTaxCodeDisagreements, inactiveBillRatesMessage, inactiveOrderRateMessage, inactiveOrderRateName, resolveOrderRateTaxCode, type OrderRateCandidate } from '@/lib/domain/purchasing/order-rate-tax-code'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
@@ -3532,13 +3532,13 @@ export type InvoiceRow = {
 async function orderRateTaxCodeFor(
   po: { taxRatePercent: unknown; taxRateName: string | null },
   supplierDefault: Parameters<typeof resolveOrderRateTaxCode>[0]['supplierDefault'],
-): Promise<{ code: ReturnType<typeof resolveOrderRateTaxCode>; inactiveName: string | null }> {
+): Promise<{ code: ReturnType<typeof resolveOrderRateTaxCode>; inactiveName: string | null; candidates: ReadonlyArray<OrderRateCandidate> }> {
   const candidates = await db.taxRate.findMany({
     where: { usedFor: { in: ['PURCHASE', 'BOTH'] }, isCompound: false, reverseCharge: false },
     select: { id: true, name: true, rate: true, accountingTaxType: true, active: true, usedFor: true, isCompound: true, reverseCharge: true },
   })
   const code = resolveOrderRateTaxCode({ recordedRate: po.taxRatePercent, recordedName: po.taxRateName, candidates, supplierDefault })
-  return { code, inactiveName: code ? null : inactiveOrderRateName({ recordedRate: po.taxRatePercent, recordedName: po.taxRateName, candidates }) }
+  return { candidates, code, inactiveName: code ? null : inactiveOrderRateName({ recordedRate: po.taxRatePercent, recordedName: po.taxRateName, candidates }) }
 }
 
 /**
@@ -3595,6 +3595,9 @@ export async function createInvoice(
             qty: true,
             qtyReceived: true,
             qtyReturned: true,
+            // What the order line recorded when it was priced: a new bill bills at the RECORDED rate, not the linked rate's current value.
+            taxForeign: true,
+            totalForeign: true,
             product: { select: { sku: true } },
             taxRate: {
               select: {
@@ -3693,6 +3696,7 @@ export async function createInvoice(
       fallbackTaxType,
       fallbackTaxRateId,
       orderRateProblem: orderRate.inactiveName ? inactiveOrderRateMessage(orderRate.inactiveName) : undefined,
+      rateCandidates: orderRate.candidates,
       reverseChargeTaxType: accountingSettings.reverseChargePurchaseTaxType || undefined,
       poLineById,
       costLineById,
@@ -4017,6 +4021,8 @@ export async function updateInvoice(
                 qty: true,
                 qtyReceived: true,
                 qtyReturned: true,
+                taxForeign: true,
+                totalForeign: true,
                 product: { select: { sku: true } },
                 taxRate: {
                   select: {
@@ -4141,6 +4147,7 @@ export async function updateInvoice(
         fallbackTaxType,
         fallbackTaxRateId,
         orderRateProblem: orderRate.inactiveName ? inactiveOrderRateMessage(orderRate.inactiveName) : undefined,
+        rateCandidates: orderRate.candidates,
         reverseChargeTaxType: accountingSettings.reverseChargePurchaseTaxType || undefined,
         poLineById,
         costLineById,

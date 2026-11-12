@@ -1645,6 +1645,12 @@ Sales Invoices sync type switched off until the mappings are in place, then enab
 bill currency's minor unit (two decimals for GBP, none for JPY, three for KWD) and the bill's VAT is the sum of those rounded amounts, with the total and the base-currency
 figures recomputed from them. Three lines of 0.03 at 20% record 0.03 of VAT (0.01 each), as Xero does, not 0.018.
 
+**A new bill bills a goods line at the rate its order line was recorded at.** The tax rate editor refreshes the order lines of **draft** orders only, so on an order that has moved on a line can be
+recorded at 20% while its linked rate now says 5%. A new bill therefore compares the linked rate's current value with the rate the line recorded (its stored tax over its stored net). Where they differ
+the line is billed at the **recorded** rate, on the Xero tax type of an active purchase rate at that percentage; if there is none (or the line is reverse charge or compound), the bill is
+refused (*The VAT rate on the purchase order line for ... has changed since the order was raised*) and the order line's tax rate needs correcting. For a line whose net is under 1 the ratio cannot
+state a rate, so the current rate is accepted only if its tax reproduces the recorded tax within a minor unit.
+
 **A bill line keeps the tax treatment it was booked with.** When a bill is created or edited, each line stores the tax type it was sent on, its effective rate, the IMS rate it
 was read from and whether it was reverse charge. Changing the purchase order's VAT rate afterwards does **not** re-price the bill: editing the bill (quantities, amounts,
 dates, notes) and raising a supplier credit note both reproduce what was booked. A bill booked before this was recorded has no stored treatment: it is worked out from the order's

@@ -90,7 +90,7 @@ export const SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE = withLedgerCheck(
  *   - more than one treatment (taxable plus exempt/NONE, two codes, or reverse charge together with ANY other treatment, such as a non-vatable cost line on a
  *     reverse-charge order): `mixed`, and the caller REFUSES the credit (SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE) rather than credit the whole amount as one treatment.
  *     Per-line credits are a follow-up;
- *   - a VAT-bearing line with no code, or no line at all on a bill that carried VAT: `undefined`, refused by the poster (lib/domain/accounting/purchase-document-tax-types.ts).
+ *   - ANY line with no code (whatever its rate), or no line at all on a bill that carried VAT: `undefined`, refused by the poster (lib/domain/accounting/purchase-document-tax-types.ts).
  * `reverseCharge` says the (single) treatment is reverse charge; `taxRateId` is the rate the code was read from, for the retired-code guard binding.
  */
 export function resolveSupplierCreditNoteTaxType(params: {
@@ -103,8 +103,8 @@ export function resolveSupplierCreditNoteTaxType(params: {
   const reverseCharge = reverseCount > 0
   const typed = lines.filter((l) => l.taxType && l.taxType.trim() !== '')
   const hadTax = params.billHadTax || lines.some((l) => l.rate > 0)
-  // A reverse-charge bill carries no supplier VAT: it is its own treatment, decided by the code its lines were booked on.
-  if (!reverseCharge && lines.some((l) => (!l.taxType || l.taxType.trim() === '') && l.rate > 0)) return { taxType: undefined }
+  // EVERY blank tax type is undecided, whatever the line's rate: a zero-rate line with no type is not known to be exempt, so the credit is refused until each line's treatment is established.
+  if (lines.some((l) => !l.taxType || l.taxType.trim() === '')) return { taxType: undefined, ...(reverseCharge ? { reverseCharge: true } : {}) }
   const treatments = new Map<string, { taxType: string; taxRateId?: string }>()
   for (const l of typed) {
     const key = l.taxType!.trim().toUpperCase()
