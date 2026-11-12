@@ -34,6 +34,10 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 - **Migration (additive):** `20261112120000_wms_order_push_items` adds the table `wms_order_push_items` (one row per warehouse line of a pushed order: line id, SKU, quantity; deleted with its link). No backfill: orders pushed before this change have no rows and keep the notice. The table is classed "must be empty" for a first load.
 - **Not changed:** the absorbing order's goods are never touched; a notice changes nothing about an order's status, stock or money.
 
+### CI: validate job type-check heap
+
+- **Fixed: `tsc --noEmit` in the CI `validate` job ran out of memory** at Node's default heap (about 4 GB). The job now sets `NODE_OPTIONS=--max-old-space-size=5632`, as the production-readiness job below it already does. CI only; no behaviour change.
+
 ### CI: ledger standing-reader check heap
 
 - **Fixed: `check:ledger-standing-readers` ran out of memory.** The scan grew past its 3 GB V8 heap cap and aborted (exit 134) in CI and in `check:all`. The cap is now 5632 MB, the same as the production-readiness job. Backend/CI only; no behaviour change.
