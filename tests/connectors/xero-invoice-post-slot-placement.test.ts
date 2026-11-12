@@ -429,11 +429,18 @@ test('the SALES_INVOICE create is wired to the number fence’s pre-post check',
   assert.ok(start > 0, 'the create branch must exist')
   const body = src.slice(start, src.indexOf("case 'SALES_INVOICE_UPDATE': {", start))
 
+  // The create hands the fence's check to pushSalesInvoice THROUGH composeFinalBeforePost (the regime-policy and scheme-type final check runs after it): the number fence's check is the first argument, and the composed callback is what the HTTP client runs at the wire.
   assert.match(
     body,
-    /beforePost:\s*numberFence\.beforePost/,
-    'the create must hand the fence’s check to pushSalesInvoice, or the slot is taken before preparation again',
+    /beforePost:\s*composeFinalBeforePost\(\s*numberFence\.beforePost\s*,\s*payload as Record<string, unknown>\s*,\s*'create'\s*\)/,
+    'the create must hand the fence’s check to pushSalesInvoice (inside composeFinalBeforePost), or the slot is taken before preparation again',
   )
+  assert.doesNotMatch(body, /beforePost:\s*numberFence\.beforePost\s*[,}]/, 'the bare fence check is no longer what is handed over: it is composed, never dropped')
+  // The composed callback runs the number fence's check (awaited, a refusal returned as is) and only then the final check.
+  const composeSrc = withoutComments(readFileSync('lib/connectors/xero/scheme-posting-check.ts', 'utf8'))
+  const compose = composeSrc.slice(composeSrc.indexOf('export function composeFinalBeforePost('))
+  assert.match(compose, /const fenced = await numberFence\(request\)\s*if \(!fenced\.ok\) return fenced/, 'the composed check runs the number fence first and returns its refusal unchanged')
+  assert.match(compose, /return last\(request\)/, 'and the final scheme and policy check is the last thing it does')
   // The round-4 shape: the slot taken by the guard, in front of everything.
   assert.doesNotMatch(
     body,
