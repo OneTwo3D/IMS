@@ -24,6 +24,7 @@ test('the COGS export returns a REPORT NOT COMPUTED CSV on a source-limit hit, n
   const lines = (await response.text()).split('\r\n')
   assert.equal(lines.length, 2)
   assert.ok(lines[0].startsWith('groupLabel,sku,mpn,'))
+  assert.ok(lines[0].endsWith(',revenueCaptured'), lines[0])
   assert.match(lines[1], /^REPORT NOT COMPUTED,"?This report hit its row limit \(100,000 rows\)/)
 })
 
@@ -44,6 +45,7 @@ test('the turnover export also returns a REPORT NOT COMPUTED CSV for any source-
   const lines = (await response.text()).split('\r\n')
   assert.equal(lines.length, 2)
   assert.ok(lines[0].startsWith('groupLabel,sku,mpn,'))
+  assert.ok(lines[0].endsWith(',snapshotDayCount'), lines[0])
   assert.ok(lines[1].startsWith('REPORT NOT COMPUTED,'))
 })
 

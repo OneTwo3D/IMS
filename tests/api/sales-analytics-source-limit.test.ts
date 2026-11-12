@@ -27,5 +27,6 @@ test('the sales-analytics export returns a CSV with the header row and a REPORT 
   const lines = (await response.text()).split('\r\n')
   assert.equal(lines.length, 2, 'header row plus the one notice row, no data rows or totals')
   assert.ok(lines[0].startsWith('key,label,groupBy,currency,'))
+  assert.ok(lines[0].endsWith(',refundsUnknownBasis'), lines[0])
   assert.match(lines[1], /^REPORT NOT COMPUTED,"?This report hit its row limit \(50,000 rows\)/)
 })

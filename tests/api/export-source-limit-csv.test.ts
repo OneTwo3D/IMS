@@ -58,8 +58,12 @@ test('finance exports return the not-computed CSV for every report', async () =>
 
 test('replenishment exports return the not-computed CSV for every report', async () => {
   const { GET } = await import('../../app/api/export/replenishment/route.ts')
-  for (const type of ['reorder', 'backorder', 'component-shortage']) {
-    await assertNotComputed(await GET(new NextRequest(`http://localhost/api/export/replenishment?type=${type}`)), 'sku', type)
+  const last: Record<string, string> = { reorder: 'urgency', backorder: 'oldestOrderAt', 'component-shortage': 'outputProducts' }
+  for (const [type, lastColumn] of Object.entries(last)) {
+    const response = await GET(new NextRequest(`http://localhost/api/export/replenishment?type=${type}`))
+    const header = (await response.clone().text()).split('\r\n')[0]
+    assert.ok(header.endsWith(`,${lastColumn}`), `${type}: header ends with ${lastColumn}, got ${header}`)
+    await assertNotComputed(response, 'sku', type)
   }
 })
 
@@ -87,6 +91,7 @@ test('stock-position exports return the not-computed CSV for the health reports'
     const lines = (await response.text()).split('\r\n')
     assert.equal(lines.length, 2)
     assert.ok(lines[0].startsWith('sku,mpn,'))
+    assert.ok(lines[0].endsWith(type === 'dead-stock' ? ',firstStockedAt' : ',source'), lines[0])
     assert.match(lines[1], /^REPORT NOT COMPUTED,/)
   }
 })
