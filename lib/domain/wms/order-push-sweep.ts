@@ -1405,7 +1405,7 @@ export async function runWmsOrderPushSweepCore(
     }
     // A throw here happened BEFORE the first delete (the connector turns every delete failure into a REFUSED answer): the caller's
     // handler records it on the link and the next sweep tries again.
-    const removal = await connector.removeOrderItems(survivorId, items, seam.clearance)
+    const removal = await connector.removeOrderItems(survivorId, { orderNumber: link.externalOrderNumber ?? null }, items, seam.clearance)
     const before = { state: link.state ?? 'MERGED', externalOrderId: survivorId }
     const settleCancelled = async () => {
       const done = { state: 'CANCELLED' as const, cancelledAt: ts, lastError: null, lastAttemptAt: ts, reconcileCheckedAt: null }
@@ -1426,7 +1426,7 @@ export async function runWmsOrderPushSweepCore(
     if (removal.kind === 'ONLY_LINES_LEFT') {
       // The merged order holds nothing but this order's lines (the other order's were taken out, or it was cancelled before): it is
       // cancelled like any order, through the same clearance.
-      const cancel = await connector.cancelMergedOrder!(survivorId, items, seam.clearance)
+      const cancel = await connector.cancelMergedOrder!(survivorId, { orderNumber: link.externalOrderNumber ?? null }, items, seam.clearance)
       if (cancel.cancelled || cancel.status === 'ALREADY_CANCELLED') {
         await settleCancelled()
         await audit({
@@ -1505,6 +1505,27 @@ export async function runWmsOrderPushSweepCore(
     const repointed = { ...link, state: 'MERGED' as const, ...(number ? { externalOrderNumber: number } : {}) }
     if (intent === 'CANCEL') await handleMergedCancel(repointed, ts)
     else await raiseMergedNotice(repointed, intent, ts)
+  }
+
+  /**
+   * The warehouse's identity gate refused a hold or cancel: the order the link names could not be proved to be this order (its number is
+   * missing, or is not the number IMS pushed, whether or not it contains a "+"). NOTHING was sent. The link stays live and is NOT moved to
+   * MERGED; the cancel / hold notice is raised once (the passes skip a link that carries it), with no note posted on the unverified order.
+   */
+  const raiseIdentityNotice = async (link: WmsPushLinkRef, intent: 'HOLD' | 'CANCEL', status: string, seen: string | undefined, ts: Date) => {
+    const verb = intent === 'HOLD' ? 'Held' : 'Cancelled'
+    const why = status === 'IDENTITY_MISMATCH'
+      ? `its number is now ${scrubWmsError(seen ?? '?', 'unknown')}, not the one IMS sent`
+      : 'its number or id could not be read'
+    await raiseWmsRefusalNotice(link, intent,
+      `${verb} in IMS, but WMS order ${link.externalOrderId} could not be verified as this order (${why}), so IMS sent nothing. `
+      + 'Check the order in the WMS (it may have been merged or renamed) and ' + (intent === 'HOLD' ? 'hold' : 'cancel') + ' it there by hand if that is right — IMS has NOT recorded this order as '
+      + (intent === 'HOLD' ? 'held' : 'cancelled in the WMS') + '.',
+      {
+        wmsStatus: status,
+        summary: `IMS ${intent === 'HOLD' ? 'hold' : 'cancel'} not sent: the WMS order could not be verified as this order — left for an operator`,
+        comment: null,
+      }, ts)
   }
 
   /**
@@ -2579,7 +2600,7 @@ export async function runWmsOrderPushSweepCore(
               context: producerContext,
             })
             if (!pullBack.proceed) shadowedCount += 1
-            const cancel = pullBack.proceed ? await connector.cancelOrder?.(push.externalOrderId, pullBack.clearance) : undefined
+            const cancel = pullBack.proceed ? await connector.cancelOrder?.(push.externalOrderId, { orderNumber: push.externalOrderNumber ?? input.orderNumber }, pullBack.clearance) : undefined
             const pulled = Boolean(cancel && (cancel.cancelled || cancel.status === 'NOT_FOUND' || cancel.status === 'ALREADY_CANCELLED'))
             if (pulled) {
               // CANCELLED for an approved withdrawal — there is nothing to
@@ -2843,7 +2864,7 @@ export async function runWmsOrderPushSweepCore(
               await port.updateLinkIfState(link.id, 'PENDING_VERIFY', { lastAttemptAt: now() }).catch(() => false)
               continue
             }
-            const cancel = await connector.cancelOrder?.(link.externalOrderId, verifiedPullBack.clearance)
+            const cancel = await connector.cancelOrder?.(link.externalOrderId, { orderNumber: link.externalOrderNumber ?? link.orderNumber ?? null }, verifiedPullBack.clearance)
             pulled = Boolean(cancel && (cancel.cancelled || cancel.status === 'NOT_FOUND' || cancel.status === 'ALREADY_CANCELLED'))
             cancelConfirmed = cancel?.cancelled === true
           } catch (e) {
@@ -3042,11 +3063,13 @@ export async function runWmsOrderPushSweepCore(
         // NOT flagged merged, but the warehouse order no longer carries the number IMS pushed: nothing was written and the link is NOT moved
         // to MERGED (it proves nothing about a merge). A durable notice is set ONCE (only while none is set, so it does not repeat every sweep);
         // the amendment stays due, so once the number matches again or the flag appears the normal paths take over.
-        if (update.status === 'ORDER_NUMBER_MISMATCH') {
+        if (update.status === 'ORDER_NUMBER_MISMATCH' || update.status === 'ORDER_UNVERIFIABLE') {
           if (!link.amendNoticeAt) {
             await port.updateLink(link.id, {
               amendNoticeAt: ts, lastAttemptAt: ts,
-              lastError: `The warehouse order number no longer matches IMS (now ${scrubWmsError(update.observedOrderNumber ?? '?', 'unknown')}); this order's change was NOT sent. Check whether the warehouse order was merged or renamed and apply the change there by hand.`,
+              lastError: update.status === 'ORDER_UNVERIFIABLE'
+                ? 'The warehouse order could not be verified as this order (its number or id could not be read); this order\'s change was NOT sent. Check the order in the warehouse and apply the change there by hand.'
+                : `The warehouse order number no longer matches IMS (now ${scrubWmsError(update.observedOrderNumber ?? '?', 'unknown')}); this order's change was NOT sent. Check whether the warehouse order was merged or renamed and apply the change there by hand.`,
             })
             await audit({
               action: 'order_update', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,
@@ -3173,7 +3196,7 @@ export async function runWmsOrderPushSweepCore(
           shadowedCount += 1
           continue
         }
-        cancel = await connector.cancelOrder(link.externalOrderId, holdSeam.clearance)
+        cancel = await connector.cancelOrder(link.externalOrderId, { orderNumber: link.externalOrderNumber ?? null }, holdSeam.clearance)
         // A 404 is NOT a cancellation. The WMS failing to return an order is also what an order MERGED AWAY (its goods now inside a
         // survivor) or removed looks like, and recording that as held let the release pass re-create the order and the goods be
         // picked twice. Only a cancellation the WMS confirmed parks the link HELD.
@@ -3182,6 +3205,10 @@ export async function runWmsOrderPushSweepCore(
             `Held in IMS, but WMS order ${link.externalOrderId} was not found (it may have been merged into another order or removed). `
             + 'IMS has NOT recorded it as held and will not re-create it — find the order in the WMS and resolve it by hand.',
             'IMS hold could not be confirmed: the WMS order was not found — left for an operator', ts)
+          continue
+        }
+        if (cancel.status === 'IDENTITY_MISMATCH' || cancel.status === 'IDENTITY_UNVERIFIABLE') {
+          await raiseIdentityNotice(link, 'HOLD', cancel.status, cancel.mergedSurvivorNumber, ts)
           continue
         }
         if (cancel.status === 'MERGED_SURVIVOR') {
@@ -3288,13 +3315,17 @@ export async function runWmsOrderPushSweepCore(
           shadowedCount += 1
           continue
         }
-        cancel = await connector.cancelOrder(link.externalOrderId, cancelSeam.clearance)
+        cancel = await connector.cancelOrder(link.externalOrderId, { orderNumber: link.externalOrderNumber ?? null }, cancelSeam.clearance)
         // A 404 is not a cancellation (see the hold pass): the order may have been merged away, and the survivor still holds its goods.
         if (cancel.status === 'NOT_FOUND') {
           await handleNotFound(link, 'CANCEL',
             `Cancelled in IMS, but WMS order ${link.externalOrderId} was not found (it may have been merged into another order or removed). `
             + 'IMS has NOT recorded it as cancelled in the WMS — find the order in the WMS and make sure it does not ship.',
             'IMS cancel could not be confirmed: the WMS order was not found — left for an operator', ts)
+          continue
+        }
+        if (cancel.status === 'IDENTITY_MISMATCH' || cancel.status === 'IDENTITY_UNVERIFIABLE') {
+          await raiseIdentityNotice(link, 'CANCEL', cancel.status, cancel.mergedSurvivorNumber, ts)
           continue
         }
         if (cancel.status === 'MERGED_SURVIVOR') {

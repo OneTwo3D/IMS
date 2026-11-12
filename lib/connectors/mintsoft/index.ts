@@ -1,4 +1,4 @@
-import type { WmsAmbiguousCreateResolution, WmsMergedItemRemoval, WmsMergedSurvivorLookup, WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsOrderItemRef, WmsOrderPart, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsOrderUpdateResult, WmsProductContentResult, WmsProductContentUpdate, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAmbiguousCreateResolution, WmsMergedItemRemoval, WmsMergedSurvivorLookup, WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsExpectedOrder, WmsOrderItemRef, WmsOrderPart, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsOrderUpdateResult, WmsProductContentResult, WmsProductContentUpdate, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   getMintsoftApiConfiguration,
   isMintsoftConfigured,
@@ -175,16 +175,16 @@ export class MintsoftConnector implements WmsConnector {
     return updateMintsoftOrder(externalOrderId, input)
   }
 
-  async cancelOrder(externalOrderId: string): Promise<WmsOrderCancelResult> {
-    return cancelMintsoftOrder(externalOrderId)
+  async cancelOrder(externalOrderId: string, expected: WmsExpectedOrder): Promise<WmsOrderCancelResult> {
+    return cancelMintsoftOrder(externalOrderId, { expectedOrderNumber: expected.orderNumber })
   }
 
-  async cancelMergedOrder(externalOrderId: string, items: WmsOrderItemRef[]): Promise<WmsOrderCancelResult> {
-    return cancelMintsoftOrder(externalOrderId, { onlyLines: items })
+  async cancelMergedOrder(externalOrderId: string, expected: WmsExpectedOrder, items: WmsOrderItemRef[]): Promise<WmsOrderCancelResult> {
+    return cancelMintsoftOrder(externalOrderId, { expectedOrderNumber: expected.orderNumber, onlyLines: items })
   }
 
-  async removeOrderItems(externalOrderId: string, items: WmsOrderItemRef[]): Promise<WmsMergedItemRemoval> {
-    return removeMintsoftOrderItems(externalOrderId, items)
+  async removeOrderItems(externalOrderId: string, expected: WmsExpectedOrder, items: WmsOrderItemRef[]): Promise<WmsMergedItemRemoval> {
+    return removeMintsoftOrderItems(externalOrderId, expected.orderNumber, items)
   }
 
   async addOrderComment(externalOrderId: string, comment: string): Promise<void> {

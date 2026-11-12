@@ -357,7 +357,7 @@ test('REAL PORT: a cancelled order merged into a survivor has ITS recorded lines
     cancelOrder: async (id: string) => { seen.cancelled.push(id); return { cancelled: true, status: 'CANCELLED' } },
     addOrderComment: async (_id: string, comment: string) => { seen.comments.push(comment) },
     cancelMergedOrder: async (id: string) => { seen.cancelled.push(id); return { cancelled: true, status: 'CANCELLED' } },
-    removeOrderItems: async (id: string, items: unknown) => { seen.removed = { id, items }; return { kind: 'REMOVED' as const, removed: items as typeof stored } },
+    removeOrderItems: async (id: string, _expected: unknown, items: unknown) => { seen.removed = { id, items }; return { kind: 'REMOVED' as const, removed: items as typeof stored } },
     verifyPushedOrder: async () => 'ours' as const,
     probeOrderPresence: async () => 'FOUND' as const,
   }
@@ -599,7 +599,7 @@ test('REAL PORT, REMOVAL vs AMENDMENT share ONE lease: the removal holds it and 
   const fresh = [{ externalItemId: '9', sku: 'A', quantity: 1 }]
   await port.replaceOrderItems!(s.orderId, 'o-r', fresh, amend!.token)
   let seen: unknown = null
-  ;(double as { removeOrderItems: unknown }).removeOrderItems = async (_id: string, items: unknown) => { seen = items; return { kind: 'REMOVED' as const, removed: items as typeof ids } }
+  ;(double as { removeOrderItems: unknown }).removeOrderItems = async (_id: string, _expected: unknown, items: unknown) => { seen = items; return { kind: 'REMOVED' as const, removed: items as typeof ids } }
   await d.sweep.runWmsOrderPushSweepCore(double as never, 'mintsoft', port, { batchSize: 500 })
   assert.deepEqual(seen, fresh, 'the removal used the fresh ids')
   const after = await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })

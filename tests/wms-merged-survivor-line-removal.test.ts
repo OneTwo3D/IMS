@@ -5,6 +5,7 @@ import { OUTBOUND_GRANT_ENV } from '../lib/security/outbound-write-hold-constant
 import { PRODUCER_CUTOFF_ENV, PRODUCER_HOLD_ENFORCED_ENV } from '../lib/security/producer-disposition-constants.ts'
 import type { WmsOrderPushPort, WmsPushLinkRef } from '../lib/domain/wms/order-push-sweep.ts'
 import type { WmsOrderItemRef, WmsOrderPushInput } from '../lib/connectors/wms/types.ts'
+import type tsTypes from 'typescript'
 
 /**
  * AN IMS ORDER MERGED INTO A WAREHOUSE SURVIVOR IS CANCELLED: ITS LINES (AND ONLY ITS LINES) COME OUT OF THE SURVIVOR.
@@ -56,6 +57,8 @@ const fake = {
   putExtraLine: false,
   /** Flagged merged but the lines still match what was sent. */
   putFlagOnly: false,
+  /** The order detail carries no OrderNumber at all. */
+  omitNumber: false,
 }
 function resetFake() {
   fake.orders = new Map()
@@ -72,6 +75,7 @@ function resetFake() {
   fake.putMerges = false
   fake.putExtraLine = false
   fake.putFlagOnly = false
+  fake.omitNumber = false
 }
 const D_LINES: FakeLine[] = [{ ID: 3603106, SKU: '243632999', Quantity: 2 }, { ID: 3603107, SKU: '923663020', Quantity: 1 }]
 const E_LINES: FakeLine[] = [{ ID: 3603108, SKU: '243632999', Quantity: 1 }, { ID: 3603109, SKU: '849293203', Quantity: 1 }]
@@ -152,7 +156,7 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
         if (fake.detailFails) return { data: null, error: 'Mintsoft request failed with status 500', status: 500 }
         const order = fake.orders.get(detailMatch[1])
         if (!order) return { data: null, error: 'Mintsoft request failed with status 404', status: 404 }
-        return { data: { ID: Number(detailMatch[1]), ClientId: CLIENT, OrderNumber: order.number, OrderStatusId: order.status, OrderNameValues: order.merged ? [{ Name: 'MergedOrder', Value: 'True' }] : [] }, status: 200 }
+        return { data: { ID: Number(detailMatch[1]), ClientId: CLIENT, ...(fake.omitNumber ? {} : { OrderNumber: order.number }), OrderStatusId: order.status, OrderNameValues: order.merged ? [{ Name: 'MergedOrder', Value: 'True' }] : [] }, status: 200 }
       }
       if (pathname === '/api/Order' && method === 'PUT') {
         const id = '999001'
@@ -247,10 +251,10 @@ async function sweep(port: WmsOrderPushPort, overrides: Record<string, unknown> 
   const connector = {
     pushOrder: async () => { throw new Error('not used') },
     updateOrder: async () => ({ updated: true, status: 'NEW' }),
-    cancelOrder: async (id: string) => orderPush.cancelMintsoftOrder(id),
-    cancelMergedOrder: async (id: string, items: WmsOrderItemRef[]) => orderPush.cancelMintsoftOrder(id, { onlyLines: items }),
+    cancelOrder: async (id: string, expected: { orderNumber: string | null }) => orderPush.cancelMintsoftOrder(id, { expectedOrderNumber: expected.orderNumber }),
+    cancelMergedOrder: async (id: string, expected: { orderNumber: string | null }, items: WmsOrderItemRef[]) => orderPush.cancelMintsoftOrder(id, { expectedOrderNumber: expected.orderNumber, onlyLines: items }),
     addOrderComment: async (id: string, comment: string) => orderPush.addMintsoftOrderComment(id, comment),
-    removeOrderItems: async (id: string, items: WmsOrderItemRef[]) => orderPush.removeMintsoftOrderItems(id, items),
+    removeOrderItems: async (id: string, expected: { orderNumber: string | null }, items: WmsOrderItemRef[]) => orderPush.removeMintsoftOrderItems(id, expected.orderNumber, items),
     findMergedSurvivor: async (number: string) => orderPush.findMintsoftMergedSurvivor(number),
     verifyPushedOrder: async () => 'ours' as const,
     probeOrderPresence: async () => 'FOUND' as const,
@@ -729,18 +733,6 @@ test('LINE ADDED between the only-lines check and the cancel: nothing is cancell
   })
 })
 
-test('AN UNFLAGGED "+" NUMBER IS AN ORDINARY ORDER: it is cancelled normally, not treated as a merged survivor', async () => {
-  await withEnv(OFF, async () => {
-    resetFake()
-    fake.orders.set(SURVIVOR, { status: 9, number: 'A+B', items: [...D_LINES], merged: false })
-    const h = makePort({ cancellable: [absorbingLinkRef()], items: storedD })
-    const result = await sweep(h.port)
-    assert.equal(fake.orders.get(SURVIVOR)!.status, 3)
-    assert.deepEqual(deletedIds(), [])
-    assert.equal(result.cancelled, 1)
-    assert.equal(h.writes.some((w) => w.data.state === 'MERGED'), false)
-  })
-})
 
 // ---------------------------------------------------------------- 9. review round 2 -----------------------------------------------
 
@@ -1152,4 +1144,137 @@ test('CREATE: the link write that marks the order SYNCED also resets any stale l
     assert.equal(reset.amendLeaseExpiresAt, null)
     assert.deepEqual(tokens, [undefined])
   })
+})
+
+// ---------------------------------------------------------------- 18. review round 12: the one identity gate ----------------------------
+
+test('IDENTITY GATE (pure): OK only for a present, equal number with the same id and client and no merge flag; MERGED for the flag; MISMATCH for a different number; UNVERIFIABLE for a missing number, id or client', async () => {
+  const { verifyWarehouseOrderIdentity: gate } = await import('../lib/connectors/mintsoft/api/order-push.ts')
+  const want = { orderNumber: 'A-1', clientId: 89, id: '10' }
+  const base = { ID: 10, ClientId: 89, OrderNumber: 'A-1' }
+  assert.equal(gate(base, want), 'OK')
+  assert.equal(gate({ ...base, OrderNameValues: [{ Name: 'MergedOrder', Value: 'True' }] }, want), 'MERGED')
+  assert.equal(gate({ ...base, OrderNumber: null, OrderNameValues: [{ Name: 'MergedOrder', Value: 'true' }] }, want), 'MERGED', 'the flag wins even with no number')
+  assert.equal(gate({ ...base, OrderNumber: 'A-1+B-2' }, want), 'MISMATCH', 'an unflagged "+" number is a mismatch, not a merge')
+  assert.equal(gate({ ...base, OrderNumber: 'OTHER' }, want), 'MISMATCH')
+  assert.equal(gate({ ...base, ID: 11 }, want), 'MISMATCH')
+  assert.equal(gate({ ID: 10, ClientId: 89 }, want), 'UNVERIFIABLE')
+  assert.equal(gate({ ...base, OrderNumber: '  ' }, want), 'UNVERIFIABLE')
+  assert.equal(gate({ ClientId: 89, OrderNumber: 'A-1' }, want), 'UNVERIFIABLE')
+  assert.equal(gate(base, { ...want, orderNumber: null }), 'UNVERIFIABLE', 'a caller that cannot say which number to expect cannot verify')
+  assert.equal(gate(base, { ...want, clientId: 5 }), 'MISMATCH')
+})
+
+for (const [label, arrange] of [
+  ['an unflagged "+" number', () => { fake.orders.get(SURVIVOR)!.merged = false; fake.orders.get(SURVIVOR)!.number = 'IMSTEST-E+IMSTEST-D' }],
+  ['no OrderNumber at all', () => { fake.orders.get(SURVIVOR)!.merged = false; fake.omitNumber = true }],
+] as const) {
+  test(`CANCEL, ${label}: nothing is sent, the link stays SYNCED (not MERGED) and the cancel notice is raised once with operator wording`, async () => {
+    await withEnv(OFF, async () => {
+      seedMerged()
+      arrange()
+      const h = makePort({ cancellable: [absorbingLinkRef()], items: storedE })
+      const result = await sweep(h.port)
+      assert.equal(fake.requests.some((r) => r.method !== 'GET' || r.path.endsWith('/Cancel')), false, 'no write of any kind')
+      assert.equal(fake.orders.get(SURVIVOR)!.status, 9)
+      assert.equal(h.writes.some((w) => w.data.state !== undefined), false, 'the link was NOT moved to MERGED')
+      assert.equal(result.operatorNotices, 1)
+      const notice = h.writes.find((w) => w.data.cancelNoticeAt instanceof Date)!
+      assert.match(String(notice.data.lastError), /could not be verified as this order .*IMS sent nothing.*cancel it there by hand/)
+    })
+  })
+
+  test(`HOLD, ${label}: the same gate: nothing is sent, the link stays SYNCED, a hold notice is raised`, async () => {
+    await withEnv(OFF, async () => {
+      seedMerged()
+      arrange()
+      const h = makePort({ cancellable: [], items: storedE })
+      h.port.holdableLinks = async () => [absorbingLinkRef()]
+      h.link.externalOrderId = SURVIVOR
+      const result = await sweep(h.port)
+      assert.equal(fake.requests.some((r) => r.method !== 'GET' || r.path.endsWith('/Cancel')), false)
+      assert.equal(h.writes.some((w) => w.data.state !== undefined), false)
+      assert.equal(result.operatorNotices, 1)
+      assert.ok(h.writes.some((w) => w.data.holdNoticeAt instanceof Date))
+    })
+  })
+
+  test(`AMEND, ${label}: no order or item write, the link stays SYNCED, the durable notice is set once`, async () => {
+    await withEnv(OFF, async () => {
+      seedMerged()
+      arrange()
+      const { h } = snapshotPort(storedE)
+      h.link.state = 'SYNCED'
+      h.link.externalOrderId = SURVIVOR
+      h.port.updatableLinks = async () => [{ ...updatableLink(), externalOrderId: SURVIVOR }] as never
+      const orderPush = await import('../lib/connectors/mintsoft/api/order-push.ts')
+      await sweep(h.port, { updateOrder: async (id: string, input: never) => orderPush.updateMintsoftOrder(id, input) })
+      assert.deepEqual(writeRequests(), [])
+      assert.equal(survivorItems().length, 4)
+      assert.equal(h.writes.some((w) => w.data.state !== undefined), false)
+      assert.equal(h.writes.filter((w) => w.data.amendNoticeAt instanceof Date).length, 1)
+    })
+  })
+
+  test(`REMOVAL, ${label}: the merged-order removal also refuses and deletes nothing`, async () => {
+    await withEnv(OFF, async () => {
+      seedMerged()
+      arrange()
+      fake.orders.get(SURVIVOR)!.merged = false
+      const orderPush = await import('../lib/connectors/mintsoft/api/order-push.ts')
+      const result = await orderPush.removeMintsoftOrderItems(SURVIVOR, 'IMSTEST-E', storedD)
+      assert.equal(result.kind, 'REFUSED')
+      assert.deepEqual(deletedIds(), [])
+    })
+  })
+}
+
+test('CANCEL with a verified identity (an unflagged order that carries exactly the number IMS pushed) is cancelled normally', async () => {
+  await withEnv(OFF, async () => {
+    resetFake()
+    fake.orders.set(SURVIVOR, { status: 9, number: 'IMSTEST-E', items: [...E_LINES], merged: false })
+    const h = makePort({ cancellable: [absorbingLinkRef()], items: storedE })
+    const result = await sweep(h.port)
+    assert.equal(fake.orders.get(SURVIVOR)!.status, 3)
+    assert.equal(result.cancelled, 1)
+  })
+})
+
+test('SOURCE CENSUS: every write to an EXISTING Mintsoft order goes through the identity gate (one gate, no bypass)', async () => {
+  const { readFileSync } = await import('node:fs')
+  const ts = (await import('typescript')).default
+  const source = readFileSync(new URL('../lib/connectors/mintsoft/api/order-push.ts', import.meta.url), 'utf8')
+  const sf = ts.createSourceFile('order-push.ts', source, ts.ScriptTarget.Latest, true)
+  const writers = new Map<string, { calls: string[]; text: string }>()
+  const visitTop = (node: tsTypes.Node) => {
+    if (ts.isFunctionDeclaration(node) && node.name && node.body) {
+      const calls: string[] = []
+      const text = node.getText(sf)
+      const walk = (n: tsTypes.Node) => {
+        if (ts.isCallExpression(n) && ts.isIdentifier(n.expression)) calls.push(n.expression.text)
+        ts.forEachChild(n, walk)
+      }
+      walk(node.body)
+      writers.set(node.name.text, { calls, text })
+    }
+  }
+  sf.forEachChild(visitTop)
+  // A function that sends a non-GET request or /Cancel to an order.
+  const sendsWrite = (text: string) => /method: '(POST|PUT|DELETE)'/.test(text) || /\/Cancel`/.test(text)
+  const writing = [...writers].filter(([, f]) => f.calls.includes('mintsoftRequest') && sendsWrite(f.text)).map(([name]) => name).sort()
+  // The create is not a write to an EXISTING order; the comment is the one deliberate, documented exemption (additive note, and the
+  // merged-order notices are posted to a survivor whose number is by definition not IMS's); the item helper runs only under updateMintsoftOrder.
+  const exempt = new Set(['createOrder', 'addMintsoftOrderComment'])
+  const gated = writing.filter((name) => !exempt.has(name))
+  assert.deepEqual(gated, ['cancelMintsoftOrder', 'reconcileMintsoftOrderItems', 'removeMintsoftOrderItems', 'updateMintsoftOrder'], 'a NEW write path to an existing order must be added here AND call the gate')
+  for (const name of ['cancelMintsoftOrder', 'removeMintsoftOrderItems', 'updateMintsoftOrder']) {
+    assert.ok(writers.get(name)!.calls.includes('fetchMintsoftOrderStatusId'), `${name} reads the order through the gate`)
+    assert.match(writers.get(name)!.text, /identity/, `${name} acts on the gate's answer`)
+  }
+  assert.ok(writers.get('fetchMintsoftOrderStatusId')!.calls.includes('verifyWarehouseOrderIdentity'), 'the read calls THE gate')
+  // The item helper is reachable only from the amendment, which has passed the gate.
+  const callers = [...writers].filter(([, f]) => f.calls.includes('reconcileMintsoftOrderItems')).map(([name]) => name)
+  assert.deepEqual(callers, ['updateMintsoftOrder'])
+  // The comment is the only caller that passes no expected number, and it says why.
+  assert.match(writers.get('addMintsoftOrderComment')!.text, /NOT identity-gated, on purpose/)
 })

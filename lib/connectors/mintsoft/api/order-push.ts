@@ -652,6 +652,38 @@ export async function verifyMintsoftPushedOrder(
   return 'unknown'
 }
 
+/** What {@link verifyWarehouseOrderIdentity} concludes about a warehouse order detail. */
+export type WarehouseOrderIdentity = 'OK' | 'MERGED' | 'MISMATCH' | 'UNVERIFIABLE'
+
+/**
+ * THE ONE IDENTITY GATE for every write to an EXISTING Mintsoft order. Pure: it judges the fresh order detail the write path has just read.
+ *
+ *   MERGED        the order is flagged MergedOrder=True (live-confirmed). It holds other orders' goods; the writer takes the merged paths.
+ *   UNVERIFIABLE  the number is missing, the id or client is missing, or the caller could not say which number to expect: it cannot be
+ *                 proved to be this order, so NOTHING may be written to it.
+ *   MISMATCH      the number (or the id, or the client) is present and is not this order's.
+ *   OK            the number is present and equals the number IMS pushed, with the same id and client, and the order is not flagged merged.
+ *
+ * Only OK (or MERGED, by the writers that handle it) proceeds. The flag is checked first because a flagged survivor is a merge whatever
+ * else its detail says.
+ */
+export function verifyWarehouseOrderIdentity(
+  detail: RawOrder,
+  expected: { orderNumber: string | null; clientId: number; id: string },
+): WarehouseOrderIdentity {
+  const flagged = Array.isArray(detail.OrderNameValues) && (detail.OrderNameValues as unknown[]).some((entry) => {
+    const nv = entry as Record<string, unknown> | null
+    return nv !== null && typeof nv === 'object' && toStr(nv.Name) === 'MergedOrder' && toStr(nv.Value)?.toLowerCase() === 'true'
+  })
+  if (flagged) return 'MERGED'
+  const number = toStr(detail.OrderNumber)
+  const id = toStr(detail.ID ?? detail.Id ?? detail.id)
+  const client = toStr(detail.ClientId ?? detail.clientId)
+  if (number === null || id === null || client === null || !expected.orderNumber) return 'UNVERIFIABLE'
+  if (id !== expected.id || client !== String(expected.clientId)) return 'MISMATCH'
+  return number === expected.orderNumber ? 'OK' : 'MISMATCH'
+}
+
 /**
  * Mintsoft OrderStatusId 1 === NEW; only NEW orders are mutable/cancellable.
  *
@@ -664,7 +696,9 @@ export async function verifyMintsoftPushedOrder(
 async function fetchMintsoftOrderStatusId(
   externalOrderId: string,
   clientId: number,
-): Promise<{ found: boolean; isNew: boolean; statusId: number | null; merged: boolean; orderNumber: string | null }> {
+  /** The number IMS pushed for this order, or null when the caller cannot say (the identity is then UNVERIFIABLE). A write path must act on `identity`. */
+  expectedOrderNumber: string | null,
+): Promise<{ found: boolean; isNew: boolean; statusId: number | null; merged: boolean; orderNumber: string | null; identity: WarehouseOrderIdentity }> {
   const current = await mintsoftRequest<unknown>(
     `/api/Order/${encodeURIComponent(externalOrderId)}?ClientId=${clientId}`,
   )
@@ -673,7 +707,7 @@ async function fetchMintsoftOrderStatusId(
   // client renders a 204 as `data: null`, and reporting that as NOT_FOUND would
   // tell the push sweep the remote cancellation succeeded — moving the local link
   // to CANCELLED/HELD while the warehouse carries on fulfilling the order.
-  if (current.status === 404) return { found: false, isNew: false, statusId: null, merged: false, orderNumber: null }
+  if (current.status === 404) return { found: false, isNew: false, statusId: null, merged: false, orderNumber: null, identity: 'UNVERIFIABLE' }
   if (current.error) throw new Error(current.error)
   const raw = extractMintsoftObjectPayload(current.data)
   if (raw === null) {
@@ -684,15 +718,9 @@ async function fetchMintsoftOrderStatusId(
   }
   const order = assertMintsoftOrderClient(raw, clientId, 'Mintsoft Order detail (push gate)')
   const statusId = orderStatusId(order)
-  // A merged survivor is ONE flagged MergedOrder=True (live-confirmed). A "+" in the number alone is not evidence: an unflagged order is
-  // an ordinary order.
   const orderNumber = toStr(order.OrderNumber)
-  const flagged = Array.isArray(order.OrderNameValues) && (order.OrderNameValues as unknown[]).some((entry) => {
-    const nv = entry as Record<string, unknown> | null
-    return nv !== null && typeof nv === 'object' && toStr(nv.Name) === 'MergedOrder' && toStr(nv.Value)?.toLowerCase() === 'true'
-  })
-  const merged = flagged
-  return { found: true, isNew: statusId === MINTSOFT_STATUS_NEW, statusId, merged, orderNumber }
+  const identity = verifyWarehouseOrderIdentity(order, { orderNumber: expectedOrderNumber, clientId, id: externalOrderId })
+  return { found: true, isNew: statusId === MINTSOFT_STATUS_NEW, statusId, merged: identity === 'MERGED', orderNumber, identity }
 }
 
 type MintsoftOrderItem = { ID: number; SKU: string | null; Quantity: number }
@@ -825,7 +853,7 @@ async function snapshotMintsoftOrderItems(
     return undefined
   }
   try {
-    const gate = await fetchMintsoftOrderStatusId(externalOrderId, clientId)
+    const gate = await fetchMintsoftOrderStatusId(externalOrderId, clientId, null)
     if (!gate.found) return skip('the order could not be found for the read-back')
     if (gate.merged) return skip('the order is already a merged order, so its lines cannot be told apart')
     const items = await fetchMintsoftOrderItemsStrict(externalOrderId, clientId)
@@ -881,20 +909,18 @@ async function reconcileMintsoftOrderItems(externalOrderId: string, input: WmsOr
 
 export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult> {
   const clientId = await getPushClientId('Mintsoft order update')
-  const { found, isNew, merged, orderNumber } = await fetchMintsoftOrderStatusId(externalOrderId, clientId)
+  const { found, isNew, orderNumber, identity } = await fetchMintsoftOrderStatusId(externalOrderId, clientId, input.orderNumber)
   if (!found) return { updated: false, status: 'NOT_FOUND' }
-  // A MERGED order (flagged MergedOrder=True) holds other orders' goods. The ABSORBING order keeps the survivor's id, so its link can
-  // still name it. Amending it would diff ALL of its lines against this one order's and delete or consolidate the other order's: refused
-  // BEFORE any order post or item write, and the link is handed to the merged paths.
-  if (merged) {
+  // THE IDENTITY GATE, before any order post or item write. MERGED (flagged MergedOrder=True): the order holds other orders' goods and the
+  // absorbing order keeps the survivor's id, so its link can still name it; amending it would diff ALL its lines against this one
+  // order's, so the link is handed to the merged paths. MISMATCH / UNVERIFIABLE (not flagged, but the number is not the one IMS pushed, or
+  // is missing: a merge whose flag is missing, a rename, an incomplete detail): the same safety, but it proves nothing about a merge, so
+  // the link is NOT moved to MERGED; the caller raises a durable notice and leaves the amendment due. Only OK amends.
+  if (identity === 'MERGED') {
     return { updated: false, status: 'MERGED_SURVIVOR', ...(orderNumber ? { mergedSurvivorNumber: orderNumber } : {}) }
   }
-  // NOT flagged, but the order no longer carries the number IMS pushed (a merge whose flag is missing, or a rename): the same safety, no
-  // item or order write, but it proves nothing about a merge, so the link is NOT moved to MERGED. The caller raises a durable notice and
-  // leaves the amendment due.
-  if (orderNumber !== null && orderNumber !== input.orderNumber) {
-    return { updated: false, status: 'ORDER_NUMBER_MISMATCH', observedOrderNumber: orderNumber }
-  }
+  if (identity === 'MISMATCH') return { updated: false, status: 'ORDER_NUMBER_MISMATCH', ...(orderNumber ? { observedOrderNumber: orderNumber } : {}) }
+  if (identity === 'UNVERIFIABLE') return { updated: false, status: 'ORDER_UNVERIFIABLE' }
   if (!isNew) return { updated: false, status: 'NOT_NEW' }
 
   const settings = await getMintsoftSettings()
@@ -984,7 +1010,9 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
  */
 export async function addMintsoftOrderComment(externalOrderId: string, comment: string): Promise<void> {
   const clientId = await getPushClientId('Mintsoft order comment')
-  const { found } = await fetchMintsoftOrderStatusId(externalOrderId, clientId)
+  // The one write to an existing order that is NOT identity-gated, on purpose: it is an additive, fixed-wording note, and the merged-order
+  // notices are posted to a survivor whose number is by definition not IMS's. The ownership read (client) still applies.
+  const { found } = await fetchMintsoftOrderStatusId(externalOrderId, clientId, null)
   if (!found) {
     // Observable, not silent: callers audit this call's outcome, and a warehouse
     // warning that was never posted must not be recorded as SUCCEEDED.
@@ -999,25 +1027,33 @@ export async function addMintsoftOrderComment(externalOrderId: string, comment: 
   if (result.error) throw new Error(result.error)
 }
 
-export async function cancelMintsoftOrder(externalOrderId: string, options?: { onlyLines?: WmsOrderItemRef[] }): Promise<WmsOrderCancelResult> {
+export async function cancelMintsoftOrder(
+  externalOrderId: string,
+  /** `expectedOrderNumber` is REQUIRED: the number IMS pushed for the order (null when unknown, which is refused as unverifiable). */
+  options: { expectedOrderNumber: string | null; onlyLines?: WmsOrderItemRef[] },
+): Promise<WmsOrderCancelResult> {
   // Only a NEW or a BACKORDERED order is cancellable (both confirmed live); anything further along is a no-op.
   // The gate also proves the order is OURS before we cancel it (o3d-bjc.6).
   const clientId = await getPushClientId('Mintsoft order cancel')
-  const { found, statusId, merged, orderNumber } = await fetchMintsoftOrderStatusId(externalOrderId, clientId)
+  const { found, statusId, merged, orderNumber, identity } = await fetchMintsoftOrderStatusId(externalOrderId, clientId, options.expectedOrderNumber)
   if (!found) return { cancelled: false, status: 'NOT_FOUND' }
+  // THE IDENTITY GATE (cancel AND hold): an order that cannot be proved to be this order (the number is missing, or is not the one IMS
+  // pushed, whether or not it contains a "+") is never cancelled. Nothing is written; the caller raises a notice and the link stays live.
+  if (identity === 'MISMATCH') return { cancelled: false, status: 'IDENTITY_MISMATCH', ...(orderNumber ? { mergedSurvivorNumber: orderNumber } : {}) }
+  if (identity === 'UNVERIFIABLE') return { cancelled: false, status: 'IDENTITY_UNVERIFIABLE' }
   // Already cancelled (by the warehouse, or by an earlier attempt whose answer was lost): Mintsoft answers /Cancel with Success: true
   // either way, so Success alone cannot tell this apart from a cancellation IMS just made. It is reported as its own status and /Cancel
   // is not called.
   if (statusId === MINTSOFT_STATUS_CANCELLED) return { cancelled: false, status: 'ALREADY_CANCELLED' }
   // A MERGED order holds other orders' goods: it is never cancelled here, whichever of its orders the call was made for (the absorbing
   // order keeps the survivor's id, so its link can still name it as a plain order). The caller removes only that order's own lines.
-  if (merged && !options?.onlyLines) return { cancelled: false, status: 'MERGED_SURVIVOR', ...(orderNumber ? { mergedSurvivorNumber: orderNumber } : {}) }
+  if (merged && !options.onlyLines) return { cancelled: false, status: 'MERGED_SURVIVOR', ...(orderNumber ? { mergedSurvivorNumber: orderNumber } : {}) }
   if (statusId !== MINTSOFT_STATUS_NEW && statusId !== MINTSOFT_STATUS_ON_BACKORDER) return { cancelled: false, status: 'NOT_CANCELLABLE' }
   // Whenever the caller names the lines it is cancelling (whatever the merge flag says on this read), the order may be cancelled only
   // while it still holds EXACTLY those lines: a strict re-read immediately
   // before /Cancel. (Mintsoft has no conditional cancel, so a line added between this read and the call is an accepted inter-system
   // race limit.)
-  if (options?.onlyLines) {
+  if (options.onlyLines) {
     const now = await fetchMintsoftOrderItemsStrict(externalOrderId, clientId)
     const mine = options.onlyLines
     const same = now.length === mine.length && mine.every((m) => now.some((n) => sameRef(n, m)))
@@ -1050,14 +1086,18 @@ const describeRef = (ref: WmsOrderItemRef) => `${ref.quantity} x ${ref.sku} (lin
  *   4. one DELETE per line, each followed by a re-read that must show that line gone and every other line exactly as it was.
  * A failure after the first delete answers REFUSED carrying exactly what was removed and what remains. Nothing is retried.
  */
-export async function removeMintsoftOrderItems(survivorId: string, wanted: WmsOrderItemRef[]): Promise<WmsMergedItemRemoval> {
+export async function removeMintsoftOrderItems(survivorId: string, expectedOrderNumber: string | null, wanted: WmsOrderItemRef[]): Promise<WmsMergedItemRemoval> {
   const clientId = await getPushClientId('Mintsoft merged-order line removal')
   const targets = [...new Map(wanted.map((ref) => [ref.externalItemId, ref])).values()]
   const refuse = (reason: string, removed: WmsOrderItemRef[], remaining: WmsOrderItemRef[]): WmsMergedItemRemoval => ({ kind: 'REFUSED', reason, removed, remaining })
   if (targets.length === 0) return refuse('IMS holds no line ids for this order', [], [])
 
-  const gate = await fetchMintsoftOrderStatusId(survivorId, clientId)
+  const gate = await fetchMintsoftOrderStatusId(survivorId, clientId, expectedOrderNumber)
   if (!gate.found) return refuse(`the merged order ${survivorId} is no longer returned by the warehouse`, [], targets)
+  // THE IDENTITY GATE: the survivor must be flagged merged (the expected state) or carry exactly the number IMS recorded for it.
+  if (gate.identity !== 'MERGED' && gate.identity !== 'OK') {
+    return refuse(`the warehouse order could not be verified as the merged order IMS recorded (${gate.identity === 'MISMATCH' ? `it now carries the number ${gate.orderNumber ?? 'unknown'}` : 'its number or id is missing from the detail'})`, [], targets)
+  }
   if (gate.statusId !== MINTSOFT_STATUS_NEW && gate.statusId !== MINTSOFT_STATUS_ON_BACKORDER) {
     return refuse(`the merged order is past the point where its lines can be changed (status ${gate.statusId ?? 'unknown'})`, [], targets)
   }
