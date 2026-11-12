@@ -57,7 +57,7 @@ import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { rateBinding, resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { previewTreatedSalesInvoice, treatImportedSalesInvoice } from './eu-vat-invoice-treatment'
-import { regimePolicyProblem, type RegimePolicy } from '@/lib/domain/accounting/eu-vat-regime-policy'
+import { regimePolicyDifference, type RegimePolicy } from '@/lib/domain/accounting/eu-vat-regime-policy'
 import { heldFreshBuildDifference, heldInvoiceDifference, heldTaxBindingDifference, heldUntreatedTaxDifference, type ExpectedHeldInvoice } from './held-invoice-verification'
 import { currentWcTaxBinding, recordWcTaxBinding } from './wc-tax-binding'
 import { buildEuVatRegimeInputFromSettings, readEuVatRegimeMode } from './eu-vat-facts'
@@ -1838,10 +1838,10 @@ function withRegimePolicy(payload: Record<string, unknown>, policy: RegimePolicy
   if (marker?.applied !== true || policy === undefined) return payload
   return { ...payload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { ...marker, regimePolicy: policy } }
 }
-/** Null when the policy in force equals the one the hold was parked under; otherwise the reason the sweep must not release it. */
-async function regimePolicyChange(payload: Record<string, unknown>): Promise<string | null> {
-  const problem = await regimePolicyProblem((payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { regimePolicy?: unknown } | null | undefined)?.regimePolicy)
-  return problem === null ? null : problem.replace('since it was prepared', 'since it was parked').replace('it was prepared before', 'it was parked before')
+/** Null when the policy in force equals the one the hold was parked under; otherwise why the sweep must not release it, and which ACCOUNT settings changed (those a re-import cannot adopt: the regime stamp is write-once and the treated lines carry their accounts). */
+async function regimePolicyChange(payload: Record<string, unknown>): Promise<{ problem: string; accountsChanged: string[] } | null> {
+  const difference = await regimePolicyDifference((payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { regimePolicy?: unknown } | null | undefined)?.regimePolicy)
+  return difference === null ? null : { problem: difference.problem.replace('since it was prepared', 'since it was parked').replace('it was prepared before', 'it was parked before'), accountsChanged: difference.accountsChanged }
 }
 
 class HeldRecheckRefusal extends Error {
@@ -2391,7 +2391,10 @@ async function releaseHeldWcSalesInvoice(
     && (await (await import('@/lib/accounting')).isAccountingSyncTypeEnabledFor(heldChartConnector, 'SALES_INVOICE'))) {
     const change = await regimePolicyChange(held.accountingPayload)
     if (change !== null) {
-      await noteHeldReleaseFailure(row.id, `WooCommerce numbered this invoice ${invoiceNumber}, but ${change}, so the sweep did not release it. NOTHING was queued. Re-import the order from WooCommerce: the re-import checks the held invoice against the order under the current settings and releases it if it still holds.`)
+      await noteHeldReleaseFailure(row.id, change.accountsChanged.length > 0
+        // regime_account_changed: the stamped regime still applies and the lines carry the old accounts, so a re-import alone is refused by the stamp.
+        ? `WooCommerce numbered this invoice ${invoiceNumber}, but the EU VAT account setting(s) changed since it was parked (${change.accountsChanged.join(', ')}), so the sweep did not release it. NOTHING was queued. The regime stamped on the order still applies and the held invoice carries the old accounts, so re-importing the order alone will not release it: restore the previous account setting(s) in Settings > Accounting, then re-import the order from WooCommerce.`
+        : `WooCommerce numbered this invoice ${invoiceNumber}, but ${change.problem}, so the sweep did not release it. NOTHING was queued. Re-import the order from WooCommerce: the re-import checks the held invoice against the order under the current settings and releases it if it still holds.`)
       return 'not-queued'
     }
   }
@@ -2433,7 +2436,7 @@ async function releaseHeldWcSalesInvoice(
       }
       if (!options?.recheck && nowMarker?.applied === true && heldChartConnector !== null && (await isAccountingSyncTypeEnabledFor(heldChartConnector, 'SALES_INVOICE'))) {
         const change = await regimePolicyChange(heldNow.accountingPayload)
-        if (change !== null) throw new HeldRecheckRefusal(`${change}`, false)
+        if (change !== null) throw new HeldRecheckRefusal(change.problem, false)
       }
       // A re-import's treated hold is verified AGAIN here against the order, on top of the above: the order's facts re-resolved under this same lock, and what is released is the hold as re-read.
       if (options?.recheck) {

@@ -11,13 +11,22 @@ import { db } from '@/lib/db'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain/erasure/erase-personal-data'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
-import { regimePolicyProblem } from '@/lib/domain/accounting/eu-vat-regime-policy'
+import { regimePolicyDifference } from '@/lib/domain/accounting/eu-vat-regime-policy'
 import { EU_VAT_TREATMENT_PAYLOAD_KEY } from '@/lib/domain/accounting/eu-vat-treatment'
 import type { AttemptRef } from '@/lib/domain/accounting/sync-log-attempt'
 import type { HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
 import { PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR } from '@/lib/domain/accounting/prior-posting-evidence'
 import { buildHeldSalesInvoicePayload, heldSalesInvoiceQueueWhere, HELD_SALES_INVOICE_RECORD_KIND } from './held-sales-invoice'
+
+/**
+ * What the operator is told when an ACCOUNT setting changed. The regime stamp is write-once and the treated lines carry their accounts, so a re-import cannot adopt the new account and would only mark the hold order-changed: re-import alone does not fix this. Two things work:
+ * restore the previous account setting (Settings > Accounting) and retry this row on /sync (`retryFailedAccountingSync`, app/actions/accounting-sync.ts:762), or post the invoice by hand in Xero and record it on this row with the per-row settlement action on /sync
+ * (`settleAccountingSyncRow`, app/actions/accounting-settlement.ts:360).
+ */
+export const REGIME_ACCOUNT_CHANGED_REFUSAL = (invoiceNumber: string, accounts: string[]): string =>
+  withLedgerCheck(`NOTHING WAS SENT. Sales invoice ${invoiceNumber} was refused: the EU VAT account setting(s) changed since it was prepared (${accounts.join(', ')}). The regime stamped on the order still applies and this invoice was built on the accounts it was prepared with, so re-importing the order will not fix it. Either restore the previous account setting(s) in Settings > Accounting and retry this row on /sync, or post the invoice by hand in Xero and record it on this row with the settle action on /sync.`)
 
 /** What the operator is told when the invoice cannot be superseded because an earlier attempt may already have created it. */
 export const REGIME_POLICY_BLOCKED_REFUSAL = (invoiceNumber: string, problem: string): string =>
@@ -36,6 +45,7 @@ export type RegimePolicyHoldOutcome =
   | { kind: 'held' }                                // superseded and parked as a held invoice
   | { kind: 'lost' }                                // the claim or attempt moved on: nothing was changed
   | { kind: 'refuse'; problem: string }             // changed, but it cannot be parked (not a WooCommerce order): the poster refuses it
+  | { kind: 'account_changed'; problem: string; accounts: string[] }  // an ACCOUNT setting changed: the stamped regime and the treated lines keep their old accounts, so a re-import cannot adopt it; not superseded, refused with steps that work
   | { kind: 'blocked'; problem: string }            // changed, but an earlier attempt may have created the invoice in Xero: never superseded, left refused for ledger reconciliation
 
 export async function holdInvoiceOnRegimePolicyChange(params: {
@@ -47,8 +57,11 @@ export async function holdInvoiceOnRegimePolicyChange(params: {
 }): Promise<RegimePolicyHoldOutcome> {
   const marker = params.payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown; regimePolicy?: unknown } | null | undefined
   if (typeof marker !== 'object' || marker === null || marker.applied !== true) return { kind: 'unaffected' }
-  const problem = await regimePolicyProblem(marker.regimePolicy)
-  if (problem === null) return { kind: 'unaffected' }
+  const difference = await regimePolicyDifference(marker.regimePolicy)
+  if (difference === null) return { kind: 'unaffected' }
+  const problem = difference.problem
+  // An account setting (IOSS, DDP, fee, rounding) is baked into the stamp (write-once) and the treated lines, so rebuilding under the new account is refused by the stamp and would only end in an order-changed hold: nothing is superseded, the row stays refused (FAILED, retryable) and the operator is told what works.
+  if (difference.accountsChanged.length > 0) return { kind: 'account_changed', problem, accounts: difference.accountsChanged }
   if (params.referenceType !== 'SalesOrder') return { kind: 'refuse', problem }
   const invoiceNumber = typeof params.payload.invoiceNumber === 'string' ? params.payload.invoiceNumber : ''
   return db.$transaction(async (tx): Promise<RegimePolicyHoldOutcome> => {

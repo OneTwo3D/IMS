@@ -30,6 +30,8 @@ let accountingMocked = false
 const betweenHook: { armed: boolean; verified: boolean; run: null | (() => Promise<void>) } = { armed: false, verified: false, run: null }
 // Runs once, right after the treatment's read of the gift-card cut-in returns (to change the setting between the read and the parking write).
 const cutInHook: { run: null | (() => Promise<void>) } = { run: null }
+// Account settings the mocked accounting settings report instead of the defaults (a test changes one while a row waits).
+const acct: Record<string, string> = {}
 async function mockAccounting() {
   if (accountingMocked) return
   const verification = await import('@/lib/connectors/woocommerce/sync/held-invoice-verification')
@@ -75,7 +77,7 @@ async function mockAccounting() {
       ...actual,
       getAccountingSettings: async () => ({
         connector: 'xero', salesAccount: '200', shippingAccount: '260', discountAccount: '270', reverseChargeSalesTaxType: rcSetting,
-        euVatIossAccount: '821', euVatDdpAccount: '232', euFeeAccount: '232', roundingDifferenceAccount: '860',
+        euVatIossAccount: acct.ioss ?? '821', euVatDdpAccount: acct.ddp ?? '232', euFeeAccount: acct.fee ?? '232', roundingDifferenceAccount: acct.rounding ?? '860',
       }),
       isAccountingSyncTypeEnabledFor: async () => switchOn,
       queueAccountingSyncTxWithOutcome: async (tx: { accountingSyncLog: { create(args: unknown): Promise<unknown> } }, params: { type: string; referenceType: string; referenceId: string; payload: Record<string, unknown>; idempotencyKey?: string }) => {
@@ -222,7 +224,7 @@ test('[eu vat] switch ON, IOSS: zero-rated goods and shipping, fee on 232, one V
   assert.equal(invoice._taxUnreconciled, undefined)
   assert.equal(invoice._registerPayment, true)
   const { taxBinding, ...marker } = invoice._euVatTreatment as Record<string, unknown> & { taxBinding: { lineRateIds: unknown[]; shippingRateIds: unknown[]; rates: Record<string, { accountingTaxType: string; reverseCharge: boolean }>; lines: Array<{ rateId: string | null; source: string; type: string | null }>; shipping: { rateId: string | null; type: string | null } } }
-  assert.deepEqual(marker, { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', orderTotal: '135.66', vatAccount: '821', feesRecoded: 1, roundingAdjustment: null, regimePolicy: { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232' } })
+  assert.deepEqual(marker, { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', orderTotal: '135.66', vatAccount: '821', feesRecoded: 1, roundingAdjustment: null, regimePolicy: { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232', fee: '232', rounding: '860', baseCurrency: 'GBP' } })
   // The tax binding recorded BEFORE the treatment re-typed the lines: both lines and the shipping on the one WooCommerce rate, which resolved to the charged code.
   assert.equal(taxBinding.lineRateIds.length, 2)
   assert.equal(taxBinding.shippingRateIds.length, 1)
@@ -387,10 +389,10 @@ test('[eu vat] the poster re-checks the scheme posting type: proven zero-rated p
   const externalId = Math.floor(Math.random() * 2_000_000_000)
   const ctx = await seed(db, wcRateId)
   t.after(async () => { await cleanup(db, externalId, ctx) })
-  const treated = { invoiceNumber: 'INV-1', _euVatTreatment: { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', vatAccount: '821', regimePolicy: { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232' } } }
+  const treated = { invoiceNumber: 'INV-1', _euVatTreatment: { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', vatAccount: '821', regimePolicy: { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232', fee: '232', rounding: '860', baseCurrency: 'GBP' } } }
   assert.equal(await euSchemePostingRefusal(treated), null)
   assert.equal(await euSchemePostingRefusal({ invoiceNumber: 'INV-2' }), null)
-  assert.equal(await euSchemePostingRefusal({ invoiceNumber: 'INV-3', _euVatTreatment: { applied: true, route: 'none', regimePolicy: { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232' } } }), null)
+  assert.equal(await euSchemePostingRefusal({ invoiceNumber: 'INV-3', _euVatTreatment: { applied: true, route: 'none', regimePolicy: { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232', fee: '232', rounding: '860', baseCurrency: 'GBP' } } }), null)
   await seedXeroList(db, { TAX131: '20.000000' })
   assert.match((await euSchemePostingRefusal(treated)) ?? '', /^NOTHING WAS SENT\. Sales invoice INV-1 was refused: .*20.*% in Xero, not zero-rated/)
   await seedXeroList(db, { TAX999: '0.000000' })
@@ -1373,7 +1375,7 @@ async function sweepAfterSettingChange(t: test.TestContext, change: ((setCutIn: 
   const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
   const marker = (held.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment as Record<string, unknown>
   assert.equal(marker.applied, true)
-  assert.deepEqual(marker.regimePolicy, { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232' }, 'the policy the hold was decided under is recorded')
+  assert.deepEqual(marker.regimePolicy, { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232', fee: '232', rounding: '860', baseCurrency: 'GBP' }, 'the policy the hold was decided under is recorded')
   if (change) await change(setCutIn)
   await db.salesOrder.update({ where: { id: orderId }, data: { invoiceNumber: `INV-${externalId}` } })
   await retryHeldWcSalesInvoiceReleases()
@@ -1411,7 +1413,7 @@ test('[eu vat] the poster refuses a treated payload whose recorded regime policy
   const ctx = await seed(db, wcRateId)
   t.after(async () => { await db.setting.deleteMany({ where: { key: 'eu_vat_gift_card_flag_cut_in' } }); await db.xeroTaxRateList.deleteMany({ where: { connector: 'xero' } }); await cleanup(db, externalId, ctx) })
   await seedXeroList(db, { TAX131: '0.000000' })
-  const policy = { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232' }
+  const policy = { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232', fee: '232', rounding: '860', baseCurrency: 'GBP' }
   const treated = (over: Record<string, unknown> = {}) => ({ invoiceNumber: 'INV-P', _euVatTreatment: { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', vatAccount: '821', regimePolicy: policy, ...over } })
   assert.equal(await euSchemePostingRefusal(treated()), null, 'unchanged policy: posts')
   assert.equal(await euSchemePostingRefusal({ invoiceNumber: 'INV-U' }), null, 'an untreated payload is untouched')
@@ -1548,7 +1550,7 @@ for (const kind of ['create', 'update'] as const) {
       const ctx = await seed(db, wcRateId)
       t.after(async () => { await db.setting.deleteMany({ where: { key: 'eu_vat_gift_card_flag_cut_in' } }); await cleanup(db, externalId, ctx) })
       await seedXeroList(db, { TAX131: '0.000000' })
-      const policy = { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232' }
+      const policy = { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232', fee: '232', rounding: '860', baseCurrency: 'GBP' }
       const payloadNow = { invoiceNumber: 'INV-L', _euVatTreatment: { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', vatAccount: '821', regimePolicy: policy } }
       const mutate = async () => {
         if (change === 'policy') await db.setting.upsert({ where: { key: 'eu_vat_gift_card_flag_cut_in' }, create: { key: 'eu_vat_gift_card_flag_cut_in', value: '2026-12-01' }, update: { value: '2026-12-01' } })
@@ -1591,4 +1593,51 @@ test('[eu vat] the final check is the LAST statement before the return in both c
   assert.match(check, /const fenced = await numberFence\(request\)\n\s+if \(!fenced\.ok\) return fenced\n\s+\}\n\s+return last\(request\)\n\s+\}/)
   // The final check: the type proof first, the policy compare last, and the function returns straight after the compare.
   assert.match(check, /const typeProblem = await schemeTypeProblem\(payload\)[\s\S]*const policyProblem = await regimePolicyProblem\(marker\.regimePolicy\)\n\s+return policyProblem === null\n[\s\S]*?\n  \}\n\}\n/)
+})
+
+// AN ACCOUNT SETTING (IOSS, DDP, fee, rounding) IS PART OF THE POLICY, AND A CHANGE TO ONE IS NOT SOMETHING A RE-IMPORT CAN ADOPT: the stamp is write-once and the lines carry their accounts.
+for (const key of ['ioss', 'ddp', 'fee', 'rounding'] as const) {
+  test(`[eu vat] the ${key} account changes while the invoice is queued: the final check refuses it, and the early gate refuses it WITHOUT superseding (distinct wording, no hold, row untouched)`, { skip }, async (t) => {
+    const db = await loadDb()
+    await mockAccounting()
+    const { composeFinalBeforePost, euSchemePostingRefusal } = await import('@/lib/connectors/xero/scheme-posting-check')
+    const { holdInvoiceOnRegimePolicyChange, REGIME_ACCOUNT_CHANGED_REFUSAL } = await import('@/lib/connectors/woocommerce/sync/regime-policy-hold')
+    const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+    const externalId = Math.floor(Math.random() * 2_000_000_000)
+    const ctx = await seed(db, wcRateId)
+    t.after(async () => { for (const k of Object.keys(acct)) delete acct[k]; await cleanup(db, externalId, ctx) })
+    await seedXeroList(db, { TAX131: '0.000000' })
+    const policy = { mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232', fee: '232', rounding: '860', baseCurrency: 'GBP' }
+    const payloadNow = { invoiceNumber: 'INV-A', _euVatTreatment: { applied: true, route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', vatAccount: '821', regimePolicy: policy } }
+    assert.deepEqual(await composeFinalBeforePost(null, payloadNow, 'create')({} as never), { ok: true })
+    acct[key] = '999'
+    const refused = await composeFinalBeforePost(null, payloadNow, 'create')({} as never)
+    assert.equal(refused.ok, false)
+    assert.match((refused as { error: string }).error, new RegExp(`the EU VAT regime settings changed since it was prepared \\(${key}\\)`))
+    // The early gate: not superseded (a row is not even needed: the outcome is decided before anything is touched).
+    const outcome = await holdInvoiceOnRegimePolicyChange({ attempt: { id: 'none', attemptRevision: 1 }, held: { heldFrom: () => new Date() }, referenceType: 'SalesOrder', referenceId: 'none', payload: payloadNow } as never)
+    assert.deepEqual(outcome, { kind: 'account_changed', problem: `the EU VAT regime settings changed since it was prepared (${key})`, accounts: [key] })
+    const message = REGIME_ACCOUNT_CHANGED_REFUSAL('INV-A', [key])
+    assert.match(message, /^BEFORE acting on this: check whether the current version is already in the accounting system, and act only if it is absent\. NOTHING WAS SENT\. Sales invoice INV-A was refused: the EU VAT account setting\(s\) changed since it was prepared/)
+    assert.match(message, /re-importing the order will not fix it/)
+    assert.match(message, /restore the previous account setting\(s\) in Settings > Accounting and retry this row on \/sync, or post the invoice by hand in Xero and record it on this row with the settle action/)
+    assert.equal(await euSchemePostingRefusal(payloadNow) !== null, true, 'the early gate refuses it too')
+  })
+}
+
+test('[eu vat] a policy recorded before the fee, rounding and base-currency fields existed is a MISMATCH but not a changed account', { skip }, async () => {
+  await mockAccounting()
+  const { regimePolicyDifference } = await import('@/lib/domain/accounting/eu-vat-regime-policy')
+  const difference = await regimePolicyDifference({ mode: 'adopt_plugin', cutIn: 'unset', ioss: '821', ddp: '232' })
+  assert.ok(difference !== null)
+  assert.match(difference.problem, /\(fee, rounding, baseCurrency\)/)
+  assert.deepEqual(difference.accountsChanged, [], 'unrecorded is not changed: it is superseded and rebuilt, not told to restore an account')
+})
+
+test('[eu vat] the SWEEP gives a held invoice whose ACCOUNT setting changed the account wording (re-import alone does not release it)', { skip }, async (t) => {
+  t.after(() => { for (const k of Object.keys(acct)) delete acct[k] })
+  const { after, rows } = await sweepAfterSettingChange(t, async () => { acct.ioss = '999' })
+  assert.equal(rows, 0, 'nothing was queued')
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /account setting\(s\) changed since it was parked \(ioss\).*re-importing the order alone will not release it: restore the previous account setting\(s\) in Settings > Accounting, then re-import/)
 })

@@ -28,6 +28,7 @@ import { currentWcTaxBinding, recordWcTaxBinding, type InvoiceTaxTypesInput, typ
 import { buildEuVatRegimeInputFromSettings, readEuVatRegimeMode, readGiftCardFlagCutIn } from './eu-vat-facts'
 import type { GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
 import { regimePolicyOf, type RegimePolicy } from '@/lib/domain/accounting/eu-vat-regime-policy'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
 import type { MappedLine } from './field-mapping'
 import type { WcFullOrder } from './types'
 
@@ -38,14 +39,16 @@ export { regimePolicyOf, type RegimePolicy }
  * while a treatment runs can never be recorded as the policy of a decision made under the old value.
  */
 async function readRegimeInputOnce(
-  client: Parameters<typeof buildEuVatRegimeInputFromSettings>[0], order: WcFullOrder, accounts: { ioss: string | null; ddp: string | null },
+  client: Parameters<typeof buildEuVatRegimeInputFromSettings>[0], order: WcFullOrder, accounts: { ioss: string | null; ddp: string | null; fee: string | null; rounding: string | null },
 ): Promise<{ ok: true; input: Awaited<ReturnType<typeof buildEuVatRegimeInputFromSettings>>; policy: RegimePolicy } | { ok: false; reason: string }> {
   const mode = await readEuVatRegimeMode()
   if (mode === null) return { ok: false, reason: 'the setting "eu_vat_regime_mode" holds a value that is neither adopt_plugin nor decide, so IMS cannot tell who decides the EU VAT regime' }
   let cutIn: GiftCardCutIn
   try { cutIn = await readGiftCardFlagCutIn() } catch { cutIn = { state: 'invalid', raw: 'setting could not be read' } }
-  const input = await buildEuVatRegimeInputFromSettings(client, order, accounts, { mode }, async () => cutIn)
-  return { ok: true, input, policy: regimePolicyOf(mode, cutIn, accounts.ioss, accounts.ddp) }
+  let baseCurrency: string | null = null
+  try { baseCurrency = await getBaseCurrencyCode() } catch { baseCurrency = null }
+  const input = await buildEuVatRegimeInputFromSettings(client, order, accounts, { mode, ...(baseCurrency === null ? {} : { baseCurrency }) }, async () => cutIn)
+  return { ok: true, input, policy: regimePolicyOf({ mode, cutIn, ioss: accounts.ioss, ddp: accounts.ddp, fee: accounts.fee, rounding: accounts.rounding, baseCurrency }) }
 }
 
 export type EuVatTreatmentAccounts = { ioss: string | null; ddp: string | null; fee: string | null; rounding: string | null }
@@ -81,7 +84,7 @@ export async function treatImportedSalesInvoice(params: {
 
   // Every input that decides a line's and the shipping's posted tax type, as the order resolves them now: recorded in the marker, so a held invoice can be compared with the order before it is released.
   const taxBinding = await currentWcTaxBinding(params.wcOrder, params.mappedLines, params.taxBindingDeps)
-  const read = await readRegimeInputOnce(db, params.wcOrder, { ioss: params.accounts.ioss, ddp: params.accounts.ddp })
+  const read = await readRegimeInputOnce(db, params.wcOrder, params.accounts)
   if (!read.ok) return { kind: 'refused', reason: read.reason }
   const { input, policy } = read
   const decision = resolveEuVatRegime(input)
@@ -158,7 +161,7 @@ export async function previewTreatedSalesInvoice(client: Prisma.TransactionClien
   if (params.storeCreditForeign.gt(0)) return { kind: 'skipped', why: 'store_credit' }
   if (EU_UNRECONCILED_KEY in params.payload) return { kind: 'skipped', why: 'unreconciled' }
   const taxBinding = await currentWcTaxBinding(params.wcOrder, params.mappedLines, params.taxBindingDeps)
-  const read = await readRegimeInputOnce(client, params.wcOrder, { ioss: params.accounts.ioss, ddp: params.accounts.ddp })
+  const read = await readRegimeInputOnce(client, params.wcOrder, params.accounts)
   if (!read.ok) return { kind: 'refused', reason: read.reason }
   const { input, policy } = read
   const stamp = await readEuVatRegimeStamp(client, params.orderId)
