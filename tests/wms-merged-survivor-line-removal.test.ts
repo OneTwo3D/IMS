@@ -240,7 +240,7 @@ function makePort(options: { cancellable: WmsPushLinkRef[]; items: WmsOrderItemR
   return { port, writes, dropped, recordedItems, events, link }
 }
 
-async function sweep(port: WmsOrderPushPort) {
+async function sweep(port: WmsOrderPushPort, overrides: Record<string, unknown> = {}) {
   const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
   const orderPush = await import('../lib/connectors/mintsoft/api/order-push.ts')
   const connector = {
@@ -253,6 +253,7 @@ async function sweep(port: WmsOrderPushPort) {
     findMergedSurvivor: async (number: string) => orderPush.findMintsoftMergedSurvivor(number),
     verifyPushedOrder: async () => 'ours' as const,
     probeOrderPresence: async () => 'FOUND' as const,
+    ...overrides,
   }
   const quiet = { warn: console.warn, error: console.error }
   console.warn = () => {}
@@ -737,5 +738,76 @@ test('AN UNFLAGGED "+" NUMBER IS AN ORDINARY ORDER: it is cancelled normally, no
     assert.deepEqual(deletedIds(), [])
     assert.equal(result.cancelled, 1)
     assert.equal(h.writes.some((w) => w.data.state === 'MERGED'), false)
+  })
+})
+
+// ---------------------------------------------------------------- 9. review round 2 -----------------------------------------------
+
+const updatableLink = () => ({
+  id: 'link-d', externalOrderId: ABSORBED,
+  order: {
+    id: 'so-d', orderNumber: 'IMSTEST-D', externalOrderNumber: null, currency: 'GBP', customerName: 'Jane Doe', customerEmail: 'j@example.com',
+    customerVatNumber: null, shippingAddress: { line1: '1 St', city: 'Leeds', postcode: 'LS1', country: 'GB' }, shippingService: 'Royal Mail',
+    subtotalForeign: 10, shippingForeign: 0, taxForeign: 0, taxRatePercent: null, pricesIncludeVat: false, discountAmount: 0, totalForeign: 10,
+    shipFromWarehouseId: 'wh-1', lines: [{ sku: 'A', qty: 1, taxForeign: 0, totalForeign: 10, description: 'Widget' }],
+  },
+})
+
+/** A port whose recorded line ids live in a small in-memory store, so the amend pass and the later cancel see the same snapshot. */
+function snapshotPort(initial: WmsOrderItemRef[]) {
+  const store = { items: [...initial] }
+  const h = makePort({ cancellable: [], items: null })
+  h.port.updatableLinks = async () => [updatableLink()] as never
+  h.port.readOrderItems = async () => [...store.items]
+  h.port.replaceOrderItems = async (_orderId, _ext, items) => { store.items = [...items] }
+  return { h, store }
+}
+
+test('AMENDMENT whose read-back FAILS (no lines returned): the old snapshot is DELETED; merged and cancelled afterwards, nothing is deleted and a notice is raised', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const { h, store } = snapshotPort(storedD)
+    await sweep(h.port) // the amend pass: updateOrder is accepted but returns no lines
+    assert.deepEqual(store.items, [], 'the stale snapshot is gone')
+    // the order is then merged away and cancelled
+    h.port.updatableLinks = async () => []
+    h.port.cancellableLinks = async () => [mergedLinkRef()]
+    h.link.state = 'MERGED'
+    h.link.externalOrderId = SURVIVOR
+    const result = await sweep(h.port)
+    assert.equal(fake.requests.some((r) => r.method === 'DELETE' || r.path.endsWith('/Cancel')), false)
+    assert.equal(result.operatorNotices, 1)
+    assert.equal(survivorItems().length, 4)
+  })
+})
+
+test('AMENDMENT that is accepted but whose line changes did not finish (partial): the snapshot is DELETED', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const { h, store } = snapshotPort(storedD)
+    const { WmsOrderUpdatePartialError } = await import('../lib/connectors/wms/courier-form.ts')
+    await sweep(h.port, { updateOrder: async () => { throw new WmsOrderUpdatePartialError('items failed', {}) } })
+    assert.deepEqual(store.items, [])
+  })
+})
+
+test('AMENDMENT whose replacement snapshot cannot be WRITTEN: the old one is cleared instead of kept', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const { h, store } = snapshotPort(storedD)
+    let calls = 0
+    h.port.replaceOrderItems = async (_o, _e, items) => { calls += 1; if (calls === 1) throw new Error('database unavailable'); store.items = [...items] }
+    await sweep(h.port, { updateOrder: async () => ({ updated: true, status: 'NEW', items: [{ externalItemId: '1', sku: 'A', quantity: 1 }] }) })
+    assert.deepEqual(store.items, [])
+  })
+})
+
+test('AMENDMENT with a verified re-read REPLACES the snapshot (control)', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const { h, store } = snapshotPort(storedD)
+    const fresh = [{ externalItemId: '55', sku: 'A', quantity: 1 }]
+    await sweep(h.port, { updateOrder: async () => ({ updated: true, status: 'NEW', items: fresh }) })
+    assert.deepEqual(store.items, fresh)
   })
 })

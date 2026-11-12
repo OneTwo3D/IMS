@@ -2967,9 +2967,19 @@ export async function runWmsOrderPushSweepCore(
           ...settled.linkFields,
         })
         if (update.updated) result.updated += 1
-        // The amendment may have replaced lines (new warehouse line ids): keep the recorded ids current. Best effort.
-        if (update.updated && update.items) {
-          await port.replaceOrderItems?.(link.order.id, link.externalOrderId, update.items).catch((e) => console.error(`[wms-order-push] could not refresh the WMS line ids for ${link.order.id}: ${scrubWmsError(e, 'write failed')}`))
+        // The amendment may have replaced, added or consolidated lines (new warehouse line ids). The recorded ids are replaced by a verified
+        // re-read, and when that cannot be had (the read-back failed, was not exactly what IMS sent, or could not be written) the OLD
+        // snapshot is DELETED: a stale one would let a later merged-order removal delete the old lines and miss an added one. With no
+        // snapshot the removal falls back to the operator notice.
+        if (update.updated) {
+          const orderId = link.order.id
+          const externalOrderId = link.externalOrderId
+          try {
+            await port.replaceOrderItems?.(orderId, externalOrderId, update.items ?? [])
+          } catch (e) {
+            console.error(`[wms-order-push] could not refresh the WMS line ids for ${orderId}: ${scrubWmsError(e, 'write failed')}`)
+            await port.replaceOrderItems?.(orderId, externalOrderId, []).catch(() => {})
+          }
         }
         await audit({
           action: 'order_update', outcome: update.updated ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,
@@ -2985,6 +2995,9 @@ export async function runWmsOrderPushSweepCore(
         result.failed += 1
         // The order post was accepted and the item reconcile failed: the courier on the WMS order has already changed, so its
         // form and warning are settled now, and the link stays due (no pushedAt) for the items to be redone.
+        // The order post was accepted but the line amendment did not finish: the lines on the warehouse order are in an unknown state, so
+        // the recorded ids no longer describe them. Forgotten (the notice path then applies to a merge).
+        if (error instanceof WmsOrderUpdatePartialError) await port.replaceOrderItems?.(link.order.id, link.externalOrderId as string, []).catch(() => {})
         const partial = error instanceof WmsOrderUpdatePartialError ? await settleAmendedCourier(link, error.applied).catch(() => null) : null
         await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts, ...(partial?.linkFields ?? {}) }).catch(() => {})
         await audit({
