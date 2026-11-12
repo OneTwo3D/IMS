@@ -132,6 +132,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   wms_inbound_receipt_events: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
   wms_mutation_events: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
   wms_order_discrepancies: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
+  wms_order_push_items: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
   wms_order_push_links: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
   wms_order_status_snapshots: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
   wms_product_links: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },

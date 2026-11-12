@@ -1,7 +1,9 @@
 import { isOutboundMaybeSentRefusalText, isOutboundWriteHeldText, outboundTextAfterEarlierSend } from '@/lib/security/outbound-write-hold-constants'
 import type {
   WmsAmbiguousCreateResolution,
+  WmsMergedItemRemoval,
   WmsMergedSurvivorLookup,
+  WmsOrderItemRef,
   WmsOrderCancelResult,
   WmsOrderPushInput,
   WmsOrderPushLine,
@@ -500,7 +502,8 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   }
 
   // A create that unambiguously succeeded binds the id Mintsoft minted for it —
-  // and says so (o3d-bjc.8). Still deliberately NOT read back HERE: the create has
+  // and says so (o3d-bjc.8). Still deliberately NOT read back HERE for the binding (the only read is the best-effort one of the
+  // order's LINES, which decides nothing and never throws): the create has
   // already happened, so a verification failure at this point leaves only bad
   // options — bind unverified anyway, or throw and let the sweep re-PUT,
   // duplicating a real warehouse order (or dead-letter the link while a live order
@@ -513,12 +516,14 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   if (created.ok && created.data) {
     const externalOrderId = toStr(created.data.OrderId)
     if (externalOrderId) {
+      const items = await snapshotMintsoftOrderItems(externalOrderId, clientId)
       return {
         externalOrderId,
         externalOrderNumber: toStr(created.data.OrderNumber) ?? input.orderNumber,
         status: 'NEW',
         courierFallback: courierFallback || boundExisting,
         ...(boundExisting ? {} : { courierForm, courierFormName }),
+        ...(items ? { items } : {}),
         needsVerification: true,
       }
     }
@@ -544,10 +549,12 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
           ? 'Mintsoft refused the create because the order number already exists, and the order holding it is CANCELLED in Mintsoft (a cancelled order keeps its number). IMS did not link to it.'
           : 'Mintsoft refused the create because the order number already exists, but the order holding it could not be confirmed live (the read-back failed, was not ours, or showed no status). IMS did not link to it.')
       }
+      const items = await snapshotMintsoftOrderItems(externalOrderId, clientId)
       return {
         externalOrderId,
         externalOrderNumber: toStr(existing.OrderNumber) ?? input.orderNumber,
         status: 'NEW',
+        ...(items ? { items } : {}),
         // Which form the pre-existing order carries is unknown: record none, flag the courier for review, and let the first
         // amendment pick it like a fresh create.
         courierFallback: true,
@@ -770,6 +777,40 @@ async function fetchMintsoftOrderItems(externalOrderId: string, clientId: number
     .filter((item): item is MintsoftOrderItem => Number.isFinite(item.ID))
 }
 
+/**
+ * STRICT read of an order's lines for the merged-order removal: a response that is not an array, or a line without a readable id, SKU
+ * and whole quantity, THROWS rather than reading as "fewer lines". The lenient reader above drops such rows, which is fine for an
+ * amendment's diff but would make a removal's proof ("these lines are gone, the others are untouched") vacuous.
+ */
+async function fetchMintsoftOrderItemsStrict(externalOrderId: string, clientId: number): Promise<WmsOrderItemRef[]> {
+  const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/Items?ClientId=${clientId}`)
+  if (result.error) throw new Error(result.error)
+  return extractMintsoftArrayPayloadStrict(result.data, 'Order items (merged-order removal)').map((raw) => {
+    const r = raw as RawOrder
+    const id = toStr(r?.ID ?? r?.Id)
+    const sku = toStr(r?.SKU)
+    const qty = typeof r?.Quantity === 'number' ? r.Quantity : Number.parseInt(toStr(r?.Quantity) ?? '', 10)
+    if (!id || !sku || !Number.isInteger(qty)) throw new Error('Mintsoft order items (merged-order removal): a line carries no readable id, SKU or whole quantity')
+    return { externalItemId: id, sku, quantity: qty }
+  })
+}
+
+/**
+ * The lines of an order IMS has just created or amended, as the warehouse numbers them. BEST EFFORT and never throws: the order exists
+ * already, so a failed read must not fail the push (a retry would duplicate the order). Undefined means "could not be read"; IMS then
+ * stores nothing and a later merged-order removal falls back to the operator notice. The create response carries no lines (live), so
+ * this is a read-back of the order just created.
+ */
+async function snapshotMintsoftOrderItems(externalOrderId: string, clientId: number): Promise<WmsOrderItemRef[] | undefined> {
+  try {
+    const items = await fetchMintsoftOrderItemsStrict(externalOrderId, clientId)
+    return items.length > 0 ? items : undefined
+  } catch (error) {
+    console.warn(`[mintsoft] could not read back the lines of order ${externalOrderId}: ${error instanceof Error ? error.message : String(error)}`)
+    return undefined
+  }
+}
+
 /** Bring a NEW Mintsoft order's line items in line with the (refund-netted) desired set. */
 async function reconcileMintsoftOrderItems(externalOrderId: string, input: WmsOrderPushInput, clientId: number): Promise<void> {
   // Mintsoft item quantities are whole units. If any desired line is non-integer or
@@ -876,7 +917,9 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
     } catch (error) {
       throw new WmsOrderUpdatePartialError(error instanceof Error ? error.message : String(error), applied)
     }
-    return { updated: true, status: 'NEW', ...applied }
+    // The amendment may have deleted, added or consolidated lines (new ids), so the stored line ids are re-read.
+    const items = await snapshotMintsoftOrderItems(externalOrderId, clientId)
+    return { updated: true, status: 'NEW', ...applied, ...(items ? { items } : {}) }
   }
   throw new Error(toStr(data?.Message) ?? 'Mintsoft order update failed')
 }
@@ -927,4 +970,85 @@ export async function cancelMintsoftOrder(externalOrderId: string): Promise<WmsO
     return { cancelled: true, status: 'CANCELLED' }
   }
   throw new Error(toStr(data?.Message) ?? 'Mintsoft order cancel failed')
+}
+
+const sameRef = (a: WmsOrderItemRef, b: WmsOrderItemRef) => a.externalItemId === b.externalItemId && a.sku === b.sku && a.quantity === b.quantity
+const describeRef = (ref: WmsOrderItemRef) => `${ref.quantity} x ${ref.sku} (line ${ref.externalItemId})`
+
+/**
+ * Take ONE order's lines out of a merged survivor (live-confirmed 2026-11-12: the merge keeps every original line, with its original
+ * line id, even for a shared SKU, and `DELETE /api/Order/{id}/Items/{itemId}` answers Success:true naming the SKU, not the line, so
+ * only a re-read proves which line went).
+ *
+ * Order of events, and what each step proves:
+ *   1. the survivor is read through the ordinary ownership gate and must be NEW or ON BACKORDER (the statuses `/Cancel` works on);
+ *   2. its lines are read STRICTLY, and every wanted line must be there with the same SKU and quantity: BEFORE anything is deleted;
+ *   3. when the wanted lines are ALL there is, nothing is written (ONLY_LINES_LEFT): the caller cancels the order normally;
+ *   4. one DELETE per line, each followed by a re-read that must show that line gone and every other line exactly as it was.
+ * A failure after the first delete answers REFUSED carrying exactly what was removed and what remains. Nothing is retried.
+ */
+export async function removeMintsoftOrderItems(survivorId: string, wanted: WmsOrderItemRef[]): Promise<WmsMergedItemRemoval> {
+  const clientId = await getPushClientId('Mintsoft merged-order line removal')
+  const targets = [...new Map(wanted.map((ref) => [ref.externalItemId, ref])).values()]
+  const refuse = (reason: string, removed: WmsOrderItemRef[], remaining: WmsOrderItemRef[]): WmsMergedItemRemoval => ({ kind: 'REFUSED', reason, removed, remaining })
+  if (targets.length === 0) return refuse('IMS holds no line ids for this order', [], [])
+
+  const gate = await fetchMintsoftOrderStatusId(survivorId, clientId)
+  if (!gate.found) return refuse(`the merged order ${survivorId} is no longer returned by the warehouse`, [], targets)
+  if (gate.statusId !== MINTSOFT_STATUS_NEW && gate.statusId !== MINTSOFT_STATUS_ON_BACKORDER) {
+    return refuse(`the merged order is past the point where its lines can be changed (status ${gate.statusId ?? 'unknown'})`, [], targets)
+  }
+
+  let current: WmsOrderItemRef[]
+  try {
+    current = await fetchMintsoftOrderItemsStrict(survivorId, clientId)
+  } catch (error) {
+    return refuse(`the merged order's lines could not be read (${error instanceof Error ? error.message : String(error)})`, [], targets)
+  }
+  const problems: string[] = []
+  for (const target of targets) {
+    const found = current.find((item) => item.externalItemId === target.externalItemId)
+    if (!found) problems.push(`line ${target.externalItemId} (${target.quantity} x ${target.sku}) is not on the merged order`)
+    else if (found.sku !== target.sku || found.quantity !== target.quantity) {
+      problems.push(`line ${target.externalItemId} is now ${found.quantity} x ${found.sku}, IMS pushed ${target.quantity} x ${target.sku}`)
+    }
+  }
+  if (problems.length > 0) return refuse(problems.join('; '), [], targets)
+  if (current.length === targets.length) return { kind: 'ONLY_LINES_LEFT' }
+
+  const removed: WmsOrderItemRef[] = []
+  let before = current
+  const base = `/api/Order/${encodeURIComponent(survivorId)}/Items`
+  for (const target of targets) {
+    const remaining = () => targets.filter((t) => !removed.some((r) => r.externalItemId === t.externalItemId))
+    const done = () => (removed.length > 0 ? `removed ${removed.map(describeRef).join(', ')}; ` : 'nothing was removed; ')
+    try {
+      const result = await mintsoftRequest<unknown>(`${base}/${encodeURIComponent(target.externalItemId)}`, { method: 'DELETE' })
+      if (result.error) throw new Error(result.error)
+      const data = extractMintsoftObjectPayload(result.data) as RawOrder | null
+      if (data?.Success !== true) throw new Error(toStr(data?.Message) ?? 'the delete was not confirmed')
+    } catch (error) {
+      return refuse(`deleting ${describeRef(target)} failed (${error instanceof Error ? error.message : String(error)}); ${done()}it may or may not have gone, so it is listed as still there`, removed, remaining())
+    }
+    let after: WmsOrderItemRef[]
+    try {
+      after = await fetchMintsoftOrderItemsStrict(survivorId, clientId)
+    } catch (error) {
+      return refuse(`${describeRef(target)} was deleted but the re-read to prove it failed (${error instanceof Error ? error.message : String(error)}); ${done()}it is listed as still there until a person checks`, removed, remaining())
+    }
+    // Two separate proofs. The line itself: gone, or not. The others: exactly as they were. A delete that DID land is recorded as
+    // removed even when something else then looks wrong, so the notice never lists a line as still there that is already gone.
+    const gone = !after.some((item) => item.externalItemId === target.externalItemId)
+    if (!gone) {
+      return refuse(`after deleting ${describeRef(target)} the line is still on the merged order; ${done()}check the order`, removed, remaining())
+    }
+    removed.push(target)
+    const expected = before.filter((item) => item.externalItemId !== target.externalItemId)
+    const unchanged = after.length === expected.length && expected.every((item) => after.some((other) => sameRef(item, other)))
+    if (!unchanged) {
+      return refuse(`after deleting ${describeRef(target)} another line of the merged order is not what it was (it changed, or a line appeared or went); ${done()}check the order`, removed, remaining())
+    }
+    before = after
+  }
+  return { kind: 'REMOVED', removed }
 }

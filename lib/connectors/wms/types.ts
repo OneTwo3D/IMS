@@ -435,7 +435,23 @@ export type WmsOrderPushInput = {
   lines: WmsOrderPushLine[]
 }
 
+/**
+ * One line of a warehouse order as the warehouse itself numbers it: its own line id, the SKU and the whole-unit quantity it held
+ * when read. IMS stores these for the orders it pushes so it can find exactly one order's lines again after the warehouse has
+ * merged that order into another.
+ */
+export type WmsOrderItemRef = {
+  externalItemId: string
+  sku: string
+  quantity: number
+}
+
 type WmsOrderPushResultBase = {
+  /**
+   * The warehouse order's lines, read back right after the create. Absent when the read-back failed or the warehouse does not
+   * number its lines: that is never a failure of the push, and IMS then stores nothing for the order.
+   */
+  items?: WmsOrderItemRef[]
   externalOrderId: string
   externalOrderNumber: string | null
   status: string
@@ -509,7 +525,22 @@ export type WmsOrderUpdateResult = {
   courierFormName?: string | null
   /** True when the amendment ended on the configured default courier: the warehouse should confirm the courier. */
   courierFallback?: boolean
+  /** The warehouse order's lines as they stand after the amendment (a re-read), so the stored line ids stay current. Absent when unread. */
+  items?: WmsOrderItemRef[]
 }
+
+/**
+ * The answer of {@link WmsConnector.removeOrderItems}: taking ONE order's lines out of a merged warehouse order.
+ *
+ *   REMOVED          every wanted line was deleted, each proved gone by a re-read, and every other line proved unchanged.
+ *   ONLY_LINES_LEFT  nothing was written: the merged order holds nothing but these lines, so the caller cancels it normally.
+ *   REFUSED          the removal stopped. `removed` is exactly what was deleted (and proved gone) before it stopped and `remaining`
+ *                    is what is still on the warehouse order; both empty/full when nothing was written. `reason` says why.
+ */
+export type WmsMergedItemRemoval =
+  | { kind: 'REMOVED'; removed: WmsOrderItemRef[] }
+  | { kind: 'ONLY_LINES_LEFT' }
+  | { kind: 'REFUSED'; reason: string; removed: WmsOrderItemRef[]; remaining: WmsOrderItemRef[] }
 
 /**
  * The contract every WMS/3PL connector implements. Core flows depend on THIS and
@@ -650,6 +681,13 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
   updateOrder?(externalOrderId: string, input: WmsOrderPushInput, clearance: WmsWriteClearance<'order.amend'>): Promise<WmsOrderUpdateResult>
   /** Cancel a WMS order by its external id; a no-op (success) if past NEW. */
   cancelOrder?(externalOrderId: string, clearance: WmsWriteClearance<'order.cancel' | 'order.hold'>): Promise<WmsOrderCancelResult>
+  /**
+   * Take the given lines (one IMS order's, by the warehouse's own line ids) out of a MERGED warehouse order, and nothing else. Only
+   * while the warehouse order can still be changed; every line is checked (present, same SKU, same quantity) BEFORE anything is
+   * deleted, each delete is proved by a re-read, and the other lines are proved unchanged. Never cancels the order itself: when
+   * these are the only lines left it answers ONLY_LINES_LEFT and writes nothing.
+   */
+  removeOrderItems?(externalOrderId: string, items: WmsOrderItemRef[], clearance: WmsWriteClearance<'order.cancel'>): Promise<WmsMergedItemRemoval>
   /** Post an operator-facing note onto the WMS order — e.g. to flag a refund to the
    *  warehouse when the API cannot auto-apply it (a past-NEW order). */
   addOrderComment?(externalOrderId: string, comment: string, clearance: WmsWriteClearance<'order.comment'>): Promise<void>

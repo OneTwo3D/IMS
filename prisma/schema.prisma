@@ -3966,6 +3966,7 @@ model WmsOrderPushLink {
   createdAt           DateTime          @default(now())
   updatedAt           DateTime          @updatedAt
 
+  items               WmsOrderPushItem[]
   order               SalesOrder        @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
   @@index([connector, state])
@@ -3974,6 +3975,27 @@ model WmsOrderPushLink {
   @@index([connector, dispatchReconcileCheckedAt])
   @@index([connector, dispatchUnresolvedAt])
   @@map("wms_order_push_links")
+}
+
+/// The warehouse's own line ids for the order IMS pushed, read back right after the create (and after an amendment): one row per
+/// warehouse order line, with the SKU and quantity it carried then. Merging two warehouse orders keeps every original line under its
+/// original id, so these rows are how IMS finds exactly one order's lines on a merged survivor. Snapshot of what the warehouse held,
+/// never of what IMS wants; replaced as a set, deleted with the link.
+model WmsOrderPushItem {
+  id              String   @id @default(cuid())
+  linkId          String   @map("link_id")
+  /// The warehouse order these lines were read from (the id the link had when the snapshot was taken).
+  externalOrderId String   @map("external_order_id")
+  externalItemId  String   @map("external_item_id")
+  sku             String
+  quantity        Int
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  link            WmsOrderPushLink @relation(fields: [linkId], references: [id], onDelete: Cascade)
+
+  @@unique([linkId, externalItemId])
+  @@index([linkId])
+  @@map("wms_order_push_items")
 }
 
 // ---------------------------------------------------------------------------

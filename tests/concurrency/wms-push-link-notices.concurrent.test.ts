@@ -310,3 +310,94 @@ test('REAL DISPATCH DEPS: the guard reads the order\'s CURRENT state - a cancel 
   // A full refund that was reversed behaves the same.
   assert.equal(await deps2.cancelIntendedForOrder!(refundReversed.orderId), false)
 })
+
+// ---------------------------------------------------------------------------------------------------------------------------------------
+// The warehouse line ids recorded for a pushed order, and the removal of a cancelled merged order's lines (REAL PORT, REAL DATABASE).
+
+test('REAL PORT: the line ids read back after a create are recorded, an amendment replaces the set, and they go with the link', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `itm${randomUUID().slice(0, 8)}`
+  const s = await seed(d, tag)
+  t.after(() => cleanup(d, s))
+  const link = await d.db.wmsOrderPushLink.create({ data: { orderId: s.orderId, connector: 'mintsoft', state: 'SYNCED', externalOrderId: 'o-1', externalOrderNumber: 'MS-I1', pushedAt: new Date() } })
+  const port = d.sweep.createPrismaWmsOrderPushPort()
+
+  assert.deepEqual(await port.readOrderItems!(link.id), [], 'an order pushed before the ids were recorded has none')
+  const first = [{ externalItemId: '11', sku: 'A', quantity: 2 }, { externalItemId: '12', sku: 'A', quantity: 1 }]
+  await port.replaceOrderItems!(s.orderId, 'o-1', first)
+  assert.deepEqual((await port.readOrderItems!(link.id)).sort((a, b) => a.externalItemId.localeCompare(b.externalItemId)), first, 'a shared SKU stays two rows')
+  // A second call with overlapping ids neither duplicates nor fails (the unique key), and REPLACES the set.
+  await port.replaceOrderItems!(s.orderId, 'o-1', [{ externalItemId: '12', sku: 'A', quantity: 1 }, { externalItemId: '13', sku: 'B', quantity: 4 }])
+  assert.deepEqual((await port.readOrderItems!(link.id)).map((r) => r.externalItemId).sort(), ['12', '13'])
+  await port.dropOrderItems!(link.id, ['12'])
+  assert.deepEqual((await port.readOrderItems!(link.id)).map((r) => r.externalItemId), ['13'])
+  await port.replaceOrderItems!(s.orderId, 'o-1', [])
+  assert.deepEqual(await port.readOrderItems!(link.id), [], 'an empty set clears')
+  // An order with no link writes nothing and does not throw.
+  await port.replaceOrderItems!(`missing-${tag}`, 'o-9', first)
+
+  await port.replaceOrderItems!(s.orderId, 'o-1', first)
+  await d.db.wmsOrderPushLink.delete({ where: { id: link.id } })
+  assert.equal(await d.db.wmsOrderPushItem.count({ where: { linkId: link.id } }), 0, 'the rows are deleted with the link')
+})
+
+test('REAL PORT: a cancelled order merged into a survivor has ITS recorded lines removed, the link becomes CANCELLED, and the survivor is not cancelled', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `rem${randomUUID().slice(0, 8)}`
+  const s = await seed(d, tag, 'CANCELLED')
+  t.after(() => cleanup(d, s))
+  const link = await d.db.wmsOrderPushLink.create({ data: { orderId: s.orderId, connector: 'mintsoft', state: 'MERGED', externalOrderId: 'surv-1', externalOrderNumber: 'MS-E+MS-D', pushedAt: new Date() } })
+  const stored = [{ externalItemId: '3603106', sku: '243632999', quantity: 2 }, { externalItemId: '3603107', sku: '923663020', quantity: 1 }]
+  await d.db.wmsOrderPushItem.createMany({ data: stored.map((i) => ({ linkId: link.id, externalOrderId: 'o-1', ...i })) })
+
+  const seen: { removed?: unknown; cancelled: string[]; comments: string[] } = { cancelled: [], comments: [] }
+  const double = {
+    pushOrder: async () => { throw new Error('must not create') },
+    updateOrder: async () => ({ updated: true, status: 'NEW' }),
+    cancelOrder: async (id: string) => { seen.cancelled.push(id); return { cancelled: true, status: 'CANCELLED' } },
+    addOrderComment: async (_id: string, comment: string) => { seen.comments.push(comment) },
+    removeOrderItems: async (id: string, items: unknown) => { seen.removed = { id, items }; return { kind: 'REMOVED' as const, removed: items as typeof stored } },
+    verifyPushedOrder: async () => 'ours' as const,
+    probeOrderPresence: async () => 'FOUND' as const,
+  }
+  const result = await d.sweep.runWmsOrderPushSweepCore(double as never, 'mintsoft', d.sweep.createPrismaWmsOrderPushPort(), { batchSize: 500 })
+  const after = await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { orderId: s.orderId } })
+  console.log(`# state=${after.state} cancelled=${result.cancelled} comments=${seen.comments.length}`)
+  assert.deepEqual((seen.removed as { id: string; items: unknown[] }).id, 'surv-1')
+  assert.deepEqual((seen.removed as { items: unknown[] }).items, stored)
+  assert.deepEqual(seen.cancelled, [], 'the survivor was never cancelled')
+  assert.equal(after.state, 'CANCELLED')
+  assert.ok(after.cancelledAt)
+  assert.equal(after.cancelNoticeAt, null, 'no notice')
+  assert.equal(seen.comments.length, 1)
+  assert.match(seen.comments[0], new RegExp(`MSO-${tag}`), 'the note names the IMS order')
+  assert.match(seen.comments[0], /2 x 243632999 \(line 3603106\), 1 x 923663020 \(line 3603107\)/)
+})
+
+test('REAL PORT: a refused removal raises the notice with what was removed and what remains, forgets the removed line and keeps the link live', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `ref${randomUUID().slice(0, 8)}`
+  const s = await seed(d, tag, 'CANCELLED')
+  t.after(() => cleanup(d, s))
+  const link = await d.db.wmsOrderPushLink.create({ data: { orderId: s.orderId, connector: 'mintsoft', state: 'MERGED', externalOrderId: 'surv-2', externalOrderNumber: 'MS-E+MS-D', pushedAt: new Date() } })
+  const a = { externalItemId: '1', sku: 'A', quantity: 2 }
+  const b = { externalItemId: '2', sku: 'B', quantity: 1 }
+  await d.db.wmsOrderPushItem.createMany({ data: [a, b].map((i) => ({ linkId: link.id, externalOrderId: 'o-2', ...i })) })
+  const double = {
+    pushOrder: async () => { throw new Error('must not create') },
+    updateOrder: async () => ({ updated: true, status: 'NEW' }),
+    cancelOrder: async () => { throw new Error('the survivor must not be cancelled') },
+    addOrderComment: async () => {},
+    removeOrderItems: async () => ({ kind: 'REFUSED' as const, reason: 'deleting 1 x B (line 2) failed (boom)', removed: [a], remaining: [b] }),
+    verifyPushedOrder: async () => 'ours' as const,
+    probeOrderPresence: async () => 'FOUND' as const,
+  }
+  const result = await d.sweep.runWmsOrderPushSweepCore(double as never, 'mintsoft', d.sweep.createPrismaWmsOrderPushPort(), { batchSize: 500 })
+  const after = await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { orderId: s.orderId } })
+  assert.equal(result.operatorNotices, 1)
+  assert.equal(after.state, 'MERGED', 'the link stays live and polled')
+  assert.ok(after.cancelNoticeAt)
+  assert.match(String(after.lastError), /REMOVED so far: 2 x A \(line 1\)/)
+  assert.match(String(after.lastError), /STILL ON THE MERGED ORDER[^]*1 x B \(line 2\)/)
+  assert.deepEqual((await d.db.wmsOrderPushItem.findMany({ where: { linkId: link.id } })).map((r) => r.externalItemId), ['2'], 'the removed line is forgotten')
+})

@@ -14,7 +14,7 @@ import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { wmsCreateObligationFloor, wmsProducerHold, wmsProducerSeam } from '@/lib/connectors/wms/producer-seam'
 import type { ProducerDecisionContext } from '@/lib/security/producer-disposition'
 import { NO_DELIVERY_STREET_REASON, resolvePushRecipient } from './push-recipient'
-import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
+import type { WmsConnector, WmsOrderAddress, WmsOrderItemRef, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
 import { decideWmsHeldRelease, wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal, wmsCreateReplayPolicy, type WmsCreateReplayPolicySource } from './create-replay-policy'
 import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere, wmsPaidBeforeCreateFloor } from './create-eligibility'
 import { scrubWmsError } from './error-scrub'
@@ -829,6 +829,16 @@ export function wmsNoticeComment(intent: 'HOLD' | 'CANCEL', merged: boolean): st
   return WMS_NOTICE_COMMENTS[`${intent}_${merged ? 'MERGED' : 'PAST_NEW'}` as keyof typeof WMS_NOTICE_COMMENTS]
 }
 
+/** One warehouse line as an operator reads it: quantity, SKU and the warehouse's own line id. */
+export function describeWmsOrderItems(items: ReadonlyArray<Pick<WmsOrderItemRef, 'externalItemId' | 'sku' | 'quantity'>>): string {
+  return items.map((item) => `${item.quantity} x ${item.sku} (line ${item.externalItemId})`).join(', ')
+}
+
+/** The one warehouse-visible note left after IMS removed a cancelled / fully refunded order's lines from a merged order. */
+export function wmsMergedRemovalComment(orderNumber: string, removed: ReadonlyArray<Pick<WmsOrderItemRef, 'externalItemId' | 'sku' | 'quantity'>>): string {
+  return `IMS: Order ${orderNumber} was cancelled / fully refunded in IMS, so IMS removed its lines from this merged order: ${describeWmsOrderItems(removed)}. No other line was changed.`
+}
+
 /**
  * Which ORDERS the cancel pass pulls from the warehouse: cancelled in IMS, or fully refunded and not yet despatched. ONE definition:
  * the pass selects on it and the exception inbox lists a cancel notice by it, so a link the pass has noticed is always listed.
@@ -852,6 +862,8 @@ export type WmsPushLinkRef = {
   attempts?: number
   /** SYNCED unless the dispatch sweep re-pointed the link at a merged survivor (MERGED). Absent reads as SYNCED. */
   state?: 'SYNCED' | 'MERGED'
+  /** The IMS order's own number, for the warehouse note. Optional: absent falls back to the order id. */
+  orderNumber?: string | null
 }
 
 /**
@@ -1001,6 +1013,16 @@ export interface WmsOrderPushPort {
    * Optional so existing test ports keep compiling; when absent, the pass does not run.
    */
   ambiguousCreateLinks?(connector: string, boundWarehouseIds: string[], limit: number, paidNotBefore?: Date): Promise<{ links: WmsPushAmbiguousCreateLink[]; total: number }>
+  /**
+   * The warehouse's own line ids recorded for this link's order when it was pushed (empty for an order pushed before they were
+   * recorded). Optional so existing test ports keep compiling; when absent the merged-order removal does not run and the operator
+   * notice is raised as before.
+   */
+  readOrderItems?(linkId: string): Promise<WmsOrderItemRef[]>
+  /** Replace the recorded line ids of the order with this set, read from warehouse order `externalOrderId`. An empty set clears them. */
+  replaceOrderItems?(orderId: string, externalOrderId: string, items: WmsOrderItemRef[]): Promise<void>
+  /** Forget these recorded line ids (lines IMS removed from a merged order). */
+  dropOrderItems?(linkId: string, externalItemIds: string[]): Promise<void>
   /** SYNCED links whose order is ON_HOLD. */
   holdableLinks(connector: string, limit: number): Promise<WmsPushLinkRef[]>
   /** SYNCED links whose order is CANCELLED in IMS. */
@@ -1116,7 +1138,7 @@ type PushConnector = Pick<
   // revalidation pass needs before it may re-open a create whose outcome is unknown. Tri-state on
   // purpose: only MISSING means "verifiably no such order", and a merged/ambiguous match must
   // never be reported as MISSING.
-  'pushOrder' | 'updateOrder' | 'cancelOrder' | 'addOrderComment' | 'verifyPushedOrder' | 'probeOrderPresence' | 'reconcileAmbiguousCreate' | 'findMergedSurvivor'
+  'pushOrder' | 'updateOrder' | 'cancelOrder' | 'addOrderComment' | 'verifyPushedOrder' | 'probeOrderPresence' | 'reconcileAmbiguousCreate' | 'findMergedSurvivor' | 'removeOrderItems'
 >
 
 /**
@@ -1285,7 +1307,7 @@ export async function runWmsOrderPushSweepCore(
 
   /**
    * The MERGED notice: the link names a surviving warehouse order that also holds other orders' goods, which IMS never cancels for one
-   * absorbed order. Item-level removal exists in the warehouse API but is NOT automated (an owner decision).
+   * absorbed order. For a CANCEL the lines of this order are removed instead where that can be done whole (handleMergedCancel); this notice is what it falls back to, and what a HOLD gets.
    */
   const raiseMergedNotice = async (link: WmsPushLinkRef, intent: 'HOLD' | 'CANCEL', ts: Date) => {
     const verb = intent === 'HOLD' ? 'Held' : 'Cancelled'
@@ -1301,6 +1323,101 @@ export async function runWmsOrderPushSweepCore(
           : 'IMS cancel not propagated: the order was merged into another WMS order — left for an operator',
         comment: wmsNoticeComment(intent, true),
       }, ts)
+  }
+
+  /**
+   * AN IMS ORDER THAT WAS MERGED INTO A SURVIVING WAREHOUSE ORDER IS CANCELLED (or fully refunded): take ITS lines out of the survivor.
+   *
+   * The survivor also holds other orders' goods, so it is NEVER cancelled for this order while it holds anything else. The warehouse
+   * keeps every original line under its original id (live-confirmed), and IMS recorded this order's line ids when it pushed it, so
+   * exactly those lines are deleted, each proved gone by a re-read, the others proved unchanged (the connector's removeOrderItems).
+   * When these lines are ALL the survivor holds, it is cancelled normally. Anything that cannot be done whole falls back to the
+   * operator notice, which now says exactly what was removed and what remains: nothing partial happens silently. A hold is never
+   * handled here (only the cancel intent removes lines).
+   */
+  const handleMergedCancel = async (link: WmsPushLinkRef, ts: Date) => {
+    const survivorId = link.externalOrderId
+    if (!survivorId || !connector.removeOrderItems || !connector.cancelOrder || !port.readOrderItems) {
+      await raiseMergedNotice(link, 'CANCEL', ts)
+      return
+    }
+    const survivorLabel = `WMS order ${survivorId}`
+    const orderLabel = link.orderNumber ?? link.orderId
+    const notice = async (detail: string, summary: string) => {
+      await raiseWmsRefusalNotice(link, 'CANCEL',
+        `Cancelled in IMS, but ${survivorLabel} is a MERGED order that also holds other orders' goods, so IMS did not cancel it. ${detail} IMS has NOT recorded this order as cancelled in the WMS.`,
+        { wmsStatus: 'MERGED', summary, comment: wmsNoticeComment('CANCEL', true) }, ts)
+    }
+    const items = await port.readOrderItems(link.id)
+    if (items.length === 0) {
+      await notice(
+        'IMS holds no record of the WMS line ids of this order (it was pushed before IMS recorded them, or they could not be read), so it cannot tell which lines are this order\'s. Take this order\'s items out of it in the WMS before it ships.',
+        'IMS cancel not propagated: the order was merged into another WMS order and its line ids are not recorded — left for an operator')
+      return
+    }
+    const seam = await wmsProducerSeam(connectorId, {
+      operation: 'order.cancel',
+      subjectType: 'SalesOrder',
+      subjectId: link.orderId,
+      payload: { externalOrderId: survivorId, action: 'remove-merged-lines', itemIds: items.map((item) => item.externalItemId) },
+      context: producerContext,
+    })
+    if (!seam.proceed) {
+      shadowedCount += 1
+      return
+    }
+    // A throw here happened BEFORE the first delete (the connector turns every delete failure into a REFUSED answer): the caller's
+    // handler records it on the link and the next sweep tries again.
+    const removal = await connector.removeOrderItems(survivorId, items, seam.clearance)
+    const before = { state: link.state ?? 'MERGED', externalOrderId: survivorId }
+    const settleCancelled = async () => {
+      const done = { state: 'CANCELLED' as const, cancelledAt: ts, lastError: null, lastAttemptAt: ts, reconcileCheckedAt: null }
+      if (port.updateLinkIfLinked) await port.updateLinkIfLinked(link.id, { state: 'MERGED', externalOrderId: survivorId }, done)
+      else await port.updateLink(link.id, done)
+      result.cancelled += 1
+    }
+    if (removal.kind === 'REMOVED') {
+      await settleCancelled()
+      await audit({
+        action: 'order_cancel', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: survivorId,
+        summary: `IMS-cancelled/fully-refunded order's lines removed from the merged WMS order: ${describeWmsOrderItems(removal.removed)}`,
+        before, after: { state: 'CANCELLED', removedLines: removal.removed.map((item) => ({ line: item.externalItemId, sku: item.sku, quantity: item.quantity })) },
+      })
+      await postConflictComment(survivorId, wmsMergedRemovalComment(orderLabel, removal.removed), link.orderId)
+      return
+    }
+    if (removal.kind === 'ONLY_LINES_LEFT') {
+      // The merged order holds nothing but this order's lines (the other order's were taken out, or it was cancelled before): it is
+      // cancelled like any order, through the same clearance.
+      const cancel = await connector.cancelOrder(survivorId, seam.clearance)
+      if (cancel.cancelled || cancel.status === 'ALREADY_CANCELLED') {
+        await settleCancelled()
+        await audit({
+          action: 'order_cancel', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: survivorId,
+          summary: 'IMS-cancelled/fully-refunded order was the only one left on the merged WMS order, which was cancelled',
+          before, after: { state: 'CANCELLED', wmsCancelStatus: cancel.status },
+        })
+      } else if (cancel.status === 'NOT_FOUND') {
+        await notice(`The merged order is no longer returned by the WMS (${survivorLabel}) — find it there and make sure it does not ship.`,
+          'IMS cancel could not be confirmed: the merged WMS order was not found — left for an operator')
+      } else {
+        await raiseWmsRefusalNotice(link, 'CANCEL',
+          `Cancelled in IMS but the merged WMS order is already past NEW (status ${cancel.status}) and could not be cancelled — raise a cancellation query in the WMS. `
+          + 'The link stays live; a despatch that follows is raised for a person, never applied to the cancelled order.',
+          { wmsStatus: cancel.status, summary: 'IMS cancel could not cancel the merged WMS order (past NEW) — link kept live, operator notified', comment: wmsNoticeComment('CANCEL', false) }, ts)
+      }
+      return
+    }
+    // REFUSED: whatever was deleted is forgotten (it is no longer on the warehouse order), and the notice names both halves.
+    if (removal.removed.length > 0) await port.dropOrderItems?.(link.id, removal.removed.map((item) => item.externalItemId)).catch(() => {})
+    const reason = scrubWmsError(removal.reason, 'the removal was refused')
+    const removedText = removal.removed.length > 0 ? `REMOVED so far: ${describeWmsOrderItems(removal.removed)}. ` : 'Nothing was removed. '
+    const remainingText = removal.remaining.length > 0 ? `STILL ON THE MERGED ORDER (take them out in the WMS before it ships): ${describeWmsOrderItems(removal.remaining)}. ` : ''
+    await notice(
+      `IMS tried to remove this order's lines from it, but did not complete: ${reason}. ${removedText}${remainingText}`.trimEnd(),
+      removal.removed.length > 0
+        ? 'IMS removed some of the cancelled order\'s lines from the merged WMS order and could not finish — left for an operator'
+        : 'IMS could not remove the cancelled order\'s lines from the merged WMS order — left for an operator')
   }
 
   /**
@@ -1350,7 +1467,9 @@ export async function runWmsOrderPushSweepCore(
         ? await port.updateLinkIfLinked(link.id, { state: link.state ?? 'SYNCED', externalOrderId: link.externalOrderId }, repoint)
         : (await port.updateLink(link.id, repoint), true)
       if (!moved) return
-      await raiseMergedNotice({ ...link, state: 'MERGED', externalOrderId: survivor.externalOrderId, externalOrderNumber: survivor.externalOrderNumber }, intent, ts)
+      const repointed = { ...link, state: 'MERGED' as const, externalOrderId: survivor.externalOrderId, externalOrderNumber: survivor.externalOrderNumber }
+      if (intent === 'CANCEL') await handleMergedCancel(repointed, ts)
+      else await raiseMergedNotice(repointed, intent, ts)
       return
     }
     await raiseWmsRefusalNotice(link, intent, notFoundReason, { wmsStatus: 'NOT_FOUND', summary: notFoundSummary, comment: null }, ts)
@@ -2277,6 +2396,14 @@ export async function runWmsOrderPushSweepCore(
           // outside the update, cancel and dispatch passes.
           { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...RESET_DISPATCH_FAILURES },
         )
+        // The warehouse's own line ids for this order (a read-back the connector did after the create). Best effort and isolated:
+        // the order exists now, so a failure here must never reach the create path's handler (it would re-queue a duplicate). Only
+        // consulted when this order is later merged into another and then cancelled.
+        try {
+          await port.replaceOrderItems?.(order.id, push.externalOrderId, push.items ?? [])
+        } catch (e) {
+          console.error(`[wms-order-push] could not record the WMS line ids for ${order.id}: ${scrubWmsError(e, 'write failed')}`)
+        }
         // o3d-6x66: the claim's withdrawal re-check committed BEFORE this
         // remote push, so a withdrawal landing in between still gets its order
         // created in the warehouse. Usually the hold pass pulls it back, but an
@@ -2819,6 +2946,10 @@ export async function runWmsOrderPushSweepCore(
           ...settled.linkFields,
         })
         if (update.updated) result.updated += 1
+        // The amendment may have replaced lines (new warehouse line ids): keep the recorded ids current. Best effort.
+        if (update.updated && update.items) {
+          await port.replaceOrderItems?.(link.order.id, link.externalOrderId, update.items).catch((e) => console.error(`[wms-order-push] could not refresh the WMS line ids for ${link.order.id}: ${scrubWmsError(e, 'write failed')}`))
+        }
         await audit({
           action: 'order_update', outcome: update.updated ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,
           summary: update.updated
@@ -2985,7 +3116,7 @@ export async function runWmsOrderPushSweepCore(
       try {
         // See the hold pass: a MERGED link is the survivor of several orders and is never cancelled for one of them.
         if (link.state === 'MERGED') {
-          await raiseMergedNotice(link, 'CANCEL', ts)
+          await handleMergedCancel(link, ts)
           continue
         }
         const cancelSeam = await wmsProducerSeam(connectorId, {
@@ -3538,9 +3669,29 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           externalOrderId: { not: null },
           order: WMS_CANCELLABLE_ORDER_WHERE,
         },
-        select: { id: true, orderId: true, externalOrderId: true, externalOrderNumber: true, attempts: true, state: true },
+        select: { id: true, orderId: true, externalOrderId: true, externalOrderNumber: true, attempts: true, state: true, order: { select: { orderNumber: true } } },
         take: limit,
-      }) as Promise<WmsPushLinkRef[]>,
+      }).then((rows) => rows.map(({ order, ...link }) => ({ ...link, orderNumber: order.orderNumber })) as WmsPushLinkRef[]),
+    async readOrderItems(linkId) {
+      const rows = await db.wmsOrderPushItem.findMany({ where: { linkId }, orderBy: { createdAt: 'asc' } })
+      return rows.map((row) => ({ externalItemId: row.externalItemId, sku: row.sku, quantity: row.quantity }))
+    },
+    async replaceOrderItems(orderId, externalOrderId, items) {
+      await db.$transaction(async (tx) => {
+        const link = await tx.wmsOrderPushLink.findUnique({ where: { orderId }, select: { id: true } })
+        if (!link) return
+        await tx.wmsOrderPushItem.deleteMany({ where: { linkId: link.id } })
+        if (items.length > 0) {
+          await tx.wmsOrderPushItem.createMany({
+            data: items.map((item) => ({ linkId: link.id, externalOrderId, externalItemId: item.externalItemId, sku: item.sku, quantity: item.quantity })),
+            skipDuplicates: true,
+          })
+        }
+      })
+    },
+    async dropOrderItems(linkId, externalItemIds) {
+      await db.wmsOrderPushItem.deleteMany({ where: { linkId, externalItemId: { in: externalItemIds } } })
+    },
     async verifyWithdrawalFence(orderId) {
       const { verifyWithdrawalFenceForPush } = await import('@/lib/connectors/woocommerce/sync/withdrawal')
       return verifyWithdrawalFenceForPush(orderId)

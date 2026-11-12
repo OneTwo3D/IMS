@@ -80,7 +80,7 @@ test('PRECONDITION: the real tree is green, and the census reached every part of
   assert.equal(report.counts.seamFunctions, MINT_SEAM_FUNCTIONS.length)
   assert.equal(report.counts.seamFunctionsConsulting, MINT_SEAM_FUNCTIONS.length)
   assert.equal(report.counts.seamOperationsNamed, report.counts.seamOperations)
-  assert.equal(report.counts.writeCalls, 13, 'the sweep (7 + comment), the refund note, the product, bundle and content writers and the two ASN buttons')
+  assert.equal(report.counts.writeCalls, 15, 'the sweep (9 + comment), the refund note, the product, bundle and content writers and the two ASN buttons')
   assert.equal(report.counts.writeCallsWithClearance, report.counts.writeCalls)
   assert.equal(report.counts.transportSites, 3, 'sendMintsoftRequest and the two login helpers')
   assert.equal(report.counts.clearanceCasts, 1)
@@ -252,10 +252,10 @@ test('the declared sweep sites are SEAM sites and SEAM-1 confirms each is preced
   const green = seamFindings(new Map([[file, text]]), scanSource(text, file), DECLARATIONS)
   assert.deepEqual(green.failures, [], 'CONTROL: the real sweep passes SEAM-1')
   const seamSites = DECLARATIONS.filter((d) => d.key.startsWith(`${file}::`) && d.mechanism === 'seam')
-  assert.equal(seamSites.length, 7)
+  assert.equal(seamSites.length, 9)
   const mutated = text.replaceAll('wmsProducerSeam(', 'Promise.resolve(').replaceAll('wmsProducerHold(', 'Promise.resolve(')
   const report = seamFindings(new Map([[file, mutated]]), scanSource(mutated, file), DECLARATIONS)
-  assert.equal(report.failures.filter((f) => f.startsWith('SEAM-1')).length, 7, JSON.stringify(report.failures))
+  assert.equal(report.failures.filter((f) => f.startsWith('SEAM-1')).length, 9, JSON.stringify(report.failures))
 })
 
 test('a direct call of a Mintsoft writer from a NEW file is an undeclared producer site (the connector facade cannot be bypassed quietly)', () => {

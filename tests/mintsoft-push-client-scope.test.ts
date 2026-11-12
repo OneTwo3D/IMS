@@ -185,10 +185,12 @@ test('[o3d-bjc.6] a clean create binds the minted id with exactly one request to
 
   const result = await pushMintsoftOrder(INPUT)
   assert.equal(result.externalOrderId, '700')
-  // No read-back (o3d-bjc.8): the create already happened, so a verification failure
+  // No read-back FOR BINDING (o3d-bjc.8): the create already happened, so a verification failure
   // would leave only bad options — bind unverified, or throw and let the sweep re-PUT
   // and duplicate a real warehouse order. Ownership is re-proven on every mutation.
-  assert.deepEqual(calls, ['/api/Order'])
+  // The one extra request is a best-effort read of the order's LINES (their ids are recorded for a later
+  // merged-order removal); it decides nothing and its failure never fails the push.
+  assert.deepEqual(calls, ['/api/Order', '/api/Order/700/Items?ClientId=5'])
 })
 
 test('[o3d-bjc.6] even a minted id cannot be MUTATED without proving ownership', async () => {
@@ -318,7 +320,8 @@ test('[o3d-bjc.6] an owned NEW order amends its items and posts the update — t
   ]
 
   const result = await updateMintsoftOrder('900', INPUT)
-  assert.deepEqual(result, { updated: true, status: 'NEW' })
+  // The amendment re-reads the lines so the recorded warehouse line ids stay current (best effort).
+  assert.deepEqual(result, { updated: true, status: 'NEW', items: [{ externalItemId: '11', sku: 'SKU-1', quantity: 5 }, { externalItemId: '12', sku: 'SKU-GONE', quantity: 2 }] })
   // The ownership gate is the FIRST call, before any mutation.
   assert.ok(calls[0].startsWith('/api/Order/900?'), `gate ran first (was ${calls[0]})`)
   assert.ok(writes.length > 0, 'item + order writes happened')

@@ -21,7 +21,7 @@
  *           'seam' declaration, a MINT-1 function that lists the operation, or an explicit entry in
  *           {@link MINT_OPERATIONS_GOVERNED_ELSEWHERE}. A new operation added to the map with no seam is red.
  *   MINT-5  THE CLEARANCE CANNOT BE FORGED, AND EVERY WRITE PASSES ONE. Every warehouse write method (pushOrder, updateOrder,
- *           cancelOrder, addOrderComment, upsertProduct, createBundle, createAsn, updateProductContent) is called with `<answer>.clearance`
+ *           cancelOrder, removeOrderItems, addOrderComment, upsertProduct, createBundle, createAsn, updateProductContent) is called with `<answer>.clearance`
  *           as its last argument, and the clearance type is minted by a type assertion in exactly one file. Every operation literal a
  *           consultation names is an operation of the map, and the generic seam names a destination for every registered warehouse
  *           connector.
@@ -66,7 +66,7 @@ export const MINT_SEAM_DEFINITION_FILES = [
 ] as const
 /** The warehouse write methods of the connector contract. Each takes a clearance as its last argument. */
 export const MINT_WRITE_METHODS = [
-  'pushOrder', 'updateOrder', 'cancelOrder', 'addOrderComment', 'upsertProduct', 'createBundle', 'createAsn', 'updateProductContent',
+  'pushOrder', 'updateOrder', 'cancelOrder', 'removeOrderItems', 'addOrderComment', 'upsertProduct', 'createBundle', 'createAsn', 'updateProductContent',
 ] as const
 export const CLEARANCE_MINT_FILE = 'lib/connectors/wms/clearance.ts'
 export const CLEARANCE_MINT_FUNCTION = 'mintWmsWriteClearance'

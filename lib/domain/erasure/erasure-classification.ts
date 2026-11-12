@@ -141,6 +141,12 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
       externalOrderNumber: 'the warehouse order number reconciles the order with the warehouse',
     },
   },
+  WmsOrderPushItem: {
+    // The warehouse's own line ids with the SKU and quantity of each line: no person is named. Deleted with its link (cascade).
+    erased: [],
+    notPersonal: ['linkId', 'externalOrderId', 'externalItemId', 'sku'],
+    retained: {},
+  },
   WmsReturnsInbox: {
     erased: ['reason', 'rawPayload', 'resolutionNote'],
     notPersonal: ['connector', 'externalReturnId', 'sku', 'reference', 'resolvedBy'],
