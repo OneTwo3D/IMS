@@ -1860,13 +1860,71 @@ async function markHeldInvoiceOrderChanged(orderId: string, rowId: string, what:
  * has to be rebuilt, and there is no automatic rebuild of a held invoice. Store-credit orders are left alone. The held-release sweep has no WooCommerce order in hand, so it does not compare; it only refuses holds that are not marked applied:true.
  */
 /**
+ * The importer's own reconciliation of the document it builds with the order: the shipping tax resolved, every component's tax compared with what WooCommerce charged, and rates that moved money but are unmapped or inactive.
+ * ONE function for the import and for the re-evaluation of a held invoice stamped `_taxUnreconciled`, so a hold is only released when the very test that stamped it now passes.
+ */
+function reconcileWcDocumentWithOrder(
+  wcOrder: WcFullOrder,
+  mappedLines: Awaited<ReturnType<typeof mapWcLineItems>>,
+  resolution: Awaited<ReturnType<typeof resolveWcOrderTaxResolution>>,
+  shippingForeign: ReturnType<typeof mapWcShipping>['shippingForeign'],
+  currency: string,
+) {
+  const { wcResolvedById, lineTaxResolved, accountingTaxType, taxRateValue, orderDefaultTaxRateId } = resolution
+  const orderMoneyDigits = currencyMinorUnits(currency)
+  const shippingTax = resolveWcShippingTaxRate({
+    shippingLines: wcOrder.shipping_lines,
+    shippingNetForeign: shippingForeign,
+    rateById: wcResolvedById,
+    orderDefault: { accountingTaxType, taxRateValue, taxRateId: orderDefaultTaxRateId },
+    currency,
+  })
+  const documentTaxReconciliation = reconcileWcDocumentTax([
+    ...mappedLines.map((l, idx) => ({
+      label: l.sku || l.description || `line ${idx + 1}`,
+      netForeign: toDecimal(l.qty).mul(toDecimal(l.unitPriceForeign)).sub(toDecimal(l.discountAmount)),
+      // A reverse-charge sales line carries NO tax on the invoice — the notional VAT nets to zero,
+      // which is why Woo reports none on it either. Modelling it at the mapped rate would invent a
+      // disagreement on every RC order.
+      rateValue: lineTaxResolved[idx]?.reverseCharge ? 0 : (lineTaxResolved[idx]?.taxRateValue ?? 0),
+      reportedTaxForeign: l.taxForeign,
+    })),
+    {
+      label: 'Shipping',
+      netForeign: shippingForeign,
+      rateValue: shippingTax.rateValue,
+      reportedTaxForeign: wcOrder.shipping_lines.reduce<Decimal>(
+        (sum, line) => addMoney(sum, toDecimal(line.total_tax ?? 0)),
+        toDecimal(0),
+      ),
+    },
+  ], currency)
+  // A rate that moved money and is unmapped or inactive (lib/domain/accounting/wc-rate-money-refusal.ts) stamps the document as surely as a tax
+  // mismatch does: same refusal at the poster, and no payment registered against a document that will not post.
+  const rateMoneyRefusal = describeWcRateMoneyRefusal(String(wcOrder.number), findWcRateMoneyProblems(wcOrder, wcResolvedById))
+  const taxMismatchReason = !shippingTax.resolved || !documentTaxReconciliation.reconciles
+    ? `The tax the accounting document would produce does not match the tax WooCommerce charged on order `
+      + `${wcOrder.number}, so the invoice would not total the order's ${wcOrder.total}. `
+      + (shippingTax.resolved ? '' : `${shippingTax.reason} `)
+      + documentTaxReconciliation.disagreements
+        // Figures at the ORDER currency's own precision (o3d-cyn r4): `toFixed(2)` printed a
+        // whole-yen tax as "101.00" and a three-decimal one as "5.00", hiding the fils the
+        // disagreement is actually in.
+        .map((d) => `${d.label}: document ${d.modelledTax.toFixed(orderMoneyDigits)} vs WooCommerce ${d.reportedTax.toFixed(orderMoneyDigits)}`)
+        .join('; ')
+    : null
+  const unreconciledReason = [taxMismatchReason, rateMoneyRefusal].filter((r): r is string => r !== null).join(' ') || null
+  const documentTotalsToTheOrder = shippingTax.resolved && documentTaxReconciliation.reconciles && rateMoneyRefusal === null
+  return { shippingTax, documentTaxReconciliation, rateMoneyRefusal, documentTotalsToTheOrder, taxMismatchReason, unreconciledReason }
+}
+
+
+/**
  * An untreated hold's document total, computed from the payload alone (`invoiceReconciliationProblem`, lib/domain/sales/sales-invoice-reconciliation.ts), against the order's total now;
  * and the payment the payload would register against the same total. A fee on the no-tax kind and a reverse-charge line are priced at 0, every other line, the shipping and the discount at the
- * rate of the order's own resolution now (their tax types were already compared with what is parked). Null when the payload still totals to the order. A payload the poster refuses anyway
- * (`_taxUnreconciled`) is not asked: it never posts and the treatment refuses it itself.
+ * rate of the order's own resolution now (their tax types were already compared with what is parked). Null when the payload still totals to the order.
  */
 async function heldUntreatedTotalDifference(payload: Record<string, unknown>, wcOrder: WcFullOrder, mappedLines: Awaited<ReturnType<typeof mapWcLineItems>>, currency: string): Promise<string | null> {
-  if (payload._taxUnreconciled !== undefined) return null
   const lines = payload.lines
   if (!Array.isArray(lines) || lines.length !== mappedLines.length) return 'the parked invoice\u2019s lines can no longer be matched to the order'
   const orderTotal = Number(wcOrder.total)
@@ -1990,6 +2048,10 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     return why === null ? { ok: true, held: currentHeld } : { ok: false, reason: why }
   }
 
+  if (marker?.applied === true && UNRECONCILED_TAX_PAYLOAD_KEY in held.accountingPayload) {
+    const now = reconcileWcDocumentWithOrder(wcOrder, mappedLines, await resolveWcOrderTaxResolution(wcOrder, mappedLines), mapWcShipping(wcOrder).shippingForeign, currency)
+    return now.unreconciledReason !== null ? await refuse(`the document still does not total the order: ${now.unreconciledReason}`) : await refuseChanged('it was held and treated while its tax did not reconcile, and now does')
+  }
   if (marker?.applied === true) {
     const verdict = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
@@ -1998,17 +2060,29 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     return verdict === null ? { outcome: 'not-needed', recheck } : await refuseChanged(verdict)
   }
 
+  // A hold stamped `_taxUnreconciled` was built for a document the importer found would not total the order, and the poster refuses it. It stays PENDING with the reason unless the importer's OWN reconciliation (reconcileWcDocumentWithOrder) now passes on the current order;
+  // then the stamp is removed and the payment legs are rebuilt as the importer builds them for a document that totals the order, and the checks and the treatment below run on that payload. A marker is never carried into a release.
+  let parkedPayload: Record<string, unknown> = held.accountingPayload
+  if (UNRECONCILED_TAX_PAYLOAD_KEY in held.accountingPayload) {
+    const now = reconcileWcDocumentWithOrder(wcOrder, mappedLines, await resolveWcOrderTaxResolution(wcOrder, mappedLines), mapWcShipping(wcOrder).shippingForeign, currency)
+    if (now.unreconciledReason !== null) return await refuse(`the document still does not total the order: ${now.unreconciledReason}`)
+    // A hold treated while it carried the stamp cannot be un-treated: it needs its invoice rebuilt.
+    if (marker?.applied === true) return await refuseChanged('it was held and treated while its tax did not reconcile, and now does')
+    const { [UNRECONCILED_TAX_PAYLOAD_KEY]: _stamp, ...clean } = held.accountingPayload
+    void _stamp
+    parkedPayload = { ...clean, _registerPayment: !!wcOrder.date_paid_gmt, _paymentAmount: resolveWcInvoicePaymentAmount(wcOrder, { totalsToTheOrder: true }) }
+  }
   // An UNTREATED hold: the parked lines must be the order's lines before the treatment is put on them.
-  const difference = heldInvoiceDifference(held.accountingPayload, expected, false)
+  const difference = heldInvoiceDifference(parkedPayload, expected, false)
   if (difference !== null) return await refuseChanged(difference)
   // Each parked line's tax type must be the effective type the order's line resolves to now, with every input (the reverse-charge setting included); a rate that cannot be resolved never matches.
-  const taxDifference = heldUntreatedTaxDifference(held.accountingPayload, currentInvoiceTypes)
+  const taxDifference = heldUntreatedTaxDifference(parkedPayload, currentInvoiceTypes)
   if (taxDifference !== null) return await refuseChanged(taxDifference)
   // The parked payload must still PRODUCE the order's total: its document total, computed from its own lines, tax codes, shipping and discount by the invoice-to-order reconciliation (the allowance the importer uses), is compared with the order's total now, and the payment it would register with the same total.
   // Net lines and tax types can stand while WooCommerce changes only the tax charged and the total; the treatment must never stamp a payload with a total it does not produce.
-  const totalDifference = await heldUntreatedTotalDifference(held.accountingPayload, wcOrder, mappedLines, currency)
+  const totalDifference = await heldUntreatedTotalDifference(parkedPayload, wcOrder, mappedLines, currency)
   if (totalDifference !== null) return await refuseChanged(totalDifference)
-  const { [EU_VAT_TREATMENT_PAYLOAD_KEY]: _marker, ...untreated } = held.accountingPayload
+  const { [EU_VAT_TREATMENT_PAYLOAD_KEY]: _marker, ...untreated } = parkedPayload
   void _marker
   const outcome = await treatImportedSalesInvoice({
     orderId, wcOrder, payload: untreated, mappedLines, connector: chart, taxBindingDeps: { reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, invoiceTypes: currentInvoiceTypes }, accounts, storeCreditForeign: coupons.storeCreditForeign, now: new Date(),
@@ -2114,6 +2188,12 @@ async function releaseHeldWcSalesInvoice(
         resolveUser: false,
       }).catch(() => {})
     }
+    return 'not-queued'
+  }
+  // NEVER RELEASE A DOCUMENT STAMPED `_taxUnreconciled`: the poster refuses it, so releasing it would mark the hold SYNCED over an invoice that never posts. It stays PENDING with the stamp's reason until a re-import re-evaluates it.
+  if (UNRECONCILED_TAX_PAYLOAD_KEY in held.accountingPayload) {
+    const stamp = held.accountingPayload[UNRECONCILED_TAX_PAYLOAD_KEY] as { reason?: unknown } | null | undefined
+    await noteHeldReleaseFailure(row.id, `WooCommerce numbered this invoice ${invoiceNumber}, but the document does not total the order (${String(stamp?.reason ?? 'no reason recorded')}). NOTHING was queued. Fix what is named, then re-import the order from WooCommerce: the re-import re-checks the document and releases it once it totals the order.`)
     return 'not-queued'
   }
   // A HOLD WITH NO TREATMENT MARKER (parked before the treatment existed) OR PARKED WHILE THE SALES INVOICES SWITCH WAS OFF was built without the EU IOSS/VOEC/DDP treatment (the import skips it while the switch is off; every hold the treatment ran on carries applied:true). Released now that the switch is on, it would
@@ -2939,7 +3019,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     // 2. Otherwise, fall back to the IMS resolver on (productCategory,
     //    shippingCountry, SALES).
     const taxResolution = await resolveWcOrderTaxResolution(wcOrder, mappedLines)
-    const { wcResolvedById, orderDefaultTaxRateId, taxRateName, taxRateValue, accountingTaxType, destCountry, taxFallbackLines, lineTaxResolved } = taxResolution
+    const { orderDefaultTaxRateId, taxRateName, taxRateValue, destCountry, taxFallbackLines, lineTaxResolved } = taxResolution
     if (shouldBlockWcTaxRateFallback(taxFallbackLines)) {
       const description = `Blocked WooCommerce order ${wcOrder.number} import because ${taxFallbackLines.length} line(s) would use the order default tax rate.`
       await logActivity({
@@ -3125,37 +3205,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     // one, and an absent field threw a bare TypeError out of `currencyMinorUnits` here rather than
     // refusing anywhere an operator could see it.
     const orderMoneyDigits = currencyMinorUnits(currency)
-    const shippingTax = resolveWcShippingTaxRate({
-      shippingLines: wcOrder.shipping_lines,
-      shippingNetForeign: shippingForeign,
-      rateById: wcResolvedById,
-      orderDefault: { accountingTaxType, taxRateValue, taxRateId: orderDefaultTaxRateId },
-      currency,
-    })
-    const documentTaxReconciliation = reconcileWcDocumentTax([
-      ...mappedLines.map((l, idx) => ({
-        label: l.sku || l.description || `line ${idx + 1}`,
-        netForeign: toDecimal(l.qty).mul(toDecimal(l.unitPriceForeign)).sub(toDecimal(l.discountAmount)),
-        // A reverse-charge sales line carries NO tax on the invoice — the notional VAT nets to zero,
-        // which is why Woo reports none on it either. Modelling it at the mapped rate would invent a
-        // disagreement on every RC order.
-        rateValue: lineTaxResolved[idx]?.reverseCharge ? 0 : (lineTaxResolved[idx]?.taxRateValue ?? 0),
-        reportedTaxForeign: l.taxForeign,
-      })),
-      {
-        label: 'Shipping',
-        netForeign: shippingForeign,
-        rateValue: shippingTax.rateValue,
-        reportedTaxForeign: wcOrder.shipping_lines.reduce<Decimal>(
-          (sum, line) => addMoney(sum, toDecimal(line.total_tax ?? 0)),
-          toDecimal(0),
-        ),
-      },
-    ], currency)
-    // A rate that moved money and is unmapped or inactive (lib/domain/accounting/wc-rate-money-refusal.ts) stamps the document as surely as a tax
-    // mismatch does: same refusal at the poster, and no payment registered against a document that will not post.
-    const rateMoneyRefusal = describeWcRateMoneyRefusal(String(wcOrder.number), findWcRateMoneyProblems(wcOrder, wcResolvedById))
-    const documentTotalsToTheOrder = shippingTax.resolved && documentTaxReconciliation.reconciles && rateMoneyRefusal === null
+    const { shippingTax, documentTaxReconciliation, rateMoneyRefusal, documentTotalsToTheOrder, unreconciledReason } = reconcileWcDocumentWithOrder(wcOrder, mappedLines, taxResolution, shippingForeign, currency)
 
     // GBP conversions
     const subtotalBase = divideRoundedNumber(subtotalForeign, fxRate, 4)
@@ -3613,18 +3663,6 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           },
         })
       }
-      const taxMismatchReason = !shippingTax.resolved || !documentTaxReconciliation.reconciles
-        ? `The tax the accounting document would produce does not match the tax WooCommerce charged on order `
-          + `${wcOrder.number}, so the invoice would not total the order's ${wcOrder.total}. `
-          + (shippingTax.resolved ? '' : `${shippingTax.reason} `)
-          + documentTaxReconciliation.disagreements
-            // Figures at the ORDER currency's own precision (o3d-cyn r4): `toFixed(2)` printed a
-            // whole-yen tax as "101.00" and a three-decimal one as "5.00", hiding the fils the
-            // disagreement is actually in.
-            .map((d) => `${d.label}: document ${d.modelledTax.toFixed(orderMoneyDigits)} vs WooCommerce ${d.reportedTax.toFixed(orderMoneyDigits)}`)
-            .join('; ')
-        : null
-      const unreconciledReason = [taxMismatchReason, rateMoneyRefusal].filter((r): r is string => r !== null).join(' ') || null
       if (unreconciledReason) {
         await logActivity({
           entityType: 'SALES_ORDER',

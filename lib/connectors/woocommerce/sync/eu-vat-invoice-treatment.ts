@@ -15,6 +15,7 @@
  * Scope: invoices IMS builds from a WooCommerce order. A manual (native) sales order has none of these facts and is not treated.
  */
 import { db } from '@/lib/db'
+import { UNRECONCILED_TAX_PAYLOAD_KEY as EU_UNRECONCILED_KEY } from '@/lib/domain/accounting/document-tax-reconciliation'
 import { logActivity } from '@/lib/activity-log'
 import { resolveEuVatRegime, type RegimeWarning } from '@/lib/domain/accounting/eu-vat-regime'
 import { stampEuVatRegime } from '@/lib/domain/accounting/eu-vat-regime-stamp'
@@ -31,7 +32,7 @@ export type EuVatTreatmentAccounts = { ioss: string | null; ddp: string | null; 
 
 export type TreatedInvoiceOutcome =
   /** Nothing was read or written: the switch is off, the connector is not Xero, or the order carries store credit. */
-  | { kind: 'skipped'; why: 'switch_off' | 'store_credit' }
+  | { kind: 'skipped'; why: 'switch_off' | 'store_credit' | 'unreconciled' }
   /** The payload with the treatment applied, and what it did. */
   | { kind: 'treated'; payload: Record<string, unknown>; warnings: RegimeWarning[]; /** The order's tax binding as it was when the treatment ran (recorded in the marker). */ taxBinding: WcTaxBinding }
   /** The order cannot be invoiced as it is: the reason is the operator-facing sentence the document is stamped with. */
@@ -55,6 +56,8 @@ export async function treatImportedSalesInvoice(params: {
   if (params.connector !== 'xero' || !(await isAccountingSyncTypeEnabledFor(params.connector, 'SALES_INVOICE'))) return { kind: 'skipped', why: 'switch_off' }
   // A store-credit invoice is refused whole by its own fence until the store-credit lines exist; it is neither stamped nor re-typed here.
   if (params.storeCreditForeign.gt(0)) return { kind: 'skipped', why: 'store_credit' }
+  // A document the importer already stamped as not totalling the order (`_taxUnreconciled`) is neither stamped nor treated: the poster refuses it whatever the treatment does, and a treated copy could not be un-treated when the cause is fixed. A held one is re-evaluated by the re-import, which treats it once it totals the order.
+  if (EU_UNRECONCILED_KEY in params.payload) return { kind: 'skipped', why: 'unreconciled' }
 
   // Every input that decides a line's and the shipping's posted tax type, as the order resolves them now: recorded in the marker, so a held invoice can be compared with the order before it is released.
   const taxBinding = await currentWcTaxBinding(params.wcOrder, params.mappedLines, params.taxBindingDeps)

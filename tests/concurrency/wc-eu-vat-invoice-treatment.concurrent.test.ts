@@ -1053,3 +1053,45 @@ test('[eu vat] a LEGACY hold where ONLY the tax charged and the order total chan
   const parked = (after.payload as unknown as { accountingPayload: Invoice }).accountingPayload
   assert.notEqual((parked._euVatTreatment as { applied?: boolean } | undefined)?.applied, true, 'not stamped applied')
 })
+
+// A hold stamped `_taxUnreconciled`: parked while WooCommerce's shipping tax disagreed with the rate IMS holds (5.00 charged where 20% of 10.00 is 2.00), then re-delivered with a number.
+async function unreconciledHold(t: test.TestContext, fixed: boolean) {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = true
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seedDomestic(db, wcRateId)
+  t.after(async () => { switchOn = false; await cleanup(db, externalId, ctx) })
+  const extra: Meta = [{ id: 2, key: 'is_vat_exempt', value: 'no' }]
+  const broken = (m: Meta) => { const p = domesticPayload(externalId, wcRateId, m); p.shipping_lines[0]!.total_tax = '5.00'; p.tax_lines[0]!.shipping_tax_total = '5.00'; p.total = '135.00'; p.total_tax = '25.00'; return p }
+  assert.equal((await importWcOrder(broken(extra) as never)).success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  const parked = (held.payload as unknown as { accountingPayload: Invoice & Record<string, unknown> }).accountingPayload
+  assert.ok(parked._taxUnreconciled !== undefined, 'the parked payload is stamped as not totalling the order')
+  assert.equal(parked._euVatTreatment, undefined, 'a stamped payload is not treated at the create path')
+  const num: Meta = [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...extra]
+  await importWcOrder((fixed ? domesticPayload(externalId, wcRateId, num) : broken(num)) as never)
+  return { after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }), rows: await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId } }) }
+}
+
+test('[eu vat] a hold stamped _taxUnreconciled whose cause is now FIXED is treated and released without the stamp', { skip }, async (t) => {
+  const { after, rows } = await unreconciledHold(t, true)
+  assert.equal(rows.length, 1, 'released')
+  assert.equal(after.status, 'SYNCED')
+  const sent = rows[0]!.payload as unknown as Record<string, unknown>
+  assert.equal(sent._taxUnreconciled, undefined, 'no stamp is released')
+  assert.deepEqual([sent._registerPayment, sent._paymentAmount], [true, 132], 'the payment legs are rebuilt for a document that totals the order')
+  assert.deepEqual([(sent._euVatTreatment as { applied?: boolean }).applied, (sent._euVatTreatment as { orderTotal?: string }).orderTotal], [true, '132.00'])
+})
+
+test('[eu vat] a hold stamped _taxUnreconciled whose cause is STILL broken stays PENDING with the reason and queues nothing', { skip }, async (t) => {
+  const { after, rows } = await unreconciledHold(t, false)
+  assert.equal(rows.length, 0)
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /does not (still )?total the order|still does not total the order/)
+  assert.notEqual(after.status, 'SYNCED')
+})
