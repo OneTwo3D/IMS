@@ -1171,3 +1171,34 @@ test('[eu vat] store credit added to the order after a treated hold was parked: 
   assert.match(after.errorMessage ?? '', /store credit/)
   assert.deepEqual(((after.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment), { applied: false, reason: 'order_changed' })
 })
+
+// RACE (compare-and-swap): the untreated hold was verified, then a concurrent import marked it order_changed, then this import's replacement transaction ran.
+test('[eu vat] an UNTREATED hold marked order_changed by a concurrent import between the verification and the replacement is not replaced and nothing is queued', { skip }, async (t) => {
+  const db = await loadDb()
+  await mockAccounting()
+  switchOn = false
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const wcRateId = 900_000 + Math.floor(Math.random() * 90_000)
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  const ctx = await seed(db, wcRateId)
+  t.after(async () => { switchOn = false; betweenHook.armed = false; betweenHook.verified = false; betweenHook.run = null; await cleanup(db, externalId, ctx) })
+  assert.equal((await importWcOrder(payload(externalId, wcRateId, PLUGIN('821')) as never)).success, true)
+  const orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+  const held = await db.shoppingSyncLog.findFirstOrThrow({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+  assert.equal('_euVatTreatment' in (held.payload as unknown as { accountingPayload: Invoice }).accountingPayload, false, 'parked untreated (switch off)')
+  switchOn = true
+  betweenHook.verified = false
+  betweenHook.armed = true
+  betweenHook.run = async () => {
+    const current = await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } })
+    const p = current.payload as unknown as { accountingPayload: Record<string, unknown> }
+    await db.shoppingSyncLog.update({ where: { id: held.id }, data: { payload: { ...p, accountingPayload: { ...p.accountingPayload, _euVatTreatment: { applied: false, reason: 'order_changed' } } } as never, errorMessage: 'concurrent import: the order changed' } })
+  }
+  await importWcOrder(payload(externalId, wcRateId, [{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...PLUGIN('821')]) as never)
+  assert.equal(betweenHook.run, null, 'the concurrent write really happened between the verification and the replacement')
+  assert.equal(await db.accountingSyncLog.count({ where: { type: 'SALES_INVOICE', referenceId: orderId } }), 0, 'nothing was enqueued')
+  const after = await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } })
+  assert.equal(after.status, 'PENDING')
+  assert.deepEqual(((after.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment), { applied: false, reason: 'order_changed' }, 'the order_changed marker was not overwritten')
+})

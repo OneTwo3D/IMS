@@ -2242,7 +2242,10 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     const current = await tx.shoppingSyncLog.findFirst({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
     if (!current || current.id !== row.id || !isHeldSalesInvoicePayload(current.payload)) return 'not-needed' as const
     const currentHeld: HeldSalesInvoicePayload = current.payload
-    if (markerOf(currentHeld.accountingPayload)?.applied === true) return 'not-needed' as const
+    // COMPARE-AND-SWAP: the hold is replaced only if it is still exactly the version that was verified above. A concurrent import that marked it order_changed (or treated it, or rewrote it) in between is never overwritten with a payload verified against this import's older snapshot.
+    const currentMarker = markerOf(currentHeld.accountingPayload)
+    if (currentMarker?.applied === true || currentMarker?.reason === 'order_changed') return 'not-needed' as const
+    if (JSON.stringify(current.payload) !== JSON.stringify(row.payload)) return 'not-needed' as const
     await tx.shoppingSyncLog.update({ where: { id: row.id }, data: { payload: { ...currentHeld, accountingPayload: treated } as unknown as Prisma.InputJsonValue, errorMessage: null } })
     return 'treated' as const
   }, { maxWait: 5_000, timeout: 20_000 })
