@@ -204,6 +204,7 @@ const HELD = { [PRODUCER_HOLD_ENFORCED_ENV]: 'mintsoft' }
 type LinkWriteLog = { id: string; data: Record<string, unknown> }
 function makePort(options: { cancellable: WmsPushLinkRef[]; items: WmsOrderItemRef[] | null }) {
   const writes: LinkWriteLog[] = []
+  const upserts: Array<{ create: Record<string, unknown>; update: Record<string, unknown> }> = []
   const dropped: string[][] = []
   const recordedItems: Array<{ orderId: string; externalOrderId: string; items: WmsOrderItemRef[] }> = []
   const events: Array<{ action: string; outcome: string; summary: string }> = []
@@ -220,7 +221,7 @@ function makePort(options: { cancellable: WmsPushLinkRef[]; items: WmsOrderItemR
     updatableLinks: async () => [],
     holdableLinks: async () => [],
     cancellableLinks: async () => options.cancellable,
-    upsertByOrder: async () => {},
+    upsertByOrder: async (_o, create, update) => { upserts.push({ create, update }) },
     updateLink: async (id, data) => { writes.push({ id, data }); if (typeof data.state === 'string') link.state = data.state as never; if (typeof data.externalOrderId === 'string') link.externalOrderId = data.externalOrderId },
     updateLinkIfState: async () => true,
     clearStaleNotices: async () => 0,
@@ -237,7 +238,7 @@ function makePort(options: { cancellable: WmsPushLinkRef[]; items: WmsOrderItemR
     dropOrderItems: async (_linkId, ids) => { dropped.push(ids) },
     recordEvent: async (event) => { events.push({ action: String(event.action), outcome: String(event.outcome), summary: String(event.summary) }) },
   }
-  return { port, writes, dropped, recordedItems, events, link }
+  return { port, writes, dropped, recordedItems, events, link, upserts }
 }
 
 async function sweep(port: WmsOrderPushPort, overrides: Record<string, unknown> = {}) {
@@ -1101,5 +1102,32 @@ test('REMOVAL LEASE: UNTRUSTED ids take no lease and raise the notice', async ()
     assert.equal(fake.requests.some((r) => r.method === 'DELETE' || r.path.endsWith('/Cancel')), false)
     assert.equal(result.operatorNotices, 1)
     assert.deepEqual(released, [])
+  })
+})
+
+// ---------------------------------------------------------------- 17. review round 10 -----------------------------------------------
+
+test('CREATE: the link write that marks the order SYNCED also resets any stale lease and mark; the snapshot write that follows carries NO token (it is conditional in the port)', async () => {
+  await withEnv(OFF, async () => {
+    const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
+    const h = makePort({ cancellable: [], items: null })
+    h.port.createCandidates = async () => [{
+      id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: null, currency: 'GBP', customerName: 'Jane Doe', customerEmail: 'j@example.com',
+      customerVatNumber: null, shippingAddress: { line1: '1 St', city: 'Leeds', postcode: 'LS1', country: 'GB' }, shippingService: 'Royal Mail',
+      subtotalForeign: 10, shippingForeign: 0, taxForeign: 0, taxRatePercent: null, pricesIncludeVat: false, discountAmount: 0, totalForeign: 10,
+      shipFromWarehouseId: 'wh-1', pushAttempts: 0, lines: [{ sku: 'A', qty: 1, taxForeign: 0, totalForeign: 10, description: 'Widget' }],
+    } as never]
+    const tokens: Array<string | undefined> = []
+    h.port.replaceOrderItems = async (_o, _e, _i, token) => { tokens.push(token) }
+    const connector = { pushOrder: async () => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW', items: [{ externalItemId: '1', sku: 'A', quantity: 1 }] }), verifyPushedOrder: async () => 'ours' as const, probeOrderPresence: async () => 'FOUND' as const }
+    const quiet = console.error
+    console.error = () => {}
+    await runWmsOrderPushSweepCore(connector as never, 'mintsoft', h.port, { now: NOW }).finally(() => { console.error = quiet })
+    const reset = h.upserts[0].update
+    assert.equal(reset.lineSnapshotUnsafeAt, null)
+    assert.equal(reset.lineSnapshotToken, null)
+    assert.equal(reset.amendLeaseOwner, null)
+    assert.equal(reset.amendLeaseExpiresAt, null)
+    assert.deepEqual(tokens, [undefined])
   })
 })

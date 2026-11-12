@@ -763,6 +763,9 @@ type LinkWrite = {
   amendNoticeAt?: Date | null
   /** Set while the recorded line ids cannot be trusted (an amendment of the lines may have changed them). */
   lineSnapshotUnsafeAt?: Date | null
+  lineSnapshotToken?: string | null
+  amendLeaseOwner?: string | null
+  amendLeaseExpiresAt?: Date | null
 }
 
 /**
@@ -1034,7 +1037,8 @@ export interface WmsOrderPushPort {
   /**
    * Replace the recorded line ids of the order with this set, read from warehouse order `externalOrderId`. An empty set clears them. With a
    * `token` (the amendment's generation from setLineIdsUnsafe) the write is a compare-and-set on the link still holding that token: a stale
-   * owner's write is a no-op that leaves the mark set.
+   * owner's write is a no-op that leaves the mark set. WITHOUT a token (the create path) the write is CONDITIONAL: it is refused, leaving the
+   * ids marked untrustworthy, when a lease is live or the mark is set (an amendment got there first); it never clears a lease or a mark.
    */
   replaceOrderItems?(orderId: string, externalOrderId: string, items: WmsOrderItemRef[], token?: string): Promise<void>
   /**
@@ -2477,7 +2481,10 @@ export async function runWmsOrderPushSweepCore(
           // create attempts, a create that finally succeeded would be
           // quarantined on its FIRST transient unknown, putting a live WMS order
           // outside the update, cancel and dispatch passes.
-          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...RESET_DISPATCH_FAILURES },
+          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...RESET_DISPATCH_FAILURES,
+            // A (re-)created warehouse order starts with no amendment in flight and no stale mark, written atomically with the state it is
+            // SYNCED under; an amendment that starts after that marks the link, and the snapshot write below then yields to it.
+            lineSnapshotUnsafeAt: null, lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null },
         )
         // The warehouse's own line ids for this order (a read-back the connector did after the create). Best effort and isolated:
         // the order exists now, so a failure here must never reach the create path's handler (it would re-queue a duplicate). Only
@@ -3820,15 +3827,25 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       await db.$transaction(async (tx) => {
         const link = await tx.wmsOrderPushLink.findUnique({ where: { orderId }, select: { id: true } })
         if (!link) return
-        // With a token this is a COMPARE-AND-SET on the link still holding it, taken FIRST so the row lock serialises overlapping
-        // amendments: a stale owner (a newer amendment marked the link since) changes nothing and leaves the mark set. It also releases
-        // the amendment lease.
-        const data = { lineSnapshotUnsafeAt: null, lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null }
         if (token !== undefined) {
-          const won = await tx.wmsOrderPushLink.updateMany({ where: { id: link.id, lineSnapshotToken: token }, data })
+          // COMPARE-AND-SET on the link still holding the token, taken FIRST so the row lock serialises overlapping amendments: a stale
+          // owner (a newer amendment marked the link since) changes nothing and leaves the mark set. It also releases the lease.
+          const won = await tx.wmsOrderPushLink.updateMany({
+            where: { id: link.id, lineSnapshotToken: token },
+            data: { lineSnapshotUnsafeAt: null, lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null },
+          })
           if (won.count === 0) return
         } else {
-          await tx.wmsOrderPushLink.update({ where: { id: link.id }, data })
+          // THE CREATE PATH: conditional, and it never clears a lease or a mark. The row is locked first; if an amendment already holds the
+          // lease or has marked the ids, this older snapshot is refused and the ids are left (or made) untrustworthy.
+          const rows = await tx.$queryRaw<Array<{ unsafe_at: Date | null; lease_expires_at: Date | null }>>`
+            SELECT line_snapshot_unsafe_at AS unsafe_at, amend_lease_expires_at AS lease_expires_at FROM wms_order_push_links WHERE id = ${link.id} FOR UPDATE`
+          const row = rows[0]
+          if (!row) return
+          if ((row.lease_expires_at && row.lease_expires_at > new Date()) || row.unsafe_at) {
+            if (!row.unsafe_at) await tx.wmsOrderPushLink.update({ where: { id: link.id }, data: { lineSnapshotUnsafeAt: new Date() } })
+            return
+          }
         }
         await tx.wmsOrderPushItem.deleteMany({ where: { linkId: link.id } })
         if (items.length > 0) {

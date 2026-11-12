@@ -414,10 +414,10 @@ test('REAL PORT: ids marked untrustworthy read as none until a verified replacem
   const ids = [{ externalItemId: '71', sku: 'A', quantity: 1 }]
   await port.replaceOrderItems!(s.orderId, 'o-u', ids)
   assert.deepEqual(await port.readOrderItems!(link.id), ids)
-  await port.setLineIdsUnsafe!(link.id, true)
+  const marked = await port.setLineIdsUnsafe!(link.id, true)
   assert.deepEqual(await port.readOrderItems!(link.id), [], 'marked: the stored rows are not trusted')
   assert.equal(await d.db.wmsOrderPushItem.count({ where: { linkId: link.id } }), 1, 'the rows are still there; only the trust is gone')
-  await port.replaceOrderItems!(s.orderId, 'o-u', [{ externalItemId: '72', sku: 'B', quantity: 2 }])
+  await port.replaceOrderItems!(s.orderId, 'o-u', [{ externalItemId: '72', sku: 'B', quantity: 2 }], marked!.token)
   assert.deepEqual((await port.readOrderItems!(link.id)).map((r) => r.externalItemId), ['72'])
   assert.equal((await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })).lineSnapshotUnsafeAt, null)
 })
@@ -605,4 +605,61 @@ test('REAL PORT, REMOVAL vs AMENDMENT share ONE lease: the removal holds it and 
   const after = await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })
   assert.equal(after.state, 'CANCELLED')
   assert.equal(after.amendLeaseOwner, null, 'the lease was released after the settlement')
+})
+
+test('REAL PORT, CREATE vs AMENDMENT: the create reaches SYNCED, an amendment takes the lease and adds a line, then the create\'s late snapshot write is REFUSED; the mark stays set and the merged cancel removes nothing', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `crt${randomUUID().slice(0, 8)}`
+  const s = await seed(d, tag, 'CANCELLED')
+  t.after(() => cleanup(d, s))
+  // The create has marked the link SYNCED (and, atomically, reset any stale lease / mark) but has not stored its snapshot yet.
+  const link = await d.db.wmsOrderPushLink.create({ data: { orderId: s.orderId, connector: 'mintsoft', state: 'SYNCED', externalOrderId: 'o-c', externalOrderNumber: 'MS-C', pushedAt: new Date() } })
+  const port = d.sweep.createPrismaWmsOrderPushPort()
+  const preAmendment = [{ externalItemId: '1', sku: 'A', quantity: 1 }]
+  // An overlapping sweep amends it now: lease + mark, and a line is added in the warehouse.
+  const amend = await port.setLineIdsUnsafe!(link.id, true)
+  assert.ok(amend)
+  // The create's late, tokenless snapshot write (the pre-amendment lines) is refused and changes nothing.
+  await port.replaceOrderItems!(s.orderId, 'o-c', preAmendment)
+  let row = await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })
+  assert.ok(row.lineSnapshotUnsafeAt, 'the mark is still set')
+  assert.equal(row.amendLeaseOwner, amend!.token, 'the amendment keeps its lease')
+  assert.equal(await d.db.wmsOrderPushItem.count({ where: { linkId: link.id } }), 0, 'the pre-amendment lines were not stored')
+  // The amendment never completes: the link goes MERGED and the order is cancelled. The removal must refuse.
+  await d.db.wmsOrderPushLink.update({ where: { id: link.id }, data: { state: 'MERGED', amendLeaseExpiresAt: new Date(Date.now() - 1000) } })
+  const calls = { removed: 0, cancelled: 0 }
+  const double = {
+    pushOrder: async () => { throw new Error('must not create') },
+    updateOrder: async () => ({ updated: true, status: 'NEW' }),
+    cancelOrder: async () => { calls.cancelled += 1; return { cancelled: true, status: 'CANCELLED' } },
+    cancelMergedOrder: async () => { calls.cancelled += 1; return { cancelled: true, status: 'CANCELLED' } },
+    removeOrderItems: async () => { calls.removed += 1; return { kind: 'REMOVED' as const, removed: preAmendment } },
+    addOrderComment: async () => {},
+    verifyPushedOrder: async () => 'ours' as const,
+    probeOrderPresence: async () => 'FOUND' as const,
+  }
+  const result = await d.sweep.runWmsOrderPushSweepCore(double as never, 'mintsoft', port, { batchSize: 500 })
+  assert.equal(calls.removed + calls.cancelled, 0)
+  assert.ok((result.operatorNotices ?? 0) >= 1)
+  // Control: with nothing in flight the create's snapshot IS stored.
+  const s2 = await seed(d, `${tag}x`)
+  t.after(() => cleanup(d, s2))
+  const link2 = await d.db.wmsOrderPushLink.create({ data: { orderId: s2.orderId, connector: 'mintsoft', state: 'SYNCED', externalOrderId: 'o-c2', pushedAt: new Date() } })
+  await port.replaceOrderItems!(s2.orderId, 'o-c2', preAmendment)
+  assert.deepEqual(await port.readOrderItems!(link2.id), preAmendment)
+  row = await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link2.id } })
+  assert.equal(row.lineSnapshotUnsafeAt, null)
+})
+
+test('REAL PORT, CREATE: a stale mark from an earlier warehouse order is reset by the create\'s own link write, so the fresh snapshot is trusted', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `rst${randomUUID().slice(0, 8)}`
+  const s = await seed(d, tag)
+  t.after(() => cleanup(d, s))
+  const link = await d.db.wmsOrderPushLink.create({ data: { orderId: s.orderId, connector: 'mintsoft', state: 'PENDING_CREATE', lineSnapshotUnsafeAt: new Date(), lineSnapshotToken: 'old' } })
+  const port = d.sweep.createPrismaWmsOrderPushPort()
+  await port.upsertByOrder(s.orderId, { connector: 'mintsoft' }, { connector: 'mintsoft', externalOrderId: 'o-r2', state: 'SYNCED', lineSnapshotUnsafeAt: null, lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null })
+  const ids = [{ externalItemId: '5', sku: 'A', quantity: 1 }]
+  await port.replaceOrderItems!(s.orderId, 'o-r2', ids)
+  assert.deepEqual(await port.readOrderItems!(link.id), ids)
 })
