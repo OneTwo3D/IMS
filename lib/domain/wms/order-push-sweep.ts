@@ -2955,6 +2955,19 @@ export async function runWmsOrderPushSweepCore(
         }
         const input = applyLinkCourierForm(buildPushInput(amendOrder, externalWarehouseId), link)
         update = await connector.updateOrder(link.externalOrderId, input, amendSeam.clearance)
+        // The warehouse order is a MERGED order (the absorbing order keeps the survivor's id, so this link can still name it as a plain
+        // order): nothing was written. The link is re-pointed as MERGED so no later pass amends it, and the change is left for a person.
+        if (update.status === 'MERGED_SURVIVOR') {
+          const moved = port.updateLinkIfLinked
+            ? await port.updateLinkIfLinked(link.id, { state: 'SYNCED', externalOrderId: link.externalOrderId }, { state: 'MERGED', ...(update.mergedSurvivorNumber ? { externalOrderNumber: update.mergedSurvivorNumber } : {}), ...RESET_DISPATCH_FAILURES, lastAttemptAt: ts, lastError: 'This order\'s change was NOT sent to the WMS: the WMS order is a MERGED order that also holds other orders\' goods, so IMS did not amend it. Apply the change in the WMS by hand.' })
+            : (await port.updateLink(link.id, { state: 'MERGED', ...RESET_DISPATCH_FAILURES, lastAttemptAt: ts, lastError: 'This order\'s change was NOT sent to the WMS: the WMS order is a MERGED order that also holds other orders\' goods, so IMS did not amend it. Apply the change in the WMS by hand.' }), true)
+          await audit({
+            action: 'order_update', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,
+            summary: `Order ${link.order.orderNumber ?? link.order.id} amendment NOT propagated — the WMS order is a merged order${moved ? '; link marked merged' : ''}`,
+            before: { state: 'SYNCED', externalOrderId: link.externalOrderId }, after: { propagated: false, wmsStatus: update.status }, error: 'Amendment refused: merged WMS order',
+          })
+          continue
+        }
         // WRITTEN BEFORE THE LINK ADVANCES (pushedAt below): a crash between the two writes then leaves the amendment still due (it is
         // re-run and the snapshot re-read), never a current-looking link over a stale snapshot.
         // The amendment may have replaced, added or consolidated lines (new warehouse line ids). The recorded ids are replaced by a verified

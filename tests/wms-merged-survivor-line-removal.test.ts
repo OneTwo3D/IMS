@@ -864,3 +864,41 @@ test('LAST-LINES CANCEL, unflagged, the re-read FAILS: nothing is sent to /Cance
     assert.ok((result.failed ?? 0) + (result.operatorNotices ?? 0) >= 1)
   })
 })
+
+// ---------------------------------------------------------------- 11. review round 4 -----------------------------------------------
+
+async function amendAbsorbing(merged: boolean) {
+  seedMerged()
+  fake.orders.get(SURVIVOR)!.merged = merged
+  // flagged case: the number still equals the pushed one, so ONLY the flag can refuse it
+  if (merged) fake.orders.get(SURVIVOR)!.number = 'IMSTEST-D'
+  const { h } = snapshotPort(storedE)
+  h.link.state = 'SYNCED'
+  h.link.externalOrderId = SURVIVOR
+  h.port.updatableLinks = async () => [{ ...updatableLink(), externalOrderId: SURVIVOR }] as never
+  const orderPush = await import('../lib/connectors/mintsoft/api/order-push.ts')
+  const result = await sweep(h.port, { updateOrder: async (id: string, input: never) => orderPush.updateMintsoftOrder(id, input) })
+  return { h, result }
+}
+
+test('ABSORBING ORDER changed in IMS while its link is still SYNCED (survivor flagged merged): NO item DELETE/POST/PUT, no order update, the link is marked MERGED and left for a person', async () => {
+  await withEnv(OFF, async () => {
+    const { h, result } = await amendAbsorbing(true)
+    assert.deepEqual(writeRequests(), [], 'nothing was written to the warehouse')
+    assert.equal(survivorItems().length, 4, 'both orders\' lines are untouched')
+    assert.equal(result.updated, 0)
+    const moved = h.writes.find((w) => w.data.state === 'MERGED')
+    assert.ok(moved, 'the link was handed to merge handling')
+    assert.match(String(moved!.data.lastError), /NOT sent to the WMS/)
+    assert.equal(h.writes.some((w) => 'pushedAt' in w.data), false)
+  })
+})
+
+test('ABSORBING ORDER, merge flag absent but the number is now a combined "a+b" one: the amendment is refused the same way', async () => {
+  await withEnv(OFF, async () => {
+    const { h } = await amendAbsorbing(false)
+    assert.deepEqual(writeRequests(), [])
+    assert.equal(survivorItems().length, 4)
+    assert.ok(h.writes.some((w) => w.data.state === 'MERGED'))
+  })
+})

@@ -881,8 +881,14 @@ async function reconcileMintsoftOrderItems(externalOrderId: string, input: WmsOr
 
 export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult> {
   const clientId = await getPushClientId('Mintsoft order update')
-  const { found, isNew } = await fetchMintsoftOrderStatusId(externalOrderId, clientId)
+  const { found, isNew, merged, orderNumber } = await fetchMintsoftOrderStatusId(externalOrderId, clientId)
   if (!found) return { updated: false, status: 'NOT_FOUND' }
+  // A MERGED order (flagged MergedOrder=True, or no longer carrying this order's own number but a combined "a+b" one) holds other
+  // orders' goods. The ABSORBING order keeps the survivor's id, so its link can still name it. Amending it would diff ALL of its lines
+  // against this one order's and delete or consolidate the other order's: refused BEFORE any order post or item write.
+  if (merged || (orderNumber !== null && orderNumber !== input.orderNumber && orderNumber.includes('+'))) {
+    return { updated: false, status: 'MERGED_SURVIVOR', ...(orderNumber ? { mergedSurvivorNumber: orderNumber } : {}) }
+  }
   if (!isNew) return { updated: false, status: 'NOT_NEW' }
 
   const settings = await getMintsoftSettings()
