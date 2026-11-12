@@ -1035,12 +1035,19 @@ export interface WmsOrderPushPort {
    */
   readOrderItems?(linkId: string): Promise<WmsOrderItemRef[]>
   /**
-   * Replace the recorded line ids of the order with this set, read from warehouse order `externalOrderId`. An empty set clears them. With a
-   * `token` (the amendment's generation from setLineIdsUnsafe) the write is a compare-and-set on the link still holding that token: a stale
-   * owner's write is a no-op that leaves the mark set. WITHOUT a token (the create path) the write is CONDITIONAL: it is refused, leaving the
-   * ids marked untrustworthy, when a lease is live or the mark is set (an amendment got there first); it never clears a lease or a mark.
+   * Replace the recorded line ids of an order with this set, read from warehouse order `externalOrderId`, as the AMENDMENT that holds the
+   * link's generation `token` (from setLineIdsUnsafe). The `token` is REQUIRED: the write is a compare-and-set on the link still holding
+   * it, and a stale owner's write is a no-op that leaves the mark set. There is deliberately NO tokenless variant: the create's snapshot is
+   * written by `upsertCreatedLinkWithItems`, in the same transaction that marks the link SYNCED.
    */
-  replaceOrderItems?(orderId: string, externalOrderId: string, items: WmsOrderItemRef[], token?: string): Promise<void>
+  replaceOrderItems?(orderId: string, externalOrderId: string, items: WmsOrderItemRef[], token: string): Promise<void>
+  /**
+   * THE CREATE PATH'S ONE TRANSACTIONAL WRITE: the link upsert (the state it is SYNCED / PENDING_VERIFY under) and the order's line-id rows
+   * in ONE transaction, so there is never a moment when the link is live without its create snapshot, and no later write can overwrite an
+   * amendment's. `items` null or empty (the read-back failed or found nothing) writes the link with the untrusted-ids mark SET, never
+   * trusted-and-empty. The generic `upsertByOrder` is untouched for every other caller.
+   */
+  upsertCreatedLinkWithItems?(orderId: string, create: LinkWrite & { connector: string }, update: LinkWrite, externalOrderId: string, items: WmsOrderItemRef[] | null): Promise<void>
   /**
    * `unsafe` true: take the link's AMENDMENT LEASE by compare-and-set (free, expired or already ours) and mark its recorded line ids
    * untrustworthy under a NEW generation token. Returns the token and `wasUnsafe` (whether the mark was ALREADY set before this
@@ -2493,27 +2500,24 @@ export async function runWmsOrderPushSweepCore(
         if (totalMismatchPence !== null) {
           console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} total mismatch: components=${componentPence ?? 'ok'} payload=${payloadPence ?? 'ok'} (recording ${totalMismatchPence}; pushed, flagged for review)`)
         }
-        await port.upsertByOrder(
-          order.id,
-          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...(unverifiableError ? { lastError: unverifiableError } : {}) },
+        const createLinkData = { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...(unverifiableError ? { lastError: unverifiableError } : {}) }
           // attempts: 0 on BOTH sides (o3d-bjc.8). claimForCreate has usually
           // created the link already, so the update side is what runs — and the
           // verification budget reads this counter. Left carrying four failed
           // create attempts, a create that finally succeeded would be
           // quarantined on its FIRST transient unknown, putting a live WMS order
           // outside the update, cancel and dispatch passes.
-          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...RESET_DISPATCH_FAILURES,
+        const updateLinkData = { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...RESET_DISPATCH_FAILURES,
             // A (re-)created warehouse order starts with no amendment in flight and no stale mark, written atomically with the state it is
-            // SYNCED under; an amendment that starts after that marks the link, and the snapshot write below then yields to it.
-            lineSnapshotUnsafeAt: null, lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null },
-        )
-        // The warehouse's own line ids for this order (a read-back the connector did after the create). Best effort and isolated:
-        // the order exists now, so a failure here must never reach the create path's handler (it would re-queue a duplicate). Only
-        // consulted when this order is later merged into another and then cancelled.
-        try {
-          await port.replaceOrderItems?.(order.id, push.externalOrderId, push.items ?? [])
-        } catch (e) {
-          console.error(`[wms-order-push] could not record the WMS line ids for ${order.id}: ${scrubWmsError(e, 'write failed')}`)
+            // SYNCED under (and with its snapshot, see upsertCreatedLinkWithItems).
+            lineSnapshotUnsafeAt: null, lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null }
+        // THE CREATE SNAPSHOT IS WRITTEN IN THE SAME TRANSACTION AS THE SYNCED LINK (when the port can): there is never a moment when the
+        // link is live without it, so no amendment can take the lease before it exists and no later write can overwrite an amendment's.
+        // A failed or empty read-back writes the link with the untrusted-ids mark set.
+        if (port.upsertCreatedLinkWithItems) {
+          await port.upsertCreatedLinkWithItems(order.id, createLinkData, updateLinkData, push.externalOrderId, push.items ?? null)
+        } else {
+          await port.upsertByOrder(order.id, createLinkData, updateLinkData)
         }
         // o3d-6x66: the claim's withdrawal re-check committed BEFORE this
         // remote push, so a withdrawal landing in between still gets its order
@@ -3102,11 +3106,11 @@ export async function runWmsOrderPushSweepCore(
           const orderId = link.order.id
           const externalOrderId = link.externalOrderId
           try {
-            await port.replaceOrderItems?.(orderId, externalOrderId, update.items ?? [], lineToken)
+            if (lineToken) await port.replaceOrderItems?.(orderId, externalOrderId, update.items ?? [], lineToken)
           } catch (e) {
             console.error(`[wms-order-push] could not refresh the WMS line ids for ${orderId}: ${scrubWmsError(e, 'write failed')}`)
             // If even the deletion cannot be written, this throws: the link is NOT advanced, so the amendment stays due.
-            await port.replaceOrderItems?.(orderId, externalOrderId, [], lineToken)
+            if (lineToken) await port.replaceOrderItems?.(orderId, externalOrderId, [], lineToken)
           }
         }
         // What the accepted order post did to the courier is settled here (form recorded, review flag, warehouse note); the same
@@ -3140,7 +3144,7 @@ export async function runWmsOrderPushSweepCore(
         // form and warning are settled now, and the link stays due (no pushedAt) for the items to be redone.
         // The order post was accepted but the line amendment did not finish: the lines on the warehouse order are in an unknown state, so
         // the recorded ids no longer describe them. Forgotten (the notice path then applies to a merge).
-        if (error instanceof WmsOrderUpdatePartialError) await port.replaceOrderItems?.(link.order.id, link.externalOrderId as string, [], lineToken).catch(() => {})
+        if (error instanceof WmsOrderUpdatePartialError && lineToken) await port.replaceOrderItems?.(link.order.id, link.externalOrderId as string, [], lineToken).catch(() => {})
         const partial = error instanceof WmsOrderUpdatePartialError ? await settleAmendedCourier(link, error.applied).catch(() => null) : null
         await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts, ...(partial?.linkFields ?? {}) }).catch(() => {})
         await audit({
@@ -3876,28 +3880,31 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       await db.$transaction(async (tx) => {
         const link = await tx.wmsOrderPushLink.findUnique({ where: { orderId }, select: { id: true } })
         if (!link) return
-        if (token !== undefined) {
-          // COMPARE-AND-SET on the link still holding the token, taken FIRST so the row lock serialises overlapping amendments: a stale
-          // owner (a newer amendment marked the link since) changes nothing and leaves the mark set. It also releases the lease.
-          const won = await tx.wmsOrderPushLink.updateMany({
-            where: { id: link.id, lineSnapshotToken: token },
-            data: { lineSnapshotUnsafeAt: null, lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null },
-          })
-          if (won.count === 0) return
-        } else {
-          // THE CREATE PATH: conditional, and it never clears a lease or a mark. The row is locked first; if an amendment already holds the
-          // lease or has marked the ids, this older snapshot is refused and the ids are left (or made) untrustworthy.
-          const rows = await tx.$queryRaw<Array<{ unsafe_at: Date | null; lease_expires_at: Date | null }>>`
-            SELECT line_snapshot_unsafe_at AS unsafe_at, amend_lease_expires_at AS lease_expires_at FROM wms_order_push_links WHERE id = ${link.id} FOR UPDATE`
-          const row = rows[0]
-          if (!row) return
-          if ((row.lease_expires_at && row.lease_expires_at > new Date()) || row.unsafe_at) {
-            if (!row.unsafe_at) await tx.wmsOrderPushLink.update({ where: { id: link.id }, data: { lineSnapshotUnsafeAt: new Date() } })
-            return
-          }
-        }
+        // COMPARE-AND-SET on the link still holding the token, taken FIRST so the row lock serialises overlapping amendments: a stale owner
+        // (a newer amendment marked the link since) changes nothing and leaves the mark set. It also releases the lease. There is no
+        // tokenless variant of this write.
+        const won = await tx.wmsOrderPushLink.updateMany({
+          where: { id: link.id, lineSnapshotToken: token },
+          data: { lineSnapshotUnsafeAt: null, lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null },
+        })
+        if (won.count === 0) return
         await tx.wmsOrderPushItem.deleteMany({ where: { linkId: link.id } })
         if (items.length > 0) {
+          await tx.wmsOrderPushItem.createMany({
+            data: items.map((item) => ({ linkId: link.id, externalOrderId, externalItemId: item.externalItemId, sku: item.sku, quantity: item.quantity })),
+            skipDuplicates: true,
+          })
+        }
+      })
+    },
+    async upsertCreatedLinkWithItems(orderId, create, update, externalOrderId, items) {
+      await db.$transaction(async (tx) => {
+        // A snapshot that is missing or empty is NOT "trusted and empty": the link is written with the untrusted-ids mark SET.
+        const trusted = items !== null && items.length > 0
+        const mark = { lineSnapshotUnsafeAt: trusted ? null : new Date(), lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null }
+        const link = await tx.wmsOrderPushLink.upsert({ where: { orderId }, create: { orderId, ...create, ...mark }, update: { ...update, ...mark }, select: { id: true } })
+        await tx.wmsOrderPushItem.deleteMany({ where: { linkId: link.id } })
+        if (trusted) {
           await tx.wmsOrderPushItem.createMany({
             data: items.map((item) => ({ linkId: link.id, externalOrderId, externalItemId: item.externalItemId, sku: item.sku, quantity: item.quantity })),
             skipDuplicates: true,

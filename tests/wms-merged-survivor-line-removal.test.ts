@@ -208,6 +208,7 @@ const HELD = { [PRODUCER_HOLD_ENFORCED_ENV]: 'mintsoft' }
 type LinkWriteLog = { id: string; data: Record<string, unknown> }
 function makePort(options: { cancellable: WmsPushLinkRef[]; items: WmsOrderItemRef[] | null }) {
   const writes: LinkWriteLog[] = []
+  const createdWrites: Array<{ orderId: string; create: Record<string, unknown>; update: Record<string, unknown>; externalOrderId: string; items: WmsOrderItemRef[] | null }> = []
   const upserts: Array<{ create: Record<string, unknown>; update: Record<string, unknown> }> = []
   const dropped: string[][] = []
   const recordedItems: Array<{ orderId: string; externalOrderId: string; items: WmsOrderItemRef[] }> = []
@@ -238,11 +239,11 @@ function makePort(options: { cancellable: WmsPushLinkRef[]; items: WmsOrderItemR
       return true
     },
     readOrderItems: async () => options.items ?? [],
-    replaceOrderItems: async (orderId, externalOrderId, items) => { recordedItems.push({ orderId, externalOrderId, items }) },
+    upsertCreatedLinkWithItems: async (orderId, create, update, externalOrderId, items) => { createdWrites.push({ orderId, create, update, externalOrderId, items }); upserts.push({ create, update }) },
     dropOrderItems: async (_linkId, ids) => { dropped.push(ids) },
     recordEvent: async (event) => { events.push({ action: String(event.action), outcome: String(event.outcome), summary: String(event.summary) }) },
   }
-  return { port, writes, dropped, recordedItems, events, link, upserts }
+  return { port, writes, dropped, recordedItems, events, link, upserts, createdWrites }
 }
 
 async function sweep(port: WmsOrderPushPort, overrides: Record<string, unknown> = {}) {
@@ -580,9 +581,9 @@ test('PUSH: a read-back that fails never fails the push (the order exists; a ret
   })
 })
 
-test('SWEEP: the ids the connector read back are recorded against the order after the create is linked; a failure to record never fails the create', async () => {
+test('SWEEP: the create link and the ids the connector read back are written in ONE transactional call; a failed read-back passes null (the link is then written with the mark set)', async () => {
   const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
-  for (const failRecord of [false, true]) {
+  for (const readBack of [true, false]) {
     await withEnv(OFF, async () => {
       const h = makePort({ cancellable: [], items: null })
       h.port.createCandidates = async () => [{
@@ -591,19 +592,21 @@ test('SWEEP: the ids the connector read back are recorded against the order afte
         subtotalForeign: 10, shippingForeign: 0, taxForeign: 0, taxRatePercent: null, pricesIncludeVat: false, discountAmount: 0, totalForeign: 10,
         shipFromWarehouseId: 'wh-1', pushAttempts: 0, lines: [{ sku: 'A', qty: 1, taxForeign: 0, totalForeign: 10, description: 'Widget' }],
       } as never]
-      if (failRecord) h.port.replaceOrderItems = async () => { throw new Error('database unavailable') }
       const items = [{ externalItemId: '55', sku: 'A', quantity: 1 }]
       const connector = {
-        pushOrder: async () => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW', items }),
+        pushOrder: async () => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW', ...(readBack ? { items } : {}) }),
         verifyPushedOrder: async () => 'ours' as const,
         probeOrderPresence: async () => 'FOUND' as const,
       }
       const quiet = console.error
       console.error = () => {}
       const result = await runWmsOrderPushSweepCore(connector as never, 'mintsoft', h.port, { now: NOW }).finally(() => { console.error = quiet })
-      assert.equal(result.created, 1, 'the create still counted')
+      assert.equal(result.created, 1)
       assert.equal(result.failed, 0)
-      if (!failRecord) assert.deepEqual(h.recordedItems, [{ orderId: 'so-1', externalOrderId: 'wms-1', items }])
+      assert.equal(h.createdWrites.length, 1, 'ONE call writes the link and the ids')
+      assert.equal(h.createdWrites[0].externalOrderId, 'wms-1')
+      assert.deepEqual(h.createdWrites[0].items, readBack ? items : null)
+      assert.equal(h.createdWrites[0].update.state, 'SYNCED')
     })
   }
 })
@@ -816,7 +819,7 @@ test('CRASH BOUNDARY: the snapshot is replaced BEFORE the link advances; a crash
     const { h, store } = snapshotPort(storedD)
     const order: string[] = []
     const replace = h.port.replaceOrderItems!
-    h.port.replaceOrderItems = async (o, e, items) => { order.push('snapshot'); await replace(o, e, items) }
+    h.port.replaceOrderItems = async (o, e, items, token) => { order.push('snapshot'); await replace(o, e, items, token) }
     h.port.updateLink = async (_id, data) => { order.push('link'); if ('pushedAt' in data) throw new Error('crash') }
     const fresh = [{ externalItemId: '55', sku: 'A', quantity: 1 }]
     await sweep(h.port, { updateOrder: async () => ({ updated: true, status: 'NEW', items: fresh }) })
@@ -1121,7 +1124,7 @@ test('REMOVAL LEASE: UNTRUSTED ids take no lease and raise the notice', async ()
 
 // ---------------------------------------------------------------- 17. review round 10 -----------------------------------------------
 
-test('CREATE: the link write that marks the order SYNCED also resets any stale lease and mark; the snapshot write that follows carries NO token (it is conditional in the port)', async () => {
+test('CREATE: the transactional create write resets any stale lease and mark; there is no separate (tokenless) snapshot write at all', async () => {
   await withEnv(OFF, async () => {
     const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
     const h = makePort({ cancellable: [], items: null })
@@ -1131,8 +1134,8 @@ test('CREATE: the link write that marks the order SYNCED also resets any stale l
       subtotalForeign: 10, shippingForeign: 0, taxForeign: 0, taxRatePercent: null, pricesIncludeVat: false, discountAmount: 0, totalForeign: 10,
       shipFromWarehouseId: 'wh-1', pushAttempts: 0, lines: [{ sku: 'A', qty: 1, taxForeign: 0, totalForeign: 10, description: 'Widget' }],
     } as never]
-    const tokens: Array<string | undefined> = []
-    h.port.replaceOrderItems = async (_o, _e, _i, token) => { tokens.push(token) }
+    let replaceCalls = 0
+    h.port.replaceOrderItems = async () => { replaceCalls += 1 }
     const connector = { pushOrder: async () => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW', items: [{ externalItemId: '1', sku: 'A', quantity: 1 }] }), verifyPushedOrder: async () => 'ours' as const, probeOrderPresence: async () => 'FOUND' as const }
     const quiet = console.error
     console.error = () => {}
@@ -1142,8 +1145,18 @@ test('CREATE: the link write that marks the order SYNCED also resets any stale l
     assert.equal(reset.lineSnapshotToken, null)
     assert.equal(reset.amendLeaseOwner, null)
     assert.equal(reset.amendLeaseExpiresAt, null)
-    assert.deepEqual(tokens, [undefined])
+    assert.equal(replaceCalls, 0, 'no later snapshot write exists for the create')
   })
+})
+
+test('SOURCE CENSUS: replaceOrderItems has NO tokenless caller or variant (its token is required and every call passes the amendment\'s)', async () => {
+  const { readFileSync } = await import('node:fs')
+  const source = readFileSync(new URL('../lib/domain/wms/order-push-sweep.ts', import.meta.url), 'utf8')
+  assert.match(source, /replaceOrderItems\?\(orderId: string, externalOrderId: string, items: WmsOrderItemRef\[\], token: string\): Promise<void>/, 'the port type requires the token')
+  assert.match(source, /async replaceOrderItems\(orderId, externalOrderId, items, token\) \{/)
+  const calls = [...source.matchAll(/port\.replaceOrderItems\?\.\(([^\n]*)/g)].map((m) => m[1])
+  assert.ok(calls.length >= 3, 'the amendment paths call it')
+  for (const call of calls) assert.match(call, /lineToken/, `every call passes the amendment's token: ${call}`)
 })
 
 // ---------------------------------------------------------------- 18. review round 12: the one identity gate ----------------------------
