@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { STORE_CREDIT_PUSH_WITHHELD_REASON, storeCreditPushMustBeWithheld } from '@/lib/domain/wms/store-credit-push-guard'
 import type { Prisma } from '@/app/generated/prisma/client'
@@ -1023,10 +1024,17 @@ export interface WmsOrderPushPort {
    * notice is raised as before.
    */
   readOrderItems?(linkId: string): Promise<WmsOrderItemRef[]>
-  /** Replace the recorded line ids of the order with this set, read from warehouse order `externalOrderId`. An empty set clears them. */
-  replaceOrderItems?(orderId: string, externalOrderId: string, items: WmsOrderItemRef[]): Promise<void>
-  /** Mark (or unmark) the link's recorded line ids as untrustworthy. While marked, readOrderItems answers none. Best effort to unmark, required to mark. */
-  setLineIdsUnsafe?(linkId: string, unsafe: boolean): Promise<void>
+  /**
+   * Replace the recorded line ids of the order with this set, read from warehouse order `externalOrderId`. An empty set clears them. With a
+   * `token` (the amendment's generation from setLineIdsUnsafe) the write is a compare-and-set on the link still holding that token: a stale
+   * owner's write is a no-op that leaves the mark set.
+   */
+  replaceOrderItems?(orderId: string, externalOrderId: string, items: WmsOrderItemRef[], token?: string): Promise<void>
+  /**
+   * Mark the link's recorded line ids as untrustworthy under a NEW generation token and return it (`unsafe` true), or clear the mark ONLY
+   * while the link still holds `token` (`unsafe` false; a stale owner's call is a no-op). While marked, readOrderItems answers none.
+   */
+  setLineIdsUnsafe?(linkId: string, unsafe: boolean, token?: string): Promise<string>
   /** Forget these recorded line ids (lines IMS removed from a merged order). */
   dropOrderItems?(linkId: string, externalItemIds: string[]): Promise<void>
   /** SYNCED links whose order is ON_HOLD. */
@@ -2915,6 +2923,7 @@ export async function runWmsOrderPushSweepCore(
 
       const ts = now()
       let update: Awaited<ReturnType<NonNullable<PushConnector['updateOrder']>>> | null = null
+      let lineToken: string | undefined
       try {
         // An erased order is not amended: the pass settles it locally (no remote call, no retry loop) instead of
         // building a payload from placeholders. Propagating an erasure to the warehouse is separate work.
@@ -2963,9 +2972,9 @@ export async function runWmsOrderPushSweepCore(
         // FAIL CLOSED: the recorded line ids are marked untrustworthy BEFORE anything is sent. They are trusted again only when a verified
         // fresh snapshot is stored below (replaceOrderItems clears the mark) or the amendment provably changed nothing. A crash, a partial
         // amendment or a failed cleanup therefore always leaves them untrusted. If the mark cannot be written, nothing is sent.
-        await port.setLineIdsUnsafe?.(link.id, true)
+        lineToken = await port.setLineIdsUnsafe?.(link.id, true)
         update = await connector.updateOrder(link.externalOrderId, input, amendSeam.clearance)
-        if (!update.updated) await port.setLineIdsUnsafe?.(link.id, false).catch(() => {}) // nothing was written: the ids still describe the order
+        if (!update.updated) await port.setLineIdsUnsafe?.(link.id, false, lineToken).catch(() => {}) // nothing was written: the ids still describe the order
         // The warehouse order is a MERGED order (the absorbing order keeps the survivor's id, so this link can still name it as a plain
         // order): nothing was written. The link is re-pointed as MERGED so no later pass amends it, and the change is left for a person.
         if (update.status === 'MERGED_SURVIVOR') {
@@ -2989,11 +2998,11 @@ export async function runWmsOrderPushSweepCore(
           const orderId = link.order.id
           const externalOrderId = link.externalOrderId
           try {
-            await port.replaceOrderItems?.(orderId, externalOrderId, update.items ?? [])
+            await port.replaceOrderItems?.(orderId, externalOrderId, update.items ?? [], lineToken)
           } catch (e) {
             console.error(`[wms-order-push] could not refresh the WMS line ids for ${orderId}: ${scrubWmsError(e, 'write failed')}`)
             // If even the deletion cannot be written, this throws: the link is NOT advanced, so the amendment stays due.
-            await port.replaceOrderItems?.(orderId, externalOrderId, [])
+            await port.replaceOrderItems?.(orderId, externalOrderId, [], lineToken)
           }
         }
         // What the accepted order post did to the courier is settled here (form recorded, review flag, warehouse note); the same
@@ -3024,7 +3033,7 @@ export async function runWmsOrderPushSweepCore(
         // form and warning are settled now, and the link stays due (no pushedAt) for the items to be redone.
         // The order post was accepted but the line amendment did not finish: the lines on the warehouse order are in an unknown state, so
         // the recorded ids no longer describe them. Forgotten (the notice path then applies to a merge).
-        if (error instanceof WmsOrderUpdatePartialError) await port.replaceOrderItems?.(link.order.id, link.externalOrderId as string, []).catch(() => {})
+        if (error instanceof WmsOrderUpdatePartialError) await port.replaceOrderItems?.(link.order.id, link.externalOrderId as string, [], lineToken).catch(() => {})
         const partial = error instanceof WmsOrderUpdatePartialError ? await settleAmendedCourier(link, error.applied).catch(() => null) : null
         await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts, ...(partial?.linkFields ?? {}) }).catch(() => {})
         await audit({
@@ -3748,13 +3757,20 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       const rows = await db.wmsOrderPushItem.findMany({ where: { linkId }, orderBy: { createdAt: 'asc' } })
       return rows.map((row) => ({ externalItemId: row.externalItemId, sku: row.sku, quantity: row.quantity }))
     },
-    async replaceOrderItems(orderId, externalOrderId, items) {
+    async replaceOrderItems(orderId, externalOrderId, items, token) {
       await db.$transaction(async (tx) => {
         const link = await tx.wmsOrderPushLink.findUnique({ where: { orderId }, select: { id: true } })
         if (!link) return
+        // With a token this is a COMPARE-AND-SET on the link still holding it, taken FIRST so the row lock serialises overlapping
+        // amendments: a stale owner (a newer amendment marked the link since) changes nothing and leaves the mark set.
+        const data = { lineSnapshotUnsafeAt: null, lineSnapshotToken: null }
+        if (token !== undefined) {
+          const won = await tx.wmsOrderPushLink.updateMany({ where: { id: link.id, lineSnapshotToken: token }, data })
+          if (won.count === 0) return
+        } else {
+          await tx.wmsOrderPushLink.update({ where: { id: link.id }, data })
+        }
         await tx.wmsOrderPushItem.deleteMany({ where: { linkId: link.id } })
-        // A verified replacement (or an explicit empty set) makes the record trustworthy again, in the SAME transaction.
-        await tx.wmsOrderPushLink.update({ where: { id: link.id }, data: { lineSnapshotUnsafeAt: null } })
         if (items.length > 0) {
           await tx.wmsOrderPushItem.createMany({
             data: items.map((item) => ({ linkId: link.id, externalOrderId, externalItemId: item.externalItemId, sku: item.sku, quantity: item.quantity })),
@@ -3763,8 +3779,14 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         }
       })
     },
-    async setLineIdsUnsafe(linkId, unsafe) {
-      await db.wmsOrderPushLink.update({ where: { id: linkId }, data: { lineSnapshotUnsafeAt: unsafe ? new Date() : null } })
+    async setLineIdsUnsafe(linkId, unsafe, token) {
+      if (unsafe) {
+        const fresh = randomUUID()
+        await db.wmsOrderPushLink.update({ where: { id: linkId }, data: { lineSnapshotUnsafeAt: new Date(), lineSnapshotToken: fresh } })
+        return fresh
+      }
+      await db.wmsOrderPushLink.updateMany({ where: { id: linkId, lineSnapshotToken: token ?? '' }, data: { lineSnapshotUnsafeAt: null, lineSnapshotToken: null } })
+      return token ?? ''
     },
     async dropOrderItems(linkId, externalItemIds) {
       await db.wmsOrderPushItem.deleteMany({ where: { linkId, externalItemId: { in: externalItemIds } } })

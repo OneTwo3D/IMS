@@ -437,3 +437,47 @@ test('REAL INBOX SELECTION: a live link with an amendment notice is listed, and 
   await d.db.wmsOrderPushLink.updateMany({ where: { orderId: withNotice.orderId, amendNoticeAt: { not: null } }, data: { amendNoticeAt: null } })
   assert.deepEqual(await listed(), [])
 })
+
+test('REAL PORT, TWO AMENDMENTS OVERLAP: the older one finishing late cannot store its snapshot or clear the mark; the merged removal still refuses', { skip }, async (t) => {
+  const d = await deps()
+  for (const bCleansUp of [false, true]) {
+    const tag = `gen${bCleansUp ? 'c' : 'n'}${randomUUID().slice(0, 8)}`
+    const s = await seed(d, tag, 'CANCELLED')
+    t.after(() => cleanup(d, s))
+    const link = await d.db.wmsOrderPushLink.create({ data: { orderId: s.orderId, connector: 'mintsoft', state: 'MERGED', externalOrderId: 'surv-g', externalOrderNumber: 'MS-E+MS-D', pushedAt: new Date() } })
+    const port = d.sweep.createPrismaWmsOrderPushPort()
+    const old = [{ externalItemId: '1', sku: 'A', quantity: 1 }]
+    await port.replaceOrderItems!(s.orderId, 'o-g', old)
+    // A starts and verifies its read-back; B starts after it, changes lines and fails partway.
+    const tokenA = await port.setLineIdsUnsafe!(link.id, true)
+    const tokenB = await port.setLineIdsUnsafe!(link.id, true)
+    assert.notEqual(tokenA, tokenB)
+    if (bCleansUp) await port.replaceOrderItems!(s.orderId, 'o-g', [], tokenB) // B's cleanup succeeds: no snapshot
+    // A now finishes with its OLDER snapshot and tries to clear the mark.
+    await port.replaceOrderItems!(s.orderId, 'o-g', old, tokenA)
+    await port.setLineIdsUnsafe!(link.id, false, tokenA)
+    const row = await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })
+    if (bCleansUp) {
+      assert.equal(await d.db.wmsOrderPushItem.count({ where: { linkId: link.id } }), 0, 'A\'s older snapshot was NOT stored')
+    } else {
+      assert.ok(row.lineSnapshotUnsafeAt, 'the mark is still set')
+      assert.equal(row.lineSnapshotToken, tokenB)
+    }
+    assert.deepEqual(await port.readOrderItems!(link.id), [], 'no trusted ids')
+    // The cancel of the merged order therefore removes nothing and raises the notice.
+    const calls = { removed: 0, cancelled: 0 }
+    const double = {
+      pushOrder: async () => { throw new Error('must not create') },
+      updateOrder: async () => ({ updated: true, status: 'NEW' }),
+      cancelOrder: async () => { calls.cancelled += 1; return { cancelled: true, status: 'CANCELLED' } },
+      cancelMergedOrder: async () => { calls.cancelled += 1; return { cancelled: true, status: 'CANCELLED' } },
+      removeOrderItems: async () => { calls.removed += 1; return { kind: 'REMOVED' as const, removed: old } },
+      addOrderComment: async () => {},
+      verifyPushedOrder: async () => 'ours' as const,
+      probeOrderPresence: async () => 'FOUND' as const,
+    }
+    const result = await d.sweep.runWmsOrderPushSweepCore(double as never, 'mintsoft', port, { batchSize: 500 })
+    assert.equal(calls.removed + calls.cancelled, 0)
+    assert.ok((result.operatorNotices ?? 0) >= 1)
+  }
+})

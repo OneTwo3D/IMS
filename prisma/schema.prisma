@@ -3968,6 +3968,9 @@ model WmsOrderPushLink {
   /// Set before IMS amends the warehouse order's lines and cleared only when a verified fresh snapshot of its line ids is stored (or the
   /// amendment provably changed nothing). While set, the recorded line ids cannot be trusted and a merged-order line removal refuses.
   lineSnapshotUnsafeAt  DateTime? @map("line_snapshot_unsafe_at")
+  /// The generation of the amendment that set the mark above. Only the amendment holding the CURRENT token may store a replacement snapshot
+  /// or clear the mark (compare-and-set), so an older amendment finishing late cannot make a newer one's stale state look trustworthy.
+  lineSnapshotToken     String?   @map("line_snapshot_token")
   holdNoticeCommentAt   DateTime? @map("hold_notice_comment_at")
   cancelNoticeCommentAt DateTime? @map("cancel_notice_comment_at")
   createdAt           DateTime          @default(now())

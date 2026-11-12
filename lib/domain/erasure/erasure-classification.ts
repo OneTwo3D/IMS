@@ -135,7 +135,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   },
   WmsOrderPushLink: {
     erased: ['lastError', 'dispatchLastError', 'dispatchUnresolvedError'],
-    notPersonal: ['connector', 'courierForm', 'courierFormName'],
+    notPersonal: ['connector', 'courierForm', 'courierFormName', 'lineSnapshotToken'],
     retained: {
       externalOrderId: 'the warehouse order id reconciles the order with the warehouse',
       externalOrderNumber: 'the warehouse order number reconciles the order with the warehouse',

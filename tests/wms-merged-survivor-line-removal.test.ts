@@ -755,13 +755,13 @@ const updatableLink = () => ({
 
 /** A port whose recorded line ids live in a small in-memory store, so the amend pass and the later cancel see the same snapshot. */
 function snapshotPort(initial: WmsOrderItemRef[]) {
-  const store = { items: [...initial], unsafe: false, marks: [] as boolean[] }
+  const store = { items: [...initial], unsafe: false, marks: [] as boolean[], tokens: [] as string[] }
   const h = makePort({ cancellable: [], items: null })
   h.port.updatableLinks = async () => [updatableLink()] as never
   // Like the real port: a link whose ids are marked untrustworthy has no usable record.
   h.port.readOrderItems = async () => (store.unsafe ? [] : [...store.items])
-  h.port.replaceOrderItems = async (_orderId, _ext, items) => { store.items = [...items]; store.unsafe = false }
-  h.port.setLineIdsUnsafe = async (_id, unsafe) => { store.marks.push(unsafe); store.unsafe = unsafe }
+  h.port.replaceOrderItems = async (_orderId, _ext, items, token) => { store.tokens.push(`replace:${token}`); store.items = [...items]; store.unsafe = false }
+  h.port.setLineIdsUnsafe = async (_id, unsafe, token) => { store.marks.push(unsafe); store.unsafe = unsafe; store.tokens.push(token ?? 'new'); return 'tok-1' }
   return { h, store }
 }
 
@@ -967,5 +967,19 @@ test('REFUSED AMENDMENT of a merged order writes the durable amendment notice (a
     const { h } = await amendAbsorbing(true)
     const moved = h.writes.find((w) => w.data.state === 'MERGED')
     assert.ok(moved!.data.amendNoticeAt instanceof Date)
+  })
+})
+
+// ---------------------------------------------------------------- 13. review round 6 -----------------------------------------------
+
+test('GENERATION TOKEN: the amendment passes the token its own mark returned to the snapshot replacement and to the un-mark', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const a = snapshotPort(storedD)
+    await sweep(a.h.port, { updateOrder: async () => ({ updated: true, status: 'NEW', items: [{ externalItemId: '1', sku: 'A', quantity: 1 }] }) })
+    assert.ok(a.store.tokens.includes('replace:tok-1'), 'replace carried the owner token')
+    const b = snapshotPort(storedD)
+    await sweep(b.h.port, { updateOrder: async () => ({ updated: false, status: 'NOT_NEW' }) })
+    assert.ok(b.store.tokens.includes('tok-1'), 'the un-mark carried the owner token')
   })
 })
