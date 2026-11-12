@@ -1574,17 +1574,36 @@ export async function updateShipmentStatus(
     skipStorefrontPush?: boolean
     /** Re-checked under the order lock inside the SHIPPED transaction; a non-null answer refuses the dispatch. */
     shipFence?: (tx: ShipmentServiceClient) => Promise<string | null>
+    /**
+     * A warehouse-reported dispatch: if the order is found DRAFT / ON_HOLD / PENDING_PAYMENT under the order lock, the
+     * goods have left, so the shipment, stock, FIFO and COGS are recorded, but the order is NOT promoted and nothing is
+     * pushed to the storefront (`despatchedWhileNotReady` is returned). Any other status promotes as usual. Honoured only
+     * for the internal caller (`applyExternalFulfillmentUpdate`).
+     */
+    allowRecordWhenNotReady?: boolean
   },
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; despatchedWhileNotReady?: string }> {
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.process')
     }
+    // Honoured only for the internal (system) caller: an operator's dispatch can never record on a held order.
+    const allowRecordWhenNotReady = options?.allowRecordWhenNotReady === true && options?.internalBypassToken === INTERNAL_ACTION_BYPASS
+    const completionAuthority = options?.completionAuthority ?? 'IMS'
+    const completion = {
+      completionAuthority,
+      storefrontCompletion: options?.storefrontCompletion ?? completionAuthority === 'IMS',
+      ...(options?.shipFence ? { fence: options.shipFence } : {}),
+    }
+    // SHP-H1: for a dispatch the order promotion runs INSIDE the dispatch transaction (`completion`), so a
+    // committed dispatch can never leave the order unpromoted or the operator with a failure for goods that left.
     const result = await transitionShipmentStatus(db, {
       shipmentId,
       targetStatus,
       extra,
       ...(targetStatus === 'SHIPPED' && options?.shipFence ? { fence: options.shipFence } : {}),
+      ...(targetStatus === 'SHIPPED' ? { completion } : {}),
+      ...(allowRecordWhenNotReady ? { allowRecordWhenNotReady: true } : {}),
     })
     if (!result.success) {
       try {
@@ -1598,13 +1617,13 @@ export async function updateShipmentStatus(
     // o3d-zvec.15: set by the reconciliation below ONLY when this call moved the order to SHIPPED.
     let storefrontCompletionKey: string | null = null
     let fenceRefusal: string | null = null
-    const completionAuthority = options?.completionAuthority ?? 'IMS'
     if (targetStatus === 'SHIPPED') {
-      const reconciliation = await reconcileOrderAfterShipment(db, result.shipment, extra, {
-        completionAuthority,
-        storefrontCompletion: options?.storefrontCompletion ?? completionAuthority === 'IMS',
-        ...(options?.shipFence ? { fence: options.shipFence } : {}),
-      })
+      // Already reconciled in the dispatch transaction when this call did the dispatch; a re-run against an
+      // already-SHIPPED shipment (retry, crashed post-commit step) reconciles here instead.
+      const reconciliation = result.reconciliation
+        ?? (result.despatchedWhileNotReady
+          ? { shouldGenerateInvoice: false, orderId: result.shipment.orderId }
+          : await reconcileOrderAfterShipment(db, result.shipment, extra, completion))
       // The shipments shipped (the goods left) but the order was NOT flipped: the verification no longer holds. Everything below still
       // runs (logs, stock sync); the refusal is reported at the end so the order stays pending and is verified again, then completed,
       // on the next sweep.
@@ -1633,6 +1652,19 @@ export async function updateShipmentStatus(
           description: `Order ${orderRef} has despatched every shipment raised against it but is still short: ${outstandingSummary}. `
             + 'It has NOT been marked SHIPPED. Allocate and ship the remainder, or set the order to SHIPPED explicitly to close it short.',
           metadata: { orderNumber: orderRef, shortfall: reconciliation.shortfall },
+        })
+      }
+      if (reconciliation.promotedFromStatus) {
+        const orderRef = result.shipment.order.orderNumber ?? result.shipment.order.externalOrderNumber
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: reconciliation.orderId,
+          action: 'order_shipped_from_non_fulfilment_status',
+          tag: 'sales',
+          level: 'WARNING',
+          description: `Order ${orderRef} was ${reconciliation.promotedFromStatus} when its last shipment was despatched. `
+            + 'The goods have left, so the order has been marked SHIPPED.',
+          metadata: { orderNumber: orderRef, previousStatus: reconciliation.promotedFromStatus },
         })
       }
       if (reconciliation.shouldGenerateInvoice) {
@@ -1680,7 +1712,7 @@ export async function updateShipmentStatus(
       // is the immediate post-commit attempt — tracking first, then the status, never failing the shipment
       // (o3d-zvec.15). Without a key (partial shipment, EXTERNAL authority with no storefrontCompletion, an
       // unlinked order) only the tracking goes.
-      if (options?.skipStorefrontPush !== true) {
+      if (options?.skipStorefrontPush !== true && !result.despatchedWhileNotReady) {
         await pushShipmentCompletionToShopping({
           orderId: result.shipment.orderId,
           completionKey: storefrontCompletionKey,
@@ -1695,7 +1727,9 @@ export async function updateShipmentStatus(
         console.error(syncError)
       }
     }
-    return fenceRefusal === null ? { success: true } : { success: false, error: fenceRefusal }
+    return fenceRefusal === null
+      ? { success: true, ...(result.despatchedWhileNotReady ? { despatchedWhileNotReady: result.despatchedWhileNotReady } : {}) }
+      : { success: false, error: fenceRefusal }
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e)
     try {

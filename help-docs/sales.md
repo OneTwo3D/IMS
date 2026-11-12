@@ -154,6 +154,12 @@ When not all products are in stock, you can ship what's available now and fulfil
 6. **Re-allocate** the remaining items and confirm to create new shipments
 7. **Ship** the final shipments — the order auto-transitions to **Shipped** once all shipments are shipped
 
+Services and fees on an order (a delivery charge, for example) never need a shipment, so they never hold an order back: the order moves to **Shipped** once every physical item has shipped.
+
+**Dispatching from the app.** A shipment of an order that is still a **Draft**, **On Hold** (for any reason) or **Pending payment** cannot be dispatched: nothing is recorded and no stock is taken, and the message tells you what to do next (finalise the draft, release the hold, or record the payment). If the order is **Processing**, dispatching the last shipment moves the order to **Shipped** in the same step, and an "Order shipped from a non-fulfilment status" warning is added to its activity log. The dispatch and the order change are saved together: if the order cannot be moved, the dispatch is not recorded at all.
+
+**Despatches reported by the warehouse (Mintsoft).** The goods have already left, so IMS records what it can. If the order is **On Hold** or **Pending payment** and already has shipments, the shipments are marked shipped and stock and cost are booked as normal, but the order itself is left exactly as it is (it is not marked Shipped, the hold is not released, nothing is sent to the storefront), and an administrator gets a "Despatch on an order that is not ready to ship" notice and an activity-log warning. Review the order, release or finalise it, then set it to Shipped if it should be closed. If the order is a **Draft**, or has no shipment yet, IMS does not record the despatch (doing so would finalise the draft or lift the hold): it appears as a stuck despatch under **Sync > Exceptions** for you to decide what to do.
+
 This flow works seamlessly with the multi-shipment system. Each round of allocation and confirmation creates new shipments without affecting previously shipped items.
 
 ## Multi-Shipment System
