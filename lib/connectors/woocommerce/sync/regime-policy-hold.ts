@@ -16,7 +16,6 @@ import { EU_VAT_TREATMENT_PAYLOAD_KEY } from '@/lib/domain/accounting/eu-vat-tre
 import type { AttemptRef } from '@/lib/domain/accounting/sync-log-attempt'
 import type { HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
-import { attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
 import { buildHeldSalesInvoicePayload, heldSalesInvoiceQueueWhere, HELD_SALES_INVOICE_RECORD_KIND } from './held-sales-invoice'
 
 /**
@@ -47,9 +46,22 @@ export type RegimePolicyHoldOutcome =
   | { kind: 'account_changed'; problem: string; accounts: string[] }  // an ACCOUNT setting changed: the stamped regime and the treated lines keep their old accounts, so a re-import cannot adopt it; not superseded, refused with steps that work
   | { kind: 'blocked'; problem: string }            // changed, but an earlier attempt may have created the invoice in Xero: never superseded, left refused for ledger reconciliation
 
-/** The durable proof, from a row alone, that no create ever left it: no document id, no create-dispatch marker or key, and the canonical never-attempted record (`attemptProvenNeverMade`: custody present, no remote-attempt stamp). One definition for the current row and every sibling. */
-function neverMade(row: { createDispatchedAt: Date | null; createDispatchIdempotencyKey: string | null; remoteAttemptedAt: Date | null; attemptStampingCustodyAt: Date | null; externalTransactionId: string | null }): boolean {
-  return row.externalTransactionId === null && row.createDispatchedAt === null && row.createDispatchIdempotencyKey === null && attemptProvenNeverMade(row)
+/**
+ * NEVER CLAIMED, from a row alone. This is the proof that nothing can have been sent for a SALES_INVOICE row, and it is deliberately NOT the money stamps: `remoteAttemptedAt` is written only for money types and the sales-invoice poster mints no create-dispatch record
+ * (its replay protection is the number fence: `CREATE_REPLAY_POLICY.SALES_INVOICE = 'number-fenced'`, create-dispatch-record.ts:172), so for an invoice those fields prove nothing. What does prove it is the claim itself: a request is only ever sent by a worker holding a claim, and every
+ * claim by a fence-aware processor bumps the attempt revision (sync-processor.ts:4119 `nextAttemptRevision(entry.attemptRevision)`; the first claim makes it 1, sync-log-attempt.ts:32-38), while a claim by a binary that does not know the column forfeits custody
+ * (`attemptStampingCustodyAt`, money-attempt-provenance.ts header, enforced by a database trigger). So: revision 0 with custody still present means no processor of any kind has ever claimed the row. No document id and no dispatch marker or key are required as well.
+ */
+function neverClaimed(row: { attemptRevision: number; createDispatchedAt: Date | null; createDispatchIdempotencyKey: string | null; remoteAttemptedAt: Date | null; attemptStampingCustodyAt: Date | null; externalTransactionId: string | null }): boolean {
+  return row.attemptRevision === 0 && row.attemptStampingCustodyAt !== null && row.remoteAttemptedAt === null && row.externalTransactionId === null && row.createDispatchedAt === null && row.createDispatchIdempotencyKey === null
+}
+
+/**
+ * THE CURRENT ROW: the claim THIS worker holds is the first claim the row has ever had (revision 1, custody present, so no earlier claim by any processor), no document id and no dispatch marker or key. The supersede runs at the head of the poster case, before the number fence and the
+ * remote-write fence of this claim, so nothing has left in it yet. A retry (revision >= 2), or a row a non-stamping binary ever claimed (custody gone), is never provably unsent.
+ */
+function firstClaimNothingSent(row: { attemptRevision: number; createDispatchedAt: Date | null; createDispatchIdempotencyKey: string | null; remoteAttemptedAt: Date | null; attemptStampingCustodyAt: Date | null; externalTransactionId: string | null }): boolean {
+  return row.attemptRevision === 1 && row.attemptStampingCustodyAt !== null && row.remoteAttemptedAt === null && row.externalTransactionId === null && row.createDispatchedAt === null && row.createDispatchIdempotencyKey === null
 }
 
 export async function holdInvoiceOnRegimePolicyChange(params: {
@@ -78,18 +90,16 @@ export async function holdInvoiceOnRegimePolicyChange(params: {
     // socket) and no dispatch key; no remote-attempt stamp under custody (`attemptProvenNeverMade`); no document id; and no other live or posted sales-invoice row for the order. Anything else is ambiguous and is left refused for ledger reconciliation.
     const row = await tx.accountingSyncLog.findUnique({
       where: { id: params.attempt.id },
-      select: { createDispatchedAt: true, createDispatchIdempotencyKey: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true, externalTransactionId: true },
+      select: { attemptRevision: true, createDispatchedAt: true, createDispatchIdempotencyKey: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true, externalTransactionId: true },
     })
-    // EVERY other sales-invoice row for the order, in any status: one that is not itself PROVEN never to have reached Xero (the same never-made proof as the current row's: custody present and no remote-attempt stamp, no create-dispatch marker or key, no document id) is ambiguous, whatever its status. A FAILED row with no document id, after a lost response, is exactly that: a rebuilt invoice released under a new idempotency key would be created again beside it.
+    // EVERY other sales-invoice row for the order, in any status: unless it was NEVER CLAIMED (see neverClaimed: the money stamps prove nothing for an invoice), it is ambiguous, whatever its fields say. A FAILED row with no document id, after a lost response, is exactly that: a rebuilt
+    // invoice released under a new idempotency key would be created again beside it. A row this flow superseded earlier was claimed too, so it blocks a later supersede as well: conservative, and a person reconciles it.
     const siblingRows = await tx.accountingSyncLog.findMany({
       where: { id: { not: params.attempt.id }, referenceType: 'SalesOrder', referenceId: params.referenceId, type: { in: [...SALES_INVOICE_SYNC_TYPES] } },
-      select: { createDispatchedAt: true, createDispatchIdempotencyKey: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true, externalTransactionId: true },
+      select: { attemptRevision: true, createDispatchedAt: true, createDispatchIdempotencyKey: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true, externalTransactionId: true },
     })
-    const ambiguousSibling = siblingRows.some((sibling) => !(neverMade(sibling)))
-    const neverDispatched = row !== null
-      && params.attempt.attemptRevision === 1
-      && neverMade(row)
-      && !ambiguousSibling
+    const ambiguousSibling = siblingRows.some((sibling) => !neverClaimed(sibling))
+    const neverDispatched = row !== null && params.attempt.attemptRevision === 1 && firstClaimNothingSent(row) && !ambiguousSibling
     if (!neverDispatched) return { kind: 'blocked', problem }
     // Superseded as an ATTEMPT (its mirrored event is voided revivably), never as a cancelled sale.
     const retired = await retireSalesInvoiceForCancelledOrder(tx, params.attempt, params.referenceId, params.held, REGIME_POLICY_SUPERSEDED_NOTE, true)

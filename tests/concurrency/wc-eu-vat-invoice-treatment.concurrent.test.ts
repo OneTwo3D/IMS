@@ -1439,7 +1439,7 @@ test('[eu vat] BOTH sales-invoice posting cases call the poster gate before anyt
 
 // THE ROUND TRIP OF A QUEUED TREATED INVOICE WHOSE REGIME POLICY CHANGED: queued, cut-in changed, the poster's gate supersedes it into a held invoice (nothing sent), a re-import rebuilds and releases it under the current policy, or refuses it with the reason.
 type BlockedInfo = { first: { kind: string; problem?: string }; second: { kind: string }; stillQueued: { status: string }; holds: number; ev: { status: string; voidBasis: string | null } }
-async function queuedThenPolicyChange(t: test.TestContext, afterHold: 'releases' | 'refuses', history: 'clean' | 'retried' | 'dispatched' | 'attempted' | 'sibling' | 'failedSiblingNoId' | 'failedSiblingDispatched' | 'failedSiblingUnproven' | 'provenSibling' = 'clean') {
+async function queuedThenPolicyChange(t: test.TestContext, afterHold: 'releases' | 'refuses', history: 'clean' | 'retried' | 'dispatched' | 'attempted' | 'sibling' | 'failedSiblingNoId' | 'failedSiblingDispatched' | 'failedSiblingUnproven' | 'claimedSiblingMarkersNull' | 'provenSibling' = 'clean') {
   const db = await loadDb()
   await mockAccounting()
   switchOn = true
@@ -1480,7 +1480,10 @@ async function queuedThenPolicyChange(t: test.TestContext, afterHold: 'releases'
   if (history === 'failedSiblingNoId') await sibling({ status: 'FAILED', errorMessage: 'response lost' })               // no custody: nothing proves it never left
   if (history === 'failedSiblingUnproven') await sibling({ status: 'FAILED', errorMessage: 'response lost' })
   if (history === 'failedSiblingDispatched') await sibling({ status: 'FAILED', attemptStampingCustodyAt: new Date(), errorMessage: 'response lost' }, { createDispatchedAt: new Date(), createDispatchIdempotencyKey: 'k-sibling' })
-  if (history === 'provenSibling') await sibling({ status: 'FAILED', attemptStampingCustodyAt: new Date(), errorMessage: 'refused before anything was sent' })
+  // FAILED, CLAIMED once (revision 1) with every marker null: for an invoice the money stamps and the dispatch marker are never written, so this row may well have reached Xero and lost its response.
+  if (history === 'claimedSiblingMarkersNull') await sibling({ status: 'FAILED', attemptStampingCustodyAt: new Date(), attemptRevision: 1, errorMessage: 'response lost' })
+  // NEVER CLAIMED (revision 0, custody present, no id, no markers): nothing can have left it.
+  if (history === 'provenSibling') await sibling({ status: 'CANCELLED', attemptStampingCustodyAt: new Date(), attemptRevision: 0, errorMessage: 'retired before any claim' })
   const args = { attempt: { id: queued.id, attemptRevision: revision }, held: { heldFrom: () => startedAt }, referenceType: 'SalesOrder', referenceId: orderId, payload: queued.payload as unknown as Record<string, unknown> }
   const first = await holdInvoiceOnRegimePolicyChange(args as never)
   const second = await holdInvoiceOnRegimePolicyChange(args as never)
@@ -1508,7 +1511,7 @@ test('[eu vat] ROUND TRIP: a queued treated invoice whose cut-in changed is supe
   const { afterPark, rows, holdAfter, gate } = await queuedThenPolicyChange(t, 'releases')
   assert.equal(afterPark.first.kind, 'held')
   assert.deepEqual([afterPark.eventAfterPark.status, afterPark.eventAfterPark.voidBasis], ['VOID', 'attempt_settled_not_posted'], 'the mirrored event is voided as a retired ATTEMPT (revivable), never as a cancelled sale')
-  assert.equal(afterPark.second.kind, 'lost', 'a second handling of the same attempt finds the row already moved on and changes nothing')
+  assert.notEqual(afterPark.second.kind, 'held', 'a second handling of the same attempt finds the row already moved on (it is no longer a first claim) and supersedes nothing again')
   assert.equal(afterPark.retired.status, 'CANCELLED')
   assert.match(afterPark.retired.errorMessage ?? '', /^Superseded: the EU VAT regime settings changed since this invoice was prepared.*re-import the order from WooCommerce/)
   assert.equal(afterPark.queuedRows, 1, 'only the superseded row exists: nothing new was queued while it was held')
@@ -1532,7 +1535,7 @@ test('[eu vat] ROUND TRIP: the same superseded invoice, re-imported under a cut-
 })
 
 // NOTHING IS SUPERSEDED WITHOUT DURABLE PROOF THAT NO CREATE WAS EVER DISPATCHED: a row whose earlier attempt may have created the invoice in Xero is left refused for ledger reconciliation (a release under a new idempotency key would bypass the prior-attempt check).
-for (const history of ['retried', 'dispatched', 'attempted', 'sibling', 'failedSiblingNoId', 'failedSiblingDispatched', 'failedSiblingUnproven'] as const) {
+for (const history of ['retried', 'dispatched', 'attempted', 'sibling', 'failedSiblingNoId', 'failedSiblingDispatched', 'failedSiblingUnproven', 'claimedSiblingMarkersNull'] as const) {
   test(`[eu vat] a policy change on a row with prior history (${history}) is NOT superseded: no hold, the row and its mirror are untouched, and the refusal says to reconcile with Xero first`, { skip }, async (t) => {
     const { blocked: found } = await queuedThenPolicyChange(t, 'releases', history)
     const blocked = found!
@@ -1651,8 +1654,8 @@ test('[eu vat] the SWEEP gives a held invoice whose ACCOUNT setting changed the 
   assert.match(after.errorMessage ?? '', /account setting\(s\) changed since it was parked \(ioss\).*re-importing the order alone will not release it: restore the previous account setting\(s\) in Settings > Accounting, then re-import/)
 })
 
-test('[eu vat] a FAILED sibling row PROVEN never to have reached Xero (custody, no stamp, no dispatch record, no id) does NOT block the supersede', { skip }, async (t) => {
+test('[eu vat] a NEVER-CLAIMED sibling row (revision 0, custody present, no id, no markers) does NOT block the supersede', { skip }, async (t) => {
   const result = await queuedThenPolicyChange(t, 'releases', 'provenSibling')
-  assert.equal(result.afterPark.first.kind, 'held', 'superseded and parked: the sibling is proven unsent')
+  assert.equal(result.afterPark.first.kind, 'held', 'superseded and parked: the sibling was never claimed')
   assert.equal(result.rows.length, 1, 'and the re-import released it')
 })
