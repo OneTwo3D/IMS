@@ -790,6 +790,13 @@ const RESET_DISPATCH_FAILURES = {
   cancelNoticeCommentAt: null,
 } satisfies LinkWrite
 
+/**
+ * How long a link's amendment lease lasts. The sweep is not single-flight, so a lease is what keeps two sweeps from amending one warehouse
+ * order. An expired lease leaves the untrusted-ids mark set; the next owner re-reads before anything is trusted. A remote write that stalls
+ * past this (several request timeouts) is the accepted limit.
+ */
+export const AMEND_LEASE_TTL_MS = 10 * 60_000
+
 /** Where the held create pass's walk stands (a Setting). Cleared when a page comes back short. */
 export const HELD_CREATE_CURSOR_KEY = 'wms_order_push_held_create_cursor'
 
@@ -1031,10 +1038,14 @@ export interface WmsOrderPushPort {
    */
   replaceOrderItems?(orderId: string, externalOrderId: string, items: WmsOrderItemRef[], token?: string): Promise<void>
   /**
-   * Mark the link's recorded line ids as untrustworthy under a NEW generation token and return it (`unsafe` true), or clear the mark ONLY
-   * while the link still holds `token` (`unsafe` false; a stale owner's call is a no-op). While marked, readOrderItems answers none.
+   * `unsafe` true: take the link's AMENDMENT LEASE by compare-and-set (free, expired or already ours) and mark its recorded line ids
+   * untrustworthy under a NEW generation token, which is returned; null when another owner's lease is live (the caller skips the link).
+   * `unsafe` false: clear the mark and the lease ONLY while the link still holds `token` (a stale owner's call is a no-op).
+   * While marked or leased, readOrderItems answers none.
    */
-  setLineIdsUnsafe?(linkId: string, unsafe: boolean, token?: string): Promise<string>
+  setLineIdsUnsafe?(linkId: string, unsafe: boolean, token?: string): Promise<string | null>
+  /** Release the lease held under `token` WITHOUT clearing the mark (an amendment that failed: the ids stay untrusted). */
+  releaseAmendLease?(linkId: string, token: string): Promise<void>
   /** Forget these recorded line ids (lines IMS removed from a merged order). */
   dropOrderItems?(linkId: string, externalItemIds: string[]): Promise<void>
   /** SYNCED links whose order is ON_HOLD. */
@@ -2972,7 +2983,10 @@ export async function runWmsOrderPushSweepCore(
         // FAIL CLOSED: the recorded line ids are marked untrustworthy BEFORE anything is sent. They are trusted again only when a verified
         // fresh snapshot is stored below (replaceOrderItems clears the mark) or the amendment provably changed nothing. A crash, a partial
         // amendment or a failed cleanup therefore always leaves them untrusted. If the mark cannot be written, nothing is sent.
-        lineToken = await port.setLineIdsUnsafe?.(link.id, true)
+        const acquired = await port.setLineIdsUnsafe?.(link.id, true)
+        // Another sweep holds this link's amendment lease: the link stays due and is neither amended, stamped nor noticed here.
+        if (acquired === null) continue
+        lineToken = acquired
         update = await connector.updateOrder(link.externalOrderId, input, amendSeam.clearance)
         if (!update.updated) await port.setLineIdsUnsafe?.(link.id, false, lineToken).catch(() => {}) // nothing was written: the ids still describe the order
         // The warehouse order is a MERGED order (the absorbing order keeps the survivor's id, so this link can still name it as a plain
@@ -3029,6 +3043,8 @@ export async function runWmsOrderPushSweepCore(
       } catch (error) {
         const message = scrubWmsError(error, 'WMS order update failed')
         result.failed += 1
+        // The lease is released (the mark stays set: the ids remain untrusted until a verified snapshot is stored).
+        if (lineToken) await port.releaseAmendLease?.(link.id, lineToken).catch(() => {})
         // The order post was accepted and the item reconcile failed: the courier on the WMS order has already changed, so its
         // form and warning are settled now, and the link stays due (no pushedAt) for the items to be redone.
         // The order post was accepted but the line amendment did not finish: the lines on the warehouse order are in an unknown state, so
@@ -3752,8 +3768,8 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       }).then((rows) => rows.map(({ order, ...link }) => ({ ...link, orderNumber: order.orderNumber })) as WmsPushLinkRef[]),
     async readOrderItems(linkId) {
       // A link whose ids are marked untrustworthy has no usable record: the merged-order removal then falls back to the notice.
-      const mark = await db.wmsOrderPushLink.findUnique({ where: { id: linkId }, select: { lineSnapshotUnsafeAt: true } })
-      if (!mark || mark.lineSnapshotUnsafeAt) return []
+      const mark = await db.wmsOrderPushLink.findUnique({ where: { id: linkId }, select: { lineSnapshotUnsafeAt: true, amendLeaseExpiresAt: true } })
+      if (!mark || mark.lineSnapshotUnsafeAt || (mark.amendLeaseExpiresAt && mark.amendLeaseExpiresAt > new Date())) return []
       const rows = await db.wmsOrderPushItem.findMany({ where: { linkId }, orderBy: { createdAt: 'asc' } })
       return rows.map((row) => ({ externalItemId: row.externalItemId, sku: row.sku, quantity: row.quantity }))
     },
@@ -3762,8 +3778,9 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         const link = await tx.wmsOrderPushLink.findUnique({ where: { orderId }, select: { id: true } })
         if (!link) return
         // With a token this is a COMPARE-AND-SET on the link still holding it, taken FIRST so the row lock serialises overlapping
-        // amendments: a stale owner (a newer amendment marked the link since) changes nothing and leaves the mark set.
-        const data = { lineSnapshotUnsafeAt: null, lineSnapshotToken: null }
+        // amendments: a stale owner (a newer amendment marked the link since) changes nothing and leaves the mark set. It also releases
+        // the amendment lease.
+        const data = { lineSnapshotUnsafeAt: null, lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null }
         if (token !== undefined) {
           const won = await tx.wmsOrderPushLink.updateMany({ where: { id: link.id, lineSnapshotToken: token }, data })
           if (won.count === 0) return
@@ -3782,11 +3799,21 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     async setLineIdsUnsafe(linkId, unsafe, token) {
       if (unsafe) {
         const fresh = randomUUID()
-        await db.wmsOrderPushLink.update({ where: { id: linkId }, data: { lineSnapshotUnsafeAt: new Date(), lineSnapshotToken: fresh } })
-        return fresh
+        const now = new Date()
+        const won = await db.wmsOrderPushLink.updateMany({
+          where: { id: linkId, OR: [{ amendLeaseExpiresAt: null }, { amendLeaseExpiresAt: { lt: now } }] },
+          data: { lineSnapshotUnsafeAt: now, lineSnapshotToken: fresh, amendLeaseOwner: fresh, amendLeaseExpiresAt: new Date(now.getTime() + AMEND_LEASE_TTL_MS) },
+        })
+        return won.count === 1 ? fresh : null
       }
-      await db.wmsOrderPushLink.updateMany({ where: { id: linkId, lineSnapshotToken: token ?? '' }, data: { lineSnapshotUnsafeAt: null, lineSnapshotToken: null } })
+      await db.wmsOrderPushLink.updateMany({
+        where: { id: linkId, lineSnapshotToken: token ?? '' },
+        data: { lineSnapshotUnsafeAt: null, lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null },
+      })
       return token ?? ''
+    },
+    async releaseAmendLease(linkId, token) {
+      await db.wmsOrderPushLink.updateMany({ where: { id: linkId, amendLeaseOwner: token }, data: { amendLeaseOwner: null, amendLeaseExpiresAt: null } })
     },
     async dropOrderItems(linkId, externalItemIds) {
       await db.wmsOrderPushItem.deleteMany({ where: { linkId, externalItemId: { in: externalItemIds } } })

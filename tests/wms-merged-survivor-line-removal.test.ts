@@ -983,3 +983,30 @@ test('GENERATION TOKEN: the amendment passes the token its own mark returned to 
     assert.ok(b.store.tokens.includes('tok-1'), 'the un-mark carried the owner token')
   })
 })
+
+// ---------------------------------------------------------------- 14. review round 7 -----------------------------------------------
+
+test('LEASE: when another sweep holds the link\'s amendment lease, the link is skipped: no remote amendment, no link write, no notice', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const { h } = snapshotPort(storedD)
+    h.port.setLineIdsUnsafe = async () => null
+    let sent = 0
+    const result = await sweep(h.port, { updateOrder: async () => { sent += 1; return { updated: true, status: 'NEW' } } })
+    assert.equal(sent, 0)
+    assert.deepEqual(h.writes, [])
+    assert.equal(result.failed, 0)
+  })
+})
+
+test('LEASE: a failed amendment releases the lease but leaves the ids untrusted (the mark stays)', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const { h, store } = snapshotPort(storedD)
+    const released: string[] = []
+    h.port.releaseAmendLease = async (_id, token) => { released.push(token) }
+    await sweep(h.port, { updateOrder: async () => { throw new Error('mintsoft down') } })
+    assert.deepEqual(released, ['tok-1'])
+    assert.equal(store.unsafe, true)
+  })
+})

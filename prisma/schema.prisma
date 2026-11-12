@@ -3971,6 +3971,11 @@ model WmsOrderPushLink {
   /// The generation of the amendment that set the mark above. Only the amendment holding the CURRENT token may store a replacement snapshot
   /// or clear the mark (compare-and-set), so an older amendment finishing late cannot make a newer one's stale state look trustworthy.
   lineSnapshotToken     String?   @map("line_snapshot_token")
+  /// A durable lease on the amendment of this link's warehouse order: set (compare-and-set) before the remote call, released after the
+  /// snapshot write. While another owner's lease is live the link is skipped; an expired lease leaves the unsafe mark set. The owner is the
+  /// same generation token as above.
+  amendLeaseOwner       String?   @map("amend_lease_owner")
+  amendLeaseExpiresAt   DateTime? @map("amend_lease_expires_at")
   holdNoticeCommentAt   DateTime? @map("hold_notice_comment_at")
   cancelNoticeCommentAt DateTime? @map("cancel_notice_comment_at")
   createdAt           DateTime          @default(now())
