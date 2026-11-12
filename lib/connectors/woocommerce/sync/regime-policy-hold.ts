@@ -59,9 +59,14 @@ function neverClaimed(row: { attemptRevision: number; createDispatchedAt: Date |
 /**
  * THE CURRENT ROW: the claim THIS worker holds is the first claim the row has ever had (revision 1, custody present, so no earlier claim by any processor), no document id and no dispatch marker or key. The supersede runs at the head of the poster case, before the number fence and the
  * remote-write fence of this claim, so nothing has left in it yet. A retry (revision >= 2), or a row a non-stamping binary ever claimed (custody gone), is never provably unsent.
+ *
+ * ACCEPTED LIMIT, documented rather than closed with new machinery: a binary OLDER than this change claims and sends without bumping the revision, its claim clears custody, and if the response is lost the current binary's claim bumps 0 to 1 and restores custody, so this proof
+ * cannot tell that row from a clean one. (The retry count and error note above catch a row that recorded its failure, not one that never wrote it.) It needs a row last claimed by a pre-revision binary, and the deployment facts rule that out: production is installed fresh (no
+ * pre-existing rows), the stage's Xero outbound is held (no stage invoice has ever been sent), and a deploy stops the service before starting the new one, so old and new binaries never run side by side.
  */
-function firstClaimNothingSent(row: { attemptRevision: number; createDispatchedAt: Date | null; createDispatchIdempotencyKey: string | null; remoteAttemptedAt: Date | null; attemptStampingCustodyAt: Date | null; externalTransactionId: string | null }): boolean {
-  return row.attemptRevision === 1 && row.attemptStampingCustodyAt !== null && row.remoteAttemptedAt === null && row.externalTransactionId === null && row.createDispatchedAt === null && row.createDispatchIdempotencyKey === null
+function firstClaimNothingSent(row: { retryCount: number; errorMessage: string | null; attemptRevision: number; createDispatchedAt: Date | null; createDispatchIdempotencyKey: string | null; remoteAttemptedAt: Date | null; attemptStampingCustodyAt: Date | null; externalTransactionId: string | null }): boolean {
+  // Belt and braces on existing columns: a row that has ever failed carries a retry count and an error note, so a first claim with either is not a clean first claim.
+  return row.retryCount === 0 && row.errorMessage === null && row.attemptRevision === 1 && row.attemptStampingCustodyAt !== null && row.remoteAttemptedAt === null && row.externalTransactionId === null && row.createDispatchedAt === null && row.createDispatchIdempotencyKey === null
 }
 
 export async function holdInvoiceOnRegimePolicyChange(params: {
@@ -90,7 +95,7 @@ export async function holdInvoiceOnRegimePolicyChange(params: {
     // socket) and no dispatch key; no remote-attempt stamp under custody (`attemptProvenNeverMade`); no document id; and no other live or posted sales-invoice row for the order. Anything else is ambiguous and is left refused for ledger reconciliation.
     const row = await tx.accountingSyncLog.findUnique({
       where: { id: params.attempt.id },
-      select: { attemptRevision: true, createDispatchedAt: true, createDispatchIdempotencyKey: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true, externalTransactionId: true },
+      select: { retryCount: true, errorMessage: true, attemptRevision: true, createDispatchedAt: true, createDispatchIdempotencyKey: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true, externalTransactionId: true },
     })
     // EVERY other sales-invoice row for the order, in any status: unless it was NEVER CLAIMED (see neverClaimed: the money stamps prove nothing for an invoice), it is ambiguous, whatever its fields say. A FAILED row with no document id, after a lost response, is exactly that: a rebuilt
     // invoice released under a new idempotency key would be created again beside it. A row this flow superseded earlier was claimed too, so it blocks a later supersede as well: conservative, and a person reconciles it.
