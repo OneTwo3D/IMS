@@ -804,7 +804,7 @@ export const AMEND_LEASE_TTL_MS = 10 * 60_000
 export const HELD_CREATE_CURSOR_KEY = 'wms_order_push_held_create_cursor'
 
 export type WmsPushCandidate = OrderForPush & { shipFromWarehouseId: string | null; pushAttempts: number }
-export type WmsPushUpdateLink = { id: string; externalOrderId: string | null; courierForm?: string | null; courierFormName?: string | null; order: OrderForPush & { shipFromWarehouseId: string | null } }
+export type WmsPushUpdateLink = { id: string; externalOrderId: string | null; courierForm?: string | null; courierFormName?: string | null; amendNoticeAt?: Date | null; order: OrderForPush & { shipFromWarehouseId: string | null } }
 /**
  * o3d-92fu: a VALIDATION_FAILED link plus the order data the payload is rebuilt from.
  * `lastError` is carried so a re-run that fails for the SAME reason can re-stamp the
@@ -3039,6 +3039,23 @@ export async function runWmsOrderPushSweepCore(
           if (markWasAlreadySet) await port.releaseAmendLease?.(link.id, lineToken).catch(() => {})
           else await port.setLineIdsUnsafe?.(link.id, false, lineToken).catch(() => {})
         }
+        // NOT flagged merged, but the warehouse order no longer carries the number IMS pushed: nothing was written and the link is NOT moved
+        // to MERGED (it proves nothing about a merge). A durable notice is set ONCE (only while none is set, so it does not repeat every sweep);
+        // the amendment stays due, so once the number matches again or the flag appears the normal paths take over.
+        if (update.status === 'ORDER_NUMBER_MISMATCH') {
+          if (!link.amendNoticeAt) {
+            await port.updateLink(link.id, {
+              amendNoticeAt: ts, lastAttemptAt: ts,
+              lastError: `The warehouse order number no longer matches IMS (now ${scrubWmsError(update.observedOrderNumber ?? '?', 'unknown')}); this order's change was NOT sent. Check whether the warehouse order was merged or renamed and apply the change there by hand.`,
+            })
+            await audit({
+              action: 'order_update', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,
+              summary: `Order ${link.order.orderNumber ?? link.order.id} amendment NOT propagated — the WMS order number no longer matches IMS; left for an operator`,
+              before: { state: 'SYNCED', externalOrderId: link.externalOrderId }, after: { propagated: false, wmsStatus: update.status }, error: 'Amendment refused: WMS order number mismatch',
+            })
+          }
+          continue
+        }
         // The warehouse order is a MERGED order (the absorbing order keeps the survivor's id, so this link can still name it as a plain
         // order): nothing was written. The link is re-pointed as MERGED so no later pass amends it, and the change is left for a person.
         if (update.status === 'MERGED_SURVIVOR') {
@@ -3077,6 +3094,7 @@ export async function runWmsOrderPushSweepCore(
         await port.updateLink(link.id, {
           lastAttemptAt: ts,
           ...(settled.retryable ? {} : { pushedAt: ts }),
+          ...(update.updated && link.amendNoticeAt ? { amendNoticeAt: null } : {}),
           lastError: settled.retryable ? 'Courier warning not posted on the WMS order; will retry' : update.updated ? null : `Amendment not propagated (WMS status ${update.status})`,
           ...settled.linkFields,
         })
@@ -3709,7 +3727,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       if (!dueIds.length) return []
       return db.wmsOrderPushLink.findMany({
         where: { id: { in: dueIds } },
-        select: { id: true, externalOrderId: true, courierForm: true, courierFormName: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, updatedAt: true } } },
+        select: { id: true, externalOrderId: true, courierForm: true, courierFormName: true, amendNoticeAt: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, updatedAt: true } } },
       })
     },
     async revalidatableLinks(connector, boundWarehouseIds, limit, paidNotBefore) {

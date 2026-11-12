@@ -883,11 +883,17 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
   const clientId = await getPushClientId('Mintsoft order update')
   const { found, isNew, merged, orderNumber } = await fetchMintsoftOrderStatusId(externalOrderId, clientId)
   if (!found) return { updated: false, status: 'NOT_FOUND' }
-  // A MERGED order (flagged MergedOrder=True, or no longer carrying this order's own number but a combined "a+b" one) holds other
-  // orders' goods. The ABSORBING order keeps the survivor's id, so its link can still name it. Amending it would diff ALL of its lines
-  // against this one order's and delete or consolidate the other order's: refused BEFORE any order post or item write.
-  if (merged || (orderNumber !== null && orderNumber !== input.orderNumber && orderNumber.includes('+'))) {
+  // A MERGED order (flagged MergedOrder=True) holds other orders' goods. The ABSORBING order keeps the survivor's id, so its link can
+  // still name it. Amending it would diff ALL of its lines against this one order's and delete or consolidate the other order's: refused
+  // BEFORE any order post or item write, and the link is handed to the merged paths.
+  if (merged) {
     return { updated: false, status: 'MERGED_SURVIVOR', ...(orderNumber ? { mergedSurvivorNumber: orderNumber } : {}) }
+  }
+  // NOT flagged, but the order no longer carries the number IMS pushed (a merge whose flag is missing, or a rename): the same safety, no
+  // item or order write, but it proves nothing about a merge, so the link is NOT moved to MERGED. The caller raises a durable notice and
+  // leaves the amendment due.
+  if (orderNumber !== null && orderNumber !== input.orderNumber) {
+    return { updated: false, status: 'ORDER_NUMBER_MISMATCH', observedOrderNumber: orderNumber }
   }
   if (!isNew) return { updated: false, status: 'NOT_NEW' }
 

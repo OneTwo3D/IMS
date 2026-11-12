@@ -530,6 +530,8 @@ export type WmsOrderUpdateResult = {
   courierFormName?: string | null
   /** Set with status MERGED_SURVIVOR: the order is itself a merged order, so NOTHING was amended; this is the warehouse's number for it. */
   mergedSurvivorNumber?: string
+  /** Set with status ORDER_NUMBER_MISMATCH: the order is NOT flagged merged but no longer carries the number IMS pushed (this is what it carries now); nothing was amended. */
+  observedOrderNumber?: string
   /** True when the amendment ended on the configured default courier: the warehouse should confirm the courier. */
   courierFallback?: boolean
   /** The warehouse order's lines as they stand after the amendment (a re-read), so the stored line ids stay current. Absent when unread. */

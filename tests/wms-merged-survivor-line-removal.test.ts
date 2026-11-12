@@ -898,12 +898,34 @@ test('ABSORBING ORDER changed in IMS while its link is still SYNCED (survivor fl
   })
 })
 
-test('ABSORBING ORDER, merge flag absent but the number is now a combined "a+b" one: the amendment is refused the same way', async () => {
+test('UNFLAGGED NUMBER MISMATCH (a "+" number, flag absent): NO order or item write, the link STAYS SYNCED, the durable notice is set ONCE across two sweeps, and the amendment stays due', async () => {
   await withEnv(OFF, async () => {
     const { h } = await amendAbsorbing(false)
-    assert.deepEqual(writeRequests(), [])
+    assert.deepEqual(writeRequests(), [], 'no order or item write')
     assert.equal(survivorItems().length, 4)
-    assert.ok(h.writes.some((w) => w.data.state === 'MERGED'))
+    assert.equal(h.writes.some((w) => w.data.state !== undefined), false, 'the link was NOT moved to MERGED')
+    const notices = () => h.writes.filter((w) => w.data.amendNoticeAt instanceof Date)
+    assert.equal(notices().length, 1)
+    assert.match(String(notices()[0].data.lastError), /no longer matches IMS \(now IMSTEST-E\+IMSTEST-D\).*NOT sent/)
+    assert.equal(h.writes.some((w) => 'pushedAt' in w.data), false, 'the amendment stays due')
+    // A second sweep sees the notice already set and writes it no more.
+    const noticeAt = notices()[0].data.amendNoticeAt as Date
+    h.port.updatableLinks = async () => [{ ...updatableLink(), externalOrderId: SURVIVOR, amendNoticeAt: noticeAt }] as never
+    const orderPush = await import('../lib/connectors/mintsoft/api/order-push.ts')
+    await sweep(h.port, { updateOrder: async (id: string, input: never) => orderPush.updateMintsoftOrder(id, input) })
+    assert.equal(notices().length, 1, 'set once, not every sweep')
+    assert.deepEqual(writeRequests(), [])
+  })
+})
+
+test('A LATER SUCCESSFUL AMENDMENT clears the mismatch notice', async () => {
+  await withEnv(OFF, async () => {
+    resetFake()
+    fake.orders.set(SURVIVOR, { status: 9, number: 'IMSTEST-D', items: [...D_LINES], merged: false })
+    const { h } = snapshotPort(storedD)
+    h.port.updatableLinks = async () => [{ ...updatableLink(), externalOrderId: SURVIVOR, amendNoticeAt: new Date() }] as never
+    await sweep(h.port, { updateOrder: async () => ({ updated: true, status: 'NEW' }) })
+    assert.ok(h.writes.some((w) => w.data.amendNoticeAt === null && 'pushedAt' in w.data))
   })
 })
 

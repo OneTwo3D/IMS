@@ -179,3 +179,14 @@ test('ACKNOWLEDGE: an order with no link is refused and nothing is written', asy
   assert.equal(result.success, false)
   assert.deepEqual(state.linkUpdates, [])
 })
+
+test('INBOX ROW: a SYNCED link with an amendment notice is the order-number-mismatch row, acknowledgeable, with its own guidance', async () => {
+  const { buildBlockedWmsPushRow } = await import('../lib/domain/wms/push-recovery-affordance.ts')
+  const row = buildBlockedWmsPushRow({
+    orderId: 'so-1', connector: 'mintsoft', state: 'SYNCED', attempts: 0, externalOrderId: 'M-1', pushedAt: new Date(), lastError: 'now X',
+    lastAttemptAt: new Date(), amendNoticeAt: new Date(), order: { id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: null },
+  })
+  assert.equal(row.why, 'Change not sent to the warehouse (order number mismatch)')
+  assert.equal(row.acknowledgeable, true)
+  assert.match(String(row.replayRefusal), /order number no longer matches IMS.*merged or renamed/)
+})

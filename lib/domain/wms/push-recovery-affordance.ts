@@ -152,7 +152,8 @@ export function decideWmsPushReplay(
 export function describeBlockedWmsPush(link: WmsPushReplayEvidence & WmsPushNoticeEvidence): string {
   if (link.holdNoticeAt && (link.state === 'SYNCED' || link.state === 'MERGED')) return 'Hold not honoured by the warehouse'
   if (link.cancelNoticeAt && (link.state === 'SYNCED' || link.state === 'MERGED')) return 'Cancel not honoured by the warehouse'
-  if (link.amendNoticeAt && (link.state === 'SYNCED' || link.state === 'MERGED')) return 'Change not sent to the warehouse (merged order)'
+  if (link.amendNoticeAt && link.state === 'SYNCED') return 'Change not sent to the warehouse (order number mismatch)'
+  if (link.amendNoticeAt && link.state === 'MERGED') return 'Change not sent to the warehouse (merged order)'
   if (link.state === 'VALIDATION_FAILED') return 'Payload invalid'
   if (link.externalOrderId) return 'Linked, unverified'
   if (link.state === 'AMBIGUOUS_CREATE') return 'Create outcome unknown'
@@ -247,6 +248,7 @@ function noticeGuidance(link: WmsPushReplayEvidence & WmsPushNoticeEvidence): st
   if (link.state !== 'SYNCED' && link.state !== 'MERGED') return null
   if (link.holdNoticeAt) return 'IMS could not hold this order in the warehouse. The link is still live, so a despatch is still recorded. Ask the warehouse to pause it, or leave it to ship.'
   if (link.cancelNoticeAt) return 'IMS could not cancel this order in the warehouse. The link is still live; a despatch that follows is raised here for you, never applied to the cancelled order. Raise a cancellation query in the warehouse.'
+  if (link.amendNoticeAt && link.state === 'SYNCED') return 'IMS did not send this order\'s latest change to the warehouse because the warehouse order number no longer matches IMS. Check whether the warehouse order was merged or renamed and apply the change there by hand, then acknowledge it here. IMS keeps the change due and will send it itself once the number matches again.'
   if (link.amendNoticeAt) return 'IMS did not send this order\'s latest change to the warehouse because the warehouse merged it into another order and amending it would alter the other order\'s lines. Apply the change in the warehouse by hand, then acknowledge it here.'
   return null
 }
