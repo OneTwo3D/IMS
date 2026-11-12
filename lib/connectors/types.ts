@@ -6,6 +6,7 @@
  */
 
 import type { SalesNoTaxLineKind } from '@/lib/domain/accounting/sales-document-tax-types'
+import type { PurchaseNoTaxLineKind } from '@/lib/domain/accounting/purchase-document-tax-types'
 
 // ---------------------------------------------------------------------------
 // Shopping Connector
@@ -171,9 +172,9 @@ export type InvoiceLine = {
   /**
    * Why this SALES line may carry no tax (taxType NONE). A sales invoice or credit-note line with no `taxType` is refused, and an
    * explicit NONE is refused unless this names an allowed kind: lib/domain/accounting/sales-document-tax-types.ts. Never sent to
-   * the accounting system, and ignored on purchase documents.
+   * the accounting system. A supplier bill or supplier credit-note line follows the same rule with its own kinds (lib/domain/accounting/purchase-document-tax-types.ts).
    */
-  noTaxKind?: SalesNoTaxLineKind
+  noTaxKind?: SalesNoTaxLineKind | PurchaseNoTaxLineKind
   /**
    * Per-line discount amount (in the invoice currency, same tax convention
    * as `unitAmount`). Generic across connectors — each connector decides how

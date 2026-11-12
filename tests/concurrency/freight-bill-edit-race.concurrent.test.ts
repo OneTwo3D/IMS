@@ -1,6 +1,6 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
-import test, { mock } from 'node:test'
+import test, { after, mock } from 'node:test'
 
 import { loadEnv, uid } from './po-landed-fixtures'
 
@@ -14,6 +14,16 @@ import { loadEnv, uid } from './po-landed-fixtures'
 
 const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const SKIP = { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' } as const
+
+// The mapped rate this file gives its supplier is removed afterwards: the shared scratch database is read by later files (the reconciliation pack compares the IMS rate set with the
+// stored Xero list), and a leftover rate of ours would be a difference they did not expect.
+const fixtureRateIds: string[] = []
+after(async () => {
+  if (fixtureRateIds.length === 0) return
+  const { db } = await import('@/lib/db')
+  await db.supplier.updateMany({ where: { taxRateId: { in: fixtureRateIds } }, data: { taxRateId: null } })
+  await db.taxRate.deleteMany({ where: { id: { in: fixtureRateIds } } })
+})
 
 mock.module('@/lib/auth/server', {
   namedExports: {
@@ -52,7 +62,11 @@ async function seedMixedFreight() {
   const product = await db.product.create({ data: { sku: tag, name: `fbrace`, type: 'SIMPLE', countryOfOrigin: 'CN' }, select: { id: true } })
   const warehouse = await db.warehouse.create({ data: { code: `${uid()}-W`, name: `${tag} wh`, type: 'STANDARD' }, select: { id: true } })
   await db.stockLevel.create({ data: { productId: product.id, warehouseId: warehouse.id, quantity: '0', reservedQty: '0' } })
-  const supplier = await db.supplier.create({ data: { name: `${tag} supplier`, currency: 'GBP' }, select: { id: true } })
+  // A bill going to the ledger is not saved with an undecided tax type, and an earlier file in this tier can leave accounting sync switched on in the shared database: the freight order is charged at
+  // 20%, so its supplier's default is a mapped 20% purchase rate (the supplier's own default is what decides among several 20% rates).
+  const vatRate = await db.taxRate.create({ data: { name: `${tag} vat20`, rate: '0.2', usedFor: 'PURCHASE', accountingTaxType: 'INPUT2', active: true }, select: { id: true } })
+  fixtureRateIds.push(vatRate.id)
+  const supplier = await db.supplier.create({ data: { name: `${tag} supplier`, currency: 'GBP', taxRateId: vatRate.id }, select: { id: true } })
   const goods = await createPurchaseOrder({
     reference: tag, supplierId: supplier.id, currency: 'GBP', destinationWarehouseId: warehouse.id,
     pricesIncludeVat: false, taxRateValue: 0,

@@ -64,7 +64,7 @@ const base: CreditNoteData = {
   contactName: 'Freight Co',
   date: '2026-08-20',
   currency: 'GBP',
-  lines: [{ description: 'Duplicate freight bill credit', quantity: 1, unitAmount: 120, accountCode: '6200', taxType: 'NONE' }],
+  lines: [{ description: 'Duplicate freight bill credit', quantity: 1, unitAmount: 120, accountCode: '6200', taxType: 'NONE', noTaxKind: 'no-vat-rate' }],
   reference: 'PO-ABC',
 }
 
@@ -297,7 +297,7 @@ test('a supplier credit note missing an account code is refused before any call 
   // Deliberately NO lookup seam, so a fence that ran ahead of the validation would show up as a GET.
   const result = await pushPurchaseCreditNote({
     ...base,
-    lines: [{ description: 'Freight credit', quantity: 1, unitAmount: 120, accountCode: '' }],
+    lines: [{ description: 'Freight credit', quantity: 1, unitAmount: 120, accountCode: '', taxType: 'INPUT2' }],
   }, 'AUTHORISED', { firstAttempt: true, creditNote: CN })
 
   assert.equal(result.success, false)

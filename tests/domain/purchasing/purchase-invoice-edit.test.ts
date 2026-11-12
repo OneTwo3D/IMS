@@ -44,7 +44,7 @@ const poLineById = new Map<string, PurchaseInvoicePoLine>([
     id: 'po-line-1',
     qty: 5,
     product: { sku: 'SKU-1' },
-    taxRate: { accountingTaxType: 'INPUT2' },
+    taxRate: { accountingTaxType: 'INPUT2', rate: '0.2000' },
   }],
 ])
 
@@ -147,8 +147,7 @@ test('calculatePurchaseInvoice builds shared totals and accounting lines for pro
     ],
     fxRateToBase: 2,
     poReference: 'PO-1',
-    poSubtotalForeign: 100,
-    poTaxForeign: 20,
+    poTaxRatePercent: '0.2',
     transitAccount: '1400',
     fallbackTaxType: 'INPUT',
     poLineById,
@@ -213,7 +212,8 @@ test('calculatePurchaseInvoice builds shared totals and accounting lines for pro
       quantity: 1,
       unitAmount: 3,
       accountCode: '1400',
-      taxType: undefined,
+      taxType: 'NONE',
+      noTaxKind: 'cost-not-vatable',
     },
   ])
 })
@@ -352,8 +352,6 @@ test('calculatePurchaseInvoice swaps taxType to reverseChargeTaxType when poLine
     ],
     fxRateToBase: 1,
     poReference: 'PO-1',
-    poSubtotalForeign: 200,
-    poTaxForeign: 40,
     transitAccount: 'TRANSIT',
     fallbackTaxType: 'NONE',
     reverseChargeTaxType: 'REVERSECHARGES',
@@ -377,8 +375,6 @@ test('calculatePurchaseInvoice falls back to baseTaxType when reverseChargeTaxTy
     lines: [{ kind: 'product', poLineId: 'po-line-rc', qtyBilled: 1, unitCostForeign: 100 }],
     fxRateToBase: 1,
     poReference: 'PO-1',
-    poSubtotalForeign: 100,
-    poTaxForeign: 0,
     transitAccount: 'TRANSIT',
     fallbackTaxType: 'NONE',
     poLineById,

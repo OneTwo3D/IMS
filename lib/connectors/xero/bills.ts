@@ -7,7 +7,20 @@ import { findOrCreateContact } from './contacts'
 import { xeroDocumentRevisionAt } from './document-revision'
 import { foreignCurrencyRateProblem, isXeroForeignCurrencyRateError, xeroCurrencyRateOrRefuse } from './fx'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { purchaseDocumentTaxTypeRefusal } from '@/lib/domain/accounting/purchase-document-tax-types'
 import type { BillData, InvoiceLine } from '../types'
+
+/** A bill that would have posted a line with no decided tax type. Thrown by the builder; `preparePurchaseBillPayload` turns it into a refusal. */
+export class XeroPurchaseDocumentTaxTypeError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'XeroPurchaseDocumentTaxTypeError'
+  }
+}
+
+export function isXeroPurchaseDocumentTaxTypeError(error: unknown): error is XeroPurchaseDocumentTaxTypeError {
+  return error instanceof XeroPurchaseDocumentTaxTypeError
+}
 
 type XeroInvoiceResponse = {
   Invoices: Array<{
@@ -35,8 +48,11 @@ export function buildPurchaseBillPayload(
     rateToBase: data.currencyRateToBase,
     what: `Purchase bill ${data.invoiceNumber ?? '(no number)'}`,
   })
-  // Xero mandates TaxType on every line; "NONE" is the no-tax fallback.
-  const DEFAULT_TAX_TYPE = 'NONE'
+  // Xero mandates TaxType on every line, and there is NO default: a missing one is refused, an explicit NONE only where the
+  // line names why it carries no tax (lib/domain/accounting/purchase-document-tax-types.ts). Thrown here so a direct caller of
+  // the builder cannot produce a payload either; `preparePurchaseBillPayload` asks first so nothing is created in Xero.
+  const taxTypeRefusal = purchaseDocumentTaxTypeRefusal(`Purchase bill ${data.invoiceNumber ?? '(no number)'}`, data)
+  if (taxTypeRefusal) throw new XeroPurchaseDocumentTaxTypeError(taxTypeRefusal)
 
   // Build line items. Xero ACCPAY (bills) does NOT support DiscountRate at
   // the line level — so we apply any generic per-line `discountAmount` by
@@ -55,7 +71,7 @@ export function buildPurchaseBillPayload(
       Quantity: line.quantity,
       UnitAmount: effectiveUnitAmount,
       AccountCode: line.accountCode,
-      TaxType: line.taxType || DEFAULT_TAX_TYPE,
+      TaxType: line.taxType,
     }
     if (line.itemCode) xeroLine.ItemCode = line.itemCode
     return xeroLine
@@ -86,6 +102,10 @@ async function preparePurchaseBillPayload(
   status: string,
   opts?: { supplierId?: string; supplierEmail?: string },
 ): Promise<{ success: true; invoice: Record<string, unknown> } | { success: false; error: string }> {
+  // BEFORE every round trip: a line with no decided tax type leaves no trace in Xero.
+  const taxTypeRefusal = purchaseDocumentTaxTypeRefusal(`Purchase bill ${data.invoiceNumber ?? '(no number)'}`, data)
+  if (taxTypeRefusal) return { success: false, error: taxTypeRefusal }
+
   // o3d-q0x56.3: BEFORE the contact round trip, which creates a contact in Xero. A foreign bill with no usable rate leaves no trace.
   const baseCurrency = await getBaseCurrencyCode()
   const rateProblem = foreignCurrencyRateProblem({
@@ -115,7 +135,7 @@ async function preparePurchaseBillPayload(
       invoice: buildPurchaseBillPayload(data, status, contactResult.contactId, baseCurrency),
     }
   } catch (error) {
-    if (isXeroForeignCurrencyRateError(error)) return { success: false, error: error.message }
+    if (isXeroForeignCurrencyRateError(error) || isXeroPurchaseDocumentTaxTypeError(error)) return { success: false, error: error.message }
     throw error
   }
 }

@@ -1,7 +1,11 @@
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { rateBinding, resolvePurchaseLineTaxType } from '@/lib/accounting/reverse-charge'
 import { usableStoredFxRate } from '@/lib/currencies/stored-document-rate'
-import { addMoney, multiplyMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, roundMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { noVatRateKind, type PurchaseNoTaxLineKind } from '@/lib/domain/accounting/purchase-document-tax-types'
+import { effectiveTaxRateFromComponents } from '@/lib/tax/tax-rate-components'
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
+import { resolveOrderRateTaxCode, type OrderRateCandidate } from '@/lib/domain/purchasing/order-rate-tax-code'
 
 export type PurchaseInvoiceEditHeader = {
   invoiceNumber: string | null
@@ -37,7 +41,14 @@ export type PurchaseInvoicePoLine = {
    */
   qtyReturned?: unknown
   product: { sku: string }
-  taxRate?: { id?: string; accountingTaxType: string | null; reverseCharge?: boolean } | null
+  /**
+   * The line's own rate. `rate` is the stored fraction (0.2 = 20%). A compound rate has active `components`, and ITS effective rate is derived from
+   * them with the compound-rate maths the sales side and the tax-rate code use (lib/tax/tax-rate-components.ts), never from a line's rounded tax over its net.
+   */
+  taxRate?: { id?: string; accountingTaxType: string | null; reverseCharge?: boolean; rate?: unknown; isCompound?: boolean; components?: ReadonlyArray<{ rate: unknown; compoundOnPrevious?: boolean }> } | null
+  /** What the order line recorded when it was priced (stored tax and net), used only to check a reconstruction of a legacy bill line (see `BilledLineTaxTreatment.recordedRate`). */
+  taxForeign?: unknown
+  totalForeign?: unknown
 }
 
 export type PurchaseInvoiceCostLine = {
@@ -47,6 +58,21 @@ export type PurchaseInvoiceCostLine = {
   vatable: boolean
 }
 
+/**
+ * THE TAX TREATMENT A BILL LINE WAS BOOKED WITH (the snapshot stored on the line): the tax code sent (null = none could be decided), the effective rate as a fraction,
+ * the IMS rate it was read from, and whether it was reverse charge. An edit that does not change the tax passes it back in, and the line keeps exactly this treatment
+ * however the purchase order's rate has changed since.
+ */
+export type BookedLineTax = { taxType: string | null; rate: number | string; taxRateId: string | null; reverseCharge: boolean }
+
+/** A refusal with the operator's wording: a rate that cannot be used for a bill. Thrown by `calculatePurchaseInvoice`; the callers return `message`. */
+export class PurchaseBillTaxRefusal extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'PurchaseBillTaxRefusal'
+  }
+}
+
 export type PurchaseInvoiceInputLine =
   | {
       kind: 'product'
@@ -54,6 +80,8 @@ export type PurchaseInvoiceInputLine =
       poLineId: string
       qtyBilled: number
       unitCostForeign: number
+      /** The line's booked treatment (an edit of an existing line that has one): kept as it is instead of being re-derived from today's rates. */
+      booked?: BookedLineTax | null
     }
   | {
       kind: 'cost'
@@ -61,6 +89,7 @@ export type PurchaseInvoiceInputLine =
       costLineId: string
       description?: string | null
       amountForeign: number
+      booked?: BookedLineTax | null
     }
 
 export type PurchaseInvoiceLineDraft = {
@@ -80,15 +109,31 @@ export type PurchaseInvoiceAccountingLine = {
   unitAmount: number
   accountCode: string
   taxType?: string
+  /** Why this line may carry NONE (lib/domain/accounting/purchase-document-tax-types.ts); never sent to the ledger. */
+  noTaxKind?: PurchaseNoTaxLineKind
   /** The rate `taxType` was read from; never sent (the enqueue guard binds the code to it, lib/tax/retired-tax-code-guard.ts). */
   taxRateId?: string
   /** How `taxType` was derived from that rate (lib/accounting/reverse-charge.ts TaxBindingBasis); never sent. */
   taxRateBasis?: string
 }
 
+/** The VAT rate each accounting line was taxed at in IMS, aligned with `accountingLines`, so it can be checked against the rate its tax code charges. */
+export type PurchaseInvoiceLineTaxRate = {
+  description: string
+  taxType: string | undefined
+  /** Fraction (0.2 = 20%). */
+  rate: number
+  /** False for a reverse-charge line, whose code is a self-accounting one whose ledger rate is not the supplier's charge. */
+  checkable: boolean
+  /** The IMS rate the code was read from, and whether the line was reverse charge: with `taxType` and `rate`, the snapshot stored on the booked line. */
+  taxRateId?: string
+  reverseCharge: boolean
+}
+
 export type PurchaseInvoiceCalculation = {
   lineData: PurchaseInvoiceLineDraft[]
   accountingLines: PurchaseInvoiceAccountingLine[]
+  lineTaxRates: PurchaseInvoiceLineTaxRate[]
   subtotalForeign: number
   subtotalBase: number
   taxForeign: number
@@ -147,22 +192,106 @@ function assertPositiveFxRate(fxRate: number): void {
   }
 }
 
+/**
+ * A goods line's OWN VAT rate, as a fraction. A rate with active components takes its effective rate from them (the existing compound-rate maths); a simple
+ * rate is its stored value; a line with no rate row takes the order's rate. On a FREIGHT order every line is taxed at the order's recorded rate.
+ */
+export function purchaseLineOwnRate(poLine: PurchaseInvoicePoLine, orderRate: Decimal, freightOrder: boolean): Decimal {
+  if (freightOrder) return orderRate
+  const rate = poLine.taxRate
+  if (!rate) return orderRate
+  const components = (rate.components ?? []).map((component) => ({ rate: Number(component.rate), compoundOnPrevious: component.compoundOnPrevious === true }))
+  if (components.length > 0) {
+    const effective = effectiveTaxRateFromComponents(components)
+    if (effective != null) return toDecimal(effective)
+  }
+  return rate.rate != null ? toDecimal(String(rate.rate)) : orderRate
+}
+
+/**
+ * THE RATE A NEW GOODS LINE IS BILLED AT IS THE RATE ITS ORDER LINE WAS RECORDED AT.
+ *
+ * An order line stores the tax it was priced with (`taxForeign` over `totalForeign`) but not the rate; the rate editor refreshes those only for DRAFT orders, so a
+ * non-draft line recorded at 20% can sit on a rate row that now says 5%. The linked rate's current value is therefore checked against the recorded one:
+ *   - net of at least 1: the recorded rate is stored tax over stored net, read to the four places a rate is stored in. Within rounding of the current rate: the current rate
+ *     is used. Otherwise the line is put back on the RECORDED rate, with the code of an active purchase rate at that percentage (the order-rate resolver); with none, the
+ *     bill is refused;
+ *   - net below 1: the ratio cannot state a rate (rounding noise), and no rate is stored on the line, so the current rate is accepted only when its tax reproduces the
+ *     recorded tax within one minor unit, else refused;
+ *   - nothing recorded (a caller that did not read it): the current rate, as before.
+ * A reverse-charge or compound line that has diverged cannot be put back on a code safely: refused.
+ */
+function recordedLineRate(
+  poLine: PurchaseInvoicePoLine,
+  orderRate: Decimal,
+  currency: string,
+  candidates: ReadonlyArray<OrderRateCandidate> | undefined,
+): { rate: Decimal; code: { taxType: string; taxRateId: string } | null } | null {
+  const rateRow = poLine.taxRate
+  if (!rateRow || poLine.totalForeign == null || poLine.taxForeign == null) return null
+  const net = toDecimal(String(poLine.totalForeign))
+  if (net.lte(0)) return null
+  const recordedTax = toDecimal(String(poLine.taxForeign))
+  const current = purchaseLineOwnRate(poLine, orderRate, false)
+  const sku = poLine.product.sku
+  const changed = (recordedPercent: string) => new PurchaseBillTaxRefusal(RATE_CHANGED_AFTER_ORDER_MESSAGE(sku, recordedPercent, current.times(100).toDecimalPlaces(4).toString()))
+  if (net.gte(RECORDED_RATE_MIN_NET)) {
+    const recordedRate = recordedTax.div(net)
+    if (recordedRate.minus(current).abs().lte(RECORDED_RATE_TOLERANCE)) return null
+    const snapped = recordedRate.toDecimalPlaces(4)
+    const percent = snapped.times(100).toString()
+    if (rateRow.reverseCharge || rateRow.isCompound || (rateRow.components?.length ?? 0) > 0) throw changed(percent)
+    const code = resolveOrderRateTaxCode({ recordedRate: snapped, candidates: candidates ?? [], supplierDefault: null })
+    if (!code) throw changed(percent)
+    return { rate: snapped, code }
+  }
+  const unit = toDecimal(1).div(toDecimal(10).pow(currencyMinorUnitsOf(currency)))
+  if (roundMoney(multiplyMoney(net, current), currency).minus(roundMoney(recordedTax, currency)).abs().lte(unit)) return null
+  throw changed('not stated: the line is too small')
+}
+
+/** A new bill refuses a goods line whose linked rate has changed since the order was raised and cannot be put back on the rate it was recorded at. */
+export const RATE_CHANGED_AFTER_ORDER_MESSAGE = (sku: string, recordedPercent: string, currentPercent: string): string => withLedgerCheck(
+  `The VAT rate on the purchase order line for ${sku} has changed since the order was raised (recorded ${recordedPercent}%, now ${currentPercent}%), and no active purchase tax type carries the recorded rate, `
+  + 'so the bill was not saved. Correct the line\'s tax rate on the purchase order, then try again.',
+)
+
 export function calculatePurchaseInvoice(params: {
   lines: PurchaseInvoiceInputLine[]
   fxRateToBase: number
-  poReference: string
-  poSubtotalForeign: number
-  poTaxForeign: number
   /**
-   * A FREIGHT order's recorded VAT rate (a fraction). When given for a freight order the bill's VAT is this rate on the
-   * vatable cost lines billed, NOT the blended `poTax / wholePoSubtotal` (which understates VAT whenever the order mixes
-   * vatable and exempt lines: 100 vatable + 100 exempt at 20% has a blended 10%). Goods orders keep the blended rate.
+   * The bill's currency. VAT is worked out PER LINE and rounded to this currency's minor unit, the way the ledger computes tax on an exclusive line, and the
+   * header tax is the sum of those rounded line amounts (three lines of 0.03 at 20% are 0.01 each, 0.03, not 0.018). Defaults to a two-decimal currency.
+   */
+  currency?: string
+  poReference: string
+  /**
+   * The order's recorded VAT rate (a fraction; null = none). It is the rate its vatable cost lines (freight, duty, handling) were
+   * charged at, and what a FREIGHT order's lines are all taxed at. THERE IS NO BLENDED RATE: the bill's VAT is each billed line's
+   * own rate on its own net (a goods line its rate, a vatable cost line this one), never `order tax / order subtotal` - the order's tax
+   * includes the cost lines' VAT while its subtotal does not (100 of goods at 20% plus 50 of vatable freight is a blended 30%, 45 of
+   * VAT instead of 30), and a part-billed mixed-rate order has no single rate at all.
    */
   poType?: string
   poTaxRatePercent?: number | string | null
   transitAccount: string
+  /**
+   * The tax type of the rate the ORDER was charged at (lib/domain/purchasing/order-rate-tax-code.ts), NOT the supplier's current default: it
+   * is the code of every vatable cost line and of a goods line with no rate row, whose VAT is taken at `poTaxRatePercent`. Undefined when no
+   * code can be shown to agree with that rate, which leaves those lines without a type (refused downstream).
+   */
   fallbackTaxType?: string
-  /** The rate `fallbackTaxType` was read from (the supplier's default), bound beside the code for the enqueue guard (lib/tax/retired-tax-code-guard.ts). */
+  /**
+   * Set when the rate the ORDER was charged at is itself inactive (lib/domain/purchasing/order-rate-tax-code.ts): a line that would take its VAT and code from the
+   * order's rate (a vatable cost line, a goods line with no rate row, any line of a freight order) is then refused with this message. A booked line keeps its snapshot.
+   */
+  orderRateProblem?: string
+  /**
+   * Every purchase-usable tax rate (lib/domain/purchasing/order-rate-tax-code.ts), so a NEW goods line whose linked rate has changed since the order was raised can be put
+   * back on the code of the rate it was RECORDED at. Without it such a line is refused instead of re-priced.
+   */
+  rateCandidates?: ReadonlyArray<OrderRateCandidate>
+  /** The rate `fallbackTaxType` was read from, bound beside the code for the enqueue guard (lib/tax/retired-tax-code-guard.ts). */
   fallbackTaxRateId?: string
   /**
    * Accounting tax type to use when a line's resolved TaxRate has
@@ -181,9 +310,12 @@ export function calculatePurchaseInvoice(params: {
   // `+=` accumulation could drift the header a penny from its lines.
   let subtotalForeign = toDecimal(0)
   let subtotalBase = toDecimal(0)
-  let taxBaseForeign = toDecimal(0)
+  let taxForeignSum = toDecimal(0)
+  const orderRate = toDecimal(params.poTaxRatePercent ?? 0)
+  const currency = params.currency ?? 'GBP'
   const lineData: PurchaseInvoiceLineDraft[] = []
   const accountingLines: PurchaseInvoiceAccountingLine[] = []
+  const lineTaxRates: PurchaseInvoiceLineTaxRate[] = []
 
   for (const line of params.lines) {
     if (line.kind === 'product') {
@@ -200,7 +332,12 @@ export function calculatePurchaseInvoice(params: {
       const totalBase = rounded4(toDecimal(totalForeign).div(params.fxRateToBase))
       subtotalForeign = addMoney(subtotalForeign, totalForeign)
       subtotalBase = addMoney(subtotalBase, totalBase)
-      taxBaseForeign = addMoney(taxBaseForeign, totalForeign)
+      const usesOrderRate = !poLine.taxRate || params.poType === 'FREIGHT'
+      if (!line.booked && usesOrderRate && params.orderRateProblem) throw new PurchaseBillTaxRefusal(params.orderRateProblem)
+      // A NEW goods line takes the rate its order line was RECORDED at, not the linked rate's current value (the rate editor refreshes the order lines of draft orders only).
+      const recorded = line.booked || usesOrderRate ? null : recordedLineRate(poLine, orderRate, params.currency ?? 'GBP', params.rateCandidates)
+      const lineRate = line.booked ? toDecimal(String(line.booked.rate)) : recorded ? recorded.rate : purchaseLineOwnRate(poLine, orderRate, params.poType === 'FREIGHT')
+      taxForeignSum = addMoney(taxForeignSum, roundMoney(multiplyMoney(totalForeign, lineRate), currency))
 
       lineData.push({
         id: line.id,
@@ -212,11 +349,21 @@ export function calculatePurchaseInvoice(params: {
         totalForeign,
         totalBase,
       })
-      const baseTaxType = poLine.taxRate?.accountingTaxType ?? params.fallbackTaxType
-      const productTaxType = resolvePurchaseLineTaxType({
-        baseTaxType,
-        reverseCharge: poLine.taxRate?.reverseCharge,
-        reverseChargePurchaseTaxType: params.reverseChargeTaxType,
+      // A line with its own rate posts on that rate's code (blank when unmapped: refused downstream). Only a line with NO rate row follows the order's
+      // recorded rate, and so its code - never an unmapped own rate falling back to a code of a different rate.
+      const baseTaxType = recorded?.code ? recorded.code.taxType : poLine.taxRate ? poLine.taxRate.accountingTaxType : params.fallbackTaxType
+      const productTaxType = line.booked
+        ? (line.booked.taxType ?? undefined)
+        : resolvePurchaseLineTaxType({
+          baseTaxType,
+          reverseCharge: poLine.taxRate?.reverseCharge,
+          reverseChargePurchaseTaxType: params.reverseChargeTaxType,
+        })
+      const productRateId = line.booked ? (line.booked.taxRateId ?? undefined) : recorded?.code ? recorded.code.taxRateId : (poLine.taxRate?.id ?? params.fallbackTaxRateId)
+      const productReverseCharge = line.booked ? line.booked.reverseCharge : !!poLine.taxRate?.reverseCharge
+      lineTaxRates.push({
+        description: `PO ${params.poReference} line`, taxType: productTaxType, rate: lineRate.toNumber(), checkable: !productReverseCharge,
+        taxRateId: productRateId, reverseCharge: productReverseCharge,
       })
       accountingLines.push({
         description: `PO ${params.poReference} line`,
@@ -224,8 +371,14 @@ export function calculatePurchaseInvoice(params: {
         unitAmount: rounded4(line.unitCostForeign),
         accountCode: params.transitAccount,
         taxType: productTaxType,
+        // A NONE that came out of the line's own (or the supplier's default) rate is that rate's decision, so it names its kind; a blank
+        // is left blank and refused by the poster.
+        ...(noVatRateKind(productTaxType) ? { noTaxKind: noVatRateKind(productTaxType) } : {}),
         // The rate that code was read from (never sent), with the basis it was derived on: the line's own rate is a purchase goods line (reverse-charge swap), the supplier default is plain.
-        ...(poLine.taxRate?.id ? rateBinding(poLine.taxRate.id, 'purchase_line') : rateBinding(params.fallbackTaxRateId, 'plain')),
+        ...(line.booked
+          ? rateBinding(line.booked.taxRateId, 'purchase_line')
+          : recorded?.code ? rateBinding(recorded.code.taxRateId, 'plain')
+          : poLine.taxRate?.id ? rateBinding(poLine.taxRate.id, 'purchase_line') : rateBinding(params.fallbackTaxRateId, 'plain')),
       })
       continue
     }
@@ -241,7 +394,11 @@ export function calculatePurchaseInvoice(params: {
     const totalBase = rounded4(toDecimal(totalForeign).div(params.fxRateToBase))
     subtotalForeign = addMoney(subtotalForeign, totalForeign)
     subtotalBase = addMoney(subtotalBase, totalBase)
-    if (costLine.vatable) taxBaseForeign = addMoney(taxBaseForeign, totalForeign)
+    if (!line.booked && costLine.vatable && params.orderRateProblem) throw new PurchaseBillTaxRefusal(params.orderRateProblem)
+    const costRate = line.booked ? toDecimal(String(line.booked.rate)) : costLine.vatable ? orderRate : toDecimal(0)
+    const costTaxType: string | undefined = line.booked ? (line.booked.taxType ?? undefined) : costLine.vatable ? params.fallbackTaxType : 'NONE'
+    const costRateId = line.booked ? (line.booked.taxRateId ?? undefined) : costLine.vatable ? params.fallbackTaxRateId : undefined
+    taxForeignSum = addMoney(taxForeignSum, roundMoney(multiplyMoney(totalForeign, costRate), currency))
 
     lineData.push({
       id: line.id,
@@ -253,28 +410,31 @@ export function calculatePurchaseInvoice(params: {
       totalForeign,
       totalBase,
     })
+    lineTaxRates.push({ description, taxType: costTaxType, rate: costRate.toNumber(), checkable: true, taxRateId: costRateId, reverseCharge: false })
     accountingLines.push({
       description,
       quantity: 1,
       unitAmount: totalForeign,
       accountCode: params.transitAccount,
-      taxType: costLine.vatable ? params.fallbackTaxType : undefined,
-      ...rateBinding(costLine.vatable ? params.fallbackTaxRateId : undefined, 'plain'),
+      // A vatable cost line takes the supplier's default type, and REFUSES downstream when there is none; a cost line the order flags as
+      // not vatable is a decided No VAT. Neither is a default.
+      taxType: costTaxType,
+      ...(costLine.vatable
+        ? (noVatRateKind(costTaxType) ? { noTaxKind: noVatRateKind(costTaxType) } : {})
+        : { noTaxKind: 'cost-not-vatable' as const }),
+      ...rateBinding(costRateId, 'plain'),
     })
   }
 
-  const freightRecordedRate = params.poType === 'FREIGHT' && params.poTaxRatePercent != null
-    ? toDecimal(params.poTaxRatePercent)
-    : null
-  const taxRate = freightRecordedRate ?? (params.poSubtotalForeign > 0
-    ? toDecimal(params.poTaxForeign).div(params.poSubtotalForeign)
-    : toDecimal(0))
-  const taxForeign = rounded4(multiplyMoney(taxBaseForeign, taxRate))
+  // The header tax is the sum of each billed line's own tax, each already rounded to the currency's minor unit (as the ledger does), so the header, the
+  // total and the base figure are all recomputed from the rounded lines.
+  const taxForeign = rounded4(taxForeignSum)
   const taxBase = rounded4(toDecimal(taxForeign).div(params.fxRateToBase))
 
   return {
     lineData,
     accountingLines,
+    lineTaxRates,
     subtotalForeign: rounded4(subtotalForeign),
     subtotalBase: rounded4(subtotalBase),
     taxForeign,
@@ -514,3 +674,126 @@ export function assertPurchaseInvoiceInputsUnchanged(before: PurchaseInvoiceTaxI
 /** Refusal for an edit that would recompute an order's lines, totals, VAT or exchange rate while a bill exists against it. */
 export const PO_BILLED_FIGURES_EDIT_MESSAGE =
   'This purchase order already has a bill, so its lines, costs, VAT or exchange rate cannot be changed: the bill would keep the old figures. Correct or credit the bill first.'
+
+
+/**
+ * THE TAX TREATMENT EACH LINE OF AN EXISTING BILL WAS BOOKED WITH: the same code and rate `calculatePurchaseInvoice` gave it (a goods line its own
+ * rate row's code and rate, a line with no rate row the order's recorded rate and its code, a vatable cost line the order's rate and code, a non-vatable
+ * cost line No VAT). A supplier credit note against the bill mirrors THESE, never the supplier's current default type.
+ */
+export type BilledLineTaxTreatment = {
+  taxType: string | undefined
+  rate: number
+  taxRateId?: string
+  reverseCharge: boolean
+  /** The line's net, for the check that a legacy reconstruction reproduces the bill's recorded VAT. */
+  net: number
+  /** True when the treatment was RECONSTRUCTED from the order's current rates (a line booked before the snapshot existed), false when it is the booked snapshot. */
+  legacy: boolean
+  /**
+   * The rate the order line RECORDED when it was priced (its stored tax over its stored net, a fraction), for a reconstructed goods line whose stored net is large enough
+   * to state it. The order's stored line tax is not refreshed when a rate is changed on a non-draft order, so it is the rate the line was booked at: a reconstruction that
+   * disagrees with it is on a rate that has changed since.
+   */
+  recordedRate?: number
+}
+
+/** What the bill line row stores of its booked treatment (the five snapshot columns). */
+export type BilledLineSnapshotColumns = {
+  taxBookedAt?: Date | string | null
+  taxType?: string | null
+  taxRateValue?: unknown
+  taxRateId?: string | null
+  taxReverseCharge?: boolean | null
+}
+
+/** The booked treatment of a stored bill line, or null for a line booked before the snapshot existed. */
+export function bookedTaxFromLine(line: BilledLineSnapshotColumns): BookedLineTax | null {
+  if (!line.taxBookedAt) return null
+  // A blank booked type is NOT booked (a snapshot that froze "undecided"): the line is re-derived from today's mapping on the next edit or credit.
+  if (!line.taxType || line.taxType.trim() === '') return null
+  return { taxType: line.taxType ?? null, rate: line.taxRateValue == null ? 0 : String(line.taxRateValue), taxRateId: line.taxRateId ?? null, reverseCharge: line.taxReverseCharge === true }
+}
+
+/** The snapshot columns to write for a booked line (`lineTaxRates` of `calculatePurchaseInvoice`, one entry per line). */
+export function snapshotColumnsFor(line: PurchaseInvoiceLineTaxRate, bookedAt: Date): { taxType: string | null; taxRateValue: number | null; taxRateId: string | null; taxReverseCharge: boolean | null; taxBookedAt: Date | null } {
+  // NEVER store a blank snapshot: a line whose type is undecided is left unbooked, so a later edit re-derives it.
+  if (!line.taxType || line.taxType.trim() === '') return { taxType: null, taxRateValue: null, taxRateId: null, taxReverseCharge: null, taxBookedAt: null }
+  return { taxType: line.taxType ?? null, taxRateValue: line.rate, taxRateId: line.taxRateId ?? null, taxReverseCharge: line.reverseCharge, taxBookedAt: bookedAt }
+}
+
+export function billLineTaxTreatments(params: {
+  billLines: ReadonlyArray<{ poLineId: string | null; costLineId: string | null; totalForeign?: unknown } & BilledLineSnapshotColumns>
+  poLineById: Map<string, PurchaseInvoicePoLine>
+  costLineById: Map<string, { vatable: boolean }>
+  poType?: string
+  poTaxRatePercent?: number | string | null
+  /** The code (and its rate id) of the rate the order was charged at (lib/domain/purchasing/order-rate-tax-code.ts). */
+  orderRateTaxType?: string
+  orderRateTaxRateId?: string
+  /** The configured reverse-charge purchase tax type, for the swap of a RECONSTRUCTED reverse-charge line (a booked line already carries the swapped code). */
+  reverseChargeTaxType?: string | null
+}): BilledLineTaxTreatment[] {
+  const orderRate = toDecimal(params.poTaxRatePercent ?? 0)
+  return params.billLines.map((line) => {
+    const net = Number(line.totalForeign ?? 0)
+    const booked = bookedTaxFromLine(line)
+    if (booked) {
+      return { taxType: booked.taxType ?? undefined, rate: Number(booked.rate), taxRateId: booked.taxRateId ?? undefined, reverseCharge: booked.reverseCharge, net, legacy: false }
+    }
+    if (line.poLineId) {
+      const poLine = params.poLineById.get(line.poLineId)
+      if (!poLine) return { taxType: undefined, rate: 0, reverseCharge: false, net, legacy: true }
+      const recordedNet = Number(poLine.totalForeign ?? 0)
+      const recordedRate = poLine.totalForeign != null && poLine.taxForeign != null && recordedNet >= RECORDED_RATE_MIN_NET
+        ? toDecimal(String(poLine.taxForeign)).div(recordedNet).toNumber()
+        : undefined
+      return {
+        recordedRate,
+        taxType: poLine.taxRate
+          ? resolvePurchaseLineTaxType({ baseTaxType: poLine.taxRate.accountingTaxType, reverseCharge: poLine.taxRate.reverseCharge, reverseChargePurchaseTaxType: params.reverseChargeTaxType })
+          : params.orderRateTaxType,
+        rate: purchaseLineOwnRate(poLine, orderRate, params.poType === 'FREIGHT').toNumber(),
+        taxRateId: poLine.taxRate ? poLine.taxRate.id : params.orderRateTaxRateId,
+        reverseCharge: !!poLine.taxRate?.reverseCharge,
+        net,
+        legacy: true,
+      }
+    }
+    const vatable = line.costLineId ? params.costLineById.get(line.costLineId)?.vatable === true : false
+    return vatable
+      ? { taxType: params.orderRateTaxType, rate: orderRate.toNumber(), taxRateId: params.orderRateTaxRateId, reverseCharge: false, net, legacy: true }
+      : { taxType: 'NONE', rate: 0, reverseCharge: false, net, legacy: true }
+  })
+}
+
+/** A stored line tax is rounded to four places, so it only states a rate once the line's net is at least this large (a smaller line would put the rate within rounding noise). */
+const RECORDED_RATE_MIN_NET = 1
+/** A rate read back from a line's stored tax over its stored net is accepted within this (four-place rounding of the tax on a net of at least RECORDED_RATE_MIN_NET, plus a margin). */
+const RECORDED_RATE_TOLERANCE = 0.0002
+
+/**
+ * DOES A RECONSTRUCTION REPRODUCE WHAT THE BILL RECORDED? A line booked before the snapshot existed can only be re-derived from the order's CURRENT rates, which may have
+ * changed since. The reconstruction is accepted only when BOTH hold; otherwise the original treatment cannot be established and the caller refuses:
+ *   1. DOCUMENT LEVEL: priced line by line the way the bill is (each line's VAT rounded to the currency's minor unit), it adds up to the VAT the bill's header recorded within
+ *      ONE minor unit IN TOTAL, not a unit per line (a per-line allowance would let a hundred-line bill accept a completely different rate);
+ *   2. LINE LEVEL, where the line states it: a reconstructed goods line's rate must reproduce the rate its order line RECORDED when it was priced (`recordedRate`).
+ * A line with no recorded tax relies on the header check alone.
+ */
+export function legacyTreatmentsReproduceBillTax(params: { treatments: ReadonlyArray<BilledLineTaxTreatment>; billTaxForeign: DecimalInput; currency: string }): boolean {
+  let sum = toDecimal(0)
+  for (const t of params.treatments) sum = addMoney(sum, roundMoney(multiplyMoney(t.net, t.rate), params.currency))
+  const unit = toDecimal(1).div(toDecimal(10).pow(currencyMinorUnitsOf(params.currency)))
+  if (sum.minus(toDecimal(params.billTaxForeign)).abs().gt(unit)) return false
+  return params.treatments.every((t) => t.recordedRate === undefined || Math.abs(t.rate - t.recordedRate) <= RECORDED_RATE_TOLERANCE)
+}
+
+function currencyMinorUnitsOf(currency: string): number {
+  return roundMoney(1.23456789, currency).decimalPlaces()
+}
+
+/** The refusal text for a bill with a legacy line the order's current rates cannot reproduce. */
+export const LEGACY_BILL_TAX_AMBIGUOUS_MESSAGE = withLedgerCheck(
+  'This bill was booked before its tax treatment was recorded, and the purchase order\'s VAT rates no longer reproduce the VAT the bill recorded, so its tax cannot be '
+  + 'worked out safely. Re-save the bill (Edit bill, then Save) to record its tax treatment at the order\'s current rates, then try again.',
+)

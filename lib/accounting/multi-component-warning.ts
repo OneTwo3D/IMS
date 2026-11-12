@@ -17,7 +17,7 @@
 export type TaxRateSnapshotForWarning = {
   name: string | null
   isCompound: boolean
-  components: Array<{ id: string }>
+  components: ReadonlyArray<unknown>
 } | null
 
 export type LineWithTaxRateSnapshot = {
