@@ -1,10 +1,10 @@
-import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { enqueueMintsoftBookedInRecheckForAsn, sweepUnprocessedMintsoftBookedInEvents } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
 import { runPostMaintenanceBookedInRecheck } from '@/lib/domain/wms/post-maintenance-recheck'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { cronResultResponse } from '@/lib/ops/cron-response'
 
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
@@ -16,7 +16,7 @@ export async function GET(request: Request) {
   if (maintenance) return maintenance
 
   if (!(await isIntegrationPluginEnabled('mintsoft'))) {
-    return NextResponse.json({ skipped: true, reason: 'Mintsoft plugin disabled' })
+    return cronResultResponse({ skipped: true, reason: 'Mintsoft plugin disabled' })
   }
 
   // o3d-hl8l r4: drain the post-maintenance re-check BEFORE the ordinary sweep. A callback refused
@@ -30,5 +30,5 @@ export async function GET(request: Request) {
   })
 
   const result = await sweepUnprocessedMintsoftBookedInEvents()
-  return NextResponse.json({ ...result, postMaintenanceRecheck: recheck })
+  return cronResultResponse({ ...result, postMaintenanceRecheck: recheck })
 }

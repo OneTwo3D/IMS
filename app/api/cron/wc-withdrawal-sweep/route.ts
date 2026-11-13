@@ -1,12 +1,12 @@
-import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { db } from '@/lib/db'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
-import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
+import { runCronWithLogging } from '@/lib/ops/cron-run'
 import { sweepDispatchEligibleWithdrawals, sweepWithdrawalSuppressions } from '@/lib/connectors/woocommerce/sync/withdrawal'
 import { drainWcOrderAdmissionRefusals } from '@/lib/connectors/woocommerce/sync/order-admission'
+import { cronRunResponse } from '@/lib/ops/cron-response'
 
 // Called by cron with Authorization: Bearer $CRON_SECRET.
 export async function GET(request: Request) {
@@ -21,7 +21,7 @@ export async function GET(request: Request) {
   // invokes cron with `curl -o /dev/null`, so a bare JSON body is discarded.
   // A broken WooCommerce credential would otherwise leave suppressed orders
   // unimported indefinitely while the job kept reporting 200.
-  const { runId, result } = await runCronWithLogging({
+  const { runId, result, outcomeClass, responseStatus } = await runCronWithLogging({
     jobName: 'wc-withdrawal-sweep',
     run: async () => {
       // Same kill switches as wc-reconcile. This job calls the WooCommerce API
@@ -96,5 +96,5 @@ export async function GET(request: Request) {
     },
   })
 
-  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit())
+  return cronRunResponse({ runId, result, outcomeClass, responseStatus })
 }

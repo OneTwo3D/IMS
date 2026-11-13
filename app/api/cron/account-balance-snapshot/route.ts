@@ -1,16 +1,10 @@
-import { NextResponse } from 'next/server'
-
 import { syncAccountingAccountBalanceSnapshots } from '@/lib/accounting'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit, type CronRateLimitChecker } from '@/lib/cron-rate-limit'
 import { balanceDateString } from '@/lib/domain/accounting/account-balance-snapshots'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
-import {
-  appendCronRunId,
-  cronRunResponseInit,
-  runCronWithLogging,
-  type CronRunLogWriter,
-} from '@/lib/ops/cron-run'
+import { runCronWithLogging, type CronRunLogWriter } from '@/lib/ops/cron-run'
+import { cronRunResponse } from '@/lib/ops/cron-response'
 
 export const runtime = 'nodejs'
 
@@ -56,7 +50,7 @@ export async function handleAccountBalanceSnapshotCron(
 
   const now = options.now ?? (() => new Date())
   const syncSnapshots = options.syncSnapshots ?? syncAccountingAccountBalanceSnapshots
-  const { runId, result, responseStatus } = await runCronWithLogging({
+  const { runId, result, outcomeClass, responseStatus } = await runCronWithLogging({
     jobName: 'account-balance-snapshot',
     now,
     createRunId: options.createRunId,
@@ -76,10 +70,7 @@ export async function handleAccountBalanceSnapshotCron(
     }),
   })
 
-  return NextResponse.json(
-    appendCronRunId(result, runId),
-    cronRunResponseInit({ status: responseStatus ?? 200 }),
-  )
+  return cronRunResponse({ runId, result, outcomeClass, responseStatus })
 }
 
 export async function GET(request: Request) {

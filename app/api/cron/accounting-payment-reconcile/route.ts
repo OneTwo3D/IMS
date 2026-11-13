@@ -1,9 +1,9 @@
-import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { db } from '@/lib/db'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { cronResultResponse } from '@/lib/ops/cron-response'
 
 /**
  * Backlog reconciliation sweep (o3d-2s8). The payment poll only ever sees Xero's modified-since
@@ -28,12 +28,12 @@ export async function GET(request: Request) {
       db.setting.findUnique({ where: { key: 'xero_sync_enabled' } }),
       db.setting.findUnique({ where: { key: 'xero_payment_reconcile_apply' } }),
     ])
-    if (syncEnabled?.value !== 'true') return NextResponse.json({ skipped: true, reason: 'Xero sync disabled' })
+    if (syncEnabled?.value !== 'true') return cronResultResponse({ skipped: true, reason: 'Xero sync disabled' })
 
     const apply = applySetting?.value === 'true'
     const { reconcileXeroPayments } = await import('@/lib/connectors/xero/payment-reconcile')
     const report = await reconcileXeroPayments({ apply })
-    return NextResponse.json({ mode: apply ? 'apply' : 'report', ...report })
+    return cronResultResponse({ mode: apply ? 'apply' : 'report', ...report })
   }
 
   // o3d-remove-parked-connectors: the QuickBooks arm here answered a NAMED skip — "payment reconcile
@@ -41,5 +41,5 @@ export async function GET(request: Request) {
   // enabled", which would have read as a configuration problem. That distinction is the pattern a
   // second ledger without a reconcile sweep should copy; the arm itself went with the connector.
 
-  return NextResponse.json({ skipped: true, reason: 'No accounting plugin enabled' })
+  return cronResultResponse({ skipped: true, reason: 'No accounting plugin enabled' })
 }

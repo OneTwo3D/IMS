@@ -1,4 +1,3 @@
-import { NextResponse } from 'next/server'
 import { execFile } from 'child_process'
 import { mkdir, readdir, stat, unlink } from 'fs/promises'
 import path from 'path'
@@ -9,7 +8,7 @@ import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getBackupDir } from '@/lib/backup-storage'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { BackupArtifactUploadError, uploadBackupArtifactsToTarget } from '@/lib/backup-remote'
-import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
+import { runCronWithLogging } from '@/lib/ops/cron-run'
 import { backupManifestPath, writeBackupManifestForFile } from '@/lib/backup-manifest'
 import {
   BACKUP_MAX_COUNT_FALLBACK,
@@ -17,6 +16,7 @@ import {
   resolveBackupPurgeLimit,
 } from '@/lib/domain/settings/backup-schedule-input'
 import { isBackupScheduleEnabled } from '@/lib/domain/settings/backup-schedule-enabled'
+import { cronRunResponse } from '@/lib/ops/cron-response'
 
 const BACKUP_DIR = getBackupDir()
 
@@ -59,7 +59,7 @@ export async function GET(request: Request) {
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
 
-  const { runId, result, responseStatus } = await runCronWithLogging({
+  const { runId, result, outcomeClass, responseStatus } = await runCronWithLogging({
     jobName: 'backup',
     run: async () => {
       // BOTH ENABLEMENT ROWS, resolved the way the crontab resolves them (Codex r20 HIGH). This read
@@ -187,5 +187,5 @@ export async function GET(request: Request) {
     }),
   })
 
-  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit({ status: responseStatus }))
+  return cronRunResponse({ runId, result, outcomeClass, responseStatus })
 }

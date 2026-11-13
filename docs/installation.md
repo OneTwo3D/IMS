@@ -1217,6 +1217,21 @@ Scheduled tasks are configured automatically, in two ways. The installer's boots
 
 **What that costs, stated rather than glossed over:** the lock file is world-readable, so any local account can open it and hold the `flock`, which delays a cutover by up to `IMS_CRONTAB_LOCK_WAIT_SECONDS` and is then reported as a refusal that names the file. That is deliberate and it is the price of the application being a party to the exclusion at all — it is the trade the *cutover* lock (`/etc/ims-cutover-state/cutover.lock`, `0600`) declines, because no unprivileged process is meant to hold that one.
 
+### Exit status of a cron job (what the heartbeat sees)
+
+Every managed job line runs `curl -sf`, so the HTTP status the route answers **is the job's exit status**: a 2xx is a healthy run and anything else makes the job exit non-zero. When heartbeats are on (`IMS_CRON_HEARTBEATS`), the `o3d-hc` wrapper reports that exit status to Healthchecks, so a failing run turns the check red on stage and in production alike. Every route under `app/api/cron/` answers through one mapping (`lib/ops/cron-response.ts`, enforced by a test that reads every route file), and a run ends in one of four ways:
+
+| Outcome | HTTP status | Meaning |
+|---|---|---|
+| ok | 200 | The run did its work. |
+| skipped | 200 | Nothing to do by design: the plugin or the sync is switched off, maintenance, no connector configured. |
+| held | 200 | The only things that went wrong are writes this installation's outbound-write hold refused before they left. |
+| failed | 500 | A genuine failure, **or** a held write together with a genuine failure. |
+
+**Why held is 2xx.** A held write is the hold doing its job, not a fault. A stage installation has no outbound grant on purpose, so every run that has queued stock or order writes records them as held; if that were a failing status the stage heartbeats would stay red permanently and a real failure could never be told from the normal state. The held work stays queued and goes out once a grant exists. The run is still **recorded** in `cron_runs` with status `failed` and the held texts in its reason, so the audit trail shows what was held; only the HTTP status (and so the heartbeat) tells a held-only run from a failed one. A held write is recognised by the hold's own reference (the same check the queues use), never by a destination's wording, so a reply that merely repeats the words is a failure. One real failure among held writes makes the whole run failed. A hold that stops a run by throwing is treated the same way; any other exception is a failure.
+
+A route may state a stricter status of its own (for example `500` from the invariant check), and a failed run can never answer 2xx. Routes that do not write a `cron_runs` row are classified from their result by the same rules (`error`, `errors`, `failed` and `success: false`, at any depth). Authentication (401), the rate limit (429) and maintenance responses come before the run and keep their own statuses.
+
 ### The first run after the crontab lock moved
 
 **Moving a lock is also a way to lose one, so read this before the first cutover of this release on an existing host.** The process serving that host was built before the relocation and goes on resolving `${DATA_DIR}/locks/.crontab-reconcile.lock`. What the release does about it, and what it does not:

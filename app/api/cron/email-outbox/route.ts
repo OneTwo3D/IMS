@@ -1,4 +1,3 @@
-import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { processPendingEmailOutbox } from '@/lib/email-outbox'
@@ -9,6 +8,7 @@ import { reconcileRawPayloads } from '@/lib/domain/erasure/raw-payloads'
 import { reconcileDerivedCopies } from '@/lib/domain/erasure/derived-copies'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { cronResultResponse } from '@/lib/ops/cron-response'
 
 export async function GET(request: Request) {
   const err = await verifyCron(request)
@@ -47,7 +47,7 @@ export async function GET(request: Request) {
       description: 'An erasure reconcile pass did not finish (see metadata for which); personal data may remain on rows of an erased order',
       metadata: { incomplete }, resolveUser: false,
     }).catch(() => undefined)
-    return NextResponse.json({ ...result, erasureReconcileIncomplete: incomplete }, { status: 500 })
+    return cronResultResponse({ ...result, erasureReconcileIncomplete: incomplete }, { outcomeClass: 'failed' })
   }
-  return NextResponse.json(erasure && erasure.addressesErased > 0 ? { ...result, erasureReconciled: erasure } : result)
+  return cronResultResponse(erasure && erasure.addressesErased > 0 ? { ...result, erasureReconciled: erasure } : result)
 }

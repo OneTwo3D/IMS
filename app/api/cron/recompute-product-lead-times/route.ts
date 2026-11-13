@@ -1,15 +1,9 @@
-import { NextResponse } from 'next/server'
-
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit, type CronRateLimitChecker } from '@/lib/cron-rate-limit'
 import { recomputeProductObservedLeadTimes } from '@/lib/domain/purchasing/product-lead-time'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
-import {
-  appendCronRunId,
-  cronRunResponseInit,
-  runCronWithLogging,
-  type CronRunLogWriter,
-} from '@/lib/ops/cron-run'
+import { runCronWithLogging, type CronRunLogWriter } from '@/lib/ops/cron-run'
+import { cronRunResponse } from '@/lib/ops/cron-response'
 
 export const runtime = 'nodejs'
 
@@ -35,7 +29,7 @@ export async function handleRecomputeProductLeadTimesCron(
 
   const now = options.now ?? (() => new Date())
   const recompute = options.recompute ?? recomputeProductObservedLeadTimes
-  const { runId, result } = await runCronWithLogging({
+  const { runId, result, outcomeClass, responseStatus } = await runCronWithLogging({
     jobName: 'recompute-product-lead-times',
     now,
     createRunId: options.createRunId,
@@ -48,7 +42,7 @@ export async function handleRecomputeProductLeadTimesCron(
     }),
   })
 
-  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit())
+  return cronRunResponse({ runId, result, outcomeClass, responseStatus })
 }
 
 export async function GET(request: Request) {

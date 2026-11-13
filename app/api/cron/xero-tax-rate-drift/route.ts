@@ -1,10 +1,10 @@
-import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { isAccountingConnectorConnected } from '@/lib/accounting'
-import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
+import { runCronWithLogging } from '@/lib/ops/cron-run'
+import { cronRunResponse } from '@/lib/ops/cron-response'
 
 /**
  * Daily/hourly IMS↔Xero TaxRate drift detection (0jls5). Compares each active IMS
@@ -20,7 +20,7 @@ export async function GET(request: Request) {
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
 
-  const { runId, result } = await runCronWithLogging({
+  const { runId, result, outcomeClass, responseStatus } = await runCronWithLogging({
     jobName: 'xero-tax-rate-drift',
     run: async () => {
       if (!(await isIntegrationPluginEnabled('xero'))) {
@@ -35,5 +35,5 @@ export async function GET(request: Request) {
     },
   })
 
-  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit())
+  return cronRunResponse({ runId, result, outcomeClass, responseStatus })
 }

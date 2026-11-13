@@ -1,4 +1,3 @@
-import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { db } from '@/lib/db'
@@ -6,6 +5,7 @@ import { runStockSyncForBinding } from '@/lib/connectors/mintsoft/sync/stock-syn
 import { isMintsoftBindingDue } from '@/lib/connectors/mintsoft/sync/stock-sync-helpers'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { cronResultResponse } from '@/lib/ops/cron-response'
 
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
@@ -17,7 +17,7 @@ export async function GET(request: Request) {
   if (maintenance) return maintenance
 
   if (!(await isIntegrationPluginEnabled('mintsoft'))) {
-    return NextResponse.json({ skipped: true, reason: 'Mintsoft plugin disabled' })
+    return cronResultResponse({ skipped: true, reason: 'Mintsoft plugin disabled' })
   }
 
   const bindings = await db.externalWmsBinding.findMany({
@@ -44,7 +44,7 @@ export async function GET(request: Request) {
     results.push(await runStockSyncForBinding(binding.id, 'cron'))
   }
 
-  return NextResponse.json({
+  return cronResultResponse({
     ran: results.length,
     due: dueBindings.length,
     details: results.map((result) => ({

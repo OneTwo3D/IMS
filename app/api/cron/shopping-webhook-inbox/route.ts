@@ -1,12 +1,11 @@
-import { NextResponse } from 'next/server'
-
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { db } from '@/lib/db'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { processPendingWcWebhookEvents } from '@/lib/jobs/woocommerce/process-shopping-webhook-events'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
-import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
+import { runCronWithLogging } from '@/lib/ops/cron-run'
+import { cronRunResponse } from '@/lib/ops/cron-response'
 
 type ConnectorTickResult = Record<string, unknown>
 
@@ -124,7 +123,7 @@ export async function GET(request: Request) {
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
 
-  const { runId, result } = await runCronWithLogging({
+  const { runId, result, outcomeClass, responseStatus } = await runCronWithLogging({
     jobName: 'shopping-webhook-inbox',
     run: async () => {
       // ONE CONNECTOR TICK TODAY (o3d-remove-parked-connectors). Shopify was the second element of
@@ -149,5 +148,5 @@ export async function GET(request: Request) {
     },
   })
 
-  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit())
+  return cronRunResponse({ runId, result, outcomeClass, responseStatus })
 }

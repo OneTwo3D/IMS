@@ -2,8 +2,32 @@ import { randomUUID } from 'node:crypto'
 
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
+import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 
 export type CronRunStatus = 'completed' | 'failed' | 'skipped'
+
+/**
+ * HOW A CRON RUN ENDS, as far as the scheduler's exit status is concerned (the wrapper's `curl -f` turns a non-2xx into a failing
+ * run, which is what Healthchecks sees).
+ *
+ *  - ok      the run did its work.
+ *  - skipped nothing to do by design: a plugin or sync switched off, maintenance, nothing configured.
+ *  - held    the only things that went wrong are writes this installation's outbound-write hold refused before they left (a
+ *            staging installation has no grant, by design). Not a fault: the work stays queued and runs once a grant exists.
+ *  - failed  a genuine failure, or a failure mixed in with held writes.
+ *
+ * ok, skipped and held answer 2xx; only failed answers non-2xx. The recorded cron_runs status is unchanged ('failed' for a
+ * held-only run too), so the audit trail still shows what was held; only the HTTP status tells the two apart.
+ */
+export type CronOutcomeClass = 'ok' | 'skipped' | 'held' | 'failed'
+
+/** Status of a run that failed. 500, not 503: a failed run is a fault of this installation, not a request to retry later. */
+export const CRON_FAILED_RESPONSE_STATUS = 500
+
+export function cronResponseStatusFor(outcome: CronOutcomeClass): number {
+  return outcome === 'failed' ? CRON_FAILED_RESPONSE_STATUS : 200
+}
 
 const MAX_STATUS_REASON_LENGTH = 500
 
@@ -43,6 +67,8 @@ export type CronRunOutcome<T> = {
   status?: CronRunStatus
   counts?: JsonObject | null
   statusReason?: string | null
+  /** How the run ended for the exit status. Derived from `status` and the result when not given. */
+  outcomeClass?: CronOutcomeClass
   responseStatus?: number
   result?: T
 }
@@ -91,7 +117,7 @@ export function cronRunResponseInit(init: ResponseInit = {}): ResponseInit {
 
 export async function runCronWithLogging<T extends Record<string, unknown>>(
   options: RunCronWithLoggingOptions<T>,
-): Promise<{ runId: string; result: T; log: CronRunLog; responseStatus?: number }> {
+): Promise<{ runId: string; result: T; log: CronRunLog; outcomeClass: CronOutcomeClass; responseStatus?: number }> {
   const now = options.now ?? (() => new Date())
   const writeLog = options.writeLog ?? persistCronRunLog
   const runId = options.createRunId?.() ?? randomUUID()
@@ -115,13 +141,22 @@ export async function runCronWithLogging<T extends Record<string, unknown>>(
     })
 
     await safeWriteCronRunLog(writeLog, log)
+    // A refused outbound write is a hold, not a fault: it is recorded (above) and answered 2xx. Recognised by its class.
+    if (isOutboundWriteHeldError(error)) {
+      return { runId, result: { error: log.statusReason, held: true } as unknown as T, log, outcomeClass: 'held' }
+    }
     throw error
   }
 
-  const outcome = {
-    ...inferCronRunOutcome(result),
-    ...(options.getOutcome?.(result) ?? {}),
-  }
+  const inferred = inferCronRunOutcome(result)
+  const explicit = options.getOutcome?.(result) ?? {}
+  const outcome = { ...inferred, ...explicit }
+  // A route that states its own status decides the class from it; otherwise the result's own classification stands.
+  const outcomeClass: CronOutcomeClass = explicit.outcomeClass
+    ?? (explicit.status === undefined
+      ? inferred.outcomeClass
+      : explicit.status === 'failed' ? 'failed' : explicit.status === 'skipped' ? 'skipped' : 'ok')
+    ?? 'ok'
   const finishedAtDate = now()
   const log = buildCronRunLog({
     runId,
@@ -142,7 +177,11 @@ export async function runCronWithLogging<T extends Record<string, unknown>>(
     runId,
     result: outcome.result ?? result,
     log,
-    responseStatus: outcome.responseStatus,
+    outcomeClass,
+    // A status the route set itself wins when it is an error; a route can never answer 2xx for a failed run.
+    responseStatus: outcome.responseStatus !== undefined && outcome.responseStatus >= 400
+      ? outcome.responseStatus
+      : cronResponseStatusFor(outcomeClass),
   }
 }
 
@@ -222,30 +261,53 @@ export async function listRecentCronRuns(
 }
 
 export function inferCronRunOutcome<T extends Record<string, unknown>>(result: T): CronRunOutcome<T> {
-  const statusValue = typeof result.status === 'string' ? result.status : null
-  const statusReason = summarizeResultError(result)
+  const classified = classifyCronResult(result)
 
-  if (result.skipped === true) {
+  if (classified.outcomeClass === 'skipped') {
     return {
       status: 'skipped',
+      outcomeClass: 'skipped',
       counts: getCounts(result),
       statusReason: typeof result.reason === 'string' ? result.reason : null,
     }
   }
 
-  if (statusReason || statusValue === 'failed' || statusValue === 'partial_failure') {
+  if (classified.outcomeClass === 'failed' || classified.outcomeClass === 'held') {
     return {
       status: 'failed',
+      outcomeClass: classified.outcomeClass,
       counts: getCounts(result),
-      statusReason: statusReason ?? statusValue,
+      statusReason: classified.statusReason,
     }
   }
 
   return {
     status: 'completed',
+    outcomeClass: 'ok',
     counts: getCounts(result),
     statusReason: null,
   }
+}
+
+/**
+ * Classify a finished run's result. Pure. Failures are collected from the usual places (`error`, `errors[]`, `failed[]`, `success:
+ * false`, a nested `status` of failed or partial_failure); each is HELD when it is the hold's own text (recognised by the hold's
+ * authenticated reference, which a destination's reply cannot forge) or is marked `held: true`. The result is held only when every
+ * collected failure is held; one genuine failure among them makes it failed.
+ */
+export function classifyCronResult(result: Record<string, unknown>): { outcomeClass: CronOutcomeClass; statusReason: string | null } {
+  if (result.skipped === true) return { outcomeClass: 'skipped', statusReason: typeof result.reason === 'string' ? result.reason : null }
+
+  const issues = collectResultIssues(result)
+  const statusValue = typeof result.status === 'string' ? result.status : null
+  const rootFailed = statusValue === 'failed' || statusValue === 'partial_failure'
+  if (issues.length === 0 && !rootFailed) return { outcomeClass: 'ok', statusReason: null }
+
+  const statusReason = (issues.length > 0 ? issues.map((issue) => issue.text).join('; ') : statusValue)?.slice(0, MAX_STATUS_REASON_LENGTH) ?? null
+  const genuine = issues.some((issue) => !issue.held)
+  const rootOnly = issues.length === 0 && rootFailed
+  if (genuine || (rootOnly && result.held !== true)) return { outcomeClass: 'failed', statusReason }
+  return { outcomeClass: 'held', statusReason }
 }
 
 function buildCronRunLog(input: CronRunLog): CronRunLog {
@@ -293,66 +355,81 @@ function getNestedCounts(result: Record<string, unknown>): JsonObject {
   return counts
 }
 
-function summarizeResultError(result: Record<string, unknown>): string | null {
-  const summaries = collectResultErrors(result)
-  if (summaries.length === 0) return null
-
-  return summaries.join('; ').slice(0, MAX_STATUS_REASON_LENGTH)
-}
-
 function summarizeError(error: unknown): string {
   if (error instanceof Error && error.message.trim()) return error.message.slice(0, MAX_STATUS_REASON_LENGTH)
   if (typeof error === 'string' && error.trim()) return error.slice(0, MAX_STATUS_REASON_LENGTH)
   return 'Unknown cron run failure'
 }
 
-function collectResultErrors(value: unknown, path: string[] = []): string[] {
+type ResultIssue = { text: string; held: boolean }
+
+function collectResultIssues(value: unknown, path: string[] = []): ResultIssue[] {
   if (!isRecord(value)) return []
 
-  const summaries: string[] = []
+  const issues: ResultIssue[] = []
   const label = path.join('.')
-  const initialLength = summaries.length
 
   if (typeof value.error === 'string' && value.error.trim()) {
-    summaries.push(formatResultError(label, value.error.trim()))
+    const text = value.error.trim()
+    // `{ error, held: true }` is the connector clients' shape for a write the hold refused before it left.
+    issues.push({ text: formatResultError(label, text), held: value.held === true || isOutboundWriteHeldText(text) })
   }
 
   if (Array.isArray(value.errors) && value.errors.length > 0) {
-    summaries.push(formatResultError(label, summarizeErrorArray(value.errors)))
+    issues.push(...entryIssues(label, value.errors, summarizeErrorArray))
   }
 
   if (Array.isArray(value.failed) && value.failed.length > 0) {
-    summaries.push(formatResultError(label, summarizeFailedArray(value.failed)))
+    issues.push(...entryIssues(label, value.failed, summarizeFailedArray))
   }
 
-  if (value.success === false && summaries.length === initialLength) {
-    summaries.push(formatResultError(label, 'success false'))
+  if (value.success === false && issues.length === 0) {
+    issues.push({ text: formatResultError(label, 'success false'), held: value.held === true })
   }
 
   if (
     path.length > 0 &&
     typeof value.status === 'string' &&
     ['failed', 'partial_failure'].includes(value.status) &&
-    summaries.length === initialLength
+    issues.length === 0
   ) {
-    summaries.push(formatResultError(label, value.status))
+    issues.push({ text: formatResultError(label, value.status), held: value.held === true })
   }
 
   for (const [key, nestedValue] of Object.entries(value)) {
     if (['error', 'errors', 'failed', 'success', 'status'].includes(key)) continue
     if (!isRecord(nestedValue) && !Array.isArray(nestedValue)) continue
-    summaries.push(...collectNestedResultErrors(nestedValue, [...path, key]))
+    issues.push(...collectNestedResultIssues(nestedValue, [...path, key]))
   }
 
-  return summaries
+  return issues
 }
 
-function collectNestedResultErrors(value: unknown, path: string[]): string[] {
+function collectNestedResultIssues(value: unknown, path: string[]): ResultIssue[] {
   if (Array.isArray(value)) {
-    return value.flatMap((entry, index) => collectNestedResultErrors(entry, [...path, String(index)]))
+    return value.flatMap((entry, index) => collectNestedResultIssues(entry, [...path, String(index)]))
   }
 
-  return collectResultErrors(value, path)
+  return collectResultIssues(value, path)
+}
+
+/** Split a list of failures into the held ones and the rest, so a held entry never hides (or is counted as) a genuine one. */
+function entryIssues(label: string, entries: unknown[], summarize: (entries: unknown[]) => string): ResultIssue[] {
+  const held = entries.filter(entryIsHeld)
+  const rest = entries.filter((entry) => !entryIsHeld(entry))
+  const issues: ResultIssue[] = []
+  if (rest.length > 0) issues.push({ text: formatResultError(label, summarize(rest)), held: false })
+  if (held.length > 0) issues.push({ text: formatResultError(label, summarize(held)), held: true })
+  return issues
+}
+
+function entryIsHeld(entry: unknown): boolean {
+  if (typeof entry === 'string') return isOutboundWriteHeldText(entry)
+  if (isRecord(entry)) {
+    if (entry.held === true) return true
+    return typeof entry.message === 'string' && isOutboundWriteHeldText(entry.message)
+  }
+  return false
 }
 
 function summarizeErrorArray(errors: unknown[]): string {

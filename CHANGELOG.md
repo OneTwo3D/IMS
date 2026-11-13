@@ -10,6 +10,12 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### Cron routes answer non-2xx when their run failed (backend / operations)
+
+- **A failed cron run no longer answers 200.** Every route under `app/api/cron/` now answers through one shared mapping, so the crontab wrapper's `curl -sf` (and the Healthchecks heartbeat behind it) sees a failing run as a failing job, on stage and in production. Before, `wc-reconcile` could record `failed` every hour while its heartbeat stayed green.
+- **Four outcomes: ok, skipped, held, failed.** ok, skipped (a plugin or sync switched off, maintenance) and held answer 200; only failed answers 500. Held means the only problems were writes the outbound-write hold refused, which is the normal state of a stage installation (no outbound grant), so stage heartbeats do not go red by design. A held write next to a genuine failure is failed. Held writes are recognised by the hold's own reference, not by wording a destination could send.
+- **Nothing recorded changes.** `cron_runs` still shows `failed` for a held-only run, with the held texts as the reason. Routes that did not write a run row are now classified from their result by the same rules; `accounting-fx-revaluation` now answers 500 (was 400) when the revaluation does not succeed. A test reads every cron route and fails if one builds its own response. The contract is in `docs/installation.md` (Cron Jobs).
+
 ### Merged Mintsoft orders: a cancelled order's lines are taken out of the combined order
 
 - **A cancelled (or fully refunded) IMS order that Mintsoft merged into another is now removed from the combined order automatically.** Mintsoft keeps every original line on the merged order under its original line id (confirmed live 2026-11-12, including a SKU both orders share, which stays as two separate lines). IMS now records those line ids when it pushes an order (one read-back right after the create, and again after an amendment) and, on the cancel, deletes exactly that order's lines from the combined order, reads the combined order again after each delete, proves the line is gone and every other line unchanged, tries to leave a warehouse note naming the order and the lines removed (best effort; not guaranteed), and marks the order's link cancelled. The combined order itself is never cancelled while it holds another order's lines; when the cancelled order's lines are the only ones left, it is cancelled normally.

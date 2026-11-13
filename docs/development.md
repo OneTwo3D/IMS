@@ -613,6 +613,10 @@ Remediation path:
 
 This repository treats `prisma/schema.prisma` as the canonical application schema. Migrations, deployment scripts, and CI all assume the Prisma schema and the live database describe the same shape unless a difference is intentionally documented as unsupported by Prisma.
 
+## Cron Routes
+
+A route under `app/api/cron/` answers through `lib/ops/cron-response.ts`: `cronRunResponse` for a run wrapped in `runCronWithLogging`, `cronResultResponse` for one that is not. Never build a `NextResponse` there; the crontab wrapper runs `curl -sf`, so the status is the job's exit status and the Healthchecks heartbeat. A run is ok, skipped or held (2xx) or failed (500); held is a write the outbound-write hold refused and must not alarm. Report a failure in the result (`error`, `errors`, `failed`, `success: false`) or pass `outcomeClass: 'failed'`, and report a refused write as its hold text or with `held: true`. The contract is in `docs/installation.md` (Exit status of a cron job); `tests/ops/cron-response-census.test.ts` fails a route that builds its own response.
+
 ## Decimal Boundary Guard
 
 Guarded domain and accounting integration paths must not import `decimalToNumber` from `@/lib/decimal` unless the file carries an explicit boundary rationale comment:

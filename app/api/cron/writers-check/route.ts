@@ -1,10 +1,9 @@
-import { NextResponse } from 'next/server'
-
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
-import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
+import { runCronWithLogging } from '@/lib/ops/cron-run'
 import { runWritersCheckRecord } from '@/lib/ops/writers-check-record'
+import { cronRunResponse } from '@/lib/ops/cron-response'
 
 export const runtime = 'nodejs'
 
@@ -18,7 +17,7 @@ export async function GET(request: Request) {
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
 
-  const { runId, result, responseStatus } = await runCronWithLogging({
+  const { runId, result, outcomeClass, responseStatus } = await runCronWithLogging({
     jobName: 'writers-check',
     run: async () => ({ ...(await runWritersCheckRecord()) }),
     getOutcome: (outcome) => ({
@@ -30,5 +29,5 @@ export async function GET(request: Request) {
     }),
   })
 
-  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit({ status: responseStatus ?? 200 }))
+  return cronRunResponse({ runId, result, outcomeClass, responseStatus })
 }

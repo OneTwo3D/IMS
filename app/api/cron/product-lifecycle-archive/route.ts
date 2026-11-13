@@ -1,15 +1,9 @@
-import { NextResponse } from 'next/server'
-
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit, type CronRateLimitChecker } from '@/lib/cron-rate-limit'
 import { archiveExhaustedEolProducts } from '@/lib/domain/inventory/product-lifecycle-archive'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
-import {
-  appendCronRunId,
-  cronRunResponseInit,
-  runCronWithLogging,
-  type CronRunLogWriter,
-} from '@/lib/ops/cron-run'
+import { runCronWithLogging, type CronRunLogWriter } from '@/lib/ops/cron-run'
+import { cronRunResponse } from '@/lib/ops/cron-response'
 
 export const runtime = 'nodejs'
 
@@ -56,7 +50,7 @@ export async function handleProductLifecycleArchiveCron(
 
   const now = options.now ?? (() => new Date())
   const archiveProducts = options.archiveProducts ?? archiveExhaustedEolProducts
-  const { runId, result } = await runCronWithLogging({
+  const { runId, result, outcomeClass, responseStatus } = await runCronWithLogging({
     jobName: 'product-lifecycle-archive',
     now,
     createRunId: options.createRunId,
@@ -72,7 +66,7 @@ export async function handleProductLifecycleArchiveCron(
     }),
   })
 
-  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit())
+  return cronRunResponse({ runId, result, outcomeClass, responseStatus })
 }
 
 export async function GET(request: Request) {
