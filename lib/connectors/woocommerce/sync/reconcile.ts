@@ -93,6 +93,8 @@ export async function runWcReconcile(): Promise<Record<string, unknown>> {
       await queueRefundStockCorrections({ limit: 50 })
     } catch (error) {
       console.error('[wc-reconcile] queueing open refund stock corrections failed', error)
+      // Carried into the result, not dropped: the rest of the run goes on, and the cron exit status reads this (held-aware, by the error text).
+      results.refundStockCorrections = { error: error instanceof Error ? error.message : String(error) }
     }
     const queued = await processQueuedWcStockSyncJobs({ limit: 100 })
     const lastReconcile = await db.setting.findUnique({ where: { key: 'last_wc_stock_daily_reconcile_at' } })

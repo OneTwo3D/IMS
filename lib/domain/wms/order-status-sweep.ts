@@ -25,6 +25,8 @@ export type WmsOrderStatusSweepResult = {
   scanned: number
   updated: number
   failed: number
+  /** PRESENT ONLY WHEN NON-EMPTY: storefront status pushes that failed (best-effort, retried next tick). A write the outbound hold refused carries the hold's text, so the cron exit status reads it as held. */
+  errors?: string[]
 }
 
 /**
@@ -159,6 +161,7 @@ export async function runWmsOrderStatusSweep(
 
   let updated = 0
   let failed = 0
+  const pushErrors: string[] = []
   // Orders whose read did not RESOLVE even though nothing threw: a null fetch whose presence probe
   // failed, could not run, or found the order without being able to read its status. They are not
   // `failed` (the returned counters and the snapshot rows keep their meaning), but the read-sync
@@ -333,9 +336,11 @@ export async function runWmsOrderStatusSweep(
             // A shadowed push (the producer-side hold) is neither pushed nor failed: wcPushedStatus stays unchanged so the
             // live phase's first tick pushes the then-current status, and nothing is logged as a failure.
             console.warn(`[wms-order-status-sweep] storefront WMS-status push failed for order ${order.id}: ${pushResult.error}`)
+            pushErrors.push(pushResult.error ?? 'Storefront WMS-status push failed')
           }
         } catch (pushError) {
           console.error('[wms-order-status-sweep] storefront WMS-status push errored', pushError)
+          pushErrors.push(pushError instanceof Error ? pushError.message : String(pushError))
         }
       }
     } catch (error) {
@@ -383,5 +388,5 @@ export async function runWmsOrderStatusSweep(
     })
   }
 
-  return { scanned: orders.length, updated, failed }
+  return { scanned: orders.length, updated, failed, ...(pushErrors.length > 0 ? { errors: pushErrors.slice(0, 20) } : {}) }
 }

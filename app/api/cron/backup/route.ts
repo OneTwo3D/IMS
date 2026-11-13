@@ -126,6 +126,8 @@ export async function GET(request: Request) {
       // Upload to remote if configured
       const autoUploadTarget = await getSetting('backup_auto_upload')
       let uploaded = false
+      // Set when a remote target IS configured and the upload failed: the backup exists locally but is not off the machine, which is the point of the target.
+      let uploadError: string | null = null
       if (autoUploadTarget === 's3' || autoUploadTarget === 'sftp') {
         try {
           await uploadBackupArtifactsToTarget(
@@ -148,11 +150,13 @@ export async function GET(request: Request) {
             description: `Scheduled backup created but remote upload to ${autoUploadTarget} failed: ${String(error)}`,
             metadata,
           })
+          uploadError = `Remote upload to ${autoUploadTarget} failed`
         }
       }
 
       // Cleanup: remove old backups beyond retention
       let deleted = 0
+      let cleanupError: string | null = null
       try {
         const files = await readdir(BACKUP_DIR)
         const backups: { name: string; mtime: Date }[] = []
@@ -172,7 +176,11 @@ export async function GET(request: Request) {
             deleted++
           }
         }
-      } catch { /* ignore cleanup errors */ }
+      } catch (error) {
+        // The backup itself is fine, but old copies were not purged, so the folder keeps growing: reported, not dropped.
+        cleanupError = 'Old backups could not be purged'
+        console.error('[backup] retention cleanup failed', error)
+      }
 
       await logActivity({
         entityType: 'SYSTEM',
@@ -181,10 +189,11 @@ export async function GET(request: Request) {
         description: `Scheduled backup ${filename} created${uploaded ? ` and uploaded to ${autoUploadTarget}` : ''}${deleted > 0 ? `, ${deleted} old backup(s) purged` : ''}`,
       })
 
-      return { filename, uploaded, deleted }
+      return { filename, uploaded, deleted, ...(uploadError ? { uploadError } : {}), ...(cleanupError ? { cleanupError } : {}) }
     },
     getOutcome: (result) => ({
       responseStatus: 'error' in result ? 500 : 200,
+      statusReason: [(result as Record<string, unknown>).uploadError, (result as Record<string, unknown>).cleanupError].filter((reason): reason is string => typeof reason === 'string').join('; ') || null,
     }),
     outcomeOf: (result) => cronOutcome('backup', result),
   })

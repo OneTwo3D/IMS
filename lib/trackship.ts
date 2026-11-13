@@ -24,7 +24,11 @@ type TrackShipResponse = {
   last_event_time?: string
 }
 
-export async function queryTrackShip(apiKey: string, trackingNumber: string, carrier: string): Promise<TrackShipResponse | null> {
+/**
+ * Returns null when the lookup failed. `onFailure` is told when the failure is one a person has to fix (a refused key, a TrackShip outage or a
+ * transport error), as opposed to the ordinary 4xx for a tracking number TrackShip does not know yet.
+ */
+export async function queryTrackShip(apiKey: string, trackingNumber: string, carrier: string, onFailure?: () => void): Promise<TrackShipResponse | null> {
   try {
     const res = await fetch('https://my.trackship.com/api/v1/get-tracking', {
       method: 'POST',
@@ -47,6 +51,7 @@ export async function queryTrackShip(apiKey: string, trackingNumber: string, car
         metadata: { trackingNumber, carrier, status: res.status },
         resolveUser: false,
       })
+      if (res.status === 401 || res.status === 403 || res.status >= 500) onFailure?.()
       return null
     }
     const data = await res.json()
@@ -68,6 +73,7 @@ export async function queryTrackShip(apiKey: string, trackingNumber: string, car
       metadata: { trackingNumber, carrier },
       resolveUser: false,
     })
+    onFailure?.()
     return null
   }
 }
@@ -145,7 +151,7 @@ export async function markOrderDelivered(
 // Check delivery status for all shipped orders
 // ---------------------------------------------------------------------------
 
-export async function checkDeliveryStatus(): Promise<{ checked: number; delivered: number }> {
+export async function checkDeliveryStatus(): Promise<{ checked: number; delivered: number; failed?: number }> {
   const settings = await db.setting.findMany({
     where: { key: { in: ['delivery_tracking_enabled', 'delivery_tracking_source', 'trackship_api_key'] } },
   })
@@ -176,6 +182,8 @@ export async function checkDeliveryStatus(): Promise<{ checked: number; delivere
 
   let checked = 0
   let delivered = 0
+  /** Lookups TrackShip refused or could not answer, and orders that could not be marked delivered. PRESENT ONLY WHEN NON-ZERO in the result. */
+  let failed = 0
 
   // Hoisted: the transition module is loaded once, not per delivered order.
   const { applySalesOrderStatusTransition } = await import('@/app/actions/sales')
@@ -199,7 +207,7 @@ export async function checkDeliveryStatus(): Promise<{ checked: number; delivere
 
       let allDelivered = trackingEntries.length > 0
       for (const entry of trackingEntries) {
-        const result = await queryTrackShip(apiKey, entry.tracking, entry.carrier)
+        const result = await queryTrackShip(apiKey, entry.tracking, entry.carrier, () => { failed++ })
         if (result?.tracking_status !== 'delivered') {
           allDelivered = false
         }
@@ -220,9 +228,10 @@ export async function checkDeliveryStatus(): Promise<{ checked: number; delivere
         // Isolate per-order failures (e.g. a transient DB error while logging)
         // so one bad order does not abort delivery processing for the rest.
         console.error(`[delivery-status] failed to mark order ${order.id} delivered:`, error)
+        failed++
       }
     }
   }
 
-  return { checked, delivered }
+  return { checked, delivered, ...(failed > 0 ? { failed } : {}) }
 }

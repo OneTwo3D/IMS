@@ -38,13 +38,17 @@ export const cronOutcomes = {
   // errors: string[]
   'accounting-payment-reconcile': (r: { errors?: string[]; skipped?: boolean }) => from(r, structural(r)),
   // failed: number minus outboundHeld; error texts anywhere in the Xero result and the sweeps around it
-  'accounting-sync': (r: { failed?: number; outboundHeld?: number }) => from(r, counts(r, ['failed']), structural(r)),
+  // a sweep that threw is carried in `errors` (held-aware), and counts even on a tick that otherwise skipped by design
+  'accounting-sync': (r: { failed?: number; outboundHeld?: number; errors?: string[] }) => {
+    const sweepFailure = r.errors && r.errors.length > 0 ? structural({ errors: r.errors }) : null
+    return worstOutcome(from(r, counts(r, ['failed']), structural(r)), ...(sweepFailure ? [sweepFailure] : []))
+  },
   // a purge reports what it deleted; there is no failure signal short of a throw
   'activity-cleanup': noFailureSignal,
-  // 'error' in the result
-  backup: (r: object) => from(r, 'error' in r ? 'failed' : null),
-  // delivery lookups report counts only; failure is a throw
-  'delivery-status': noFailureSignal,
+  // `error` (the dump or its manifest failed); `uploadError` (a configured remote target did not take the copy); `cleanupError` (retention purge failed)
+  backup: (r: object) => from(r, 'error' in r || 'uploadError' in r || 'cleanupError' in r ? 'failed' : null),
+  // failed: number (a refused or unanswered TrackShip lookup, an order that could not be marked delivered)
+  'delivery-status': (r: { checked: number; delivered: number; failed?: number }) => from(r, counts(r, ['failed'])),
   // failed (an email that did not send), parked (stale rows moved to the send cap), conflicted, conflictedWithoutSend and
   // unresolvedAfterSend (a duplicate send is possible): numbers; erasureReconcileIncomplete: string[]
   'email-outbox': (r: ProcessEmailOutboxResult & { erasureReconcileIncomplete?: string[] }) =>
@@ -77,7 +81,7 @@ export const cronOutcomes = {
   // failed: number (events that failed to process) and error texts, per connector tick and per drain
   'shopping-webhook-inbox': (r: object) => from(r, counts(r, ['failed']), structural(r)),
   // error texts and lists in each section (orders, products, stock, queued pushes); held pushes are recognised by their text;
-  // products.permanentErrors: permanent import conflicts, reported apart from errors and never cleared without an operator
+  // refundStockCorrections.error (the queueing of open refund stock corrections threw); products.permanentErrors: permanent import conflicts, reported apart from errors and never cleared without an operator
   'wc-reconcile': (r: object) => from(r, structural(r), permanentLists(r, ['permanentErrors'])),
   // the withdrawal and screening failures throw; errors: string[] from the erasure and admission sweeps
   'wc-withdrawal-sweep': (r: object) => from(r, structural(r)),
@@ -85,8 +89,8 @@ export const cronOutcomes = {
   'wms-order-push': (r: WmsOrderPushSweepResult) => from(r, counts(r, ['failed', 'deadLettered'])),
   // status enum; counters.errors: number
   'wms-order-reconcile': (r: WmsOrderReconcileResult) => enumResult(r, ['errors']),
-  // failed: number
-  'wms-order-status': (r: WmsOrderStatusSweepResult) => from(r, counts(r, ['failed'])),
+  // failed: number; errors: string[] (storefront status pushes that failed, held-aware)
+  'wms-order-status': (r: WmsOrderStatusSweepResult) => from(r, counts(r, ['failed']), structural(r)),
   // status: FAILED = breaches nobody could be alerted to
   'wms-watchdog': (r: WmsWatchdogResult): CronOutcomeClass => (r.status === 'FAILED' ? 'failed' : r.status === 'SKIPPED' ? 'skipped' : 'ok'),
   // status: FAILED
