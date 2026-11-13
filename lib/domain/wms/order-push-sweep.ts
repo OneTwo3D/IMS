@@ -343,6 +343,8 @@ export type WmsOrderPushSweepResult = {
   ambiguousCreateAdopted?: number
   /** PRESENT ONLY WHEN NON-ZERO: holds / cancellations the warehouse could not honour, left on the link as an operator notice (the link stays live). */
   operatorNotices?: number
+  /** PRESENT ONLY WHEN NON-ZERO: pushes the outbound-write hold refused. Each is also counted in `failed` (it spent no attempt); the cron exit status subtracts them, so a held push alone does not read as a failure. */
+  outboundHeld?: number
   /** PRESENT ONLY WHEN NON-ZERO: warehouse notes for earlier notices that were delivered on this sweep after an earlier failure. */
   noticeCommentsRetried?: number
   /**
@@ -2703,6 +2705,7 @@ export async function runWmsOrderPushSweepCore(
         const message = scrubWmsError(error, 'WMS order push failed')
         if (dead) result.deadLettered += 1
         else result.failed += 1
+        if (heldByOutboundHold) result.outboundHeld = (result.outboundHeld ?? 0) + 1
         const state: PushState = dead ? 'DEAD_LETTER' : 'PENDING_CREATE'
         // `lastAttemptAt` IS the create dispatch stamp (decideCreateClaim): a stamped PENDING_CREATE link is
         // skipped until its lease expires and then parked AMBIGUOUS_CREATE ("a create may have left"). A

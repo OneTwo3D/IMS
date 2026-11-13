@@ -5,6 +5,7 @@ import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { sweepUnallocatedProcessingOrders } from '@/lib/fulfillment/reallocation-sweep'
 import { sweepUnresolvedDirectCreateMarkers } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { cronResultResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 /**
  * The wall-clock budget for the whole tick, well inside the job's 15-minute cadence.
@@ -70,8 +71,7 @@ export async function GET(request: Request) {
 
   const failed = Object.keys(failures).length > 0
   // A pass that threw only because the outbound-write hold refused a write is held, not failed.
-  return cronResultResponse(
-    { ...(result ?? {}), directCreateMarkers, ...(failed ? { ok: false, failures } : {}) },
-    { outcomeClass: failed ? (genuineFailure ? 'failed' : 'held') : undefined },
-  )
+  const body = { ...(result ?? {}), directCreateMarkers, ...(failed ? { ok: false, failures } : {}) }
+  const mapped = cronOutcome('reallocation-sweep', body)
+  return cronResultResponse(body, { outcomeClass: mapped === 'failed' && !genuineFailure ? 'held' : mapped })
 }

@@ -3,6 +3,7 @@ import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runWmsOrderReconcileSweep } from '@/lib/domain/wms/order-reconcile-sweep'
 import { cronResultResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export async function GET(request: Request) {
   const authFailure = await verifyCron(request)
@@ -15,5 +16,5 @@ export async function GET(request: Request) {
   if (maintenance) return maintenance
 
   const result = await runWmsOrderReconcileSweep('cron')
-  return cronResultResponse(result)
+  return cronResultResponse(result, { outcomeClass: cronOutcome('wms-order-reconcile', result) })
 }

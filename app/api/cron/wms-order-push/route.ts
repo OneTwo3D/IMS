@@ -3,6 +3,7 @@ import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runWmsOrderPushSweep } from '@/lib/domain/wms/order-push-sweep'
 import { cronResultResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
@@ -15,5 +16,5 @@ export async function GET(request: Request) {
   if (maintenance) return maintenance
 
   const result = await runWmsOrderPushSweep()
-  return cronResultResponse(result)
+  return cronResultResponse(result, { outcomeClass: cronOutcome('wms-order-push', result) })
 }

@@ -35,3 +35,20 @@ test('no route passes a hand-set HTTP status to the response (pass an outcomeCla
     assert.doesNotMatch(source, /\{\s*status:\s*\d{3}|status:\s*[a-zA-Z.]+\s*\?\s*\d{3}/, `${slug}: a hand-set status bypasses the mapping`)
   }
 })
+
+test('every cron route declares its own outcome mapping, and the mapping has an entry for it (no inference alone)', async () => {
+  const { cronOutcomes } = await import('../../lib/ops/cron-outcomes.ts')
+  assert.deepEqual(Object.keys(cronOutcomes).sort(), [...slugs].sort(), 'cronOutcomes must have exactly one entry per route directory')
+  for (const slug of slugs) {
+    const source = readFileSync(`${ROOT}/${slug}/route.ts`, 'utf8')
+    assert.ok(source.includes(`cronOutcome('${slug}'`), `${slug}: the route does not call cronOutcome('${slug}', ...) with its own slug`)
+    if (/runCronWithLogging\b/.test(source)) {
+      assert.match(source, /outcomeOf:\s*\(result\)\s*=>\s*cronOutcome\(/, `${slug}: a logged run must pass outcomeOf`)
+    }
+  }
+})
+
+test('a response is never built without a class: the helpers have no inferring default', () => {
+  const source = readFileSync('lib/ops/cron-response.ts', 'utf8')
+  assert.doesNotMatch(source, /classifyCronResult/, 'the response helpers must not infer a class from the result')
+})

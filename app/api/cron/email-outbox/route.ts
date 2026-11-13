@@ -9,6 +9,7 @@ import { reconcileDerivedCopies } from '@/lib/domain/erasure/derived-copies'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { cronResultResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export async function GET(request: Request) {
   const err = await verifyCron(request)
@@ -47,7 +48,9 @@ export async function GET(request: Request) {
       description: 'An erasure reconcile pass did not finish (see metadata for which); personal data may remain on rows of an erased order',
       metadata: { incomplete }, resolveUser: false,
     }).catch(() => undefined)
-    return cronResultResponse({ ...result, erasureReconcileIncomplete: incomplete }, { outcomeClass: 'failed' })
+    const body = { ...result, erasureReconcileIncomplete: incomplete }
+    return cronResultResponse(body, { outcomeClass: cronOutcome('email-outbox', body) })
   }
-  return cronResultResponse(erasure && erasure.addressesErased > 0 ? { ...result, erasureReconciled: erasure } : result)
+  const body = erasure && erasure.addressesErased > 0 ? { ...result, erasureReconciled: erasure } : result
+  return cronResultResponse(body, { outcomeClass: cronOutcome('email-outbox', body) })
 }

@@ -425,6 +425,8 @@ export type WmsDispatchCounters = {
    * dispatched on unread evidence, and the next sweep decides them.
    */
   deferred: number
+  /** PRESENT ONLY WHEN NON-ZERO: errors that are writes the outbound-write hold refused (also counted in `errors`). */
+  outboundHeld?: number
 }
 
 export type WmsDispatchLog = {
@@ -1635,6 +1637,7 @@ export async function runWmsDispatchSweepCore(
     let reason = outcome.reason
     try {
       if (outcome.action === 'error') {
+        if (isOutboundWriteHeldText(outcome.reason)) counters.outboundHeld = (counters.outboundHeld ?? 0) + 1
         const { deadLettered } = await deps.recordDispatchError(candidate, outcome.reason)
         if (deadLettered) reason = `${outcome.reason} — dead-lettered after ${DISPATCH_MAX_CONSECUTIVE_FAILURES} consecutive failures`
       } else if (!outcome.unresolved) {
@@ -2315,6 +2318,8 @@ export type WmsDispatchSweepResult = {
   pending: number
   errors: number
   skippedReason?: string
+  /** PRESENT ONLY WHEN NON-ZERO: errors that are writes the outbound-write hold refused (also counted in `errors`). */
+  outboundHeld?: number
 }
 
 /**
@@ -3562,7 +3567,7 @@ async function runWmsDispatchSweepLocked(
       })
     }
 
-    return { jobId: job.id, status, totalChecked: counters.totalChecked, dispatched: counters.dispatched, pending: counters.pending, errors: effectiveErrors }
+    return { jobId: job.id, status, totalChecked: counters.totalChecked, dispatched: counters.dispatched, pending: counters.pending, errors: effectiveErrors, ...(counters.outboundHeld ? { outboundHeld: counters.outboundHeld } : {}) }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'WMS dispatch sync failed'
     await db.wmsSyncJob.update({ where: { id: job.id }, data: { status: 'FAILED', finishedAt: new Date() } })

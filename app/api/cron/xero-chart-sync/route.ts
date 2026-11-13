@@ -6,6 +6,7 @@ import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runCronWithLogging, type CronRunLogWriter } from '@/lib/ops/cron-run'
 import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export const runtime = 'nodejs'
 
@@ -67,6 +68,7 @@ export async function handleXeroChartSyncCron(
         responseStatus: failed ? 500 : 200,
       }
     },
+    outcomeOf: (result) => cronOutcome('xero-chart-sync', result),
   })
 
   return cronRunResponse({ runId, result: result as Record<string, unknown>, outcomeClass, responseStatus })

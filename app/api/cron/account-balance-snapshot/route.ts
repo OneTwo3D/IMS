@@ -5,6 +5,7 @@ import { balanceDateString } from '@/lib/domain/accounting/account-balance-snaps
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runCronWithLogging, type CronRunLogWriter } from '@/lib/ops/cron-run'
 import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export const runtime = 'nodejs'
 
@@ -68,6 +69,7 @@ export async function handleAccountBalanceSnapshotCron(
       statusReason: result.errors.length > 0 ? result.errors.join('; ') : null,
       responseStatus: result.errors.length > 0 ? 500 : 200,
     }),
+    outcomeOf: (result) => cronOutcome('account-balance-snapshot', result),
   })
 
   return cronRunResponse({ runId, result, outcomeClass, responseStatus })

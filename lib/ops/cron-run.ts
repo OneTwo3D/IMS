@@ -102,6 +102,8 @@ export type RunCronWithLoggingOptions<T extends Record<string, unknown>> = {
   now?: () => Date
   createRunId?: () => string
   getOutcome?: (result: T) => CronRunOutcome<T>
+  /** The route's own mapping of its result to an exit-status class (lib/ops/cron-outcomes.ts). When given it decides the class and the recorded status. */
+  outcomeOf?: (result: NoInfer<T>) => CronOutcomeClass
   writeLog?: CronRunLogWriter
 }
 
@@ -152,21 +154,28 @@ export async function runCronWithLogging<T extends Record<string, unknown>>(
   const explicit = options.getOutcome?.(result) ?? {}
   const outcome = { ...inferred, ...explicit }
   // A route that states its own status decides the class from it; otherwise the result's own classification stands.
-  const outcomeClass: CronOutcomeClass = explicit.outcomeClass
+  const routeClass = options.outcomeOf?.(result)
+  const outcomeClass: CronOutcomeClass = routeClass
+    ?? explicit.outcomeClass
     ?? (explicit.status === undefined
       ? inferred.outcomeClass
       : explicit.status === 'failed' ? 'failed' : explicit.status === 'skipped' ? 'skipped' : 'ok')
     ?? 'ok'
   const finishedAtDate = now()
+  // The route's own class decides what is recorded: a run it calls failed (or held) is never recorded completed.
+  const recordedStatus: CronRunStatus | undefined = routeClass === undefined
+    ? outcome.status
+    : routeClass === 'skipped' ? 'skipped' : routeClass === 'ok' ? 'completed' : 'failed'
   const log = buildCronRunLog({
     runId,
     jobName: options.jobName,
     startedAt,
     finishedAt: finishedAtDate.toISOString(),
     durationMs: durationMs(startedAtDate, finishedAtDate),
-    status: outcome.status ?? 'completed',
+    status: recordedStatus ?? 'completed',
     counts: outcome.counts ?? null,
-    statusReason: outcome.statusReason ?? null,
+    statusReason: outcome.statusReason
+      ?? (routeClass === 'failed' ? 'The run reported failures' : routeClass === 'held' ? 'The only failures were writes held by the outbound-write hold' : null),
   })
 
   // CronRun is the canonical audit record for successful cron execution. If

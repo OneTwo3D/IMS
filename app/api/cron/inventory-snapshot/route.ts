@@ -9,6 +9,7 @@ import {
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runCronWithLogging, type CronRunLogWriter } from '@/lib/ops/cron-run'
 import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export const runtime = 'nodejs'
 
@@ -53,6 +54,7 @@ export async function handleInventorySnapshotCron(
       counts: inventorySnapshotCounts(result),
       statusReason: inventorySnapshotStatusReason(result),
     }),
+    outcomeOf: (result) => cronOutcome('inventory-snapshot', result),
   })
 
   return cronRunResponse({ runId, result, outcomeClass, responseStatus })

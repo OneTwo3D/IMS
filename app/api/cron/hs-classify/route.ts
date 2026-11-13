@@ -3,6 +3,7 @@ import { CRON_RATE_LIMIT_FIFTEEN_MINUTE_MAX, enforceCronRateLimit } from '@/lib/
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runHsClassificationSweep } from '@/lib/trade/hs-classification-sweep'
 import { cronResultResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 /**
  * Background HS-code classification sweep (6igm.4). Classifies a batch of uncoded products and
@@ -20,5 +21,5 @@ export async function GET(request: Request) {
   if (maintenance) return maintenance
 
   const result = await runHsClassificationSweep()
-  return cronResultResponse(result)
+  return cronResultResponse(result, { outcomeClass: cronOutcome('hs-classify', result) })
 }

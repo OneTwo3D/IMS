@@ -4,7 +4,8 @@ import { enqueueMintsoftBookedInRecheckForAsn, sweepUnprocessedMintsoftBookedInE
 import { runPostMaintenanceBookedInRecheck } from '@/lib/domain/wms/post-maintenance-recheck'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
-import { cronResultResponse } from '@/lib/ops/cron-response'
+import { cronResultResponse, cronSkippedResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
@@ -16,7 +17,7 @@ export async function GET(request: Request) {
   if (maintenance) return maintenance
 
   if (!(await isIntegrationPluginEnabled('mintsoft'))) {
-    return cronResultResponse({ skipped: true, reason: 'Mintsoft plugin disabled' })
+    return cronSkippedResponse('Mintsoft plugin disabled')
   }
 
   // o3d-hl8l r4: drain the post-maintenance re-check BEFORE the ordinary sweep. A callback refused
@@ -30,5 +31,6 @@ export async function GET(request: Request) {
   })
 
   const result = await sweepUnprocessedMintsoftBookedInEvents()
-  return cronResultResponse({ ...result, postMaintenanceRecheck: recheck })
+  const body = { ...result, postMaintenanceRecheck: recheck }
+  return cronResultResponse(body, { outcomeClass: cronOutcome('mintsoft-webhook-sweeper', body) })
 }

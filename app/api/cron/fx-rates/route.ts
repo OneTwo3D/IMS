@@ -5,6 +5,7 @@ import { fetchAllFxRatesInternal } from '@/lib/currencies/fx-refresh'
 import { logActivity } from '@/lib/activity-log'
 import { runCronWithLogging } from '@/lib/ops/cron-run'
 import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export async function GET(request: Request) {
   const err = await verifyCron(request)
@@ -44,6 +45,7 @@ export async function GET(request: Request) {
       return { ...refreshed, pendingWcReceiptRetry: { queue, orphans }, ...(stepFailures.length > 0 ? { stepFailures } : {}) }
     },
     getOutcome: (result) => ({ result, ...(Array.isArray((result as { stepFailures?: unknown }).stepFailures) ? { responseStatus: 500 } : {}) }),
+    outcomeOf: (result) => cronOutcome('fx-rates', result),
   })
 
   return cronRunResponse({ runId, result, outcomeClass, responseStatus })

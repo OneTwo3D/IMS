@@ -4,6 +4,7 @@ import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { resolveScheduledDailyBatchSweep } from '@/lib/domain/accounting/daily-batch-sweep-schedule'
 import { runCronWithLogging } from '@/lib/ops/cron-run'
 import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
@@ -34,6 +35,7 @@ export async function GET(request: Request) {
         }
       }
     },
+    outcomeOf: (result) => cronOutcome('accounting-daily-batch', result),
   })
 
   return cronRunResponse({ runId, result, outcomeClass, responseStatus })

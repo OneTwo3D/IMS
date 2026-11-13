@@ -17,6 +17,7 @@ import {
 } from '@/lib/domain/settings/backup-schedule-input'
 import { isBackupScheduleEnabled } from '@/lib/domain/settings/backup-schedule-enabled'
 import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 const BACKUP_DIR = getBackupDir()
 
@@ -185,6 +186,7 @@ export async function GET(request: Request) {
     getOutcome: (result) => ({
       responseStatus: 'error' in result ? 500 : 200,
     }),
+    outcomeOf: (result) => cronOutcome('backup', result),
   })
 
   return cronRunResponse({ runId, result, outcomeClass, responseStatus })

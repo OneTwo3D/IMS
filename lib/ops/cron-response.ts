@@ -2,7 +2,6 @@ import { NextResponse } from 'next/server'
 
 import {
   appendCronRunId,
-  classifyCronResult,
   cronResponseStatusFor,
   cronRunResponseInit,
   type CronOutcomeClass,
@@ -17,25 +16,28 @@ import {
  * tests/ops/cron-response-census.test.ts holds every route under app/api/cron to this module.
  */
 
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
-
 /** A run that went through runCronWithLogging. A route-set error status (>= 400) is kept; a failed run can never answer 2xx. */
 export function cronRunResponse(
-  run: { runId: string; result: object; outcomeClass?: CronOutcomeClass; responseStatus?: number },
+  run: { runId: string; result: object; outcomeClass: CronOutcomeClass; responseStatus?: number },
   init: ResponseInit = {},
 ): NextResponse {
   const status = run.responseStatus !== undefined && run.responseStatus >= 400
     ? run.responseStatus
-    : cronResponseStatusFor(run.outcomeClass ?? classifyCronResult(run.result as Record<string, unknown>).outcomeClass)
+    : cronResponseStatusFor(run.outcomeClass)
   return NextResponse.json(appendCronRunId(run.result as Record<string, unknown>, run.runId), cronRunResponseInit({ ...init, status }))
 }
 
-/** A run that is not logged as a cron run: the result is classified the same way. `outcomeClass` overrides when the route knows. */
+/** A run that is not logged as a cron run. The route states the class from its own mapping (`cronOutcome` in lib/ops/cron-outcomes.ts). */
 export function cronResultResponse(
   result: unknown,
-  options: { outcomeClass?: CronOutcomeClass } & ResponseInit = {},
+  options: { outcomeClass: CronOutcomeClass } & ResponseInit,
 ): NextResponse {
   const { outcomeClass, ...init } = options
-  const status = cronResponseStatusFor(outcomeClass ?? classifyCronResult(isRecord(result) ? result : {}).outcomeClass)
+  const status = cronResponseStatusFor(outcomeClass)
   return NextResponse.json(result, cronRunResponseInit({ ...init, status }))
+}
+
+/** A run that did nothing by design (a plugin or sync switched off, nothing configured): 200, and never a failure. */
+export function cronSkippedResponse(reason: string, extra: Record<string, unknown> = {}): NextResponse {
+  return cronResultResponse({ skipped: true, reason, ...extra }, { outcomeClass: 'skipped' })
 }

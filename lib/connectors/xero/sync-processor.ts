@@ -8,6 +8,7 @@ import { holdInvoiceOnRegimePolicyChange, REGIME_ACCOUNT_CHANGED_REFUSAL, REGIME
 import { resolveSalesPostContact } from '@/lib/domain/erasure/accounting-contact'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { getRateLimitBackoffMs, isRateLimitError } from './deferral'
+import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { isUsableImsRate } from '@/lib/domain/accounting/foreign-currency-rate-guard'
@@ -301,6 +302,8 @@ type ProcessResult = {
   succeeded: number
   failed: number
   skipped: number
+  /** PRESENT ONLY WHEN NON-ZERO: failures that are writes the outbound-write hold refused (also counted in `failed`). */
+  outboundHeld?: number
 }
 
 type SyncPayload = Record<string, unknown>
@@ -4404,6 +4407,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           })
         }
         result.failed++
+        if (isOutboundWriteHeldText(errorMessage)) result.outboundHeld = (result.outboundHeld ?? 0) + 1
       }
     } catch (e) {
       if (e instanceof PostedDocumentEvidenceUnwritten) {
@@ -4430,6 +4434,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         })
       }
       result.failed++
+      if (isOutboundWriteHeldText(errorMessage)) result.outboundHeld = (result.outboundHeld ?? 0) + 1
     }
   }
 

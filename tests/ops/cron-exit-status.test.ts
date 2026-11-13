@@ -36,7 +36,7 @@ test('ok: a clean result is 2xx', () => {
 test('skipped: skipped by design is 2xx, whatever else the result carries', () => {
   const result = { skipped: true, reason: 'WC sync disabled' }
   assert.equal(classifyCronResult(result).outcomeClass, 'skipped')
-  assert.equal(cronResultResponse(result).status, 200)
+  assert.equal(cronResultResponse(result, { outcomeClass: classifyCronResult(result).outcomeClass }).status, 200)
   assert.equal(cronResponseStatusFor('skipped'), 200)
 })
 
@@ -52,7 +52,7 @@ test('failed: a genuine failure is non-2xx, in each place a failure is reported'
     { stock: { sync: { errors: ['Stock push failed'] } } },
   ]) {
     assert.equal(classifyCronResult(result).outcomeClass, 'failed', JSON.stringify(result))
-    assert.equal(cronResultResponse(result).status, 500, JSON.stringify(result))
+    assert.equal(cronResultResponse(result, { outcomeClass: classifyCronResult(result).outcomeClass }).status, 500, JSON.stringify(result))
   }
 })
 
@@ -66,7 +66,7 @@ test('held: a result whose only failures are held writes is 2xx', () => {
     { error: `Failed to push product 7: ${heldText()}` },
   ]) {
     assert.equal(classifyCronResult(result).outcomeClass, 'held', JSON.stringify(result))
-    assert.equal(cronResultResponse(result).status, 200, JSON.stringify(result))
+    assert.equal(cronResultResponse(result, { outcomeClass: classifyCronResult(result).outcomeClass }).status, 200, JSON.stringify(result))
   }
 })
 
@@ -78,7 +78,7 @@ test('mixed: a held write next to a genuine failure is non-2xx', () => {
     { stock: { error: 'WooCommerce said no' } , queued: { errors: [heldText()] } },
   ]) {
     assert.equal(classifyCronResult(result).outcomeClass, 'failed', JSON.stringify(result))
-    assert.equal(cronResultResponse(result).status, 500, JSON.stringify(result))
+    assert.equal(cronResultResponse(result, { outcomeClass: classifyCronResult(result).outcomeClass }).status, 500, JSON.stringify(result))
   }
 })
 

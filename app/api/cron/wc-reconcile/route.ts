@@ -6,6 +6,7 @@ import { runWcReconcile } from '@/lib/connectors/woocommerce/sync/reconcile'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { runCronWithLogging } from '@/lib/ops/cron-run'
 import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 // Called by cron with Authorization: Bearer $CRON_SECRET.
 export async function GET(request: Request) {
@@ -30,6 +31,7 @@ export async function GET(request: Request) {
 
       return await runWcReconcile() as Record<string, unknown>
     },
+    outcomeOf: (result) => cronOutcome('wc-reconcile', result),
   })
 
   return cronRunResponse({ runId, result, outcomeClass, responseStatus })

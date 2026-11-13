@@ -4,6 +4,7 @@ import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runCronWithLogging } from '@/lib/ops/cron-run'
 import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export const runtime = 'nodejs'
 
@@ -18,6 +19,7 @@ export async function GET(request: Request) {
   const { runId, result, outcomeClass } = await runCronWithLogging({
     jobName: 'invariant-check',
     run: async ({ runId }) => await runScheduledInvariantCheck({ createRunId: () => runId }) as unknown as Record<string, unknown>,
+    outcomeOf: (result) => cronOutcome('invariant-check', result),
   })
 
   // Any status but completed is a failure of the check, whatever the result carries.

@@ -3,7 +3,8 @@ import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { runMintsoftReturnsSync } from '@/lib/connectors/mintsoft/sync/returns-sync'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
-import { cronResultResponse } from '@/lib/ops/cron-response'
+import { cronResultResponse, cronSkippedResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
@@ -15,8 +16,9 @@ export async function GET(request: Request) {
   if (maintenance) return maintenance
 
   if (!(await isIntegrationPluginEnabled('mintsoft'))) {
-    return cronResultResponse({ skipped: true, reason: 'Mintsoft plugin disabled' })
+    return cronSkippedResponse('Mintsoft plugin disabled')
   }
 
-  return cronResultResponse(await runMintsoftReturnsSync('cron'))
+  const result = await runMintsoftReturnsSync('cron')
+  return cronResultResponse(result, { outcomeClass: cronOutcome('mintsoft-returns-sync', result) })
 }

@@ -7,6 +7,7 @@ import { runCronWithLogging } from '@/lib/ops/cron-run'
 import { sweepDispatchEligibleWithdrawals, sweepWithdrawalSuppressions } from '@/lib/connectors/woocommerce/sync/withdrawal'
 import { drainWcOrderAdmissionRefusals } from '@/lib/connectors/woocommerce/sync/order-admission'
 import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 // Called by cron with Authorization: Bearer $CRON_SECRET.
 export async function GET(request: Request) {
@@ -94,6 +95,7 @@ export async function GET(request: Request) {
         return { ...sweep, dispatchScreen: recon ?? undefined, admissionRefusals }
       })
     },
+    outcomeOf: (result) => cronOutcome('wc-withdrawal-sweep', result),
   })
 
   return cronRunResponse({ runId, result, outcomeClass, responseStatus })

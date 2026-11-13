@@ -4,6 +4,7 @@ import { recomputeProductObservedLeadTimes } from '@/lib/domain/purchasing/produ
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runCronWithLogging, type CronRunLogWriter } from '@/lib/ops/cron-run'
 import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export const runtime = 'nodejs'
 
@@ -36,10 +37,10 @@ export async function handleRecomputeProductLeadTimesCron(
     writeLog: options.writeLog,
     run: async () => recompute({ now }),
     getOutcome: (r) => ({
-      status: 'completed',
       counts: { scanned: r.scanned, updated: r.updated, cleared: r.cleared, failed: r.failed },
       statusReason: `Observed lead time: ${r.updated} updated, ${r.cleared} cleared, ${r.failed} failed (${r.scanned} with PO history)`,
     }),
+    outcomeOf: (result) => cronOutcome('recompute-product-lead-times', result),
   })
 
   return cronRunResponse({ runId, result, outcomeClass, responseStatus })

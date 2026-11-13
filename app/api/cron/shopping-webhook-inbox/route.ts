@@ -6,6 +6,7 @@ import { processPendingWcWebhookEvents } from '@/lib/jobs/woocommerce/process-sh
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runCronWithLogging } from '@/lib/ops/cron-run'
 import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 type ConnectorTickResult = Record<string, unknown>
 
@@ -146,6 +147,7 @@ export async function GET(request: Request) {
 
       return { connectors: { woocommerce: { ...woocommerce, orderCompletions, orderStatusPushes, invoiceDocumentPublications } } } as Record<string, unknown>
     },
+    outcomeOf: (result) => cronOutcome('shopping-webhook-inbox', result),
   })
 
   return cronRunResponse({ runId, result, outcomeClass, responseStatus })

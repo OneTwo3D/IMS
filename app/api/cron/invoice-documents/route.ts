@@ -6,6 +6,7 @@ import { runInvoiceDocumentSweep } from '@/lib/domain/invoice-documents/sweep'
 import { getInvoiceDocumentHealth } from '@/lib/domain/invoice-documents/health'
 import { xeroInvoiceDocumentDeps } from '@/lib/connectors/xero/invoice-document-deps'
 import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export const runtime = 'nodejs'
 
@@ -28,6 +29,7 @@ export async function GET(request: Request) {
       statusReason: outcome.stoppedEarly ?? (outcome.skipped ? `skipped: ${outcome.skipped}` : null),
       responseStatus: outcome.stoppedEarly && outcome.stored === 0 && outcome.failed > 0 ? 500 : 200,
     }),
+    outcomeOf: (result) => cronOutcome('invoice-documents', result),
   })
 
   return cronRunResponse({ runId, result, outcomeClass, responseStatus })

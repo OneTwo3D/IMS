@@ -3,6 +3,7 @@ import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runArApFxRevaluation } from '@/lib/accounting-fx-revaluation'
 import { cronResultResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
@@ -15,5 +16,5 @@ export async function GET(request: Request) {
   const url = new URL(request.url)
   const valuationDate = url.searchParams.get('date') ?? undefined
   const result = await runArApFxRevaluation({ valuationDate })
-  return cronResultResponse(result, { outcomeClass: result.success ? undefined : 'failed' })
+  return cronResultResponse(result, { outcomeClass: cronOutcome('accounting-fx-revaluation', result) })
 }

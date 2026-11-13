@@ -4,6 +4,7 @@ import { archiveExhaustedEolProducts } from '@/lib/domain/inventory/product-life
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runCronWithLogging, type CronRunLogWriter } from '@/lib/ops/cron-run'
 import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export const runtime = 'nodejs'
 
@@ -64,6 +65,7 @@ export async function handleProductLifecycleArchiveCron(
       counts: productLifecycleArchiveCounts(result),
       statusReason: productLifecycleArchiveStatusReason(result),
     }),
+    outcomeOf: (result) => cronOutcome('product-lifecycle-archive', result),
   })
 
   return cronRunResponse({ runId, result, outcomeClass, responseStatus })

@@ -5,6 +5,7 @@ import { runCronWithLogging } from '@/lib/ops/cron-run'
 import { runScheduledReconciliationPack } from '@/lib/ops/reconciliation-pack-schedule'
 import { PACK_SCHEDULE_SLUG } from '@/lib/reconciliation-pack/schedule-constants'
 import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export const runtime = 'nodejs'
 
@@ -43,6 +44,7 @@ export async function GET(request: Request) {
         responseStatus: failed ? 500 : 200,
       }
     },
+    outcomeOf: (result) => cronOutcome('reconciliation-pack', result),
   })
 
   return cronRunResponse({ runId, result, outcomeClass, responseStatus })

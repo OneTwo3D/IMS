@@ -4,7 +4,8 @@ import { db } from '@/lib/db'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { isAccountingConnectorConnected } from '@/lib/accounting'
-import { cronResultResponse } from '@/lib/ops/cron-response'
+import { cronResultResponse, cronSkippedResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
@@ -28,10 +29,10 @@ export async function GET(request: Request) {
   if (await isIntegrationPluginEnabled('xero')) {
     const enabled = await db.setting.findUnique({ where: { key: 'xero_sync_enabled' } })
     if (enabled?.value !== 'true') {
-      return cronResultResponse({ skipped: true, reason: 'Xero sync disabled', provisionalPostingRefusals })
+      return cronSkippedResponse('Xero sync disabled', { provisionalPostingRefusals })
     }
     if (!(await isAccountingConnectorConnected('xero'))) {
-      return cronResultResponse({ skipped: true, reason: 'Xero not connected', provisionalPostingRefusals })
+      return cronSkippedResponse('Xero not connected', { provisionalPostingRefusals })
     }
     // audit-grob: drain the landed-cost adjustment-journal backstop FIRST so any
     // journals lost to a crash are re-queued (into AccountingSyncLog) in time for
@@ -55,7 +56,8 @@ export async function GET(request: Request) {
     } catch (reenqueueError) {
       console.error('accounting-sync cron: credit-note allocation re-enqueue sweep failed', reenqueueError)
     }
-    return cronResultResponse({ ...result, backReferenceRepair, creditNoteAllocationReenqueue, landedCostJournalOutbox, provisionalPostingRefusals })
+    const body = { ...result, backReferenceRepair, creditNoteAllocationReenqueue, landedCostJournalOutbox, provisionalPostingRefusals }
+    return cronResultResponse(body, { outcomeClass: cronOutcome('accounting-sync', body) })
   }
 
   // THE QUICKBOOKS BRANCH WAS HERE, AND IS ARCHIVED (o3d-remove-parked-connectors).
@@ -71,7 +73,7 @@ export async function GET(request: Request) {
   // POST-TIME AUTHORIZATION (o3d-8prh) and ORIGIN PROPAGATION — are what a second connector would
   // have to satisfy before its rows may be swept. See docs/archive/quickbooks-connector-removal.md.
 
-  return cronResultResponse({ skipped: true, reason: 'No accounting plugin enabled', provisionalPostingRefusals })
+  return cronSkippedResponse('No accounting plugin enabled', { provisionalPostingRefusals })
 }
 
 // audit-grob: drain the landed-cost adjustment-journal backstop. Called only from

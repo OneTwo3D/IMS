@@ -5,6 +5,7 @@ import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { isAccountingConnectorConnected } from '@/lib/accounting'
 import { runCronWithLogging } from '@/lib/ops/cron-run'
 import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 /**
  * Daily/hourly IMS↔Xero TaxRate drift detection (0jls5). Compares each active IMS
@@ -33,6 +34,7 @@ export async function GET(request: Request) {
       const sweep = await runXeroTaxRateDriftSweep()
       return { checked: sweep.checked, drifted: sweep.drifted }
     },
+    outcomeOf: (result) => cronOutcome('xero-tax-rate-drift', result),
   })
 
   return cronRunResponse({ runId, result, outcomeClass, responseStatus })
