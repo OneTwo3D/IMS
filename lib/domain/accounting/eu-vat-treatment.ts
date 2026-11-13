@@ -21,6 +21,7 @@
  */
 import { currencyMinorUnits, roundMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { droppedExtraMapping } from './sales-document-tax-types'
+import { withLedgerCheck } from './hand-post-instruction'
 import type { EuVatRegimeDecision, EuVatRegimeInput } from './eu-vat-regime'
 import type { StampedRegime } from './eu-vat-regime-stamp'
 
@@ -323,6 +324,13 @@ export function routeFor(
     return {
       ok: false,
       reason: `the order was stamped ${stamp.regime} on account ${stamp.vatAccount}, but its facts now decide ${decision.regime} on account ${decision.vatAccount.trim()}; the stamp is never re-derived, so it is not posted until a person looks`,
+    }
+  }
+  // The posting type is part of what the stamp recorded: a credit note reverses THAT type, so an invoice must not be posted on another one because a rate's Xero mapping moved after the stamp. A stamp that recorded none (written before it was kept) is not held to it.
+  if (stamp.schemePostingTaxType != null && stamp.schemePostingTaxType.trim() !== decision.schemePostingTaxType.trim()) {
+    return {
+      ok: false,
+      reason: withLedgerCheck(`the order was stamped on the zero-rated type ${stamp.schemePostingTaxType}, but the rate's Xero mapping now says ${decision.schemePostingTaxType}; it changed since the order was stamped, so the invoice is not posted on a type that a credit note would not reverse. Restore the rate's scheme posting type to ${stamp.schemePostingTaxType} (Settings > Tax Rates) and re-import the order, or post the invoice by hand in Xero`),
     }
   }
   const percent = schemeRatePercent(input)

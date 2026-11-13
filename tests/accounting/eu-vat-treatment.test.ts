@@ -280,12 +280,39 @@ test('routeFor: a stamp and the current facts that contradict each other refuse;
   const e = routeFor({ regime: 'IOSS', vatAccount: '821', stampedAt }, scheme, built.input)
   assert.ok(e.ok)
   assert.deepEqual(e.ok && e.route.kind === 'scheme' && [e.route.regime, e.route.vatAccount], ['IOSS', '821'])
+  // the zero-rated type recorded with the stamp is compared trimmed on both sides, and the route keeps the decision's own (trimmed) type
+  assert.equal(scheme.kind === 'SCHEME', true)
+  if (scheme.kind === 'SCHEME') {
+    const padStamp = routeFor({ regime: 'IOSS', vatAccount: '821', stampedAt, schemePostingTaxType: ` ${scheme.schemePostingTaxType} ` }, scheme, built.input)
+    assert.ok(padStamp.ok, 'a padded stamped type is the same type')
+    assert.equal(padStamp.ok && padStamp.route.kind === 'scheme' && padStamp.route.schemePostingTaxType, scheme.schemePostingTaxType)
+    const padDecision = routeFor({ regime: 'IOSS', vatAccount: '821', stampedAt, schemePostingTaxType: scheme.schemePostingTaxType }, { ...scheme, schemePostingTaxType: `${scheme.schemePostingTaxType} ` }, built.input)
+    assert.ok(padDecision.ok, 'a padded decided type is the same type')
+    const other = routeFor({ regime: 'IOSS', vatAccount: '821', stampedAt, schemePostingTaxType: 'OTHER_ZERO' }, scheme, built.input)
+    assert.equal(other.ok, false)
+    assert.match(other.ok ? '' : other.reason, /changed since the order was stamped/)
+  }
   // the stamp is never re-derived: a fresh decision of another regime or another account is NOT posted through the old stamp
   const f = routeFor({ regime: 'DDP', vatAccount: '232', stampedAt }, scheme, built.input)
   assert.equal(f.ok, false)
   assert.match(f.ok ? '' : f.reason, /stamped DDP on account 232, but its facts now decide IOSS on account 821/)
   const g = routeFor({ regime: 'IOSS', vatAccount: '999', stampedAt }, scheme, built.input)
   assert.equal(g.ok, false)
+})
+
+test('routeFor: a mapping moved to another zero-rated type AFTER the stamp refuses the invoice (a credit note reverses the stamped type); an unrecorded type is not held to it', () => {
+  const de = schemeRows.find((r) => r.country === 'DE')!
+  const built = build(de, { goodsSubtotal: '100.00' })
+  const scheme = resolveEuVatRegime(built.input)
+  assert.equal(scheme.kind, 'SCHEME')
+  if (scheme.kind !== 'SCHEME') return
+  const stampedAt = new Date()
+  const same = routeFor({ regime: 'IOSS', vatAccount: '821', stampedAt, schemePostingTaxType: scheme.schemePostingTaxType }, scheme, built.input)
+  assert.equal(same.ok, true)
+  const moved = routeFor({ regime: 'IOSS', vatAccount: '821', stampedAt, schemePostingTaxType: 'TAX-OLD' }, scheme, built.input)
+  assert.equal(moved.ok, false)
+  assert.match(moved.ok ? '' : moved.reason, /the order was stamped on the zero-rated type TAX-OLD, but the rate's Xero mapping now says .*changed since the order was stamped/)
+  assert.equal(routeFor({ regime: 'IOSS', vatAccount: '821', stampedAt, schemePostingTaxType: null }, scheme, built.input).ok, true)
 })
 
 test('a threshold-crossing re-import: stamped IOSS at 96, the goods rise over EUR 150, the fresh decision is DDP, so the invoice is refused, not posted through the IOSS stamp', () => {

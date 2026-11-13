@@ -2,7 +2,7 @@
  * Push credit notes to Xero.
  */
 
-import type { ContactGate } from './invoices'
+import { withSalesInvoiceAuthorization, type BeforeRemoteWrite, type ContactGate } from './invoices'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { createHash } from 'node:crypto'
 import { xeroGet, xeroPost, xeroPut } from './api'
@@ -70,7 +70,7 @@ export const XERO_SALES_CREDIT_NOTE_TYPE = 'ACCRECCREDIT'
 export async function pushCreditNote(
   data: CreditNoteData,
   status: string = 'AUTHORISED',
-  opts?: { idempotencyKey?: string; customerId?: string; contactGate?: ContactGate },
+  opts?: { idempotencyKey?: string; customerId?: string; contactGate?: ContactGate; beforePost?: BeforeRemoteWrite },
 ): Promise<{ success: boolean; creditNoteId?: string; error?: string }> {
   // Xero mandates a TaxType on every line, and there is NO default: a missing one is refused, an explicit NONE only
   // where the line names why it carries no tax (lib/domain/accounting/sales-document-tax-types.ts). BEFORE every round trip.
@@ -139,7 +139,8 @@ export async function pushCreditNote(
   if (xeroCurrencyRate != null) creditNote.CurrencyRate = xeroCurrencyRate
   if (data.reference) creditNote.Reference = data.reference
 
-  const res = await xeroPost<XeroCreditNoteResponse>('CreditNotes', creditNote, opts)
+  // The pre-socket authorization (the EU scheme proof and the recorded regime policy) runs INSIDE the request, as the last statement before it leaves, exactly as it does for a sales invoice. Without one the post is the plain call it always was.
+  const res = await withSalesInvoiceAuthorization(opts?.beforePost, () => xeroPost<XeroCreditNoteResponse>('CreditNotes', creditNote, opts))
   if (!res.ok || !res.data?.CreditNotes?.length) {
     return { success: false, error: res.error ?? 'Failed to create credit note' }
   }

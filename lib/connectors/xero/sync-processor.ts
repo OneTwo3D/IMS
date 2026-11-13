@@ -3,7 +3,8 @@
  * Each entry represents one IMS transaction → one Xero API call.
  */
 
-import { composeFinalBeforePost, euSchemePostingRefusal } from './scheme-posting-check'
+import { refusedCreditNoteError as refusedCreditNoteErrorOf } from '@/lib/domain/accounting/eu-vat-credit-note'
+import { composeFinalBeforePost, creditNoteBeforePost, euCreditNoteSchemePostingRefusal, euSchemePostingRefusal } from './scheme-posting-check'
 import { holdInvoiceOnRegimePolicyChange, REGIME_ACCOUNT_CHANGED_REFUSAL, REGIME_POLICY_BLOCKED_REFUSAL } from '@/lib/connectors/woocommerce/sync/regime-policy-hold'
 import { resolveSalesPostContact } from '@/lib/domain/erasure/accounting-contact'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
@@ -6704,9 +6705,16 @@ export async function processClaimedEntry(
     }
 
     case 'CREDIT_NOTE': {
+      // A credit note IMS refused to build (a scheme order with no recorded regime) is queued only so it shows on /sync and can be settled by hand: it is refused here, before anything else, on every attempt.
+      const refusedCreditNoteError = refusedCreditNoteErrorOf(payload as Record<string, unknown>)
+      if (refusedCreditNoteError !== null) return { success: false, error: refusedCreditNoteError }
       // As the sales invoice: no decided tax type, no document. Before the store-credit guard's reads and any claim.
       const untypedCreditNote = salesDocumentTaxTypeRefusal(`Credit note ${String(payload.creditNoteNumber ?? '(no number)')}`, payload as SalesDocumentTaxTypeInput)
       if (untypedCreditNote) return { success: false, error: untypedCreditNote }
+      // An EU-treated scheme credit note was built under the regime settings recorded on it and on a zero-rated type: both are checked now, before the claim is re-taken, and again as the last statement before the request leaves (`beforePost` below).
+      // A refusal here is final for this payload: a credit note is never superseded or rebuilt in place, so the operator restores the setting or posts by hand, as the refusal says.
+      const creditNoteSchemeRefusal = await euCreditNoteSchemePostingRefusal(payload as Record<string, unknown>)
+      if (creditNoteSchemeRefusal) return { success: false, error: creditNoteSchemeRefusal }
       const storeCreditRefusal = await guardStoreCreditCreditNote(referenceType, referenceId)
       if (storeCreditRefusal) return storeCreditRefusal
       const creditCustomerId = referenceType === 'SalesOrderRefund'
@@ -6718,6 +6726,7 @@ export async function processClaimedEntry(
       // The erasure state is read BEFORE the claim is re-taken and fails closed: if it cannot be read, nothing is posted and the entry is retried.
       const creditContact = await resolveSalesPostContact(referenceType, referenceId, payload)
       if (!creditContact.ok) return { success: false, error: creditContact.error }
+      const creditNoteBeforePostHook = creditNoteBeforePost(payload as Record<string, unknown>)
       const fence = await lease.fenceBeforeRemoteWrite('credit-note')
       if (!fence.ok) return fence.result
       return pushCreditNote({
@@ -6730,7 +6739,7 @@ export async function processClaimedEntry(
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; noTaxKind?: SalesNoTaxLineKind }>,
         reference: payload.reference as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId, contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId, ...(creditNoteBeforePostHook ? { beforePost: creditNoteBeforePostHook } : {}), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
     }
 
     case 'PURCHASE_CREDIT_NOTE': {

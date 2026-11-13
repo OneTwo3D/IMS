@@ -3100,6 +3100,8 @@ export async function recordRefundParkManually(
       {
         internalBypassToken: INTERNAL_ACTION_BYPASS,
         externalRefundId,
+        // IOSS credit notes: the gross WooCommerce returned (the figure the allocation was just reconciled to). A scheme credit note must total it exactly; ignored unless the Sales Invoices switch is on and the order is on a scheme.
+        statedGrossForeign: parkedGross.toNumber(),
         // Codex r3 #2: re-take the per-target caps under the refund transaction's order lock, so two
         // concurrent recordings against this order cannot both pass their own pre-flight and jointly
         // over-refund one line.

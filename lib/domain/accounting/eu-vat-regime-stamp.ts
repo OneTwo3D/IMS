@@ -23,6 +23,13 @@ export type StampedRegime = {
   regime: EuVatRegimeName | null
   vatAccount: string | null
   stampedAt: Date
+  /** The zero-rated posting type recorded with the stamp (scheme.schemePostingTaxType); null/absent on a stamp written before it was kept. */
+  schemePostingTaxType?: string | null
+}
+
+function recordedType(basis: unknown): string | null {
+  const value = (basis as { scheme?: { schemePostingTaxType?: unknown } } | null)?.scheme?.schemePostingTaxType
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : null
 }
 
 export type StampOutcome =
@@ -57,10 +64,10 @@ export async function readEuVatRegimeStamp(
 ): Promise<StampedRegime | null> {
   const row = await client.salesOrder.findUnique({
     where: { id: orderId },
-    select: { euVatRegime: true, euVatLineAccount: true, euVatRegimeStampedAt: true },
+    select: { euVatRegime: true, euVatLineAccount: true, euVatRegimeStampedAt: true, euVatRegimeBasis: true },
   })
   if (!row || row.euVatRegimeStampedAt === null) return null
-  return { regime: row.euVatRegime, vatAccount: row.euVatLineAccount, stampedAt: row.euVatRegimeStampedAt }
+  return { regime: row.euVatRegime, vatAccount: row.euVatLineAccount, stampedAt: row.euVatRegimeStampedAt, schemePostingTaxType: recordedType(row.euVatRegimeBasis) }
 }
 
 /**
@@ -76,11 +83,11 @@ export async function stampEuVatRegime(
   await lockSalesOrder(tx, orderId)
   const row = await tx.salesOrder.findUnique({
     where: { id: orderId },
-    select: { euVatRegime: true, euVatLineAccount: true, euVatRegimeStampedAt: true },
+    select: { euVatRegime: true, euVatLineAccount: true, euVatRegimeStampedAt: true, euVatRegimeBasis: true },
   })
   if (!row) return { kind: 'order_not_found' }
   if (row.euVatRegimeStampedAt !== null) {
-    return { kind: 'already_stamped', stamp: { regime: row.euVatRegime, vatAccount: row.euVatLineAccount, stampedAt: row.euVatRegimeStampedAt } }
+    return { kind: 'already_stamped', stamp: { regime: row.euVatRegime, vatAccount: row.euVatLineAccount, stampedAt: row.euVatRegimeStampedAt, schemePostingTaxType: recordedType(row.euVatRegimeBasis) } }
   }
 
   const decision = resolveEuVatRegime(await buildInput())

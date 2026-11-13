@@ -17,6 +17,7 @@ import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-ma
 import { FULL_REFUND_RATIO } from '@/lib/domain/sales/refund-thresholds'
 import { activeRefundParkWhere, WC_REFUND_PARK_RECORD_KIND } from '@/lib/domain/sales/refund-park-recovery'
 // o3d-w00 (Codex r7 #3): shared with the exception inbox's hand-recording path — see refund-line-link.
+import { easRefundRefusal, refundTaxOnEasRate } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { refundedOrderLineId } from './refund-line-link'
 export { refundedOrderLineId }
 import type { WcRefund } from './types'
@@ -685,6 +686,8 @@ export async function syncWcRefund(
         // o3d-w00: taxBase is what makes the gross->net conversion basis CHECKABLE — the header rate is
         // only trusted when it reproduces the order's own VAT (resolveMonetaryRefundVatRate).
         taxBase: true,
+        // IOSS credit notes: the write-once regime stamp, read only to tell a scheme order (never to decide a regime).
+        euVatRegime: true,
         taxRatePercent: true,
         // o3d-w00 (Codex r1 #2): shippingBase and the per-line tax fields size the reconciliation
         // tolerance to this order's ACTUAL rounding exposure (one penny-rounded VAT figure per line plus
@@ -825,6 +828,28 @@ export async function syncWcRefund(
       return { outcome: 'quarantined-refusal', error: message }
     }
     const refundAmountForeign = parseDecimalAbs(wcRefund.amount)
+
+    // IOSS CREDIT NOTES (behind the Sales Invoices switch): a refund on a scheme-stamped order whose tax the EAS compliance plugin booked on WooCommerce rate 182 is not recorded in this release.
+    // The check is made only for a refund that carries 182 tax on an order stamped on a scheme, and the switch is asked only then, so every other refund is read exactly as before.
+    const easTax = so.euVatRegime != null ? refundTaxOnEasRate(wcRefund) : null
+    if (easTax !== null) {
+      const { isAccountingSyncTypeEnabledFor } = await import('@/lib/accounting')
+      if (await isAccountingSyncTypeEnabledFor('xero', 'SALES_INVOICE')) {
+        const message = easRefundRefusal(wcRefund.id, easTax)
+        await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: message, payload: wcRefund })
+        await writeActivity({
+          entityType: 'SALES_ORDER',
+          entityId: so.id,
+          action: 'refund_sync_eas_rate_182_refused',
+          tag: 'sync',
+          level: 'WARNING',
+          description: message,
+          metadata: { externalRefundId: wcRefund.id },
+          resolveUser: false,
+        })
+        return { outcome: 'quarantined-refusal', error: message }
+      }
+    }
 
     // Determine if restock is needed
     // Restock if any refund line item has qty != 0
@@ -1012,7 +1037,7 @@ export async function syncWcRefund(
         refundLines.filter((l) => l.qty > 0 || l.totalBase > 0),
         wcRefund.reason || 'WooCommerce refund',
         returnWarehouseId,
-        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id },
+        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id, statedGrossForeign: refundAmountForeign.toNumber() },
       )
     } catch (error) {
       if (!isExternalRefundIdUniqueConflict(error)) throw error

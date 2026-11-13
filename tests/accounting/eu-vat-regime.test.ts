@@ -83,7 +83,7 @@ test('a scheme decision states the VAT, the zero-rated posting type and what it 
   assert.equal(d.schemePostingTaxType, 'TAX-DE')
   assert.deepEqual(d.basis, {
     source: 'ims', destination: 'DE', thresholdCurrency: 'EUR', threshold: '150', intrinsicValue: '100', convertedValue: '100.00',
-    fx: { rate: '1', sameCurrency: true, asOf: '2026-11-01T10:00:00.000Z', source: 'same currency' }, pluginFx: notRecorded, vatTotal: '19', wooRateIds: [216], imsRateIds: ['ims-DE'],
+    fx: { rate: '1', sameCurrency: true, asOf: '2026-11-01T10:00:00.000Z', source: 'same currency' }, pluginFx: notRecorded, vatTotal: '19', wooRateIds: [216], imsRateIds: ['ims-DE'], schemePostingTaxType: 'TAX-DE',
   })
   const no = scheme(resolveEuVatRegime(nokOrderOf('1000')))
   assert.equal(no.basis.thresholdCurrency, 'NOK')
