@@ -29,7 +29,7 @@ export type TreatedCreditNoteOutcome =
   | { kind: 'skipped'; why: 'switch_off' | 'not_scheme' }
   | { kind: 'treated'; payload: Record<string, unknown>; regimePolicy: RegimePolicy }
   /** The credit note cannot be raised as it is: the reason is the operator-facing sentence. */
-  | { kind: 'refused'; reason: string }
+  | { kind: 'refused'; reason: string; /** `no_stamp`: nothing a retry can change, so the hand-off queues a REFUSED row for the operator to settle by hand; any other refusal is cleared by fixing its cause and retrying. */ code?: 'no_stamp' }
 
 const SCHEME_CATEGORIES = new Set(['IOSS', 'VOEC'])
 const DESTINATION_LABEL = { IOSS: 'IOSS VAT refunded', VOEC: 'VOEC VAT refunded', DDP: 'DDP import VAT refunded' } as const
@@ -72,7 +72,7 @@ export async function treatCreditNotePayload(params: {
   // THE STAMP, READ AND NEVER DECIDED AGAIN.
   if (order.euVatRegimeStampedAt === null) {
     const soldOnScheme = order.lines.some((line) => SCHEME_CATEGORIES.has((line.taxRate?.reportingCategory ?? '').trim().toUpperCase()) || (line.taxRate?.schemePostingTaxType ?? '').trim() !== '')
-    return soldOnScheme ? { kind: 'refused', reason: noStampRefusal(number) } : { kind: 'skipped', why: 'not_scheme' }
+    return soldOnScheme ? { kind: 'refused', reason: noStampRefusal(number), code: 'no_stamp' as const } : { kind: 'skipped', why: 'not_scheme' }
   }
   if (order.euVatRegime === null) return { kind: 'skipped', why: 'not_scheme' }
   const regime = order.euVatRegime
@@ -108,6 +108,8 @@ export async function treatCreditNotePayload(params: {
   const rateIndex = buildTaxTypeRateIndex(await db.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }))
   let net = toDecimal(0)
   let pricedTax = toDecimal(0)
+  // What the refund's own recorded (unrounded) line totals come to with their tax: the target when the source states no gross.
+  let rawGross = toDecimal(0)
   for (const [index, line] of lines.entries()) {
     const lineNet = predictedUntaxedTotal({ currency: payload.currency, lines: [{ quantity: line.quantity, unitAmount: line.unitAmount, accountCode: line.accountCode }] })
     if (lineNet === null) return { kind: 'refused', reason: `Credit note ${number}: an amount on line ${index + 1} cannot be read. Nothing was queued.` }
@@ -116,7 +118,9 @@ export async function treatCreditNotePayload(params: {
     if (code === '') return { kind: 'refused', reason: `Credit note ${number}: line ${index + 1} has no tax identity, so IMS cannot work out the VAT it carries. Nothing was queued.` }
     const priced = priceSnapshottedTaxIdentity({ accountingTaxType: code, rateByTaxType: rateIndex, label: `Credit note line ${index + 1}` })
     if (!priced.ok) return { kind: 'refused', reason: `Credit note ${number}: ${priced.reason} Nothing was queued.` }
-    pricedTax = pricedTax.plus(lineNet.times(priced.rate))
+    const rawNet = toDecimal(line.quantity).times(toDecimal(line.unitAmount))
+    pricedTax = pricedTax.plus(rawNet.times(priced.rate))
+    rawGross = rawGross.plus(rawNet.times(toDecimal(1).plus(priced.rate)))
   }
 
   // The refund's own tax total, and the amount the document must total. A whole-order reversal (the payment poller's chargeback) reverses the order's whole collected VAT.
@@ -125,7 +129,7 @@ export async function treatCreditNotePayload(params: {
     const vat: Decimal = toDecimal(order.taxForeign)
     figures = { ok: true, vatAmount: vat.toString(), refundTotal: net.plus(vat).toString() }
   } else {
-    figures = refundTaxAndTotal({ net, pricedTax, statedGross: refund.statedGrossForeign === null ? null : toDecimal(refund.statedGrossForeign), currency: payload.currency, toleranceMinorUnits: lines.length + 1 })
+    figures = refundTaxAndTotal({ net, pricedTax, rawGross, statedGross: refund.statedGrossForeign === null ? null : toDecimal(refund.statedGrossForeign), currency: payload.currency, toleranceMinorUnits: lines.length + 1 })
   }
   if (!figures.ok) return { kind: 'refused', reason: `Credit note ${number}: ${figures.reason}. Nothing was queued.` }
 

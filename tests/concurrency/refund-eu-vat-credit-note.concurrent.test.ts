@@ -250,7 +250,7 @@ test('[eu vat credit note] the account is the STAMPED one after the facts change
   assert.equal((outcome.regimePolicy as Record<string, string>).ioss, '999', 'the policy records the setting in force; the account is not taken from it')
 })
 
-test('[eu vat credit note] a scheme order with NO stamp refuses and queues nothing; an order outside the scheme is untouched', { skip }, async (t) => {
+test('[eu vat credit note] a scheme order with NO stamp: a REFUSED row is queued (never sent), the refund is not left as an accounting exception, and the operator settles the row by hand; an order outside the scheme is untouched', { skip }, async (t) => {
   const deps = await loadDeps()
   const restore = await configure(deps.db, true)
   const unstamped = await seed(deps, { stamp: null, schemeRate: true })
@@ -258,20 +258,55 @@ test('[eu vat credit note] a scheme order with NO stamp refuses and queues nothi
   t.after(async () => { await restore(); await cleanup(deps.db, unstamped); await cleanup(deps.db, outside) })
   await seedXeroList(deps.db, { TAX131: '0.000000' })
   const refused = await deps.createRefund(unstamped.orderId, [itemised(unstamped.goods, 'Widget', 100, 19)], 'unstamped', undefined, { internalBypassToken: deps.bypass, externalRefundId: wooRefundId(), statedGrossForeign: 119 })
-  // The refund itself is recorded (the money has gone back); its credit note is what is refused, and the refund stays marked for retry.
   assert.equal(refused.success, true, refused.error)
   const row = await creditNoteRow(deps.db, unstamped.orderId)
-  assert.equal(row?.payload, null, 'no credit note is queued')
-  const refundRow = await deps.db.salesOrderRefund.findUnique({ where: { id: row!.refundId }, select: { accountingRetryRequired: true } })
-  assert.equal(refundRow?.accountingRetryRequired, true, 'the refund is still marked for accounting retry')
-  const log = await deps.db.activityLog.findFirst({ where: { entityId: unstamped.orderId, action: 'refund_credit_note_eu_vat_refused' }, select: { description: true } })
-  assert.match(log?.description ?? '', /NOTHING WAS QUEUED\. Credit note [\s\S]* has no recorded VAT regime[\s\S]*stays marked for accounting retry/)
+  assert.ok(row?.payload, 'a row is queued so the operator has something to settle')
+  const { refusedCreditNoteError } = await import('../../lib/domain/accounting/eu-vat-credit-note.ts')
+  const error = refusedCreditNoteError(row.payload)
+  assert.ok(error, 'the poster refuses it before anything else')
+  assert.match(error, /NOTHING WAS SENT\. Credit note .* has no recorded VAT regime[\s\S]*This row is refused and is never sent\. Check Xero for credit note .* first[\s\S]*post the credit note by hand in Xero on the same VAT account the order's invoice used[\s\S]*record the outcome on this row with the settle action on \/sync/)
+  assert.equal(refusedCreditNoteError({ creditNoteNumber: 'CN-OK', lines: [] }), null, 'any other credit note is not affected')
+  // The refund is no longer an accounting exception: its obligation is discharged by the queued row.
+  const refundRow = await deps.db.salesOrderRefund.findUnique({ where: { id: row.refundId }, select: { accountingRetryRequired: true } })
+  assert.equal(refundRow?.accountingRetryRequired, false)
+  // What the poster does with it: a refusal, so the row is FAILED at attempt 1 with that wording.
+  const log = await deps.db.accountingSyncLog.findFirst({ where: { type: 'CREDIT_NOTE', referenceId: row.refundId }, select: { id: true } })
+  await deps.db.accountingSyncLog.update({ where: { id: log!.id }, data: { status: 'FAILED', attemptRevision: 1, errorMessage: error, retryCount: 1 } })
+  // The operator checks Xero, posts by hand, and settles the row on /sync.
+  await deps.db.user.upsert({ where: { id: 'ioss-cn-test' }, create: { id: 'ioss-cn-test', email: 'ioss-cn-test@example.invalid', name: 'ioss test', passwordHash: 'x' }, update: {} })
+  t.after(async () => { await deps.db.activityLog.deleteMany({ where: { userId: 'ioss-cn-test' } }); await deps.db.user.deleteMany({ where: { id: 'ioss-cn-test' } }) })
+  const { settleAccountingSyncRow } = await import('../../app/actions/accounting-settlement.ts')
+  const settled = await settleAccountingSyncRow(log!.id, { observedStatus: 'FAILED', observedAttemptRevision: 1, outcome: 'POSTED', externalTransactionId: 'CN-BY-HAND-1' })
+  assert.equal(settled.success, true, JSON.stringify(settled))
+  const after = await deps.db.accountingSyncLog.findUnique({ where: { id: log!.id }, select: { status: true, externalTransactionId: true } })
+  assert.deepEqual([after?.status, after?.externalTransactionId], ['SYNCED', 'CN-BY-HAND-1'])
+  assert.equal((await deps.db.salesOrderRefund.findUnique({ where: { id: row.refundId }, select: { accountingRetryRequired: true } }))?.accountingRetryRequired, false)
   // Not a scheme order, and never stamped: left exactly as before.
   const ok = await deps.createRefund(outside.orderId, [itemised(outside.goods, 'Widget', 100, 19)], 'plain', undefined, { internalBypassToken: deps.bypass, externalRefundId: wooRefundId(), statedGrossForeign: 119 })
   assert.equal(ok.success, true, ok.error)
   const plain = await creditNoteRow(deps.db, outside.orderId)
   assert.ok(plain?.payload)
   assert.equal('_euVatTreatment' in plain.payload, false)
+  assert.equal(refusedCreditNoteError(plain.payload), null)
+})
+
+test('[eu vat credit note] a hand-recorded parked refund (Sync Exceptions) carries the WooCommerce gross into the snapshot, and the credit note totals it exactly: a 0.025 net line refunded as 0.03 is 0.03, never 0.04', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true)
+  const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx) })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  // A line allocation whose net is 0.025 (0.02975 with its 19% tax): rounded per line it is 0.03, and the tax on top would make 0.04 for a 0.03 refund.
+  const gross = 0.03
+  for (const [stated, expected] of [[gross, 0.03], [null, 0.03]] as const) {
+    const id = wooRefundId()
+    const result = await deps.createRefund(fx.orderId, [{ lineId: fx.goods, productId: null, description: 'Widget', qty: 0, totalBase: 0.025, lineKind: 'sale' }], 'tiny', undefined, { internalBypassToken: deps.bypass, externalRefundId: id, ...(stated === null ? {} : { statedGrossForeign: stated }) })
+    assert.equal(result.success, true, result.error)
+    const refund = await deps.db.salesOrderRefund.findFirst({ where: { externalRefundId: id }, select: { id: true } })
+    const queued = await deps.db.accountingSyncLog.findFirst({ where: { type: 'CREDIT_NOTE', referenceId: refund!.id }, select: { payload: true } })
+    const lines = (queued!.payload as { lines: Array<{ unitAmount: number; quantity: number }> }).lines
+    assert.equal(lines.reduce((sum, l) => sum + Math.round(l.unitAmount * l.quantity * 100) / 100, 0).toFixed(2), expected.toFixed(2), `stated ${String(stated)}`)
+  }
 })
 
 test('[eu vat credit note] a CANCELLATION (the whole-order reversal) reverses the whole VAT with full lines: the stamped regime, every fee, the order\'s own tax', { skip }, async (t) => {
@@ -341,11 +376,14 @@ test('[eu vat credit note] a WooCommerce refund whose tax is booked on rate 182 
 test('[eu vat credit note] every route to a credit note reaches the one builder, and the poster wires both checks', () => {
   const sales = readFileSync('app/actions/sales.ts', 'utf8')
   // The hand-off builds the payload once and treats it before the enqueue.
-  assert.match(sales, /const builtCreditNotePayload[\s\S]*await treatCreditNotePayload\(\{[\s\S]*payload: creditNoteTreatment\.kind === 'treated' \? creditNoteTreatment\.payload : builtCreditNotePayload/)
+  assert.match(sales, /const builtCreditNotePayload[\s\S]*await treatCreditNotePayload\(\{[\s\S]*creditNoteTreatment\.kind === 'treated'\s*\? creditNoteTreatment\.payload[\s\S]*: builtCreditNotePayload/)
   // The refund (storefront or operator), the payment poller's whole-order reversal (a chargeback, which calls createRefund) and an accounting retry all end in it.
   assert.equal((sales.match(/await queueRefundAccountingActions\(\{/g) ?? []).length, 2, 'createRefund and retryRefundAccounting')
   assert.match(sales, /export async function raiseChargebackForReversedOrder[\s\S]*await createRefund\(orderId, lines, 'Payment reversed \(chargeback\)'/)
+  // The Sync Exceptions hand-recording path passes the parked WooCommerce gross, so the credit note totals it.
+  assert.match(readFileSync('app/actions/sync-exceptions.ts', 'utf8'), /externalRefundId,\n[^\n]*\n\s+statedGrossForeign: parkedGross\.toNumber\(\),/)
   const processor = readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8')
+  assert.match(readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8'), /case 'CREDIT_NOTE': \{\n[^\n]*\n\s+const refusedCreditNoteError = refusedCreditNoteErrorOf\(payload as Record<string, unknown>\)\n\s+if \(refusedCreditNoteError !== null\) return \{ success: false, error: refusedCreditNoteError \}/, 'the refused row is refused before anything else')
   assert.match(processor, /const creditNoteSchemeRefusal = await euCreditNoteSchemePostingRefusal\(payload as Record<string, unknown>\)/)
   assert.match(processor, /const creditNoteBeforePostHook = creditNoteBeforePost\(payload as Record<string, unknown>\)\n\s+const fence = await lease\.fenceBeforeRemoteWrite\('credit-note'\)/)
   assert.match(processor, /\.\.\.\(creditNoteBeforePostHook \? \{ beforePost: creditNoteBeforePostHook \} : \{\}\)/)

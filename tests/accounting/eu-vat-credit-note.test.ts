@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
-import { toDecimal } from '../../lib/domain/math/decimal'
+import { roundMoney, toDecimal } from '../../lib/domain/math/decimal'
 import {
   applyEuVatCreditNoteTreatment, easRefundRefusal, EAS_REFUND_TAX_RATE_ID, noStampRefusal, refundTaxAndTotal, refundTaxOnEasRate,
   type CreditNoteLineKind, type EuVatCreditNotePlan,
@@ -112,15 +112,15 @@ test('[credit note] DDP: the fee account is the VAT account (232), so the fee li
 })
 
 test('[credit note] the VAT line and total come from the refund: a stated gross gives the tax, and a figure far from the lines\' own rates is not posted', () => {
-  const ok = refundTaxAndTotal({ net: D('130'), pricedTax: D('24.70'), statedGross: D('154.70'), currency: 'EUR', toleranceMinorUnits: 4 })
+  const ok = refundTaxAndTotal({ net: D('130'), pricedTax: D('24.70'), rawGross: D('154.70'), statedGross: D('154.70'), currency: 'EUR', toleranceMinorUnits: 4 })
   assert.deepEqual(ok, { ok: true, vatAmount: '24.7', refundTotal: '154.7' })
-  const rounding = refundTaxAndTotal({ net: D('130'), pricedTax: D('24.70'), statedGross: D('154.71'), currency: 'EUR', toleranceMinorUnits: 4 })
+  const rounding = refundTaxAndTotal({ net: D('130'), pricedTax: D('24.70'), rawGross: D('154.70'), statedGross: D('154.71'), currency: 'EUR', toleranceMinorUnits: 4 })
   assert.equal(rounding.ok && rounding.vatAmount, '24.71')
-  const far = refundTaxAndTotal({ net: D('130'), pricedTax: D('24.70'), statedGross: D('157'), currency: 'EUR', toleranceMinorUnits: 4 })
+  const far = refundTaxAndTotal({ net: D('130'), pricedTax: D('24.70'), rawGross: D('154.70'), statedGross: D('157'), currency: 'EUR', toleranceMinorUnits: 4 })
   assert.equal(far.ok, false)
   if (!far.ok) assert.match(far.reason, /more than rounding explains/)
-  assert.equal(refundTaxAndTotal({ net: D('130'), pricedTax: D('24.70'), statedGross: D('120'), currency: 'EUR', toleranceMinorUnits: 4 }).ok, false)
-  const manual = refundTaxAndTotal({ net: D('130'), pricedTax: D('24.7'), statedGross: null, currency: 'EUR', toleranceMinorUnits: 4 })
+  assert.equal(refundTaxAndTotal({ net: D('130'), pricedTax: D('24.70'), rawGross: D('154.70'), statedGross: D('120'), currency: 'EUR', toleranceMinorUnits: 4 }).ok, false)
+  const manual = refundTaxAndTotal({ net: D('130'), pricedTax: D('24.7'), rawGross: D('154.7'), statedGross: null, currency: 'EUR', toleranceMinorUnits: 4 })
   assert.deepEqual(manual, { ok: true, vatAmount: '24.7', refundTotal: '154.7' })
 })
 
@@ -136,10 +136,36 @@ test('[credit note] rate 182: refund tax carried on it is detected on items, shi
 
 test('[credit note] operator wording: each refusal names what happened, that nothing was sent, and what to do', () => {
   assert.match(easRefundRefusal(77, '4'), /rate 182[\s\S]*Nothing was sent to Xero[\s\S]*record it manually/)
-  assert.match(noStampRefusal('CN-1'), /NOTHING WAS QUEUED\. Credit note CN-1[\s\S]*no recorded VAT regime[\s\S]*stays marked for accounting retry[\s\S]*post the credit note by hand in Xero on the same VAT account/)
+  assert.match(noStampRefusal('CN-1'), /NOTHING WAS SENT\. Credit note CN-1[\s\S]*no recorded VAT regime[\s\S]*This row is refused and is never sent\. Check Xero for credit note CN-1 first[\s\S]*post the credit note by hand in Xero on the same VAT account[\s\S]*settle action on \/sync/)
 })
 
 test('[credit note] this module reads no database and no clock (pure)', () => {
   const src = readFileSync('lib/domain/accounting/eu-vat-credit-note.ts', 'utf8')
   assert.doesNotMatch(src, /from '@\/lib\/db'|new Date\(|Date\.now\(|prisma/i)
+})
+
+test('[credit note] rounding boundaries (table): the credit note totals the refund\'s own gross to the cent, whatever the per-line rounding; EUR 0.03 at 20% is 0.03, never 0.04', () => {
+  const rows: Array<{ rawNet: string; rate: string; stated: string | null; total: string; vat: string }> = [
+    { rawNet: '0.025', rate: '0.2', stated: null, total: '0.03', vat: '0' },
+    { rawNet: '0.025', rate: '0.2', stated: '0.03', total: '0.03', vat: '0' },
+    { rawNet: '0.05', rate: '0.2', stated: '0.06', total: '0.06', vat: '0.01' },
+    { rawNet: '33.333', rate: '0.19', stated: null, total: '39.67', vat: '6.34' },
+    { rawNet: '33.333', rate: '0.19', stated: '39.67', total: '39.67', vat: '6.34' },
+    { rawNet: '10.005', rate: '0.19', stated: null, total: '11.91', vat: '1.9' },
+    { rawNet: '100', rate: '0.19', stated: '119.00', total: '119', vat: '19' },
+  ]
+  for (const row of rows) {
+    const raw = D(row.rawNet)
+    const net = roundMoney(raw, 'EUR')
+    const figures = refundTaxAndTotal({ net, pricedTax: raw.times(row.rate), rawGross: raw.times(D(1).plus(row.rate)), statedGross: row.stated === null ? null : D(row.stated), currency: 'EUR', toleranceMinorUnits: 2 })
+    assert.equal(figures.ok, true, JSON.stringify(row))
+    if (!figures.ok) continue
+    assert.deepEqual([figures.refundTotal, figures.vatAmount], [row.total, row.vat], JSON.stringify(row))
+    // The finished document: the line at its rounded net plus the VAT line is exactly the total.
+    const result = applyEuVatCreditNoteTreatment(
+      { currency: 'EUR', lines: [{ description: 'W', quantity: 1, unitAmount: raw.toNumber(), accountCode: '200', taxType: CHARGED }], lineAmountsIncludeTax: false },
+      plan({ lineKinds: ['goods'], linePostingTypes: ['TAX131'], vatAmount: figures.vatAmount, refundTotal: figures.refundTotal }),
+    )
+    assert.equal(result.ok, true, JSON.stringify(row))
+  }
 })

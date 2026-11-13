@@ -63,8 +63,18 @@ export const easRefundRefusal = (refundId: string | number, amount: string): str
 
 /** What the operator reads when a credit note is raised on a scheme order that has no stamp. */
 export const noStampRefusal = (creditNoteNumber: string): string =>
-  withLedgerCheck(`NOTHING WAS QUEUED. Credit note ${creditNoteNumber} is on an order sold under the EU IOSS/VOEC/DDP scheme, but the order has no recorded VAT regime (it was imported before the Sales Invoices switch was on, or its regime could not be decided), so IMS cannot tell which account its VAT was posted to and will not guess. `
-  + `This refund stays marked for accounting retry and nothing was sent to Xero. Check Xero for credit note ${creditNoteNumber} first. If it is not there, post the credit note by hand in Xero on the same VAT account the order's invoice used (821 for IOSS and VOEC, 232 for DDP) and the zero-rated type of the order's scheme rate.`)
+  withLedgerCheck(`NOTHING WAS SENT. Credit note ${creditNoteNumber} is on an order sold under the EU IOSS/VOEC/DDP scheme, but the order has no recorded VAT regime (it was imported before the Sales Invoices switch was on, or its regime could not be decided), so IMS cannot tell which account its VAT was posted to and will not guess. `
+  + `This row is refused and is never sent. Check Xero for credit note ${creditNoteNumber} first. If it is not there, post the credit note by hand in Xero on the same VAT account the order's invoice used (821 for IOSS and VOEC, 232 for DDP) and the zero-rated type of the order's scheme rate. Then record the outcome on this row with the settle action on /sync.`)
+
+/** The payload key a REFUSED credit-note row carries: the poster refuses any row holding it, before anything else, so the row can be claimed and shown on /sync and settled by hand but never sent. */
+export const EU_VAT_CREDIT_NOTE_REFUSED_KEY = '_euVatCreditNoteRefused'
+
+/** The refusal a REFUSED credit-note row (one carrying the key above) always answers with, or null for any other payload. The poster returns it before anything else. */
+export function refusedCreditNoteError(payload: Record<string, unknown>): string | null {
+  const marker = payload[EU_VAT_CREDIT_NOTE_REFUSED_KEY] as { reason?: unknown } | null | undefined
+  if (marker === undefined || marker === null) return null
+  return typeof marker.reason === 'string' && marker.reason !== '' ? marker.reason : 'NOTHING WAS SENT. This credit note was refused when it was built and is never sent.'
+}
 
 export type CreditNoteLineKind = 'goods' | 'marked-fee'
 
@@ -171,13 +181,17 @@ export function applyEuVatCreditNoteTreatment<P extends TreatablePayload>(payloa
  * The refund's own tax total and the amount the credit note must total, from the refund's figures. Pure.
  *   `statedGross` present (a WooCommerce refund): the amount the source says it returned. The tax is that less the net of the lines, and it must be within `tolerance` of the tax the lines' own rates give (`pricedTax`):
  *       a refund whose stated amount is far from its lines' own tax is not posted on either figure.
- *   absent (a manual or chargeback refund): the tax is `pricedTax`, and the total is the net plus that.
+ *   absent (a manual refund): the total is the refund's own recorded line totals with their tax, rounded once (`rawGross`), and the tax is that less the net the lines are sent at.
  * `net` is what the credit note's lines sum to (predictedUntaxedTotal of the payload before the treatment).
  */
-export function refundTaxAndTotal(input: { net: Decimal; pricedTax: Decimal; statedGross: Decimal | null; currency: string; toleranceMinorUnits: number }): { ok: true; vatAmount: string; refundTotal: string } | { ok: false; reason: string } {
+export function refundTaxAndTotal(input: { net: Decimal; pricedTax: Decimal; /** The refund's recorded, UNROUNDED line totals with their tax. */ rawGross: Decimal; statedGross: Decimal | null; currency: string; toleranceMinorUnits: number }): { ok: true; vatAmount: string; refundTotal: string } | { ok: false; reason: string } {
   const { net, pricedTax, currency } = input
   if (input.statedGross === null) {
-    return { ok: true, vatAmount: roundMoney(pricedTax, currency).toString(), refundTotal: roundMoney(net.plus(pricedTax), currency).toString() }
+    // The target is the refund's own recorded total (unrounded lines plus their tax), rounded ONCE: rounding each line first and adding the tax on top can come to a cent more than the refund (0.03 at 20%: a 0.025 net line is sent as 0.03, and 0.01 of tax on top would make 0.04).
+    const total = roundMoney(input.rawGross, currency)
+    const vat = total.minus(net)
+    if (vat.isNegative()) return { ok: false, reason: `the refund's recorded total (${total.toString()} ${currency}) is less than the ${net.toString()} its lines are sent at` }
+    return { ok: true, vatAmount: vat.toString(), refundTotal: total.toString() }
   }
   const gross = roundMoney(input.statedGross, currency)
   const vat = gross.minus(net)

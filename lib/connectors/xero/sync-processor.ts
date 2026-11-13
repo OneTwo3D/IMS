@@ -3,6 +3,7 @@
  * Each entry represents one IMS transaction → one Xero API call.
  */
 
+import { refusedCreditNoteError as refusedCreditNoteErrorOf } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { composeFinalBeforePost, creditNoteBeforePost, euCreditNoteSchemePostingRefusal, euSchemePostingRefusal } from './scheme-posting-check'
 import { holdInvoiceOnRegimePolicyChange, REGIME_ACCOUNT_CHANGED_REFUSAL, REGIME_POLICY_BLOCKED_REFUSAL } from '@/lib/connectors/woocommerce/sync/regime-policy-hold'
 import { resolveSalesPostContact } from '@/lib/domain/erasure/accounting-contact'
@@ -6704,6 +6705,9 @@ export async function processClaimedEntry(
     }
 
     case 'CREDIT_NOTE': {
+      // A credit note IMS refused to build (a scheme order with no recorded regime) is queued only so it shows on /sync and can be settled by hand: it is refused here, before anything else, on every attempt.
+      const refusedCreditNoteError = refusedCreditNoteErrorOf(payload as Record<string, unknown>)
+      if (refusedCreditNoteError !== null) return { success: false, error: refusedCreditNoteError }
       // As the sales invoice: no decided tax type, no document. Before the store-credit guard's reads and any claim.
       const untypedCreditNote = salesDocumentTaxTypeRefusal(`Credit note ${String(payload.creditNoteNumber ?? '(no number)')}`, payload as SalesDocumentTaxTypeInput)
       if (untypedCreditNote) return { success: false, error: untypedCreditNote }
