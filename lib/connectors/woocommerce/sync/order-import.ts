@@ -2,6 +2,7 @@
  * WooCommerce → IMS order import.
  */
 
+import { SALES_INVOICE_QUEUE_FAILED_NOT_HELD, heldOrderInvoiceObligation } from './held-order-invoice-obligation'
 import { describeWcRateMoneyRefusal, findWcRateMoneyProblems } from '@/lib/domain/accounting/wc-rate-money-refusal'
 import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain/erasure/erase-personal-data'
 import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
@@ -3057,6 +3058,11 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
         if (!options.pendingFxRetryLogId) return { success: true, orderId: heldOrderId }
         return { success: false, error: updated.gaveUp ? 'The paid order still disagrees with IMS; the automatic retry has stopped' : 'The paid order disagrees with IMS; kept in the retry queue until it agrees' }
       }
+      // An invoice enqueue failure on record with no held invoice and no ledger row behind it: the order is NOT handled (never marked synced, never acknowledged), so the retry
+      // row stays and the delivery is retried. See held-order-invoice-obligation.ts.
+      if ((await heldOrderInvoiceObligation(db as never, { orderId: heldOrderId, wcOrderId: wcOrder.id })) === 'unmet') {
+        return { success: false, orderId: heldOrderId, error: `Order #${wcOrder.number} is imported, but queueing its sales invoice failed earlier and nothing is held or queued for it` }
+      }
       if (options.pendingFxRetryLogId) await markPendingFxRetryLogSynced(options.pendingFxRetryLogId, heldOrderId)
       // o3d-z82a: deliberately NO marker resolution here. A redelivery can arrive while the
       // import that created the order is still between its create transaction and its
@@ -3818,6 +3824,8 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       ? null
       : `Accounting sales invoice HELD — ${invoiceNumberResolution.reason}`
 
+    // Set once the sales invoice payload is built and about to be enqueued: parks that SAME payload as a held sales invoice, which the reconcile's release sweep enqueues (see the catch).
+    let parkForRetry: (() => Promise<void>) | null = null
     try {
       const { queueAccountingSyncTxWithOutcome, getAccountingSettings } = await import('@/lib/accounting')
       const settings = await getAccountingSettings()
@@ -3966,9 +3974,25 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
         }
       }
 
+      // The payload as it is PARKED when the invoice is held (below), built once: a failed enqueue parks the same bytes, so the release sweep posts what this import would have.
+      const parkedPayload: Record<string, unknown> = withRegimePolicy(euVatOutcome.kind === 'refused'
+      ? { ...accountingPayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'treatment_refused', refusal: euVatOutcome.reason } }
+      : euVatOutcome.kind === 'skipped'
+      ? (euVatOutcome.why === 'store_credit' ? { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'store_credit' } } : invoicePayload)
+      : invoicePayload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
+        ? invoicePayload
+        : { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? ''), taxBinding: euVatOutcome.kind === 'treated' ? recordWcTaxBinding(euVatOutcome.taxBinding) : null } }, euVatOutcome.kind === 'treated' ? euVatOutcome.regimePolicy : undefined)
       // A TREATMENT REFUSAL IS NEVER QUEUED, NUMBERED OR NOT: the poster always refuses the stamped payload, and a re-import of an existing order only reconciles HELD invoices, so a queued refused invoice would never be rebuilt.
       // It is parked as a hold instead (applied:false, reason treatment_refused, the original payload), which the re-import repair path recovers once the cause is fixed: verify against the order, retry the treatment, release only on success.
       if (invoiceNumberResolution.ok && euVatOutcome.kind !== 'refused') {
+        parkForRetry = () => holdWcSalesInvoiceForMissingNumber({
+          salesOrderId: so.id,
+          wcOrder,
+          orderNumber,
+          metaKey: invoiceNumberResolution.metaKey,
+          accountingPayload: parkedPayload,
+          chartConnector: settings.connector,
+        })
         // ONE ORDER-LOCKED TRANSACTION (as the held release): the erasure marker is read under the order lock, the contact block is the
         // real one or the placeholder accordingly, and the row is inserted, all inside it. An erasure that commits between the order
         // create and this enqueue is therefore seen; one that runs after it finds the row and scrubs it. A failure rolls back and is
@@ -4028,13 +4052,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           // an absent marker is an untreated hold, which the release and the re-import already treat as such.
           // A treatment REFUSAL parks the ORIGINAL payload marked applied:false with the refusal's reason, never applied:true: it is an untreated hold, so the sweep never releases it, and a later fixed re-import verifies it against the order, retries the
           // treatment and releases only when that succeeds (a cause not fixed leaves it PENDING with the reason).
-          accountingPayload: withRegimePolicy(euVatOutcome.kind === 'refused'
-            ? { ...accountingPayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'treatment_refused', refusal: euVatOutcome.reason } }
-            : euVatOutcome.kind === 'skipped'
-            ? (euVatOutcome.why === 'store_credit' ? { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'store_credit' } } : invoicePayload)
-            : invoicePayload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
-              ? invoicePayload
-              : { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: true, route: 'none', regime: null, vatAccount: null, feesRecoded: 0, roundingAdjustment: null, orderTotal: String(wcOrder.total ?? ''), taxBinding: euVatOutcome.kind === 'treated' ? recordWcTaxBinding(euVatOutcome.taxBinding) : null } }, euVatOutcome.kind === 'treated' ? euVatOutcome.regimePolicy : undefined),
+          accountingPayload: parkedPayload,
           // o3d-j625: the same chart read that produced every account code in `accountingPayload`,
           // parked alongside them — the release can be days later and must not re-resolve it.
           chartConnector: settings.connector,
@@ -4058,7 +4076,20 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       // NOT swallowed: nothing is queued to post this invoice, so the import must not read as a success. Thrown to the failure handling below, which every caller
       // already honours: a FAILED sync row for the order (visible in the sync inbox), `success: false` to the order poll, the admission drain, the withdrawal sweep and
       // the webhook (retried by the inbox), and, for the FX retry, the pending row marked failed and kept for retry instead of marked SYNCED.
-      throw new Error(`Order #${orderNumber} was imported, but queueing its sales invoice failed`, { cause: accountingError })
+      // A DURABLE OBLIGATION BEFORE THE FAILURE IS REPORTED: the built payload is parked as a held sales invoice. The order already carries its invoice number, so the reconcile's
+      // release sweep (`retryHeldWcSalesInvoiceReleases`, driven by the reconcile cron) enqueues it verbatim through the same enqueue, with the same deterministic idempotency key
+      // on (order, number) that makes a second release add nothing, and closes the hold once the ledger row is confirmed. A redelivery of the order takes the existing-order branch,
+      // which only checks (see `heldOrderInvoiceObligation`) that this obligation, or a ledger row, exists: it never queues a second invoice.
+      let held = false
+      if (parkForRetry) {
+        try {
+          await parkForRetry()
+          held = true
+        } catch (parkError) {
+          console.error('[wc-import] could not hold the sales invoice whose enqueue failed', parkError)
+        }
+      }
+      throw new Error(`Order #${orderNumber} was imported, but queueing its sales invoice failed${held ? ' (the invoice is held and is released by the next reconcile)' : ` ${SALES_INVOICE_QUEUE_FAILED_NOT_HELD}`}`, { cause: accountingError })
     }
 
     // o3d-k26m.1/.6: the order imported, nothing was posted, and the reason lands on the sync row.

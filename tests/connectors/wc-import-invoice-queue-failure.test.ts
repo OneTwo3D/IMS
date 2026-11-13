@@ -21,6 +21,7 @@ test('the sales invoice enqueue catch does not swallow: it records the warning a
   const catchEnd = src.indexOf('\n    }\n', at)
   const block = src.slice(at, catchEnd)
   assert.ok(block.includes('throw new Error('), 'the catch must throw, not return into the success path')
+  assert.ok(block.includes('await parkForRetry()'), 'after parking the built payload as a held sales invoice (the release sweep posts it)')
   // The failure handling it throws into: a FAILED sync row, or the pending FX row marked failed (never SYNCED) when it is a retry.
   const handler = src.slice(src.indexOf('} catch (e) {\n    if (e instanceof WcImportErasedRetry)'))
   assert.ok(handler.includes('markPendingFxRetryLogFailed(options.pendingFxRetryLogId, e)'), 'an FX retry row is marked failed, not synced')
