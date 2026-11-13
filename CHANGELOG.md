@@ -15,7 +15,21 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 - **A failed cron run no longer answers 200.** Every route under `app/api/cron/` now answers through one shared mapping, so the crontab wrapper's `curl -sf` (and the Healthchecks heartbeat behind it) sees a failing run as a failing job, on stage and in production. Before, `wc-reconcile` could record `failed` every hour while its heartbeat stayed green.
 - **Four outcomes: ok, skipped, held, failed.** ok, skipped (a plugin or sync switched off, maintenance) and held answer 200; only failed answers 500. Held means the only problems were writes the outbound-write hold refused, which is the normal state of a stage installation (no outbound grant), so stage heartbeats do not go red by design. A held write next to a genuine failure is failed. Held writes are recognised by the hold's own reference, not by wording a destination could send.
 - **Each route declares how its own result reports failure.** An entry per route in `lib/ops/cron-outcomes.ts` covers the shapes the routes really return: an uppercase `FAILED` or `PARTIAL` status with an error count (WMS order reconcile, Mintsoft stock, despatch, product, bundle and returns sync), counts of failed items (WMS order push and status, refund reservation release, e-mail outbox, Mintsoft webhook sweep, HS classification, observed lead times), `success: false`, and error lists. The WMS order push, WMS despatch and Xero accounting sweeps also report the writes the hold refused (`outboundHeld`) so those do not count as failures. A run a route calls failed is now recorded failed too (observed lead times recorded `completed` with failures).
+- **Failures reported apart from the error list count too.** `wc-reconcile` counts permanent product import conflicts (`products.permanentErrors`), and the e-mail outbox counts parked, conflicted and unresolved-after-send rows.
 - **Nothing else recorded changes.** `cron_runs` still shows `failed` for a held-only run, with the held texts as the reason. Routes that did not write a run row are now classified from their result by the same rules; `accounting-fx-revaluation` now answers 500 (was 400) when the revaluation does not succeed. A test reads every cron route and fails if one builds its own response. The contract is in `docs/installation.md` (Cron Jobs).
+
+## 4.0.0 - 2026-11-13
+
+### Operator actions (breaking)
+
+Numbered 4.0.0 because these changes need operator action when Xero sync is on. Each line names the topic below that it comes from.
+
+- **Map a Xero tax type to every VAT rate that supplier bills use, and keep those rates active** (Settings > Accounting > Tax, import the purchase tax rates from Xero if needed). A supplier bill or supplier credit note whose line has no mapped tax type, or is priced on an inactive purchase tax rate, is now refused (nothing is sent to Xero) instead of posting as "No VAT". With Xero sync on, check the rate on each open purchase order and each bill still to be raised before relying on them. See *Xero accounting audit fixes: bill VAT, supplier-document tax types and payment dates*.
+- **Re-save any queued bill that has a non-vatable cost line** (one edit-and-save) so it is re-derived on the corrected rules. Same topic.
+- **Supplier credits against a reverse-charge bill, or a bill that mixes tax treatments, are raised in Xero directly.** With Xero sync on, such a credit is refused before it is claimed and stays a draft in IMS; mapping tax rates does not unblock it. Raise the credit in Xero by hand (it is not sent from IMS). Same topic.
+- **Re-save an older bill before crediting it, if the credit is refused.** A supplier credit against a bill booked before this release is refused when the order's current rates no longer reproduce the VAT that bill recorded (mapping rates does not fix this). One edit-and-save of the bill records its tax treatment; then post the credit again. Same topic.
+
+Everything else in this release is additive migrations, backend or CI changes, or behind a switch that is off by default (the EU VAT invoice treatment behind the Sales Invoices switch, and the gift-card flag cut-in, unset by default): built, switched off, no action needed.
 
 ### Merged Mintsoft orders: a cancelled order's lines are taken out of the combined order
 
