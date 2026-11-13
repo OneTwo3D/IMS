@@ -135,8 +135,8 @@ test('[credit note] rate 182: refund tax carried on it is detected on items, shi
 })
 
 test('[credit note] operator wording: each refusal names what happened, that nothing was sent, and what to do', () => {
-  assert.match(easRefundRefusal(77, '4'), /rate 182.*Nothing was sent to Xero.*record it manually/s)
-  assert.match(noStampRefusal('CN-1'), /NOTHING WAS QUEUED\. Credit note CN-1.*no recorded VAT regime.*stays marked for accounting retry.*post the credit note by hand in Xero on the same VAT account/s)
+  assert.match(easRefundRefusal(77, '4'), /rate 182[\s\S]*Nothing was sent to Xero[\s\S]*record it manually/)
+  assert.match(noStampRefusal('CN-1'), /NOTHING WAS QUEUED\. Credit note CN-1[\s\S]*no recorded VAT regime[\s\S]*stays marked for accounting retry[\s\S]*post the credit note by hand in Xero on the same VAT account/)
 })
 
 test('[credit note] this module reads no database and no clock (pure)', () => {

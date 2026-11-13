@@ -265,7 +265,7 @@ test('[eu vat credit note] a scheme order with NO stamp refuses and queues nothi
   const refundRow = await deps.db.salesOrderRefund.findUnique({ where: { id: row!.refundId }, select: { accountingRetryRequired: true } })
   assert.equal(refundRow?.accountingRetryRequired, true, 'the refund is still marked for accounting retry')
   const log = await deps.db.activityLog.findFirst({ where: { entityId: unstamped.orderId, action: 'refund_credit_note_eu_vat_refused' }, select: { description: true } })
-  assert.match(log?.description ?? '', /NOTHING WAS QUEUED\. Credit note .* has no recorded VAT regime.*stays marked for accounting retry/s)
+  assert.match(log?.description ?? '', /NOTHING WAS QUEUED\. Credit note [\s\S]* has no recorded VAT regime[\s\S]*stays marked for accounting retry/)
   // Not a scheme order, and never stamped: left exactly as before.
   const ok = await deps.createRefund(outside.orderId, [itemised(outside.goods, 'Widget', 100, 19)], 'plain', undefined, { internalBypassToken: deps.bypass, externalRefundId: wooRefundId(), statedGrossForeign: 119 })
   assert.equal(ok.success, true, ok.error)
