@@ -122,12 +122,10 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
   },
   'wms-order-push': {
     skipState: { skipped: 'x' },
-    consumed: ['failed', 'deadLettered', 'shadowUnrecorded'],
+    consumed: ['failed', 'deadLettered', 'shadowUnrecorded', 'validationFailed', 'createClaimParked'],
     ignored: {
       verifyQuarantined: 'links quarantined by verification: each is also counted in `deadLettered` (consumed) and audited as a FAILED order create, so the run already reads failed',
       verifyUnresolved: 'links still awaiting a verdict: counted so an unknown is not silent, not a failure',
-      validationFailed: 'orders whose payload could not be built locally: nothing was sent, the link is parked VALIDATION_FAILED and shown by the order push recovery view and the production preflight, and it is recorded once on entry rather than every sweep',
-      createClaimParked: 'expired create claims parked AMBIGUOUS_CREATE because a create may have been dispatched: the link state is shown by the order push recovery view and the production preflight, and the sweep logs it',
       recoveryRefusedPreCutoff: 'a recovery the live-from cut-off refuses by design',
     },
   },

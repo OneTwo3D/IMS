@@ -114,6 +114,14 @@ test('wms-order-push: failed pushes answer 500; pushes the hold refused do not; 
   assert.equal(await statusOf(pushRoute), 500)
   doubles.push = { ...base, deadLettered: 1 }
   assert.equal(await statusOf(pushRoute), 500)
+  // Orders NEWLY parked this run (counted once, on entry): the payload could not be built; a dispatched create has no recorded outcome. Each is a failed run.
+  doubles.push = { ...base, validationFailed: 1 }
+  assert.equal(await statusOf(pushRoute), 500)
+  doubles.push = { ...base, createClaimParked: 1 }
+  assert.equal(await statusOf(pushRoute), 500)
+  // A pre-existing backlog is not counted again: a later healthy sweep (nothing newly parked; parked links waiting on the warehouse or an operator) is green.
+  doubles.push = { ...base, created: 3, verifyUnresolved: 2, revalidated: 1, revalidateAmbiguous: 2, ambiguousCreateRequeued: 1 }
+  assert.equal(await statusOf(pushRoute), 200)
   // `held` here counts orders put on hold in the warehouse, which is not a hold on writes.
   doubles.push = { ...base, held: 3 }
   assert.equal(await statusOf(pushRoute), 200)
