@@ -4538,7 +4538,9 @@ export async function syncNewWcOrders(
   // orders currently in those statuses, with no modified-after, to an empty page, through the same
   // import path as the sweep below (withdrawal handling included). The set of orders sitting in a
   // withdrawal status is small, so the page ceiling is not a practical limit; if it is hit anyway the
-  // run is refused loudly. The marker is cleared only in the commit, which is reached only after this
+  // run is refused loudly. KNOWN, ACCEPTED LIMIT: the read finds only orders still IN a withdrawal status. An order rejected back to
+  // another status during the outage is fetched by the ordinary sweep through its new date_modified, and an approved one is still in
+  // the withdrawn status when recovery runs. The marker is cleared only in the commit, which is reached only after this
   // read ended on an empty page with no error, so a failed read leaves it set and retries next run.
   const recoverySlugs = droppedSinceSetting ? statuses.filter((status) => withdrawalSlugs.has(status)) : []
   const recoveryDue = recoverySlugs.length > 0
