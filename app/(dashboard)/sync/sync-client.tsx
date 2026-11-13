@@ -539,6 +539,8 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
     message: string
     activeOrdersImported: number
     activeOrdersSkipped: number
+    /** Orders a guard blocked, each recorded under Sync > Exceptions. Absent on progress saved before the field existed. */
+    ordersBlocked?: number
     totalOrders: number
     currentPage: number
     totalPages: number
@@ -1040,6 +1042,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                 <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
                   <span>Imported: {importProgress.activeOrdersImported}</span>
                   <span>Skipped: {importProgress.activeOrdersSkipped}</span>
+                  {(importProgress.ordersBlocked ?? 0) > 0 && <span>Blocked (see Exceptions): {importProgress.ordersBlocked}</span>}
                   {importProgress.errors.length > 0 && <span className="text-destructive">Errors: {importProgress.errors.length}</span>}
                 </div>
               </div>

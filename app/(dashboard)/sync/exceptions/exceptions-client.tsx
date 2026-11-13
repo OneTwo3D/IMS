@@ -1440,6 +1440,39 @@ export function ExceptionsClient({ data }: Props) {
         </Card>
       ) : null}
 
+      {data.blockedWcOrders.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`WooCommerce orders — blocked from import (${data.summary.blockedWcOrders})`}
+            detail="A safety check refused to import these WooCommerce orders (for example a line would be taxed at the order's default rate because its WooCommerce tax rate is not mapped, or a coupon does not reconcile with the order total). IMS does not import them in a degraded way, and it does not forget them: each order is re-checked by order id every 15 minutes and imports itself as soon as the cause is fixed. Fix the cause (for a tax rate, map it on the Tax Rates tab); there is nothing to acknowledge here, the row clears when the order imports."
+            shown={data.blockedWcOrders.length}
+            total={data.summary.blockedWcOrders}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[860px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>WooCommerce order</TableHead>
+                <TableHead>Reason</TableHead>
+                <TableHead>What to fix</TableHead>
+                <TableHead>Re-checks</TableHead>
+                <TableHead>Blocked since</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.blockedWcOrders.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell className="text-xs font-mono">#{row.externalOrderNumber || row.externalOrderId}</TableCell>
+                  <TableCell className="text-xs">{row.reason === 'tax_rate_unmapped' ? 'Tax rate not mapped' : 'Coupon does not reconcile'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground max-w-[420px]" title={row.detail ?? ''}>{row.detail ?? '—'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{row.attempts}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.blockedAt)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
       {isPending ? <p className="text-xs text-muted-foreground flex items-center gap-1"><Loader2 className="h-3 w-3 animate-spin" />Working…</p> : null}
     </div>
   )

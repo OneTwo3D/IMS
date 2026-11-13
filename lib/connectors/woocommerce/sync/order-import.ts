@@ -2881,6 +2881,12 @@ export type ImportWcOrderResult = {
    * `success` is true for all three: these are resolved decisions, not failures to retry. All
    * three leave a durable by-id row in the admission-refusal queue.
    *
+   * The same field carries the two GUARD blocks, `tax_rate_unmapped` and `coupon_refused`: the
+   * order was NOT imported because a deterministic guard refused it, and the same durable row now
+   * records that (plus a notice under Sync > Exceptions). Callers need no new branch: a recorded
+   * block is a resolved skip, so a pass may move its cursor past the order because the by-id drain
+   * owns it now.
+   *
    * SET ONLY WHEN THAT ROW IS CONFIRMED READABLE (r14). A refusal whose queue row could not be
    * written or read back is NOT a resolved decision — it is an order about to disappear — so it
    * returns `success: false` with no `skipped`, and every caller treats it as the retryable
@@ -2964,9 +2970,16 @@ async function refuseWcOrderCreate(
   reason: WcAdmissionRefusalReason,
   configured: string[],
   options: ImportWcOrderOptions,
+  /** The guard's own sentence, for the blocked-import reasons (`tax_rate_unmapped`, `coupon_refused`). */
+  detail = '',
+  /** Runs once, only when this call CREATED the queue row, so a drain re-blocking the same order every fifteen minutes does not re-log it. */
+  onFirstRecord?: () => Promise<void>,
 ): Promise<ImportWcOrderResult> {
-  const { recordWcOrderAdmissionRefusal } = await import('./order-admission')
-  const recorded = await recordWcOrderAdmissionRefusal(wcOrder, reason, configured)
+  const { recordWcOrderAdmissionRefusal, isWcBlockedImportReason } = await import('./order-admission')
+  const recorded = await recordWcOrderAdmissionRefusal(wcOrder, reason, configured, detail)
+  // The guard's activity row is written when the order is first recorded, or when it could not be
+  // (an operator must see a block that has no row). A refresh of an existing row is silent.
+  if (onFirstRecord && (!recorded.persisted || recorded.created)) await onFirstRecord()
   if (!recorded.persisted) {
     // A REFUSAL THAT WAS NOT WRITTEN DOWN IS NOT A REFUSAL, IT IS A LOSS (o3d-batch-ret r14,
     // Codex HIGH). Every one of the three facts below is a fact about a refusal that was RECORDED:
@@ -2991,7 +3004,11 @@ async function refuseWcOrderCreate(
         + 'order is redelivered rather than lost.',
     }
   }
-  await noteWcOrderAdmissionRefusal(wcOrder.date_modified_gmt ?? wcOrder.date_created_gmt)
+  // The watermark rewinds the pull cursors when the "Import order statuses" selection WIDENS. A guard
+  // block has nothing to do with the selection, so it must not pull that watermark back.
+  if (!isWcBlockedImportReason(reason)) {
+    await noteWcOrderAdmissionRefusal(wcOrder.date_modified_gmt ?? wcOrder.date_created_gmt)
+  }
   if (options.pendingFxRetryLogId) {
     await markPendingFxRetryLogFailed(
       options.pendingFxRetryLogId,
@@ -3008,6 +3025,12 @@ async function refuseWcOrderCreate(
           'An FX rate arrived, but WooCommerce states no usable currency for this order, so the '
           + 'stored snapshot cannot be imported at all. It is queued for retry by order id instead, '
           + 'which re-reads the LIVE order.',
+        tax_rate_unmapped:
+          'An FX rate arrived, but a guard blocks this order (a line would use the order default tax rate). '
+          + 'It is recorded under Sync > Exceptions and retried by order id instead.',
+        coupon_refused:
+          'An FX rate arrived, but a guard blocks this order (its coupons do not reconcile). '
+          + 'It is recorded under Sync > Exceptions and retried by order id instead.',
       }[reason],
     ).catch(() => {})
   }
@@ -3217,22 +3240,29 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     const { orderDefaultTaxRateId, taxRateName, taxRateValue, destCountry, taxFallbackLines, lineTaxResolved } = taxResolution
     if (shouldBlockWcTaxRateFallback(taxFallbackLines)) {
       const description = `Blocked WooCommerce order ${wcOrder.number} import because ${taxFallbackLines.length} line(s) would use the order default tax rate.`
-      await logActivity({
-        entityType: 'SYNC',
-        entityId: null,
-        action: 'tax_rate_fallback_blocked',
-        tag: 'sync',
-        level: 'ERROR',
-        description,
-        metadata: {
-          connector: 'woocommerce',
-          externalOrderId: String(wcOrder.id),
-          externalOrderNumber: wcOrder.number,
-          destCountry,
-          lines: taxFallbackLines,
-        },
+      // RECORDED, NOT JUST LOGGED. A bare `{ success: false }` left the order with no durable trace,
+      // so a pass that carried on past it (the initial import, the modified_after sweep) moved its
+      // cursor beyond an order nothing would ever read again. The block is now a by-id queue row
+      // plus an entry under Sync > Exceptions; the order is NOT imported in a degraded way and the
+      // guard is unchanged. If the row cannot be written the result is the unrecorded-refusal
+      // failure and every caller holds its cursor.
+      return refuseWcOrderCreate(wcOrder, 'tax_rate_unmapped', [], options, description, async () => {
+        await logActivity({
+          entityType: 'SYNC',
+          entityId: null,
+          action: 'tax_rate_fallback_blocked',
+          tag: 'sync',
+          level: 'ERROR',
+          description,
+          metadata: {
+            connector: 'woocommerce',
+            externalOrderId: String(wcOrder.id),
+            externalOrderNumber: wcOrder.number,
+            destCountry,
+            lines: taxFallbackLines,
+          },
+        })
       })
-      return { success: false, error: description }
     }
 
     // Coupons. Woo allocates cart-coupon money INTO the lines (each line's `total` is already its
@@ -3270,26 +3300,28 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     const unallocatedCouponForeign = couponPlan.unallocated
     const storeCreditForeign = couponPlan.storeCreditForeign
     if (couponPlan.refusal) {
-      const description = describeWcCouponRefusal(String(wcOrder.number), couponPlan.refusal)
-      await logActivity({
-        entityType: 'SYNC',
-        entityId: null,
-        action: 'wc_coupon_import_refused',
-        tag: 'sync',
-        level: 'ERROR',
-        description,
-        metadata: {
-          connector: 'woocommerce',
-          externalOrderId: String(wcOrder.id),
-          externalOrderNumber: wcOrder.number,
-          refusal: couponPlan.refusal.kind,
-          coupons: couponPlan.refusal.kind === 'CREDIT_NOT_RECONCILED' ? [] : couponPlan.refusal.coupons,
-          genuineCouponNetForeign: couponPlan.genuineCouponNet.toNumber(),
-          lineDiscountTotalForeign: roundDecimalNumber(lineDiscountTotalForeign, 4),
-          unallocatedForeign: unallocatedCouponForeign,
-        },
+      const couponRefusal = couponPlan.refusal
+      const description = describeWcCouponRefusal(String(wcOrder.number), couponRefusal)
+      return refuseWcOrderCreate(wcOrder, 'coupon_refused', [], options, description, async () => {
+        await logActivity({
+          entityType: 'SYNC',
+          entityId: null,
+          action: 'wc_coupon_import_refused',
+          tag: 'sync',
+          level: 'ERROR',
+          description,
+          metadata: {
+            connector: 'woocommerce',
+            externalOrderId: String(wcOrder.id),
+            externalOrderNumber: wcOrder.number,
+            refusal: couponRefusal.kind,
+            coupons: couponRefusal.kind === 'CREDIT_NOT_RECONCILED' ? [] : couponRefusal.coupons,
+            genuineCouponNetForeign: couponPlan.genuineCouponNet.toNumber(),
+            lineDiscountTotalForeign: roundDecimalNumber(lineDiscountTotalForeign, 4),
+            unallocatedForeign: unallocatedCouponForeign,
+          },
+        })
       })
-      return { success: false, error: description }
     }
     if (unallocatedCouponForeign > 0) {
       // A coupon shape we do not model. The residual is kept (dropping it would overstate the
@@ -3369,24 +3401,25 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
             + `${reconciled.difference.toFixed(currencyMinorUnits(currency))}, so the credit is not the only thing between the goods and the total.`,
         }
         const description = describeWcCouponRefusal(String(wcOrder.number), refusal)
-        await logActivity({
-          entityType: 'SYNC',
-          entityId: null,
-          action: 'wc_coupon_import_refused',
-          tag: 'sync',
-          level: 'ERROR',
-          description,
-          metadata: {
-            connector: 'woocommerce',
-            externalOrderId: String(wcOrder.id),
-            externalOrderNumber: wcOrder.number,
-            refusal: refusal.kind,
-            storeCreditForeign: storeCreditForeign.toNumber(),
-            differenceForeign: reconciled.difference.toNumber(),
-            toleranceForeign: reconciled.tolerance.toNumber(),
-          },
+        return refuseWcOrderCreate(wcOrder, 'coupon_refused', [], options, description, async () => {
+          await logActivity({
+            entityType: 'SYNC',
+            entityId: null,
+            action: 'wc_coupon_import_refused',
+            tag: 'sync',
+            level: 'ERROR',
+            description,
+            metadata: {
+              connector: 'woocommerce',
+              externalOrderId: String(wcOrder.id),
+              externalOrderNumber: wcOrder.number,
+              refusal: refusal.kind,
+              storeCreditForeign: storeCreditForeign.toNumber(),
+              differenceForeign: reconciled.difference.toNumber(),
+              toleranceForeign: reconciled.tolerance.toNumber(),
+            },
+          })
         })
-        return { success: false, error: description }
       }
     }
 
@@ -4650,7 +4683,8 @@ export async function syncNewWcOrders(
             result.errors.push(`syncWcOrderStatus #${order.id}: ${String(e)}`)
           }
         }
-        if (mode !== 'poll') {
+        // An order recorded as blocked or refused is NOT in IMS, so there is nothing for its refunds to attach to; the by-id drain imports it later.
+        if (mode !== 'poll' && !importResult.skipped) {
           // The cursor below only advances on a clean run, and a refund list read only in part is
           // not clean: advancing past this order is what makes the missing refunds permanent, since
           // nothing here is re-driven by anything else. Recorded as an error so the cursor is HELD

@@ -10,6 +10,14 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### WooCommerce: orders blocked by a guard are recorded, so the initial import cannot strand them
+
+- **Fixed: the initial order import could complete over orders it had refused, and those orders were never imported.** An order blocked by the tax-rate fallback guard (a line would use the order default tax rate because its WooCommerce rate is not mapped) or by the coupon guard was counted as a per-order error and outvoted by the orders that did import. The pass stamped `wc_initial_import_completed` and moved `last_wc_order_sync_at` to now, so the `modified_after` sweep started after the blocked orders and they were only ever imported if someone changed them in WooCommerce. (Seen on stage: 12 imported, 265 blocked, outcome complete.)
+- **Now every guard block is durable.** The order is written to the by-id refusal queue (the one the 15-minute drain re-reads) with the guard's own sentence, and listed under **Sync > Exceptions** as "WooCommerce orders — blocked from import", with the order number, the reason and what to fix. Fix the cause (map the tax rate) and the drain imports the order by id. The guards themselves are unchanged and nothing is imported in a degraded way.
+- **The initial import completes over recorded blocks** (the progress card and completion message show the blocked count, and the notification is a warning), and **holds exactly as before if a block cannot be recorded** (the "Import held" outcome).
+- **A permanently blocked order no longer fails the ongoing sweep forever.** Once recorded, the poll and reconcile sweeps treat it as a resolved skip, advance their cursor and stamp their liveness, and the webhook acknowledges it; an unrecorded block still holds the cursor. A block that does not touch the "Import order statuses" selection no longer feeds the cursor-rewind watermark, and the guard's ERROR activity entry is written when the order is first recorded rather than on every re-check.
+- No migration (the existing `shopping_sync_logs` queue carries the new reasons). Accepted limit: the drain re-reads at most 50 queued orders per 15-minute run, so a very large blocked set is worked through over several runs.
+
 ### CI: pin GitHub runners to Ubuntu 24.04
 
 - **Fixed: CI broke when GitHub moved `ubuntu-latest` to Ubuntu 26.04** (runner image ubuntu-26.04, 2026-11-13). Playwright does not support Chromium there (the e2e job failed to install browsers) and the deploy-script re-fence tests failed. Every workflow job now runs on `ubuntu-24.04`, the image all of CI passed on until then. CI only; no behaviour change.

@@ -20,6 +20,7 @@ import { logActivity } from '@/lib/activity-log'
 import { notify } from '@/lib/notifications'
 import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeUnendedWcPageWalk, describeUnreadWcPage } from '../api'
 import { getWcPullStatuses, importWcOrder } from './order-import'
+import { isWcBlockedImportReason } from './order-admission'
 import { WC_NO_STATUSES_SELECTED_MESSAGE } from '../order-status-filter'
 import type { WcFullOrder } from './types'
 
@@ -32,6 +33,13 @@ export type InitialImportProgress = {
   message: string
   activeOrdersImported: number
   activeOrdersSkipped: number
+  /**
+   * Orders a deterministic guard refused (an unmapped tax rate, a coupon that does not reconcile),
+   * each one durably recorded in the by-id refusal queue and listed under Sync > Exceptions. They are
+   * NOT errors and NOT progress: the pass may complete over them because the drain now owns them.
+   * Optional because progress saved before this field existed does not carry it.
+   */
+  ordersBlocked?: number
   totalOrders: number
   currentPage: number
   totalPages: number
@@ -48,6 +56,14 @@ const JOB_KEY = 'initial_order_import_job'
  * way to retry. A pass that imported/reconciled at least one order, or had no
  * active orders to import, is complete (per-order errors are surfaced but don't
  * block, since live sync of new orders can still proceed).
+ *
+ * A BLOCKED ORDER THAT IS RECORDED IS NOT AN ERROR HERE (the blocked-orders fix). An order a guard
+ * refused (an unmapped tax rate, a coupon that does not reconcile) used to come back as a bare
+ * `success: false`, was counted in `errorCount`, and was outvoted by the orders that did import: the
+ * pass completed, `last_wc_order_sync_at` moved to now and nothing ever read the order again. Such an
+ * order now leaves a durable by-id row and a notice under Sync > Exceptions BEFORE it comes back, and
+ * the loop counts it as `ordersBlocked`, which is neither progress nor an error. If the row could not
+ * be written the result carries `unrecordedRefusal` and the rule below applies.
  *
  * EXCEPT FOR AN UNRECORDED REFUSAL, WHICH BLOCKS COMPLETION ON ITS OWN (o3d-batch-ret r15,
  * Codex HIGH). "Per-order errors don't block" is true of every error this loop can otherwise
@@ -123,6 +139,7 @@ const INITIAL_PROGRESS: InitialImportProgress = {
   message: '',
   activeOrdersImported: 0,
   activeOrdersSkipped: 0,
+  ordersBlocked: 0,
   totalOrders: 0,
   currentPage: 0,
   totalPages: 0,
@@ -346,6 +363,13 @@ export async function runInitialImport(
         }
         if (importResult.success && importResult.orderId) {
           progress.activeOrdersImported++
+        } else if (importResult.success && isWcBlockedImportReason(importResult.skipped)) {
+          // BLOCKED BY A GUARD AND RECORDED (not imported, not an error). `importWcOrder` only
+          // answers `success` with a `skipped` reason once the by-id queue row is confirmed
+          // readable; a block it could not record comes back as `unrecordedRefusal` below and fails
+          // the pass. So by this line the order is not lost: it is in the queue the fifteen-minute
+          // drain re-reads, and under Sync > Exceptions, and the cursor may move past it.
+          progress.ordersBlocked = (progress.ordersBlocked ?? 0) + 1
         } else if (importResult.success) {
           progress.activeOrdersSkipped++
         } else {
@@ -450,6 +474,9 @@ export async function runInitialImport(
     const parts: string[] = []
     if (progress.activeOrdersImported > 0) parts.push(`${progress.activeOrdersImported} active orders imported`)
     if (progress.activeOrdersSkipped > 0) parts.push(`${progress.activeOrdersSkipped} already imported`)
+    if ((progress.ordersBlocked ?? 0) > 0) {
+      parts.push(`${progress.ordersBlocked} blocked and listed under Sync > Exceptions (they import by themselves once the cause is fixed)`)
+    }
     if (progress.errors.length > 0) parts.push(`${progress.errors.length} errors`)
     if (parts.length === 0) parts.push('No active orders found')
     progress.message = parts.join(' \u00b7 ') + (stampCompletion ? '' : ' \u00b7 REHEARSAL: not stamped')
@@ -464,7 +491,7 @@ export async function runInitialImport(
     })
 
     notify({
-      type: 'success',
+      type: (progress.ordersBlocked ?? 0) > 0 ? 'warning' : 'success',
       title: 'Active Order Import Complete',
       message: progress.message,
       actionUrl: '/sync',

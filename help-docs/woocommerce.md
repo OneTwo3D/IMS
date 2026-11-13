@@ -90,6 +90,20 @@ order that has no record anywhere — no webhook will resend a historical order,
 retry row for the fifteen-minute recheck to find. Press **Import Active Orders** again once the
 cause is resolved; orders that already imported are skipped, so a retry costs nothing.
 
+**Blocked orders are never left behind.** Some orders are refused by a safety check rather than
+imported in a degraded way: a line that would be taxed at the order's default rate because its
+WooCommerce tax rate is not mapped, or a coupon that does not reconcile with the order total. Each
+such order is written down before the import moves on: it gets a record in the same by-id queue
+that the 15-minute recheck reads, and a row under **Sync > Exceptions** ("WooCommerce orders —
+blocked from import") naming the order and what to fix. Because every blocked order is recorded,
+the import still completes and the ongoing sync starts after them; the progress card shows how many
+were *Blocked*, and the completion message says so. Fix the cause (for a tax rate, map it on the
+**Tax Rates** tab) and the recheck imports the order by itself within 15 minutes; nothing needs to
+be modified in WooCommerce and nothing needs pressing in IMS. The same rule applies to the ongoing
+sync and to webhooks: a blocked order is recorded once, does not make every sweep fail again, and
+does not keep being fetched as an error. If a block cannot be recorded, the import is held exactly
+as described above.
+
 ### Ongoing Order Sync
 
 With the initial import complete, new and updated WooCommerce orders are imported automatically.
@@ -489,10 +503,10 @@ If the resolver also can't find a match, the system would fall back to the order
 
 The system handles this two ways:
 
-- **Non-zero fallback → import BLOCKED.** If the order-default rate is non-zero (most common case) and a line would use it, the import is rejected with a clear error message. A `tax_rate_fallback_blocked` activity log entry is written with the order details and the lines that hit fallback.
+- **Non-zero fallback → import BLOCKED.** If the order-default rate is non-zero (most common case) and a line would use it, the order is not imported. A `tax_rate_fallback_blocked` activity log entry is written once, with the order details and the lines that hit fallback, and the order is recorded under **Sync > Exceptions** ("WooCommerce orders — blocked from import") and in the by-id recheck queue, so the initial import and the ongoing sync can move past it without losing it.
 - **Zero-rated fallback → import allowed, but logged.** If the fallback is to a zero-rate, the import proceeds but a `tax_rate_fallback` warning activity entry is written so operators can review.
 
-**To unblock a blocked order:** import the missing tax rates from WC, ensure the relevant country + category combination resolves, then retry the import from Sync > WooCommerce > Sync Log.
+**To unblock a blocked order:** import the missing tax rates from WC, ensure the relevant country + category combination resolves, the blocked order is then imported by the 15-minute recheck (it clears from Sync > Exceptions when it imports). You do not need to retry it by hand.
 
 The Sales Settings page surfaces recent fallback events as a widget so you can spot misconfigurations early.
 
