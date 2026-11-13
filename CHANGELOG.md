@@ -10,6 +10,17 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+## 4.0.0 - 2026-11-13
+
+### Operator actions (breaking)
+
+Numbered 4.0.0 because one change needs operator action when Xero sync is on. Each line names the topic below that it comes from.
+
+- **Map a Xero tax type to every VAT rate that supplier bills use, and keep those rates active** (Settings > Accounting > Tax, import the purchase tax rates from Xero if needed). A supplier bill or supplier credit note whose line has no mapped tax type, or is priced on an inactive purchase tax rate, is now refused (nothing is sent to Xero) instead of posting as "No VAT". With Xero sync on, check the rate on each open purchase order and each bill still to be raised before relying on them. See *Xero accounting audit fixes: bill VAT, supplier-document tax types and payment dates*.
+- **Re-save any queued bill that has a non-vatable cost line** (one edit-and-save) so it is re-derived on the corrected rules. Same topic.
+
+Everything else in this release is additive migrations, backend or CI changes, or behind a switch that is off by default (the EU VAT invoice treatment behind the Sales Invoices switch, and the gift-card flag cut-in, unset by default): built, switched off, no action needed.
+
 ### Merged Mintsoft orders: a cancelled order's lines are taken out of the combined order
 
 - **A cancelled (or fully refunded) IMS order that Mintsoft merged into another is now removed from the combined order automatically.** Mintsoft keeps every original line on the merged order under its original line id (confirmed live 2026-11-12, including a SKU both orders share, which stays as two separate lines). IMS now records those line ids when it pushes an order (one read-back right after the create, and again after an amendment) and, on the cancel, deletes exactly that order's lines from the combined order, reads the combined order again after each delete, proves the line is gone and every other line unchanged, tries to leave a warehouse note naming the order and the lines removed (best effort; not guaranteed), and marks the order's link cancelled. The combined order itself is never cancelled while it holds another order's lines; when the cancelled order's lines are the only ones left, it is cancelled normally.
