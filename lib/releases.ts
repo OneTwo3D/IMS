@@ -14,6 +14,36 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
+    version: '4.0.0',
+    date: '2026-11-13',
+    title: 'Xero supplier-document tax checks, merged Mintsoft order handling, report export notices, EU VAT invoice treatment built and switched off',
+    summary: 'Numbered 4.0.0 because supplier-document changes need operator action when Xero sync is on: a supplier bill or supplier credit note whose line has no mapped tax type, or uses an inactive purchase tax rate, is now refused instead of posting as "No VAT", so every VAT rate used on supplier bills must be mapped and active first, and supplier credits against reverse-charge or mixed-treatment bills are raised in Xero directly. See the Operator actions list at the top of the 4.0.0 section of CHANGELOG.md. The rest: bill VAT is worked out line by line, a cancelled order that Mintsoft merged into another is taken out of the combined order, report CSV exports that hit the row limit download a notice file, and the EU VAT invoice treatment and the gift-card flag cut-in are built and switched off.',
+    userMessage: 'IMS 4.0 tightens supplier bills in Xero: a bill or supplier credit note on a VAT rate with no mapped Xero tax type, or on an inactive rate, is now refused instead of posting as No VAT. Administrators should map the purchase tax rates before raising bills. Cancelled orders that Mintsoft merged into another are now taken out of the combined order, and over-limit report exports download a clear notice file.',
+    userHighlights: [
+      'Xero bills: a supplier bill or supplier credit note line with no mapped tax type, or priced on an inactive purchase tax rate, is refused instead of posting as "No VAT", with the reason shown at the point of saving or posting: the bill is not saved, and the supplier credit note stays a draft. Neither appears as a row on the Sync page, because nothing is queued.',
+      'Xero bills: the VAT on a bill is the sum of each line\'s own rate, rounded per line as Xero does, so it agrees with Xero. A bill keeps the tax treatment it was booked with if the order\'s rate changes later.',
+      'Xero bills: a supplier credit note copies the tax treatment of the bill it credits. A supplier credit note against a bill that mixes tax treatments, or has a reverse-charge line, is not posted from IMS and stays a draft.',
+      'Xero payments: a paid bill or invoice whose payment date is missing or unreadable is skipped with a warning and revisited on every poll until the date can be read.',
+      'Mintsoft: when an order that Mintsoft merged into another is cancelled or fully refunded in IMS, its own lines are removed from the combined order, and anything IMS cannot do safely raises a notice naming the lines to take out by hand. A merged order is never amended or cancelled by mistake.',
+      'Reports: a report CSV export that hits its row limit now downloads a file marked REPORT NOT COMPUTED instead of failing with an error.',
+    ],
+    technicalHighlights: [
+      'Operator actions (breaking): the full list is at the top of the 4.0.0 section of CHANGELOG.md; it covers the Xero tax types for supplier bills and queued bills with a non-vatable cost line.',
+      'Bill VAT is computed per line and rounded to the bill currency\'s minor unit; the tax type, effective rate, IMS rate id and reverse-charge flag are stored per bill line, and a bill booked before that is trusted only when its reconstruction matches within one minor unit.',
+      'Xero dates go through one parser for the `/Date(ms)/` form; documents with an unreadable payment date are remembered in xero_payment_date_pending and re-read by id on every poll.',
+      'Mintsoft push: recorded warehouse line ids (wms_order_push_items), a per-link amendment lease, a generation token on the line snapshot, an identity check before every write to an existing order, and a merge followed only when the combined order holds every recorded line.',
+      'Migrations (additive, nullable, no backfill): purchase_invoice_line_tax_snapshot, xero_payment_date_pending (and its tenant column), wms_order_push_items, wms_push_link_amend_notice_and_snapshot_unsafe, wms_push_link_line_snapshot_token and wms_push_link_amend_lease.',
+      'CI: the validate job and the ledger standing-reader check now run with a 5632 MB heap.',
+      'Built, switched off: the EU IOSS / VOEC / DDP invoice treatment behind the Sales Invoices switch (nothing is read or rewritten while the switch is off), and the gift-card flag cut-in setting eu_vat_gift_card_flag_cut_in (unset by default; the resolver is not yet called by a posting path).',
+    ],
+    operatorActions: [
+      'With Xero sync on, map a Xero tax type to every VAT rate that supplier bills use and keep those rates active (Settings > Accounting > Tax; the purchase tax rates can be imported from Xero). A supplier bill or supplier credit note line with no mapped tax type, or on an inactive purchase rate, is now refused instead of posting as "No VAT".',
+      'A queued supplier bill that has a non-vatable cost line needs one edit-and-save, so it is re-derived on the corrected rules.',
+      'With Xero sync on, a supplier credit against a bill that has a reverse-charge line, or that mixes tax treatments, is refused and stays a draft in IMS. Mapping tax rates does not unblock it: IMS leaves these credits unsent in this release, so Xero has no record of such a credit unless it was made in Xero.',
+      'A supplier credit against a bill booked before this release is refused when the order\'s current rates no longer reproduce the VAT that bill recorded. One edit-and-save of that bill records its tax treatment, after which the credit is accepted.',
+    ],
+  },
+  {
     version: '3.1.0',
     date: '2026-11-12',
     title: 'Dispatch completion, searchable order lists, Mintsoft push hardening, reconciling refund and PDF figures, one revenue basis',
