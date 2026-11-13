@@ -94,6 +94,12 @@ test('mintsoft-stock-sync: one failing binding makes the run fail; skipped bindi
   assert.equal(await statusOf(stockRoute), 500)
   doubles.stock = { ...base, status: 'FAILED', errors: 1 }
   assert.equal(await statusOf(stockRoute), 500)
+  // An alignment was applied (an align-down, the case that matters) and the storefront stock enqueue threw: the store keeps the higher quantity, an oversell window.
+  doubles.stock = { ...base, status: 'SUCCEEDED', errors: 0, corrected: 1, stockEnqueueFailures: 1 }
+  assert.equal(await statusOf(stockRoute), 500)
+  // One the outbound-write hold refused is a decision of this installation, not a failure.
+  doubles.stock = { ...base, status: 'SUCCEEDED', errors: 0, corrected: 1, stockEnqueueHeld: 1 }
+  assert.equal(await statusOf(stockRoute), 200)
 })
 
 test('mintsoft-returns-sync: the status enum decides', async () => {

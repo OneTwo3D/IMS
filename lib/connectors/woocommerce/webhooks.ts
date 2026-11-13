@@ -1,3 +1,4 @@
+import { classifyStockEnqueueFailure } from '@/lib/domain/integrations/stock-enqueue-failure'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
@@ -1037,6 +1038,11 @@ async function handleProductWebhook(payload: unknown, originAttestation: string)
               error: error instanceof Error ? error.message : String(error),
             },
           })
+          // The store keeps the quantity it just sent until a correction runs: answer failed so the sender (and the webhook inbox, which retries 5xx and is counted by the cron) tries again.
+          // A write the outbound-write hold refused is a decision of this installation, not a failure.
+          if (classifyStockEnqueueFailure(error) === 'failed') {
+            return NextResponse.json({ ok: false, error: `Stock correction for ${product.sku} failed` }, { status: 500 })
+          }
         }
       }
     }

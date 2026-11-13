@@ -183,8 +183,9 @@ export const cronOutcomes = {
   // status: 'failed', or the run was not recorded
   'reconciliation-pack': (r: ReconciliationPackCronResult) =>
     r.status === 'skipped' && r.recorded ? 'skipped' : r.status === 'failed' || !r.recorded ? 'failed' : 'ok',
+  // stockEnqueueFailures: the storefront stock enqueue after the allocations failed (the store keeps the old quantities);
   // a pass that threw is reported as ok: false with failures (the route classifies held throws itself and passes the class)
-  'reallocation-sweep': (r: ReallocationSweepCronResult) => from(r, r.ok === false ? 'failed' : null, counts(r, ['errors'])),
+  'reallocation-sweep': (r: ReallocationSweepCronResult) => from(r, r.ok === false ? 'failed' : null, counts(r, ['errors', 'stockEnqueueFailures'])),
   // failed: number in each of the two drains
   'refund-reservation-release': (r: { release: ProcessRefundReservationReleaseResult; unmatchedWarnings: ProcessRefundReservationReleaseResult }) =>
     from(r, counts(r, ['failed'])),

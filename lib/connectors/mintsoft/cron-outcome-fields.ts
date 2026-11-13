@@ -20,11 +20,11 @@ export const mintsoftCronFailureFields = {
     ignored: { mismatched: 'warehouse mismatches are findings the sweep reports as data and, by binding mode, corrects or notifies (the discrepancy inbox); a run that finds them has done its job, and a sweep that could not compare is `errors`, which is consumed' },
   },
   'mintsoft-stock-sync': {
-    consumed: ['details[].errors'],
+    consumed: ['details[].errors', 'details[].stockEnqueueFailures'],
     ignored: { 'details[].mismatched': 'warehouse mismatches are findings the sweep reports as data and, by binding mode, corrects or notifies (the discrepancy inbox); a run that finds them has done its job, and a sweep that could not compare is `errors`, which is consumed' },
   },
   'mintsoft-webhook-sweeper': {
-    consumed: ['failed', 'postMaintenanceRecheck.failed'],
+    consumed: ['failed', 'postMaintenanceRecheck.failed', 'stockEnqueueFailures'],
     ignored: { 'postMaintenanceRecheck.refusal': 'why the post-maintenance re-check did not run (maintenance still on, window reopened): a by-design refusal, not a failure' },
   },
 } satisfies Record<string, CronFieldDeclaration>

@@ -55,6 +55,8 @@ export async function GET(request: Request) {
       totalChecked: result.totalChecked,
       mismatched: result.mismatched,
       errors: result.errors,
+      ...(result.stockEnqueueFailures ? { stockEnqueueFailures: result.stockEnqueueFailures } : {}),
+      ...(result.stockEnqueueHeld ? { stockEnqueueHeld: result.stockEnqueueHeld } : {}),
       skippedReason: result.skippedReason ?? null,
       jobId: result.jobId,
     })),

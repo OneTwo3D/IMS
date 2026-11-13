@@ -60,6 +60,7 @@ import { enqueueStockSync } from '@/lib/shopping'
 // RECEIPT writer and owes the same journal, the same transit subledger row and — above all — the
 // same COST DEFINITION as the other two (the manual receipt in app/actions/purchase-orders.ts and
 // the WMS book-in in lib/domain/wms/booked-in-service.ts).
+import { classifyStockEnqueueFailure, type StockEnqueueOutcome } from '@/lib/domain/integrations/stock-enqueue-failure'
 import {
   getAccountingSettingsFor,
   getActiveAccountingConnectorId,
@@ -85,9 +86,10 @@ import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selecti
  * (for align-down that re-opens the oversell window the correction just closed).
  * Best-effort post-commit: a failure is surfaced as a WARNING, never thrown.
  */
-async function enqueueAlignmentStockSync(binding: SyncBinding, productId: string, sku: string): Promise<void> {
+async function enqueueAlignmentStockSync(binding: SyncBinding, productId: string, sku: string): Promise<StockEnqueueOutcome> {
   try {
     await enqueueStockSync([productId], 'IMS_CHANGE')
+    return 'ok'
   } catch (error) {
     console.error(error)
     try {
@@ -103,6 +105,8 @@ async function enqueueAlignmentStockSync(binding: SyncBinding, productId: string
     } catch (logError) {
       console.error(logError)
     }
+    // Counted by the caller into the sweep's result (`stockEnqueueFailures`): the store may keep advertising the pre-alignment quantity.
+    return classifyStockEnqueueFailure(error)
   }
 }
 
@@ -166,6 +170,10 @@ export type MintsoftStockSyncResult = {
   notifiedUsers: number
   dryRun?: boolean
   alignmentPreviews?: number
+  /** PRESENT ONLY WHEN NON-ZERO: storefront stock enqueues that failed after an applied alignment (the store may keep advertising the old quantity). */
+  stockEnqueueFailures?: number
+  /** PRESENT ONLY WHEN NON-ZERO: those the outbound-write hold refused. */
+  stockEnqueueHeld?: number
   skippedReason?: string
 }
 
@@ -1517,6 +1525,7 @@ export async function applyMintsoftAlignmentForProduct(params: {
 }): Promise<{
   applied: boolean
   dryRun: boolean
+  stockEnqueue?: Exclude<StockEnqueueOutcome, 'ok'>
   correctedQty: number
   reason: string
 }> {
@@ -2266,6 +2275,7 @@ export async function applyMintsoftAlignmentForProduct(params: {
     }
   }, { maxWait: 5000, timeout: 30000 })
 
+  let alignEnqueue: StockEnqueueOutcome = 'ok'
   if (outcome.kind === 'applied') {
     // A negative landed cost larger than the goods cost was held at zero for some of these layers: the
     // durable WARNING is written now, AFTER the commit, one entry per purchase order.
@@ -2313,11 +2323,12 @@ export async function applyMintsoftAlignmentForProduct(params: {
       after: { sku: params.sku, warehouseId: params.binding.warehouseId, quantity: outcome.quantityAfter, delta: params.delta, allocations: outcome.allocations },
       triggeredBy: 'stock-sync',
     })
-    await enqueueAlignmentStockSync(params.binding, params.productId, params.sku)
+    alignEnqueue = await enqueueAlignmentStockSync(params.binding, params.productId, params.sku)
   }
 
   return {
     applied: outcome.kind === 'applied',
+    ...(alignEnqueue !== 'ok' ? { stockEnqueue: alignEnqueue } : {}),
     dryRun: outcome.kind === 'dryRun',
     correctedQty: outcome.correctedQty,
     reason: outcome.reason,
@@ -2378,6 +2389,7 @@ async function applyMintsoftAlignDownForProduct(params: {
 }): Promise<{
   applied: boolean
   dryRun: boolean
+  stockEnqueue?: Exclude<StockEnqueueOutcome, 'ok'>
   reason: string
 }> {
   const [priorDiscrepancy, openAsnPendingQty, stockLevel, alignDownReason] = await Promise.all([
@@ -2468,6 +2480,7 @@ async function applyMintsoftAlignDownForProduct(params: {
     }
   }, { maxWait: 5000, timeout: 30000 })
 
+  let alignEnqueue: StockEnqueueOutcome = 'ok'
   if (outcome.applied) {
     await logActivity({
       entityType: 'SYNC',
@@ -2497,10 +2510,10 @@ async function applyMintsoftAlignDownForProduct(params: {
       after: { sku: params.sku, warehouseId: params.binding.warehouseId, quantity: params.wmsQty, delta: params.delta, movementId: outcome.movementId, adjustmentReasonId: params.binding.alignDownReasonId },
       triggeredBy: 'stock-sync',
     })
-    await enqueueAlignmentStockSync(params.binding, params.productId, params.sku)
+    alignEnqueue = await enqueueAlignmentStockSync(params.binding, params.productId, params.sku)
   }
 
-  return { applied: outcome.applied, dryRun: false, reason: outcome.reason }
+  return { applied: outcome.applied, dryRun: false, ...(alignEnqueue !== 'ok' ? { stockEnqueue: alignEnqueue } : {}), reason: outcome.reason }
 }
 
 async function notifyThresholdBreaches(binding: SyncBinding, breachCount: number): Promise<number> {
@@ -2670,6 +2683,9 @@ export async function runStockSyncForBinding(
   }
 
   let thresholdBreaches = 0
+  // Storefront stock enqueues that failed after an applied alignment (the store may keep the old quantity, after an align-down a higher one), and those the hold refused.
+  let stockEnqueueFailures = 0
+  let stockEnqueueHeld = 0
   const alignmentDryRun = binding.stockSyncMode === 'ALIGN_TO_WMS' && !binding.alignmentConfirmedAt
   // 6oyu.1: align-down's persistence gate compares the prior discrepancy's
   // lastSeenAt against this run's start — a row written by THIS run must not
@@ -2883,6 +2899,8 @@ export async function runStockSyncForBinding(
             dryRun: alignmentDryRun,
           })
 
+          if (alignment.stockEnqueue === 'failed') stockEnqueueFailures += 1
+          else if (alignment.stockEnqueue === 'held') stockEnqueueHeld += 1
           if (alignment.applied || alignment.dryRun) {
             if (alignment.applied) {
               counters.corrected += 1
@@ -2924,6 +2942,8 @@ export async function runStockSyncForBinding(
             runStartedAt,
           })
 
+          if (alignDown.stockEnqueue === 'failed') stockEnqueueFailures += 1
+          else if (alignDown.stockEnqueue === 'held') stockEnqueueHeld += 1
           if (alignDown.applied) {
             counters.corrected += 1
             await resolveOpenDiscrepancies(binding, product.id, product.sku)
@@ -3106,6 +3126,8 @@ export async function runStockSyncForBinding(
       notifiedUsers,
       dryRun: alignmentDryRun,
       alignmentPreviews: counters.alignmentPreviews,
+      ...(stockEnqueueFailures > 0 ? { stockEnqueueFailures } : {}),
+      ...(stockEnqueueHeld > 0 ? { stockEnqueueHeld } : {}),
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Mintsoft stock sync failed'
@@ -3150,6 +3172,8 @@ export async function runStockSyncForBinding(
       notifiedUsers: 0,
       dryRun: alignmentDryRun,
       alignmentPreviews: counters.alignmentPreviews,
+      ...(stockEnqueueFailures > 0 ? { stockEnqueueFailures } : {}),
+      ...(stockEnqueueHeld > 0 ? { stockEnqueueHeld } : {}),
       skippedReason: message,
     }
   }

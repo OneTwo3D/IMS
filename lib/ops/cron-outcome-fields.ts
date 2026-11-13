@@ -83,7 +83,7 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
   'recompute-product-lead-times': { consumed: ['failed'] },
   'reconciliation-pack': {},
   'reallocation-sweep': {
-    consumed: ['errors', 'directCreateMarkers.errors', 'failures'],
+    consumed: ['errors', 'directCreateMarkers.errors', 'failures', 'stockEnqueueFailures'],
     probes: { failures: { ok: false } },
   },
   'refund-reservation-release': { consumed: ['release.failed', 'unmatchedWarnings.failed'] },

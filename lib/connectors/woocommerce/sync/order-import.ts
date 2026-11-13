@@ -2868,6 +2868,8 @@ export function readWcOrderCurrency(wcOrder: Pick<WcFullOrder, 'currency'>): str
 
 export type ImportWcOrderResult = {
   success: boolean
+  /** The order was imported but its sales invoice could NOT be queued (the enqueue threw, so nothing will post it): a money-visible gap the poll reports as an error. */
+  accountingQueueFailed?: boolean
   /** INTERNAL (stripped by importWcOrder): the create transaction found a customer erasure and must be retried through the erased-on-create path. */
   erasedRetry?: { customerId: string | null }
   orderId?: string
@@ -3818,6 +3820,8 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       ? null
       : `Accounting sales invoice HELD — ${invoiceNumberResolution.reason}`
 
+    // Set when queueing the sales invoice threw: nothing will post it, so the import result says so (the poll reports it).
+    let accountingQueueFailed = false
     try {
       const { queueAccountingSyncTxWithOutcome, getAccountingSettings } = await import('@/lib/accounting')
       const settings = await getAccountingSettings()
@@ -4041,6 +4045,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
         })
       }
     } catch (accountingError) {
+      accountingQueueFailed = true
       await logActivity({
         entityType: 'SALES_ORDER',
         entityId: so.id,
@@ -4109,7 +4114,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       resolveUser: false,
     })
 
-    return { success: true, orderId: so.id }
+    return { success: true, orderId: so.id, ...(accountingQueueFailed ? { accountingQueueFailed: true } : {}) }
   } catch (e) {
     if (e instanceof WcImportErasedRetry) return { success: false, error: e.message, erasedRetry: { customerId: e.customerId } }
     if (e instanceof WcReceiptRegistrationNotRecorded) {
@@ -4619,6 +4624,9 @@ export async function syncNewWcOrders(
         result.errors.push(
           `WooCommerce order #${order.number}: imported, but applying the customer's withdrawal FAILED — the order is live and withdrawn`,
         )
+      }
+      if (importResult.accountingQueueFailed) {
+        result.errors.push(`WooCommerce order #${order.number}: imported, but its sales invoice could not be queued, so nothing will post it to the ledger until an operator re-queues it`)
       }
       if (guarded.suppressionHandled) {
         // A withdrawal transition was just applied; do not sync this stale

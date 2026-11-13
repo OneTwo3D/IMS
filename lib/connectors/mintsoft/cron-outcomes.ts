@@ -15,7 +15,7 @@ import type { MintsoftStockSyncResult } from './sync/stock-sync'
 type MintsoftStockSyncCronResult = {
   ran: number
   due: number
-  details: Array<Pick<MintsoftStockSyncResult, 'bindingId' | 'warehouseCode' | 'status' | 'totalChecked' | 'mismatched' | 'errors' | 'jobId'> & { skippedReason: string | null }>
+  details: Array<Pick<MintsoftStockSyncResult, 'bindingId' | 'warehouseCode' | 'status' | 'totalChecked' | 'mismatched' | 'errors' | 'jobId' | 'stockEnqueueFailures' | 'stockEnqueueHeld'> & { skippedReason: string | null }>
 }
 type MintsoftWebhookSweeperCronResult = ProcessMintsoftBookedInEventsResult & { postMaintenanceRecheck: Awaited<ReturnType<typeof runPostMaintenanceBookedInRecheck>> }
 
@@ -28,8 +28,8 @@ export const mintsoftCronOutcomes = {
   'mintsoft-product-verify': (r: MintsoftProductSyncResult) => enumResult(r, ['errors']),
   // status enum; errors: number
   'mintsoft-returns-sync': (r: MintsoftReturnsSyncResult) => enumResult(r, ['errors']),
-  // one result per binding: status enum and errors: number
-  'mintsoft-stock-sync': (r: MintsoftStockSyncCronResult) => from(r, ...r.details.map((detail) => enumResult(detail, ['errors']))),
-  // failed: number (booked-in events that failed to process); error texts in the recheck
-  'mintsoft-webhook-sweeper': (r: MintsoftWebhookSweeperCronResult) => from(r, counts(r, ['failed']), structural(r)),
+  // one result per binding: status enum and errors: number; stockEnqueueFailures: storefront stock enqueues that failed after an applied alignment (the store keeps the old quantity: an oversell window after an align-down)
+  'mintsoft-stock-sync': (r: MintsoftStockSyncCronResult) => from(r, ...r.details.map((detail) => enumResult(detail, ['errors', 'stockEnqueueFailures']))),
+  // failed: number (booked-in events that failed to process); stockEnqueueFailures: processed receipts whose storefront stock enqueue failed; error texts in the recheck
+  'mintsoft-webhook-sweeper': (r: MintsoftWebhookSweeperCronResult) => from(r, counts(r, ['failed', 'stockEnqueueFailures']), structural(r)),
 }

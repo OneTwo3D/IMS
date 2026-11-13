@@ -74,6 +74,10 @@ test('each route-owned signal: status enums, success flags, error keys', () => {
     const allErrors = [...Array.from({ length: 12 }, () => held), 'WC API error: 500 boom']
     assert.equal(cronOutcome('wc-reconcile', { stock: { errors: allErrors.slice(0, 10), sync: { errors: allErrors } } } as never), 'failed')
   }
+  // storefront stock enqueues that failed after a stock change: the store keeps the old quantity (a booked-in receipt, a reallocation, an alignment)
+  assert.equal(cronOutcome('mintsoft-webhook-sweeper', { attempted: 1, processed: 1, duplicates: 0, pending: 0, requiresReview: 0, failed: 0, stockEnqueueFailures: 1, postMaintenanceRecheck: {} }), 'failed')
+  assert.equal(cronOutcome('reallocation-sweep', { scanned: 2, needing: 2, allocated: 2, skipped: 0, errors: 0, hasRemainder: false, nextCursor: '', cursorPersisted: true, stockEnqueueFailures: 1 }), 'failed')
+  assert.equal(cronOutcome('reallocation-sweep', { scanned: 2, needing: 2, allocated: 2, skipped: 0, errors: 0, hasRemainder: false, nextCursor: '', cursorPersisted: true, stockEnqueueHeld: 1 }), 'ok')
   // a presence probe that threw is a failed read, even in a sweep that updated orders
   assert.equal(cronOutcome('wms-order-status', { scanned: 3, updated: 2, failed: 0, probeFailures: 1 }), 'failed')
   assert.equal(cronOutcome('wms-order-status', { scanned: 3, updated: 2, failed: 0 }), 'ok')
