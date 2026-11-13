@@ -11,7 +11,7 @@ import { OutboundWriteHeldError } from '../../lib/security/outbound-write-grant.
 
 process.env.SETTINGS_ENCRYPTION_KEY ||= 'a'.repeat(64)
 
-const state = { runnable: [] as string[], pushError: null as string | null, pushes: 0 }
+const state = { runnable: [] as string[], pushError: null as string | null, pushes: 0, orderCount: 1, errorFor: null as ((call: number) => string | null) | null }
 
 mock.module('@/lib/integration-plugins', { namedExports: { getIntegrationPluginState: async () => ({ mintsoft: true }) } })
 mock.module('@/lib/connectors/wms/types', { namedExports: { WMS_CONNECTOR_IDS: ['mintsoft'] } })
@@ -32,7 +32,8 @@ mock.module('@/lib/shopping', {
     listRunnableShoppingConnectorIds: async () => state.runnable,
     pushWmsOrderStatusToShopping: async () => {
       state.pushes += 1
-      return state.pushError ? { success: false, error: state.pushError } : { success: true }
+      const error = state.errorFor ? state.errorFor(state.pushes) : state.pushError
+      return error ? { success: false, error } : { success: true }
     },
   },
 })
@@ -42,7 +43,7 @@ const dbMock = {
   setting: { upsert: async () => ({}) },
   salesOrder: {
     count: async () => 0,
-    findMany: async () => [{ id: 'order-1', shoppingLinks: [{ externalOrderNumber: 'SO-1' }], wmsOrderStatus: null }],
+    findMany: async () => Array.from({ length: state.orderCount }, (_, index) => ({ id: `order-${index + 1}`, shoppingLinks: [{ externalOrderNumber: `SO-${index + 1}` }], wmsOrderStatus: null })),
     findUnique: async () => ({ erasedAt: null }),
   },
   wmsOrderPushLink: { updateMany: async () => ({ count: 0 }) },
@@ -82,4 +83,30 @@ test('a runnable connector whose push fails is an error and fails the run; a hol
 
   state.pushError = null
   assert.equal(cronOutcome('wms-order-status', (await run()) as never), 'ok')
+})
+
+test('twenty held pushes followed by one genuine failure answers failed: the error list is cut for display, the counts cover the whole batch', async () => {
+  const held = new OutboundWriteHeldError(
+    { connector: 'woocommerce', code: 'no_grant', method: 'PUT', target: 'https://shop.example.test/wp-json/wc/v3/orders/1', granted: null, attempted: null, basis: 'test' },
+    0,
+  ).message
+  state.runnable = ['woocommerce']
+  state.orderCount = 21
+  state.errorFor = (call) => (call <= 20 ? held : 'WooCommerce: WC API error: 500 boom')
+  try {
+    const result = await run()
+    assert.equal(result.errors?.length, 20, 'the listed texts are cut at 20, so the genuine one is not in them')
+    assert.ok(result.errors?.every((text) => text === held))
+    assert.equal(result.pushHeld, 20)
+    assert.equal(result.pushFailures, 1)
+    assert.equal(cronOutcome('wms-order-status', result as never), 'failed')
+
+    state.errorFor = () => held
+    const onlyHeld = await run()
+    assert.equal(onlyHeld.pushFailures, undefined)
+    assert.equal(cronOutcome('wms-order-status', onlyHeld as never), 'held')
+  } finally {
+    state.errorFor = null
+    state.orderCount = 1
+  }
 })

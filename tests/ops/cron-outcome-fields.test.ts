@@ -5,6 +5,7 @@ import test from 'node:test'
 import ts from 'typescript'
 
 import { cronOutcomes, type CronOutcomeSlug } from '../../lib/ops/cron-outcomes.ts'
+import { outboundHeldMessage } from '../../lib/security/outbound-write-hold-constants.ts'
 import { cronFailureFields, type CronFieldDeclaration } from '../../lib/ops/cron-outcome-fields.ts'
 
 /**
@@ -209,6 +210,28 @@ test('every consumed field really is consumed: the mapping does not answer ok wh
   assert.ok(probed >= 60, `probed ${probed}`)
   assert.ok(probedWithSkip >= 20, `probed with a skip state: ${probedWithSkip}`)
   assert.ok(probedWithProgress >= 40, `probed against a busy successful run: ${probedWithProgress}`)
+})
+
+/** More held texts than any display cap (the sweeps cut their lists at 20 or fewer), then one genuine failure, last. */
+const HELD_THEN_GENUINE = [
+  ...Array.from({ length: 120 }, (_, index) => outboundHeldMessage({ connector: 'woocommerce', code: 'no_grant', granted: null, attempted: null, method: 'PUT', target: `https://shop.example.test/p/${index}`, hop: 0 })),
+  'Storefront WMS-status push failed: HTTP 500',
+]
+
+test('every error list a mapping reads: a long run of held errors followed by one genuine failure is still failed (a list cut for display must not decide held)', () => {
+  let probed = 0
+  for (const slug of Object.keys(cronOutcomes) as CronOutcomeSlug[]) {
+    const declaration = cronFailureFields[slug]
+    for (const field of declaration.consumed ?? []) {
+      if (enumerated.get(slug)!.fields.get(field) !== LEAF.stringArray) continue
+      const base = { ...declaration.probes?.['*'], ...declaration.probes?.[field] }
+      const sample = merge({ ...base }, objectAt(field, HELD_THEN_GENUINE))
+      assert.equal(mapper(slug)(sample), 'failed', `${slug}: '${field}' holding ${HELD_THEN_GENUINE.length - 1} held errors then a genuine one must be failed`)
+      // The producer cuts the list: the genuine one is NOT in what the mapping sees, so the mapping needs its own whole-batch count (declared as a consumed count beside the list).
+      probed++
+    }
+  }
+  assert.ok(probed >= 10, `probed ${probed} error lists`)
 })
 
 test('a busy, successful run on its own is ok (the progress baseline is not itself failing)', () => {

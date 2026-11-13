@@ -134,7 +134,7 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
   'wms-order-reconcile': {
     ignored: { 'counters.errors': 'decides `status` (FAILED or PARTIAL when above zero), which the mapping reads' },
   },
-  'wms-order-status': { consumed: ['failed', 'errors', 'probeFailures'], skipState: { skipped: 'x' } },
+  'wms-order-status': { consumed: ['failed', 'errors', 'probeFailures', 'pushFailures'], skipState: { skipped: 'x' } },
   'wms-watchdog': {
     ignored: {
       deliveryFailures: 'decides `status` (FAILED when a breach could not be alerted), which the mapping reads',

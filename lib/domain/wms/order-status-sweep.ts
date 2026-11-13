@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
@@ -19,6 +20,8 @@ import { WMS_ORDER_STATUS_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liven
 const TERMINAL_SALES_STATUSES = ['COMPLETED', 'DELIVERED', 'CANCELLED'] as const
 const DEFAULT_STALE_MINUTES = 30
 const DEFAULT_BATCH_SIZE = 50
+/** How many push error texts the result lists (display only: the counts above cover the whole batch). */
+export const PUSH_ERRORS_DISPLAY_CAP = 20
 
 export type WmsOrderStatusSweepResult = {
   skipped?: string
@@ -29,6 +32,10 @@ export type WmsOrderStatusSweepResult = {
   errors?: string[]
   /** PRESENT ONLY WHEN NON-ZERO: storefront status pushes not attempted because no storefront connector is runnable (a state chosen on purpose, not a failure). */
   pushSkipped?: number
+  /** PRESENT ONLY WHEN NON-ZERO: storefront status pushes that failed for a reason other than the outbound-write hold, counted over the WHOLE batch (`errors` is cut for display; this is what the cron exit status reads). */
+  pushFailures?: number
+  /** PRESENT ONLY WHEN NON-ZERO: storefront status pushes the outbound-write hold refused (nothing sent), counted over the whole batch. */
+  pushHeld?: number
   /** Orders whose null fetch could not be settled because the presence probe THREW: a failed read, apart from the expected unresolved states (no probe, order present without a status) that only withhold the stamp. */
   probeFailures?: number
 }
@@ -166,6 +173,15 @@ export async function runWmsOrderStatusSweep(
   let updated = 0
   let failed = 0
   const pushErrors: string[] = []
+  // Counted over the whole batch: `errors` below is cut for display, and a cron exit status decided from the cut list would read twenty held pushes
+  // followed by a genuine failure as held.
+  let pushFailures = 0
+  let pushHeld = 0
+  const notePushError = (text: string): void => {
+    pushErrors.push(text)
+    if (isOutboundWriteHeldText(text)) pushHeld += 1
+    else pushFailures += 1
+  }
   let pushSkipped = 0
   let probeFailures = 0
   let storefrontRunnable: boolean | undefined
@@ -351,11 +367,11 @@ export async function runWmsOrderStatusSweep(
             // A shadowed push (the producer-side hold) is neither pushed nor failed: wcPushedStatus stays unchanged so the
             // live phase's first tick pushes the then-current status, and nothing is logged as a failure.
             console.warn(`[wms-order-status-sweep] storefront WMS-status push failed for order ${order.id}: ${pushResult.error}`)
-            pushErrors.push(pushResult.error ?? 'Storefront WMS-status push failed')
+            notePushError(pushResult.error ?? 'Storefront WMS-status push failed')
           }
         } catch (pushError) {
           console.error('[wms-order-status-sweep] storefront WMS-status push errored', pushError)
-          pushErrors.push(pushError instanceof Error ? pushError.message : String(pushError))
+          notePushError(pushError instanceof Error ? pushError.message : String(pushError))
         }
       }
     } catch (error) {
@@ -403,5 +419,5 @@ export async function runWmsOrderStatusSweep(
     })
   }
 
-  return { scanned: orders.length, updated, failed, ...(pushErrors.length > 0 ? { errors: pushErrors.slice(0, 20) } : {}), ...(pushSkipped > 0 ? { pushSkipped } : {}), ...(probeFailures > 0 ? { probeFailures } : {}) }
+  return { scanned: orders.length, updated, failed, ...(pushErrors.length > 0 ? { errors: pushErrors.slice(0, PUSH_ERRORS_DISPLAY_CAP) } : {}), ...(pushSkipped > 0 ? { pushSkipped } : {}), ...(pushFailures > 0 ? { pushFailures } : {}), ...(pushHeld > 0 ? { pushHeld } : {}), ...(probeFailures > 0 ? { probeFailures } : {}) }
 }

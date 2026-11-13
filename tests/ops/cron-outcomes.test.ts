@@ -1,3 +1,4 @@
+import { outboundHeldMessage } from '../../lib/security/outbound-write-hold-constants.ts'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
@@ -67,6 +68,12 @@ test('each route-owned signal: status enums, success flags, error keys', () => {
   assert.equal(cronOutcome('invoice-documents', { stoppedEarly: 'unexpected error: x', stored: 5, failed: 0 }), 'failed')
   assert.equal(cronOutcome('invoice-documents', { stoppedEarly: null, stored: 3, failed: 1 }), 'failed')
   assert.equal(cronOutcome('invoice-documents', { stoppedEarly: null, stored: 3, failed: 0 }), 'ok')
+  // wc-reconcile cuts `stock.errors` at 10 for display but keeps the whole stock push result under `stock.sync`, which the mapping also reads
+  {
+    const held = outboundHeldMessage({ connector: 'woocommerce', code: 'no_grant', granted: null, attempted: null, method: 'PUT', target: 'https://shop.example.test/p', hop: 0 })
+    const allErrors = [...Array.from({ length: 12 }, () => held), 'WC API error: 500 boom']
+    assert.equal(cronOutcome('wc-reconcile', { stock: { errors: allErrors.slice(0, 10), sync: { errors: allErrors } } } as never), 'failed')
+  }
   // a presence probe that threw is a failed read, even in a sweep that updated orders
   assert.equal(cronOutcome('wms-order-status', { scanned: 3, updated: 2, failed: 0, probeFailures: 1 }), 'failed')
   assert.equal(cronOutcome('wms-order-status', { scanned: 3, updated: 2, failed: 0 }), 'ok')
