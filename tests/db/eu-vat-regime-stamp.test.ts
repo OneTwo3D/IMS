@@ -65,7 +65,7 @@ test('a scheme decision is written once: regime, account, marker and basis', { s
     assert.equal(basis.outcome, 'SCHEME')
     assert.equal(basis.scheme.convertedValue, '100.00')
     assert.equal(basis.scheme.vatTotal, '19')
-    assert.deepEqual(await readEuVatRegimeStamp(db, id), { regime: 'IOSS', vatAccount: '821', stampedAt: NOW })
+    assert.deepEqual(await readEuVatRegimeStamp(db, id), { regime: 'IOSS', schemePostingTaxType: 'TAX131', vatAccount: '821', stampedAt: NOW })
   } finally {
     await db.salesOrder.delete({ where: { id } })
   }
@@ -80,9 +80,10 @@ test('a stamped order is never re-derived: a later rate that would choose DDP ch
     const later = await db.$transaction((tx) => stampEuVatRegime(tx, id, () => { gathered += 1; return input('151.00') }, new Date('2026-11-09T00:00:00.000Z')))
     assert.equal(gathered, 0)
     assert.equal(later.kind, 'already_stamped')
-    assert.deepEqual(later.kind === 'already_stamped' && later.stamp, { regime: 'IOSS', vatAccount: '821', stampedAt: NOW })
-    const row = await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { euVatRegime: true, euVatLineAccount: true, euVatRegimeStampedAt: true } })
+    assert.deepEqual(later.kind === 'already_stamped' && later.stamp, { regime: 'IOSS', schemePostingTaxType: 'TAX131', vatAccount: '821', stampedAt: NOW })
+    const row = await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { euVatRegime: true, euVatLineAccount: true, euVatRegimeStampedAt: true, euVatRegimeBasis: true } })
     assert.deepEqual([row.euVatRegime, row.euVatLineAccount, row.euVatRegimeStampedAt], ['IOSS', '821', NOW])
+    assert.equal((row.euVatRegimeBasis as { scheme: { schemePostingTaxType: string } }).scheme.schemePostingTaxType, 'TAX131', 'the recorded zero-rated type is never re-derived either')
   } finally {
     await db.salesOrder.delete({ where: { id } })
   }
@@ -230,9 +231,10 @@ test('a stale read cannot overwrite: if the order is stamped between the read an
       return stampEuVatRegime(stale, id, () => input('200.00'), new Date('2026-11-09T00:00:00.000Z'))
     })
     assert.equal(later.kind, 'already_stamped')
-    assert.deepEqual(later.kind === 'already_stamped' && later.stamp, { regime: 'IOSS', vatAccount: '821', stampedAt: NOW })
-    const row = await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { euVatRegime: true, euVatRegimeStampedAt: true } })
+    assert.deepEqual(later.kind === 'already_stamped' && later.stamp, { regime: 'IOSS', schemePostingTaxType: 'TAX131', vatAccount: '821', stampedAt: NOW })
+    const row = await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { euVatRegime: true, euVatRegimeStampedAt: true, euVatRegimeBasis: true } })
     assert.deepEqual([row.euVatRegime, row.euVatRegimeStampedAt], ['IOSS', NOW])
+    assert.equal((row.euVatRegimeBasis as { scheme: { schemePostingTaxType: string } }).scheme.schemePostingTaxType, 'TAX131', 'a stale read leaves the recorded type unchanged')
   } finally {
     await db.salesOrder.delete({ where: { id } })
   }
