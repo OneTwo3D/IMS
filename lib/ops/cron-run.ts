@@ -143,8 +143,9 @@ export async function runCronWithLogging<T extends Record<string, unknown>>(
     })
 
     await safeWriteCronRunLog(writeLog, log)
-    // A refused outbound write is a hold, not a fault: it is recorded (above) and answered 2xx. Recognised by its class.
-    if (isOutboundWriteHeldError(error)) {
+    // A refused outbound write is a hold, not a fault: it is recorded (above) and answered 2xx. Recognised by its class, and only when it PROVES
+    // nothing was sent (hop 0): a refusal at a redirect hop follows a request that went out, so its outcome is unknown and it is a failure.
+    if (isOutboundWriteHeldError(error) && error.nothingSent === true) {
       return { runId, result: { error: log.statusReason, held: true } as unknown as T, log, outcomeClass: 'held' }
     }
     throw error

@@ -140,6 +140,16 @@ test('runCronWithLogging: a thrown hold is recorded and answers 2xx; any other t
   await assert.rejects(runCronWithLogging({ jobName: 'j', writeLog, run: async () => { throw new Error('boom') } }), /boom/)
 })
 
+test('runCronWithLogging: a refusal at a redirect hop (the first write already went out) is not a hold: it propagates, so the route answers 500', async () => {
+  const refusal = { connector: 'woocommerce', code: 'no_grant', method: 'PUT', target: 'https://shop.example.test/x', granted: null, attempted: null, basis: 't' } as const
+  const logs: CronRunLog[] = []
+  await assert.rejects(
+    runCronWithLogging({ jobName: 'j', writeLog: async (log) => { logs.push(log) }, run: async () => { throw new OutboundWriteHeldError(refusal, 1) } }),
+    (error: unknown) => error instanceof OutboundWriteHeldError && error.nothingSent === false,
+  )
+  assert.equal(logs[0]?.status, 'failed')
+})
+
 test('cronResultResponse: an explicit outcome class overrides the result, and the response is not cacheable', () => {
   const response = cronResultResponse({ status: 'FAILED' }, { outcomeClass: 'failed' })
   assert.equal(response.status, 500)

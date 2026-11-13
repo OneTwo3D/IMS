@@ -47,7 +47,7 @@ export async function GET(request: Request) {
     result = await sweepUnallocatedProcessingOrders()
   } catch (error) {
     failures.reallocationSweep = error instanceof Error ? error.message : String(error)
-    if (!isOutboundWriteHeldError(error)) genuineFailure = true
+    if (!(isOutboundWriteHeldError(error) && error.nothingSent === true)) genuineFailure = true
     console.error('[reallocation-sweep] allocation pass failed:', error)
   }
 
@@ -65,7 +65,7 @@ export async function GET(request: Request) {
     })
   } catch (error) {
     failures.directCreateMarkerSweep = error instanceof Error ? error.message : String(error)
-    if (!isOutboundWriteHeldError(error)) genuineFailure = true
+    if (!(isOutboundWriteHeldError(error) && error.nothingSent === true)) genuineFailure = true
     console.error('[reallocation-sweep] direct-create marker pass failed:', error)
   }
 

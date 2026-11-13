@@ -29,6 +29,8 @@ export type WmsOrderStatusSweepResult = {
   errors?: string[]
   /** PRESENT ONLY WHEN NON-ZERO: storefront status pushes not attempted because no storefront connector is runnable (a state chosen on purpose, not a failure). */
   pushSkipped?: number
+  /** Orders whose null fetch could not be settled because the presence probe THREW: a failed read, apart from the expected unresolved states (no probe, order present without a status) that only withhold the stamp. */
+  probeFailures?: number
 }
 
 /**
@@ -165,6 +167,7 @@ export async function runWmsOrderStatusSweep(
   let failed = 0
   const pushErrors: string[] = []
   let pushSkipped = 0
+  let probeFailures = 0
   let storefrontRunnable: boolean | undefined
   // Orders whose read did not RESOLVE even though nothing threw: a null fetch whose presence probe
   // failed, could not run, or found the order without being able to read its status. They are not
@@ -242,6 +245,7 @@ export async function runWmsOrderStatusSweep(
               probeError instanceof Error ? probeError.message : String(probeError)
             }`
             unresolvedReads += 1
+            probeFailures += 1
           }
         }
       }
@@ -399,5 +403,5 @@ export async function runWmsOrderStatusSweep(
     })
   }
 
-  return { scanned: orders.length, updated, failed, ...(pushErrors.length > 0 ? { errors: pushErrors.slice(0, 20) } : {}), ...(pushSkipped > 0 ? { pushSkipped } : {}) }
+  return { scanned: orders.length, updated, failed, ...(pushErrors.length > 0 ? { errors: pushErrors.slice(0, 20) } : {}), ...(pushSkipped > 0 ? { pushSkipped } : {}), ...(probeFailures > 0 ? { probeFailures } : {}) }
 }

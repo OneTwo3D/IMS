@@ -67,6 +67,9 @@ test('each route-owned signal: status enums, success flags, error keys', () => {
   assert.equal(cronOutcome('invoice-documents', { stoppedEarly: 'unexpected error: x', stored: 5, failed: 0 }), 'failed')
   assert.equal(cronOutcome('invoice-documents', { stoppedEarly: null, stored: 3, failed: 1 }), 'failed')
   assert.equal(cronOutcome('invoice-documents', { stoppedEarly: null, stored: 3, failed: 0 }), 'ok')
+  // a presence probe that threw is a failed read, even in a sweep that updated orders
+  assert.equal(cronOutcome('wms-order-status', { scanned: 3, updated: 2, failed: 0, probeFailures: 1 }), 'failed')
+  assert.equal(cronOutcome('wms-order-status', { scanned: 3, updated: 2, failed: 0 }), 'ok')
 })
 
 test('wc-reconcile: permanent import conflicts with an empty errors list are a failure', () => {

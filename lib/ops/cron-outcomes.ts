@@ -199,8 +199,8 @@ export const cronOutcomes = {
   'wms-order-push': (r: WmsOrderPushSweepResult) => from(r, counts(r, ['failed', 'deadLettered', 'shadowUnrecorded'])),
   // status enum; counters.errors: number
   'wms-order-reconcile': (r: WmsOrderReconcileResult) => enumResult(r, ['errors']),
-  // failed: number; errors: string[] (storefront status pushes that failed, held-aware)
-  'wms-order-status': (r: WmsOrderStatusSweepResult) => from(r, counts(r, ['failed']), structural(r)),
+  // failed: number; probeFailures: number (a presence probe that threw, apart from the expected unresolved states); errors: string[] (storefront status pushes that failed, held-aware)
+  'wms-order-status': (r: WmsOrderStatusSweepResult) => from(r, counts(r, ['failed', 'probeFailures']), structural(r)),
   // status: FAILED = breaches nobody could be alerted to
   'wms-watchdog': (r: WmsWatchdogResult): CronOutcomeClass => (r.status === 'FAILED' ? 'failed' : r.status === 'SKIPPED' ? 'skipped' : 'ok'),
   // status: FAILED
