@@ -74,6 +74,23 @@ export const noStampRefusal = (creditNoteNumber: string): string =>
 /** The payload key a REFUSED credit-note row carries: the poster refuses any row holding it, before anything else, so the row can be claimed and shown on /sync and settled by hand but never sent. */
 export const EU_VAT_CREDIT_NOTE_REFUSED_KEY = '_euVatCreditNoteRefused'
 
+/**
+ * The payload of a REFUSED credit-note row: a dedicated, NON-POSTABLE record. The marker and the reason, the credit note's number, currency, reference and date, the refund and order it is for, and the amount it would have been (net, in the document currency). NO lines and no tax types, so no tax-code binding can reach
+ * the enqueue's retired-code guard (a tax re-key that retired a line's code would otherwise stop the row from existing and leave nothing to settle) and nothing in it could ever be posted.
+ */
+export function refusedCreditNotePayload(input: { creditNoteNumber: unknown; currency: unknown; reference: unknown; date: unknown; refundId: string; orderId: string; lines: unknown; reason: string }): Record<string, unknown> {
+  const lines = Array.isArray(input.lines) ? (input.lines as Array<{ quantity?: unknown; unitAmount?: unknown }>) : []
+  const net = lines.reduce((sum, line) => sum.plus(toDecimal(Number(line.quantity ?? 0)).times(toDecimal(Number(line.unitAmount ?? 0)))), toDecimal(0))
+  return {
+    creditNoteNumber: input.creditNoteNumber,
+    currency: input.currency,
+    reference: input.reference,
+    date: input.date,
+    lines: [],
+    [EU_VAT_CREDIT_NOTE_REFUSED_KEY]: { reason: input.reason, refundId: input.refundId, orderId: input.orderId, netAmount: net.toString() },
+  }
+}
+
 /** The refusal a REFUSED credit-note row (one carrying the key above) always answers with, or null for any other payload. The poster returns it before anything else. */
 export function refusedCreditNoteError(payload: Record<string, unknown>): string | null {
   const marker = payload[EU_VAT_CREDIT_NOTE_REFUSED_KEY] as { reason?: unknown } | null | undefined

@@ -78,7 +78,7 @@ import { dischargeRefundAccountingObligation } from '@/lib/domain/sales/refund-a
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { rateBinding, resolveSalesLineTaxType, taxTypeForBasis } from '@/lib/accounting/reverse-charge'
 import { creditNoteLineTaxTypeResolver } from '@/lib/domain/sales/refund-posted-tax-identity'
-import { EU_VAT_CREDIT_NOTE_REFUSED_KEY } from '@/lib/domain/accounting/eu-vat-credit-note'
+import { refusedCreditNotePayload } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { recordCreditNoteTreatmentRefusal, treatCreditNotePayload } from '@/lib/domain/sales/eu-vat-credit-note-treatment'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
@@ -2401,7 +2401,7 @@ async function queueRefundAccountingActions(input: {
       payload: creditNoteTreatment.kind === 'treated'
         ? creditNoteTreatment.payload
         : creditNoteTreatment.kind === 'refused'
-          ? { ...builtCreditNotePayload, [EU_VAT_CREDIT_NOTE_REFUSED_KEY]: { reason: creditNoteTreatment.reason } }
+          ? refusedCreditNotePayload({ creditNoteNumber: builtCreditNotePayload.creditNoteNumber, currency: builtCreditNotePayload.currency, reference: builtCreditNotePayload.reference, date: builtCreditNotePayload.date, refundId: input.refundId, orderId: input.orderId, lines: builtCreditNotePayload.lines, reason: creditNoteTreatment.reason })
           : builtCreditNotePayload,
     }))
   }

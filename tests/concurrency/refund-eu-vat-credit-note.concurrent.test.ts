@@ -353,6 +353,48 @@ test('[eu vat credit note] unstamped orders: an IMS-queued treated invoice makes
   assert.equal(refusedCreditNoteError(rowB!.payload!), null, 'documented limit: no stamp, no IMS invoice, no scheme mapping now: an ordinary credit note')
 })
 
+test('[eu vat credit note] a refused hand-post row carries NO lines or tax codes: a tax re-key that retired the line\'s code before the enqueue cannot stop it from existing; it fails at the poster, settles, and the refund is not flagged', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true)
+  const fx = await seed(deps, { stamp: null, schemeRate: true })
+  const replacement = await deps.db.taxRate.create({ data: { name: `DE CN REPL ${randomUUID().slice(0, 6)}`, rate: '0.19', usedFor: 'SALES', accountingTaxType: `DE_NEW_${randomUUID().slice(0, 6)}`, countryCode: 'DE', taxCategory: 'STANDARD', active: true } })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx); await deps.db.taxRate.deleteMany({ where: { id: replacement.id } }) })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  // The re-key: the order's rate is retired in favour of the replacement (a different Xero code) before the credit note is queued.
+  await deps.db.taxRate.update({ where: { id: fx.rate.id }, data: { replacedById: replacement.id, active: false } })
+  const result = await deps.createRefund(fx.orderId, [itemised(fx.goods, 'Widget', 100, 19)], 'rekeyed', undefined, { internalBypassToken: deps.bypass, externalRefundId: wooRefundId(), statedGrossForeign: 119 })
+  assert.equal(result.success, true, result.error)
+  const row = await creditNoteRow(deps.db, fx.orderId)
+  assert.ok(row?.payload, 'the refused row exists: the retired-code guard had nothing to reject')
+  const payload = row.payload
+  assert.deepEqual(payload.lines, [])
+  assert.doesNotMatch(JSON.stringify(payload), /taxType|taxRateId|DE_CHARGED/)
+  const marker = payload._euVatCreditNoteRefused as { reason: string; refundId: string; orderId: string; netAmount: string }
+  assert.deepEqual([marker.refundId, marker.orderId, marker.netAmount], [row.refundId, fx.orderId, '100'])
+  const { refusedCreditNoteError } = await import('../../lib/domain/accounting/eu-vat-credit-note.ts')
+  assert.match(refusedCreditNoteError(payload) ?? '', /no recorded VAT regime|treated invoice|NOTHING WAS SENT/)
+  assert.equal((await deps.db.salesOrderRefund.findUnique({ where: { id: row.refundId }, select: { accountingRetryRequired: true } }))?.accountingRetryRequired, false)
+  const log = await deps.db.accountingSyncLog.findFirst({ where: { type: 'CREDIT_NOTE', referenceId: row.refundId }, select: { id: true } })
+  await deps.db.accountingSyncLog.update({ where: { id: log!.id }, data: { status: 'FAILED', attemptRevision: 1, errorMessage: refusedCreditNoteError(payload), retryCount: 1 } })
+  await deps.db.user.upsert({ where: { id: 'ioss-cn-test' }, create: { id: 'ioss-cn-test', email: 'ioss-cn-test@example.invalid', name: 'ioss test', passwordHash: 'x' }, update: {} })
+  t.after(async () => { await deps.db.activityLog.deleteMany({ where: { userId: 'ioss-cn-test' } }); await deps.db.user.deleteMany({ where: { id: 'ioss-cn-test' } }) })
+  const { settleAccountingSyncRow } = await import('../../app/actions/accounting-settlement.ts')
+  const settled = await settleAccountingSyncRow(log!.id, { observedStatus: 'FAILED', observedAttemptRevision: 1, outcome: 'POSTED', externalTransactionId: 'CN-BY-HAND-2' })
+  assert.equal(settled.success, true, JSON.stringify(settled))
+  assert.equal((await deps.db.accountingSyncLog.findUnique({ where: { id: log!.id }, select: { status: true } }))?.status, 'SYNCED')
+})
+
+test('[eu vat credit note] the refused-row payload is a dedicated record, and only a payload with the marker is ever treated as refused', async () => {
+  const { refusedCreditNotePayload, refusedCreditNoteError } = await import('../../lib/domain/accounting/eu-vat-credit-note.ts')
+  const built = refusedCreditNotePayload({ creditNoteNumber: 'CN-1', currency: 'EUR', reference: 'R', date: '2026-11-13', refundId: 'rf', orderId: 'so', reason: 'why', lines: [{ quantity: 2, unitAmount: 10.5, taxType: 'X', accountCode: '200' }] })
+  assert.deepEqual(Object.keys(built).sort(), ['_euVatCreditNoteRefused', 'creditNoteNumber', 'currency', 'date', 'lines', 'reference'])
+  assert.deepEqual(built.lines, [])
+  assert.equal((built._euVatCreditNoteRefused as { netAmount: string }).netAmount, '21')
+  assert.equal(refusedCreditNoteError(built), 'why')
+  // A postable payload (lines, tax types, no marker) is never refused by this route, so the exemption cannot swallow a real credit note.
+  assert.equal(refusedCreditNoteError({ creditNoteNumber: 'CN-2', lines: [{ description: 'W', quantity: 1, unitAmount: 1, accountCode: '200', taxType: 'X' }] }), null)
+})
+
 test('[eu vat credit note] a CANCELLATION (the whole-order reversal) reverses the whole VAT with full lines: the stamped regime, every fee, the order\'s own tax', { skip }, async (t) => {
   const deps = await loadDeps()
   const restore = await configure(deps.db, true)
