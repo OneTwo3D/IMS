@@ -76,3 +76,21 @@ test('email-outbox: parked, conflicted and unresolved-after-send rows are failur
     assert.equal(cronOutcome('email-outbox', { ...base, [key]: 1 } as never), 'failed', key)
   }
 })
+
+test('outboundHeld is subtracted only from the counter it is part of', () => {
+  const base = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0, createClaimParked: 0, ambiguousCreateRequeued: 0 }
+  assert.equal(cronOutcome('wms-order-push', { ...base, failed: 1, outboundHeld: 1 }), 'held')
+  assert.equal(cronOutcome('wms-order-push', { ...base, failed: 1, deadLettered: 1, outboundHeld: 1 }), 'failed')
+  assert.equal(cronOutcome('wms-order-push', { ...base, deadLettered: 1, outboundHeld: 1 }), 'failed')
+  assert.equal(cronOutcome('email-outbox', { processed: 1, sent: 0, failed: 1, parked: 1, conflicted: 0, conflictedWithoutSend: 0, unresolvedAfterSend: 0, outboundHeld: 1 } as never), 'failed')
+  // the status-enum sweeps pair it with `errors`
+  assert.equal(cronOutcome('mintsoft-dispatch-sync', { jobId: 'j', status: 'PARTIAL', totalChecked: 1, dispatched: 0, pending: 0, errors: 1, outboundHeld: 1 }), 'held')
+  assert.equal(cronOutcome('accounting-sync', { processed: 2, succeeded: 0, failed: 1, skipped: 0, outboundHeld: 1, unmatched: { failed: 1 } } as never), 'failed')
+})
+
+test('accounting-daily-batch: lock contention is skipped by design, a real batch error is a failure', () => {
+  const base = { groupA1: 0, groupA2: 0, groupB: 0, batchLimit: 50, hasMore: { A1: false, A2: false, B: false }, errors: [] as string[] }
+  assert.equal(cronOutcome('accounting-daily-batch', { ...base, skipped: true, reason: 'already-running' } as never), 'skipped')
+  assert.equal(cronOutcome('accounting-daily-batch', { ...base, errors: ['Journal rejected'] } as never), 'failed')
+  assert.equal(cronOutcome('accounting-daily-batch', base as never), 'ok')
+})

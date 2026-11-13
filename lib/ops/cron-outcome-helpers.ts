@@ -33,9 +33,9 @@ export function enumStatus(result: unknown): CronOutcomeClass | null {
   return errors > 0 && errors <= num(result.outboundHeld) ? 'held' : 'failed'
 }
 
-/** Counts of failures: `failed` or `errors` as numbers, minus the held ones, in the record and every record nested in it. */
-export function counts(result: unknown, keys: readonly string[]): CronOutcomeClass {
-  if (Array.isArray(result)) return worstOutcome('ok', ...result.map((entry) => counts(entry, keys)))
+/** Counts of failures: `failed`, `errors` or others as numbers, with the held ones subtracted from `heldCounter` only, in the record and every record nested in it. */
+export function counts(result: unknown, keys: readonly string[], heldCounter = 'failed'): CronOutcomeClass {
+  if (Array.isArray(result)) return worstOutcome('ok', ...result.map((entry) => counts(entry, keys, heldCounter)))
   if (!isRec(result) || result.skipped === true) return 'ok'
   const held = num(result.outboundHeld)
   const classes: CronOutcomeClass[] = ['ok']
@@ -43,10 +43,12 @@ export function counts(result: unknown, keys: readonly string[]): CronOutcomeCla
     // A list of error texts next to the count is the better evidence (held-aware): structural() reads it.
     if (Array.isArray(result[key])) continue
     const count = num(result[key])
-    if (count > 0) classes.push(count <= held ? 'held' : 'failed')
+    // `outboundHeld` is part of ONE counter (named by heldCounter) and is subtracted from that counter only: any other counter above
+    // zero (a dead-lettered push, say) is a genuine failure whatever was held.
+    if (count > 0) classes.push(key === heldCounter && count <= held ? 'held' : 'failed')
   }
   for (const value of Object.values(result)) {
-    if (isRec(value) || Array.isArray(value)) classes.push(counts(value, keys))
+    if (isRec(value) || Array.isArray(value)) classes.push(counts(value, keys, heldCounter))
   }
   return worstOutcome(...classes)
 }
@@ -81,6 +83,6 @@ export function from(result: unknown, ...parts: Array<CronOutcomeClass | null>):
 export function enumResult(result: unknown, keys: readonly string[]): CronOutcomeClass {
   const status = enumStatus(result)
   if (status === 'skipped') return 'skipped'
-  return from(result, status, counts(result, keys), structural(result))
+  return from(result, status, counts(result, keys, 'errors'), structural(result))
 }
 
