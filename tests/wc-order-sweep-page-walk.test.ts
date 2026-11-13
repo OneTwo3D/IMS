@@ -49,14 +49,21 @@ async function upsert({ where, create, update }: {
   return { key: where.key, value: settings.get(where.key) ?? '' }
 }
 
+const sweepDb: Record<string, unknown> = {}
 mock.module('@/lib/db', {
   namedExports: {
-    db: {
-      setting: { findUnique: async ({ where }: { where: { key: string } }) => settingRow(where.key), upsert },
+    db: Object.assign(sweepDb, {
+      setting: {
+        findUnique: async ({ where }: { where: { key: string } }) => settingRow(where.key),
+        findMany: async ({ where }: { where: { key: { in: string[] } } }) => where.key.in.map((key) => settingRow(key)).filter(Boolean),
+        deleteMany: async ({ where }: { where: { key: string } }) => { settings.delete(where.key); return { count: 1 } },
+        upsert,
+      },
       salesOrder: { findFirst: async () => ({ id: 'so-1' }) },
-      // The cursor and its status fingerprint are written together, as an array of upserts.
-      $transaction: async (ops: Array<Promise<unknown>>) => await Promise.all(ops),
-    },
+      $queryRaw: async () => [],
+      // The cursor, its status fingerprint and the outage bookkeeping are written together, in one interactive transaction.
+      $transaction: async (run: (tx: unknown) => Promise<unknown>) => await run(sweepDb),
+    }),
   },
 })
 

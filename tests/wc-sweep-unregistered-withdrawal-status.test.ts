@@ -20,6 +20,9 @@ const state = {
   /** What the registered-status read answers: a slug list, or 'error'. */
   registered: ['pending', 'processing', 'on-hold', 'completed', 'cancelled', 'refunded', 'failed'] as string[] | 'error' | 'empty',
   totalsCalls: 0,
+  /** When set, the next /orders fetch waits for this promise (lets a second run commit in between). */
+  pauseOrders: null as Promise<void> | null,
+  ordersReached: null as (() => void) | null,
 }
 
 mock.module('@/lib/activity-log', {
@@ -44,6 +47,12 @@ mock.module('@/lib/connectors/woocommerce/api', {
         return { data: state.registered.map((slug) => ({ slug, name: slug, total: 1 })), totalPages: 1, totalItems: 0 }
       }
       if (path === '/orders') {
+        if (state.pauseOrders) {
+          const gate = state.pauseOrders
+          state.pauseOrders = null
+          state.ordersReached?.()
+          await gate
+        }
         state.modifiedAfter.push(params.modified_after)
         state.statusParams.push(params.status)
       }
@@ -58,14 +67,17 @@ mock.module('@/lib/connectors/woocommerce/api', {
   },
 })
 
+const sweepDb: Record<string, unknown> = {}
 mock.module('@/lib/db', {
   namedExports: {
-    db: {
+    db: Object.assign(sweepDb, {
       setting: {
         findUnique: async ({ where }: { where: { key: string } }) => {
           const value = state.settings.get(where.key)
           return value === undefined ? null : { key: where.key, value }
         },
+        findMany: async ({ where }: { where: { key: { in: string[] } } }) =>
+          where.key.in.flatMap((key) => (state.settings.has(key) ? [{ key, value: state.settings.get(key)! }] : [])),
         upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => {
           state.upserts.push({ key: where.key, value: create.value })
           state.settings.set(where.key, create.value)
@@ -77,9 +89,10 @@ mock.module('@/lib/db', {
         },
       },
       salesOrder: { findFirst: async () => ({ id: 'so-any' }) },
-      // The sweep writes the cursor and its fingerprint as ONE fact; the double runs the batch.
-      $transaction: async (operations: Array<Promise<unknown>>) => Promise.all(operations),
-    },
+      $queryRaw: async () => [],
+      // The sweep writes the cursor and its fingerprint as ONE fact, in one interactive transaction.
+      $transaction: async (run: (tx: unknown) => Promise<unknown>) => run(sweepDb),
+    }),
   },
 })
 
@@ -267,6 +280,42 @@ test('a stale admission refusal does not widen a withdrawal-only re-registration
   await sweep()
 
   assert.deepEqual(state.modifiedAfter, [CURSOR_AT], 'only the withdrawal marker applies; the refusal watermark is for selection widenings')
+})
+
+test('overlapping sweeps: a slow run that read the full fingerprint writes nothing after a narrowed run committed', async () => {
+  const FULL = JSON.stringify(['pending-wdraw', 'processing', 'withdrawn'])
+  await reset({ [CURSOR_STATUSES_KEY]: FULL })
+  state.registered = WITH_PLUGIN
+
+  // Run A (plugin active) reads its state, then stalls in its first fetch.
+  let release!: () => void
+  state.pauseOrders = new Promise<void>((resolve) => { release = resolve })
+  const reached = new Promise<void>((resolve) => { state.ordersReached = resolve })
+  const runA = sweep()
+  await reached
+
+  // Run B (plugin inactive) runs to completion meanwhile and commits the narrowed fingerprint and the marker.
+  state.registered = NO_PLUGIN
+  await sweep()
+  const narrowed = JSON.stringify(['processing'])
+  assert.equal(state.settings.get(CURSOR_STATUSES_KEY), narrowed)
+  const marker = state.settings.get(DROPPED_KEY)
+  assert.equal(marker, CURSOR_AT)
+  const afterB = new Map(state.settings)
+
+  // Run A now finishes and tries to commit.
+  state.activity = []
+  release()
+  await runA
+
+  assert.deepEqual([...state.settings.entries()], [...afterB.entries()], 'the superseded run wrote nothing at all')
+  assert.ok(state.activity.some((entry) => entry.action === 'wc_order_sync_superseded'))
+
+  // Re-registration still rewinds to the marker.
+  state.registered = WITH_PLUGIN
+  state.modifiedAfter = []
+  await sweep()
+  assert.deepEqual(state.modifiedAfter, [CURSOR_AT])
 })
 
 test('reconcileWcPullStatusesWithRegistered: null registered list changes nothing', async () => {

@@ -4725,50 +4725,83 @@ export async function syncNewWcOrders(
   if (result.errors.length === 0) {
     const now = new Date().toISOString()
     const fingerprint = JSON.stringify([...statuses].sort())
-    const cursorWrites: Prisma.PrismaPromise<unknown>[] = [
-      db.setting.upsert({
+    // THE COMMIT IS CONDITIONAL ON THE STATE THIS RUN STARTED FROM. Two sweeps can overlap on one
+    // cursor (a manual reconcile and the scheduled one). A slow run that read the full fingerprint
+    // and then commits AFTER a narrowed run would restore the full fingerprint while the outage
+    // marker the narrowed run wrote stays: the plugin coming back would then look like no widening
+    // and nothing would rewind. So the commit takes a transaction-scoped advisory lock on this
+    // cursor, re-reads the fingerprint, the outage marker and the clean-sweep position, and writes
+    // NOTHING unless all three are what this run read at its start. A superseded run costs one
+    // re-fetch next time; it never writes a stale fact.
+    //
+    // The CURSOR VALUE is deliberately not compared: order and refund webhooks advance it
+    // (advanceWcOrderSyncCursor) on their own, and comparing it would make nearly every sweep look
+    // superseded. It does not need to be: every sweep that moves the cursor also moves the clean-sweep
+    // position in the same transaction, so a concurrent sweep is always caught by that one. The
+    // fingerprint and the marker are never excluded.
+    const committed = await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${cursorKey}))`
+      const current = await tx.setting.findMany({ where: { key: { in: [cursorStatusesKey, droppedSinceKey, cleanAtKey] } } })
+      const valueOf = (key: string): string | null => current.find((row) => row.key === key)?.value ?? null
+      if (
+        valueOf(cursorStatusesKey) !== (cursorStatusesSetting?.value ?? null)
+        || valueOf(droppedSinceKey) !== (droppedSinceSetting?.value ?? null)
+        || valueOf(cleanAtKey) !== (cleanAtSetting?.value ?? null)
+      ) return false
+      await tx.setting.upsert({
         where: { key: cursorKey },
         create: { key: cursorKey, value: now },
         update: { value: now },
-      }),
+      })
       // Written WITH the cursor, in one transaction: a cursor and the selection it was earned
       // under are one fact, and a cursor advanced without its fingerprint would make the next
       // widening undetectable.
-      db.setting.upsert({
+      await tx.setting.upsert({
         where: { key: cursorStatusesKey },
         create: { key: cursorStatusesKey, value: fingerprint },
         update: { value: fingerprint },
-      }),
+      })
       // Outage bookkeeping, in the same transaction for the same reason. While a withdrawal status is
       // dropped the position is held; once a run asks for it again the widening above has been served
       // and the marker is cleared. A run that never had one writes nothing.
-      db.setting.upsert({
+      await tx.setting.upsert({
         where: { key: cleanAtKey },
         create: { key: cleanAtKey, value: now },
         update: { value: now },
-      }),
-      ...(droppedSinceToStore !== null
-        ? [db.setting.upsert({
-            where: { key: droppedSinceKey },
-            create: { key: droppedSinceKey, value: droppedSinceToStore },
-            update: { value: droppedSinceToStore },
-          })]
-        : droppedSinceSetting
-          ? [db.setting.deleteMany({ where: { key: droppedSinceKey } })]
-          : []),
+      })
+      if (droppedSinceToStore !== null) {
+        await tx.setting.upsert({
+          where: { key: droppedSinceKey },
+          create: { key: droppedSinceKey, value: droppedSinceToStore },
+          update: { value: droppedSinceToStore },
+        })
+      } else if (droppedSinceSetting) {
+        await tx.setting.deleteMany({ where: { key: droppedSinceKey } })
+      }
       // The sweep's LAST-SUCCESS stamp (read-sync liveness), in the SAME transaction as the cursor: it
       // exists only because this branch is reached - the walk ended on an empty page with no error -
       // so a sweep that failed, or ran out of ceiling, or fetched nothing because of an error, can
       // never advance it. It is separate from the cursor on purpose: an admitted webhook delivery
       // also advances `last_wc_order_sync_at` (advanceWcOrderSyncCursor), so the cursor cannot say
       // whether the SWEEP is alive. A clean sweep that found no new orders reaches here and counts.
-      db.setting.upsert({
+      await tx.setting.upsert({
         where: { key: WC_ORDER_SWEEP_LAST_SUCCESS_SETTING },
         create: { key: WC_ORDER_SWEEP_LAST_SUCCESS_SETTING, value: now },
         update: { value: now },
-      }),
-    ]
-    await db.$transaction(cursorWrites)
+      })
+      return true
+    })
+    if (!committed) {
+      await logActivity({
+        entityType: 'SYNC',
+        action: 'wc_order_sync_superseded',
+        tag: 'sync',
+        level: 'INFO',
+        description: `The ${mode} sweep finished, but another sweep of the same orders committed first, so this run left the sweep position unchanged. The next run re-reads from the true position.`,
+        metadata: { mode, cursorKey },
+        resolveUser: false,
+      }).catch(() => undefined)
+    }
   }
 
   if (result.synced > 0) {
