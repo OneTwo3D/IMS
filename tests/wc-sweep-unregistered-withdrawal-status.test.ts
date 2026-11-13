@@ -85,6 +85,8 @@ mock.module('@/lib/db', {
 
 const CURSOR_KEY = 'last_wc_order_sync_at'
 const CURSOR_STATUSES_KEY = 'last_wc_order_sync_at_statuses'
+const CLEAN_AT_KEY = 'last_wc_order_sync_at_sweep_clean_at'
+const REFUSED_SINCE_KEY = 'wc_order_admission_refused_since'
 const DROPPED_KEY = 'last_wc_order_sync_at_withdrawal_dropped_since'
 const CURSOR_AT = '2026-08-10T00:00:00.000Z'
 const WARN = 'wc_order_sync_withdrawal_status_unregistered'
@@ -231,6 +233,40 @@ test('re-registering the plugin is a WIDENING: the sweep re-reads from the start
   state.modifiedAfter = []
   await sweep()
   assert.notEqual(state.modifiedAfter[0], CURSOR_AT, 'and the next run is incremental again')
+})
+
+test('a webhook advancing the cursor after a missed withdrawal does not move the rewind floor', async () => {
+  // The last CLEAN sweep (plugin active) ran at 08-10. A withdrawal happened at 08-15 but its
+  // webhook was missed; an unrelated order webhook then advanced the shared cursor to 08-20, all
+  // before the first dropped-status sweep.
+  const LAST_CLEAN = '2026-08-10T00:00:00.000Z'
+  await reset({
+    [CLEAN_AT_KEY]: LAST_CLEAN,
+    [CURSOR_KEY]: '2026-08-20T00:00:00.000Z',
+    [CURSOR_STATUSES_KEY]: JSON.stringify(['pending-wdraw', 'processing', 'withdrawn']),
+  })
+
+  await sweep()
+  assert.equal(state.settings.get(DROPPED_KEY), LAST_CLEAN, 'the floor is the last clean sweep, not the webhook-advanced cursor')
+
+  state.modifiedAfter = []
+  state.registered = WITH_PLUGIN
+  await sweep()
+
+  assert.deepEqual(state.modifiedAfter, [LAST_CLEAN], 'the withdrawal order modified at 08-15 is inside the re-fetch window')
+})
+
+test('a stale admission refusal does not widen a withdrawal-only re-registration', async () => {
+  const STALE_REFUSAL = '2026-01-01T00:00:00.000Z'
+  await reset({ [REFUSED_SINCE_KEY]: STALE_REFUSAL })
+  await sweep()
+  assert.equal(state.settings.get(DROPPED_KEY), CURSOR_AT)
+
+  state.modifiedAfter = []
+  state.registered = WITH_PLUGIN
+  await sweep()
+
+  assert.deepEqual(state.modifiedAfter, [CURSOR_AT], 'only the withdrawal marker applies; the refusal watermark is for selection widenings')
 })
 
 test('reconcileWcPullStatusesWithRegistered: null registered list changes nothing', async () => {
