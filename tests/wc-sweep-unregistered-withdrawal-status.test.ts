@@ -23,6 +23,12 @@ const state = {
   /** When set, the next /orders fetch waits for this promise (lets a second run commit in between). */
   pauseOrders: null as Promise<void> | null,
   ordersReached: null as (() => void) | null,
+  /** Orders the store holds in a withdrawal status (returned only to a status-scoped read with no modified_after). */
+  withdrawalOrders: [] as Array<Record<string, unknown>>,
+  /** Error answered to the next status-scoped recovery read. */
+  recoveryError: null as string | null,
+  /** Ids of every order the sweep passed through the import path. */
+  imported: [] as string[],
 }
 
 mock.module('@/lib/activity-log', {
@@ -60,6 +66,15 @@ mock.module('@/lib/connectors/woocommerce/api', {
         if (Array.isArray(registeredAtCall) && params.status.split(',').some((slug) => !registeredAtCall.includes(slug))) {
           return { data: null, totalPages: 0, totalItems: 0, error: 'WC API error: 400 rest_invalid_param' }
         }
+        const isRecoveryRead = params.modified_after === undefined && params.status.split(',').every((slug) => slug === 'pending-wdraw' || slug === 'withdrawn')
+        if (isRecoveryRead) {
+          if (state.recoveryError) {
+            const error = state.recoveryError
+            state.recoveryError = null
+            return { data: null, totalPages: 0, totalItems: 0, error }
+          }
+          return { data: params.page === '1' ? state.withdrawalOrders : [], totalPages: 1, totalItems: 0 }
+        }
       }
       return { data: [], totalPages: 1, totalItems: 0 }
     },
@@ -69,6 +84,16 @@ mock.module('@/lib/connectors/woocommerce/api', {
     MAX_WC_PAGE_WALK_PAGES: 1000,
     describeUnendedWcPageWalk: (collection: string, pagesRead: number) =>
       `The WooCommerce ${collection} walk did not reach an empty page within ${pagesRead} page(s).`,
+  },
+})
+
+mock.module('@/lib/connectors/woocommerce/sync/withdrawal', {
+  namedExports: {
+    getWithdrawalStatuses: async () => ({ submitted: 'pending-wdraw', approved: 'withdrawn' }),
+    importWcOrderGuarded: async (order: { id: number }) => {
+      state.imported.push(String(order.id))
+      return { outcome: 'skipped-withdrawal' }
+    },
   },
 })
 
@@ -103,11 +128,9 @@ mock.module('@/lib/db', {
 
 const CURSOR_KEY = 'last_wc_order_sync_at'
 const CURSOR_STATUSES_KEY = 'last_wc_order_sync_at_statuses'
-const CLEAN_AT_KEY = 'last_wc_order_sync_at_sweep_clean_at'
 const REFUSED_SINCE_KEY = 'wc_order_admission_refused_since'
-const DROPPED_KEY = 'last_wc_order_sync_at_withdrawal_dropped_since'
+const DROPPED_KEY = 'last_wc_order_sync_at_withdrawal_dropped'
 const CURSOR_AT = '2026-08-10T00:00:00.000Z'
-const STAMP_KEY = 'wc_order_sweep_last_success_at'
 const WARN = 'wc_order_sync_withdrawal_status_unregistered'
 
 const NO_PLUGIN = ['pending', 'processing', 'on-hold', 'completed', 'cancelled', 'refunded', 'failed']
@@ -118,7 +141,6 @@ async function reset(overrides: Record<string, string> = {}) {
     ['wc_initial_import_completed', 'true'],
     ['wc_sync_order_statuses', JSON.stringify(['processing'])],
     [CURSOR_KEY, CURSOR_AT],
-    [STAMP_KEY, CURSOR_AT],
     ...Object.entries(overrides),
   ])
   state.upserts = []
@@ -127,6 +149,9 @@ async function reset(overrides: Record<string, string> = {}) {
   state.activity = []
   state.registered = NO_PLUGIN
   state.totalsCalls = 0
+  state.withdrawalOrders = []
+  state.recoveryError = null
+  state.imported = []
   const { resetWcWithdrawalUnregisteredWarnings } = await import('@/lib/connectors/woocommerce/sync/order-import')
   resetWcWithdrawalUnregisteredWarnings()
 }
@@ -217,76 +242,134 @@ test('a store with the plugin registered is swept with the withdrawal statuses, 
   assert.equal(state.activity.some((entry) => entry.action === WARN), false)
 })
 
-test('the fingerprint is the RESOLVED list and does not churn while the plugin stays off', async () => {
+const WDRAW_ORDER = { id: 7, number: '7', status: 'withdrawn', date_modified: '2026-08-15T00:00:00' }
+const isRecoveryRead = (index: number) => state.statusParams[index] === 'pending-wdraw,withdrawn' && state.modifiedAfter[index] === undefined
+
+test('a drop records only that it happened, and the fingerprint does not churn while the plugin stays off', async () => {
   await reset({ [CURSOR_STATUSES_KEY]: JSON.stringify(['processing', 'pending-wdraw', 'withdrawn']) })
 
   await sweep()
   const first = state.settings.get(CURSOR_STATUSES_KEY)
   assert.equal(first, JSON.stringify(['processing']), 'withdrawal statuses were not asked for, so not recorded')
-  assert.equal(state.settings.get(DROPPED_KEY), CURSOR_AT, 'the position the outage started from is kept')
+  assert.ok(state.settings.has(DROPPED_KEY), 'the marker records that a withdrawal status was dropped')
+  const marker = state.settings.get(DROPPED_KEY)
 
   await sweep()
 
   assert.equal(state.settings.get(CURSOR_STATUSES_KEY), first)
-  assert.equal(state.modifiedAfter.length, 2)
+  assert.equal(state.settings.get(DROPPED_KEY), marker, 'the marker keeps its first value')
   assert.equal(state.activity.some((entry) => entry.action === 'wc_order_sync_cursor_rewound'), false, 'narrowing and steady state never rewind')
-  assert.equal(state.settings.get(DROPPED_KEY), CURSOR_AT, 'the marker keeps its earliest value')
 })
 
-test('re-registering the plugin is a WIDENING: the sweep re-reads from the start of the outage', async () => {
+test('re-registering the plugin runs a one-off status-scoped read with no date bound, then clears the marker', async () => {
   await reset()
   await sweep()
-  assert.equal(state.settings.get(DROPPED_KEY), CURSOR_AT)
-  // Time passes: the cursor moves on during the outage.
-  state.settings.set(CURSOR_KEY, '2026-08-20T00:00:00.000Z')
+  assert.ok(state.settings.has(DROPPED_KEY))
+  state.statusParams = []
   state.modifiedAfter = []
-  state.activity = []
+  state.registered = WITH_PLUGIN
+  state.withdrawalOrders = [WDRAW_ORDER]
+
+  const result = await sweep()
+
+  assert.deepEqual(result.errors, [])
+  assert.ok(isRecoveryRead(0), 'the recovery read comes first: only the withdrawal statuses, no modified_after')
+  assert.deepEqual(state.imported, ['7'], 'its orders go through the normal import path')
+  assert.equal(state.statusParams.at(-1), 'processing,pending-wdraw,withdrawn', 'then the ordinary sweep')
+  assert.notEqual(state.modifiedAfter.at(-1), undefined, 'which keeps its cursor')
+  assert.equal(state.settings.has(DROPPED_KEY), false, 'cleared after the read ended cleanly')
+
+  state.statusParams = []
+  await sweep()
+  assert.equal(state.statusParams.length, 1, 'and the next run is an ordinary sweep')
+})
+
+test('a withdrawal that happened before the first dropped sweep, with no cursor at all, is fetched after re-registration', async () => {
+  await reset()
+  state.settings.delete(CURSOR_KEY)
+  await sweep()
+  assert.ok(state.settings.has(DROPPED_KEY))
+  state.statusParams = []
+  state.modifiedAfter = []
+  state.registered = WITH_PLUGIN
+  state.withdrawalOrders = [WDRAW_ORDER]
+
+  await sweep()
+
+  assert.ok(isRecoveryRead(0))
+  assert.deepEqual(state.imported, ['7'])
+})
+
+test('a missed withdrawal webhook followed by an unrelated webhook advancing the cursor is still fetched', async () => {
+  // The cursor was moved to 08-20 by an unrelated webhook after a withdrawal at 08-15 whose webhook was missed.
+  await reset({ [CURSOR_KEY]: '2026-08-20T00:00:00.000Z', [CURSOR_STATUSES_KEY]: JSON.stringify(['pending-wdraw', 'processing', 'withdrawn']) })
+  await sweep()
+  state.statusParams = []
+  state.modifiedAfter = []
+  state.registered = WITH_PLUGIN
+  state.withdrawalOrders = [WDRAW_ORDER]
+
+  await sweep()
+
+  assert.ok(isRecoveryRead(0), 'no position is consulted, so no cursor movement can hide the order')
+  assert.deepEqual(state.imported, ['7'])
+})
+
+test('a stale admission refusal does not rewind a withdrawal-only re-registration', async () => {
+  await reset({ [REFUSED_SINCE_KEY]: '2026-01-01T00:00:00.000Z' })
+  await sweep()
+  const cursorAfterDrop = state.settings.get(CURSOR_KEY)
+  state.statusParams = []
+  state.modifiedAfter = []
   state.registered = WITH_PLUGIN
 
   await sweep()
 
-  assert.deepEqual(state.modifiedAfter, [CURSOR_AT], 'orders already sitting in a withdrawal status are not skipped')
-  assert.ok(state.activity.some((entry) => entry.action === 'wc_order_sync_cursor_rewound'))
-  assert.deepEqual(JSON.parse(state.settings.get(CURSOR_STATUSES_KEY)!), ['pending-wdraw', 'processing', 'withdrawn'])
-  assert.equal(state.settings.has(DROPPED_KEY), false, 'the marker is cleared once the widening has been served')
-
-  state.modifiedAfter = []
-  await sweep()
-  assert.notEqual(state.modifiedAfter[0], CURSOR_AT, 'and the next run is incremental again')
+  assert.equal(state.modifiedAfter.at(-1), cursorAfterDrop, 'the ordinary sweep keeps its cursor')
+  assert.equal(state.activity.some((entry) => entry.action === 'wc_order_sync_cursor_rewound'), false)
 })
 
-test('a webhook advancing the cursor after a missed withdrawal does not move the rewind floor', async () => {
-  // The last CLEAN sweep (plugin active) ran at 08-10. A withdrawal happened at 08-15 but its
-  // webhook was missed; an unrelated order webhook then advanced the shared cursor to 08-20, all
-  // before the first dropped-status sweep.
-  const LAST_CLEAN = '2026-08-10T00:00:00.000Z'
+test('a selection widening still rewinds to the refusal watermark', async () => {
   await reset({
-    [CLEAN_AT_KEY]: LAST_CLEAN,
-    [CURSOR_KEY]: '2026-08-20T00:00:00.000Z',
-    [CURSOR_STATUSES_KEY]: JSON.stringify(['pending-wdraw', 'processing', 'withdrawn']),
+    wc_sync_order_statuses: JSON.stringify(['processing', 'pending']),
+    [CURSOR_STATUSES_KEY]: JSON.stringify(['processing']),
+    [REFUSED_SINCE_KEY]: '2026-08-01T00:00:00.000Z',
   })
-
-  await sweep()
-  assert.equal(state.settings.get(DROPPED_KEY), LAST_CLEAN, 'the floor is the last clean sweep, not the webhook-advanced cursor')
-
-  state.modifiedAfter = []
   state.registered = WITH_PLUGIN
+
   await sweep()
 
-  assert.deepEqual(state.modifiedAfter, [LAST_CLEAN], 'the withdrawal order modified at 08-15 is inside the re-fetch window')
+  assert.deepEqual(state.modifiedAfter, ['2026-08-01T00:00:00.000Z'])
 })
 
-test('a stale admission refusal does not widen a withdrawal-only re-registration', async () => {
-  const STALE_REFUSAL = '2026-01-01T00:00:00.000Z'
-  await reset({ [REFUSED_SINCE_KEY]: STALE_REFUSAL })
+test('a recovery read that errors leaves the marker set, holds the run, and retries next run', async () => {
+  await reset()
   await sweep()
-  assert.equal(state.settings.get(DROPPED_KEY), CURSOR_AT)
-
-  state.modifiedAfter = []
+  const marker = state.settings.get(DROPPED_KEY)
+  assert.ok(marker)
   state.registered = WITH_PLUGIN
-  await sweep()
+  state.withdrawalOrders = [WDRAW_ORDER]
+  state.recoveryError = 'WC API error: 500 boom'
+  state.statusParams = []
+  state.modifiedAfter = []
+  const cursorBefore = state.settings.get(CURSOR_KEY)
 
-  assert.deepEqual(state.modifiedAfter, [CURSOR_AT], 'only the withdrawal marker applies; the refusal watermark is for selection widenings')
+  const failed = await sweep()
+
+  assert.equal(failed.errors.length, 1)
+  assert.equal(state.settings.get(DROPPED_KEY), marker, 'marker still set')
+  assert.equal(state.settings.get(CURSOR_KEY), cursorBefore, 'cursor not advanced')
+  assert.equal(state.statusParams.length, 1, 'the ordinary sweep did not run after a failed recovery')
+  assert.ok(isRecoveryRead(0))
+
+  state.statusParams = []
+  state.modifiedAfter = []
+  const retried = await sweep()
+
+  assert.deepEqual(retried.errors, [])
+  assert.ok(isRecoveryRead(0), 'retried')
+  assert.deepEqual(state.imported, ['7'])
+  assert.equal(state.settings.has(DROPPED_KEY), false)
 })
 
 test('overlapping sweeps: a slow run that read the full fingerprint writes nothing after a narrowed run committed', async () => {
@@ -304,10 +387,8 @@ test('overlapping sweeps: a slow run that read the full fingerprint writes nothi
   // Run B (plugin inactive) runs to completion meanwhile and commits the narrowed fingerprint and the marker.
   state.registered = NO_PLUGIN
   await sweep()
-  const narrowed = JSON.stringify(['processing'])
-  assert.equal(state.settings.get(CURSOR_STATUSES_KEY), narrowed)
-  const marker = state.settings.get(DROPPED_KEY)
-  assert.equal(marker, CURSOR_AT)
+  assert.equal(state.settings.get(CURSOR_STATUSES_KEY), JSON.stringify(['processing']))
+  assert.ok(state.settings.has(DROPPED_KEY))
   const afterB = new Map(state.settings)
 
   // Run A now finishes and tries to commit.
@@ -318,46 +399,19 @@ test('overlapping sweeps: a slow run that read the full fingerprint writes nothi
   assert.deepEqual([...state.settings.entries()], [...afterB.entries()], 'the superseded run wrote nothing at all')
   assert.ok(state.activity.some((entry) => entry.action === 'wc_order_sync_superseded'))
 
-  // Re-registration still rewinds to the marker.
+  // Re-registration still recovers.
   state.registered = WITH_PLUGIN
+  state.withdrawalOrders = [WDRAW_ORDER]
+  state.statusParams = []
   state.modifiedAfter = []
+  state.imported = []
   await sweep()
-  assert.deepEqual(state.modifiedAfter, [CURSOR_AT])
+  assert.ok(isRecoveryRead(0))
+  assert.deepEqual(state.imported, ['7'])
 })
 
-test('first deploy: with no clean-sweep position but a success stamp, the marker is the stamp even when a webhook moved the cursor later', async () => {
-  const STAMP = '2026-08-05T00:00:00.000Z'
-  await reset({ [STAMP_KEY]: STAMP, [CURSOR_KEY]: '2026-08-20T00:00:00.000Z' })
-
-  const result = await sweep()
-
-  assert.deepEqual(result.errors, [])
-  assert.equal(state.settings.get(DROPPED_KEY), STAMP)
-})
-
-test('first deploy: with neither a clean-sweep position nor a success stamp, nothing is dropped and the failure is logged once', async () => {
+test('with a cursor in use and no success stamp, a drop is still allowed (no floor is needed)', async () => {
   await reset()
-  state.settings.delete(STAMP_KEY)
-
-  const first = await sweep()
-  const second = await sweep()
-
-  assert.deepEqual(state.statusParams, ['processing,pending-wdraw,withdrawn', 'processing,pending-wdraw,withdrawn'], 'the full list is asked for, as before')
-  assert.equal(first.errors.length, 1, 'WooCommerce refuses it and the run fails, as before')
-  assert.equal(second.errors.length, 1)
-  const logged = state.activity.filter((entry) => entry.action === 'wc_order_sync_withdrawal_status_unregistered_no_floor')
-  assert.equal(logged.length, 1, 'once, not on every run')
-  assert.equal(logged[0].level, 'ERROR')
-  assert.match(String(logged[0].description), /plugin/)
-  assert.match(String(logged[0].description), /first clean order sweep has not happened yet/)
-  assert.equal(state.settings.has(DROPPED_KEY), false)
-  assert.equal(state.settings.get(CURSOR_KEY), CURSOR_AT, 'the cursor is not advanced')
-})
-
-test('with no cursor at all (a full read every time) a drop is safe with no recorded position', async () => {
-  await reset()
-  state.settings.delete(STAMP_KEY)
-  state.settings.delete(CURSOR_KEY)
 
   const result = await sweep()
 
