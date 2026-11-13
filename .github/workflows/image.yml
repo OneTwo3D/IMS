@@ -23,7 +23,7 @@ env:
 
 jobs:
   image:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # `next build` is memory-hungry (it OOMs next to other gates), so this is the only job that runs
     # it in this workflow and it gets a whole runner to itself.
     timeout-minutes: 45

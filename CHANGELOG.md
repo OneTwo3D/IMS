@@ -10,6 +10,10 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### CI: pin GitHub runners to Ubuntu 24.04
+
+- **Fixed: CI broke when GitHub moved `ubuntu-latest` to Ubuntu 26.04** (runner image ubuntu-26.04, 2026-11-13). Playwright does not support Chromium there (the e2e job failed to install browsers) and the deploy-script re-fence tests failed. Every workflow job now runs on `ubuntu-24.04`, the image all of CI passed on until then. CI only; no behaviour change.
+
 ### WooCommerce order sweep no longer fails when the withdrawal plugin is not active
 
 - **The order poll and reconciliation now skip an EU withdrawal status the store has not registered, instead of failing the whole run.** WooCommerce refuses any order query naming a status it does not know, so a store without the WebToffee EU Order Withdrawal Button plugin made every sweep fail and import nothing. IMS now reads the store's registered order statuses once per run and drops only the unregistered withdrawal statuses, with a WARNING in the activity log (at most every six hours) naming the plugin and saying withdrawal requests are not seen until it is active. A status you ticked under "Import order statuses" (or `completed` on reconciliation) that is not registered still refuses the run with an error; if the registered statuses cannot be read, nothing is dropped.
