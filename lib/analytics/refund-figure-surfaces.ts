@@ -380,6 +380,13 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'The same Xero can-apply-to flag, copied into the stored tax-rate list. A boolean on a tax-rate definition; no refund moves it.',
   },
   {
+    file: 'lib/domain/accounting/eu-vat-credit-note.ts',
+    figures: ['netAmount'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      '`netAmount` is the net the refused (never posted) EU scheme credit-note row would have carried, written onto that row only so the operator sees what to post by hand on /sync. It is the refund itself, not an analytics figure: no report reads it and no refund moves it.',
+  },
+  {
     file: 'lib/domain/accounting/eu-vat-treatment.ts',
     figures: ['revenue'],
     treatment: 'not-refund-sensitive',
