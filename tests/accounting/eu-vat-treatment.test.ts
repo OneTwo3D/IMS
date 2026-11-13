@@ -280,6 +280,18 @@ test('routeFor: a stamp and the current facts that contradict each other refuse;
   const e = routeFor({ regime: 'IOSS', vatAccount: '821', stampedAt }, scheme, built.input)
   assert.ok(e.ok)
   assert.deepEqual(e.ok && e.route.kind === 'scheme' && [e.route.regime, e.route.vatAccount], ['IOSS', '821'])
+  // the zero-rated type recorded with the stamp is compared trimmed on both sides, and the route keeps the decision's own (trimmed) type
+  assert.equal(scheme.kind === 'SCHEME', true)
+  if (scheme.kind === 'SCHEME') {
+    const padStamp = routeFor({ regime: 'IOSS', vatAccount: '821', stampedAt, schemePostingTaxType: ` ${scheme.schemePostingTaxType} ` }, scheme, built.input)
+    assert.ok(padStamp.ok, 'a padded stamped type is the same type')
+    assert.equal(padStamp.ok && padStamp.route.kind === 'scheme' && padStamp.route.schemePostingTaxType, scheme.schemePostingTaxType)
+    const padDecision = routeFor({ regime: 'IOSS', vatAccount: '821', stampedAt, schemePostingTaxType: scheme.schemePostingTaxType }, { ...scheme, schemePostingTaxType: `${scheme.schemePostingTaxType} ` }, built.input)
+    assert.ok(padDecision.ok, 'a padded decided type is the same type')
+    const other = routeFor({ regime: 'IOSS', vatAccount: '821', stampedAt, schemePostingTaxType: 'OTHER_ZERO' }, scheme, built.input)
+    assert.equal(other.ok, false)
+    assert.match(other.ok ? '' : other.reason, /changed since the order was stamped/)
+  }
   // the stamp is never re-derived: a fresh decision of another regime or another account is NOT posted through the old stamp
   const f = routeFor({ regime: 'DDP', vatAccount: '232', stampedAt }, scheme, built.input)
   assert.equal(f.ok, false)

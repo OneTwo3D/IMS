@@ -484,6 +484,11 @@ test('[eu vat credit note] a WooCommerce refund whose tax is booked on rate 182 
   assert.match(outcome.error ?? '', new RegExp(`WooCommerce refund ${id} was NOT recorded: its VAT \\(19\\) is booked on WooCommerce tax rate 182`))
   const park = await deps.db.shoppingSyncLog.findFirst({ where: { externalId: String(id), entityId: fx.orderId }, select: { status: true } })
   assert.equal(park?.status, 'QUARANTINED')
+  const parkedMessage = await deps.db.shoppingSyncLog.findFirst({ where: { externalId: String(id), entityId: fx.orderId }, select: { errorMessage: true } })
+  assert.match(parkedMessage?.errorMessage ?? '', new RegExp(`WooCommerce refund ${id} was NOT recorded`), 'the parked row carries the operator wording')
+  const activity = await deps.db.activityLog.findFirst({ where: { entityId: fx.orderId, action: 'refund_sync_eas_rate_182_refused' }, select: { level: true, description: true } })
+  assert.equal(activity?.level, 'WARNING')
+  assert.match(activity?.description ?? '', /rate 182/)
   // The same refund on another rate, switch on, scheme order: not refused.
   await syncWcRefund(externalOrderId, refund(wooRefundId(), 244) as never, { createRefund: stub as never })
   assert.equal(called, 1, 'any other rate is recorded as before')
@@ -503,6 +508,7 @@ test('[eu vat credit note] every route to a credit note reaches the one builder,
   assert.match(readFileSync('app/actions/sync-exceptions.ts', 'utf8'), /externalRefundId,\n[^\n]*\n\s+statedGrossForeign: parkedGross\.toNumber\(\),/)
   const processor = readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8')
   assert.match(readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8'), /case 'CREDIT_NOTE': \{\n[^\n]*\n\s+const refusedCreditNoteError = refusedCreditNoteErrorOf\(payload as Record<string, unknown>\)\n\s+if \(refusedCreditNoteError !== null\) return \{ success: false, error: refusedCreditNoteError \}/, 'the refused row is refused before anything else')
+  assert.match(processor, /if \(creditNoteSchemeRefusal\) return \{ success: false, error: creditNoteSchemeRefusal \}/, 'the early refusal is returned')
   assert.match(processor, /const creditNoteSchemeRefusal = await euCreditNoteSchemePostingRefusal\(payload as Record<string, unknown>\)/)
   assert.match(processor, /const creditNoteBeforePostHook = creditNoteBeforePost\(payload as Record<string, unknown>\)\n\s+const fence = await lease\.fenceBeforeRemoteWrite\('credit-note'\)/)
   assert.match(processor, /\.\.\.\(creditNoteBeforePostHook \? \{ beforePost: creditNoteBeforePostHook \} : \{\}\)/)
@@ -512,4 +518,260 @@ test('[eu vat credit note] every route to a credit note reaches the one builder,
   assert.match(credit, /withSalesInvoiceAuthorization\(opts\?\.beforePost, \(\) => xeroPost<XeroCreditNoteResponse>\('CreditNotes', creditNote, opts\)\)/)
   // No default tax type on a sales credit note: a missing one is refused before anything is sent.
   assert.doesNotMatch(credit.slice(credit.indexOf('export async function pushCreditNote'), credit.indexOf('export const XERO_PURCHASE_CREDIT_NOTE_TYPE')), /\|\| ?'NONE'|DEFAULT_TAX_TYPE/)
+})
+
+// ------------------------------------------------------------------------------------------------------------------------------------------
+// MUTATION-DRIVEN CASES: each pins one decision of the treatment, the snapshot or the refund-time freeze that no case above reaches.
+// ------------------------------------------------------------------------------------------------------------------------------------------
+type DirectLine = { orderLineId?: string | null; net: string; qty?: number; rate?: string | null; type?: string | null }
+const ACCOUNTS = { ioss: '821', ddp: '232', fee: '232', rounding: '860' }
+
+/** A refund and its lines written straight to the database (as the snapshot would have left them), and the payload the hand-off would build for it. */
+async function directRefund(deps: Deps, fx: Fixture, opts: { lines: DirectLine[]; stated?: string | null; source?: 'MANUAL_UI' | 'CHARGEBACK_POLLER'; number?: string | null }) {
+  const number = opts.number === undefined ? `CN-D-${randomUUID().slice(0, 6)}` : opts.number
+  const refund = await deps.db.salesOrderRefund.create({
+    data: {
+      orderId: fx.orderId, creditNoteNumber: number, totalForeign: '1', totalBase: '1', totalsBasis: 'NET', source: opts.source ?? 'MANUAL_UI', statedGrossForeign: opts.stated ?? null,
+      lines: { create: opts.lines.map((l) => ({ salesOrderLineId: l.orderLineId === undefined ? fx.goods : l.orderLineId, description: 'Widget', qty: l.qty ?? 1, unitPriceForeign: l.net, unitPriceBase: l.net, totalForeign: l.net, totalBase: l.net, accountingTaxType: fx.rate.accountingTaxType, lineKind: 'sale', postingTaxType: l.type === undefined ? 'TAX131' : l.type, schemeTaxRateValue: l.rate === undefined ? '0.19' : l.rate })) },
+    },
+    select: { id: true, lines: { select: { id: true }, orderBy: { id: 'asc' } } },
+  })
+  const rows = await deps.db.salesOrderRefundLine.findMany({ where: { refundId: refund.id }, select: { id: true }, orderBy: { id: 'asc' } })
+  const payload = (over: Record<string, unknown> = {}) => ({ creditNoteNumber: number ?? 'CN-PAYLOAD', currency: deps.baseCurrency, lines: opts.lines.map((l) => ({ description: 'Widget', quantity: l.qty ?? 1, unitAmount: Number(l.net) / (l.qty ?? 1), accountCode: '200', taxType: fx.rate.accountingTaxType })), lineAmountsIncludeTax: false, ...over })
+  return { refundId: refund.id, lineIds: rows.map((r) => r.id), number, payload }
+}
+async function treat(deps: Deps, fx: Fixture, refund: Awaited<ReturnType<typeof directRefund>>, over: { payload?: Record<string, unknown>; lineIds?: readonly string[]; connector?: string | null; refundId?: string } = {}) {
+  const { treatCreditNotePayload } = await import('../../lib/domain/sales/eu-vat-credit-note-treatment.ts')
+  return treatCreditNotePayload({ refundId: over.refundId ?? refund.refundId, orderId: fx.orderId, payload: over.payload ?? refund.payload(), refundLineIds: over.lineIds ?? refund.lineIds, connector: over.connector === undefined ? 'xero' : over.connector, accounts: ACCOUNTS, now: new Date() })
+}
+const refusal = (outcome: Awaited<ReturnType<typeof treat>>) => (outcome.kind === 'refused' ? outcome : null)
+
+async function prepared(t: test.TestContext, opts: { stamp: 'IOSS' | 'none' | null; schemeRate: boolean }) {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true)
+  const fx = await seed(deps, opts)
+  t.after(async () => { await deps.db.setting.deleteMany({ where: { key: { in: ['eu_vat_regime_mode', 'eu_vat_gift_card_flag_cut_in'] } } }); await restore(); await cleanup(deps.db, fx) })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  return { deps, fx }
+}
+
+test('[eu vat credit note] the treatment asks first: only Xero with the Sales Invoices switch on; a refund that does not exist is refused, and the number named is the refund\'s own', { skip }, async (t) => {
+  const { deps, fx } = await prepared(t, { stamp: 'IOSS', schemeRate: true })
+  const refund = await directRefund(deps, fx, { lines: [{ net: '100' }], stated: '119' })
+  for (const connector of ['quickbooks', null]) assert.deepEqual(await treat(deps, fx, refund, { connector }), { kind: 'skipped', why: 'switch_off' })
+  assert.equal((await treat(deps, fx, refund)).kind, 'treated')
+  const missing = refusal(await treat(deps, fx, refund, { refundId: randomUUID() }))
+  assert.match(missing?.reason ?? '', /could not be found/)
+  // A line that is not the refund's is refused, not skipped over.
+  assert.match(refusal(await treat(deps, fx, refund, { lineIds: [randomUUID()] }))?.reason ?? '', /refund line could not be found/)
+  // The number on a refusal is the refund's own, else the payload's.
+  const unfrozen = await directRefund(deps, fx, { lines: [{ net: '100', rate: null }], stated: null, number: `CN-OWN-${randomUUID().slice(0, 4)}` })
+  assert.match(refusal(await treat(deps, fx, unfrozen))?.reason ?? '', new RegExp(`Credit note ${unfrozen.number}`))
+  const unnumbered = await directRefund(deps, fx, { lines: [{ net: '100', rate: null }], stated: null, number: null })
+  assert.match(refusal(await treat(deps, fx, unnumbered, { payload: unnumbered.payload({ creditNoteNumber: 'CN-FROM-PAYLOAD' }) }))?.reason ?? '', /Credit note CN-FROM-PAYLOAD/)
+  // Lines and ids that do not line up are refused.
+  assert.match(refusal(await treat(deps, fx, refund, { lineIds: [refund.lineIds[0]!, refund.lineIds[0]!] }))?.reason ?? '', /do not line up/)
+})
+
+test('[eu vat credit note] an unstamped order: the three classifications (a) IMS-queued treated invoice, (b) a stamp outside the scheme, (c) the rates\' current scheme mapping', { skip }, async (t) => {
+  const { deps, fx } = await prepared(t, { stamp: null, schemeRate: false })
+  const refund = await directRefund(deps, fx, { lines: [{ net: '100' }], stated: '119' })
+  const rateOf = (data: Record<string, unknown>) => deps.db.taxRate.update({ where: { id: fx.rate.id }, data })
+  // (c) no evidence and no scheme mapping: not a scheme order.
+  assert.deepEqual(await treat(deps, fx, refund), { kind: 'skipped', why: 'not_scheme' })
+  // (c) the category alone, or the posting type alone, makes it a scheme order; case and padding do not matter; a blank posting type is nothing.
+  await rateOf({ reportingCategory: 'IOSS' })
+  assert.equal(refusal(await treat(deps, fx, refund))?.code, 'hand_post')
+  await rateOf({ reportingCategory: ' voec ' })
+  assert.equal(refusal(await treat(deps, fx, refund))?.code, 'hand_post')
+  await rateOf({ reportingCategory: null, schemePostingTaxType: 'TAX131' })
+  assert.equal(refusal(await treat(deps, fx, refund))?.code, 'hand_post')
+  await rateOf({ schemePostingTaxType: '  ' })
+  assert.deepEqual(await treat(deps, fx, refund), { kind: 'skipped', why: 'not_scheme' })
+  await rateOf({ schemePostingTaxType: null, reportingCategory: 'STANDARD' })
+  assert.deepEqual(await treat(deps, fx, refund), { kind: 'skipped', why: 'not_scheme' })
+  // (a) an invoice IMS queued with the treatment marker makes it a scheme order, whichever of the two invoice types it was; one without the marker does not.
+  const log = (type: 'SALES_INVOICE' | 'SALES_INVOICE_UPDATE', marker: unknown, referenceId = fx.orderId) => deps.db.accountingSyncLog.create({ data: { connector: 'xero', type, status: 'SYNCED', referenceType: 'SalesOrder', referenceId, payload: { invoiceNumber: 'INV-X', lines: [], _euVatTreatment: marker } as never, attemptRevision: 1 } })
+  await log('SALES_INVOICE', { applied: false })
+  await log('SALES_INVOICE', { applied: true }, randomUUID())
+  assert.deepEqual(await treat(deps, fx, refund), { kind: 'skipped', why: 'not_scheme' })
+  await log('SALES_INVOICE_UPDATE', { applied: true })
+  const viaUpdate = refusal(await treat(deps, fx, refund))
+  assert.equal(viaUpdate?.code, 'hand_post')
+  assert.match(viaUpdate?.reason ?? '', /no recorded VAT regime/)
+  await deps.db.accountingSyncLog.deleteMany({ where: { referenceId: { in: [fx.orderId] } } })
+})
+
+test('[eu vat credit note] (b) a stamp outside the scheme is not a scheme order', { skip }, async (t) => {
+  const { deps, fx } = await prepared(t, { stamp: 'none', schemeRate: false })
+  const r0 = await directRefund(deps, fx, { lines: [{ net: '100' }], stated: '119' })
+  assert.deepEqual(await treat(deps, fx, r0), { kind: 'skipped', why: 'not_scheme' })
+})
+
+test('[eu vat credit note] a stamped order with a blank account is refused; a padded account is trimmed', { skip }, async (t) => {
+  const { deps, fx } = await prepared(t, { stamp: 'IOSS', schemeRate: true })
+  const refund = await directRefund(deps, fx, { lines: [{ net: '100' }], stated: '119' })
+  await deps.db.salesOrder.update({ where: { id: fx.orderId }, data: { euVatLineAccount: '   ' } })
+  assert.match(refusal(await treat(deps, fx, refund))?.reason ?? '', /names no VAT account/)
+  await deps.db.salesOrder.update({ where: { id: fx.orderId }, data: { euVatLineAccount: ' 821 ' } })
+  const ok = await treat(deps, fx, refund)
+  assert.equal(ok.kind, 'treated')
+  if (ok.kind === 'treated') assert.equal((ok.payload.lines as Array<{ noTaxKind?: string; accountCode: string }>).find((l) => l.noTaxKind === 'eu-vat-recovery')?.accountCode, '821')
+})
+
+test('[eu vat credit note] the policy record: an unreadable mode refuses, the cut-in and the accounts and the mode are recorded as read, and the marker carries the figures', { skip }, async (t) => {
+  const { deps, fx } = await prepared(t, { stamp: 'IOSS', schemeRate: true })
+  const refund = await directRefund(deps, fx, { lines: [{ net: '100' }, { net: '20', orderLineId: fx.feeA }], stated: '142.80' })
+  await deps.db.setting.upsert({ where: { key: 'eu_vat_regime_mode' }, create: { key: 'eu_vat_regime_mode', value: 'garbage' }, update: { value: 'garbage' } })
+  assert.match(refusal(await treat(deps, fx, refund))?.reason ?? '', /neither adopt_plugin nor decide/)
+  await deps.db.setting.upsert({ where: { key: 'eu_vat_regime_mode' }, create: { key: 'eu_vat_regime_mode', value: 'decide' }, update: { value: 'decide' } })
+  await deps.db.setting.upsert({ where: { key: 'eu_vat_gift_card_flag_cut_in' }, create: { key: 'eu_vat_gift_card_flag_cut_in', value: '2026-12-01' }, update: { value: '2026-12-01' } })
+  const outcome = await treat(deps, fx, refund)
+  assert.equal(outcome.kind, 'treated')
+  if (outcome.kind !== 'treated') return
+  assert.deepEqual({ ...outcome.regimePolicy, cutIn: outcome.regimePolicy.cutIn!.slice(0, 10) }, { mode: 'decide', cutIn: '2026-12-01', ioss: '821', ddp: '232', fee: '232', rounding: '860', baseCurrency: deps.baseCurrency })
+  const marker = outcome.payload._euVatTreatment as Record<string, unknown>
+  assert.deepEqual({ ...marker, regimePolicy: undefined }, { applied: true, document: 'credit-note', route: 'scheme', regime: 'IOSS', schemePostingTaxType: 'TAX131', vatAccount: '821', vatAmount: '22.8', refundTotal: '142.8', feesRecoded: 1, regimePolicy: undefined })
+  assert.deepEqual(marker.regimePolicy, outcome.regimePolicy)
+  // The fee account comes from the accounts read once by the caller.
+  const fee = (outcome.payload.lines as Array<{ noTaxKind?: string; accountCode: string }>).find((l) => l.noTaxKind === 'fee-no-tax')
+  assert.equal(fee?.accountCode, '232')
+})
+
+test('[eu vat credit note] the frozen basis decides every figure: a missing gross or rate is a hand-post row, each line is priced at its own frozen rate and quantity, and the stated gross is the total', { skip }, async (t) => {
+  const { deps, fx } = await prepared(t, { stamp: 'IOSS', schemeRate: true })
+  const taxOf = (o: Awaited<ReturnType<typeof treat>>) => o.kind === 'treated' ? (o.payload.lines as Array<{ noTaxKind?: string; unitAmount: number }>).find((l) => l.noTaxKind === 'eu-vat-recovery')?.unitAmount : undefined
+  const totalOf = (o: Awaited<ReturnType<typeof treat>>) => o.kind === 'treated' ? (o.payload.lines as Array<{ unitAmount: number; quantity: number }>).reduce((s, l) => s + l.unitAmount * l.quantity, 0).toFixed(2) : undefined
+  // No frozen gross: refused as a hand-post row, with the frozen-basis wording.
+  const noGross = await directRefund(deps, fx, { lines: [{ net: '100' }], stated: null })
+  const r1 = refusal(await treat(deps, fx, noGross))
+  assert.equal(r1?.code, 'hand_post')
+  assert.match(r1?.reason ?? '', /did not record the VAT rate and amount it was priced at/)
+  // Two lines, two frozen rates (19% and 7%): each line is priced at its own.
+  const mixed = await directRefund(deps, fx, { lines: [{ net: '100', rate: '0.19' }, { net: '100', rate: '0.07', orderLineId: fx.feeA }], stated: '226' })
+  const mixedOutcome = await treat(deps, fx, mixed)
+  assert.equal(taxOf(mixedOutcome), 26)
+  assert.equal(totalOf(mixedOutcome), '226.00')
+  // Quantity multiplies: 2 x 50 at 19%.
+  const qty = await directRefund(deps, fx, { lines: [{ net: '100', qty: 2 }], stated: '119' })
+  assert.equal(taxOf(await treat(deps, fx, qty)), 19)
+  // The stated gross is the total, within the tolerance of the lines' own tax (2 minor units for one line); beyond it is refused.
+  const cents = await directRefund(deps, fx, { lines: [{ net: '100' }], stated: '119.02' })
+  const centsOutcome = await treat(deps, fx, cents)
+  assert.equal(taxOf(centsOutcome), 19.02)
+  assert.equal(totalOf(centsOutcome), '119.02')
+  const marker = centsOutcome.kind === 'treated' ? (centsOutcome.payload._euVatTreatment as Record<string, unknown>) : {}
+  assert.equal(marker.vatAmount, '19.02')
+  assert.equal(marker.refundTotal, '119.02')
+  const far = await directRefund(deps, fx, { lines: [{ net: '100' }], stated: '120' })
+  assert.match(refusal(await treat(deps, fx, far))?.reason ?? '', /more than rounding explains/)
+  const negative = await directRefund(deps, fx, { lines: [{ net: '100', rate: '0' }], stated: '99.99' })
+  assert.match(refusal(await treat(deps, fx, negative))?.reason ?? '', /less than the/)
+  // A line amount that cannot be read, and a payload the builder will not treat (tax-inclusive), are refused.
+  assert.match(refusal(await treat(deps, fx, cents, { payload: cents.payload({ lines: [{ description: 'W', quantity: 1, unitAmount: Number.NaN, accountCode: '200', taxType: 'X' }] }) }))?.reason ?? '', /cannot be read/)
+  assert.match(refusal(await treat(deps, fx, cents, { payload: cents.payload({ lineAmountsIncludeTax: true }) }))?.reason ?? '', /tax-inclusive/)
+  // A blank posting type (even only spaces) is the invoiced-type hand-post row.
+  const padded = await directRefund(deps, fx, { lines: [{ net: '100', type: '  ' }], stated: '119' })
+  const r2 = refusal(await treat(deps, fx, padded))
+  assert.equal(r2?.code, 'hand_post')
+  assert.match(r2?.reason ?? '', /did not record which zero-rated/)
+  // The posting type is proved against the stored Xero list: a taxable one refuses; one the list does not hold refuses.
+  await seedXeroList(deps.db, { TAX131: '20.000000' })
+  assert.match(refusal(await treat(deps, fx, cents))?.reason ?? '', /not zero-rated/)
+  await seedXeroList(deps.db, { TAX999: '0.000000' })
+  assert.match(refusal(await treat(deps, fx, cents))?.reason ?? '', /not in the stored Xero tax-rate list/)
+})
+
+test('[eu vat credit note] a whole-order reversal (the chargeback) needs no frozen basis and reverses the order\'s whole VAT', { skip }, async (t) => {
+  const { deps, fx } = await prepared(t, { stamp: 'IOSS', schemeRate: true })
+  const refund = await directRefund(deps, fx, { lines: [{ net: '134', rate: null }], stated: null, source: 'CHARGEBACK_POLLER' })
+  const outcome = await treat(deps, fx, refund)
+  assert.equal(outcome.kind, 'treated')
+  if (outcome.kind !== 'treated') return
+  const lines = outcome.payload.lines as Array<{ noTaxKind?: string; unitAmount: number }>
+  assert.equal(lines.find((l) => l.noTaxKind === 'eu-vat-recovery')?.unitAmount, 25.46)
+  assert.equal((outcome.payload._euVatTreatment as Record<string, unknown>).refundTotal, '159.46')
+})
+
+test('[eu vat credit note] a refused credit note leaves its operator record', { skip }, async (t) => {
+  const { deps, fx } = await prepared(t, { stamp: 'IOSS', schemeRate: true })
+  const { recordCreditNoteTreatmentRefusal } = await import('../../lib/domain/sales/eu-vat-credit-note-treatment.ts')
+  await recordCreditNoteTreatmentRefusal({ orderId: fx.orderId, refundId: 'r-1', reason: 'because' })
+  const row = await deps.db.activityLog.findFirst({ where: { entityId: fx.orderId, action: 'refund_credit_note_eu_vat_refused' }, select: { description: true, level: true } })
+  assert.equal(row?.description, 'because')
+  assert.equal(row?.level, 'WARNING')
+})
+
+test('[eu vat credit note] the posting snapshot: read from the stamp only, trimmed, NULL when none was kept, nothing for an unstamped, unknown or non-scheme order', { skip }, async (t) => {
+  const { deps, fx } = await prepared(t, { stamp: 'IOSS', schemeRate: true })
+  const { resolveSchemePostingSnapshot } = await import('../../lib/domain/sales/refund-scheme-posting.ts')
+  const snap = () => resolveSchemePostingSnapshot(deps.db, fx.orderId)
+  const setBasis = (basis: unknown) => deps.db.salesOrder.update({ where: { id: fx.orderId }, data: { euVatRegimeBasis: basis as never } })
+  assert.deepEqual(await snap(), { scheme: true, regime: 'IOSS', postingTaxType: 'TAX131' })
+  await setBasis({ version: 1, outcome: 'SCHEME', scheme: { schemePostingTaxType: ' TAX131 ' } })
+  assert.deepEqual(await snap(), { scheme: true, regime: 'IOSS', postingTaxType: 'TAX131' })
+  await setBasis({ version: 1, outcome: 'SCHEME', scheme: { schemePostingTaxType: '  ' } })
+  assert.deepEqual(await snap(), { scheme: true, regime: 'IOSS', postingTaxType: null })
+  await setBasis({ version: 1, outcome: 'SCHEME', scheme: { schemePostingTaxType: 5 } })
+  assert.deepEqual(await snap(), { scheme: true, regime: 'IOSS', postingTaxType: null })
+  await setBasis({ version: 1, outcome: 'SCHEME', scheme: {} })
+  assert.deepEqual(await snap(), { scheme: true, regime: 'IOSS', postingTaxType: null })
+  assert.deepEqual(await resolveSchemePostingSnapshot(deps.db, randomUUID()), { scheme: false })
+  // Stamped but outside the scheme (regime null): nothing is snapshotted.
+  await deps.db.salesOrder.update({ where: { id: fx.orderId }, data: { euVatRegime: null, euVatLineAccount: null, euVatRegimeBasis: { version: 1, outcome: 'SKIP', skipReason: 'no_scheme_vat', warnings: [] } } })
+  assert.deepEqual(await snap(), { scheme: false })
+})
+
+test('[eu vat credit note] the refund-time freeze: the source\'s own gross wins over the computed one, the computed one is rounded once, each line keeps its own rate at the quantity and amount refunded, an unpriceable line leaves no gross, a purchase rate is not a price', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true)
+  const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  const reduced = await deps.db.taxRate.create({ data: { name: `DE CN RED ${randomUUID().slice(0, 6)}`, rate: '0.07', usedFor: 'SALES', accountingTaxType: `DE_RED_${randomUUID().slice(0, 8)}`, countryCode: 'DE', taxCategory: 'REDUCED', active: true } })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx); await deps.db.taxRate.deleteMany({ where: { id: reduced.id } }) })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  await deps.db.salesOrderLine.update({ where: { id: fx.feeA }, data: { taxRateId: reduced.id } })
+  const wipeRefunds = async () => {
+    const ids = (await deps.db.salesOrderRefund.findMany({ where: { orderId: fx.orderId }, select: { id: true } })).map((r) => r.id)
+    await deps.db.accountingSyncLog.deleteMany({ where: { referenceId: { in: ids } } })
+    await deps.db.accountingEvent.deleteMany({ where: { sourceEntityId: { in: ids } } }).catch(() => undefined)
+    await deps.db.salesOrderRefundLine.deleteMany({ where: { refundId: { in: ids } } })
+    await deps.db.salesOrderRefund.deleteMany({ where: { id: { in: ids } } })
+  }
+  const frozen = async (lines: RefundLine[], extra: Record<string, unknown> = {}) => {
+    const result = await deps.createRefund(fx.orderId, lines, 'freeze', undefined, { internalBypassToken: deps.bypass, externalRefundId: wooRefundId(), ...extra })
+    assert.equal(result.success, true, result.error)
+    const refund = await deps.db.salesOrderRefund.findFirstOrThrow({ where: { orderId: fx.orderId }, orderBy: { createdAt: 'desc' }, select: { id: true, statedGrossForeign: true, lines: { select: { schemeTaxRateValue: true, salesOrderLineId: true } } } })
+    await wipeRefunds()
+    return { gross: refund.statedGrossForeign?.toString() ?? null, rates: refund.lines.map((l) => [l.salesOrderLineId === fx.goods ? 'goods' : l.salesOrderLineId === fx.feeA ? 'feeA' : 'other', l.schemeTaxRateValue?.toString() ?? null].join(':')).sort() }
+  }
+  // Each line its own rate: 100 at 19% and 20 at 7% (computed gross 119 + 21.4).
+  const mixed = await frozen([itemised(fx.goods, 'Widget', 100, 19), itemised(fx.feeA, 'EU Customs Fee', 20, 1.4)])
+  assert.deepEqual(mixed, { gross: '140.4', rates: ['feeA:0.07', 'goods:0.19'] })
+  // Shipping is frozen at its own identity too (priced as a shipping line, not as a goods line).
+  const shipping = await frozen([{ lineId: null, productId: null, description: 'Shipping', qty: 0, totalBase: 10, lineKind: 'shipping', chargedTaxForeign: 1.9 } as RefundLine])
+  assert.deepEqual(shipping, { gross: '11.9', rates: ['other:0.19'] })
+  // The source's own gross is stored as stated, even when it differs from the computed one.
+  const stated = await frozen([itemised(fx.goods, 'Widget', 100, 19)], { statedGrossForeign: 119.01 })
+  assert.equal(stated.gross, '119.01')
+  // A gross that is not a number is not stored: the computed one is.
+  const nan = await frozen([itemised(fx.goods, 'Widget', 100, 19)], { statedGrossForeign: Number.NaN })
+  assert.equal(nan.gross, '119')
+  // The computed gross is rounded once, to the currency's minor unit: 0.025 net at 19% is 0.02975, stored as 0.03.
+  const tiny = await frozen([itemised(fx.goods, 'Widget', 0.025, 0.005)])
+  assert.equal(tiny.gross, '0.03')
+  // The amount the line is priced on is the foreign total when one is given, else the base total at the order's rate.
+  await deps.db.salesOrder.update({ where: { id: fx.orderId }, data: { fxRateToBase: '0.5' } })
+  const foreign = await frozen([{ ...itemised(fx.goods, 'Widget', 50, 9.5), totalForeign: 50 } as RefundLine])
+  assert.equal(foreign.gross, '59.5', 'the foreign total when one is given')
+  await deps.db.salesOrder.update({ where: { id: fx.orderId }, data: { fxRateToBase: '1' } })
+  // A purchase-only rate sharing the code is not a price and does not make the code ambiguous.
+  const purchase = await deps.db.taxRate.create({ data: { name: `DE CN PUR ${randomUUID().slice(0, 6)}`, rate: '0.05', usedFor: 'PURCHASE', accountingTaxType: fx.rate.accountingTaxType, countryCode: 'DE', taxCategory: 'STANDARD', active: true } }).catch(() => null)
+  const withPurchase = await frozen([itemised(fx.goods, 'Widget', 100, 19)])
+  assert.deepEqual(withPurchase, { gross: '119', rates: ['goods:0.19'] })
+  if (purchase) await deps.db.taxRate.delete({ where: { id: purchase.id } })
+  // An unpriceable line (its code is in no sales rate): no rate on the line and no gross, so the credit note is a hand-post row.
+  await deps.db.taxRate.update({ where: { id: fx.rate.id }, data: { usedFor: 'PURCHASE' } })
+  const refused = await deps.createRefund(fx.orderId, [itemised(fx.goods, 'Widget', 100, 19)], 'unpriced', undefined, { internalBypassToken: deps.bypass, externalRefundId: wooRefundId() })
+  const kept = await deps.db.salesOrderRefund.findFirst({ where: { orderId: fx.orderId }, select: { statedGrossForeign: true, lines: { select: { schemeTaxRateValue: true } } } })
+  assert.ok(kept === null || (kept.statedGrossForeign === null && kept.lines.every((l) => l.schemeTaxRateValue === null)), `unpriced line froze a basis: ${JSON.stringify(kept)} ${String(refused.error)}`)
 })

@@ -4,7 +4,7 @@ import test from 'node:test'
 
 import { roundMoney, toDecimal } from '../../lib/domain/math/decimal'
 import {
-  applyEuVatCreditNoteTreatment, easRefundRefusal, EAS_REFUND_TAX_RATE_ID, noStampRefusal, refundTaxAndTotal, refundTaxOnEasRate,
+  applyEuVatCreditNoteTreatment, easRefundRefusal, refusedCreditNoteError, refusedCreditNotePayload, EAS_REFUND_TAX_RATE_ID, noStampRefusal, refundTaxAndTotal, refundTaxOnEasRate,
   type CreditNoteLineKind, type EuVatCreditNotePlan,
 } from '../../lib/domain/accounting/eu-vat-credit-note'
 import { findSalesDocumentTaxTypeProblems } from '../../lib/domain/accounting/sales-document-tax-types'
@@ -168,4 +168,78 @@ test('[credit note] rounding boundaries (table): the credit note totals the refu
     )
     assert.equal(result.ok, true, JSON.stringify(row))
   }
+})
+
+// MUTATION-DRIVEN CASES: each pins one decision of the builder that no other case reaches.
+test('[credit note] the builder: alignment, blanks, trims and the exact shape of each line it writes', () => {
+  const refused = (pl: TreatablePayload, pn: EuVatCreditNotePlan, pattern: RegExp) => { const r = applyEuVatCreditNoteTreatment(pl, pn); assert.equal(r.ok, false); if (!r.ok) assert.match(r.reason, pattern) }
+  // Each aligned list is checked on its own.
+  refused(payload(), plan({ lineKinds: ['goods', 'goods'] }), /do not line up/)
+  refused(payload(), plan({ linePostingTypes: ['TAX131', 'TAX131'] }), /do not line up/)
+  refused(payload({ lines: [] }), plan({ lineKinds: [], linePostingTypes: [], vatAmount: '0', refundTotal: '0' }), /no lines/)
+  // A blank VAT account is refused, even if only spaces.
+  refused(payload(), plan({ vatAccount: '  ' }), /names no account/)
+  // The posting type is trimmed; a padded and a plain copy are ONE type.
+  const padded = applyEuVatCreditNoteTreatment(payload(), plan({ linePostingTypes: [' TAX131 ', 'TAX131', ' TAX131'] }))
+  assert.equal(padded.ok, true)
+  if (padded.ok) { assert.deepEqual(padded.payload.lines.filter((l) => l.noTaxKind === undefined).map((l) => l.taxType), ['TAX131', 'TAX131']); assert.equal(padded.applied.schemePostingTaxType, 'TAX131'); assert.equal(padded.applied.regime, 'IOSS') }
+  // No fee on the refund: no fee account is needed.
+  const noFee = applyEuVatCreditNoteTreatment(payload({ lines: [payload().lines[0]!, payload().lines[2]!] }), plan({ lineKinds: ['goods', 'goods'], linePostingTypes: ['TAX131', 'TAX131'], feeAccount: null, vatAmount: '22.00', refundTotal: '132.00' }))
+  assert.equal(noFee.ok, true)
+  if (noFee.ok) assert.equal(noFee.applied.feesRecoded, 0)
+  // The fee line: padded account trimmed, marked as a fee, binding dropped; the VAT line account trimmed too; no line keeps a binding.
+  const shaped = applyEuVatCreditNoteTreatment(payload(), plan({ feeAccount: ' 232 ', vatAccount: ' 821 ' }))
+  assert.equal(shaped.ok, true)
+  if (shaped.ok) {
+    const fee = shaped.payload.lines.find((l) => l.noTaxKind === 'fee-no-tax')!
+    assert.equal(fee.accountCode, '232'); assert.equal((fee as { euFeeMarked?: boolean }).euFeeMarked, true)
+    assert.equal(shaped.payload.lines.find((l) => l.noTaxKind === 'eu-vat-recovery')!.accountCode, '821')
+    for (const l of shaped.payload.lines) { assert.equal('taxRateId' in l, false); assert.equal('taxRateBasis' in l, false) }
+  }
+  // Tax: negative refused, unrounded figure rounded onto the line, a padded VAT-account line already present refused.
+  refused(payload(), plan({ vatAmount: '-1' }), /negative/)
+  const rounded = applyEuVatCreditNoteTreatment(payload(), plan({ vatAmount: '24.704' }))
+  assert.equal(rounded.ok, true)
+  if (rounded.ok) assert.equal(rounded.payload.lines.find((l) => l.noTaxKind === 'eu-vat-recovery')!.unitAmount, 24.7)
+  refused(payload({ lines: [{ ...payload().lines[0]!, accountCode: ' 821 ' }, payload().lines[1]!, payload().lines[2]!] }), plan(), /already posted to the VAT account/)
+  // The refund total: unreadable refused (not thrown), a line amount that cannot be read refused (not thrown), the target rounded before comparing.
+  refused(payload(), plan({ refundTotal: 'abc' }), /refund amount cannot be read/)
+  refused(payload({ lines: [{ ...payload().lines[0]!, unitAmount: Number.NaN }, payload().lines[1]!, payload().lines[2]!] }), plan(), /line amount cannot be read/)
+  assert.equal(applyEuVatCreditNoteTreatment(payload(), plan({ refundTotal: '154.704' })).ok, true)
+})
+
+test('[credit note] the refund figures at their boundaries: negative tax, rounding of the stated gross, the tolerance edge, its floor and its sign, and a currency with no minor unit', () => {
+  const f = (over: Partial<Parameters<typeof refundTaxAndTotal>[0]>) => refundTaxAndTotal({ net: D('130'), pricedTax: D('24.70'), rawGross: D('154.70'), statedGross: D('154.70'), currency: 'EUR', toleranceMinorUnits: 4, ...over })
+  // No stated gross: a recorded total below the lines' net refuses.
+  assert.equal(f({ statedGross: null, rawGross: D('100') }).ok, false)
+  // A stated gross is rounded before it is used.
+  assert.deepEqual(f({ statedGross: D('154.704') }), { ok: true, vatAmount: '24.7', refundTotal: '154.7' })
+  // A stated gross below the net refuses, even where the lines' own rate gives no tax (so the tolerance alone would accept it).
+  assert.equal(f({ pricedTax: D('0'), statedGross: D('129.99') }).ok, false)
+  // The tolerance: exactly 4 minor units is accepted, 5 is not; a tolerance of 0 still allows 1; the difference is judged in either direction.
+  assert.equal(f({ statedGross: D('154.74') }).ok, true)
+  assert.equal(f({ statedGross: D('154.75') }).ok, false)
+  assert.equal(f({ statedGross: D('154.71'), toleranceMinorUnits: 0 }).ok, true)
+  assert.equal(f({ statedGross: D('154.72'), toleranceMinorUnits: 0 }).ok, false)
+  assert.equal(f({ statedGross: D('154.20') }).ok, false, 'tax below the lines\' own: refused')
+  // A currency with no minor unit: the tolerance is whole units.
+  assert.equal(f({ currency: 'JPY', net: D('1000'), pricedTax: D('200'), rawGross: D('1200'), statedGross: D('1201'), toleranceMinorUnits: 1 }).ok, true)
+  assert.equal(f({ currency: 'JPY', net: D('1000'), pricedTax: D('200'), rawGross: D('1200'), statedGross: D('1202'), toleranceMinorUnits: 1 }).ok, false)
+})
+
+test('[credit note] the refused-row record carries the credit note\'s identity, and a marker with no usable reason still refuses', () => {
+  const rec = refusedCreditNotePayload({ creditNoteNumber: 'CN-9', currency: 'EUR', reference: 'REF', date: '2026-11-13', refundId: 'r1', orderId: 'o1', lines: [{ quantity: 2, unitAmount: 5 }], reason: 'why' })
+  assert.deepEqual(rec, { creditNoteNumber: 'CN-9', currency: 'EUR', reference: 'REF', date: '2026-11-13', lines: [], _euVatCreditNoteRefused: { reason: 'why', refundId: 'r1', orderId: 'o1', netAmount: '10' } })
+  assert.equal(refusedCreditNoteError(rec), 'why')
+  assert.match(refusedCreditNoteError({ _euVatCreditNoteRefused: { reason: '' } }) ?? '', /refused when it was built and is never sent/)
+  assert.match(refusedCreditNoteError({ _euVatCreditNoteRefused: { reason: 5 } }) ?? '', /refused when it was built and is never sent/)
+  assert.match(refusedCreditNoteError({ _euVatCreditNoteRefused: {} }) ?? '', /never sent/)
+  assert.equal(refusedCreditNoteError({}), null)
+})
+
+test('[credit note] rate 182 figures: an unreadable one counts as 1, a number is read, a padded string is trimmed, an item with no taxes is skipped', () => {
+  assert.equal(refundTaxOnEasRate({ line_items: [{ taxes: [{ id: 182, total: 'abc' }] }] }), '1')
+  assert.equal(refundTaxOnEasRate({ line_items: [{ taxes: [{ id: 182, total: -3.1 }] }] }), '3.1')
+  assert.equal(refundTaxOnEasRate({ line_items: [{ taxes: [{ id: 182, total: ' -3.10 ' }] }] }), '3.1')
+  assert.equal(refundTaxOnEasRate({ line_items: [{ taxes: null }, { }], shipping_lines: [{ taxes: [{ id: 182, total: '-1' }] }] }), '1')
 })
