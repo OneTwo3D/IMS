@@ -1,0 +1,194 @@
+import assert from 'node:assert/strict'
+import path from 'node:path'
+import test from 'node:test'
+
+import ts from 'typescript'
+
+import { cronOutcomes, type CronOutcomeSlug } from '../../lib/ops/cron-outcomes.ts'
+import { cronFailureFields, type CronFieldDeclaration } from '../../lib/ops/cron-outcome-fields.ts'
+
+/**
+ * A NEW FAILURE FIELD IN A PRODUCER FAILS CI UNTIL IT IS MAPPED OR JUSTIFIED.
+ *
+ * The type of every route's result (the parameter of its entry in cronOutcomes) is read with the TypeScript compiler, every property at any depth whose
+ * name looks like a failure is listed, and each must be declared in lib/ops/cron-outcome-fields.ts as consumed (and the test probes that it really is:
+ * the mapping must not answer ok when only that field is set), a breakdown of a parent count (and the test checks it alone does not fail the run), or
+ * ignored with a reason.
+ */
+
+const FAILURE_LIKE = /fail|error|dead|conflict|park|unresolved|reject|quarantin|incomplete|orphan|stuck|blocked|refus/i
+const LEAF = { number: 'number', string: 'string', stringArray: 'string[]', boolean: 'boolean', other: 'other' } as const
+type Leaf = (typeof LEAF)[keyof typeof LEAF]
+
+type Enumerated = Map<string, Leaf>
+
+function buildEnumerator() {
+  const configPath = path.resolve('tsconfig.json')
+  const config = ts.readConfigFile(configPath, ts.sys.readFile)
+  const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, path.dirname(configPath))
+  const file = path.resolve('lib/ops/cron-outcomes.ts')
+  const program = ts.createProgram({ rootNames: [file], options: { ...parsed.options, noEmit: true, incremental: false, skipLibCheck: true } })
+  const checker = program.getTypeChecker()
+  const source = program.getSourceFile(file)
+  assert.ok(source, 'cron-outcomes.ts is in the program')
+  const moduleSymbol = checker.getSymbolAtLocation(source)
+  assert.ok(moduleSymbol)
+  const exported = checker.getExportsOfModule(moduleSymbol).find((entry) => entry.name === 'cronOutcomes')
+  assert.ok(exported, 'cronOutcomes is exported')
+  const registryType = checker.getTypeOfSymbolAtLocation(exported, source)
+  const BUILT_INS = new Set(['Date', 'Map', 'Set', 'Promise', 'Error', 'RegExp', 'Buffer', 'Uint8Array'])
+
+  const leafOf = (type: ts.Type): Leaf => {
+    const parts = type.isUnion() ? type.types.filter((part) => !(part.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined))) : [type]
+    if (parts.some((part) => part.flags & ts.TypeFlags.NumberLike)) return LEAF.number
+    if (parts.some((part) => checker.isArrayType(part))) return LEAF.stringArray
+    if (parts.some((part) => part.flags & ts.TypeFlags.StringLike)) return LEAF.string
+    if (parts.some((part) => part.flags & ts.TypeFlags.BooleanLike)) return LEAF.boolean
+    return LEAF.other
+  }
+
+  function walk(type: ts.Type, prefix: string, out: Enumerated, seen: Set<ts.Type>, depth: number): void {
+    if (depth > 7) return
+    const members = type.isUnion() ? type.types : [type]
+    for (const member of members) {
+      if (member.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined)) continue
+      if (checker.isArrayType(member)) {
+        const element = checker.getTypeArguments(member as ts.TypeReference)[0]
+        if (element) walk(element, `${prefix}[]`, out, seen, depth + 1)
+        continue
+      }
+      if (!(member.flags & ts.TypeFlags.Object) && !member.isIntersection()) continue
+      if (seen.has(member)) continue
+      if (BUILT_INS.has(member.symbol?.name ?? '')) continue
+      if ((member.symbol?.declarations?.[0]?.getSourceFile().fileName ?? '').includes('node_modules')) continue
+      const nextSeen = new Set(seen)
+      nextSeen.add(member)
+      for (const property of member.getProperties()) {
+        const propertyType = checker.getTypeOfSymbolAtLocation(property, source!)
+        const propertyPath = prefix ? `${prefix}.${property.name}` : property.name
+        if (FAILURE_LIKE.test(property.name)) out.set(propertyPath, leafOf(propertyType))
+        walk(propertyType, propertyPath, out, nextSeen, depth + 1)
+      }
+    }
+  }
+
+  const bySlug = new Map<string, { fields: Enumerated; topLevelProperties: number; typeText: string }>()
+  for (const property of registryType.getProperties()) {
+    const mapperType = checker.getTypeOfSymbolAtLocation(property, source)
+    const parameter = mapperType.getCallSignatures()[0]?.getParameters()[0]
+    assert.ok(parameter, `${property.name}: the mapping takes a result`)
+    const parameterType = checker.getTypeOfSymbolAtLocation(parameter, source)
+    const fields: Enumerated = new Map()
+    walk(parameterType, '', fields, new Set(), 0)
+    const members = parameterType.isUnion() ? parameterType.types : [parameterType]
+    bySlug.set(property.name, {
+      fields,
+      topLevelProperties: members.reduce((total, member) => total + member.getProperties().length, 0),
+      typeText: checker.typeToString(parameterType).slice(0, 80),
+    })
+  }
+  return bySlug
+}
+
+/** The comparison itself, on plain data so it can be shown to fail. */
+export function diffFieldDeclaration(enumerated: Enumerated, declaration: CronFieldDeclaration): string[] {
+  const problems: string[] = []
+  const consumed = new Set(declaration.consumed ?? [])
+  const breakdown = new Set(Object.keys(declaration.breakdownOf ?? {}))
+  const ignored = new Set(Object.keys(declaration.ignored ?? {}))
+  const declared = [...consumed, ...breakdown, ...ignored]
+  for (const field of enumerated.keys()) if (!declared.includes(field)) problems.push(`${field}: a failure-like field with no declaration (consume it in the mapping, or list it as breakdownOf/ignored with a reason)`)
+  for (const field of declared) if (!enumerated.has(field)) problems.push(`${field}: declared but not in the result type (stale)`)
+  const seenOnce = new Set<string>()
+  for (const field of declared) { if (seenOnce.has(field)) problems.push(`${field}: declared in more than one category`); seenOnce.add(field) }
+  for (const [field, parent] of Object.entries(declaration.breakdownOf ?? {})) if (!consumed.has(parent)) problems.push(`${field}: breakdownOf '${parent}', which is not a consumed field`)
+  for (const [field, reason] of Object.entries(declaration.ignored ?? {})) if (reason.trim().length < 15) problems.push(`${field}: the ignore reason is too short to be a reason`)
+  return problems
+}
+
+/** A result with only `path` set to a failing value, over any base the declaration gives. */
+function sampleFor(fieldPath: string, leaf: Leaf, base: Record<string, unknown> = {}): Record<string, unknown> {
+  const value: unknown = leaf === LEAF.number ? 1 : leaf === LEAF.stringArray ? ['x'] : leaf === LEAF.boolean ? true : 'x'
+  const segments = fieldPath.split('.')
+  const build = (index: number): unknown => {
+    const segment = segments[index]!
+    const isArray = segment.endsWith('[]')
+    const key = isArray ? segment.slice(0, -2) : segment
+    const inner = index === segments.length - 1 ? value : build(index + 1)
+    return { [key]: isArray ? [inner] : inner }
+  }
+  const built = build(0) as Record<string, unknown>
+  const merge = (target: Record<string, unknown>, extra: Record<string, unknown>): Record<string, unknown> => {
+    for (const [key, extraValue] of Object.entries(extra)) {
+      const existing = target[key]
+      target[key] = existing && typeof existing === 'object' && !Array.isArray(existing) && extraValue && typeof extraValue === 'object' && !Array.isArray(extraValue)
+        ? merge({ ...(existing as Record<string, unknown>) }, extraValue as Record<string, unknown>)
+        : extraValue
+    }
+    return target
+  }
+  return merge({ ...base }, built)
+}
+
+const mapper = (slug: string): ((result: unknown) => string) => (result) => (cronOutcomes as Record<string, (r: never) => string>)[slug]!(result as never)
+
+const enumerated = buildEnumerator()
+
+test('the census sees every route, and every route has a typed result (not vacuous)', () => {
+  const slugs = Object.keys(cronOutcomes)
+  assert.equal(enumerated.size, slugs.length)
+  assert.deepEqual(Object.keys(cronFailureFields).sort(), [...slugs].sort(), 'cronFailureFields must have one entry per route')
+  let total = 0
+  for (const [slug, entry] of enumerated) {
+    total += entry.fields.size
+    assert.ok(entry.topLevelProperties > 0, `${slug}: the mapping's parameter is typed ${entry.typeText}, which has no properties, so its failure fields cannot be seen; type it from the producer`)
+  }
+  console.log(`# failure-like fields found across ${slugs.length} routes: ${total}`)
+  assert.ok(total >= 80)
+})
+
+test('every failure-like field of every result is consumed, a declared breakdown, or ignored with a reason', () => {
+  for (const slug of Object.keys(cronOutcomes) as CronOutcomeSlug[]) {
+    const problems = diffFieldDeclaration(enumerated.get(slug)!.fields, cronFailureFields[slug])
+    assert.deepEqual(problems, [], `${slug}:\n  ${problems.join('\n  ')}`)
+  }
+})
+
+test('every consumed field really is consumed: the mapping does not answer ok when only that field is set', () => {
+  let probed = 0
+  for (const slug of Object.keys(cronOutcomes) as CronOutcomeSlug[]) {
+    const declaration = cronFailureFields[slug]
+    for (const field of declaration.consumed ?? []) {
+      const leaf = enumerated.get(slug)!.fields.get(field)!
+      const outcome = mapper(slug)(sampleFor(field, leaf, declaration.probes?.[field]))
+      assert.notEqual(outcome, 'ok', `${slug}: '${field}' is declared consumed but a result with it set maps to ok`)
+      probed++
+    }
+  }
+  assert.ok(probed >= 60, `probed ${probed}`)
+})
+
+test('a declared breakdown alone does not fail the run, so it is not counted twice', () => {
+  for (const slug of Object.keys(cronOutcomes) as CronOutcomeSlug[]) {
+    const declaration = cronFailureFields[slug]
+    for (const field of Object.keys(declaration.breakdownOf ?? {})) {
+      const leaf = enumerated.get(slug)!.fields.get(field)!
+      assert.equal(mapper(slug)(sampleFor(field, leaf)), 'ok', `${slug}: breakdown '${field}' fails the run on its own`)
+    }
+  }
+})
+
+test('a breakdown beside held parents stays held: the real Mintsoft content failure shape', () => {
+  const result = { jobId: 'j', status: 'PARTIAL', totalChecked: 1, matched: 0, mismatched: 0, corrected: 0, skipped: 0, errors: 1, outboundHeld: 1, content: { sent: 0, shadowed: 0, held: 0, errors: 1 } }
+  assert.equal(mapper('mintsoft-product-verify')(result), 'held')
+  assert.equal(mapper('mintsoft-product-verify')({ ...result, errors: 2 }), 'failed')
+})
+
+test('the comparison can fail: a new field, a stale entry, a missing reason and a bad breakdown are each reported', () => {
+  const fields: Enumerated = new Map([['errors', LEAF.number], ['newFailureCount', LEAF.number]])
+  assert.match(diffFieldDeclaration(fields, { consumed: ['errors'] }).join('\n'), /newFailureCount: a failure-like field with no declaration/)
+  assert.match(diffFieldDeclaration(fields, { consumed: ['errors', 'newFailureCount', 'gone'] }).join('\n'), /gone: declared but not in the result type/)
+  assert.match(diffFieldDeclaration(fields, { consumed: ['errors'], ignored: { newFailureCount: 'x' } }).join('\n'), /reason is too short/)
+  assert.match(diffFieldDeclaration(fields, { consumed: ['errors'], breakdownOf: { newFailureCount: 'nothing' } }).join('\n'), /not a consumed field/)
+  assert.deepEqual(diffFieldDeclaration(fields, { consumed: ['errors'], breakdownOf: { newFailureCount: 'errors' } }), [])
+})

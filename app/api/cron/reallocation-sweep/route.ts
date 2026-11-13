@@ -73,5 +73,7 @@ export async function GET(request: Request) {
   // A pass that threw only because the outbound-write hold refused a write is held, not failed.
   const body = { ...(result ?? {}), directCreateMarkers, ...(failed ? { ok: false, failures } : {}) }
   const mapped = cronOutcome('reallocation-sweep', body)
-  return cronResultResponse(body, { outcomeClass: mapped === 'failed' && !genuineFailure ? 'held' : mapped })
+  // Passes that failed only on a thrown hold are held; counted per-order errors in the passes that did run still make it failed.
+  const withoutThrown = failed && !genuineFailure ? cronOutcome('reallocation-sweep', { ...body, ok: undefined }) : mapped
+  return cronResultResponse(body, { outcomeClass: failed && !genuineFailure ? (withoutThrown === 'failed' ? 'failed' : 'held') : mapped })
 }

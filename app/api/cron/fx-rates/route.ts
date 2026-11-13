@@ -31,7 +31,7 @@ export async function GET(request: Request) {
           return { error: text }
         }
       }
-      const refreshed = await runStep('fx-refresh', async () => await fetchAllFxRatesInternal() as Record<string, unknown>)
+      const refreshed = await runStep('fx-refresh', async () => await fetchAllFxRatesInternal())
       // A stored receipt whose ledger registration is not on record is retried on EVERY scheduled run, whether or not any rate changed (the refresh above retries the
       // rate-waiting orders only after a fetch that updated a rate). Idempotent (the registration enqueue is keyed per receipt and document) and bounded (50 rows).
       const queue = await runStep('wc-receipt-retry', async () => {

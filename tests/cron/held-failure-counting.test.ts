@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
-import { cronOutcome } from '../../lib/ops/cron-outcomes.ts'
+import { cronOutcome as typedOutcome, type CronOutcomeSlug } from '../../lib/ops/cron-outcomes.ts'
+
+const cronOutcome = (slug: CronOutcomeSlug, result: unknown) => typedOutcome(slug, result as never)
 import { OutboundWriteHeldError } from '../../lib/security/outbound-write-grant.ts'
 
 /**

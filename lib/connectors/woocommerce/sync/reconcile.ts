@@ -32,9 +32,33 @@ function parseCursor(value: string): { afterId: string; version: string } | null
   }
 }
 
-export async function runWcReconcile(): Promise<Record<string, unknown>> {
+type WcReconcileSkipped = { skipped: true; reason: string; reconciliationDue: boolean; lastReconciledAt: string | null }
+
+/** What the reconcile reports, section by section. Written out so tests/ops/cron-outcome-fields.test.ts sees every failure field. */
+export type WcReconcileResult = {
+  orders?: Awaited<ReturnType<typeof syncNewWcOrders>> | WcReconcileSkipped
+  heldSalesInvoices?: Awaited<ReturnType<typeof retryHeldWcSalesInvoiceReleases>>
+  products?: Awaited<ReturnType<typeof syncAllWcProducts>> | WcReconcileSkipped
+  refundStockCorrections?: { error: string }
+  stock?: {
+    queued: Awaited<ReturnType<typeof processQueuedWcStockSyncJobs>>
+    sync?: Awaited<ReturnType<typeof pushStockToWc>>
+    skipped?: true
+    reason?: string
+    reconciliationDue?: boolean
+    lastReconciledAt?: string | null
+    errors?: string[]
+    chunks?: number
+    synced?: number
+    candidates?: number
+    resumeAfter?: string | null
+    reconciledAt?: string
+  }
+}
+
+export async function runWcReconcile(): Promise<WcReconcileResult> {
   const startedAt = Date.now()
-  const results: Record<string, unknown> = {}
+  const results: WcReconcileResult = {}
 
   const webhookPrimaryActive = await isWcOrderWebhookPrimaryActive()
   if (!webhookPrimaryActive) {

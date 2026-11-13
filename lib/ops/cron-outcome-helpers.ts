@@ -34,8 +34,8 @@ export function enumStatus(result: unknown): CronOutcomeClass | null {
 }
 
 /** Counts of failures: `failed`, `errors` or others as numbers, with the held ones subtracted from `heldCounter` only, in the record and every record nested in it. */
-export function counts(result: unknown, keys: readonly string[], heldCounter = 'failed'): CronOutcomeClass {
-  if (Array.isArray(result)) return worstOutcome('ok', ...result.map((entry) => counts(entry, keys, heldCounter)))
+export function counts(result: unknown, keys: readonly string[], heldCounter = 'failed', nested = true): CronOutcomeClass {
+  if (Array.isArray(result)) return worstOutcome('ok', ...result.map((entry) => counts(entry, keys, heldCounter, nested)))
   if (!isRec(result) || result.skipped === true) return 'ok'
   const held = num(result.outboundHeld)
   const classes: CronOutcomeClass[] = ['ok']
@@ -47,8 +47,9 @@ export function counts(result: unknown, keys: readonly string[], heldCounter = '
     // zero (a dead-lettered push, say) is a genuine failure whatever was held.
     if (count > 0) classes.push(key === heldCounter && count <= held ? 'held' : 'failed')
   }
-  for (const value of Object.values(result)) {
-    if (isRec(value) || Array.isArray(value)) classes.push(counts(value, keys, heldCounter))
+  // `nested: false` reads the top-level counters only, for a result whose nested records are a BREAKDOWN of a parent count (not extra failures).
+  for (const value of nested ? Object.values(result) : []) {
+    if (isRec(value) || Array.isArray(value)) classes.push(counts(value, keys, heldCounter, nested))
   }
   return worstOutcome(...classes)
 }
@@ -83,6 +84,6 @@ export function from(result: unknown, ...parts: Array<CronOutcomeClass | null>):
 export function enumResult(result: unknown, keys: readonly string[]): CronOutcomeClass {
   const status = enumStatus(result)
   if (status === 'skipped') return 'skipped'
-  return from(result, status, counts(result, keys, 'errors'), structural(result))
+  return from(result, status, counts(result, keys, 'errors', false), structural(result))
 }
 

@@ -285,17 +285,19 @@ export async function runWcErasureSweepIfDue(): Promise<WcErasureSweepResult | {
  * store, say) makes the host job fail every tick, and the sweep must not be starved by it. The host's failure is then re-raised with the erasure
  * outcome attached, so the cron's status and health semantics for the withdrawal part are unchanged.
  */
+export type WcErasureSweepOutcome = Awaited<ReturnType<typeof runWcErasureSweepIfDue>>
+
 export async function runWithErasureSweepAlways<T extends Record<string, unknown>>(
   hostWork: () => Promise<T>,
-  sweep: () => Promise<unknown> = runWcErasureSweepIfDue,
-): Promise<T & { erasureSweep: unknown }> {
+  sweep: () => Promise<WcErasureSweepOutcome> = runWcErasureSweepIfDue,
+): Promise<T & { erasureSweep: WcErasureSweepOutcome }> {
   let outcome: { ok: true; value: T } | { ok: false; error: unknown }
   try {
     outcome = { ok: true, value: await hostWork() }
   } catch (error) {
     outcome = { ok: false, error }
   }
-  let erasureSweep: unknown
+  let erasureSweep: WcErasureSweepOutcome
   try {
     erasureSweep = await sweep()
   } catch (e) {

@@ -31,7 +31,7 @@ export async function GET(request: Request) {
       switch (schedule.connector) {
         case 'xero': {
           const { runDailyBatchSync } = await import('@/lib/connectors/xero/daily-sync')
-          return await runDailyBatchSync() as Record<string, unknown>
+          return await runDailyBatchSync()
         }
       }
     },

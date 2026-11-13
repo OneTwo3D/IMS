@@ -1,6 +1,7 @@
 import type { WmsDispatchSweepResult } from '@/lib/domain/wms/dispatch-sweep'
 import type { ProcessMintsoftBookedInEventsResult } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
-import { counts, enumResult, from, structural, type Rec } from '@/lib/ops/cron-outcome-helpers'
+import type { runPostMaintenanceBookedInRecheck } from '@/lib/domain/wms/post-maintenance-recheck'
+import { counts, enumResult, from, structural } from '@/lib/ops/cron-outcome-helpers'
 import type { MintsoftBundleVerifyResult } from './sync/bundle-sync'
 import type { MintsoftProductSyncResult } from './sync/product-sync'
 import type { MintsoftReturnsSyncResult } from './sync/returns-sync'
@@ -11,7 +12,12 @@ import type { MintsoftStockSyncResult } from './sync/stock-sync'
  * Each entry says how that route's own result reports failure; lib/ops/cron-outcomes.ts spreads this object into the registry.
  */
 
-type MintsoftStockSyncCronResult = { ran: number; due: number; details: Array<Pick<MintsoftStockSyncResult, 'status' | 'errors'>> }
+type MintsoftStockSyncCronResult = {
+  ran: number
+  due: number
+  details: Array<Pick<MintsoftStockSyncResult, 'bindingId' | 'warehouseCode' | 'status' | 'totalChecked' | 'mismatched' | 'errors' | 'jobId'> & { skippedReason: string | null }>
+}
+type MintsoftWebhookSweeperCronResult = ProcessMintsoftBookedInEventsResult & { postMaintenanceRecheck: Awaited<ReturnType<typeof runPostMaintenanceBookedInRecheck>> }
 
 export const mintsoftCronOutcomes = {
   // status: SKIPPED | SUCCEEDED | PARTIAL | FAILED; errors: number
@@ -25,5 +31,5 @@ export const mintsoftCronOutcomes = {
   // one result per binding: status enum and errors: number
   'mintsoft-stock-sync': (r: MintsoftStockSyncCronResult) => from(r, ...r.details.map((detail) => enumResult(detail, ['errors']))),
   // failed: number (booked-in events that failed to process); error texts in the recheck
-  'mintsoft-webhook-sweeper': (r: Partial<ProcessMintsoftBookedInEventsResult> & Rec) => from(r, counts(r, ['failed']), structural(r)),
+  'mintsoft-webhook-sweeper': (r: MintsoftWebhookSweeperCronResult) => from(r, counts(r, ['failed']), structural(r)),
 }

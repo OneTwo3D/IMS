@@ -18,7 +18,7 @@ export async function GET(request: Request) {
 
   const { runId, result, outcomeClass } = await runCronWithLogging({
     jobName: 'invariant-check',
-    run: async ({ runId }) => await runScheduledInvariantCheck({ createRunId: () => runId }) as unknown as Record<string, unknown>,
+    run: async ({ runId }) => await runScheduledInvariantCheck({ createRunId: () => runId }),
     outcomeOf: (result) => cronOutcome('invariant-check', result),
   })
 

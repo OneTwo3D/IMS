@@ -29,7 +29,7 @@ export async function GET(request: Request) {
         return { skipped: true, reason: 'WC sync disabled' }
       }
 
-      return await runWcReconcile() as Record<string, unknown>
+      return await runWcReconcile()
     },
     outcomeOf: (result) => cronOutcome('wc-reconcile', result),
   })

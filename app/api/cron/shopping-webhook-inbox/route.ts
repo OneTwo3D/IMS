@@ -6,9 +6,10 @@ import { processPendingWcWebhookEvents } from '@/lib/jobs/woocommerce/process-sh
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runCronWithLogging } from '@/lib/ops/cron-run'
 import { cronRunResponse } from '@/lib/ops/cron-response'
-import { cronOutcome } from '@/lib/ops/cron-outcomes'
+import { cronOutcome, type ShoppingDrain, type ShoppingTick } from '@/lib/ops/cron-outcomes'
 
-type ConnectorTickResult = Record<string, unknown>
+type ConnectorTickResult = ShoppingTick
+type DrainResult = ShoppingDrain
 
 function normalizeCronError(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -61,7 +62,7 @@ async function runConnectorTick(input: {
  * `wc_sync_enabled` — the status push has never been gated by that setting, and an order must not stay
  * `processing` in the storefront because inbound sync is switched off. Never throws.
  */
-async function drainOrderCompletions(): Promise<ConnectorTickResult> {
+async function drainOrderCompletions(): Promise<DrainResult> {
   try {
     if (!(await isIntegrationPluginEnabled('woocommerce'))) {
       return { skipped: true, reason: 'woocommerce_plugin_disabled' }
@@ -80,7 +81,7 @@ async function drainOrderCompletions(): Promise<ConnectorTickResult> {
  * unpushed because inbound sync is switched off). Separate from the completion drain so one failing never
  * hides the other. Never throws.
  */
-async function drainOrderStatusPushes(): Promise<ConnectorTickResult> {
+async function drainOrderStatusPushes(): Promise<DrainResult> {
   try {
     if (!(await isIntegrationPluginEnabled('woocommerce'))) {
       return { skipped: true, reason: 'woocommerce_plugin_disabled' }
@@ -97,7 +98,7 @@ async function drainOrderStatusPushes(): Promise<ConnectorTickResult> {
  * Queue and drain the "show this order's invoice in My Account" publications. OFF unless `wc_invoice_document_enabled` is `true`; while it
  * is not, nothing is queued, claimed or sent. Same plugin gate as the other drains, separate so one failing never hides another. Never throws.
  */
-async function drainInvoiceDocumentPublications(): Promise<ConnectorTickResult> {
+async function drainInvoiceDocumentPublications(): Promise<DrainResult> {
   try {
     if (!(await isIntegrationPluginEnabled('woocommerce'))) {
       return { skipped: true, reason: 'woocommerce_plugin_disabled' }
@@ -145,7 +146,7 @@ export async function GET(request: Request) {
       const orderStatusPushes = await drainOrderStatusPushes()
       const invoiceDocumentPublications = await drainInvoiceDocumentPublications()
 
-      return { connectors: { woocommerce: { ...woocommerce, orderCompletions, orderStatusPushes, invoiceDocumentPublications } } } as Record<string, unknown>
+      return { connectors: { woocommerce: { ...woocommerce, orderCompletions, orderStatusPushes, invoiceDocumentPublications } } }
     },
     outcomeOf: (result) => cronOutcome('shopping-webhook-inbox', result),
   })

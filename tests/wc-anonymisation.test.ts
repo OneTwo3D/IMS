@@ -66,11 +66,11 @@ test('runWithErasureSweepAlways: the sweep is attempted even when the host work 
   let swept = 0
   const sweep = async () => { swept += 1; return { pages: 1 } }
   await assert.rejects(
-    () => runWithErasureSweepAlways(async () => { throw new Error('1 withdrawal suppression(s) could not be resolved') }, sweep),
+    () => runWithErasureSweepAlways(async () => { throw new Error('1 withdrawal suppression(s) could not be resolved') }, sweep as never),
     (e: Error) => /could not be resolved/.test(e.message) && /erasure sweep: \{"pages":1\}/.test(e.message),
   )
   assert.equal(swept, 1, 'the sweep ran although the host work failed')
-  const ok = await runWithErasureSweepAlways(async () => ({ scanned: 3 }), sweep)
+  const ok = await runWithErasureSweepAlways(async () => ({ scanned: 3 }), sweep as never)
   assert.deepEqual(ok, { scanned: 3, erasureSweep: { pages: 1 } })
   const ok2 = await runWithErasureSweepAlways(async () => ({ scanned: 3 }), async () => { throw new Error('boom') })
   assert.equal(ok2.scanned, 3)
