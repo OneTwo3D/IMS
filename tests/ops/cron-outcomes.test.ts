@@ -62,7 +62,11 @@ test('each route-owned signal: status enums, success flags, error keys', () => {
   assert.equal(cronOutcome('mintsoft-bundle-verify', { status: 'PARTIAL', totalChecked: 1, synced: 0, conflicts: 0, skipped: 0, errors: 1 }), 'failed')
   assert.equal(cronOutcome('mintsoft-product-verify', { jobId: null, status: 'SKIPPED', totalChecked: 0, matched: 0, mismatched: 0, corrected: 0, skipped: 0, errors: 0 }), 'skipped')
   assert.equal(cronOutcome('invoice-documents', { stoppedEarly: 'x', stored: 0, failed: 2 }), 'failed')
-  assert.equal(cronOutcome('invoice-documents', { stoppedEarly: undefined, stored: 3, failed: 1 }), 'ok')
+  // partial progress does not make an unfinished sweep a success
+  assert.equal(cronOutcome('invoice-documents', { stoppedEarly: 'the ledger refused or is rate-limited: 429', stored: 1, failed: 1 }), 'failed')
+  assert.equal(cronOutcome('invoice-documents', { stoppedEarly: 'unexpected error: x', stored: 5, failed: 0 }), 'failed')
+  assert.equal(cronOutcome('invoice-documents', { stoppedEarly: null, stored: 3, failed: 1 }), 'failed')
+  assert.equal(cronOutcome('invoice-documents', { stoppedEarly: null, stored: 3, failed: 0 }), 'ok')
 })
 
 test('wc-reconcile: permanent import conflicts with an empty errors list are a failure', () => {

@@ -14,9 +14,10 @@ type Doubles = {
   returns: unknown
   push: unknown
   wc: unknown
+  invoiceDocs: unknown
 }
 const recorded: string[] = []
-const doubles: Doubles = { reconcile: null, dispatch: null, stock: null, returns: null, push: null, wc: null }
+const doubles: Doubles = { reconcile: null, dispatch: null, stock: null, returns: null, push: null, wc: null, invoiceDocs: null }
 
 mock.module('@/lib/cron-auth', { namedExports: { verifyCron: async () => null } })
 mock.module('@/lib/cron-rate-limit', { namedExports: { enforceCronRateLimit: async () => null } })
@@ -40,6 +41,9 @@ mock.module('@/lib/connectors/mintsoft/sync/returns-sync', { namedExports: { run
 mock.module('@/lib/connectors/mintsoft/sync/stock-sync', { namedExports: { runStockSyncForBinding: async () => doubles.stock } })
 mock.module('@/lib/connectors/mintsoft/sync/stock-sync-helpers', { namedExports: { isMintsoftBindingDue: () => true } })
 mock.module('@/lib/connectors/woocommerce/sync/reconcile', { namedExports: { runWcReconcile: async () => doubles.wc } })
+mock.module('@/lib/domain/invoice-documents/sweep', { namedExports: { runInvoiceDocumentSweep: async () => doubles.invoiceDocs } })
+mock.module('@/lib/domain/invoice-documents/health', { namedExports: { getInvoiceDocumentHealth: async () => ({ needsAttention: 0, pending: 0, oldestPendingAt: null }) } })
+mock.module('@/lib/connectors/xero/invoice-document-deps', { namedExports: { xeroInvoiceDocumentDeps: () => ({}) } })
 mock.module('@/lib/domain/purchasing/product-lead-time', { namedExports: { recomputeProductObservedLeadTimes: async () => ({}) } })
 
 const request = (): Request => new Request('http://localhost/api/cron/x')
@@ -146,4 +150,17 @@ test('wc-reconcile: permanent product conflicts with an empty errors list answer
   doubles.wc = { orders: { synced: 1, skipped: 0, errors: [] }, products: { synced: 2, skipped: 0, errors: [], permanentErrors: [] } }
   assert.equal((await GET(request())).status, 200)
   assert.equal(recorded.at(-1), 'completed')
+})
+
+test('invoice-documents: a sweep that stores one document and then stops early answers 500 and is recorded failed; a finished one answers 200', async () => {
+  const { GET } = await import('@/app/api/cron/invoice-documents/route')
+  const base = { considered: 3, stored: 1, waiting: 0, needsAttention: 0, failed: 0, stoppedEarly: null as string | null }
+  doubles.invoiceDocs = { ...base }
+  assert.equal((await GET(request())).status, 200)
+  assert.equal(recorded.at(-1), 'completed')
+  doubles.invoiceDocs = { ...base, failed: 1, stoppedEarly: 'the ledger refused or is rate-limited: 429' }
+  assert.equal((await GET(request())).status, 500)
+  assert.equal(recorded.at(-1), 'failed', 'the recorded status agrees with the response')
+  doubles.invoiceDocs = { ...base, stoppedEarly: 'unexpected error: boom' }
+  assert.equal((await GET(request())).status, 500)
 })

@@ -170,9 +170,10 @@ export const cronOutcomes = {
   'invariant-check': (r: Ret<typeof runScheduledInvariantCheck>) => from(r, r.status === 'completed' ? structural(r) : 'failed'),
   // a snapshot reports drift as data, which is an alert and not a failed run; failure is a throw
   'inventory-snapshot': (r: Ret<typeof writeDailyInventorySnapshot>) => noFailureSignal(r),
-  // a run that stopped early having stored nothing and failed something; a partial run that stored some is progress
+  // stoppedEarly (an unexpected exception, a ledger refusal or rate limit, or three fetch failures in a row) fails the run WHATEVER `stored` is:
+  // partial progress does not make an unfinished sweep a success. Held-aware (a hold-refused stop reads as held). failed: documents that failed this run.
   'invoice-documents': (r: InvoiceDocumentsCronResult) =>
-    from(r, r.stoppedEarly && num(r.stored) === 0 && num(r.failed) > 0 ? 'failed' : null),
+    from(r, r.stoppedEarly ? structural({ error: r.stoppedEarly }) : null, num(r.failed) > 0 ? 'failed' : null),
   // an archive pass reports what it archived and skipped; there is no failure signal short of a throw
   'product-lifecycle-archive': (r: { scanned: number; archived: number; skippedWithStock: number; skippedWithIncoming: number }) => noFailureSignal(r),
   // status: FAILED = a stale feed that no admin could be told about

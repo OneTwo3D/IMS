@@ -24,10 +24,9 @@ export async function GET(request: Request) {
     jobName: 'invoice-documents',
     run: async () => ({ ...(await runInvoiceDocumentSweep(xeroInvoiceDocumentDeps())), health: await getInvoiceDocumentHealth() }),
     getOutcome: (outcome) => ({
-      status: outcome.stoppedEarly && outcome.stored === 0 && outcome.failed > 0 ? 'failed' : 'completed',
       counts: { considered: outcome.considered, stored: outcome.stored, waiting: outcome.waiting, needsAttention: outcome.needsAttention, failed: outcome.failed, needsAttentionTotal: outcome.health.needsAttention, pendingTotal: outcome.health.pending },
-      statusReason: outcome.stoppedEarly ?? (outcome.skipped ? `skipped: ${outcome.skipped}` : null),
-      responseStatus: outcome.stoppedEarly && outcome.stored === 0 && outcome.failed > 0 ? 500 : 200,
+      // The recorded status and the response both come from the mapping (lib/ops/cron-outcomes.ts), so they cannot disagree.
+      statusReason: outcome.stoppedEarly ?? (outcome.failed > 0 ? `${outcome.failed} document(s) failed` : outcome.skipped ? `skipped: ${outcome.skipped}` : null),
     }),
     outcomeOf: (result) => cronOutcome('invoice-documents', result),
   })

@@ -16,11 +16,14 @@ import { cronFailureFields, type CronFieldDeclaration } from '../../lib/ops/cron
  * ignored with a reason.
  */
 
-const FAILURE_LIKE = /fail|error|dead|conflict|park|unresolved|reject|quarantin|incomplete|orphan|stuck|blocked|refus|unrecorded|unwritten|lost|missing|abandon|stale|skippedWithError|mismatch|drift|invalid|denied|timeout|unavailable/i
+const FAILURE_LIKE = /fail|error|dead|conflict|park|unresolved|reject|quarantin|incomplete|orphan|stuck|blocked|refus|unrecorded|unwritten|lost|missing|abandon|stale|skippedWithError|mismatch|drift|invalid|denied|timeout|unavailable|stoppedEarly|aborted|halted|interrupted|truncated|capped/i
+/** Names of counters that say a run made progress: a failure field must still be read when every one of these is above zero. */
+const PROGRESS_LIKE = /stored|synced|processed|pushed|imported|updated|sent|created|succeeded|released|registered|verified|dispatched|delivered|archived|written|claimed|attempted|scanned|considered|checked|paid|reversed|revalued|persisted|fetched|corrected|matched|cleared|completed|reconciled|enqueued|queued/i
 const LEAF = { number: 'number', string: 'string', stringArray: 'string[]', boolean: 'boolean', other: 'other' } as const
 type Leaf = (typeof LEAF)[keyof typeof LEAF]
 
 type Enumerated = Map<string, Leaf>
+type Progress = Map<string, Leaf>
 
 function buildEnumerator() {
   const configPath = path.resolve('tsconfig.json')
@@ -47,14 +50,14 @@ function buildEnumerator() {
     return LEAF.other
   }
 
-  function walk(type: ts.Type, prefix: string, out: Enumerated, seen: Set<ts.Type>, depth: number): void {
+  function walk(type: ts.Type, prefix: string, out: Enumerated, seen: Set<ts.Type>, depth: number, progress?: Progress): void {
     if (depth > 7) return
     const members = type.isUnion() ? type.types : [type]
     for (const member of members) {
       if (member.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined)) continue
       if (checker.isArrayType(member)) {
         const element = checker.getTypeArguments(member as ts.TypeReference)[0]
-        if (element) walk(element, `${prefix}[]`, out, seen, depth + 1)
+        if (element) walk(element, `${prefix}[]`, out, seen, depth + 1, progress)
         continue
       }
       if (!(member.flags & ts.TypeFlags.Object) && !member.isIntersection()) continue
@@ -67,22 +70,25 @@ function buildEnumerator() {
         const propertyType = checker.getTypeOfSymbolAtLocation(property, source!)
         const propertyPath = prefix ? `${prefix}.${property.name}` : property.name
         if (FAILURE_LIKE.test(property.name)) out.set(propertyPath, leafOf(propertyType))
-        walk(propertyType, propertyPath, out, nextSeen, depth + 1)
+        else if (progress && PROGRESS_LIKE.test(property.name) && leafOf(propertyType) === LEAF.number) progress.set(propertyPath, LEAF.number)
+        walk(propertyType, propertyPath, out, nextSeen, depth + 1, progress)
       }
     }
   }
 
-  const bySlug = new Map<string, { fields: Enumerated; topLevelProperties: number; typeText: string }>()
+  const bySlug = new Map<string, { fields: Enumerated; progress: Progress; topLevelProperties: number; typeText: string }>()
   for (const property of registryType.getProperties()) {
     const mapperType = checker.getTypeOfSymbolAtLocation(property, source)
     const parameter = mapperType.getCallSignatures()[0]?.getParameters()[0]
     assert.ok(parameter, `${property.name}: the mapping takes a result`)
     const parameterType = checker.getTypeOfSymbolAtLocation(parameter, source)
     const fields: Enumerated = new Map()
-    walk(parameterType, '', fields, new Set(), 0)
+    const progress: Progress = new Map()
+    walk(parameterType, '', fields, new Set(), 0, progress)
     const members = parameterType.isUnion() ? parameterType.types : [parameterType]
     bySlug.set(property.name, {
       fields,
+      progress,
       topLevelProperties: members.reduce((total, member) => total + member.getProperties().length, 0),
       typeText: checker.typeToString(parameterType).slice(0, 80),
     })
@@ -106,9 +112,24 @@ export function diffFieldDeclaration(enumerated: Enumerated, declaration: CronFi
   return problems
 }
 
-/** A result with only `path` set to a failing value, over any base the declaration gives. */
-function sampleFor(fieldPath: string, leaf: Leaf, base: Record<string, unknown> = {}): Record<string, unknown> {
-  const value: unknown = leaf === LEAF.number ? 1 : leaf === LEAF.stringArray ? ['x'] : leaf === LEAF.boolean ? true : 'x'
+const isPlain = (value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+
+/** Deep merge in which the first element of two arrays of objects is merged too, so `details[].processed` and `details[].errors` land in one item. */
+function merge(target: Record<string, unknown>, extra: Record<string, unknown>): Record<string, unknown> {
+  for (const [key, extraValue] of Object.entries(extra)) {
+    const existing = target[key]
+    if (isPlain(existing) && isPlain(extraValue)) target[key] = merge({ ...existing }, extraValue)
+    else if (Array.isArray(existing) && Array.isArray(extraValue) && isPlain(existing[0]) && isPlain(extraValue[0])) target[key] = [merge({ ...existing[0] }, extraValue[0]), ...extraValue.slice(1)]
+    else target[key] = extraValue
+  }
+  return target
+}
+
+function valueFor(leaf: Leaf): unknown {
+  return leaf === LEAF.number ? 1 : leaf === LEAF.stringArray ? ['x'] : leaf === LEAF.boolean ? true : 'x'
+}
+
+function objectAt(fieldPath: string, value: unknown): Record<string, unknown> {
   const segments = fieldPath.split('.')
   const build = (index: number): unknown => {
     const segment = segments[index]!
@@ -117,17 +138,19 @@ function sampleFor(fieldPath: string, leaf: Leaf, base: Record<string, unknown> 
     const inner = index === segments.length - 1 ? value : build(index + 1)
     return { [key]: isArray ? [inner] : inner }
   }
-  const built = build(0) as Record<string, unknown>
-  const merge = (target: Record<string, unknown>, extra: Record<string, unknown>): Record<string, unknown> => {
-    for (const [key, extraValue] of Object.entries(extra)) {
-      const existing = target[key]
-      target[key] = existing && typeof existing === 'object' && !Array.isArray(existing) && extraValue && typeof extraValue === 'object' && !Array.isArray(extraValue)
-        ? merge({ ...(existing as Record<string, unknown>) }, extraValue as Record<string, unknown>)
-        : extraValue
-    }
-    return target
-  }
-  return merge({ ...base }, built)
+  return build(0) as Record<string, unknown>
+}
+
+/** A result with only `path` set to a failing value, over any base the declaration gives. */
+function sampleFor(fieldPath: string, leaf: Leaf, base: Record<string, unknown> = {}): Record<string, unknown> {
+  return merge({ ...base }, objectAt(fieldPath, valueFor(leaf)))
+}
+
+/** A busy, successful run: every progress counter of the result, at any depth, is above zero. */
+function busyBaseline(progress: Progress): Record<string, unknown> {
+  let result: Record<string, unknown> = {}
+  for (const progressPath of progress.keys()) result = merge(result, objectAt(progressPath, 1))
+  return result
 }
 
 const mapper = (slug: string): ((result: unknown) => string) => (result) => (cronOutcomes as Record<string, (r: never) => string>)[slug]!(result as never)
@@ -158,14 +181,22 @@ test('every failure-like field of every result is consumed, a declared breakdown
 test('every consumed field really is consumed: the mapping does not answer ok when only that field is set', () => {
   let probed = 0
   let probedWithSkip = 0
+  let probedWithProgress = 0
   for (const slug of Object.keys(cronOutcomes) as CronOutcomeSlug[]) {
     const declaration = cronFailureFields[slug]
     for (const field of declaration.consumed ?? []) {
       const leaf = enumerated.get(slug)!.fields.get(field)!
-      const sample = sampleFor(field, leaf, declaration.probes?.[field])
+      const sample = sampleFor(field, leaf, { ...declaration.probes?.['*'], ...declaration.probes?.[field] })
       const outcome = mapper(slug)(sample)
       assert.notEqual(outcome, 'ok', `${slug}: '${field}' is declared consumed but a result with it set maps to ok`)
       probed++
+      // And against a busy, successful run: partial progress must not make a failure read as ok.
+      const busy = enumerated.get(slug)!.progress
+      if (busy.size > 0) {
+        const withProgress = mapper(slug)(merge(busyBaseline(busy), sample))
+        assert.notEqual(withProgress, 'ok', `${slug}: '${field}' is masked by progress counters (${[...busy.keys()].join(', ')}): a run that made progress still failed`)
+        probedWithProgress++
+      }
       // The same field with the route's skip state set: a top-level skip must never mask the failure of a sweep that ran.
       if (declaration.skipState) {
         const skipped = mapper(slug)({ ...sample, ...declaration.skipState })
@@ -177,6 +208,16 @@ test('every consumed field really is consumed: the mapping does not answer ok wh
   }
   assert.ok(probed >= 60, `probed ${probed}`)
   assert.ok(probedWithSkip >= 20, `probed with a skip state: ${probedWithSkip}`)
+  assert.ok(probedWithProgress >= 40, `probed against a busy successful run: ${probedWithProgress}`)
+})
+
+test('a busy, successful run on its own is ok (the progress baseline is not itself failing)', () => {
+  for (const slug of Object.keys(cronOutcomes) as CronOutcomeSlug[]) {
+    const busy = enumerated.get(slug)!.progress
+    if (busy.size === 0) continue
+    const declaration = cronFailureFields[slug]
+    assert.equal(mapper(slug)(merge(busyBaseline(busy), declaration.probes?.['*'] ?? {})), 'ok', `${slug}: a run with every progress counter above zero and nothing failing must be ok`)
+  }
 })
 
 test('a skip with no failing field is still skipped, and the skip states themselves are skips', () => {

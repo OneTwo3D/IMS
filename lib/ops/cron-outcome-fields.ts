@@ -6,7 +6,7 @@ import { mintsoftCronFailureFields as warehouseConnectorCronFailureFields } from
  *
  * tests/ops/cron-outcome-fields.test.ts reads the TypeScript type of each route's result (the parameter of its entry in lib/ops/cron-outcomes.ts),
  * lists every property at any depth whose name looks like a failure (fail, error, dead, conflict, park, unresolved, reject, quarantin, incomplete,
- * orphan, stuck, blocked, refus), and requires each to be declared here, once:
+ * orphan, stuck, blocked, refus, stoppedEarly, aborted, halted, interrupted, truncated, capped), and requires each to be declared here, once:
  *
  *  - `consumed`: the mapping turns it into failed (or held). The test PROBES it: a result with only that field set must not map to ok.
  *  - `breakdownOf`: already included in a parent count or list, so counting it again would double-count; the value names the parent (which must be
@@ -14,7 +14,7 @@ import { mintsoftCronFailureFields as warehouseConnectorCronFailureFields } from
  *  - `ignored`: not a failure of the run, with the reason. A reason that says "it decides X" names the field the mapping reads instead.
  *
  * A new failure field added to a producer therefore fails CI until it is mapped or justified here. Paths use `.` for a property and `[]` for array items.
- * `probes` gives the other fields a consumed path needs to be set for its probe to mean anything (for example a precondition).
+ * `probes` (key `'*'`: every probe, and the busy-run baseline) gives the other fields a consumed path needs to be set for its probe to mean anything (for example a precondition).
  */
 export type CronFieldDeclaration = {
   consumed?: string[]
@@ -34,6 +34,8 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
   'accounting-fx-revaluation': {
     skipState: { success: true, skipped: true, reason: 'x' },
     consumed: ['error', 'refused'],
+    // `success` is the mapping's own signal: probe each field on a run that otherwise succeeded, or the probe would pass on `success` alone
+    probes: { '*': { success: true } },
   },
   'accounting-payment-poll': { consumed: ['errors'], skipState: { skipped: 'x' } },
   'accounting-payment-reconcile': { consumed: ['errors'], skipState: { skipped: true, reason: 'x' } },
@@ -61,6 +63,7 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
   'invariant-check': {
     consumed: ['errors'],
     probes: { errors: { status: 'completed' } },
+    ignored: { 'reports.inventory.truncated': 'only says the inventory report\'s finding list was cut at its cap: the findings are data for the readiness gate, which fails on `truncated` itself and on the `invariant_report_truncated` finding; the check ran to completion (`status`), and a run that did not is read from `status`' },
   },
   'inventory-snapshot': {
     ignored: {
@@ -70,8 +73,8 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
     },
   },
   'invoice-documents': {
-    consumed: ['failed'],
-    probes: { failed: { stoppedEarly: 'stopped', stored: 0 } },
+    consumed: ['failed', 'stoppedEarly'],
+    probes: { failed: { stoppedEarly: null, stored: 0 } },
   },
   'product-lifecycle-archive': {},
   'read-sync-liveness': {
@@ -104,7 +107,7 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
     skipState: { skipped: true, reason: 'x' },
     consumed: ['orders.errors', 'products.errors', 'products.permanentErrors', 'refundStockCorrections.error', 'stock.queued.errors', 'stock.sync.errors', 'stock.errors'],
     breakdownOf: { 'stock.queued.failed': 'stock.queued.errors' },
-    ignored: { 'heldSalesInvoices.stillStuck': 'held sales invoices waiting on the accounting connector: each pass logs the stuck invoices as an activity warning, and counting them would keep the run red for as long as accounting is disconnected' },
+    ignored: { 'stock.sync.aborted': 'a stock push refused before any work (the setting is off, no credentials or warehouses, or the outbound-write hold): the route reports it as a skip (`reconciliation_refused`) that leaves the pass due, by design; a push that failed in flight carries `stock.sync.errors`, which is consumed', 'heldSalesInvoices.stillStuck': 'held sales invoices waiting on the accounting connector: each pass logs the stuck invoices as an activity warning, and counting them would keep the run red for as long as accounting is disconnected' },
   },
   'wc-withdrawal-sweep': {
     consumed: ['erasureSweep.errors', 'admissionRefusals.failed'],
