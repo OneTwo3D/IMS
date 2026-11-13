@@ -196,8 +196,9 @@ export const cronOutcomes = {
   // the withdrawal and screening failures throw; errors: string[] from the erasure sweep; admissionRefusals.failed: number (the by-id read or the import failed)
   'wc-withdrawal-sweep': (r: WcWithdrawalSweepCronResult | Skip) => from(r, structural(r), counts(r, ['failed'])),
   // failed, deadLettered and shadowUnrecorded (a held create whose only record could not be written): numbers, with outboundHeld (held pushes, also in failed) subtracted;
-  // validationFailed and createClaimParked: orders NEWLY parked this run (the payload cannot be built; a dispatched create with no recorded outcome), counted once on entry, never the backlog, so a later healthy sweep is green again
-  'wms-order-push': (r: WmsOrderPushSweepResult) => from(r, counts(r, ['failed', 'deadLettered', 'shadowUnrecorded', 'validationFailed', 'createClaimParked'])),
+  // validationFailed and createClaimParked: orders NEWLY parked this run (the payload cannot be built; a dispatched create with no recorded outcome), counted once on entry, never the backlog, so a later healthy sweep is green again;
+  // fenceCheckErrors, claimErrors and linkWriteErrors: a withdrawal-fence check, create-claim transaction or recovery-pass link write that THREW (the order is skipped and retried, but the sweep could not decide it)
+  'wms-order-push': (r: WmsOrderPushSweepResult) => from(r, counts(r, ['failed', 'deadLettered', 'shadowUnrecorded', 'validationFailed', 'createClaimParked', 'fenceCheckErrors', 'claimErrors', 'linkWriteErrors'])),
   // status enum; counters.errors: number
   'wms-order-reconcile': (r: WmsOrderReconcileResult) => enumResult(r, ['errors']),
   // failed: number; probeFailures: number (a presence probe that threw, apart from the expected unresolved states); pushFailures / pushHeld: whole-batch counts of failed and hold-refused pushes (`errors` is cut at 20 for display, so the mapping reads the counts); errors: string[] (storefront status pushes that failed, held-aware)

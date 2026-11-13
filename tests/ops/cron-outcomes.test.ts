@@ -95,7 +95,7 @@ test('email-outbox: parked, conflicted and unresolved-after-send rows are failur
 })
 
 test('outboundHeld is subtracted only from the counter it is part of', () => {
-  const base = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0, createClaimParked: 0, ambiguousCreateRequeued: 0 }
+  const base = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0, createClaimParked: 0, fenceCheckErrors: 0, claimErrors: 0, linkWriteErrors: 0, ambiguousCreateRequeued: 0 }
   assert.equal(cronOutcome('wms-order-push', { ...base, failed: 1, outboundHeld: 1 }), 'held')
   assert.equal(cronOutcome('wms-order-push', { ...base, failed: 1, deadLettered: 1, outboundHeld: 1 }), 'failed')
   assert.equal(cronOutcome('wms-order-push', { ...base, deadLettered: 1, outboundHeld: 1 }), 'failed')

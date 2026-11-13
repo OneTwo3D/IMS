@@ -122,7 +122,7 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
   },
   'wms-order-push': {
     skipState: { skipped: 'x' },
-    consumed: ['failed', 'deadLettered', 'shadowUnrecorded', 'validationFailed', 'createClaimParked'],
+    consumed: ['failed', 'deadLettered', 'shadowUnrecorded', 'validationFailed', 'createClaimParked', 'fenceCheckErrors', 'claimErrors', 'linkWriteErrors'],
     ignored: {
       verifyQuarantined: 'links quarantined by verification: each is also counted in `deadLettered` (consumed) and audited as a FAILED order create, so the run already reads failed',
       verifyUnresolved: 'links still awaiting a verdict: counted so an unknown is not silent, not a failure',

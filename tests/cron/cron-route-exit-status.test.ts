@@ -105,7 +105,7 @@ test('mintsoft-returns-sync: the status enum decides', async () => {
 })
 
 test('wms-order-push: failed pushes answer 500; pushes the hold refused do not; a skip is 2xx', async () => {
-  const base = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0, createClaimParked: 0, ambiguousCreateRequeued: 0 }
+  const base = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0, createClaimParked: 0, fenceCheckErrors: 0, claimErrors: 0, linkWriteErrors: 0, ambiguousCreateRequeued: 0 }
   doubles.push = { ...base, created: 2 }
   assert.equal(await statusOf(pushRoute), 200)
   doubles.push = { skipped: 'No WMS connector is enabled', ...base }
@@ -118,6 +118,13 @@ test('wms-order-push: failed pushes answer 500; pushes the hold refused do not; 
   doubles.push = { ...base, validationFailed: 1 }
   assert.equal(await statusOf(pushRoute), 500)
   doubles.push = { ...base, createClaimParked: 1 }
+  assert.equal(await statusOf(pushRoute), 500)
+  // A fence check or a create claim that threw: the order is skipped and retried, but the run could not decide it.
+  doubles.push = { ...base, fenceCheckErrors: 1 }
+  assert.equal(await statusOf(pushRoute), 500)
+  doubles.push = { ...base, claimErrors: 1 }
+  assert.equal(await statusOf(pushRoute), 500)
+  doubles.push = { ...base, linkWriteErrors: 1 }
   assert.equal(await statusOf(pushRoute), 500)
   // A pre-existing backlog is not counted again: a later healthy sweep (nothing newly parked; parked links waiting on the warehouse or an operator) is green.
   doubles.push = { ...base, created: 3, verifyUnresolved: 2, revalidated: 1, revalidateAmbiguous: 2, ambiguousCreateRequeued: 1 }
