@@ -10,6 +10,24 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### WooCommerce order sweep no longer fails when the withdrawal plugin is not active
+
+- **The order poll and reconciliation now skip an EU withdrawal status the store has not registered, instead of failing the whole run.** WooCommerce refuses any order query naming a status it does not know, so a store without the WebToffee EU Order Withdrawal Button plugin made every sweep fail and import nothing. IMS now reads the store's registered order statuses once per run and drops only the unregistered withdrawal statuses, with a WARNING in the activity log (at most every six hours) naming the plugin and saying withdrawal requests are not seen until it is active. A status you ticked under "Import order statuses" (or `completed` on reconciliation) that is not registered still refuses the run with an error; if the registered statuses cannot be read, nothing is dropped.
+- **Re-activating the plugin cannot skip orders.** While a withdrawal status is skipped, IMS records only that it was. The first run after the plugin returns reads every order currently in a withdrawal status (no date limit), imports each the normal way, and only then clears the record; a failed read holds the run and is retried.
+
+## 4.0.0 - 2026-11-13
+
+### Operator actions (breaking)
+
+Numbered 4.0.0 because these changes need operator action when Xero sync is on. Each line names the topic below that it comes from.
+
+- **Map a Xero tax type to every VAT rate that supplier bills use, and keep those rates active** (Settings > Accounting > Tax, import the purchase tax rates from Xero if needed). A supplier bill or supplier credit note whose line has no mapped tax type, or is priced on an inactive purchase tax rate, is now refused (nothing is sent to Xero) instead of posting as "No VAT". With Xero sync on, check the rate on each open purchase order and each bill still to be raised before relying on them. See *Xero accounting audit fixes: bill VAT, supplier-document tax types and payment dates*.
+- **Re-save any queued bill that has a non-vatable cost line** (one edit-and-save) so it is re-derived on the corrected rules. Same topic.
+- **Supplier credits against a reverse-charge bill, or a bill that mixes tax treatments, are raised in Xero directly.** With Xero sync on, such a credit is refused before it is claimed and stays a draft in IMS; mapping tax rates does not unblock it. Raise the credit in Xero by hand (it is not sent from IMS). Same topic.
+- **Re-save an older bill before crediting it, if the credit is refused.** A supplier credit against a bill booked before this release is refused when the order's current rates no longer reproduce the VAT that bill recorded (mapping rates does not fix this). One edit-and-save of the bill records its tax treatment; then post the credit again. Same topic.
+
+Everything else in this release is additive migrations, backend or CI changes, or behind a switch that is off by default (the EU VAT invoice treatment behind the Sales Invoices switch, and the gift-card flag cut-in, unset by default): built, switched off, no action needed.
+
 ### Merged Mintsoft orders: a cancelled order's lines are taken out of the combined order
 
 - **A cancelled (or fully refunded) IMS order that Mintsoft merged into another is now removed from the combined order automatically.** Mintsoft keeps every original line on the merged order under its original line id (confirmed live 2026-11-12, including a SKU both orders share, which stays as two separate lines). IMS now records those line ids when it pushes an order (one read-back right after the create, and again after an amendment) and, on the cancel, deletes exactly that order's lines from the combined order, reads the combined order again after each delete, proves the line is gone and every other line unchanged, tries to leave a warehouse note naming the order and the lines removed (best effort; not guaranteed), and marks the order's link cancelled. The combined order itself is never cancelled while it holds another order's lines; when the cancelled order's lines are the only ones left, it is cancelled normally.
