@@ -42,7 +42,7 @@ on:
 jobs:
   migration-scope:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -54,7 +54,7 @@ jobs:
         run: node scripts/check-prisma-schema-scope.mjs "origin/${{ github.base_ref }}" HEAD
 
   fresh-db-drift:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:16
@@ -248,7 +248,7 @@ jobs:
   # both: the four locale tests in `tests/db/reconciliation-void-mirror-contradictions.test.ts`
   # connect to `postgres`, CREATE an ICU `tr-TR` scratch database, migrate it and drop it.
   db-backed-regressions:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
       postgres:

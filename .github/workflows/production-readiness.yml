@@ -27,7 +27,7 @@ env:
 
 jobs:
   classify_changes:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       run_expensive: ${{ steps.changed-files.outputs.run_expensive }}
@@ -71,7 +71,7 @@ jobs:
   validate:
     needs: classify_changes
     if: needs.classify_changes.outputs.run_expensive == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The unit-test step alone now takes ~25-28 min and several runs hit the old 30 min cap with no
     # failing test. 45 min is headroom, not a target: shard the unit tests if a run approaches it.
     timeout-minutes: 45
@@ -96,7 +96,7 @@ jobs:
       - run: npm run validate
 
   docs-workflows:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -110,7 +110,7 @@ jobs:
   preflight-production:
     needs: classify_changes
     if: needs.classify_changes.outputs.run_expensive == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       AUTH_URL: https://localhost:3001
@@ -153,7 +153,7 @@ jobs:
   invariant-preflight:
     needs: classify_changes
     if: needs.classify_changes.outputs.run_expensive == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ims_ci
@@ -186,7 +186,7 @@ jobs:
   build:
     needs: classify_changes
     if: needs.classify_changes.outputs.run_expensive == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     # o3d-2k5r r21, Codex: THE BUILD-LEVEL CHECKS RUN HERE, BECAUSE THIS IS THE ONLY JOB THAT HAS A
     # BUILD. GitHub jobs do not share a workspace: `validate` runs the unit suite in a fresh
@@ -274,7 +274,7 @@ jobs:
   e2e-select:
     needs: classify_changes
     if: needs.classify_changes.outputs.run_expensive == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ims_ci

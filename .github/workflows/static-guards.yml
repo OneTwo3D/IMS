@@ -45,7 +45,7 @@ concurrency:
 
 jobs:
   documented-env-vars:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -58,7 +58,7 @@ jobs:
       - run: npm ci
       - run: npm run check:documented-env-vars
   wc-sync-row-predicates:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -71,7 +71,7 @@ jobs:
       - run: npm ci
       - run: npm run check:wc-sync-row-predicates
   fulfillment-requirement-seam:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -84,7 +84,7 @@ jobs:
       - run: npm ci
       - run: npm run check:fulfillment-requirement-seam
   wms-connector-boundary:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -97,7 +97,7 @@ jobs:
       - run: npm ci
       - run: npm run check:wms-connector-boundary
   migration-conventions:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     # The script's own default base is origin/development, which on a PUSH to development is HEAD itself: an
     # empty comparison that examined nothing (o3d-ok6hk). A pull request compares against its base branch; a
@@ -115,7 +115,7 @@ jobs:
       - run: npm ci
       - run: npm run check:migration-conventions
   decimal-boundaries:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -128,7 +128,7 @@ jobs:
       - run: npm ci
       - run: npm run check:decimal-boundaries
   connector-fetch-boundaries:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -141,7 +141,7 @@ jobs:
       - run: npm ci
       - run: npm run check:connector-fetch-boundaries
   system-import-capability:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
