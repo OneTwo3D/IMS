@@ -62,6 +62,11 @@ export const easRefundRefusal = (refundId: string | number, amount: string): str
   + 'Check the credit note in Xero against the WooCommerce refund amount before it is released.')
 
 /** What the operator reads when a credit note is raised on a scheme order that has no stamp. */
+/** What the operator reads when the invoice's zero-rated posting type cannot be established for a scheme credit note (the stamp was written before it was kept). The same refused, settleable row as the no-stamp case. */
+export const noInvoicedTypeRefusal = (creditNoteNumber: string): string =>
+  withLedgerCheck(`NOTHING WAS SENT. Credit note ${creditNoteNumber} is on an order sold under the EU IOSS/VOEC/DDP scheme, but IMS did not record which zero-rated Xero tax type the order's invoice was posted on, and a rate's mapping may have changed since, so it will not guess. `
+  + `This row is refused and is never sent. Check Xero for credit note ${creditNoteNumber} first. If it is not there, open the order's invoice in Xero, post the credit note by hand on the same tax type that invoice used and on the stamped VAT account (821 for IOSS and VOEC, 232 for DDP). Then record the outcome on this row with the settle action on /sync.`)
+
 export const noStampRefusal = (creditNoteNumber: string): string =>
   withLedgerCheck(`NOTHING WAS SENT. Credit note ${creditNoteNumber} is on an order sold under the EU IOSS/VOEC/DDP scheme, but the order has no recorded VAT regime (it was imported before the Sales Invoices switch was on, or its regime could not be decided), so IMS cannot tell which account its VAT was posted to and will not guess. `
   + `This row is refused and is never sent. Check Xero for credit note ${creditNoteNumber} first. If it is not there, post the credit note by hand in Xero on the same VAT account the order's invoice used (821 for IOSS and VOEC, 232 for DDP) and the zero-rated type of the order's scheme rate. Then record the outcome on this row with the settle action on /sync.`)

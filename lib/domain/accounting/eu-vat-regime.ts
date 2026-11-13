@@ -210,6 +210,8 @@ export type SchemeBasis = {
   vatTotal: string
   wooRateIds: number[]
   imsRateIds: string[]
+  /** The zero-rated Xero type the order's goods, shipping and discount are posted on, recorded WITH the stamp (write-once) so a credit note reverses what the invoice used even if a rate's mapping moves later. Absent on a stamp written before it was kept. */
+  schemePostingTaxType?: string
 }
 
 export type EuVatRegimeDecision =
@@ -452,6 +454,7 @@ export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision
       vatTotal: vatTotal.toString(),
       wooRateIds: qualifying.map((q) => q.fact.wooRateId).sort((a, b) => a - b),
       imsRateIds: [...new Set(qualifying.map((q) => q.mapped.imsRateId))].sort(),
+      schemePostingTaxType,
     },
     warnings,
   }

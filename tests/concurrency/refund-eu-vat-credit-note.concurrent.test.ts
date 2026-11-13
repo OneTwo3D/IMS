@@ -79,7 +79,7 @@ type Fixture = Awaited<ReturnType<typeof seed>>
  * One order: goods 100.00 (tax 19.00), TWO landed-cost fees 20.00 (tax 3.80) and 4.00 (tax 0.76), shipping 10.00 (tax 1.90), all at 19%; total 158.46 + ... (net 134, tax 25.46, total 159.46 is not needed: only the refunds' own figures matter).
  * `stamp`: null (never decided), 'IOSS' (stamped on 821) or 'none' (decided, outside the scheme).
  */
-async function seed(deps: Deps, opts: { stamp: 'IOSS' | 'none' | null; schemeRate: boolean }) {
+async function seed(deps: Deps, opts: { stamp: 'IOSS' | 'none' | null; schemeRate: boolean; noType?: boolean }) {
   const { db } = deps
   const { Prisma } = await import('../../app/generated/prisma/client.ts')
   const suffix = randomUUID().slice(0, 8)
@@ -100,7 +100,7 @@ async function seed(deps: Deps, opts: { stamp: 'IOSS' | 'none' | null; schemeRat
       shippingForeign: new Prisma.Decimal('10'), shippingBase: new Prisma.Decimal('10'),
       ...(opts.stamp === null ? {} : opts.stamp === 'none'
         ? { euVatRegimeStampedAt: new Date(), euVatRegimeBasis: { version: 1, outcome: 'SKIP', skipReason: 'no_scheme_vat', warnings: [] } }
-        : { euVatRegime: 'IOSS' as const, euVatLineAccount: '821', euVatRegimeStampedAt: new Date(), euVatRegimeBasis: { version: 1, outcome: 'SCHEME', scheme: { imsRateIds: [rate.id] }, warnings: [] } }),
+        : { euVatRegime: 'IOSS' as const, euVatLineAccount: '821', euVatRegimeStampedAt: new Date(), euVatRegimeBasis: { version: 1, outcome: 'SCHEME', scheme: { imsRateIds: [rate.id], ...(opts.noType ? {} : { schemePostingTaxType: 'TAX131' }) }, warnings: [] } }),
       lines: { create: [line('Widget', '100.00', '19.00', null), line('EU Customs Fee', '20.00', '3.80', 'duty_flat'), line('EU Handling Fee', '4.00', '0.76', 'uhf')] },
     },
     select: { id: true, lines: { select: { id: true, description: true } } },
@@ -234,7 +234,7 @@ test('[eu vat credit note] the account is the STAMPED one after the facts change
   t.after(async () => { await restore(); await cleanup(deps.db, fx) })
   await seedXeroList(deps.db, { TAX131: '0.000000' })
   // The order's facts now point elsewhere: a different rate, a basis that would decide DDP, and the IOSS account setting itself changed. The stamp is write-once.
-  await deps.db.salesOrder.update({ where: { id: fx.orderId }, data: { fxRateToBase: '0.5', euVatRegimeBasis: { version: 1, outcome: 'SCHEME', scheme: { imsRateIds: [fx.rate.id], intrinsicValue: '9999', fx: { rate: '0.5' } }, warnings: [] } } })
+  await deps.db.salesOrder.update({ where: { id: fx.orderId }, data: { fxRateToBase: '0.5', euVatRegimeBasis: { version: 1, outcome: 'SCHEME', scheme: { imsRateIds: [fx.rate.id], schemePostingTaxType: 'TAX131', intrinsicValue: '9999', fx: { rate: '0.5' } }, warnings: [] } } })
   await deps.db.setting.upsert({ where: { key: 'xero_eu_vat_ioss_account' }, create: { key: 'xero_eu_vat_ioss_account', value: '999' }, update: { value: '999' } })
   const { treatCreditNotePayload } = await import('../../lib/domain/sales/eu-vat-credit-note-treatment.ts')
   const refund = await deps.db.salesOrderRefund.create({
@@ -307,6 +307,30 @@ test('[eu vat credit note] a hand-recorded parked refund (Sync Exceptions) carri
     const lines = (queued!.payload as { lines: Array<{ unitAmount: number; quantity: number }> }).lines
     assert.equal(lines.reduce((sum, l) => sum + Math.round(l.unitAmount * l.quantity * 100) / 100, 0).toFixed(2), expected.toFixed(2), `stated ${String(stated)}`)
   }
+})
+
+test('[eu vat credit note] the credit note reverses what the INVOICE used: a rate whose scheme type moved to another 0% type after invoicing does not change it; a stamp that never recorded the type is a refused row to post by hand', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true)
+  const moved = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  const unknown = await seed(deps, { stamp: 'IOSS', schemeRate: true, noType: true })
+  t.after(async () => { await restore(); await cleanup(deps.db, moved); await cleanup(deps.db, unknown) })
+  await seedXeroList(deps.db, { TAX131: '0.000000', TAX999: '0.000000' })
+  await deps.db.taxRate.update({ where: { id: moved.rate.id }, data: { schemePostingTaxType: 'TAX999' } })
+  await deps.db.taxRate.update({ where: { id: unknown.rate.id }, data: { schemePostingTaxType: 'TAX999' } })
+  const ok = await deps.createRefund(moved.orderId, [itemised(moved.goods, 'Widget', 100, 19)], 'moved', undefined, { internalBypassToken: deps.bypass, externalRefundId: wooRefundId(), statedGrossForeign: 119 })
+  assert.equal(ok.success, true, ok.error)
+  const row = await creditNoteRow(deps.db, moved.orderId)
+  const lines = row!.payload!.lines as Array<{ description: string; taxType: string }>
+  assert.equal(lines.find((l) => l.description === 'Widget')?.taxType, 'TAX131', 'the type the invoice was posted on, not the rate\'s mapping now')
+  assert.equal((row!.payload!._euVatTreatment as { schemePostingTaxType: string }).schemePostingTaxType, 'TAX131')
+  const refused = await deps.createRefund(unknown.orderId, [itemised(unknown.goods, 'Widget', 100, 19)], 'unknown', undefined, { internalBypassToken: deps.bypass, externalRefundId: wooRefundId(), statedGrossForeign: 119 })
+  assert.equal(refused.success, true, refused.error)
+  const unknownRow = await creditNoteRow(deps.db, unknown.orderId)
+  const { refusedCreditNoteError } = await import('../../lib/domain/accounting/eu-vat-credit-note.ts')
+  const error = refusedCreditNoteError(unknownRow!.payload!)
+  assert.match(error ?? '', /did not record which zero-rated Xero tax type the order's invoice was posted on[\s\S]*Check Xero for credit note .* first[\s\S]*same tax type that invoice used[\s\S]*settle action on \/sync/)
+  assert.equal((await deps.db.salesOrderRefund.findUnique({ where: { id: unknownRow!.refundId }, select: { accountingRetryRequired: true } }))?.accountingRetryRequired, false)
 })
 
 test('[eu vat credit note] a CANCELLATION (the whole-order reversal) reverses the whole VAT with full lines: the stamped regime, every fee, the order\'s own tax', { skip }, async (t) => {

@@ -18,7 +18,7 @@ import { regimePolicyOf, type RegimePolicy } from '@/lib/domain/accounting/eu-va
 import { readEuVatRegimeMode, readGiftCardFlagCutIn } from '@/lib/connectors/woocommerce/sync/eu-vat-facts'
 import type { GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
 import { predictedUntaxedTotal } from '@/lib/domain/accounting/eu-vat-treatment'
-import { applyEuVatCreditNoteTreatment, noStampRefusal, refundTaxAndTotal, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
+import { applyEuVatCreditNoteTreatment, noInvoicedTypeRefusal, noStampRefusal, refundTaxAndTotal, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
 import { buildTaxTypeRateIndex, priceSnapshottedTaxIdentity } from '@/lib/domain/sales/refund-posted-tax-identity'
 
@@ -29,7 +29,7 @@ export type TreatedCreditNoteOutcome =
   | { kind: 'skipped'; why: 'switch_off' | 'not_scheme' }
   | { kind: 'treated'; payload: Record<string, unknown>; regimePolicy: RegimePolicy }
   /** The credit note cannot be raised as it is: the reason is the operator-facing sentence. */
-  | { kind: 'refused'; reason: string; /** `no_stamp`: nothing a retry can change, so the hand-off queues a REFUSED row for the operator to settle by hand; any other refusal is cleared by fixing its cause and retrying. */ code?: 'no_stamp' }
+  | { kind: 'refused'; reason: string; /** `hand_post`: nothing a retry can change, so the hand-off queues a REFUSED row for the operator to settle by hand; any other refusal is cleared by fixing its cause and retrying. */ code?: 'hand_post' }
 
 const SCHEME_CATEGORIES = new Set(['IOSS', 'VOEC'])
 const DESTINATION_LABEL = { IOSS: 'IOSS VAT refunded', VOEC: 'VOEC VAT refunded', DDP: 'DDP import VAT refunded' } as const
@@ -72,7 +72,7 @@ export async function treatCreditNotePayload(params: {
   // THE STAMP, READ AND NEVER DECIDED AGAIN.
   if (order.euVatRegimeStampedAt === null) {
     const soldOnScheme = order.lines.some((line) => SCHEME_CATEGORIES.has((line.taxRate?.reportingCategory ?? '').trim().toUpperCase()) || (line.taxRate?.schemePostingTaxType ?? '').trim() !== '')
-    return soldOnScheme ? { kind: 'refused', reason: noStampRefusal(number), code: 'no_stamp' as const } : { kind: 'skipped', why: 'not_scheme' }
+    return soldOnScheme ? { kind: 'refused', reason: noStampRefusal(number), code: 'hand_post' as const } : { kind: 'skipped', why: 'not_scheme' }
   }
   if (order.euVatRegime === null) return { kind: 'skipped', why: 'not_scheme' }
   const regime = order.euVatRegime
@@ -103,6 +103,9 @@ export async function treatCreditNotePayload(params: {
     lineKinds.push(orderLine !== undefined && orderLine.wclcFeeKind !== null ? 'marked-fee' : 'goods')
     linePostingTypes.push(refundLine.postingTaxType)
   }
+
+  // The invoice's posting type was not recorded on a refund line (its stamp predates the type being kept): a person posts it, on a refused row.
+  if (linePostingTypes.some((type) => (type ?? '').trim() === '')) return { kind: 'refused', reason: noInvoicedTypeRefusal(number), code: 'hand_post' }
 
   // The tax the refund's lines carry at their own rates (the code each line was priced under), and the net they sum to.
   const rateIndex = buildTaxTypeRateIndex(await db.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }))

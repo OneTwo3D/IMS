@@ -2384,7 +2384,7 @@ async function queueRefundAccountingActions(input: {
     accounts: { ioss: settings.euVatIossAccount ?? null, ddp: settings.euVatDdpAccount ?? null, fee: settings.euFeeAccount ?? null, rounding: settings.roundingDifferenceAccount ?? null },
     now: new Date(),
   })
-  if (creditNoteTreatment.kind === 'refused' && creditNoteTreatment.code !== 'no_stamp') {
+  if (creditNoteTreatment.kind === 'refused' && creditNoteTreatment.code !== 'hand_post') {
     // Nothing is queued and the obligation stays unmet: the refund stays marked for retry, and a retry after the cause is fixed rebuilds the credit note.
     await recordCreditNoteTreatmentRefusal({ orderId: input.orderId, refundId: input.refundId, reason: creditNoteTreatment.reason })
     ledger.account(creditNote, { queued: false, reason: 'refused', connector: settings.connector })
