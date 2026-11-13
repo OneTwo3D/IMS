@@ -4817,6 +4817,26 @@ export async function createSalesOrderRefund(
     const accountingStagingFollows = Boolean(so.revenueDeferredDate && input.accountingSettings)
     // Under the order lock this transaction holds: the stamp it reads cannot change before the lines are written. Not read at all unless the caller says the switch is on.
     const schemeSnapshot = input.euVatSchemeSnapshot === true ? await resolveSchemePostingSnapshot(tx, input.orderId) : null
+    // SCHEME REFUNDS FREEZE THEIR PRICING HERE, under the order lock: each line's VAT rate (the rate of the code it is priced under) and the gross the refund comes to. The credit note is built from these only, never from a TaxRate read later,
+    // so an accounting retry after a rate changed posts what this refund was. The gross is the source's own figure when it states one, else the lines' unrounded totals with their tax, rounded once.
+    let frozenRates: Array<string | null> | null = null
+    let frozenGross: number | null = null
+    if (schemeSnapshot?.scheme === true) {
+      const index = buildTaxTypeRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }))
+      let gross = toDecimal(0)
+      let complete = true
+      frozenRates = refundLines.map((refundLine) => {
+        const kind: 'sale' | 'shipping' | 'discount' = refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale'
+        const code = resolveRefundLineTaxIdentity(refundLine.lineId, kind).accountingTaxType
+        const priced = code ? priceSnapshottedTaxIdentity({ accountingTaxType: code, rateByTaxType: index, label: 'refund line' }) : null
+        const lineTotal = toDecimal(refundLine.totalForeign != null ? Math.round(refundLine.totalForeign * 10000) / 10000 : Math.round(refundLine.totalBase * fxRate * 10000) / 10000)
+        if (priced === null || !priced.ok) { complete = false; return null }
+        gross = gross.plus(lineTotal.times(toDecimal(1).plus(priced.rate)))
+        return priced.rate.toString()
+      })
+      if (input.statedGrossForeign != null && Number.isFinite(input.statedGrossForeign)) frozenGross = input.statedGrossForeign
+      else if (complete) frozenGross = gross.toDecimalPlaces(currencyMinorUnits(so.currency), 4).toNumber()
+    }
     const createdRefund = await tx.salesOrderRefund.create({
       data: {
         orderId: input.orderId,
@@ -4857,7 +4877,7 @@ export async function createSalesOrderRefund(
         // A binary that does not write it leaves NULL, and NULL is undecidable — never exonerated
         // by a default and never minted for it by the database.
         reversalStagingState: REVERSAL_STAGING_NOT_STAGED,
-        ...(schemeSnapshot?.scheme === true && input.statedGrossForeign != null && Number.isFinite(input.statedGrossForeign) ? { statedGrossForeign: input.statedGrossForeign } : {}),
+        ...(schemeSnapshot?.scheme === true && frozenGross !== null ? { statedGrossForeign: frozenGross } : {}),
       },
       select: { id: true },
     })
@@ -4883,7 +4903,7 @@ export async function createSalesOrderRefund(
     }
 
     const createdRefundLines: CreatedRefundLine[] = []
-    for (const refundLine of refundLines) {
+    for (const [refundLineIndex, refundLine] of refundLines.entries()) {
       const lineTotalForeign = refundLine.totalForeign != null
         ? Math.round(refundLine.totalForeign * 10000) / 10000
         : Math.round(refundLine.totalBase * fxRate * 10000) / 10000
@@ -4907,7 +4927,7 @@ export async function createSalesOrderRefund(
           accountingTaxType: taxIdentity.accountingTaxType,
           reverseCharge: taxIdentity.reverseCharge,
           lineKind,
-          ...(schemeSnapshot?.scheme === true ? { postingTaxType: schemeSnapshot.postingTaxType } : {}),
+          ...(schemeSnapshot?.scheme === true ? { postingTaxType: schemeSnapshot.postingTaxType, schemeTaxRateValue: frozenRates?.[refundLineIndex] ?? null } : {}),
         },
         select: {
           id: true,

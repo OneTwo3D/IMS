@@ -18,9 +18,8 @@ import { regimePolicyOf, type RegimePolicy } from '@/lib/domain/accounting/eu-va
 import { readEuVatRegimeMode, readGiftCardFlagCutIn } from '@/lib/connectors/woocommerce/sync/eu-vat-facts'
 import type { GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
 import { predictedUntaxedTotal } from '@/lib/domain/accounting/eu-vat-treatment'
-import { applyEuVatCreditNoteTreatment, noInvoicedTypeRefusal, noStampRefusal, refundTaxAndTotal, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
+import { applyEuVatCreditNoteTreatment, noFrozenBasisRefusal, noInvoicedTypeRefusal, noStampRefusal, refundTaxAndTotal, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
-import { buildTaxTypeRateIndex, priceSnapshottedTaxIdentity } from '@/lib/domain/sales/refund-posted-tax-identity'
 
 export type EuVatCreditNoteAccounts = { ioss: string | null; ddp: string | null; fee: string | null; rounding: string | null }
 
@@ -63,7 +62,7 @@ export async function treatCreditNotePayload(params: {
     }),
     db.salesOrderRefund.findUnique({
       where: { id: params.refundId },
-      select: { creditNoteNumber: true, source: true, statedGrossForeign: true, lines: { select: { id: true, salesOrderLineId: true, postingTaxType: true } } },
+      select: { creditNoteNumber: true, source: true, statedGrossForeign: true, lines: { select: { id: true, salesOrderLineId: true, postingTaxType: true, schemeTaxRateValue: true } } },
     }),
   ])
   if (!order || !refund) return { kind: 'refused', reason: 'the order or the refund could not be found to build its credit note' }
@@ -114,23 +113,19 @@ export async function treatCreditNotePayload(params: {
   // The invoice's posting type was not recorded on a refund line (its stamp predates the type being kept): a person posts it, on a refused row.
   if (linePostingTypes.some((type) => (type ?? '').trim() === '')) return { kind: 'refused', reason: noInvoicedTypeRefusal(number), code: 'hand_post' }
 
-  // The tax the refund's lines carry at their own rates (the code each line was priced under), and the net they sum to.
-  const rateIndex = buildTaxTypeRateIndex(await db.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }))
+  // THE FROZEN BASIS. Every figure below comes from the refund itself, snapshotted when it was created (each line's VAT rate and the refund's gross): never from a TaxRate or a setting read now, so a retry after a rate changed posts what the refund was. A refund with no frozen basis
+  // (created before it was kept, or a line whose rate could not be priced then) is posted by hand.
+  const frozenRates = params.refundLineIds.map((id) => refundLineById.get(id)?.schemeTaxRateValue ?? null)
+  const wholeOrderReversal = refund.source === 'CHARGEBACK_POLLER'
+  if (!wholeOrderReversal && (refund.statedGrossForeign === null || frozenRates.some((rate) => rate === null))) return { kind: 'refused', reason: noFrozenBasisRefusal(number), code: 'hand_post' }
   let net = toDecimal(0)
   let pricedTax = toDecimal(0)
-  // What the refund's own recorded (unrounded) line totals come to with their tax: the target when the source states no gross.
-  let rawGross = toDecimal(0)
   for (const [index, line] of lines.entries()) {
     const lineNet = predictedUntaxedTotal({ currency: payload.currency, lines: [{ quantity: line.quantity, unitAmount: line.unitAmount, accountCode: line.accountCode }] })
     if (lineNet === null) return { kind: 'refused', reason: `Credit note ${number}: an amount on line ${index + 1} cannot be read. Nothing was queued.` }
     net = net.plus(lineNet)
-    const code = (line.taxType ?? '').trim()
-    if (code === '') return { kind: 'refused', reason: `Credit note ${number}: line ${index + 1} has no tax identity, so IMS cannot work out the VAT it carries. Nothing was queued.` }
-    const priced = priceSnapshottedTaxIdentity({ accountingTaxType: code, rateByTaxType: rateIndex, label: `Credit note line ${index + 1}` })
-    if (!priced.ok) return { kind: 'refused', reason: `Credit note ${number}: ${priced.reason} Nothing was queued.` }
-    const rawNet = toDecimal(line.quantity).times(toDecimal(line.unitAmount))
-    pricedTax = pricedTax.plus(rawNet.times(priced.rate))
-    rawGross = rawGross.plus(rawNet.times(toDecimal(1).plus(priced.rate)))
+    const rate = frozenRates[index]
+    if (rate !== null && rate !== undefined) pricedTax = pricedTax.plus(toDecimal(line.quantity).times(toDecimal(line.unitAmount)).times(toDecimal(rate)))
   }
 
   // The refund's own tax total, and the amount the document must total. A whole-order reversal (the payment poller's chargeback) reverses the order's whole collected VAT.
@@ -139,7 +134,7 @@ export async function treatCreditNotePayload(params: {
     const vat: Decimal = toDecimal(order.taxForeign)
     figures = { ok: true, vatAmount: vat.toString(), refundTotal: net.plus(vat).toString() }
   } else {
-    figures = refundTaxAndTotal({ net, pricedTax, rawGross, statedGross: refund.statedGrossForeign === null ? null : toDecimal(refund.statedGrossForeign), currency: payload.currency, toleranceMinorUnits: lines.length + 1 })
+    figures = refundTaxAndTotal({ net, pricedTax, rawGross: net.plus(pricedTax), statedGross: refund.statedGrossForeign === null ? null : toDecimal(refund.statedGrossForeign), currency: payload.currency, toleranceMinorUnits: lines.length + 1 })
   }
   if (!figures.ok) return { kind: 'refused', reason: `Credit note ${number}: ${figures.reason}. Nothing was queued.` }
 

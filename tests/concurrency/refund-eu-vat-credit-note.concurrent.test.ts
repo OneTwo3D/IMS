@@ -238,7 +238,7 @@ test('[eu vat credit note] the account is the STAMPED one after the facts change
   await deps.db.setting.upsert({ where: { key: 'xero_eu_vat_ioss_account' }, create: { key: 'xero_eu_vat_ioss_account', value: '999' }, update: { value: '999' } })
   const { treatCreditNotePayload } = await import('../../lib/domain/sales/eu-vat-credit-note-treatment.ts')
   const refund = await deps.db.salesOrderRefund.create({
-    data: { orderId: fx.orderId, creditNoteNumber: `CN-FX-${randomUUID().slice(0, 6)}`, totalForeign: '100', totalBase: '100', totalsBasis: 'NET', source: 'MANUAL_UI', lines: { create: [{ salesOrderLineId: fx.goods, description: 'Widget', qty: 1, unitPriceForeign: '100', unitPriceBase: '100', totalForeign: '100', totalBase: '100', accountingTaxType: fx.rate.accountingTaxType, lineKind: 'sale', postingTaxType: 'TAX131' }] } },
+    data: { orderId: fx.orderId, creditNoteNumber: `CN-FX-${randomUUID().slice(0, 6)}`, totalForeign: '100', totalBase: '100', totalsBasis: 'NET', source: 'MANUAL_UI', statedGrossForeign: '119', lines: { create: [{ salesOrderLineId: fx.goods, description: 'Widget', qty: 1, unitPriceForeign: '100', unitPriceBase: '100', totalForeign: '100', totalBase: '100', accountingTaxType: fx.rate.accountingTaxType, lineKind: 'sale', postingTaxType: 'TAX131', schemeTaxRateValue: '0.19' }] } },
     select: { id: true, lines: { select: { id: true } } },
   })
   const payload = { creditNoteNumber: 'CN-FX', currency: deps.baseCurrency, lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: fx.rate.accountingTaxType }], lineAmountsIncludeTax: false }
@@ -246,7 +246,7 @@ test('[eu vat credit note] the account is the STAMPED one after the facts change
   assert.equal(outcome.kind, 'treated')
   if (outcome.kind !== 'treated') return
   const vat = (outcome.payload.lines as Array<{ noTaxKind?: string; accountCode: string; unitAmount: number }>).find((l) => l.noTaxKind === 'eu-vat-recovery')
-  assert.deepEqual([vat?.accountCode, vat?.unitAmount], ['821', 19], 'the VAT line is on the account stamped at the invoice, at the refund\'s own tax (no stated gross: the line\'s own rate)')
+  assert.deepEqual([vat?.accountCode, vat?.unitAmount], ['821', 19], 'the VAT line is on the account stamped at the invoice, at the refund\'s own tax (the frozen gross)')
   assert.equal((outcome.regimePolicy as Record<string, string>).ioss, '999', 'the policy records the setting in force; the account is not taken from it')
 })
 
@@ -393,6 +393,39 @@ test('[eu vat credit note] the refused-row payload is a dedicated record, and on
   assert.equal(refusedCreditNoteError(built), 'why')
   // A postable payload (lines, tax types, no marker) is never refused by this route, so the exemption cannot swallow a real credit note.
   assert.equal(refusedCreditNoteError({ creditNoteNumber: 'CN-2', lines: [{ description: 'W', quantity: 1, unitAmount: 1, accountCode: '200', taxType: 'X' }] }), null)
+})
+
+test('[eu vat credit note] a MANUAL refund is priced once, at creation: the rate changing before the accounting retry does not change the credit note; a refund with no frozen basis is a refused hand-post row', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true)
+  const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx) })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  const result = await deps.createRefund(fx.orderId, [itemised(fx.goods, 'Widget', 100, 19)], 'manual', undefined, { internalBypassToken: deps.bypass })
+  assert.equal(result.success, true, result.error)
+  const row = await creditNoteRow(deps.db, fx.orderId)
+  const first = row!.payload!.lines as Array<{ noTaxKind?: string; unitAmount: number }>
+  assert.equal(first.find((l) => l.noTaxKind === 'eu-vat-recovery')?.unitAmount, 19)
+  const frozen = await deps.db.salesOrderRefund.findUnique({ where: { id: row!.refundId }, select: { statedGrossForeign: true, source: true, lines: { select: { id: true, schemeTaxRateValue: true } } } })
+  assert.equal(frozen?.source, 'MANUAL_UI')
+  assert.equal(frozen?.statedGrossForeign?.toString(), '119')
+  assert.equal(frozen?.lines[0]?.schemeTaxRateValue?.toString(), '0.19')
+  // The rate changes to 20% before the accounting retry rebuilds the credit note.
+  await deps.db.taxRate.update({ where: { id: fx.rate.id }, data: { rate: '0.2' } })
+  const { treatCreditNotePayload } = await import('../../lib/domain/sales/eu-vat-credit-note-treatment.ts')
+  const rebuilt = { creditNoteNumber: 'CN-RETRY', currency: deps.baseCurrency, lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: fx.rate.accountingTaxType }], lineAmountsIncludeTax: false }
+  const outcome = await treatCreditNotePayload({ refundId: row!.refundId, orderId: fx.orderId, payload: rebuilt, refundLineIds: [frozen!.lines[0]!.id], connector: 'xero', accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' }, now: new Date() })
+  assert.equal(outcome.kind, 'treated')
+  if (outcome.kind !== 'treated') return
+  const lines = outcome.payload.lines as Array<{ noTaxKind?: string; unitAmount: number; quantity: number }>
+  assert.equal(lines.find((l) => l.noTaxKind === 'eu-vat-recovery')?.unitAmount, 19, 'the original 19%, not 20%')
+  assert.equal(lines.reduce((sum, l) => sum + l.unitAmount * l.quantity, 0).toFixed(2), '119.00')
+  // A refund created before the basis was frozen: refused, to be posted by hand.
+  await deps.db.salesOrderRefundLine.update({ where: { id: frozen!.lines[0]!.id }, data: { schemeTaxRateValue: null } })
+  const old = await treatCreditNotePayload({ refundId: row!.refundId, orderId: fx.orderId, payload: rebuilt, refundLineIds: [frozen!.lines[0]!.id], connector: 'xero', accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' }, now: new Date() })
+  assert.equal(old.kind, 'refused')
+  assert.equal(old.kind === 'refused' && old.code, 'hand_post')
+  assert.match(old.kind === 'refused' ? old.reason : '', /did not record the VAT rate and amount it was priced at[\s\S]*settle action on \/sync/)
 })
 
 test('[eu vat credit note] a CANCELLATION (the whole-order reversal) reverses the whole VAT with full lines: the stamped regime, every fee, the order\'s own tax', { skip }, async (t) => {

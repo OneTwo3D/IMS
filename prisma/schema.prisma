@@ -2487,6 +2487,8 @@ model SalesOrderRefundLine {
   /// (which stays the rate's own code and is never sent for such a line). Written only while the Sales Invoices switch is on AND the order's stamped regime
   /// is a scheme; NULL on every other line and on every row written before the column existed. A scheme credit note with a NULL here refuses.
   postingTaxType   String?  @map("posting_tax_type")
+  /// The VAT rate (a fraction, 0.19 = 19%) the line was priced at when the refund was created, frozen with the posting type so an accounting retry never re-prices it from a TaxRate that has since changed. Written under the same conditions as `postingTaxType`; NULL when the line's rate could not be priced then, and on every older row.
+  schemeTaxRateValue Decimal? @db.Decimal(9, 6) @map("scheme_tax_rate_value")
 
   refund          SalesOrderRefund @relation(fields: [refundId], references: [id])
   salesOrderLine  SalesOrderLine?  @relation(fields: [salesOrderLineId], references: [id], onDelete: SetNull)
