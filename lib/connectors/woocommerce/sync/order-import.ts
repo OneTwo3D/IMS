@@ -82,7 +82,9 @@ import { startWcIncumbentEvidence } from '@/lib/domain/incumbent-evidence/record
 import { isWcStatus, readWcOrderStatus } from './status-mapping'
 import type { WcAdmissionRefusalReason } from './order-admission'
 import {
+  normaliseWcOrderStatus,
   parseWcSyncOrderStatuses,
+  reconcileWcPullStatusesWithRegistered,
   resolveWcPullStatuses,
   WC_NO_STATUSES_SELECTED_MESSAGE,
   WC_SYNC_ORDER_STATUSES_SETTING_KEY,
@@ -4285,6 +4287,42 @@ export async function getWcPullStatuses(route: WcOrderPullRoute): Promise<string
 }
 
 /**
+ * The status slugs the store has REGISTERED, from `GET /reports/orders/totals` (read-only; one row
+ * per registered order status, slug without the `wc-` prefix).
+ *
+ * `null` means "could not be read" — a transport or API error, or an answer that is not a usable
+ * list (an empty list is not usable: every store registers at least `pending`). Callers FAIL
+ * CLOSED on null: the status list is used exactly as configured, so an unreadable answer can never
+ * cause a status to be silently dropped. Read once per sweep run, not per page.
+ */
+async function readRegisteredWcStatuses(): Promise<string[] | null> {
+  try {
+    const { data, error } = await wcFetch('/reports/orders/totals')
+    if (error || !Array.isArray(data)) return null
+    const slugs = data
+      .map((row) => (row && typeof row === 'object' ? normaliseWcOrderStatus((row as { slug?: unknown }).slug) : ''))
+      .filter((slug) => slug !== '')
+    return slugs.length > 0 ? slugs : null
+  } catch {
+    return null
+  }
+}
+
+/** Rate limit for the "withdrawal plugin inactive" warning: a 5-minute sweep must not write 288 a day. */
+const WC_WITHDRAWAL_UNREGISTERED_WARN_INTERVAL_MS = 6 * 60 * 60 * 1000
+const lastWithdrawalUnregisteredWarnAt = new Map<string, number>()
+
+/** Test hook: forget the rate-limit memory. */
+export function resetWcWithdrawalUnregisteredWarnings(): void {
+  lastWithdrawalUnregisteredWarnAt.clear()
+}
+
+/** The outage marker: set while a withdrawal status is dropped, cleared after the recovery read (see syncNewWcOrders). */
+function wcCursorWithdrawalDroppedKey(cursorKey: string): string {
+  return `${cursorKey}_withdrawal_dropped`
+}
+
+/**
  * WHERE THE PULL CURSORS LIVE, and what makes one valid (o3d-tj6v r4).
  *
  * `last_wc_order_sync_at` / `last_wc_order_reconcile_at` become `?modified_after=` on the next
@@ -4381,7 +4419,7 @@ export async function syncNewWcOrders(
   // the initial import cannot drift away from it (see order-status-filter.ts).
   const { getWithdrawalStatuses } = await import('./withdrawal')
   const cursorStatusesKey = wcCursorStatusesKey(cursorKey)
-  const [lastSyncSetting, cursorStatusesSetting, refusedSinceSetting, existingOrder, statuses, wdraw] = await Promise.all([
+  const [lastSyncSetting, cursorStatusesSetting, refusedSinceSetting, existingOrder, configuredPullStatuses, wdraw] = await Promise.all([
     db.setting.findUnique({ where: { key: cursorKey } }),
     db.setting.findUnique({ where: { key: cursorStatusesKey } }),
     db.setting.findUnique({ where: { key: WC_ORDER_ADMISSION_REFUSED_SINCE_KEY } }),
@@ -4393,8 +4431,69 @@ export async function syncNewWcOrders(
   // No statuses selected is a real instruction, not an unset setting: fetch
   // nothing. Passing an empty list through to `status=` would ask WooCommerce
   // for EVERY status, which is the opposite of what was configured.
-  if (statuses.length === 0) {
+  if (configuredPullStatuses.length === 0) {
     return { synced: 0, skipped: 0, errors: [WC_NO_STATUSES_SELECTED_MESSAGE] }
+  }
+
+  // REGISTERED STATUSES. WooCommerce rejects the whole `/orders?status=` call (400
+  // rest_invalid_param) when one slug is not registered, so a store without the EU withdrawal
+  // plugin could not be swept at all while the withdrawal statuses are on the list. Resolve the
+  // list against the store's registered statuses, ONCE for the run:
+  //   - an unregistered WITHDRAWAL status that IMS added itself is dropped, with a warning;
+  //   - an unregistered CORE status (the operator's selection, or `completed` on reconcile) refuses
+  //     the run, as WooCommerce itself would have;
+  //   - an unreadable registered list changes nothing (fail closed: no silent drop).
+  const configuredSelection = parseWcSyncOrderStatuses(
+    (await db.setting.findUnique({ where: { key: WC_SYNC_ORDER_STATUSES_SETTING_KEY } }))?.value,
+  )
+  const registered = await readRegisteredWcStatuses()
+  const resolution = reconcileWcPullStatusesWithRegistered(configuredPullStatuses, configuredSelection, wdraw, registered)
+  if (resolution.missingCore.length > 0) {
+    const message = `WooCommerce does not have the order status${resolution.missingCore.length === 1 ? '' : 'es'} `
+      + `${resolution.missingCore.join(', ')} registered, so the ${mode === 'poll' ? 'order poll' : 'order reconciliation'} did not run. `
+      + 'Untick it under Sync -> WooCommerce -> Order Sync -> "Import order statuses", or register the status in WooCommerce.'
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_order_sync_status_unregistered',
+      tag: 'sync',
+      level: 'ERROR',
+      description: message,
+      metadata: { mode, missing: resolution.missingCore },
+      resolveUser: false,
+    }).catch(() => undefined)
+    return { synced: 0, skipped: 0, errors: [message] }
+  }
+  const droppedWithdrawal = resolution.droppedWithdrawal
+  const statuses = resolution.statuses
+
+  // OUTAGE MARKER (withdrawal statuses dropped). While a withdrawal status is dropped, the only thing
+  // recorded is THAT it was dropped: `<cursorKey>_withdrawal_dropped`, written with the cursor in the
+  // commit below. Its value (the time of the first drop) is informational; correctness never reads
+  // it as a position. That removes the "which floor?" question entirely: when the status is
+  // registered again, the sweep runs a ONE-OFF, status-scoped read of exactly the re-registered
+  // withdrawal statuses with NO modified-after bound (see `recoveryDue` below), so an order that
+  // entered a withdrawal status at any time, however long ago, is seen whatever any cursor did.
+  // Dropping is therefore allowed whenever the plugin is absent, with no special case for a first
+  // deploy or a missing cursor.
+  const droppedSinceKey = wcCursorWithdrawalDroppedKey(cursorKey)
+  const droppedSinceSetting = await db.setting.findUnique({ where: { key: droppedSinceKey } })
+  if (droppedWithdrawal.length > 0) {
+    const lastWarnedAt = lastWithdrawalUnregisteredWarnAt.get(cursorKey) ?? 0
+    if (Date.now() - lastWarnedAt >= WC_WITHDRAWAL_UNREGISTERED_WARN_INTERVAL_MS) {
+      lastWithdrawalUnregisteredWarnAt.set(cursorKey, Date.now())
+      await logActivity({
+        entityType: 'SYNC',
+        action: 'wc_order_sync_withdrawal_status_unregistered',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `WooCommerce does not have the EU withdrawal status${droppedWithdrawal.length === 1 ? '' : 'es'} `
+          + `${droppedWithdrawal.join(', ')} registered. The "EU Order Withdrawal Button" plugin (WebToffee) is not active on the store. `
+          + `The ${mode === 'poll' ? 'order poll' : 'order reconciliation'} skips ${droppedWithdrawal.length === 1 ? 'that status' : 'those statuses'} and carries on, `
+          + 'so customer withdrawal requests are not seen until the plugin is active.',
+        metadata: { mode, cursorKey, droppedWithdrawalStatuses: droppedWithdrawal },
+        resolveUser: false,
+      }).catch(() => undefined)
+    }
   }
 
   // After a transaction reset or on a fresh install, there is nothing local to
@@ -4407,10 +4506,20 @@ export async function syncNewWcOrders(
   // not in the list the cursor was earned under is in it now, rewind to the earliest refusal we
   // have ever recorded. Bounded by that watermark rather than reaching back to the whole history,
   // and taken only on the run after the selection actually changed.
+  //
+  // The fingerprint records the RESOLVED list (what was actually asked of WooCommerce). A withdrawal
+  // status coming back is NOT a selection widening and never rewinds the cursor: it is recovered by
+  // the status-scoped read instead, so an ancient refusal watermark can never drag a withdrawal-only
+  // change past the page-walk ceiling.
   const cursorStatuses = parseStoredStatusList(cursorStatusesSetting?.value)
-  const widened = cursorStatuses !== null && statuses.some((status) => !cursorStatuses.includes(status))
+  const withdrawalSlugs = new Set(
+    [wdraw.submitted, wdraw.approved].map(normaliseWcOrderStatus).filter((slug) => slug && !configuredSelection.includes(slug)),
+  )
+  const selectionWidened = cursorStatuses !== null
+    && statuses.some((status) => !cursorStatuses.includes(status) && !withdrawalSlugs.has(status))
   const refusedSinceMs = refusedSinceSetting?.value ? Date.parse(refusedSinceSetting.value) : NaN
-  if (lastSync && widened && Number.isFinite(refusedSinceMs) && refusedSinceMs < Date.parse(lastSync)) {
+  if (lastSync && selectionWidened && Number.isFinite(refusedSinceMs) && refusedSinceMs < Date.parse(lastSync)) {
+    const previousCursor = lastSync
     lastSync = refusedSinceSetting!.value
     await logActivity({
       entityType: 'SYNC',
@@ -4420,33 +4529,44 @@ export async function syncNewWcOrders(
       description: `The "Import order statuses" selection widened to ${statuses.join(', ')}, so the ${mode} sweep `
         + `re-reads WooCommerce from ${lastSync} — the earliest order the previous selection turned away. `
         + 'Orders that were skipped while their status was unselected are imported by this run.',
-      metadata: { mode, cursorKey, previousStatuses: cursorStatuses, statuses, rewoundTo: lastSync },
+      metadata: { mode, cursorKey, previousStatuses: cursorStatuses, statuses, rewoundTo: lastSync, previousCursor },
       resolveUser: false,
     })
   }
+
+  // RECOVERY READ. The outage marker is set and a withdrawal status is registered again: read the
+  // orders currently in those statuses, with no modified-after, to an empty page, through the same
+  // import path as the sweep below (withdrawal handling included). The set of orders sitting in a
+  // withdrawal status is small, so the page ceiling is not a practical limit; if it is hit anyway the
+  // run is refused loudly. KNOWN, ACCEPTED LIMIT: the read finds only orders still IN a withdrawal status. An order rejected back to
+  // another status during the outage is fetched by the ordinary sweep through its new date_modified, and an approved one is still in
+  // the withdrawn status when recovery runs. The marker is cleared only in the commit, which is reached only after this
+  // read ended on an empty page with no error, so a failed read leaves it set and retries next run.
+  const recoverySlugs = droppedSinceSetting ? statuses.filter((status) => withdrawalSlugs.has(status)) : []
+  const recoveryDue = recoverySlugs.length > 0
+  let recoveryComplete = false
 
   // Fetch orders page by page — ENDING ON AN EMPTY PAGE, not on `x-wp-totalpages` (o3d-xnwu).
   // `totalPages` is a header, and `readWcCountHeader` answers the caller's default of 1 for an
   // absent one; ending on it let a store that sends none truncate this sweep to 100 orders with no
   // error, after which the cursor below advanced past everything it had never asked for.
+  const walkOrders = async (statusList: string[], modifiedAfter: string | null): Promise<{ endedOnEmptyPage: boolean; page: number }> => {
   let page = 1
-  let totalPages = 1
   let endedOnEmptyPage = false
 
   while (page <= MAX_WC_PAGE_WALK_PAGES) {
     const params: Record<string, string> = {
-      status: statuses.join(','),
+      status: statusList.join(','),
       per_page: '100',
       page: String(page),
       orderby: 'date',
       order: 'asc',
     }
-    if (lastSync) params.modified_after = lastSync
+    if (modifiedAfter) params.modified_after = modifiedAfter
 
-    const { data, totalPages: tp, error } = await wcFetch('/orders', params)
+    const { data, error } = await wcFetch('/orders', params)
     if (error) { result.errors.push(error); break }
 
-    totalPages = tp
     const orders = data as WcFullOrder[]
 
     // THE ONLY PROOF OF AN ENDING (o3d-xnwu). Before any work, so it costs one request and imports
@@ -4551,6 +4671,23 @@ export async function syncNewWcOrders(
 
     page++
   }
+  return { endedOnEmptyPage, page }
+  }
+
+  // The recovery read runs first. If it fails, the sweep below does not run (the run is held either way).
+  if (recoveryDue) {
+    const recovery = await walkOrders(recoverySlugs, null)
+    if (result.errors.length === 0 && !recovery.endedOnEmptyPage) {
+      result.errors.push(
+        `The read of orders in the withdrawal statuses ${recoverySlugs.join(', ')} did not reach an empty page within ${MAX_WC_PAGE_WALK_PAGES} pages, so the ${mode === 'poll' ? 'order poll' : 'order reconciliation'} was refused.`,
+      )
+    }
+    recoveryComplete = result.errors.length === 0
+  }
+  const walked = result.errors.length === 0
+    ? await walkOrders(statuses, lastSync)
+    : { endedOnEmptyPage: false, page: 1 }
+  const { endedOnEmptyPage, page } = walked
 
   // A truncated read is a fetch error by another name, so it goes in `errors` and the cursor below
   // is held (o3d-xnwu). The `break` on a fetch error above pushed its own, so this only fires on a
@@ -4579,32 +4716,77 @@ export async function syncNewWcOrders(
   if (result.errors.length === 0) {
     const now = new Date().toISOString()
     const fingerprint = JSON.stringify([...statuses].sort())
-    await db.$transaction([
-      db.setting.upsert({
+    // THE COMMIT IS CONDITIONAL ON THE STATE THIS RUN STARTED FROM. Two sweeps can overlap on one
+    // cursor (a manual reconcile and the scheduled one). A slow run that read the full fingerprint
+    // and then commits AFTER a narrowed run would restore the full fingerprint while the outage
+    // marker the narrowed run wrote stays: the plugin coming back would then look like no widening
+    // and nothing would rewind. So the commit takes a transaction-scoped advisory lock on this
+    // cursor, re-reads the fingerprint and the outage marker, and writes
+    // NOTHING unless both are what this run read at its start. A superseded run costs one
+    // re-fetch next time; it never writes a stale fact.
+    //
+    // The CURSOR VALUE is deliberately not compared: order and refund webhooks advance it
+    // (advanceWcOrderSyncCursor) on their own, and comparing it would make nearly every sweep look
+    // superseded. The fingerprint and the marker are never excluded: a concurrent sweep that narrowed
+    // the list or set/cleared the marker is always caught by them.
+    const committed = await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${cursorKey}))`
+      const current = await tx.setting.findMany({ where: { key: { in: [cursorStatusesKey, droppedSinceKey] } } })
+      const valueOf = (key: string): string | null => current.find((row) => row.key === key)?.value ?? null
+      if (
+        valueOf(cursorStatusesKey) !== (cursorStatusesSetting?.value ?? null)
+        || valueOf(droppedSinceKey) !== (droppedSinceSetting?.value ?? null)
+      ) return false
+      await tx.setting.upsert({
         where: { key: cursorKey },
         create: { key: cursorKey, value: now },
         update: { value: now },
-      }),
+      })
       // Written WITH the cursor, in one transaction: a cursor and the selection it was earned
       // under are one fact, and a cursor advanced without its fingerprint would make the next
       // widening undetectable.
-      db.setting.upsert({
+      await tx.setting.upsert({
         where: { key: cursorStatusesKey },
         create: { key: cursorStatusesKey, value: fingerprint },
         update: { value: fingerprint },
-      }),
+      })
+      // Outage bookkeeping, in the same transaction for the same reason. While a withdrawal status is
+      // dropped the marker is set (keeping its first value); it is cleared only when this run's
+      // recovery read ended cleanly on an empty page.
+      if (droppedWithdrawal.length > 0) {
+        const markerValue = droppedSinceSetting?.value ?? now
+        await tx.setting.upsert({
+          where: { key: droppedSinceKey },
+          create: { key: droppedSinceKey, value: markerValue },
+          update: { value: markerValue },
+        })
+      } else if (droppedSinceSetting && recoveryComplete) {
+        await tx.setting.deleteMany({ where: { key: droppedSinceKey } })
+      }
       // The sweep's LAST-SUCCESS stamp (read-sync liveness), in the SAME transaction as the cursor: it
       // exists only because this branch is reached - the walk ended on an empty page with no error -
       // so a sweep that failed, or ran out of ceiling, or fetched nothing because of an error, can
       // never advance it. It is separate from the cursor on purpose: an admitted webhook delivery
       // also advances `last_wc_order_sync_at` (advanceWcOrderSyncCursor), so the cursor cannot say
       // whether the SWEEP is alive. A clean sweep that found no new orders reaches here and counts.
-      db.setting.upsert({
+      await tx.setting.upsert({
         where: { key: WC_ORDER_SWEEP_LAST_SUCCESS_SETTING },
         create: { key: WC_ORDER_SWEEP_LAST_SUCCESS_SETTING, value: now },
         update: { value: now },
-      }),
-    ])
+      })
+      return true
+    })
+    if (!committed) {
+      await logActivity({
+        entityType: 'SYNC',
+        action: 'wc_order_sync_superseded',
+        tag: 'sync',
+        level: 'INFO',
+        description: `The ${mode} sweep finished, but another sweep of the same orders committed first, so this run left the sweep position unchanged. The next run re-reads from the true position.`,
+        metadata: { mode, cursorKey },
+        resolveUser: false,
+      }).catch(() => undefined)
+    }
   }
 
   if (result.synced > 0) {

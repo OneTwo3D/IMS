@@ -49,7 +49,12 @@ let resolution: { kind: string; id?: string } = { kind: 'one', id: 'mintsoft' }
 let probeImpl: ((reference: string) => Promise<string>) | null = async () => 'ABSENT'
 
 const orderDb: Record<string, unknown> = {
-  setting: { findUnique: async ({ where }: { where: { key: string } }) => (settings.has(where.key) ? { key: where.key, value: settings.get(where.key) } : null), upsert },
+  setting: {
+    findUnique: async ({ where }: { where: { key: string } }) => (settings.has(where.key) ? { key: where.key, value: settings.get(where.key) } : null),
+    findMany: async ({ where }: { where: { key: { in: string[] } } }) => where.key.in.flatMap((key) => (settings.has(key) ? [{ key, value: settings.get(key) }] : [])),
+    deleteMany: async ({ where }: { where: { key: string } }) => { settings.delete(where.key); return { count: 1 } },
+    upsert,
+  },
   salesOrder: {
     findFirst: async () => ({ id: 'so-1' }),
     findUnique: async () => ({ erasedAt: null }),
@@ -74,7 +79,15 @@ const orderDb: Record<string, unknown> = {
   $queryRaw: async () => [],
   $transaction: async (ops: Array<Promise<unknown>> | ((tx: unknown) => Promise<unknown>)) => {
     // The status sweep's snapshot write is an interactive transaction (order lock, erasure marker, upsert).
-    if (typeof ops === 'function') return ops(orderDb)
+    if (typeof ops === 'function') {
+      // The WooCommerce sweep's commit is the same kind of transaction: the keys it upserted while the
+      // function ran are ONE batch, committed together.
+      const before = upserts.length
+      const outcome = await ops(orderDb)
+      const keys = upserts.slice(before) as string[]
+      if (keys.includes('last_wc_order_sync_at') || keys.includes('last_wc_order_reconcile_at')) batches.push(keys)
+      return outcome
+    }
     // The statements are already built when $transaction receives them; what it was handed is what
     // they resolve to, so the batch is read from the results, not from a before/after slice.
     const done = (await Promise.all(ops)) as Array<{ key: string }>

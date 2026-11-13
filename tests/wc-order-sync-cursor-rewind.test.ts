@@ -58,14 +58,17 @@ mock.module('@/lib/connectors/woocommerce/api', {
   },
 })
 
+const sweepDb: Record<string, unknown> = {}
 mock.module('@/lib/db', {
   namedExports: {
-    db: {
+    db: Object.assign(sweepDb, {
       setting: {
         findUnique: async ({ where }: { where: { key: string } }) => {
           const value = state.settings.get(where.key)
           return value === undefined ? null : { key: where.key, value }
         },
+        findMany: async ({ where }: { where: { key: { in: string[] } } }) =>
+          where.key.in.flatMap((key) => (state.settings.has(key) ? [{ key, value: state.settings.get(key)! }] : [])),
         upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => {
           state.upserts.push({ key: where.key, value: create.value })
           state.settings.set(where.key, create.value)
@@ -73,9 +76,10 @@ mock.module('@/lib/db', {
         },
       },
       salesOrder: { findFirst: async () => ({ id: 'so-any' }) },
-      // The sweep writes the cursor and its fingerprint as ONE fact; the double runs the batch.
-      $transaction: async (operations: Array<Promise<unknown>>) => Promise.all(operations),
-    },
+      $queryRaw: async () => [],
+      // The sweep writes the cursor and its fingerprint as ONE fact, in one interactive transaction.
+      $transaction: async (run: (tx: unknown) => Promise<unknown>) => run(sweepDb),
+    }),
   },
 })
 

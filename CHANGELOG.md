@@ -30,6 +30,15 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 - **A failure a call returns is no longer thrown away.** The FX refresh ignored the result of the connector push fan-out, which returns a WooCommerce push error (and logs it FAILED) without throwing, so the fx-rates cron answered 200. The refresh now carries `connectorPushFailures` (and `connectorPushHeld` for pushes the outbound-write hold refused, which stay 200) and `pendingWcOrderRetryFailures` (the retry of orders waiting for rates threw) into its result; the mapping reads both failure counts. The WooCommerce reconcile likewise carried only a throw of the refund stock correction queueing, not the per-refund `failed` count it returns; that count now reaches the result. A new test reads every cron route's module graph and fails on any other call that discards a failure-carrying result unless it is justified.
 - **Nothing else recorded changes.** `cron_runs` still shows `failed` for a held-only run, with the held texts as the reason. Routes that did not write a run row are now classified from their result by the same rules; `accounting-fx-revaluation` now answers 500 (was 400) when the revaluation does not succeed. A test reads every cron route and fails if one builds its own response. The contract is in `docs/installation.md` (Cron Jobs).
 
+### CI: pin GitHub runners to Ubuntu 24.04
+
+- **Fixed: CI broke when GitHub moved `ubuntu-latest` to Ubuntu 26.04** (runner image ubuntu-26.04, 2026-11-13). Playwright does not support Chromium there (the e2e job failed to install browsers) and the deploy-script re-fence tests failed. Every workflow job now runs on `ubuntu-24.04`, the image all of CI passed on until then. CI only; no behaviour change.
+
+### WooCommerce order sweep no longer fails when the withdrawal plugin is not active
+
+- **The order poll and reconciliation now skip an EU withdrawal status the store has not registered, instead of failing the whole run.** WooCommerce refuses any order query naming a status it does not know, so a store without the WebToffee EU Order Withdrawal Button plugin made every sweep fail and import nothing. IMS now reads the store's registered order statuses once per run and drops only the unregistered withdrawal statuses, with a WARNING in the activity log (at most every six hours) naming the plugin and saying withdrawal requests are not seen until it is active. A status you ticked under "Import order statuses" (or `completed` on reconciliation) that is not registered still refuses the run with an error; if the registered statuses cannot be read, nothing is dropped.
+- **Re-activating the plugin cannot skip orders.** While a withdrawal status is skipped, IMS records only that it was. The first run after the plugin returns reads every order currently in a withdrawal status (no date limit), imports each the normal way, and only then clears the record; a failed read holds the run and is retried.
+
 ## 4.0.0 - 2026-11-13
 
 ### Operator actions (breaking)
