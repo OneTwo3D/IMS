@@ -10,6 +10,11 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### WooCommerce order sweep no longer fails when the withdrawal plugin is not active
+
+- **The order poll and reconciliation now skip an EU withdrawal status the store has not registered, instead of failing the whole run.** WooCommerce refuses any order query naming a status it does not know, so a store without the WebToffee EU Order Withdrawal Button plugin made every sweep fail and import nothing. IMS now reads the store's registered order statuses once per run and drops only the unregistered withdrawal statuses, with a WARNING in the activity log (at most every six hours) naming the plugin and saying withdrawal requests are not seen until it is active. A status you ticked under "Import order statuses" (or `completed` on reconciliation) that is not registered still refuses the run with an error; if the registered statuses cannot be read, nothing is dropped.
+- **Re-activating the plugin cannot skip orders.** While a withdrawal status is skipped, IMS records only that it was. The first run after the plugin returns reads every order currently in a withdrawal status (no date limit), imports each the normal way, and only then clears the record; a failed read holds the run and is retried.
+
 ## 4.0.0 - 2026-11-13
 
 ### Operator actions (breaking)

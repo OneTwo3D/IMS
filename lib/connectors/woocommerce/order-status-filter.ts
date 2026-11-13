@@ -131,6 +131,56 @@ export function resolveWcPullStatuses(
 }
 
 /**
+ * The result of checking a pull route's status list against the statuses the store has registered.
+ *
+ * `statuses` is what may safely be asked for; `droppedWithdrawal` are withdrawal statuses taken
+ * out because the store does not register them (the EU withdrawal plugin is inactive);
+ * `missingCore` are statuses the operator selected (or that the route always needs, such as
+ * `completed` on the reconcile sweeps) that the store does not register. A non-empty `missingCore`
+ * means the run must be refused: dropping one would silently import less than was asked for.
+ */
+export interface WcRegisteredStatusResolution {
+  statuses: string[]
+  droppedWithdrawal: string[]
+  missingCore: string[]
+}
+
+/**
+ * Check a resolved pull list against the store's registered status slugs.
+ *
+ * WooCommerce rejects the WHOLE `/orders?status=a,b` request with 400 `rest_invalid_param` when any
+ * one slug is not registered, so a store without the EU withdrawal plugin cannot be swept at all
+ * while the withdrawal statuses are on the list.
+ *
+ * ONLY a withdrawal status that IMS added on its own is droppable. A status the operator ticked
+ * (even one that happens to be a withdrawal slug) is core, as is anything a route adds for its own
+ * reasons. `registered === null` means the registered list could not be read: FAIL CLOSED, change
+ * nothing, so an unreadable list never causes a silent drop.
+ */
+export function reconcileWcPullStatusesWithRegistered(
+  statuses: readonly string[],
+  configured: readonly string[],
+  withdrawal: { submitted: string; approved: string },
+  registered: readonly string[] | null,
+): WcRegisteredStatusResolution {
+  if (registered === null) return { statuses: [...statuses], droppedWithdrawal: [], missingCore: [] }
+  const known = new Set(registered.map(normaliseWcOrderStatus))
+  const selected = new Set(configured.map(normaliseWcOrderStatus))
+  const droppable = new Set(
+    [withdrawal.submitted, withdrawal.approved].map(normaliseWcOrderStatus).filter((slug) => slug && !selected.has(slug)),
+  )
+  const kept: string[] = []
+  const droppedWithdrawal: string[] = []
+  const missingCore: string[] = []
+  for (const status of statuses) {
+    if (known.has(status)) kept.push(status)
+    else if (droppable.has(status)) droppedWithdrawal.push(status)
+    else missingCore.push(status)
+  }
+  return { statuses: kept, droppedWithdrawal, missingCore }
+}
+
+/**
  * Whether a PUSHED WooCommerce order may be CREATED in IMS — the webhook half of the
  * `wc_sync_order_statuses` selection (o3d-tj6v r3).
  *
