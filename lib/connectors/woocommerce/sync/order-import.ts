@@ -4626,7 +4626,7 @@ export async function syncNewWcOrders(
         )
       }
       if (importResult.accountingQueueFailed) {
-        result.errors.push(`WooCommerce order #${order.number}: imported, but its sales invoice could not be queued, so nothing will post it to the ledger until an operator re-queues it`)
+        result.errors.push(`WooCommerce order #${order.number}: imported, but queueing its sales invoice failed`)
       }
       if (guarded.suppressionHandled) {
         // A withdrawal transition was just applied; do not sync this stale
