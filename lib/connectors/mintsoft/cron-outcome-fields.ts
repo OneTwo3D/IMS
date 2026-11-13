@@ -12,9 +12,17 @@ export const mintsoftCronFailureFields = {
     skipState: { status: 'SKIPPED' },
     consumed: ['errors'],
     breakdownOf: { 'content.errors': 'errors' },
+    ignored: { mismatched: 'warehouse mismatches are findings the sweep reports as data and, by binding mode, corrects or notifies (the discrepancy inbox); a run that finds them has done its job, and a sweep that could not compare is `errors`, which is consumed' },
   },
-  'mintsoft-returns-sync': { consumed: ['errors'], skipState: { status: 'SKIPPED' } },
-  'mintsoft-stock-sync': { consumed: ['details[].errors'] },
+  'mintsoft-returns-sync': {
+    consumed: ['errors'],
+    skipState: { status: 'SKIPPED' },
+    ignored: { mismatched: 'warehouse mismatches are findings the sweep reports as data and, by binding mode, corrects or notifies (the discrepancy inbox); a run that finds them has done its job, and a sweep that could not compare is `errors`, which is consumed' },
+  },
+  'mintsoft-stock-sync': {
+    consumed: ['details[].errors'],
+    ignored: { 'details[].mismatched': 'warehouse mismatches are findings the sweep reports as data and, by binding mode, corrects or notifies (the discrepancy inbox); a run that finds them has done its job, and a sweep that could not compare is `errors`, which is consumed' },
+  },
   'mintsoft-webhook-sweeper': {
     consumed: ['failed', 'postMaintenanceRecheck.failed'],
     ignored: { 'postMaintenanceRecheck.refusal': 'why the post-maintenance re-check did not run (maintenance still on, window reopened): a by-design refusal, not a failure' },

@@ -16,7 +16,7 @@ import { cronFailureFields, type CronFieldDeclaration } from '../../lib/ops/cron
  * ignored with a reason.
  */
 
-const FAILURE_LIKE = /fail|error|dead|conflict|park|unresolved|reject|quarantin|incomplete|orphan|stuck|blocked|refus/i
+const FAILURE_LIKE = /fail|error|dead|conflict|park|unresolved|reject|quarantin|incomplete|orphan|stuck|blocked|refus|unrecorded|unwritten|lost|missing|abandon|stale|skippedWithError|mismatch|drift|invalid|denied|timeout|unavailable/i
 const LEAF = { number: 'number', string: 'string', stringArray: 'string[]', boolean: 'boolean', other: 'other' } as const
 type Leaf = (typeof LEAF)[keyof typeof LEAF]
 
@@ -148,10 +148,11 @@ test('the census sees every route, and every route has a typed result (not vacuo
 })
 
 test('every failure-like field of every result is consumed, a declared breakdown, or ignored with a reason', () => {
+  const all: string[] = []
   for (const slug of Object.keys(cronOutcomes) as CronOutcomeSlug[]) {
-    const problems = diffFieldDeclaration(enumerated.get(slug)!.fields, cronFailureFields[slug])
-    assert.deepEqual(problems, [], `${slug}:\n  ${problems.join('\n  ')}`)
+    for (const problem of diffFieldDeclaration(enumerated.get(slug)!.fields, cronFailureFields[slug])) all.push(`${slug}: ${problem}`)
   }
+  assert.deepEqual(all, [], `\n${all.join('\n')}`)
 })
 
 test('every consumed field really is consumed: the mapping does not answer ok when only that field is set', () => {

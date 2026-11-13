@@ -27,6 +27,8 @@ export type WmsOrderStatusSweepResult = {
   failed: number
   /** PRESENT ONLY WHEN NON-EMPTY: storefront status pushes that failed (best-effort, retried next tick). A write the outbound hold refused carries the hold's text, so the cron exit status reads it as held. */
   errors?: string[]
+  /** PRESENT ONLY WHEN NON-ZERO: storefront status pushes not attempted because no storefront connector is runnable (a state chosen on purpose, not a failure). */
+  pushSkipped?: number
 }
 
 /**
@@ -162,6 +164,8 @@ export async function runWmsOrderStatusSweep(
   let updated = 0
   let failed = 0
   const pushErrors: string[] = []
+  let pushSkipped = 0
+  let storefrontRunnable: boolean | undefined
   // Orders whose read did not RESOLVE even though nothing threw: a null fetch whose presence probe
   // failed, could not run, or found the order without being able to read its status. They are not
   // `failed` (the returned counters and the snapshot rows keep their meaning), but the read-sync
@@ -320,7 +324,14 @@ export async function runWmsOrderStatusSweep(
           // above must not be followed by a push built from the lookup.
           const beforePush = await db.salesOrder.findUnique({ where: { id: order.id }, select: { erasedAt: true } })
           if (beforePush?.erasedAt) continue
-          const { pushWmsOrderStatusToShopping } = await import('@/lib/shopping')
+          const { pushWmsOrderStatusToShopping, listRunnableShoppingConnectorIds } = await import('@/lib/shopping')
+          // No runnable storefront connector (the plugin is off, or sync is switched off) is a state chosen on purpose, not a failed push: nothing
+          // is pushed, wcPushedStatus stays unchanged so the push happens once a connector runs, and it is counted as skipped, not as an error.
+          storefrontRunnable ??= (await listRunnableShoppingConnectorIds()).length > 0
+          if (!storefrontRunnable) {
+            pushSkipped += 1
+            continue
+          }
           const pushResult = await pushWmsOrderStatusToShopping(order.id, {
             status: status.status,
             statusLabel: status.statusLabel,
@@ -388,5 +399,5 @@ export async function runWmsOrderStatusSweep(
     })
   }
 
-  return { scanned: orders.length, updated, failed, ...(pushErrors.length > 0 ? { errors: pushErrors.slice(0, 20) } : {}) }
+  return { scanned: orders.length, updated, failed, ...(pushErrors.length > 0 ? { errors: pushErrors.slice(0, 20) } : {}), ...(pushSkipped > 0 ? { pushSkipped } : {}) }
 }

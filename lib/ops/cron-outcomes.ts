@@ -194,8 +194,8 @@ export const cronOutcomes = {
   'wc-reconcile': (r: WcReconcileResult | Skip) => from(r, structural(r), permanentLists(r, ['permanentErrors'])),
   // the withdrawal and screening failures throw; errors: string[] from the erasure sweep; admissionRefusals.failed: number (the by-id read or the import failed)
   'wc-withdrawal-sweep': (r: WcWithdrawalSweepCronResult | Skip) => from(r, structural(r), counts(r, ['failed'])),
-  // failed and deadLettered: numbers, with outboundHeld (held pushes, also in failed) subtracted
-  'wms-order-push': (r: WmsOrderPushSweepResult) => from(r, counts(r, ['failed', 'deadLettered'])),
+  // failed, deadLettered and shadowUnrecorded (a held create whose only record could not be written): numbers, with outboundHeld (held pushes, also in failed) subtracted
+  'wms-order-push': (r: WmsOrderPushSweepResult) => from(r, counts(r, ['failed', 'deadLettered', 'shadowUnrecorded'])),
   // status enum; counters.errors: number
   'wms-order-reconcile': (r: WmsOrderReconcileResult) => enumResult(r, ['errors']),
   // failed: number; errors: string[] (storefront status pushes that failed, held-aware)

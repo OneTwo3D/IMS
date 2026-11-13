@@ -113,6 +113,9 @@ test('wms-order-push: failed pushes answer 500; pushes the hold refused do not; 
   // `held` here counts orders put on hold in the warehouse, which is not a hold on writes.
   doubles.push = { ...base, held: 3 }
   assert.equal(await statusOf(pushRoute), 200)
+  // a held create whose only record could not be written was not handled at all: a failure, though it name-matches no failure counter
+  doubles.push = { ...base, shadowUnrecorded: 1 }
+  assert.equal(await statusOf(pushRoute), 500)
   doubles.push = { ...base, failed: 2, outboundHeld: 2 }
   assert.equal(await statusOf(pushRoute), 200)
   doubles.push = { ...base, failed: 3, outboundHeld: 2 }

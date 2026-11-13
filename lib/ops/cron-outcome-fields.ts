@@ -62,7 +62,13 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
     consumed: ['errors'],
     probes: { errors: { status: 'completed' } },
   },
-  'inventory-snapshot': {},
+  'inventory-snapshot': {
+    ignored: {
+      driftCount: 'value drift between the day\'s snapshot and the ledger is reported as data (it is the run\'s status reason `inventory_snapshot_value_drift:N`) and is what the invariant check monitors; the snapshot itself was written',
+      driftTruncated: 'only says the drift list was cut at its cap; `driftCount` is the finding',
+      drift: 'the list behind `driftCount`: findings reported as data for the invariant check, not a failed snapshot',
+    },
+  },
   'invoice-documents': {
     consumed: ['failed'],
     probes: { failed: { stoppedEarly: 'stopped', stored: 0 } },
@@ -113,7 +119,7 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
   },
   'wms-order-push': {
     skipState: { skipped: 'x' },
-    consumed: ['failed', 'deadLettered'],
+    consumed: ['failed', 'deadLettered', 'shadowUnrecorded'],
     ignored: {
       verifyQuarantined: 'links quarantined by verification: each is also counted in `deadLettered` (consumed) and audited as a FAILED order create, so the run already reads failed',
       verifyUnresolved: 'links still awaiting a verdict: counted so an unknown is not silent, not a failure',
@@ -127,10 +133,15 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
   },
   'wms-order-status': { consumed: ['failed', 'errors'], skipState: { skipped: 'x' } },
   'wms-watchdog': {
-    ignored: { deliveryFailures: 'decides `status` (FAILED when a breach could not be alerted), which the mapping reads' },
+    ignored: {
+      deliveryFailures: 'decides `status` (FAILED when a breach could not be alerted), which the mapping reads',
+      staleBindingAlerts: 'the number of stale-sync alerts that WERE raised and delivered; an alert that could not be delivered is `deliveryFailures`, which decides `status`',
+    },
   },
   'writers-check': {},
   'xero-chart-sync': { consumed: ['errors'], skipState: { skipped: true, reason: 'x' } },
-  'xero-tax-rate-drift': {},
+  'xero-tax-rate-drift': {
+    ignored: { drifted: 'an alert-only check: each drifted rate is logged as an operator WARNING and that is the whole job; a failed check is a throw' },
+  },
   ...warehouseConnectorCronFailureFields,
 }
