@@ -3660,6 +3660,8 @@ export async function createSalesOrderRefund(
     euVatSchemeSnapshot?: boolean
     /** The gross (tax included) the source of the refund states it returned, in the order currency: the WooCommerce refund `amount`. Honoured only with `euVatSchemeSnapshot`, and only from an internal caller. */
     statedGrossForeign?: number
+    /** IOSS credit notes, rate 182: the tax the WooCommerce refund states across ALL its rate ids, set only when the refund carried tax on the EAS plugin's rate 182. Honoured only with `euVatSchemeSnapshot`, and only from an internal caller. */
+    eas182StatedTaxForeign?: number
   },
 ): Promise<CreateSalesOrderRefundResult> {
   // THE ROW-SHAPE CHECKS RUN ON THE REQUEST AS SENT, before any filtering: a row the filter below would drop (a negative quantity with no money)
@@ -4878,6 +4880,7 @@ export async function createSalesOrderRefund(
         // by a default and never minted for it by the database.
         reversalStagingState: REVERSAL_STAGING_NOT_STAGED,
         ...(schemeSnapshot?.scheme === true && frozenGross !== null ? { statedGrossForeign: frozenGross } : {}),
+        ...(schemeSnapshot?.scheme === true && input.eas182StatedTaxForeign != null && Number.isFinite(input.eas182StatedTaxForeign) ? { eas182StatedTaxForeign: input.eas182StatedTaxForeign } : {}),
       },
       select: { id: true },
     })

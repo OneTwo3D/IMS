@@ -1,0 +1,269 @@
+import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import test, { mock } from 'node:test'
+import { config } from 'dotenv'
+
+import { EU_VAT_CREDIT_NOTE_REFUSED_KEY } from '../../lib/domain/accounting/eu-vat-credit-note.ts'
+import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-keys.ts'
+
+/**
+ * THE FIRST-N HOLD ON A RATE-182 SCHEME CREDIT NOTE, through the real `createRefund`, against a real PostgreSQL (scratch database). No Xero call is made: the queue writes a row and nothing posts.
+ *   1. The first refund is held: queued as a refused row (never sent), the count goes 0 -> 1, the refund is stamped.
+ *   2. With the count at the threshold the next one posts normally: ONE VAT line on the stamped account, total = the refund.
+ *   3. Two refunds racing at count 9 of 10 hold exactly one.
+ *   4. A refund whose VAT is over the order's VAT not already refunded, or does not match its own stated tax, refuses: nothing queued.
+ *   5. Switch OFF: nothing is read or written (no stamp, no count), whatever the caller hands in.
+ *   6. An accounting retry of a held refund is held again and is not counted again.
+ */
+const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
+const skip = !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1'
+
+let depsPromise: ReturnType<typeof loadDepsOnce> | undefined
+function loadDeps() { depsPromise ??= loadDepsOnce(); return depsPromise }
+async function loadDepsOnce() {
+  config({ path: '.env.local', quiet: true })
+  config({ quiet: true })
+  mock.module('../../lib/domain/sales/post-refund-release.ts', { namedExports: { releaseReservationsAfterRefund: async () => undefined } })
+  mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {}, unstable_cache: (fn: unknown) => fn } })
+  const realAuth = await import('../../lib/auth/server.ts')
+  mock.module('../../lib/auth/server.ts', { namedExports: { ...realAuth, requirePermission: async () => ({ user: { id: 'ioss-cn-test' } }), requireFreshPermission: async () => ({ user: { id: 'ioss-cn-test' } }), freshAuthFailureResult: () => null } })
+  const [{ db }, actions, bypass, { getBaseCurrencyCode }] = await Promise.all([
+    import('../../lib/db/index.ts'), import('../../app/actions/sales.ts'), import('../../lib/internal-action-bypass.ts'), import('../../lib/base-currency.ts'),
+  ])
+  return { db, createRefund: actions.createRefund, bypass: bypass.INTERNAL_ACTION_BYPASS, baseCurrency: await getBaseCurrencyCode() }
+}
+type Deps = Awaited<ReturnType<typeof loadDepsOnce>>
+type Db = Deps['db']
+
+/** Xero active, sync on, credit notes posting, every account configured; the Sales Invoices switch as asked. Returns what to put back. */
+async function configure(db: Db, switchOn: boolean, extra: Record<string, string> = {}): Promise<() => Promise<void>> {
+  const entries: Array<[string, string]> = Object.entries({
+    [INTEGRATION_PLUGIN_SETTING_KEYS.xero]: 'true', xero_sync_enabled: 'true', xero_sync_credit_note: 'draft', xero_sync_sales_invoice: switchOn ? 'draft' : 'off',
+    xero_sales_account: '200', xero_shipping_account: '260', xero_discount_account: '270', xero_eu_vat_ioss_account: '821', xero_eu_vat_ddp_account: '232', xero_eu_fee_account: '232', xero_rounding_difference_account: '860',
+    ...extra,
+  })
+  const before = new Map((await db.setting.findMany({ where: { key: { in: entries.map(([k]) => k) } } })).map((row) => [row.key, row.value]))
+  for (const [key, value] of entries) await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+  return async () => {
+    for (const [key] of entries) {
+      const previous = before.get(key)
+      if (previous === undefined) await db.setting.deleteMany({ where: { key } })
+      else await db.setting.update({ where: { key }, data: { value: previous } })
+    }
+  }
+}
+
+/** The stored Xero tax-rate list the treatment proves the scheme posting type against. */
+async function seedXeroList(db: Db, rates: Record<string, string>) {
+  const { replaceXeroTaxRateList } = await import('../../lib/connectors/xero/tax-rate-store.ts')
+  const { TAX_RATE_DRIFT_LAST_CHECKED_SETTING } = await import('../../lib/connectors/xero/tax-rate-drift-sweeper.ts')
+  const now = new Date()
+  await db.accountingToken.deleteMany({ where: { connector: 'xero' } })
+  await db.accountingToken.create({ data: { connector: 'xero', accessToken: 'test', expiresAt: new Date(now.getTime() + 3_600_000), tenantId: 'tenant-eu-vat-cn-test' } })
+  await db.$transaction(async (tx) => {
+    await replaceXeroTaxRateList(tx, {
+      tenantId: 'tenant-eu-vat-cn-test',
+      fetchedAt: now,
+      rows: Object.entries(rates).map(([taxType, effectiveRate]) => ({ taxType, name: taxType, status: 'ACTIVE' as const, reportTaxType: null, effectiveRate, displayTaxRate: effectiveRate, components: [], canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: true } })),
+    })
+    await tx.setting.upsert({ where: { key: TAX_RATE_DRIFT_LAST_CHECKED_SETTING }, create: { key: TAX_RATE_DRIFT_LAST_CHECKED_SETTING, value: now.toISOString() }, update: { value: now.toISOString() } })
+  })
+}
+
+type Fixture = Awaited<ReturnType<typeof seed>>
+
+/**
+ * One order: goods 100.00 (tax 19.00), TWO landed-cost fees 20.00 (tax 3.80) and 4.00 (tax 0.76), shipping 10.00 (tax 1.90), all at 19%; total 158.46 + ... (net 134, tax 25.46, total 159.46 is not needed: only the refunds' own figures matter).
+ * `stamp`: null (never decided), 'IOSS' (stamped on 821) or 'none' (decided, outside the scheme).
+ */
+async function seed(deps: Deps, opts: { stamp: 'IOSS' | 'none' | null; schemeRate: boolean; noType?: boolean }) {
+  const { db } = deps
+  const { Prisma } = await import('../../app/generated/prisma/client.ts')
+  const suffix = randomUUID().slice(0, 8)
+  const rate = await db.taxRate.create({
+    data: {
+      name: `DE CN VAT ${suffix}`, rate: new Prisma.Decimal('0.19'), usedFor: 'SALES', accountingTaxType: `DE_CHARGED_${suffix}`, countryCode: 'DE', taxCategory: 'STANDARD', active: true,
+      ...(opts.schemeRate ? { reportingCategory: 'IOSS', schemePostingTaxType: 'TAX131' } : {}),
+    },
+  })
+  const line = (description: string, net: string, tax: string, fee: string | null) => ({
+    description, qty: new Prisma.Decimal('1'), unitPriceForeign: new Prisma.Decimal(net), unitPriceBase: new Prisma.Decimal(net), taxForeign: new Prisma.Decimal(tax), taxBase: new Prisma.Decimal(tax),
+    totalForeign: new Prisma.Decimal(net), totalBase: new Prisma.Decimal(net), taxRateId: rate.id, ...(fee === null ? {} : { wclcFeeKind: fee }),
+  })
+  const order = await db.salesOrder.create({
+    data: {
+      orderNumber: `CN-${suffix}`, status: 'SHIPPED', currency: deps.baseCurrency, fxRateToBase: new Prisma.Decimal('1'), pricesIncludeVat: false, taxRateName: rate.name, taxRatePercent: new Prisma.Decimal('0.19'),
+      subtotalForeign: new Prisma.Decimal('134'), subtotalBase: new Prisma.Decimal('134'), taxForeign: new Prisma.Decimal('25.46'), taxBase: new Prisma.Decimal('25.46'), totalForeign: new Prisma.Decimal('159.46'), totalBase: new Prisma.Decimal('159.46'),
+      shippingForeign: new Prisma.Decimal('10'), shippingBase: new Prisma.Decimal('10'),
+      ...(opts.stamp === null ? {} : opts.stamp === 'none'
+        ? { euVatRegimeStampedAt: new Date(), euVatRegimeBasis: { version: 1, outcome: 'SKIP', skipReason: 'no_scheme_vat', warnings: [] } }
+        : { euVatRegime: 'IOSS' as const, euVatLineAccount: '821', euVatRegimeStampedAt: new Date(), euVatRegimeBasis: { version: 1, outcome: 'SCHEME', scheme: { imsRateIds: [rate.id], ...(opts.noType ? {} : { schemePostingTaxType: 'TAX131' }) }, warnings: [] } }),
+      lines: { create: [line('Widget', '100.00', '19.00', null), line('EU Customs Fee', '20.00', '3.80', 'duty_flat'), line('EU Handling Fee', '4.00', '0.76', 'uhf')] },
+    },
+    select: { id: true, lines: { select: { id: true, description: true } } },
+  })
+  const lineId = (description: string) => order.lines.find((l) => l.description === description)!.id
+  return { rate, orderId: order.id, goods: lineId('Widget'), feeA: lineId('EU Customs Fee'), feeB: lineId('EU Handling Fee') }
+}
+
+async function cleanup(db: Db, fx: Fixture | undefined) {
+  if (!fx) return
+  const refunds = await db.salesOrderRefund.findMany({ where: { orderId: fx.orderId }, select: { id: true } })
+  const ids = refunds.map((r) => r.id)
+  await db.accountingSyncLog.deleteMany({ where: { referenceId: { in: [...ids, fx.orderId] } } }).catch(() => {})
+  await db.accountingEvent.deleteMany({ where: { sourceEntityId: { in: ids } } }).catch(() => {})
+  await db.salesOrderRefundLine.deleteMany({ where: { refund: { orderId: fx.orderId } } }).catch(() => {})
+  await db.salesOrderRefund.deleteMany({ where: { orderId: fx.orderId } }).catch(() => {})
+  await db.shoppingSyncLog.deleteMany({ where: { entityId: fx.orderId } }).catch(() => {})
+  await db.shoppingOrderLink.deleteMany({ where: { orderId: fx.orderId } }).catch(() => {})
+  await db.activityLog.deleteMany({ where: { entityId: fx.orderId } }).catch(() => {})
+  await db.salesOrderLine.deleteMany({ where: { orderId: fx.orderId } }).catch(() => {})
+  await db.salesOrder.deleteMany({ where: { id: fx.orderId } }).catch(() => {})
+  await db.taxRate.deleteMany({ where: { id: fx.rate.id } }).catch(() => {})
+  await db.xeroTaxRateList.deleteMany({ where: { connector: 'xero' } }).catch(() => {})
+  await db.xeroTaxRate.deleteMany({ where: { connector: 'xero' } }).catch(() => {})
+  await db.accountingToken.deleteMany({ where: { connector: 'xero', tenantId: 'tenant-eu-vat-cn-test' } }).catch(() => {})
+}
+
+const wooRefundId = () => 3_000_000 + Math.floor(Math.random() * 6_000_000)
+type RefundLine = { lineId: string | null; productId: null; description: string; qty: 0; totalBase: number; lineKind: 'sale' | 'shipping'; chargedTaxForeign?: number }
+const itemised = (lineId: string, description: string, net: number, tax: number): RefundLine => ({ lineId, productId: null, description, qty: 0, totalBase: net, lineKind: 'sale', chargedTaxForeign: tax })
+
+async function creditNoteRowOf(db: Db, refundId: string) {
+  const row = await db.accountingSyncLog.findFirst({ where: { type: 'CREDIT_NOTE', referenceId: refundId }, select: { payload: true } })
+  return (row?.payload ?? null) as Record<string, unknown> | null
+}
+const COUNT = 'eu_vat_refund182_held_count'
+const THRESHOLD = 'eu_vat_refund182_hold_threshold'
+const heldCount = async (db: Db) => (await db.setting.findUnique({ where: { key: COUNT } }))?.value ?? null
+
+/** A rate-182 refund of the goods line: net 100, VAT as stated (19 by default), gross as stated. */
+async function refund182(deps: Deps, fx: Fixture, opts: { gross?: number; statedTax?: number; net?: number; tax?: number } = {}) {
+  const net = opts.net ?? 100
+  const tax = opts.tax ?? 19
+  const result = await deps.createRefund(fx.orderId, [itemised(fx.goods, 'Widget', net, tax)], 'rate 182', undefined, {
+    internalBypassToken: deps.bypass, externalRefundId: wooRefundId(), statedGrossForeign: opts.gross ?? net + tax, eas182StatedTaxForeign: opts.statedTax ?? tax,
+  })
+  const refund = await deps.db.salesOrderRefund.findFirst({ where: { orderId: fx.orderId }, orderBy: { createdAt: 'desc' }, select: { id: true, eas182HeldAt: true, eas182StatedTaxForeign: true, accountingRetryRequired: true } })
+  return { result, refund: refund!, payload: result.success ? await creditNoteRowOf(deps.db, refund!.id) : null }
+}
+
+test('[refund 182 hold] the FIRST refund is held (a refused row, never sent) and the count increments; the 11th posts on the stamped account', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true, { [COUNT]: '0', [THRESHOLD]: '10' })
+  const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx) })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  const first = await refund182(deps, fx)
+  assert.equal(first.result.success, true, first.result.error)
+  assert.ok(first.payload, 'a row was queued')
+  const marker = first.payload[EU_VAT_CREDIT_NOTE_REFUSED_KEY] as { reason: string } | undefined
+  assert.ok(marker, 'the held credit note is the refused, non-postable row')
+  assert.match(marker.reason, /rate 182[\s\S]*first 10[\s\S]*number 1[\s\S]*Check Xero[\s\S]*settle action on \/sync/)
+  assert.deepEqual(first.payload.lines, [], 'no lines: nothing in it could be posted')
+  assert.equal(await heldCount(deps.db), '1')
+  assert.ok(first.refund.eas182HeldAt, 'the refund is stamped as held')
+  assert.equal(first.refund.eas182StatedTaxForeign?.toString(), '19')
+  // The count reaches the threshold: the next credit note posts as an ordinary scheme credit note.
+  await deps.db.setting.update({ where: { key: COUNT }, data: { value: '10' } })
+  const eleventh = await refund182(deps, fx, { net: 20, tax: 3.8 })
+  assert.equal(eleventh.result.success, true, eleventh.result.error)
+  assert.ok(eleventh.payload, 'a row was queued')
+  assert.equal(EU_VAT_CREDIT_NOTE_REFUSED_KEY in eleventh.payload, false, 'not held')
+  const lines = eleventh.payload.lines as Array<{ description: string; accountCode: string; taxType: string; noTaxKind?: string; unitAmount: number; quantity: number }>
+  assert.deepEqual(lines.map((l) => [l.description, l.accountCode, l.taxType, l.noTaxKind ?? null, l.unitAmount]), [['Widget', '200', 'TAX131', null, 20], ['IOSS VAT refunded', '821', 'NONE', 'eu-vat-recovery', 3.8]])
+  assert.equal(lines.reduce((sum, l) => sum + l.unitAmount * l.quantity, 0).toFixed(2), '23.80', 'the total is the refund amount')
+  assert.equal((eleventh.payload._euVatTreatment as Record<string, unknown>).applied, true)
+  assert.equal(await heldCount(deps.db), '10', 'a posted credit note is not counted')
+  assert.equal(eleventh.refund.eas182HeldAt, null)
+})
+
+test('[refund 182 hold] two refunds racing at count 9 of 10 hold EXACTLY one; the other posts; the count ends at 10', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true, { [COUNT]: '9', [THRESHOLD]: '10' })
+  const a = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  const b = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  t.after(async () => { await restore(); await cleanup(deps.db, a); await cleanup(deps.db, b) })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  const [x, y] = await Promise.all([refund182(deps, a), refund182(deps, b)])
+  assert.equal(x.result.success, true, x.result.error)
+  assert.equal(y.result.success, true, y.result.error)
+  const held = [x, y].filter((r) => r.payload !== null && EU_VAT_CREDIT_NOTE_REFUSED_KEY in r.payload)
+  const posted = [x, y].filter((r) => r.payload !== null && !(EU_VAT_CREDIT_NOTE_REFUSED_KEY in r.payload))
+  assert.equal(held.length, 1, 'exactly one is held')
+  assert.equal(posted.length, 1, 'the other posts')
+  assert.equal(await heldCount(deps.db), '10')
+  assert.equal([x, y].filter((r) => r.refund.eas182HeldAt !== null).length, 1)
+})
+
+test('[refund 182 hold] a refund whose VAT is over the order\'s VAT not already refunded, or does not match its own stated tax, REFUSES: nothing queued, nothing counted', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true, { [COUNT]: '10', [THRESHOLD]: '10' })
+  const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  const fx2 = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx); await cleanup(deps.db, fx2) })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  // The stated gross and the stated tax disagree beyond rounding: refused (the total check).
+  const mismatch = await refund182(deps, fx, { gross: 125, statedTax: 19 })
+  assert.equal(mismatch.payload, null, 'nothing queued')
+  assert.equal(mismatch.refund.accountingRetryRequired, true, 'the obligation stays unmet')
+  const refusal = await deps.db.activityLog.findFirst({ where: { entityId: fx.orderId, action: 'refund_credit_note_eu_vat_refused' }, select: { description: true } })
+  assert.match(refusal?.description ?? '', /tax it states across its tax rates is 19/)
+  // An earlier refund took 25 of the order's 25.46 VAT (re-priced by the plugin); a second one asking 6.46 is over what is left.
+  const first = await refund182(deps, fx2, { gross: 125, statedTax: 25, net: 100, tax: 19 })
+  assert.equal(first.result.success, true, first.result.error)
+  assert.ok(first.payload && !(EU_VAT_CREDIT_NOTE_REFUSED_KEY in first.payload), 'the first posts (count at the threshold)')
+  const over = await refund182(deps, fx2, { net: 34, tax: 6.46 })
+  const overRefunds = await deps.db.salesOrderRefund.findMany({ where: { orderId: fx2.orderId }, select: { id: true } })
+  assert.equal(overRefunds.length >= 2, true)
+  const overRow = await deps.db.accountingSyncLog.count({ where: { type: 'CREDIT_NOTE', referenceId: over.refund.id } })
+  assert.equal(overRow, 0, 'nothing queued for the over-bound refund')
+  assert.equal(over.refund.accountingRetryRequired, true)
+  const overActivity = await deps.db.activityLog.findFirst({ where: { entityId: fx2.orderId, action: 'refund_credit_note_eu_vat_refused', description: { contains: 'not already refunded' } }, select: { description: true } })
+  assert.ok(overActivity, 'the refusal says the VAT is over what is left to refund')
+  assert.equal(await heldCount(deps.db), '10', 'a refusal is not counted')
+})
+
+test('[refund 182 hold] switch OFF: the 182 figure handed in is ignored: no stamp, no count, no marker, the credit note is built as development builds it', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, false, { [COUNT]: '0', [THRESHOLD]: '10' })
+  const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx) })
+  const out = await refund182(deps, fx)
+  assert.equal(out.result.success, true, out.result.error)
+  assert.ok(out.payload)
+  assert.equal(EU_VAT_CREDIT_NOTE_REFUSED_KEY in out.payload, false)
+  assert.equal('_euVatTreatment' in out.payload, false)
+  assert.match((out.payload.lines as Array<{ taxType: string }>)[0]!.taxType, /^DE_CHARGED_/, 'the charged code, as development builds it')
+  assert.equal(out.refund.eas182HeldAt, null)
+  assert.equal(out.refund.eas182StatedTaxForeign, null)
+  assert.equal(await heldCount(deps.db), '0', 'the count is untouched')
+})
+
+test('[refund 182 hold] an accounting retry of a held refund is held again and NOT counted again; a threshold that is not a number holds without counting', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true, { [COUNT]: '0', [THRESHOLD]: '10' })
+  const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx) })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  const { decideRefund182Hold } = await import('../../lib/domain/sales/refund-182-hold.ts')
+  const first = await refund182(deps, fx)
+  assert.equal(first.result.success, true, first.result.error)
+  assert.equal(await heldCount(deps.db), '1')
+  const again = await decideRefund182Hold(first.refund.id)
+  assert.deepEqual(again, { held: true, newlyHeld: false, heldNumber: 1, threshold: 10 })
+  assert.equal(await heldCount(deps.db), '1', 'not counted twice')
+  // Not a whole number: held, and the count is left alone.
+  await deps.db.setting.update({ where: { key: THRESHOLD }, data: { value: 'ten' } })
+  const second = await refund182(deps, fx, { net: 20, tax: 3.8 })
+  assert.equal(second.result.success, true, second.result.error)
+  assert.ok(second.payload && EU_VAT_CREDIT_NOTE_REFUSED_KEY in second.payload, 'held, not guessed')
+  assert.equal(await heldCount(deps.db), '1')
+  // Threshold 0: nothing is held and nothing is written.
+  await deps.db.setting.update({ where: { key: THRESHOLD }, data: { value: '0' } })
+  const third = await refund182(deps, fx, { net: 10, tax: 1.9 })
+  assert.ok(third.payload && !(EU_VAT_CREDIT_NOTE_REFUSED_KEY in third.payload), 'posts')
+  assert.equal(await heldCount(deps.db), '1')
+})

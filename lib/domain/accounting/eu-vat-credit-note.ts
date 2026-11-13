@@ -14,8 +14,10 @@
  * THE INVARIANT. Every line is on a zero-rated type or on NONE, so Xero adds no tax and the document totals the sum of its lines. That sum must equal the refund's amount EXACTLY, to the minor unit. No rounding line: the
  * refund's amount is the source's own figure, and a difference means a figure is wrong, so it refuses.
  *
- * WOOCOMMERCE RATE 182. The EAS compliance plugin re-prices a refund on its own orders, books the refund's VAT under its own tax rate (182) whatever rate the order charged, and leaves fee lines out. In this first release a refund
- * whose tax is carried on 182 REFUSES (`easRefundRefusal`) for a person to look at, instead of being posted on a figure IMS did not derive.
+ * WOOCOMMERCE RATE 182. The EAS compliance plugin re-prices a refund on its own orders, books the refund's VAT under its own tax rate (182) whatever rate the order charged, and leaves fee lines out. While the Sales Invoices switch is on, such a refund on a
+ * scheme-stamped order is recorded and its VAT is booked as the credit note's ONE VAT line on the order's STAMPED account (`eas182RefundFigures`): the tax is the sum across ALL rate ids, confirmed against the refund's own stated gross and held to the order's collected VAT
+ * not already refunded. The first N such credit notes (the owner's ruling) are queued as a refused, settle-by-hand row for a person to check (`refund182HeldRefusal`); after that they post. A refund whose figures fail either check refuses. `easRefundRefusal` remains the wording
+ * for a rate-182 refund whose tax figure cannot be read at all.
  */
 import { withLedgerCheck } from './hand-post-instruction'
 import { currencyMinorUnits, roundMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
@@ -60,6 +62,50 @@ export const easRefundRefusal = (refundId: string | number, amount: string): str
   withLedgerCheck(`WooCommerce refund ${refundId} was NOT recorded: its VAT (${amount}) is booked on WooCommerce tax rate 182, the rate the EAS compliance plugin uses when it re-prices a refund, on an order IMS posts under the EU IOSS/VOEC/DDP scheme. `
   + 'IMS does not post a credit note on a figure the EAS plugin re-priced (it also leaves fee lines out). Nothing was sent to Xero. Open this refund in the sync exceptions inbox and record it manually: IMS then credits the order\'s own lines at the VAT the order was charged. '
   + 'Check the credit note in Xero against the WooCommerce refund amount before it is released.')
+
+/** The tax (absolute, as text) a WooCommerce refund states across ALL its rate ids, and whether any figure could not be read (then the sum is not a figure at all). */
+export function refundStatedTax(refund: RefundTaxCarrier): { total: string; unreadable: boolean } {
+  let sum = toDecimal(0)
+  let unreadable = false
+  for (const group of [refund.line_items ?? [], refund.shipping_lines ?? [], refund.fee_lines ?? []]) {
+    for (const item of group) {
+      for (const entry of item.taxes ?? []) {
+        const text = typeof entry?.total === 'number' ? String(entry.total) : typeof entry?.total === 'string' ? entry.total.trim() : ''
+        if (!/^-?\d+(\.\d+)?$/.test(text)) { unreadable = true; continue }
+        sum = sum.plus(toDecimal(text).abs())
+      }
+    }
+  }
+  return { total: sum.toString(), unreadable }
+}
+
+/**
+ * THE FIGURES OF A RATE-182 SCHEME CREDIT NOTE. Pure. The VAT is the refund's stated gross less the net of its lines (so the credit note totals the refund exactly, as every scheme credit note does), and it is:
+ *   confirmed against the tax the refund itself states across all its rate ids (`statedTax`), within `toleranceMinorUnits` of a minor unit: the figure the EAS plugin re-priced is not trusted on its own, and the refund's lines' own rates are NOT consulted (the plugin books its own);
+ *   held to the order's collected VAT not already refunded (`orderTax` less `priorRefundedTax`), with the same rounding allowance. `priorRefundedTax` null means an earlier refund's VAT cannot be established, which refuses.
+ */
+export function eas182RefundFigures(input: { net: Decimal; statedGross: Decimal; statedTax: Decimal; orderTax: Decimal; priorRefundedTax: Decimal | null; currency: string; toleranceMinorUnits: number }): { ok: true; vatAmount: string; refundTotal: string } | { ok: false; reason: string } {
+  const { currency } = input
+  const gross = roundMoney(input.statedGross, currency)
+  const vat = gross.minus(input.net)
+  const minor = toDecimal(1).div(toDecimal(10).pow(currencyMinorUnits(currency)))
+  const allowance = minor.times(Math.max(1, input.toleranceMinorUnits))
+  if (vat.isNegative()) return { ok: false, reason: `the refund states ${gross.toString()} ${currency} in all, which is less than the ${input.net.toString()} its lines net to` }
+  if (vat.minus(input.statedTax).abs().gt(allowance)) {
+    return { ok: false, reason: `the refund states ${gross.toString()} ${currency} in all, so ${vat.toString()} of tax over a net of ${input.net.toString()}, but the tax it states across its tax rates is ${roundMoney(input.statedTax, currency).toString()}; that is more than rounding explains` }
+  }
+  if (input.priorRefundedTax === null) return { ok: false, reason: 'the VAT of an earlier refund on this order cannot be established, so this refund\'s VAT cannot be held to what is left to refund' }
+  const left = input.orderTax.minus(input.priorRefundedTax)
+  if (vat.gt(left.plus(allowance))) {
+    return { ok: false, reason: `the refund's VAT (${vat.toString()} ${currency}) is more than the order's collected VAT not already refunded (${roundMoney(left.isNegative() ? toDecimal(0) : left, currency).toString()} ${currency} of ${roundMoney(input.orderTax, currency).toString()})` }
+  }
+  return { ok: true, vatAmount: vat.toString(), refundTotal: gross.toString() }
+}
+
+/** What the operator reads when a rate-182 scheme credit note is one of the first N, held for a person to check. The same refused, settleable row as the hand-post cases: never sent. */
+export const refund182HeldRefusal = (input: { creditNoteNumber: string; heldNumber: number; threshold: number; vatAccount: string; vatAmount: string; refundTotal: string; currency: string }): string =>
+  withLedgerCheck(`NOTHING WAS SENT. Credit note ${input.creditNoteNumber} is on a refund whose VAT the EAS compliance plugin booked on WooCommerce tax rate 182, on an order sold under the EU IOSS/VOEC/DDP scheme. IMS posts such a VAT to the order's stamped VAT account (${input.vatAccount}), and the first ${input.threshold} of these credit notes are held for a person to review before any is released; this is number ${input.heldNumber}. `
+  + `The credit note would total ${input.refundTotal} ${input.currency}, of which ${input.vatAmount} is VAT. This row is refused and is never sent. Check Xero for credit note ${input.creditNoteNumber} first. If it is not there, post the credit note by hand in Xero for ${input.refundTotal} ${input.currency}, with the VAT on account ${input.vatAccount} and the tax type of the order's invoice, and review it against the WooCommerce refund. Then record the outcome on this row with the settle action on /sync.`)
 
 /** What the operator reads when a credit note is raised on a scheme order that has no stamp. */
 /** What the operator reads when the invoice's zero-rated posting type cannot be established for a scheme credit note (the stamp was written before it was kept). The same refused, settleable row as the no-stamp case. */

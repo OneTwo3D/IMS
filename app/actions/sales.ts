@@ -2631,6 +2631,8 @@ export async function createRefund(
     expectedTaxIdentities?: RefundExpectedTaxIdentity[]
     /** IOSS credit notes: what the SOURCE of the refund (the WooCommerce refund `amount`) states was returned in all, tax included, in the order currency. Internal callers only; recorded only while the Sales Invoices switch is on and the order is on an EU scheme. */
     statedGrossForeign?: number
+    /** IOSS credit notes, rate 182: the tax the WooCommerce refund states across all its rate ids. Internal callers only; recorded only while the Sales Invoices switch is on and the order is on an EU scheme. */
+    eas182StatedTaxForeign?: number
   },
   // Two independent outcomes ride alongside `error`:
   //   `conflict`   (o3d-6oyu.18) — the refund transaction refused this credit note because the
@@ -2727,7 +2729,7 @@ export async function createRefund(
       expectedTaxIdentities: isInternal ? options?.expectedTaxIdentities : undefined,
       // IOSS credit notes: asked of the chart's connector once, here. Off (the default) the writer snapshots nothing and the refund is written exactly as before.
       ...(accountingSettings?.connector === 'xero' && await isAccountingSyncTypeEnabledFor('xero', 'SALES_INVOICE')
-        ? { euVatSchemeSnapshot: true, ...(isInternal && options?.statedGrossForeign != null ? { statedGrossForeign: options.statedGrossForeign } : {}) }
+        ? { euVatSchemeSnapshot: true, ...(isInternal && options?.statedGrossForeign != null ? { statedGrossForeign: options.statedGrossForeign } : {}), ...(isInternal && options?.eas182StatedTaxForeign != null ? { eas182StatedTaxForeign: options.eas182StatedTaxForeign } : {}) }
         : {}),
     })
     if (!refundResult.success) return refundResult

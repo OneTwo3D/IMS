@@ -27,6 +27,13 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 - **The poster re-checks the recorded regime policy and the zero-rated type** for a treated credit note before it claims the row and as the last step before the request leaves (`pushCreditNote` now takes the same pre-socket authorization as an invoice); a difference refuses with a working instruction (restore the setting and retry on /sync, or post by hand and settle).
 - **Unchanged while the Sales Invoices switch is off:** nothing is read, snapshotted or rewritten and the credit-note payload is byte-identical (a golden test compares it with origin/development). Nothing is switched on by this change.
 
+### EU IOSS credit notes: rate-182 refund VAT posts to the stamped account, the first 10 held (built and switched off: behind the Sales Invoices switch)
+
+- **Changed: a WooCommerce refund whose VAT the EAS compliance plugin booked on rate 182, on a scheme-stamped order, is now recorded instead of refused** (while the Sales Invoices switch is on). Its VAT is the tax the refund states across all rate ids, confirmed against the refund's own stated gross (to within rounding) and held to the order's collected VAT not already refunded; it is posted as the credit note's one VAT line on the order's stamped account, and the credit note totals the refund exactly. A refund that fails either check is refused as before; a 182 figure that cannot be read is still parked.
+- **Added: the first N such credit notes are held** (owner ruling 2026-11-09). While `eu_vat_refund182_held_count` is below `eu_vat_refund182_hold_threshold` (default 10), the credit note is queued as a refused row that is never sent, with wording to check it in Xero and settle it on /sync; the count is taken under a row lock in the same transaction that stamps the refund (`lib/domain/sales/refund-182-hold.ts`), so concurrent refunds cannot exceed the threshold and a retry never counts a refund twice. Later ones post normally.
+- **Added: two nullable columns on refunds** (additive migration `20261113110000_refund_eas182_hold`): `eas182_stated_tax_foreign` and `eas182_held_at`, written only for a rate-182 refund while the switch is on.
+- **Unchanged while the Sales Invoices switch is off:** nothing is read, written or counted and the refund sync treats rate 182 exactly as before (golden tests).
+
 ## 4.0.0 - 2026-11-13
 
 ### Operator actions (breaking)

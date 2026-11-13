@@ -15,7 +15,7 @@ import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-ke
  *   3. A cancellation (the payment poller's whole-order reversal) reverses the order's whole VAT and totals the whole invoice.
  *   4. A scheme order with no stamp refuses and queues nothing; an order outside the scheme is left alone.
  *   5. The stamped account is reused after the facts changed; the policy recorded is the one in force; a change to it is refused by the final pre-socket check, with the working instruction.
- *   6. A WooCommerce refund whose tax is booked on rate 182 is parked, not recorded, and createRefund is never called.
+ *   6. A WooCommerce refund whose tax is booked on rate 182 is recorded with its tax summed across all rate ids (the hold of the first N is tested in refund-eas182-hold.concurrent.test.ts); an unreadable 182 figure is parked and createRefund is never called.
  */
 const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const skip = !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1'
@@ -452,7 +452,7 @@ test('[eu vat credit note] a CANCELLATION (the whole-order reversal) reverses th
   assert.equal(queued.reduce((sum, l) => sum + l.unitAmount * l.quantity, 0).toFixed(2), '159.46', 'and the credit note totals the whole invoice')
 })
 
-test('[eu vat credit note] a WooCommerce refund whose tax is booked on rate 182 is parked, not recorded: createRefund is never called; the switch off, or a non-scheme order, is not touched', { skip }, async (t) => {
+test('[eu vat credit note] a WooCommerce refund whose tax is booked on rate 182 is recorded with its tax summed across ALL rate ids (an unreadable 182 figure is still parked); the switch off, or a non-scheme order, is not touched', { skip }, async (t) => {
   const deps = await loadDeps()
   const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
   const outside = await seed(deps, { stamp: 'none', schemeRate: false })
@@ -462,39 +462,52 @@ test('[eu vat credit note] a WooCommerce refund whose tax is booked on rate 182 
   await deps.db.shoppingOrderLink.create({ data: { orderId: outside.orderId, connector: 'woocommerce', externalOrderId: String(externalOutside) } })
   t.after(async () => { await cleanup(deps.db, fx); await cleanup(deps.db, outside) })
   const { syncWcRefund } = await import('../../lib/connectors/woocommerce/sync/refund-sync.ts')
-  const refund = (id: number, rateId: number) => ({
+  const refund = (id: number, rateId: number, total = '-19.00') => ({
     id, parent_id: externalOrderId, date_created: '2026-11-02T10:00:00', date_created_gmt: '2026-11-02T10:00:00', amount: '119.00', reason: 'r', refunded_by: 1, refunded_payment: false, meta_data: [],
-    line_items: [{ id: 91, name: 'Widget', product_id: 1, variation_id: 0, quantity: 0, tax_class: '', subtotal: '-100.00', subtotal_tax: '-19.00', total: '-100.00', total_tax: '-19.00', sku: 's', meta_data: [], refund_total: -100, taxes: [{ id: rateId, total: '-19.00' }] }],
+    line_items: [{ id: 91, name: 'Widget', product_id: 1, variation_id: 0, quantity: 0, tax_class: '', subtotal: '-100.00', subtotal_tax: '-19.00', total: '-100.00', total_tax: '-19.00', sku: 's', meta_data: [], refund_total: -100, taxes: [{ id: rateId, total }, { id: 244, total: '0.00' }] }],
   })
-  let called = 0
-  const stub = async () => { called += 1; return { success: true } }
-  // Switch OFF: the refund is read as it always was (the stub is reached).
+  const calls: Array<Record<string, unknown>> = []
+  const stub = async (...args: unknown[]) => { calls.push((args[4] ?? {}) as Record<string, unknown>); return { success: true } }
+  // Switch OFF: the refund is read as it always was (the stub is reached, and no 182 figure is handed on).
   let restore = await configure(deps.db, false)
   await syncWcRefund(externalOrderId, refund(wooRefundId(), 182) as never, { createRefund: stub as never })
-  assert.equal(called, 1, 'switch off: not refused')
+  assert.equal(calls.length, 1, 'switch off: not refused')
+  assert.equal('eas182StatedTaxForeign' in calls[0]!, false, 'switch off: nothing handed on')
   await restore()
-  // Switch ON, scheme order, tax on 182: parked QUARANTINED with the operator wording, createRefund not called.
+  // Switch ON, scheme order, tax on 182: recorded, the tax summed across all rate ids is handed to the writer, nothing is parked.
   restore = await configure(deps.db, true)
   t.after(async () => { await restore() })
-  called = 0
+  calls.length = 0
   const id = wooRefundId()
   const outcome = await syncWcRefund(externalOrderId, refund(id, 182) as never, { createRefund: stub as never })
-  assert.equal(outcome.outcome, 'quarantined-refusal')
-  assert.equal(called, 0)
-  assert.match(outcome.error ?? '', new RegExp(`WooCommerce refund ${id} was NOT recorded: its VAT \\(19\\) is booked on WooCommerce tax rate 182`))
-  const park = await deps.db.shoppingSyncLog.findFirst({ where: { externalId: String(id), entityId: fx.orderId }, select: { status: true } })
+  assert.notEqual(outcome.outcome, 'quarantined-refusal')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0]!.eas182StatedTaxForeign, 19)
+  assert.equal(calls[0]!.statedGrossForeign, 119)
+  assert.equal(await deps.db.shoppingSyncLog.count({ where: { externalId: String(id), entityId: fx.orderId, status: 'QUARANTINED' } }), 0, 'not parked as quarantined')
+  // A 182 figure that cannot be read: parked QUARANTINED with the operator wording, createRefund not called.
+  calls.length = 0
+  const unreadable = wooRefundId()
+  const refused = await syncWcRefund(externalOrderId, refund(unreadable, 182, 'abc') as never, { createRefund: stub as never })
+  assert.equal(refused.outcome, 'quarantined-refusal')
+  assert.equal(calls.length, 0)
+  assert.match(refused.error ?? '', new RegExp(`WooCommerce refund ${unreadable} was NOT recorded: its VAT \\(1\\) is booked on WooCommerce tax rate 182`))
+  const park = await deps.db.shoppingSyncLog.findFirst({ where: { externalId: String(unreadable), entityId: fx.orderId }, select: { status: true, errorMessage: true } })
   assert.equal(park?.status, 'QUARANTINED')
-  const parkedMessage = await deps.db.shoppingSyncLog.findFirst({ where: { externalId: String(id), entityId: fx.orderId }, select: { errorMessage: true } })
-  assert.match(parkedMessage?.errorMessage ?? '', new RegExp(`WooCommerce refund ${id} was NOT recorded`), 'the parked row carries the operator wording')
+  assert.match(park?.errorMessage ?? '', new RegExp(`WooCommerce refund ${unreadable} was NOT recorded`), 'the parked row carries the operator wording')
   const activity = await deps.db.activityLog.findFirst({ where: { entityId: fx.orderId, action: 'refund_sync_eas_rate_182_refused' }, select: { level: true, description: true } })
   assert.equal(activity?.level, 'WARNING')
   assert.match(activity?.description ?? '', /rate 182/)
-  // The same refund on another rate, switch on, scheme order: not refused.
+  // The same refund on another rate, switch on, scheme order: recorded as before, nothing extra handed on.
+  calls.length = 0
   await syncWcRefund(externalOrderId, refund(wooRefundId(), 244) as never, { createRefund: stub as never })
-  assert.equal(called, 1, 'any other rate is recorded as before')
-  // 182 on an order outside the scheme: not refused.
+  assert.equal(calls.length, 1, 'any other rate is recorded as before')
+  assert.equal('eas182StatedTaxForeign' in calls[0]!, false)
+  // 182 on an order outside the scheme: not touched.
+  calls.length = 0
   await syncWcRefund(externalOutside, refund(wooRefundId(), 182) as never, { createRefund: stub as never })
-  assert.equal(called, 2, 'a non-scheme order is not touched')
+  assert.equal(calls.length, 1, 'a non-scheme order is not touched')
+  assert.equal('eas182StatedTaxForeign' in calls[0]!, false)
 })
 
 test('[eu vat credit note] every route to a credit note reaches the one builder, and the poster wires both checks', () => {

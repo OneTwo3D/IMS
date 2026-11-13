@@ -17,7 +17,7 @@ import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-ma
 import { FULL_REFUND_RATIO } from '@/lib/domain/sales/refund-thresholds'
 import { activeRefundParkWhere, WC_REFUND_PARK_RECORD_KIND } from '@/lib/domain/sales/refund-park-recovery'
 // o3d-w00 (Codex r7 #3): shared with the exception inbox's hand-recording path — see refund-line-link.
-import { easRefundRefusal, refundTaxOnEasRate } from '@/lib/domain/accounting/eu-vat-credit-note'
+import { easRefundRefusal, refundStatedTax, refundTaxOnEasRate } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { refundedOrderLineId } from './refund-line-link'
 export { refundedOrderLineId }
 import type { WcRefund } from './types'
@@ -829,25 +829,31 @@ export async function syncWcRefund(
     }
     const refundAmountForeign = parseDecimalAbs(wcRefund.amount)
 
-    // IOSS CREDIT NOTES (behind the Sales Invoices switch): a refund on a scheme-stamped order whose tax the EAS compliance plugin booked on WooCommerce rate 182 is not recorded in this release.
+    // IOSS CREDIT NOTES (behind the Sales Invoices switch): a refund on a scheme-stamped order whose tax the EAS compliance plugin booked on WooCommerce rate 182 IS recorded: its tax is the sum across ALL the refund's rate ids,
+    // handed to the writer, and the credit note books it on the stamped VAT account (the first N held for a person: lib/domain/sales/refund-182-hold.ts). A 182 figure that cannot be read is still refused and parked.
     // The check is made only for a refund that carries 182 tax on an order stamped on a scheme, and the switch is asked only then, so every other refund is read exactly as before.
     const easTax = so.euVatRegime != null ? refundTaxOnEasRate(wcRefund) : null
+    let eas182StatedTaxForeign: number | undefined
     if (easTax !== null) {
       const { isAccountingSyncTypeEnabledFor } = await import('@/lib/accounting')
       if (await isAccountingSyncTypeEnabledFor('xero', 'SALES_INVOICE')) {
-        const message = easRefundRefusal(wcRefund.id, easTax)
-        await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: message, payload: wcRefund })
-        await writeActivity({
-          entityType: 'SALES_ORDER',
-          entityId: so.id,
-          action: 'refund_sync_eas_rate_182_refused',
-          tag: 'sync',
-          level: 'WARNING',
-          description: message,
-          metadata: { externalRefundId: wcRefund.id },
-          resolveUser: false,
-        })
-        return { outcome: 'quarantined-refusal', error: message }
+        const stated = refundStatedTax(wcRefund)
+        if (!stated.unreadable) eas182StatedTaxForeign = toDecimal(stated.total).toNumber()
+        else {
+          const message = easRefundRefusal(wcRefund.id, easTax)
+          await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: message, payload: wcRefund })
+          await writeActivity({
+            entityType: 'SALES_ORDER',
+            entityId: so.id,
+            action: 'refund_sync_eas_rate_182_refused',
+            tag: 'sync',
+            level: 'WARNING',
+            description: message,
+            metadata: { externalRefundId: wcRefund.id },
+            resolveUser: false,
+          })
+          return { outcome: 'quarantined-refusal', error: message }
+        }
       }
     }
 
@@ -1037,7 +1043,7 @@ export async function syncWcRefund(
         refundLines.filter((l) => l.qty > 0 || l.totalBase > 0),
         wcRefund.reason || 'WooCommerce refund',
         returnWarehouseId,
-        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id, statedGrossForeign: refundAmountForeign.toNumber() },
+        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id, statedGrossForeign: refundAmountForeign.toNumber(), ...(eas182StatedTaxForeign !== undefined ? { eas182StatedTaxForeign } : {}) },
       )
     } catch (error) {
       if (!isExternalRefundIdUniqueConflict(error)) throw error
