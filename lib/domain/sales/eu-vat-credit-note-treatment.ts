@@ -71,6 +71,13 @@ export async function treatCreditNotePayload(params: {
 
   // THE STAMP, READ AND NEVER DECIDED AGAIN.
   if (order.euVatRegimeStampedAt === null) {
+    // IMMUTABLE EVIDENCE FIRST. (a) a stamp: handled below. (b) no stamp, but IMS itself queued or posted an invoice for this order carrying the EU VAT treatment marker: a scheme order, whatever the rates map to now.
+    const treatedInvoice = await db.accountingSyncLog.findFirst({
+      where: { type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] }, referenceType: 'SalesOrder', referenceId: params.orderId, payload: { path: ['_euVatTreatment', 'applied'], equals: true } },
+      select: { id: true },
+    })
+    if (treatedInvoice !== null) return { kind: 'refused', reason: noStampRefusal(number), code: 'hand_post' as const }
+    // (c) no stamp and no invoice of IMS's: the invoice came from the storefront plugin before cut-over. ACCEPTED LIMIT: only the rates' CURRENT mapping can say whether it was a scheme sale, so removing a rate's scheme mapping while refunds of such pre-cut-over orders are still possible misclassifies them as ordinary. Do not remove scheme mappings from rates used on those orders.
     const soldOnScheme = order.lines.some((line) => SCHEME_CATEGORIES.has((line.taxRate?.reportingCategory ?? '').trim().toUpperCase()) || (line.taxRate?.schemePostingTaxType ?? '').trim() !== '')
     return soldOnScheme ? { kind: 'refused', reason: noStampRefusal(number), code: 'hand_post' as const } : { kind: 'skipped', why: 'not_scheme' }
   }

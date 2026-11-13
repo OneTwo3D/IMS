@@ -288,6 +288,21 @@ test('routeFor: a stamp and the current facts that contradict each other refuse;
   assert.equal(g.ok, false)
 })
 
+test('routeFor: a mapping moved to another zero-rated type AFTER the stamp refuses the invoice (a credit note reverses the stamped type); an unrecorded type is not held to it', () => {
+  const de = schemeRows.find((r) => r.country === 'DE')!
+  const built = build(de, { goodsSubtotal: '100.00' })
+  const scheme = resolveEuVatRegime(built.input)
+  assert.equal(scheme.kind, 'SCHEME')
+  if (scheme.kind !== 'SCHEME') return
+  const stampedAt = new Date()
+  const same = routeFor({ regime: 'IOSS', vatAccount: '821', stampedAt, schemePostingTaxType: scheme.schemePostingTaxType }, scheme, built.input)
+  assert.equal(same.ok, true)
+  const moved = routeFor({ regime: 'IOSS', vatAccount: '821', stampedAt, schemePostingTaxType: 'TAX-OLD' }, scheme, built.input)
+  assert.equal(moved.ok, false)
+  assert.match(moved.ok ? '' : moved.reason, /the order was stamped on the zero-rated type TAX-OLD, but the rate's Xero mapping now says .*changed since the order was stamped/)
+  assert.equal(routeFor({ regime: 'IOSS', vatAccount: '821', stampedAt, schemePostingTaxType: null }, scheme, built.input).ok, true)
+})
+
 test('a threshold-crossing re-import: stamped IOSS at 96, the goods rise over EUR 150, the fresh decision is DDP, so the invoice is refused, not posted through the IOSS stamp', () => {
   const de = schemeRows.find((r) => r.country === 'DE')!
   const first = build(de, { goodsSubtotal: '100.00' })

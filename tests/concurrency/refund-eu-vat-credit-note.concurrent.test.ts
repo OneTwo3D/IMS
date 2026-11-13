@@ -333,6 +333,26 @@ test('[eu vat credit note] the credit note reverses what the INVOICE used: a rat
   assert.equal((await deps.db.salesOrderRefund.findUnique({ where: { id: unknownRow!.refundId }, select: { accountingRetryRequired: true } }))?.accountingRetryRequired, false)
 })
 
+test('[eu vat credit note] unstamped orders: an IMS-queued treated invoice makes it a scheme order even after the rate mapping is removed; with no such invoice (pre-cut-over) the current mapping decides, an accepted limit', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true)
+  const withInvoice = await seed(deps, { stamp: null, schemeRate: false })
+  const preCutover = await seed(deps, { stamp: null, schemeRate: false })
+  t.after(async () => { await restore(); await cleanup(deps.db, withInvoice); await cleanup(deps.db, preCutover) })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  // The scheme mapping has been REMOVED from the rate (schemeRate: false). IMS had queued a treated invoice for the first order.
+  await deps.db.accountingSyncLog.create({ data: { connector: 'xero', type: 'SALES_INVOICE', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: withInvoice.orderId, payload: { invoiceNumber: 'INV-X', lines: [], _euVatTreatment: { applied: true, route: 'scheme' } }, attemptRevision: 1 } })
+  const a = await deps.createRefund(withInvoice.orderId, [itemised(withInvoice.goods, 'Widget', 100, 19)], 'a', undefined, { internalBypassToken: deps.bypass, externalRefundId: wooRefundId(), statedGrossForeign: 119 })
+  assert.equal(a.success, true, a.error)
+  const rowA = await creditNoteRow(deps.db, withInvoice.orderId)
+  const { refusedCreditNoteError } = await import('../../lib/domain/accounting/eu-vat-credit-note.ts')
+  assert.match(refusedCreditNoteError(rowA!.payload!) ?? '', /no recorded VAT regime/, 'still refused, to be posted by hand')
+  const b = await deps.createRefund(preCutover.orderId, [itemised(preCutover.goods, 'Widget', 100, 19)], 'b', undefined, { internalBypassToken: deps.bypass, externalRefundId: wooRefundId(), statedGrossForeign: 119 })
+  assert.equal(b.success, true, b.error)
+  const rowB = await creditNoteRow(deps.db, preCutover.orderId)
+  assert.equal(refusedCreditNoteError(rowB!.payload!), null, 'documented limit: no stamp, no IMS invoice, no scheme mapping now: an ordinary credit note')
+})
+
 test('[eu vat credit note] a CANCELLATION (the whole-order reversal) reverses the whole VAT with full lines: the stamped regime, every fee, the order\'s own tax', { skip }, async (t) => {
   const deps = await loadDeps()
   const restore = await configure(deps.db, true)
