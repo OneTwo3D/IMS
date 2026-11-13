@@ -340,6 +340,8 @@ If your store uses the EU order-withdrawal button plugin, IMS follows its status
 
 Orders held for a withdrawal are re-checked every 15 minutes by the **WooCommerce Withdrawal Sweep** job (Settings > System > Scheduler), so a request is not missed if a webhook is lost. If a withdrawn order's shipment is later reported by the warehouse, it appears under **Sync > Exceptions** marked **Withdrawal standing** until the withdrawal is resolved.
 
+**If the withdrawal plugin is not active on the store**, WooCommerce does not know the withdrawal statuses and refuses any order query that names them. IMS therefore checks the store's registered order statuses once per run (a read-only request) and leaves the unregistered withdrawal statuses out of the poll and reconciliation, so orders keep importing. It writes a **WARNING** to the activity log (at most once every six hours) naming the missing plugin and saying that withdrawal requests are not seen until the plugin is active. Once the plugin is active again, the next run notices the statuses are back and re-reads orders from the point the gap began, so an order that is already withdrawn is picked up. This only ever applies to the two withdrawal statuses: if a status you ticked under "Import order statuses" (or `completed` on the reconciliation) is not registered in WooCommerce, the run is refused with an error naming it. If IMS cannot read the store's registered statuses, it changes nothing and behaves as before.
+
 ## Product Sync
 
 The **Products** tab controls bidirectional product synchronisation.

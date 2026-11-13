@@ -10,6 +10,11 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### WooCommerce order sweep no longer fails when the withdrawal plugin is not active
+
+- **The order poll and reconciliation now skip an EU withdrawal status the store has not registered, instead of failing the whole run.** WooCommerce refuses any order query naming a status it does not know, so a store without the WebToffee EU Order Withdrawal Button plugin made every sweep fail and import nothing. IMS now reads the store's registered order statuses once per run and drops only the unregistered withdrawal statuses, with a WARNING in the activity log (at most every six hours) naming the plugin and saying withdrawal requests are not seen until it is active. A status you ticked under "Import order statuses" (or `completed` on reconciliation) that is not registered still refuses the run with an error; if the registered statuses cannot be read, nothing is dropped.
+- **Re-activating the plugin cannot skip orders.** The statuses recorded with the sweep position are the ones actually asked for, so the run after the plugin returns counts as a widening and re-reads from the point the gap began.
+
 ### Merged Mintsoft orders: a cancelled order's lines are taken out of the combined order
 
 - **A cancelled (or fully refunded) IMS order that Mintsoft merged into another is now removed from the combined order automatically.** Mintsoft keeps every original line on the merged order under its original line id (confirmed live 2026-11-12, including a SKU both orders share, which stays as two separate lines). IMS now records those line ids when it pushes an order (one read-back right after the create, and again after an amendment) and, on the cancel, deletes exactly that order's lines from the combined order, reads the combined order again after each delete, proves the line is gone and every other line unchanged, tries to leave a warehouse note naming the order and the lines removed (best effort; not guaranteed), and marks the order's link cancelled. The combined order itself is never cancelled while it holds another order's lines; when the cancelled order's lines are the only ones left, it is cancelled normally.
