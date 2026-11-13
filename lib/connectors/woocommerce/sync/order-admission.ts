@@ -181,11 +181,11 @@ export function wcAdmissionRefusalQueueWhere(externalOrderId?: string): Prisma.S
  * predicate, never a second statement of it.
  */
 export function wcBlockedOrderQueueWhere(): Prisma.ShoppingSyncLogWhereInput {
+  // The queue's own predicate, plus one top-level OR over the guard reasons (flat rather than an AND
+  // of two payload filters, so it stays inside the `where` language the test doubles interpret).
   return {
-    AND: [
-      wcAdmissionRefusalQueueWhere(),
-      { OR: WC_BLOCKED_IMPORT_REASONS.map((reason) => ({ payload: { path: ['reason'], equals: reason } })) },
-    ],
+    ...wcAdmissionRefusalQueueWhere(),
+    OR: WC_BLOCKED_IMPORT_REASONS.map((reason) => ({ payload: { path: ['reason'], equals: reason } })),
   }
 }
 
