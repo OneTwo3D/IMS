@@ -14,10 +14,11 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ### Operator actions (breaking)
 
-Numbered 4.0.0 because one change needs operator action when Xero sync is on. Each line names the topic below that it comes from.
+Numbered 4.0.0 because these changes need operator action when Xero sync is on. Each line names the topic below that it comes from.
 
 - **Map a Xero tax type to every VAT rate that supplier bills use, and keep those rates active** (Settings > Accounting > Tax, import the purchase tax rates from Xero if needed). A supplier bill or supplier credit note whose line has no mapped tax type, or is priced on an inactive purchase tax rate, is now refused (nothing is sent to Xero) instead of posting as "No VAT". With Xero sync on, check the rate on each open purchase order and each bill still to be raised before relying on them. See *Xero accounting audit fixes: bill VAT, supplier-document tax types and payment dates*.
 - **Re-save any queued bill that has a non-vatable cost line** (one edit-and-save) so it is re-derived on the corrected rules. Same topic.
+- **Supplier credits against a reverse-charge bill, or a bill that mixes tax treatments, are raised in Xero directly.** With Xero sync on, such a credit is refused before it is claimed and stays a draft in IMS; mapping tax rates does not unblock it. Raise the credit in Xero by hand (it is not sent from IMS). Same topic.
 
 Everything else in this release is additive migrations, backend or CI changes, or behind a switch that is off by default (the EU VAT invoice treatment behind the Sales Invoices switch, and the gift-card flag cut-in, unset by default): built, switched off, no action needed.
 
