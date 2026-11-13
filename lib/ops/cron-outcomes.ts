@@ -162,8 +162,8 @@ export const cronOutcomes = {
   // unresolvedAfterSend (a duplicate send is possible): numbers; erasureReconcileIncomplete: string[]
   'email-outbox': (r: ProcessEmailOutboxResult & { erasureReconcileIncomplete?: string[] }) =>
     from(r, counts(r, ['failed', 'parked', 'conflicted', 'conflictedWithoutSend', 'unresolvedAfterSend']), (r.erasureReconcileIncomplete?.length ?? 0) > 0 ? 'failed' : null),
-  // errors / stepFailures: lists of texts; a step that threw is reported as { error }
-  'fx-rates': (r: FxRatesCronResult) => from(r, structural(r), counts(r, ['failed'])),
+  // errors / stepFailures: lists of texts; a step that threw is reported as { error }; connectorPushFailures / connectorPushHeld: connector FX push errors returned (not thrown) by the fan-out, held ones apart; pendingWcOrderRetryFailures: the order retry threw
+  'fx-rates': (r: FxRatesCronResult) => from(r, structural(r), counts(r, ['failed', 'connectorPushFailures', 'pendingWcOrderRetryFailures'])),
   // errors: number
   'hs-classify': (r: HsSweepResult) => from(r, num(r.errors) > 0 ? 'failed' : null),
   // status !== 'completed'

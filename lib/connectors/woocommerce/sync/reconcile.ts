@@ -114,7 +114,11 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
   if (stockEnabled?.value === 'true') {
     // Stock corrections that refunds still owe the store (a queue failure left them open): record their jobs first so this run processes them.
     try {
-      await queueRefundStockCorrections({ limit: 50 })
+      const queuedCorrections = await queueRefundStockCorrections({ limit: 50 })
+      // The call RETURNS its per-refund failures (obligations left open because recording their job failed) without throwing: carry them, not drop them.
+      if (queuedCorrections.failed > 0) {
+        results.refundStockCorrections = { error: `${queuedCorrections.failed} open refund stock correction(s) could not be queued (they stay open and are retried)` }
+      }
     } catch (error) {
       console.error('[wc-reconcile] queueing open refund stock corrections failed', error)
       // Carried into the result, not dropped: the rest of the run goes on, and the cron exit status reads this (held-aware, by the error text).
