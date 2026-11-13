@@ -1,4 +1,5 @@
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
+import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { WMS_CANCELLABLE_ORDER_WHERE } from '@/lib/domain/wms/order-push-sweep'
@@ -1605,6 +1606,7 @@ export async function runWmsDispatchSweepCore(
     }
 
     let outcome: WmsDispatchOutcome
+    let thrownHold = false
     try {
       outcome = await reconcileOneOrder(deps, candidate, preload, expectedExternalOrderId, requireResolution, mergeNumberUnique)
     } catch (error) {
@@ -1618,6 +1620,8 @@ export async function runWmsDispatchSweepCore(
       outcome = isWmsUnresolvableRecordError(error)
         ? { action: 'pending', reason: scrubWmsError(error, 'WMS record unusable'), unresolved: true }
         : { action: 'error', reason: scrubWmsError(error, 'WMS dispatch sweep error') }
+      // The class is read BEFORE the text is scrubbed: scrubbing redacts and truncates, which would break the hold's own reference.
+      thrownHold = isOutboundWriteHeldError(error) && error.nothingSent
     }
     // Any error — or a pending we could not actually RESOLVE — holds the watermark
     // back so a changed row can't age out of the next window before it's applied.
@@ -1637,7 +1641,7 @@ export async function runWmsDispatchSweepCore(
     let reason = outcome.reason
     try {
       if (outcome.action === 'error') {
-        if (isOutboundWriteHeldText(outcome.reason)) counters.outboundHeld = (counters.outboundHeld ?? 0) + 1
+        if (thrownHold || isOutboundWriteHeldText(outcome.reason)) counters.outboundHeld = (counters.outboundHeld ?? 0) + 1
         const { deadLettered } = await deps.recordDispatchError(candidate, outcome.reason)
         if (deadLettered) reason = `${outcome.reason} — dead-lettered after ${DISPATCH_MAX_CONSECUTIVE_FAILURES} consecutive failures`
       } else if (!outcome.unresolved) {

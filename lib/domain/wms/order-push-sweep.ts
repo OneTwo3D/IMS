@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
+import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { STORE_CREDIT_PUSH_WITHHELD_REASON, storeCreditPushMustBeWithheld } from '@/lib/domain/wms/store-credit-push-guard'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
@@ -298,6 +299,13 @@ export function provesNoRemoteWmsCall(
 const DEFAULT_BATCH_SIZE = 25
 /** o3d-rbyg: shared empty result for the live withdrawal screen — "nothing withdrawn", not "unknown". */
 const EMPTY_ORDER_ID_SET: ReadonlySet<string> = new Set<string>()
+
+/** A failure that is a write the outbound-write hold refused (by class, or by the hold's authenticated text) is also counted in `outboundHeld`. */
+function noteOutboundHeld(result: { outboundHeld?: number }, error: unknown): void {
+  if ((isOutboundWriteHeldError(error) && error.nothingSent) || isOutboundWriteHeldText(error instanceof Error ? error.message : String(error))) {
+    result.outboundHeld = (result.outboundHeld ?? 0) + 1
+  }
+}
 
 export type WmsOrderPushSweepResult = {
   skipped?: string
@@ -2661,6 +2669,7 @@ export async function runWmsOrderPushSweepCore(
             const message = scrubWmsError(e, 'raced-withdrawal compensation failed')
             console.error(`[wms-order-push] ${order.id}: ${message}`)
             result.failed += 1
+            noteOutboundHeld(result, e)
             await port.updateLinkByOrder?.(order.id, { lastError: message, lastAttemptAt: ts }).catch(() => {})
           }
           // Deliberately NOT counted as `created`: the order existed at the
@@ -2705,7 +2714,7 @@ export async function runWmsOrderPushSweepCore(
         const message = scrubWmsError(error, 'WMS order push failed')
         if (dead) result.deadLettered += 1
         else result.failed += 1
-        if (heldByOutboundHold) result.outboundHeld = (result.outboundHeld ?? 0) + 1
+        if (heldByOutboundHold || (isOutboundWriteHeldError(error) && error.nothingSent)) result.outboundHeld = (result.outboundHeld ?? 0) + 1
         const state: PushState = dead ? 'DEAD_LETTER' : 'PENDING_CREATE'
         // `lastAttemptAt` IS the create dispatch stamp (decideCreateClaim): a stamped PENDING_CREATE link is
         // skipped until its lease expires and then parked AMBIGUOUS_CREATE ("a create may have left"). A
@@ -3157,6 +3166,7 @@ export async function runWmsOrderPushSweepCore(
       } catch (error) {
         const message = scrubWmsError(error, 'WMS order update failed')
         result.failed += 1
+        noteOutboundHeld(result, error)
         // The lease is released (the mark stays set: the ids remain untrusted until a verified snapshot is stored).
         if (lineToken) await port.releaseAmendLease?.(link.id, lineToken).catch(() => {})
         // The order post was accepted and the item reconcile failed: the courier on the WMS order has already changed, so its
@@ -3302,6 +3312,7 @@ export async function runWmsOrderPushSweepCore(
       } catch (error) {
         const message = scrubWmsError(error, 'WMS hold/cancel failed')
         result.failed += 1
+        noteOutboundHeld(result, error)
         await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts }).catch(() => {})
         const remoteCancelled = cancel?.cancelled === true
         await audit({
@@ -3381,6 +3392,7 @@ export async function runWmsOrderPushSweepCore(
       } catch (error) {
         const message = scrubWmsError(error, 'WMS cancel failed')
         result.failed += 1
+        noteOutboundHeld(result, error)
         await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts }).catch(() => {})
         const remoteCancelled = cancel?.cancelled === true
         await audit({

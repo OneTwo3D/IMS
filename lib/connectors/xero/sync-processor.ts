@@ -9,6 +9,7 @@ import { resolveSalesPostContact } from '@/lib/domain/erasure/accounting-contact
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { getRateLimitBackoffMs, isRateLimitError } from './deferral'
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
+import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { isUsableImsRate } from '@/lib/domain/accounting/foreign-currency-rate-guard'
@@ -304,6 +305,16 @@ type ProcessResult = {
   skipped: number
   /** PRESENT ONLY WHEN NON-ZERO: failures that are writes the outbound-write hold refused (also counted in `failed`). */
   outboundHeld?: number
+}
+
+/**
+ * A failure that is a write the outbound-write hold refused (recognised by the thrown class, or by the hold's own authenticated text) is
+ * ALSO counted in `outboundHeld`, which the cron exit status subtracts from `failed`: a held write is not a fault of this run. Call it
+ * beside every `result.failed++` whose cause is an error value.
+ */
+export function noteHeldFailure(result: ProcessResult, error: unknown): void {
+  const held = (isOutboundWriteHeldError(error) && error.nothingSent) || isOutboundWriteHeldText(error instanceof Error ? error.message : String(error))
+  if (held) result.outboundHeld = (result.outboundHeld ?? 0) + 1
 }
 
 type SyncPayload = Record<string, unknown>
@@ -4248,6 +4259,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           await markSyncLogForFollowUpRetry(attempt, entry, followUpError)
           await logFollowUpRetry(entry.id, followUpError)
           result.failed++
+          noteHeldFailure(result, followUpError)
           continue
         }
         result.succeeded++
@@ -4387,6 +4399,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           await markSyncLogForFollowUpRetry(attempt, entry, followUpError)
           await logFollowUpRetry(entry.id, followUpError)
           result.failed++
+          noteHeldFailure(result, followUpError)
           continue
         }
 
@@ -4407,7 +4420,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           })
         }
         result.failed++
-        if (isOutboundWriteHeldText(errorMessage)) result.outboundHeld = (result.outboundHeld ?? 0) + 1
+        noteHeldFailure(result, errorMessage)
       }
     } catch (e) {
       if (e instanceof PostedDocumentEvidenceUnwritten) {
@@ -4434,7 +4447,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         })
       }
       result.failed++
-      if (isOutboundWriteHeldText(errorMessage)) result.outboundHeld = (result.outboundHeld ?? 0) + 1
+      noteHeldFailure(result, e)
     }
   }
 
@@ -4853,6 +4866,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           await logFollowUpRetry(entry.id, followUpError)
           if (!retry.errorMessage) throw new Error(`Xero sync entry ${entry.id} follow-up failure could not be recorded`)
           result.failed++
+          noteHeldFailure(result, followUpError)
           continue
         }
         await markXeroOutboxSuccess(job)
@@ -5018,6 +5032,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           await logFollowUpRetry(entry.id, followUpError)
           if (!retry.errorMessage) throw new Error(`Xero sync entry ${entry.id} follow-up failure could not be recorded`)
           result.failed++
+          noteHeldFailure(result, followUpError)
           continue
         }
 
@@ -5046,6 +5061,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           })
         }
         result.failed++
+        noteHeldFailure(result, errorMessage)
       }
     } catch (e) {
       if (e instanceof XeroOutboxCompletionError) throw e
@@ -5085,6 +5101,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         })
       }
       result.failed++
+      noteHeldFailure(result, e)
     }
   }
 

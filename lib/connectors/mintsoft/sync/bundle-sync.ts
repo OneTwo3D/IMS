@@ -1,3 +1,5 @@
+import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
+import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { createHash } from 'crypto'
 import { Prisma, ProductLifecycleStatus, ProductType, WmsBundleSyncDirection } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
@@ -83,6 +85,8 @@ export type MintsoftBundleVerifyResult = {
   skippedReason?: string
   /** Bundles the producer-side hold kept as a shadow (also counted in `skipped`). PRESENT ONLY WHEN NON-ZERO. */
   shadowed?: number
+  /** PRESENT ONLY WHEN NON-ZERO: errors that are writes the outbound-write hold refused (also counted in `errors`). */
+  outboundHeld?: number
 }
 
 const BUNDLE_CANDIDATE_SELECT = {
@@ -1056,6 +1060,8 @@ export async function runMintsoftBundleVerify(
 
   const counters = { synced: 0, conflicts: 0, skipped: 0, errors: 0 }
   let shadowedBundles = 0
+  /** Errors that are writes the outbound-write hold refused (also in `errors`). */
+  let heldBundles = 0
   let index = 0
 
   async function worker(): Promise<void> {
@@ -1067,13 +1073,17 @@ export async function runMintsoftBundleVerify(
         const result = await syncBundleInternal(candidate.id, triggeredBy)
         if (result.status === 'SYNCED') counters.synced += 1
         else if (result.status === 'CONFLICT') counters.conflicts += 1
-        else if (result.status === 'ERROR') counters.errors += 1
+        else if (result.status === 'ERROR') {
+          counters.errors += 1
+          if (isOutboundWriteHeldText(result.reason)) heldBundles += 1
+        }
         else {
           counters.skipped += 1
           if (result.action === 'shadowed') shadowedBundles += 1
         }
       } catch (error) {
         counters.errors += 1
+        if ((isOutboundWriteHeldError(error) && error.nothingSent) || isOutboundWriteHeldText(error instanceof Error ? error.message : String(error))) heldBundles += 1
         console.error('Mintsoft bundle verify failed', candidate.id, error)
       }
     }
@@ -1110,5 +1120,6 @@ export async function runMintsoftBundleVerify(
     totalChecked,
     ...counters,
     ...(shadowedBundles > 0 ? { shadowed: shadowedBundles } : {}),
+    ...(heldBundles > 0 ? { outboundHeld: heldBundles } : {}),
   }
 }
