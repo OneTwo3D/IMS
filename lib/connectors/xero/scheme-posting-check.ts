@@ -12,6 +12,7 @@ import { schemePostingTypeProblem, EU_VAT_TREATMENT_PAYLOAD_KEY } from '@/lib/do
 import { readStoredXeroList, type Client } from '@/lib/tax/purchase-tax-import'
 import { regimePolicyProblem } from '@/lib/domain/accounting/eu-vat-regime-policy'
 import { REGIME_POLICY_BLOCKED_REFUSAL } from '@/lib/connectors/woocommerce/sync/regime-policy-hold'
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { BeforeRemoteWrite } from './invoices'
 
 /** Null when `taxType` is shown to be a known, ACTIVE, revenue, exactly 0% type by the proven stored list; otherwise the reason. */
@@ -43,6 +44,25 @@ export async function euSchemePostingRefusal(payload: Record<string, unknown>, n
   return `NOTHING WAS SENT. Sales invoice ${String(payload.invoiceNumber ?? '(no number)')} was refused: ${problem}. The invoice was built for an IOSS, VOEC or DDP order on a zero-rated type and would not total the order on any other. Fix the Xero tax type or the IMS rate's scheme posting type, then re-import the order.`
 }
 
+/** What the operator is told when a queued credit note's regime settings changed since it was prepared. A credit note is never superseded or rebuilt in place (its row may already have been claimed, and a claimed row is never provably unsent), so the two ways out are the ones that work: restore the setting, or post it by hand. */
+export const CREDIT_NOTE_POLICY_REFUSAL = (creditNoteNumber: string, problem: string): string =>
+  withLedgerCheck(`NOTHING WAS SENT. Credit note ${creditNoteNumber} was refused: ${problem}. The credit note was built under the previous settings and an earlier attempt on this row may already have created it in Xero, so IMS does not rebuild it. Check Xero for credit note ${creditNoteNumber} first. If it is there, record it on this row with the settle action on /sync. If it is not, either restore the previous EU VAT settings (Settings > Accounting) and retry this row on /sync, or post the credit note by hand in Xero and record it on this row with the settle action on /sync.`)
+
+/** The credit note's last look before the claim is re-taken: a payload carrying the credit-note treatment marker is judged on the recorded regime policy and the stored Xero proof of its zero-rated type. Every other payload returns null and is posted as before. */
+export async function euCreditNoteSchemePostingRefusal(payload: Record<string, unknown>, now: Date = new Date()): Promise<string | null> {
+  const marker = payload[EU_VAT_TREATMENT_PAYLOAD_KEY]
+  if (typeof marker !== 'object' || marker === null) return null
+  const m = marker as { applied?: unknown; document?: unknown; route?: unknown; schemePostingTaxType?: unknown; regimePolicy?: unknown }
+  if (m.applied !== true || m.document !== 'credit-note') return null
+  const number = String(payload.creditNoteNumber ?? '(no number)')
+  const policyProblem = await regimePolicyProblem(m.regimePolicy)
+  if (policyProblem !== null) return CREDIT_NOTE_POLICY_REFUSAL(number, policyProblem)
+  const type = typeof m.schemePostingTaxType === 'string' ? m.schemePostingTaxType.trim() : ''
+  const problem = type === '' ? 'the treatment marker names no scheme posting type' : await storedSchemePostingTypeProblem(type, now)
+  if (problem === null) return null
+  return withLedgerCheck(`NOTHING WAS SENT. Credit note ${number} was refused: ${problem}. The credit note was built for an IOSS, VOEC or DDP order on a zero-rated type and would not total the refund on any other. Check Xero for credit note ${number} first. Fix the Xero tax type or the IMS rate's scheme posting type, then retry this row on /sync.`)
+}
+
 /** The scheme posting-type proof of a treated scheme payload (the stored Xero list, read now); null for every other payload or when the type is proven zero-rated and active. */
 async function schemeTypeProblem(payload: Record<string, unknown>, now: Date = new Date()): Promise<string | null> {
   const marker = payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown; route?: unknown; schemePostingTaxType?: unknown } | null | undefined
@@ -58,6 +78,8 @@ async function schemeTypeProblem(payload: Record<string, unknown>, now: Date = n
  * It only ever REFUSES, never supersedes: this attempt's dispatch marker has been minted by now, so the row is not provably unsent and the refusal says to check Xero first. What changes after this, while the request is on the wire, cannot be checked by anything.
  */
 export function finalSchemeAndPolicyCheck(payload: Record<string, unknown>, kind: 'create' | 'update'): BeforeRemoteWrite {
+  // A credit note carries the same marker with `document: 'credit-note'` and is judged by the same two proofs in the same order, with its own words (see `finalCreditNoteSchemeAndPolicyCheck`).
+  if ((payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { document?: unknown } | null | undefined)?.document === 'credit-note') return finalCreditNoteSchemeAndPolicyCheck(payload)
   return async () => {
     const number = String(payload.invoiceNumber ?? '(no number)')
     const typeProblem = await schemeTypeProblem(payload)
@@ -85,4 +107,34 @@ export function composeFinalBeforePost(numberFence: BeforeRemoteWrite | null, pa
     }
     return last(request)
   }
+}
+
+/**
+ * THE CREDIT NOTE'S FINAL CHECK BEFORE THE SOCKET, the same shape as `finalSchemeAndPolicyCheck`: the scheme posting-type proof, then the recorded regime policy, the policy compare the LAST awaited step. It is handed to `pushCreditNote` as `beforePost` and runs as the last statement before the request
+ * leaves, after the early check (`euCreditNoteSchemePostingRefusal`) and the claim fence, because a setting or the stored Xero list can change in the time between. It only ever REFUSES: this attempt holds a claim, so the row is not provably unsent, and the refusal says to check Xero first.
+ * Only a payload carrying the credit-note treatment marker is judged; every other credit note passes unchanged.
+ */
+export function finalCreditNoteSchemeAndPolicyCheck(payload: Record<string, unknown>): BeforeRemoteWrite {
+  return async () => {
+    const marker = payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown; document?: unknown; route?: unknown; schemePostingTaxType?: unknown; regimePolicy?: unknown } | null | undefined
+    if (typeof marker !== 'object' || marker === null || marker.applied !== true || marker.document !== 'credit-note') return { ok: true }
+    const number = String(payload.creditNoteNumber ?? '(no number)')
+    const type = typeof marker.schemePostingTaxType === 'string' ? marker.schemePostingTaxType.trim() : ''
+    const typeProblem = type === '' ? 'the treatment marker names no scheme posting type' : await storedSchemePostingTypeProblem(type)
+    if (typeProblem !== null) {
+      return { ok: false, error: withLedgerCheck(`NOTHING WAS SENT. Credit note ${number} was refused immediately before it left: ${typeProblem}. The credit note was built for an IOSS, VOEC or DDP order on a zero-rated type and would not total the refund on any other. Check Xero for credit note ${number} first. Fix the Xero tax type or the IMS rate's scheme posting type, then retry this row on /sync.`) }
+    }
+    const policyProblem = await regimePolicyProblem(marker.regimePolicy)
+    return policyProblem === null ? { ok: true } : { ok: false, error: CREDIT_NOTE_POLICY_REFUSAL(number, policyProblem) }
+  }
+}
+
+/**
+ * The pre-socket authorization of a credit-note post: the composed final check for a payload carrying the credit-note treatment marker, and NOTHING (undefined) for every other credit note, so a credit note the treatment did not touch is posted through exactly the path it always was.
+ * It goes through `composeFinalBeforePost` like the invoice create, so the final check is structurally the last statement before the request.
+ */
+export function creditNoteBeforePost(payload: Record<string, unknown>): BeforeRemoteWrite | undefined {
+  const marker = payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown; document?: unknown } | null | undefined
+  if (typeof marker !== 'object' || marker === null || marker.applied !== true || marker.document !== 'credit-note') return undefined
+  return composeFinalBeforePost(null, payload, 'create')
 }

@@ -123,7 +123,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   },
   SalesOrderRefundLine: {
     erased: [],
-    notPersonal: ['costLayerSnapshot', 'accountingTaxType', 'lineKind'],
+    notPersonal: ['costLayerSnapshot', 'accountingTaxType', 'lineKind', 'postingTaxType'],
     retained: { description: 'the text on a refunded line: part of the retained credit-note record' },
   },
   ShipmentLine: { erased: [], notPersonal: ['costLayerSnapshot'], retained: {} },

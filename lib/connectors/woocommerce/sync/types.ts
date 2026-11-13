@@ -148,6 +148,8 @@ export type WcRefundLineItem = {
   sku: string
   meta_data: WcMeta[]
   refund_total: number
+  /** The tax the refund returned on this item, per WooCommerce tax rate id. */
+  taxes?: { id: number; total: string }[]
 }
 
 export type WcRefund = {
@@ -162,6 +164,7 @@ export type WcRefund = {
   meta_data: WcMeta[]
   line_items: WcRefundLineItem[]
   shipping_lines?: WcShippingLine[]
+  fee_lines?: { taxes?: { id: number; total: string }[] }[]
 }
 
 export type WcFullProduct = {

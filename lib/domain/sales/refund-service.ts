@@ -31,6 +31,7 @@ import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-ma
 import { findGrossOverPaidBalance, findOverAllocatedRefundTarget, invalidQuantityRefusal, nonSaleRowRefusal, overAllocatedRefundTargetMessage, publicRefundLineRefusal } from '@/lib/domain/sales/refund-target-balances'
 import { orderDiscountReversal, refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
 import { storedAmountsIncludeVat } from '@/lib/domain/sales/sales-order-vat-basis'
+import { resolveSchemePostingSnapshot } from '@/lib/domain/sales/refund-scheme-posting'
 import {
   RATE_EPSILON,
   buildTaxTypeRateIndex,
@@ -3652,6 +3653,13 @@ export async function createSalesOrderRefund(
      * operator records it again against the configuration that now holds.
      */
     expectedTaxIdentities?: RefundExpectedTaxIdentity[]
+    /**
+     * IOSS credit notes: set by the caller ONLY while the Sales Invoices switch is on for the Xero chart. The writer then snapshots, under the order lock, the scheme posting type of
+     * each refund line (`postingTaxType`) and the gross the source stated (`statedGrossForeign`) when the order's write-once stamp is on a scheme. Unset (the default, and always with the switch off) writes neither.
+     */
+    euVatSchemeSnapshot?: boolean
+    /** The gross (tax included) the source of the refund states it returned, in the order currency: the WooCommerce refund `amount`. Honoured only with `euVatSchemeSnapshot`, and only from an internal caller. */
+    statedGrossForeign?: number
   },
 ): Promise<CreateSalesOrderRefundResult> {
   // THE ROW-SHAPE CHECKS RUN ON THE REQUEST AS SENT, before any filtering: a row the filter below would drop (a negative quantity with no money)
@@ -4807,6 +4815,8 @@ export async function createSalesOrderRefund(
     // Whether the accounting staging (and so the reversal journals) follows this transaction. ONE evaluation, used
     // both to arm the refund's accounting obligation and to decide whether its return document waits to be valued.
     const accountingStagingFollows = Boolean(so.revenueDeferredDate && input.accountingSettings)
+    // Under the order lock this transaction holds: the stamp it reads cannot change before the lines are written. Not read at all unless the caller says the switch is on.
+    const schemeSnapshot = input.euVatSchemeSnapshot === true ? await resolveSchemePostingSnapshot(tx, input.orderId) : null
     const createdRefund = await tx.salesOrderRefund.create({
       data: {
         orderId: input.orderId,
@@ -4847,6 +4857,7 @@ export async function createSalesOrderRefund(
         // A binary that does not write it leaves NULL, and NULL is undecidable — never exonerated
         // by a default and never minted for it by the database.
         reversalStagingState: REVERSAL_STAGING_NOT_STAGED,
+        ...(schemeSnapshot?.scheme === true && input.statedGrossForeign != null && Number.isFinite(input.statedGrossForeign) ? { statedGrossForeign: input.statedGrossForeign } : {}),
       },
       select: { id: true },
     })
@@ -4896,6 +4907,7 @@ export async function createSalesOrderRefund(
           accountingTaxType: taxIdentity.accountingTaxType,
           reverseCharge: taxIdentity.reverseCharge,
           lineKind,
+          ...(schemeSnapshot?.scheme === true ? { postingTaxType: schemeSnapshot.postingTaxType } : {}),
         },
         select: {
           id: true,

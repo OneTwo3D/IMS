@@ -2184,6 +2184,10 @@ model SalesOrderRefund {
   // are GROSS. The o3d-w00 net ceiling/status is only applied when ALL of an order's refunds are NET —
   // otherwise a mixed gross+net sum could mark an order FULL early, so it falls back to the gross basis.
   totalsBasis     String?    @map("totals_basis")
+  /// What the SOURCE of the refund (the WooCommerce refund `amount`) states was returned in all, tax included, in the ORDER's currency. Written only while the Sales Invoices
+  /// switch is on and the order is on an EU scheme; NULL for a manual or chargeback refund (which state nothing) and for every row written before the column existed.
+  /// The scheme credit note's one VAT line is this less the net of its lines.
+  statedGrossForeign Decimal? @db.Decimal(18, 4) @map("stated_gross_foreign")
   source          String?
   accountingRetryRequired Boolean @default(false) @map("accounting_retry_required")
   accountingWarning String?   @map("accounting_warning")
@@ -2479,6 +2483,10 @@ model SalesOrderRefundLine {
   // revenue lands in the shipping account on retry. NULL on legacy rows: the loader keeps its historical
   // inference for those, so no backfill is required and existing behaviour is unchanged.
   lineKind         String?
+  /// The zero-rated Xero TaxType a credit-note line on an EU IOSS/VOEC/DDP scheme order posts on, snapshotted at refund creation beside `accountingTaxType`
+  /// (which stays the rate's own code and is never sent for such a line). Written only while the Sales Invoices switch is on AND the order's stamped regime
+  /// is a scheme; NULL on every other line and on every row written before the column existed. A scheme credit note with a NULL here refuses.
+  postingTaxType   String?  @map("posting_tax_type")
 
   refund          SalesOrderRefund @relation(fields: [refundId], references: [id])
   salesOrderLine  SalesOrderLine?  @relation(fields: [salesOrderLineId], references: [id], onDelete: SetNull)

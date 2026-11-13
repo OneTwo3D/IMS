@@ -69,7 +69,7 @@ export type BeforeRemoteWrite = (
  * `res.error ?? 'Failed to create invoice'` reports the fence's own words, unprefixed by an HTTP
  * status Xero never issued.
  */
-function withSalesInvoiceAuthorization<T>(check: BeforeRemoteWrite | undefined, send: () => Promise<T>): Promise<T> {
+export function withSalesInvoiceAuthorization<T>(check: BeforeRemoteWrite | undefined, send: () => Promise<T>): Promise<T> {
   if (!check) return send()
   return withAccountingEgressAuthorization(
     {

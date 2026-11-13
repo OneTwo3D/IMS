@@ -78,6 +78,7 @@ import { dischargeRefundAccountingObligation } from '@/lib/domain/sales/refund-a
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { rateBinding, resolveSalesLineTaxType, taxTypeForBasis } from '@/lib/accounting/reverse-charge'
 import { creditNoteLineTaxTypeResolver } from '@/lib/domain/sales/refund-posted-tax-identity'
+import { recordCreditNoteTreatmentRefusal, treatCreditNotePayload } from '@/lib/domain/sales/eu-vat-credit-note-treatment'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync } from '@/lib/shopping'
@@ -2332,53 +2333,72 @@ async function queueRefundAccountingActions(input: {
     isTypeEnabledFor: isAccountingSyncTypeEnabledFor,
   })
 
-  ledger.account(creditNote, await queueAccountingSync({
-    ...creditNote,
-    idempotencyKey: `sales-order-refund:${input.refundId}:credit-note`,
-    // o3d-j625: every `accountCode` below is `settings.*`, so the row is routed by the same resolution
-    // those codes came from. Where the chart's connector has since been retired the enqueue refuses,
-    // which the ledger records as an unmet obligation — `accountingRetryRequired` stays set and the
-    // caller reports the warning — instead of committing a credit note to books it does not describe.
-    chartConnector: settings.connector,
-    payload: {
-      creditNoteNumber: input.creditNoteNumber ?? undefined,
-      contactName: cnContactName,
-      contactEmail: orderForCN?.customer?.email ?? undefined,
-      date: new Date().toISOString().slice(0, 10),
-      currency: orderForCN?.currency ?? baseCurrency,
-      reference: input.externalOrderNumber ?? undefined,
-      lines: input.lines.map((line) => ({
-        description: line.description || 'Refund line',
-        quantity: line.qty > 0 ? line.qty : 1,
-        unitAmount: orderForCN?.currency === baseCurrency
-          ? (line.qty > 0 ? line.unitPriceBase : line.totalBase)
-          : (line.qty > 0 ? line.unitPriceForeign : line.totalForeign),
-        accountCode: line.lineKind === 'shipping'
-          ? (settings.shippingAccount || settings.salesAccount)
-          : line.lineKind === 'discount'
-            ? (settings.discountAccount || settings.salesAccount)
-            : settings.salesAccount,
-        // Post under the tax identity SNAPSHOTTED at refund creation (o3d-w00) — the rate the invoice
-        // actually validated — instead of re-predicting it from the order default here, which mis-taxed
-        // deactivated-rate/reverse-charge/mixed-rate refunds. Fall back to the old prediction only for
-        // legacy rows with no snapshot (created before the column existed).
-        taxType: creditNoteTaxTypeOf(line) ?? undefined,
-        // The rate this code can be traced to (never sent): the order line's own rate when the code is its code, else the order-default rate when it is that code's. Checked by the enqueue guard
-        // (lib/tax/retired-tax-code-guard.ts); absent for a swapped or snapshot-only code, which the guard refuses only if a re-key retired it.
-        ...((): Record<string, string> => {
-          const code = creditNoteTaxTypeOf(line) ?? undefined
-          const own = orderForCN?.lines.find((ol) => ol.id === line.lineId)
-          // The order line's own rate when the code is its derivation (a sales goods line), else the order-default rate when the code is that rate's own code (plain); never a rate the code cannot be traced to.
-          if (own?.taxRateId && (code === undefined || own.taxRate?.accountingTaxType == null || code === taxTypeForBasis('sales_line', { baseTaxType: own.taxRate.accountingTaxType, reverseCharge: own.taxRate.reverseCharge, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }))) return rateBinding(own.taxRateId, 'sales_line')
-          return code === undefined || code === cnTaxRate?.accountingTaxType ? rateBinding(cnTaxRate?.id, 'plain') : {}
-        })(),
-      })),
-      // Every stored refund line is NET (o3d-w00): the WooCommerce monetary-only refund — the one caller
-      // that had a gross amount — is now netted at source, so this correctly grosses every line up.
-      lineAmountsIncludeTax: false,
-      currencyRateToBase: usableStoredFxRate(input.refundFxRate)?.toNumber(),
-    },
-  }))
+  const builtCreditNotePayload: Record<string, unknown> = {
+    creditNoteNumber: input.creditNoteNumber ?? undefined,
+    contactName: cnContactName,
+    contactEmail: orderForCN?.customer?.email ?? undefined,
+    date: new Date().toISOString().slice(0, 10),
+    currency: orderForCN?.currency ?? baseCurrency,
+    reference: input.externalOrderNumber ?? undefined,
+    lines: input.lines.map((line) => ({
+      description: line.description || 'Refund line',
+      quantity: line.qty > 0 ? line.qty : 1,
+      unitAmount: orderForCN?.currency === baseCurrency
+        ? (line.qty > 0 ? line.unitPriceBase : line.totalBase)
+        : (line.qty > 0 ? line.unitPriceForeign : line.totalForeign),
+      accountCode: line.lineKind === 'shipping'
+        ? (settings.shippingAccount || settings.salesAccount)
+        : line.lineKind === 'discount'
+          ? (settings.discountAccount || settings.salesAccount)
+          : settings.salesAccount,
+      // Post under the tax identity SNAPSHOTTED at refund creation (o3d-w00) — the rate the invoice
+      // actually validated — instead of re-predicting it from the order default here, which mis-taxed
+      // deactivated-rate/reverse-charge/mixed-rate refunds. Fall back to the old prediction only for
+      // legacy rows with no snapshot (created before the column existed).
+      taxType: creditNoteTaxTypeOf(line) ?? undefined,
+      // The rate this code can be traced to (never sent): the order line's own rate when the code is its code, else the order-default rate when it is that code's. Checked by the enqueue guard
+      // (lib/tax/retired-tax-code-guard.ts); absent for a swapped or snapshot-only code, which the guard refuses only if a re-key retired it.
+      ...((): Record<string, string> => {
+        const code = creditNoteTaxTypeOf(line) ?? undefined
+        const own = orderForCN?.lines.find((ol) => ol.id === line.lineId)
+        // The order line's own rate when the code is its derivation (a sales goods line), else the order-default rate when the code is that rate's own code (plain); never a rate the code cannot be traced to.
+        if (own?.taxRateId && (code === undefined || own.taxRate?.accountingTaxType == null || code === taxTypeForBasis('sales_line', { baseTaxType: own.taxRate.accountingTaxType, reverseCharge: own.taxRate.reverseCharge, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }))) return rateBinding(own.taxRateId, 'sales_line')
+        return code === undefined || code === cnTaxRate?.accountingTaxType ? rateBinding(cnTaxRate?.id, 'plain') : {}
+      })(),
+    })),
+    // Every stored refund line is NET (o3d-w00): the WooCommerce monetary-only refund — the one caller
+    // that had a gross amount — is now netted at source, so this correctly grosses every line up.
+    lineAmountsIncludeTax: false,
+    currencyRateToBase: usableStoredFxRate(input.refundFxRate)?.toNumber(),
+  }
+
+  // IOSS credit notes (behind the Sales Invoices switch): a credit note on an order stamped as an IOSS/VOEC/DDP scheme order is rebuilt on the stamped regime. Off, nothing is read and the payload above is queued exactly as built.
+  // The accounts are the ones read ONCE above for this very payload.
+  const creditNoteTreatment = await treatCreditNotePayload({
+    refundId: input.refundId,
+    orderId: input.orderId,
+    payload: builtCreditNotePayload,
+    refundLineIds: input.lines.map((line) => line.id),
+    connector: settings.connector,
+    accounts: { ioss: settings.euVatIossAccount ?? null, ddp: settings.euVatDdpAccount ?? null, fee: settings.euFeeAccount ?? null, rounding: settings.roundingDifferenceAccount ?? null },
+    now: new Date(),
+  })
+  if (creditNoteTreatment.kind === 'refused') {
+    // Nothing is queued and the obligation stays unmet: the refund stays marked for retry, and a retry after the cause is fixed rebuilds the credit note.
+    await recordCreditNoteTreatmentRefusal({ orderId: input.orderId, refundId: input.refundId, reason: creditNoteTreatment.reason })
+    ledger.account(creditNote, { queued: false, reason: 'refused', connector: settings.connector })
+  } else {
+    ledger.account(creditNote, await queueAccountingSync({
+      ...creditNote,
+      idempotencyKey: `sales-order-refund:${input.refundId}:credit-note`,
+      // o3d-j625: every `accountCode` below is `settings.*`, so the row is routed by the same resolution
+      // those codes came from. Where the chart's connector has since been retired the enqueue refuses,
+      // which the ledger records as an unmet obligation — `accountingRetryRequired` stays set and the
+      // caller reports the warning — instead of committing a credit note to books it does not describe.
+      chartConnector: settings.connector,
+      payload: creditNoteTreatment.kind === 'treated' ? creditNoteTreatment.payload : builtCreditNotePayload,
+    }))
+  }
 
   for (const sync of input.accountingSyncs) {
     // o3d-j625 r2 (Codex HIGH 2) — A REQUEST THAT CANNOT NAME ITS CHART IS REFUSED HERE, NOT ROUTED.
@@ -2603,6 +2623,8 @@ export async function createRefund(
      * order lock. Internal-only and a pure TIGHTENING — it can only refuse a refund, never widen one.
      */
     expectedTaxIdentities?: RefundExpectedTaxIdentity[]
+    /** IOSS credit notes: what the SOURCE of the refund (the WooCommerce refund `amount`) states was returned in all, tax included, in the order currency. Internal callers only; recorded only while the Sales Invoices switch is on and the order is on an EU scheme. */
+    statedGrossForeign?: number
   },
   // Two independent outcomes ride alongside `error`:
   //   `conflict`   (o3d-6oyu.18) — the refund transaction refused this credit note because the
@@ -2697,6 +2719,10 @@ export async function createRefund(
       // list from a public caller would switch the fence off for the hand-recording path, so it is read
       // only from an internal caller.
       expectedTaxIdentities: isInternal ? options?.expectedTaxIdentities : undefined,
+      // IOSS credit notes: asked of the chart's connector once, here. Off (the default) the writer snapshots nothing and the refund is written exactly as before.
+      ...(accountingSettings?.connector === 'xero' && await isAccountingSyncTypeEnabledFor('xero', 'SALES_INVOICE')
+        ? { euVatSchemeSnapshot: true, ...(isInternal && options?.statedGrossForeign != null ? { statedGrossForeign: options.statedGrossForeign } : {}) }
+        : {}),
     })
     if (!refundResult.success) return refundResult
 
