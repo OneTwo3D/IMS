@@ -21,26 +21,33 @@ export type CronFieldDeclaration = {
   breakdownOf?: Record<string, string>
   ignored?: Record<string, string>
   probes?: Record<string, Record<string, unknown>>
+  /**
+   * How this route's result says it skipped by design (`{ skipped: true }`, a status enum, a skip reason). Every consumed field is probed a second
+   * time WITH this set: a top-level skip must never mask the failure of a sweep that ran. Omit it for a route that cannot skip.
+   */
+  skipState?: Record<string, unknown>
 }
 
 export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = {
   'account-balance-snapshot': { consumed: ['errors'] },
-  'accounting-daily-batch': { consumed: ['errors'] },
+  'accounting-daily-batch': { consumed: ['errors'], skipState: { skipped: true, reason: 'x' } },
   'accounting-fx-revaluation': {
+    skipState: { success: true, skipped: true, reason: 'x' },
     consumed: ['error', 'refused'],
   },
-  'accounting-payment-poll': { consumed: ['errors'] },
-  'accounting-payment-reconcile': { consumed: ['errors'] },
+  'accounting-payment-poll': { consumed: ['errors'], skipState: { skipped: 'x' } },
+  'accounting-payment-reconcile': { consumed: ['errors'], skipState: { skipped: true, reason: 'x' } },
   'accounting-sync': {
+    skipState: { skipped: true, reason: 'x' },
     consumed: ['failed', 'backReferenceRepair.failed', 'creditNoteAllocationReenqueue.failed', 'landedCostJournalOutbox.failed', 'provisionalPostingRefusals.failed', 'errors'],
     ignored: { provisionalPostingRefusals: 'the replay result as a whole; its failure count is `provisionalPostingRefusals.failed`, which is consumed' },
   },
   'activity-cleanup': {},
-  backup: { consumed: ['error', 'uploadError', 'cleanupError'] },
+  backup: { consumed: ['error', 'uploadError', 'cleanupError'], skipState: { skipped: true, reason: 'x' } },
   'delivery-status': { consumed: ['failed'] },
   'email-outbox': {
     consumed: ['failed', 'parked', 'conflicted', 'conflictedWithoutSend', 'unresolvedAfterSend', 'erasureReconcileIncomplete'],
-    ignored: { unresolvedWithoutSend: 'the quietest of the four claim-loss counts: nothing was delivered and nothing attributed, so there is no incident (see the field comment in lib/email-outbox.ts)' },
+    ignored: { unresolvedWithoutSend: 'the quietest of the four claim-loss counts: nothing was delivered and nothing attributed, so there is no incident (see the field comment in lib/email-outbox.ts); a row left unresolved is reclaimed by the stale-claim pass, and one that keeps failing reaches `parked`, which is consumed' },
   },
   'fx-rates': {
     consumed: ['failed', 'error', 'pendingWcOrderRetry.failed', 'pendingWcReceiptRetry.queue.failed', 'pendingWcReceiptRetry.queue.error', 'pendingWcReceiptRetry.orphans.failed', 'pendingWcReceiptRetry.orphans.error', 'stepFailures[].error'],
@@ -88,39 +95,42 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
     ],
   },
   'wc-reconcile': {
+    skipState: { skipped: true, reason: 'x' },
     consumed: ['orders.errors', 'products.errors', 'products.permanentErrors', 'refundStockCorrections.error', 'stock.queued.errors', 'stock.sync.errors', 'stock.errors'],
     breakdownOf: { 'stock.queued.failed': 'stock.queued.errors' },
-    ignored: { 'heldSalesInvoices.stillStuck': 'held sales invoices waiting on the accounting connector; it would keep the run red for as long as accounting is disconnected, and the held-invoice queue has its own exception inbox' },
+    ignored: { 'heldSalesInvoices.stillStuck': 'held sales invoices waiting on the accounting connector: each pass logs the stuck invoices as an activity warning, and counting them would keep the run red for as long as accounting is disconnected' },
   },
   'wc-withdrawal-sweep': {
-    consumed: ['erasureSweep.errors'],
+    consumed: ['erasureSweep.errors', 'admissionRefusals.failed'],
+    skipState: { skipped: true, reason: 'x' },
     ignored: {
       unresolved: 'the route throws when this is above zero (a failed run by the exception path)',
       'dispatchScreen.unresolved': 'the route throws when this is above zero (a failed run by the exception path)',
       'admissionRefusals.stillRefused': 'orders that are still, correctly, refused admission: failing the job on them would make a correct refusal look like a broken cron (see the route)',
-      'admissionRefusals.unresolved': 'reported, not thrown, by design: a storefront outage already surfaces through the withdrawal sweep (see the route)',
+      'admissionRefusals.unresolved': 'expected states only (the order is gone from the store, the first-import lock was busy, the withdrawal screen could not decide yet): asked again next sweep, no operator action; read and import failures are counted in `admissionRefusals.failed`, which is consumed',
       admissionRefusals: 'the drain result as a whole; its counts are listed individually',
     },
   },
   'wms-order-push': {
+    skipState: { skipped: 'x' },
     consumed: ['failed', 'deadLettered'],
     ignored: {
-      verifyQuarantined: 'links quarantined by verification: an operator-queue state with its own notice, not a failed run',
+      verifyQuarantined: 'links quarantined by verification: each is also counted in `deadLettered` (consumed) and audited as a FAILED order create, so the run already reads failed',
       verifyUnresolved: 'links still awaiting a verdict: counted so an unknown is not silent, not a failure',
-      validationFailed: 'orders whose payload could not be built locally: documented as NOT a failure (nothing was sent), parked for an operator',
-      createClaimParked: 'expired create claims parked because a create may have been dispatched: nothing failed, an operator or the next sweep decides',
+      validationFailed: 'orders whose payload could not be built locally: nothing was sent, the link is parked VALIDATION_FAILED and shown by the order push recovery view and the production preflight, and it is recorded once on entry rather than every sweep',
+      createClaimParked: 'expired create claims parked AMBIGUOUS_CREATE because a create may have been dispatched: the link state is shown by the order push recovery view and the production preflight, and the sweep logs it',
       recoveryRefusedPreCutoff: 'a recovery the live-from cut-off refuses by design',
     },
   },
   'wms-order-reconcile': {
     ignored: { 'counters.errors': 'decides `status` (FAILED or PARTIAL when above zero), which the mapping reads' },
   },
-  'wms-order-status': { consumed: ['failed', 'errors'] },
+  'wms-order-status': { consumed: ['failed', 'errors'], skipState: { skipped: 'x' } },
   'wms-watchdog': {
     ignored: { deliveryFailures: 'decides `status` (FAILED when a breach could not be alerted), which the mapping reads' },
   },
   'writers-check': {},
-  'xero-chart-sync': { consumed: ['errors'] },
+  'xero-chart-sync': { consumed: ['errors'], skipState: { skipped: true, reason: 'x' } },
   'xero-tax-rate-drift': {},
   ...warehouseConnectorCronFailureFields,
 }

@@ -3,15 +3,17 @@ import type { CronFieldDeclaration } from '@/lib/ops/cron-outcome-fields'
 /** The failure-field declarations of the Mintsoft cron routes (see lib/ops/cron-outcome-fields.ts for the contract). */
 export const mintsoftCronFailureFields = {
   'mintsoft-bundle-verify': {
+    skipState: { status: 'SKIPPED' },
     consumed: ['errors'],
-    ignored: { conflicts: 'bundle drift findings (the operator inbox), like `mismatched` on the other verifiers; not a failed run' },
+    ignored: { conflicts: 'bundle derivation conflicts: each is recorded as a BUNDLE_DERIVATION_CONFLICT discrepancy in the operator discrepancy inbox and the bundle is left untouched, like `mismatched` on the other verifiers; not a failed run' },
   },
-  'mintsoft-dispatch-sync': { consumed: ['errors'] },
+  'mintsoft-dispatch-sync': { consumed: ['errors'], skipState: { status: 'SKIPPED' } },
   'mintsoft-product-verify': {
+    skipState: { status: 'SKIPPED' },
     consumed: ['errors'],
     breakdownOf: { 'content.errors': 'errors' },
   },
-  'mintsoft-returns-sync': { consumed: ['errors'] },
+  'mintsoft-returns-sync': { consumed: ['errors'], skipState: { status: 'SKIPPED' } },
   'mintsoft-stock-sync': { consumed: ['details[].errors'] },
   'mintsoft-webhook-sweeper': {
     consumed: ['failed', 'postMaintenanceRecheck.failed'],

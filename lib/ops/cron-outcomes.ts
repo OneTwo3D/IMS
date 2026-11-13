@@ -150,7 +150,7 @@ export const cronOutcomes = {
   // a sweep that threw is carried in `errors` (held-aware), and counts even on a tick that otherwise skipped by design
   'accounting-sync': (r: AccountingSyncCronResult) => {
     const sweepFailure = r.errors && r.errors.length > 0 ? structural({ errors: r.errors }) : null
-    return worstOutcome(from(r, counts(r, ['failed']), structural(r)), ...(sweepFailure ? [sweepFailure] : []))
+    return from(r, counts(r, ['failed']), structural(r), sweepFailure)
   },
   // a purge reports what it deleted; there is no failure signal short of a throw
   'activity-cleanup': (r: ActivityCleanupCronResult) => noFailureSignal(r),
@@ -192,8 +192,8 @@ export const cronOutcomes = {
   // error texts and lists in each section (orders, products, stock, queued pushes); held pushes are recognised by their text;
   // refundStockCorrections.error (the queueing of open refund stock corrections threw); products.permanentErrors: permanent import conflicts, reported apart from errors and never cleared without an operator
   'wc-reconcile': (r: WcReconcileResult | Skip) => from(r, structural(r), permanentLists(r, ['permanentErrors'])),
-  // the withdrawal and screening failures throw; errors: string[] from the erasure and admission sweeps
-  'wc-withdrawal-sweep': (r: WcWithdrawalSweepCronResult | Skip) => from(r, structural(r)),
+  // the withdrawal and screening failures throw; errors: string[] from the erasure sweep; admissionRefusals.failed: number (the by-id read or the import failed)
+  'wc-withdrawal-sweep': (r: WcWithdrawalSweepCronResult | Skip) => from(r, structural(r), counts(r, ['failed'])),
   // failed and deadLettered: numbers, with outboundHeld (held pushes, also in failed) subtracted
   'wms-order-push': (r: WmsOrderPushSweepResult) => from(r, counts(r, ['failed', 'deadLettered'])),
   // status enum; counters.errors: number

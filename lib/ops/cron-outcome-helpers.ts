@@ -36,7 +36,7 @@ export function enumStatus(result: unknown): CronOutcomeClass | null {
 /** Counts of failures: `failed`, `errors` or others as numbers, with the held ones subtracted from `heldCounter` only, in the record and every record nested in it. */
 export function counts(result: unknown, keys: readonly string[], heldCounter = 'failed', nested = true): CronOutcomeClass {
   if (Array.isArray(result)) return worstOutcome('ok', ...result.map((entry) => counts(entry, keys, heldCounter, nested)))
-  if (!isRec(result) || result.skipped === true) return 'ok'
+  if (!isRec(result)) return 'ok'
   const held = num(result.outboundHeld)
   const classes: CronOutcomeClass[] = ['ok']
   for (const key of keys) {
@@ -57,7 +57,8 @@ export function counts(result: unknown, keys: readonly string[], heldCounter = '
 /** Lists of failures a run reports apart from `errors`, because re-running gives the same answer until an operator acts: any non-empty one, at any depth, is a failure. */
 export function permanentLists(result: unknown, keys: readonly string[]): CronOutcomeClass {
   if (Array.isArray(result)) return worstOutcome('ok', ...result.map((entry) => permanentLists(entry, keys)))
-  if (!isRec(result) || result.skipped === true) return 'ok'
+  // A record that says `skipped` can still hold sweeps that ran (a skipped section beside the queue it drained): nothing is skipped over here.
+  if (!isRec(result)) return 'ok'
   const classes: CronOutcomeClass[] = ['ok']
   for (const [key, value] of Object.entries(result)) {
     if (keys.includes(key) && Array.isArray(value) && value.length > 0) classes.push('failed')
@@ -75,15 +76,25 @@ export function skippedByDesign(result: unknown): boolean {
 /** A route whose result carries no failure signal (it reports what it did; a failure is a throw): ok, or skipped when it says so. */
 export const noFailureSignal = (result: object): CronOutcomeClass => (skippedByDesign(result) ? 'skipped' : 'ok')
 
+/**
+ * The class of a result from the classes of its consumed failure fields. A TOP-LEVEL SKIP NEVER MASKS A FAILURE: a run that says it skipped can
+ * still have run sweeps beside the skipped part (the accounting-sync tick replays refusals before it reads the connector gates), so every part is
+ * evaluated whatever the skip flag says, and the skip only decides what a result with NO failing part is.
+ */
 export function from(result: unknown, ...parts: Array<CronOutcomeClass | null>): CronOutcomeClass {
+  const present = parts.filter((part): part is CronOutcomeClass => part !== null)
+  const failing = present.filter((part) => part === 'failed' || part === 'held')
+  if (failing.length > 0) return worstOutcome(...failing)
   if (skippedByDesign(result)) return 'skipped'
-  return worstOutcome('ok', ...parts.filter((part): part is CronOutcomeClass => part !== null))
+  return worstOutcome('ok', ...present)
 }
 
-/** A status-enum result: SKIPPED is skipped; otherwise the enum, the counts and the error texts decide. */
+/** A status-enum result: SKIPPED is skipped when nothing failed; the enum, the counts and the error texts decide the rest. */
 export function enumResult(result: unknown, keys: readonly string[]): CronOutcomeClass {
   const status = enumStatus(result)
-  if (status === 'skipped') return 'skipped'
-  return from(result, status, counts(result, keys, 'errors', false), structural(result))
+  const parts = [status === 'skipped' ? null : status, counts(result, keys, 'errors', false), structural(result)]
+  const failing = parts.filter((part): part is CronOutcomeClass => part === 'failed' || part === 'held')
+  if (failing.length > 0) return worstOutcome(...failing)
+  return status === 'skipped' ? 'skipped' : from(result, ...parts)
 }
 

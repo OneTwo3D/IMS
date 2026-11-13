@@ -156,16 +156,33 @@ test('every failure-like field of every result is consumed, a declared breakdown
 
 test('every consumed field really is consumed: the mapping does not answer ok when only that field is set', () => {
   let probed = 0
+  let probedWithSkip = 0
   for (const slug of Object.keys(cronOutcomes) as CronOutcomeSlug[]) {
     const declaration = cronFailureFields[slug]
     for (const field of declaration.consumed ?? []) {
       const leaf = enumerated.get(slug)!.fields.get(field)!
-      const outcome = mapper(slug)(sampleFor(field, leaf, declaration.probes?.[field]))
+      const sample = sampleFor(field, leaf, declaration.probes?.[field])
+      const outcome = mapper(slug)(sample)
       assert.notEqual(outcome, 'ok', `${slug}: '${field}' is declared consumed but a result with it set maps to ok`)
       probed++
+      // The same field with the route's skip state set: a top-level skip must never mask the failure of a sweep that ran.
+      if (declaration.skipState) {
+        const skipped = mapper(slug)({ ...sample, ...declaration.skipState })
+        assert.notEqual(skipped, 'ok', `${slug}: '${field}' is masked by the skip state ${JSON.stringify(declaration.skipState)} (maps to ${skipped})`)
+        assert.notEqual(skipped, 'skipped', `${slug}: '${field}' is masked by the skip state ${JSON.stringify(declaration.skipState)} (maps to ${skipped})`)
+        probedWithSkip++
+      }
     }
   }
   assert.ok(probed >= 60, `probed ${probed}`)
+  assert.ok(probedWithSkip >= 20, `probed with a skip state: ${probedWithSkip}`)
+})
+
+test('a skip with no failing field is still skipped, and the skip states themselves are skips', () => {
+  for (const slug of Object.keys(cronOutcomes) as CronOutcomeSlug[]) {
+    const { skipState } = cronFailureFields[slug]
+    if (skipState) assert.equal(mapper(slug)(skipState), 'skipped', `${slug}: its declared skip state does not map to skipped`)
+  }
 })
 
 test('a declared breakdown alone does not fail the run, so it is not counted twice', () => {
