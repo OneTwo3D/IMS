@@ -27,6 +27,8 @@ const state = {
   withdrawalOrders: [] as Array<Record<string, unknown>>,
   /** Error answered to the next status-scoped recovery read. */
   recoveryError: null as string | null,
+  /** When true the recovery read never reaches an empty page. */
+  recoveryEndless: false,
   /** Ids of every order the sweep passed through the import path. */
   imported: [] as string[],
 }
@@ -73,6 +75,7 @@ mock.module('@/lib/connectors/woocommerce/api', {
             state.recoveryError = null
             return { data: null, totalPages: 0, totalItems: 0, error }
           }
+          if (state.recoveryEndless) return { data: [{ id: 1000 + Number(params.page), number: String(params.page), status: 'withdrawn' }], totalPages: 1, totalItems: 0 }
           return { data: params.page === '1' ? state.withdrawalOrders : [], totalPages: 1, totalItems: 0 }
         }
       }
@@ -151,6 +154,7 @@ async function reset(overrides: Record<string, string> = {}) {
   state.totalsCalls = 0
   state.withdrawalOrders = []
   state.recoveryError = null
+  state.recoveryEndless = false
   state.imported = []
   const { resetWcWithdrawalUnregisteredWarnings } = await import('@/lib/connectors/woocommerce/sync/order-import')
   resetWcWithdrawalUnregisteredWarnings()
@@ -408,6 +412,76 @@ test('overlapping sweeps: a slow run that read the full fingerprint writes nothi
   await sweep()
   assert.ok(isRecoveryRead(0))
   assert.deepEqual(state.imported, ['7'])
+})
+
+test('a status the operator ticked that is a withdrawal slug widens the selection like any other', async () => {
+  await reset({
+    wc_sync_order_statuses: JSON.stringify(['processing', 'withdrawn']),
+    [CURSOR_STATUSES_KEY]: JSON.stringify(['processing']),
+    [REFUSED_SINCE_KEY]: '2026-08-01T00:00:00.000Z',
+  })
+  state.registered = WITH_PLUGIN
+
+  await sweep()
+
+  assert.equal(state.modifiedAfter.at(-1), '2026-08-01T00:00:00.000Z', 'a ticked status that was not being read rewinds to the refusal watermark')
+})
+
+test('a recovery read that never reaches an empty page is refused loudly and leaves the marker set', async () => {
+  await reset()
+  await sweep()
+  const marker = state.settings.get(DROPPED_KEY)
+  const cursorBefore = state.settings.get(CURSOR_KEY)
+  state.registered = WITH_PLUGIN
+  state.recoveryEndless = true
+
+  const result = await sweep()
+
+  assert.equal(result.errors.length, 1)
+  assert.match(result.errors[0], /did not reach an empty page/)
+  assert.equal(state.settings.get(DROPPED_KEY), marker)
+  assert.equal(state.settings.get(CURSOR_KEY), cursorBefore, 'the cursor is held')
+})
+
+async function overlapWithSecondRun(overrides: Record<string, string>, registeredForA: string[], prepareB: () => void) {
+  await reset(overrides)
+  state.registered = registeredForA
+  let release!: () => void
+  state.pauseOrders = new Promise<void>((resolve) => { release = resolve })
+  const reached = new Promise<void>((resolve) => { state.ordersReached = resolve })
+  const runA = sweep()
+  await reached
+  prepareB()
+  await sweep()
+  const afterB = new Map(state.settings)
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  state.activity = []
+  release()
+  await runA
+  return { afterB }
+}
+
+test('overlap: a run whose FINGERPRINT alone was changed by another sweep writes nothing', async () => {
+  const { afterB } = await overlapWithSecondRun(
+    { [CURSOR_STATUSES_KEY]: JSON.stringify(['pending-wdraw', 'processing', 'withdrawn']) },
+    WITH_PLUGIN,
+    () => { state.settings.set('wc_sync_order_statuses', JSON.stringify(['processing', 'pending'])) },
+  )
+
+  assert.deepEqual([...state.settings.entries()], [...afterB.entries()])
+  assert.ok(state.activity.some((entry) => entry.action === 'wc_order_sync_superseded'))
+})
+
+test('overlap: a run whose MARKER alone was changed by another sweep writes nothing', async () => {
+  const { afterB } = await overlapWithSecondRun(
+    { [CURSOR_STATUSES_KEY]: JSON.stringify(['processing']) },
+    NO_PLUGIN,
+    () => { /* B runs with the same list and sets the marker */ },
+  )
+
+  assert.ok(state.settings.has(DROPPED_KEY))
+  assert.deepEqual([...state.settings.entries()], [...afterB.entries()])
+  assert.ok(state.activity.some((entry) => entry.action === 'wc_order_sync_superseded'))
 })
 
 test('with a cursor in use and no success stamp, a drop is still allowed (no floor is needed)', async () => {
