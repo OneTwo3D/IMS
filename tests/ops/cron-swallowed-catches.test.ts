@@ -19,6 +19,7 @@ const FAILURE_LIKE = /fail|error|dead|conflict|park|unresolved|reject|quarantin|
 
 /** "<file>::<innermost named function>" -> how many flagged catch clauses it holds and why each is safe. */
 const JUSTIFIED: Record<string, { count: number; reason: string }> = {
+  "lib/connectors/woocommerce/sync/order-import.ts::importWcOrderOnce": { count: 1, reason: "the park of the invoice whose enqueue failed: its failure is carried (`held` stays false, which stamps SALES_INVOICE_QUEUE_FAILED_NOT_HELD into the failure thrown next, and a redelivery then fails until an invoice stands for the order)" },
   "lib/connectors/mintsoft/sync/stock-sync.ts::enqueueAlignmentStockSync": { count: 1, reason: "the WARNING activity write after a failed stock enqueue: the enqueue failure itself is counted (`stockEnqueueFailures`), this only logs it" },
   "lib/accounting.ts::logUnknownAccountingConnector": { count: 1, reason: "best-effort logging or notice: a warning or audit write that failed must not decide the run; the state it describes is recorded elsewhere" },
   "lib/cron-auth.ts::scheduleCronAuthRejectedLog": { count: 2, reason: "best-effort logging or notice: a warning or audit write that failed must not decide the run; the state it describes is recorded elsewhere" },

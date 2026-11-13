@@ -184,6 +184,8 @@ function txDelegates() {
     findMany: async ({ where }: { where: Row }) => matchLogs(where),
     count: async () => 0,
   },
+  // The existing-order branch asks whether an invoice enqueue failure is on record with nothing behind it: none in this store.
+  accountingSyncLog: { findFirst: async () => null },
   product: { findMany: async () => [] },
   taxRate: { findMany: async () => [] },
   warehouse: { findMany: async () => [] },
