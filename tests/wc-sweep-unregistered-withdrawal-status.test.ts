@@ -47,6 +47,7 @@ mock.module('@/lib/connectors/woocommerce/api', {
         return { data: state.registered.map((slug) => ({ slug, name: slug, total: 1 })), totalPages: 1, totalItems: 0 }
       }
       if (path === '/orders') {
+        const registeredAtCall = state.registered
         if (state.pauseOrders) {
           const gate = state.pauseOrders
           state.pauseOrders = null
@@ -55,6 +56,10 @@ mock.module('@/lib/connectors/woocommerce/api', {
         }
         state.modifiedAfter.push(params.modified_after)
         state.statusParams.push(params.status)
+        // WooCommerce rejects the whole call when a status slug is not registered.
+        if (Array.isArray(registeredAtCall) && params.status.split(',').some((slug) => !registeredAtCall.includes(slug))) {
+          return { data: null, totalPages: 0, totalItems: 0, error: 'WC API error: 400 rest_invalid_param' }
+        }
       }
       return { data: [], totalPages: 1, totalItems: 0 }
     },
@@ -102,6 +107,7 @@ const CLEAN_AT_KEY = 'last_wc_order_sync_at_sweep_clean_at'
 const REFUSED_SINCE_KEY = 'wc_order_admission_refused_since'
 const DROPPED_KEY = 'last_wc_order_sync_at_withdrawal_dropped_since'
 const CURSOR_AT = '2026-08-10T00:00:00.000Z'
+const STAMP_KEY = 'wc_order_sweep_last_success_at'
 const WARN = 'wc_order_sync_withdrawal_status_unregistered'
 
 const NO_PLUGIN = ['pending', 'processing', 'on-hold', 'completed', 'cancelled', 'refunded', 'failed']
@@ -112,6 +118,7 @@ async function reset(overrides: Record<string, string> = {}) {
     ['wc_initial_import_completed', 'true'],
     ['wc_sync_order_statuses', JSON.stringify(['processing'])],
     [CURSOR_KEY, CURSOR_AT],
+    [STAMP_KEY, CURSOR_AT],
     ...Object.entries(overrides),
   ])
   state.upserts = []
@@ -316,6 +323,46 @@ test('overlapping sweeps: a slow run that read the full fingerprint writes nothi
   state.modifiedAfter = []
   await sweep()
   assert.deepEqual(state.modifiedAfter, [CURSOR_AT])
+})
+
+test('first deploy: with no clean-sweep position but a success stamp, the marker is the stamp even when a webhook moved the cursor later', async () => {
+  const STAMP = '2026-08-05T00:00:00.000Z'
+  await reset({ [STAMP_KEY]: STAMP, [CURSOR_KEY]: '2026-08-20T00:00:00.000Z' })
+
+  const result = await sweep()
+
+  assert.deepEqual(result.errors, [])
+  assert.equal(state.settings.get(DROPPED_KEY), STAMP)
+})
+
+test('first deploy: with neither a clean-sweep position nor a success stamp, nothing is dropped and the failure is logged once', async () => {
+  await reset()
+  state.settings.delete(STAMP_KEY)
+
+  const first = await sweep()
+  const second = await sweep()
+
+  assert.deepEqual(state.statusParams, ['processing,pending-wdraw,withdrawn', 'processing,pending-wdraw,withdrawn'], 'the full list is asked for, as before')
+  assert.equal(first.errors.length, 1, 'WooCommerce refuses it and the run fails, as before')
+  assert.equal(second.errors.length, 1)
+  const logged = state.activity.filter((entry) => entry.action === 'wc_order_sync_withdrawal_status_unregistered_no_floor')
+  assert.equal(logged.length, 1, 'once, not on every run')
+  assert.equal(logged[0].level, 'ERROR')
+  assert.match(String(logged[0].description), /plugin/)
+  assert.match(String(logged[0].description), /first clean order sweep has not happened yet/)
+  assert.equal(state.settings.has(DROPPED_KEY), false)
+  assert.equal(state.settings.get(CURSOR_KEY), CURSOR_AT, 'the cursor is not advanced')
+})
+
+test('with no cursor at all (a full read every time) a drop is safe with no recorded position', async () => {
+  await reset()
+  state.settings.delete(STAMP_KEY)
+  state.settings.delete(CURSOR_KEY)
+
+  const result = await sweep()
+
+  assert.deepEqual(result.errors, [])
+  assert.deepEqual(state.statusParams, ['processing'])
 })
 
 test('reconcileWcPullStatusesWithRegistered: null registered list changes nothing', async () => {

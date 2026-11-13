@@ -4471,8 +4471,66 @@ export async function syncNewWcOrders(
     }).catch(() => undefined)
     return { synced: 0, skipped: 0, errors: [message] }
   }
-  const droppedWithdrawal = resolution.droppedWithdrawal
-  const statuses = resolution.statuses
+  let droppedWithdrawal = resolution.droppedWithdrawal
+  let statuses = resolution.statuses
+
+  // THE OUTAGE FLOOR, AND WHEN A DROP IS SAFE. Dropping a withdrawal status is only safe if the
+  // re-fetch after the plugin returns can be bounded from a position that no webhook can have moved
+  // past a missed withdrawal. In order of trust:
+  //   1. the outage marker already stored (a drop is already under way);
+  //   2. `<cursorKey>_sweep_clean_at`, this cursor's last clean sweep (never written by a webhook);
+  //   3. FIRST DEPLOY, before (2) exists: WC_ORDER_SWEEP_LAST_SUCCESS_SETTING, also written only by a
+  //      clean sweep, taking the EARLIER of it and the cursor (it is shared by both modes, so it can
+  //      only be too early, which costs a longer re-fetch but never a skipped order);
+  //   4. nothing recorded and a cursor exists: the only position left is a cursor a webhook may have
+  //      advanced, which could sit after a missed withdrawal. Do NOT drop. Ask for the full list as
+  //      before, so WooCommerce's 400 fails the run, and say so once. The first clean sweep never
+  //      happens in that state, so this is the old behaviour, loudly; it needs the plugin (or a
+  //      clean sweep) once.
+  // With no cursor at all the sweep reads the whole history each time, so there is nothing to
+  // rewind and the drop is safe. Never a full-history rewind otherwise: it can exceed the page-walk
+  // ceiling and stall the sweep for good.
+  const droppedSinceKey = wcCursorWithdrawalDroppedKey(cursorKey)
+  const cleanAtKey = wcCursorSweepCleanAtKey(cursorKey)
+  const [droppedSinceSetting, cleanAtSetting, sweepStampSetting] = await Promise.all([
+    db.setting.findUnique({ where: { key: droppedSinceKey } }),
+    db.setting.findUnique({ where: { key: cleanAtKey } }),
+    db.setting.findUnique({ where: { key: WC_ORDER_SWEEP_LAST_SUCCESS_SETTING } }),
+  ])
+  const validIso = (value: string | null | undefined): string | null =>
+    value && Number.isFinite(Date.parse(value)) ? value : null
+  const earlier = (...values: Array<string | null>): string | null => {
+    const ok = values.filter((value): value is string => value !== null)
+    return ok.length === 0 ? null : ok.sort((x, y) => Date.parse(x) - Date.parse(y))[0]
+  }
+  if (droppedWithdrawal.length > 0) {
+    const cursorInUse = existingOrder ? (validIso(lastSyncSetting?.value) ?? null) : null
+    const floorKnown = validIso(droppedSinceSetting?.value) !== null
+      || validIso(cleanAtSetting?.value) !== null
+      || validIso(sweepStampSetting?.value) !== null
+      || cursorInUse === null
+    if (!floorKnown) {
+      const wouldDrop = droppedWithdrawal
+      droppedWithdrawal = []
+      statuses = configuredPullStatuses
+      const noFloorKey = `${cursorKey}:no-floor`
+      if (!lastWithdrawalUnregisteredWarnAt.has(noFloorKey)) {
+        lastWithdrawalUnregisteredWarnAt.set(noFloorKey, Date.now())
+        await logActivity({
+          entityType: 'SYNC',
+          action: 'wc_order_sync_withdrawal_status_unregistered_no_floor',
+          tag: 'sync',
+          level: 'ERROR',
+          description: `WooCommerce does not have the EU withdrawal status${wouldDrop.length === 1 ? '' : 'es'} ${wouldDrop.join(', ')} registered `
+            + '(the "EU Order Withdrawal Button" plugin by WebToffee is not active), and the first clean order sweep has not happened yet, '
+            + `so IMS cannot yet skip ${wouldDrop.length === 1 ? 'it' : 'them'} safely. The ${mode === 'poll' ? 'order poll' : 'order reconciliation'} will fail until the plugin is active `
+            + 'or one sweep completes cleanly.',
+          metadata: { mode, cursorKey, droppedWithdrawalStatuses: wouldDrop },
+          resolveUser: false,
+        }).catch(() => undefined)
+      }
+    }
+  }
   if (droppedWithdrawal.length > 0) {
     const lastWarnedAt = lastWithdrawalUnregisteredWarnAt.get(cursorKey) ?? 0
     if (Date.now() - lastWarnedAt >= WC_WITHDRAWAL_UNREGISTERED_WARN_INTERVAL_MS) {
@@ -4532,18 +4590,6 @@ export async function syncNewWcOrders(
   const newlyAsked = cursorStatuses === null ? [] : statuses.filter((status) => !cursorStatuses.includes(status))
   const selectionWidened = newlyAsked.some((status) => !withdrawalSlugs.has(status))
   const withdrawalWidened = newlyAsked.some((status) => withdrawalSlugs.has(status))
-  const droppedSinceKey = wcCursorWithdrawalDroppedKey(cursorKey)
-  const cleanAtKey = wcCursorSweepCleanAtKey(cursorKey)
-  const [droppedSinceSetting, cleanAtSetting] = await Promise.all([
-    db.setting.findUnique({ where: { key: droppedSinceKey } }),
-    db.setting.findUnique({ where: { key: cleanAtKey } }),
-  ])
-  const validIso = (value: string | null | undefined): string | null =>
-    value && Number.isFinite(Date.parse(value)) ? value : null
-  const earlier = (...values: Array<string | null>): string | null => {
-    const ok = values.filter((value): value is string => value !== null)
-    return ok.length === 0 ? null : ok.sort((x, y) => Date.parse(x) - Date.parse(y))[0]
-  }
   const originalCursor = lastSync
   const rewindTo = earlier(
     selectionWidened ? validIso(refusedSinceSetting?.value) : null,
@@ -4567,7 +4613,11 @@ export async function syncNewWcOrders(
   // outage, else the last clean sweep's position, never later than the cursor this run started from.
   const droppedSinceToStore = droppedWithdrawal.length > 0
     ? (validIso(droppedSinceSetting?.value)
-        ?? earlier(validIso(cleanAtSetting?.value), originalCursor)
+        ?? (validIso(cleanAtSetting?.value)
+          ? earlier(validIso(cleanAtSetting?.value), originalCursor)
+          : validIso(sweepStampSetting?.value)
+            ? earlier(validIso(sweepStampSetting?.value), originalCursor)
+            : originalCursor)
         ?? new Date().toISOString())
     : null
 
