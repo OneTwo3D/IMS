@@ -5,7 +5,7 @@ import type { WmsWatchdogResult } from '@/lib/domain/wms/watchdog-sweep'
 import type { HsSweepResult } from '@/lib/trade/hs-classification-sweep'
 import type { ProcessEmailOutboxResult } from '@/lib/email-outbox'
 import type { ProcessRefundReservationReleaseResult } from '@/lib/domain/sales/refund-reservation-release-outbox'
-import { counts, from, enumResult, noFailureSignal, num, structural, worstOutcome } from './cron-outcome-helpers'
+import { counts, from, enumResult, noFailureSignal, num, permanentLists, structural, worstOutcome } from './cron-outcome-helpers'
 import { mintsoftCronOutcomes as warehouseConnectorCronOutcomes } from '@/lib/connectors/mintsoft/cron-outcomes' // wms-connector-boundary-ok: 2026-11-13: the registry spreads the connector's own entries
 import type { CronOutcomeClass } from './cron-run'
 
@@ -45,9 +45,10 @@ export const cronOutcomes = {
   backup: (r: object) => from(r, 'error' in r ? 'failed' : null),
   // delivery lookups report counts only; failure is a throw
   'delivery-status': noFailureSignal,
-  // failed: number (an email that did not send); erasureReconcileIncomplete: string[]
+  // failed (an email that did not send), parked (stale rows moved to the send cap), conflicted, conflictedWithoutSend and
+  // unresolvedAfterSend (a duplicate send is possible): numbers; erasureReconcileIncomplete: string[]
   'email-outbox': (r: ProcessEmailOutboxResult & { erasureReconcileIncomplete?: string[] }) =>
-    from(r, num(r.failed) > 0 || (r.erasureReconcileIncomplete?.length ?? 0) > 0 ? 'failed' : null),
+    from(r, counts(r, ['failed', 'parked', 'conflicted', 'conflictedWithoutSend', 'unresolvedAfterSend']), (r.erasureReconcileIncomplete?.length ?? 0) > 0 ? 'failed' : null),
   // errors / stepFailures: lists of texts; a step that threw is reported as { error }
   'fx-rates': (r: object) => from(r, structural(r)),
   // errors: number
@@ -75,8 +76,9 @@ export const cronOutcomes = {
     from(r, counts(r, ['failed'])),
   // failed: number (events that failed to process) and error texts, per connector tick and per drain
   'shopping-webhook-inbox': (r: object) => from(r, counts(r, ['failed']), structural(r)),
-  // error texts and lists in each section (orders, products, stock, queued pushes); held pushes are recognised by their text
-  'wc-reconcile': (r: object) => from(r, structural(r)),
+  // error texts and lists in each section (orders, products, stock, queued pushes); held pushes are recognised by their text;
+  // products.permanentErrors: permanent import conflicts, reported apart from errors and never cleared without an operator
+  'wc-reconcile': (r: object) => from(r, structural(r), permanentLists(r, ['permanentErrors'])),
   // the withdrawal and screening failures throw; errors: string[] from the erasure and admission sweeps
   'wc-withdrawal-sweep': (r: object) => from(r, structural(r)),
   // failed and deadLettered: numbers, with outboundHeld (held pushes, also in failed) subtracted

@@ -51,6 +51,18 @@ export function counts(result: unknown, keys: readonly string[]): CronOutcomeCla
   return worstOutcome(...classes)
 }
 
+/** Lists of failures a run reports apart from `errors`, because re-running gives the same answer until an operator acts: any non-empty one, at any depth, is a failure. */
+export function permanentLists(result: unknown, keys: readonly string[]): CronOutcomeClass {
+  if (Array.isArray(result)) return worstOutcome('ok', ...result.map((entry) => permanentLists(entry, keys)))
+  if (!isRec(result) || result.skipped === true) return 'ok'
+  const classes: CronOutcomeClass[] = ['ok']
+  for (const [key, value] of Object.entries(result)) {
+    if (keys.includes(key) && Array.isArray(value) && value.length > 0) classes.push('failed')
+    else if (isRec(value) || Array.isArray(value)) classes.push(permanentLists(value, keys))
+  }
+  return worstOutcome(...classes)
+}
+
 /** A top-level skip: `skipped: true`, or a skip reason in `skipped` (a string) or `skippedReason`. */
 export function skippedByDesign(result: unknown): boolean {
   if (!isRec(result)) return false

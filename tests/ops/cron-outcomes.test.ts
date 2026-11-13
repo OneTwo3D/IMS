@@ -61,3 +61,18 @@ test('each route-owned signal: status enums, success flags, error keys', () => {
   assert.equal(cronOutcome('invoice-documents', { stoppedEarly: 'x', stored: 0, failed: 2 }), 'failed')
   assert.equal(cronOutcome('invoice-documents', { stoppedEarly: undefined, stored: 3, failed: 1 }), 'ok')
 })
+
+test('wc-reconcile: permanent import conflicts with an empty errors list are a failure', () => {
+  const conflicts = { synced: 3, skipped: 0, errors: [], permanentErrors: ['SKU A-1: duplicate SKU in WooCommerce'] }
+  assert.equal(cronOutcome('wc-reconcile', { products: conflicts }), 'failed')
+  assert.equal(cronOutcome('wc-reconcile', { products: { ...conflicts, permanentErrors: [] } }), 'ok')
+  assert.equal(cronOutcome('wc-reconcile', { skipped: true, reason: 'WC sync disabled' }), 'skipped')
+})
+
+test('email-outbox: parked, conflicted and unresolved-after-send rows are failures, an idle run is not', () => {
+  const base = { processed: 0, sent: 0, failed: 0, parked: 0, conflicted: 0, conflictedWithoutSend: 0, unresolvedAfterSend: 0 }
+  assert.equal(cronOutcome('email-outbox', base as never), 'ok')
+  for (const key of ['parked', 'conflicted', 'conflictedWithoutSend', 'unresolvedAfterSend', 'failed']) {
+    assert.equal(cronOutcome('email-outbox', { ...base, [key]: 1 } as never), 'failed', key)
+  }
+})

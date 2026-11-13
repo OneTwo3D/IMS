@@ -13,8 +13,10 @@ type Doubles = {
   stock: unknown
   returns: unknown
   push: unknown
+  wc: unknown
 }
-const doubles: Doubles = { reconcile: null, dispatch: null, stock: null, returns: null, push: null }
+const recorded: string[] = []
+const doubles: Doubles = { reconcile: null, dispatch: null, stock: null, returns: null, push: null, wc: null }
 
 mock.module('@/lib/cron-auth', { namedExports: { verifyCron: async () => null } })
 mock.module('@/lib/cron-rate-limit', { namedExports: { enforceCronRateLimit: async () => null } })
@@ -22,7 +24,13 @@ mock.module('@/lib/maintenance-mode', { namedExports: { getMaintenanceModeRespon
 mock.module('@/lib/integration-plugins', { namedExports: { isIntegrationPluginEnabled: async () => true } })
 mock.module('@/lib/db', {
   namedExports: {
-    db: { externalWmsBinding: { findMany: async () => [{ id: 'b1', lastStockSyncAt: null, syncFrequencyMinutes: 15 }] } },
+    db: {
+      setting: { findUnique: async () => ({ value: 'true' }) },
+      $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({
+        cronRun: { create: async (args: { data: { status: string } }) => { recorded.push(args.data.status) } },
+        activityLog: { create: async () => ({}) },
+      }),
+      externalWmsBinding: { findMany: async () => [{ id: 'b1', lastStockSyncAt: null, syncFrequencyMinutes: 15 }] } },
   },
 })
 mock.module('@/lib/domain/wms/order-reconcile-sweep', { namedExports: { runWmsOrderReconcileSweep: async () => doubles.reconcile } })
@@ -31,6 +39,7 @@ mock.module('@/lib/connectors/mintsoft/sync/dispatch-poll', { namedExports: { ru
 mock.module('@/lib/connectors/mintsoft/sync/returns-sync', { namedExports: { runMintsoftReturnsSync: async () => doubles.returns } })
 mock.module('@/lib/connectors/mintsoft/sync/stock-sync', { namedExports: { runStockSyncForBinding: async () => doubles.stock } })
 mock.module('@/lib/connectors/mintsoft/sync/stock-sync-helpers', { namedExports: { isMintsoftBindingDue: () => true } })
+mock.module('@/lib/connectors/woocommerce/sync/reconcile', { namedExports: { runWcReconcile: async () => doubles.wc } })
 mock.module('@/lib/domain/purchasing/product-lead-time', { namedExports: { recomputeProductObservedLeadTimes: async () => ({}) } })
 
 const request = (): Request => new Request('http://localhost/api/cron/x')
@@ -123,4 +132,15 @@ test('recompute-product-lead-times: failed > 0 answers 500 and is recorded faile
   }
   assert.deepEqual(await run({ scanned: 4, updated: 3, cleared: 1, failed: 0 }), { status: 200, recorded: 'completed' })
   assert.deepEqual(await run({ scanned: 4, updated: 2, cleared: 0, failed: 2 }), { status: 500, recorded: 'failed' })
+})
+
+test('wc-reconcile: permanent product conflicts with an empty errors list answer 500 and are recorded failed', async () => {
+  const { GET } = await import('@/app/api/cron/wc-reconcile/route')
+  doubles.wc = { orders: { synced: 1, skipped: 0, errors: [] }, products: { synced: 2, skipped: 0, errors: [], permanentErrors: ['SKU A-1: duplicate SKU'] } }
+  const response = await GET(request())
+  assert.equal(response.status, 500)
+  assert.equal(recorded.at(-1), 'failed')
+  doubles.wc = { orders: { synced: 1, skipped: 0, errors: [] }, products: { synced: 2, skipped: 0, errors: [], permanentErrors: [] } }
+  assert.equal((await GET(request())).status, 200)
+  assert.equal(recorded.at(-1), 'completed')
 })
