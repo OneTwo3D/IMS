@@ -288,15 +288,51 @@ test('a carry never widens: on-hold newly selected, old missed on-hold order, no
   })
 })
 
-test('a carry needs a stored poll fingerprint: with none (fresh install) it is skipped', { skip }, async () => {
+test('legacy install, no stored poll fingerprint: a clean reconcile bootstrap-carries and records the fingerprint', { skip }, async () => {
   const { syncNewWcOrders } = await import('../../lib/connectors/woocommerce/sync/order-import')
   await scenario(async () => {
     await put('wc_initial_import_completed', 'true')
-    await put('wc_sync_order_statuses', JSON.stringify(['processing']))
-    const oldCursor = '2026-11-01T00:00:00.000Z'
-    await put(ORDER_CURSOR, oldCursor)
-    await syncNewWcOrders({ mode: 'reconcile' })
-    assert.equal(await get(ORDER_CURSOR), oldCursor)
-    assert.equal(await get(`${ORDER_CURSOR}_statuses`), null)
+    const expected = await resolvedPollFingerprint(['processing'])
+    await put(ORDER_CURSOR, '2026-11-01T00:00:00.000Z')
+    const reconciled = await syncNewWcOrders({ mode: 'reconcile' })
+    assert.deepEqual(reconciled.errors, [])
+    assert.ok(Date.parse((await get(ORDER_CURSOR))!) > Date.parse('2026-11-10T00:00:00.000Z'))
+    assert.equal(await get(`${ORDER_CURSOR}_statuses`), expected)
   })
 })
+
+test('the initial import writes the poll fingerprint with the cursor', { skip }, async () => {
+  const { runInitialImport } = await import('../../lib/connectors/woocommerce/sync/initial-import')
+  await scenario(async () => {
+    const expected = await resolvedPollFingerprint(['processing'])
+    await (await getDb()).setting.deleteMany({ where: { key: 'wc_initial_import_completed' } })
+    const run = await runInitialImport(freshProgress())
+    assert.equal(run.stamped, true, JSON.stringify(run.progress.errors))
+    assert.equal(await get(`${ORDER_CURSOR}_statuses`), expected)
+    assert.ok(await get(ORDER_CURSOR))
+  })
+})
+
+test('fresh webhook-primary install: initial import, reconciles with no poll, then webhooks stop and the poll reads from a recent position', { skip }, async () => {
+  const { runInitialImport } = await import('../../lib/connectors/woocommerce/sync/initial-import')
+  const { syncNewWcOrders } = await import('../../lib/connectors/woocommerce/sync/order-import')
+  const { WC_PULL_CURSOR_OVERLAP_MS } = await import('../../lib/connectors/woocommerce/sync/read-cursor')
+  await scenario(async () => {
+    await resolvedPollFingerprint(['processing'])
+    await (await getDb()).setting.deleteMany({ where: { key: 'wc_initial_import_completed' } })
+    assert.equal((await runInitialImport(freshProgress())).stamped, true)
+    const afterImport = (await get(ORDER_CURSOR))!
+    // Time passes: simulate the import having happened long ago.
+    await put(ORDER_CURSOR, '2026-11-01T00:00:00.000Z')
+    for (let i = 0; i < 3; i += 1) assert.deepEqual((await syncNewWcOrders({ mode: 'reconcile' })).errors, [])
+    const before = Date.now()
+    asked.length = 0
+    assert.deepEqual((await syncNewWcOrders({ mode: 'poll' })).errors, []) // webhooks stopped: the poll runs
+    const modifiedAfter = Date.parse(asked.find((call) => call.path === '/orders')!.modifiedAfter!)
+    assert.ok(modifiedAfter >= Date.parse(afterImport) - 1000 && modifiedAfter <= before, 'the poll reads from the carried (recent) position, not the stale cursor')
+    assert.ok(modifiedAfter > Date.parse('2026-11-10T00:00:00.000Z'))
+    assert.ok(WC_PULL_CURSOR_OVERLAP_MS > 0)
+  })
+})
+
+const freshProgress = () => ({ status: 'running' as const, message: '', activeOrdersImported: 0, activeOrdersSkipped: 0, totalOrders: 0, currentPage: 0, totalPages: 0, errors: [] as string[] })

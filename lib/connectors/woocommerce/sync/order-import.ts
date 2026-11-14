@@ -4442,7 +4442,7 @@ function wcCursorWithdrawalDroppedKey(cursorKey: string): string {
  */
 export const WC_ORDER_ADMISSION_REFUSED_SINCE_KEY = 'wc_order_admission_refused_since'
 
-function wcCursorStatusesKey(cursorKey: string): string {
+export function wcCursorStatusesKey(cursorKey: string): string {
   return `${cursorKey}_statuses`
 }
 
@@ -4581,14 +4581,21 @@ export async function syncNewWcOrders(
     // lacks is dropped from both, so it is not a difference between them).
     const pollStatuses = reconcileWcPullStatusesWithRegistered(await getWcPullStatuses('poll'), configuredSelection, wdraw, registered).statuses
     const pollRows = await db.setting.findMany({ where: { key: { in: [pollStatusesKey, pollDroppedKey] } } })
-    // A CARRY NEVER WIDENS THE POLL'S FINGERPRINT. It may keep it the same or narrow it, because the position
-    // it hands over was earned by a read whose reach is at least the poll's current list; but this run read
-    // only from its own recent cursor, so a status newly included since the poll last earned its cursor
-    // (an old order it refused, whose webhook was missed) was NOT read back far enough. Writing the wider
-    // fingerprint and the later cursor would hide that widening from the poll for good. So a pending widening,
-    // or no stored fingerprint at all (a fresh install), skips the carry entirely and the poll's own rewind runs.
+    // A CARRY NEVER WIDENS THE POLL'S FINGERPRINT. With a stored fingerprint it may keep it the same or narrow
+    // it, because the position it hands over was earned by a read whose reach is at least the poll's current
+    // list; but this run read only from its own recent cursor, so a status newly included since the poll last
+    // earned its cursor (an old order it refused, whose webhook was missed) was NOT read back far enough.
+    // Writing the wider fingerprint and the later cursor would hide that widening from the poll for good. So a
+    // pending widening skips the carry entirely and the poll's own rewind runs.
+    //
+    // NO STORED FINGERPRINT = BOOTSTRAP CARRY (ACCEPTED LIMIT). The initial import now writes the fingerprint, so
+    // the only installs without one are LEGACY ones, where webhooks used to move the poll cursor and nothing
+    // recorded the selection it was earned under. There is nothing to compare, and the pre-existing behaviour
+    // was already to move the cursor with no fingerprint, so a clean reconcile whose list covers the poll's
+    // carries and records the poll's current list as the fingerprint. A widening that happened before this
+    // point on such an install is not recoverable from the cursor; that limit predates this change.
     const storedPollList = parseStoredStatusList(pollRows.find((row) => row.key === pollStatusesKey)?.value)
-    if (storedPollList !== null && statusListCovers(statuses, pollStatuses) && statusListCovers(storedPollList, pollStatuses)) {
+    if (statusListCovers(statuses, pollStatuses) && (storedPollList === null || statusListCovers(storedPollList, pollStatuses))) {
       pollCarry = {
         statuses: pollStatuses,
         fingerprintAtStart: pollRows.find((row) => row.key === pollStatusesKey)?.value ?? null,

@@ -466,6 +466,19 @@ export async function runInitialImport(
         create: { key: 'wc_initial_import_completed', value: 'true' },
         update: { value: 'true' },
       })
+      // The cursor and the selection it was earned under are ONE fact, written together: without the poll's
+      // fingerprint every reconcile carry is skipped (webhook-primary installs would never move the poll
+      // cursor) and a later widening would be undetectable. The import reads the operator's selection, and
+      // the withdrawal statuses it leaves out are unlinked orders the importer skips anyway (see above), so the
+      // fingerprint is the poll's current resolved list.
+      const pollFingerprint = JSON.stringify([...(await getWcPullStatuses('poll'))].sort())
+      // Fingerprint first, then the cursor: a failure between them leaves a fingerprint with no cursor, which a
+      // sweep treats as a fresh start; the reverse would leave a cursor with no fingerprint.
+      await db.setting.upsert({
+        where: { key: 'last_wc_order_sync_at_statuses' }, // wcCursorStatusesKey('last_wc_order_sync_at')
+        create: { key: 'last_wc_order_sync_at_statuses', value: pollFingerprint },
+        update: { value: pollFingerprint },
+      })
       await advancePullCursor(db, 'last_wc_order_sync_at', wcPullCursorCandidate(readStartedAtMs))
       runResult.stamped = true
     }
