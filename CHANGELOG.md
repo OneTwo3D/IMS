@@ -10,6 +10,8 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+## 4.2.0 - 2026-11-14
+
 ### WooCommerce pull cursors are taken at read start, not at commit (backend / sync)
 
 - **Fixed: an order modified while a sweep was finishing could be skipped for good.** The order sweep stamped its `modified_after` cursor with the time it COMMITTED, after the final empty-page read. An order changed between that read and the stamp was never read by the run yet sat behind the next sweep's window, and with its webhook missed it was never processed. Every WooCommerce pull cursor (order poll and reconcile, product poll and reconcile, the initial import's completion stamp) is now the time the run STARTED, before its first WooCommerce read, less a 120 second overlap (`WC_PULL_CURSOR_OVERLAP_MS`, covering second-precision `date_modified` and clock skew between the IMS and WooCommerce hosts). Re-reading the overlap is safe: order import updates an order it already holds and product sync upserts by SKU.
