@@ -82,9 +82,9 @@ export function refundStatedTax(refund: RefundTaxCarrier): { total: string; unre
 /**
  * THE FIGURES OF A RATE-182 SCHEME CREDIT NOTE. Pure. The VAT is the refund's stated gross less the net of its lines (so the credit note totals the refund exactly, as every scheme credit note does), and it is:
  *   confirmed against the tax the refund itself states across all its rate ids (`statedTax`), within `toleranceMinorUnits` of a minor unit: the figure the EAS plugin re-priced is not trusted on its own, and the refund's lines' own rates are NOT consulted (the plugin books its own);
- *   held to the order's collected VAT not already refunded (`orderTax` less `priorRefundedTax`), with the same rounding allowance. `priorRefundedTax` null means an earlier refund's VAT cannot be established, which refuses.
+ *   held, in the AGGREGATE, to the order's collected VAT: the VAT of the earlier refunds (`priorRefundedTax`) plus this one may not exceed `orderTax` by more than ONE fixed allowance of the order's own (`orderAllowanceMinorUnits`), and nothing positive is accepted once it is all refunded. `priorRefundedTax` null means an earlier refund's VAT cannot be established, which refuses.
  */
-export function eas182RefundFigures(input: { net: Decimal; statedGross: Decimal; statedTax: Decimal; orderTax: Decimal; priorRefundedTax: Decimal | null; currency: string; toleranceMinorUnits: number }): { ok: true; vatAmount: string; refundTotal: string } | { ok: false; reason: string } {
+export function eas182RefundFigures(input: { net: Decimal; statedGross: Decimal; statedTax: Decimal; orderTax: Decimal; priorRefundedTax: Decimal | null; currency: string; toleranceMinorUnits: number; /** The ONE rounding allowance for the whole order's VAT bound, in minor units (the order's own, fixed: not granted again per refund). */ orderAllowanceMinorUnits: number }): { ok: true; vatAmount: string; refundTotal: string } | { ok: false; reason: string } {
   const { currency } = input
   const gross = roundMoney(input.statedGross, currency)
   const vat = gross.minus(input.net)
@@ -95,8 +95,13 @@ export function eas182RefundFigures(input: { net: Decimal; statedGross: Decimal;
     return { ok: false, reason: `the refund states ${gross.toString()} ${currency} in all, so ${vat.toString()} of tax over a net of ${input.net.toString()}, but the tax it states across its tax rates is ${roundMoney(input.statedTax, currency).toString()}; that is more than rounding explains` }
   }
   if (input.priorRefundedTax === null) return { ok: false, reason: 'the VAT of an earlier refund on this order cannot be established, so this refund\'s VAT cannot be held to what is left to refund' }
+  // THE BOUND IS ON THE AGGREGATE: all the VAT credited across the order's refunds, this one included, may not exceed the order's collected VAT plus ONE fixed allowance of the order's own. The allowance is not granted again per refund, and once the collected VAT is used up no further positive VAT is accepted.
   const left = input.orderTax.minus(input.priorRefundedTax)
-  if (vat.gt(left.plus(allowance))) {
+  const orderAllowance = minor.times(Math.max(1, input.orderAllowanceMinorUnits))
+  if (vat.gt(0) && !left.gt(0)) {
+    return { ok: false, reason: `the order's collected VAT (${roundMoney(input.orderTax, currency).toString()} ${currency}) has already been refunded, so this refund's VAT (${vat.toString()} ${currency}) is more than the order's collected VAT not already refunded (0 ${currency})` }
+  }
+  if (input.priorRefundedTax.plus(vat).gt(input.orderTax.plus(orderAllowance))) {
     return { ok: false, reason: `the refund's VAT (${vat.toString()} ${currency}) is more than the order's collected VAT not already refunded (${roundMoney(left.isNegative() ? toDecimal(0) : left, currency).toString()} ${currency} of ${roundMoney(input.orderTax, currency).toString()})` }
   }
   return { ok: true, vatAmount: vat.toString(), refundTotal: gross.toString() }

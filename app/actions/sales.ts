@@ -2383,8 +2383,18 @@ async function queueRefundAccountingActions(input: {
     connector: settings.connector,
     accounts: { ioss: settings.euVatIossAccount ?? null, ddp: settings.euVatDdpAccount ?? null, fee: settings.euFeeAccount ?? null, rounding: settings.roundingDifferenceAccount ?? null },
     now: new Date(),
+    // The hold queues its REFUSED row through the very enqueue below (same key, same chart pin), inside the hold's own transaction, so no stamp or count exists without the row.
+    enqueueHeldRow: (reason) => queueAccountingSync({
+      ...creditNote,
+      idempotencyKey: `sales-order-refund:${input.refundId}:credit-note`,
+      chartConnector: settings.connector,
+      payload: refusedCreditNotePayload({ creditNoteNumber: builtCreditNotePayload.creditNoteNumber, currency: builtCreditNotePayload.currency, reference: builtCreditNotePayload.reference, date: builtCreditNotePayload.date, refundId: input.refundId, orderId: input.orderId, lines: builtCreditNotePayload.lines, reason }),
+    }),
   })
-  if (creditNoteTreatment.kind === 'refused' && creditNoteTreatment.code !== 'hand_post') {
+  if (creditNoteTreatment.kind === 'held') {
+    // The refused row IS the hand-off's credit note (queued, or not: then the obligation stays unmet and a retry holds it again).
+    ledger.account(creditNote, creditNoteTreatment.outcome)
+  } else if (creditNoteTreatment.kind === 'refused' && creditNoteTreatment.code !== 'hand_post') {
     // Nothing is queued and the obligation stays unmet: the refund stays marked for retry, and a retry after the cause is fixed rebuilds the credit note.
     await recordCreditNoteTreatmentRefusal({ orderId: input.orderId, refundId: input.refundId, reason: creditNoteTreatment.reason })
     ledger.account(creditNote, { queued: false, reason: 'refused', connector: settings.connector })

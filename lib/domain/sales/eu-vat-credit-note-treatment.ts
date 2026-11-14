@@ -18,6 +18,7 @@ import { regimePolicyOf, type RegimePolicy } from '@/lib/domain/accounting/eu-va
 import { readEuVatRegimeMode, readGiftCardFlagCutIn } from '@/lib/connectors/woocommerce/sync/eu-vat-facts'
 import type { GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
 import { predictedUntaxedTotal } from '@/lib/domain/accounting/eu-vat-treatment'
+import type { AccountingEnqueueOutcome } from '@/lib/accounting'
 import { decideRefund182Hold } from '@/lib/domain/sales/refund-182-hold'
 import { applyEuVatCreditNoteTreatment, eas182RefundFigures, refund182HeldRefusal, noFrozenBasisRefusal, noInvoicedTypeRefusal, noStampRefusal, refundTaxAndTotal, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
@@ -27,6 +28,8 @@ export type EuVatCreditNoteAccounts = { ioss: string | null; ddp: string | null;
 export type TreatedCreditNoteOutcome =
   /** Nothing was read or written for the treatment (the switch is off, or the connector is not Xero), or the order is not on a scheme and the payload is exactly as built. */
   | { kind: 'skipped'; why: 'switch_off' | 'not_scheme' }
+  /** A rate-182 credit note held for review: its REFUSED row (never sent) is what `outcome` reports on (queued, or not: then nothing was stamped or counted and the obligation stays unmet). The hand-off accounts the obligation with it and queues nothing more. */
+  | { kind: 'held'; outcome: AccountingEnqueueOutcome }
   | { kind: 'treated'; payload: Record<string, unknown>; regimePolicy: RegimePolicy }
   /** The credit note cannot be raised as it is: the reason is the operator-facing sentence. */
   | { kind: 'refused'; reason: string; /** `hand_post`: nothing a retry can change, so the hand-off queues a REFUSED row for the operator to settle by hand; any other refusal is cleared by fixing its cause and retrying. */ code?: 'hand_post' }
@@ -48,7 +51,21 @@ export async function treatCreditNotePayload(params: {
   /** The account settings the caller read ONCE for this payload. */
   accounts: EuVatCreditNoteAccounts
   now: Date
+  /** Enqueues the REFUSED credit-note row (never sent) carrying `reason`, exactly as the hand-off queues any refused row (same idempotency key and chart pin). The hold uses it so that no stamp or count exists without the row. */
+  enqueueHeldRow: (reason: string) => Promise<AccountingEnqueueOutcome>
 }): Promise<TreatedCreditNoteOutcome> {
+  // A HELD DECISION IS PERMANENT, so it is asked BEFORE the switch: a refund already held for review is held again whatever the Sales Invoices switch says now, and never becomes a sendable credit note by a switch being turned off. (One read of the refund; nothing else is read or written when the switch is off and the refund was never held.)
+  const prior = await db.salesOrderRefund.findUnique({ where: { id: params.refundId }, select: { eas182HeldAt: true, creditNoteNumber: true, statedGrossForeign: true, eas182StatedTaxForeign: true, order: { select: { euVatLineAccount: true } } } })
+  if (prior !== null && prior.eas182HeldAt !== null) {
+    const heldNumber = String(prior.creditNoteNumber ?? params.payload.creditNoteNumber ?? '(no number)')
+    const currency = String(params.payload.currency ?? '')
+    const decision = await decideRefund182Hold(params.refundId, async (place) => params.enqueueHeldRow(refund182HeldRefusal({
+      creditNoteNumber: heldNumber, heldNumber: place.heldNumber, threshold: place.threshold ?? place.heldNumber, vatAccount: (prior.order.euVatLineAccount ?? '').trim() || 'the stamped VAT account',
+      vatAmount: prior.eas182StatedTaxForeign === null ? 'the refund\'s VAT' : toDecimal(prior.eas182StatedTaxForeign).toString(), refundTotal: prior.statedGrossForeign === null ? 'the refund amount' : toDecimal(prior.statedGrossForeign).toString(), currency,
+    })))
+    if (decision.held) return { kind: 'held', outcome: decision.outcome }
+  }
+
   // THE SWITCH, ASKED FIRST (the Sales Invoices switch, the one the invoice treatment asks): off means nothing here runs.
   const { isAccountingSyncTypeEnabledFor } = await import('@/lib/accounting')
   if (params.connector !== 'xero' || !(await isAccountingSyncTypeEnabledFor(params.connector, 'SALES_INVOICE'))) return { kind: 'skipped', why: 'switch_off' }
@@ -138,8 +155,8 @@ export async function treatCreditNotePayload(params: {
     figures = { ok: true, vatAmount: vat.toString(), refundTotal: net.plus(vat).toString() }
   } else if (rate182) {
     // RATE 182: the tax the refund states across ALL its rate ids, confirmed against its own gross and held to the order's VAT not already refunded.
-    const prior = await priorRefundedTax(params.orderId, params.refundId, toDecimal(order.taxForeign))
-    figures = eas182RefundFigures({ net, statedGross: toDecimal(refund.statedGrossForeign!), statedTax: toDecimal(refund.eas182StatedTaxForeign!), orderTax: toDecimal(order.taxForeign), priorRefundedTax: prior, currency: payload.currency, toleranceMinorUnits: lines.length + 1 })
+    const priorTax = await priorRefundedTax(params.orderId, params.refundId, toDecimal(order.taxForeign))
+    figures = eas182RefundFigures({ net, statedGross: toDecimal(refund.statedGrossForeign!), statedTax: toDecimal(refund.eas182StatedTaxForeign!), orderTax: toDecimal(order.taxForeign), priorRefundedTax: priorTax, currency: payload.currency, toleranceMinorUnits: lines.length + 1, orderAllowanceMinorUnits: order.lines.length + 1 })
   } else {
     figures = refundTaxAndTotal({ net, pricedTax, rawGross: net.plus(pricedTax), statedGross: refund.statedGrossForeign === null ? null : toDecimal(refund.statedGrossForeign), currency: payload.currency, toleranceMinorUnits: lines.length + 1 })
   }
@@ -163,16 +180,16 @@ export async function treatCreditNotePayload(params: {
   if (!treated.ok) return { kind: 'refused', reason: `Credit note ${number}: ${treated.reason}. Nothing was queued.` }
   // THE HOLD, decided last: only a credit note that would otherwise post is counted. The first N rate-182 credit notes are a refused, settle-by-hand row (never sent); after that they post.
   if (rate182) {
-    const hold = await decideRefund182Hold(params.refundId)
+    const hold = await decideRefund182Hold(params.refundId, async (place) => params.enqueueHeldRow(refund182HeldRefusal({ creditNoteNumber: number, heldNumber: place.heldNumber, threshold: place.threshold ?? place.heldNumber, vatAccount, vatAmount: figures.vatAmount, refundTotal: figures.refundTotal, currency: payload.currency })))
     if (hold.held) {
-      if (hold.newlyHeld) {
+      if (hold.queued && hold.newlyHeld) {
         await logActivity({
           entityType: 'SALES_ORDER', entityId: params.orderId, action: 'refund_182_credit_note_held', tag: 'accounting', level: 'WARNING',
           description: `Credit note ${number} (a refund whose VAT is on WooCommerce rate 182) was held for review: number ${hold.heldNumber}${hold.threshold === null ? ', counted against a threshold that is not a whole number' : ` of the first ${hold.threshold}`}. It is on the sync exceptions page and is never sent.`,
           metadata: { refundId: params.refundId },
         }).catch(() => { /* the refused row is what holds it; logging must not throw */ })
       }
-      return { kind: 'refused', code: 'hand_post', reason: refund182HeldRefusal({ creditNoteNumber: number, heldNumber: hold.heldNumber, threshold: hold.threshold ?? hold.heldNumber, vatAccount, vatAmount: figures.vatAmount, refundTotal: figures.refundTotal, currency: payload.currency }) }
+      return { kind: 'held', outcome: hold.outcome }
     }
   }
   return {

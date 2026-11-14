@@ -251,8 +251,8 @@ test('[refund 182 hold] an accounting retry of a held refund is held again and N
   const first = await refund182(deps, fx)
   assert.equal(first.result.success, true, first.result.error)
   assert.equal(await heldCount(deps.db), '1')
-  const again = await decideRefund182Hold(first.refund.id)
-  assert.deepEqual(again, { held: true, newlyHeld: false, heldNumber: 1, threshold: 10 })
+  const again = await decideRefund182Hold(first.refund.id, async () => ({ queued: true as const }))
+  assert.deepEqual(again, { held: true, queued: true, newlyHeld: false, heldNumber: 1, threshold: 10, outcome: { queued: true } })
   assert.equal(await heldCount(deps.db), '1', 'not counted twice')
   // Not a whole number: held, and the count is left alone.
   await deps.db.setting.update({ where: { key: THRESHOLD }, data: { value: 'ten' } })
@@ -265,4 +265,47 @@ test('[refund 182 hold] an accounting retry of a held refund is held again and N
   const third = await refund182(deps, fx, { net: 10, tax: 1.9 })
   assert.ok(third.payload && !(EU_VAT_CREDIT_NOTE_REFUSED_KEY in third.payload), 'posts')
   assert.equal(await heldCount(deps.db), '1')
+})
+
+test('[refund 182 hold] no stamp and no count without the row: an enqueue that fails or throws rolls the hold back; a held refund stays held (the refused row only, no sendable payload) after the switch is turned off', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true, { [COUNT]: '0', [THRESHOLD]: '10' })
+  const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  const fx2 = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx); await cleanup(deps.db, fx2) })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  const { decideRefund182Hold } = await import('../../lib/domain/sales/refund-182-hold.ts')
+  const { retryRefundAccounting } = await import('../../app/actions/sales.ts')
+  const first = await refund182(deps, fx)
+  assert.equal(first.result.success, true, first.result.error)
+  assert.ok(first.payload && EU_VAT_CREDIT_NOTE_REFUSED_KEY in first.payload)
+  assert.equal(await heldCount(deps.db), '1')
+
+  // A second refund whose enqueue is refused, then one whose enqueue throws: nothing stamped, nothing counted.
+  const second = await refund182(deps, fx2, { net: 20, tax: 3.8 })
+  await deps.db.setting.update({ where: { key: COUNT }, data: { value: '1' } })
+  const stampOf = async (id: string) => (await deps.db.salesOrderRefund.findUnique({ where: { id }, select: { eas182HeldAt: true } }))!.eas182HeldAt
+  const fresh = await deps.db.salesOrderRefund.create({ data: { orderId: fx2.orderId, totalForeign: 1, totalBase: 1, totalsBasis: 'NET' }, select: { id: true } })
+  const refusedEnqueue = await decideRefund182Hold(fresh.id, async () => ({ queued: false as const }))
+  assert.deepEqual(refusedEnqueue, { held: true, queued: false, outcome: { queued: false } })
+  assert.equal(await stampOf(fresh.id), null, 'not stamped')
+  assert.equal(await heldCount(deps.db), '1', 'not counted')
+  await assert.rejects(decideRefund182Hold(fresh.id, async () => { throw new Error('enqueue exploded') }), /enqueue exploded/)
+  assert.equal(await stampOf(fresh.id), null)
+  assert.equal(await heldCount(deps.db), '1')
+  await deps.db.salesOrderRefund.delete({ where: { id: fresh.id } })
+  void second
+
+  // The stamp is committed but the row was lost; the switch is turned OFF; the retry gives the held refused row only, and the count is unchanged.
+  await deps.db.accountingSyncLog.deleteMany({ where: { type: 'CREDIT_NOTE', referenceId: first.refund.id } })
+  await deps.db.salesOrderRefund.update({ where: { id: first.refund.id }, data: { accountingRetryRequired: true } })
+  await deps.db.setting.upsert({ where: { key: 'xero_sync_sales_invoice' }, create: { key: 'xero_sync_sales_invoice', value: 'off' }, update: { value: 'off' } })
+  const retried = await retryRefundAccounting(first.refund.id)
+  assert.equal(retried.success, true, retried.error)
+  const row = await creditNoteRowOf(deps.db, first.refund.id)
+  assert.ok(row, 'the refused row is queued again')
+  assert.ok(EU_VAT_CREDIT_NOTE_REFUSED_KEY in row, 'a held refund stays held with the switch off')
+  assert.deepEqual(row.lines, [], 'no sendable payload')
+  assert.equal('_euVatTreatment' in row, false)
+  assert.equal(await heldCount(deps.db), '1', 'the count is unchanged')
 })

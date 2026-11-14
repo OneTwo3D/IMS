@@ -242,7 +242,7 @@ test('[eu vat credit note] the account is the STAMPED one after the facts change
     select: { id: true, lines: { select: { id: true } } },
   })
   const payload = { creditNoteNumber: 'CN-FX', currency: deps.baseCurrency, lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: fx.rate.accountingTaxType }], lineAmountsIncludeTax: false }
-  const outcome = await treatCreditNotePayload({ refundId: refund.id, orderId: fx.orderId, payload, refundLineIds: refund.lines.map((l) => l.id), connector: 'xero', accounts: { ioss: '999', ddp: '232', fee: '232', rounding: '860' }, now: new Date() })
+  const outcome = await treatCreditNotePayload({ refundId: refund.id, orderId: fx.orderId, payload, refundLineIds: refund.lines.map((l) => l.id), connector: 'xero', accounts: { ioss: '999', ddp: '232', fee: '232', rounding: '860' }, now: new Date(), enqueueHeldRow: async () => ({ queued: false, reason: "refused", connector: null }) })
   assert.equal(outcome.kind, 'treated')
   if (outcome.kind !== 'treated') return
   const vat = (outcome.payload.lines as Array<{ noTaxKind?: string; accountCode: string; unitAmount: number }>).find((l) => l.noTaxKind === 'eu-vat-recovery')
@@ -414,7 +414,7 @@ test('[eu vat credit note] a MANUAL refund is priced once, at creation: the rate
   await deps.db.taxRate.update({ where: { id: fx.rate.id }, data: { rate: '0.2' } })
   const { treatCreditNotePayload } = await import('../../lib/domain/sales/eu-vat-credit-note-treatment.ts')
   const rebuilt = { creditNoteNumber: 'CN-RETRY', currency: deps.baseCurrency, lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: fx.rate.accountingTaxType }], lineAmountsIncludeTax: false }
-  const outcome = await treatCreditNotePayload({ refundId: row!.refundId, orderId: fx.orderId, payload: rebuilt, refundLineIds: [frozen!.lines[0]!.id], connector: 'xero', accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' }, now: new Date() })
+  const outcome = await treatCreditNotePayload({ refundId: row!.refundId, orderId: fx.orderId, payload: rebuilt, refundLineIds: [frozen!.lines[0]!.id], connector: 'xero', accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' }, now: new Date(), enqueueHeldRow: async () => ({ queued: false, reason: "refused", connector: null }) })
   assert.equal(outcome.kind, 'treated')
   if (outcome.kind !== 'treated') return
   const lines = outcome.payload.lines as Array<{ noTaxKind?: string; unitAmount: number; quantity: number }>
@@ -422,7 +422,7 @@ test('[eu vat credit note] a MANUAL refund is priced once, at creation: the rate
   assert.equal(lines.reduce((sum, l) => sum + l.unitAmount * l.quantity, 0).toFixed(2), '119.00')
   // A refund created before the basis was frozen: refused, to be posted by hand.
   await deps.db.salesOrderRefundLine.update({ where: { id: frozen!.lines[0]!.id }, data: { schemeTaxRateValue: null } })
-  const old = await treatCreditNotePayload({ refundId: row!.refundId, orderId: fx.orderId, payload: rebuilt, refundLineIds: [frozen!.lines[0]!.id], connector: 'xero', accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' }, now: new Date() })
+  const old = await treatCreditNotePayload({ refundId: row!.refundId, orderId: fx.orderId, payload: rebuilt, refundLineIds: [frozen!.lines[0]!.id], connector: 'xero', accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' }, now: new Date(), enqueueHeldRow: async () => ({ queued: false, reason: "refused", connector: null }) })
   assert.equal(old.kind, 'refused')
   assert.equal(old.kind === 'refused' && old.code, 'hand_post')
   assert.match(old.kind === 'refused' ? old.reason : '', /did not record the VAT rate and amount it was priced at[\s\S]*settle action on \/sync/)
@@ -555,7 +555,7 @@ async function directRefund(deps: Deps, fx: Fixture, opts: { lines: DirectLine[]
 }
 async function treat(deps: Deps, fx: Fixture, refund: Awaited<ReturnType<typeof directRefund>>, over: { payload?: Record<string, unknown>; lineIds?: readonly string[]; connector?: string | null; refundId?: string } = {}) {
   const { treatCreditNotePayload } = await import('../../lib/domain/sales/eu-vat-credit-note-treatment.ts')
-  return treatCreditNotePayload({ refundId: over.refundId ?? refund.refundId, orderId: fx.orderId, payload: over.payload ?? refund.payload(), refundLineIds: over.lineIds ?? refund.lineIds, connector: over.connector === undefined ? 'xero' : over.connector, accounts: ACCOUNTS, now: new Date() })
+  return treatCreditNotePayload({ refundId: over.refundId ?? refund.refundId, orderId: fx.orderId, payload: over.payload ?? refund.payload(), refundLineIds: over.lineIds ?? refund.lineIds, connector: over.connector === undefined ? 'xero' : over.connector, accounts: ACCOUNTS, now: new Date(), enqueueHeldRow: async () => ({ queued: false, reason: "refused", connector: null }) })
 }
 const refusal = (outcome: Awaited<ReturnType<typeof treat>>) => (outcome.kind === 'refused' ? outcome : null)
 
