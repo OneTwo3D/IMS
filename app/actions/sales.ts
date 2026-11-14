@@ -2373,6 +2373,18 @@ async function queueRefundAccountingActions(input: {
     currencyRateToBase: usableStoredFxRate(input.refundFxRate)?.toNumber(),
   }
 
+  // The one enqueue of this hand-off's credit-note row (the treated, plain or REFUSED payload alike).
+  // o3d-j625: every `accountCode` below is `settings.*`, so the row is routed by the same resolution
+  // those codes came from. Where the chart's connector has since been retired the enqueue refuses,
+  // which the ledger records as an unmet obligation — `accountingRetryRequired` stays set and the
+  // caller reports the warning — instead of committing a credit note to books it does not describe.
+  const enqueueCreditNoteRow = (payload: Record<string, unknown>) => queueAccountingSync({
+    ...creditNote,
+    idempotencyKey: `sales-order-refund:${input.refundId}:credit-note`,
+    chartConnector: settings.connector,
+    payload,
+  })
+
   // IOSS credit notes (behind the Sales Invoices switch): a credit note on an order stamped as an IOSS/VOEC/DDP scheme order is rebuilt on the stamped regime. Off, nothing is read and the payload above is queued exactly as built.
   // The accounts are the ones read ONCE above for this very payload.
   const creditNoteTreatment = await treatCreditNotePayload({
@@ -2384,12 +2396,7 @@ async function queueRefundAccountingActions(input: {
     accounts: { ioss: settings.euVatIossAccount ?? null, ddp: settings.euVatDdpAccount ?? null, fee: settings.euFeeAccount ?? null, rounding: settings.roundingDifferenceAccount ?? null },
     now: new Date(),
     // The hold queues its REFUSED row through the very enqueue below (same key, same chart pin), inside the hold's own transaction, so no stamp or count exists without the row.
-    enqueueHeldRow: (reason) => queueAccountingSync({
-      ...creditNote,
-      idempotencyKey: `sales-order-refund:${input.refundId}:credit-note`,
-      chartConnector: settings.connector,
-      payload: refusedCreditNotePayload({ creditNoteNumber: builtCreditNotePayload.creditNoteNumber, currency: builtCreditNotePayload.currency, reference: builtCreditNotePayload.reference, date: builtCreditNotePayload.date, refundId: input.refundId, orderId: input.orderId, lines: builtCreditNotePayload.lines, reason }),
-    }),
+    enqueueHeldRow: (reason) => enqueueCreditNoteRow(refusedCreditNotePayload({ creditNoteNumber: builtCreditNotePayload.creditNoteNumber, currency: builtCreditNotePayload.currency, reference: builtCreditNotePayload.reference, date: builtCreditNotePayload.date, refundId: input.refundId, orderId: input.orderId, lines: builtCreditNotePayload.lines, reason })),
   })
   if (creditNoteTreatment.kind === 'held') {
     // The refused row IS the hand-off's credit note (queued, or not: then the obligation stays unmet and a retry holds it again).
@@ -2399,21 +2406,13 @@ async function queueRefundAccountingActions(input: {
     await recordCreditNoteTreatmentRefusal({ orderId: input.orderId, refundId: input.refundId, reason: creditNoteTreatment.reason })
     ledger.account(creditNote, { queued: false, reason: 'refused', connector: settings.connector })
   } else {
-    ledger.account(creditNote, await queueAccountingSync({
-      ...creditNote,
-      idempotencyKey: `sales-order-refund:${input.refundId}:credit-note`,
-      // o3d-j625: every `accountCode` below is `settings.*`, so the row is routed by the same resolution
-      // those codes came from. Where the chart's connector has since been retired the enqueue refuses,
-      // which the ledger records as an unmet obligation — `accountingRetryRequired` stays set and the
-      // caller reports the warning — instead of committing a credit note to books it does not describe.
-      chartConnector: settings.connector,
-      // A scheme order with no stamp: a REFUSED row (the poster refuses it before anything else, so it can never be sent). A retry cannot change the answer, so the row is what the operator settles by hand on /sync.
-      payload: creditNoteTreatment.kind === 'treated'
+    ledger.account(creditNote, await enqueueCreditNoteRow(
+      creditNoteTreatment.kind === 'treated'
         ? creditNoteTreatment.payload
         : creditNoteTreatment.kind === 'refused'
           ? refusedCreditNotePayload({ creditNoteNumber: builtCreditNotePayload.creditNoteNumber, currency: builtCreditNotePayload.currency, reference: builtCreditNotePayload.reference, date: builtCreditNotePayload.date, refundId: input.refundId, orderId: input.orderId, lines: builtCreditNotePayload.lines, reason: creditNoteTreatment.reason })
           : builtCreditNotePayload,
-    }))
+    ))
   }
 
   for (const sync of input.accountingSyncs) {
