@@ -14,6 +14,19 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
+    version: '4.1.1',
+    date: '2026-11-14',
+    title: 'WooCommerce order sweep can save its progress again',
+    summary: 'Backend fix only, no operator action. In 4.1.0 the WooCommerce order sweep read orders correctly but failed when saving its progress, so it reported a failure every run and did not move forward. Nothing was lost; the sweep re-read the same window each time.',
+    userMessage: 'IMS 4.1.1 fixes the WooCommerce order sweep, which in 4.1.0 could not save its progress. No orders were lost.',
+    userHighlights: [
+      'WooCommerce: the order sweep saves its progress again, so its last-success time moves forward and the Healthchecks heartbeat for the WooCommerce reconcile is no longer red because of it.',
+    ],
+    technicalHighlights: [
+      'The sweep commit took its per-cursor advisory lock with $queryRaw; pg_advisory_xact_lock returns void, which Prisma cannot deserialize. It now uses $executeRaw, and a source test forbids $queryRaw for pg_advisory lock calls.',
+    ],
+  },
+  {
     version: '4.1.0',
     date: '2026-11-14',
     title: 'Blocked WooCommerce orders recorded, cron failures reach Healthchecks, EU VAT credit notes built and switched off',
