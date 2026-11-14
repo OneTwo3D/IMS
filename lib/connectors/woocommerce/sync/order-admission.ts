@@ -51,6 +51,7 @@ import {
   parseWcSyncOrderStatuses,
   WC_SYNC_ORDER_STATUSES_SETTING_KEY,
 } from '../order-status-filter'
+import { WC_ADMISSION_REFUSAL_QUEUE_MARKER } from '@/lib/domain/sales/wc-sync-row-families'
 import type { WcFullOrder } from './types'
 
 export type WcOrderCreateAdmission = {
@@ -88,7 +89,7 @@ export async function resolveWcOrderCreateAdmission(
 // ---------------------------------------------------------------------------
 
 /** Discriminator on the queue row's payload, so this queue and the pending-FX queue stay disjoint. */
-export const WC_ADMISSION_REFUSAL_QUEUE = 'wc_order_admission_refusal'
+export const WC_ADMISSION_REFUSAL_QUEUE = WC_ADMISSION_REFUSAL_QUEUE_MARKER
 
 /**
  * WHY a create was withheld. All three are ACKNOWLEDGED decisions rather than failures.

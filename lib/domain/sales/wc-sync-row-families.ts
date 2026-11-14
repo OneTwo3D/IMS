@@ -363,6 +363,40 @@ export function unresolvedWcOrderRowSql(): Prisma.Sql {
 }
 
 /**
+ * The payload discriminator of the by-id ADMISSION-REFUSAL QUEUE (`order-admission.ts` re-exports it as
+ * `WC_ADMISSION_REFUSAL_QUEUE`). It lives here, in the pure module, so the retention sweep can render the
+ * family without importing a module that holds a database handle.
+ */
+export const WC_ADMISSION_REFUSAL_QUEUE_MARKER = 'wc_order_admission_refusal'
+
+/**
+ * TRUE for a PENDING row of the admission-refusal queue: an order IMS did not import (excluded or unmapped
+ * status, missing currency, or blocked by a tax-rate / coupon guard) whose ONLY durable record is this row.
+ * The pull cursors have moved past such an order and WooCommerce will not send it again, so the by-id drain
+ * reading this row is the sole route back to it.
+ *
+ * Retention must NEVER delete one while it is PENDING, whatever its age. The drain keeps a row young by
+ * re-stamping `createdAt` each time it runs, but only while WooCommerce sync is on and the cron runs; with
+ * sync off or the cron stopped for longer than the retention window an age-only sweep would delete the row
+ * and the order would be lost for good. These rows have no `entityId` (the order does not exist in IMS yet),
+ * so {@link unresolvedWcOrderRowSql} does not cover them and must not be widened to: it is keyed on the
+ * entityId-bearing families.
+ *
+ * Rendered TOTAL (`COALESCE(..., FALSE)`) for the same reason as the rule above: the retention DELETE negates
+ * it, and `payload` and the cast could otherwise answer UNKNOWN and put a row in neither set.
+ */
+export function pendingAdmissionRefusalRowSql(): Prisma.Sql {
+  return Prisma.sql`COALESCE((
+        "shopping_sync_logs".connector = 'woocommerce'
+    AND "shopping_sync_logs".direction = 'FROM_CONNECTOR'::"ShoppingSyncDirection"
+    AND "shopping_sync_logs"."entityType" = 'SalesOrder'
+    AND "shopping_sync_logs".status = 'PENDING'::"ShoppingSyncStatus"
+    AND jsonb_typeof("shopping_sync_logs".payload) = 'object'
+    AND "shopping_sync_logs".payload->>'queue' = ${WC_ADMISSION_REFUSAL_QUEUE_MARKER}
+  ), FALSE)`
+}
+
+/**
  * THE ROW THE RECOVERY WITNESS ACCUSES: a `shopping_sync_logs` row an operator recovery once acted on that is
  * NOW shaped or stamped as a held sales invoice. This is the predicate of check 7 of the 20260822120000
  * migration's verify.sql, spelt here for the retention sweep and compared with that file by a test, because the

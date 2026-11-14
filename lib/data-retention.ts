@@ -10,7 +10,7 @@ import {
 import { followUpObligationsOwedBy } from '@/lib/domain/accounting/compacted-followup-loss'
 import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
 import { WC_REFUND_PARK_RECOVERED_ACTION, WC_REFUND_PARK_VERIFICATION_MIGRATION } from '@/lib/domain/sales/refund-park-recovery'
-import { recoveryAccusedRowSql, unresolvedWcOrderRowSql } from '@/lib/domain/sales/wc-sync-row-families'
+import { pendingAdmissionRefusalRowSql, recoveryAccusedRowSql, unresolvedWcOrderRowSql } from '@/lib/domain/sales/wc-sync-row-families'
 import { EXTERNAL_DOCUMENT_EVIDENCE_WHERE } from '@/lib/domain/accounting/external-document-evidence'
 import { REMOTE_MONEY_EVIDENCE_TYPES } from '@/lib/domain/accounting/remote-money-evidence'
 import { UNRESOLVED_ABANDONED_CLAIM_WHERE } from '@/lib/domain/accounting/unresolved-abandoned-claim'
@@ -260,6 +260,10 @@ export async function purgeExpiredData(): Promise<{
              -- protect this DELETE and no future one, and the next reader would write the obvious
              -- negation and be wrong again with nothing in the tree to say so.
              AND NOT (${unresolvedWcOrderRowSql()})
+             -- A PENDING admission-refusal row is an order's only record (no entityId: IMS never
+             -- created it), and the drain that keeps it young only runs while sync is on. Never
+             -- deleted by age while PENDING; a resolved one (SYNCED) expires like any other row.
+             AND NOT (${pendingAdmissionRefusalRowSql()})
              AND NOT ${recoveryWitnessRetainsRowSql()}
           RETURNING 1
         )
