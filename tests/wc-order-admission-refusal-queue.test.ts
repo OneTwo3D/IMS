@@ -128,6 +128,8 @@ function txDelegates() {
     },
   },
   salesOrder: {
+    // The existing-order branch asks whether a sales invoice is still owed by the order: not in this store.
+    findUnique: async () => ({ salesInvoiceOwedAt: null }),
     findFirst: async ({ where }: { where: Record<string, unknown> }) => {
       const some = (where as {
         shoppingLinks?: { some?: { connector?: string; externalOrderId?: string } }
@@ -184,6 +186,8 @@ function txDelegates() {
     findMany: async ({ where }: { where: Row }) => matchLogs(where),
     count: async () => 0,
   },
+  // The existing-order branch asks whether an invoice enqueue failure is on record with nothing behind it: none in this store.
+  accountingSyncLog: { findFirst: async () => null },
   product: { findMany: async () => [] },
   taxRate: { findMany: async () => [] },
   warehouse: { findMany: async () => [] },
@@ -211,6 +215,8 @@ function txClient() {
     salesOrder: {
       ...base.salesOrder,
       findUnique: async () => ({ erasedAt: null }),
+      // Clearing the owed-invoice mark: not a status application, so it is not recorded in updatedOrderIds.
+      updateMany: async () => ({ count: 1 }),
       update: async ({ where }: { where: { id: string } }) => {
         store.updatedOrderIds.push(where.id)
         return {}
@@ -384,14 +390,15 @@ test('an order that becomes MAPPABLE is imported by the same drain, on the same 
   assert.equal(queued().length, 0)
 })
 
-test('an order that cannot be read stays queued and is reported unresolved, not retired', async () => {
+test('an order that cannot be read stays queued and is reported failed (not unresolved), not retired', async () => {
   reset()
   await importOrder(wcOrder(304, 'on-hold'))
   store.liveReadable = false
 
   const result = await drain()
 
-  assert.equal(result.unresolved, 1)
+  assert.equal(result.failed, 1, 'a failed read is a genuine failure, which the cron exit status reads')
+  assert.equal(result.unresolved, 0)
   assert.equal(result.retired, 0, 'an unreadable order must never be dropped from the queue')
   assert.equal(queued().length, 1)
 })

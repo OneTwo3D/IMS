@@ -59,6 +59,10 @@ type MintsoftBookedInCounters = {
   pending: number
   requiresReview: number
   failed: number
+  /** PRESENT ONLY WHEN NON-ZERO: processed events whose storefront stock enqueue failed (the store keeps advertising the pre-receipt quantity). */
+  stockEnqueueFailures?: number
+  /** PRESENT ONLY WHEN NON-ZERO: those the outbound-write hold refused. */
+  stockEnqueueHeld?: number
 }
 
 export type ProcessMintsoftBookedInEventsResult = MintsoftBookedInCounters & {
@@ -239,6 +243,8 @@ export async function processMintsoftBookedInEvent(
 function incrementCounter(counters: MintsoftBookedInCounters, result: ProcessMintsoftBookedInResult): void {
   if (result.status === 'processed') {
     counters.processed += 1
+    if (result.stockEnqueue === 'failed') counters.stockEnqueueFailures = (counters.stockEnqueueFailures ?? 0) + 1
+    else if (result.stockEnqueue === 'held') counters.stockEnqueueHeld = (counters.stockEnqueueHeld ?? 0) + 1
   } else if (result.status === 'duplicate') {
     counters.duplicates += 1
   } else if (result.status === 'pending') {

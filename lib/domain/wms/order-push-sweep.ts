@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
+import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { STORE_CREDIT_PUSH_WITHHELD_REASON, storeCreditPushMustBeWithheld } from '@/lib/domain/wms/store-credit-push-guard'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
@@ -299,6 +300,13 @@ const DEFAULT_BATCH_SIZE = 25
 /** o3d-rbyg: shared empty result for the live withdrawal screen — "nothing withdrawn", not "unknown". */
 const EMPTY_ORDER_ID_SET: ReadonlySet<string> = new Set<string>()
 
+/** A failure that is a write the outbound-write hold refused (by class, or by the hold's authenticated text) is also counted in `outboundHeld`. */
+function noteOutboundHeld(result: { outboundHeld?: number }, error: unknown): void {
+  if ((isOutboundWriteHeldError(error) && error.nothingSent) || isOutboundWriteHeldText(error instanceof Error ? error.message : String(error))) {
+    result.outboundHeld = (result.outboundHeld ?? 0) + 1
+  }
+}
+
 export type WmsOrderPushSweepResult = {
   skipped?: string
   created: number
@@ -337,12 +345,27 @@ export type WmsOrderPushSweepResult = {
    * `revalidateAmbiguous`, which is the same refusal reached from the validation-failure route.
    */
   createClaimParked: number
+  /**
+   * Orders whose withdrawal-fence check THREW (an unreadable storefront, a failed read): the order is skipped this sweep (fail closed) and retried
+   * next one, but the sweep could not decide it, so the cron reports a failed run. NOT an ordinary fence refusal (a withdrawal the fence knows of), which is a decision.
+   */
+  fenceCheckErrors: number
+  /** Orders whose create-claim transaction THREW: skipped this sweep and retried next one, counted so the run does not read healthy. NOT a concurrent-claim skip (another worker owns the order), which is normal. */
+  claimErrors: number
+  /**
+   * Link writes of the recovery passes that THREW (parking a held link that has no automatic exit, releasing a held link, re-queuing a revalidated order or a parked
+   * create, binding a parked create to the warehouse order): the link keeps its state and the pass retries it next sweep, but this sweep could not move it, so the cron reports a failed run.
+   * NOT a concurrent write another worker won (the pass logs that and moves on).
+   */
+  linkWriteErrors: number
   /** ...and parked links this sweep put back in the create queue, on the connector's replay policy. */
   ambiguousCreateRequeued: number
   /** PRESENT ONLY WHEN NON-ZERO: parked creates this sweep BOUND to the order the warehouse already holds (proved by its own reference; still to be verified). */
   ambiguousCreateAdopted?: number
   /** PRESENT ONLY WHEN NON-ZERO: holds / cancellations the warehouse could not honour, left on the link as an operator notice (the link stays live). */
   operatorNotices?: number
+  /** PRESENT ONLY WHEN NON-ZERO: pushes the outbound-write hold refused. Each is also counted in `failed` (it spent no attempt); the cron exit status subtracts them, so a held push alone does not read as a failure. */
+  outboundHeld?: number
   /** PRESENT ONLY WHEN NON-ZERO: warehouse notes for earlier notices that were delivered on this sweep after an earlier failure. */
   noticeCommentsRetried?: number
   /**
@@ -1213,7 +1236,7 @@ export async function runWmsOrderPushSweepCore(
     producerContext?: ProducerDecisionContext
   },
 ): Promise<WmsOrderPushSweepResult> {
-  const result: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0, createClaimParked: 0, ambiguousCreateRequeued: 0 }
+  const result: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0, createClaimParked: 0, fenceCheckErrors: 0, claimErrors: 0, linkWriteErrors: 0, ambiguousCreateRequeued: 0 }
   if (!connector.pushOrder) return { ...result, skipped: 'Active WMS connector has no order-push support' }
 
   const batchSize = options?.batchSize ?? DEFAULT_BATCH_SIZE
@@ -1685,6 +1708,7 @@ export async function runWmsOrderPushSweepCore(
         parked = await port.updateLinkIfState(link.id, 'HELD', { state: 'DEAD_LETTER', lastError: gate.guidance, lastAttemptAt: now() })
       } catch (error) {
         console.error('[wms-order-push] held-release park failed', link.id, error)
+        result.linkWriteErrors += 1
         continue
       }
       if (!parked) {
@@ -1738,6 +1762,7 @@ export async function runWmsOrderPushSweepCore(
       released = await port.updateLinkIfState(link.id, 'HELD', { state: 'PENDING_CREATE', externalOrderId: null, externalOrderNumber: null, attempts: 0, lastError: null, lastAttemptAt: null, cancelledAt: null, ...RESET_DISPATCH_FAILURES })
     } catch (error) {
       console.error('[wms-order-push] release link update failed', link.id, error)
+      result.linkWriteErrors += 1
       continue
     }
     if (!released) {
@@ -1958,6 +1983,7 @@ export async function runWmsOrderPushSweepCore(
         promoted = await port.updateLinkIfState(link.id, 'VALIDATION_FAILED', { state: 'PENDING_CREATE', lastError: null, lastAttemptAt: null })
       } catch (error) {
         console.error('[wms-order-push] failed to re-queue a revalidated order', link.id, error)
+        result.linkWriteErrors += 1
         continue
       }
       if (!promoted) {
@@ -2053,6 +2079,7 @@ export async function runWmsOrderPushSweepCore(
             })
           } catch (error) {
             console.error('[wms-order-push] failed to bind a parked create to the warehouse order', link.id, error)
+            result.linkWriteErrors += 1
             continue
           }
           if (!adopted) {
@@ -2174,6 +2201,7 @@ export async function runWmsOrderPushSweepCore(
         promoted = await port.updateLinkIfState(link.id, 'AMBIGUOUS_CREATE', { state: 'PENDING_CREATE', lastError: null, lastAttemptAt: null })
       } catch (error) {
         console.error('[wms-order-push] failed to re-queue a parked create claim', link.id, error)
+        result.linkWriteErrors += 1
         continue
       }
       if (!promoted) {
@@ -2352,6 +2380,7 @@ export async function runWmsOrderPushSweepCore(
       } catch (e) {
         console.error(`[wms-order-push] withdrawal fence check failed for ${order.id}: ${scrubWmsError(e, 'fence check failed')}`)
         fenceOk = false
+        result.fenceCheckErrors += 1
       }
       if (!fenceOk) continue
 
@@ -2362,6 +2391,7 @@ export async function runWmsOrderPushSweepCore(
         claim = createFloor ? await port.claimForCreate(order.id, connectorId, ts, createFloor) : await port.claimForCreate(order.id, connectorId, ts)
       } catch (error) {
         console.error('[wms-order-push] create claim failed', order.id, error)
+        result.claimErrors += 1
       }
       // o3d-2k5r r4 — THE CRASHED-CREATE PATH, which had no guard at all.
       //
@@ -2659,6 +2689,7 @@ export async function runWmsOrderPushSweepCore(
             const message = scrubWmsError(e, 'raced-withdrawal compensation failed')
             console.error(`[wms-order-push] ${order.id}: ${message}`)
             result.failed += 1
+            noteOutboundHeld(result, e)
             await port.updateLinkByOrder?.(order.id, { lastError: message, lastAttemptAt: ts }).catch(() => {})
           }
           // Deliberately NOT counted as `created`: the order existed at the
@@ -2703,6 +2734,7 @@ export async function runWmsOrderPushSweepCore(
         const message = scrubWmsError(error, 'WMS order push failed')
         if (dead) result.deadLettered += 1
         else result.failed += 1
+        if (heldByOutboundHold || (isOutboundWriteHeldError(error) && error.nothingSent)) result.outboundHeld = (result.outboundHeld ?? 0) + 1
         const state: PushState = dead ? 'DEAD_LETTER' : 'PENDING_CREATE'
         // `lastAttemptAt` IS the create dispatch stamp (decideCreateClaim): a stamped PENDING_CREATE link is
         // skipped until its lease expires and then parked AMBIGUOUS_CREATE ("a create may have left"). A
@@ -3154,6 +3186,7 @@ export async function runWmsOrderPushSweepCore(
       } catch (error) {
         const message = scrubWmsError(error, 'WMS order update failed')
         result.failed += 1
+        noteOutboundHeld(result, error)
         // The lease is released (the mark stays set: the ids remain untrusted until a verified snapshot is stored).
         if (lineToken) await port.releaseAmendLease?.(link.id, lineToken).catch(() => {})
         // The order post was accepted and the item reconcile failed: the courier on the WMS order has already changed, so its
@@ -3299,6 +3332,7 @@ export async function runWmsOrderPushSweepCore(
       } catch (error) {
         const message = scrubWmsError(error, 'WMS hold/cancel failed')
         result.failed += 1
+        noteOutboundHeld(result, error)
         await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts }).catch(() => {})
         const remoteCancelled = cancel?.cancelled === true
         await audit({
@@ -3378,6 +3412,7 @@ export async function runWmsOrderPushSweepCore(
       } catch (error) {
         const message = scrubWmsError(error, 'WMS cancel failed')
         result.failed += 1
+        noteOutboundHeld(result, error)
         await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts }).catch(() => {})
         const remoteCancelled = cancel?.cancelled === true
         await audit({
@@ -4073,7 +4108,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
 export async function runWmsOrderPushSweep(
   options?: { batchSize?: number },
 ): Promise<WmsOrderPushSweepResult> {
-  const empty: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0, createClaimParked: 0, ambiguousCreateRequeued: 0 }
+  const empty: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0, createClaimParked: 0, fenceCheckErrors: 0, claimErrors: 0, linkWriteErrors: 0, ambiguousCreateRequeued: 0 }
 
   const state = await getIntegrationPluginState()
   const resolution = resolveEnabledWmsConnector(state)

@@ -19,6 +19,7 @@ import {
 } from './asn-reconciliation'
 import { loadManualReceiptPools, requireManualReceiptPool } from '@/lib/domain/wms/manual-receipt-pool'
 import { enqueueStockSync } from '@/lib/shopping'
+import { classifyStockEnqueueFailure } from '@/lib/domain/integrations/stock-enqueue-failure'
 import {
   isStockMovementIdempotencyConflict,
   wmsPurchaseReceiptMovementKey,
@@ -126,6 +127,8 @@ export type ProcessMintsoftBookedInResult =
     eventId: string
     externalAsnId: string
     productIds: string[]
+    /** The storefront stock enqueue after the receipt failed ('failed') or was refused by the outbound-write hold ('held'): the store keeps advertising the old quantity. */
+    stockEnqueue?: 'failed' | 'held'
   }
   | {
     status: 'duplicate'
@@ -1848,11 +1851,13 @@ export async function processBookedInEvent(
       }
     }
 
+    let stockEnqueue: 'failed' | 'held' | undefined
     if (processed.productIds.length > 0) {
       try {
         await enqueueStockSync(processed.productIds, 'IMS_CHANGE')
       } catch (error) {
         console.error(error)
+        stockEnqueue = classifyStockEnqueueFailure(error)
       }
     }
 
@@ -1893,6 +1898,7 @@ export async function processBookedInEvent(
       eventId: event.id,
       externalAsnId: event.externalAsnId,
       productIds: processed.productIds,
+      ...(stockEnqueue ? { stockEnqueue } : {}),
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Mintsoft booked-in processing failed'

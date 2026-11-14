@@ -14,6 +14,7 @@ type SyncResult = { success: boolean; error?: string }
 const syncResult = { current: { success: true } as SyncResult }
 const upsertCalls: unknown[] = []
 const stockEnqueueCalls: unknown[] = []
+const stockEnqueue = { error: null as Error | null }
 
 mock.module('@/lib/connectors/woocommerce/sync/product-sync', {
   namedExports: { syncWcProductToIms: async () => syncResult.current },
@@ -23,7 +24,7 @@ mock.module('@/lib/activity-log', {
 })
 mock.module('@/lib/connectors/woocommerce/sync/stock-sync-jobs', {
   namedExports: {
-    enqueueAndProcessImmediateWcStockSync: async (...args: unknown[]) => { stockEnqueueCalls.push(args) },
+    enqueueAndProcessImmediateWcStockSync: async (...args: unknown[]) => { stockEnqueueCalls.push(args); if (stockEnqueue.error) throw stockEnqueue.error },
     recordIncomingWcWebhook: async () => {},
     shouldSuppressWcWebhookEcho: async () => false,
   },
@@ -79,4 +80,16 @@ test('a transient failure returns 500 BEFORE the stock correction, so a retry ca
   const response = await processProduct({ ...basePayload, stock_quantity: 7 })
   assert.equal(response.status, 500)
   assert.equal(stockEnqueueCalls.length, 0, 'the forced stock write is not run on a transient product failure')
+})
+
+test('a stock correction that THROWS after a good import is a retryable 500, not a 200 ack: the store keeps the quantity it sent', async () => {
+  syncResult.current = { success: true }
+  stockEnqueue.error = new Error('queue down')
+  try {
+    const response = await processProduct({ ...basePayload, stock_quantity: 7 })
+    assert.equal(response.status, 500)
+  } finally {
+    stockEnqueue.error = null
+  }
+  assert.equal((await processProduct({ ...basePayload, stock_quantity: 7 })).status, 200)
 })

@@ -653,6 +653,9 @@ export type XeroDailyBatchResult = {
   batchLimit: number
   hasMore: Record<DailyBatchGroup, boolean>
   errors: string[]
+  /** Set when another run held the batch lock and this one did nothing, by design. */
+  skipped?: boolean
+  reason?: string
   // cogs-audit scjz.60.4: the rounding-residue (GL_BASE_PRECISION units) swept to the
   // rounding-difference account this run, or null when nothing was swept (balanced,
   // unavailable, material gap flagged, or no rounding account configured).
@@ -1366,8 +1369,8 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
   // the Xero payment jobs, so a leak stalls those too, not just the batch.
   const batchLock = await acquirePinnedAdvisoryLockOrNull(XERO_DAILY_BATCH_LOCK_KEY)
   if (!batchLock) {
-    result.errors.push('Daily batch already running')
-    return result
+    // By design, not a failure: another run holds the batch lock, so this tick does nothing and the next one carries on.
+    return { ...result, skipped: true, reason: 'already-running' }
   }
 
   try {

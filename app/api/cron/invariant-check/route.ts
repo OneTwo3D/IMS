@@ -1,10 +1,10 @@
-import { NextResponse } from 'next/server'
-
 import { runScheduledInvariantCheck } from '@/lib/cron/invariant-check'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
-import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
+import { runCronWithLogging } from '@/lib/ops/cron-run'
+import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export const runtime = 'nodejs'
 
@@ -16,12 +16,12 @@ export async function GET(request: Request) {
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
 
-  const { runId, result } = await runCronWithLogging({
+  const { runId, result, outcomeClass } = await runCronWithLogging({
     jobName: 'invariant-check',
-    run: async ({ runId }) => await runScheduledInvariantCheck({ createRunId: () => runId }) as unknown as Record<string, unknown>,
+    run: async ({ runId }) => await runScheduledInvariantCheck({ createRunId: () => runId }),
+    outcomeOf: (result) => cronOutcome('invariant-check', result),
   })
 
-  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit({
-    status: result.status === 'completed' ? 200 : 500,
-  }))
+  // Any status but completed is a failure of the check, whatever the result carries.
+  return cronRunResponse({ runId, result, outcomeClass: result.status === 'completed' ? outcomeClass : 'failed' })
 }

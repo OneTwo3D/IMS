@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { cronOutcome } from '../lib/ops/cron-outcomes.ts'
 import {
   AMBIGUOUS_ATTEMPTS,
   decideCreateClaim,
@@ -468,6 +469,27 @@ test('create: a claim error skips the order without calling the WMS or burning a
   assert.equal(r.created, 0)
   assert.equal(r.deadLettered, 0)
   assert.equal(upserts.length, 0)
+  // The order is skipped and retried, but the sweep could not decide it: counted, and the cron answers failed (500), not a healthy 200.
+  assert.equal(r.claimErrors, 1)
+  assert.equal(cronOutcome('wms-order-push', r as never), 'failed')
+})
+
+test('create: a withdrawal fence check that THROWS skips the order (fail closed) and fails the run; a refusal by the fence is a decision, not an error', async () => {
+  let pushed = 0
+  const tracked = connector({ pushOrder: async () => { pushed += 1; return { externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' } } })
+  const { port } = makePort({ createCandidates: [candidate()] })
+  port.verifyWithdrawalFence = async () => { throw new Error('storefront unreadable') }
+  const thrown = await runWmsOrderPushSweepCore(tracked, 'mintsoft', port, { now: NOW })
+  assert.equal(pushed, 0)
+  assert.equal(thrown.fenceCheckErrors, 1)
+  assert.equal(cronOutcome('wms-order-push', thrown as never), 'failed')
+
+  const refusing = makePort({ createCandidates: [candidate()] })
+  refusing.port.verifyWithdrawalFence = async () => false
+  const refused = await runWmsOrderPushSweepCore(tracked, 'mintsoft', refusing.port, { now: NOW })
+  assert.equal(pushed, 0)
+  assert.equal(refused.fenceCheckErrors, 0)
+  assert.equal(cronOutcome('wms-order-push', refused as never), 'ok')
 })
 
 test('create: a push failure increments attempts and stays PENDING_CREATE', async () => {
@@ -1331,6 +1353,9 @@ test('audit: a failed release records no event and does not count (Codex r1)', a
   const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
   assert.equal(r.released, 0)
   assert.equal(events.filter((entry) => entry.action === 'order_release').length, 0)
+  // The link keeps its state and is retried, but this sweep could not move it: counted, and the cron answers failed.
+  assert.equal(r.linkWriteErrors, 1)
+  assert.equal(cronOutcome('wms-order-push', r as never), 'failed')
 })
 
 test('audit: remote cancel succeeds but the link write fails → SUCCEEDED with linkPersistFailed (Codex r1)', async () => {

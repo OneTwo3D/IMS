@@ -143,6 +143,23 @@ test('a FAILING probe does not degrade to confirmed-absent (o3d-x9nc)', async ()
   assert.match(String(snapshot?.lastError), /ETIMEDOUT/)
 })
 
+test('a probe that THROWS is reported as probeFailures (a failed read: the cron answers 500), unlike the expected unresolved states', async () => {
+  const { runWmsOrderStatusSweep } = await import('@/lib/domain/wms/order-status-sweep')
+  const { cronOutcome } = await import('@/lib/ops/cron-outcomes')
+  hasProbe = true
+  presenceThrows = new Error('ETIMEDOUT')
+  const failedProbe = await runWmsOrderStatusSweep()
+  assert.equal(failedProbe.probeFailures, 1)
+  assert.equal(failedProbe.failed, 0)
+  assert.equal(cronOutcome('wms-order-status', failedProbe), 'failed')
+
+  // present without a readable status: unresolved (stamp withheld) but the probe itself worked
+  presenceThrows = null
+  presenceResult = 'FOUND'
+  const unresolved = await runWmsOrderStatusSweep()
+  assert.equal(unresolved.probeFailures, undefined)
+})
+
 test('a connector with NO probe stays on the conservative reading (o3d-x9nc)', async () => {
   const { WMS_LOOKUP_CONFIRMED_ABSENT: WMS_LOOKUP_NOT_FOUND } = await import('@/lib/domain/wms/order-status-sweep')
   hasProbe = false

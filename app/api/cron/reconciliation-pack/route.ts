@@ -1,11 +1,11 @@
-import { NextResponse } from 'next/server'
-
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
-import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
+import { runCronWithLogging } from '@/lib/ops/cron-run'
 import { runScheduledReconciliationPack } from '@/lib/ops/reconciliation-pack-schedule'
 import { PACK_SCHEDULE_SLUG } from '@/lib/reconciliation-pack/schedule-constants'
+import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export const runtime = 'nodejs'
 
@@ -20,7 +20,7 @@ export async function GET(request: Request) {
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
 
-  const { runId, result, responseStatus } = await runCronWithLogging({
+  const { runId, result, outcomeClass, responseStatus } = await runCronWithLogging({
     jobName: PACK_SCHEDULE_SLUG,
     run: async (context) => {
       const outcome = await runScheduledReconciliationPack(context.runId)
@@ -44,7 +44,8 @@ export async function GET(request: Request) {
         responseStatus: failed ? 500 : 200,
       }
     },
+    outcomeOf: (result) => cronOutcome('reconciliation-pack', result),
   })
 
-  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit({ status: responseStatus ?? 200 }))
+  return cronRunResponse({ runId, result, outcomeClass, responseStatus })
 }
