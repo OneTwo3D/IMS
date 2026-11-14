@@ -9,7 +9,7 @@ import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { EU_VAT_TREATMENT_PAYLOAD_KEY } from '@/lib/domain/accounting/eu-vat-treatment'
 import { readEuVatRegimeStamp } from '@/lib/domain/accounting/eu-vat-regime-stamp'
 import { heldSalesInvoiceQueueWhere, isHeldSalesInvoicePayload } from '@/lib/connectors/woocommerce/sync/held-sales-invoice'
-import { GIFT_CARD_RESOLUTION_CONNECTOR } from '@/lib/connectors/woocommerce/sync/gift-card-line-resolution'
+import { GIFT_CARD_RESOLUTION_CONNECTOR, giftCardUnsettledHoldWhere } from '@/lib/connectors/woocommerce/sync/gift-card-line-resolution'
 
 /**
  * SYNC > EXCEPTIONS: GIFT-CARD ANSWERS FOR ORDER LINES THE STORE COULD NOT SETTLE.
@@ -31,7 +31,10 @@ export type GiftCardLineRow = {
 }
 export type GiftCardOrderRow = { salesOrderId: string; orderNumber: string; externalOrderId: string; lines: GiftCardLineRow[] }
 
-const ROW_LIMIT = 50
+/** Orders per page of the section. */
+export const GIFT_CARD_PAGE_SIZE = 50
+
+export type GiftCardLinePage = { rows: GiftCardOrderRow[]; total: number; page: number; pageSize: number }
 
 function lineIdsOf(payload: unknown): number[] {
   if (!isHeldSalesInvoicePayload(payload)) return []
@@ -41,14 +44,15 @@ function lineIdsOf(payload: unknown): number[] {
 }
 
 /** The held invoices refused for an unsettled gift-card flag, with each such line and any answer already given. */
-export async function listGiftCardLinesToResolve(): Promise<GiftCardOrderRow[]> {
+export async function listGiftCardLinesToResolve(pageInput = 0): Promise<GiftCardLinePage> {
   await requirePermission('sync')
-  const held = await db.shoppingSyncLog.findMany({
-    where: { AND: [heldSalesInvoiceQueueWhere(), { payload: { path: ['accountingPayload', EU_VAT_TREATMENT_PAYLOAD_KEY, 'reason'], equals: 'treatment_refused' } }] },
-    orderBy: { createdAt: 'asc' },
-    take: ROW_LIMIT,
-    select: { payload: true },
-  })
+  const page = Number.isInteger(pageInput) && pageInput > 0 ? pageInput : 0
+  // The filter is in the database and the page is cut AFTER it, so unrelated refusals can never hide an order that can be answered; every matching order is reachable by paging.
+  const where = giftCardUnsettledHoldWhere()
+  const [total, held] = await Promise.all([
+    db.shoppingSyncLog.count({ where }),
+    db.shoppingSyncLog.findMany({ where, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], skip: page * GIFT_CARD_PAGE_SIZE, take: GIFT_CARD_PAGE_SIZE, select: { payload: true } }),
+  ])
   const rows: GiftCardOrderRow[] = []
   for (const row of held) {
     const ids = lineIdsOf(row.payload)
@@ -77,7 +81,7 @@ export async function listGiftCardLinesToResolve(): Promise<GiftCardOrderRow[]> 
       }),
     })
   }
-  return rows
+  return { rows, total, page, pageSize: GIFT_CARD_PAGE_SIZE }
 }
 
 export type ResolveGiftCardLineResult = { success: boolean; error?: string; notice?: string } | FreshAuthFailureResult

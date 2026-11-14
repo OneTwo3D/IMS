@@ -13,6 +13,8 @@
  */
 import type { Prisma } from '@/app/generated/prisma/client'
 import type { GoodsLineFact } from '@/lib/domain/accounting/eu-vat-regime'
+import { EU_VAT_TREATMENT_PAYLOAD_KEY } from '@/lib/domain/accounting/eu-vat-treatment'
+import { heldSalesInvoiceQueueWhere } from './held-sales-invoice'
 
 export const GIFT_CARD_RESOLUTION_CONNECTOR = 'woocommerce'
 
@@ -37,4 +39,19 @@ export function applyGiftCardLineResolutions(lines: readonly GoodsLineFact[], an
     const flag = answer ? 'yes' : 'no'
     return { ...line, voucher: flag, voucherStrict: flag }
   })
+}
+
+/**
+ * The held invoices an operator can answer for: a PENDING hold whose parked marker says the treatment refused it AND flags unsettled gift-card lines (`giftCardUnsettled`, written with `giftCardLineIds` when the refusal is
+ * `gift_card_flag_missing`). Decided in the database, so a page or a count over it is never diluted by other refusals.
+ */
+export function giftCardUnsettledHoldWhere(): Prisma.ShoppingSyncLogWhereInput {
+  const at = (key: string) => ['accountingPayload', EU_VAT_TREATMENT_PAYLOAD_KEY, key]
+  return {
+    AND: [
+      heldSalesInvoiceQueueWhere(),
+      { payload: { path: at('reason'), equals: 'treatment_refused' } },
+      { payload: { path: at('giftCardUnsettled'), equals: true } },
+    ],
+  }
 }

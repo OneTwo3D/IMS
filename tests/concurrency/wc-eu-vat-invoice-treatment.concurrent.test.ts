@@ -1351,6 +1351,7 @@ test('[eu vat] gift-card line with no flag, cut-in BEFORE the order, then an ope
   const { parkedMarker, stampedAtPark, rows, after } = await giftCardHold(t, { atPark: '2026-11-01', atRelease: '2026-11-01' }, { isGiftCard: false })
   assert.deepEqual([parkedMarker.applied, parkedMarker.reason], [false, 'treatment_refused'])
   assert.deepEqual(parkedMarker.giftCardLineIds, [1], 'the refusal names the unsettled line')
+  assert.equal(parkedMarker.giftCardUnsettled, true, 'and flags the hold so the Exceptions list and count can select it in the database')
   assert.equal(stampedAtPark, null, 'nothing was stamped while it was unanswered')
   assert.equal(rows.length, 1, 'released')
   assert.equal(after.status, 'SYNCED')

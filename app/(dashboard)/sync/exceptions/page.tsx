@@ -10,11 +10,12 @@ export const metadata: Metadata = {
 
 export const dynamic = 'force-dynamic'
 
-export default async function SyncExceptionsPage() {
-  const [data, giftCardRows] = await Promise.all([getExceptionInboxData(), listGiftCardLinesToResolve()])
+export default async function SyncExceptionsPage({ searchParams }: { searchParams: Promise<{ gcPage?: string }> }) {
+  const { gcPage } = await searchParams
+  const [data, giftCardPage] = await Promise.all([getExceptionInboxData(), listGiftCardLinesToResolve(Number.parseInt(gcPage ?? '0', 10) || 0)])
   return (
     <div className="space-y-4">
-      <GiftCardLinesSection rows={giftCardRows} />
+      <GiftCardLinesSection data={giftCardPage} />
       <ExceptionsClient data={data} />
     </div>
   )
