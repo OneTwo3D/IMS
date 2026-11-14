@@ -44,7 +44,7 @@ const ORDER_CURSOR = 'last_wc_order_sync_at'
 const PRODUCT_CURSOR = 'last_wc_product_sync_at'
 const KEYS = [
   ORDER_CURSOR, `${ORDER_CURSOR}_statuses`, `${ORDER_CURSOR}_withdrawal_dropped`,
-  PRODUCT_CURSOR,
+  PRODUCT_CURSOR, 'last_wc_order_reconcile_at', 'last_wc_order_reconcile_at_statuses', 'last_wc_order_reconcile_at_withdrawal_dropped', 'last_wc_product_reconcile_at',
   'wc_initial_import_completed', 'wc_sync_order_statuses', 'wc_order_sweep_last_success_at',
   'wc_order_webhook_last_processed_at', 'wc_product_webhook_last_processed_at',
 ]
@@ -161,3 +161,50 @@ test('only the sweep advances the cursor: after a clean poll it is read-start le
     assert.ok(committed >= before - WC_PULL_CURSOR_OVERLAP_MS && committed <= Date.now() - WC_PULL_CURSOR_OVERLAP_MS)
   })
 })
+
+test('webhook-primary mode: a clean order reconcile carries its position to an old poll cursor', { skip }, async () => {
+  const { syncNewWcOrders } = await import('../../lib/connectors/woocommerce/sync/order-import')
+  const { WC_PULL_CURSOR_OVERLAP_MS } = await import('../../lib/connectors/woocommerce/sync/read-cursor')
+  await scenario(async () => {
+    await put('wc_initial_import_completed', 'true')
+    await put('wc_sync_order_statuses', JSON.stringify(['processing']))
+    await put(ORDER_CURSOR, '2026-01-01T00:00:00.000Z') // a long webhook-primary spell: the poll cursor is far behind
+    const before = Date.now()
+    const result = await syncNewWcOrders({ mode: 'reconcile' })
+    assert.deepEqual(result.errors, [])
+    const reconcile = Date.parse((await get('last_wc_order_reconcile_at'))!)
+    const poll = Date.parse((await get(ORDER_CURSOR))!)
+    assert.ok(reconcile >= before - WC_PULL_CURSOR_OVERLAP_MS)
+    assert.equal(poll, reconcile, 'the poll cursor is at least reconcile read-start less the overlap')
+  })
+})
+
+test('a clean poll does NOT touch the reconcile cursor, and the carry never moves a newer poll cursor backwards', { skip }, async () => {
+  const { syncNewWcOrders } = await import('../../lib/connectors/woocommerce/sync/order-import')
+  await scenario(async () => {
+    await put('wc_initial_import_completed', 'true')
+    await put('wc_sync_order_statuses', JSON.stringify(['processing']))
+    const newer = new Date(Date.now() + 3_600_000).toISOString()
+    await put(ORDER_CURSOR, newer)
+    await syncNewWcOrders({ mode: 'reconcile' })
+    assert.equal(await get(ORDER_CURSOR), newer)
+    await db_delete('last_wc_order_reconcile_at')
+    await syncNewWcOrders({ mode: 'poll' })
+    assert.equal(await get('last_wc_order_reconcile_at'), null)
+  })
+})
+
+test('webhook-primary mode: a clean product reconcile carries its position to an old product poll cursor', { skip }, async () => {
+  const { syncAllWcProducts } = await import('../../lib/connectors/woocommerce/sync/product-sync')
+  await scenario(async () => {
+    await put(PRODUCT_CURSOR, '2026-01-01T00:00:00.000Z')
+    const result = await syncAllWcProducts({ mode: 'reconcile' })
+    assert.deepEqual(result.errors, [])
+    assert.equal(await get(PRODUCT_CURSOR), await get('last_wc_product_reconcile_at'))
+    assert.ok(Date.parse((await get(PRODUCT_CURSOR))!) > Date.parse('2026-11-01T00:00:00.000Z'))
+  })
+})
+
+async function db_delete(key: string) {
+  await (await getDb()).setting.deleteMany({ where: { key } })
+}

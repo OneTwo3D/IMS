@@ -3,7 +3,7 @@
  */
 
 import { heldOrderInvoiceObligation } from './held-order-invoice-obligation'
-import { advancePullCursor, wcPullCursorCandidate } from './read-cursor'
+import { advancePullCursor, statusListCovers, wcPullCursorCandidate } from './read-cursor'
 import { describeWcRateMoneyRefusal, findWcRateMoneyProblems } from '@/lib/domain/accounting/wc-rate-money-refusal'
 import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain/erasure/erase-personal-data'
 import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
@@ -4822,6 +4822,19 @@ export async function syncNewWcOrders(
     // The CURSOR VALUE is deliberately not compared: a concurrent sweep advances it, and comparing it
     // would make nearly every overlap look superseded (webhooks never write it). The fingerprint and the marker are never excluded: a concurrent sweep that narrowed
     // the list or set/cleared the marker is always caught by them.
+    // CARRY A RECONCILE'S POSITION TO THE POLL CURSOR. In webhook-primary mode only the reconcile runs, and
+    // webhooks no longer move the poll cursor, so without this the poll cursor stays wherever the last poll
+    // left it and the first poll after a long webhook-primary spell could need more pages than the walk
+    // ceiling and never advance. A clean reconcile has read everything the poll would, IF its status list
+    // contains the poll's (it adds `completed`): then the poll cursor may take the same read-start position
+    // (atomic max, so never backwards). A narrower list proves nothing about the poll's statuses: no carry.
+    let carryToPollKey: string | null = null
+    if (mode !== 'poll') {
+      // The poll's list as it would resolve against the SAME registered statuses (a withdrawal status the store
+      // lacks is dropped from both, so it is not a difference between them).
+      const pollStatuses = reconcileWcPullStatusesWithRegistered(await getWcPullStatuses('poll'), configuredSelection, wdraw, registered).statuses
+      if (statusListCovers(statuses, pollStatuses)) carryToPollKey = 'last_wc_order_sync_at'
+    }
     const committed = await db.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${cursorKey}))`
       const current = await tx.setting.findMany({ where: { key: { in: [cursorStatusesKey, droppedSinceKey] } } })
@@ -4833,6 +4846,7 @@ export async function syncNewWcOrders(
       // READ-START cursor, never commit time, and never behind what is stored (only sweeps write it).
       // A rewind (selection widening, refusal watermark) lowers only where THIS run read from.
       await advancePullCursor(tx, cursorKey, cursorCandidate)
+      if (carryToPollKey) await advancePullCursor(tx, carryToPollKey, cursorCandidate)
       // Written WITH the cursor, in one transaction: a cursor and the selection it was earned
       // under are one fact, and a cursor advanced without its fingerprint would make the next
       // widening undetectable.
