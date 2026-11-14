@@ -4569,6 +4569,26 @@ export async function syncNewWcOrders(
   // deploy or a missing cursor.
   const droppedSinceKey = wcCursorWithdrawalDroppedKey(cursorKey)
   const droppedSinceSetting = await db.setting.findUnique({ where: { key: droppedSinceKey } })
+
+  // THE POLL'S STATE, READ AT THIS RUN'S START (reconcile modes only), so the carry below is conditional on
+  // it being unchanged: the poll list this run would cover, and the poll's fingerprint and outage marker.
+  const pollCursorKey = 'last_wc_order_sync_at'
+  const pollStatusesKey = wcCursorStatusesKey(pollCursorKey)
+  const pollDroppedKey = wcCursorWithdrawalDroppedKey(pollCursorKey)
+  let pollCarry: { statuses: string[]; fingerprintAtStart: string | null; droppedAtStart: string | null } | null = null
+  if (mode !== 'poll') {
+    // The poll's list as it would resolve against the SAME registered statuses (a withdrawal status the store
+    // lacks is dropped from both, so it is not a difference between them).
+    const pollStatuses = reconcileWcPullStatusesWithRegistered(await getWcPullStatuses('poll'), configuredSelection, wdraw, registered).statuses
+    if (statusListCovers(statuses, pollStatuses)) {
+      const pollRows = await db.setting.findMany({ where: { key: { in: [pollStatusesKey, pollDroppedKey] } } })
+      pollCarry = {
+        statuses: pollStatuses,
+        fingerprintAtStart: pollRows.find((row) => row.key === pollStatusesKey)?.value ?? null,
+        droppedAtStart: pollRows.find((row) => row.key === pollDroppedKey)?.value ?? null,
+      }
+    }
+  }
   if (droppedWithdrawal.length > 0) {
     const lastWarnedAt = lastWithdrawalUnregisteredWarnAt.get(cursorKey) ?? 0
     if (Date.now() - lastWarnedAt >= WC_WITHDRAWAL_UNREGISTERED_WARN_INTERVAL_MS) {
@@ -4822,19 +4842,13 @@ export async function syncNewWcOrders(
     // The CURSOR VALUE is deliberately not compared: a concurrent sweep advances it, and comparing it
     // would make nearly every overlap look superseded (webhooks never write it). The fingerprint and the marker are never excluded: a concurrent sweep that narrowed
     // the list or set/cleared the marker is always caught by them.
-    // CARRY A RECONCILE'S POSITION TO THE POLL CURSOR. In webhook-primary mode only the reconcile runs, and
-    // webhooks no longer move the poll cursor, so without this the poll cursor stays wherever the last poll
-    // left it and the first poll after a long webhook-primary spell could need more pages than the walk
-    // ceiling and never advance. A clean reconcile has read everything the poll would, IF its status list
-    // contains the poll's (it adds `completed`): then the poll cursor may take the same read-start position
-    // (atomic max, so never backwards). A narrower list proves nothing about the poll's statuses: no carry.
-    let carryToPollKey: string | null = null
-    if (mode !== 'poll') {
-      // The poll's list as it would resolve against the SAME registered statuses (a withdrawal status the store
-      // lacks is dropped from both, so it is not a difference between them).
-      const pollStatuses = reconcileWcPullStatusesWithRegistered(await getWcPullStatuses('poll'), configuredSelection, wdraw, registered).statuses
-      if (statusListCovers(statuses, pollStatuses)) carryToPollKey = 'last_wc_order_sync_at'
-    }
+    // CARRY A RECONCILE'S POSITION TO THE POLL CURSOR (see `pollCarry` above). In webhook-primary mode only the
+    // reconcile runs, and webhooks no longer move the poll cursor, so without this the first poll after a long
+    // spell could need more pages than the walk ceiling and never advance. A clean reconcile has read
+    // everything the poll would IF its status list contains the poll's (it adds `completed`). The poll cursor
+    // takes the same read-start position (atomic max) TOGETHER WITH the poll's fingerprint and outage
+    // marker, in the same locked transaction: a cursor and the selection it was earned under are one fact,
+    // so a later widening is detected against it. A narrower list proves nothing: no carry.
     const committed = await db.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${cursorKey}))`
       const current = await tx.setting.findMany({ where: { key: { in: [cursorStatusesKey, droppedSinceKey] } } })
@@ -4846,7 +4860,32 @@ export async function syncNewWcOrders(
       // READ-START cursor, never commit time, and never behind what is stored (only sweeps write it).
       // A rewind (selection widening, refusal watermark) lowers only where THIS run read from.
       await advancePullCursor(tx, cursorKey, cursorCandidate)
-      if (carryToPollKey) await advancePullCursor(tx, carryToPollKey, cursorCandidate)
+      if (pollCarry) {
+        // Fixed lock order (reconcile key, then poll key) so two carries/polls cannot deadlock. SKIPPED, never
+        // half-applied, if a concurrent poll commit changed the poll's fingerprint or marker since this run began.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pollCursorKey}))`
+        const pollNow = await tx.setting.findMany({ where: { key: { in: [pollStatusesKey, pollDroppedKey] } } })
+        const pollValue = (key: string): string | null => pollNow.find((row) => row.key === key)?.value ?? null
+        if (pollValue(pollStatusesKey) === pollCarry.fingerprintAtStart && pollValue(pollDroppedKey) === pollCarry.droppedAtStart) {
+          await advancePullCursor(tx, pollCursorKey, cursorCandidate)
+          const pollFingerprint = JSON.stringify([...pollCarry.statuses].sort())
+          await tx.setting.upsert({
+            where: { key: pollStatusesKey },
+            create: { key: pollStatusesKey, value: pollFingerprint },
+            update: { value: pollFingerprint },
+          })
+          // The outage marker as the poll itself would set it: set (keeping its first value) while a withdrawal
+          // status is dropped. Never cleared here: only the poll's own recovery read clears it.
+          if (droppedWithdrawal.length > 0) {
+            const markerValue = pollCarry.droppedAtStart ?? now
+            await tx.setting.upsert({
+              where: { key: pollDroppedKey },
+              create: { key: pollDroppedKey, value: markerValue },
+              update: { value: markerValue },
+            })
+          }
+        }
+      }
       // Written WITH the cursor, in one transaction: a cursor and the selection it was earned
       // under are one fact, and a cursor advanced without its fingerprint would make the next
       // widening undetectable.

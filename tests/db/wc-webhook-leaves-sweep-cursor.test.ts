@@ -26,11 +26,13 @@ if (skip && process.env.REQUIRE_DB_RETENTION_TESTS === '1') {
 }
 
 const asked: Array<{ path: string; modifiedAfter: string | undefined }> = []
+const hooks: { onOrdersFetch: null | (() => Promise<void>) } = { onOrdersFetch: null }
 
 mock.module('@/lib/connectors/woocommerce/api', {
   namedExports: {
     wcFetch: async (path: string, params: Record<string, string> = {}) => {
       asked.push({ path, modifiedAfter: params.modified_after })
+      if (path === '/orders') await hooks.onOrdersFetch?.()
       return { data: [], totalPages: 1, totalItems: 0 }
     },
     wcPut: async () => ({ data: null }),
@@ -44,7 +46,7 @@ const ORDER_CURSOR = 'last_wc_order_sync_at'
 const PRODUCT_CURSOR = 'last_wc_product_sync_at'
 const KEYS = [
   ORDER_CURSOR, `${ORDER_CURSOR}_statuses`, `${ORDER_CURSOR}_withdrawal_dropped`,
-  PRODUCT_CURSOR, 'last_wc_order_reconcile_at', 'last_wc_order_reconcile_at_statuses', 'last_wc_order_reconcile_at_withdrawal_dropped', 'last_wc_product_reconcile_at',
+  'wc_order_admission_refused_since', PRODUCT_CURSOR, 'last_wc_order_reconcile_at', 'last_wc_order_reconcile_at_statuses', 'last_wc_order_reconcile_at_withdrawal_dropped', 'last_wc_product_reconcile_at',
   'wc_initial_import_completed', 'wc_sync_order_statuses', 'wc_order_sweep_last_success_at',
   'wc_order_webhook_last_processed_at', 'wc_product_webhook_last_processed_at',
 ]
@@ -80,6 +82,7 @@ async function scenario(fn: () => Promise<void>) {
   const saved = await db.setting.findMany({ where: { key: { in: KEYS } }, select: { key: true, value: true } })
   await db.setting.deleteMany({ where: { key: { in: KEYS } } })
   asked.length = 0
+  hooks.onOrdersFetch = null
   const sku = `WHC-${randomUUID().slice(0, 8)}`
   const order = await db.salesOrder.create({
     data: {
@@ -208,3 +211,55 @@ test('webhook-primary mode: a clean product reconcile carries its position to an
 async function db_delete(key: string) {
   await (await getDb()).setting.deleteMany({ where: { key } })
 }
+
+async function resolvedPollFingerprint(selection: string[]): Promise<string> {
+  const { getWcPullStatuses } = await import('../../lib/connectors/woocommerce/sync/order-import')
+  await put('wc_sync_order_statuses', JSON.stringify(selection))
+  return JSON.stringify([...(await getWcPullStatuses('poll'))].sort())
+}
+
+test('a carried reconcile also carries the poll fingerprint: narrow, carry, widen back, and the next poll rewinds', { skip }, async () => {
+  const { syncNewWcOrders } = await import('../../lib/connectors/woocommerce/sync/order-import')
+  await scenario(async () => {
+    await put('wc_initial_import_completed', 'true')
+    const wide = await resolvedPollFingerprint(['processing', 'on-hold'])
+    const narrow = await resolvedPollFingerprint(['processing'])
+    assert.notEqual(wide, narrow)
+    await put(ORDER_CURSOR, '2026-11-01T00:00:00.000Z')
+    await put(`${ORDER_CURSOR}_statuses`, wide) // the poll last ran under the wider selection
+
+    const reconciled = await syncNewWcOrders({ mode: 'reconcile' }) // selection is narrow now
+    assert.deepEqual(reconciled.errors, [])
+    assert.equal(await get(`${ORDER_CURSOR}_statuses`), narrow, 'the poll fingerprint is what the reconcile actually covered')
+    const carried = await get(ORDER_CURSOR)
+    assert.ok(Date.parse(carried!) > Date.parse('2026-11-10T00:00:00.000Z'), 'and the cursor moved with it')
+
+    // on-hold is selected again, with an order it once refused far behind the cursor
+    await put('wc_sync_order_statuses', JSON.stringify(['processing', 'on-hold']))
+    const refusedAt = '2026-11-05T00:00:00.000Z'
+    await put('wc_order_admission_refused_since', refusedAt)
+    asked.length = 0
+    const poll = await syncNewWcOrders({ mode: 'poll' })
+    assert.deepEqual(poll.errors, [])
+    assert.equal(asked.find((call) => call.path === '/orders')?.modifiedAfter, refusedAt, 'the poll saw the widening and rewound')
+  })
+})
+
+test('a poll commit that lands during the reconcile means the carry is skipped', { skip }, async () => {
+  const { syncNewWcOrders } = await import('../../lib/connectors/woocommerce/sync/order-import')
+  await scenario(async () => {
+    await put('wc_initial_import_completed', 'true')
+    const wide = await resolvedPollFingerprint(['processing', 'on-hold'])
+    const narrow = await resolvedPollFingerprint(['processing'])
+    const oldCursor = '2026-11-01T00:00:00.000Z'
+    await put(ORDER_CURSOR, oldCursor)
+    await put(`${ORDER_CURSOR}_statuses`, wide)
+    hooks.onOrdersFetch = async () => { await put(`${ORDER_CURSOR}_statuses`, narrow) } // a concurrent poll commit
+
+    const reconciled = await syncNewWcOrders({ mode: 'reconcile' })
+    assert.deepEqual(reconciled.errors, [])
+    assert.equal(await get(ORDER_CURSOR), oldCursor, 'the carry did not move the poll cursor')
+    assert.equal(await get(`${ORDER_CURSOR}_statuses`), narrow, "and left the concurrent commit's fingerprint alone")
+    assert.ok(await get('last_wc_order_reconcile_at'), 'the reconcile itself still committed')
+  })
+})
