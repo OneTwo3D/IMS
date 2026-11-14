@@ -30,7 +30,7 @@ export const RELEASES: AppRelease[] = [
       'Cron failure mapping lives in lib/ops/cron-outcomes.ts, one entry per route, with a census test that fails CI when a new failure-like field in a producer is not mapped or justified.',
       'Migrations (additive, nullable, no backfill): refund_scheme_posting_snapshot, refund_line_scheme_tax_rate_value, refund_eas182_hold and refund_scheme_treated_at.',
       'CI: every workflow job is pinned to ubuntu-24.04.',
-      'Built, switched off: the EU IOSS / VOEC / DDP credit-note treatment, and the hold of the first 10 rate-182 refund credit notes, both behind the Sales Invoices switch (nothing is read, written or counted while the switch is off).',
+      'Built, switched off: the EU IOSS / VOEC / DDP credit-note treatment, and the hold of the first 10 rate-182 refund credit notes, both behind the Sales Invoices switch. With the switch off, new refunds skip the treatment; a refund already recorded under the scheme, or already held, keeps that treatment or hold even after the switch is turned off.',
     ],
   },
   {
