@@ -571,7 +571,12 @@ async function prepared(t: test.TestContext, opts: { stamp: 'IOSS' | 'none' | nu
 test('[eu vat credit note] the treatment asks first: only Xero with the Sales Invoices switch on; a refund that does not exist is refused, and the number named is the refund\'s own', { skip }, async (t) => {
   const { deps, fx } = await prepared(t, { stamp: 'IOSS', schemeRate: true })
   const refund = await directRefund(deps, fx, { lines: [{ net: '100' }], stated: '119' })
-  for (const connector of ['quickbooks', null]) assert.deepEqual(await treat(deps, fx, refund, { connector }), { kind: 'skipped', why: 'switch_off' })
+  // A refund with no persisted scheme snapshot is skipped; one recorded under the scheme treatment is never skipped (a persisted decision outranks the switch and the connector).
+  const bareRefund = await directRefund(deps, fx, { lines: [{ net: '100', type: null, rate: null }], stated: null })
+  for (const connector of ['quickbooks', null]) {
+    assert.deepEqual(await treat(deps, fx, bareRefund, { connector }), { kind: 'skipped', why: 'switch_off' })
+    assert.equal(refusal(await treat(deps, fx, refund, { connector }))?.code, 'hand_post')
+  }
   assert.equal((await treat(deps, fx, refund)).kind, 'treated')
   const missing = refusal(await treat(deps, fx, refund, { refundId: randomUUID() }))
   assert.match(missing?.reason ?? '', /could not be found/)
@@ -589,9 +594,12 @@ test('[eu vat credit note] the treatment asks first: only Xero with the Sales In
 test('[eu vat credit note] an unstamped order: the three classifications (a) IMS-queued treated invoice, (b) a stamp outside the scheme, (c) the rates\' current scheme mapping', { skip }, async (t) => {
   const { deps, fx } = await prepared(t, { stamp: null, schemeRate: false })
   const refund = await directRefund(deps, fx, { lines: [{ net: '100' }], stated: '119' })
+  // The same refund with no persisted scheme snapshot: only that kind may be skipped.
+  const bare = await directRefund(deps, fx, { lines: [{ net: '100', type: null, rate: null }], stated: null })
   const rateOf = (data: Record<string, unknown>) => deps.db.taxRate.update({ where: { id: fx.rate.id }, data })
   // (c) no evidence and no scheme mapping: not a scheme order.
-  assert.deepEqual(await treat(deps, fx, refund), { kind: 'skipped', why: 'not_scheme' })
+  assert.deepEqual(await treat(deps, fx, bare), { kind: 'skipped', why: 'not_scheme' })
+  assert.equal(refusal(await treat(deps, fx, refund))?.code, 'hand_post', 'a persisted snapshot is never skipped')
   // (c) the category alone, or the posting type alone, makes it a scheme order; case and padding do not matter; a blank posting type is nothing.
   await rateOf({ reportingCategory: 'IOSS' })
   assert.equal(refusal(await treat(deps, fx, refund))?.code, 'hand_post')
@@ -600,14 +608,17 @@ test('[eu vat credit note] an unstamped order: the three classifications (a) IMS
   await rateOf({ reportingCategory: null, schemePostingTaxType: 'TAX131' })
   assert.equal(refusal(await treat(deps, fx, refund))?.code, 'hand_post')
   await rateOf({ schemePostingTaxType: '  ' })
-  assert.deepEqual(await treat(deps, fx, refund), { kind: 'skipped', why: 'not_scheme' })
+  assert.deepEqual(await treat(deps, fx, bare), { kind: 'skipped', why: 'not_scheme' })
+  assert.equal(refusal(await treat(deps, fx, refund))?.code, 'hand_post', 'a persisted snapshot is never skipped')
   await rateOf({ schemePostingTaxType: null, reportingCategory: 'STANDARD' })
-  assert.deepEqual(await treat(deps, fx, refund), { kind: 'skipped', why: 'not_scheme' })
+  assert.deepEqual(await treat(deps, fx, bare), { kind: 'skipped', why: 'not_scheme' })
+  assert.equal(refusal(await treat(deps, fx, refund))?.code, 'hand_post', 'a persisted snapshot is never skipped')
   // (a) an invoice IMS queued with the treatment marker makes it a scheme order, whichever of the two invoice types it was; one without the marker does not.
   const log = (type: 'SALES_INVOICE' | 'SALES_INVOICE_UPDATE', marker: unknown, referenceId = fx.orderId) => deps.db.accountingSyncLog.create({ data: { connector: 'xero', type, status: 'SYNCED', referenceType: 'SalesOrder', referenceId, payload: { invoiceNumber: 'INV-X', lines: [], _euVatTreatment: marker } as never, attemptRevision: 1 } })
   await log('SALES_INVOICE', { applied: false })
   await log('SALES_INVOICE', { applied: true }, randomUUID())
-  assert.deepEqual(await treat(deps, fx, refund), { kind: 'skipped', why: 'not_scheme' })
+  assert.deepEqual(await treat(deps, fx, bare), { kind: 'skipped', why: 'not_scheme' })
+  assert.equal(refusal(await treat(deps, fx, refund))?.code, 'hand_post', 'a persisted snapshot is never skipped')
   await log('SALES_INVOICE_UPDATE', { applied: true })
   const viaUpdate = refusal(await treat(deps, fx, refund))
   assert.equal(viaUpdate?.code, 'hand_post')
@@ -617,8 +628,11 @@ test('[eu vat credit note] an unstamped order: the three classifications (a) IMS
 
 test('[eu vat credit note] (b) a stamp outside the scheme is not a scheme order', { skip }, async (t) => {
   const { deps, fx } = await prepared(t, { stamp: 'none', schemeRate: false })
-  const r0 = await directRefund(deps, fx, { lines: [{ net: '100' }], stated: '119' })
+  const r0 = await directRefund(deps, fx, { lines: [{ net: '100', type: null, rate: null }], stated: null })
   assert.deepEqual(await treat(deps, fx, r0), { kind: 'skipped', why: 'not_scheme' })
+  // A refund carrying the scheme snapshot on an order stamped outside the scheme cannot be treated: refused, never skipped.
+  const persisted = await directRefund(deps, fx, { lines: [{ net: '100' }], stated: '119' })
+  assert.equal(refusal(await treat(deps, fx, persisted))?.code, 'hand_post')
 })
 
 test('[eu vat credit note] a stamped order with a blank account is refused; a padded account is trimmed', { skip }, async (t) => {
