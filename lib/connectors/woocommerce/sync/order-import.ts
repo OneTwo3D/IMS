@@ -3,7 +3,7 @@
  */
 
 import { heldOrderInvoiceObligation } from './held-order-invoice-obligation'
-import { advancePullCursor, wcPullCursorCandidate } from './read-cursor'
+import { advancePullCursor, statusListCovers, wcPullCursorCandidate } from './read-cursor'
 import { describeWcRateMoneyRefusal, findWcRateMoneyProblems } from '@/lib/domain/accounting/wc-rate-money-refusal'
 import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain/erasure/erase-personal-data'
 import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
@@ -4419,7 +4419,7 @@ function wcCursorWithdrawalDroppedKey(cursorKey: string): string {
  * order was never wanted — and it was the hole under round 3's acknowledged admission refusals.
  *
  * A refusal correctly does not advance the cursor, but the cursor is advanced by everything ELSE:
- * the very next admitted delivery calls `advanceWcOrderSyncCursor()` and stamps it at `now`. The
+ * the very next admitted delivery used to stamp it at `now` (webhooks no longer touch it). The
  * refused order's `date_modified` is now BEHIND the cursor. While its status stays excluded that
  * is exactly right. The moment the operator TICKS that status, though, nothing brings it back:
  * WooCommerce fires no webhook for a setting IMS changed, and the sweep will not reach back past
@@ -4569,6 +4569,26 @@ export async function syncNewWcOrders(
   // deploy or a missing cursor.
   const droppedSinceKey = wcCursorWithdrawalDroppedKey(cursorKey)
   const droppedSinceSetting = await db.setting.findUnique({ where: { key: droppedSinceKey } })
+
+  // THE POLL'S STATE, READ AT THIS RUN'S START (reconcile modes only), so the carry below is conditional on
+  // it being unchanged: the poll list this run would cover, and the poll's fingerprint and outage marker.
+  const pollCursorKey = 'last_wc_order_sync_at'
+  const pollStatusesKey = wcCursorStatusesKey(pollCursorKey)
+  const pollDroppedKey = wcCursorWithdrawalDroppedKey(pollCursorKey)
+  let pollCarry: { statuses: string[]; fingerprintAtStart: string | null; droppedAtStart: string | null } | null = null
+  if (mode !== 'poll') {
+    // The poll's list as it would resolve against the SAME registered statuses (a withdrawal status the store
+    // lacks is dropped from both, so it is not a difference between them).
+    const pollStatuses = reconcileWcPullStatusesWithRegistered(await getWcPullStatuses('poll'), configuredSelection, wdraw, registered).statuses
+    if (statusListCovers(statuses, pollStatuses)) {
+      const pollRows = await db.setting.findMany({ where: { key: { in: [pollStatusesKey, pollDroppedKey] } } })
+      pollCarry = {
+        statuses: pollStatuses,
+        fingerprintAtStart: pollRows.find((row) => row.key === pollStatusesKey)?.value ?? null,
+        droppedAtStart: pollRows.find((row) => row.key === pollDroppedKey)?.value ?? null,
+      }
+    }
+  }
   if (droppedWithdrawal.length > 0) {
     const lastWarnedAt = lastWithdrawalUnregisteredWarnAt.get(cursorKey) ?? 0
     if (Date.now() - lastWarnedAt >= WC_WITHDRAWAL_UNREGISTERED_WARN_INTERVAL_MS) {
@@ -4819,10 +4839,16 @@ export async function syncNewWcOrders(
     // NOTHING unless both are what this run read at its start. A superseded run costs one
     // re-fetch next time; it never writes a stale fact.
     //
-    // The CURSOR VALUE is deliberately not compared: order and refund webhooks advance it
-    // (advanceWcOrderSyncCursor) on their own, and comparing it would make nearly every sweep look
-    // superseded. The fingerprint and the marker are never excluded: a concurrent sweep that narrowed
+    // The CURSOR VALUE is deliberately not compared: a concurrent sweep advances it, and comparing it
+    // would make nearly every overlap look superseded (webhooks never write it). The fingerprint and the marker are never excluded: a concurrent sweep that narrowed
     // the list or set/cleared the marker is always caught by them.
+    // CARRY A RECONCILE'S POSITION TO THE POLL CURSOR (see `pollCarry` above). In webhook-primary mode only the
+    // reconcile runs, and webhooks no longer move the poll cursor, so without this the first poll after a long
+    // spell could need more pages than the walk ceiling and never advance. A clean reconcile has read
+    // everything the poll would IF its status list contains the poll's (it adds `completed`). The poll cursor
+    // takes the same read-start position (atomic max) TOGETHER WITH the poll's fingerprint and outage
+    // marker, in the same locked transaction: a cursor and the selection it was earned under are one fact,
+    // so a later widening is detected against it. A narrower list proves nothing: no carry.
     const committed = await db.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${cursorKey}))`
       const current = await tx.setting.findMany({ where: { key: { in: [cursorStatusesKey, droppedSinceKey] } } })
@@ -4831,9 +4857,35 @@ export async function syncNewWcOrders(
         valueOf(cursorStatusesKey) !== (cursorStatusesSetting?.value ?? null)
         || valueOf(droppedSinceKey) !== (droppedSinceSetting?.value ?? null)
       ) return false
-      // READ-START cursor, never commit time, and never behind what is stored (webhooks advance it too).
+      // READ-START cursor, never commit time, and never behind what is stored (only sweeps write it).
       // A rewind (selection widening, refusal watermark) lowers only where THIS run read from.
       await advancePullCursor(tx, cursorKey, cursorCandidate)
+      if (pollCarry) {
+        // Fixed lock order (reconcile key, then poll key) so two carries/polls cannot deadlock. SKIPPED, never
+        // half-applied, if a concurrent poll commit changed the poll's fingerprint or marker since this run began.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pollCursorKey}))`
+        const pollNow = await tx.setting.findMany({ where: { key: { in: [pollStatusesKey, pollDroppedKey] } } })
+        const pollValue = (key: string): string | null => pollNow.find((row) => row.key === key)?.value ?? null
+        if (pollValue(pollStatusesKey) === pollCarry.fingerprintAtStart && pollValue(pollDroppedKey) === pollCarry.droppedAtStart) {
+          await advancePullCursor(tx, pollCursorKey, cursorCandidate)
+          const pollFingerprint = JSON.stringify([...pollCarry.statuses].sort())
+          await tx.setting.upsert({
+            where: { key: pollStatusesKey },
+            create: { key: pollStatusesKey, value: pollFingerprint },
+            update: { value: pollFingerprint },
+          })
+          // The outage marker as the poll itself would set it: set (keeping its first value) while a withdrawal
+          // status is dropped. Never cleared here: only the poll's own recovery read clears it.
+          if (droppedWithdrawal.length > 0) {
+            const markerValue = pollCarry.droppedAtStart ?? now
+            await tx.setting.upsert({
+              where: { key: pollDroppedKey },
+              create: { key: pollDroppedKey, value: markerValue },
+              update: { value: markerValue },
+            })
+          }
+        }
+      }
       // Written WITH the cursor, in one transaction: a cursor and the selection it was earned
       // under are one fact, and a cursor advanced without its fingerprint would make the next
       // widening undetectable.
@@ -4858,9 +4910,8 @@ export async function syncNewWcOrders(
       // The sweep's LAST-SUCCESS stamp (read-sync liveness), in the SAME transaction as the cursor: it
       // exists only because this branch is reached - the walk ended on an empty page with no error -
       // so a sweep that failed, or ran out of ceiling, or fetched nothing because of an error, can
-      // never advance it. It is separate from the cursor on purpose: an admitted webhook delivery
-      // also advances `last_wc_order_sync_at` (advanceWcOrderSyncCursor), so the cursor cannot say
-      // whether the SWEEP is alive. A clean sweep that found no new orders reaches here and counts.
+      // never advance it. It is a separate stamp from the cursor so liveness is an explicit fact, not
+      // inferred from a value that rewinds and is held on errors. A clean sweep that found no new orders reaches here and counts.
       await tx.setting.upsert({
         where: { key: WC_ORDER_SWEEP_LAST_SUCCESS_SETTING },
         create: { key: WC_ORDER_SWEEP_LAST_SUCCESS_SETTING, value: now },

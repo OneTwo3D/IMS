@@ -128,12 +128,28 @@ export function isEmptyWcWebhookBodyAllowed(request: Request): boolean {
   return isWebhookPing(signature, topic) || isSignedActionPing(topic)
 }
 
-async function advanceWcOrderSyncCursor() {
-  await db.setting.upsert({
-    where: { key: 'last_wc_order_sync_at' },
-    create: { key: 'last_wc_order_sync_at', value: new Date().toISOString() },
-    update: { value: new Date().toISOString() },
-  })
+/**
+ * A COMPLETE order delivery is recorded here and ONLY here. It must never touch `last_wc_order_sync_at`.
+ *
+ * That key is the `?modified_after=` the poll sweep reads from, and the SWEEP OWNS IT: it commits
+ * max(stored, read-start - 120 s) only after a walk that ended cleanly on an empty page (see
+ * read-cursor.ts). A webhook that stamped it to NOW moved it past an older order whose own webhook
+ * had been missed - delivery for order B advanced the cursor beyond order A's modification time, so
+ * the next sweep never read A. A webhook knows about the one order it carries; the cursor is a claim
+ * about every order before it. So the webhook keeps its own stamp, and nothing reads that stamp as a
+ * sweep position.
+ */
+export const WC_ORDER_WEBHOOK_LAST_PROCESSED_SETTING = 'wc_order_webhook_last_processed_at'
+export const WC_PRODUCT_WEBHOOK_LAST_PROCESSED_SETTING = 'wc_product_webhook_last_processed_at'
+
+export async function recordWcWebhookProcessed(key: string) {
+  const value = new Date().toISOString()
+  await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+}
+
+/** Exported so the database test drives the real write, not a re-spelling of it. */
+export async function recordWcOrderWebhookProcessed() {
+  await recordWcWebhookProcessed(WC_ORDER_WEBHOOK_LAST_PROCESSED_SETTING)
 }
 
 // o3d-mqz: throttle the "initial import pending" skip WARNING so a live store's order webhook volume
@@ -344,7 +360,7 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
       }
     }
     if (failures.length === 0) {
-      await advanceWcOrderSyncCursor()
+      await recordWcOrderWebhookProcessed()
       return NextResponse.json({ ok: true })
     }
     await logActivity({
@@ -718,7 +734,7 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
         metadata: { externalOrderId: wcOrder.id, topic, status: wcOrder.status, permanentFailures },
       })
     }
-    await advanceWcOrderSyncCursor()
+    await recordWcOrderWebhookProcessed()
     return NextResponse.json({ ok: true, ...(permanentFailures.length > 0 ? { permanentFailures } : {}) })
   }
 
@@ -928,11 +944,8 @@ async function handleProductWebhook(payload: unknown, originAttestation: string)
     // lock, from the version it snapshotted (o3d-mlc7).
     const result = await syncWcProductToIms(productPayload as WcFullProduct)
     if (result.success) {
-      await db.setting.upsert({
-        where: { key: 'last_wc_product_sync_at' },
-        create: { key: 'last_wc_product_sync_at', value: new Date().toISOString() },
-        update: { value: new Date().toISOString() },
-      })
+      // The product SWEEP owns `last_wc_product_sync_at`; a delivery stamps its own key (see above).
+      await recordWcWebhookProcessed(WC_PRODUCT_WEBHOOK_LAST_PROCESSED_SETTING)
     } else if (result.permanent) {
       // A deterministic conflict, of one of two kinds:
       //   - MAPPING (o3d-gtk, o3d-fsi): the GTIN, the WC id, or the SKU itself already belongs to

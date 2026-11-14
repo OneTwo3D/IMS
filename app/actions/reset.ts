@@ -31,6 +31,7 @@ const WC_ORDER_SYNC_STATE_KEYS = [
   'last_wc_order_reconcile_at',
   WC_ORDER_SWEEP_LAST_SUCCESS_SETTING,
   'wc_order_webhook_last_received_at',
+  'wc_order_webhook_last_processed_at',
   'wc_webhook_last_received_at',
 ] as const
 
@@ -38,6 +39,7 @@ const WC_PRODUCT_SYNC_STATE_KEYS = [
   'last_wc_product_sync_at',
   'last_wc_product_reconcile_at',
   'wc_product_webhook_last_received_at',
+  'wc_product_webhook_last_processed_at',
   'wc_webhook_last_received_at',
 ] as const
 

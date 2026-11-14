@@ -391,7 +391,7 @@ test('an ADMITTED order is unaffected — the durability check governs refusals 
   assert.equal(response.status, 200)
   assert.equal((await queued()).length, 0, 'an order IMS holds is never gated, so nothing is refused')
   assert.equal(
-    store.settingUpserts.includes('last_wc_order_sync_at'),
+    store.settingUpserts.includes('wc_order_webhook_last_processed_at'),
     true,
     'and a real import still advances the cursor',
   )

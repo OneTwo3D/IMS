@@ -60,3 +60,12 @@ export async function advancePullCursor(client: RawClient, key: string, candidat
         END,
         "updatedAt" = NOW()`
 }
+
+/**
+ * Whether a sweep that read `covering` has read everything a sweep of `covered` would. Only then may its
+ * position be carried to the other sweep's cursor (a reconcile to the poll cursor). An empty `covered` is
+ * "reads nothing", which proves nothing, so it never covers.
+ */
+export function statusListCovers(covering: readonly string[], covered: readonly string[]): boolean {
+  return covered.length > 0 && covered.every((status) => covering.includes(status))
+}

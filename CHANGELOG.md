@@ -10,6 +10,13 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### WooCommerce webhooks no longer move the sweep cursor (backend / sync)
+
+- **Fixed: a delivered webhook could hide an older missed order or product from the sweep for good.** In poll mode every admitted order webhook stamped `last_wc_order_sync_at` to now, and every successful product webhook stamped `last_wc_product_sync_at` to now. If order A changed and its webhook was missed, then order B's webhook arrived, the cursor jumped past A and the next sweep asked WooCommerce for changes after it, so A was never read. The sweep now owns both cursors: only a sweep that ended cleanly on an empty page writes them (read-start less 120 seconds, never backwards). A webhook writes its own stamps instead, `wc_order_webhook_last_processed_at` and `wc_product_webhook_last_processed_at`, which nothing reads as a sweep position.
+- Nothing else depended on the webhook moving the cursor: the read-sync liveness stamp, the refusal watermark and the withdrawal-recovery marker are separate settings, and webhook-primary mode keys off `wc_*_webhook_last_received_at` and the reconcile cursors. The Sync page's "Last order intake" / "Last product intake" now show the last sweep position rather than the last webhook.
+- **Webhook-primary mode keeps the poll cursors close.** A clean reconcile now also carries its position to the poll cursor (atomic max, in the same locked commit; orders only when the reconcile's resolved status list contains the poll's, and together with the poll's status fingerprint and outage marker, skipped if a poll commit changed them meanwhile), so a long webhook-primary spell no longer leaves the first poll afterwards a window larger than the page-walk ceiling. This replaces the "re-reads the gap" side effect above.
+- Both new keys are cleared by the operator reset and are machine-managed (not writable from the settings form). No migration.
+
 ## 4.2.0 - 2026-11-14
 
 ### WooCommerce pull cursors are taken at read start, not at commit (backend / sync)

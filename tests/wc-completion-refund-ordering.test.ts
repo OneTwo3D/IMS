@@ -204,7 +204,7 @@ test('o3d-xnwu r2: a refund arriving in the SAME delivery as the completion sett
     [],
     'nothing was rejected, so nothing may be logged as rejected',
   )
-  assert.ok(settingUpserts.includes('last_wc_order_sync_at'), 'the delivery is complete')
+  assert.ok(settingUpserts.includes('wc_order_webhook_last_processed_at'), 'the delivery is complete')
 })
 
 test('o3d-xnwu r2: with the refunds in, a shortfall that still stands is STILL permanent', async () => {
@@ -261,7 +261,7 @@ test('o3d-xnwu r2: an INCOMPLETE refund read may not bury the shortfall', async 
     'the held refusal is released as TRANSIENT, so the redelivery re-decides it',
   )
   assert.equal(
-    settingUpserts.includes('last_wc_order_sync_at'),
+    settingUpserts.includes('wc_order_webhook_last_processed_at'),
     false,
     'and the cursor does not move past an order whose refunds were not read',
   )
@@ -312,7 +312,7 @@ test('o3d-xnwu r3: a refund that was READ but failed to APPLY may not bury the s
   )
   assert.deepEqual(calls, ['status', 'refunds'], 'an unsettled order buys no second look')
   assert.equal(
-    settingUpserts.includes('last_wc_order_sync_at'),
+    settingUpserts.includes('wc_order_webhook_last_processed_at'),
     false,
     'and the cursor does not move past an order whose refunds are not in IMS',
   )
