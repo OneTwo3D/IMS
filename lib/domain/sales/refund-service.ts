@@ -5780,7 +5780,7 @@ export async function retrySalesOrderRefundAccounting(
       // -------------------------------------------------------------------------------------------
       const replayLines = refund.lines.map(reconstructReplayLine)
       // A rate-182 refund (the EAS plugin re-priced its tax; recorded under the creation fence's rate-182 replacement) is not re-fenced per line either: its VAT was confirmed against its own stated figures and the order's aggregate bound when it was created, and the credit-note treatment checks both again.
-      const postedTaxRefusal = input.creditNotePostingEnabled && refund.eas182StatedTaxForeign === null
+      const postedTaxRefusal = input.creditNotePostingEnabled && refund.eas182StatedTaxForeign == null
         ? await fenceRetryPostedTax(
             tx,
             refund.order,
