@@ -10,6 +10,12 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### WooCommerce pull cursors are taken at read start, not at commit (backend / sync)
+
+- **Fixed: an order modified while a sweep was finishing could be skipped for good.** The order sweep stamped its `modified_after` cursor with the time it COMMITTED, after the final empty-page read. An order changed between that read and the stamp was never read by the run yet sat behind the next sweep's window, and with its webhook missed it was never processed. Every WooCommerce pull cursor (order poll and reconcile, product poll and reconcile, the initial import's completion stamp) is now the time the run STARTED, before its first WooCommerce read, less a 120 second overlap (`WC_PULL_CURSOR_OVERLAP_MS`, covering second-precision `date_modified` and clock skew between the IMS and WooCommerce hosts). Re-reading the overlap is safe: order import updates an order it already holds and product sync upserts by SKU.
+- A commit never moves a cursor backwards: it writes the later of the stored value and the new candidate. The selection-widening and refusal-watermark rewinds are unchanged (they lower only where a run reads from). The conditional commit under the advisory lock and the read-sync liveness stamp (which stays the real commit time) are unchanged.
+- No migration.
+
 ### WooCommerce reconcile: a failed held-invoice sweep read answers 500 (backend / operations)
 
 - **Fixed: invoices awaiting release could go unprocessed while the `wc-reconcile` heartbeat stayed green.** The held sales-invoice release sweep returned plain counters when the held-invoice queue read, or the order read behind it, threw, so the run read as ok. It now returns `heldSalesInvoices.readError` for either read, and for a numbered invoice whose hold lookup or queued-invoice confirmation threw (that was read as an absent hold or as a tolerated stuck invoice), the cron outcome mapping counts it as a failure, and the route answers 500 (and records `failed`). A database read cannot be refused by the outbound-write hold, so it is never held.

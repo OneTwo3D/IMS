@@ -3,6 +3,7 @@
  */
 
 import { heldOrderInvoiceObligation } from './held-order-invoice-obligation'
+import { advancePullCursor, wcPullCursorCandidate } from './read-cursor'
 import { describeWcRateMoneyRefusal, findWcRateMoneyProblems } from '@/lib/domain/accounting/wc-rate-money-refusal'
 import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain/erasure/erase-personal-data'
 import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
@@ -4494,6 +4495,9 @@ export async function syncNewWcOrders(
   const result: SyncResult = { synced: 0, skipped: 0, errors: [] }
   const mode = opts.mode ?? 'poll'
   const cursorKey = mode === 'poll' ? 'last_wc_order_sync_at' : 'last_wc_order_reconcile_at'
+  // THE CURSOR THIS RUN MAY COMMIT is fixed NOW, before its first WooCommerce read (see read-cursor.ts):
+  // an order modified after the final empty-page read must stay ahead of the next sweep's window.
+  const readStartedAtMs = Date.now()
 
   // Guard: initial import must be completed before ongoing sync runs
   const initialImportSetting = await db.setting.findUnique({ where: { key: 'wc_initial_import_completed' } })
@@ -4804,6 +4808,7 @@ export async function syncNewWcOrders(
   // or import error can permanently skip remote changes older than now.
   if (result.errors.length === 0) {
     const now = new Date().toISOString()
+    const cursorCandidate = wcPullCursorCandidate(readStartedAtMs)
     const fingerprint = JSON.stringify([...statuses].sort())
     // THE COMMIT IS CONDITIONAL ON THE STATE THIS RUN STARTED FROM. Two sweeps can overlap on one
     // cursor (a manual reconcile and the scheduled one). A slow run that read the full fingerprint
@@ -4826,11 +4831,9 @@ export async function syncNewWcOrders(
         valueOf(cursorStatusesKey) !== (cursorStatusesSetting?.value ?? null)
         || valueOf(droppedSinceKey) !== (droppedSinceSetting?.value ?? null)
       ) return false
-      await tx.setting.upsert({
-        where: { key: cursorKey },
-        create: { key: cursorKey, value: now },
-        update: { value: now },
-      })
+      // READ-START cursor, never commit time, and never behind what is stored (webhooks advance it too).
+      // A rewind (selection widening, refusal watermark) lowers only where THIS run read from.
+      await advancePullCursor(tx, cursorKey, cursorCandidate)
       // Written WITH the cursor, in one transaction: a cursor and the selection it was earned
       // under are one fact, and a cursor advanced without its fingerprint would make the next
       // widening undetectable.

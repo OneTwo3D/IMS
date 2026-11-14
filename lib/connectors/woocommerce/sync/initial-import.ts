@@ -14,6 +14,7 @@
  * Sync page prints the resolved list before the button is pressed.
  */
 
+import { advancePullCursor, wcPullCursorCandidate } from './read-cursor'
 import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -223,6 +224,9 @@ export async function runInitialImport(
 ): Promise<InitialImportRunResult> {
   const stampCompletion = options.stampCompletion !== false
   const runResult: InitialImportRunResult = { outcome: 'not-run', stamped: false, statuses: [], unrecordedRefusals: 0, progress }
+  // The completion cursor is the time the pass STARTED, less the overlap (read-cursor.ts), not the time it finished:
+  // an order that changed after its page was read must stay ahead of the first `modified_after` sweep.
+  const readStartedAtMs = Date.now()
   try {
     const statuses = await getWcPullStatuses('initial')
     runResult.statuses = statuses
@@ -462,11 +466,7 @@ export async function runInitialImport(
         create: { key: 'wc_initial_import_completed', value: 'true' },
         update: { value: 'true' },
       })
-      await db.setting.upsert({
-        where: { key: 'last_wc_order_sync_at' },
-        create: { key: 'last_wc_order_sync_at', value: new Date().toISOString() },
-        update: { value: new Date().toISOString() },
-      })
+      await advancePullCursor(db, 'last_wc_order_sync_at', wcPullCursorCandidate(readStartedAtMs))
       runResult.stamped = true
     }
 

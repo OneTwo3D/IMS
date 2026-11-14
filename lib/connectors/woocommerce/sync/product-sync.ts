@@ -2,6 +2,7 @@
  * Bidirectional product sync between WooCommerce and IMS.
  */
 
+import { advancePullCursor, wcPullCursorCandidate } from './read-cursor'
 import { readWcProductPushDecision } from './product-push-gate'
 import { after } from 'next/server'
 import { db } from '@/lib/db'
@@ -2274,6 +2275,8 @@ export async function syncAllWcProducts(
   const mode = opts.mode ?? 'poll'
   const onProgress = opts.onProgress
   const cursorKey = mode === 'poll' ? 'last_wc_product_sync_at' : 'last_wc_product_reconcile_at'
+  // The cursor this run may commit is fixed before its first WooCommerce read (see read-cursor.ts).
+  const readStartedAtMs = Date.now()
   let totalProducts = 0
   let processedProducts = 0
 
@@ -2461,7 +2464,7 @@ export async function syncAllWcProducts(
   }
 
   if (result.errors.length === 0) {
-    const cursorAt = new Date().toISOString()
+    const cursorAt = wcPullCursorCandidate(readStartedAtMs)
     await db.$transaction(async (tx) => {
       // Inside, and FIRST, so a failure to record the burial aborts the burial. `userId` is passed
       // explicitly because the session lookup logActivity falls back on is a cache() read with no
@@ -2469,11 +2472,8 @@ export async function syncAllWcProducts(
       if (result.permanentErrors.length > 0) {
         await logActivityInTransaction(tx, { ...permanentConflictLine, userId: null })
       }
-      await tx.setting.upsert({
-        where: { key: cursorKey },
-        create: { key: cursorKey, value: cursorAt },
-        update: { value: cursorAt },
-      })
+      // Never behind what is stored (the product webhook advances `last_wc_product_sync_at` too).
+      await advancePullCursor(tx, cursorKey, cursorAt)
     })
   } else if (result.permanentErrors.length > 0) {
     // The cursor is HELD by a transient failure, so these SKUs are re-read and re-reported by the

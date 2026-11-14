@@ -1,0 +1,50 @@
+/**
+ * THE `modified_after` PULL CURSORS ARE TAKEN AT READ START, NOT AT COMMIT.
+ *
+ * A sweep that stamped `new Date()` when it COMMITTED left a window between its last WooCommerce
+ * read and that stamp: an order modified in it was never read by this run, yet fell behind the next
+ * run's `modified_after`. With the webhook missed it was never processed. So every pull cursor is
+ * now the time the run STARTED (before its first WooCommerce read), less an overlap, and nothing
+ * later is ever committed.
+ *
+ * THE OVERLAP (120 s) covers the two things a bare start time cannot:
+ *   - PRECISION: WooCommerce `date_modified` is second precision and `modified_after` is compared
+ *     with `>`/`>=` semantics that differ across versions, so an order stamped in the same second as
+ *     the cursor must still be read: at least 1-2 s.
+ *   - CLOCK SKEW: the IMS host and the WooCommerce host are different machines (and the order's
+ *     modified time is set when the row is written, which can trail the HTTP request that caused it
+ *     by the length of the write). NTP-synced hosts agree to well under a second; two minutes is a
+ *     deliberately generous bound that still costs only the handful of orders touched in two minutes
+ *     per sweep.
+ *
+ * Re-reading the overlap is safe: order import is idempotent (an order IMS holds takes the update
+ * path, `shopping_order_links` is unique on connector + externalOrderId), and product sync upserts
+ * by SKU.
+ */
+export const WC_PULL_CURSOR_OVERLAP_MS = 120_000
+
+/** The cursor a run may commit: its read-start time less the overlap, as an ISO string. */
+export function wcPullCursorCandidate(readStartedAtMs: number): string {
+  return new Date(readStartedAtMs - WC_PULL_CURSOR_OVERLAP_MS).toISOString()
+}
+
+/** The later of a stored cursor and a candidate. A cursor never moves backwards through a commit. */
+export function laterCursor(current: string | null | undefined, candidate: string): string {
+  const currentMs = current ? Date.parse(current) : NaN
+  return Number.isFinite(currentMs) && currentMs > Date.parse(candidate) ? (current as string) : candidate
+}
+
+type SettingClient = {
+  setting: {
+    findUnique: (args: { where: { key: string } }) => PromiseLike<{ value: string } | null>
+    upsert: (args: { where: { key: string }; create: { key: string; value: string }; update: { value: string } }) => PromiseLike<unknown>
+  }
+}
+
+/** Write `max(current, candidate)` to a cursor setting; returns what is stored afterwards. */
+export async function advancePullCursor(client: SettingClient, key: string, candidate: string): Promise<string> {
+  const current = await client.setting.findUnique({ where: { key } })
+  const next = laterCursor(current?.value, candidate)
+  await client.setting.upsert({ where: { key }, create: { key, value: next }, update: { value: next } })
+  return next
+}
