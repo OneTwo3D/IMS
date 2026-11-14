@@ -380,3 +380,74 @@ test('[refund 182 hold] the held row must EXIST with this refund\'s key before a
   assert.match(readFileSync('app/actions/sales.ts', 'utf8'), /idempotencyKey: `sales-order-refund:\$\{input\.refundId\}:credit-note`/)
   assert.equal(creditNoteIdempotencyKey('R1'), 'sales-order-refund:R1:credit-note')
 })
+
+test('[refund 182 hold] edge cases: threshold 0 writes nothing; a held refund stays held when the threshold drops to 0; a cancelled sendable row is not a conflict; a non-numeric count holds without counting; an already-held refund whose row is missing is unmet; the place among the held is reported', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true, { [COUNT]: '3', [THRESHOLD]: '10' })
+  const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx) })
+  const { decideRefund182Hold, creditNoteIdempotencyKey } = await import('../../lib/domain/sales/refund-182-hold.ts')
+  const mkRefund = async () => (await deps.db.salesOrderRefund.create({ data: { orderId: fx.orderId, totalForeign: 1, totalBase: 1, totalsBasis: 'NET' }, select: { id: true } })).id
+  const refusedRow = (refundId: string, over: Record<string, unknown> = {}) => deps.db.accountingSyncLog.create({ data: { type: 'CREDIT_NOTE', status: 'PENDING', referenceType: 'SalesOrderRefund', referenceId: refundId, payload: { lines: [], _euVatCreditNoteRefused: { reason: 'x' }, _idempotencyKey: creditNoteIdempotencyKey(refundId), ...over } } })
+  const stamp = async (id: string) => (await deps.db.salesOrderRefund.findUnique({ where: { id }, select: { eas182HeldAt: true } }))!.eas182HeldAt
+  const queued = async () => ({ queued: true as const, reason: 'queued' })
+
+  // Threshold 0 with NO counter row: nothing is held and no counter row is written.
+  await deps.db.setting.deleteMany({ where: { key: COUNT } })
+  await deps.db.setting.update({ where: { key: THRESHOLD }, data: { value: '0' } })
+  const zero = await mkRefund()
+  assert.deepEqual(await decideRefund182Hold(zero, queued), { held: false })
+  assert.equal(await heldCount(deps.db), null, 'no counter row was written')
+  await deps.db.setting.update({ where: { key: THRESHOLD }, data: { value: '10' } })
+  await deps.db.setting.upsert({ where: { key: COUNT }, create: { key: COUNT, value: '3' }, update: { value: '3' } })
+
+  // A held refund stays held when the threshold is later lowered to 0 (and when it is no longer below the count).
+  const heldId = await mkRefund()
+  await refusedRow(heldId)
+  const first = await decideRefund182Hold(heldId, queued)
+  assert.equal(first.held && 'queued' in first && first.queued && first.newlyHeld && first.heldNumber >= 1, true)
+  assert.equal(first.held && 'heldNumber' in first ? first.heldNumber : -1, 4, 'the number is the count after this one (3 + 1)')
+  await deps.db.setting.update({ where: { key: THRESHOLD }, data: { value: '0' } })
+  const again = await decideRefund182Hold(heldId, queued)
+  assert.equal(again.held && 'newlyHeld' in again && again.newlyHeld === false, true, 'still held, not counted again')
+  await deps.db.setting.update({ where: { key: THRESHOLD }, data: { value: '10' } })
+
+  // An already-held refund whose refused row is gone: held again but UNMET (nothing exists to settle).
+  const gone = await mkRefund()
+  await deps.db.$executeRaw`UPDATE sales_order_refunds SET eas182_held_at = now() WHERE id = ${gone}`
+  const missing = await decideRefund182Hold(gone, queued)
+  assert.deepEqual(missing, { held: true, queued: false, outcome: { queued: true, reason: 'queued' }, rowMissing: true })
+
+  // A CANCELLED sendable row can never go out: not a conflict.
+  const cancelled = await mkRefund()
+  await deps.db.accountingSyncLog.create({ data: { type: 'CREDIT_NOTE', status: 'CANCELLED', referenceType: 'SalesOrderRefund', referenceId: cancelled, payload: { lines: [{ description: 'x', quantity: 1, unitAmount: 1 }] } } })
+  await refusedRow(cancelled)
+  const ok = await decideRefund182Hold(cancelled, queued)
+  assert.equal(ok.held && 'queued' in ok && ok.queued, true)
+  assert.ok(await stamp(cancelled))
+
+  // A count that is not a whole number holds without counting.
+  await deps.db.setting.update({ where: { key: COUNT }, data: { value: 'abc' } })
+  const odd = await mkRefund()
+  await refusedRow(odd)
+  const held = await decideRefund182Hold(odd, queued)
+  assert.equal(held.held && 'queued' in held && held.queued && held.threshold === null, true)
+  assert.equal(await heldCount(deps.db), 'abc', 'not counted')
+})
+
+
+test('[refund 182 hold] the SAME refund treated twice at once is counted ONCE (the held mark is re-read under the counter lock)', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true, { [COUNT]: '3', [THRESHOLD]: '10' })
+  const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx) })
+  const { decideRefund182Hold, creditNoteIdempotencyKey } = await import('../../lib/domain/sales/refund-182-hold.ts')
+  const refund = await deps.db.salesOrderRefund.create({ data: { orderId: fx.orderId, totalForeign: 1, totalBase: 1, totalsBasis: 'NET' }, select: { id: true } })
+  await deps.db.accountingSyncLog.create({ data: { type: 'CREDIT_NOTE', status: 'PENDING', referenceType: 'SalesOrderRefund', referenceId: refund.id, payload: { lines: [], _euVatCreditNoteRefused: { reason: 'x' }, _idempotencyKey: creditNoteIdempotencyKey(refund.id) } } })
+  // A slow enqueue keeps the counter lock held while the others have already passed the unlocked held check and are waiting on it.
+  const enqueue = async () => { await new Promise((resolve) => setTimeout(resolve, 300)); return { queued: true as const, reason: 'already-queued' } }
+  const results = await Promise.all([decideRefund182Hold(refund.id, enqueue), decideRefund182Hold(refund.id, enqueue), decideRefund182Hold(refund.id, enqueue)])
+  assert.equal(results.every((r) => r.held), true)
+  assert.equal(results.filter((r) => r.held && 'newlyHeld' in r && r.newlyHeld).length, 1, 'exactly one counted it')
+  assert.equal(await heldCount(deps.db), '4', 'the count went up by one')
+})

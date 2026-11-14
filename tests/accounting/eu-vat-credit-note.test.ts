@@ -297,3 +297,13 @@ test('[credit note 182] the held wording names the account, the amounts, the pla
   assert.match(text, /total 119 EUR, of which 19 is VAT|119 EUR, of which 19 is VAT/)
   assert.match(text, /Check Xero for credit note CN-0001 first[\s\S]*settle action on \/sync/)
 })
+
+test('[credit note 182] a refund that states LESS than its net refuses; the VAT booked is gross less net (not the stated tax); exactly the order bound passes', () => {
+  const less = figures182({ statedGross: D('99.99'), statedTax: D('0') })
+  assert.equal(less.ok, false)
+  assert.match(!less.ok ? less.reason : '', /less than the 100 its lines net to/)
+  assert.deepEqual(figures182({ statedGross: D('119'), statedTax: D('19.02') }), { ok: true, vatAmount: '19', refundTotal: '119' }, 'the VAT is gross less net; the stated tax only confirms it')
+  // 19 + 6.49 = 25.49 = 25.46 + the 3-minor-unit allowance: on the bound passes.
+  assert.equal(figures182({ priorRefundedTax: D('6.49') }).ok, true)
+  assert.equal(figures182({ priorRefundedTax: D('6.50') }).ok, false)
+})
