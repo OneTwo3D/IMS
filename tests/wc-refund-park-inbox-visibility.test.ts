@@ -78,6 +78,10 @@ function matches(row: Record<string, unknown>, where: Record<string, unknown>): 
       if (!(condition as Array<Record<string, unknown>>).some((branch) => matches(row, branch))) return false
       continue
     }
+    if (key === 'AND') {
+      if (!(condition as Array<Record<string, unknown>>).every((branch) => matches(row, branch))) return false
+      continue
+    }
     if (key === 'NOT') {
       if (matches(row, condition as Record<string, unknown>)) return false
       continue

@@ -30,6 +30,8 @@ let accountingMocked = false
 const betweenHook: { armed: boolean; verified: boolean; run: null | (() => Promise<void>) } = { armed: false, verified: false, run: null }
 // Runs once, right after the treatment's read of the gift-card cut-in returns (to change the setting between the read and the parking write).
 const cutInHook: { run: null | (() => Promise<void>) } = { run: null }
+// Runs once, at the stamp transaction's order lock, but only after the regime input has been built (so an answer can change between the input's read and the stamp).
+const stampHook: { armed: boolean; built: boolean; run: null | (() => Promise<void>) } = { armed: false, built: false, run: null }
 // Account settings the mocked accounting settings report instead of the defaults (a test changes one while a row waits).
 const acct: Record<string, string> = {}
 async function mockAccounting() {
@@ -49,6 +51,11 @@ async function mockAccounting() {
   mock.module('@/lib/connectors/woocommerce/sync/eu-vat-facts', {
     namedExports: {
       ...facts,
+      buildEuVatRegimeInputFromSettings: async (...args: Parameters<typeof facts.buildEuVatRegimeInputFromSettings>) => {
+        const built = await facts.buildEuVatRegimeInputFromSettings(...args)
+        if (stampHook.armed) stampHook.built = true
+        return built
+      },
       readGiftCardFlagCutIn: async () => {
         const read = await facts.readGiftCardFlagCutIn()
         if (cutInHook.run) { const run = cutInHook.run; cutInHook.run = null; await run() }
@@ -61,6 +68,12 @@ async function mockAccounting() {
     namedExports: {
       ...allocation,
       lockSalesOrder: async (...args: Parameters<typeof allocation.lockSalesOrder>) => {
+        if (stampHook.armed && stampHook.built && stampHook.run) {
+          const run = stampHook.run
+          stampHook.run = null
+          stampHook.armed = false
+          await run()
+        }
         if (betweenHook.armed && betweenHook.verified && betweenHook.run) {
           const run = betweenHook.run
           betweenHook.run = null
@@ -1295,7 +1308,9 @@ test('[eu vat] the SWEEP never releases a treated hold that carries the not-tota
 
 // THE TREATMENT AND THE IMPORT'S HELD-INVOICE CHECK DECIDE THE REGIME FROM THE SAME SETTINGS-DERIVED INPUT, the gift-card flag cut-in included.
 const GIFT_CARD_CUT_IN = 'eu_vat_gift_card_flag_cut_in'
-async function giftCardHold(t: test.TestContext, cutIn: { atPark: string | null; atRelease: string | null }) {
+const STORE_SETTING = 'wc_url'
+const STORE_A = 'https://store-a.example'
+async function giftCardHold(t: test.TestContext, cutIn: { atPark: string | null; atRelease: string | null }, answer?: { isGiftCard: boolean; store?: string; flipTo?: boolean }) {
   const db = await loadDb()
   await mockAccounting()
   switchOn = true
@@ -1308,7 +1323,10 @@ async function giftCardHold(t: test.TestContext, cutIn: { atPark: string | null;
     if (value === null) await db.setting.deleteMany({ where: { key: GIFT_CARD_CUT_IN } })
     else await db.setting.upsert({ where: { key: GIFT_CARD_CUT_IN }, create: { key: GIFT_CARD_CUT_IN, value }, update: { value } })
   }
-  t.after(async () => { switchOn = false; await setCutIn(null); await cleanup(db, externalId, ctx) })
+  const previousUrl = await db.setting.findUnique({ where: { key: STORE_SETTING } })
+  await db.setting.upsert({ where: { key: STORE_SETTING }, create: { key: STORE_SETTING, value: `${STORE_A}/` }, update: { value: `${STORE_A}/` } })
+  t.after(async () => { stampHook.armed = false; stampHook.run = null; stampHook.built = false; if (previousUrl) await db.setting.update({ where: { key: STORE_SETTING }, data: { value: previousUrl.value } }); else await db.setting.deleteMany({ where: { key: STORE_SETTING } }) })
+  t.after(async () => { switchOn = false; await setCutIn(null); await db.euVatGiftCardLineResolution.deleteMany({ where: { externalOrderId: String(externalId) } }); await cleanup(db, externalId, ctx) })
   // The order carries a gift-card line with NO flag (the plugin did not write one): lenient before the cut-in, a refusal from it on. It was created 2026-11-02.
   const unflagged = (m: Meta) => { const p = payload(externalId, wcRateId, m); p.line_items[0]!.meta_data = []; return p }
   await setCutIn(cutIn.atPark)
@@ -1319,9 +1337,23 @@ async function giftCardHold(t: test.TestContext, cutIn: { atPark: string | null;
   const parkedMarker = (held.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment as Record<string, unknown>
   const stampedAtPark = (await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { euVatRegime: true } })).euVatRegime
   await setCutIn(cutIn.atRelease)
-  await importWcOrder(unflagged([{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...PLUGIN('821')]) as never)
+  // An operator's answer for the unflagged line (WooCommerce line item 1), recorded before the re-import.
+  if (answer) await db.euVatGiftCardLineResolution.create({ data: { connector: 'woocommerce', storeIdentity: answer.store ?? STORE_A, externalOrderId: String(externalId), externalLineItemId: 1, isGiftCard: answer.isGiftCard, resolvedByUserId: 'test-operator' } })
+  const withNumber = () => unflagged([{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...PLUGIN('821')]) as never
+  let abortedImport: { stamp: string | null; status: string; error: string | null } | null = null
+  if (answer?.flipTo !== undefined) {
+    // The operator changes the answer AFTER the regime input has read it and BEFORE the stamp takes the order lock.
+    stampHook.built = false
+    stampHook.run = async () => { await db.euVatGiftCardLineResolution.updateMany({ where: { externalOrderId: String(externalId) }, data: { isGiftCard: answer.flipTo! } }) }
+    stampHook.armed = true
+    await importWcOrder(withNumber())
+    const mid = await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { euVatRegime: true, euVatRegimeStampedAt: true } })
+    const midHold = await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } })
+    abortedImport = { stamp: mid.euVatRegimeStampedAt === null ? null : String(mid.euVatRegime), status: midHold.status, error: midHold.errorMessage }
+  }
+  await importWcOrder(withNumber())
   return {
-    parkedMarker, stampedAtPark,
+    abortedImport, parkedMarker, stampedAtPark,
     after: await db.shoppingSyncLog.findUniqueOrThrow({ where: { id: held.id } }),
     rows: await db.accountingSyncLog.findMany({ where: { type: 'SALES_INVOICE', referenceId: orderId } }),
   }
@@ -1340,6 +1372,39 @@ test('[eu vat] gift-card line with no flag, cut-in BEFORE the order (required): 
   assert.deepEqual([parkedMarker.applied, parkedMarker.reason], [false, 'treatment_refused'])
   assert.match(String(parkedMarker.refusal), /gift-card flag/)
   assert.equal(stampedAtPark, null, 'nothing was stamped')
+  assert.equal(rows.length, 0)
+  assert.equal(after.status, 'PENDING')
+  assert.match(after.errorMessage ?? '', /gift-card flag/)
+})
+
+test('[eu vat] gift-card line with no flag, cut-in BEFORE the order, then an operator answers "not a gift card": the parked refusal names the line, and the re-import treats, stamps and releases the hold', { skip }, async (t) => {
+  const { parkedMarker, stampedAtPark, rows, after } = await giftCardHold(t, { atPark: '2026-11-01', atRelease: '2026-11-01' }, { isGiftCard: false })
+  assert.deepEqual([parkedMarker.applied, parkedMarker.reason], [false, 'treatment_refused'])
+  assert.deepEqual(parkedMarker.giftCardLineIds, [1], 'the refusal names the unsettled line')
+  assert.equal(parkedMarker.giftCardUnsettled, true, 'and flags the hold so the Exceptions list and count can select it in the database')
+  assert.equal(stampedAtPark, null, 'nothing was stamped while it was unanswered')
+  assert.equal(rows.length, 1, 'released')
+  assert.equal(after.status, 'SYNCED')
+})
+
+test('[eu vat] the same, answered "a gift card": the order is decided and released too (the answer settles the flag; the value rule is the regime\u2019s own)', { skip }, async (t) => {
+  const { rows, after } = await giftCardHold(t, { atPark: '2026-11-01', atRelease: '2026-11-01' }, { isGiftCard: true })
+  assert.equal(rows.length, 1, 'released')
+  assert.equal(after.status, 'SYNCED')
+})
+
+test('[eu vat] the answer changes between the regime input\u2019s read and the stamp: nothing is stamped, and the next import decides with the new answer and releases', { skip }, async (t) => {
+  const { abortedImport, rows, after } = await giftCardHold(t, { atPark: '2026-11-01', atRelease: '2026-11-01' }, { isGiftCard: false, flipTo: true })
+  assert.ok(abortedImport)
+  assert.equal(abortedImport.stamp, null, 'the stale decision was not stamped')
+  assert.equal(abortedImport.status, 'PENDING')
+  assert.match(abortedImport.error ?? '', /gift-card answer .* changed/)
+  assert.equal(rows.length, 1, 'the next import released it')
+  assert.equal(after.status, 'SYNCED')
+})
+
+test('[eu vat] an answer given under another store\u2019s identity is not applied: the order still refuses', { skip }, async (t) => {
+  const { rows, after } = await giftCardHold(t, { atPark: '2026-11-01', atRelease: '2026-11-01' }, { isGiftCard: false, store: 'https://store-b.example' })
   assert.equal(rows.length, 0)
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /gift-card flag/)

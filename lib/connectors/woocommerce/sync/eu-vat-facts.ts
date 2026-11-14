@@ -20,6 +20,7 @@ import type {
 import { normaliseDestination } from '@/lib/domain/accounting/eu-vat-regime'
 import { EU_VAT_GIFT_CARD_CUT_IN_SETTING, EU_VAT_REGIME_MODE_SETTING, parseGiftCardCutIn, parseRegimeMode, parseStrictIsoInstant, type GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
 import { getSettingValues } from '@/lib/settings-store'
+import { applyGiftCardLineResolutions, currentGiftCardStoreIdentity, giftCardAnswersUsed, loadGiftCardLineResolutions, type GiftCardAnswersUsed, type GiftCardResolutionClient } from './gift-card-line-resolution'
 import { readWclcFeeKind, wcMetaFlag } from './field-mapping'
 import { parseWcGmtInstant } from './receipt-settlement-rate'
 import type { WcFullOrder, WcMeta } from './types'
@@ -147,7 +148,7 @@ export function readGoodsLines(order: Pick<WcFullOrder, 'line_items'>, problems:
     const total = decimalText(line.total)
     if (total === null) problems.push(`goods line ${index + 1} (id ${String(line.id)}) has an unreadable total`)
     // Only the line's own flag is read. The product-level marker (`_coupon_title`) is not on the order and IMS imports no product meta, so a line with no (or an unreadable) flag is unknown and the resolver decides what that means.
-    return { total: total ?? '0', voucherStrict: agree(entries.map((e) => readStrictFlag(e.value))), voucher: agree(entries.map((e) => lenient(e.value))) }
+    return { total: total ?? '0', ...(Number.isInteger(line.id) ? { lineId: line.id } : {}), voucherStrict: agree(entries.map((e) => readStrictFlag(e.value))), voucher: agree(entries.map((e) => lenient(e.value))) }
   })
 }
 
@@ -287,14 +288,15 @@ export function giftCardFlagPolicy(cutIn: GiftCardCutIn, orderedAt: Date): 'off'
   return orderedAt.getTime() >= cutIn.at.getTime() ? 'required' : 'off'
 }
 
-export type EuVatRegimeInputClient = MappingClient & FxLookupClient
+/** The answer table is optional on the client: a client without it has no answers, so unsettled lines keep refusing. */
+export type EuVatRegimeInputClient = MappingClient & FxLookupClient & Partial<GiftCardResolutionClient>
 
 /** The resolver's whole input for a WooCommerce order. `accounts` are the configured VAT account codes (Xero account roles). */
 export async function buildEuVatRegimeInput(
   client: EuVatRegimeInputClient,
   order: WcFullOrder,
   accounts: { ioss: string | null; ddp: string | null },
-  options: { baseCurrency?: string; mode?: EuVatRegimeMode; giftCardCutIn: GiftCardCutIn },
+  options: { baseCurrency?: string; mode?: EuVatRegimeMode; giftCardCutIn: GiftCardCutIn; /** Receives what the gift-card answers were read from, so the stamp can prove under the order lock that they have not changed. */ answersUsed?: { value?: GiftCardAnswersUsed } },
 ): Promise<EuVatRegimeInput> {
   const facts = readWcEuVatFacts(order)
   const mappings = await loadRateMappings(client, facts.rateTax.map((r) => r.wooRateId))
@@ -306,7 +308,16 @@ export async function buildEuVatRegimeInput(
     : await resolveThresholdFx(client, { currency: facts.currency, destination, orderedAt, baseCurrency: options.baseCurrency })
   const { rateTax: _rateTax, ...rest } = facts
   void _rateTax
-  return { ...rest, mode: options.mode ?? 'adopt_plugin', rates, thresholdFx, accounts, giftCardFlag: giftCardFlagPolicy(options.giftCardCutIn, giftCardOrderedAt(order)) }
+  // An operator's answer fills a line the plugin left unsettled (never a readable yes/no); asked only when there is such a line.
+  const needsAnswer = rest.goodsLines.some((line) => line.lineId !== undefined && (line.voucherStrict ?? 'unknown') === 'unknown')
+  let goodsLines = rest.goodsLines
+  if (needsAnswer) {
+    const storeIdentity = await currentGiftCardStoreIdentity()
+    const answers = await loadGiftCardLineResolutions(client, storeIdentity, String(order.id))
+    goodsLines = applyGiftCardLineResolutions(rest.goodsLines, answers)
+    if (options.answersUsed) options.answersUsed.value = giftCardAnswersUsed(storeIdentity, rest.goodsLines, answers)
+  }
+  return { ...rest, goodsLines, mode: options.mode ?? 'adopt_plugin', rates, thresholdFx, accounts, giftCardFlag: giftCardFlagPolicy(options.giftCardCutIn, giftCardOrderedAt(order)) }
 }
 
 /**
@@ -317,7 +328,7 @@ export async function buildEuVatRegimeInputFromSettings(
   client: EuVatRegimeInputClient,
   order: WcFullOrder,
   accounts: { ioss: string | null; ddp: string | null },
-  options: { baseCurrency?: string; mode?: EuVatRegimeMode } = {},
+  options: { baseCurrency?: string; mode?: EuVatRegimeMode; answersUsed?: { value?: GiftCardAnswersUsed } } = {},
   readCutIn: () => Promise<GiftCardCutIn> = readGiftCardFlagCutIn,
 ): Promise<EuVatRegimeInput> {
   let giftCardCutIn: GiftCardCutIn

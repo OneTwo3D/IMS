@@ -37,6 +37,7 @@ import {
   describeFollowUpObligationBacklogRow,
   readFollowUpObligationDatabaseNow,
 } from '@/lib/domain/accounting/follow-up-obligation-registry'
+import { giftCardUnsettledHoldWhere } from '@/lib/connectors/woocommerce/sync/gift-card-line-resolution'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { accountingSyncRowCanPostOrHasPosted, retiredUnprovenRows } from '@/lib/domain/accounting/postable-sync-statuses'
@@ -765,6 +766,8 @@ export type ExceptionInboxSummary = {
   productStructureConflicts: number
   /** WooCommerce orders a guard refused to import, recorded in the by-id queue. */
   blockedWcOrders: number
+  /** Held invoices refused for a gift-card flag the store left unsettled: an operator answers per line (counted in the total). */
+  giftCardLinesToResolve: number
   unresolvedDrift: number
   /**
    * o3d-0bfh r6 (Codex HIGH): accounting sync rows that finished posting still owing follow-up work,
@@ -1138,6 +1141,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     db.accountingPostingRefusal.count({ where: { resolvedAt: null, handPostClaimedAt: { not: null } } }),
   ])
 
+  const giftCardLinesToResolve = await db.shoppingSyncLog.count({ where: giftCardUnsettledHoldWhere() })
   const maintenanceRecovery = countMaintenanceRecovery(await loadMaintenanceRecoveryState())
   const deadReceiptEvents = deadReceipts + deadWebhooks + deadShoppingWebhooks
   return {
@@ -1151,6 +1155,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     orderReconcileDrift,
     productStructureConflicts,
     blockedWcOrders,
+    giftCardLinesToResolve,
     unresolvedDrift: driftIncidents.length,
     accountingFollowUpObligations,
     accountingPostingRefusals: outstandingPostingRefusals + unconfirmedPostingRefusals,
@@ -1158,7 +1163,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // Not in `total` — see the field's own comment: an operator settling a refusal is not a second debt.
     accountingHandPostClaims: handPostClaims,
     total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks
-      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + blockedWcOrders + driftIncidents.length
+      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + blockedWcOrders + giftCardLinesToResolve + driftIncidents.length
       + accountingFollowUpObligations + outstandingPostingRefusals + unconfirmedPostingRefusals,
   }
 }

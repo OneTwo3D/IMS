@@ -32,6 +32,7 @@ import {
   buildWooCommerceConnectionFingerprint,
   evaluateWooCommerceEnableConnectionGate,
 } from '@/lib/connectors/woocommerce/connection-test-gate'
+import { normaliseStoreIdentity } from '@/lib/connectors/woocommerce/tax-rate-plan'
 import { normaliseWcOrderStatus } from '@/lib/connectors/woocommerce/order-status-filter'
 import {
   UNRESOLVED_WC_ORDER_ROW_DESCRIPTIONS,
@@ -515,6 +516,9 @@ export async function saveWcCredentials(url: string, key: string, secret: string
       create: { key: WC_SETTINGS_VERSION_KEY, value: nextVersion },
       update: { value: nextVersion },
     })
+
+    // Operator gift-card answers are bound to the store they were given for: those of any other store than the one now configured are deleted with the rebind (the activity log keeps who answered what).
+    await tx.euVatGiftCardLineResolution.deleteMany({ where: { NOT: { storeIdentity: normaliseStoreIdentity(validatedUrl.normalizedUrl) ?? '' } } })
 
     // Wipe the cache in the same transaction. A crash between the
     // credentials write and the wipe would otherwise leave the cache

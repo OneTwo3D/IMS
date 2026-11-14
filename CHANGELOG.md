@@ -10,6 +10,14 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### EU VAT: an operator can settle a gift-card line the store left `unknown`
+
+- **Fixed: after the gift-card cut-in, an order with a custom line or a deleted-product line was refused for good.** The plugin writes `unknown` on such lines and IMS treated that as missing, so the order was refused (`gift_card_flag_missing`) and re-importing could never clear it. The cut-in (`eu_vat_gift_card_flag_cut_in`) should not be set until this is deployed.
+- **Now an operator answers per line.** **Sync > Exceptions > "Gift card or not? Order lines the store could not settle"** lists the held orders and the lines the refusal named; **Gift card** or **Not a gift card** records the answer with who and when (sync permission, fresh sign-in; the history is in the activity log). The regime builder uses the answer for that line only where the store left it unsettled: a flagged `yes`/`no` is never overridden, and an unanswered line keeps refusing (no default). Re-import the order afterwards and its held invoice is released.
+- An answer is bound to the store it was given for (new column `store_identity`, the same normalised store URL the tax-rate mappings use) and is deleted when the store connection is changed to another store and by the operator reset. The stamp re-reads the answers under the order lock and writes nothing if one changed since the regime input was built.
+- The section is filtered in the database before it is paged (50 orders a page, with Previous / Next), its heading shows the true count, and the count is part of the Sync > Exceptions badge, so a backlog is never hidden behind unrelated refusals.
+- The refusal now says where to answer, and the parked refusal records the line ids. Migration: one new table, `eu_vat_gift_card_line_resolutions` (additive). Not done on purpose: no automatic "not a gift card" rule from the product, because IMS holds no gift-card marker on products to prove it.
+
 ### WooCommerce reconcile: a failed held-invoice sweep read answers 500 (backend / operations)
 
 - **Fixed: invoices awaiting release could go unprocessed while the `wc-reconcile` heartbeat stayed green.** The held sales-invoice release sweep returned plain counters when the held-invoice queue read, or the order read behind it, threw, so the run read as ok. It now returns `heldSalesInvoices.readError` for either read, and for a numbered invoice whose hold lookup or queued-invoice confirmation threw (that was read as an absent hold or as a tolerated stuck invoice), the cron outcome mapping counts it as a failure, and the route answers 500 (and records `failed`). A database read cannot be refused by the outbound-write hold, so it is never held.
