@@ -19,6 +19,7 @@ import { readEuVatRegimeMode, readGiftCardFlagCutIn } from '@/lib/connectors/woo
 import type { GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
 import { predictedUntaxedTotal } from '@/lib/domain/accounting/eu-vat-treatment'
 import type { AccountingEnqueueOutcome } from '@/lib/accounting'
+import { unstampedOrderIsScheme } from '@/lib/domain/sales/eu-vat-scheme-evidence'
 import { decideRefund182Hold } from '@/lib/domain/sales/refund-182-hold'
 import { priorRefundedTax } from '@/lib/domain/sales/refund-182-prior-tax'
 import { applyEuVatCreditNoteTreatment, eas182RefundFigures, persistedSchemeUntreatableRefusal, refund182HeldRefusal, noFrozenBasisRefusal, noInvoicedTypeRefusal, noStampRefusal, refundTaxAndTotal, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
@@ -39,7 +40,6 @@ export type TreatedCreditNoteOutcome =
   /** The credit note cannot be raised as it is: the reason is the operator-facing sentence. */
   | { kind: 'refused'; reason: string; /** `hand_post`: nothing a retry can change, so the hand-off queues a REFUSED row for the operator to settle by hand; any other refusal is cleared by fixing its cause and retrying. */ code?: 'hand_post' }
 
-const SCHEME_CATEGORIES = new Set(['IOSS', 'VOEC'])
 const DESTINATION_LABEL = { IOSS: 'IOSS VAT refunded', VOEC: 'VOEC VAT refunded', DDP: 'DDP import VAT refunded' } as const
 
 type PayloadLine = { description?: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; [key: string]: unknown }
@@ -60,7 +60,7 @@ export async function treatCreditNotePayload(params: {
   enqueueHeldRow: (reason: string) => Promise<AccountingEnqueueOutcome>
 }): Promise<TreatedCreditNoteOutcome> {
   // A HELD DECISION IS PERMANENT, so it is asked BEFORE the switch: a refund already held for review is held again whatever the Sales Invoices switch says now, and never becomes a sendable credit note by a switch being turned off. (One read of the refund; nothing else is read or written when the switch is off and the refund was never held.)
-  const prior = await db.salesOrderRefund.findUnique({ where: { id: params.refundId }, select: { eas182HeldAt: true, creditNoteNumber: true, statedGrossForeign: true, eas182StatedTaxForeign: true, lines: { select: { postingTaxType: true, schemeTaxRateValue: true } }, order: { select: { euVatLineAccount: true } } } })
+  const prior = await db.salesOrderRefund.findUnique({ where: { id: params.refundId }, select: { eas182HeldAt: true, schemeTreatedAt: true, creditNoteNumber: true, statedGrossForeign: true, eas182StatedTaxForeign: true, lines: { select: { postingTaxType: true, schemeTaxRateValue: true } }, order: { select: { euVatLineAccount: true } } } })
   if (prior !== null && prior.eas182HeldAt !== null) {
     const heldNumber = String(prior.creditNoteNumber ?? params.payload.creditNoteNumber ?? '(no number)')
     const currency = String(params.payload.currency ?? '')
@@ -73,9 +73,10 @@ export async function treatCreditNotePayload(params: {
     if (decision.held) return { kind: 'held', outcome: decision.queued || !decision.rowMissing ? decision.outcome : unmetOutcome(decision.outcome) }
   }
 
-  // A PERSISTED CREATION-TIME DECISION OUTRANKS THE SWITCH. The refund writer snapshots the scheme treatment (a line's posting type or frozen rate, the stated gross, the rate-182 stated tax) ONLY while the Sales Invoices switch is on and the order is on a scheme, so the presence of any of them means this refund
+  // A PERSISTED CREATION-TIME DECISION OUTRANKS THE SWITCH. `scheme_treated_at` records it EXPLICITLY (set by the refund writer whenever a refund is created under the scheme path, even when no pricing field could be filled); the snapshot fields below are the evidence for refunds created BEFORE that column existed.
+  // RESIDUAL: such an older refund whose fields are ALL null (an older stamp without a type, an unpriceable rate) carries no evidence and is still skipped on a switch-off. None that matter exist (production is reinstalled fresh; stage's Xero is held). The refund writer snapshots the scheme treatment (a line's posting type or frozen rate, the stated gross, the rate-182 stated tax) ONLY while the Sales Invoices switch is on and the order is on a scheme, so the presence of any of them means this refund
   // was created under the scheme treatment. A switch turned off since then must not let it be queued as an ordinary credit note under the original tax identity (which would add VAT in Xero and bypass the rate-182 bound and hold): it is treated on the stamped regime, or, when that cannot be done, refused as a settle-by-hand row. Never skipped.
-  const persistedScheme = prior !== null && (prior.eas182StatedTaxForeign !== null || prior.statedGrossForeign !== null || prior.lines.some((line) => (line.postingTaxType ?? '').trim() !== '' || line.schemeTaxRateValue !== null))
+  const persistedScheme = prior !== null && (prior.schemeTreatedAt !== null || prior.eas182StatedTaxForeign !== null || prior.statedGrossForeign !== null || prior.lines.some((line) => (line.postingTaxType ?? '').trim() !== '' || line.schemeTaxRateValue !== null))
   const persistedNumber = String(prior?.creditNoteNumber ?? params.payload.creditNoteNumber ?? '(no number)')
 
   // THE SWITCH, ASKED FIRST (the Sales Invoices switch, the one the invoice treatment asks): off means nothing here runs, for a refund that was not created under the scheme treatment.
@@ -103,14 +104,9 @@ export async function treatCreditNotePayload(params: {
   // THE STAMP, READ AND NEVER DECIDED AGAIN.
   if (order.euVatRegimeStampedAt === null) {
     // IMMUTABLE EVIDENCE FIRST. (a) a stamp: handled below. (b) no stamp, but IMS itself queued or posted an invoice for this order carrying the EU VAT treatment marker: a scheme order, whatever the rates map to now.
-    const treatedInvoice = await db.accountingSyncLog.findFirst({
-      where: { type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] }, referenceType: 'SalesOrder', referenceId: params.orderId, payload: { path: ['_euVatTreatment', 'applied'], equals: true } },
-      select: { id: true },
-    })
-    if (treatedInvoice !== null) return { kind: 'refused', reason: noStampRefusal(number), code: 'hand_post' as const }
+    if (await unstampedOrderIsScheme(db, params.orderId)) return { kind: 'refused', reason: noStampRefusal(number), code: 'hand_post' as const }
     // (c) no stamp and no invoice of IMS's: the invoice came from the storefront plugin before cut-over. ACCEPTED LIMIT: only the rates' CURRENT mapping can say whether it was a scheme sale, so removing a rate's scheme mapping while refunds of such pre-cut-over orders are still possible misclassifies them as ordinary. Do not remove scheme mappings from rates used on those orders.
-    const soldOnScheme = order.lines.some((line) => SCHEME_CATEGORIES.has((line.taxRate?.reportingCategory ?? '').trim().toUpperCase()) || (line.taxRate?.schemePostingTaxType ?? '').trim() !== '')
-    return soldOnScheme ? { kind: 'refused', reason: noStampRefusal(number), code: 'hand_post' as const } : persistedScheme ? { kind: 'refused', reason: persistedSchemeUntreatableRefusal(number), code: 'hand_post' as const } : { kind: 'skipped', why: 'not_scheme' }
+    return persistedScheme ? { kind: 'refused', reason: persistedSchemeUntreatableRefusal(number), code: 'hand_post' as const } : { kind: 'skipped', why: 'not_scheme' }
   }
   if (order.euVatRegime === null) return persistedScheme ? { kind: 'refused', reason: persistedSchemeUntreatableRefusal(number), code: 'hand_post' } : { kind: 'skipped', why: 'not_scheme' }
   const regime = order.euVatRegime

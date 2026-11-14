@@ -474,3 +474,45 @@ test('[refund 182 hold] a rate-182 refund created with the switch ON, the switch
   assert.equal('_euVatTreatment' in row, false)
   assert.equal(await heldCount(deps.db), '1')
 })
+
+test('[refund scheme-treated] the scheme decision is recorded EXPLICITLY (scheme_treated_at) even when no pricing field could be filled, so a switch turned off before a retry gives the refused hand_post row, never an ordinary credit note; a non-scheme refund stays unmarked and is skipped', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true, { [COUNT]: '0', [THRESHOLD]: '10' })
+  // (1) a stamp that never recorded a posting type: nothing is priceable, every snapshot field is null.
+  const noType = await seed(deps, { stamp: 'IOSS', schemeRate: true, noType: true })
+  // (2) an UNSTAMPED order classified a scheme order on the rates' scheme mapping.
+  const unstamped = await seed(deps, { stamp: null, schemeRate: true })
+  // (3) an order outside the scheme.
+  const outside = await seed(deps, { stamp: 'none', schemeRate: false })
+  t.after(async () => { await restore(); for (const f of [noType, unstamped, outside]) await cleanup(deps.db, f) })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  const { retryRefundAccounting } = await import('../../app/actions/sales.ts')
+  const create = async (fx: Fixture) => {
+    const result = await deps.createRefund(fx.orderId, [itemised(fx.goods, 'Widget', 100, 19)], 'r', undefined, { internalBypassToken: deps.bypass, externalRefundId: wooRefundId() })
+    assert.equal(result.success, true, result.error)
+    return (await deps.db.salesOrderRefund.findFirst({ where: { orderId: fx.orderId }, select: { id: true, schemeTreatedAt: true, statedGrossForeign: true, lines: { select: { postingTaxType: true, schemeTaxRateValue: true } } } }))!
+  }
+  for (const fx of [noType, unstamped]) {
+    const refund = await create(fx)
+    assert.ok(refund.schemeTreatedAt, 'the decision is recorded')
+    assert.deepEqual(refund.lines.map((l) => l.postingTaxType), [null], 'the posting type could not be filled (the stamp never recorded one)')
+    // The first hand-off queued the refused hand-post row; lose it, turn the switch OFF, retry.
+    await deps.db.accountingSyncLog.deleteMany({ where: { type: 'CREDIT_NOTE', referenceId: refund.id } })
+    await deps.db.salesOrderRefund.update({ where: { id: refund.id }, data: { accountingRetryRequired: true } })
+    await deps.db.setting.upsert({ where: { key: 'xero_sync_sales_invoice' }, create: { key: 'xero_sync_sales_invoice', value: 'off' }, update: { value: 'off' } })
+    await retryRefundAccounting(refund.id)
+    const row = await creditNoteRowOf(deps.db, refund.id)
+    assert.ok(row && EU_VAT_CREDIT_NOTE_REFUSED_KEY in row, 'the refused hand_post row, not an ordinary credit note')
+    assert.deepEqual(row.lines, [])
+    await deps.db.setting.update({ where: { key: 'xero_sync_sales_invoice' }, data: { value: 'draft' } })
+  }
+  // A non-scheme refund: unmarked, and with the switch off it is built exactly as before.
+  const plain = await create(outside)
+  assert.equal(plain.schemeTreatedAt, null)
+  await deps.db.accountingSyncLog.deleteMany({ where: { type: 'CREDIT_NOTE', referenceId: plain.id } })
+  await deps.db.salesOrderRefund.update({ where: { id: plain.id }, data: { accountingRetryRequired: true } })
+  await deps.db.setting.update({ where: { key: 'xero_sync_sales_invoice' }, data: { value: 'off' } })
+  await retryRefundAccounting(plain.id)
+  const ordinary = await creditNoteRowOf(deps.db, plain.id)
+  assert.ok(ordinary && !(EU_VAT_CREDIT_NOTE_REFUSED_KEY in ordinary) && !('_euVatTreatment' in ordinary), 'an ordinary credit note, untouched')
+})

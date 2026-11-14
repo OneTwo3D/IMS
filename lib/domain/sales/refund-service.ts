@@ -18,6 +18,7 @@ import {
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
 import { eas182RefundFigures } from '@/lib/domain/accounting/eu-vat-credit-note'
+import { unstampedOrderIsScheme } from '@/lib/domain/sales/eu-vat-scheme-evidence'
 import { priorRefundedTax } from '@/lib/domain/sales/refund-182-prior-tax'
 import { addMoney, currencyMinorUnits, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
@@ -4848,6 +4849,13 @@ export async function createSalesOrderRefund(
     const accountingStagingFollows = Boolean(so.revenueDeferredDate && input.accountingSettings)
     // Under the order lock this transaction holds: the stamp it reads cannot change before the lines are written. Not read at all unless the caller says the switch is on.
     const schemeSnapshot = input.euVatSchemeSnapshot === true ? await resolveSchemePostingSnapshot(tx, input.orderId) : null
+    // THE SCHEME DECISION, RECORDED EXPLICITLY: whenever the refund is created under the scheme path (the switch is on and the order is scheme-stamped, or it is unstamped and classified a scheme order on immutable evidence), regardless of whether any pricing field below could be filled, so a later switch-off
+    // cannot make the refund look ordinary. Never written with the switch off (`euVatSchemeSnapshot` unset) or for an order outside the scheme.
+    let schemeTreated = schemeSnapshot?.scheme === true
+    if (input.euVatSchemeSnapshot === true && !schemeTreated) {
+      const stamp = await tx.salesOrder.findUnique({ where: { id: input.orderId }, select: { euVatRegimeStampedAt: true } })
+      if (stamp !== null && stamp.euVatRegimeStampedAt === null) schemeTreated = await unstampedOrderIsScheme(tx, input.orderId)
+    }
     // SCHEME REFUNDS FREEZE THEIR PRICING HERE, under the order lock: each line's VAT rate (the rate of the code it is priced under) and the gross the refund comes to. The credit note is built from these only, never from a TaxRate read later,
     // so an accounting retry after a rate changed posts what this refund was. The gross is the source's own figure when it states one, else the lines' unrounded totals with their tax, rounded once.
     let frozenRates: Array<string | null> | null = null
@@ -4909,6 +4917,7 @@ export async function createSalesOrderRefund(
         // by a default and never minted for it by the database.
         reversalStagingState: REVERSAL_STAGING_NOT_STAGED,
         ...(schemeSnapshot?.scheme === true && frozenGross !== null ? { statedGrossForeign: frozenGross } : {}),
+        ...(schemeTreated ? { schemeTreatedAt: new Date() } : {}),
         ...(schemeSnapshot?.scheme === true && input.eas182StatedTaxForeign != null && Number.isFinite(input.eas182StatedTaxForeign) ? { eas182StatedTaxForeign: input.eas182StatedTaxForeign } : {}),
       },
       select: { id: true },

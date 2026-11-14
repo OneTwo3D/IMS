@@ -280,3 +280,18 @@ test('[refund 182 persisted] a refund recorded under the scheme treatment keeps 
   const other = await treatCreditNotePayload({ refundId: r182.refundId, orderId: fx.orderId, payload: r182.payload, refundLineIds: r182.lineIds, connector: 'quickbooks', accounts: ACCOUNTS, now: new Date(), enqueueHeldRow: (async () => ({ queued: true })) as never })
   assert.equal(other.kind === 'refused' && other.code, 'hand_post')
 })
+
+test('[refund 182 persisted] scheme_treated_at alone (every snapshot field null) is a persisted scheme decision: with the switch OFF the credit note is refused as hand_post, never skipped; without it the same refund is skipped', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, false, { [COUNT]: '0', [THRESHOLD]: '10' })
+  const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx) })
+  const bare = await eas182Refund(deps, fx, { net: '100', stated: '0', tax: '0', rate: null, eas: false, withStated: false })
+  await deps.db.salesOrderRefundLine.updateMany({ where: { refundId: bare.refundId }, data: { postingTaxType: null } })
+  const { treatCreditNotePayload } = await import('../../lib/domain/sales/eu-vat-credit-note-treatment.ts')
+  const run = () => treatCreditNotePayload({ refundId: bare.refundId, orderId: fx.orderId, payload: bare.payload, refundLineIds: bare.lineIds, connector: 'xero', accounts: ACCOUNTS, now: new Date(), enqueueHeldRow: (async () => ({ queued: true })) as never })
+  assert.deepEqual(await run(), { kind: 'skipped', why: 'switch_off' }, 'no marker and no snapshot field: skipped as before')
+  await deps.db.$executeRaw`UPDATE sales_order_refunds SET scheme_treated_at = now() WHERE id = ${bare.refundId}`
+  const marked = await run()
+  assert.equal(marked.kind === 'refused' && marked.code, 'hand_post', 'the explicit marker is never skipped')
+})
