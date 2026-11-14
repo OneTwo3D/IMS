@@ -208,7 +208,7 @@ function refusalDescription(
   if (isWcBlockedImportReason(reason)) {
     return `${detail} The order was NOT imported, and the sync will not move past it unrecorded: this row is `
       + 'its record. Fix the cause (for a tax rate, map it on the Tax Rates tab); '
-      + 'the row is re-checked by order id every 15 minutes and the order imports itself once the guard passes.'
+      + 'the row is re-checked by order id (up to 50 orders every 15 minutes) and the order imports itself once the guard passes.'
   }
   if (reason === 'currency_missing') {
     // Quotes the raw value rather than describing it, because "blank" and "absent" are different

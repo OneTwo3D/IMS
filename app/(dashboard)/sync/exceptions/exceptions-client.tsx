@@ -1444,7 +1444,7 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`WooCommerce orders — blocked from import (${data.summary.blockedWcOrders})`}
-            detail="A safety check refused to import these WooCommerce orders (for example a line would be taxed at the order's default rate because its WooCommerce tax rate is not mapped, or a coupon does not reconcile with the order total). IMS does not import them in a degraded way, and it does not forget them: each order is re-checked by order id every 15 minutes and imports itself as soon as the cause is fixed. Fix the cause (for a tax rate, map it on the Tax Rates tab); there is nothing to acknowledge here, the row clears when the order imports."
+            detail="A safety check refused to import these WooCommerce orders (for example a line would be taxed at the order's default rate because its WooCommerce tax rate is not mapped, or a coupon does not reconcile with the order total). IMS does not import them in a degraded way, and it does not forget them: each order is re-checked by order id (up to 50 orders every 15 minutes) and imports itself as soon as the cause is fixed. Fix the cause (for a tax rate, map it on the Tax Rates tab); there is nothing to acknowledge here, the row clears when the order imports."
             shown={data.blockedWcOrders.length}
             total={data.summary.blockedWcOrders}
           />
