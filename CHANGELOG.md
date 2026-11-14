@@ -16,6 +16,21 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 - **Now an operator answers per line.** **Sync > Exceptions > "Gift card or not? Order lines the store could not settle"** lists the held orders and the lines the refusal named; **Gift card** or **Not a gift card** records the answer with who and when (sync permission, fresh sign-in; the history is in the activity log). The regime builder uses the answer for that line only where the store left it unsettled: a flagged `yes`/`no` is never overridden, and an unanswered line keeps refusing (no default). Re-import the order afterwards and its held invoice is released.
 - The refusal now says where to answer, and the parked refusal records the line ids. Migration: one new table, `eu_vat_gift_card_line_resolutions` (additive). Not done on purpose: no automatic "not a gift card" rule from the product, because IMS holds no gift-card marker on products to prove it.
 
+## 4.1.1 - 2026-11-14
+
+### Fixed: the WooCommerce order sweep could not commit
+
+- **Every clean order-sweep commit failed** with `Failed to deserialize column of type 'void'`: the commit took its per-cursor advisory lock with `$queryRaw`, and `pg_advisory_xact_lock` returns `void`, which Prisma cannot read back. It now uses `$executeRaw`, as every other advisory lock in IMS does. Seen on stage after 4.1.0; nothing was lost (the sweep re-reads its window), but the cursor and the liveness stamp did not advance. Unit tests mocked the call, so a source test now forbids `$queryRaw` for any `pg_advisory*` lock call.
+
+## 4.1.0 - 2026-11-14
+
+Numbered 4.1.0 (not 5.0.0): nothing in this release needs an operator action on upgrade. The additive migrations apply with the normal deploy, the new Sync > Exceptions sections are things to watch, and the EU VAT credit-note work is built and switched off.
+
+### Ops notes
+
+- **Cron heartbeats can now go red on a real failure.** A cron route that genuinely failed used to answer HTTP 200, so its Healthchecks heartbeat stayed green. It now answers 500, and the crontab wrapper's `curl -sf` reports the job as failed. Nothing has to be changed for this to work; expect that a heartbeat which was silently green over a failing job may turn red after the deploy, and treat that as a real failure to look at. A stage installation with no outbound grant stays green by design (held writes answer 200).
+- **Watch Sync > Exceptions** for the new "WooCommerce orders — blocked from import" section: it lists orders that need a cause fixed, such as an unmapped tax rate.
+
 ### WooCommerce: orders blocked by a guard are recorded, so the initial import cannot strand them
 
 - **Fixed: the initial order import could complete over orders it had refused, and those orders were never imported.** An order blocked by the tax-rate fallback guard (a line would use the order default tax rate because its WooCommerce rate is not mapped) or by the coupon guard was counted as a per-order error and outvoted by the orders that did import. The pass stamped `wc_initial_import_completed` and moved `last_wc_order_sync_at` to now, so the `modified_after` sweep started after the blocked orders and they were only ever imported if someone changed them in WooCommerce. (Seen on stage: 12 imported, 265 blocked, outcome complete.)
@@ -63,7 +78,7 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 - **The invoice treatment now honours the stamp's recorded posting type** (a rate mapping moved to another zero-rated type after the order was stamped refuses the invoice instead of posting it on a type a credit note would not reverse), and an unstamped order is recognised as a scheme order by an IMS-queued treated invoice before the rates' current mapping (accepted limit for pre-cut-over orders documented in the help).
 - **Added: the posting type and the stated gross are snapshotted** on the refund (additive migrations `20261113090000_refund_scheme_posting_snapshot` and `20261113100000_refund_line_scheme_tax_rate_value`: nullable `posting_tax_type` and `scheme_tax_rate_value` on refund lines and `stated_gross_foreign` on refunds; every scheme refund freezes its line rates and its gross at creation, so a retry never re-prices from a changed rate), only while the switch is on and the order is on a scheme.
 - **The poster re-checks the recorded regime policy and the zero-rated type** for a treated credit note before it claims the row and as the last step before the request leaves (`pushCreditNote` now takes the same pre-socket authorization as an invoice); a difference refuses with a working instruction (restore the setting and retry on /sync, or post by hand and settle).
-- **Unchanged while the Sales Invoices switch is off:** nothing is read, snapshotted or rewritten and the credit-note payload is byte-identical (a golden test compares it with origin/development). Nothing is switched on by this change.
+- **Unchanged while the Sales Invoices switch is off, for new refunds:** a refund created with the switch off is not snapshotted or treated, and its credit-note payload is byte-identical (a golden test compares it with origin/development). A refund already recorded under the scheme keeps its treatment, or its refusal, even if the switch is turned off later. Nothing is switched on by this change.
 
 ### EU IOSS credit notes: rate-182 refund VAT posts to the stamped account, the first 10 held (built and switched off: behind the Sales Invoices switch)
 
@@ -71,7 +86,7 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 - **Added: the first N such credit notes are held** (owner ruling 2026-11-09). While `eu_vat_refund182_held_count` is below `eu_vat_refund182_hold_threshold` (default 10), the credit note is queued as a refused row that is never sent, with wording to check it in Xero and settle it on /sync; the count is taken under a row lock, and the refused row, the count and the held stamp commit together (no stamp or count without the row), so concurrent refunds cannot exceed the threshold and a retry never counts a refund twice. A held credit note stays held on every later retry whatever the switch says. The VAT bound is on the aggregate across the order's refunds with one fixed rounding allowance (`lib/domain/sales/refund-182-hold.ts`). Later ones post normally.
 - **Added: two nullable columns on refunds** (additive migration `20261113110000_refund_eas182_hold`): `eas182_stated_tax_foreign` and `eas182_held_at`, written only for a rate-182 refund while the switch is on.
 - **Added: `scheme_treated_at` on refunds** (additive migration `20261113130000_refund_scheme_treated_at`): written under the order lock whenever a refund is created under the scheme path (switch on and the order scheme-stamped, or an unstamped order classified a scheme order on immutable evidence), whether or not any pricing field could be filled. A persisted scheme decision outranks the Sales Invoices switch: a credit note for such a refund (or one carrying any scheme snapshot field) is scheme-treated or a refused settle-by-hand row, never an ordinary credit note. Residual: a refund created before this column with every snapshot field null carries no evidence and is still skipped on a switch-off (none that matter exist).
-- **Unchanged while the Sales Invoices switch is off:** nothing is read, written or counted and the refund sync treats rate 182 exactly as before (golden tests).
+- **Unchanged while the Sales Invoices switch is off, for new refunds:** the refund sync treats rate 182 exactly as before (golden tests), and nothing is counted. A rate-182 refund already held keeps its hold even if the switch is turned off later.
 
 ## 4.0.0 - 2026-11-13
 
