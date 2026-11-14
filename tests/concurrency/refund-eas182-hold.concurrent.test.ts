@@ -205,24 +205,24 @@ test('[refund 182 hold] a refund whose VAT is over the order\'s VAT not already 
   const fx2 = await seed(deps, { stamp: 'IOSS', schemeRate: true })
   t.after(async () => { await restore(); await cleanup(deps.db, fx); await cleanup(deps.db, fx2) })
   await seedXeroList(deps.db, { TAX131: '0.000000' })
-  // The stated gross and the stated tax disagree beyond rounding: refused (the total check).
-  const mismatch = await refund182(deps, fx, { gross: 125, statedTax: 19 })
-  assert.equal(mismatch.payload, null, 'nothing queued')
-  assert.equal(mismatch.refund.accountingRetryRequired, true, 'the obligation stays unmet')
-  const refusal = await deps.db.activityLog.findFirst({ where: { entityId: fx.orderId, action: 'refund_credit_note_eu_vat_refused' }, select: { description: true } })
-  assert.match(refusal?.description ?? '', /tax it states across its tax rates is 19/)
-  // An earlier refund took 25 of the order's 25.46 VAT (re-priced by the plugin); a second one asking 6.46 is over what is left.
-  const first = await refund182(deps, fx2, { gross: 125, statedTax: 25, net: 100, tax: 19 })
-  assert.equal(first.result.success, true, first.result.error)
-  assert.ok(first.payload && !(EU_VAT_CREDIT_NOTE_REFUSED_KEY in first.payload), 'the first posts (count at the threshold)')
-  const over = await refund182(deps, fx2, { net: 34, tax: 6.46 })
-  const overRefunds = await deps.db.salesOrderRefund.findMany({ where: { orderId: fx2.orderId }, select: { id: true } })
-  assert.equal(overRefunds.length >= 2, true)
-  const overRow = await deps.db.accountingSyncLog.count({ where: { type: 'CREDIT_NOTE', referenceId: over.refund.id } })
-  assert.equal(overRow, 0, 'nothing queued for the over-bound refund')
-  assert.equal(over.refund.accountingRetryRequired, true)
-  const overActivity = await deps.db.activityLog.findFirst({ where: { entityId: fx2.orderId, action: 'refund_credit_note_eu_vat_refused', description: { contains: 'not already refunded' } }, select: { description: true } })
-  assert.ok(overActivity, 'the refusal says the VAT is over what is left to refund')
+  // The stated gross and the stated tax disagree beyond rounding: refused by the writer's rate-182 check, nothing recorded.
+  const lines = (net: number, tax: number) => [itemised(fx.goods, 'Widget', net, tax)]
+  const internal = (gross: number, statedTax: number) => ({ internalBypassToken: deps.bypass, externalRefundId: wooRefundId(), statedGrossForeign: gross, eas182StatedTaxForeign: statedTax })
+  const mismatch = await deps.createRefund(fx.orderId, lines(100, 19), 'mismatch', undefined, internal(125, 19))
+  assert.equal(mismatch.success, false)
+  assert.match(mismatch.error ?? '', /tax it states across its tax rates is 19/)
+  assert.equal((await deps.db.salesOrderRefund.count({ where: { orderId: fx.orderId } })), 0, 'nothing recorded')
+  // The tax the lines state and the tax the refund states in all disagree: refused.
+  const lineMismatch = await deps.createRefund(fx.orderId, lines(100, 19), 'line mismatch', undefined, internal(125, 25))
+  assert.equal(lineMismatch.success, false)
+  assert.match(lineMismatch.error ?? '', /does not match the VAT the refund states in all/)
+  // An earlier refund took 25 of the order's 25.46 VAT (re-priced by the plugin, so the line states 25); a second one asking 6.46 is over what is left.
+  const first = await deps.createRefund(fx2.orderId, lines(100, 25), 'first', undefined, internal(125, 25))
+  assert.equal(first.success, true, first.error)
+  const over = await deps.createRefund(fx2.orderId, lines(34, 6.46), 'over', undefined, internal(40.46, 6.46))
+  assert.equal(over.success, false)
+  assert.match(over.error ?? '', /more than the order's collected VAT not already refunded/)
+  assert.equal((await deps.db.salesOrderRefund.count({ where: { orderId: fx2.orderId } })), 1, 'only the first is recorded')
   assert.equal(await heldCount(deps.db), '10', 'a refusal is not counted')
 })
 
