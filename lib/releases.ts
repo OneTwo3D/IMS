@@ -14,6 +14,26 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
+    version: '4.1.0',
+    date: '2026-11-14',
+    title: 'Blocked WooCommerce orders recorded, cron failures reach Healthchecks, EU VAT credit notes built and switched off',
+    summary: 'Nothing in 4.1.0 needs an operator action on upgrade. Orders the WooCommerce import refuses are now recorded and listed under Sync > Exceptions instead of being lost, the order sweep copes with a store that does not have the withdrawal plugin active, and cron routes now answer a failure with HTTP 500, so a Healthchecks heartbeat can go red on a real failure that used to stay green. The EU VAT credit-note treatment and the hold on the first rate-182 credit notes are built and switched off behind the Sales Invoices switch.',
+    userMessage: 'IMS 4.1 records WooCommerce orders that the import blocks (for example an unmapped tax rate) and lists them under Sync > Exceptions with the reason, so they are no longer missed. The order sweep also keeps working when the store does not have the EU withdrawal plugin active.',
+    userHighlights: [
+      'WooCommerce: an order blocked by the tax-rate or coupon guard is recorded and listed under Sync > Exceptions as "WooCommerce orders: blocked from import", with the order number, the reason and what to fix. Once the cause is fixed the order is imported automatically.',
+      'WooCommerce: the initial import no longer completes silently over orders it refused; the progress card shows the blocked count.',
+      'WooCommerce: the order poll and reconciliation skip an EU withdrawal status the store has not registered, with a warning in the activity log, instead of failing the whole run.',
+      'Data retention no longer deletes a refused or blocked order that is still waiting to be imported.',
+    ],
+    technicalHighlights: [
+      'Ops note: every route under app/api/cron/ now answers 500 when its run genuinely failed (ok, skipped and held answer 200). Healthchecks heartbeats can turn red on real failures that were silently green before; nothing needs to be changed, and a stage installation with no outbound grant stays green by design.',
+      'Cron failure mapping lives in lib/ops/cron-outcomes.ts, one entry per route, with a census test that fails CI when a new failure-like field in a producer is not mapped or justified.',
+      'Migrations (additive, nullable, no backfill): refund_scheme_posting_snapshot, refund_line_scheme_tax_rate_value, refund_eas182_hold and refund_scheme_treated_at.',
+      'CI: every workflow job is pinned to ubuntu-24.04.',
+      'Built, switched off: the EU IOSS / VOEC / DDP credit-note treatment, and the hold of the first 10 rate-182 refund credit notes, both behind the Sales Invoices switch (nothing is read, written or counted while the switch is off).',
+    ],
+  },
+  {
     version: '4.0.0',
     date: '2026-11-13',
     title: 'Xero supplier-document tax checks, merged Mintsoft order handling, report export notices, EU VAT invoice treatment built and switched off',

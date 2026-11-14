@@ -10,6 +10,15 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+## 4.1.0 - 2026-11-14
+
+Numbered 4.1.0 (not 5.0.0): nothing in this release needs an operator action on upgrade. The additive migrations apply with the normal deploy, the new Sync > Exceptions sections are things to watch, and the EU VAT credit-note work is built and switched off.
+
+### Ops notes
+
+- **Cron heartbeats can now go red on a real failure.** A cron route that genuinely failed used to answer HTTP 200, so its Healthchecks heartbeat stayed green. It now answers 500, and the crontab wrapper's `curl -sf` reports the job as failed. Nothing has to be changed for this to work; expect that a heartbeat which was silently green over a failing job may turn red after the deploy, and treat that as a real failure to look at. A stage installation with no outbound grant stays green by design (held writes answer 200).
+- **Watch Sync > Exceptions** for the new "WooCommerce orders — blocked from import" section: it lists orders that need a cause fixed, such as an unmapped tax rate.
+
 ### WooCommerce: orders blocked by a guard are recorded, so the initial import cannot strand them
 
 - **Fixed: the initial order import could complete over orders it had refused, and those orders were never imported.** An order blocked by the tax-rate fallback guard (a line would use the order default tax rate because its WooCommerce rate is not mapped) or by the coupon guard was counted as a per-order error and outvoted by the orders that did import. The pass stamped `wc_initial_import_completed` and moved `last_wc_order_sync_at` to now, so the `modified_after` sweep started after the blocked orders and they were only ever imported if someone changed them in WooCommerce. (Seen on stage: 12 imported, 265 blocked, outcome complete.)
