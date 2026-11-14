@@ -10,6 +10,12 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### WooCommerce webhooks no longer move the sweep cursor (backend / sync)
+
+- **Fixed: a delivered webhook could hide an older missed order or product from the sweep for good.** In poll mode every admitted order webhook stamped `last_wc_order_sync_at` to now, and every successful product webhook stamped `last_wc_product_sync_at` to now. If order A changed and its webhook was missed, then order B's webhook arrived, the cursor jumped past A and the next sweep asked WooCommerce for changes after it, so A was never read. The sweep now owns both cursors: only a sweep that ended cleanly on an empty page writes them (read-start less 120 seconds, never backwards). A webhook writes its own stamps instead, `wc_order_webhook_last_processed_at` and `wc_product_webhook_last_processed_at`, which nothing reads as a sweep position.
+- Nothing else depended on the webhook moving the cursor: the read-sync liveness stamp, the refusal watermark and the withdrawal-recovery marker are separate settings, and webhook-primary mode keys off `wc_*_webhook_last_received_at` and the reconcile cursors. One visible effect: after a long webhook-primary spell, the first poll sweep reads from its own last position instead of from the last webhook, so it re-reads the gap (idempotent; bounded by the page-walk ceiling). The Sync page's "Last order intake" / "Last product intake" now show the last sweep position rather than the last webhook.
+- Both new keys are cleared by the operator reset and are machine-managed (not writable from the settings form). No migration.
+
 ### WooCommerce pull cursors are taken at read start, not at commit (backend / sync)
 
 - **Fixed: an order modified while a sweep was finishing could be skipped for good.** The order sweep stamped its `modified_after` cursor with the time it COMMITTED, after the final empty-page read. An order changed between that read and the stamp was never read by the run yet sat behind the next sweep's window, and with its webhook missed it was never processed. Every WooCommerce pull cursor (order poll and reconcile, product poll and reconcile, the initial import's completion stamp) is now the time the run STARTED, before its first WooCommerce read, less a 120 second overlap (`WC_PULL_CURSOR_OVERLAP_MS`, covering second-precision `date_modified` and clock skew between the IMS and WooCommerce hosts). Re-reading the overlap is safe: order import updates an order it already holds and product sync upserts by SKU.

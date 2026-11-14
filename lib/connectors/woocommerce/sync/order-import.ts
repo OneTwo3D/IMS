@@ -4419,7 +4419,7 @@ function wcCursorWithdrawalDroppedKey(cursorKey: string): string {
  * order was never wanted — and it was the hole under round 3's acknowledged admission refusals.
  *
  * A refusal correctly does not advance the cursor, but the cursor is advanced by everything ELSE:
- * the very next admitted delivery calls `advanceWcOrderSyncCursor()` and stamps it at `now`. The
+ * the very next admitted delivery used to stamp it at `now` (webhooks no longer touch it). The
  * refused order's `date_modified` is now BEHIND the cursor. While its status stays excluded that
  * is exactly right. The moment the operator TICKS that status, though, nothing brings it back:
  * WooCommerce fires no webhook for a setting IMS changed, and the sweep will not reach back past
@@ -4819,9 +4819,8 @@ export async function syncNewWcOrders(
     // NOTHING unless both are what this run read at its start. A superseded run costs one
     // re-fetch next time; it never writes a stale fact.
     //
-    // The CURSOR VALUE is deliberately not compared: order and refund webhooks advance it
-    // (advanceWcOrderSyncCursor) on their own, and comparing it would make nearly every sweep look
-    // superseded. The fingerprint and the marker are never excluded: a concurrent sweep that narrowed
+    // The CURSOR VALUE is deliberately not compared: a concurrent sweep advances it, and comparing it
+    // would make nearly every overlap look superseded (webhooks never write it). The fingerprint and the marker are never excluded: a concurrent sweep that narrowed
     // the list or set/cleared the marker is always caught by them.
     const committed = await db.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${cursorKey}))`
@@ -4831,7 +4830,7 @@ export async function syncNewWcOrders(
         valueOf(cursorStatusesKey) !== (cursorStatusesSetting?.value ?? null)
         || valueOf(droppedSinceKey) !== (droppedSinceSetting?.value ?? null)
       ) return false
-      // READ-START cursor, never commit time, and never behind what is stored (webhooks advance it too).
+      // READ-START cursor, never commit time, and never behind what is stored (only sweeps write it).
       // A rewind (selection widening, refusal watermark) lowers only where THIS run read from.
       await advancePullCursor(tx, cursorKey, cursorCandidate)
       // Written WITH the cursor, in one transaction: a cursor and the selection it was earned
@@ -4858,9 +4857,8 @@ export async function syncNewWcOrders(
       // The sweep's LAST-SUCCESS stamp (read-sync liveness), in the SAME transaction as the cursor: it
       // exists only because this branch is reached - the walk ended on an empty page with no error -
       // so a sweep that failed, or ran out of ceiling, or fetched nothing because of an error, can
-      // never advance it. It is separate from the cursor on purpose: an admitted webhook delivery
-      // also advances `last_wc_order_sync_at` (advanceWcOrderSyncCursor), so the cursor cannot say
-      // whether the SWEEP is alive. A clean sweep that found no new orders reaches here and counts.
+      // never advance it. It is a separate stamp from the cursor so liveness is an explicit fact, not
+      // inferred from a value that rewinds and is held on errors. A clean sweep that found no new orders reaches here and counts.
       await tx.setting.upsert({
         where: { key: WC_ORDER_SWEEP_LAST_SUCCESS_SETTING },
         create: { key: WC_ORDER_SWEEP_LAST_SUCCESS_SETTING, value: now },

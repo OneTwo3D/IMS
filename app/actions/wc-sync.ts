@@ -114,6 +114,8 @@ const MACHINE_MANAGED_SYNC_KEYS = new Set<string>([
   'wc_webhook_last_received_at',
   'wc_order_webhook_last_received_at',
   'wc_product_webhook_last_received_at',
+  'wc_order_webhook_last_processed_at',
+  'wc_product_webhook_last_processed_at',
   'last_wc_order_sync_at',
   'last_wc_order_reconcile_at',
   'last_wc_product_sync_at',

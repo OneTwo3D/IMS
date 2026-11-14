@@ -236,7 +236,7 @@ test('the refusal is ACKNOWLEDGED and does NOT advance the order cursor', async 
   assert.ok(response.status < 400, `expected an ACK, got ${response.status}`)
   // ...but this delivery imported nothing, so it must not stand in for the poll sweep's progress.
   assert.equal(
-    settingUpserts.includes('last_wc_order_sync_at'),
+    settingUpserts.includes('wc_order_webhook_last_processed_at'),
     false,
     'a skipped delivery is not sync progress',
   )
@@ -276,11 +276,14 @@ test('the gate DISCRIMINATES — the selected status imports, the unselected one
 
   await pushOrder(wcOrder(105, 'pending'))
   assert.deepEqual(imported, [], 'unselected')
-  assert.equal(settingUpserts.includes('last_wc_order_sync_at'), false, 'a skip is not sync progress')
+  assert.equal(settingUpserts.includes('wc_order_webhook_last_processed_at'), false, 'a skip is not sync progress')
 
   await pushOrder(wcOrder(115, 'processing'))
   assert.deepEqual(imported, [115], 'selected')
-  assert.equal(settingUpserts.includes('last_wc_order_sync_at'), true, 'a real import advances the cursor')
+  assert.equal(settingUpserts.includes('wc_order_webhook_last_processed_at'), true, 'a real import records the webhook\'s own processed stamp')
+  // ...and never the SWEEP's cursor: stamping it to now would move it past an older order whose own
+  // webhook was missed, and the next sweep would never read that order.
+  assert.equal(settingUpserts.includes('last_wc_order_sync_at'), false, 'a delivery does not touch the sweep cursor')
 })
 
 test('the gate keys on WHETHER IMS HOLDS THE ORDER, not on the status alone', async () => {

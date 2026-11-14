@@ -1195,7 +1195,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                 <span className="text-xs text-muted-foreground">Complete initial import first</span>
               )}
               {s.last_wc_order_sync_at && (
-                <span className="text-xs text-muted-foreground">Last order intake: {formatDateTime(s.last_wc_order_sync_at)}</span>
+                <span className="text-xs text-muted-foreground">Last order sweep position: {formatDateTime(s.last_wc_order_sync_at)}</span>
               )}
               {s.last_wc_order_reconcile_at && (
                 <span className="text-xs text-muted-foreground">Last reconcile: {formatDateTime(s.last_wc_order_reconcile_at)}</span>
@@ -1259,7 +1259,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                   <p className="text-xs text-muted-foreground">Primary product polling is disabled — products are updated via webhook (last received: {formatDateTime(s.wc_product_webhook_last_received_at)}). Cron only runs backup reconciliation.</p>
                 )}
                 {s.last_wc_product_sync_at && (
-                  <p className="text-xs text-muted-foreground">Last product intake: {formatDateTime(s.last_wc_product_sync_at)}</p>
+                  <p className="text-xs text-muted-foreground">Last product sweep position: {formatDateTime(s.last_wc_product_sync_at)}</p>
                 )}
                 {s.last_wc_product_reconcile_at && (
                   <p className="text-xs text-muted-foreground">Last product reconcile: {formatDateTime(s.last_wc_product_reconcile_at)}</p>
