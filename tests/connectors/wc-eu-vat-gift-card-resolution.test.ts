@@ -1,11 +1,17 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { mock } from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
 import { resolveEuVatRegime } from '@/lib/domain/accounting/eu-vat-regime'
-import { buildEuVatRegimeInput, readGoodsLines, type EuVatRegimeInputClient } from '@/lib/connectors/woocommerce/sync/eu-vat-facts'
-import { applyGiftCardLineResolutions } from '@/lib/connectors/woocommerce/sync/gift-card-line-resolution'
+import type { EuVatRegimeInputClient } from '@/lib/connectors/woocommerce/sync/eu-vat-facts'
 import type { WcFullOrder, WcMeta } from '@/lib/connectors/woocommerce/sync/types'
+
+// The store configured now: the answers are bound to it. A test changes it to play a store rebind.
+let configuredUrl = 'https://store-a.example/'
+mock.module('@/lib/settings-store', { namedExports: { getSettingValues: async () => new Map([['wc_url', configuredUrl]]), getSettingValue: async () => null } })
+const facts = () => import('@/lib/connectors/woocommerce/sync/eu-vat-facts')
+const resolution = () => import('@/lib/connectors/woocommerce/sync/gift-card-line-resolution')
+const STORE_A = 'https://store-a.example'
 
 const meta = (key: string, value: unknown): WcMeta => ({ id: 1, key, value })
 const CUT_IN = { state: 'ok' as const, at: new Date('2026-10-01T00:00:00Z') }
@@ -21,7 +27,7 @@ function order(lines: Array<{ id: number; flag?: unknown }>): WcFullOrder {
   } as unknown as WcFullOrder
 }
 
-function client(answers: Array<{ externalLineItemId: number; isGiftCard: boolean }> | null): EuVatRegimeInputClient {
+function client(answers: Array<{ externalLineItemId: number; isGiftCard: boolean; storeIdentity?: string }> | null): EuVatRegimeInputClient {
   const fetchedAt = new Date('2026-10-31T12:00:00Z')
   const asked: unknown[] = []
   const base = {
@@ -29,12 +35,12 @@ function client(answers: Array<{ externalLineItemId: number; isGiftCard: boolean
     fxRate: { groupBy: (async () => [{ toCurrency: 'EUR', _max: { fetchedAt } }]) as never, findMany: (async () => []) as never },
     setting: { findMany: (async () => []) as never },
   }
-  return (answers === null ? base : { ...base, euVatGiftCardLineResolution: { findMany: (async (args: unknown) => { asked.push(args); return answers }) as never } }) as unknown as EuVatRegimeInputClient
+  return (answers === null ? base : { ...base, euVatGiftCardLineResolution: { findMany: (async (args: { where: { storeIdentity: string; externalOrderId: string } }) => { asked.push(args); return answers.filter((a) => (a.storeIdentity ?? STORE_A) === args.where.storeIdentity) }) as never } }) as unknown as EuVatRegimeInputClient
 }
-const decision = async (c: EuVatRegimeInputClient, o: WcFullOrder) => resolveEuVatRegime(await buildEuVatRegimeInput(c, o, ACCOUNTS, { baseCurrency: 'EUR', mode: 'decide', giftCardCutIn: CUT_IN })) as { kind: string; code?: string; giftCardLineIds?: number[] }
+const decision = async (c: EuVatRegimeInputClient, o: WcFullOrder) => resolveEuVatRegime(await (await facts()).buildEuVatRegimeInput(c, o, ACCOUNTS, { baseCurrency: 'EUR', mode: 'decide', giftCardCutIn: CUT_IN })) as { kind: string; code?: string; giftCardLineIds?: number[] }
 
-test('a goods line carries the store id of its order line', () => {
-  assert.deepEqual(readGoodsLines(order([{ id: 11, flag: 'no' }, { id: 12 }])).map((l) => l.lineId), [11, 12])
+test('a goods line carries the store id of its order line', async () => {
+  assert.deepEqual((await facts()).readGoodsLines(order([{ id: 11, flag: 'no' }, { id: 12 }])).map((l) => l.lineId), [11, 12])
 })
 
 test('an unsettled line refuses with the store ids of the lines to answer for, and only those', async () => {
@@ -62,8 +68,9 @@ test('an answer for one line does not settle another', async () => {
   assert.deepEqual(d.giftCardLineIds, [13])
 })
 
-test('an answer never overrides a flag the store did settle', () => {
-  const lines = readGoodsLines(order([{ id: 11, flag: 'yes' }, { id: 12, flag: 'no' }, { id: 13, flag: 'unknown' }]))
+test('an answer never overrides a flag the store did settle', async () => {
+  const { applyGiftCardLineResolutions } = await resolution()
+  const lines = (await facts()).readGoodsLines(order([{ id: 11, flag: 'yes' }, { id: 12, flag: 'no' }, { id: 13, flag: 'unknown' }]))
   const applied = applyGiftCardLineResolutions(lines, new Map([[11, false], [12, true], [13, true]]))
   assert.deepEqual(applied.map((l) => l.voucherStrict), ['yes', 'no', 'yes'])
   assert.deepEqual(applied.map((l) => l.voucher), ['yes', 'no', 'yes'])
@@ -77,4 +84,29 @@ test('the answer table is read only for an order with an unsettled line', async 
   assert.equal(reads, 0)
   await decision(counted, order([{ id: 11, flag: 'no' }, { id: 12 }]))
   assert.equal(reads, 1)
+})
+
+test('an answer given for store A is not applied to store B\u2019s identical order and line ids; it applies again under store A', async () => {
+  const o = order([{ id: 11, flag: 'no' }, { id: 12, flag: 'unknown' }])
+  const answers = [{ externalLineItemId: 12, isGiftCard: false, storeIdentity: STORE_A }]
+  configuredUrl = 'https://store-a.example/'
+  assert.notEqual((await decision(client(answers), o)).code, 'gift_card_flag_missing')
+  configuredUrl = 'https://store-b.example/'
+  try {
+    assert.equal((await decision(client(answers), o)).code, 'gift_card_flag_missing')
+  } finally { configuredUrl = 'https://store-a.example/' }
+  assert.notEqual((await decision(client(answers), o)).code, 'gift_card_flag_missing')
+})
+
+test('the locked re-read: unchanged answers pass; a changed, added or removed answer, or a changed store, is reported', async () => {
+  const { giftCardAnswersChanged, giftCardAnswersUsed } = await resolution()
+  const lines = (await facts()).readGoodsLines(order([{ id: 12, flag: 'unknown' }, { id: 13 }]))
+  const used = giftCardAnswersUsed(STORE_A, lines, new Map([[12, false]]))
+  const reread = (rows: Array<{ externalLineItemId: number; isGiftCard: boolean }>) => ({ euVatGiftCardLineResolution: { findMany: async () => rows } }) as never
+  assert.equal(await giftCardAnswersChanged(reread([{ externalLineItemId: 12, isGiftCard: false }]), '77', used), false)
+  assert.equal(await giftCardAnswersChanged(reread([{ externalLineItemId: 12, isGiftCard: true }]), '77', used), true, 'changed')
+  assert.equal(await giftCardAnswersChanged(reread([{ externalLineItemId: 12, isGiftCard: false }, { externalLineItemId: 13, isGiftCard: true }]), '77', used), true, 'added')
+  assert.equal(await giftCardAnswersChanged(reread([]), '77', used), true, 'removed')
+  configuredUrl = 'https://store-b.example/'
+  try { assert.equal(await giftCardAnswersChanged(reread([{ externalLineItemId: 12, isGiftCard: false }]), '77', used), true, 'store changed') } finally { configuredUrl = 'https://store-a.example/' }
 })

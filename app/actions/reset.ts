@@ -113,6 +113,8 @@ async function clearTransactionScope(guards: ResetGuards) {
     await tx.salesOrderRefund.deleteMany({})
     await tx.salesOrderLine.deleteMany({})
     await tx.salesOrder.deleteMany({})
+    // Operator answers for WooCommerce order lines belong to the orders just deleted.
+    await tx.euVatGiftCardLineResolution.deleteMany({})
   }, { timeout: 600_000, maxWait: 30_000 })
 
   guards.assertHeld('purchasing')

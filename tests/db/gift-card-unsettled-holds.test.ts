@@ -68,3 +68,20 @@ test('55 gift-card holds are reached in two pages and the count says 55', { skip
   const seen = new Set([...first.rows, ...second.rows].map((row) => row.orderNumber))
   assert.equal(seen.size, 55, 'every order once')
 })
+
+test('an answer is read only under the store it was given for, and a rebind to another store deletes the old store’s answers', { skip }, async (t) => {
+  const { db } = await setup()
+  const { loadGiftCardLineResolutions } = await import('@/lib/connectors/woocommerce/sync/gift-card-line-resolution')
+  const order = `gcp-store-${randomUUID()}`
+  t.after(() => db.euVatGiftCardLineResolution.deleteMany({ where: { externalOrderId: order } }))
+  const row = (storeIdentity: string, isGiftCard: boolean) => ({ connector: 'woocommerce', storeIdentity, externalOrderId: order, externalLineItemId: 5, isGiftCard, resolvedByUserId: 'u1' })
+  await db.euVatGiftCardLineResolution.createMany({ data: [row('https://a.example', true), row('https://b.example', false)] })
+  assert.deepEqual([...await loadGiftCardLineResolutions(db, 'https://a.example', order)], [[5, true]])
+  assert.deepEqual([...await loadGiftCardLineResolutions(db, 'https://b.example', order)], [[5, false]])
+  assert.equal((await loadGiftCardLineResolutions(db, 'https://c.example', order)).size, 0)
+  assert.equal((await loadGiftCardLineResolutions(db, null, order)).size, 0, 'no known store: no answer')
+  // The rebind's deletion (app/actions/wc-sync.ts): every answer of a store other than the one now configured.
+  await db.euVatGiftCardLineResolution.deleteMany({ where: { NOT: { storeIdentity: 'https://b.example' }, externalOrderId: order } })
+  assert.equal((await loadGiftCardLineResolutions(db, 'https://a.example', order)).size, 0)
+  assert.equal((await loadGiftCardLineResolutions(db, 'https://b.example', order)).size, 1)
+})

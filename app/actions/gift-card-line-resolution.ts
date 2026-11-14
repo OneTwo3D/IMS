@@ -9,7 +9,7 @@ import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { EU_VAT_TREATMENT_PAYLOAD_KEY } from '@/lib/domain/accounting/eu-vat-treatment'
 import { readEuVatRegimeStamp } from '@/lib/domain/accounting/eu-vat-regime-stamp'
 import { heldSalesInvoiceQueueWhere, isHeldSalesInvoicePayload } from '@/lib/connectors/woocommerce/sync/held-sales-invoice'
-import { GIFT_CARD_RESOLUTION_CONNECTOR, giftCardUnsettledHoldWhere } from '@/lib/connectors/woocommerce/sync/gift-card-line-resolution'
+import { GIFT_CARD_RESOLUTION_CONNECTOR, currentGiftCardStoreIdentity, giftCardUnsettledHoldWhere } from '@/lib/connectors/woocommerce/sync/gift-card-line-resolution'
 
 /**
  * SYNC > EXCEPTIONS: GIFT-CARD ANSWERS FOR ORDER LINES THE STORE COULD NOT SETTLE.
@@ -53,6 +53,7 @@ export async function listGiftCardLinesToResolve(pageInput = 0): Promise<GiftCar
     db.shoppingSyncLog.count({ where }),
     db.shoppingSyncLog.findMany({ where, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], skip: page * GIFT_CARD_PAGE_SIZE, take: GIFT_CARD_PAGE_SIZE, select: { payload: true } }),
   ])
+  const storeIdentity = await currentGiftCardStoreIdentity()
   const rows: GiftCardOrderRow[] = []
   for (const row of held) {
     const ids = lineIdsOf(row.payload)
@@ -60,7 +61,7 @@ export async function listGiftCardLinesToResolve(pageInput = 0): Promise<GiftCar
     const { salesOrderId, orderNumber, externalOrderId } = row.payload
     const [lines, answers] = await Promise.all([
       db.salesOrderLine.findMany({ where: { orderId: salesOrderId, externalLineItemId: { in: ids } }, select: { externalLineItemId: true, description: true, sku: true, qty: true } }),
-      db.euVatGiftCardLineResolution.findMany({ where: { connector: GIFT_CARD_RESOLUTION_CONNECTOR, externalOrderId, externalLineItemId: { in: ids } }, select: { externalLineItemId: true, isGiftCard: true, resolvedAt: true, resolvedByUserId: true } }),
+      db.euVatGiftCardLineResolution.findMany({ where: { connector: GIFT_CARD_RESOLUTION_CONNECTOR, storeIdentity: storeIdentity ?? '', externalOrderId, externalLineItemId: { in: ids } }, select: { externalLineItemId: true, isGiftCard: true, resolvedAt: true, resolvedByUserId: true } }),
     ])
     const users = await db.user.findMany({ where: { id: { in: [...new Set(answers.map((a) => a.resolvedByUserId))] } }, select: { id: true, name: true } })
     const byLine = new Map(lines.map((l) => [l.externalLineItemId, l]))
@@ -94,6 +95,8 @@ export async function resolveGiftCardLineAction(salesOrderId: string, externalLi
   try {
     const session = await requireFreshPermission('sync')
     if (typeof salesOrderId !== 'string' || salesOrderId === '' || !Number.isInteger(externalLineItemId) || typeof isGiftCard !== 'boolean') return { success: false, error: 'No order line was named.' }
+    const storeIdentity = await currentGiftCardStoreIdentity()
+    if (storeIdentity === null) return { success: false, error: 'The WooCommerce store this order belongs to cannot be identified, so an answer cannot be recorded.' }
     const outcome = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, salesOrderId)
       if ((await readEuVatRegimeStamp(tx, salesOrderId)) !== null) return { ok: false as const, error: 'This order’s EU VAT treatment is already decided, so an answer for its lines would change nothing.' }
@@ -101,10 +104,10 @@ export async function resolveGiftCardLineAction(salesOrderId: string, externalLi
       if (!held || !lineIdsOf(held.payload).includes(externalLineItemId)) return { ok: false as const, error: 'This line is not waiting for a gift-card answer. Reload the page.' }
       if (!isHeldSalesInvoicePayload(held.payload)) return { ok: false as const, error: 'This line is not waiting for a gift-card answer. Reload the page.' }
       const { externalOrderId, orderNumber } = held.payload
-      const key = { connector: GIFT_CARD_RESOLUTION_CONNECTOR, externalOrderId, externalLineItemId }
-      const previous = await tx.euVatGiftCardLineResolution.findUnique({ where: { connector_externalOrderId_externalLineItemId: key }, select: { isGiftCard: true } })
+      const key = { connector: GIFT_CARD_RESOLUTION_CONNECTOR, storeIdentity, externalOrderId, externalLineItemId }
+      const previous = await tx.euVatGiftCardLineResolution.findUnique({ where: { connector_storeIdentity_externalOrderId_externalLineItemId: key }, select: { isGiftCard: true } })
       await tx.euVatGiftCardLineResolution.upsert({
-        where: { connector_externalOrderId_externalLineItemId: key },
+        where: { connector_storeIdentity_externalOrderId_externalLineItemId: key },
         create: { ...key, isGiftCard, resolvedByUserId: session.user.id },
         update: { isGiftCard, resolvedByUserId: session.user.id, resolvedAt: new Date() },
       })
