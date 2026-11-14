@@ -173,6 +173,20 @@ test('wc-reconcile: permanent product conflicts with an empty errors list answer
   assert.equal(recorded.at(-1), 'completed')
 })
 
+test('wc-reconcile: a held-invoice release sweep that could not read its queue or its orders answers 500 and is recorded failed', async () => {
+  const { GET } = await import('@/app/api/cron/wc-reconcile/route')
+  const counters = { scanned: 0, released: 0, stillWaiting: 0, stillStuck: 0, closed: 0, scanCapReached: false }
+  for (const readError of ['could not read the held-invoice queue', 'could not read the orders behind the held invoices', 'could not read the state of 1 numbered held invoice(s)']) {
+    doubles.wc = { orders: { synced: 1, skipped: 0, errors: [] }, heldSalesInvoices: { ...counters, readError } }
+    const response = await GET(request())
+    assert.equal(response.status, 500, readError)
+    assert.equal(recorded.at(-1), 'failed', readError)
+  }
+  doubles.wc = { orders: { synced: 1, skipped: 0, errors: [] }, heldSalesInvoices: counters }
+  assert.equal((await GET(request())).status, 200)
+  assert.equal(recorded.at(-1), 'completed')
+})
+
 test('invoice-documents: a sweep that stores one document and then stops early answers 500 and is recorded failed; a finished one answers 200', async () => {
   const { GET } = await import('@/app/api/cron/invoice-documents/route')
   const base = { considered: 3, stored: 1, waiting: 0, needsAttention: 0, failed: 0, stoppedEarly: null as string | null }

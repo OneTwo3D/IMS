@@ -17,6 +17,11 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 - The section is filtered in the database before it is paged (50 orders a page, with Previous / Next), its heading shows the true count, and the count is part of the Sync > Exceptions badge, so a backlog is never hidden behind unrelated refusals.
 - The refusal now says where to answer, and the parked refusal records the line ids. Migration: one new table, `eu_vat_gift_card_line_resolutions` (additive). Not done on purpose: no automatic "not a gift card" rule from the product, because IMS holds no gift-card marker on products to prove it.
 
+### WooCommerce reconcile: a failed held-invoice sweep read answers 500 (backend / operations)
+
+- **Fixed: invoices awaiting release could go unprocessed while the `wc-reconcile` heartbeat stayed green.** The held sales-invoice release sweep returned plain counters when the held-invoice queue read, or the order read behind it, threw, so the run read as ok. It now returns `heldSalesInvoices.readError` for either read, and for a numbered invoice whose hold lookup or queued-invoice confirmation threw (that was read as an absent hold or as a tolerated stuck invoice), the cron outcome mapping counts it as a failure, and the route answers 500 (and records `failed`). A database read cannot be refused by the outbound-write hold, so it is never held.
+- No migration.
+
 ## 4.1.1 - 2026-11-14
 
 ### Fixed: the WooCommerce order sweep could not commit
