@@ -27,6 +27,11 @@ const store = {
   live: new Map<string, string>(),
   liveReadable: true,
   taxMapped: false,
+  refundReads: [] as number[],
+  refundReadFails: false,
+  /** WooCommerce order id -> refund ids the storefront holds. */
+  wcRefunds: new Map<string, number[]>(),
+  appliedRefunds: new Set<number>(),
   /** What the storefront lists for `/orders`. */
   listed: [] as Array<Record<string, unknown>>,
   /** Order ids whose live payload carries the unmapped-rate line. */
@@ -289,7 +294,13 @@ mock.module('@/lib/connectors/woocommerce/sync/refund-sync', {
     // webhook fails the delivery when it did not. A double answering `undefined` makes
     // `refundSweep.complete` throw, and the delivery 500s for a reason that has nothing to do
     // with the admission gate under test.
-    syncRefundsForOrder: async () => ({ synced: 0, fetched: 0, unapplied: 0, outstanding: 0, complete: true }),
+    // Applies the refunds the storefront holds for the order, once each (the real sweep dedupes by WooCommerce refund id).
+    syncRefundsForOrder: async (wcOrderId: number) => {
+      store.refundReads.push(wcOrderId)
+      if (store.refundReadFails) return { synced: 0, fetched: 0, unapplied: 0, outstanding: 0, complete: false, error: 'refund read failed' }
+      for (const refundId of store.wcRefunds.get(String(wcOrderId)) ?? []) store.appliedRefunds.add(refundId)
+      return { synced: 0, fetched: 0, unapplied: 0, outstanding: 0, complete: true }
+    },
     syncWcRefund: async () => ({ outcome: 'applied' }),
     // o3d-xnwu r4: the webhook imports these two from the same module, so a double that replaces the
     // module must supply them or the handler calls `undefined`.
@@ -325,6 +336,10 @@ function reset() {
   store.live.clear()
   store.liveReadable = true
   store.taxMapped = false
+  store.refundReads.length = 0
+  store.refundReadFails = false
+  store.wcRefunds.clear()
+  store.appliedRefunds.clear()
   store.listed = []
   store.blockedIds.clear()
   store.failLogWrites = false
@@ -525,4 +540,45 @@ test('the sweep still holds its cursor when a block cannot be recorded', async (
 
   assert.equal(result.errors.length, 1)
   assert.equal(store.settings.get('last_wc_order_sync_at'), '2026-01-01T00:00:00.000Z')
+})
+
+// --- refunds ride the drain ---------------------------------------------------------------------
+
+test('a refund created while the order was blocked is applied by the drain, which then resolves the row', async () => {
+  reset()
+  await importOrder(blockedOrder(801))
+  store.blockedIds.add('801')
+  store.live.set('801', 'processing')
+  store.wcRefunds.set('801', [9001]) // refunded in WooCommerce while IMS had refused the order
+
+  store.taxMapped = true
+  const result = await drain()
+
+  assert.equal(result.imported, 1)
+  assert.equal(store.links.has('801'), true)
+  assert.deepEqual(store.refundReads, [801], 'the refunds were read for the imported order')
+  assert.equal(store.appliedRefunds.has(9001), true, 'and the refund applied')
+  assert.equal(queued().length, 0, 'the row is resolved only after that')
+})
+
+test('a refund read that fails keeps the row pending and counts it unresolved, then a later run resolves it', async () => {
+  reset()
+  await importOrder(blockedOrder(811))
+  store.blockedIds.add('811')
+  store.live.set('811', 'processing')
+  store.wcRefunds.set('811', [9002])
+  store.taxMapped = true
+  store.refundReadFails = true
+
+  const first = await drain()
+  assert.equal(first.imported, 0)
+  assert.equal(first.unresolved, 1)
+  assert.equal(queued().length, 1, 'the row stays pending so the next run retries the refunds')
+  assert.equal(store.appliedRefunds.has(9002), false)
+
+  store.refundReadFails = false
+  const second = await drain()
+  assert.equal(second.imported, 1, 'the order already exists; the retry finishes the refunds and resolves the row')
+  assert.equal(store.appliedRefunds.has(9002), true)
+  assert.equal(queued().length, 0)
 })

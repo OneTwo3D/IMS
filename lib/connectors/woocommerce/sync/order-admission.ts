@@ -447,6 +447,20 @@ export async function drainWcOrderAdmissionRefusals(limit = 50): Promise<WcAdmis
         continue
       }
       if (guarded.result.success && guarded.result.orderId) {
+        // THE REFUNDS COME WITH THE ORDER. While the order was refused (or blocked by a guard) the
+        // sweeps skipped its refund read and advanced past it, and a refund webhook for an order IMS
+        // did not hold had finite retries that have long run out. This drain is the only thing left
+        // that knows the order, so it applies the refunds BEFORE resolving the row. Idempotent: a
+        // refund already in IMS is found by its WooCommerce refund id (`externalRefundId`, globally
+        // unique) in `syncWcRefund` and answered `already-applied`, so a retry re-applies nothing.
+        // An incomplete read, or a refund that may still reach IMS, keeps the row PENDING for the
+        // next run and is counted in `unresolved`.
+        const { syncRefundsForOrder } = await import('./refund-sync')
+        const refunds = await syncRefundsForOrder(Number(externalOrderId))
+        if (!refunds.complete || refunds.outstanding > 0) {
+          result.unresolved++
+          continue
+        }
         await resolveRefusalRow(
           row.id,
           `Imported by the admission-refusal retry once the order became admissible (status "${String(live.status)}")`,
