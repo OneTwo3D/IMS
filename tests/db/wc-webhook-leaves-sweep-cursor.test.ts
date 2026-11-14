@@ -172,6 +172,7 @@ test('webhook-primary mode: a clean order reconcile carries its position to an o
     await put('wc_initial_import_completed', 'true')
     await put('wc_sync_order_statuses', JSON.stringify(['processing']))
     await put(ORDER_CURSOR, '2026-01-01T00:00:00.000Z') // a long webhook-primary spell: the poll cursor is far behind
+    await put(`${ORDER_CURSOR}_statuses`, await resolvedPollFingerprint(['processing'])) // the poll last earned its cursor under this selection (equal list)
     const before = Date.now()
     const result = await syncNewWcOrders({ mode: 'reconcile' })
     assert.deepEqual(result.errors, [])
@@ -261,5 +262,41 @@ test('a poll commit that lands during the reconcile means the carry is skipped',
     assert.equal(await get(ORDER_CURSOR), oldCursor, 'the carry did not move the poll cursor')
     assert.equal(await get(`${ORDER_CURSOR}_statuses`), narrow, "and left the concurrent commit's fingerprint alone")
     assert.ok(await get('last_wc_order_reconcile_at'), 'the reconcile itself still committed')
+  })
+})
+
+test('a carry never widens: on-hold newly selected, old missed on-hold order, no watermark: the carry is skipped and the poll handles it', { skip }, async () => {
+  const { syncNewWcOrders } = await import('../../lib/connectors/woocommerce/sync/order-import')
+  await scenario(async () => {
+    await put('wc_initial_import_completed', 'true')
+    const narrow = await resolvedPollFingerprint(['processing'])
+    const wide = await resolvedPollFingerprint(['processing', 'on-hold']) // selection is wide now
+    const oldCursor = '2026-11-01T00:00:00.000Z'
+    await put(ORDER_CURSOR, oldCursor)
+    await put(`${ORDER_CURSOR}_statuses`, narrow) // the poll last earned its cursor without on-hold
+
+    const reconciled = await syncNewWcOrders({ mode: 'reconcile' })
+    assert.deepEqual(reconciled.errors, [])
+    assert.equal(await get(ORDER_CURSOR), oldCursor, 'no cursor was carried')
+    assert.equal(await get(`${ORDER_CURSOR}_statuses`), narrow, 'and no fingerprint was written')
+
+    asked.length = 0
+    const poll = await syncNewWcOrders({ mode: 'poll' })
+    assert.deepEqual(poll.errors, [])
+    assert.equal(asked.find((call) => call.path === '/orders')?.modifiedAfter, oldCursor, 'the poll still reads from before the old on-hold order')
+    assert.equal(await get(`${ORDER_CURSOR}_statuses`), wide, 'and only now records the widened selection')
+  })
+})
+
+test('a carry needs a stored poll fingerprint: with none (fresh install) it is skipped', { skip }, async () => {
+  const { syncNewWcOrders } = await import('../../lib/connectors/woocommerce/sync/order-import')
+  await scenario(async () => {
+    await put('wc_initial_import_completed', 'true')
+    await put('wc_sync_order_statuses', JSON.stringify(['processing']))
+    const oldCursor = '2026-11-01T00:00:00.000Z'
+    await put(ORDER_CURSOR, oldCursor)
+    await syncNewWcOrders({ mode: 'reconcile' })
+    assert.equal(await get(ORDER_CURSOR), oldCursor)
+    assert.equal(await get(`${ORDER_CURSOR}_statuses`), null)
   })
 })
