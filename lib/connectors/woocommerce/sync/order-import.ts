@@ -2,7 +2,7 @@
  * WooCommerce → IMS order import.
  */
 
-import { SALES_INVOICE_QUEUE_FAILED_NOT_HELD, heldOrderInvoiceObligation } from './held-order-invoice-obligation'
+import { heldOrderInvoiceObligation } from './held-order-invoice-obligation'
 import { describeWcRateMoneyRefusal, findWcRateMoneyProblems } from '@/lib/domain/accounting/wc-rate-money-refusal'
 import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain/erasure/erase-personal-data'
 import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
@@ -1772,6 +1772,8 @@ async function holdWcSalesInvoiceForMissingNumber(params: {
     } else {
       await tx.shoppingSyncLog.create({ data })
     }
+    // The hold IS the obligation: the owed mark clears in the transaction that records it.
+    await tx.salesOrder.updateMany({ where: { id: params.salesOrderId }, data: { salesInvoiceOwedAt: null } })
   }, { maxWait: 5_000, timeout: 20_000 })
 }
 
@@ -3058,10 +3060,10 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
         if (!options.pendingFxRetryLogId) return { success: true, orderId: heldOrderId }
         return { success: false, error: updated.gaveUp ? 'The paid order still disagrees with IMS; the automatic retry has stopped' : 'The paid order disagrees with IMS; kept in the retry queue until it agrees' }
       }
-      // An invoice enqueue failure on record with no held invoice and no ledger row behind it: the order is NOT handled (never marked synced, never acknowledged), so the retry
+      // A sales invoice still OWED by this order (set when the import created it, cleared when the enqueue or the park recorded it) with no held invoice and no ledger row behind it: the order is NOT handled (never marked synced, never acknowledged), so the retry
       // row stays and the delivery is retried. See held-order-invoice-obligation.ts.
-      if ((await heldOrderInvoiceObligation(db as never, { orderId: heldOrderId, wcOrderId: wcOrder.id })) === 'unmet') {
-        return { success: false, orderId: heldOrderId, error: `Order #${wcOrder.number} is imported, but queueing its sales invoice failed earlier and nothing is held or queued for it` }
+      if ((await heldOrderInvoiceObligation(db as never, { orderId: heldOrderId })) === 'unmet') {
+        return { success: false, orderId: heldOrderId, error: `Order #${wcOrder.number} is imported, but its sales invoice is owed and nothing is held or queued for it` }
       }
       if (options.pendingFxRetryLogId) await markPendingFxRetryLogSynced(options.pendingFxRetryLogId, heldOrderId)
       // o3d-z82a: deliberately NO marker resolution here. A redelivery can arrive while the
@@ -3546,6 +3548,8 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           externalUpdatedAt: parseWcGmtInstant(wcOrder.date_modified_gmt || wcOrder.date_modified),
           ...(options.useWcDateAsCreatedAt ? { createdAt: parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created) } : {}),
           status: lifecycleStatus,
+          // The invoice this import will queue is OWED from the moment the order commits, and stays owed until the enqueue or the park records it (same predicate as the enqueue below).
+          ...(imsStatus === 'PROCESSING' && !options.skipAccounting ? { salesInvoiceOwedAt: new Date() } : {}),
           refundStatus: importRefundDisposition,
           shipFromWarehouseId: wcDefaultWarehouseId,
           currency,
@@ -4001,7 +4005,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           await lockSalesOrder(tx, so.id)
           const erased = await orderIsErasedInTx(tx, so.id)
           const postable = erased ? scrubContactInAccountingPayload(invoicePayload) : invoicePayload
-          return queueAccountingSyncTxWithOutcome(tx, {
+          const queued = await queueAccountingSyncTxWithOutcome(tx, {
             type: 'SALES_INVOICE',
             referenceType: 'SalesOrder',
             referenceId: so.id,
@@ -4013,6 +4017,9 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
             chartConnector: settings.connector,
             recordRefusalAsOutstanding: true,
           })
+          // The obligation is recorded (a ledger row, or the refusal the enqueue wrote): the owed mark clears in this same transaction.
+          await tx.salesOrder.updateMany({ where: { id: so.id }, data: { salesInvoiceOwedAt: null } })
+          return queued
         }, { maxWait: 5_000, timeout: 20_000 })
         // o3d-j625 r3 (Codex HIGH 1 family) — THE ANSWER IS READ, which on this arm nothing did.
         //
@@ -4089,7 +4096,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           console.error('[wc-import] could not hold the sales invoice whose enqueue failed', parkError)
         }
       }
-      throw new Error(`Order #${orderNumber} was imported, but queueing its sales invoice failed${held ? ' (the invoice is held and is released by the next reconcile)' : ` ${SALES_INVOICE_QUEUE_FAILED_NOT_HELD}`}`, { cause: accountingError })
+      throw new Error(`Order #${orderNumber} was imported, but queueing its sales invoice failed${held ? ' (the invoice is held and is released by the next reconcile)' : ' (it could not be held either)'}`, { cause: accountingError })
     }
 
     // o3d-k26m.1/.6: the order imported, nothing was posted, and the reason lands on the sync row.

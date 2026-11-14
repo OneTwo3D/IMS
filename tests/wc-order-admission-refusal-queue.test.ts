@@ -128,6 +128,8 @@ function txDelegates() {
     },
   },
   salesOrder: {
+    // The existing-order branch asks whether a sales invoice is still owed by the order: not in this store.
+    findUnique: async () => ({ salesInvoiceOwedAt: null }),
     findFirst: async ({ where }: { where: Record<string, unknown> }) => {
       const some = (where as {
         shoppingLinks?: { some?: { connector?: string; externalOrderId?: string } }
@@ -213,6 +215,8 @@ function txClient() {
     salesOrder: {
       ...base.salesOrder,
       findUnique: async () => ({ erasedAt: null }),
+      // Clearing the owed-invoice mark: not a status application, so it is not recorded in updatedOrderIds.
+      updateMany: async () => ({ count: 1 }),
       update: async ({ where }: { where: { id: string } }) => {
         store.updatedOrderIds.push(where.id)
         return {}

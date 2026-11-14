@@ -1860,6 +1860,10 @@ model SalesOrder {
   // Global and on the VALUE alone, deliberately — see PurchaseInvoice.accountingInvoiceId. NULLs are
   // not equal in Postgres, so any number of orders may be unlinked.
   accountingInvoiceId     String?    @unique @map("accounting_invoice_id") // Accounting invoice ID after sync
+  /// Set in the transaction that creates a WooCommerce-imported order the import will invoice; cleared in the transaction that queues the invoice or parks it as a held invoice.
+  /// A value that is still set means an invoice obligation has not been recorded anywhere yet, so an existing-order import of it cannot succeed until a held invoice or a
+  /// SALES_INVOICE row (any status) exists. NULL for every order imported before this column and for orders the import does not invoice.
+  salesInvoiceOwedAt      DateTime?  @map("sales_invoice_owed_at")
   /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
   ///
   /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
