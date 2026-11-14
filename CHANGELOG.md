@@ -10,6 +10,10 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### Fixed: the WooCommerce order sweep could not commit
+
+- **Every clean order-sweep commit failed** with `Failed to deserialize column of type 'void'`: the commit took its per-cursor advisory lock with `$queryRaw`, and `pg_advisory_xact_lock` returns `void`, which Prisma cannot read back. It now uses `$executeRaw`, as every other advisory lock in IMS does. Seen on stage after 4.1.0; nothing was lost (the sweep re-reads its window), but the cursor and the liveness stamp did not advance. Unit tests mocked the call, so a source test now forbids `$queryRaw` for any `pg_advisory*` lock call.
+
 ## 4.1.0 - 2026-11-14
 
 Numbered 4.1.0 (not 5.0.0): nothing in this release needs an operator action on upgrade. The additive migrations apply with the normal deploy, the new Sync > Exceptions sections are things to watch, and the EU VAT credit-note work is built and switched off.

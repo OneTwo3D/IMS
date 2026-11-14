@@ -61,6 +61,7 @@ mock.module('@/lib/db', {
       },
       salesOrder: { findFirst: async () => ({ id: 'so-1' }) },
       $queryRaw: async () => [],
+      $executeRaw: async () => 0,
       // The cursor, its status fingerprint and the outage bookkeeping are written together, in one interactive transaction.
       $transaction: async (run: (tx: unknown) => Promise<unknown>) => await run(sweepDb),
     }),
