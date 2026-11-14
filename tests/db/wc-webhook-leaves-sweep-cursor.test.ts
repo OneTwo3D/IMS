@@ -335,4 +335,36 @@ test('fresh webhook-primary install: initial import, reconciles with no poll, th
   })
 })
 
+test('a status added while the initial import runs is NOT claimed by the fingerprint: no carry, and the next poll sees a widening', { skip }, async () => {
+  const { runInitialImport } = await import('../../lib/connectors/woocommerce/sync/initial-import')
+  const { syncNewWcOrders } = await import('../../lib/connectors/woocommerce/sync/order-import')
+  await scenario(async () => {
+    const startList = await resolvedPollFingerprint(['processing'])
+    const wideList = await resolvedPollFingerprint(['processing', 'on-hold'])
+    await put('wc_sync_order_statuses', JSON.stringify(['processing']))
+    await (await getDb()).setting.deleteMany({ where: { key: 'wc_initial_import_completed' } })
+    // The operator ticks on-hold while the import is reading (the page-fetch seam).
+    hooks.onOrdersFetch = async () => {
+      hooks.onOrdersFetch = null
+      await put('wc_sync_order_statuses', JSON.stringify(['processing', 'on-hold']))
+    }
+    assert.equal((await runInitialImport(freshProgress())).stamped, true)
+    assert.equal(await get(`${ORDER_CURSOR}_statuses`), startList, 'the fingerprint is the list the import started with')
+    const importCursor = (await get(ORDER_CURSOR))!
+
+    // No carry before the poll has handled the widening.
+    assert.deepEqual((await syncNewWcOrders({ mode: 'reconcile' })).errors, [])
+    assert.equal(await get(ORDER_CURSOR), importCursor, 'the reconcile did not carry over a pending widening')
+    assert.equal(await get(`${ORDER_CURSOR}_statuses`), startList)
+
+    // An on-hold order the import never read was refused long before the import cursor.
+    const refusedAt = new Date(Date.parse(importCursor) - 86_400_000).toISOString()
+    await put('wc_order_admission_refused_since', refusedAt)
+    asked.length = 0
+    assert.deepEqual((await syncNewWcOrders({ mode: 'poll' })).errors, [])
+    assert.equal(asked.find((call) => call.path === '/orders')?.modifiedAfter, refusedAt, 'the poll treated it as a widening and rewound')
+    assert.equal(await get(`${ORDER_CURSOR}_statuses`), wideList)
+  })
+})
+
 const freshProgress = () => ({ status: 'running' as const, message: '', activeOrdersImported: 0, activeOrdersSkipped: 0, totalOrders: 0, currentPage: 0, totalPages: 0, errors: [] as string[] })

@@ -60,6 +60,7 @@ mock.module('@/lib/db', {
         },
       },
       shoppingOrderLink: { findMany: async () => [] },
+      $transaction: async function (this: unknown, fn: (tx: unknown) => Promise<unknown>) { return fn(this) },
       $executeRaw: cursorRaw((key, value) => settings.set(key, value)),
     },
   },
