@@ -17,6 +17,8 @@ import {
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
+import { eas182RefundFigures } from '@/lib/domain/accounting/eu-vat-credit-note'
+import { priorRefundedTax } from '@/lib/domain/sales/refund-182-prior-tax'
 import { addMoney, currencyMinorUnits, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
@@ -4642,7 +4644,34 @@ export async function createSalesOrderRefund(
       // once each part has been checked on its own — see postedCreditNoteAggregateCheck.
       const legs: PostedCreditNoteLeg[] = []
 
-      for (const refundLine of refundLines) {
+      // IOSS credit notes, rate 182 (internal callers only, behind the Sales Invoices switch, scheme-stamped order): the EAS compliance plugin RE-PRICES a refund's tax under its own rate, so each line's stated VAT is not the VAT of the order line's ORIGINAL rate and the per-line posted-VAT
+      // fence below would refuse exactly the refunds this exists for. For that refund ONLY the fence is replaced by (a) the source-stated tax, summed over the lines, which must equal the tax the refund states in all (within the per-refund tolerance), and (b) the aggregate order bound (`eas182RefundFigures`): the VAT
+      // credited across the order's refunds may not exceed the order's collected VAT by more than one fixed allowance. Every other refund keeps the per-line fence unchanged.
+      const rate182 = input.euVatSchemeSnapshot === true && input.eas182StatedTaxForeign != null && Number.isFinite(input.eas182StatedTaxForeign) && input.statedGrossForeign != null && Number.isFinite(input.statedGrossForeign)
+      if (rate182) {
+        const taxedLines = refundLines.filter((refundLine) => refundLine.lineKind !== 'discount')
+        let net182 = toDecimal(0)
+        let statedLineTax = toDecimal(0)
+        let everyLineStates = true
+        for (const refundLine of taxedLines) {
+          net182 = net182.add(toDecimal(netForeignOf(refundLine)))
+          if (refundLine.chargedTaxForeign == null) everyLineStates = false
+          else statedLineTax = statedLineTax.add(toDecimal(refundLine.chargedTaxForeign))
+        }
+        const minor182 = toDecimal(1).div(toDecimal(10).pow(currencyMinorUnits(so.currency)))
+        if (everyLineStates && statedLineTax.sub(toDecimal(input.eas182StatedTaxForeign!)).abs().gt(minor182.mul(taxedLines.length + 1))) {
+          return refuse(`the VAT its lines state (${statedLineTax.toString()} ${so.currency}) does not match the VAT the refund states in all (${toDecimal(input.eas182StatedTaxForeign!).toString()} ${so.currency}).`)
+        }
+        const priorTax = await priorRefundedTax(tx, input.orderId, null, toDecimal(so.taxForeign))
+        const bound = eas182RefundFigures({
+          net: net182, statedGross: toDecimal(input.statedGrossForeign!), statedTax: toDecimal(input.eas182StatedTaxForeign!), orderTax: toDecimal(so.taxForeign), priorRefundedTax: priorTax, currency: so.currency,
+          toleranceMinorUnits: taxedLines.length + 1, orderAllowanceMinorUnits: so.lines.length + 1,
+        })
+        if (!bound.ok) return refuse(`${bound.reason}.`)
+      }
+      const fenceLines = rate182 ? [] : refundLines
+
+      for (const refundLine of fenceLines) {
         const lineKind: 'sale' | 'shipping' | 'discount' =
           refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale'
         // A mirrored order-level discount has no VAT figure of its OWN anywhere in IMS — its VAT is
@@ -4752,7 +4781,7 @@ export async function createSalesOrderRefund(
       // residue is shipping's VAT alone, the shipping leg is already checked on its own above, and the
       // discount leg's VAT was never in the order's total to be checked against.
       // -------------------------------------------------------------------------------------------
-      const discountLegs = refundLines.filter((refundLine) => refundLine.lineKind === 'discount')
+      const discountLegs = fenceLines.filter((refundLine) => refundLine.lineKind === 'discount')
       if (input.chargeback && discountLegs.length > 0 && !orderTaxIsSumOfComponents) {
         const combinedNet = refundLines
           .filter((refundLine) => refundLine.lineKind === 'discount' || refundLine.lineKind === 'shipping')
@@ -5663,6 +5692,7 @@ export async function retrySalesOrderRefundAccounting(
           creditNoteNumber: true,
           externalRefundId: true,
           chargeback: true,
+          eas182StatedTaxForeign: true,
           accountingRetryRequired: true,
           accountingRetrySyncs: true,
           // o3d-2sm1: the witness `stageRefundAccountingReversals` writes in the same transaction as
@@ -5749,7 +5779,8 @@ export async function retrySalesOrderRefundAccounting(
       // until the mapping is restored. Retrying is then what completes it.
       // -------------------------------------------------------------------------------------------
       const replayLines = refund.lines.map(reconstructReplayLine)
-      const postedTaxRefusal = input.creditNotePostingEnabled
+      // A rate-182 refund (the EAS plugin re-priced its tax; recorded under the creation fence's rate-182 replacement) is not re-fenced per line either: its VAT was confirmed against its own stated figures and the order's aggregate bound when it was created, and the credit-note treatment checks both again.
+      const postedTaxRefusal = input.creditNotePostingEnabled && refund.eas182StatedTaxForeign === null
         ? await fenceRetryPostedTax(
             tx,
             refund.order,

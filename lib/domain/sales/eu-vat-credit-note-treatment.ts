@@ -20,6 +20,7 @@ import type { GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
 import { predictedUntaxedTotal } from '@/lib/domain/accounting/eu-vat-treatment'
 import type { AccountingEnqueueOutcome } from '@/lib/accounting'
 import { decideRefund182Hold } from '@/lib/domain/sales/refund-182-hold'
+import { priorRefundedTax } from '@/lib/domain/sales/refund-182-prior-tax'
 import { applyEuVatCreditNoteTreatment, eas182RefundFigures, refund182HeldRefusal, noFrozenBasisRefusal, noInvoicedTypeRefusal, noStampRefusal, refundTaxAndTotal, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
 
@@ -161,7 +162,7 @@ export async function treatCreditNotePayload(params: {
     figures = { ok: true, vatAmount: vat.toString(), refundTotal: net.plus(vat).toString() }
   } else if (rate182) {
     // RATE 182: the tax the refund states across ALL its rate ids, confirmed against its own gross and held to the order's VAT not already refunded.
-    const priorTax = await priorRefundedTax(params.orderId, params.refundId, toDecimal(order.taxForeign))
+    const priorTax = await priorRefundedTax(db, params.orderId, params.refundId, toDecimal(order.taxForeign))
     figures = eas182RefundFigures({ net, statedGross: toDecimal(refund.statedGrossForeign!), statedTax: toDecimal(refund.eas182StatedTaxForeign!), orderTax: toDecimal(order.taxForeign), priorRefundedTax: priorTax, currency: payload.currency, toleranceMinorUnits: lines.length + 1, orderAllowanceMinorUnits: order.lines.length + 1 })
   } else {
     figures = refundTaxAndTotal({ net, pricedTax, rawGross: net.plus(pricedTax), statedGross: refund.statedGrossForeign === null ? null : toDecimal(refund.statedGrossForeign), currency: payload.currency, toleranceMinorUnits: lines.length + 1 })
@@ -234,27 +235,6 @@ export async function recordCreditNoteTreatmentRefusal(input: { orderId: string;
   }).catch(() => { /* the unmet obligation is what the ledger acts on; logging must not throw */ })
 }
 
-/**
- * The VAT the order's OTHER refunds have already returned, so a rate-182 refund can be held to what is left. A stated gross gives its tax outright (gross less the net, which every NET refund stores); a refund with none is priced from its lines' frozen rates; a whole-order reversal returned all the order's VAT.
- * Null when any of them cannot be established (a legacy gross-basis refund, a line with no frozen rate): the caller refuses rather than guesses.
- */
-async function priorRefundedTax(orderId: string, refundId: string, orderTax: Decimal): Promise<Decimal | null> {
-  const others = await db.salesOrderRefund.findMany({
-    where: { orderId, id: { not: refundId } },
-    select: { source: true, totalsBasis: true, totalForeign: true, statedGrossForeign: true, lines: { select: { totalForeign: true, schemeTaxRateValue: true } } },
-  })
-  let sum = toDecimal(0)
-  for (const other of others) {
-    if (other.source === 'CHARGEBACK_POLLER') { sum = sum.plus(orderTax); continue }
-    if (other.totalsBasis !== 'NET') return null
-    if (other.statedGrossForeign !== null) { sum = sum.plus(toDecimal(other.statedGrossForeign).minus(toDecimal(other.totalForeign))); continue }
-    for (const line of other.lines) {
-      if (line.schemeTaxRateValue === null) return null
-      sum = sum.plus(toDecimal(line.totalForeign).times(toDecimal(line.schemeTaxRateValue)))
-    }
-  }
-  return sum
-}
 
 /** The operator notice for a hold that could not be applied because a sendable (or posted) credit note already exists for the refund. */
 async function recordHoldConflict(orderId: string, refundId: string, number: string): Promise<void> {
