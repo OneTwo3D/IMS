@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test, { mock } from 'node:test'
 import { config } from 'dotenv'
+import type { Prisma } from '@/app/generated/prisma/client'
 
 /**
  * THE GIFT-CARD SECTION OF SYNC > EXCEPTIONS AGAINST A REAL DATABASE: the filter is applied in the database BEFORE the page is cut, so unrelated refusals cannot hide an answerable order; every matching order is
@@ -15,7 +16,7 @@ if (skip && process.env.REQUIRE_DB_RETENTION_TESTS === '1') {
 mock.module('@/lib/auth/server', { namedExports: { requirePermission: async () => ({ user: { id: 'u1' } }), requireFreshPermission: async () => ({ user: { id: 'u1' } }), freshAuthFailureResult: () => null } })
 mock.module('next/cache', { namedExports: { revalidatePath: () => undefined } })
 
-async function hold(db: Awaited<ReturnType<typeof setup>>['db'], tag: string, marker: Record<string, unknown>, at: Date) {
+async function hold(db: Awaited<ReturnType<typeof setup>>['db'], tag: string, marker: Prisma.InputJsonObject, at: Date) {
   const { HELD_SALES_INVOICE_RECORD_KIND, MISSING_INVOICE_NUMBER_QUEUE_REASON } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
   const id = randomUUID()
   await db.shoppingSyncLog.create({
