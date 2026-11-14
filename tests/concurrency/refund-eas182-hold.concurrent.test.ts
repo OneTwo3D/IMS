@@ -516,3 +516,44 @@ test('[refund scheme-treated] the scheme decision is recorded EXPLICITLY (scheme
   const ordinary = await creditNoteRowOf(deps.db, plain.id)
   assert.ok(ordinary && !(EU_VAT_CREDIT_NOTE_REFUSED_KEY in ordinary) && !('_euVatTreatment' in ordinary), 'an ordinary credit note, untouched')
 })
+
+test('[refund 182 hold] RECONCILE: a refused row that already exists (queued, then its counter transaction failed) is stamped and counted on the retry even when the threshold is full or 0, never fallen through to a sendable enqueue; a sendable row beside it is still a conflict', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true, { [COUNT]: '10', [THRESHOLD]: '10' })
+  const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx) })
+  const { decideRefund182Hold, creditNoteIdempotencyKey } = await import('../../lib/domain/sales/refund-182-hold.ts')
+  const mk = async () => (await deps.db.salesOrderRefund.create({ data: { orderId: fx.orderId, totalForeign: 1, totalBase: 1, totalsBasis: 'NET' }, select: { id: true } })).id
+  const refused = (id: string) => deps.db.accountingSyncLog.create({ data: { type: 'CREDIT_NOTE', status: 'PENDING', referenceType: 'SalesOrderRefund', referenceId: id, payload: { lines: [], _euVatCreditNoteRefused: { reason: 'x' }, _idempotencyKey: creditNoteIdempotencyKey(id) } } })
+  const stamp = async (id: string) => (await deps.db.salesOrderRefund.findUnique({ where: { id }, select: { eas182HeldAt: true } }))!.eas182HeldAt
+  let enqueued = 0
+  const enqueue = async () => { enqueued += 1; return { queued: true as const, reason: 'already-queued' } }
+  // Threshold FULL (count 10 of 10): without a row the next one posts; WITH the orphan row it is reconciled.
+  const plain = await mk()
+  assert.deepEqual(await decideRefund182Hold(plain, enqueue), { held: false }, 'no row, full: posts')
+  assert.equal(enqueued, 0)
+  const orphan = await mk()
+  await refused(orphan)
+  const reconciled = await decideRefund182Hold(orphan, enqueue)
+  assert.equal(reconciled.held && 'reconciled' in reconciled && reconciled.reconciled === true && reconciled.newlyHeld, true)
+  assert.ok(await stamp(orphan), 'stamped')
+  assert.equal(await heldCount(deps.db), '11', 'counted, past the threshold, because the hold is real')
+  assert.equal(await deps.db.accountingSyncLog.count({ where: { type: 'CREDIT_NOTE', referenceId: orphan } }), 1, 'no second (sendable) row')
+  // Threshold 0 with an orphan row: still reconciled.
+  await deps.db.setting.update({ where: { key: THRESHOLD }, data: { value: '0' } })
+  const zero = await mk()
+  await refused(zero)
+  const z = await decideRefund182Hold(zero, enqueue)
+  assert.equal(z.held && 'reconciled' in z && z.reconciled === true, true)
+  assert.equal(await heldCount(deps.db), '12')
+  // A sendable row beside the refused one is NOT reconciled (nothing is stamped or counted).
+  const both = await mk()
+  await refused(both)
+  await deps.db.accountingSyncLog.create({ data: { type: 'CREDIT_NOTE', status: 'PENDING', referenceType: 'SalesOrderRefund', referenceId: both, payload: { lines: [{ description: 'x', quantity: 1, unitAmount: 1 }] } } })
+  await deps.db.setting.update({ where: { key: THRESHOLD }, data: { value: '10' } })
+  const c = await decideRefund182Hold(both, enqueue)
+  assert.equal('reconciled' in c, false)
+  assert.equal(c.held && 'reconciled' in c, false)
+  assert.equal(await stamp(both), null)
+  assert.equal(await heldCount(deps.db), '12')
+})

@@ -206,3 +206,29 @@ test('[refund 182 re-price] a PUBLIC caller cannot state the rate-182 tax: creat
   const internal = await deps.createRefund(fx.orderId, [{ lineId: fx.goods, productId: null, description: 'Widget', qty: 0, totalBase: 100, lineKind: 'sale', chargedTaxForeign: 20 }], 'internal', undefined, { internalBypassToken: deps.bypass, externalRefundId: wooRefundId(), eas182StatedTaxForeign: 20, statedGrossForeign: 120 })
   assert.equal(internal.success, true, internal.error)
 })
+
+test('[refund 182 re-price] a MONETARY-ONLY refund (zero returned quantity) on a 19% order re-priced by EAS to 20% VAT is recorded and held: the net is the stated gross less the stated 182 tax, not the gross divided by the order\'s own rate', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true, { [COUNT]: '0', [THRESHOLD]: '10' })
+  const { fx, externalOrderId } = await wcOrder(deps, 'IOSS')
+  const over = await wcOrder(deps, 'IOSS')
+  t.after(async () => { await restore(); await cleanup(deps.db, fx); await cleanup(deps.db, over.fx) })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  const { syncWcRefund } = await import('../../lib/connectors/woocommerce/sync/refund-sync.ts')
+  const monetary = (id: number, parent: number, net: string, tax: string) => ({
+    id, parent_id: parent, date_created: '2026-11-02T10:00:00', date_created_gmt: '2026-11-02T10:00:00', amount: (Number(net) + Number(tax)).toFixed(2), reason: 'r', refunded_by: 1, refunded_payment: false, meta_data: [],
+    line_items: [{ id: 91, name: 'Widget', product_id: 1, variation_id: 0, quantity: 0, tax_class: '', subtotal: `-${net}`, subtotal_tax: `-${tax}`, total: `-${net}`, total_tax: `-${tax}`, sku: 's', meta_data: [], refund_total: -Number(net), taxes: [{ id: 182, total: `-${tax}` }] }],
+  })
+  const outcome = await syncWcRefund(externalOrderId, monetary(wooRefundId(), externalOrderId, '100.00', '20.00') as never)
+  assert.notEqual(outcome.outcome, 'quarantined-refusal', outcome.error)
+  const refunds = await refundsOf(deps, fx.orderId)
+  assert.equal(refunds.length, 1, 'the refund is recorded: ' + (outcome.error ?? ''))
+  assert.equal(refunds[0]!.statedGrossForeign?.toString(), '120')
+  assert.equal(refunds[0]!.eas182StatedTaxForeign?.toString(), '20')
+  assert.ok(refunds[0]!.eas182HeldAt, 'held')
+  const lines = await deps.db.salesOrderRefundLine.findMany({ where: { refundId: refunds[0]!.id }, select: { totalForeign: true } })
+  assert.equal(lines.reduce((sum, l) => sum + Number(l.totalForeign), 0), 100, 'the net is 120 - 20, not 120 / 1.19')
+  // Over the order's VAT (30.00 of VAT): refused by the writer's aggregate bound, nothing recorded.
+  const refused = await syncWcRefund(over.externalOrderId, monetary(wooRefundId(), over.externalOrderId, '10.00', '30.00') as never)
+  assert.equal((await refundsOf(deps, over.fx.orderId)).length, 0, 'over-bound: ' + (refused.error ?? ''))
+})

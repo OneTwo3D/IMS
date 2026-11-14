@@ -194,7 +194,14 @@ export async function treatCreditNotePayload(params: {
     if ('handledByHand' in hold) return { kind: 'hold_handled', outcome: hold.outcome }
     if ('conflict' in hold) { await recordHoldConflict(params.orderId, params.refundId, number); return { kind: 'hold_conflict', outcome: hold.outcome } }
     if (hold.held) {
-      if (hold.queued && hold.newlyHeld) {
+      if (hold.queued && hold.reconciled) {
+        await logActivity({
+          entityType: 'SALES_ORDER', entityId: params.orderId, action: 'refund_182_hold_reconciled', tag: 'accounting', level: 'WARNING',
+          description: `Credit note ${number} (a refund whose VAT is on WooCommerce rate 182) already had its held row queued by an earlier attempt that was never counted; it is counted now as number ${hold.heldNumber}${hold.threshold === null ? '' : ` (the first ${hold.threshold} are held)`}, even if that takes the count past the threshold, because the hold is real. It is on the sync exceptions page and is never sent.`,
+          metadata: { refundId: params.refundId },
+        }).catch(() => { /* the refused row is what holds it; logging must not throw */ })
+      }
+      if (hold.queued && hold.newlyHeld && !hold.reconciled) {
         await logActivity({
           entityType: 'SALES_ORDER', entityId: params.orderId, action: 'refund_182_credit_note_held', tag: 'accounting', level: 'WARNING',
           description: `Credit note ${number} (a refund whose VAT is on WooCommerce rate 182) was held for review: number ${hold.heldNumber}${hold.threshold === null ? ', counted against a threshold that is not a whole number' : ` of the first ${hold.threshold}`}. It is on the sync exceptions page and is never sent.`,

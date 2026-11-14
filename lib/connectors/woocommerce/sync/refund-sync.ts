@@ -975,7 +975,10 @@ export async function syncWcRefund(
       // closed here is deliberate: a refund stored on an undetermined basis would still be stamped
       // totalsBasis='NET', so a gross figure would enter the net ceiling / FULL-vs-PARTIAL comparison
       // and both over-credit Xero and strand the order at PARTIALLY_REFUNDED.
-      const basis = resolveMonetaryRefundVatRate(so)
+      // RATE 182 (the EAS plugin re-priced this refund under its own rate): the order's header VAT rate is NOT what the plugin charged, so a net derived from it would not reconcile with the VAT the refund states and the writer's rate-182 check would refuse the refund on every retry.
+      // The net is the refund's stated gross less the VAT it states across all its rate ids; the writer then validates it (stated tax within tolerance, aggregate order bound).
+      const eas182Net = eas182StatedTaxForeign === undefined ? null : refundAmountForeign.sub(toDecimal(eas182StatedTaxForeign))
+      const basis = eas182Net !== null ? ({ ok: true, vatRate: toDecimal(0) } as const) : resolveMonetaryRefundVatRate(so)
       if (!basis.ok) {
         const error =
           `WooCommerce refund ${wcRefund.id} (${refundAmountForeign.toDecimalPlaces(2).toFixed(2)} gross): ` +
@@ -996,7 +999,7 @@ export async function syncWcRefund(
         // no resolution reaches at all.
         return { outcome: 'quarantined-refusal', error }
       }
-      const netForeign = toDecimal(refundAmountForeign).div(toDecimal(1).add(basis.vatRate))
+      const netForeign = eas182Net !== null ? eas182Net : toDecimal(refundAmountForeign).div(toDecimal(1).add(basis.vatRate))
       refundLines.push({
         productId: null,
         description: wcRefund.reason || 'WooCommerce refund',

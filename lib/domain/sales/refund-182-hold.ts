@@ -25,7 +25,7 @@ export const creditNoteIdempotencyKey = (refundId: string): string => `sales-ord
 export type Refund182HoldDecision<T extends HeldRowEnqueue> =
   | { held: false }
   /** The row was queued and (for `newlyHeld`) the count and the stamp committed with it. `threshold` is null when the stored threshold or count is not a whole number. */
-  | { held: true; queued: true; newlyHeld: boolean; heldNumber: number; threshold: number | null; outcome: T }
+  | { held: true; queued: true; newlyHeld: boolean; /** The refused row already existed (an earlier attempt queued it but its counter transaction failed): it is stamped and counted now even if that takes the count past the threshold, because the hold is real. */ reconciled?: true; heldNumber: number; threshold: number | null; outcome: T }
   /** The row could not be queued: nothing was stamped or counted. `outcome` is what the enqueue said, for the caller's obligation ledger. */
   | { held: true; queued: false; outcome: T; /** The enqueue said queued but no refused row of this refund exists, so nothing was held: the caller must account the obligation as UNMET, whatever `outcome` says. */ rowMissing?: true }
   /** The key resolves to a row that is NOT the refused one (sendable, or already posted): the hold could not be applied. Nothing was stamped or counted and the row is untouched. */
@@ -81,7 +81,9 @@ export async function decideRefund182Hold<T extends HeldRowEnqueue>(refundId: st
   }
   if ((await heldAtOf(db)) !== null) return alreadyHeld(await thresholdOf(db))
   const preThreshold = await thresholdOf(db)
-  if (preThreshold === 0) return { held: false }
+  // A refused row of this refund that already exists (queued by an attempt whose counter transaction then failed) is a real hold: it is reconciled below whatever the threshold says now, never fallen through to a sendable enqueue that would dedupe against it.
+  const orphanBefore = await creditNoteRowsOf(db, refundId)
+  if (preThreshold === 0 && !(orphanBefore.refusedRowExists && orphanBefore.sendable.length === 0)) return { held: false }
 
   try {
     return await db.$transaction(async (tx) => {
@@ -91,11 +93,16 @@ export async function decideRefund182Hold<T extends HeldRowEnqueue>(refundId: st
       // Re-read under the lock: a concurrent treatment of this same refund may have held it, and the threshold may have changed.
       if ((await heldAtOf(tx as unknown as typeof db)) !== null) return await alreadyHeld(await thresholdOf(db))
       const threshold = await thresholdOf(tx as unknown as typeof db)
-      if (threshold === 0) return { held: false as const }
       const count = parseCountSetting(stored)
       const countable = threshold !== null && count.state !== 'invalid'
       const held = count.state === 'ok' ? count.value : 0
-      if (countable && held >= threshold) return { held: false as const }
+      // RECONCILE BEFORE THE THRESHOLD DECISION: an existing refused row (marker plus this refund's key) with nothing sendable beside it is a hold that was queued but never stamped or counted.
+      const existing = await creditNoteRowsOf(tx as unknown as typeof db, refundId)
+      const reconciling = existing.refusedRowExists && existing.sendable.length === 0
+      if (!reconciling) {
+        if (threshold === 0) return { held: false as const }
+        if (countable && held >= threshold) return { held: false as const }
+      }
       const heldNumber = countable ? held + 1 : (await tx.$queryRaw<Array<{ n: bigint }>>`SELECT COUNT(*) + 1 AS n FROM sales_order_refunds WHERE eas182_held_at IS NOT NULL`).map((row) => Number(row.n))[0] ?? 1
       const outcome = await enqueueHeldRow({ heldNumber, threshold: countable ? threshold : null })
       if (!outcome.queued) throw new RowNotQueued(outcome)
@@ -106,7 +113,7 @@ export async function decideRefund182Hold<T extends HeldRowEnqueue>(refundId: st
       if (verified.verdict === 'missing') throw new RowNotQueued(outcome, true)
       if (countable) await tx.$executeRaw`UPDATE settings SET value = ${String(held + 1)}, "updatedAt" = now() WHERE key = ${EU_VAT_REFUND_HELD_COUNT_SETTING}`
       await tx.$executeRaw`UPDATE sales_order_refunds SET eas182_held_at = now() WHERE id = ${refundId}`
-      return { held: true as const, queued: true as const, newlyHeld: true, heldNumber, threshold: countable ? threshold : null, outcome }
+      return { held: true as const, queued: true as const, newlyHeld: true, ...(reconciling ? { reconciled: true as const } : {}), heldNumber, threshold: countable ? threshold : null, outcome }
     }, { timeout: 60_000, maxWait: 60_000 })
   } catch (error) {
     if (error instanceof RowNotQueued) return { held: true, queued: false, outcome: error.outcome as T, ...(error.rowMissing ? { rowMissing: true as const } : {}) }
