@@ -45,7 +45,7 @@ const state = {
   asked: [] as Array<Record<string, unknown>>,
   activity: [] as { action: string; description: string }[],
   /** Which database read throws (the sweep's two reads). */
-  readThrows: null as null | 'queue' | 'orders',
+  readThrows: null as null | 'queue' | 'orders' | 'release' | 'confirm',
 }
 
 /** Block and line comments removed, so a commented-out call cannot satisfy a source scan. */
@@ -113,8 +113,10 @@ mock.module('@/lib/db', {
           if (state.readThrows === 'queue') throw new Error('queue read down')
           return state.held.filter((r) => matchesHeld(r, where)).slice(0, take ?? undefined)
         },
-        findFirst: async ({ where }: { where: Record<string, unknown> }) =>
-          state.held.filter((r) => matchesHeld(r, where))[0] ?? null,
+        findFirst: async ({ where }: { where: Record<string, unknown> }) => {
+          if (state.readThrows === 'release') throw new Error('hold read down')
+          return state.held.filter((r) => matchesHeld(r, where))[0] ?? null
+        },
         update: async ({ where, data }: { where: { id: string }; data: Partial<HeldRow> }) => {
           const row = state.held.find((r) => r.id === where.id)
           if (!row) throw new Error(`no held row ${where.id}`)
@@ -160,6 +162,7 @@ mock.module('@/lib/db', {
       },
       accountingSyncLog: {
         findFirst: async ({ where }: { where: Record<string, unknown> }) => {
+          if (state.readThrows === 'confirm') throw new Error('confirm read down')
           const key = (where.payload as { path: string[]; equals: string }).equals
           assert.deepEqual((where.payload as { path: string[] }).path, ['_idempotencyKey'])
           const hit = state.queued.find((q) => q.idempotencyKey === key && q.referenceId === where.referenceId)
@@ -571,3 +574,24 @@ test('a sweep whose reads succeed carries no readError and maps to ok', async ()
   const { cronOutcome } = await import('@/lib/ops/cron-outcomes')
   assert.equal(cronOutcome('wc-reconcile', { orders: { synced: 1 }, heldSalesInvoices: result } as never), 'ok')
 })
+
+// The per-invoice reads: a numbered held order whose hold lookup, or queued-invoice confirmation, threw is NOT 'nothing to do'.
+for (const which of ['release', 'confirm'] as const) {
+  test(`a numbered held order whose ${which} read throws is a readError (failed run), not an absent hold`, async () => {
+    reset()
+    state.held.push(heldRow({ id: 'hold-1', entityId: 'so-1' }))
+    state.orders.push({ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null })
+    state.readThrows = which
+    const errors = mock.method(console, 'error', () => {})
+    try {
+      const result = await sweep()
+      assert.equal(typeof result.readError, 'string', 'the per-invoice read failure is carried in the result')
+      assert.equal(result.released, 0)
+      assert.equal(result.stillStuck, 0, 'it is not counted as a (tolerated) stuck invoice')
+      const { cronOutcome } = await import('@/lib/ops/cron-outcomes')
+      assert.equal(cronOutcome('wc-reconcile', { orders: { synced: 1 }, heldSalesInvoices: result } as never), 'failed')
+    } finally {
+      errors.mock.restore()
+    }
+  })
+}
