@@ -25,6 +25,7 @@ import {
 } from '@/lib/domain/accounting/eu-vat-treatment'
 import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
 import { currentWcTaxBinding, recordWcTaxBinding, type InvoiceTaxTypesInput, type WcTaxBinding } from './wc-tax-binding'
+import { GiftCardAnswersChangedError, giftCardAnswersChanged, type GiftCardAnswersUsed } from './gift-card-line-resolution'
 import { buildEuVatRegimeInputFromSettings, readEuVatRegimeMode, readGiftCardFlagCutIn } from './eu-vat-facts'
 import type { GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
 import { regimePolicyOf, type RegimePolicy } from '@/lib/domain/accounting/eu-vat-regime-policy'
@@ -40,15 +41,16 @@ export { regimePolicyOf, type RegimePolicy }
  */
 async function readRegimeInputOnce(
   client: Parameters<typeof buildEuVatRegimeInputFromSettings>[0], order: WcFullOrder, accounts: { ioss: string | null; ddp: string | null; fee: string | null; rounding: string | null },
-): Promise<{ ok: true; input: Awaited<ReturnType<typeof buildEuVatRegimeInputFromSettings>>; policy: RegimePolicy } | { ok: false; reason: string }> {
+): Promise<{ ok: true; input: Awaited<ReturnType<typeof buildEuVatRegimeInputFromSettings>>; policy: RegimePolicy; answersUsed: GiftCardAnswersUsed | undefined } | { ok: false; reason: string }> {
   const mode = await readEuVatRegimeMode()
   if (mode === null) return { ok: false, reason: 'the setting "eu_vat_regime_mode" holds a value that is neither adopt_plugin nor decide, so IMS cannot tell who decides the EU VAT regime' }
   let cutIn: GiftCardCutIn
   try { cutIn = await readGiftCardFlagCutIn() } catch { cutIn = { state: 'invalid', raw: 'setting could not be read' } }
   let baseCurrency: string | null = null
   try { baseCurrency = await getBaseCurrencyCode() } catch { baseCurrency = null }
-  const input = await buildEuVatRegimeInputFromSettings(client, order, accounts, { mode, ...(baseCurrency === null ? {} : { baseCurrency }) }, async () => cutIn)
-  return { ok: true, input, policy: regimePolicyOf({ mode, cutIn, ioss: accounts.ioss, ddp: accounts.ddp, fee: accounts.fee, rounding: accounts.rounding, baseCurrency }) }
+  const answers: { value?: GiftCardAnswersUsed } = {}
+  const input = await buildEuVatRegimeInputFromSettings(client, order, accounts, { mode, answersUsed: answers, ...(baseCurrency === null ? {} : { baseCurrency }) }, async () => cutIn)
+  return { ok: true, input, answersUsed: answers.value, policy: regimePolicyOf({ mode, cutIn, ioss: accounts.ioss, ddp: accounts.ddp, fee: accounts.fee, rounding: accounts.rounding, baseCurrency }) }
 }
 
 export type EuVatTreatmentAccounts = { ioss: string | null; ddp: string | null; fee: string | null; rounding: string | null }
@@ -59,7 +61,7 @@ export type TreatedInvoiceOutcome =
   /** The payload with the treatment applied, and what it did. */
   | { kind: 'treated'; payload: Record<string, unknown>; warnings: RegimeWarning[]; /** The order's tax binding as it was when the treatment ran (recorded in the marker). */ taxBinding: WcTaxBinding; /** The regime settings the decision was made under, from the one read (recorded on the hold). */ regimePolicy: RegimePolicy }
   /** The order cannot be invoiced as it is: the reason is the operator-facing sentence the document is stamped with. */
-  | { kind: 'refused'; reason: string }
+  | { kind: 'refused'; reason: string; /** The store ids of the lines whose gift-card flag is unsettled, when that is why (an operator can answer for them). */ giftCardLineIds?: number[] }
 
 export async function treatImportedSalesInvoice(params: {
   orderId: string
@@ -86,10 +88,21 @@ export async function treatImportedSalesInvoice(params: {
   const taxBinding = await currentWcTaxBinding(params.wcOrder, params.mappedLines, params.taxBindingDeps)
   const read = await readRegimeInputOnce(db, params.wcOrder, params.accounts)
   if (!read.ok) return { kind: 'refused', reason: read.reason }
-  const { input, policy } = read
+  const { input, policy, answersUsed } = read
   const decision = resolveEuVatRegime(input)
-  const outcome = await db.$transaction((tx) => stampEuVatRegime(tx, params.orderId, () => input, params.now), { maxWait: 5_000, timeout: 20_000 })
-  if (outcome.kind === 'refused') return { kind: 'refused', reason: `the order's EU VAT regime cannot be established (${outcome.code}): ${outcome.reason}` }
+  // The input above read the operator's gift-card answers BEFORE the order lock. Inside the stamp transaction (which holds the order's row lock, the same lock the answer action takes) they are read again, and if they differ the
+  // transaction rolls back with nothing stamped: the stamp is write-once, so it must never record a decision made on an answer that has since changed. The next import reads the current answer.
+  let outcome: Awaited<ReturnType<typeof stampEuVatRegime>>
+  try {
+    outcome = await db.$transaction((tx) => stampEuVatRegime(tx, params.orderId, async () => {
+      if (answersUsed !== undefined && await giftCardAnswersChanged(tx, String(params.wcOrder.id), answersUsed)) throw new GiftCardAnswersChangedError()
+      return input
+    }, params.now), { maxWait: 5_000, timeout: 20_000 })
+  } catch (error) {
+    if (error instanceof GiftCardAnswersChangedError) return { kind: 'refused', reason: 'a gift-card answer for this order changed while its EU VAT regime was being decided, so nothing was recorded. Re-import the order from WooCommerce to decide it with the current answer' }
+    throw error
+  }
+  if (outcome.kind === 'refused') return { kind: 'refused', reason: `the order's EU VAT regime cannot be established (${outcome.code}): ${outcome.reason}`, ...(outcome.giftCardLineIds ? { giftCardLineIds: outcome.giftCardLineIds } : {}) }
   if (outcome.kind === 'order_not_found') return { kind: 'refused', reason: 'the sales order could not be found to record its EU VAT regime' }
 
   if (outcome.kind === 'stamped' && outcome.warnings.length > 0) {

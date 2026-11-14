@@ -325,6 +325,7 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
     salesOrderRefund: inertModel,
     salesOrderLine: inertModel,
     salesOrder: inertModel,
+    euVatGiftCardLineResolution: inertModel,
     setting: {
       findUnique: async ({ where }: { where: { key: string } }): Promise<SettingRow | null> => {
         if (settingReadGate) await settingReadGate(where.key)

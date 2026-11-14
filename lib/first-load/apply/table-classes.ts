@@ -46,6 +46,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   document_templates: { kind: 'CONFIG_ALLOWED', reason: 'configured document templates' },
   email_outbox: { kind: 'MUST_BE_EMPTY', reason: 'outbound email queue and suppressions' },
   email_suppressions: { kind: 'MUST_BE_EMPTY', reason: 'outbound email queue and suppressions' },
+  eu_vat_gift_card_line_resolutions: { kind: 'MUST_BE_EMPTY', reason: 'operator answers on WooCommerce order lines (EU VAT gift-card flag): business data this runner never writes' },
   external_wms_bindings: { kind: 'CONFIG_ALLOWED', reason: 'warehouse connector binding configuration' },
   first_load_apply_runs: { kind: 'RUNNER_WRITES', reason: "the runner's own run record" },
   freight_cost_lines: { kind: 'MUST_BE_EMPTY', reason: 'freight on purchase orders' },

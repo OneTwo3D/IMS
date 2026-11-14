@@ -130,6 +130,7 @@ const IDENTIFIER_COLUMNS: Record<string, 'erased' | 'retained' | 'surrogate' | '
   'AccountingAccountBalanceSnapshot.externalAccountId': 'not-customer',
   'AccountingEventLog.accountingEventId': 'not-customer',
   'AccountingOperatorLedgerCheck.checkedByUserId': 'not-customer',
+  'EuVatGiftCardLineResolution.resolvedByUserId': 'not-customer',
   'OutboundShadowWrite.accountingSyncLogId': 'not-customer',
   'Passkey.userId': 'not-customer',
   'Session.userId': 'not-customer',

@@ -38,7 +38,7 @@ export type StampOutcome =
   /** The order was already stamped (by an earlier call or a racing one): the stamp as it is, nothing re-derived. */
   | { kind: 'already_stamped'; stamp: StampedRegime }
   /** The order cannot be classified: nothing was written. */
-  | { kind: 'refused'; code: RefusalCode; reason: string }
+  | { kind: 'refused'; code: RefusalCode; reason: string; giftCardLineIds?: number[] }
   | { kind: 'order_not_found' }
 
 const REGIMES: readonly string[] = ['IOSS', 'VOEC', 'DDP']
@@ -91,7 +91,7 @@ export async function stampEuVatRegime(
   }
 
   const decision = resolveEuVatRegime(await buildInput())
-  if (decision.kind === 'REFUSE') return { kind: 'refused', code: decision.code, reason: decision.reason }
+  if (decision.kind === 'REFUSE') return { kind: 'refused', code: decision.code, reason: decision.reason, ...(decision.giftCardLineIds ? { giftCardLineIds: decision.giftCardLineIds } : {}) }
 
   const regime = decision.kind === 'SCHEME' ? decision.regime : null
   const vatAccount = decision.kind === 'SCHEME' ? decision.vatAccount : null

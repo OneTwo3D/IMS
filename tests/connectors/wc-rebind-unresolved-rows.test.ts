@@ -85,6 +85,7 @@ mock.module('@/lib/db', {
         },
         shoppingSyncLog: shoppingSyncLogFake(state.syncRows),
         product: { updateMany: async () => ({ count: (state.wipedMappings += 1, 0) }) },
+        euVatGiftCardLineResolution: { deleteMany: async () => ({ count: 0 }) },
       }),
     },
   },

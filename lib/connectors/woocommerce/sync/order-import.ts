@@ -4027,7 +4027,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
 
       // The payload as it is PARKED when the invoice is held (below), built once: a failed enqueue parks the same bytes, so the release sweep posts what this import would have.
       const parkedPayload: Record<string, unknown> = withRegimePolicy(euVatOutcome.kind === 'refused'
-      ? { ...accountingPayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'treatment_refused', refusal: euVatOutcome.reason } }
+      ? { ...accountingPayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'treatment_refused', refusal: euVatOutcome.reason, ...(euVatOutcome.giftCardLineIds && euVatOutcome.giftCardLineIds.length > 0 ? { giftCardLineIds: euVatOutcome.giftCardLineIds, giftCardUnsettled: true } : {}) } }
       : euVatOutcome.kind === 'skipped'
       ? (euVatOutcome.why === 'store_credit' ? { ...invoicePayload, [EU_VAT_TREATMENT_PAYLOAD_KEY]: { applied: false, reason: 'store_credit' } } : invoicePayload)
       : invoicePayload[EU_VAT_TREATMENT_PAYLOAD_KEY] !== undefined
