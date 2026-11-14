@@ -54,7 +54,8 @@ test('60 unrelated refusals older than 3 gift-card ones do not hide them; the co
 })
 
 test('55 gift-card holds are reached in two pages and the count says 55', { skip }, async (t) => {
-  const { db, listGiftCardLinesToResolve, GIFT_CARD_PAGE_SIZE } = await setup()
+  const { db, listGiftCardLinesToResolve } = await setup()
+  const GIFT_CARD_PAGE_SIZE = 50
   t.after(() => clean(db))
   const { giftCardUnsettledHoldWhere } = await import('@/lib/connectors/woocommerce/sync/gift-card-line-resolution')
   const before = await db.shoppingSyncLog.count({ where: giftCardUnsettledHoldWhere() })

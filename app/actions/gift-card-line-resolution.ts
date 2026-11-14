@@ -32,7 +32,7 @@ export type GiftCardLineRow = {
 export type GiftCardOrderRow = { salesOrderId: string; orderNumber: string; externalOrderId: string; lines: GiftCardLineRow[] }
 
 /** Orders per page of the section. */
-export const GIFT_CARD_PAGE_SIZE = 50
+const GIFT_CARD_PAGE_SIZE = 50
 
 export type GiftCardLinePage = { rows: GiftCardOrderRow[]; total: number; page: number; pageSize: number }
 
