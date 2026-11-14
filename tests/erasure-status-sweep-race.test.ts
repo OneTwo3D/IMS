@@ -31,7 +31,7 @@ mock.module('@/lib/connectors/wms/registry', {
     }),
   },
 })
-mock.module('@/lib/shopping', { namedExports: { pushWmsOrderStatusToShopping: async () => { state.pushes += 1; return { success: true } } } })
+mock.module('@/lib/shopping', { namedExports: { pushWmsOrderStatusToShopping: async () => { state.pushes += 1; return { success: true } }, listRunnableShoppingConnectorIds: async () => ['woocommerce'] } })
 mock.module('@/lib/domain/sales/allocation-service', {
   namedExports: { lockSalesOrder: async () => { state.locks += 1; state.order.push('lock') } },
 })

@@ -1,9 +1,10 @@
-import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { runMintsoftReturnsSync } from '@/lib/connectors/mintsoft/sync/returns-sync'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { cronResultResponse, cronSkippedResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
@@ -15,8 +16,9 @@ export async function GET(request: Request) {
   if (maintenance) return maintenance
 
   if (!(await isIntegrationPluginEnabled('mintsoft'))) {
-    return NextResponse.json({ skipped: true, reason: 'Mintsoft plugin disabled' })
+    return cronSkippedResponse('Mintsoft plugin disabled')
   }
 
-  return NextResponse.json(await runMintsoftReturnsSync('cron'))
+  const result = await runMintsoftReturnsSync('cron')
+  return cronResultResponse(result, { outcomeClass: cronOutcome('mintsoft-returns-sync', result) })
 }

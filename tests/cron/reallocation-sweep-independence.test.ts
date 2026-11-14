@@ -15,7 +15,7 @@ import test, { mock } from 'node:test'
  */
 
 const calls: string[] = []
-let allocationThrows = false
+let allocationThrows: boolean | Error = false
 let markerThrows = false
 /** The budget the route handed the marker sweep, so "bounded wall time" is observable. */
 let markerOptions: { budgetMs?: number } | undefined
@@ -36,7 +36,7 @@ mock.module('@/lib/fulfillment/reallocation-sweep', {
   namedExports: {
     sweepUnallocatedProcessingOrders: async () => {
       calls.push('allocation')
-      if (allocationThrows) throw new Error('allocation pass exploded')
+      if (allocationThrows) throw allocationThrows instanceof Error ? allocationThrows : new Error('allocation pass exploded')
       return { scanned: 3, needing: 0, allocated: 0, skipped: 0, errors: 0, hasRemainder: false, nextCursor: '', cursorPersisted: true }
     },
   },
@@ -126,4 +126,15 @@ test('the marker sweep is given only the wall-clock budget the tick has left (o3
   assert.equal(typeof markerOptions?.budgetMs, 'number')
   assert.ok((markerOptions?.budgetMs ?? -1) >= 0, 'never negative — a zero budget still resolves one marker')
   assert.ok((markerOptions?.budgetMs ?? 0) <= 300_000, 'and never more than the tick\'s whole budget')
+})
+
+test('a thrown hold is held (200) only when nothing was sent; a refusal at a redirect hop is a failure (500)', async () => {
+  const { OutboundWriteHeldError } = await import('@/lib/security/outbound-write-grant')
+  const refusal = { connector: 'woocommerce', code: 'no_grant', method: 'PUT', target: 'https://shop.example.test/x', granted: null, attempted: null, basis: 't' } as const
+  reset()
+  allocationThrows = new OutboundWriteHeldError(refusal, 0)
+  assert.equal((await runRoute()).status, 200)
+  reset()
+  allocationThrows = new OutboundWriteHeldError(refusal, 1)
+  assert.equal((await runRoute()).status, 500)
 })

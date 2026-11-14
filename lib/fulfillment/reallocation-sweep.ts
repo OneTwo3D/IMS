@@ -1,3 +1,4 @@
+import { classifyStockEnqueueFailure } from '@/lib/domain/integrations/stock-enqueue-failure'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
@@ -71,6 +72,10 @@ export type ReallocationSweepResult = {
   /** left the eligible set between selection and the order lock — a deliberate no-op, not a failure. */
   skipped: number
   errors: number
+  /** PRESENT ONLY WHEN NON-ZERO: the coalesced storefront stock enqueue failed (the store keeps advertising the pre-allocation quantities). */
+  stockEnqueueFailures?: number
+  /** PRESENT ONLY WHEN NON-ZERO: the enqueue the outbound-write hold refused. */
+  stockEnqueueHeld?: number
   /** true when this tick's keyset page was full — more orders remain for the next tick. */
   hasRemainder: boolean
   /** the cursor persisted for the next run ('' means the scan wrapped back to the start). */
@@ -397,6 +402,9 @@ export async function sweepUnallocatedProcessingOrders(
       await deps.enqueueStockSync([...syncProductIds], 'IMS_CHANGE')
     } catch (syncError) {
       console.error(syncError)
+      // The store keeps advertising the old quantities until a sync runs: counted so the run does not read healthy (held apart).
+      if (classifyStockEnqueueFailure(syncError) === 'held') result.stockEnqueueHeld = 1
+      else result.stockEnqueueFailures = 1
     }
   }
 

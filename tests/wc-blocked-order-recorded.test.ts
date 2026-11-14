@@ -154,6 +154,8 @@ function txDelegates() {
     },
   },
   salesOrder: {
+    // The existing-order branch asks whether a sales invoice is still owed by the order: not in this store.
+    findUnique: async () => ({ salesInvoiceOwedAt: null }),
     findFirst: async ({ where }: { where?: Record<string, unknown> } = {}) => {
       const some = (where as {
         shoppingLinks?: { some?: { connector?: string; externalOrderId?: string } }
@@ -213,6 +215,8 @@ function txDelegates() {
     findMany: async ({ where }: { where: Row }) => matchLogs(where),
     count: async () => 0,
   },
+  // The existing-order branch asks whether an invoice enqueue failure is on record with nothing behind it: none here.
+  accountingSyncLog: { findFirst: async () => null },
   product: { findMany: async () => [] },
   taxRate: { findMany: async () => [], findFirst: async () => null, findUnique: async () => null },
   warehouse: { findMany: async () => [] },
@@ -240,6 +244,7 @@ function txClient() {
     salesOrder: {
       ...base.salesOrder,
       findUnique: async () => ({ erasedAt: null }),
+      updateMany: async () => ({ count: 1 }),
       update: async ({ where }: { where: { id: string } }) => {
         store.updatedOrderIds.push(where.id)
         return {}
@@ -565,7 +570,7 @@ test('a refund created while the order was blocked is applied by the drain, whic
   assert.equal(queued().length, 0, 'the row is resolved only after that')
 })
 
-test('a refund read that fails keeps the row pending and counts it unresolved, then a later run resolves it', async () => {
+test('a refund read that fails keeps the row pending and counts it failed, then a later run resolves it', async () => {
   reset()
   await importOrder(blockedOrder(811))
   store.blockedIds.add('811')
@@ -576,7 +581,8 @@ test('a refund read that fails keeps the row pending and counts it unresolved, t
 
   const first = await drain()
   assert.equal(first.imported, 0)
-  assert.equal(first.unresolved, 1)
+  assert.equal(first.failed, 1, 'a refund READ failure is a genuine failure, which the cron answers non-2xx for')
+  assert.equal(first.unresolved, 0)
   assert.equal(queued().length, 1, 'the row stays pending so the next run retries the refunds')
   assert.equal(store.appliedRefunds.has(9002), false)
 
@@ -649,6 +655,7 @@ test('the drain keeps the row pending while a refund may still reach IMS', async
   const result = await drain()
 
   assert.equal(result.imported, 0)
-  assert.equal(result.unresolved, 1)
+  assert.equal(result.unresolved, 1, 'a still-pending refund is an expected state, not a failure')
+  assert.equal(result.failed, 0)
   assert.equal(queued().length, 1)
 })

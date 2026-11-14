@@ -343,19 +343,26 @@ export type WcAdmissionRefusalDrainResult = {
   scanned: number
   imported: number
   stillRefused: number
+  /**
+   * EXPECTED states that need no operator and will be asked again: the order is gone from the store (WooCommerce answers 404), the first-import
+   * lock was busy, or the withdrawal screen could not decide yet. NOT failures of the run.
+   */
   unresolved: number
+  /** GENUINE failures: the by-id read of the order failed (an outage, a refused credential, an unreadable answer), or the import threw or reported failure. */
+  failed: number
   retired: number
 }
 
-/** The live order, or null when it cannot be read. */
-async function readLiveWcOrder(externalOrderId: string): Promise<WcFullOrder | null> {
+/** The live order; `gone` when the store says it does not exist; `failed` when it could not be read for any other reason. */
+async function readLiveWcOrder(externalOrderId: string): Promise<{ order: WcFullOrder } | { gone: true } | { failed: true }> {
   try {
     const { wcFetch } = await import('../api')
     const { data, error } = await wcFetch(`/orders/${externalOrderId}`)
-    if (error || !data || typeof data !== 'object' || !('status' in data)) return null
-    return data as WcFullOrder
+    if (error) return /\b404\b/.test(error) ? { gone: true } : { failed: true }
+    if (!data || typeof data !== 'object' || !('status' in data)) return { failed: true }
+    return { order: data as WcFullOrder }
   } catch {
-    return null
+    return { failed: true }
   }
 }
 
@@ -392,7 +399,7 @@ export async function drainWcOrderAdmissionRefusals(limit = 50): Promise<WcAdmis
   })
 
   const result: WcAdmissionRefusalDrainResult = {
-    scanned: rows.length, imported: 0, stillRefused: 0, unresolved: 0, retired: 0,
+    scanned: rows.length, imported: 0, stillRefused: 0, unresolved: 0, failed: 0, retired: 0,
   }
   if (rows.length === 0) return result
 
@@ -419,11 +426,16 @@ export async function drainWcOrderAdmissionRefusals(limit = 50): Promise<WcAdmis
       },
     }).catch(() => {})
 
-    const live = await readLiveWcOrder(externalOrderId)
-    if (!live) {
+    const read = await readLiveWcOrder(externalOrderId)
+    if ('gone' in read) {
       result.unresolved++
       continue
     }
+    if ('failed' in read) {
+      result.failed++
+      continue
+    }
+    const live = read.order
 
     try {
       const guarded = await importWcOrderGuarded(live, () => importWcOrder(live))
@@ -454,10 +466,15 @@ export async function drainWcOrderAdmissionRefusals(limit = 50): Promise<WcAdmis
         // refund already in IMS is found by its WooCommerce refund id (`externalRefundId`, globally
         // unique) in `syncWcRefund` and answered `already-applied`, so a retry re-applies nothing.
         // An incomplete read, or a refund that may still reach IMS, keeps the row PENDING for the
-        // next run and is counted in `unresolved`.
+        // next run. A refund READ that failed is a genuine failure (`failed`, which the cron answers
+        // non-2xx for); a refund that is merely still pending is an expected state (`unresolved`).
         const { syncRefundsForOrder } = await import('./refund-sync')
         const refunds = await syncRefundsForOrder(Number(externalOrderId))
-        if (!refunds.complete || refunds.outstanding > 0) {
+        if (!refunds.complete) {
+          result.failed++
+          continue
+        }
+        if (refunds.outstanding > 0) {
           result.unresolved++
           continue
         }
@@ -469,9 +486,10 @@ export async function drainWcOrderAdmissionRefusals(limit = 50): Promise<WcAdmis
         result.imported++
         continue
       }
-      result.unresolved++
+      // The import ran and reported neither success nor a skip: it failed.
+      result.failed++
     } catch (e) {
-      result.unresolved++
+      result.failed++
       console.error(`[wc-admission-refusal-drain] ${externalOrderId}: ${e instanceof Error ? e.message : String(e)}`)
     }
   }
@@ -484,7 +502,7 @@ export async function drainWcOrderAdmissionRefusals(limit = 50): Promise<WcAdmis
       level: 'INFO',
       description: `Re-checked ${result.scanned} WooCommerce order(s) the "Import order statuses" boundary had `
         + `turned away: ${result.imported} imported, ${result.stillRefused} still excluded, `
-        + `${result.retired} retired, ${result.unresolved} could not be read.`,
+        + `${result.retired} retired, ${result.unresolved} could not be decided yet, ${result.failed} failed.`,
       metadata: { ...result },
       resolveUser: false,
     })

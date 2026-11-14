@@ -1,3 +1,4 @@
+process.env.SETTINGS_ENCRYPTION_KEY ??= 'a'.repeat(64)
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
@@ -399,4 +400,18 @@ test('ABA: a stale run is rejected even when the cursor tuple has cycled back to
   assert.equal(result.cursorPersisted, false, 'the stale write must be rejected on generation')
   assert.deepEqual(writes, [], 'nothing was persisted')
   assert.equal(stored.generation, 5, 'the newer generation stands')
+})
+
+test('a failed storefront stock enqueue is counted in the result (the store keeps the pre-allocation quantities), a held one apart', async () => {
+  const failing = baseDeps({ enqueueStockSync: async () => { throw new Error('queue down') } })
+  const failed = await sweepUnallocatedProcessingOrders({ deps: failing.deps })
+  assert.equal(failed.stockEnqueueFailures, 1)
+  assert.equal(failed.stockEnqueueHeld, undefined)
+  const { outboundHeldMessage } = await import('../../lib/security/outbound-write-hold-constants.ts')
+  const text = outboundHeldMessage({ connector: 'woocommerce', code: 'no_grant', granted: null, attempted: null, method: 'PUT', target: 'https://shop.example.test/x', hop: 0 })
+  const held = await sweepUnallocatedProcessingOrders({ deps: baseDeps({ enqueueStockSync: async () => { throw new Error(text) } }).deps })
+  assert.equal(held.stockEnqueueFailures, undefined)
+  assert.equal(held.stockEnqueueHeld, 1)
+  const ok = await sweepUnallocatedProcessingOrders({ deps: baseDeps().deps })
+  assert.equal(ok.stockEnqueueFailures, undefined)
 })

@@ -1,9 +1,11 @@
-import { NextResponse } from 'next/server'
+import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { sweepUnallocatedProcessingOrders } from '@/lib/fulfillment/reallocation-sweep'
 import { sweepUnresolvedDirectCreateMarkers } from '@/lib/fulfillment/pre-fulfilment-reallocation'
+import { cronResultResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 /**
  * The wall-clock budget for the whole tick, well inside the job's 15-minute cadence.
@@ -31,6 +33,7 @@ export async function GET(request: Request) {
 
   const startedAt = Date.now()
   const failures: Record<string, string> = {}
+  let genuineFailure = false
 
   // o3d-z82a, Codex review r5: the two passes are INDEPENDENT, and each failure is caught here
   // rather than allowed to propagate. Sequencing them with a bare `await` meant a throw in the
@@ -44,6 +47,7 @@ export async function GET(request: Request) {
     result = await sweepUnallocatedProcessingOrders()
   } catch (error) {
     failures.reallocationSweep = error instanceof Error ? error.message : String(error)
+    if (!(isOutboundWriteHeldError(error) && error.nothingSent === true)) genuineFailure = true
     console.error('[reallocation-sweep] allocation pass failed:', error)
   }
 
@@ -61,12 +65,15 @@ export async function GET(request: Request) {
     })
   } catch (error) {
     failures.directCreateMarkerSweep = error instanceof Error ? error.message : String(error)
+    if (!(isOutboundWriteHeldError(error) && error.nothingSent === true)) genuineFailure = true
     console.error('[reallocation-sweep] direct-create marker pass failed:', error)
   }
 
   const failed = Object.keys(failures).length > 0
-  return NextResponse.json(
-    { ...(result ?? {}), directCreateMarkers, ...(failed ? { ok: false, failures } : {}) },
-    { status: failed ? 500 : 200 },
-  )
+  // A pass that threw only because the outbound-write hold refused a write is held, not failed.
+  const body = { ...(result ?? {}), directCreateMarkers, ...(failed ? { ok: false, failures } : {}) }
+  const mapped = cronOutcome('reallocation-sweep', body)
+  // Passes that failed only on a thrown hold are held; counted per-order errors in the passes that did run still make it failed.
+  const withoutThrown = failed && !genuineFailure ? cronOutcome('reallocation-sweep', { ...body, ok: undefined }) : mapped
+  return cronResultResponse(body, { outcomeClass: failed && !genuineFailure ? (withoutThrown === 'failed' ? 'failed' : 'held') : mapped })
 }

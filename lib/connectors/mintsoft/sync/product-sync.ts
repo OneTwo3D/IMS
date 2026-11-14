@@ -7,6 +7,7 @@ import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { isDeclarableCn8, normalizeCn8 } from '@/lib/trade/cn-validate'
 import { DEFAULT_COUNTRY_OF_ORIGIN, toIsoCountryCode } from '@/lib/countries'
 import type { WmsProductDto, WmsProductRef } from '@/lib/connectors/wms/types'
+import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { mintsoftProducerSeam } from '../producer-seam'
 import { snapshotFromRow } from '@/lib/domain/product-content/store'
@@ -119,6 +120,8 @@ export type MintsoftProductSyncResult = {
    * exactly what it always did.
    */
   shadowed?: number
+  /** PRESENT ONLY WHEN NON-ZERO: errors that are writes the outbound-write hold refused (also counted in `errors`). */
+  outboundHeld?: number
 }
 
 export type MintsoftContentCounters = {
@@ -1032,6 +1035,7 @@ async function processMintsoftProductChunk(params: {
       if (result.contentError) {
         contentCounters.errors += 1
         params.counters.errors += 1
+        if (isOutboundWriteHeldText(result.contentError)) params.counters.outboundHeld = (params.counters.outboundHeld ?? 0) + 1
         params.logs.push({
           jobId: params.jobId,
           sku: result.product.sku,
@@ -1045,6 +1049,7 @@ async function processMintsoftProductChunk(params: {
     }
 
     params.counters.errors += 1
+    if (isOutboundWriteHeldText(result.error)) params.counters.outboundHeld = (params.counters.outboundHeld ?? 0) + 1
     params.logs.push({
       jobId: params.jobId,
       sku: result.product.sku,

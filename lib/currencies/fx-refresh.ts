@@ -1,3 +1,4 @@
+import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { revalidatePath } from 'next/cache'
 import { fxWriteStamp, withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
 import { db } from '@/lib/db'
@@ -25,6 +26,12 @@ export async function fetchAllFxRatesInternal(): Promise<{
   retryCount?: number
   skippedManualOverrides?: string[]
   pendingWcOrderRetry?: { attempted: number; imported: number; stillPending: number; failed: number } | null
+  /** PRESENT ONLY WHEN NON-ZERO: connector FX pushes that failed (an error text a connector returned, or the fan-out threw), for a reason other than the outbound-write hold. Counted over every connector; the run is not rolled back. */
+  connectorPushFailures?: number
+  /** PRESENT ONLY WHEN NON-ZERO: connector FX push errors the outbound-write hold refused (nothing sent). */
+  connectorPushHeld?: number
+  /** PRESENT ONLY WHEN NON-ZERO: 1 when the retry of WooCommerce orders waiting for these rates threw (the throw is logged and does not roll the fetch back). */
+  pendingWcOrderRetryFailures?: number
 }> {
   try {
     // The FX source switch (default 'ecb' = everything below, unchanged). 'aelia' reads Aelia's rates through the helper plugin instead and never contacts frankfurter.
@@ -141,11 +148,13 @@ export async function fetchAllFxRatesInternal(): Promise<{
     await logActivity({ entityType: 'SYNC', tag: 'sync', action: 'fx_rates_fetched', description: `Fetched FX rates for ${updated.length} currencies` })
 
     let pendingWcOrderRetry: { attempted: number; imported: number; stillPending: number; failed: number } | null = null
+    let pendingWcOrderRetryFailures = 0
     if (updated.length > 0) {
       try {
         const { retryPendingWcOrdersWaitingForFx } = await import('@/lib/connectors/woocommerce/sync/order-import')
         pendingWcOrderRetry = await retryPendingWcOrdersWaitingForFx()
       } catch (e) {
+        pendingWcOrderRetryFailures += 1
         await logActivity({
           entityType: 'SYNC',
           tag: 'sync',
@@ -159,11 +168,17 @@ export async function fetchAllFxRatesInternal(): Promise<{
     // b8i6.2: fan the new rates out to every configured shopping connector via
     // the facade (each owns its own push + telemetry; a connector is skipped until it
     // gains an FX push). Failure here must never roll back the inbound fetch.
+    let connectorPushFailures = 0
+    let connectorPushHeld = 0
     if (updated.length) {
       try {
         const { pushFxRatesToConnectors } = await import('@/lib/shopping')
-        await pushFxRatesToConnectors()
+        // Each connector's failure is RETURNED (and logged FAILED by the facade), not thrown: fold it into the result so the cron answers it.
+        const counted = countFxPushErrors(await pushFxRatesToConnectors())
+        connectorPushFailures += counted.failures
+        connectorPushHeld += counted.held
       } catch (e) {
+        connectorPushFailures += 1
         await logActivity({
           entityType: 'SYNC',
           tag: 'sync',
@@ -176,7 +191,12 @@ export async function fetchAllFxRatesInternal(): Promise<{
 
     revalidatePath('/settings', 'layout')
     revalidatePath('/purchase-orders')
-    return { success: true, updated, failed, retryCount, skippedManualOverrides: Array.from(overrideCodes), pendingWcOrderRetry }
+    return {
+      success: true, updated, failed, retryCount, skippedManualOverrides: Array.from(overrideCodes), pendingWcOrderRetry,
+      ...(connectorPushFailures > 0 ? { connectorPushFailures } : {}),
+      ...(connectorPushHeld > 0 ? { connectorPushHeld } : {}),
+      ...(pendingWcOrderRetryFailures > 0 ? { pendingWcOrderRetryFailures } : {}),
+    }
   } catch (e) {
     const error = String(e)
     await recordFxFetchAttempt({
@@ -196,6 +216,19 @@ export async function fetchAllFxRatesInternal(): Promise<{
 }
 
 type FxRefreshResult = Awaited<ReturnType<typeof fetchAllFxRatesInternal>>
+
+/** The error texts of every connector's FX push, split into those the outbound-write hold refused and the rest. */
+function countFxPushErrors(results: ReadonlyArray<{ errors: string[] }>): { failures: number; held: number } {
+  let failures = 0
+  let held = 0
+  for (const entry of results) {
+    for (const text of entry.errors) {
+      if (isOutboundWriteHeldText(text)) held += 1
+      else failures += 1
+    }
+  }
+  return { failures, held }
+}
 
 /**
  * The scheduled refresh when the FX source is Aelia: ONE read of the helper plugin (no retries here; the next scheduled run is the retry), then lib/currencies/aelia-ingest.ts validates and stores.
@@ -256,11 +289,13 @@ async function refreshFromAelia(): Promise<FxRefreshResult> {
   })
 
   let pendingWcOrderRetry: { attempted: number; imported: number; stillPending: number; failed: number } | null = null
+  let pendingWcOrderRetryFailures = 0
   if (result.written.length > 0) {
     try {
       const { retryPendingWcOrdersWaitingForFx } = await import('@/lib/connectors/woocommerce/sync/order-import')
       pendingWcOrderRetry = await retryPendingWcOrdersWaitingForFx()
     } catch (e) {
+      pendingWcOrderRetryFailures += 1
       await logActivity({
         entityType: 'SYNC', tag: 'sync', action: 'wc_order_fx_pending_retry', level: 'WARNING',
         description: `Failed to retry WooCommerce orders waiting for FX rates: ${String(e).slice(0, 240)}`,
@@ -269,7 +304,7 @@ async function refreshFromAelia(): Promise<FxRefreshResult> {
   }
   revalidatePath('/settings', 'layout')
   revalidatePath('/purchase-orders')
-  return { success: true, updated: result.written, failed, retryCount: 1, skippedManualOverrides: result.skippedManualOverrides, pendingWcOrderRetry }
+  return { success: true, updated: result.written, failed, retryCount: 1, skippedManualOverrides: result.skippedManualOverrides, pendingWcOrderRetry, ...(pendingWcOrderRetryFailures > 0 ? { pendingWcOrderRetryFailures } : {}) }
 }
 
 /**

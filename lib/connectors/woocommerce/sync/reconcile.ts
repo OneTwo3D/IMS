@@ -32,9 +32,33 @@ function parseCursor(value: string): { afterId: string; version: string } | null
   }
 }
 
-export async function runWcReconcile(): Promise<Record<string, unknown>> {
+type WcReconcileSkipped = { skipped: true; reason: string; reconciliationDue: boolean; lastReconciledAt: string | null }
+
+/** What the reconcile reports, section by section. Written out so tests/ops/cron-outcome-fields.test.ts sees every failure field. */
+export type WcReconcileResult = {
+  orders?: Awaited<ReturnType<typeof syncNewWcOrders>> | WcReconcileSkipped
+  heldSalesInvoices?: Awaited<ReturnType<typeof retryHeldWcSalesInvoiceReleases>>
+  products?: Awaited<ReturnType<typeof syncAllWcProducts>> | WcReconcileSkipped
+  refundStockCorrections?: { error: string }
+  stock?: {
+    queued: Awaited<ReturnType<typeof processQueuedWcStockSyncJobs>>
+    sync?: Awaited<ReturnType<typeof pushStockToWc>>
+    skipped?: true
+    reason?: string
+    reconciliationDue?: boolean
+    lastReconciledAt?: string | null
+    errors?: string[]
+    chunks?: number
+    synced?: number
+    candidates?: number
+    resumeAfter?: string | null
+    reconciledAt?: string
+  }
+}
+
+export async function runWcReconcile(): Promise<WcReconcileResult> {
   const startedAt = Date.now()
-  const results: Record<string, unknown> = {}
+  const results: WcReconcileResult = {}
 
   const webhookPrimaryActive = await isWcOrderWebhookPrimaryActive()
   if (!webhookPrimaryActive) {
@@ -90,9 +114,15 @@ export async function runWcReconcile(): Promise<Record<string, unknown>> {
   if (stockEnabled?.value === 'true') {
     // Stock corrections that refunds still owe the store (a queue failure left them open): record their jobs first so this run processes them.
     try {
-      await queueRefundStockCorrections({ limit: 50 })
+      const queuedCorrections = await queueRefundStockCorrections({ limit: 50 })
+      // The call RETURNS its per-refund failures (obligations left open because recording their job failed) without throwing: carry them, not drop them.
+      if (queuedCorrections.failed > 0) {
+        results.refundStockCorrections = { error: `${queuedCorrections.failed} open refund stock correction(s) could not be queued (they stay open and are retried)` }
+      }
     } catch (error) {
       console.error('[wc-reconcile] queueing open refund stock corrections failed', error)
+      // Carried into the result, not dropped: the rest of the run goes on, and the cron exit status reads this (held-aware, by the error text).
+      results.refundStockCorrections = { error: error instanceof Error ? error.message : String(error) }
     }
     const queued = await processQueuedWcStockSyncJobs({ limit: 100 })
     const lastReconcile = await db.setting.findUnique({ where: { key: 'last_wc_stock_daily_reconcile_at' } })

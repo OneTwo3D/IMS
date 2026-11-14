@@ -1,4 +1,3 @@
-import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { purgeExpiredActivityLogs, purgeExpiredCronRuns } from '@/lib/activity-log-cleanup'
@@ -7,6 +6,8 @@ import { purgeExpiredData } from '@/lib/data-retention'
 import { purgeExpiredWmsMutationEvents, WMS_MUTATION_EVENT_RETENTION_DAYS } from '@/lib/domain/wms/mutation-audit'
 import { logActivity } from '@/lib/activity-log'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
+import { cronResultResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export async function GET(request: Request) {
   const err = await verifyCron(request)
@@ -46,5 +47,6 @@ export async function GET(request: Request) {
     })
   }
 
-  return NextResponse.json({ totalDeleted, retention, demandDeleted, cronRuns, dataRetention, wmsMutationEvents })
+  const body = { totalDeleted, retention, demandDeleted, cronRuns, dataRetention, wmsMutationEvents }
+  return cronResultResponse(body, { outcomeClass: cronOutcome('activity-cleanup', body) })
 }

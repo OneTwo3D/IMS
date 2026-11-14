@@ -1,4 +1,3 @@
-import { NextResponse } from 'next/server'
 import { execFile } from 'child_process'
 import { mkdir, readdir, stat, unlink } from 'fs/promises'
 import path from 'path'
@@ -9,7 +8,7 @@ import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getBackupDir } from '@/lib/backup-storage'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { BackupArtifactUploadError, uploadBackupArtifactsToTarget } from '@/lib/backup-remote'
-import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
+import { runCronWithLogging } from '@/lib/ops/cron-run'
 import { backupManifestPath, writeBackupManifestForFile } from '@/lib/backup-manifest'
 import {
   BACKUP_MAX_COUNT_FALLBACK,
@@ -17,6 +16,8 @@ import {
   resolveBackupPurgeLimit,
 } from '@/lib/domain/settings/backup-schedule-input'
 import { isBackupScheduleEnabled } from '@/lib/domain/settings/backup-schedule-enabled'
+import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 const BACKUP_DIR = getBackupDir()
 
@@ -59,7 +60,7 @@ export async function GET(request: Request) {
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
 
-  const { runId, result, responseStatus } = await runCronWithLogging({
+  const { runId, result, outcomeClass, responseStatus } = await runCronWithLogging({
     jobName: 'backup',
     run: async () => {
       // BOTH ENABLEMENT ROWS, resolved the way the crontab resolves them (Codex r20 HIGH). This read
@@ -125,6 +126,8 @@ export async function GET(request: Request) {
       // Upload to remote if configured
       const autoUploadTarget = await getSetting('backup_auto_upload')
       let uploaded = false
+      // Set when a remote target IS configured and the upload failed: the backup exists locally but is not off the machine, which is the point of the target.
+      let uploadError: string | null = null
       if (autoUploadTarget === 's3' || autoUploadTarget === 'sftp') {
         try {
           await uploadBackupArtifactsToTarget(
@@ -147,11 +150,13 @@ export async function GET(request: Request) {
             description: `Scheduled backup created but remote upload to ${autoUploadTarget} failed: ${String(error)}`,
             metadata,
           })
+          uploadError = `Remote upload to ${autoUploadTarget} failed`
         }
       }
 
       // Cleanup: remove old backups beyond retention
       let deleted = 0
+      let cleanupError: string | null = null
       try {
         const files = await readdir(BACKUP_DIR)
         const backups: { name: string; mtime: Date }[] = []
@@ -171,7 +176,11 @@ export async function GET(request: Request) {
             deleted++
           }
         }
-      } catch { /* ignore cleanup errors */ }
+      } catch (error) {
+        // The backup itself is fine, but old copies were not purged, so the folder keeps growing: reported, not dropped.
+        cleanupError = 'Old backups could not be purged'
+        console.error('[backup] retention cleanup failed', error)
+      }
 
       await logActivity({
         entityType: 'SYSTEM',
@@ -180,12 +189,14 @@ export async function GET(request: Request) {
         description: `Scheduled backup ${filename} created${uploaded ? ` and uploaded to ${autoUploadTarget}` : ''}${deleted > 0 ? `, ${deleted} old backup(s) purged` : ''}`,
       })
 
-      return { filename, uploaded, deleted }
+      return { filename, uploaded, deleted, ...(uploadError ? { uploadError } : {}), ...(cleanupError ? { cleanupError } : {}) }
     },
     getOutcome: (result) => ({
       responseStatus: 'error' in result ? 500 : 200,
+      statusReason: [(result as Record<string, unknown>).uploadError, (result as Record<string, unknown>).cleanupError].filter((reason): reason is string => typeof reason === 'string').join('; ') || null,
     }),
+    outcomeOf: (result) => cronOutcome('backup', result),
   })
 
-  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit({ status: responseStatus }))
+  return cronRunResponse({ runId, result, outcomeClass, responseStatus })
 }
