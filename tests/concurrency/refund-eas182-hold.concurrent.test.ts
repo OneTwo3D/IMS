@@ -451,3 +451,26 @@ test('[refund 182 hold] the SAME refund treated twice at once is counted ONCE (t
   assert.equal(results.filter((r) => r.held && 'newlyHeld' in r && r.newlyHeld).length, 1, 'exactly one counted it')
   assert.equal(await heldCount(deps.db), '4', 'the count went up by one')
 })
+
+test('[refund 182 hold] a rate-182 refund created with the switch ON, the switch then turned OFF before its first hand-off completes, is HELD on the retry (the refused row), never queued as an ordinary credit note', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true, { [COUNT]: '0', [THRESHOLD]: '10' })
+  const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx) })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  const { retryRefundAccounting } = await import('../../app/actions/sales.ts')
+  const first = await refund182(deps, fx)
+  assert.equal(first.result.success, true, first.result.error)
+  // Back to the state before any credit note was queued, as if the first hand-off never completed.
+  await deps.db.accountingSyncLog.deleteMany({ where: { type: 'CREDIT_NOTE', referenceId: first.refund.id } })
+  await deps.db.$executeRaw`UPDATE sales_order_refunds SET eas182_held_at = NULL, accounting_retry_required = true WHERE id = ${first.refund.id}`
+  await deps.db.setting.update({ where: { key: COUNT }, data: { value: '0' } })
+  await deps.db.setting.upsert({ where: { key: 'xero_sync_sales_invoice' }, create: { key: 'xero_sync_sales_invoice', value: 'off' }, update: { value: 'off' } })
+  const retried = await retryRefundAccounting(first.refund.id)
+  assert.equal(retried.success, true, retried.error)
+  const row = await creditNoteRowOf(deps.db, first.refund.id)
+  assert.ok(row && EU_VAT_CREDIT_NOTE_REFUSED_KEY in row, 'the held, refused row')
+  assert.deepEqual(row.lines, [], 'no sendable payload')
+  assert.equal('_euVatTreatment' in row, false)
+  assert.equal(await heldCount(deps.db), '1')
+})

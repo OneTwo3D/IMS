@@ -241,3 +241,42 @@ test('[refund 182 treatment] prior refunds are priced for the aggregate bound: a
   const r6 = await eas182Refund(deps, f6, { net: '100', stated: '123.61', tax: '23.61' })
   assert.match((await refused(f6, r6)) ?? '', /more than the order's collected VAT not already refunded/)
 })
+
+test('[refund 182 persisted] a refund recorded under the scheme treatment keeps it when the Sales Invoices switch is turned OFF: held (or refused, or scheme-treated), never skipped to an ordinary credit note; a refund with NO snapshot is skipped as before', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, false, { [COUNT]: '0', [THRESHOLD]: '10' })
+  const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  const noStamp = await seed(deps, { stamp: null, schemeRate: true })
+  const outside = await seed(deps, { stamp: 'none', schemeRate: false })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx); await cleanup(deps.db, noStamp); await cleanup(deps.db, outside) })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  // (1) rate-182 refund, switch off, count below the threshold: HELD (the refused row), counted.
+  const r182 = await eas182Refund(deps, fx, { net: '100', stated: '119', tax: '19' })
+  let reason = ''
+  const held = await treat(deps, fx, r182, async (r) => { reason = r; return { queued: true, reason: 'queued', connector: 'xero' } })
+  assert.equal(held.kind, 'held', 'never skipped')
+  assert.match(reason, /rate 182/)
+  // (2) a persisted scheme snapshot WITHOUT the 182 figure (a #895 refund: stated gross, posting type, frozen rate): scheme-treated on the stamped account, not skipped.
+  const plain = await eas182Refund(deps, fx, { net: '100', stated: '119', tax: '19', eas: false })
+  const treated = await treat(deps, fx, plain, async () => ({ queued: true, connector: 'xero' }))
+  assert.equal(treated.kind, 'treated')
+  assert.equal(treated.kind === 'treated' && (treated.payload as { _euVatTreatment?: { applied?: boolean } })._euVatTreatment?.applied, true, 'carries the scheme marker')
+  // (3) the same snapshot on an order whose stamp is missing, or outside the scheme: a REFUSED hand-post row, never skipped.
+  const orphan = await eas182Refund(deps, noStamp, { net: '100', stated: '119', tax: '19' })
+  const a = await treat(deps, noStamp, orphan, async () => ({ queued: true, connector: 'xero' }))
+  assert.equal(a.kind, 'refused')
+  assert.equal(a.kind === 'refused' && a.code, 'hand_post')
+  const stray = await eas182Refund(deps, outside, { net: '100', stated: '119', tax: '19' })
+  const b = await treat(deps, outside, stray, async () => ({ queued: true, connector: 'xero' }))
+  assert.equal(b.kind === 'refused' && b.code, 'hand_post')
+  assert.match(b.kind === 'refused' ? b.reason : '', /recorded under the EU IOSS\/VOEC\/DDP scheme treatment/)
+  // (4) a refund with NO persisted snapshot at all: skipped, as before (byte-identical).
+  const bare = await deps.db.salesOrderRefund.create({ data: { orderId: fx.orderId, creditNoteNumber: 'CN-BARE', totalForeign: '100', totalBase: '100', totalsBasis: 'NET', lines: { create: [{ salesOrderLineId: fx.goods, description: 'Widget', qty: 1, unitPriceForeign: '100', unitPriceBase: '100', totalForeign: '100', totalBase: '100', accountingTaxType: fx.rate.accountingTaxType, lineKind: 'sale' }] } }, select: { id: true } })
+  const lineIds = (await deps.db.salesOrderRefundLine.findMany({ where: { refundId: bare.id }, select: { id: true } })).map((l) => l.id)
+  const { treatCreditNotePayload } = await import('../../lib/domain/sales/eu-vat-credit-note-treatment.ts')
+  const skipped = await treatCreditNotePayload({ refundId: bare.id, orderId: fx.orderId, payload: r182.payload, refundLineIds: lineIds, connector: 'xero', accounts: ACCOUNTS, now: new Date(), enqueueHeldRow: (async () => ({ queued: true })) as never })
+  assert.deepEqual(skipped, { kind: 'skipped', why: 'switch_off' })
+  // (5) the connector is no longer Xero but the refund was recorded under the scheme: refused, never skipped.
+  const other = await treatCreditNotePayload({ refundId: r182.refundId, orderId: fx.orderId, payload: r182.payload, refundLineIds: r182.lineIds, connector: 'quickbooks', accounts: ACCOUNTS, now: new Date(), enqueueHeldRow: (async () => ({ queued: true })) as never })
+  assert.equal(other.kind === 'refused' && other.code, 'hand_post')
+})
