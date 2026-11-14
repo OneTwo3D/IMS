@@ -137,7 +137,7 @@ async function listConfiguredShoppingConnectorIds(): Promise<ShoppingConnectorId
   return connectors
 }
 
-async function listRunnableShoppingConnectorIds(): Promise<ShoppingConnectorId[]> {
+export async function listRunnableShoppingConnectorIds(): Promise<ShoppingConnectorId[]> {
   const configured = await listConfiguredShoppingConnectorIds()
   return configured.filter((id) => getShoppingConnector(id).available)
 }

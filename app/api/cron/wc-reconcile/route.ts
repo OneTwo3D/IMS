@@ -1,11 +1,12 @@
-import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { db } from '@/lib/db'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runWcReconcile } from '@/lib/connectors/woocommerce/sync/reconcile'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
-import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
+import { runCronWithLogging } from '@/lib/ops/cron-run'
+import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 // Called by cron with Authorization: Bearer $CRON_SECRET.
 export async function GET(request: Request) {
@@ -16,7 +17,7 @@ export async function GET(request: Request) {
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
 
-  const { runId, result } = await runCronWithLogging({
+  const { runId, result, outcomeClass, responseStatus } = await runCronWithLogging({
     jobName: 'wc-reconcile',
     run: async () => {
       if (!(await isIntegrationPluginEnabled('woocommerce'))) {
@@ -28,9 +29,10 @@ export async function GET(request: Request) {
         return { skipped: true, reason: 'WC sync disabled' }
       }
 
-      return await runWcReconcile() as Record<string, unknown>
+      return await runWcReconcile()
     },
+    outcomeOf: (result) => cronOutcome('wc-reconcile', result),
   })
 
-  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit())
+  return cronRunResponse({ runId, result, outcomeClass, responseStatus })
 }

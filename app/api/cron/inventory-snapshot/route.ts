@@ -1,5 +1,3 @@
-import { NextResponse } from 'next/server'
-
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit, type CronRateLimitChecker } from '@/lib/cron-rate-limit'
 import {
@@ -9,12 +7,9 @@ import {
   writeDailyInventorySnapshot,
 } from '@/lib/domain/inventory/inventory-snapshot'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
-import {
-  appendCronRunId,
-  cronRunResponseInit,
-  runCronWithLogging,
-  type CronRunLogWriter,
-} from '@/lib/ops/cron-run'
+import { runCronWithLogging, type CronRunLogWriter } from '@/lib/ops/cron-run'
+import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export const runtime = 'nodejs'
 
@@ -43,7 +38,7 @@ export async function handleInventorySnapshotCron(
 
   const now = options.now ?? (() => new Date())
   const writeSnapshot = options.writeSnapshot ?? writeDailyInventorySnapshot
-  const { runId, result } = await runCronWithLogging({
+  const { runId, result, outcomeClass, responseStatus } = await runCronWithLogging({
     jobName: 'inventory-snapshot',
     now,
     createRunId: options.createRunId,
@@ -59,9 +54,10 @@ export async function handleInventorySnapshotCron(
       counts: inventorySnapshotCounts(result),
       statusReason: inventorySnapshotStatusReason(result),
     }),
+    outcomeOf: (result) => cronOutcome('inventory-snapshot', result),
   })
 
-  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit())
+  return cronRunResponse({ runId, result, outcomeClass, responseStatus })
 }
 
 export async function GET(request: Request) {

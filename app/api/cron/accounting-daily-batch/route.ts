@@ -1,9 +1,10 @@
-import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { resolveScheduledDailyBatchSweep } from '@/lib/domain/accounting/daily-batch-sweep-schedule'
-import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
+import { runCronWithLogging } from '@/lib/ops/cron-run'
+import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
@@ -13,7 +14,7 @@ export async function GET(request: Request) {
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
 
-  const { runId, result } = await runCronWithLogging({
+  const { runId, result, outcomeClass, responseStatus } = await runCronWithLogging({
     jobName: 'accounting-daily-batch',
     run: async () => {
       // o3d-i0o6 r6: which sweep runs — and the skip reasons — come from the SHARED definition, not
@@ -30,11 +31,12 @@ export async function GET(request: Request) {
       switch (schedule.connector) {
         case 'xero': {
           const { runDailyBatchSync } = await import('@/lib/connectors/xero/daily-sync')
-          return await runDailyBatchSync() as Record<string, unknown>
+          return await runDailyBatchSync()
         }
       }
     },
+    outcomeOf: (result) => cronOutcome('accounting-daily-batch', result),
   })
 
-  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit())
+  return cronRunResponse({ runId, result, outcomeClass, responseStatus })
 }

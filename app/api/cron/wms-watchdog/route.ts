@@ -1,8 +1,9 @@
-import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runWmsWatchdog } from '@/lib/domain/wms/watchdog-sweep'
+import { cronResultResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export async function GET(request: Request) {
   const authFailure = await verifyCron(request)
@@ -21,5 +22,5 @@ export async function GET(request: Request) {
   const result = await runWmsWatchdog()
   // FAILED = breaches exist that no one was alerted to (undeliverable
   // notifications) — surface as 500 so scheduler monitoring goes red.
-  return NextResponse.json(result, { status: result.status === 'FAILED' ? 500 : 200 })
+  return cronResultResponse(result, { outcomeClass: cronOutcome('wms-watchdog', result) })
 }

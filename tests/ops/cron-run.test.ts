@@ -435,6 +435,7 @@ test('cron run helper infers invariant summaries and error arrays', () => {
     }),
     {
       status: 'failed',
+      outcomeClass: 'failed',
       counts: { total: { total: 1, warning: 0, critical: 1, info: 0 } },
       statusReason: 'inventory failed',
     },
@@ -461,6 +462,7 @@ test('cron run helper infers non-empty failed arrays as failures', () => {
     }),
     {
       status: 'failed',
+      outcomeClass: 'failed',
       counts: { success: true },
       statusReason: 'failed: USD, CAD',
     },
@@ -479,6 +481,7 @@ test('cron run helper preserves nested WooCommerce reconcile counts', () => {
     }),
     {
       status: 'completed',
+      outcomeClass: 'ok',
       counts: {
         orders: { synced: 4, skipped: 1 },
         products: { synced: 2, skipped: 0 },
@@ -500,6 +503,7 @@ test('cron run helper treats nested skipped sections as non-fatal', () => {
     }),
     {
       status: 'completed',
+      outcomeClass: 'ok',
       counts: { orders: { imported: 3 }, stock: { skipped: true } },
       statusReason: null,
     },

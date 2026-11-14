@@ -1,17 +1,12 @@
-import { NextResponse } from 'next/server'
-
 import { isAccountingConnectorConnected } from '@/lib/accounting'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit, type CronRateLimitChecker } from '@/lib/cron-rate-limit'
 import { syncChartOfAccounts } from '@/lib/connectors/xero/accounts'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
-import {
-  appendCronRunId,
-  cronRunResponseInit,
-  runCronWithLogging,
-  type CronRunLogWriter,
-} from '@/lib/ops/cron-run'
+import { runCronWithLogging, type CronRunLogWriter } from '@/lib/ops/cron-run'
+import { cronRunResponse } from '@/lib/ops/cron-response'
+import { cronOutcome } from '@/lib/ops/cron-outcomes'
 
 export const runtime = 'nodejs'
 
@@ -51,7 +46,7 @@ export async function handleXeroChartSyncCron(
   const pluginEnabled = options.isPluginEnabled ?? isIntegrationPluginEnabled
   const connected = options.isConnected ?? isAccountingConnectorConnected
   const syncChart = options.syncChart ?? syncChartOfAccounts
-  const { runId, result, responseStatus } = await runCronWithLogging<ChartSyncCronResult>({
+  const { runId, result, outcomeClass, responseStatus } = await runCronWithLogging<ChartSyncCronResult>({
     jobName: 'xero-chart-sync',
     now: options.now,
     createRunId: options.createRunId,
@@ -73,12 +68,10 @@ export async function handleXeroChartSyncCron(
         responseStatus: failed ? 500 : 200,
       }
     },
+    outcomeOf: (result) => cronOutcome('xero-chart-sync', result),
   })
 
-  return NextResponse.json(
-    appendCronRunId(result as Record<string, unknown>, runId),
-    cronRunResponseInit({ status: responseStatus ?? 200 }),
-  )
+  return cronRunResponse({ runId, result: result as Record<string, unknown>, outcomeClass, responseStatus })
 }
 
 export async function GET(request: Request) {

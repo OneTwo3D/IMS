@@ -18,6 +18,8 @@ mock.module('@/lib/ops/cron-run', {
     runCronWithLogging: async (input: { run: () => Promise<Record<string, unknown>> }) => ({ runId: 'run-1', result: await input.run() }),
     appendCronRunId: (result: Record<string, unknown>, runId: string) => ({ ...result, runId }),
     cronRunResponseInit: () => undefined,
+    classifyCronResult: () => ({ outcomeClass: 'ok', statusReason: null }),
+    cronResponseStatusFor: () => 200,
   },
 })
 mock.module('@/lib/integration-plugins', { namedExports: { isIntegrationPluginEnabled: async () => state.pluginEnabled } })

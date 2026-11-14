@@ -71,6 +71,8 @@ function txDelegates() {
     },
   },
   salesOrder: {
+    // The existing-order branch asks whether a sales invoice is still owed by the order: not in this store.
+    findUnique: async () => ({ salesInvoiceOwedAt: null }),
     findFirst: async () => {
       state.findFirstCalls++
       return state.held ? { id: 'so-existing' } : null
