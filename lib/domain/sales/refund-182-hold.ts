@@ -30,8 +30,8 @@ export type Refund182HoldDecision<T extends HeldRowEnqueue> =
 
 /** The credit-note rows of this refund that could still be sent or are already posted: not cancelled, and not the refused marker. */
 async function sendableCreditNoteRows(client: Pick<typeof db, 'accountingSyncLog'>, refundId: string): Promise<string[]> {
-  const rows = await client.accountingSyncLog.findMany({ where: { type: 'CREDIT_NOTE', referenceType: 'SalesOrderRefund', referenceId: refundId, status: { not: 'CANCELLED' } }, select: { id: true, payload: true } })
-  return rows.filter((row) => { const payload = row.payload as Record<string, unknown> | null; return payload === null || typeof payload !== 'object' || payload[EU_VAT_CREDIT_NOTE_REFUSED_KEY] === undefined || payload[EU_VAT_CREDIT_NOTE_REFUSED_KEY] === null }).map((row) => row.id)
+  const rows = await client.accountingSyncLog.findMany({ where: { type: 'CREDIT_NOTE', referenceType: 'SalesOrderRefund', referenceId: refundId }, select: { id: true, status: true, payload: true } })
+  return rows.filter((row) => { if (row.status === 'CANCELLED') return false; const payload = row.payload as Record<string, unknown> | null; return payload === null || typeof payload !== 'object' || payload[EU_VAT_CREDIT_NOTE_REFUSED_KEY] === undefined || payload[EU_VAT_CREDIT_NOTE_REFUSED_KEY] === null }).map((row) => row.id)
 }
 
 class RowNotQueued<T> extends Error {
