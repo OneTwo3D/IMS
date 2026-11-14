@@ -1,11 +1,9 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import test, { mock } from 'node:test'
 import { config } from 'dotenv'
 
-import { EU_VAT_CREDIT_NOTE_REFUSED_KEY } from '../../lib/domain/accounting/eu-vat-credit-note.ts'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-keys.ts'
 
 /**
@@ -122,14 +120,7 @@ async function cleanup(db: Db, fx: Fixture | undefined) {
   await db.accountingToken.deleteMany({ where: { connector: 'xero', tenantId: 'tenant-eu-vat-cn-test' } }).catch(() => {})
 }
 
-const wooRefundId = () => 3_000_000 + Math.floor(Math.random() * 6_000_000)
-type RefundLine = { lineId: string | null; productId: null; description: string; qty: 0; totalBase: number; lineKind: 'sale' | 'shipping'; chargedTaxForeign?: number }
-const itemised = (lineId: string, description: string, net: number, tax: number): RefundLine => ({ lineId, productId: null, description, qty: 0, totalBase: net, lineKind: 'sale', chargedTaxForeign: tax })
 
-async function creditNoteRowOf(db: Db, refundId: string) {
-  const row = await db.accountingSyncLog.findFirst({ where: { type: 'CREDIT_NOTE', referenceId: refundId }, select: { payload: true } })
-  return (row?.payload ?? null) as Record<string, unknown> | null
-}
 const COUNT = 'eu_vat_refund182_held_count'
 const THRESHOLD = 'eu_vat_refund182_hold_threshold'
 const ACCOUNTS = { ioss: '821', ddp: '232', fee: '232', rounding: '860' }
