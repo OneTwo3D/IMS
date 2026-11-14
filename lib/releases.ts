@@ -14,6 +14,26 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
+    version: '4.2.0',
+    date: '2026-11-14',
+    title: 'Gift-card answers for unsettled order lines, safer WooCommerce sweep cursors, held-invoice sweep failures now visible',
+    summary: 'Nothing in 4.2.0 needs an operator action on upgrade. Sync > Exceptions gains a section where an operator answers "gift card or not" for order lines the store flagged unknown; the section is live, but it only matters once the EU VAT gift-card cut-in is set, which the owner can now do safely. The EU VAT pieces behind the Sales Invoices switch remain built, switched off. WooCommerce pull cursors no longer skip an order modified while a sweep was finishing, and a failed held-invoice sweep read now turns the wc-reconcile heartbeat red instead of staying green.',
+    userMessage: 'IMS 4.2 adds a "Gift card or not?" section to Sync > Exceptions, where you can answer for an order line the store could not settle. WooCommerce order and product sweeps are also less likely to miss an order changed while a sweep was finishing.',
+    userHighlights: [
+      'Sync > Exceptions: a new section, "Gift card or not? Order lines the store could not settle", lists held orders and the lines in question. Gift card or Not a gift card records the answer with who and when, and re-importing the order releases its held invoice. It is relevant only once the gift-card cut-in is set; until then no order is held for this reason.',
+      'Sync > Exceptions: the section is paged 50 orders at a time, its heading shows the true count, and the count is included in the Exceptions badge.',
+      'WooCommerce: an order modified while a sweep was finishing is no longer skipped; pull cursors now start from when the run began, less a 120 second overlap.',
+      'WooCommerce reconcile: a failed read while releasing held invoices now shows as a failure on the heartbeat instead of passing as ok.',
+    ],
+    technicalHighlights: [
+      'Migration (additive): new table eu_vat_gift_card_line_resolutions, with a store_identity column binding each answer to the store it was given for; answers are deleted when the store connection changes to another store and by the operator reset.',
+      'The eu_vat_gift_card_flag_cut_in setting may now be set by the owner: an unknown line no longer causes a permanent refusal, because an operator answer settles it. A flagged yes or no is never overridden, and an unanswered line keeps refusing.',
+      'Built, switched off: the EU VAT treatment itself stays behind the Sales Invoices switch. Only the answer section is live.',
+      'All WooCommerce pull cursors (order and product poll and reconcile, initial import completion) take the run start time minus WC_PULL_CURSOR_OVERLAP_MS (120 s). A commit writes the later of the stored and new value in one atomic upsert, so a cursor never moves backwards.',
+      'The held sales-invoice release sweep returns heldSalesInvoices.readError when a read throws; the cron outcome mapping counts it as a failure and the wc-reconcile route answers 500.',
+    ],
+  },
+  {
     version: '4.1.1',
     date: '2026-11-14',
     title: 'WooCommerce order sweep can save its progress again',
