@@ -77,6 +77,7 @@ const orderDb: Record<string, unknown> = {
   },
   wmsOrderPushLink: { updateMany: async () => ({ count: 0 }) },
   $queryRaw: async () => [],
+  $executeRaw: async () => 0,
   $transaction: async (ops: Array<Promise<unknown>> | ((tx: unknown) => Promise<unknown>)) => {
     // The status sweep's snapshot write is an interactive transaction (order lock, erasure marker, upsert).
     if (typeof ops === 'function') {

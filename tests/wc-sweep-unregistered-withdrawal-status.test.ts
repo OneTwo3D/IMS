@@ -123,6 +123,7 @@ mock.module('@/lib/db', {
       },
       salesOrder: { findFirst: async () => ({ id: 'so-any' }) },
       $queryRaw: async () => [],
+      $executeRaw: async () => 0,
       // The sweep writes the cursor and its fingerprint as ONE fact, in one interactive transaction.
       $transaction: async (run: (tx: unknown) => Promise<unknown>) => run(sweepDb),
     }),

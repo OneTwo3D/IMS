@@ -4819,7 +4819,7 @@ export async function syncNewWcOrders(
     // superseded. The fingerprint and the marker are never excluded: a concurrent sweep that narrowed
     // the list or set/cleared the marker is always caught by them.
     const committed = await db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${cursorKey}))`
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${cursorKey}))`
       const current = await tx.setting.findMany({ where: { key: { in: [cursorStatusesKey, droppedSinceKey] } } })
       const valueOf = (key: string): string | null => current.find((row) => row.key === key)?.value ?? null
       if (
