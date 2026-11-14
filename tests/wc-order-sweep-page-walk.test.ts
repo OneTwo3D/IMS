@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { cursorRaw } from './helpers/cursor-raw'
 import test, { mock } from 'node:test'
 
 import { MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '@/lib/connectors/woocommerce/api'
@@ -61,7 +62,7 @@ mock.module('@/lib/db', {
       },
       salesOrder: { findFirst: async () => ({ id: 'so-1' }) },
       $queryRaw: async () => [],
-      $executeRaw: async () => 0,
+      $executeRaw: cursorRaw((key, value) => upsert({ where: { key }, create: { key, value }, update: { value } })),
       // The cursor, its status fingerprint and the outage bookkeeping are written together, in one interactive transaction.
       $transaction: async (run: (tx: unknown) => Promise<unknown>) => await run(sweepDb),
     }),

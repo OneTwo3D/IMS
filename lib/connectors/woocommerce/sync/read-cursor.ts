@@ -34,17 +34,29 @@ export function laterCursor(current: string | null | undefined, candidate: strin
   return Number.isFinite(currentMs) && currentMs > Date.parse(candidate) ? (current as string) : candidate
 }
 
-type SettingClient = {
-  setting: {
-    findUnique: (args: { where: { key: string } }) => PromiseLike<{ value: string } | null>
-    upsert: (args: { where: { key: string }; create: { key: string; value: string }; update: { value: string } }) => PromiseLike<unknown>
-  }
-}
+type RawClient = { $executeRaw: (query: TemplateStringsArray, ...values: unknown[]) => PromiseLike<number> }
 
-/** Write `max(current, candidate)` to a cursor setting; returns what is stored afterwards. */
-export async function advancePullCursor(client: SettingClient, key: string, candidate: string): Promise<string> {
-  const current = await client.setting.findUnique({ where: { key } })
-  const next = laterCursor(current?.value, candidate)
-  await client.setting.upsert({ where: { key }, create: { key, value: next }, update: { value: next } })
-  return next
+/**
+ * Write `max(stored, candidate)` to a cursor setting in ONE statement.
+ *
+ * A read-then-upsert let two overlapping sweeps (or a sweep and a webhook advance) both read the same
+ * stored value and the older candidate land last, moving the cursor backwards. The comparison now
+ * happens inside the upsert, under the row lock the conflicting insert takes. Values are ISO
+ * timestamps held as text, compared as timestamptz; a stored value that is not an ISO timestamp is
+ * replaced by the candidate. `$executeRaw`, not `$queryRaw` (the statement returns no rows).
+ *
+ * Intended REWINDS (selection widening, refusal watermark) never go through here: they lower only the
+ * `modified_after` a run reads from and write their own settings directly.
+ */
+export async function advancePullCursor(client: RawClient, key: string, candidate: string): Promise<void> {
+  await client.$executeRaw`
+    INSERT INTO settings (key, value, "updatedAt")
+    VALUES (${key}, ${candidate}, NOW())
+    ON CONFLICT (key) DO UPDATE
+    SET value = CASE
+          WHEN settings.value ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' AND settings.value::timestamptz >= EXCLUDED.value::timestamptz
+            THEN settings.value
+          ELSE EXCLUDED.value
+        END,
+        "updatedAt" = NOW()`
 }

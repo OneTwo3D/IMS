@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { cursorRaw } from './helpers/cursor-raw'
 import test, { mock } from 'node:test'
 import type { WcFullProduct } from '../lib/connectors/woocommerce/sync/types.ts'
 import { describeWcPageWalkCeilingStall } from '@/lib/connectors/woocommerce/api'
@@ -781,7 +782,7 @@ const txClient = {
     findMany: async () => [],
     findUnique: async () => null,
   },
-  $executeRaw: async () => 1,
+  $executeRaw: cursorRaw((key) => { state.settingUpserts.push(key) }, async () => 1),
 }
 
 const dbMock = {

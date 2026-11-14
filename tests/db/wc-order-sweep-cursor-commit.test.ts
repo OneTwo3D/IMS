@@ -33,6 +33,8 @@ mock.module('@/lib/connectors/woocommerce/api', {
 })
 
 const CURSOR_KEY = 'last_wc_order_reconcile_at'
+// The settings rows these tests touch. They are SNAPSHOTTED before each test and RESTORED after it, so a
+// run against a database that holds real values leaves them as it found them.
 const KEYS = [
   CURSOR_KEY,
   `${CURSOR_KEY}_statuses`,
@@ -46,7 +48,34 @@ async function getDb() {
   config({ path: '.env.local', quiet: true })
   config({ quiet: true })
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required when RUN_DB_RETENTION_TESTS=1')
-  return (await import('../../lib/db')).db
+  const db = (await import('../../lib/db')).db
+  await assertDisposableDatabase(db)
+  return db
+}
+
+/**
+ * These tests write settings rows through the real sweep, which cannot run inside a rolled-back
+ * transaction (it opens its own). So refuse anything that does not look like a scratch or CI database.
+ */
+async function assertDisposableDatabase(db: { $queryRaw: <T>(q: TemplateStringsArray) => Promise<T> }) {
+  const [row] = await db.$queryRaw<Array<{ n: string }>>`SELECT current_database()::text AS n`
+  const name = row!.n
+  if (/^(postgres|template|pg_)|onetwo3d|onetwoinventory|prod|live/i.test(name) || !/scratch|_ci$|_test$/i.test(name)) {
+    throw new Error(`refusing to run against database "${name}": it is not a scratch/CI database (name must contain "scratch" or end in _ci/_test)`)
+  }
+}
+
+type Saved = Array<{ key: string; value: string }>
+
+async function snapshot(): Promise<Saved> {
+  const db = await getDb()
+  return db.setting.findMany({ where: { key: { in: KEYS } }, select: { key: true, value: true } })
+}
+
+async function restore(saved: Saved) {
+  const db = await getDb()
+  await db.setting.deleteMany({ where: { key: { in: KEYS } } })
+  for (const row of saved) await db.setting.create({ data: row })
 }
 
 async function put(key: string, value: string) {
@@ -59,21 +88,25 @@ async function get(key: string): Promise<string | null> {
   return (await db.setting.findUnique({ where: { key } }))?.value ?? null
 }
 
-async function clean() {
-  const db = await getDb()
-  await db.setting.deleteMany({ where: { key: { in: KEYS } } })
-}
-
 async function sweep() {
   const { syncNewWcOrders } = await import('../../lib/connectors/woocommerce/sync/order-import')
   return syncNewWcOrders({ mode: 'reconcile' })
 }
 
+async function withSnapshot(fn: () => Promise<void>) {
+  const db = await getDb()
+  const saved = await snapshot()
+  await db.setting.deleteMany({ where: { key: { in: KEYS } } })
+  try {
+    await fn()
+  } finally {
+    await restore(saved)
+  }
+}
+
 test('a clean sweep commits the read-start cursor less the overlap, through the real advisory-lock transaction', { skip }, async () => {
   const { WC_PULL_CURSOR_OVERLAP_MS } = await import('../../lib/connectors/woocommerce/sync/read-cursor')
-  const db = await getDb()
-  await clean()
-  try {
+  await withSnapshot(async () => {
     await put('wc_initial_import_completed', 'true')
     await put('wc_sync_order_statuses', JSON.stringify(['processing']))
     const before = Date.now()
@@ -89,16 +122,11 @@ test('a clean sweep commits the read-start cursor less the overlap, through the 
     assert.ok(await get(`${CURSOR_KEY}_statuses`), 'the fingerprint is written with it')
     const liveness = await get('wc_order_sweep_last_success_at')
     assert.ok(liveness && Date.parse(liveness) >= before, 'the liveness stamp is the real commit time, not the cursor')
-  } finally {
-    await clean()
-    await db.$disconnect()
-  }
+  })
 })
 
-test('a stored cursor newer than the candidate is kept (never regresses)', { skip }, async () => {
-  const db = await getDb()
-  await clean()
-  try {
+test('a stored cursor newer than the candidate is kept by the sweep (never regresses)', { skip }, async () => {
+  await withSnapshot(async () => {
     const newer = new Date(Date.now() + 60_000).toISOString()
     await put('wc_initial_import_completed', 'true')
     await put('wc_sync_order_statuses', JSON.stringify(['processing']))
@@ -106,8 +134,41 @@ test('a stored cursor newer than the candidate is kept (never regresses)', { ski
     const result = await sweep()
     assert.deepEqual(result.errors, [])
     assert.equal(await get(CURSOR_KEY), newer)
-  } finally {
-    await clean()
-    await db.$disconnect()
-  }
+  })
+})
+
+test('advancePullCursor is one atomic max: an OLDER candidate applied after a NEWER one leaves the newer', { skip }, async () => {
+  const { advancePullCursor } = await import('../../lib/connectors/woocommerce/sync/read-cursor')
+  const db = await getDb()
+  await withSnapshot(async () => {
+    const older = '2026-11-14T10:00:00.000Z'
+    const newer = '2026-11-14T10:05:00.000Z'
+    await advancePullCursor(db, CURSOR_KEY, newer)
+    await advancePullCursor(db, CURSOR_KEY, older)
+    assert.equal(await get(CURSOR_KEY), newer, 'the late, older writer did not move the cursor backwards')
+    await advancePullCursor(db, CURSOR_KEY, '2026-11-14T10:10:00.000Z')
+    assert.equal(await get(CURSOR_KEY), '2026-11-14T10:10:00.000Z', 'a newer candidate still advances it')
+  })
+})
+
+test('advancePullCursor: concurrent writers in either order end on the maximum', { skip }, async () => {
+  const { advancePullCursor } = await import('../../lib/connectors/woocommerce/sync/read-cursor')
+  const db = await getDb()
+  await withSnapshot(async () => {
+    const times = Array.from({ length: 12 }, (_, i) => new Date(Date.parse('2026-11-14T10:00:00.000Z') + i * 60_000).toISOString())
+    const shuffled = [...times].reverse().map((t, i) => (i % 2 ? t : times[i]))
+    await Promise.all(shuffled.map((t) => db.$transaction((tx) => advancePullCursor(tx, CURSOR_KEY, t))))
+    const expected = shuffled.reduce((a, b) => (Date.parse(a) >= Date.parse(b) ? a : b))
+    assert.equal(await get(CURSOR_KEY), expected)
+  })
+})
+
+test('advancePullCursor replaces a stored value that is not a timestamp', { skip }, async () => {
+  const { advancePullCursor } = await import('../../lib/connectors/woocommerce/sync/read-cursor')
+  const db = await getDb()
+  await withSnapshot(async () => {
+    await put(CURSOR_KEY, 'not-a-date')
+    await advancePullCursor(db, CURSOR_KEY, '2026-11-14T10:00:00.000Z')
+    assert.equal(await get(CURSOR_KEY), '2026-11-14T10:00:00.000Z')
+  })
 })

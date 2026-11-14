@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { cursorRaw } from './helpers/cursor-raw'
 import test, { mock } from 'node:test'
 
 /**
@@ -72,6 +73,7 @@ mock.module('@/lib/db', {
         },
       },
       shoppingOrderLink: { findMany: async () => [] },
+      $executeRaw: cursorRaw((key, value) => settings.set(key, value)),
     },
   },
 })

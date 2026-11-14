@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { cursorRaw } from './helpers/cursor-raw'
 import test, { mock } from 'node:test'
 
 /**
@@ -59,7 +60,11 @@ mock.module('@/lib/db', {
       },
       salesOrder: { findFirst: async () => ({ id: 'so-any' }) },
       $queryRaw: async () => [],
-      $executeRaw: async () => 0,
+      $executeRaw: cursorRaw((key, value) => {
+        // The real statement keeps the later value (pinned against Postgres in tests/db); the double mirrors that.
+        const stored = state.settings.get(key)
+        if (!stored || Date.parse(stored) < Date.parse(value)) state.settings.set(key, value)
+      }),
       $transaction: async (run: (tx: unknown) => Promise<unknown>) => run(sweepDb),
     }),
   },
