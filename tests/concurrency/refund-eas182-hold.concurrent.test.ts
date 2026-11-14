@@ -1,5 +1,6 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import test, { mock } from 'node:test'
 import { config } from 'dotenv'
@@ -343,4 +344,39 @@ test('[refund 182 hold] a SENDABLE credit note already queued for the refund is 
   assert.ok(await deps.db.activityLog.findFirst({ where: { entityId: fx.orderId, action: 'refund_182_hold_conflict' } }), 'surfaced again')
   assert.equal(await heldCount(deps.db), '0')
   assert.deepEqual((await deps.db.accountingSyncLog.findMany({ where: { type: 'CREDIT_NOTE', referenceId: first.refund.id }, select: { id: true, status: true, payload: true } }))[0], rowBefore)
+})
+
+test('[refund 182 hold] the held row must EXIST with this refund\'s key before anything is stamped or counted: a handled-by-hand answer with no row, and a "queued" answer with no row, both leave no stamp and no count', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true, { [COUNT]: '3', [THRESHOLD]: '10' })
+  const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx) })
+  const { decideRefund182Hold, creditNoteIdempotencyKey } = await import('../../lib/domain/sales/refund-182-hold.ts')
+  const fresh = await deps.db.salesOrderRefund.create({ data: { orderId: fx.orderId, totalForeign: 1, totalBase: 1, totalsBasis: 'NET' }, select: { id: true } })
+  const stampOf = async () => (await deps.db.salesOrderRefund.findUnique({ where: { id: fresh.id }, select: { eas182HeldAt: true } }))!.eas182HeldAt
+  // The posting was marked handled by hand: the enqueue answers queued, reason handled-by-hand, and writes NO row.
+  const handled = await decideRefund182Hold(fresh.id, async () => ({ queued: true as const, reason: 'handled-by-hand' }))
+  assert.deepEqual(handled, { held: false, handledByHand: true, outcome: { queued: true, reason: 'handled-by-hand' } })
+  assert.equal(await stampOf(), null, 'no stamp')
+  assert.equal(await heldCount(deps.db), '3', 'no count')
+  // "Queued" with no row at all (any other reason): not a hold; reported as unmet.
+  const missing = await decideRefund182Hold(fresh.id, async () => ({ queued: true as const, reason: 'already-queued' }))
+  assert.deepEqual(missing, { held: true, queued: false, outcome: { queued: true, reason: 'already-queued' }, rowMissing: true })
+  assert.equal(await stampOf(), null)
+  assert.equal(await heldCount(deps.db), '3')
+  // A refused row under ANOTHER key is not this refund's held row.
+  const other = await deps.db.accountingSyncLog.create({ data: { type: 'CREDIT_NOTE', status: 'PENDING', referenceType: 'SalesOrderRefund', referenceId: fresh.id, payload: { lines: [], _euVatCreditNoteRefused: { reason: 'x' }, _idempotencyKey: 'some-other-key' } }, select: { id: true } })
+  const wrongKey = await decideRefund182Hold(fresh.id, async () => ({ queued: true as const, reason: 'already-queued' }))
+  assert.equal(wrongKey.held && !wrongKey.queued, true)
+  assert.equal(await stampOf(), null)
+  assert.equal(await heldCount(deps.db), '3')
+  // The row with this refund's key: held, stamped, counted.
+  await deps.db.accountingSyncLog.update({ where: { id: other.id }, data: { payload: { lines: [], _euVatCreditNoteRefused: { reason: 'x' }, _idempotencyKey: creditNoteIdempotencyKey(fresh.id) } } })
+  const ok = await decideRefund182Hold(fresh.id, async () => ({ queued: true as const, reason: 'already-queued' }))
+  assert.equal(ok.held && ok.queued && ok.newlyHeld, true)
+  assert.ok(await stampOf())
+  assert.equal(await heldCount(deps.db), '4')
+  // The key the hold expects is the key the hand-off queues under.
+  assert.match(readFileSync('app/actions/sales.ts', 'utf8'), /idempotencyKey: `sales-order-refund:\$\{input\.refundId\}:credit-note`/)
+  assert.equal(creditNoteIdempotencyKey('R1'), 'sales-order-refund:R1:credit-note')
 })

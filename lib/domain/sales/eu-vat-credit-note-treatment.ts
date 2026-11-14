@@ -32,6 +32,8 @@ export type TreatedCreditNoteOutcome =
   | { kind: 'held'; outcome: AccountingEnqueueOutcome }
   /** A rate-182 hold could not be applied: the refund's credit-note row is already queued SENDABLE (or posted). Nothing was stamped or counted and that row is untouched; `outcome` is the enqueue's answer for the obligation ledger. */
   | { kind: 'hold_conflict'; outcome: AccountingEnqueueOutcome }
+  /** The posting was already marked handled by hand, so the held row's enqueue wrote nothing (the answer is queued): no stamp, no count, nothing to hold. `outcome` settles the obligation. */
+  | { kind: 'hold_handled'; outcome: AccountingEnqueueOutcome }
   | { kind: 'treated'; payload: Record<string, unknown>; regimePolicy: RegimePolicy }
   /** The credit note cannot be raised as it is: the reason is the operator-facing sentence. */
   | { kind: 'refused'; reason: string; /** `hand_post`: nothing a retry can change, so the hand-off queues a REFUSED row for the operator to settle by hand; any other refusal is cleared by fixing its cause and retrying. */ code?: 'hand_post' }
@@ -65,8 +67,9 @@ export async function treatCreditNotePayload(params: {
       creditNoteNumber: heldNumber, heldNumber: place.heldNumber, threshold: place.threshold ?? place.heldNumber, vatAccount: (prior.order.euVatLineAccount ?? '').trim() || 'the stamped VAT account',
       vatAmount: prior.eas182StatedTaxForeign === null ? 'the refund\'s VAT' : toDecimal(prior.eas182StatedTaxForeign).toString(), refundTotal: prior.statedGrossForeign === null ? 'the refund amount' : toDecimal(prior.statedGrossForeign).toString(), currency,
     })))
+    if ('handledByHand' in decision) return { kind: 'hold_handled', outcome: decision.outcome }
     if ('conflict' in decision) { await recordHoldConflict(params.orderId, params.refundId, heldNumber); return { kind: 'hold_conflict', outcome: decision.outcome } }
-    if (decision.held) return { kind: 'held', outcome: decision.outcome }
+    if (decision.held) return { kind: 'held', outcome: decision.queued || !decision.rowMissing ? decision.outcome : unmetOutcome(decision.outcome) }
   }
 
   // THE SWITCH, ASKED FIRST (the Sales Invoices switch, the one the invoice treatment asks): off means nothing here runs.
@@ -184,6 +187,7 @@ export async function treatCreditNotePayload(params: {
   // THE HOLD, decided last: only a credit note that would otherwise post is counted. The first N rate-182 credit notes are a refused, settle-by-hand row (never sent); after that they post.
   if (rate182) {
     const hold = await decideRefund182Hold(params.refundId, async (place) => params.enqueueHeldRow(refund182HeldRefusal({ creditNoteNumber: number, heldNumber: place.heldNumber, threshold: place.threshold ?? place.heldNumber, vatAccount, vatAmount: figures.vatAmount, refundTotal: figures.refundTotal, currency: payload.currency })))
+    if ('handledByHand' in hold) return { kind: 'hold_handled', outcome: hold.outcome }
     if ('conflict' in hold) { await recordHoldConflict(params.orderId, params.refundId, number); return { kind: 'hold_conflict', outcome: hold.outcome } }
     if (hold.held) {
       if (hold.queued && hold.newlyHeld) {
@@ -193,7 +197,7 @@ export async function treatCreditNotePayload(params: {
           metadata: { refundId: params.refundId },
         }).catch(() => { /* the refused row is what holds it; logging must not throw */ })
       }
-      return { kind: 'held', outcome: hold.outcome }
+      return { kind: 'held', outcome: hold.queued || !hold.rowMissing ? hold.outcome : unmetOutcome(hold.outcome) }
     }
   }
   return {
@@ -259,4 +263,9 @@ async function recordHoldConflict(orderId: string, refundId: string, number: str
     description: `Credit note ${number} (a refund whose VAT is on WooCommerce rate 182) could NOT be held for review: a credit note for this refund was already queued to be sent, or already posted, before the hold applied. Nothing was held or counted and that credit note was left as it is. Check Xero for credit note ${number} and review it there.`,
     metadata: { refundId },
   }).catch(() => { /* the untouched row stands; logging must not throw */ })
+}
+
+/** The held row's enqueue said queued but wrote no refused row: the obligation is unmet (a retry holds it again), whatever the enqueue said. */
+function unmetOutcome(outcome: AccountingEnqueueOutcome): AccountingEnqueueOutcome {
+  return { queued: false, reason: 'refused', connector: outcome.connector ?? null }
 }

@@ -276,7 +276,7 @@ test('o3d-2sm1 r7: every enqueue in the refund hand-off is accounted for, and it
     assert.match(call[1], /ledger\.account\(\w+, $|\(payload: Record<string, unknown>\) => $/, 'every facade enqueue hands its answer to the ledger')
   }
   assert.match(handoff, /ledger\.account\(creditNote, await enqueueCreditNoteRow\(/, 'the credit note enqueue is accounted')
-  assert.match(handoff, /creditNoteTreatment\.kind === 'held' \|\| creditNoteTreatment\.kind === 'hold_conflict'\) \{[^}]*ledger\.account\(creditNote, creditNoteTreatment\.outcome\)/, 'a held credit note accounts its refused row\'s outcome')
+  assert.match(handoff, /creditNoteTreatment\.kind === 'held' \|\| creditNoteTreatment\.kind === 'hold_conflict' \|\| creditNoteTreatment\.kind === 'hold_handled'\) \{[^}]*ledger\.account\(creditNote, creditNoteTreatment\.outcome\)/, 'a held credit note accounts its refused row\'s outcome')
   // r8: THROUGH THE ADAPTER, which is what carries the enqueue's own resolved connector out to the
   // ledger. A bare `queueAccountingSyncTx` here would hand back a boolean again and the pinned check
   // would have nothing to check.

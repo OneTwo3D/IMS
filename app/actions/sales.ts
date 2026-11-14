@@ -2398,7 +2398,7 @@ async function queueRefundAccountingActions(input: {
     // The hold queues its REFUSED row through the very enqueue below (same key, same chart pin), inside the hold's own transaction, so no stamp or count exists without the row.
     enqueueHeldRow: (reason) => enqueueCreditNoteRow(refusedCreditNotePayload({ creditNoteNumber: builtCreditNotePayload.creditNoteNumber, currency: builtCreditNotePayload.currency, reference: builtCreditNotePayload.reference, date: builtCreditNotePayload.date, refundId: input.refundId, orderId: input.orderId, lines: builtCreditNotePayload.lines, reason })),
   })
-  if (creditNoteTreatment.kind === 'held' || creditNoteTreatment.kind === 'hold_conflict') {
+  if (creditNoteTreatment.kind === 'held' || creditNoteTreatment.kind === 'hold_conflict' || creditNoteTreatment.kind === 'hold_handled') {
     // The refused row IS the hand-off's credit note (queued, or not: then the obligation stays unmet and a retry holds it again).
     ledger.account(creditNote, creditNoteTreatment.outcome)
   } else if (creditNoteTreatment.kind === 'refused' && creditNoteTreatment.code !== 'hand_post') {
