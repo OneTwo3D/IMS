@@ -232,3 +232,29 @@ test('[refund 182 re-price] a MONETARY-ONLY refund (zero returned quantity) on a
   const refused = await syncWcRefund(over.externalOrderId, monetary(wooRefundId(), over.externalOrderId, '10.00', '30.00') as never)
   assert.equal((await refundsOf(deps, over.fx.orderId)).length, 0, 'over-bound: ' + (refused.error ?? ''))
 })
+
+test('[refund 182 re-price] a DISCOUNTED order: the re-priced refund is recorded, the credit note the treatment builds equals the refund, no server discount line is added on this internal path, and a LATER refund is bounded by the correct prior VAT', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, true, { [COUNT]: '0', [THRESHOLD]: '0' })
+  const { fx, externalOrderId } = await wcOrder(deps, 'IOSS')
+  t.after(async () => { await restore(); await cleanup(deps.db, fx) })
+  await deps.db.salesOrder.update({ where: { id: fx.orderId }, data: { discountAmount: '10' } })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  const { syncWcRefund } = await import('../../lib/connectors/woocommerce/sync/refund-sync.ts')
+  // Threshold 0: nothing is held, the credit note posts on the stamped account.
+  const first = await syncWcRefund(externalOrderId, wcShippingRefund(wooRefundId(), externalOrderId, '10.00', '2.00') as never)
+  assert.notEqual(first.outcome, 'quarantined-refusal', first.error)
+  const refunds = await refundsOf(deps, fx.orderId)
+  assert.equal(refunds.length, 1, 'recorded: ' + (first.error ?? ''))
+  const persisted = await deps.db.salesOrderRefundLine.findMany({ where: { refundId: refunds[0]!.id }, select: { lineKind: true, totalForeign: true } })
+  assert.deepEqual(persisted.map((l) => [l.lineKind, Number(l.totalForeign)]), [['shipping', 10]], 'no server discount line on the internal path')
+  const row = await deps.db.accountingSyncLog.findFirst({ where: { type: 'CREDIT_NOTE', referenceId: refunds[0]!.id }, select: { payload: true } })
+  const lines = (row?.payload as { lines: Array<{ unitAmount: number; quantity: number; accountCode: string }> }).lines
+  assert.equal(lines.reduce((sum, l) => sum + l.unitAmount * l.quantity, 0).toFixed(2), '12.00', 'the credit note totals the refund')
+  assert.equal(lines.at(-1)?.accountCode, '821', 'VAT on the stamped account')
+  // The later refund is bounded by the prior 2.00: 23.46 more is exactly the order's 25.46; one more cent over the allowance is refused.
+  const second = await syncWcRefund(externalOrderId, wcShippingRefund(wooRefundId(), externalOrderId, '10.00', '23.46') as never)
+  assert.equal((await refundsOf(deps, fx.orderId)).length, 2, 'the second fits: ' + (second.error ?? ''))
+  const third = await syncWcRefund(externalOrderId, wcShippingRefund(wooRefundId(), externalOrderId, '1.00', '0.06') as never)
+  assert.equal((await refundsOf(deps, fx.orderId)).length, 2, 'the VAT is exhausted: ' + (third.error ?? ''))
+})

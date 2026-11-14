@@ -4650,17 +4650,20 @@ export async function createSalesOrderRefund(
       // credited across the order's refunds may not exceed the order's collected VAT by more than one fixed allowance. Every other refund keeps the per-line fence unchanged.
       const rate182 = input.euVatSchemeSnapshot === true && input.eas182StatedTaxForeign != null && Number.isFinite(input.eas182StatedTaxForeign) && input.statedGrossForeign != null && Number.isFinite(input.statedGrossForeign)
       if (rate182) {
+        // The net is that of EVERY line that will be persisted and that the credit note will be built from, a server-generated (negative) order-discount line included if there is one: the treatment sums every persisted line, so this must too or the writer would accept what the credit note then refuses.
+        // (Only a public caller's refund gets the server-derived discount line, and the rate-182 classification is internal-only, so today none is present; the sum is over refundLines either way.)
         const taxedLines = refundLines.filter((refundLine) => refundLine.lineKind !== 'discount')
+        const hasDiscountLine = taxedLines.length !== refundLines.length
         let net182 = toDecimal(0)
+        for (const refundLine of refundLines) net182 = net182.add(toDecimal(netForeignOf(refundLine)))
         let statedLineTax = toDecimal(0)
         let everyLineStates = true
         for (const refundLine of taxedLines) {
-          net182 = net182.add(toDecimal(netForeignOf(refundLine)))
           if (refundLine.chargedTaxForeign == null) everyLineStates = false
           else statedLineTax = statedLineTax.add(toDecimal(refundLine.chargedTaxForeign))
         }
         const minor182 = toDecimal(1).div(toDecimal(10).pow(currencyMinorUnits(so.currency)))
-        if (everyLineStates && statedLineTax.sub(toDecimal(input.eas182StatedTaxForeign!)).abs().gt(minor182.mul(taxedLines.length + 1))) {
+        if (everyLineStates && !hasDiscountLine && statedLineTax.sub(toDecimal(input.eas182StatedTaxForeign!)).abs().gt(minor182.mul(taxedLines.length + 1))) {
           return refuse(`the VAT its lines state (${statedLineTax.toString()} ${so.currency}) does not match the VAT the refund states in all (${toDecimal(input.eas182StatedTaxForeign!).toString()} ${so.currency}).`)
         }
         const priorTax = await priorRefundedTax(tx, input.orderId, null, toDecimal(so.taxForeign))
