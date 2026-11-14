@@ -1295,7 +1295,7 @@ test('[eu vat] the SWEEP never releases a treated hold that carries the not-tota
 
 // THE TREATMENT AND THE IMPORT'S HELD-INVOICE CHECK DECIDE THE REGIME FROM THE SAME SETTINGS-DERIVED INPUT, the gift-card flag cut-in included.
 const GIFT_CARD_CUT_IN = 'eu_vat_gift_card_flag_cut_in'
-async function giftCardHold(t: test.TestContext, cutIn: { atPark: string | null; atRelease: string | null }) {
+async function giftCardHold(t: test.TestContext, cutIn: { atPark: string | null; atRelease: string | null }, answer?: { isGiftCard: boolean }) {
   const db = await loadDb()
   await mockAccounting()
   switchOn = true
@@ -1308,7 +1308,7 @@ async function giftCardHold(t: test.TestContext, cutIn: { atPark: string | null;
     if (value === null) await db.setting.deleteMany({ where: { key: GIFT_CARD_CUT_IN } })
     else await db.setting.upsert({ where: { key: GIFT_CARD_CUT_IN }, create: { key: GIFT_CARD_CUT_IN, value }, update: { value } })
   }
-  t.after(async () => { switchOn = false; await setCutIn(null); await cleanup(db, externalId, ctx) })
+  t.after(async () => { switchOn = false; await setCutIn(null); await db.euVatGiftCardLineResolution.deleteMany({ where: { externalOrderId: String(externalId) } }); await cleanup(db, externalId, ctx) })
   // The order carries a gift-card line with NO flag (the plugin did not write one): lenient before the cut-in, a refusal from it on. It was created 2026-11-02.
   const unflagged = (m: Meta) => { const p = payload(externalId, wcRateId, m); p.line_items[0]!.meta_data = []; return p }
   await setCutIn(cutIn.atPark)
@@ -1319,6 +1319,8 @@ async function giftCardHold(t: test.TestContext, cutIn: { atPark: string | null;
   const parkedMarker = (held.payload as unknown as { accountingPayload: Invoice }).accountingPayload._euVatTreatment as Record<string, unknown>
   const stampedAtPark = (await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { euVatRegime: true } })).euVatRegime
   await setCutIn(cutIn.atRelease)
+  // An operator's answer for the unflagged line (WooCommerce line item 1), recorded before the re-import.
+  if (answer) await db.euVatGiftCardLineResolution.create({ data: { connector: 'woocommerce', externalOrderId: String(externalId), externalLineItemId: 1, isGiftCard: answer.isGiftCard, resolvedByUserId: 'test-operator' } })
   await importWcOrder(unflagged([{ id: 4, key: '_wcpdf_invoice_number', value: `INV-${externalId}` }, ...PLUGIN('821')]) as never)
   return {
     parkedMarker, stampedAtPark,
@@ -1343,6 +1345,21 @@ test('[eu vat] gift-card line with no flag, cut-in BEFORE the order (required): 
   assert.equal(rows.length, 0)
   assert.equal(after.status, 'PENDING')
   assert.match(after.errorMessage ?? '', /gift-card flag/)
+})
+
+test('[eu vat] gift-card line with no flag, cut-in BEFORE the order, then an operator answers "not a gift card": the parked refusal names the line, and the re-import treats, stamps and releases the hold', { skip }, async (t) => {
+  const { parkedMarker, stampedAtPark, rows, after } = await giftCardHold(t, { atPark: '2026-11-01', atRelease: '2026-11-01' }, { isGiftCard: false })
+  assert.deepEqual([parkedMarker.applied, parkedMarker.reason], [false, 'treatment_refused'])
+  assert.deepEqual(parkedMarker.giftCardLineIds, [1], 'the refusal names the unsettled line')
+  assert.equal(stampedAtPark, null, 'nothing was stamped while it was unanswered')
+  assert.equal(rows.length, 1, 'released')
+  assert.equal(after.status, 'SYNCED')
+})
+
+test('[eu vat] the same, answered "a gift card": the order is decided and released too (the answer settles the flag; the value rule is the regime\u2019s own)', { skip }, async (t) => {
+  const { rows, after } = await giftCardHold(t, { atPark: '2026-11-01', atRelease: '2026-11-01' }, { isGiftCard: true })
+  assert.equal(rows.length, 1, 'released')
+  assert.equal(after.status, 'SYNCED')
 })
 
 test('[eu vat] the cut-in passes between parking and release: the treated hold is refused by the held-invoice check with the same gift-card reason', { skip }, async (t) => {

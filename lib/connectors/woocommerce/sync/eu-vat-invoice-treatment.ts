@@ -59,7 +59,7 @@ export type TreatedInvoiceOutcome =
   /** The payload with the treatment applied, and what it did. */
   | { kind: 'treated'; payload: Record<string, unknown>; warnings: RegimeWarning[]; /** The order's tax binding as it was when the treatment ran (recorded in the marker). */ taxBinding: WcTaxBinding; /** The regime settings the decision was made under, from the one read (recorded on the hold). */ regimePolicy: RegimePolicy }
   /** The order cannot be invoiced as it is: the reason is the operator-facing sentence the document is stamped with. */
-  | { kind: 'refused'; reason: string }
+  | { kind: 'refused'; reason: string; /** The store ids of the lines whose gift-card flag is unsettled, when that is why (an operator can answer for them). */ giftCardLineIds?: number[] }
 
 export async function treatImportedSalesInvoice(params: {
   orderId: string
@@ -89,7 +89,7 @@ export async function treatImportedSalesInvoice(params: {
   const { input, policy } = read
   const decision = resolveEuVatRegime(input)
   const outcome = await db.$transaction((tx) => stampEuVatRegime(tx, params.orderId, () => input, params.now), { maxWait: 5_000, timeout: 20_000 })
-  if (outcome.kind === 'refused') return { kind: 'refused', reason: `the order's EU VAT regime cannot be established (${outcome.code}): ${outcome.reason}` }
+  if (outcome.kind === 'refused') return { kind: 'refused', reason: `the order's EU VAT regime cannot be established (${outcome.code}): ${outcome.reason}`, ...(outcome.giftCardLineIds ? { giftCardLineIds: outcome.giftCardLineIds } : {}) }
   if (outcome.kind === 'order_not_found') return { kind: 'refused', reason: 'the sales order could not be found to record its EU VAT regime' }
 
   if (outcome.kind === 'stamped' && outcome.warnings.length > 0) {

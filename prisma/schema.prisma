@@ -3850,6 +3850,23 @@ model ShoppingCustomerLink {
   @@map("shopping_customer_links")
 }
 
+/// An operator's answer for one WooCommerce order line whose gift-card flag (`_o3d_is_voucher`) the plugin could not
+/// settle (it wrote `unknown`, or nothing). Keyed by the store's own ids, so it survives a re-import and needs no local
+/// line to exist. It fills a gap only: the regime builder honours it for a line whose flag is unreadable, never over a
+/// readable yes/no. Who and when are kept; a changed answer overwrites the row and the activity log keeps the history.
+model EuVatGiftCardLineResolution {
+  id                  String   @id @default(cuid())
+  connector           String
+  externalOrderId     String   @map("external_order_id")
+  externalLineItemId  Int      @map("external_line_item_id")
+  isGiftCard          Boolean  @map("is_gift_card")
+  resolvedByUserId    String   @map("resolved_by_user_id")
+  resolvedAt          DateTime @default(now()) @map("resolved_at")
+
+  @@unique([connector, externalOrderId, externalLineItemId], map: "eu_vat_gift_card_line_resolutions_line_key")
+  @@map("eu_vat_gift_card_line_resolutions")
+}
+
 model ShoppingOrderLink {
   id                  String   @id @default(cuid())
   orderId             String

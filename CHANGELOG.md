@@ -10,6 +10,12 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### EU VAT: an operator can settle a gift-card line the store left `unknown`
+
+- **Fixed: after the gift-card cut-in, an order with a custom line or a deleted-product line was refused for good.** The plugin writes `unknown` on such lines and IMS treated that as missing, so the order was refused (`gift_card_flag_missing`) and re-importing could never clear it. The cut-in (`eu_vat_gift_card_flag_cut_in`) should not be set until this is deployed.
+- **Now an operator answers per line.** **Sync > Exceptions > "Gift card or not? Order lines the store could not settle"** lists the held orders and the lines the refusal named; **Gift card** or **Not a gift card** records the answer with who and when (sync permission, fresh sign-in; the history is in the activity log). The regime builder uses the answer for that line only where the store left it unsettled: a flagged `yes`/`no` is never overridden, and an unanswered line keeps refusing (no default). Re-import the order afterwards and its held invoice is released.
+- The refusal now says where to answer, and the parked refusal records the line ids. Migration: one new table, `eu_vat_gift_card_line_resolutions` (additive). Not done on purpose: no automatic "not a gift card" rule from the product, because IMS holds no gift-card marker on products to prove it.
+
 ### WooCommerce: orders blocked by a guard are recorded, so the initial import cannot strand them
 
 - **Fixed: the initial order import could complete over orders it had refused, and those orders were never imported.** An order blocked by the tax-rate fallback guard (a line would use the order default tax rate because its WooCommerce rate is not mapped) or by the coupon guard was counted as a per-order error and outvoted by the orders that did import. The pass stamped `wc_initial_import_completed` and moved `last_wc_order_sync_at` to now, so the `modified_after` sweep started after the blocked orders and they were only ever imported if someone changed them in WooCommerce. (Seen on stage: 12 imported, 265 blocked, outcome complete.)

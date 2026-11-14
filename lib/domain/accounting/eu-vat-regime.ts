@@ -92,6 +92,8 @@ export type RateFact = {
 }
 
 export type GoodsLineFact = {
+  /** The store's own id of the order line (WooCommerce line item id): what an operator's gift-card answer is keyed by. Absent on a line with no readable id. */
+  lineId?: number
   /** The line total after coupons, excluding tax, in the order currency. */
   total: string
   /** The gift-card flag (`_o3d_is_voucher`): yes and no were read from the line; unknown means the line carried none and the product-level marker (`_coupon_title`) is not imported to settle it. */
@@ -216,7 +218,7 @@ export type SchemeBasis = {
 
 export type EuVatRegimeDecision =
   | { kind: 'SKIP'; reason: SkipReason; vatExemptB2b: boolean; warnings: RegimeWarning[] }
-  | { kind: 'REFUSE'; code: RefusalCode; reason: string }
+  | { kind: 'REFUSE'; code: RefusalCode; reason: string; /** With `gift_card_flag_missing`: the store ids of the lines whose flag is unsettled (those an operator can answer for). */ giftCardLineIds?: number[] }
   | {
       kind: 'SCHEME'
       regime: EuVatRegimeName
@@ -245,7 +247,10 @@ export function resolveEuVatRegime(input: EuVatRegimeInput): EuVatRegimeDecision
   if (input.giftCardFlag === 'setting_unreadable') return refuse('gift_card_cut_in_unreadable', 'the gift-card flag cut-in setting (or the order creation date) cannot be read, so it is not known whether this order must carry a gift-card flag on every line')
   if (input.giftCardFlag === 'required') {
     const missing = input.goodsLines.flatMap((line, index) => (line.voucherStrict === 'yes' || line.voucherStrict === 'no' ? [] : [index + 1]))
-    if (missing.length > 0) return refuse('gift_card_flag_missing', `the order was created after the gift-card flag cut-in but line(s) ${missing.join(', ')} carry no readable gift-card flag (_o3d_is_voucher yes/no)`)
+    if (missing.length > 0) {
+      const giftCardLineIds = missing.flatMap((position) => { const id = input.goodsLines[position - 1]?.lineId; return id === undefined ? [] : [id] })
+      return { ...refuse('gift_card_flag_missing', `the order was created after the gift-card flag cut-in but line(s) ${missing.join(', ')} carry no readable gift-card flag (_o3d_is_voucher yes/no). An operator can mark each such line as a gift card or not in Sync > Exceptions`), giftCardLineIds } as EuVatRegimeDecision
+    }
   }
   const destination = normaliseDestination(input.shippingCountry) || normaliseDestination(input.billingCountry)
   const covered = SCHEME_DESTINATIONS.has(destination)

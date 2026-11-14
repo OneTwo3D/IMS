@@ -52,8 +52,8 @@ test('gift-card detection: yes and no are read from the line; a line with no fla
     ] as never,
   }))
   assert.deepEqual(lines, [
-    { total: '10.00', voucher: 'yes', voucherStrict: 'yes' }, { total: '20.00', voucher: 'no', voucherStrict: 'no' }, { total: '30.00', voucher: 'no', voucherStrict: 'unknown' },
-    { total: '40.00', voucher: 'unknown', voucherStrict: 'unknown' }, { total: '0', voucher: 'unknown', voucherStrict: 'unknown' },
+    { total: '10.00', lineId: 1, voucher: 'yes', voucherStrict: 'yes' }, { total: '20.00', lineId: 2, voucher: 'no', voucherStrict: 'no' }, { total: '30.00', lineId: 3, voucher: 'no', voucherStrict: 'unknown' },
+    { total: '40.00', lineId: 4, voucher: 'unknown', voucherStrict: 'unknown' }, { total: '0', lineId: 5, voucher: 'unknown', voucherStrict: 'unknown' },
   ])
 })
 
