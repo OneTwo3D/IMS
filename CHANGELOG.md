@@ -10,6 +10,12 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### WooCommerce pull cursors are taken at read start, not at commit (backend / sync)
+
+- **Fixed: an order modified while a sweep was finishing could be skipped for good.** The order sweep stamped its `modified_after` cursor with the time it COMMITTED, after the final empty-page read. An order changed between that read and the stamp was never read by the run yet sat behind the next sweep's window, and with its webhook missed it was never processed. Every WooCommerce pull cursor (order poll and reconcile, product poll and reconcile, the initial import's completion stamp) is now the time the run STARTED, before its first WooCommerce read, less a 120 second overlap (`WC_PULL_CURSOR_OVERLAP_MS`, covering second-precision `date_modified` and clock skew between the IMS and WooCommerce hosts). Re-reading the overlap is safe: order import updates an order it already holds and product sync upserts by SKU.
+- A commit never moves a cursor backwards: it writes the later of the stored value and the new candidate, in one atomic upsert (`GREATEST` semantics under the row lock), so two overlapping sweeps cannot move it backwards. The selection-widening and refusal-watermark rewinds are unchanged (they lower only where a run reads from). The conditional commit under the advisory lock and the read-sync liveness stamp (which stays the real commit time) are unchanged.
+- No migration.
+
 ### EU VAT: an operator can settle a gift-card line the store left `unknown`
 
 - **Fixed: after the gift-card cut-in, an order with a custom line or a deleted-product line was refused for good.** The plugin writes `unknown` on such lines and IMS treated that as missing, so the order was refused (`gift_card_flag_missing`) and re-importing could never clear it. The cut-in (`eu_vat_gift_card_flag_cut_in`) should not be set until this is deployed.

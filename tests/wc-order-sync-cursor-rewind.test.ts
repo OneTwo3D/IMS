@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { cursorRaw } from './helpers/cursor-raw'
 import test, { mock } from 'node:test'
 
 /**
@@ -77,7 +78,7 @@ mock.module('@/lib/db', {
       },
       salesOrder: { findFirst: async () => ({ id: 'so-any' }) },
       $queryRaw: async () => [],
-      $executeRaw: async () => 0,
+      $executeRaw: cursorRaw((key, value) => { state.upserts.push({ key, value }); state.settings.set(key, value) }),
       // The sweep writes the cursor and its fingerprint as ONE fact, in one interactive transaction.
       $transaction: async (run: (tx: unknown) => Promise<unknown>) => run(sweepDb),
     }),

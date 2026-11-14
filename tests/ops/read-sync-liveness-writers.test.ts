@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { cursorRaw } from '../helpers/cursor-raw'
 import test, { mock } from 'node:test'
 
 import { MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '@/lib/connectors/woocommerce/api'
@@ -77,7 +78,7 @@ const orderDb: Record<string, unknown> = {
   },
   wmsOrderPushLink: { updateMany: async () => ({ count: 0 }) },
   $queryRaw: async () => [],
-  $executeRaw: async () => 0,
+  $executeRaw: cursorRaw((key, value) => upsert({ where: { key }, create: { key, value }, update: { value } })),
   $transaction: async (ops: Array<Promise<unknown>> | ((tx: unknown) => Promise<unknown>)) => {
     // The status sweep's snapshot write is an interactive transaction (order lock, erasure marker, upsert).
     if (typeof ops === 'function') {
