@@ -2378,7 +2378,7 @@ async function queueRefundAccountingActions(input: {
   // those codes came from. Where the chart's connector has since been retired the enqueue refuses,
   // which the ledger records as an unmet obligation — `accountingRetryRequired` stays set and the
   // caller reports the warning — instead of committing a credit note to books it does not describe.
-  const enqueueCreditNoteRow = (payload: Record<string, unknown>) => queueAccountingSync({
+  const enqueueCreditNoteRow = async (payload: Record<string, unknown>) => await queueAccountingSync({
     ...creditNote,
     idempotencyKey: `sales-order-refund:${input.refundId}:credit-note`,
     chartConnector: settings.connector,

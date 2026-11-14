@@ -272,8 +272,11 @@ test('o3d-2sm1 r7: every enqueue in the refund hand-off is accounted for, and it
   const facadeCalls = [...handoff.matchAll(/(.{0,40})await queueAccountingSync\(/g)]
   assert.equal(facadeCalls.length, 2, 'the credit note and the non-COGS syncs')
   for (const call of facadeCalls) {
-    assert.match(call[1], /ledger\.account\(\w+, $/, 'every facade enqueue hands its answer to the ledger')
+    // The credit-note row has ONE enqueue site (`enqueueCreditNoteRow`), shared by the treated, plain and refused payloads and by the rate-182 hold (which queues its refused row inside its own transaction); each use of it is handed to the ledger below.
+    assert.match(call[1], /ledger\.account\(\w+, $|\(payload: Record<string, unknown>\) => $/, 'every facade enqueue hands its answer to the ledger')
   }
+  assert.match(handoff, /ledger\.account\(creditNote, await enqueueCreditNoteRow\(/, 'the credit note enqueue is accounted')
+  assert.match(handoff, /creditNoteTreatment\.kind === 'held'\) \{[^}]*ledger\.account\(creditNote, creditNoteTreatment\.outcome\)/, 'a held credit note accounts its refused row\'s outcome')
   // r8: THROUGH THE ADAPTER, which is what carries the enqueue's own resolved connector out to the
   // ledger. A bare `queueAccountingSyncTx` here would hand back a boolean again and the pinned check
   // would have nothing to check.
