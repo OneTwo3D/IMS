@@ -27,6 +27,8 @@ const store = {
   live: new Map<string, string>(),
   liveReadable: true,
   taxMapped: false,
+  notices: [] as Row[],
+  outstandingRefunds: 0,
   refundReads: [] as number[],
   refundReadFails: false,
   /** WooCommerce order id -> refund ids the storefront holds. */
@@ -54,7 +56,7 @@ mock.module('@/lib/activity-log', {
 mock.module('@/lib/connectors/woocommerce/sync/first-import-lock', { namedExports: { acquireWcFirstImportLock: async () => async () => undefined, wcFirstImportLockHeld: () => false, withWcFirstImportLock: async (_id: unknown, fn: () => Promise<unknown>) => fn(), WcFirstImportLockUnavailable: class extends Error {} } })
 mock.module('@/lib/connectors/woocommerce/sync/erasure-obligation', { namedExports: { recordWcErasureObligation: async () => undefined, hasOpenWcErasureObligation: async () => false, retireWcErasureObligation: async () => undefined, payloadCustomerTombstoned: async () => false } })
 mock.module('@/lib/domain/erasure/customer-key-lock', { namedExports: { lockStorefrontCustomerKeys: async () => [] } })
-mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
+mock.module('@/lib/notifications', { namedExports: { notify: (entry: Row) => { store.notices.push(entry) } } })
 mock.module('@/lib/maintenance-mode', { namedExports: { getMaintenanceModeResponse: async () => null } })
 mock.module('@/lib/integration-plugins', { namedExports: { isIntegrationPluginEnabled: async () => true } })
 
@@ -299,7 +301,7 @@ mock.module('@/lib/connectors/woocommerce/sync/refund-sync', {
       store.refundReads.push(wcOrderId)
       if (store.refundReadFails) return { synced: 0, fetched: 0, unapplied: 0, outstanding: 0, complete: false, error: 'refund read failed' }
       for (const refundId of store.wcRefunds.get(String(wcOrderId)) ?? []) store.appliedRefunds.add(refundId)
-      return { synced: 0, fetched: 0, unapplied: 0, outstanding: 0, complete: true }
+      return { synced: 0, fetched: 0, unapplied: store.outstandingRefunds, outstanding: store.outstandingRefunds, complete: true }
     },
     syncWcRefund: async () => ({ outcome: 'applied' }),
     // o3d-xnwu r4: the webhook imports these two from the same module, so a double that replaces the
@@ -336,6 +338,8 @@ function reset() {
   store.live.clear()
   store.liveReadable = true
   store.taxMapped = false
+  store.notices.length = 0
+  store.outstandingRefunds = 0
   store.refundReads.length = 0
   store.refundReadFails = false
   store.wcRefunds.clear()
@@ -581,4 +585,70 @@ test('a refund read that fails keeps the row pending and counts it unresolved, t
   assert.equal(second.imported, 1, 'the order already exists; the retry finishes the refunds and resolves the row')
   assert.equal(store.appliedRefunds.has(9002), true)
   assert.equal(queued().length, 0)
+})
+
+// --- survivors of the mutation pass -------------------------------------------------------------
+
+/** A coupon of unknown type that left money off the lines: the coupon guard refuses it. */
+function couponOrder(id: number) {
+  return { ...wcOrder(id, 'processing'), coupon_lines: [{ id: 1, code: 'MYSTERY', discount: '5.00', discount_tax: '0.00', meta_data: [] }] }
+}
+
+test('a coupon-guard block is recorded and listed like a tax block', async () => {
+  reset()
+  const result = await importOrder(couponOrder(821) as never)
+
+  assert.equal(result.skipped, 'coupon_refused')
+  assert.equal(store.links.has('821'), false)
+  const rows = await listedAsBlocked()
+  assert.equal(rows.length, 1, 'the coupon block is on the Exceptions list')
+  assert.equal((rows[0].payload as Record<string, unknown>).reason, 'coupon_refused')
+})
+
+test('a guard block does not move the selection-widening watermark, an admission refusal does', async () => {
+  reset()
+  await importOrder(blockedOrder(831))
+  assert.equal(store.settings.get('wc_order_admission_refused_since'), undefined, 'a guard block says nothing about the selection')
+
+  await importOrder(wcOrder(832, 'on-hold')) // not selected: an admission refusal
+  assert.ok(store.settings.get('wc_order_admission_refused_since'), 'the control: an admission refusal does set it')
+})
+
+test('the initial import ends in a WARNING notice when orders were blocked and a success notice when none were', async () => {
+  reset()
+  store.listed = [wcOrder(841, 'processing'), blockedOrder(842)]
+  await runInitial()
+  assert.equal(store.notices.at(-1)?.type, 'warning')
+
+  reset()
+  store.listed = [wcOrder(851, 'processing')]
+  await runInitial()
+  assert.equal(store.notices.at(-1)?.type, 'success')
+})
+
+test('the reconcile sweep reads refunds for an imported order but not for one recorded as blocked', async () => {
+  reset()
+  store.settings.set('last_wc_order_reconcile_at', '2026-01-01T00:00:00.000Z')
+  store.listed = [wcOrder(861, 'processing'), blockedOrder(862)]
+  const { syncNewWcOrders } = await import('@/lib/connectors/woocommerce/sync/order-import')
+
+  const result = await syncNewWcOrders({ mode: 'reconcile' })
+
+  assert.deepEqual(result.errors, [])
+  assert.deepEqual(store.refundReads, [861], 'no order in IMS, so nothing for 862 refunds to attach to')
+})
+
+test('the drain keeps the row pending while a refund may still reach IMS', async () => {
+  reset()
+  await importOrder(blockedOrder(871))
+  store.blockedIds.add('871')
+  store.live.set('871', 'processing')
+  store.taxMapped = true
+  store.outstandingRefunds = 1
+
+  const result = await drain()
+
+  assert.equal(result.imported, 0)
+  assert.equal(result.unresolved, 1)
+  assert.equal(queued().length, 1)
 })

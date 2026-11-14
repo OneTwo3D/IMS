@@ -89,6 +89,9 @@ mock.module('@/lib/db', {
  * It still refuses an option shape it does not model, and the only option it models is the one
  * legitimate opt-out.
  */
+/** Orders the importer double answers as RECORDED guard blocks. */
+let blockedOrderIds: number[] = []
+
 mock.module('@/lib/connectors/woocommerce/sync/order-import', {
   namedExports: {
     importWcOrder: async (order: { id: number; status: string }, options: Record<string, unknown> = {}) => {
@@ -109,6 +112,7 @@ mock.module('@/lib/connectors/woocommerce/sync/order-import', {
           refusalWatermarks.push(String(order.id))
           return { success: true, skipped: 'status_not_admitted', configured: admission.configured }
         }
+        if (blockedOrderIds.includes(order.id)) return { success: true, skipped: 'tax_rate_unmapped', configured: [] }
         if (unmappedStatuses.includes(order.status)) {
           refusalWatermarks.push(String(order.id))
           return { success: true, skipped: 'status_not_mapped', configured: admission.configured }
@@ -396,4 +400,21 @@ test('a status IMS has no reading of is refused as UNMAPPED, and says so separat
     false,
     'and must not be reported as a selection problem, whose fix is a different one',
   )
+})
+
+test('a RECORDED guard block is acknowledged under its own answer and not logged as an admission skip', async () => {
+  reset()
+  blockedOrderIds = [141]
+  try {
+    const response = await pushOrder(wcOrder(141, 'processing'))
+
+    assert.deepEqual(await response.json(), { ok: true, skipped: 'blocked_recorded_for_operator' })
+    assert.equal(
+      activityLog.some((entry) => String(entry.action).startsWith('wc_order_webhook_status_')),
+      false,
+      'the guard wrote its own notice when it recorded the order; the throttled admission notice would only repeat it',
+    )
+  } finally {
+    blockedOrderIds = []
+  }
 })
