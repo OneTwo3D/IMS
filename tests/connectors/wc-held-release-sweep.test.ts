@@ -44,6 +44,8 @@ const state = {
   // o3d-j625 r6: every enqueue's params, so a later sweep's posting key can be compared with a refused one's.
   asked: [] as Array<Record<string, unknown>>,
   activity: [] as { action: string; description: string }[],
+  /** Which database read throws (the sweep's two reads). */
+  readThrows: null as null | 'queue' | 'orders',
 }
 
 /** Block and line comments removed, so a commented-out call cannot satisfy a source scan. */
@@ -107,8 +109,10 @@ mock.module('@/lib/db', {
       $transaction: async function (this: unknown, fn: (tx: unknown) => Promise<unknown>) { return fn(this) },
       $queryRaw: async () => [],
       shoppingSyncLog: {
-        findMany: async ({ where, take }: { where: Record<string, unknown>; take?: number }) =>
-          state.held.filter((r) => matchesHeld(r, where)).slice(0, take ?? undefined),
+        findMany: async ({ where, take }: { where: Record<string, unknown>; take?: number }) => {
+          if (state.readThrows === 'queue') throw new Error('queue read down')
+          return state.held.filter((r) => matchesHeld(r, where)).slice(0, take ?? undefined)
+        },
         findFirst: async ({ where }: { where: Record<string, unknown> }) =>
           state.held.filter((r) => matchesHeld(r, where))[0] ?? null,
         update: async ({ where, data }: { where: { id: string }; data: Partial<HeldRow> }) => {
@@ -121,8 +125,10 @@ mock.module('@/lib/db', {
       },
       salesOrder: {
         findUnique: async () => ({ erasedAt: null, customer: null }),
-        findMany: async ({ where }: { where: { id: { in: string[] } } }) =>
-          state.orders.filter((o) => where.id.in.includes(o.id)),
+        findMany: async ({ where }: { where: { id: { in: string[] } } }) => {
+          if (state.readThrows === 'orders') throw new Error('order read down')
+          return state.orders.filter((o) => where.id.in.includes(o.id))
+        },
       },
       // o3d-j625 r4: the exception inbox's own table. Modelled (upsert semantics, not a spy) because the
       // assertion below is that a refusal is SELECTABLE as outstanding work, which is a property of the
@@ -222,6 +228,7 @@ function reset() {
   state.enqueueRefusesAndRecords = false
   state.asked = []
   state.activity = []
+  state.readThrows = null
 }
 
 test('a numbered order whose release failed is picked up WITHOUT the storefront touching it again', async () => {
@@ -531,4 +538,36 @@ test('[shadow] shadowed holds do not consume the sweep limit: with a limit of 2,
   assert.equal(result.closed, 4)
   assert.equal(result.stillStuck, 0)
   assert.ok(state.held.every((row) => row.status === 'SYNCED'))
+})
+
+// A read that throws is a sweep that could not look: it is reported in the result (`readError`), which the
+// wc-reconcile outcome mapping reads as failed, instead of returning bare counters the heartbeat reads as ok.
+for (const which of ['queue', 'orders'] as const) {
+  test(`a throwing ${which} read is reported as readError and maps to a failed wc-reconcile run`, async () => {
+    reset()
+    state.held.push(heldRow({ id: 'hold-1', entityId: 'so-1' }))
+    state.orders.push({ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null })
+    state.readThrows = which
+    const errors = mock.method(console, 'error', () => {})
+    try {
+      const result = await sweep()
+      assert.equal(typeof result.readError, 'string', 'the failure is carried in the result')
+      assert.equal(result.released, 0)
+      assert.equal(state.queued.length, 0)
+      const { cronOutcome } = await import('@/lib/ops/cron-outcomes')
+      assert.equal(cronOutcome('wc-reconcile', { orders: { synced: 1 }, heldSalesInvoices: result } as never), 'failed')
+    } finally {
+      errors.mock.restore()
+    }
+  })
+}
+
+test('a sweep whose reads succeed carries no readError and maps to ok', async () => {
+  reset()
+  state.held.push(heldRow({ id: 'hold-1', entityId: 'so-1' }))
+  state.orders.push({ id: 'so-1', invoiceNumber: null, accountingInvoiceId: null })
+  const result = await sweep()
+  assert.equal(result.readError, undefined)
+  const { cronOutcome } = await import('@/lib/ops/cron-outcomes')
+  assert.equal(cronOutcome('wc-reconcile', { orders: { synced: 1 }, heldSalesInvoices: result } as never), 'ok')
 })

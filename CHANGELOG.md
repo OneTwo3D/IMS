@@ -10,6 +10,11 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### WooCommerce reconcile: a failed held-invoice sweep read answers 500 (backend / operations)
+
+- **Fixed: invoices awaiting release could go unprocessed while the `wc-reconcile` heartbeat stayed green.** The held sales-invoice release sweep returned plain counters when the held-invoice queue read, or the order read behind it, threw, so the run read as ok. It now returns `heldSalesInvoices.readError` for either read, the cron outcome mapping counts it as a failure, and the route answers 500 (and records `failed`). A database read cannot be refused by the outbound-write hold, so it is never held.
+- No migration.
+
 ### WooCommerce: orders blocked by a guard are recorded, so the initial import cannot strand them
 
 - **Fixed: the initial order import could complete over orders it had refused, and those orders were never imported.** An order blocked by the tax-rate fallback guard (a line would use the order default tax rate because its WooCommerce rate is not mapped) or by the coupon guard was counted as a per-order error and outvoted by the orders that did import. The pass stamped `wc_initial_import_completed` and moved `last_wc_order_sync_at` to now, so the `modified_after` sweep started after the blocked orders and they were only ever imported if someone changed them in WooCommerce. (Seen on stage: 12 imported, 265 blocked, outcome complete.)

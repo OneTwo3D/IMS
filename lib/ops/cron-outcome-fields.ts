@@ -105,7 +105,7 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
   },
   'wc-reconcile': {
     skipState: { skipped: true, reason: 'x' },
-    consumed: ['orders.errors', 'products.errors', 'products.permanentErrors', 'refundStockCorrections.error', 'stock.queued.errors', 'stock.sync.errors', 'stock.errors'],
+    consumed: ['orders.errors', 'products.errors', 'products.permanentErrors', 'refundStockCorrections.error', 'stock.queued.errors', 'stock.sync.errors', 'stock.errors', 'heldSalesInvoices.readError'],
     breakdownOf: { 'stock.queued.failed': 'stock.queued.errors' },
     ignored: { 'stock.sync.aborted': 'a stock push refused before any work (the setting is off, no credentials or warehouses, or the outbound-write hold): the route reports it as a skip (`reconciliation_refused`) that leaves the pass due, by design; a push that failed in flight carries `stock.sync.errors`, which is consumed', 'heldSalesInvoices.stillStuck': 'held sales invoices waiting on the accounting connector: each pass logs the stuck invoices as an activity warning, and counting them would keep the run red for as long as accounting is disconnected' },
   },

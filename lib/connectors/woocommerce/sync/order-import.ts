@@ -2675,6 +2675,12 @@ export async function retryHeldWcSalesInvoiceReleases(options?: {
   stillStuck: number
   closed: number
   scanCapReached: boolean
+  /**
+   * Set when the held-queue read or the sales-order read behind it threw: the sweep could not look, so
+   * invoices awaiting release were not processed. The wc-reconcile outcome mapping reads it as a failed
+   * run. A database read cannot be refused by the outbound-write hold, so it is never held.
+   */
+  readError?: string
 }> {
   const limit = Math.min(Math.max(options?.limit ?? 50, 1), 250)
   const scanLimit = Math.min(Math.max(options?.scanLimit ?? 500, limit), 2000)
@@ -2690,7 +2696,7 @@ export async function retryHeldWcSalesInvoiceReleases(options?: {
     })
   } catch (error) {
     console.error('[wc-held-release] could not read the held sales-invoice queue:', error)
-    return result
+    return { ...result, readError: 'Held sales-invoice release sweep could not read the held-invoice queue; no held invoice was processed this run' }
   }
   result.scanned = rows.length
   result.scanCapReached = rows.length >= scanLimit
@@ -2705,7 +2711,7 @@ export async function retryHeldWcSalesInvoiceReleases(options?: {
     })
   } catch (error) {
     console.error('[wc-held-release] could not read the orders behind the held sales invoices:', error)
-    return result
+    return { ...result, readError: 'Held sales-invoice release sweep could not read the orders behind the held invoices; no held invoice was processed this run' }
   }
   const byId = new Map(orders.map((order) => [order.id, order]))
 
