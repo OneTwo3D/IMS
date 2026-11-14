@@ -309,3 +309,38 @@ test('[refund 182 hold] no stamp and no count without the row: an enqueue that f
   assert.equal('_euVatTreatment' in row, false)
   assert.equal(await heldCount(deps.db), '1', 'the count is unchanged')
 })
+
+test('[refund 182 hold] a SENDABLE credit note already queued for the refund is a CONFLICT: nothing is stamped or counted, the row is left alone, the operator is told; the permanent-hold path conflicts too', { skip }, async (t) => {
+  const deps = await loadDeps()
+  // Threshold 0: the 182 credit note is queued as an ordinary, sendable, pending credit note.
+  const restore = await configure(deps.db, true, { [COUNT]: '0', [THRESHOLD]: '0' })
+  const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx) })
+  await seedXeroList(deps.db, { TAX131: '0.000000' })
+  const { retryRefundAccounting } = await import('../../app/actions/sales.ts')
+  const first = await refund182(deps, fx)
+  assert.equal(first.result.success, true, first.result.error)
+  assert.ok(first.payload && !(EU_VAT_CREDIT_NOTE_REFUSED_KEY in first.payload), 'queued sendable')
+  const rowBefore = await deps.db.accountingSyncLog.findFirst({ where: { type: 'CREDIT_NOTE', referenceId: first.refund.id }, select: { id: true, status: true, payload: true } })
+  assert.ok(rowBefore)
+  // The threshold is raised above the count; a retry would dedupe against the sendable row.
+  await deps.db.setting.update({ where: { key: THRESHOLD }, data: { value: '10' } })
+  await deps.db.salesOrderRefund.update({ where: { id: first.refund.id }, data: { accountingRetryRequired: true } })
+  await retryRefundAccounting(first.refund.id)
+  const stamp = await deps.db.salesOrderRefund.findUnique({ where: { id: first.refund.id }, select: { eas182HeldAt: true } })
+  assert.equal(stamp?.eas182HeldAt, null, 'not stamped')
+  assert.equal(await heldCount(deps.db), '0', 'not counted')
+  const rowAfter = await deps.db.accountingSyncLog.findMany({ where: { type: 'CREDIT_NOTE', referenceId: first.refund.id }, select: { id: true, status: true, payload: true } })
+  assert.equal(rowAfter.length, 1)
+  assert.deepEqual(rowAfter[0], rowBefore, 'the sendable row is untouched')
+  const notice = await deps.db.activityLog.findFirst({ where: { entityId: fx.orderId, action: 'refund_182_hold_conflict' }, select: { description: true } })
+  assert.match(notice?.description ?? '', /could NOT be held for review[\s\S]*already queued to be sent/)
+
+  // Permanent-hold path: a stamped refund whose key resolves to a sendable row is a conflict, never silently held.
+  await deps.db.salesOrderRefund.update({ where: { id: first.refund.id }, data: { eas182HeldAt: new Date(), accountingRetryRequired: true } })
+  await deps.db.activityLog.deleteMany({ where: { entityId: fx.orderId, action: 'refund_182_hold_conflict' } })
+  await retryRefundAccounting(first.refund.id)
+  assert.ok(await deps.db.activityLog.findFirst({ where: { entityId: fx.orderId, action: 'refund_182_hold_conflict' } }), 'surfaced again')
+  assert.equal(await heldCount(deps.db), '0')
+  assert.deepEqual((await deps.db.accountingSyncLog.findMany({ where: { type: 'CREDIT_NOTE', referenceId: first.refund.id }, select: { id: true, status: true, payload: true } }))[0], rowBefore)
+})

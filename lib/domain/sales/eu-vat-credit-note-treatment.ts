@@ -30,6 +30,8 @@ export type TreatedCreditNoteOutcome =
   | { kind: 'skipped'; why: 'switch_off' | 'not_scheme' }
   /** A rate-182 credit note held for review: its REFUSED row (never sent) is what `outcome` reports on (queued, or not: then nothing was stamped or counted and the obligation stays unmet). The hand-off accounts the obligation with it and queues nothing more. */
   | { kind: 'held'; outcome: AccountingEnqueueOutcome }
+  /** A rate-182 hold could not be applied: the refund's credit-note row is already queued SENDABLE (or posted). Nothing was stamped or counted and that row is untouched; `outcome` is the enqueue's answer for the obligation ledger. */
+  | { kind: 'hold_conflict'; outcome: AccountingEnqueueOutcome }
   | { kind: 'treated'; payload: Record<string, unknown>; regimePolicy: RegimePolicy }
   /** The credit note cannot be raised as it is: the reason is the operator-facing sentence. */
   | { kind: 'refused'; reason: string; /** `hand_post`: nothing a retry can change, so the hand-off queues a REFUSED row for the operator to settle by hand; any other refusal is cleared by fixing its cause and retrying. */ code?: 'hand_post' }
@@ -63,6 +65,7 @@ export async function treatCreditNotePayload(params: {
       creditNoteNumber: heldNumber, heldNumber: place.heldNumber, threshold: place.threshold ?? place.heldNumber, vatAccount: (prior.order.euVatLineAccount ?? '').trim() || 'the stamped VAT account',
       vatAmount: prior.eas182StatedTaxForeign === null ? 'the refund\'s VAT' : toDecimal(prior.eas182StatedTaxForeign).toString(), refundTotal: prior.statedGrossForeign === null ? 'the refund amount' : toDecimal(prior.statedGrossForeign).toString(), currency,
     })))
+    if ('conflict' in decision) { await recordHoldConflict(params.orderId, params.refundId, heldNumber); return { kind: 'hold_conflict', outcome: decision.outcome } }
     if (decision.held) return { kind: 'held', outcome: decision.outcome }
   }
 
@@ -181,6 +184,7 @@ export async function treatCreditNotePayload(params: {
   // THE HOLD, decided last: only a credit note that would otherwise post is counted. The first N rate-182 credit notes are a refused, settle-by-hand row (never sent); after that they post.
   if (rate182) {
     const hold = await decideRefund182Hold(params.refundId, async (place) => params.enqueueHeldRow(refund182HeldRefusal({ creditNoteNumber: number, heldNumber: place.heldNumber, threshold: place.threshold ?? place.heldNumber, vatAccount, vatAmount: figures.vatAmount, refundTotal: figures.refundTotal, currency: payload.currency })))
+    if ('conflict' in hold) { await recordHoldConflict(params.orderId, params.refundId, number); return { kind: 'hold_conflict', outcome: hold.outcome } }
     if (hold.held) {
       if (hold.queued && hold.newlyHeld) {
         await logActivity({
@@ -246,4 +250,13 @@ async function priorRefundedTax(orderId: string, refundId: string, orderTax: Dec
     }
   }
   return sum
+}
+
+/** The operator notice for a hold that could not be applied because a sendable (or posted) credit note already exists for the refund. */
+async function recordHoldConflict(orderId: string, refundId: string, number: string): Promise<void> {
+  await logActivity({
+    entityType: 'SALES_ORDER', entityId: orderId, action: 'refund_182_hold_conflict', tag: 'accounting', level: 'WARNING',
+    description: `Credit note ${number} (a refund whose VAT is on WooCommerce rate 182) could NOT be held for review: a credit note for this refund was already queued to be sent, or already posted, before the hold applied. Nothing was held or counted and that credit note was left as it is. Check Xero for credit note ${number} and review it there.`,
+    metadata: { refundId },
+  }).catch(() => { /* the untouched row stands; logging must not throw */ })
 }
