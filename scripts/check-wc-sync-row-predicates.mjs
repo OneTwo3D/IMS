@@ -172,7 +172,14 @@ const SQL_OWNER = 'lib/domain/sales/wc-sync-row-families.ts::unresolvedWcOrderRo
  * rendered once here, and tests/data-retention-refund-park-witness.test.ts holds it to the verify.sql text.
  */
 const SQL_ACCUSED_OWNER = 'lib/domain/sales/wc-sync-row-families.ts::recoveryAccusedRowSql'
-const SQL_OWNERS = [SQL_OWNER, SQL_ACCUSED_OWNER]
+
+/**
+ * The third SQL renderer: a PENDING row of the by-id admission-refusal queue, which the retention sweep must
+ * never delete by age (it is an order's only record and carries no entityId, so the union above cannot cover
+ * it). Rendered once here; tests/db/admission-refusal-retention.test.ts proves it against Postgres.
+ */
+const SQL_PENDING_REFUSAL_OWNER = 'lib/domain/sales/wc-sync-row-families.ts::pendingAdmissionRefusalRowSql'
+const SQL_OWNERS = [SQL_OWNER, SQL_ACCUSED_OWNER, SQL_PENDING_REFUSAL_OWNER]
 
 /**
  * Tokens that make a raw SQL string a family predicate rather than an ordinary statement about this

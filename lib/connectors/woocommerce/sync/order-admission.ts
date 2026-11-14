@@ -51,6 +51,7 @@ import {
   parseWcSyncOrderStatuses,
   WC_SYNC_ORDER_STATUSES_SETTING_KEY,
 } from '../order-status-filter'
+import { WC_ADMISSION_REFUSAL_QUEUE_MARKER } from '@/lib/domain/sales/wc-sync-row-families'
 import type { WcFullOrder } from './types'
 
 export type WcOrderCreateAdmission = {
@@ -88,7 +89,7 @@ export async function resolveWcOrderCreateAdmission(
 // ---------------------------------------------------------------------------
 
 /** Discriminator on the queue row's payload, so this queue and the pending-FX queue stay disjoint. */
-export const WC_ADMISSION_REFUSAL_QUEUE = 'wc_order_admission_refusal'
+export const WC_ADMISSION_REFUSAL_QUEUE = WC_ADMISSION_REFUSAL_QUEUE_MARKER
 
 /**
  * WHY a create was withheld. All three are ACKNOWLEDGED decisions rather than failures.
@@ -111,6 +112,35 @@ export type WcAdmissionRefusalReason =
    * into, and a guess there is wrong in a way nothing downstream can detect.
    */
   | 'currency_missing'
+  /**
+   * A DETERMINISTIC IMPORT GUARD blocked the order (the tax-rate fallback guard: a line would be
+   * taxed at the order's default rate because WooCommerce's rate id is not mapped). Unlike the
+   * three reasons above this is not a decision about whether IMS TAKES the order on, it is a
+   * refusal to import it in a degraded way — and it is resolved by the operator fixing the cause
+   * (mapping the tax rate), which fires nothing in WooCommerce. See {@link WC_BLOCKED_IMPORT_REASONS}.
+   */
+  | 'tax_rate_unmapped'
+  /**
+   * The coupon guard refused the order: a coupon of unknown type left money off the lines, or store
+   * credit could not be reconciled with the order total. Same family as `tax_rate_unmapped`.
+   */
+  | 'coupon_refused'
+
+/**
+ * THE REASONS THAT MEAN "A GUARD BLOCKED THIS ORDER" rather than "IMS declined to take it on".
+ *
+ * They share the queue, the recorder, the by-id drain and the acknowledgement-is-conditional-on-the-
+ * row rule with the three admission reasons, because the failure is the same one: the order is not
+ * imported, nothing will redeliver it, and the cursors are about to move past it. They differ in two
+ * ways. They carry the guard's own sentence (`detail`) because it names the lines or coupons the
+ * operator has to fix, and they are LISTED under Sync > Exceptions, because unlike an unticked status
+ * they are not a choice the operator made.
+ */
+export const WC_BLOCKED_IMPORT_REASONS = ['tax_rate_unmapped', 'coupon_refused'] as const
+
+export function isWcBlockedImportReason(reason: unknown): reason is (typeof WC_BLOCKED_IMPORT_REASONS)[number] {
+  return typeof reason === 'string' && (WC_BLOCKED_IMPORT_REASONS as readonly string[]).includes(reason)
+}
 
 export type WcAdmissionRefusalPayload = {
   queue: typeof WC_ADMISSION_REFUSAL_QUEUE
@@ -126,6 +156,8 @@ export type WcAdmissionRefusalPayload = {
    * in it. Optional only because rows written before r13 do not carry it.
    */
   currency?: string
+  /** The guard's own sentence, for the blocked-import reasons. Absent on the three admission reasons. */
+  detail?: string
   /** When the boundary FIRST turned this order away. Preserved across re-refusals. */
   refusedAt: string
   attempts: number
@@ -145,6 +177,19 @@ export function wcAdmissionRefusalQueueWhere(externalOrderId?: string): Prisma.S
   }
 }
 
+/**
+ * The queue rows a GUARD wrote — the ones Sync > Exceptions lists. A NARROWING of the queue's own
+ * predicate, never a second statement of it.
+ */
+export function wcBlockedOrderQueueWhere(): Prisma.ShoppingSyncLogWhereInput {
+  // The queue's own predicate, plus one top-level OR over the guard reasons (flat rather than an AND
+  // of two payload filters, so it stays inside the `where` language the test doubles interpret).
+  return {
+    ...wcAdmissionRefusalQueueWhere(),
+    OR: WC_BLOCKED_IMPORT_REASONS.map((reason) => ({ payload: { path: ['reason'], equals: reason } })),
+  }
+}
+
 export function isWcAdmissionRefusalPayload(payload: unknown): payload is WcAdmissionRefusalPayload {
   return typeof payload === 'object'
     && payload !== null
@@ -159,7 +204,13 @@ function refusalDescription(
   status: string,
   configured: string[],
   currency: string,
+  detail: string,
 ): string {
+  if (isWcBlockedImportReason(reason)) {
+    return `${detail} The order was NOT imported, and the sync will not move past it unrecorded: this row is `
+      + 'its record. Fix the cause (for a tax rate, map it on the Tax Rates tab); '
+      + 'the row is re-checked by order id (up to 50 orders every 15 minutes) and the order imports itself once the guard passes.'
+  }
   if (reason === 'currency_missing') {
     // Quotes the raw value rather than describing it, because "blank" and "absent" are different
     // faults at the source and the operator is the one who has to tell them apart.
@@ -188,7 +239,12 @@ function refusalDescription(
  * allowed to send the order again. See `recordWcOrderAdmissionRefusal`.
  */
 export type WcAdmissionRefusalRecord =
-  | { persisted: true; id: string }
+  | {
+      persisted: true
+      id: string
+      /** True when this call created the row, false when it refreshed one that was already there. */
+      created: boolean
+    }
   | { persisted: false; reason: string }
 
 /**
@@ -225,6 +281,7 @@ export async function recordWcOrderAdmissionRefusal(
   wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'> & Partial<Pick<WcFullOrder, 'currency'>>,
   reason: WcAdmissionRefusalReason,
   configured: string[],
+  detail = '',
 ): Promise<WcAdmissionRefusalRecord> {
   try {
     const externalOrderId = String(wcOrder.id)
@@ -246,6 +303,7 @@ export async function recordWcOrderAdmissionRefusal(
       status: String(wcOrder.status ?? ''),
       configured,
       currency: statedCurrency,
+      ...(detail ? { detail } : {}),
       refusedAt: previous?.refusedAt ?? new Date().toISOString(),
       attempts: previous?.attempts ?? 0,
     }
@@ -256,7 +314,7 @@ export async function recordWcOrderAdmissionRefusal(
       entityType: 'SalesOrder',
       externalId: externalOrderId,
       payload: JSON.parse(JSON.stringify(payload)) as Prisma.InputJsonValue,
-      errorMessage: refusalDescription(reason, payload.status, configured, statedCurrency),
+      errorMessage: refusalDescription(reason, payload.status, configured, statedCurrency, detail),
       syncedAt: null,
     }
     if (existing) await db.shoppingSyncLog.update({ where: { id: existing.id }, data })
@@ -275,7 +333,7 @@ export async function recordWcOrderAdmissionRefusal(
       )
       return { persisted: false, reason: 'the refusal queue row could not be read back after writing' }
     }
-    return { persisted: true, id: confirmed.id }
+    return { persisted: true, id: confirmed.id, created: !existing }
   } catch (e) {
     console.error('o3d-tj6v r5: failed to record an admission refusal for later retry', e)
     return { persisted: false, reason: e instanceof Error ? e.message : String(e) }
@@ -402,6 +460,25 @@ export async function drainWcOrderAdmissionRefusals(limit = 50): Promise<WcAdmis
         continue
       }
       if (guarded.result.success && guarded.result.orderId) {
+        // THE REFUNDS COME WITH THE ORDER. While the order was refused (or blocked by a guard) the
+        // sweeps skipped its refund read and advanced past it, and a refund webhook for an order IMS
+        // did not hold had finite retries that have long run out. This drain is the only thing left
+        // that knows the order, so it applies the refunds BEFORE resolving the row. Idempotent: a
+        // refund already in IMS is found by its WooCommerce refund id (`externalRefundId`, globally
+        // unique) in `syncWcRefund` and answered `already-applied`, so a retry re-applies nothing.
+        // An incomplete read, or a refund that may still reach IMS, keeps the row PENDING for the
+        // next run. A refund READ that failed is a genuine failure (`failed`, which the cron answers
+        // non-2xx for); a refund that is merely still pending is an expected state (`unresolved`).
+        const { syncRefundsForOrder } = await import('./refund-sync')
+        const refunds = await syncRefundsForOrder(Number(externalOrderId))
+        if (!refunds.complete) {
+          result.failed++
+          continue
+        }
+        if (refunds.outstanding > 0) {
+          result.unresolved++
+          continue
+        }
         await resolveRefusalRow(
           row.id,
           `Imported by the admission-refusal retry once the order became admissible (status "${String(live.status)}")`,

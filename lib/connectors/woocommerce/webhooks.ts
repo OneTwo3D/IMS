@@ -225,6 +225,9 @@ async function logWcOrderWebhookNotAdmitted(
   reason: WcAdmissionRefusalReason,
   configured: string[],
 ): Promise<void> {
+  // A guard block wrote its own ERROR activity row when it first recorded the order, and the order is
+  // listed under Sync > Exceptions; this throttled admission notice would only repeat it.
+  if (reason === 'tax_rate_unmapped' || reason === 'coupon_refused') return
   const notAdmitted = reason === 'status_not_admitted'
   const currencyMissing = reason === 'currency_missing'
   const key = currencyMissing
@@ -447,6 +450,8 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
           status_not_admitted: 'status_not_selected_for_import',
           status_not_mapped: 'status_not_mapped',
           currency_missing: 'currency_not_stated_by_woocommerce',
+          tax_rate_unmapped: 'blocked_recorded_for_operator',
+          coupon_refused: 'blocked_recorded_for_operator',
         }[guarded.result.skipped],
       })
     }
