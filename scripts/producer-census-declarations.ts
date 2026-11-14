@@ -167,7 +167,7 @@ export const DECLARATIONS: readonly Declaration[] = [
   d('app/actions/sales.ts::applySalesOrderStatusTransition::queueDispatchEmailIfEligible#1', 'customer-email', 'despatch', 'queue-producer', 'not-applicable',
     'Queues the despatch e-mail on an order status transition (setting-gated).'),
   d('app/actions/sales.ts::queueRefundAccountingActions::queueAccountingSync#1', 'xero', 'sales.credit-note', 'queue-producer', 'required',
-    'Queues CREDIT_NOTE for a refund.'),
+    'Queues CREDIT_NOTE for a refund (the treated, plain or refused payload; a rate-182 hold queues its refused row through the same call inside the hold\'s transaction).'),
   d('app/actions/sales.ts::queueRefundAccountingActions::queueAccountingSyncTxWithOutcome#1', 'xero', 'inventory.journals', 'queue-producer', 'required',
     'Queues the refund COGS_REVERSAL or UNEARNED_REV_REVERSAL inside the refund transaction.'),
   d('app/actions/sales.ts::queueRefundAccountingActions::queueAccountingSync#2', 'xero', 'inventory.journals', 'queue-producer', 'required',

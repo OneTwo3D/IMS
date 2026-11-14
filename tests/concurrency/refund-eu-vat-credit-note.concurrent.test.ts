@@ -15,7 +15,7 @@ import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-ke
  *   3. A cancellation (the payment poller's whole-order reversal) reverses the order's whole VAT and totals the whole invoice.
  *   4. A scheme order with no stamp refuses and queues nothing; an order outside the scheme is left alone.
  *   5. The stamped account is reused after the facts changed; the policy recorded is the one in force; a change to it is refused by the final pre-socket check, with the working instruction.
- *   6. A WooCommerce refund whose tax is booked on rate 182 is parked, not recorded, and createRefund is never called.
+ *   6. A WooCommerce refund whose tax is booked on rate 182 is recorded with its tax summed across all rate ids (the hold of the first N is tested in refund-eas182-hold.concurrent.test.ts); an unreadable 182 figure is parked and createRefund is never called.
  */
 const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const skip = !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1'
@@ -242,7 +242,7 @@ test('[eu vat credit note] the account is the STAMPED one after the facts change
     select: { id: true, lines: { select: { id: true } } },
   })
   const payload = { creditNoteNumber: 'CN-FX', currency: deps.baseCurrency, lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: fx.rate.accountingTaxType }], lineAmountsIncludeTax: false }
-  const outcome = await treatCreditNotePayload({ refundId: refund.id, orderId: fx.orderId, payload, refundLineIds: refund.lines.map((l) => l.id), connector: 'xero', accounts: { ioss: '999', ddp: '232', fee: '232', rounding: '860' }, now: new Date() })
+  const outcome = await treatCreditNotePayload({ refundId: refund.id, orderId: fx.orderId, payload, refundLineIds: refund.lines.map((l) => l.id), connector: 'xero', accounts: { ioss: '999', ddp: '232', fee: '232', rounding: '860' }, now: new Date(), enqueueHeldRow: async () => ({ queued: false, reason: "refused", connector: null }) })
   assert.equal(outcome.kind, 'treated')
   if (outcome.kind !== 'treated') return
   const vat = (outcome.payload.lines as Array<{ noTaxKind?: string; accountCode: string; unitAmount: number }>).find((l) => l.noTaxKind === 'eu-vat-recovery')
@@ -414,7 +414,7 @@ test('[eu vat credit note] a MANUAL refund is priced once, at creation: the rate
   await deps.db.taxRate.update({ where: { id: fx.rate.id }, data: { rate: '0.2' } })
   const { treatCreditNotePayload } = await import('../../lib/domain/sales/eu-vat-credit-note-treatment.ts')
   const rebuilt = { creditNoteNumber: 'CN-RETRY', currency: deps.baseCurrency, lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: fx.rate.accountingTaxType }], lineAmountsIncludeTax: false }
-  const outcome = await treatCreditNotePayload({ refundId: row!.refundId, orderId: fx.orderId, payload: rebuilt, refundLineIds: [frozen!.lines[0]!.id], connector: 'xero', accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' }, now: new Date() })
+  const outcome = await treatCreditNotePayload({ refundId: row!.refundId, orderId: fx.orderId, payload: rebuilt, refundLineIds: [frozen!.lines[0]!.id], connector: 'xero', accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' }, now: new Date(), enqueueHeldRow: async () => ({ queued: false, reason: "refused", connector: null }) })
   assert.equal(outcome.kind, 'treated')
   if (outcome.kind !== 'treated') return
   const lines = outcome.payload.lines as Array<{ noTaxKind?: string; unitAmount: number; quantity: number }>
@@ -422,7 +422,7 @@ test('[eu vat credit note] a MANUAL refund is priced once, at creation: the rate
   assert.equal(lines.reduce((sum, l) => sum + l.unitAmount * l.quantity, 0).toFixed(2), '119.00')
   // A refund created before the basis was frozen: refused, to be posted by hand.
   await deps.db.salesOrderRefundLine.update({ where: { id: frozen!.lines[0]!.id }, data: { schemeTaxRateValue: null } })
-  const old = await treatCreditNotePayload({ refundId: row!.refundId, orderId: fx.orderId, payload: rebuilt, refundLineIds: [frozen!.lines[0]!.id], connector: 'xero', accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' }, now: new Date() })
+  const old = await treatCreditNotePayload({ refundId: row!.refundId, orderId: fx.orderId, payload: rebuilt, refundLineIds: [frozen!.lines[0]!.id], connector: 'xero', accounts: { ioss: '821', ddp: '232', fee: '232', rounding: '860' }, now: new Date(), enqueueHeldRow: async () => ({ queued: false, reason: "refused", connector: null }) })
   assert.equal(old.kind, 'refused')
   assert.equal(old.kind === 'refused' && old.code, 'hand_post')
   assert.match(old.kind === 'refused' ? old.reason : '', /did not record the VAT rate and amount it was priced at[\s\S]*settle action on \/sync/)
@@ -452,7 +452,7 @@ test('[eu vat credit note] a CANCELLATION (the whole-order reversal) reverses th
   assert.equal(queued.reduce((sum, l) => sum + l.unitAmount * l.quantity, 0).toFixed(2), '159.46', 'and the credit note totals the whole invoice')
 })
 
-test('[eu vat credit note] a WooCommerce refund whose tax is booked on rate 182 is parked, not recorded: createRefund is never called; the switch off, or a non-scheme order, is not touched', { skip }, async (t) => {
+test('[eu vat credit note] a WooCommerce refund whose tax is booked on rate 182 is recorded with its tax summed across ALL rate ids (an unreadable 182 figure is still parked); the switch off, or a non-scheme order, is not touched', { skip }, async (t) => {
   const deps = await loadDeps()
   const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
   const outside = await seed(deps, { stamp: 'none', schemeRate: false })
@@ -462,39 +462,52 @@ test('[eu vat credit note] a WooCommerce refund whose tax is booked on rate 182 
   await deps.db.shoppingOrderLink.create({ data: { orderId: outside.orderId, connector: 'woocommerce', externalOrderId: String(externalOutside) } })
   t.after(async () => { await cleanup(deps.db, fx); await cleanup(deps.db, outside) })
   const { syncWcRefund } = await import('../../lib/connectors/woocommerce/sync/refund-sync.ts')
-  const refund = (id: number, rateId: number) => ({
+  const refund = (id: number, rateId: number, total = '-19.00') => ({
     id, parent_id: externalOrderId, date_created: '2026-11-02T10:00:00', date_created_gmt: '2026-11-02T10:00:00', amount: '119.00', reason: 'r', refunded_by: 1, refunded_payment: false, meta_data: [],
-    line_items: [{ id: 91, name: 'Widget', product_id: 1, variation_id: 0, quantity: 0, tax_class: '', subtotal: '-100.00', subtotal_tax: '-19.00', total: '-100.00', total_tax: '-19.00', sku: 's', meta_data: [], refund_total: -100, taxes: [{ id: rateId, total: '-19.00' }] }],
+    line_items: [{ id: 91, name: 'Widget', product_id: 1, variation_id: 0, quantity: 0, tax_class: '', subtotal: '-100.00', subtotal_tax: '-19.00', total: '-100.00', total_tax: '-19.00', sku: 's', meta_data: [], refund_total: -100, taxes: [{ id: rateId, total }, { id: 244, total: '0.00' }] }],
   })
-  let called = 0
-  const stub = async () => { called += 1; return { success: true } }
-  // Switch OFF: the refund is read as it always was (the stub is reached).
+  const calls: Array<Record<string, unknown>> = []
+  const stub = async (...args: unknown[]) => { calls.push((args[4] ?? {}) as Record<string, unknown>); return { success: true } }
+  // Switch OFF: the refund is read as it always was (the stub is reached, and no 182 figure is handed on).
   let restore = await configure(deps.db, false)
   await syncWcRefund(externalOrderId, refund(wooRefundId(), 182) as never, { createRefund: stub as never })
-  assert.equal(called, 1, 'switch off: not refused')
+  assert.equal(calls.length, 1, 'switch off: not refused')
+  assert.equal('eas182StatedTaxForeign' in calls[0]!, false, 'switch off: nothing handed on')
   await restore()
-  // Switch ON, scheme order, tax on 182: parked QUARANTINED with the operator wording, createRefund not called.
+  // Switch ON, scheme order, tax on 182: recorded, the tax summed across all rate ids is handed to the writer, nothing is parked.
   restore = await configure(deps.db, true)
   t.after(async () => { await restore() })
-  called = 0
+  calls.length = 0
   const id = wooRefundId()
   const outcome = await syncWcRefund(externalOrderId, refund(id, 182) as never, { createRefund: stub as never })
-  assert.equal(outcome.outcome, 'quarantined-refusal')
-  assert.equal(called, 0)
-  assert.match(outcome.error ?? '', new RegExp(`WooCommerce refund ${id} was NOT recorded: its VAT \\(19\\) is booked on WooCommerce tax rate 182`))
-  const park = await deps.db.shoppingSyncLog.findFirst({ where: { externalId: String(id), entityId: fx.orderId }, select: { status: true } })
+  assert.notEqual(outcome.outcome, 'quarantined-refusal')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0]!.eas182StatedTaxForeign, 19)
+  assert.equal(calls[0]!.statedGrossForeign, 119)
+  assert.equal(await deps.db.shoppingSyncLog.count({ where: { externalId: String(id), entityId: fx.orderId, status: 'QUARANTINED' } }), 0, 'not parked as quarantined')
+  // A 182 figure that cannot be read: parked QUARANTINED with the operator wording, createRefund not called.
+  calls.length = 0
+  const unreadable = wooRefundId()
+  const refused = await syncWcRefund(externalOrderId, refund(unreadable, 182, 'abc') as never, { createRefund: stub as never })
+  assert.equal(refused.outcome, 'quarantined-refusal')
+  assert.equal(calls.length, 0)
+  assert.match(refused.error ?? '', new RegExp(`WooCommerce refund ${unreadable} was NOT recorded: its VAT \\(1\\) is booked on WooCommerce tax rate 182`))
+  const park = await deps.db.shoppingSyncLog.findFirst({ where: { externalId: String(unreadable), entityId: fx.orderId }, select: { status: true, errorMessage: true } })
   assert.equal(park?.status, 'QUARANTINED')
-  const parkedMessage = await deps.db.shoppingSyncLog.findFirst({ where: { externalId: String(id), entityId: fx.orderId }, select: { errorMessage: true } })
-  assert.match(parkedMessage?.errorMessage ?? '', new RegExp(`WooCommerce refund ${id} was NOT recorded`), 'the parked row carries the operator wording')
+  assert.match(park?.errorMessage ?? '', new RegExp(`WooCommerce refund ${unreadable} was NOT recorded`), 'the parked row carries the operator wording')
   const activity = await deps.db.activityLog.findFirst({ where: { entityId: fx.orderId, action: 'refund_sync_eas_rate_182_refused' }, select: { level: true, description: true } })
   assert.equal(activity?.level, 'WARNING')
   assert.match(activity?.description ?? '', /rate 182/)
-  // The same refund on another rate, switch on, scheme order: not refused.
+  // The same refund on another rate, switch on, scheme order: recorded as before, nothing extra handed on.
+  calls.length = 0
   await syncWcRefund(externalOrderId, refund(wooRefundId(), 244) as never, { createRefund: stub as never })
-  assert.equal(called, 1, 'any other rate is recorded as before')
-  // 182 on an order outside the scheme: not refused.
+  assert.equal(calls.length, 1, 'any other rate is recorded as before')
+  assert.equal('eas182StatedTaxForeign' in calls[0]!, false)
+  // 182 on an order outside the scheme: not touched.
+  calls.length = 0
   await syncWcRefund(externalOutside, refund(wooRefundId(), 182) as never, { createRefund: stub as never })
-  assert.equal(called, 2, 'a non-scheme order is not touched')
+  assert.equal(calls.length, 1, 'a non-scheme order is not touched')
+  assert.equal('eas182StatedTaxForeign' in calls[0]!, false)
 })
 
 test('[eu vat credit note] every route to a credit note reaches the one builder, and the poster wires both checks', () => {
@@ -542,7 +555,7 @@ async function directRefund(deps: Deps, fx: Fixture, opts: { lines: DirectLine[]
 }
 async function treat(deps: Deps, fx: Fixture, refund: Awaited<ReturnType<typeof directRefund>>, over: { payload?: Record<string, unknown>; lineIds?: readonly string[]; connector?: string | null; refundId?: string } = {}) {
   const { treatCreditNotePayload } = await import('../../lib/domain/sales/eu-vat-credit-note-treatment.ts')
-  return treatCreditNotePayload({ refundId: over.refundId ?? refund.refundId, orderId: fx.orderId, payload: over.payload ?? refund.payload(), refundLineIds: over.lineIds ?? refund.lineIds, connector: over.connector === undefined ? 'xero' : over.connector, accounts: ACCOUNTS, now: new Date() })
+  return treatCreditNotePayload({ refundId: over.refundId ?? refund.refundId, orderId: fx.orderId, payload: over.payload ?? refund.payload(), refundLineIds: over.lineIds ?? refund.lineIds, connector: over.connector === undefined ? 'xero' : over.connector, accounts: ACCOUNTS, now: new Date(), enqueueHeldRow: async () => ({ queued: false, reason: "refused", connector: null }) })
 }
 const refusal = (outcome: Awaited<ReturnType<typeof treat>>) => (outcome.kind === 'refused' ? outcome : null)
 
@@ -558,7 +571,12 @@ async function prepared(t: test.TestContext, opts: { stamp: 'IOSS' | 'none' | nu
 test('[eu vat credit note] the treatment asks first: only Xero with the Sales Invoices switch on; a refund that does not exist is refused, and the number named is the refund\'s own', { skip }, async (t) => {
   const { deps, fx } = await prepared(t, { stamp: 'IOSS', schemeRate: true })
   const refund = await directRefund(deps, fx, { lines: [{ net: '100' }], stated: '119' })
-  for (const connector of ['quickbooks', null]) assert.deepEqual(await treat(deps, fx, refund, { connector }), { kind: 'skipped', why: 'switch_off' })
+  // A refund with no persisted scheme snapshot is skipped; one recorded under the scheme treatment is never skipped (a persisted decision outranks the switch and the connector).
+  const bareRefund = await directRefund(deps, fx, { lines: [{ net: '100', type: null, rate: null }], stated: null })
+  for (const connector of ['quickbooks', null]) {
+    assert.deepEqual(await treat(deps, fx, bareRefund, { connector }), { kind: 'skipped', why: 'switch_off' })
+    assert.equal(refusal(await treat(deps, fx, refund, { connector }))?.code, 'hand_post')
+  }
   assert.equal((await treat(deps, fx, refund)).kind, 'treated')
   const missing = refusal(await treat(deps, fx, refund, { refundId: randomUUID() }))
   assert.match(missing?.reason ?? '', /could not be found/)
@@ -576,9 +594,12 @@ test('[eu vat credit note] the treatment asks first: only Xero with the Sales In
 test('[eu vat credit note] an unstamped order: the three classifications (a) IMS-queued treated invoice, (b) a stamp outside the scheme, (c) the rates\' current scheme mapping', { skip }, async (t) => {
   const { deps, fx } = await prepared(t, { stamp: null, schemeRate: false })
   const refund = await directRefund(deps, fx, { lines: [{ net: '100' }], stated: '119' })
+  // The same refund with no persisted scheme snapshot: only that kind may be skipped.
+  const bare = await directRefund(deps, fx, { lines: [{ net: '100', type: null, rate: null }], stated: null })
   const rateOf = (data: Record<string, unknown>) => deps.db.taxRate.update({ where: { id: fx.rate.id }, data })
   // (c) no evidence and no scheme mapping: not a scheme order.
-  assert.deepEqual(await treat(deps, fx, refund), { kind: 'skipped', why: 'not_scheme' })
+  assert.deepEqual(await treat(deps, fx, bare), { kind: 'skipped', why: 'not_scheme' })
+  assert.equal(refusal(await treat(deps, fx, refund))?.code, 'hand_post', 'a persisted snapshot is never skipped')
   // (c) the category alone, or the posting type alone, makes it a scheme order; case and padding do not matter; a blank posting type is nothing.
   await rateOf({ reportingCategory: 'IOSS' })
   assert.equal(refusal(await treat(deps, fx, refund))?.code, 'hand_post')
@@ -587,14 +608,17 @@ test('[eu vat credit note] an unstamped order: the three classifications (a) IMS
   await rateOf({ reportingCategory: null, schemePostingTaxType: 'TAX131' })
   assert.equal(refusal(await treat(deps, fx, refund))?.code, 'hand_post')
   await rateOf({ schemePostingTaxType: '  ' })
-  assert.deepEqual(await treat(deps, fx, refund), { kind: 'skipped', why: 'not_scheme' })
+  assert.deepEqual(await treat(deps, fx, bare), { kind: 'skipped', why: 'not_scheme' })
+  assert.equal(refusal(await treat(deps, fx, refund))?.code, 'hand_post', 'a persisted snapshot is never skipped')
   await rateOf({ schemePostingTaxType: null, reportingCategory: 'STANDARD' })
-  assert.deepEqual(await treat(deps, fx, refund), { kind: 'skipped', why: 'not_scheme' })
+  assert.deepEqual(await treat(deps, fx, bare), { kind: 'skipped', why: 'not_scheme' })
+  assert.equal(refusal(await treat(deps, fx, refund))?.code, 'hand_post', 'a persisted snapshot is never skipped')
   // (a) an invoice IMS queued with the treatment marker makes it a scheme order, whichever of the two invoice types it was; one without the marker does not.
   const log = (type: 'SALES_INVOICE' | 'SALES_INVOICE_UPDATE', marker: unknown, referenceId = fx.orderId) => deps.db.accountingSyncLog.create({ data: { connector: 'xero', type, status: 'SYNCED', referenceType: 'SalesOrder', referenceId, payload: { invoiceNumber: 'INV-X', lines: [], _euVatTreatment: marker } as never, attemptRevision: 1 } })
   await log('SALES_INVOICE', { applied: false })
   await log('SALES_INVOICE', { applied: true }, randomUUID())
-  assert.deepEqual(await treat(deps, fx, refund), { kind: 'skipped', why: 'not_scheme' })
+  assert.deepEqual(await treat(deps, fx, bare), { kind: 'skipped', why: 'not_scheme' })
+  assert.equal(refusal(await treat(deps, fx, refund))?.code, 'hand_post', 'a persisted snapshot is never skipped')
   await log('SALES_INVOICE_UPDATE', { applied: true })
   const viaUpdate = refusal(await treat(deps, fx, refund))
   assert.equal(viaUpdate?.code, 'hand_post')
@@ -604,8 +628,11 @@ test('[eu vat credit note] an unstamped order: the three classifications (a) IMS
 
 test('[eu vat credit note] (b) a stamp outside the scheme is not a scheme order', { skip }, async (t) => {
   const { deps, fx } = await prepared(t, { stamp: 'none', schemeRate: false })
-  const r0 = await directRefund(deps, fx, { lines: [{ net: '100' }], stated: '119' })
+  const r0 = await directRefund(deps, fx, { lines: [{ net: '100', type: null, rate: null }], stated: null })
   assert.deepEqual(await treat(deps, fx, r0), { kind: 'skipped', why: 'not_scheme' })
+  // A refund carrying the scheme snapshot on an order stamped outside the scheme cannot be treated: refused, never skipped.
+  const persisted = await directRefund(deps, fx, { lines: [{ net: '100' }], stated: '119' })
+  assert.equal(refusal(await treat(deps, fx, persisted))?.code, 'hand_post')
 })
 
 test('[eu vat credit note] a stamped order with a blank account is refused; a padded account is trimmed', { skip }, async (t) => {

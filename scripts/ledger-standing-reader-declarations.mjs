@@ -15,6 +15,8 @@
 // slice-1c conversion entry remains); o3d-2by1 owns the re-settleability authority question.
 
 export const DECLARATIONS = [
+  { key: "lib/domain/sales/refund-182-hold.ts::creditNoteRowsOf::cmp-cancelled#1", class: "GUARD",
+    reason: "Refuses to apply the first-N hold of a rate-182 credit note when the refund already has a credit-note row that is not the refused marker row. A deliberately CANCELLED row is skipped because it can never be sent; every other status (pending, processing, failed, synced) is a row that may still go out or already did, so the hold is declared a conflict instead of stamping the refund held over it. It decides nothing about the ledger's standing." },
   { key: "app/(dashboard)/sync/xero-client.tsx::XeroClient::id-read#1", class: "DISPLAY",
     reason: "Names the id in the toast for a settlement action's result." },
   { key: "app/(dashboard)/sync/xero-client.tsx::XeroClient::cmp-cancelled#1", class: "DISPLAY",

@@ -1,0 +1,122 @@
+/**
+ * THE FIRST-N HOLD ON A RATE-182 SCHEME CREDIT NOTE (owner ruling 2026-11-09). A refund whose VAT the EAS compliance plugin booked on WooCommerce rate 182, on an order stamped as an IOSS/VOEC/DDP scheme order, is posted to the stamped VAT account, but the first
+ * `eu_vat_refund182_hold_threshold` (default 10) credit notes are held: queued as a refused row (never sent) for a person to review in Xero and settle on /sync.
+ *
+ * NO STAMP AND NO COUNT WITHOUT THE ROW. One transaction takes the counter's row lock, reads the threshold and the count, and, while the count is below the threshold, calls `enqueueHeldRow` (the caller's idempotent enqueue of the REFUSED credit-note row, made on its own connection while the lock is held).
+ * Only when that reports the row queued does the same transaction increment the count and stamp the refund (`eas182_held_at`) and commit; if it does not, or throws, the transaction rolls back and nothing is counted. A crash between the enqueue and the commit leaves a refused,
+ * never-sent row and no stamp, and the retry (same idempotency key) finds that row. Two refunds racing at count 9 of 10 queue behind the counter's lock, so exactly one holds.
+ *
+ * THE ROW MUST BE THE REFUSED ONE. The enqueue answers `queued` also when the idempotency key already has a live or posted row, without looking at its payload (a credit note queued sendable earlier, say while the threshold was 0). So after every enqueue the credit-note rows of the refund are READ (under the counter's lock, in the same transaction) and
+ * any row that is not CANCELLED and does not carry the refused marker is a CONFLICT: nothing is stamped or counted, the existing row is left alone (a decision taken earlier stands) and the caller is told so, to raise an operator notice. This applies equally to an already-held refund: it is never silently treated as held over a sendable row.
+ *
+ * A HELD DECISION IS PERMANENT. A refund already stamped is held again on every later treatment, whatever the Sales Invoices switch says now and whatever the count is, WITHOUT being counted again (`eas182_held_at` is set once). It never posts automatically; a person settles the row.
+ * A threshold or count that is not a whole number is not guessed: the credit note is held, and nothing is counted. A threshold of 0 holds nothing and writes nothing.
+ */
+import { db } from '@/lib/db'
+import { EU_VAT_CREDIT_NOTE_REFUSED_KEY } from '@/lib/domain/accounting/eu-vat-credit-note'
+import { EU_VAT_REFUND_HELD_COUNT_SETTING, EU_VAT_REFUND_HOLD_THRESHOLD_SETTING, parseCountSetting, refundHoldThreshold } from '@/lib/domain/accounting/eu-vat-settings'
+
+/** What the caller's enqueue of the refused row answered (the accounting facade's outcome, passed through untouched). */
+export type HeldRowEnqueue = { queued: boolean; reason?: string }
+
+/** The idempotency key the hand-off queues a refund's credit note under (app/actions/sales.ts `enqueueCreditNoteRow`; a test pins the two together). */
+export const creditNoteIdempotencyKey = (refundId: string): string => `sales-order-refund:${refundId}:credit-note`
+
+export type Refund182HoldDecision<T extends HeldRowEnqueue> =
+  | { held: false }
+  /** The row was queued and (for `newlyHeld`) the count and the stamp committed with it. `threshold` is null when the stored threshold or count is not a whole number. */
+  | { held: true; queued: true; newlyHeld: boolean; /** The refused row already existed (an earlier attempt queued it but its counter transaction failed): it is stamped and counted now even if that takes the count past the threshold, because the hold is real. */ reconciled?: true; heldNumber: number; threshold: number | null; outcome: T }
+  /** The row could not be queued: nothing was stamped or counted. `outcome` is what the enqueue said, for the caller's obligation ledger. */
+  | { held: true; queued: false; outcome: T; /** The enqueue said queued but no refused row of this refund exists, so nothing was held: the caller must account the obligation as UNMET, whatever `outcome` says. */ rowMissing?: true }
+  /** The key resolves to a row that is NOT the refused one (sendable, or already posted): the hold could not be applied. Nothing was stamped or counted and the row is untouched. */
+  | { held: false; conflict: true; outcome: T; sendableRowIds: string[] }
+  /** The posting was already marked handled by hand: the enqueue answered `queued` WITHOUT writing a row. There is nothing to hold and nothing to settle: no stamp, no count; the obligation is already settled by hand. */
+  | { held: false; handledByHand: true; outcome: T }
+
+/** The credit-note rows of this refund that could still be sent or are already posted: not cancelled, and not the refused marker. */
+async function creditNoteRowsOf(client: Pick<typeof db, 'accountingSyncLog'>, refundId: string): Promise<{ sendable: string[]; refusedRowExists: boolean }> {
+  const rows = await client.accountingSyncLog.findMany({ where: { type: 'CREDIT_NOTE', referenceType: 'SalesOrderRefund', referenceId: refundId }, select: { id: true, status: true, payload: true } })
+  const sendable: string[] = []
+  let refusedRowExists = false
+  for (const row of rows) {
+    if (row.status === 'CANCELLED') continue
+    const payload = row.payload as Record<string, unknown> | null
+    const refused = payload !== null && typeof payload === 'object' && payload[EU_VAT_CREDIT_NOTE_REFUSED_KEY] !== undefined && payload[EU_VAT_CREDIT_NOTE_REFUSED_KEY] !== null
+    if (!refused) sendable.push(row.id)
+    else if (payload._idempotencyKey === creditNoteIdempotencyKey(refundId)) refusedRowExists = true
+  }
+  return { sendable, refusedRowExists }
+}
+
+/** What the held row's enqueue really left behind: `held` (a refused row with this refund's key exists and nothing sendable does), a `conflict`, `handled-by-hand` (no row, by design) or `missing` (it said queued but no refused row exists: not a hold). */
+async function verifyHeldRow<T extends HeldRowEnqueue>(client: Pick<typeof db, 'accountingSyncLog'>, refundId: string, outcome: T): Promise<{ verdict: 'held' } | { verdict: 'missing' } | { verdict: 'handled' } | { verdict: 'conflict'; sendable: string[] }> {
+  if (outcome.reason === 'handled-by-hand') return { verdict: 'handled' }
+  const { sendable, refusedRowExists } = await creditNoteRowsOf(client, refundId)
+  if (sendable.length > 0) return { verdict: 'conflict', sendable }
+  return refusedRowExists ? { verdict: 'held' } : { verdict: 'missing' }
+}
+
+class RowNotQueued<T> extends Error {
+  constructor(readonly outcome: T, readonly rowMissing = false) { super('the held credit-note row was not queued') }
+}
+
+export async function decideRefund182Hold<T extends HeldRowEnqueue>(refundId: string, enqueueHeldRow: (place: { heldNumber: number; threshold: number | null }) => Promise<T>): Promise<Refund182HoldDecision<T>> {
+  const heldAtOf = async (client: Pick<typeof db, '$queryRaw'>): Promise<Date | null> => {
+    const rows = await client.$queryRaw<Array<{ held: Date | null }>>`SELECT eas182_held_at AS held FROM sales_order_refunds WHERE id = ${refundId}`
+    if (rows.length === 0) throw new Error('the refund to hold could not be found')
+    return rows[0]!.held
+  }
+  const placeOf = async (client: Pick<typeof db, '$queryRaw'>): Promise<number> => Number((await client.$queryRaw<Array<{ n: bigint }>>`SELECT COUNT(*) AS n FROM sales_order_refunds WHERE eas182_held_at IS NOT NULL AND eas182_held_at <= (SELECT eas182_held_at FROM sales_order_refunds WHERE id = ${refundId})`)[0]?.n ?? 0)
+  const thresholdOf = async (client: typeof db): Promise<number | null> => refundHoldThreshold((await client.setting.findUnique({ where: { key: EU_VAT_REFUND_HOLD_THRESHOLD_SETTING }, select: { value: true } }))?.value)
+
+  // Already held: held again, never counted again, and the (idempotent) refused row is enqueued again in case the first attempt never got it queued.
+  const alreadyHeld = async (threshold: number | null): Promise<Refund182HoldDecision<T>> => {
+    const outcome = await enqueueHeldRow({ heldNumber: await placeOf(db), threshold })
+    if (!outcome.queued) return { held: true, queued: false, outcome }
+    const verified = await verifyHeldRow(db, refundId, outcome)
+    if (verified.verdict === 'conflict') return { held: false, conflict: true, outcome, sendableRowIds: verified.sendable }
+    if (verified.verdict === 'handled') return { held: false, handledByHand: true, outcome }
+    if (verified.verdict === 'missing') return { held: true, queued: false, outcome, rowMissing: true }
+    return { held: true, queued: true, newlyHeld: false, heldNumber: await placeOf(db), threshold, outcome }
+  }
+  if ((await heldAtOf(db)) !== null) return alreadyHeld(await thresholdOf(db))
+  const preThreshold = await thresholdOf(db)
+  // A refused row of this refund that already exists (queued by an attempt whose counter transaction then failed) is a real hold: it is reconciled below whatever the threshold says now, never fallen through to a sendable enqueue that would dedupe against it.
+  const orphanBefore = await creditNoteRowsOf(db, refundId)
+  if (preThreshold === 0 && !(orphanBefore.refusedRowExists && orphanBefore.sendable.length === 0)) return { held: false }
+
+  try {
+    return await db.$transaction(async (tx) => {
+      // The counter's row lock serialises every hold decision.
+      await tx.$executeRaw`INSERT INTO settings (key, value, "updatedAt") VALUES (${EU_VAT_REFUND_HELD_COUNT_SETTING}, '0', now()) ON CONFLICT (key) DO NOTHING`
+      const stored = (await tx.$queryRaw<Array<{ value: string }>>`SELECT value FROM settings WHERE key = ${EU_VAT_REFUND_HELD_COUNT_SETTING} FOR UPDATE`)[0]?.value
+      // Re-read under the lock: a concurrent treatment of this same refund may have held it, and the threshold may have changed.
+      if ((await heldAtOf(tx as unknown as typeof db)) !== null) return await alreadyHeld(await thresholdOf(db))
+      const threshold = await thresholdOf(tx as unknown as typeof db)
+      const count = parseCountSetting(stored)
+      const countable = threshold !== null && count.state !== 'invalid'
+      const held = count.state === 'ok' ? count.value : 0
+      // RECONCILE BEFORE THE THRESHOLD DECISION: an existing refused row (marker plus this refund's key) with nothing sendable beside it is a hold that was queued but never stamped or counted.
+      const existing = await creditNoteRowsOf(tx as unknown as typeof db, refundId)
+      const reconciling = existing.refusedRowExists && existing.sendable.length === 0
+      if (!reconciling) {
+        if (threshold === 0) return { held: false as const }
+        if (countable && held >= threshold) return { held: false as const }
+      }
+      const heldNumber = countable ? held + 1 : (await tx.$queryRaw<Array<{ n: bigint }>>`SELECT COUNT(*) + 1 AS n FROM sales_order_refunds WHERE eas182_held_at IS NOT NULL`).map((row) => Number(row.n))[0] ?? 1
+      const outcome = await enqueueHeldRow({ heldNumber, threshold: countable ? threshold : null })
+      if (!outcome.queued) throw new RowNotQueued(outcome)
+      // REQUIRE the refused row (this refund's key) to exist before anything is stamped or counted.
+      const verified = await verifyHeldRow(tx as unknown as typeof db, refundId, outcome)
+      if (verified.verdict === 'conflict') return { held: false as const, conflict: true as const, outcome, sendableRowIds: verified.sendable }
+      if (verified.verdict === 'handled') return { held: false as const, handledByHand: true as const, outcome }
+      if (verified.verdict === 'missing') throw new RowNotQueued(outcome, true)
+      if (countable) await tx.$executeRaw`UPDATE settings SET value = ${String(held + 1)}, "updatedAt" = now() WHERE key = ${EU_VAT_REFUND_HELD_COUNT_SETTING}`
+      await tx.$executeRaw`UPDATE sales_order_refunds SET eas182_held_at = now() WHERE id = ${refundId}`
+      return { held: true as const, queued: true as const, newlyHeld: true, ...(reconciling ? { reconciled: true as const } : {}), heldNumber, threshold: countable ? threshold : null, outcome }
+    }, { timeout: 60_000, maxWait: 60_000 })
+  } catch (error) {
+    if (error instanceof RowNotQueued) return { held: true, queued: false, outcome: error.outcome as T, ...(error.rowMissing ? { rowMissing: true as const } : {}) }
+    throw error
+  }
+}

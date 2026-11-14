@@ -2192,6 +2192,13 @@ model SalesOrderRefund {
   /// switch is on and the order is on an EU scheme; NULL for a manual or chargeback refund (which state nothing) and for every row written before the column existed.
   /// The scheme credit note's one VAT line is this less the net of its lines.
   statedGrossForeign Decimal? @db.Decimal(18, 4) @map("stated_gross_foreign")
+  /// IOSS credit notes, rate 182: the tax a WooCommerce refund states across ALL its rate ids (the EAS compliance plugin books a refund's VAT under its own rate 182), in the order currency. Written only when the refund carried tax on rate 182, the Sales Invoices
+  /// switch is on and the order is on an EU scheme; NULL for every other refund and every row written before the column existed.
+  eas182StatedTaxForeign Decimal? @db.Decimal(18, 4) @map("eas182_stated_tax_foreign")
+  /// When this rate-182 credit note was counted against the hold (the first N are queued as a refused, settle-by-hand row and never sent). Set in the same transaction as the count, once per refund, so an accounting retry never counts it again. NULL: not held.
+  eas182HeldAt DateTime? @map("eas182_held_at")
+  /// When this refund was recorded under the EU IOSS/VOEC/DDP scheme path (the Sales Invoices switch on and the order scheme-stamped, or an unstamped order classified a scheme order on immutable evidence), written under the order lock WHETHER OR NOT any pricing field could be filled. A persisted decision: a credit note for it is scheme-treated or refused, never skipped, whatever the switch says later. NULL: created off the scheme path, or before the column existed.
+  schemeTreatedAt DateTime? @map("scheme_treated_at")
   source          String?
   accountingRetryRequired Boolean @default(false) @map("accounting_retry_required")
   accountingWarning String?   @map("accounting_warning")

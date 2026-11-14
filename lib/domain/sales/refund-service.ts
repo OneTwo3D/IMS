@@ -17,6 +17,9 @@ import {
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
+import { eas182RefundFigures } from '@/lib/domain/accounting/eu-vat-credit-note'
+import { unstampedOrderIsScheme } from '@/lib/domain/sales/eu-vat-scheme-evidence'
+import { priorRefundedTax } from '@/lib/domain/sales/refund-182-prior-tax'
 import { addMoney, currencyMinorUnits, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
@@ -3660,6 +3663,8 @@ export async function createSalesOrderRefund(
     euVatSchemeSnapshot?: boolean
     /** The gross (tax included) the source of the refund states it returned, in the order currency: the WooCommerce refund `amount`. Honoured only with `euVatSchemeSnapshot`, and only from an internal caller. */
     statedGrossForeign?: number
+    /** IOSS credit notes, rate 182: the tax the WooCommerce refund states across ALL its rate ids, set only when the refund carried tax on the EAS plugin's rate 182. Honoured only with `euVatSchemeSnapshot`, and only from an internal caller. */
+    eas182StatedTaxForeign?: number
   },
 ): Promise<CreateSalesOrderRefundResult> {
   // THE ROW-SHAPE CHECKS RUN ON THE REQUEST AS SENT, before any filtering: a row the filter below would drop (a negative quantity with no money)
@@ -4640,7 +4645,37 @@ export async function createSalesOrderRefund(
       // once each part has been checked on its own — see postedCreditNoteAggregateCheck.
       const legs: PostedCreditNoteLeg[] = []
 
-      for (const refundLine of refundLines) {
+      // IOSS credit notes, rate 182 (internal callers only, behind the Sales Invoices switch, scheme-stamped order): the EAS compliance plugin RE-PRICES a refund's tax under its own rate, so each line's stated VAT is not the VAT of the order line's ORIGINAL rate and the per-line posted-VAT
+      // fence below would refuse exactly the refunds this exists for. For that refund ONLY the fence is replaced by (a) the source-stated tax, summed over the lines, which must equal the tax the refund states in all (within the per-refund tolerance), and (b) the aggregate order bound (`eas182RefundFigures`): the VAT
+      // credited across the order's refunds may not exceed the order's collected VAT by more than one fixed allowance. Every other refund keeps the per-line fence unchanged.
+      const rate182 = input.euVatSchemeSnapshot === true && input.eas182StatedTaxForeign != null && Number.isFinite(input.eas182StatedTaxForeign) && input.statedGrossForeign != null && Number.isFinite(input.statedGrossForeign)
+      if (rate182) {
+        // The net is that of EVERY line that will be persisted and that the credit note will be built from, a server-generated (negative) order-discount line included if there is one: the treatment sums every persisted line, so this must too or the writer would accept what the credit note then refuses.
+        // (Only a public caller's refund gets the server-derived discount line, and the rate-182 classification is internal-only, so today none is present; the sum is over refundLines either way.)
+        const taxedLines = refundLines.filter((refundLine) => refundLine.lineKind !== 'discount')
+        const hasDiscountLine = taxedLines.length !== refundLines.length
+        let net182 = toDecimal(0)
+        for (const refundLine of refundLines) net182 = net182.add(toDecimal(netForeignOf(refundLine)))
+        let statedLineTax = toDecimal(0)
+        let everyLineStates = true
+        for (const refundLine of taxedLines) {
+          if (refundLine.chargedTaxForeign == null) everyLineStates = false
+          else statedLineTax = statedLineTax.add(toDecimal(refundLine.chargedTaxForeign))
+        }
+        const minor182 = toDecimal(1).div(toDecimal(10).pow(currencyMinorUnits(so.currency)))
+        if (everyLineStates && !hasDiscountLine && statedLineTax.sub(toDecimal(input.eas182StatedTaxForeign!)).abs().gt(minor182.mul(taxedLines.length + 1))) {
+          return refuse(`the VAT its lines state (${statedLineTax.toString()} ${so.currency}) does not match the VAT the refund states in all (${toDecimal(input.eas182StatedTaxForeign!).toString()} ${so.currency}).`)
+        }
+        const priorTax = await priorRefundedTax(tx, input.orderId, null, toDecimal(so.taxForeign))
+        const bound = eas182RefundFigures({
+          net: net182, statedGross: toDecimal(input.statedGrossForeign!), statedTax: toDecimal(input.eas182StatedTaxForeign!), orderTax: toDecimal(so.taxForeign), priorRefundedTax: priorTax, currency: so.currency,
+          toleranceMinorUnits: taxedLines.length + 1, orderAllowanceMinorUnits: so.lines.length + 1,
+        })
+        if (!bound.ok) return refuse(`${bound.reason}.`)
+      }
+      const fenceLines = rate182 ? [] : refundLines
+
+      for (const refundLine of fenceLines) {
         const lineKind: 'sale' | 'shipping' | 'discount' =
           refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale'
         // A mirrored order-level discount has no VAT figure of its OWN anywhere in IMS — its VAT is
@@ -4750,7 +4785,7 @@ export async function createSalesOrderRefund(
       // residue is shipping's VAT alone, the shipping leg is already checked on its own above, and the
       // discount leg's VAT was never in the order's total to be checked against.
       // -------------------------------------------------------------------------------------------
-      const discountLegs = refundLines.filter((refundLine) => refundLine.lineKind === 'discount')
+      const discountLegs = fenceLines.filter((refundLine) => refundLine.lineKind === 'discount')
       if (input.chargeback && discountLegs.length > 0 && !orderTaxIsSumOfComponents) {
         const combinedNet = refundLines
           .filter((refundLine) => refundLine.lineKind === 'discount' || refundLine.lineKind === 'shipping')
@@ -4817,6 +4852,13 @@ export async function createSalesOrderRefund(
     const accountingStagingFollows = Boolean(so.revenueDeferredDate && input.accountingSettings)
     // Under the order lock this transaction holds: the stamp it reads cannot change before the lines are written. Not read at all unless the caller says the switch is on.
     const schemeSnapshot = input.euVatSchemeSnapshot === true ? await resolveSchemePostingSnapshot(tx, input.orderId) : null
+    // THE SCHEME DECISION, RECORDED EXPLICITLY: whenever the refund is created under the scheme path (the switch is on and the order is scheme-stamped, or it is unstamped and classified a scheme order on immutable evidence), regardless of whether any pricing field below could be filled, so a later switch-off
+    // cannot make the refund look ordinary. Never written with the switch off (`euVatSchemeSnapshot` unset) or for an order outside the scheme.
+    let schemeTreated = schemeSnapshot?.scheme === true
+    if (input.euVatSchemeSnapshot === true && !schemeTreated) {
+      const stamp = await tx.salesOrder.findUnique({ where: { id: input.orderId }, select: { euVatRegimeStampedAt: true } })
+      if (stamp !== null && stamp.euVatRegimeStampedAt === null) schemeTreated = await unstampedOrderIsScheme(tx, input.orderId)
+    }
     // SCHEME REFUNDS FREEZE THEIR PRICING HERE, under the order lock: each line's VAT rate (the rate of the code it is priced under) and the gross the refund comes to. The credit note is built from these only, never from a TaxRate read later,
     // so an accounting retry after a rate changed posts what this refund was. The gross is the source's own figure when it states one, else the lines' unrounded totals with their tax, rounded once.
     let frozenRates: Array<string | null> | null = null
@@ -4878,6 +4920,8 @@ export async function createSalesOrderRefund(
         // by a default and never minted for it by the database.
         reversalStagingState: REVERSAL_STAGING_NOT_STAGED,
         ...(schemeSnapshot?.scheme === true && frozenGross !== null ? { statedGrossForeign: frozenGross } : {}),
+        ...(schemeTreated ? { schemeTreatedAt: new Date() } : {}),
+        ...(schemeSnapshot?.scheme === true && input.eas182StatedTaxForeign != null && Number.isFinite(input.eas182StatedTaxForeign) ? { eas182StatedTaxForeign: input.eas182StatedTaxForeign } : {}),
       },
       select: { id: true },
     })
@@ -5660,6 +5704,7 @@ export async function retrySalesOrderRefundAccounting(
           creditNoteNumber: true,
           externalRefundId: true,
           chargeback: true,
+          eas182StatedTaxForeign: true,
           accountingRetryRequired: true,
           accountingRetrySyncs: true,
           // o3d-2sm1: the witness `stageRefundAccountingReversals` writes in the same transaction as
@@ -5746,7 +5791,8 @@ export async function retrySalesOrderRefundAccounting(
       // until the mapping is restored. Retrying is then what completes it.
       // -------------------------------------------------------------------------------------------
       const replayLines = refund.lines.map(reconstructReplayLine)
-      const postedTaxRefusal = input.creditNotePostingEnabled
+      // A rate-182 refund (the EAS plugin re-priced its tax; recorded under the creation fence's rate-182 replacement) is not re-fenced per line either: its VAT was confirmed against its own stated figures and the order's aggregate bound when it was created, and the credit-note treatment checks both again.
+      const postedTaxRefusal = input.creditNotePostingEnabled && refund.eas182StatedTaxForeign == null
         ? await fenceRetryPostedTax(
             tx,
             refund.order,

@@ -2373,6 +2373,18 @@ async function queueRefundAccountingActions(input: {
     currencyRateToBase: usableStoredFxRate(input.refundFxRate)?.toNumber(),
   }
 
+  // The one enqueue of this hand-off's credit-note row (the treated, plain or REFUSED payload alike).
+  // o3d-j625: every `accountCode` below is `settings.*`, so the row is routed by the same resolution
+  // those codes came from. Where the chart's connector has since been retired the enqueue refuses,
+  // which the ledger records as an unmet obligation — `accountingRetryRequired` stays set and the
+  // caller reports the warning — instead of committing a credit note to books it does not describe.
+  const enqueueCreditNoteRow = async (payload: Record<string, unknown>) => await queueAccountingSync({
+    ...creditNote,
+    idempotencyKey: `sales-order-refund:${input.refundId}:credit-note`,
+    chartConnector: settings.connector,
+    payload,
+  })
+
   // IOSS credit notes (behind the Sales Invoices switch): a credit note on an order stamped as an IOSS/VOEC/DDP scheme order is rebuilt on the stamped regime. Off, nothing is read and the payload above is queued exactly as built.
   // The accounts are the ones read ONCE above for this very payload.
   const creditNoteTreatment = await treatCreditNotePayload({
@@ -2383,27 +2395,24 @@ async function queueRefundAccountingActions(input: {
     connector: settings.connector,
     accounts: { ioss: settings.euVatIossAccount ?? null, ddp: settings.euVatDdpAccount ?? null, fee: settings.euFeeAccount ?? null, rounding: settings.roundingDifferenceAccount ?? null },
     now: new Date(),
+    // The hold queues its REFUSED row through the very enqueue below (same key, same chart pin), inside the hold's own transaction, so no stamp or count exists without the row.
+    enqueueHeldRow: (reason) => enqueueCreditNoteRow(refusedCreditNotePayload({ creditNoteNumber: builtCreditNotePayload.creditNoteNumber, currency: builtCreditNotePayload.currency, reference: builtCreditNotePayload.reference, date: builtCreditNotePayload.date, refundId: input.refundId, orderId: input.orderId, lines: builtCreditNotePayload.lines, reason })),
   })
-  if (creditNoteTreatment.kind === 'refused' && creditNoteTreatment.code !== 'hand_post') {
+  if (creditNoteTreatment.kind === 'held' || creditNoteTreatment.kind === 'hold_conflict' || creditNoteTreatment.kind === 'hold_handled') {
+    // The refused row IS the hand-off's credit note (queued, or not: then the obligation stays unmet and a retry holds it again).
+    ledger.account(creditNote, creditNoteTreatment.outcome)
+  } else if (creditNoteTreatment.kind === 'refused' && creditNoteTreatment.code !== 'hand_post') {
     // Nothing is queued and the obligation stays unmet: the refund stays marked for retry, and a retry after the cause is fixed rebuilds the credit note.
     await recordCreditNoteTreatmentRefusal({ orderId: input.orderId, refundId: input.refundId, reason: creditNoteTreatment.reason })
     ledger.account(creditNote, { queued: false, reason: 'refused', connector: settings.connector })
   } else {
-    ledger.account(creditNote, await queueAccountingSync({
-      ...creditNote,
-      idempotencyKey: `sales-order-refund:${input.refundId}:credit-note`,
-      // o3d-j625: every `accountCode` below is `settings.*`, so the row is routed by the same resolution
-      // those codes came from. Where the chart's connector has since been retired the enqueue refuses,
-      // which the ledger records as an unmet obligation — `accountingRetryRequired` stays set and the
-      // caller reports the warning — instead of committing a credit note to books it does not describe.
-      chartConnector: settings.connector,
-      // A scheme order with no stamp: a REFUSED row (the poster refuses it before anything else, so it can never be sent). A retry cannot change the answer, so the row is what the operator settles by hand on /sync.
-      payload: creditNoteTreatment.kind === 'treated'
+    ledger.account(creditNote, await enqueueCreditNoteRow(
+      creditNoteTreatment.kind === 'treated'
         ? creditNoteTreatment.payload
         : creditNoteTreatment.kind === 'refused'
           ? refusedCreditNotePayload({ creditNoteNumber: builtCreditNotePayload.creditNoteNumber, currency: builtCreditNotePayload.currency, reference: builtCreditNotePayload.reference, date: builtCreditNotePayload.date, refundId: input.refundId, orderId: input.orderId, lines: builtCreditNotePayload.lines, reason: creditNoteTreatment.reason })
           : builtCreditNotePayload,
-    }))
+    ))
   }
 
   for (const sync of input.accountingSyncs) {
@@ -2631,6 +2640,8 @@ export async function createRefund(
     expectedTaxIdentities?: RefundExpectedTaxIdentity[]
     /** IOSS credit notes: what the SOURCE of the refund (the WooCommerce refund `amount`) states was returned in all, tax included, in the order currency. Internal callers only; recorded only while the Sales Invoices switch is on and the order is on an EU scheme. */
     statedGrossForeign?: number
+    /** IOSS credit notes, rate 182: the tax the WooCommerce refund states across all its rate ids. Internal callers only; recorded only while the Sales Invoices switch is on and the order is on an EU scheme. */
+    eas182StatedTaxForeign?: number
   },
   // Two independent outcomes ride alongside `error`:
   //   `conflict`   (o3d-6oyu.18) — the refund transaction refused this credit note because the
@@ -2727,7 +2738,7 @@ export async function createRefund(
       expectedTaxIdentities: isInternal ? options?.expectedTaxIdentities : undefined,
       // IOSS credit notes: asked of the chart's connector once, here. Off (the default) the writer snapshots nothing and the refund is written exactly as before.
       ...(accountingSettings?.connector === 'xero' && await isAccountingSyncTypeEnabledFor('xero', 'SALES_INVOICE')
-        ? { euVatSchemeSnapshot: true, ...(isInternal && options?.statedGrossForeign != null ? { statedGrossForeign: options.statedGrossForeign } : {}) }
+        ? { euVatSchemeSnapshot: true, ...(isInternal && options?.statedGrossForeign != null ? { statedGrossForeign: options.statedGrossForeign } : {}), ...(isInternal && options?.eas182StatedTaxForeign != null ? { eas182StatedTaxForeign: options.eas182StatedTaxForeign } : {}) }
         : {}),
     })
     if (!refundResult.success) return refundResult

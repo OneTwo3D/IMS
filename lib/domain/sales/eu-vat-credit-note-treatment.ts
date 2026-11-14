@@ -18,7 +18,11 @@ import { regimePolicyOf, type RegimePolicy } from '@/lib/domain/accounting/eu-va
 import { readEuVatRegimeMode, readGiftCardFlagCutIn } from '@/lib/connectors/woocommerce/sync/eu-vat-facts'
 import type { GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
 import { predictedUntaxedTotal } from '@/lib/domain/accounting/eu-vat-treatment'
-import { applyEuVatCreditNoteTreatment, noFrozenBasisRefusal, noInvoicedTypeRefusal, noStampRefusal, refundTaxAndTotal, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
+import type { AccountingEnqueueOutcome } from '@/lib/accounting'
+import { unstampedOrderIsScheme } from '@/lib/domain/sales/eu-vat-scheme-evidence'
+import { decideRefund182Hold } from '@/lib/domain/sales/refund-182-hold'
+import { priorRefundedTax } from '@/lib/domain/sales/refund-182-prior-tax'
+import { applyEuVatCreditNoteTreatment, eas182RefundFigures, persistedSchemeUntreatableRefusal, refund182HeldRefusal, noFrozenBasisRefusal, noInvoicedTypeRefusal, noStampRefusal, refundTaxAndTotal, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
 
 export type EuVatCreditNoteAccounts = { ioss: string | null; ddp: string | null; fee: string | null; rounding: string | null }
@@ -26,11 +30,16 @@ export type EuVatCreditNoteAccounts = { ioss: string | null; ddp: string | null;
 export type TreatedCreditNoteOutcome =
   /** Nothing was read or written for the treatment (the switch is off, or the connector is not Xero), or the order is not on a scheme and the payload is exactly as built. */
   | { kind: 'skipped'; why: 'switch_off' | 'not_scheme' }
+  /** A rate-182 credit note held for review: its REFUSED row (never sent) is what `outcome` reports on (queued, or not: then nothing was stamped or counted and the obligation stays unmet). The hand-off accounts the obligation with it and queues nothing more. */
+  | { kind: 'held'; outcome: AccountingEnqueueOutcome }
+  /** A rate-182 hold could not be applied: the refund's credit-note row is already queued SENDABLE (or posted). Nothing was stamped or counted and that row is untouched; `outcome` is the enqueue's answer for the obligation ledger. */
+  | { kind: 'hold_conflict'; outcome: AccountingEnqueueOutcome }
+  /** The posting was already marked handled by hand, so the held row's enqueue wrote nothing (the answer is queued): no stamp, no count, nothing to hold. `outcome` settles the obligation. */
+  | { kind: 'hold_handled'; outcome: AccountingEnqueueOutcome }
   | { kind: 'treated'; payload: Record<string, unknown>; regimePolicy: RegimePolicy }
   /** The credit note cannot be raised as it is: the reason is the operator-facing sentence. */
   | { kind: 'refused'; reason: string; /** `hand_post`: nothing a retry can change, so the hand-off queues a REFUSED row for the operator to settle by hand; any other refusal is cleared by fixing its cause and retrying. */ code?: 'hand_post' }
 
-const SCHEME_CATEGORIES = new Set(['IOSS', 'VOEC'])
 const DESTINATION_LABEL = { IOSS: 'IOSS VAT refunded', VOEC: 'VOEC VAT refunded', DDP: 'DDP import VAT refunded' } as const
 
 type PayloadLine = { description?: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; [key: string]: unknown }
@@ -47,10 +56,34 @@ export async function treatCreditNotePayload(params: {
   /** The account settings the caller read ONCE for this payload. */
   accounts: EuVatCreditNoteAccounts
   now: Date
+  /** Enqueues the REFUSED credit-note row (never sent) carrying `reason`, exactly as the hand-off queues any refused row (same idempotency key and chart pin). The hold uses it so that no stamp or count exists without the row. */
+  enqueueHeldRow: (reason: string) => Promise<AccountingEnqueueOutcome>
 }): Promise<TreatedCreditNoteOutcome> {
-  // THE SWITCH, ASKED FIRST (the Sales Invoices switch, the one the invoice treatment asks): off means nothing here runs.
+  // A HELD DECISION IS PERMANENT, so it is asked BEFORE the switch: a refund already held for review is held again whatever the Sales Invoices switch says now, and never becomes a sendable credit note by a switch being turned off. (One read of the refund; nothing else is read or written when the switch is off and the refund was never held.)
+  const prior = await db.salesOrderRefund.findUnique({ where: { id: params.refundId }, select: { eas182HeldAt: true, schemeTreatedAt: true, creditNoteNumber: true, statedGrossForeign: true, eas182StatedTaxForeign: true, lines: { select: { postingTaxType: true, schemeTaxRateValue: true } }, order: { select: { euVatLineAccount: true } } } })
+  if (prior !== null && prior.eas182HeldAt !== null) {
+    const heldNumber = String(prior.creditNoteNumber ?? params.payload.creditNoteNumber ?? '(no number)')
+    const currency = String(params.payload.currency ?? '')
+    const decision = await decideRefund182Hold(params.refundId, async (place) => params.enqueueHeldRow(refund182HeldRefusal({
+      creditNoteNumber: heldNumber, heldNumber: place.heldNumber, threshold: place.threshold ?? place.heldNumber, vatAccount: (prior.order.euVatLineAccount ?? '').trim() || 'the stamped VAT account',
+      vatAmount: prior.eas182StatedTaxForeign === null ? 'the refund\'s VAT' : toDecimal(prior.eas182StatedTaxForeign).toString(), refundTotal: prior.statedGrossForeign === null ? 'the refund amount' : toDecimal(prior.statedGrossForeign).toString(), currency,
+    })))
+    if ('handledByHand' in decision) return { kind: 'hold_handled', outcome: decision.outcome }
+    if ('conflict' in decision) { await recordHoldConflict(params.orderId, params.refundId, heldNumber); return { kind: 'hold_conflict', outcome: decision.outcome } }
+    if (decision.held) return { kind: 'held', outcome: decision.queued || !decision.rowMissing ? decision.outcome : unmetOutcome(decision.outcome) }
+  }
+
+  // A PERSISTED CREATION-TIME DECISION OUTRANKS THE SWITCH. `scheme_treated_at` records it EXPLICITLY (set by the refund writer whenever a refund is created under the scheme path, even when no pricing field could be filled); the snapshot fields below are the evidence for refunds created BEFORE that column existed.
+  // RESIDUAL: such an older refund whose fields are ALL null (an older stamp without a type, an unpriceable rate) carries no evidence and is still skipped on a switch-off. None that matter exist (production is reinstalled fresh; stage's Xero is held). The refund writer snapshots the scheme treatment (a line's posting type or frozen rate, the stated gross, the rate-182 stated tax) ONLY while the Sales Invoices switch is on and the order is on a scheme, so the presence of any of them means this refund
+  // was created under the scheme treatment. A switch turned off since then must not let it be queued as an ordinary credit note under the original tax identity (which would add VAT in Xero and bypass the rate-182 bound and hold): it is treated on the stamped regime, or, when that cannot be done, refused as a settle-by-hand row. Never skipped.
+  const persistedScheme = prior !== null && (prior.schemeTreatedAt !== null || prior.eas182StatedTaxForeign !== null || prior.statedGrossForeign !== null || prior.lines.some((line) => (line.postingTaxType ?? '').trim() !== '' || line.schemeTaxRateValue !== null))
+  const persistedNumber = String(prior?.creditNoteNumber ?? params.payload.creditNoteNumber ?? '(no number)')
+
+  // THE SWITCH, ASKED FIRST (the Sales Invoices switch, the one the invoice treatment asks): off means nothing here runs, for a refund that was not created under the scheme treatment.
   const { isAccountingSyncTypeEnabledFor } = await import('@/lib/accounting')
-  if (params.connector !== 'xero' || !(await isAccountingSyncTypeEnabledFor(params.connector, 'SALES_INVOICE'))) return { kind: 'skipped', why: 'switch_off' }
+  const switchOn = params.connector === 'xero' && (await isAccountingSyncTypeEnabledFor(params.connector, 'SALES_INVOICE'))
+  if (!switchOn && !persistedScheme) return { kind: 'skipped', why: 'switch_off' }
+  if (!switchOn && params.connector !== 'xero') return { kind: 'refused', code: 'hand_post', reason: persistedSchemeUntreatableRefusal(persistedNumber) }
 
   const [order, refund] = await Promise.all([
     db.salesOrder.findUnique({
@@ -62,7 +95,7 @@ export async function treatCreditNotePayload(params: {
     }),
     db.salesOrderRefund.findUnique({
       where: { id: params.refundId },
-      select: { creditNoteNumber: true, source: true, statedGrossForeign: true, lines: { select: { id: true, salesOrderLineId: true, postingTaxType: true, schemeTaxRateValue: true } } },
+      select: { creditNoteNumber: true, source: true, statedGrossForeign: true, eas182StatedTaxForeign: true, lines: { select: { id: true, salesOrderLineId: true, postingTaxType: true, schemeTaxRateValue: true } } },
     }),
   ])
   if (!order || !refund) return { kind: 'refused', reason: 'the order or the refund could not be found to build its credit note' }
@@ -71,16 +104,11 @@ export async function treatCreditNotePayload(params: {
   // THE STAMP, READ AND NEVER DECIDED AGAIN.
   if (order.euVatRegimeStampedAt === null) {
     // IMMUTABLE EVIDENCE FIRST. (a) a stamp: handled below. (b) no stamp, but IMS itself queued or posted an invoice for this order carrying the EU VAT treatment marker: a scheme order, whatever the rates map to now.
-    const treatedInvoice = await db.accountingSyncLog.findFirst({
-      where: { type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] }, referenceType: 'SalesOrder', referenceId: params.orderId, payload: { path: ['_euVatTreatment', 'applied'], equals: true } },
-      select: { id: true },
-    })
-    if (treatedInvoice !== null) return { kind: 'refused', reason: noStampRefusal(number), code: 'hand_post' as const }
+    if (await unstampedOrderIsScheme(db, params.orderId)) return { kind: 'refused', reason: noStampRefusal(number), code: 'hand_post' as const }
     // (c) no stamp and no invoice of IMS's: the invoice came from the storefront plugin before cut-over. ACCEPTED LIMIT: only the rates' CURRENT mapping can say whether it was a scheme sale, so removing a rate's scheme mapping while refunds of such pre-cut-over orders are still possible misclassifies them as ordinary. Do not remove scheme mappings from rates used on those orders.
-    const soldOnScheme = order.lines.some((line) => SCHEME_CATEGORIES.has((line.taxRate?.reportingCategory ?? '').trim().toUpperCase()) || (line.taxRate?.schemePostingTaxType ?? '').trim() !== '')
-    return soldOnScheme ? { kind: 'refused', reason: noStampRefusal(number), code: 'hand_post' as const } : { kind: 'skipped', why: 'not_scheme' }
+    return persistedScheme ? { kind: 'refused', reason: persistedSchemeUntreatableRefusal(number), code: 'hand_post' as const } : { kind: 'skipped', why: 'not_scheme' }
   }
-  if (order.euVatRegime === null) return { kind: 'skipped', why: 'not_scheme' }
+  if (order.euVatRegime === null) return persistedScheme ? { kind: 'refused', reason: persistedSchemeUntreatableRefusal(number), code: 'hand_post' } : { kind: 'skipped', why: 'not_scheme' }
   const regime = order.euVatRegime
   const vatAccount = (order.euVatLineAccount ?? '').trim()
   if (vatAccount === '') return { kind: 'refused', reason: `Credit note ${number}: the order's ${regime} stamp names no VAT account, so the VAT line cannot be posted. Nothing was queued.` }
@@ -117,7 +145,9 @@ export async function treatCreditNotePayload(params: {
   // (created before it was kept, or a line whose rate could not be priced then) is posted by hand.
   const frozenRates = params.refundLineIds.map((id) => refundLineById.get(id)?.schemeTaxRateValue ?? null)
   const wholeOrderReversal = refund.source === 'CHARGEBACK_POLLER'
-  if (!wholeOrderReversal && (refund.statedGrossForeign === null || frozenRates.some((rate) => rate === null))) return { kind: 'refused', reason: noFrozenBasisRefusal(number), code: 'hand_post' }
+  // A rate-182 refund (the EAS plugin books its own tax rate) is priced from the refund's own stated figures, so its lines' frozen rates are not needed.
+  const rate182 = refund.eas182StatedTaxForeign !== null
+  if (!wholeOrderReversal && (refund.statedGrossForeign === null || (!rate182 && frozenRates.some((rate) => rate === null)))) return { kind: 'refused', reason: noFrozenBasisRefusal(number), code: 'hand_post' }
   let net = toDecimal(0)
   let pricedTax = toDecimal(0)
   for (const [index, line] of lines.entries()) {
@@ -133,6 +163,10 @@ export async function treatCreditNotePayload(params: {
   if (refund.source === 'CHARGEBACK_POLLER') {
     const vat: Decimal = toDecimal(order.taxForeign)
     figures = { ok: true, vatAmount: vat.toString(), refundTotal: net.plus(vat).toString() }
+  } else if (rate182) {
+    // RATE 182: the tax the refund states across ALL its rate ids, confirmed against its own gross and held to the order's VAT not already refunded.
+    const priorTax = await priorRefundedTax(db, params.orderId, params.refundId, toDecimal(order.taxForeign))
+    figures = eas182RefundFigures({ net, statedGross: toDecimal(refund.statedGrossForeign!), statedTax: toDecimal(refund.eas182StatedTaxForeign!), orderTax: toDecimal(order.taxForeign), priorRefundedTax: priorTax, currency: payload.currency, toleranceMinorUnits: lines.length + 1, orderAllowanceMinorUnits: order.lines.length + 1 })
   } else {
     figures = refundTaxAndTotal({ net, pricedTax, rawGross: net.plus(pricedTax), statedGross: refund.statedGrossForeign === null ? null : toDecimal(refund.statedGrossForeign), currency: payload.currency, toleranceMinorUnits: lines.length + 1 })
   }
@@ -154,6 +188,29 @@ export async function treatCreditNotePayload(params: {
   }
   const treated = applyEuVatCreditNoteTreatment(payload, plan)
   if (!treated.ok) return { kind: 'refused', reason: `Credit note ${number}: ${treated.reason}. Nothing was queued.` }
+  // THE HOLD, decided last: only a credit note that would otherwise post is counted. The first N rate-182 credit notes are a refused, settle-by-hand row (never sent); after that they post.
+  if (rate182) {
+    const hold = await decideRefund182Hold(params.refundId, async (place) => params.enqueueHeldRow(refund182HeldRefusal({ creditNoteNumber: number, heldNumber: place.heldNumber, threshold: place.threshold ?? place.heldNumber, vatAccount, vatAmount: figures.vatAmount, refundTotal: figures.refundTotal, currency: payload.currency })))
+    if ('handledByHand' in hold) return { kind: 'hold_handled', outcome: hold.outcome }
+    if ('conflict' in hold) { await recordHoldConflict(params.orderId, params.refundId, number); return { kind: 'hold_conflict', outcome: hold.outcome } }
+    if (hold.held) {
+      if (hold.queued && hold.reconciled) {
+        await logActivity({
+          entityType: 'SALES_ORDER', entityId: params.orderId, action: 'refund_182_hold_reconciled', tag: 'accounting', level: 'WARNING',
+          description: `Credit note ${number} (a refund whose VAT is on WooCommerce rate 182) already had its held row queued by an earlier attempt that was never counted; it is counted now as number ${hold.heldNumber}${hold.threshold === null ? '' : ` (the first ${hold.threshold} are held)`}, even if that takes the count past the threshold, because the hold is real. It is on the sync exceptions page and is never sent.`,
+          metadata: { refundId: params.refundId },
+        }).catch(() => { /* the refused row is what holds it; logging must not throw */ })
+      }
+      if (hold.queued && hold.newlyHeld && !hold.reconciled) {
+        await logActivity({
+          entityType: 'SALES_ORDER', entityId: params.orderId, action: 'refund_182_credit_note_held', tag: 'accounting', level: 'WARNING',
+          description: `Credit note ${number} (a refund whose VAT is on WooCommerce rate 182) was held for review: number ${hold.heldNumber}${hold.threshold === null ? ', counted against a threshold that is not a whole number' : ` of the first ${hold.threshold}`}. It is on the sync exceptions page and is never sent.`,
+          metadata: { refundId: params.refundId },
+        }).catch(() => { /* the refused row is what holds it; logging must not throw */ })
+      }
+      return { kind: 'held', outcome: hold.queued || !hold.rowMissing ? hold.outcome : unmetOutcome(hold.outcome) }
+    }
+  }
   return {
     kind: 'treated',
     payload: {
@@ -186,4 +243,19 @@ export async function recordCreditNoteTreatmentRefusal(input: { orderId: string;
     description: input.reason,
     metadata: { refundId: input.refundId },
   }).catch(() => { /* the unmet obligation is what the ledger acts on; logging must not throw */ })
+}
+
+
+/** The operator notice for a hold that could not be applied because a sendable (or posted) credit note already exists for the refund. */
+async function recordHoldConflict(orderId: string, refundId: string, number: string): Promise<void> {
+  await logActivity({
+    entityType: 'SALES_ORDER', entityId: orderId, action: 'refund_182_hold_conflict', tag: 'accounting', level: 'WARNING',
+    description: `Credit note ${number} (a refund whose VAT is on WooCommerce rate 182) could NOT be held for review: a credit note for this refund was already queued to be sent, or already posted, before the hold applied. Nothing was held or counted and that credit note was left as it is. Check Xero for credit note ${number} and review it there.`,
+    metadata: { refundId },
+  }).catch(() => { /* the untouched row stands; logging must not throw */ })
+}
+
+/** The held row's enqueue said queued but wrote no refused row: the obligation is unmet (a retry holds it again), whatever the enqueue said. */
+function unmetOutcome(outcome: AccountingEnqueueOutcome): AccountingEnqueueOutcome {
+  return { queued: false, reason: 'refused', connector: outcome.connector ?? null }
 }

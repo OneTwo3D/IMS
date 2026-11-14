@@ -4,7 +4,7 @@ import test from 'node:test'
 
 import { roundMoney, toDecimal } from '../../lib/domain/math/decimal'
 import {
-  applyEuVatCreditNoteTreatment, easRefundRefusal, refusedCreditNoteError, refusedCreditNotePayload, EAS_REFUND_TAX_RATE_ID, noStampRefusal, refundTaxAndTotal, refundTaxOnEasRate,
+  applyEuVatCreditNoteTreatment, easRefundRefusal, refusedCreditNoteError, refusedCreditNotePayload, EAS_REFUND_TAX_RATE_ID, noStampRefusal, refundTaxAndTotal, refundTaxOnEasRate, refundStatedTax, eas182RefundFigures, refund182HeldRefusal,
   type CreditNoteLineKind, type EuVatCreditNotePlan,
 } from '../../lib/domain/accounting/eu-vat-credit-note'
 import { findSalesDocumentTaxTypeProblems } from '../../lib/domain/accounting/sales-document-tax-types'
@@ -242,4 +242,68 @@ test('[credit note] rate 182 figures: an unreadable one counts as 1, a number is
   assert.equal(refundTaxOnEasRate({ line_items: [{ taxes: [{ id: 182, total: -3.1 }] }] }), '3.1')
   assert.equal(refundTaxOnEasRate({ line_items: [{ taxes: [{ id: 182, total: ' -3.10 ' }] }] }), '3.1')
   assert.equal(refundTaxOnEasRate({ line_items: [{ taxes: null }, { }], shipping_lines: [{ taxes: [{ id: 182, total: '-1' }] }] }), '1')
+})
+
+// ---- rate 182: post-and-hold (the figures and the wording; the hold itself is tested against a real database in tests/concurrency/refund-eas182-hold.concurrent.test.ts) ----
+test('[credit note 182] the stated tax sums ALL rate ids (182 included) on items, shipping and fees, and an unreadable figure is flagged, not summed', () => {
+  assert.deepEqual(refundStatedTax({ line_items: [{ taxes: [{ id: 182, total: '-3.10' }, { id: 244, total: '-1.00' }] }], shipping_lines: [{ taxes: [{ id: 182, total: -0.9 }] }], fee_lines: [{ taxes: [{ id: 5, total: ' -0.5 ' }] }] }), { total: '5.5', unreadable: false })
+  assert.deepEqual(refundStatedTax({}), { total: '0', unreadable: false })
+  assert.equal(refundStatedTax({ line_items: [{ taxes: [{ id: 182, total: 'abc' }] }] }).unreadable, true)
+  assert.equal(refundStatedTax({ line_items: [{ taxes: [{ id: 182 }] }] }).unreadable, true, 'a missing figure is unreadable')
+})
+
+const figures182 = (over: Partial<Parameters<typeof eas182RefundFigures>[0]> = {}) => eas182RefundFigures({ net: D('100'), statedGross: D('119'), statedTax: D('19'), orderTax: D('25.46'), priorRefundedTax: D('0'), currency: 'GBP', toleranceMinorUnits: 2, orderAllowanceMinorUnits: 3, ...over })
+
+test('[credit note 182] figures: the VAT is gross less net, confirmed against the stated tax and held to the order\'s VAT not already refunded', () => {
+  assert.deepEqual(figures182(), { ok: true, vatAmount: '19', refundTotal: '119' })
+  // The EAS plugin re-priced the tax: the lines' own rate (19%) is NOT consulted, only the stated figures.
+  assert.deepEqual(figures182({ statedGross: D('125'), statedTax: D('25') }), { ok: true, vatAmount: '25', refundTotal: '125' })
+  // Within the rounding allowance of the stated tax (2 minor units): accepted. Beyond: refused.
+  assert.equal(figures182({ statedTax: D('19.02') }).ok, true)
+  const total = figures182({ statedTax: D('19.03') })
+  assert.equal(total.ok, false)
+  assert.match(!total.ok ? total.reason : '', /tax it states across its tax rates is 19.03; that is more than rounding explains/)
+  // Gross below net.
+  assert.equal(figures182({ statedGross: D('99') }).ok, false)
+})
+
+test('[credit note 182] bound: on the AGGREGATE with one fixed order allowance; nothing positive once the VAT is all refunded', () => {
+  assert.equal(figures182({ statedGross: D('125.46'), statedTax: D('25.46') }).ok, true, 'all of the order\'s VAT')
+  assert.equal(figures182({ priorRefundedTax: D('6.46') }).ok, true, '19.00 left, 19 asked')
+  assert.equal(figures182({ priorRefundedTax: D('6.48') }).ok, true, 'within the order\'s 3-minor-unit allowance')
+  const over = figures182({ priorRefundedTax: D('6.50') })
+  assert.equal(over.ok, false)
+  assert.match(!over.ok ? over.reason : '', /more than the order's collected VAT not already refunded \(18.96 GBP of 25.46\)/)
+  const spent = figures182({ priorRefundedTax: D('30') })
+  assert.match(!spent.ok ? spent.reason : '', /\(0 GBP\)/, 'nothing left reads as zero')
+  const unknown = figures182({ priorRefundedTax: null })
+  assert.match(!unknown.ok ? unknown.reason : '', /earlier refund on this order cannot be established/)
+  // The allowance is not granted again per refund: once the VAT is exactly used up, a run of one-cent refunds all refuse.
+  let prior = D('25.46')
+  for (let i = 0; i < 5; i++) {
+    const tiny = figures182({ net: D('1'), statedGross: D('1.01'), statedTax: D('0.01'), priorRefundedTax: prior })
+    assert.equal(tiny.ok, false, `refund ${i + 1} after exhaustion refuses`)
+  }
+  // Below exhaustion the overshoot is bounded once for the order: 25.45 refunded, a 0.02 refund passes (25.47 <= 25.46 + 0.03); the VAT is then used up, so the next one refuses.
+  prior = D('25.45')
+  assert.equal(figures182({ net: D('1'), statedGross: D('1.02'), statedTax: D('0.02'), priorRefundedTax: prior }).ok, true)
+  assert.equal(figures182({ net: D('1'), statedGross: D('1.02'), statedTax: D('0.02'), priorRefundedTax: prior.plus(D('0.02')) }).ok, false, 'used up')
+})
+
+test('[credit note 182] the held wording names the account, the amounts, the place among the first N, and the way out (check Xero, then settle on /sync)', () => {
+  const text = refund182HeldRefusal({ creditNoteNumber: 'CN-0001', heldNumber: 3, threshold: 10, vatAccount: '821', vatAmount: '19', refundTotal: '119', currency: 'EUR' })
+  assert.match(text, /NOTHING WAS SENT/)
+  assert.match(text, /rate 182[\s\S]*account \(821\)[\s\S]*first 10[\s\S]*number 3/)
+  assert.match(text, /total 119 EUR, of which 19 is VAT|119 EUR, of which 19 is VAT/)
+  assert.match(text, /Check Xero for credit note CN-0001 first[\s\S]*settle action on \/sync/)
+})
+
+test('[credit note 182] a refund that states LESS than its net refuses; the VAT booked is gross less net (not the stated tax); exactly the order bound passes', () => {
+  const less = figures182({ statedGross: D('99.99'), statedTax: D('0') })
+  assert.equal(less.ok, false)
+  assert.match(!less.ok ? less.reason : '', /less than the 100 its lines net to/)
+  assert.deepEqual(figures182({ statedGross: D('119'), statedTax: D('19.02') }), { ok: true, vatAmount: '19', refundTotal: '119' }, 'the VAT is gross less net; the stated tax only confirms it')
+  // 19 + 6.49 = 25.49 = 25.46 + the 3-minor-unit allowance: on the bound passes.
+  assert.equal(figures182({ priorRefundedTax: D('6.49') }).ok, true)
+  assert.equal(figures182({ priorRefundedTax: D('6.50') }).ok, false)
 })
