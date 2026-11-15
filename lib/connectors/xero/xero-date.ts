@@ -12,10 +12,11 @@
 
 const DOT_NET = /^\/Date\((-?\d+)([+-]\d{4})?\)\/$/
 // A date-time with a time part and no zone designator (Z or +hh:mm / +hhmm / -hh:mm).
-const ISO_NO_ZONE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/
+const ISO_NO_ZONE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/i
 
 const ISO_ZONED_TIME = /^\d{4}-\d{2}-\d{2}[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?\s*(?:Z|[+-]\d{2}:?\d{2})$/i
-const ISO_DATE_PART = /^(\d{4})-(\d{2})-(\d{2})(?=$|[T ])/
+// ANY value that begins YYYY-MM-DD is date-first, whatever follows (T, t, space, anything), so no separator variant can bypass the day check.
+const ISO_DATE_PART = /^(\d{4})-(\d{2})-(\d{2})/
 
 /**
  * `Date.parse` quietly normalises an impossible calendar date (2026-02-30 -> 2 March, 2026-04-31 -> 1 May), zoned or not, so a Xero value
@@ -38,7 +39,7 @@ export function parseXeroDate(value: string | undefined | null): number {
   if (dotNet) return Number(dotNet[1])
   if (!isoDatePartIsRealDate(trimmed)) return NaN
   if (ISO_NO_ZONE.test(trimmed)) {
-    const ms = Date.parse(`${trimmed.replace(' ', 'T')}Z`)
+    const ms = Date.parse(`${trimmed.replace(/[ t]/i, 'T')}Z`)
     if (!Number.isFinite(ms)) return NaN
     // Read as UTC, the parsed day must still be the written day (an hour of 24 would roll it on).
     const p = new Date(ms)
