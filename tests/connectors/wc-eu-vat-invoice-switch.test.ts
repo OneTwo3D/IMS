@@ -59,3 +59,20 @@ test('switch on, but the order carries store credit: skipped (its invoice is ref
   assert.deepEqual(await treatImportedSalesInvoice(params({ storeCreditForeign: { gt: () => true } })), { kind: 'skipped', why: 'store_credit' })
   assert.deepEqual(touched, [])
 })
+
+test('the shadow preview assumes the switch ON in memory: it never asks the setting; the held-invoice preview still asks and stays off', async () => {
+  const { previewTreatedSalesInvoice } = await import('../../lib/connectors/woocommerce/sync/eu-vat-invoice-treatment')
+  enabled = false
+  asked.length = 0
+  const client = dbProbe as never
+  // Default (the held-invoice check): the switch is asked, and off means skipped.
+  assert.deepEqual(await previewTreatedSalesInvoice(client, params()), { kind: 'skipped', why: 'switch_off' })
+  assert.deepEqual(asked, [['xero', 'SALES_INVOICE']])
+  // Shadow: the switch is not asked at all (so it is neither read nor changed); the next gate is reached instead.
+  asked.length = 0
+  assert.deepEqual(await previewTreatedSalesInvoice(client, params({ storeCreditForeign: { gt: () => true } }), { assumeSwitchOn: true, provisionalStamp: true }), { kind: 'skipped', why: 'store_credit' })
+  assert.deepEqual(asked, [])
+  // Still Xero only.
+  assert.deepEqual(await previewTreatedSalesInvoice(client, params({ connector: 'quickbooks' }), { assumeSwitchOn: true }), { kind: 'skipped', why: 'switch_off' })
+  assert.deepEqual(touched, [])
+})

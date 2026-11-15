@@ -1708,6 +1708,7 @@ This is configuration only: no document builder reads it yet, so it changes no p
 npm run eu-vat:preflight                                   # read only: what is missing or mismatched against lib/tax/eu-vat-seed.json
 npm run eu-vat:seed                                        # DRY RUN: the rates it would set and the plan's digest
 npm run eu-vat:seed -- --apply --confirm <digest>          # write exactly the plan the dry run printed (an explicit operator step; nothing runs it automatically)
+npm run eu-vat:shadow -- --live-read --orders <ids>           # read only (GETs): what IMS would invoice vs the Xero invoice, per line. Owner-gated; see help-docs/xero-sync.md, EU go-live runbook
 ```
 
 Run both after the WooCommerce tax import and adoption and after `npm run tax:rekey`, with the application's environment file. Neither command calls Xero or WooCommerce, and nothing here writes a tax rate to Xero:
