@@ -176,8 +176,6 @@ export const SHADOW_READER_DECLARATIONS = [
     reason: "This IS the retention predicate that deliberately lets a shadow's sync row expire (it holds no ledger claim). The compensating control is the durable record, which the destructive readers above consult; shadow retention itself is a separate bead." },
   { key: "lib/domain/accounting/payment-reversal.ts::markBillPaidSupersedingStaleRegistrations::MAY_HAVE_REACHED_LEDGER_WHERE", class: "EXEMPT",
     reason: "Re-reads only the PENDING registration row ids this call requested to supersede, to refuse if one moved; a shadow is CANCELLED from creation so it is never among them, and the answer never rests on the absence of a row." },
-  { key: "lib/domain/sales/eu-vat-credit-note-treatment.ts::treatCreditNotePayload::MAY_HAVE_REACHED_LEDGER_WHERE", class: "EXEMPT",
-    reason: "Reads the payload of the treated scheme invoice a whole-order reversal credit note must equal, and only ever REFUSES on it (nothing is deleted or retracted). The absence of a row, as after retention, leaves the reversal unproven, which refuses to a settle-by-hand row; it never rests a posting on the absence." },
   { key: "lib/domain/accounting/deferred-trueup.ts::UNEARNED_REVERSAL_NETTING_WHERE::UNPROVEN_CANCELLED_WHERE", class: "EXEMPT",
     reason: "Report-only (o3d-3la07 D3): it widens the read so the true-up run SAYS which rows may have posted; it changes no arithmetic and deletes nothing." },
   { key: "app/actions/sales.ts::readPaymentRegistrations::UNPROVEN_CANCELLED_WHERE", class: "PENDING_CONVERSION:o3d-zjsb5.26.10",

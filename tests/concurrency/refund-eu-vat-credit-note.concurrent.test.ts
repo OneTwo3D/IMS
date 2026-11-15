@@ -130,11 +130,11 @@ async function cleanup(db: Db, fx: Fixture | undefined) {
 
 
 /** The treated scheme invoice IMS queued for the fixture order (net 134, shipping 10 as a line, VAT 25.46; a rounding line when asked): a whole-order reversal is derived from it (o3d-k26m.13). */
-async function seedInvoice(db: Db, fx: Fixture, currency: string, opts: { rounding?: number; marker?: boolean; goods?: number } = {}) {
+async function seedInvoice(db: Db, fx: Fixture, currency: string, opts: { rounding?: number; marker?: boolean; goods?: number; status?: 'SYNCED' | 'PENDING' | 'FAILED'; type?: 'SALES_INVOICE' | 'SALES_INVOICE_UPDATE'; createdAt?: Date } = {}) {
   const line = (description: string, unitAmount: number, accountCode: string, taxType: string, noTaxKind?: string) => ({ description, quantity: 1, unitAmount, accountCode, taxType, ...(noTaxKind ? { noTaxKind } : {}) })
   await db.accountingSyncLog.create({
     data: {
-      connector: 'xero', type: 'SALES_INVOICE', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: fx.orderId,
+      connector: 'xero', type: opts.type ?? 'SALES_INVOICE', status: opts.status ?? 'SYNCED', ...(opts.createdAt ? { createdAt: opts.createdAt } : {}), referenceType: 'SalesOrder', referenceId: fx.orderId,
       payload: {
         currency, lineAmountsIncludeTax: false,
         ...(opts.marker === false ? {} : { _euVatTreatment: { applied: true, route: 'scheme', regime: 'IOSS' } }),
@@ -764,7 +764,7 @@ test('[eu vat credit note] a whole-order reversal that cannot be PROVEN equal to
   assert.equal(none.kind === 'refused' ? none.code : null, 'hand_post')
   assert.match(refusal(none)?.reason ?? '', /cannot prove it equals the invoice[\s\S]*no invoice of IMS/)
   await seedInvoice(deps.db, fx, deps.baseCurrency, { marker: false })
-  assert.match(refusal(await treat(deps, fx, refund))?.reason ?? '', /no invoice of IMS/)
+  assert.match(refusal(await treat(deps, fx, refund))?.reason ?? '', /scheme treatment marker/)
   await deps.db.accountingSyncLog.deleteMany({ where: { referenceId: fx.orderId } })
   await seedInvoice(deps.db, fx, deps.baseCurrency, { goods: 99, rounding: 0.01 })
   const differs = refusal(await treat(deps, fx, refund))
@@ -853,4 +853,39 @@ test('[eu vat credit note] the refund-time freeze: the source\'s own gross wins 
   const refused = await deps.createRefund(fx.orderId, [itemised(fx.goods, 'Widget', 100, 19)], 'unpriced', undefined, { internalBypassToken: deps.bypass, externalRefundId: wooRefundId() })
   const kept = await deps.db.salesOrderRefund.findFirst({ where: { orderId: fx.orderId }, select: { statedGrossForeign: true, lines: { select: { schemeTaxRateValue: true } } } })
   assert.ok(kept === null || (kept.statedGrossForeign === null && kept.lines.every((l) => l.schemeTaxRateValue === null)), `unpriced line froze a basis: ${JSON.stringify(kept)} ${String(refused.error)}`)
+})
+
+test('[eu vat credit note] a whole-order reversal uses the invoice version CONFIRMED in Xero: a pending or failed newer UPDATE refuses (hand-post), a confirmed UPDATE is the one reversed (o3d-k26m.13)', { skip }, async (t) => {
+  const { deps, fx } = await prepared(t, { stamp: 'IOSS', schemeRate: true })
+  await seedInvoice(deps.db, fx, deps.baseCurrency, { createdAt: new Date('2026-11-01T00:00:00Z') })
+  const refund = await directRefund(deps, fx, { lines: [{ net: '134', rate: null }], stated: null, source: 'CHARGEBACK_POLLER' })
+  for (const status of ['PENDING', 'FAILED'] as const) {
+    await seedInvoice(deps.db, fx, deps.baseCurrency, { type: 'SALES_INVOICE_UPDATE', status, rounding: -0.01, createdAt: new Date('2026-11-02T00:00:00Z') })
+    const outcome = await treat(deps, fx, refund)
+    assert.equal(outcome.kind, 'refused', status)
+    assert.equal(outcome.kind === 'refused' ? outcome.code : null, 'hand_post')
+    assert.match(refusal(outcome)?.reason ?? '', /NOTHING WAS SENT[\s\S]*not confirmed as posted/)
+    await deps.db.accountingSyncLog.deleteMany({ where: { referenceId: fx.orderId, type: 'SALES_INVOICE_UPDATE' } })
+  }
+  await seedInvoice(deps.db, fx, deps.baseCurrency, { type: 'SALES_INVOICE_UPDATE', status: 'SYNCED', rounding: -0.01, createdAt: new Date('2026-11-02T00:00:00Z') })
+  const outcome = await treat(deps, fx, refund)
+  assert.equal(outcome.kind, 'treated')
+  if (outcome.kind !== 'treated') return
+  assert.equal((outcome.payload._euVatTreatment as Record<string, unknown>).refundTotal, '159.45', 'the confirmed update (with its rounding line) is what is reversed')
+})
+
+test('[eu vat credit note] two separate WooCommerce refunds of the SAME fee: the writer caps each fee across ALL prior refunds under the order lock; the one over the remainder is quarantined, the one equal to it is recorded (o3d-k26m.14)', { skip }, async (t) => {
+  const deps = await loadDeps()
+  const restore = await configure(deps.db, false)
+  const fx = await seed(deps, { stamp: 'none', schemeRate: false })
+  t.after(async () => { await restore(); await cleanup(deps.db, fx) })
+  const refundFee = (net: number, tax: number) => deps.createRefund(fx.orderId, [itemised(fx.feeA, 'EU Customs Fee', net, tax)], 'fee', undefined, { internalBypassToken: deps.bypass, externalRefundId: wooRefundId(), statedGrossForeign: net + tax, enforcePerTargetBalances: true })
+  const first = await refundFee(12, 2.28)
+  assert.equal(first.success, true, first.error)
+  const over = await refundFee(9, 1.71) // the fee has 8.00 net left
+  assert.equal(over.success, false)
+  assert.equal(over.quarantine, true, 'parked for an operator, not retried')
+  assert.match(over.error ?? '', /has left to refund \(8\.00 net, after earlier refunds\)/)
+  const exact = await refundFee(8, 1.52)
+  assert.equal(exact.success, true, exact.error)
 })

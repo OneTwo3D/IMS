@@ -29,8 +29,8 @@ export type FeeMatchOrderLine = { id: string; productId: string | null; external
  * The ORIGINAL ORDER FEE LINE each refunded WooCommerce fee line refers to (o3d-k26m.14).
  *
  * The importer stores a fee line with no WooCommerce item id (`mapWcFeeLines` sets `externalLineItemId: null`) and no product, so unlike a goods line it cannot be linked through `_refunded_item_id`. The link is the fee's NAME on a fee-shaped order line
- * (no product, no item id). A fee that matches exactly ONE not-yet-used order line by name is linked to it; several same-named fees are told apart only by an exact net amount, and still must leave exactly one candidate. Anything else is UNMATCHED and the
- * caller parks the refund: a refunded fee is never dropped and never guessed at.
+ * (no product, no item id), and ONLY when exactly ONE fee-shaped line on the order has that name. Several same-named fees are never told apart, not even by amount (a partial refund of a larger fee can equal a smaller fee in full), so they are UNMATCHED.
+ * A second refunded line naming the same fee in one refund is unmatched too. The caller parks an unmatched fee: a refunded fee is never dropped and never guessed at.
  * Returns, per input fee line (same order), the matched order line id or null.
  */
 export function matchRefundedFeeLines(feeLines: readonly WcRefundFeeLineLike[], orderLines: readonly FeeMatchOrderLine[]): Array<string | null> {
@@ -40,16 +40,11 @@ export function matchRefundedFeeLines(feeLines: readonly WcRefundFeeLineLike[], 
   return feeLines.map((fee) => {
     const wanted = name(fee.name)
     if (wanted === '') return null
-    const candidates = feeShaped.filter((line) => !used.has(line.id) && name(line.description) === wanted)
-    let chosen: FeeMatchOrderLine | undefined
-    if (candidates.length === 1) chosen = candidates[0]
-    else if (candidates.length > 1) {
-      const refundedNet = Math.abs(Number(fee.total))
-      const exact = candidates.filter((line) => line.totalForeign !== undefined && line.totalForeign !== null && Number.isFinite(refundedNet) && Math.abs(Number(line.totalForeign) - refundedNet) < 0.005)
-      if (exact.length === 1) chosen = exact[0]
-    }
-    if (chosen === undefined) return null
-    used.add(chosen.id)
-    return chosen.id
+    const sameName = feeShaped.filter((line) => name(line.description) === wanted)
+    if (sameName.length !== 1) return null
+    const only = sameName[0]!
+    if (used.has(only.id)) return null
+    used.add(only.id)
+    return only.id
   })
 }

@@ -185,6 +185,7 @@ function makeDependencies(options: {
   // could not tell a line that states it from one that does not.
   const createRefundLines: Array<{ lineId?: string; productId: string | null; qty?: number; totalForeign?: number | null; totalBase?: number; lineKind?: string; chargedTaxForeign?: number | null }> = []
   let createRefundCalls = 0
+  const createRefundOptionsSeen: Array<Record<string, unknown>> = []
   let nextLogId = 1
   // o3d-w00 (Codex r3 #3): what the production query actually asks for. The foreign-currency shipping
   // derivation is dead code unless those columns are selected, and no assertion on the returned double
@@ -319,6 +320,7 @@ function makeDependencies(options: {
       // actually LINKED to its IMS order line, which is how the _refunded_item_id bug
       // survived: createRefund was only ever checked for being called.
       createRefundLines.push(...(lines as unknown as typeof createRefundLines))
+      createRefundOptionsSeen.push(createOptions as unknown as Record<string, unknown>)
       if (options.refuseWithQuarantine) {
         // o3d-w00 #2/#5: a monetary-only refund on a non-uniform order is refused for quarantine.
         return { success: false, error: 'not uniformly taxed; parked for manual resolution', quarantine: true }
@@ -337,6 +339,7 @@ function makeDependencies(options: {
     syncLogs,
     activityLogs,
     createRefundLines,
+    createRefundOptionsSeen,
     get orderSelect() {
       return orderSelect
     },
@@ -1755,6 +1758,7 @@ test('a refund of goods PLUS a fee maps both: the fee is linked to the original 
   assert.equal(fee.chargedTaxForeign, 0.8)
   assert.equal(fee.qty, 0, 'a fee carries no stock quantity')
   assert.equal(fee.lineKind, 'sale')
+  assert.equal(state.createRefundOptionsSeen[0]?.enforcePerTargetBalances, true, 'a refund carrying a fee asks the writer for its locked per-target balance check')
 })
 
 test('a fee-only refund maps the fee line (it is not a monetary-only refund taxed at the order rate) (o3d-k26m.14)', async () => {
@@ -1785,16 +1789,18 @@ test('a refunded fee that matches NO order fee line is a clear QUARANTINED park,
   assert.equal((state.activityLogs as Array<{ action?: string }>).some((entry) => entry.action === 'refund_sync_fee_line_unmatched'), true)
 })
 
-test('two same-named fees are ambiguous unless the amount tells them apart; an ambiguous refunded fee parks (o3d-k26m.14)', async () => {
+test('same-named fees are NEVER told apart, not even by amount: a partial refund of the larger fee equal to the smaller one in full parks (o3d-k26m.14)', async () => {
   const twins: OrderLineDouble[] = [
     DEFAULT_ORDER_LINE,
-    { id: 'fee-a', productId: null, externalLineItemId: null, description: 'Fee', qty: 1, totalBase: 4, taxBase: 0.8, taxRate: null, totalForeign: 4 } as OrderLineDouble,
+    { id: 'fee-a', productId: null, externalLineItemId: null, description: 'Fee', qty: 1, totalBase: 10, taxBase: 2, taxRate: null, totalForeign: 10 } as OrderLineDouble,
     { id: 'fee-b', productId: null, externalLineItemId: null, description: 'Fee', qty: 1, totalBase: 4, taxBase: 0.8, taxRate: null, totalForeign: 4 } as OrderLineDouble,
   ]
-  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: twins } })
-  const result = await syncWcRefund(1001, makeRefund({ amount: '4.80', line_items: [], fee_lines: [{ name: 'Fee', total: '-4.00', total_tax: '-0.80' }] }), state.dependencies)
-  assert.equal(result.outcome, 'quarantined-refusal')
-  assert.equal(state.createRefundCalls, 0)
+  for (const net of ['-4.00', '-10.00']) {
+    const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: twins } })
+    const result = await syncWcRefund(1001, makeRefund({ amount: '12.00', line_items: [], fee_lines: [{ name: 'Fee', total: net, total_tax: '-0.80' }] }), state.dependencies)
+    assert.equal(result.outcome, 'quarantined-refusal', net)
+    assert.equal(state.createRefundCalls, 0)
+  }
 })
 
 test('a zero-amount fee line on a refund is not a refunded fee and does not park it (o3d-k26m.14)', async () => {

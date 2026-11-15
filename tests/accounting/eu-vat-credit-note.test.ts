@@ -4,7 +4,7 @@ import test from 'node:test'
 
 import { roundMoney, toDecimal } from '../../lib/domain/math/decimal'
 import {
-  applyEuVatCreditNoteTreatment, easRefundRefusal, refusedCreditNoteError, refusedCreditNotePayload, EAS_REFUND_TAX_RATE_ID, noStampRefusal, refundTaxAndTotal, refundTaxOnEasRate, refundStatedTax, eas182RefundFigures, refund182HeldRefusal, wholeOrderReversalFigures, reversalNotProvenRefusal,
+  applyEuVatCreditNoteTreatment, easRefundRefusal, refusedCreditNoteError, refusedCreditNotePayload, EAS_REFUND_TAX_RATE_ID, noStampRefusal, refundTaxAndTotal, refundTaxOnEasRate, refundStatedTax, eas182RefundFigures, refund182HeldRefusal, wholeOrderReversalFigures, reversalNotProvenRefusal, invoiceToReverse,
   type CreditNoteLineKind, type EuVatCreditNotePlan,
 } from '../../lib/domain/accounting/eu-vat-credit-note'
 import { findSalesDocumentTaxTypeProblems } from '../../lib/domain/accounting/sales-document-tax-types'
@@ -367,4 +367,35 @@ test('[reversal] the builder refuses a rounding reversal that names no account o
   assert.equal(applyEuVatCreditNoteTreatment(note, plan({ ...base, roundingReversal: { amount: 'x', accountCode: '860' } })).ok, false)
   const zero = applyEuVatCreditNoteTreatment(note, plan({ ...base, roundingReversal: { amount: '0', accountCode: '860' } }))
   assert.equal(zero.ok && zero.payload.lines.some((l) => l.noTaxKind === 'rounding-difference'), false)
+})
+
+// ---- o3d-k26m.13 (Codex R1): the reversal uses the invoice version CONFIRMED in Xero ----
+const row = (createdAt: string, over: Record<string, unknown>) => ({ createdAt: new Date(createdAt), payload: { v: createdAt }, status: 'SYNCED', externalTransactionId: 'INV-1', abandonedBeforeRemoteCall: null, settlementBasis: null, ...over })
+
+test('[reversal] a confirmed UPDATE is the version reversed; an older confirmed one is not', () => {
+  const picked = invoiceToReverse([row('2026-11-01', {}), row('2026-11-02', { payload: { v: 'update' } })])
+  assert.deepEqual(picked, { ok: true, payload: { v: 'update' } })
+})
+
+test('[reversal] a newer PENDING update, a newer FAILED (unresolved) update, an in-flight one, an operator-typed one and a shadow all REFUSE rather than fall back to the older confirmed invoice', () => {
+  const confirmed = row('2026-11-01', {})
+  const cases: Array<Record<string, unknown>> = [
+    { status: 'PENDING', externalTransactionId: null },
+    { status: 'PROCESSING', externalTransactionId: null },
+    { status: 'FAILED', externalTransactionId: null },
+    { status: 'SYNCED', externalTransactionId: 'INV-2', settlementBasis: 'OPERATOR_ASSERTION' },
+    { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'HELD_SHADOW' },
+    { status: 'CANCELLED', externalTransactionId: null },
+  ]
+  for (const over of cases) {
+    const picked = invoiceToReverse([confirmed, row('2026-11-02', over)])
+    assert.equal(picked.ok, false, JSON.stringify(over))
+    if (!picked.ok) assert.match(picked.reason, /not confirmed as posted/)
+  }
+})
+
+test('[reversal] a newer update PROVEN never sent (cancelled before any call) is skipped; no rows at all is "no invoice"', () => {
+  const never = row('2026-11-02', { status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true })
+  assert.deepEqual(invoiceToReverse([row('2026-11-01', {}), never]), { ok: true, payload: { v: '2026-11-01' } })
+  assert.deepEqual(invoiceToReverse([]), { ok: true, payload: null })
 })

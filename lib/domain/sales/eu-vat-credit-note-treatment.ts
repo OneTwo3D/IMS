@@ -14,7 +14,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { toDecimal } from '@/lib/domain/math/decimal'
-import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
+import { LEDGER_STANDING_SELECT } from '@/lib/domain/accounting/ledger-standing'
 import { regimePolicyOf, type RegimePolicy } from '@/lib/domain/accounting/eu-vat-regime-policy'
 import { readEuVatRegimeMode, readGiftCardFlagCutIn } from '@/lib/connectors/woocommerce/sync/eu-vat-facts'
 import type { GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
@@ -23,7 +23,7 @@ import type { AccountingEnqueueOutcome } from '@/lib/accounting'
 import { unstampedOrderIsScheme } from '@/lib/domain/sales/eu-vat-scheme-evidence'
 import { decideRefund182Hold } from '@/lib/domain/sales/refund-182-hold'
 import { priorRefundedTax } from '@/lib/domain/sales/refund-182-prior-tax'
-import { applyEuVatCreditNoteTreatment, eas182RefundFigures, persistedSchemeUntreatableRefusal, refund182HeldRefusal, noFrozenBasisRefusal, noInvoicedTypeRefusal, noStampRefusal, refundTaxAndTotal, reversalNotProvenRefusal, wholeOrderReversalFigures, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
+import { applyEuVatCreditNoteTreatment, eas182RefundFigures, persistedSchemeUntreatableRefusal, refund182HeldRefusal, noFrozenBasisRefusal, noInvoicedTypeRefusal, noStampRefusal, refundTaxAndTotal, reversalNotProvenRefusal, wholeOrderReversalFigures, invoiceToReverse, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
 
 export type EuVatCreditNoteAccounts = { ioss: string | null; ddp: string | null; fee: string | null; rounding: string | null }
@@ -163,13 +163,14 @@ export async function treatCreditNotePayload(params: {
   let figures: ReturnType<typeof refundTaxAndTotal>
   let reversalRounding: { amount: string; accountCode: string } | null = null
   if (refund.source === 'CHARGEBACK_POLLER') {
-    // The target, the VAT and any rounding reversal come from the invoice payload IMS posted (or queued), and the reversal must equal it: the latest IMS invoice that may have reached the ledger (not one proven never posted) for the order carrying the scheme marker.
-    const invoiceRow = await db.accountingSyncLog.findFirst({
-      where: { type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] }, referenceType: 'SalesOrder', referenceId: params.orderId, ...MAY_HAVE_REACHED_LEDGER_WHERE, payload: { path: ['_euVatTreatment', 'applied'], equals: true } },
-      orderBy: { createdAt: 'desc' },
-      select: { payload: true },
+    // The target, the VAT and any rounding reversal come from the invoice payload of the version CONFIRMED in Xero (`invoiceToReverse`: a newer row that is queued, failed or of unknown outcome refuses), and the reversal must equal it.
+    const invoiceRows = await db.accountingSyncLog.findMany({
+      where: { type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] }, referenceType: 'SalesOrder', referenceId: params.orderId },
+      select: { ...LEDGER_STANDING_SELECT, createdAt: true, payload: true },
     })
-    const proven = wholeOrderReversalFigures({ invoice: (invoiceRow?.payload ?? null) as Record<string, unknown> | null, currency: payload.currency, net })
+    const picked = invoiceToReverse(invoiceRows)
+    if (!picked.ok) return { kind: 'refused', reason: reversalNotProvenRefusal(number, picked.reason), code: 'hand_post' }
+    const proven = wholeOrderReversalFigures({ invoice: picked.payload, currency: payload.currency, net })
     if (!proven.ok) return { kind: 'refused', reason: reversalNotProvenRefusal(number, proven.reason), code: 'hand_post' }
     reversalRounding = proven.rounding
     figures = { ok: true, vatAmount: proven.vatAmount, refundTotal: proven.refundTotal }

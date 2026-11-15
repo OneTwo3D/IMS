@@ -20,6 +20,7 @@
  * for a rate-182 refund whose tax figure cannot be read at all.
  */
 import { withLedgerCheck } from './hand-post-instruction'
+import { ledgerStanding, type LedgerStandingRow } from './ledger-standing'
 import { currencyMinorUnits, roundMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { EU_VAT_TREATMENT_PAYLOAD_KEY, predictedUntaxedTotal, type TreatableLine, type TreatablePayload } from './eu-vat-treatment'
 
@@ -346,4 +347,21 @@ export function wholeOrderReversalFigures(input: { invoice: Record<string, unkno
     return { ok: false, reason: `the reversal (lines ${roundMoney(input.net, currency).toString()} + VAT ${vatRounded.toString()} + rounding ${roundingAmount.toString()} = ${reversal.toString()} ${currency}) is not the invoice's total (${invoiceTotal.toString()} ${currency})` }
   }
   return { ok: true, vatAmount: vatRounded.toString(), refundTotal: invoiceTotal.toString(), rounding }
+}
+
+
+/**
+ * WHICH INVOICE A WHOLE-ORDER REVERSAL REVERSES: the version that is IN XERO. `rows` are every SALES_INVOICE / SALES_INVOICE_UPDATE row for the order, in any order, newest decided by `createdAt`.
+ * Walking from the newest: a row PROVEN never to have reached the ledger is skipped; the first other row must be a CONFIRMED_POSTED ledger fact (the connector answered with the document), and is the one used.
+ * Anything else first (queued or in-flight work, a failed attempt whose outcome is unknown, an operator's typed id, a shadow) means the newest version's state is unknown, so it refuses: reversing an older version could differ from what Xero holds.
+ */
+export function invoiceToReverse<T extends LedgerStandingRow & { createdAt: Date; payload: unknown }>(rows: readonly T[]): { ok: true; payload: Record<string, unknown> | null } | { ok: false; reason: string } {
+  const newestFirst = [...rows].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+  for (const row of newestFirst) {
+    const standing = ledgerStanding(row)
+    if (standing === 'PROVEN_NOT_POSTED') continue
+    if (standing === 'CONFIRMED_POSTED') return { ok: true, payload: (row.payload ?? null) as Record<string, unknown> | null }
+    return { ok: false, reason: `the newest invoice row for the order (${row.status}, ledger standing ${standing}) is not confirmed as posted to Xero and is not proven never sent, so which invoice version Xero holds is not known` }
+  }
+  return { ok: true, payload: null }
 }

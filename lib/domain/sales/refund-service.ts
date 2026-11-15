@@ -4470,7 +4470,12 @@ export async function createSalesOrderRefund(
         })),
       })
       if (overAllocated) {
-        return { error: overAllocatedRefundTargetMessage(overAllocated) } as const
+        // `quarantine`: a storefront refund that over-credits a fee (or any capped target) is parked for an operator, never retried blindly.
+        return {
+          error: overAllocatedRefundTargetMessage(overAllocated)
+            + (input.externalRefundId != null ? ` The money has ALREADY been returned in the storefront (refund ${input.externalRefundId}) — do NOT issue another storefront refund. ${REFUND_PARK_MANUAL_RESOLUTION_HINT}` : ''),
+          quarantine: true as const,
+        } as const
       }
     }
 

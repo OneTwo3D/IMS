@@ -966,7 +966,7 @@ export async function syncWcRefund(
     // ---------------------------------------------------------------------------------------------
     // o3d-k26m.14: REFUNDED FEE LINES. A refund that returns a fee (a landed-cost or handling fee) states it in `fee_lines`, which
     // used to be ignored, so the mapped gross missed the fee and the refund parked PENDING for ever. Each is linked to the ORIGINAL
-    // order fee line (by name, see matchRefundedFeeLines) and carried with its net and the tax WooCommerce states it returned, like a
+    // order fee line (by name, only when exactly one fee has it; see matchRefundedFeeLines) and, below, capped per fee across ALL the order's refunds under the writer's order lock (enforcePerTargetBalances) and carried with its net and the tax WooCommerce states it returned, like a
     // goods line, so a marked (wclc) fee reaches the credit-note builder as a marked fee. A fee that cannot be matched is NEVER
     // dropped: the refund is QUARANTINED with a message naming it, for an operator to record by hand.
     // ---------------------------------------------------------------------------------------------
@@ -977,7 +977,7 @@ export async function syncWcRefund(
       const unmatched = refundedFeeLines.filter((_, index) => matched[index] === null)
       if (unmatched.length > 0) {
         const names = unmatched.map((feeLine) => `"${feeLine.name ?? '(unnamed)'}" (${parseDecimalAbs(feeLine.total).toFixed(2)} net, ${parseDecimalAbs(feeLine.total_tax).toFixed(2)} tax)`).join(', ')
-        const error = withLedgerCheck(`WooCommerce refund ${wcRefund.id} refunds fee ${names} that IMS cannot match to exactly one fee line on the original order, so the refund was NOT recorded and nothing was sent to Xero. Record the refund manually from the order, crediting that fee line.`)
+        const error = withLedgerCheck(`WooCommerce refund ${wcRefund.id} refunds fee ${names} that IMS cannot match to exactly one fee line on the original order (it matches by name, and only when no other fee on the order has that name), so the refund was NOT recorded and nothing was sent to Xero. Record the refund manually from the order, crediting that fee line.`)
         await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: error, payload: wcRefund })
         await writeActivity({
           entityType: 'SALES_ORDER',
@@ -1091,7 +1091,7 @@ export async function syncWcRefund(
         refundLines.filter((l) => l.qty > 0 || l.totalBase > 0),
         wcRefund.reason || 'WooCommerce refund',
         returnWarehouseId,
-        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id, statedGrossForeign: refundAmountForeign.toNumber(), ...(eas182StatedTaxForeign !== undefined ? { eas182StatedTaxForeign } : {}) },
+        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id, statedGrossForeign: refundAmountForeign.toNumber(), ...(eas182StatedTaxForeign !== undefined ? { eas182StatedTaxForeign } : {}), ...(refundedFeeLines.length > 0 ? { enforcePerTargetBalances: true } : {}) },
       )
     } catch (error) {
       if (!isExternalRefundIdUniqueConflict(error)) throw error
