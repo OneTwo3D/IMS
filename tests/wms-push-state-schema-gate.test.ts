@@ -135,8 +135,11 @@ test('o3d-1izw gate: the sweep asks it BEFORE it reads a candidate, and the clai
   const { readFile } = await import('node:fs/promises')
   const source = await readFile(new URL('../lib/domain/wms/order-push-sweep.ts', import.meta.url), 'utf8')
 
-  const preflight = source.indexOf('await assertWmsPushStateSchemaReady()\n\n  return runWmsOrderPushSweepCore(')
-  assert.notEqual(preflight, -1, 'the preflight runs immediately before the core sweep, not after it')
+  assert.match(
+    source,
+    /await assertWmsPushStateSchemaReady\(\)[^]*?withOrderPushSweepLockOrSkip\(connectorId, \(\) =>\s*runWmsOrderPushSweepCore\(/,
+    'the preflight runs before the core sweep (which runs inside the push-sweep lock), not after it',
+  )
 
   const claim = source.indexOf('async claimForCreate(orderId, connector, attemptedAt, paidNotBefore) {')
   assert.notEqual(claim, -1)

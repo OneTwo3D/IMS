@@ -19,6 +19,7 @@ import { NO_DELIVERY_STREET_REASON, resolvePushRecipient } from './push-recipien
 import type { WmsConnector, WmsOrderAddress, WmsOrderItemRef, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
 import { decideWmsHeldRelease, wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal, wmsCreateReplayPolicy, type WmsCreateReplayPolicySource } from './create-replay-policy'
 import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere, wmsPaidBeforeCreateFloor } from './create-eligibility'
+import { withOrderPushSweepLockOrSkip } from './dispatch-sweep-lock'
 import { scrubWmsError } from './error-scrub'
 import { proveMergeLineage } from './merge-lineage'
 import { recordWmsMutationEvent, type WmsMutationEventInput } from './mutation-audit'
@@ -827,6 +828,15 @@ export const AMEND_LEASE_TTL_MS = 10 * 60_000
 /** Where the held create pass's walk stands (a Setting). Cleared when a page comes back short. */
 export const HELD_CREATE_CURSOR_KEY = 'wms_order_push_held_create_cursor'
 
+/**
+ * The warehouse note that names the lines removed from a merged survivor is an OBLIGATION that outlives the link: the link is closed
+ * (CANCELLED) the moment the removal is verified, and a CANCELLED link is never selected again, so a note that failed to post would be lost.
+ * The obligation is therefore written (a Setting, one per link, so no schema change) BEFORE the link is closed, retried by every sweep
+ * until the note is posted, and deleted only then. Deleting it IS the record that the note is delivered, so a recorded note is never posted twice.
+ */
+export const REMOVAL_NOTE_KEY_PREFIX = 'wms_order_push_removal_note:'
+export type WmsRemovalNoteObligation = { linkId: string; orderId: string; externalOrderId: string; comment: string }
+
 export type WmsPushCandidate = OrderForPush & { shipFromWarehouseId: string | null; pushAttempts: number }
 export type WmsPushUpdateLink = { id: string; externalOrderId: string | null; courierForm?: string | null; courierFormName?: string | null; amendNoticeAt?: Date | null; order: OrderForPush & { shipFromWarehouseId: string | null } }
 /**
@@ -1132,6 +1142,12 @@ export interface WmsOrderPushPort {
    * noticed afresh instead of being skipped behind a stale notice. Optional so existing test ports keep compiling.
    */
   clearStaleNotices?(connector: string): Promise<number>
+  /** Durably record that a removal note is owed for a link about to be closed (see REMOVAL_NOTE_KEY_PREFIX). Idempotent per link. */
+  recordRemovalNote?(connector: string, note: WmsRemovalNoteObligation): Promise<void>
+  /** Removal notes still owed, oldest first. */
+  pendingRemovalNotes?(connector: string, limit: number): Promise<WmsRemovalNoteObligation[]>
+  /** The note was posted: drop the obligation. Returns whether it was still recorded. */
+  clearRemovalNote?(connector: string, linkId: string): Promise<boolean>
   /** Notices whose warehouse note was never delivered (the comment failed, was shadowed, or the connector could not post). */
   noticesAwaitingComment?(connector: string, limit: number): Promise<Array<{ id: string; orderId: string; externalOrderId: string; state: 'SYNCED' | 'MERGED'; intent: 'HOLD' | 'CANCEL'; noticeAt: Date }>>
   updateLinkIfLinked?(
@@ -1445,13 +1461,22 @@ export async function runWmsOrderPushSweepCore(
       result.cancelled += 1
     }
     if (removal.kind === 'REMOVED') {
+      // The note naming the removed lines is owed to the warehouse. Persist that obligation BEFORE the link is closed: a CANCELLED link
+      // is never revisited, so a note that fails to post below is retried from the obligation instead of being lost. If recording
+      // throws, the link is not closed and the caller's handler leaves it due.
+      const removalComment = wmsMergedRemovalComment(orderLabel, removal.removed)
+      await port.recordRemovalNote?.(connectorId, { linkId: link.id, orderId: link.orderId, externalOrderId: survivorId, comment: removalComment })
       await settleCancelled()
       await audit({
         action: 'order_cancel', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: survivorId,
         summary: `IMS-cancelled/fully-refunded order's lines removed from the merged WMS order: ${describeWmsOrderItems(removal.removed)}`,
         before, after: { state: 'CANCELLED', removedLines: removal.removed.map((item) => ({ line: item.externalItemId, sku: item.sku, quantity: item.quantity })) },
       })
-      await postConflictComment(survivorId, wmsMergedRemovalComment(orderLabel, removal.removed), link.orderId)
+      if (port.recordRemovalNote && (await postConflictComment(survivorId, removalComment, link.orderId)) === 'posted') {
+        await port.clearRemovalNote?.(connectorId, link.id).catch((e) => console.error('[wms-order-push] could not clear the delivered removal note; it may be posted again', e))
+      } else if (!port.recordRemovalNote) {
+        await postConflictComment(survivorId, removalComment, link.orderId)
+      }
       return
     }
     if (removal.kind === 'ONLY_LINES_LEFT') {
@@ -3227,6 +3252,14 @@ export async function runWmsOrderPushSweepCore(
         noticeCommentsRetried += 1
       }
     }
+    // Merged-line removal notes still owed (their link is CANCELLED, so the notice retry above cannot see them). Retried until posted;
+    // the obligation is deleted only once the note is, so a delivered note is never posted again.
+    for (const owed of warehouseHeld ? [] : (await port.pendingRemovalNotes?.(connectorId, batchSize).catch(() => [])) ?? []) {
+      if ((await postConflictComment(owed.externalOrderId, owed.comment, owed.orderId)) === 'posted') {
+        await port.clearRemovalNote?.(connectorId, owed.linkId).catch((e) => console.error('[wms-order-push] could not clear the delivered removal note; it may be posted again', e))
+        noticeCommentsRetried += 1
+      }
+    }
     for (const link of await port.holdableLinks(connectorId, batchSize)) {
       if (!link.externalOrderId) continue
       const ts = now()
@@ -4068,6 +4101,29 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       })
       return hold.count + cancel.count
     },
+    async recordRemovalNote(connector, note) {
+      const key = `${REMOVAL_NOTE_KEY_PREFIX}${connector}:${note.linkId}`
+      const value = JSON.stringify({ linkId: note.linkId, orderId: note.orderId, externalOrderId: note.externalOrderId, comment: note.comment })
+      // update: {} — an obligation already recorded (a retried removal) is left exactly as it was.
+      await db.setting.upsert({ where: { key }, create: { key, value }, update: {} })
+    },
+    async pendingRemovalNotes(connector, limit) {
+      const rows = await db.setting.findMany({ where: { key: { startsWith: `${REMOVAL_NOTE_KEY_PREFIX}${connector}:` } }, orderBy: { updatedAt: 'asc' }, take: limit, select: { value: true } })
+      const owed: WmsRemovalNoteObligation[] = []
+      for (const row of rows) {
+        try {
+          const parsed = JSON.parse(row.value) as Partial<WmsRemovalNoteObligation>
+          if (typeof parsed.linkId === 'string' && typeof parsed.orderId === 'string' && typeof parsed.externalOrderId === 'string' && typeof parsed.comment === 'string') {
+            owed.push({ linkId: parsed.linkId, orderId: parsed.orderId, externalOrderId: parsed.externalOrderId, comment: parsed.comment })
+          }
+        } catch { /* an unreadable obligation is skipped, never posted */ }
+      }
+      return owed
+    },
+    async clearRemovalNote(connector, linkId) {
+      const { count } = await db.setting.deleteMany({ where: { key: `${REMOVAL_NOTE_KEY_PREFIX}${connector}:${linkId}` } })
+      return count > 0
+    },
     async noticesAwaitingComment(connector, limit) {
       const base = { connector, state: { in: ['SYNCED', 'MERGED'] as Array<'SYNCED' | 'MERGED'> }, externalOrderId: { not: null } }
       const [holds, cancels] = await Promise.all([
@@ -4125,5 +4181,10 @@ export async function runWmsOrderPushSweep(
   // failed job rather than a green run that quietly did nothing.
   await assertWmsPushStateSchemaReady()
 
-  return runWmsOrderPushSweepCore(connector, connectorId, createPrismaWmsOrderPushPort(), options)
+  // One push sweep per connector at a time (o3d-hqvrp.339): creates, holds, releases, cancels and note retries all act on the same
+  // links, and the per-link amend lease covers only the amendment path. Skip rather than queue: the holder is doing this work now.
+  const locked = await withOrderPushSweepLockOrSkip(connectorId, () =>
+    runWmsOrderPushSweepCore(connector, connectorId, createPrismaWmsOrderPushPort(), options))
+  if ('lockSkipped' in locked) return { ...empty, skipped: 'Another WMS order push sweep is already running' }
+  return locked
 }
