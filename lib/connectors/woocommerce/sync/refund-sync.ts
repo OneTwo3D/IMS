@@ -970,6 +970,26 @@ export async function syncWcRefund(
     // goods line, so a marked (wclc) fee reaches the credit-note builder as a marked fee. A fee that cannot be matched is NEVER
     // dropped: the refund is QUARANTINED with a message naming it, for an operator to record by hand.
     // ---------------------------------------------------------------------------------------------
+    // A ZERO-QUANTITY GOODS AMOUNT (a line_items entry that returns money but no units) is not mapped above. With no fee line the monetary-only fallback below records the whole refund; WITH a fee line the refund has a mapped line, the fallback is skipped,
+    // and the mapped gross would hold only the fee, so it could never reconcile and would retry for ever with the customer already refunded. IMS does not split that mix: it is QUARANTINED for an operator to record by hand.
+    const hasFeeLine = (wcRefund.fee_lines ?? []).some((feeLine) => parseDecimalAbs(feeLine.total).gt(0.000001) || parseDecimalAbs(feeLine.total_tax).gt(0.000001))
+    const hasAmountOnlyGoods = wcRefund.line_items.some((l) => Math.abs(l.quantity) === 0 && (parseDecimalAbs(l.total).gt(0.000001) || parseDecimalAbs(l.total_tax).gt(0.000001)))
+    if (hasFeeLine && hasAmountOnlyGoods) {
+      const error = withLedgerCheck(`WooCommerce refund ${wcRefund.id} mixes an amount-only goods refund (money returned on a line with no quantity) with a fee refund, which IMS cannot split automatically, so the refund was NOT recorded and nothing was sent to Xero. The money has ALREADY been returned in the storefront (refund ${wcRefund.id}) - do NOT issue another storefront refund. ${REFUND_PARK_MANUAL_RESOLUTION_HINT}`)
+      await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: error, payload: wcRefund })
+      await writeActivity({
+        entityType: 'SALES_ORDER',
+        entityId: so.id,
+        action: 'refund_sync_amount_only_goods_with_fee',
+        tag: 'sync',
+        level: 'WARNING',
+        description: error,
+        metadata: { externalRefundId: wcRefund.id },
+        resolveUser: false,
+      })
+      return { outcome: 'quarantined-refusal', error }
+    }
+
     const refundedFeeLines = (wcRefund.fee_lines ?? [])
       .filter((feeLine) => parseDecimalAbs(feeLine.total).gt(0.000001) || parseDecimalAbs(feeLine.total_tax).gt(0.000001))
     if (refundedFeeLines.length > 0) {

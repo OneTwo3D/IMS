@@ -1837,3 +1837,28 @@ test('EVERY mapped fee line that contributes to the gross reaches the refund wri
   assert.equal(sent.length, 1)
   assert.ok((sent[0]?.totalBase ?? 0) > 0 || (sent[0]?.qty ?? 0) > 0, 'the writer\'s filter keeps it')
 })
+
+test('a refund with an AMOUNT-ONLY goods line (zero quantity) plus a fee is QUARANTINED, not parked PENDING: createRefund is not called, it does not retry, and it says the money is already returned (o3d-k26m.14)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: FEE_ORDER_LINES } })
+  const refund = makeRefund({
+    amount: '19.80',
+    line_items: [{ ...goodsRefundLine, quantity: 0 }],
+    fee_lines: [{ name: 'EU Customs Fee', total: '-4.00', total_tax: '-0.80' }],
+  })
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+  assert.equal(result.outcome, 'quarantined-refusal')
+  assert.equal(refundOutcomeFailed(result.outcome), true)
+  assert.notEqual(result.outcome, 'retryable-failure', 'a QUARANTINED park is skipped by the sweep, never retried on a timer')
+  assert.match(result.error ?? '', /amount-only goods refund[\s\S]*fee refund[\s\S]*ALREADY been returned in the storefront/)
+  assert.equal(state.createRefundCalls, 0)
+  assert.equal(state.syncLogs.some((log) => (log as { data?: { status?: string } }).data?.status === 'QUARANTINED'), true)
+  assert.equal((state.activityLogs as Array<{ action?: string }>).some((e) => e.action === 'refund_sync_amount_only_goods_with_fee'), true)
+})
+
+test('the monetary-only fallback is unchanged when there is no fee line: an amount-only goods refund alone is still recorded', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: TAXABLE_ORDER })
+  const result = await syncWcRefund(1001, makeRefund({ amount: '120.00', line_items: [{ ...goodsRefundLine, quantity: 0, total: '-100.00', total_tax: '-20.00' }], shipping_lines: [] }), state.dependencies)
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
+  assert.equal(state.createRefundLines.length, 1)
+  assert.equal(state.createRefundLines[0].totalForeign, 100)
+})
