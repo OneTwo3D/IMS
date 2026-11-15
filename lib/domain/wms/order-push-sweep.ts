@@ -4116,7 +4116,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           if (typeof parsed.linkId === 'string' && typeof parsed.orderId === 'string' && typeof parsed.externalOrderId === 'string' && typeof parsed.comment === 'string') {
             owed.push({ linkId: parsed.linkId, orderId: parsed.orderId, externalOrderId: parsed.externalOrderId, comment: parsed.comment })
           }
-        } catch { /* an unreadable obligation is skipped, never posted */ }
+        } catch (e) { console.error('[wms-order-push] an unreadable removal-note obligation was skipped', e) }
       }
       return owed
     },
