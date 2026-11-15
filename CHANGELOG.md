@@ -10,12 +10,14 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+## 4.4.0 - 2026-11-15
+
 ### EU VAT credit notes: whole-order reversal rounding, and refunded fees (backend / sync)
 
 The EU IOSS/VOEC/DDP credit-note treatment is built but switched off (it runs only while the Sales Invoices switch is on); nothing here changes behaviour while that switch is off, except the WooCommerce refund-fee mapping below.
 
 - **Fixed: a whole-order reversal (the payment poller's chargeback credit note) on a scheme order now reverses the invoice it cancels, rounding line included.** Its target, its VAT line and any rounding reversal (account 860 "Rounding") are read from the invoice payload IMS queued or posted, and the credit note must equal that invoice's total exactly. When that cannot be proven (no IMS invoice carrying the scheme marker, lines that differ from the invoice) it is refused as a settle-by-hand row on /sync, never sent.
-- **Fixed: a WooCommerce refund that includes a fee is now mapped.** Refunded `fee_lines` are linked to the original order fee line (by name; several same-named fees need an exact net) with their net and tax, so the mapped total matches the Woo refund amount and a marked landed-cost fee reaches the credit-note builder as a fee. A refunded fee that matches no single order fee line is quarantined with a message naming it, instead of parking PENDING for ever. A fee's cumulative refunded net and VAT are each held to what the fee bore, across all of the order's refunds, under the refund write's order lock; an over-refund is quarantined. (Adds a nullable `charged_tax_foreign` column to refund lines; no backfill.)
+- **Fixed: a WooCommerce refund that includes a fee is now mapped.** Refunded `fee_lines` are linked to the original order fee line (by name, only when exactly one order fee has that name) with their net and tax, so the mapped total matches the Woo refund amount and a marked landed-cost fee reaches the credit-note builder as a fee. A refunded fee that matches no single order fee line, a fee refund carrying VAT but no net, or a refund mixing an amount-only goods line with a fee is quarantined with a message saying to record it by hand, instead of parking PENDING for ever. A fee's cumulative refunded net and VAT are each held to what the fee bore, across all of the order's refunds, under the refund write's order lock; an over-refund is quarantined. (Adds a nullable `charged_tax_foreign` column to refund lines; no backfill.)
 
 ### EU IOSS / VOEC / DDP shadow comparison report and go-live runbook (backend / ops)
 
