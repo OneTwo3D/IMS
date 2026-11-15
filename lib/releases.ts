@@ -14,6 +14,23 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
+    version: '4.4.0',
+    date: '2026-11-15',
+    title: 'WooCommerce refunds with fees are recorded, safer EU VAT credit notes, EU VAT comparison report',
+    summary: 'Nothing in 4.4.0 needs an operator action on upgrade; the migration (one nullable column on refund lines) applies automatically on deploy. WooCommerce refunds that include a fee are now recorded instead of waiting as pending for ever; any fee refund IMS cannot match safely is quarantined for an operator. The EU VAT credit-note changes are built, switched off: they take effect only once the Sales Invoices switch is on. The new read-only EU VAT comparison report is meant to be run BEFORE that switch is turned on, as the go-live runbook describes.',
+    userMessage: 'IMS 4.4 records WooCommerce refunds that include a fee. A fee refund IMS cannot match safely is set aside in the exceptions inbox for an operator, instead of waiting as pending.',
+    userHighlights: [
+      'WooCommerce refunds that include a fee are now recorded, with the fee matched to the order fee of the same name.',
+      'A fee refund IMS cannot match safely (two fees with the same name, a fee refunding VAT but no net, more than the fee had left after earlier refunds, or an amount-only goods refund mixed with a fee) is quarantined in the exceptions inbox for an operator, and nothing is sent to Xero. The money has already gone back to the customer in the store, so do not refund it again there.',
+    ],
+    technicalHighlights: [
+      'Migration (additive): nullable column sales_order_refund_lines.charged_tax_foreign, the VAT stated on each refund line; no backfill. Cumulative refunded net and VAT per fee are capped under the refund write order lock.',
+      'Built, switched off (Sales Invoices switch): a whole-order reversal credit note is built from the invoice version Xero has confirmed, reverses its rounding line, must match it account by account, and refuses to a hand-post row otherwise; an unmarked untaxed fee keeps No VAT on its credit note.',
+      'Available before go-live: npm run eu-vat:shadow -- --live-read --orders <ids> (or --from/--to) compares, read-only, what IMS would send for chosen EU orders with the invoice Xero holds (GETs only; it never refreshes the Xero token or writes anything). Running it on live data is the owner\'s decision. The go-live runbook is in help-docs/xero-sync.md.',
+      'The VAT difference report now states, for --scheme ioss/voec, that it compares rate configuration only.',
+    ],
+  },
+  {
     version: '4.3.0',
     date: '2026-11-15',
     title: 'WooCommerce webhooks no longer move the sweep cursor',
