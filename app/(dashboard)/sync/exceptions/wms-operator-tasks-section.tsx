@@ -48,9 +48,9 @@ export function WmsOperatorTasksSection({ data }: { data: WmsOperatorTaskPage })
   return (
     <Card className="p-4 space-y-3">
       <div>
-        <h2 className="text-sm font-semibold">{`Raise a Mintsoft query (${total})`}</h2>
+        <h2 className="text-sm font-semibold">{`Raise a warehouse query (${total})`}</h2>
         <p className="text-xs text-muted-foreground">
-          IMS no longer writes notes on warehouse orders: the warehouse does not read them and a query cannot be raised from IMS. For each task, raise a query in Mintsoft with the text below, then press Done.
+          IMS no longer writes notes on warehouse orders: the warehouse does not read them and a query cannot be raised from IMS. For each task, raise a query in the warehouse's own system with the text below, then press Done.
           Your name and the time are recorded. A partial-removal task is checked first: Done is refused until every listed line is gone from the warehouse order.
         </p>
       </div>
@@ -61,7 +61,7 @@ export function WmsOperatorTasksSection({ data }: { data: WmsOperatorTaskPage })
           <div key={task.id} className="rounded-lg border p-3 space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
               <div className="space-y-0.5">
-                <div className="font-medium">{`Raise a Mintsoft query for order ${task.warehouseOrder}`}</div>
+                <div className="font-medium">{`Raise a warehouse query for order ${task.warehouseOrder}`}</div>
                 <div className="text-xs text-muted-foreground">
                   {`${task.reasonLabel}. IMS order `}
                   <Link className="underline underline-offset-2" href={`/sales/${task.orderId}`}>{task.orderNumber}</Link>

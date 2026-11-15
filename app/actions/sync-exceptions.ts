@@ -768,7 +768,7 @@ export type ExceptionInboxSummary = {
   blockedWcOrders: number
   /** Held invoices refused for a gift-card flag the store left unsettled: an operator answers per line (counted in the total). */
   giftCardLinesToResolve: number
-  /** Open operator tasks ("raise a Mintsoft query"): IMS writes no warehouse comments, so each is a query a person raises by hand (counted in the total). */
+  /** Open operator tasks ("raise a warehouse query"): IMS writes no warehouse comments, so each is a query a person raises by hand (counted in the total). */
   wmsOperatorTasksOpen: number
   unresolvedDrift: number
   /**

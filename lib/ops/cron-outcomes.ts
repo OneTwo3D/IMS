@@ -201,7 +201,7 @@ export const cronOutcomes = {
   // failed, deadLettered and shadowUnrecorded (a held create whose only record could not be written): numbers, with outboundHeld (held pushes, also in failed) subtracted;
   // validationFailed and createClaimParked: orders NEWLY parked this run (the payload cannot be built; a dispatched create with no recorded outcome), counted once on entry, never the backlog, so a later healthy sweep is green again;
   // fenceCheckErrors, claimErrors and linkWriteErrors: a withdrawal-fence check, create-claim transaction or recovery-pass link write that THREW (the order is skipped and retried, but the sweep could not decide it)
-  // operatorTaskErrors: operator tasks ("raise a Mintsoft query") that could not be recorded this run (retried next run). operatorTasksRaised and operatorTasksOpen are information: an open task is a person's to-do, never a failure
+  // operatorTaskErrors: operator tasks ("raise a warehouse query") that could not be recorded this run (retried next run). operatorTasksRaised and operatorTasksOpen are information: an open task is a person's to-do, never a failure
   'wms-order-push': (r: WmsOrderPushSweepResult) => from(r, counts(r, ['failed', 'deadLettered', 'shadowUnrecorded', 'validationFailed', 'createClaimParked', 'fenceCheckErrors', 'claimErrors', 'linkWriteErrors', 'operatorTaskErrors'])),
   // status enum; counters.errors: number
   'wms-order-reconcile': (r: WmsOrderReconcileResult) => enumResult(r, ['errors']),

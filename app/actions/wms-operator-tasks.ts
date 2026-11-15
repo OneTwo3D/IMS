@@ -8,7 +8,7 @@ import { completeWmsOperatorTask } from '@/lib/domain/wms/operator-task-done'
 import { WMS_OPERATOR_TASK_REASON_LABELS, type WmsOperatorTaskPayload } from '@/lib/domain/wms/operator-tasks'
 
 /**
- * SYNC > EXCEPTIONS: RAISE A MINTSOFT QUERY.
+ * SYNC > EXCEPTIONS: RAISE A WAREHOUSE QUERY.
  *
  * IMS writes no comment to the warehouse (its staff do not read them; only a query raised in their own system reaches them, and the API cannot
  * raise one). Each open task here is a query a person raises by hand from the copy-ready text, then marks Done. Done needs the sync permission and
