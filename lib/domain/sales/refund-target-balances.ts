@@ -22,7 +22,7 @@ export const REFUND_TARGET_BALANCE_EPSILON = 0.005
 
 export type RefundTargetOrder = {
   shippingForeign?: DecimalInput
-  lines: readonly { id: string; description?: string | null; totalForeign?: DecimalInput }[]
+  lines: readonly { id: string; description?: string | null; totalForeign?: DecimalInput; taxForeign?: DecimalInput }[]
 }
 
 /** A refund line that already exists on the order (any prior refund). */
@@ -30,6 +30,8 @@ export type PriorRefundTargetLine = {
   salesOrderLineId?: string | null
   lineKind?: string | null
   totalForeign?: DecimalInput
+  /** The VAT the source stated it returned on this line; absent/null when none was stated. */
+  chargedTaxForeign?: DecimalInput | null
 }
 
 /** A NET foreign-currency amount this recording wants to put on one target. */
@@ -37,6 +39,8 @@ export type RefundTargetAllocation = {
   lineId?: string | null
   lineKind?: 'sale' | 'shipping' | 'discount' | null
   netForeign: DecimalInput
+  /** The VAT the source states this money bore; null when it states none (then no VAT cap applies to it). */
+  taxForeign?: DecimalInput | null
 }
 
 export type OverAllocatedRefundTarget = {
@@ -47,6 +51,8 @@ export type OverAllocatedRefundTarget = {
   chargedNetForeign: Decimal
   /** True when earlier refunds are the reason it no longer fits — worth saying out loud. */
   reducedByPriorRefunds: boolean
+  /** `tax`: the net fits but the VAT stated for it does not. The three figures above are then VAT. */
+  kind?: 'net' | 'tax'
 }
 
 function targetKey(lineId: string | null | undefined, lineKind: string | null | undefined): string | null {
@@ -68,24 +74,36 @@ export function findOverAllocatedRefundTarget(input: {
   priorRefundLines: readonly PriorRefundTargetLine[]
   allocations: readonly RefundTargetAllocation[]
   epsilon?: number
+  /** Order lines whose cumulative refunded VAT is ALSO held to the VAT the line bore (fee lines). */
+  taxCappedLineIds?: ReadonlySet<string>
 }): OverAllocatedRefundTarget | null {
   const epsilon = toDecimal(input.epsilon ?? REFUND_TARGET_BALANCE_EPSILON)
   const orderLineById = new Map(input.order.lines.map((line) => [line.id, line]))
 
   const priorByKey = new Map<string, Decimal>()
+  const priorTaxByKey = new Map<string, Decimal>()
   for (const priorLine of input.priorRefundLines) {
     const key = targetKey(priorLine.salesOrderLineId, priorLine.lineKind)
     if (!key) continue
     priorByKey.set(key, (priorByKey.get(key) ?? toDecimal(0)).add(toDecimal(priorLine.totalForeign ?? 0)))
+    // A prior line that stated no VAT (a manual refund, or any older row) is counted at the order line's own charged rate, which a net within its balance can never push past the line's VAT.
+    const orderLine = orderLineById.get(key.slice('line:'.length))
+    let priorTax: Decimal | null = priorLine.chargedTaxForeign != null ? toDecimal(priorLine.chargedTaxForeign) : null
+    if (priorTax === null && orderLine && toDecimal(orderLine.totalForeign ?? 0).gt(0)) {
+      priorTax = toDecimal(priorLine.totalForeign ?? 0).mul(toDecimal(orderLine.taxForeign ?? 0)).div(toDecimal(orderLine.totalForeign ?? 0))
+    }
+    if (priorTax !== null) priorTaxByKey.set(key, (priorTaxByKey.get(key) ?? toDecimal(0)).add(priorTax))
   }
 
   const allocatedByKey = new Map<string, Decimal>()
+  const allocatedTaxByKey = new Map<string, Decimal>()
   const orderedKeys: string[] = []
   for (const allocation of input.allocations) {
     const key = targetKey(allocation.lineId, allocation.lineKind ?? (allocation.lineId ? 'sale' : null))
     if (!key) continue
     if (!allocatedByKey.has(key)) orderedKeys.push(key)
     allocatedByKey.set(key, (allocatedByKey.get(key) ?? toDecimal(0)).add(toDecimal(allocation.netForeign)))
+    if (allocation.taxForeign != null) allocatedTaxByKey.set(key, (allocatedTaxByKey.get(key) ?? toDecimal(0)).add(toDecimal(allocation.taxForeign).abs()))
   }
 
   for (const key of orderedKeys) {
@@ -105,12 +123,38 @@ export function findOverAllocatedRefundTarget(input: {
         reducedByPriorRefunds: prior.gt(0),
       }
     }
+    // The VAT cap, for the lines asked for: the VAT stated for this money against what the line's own VAT has left after the VAT earlier refunds returned on it.
+    const lineId = key.slice('line:'.length)
+    const stated = allocatedTaxByKey.get(key)
+    if (!isShipping && line && stated !== undefined && input.taxCappedLineIds?.has(lineId)) {
+      const chargedTax = toDecimal(line.taxForeign ?? 0)
+      const priorTax = priorTaxByKey.get(key) ?? toDecimal(0)
+      const remainingTax = chargedTax.sub(priorTax)
+      if (stated.sub(remainingTax).gt(epsilon)) {
+        return {
+          label: line.description || `line ${line.id}`,
+          allocatedNetForeign: stated,
+          remainingNetForeign: remainingTax,
+          chargedNetForeign: chargedTax,
+          reducedByPriorRefunds: priorTax.gt(0),
+          kind: 'tax',
+        }
+      }
+    }
   }
   return null
 }
 
 /** The operator-facing refusal for an over-allocated target — one wording, wherever it is raised. */
 export function overAllocatedRefundTargetMessage(over: OverAllocatedRefundTarget): string {
+  if (over.kind === 'tax') {
+    return (
+      `The VAT refunded on ${over.label} (${over.allocatedNetForeign.toFixed(2)}) is more than it ` +
+      `has left to refund (${over.remainingNetForeign.toFixed(2)} of the ${over.chargedNetForeign.toFixed(2)} it bore` +
+      `${over.reducedByPriorRefunds ? ', after earlier refunds' : ''}). ` +
+      'Split the refund across the parts it actually covered.'
+    )
+  }
   return (
     `The amount allocated to ${over.label} (${over.allocatedNetForeign.toFixed(2)} net) is more than it ` +
     `has left to refund (${over.remainingNetForeign.toFixed(2)} net` +

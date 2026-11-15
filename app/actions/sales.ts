@@ -97,6 +97,7 @@ import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { creditNoteLineFacts } from '@/lib/domain/sales/credit-note-display'
 import { refundSafeguards } from '@/lib/domain/sales/refund-target-balances'
+import { isStoredUntaxedFee } from '@/lib/domain/accounting/eu-vat-treatment'
 import { decimalToNumber } from '@/lib/decimal'
 import { addMoney, compareDecimal, currencyMinorUnits, ledgerAmountEpsilon, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { validateManualSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
@@ -1603,7 +1604,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
       // A FEE the shop charged no tax on is stored as a line with no product, no tax rate and no VAT (the WooCommerce importer's forced no-tax fee).
       // It is sent on the explicit no-tax code, naming why, as the importer's own invoice sends it: left to the fall-through it takes the order's TAXABLE
       // default code and the ledger adds VAT to a fee nobody charged VAT on. Derived from the stored line, so a clone carries it with the line.
-      const isNoTaxFee = !l.productId && !l.taxRateId && Number(l.taxForeign ?? 0) === 0
+      const isNoTaxFee = isStoredUntaxedFee(l)
       const taxType = isNoTaxFee ? NO_TAX_TYPE : resolveSalesLineTaxType({
         baseTaxType: l.taxRate?.accountingTaxType ?? orderDefaultTaxType,
         reverseCharge: l.taxRate?.reverseCharge,

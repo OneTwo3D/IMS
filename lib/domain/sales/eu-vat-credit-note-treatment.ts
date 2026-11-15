@@ -13,16 +13,17 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
-import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import { toDecimal } from '@/lib/domain/math/decimal'
+import { LEDGER_STANDING_SELECT } from '@/lib/domain/accounting/ledger-standing'
 import { regimePolicyOf, type RegimePolicy } from '@/lib/domain/accounting/eu-vat-regime-policy'
 import { readEuVatRegimeMode, readGiftCardFlagCutIn } from '@/lib/connectors/woocommerce/sync/eu-vat-facts'
 import type { GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
-import { predictedUntaxedTotal } from '@/lib/domain/accounting/eu-vat-treatment'
+import { predictedUntaxedTotal, storedLineKindOf } from '@/lib/domain/accounting/eu-vat-treatment'
 import type { AccountingEnqueueOutcome } from '@/lib/accounting'
 import { unstampedOrderIsScheme } from '@/lib/domain/sales/eu-vat-scheme-evidence'
 import { decideRefund182Hold } from '@/lib/domain/sales/refund-182-hold'
 import { priorRefundedTax } from '@/lib/domain/sales/refund-182-prior-tax'
-import { applyEuVatCreditNoteTreatment, eas182RefundFigures, persistedSchemeUntreatableRefusal, refund182HeldRefusal, noFrozenBasisRefusal, noInvoicedTypeRefusal, noStampRefusal, refundTaxAndTotal, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
+import { applyEuVatCreditNoteTreatment, eas182RefundFigures, persistedSchemeUntreatableRefusal, refund182HeldRefusal, noFrozenBasisRefusal, noInvoicedTypeRefusal, noStampRefusal, refundTaxAndTotal, reversalNotProvenRefusal, wholeOrderReversalFigures, invoiceToReverse, reversalAccountsDifference, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
 
 export type EuVatCreditNoteAccounts = { ioss: string | null; ddp: string | null; fee: string | null; rounding: string | null }
@@ -90,7 +91,7 @@ export async function treatCreditNotePayload(params: {
       where: { id: params.orderId },
       select: {
         currency: true, taxForeign: true, euVatRegime: true, euVatLineAccount: true, euVatRegimeStampedAt: true,
-        lines: { select: { id: true, wclcFeeKind: true, taxRate: { select: { reportingCategory: true, schemePostingTaxType: true } } } },
+        lines: { select: { id: true, wclcFeeKind: true, productId: true, taxRateId: true, taxForeign: true, taxRate: { select: { reportingCategory: true, schemePostingTaxType: true } } } },
       },
     }),
     db.salesOrderRefund.findUnique({
@@ -134,12 +135,15 @@ export async function treatCreditNotePayload(params: {
     const refundLine = refundLineById.get(id)
     if (!refundLine) return { kind: 'refused', reason: `Credit note ${number}: a refund line could not be found to read its posting type. Nothing was queued.` }
     const orderLine = refundLine.salesOrderLineId === null ? undefined : orderLineById.get(refundLine.salesOrderLineId)
-    lineKinds.push(orderLine !== undefined && orderLine.wclcFeeKind !== null ? 'marked-fee' : 'goods')
+    lineKinds.push(orderLine === undefined ? 'goods' : storedLineKindOf(orderLine))
     linePostingTypes.push(refundLine.postingTaxType)
   }
 
   // The invoice's posting type was not recorded on a refund line (its stamp predates the type being kept): a person posts it, on a refused row.
-  if (linePostingTypes.some((type) => (type ?? '').trim() === '')) return { kind: 'refused', reason: noInvoicedTypeRefusal(number), code: 'hand_post' }
+  // An untaxed fee is not on the scheme type (see applyEuVatCreditNoteTreatment): its snapshot is judged only when no other kind of line is there.
+  const typedPositions = lineKinds.map((kind, index) => (kind === 'untaxed-fee' ? -1 : index)).filter((index) => index >= 0)
+  const judged = typedPositions.length > 0 ? typedPositions : lineKinds.map((_, index) => index)
+  if (judged.some((index) => (linePostingTypes[index] ?? '').trim() === '')) return { kind: 'refused', reason: noInvoicedTypeRefusal(number), code: 'hand_post' }
 
   // THE FROZEN BASIS. Every figure below comes from the refund itself, snapshotted when it was created (each line's VAT rate and the refund's gross): never from a TaxRate or a setting read now, so a retry after a rate changed posts what the refund was. A refund with no frozen basis
   // (created before it was kept, or a line whose rate could not be priced then) is posted by hand.
@@ -147,7 +151,7 @@ export async function treatCreditNotePayload(params: {
   const wholeOrderReversal = refund.source === 'CHARGEBACK_POLLER'
   // A rate-182 refund (the EAS plugin books its own tax rate) is priced from the refund's own stated figures, so its lines' frozen rates are not needed.
   const rate182 = refund.eas182StatedTaxForeign !== null
-  if (!wholeOrderReversal && (refund.statedGrossForeign === null || (!rate182 && frozenRates.some((rate) => rate === null)))) return { kind: 'refused', reason: noFrozenBasisRefusal(number), code: 'hand_post' }
+  if (!wholeOrderReversal && (refund.statedGrossForeign === null || (!rate182 && judged.some((index) => frozenRates[index] === null)))) return { kind: 'refused', reason: noFrozenBasisRefusal(number), code: 'hand_post' }
   let net = toDecimal(0)
   let pricedTax = toDecimal(0)
   for (const [index, line] of lines.entries()) {
@@ -160,9 +164,21 @@ export async function treatCreditNotePayload(params: {
 
   // The refund's own tax total, and the amount the document must total. A whole-order reversal (the payment poller's chargeback) reverses the order's whole collected VAT.
   let figures: ReturnType<typeof refundTaxAndTotal>
+  let reversalRounding: { amount: string; accountCode: string } | null = null
+  let reversedInvoice: Record<string, unknown> | null = null
   if (refund.source === 'CHARGEBACK_POLLER') {
-    const vat: Decimal = toDecimal(order.taxForeign)
-    figures = { ok: true, vatAmount: vat.toString(), refundTotal: net.plus(vat).toString() }
+    // The target, the VAT and any rounding reversal come from the invoice payload of the version CONFIRMED in Xero (`invoiceToReverse`: a newer row that is queued, failed or of unknown outcome refuses), and the reversal must equal it.
+    const invoiceRows = await db.accountingSyncLog.findMany({
+      where: { type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] }, referenceType: 'SalesOrder', referenceId: params.orderId },
+      select: { ...LEDGER_STANDING_SELECT, createdAt: true, payload: true },
+    })
+    const picked = invoiceToReverse(invoiceRows)
+    if (!picked.ok) return { kind: 'refused', reason: reversalNotProvenRefusal(number, picked.reason), code: 'hand_post' }
+    const proven = wholeOrderReversalFigures({ invoice: picked.payload, currency: payload.currency, net })
+    if (!proven.ok) return { kind: 'refused', reason: reversalNotProvenRefusal(number, proven.reason), code: 'hand_post' }
+    reversalRounding = proven.rounding
+    reversedInvoice = picked.payload
+    figures = { ok: true, vatAmount: proven.vatAmount, refundTotal: proven.refundTotal }
   } else if (rate182) {
     // RATE 182: the tax the refund states across ALL its rate ids, confirmed against its own gross and held to the order's VAT not already refunded.
     const priorTax = await priorRefundedTax(db, params.orderId, params.refundId, toDecimal(order.taxForeign))
@@ -172,7 +188,7 @@ export async function treatCreditNotePayload(params: {
   }
   if (!figures.ok) return { kind: 'refused', reason: `Credit note ${number}: ${figures.reason}. Nothing was queued.` }
 
-  const types = new Set(linePostingTypes.map((type) => (type ?? '').trim()))
+  const types = new Set(judged.map((index) => (linePostingTypes[index] ?? '').trim()))
   const onlyType = types.size === 1 && !types.has('') ? [...types][0]! : null
   const plan: EuVatCreditNotePlan = {
     regime,
@@ -183,11 +199,17 @@ export async function treatCreditNotePayload(params: {
     vatAmount: figures.vatAmount,
     refundTotal: figures.refundTotal,
     vatDescription: `${DESTINATION_LABEL[regime]}`,
+    roundingReversal: reversalRounding,
     // Asked only when there is one type to ask about; the pure treatment refuses a blank or mixed set by itself.
     schemePostingTypeProblem: onlyType === null ? null : await storedSchemePostingTypeProblem(onlyType, params.now),
   }
   const treated = applyEuVatCreditNoteTreatment(payload, plan)
   if (!treated.ok) return { kind: 'refused', reason: `Credit note ${number}: ${treated.reason}. Nothing was queued.` }
+  // A whole-order reversal must book through the SAME accounts and tax types as the invoice it cancels, not the settings in force now.
+  if (reversedInvoice !== null) {
+    const accountsDiffer = reversalAccountsDifference(reversedInvoice, treated.payload.lines as never, payload.currency)
+    if (accountsDiffer !== null) return { kind: 'refused', reason: reversalNotProvenRefusal(number, accountsDiffer), code: 'hand_post' }
+  }
   // THE HOLD, decided last: only a credit note that would otherwise post is counted. The first N rate-182 credit notes are a refused, settle-by-hand row (never sent); after that they post.
   if (rate182) {
     const hold = await decideRefund182Hold(params.refundId, async (place) => params.enqueueHeldRow(refund182HeldRefusal({ creditNoteNumber: number, heldNumber: place.heldNumber, threshold: place.threshold ?? place.heldNumber, vatAccount, vatAmount: figures.vatAmount, refundTotal: figures.refundTotal, currency: payload.currency })))

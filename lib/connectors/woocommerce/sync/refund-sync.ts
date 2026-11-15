@@ -18,7 +18,7 @@ import { FULL_REFUND_RATIO } from '@/lib/domain/sales/refund-thresholds'
 import { activeRefundParkWhere, WC_REFUND_PARK_RECORD_KIND } from '@/lib/domain/sales/refund-park-recovery'
 // o3d-w00 (Codex r7 #3): shared with the exception inbox's hand-recording path — see refund-line-link.
 import { easRefundRefusal, refundStatedTax, refundTaxOnEasRate } from '@/lib/domain/accounting/eu-vat-credit-note'
-import { refundedOrderLineId } from './refund-line-link'
+import { matchRefundedFeeLines, refundedOrderLineId } from './refund-line-link'
 export { refundedOrderLineId }
 import type { WcRefund } from './types'
 import type { createRefund as createRefundAction } from '@/app/actions/sales'
@@ -702,7 +702,7 @@ export async function syncWcRefund(
         shippingForeign: true,
         lines: {
           select: {
-            id: true, productId: true, externalLineItemId: true, description: true, qty: true, totalBase: true,
+            id: true, productId: true, externalLineItemId: true, description: true, qty: true, totalBase: true, totalForeign: true,
             taxBase: true,
             taxForeign: true,
             taxRate: { select: { rate: true, reverseCharge: true } },
@@ -963,6 +963,77 @@ export async function syncWcRefund(
       })
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // o3d-k26m.14: REFUNDED FEE LINES. A refund that returns a fee (a landed-cost or handling fee) states it in `fee_lines`, which
+    // used to be ignored, so the mapped gross missed the fee and the refund parked PENDING for ever. Each is linked to the ORIGINAL
+    // order fee line (by name, only when exactly one fee has it; see matchRefundedFeeLines) and, below, capped per fee across ALL the order's refunds under the writer's order lock (enforcePerTargetBalances) and carried with its net and the tax WooCommerce states it returned, like a
+    // goods line, so a marked (wclc) fee reaches the credit-note builder as a marked fee. A fee that cannot be matched is NEVER
+    // dropped: the refund is QUARANTINED with a message naming it, for an operator to record by hand.
+    // ---------------------------------------------------------------------------------------------
+    // A ZERO-QUANTITY GOODS AMOUNT (a line_items entry that returns money but no units) is not mapped above. With no fee line the monetary-only fallback below records the whole refund; WITH a fee line the refund has a mapped line, the fallback is skipped,
+    // and the mapped gross would hold only the fee, so it could never reconcile and would retry for ever with the customer already refunded. IMS does not split that mix: it is QUARANTINED for an operator to record by hand.
+    const hasFeeLine = (wcRefund.fee_lines ?? []).some((feeLine) => parseDecimalAbs(feeLine.total).gt(0.000001) || parseDecimalAbs(feeLine.total_tax).gt(0.000001))
+    const hasAmountOnlyGoods = wcRefund.line_items.some((l) => Math.abs(l.quantity) === 0 && (parseDecimalAbs(l.total).gt(0.000001) || parseDecimalAbs(l.total_tax).gt(0.000001)))
+    if (hasFeeLine && hasAmountOnlyGoods) {
+      const error = withLedgerCheck(`WooCommerce refund ${wcRefund.id} mixes an amount-only goods refund (money returned on a line with no quantity) with a fee refund, which IMS cannot split automatically, so the refund was NOT recorded and nothing was sent to Xero. The money has ALREADY been returned in the storefront (refund ${wcRefund.id}) - do NOT issue another storefront refund. ${REFUND_PARK_MANUAL_RESOLUTION_HINT}`)
+      await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: error, payload: wcRefund })
+      await writeActivity({
+        entityType: 'SALES_ORDER',
+        entityId: so.id,
+        action: 'refund_sync_amount_only_goods_with_fee',
+        tag: 'sync',
+        level: 'WARNING',
+        description: error,
+        metadata: { externalRefundId: wcRefund.id },
+        resolveUser: false,
+      })
+      return { outcome: 'quarantined-refusal', error }
+    }
+
+    const refundedFeeLines = (wcRefund.fee_lines ?? [])
+      .filter((feeLine) => parseDecimalAbs(feeLine.total).gt(0.000001) || parseDecimalAbs(feeLine.total_tax).gt(0.000001))
+    if (refundedFeeLines.length > 0) {
+      const matched = matchRefundedFeeLines(refundedFeeLines, so.lines)
+      const unmatched = refundedFeeLines.filter((_, index) => matched[index] === null)
+      // EVERY mapped fee line that adds to the gross must reach the refund write, whose line filter keeps a line only if it has a quantity or a positive base net. A fee with tax but no net (or a net that rounds to zero in base) would be counted in
+      // the gross and then dropped, leaving the credit note short by its tax, so it is quarantined like an unmatched fee. (Net with no tax is kept by the filter, so it is not a problem.)
+      const unwritable = refundedFeeLines.filter((feeLine, index) => matched[index] !== null && !(divideRoundedNumber(parseDecimalAbs(feeLine.total), fxRate, 4) > 0))
+      if (unmatched.length > 0 || unwritable.length > 0) {
+        const describe = (feeLine: (typeof refundedFeeLines)[number]) => `"${feeLine.name ?? '(unnamed)'}" (${parseDecimalAbs(feeLine.total).toFixed(2)} net, ${parseDecimalAbs(feeLine.total_tax).toFixed(2)} tax)`
+        const parts: string[] = []
+        if (unmatched.length > 0) parts.push(`refunds fee ${unmatched.map(describe).join(', ')} that IMS cannot match to exactly one fee line on the original order (it matches by name, and only when no other fee on the order has that name)`)
+        if (unwritable.length > 0) parts.push(`refunds fee ${unwritable.map(describe).join(', ')}: a fee refund carrying tax but no net cannot be recorded automatically`)
+        const error = withLedgerCheck(`WooCommerce refund ${wcRefund.id} ${parts.join(' and ')}, so the refund was NOT recorded and nothing was sent to Xero. Record the refund manually from the order, crediting that fee line.`)
+        await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: error, payload: wcRefund })
+        await writeActivity({
+          entityType: 'SALES_ORDER',
+          entityId: so.id,
+          action: 'refund_sync_fee_line_unmatched',
+          tag: 'sync',
+          level: 'WARNING',
+          description: error,
+          metadata: { externalRefundId: wcRefund.id },
+          resolveUser: false,
+        })
+        return { outcome: 'quarantined-refusal', error }
+      }
+      for (const [index, feeLine] of refundedFeeLines.entries()) {
+        const feeNet = parseDecimalAbs(feeLine.total)
+        const feeTax = parseDecimalAbs(feeLine.total_tax)
+        mappedGrossForeign = mappedGrossForeign.add(feeNet).add(feeTax)
+        refundLines.push({
+          lineId: matched[index]!,
+          productId: null,
+          description: feeLine.name || 'Fee refund',
+          qty: 0,
+          totalForeign: roundDecimalNumber(feeNet, 4),
+          totalBase: divideRoundedNumber(feeNet, fxRate, 4),
+          lineKind: 'sale',
+          chargedTaxForeign: roundDecimalNumber(feeTax, 4),
+        })
+      }
+    }
+
     if (refundLines.length === 0) {
       // Monetary-only refund (no line items / shipping to break down): the money returned to the customer
       // is GROSS (tax-inclusive), but every refund line is stored NET (o3d-w00) — the credit note grosses
@@ -1046,7 +1117,7 @@ export async function syncWcRefund(
         refundLines.filter((l) => l.qty > 0 || l.totalBase > 0),
         wcRefund.reason || 'WooCommerce refund',
         returnWarehouseId,
-        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id, statedGrossForeign: refundAmountForeign.toNumber(), ...(eas182StatedTaxForeign !== undefined ? { eas182StatedTaxForeign } : {}) },
+        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id, statedGrossForeign: refundAmountForeign.toNumber(), ...(eas182StatedTaxForeign !== undefined ? { eas182StatedTaxForeign } : {}), ...(refundedFeeLines.length > 0 ? { enforcePerTargetBalances: true } : {}) },
       )
     } catch (error) {
       if (!isExternalRefundIdUniqueConflict(error)) throw error
