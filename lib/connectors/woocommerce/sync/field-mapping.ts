@@ -4,6 +4,7 @@
 
 import { db } from '@/lib/db'
 import { getFxRateToBase as getFxRateToBaseFromTable, isMissingFxRateError, MissingFxRateError } from '@/lib/currencies/fx-lookup'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { logActivity } from '@/lib/activity-log'
 import { currencyMinorUnits, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
@@ -518,14 +519,28 @@ type ResolvedTaxRate = {
  * Making it LOUD is the part that needs no opinion — a wrong number nobody can see is strictly
  * worse than a wrong number on the exceptions dashboard.
  */
+/**
+ * SIDE-EFFECT-FREE TAX RESOLUTION, for the EU VAT shadow report only. Inside `collectingUnmappedWcRates` a WooCommerce rate id with no mapping is NOT logged to the activity log: it is recorded in the
+ * collector and the caller decides (the shadow build refuses the order as `unmapped_tax_rate`, never falling back silently). Outside it, nothing changes: the substitution is still logged loudly.
+ */
+const unmappedRateCollector = new AsyncLocalStorage<{ unmapped: Set<number> }>()
+
+export async function collectingUnmappedWcRates<T>(fn: () => Promise<T>): Promise<{ result: T; unmapped: number[] }> {
+  const collector = { unmapped: new Set<number>() }
+  const result = await unmappedRateCollector.run(collector, fn)
+  return { result, unmapped: [...collector.unmapped].sort((a, b) => a - b) }
+}
+
 async function fallbackDefaultTaxRate(unmappedWcRateId: number | null = null): Promise<ResolvedTaxRate> {
+  const collector = unmappedRateCollector.getStore()
+  if (collector && unmappedWcRateId !== null) collector.unmapped.add(unmappedWcRateId)
   const defaultRate = await db.taxRate.findFirst({
     where: { isDefault: true, active: true },
     select: { id: true, name: true, rate: true, accountingTaxType: true, reverseCharge: true },
   })
 
   if (defaultRate) {
-    if (unmappedWcRateId !== null) {
+    if (unmappedWcRateId !== null && !collector) {
       await logActivity({
         entityType: 'SYNC',
         action: 'wc_tax_rate_unmapped',
@@ -557,7 +572,7 @@ async function fallbackDefaultTaxRate(unmappedWcRateId: number | null = null): P
   // No usable default. Returning 0% here is the worst answer available — plausible, and wrong
   // whenever WooCommerce actually charged tax. ERROR (not WARNING) when a real rate went
   // unmapped, because the order carries VAT we have just recorded as zero.
-  if (unmappedWcRateId !== null) {
+  if (unmappedWcRateId !== null && !collector) {
     await logActivity({
       entityType: 'SYNC',
       action: 'wc_tax_rate_unresolvable',

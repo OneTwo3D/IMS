@@ -9,7 +9,8 @@
  * paired with the closest unmatched one on the other side so the difference is shown field by field.
  *
  * TAX. IMS sends no TaxAmount (Xero computes it), so the expected tax of a line is its net times the effective rate of its TaxType, to the minor unit, using the rates the caller supplies. A tax figure
- * or total is accepted within `toleranceMinor` minor units per taxed line (Xero rounds per line), and an unknown rate means the tax of that line is NOT compared and the report says so: nothing is guessed.
+ * or total is accepted within `toleranceMinor` minor units per taxed line (Xero rounds per line). MATCH MEANS FULLY COMPARED: an unknown rate, a Xero line with no TaxAmount, or an unavailable total on either side makes the
+ * order `not_comparable` (with the reasons), never a match. Nothing is guessed.
  * On the scheme, B2B and fee lines every type is zero-rated or NONE, so the comparison there is exact.
  *
  * BOUNDARY ORDERS (owner ruling Q5). An order whose regime warnings include a threshold-band or adopted-regime difference may legitimately decide differently from the plugin, because IMS converts the goods
@@ -143,7 +144,10 @@ export type VatLineCheck =
   | { present: true; account: string; ims: string; xero: string | null; match: boolean }
 
 export type InvoiceComparison = {
-  verdict: 'match' | 'differs'
+  /** `match` means FULLY compared and equal. `not_comparable`: nothing differs in what could be compared, but a required figure (a tax amount, the expected total or the Xero total) was unavailable, so equality is not established. */
+  verdict: 'match' | 'differs' | 'not_comparable'
+  /** Why a comparison is incomplete (empty for a full one). */
+  incomplete: string[]
   currencyMatch: boolean
   lines: LineRow[]
   vatLine: VatLineCheck
@@ -215,8 +219,18 @@ export function compareComparableInvoices(ims: ComparableInvoice, xero: Comparab
   if (vatLine.present && !vatLine.match) differences.push(`VAT line on ${vatLine.account}: IMS ${vatLine.ims}, Xero ${vatLine.xero ?? 'none'}`)
   if (!totalMatch) differences.push(`total: IMS ${ims.total}, Xero ${xero.total}`)
 
+  // MATCH MEANS FULLY COMPARED. A figure that was not available is never read as equal.
+  const incomplete: string[] = []
+  const unknownRates = new Set<string>()
+  ims.lines.forEach((line) => { if (line.taxAmount === null) unknownRates.add(line.taxType) })
+  if (unknownRates.size > 0) incomplete.push(`the tax rate of ${[...unknownRates].sort().join(', ')} is not known, so the tax amount was not compared`)
+  if (xero.lines.some((line) => line.taxAmount === null)) incomplete.push('a Xero line carries no TaxAmount')
+  if (ims.total === null) incomplete.push('IMS cannot state the expected total')
+  if (xero.total === null) incomplete.push('the Xero invoice carries no Total')
+
   return {
-    verdict: differences.length === 0 ? 'match' : 'differs',
+    verdict: differences.length > 0 ? 'differs' : incomplete.length > 0 ? 'not_comparable' : 'match',
+    incomplete,
     currencyMatch,
     lines: rows,
     vatLine,
@@ -235,7 +249,8 @@ export function isBoundaryOrder(warnings: ReadonlyArray<{ code: string }>): bool
 }
 
 /** The status of a compared order: a boundary order that differs is `review`; one that matches is `match`. */
-export function statusOfComparison(comparison: InvoiceComparison, boundary: boolean): 'match' | 'differs' | 'review' {
+export function statusOfComparison(comparison: InvoiceComparison, boundary: boolean): 'match' | 'differs' | 'review' | 'not_comparable' {
   if (comparison.verdict === 'match') return 'match'
+  if (comparison.verdict === 'not_comparable') return 'not_comparable'
   return boundary ? 'review' : 'differs'
 }

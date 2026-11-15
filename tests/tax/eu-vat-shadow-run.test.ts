@@ -5,7 +5,6 @@ import { readFileSync } from 'node:fs'
 import type { ComparableInvoice } from '../../lib/domain/accounting/eu-vat-shadow-compare'
 import { parseEuVatShadowArgs, renderEuVatShadowText, euVatShadowJson, renderEuVatShadowUsage } from '../../lib/tax/eu-vat-shadow-cli'
 import { runEuVatShadow, shadowExitCode, SHADOW_HARD_MAX_ORDERS, type ShadowImsBuild, type ShadowPorts, type ShadowXeroFetch } from '../../lib/tax/eu-vat-shadow-run'
-import { closedCodeOf } from '../../lib/tax/eu-vat-shadow-live'
 import { runEuVatShadowCli } from '../../scripts/eu-vat-shadow-report'
 
 /**
@@ -144,17 +143,26 @@ test('the command refuses without --live-read and never reaches a port; with it,
   assert.equal(await runEuVatShadowCli({ ...base, uid: 1234, checkoutOwnerUid: 1, argv: ['--live-read', '--orders', '1'] }), 3)
 })
 
-test('a vendor error becomes a closed code: never its text', () => {
-  assert.equal(closedCodeOf('WC API error: 401 {"auth":"abc123"} ?auth=secret', 'x'), 'http_401')
-  assert.equal(closedCodeOf('something went wrong with token=zzz', 'unreadable'), 'unreadable')
-  assert.equal(closedCodeOf(undefined, 'unreadable'), 'unreadable')
+test('an expired Xero token is not_comparable with the instruction, never a match; the exit code is non-zero', async () => {
+  const report = await runEuVatShadow(ports({ '1': { xero: { kind: 'error', code: 'xero_token_expired' } }, '2': { xero: { kind: 'error', code: 'xero_token_expired' } } }), { selection: { kind: 'orders', refs: ['x'] }, maxOrders: 5 })
+  assert.deepEqual(report.counts, { match: 0, differs: 0, review: 0, no_xero_doc: 0, ims_refused: 0, not_comparable: 2 })
+  assert.match(report.results[0]!.detail ?? '', /Xero access token expired; open IMS Sync once to refresh, then rerun/)
+  assert.equal(shadowExitCode(report), 1)
+})
+
+test('an order whose comparison is incomplete (a figure unavailable) is not_comparable with the reasons, and the exit code is 1', async () => {
+  const noTotalXero = { ...xeroFor(), Total: undefined }
+  const report = await runEuVatShadow(ports({ '1': { xero: { kind: 'found', invoice: noTotalXero } } }), { selection: { kind: 'orders', refs: ['x'] }, maxOrders: 5 })
+  assert.equal(report.results[0]!.status, 'not_comparable')
+  assert.match(report.results[0]!.detail ?? '', /not fully compared: .*no Total/)
+  assert.equal(shadowExitCode(report), 1)
 })
 
 /**
  * THE SHADOW PATH CALLS ONLY READS. The sources of every function it runs are scanned for a write: a queue, an outbox, a stamp, a setting, a log entry, a POST/PUT, a create/update/upsert/delete.
  */
 const FORBIDDEN = [
-  /\bxeroPost\b/, /\bxeroPut\b/, /\bwcPost\b/, /\bwcPut\b/, /\bpushSalesInvoice\b/, /\bupdateSalesInvoice\b/, /\bqueueAccounting\w*/, /\bstampEuVatRegime\b/, /\btreatImportedSalesInvoice\b/,
+  /\bxeroPost\b/, /\bxeroPut\b/, /\bxeroGet\b/, /\bwcFetch\b/, /\bgetAccessToken\b/, /\brefreshToken\b/, /\bgetWcCredentials\b/, /\bgetSettingValues?\b/, /\bxeroPost\b/, /\bwcPost\b/, /\bwcPut\b/, /\bpushSalesInvoice\b/, /\bupdateSalesInvoice\b/, /\bqueueAccounting\w*/, /\bstampEuVatRegime\b/, /\btreatImportedSalesInvoice\b/,
   /\blogActivity\w*/, /\bsetSetting\w*/, /\.\s*(create|createMany|update|updateMany|upsert|delete|deleteMany)\s*\(/, /\$executeRaw/, /\$transaction/, /\brecordWcTaxBinding\b/,
 ]
 function sliceFunction(source: string, signature: string): string {
@@ -165,7 +173,7 @@ function sliceFunction(source: string, signature: string): string {
 }
 
 test('the shadow files and the functions they reach contain no write', () => {
-  const whole = ['lib/tax/eu-vat-shadow-live.ts', 'lib/tax/eu-vat-shadow-run.ts', 'lib/tax/eu-vat-shadow-cli.ts', 'lib/domain/accounting/eu-vat-shadow-compare.ts', 'scripts/eu-vat-shadow-report.ts']
+  const whole = ['lib/tax/eu-vat-shadow-live.ts', 'lib/tax/eu-vat-shadow-http.ts', 'lib/tax/eu-vat-shadow-run.ts', 'lib/tax/eu-vat-shadow-cli.ts', 'lib/domain/accounting/eu-vat-shadow-compare.ts', 'scripts/eu-vat-shadow-report.ts']
   for (const file of whole) {
     const source = readFileSync(new URL(`../../${file}`, import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
     for (const pattern of FORBIDDEN) assert.equal(pattern.test(source), false, `${file} matches ${pattern}`)
@@ -175,6 +183,9 @@ test('the shadow files and the functions they reach contain no write', () => {
     const body = sliceFunction(importer, signature).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
     for (const pattern of FORBIDDEN) assert.equal(pattern.test(body), false, `${signature} matches ${pattern}`)
   }
+  const shadowBody = sliceFunction(importer, 'export async function buildShadowWcSalesInvoice(')
+  assert.match(shadowBody, /collectingUnmappedWcRates\(/, 'the shadow build resolves tax inside the side-effect-free collector')
+  assert.match(shadowBody, /unmapped_tax_rate/, 'an unmapped rate refuses the order as unmapped_tax_rate')
   const treatment = readFileSync(new URL('../../lib/connectors/woocommerce/sync/eu-vat-invoice-treatment.ts', import.meta.url), 'utf8')
   const preview = sliceFunction(treatment, 'export async function previewTreatedSalesInvoice(').replace(/Parameters<typeof treatImportedSalesInvoice>/g, '').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
   for (const pattern of FORBIDDEN) assert.equal(pattern.test(preview), false, `previewTreatedSalesInvoice matches ${pattern}`)

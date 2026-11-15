@@ -34,7 +34,7 @@ import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from 
 import type { WcFullOrder, SyncResult } from './types'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems,
-  mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, getFxRateToBase, isMissingFxRateError,
+  mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, collectingUnmappedWcRates, getFxRateToBase, isMissingFxRateError,
   readWcCustomerVat, resolveWcOrderLevelDiscount,
   type MappedLine,
 } from './field-mapping'
@@ -2180,7 +2180,9 @@ export async function buildShadowWcSalesInvoice(orderId: string, wcOrder: WcFull
   }
   const chart = prep.inputs.settings.connector
   if (chart !== 'xero') return { kind: 'refused', reason: 'the accounting connector is not Xero, so no Xero document would be built' }
-  const built = await buildFreshWcSalesInvoice({ client: db as unknown as Prisma.TransactionClient, orderId, wcOrder, inputs: prep.inputs, chart, withTreatment: true, shadow: true })
+  // The tax resolution runs inside the collector: an unmapped WooCommerce rate is recorded, not logged, and the order is refused rather than built on the default rate's substitution.
+  const { result: built, unmapped } = await collectingUnmappedWcRates(() => buildFreshWcSalesInvoice({ client: db as unknown as Prisma.TransactionClient, orderId, wcOrder, inputs: prep.inputs, chart, withTreatment: true, shadow: true }))
+  if (unmapped.length > 0) return { kind: 'refused', reason: `unmapped_tax_rate: WooCommerce tax rate ${unmapped.join(', ')} is not mapped to an IMS tax rate, so IMS would substitute the default rate; the order is not built` }
   if (!built.ok) return { kind: 'refused', reason: built.reason }
   return { kind: 'built', payload: built.payload, warnings: built.warnings ?? [], stampSource: built.stampSource ?? 'none', chartConnector: chart }
 }

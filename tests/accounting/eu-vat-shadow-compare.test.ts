@@ -116,12 +116,32 @@ test('a different total differs even when every line matches', () => {
   assert.ok(comparison.differences.some((d) => d.startsWith('total:')))
 })
 
-test('an unknown tax rate means the tax of that line is NOT compared and says so; the amounts still are', () => {
-  const { comparison, mine } = compare(xeroPlugin(), (type) => (type === 'TAX131' ? null : rateOf(type)))
-  assert.equal(comparison.verdict, 'match')
-  assert.equal(mine.total, null)
-  assert.equal(comparison.total.compared, false)
-  assert.ok(comparison.lines.some((row) => row.taxNotCompared))
+test('MATCH MEANS FULLY COMPARED: an unknown rate, a missing Xero TaxAmount or an unavailable total is not_comparable with the reason, never a match', () => {
+  const unknownRate = compare(xeroPlugin(), (type) => (type === 'TAX131' ? null : rateOf(type)))
+  assert.equal(unknownRate.comparison.verdict, 'not_comparable')
+  assert.equal(unknownRate.mine.total, null)
+  assert.ok(unknownRate.comparison.incomplete.some((r) => r.includes('TAX131')))
+  assert.ok(unknownRate.comparison.incomplete.some((r) => r.includes('expected total')))
+  assert.equal(statusOfComparison(unknownRate.comparison, false), 'not_comparable')
+  assert.equal(statusOfComparison(unknownRate.comparison, true), 'not_comparable', 'a boundary order that could not be compared is not a review either')
+
+  const noTax = xeroPlugin()
+  const withoutTaxAmount = { ...noTax, LineItems: noTax.LineItems.map((l, i) => (i === 0 ? { AccountCode: l.AccountCode, TaxType: l.TaxType, LineAmount: l.LineAmount } : l)) }
+  assert.equal(compare(withoutTaxAmount).comparison.verdict, 'not_comparable')
+  assert.ok(compare(withoutTaxAmount).comparison.incomplete.some((r) => r.includes('no TaxAmount')))
+
+  const { Total: _total, ...withoutTotal } = xeroPlugin()
+  void _total
+  const noTotal = compare(withoutTotal).comparison
+  assert.equal(noTotal.verdict, 'not_comparable')
+  assert.equal(noTotal.total.compared, false)
+  assert.ok(noTotal.incomplete.some((r) => r.includes('no Total')))
+})
+
+test('a real difference still wins over an incomplete comparison', () => {
+  const { comparison } = compare(xeroPlugin({ goodsType: 'TAX132' }), (type) => (type === 'NONE' ? null : rateOf(type)))
+  assert.equal(comparison.verdict, 'differs')
+  assert.ok(comparison.incomplete.length > 0)
 })
 
 test('a boundary-FX order that differs is REVIEW, never differs; one that matches is match', () => {

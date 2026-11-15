@@ -68,6 +68,13 @@ export type ShadowReport = {
   counts: Record<ShadowStatus, number>
 }
 
+/** What to do about a closed code, said in IMS's own words. */
+const CODE_HINTS: Record<string, string> = {
+  xero_token_expired: 'Xero access token expired; open IMS Sync once to refresh, then rerun',
+  xero_not_connected: 'Xero is not connected',
+  xero_tenant_blocked: 'the stored Xero connection is refused by the tenant guard',
+}
+
 const emptyCounts = (): Record<ShadowStatus, number> => ({ match: 0, differs: 0, review: 0, no_xero_doc: 0, ims_refused: 0, not_comparable: 0 })
 
 const blank = (orderNumber: string, status: ShadowStatus, detail: string | null): ShadowOrderResult => ({
@@ -109,7 +116,7 @@ async function runOne(ports: ShadowPorts, ref: ShadowOrderRef): Promise<ShadowOr
   const fetched = await ports.fetchXeroInvoice(loaded.wc.invoiceNumber.trim())
   if (fetched.kind === 'none') return { ...base, status: 'no_xero_doc', detail: 'Xero holds no sales invoice under this order’s number' }
   if (fetched.kind === 'ambiguous') return { ...base, status: 'not_comparable', detail: `Xero holds ${fetched.count} documents under this order’s number, so none can be chosen` }
-  if (fetched.kind === 'error') return { ...base, status: 'not_comparable', detail: `the Xero invoice could not be read (${fetched.code})` }
+  if (fetched.kind === 'error') return { ...base, status: 'not_comparable', detail: `the Xero invoice could not be read (${fetched.code})${CODE_HINTS[fetched.code] ? `: ${CODE_HINTS[fetched.code]}` : ''}` }
 
   const reading = comparableFromXeroInvoice(fetched.invoice)
   if (!reading.ok) return { ...base, status: 'not_comparable', detail: reading.reason }
@@ -117,7 +124,7 @@ async function runOne(ports: ShadowPorts, ref: ShadowOrderRef): Promise<ShadowOr
 
   const comparison = compareComparableInvoices(built.invoice, reading.invoice)
   const status = statusOfComparison(comparison, boundary)
-  return { ...base, status, xeroStatus: reading.status, comparison }
+  return { ...base, status, xeroStatus: reading.status, comparison, detail: status === 'not_comparable' ? `not fully compared: ${comparison.incomplete.join('; ')}` : null }
 }
 
 /** The exit code of a finished report: 0 only when every order matched; 1 when anything differs, needs review (boundary), was refused by IMS, has no Xero document or could not be compared, or the selection was cut short or not fully resolved. A `review` order is accepted by a person, not by the exit code. */

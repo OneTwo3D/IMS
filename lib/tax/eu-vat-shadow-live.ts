@@ -2,35 +2,27 @@
  * THE LIVE PORTS OF THE EU VAT SHADOW REPORT (npm run eu-vat:shadow --live-read). Read only, end to end:
  *
  *   IMS         `shoppingOrderLink.findMany`, the stored Xero tax-rate list, the importer's `buildShadowWcSalesInvoice` (which reads and never writes) and the pure Xero payload builder.
- *   WooCommerce ONE `GET /orders/{id}` per order through `wcFetch` (which has no write verb).
- *   Xero        the invoice-number lookup (`lookupInvoiceDocumentClaims`, a GET) and ONE `GET /Invoices/{id}` through `xeroGet`.
+ *   WooCommerce ONE `GET /orders/{id}` per order through `wcReadOnlyGetOrder` (eu-vat-shadow-http.ts: stored credentials read without migrate-on-read; no write path).
+ *   Xero        the invoice-number lookup and ONE `GET /Invoices/{id}` through `xeroReadOnlyGet`, with the stored token ONLY IF IT HAS NOT EXPIRED: it never refreshes (a refresh is a POST and a database write), logs or notifies.
  *
- * Nothing here calls `pushSalesInvoice`, a queue function, `stampEuVatRegime`, `treatImportedSalesInvoice`, `logActivity`, `xeroPost`, `xeroPut`, `wcPost` or `wcPut`. What a vendor says is reduced to a closed code before
+ * Nothing here calls `pushSalesInvoice`, a queue function, `stampEuVatRegime`, `treatImportedSalesInvoice`, `logActivity`, `xeroPost`, `xeroPut`, `wcPost`, `wcPut`, `xeroGet`, `wcFetch` or `getAccessToken` (the clients that can refresh a token or re-encrypt a setting). What a vendor says is reduced to a closed code before
  * it leaves this file (an HTTP status or a fixed word): a response body, a header or an error text is never returned, so no credential or token that a vendor echoed can reach the output.
  */
 import { db } from '@/lib/db'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
-import { wcFetch } from '@/lib/connectors/woocommerce/api'
 import { buildShadowWcSalesInvoice } from '@/lib/connectors/woocommerce/sync/order-import'
 import { resolveWcAccountingInvoiceNumber } from '@/lib/connectors/woocommerce/sync/invoice-number'
 import type { WcFullOrder } from '@/lib/connectors/woocommerce/sync/types'
-import { xeroGet } from '@/lib/connectors/xero/api'
-import { lookupInvoiceDocumentClaims } from '@/lib/connectors/xero/invoice-document-source'
 import { buildSalesInvoicePayload, isXeroSalesDocumentTaxTypeError } from '@/lib/connectors/xero/invoices'
 import { isXeroForeignCurrencyRateError } from '@/lib/connectors/xero/fx'
 import { EU_VAT_TREATMENT_PAYLOAD_KEY } from '@/lib/domain/accounting/eu-vat-treatment'
 import { comparableFromBuiltPayload } from '@/lib/domain/accounting/eu-vat-shadow-compare'
 import { readStoredXeroList, type Client } from '@/lib/tax/purchase-tax-import'
 import type { InvoiceData } from '@/lib/connectors/types'
+import { readShadowWcCredentials, readShadowXeroGrant, wcReadOnlyGetOrder, xeroReadOnlyGet } from '@/lib/tax/eu-vat-shadow-http'
 import type { ShadowImsBuild, ShadowOrderRef, ShadowPorts, ShadowSelection, ShadowXeroFetch } from '@/lib/tax/eu-vat-shadow-run'
 
 const GUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
-
-/** An HTTP status out of the connectors' error strings (`WC API error: 404 ...`, `Xero ... 404`), or a fixed word. Never the text. */
-export function closedCodeOf(error: string | undefined, fallback: string): string {
-  const status = /\b([1-5]\d{2})\b/.exec(error ?? '')
-  return status ? `http_${status[1]}` : fallback
-}
 
 /** The effective rate of every type in the stored Xero list, or null when the list cannot be relied on (the tax of such lines is then not compared). */
 async function loadRateTable(now: Date): Promise<(taxType: string) => number | null> {
@@ -71,9 +63,11 @@ export async function createLiveShadowPorts(now: Date = new Date()): Promise<Sha
     },
 
     async loadWcOrder(ref) {
-      if (!/^\d{1,12}$/.test(ref.externalOrderId)) return { ok: false, code: 'bad_external_id' }
-      const result = await wcFetch(`/orders/${ref.externalOrderId}`)
-      if (result.error || result.data === null || typeof result.data !== 'object') return { ok: false, code: closedCodeOf(result.error, 'unreadable') }
+      const creds = await readShadowWcCredentials()
+      if (!creds.ok) return { ok: false, code: creds.code }
+      const result = await wcReadOnlyGetOrder(creds, ref.externalOrderId)
+      if (!result.ok) return { ok: false, code: result.code }
+      if (result.data === null || typeof result.data !== 'object') return { ok: false, code: 'unreadable' }
       const order = result.data as WcFullOrder
       const destination = (order.shipping?.country || order.billing?.country || '').trim() || null
       const number = resolveWcAccountingInvoiceNumber(order)
@@ -109,15 +103,22 @@ export async function createLiveShadowPorts(now: Date = new Date()): Promise<Sha
     },
 
     async fetchXeroInvoice(invoiceNumber): Promise<ShadowXeroFetch> {
-      const claims = await lookupInvoiceDocumentClaims(invoiceNumber)
-      if (!claims.ok) return { kind: 'error', code: claims.stop ? 'ledger_unavailable' : claims.unaskable ? 'number_not_askable' : 'lookup_failed' }
-      if (claims.claims.length === 0) return { kind: 'none' }
-      if (claims.claims.length > 1) return { kind: 'ambiguous', count: claims.claims.length }
-      const id = claims.claims[0]!.documentId
-      if (!GUID.test(id)) return { kind: 'error', code: 'bad_document_id' }
-      const response = await xeroGet<{ Invoices?: unknown[] }>(`/Invoices/${id}`)
-      if (!response.ok) return { kind: 'error', code: closedCodeOf(response.error, `http_${response.status}`) }
-      const invoice = response.data?.Invoices?.[0]
+      // FAIL CLOSED: an expired, missing or blocked token is never refreshed here.
+      const grant = await readShadowXeroGrant(new Date())
+      if (!grant.ok) return { kind: 'error', code: grant.code }
+      if (!/^[A-Za-z0-9._/# -]{1,64}$/.test(invoiceNumber)) return { kind: 'error', code: 'number_not_askable' }
+      const listed = await xeroReadOnlyGet(grant, `Invoices?InvoiceNumbers=${encodeURIComponent(invoiceNumber)}&summaryOnly=true`)
+      if (!listed.ok) return { kind: 'error', code: listed.code }
+      const rows = (listed.data as { Invoices?: Array<{ InvoiceID?: unknown; Type?: unknown }> } | null)?.Invoices
+      if (!Array.isArray(rows)) return { kind: 'error', code: 'unreadable' }
+      const sales = rows.filter((row) => row.Type === 'ACCREC')
+      if (sales.length === 0) return { kind: 'none' }
+      if (sales.length > 1) return { kind: 'ambiguous', count: sales.length }
+      const id = sales[0]!.InvoiceID
+      if (typeof id !== 'string' || !GUID.test(id)) return { kind: 'error', code: 'bad_document_id' }
+      const fetched = await xeroReadOnlyGet(grant, `Invoices/${id}`)
+      if (!fetched.ok) return { kind: 'error', code: fetched.code }
+      const invoice = (fetched.data as { Invoices?: unknown[] } | null)?.Invoices?.[0]
       return invoice === undefined ? { kind: 'none' } : { kind: 'found', invoice }
     },
   }
