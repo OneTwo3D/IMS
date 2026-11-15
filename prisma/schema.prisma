@@ -2500,6 +2500,8 @@ model SalesOrderRefundLine {
   postingTaxType   String?  @map("posting_tax_type")
   /// The VAT rate (a fraction, 0.19 = 19%) the line was priced at when the refund was created, frozen with the posting type so an accounting retry never re-prices it from a TaxRate that has since changed. Written under the same conditions as `postingTaxType`; NULL when the line's rate could not be priced then, and on every older row.
   schemeTaxRateValue Decimal? @db.Decimal(9, 6) @map("scheme_tax_rate_value")
+  /// The VAT the source STATED it returned on this line (a WooCommerce refund states it per refunded line), in the order's currency. NULL when nothing was stated (a manual refund) and on every older row. Read only by the per-target refund balance, which holds a fee line's cumulative refunded VAT to the VAT the order line bore.
+  chargedTaxForeign Decimal? @db.Decimal(18, 4) @map("charged_tax_foreign")
 
   refund          SalesOrderRefund @relation(fields: [refundId], references: [id])
   salesOrderLine  SalesOrderLine?  @relation(fields: [salesOrderLineId], references: [id], onDelete: SetNull)

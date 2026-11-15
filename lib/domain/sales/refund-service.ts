@@ -3783,6 +3783,7 @@ export async function createSalesOrderRefund(
           select: {
             id: true,
             productId: true,
+            externalLineItemId: true,
             description: true,
             qty: true,
             totalForeign: true,
@@ -4406,7 +4407,7 @@ export async function createSalesOrderRefund(
 
     const existingRefundLines = await tx.salesOrderRefundLine.findMany({
       where: { refund: { orderId: input.orderId } },
-      select: { productId: true, qty: true, salesOrderLineId: true, lineKind: true, totalForeign: true, accountingTaxType: true },
+      select: { productId: true, qty: true, salesOrderLineId: true, lineKind: true, totalForeign: true, accountingTaxType: true, chargedTaxForeign: true },
     })
 
     // THE CURRENCY THE CREDIT NOTE POSTS IN. The ceiling above sums BASE; a foreign-currency credit note posts the FOREIGN column. So a public refund's
@@ -4467,7 +4468,10 @@ export async function createSalesOrderRefund(
           // The stored NET foreign amount — the same basis the order's line totals and any prior refund
           // lines are held in. Derived from base only when the caller did not supply it.
           netForeign: refundLine.totalForeign ?? Math.round(refundLine.totalBase * fxRate * 10000) / 10000,
+          taxForeign: refundLine.chargedTaxForeign ?? null,
         })),
+        // A FEE line's cumulative refunded VAT is held to the VAT the fee bore, as its net is held to its net (a rate-182 refund skips the per-line VAT fence below, and its order-wide bound cannot see one fee's share). A fee is an order line with no product and no storefront item id (the importer's shape).
+        taxCappedLineIds: new Set(so.lines.filter((line) => line.productId === null && line.externalLineItemId === null).map((line) => line.id)),
       })
       if (overAllocated) {
         // `quarantine`: a storefront refund that over-credits a fee (or any capped target) is parked for an operator, never retried blindly.
@@ -4976,6 +4980,7 @@ export async function createSalesOrderRefund(
           accountingTaxType: taxIdentity.accountingTaxType,
           reverseCharge: taxIdentity.reverseCharge,
           lineKind,
+          ...(refundLine.chargedTaxForeign != null && Number.isFinite(refundLine.chargedTaxForeign) ? { chargedTaxForeign: Math.round(Math.abs(refundLine.chargedTaxForeign) * 10000) / 10000 } : {}),
           ...(schemeSnapshot?.scheme === true ? { postingTaxType: schemeSnapshot.postingTaxType, schemeTaxRateValue: frozenRates?.[refundLineIndex] ?? null } : {}),
         },
         select: {

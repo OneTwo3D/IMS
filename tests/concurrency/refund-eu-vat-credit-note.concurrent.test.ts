@@ -920,3 +920,19 @@ test('[eu vat credit note] a partial refund of an unmarked UNTAXED fee (no produ
   const lines = outcome.payload.lines as Array<{ description: string; accountCode: string; taxType: string; noTaxKind?: string }>
   assert.deepEqual(lines.slice(0, 2).map((l) => [l.description, l.accountCode, l.taxType, l.noTaxKind ?? null]), [['Widget', '200', 'TAX131', null], ['Plain fee', '200', 'NONE', 'fee-no-tax']])
 })
+
+test('[eu vat credit note] rate-182 refunds of ONE fee: its cumulative refunded VAT is capped at the VAT the fee bore, under the writer\'s lock; the one over the remainder is quarantined, the one equal to it is recorded (o3d-k26m.14)', { skip }, async (t) => {
+  const { deps, fx } = await prepared(t, { stamp: 'IOSS', schemeRate: true })
+  // feeA: 20.00 net + 3.80 VAT on an order with 21.66 more VAT on its other lines. 182 refunds state their own tax.
+  const refundFee = (net: number, tax: number) => deps.createRefund(fx.orderId, [itemised(fx.feeA, 'EU Customs Fee', net, tax)], 'fee', undefined, { internalBypassToken: deps.bypass, externalRefundId: wooRefundId(), statedGrossForeign: net + tax, eas182StatedTaxForeign: tax, enforcePerTargetBalances: true })
+  const first = await refundFee(10, 3.0)
+  assert.equal(first.success, true, first.error)
+  const over = await refundFee(5, 1.0) // the fee has 0.80 of VAT left; its net (10 left) fits
+  assert.equal(over.success, false)
+  assert.equal(over.quarantine, true, 'parked for an operator, not retried')
+  assert.match(over.error ?? '', /VAT refunded on EU Customs Fee \(1\.00\) is more than it has left to refund \(0\.80 of the 3\.80 it bore, after earlier refunds\)/)
+  const exact = await refundFee(5, 0.8)
+  assert.equal(exact.success, true, exact.error)
+  const stored = await deps.db.salesOrderRefundLine.findMany({ where: { salesOrderLineId: fx.feeA }, select: { chargedTaxForeign: true }, orderBy: { id: 'asc' } })
+  assert.deepEqual(stored.map((l) => Number(l.chargedTaxForeign)).sort(), [0.8, 3])
+})
