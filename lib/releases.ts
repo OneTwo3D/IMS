@@ -14,6 +14,22 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
+    version: '4.3.0',
+    date: '2026-11-15',
+    title: 'WooCommerce webhooks no longer move the sweep cursor',
+    summary: 'Nothing in 4.3.0 needs an operator action on upgrade. A delivered WooCommerce order or product webhook no longer moves the sweep position, so an older order or product whose webhook was missed is still picked up by the next sweep. The Sync page "Last order intake" and "Last product intake" now show the last sweep position rather than the last webhook. The EU VAT pieces behind the Sales Invoices switch remain built, switched off.',
+    userMessage: 'IMS 4.3 makes the WooCommerce sweep more reliable: an order or product whose webhook was missed is no longer skipped because a later webhook arrived.',
+    userHighlights: [
+      'WooCommerce: an order or product whose webhook was missed is still picked up by the next sweep, even if a later webhook for another order arrived first.',
+      'Sync page: "Last order intake" and "Last product intake" now show where the last sweep read up to, not when the last webhook arrived.',
+    ],
+    technicalHighlights: [
+      'Webhooks write wc_order_webhook_last_processed_at and wc_product_webhook_last_processed_at instead of last_wc_order_sync_at and last_wc_product_sync_at; only a clean sweep moves the sweep cursors. Both new keys are cleared by the operator reset. No migration.',
+      'Webhook-primary mode: a clean reconcile carries its position to the poll cursor (atomic max, in the same locked commit), only when its status list covers the poll list and the carry would not widen the stored poll fingerprint. The initial import writes that fingerprint with the cursor, in one transaction, from the status list it started with.',
+      'Accepted limits: after a status is added in webhook-primary mode, reconciles do not carry until a poll has run, so a very large backlog (over 100,000 changed orders) could reach the page-walk ceiling on the first poll. On a legacy install with no fingerprint, the first carry cannot recover a status widening made before it. Both are filed as follow-ups.',
+    ],
+  },
+  {
     version: '4.2.0',
     date: '2026-11-14',
     title: 'Gift-card answers for unsettled order lines, safer WooCommerce sweep cursors, held-invoice sweep failures now visible',

@@ -10,6 +10,8 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+## 4.3.0 - 2026-11-15
+
 ### WooCommerce webhooks no longer move the sweep cursor (backend / sync)
 
 - **Fixed: a delivered webhook could hide an older missed order or product from the sweep for good.** In poll mode every admitted order webhook stamped `last_wc_order_sync_at` to now, and every successful product webhook stamped `last_wc_product_sync_at` to now. If order A changed and its webhook was missed, then order B's webhook arrived, the cursor jumped past A and the next sweep asked WooCommerce for changes after it, so A was never read. The sweep now owns both cursors: only a sweep that ended cleanly on an empty page writes them (read-start less 120 seconds, never backwards). A webhook writes its own stamps instead, `wc_order_webhook_last_processed_at` and `wc_product_webhook_last_processed_at`, which nothing reads as a sweep position.
