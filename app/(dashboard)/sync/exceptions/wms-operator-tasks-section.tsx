@@ -50,7 +50,7 @@ export function WmsOperatorTasksSection({ data }: { data: WmsOperatorTaskPage })
       <div>
         <h2 className="text-sm font-semibold">{`Raise a warehouse query (${total})`}</h2>
         <p className="text-xs text-muted-foreground">
-          IMS no longer writes notes on warehouse orders: the warehouse does not read them and a query cannot be raised from IMS. For each task, raise a query in the warehouse's own system with the text below, then press Done.
+          IMS no longer writes notes on warehouse orders: the warehouse does not read them and a query cannot be raised from IMS. For each task, raise a query in the warehouse&apos;s own system with the text below, then press Done.
           Your name and the time are recorded. A partial-removal task is checked first: Done is refused until every listed line is gone from the warehouse order.
         </p>
       </div>
