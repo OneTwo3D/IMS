@@ -1498,7 +1498,8 @@ test('[eu vat] the poster refuses a treated payload whose recorded regime policy
 
 test('[eu vat] BOTH sales-invoice posting cases call the poster gate before anything is sent', () => {
   const src = readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8')
-  assert.equal((src.match(/await euSchemePostingRefusal\(payload as Record<string, unknown>\)/g) ?? []).length, 2, 'SALES_INVOICE and SALES_INVOICE_UPDATE')
+  assert.equal((src.match(/await euSchemePostingRefusal\(payload as Record<string, unknown>(, new Date\(\), 'update')?\)/g) ?? []).length, 2, 'SALES_INVOICE and SALES_INVOICE_UPDATE')
+  assert.equal((src.match(/await euSchemePostingRefusal\(payload as Record<string, unknown>, new Date\(\), 'update'\)/g) ?? []).length, 1, 'the UPDATE case says it is an update, so its refusal names the remedy for an invoice already in Xero')
   const hold = src.indexOf('await holdInvoiceOnRegimePolicyChange({ attempt, held: lease')
   assert.ok(hold > 0 && hold < src.indexOf('await euSchemePostingRefusal(payload as Record<string, unknown>)'), 'the SALES_INVOICE create supersedes a policy-changed invoice into a held invoice before the refusal gate')
 })
