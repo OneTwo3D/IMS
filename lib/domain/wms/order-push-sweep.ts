@@ -3379,22 +3379,38 @@ export async function runWmsOrderPushSweepCore(
       if (ctx === undefined) continue
       // A link or order that is gone (a reset, a deletion), an erased order, or a link that is another order's is never posted for. The
       // link's CURRENT warehouse order is NOT compared for an OWED obligation: owed means the removal was verified on THIS obligation's
-      // warehouse order, so its note belongs there even if the link has since been re-pointed. An INTENDED one for an order the link no
-      // longer names was never verified (the removal did not run on, or cannot be tied to, the current order): stale, dropped.
+      // warehouse order, so its note belongs there even if the link has since been re-pointed. An INTENDED one is settled by a read of its
+      // OWN warehouse order's lines (below), never dropped blind.
       const gone = ctx === null || ctx.orderId !== ob.orderId || ctx.erased
-      const staleIntended = ob.state === 'intended' && ctx !== null && ctx.externalOrderId !== ob.externalOrderId
-      if (gone || staleIntended) {
-        console.error(`[wms-order-push] dropping removal note obligation for link ${ob.linkId}: ${gone ? 'its link or order is gone, erased or no longer the same order (reset, deletion, erasure)' : 'it was only intended for a warehouse order the link no longer names'}; nothing is posted`)
+      if (gone) {
+        console.error(`[wms-order-push] dropping removal note obligation for link ${ob.linkId}: its link or order is gone, erased or no longer the same order (reset, deletion, erasure); nothing is posted`)
         await port.clearRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId).catch(() => {})
         continue
       }
       let current = ob
       if (ob.state === 'intended') {
+        // The same read-only lines-gone check, against the obligation's OWN warehouse order (the snapshot's), whether or not the link
+        // still names it.
         const lines = connector.fetchOrderItemRefs ? await connector.fetchOrderItemRefs(ob.externalOrderId).catch(() => null) : null
-        const confirmedGone = lines !== null && !ob.items.some((item) => lines.some((line) => line.externalItemId === item.externalItemId))
+        const present = lines === null ? null : ob.items.filter((item) => lines.some((line) => line.externalItemId === item.externalItemId)).length
+        const confirmedGone = present === 0
+        const repointed = ctx.externalOrderId !== ob.externalOrderId
         if (confirmedGone) {
           if (!(await port.updateRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId, { state: 'owed' }).catch(() => false))) continue
           current = { ...ob, state: 'owed' }
+        } else if (repointed) {
+          // The link was re-pointed away from the warehouse order this obligation was recorded for. NEVER dropped blind: every line still
+          // there = the removal never ran on it (stale, dropped); anything else (some gone, or the read failed / is unavailable) = it may have
+          // run (a crash after the deletes), so it goes to an operator.
+          if (present === ob.items.length) {
+            console.error(`[wms-order-push] dropping removal note obligation for link ${ob.linkId}: the link was re-pointed and every recorded line is still on WMS order ${ob.externalOrderId} (the removal never ran); nothing is posted`)
+            await port.clearRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId).catch(() => {})
+          } else {
+            await markRemovalNoteNeedsCheck(ob, present === null
+              ? 'the link was re-pointed after an interrupted removal and the recorded warehouse order\'s lines could not be read to tell whether the removal ran'
+              : 'the link was re-pointed after an interrupted removal and only some of the recorded lines are still on the warehouse order')
+          }
+          continue
         } else {
           if (lines !== null && !ctx.cancellable) await port.clearRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId).catch(() => {})
           continue

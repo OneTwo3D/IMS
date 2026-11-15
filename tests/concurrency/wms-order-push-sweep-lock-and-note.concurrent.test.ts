@@ -236,3 +236,57 @@ test('real database: the link is re-pointed after the removal is verified and be
   assert.equal(mine().length, 1, 'never again')
   assert.equal(await db.setting.count({ where: { key: { endsWith: `${link.id}:${orig}` } } }), 0, 'the original order\'s obligation is cleared')
 })
+
+test('real database: crash after the deletes, lease expiry, the REAL dispatch re-point, then the retry: the note posts ONCE to the original warehouse order', SKIP, async (t) => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const { createPrismaWmsOrderPushPort, runWmsOrderPushSweepCore } = await import('@/lib/domain/wms/order-push-sweep')
+  const { createPrismaDispatchDeps } = await import('@/lib/domain/wms/dispatch-sweep')
+  const { randomUUID } = await import('node:crypto')
+  const id = `crash${randomUUID().slice(0, 8)}`
+  const orig = `surv-${id}`
+  let linkId = ''
+  t.after(async () => {
+    if (linkId) await db.setting.deleteMany({ where: { key: { startsWith: `wms_order_push_removal_note:mintsoft:${linkId}:` } } })
+    await db.salesOrder.deleteMany({ where: { id } })
+  })
+  await db.salesOrder.create({ data: { id, orderNumber: `IMSTEST-${id}`, status: 'CANCELLED', currency: 'GBP', subtotalForeign: 100, totalForeign: 100, subtotalBase: 100, totalBase: 100 } })
+  const link = await db.wmsOrderPushLink.create({ data: { orderId: id, connector: 'mintsoft', state: 'MERGED', externalOrderId: orig, externalOrderNumber: 'MS-A+MS-B' } })
+  linkId = link.id
+  await db.wmsOrderPushItem.create({ data: { linkId, externalOrderId: orig, externalItemId: '601', sku: 'SKU-C', quantity: 1 } })
+
+  const posted: Array<{ id: string; comment: string }> = []
+  const lines = new Set(['601'])
+  let crash = true
+  const connector = {
+    pushOrder: async () => { throw new Error('not used') },
+    cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }),
+    removeOrderItems: async (target: string, _e: unknown, items: Array<{ externalItemId: string }>) => {
+      if (target !== orig) return { kind: 'REFUSED' as const, removed: [], remaining: [], reason: 'lines are not on this order' }
+      for (const item of items) lines.delete(item.externalItemId) // the Mintsoft deletes succeed...
+      if (crash) { crash = false; throw new Error('worker crashed before recording the removal') } // ...and the worker dies
+      return { kind: 'REMOVED' as const, removed: items as never }
+    },
+    cancelMergedOrder: async () => { throw new Error('not used') },
+    fetchOrderItemRefs: async (target: string) => (target === orig ? [...lines].map((externalItemId) => ({ externalItemId, sku: 'SKU-C', quantity: 1 })) : []),
+    addOrderComment: async (target: string, comment: string) => { posted.push({ id: target, comment }) },
+  }
+  const run = () => runWmsOrderPushSweepCore(connector as never, 'mintsoft', createPrismaWmsOrderPushPort(), { batchSize: 50 })
+
+  await run()
+  assert.equal(posted.length, 0)
+  assert.equal(lines.size, 0, 'the deletes went through')
+  assert.equal(await db.setting.count({ where: { key: { endsWith: `${linkId}:${orig}` } } }), 1, 'the obligation survived as intended')
+  // The lease expires (the crashed worker never released it); the dispatch sweep's real re-point now succeeds.
+  await db.wmsOrderPushLink.update({ where: { id: linkId }, data: { amendLeaseOwner: 'dead', amendLeaseExpiresAt: new Date(Date.now() - 1000) } })
+  const moved = await createPrismaDispatchDeps('mintsoft', {} as never).repointLink(linkId, { externalOrderId: 'new-warehouse-order', externalOrderNumber: 'MS-N' }, { externalOrderId: orig })
+  assert.equal(moved, true)
+
+  await run()
+  const mine = () => posted.filter((p) => p.id === orig && p.comment.startsWith('[IMS removal-note'))
+  assert.equal(mine().length, 1, 'the verified note posted once, to the original order')
+  assert.equal(posted.filter((p) => p.id === 'new-warehouse-order' && p.comment.startsWith('[IMS removal-note')).length, 0)
+  await run()
+  assert.equal(mine().length, 1, 'never again')
+  assert.equal(await db.setting.count({ where: { key: { endsWith: `${linkId}:${orig}` } } }), 0, 'cleared')
+})

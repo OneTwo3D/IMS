@@ -587,15 +587,51 @@ test('REPOINTED LINK, OWED note for the OLD warehouse order (its removal was VER
   })
 })
 
-test('REPOINTED LINK, only INTENDED for the old warehouse order (never verified): dropped, nothing posted to it, the current order processed normally', async () => {
+test('REPOINTED LINK, INTENDED for the old warehouse order: lines ALL STILL THERE = the removal never ran, dropped; ALL GONE = verified, promoted and the note posts ONCE to that order; SOME gone or an UNREADABLE read = needs_check, never dropped or posted', async () => {
+  const cases: Array<{ name: string; oldLines: FakeLine[] | null; expect: 'dropped' | 'posted' | 'needs_check' }> = [
+    { name: 'all present', oldLines: [...D_LINES], expect: 'dropped' },
+    { name: 'all absent', oldLines: [...E_LINES], expect: 'posted' },
+    { name: 'partial', oldLines: [D_LINES[0], ...E_LINES], expect: 'needs_check' },
+    { name: 'unreadable (the order cannot be read)', oldLines: null, expect: 'needs_check' },
+  ]
+  for (const c of cases) {
+    await withEnv(OFF, async () => {
+      seedMerged()
+      if (c.oldLines) fake.orders.set(OLD_ORDER, { status: 9, number: 'OLD', items: c.oldLines, merged: true })
+      const h = makePort({ cancellable: [], items: storedD })
+      h.removalNotes.set('', staleOb('intended'))
+      h.noteContext.cancellable = false
+      const result = await sweep(h.port)
+      const toOld = fake.comments.filter((x) => x.id === OLD_ORDER)
+      const stored = h.removalNotes.get(`link-d|${OLD_ORDER}`)
+      if (c.expect === 'dropped') { assert.equal(stored, undefined, c.name); assert.equal(toOld.length, 0, c.name) }
+      if (c.expect === 'posted') { assert.equal(toOld.length, 1, c.name); assert.match(toOld[0].comment, /^\[IMS removal-note link-d-old1\] /); assert.equal(stored, undefined, c.name) }
+      if (c.expect === 'needs_check') { assert.equal(stored?.state, 'needs_check', c.name); assert.equal(toOld.length, 0, c.name); assert.equal(result.removalNoteNeedsCheck, 1, c.name) }
+      assert.deepEqual(deletedIds(), [], `${c.name}: the retry pass deletes nothing`)
+    })
+  }
+})
+
+test('SEQUENCE: crash after the deletes, the link is re-pointed, then the retry: the note posts ONCE to the ORIGINAL warehouse order', async () => {
   await withEnv(OFF, async () => {
     seedMerged()
     const h = makePort({ cancellable: [mergedLinkRef()], items: storedD })
-    h.removalNotes.set('', staleOb('intended'))
+    const real = h.port.updateRemovalNote!
+    let failed = false
+    h.port.updateRemovalNote = async (c, l, e, patch) => { if (!failed && patch.state === 'owed') { failed = true; throw new Error('crash after the deletes') } return real(c, l, e, patch) }
     await sweep(h.port)
-    assert.equal(fake.comments.filter((c) => c.id === OLD_ORDER).length, 0)
-    assert.equal(h.removalNotes.get(`link-d|${OLD_ORDER}`), undefined, 'dropped')
     assert.deepEqual(deletedIds(), ['3603106', '3603107'])
+    assert.equal(h.removalNotes.get('link-d')?.state, 'intended')
+    // lease expires, dispatch re-points the link
+    h.link.externalOrderId = 'new-warehouse-order'
+    h.noteContext.external = 'new-warehouse-order'
+    h.port.cancellableLinks = async () => []
+    await sweep(h.port)
+    assert.equal(fake.comments.length, 1, 'posted once')
+    assert.equal(fake.comments[0].id, SURVIVOR, 'to the original order')
+    assert.match(fake.comments[0].comment, /^\[IMS removal-note link-d-ob1\] /)
+    await sweep(h.port)
+    assert.equal(fake.comments.length, 1)
   })
 })
 
