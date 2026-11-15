@@ -88,7 +88,9 @@ export async function createLiveShadowPorts(now: Date = new Date()): Promise<Sha
       let built: Record<string, unknown>
       try {
         // THE REAL BUILDER, the one every Xero sales invoice goes through. A contact id and a draft status stand in for the two things only a real post has; nothing is sent.
-        built = buildSalesInvoicePayload({ ...(payload as unknown as InvoiceData), invoiceNumber: wc.invoiceNumber ?? 'SHADOW', contactName: 'shadow' }, 'DRAFT', 'shadow-contact', new Set<string>(), baseCurrency)
+        // The builder never reads the contact (it takes a ContactID), and this report never holds one: the placeholder is a constant, not a customer's name.
+        const contactName = 'shadow'
+        built = buildSalesInvoicePayload({ ...(payload as unknown as InvoiceData), invoiceNumber: wc.invoiceNumber ?? 'SHADOW', contactName }, 'DRAFT', 'shadow-contact', new Set<string>(), baseCurrency)
       } catch (error) {
         if (isXeroForeignCurrencyRateError(error) || isXeroSalesDocumentTaxTypeError(error)) return { kind: 'refused', reason: error.message }
         return { kind: 'refused', reason: 'the invoice builder failed on this order' }
