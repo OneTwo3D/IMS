@@ -416,6 +416,14 @@ test('CLI: argument and environment hardening, exit codes, --json', async () => 
   out.length = 0
   assert.equal(await runVatDiffCli({ ...common, argv: [], deps: deps(wooPort(baseline().woo.map(asApi))) }), 0)
   assert.match(out.join('\n'), /No differences/)
+  // For the IOSS and VOEC schemes "no differences" is about rate configuration only, and the report says so and names the command that reads posted documents.
+  assert.match(out.join('\n'), /Scope: rate configuration only\. No posted document was read.*npm run eu-vat:shadow/)
+  out.length = 0
+  assert.equal(await runVatDiffCli({ ...common, argv: ['--scheme', 'ioss'], deps: deps(wooPort(baseline().woo.map(asApi))) }), 0)
+  assert.match(out.join('\n'), /Scope: rate configuration only/)
+  out.length = 0
+  assert.equal(await runVatDiffCli({ ...common, argv: ['--scheme', 'uk'], deps: deps(wooPort(baseline().woo.map(asApi))) }), 0)
+  assert.doesNotMatch(out.join('\n'), /Scope: rate configuration only/, 'a UK-only run is not about the EU schemes')
   assert.equal(await runVatDiffCli({ ...common, argv: [], deps: deps(wooPort([], { fail: true })) }), 2)
   assert.equal(await runVatDiffCli({ ...common, argv: [], uid: 1234, deps: deps(wooPort([])) }), 3)
   assert.equal(await runVatDiffCli({ ...common, argv: [], env: { PATH: '/bin' }, deps: deps(wooPort([])) }), 3)

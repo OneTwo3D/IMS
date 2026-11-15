@@ -347,3 +347,14 @@ export function routeFor(
   }
 }
 
+
+/**
+ * The stamp an UNSTAMPED order would receive, built in memory from a fresh decision and NEVER written (the EU VAT shadow report: the Sales Invoices switch is off, so no order has been stamped yet).
+ * Mirrors what `stampEuVatRegime` records for the same decision (the regime and VAT account of a SCHEME, none for a SKIP, the zero-rated type of the scheme), so `routeFor` takes the same route it
+ * would after a real stamp. A refusal gives null: it stamps nothing in the real path either.
+ */
+export function provisionalStampFromDecision(decision: EuVatRegimeDecision, at: Date): StampedRegime | null {
+  if (decision.kind === 'REFUSE') return null
+  if (decision.kind === 'SKIP') return { regime: null, vatAccount: null, stampedAt: at }
+  return { regime: decision.regime, vatAccount: decision.vatAccount, stampedAt: at, schemePostingTaxType: decision.schemePostingTaxType }
+}

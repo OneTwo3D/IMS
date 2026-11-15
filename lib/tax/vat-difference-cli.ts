@@ -9,6 +9,7 @@ import { VAT_DIFFERENCE_REASONS, VAT_DIFFERENCE_REASON_LIST, type VatDifference,
 import { VAT_SCHEMES, VAT_SCHEME_TITLES, type VatScheme, type VatSchemeBucket } from '@/lib/tax/vat-scheme'
 
 export const VAT_DIFF_COMMAND = 'npm run vat:diff'
+const EU_VAT_SHADOW_COMMAND = 'npm run eu-vat:shadow'
 
 export const VAT_DIFF_EXIT_CODES = [
   { code: 0, name: 'no-differences', meaning: 'All three systems were read and proven, and they use the same set of VAT rates.' },
@@ -121,5 +122,7 @@ export function renderVatDiffText(report: VatDifferenceReport, selection: VatSch
     for (const difference of section.differences) lines.push(renderRow(difference))
   }
   if (selectedBuckets(selection).every((bucket) => report.schemes[bucket].differences.length === 0)) lines.push('', 'No differences: the selected schemes use the same set of VAT rates in all three systems.')
+  // This report compares RATE CONFIGURATION only; it never reads a posted document. For the IOSS and VOEC schemes "no differences" therefore says nothing about how an order's invoice is posted.
+  if (selection === 'all' || selection === 'ioss' || selection === 'voec') lines.push('', `Scope: rate configuration only. No posted document was read, so this says nothing about how IOSS, VOEC or DDP orders are posted: compare real invoices with ${EU_VAT_SHADOW_COMMAND}.`)
   return lines.join('\n')
 }

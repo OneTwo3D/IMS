@@ -21,7 +21,7 @@ import { resolveEuVatRegime, type RegimeWarning } from '@/lib/domain/accounting/
 import { readEuVatRegimeStamp, stampEuVatRegime } from '@/lib/domain/accounting/eu-vat-regime-stamp'
 import type { Prisma } from '@/app/generated/prisma/client'
 import {
-  applyEuVatTreatment, EU_VAT_TREATMENT_PAYLOAD_KEY, lineKindsOf, routeFor, type EuVatTreatmentPlan, type TreatablePayload,
+  applyEuVatTreatment, EU_VAT_TREATMENT_PAYLOAD_KEY, lineKindsOf, provisionalStampFromDecision, routeFor, type EuVatTreatmentPlan, type TreatablePayload,
 } from '@/lib/domain/accounting/eu-vat-treatment'
 import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
 import { currentWcTaxBinding, recordWcTaxBinding, type InvoiceTaxTypesInput, type WcTaxBinding } from './wc-tax-binding'
@@ -59,7 +59,7 @@ export type TreatedInvoiceOutcome =
   /** Nothing was read or written: the switch is off, the connector is not Xero, or the order carries store credit. */
   | { kind: 'skipped'; why: 'switch_off' | 'store_credit' | 'unreconciled' }
   /** The payload with the treatment applied, and what it did. */
-  | { kind: 'treated'; payload: Record<string, unknown>; warnings: RegimeWarning[]; /** The order's tax binding as it was when the treatment ran (recorded in the marker). */ taxBinding: WcTaxBinding; /** The regime settings the decision was made under, from the one read (recorded on the hold). */ regimePolicy: RegimePolicy }
+  | { kind: 'treated'; payload: Record<string, unknown>; warnings: RegimeWarning[]; /** Preview only: whether the stamp used was the order's own or an in-memory decision. Absent for the importer. */ stampSource?: 'stored' | 'provisional'; /** The order's tax binding as it was when the treatment ran (recorded in the marker). */ taxBinding: WcTaxBinding; /** The regime settings the decision was made under, from the one read (recorded on the hold). */ regimePolicy: RegimePolicy }
   /** The order cannot be invoiced as it is: the reason is the operator-facing sentence the document is stamped with. */
   | { kind: 'refused'; reason: string; /** The store ids of the lines whose gift-card flag is unsettled, when that is why (an operator can answer for them). */ giftCardLineIds?: number[] }
 
@@ -122,7 +122,7 @@ export async function treatImportedSalesInvoice(params: {
 }
 
 /** The route, the plan and the pure treatment, from a stamp already in hand: shared by the import (which stamps) and the held-invoice preview (which only reads the stamp). */
-async function completeTreatment(params: Parameters<typeof treatImportedSalesInvoice>[0], stamp: Parameters<typeof routeFor>[0], decision: Parameters<typeof routeFor>[1], input: Parameters<typeof routeFor>[2], warnings: RegimeWarning[], taxBinding: WcTaxBinding, policy: RegimePolicy): Promise<TreatedInvoiceOutcome> {
+async function completeTreatment(params: Parameters<typeof treatImportedSalesInvoice>[0], stamp: Parameters<typeof routeFor>[0], decision: Parameters<typeof routeFor>[1], input: Parameters<typeof routeFor>[2], warnings: RegimeWarning[], taxBinding: WcTaxBinding, policy: RegimePolicy, stampSource?: 'stored' | 'provisional'): Promise<TreatedInvoiceOutcome> {
   const routed = routeFor(stamp, decision, input)
   if (!routed.ok) return { kind: 'refused', reason: routed.reason }
 
@@ -139,7 +139,7 @@ async function completeTreatment(params: Parameters<typeof treatImportedSalesInv
   const treated = applyEuVatTreatment(params.payload as TreatablePayload, plan)
   if (!treated.ok) return { kind: 'refused', reason: treated.reason }
   // An order the treatment left exactly as it was (no scheme, no B2B, no fee) keeps its payload byte for byte.
-  if (treated.applied.route === 'none' && treated.applied.feesRecoded === 0) return { kind: 'treated', payload: params.payload, warnings, taxBinding, regimePolicy: policy }
+  if (treated.applied.route === 'none' && treated.applied.feesRecoded === 0) return { kind: 'treated', payload: params.payload, warnings, taxBinding, regimePolicy: policy, ...(stampSource ? { stampSource } : {}) }
   return {
     kind: 'treated',
     payload: {
@@ -161,6 +161,7 @@ async function completeTreatment(params: Parameters<typeof treatImportedSalesInv
     warnings,
     taxBinding,
     regimePolicy: policy,
+    ...(stampSource ? { stampSource } : {}),
   }
 }
 
@@ -168,16 +169,32 @@ async function completeTreatment(params: Parameters<typeof treatImportedSalesInv
  * THE TREATMENT AS IT WOULD BE APPLIED NOW, WRITING NOTHING: the same mode, regime input, route and pure treatment as `treatImportedSalesInvoice`, but the order's EXISTING stamp is read (through `client`) instead of written, and is used only if it still agrees
  * with the fresh decision (`routeFor` refuses otherwise). A held invoice is compared with this before it is released.
  */
-export async function previewTreatedSalesInvoice(client: Prisma.TransactionClient, params: Parameters<typeof treatImportedSalesInvoice>[0]): Promise<TreatedInvoiceOutcome> {
-  const { isAccountingSyncTypeEnabledFor } = await import('@/lib/accounting')
-  if (params.connector !== 'xero' || !(await isAccountingSyncTypeEnabledFor(params.connector, 'SALES_INVOICE'))) return { kind: 'skipped', why: 'switch_off' }
+export async function previewTreatedSalesInvoice(
+  client: Prisma.TransactionClient,
+  params: Parameters<typeof treatImportedSalesInvoice>[0],
+  /**
+   * SHADOW ONLY (the EU VAT shadow report). `assumeSwitchOn` skips the Sales Invoices switch for this call, in memory: the setting is not read and not changed. `provisionalStamp` decides an UNSTAMPED order's regime in memory from the fresh decision
+   * (`provisionalStampFromDecision`) and never writes it; an order that has a stamp is still built through its own stamp. Both default off, so the held-invoice check is unchanged.
+   */
+  options?: { assumeSwitchOn?: boolean; provisionalStamp?: boolean },
+): Promise<TreatedInvoiceOutcome> {
+  if (options?.assumeSwitchOn !== true) {
+    const { isAccountingSyncTypeEnabledFor } = await import('@/lib/accounting')
+    if (params.connector !== 'xero' || !(await isAccountingSyncTypeEnabledFor(params.connector, 'SALES_INVOICE'))) return { kind: 'skipped', why: 'switch_off' }
+  } else if (params.connector !== 'xero') return { kind: 'skipped', why: 'switch_off' }
   if (params.storeCreditForeign.gt(0)) return { kind: 'skipped', why: 'store_credit' }
   if (EU_UNRECONCILED_KEY in params.payload) return { kind: 'skipped', why: 'unreconciled' }
   const taxBinding = await currentWcTaxBinding(params.wcOrder, params.mappedLines, params.taxBindingDeps)
   const read = await readRegimeInputOnce(client, params.wcOrder, params.accounts)
   if (!read.ok) return { kind: 'refused', reason: read.reason }
   const { input, policy } = read
-  const stamp = await readEuVatRegimeStamp(client, params.orderId)
-  if (stamp === null) return { kind: 'refused', reason: 'the order carries no EU VAT regime stamp' }
-  return completeTreatment(params, stamp, resolveEuVatRegime(input), input, [], taxBinding, policy)
+  const decision = resolveEuVatRegime(input)
+  const stored = await readEuVatRegimeStamp(client, params.orderId)
+  if (stored === null) {
+    if (options?.provisionalStamp !== true) return { kind: 'refused', reason: 'the order carries no EU VAT regime stamp' }
+    const provisional = provisionalStampFromDecision(decision, params.now)
+    if (provisional === null) return { kind: 'refused', reason: decision.kind === 'REFUSE' ? `the order's EU VAT regime cannot be established (${decision.code}): ${decision.reason}` : 'the order carries no EU VAT regime stamp' }
+    return completeTreatment(params, provisional, decision, input, decision.kind === 'REFUSE' ? [] : decision.warnings, taxBinding, policy, 'provisional')
+  }
+  return completeTreatment(params, stored, decision, input, options?.provisionalStamp === true && decision.kind !== 'REFUSE' ? decision.warnings : [], taxBinding, policy, options?.provisionalStamp === true ? 'stored' : undefined)
 }

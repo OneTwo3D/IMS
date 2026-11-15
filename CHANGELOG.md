@@ -10,6 +10,13 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### EU IOSS / VOEC / DDP shadow comparison report and go-live runbook (backend / ops)
+
+- **New, read-only: `npm run eu-vat:shadow -- --live-read ...`.** For chosen EU orders (IMS order ids or numbers, or a date range, with a hard cap) it builds, in memory, the sales invoice IMS would post, using the importer's own build and the real Xero payload builder with the EU treatment forced on for that build only, and compares it with the invoice Xero holds: per line (account code, TaxType, line amount, tax amount), the VAT line and the total. It prints a per-order table and a summary (match, differs, review, no Xero doc, IMS refused with the reason, not comparable). A boundary-FX order that differs is `review`, not `differs`. The Xero and WooCommerce reads are GETs behind injectable ports; the comparator is pure. It refuses to run without `--live-read`, never changes the Sales Invoices switch or any setting, and never enqueues, writes, posts or stamps. Only the order number and the compared figures are printed. Built, switched off: nothing runs it automatically, and running it against live Xero is the owner's call.
+- **Refactor, no behaviour change.** The held-invoice check's fresh build is now a shared function (`buildFreshWcSalesInvoice`, with `readFreshWcInvoiceInputs`), and `previewTreatedSalesInvoice` takes optional shadow-only options (`assumeSwitchOn`, `provisionalStamp`) that default off. An unstamped order is decided in memory by the new pure `provisionalStampFromDecision` and is never stamped.
+- **Fixed: the VAT difference report said "No differences" for `--scheme ioss` and `voec`** although it compares rate configuration only. It now ends with a scope line saying no posted document was read and naming `npm run eu-vat:shadow`.
+- **Docs:** the EU go-live runbook (preflight, the shadow report and its acceptance bar, the order of switching over, the gift-card flag cut-in on IMS 4.2.0 or later, the first rate-182 credit-note hold, rollback) is in `help-docs/xero-sync.md`. No migration.
+
 ## 4.3.0 - 2026-11-15
 
 ### WooCommerce webhooks no longer move the sweep cursor (backend / sync)
