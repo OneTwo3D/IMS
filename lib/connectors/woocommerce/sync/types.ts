@@ -164,7 +164,8 @@ export type WcRefund = {
   meta_data: WcMeta[]
   line_items: WcRefundLineItem[]
   shipping_lines?: WcShippingLine[]
-  fee_lines?: { taxes?: { id: number; total: string }[] }[]
+  /** A refunded fee: WooCommerce reports its net and tax negative, like the other refund lines. */
+  fee_lines?: { id?: number; name?: string; total?: string; total_tax?: string; taxes?: { id: number; total: string }[]; meta_data?: WcMeta[] }[]
 }
 
 export type WcFullProduct = {

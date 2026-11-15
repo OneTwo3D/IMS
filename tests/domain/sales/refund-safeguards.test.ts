@@ -30,3 +30,17 @@ test('the action and the order read use the shared definitions', () => {
   assert.match(actions, /postedNet: creditFactsByRefund\.get\(r\.id\)!\[index\]\.postedNet/)
   assert.match(actions, /vatRate: creditFactsByRefund\.get\(r\.id\)!\[index\]\.vatRate/)
 })
+
+test('[fee VAT cap] a fee line\'s cumulative refunded VAT is held to the VAT it bore; prior lines with no stated VAT count at the line\'s own rate; goods lines and unrequested lines are not VAT-capped', () => {
+  const order = { shippingForeign: 0, lines: [{ id: 'fee', description: 'Fee', totalForeign: 10, taxForeign: 2 }, { id: 'goods', description: 'Goods', totalForeign: 10, taxForeign: 2 }] }
+  const over = (prior: Array<{ salesOrderLineId: string; totalForeign: number; chargedTaxForeign?: number | null }>, allocation: { lineId: string; netForeign: number; taxForeign: number | null }, capped = true) =>
+    findOverAllocatedRefundTarget({ order, priorRefundLines: prior.map((p) => ({ ...p, lineKind: 'sale' })), allocations: [allocation], taxCappedLineIds: capped ? new Set(['fee']) : new Set() })
+  assert.equal(over([{ salesOrderLineId: 'fee', totalForeign: 5, chargedTaxForeign: 1.5 }], { lineId: 'fee', netForeign: 5, taxForeign: 1 })?.kind, 'tax')
+  assert.equal(over([{ salesOrderLineId: 'fee', totalForeign: 5, chargedTaxForeign: 1.5 }], { lineId: 'fee', netForeign: 5, taxForeign: 0.5 }), null, 'exactly the remainder')
+  // an unstated prior half (net 5 of 10 at 2/10) counts 1.00, leaving 1.00
+  assert.equal(over([{ salesOrderLineId: 'fee', totalForeign: 5 }], { lineId: 'fee', netForeign: 5, taxForeign: 1.2 })?.kind, 'tax')
+  assert.equal(over([{ salesOrderLineId: 'fee', totalForeign: 5 }], { lineId: 'fee', netForeign: 5, taxForeign: 1 }), null)
+  assert.equal(over([], { lineId: 'fee', netForeign: 5, taxForeign: null }), null, 'no stated VAT, no VAT cap (the net cap still applies)')
+  assert.equal(over([{ salesOrderLineId: 'goods', totalForeign: 5, chargedTaxForeign: 1.9 }], { lineId: 'goods', netForeign: 5, taxForeign: 1.9 }), null, 'goods are not VAT-capped')
+  assert.equal(over([{ salesOrderLineId: 'fee', totalForeign: 5, chargedTaxForeign: 1.5 }], { lineId: 'fee', netForeign: 5, taxForeign: 1 }, false), null, 'not requested for this line')
+})

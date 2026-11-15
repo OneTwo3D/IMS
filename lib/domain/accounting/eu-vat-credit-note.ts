@@ -20,6 +20,7 @@
  * for a rate-182 refund whose tax figure cannot be read at all.
  */
 import { withLedgerCheck } from './hand-post-instruction'
+import { ledgerStanding, type LedgerStandingRow } from './ledger-standing'
 import { currencyMinorUnits, roundMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { EU_VAT_TREATMENT_PAYLOAD_KEY, predictedUntaxedTotal, type TreatableLine, type TreatablePayload } from './eu-vat-treatment'
 
@@ -132,6 +133,11 @@ export const noStampRefusal = (creditNoteNumber: string): string =>
   withLedgerCheck(`NOTHING WAS SENT. Credit note ${creditNoteNumber} is on an order sold under the EU IOSS/VOEC/DDP scheme, but the order has no recorded VAT regime (it was imported before the Sales Invoices switch was on, or its regime could not be decided), so IMS cannot tell which account its VAT was posted to and will not guess. `
   + `This row is refused and is never sent. Check Xero for credit note ${creditNoteNumber} first. If it is not there, post the credit note by hand in Xero on the same VAT account the order's invoice used (821 for IOSS and VOEC, 232 for DDP) and the zero-rated type of the order's scheme rate. Then record the outcome on this row with the settle action on /sync.`)
 
+/** What the operator reads when a whole-order reversal cannot be proven equal to the invoice it cancels (no readable invoice payload, or its figures differ from the refund's lines). The same refused, settleable row. */
+export const reversalNotProvenRefusal = (creditNoteNumber: string, why: string): string =>
+  withLedgerCheck(`NOTHING WAS SENT. Credit note ${creditNoteNumber} reverses a whole order sold under the EU IOSS/VOEC/DDP scheme, but IMS cannot prove it equals the invoice it cancels: ${why}. IMS will not post a credit note that may differ from the invoice (for example one that misses the invoice's rounding line). `
+  + `This row is refused and is never sent. Check Xero for credit note ${creditNoteNumber} first. If it is not there, open the order's invoice in Xero and post the credit note by hand as an exact copy of it (every line, the VAT line on the stamped account, and any rounding line). Then record the outcome on this row with the settle action on /sync.`)
+
 /** The payload key a REFUSED credit-note row carries: the poster refuses any row holding it, before anything else, so the row can be claimed and shown on /sync and settled by hand but never sent. */
 export const EU_VAT_CREDIT_NOTE_REFUSED_KEY = '_euVatCreditNoteRefused'
 
@@ -159,7 +165,8 @@ export function refusedCreditNoteError(payload: Record<string, unknown>): string
   return typeof marker.reason === 'string' && marker.reason !== '' ? marker.reason : 'NOTHING WAS SENT. This credit note was refused when it was built and is never sent.'
 }
 
-export type CreditNoteLineKind = 'goods' | 'marked-fee'
+/** `untaxed-fee`: an unmarked fee the shop charged no tax on. As on the invoice, it stays on NONE as a `fee-no-tax` line on its own account; it is not a scheme-typed goods line and not moved to the fee account. */
+export type CreditNoteLineKind = 'goods' | 'marked-fee' | 'untaxed-fee'
 
 export type EuVatCreditNotePlan = {
   /** From the order's stamp: never decided again. */
@@ -179,6 +186,8 @@ export type EuVatCreditNotePlan = {
   vatDescription: string
   /** Why the posting type cannot be relied on (unknown, not ACTIVE, not revenue, not exactly 0%, or the stored Xero list cannot prove it), or null. REQUIRED, never defaulted. */
   schemePostingTypeProblem: string | null
+  /** A whole-order reversal only: the rounding line the invoice carried (owner ruling Q7, account 860), reversed at the same signed amount on the same account. Absent or null when the invoice had none. */
+  roundingReversal?: { amount: string; accountCode: string } | null
 }
 
 export type EuVatCreditNoteResult<P extends TreatablePayload> =
@@ -212,7 +221,10 @@ export function applyEuVatCreditNoteTreatment<P extends TreatablePayload>(payloa
   if (plan.schemePostingTypeProblem !== null) return refuse(plan.schemePostingTypeProblem)
 
   // The refund lines were snapshotted together, so they name ONE posting type. A line with none, or two types, is a refund IMS cannot post on a decided type.
-  const types = new Set(plan.linePostingTypes.map((type) => (type ?? '').trim()))
+  // An untaxed fee is not on the scheme type, so its snapshot is not part of the one type the others name (unless it is the only kind of line there is).
+  const typedIndexes = plan.lineKinds.map((kind, index) => (kind === 'untaxed-fee' ? -1 : index)).filter((index) => index >= 0)
+  const typeIndexes = typedIndexes.length > 0 ? typedIndexes : plan.lineKinds.map((_, index) => index)
+  const types = new Set(typeIndexes.map((index) => (plan.linePostingTypes[index] ?? '').trim()))
   if (types.has('')) return refuse('a refund line has no scheme posting type snapshot (the refund predates the order\'s regime stamp, or the order\'s rates name none), so IMS cannot book it on the scheme\'s zero-rated type')
   if (types.size !== 1) return refuse(`the refund lines name more than one scheme posting type (${[...types].join(', ')})`)
   const schemePostingTaxType = [...types][0]!
@@ -224,6 +236,7 @@ export function applyEuVatCreditNoteTreatment<P extends TreatablePayload>(payloa
     if (plan.lineKinds[index] === 'marked-fee') {
       return { ...withoutBinding(line), accountCode: plan.feeAccount!.trim(), taxType: NO_TAX, noTaxKind: 'fee-no-tax', euFeeMarked: true }
     }
+    if (plan.lineKinds[index] === 'untaxed-fee') return { ...withoutBinding(line), taxType: NO_TAX, noTaxKind: 'fee-no-tax' }
     return { ...withoutBinding(line), taxType: schemePostingTaxType }
   })
 
@@ -246,6 +259,19 @@ export function applyEuVatCreditNoteTreatment<P extends TreatablePayload>(payloa
     const onVatAccount = next.lines.filter((existing) => existing.accountCode.trim() === line.accountCode && existing.noTaxKind !== 'fee-no-tax')
     if (onVatAccount.length > 0) return refuse(`a line other than the VAT line is already posted to the VAT account ${line.accountCode}`)
     next = { ...next, lines: [...next.lines, line] }
+  }
+
+  // The invoice's rounding line, reversed (whole-order reversal only): the same signed amount on the same account, on NONE.
+  if (plan.roundingReversal != null) {
+    const amount = dec(plan.roundingReversal.amount)
+    if (amount === null) return refuse('the invoice\'s rounding amount cannot be read')
+    if (isBlank(plan.roundingReversal.accountCode)) return refuse('the invoice\'s rounding line names no account')
+    if (!amount.isZero()) {
+      next = {
+        ...next,
+        lines: [...next.lines, { description: 'Rounding adjustment reversed', quantity: 1, unitAmount: roundMoney(amount, currency).toNumber(), accountCode: plan.roundingReversal.accountCode.trim(), taxType: NO_TAX, noTaxKind: 'rounding-difference' }],
+      }
+    }
   }
 
   const refundTotal = dec(plan.refundTotal)
@@ -284,4 +310,103 @@ export function refundTaxAndTotal(input: { net: Decimal; pricedTax: Decimal; /**
     return { ok: false, reason: `the refund states ${gross.toString()} ${currency} in all, so ${vat.toString()} of tax over a net of ${net.toString()}, but its lines' own rates give ${roundMoney(pricedTax, currency).toString()}; that is more than rounding explains` }
   }
   return { ok: true, vatAmount: vat.toString(), refundTotal: gross.toString() }
+}
+
+
+/**
+ * THE FIGURES OF A WHOLE-ORDER REVERSAL, DERIVED FROM THE INVOICE PAYLOAD IMS POSTED (or queued to post) AND REQUIRED TO EQUAL IT. Pure.
+ * The invoice's own lines give the VAT (its one `eu-vat-recovery` line) and the rounding line (at most one `rounding-difference` line, owner ruling Q7), and its untaxed total is the amount the reversal must total. The credit note's lines (`net`, what its goods, fee and shipping lines sum to) plus
+ * that VAT plus that rounding must equal the invoice total EXACTLY; if not, or if the invoice cannot be read as a treated scheme invoice in the same currency, it refuses rather than let the credit note differ from the invoice it cancels.
+ */
+export function wholeOrderReversalFigures(input: { invoice: Record<string, unknown> | null; currency: string; net: Decimal }): { ok: true; vatAmount: string; refundTotal: string; rounding: { amount: string; accountCode: string } | null } | { ok: false; reason: string } {
+  const { invoice, currency } = input
+  if (invoice === null) return { ok: false, reason: 'no invoice of IMS\'s for this order carries the EU VAT treatment, so there is no invoice payload to reverse' }
+  const marker = invoice[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown; route?: unknown } | null | undefined
+  if (marker?.applied !== true || marker.route !== 'scheme') return { ok: false, reason: 'the order\'s invoice does not carry the scheme treatment marker' }
+  if (typeof invoice.currency !== 'string' || invoice.currency.trim().toUpperCase() !== currency.trim().toUpperCase()) return { ok: false, reason: `the invoice is in ${String(invoice.currency ?? '(no currency)')} but the credit note is in ${currency}` }
+  if (invoice.lineAmountsIncludeTax === true || !Array.isArray(invoice.lines)) return { ok: false, reason: 'the invoice payload has no readable tax-exclusive lines' }
+  const lines = invoice.lines as TreatableLine[]
+  const vatLines = lines.filter((line) => line.noTaxKind === 'eu-vat-recovery')
+  const roundingLines = lines.filter((line) => line.noTaxKind === 'rounding-difference')
+  if (vatLines.length !== 1) return { ok: false, reason: `the invoice has ${vatLines.length} VAT line(s), not one` }
+  if (roundingLines.length > 1) return { ok: false, reason: `the invoice has ${roundingLines.length} rounding lines, not at most one` }
+  const vat = dec(vatLines[0]!.unitAmount)
+  const quantity = dec(vatLines[0]!.quantity)
+  if (vat === null || quantity === null || !quantity.eq(1)) return { ok: false, reason: 'the invoice\'s VAT line cannot be read' }
+  let rounding: { amount: string; accountCode: string } | null = null
+  let roundingAmount = toDecimal(0)
+  if (roundingLines.length === 1) {
+    const amount = dec(roundingLines[0]!.unitAmount)
+    const roundingQuantity = dec(roundingLines[0]!.quantity)
+    if (amount === null || roundingQuantity === null || !roundingQuantity.eq(1)) return { ok: false, reason: 'the invoice\'s rounding line cannot be read' }
+    const accountCode = String(roundingLines[0]!.accountCode ?? '').trim()
+    if (accountCode === '') return { ok: false, reason: 'the invoice\'s rounding line names no account' }
+    roundingAmount = roundMoney(amount, currency)
+    rounding = { amount: roundingAmount.toString(), accountCode }
+  }
+  const invoiceTotal = predictedUntaxedTotal(invoice as unknown as TreatablePayload)
+  if (invoiceTotal === null) return { ok: false, reason: 'an amount on the invoice cannot be read' }
+  const vatRounded = roundMoney(vat, currency)
+  const reversal = roundMoney(input.net, currency).plus(vatRounded).plus(roundingAmount)
+  if (!reversal.eq(invoiceTotal)) {
+    return { ok: false, reason: `the reversal (lines ${roundMoney(input.net, currency).toString()} + VAT ${vatRounded.toString()} + rounding ${roundingAmount.toString()} = ${reversal.toString()} ${currency}) is not the invoice's total (${invoiceTotal.toString()} ${currency})` }
+  }
+  return { ok: true, vatAmount: vatRounded.toString(), refundTotal: invoiceTotal.toString(), rounding }
+}
+
+
+/**
+ * WHICH INVOICE A WHOLE-ORDER REVERSAL REVERSES: the version that is IN XERO. `rows` are every SALES_INVOICE / SALES_INVOICE_UPDATE row for the order, in any order, newest decided by `createdAt`.
+ * Walking from the newest: a row PROVEN never to have reached the ledger is skipped; the first other row must be a CONFIRMED_POSTED ledger fact (the connector answered with the document), and is the one used.
+ * Anything else first (queued or in-flight work, a failed attempt whose outcome is unknown, an operator's typed id, a shadow) means the newest version's state is unknown, so it refuses: reversing an older version could differ from what Xero holds.
+ */
+export function invoiceToReverse<T extends LedgerStandingRow & { createdAt: Date; payload: unknown }>(rows: readonly T[]): { ok: true; payload: Record<string, unknown> | null } | { ok: false; reason: string } {
+  const newestFirst = [...rows].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+  for (const row of newestFirst) {
+    const standing = ledgerStanding(row)
+    if (standing === 'PROVEN_NOT_POSTED') continue
+    if (standing === 'CONFIRMED_POSTED') return { ok: true, payload: (row.payload ?? null) as Record<string, unknown> | null }
+    return { ok: false, reason: `the newest invoice row for the order (${row.status}, ledger standing ${standing}) is not confirmed as posted to Xero and is not proven never sent, so which invoice version Xero holds is not known` }
+  }
+  return { ok: true, payload: null }
+}
+
+
+/**
+ * A WHOLE-ORDER REVERSAL BOOKS THROUGH THE SAME ACCOUNTS AS THE INVOICE IT CANCELS. Pure. The totals can match while the credit note's goods, shipping and discount lines use the CURRENT account settings and the invoice used the ones in force when it was posted: the money would
+ * then come off different accounts. Both sides are aggregated by (account code, tax type) to net amounts, the invoice's separate shipping and discount amounts counted as the lines they post as, and the VAT line and the rounding line (checked separately) left out. The two must have
+ * the same keys and equal amounts to the minor unit. Returns null when they agree, otherwise a sentence naming the first differing account (keys in sorted order). It never rebuilds a line.
+ */
+export function reversalAccountsDifference(invoice: Record<string, unknown>, creditLines: readonly TreatableLine[], currency: string): string | null {
+  const keyOf = (line: { accountCode?: unknown; taxType?: unknown }) => `${String(line.accountCode ?? '').trim()}\u0000${String(line.taxType ?? '').trim()}`
+  const isExcluded = (line: TreatableLine) => line.noTaxKind === 'eu-vat-recovery' || line.noTaxKind === 'rounding-difference'
+  const add = (map: Map<string, Decimal>, key: string, amount: Decimal) => map.set(key, (map.get(key) ?? toDecimal(0)).plus(amount))
+  const aggregate = (lines: readonly TreatableLine[], extra: Array<{ key: string; amount: Decimal }>): Map<string, Decimal> | null => {
+    const map = new Map<string, Decimal>()
+    for (const line of lines) {
+      if (isExcluded(line)) continue
+      const amount = predictedUntaxedTotal({ currency, lines: [{ ...line, accountCode: line.accountCode }] } as TreatablePayload)
+      if (amount === null) return null
+      add(map, keyOf(line), amount)
+    }
+    for (const entry of extra) add(map, entry.key, entry.amount)
+    return map
+  }
+  const extras: Array<{ key: string; amount: Decimal }> = []
+  const shipping = dec(invoice.shippingAmount)
+  if (shipping !== null && shipping.gt(0) && String(invoice.shippingAccountCode ?? '').trim() !== '') extras.push({ key: keyOf({ accountCode: invoice.shippingAccountCode, taxType: invoice.shippingTaxType }), amount: roundMoney(shipping, currency) })
+  const discount = dec(invoice.discountAmount)
+  if (discount !== null && discount.gt(0) && String(invoice.discountAccountCode ?? '').trim() !== '') extras.push({ key: keyOf({ accountCode: invoice.discountAccountCode, taxType: invoice.discountTaxType }), amount: roundMoney(discount, currency).negated() })
+  const invoiceSide = aggregate((invoice.lines ?? []) as TreatableLine[], extras)
+  const creditSide = aggregate(creditLines, [])
+  if (invoiceSide === null || creditSide === null) return 'a line amount cannot be read, so the accounts of the invoice and the credit note cannot be compared'
+  for (const key of [...new Set([...invoiceSide.keys(), ...creditSide.keys()])].sort()) {
+    const a = roundMoney(invoiceSide.get(key) ?? toDecimal(0), currency)
+    const b = roundMoney(creditSide.get(key) ?? toDecimal(0), currency)
+    if (!a.eq(b)) {
+      const [account, taxType] = key.split('\u0000')
+      return `account ${account || '(none)'} on tax type ${taxType || '(none)'}: the invoice booked ${a.toString()} ${currency} and the credit note would book ${b.toString()} ${currency}, so it would reverse the money through different accounts than the invoice used (an account mapping changed since the invoice was posted)`
+    }
+  }
+  return null
 }
