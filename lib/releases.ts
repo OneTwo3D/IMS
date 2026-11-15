@@ -14,10 +14,26 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
+    version: '4.4.1',
+    date: '2026-11-15',
+    title: 'Warehouse note for removed merged-order lines is no longer lost; order push runs one at a time',
+    summary: 'Backend fix, no migration and no action on upgrade. When IMS removes lines from a merged warehouse order, the note telling the warehouse which lines were removed is now saved before the removal and retried after a clear refusal. A note whose delivery is uncertain, or a removal that stopped part-way, is not retried automatically: the order push heartbeat turns red once and the case waits for an operator. Until the planned screen exists, resolve it in two steps. First, open the warehouse order in Mintsoft and confirm that EVERY line the removal named is gone; if any is still there, the removal stopped part-way, so remove those lines or escalate the cancellation, and leave the IMS record alone until that is done. Only then check the order\'s comments for the note (it starts with [IMS removal-note), add it if it is missing, and ask for the wms_order_push_removal_note setting for that order to be cleared. Two order push runs can no longer overlap. Correction to the 4.4.0 notes: a refund already recorded under the EU VAT scheme, or a held rate-182 credit note, keeps that treatment or hold after the Sales Invoices switch is turned off.',
+    userMessage: 'IMS 4.4.1 makes the note to the warehouse about removed order lines reliable, and stops two order push runs overlapping.',
+    userHighlights: [
+      'Mintsoft: the note naming lines removed from a merged order is no longer lost if IMS stops or the first attempt is clearly refused, and IMS never sends it a second time on its own.',
+      'Mintsoft: if IMS cannot tell whether a note reached the warehouse, the order push heartbeat turns red once and the case waits for an operator to check the warehouse order in Mintsoft, lines first, then the note. There is no screen for these yet; a follow-up is planned, and until then the check is done by hand as described in the summary.',
+    ],
+    technicalHighlights: [
+      'The removal note is a durable obligation stored as a setting per link and warehouse order (ids, SKUs and quantities only): intended before the first remote delete, owed once the removal is verified, needs_check when the outcome is uncertain or the removal was partial. Cleared by the transaction reset; dropped for erased or deleted orders.',
+      'The order push sweep takes a per-connector session advisory lock and answers skipped when another run holds it. The dispatch sweep no longer repoints a link while the push sweep holds its amendment lease.',
+      'Correction to 4.4.0: the EU VAT credit-note treatment reaches new refunds only while the Sales Invoices switch is on; a refund already recorded under the scheme, or a held rate-182 credit note, keeps that treatment or hold after switch-off.',
+    ],
+  },
+  {
     version: '4.4.0',
     date: '2026-11-15',
     title: 'WooCommerce refunds with fees are recorded, safer EU VAT credit notes, EU VAT comparison report',
-    summary: 'Nothing in 4.4.0 needs an operator action on upgrade; the migration (one nullable column on refund lines) applies automatically on deploy. WooCommerce refunds that include a fee are now recorded instead of waiting as pending for ever; any fee refund IMS cannot match safely is quarantined for an operator. The EU VAT credit-note changes are built, switched off: they take effect only once the Sales Invoices switch is on. The new read-only EU VAT comparison report is meant to be run BEFORE that switch is turned on, as the go-live runbook describes.',
+    summary: 'Nothing in 4.4.0 needs an operator action on upgrade; the migration (one nullable column on refund lines) applies automatically on deploy. WooCommerce refunds that include a fee are now recorded instead of waiting as pending for ever; any fee refund IMS cannot match safely is quarantined for an operator. The EU VAT credit-note changes are built, switched off: new refunds get them only while the Sales Invoices switch is on, and a refund already recorded under the scheme, or a held rate-182 credit note, keeps that treatment or hold after the switch is turned off. The new read-only EU VAT comparison report is meant to be run BEFORE that switch is turned on, as the go-live runbook describes.',
     userMessage: 'IMS 4.4 records WooCommerce refunds that include a fee. A fee refund IMS cannot match safely is set aside in the exceptions inbox for an operator, instead of waiting as pending.',
     userHighlights: [
       'WooCommerce refunds that include a fee are now recorded, with the fee matched to the order fee of the same name.',
@@ -25,7 +41,7 @@ export const RELEASES: AppRelease[] = [
     ],
     technicalHighlights: [
       'Migration (additive): nullable column sales_order_refund_lines.charged_tax_foreign, the VAT stated on each refund line; no backfill. Cumulative refunded net and VAT per fee are capped under the refund write order lock.',
-      'Built, switched off (Sales Invoices switch): a whole-order reversal credit note is built from the invoice version Xero has confirmed, reverses its rounding line, must match it account by account, and refuses to a hand-post row otherwise; an unmarked untaxed fee keeps No VAT on its credit note.',
+      'Built, switched off (Sales Invoices switch; a refund already recorded under the scheme keeps its treatment after switch-off): a whole-order reversal credit note is built from the invoice version Xero has confirmed, reverses its rounding line, must match it account by account, and refuses to a hand-post row otherwise; an unmarked untaxed fee keeps No VAT on its credit note.',
       'Available before go-live: npm run eu-vat:shadow -- --live-read --orders <ids> (or --from/--to) compares, read-only, what IMS would send for chosen EU orders with the invoice Xero holds (GETs only; it never refreshes the Xero token or writes anything). Running it on live data is the owner\'s decision. The go-live runbook is in help-docs/xero-sync.md.',
       'The VAT difference report now states, for --scheme ioss/voec, that it compares rate configuration only.',
     ],
