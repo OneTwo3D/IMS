@@ -7,6 +7,7 @@ import {
   applyEuVatCreditNoteTreatment, easRefundRefusal, refusedCreditNoteError, refusedCreditNotePayload, EAS_REFUND_TAX_RATE_ID, noStampRefusal, refundTaxAndTotal, refundTaxOnEasRate, refundStatedTax, eas182RefundFigures, refund182HeldRefusal, wholeOrderReversalFigures, reversalNotProvenRefusal, invoiceToReverse, reversalAccountsDifference,
   type CreditNoteLineKind, type EuVatCreditNotePlan,
 } from '../../lib/domain/accounting/eu-vat-credit-note'
+import { storedLineKindOf, isStoredUntaxedFee } from '../../lib/domain/accounting/eu-vat-treatment'
 import { findSalesDocumentTaxTypeProblems } from '../../lib/domain/accounting/sales-document-tax-types'
 import type { TreatablePayload } from '../../lib/domain/accounting/eu-vat-treatment'
 
@@ -423,4 +424,46 @@ test('[reversal accounts] equal totals but a different REVENUE account, SHIPPING
   const type = reversalAccountsDifference(invoice(), CN_LINES.map((l) => (l.accountCode === '200' ? { ...l, taxType: 'TAX999' } : l)), 'EUR')
   assert.match(type ?? '', /account 200 on tax type TAX131/)
   assert.match(reversalAccountsDifference(invoice({ shippingAmount: 10, shippingAccountCode: '260', shippingTaxType: 'TAX131', lines: (invoice().lines as unknown[]).filter((l) => (l as { accountCode: string }).accountCode !== '260') }), CN_LINES.map((l) => (l.accountCode === '260' ? { ...l, accountCode: '261' } : l)), 'EUR') ?? '', /account 260/)
+})
+
+// ---- o3d-k26m.13 (Codex R4): an unmarked, untaxed fee keeps NONE / fee-no-tax on a partial refund, as on the invoice ----
+test('[credit note] the stored-line classification is the invoice\'s: marked fee first, then an untaxed fee (no product, no rate, no tax), else goods', () => {
+  assert.equal(storedLineKindOf({ wclcFeeKind: 'uhf', productId: null, taxRateId: null, taxForeign: 0 }), 'marked-fee')
+  assert.equal(storedLineKindOf({ wclcFeeKind: null, productId: null, taxRateId: null, taxForeign: '0.0000' }), 'untaxed-fee')
+  assert.equal(storedLineKindOf({ wclcFeeKind: null, productId: null, taxRateId: 'r1', taxForeign: 1 }), 'goods')
+  assert.equal(storedLineKindOf({ wclcFeeKind: null, productId: 'p1', taxRateId: null, taxForeign: 0 }), 'goods')
+  assert.equal(isStoredUntaxedFee({ productId: null, taxRateId: null, taxForeign: 0.01 }), false)
+})
+
+test('[credit note] a partial refund of an unmarked UNTAXED fee stays on NONE / fee-no-tax on its own account; a marked fee and goods are unchanged', () => {
+  const note = applyEuVatCreditNoteTreatment(
+    payload({ lines: [
+      { description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: CHARGED, taxRateId: 'r1', taxRateBasis: 'sales_line' },
+      { description: 'EU Customs Fee', quantity: 1, unitAmount: 20, accountCode: '200', taxType: CHARGED },
+      { description: 'Plain fee', quantity: 1, unitAmount: 5, accountCode: '200', taxType: CHARGED, taxRateId: 'r1' },
+    ] }),
+    plan({ lineKinds: ['goods', 'marked-fee', 'untaxed-fee'], linePostingTypes: ['TAX131', 'TAX131', 'TAX131'], vatAmount: '0', refundTotal: '125' }),
+  )
+  assert.equal(note.ok, true, note.ok ? '' : note.reason)
+  if (!note.ok) return
+  assert.deepEqual(note.payload.lines.map((l) => [l.description, l.accountCode, l.taxType, l.noTaxKind ?? null]), [
+    ['Widget', '200', 'TAX131', null],
+    ['EU Customs Fee', '232', 'NONE', 'fee-no-tax'],
+    ['Plain fee', '200', 'NONE', 'fee-no-tax'],
+  ])
+  assert.equal('taxRateId' in note.payload.lines[2]!, false, 'the rate binding is dropped')
+  assert.deepEqual(findSalesDocumentTaxTypeProblems(note.payload), [])
+})
+
+test('[credit note] an untaxed fee is not part of the scheme posting type: its blank snapshot does not refuse beside goods, and a fee-only refund still needs a type for the marker', () => {
+  const beside = applyEuVatCreditNoteTreatment(
+    payload({ lines: [payload().lines[0]!, { description: 'Plain fee', quantity: 1, unitAmount: 5, accountCode: '200', taxType: CHARGED }] }),
+    plan({ lineKinds: ['goods', 'untaxed-fee'], linePostingTypes: ['TAX131', null], vatAmount: '0', refundTotal: '105' }),
+  )
+  assert.equal(beside.ok && beside.applied.schemePostingTaxType, 'TAX131')
+  const alone = applyEuVatCreditNoteTreatment(
+    payload({ lines: [{ description: 'Plain fee', quantity: 1, unitAmount: 5, accountCode: '200', taxType: CHARGED }] }),
+    plan({ lineKinds: ['untaxed-fee'], linePostingTypes: [null], vatAmount: '0', refundTotal: '5' }),
+  )
+  assert.equal(alone.ok, false)
 })

@@ -295,6 +295,21 @@ function schemeRatePercent(input: EuVatRegimeInput): string | null {
   return Number.isFinite(pct) ? String(Number(pct.toFixed(4))) : null
 }
 
+/**
+ * THE ONE PREDICATE FOR "A FEE THE SHOP CHARGED NO TAX ON", read off a STORED order line (no product, no tax rate, no VAT): the shape the WooCommerce importer's forced no-tax fee is stored in. The native invoice builder, the credit-note
+ * classification (`storedLineKindOf`) and the importer's own invoice (`lineKindsOf`, which reads the same fact before the line is stored) all mean this, so a partial refund of such a fee is classified as the invoice classified it.
+ */
+export function isStoredUntaxedFee(line: { productId?: string | null; taxRateId?: string | null; taxForeign?: unknown }): boolean {
+  return !line.productId && !line.taxRateId && Number(line.taxForeign ?? 0) === 0
+}
+
+/** The kind of a STORED order line, in the invoice classification's own order: a marked (wclc) fee first, then an untaxed fee, otherwise goods. */
+export function storedLineKindOf(line: { wclcFeeKind?: string | null; productId?: string | null; taxRateId?: string | null; taxForeign?: unknown }): TreatedLineKind {
+  if (line.wclcFeeKind != null) return 'marked-fee'
+  if (isStoredUntaxedFee(line)) return 'untaxed-fee'
+  return 'goods'
+}
+
 export function lineKindsOf(mappedLines: ReadonlyArray<{ isFeeLine?: boolean; wclcFeeKind?: string | null; forceNoTax?: boolean }>): TreatedLineKind[] {
   return mappedLines.map((line) => {
     if (line.isFeeLine === true && line.wclcFeeKind != null) return 'marked-fee'

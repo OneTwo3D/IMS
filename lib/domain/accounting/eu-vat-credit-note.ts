@@ -165,7 +165,8 @@ export function refusedCreditNoteError(payload: Record<string, unknown>): string
   return typeof marker.reason === 'string' && marker.reason !== '' ? marker.reason : 'NOTHING WAS SENT. This credit note was refused when it was built and is never sent.'
 }
 
-export type CreditNoteLineKind = 'goods' | 'marked-fee'
+/** `untaxed-fee`: an unmarked fee the shop charged no tax on. As on the invoice, it stays on NONE as a `fee-no-tax` line on its own account; it is not a scheme-typed goods line and not moved to the fee account. */
+export type CreditNoteLineKind = 'goods' | 'marked-fee' | 'untaxed-fee'
 
 export type EuVatCreditNotePlan = {
   /** From the order's stamp: never decided again. */
@@ -220,7 +221,10 @@ export function applyEuVatCreditNoteTreatment<P extends TreatablePayload>(payloa
   if (plan.schemePostingTypeProblem !== null) return refuse(plan.schemePostingTypeProblem)
 
   // The refund lines were snapshotted together, so they name ONE posting type. A line with none, or two types, is a refund IMS cannot post on a decided type.
-  const types = new Set(plan.linePostingTypes.map((type) => (type ?? '').trim()))
+  // An untaxed fee is not on the scheme type, so its snapshot is not part of the one type the others name (unless it is the only kind of line there is).
+  const typedIndexes = plan.lineKinds.map((kind, index) => (kind === 'untaxed-fee' ? -1 : index)).filter((index) => index >= 0)
+  const typeIndexes = typedIndexes.length > 0 ? typedIndexes : plan.lineKinds.map((_, index) => index)
+  const types = new Set(typeIndexes.map((index) => (plan.linePostingTypes[index] ?? '').trim()))
   if (types.has('')) return refuse('a refund line has no scheme posting type snapshot (the refund predates the order\'s regime stamp, or the order\'s rates name none), so IMS cannot book it on the scheme\'s zero-rated type')
   if (types.size !== 1) return refuse(`the refund lines name more than one scheme posting type (${[...types].join(', ')})`)
   const schemePostingTaxType = [...types][0]!
@@ -232,6 +236,7 @@ export function applyEuVatCreditNoteTreatment<P extends TreatablePayload>(payloa
     if (plan.lineKinds[index] === 'marked-fee') {
       return { ...withoutBinding(line), accountCode: plan.feeAccount!.trim(), taxType: NO_TAX, noTaxKind: 'fee-no-tax', euFeeMarked: true }
     }
+    if (plan.lineKinds[index] === 'untaxed-fee') return { ...withoutBinding(line), taxType: NO_TAX, noTaxKind: 'fee-no-tax' }
     return { ...withoutBinding(line), taxType: schemePostingTaxType }
   })
 

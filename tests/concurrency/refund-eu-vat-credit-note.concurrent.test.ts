@@ -902,3 +902,21 @@ test('[eu vat credit note] a whole-order reversal refuses when the invoice was p
   assert.equal(outcome.kind === 'refused' ? outcome.code : null, 'hand_post')
   assert.match(refusal(outcome)?.reason ?? '', /NOTHING WAS SENT[\s\S]*account 20[01] on tax type TAX131[\s\S]*different accounts/)
 })
+
+test('[eu vat credit note] a partial refund of an unmarked UNTAXED fee (no product, no rate, no tax) stays NONE / fee-no-tax next to scheme-typed goods, even with no frozen rate on the fee line (o3d-k26m.13)', { skip }, async (t) => {
+  const { deps, fx } = await prepared(t, { stamp: 'IOSS', schemeRate: true })
+  const plain = await deps.db.salesOrderLine.create({
+    data: { orderId: fx.orderId, description: 'Plain fee', qty: 1, unitPriceForeign: '5', unitPriceBase: '5', taxForeign: '0', taxBase: '0', totalForeign: '5', totalBase: '5' },
+    select: { id: true },
+  })
+  const refund = await directRefund(deps, fx, { stated: '12.90', lines: [{ net: '10', rate: '0.19' }, { net: '1', orderLineId: plain.id, rate: null }] })
+  const payload = refund.payload({ lines: [
+    { description: 'Widget', quantity: 1, unitAmount: 10, accountCode: '200', taxType: fx.rate.accountingTaxType },
+    { description: 'Plain fee', quantity: 1, unitAmount: 1, accountCode: '200', taxType: fx.rate.accountingTaxType },
+  ] })
+  const outcome = await treat(deps, fx, refund, { payload })
+  assert.equal(outcome.kind, 'treated', outcome.kind === 'refused' ? outcome.reason : '')
+  if (outcome.kind !== 'treated') return
+  const lines = outcome.payload.lines as Array<{ description: string; accountCode: string; taxType: string; noTaxKind?: string }>
+  assert.deepEqual(lines.slice(0, 2).map((l) => [l.description, l.accountCode, l.taxType, l.noTaxKind ?? null]), [['Widget', '200', 'TAX131', null], ['Plain fee', '200', 'NONE', 'fee-no-tax']])
+})
