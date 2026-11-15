@@ -1486,10 +1486,10 @@ test('[eu vat] the poster refuses a treated payload whose recorded regime policy
   // The cut-in is changed while the row waits.
   await db.setting.upsert({ where: { key: 'eu_vat_gift_card_flag_cut_in' }, create: { key: 'eu_vat_gift_card_flag_cut_in', value: '2026-12-01' }, update: { value: '2026-12-01' } })
   const refused = (await euSchemePostingRefusal(treated())) ?? ''
-  assert.match(refused, /NOTHING WAS SENT\. Sales invoice INV-P was refused: the EU VAT regime settings changed since it was prepared \(cutIn\)\..*re-importing the order will not rebuild it.*post the invoice by hand in Xero and record it on this row with the settle action/s)
+  assert.match(refused, /NOTHING WAS SENT\. Sales invoice INV-P was refused: the EU VAT regime settings changed since it was prepared \(cutIn\)\.[\s\S]*re-importing the order will not rebuild it[\s\S]*post the invoice by hand in Xero and record it on this row with the settle action/)
   assert.doesNotMatch(refused, /; re-import the order/, 'the dead remedy is not named')
   const refusedUpdate = (await euSchemePostingRefusal(treated(), new Date(), 'update')) ?? ''
-  assert.match(refusedUpdate, /NOTHING WAS SENT\. The update of sales invoice INV-P was refused: the EU VAT regime settings changed since it was prepared \(cutIn\)\..*Check Xero for invoice INV-P first.*retry this row on \/sync.*settle action/s)
+  assert.match(refusedUpdate, /NOTHING WAS SENT\. The update of sales invoice INV-P was refused: the EU VAT regime settings changed since it was prepared \(cutIn\)\.[\s\S]*Check Xero for invoice INV-P first[\s\S]*retry this row on \/sync[\s\S]*settle action/)
   assert.doesNotMatch(refusedUpdate, /then re-import|; re-import the order/)
   // Also a route-none treated payload, and one with no recorded policy.
   assert.match((await euSchemePostingRefusal({ invoiceNumber: 'INV-N', _euVatTreatment: { applied: true, route: 'none', regimePolicy: policy } })) ?? '', /settings changed since it was prepared/)
