@@ -1348,7 +1348,6 @@ export async function runWmsOrderPushSweepCore(
    * (anything but a definite "nothing was sent"), go to needs_check. Only a definite refusal clears the flag and is retried.
    */
   const deliverRemovalNote = async (ob: WmsRemovalNoteObligation, orderLabel: string): Promise<'posted' | 'pending' | 'needs_check'> => {
-    if (!connector.addOrderComment) return 'pending'
     const clear = () => port.clearRemovalNote?.(connectorId, ob.linkId).catch((e) => console.error('[wms-order-push] could not clear the removal note obligation', e))
     const marker = removalNoteMarker(ob)
     if (ob.attempted) {
