@@ -104,6 +104,7 @@ test('a courier task that cannot be recorded keeps the link retryable: not marke
   assert.equal('pushedAt' in run.linkWrites[0]!, false, 'the order stays due, so the next pass amends and raises the task again (it is deduplicated)')
   assert.equal('courierForm' in run.linkWrites[0]!, false, 'the next pass finds the fallback again')
   assert.equal(run.linkWrites[0]!.courierPending, true)
+  assert.equal(run.linkWrites[0]!.courierTaskService, 'RM Tracked', 'the task stays DUE on the link, so a later sweep records it even if the order is never amended again')
   assert.match(String(run.linkWrites[0]!.lastError), /operator task not recorded/)
 })
 

@@ -11,7 +11,6 @@ import { enabledWmsConnectorId } from '@/lib/connectors/wms/enabled-connector'
 import { isWmsConnectorId } from '@/lib/connectors/wms/types'
 import { logActivity } from '@/lib/activity-log'
 import { entersFulfilment, reconcileAllocationBeforeFulfilment, recordShortfallUnderLock } from '@/lib/fulfillment/pre-fulfilment-reallocation'
-import { raiseWmsOperatorTask, refundNoteQuery, warehouseOrderRef } from '@/lib/domain/wms/operator-tasks'
 import { freshAuthFailureResult, requireFreshPermission, requireInternalUser, requirePermission } from '@/lib/auth/server'
 import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
 import { xeroGet } from '@/lib/connectors/xero/api'
@@ -2944,19 +2943,8 @@ export async function createRefund(
               })
             }
 
-            // The warehouse's staff do not read order comments, so IMS writes none: an operator task ("raise a query") is recorded
-            // instead, listed on Sync > Exceptions. A local write (nothing is sent), deduplicated on the credit note.
-            if (wmsLink.externalOrderId && isWmsConnectorId(wmsLink.connector)) {
-              await raiseWmsOperatorTask(db, {
-                connector: wmsLink.connector,
-                orderId,
-                externalOrderId: wmsLink.externalOrderId,
-                reason: 'REFUND_NOTE',
-                dedupeBasis: `refund:${creditNote ?? refundResult.createdRefund.id}:${isFull ? 'full' : 'partial'}`,
-                queryText: refundNoteQuery(warehouseOrderRef(wmsLink.externalOrderNumber, wmsLink.externalOrderId), orderRef, creditNote, isFull),
-                payload: { orderNumber: orderRef, externalOrderNumber: wmsLink.externalOrderNumber ?? null },
-              })
-            }
+            // The operator task ("raise a query": IMS writes no comment to the warehouse) was recorded inside the refund's own transaction
+            // (createSalesOrderRefund), so it can never be lost to a failure here.
           }
         }
       } catch (wmsNotifyError) {

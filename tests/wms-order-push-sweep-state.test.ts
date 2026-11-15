@@ -415,6 +415,41 @@ test('create: a component check that THROWS is contained locally; the payload ch
   assert.equal(upserts[0].create.totalMismatchPence, 200, 'the payload check still ran')
 })
 
+test('create: a courier task that cannot be recorded stays DUE on the link (written with it) and the next sweep records it with no order change, once', async () => {
+  const fallbackPush = connector({ pushOrder: async () => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW', courierFallback: true }) })
+  const first = makePort({ createCandidates: [candidate()] })
+  first.port.raiseOperatorTask = async () => { throw new Error('database unavailable') }
+  const r1 = await runWmsOrderPushSweepCore(fallbackPush, 'mintsoft', first.port, { now: NOW })
+  assert.equal(r1.created, 1)
+  assert.equal(r1.operatorTaskErrors, 1, 'visible: the cron reports it')
+  assert.equal(first.upserts[0].create.courierTaskService, 'Royal Mail', 'the due-marker is written in the same write as the SYNCED link')
+  assert.equal(first.upserts[0].update.courierTaskService, 'Royal Mail')
+  // Next sweep: nothing created, nothing amended; the link carries the marker and the pass records the task.
+  const cleared: string[] = []
+  const next = makePort({})
+  next.port.courierTasksDue = async () => [{ orderId: 'so-1', externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', orderNumber: 'SO-1', service: 'Royal Mail' }]
+  next.port.clearCourierTaskDue = async (orderId, service) => { cleared.push(`${orderId}:${service}`) }
+  const r2 = await runWmsOrderPushSweepCore(connector(), 'mintsoft', next.port, { now: NOW })
+  assert.equal(r2.operatorTasksRaised, 1)
+  assert.deepEqual(next.tasks.map((t) => [t.reason, t.externalOrderId]), [['COURIER_FALLBACK', 'wms-1']])
+  assert.match(next.tasks[0].queryText, /'Royal Mail'/)
+  assert.deepEqual(cleared, ['so-1:Royal Mail'])
+})
+
+test('courier tasks are keyed to the service: a fallback for another service is a different task with its own text', async () => {
+  const a = makePort({})
+  const b = makePort({})
+  const run = (h: ReturnType<typeof makePort>, service: string) => {
+    h.port.courierTasksDue = async () => [{ orderId: 'so-1', externalOrderId: 'wms-1', externalOrderNumber: null, orderNumber: 'SO-1', service }]
+    return runWmsOrderPushSweepCore(connector(), 'mintsoft', h.port, { now: NOW })
+  }
+  await run(a, 'Royal Mail')
+  await run(b, 'DPD Next Day')
+  assert.notEqual(a.tasks[0].dedupeBasis, b.tasks[0].dedupeBasis)
+  assert.match(b.tasks[0].queryText, /DPD Next Day/)
+  assert.doesNotMatch(b.tasks[0].queryText, /Royal Mail/)
+})
+
 test('create: a normal (no-fallback) push raises no courier task', async () => {
   const { port, tasks } = makePort({ createCandidates: [candidate()] })
   const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })

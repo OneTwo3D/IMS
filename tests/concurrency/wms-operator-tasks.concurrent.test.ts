@@ -166,3 +166,151 @@ test('the tasks hold no personal data: order numbers, SKUs, quantities and line 
   assert.doesNotMatch(text, /Pat Example|pat@example|Test Street|LS1 1AA/)
   assert.deepEqual(Object.keys(f.task.payload as object).sort(), ['items', 'linkId', 'orderNumber'])
 })
+
+// ---------------------------------------------------------------------------------------------------------------------------------------
+// Review round: once IMS knows the warehouse must act, a task MUST end up recorded (and only a failure we can see and retry is allowed).
+// ---------------------------------------------------------------------------------------------------------------------------------------
+
+const quiet = async <T>(fn: () => Promise<T>): Promise<T> => {
+  const saved = { warn: console.warn, error: console.error }
+  console.warn = () => {}
+  console.error = () => {}
+  try { return await fn() } finally { console.warn = saved.warn; console.error = saved.error }
+}
+const sweepConnector = () => ({
+  pushOrder: async () => { throw new Error('must not create') },
+  cancelOrder: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }),
+})
+
+test('courier fallback: a task for service A that is DONE does not swallow a later fallback for service B; the same service is one task', SKIP, async (t) => {
+  const w = await world()
+  const id = await order(w, 'cf')
+  t.after(async () => { await w.db.salesOrder.deleteMany({ where: { id } }) })
+  const raise = (service: string) => w.tasks.raiseWmsOperatorTask(w.db, {
+    connector: 'mintsoft', orderId: id, externalOrderId: 'wms-c', reason: 'COURIER_FALLBACK',
+    queryText: w.tasks.courierFallbackQuery('wms-c', 'IMS-1', service), dedupeBasis: `courier-fallback:${service}`,
+  })
+  assert.equal(await raise('Royal Mail'), true)
+  await w.db.wmsOperatorTask.updateMany({ where: { orderId: id }, data: { status: 'DONE', doneAt: new Date() } })
+  assert.equal(await raise('Royal Mail'), false, 'the same service again: still the one (done) task')
+  assert.equal(await raise('DPD Next Day'), true, 'another service: a NEW task, though the first is done')
+  const open = await w.db.wmsOperatorTask.findMany({ where: { orderId: id, status: 'OPEN' } })
+  assert.equal(open.length, 1)
+  assert.match(open[0]!.queryText, /DPD Next Day/, 'the text describes the current service')
+  assert.doesNotMatch(open[0]!.queryText, /Royal Mail/)
+})
+
+test('courier fallback, real port: a task due and not yet recorded (a failed insert at create, or a link from before operator tasks) is recorded by the next sweep with NO order change, once', SKIP, async (t) => {
+  const w = await world()
+  const sweep = await import('@/lib/domain/wms/order-push-sweep')
+  const id = await order(w, 'cd')
+  await w.db.salesOrder.update({ where: { id }, data: { status: 'PROCESSING' } }) // not cancelled: only the courier task is in play
+  t.after(async () => { await w.db.salesOrder.deleteMany({ where: { id } }) })
+  const link = await w.db.wmsOrderPushLink.create({ data: { orderId: id, connector: 'mintsoft', state: 'SYNCED', externalOrderId: 'wms-d', externalOrderNumber: 'MS-D', courierPending: true, courierTaskService: 'Royal Mail', pushedAt: new Date() } })
+  // The first sweep cannot record it (the insert fails): the marker stays, and the failure is counted so the cron shows it.
+  const failing = sweep.createPrismaWmsOrderPushPort()
+  failing.raiseOperatorTask = async () => { throw new Error('database unavailable') }
+  const first = await quiet(() => sweep.runWmsOrderPushSweepCore(sweepConnector() as never, 'mintsoft', failing, { batchSize: 50 }))
+  assert.equal(first.operatorTaskErrors, 1)
+  assert.equal(await w.db.wmsOperatorTask.count({ where: { orderId: id } }), 0)
+  assert.equal((await w.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })).courierTaskService, 'Royal Mail', 'still due')
+  // The next sweep records it, with no change to the order, and clears the marker.
+  const second = await quiet(() => sweep.runWmsOrderPushSweepCore(sweepConnector() as never, 'mintsoft', sweep.createPrismaWmsOrderPushPort(), { batchSize: 50 }))
+  assert.equal(second.operatorTasksRaised, 1)
+  const tasks = await w.db.wmsOperatorTask.findMany({ where: { orderId: id } })
+  assert.deepEqual(tasks.map((x) => [x.reason, x.externalOrderId]), [['COURIER_FALLBACK', 'wms-d']])
+  assert.match(tasks[0]!.queryText, /Royal Mail/)
+  assert.match(tasks[0]!.queryText, /MS-D/)
+  assert.equal((await w.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })).courierTaskService, null, 'cleared')
+  await quiet(() => sweep.runWmsOrderPushSweepCore(sweepConnector() as never, 'mintsoft', sweep.createPrismaWmsOrderPushPort(), { batchSize: 50 }))
+  assert.equal(await w.db.wmsOperatorTask.count({ where: { orderId: id } }), 1, 'once')
+})
+
+test('outstanding hold and cancel notices stamped by an OLD (unread) comment each get exactly one task; running the backfill and the sweep twice changes nothing', SKIP, async (t) => {
+  const w = await world()
+  const sweep = await import('@/lib/domain/wms/order-push-sweep')
+  const { readFileSync, readdirSync } = await import('node:fs')
+  const held = await order(w, 'nh')
+  const cancelled = await order(w, 'nc')
+  const stale = await order(w, 'ns')
+  t.after(async () => { await w.db.salesOrder.deleteMany({ where: { id: { in: [held, cancelled, stale] } } }) })
+  await w.db.salesOrder.update({ where: { id: held }, data: { status: 'ON_HOLD' } }) // cancelled order: status CANCELLED already; `stale` is CANCELLED too but its link is dead
+  const oldStamp = new Date('2026-11-01T00:00:00Z')
+  const mk = (orderId: string, ext: string, data: Record<string, unknown>) => w.db.wmsOrderPushLink.create({ data: { orderId, connector: 'mintsoft', externalOrderId: ext, externalOrderNumber: `MS-${ext}`, pushedAt: new Date(), ...data } as never })
+  await mk(held, 'h-1', { state: 'SYNCED', holdNoticeAt: oldStamp, holdNoticeCommentAt: oldStamp })
+  await mk(cancelled, 'c-1', { state: 'MERGED', cancelNoticeAt: oldStamp, cancelNoticeCommentAt: oldStamp })
+  await mk(stale, 's-1', { state: 'CANCELLED', cancelNoticeAt: oldStamp, cancelNoticeCommentAt: oldStamp }) // not live: not outstanding
+
+  // The migration's own backfill statements, run (twice) against this data.
+  const dir = new URL('../../prisma/migrations/', import.meta.url)
+  const name = readdirSync(dir).find((n) => n.endsWith('_wms_operator_tasks'))!
+  const sql = readFileSync(new URL(`${name}/migration.sql`, dir), 'utf8')
+  const updates = sql.split(';').map((x) => x.replace(/^(\s*--[^\n]*\n)+/g, '').trim()).filter((x) => /^UPDATE "wms_order_push_links" SET "(hold|cancel)_notice_comment_at"/.test(x))
+  assert.equal(updates.length, 2)
+  for (let i = 0; i < 2; i += 1) for (const statement of updates) await w.db.$executeRawUnsafe(statement)
+  const after = await w.db.wmsOrderPushLink.findMany({ where: { orderId: { in: [held, cancelled, stale] } }, select: { orderId: true, holdNoticeCommentAt: true, cancelNoticeCommentAt: true } })
+  const by = (id: string) => after.find((x) => x.orderId === id)!
+  assert.equal(by(held).holdNoticeCommentAt, null, 'the live hold notice is back to "no task yet"')
+  assert.equal(by(cancelled).cancelNoticeCommentAt, null)
+  assert.ok(by(stale).cancelNoticeCommentAt, 'a dead link is not outstanding: untouched')
+
+  for (let i = 0; i < 2; i += 1) await quiet(() => sweep.runWmsOrderPushSweepCore(sweepConnector() as never, 'mintsoft', sweep.createPrismaWmsOrderPushPort(), { batchSize: 100 }))
+  const tasks = await w.db.wmsOperatorTask.findMany({ where: { orderId: { in: [held, cancelled, stale] } }, orderBy: { reason: 'asc' } })
+  assert.deepEqual(tasks.map((x) => [x.orderId, x.reason]).sort(), [[cancelled, 'CANCEL_NOTICE'], [held, 'PUSH_CONFLICT']].sort(), 'exactly one task per outstanding notice, none for the dead link')
+  for (const link of await w.db.wmsOrderPushLink.findMany({ where: { orderId: { in: [held, cancelled] } } })) assert.ok(link.holdNoticeCommentAt ?? link.cancelNoticeCommentAt, 'stamped: its task is recorded')
+})
+
+test('a refund of a pushed order records its task INSIDE the refund transaction: both commit together, both roll back together, and a replay adds none', SKIP, async (t) => {
+  const w = await world()
+  const { createSalesOrderRefund } = await import('@/lib/domain/sales/refund-service')
+  const { Prisma } = await import('@/app/generated/prisma/client')
+  const suffix = randomUUID().slice(0, 8)
+  const taxRate = await w.db.taxRate.create({ data: { name: `RT-VAT-${suffix}`, rate: new Prisma.Decimal('0.2'), accountingTaxType: 'OUTPUT2', reverseCharge: false }, select: { id: true } })
+  const so = await w.db.salesOrder.create({
+    data: {
+      orderNumber: `RT-${suffix}`, status: 'SHIPPED', currency: 'GBP', fxRateToBase: new Prisma.Decimal('1'),
+      subtotalForeign: new Prisma.Decimal('100'), totalForeign: new Prisma.Decimal('120'), subtotalBase: new Prisma.Decimal('100'),
+      taxForeign: new Prisma.Decimal('20'), taxBase: new Prisma.Decimal('20'), shippingForeign: new Prisma.Decimal('0'), totalBase: new Prisma.Decimal('120'),
+      pricesIncludeVat: false, taxRatePercent: new Prisma.Decimal('0.2'),
+      lines: { create: [{ description: 'Widget', qty: new Prisma.Decimal('2'), unitPriceForeign: new Prisma.Decimal('50'), unitPriceBase: new Prisma.Decimal('50'), taxForeign: new Prisma.Decimal('20'), taxBase: new Prisma.Decimal('20'), totalForeign: new Prisma.Decimal('100'), totalBase: new Prisma.Decimal('100'), taxRateId: taxRate.id }] },
+    },
+    select: { id: true, lines: { select: { id: true } } },
+  })
+  t.after(async () => {
+    await w.db.salesOrderRefundLine.deleteMany({ where: { refund: { orderId: so.id } } }).catch(() => {})
+    await w.db.salesOrderRefund.deleteMany({ where: { orderId: so.id } }).catch(() => {})
+    await w.db.salesOrderLine.deleteMany({ where: { orderId: so.id } }).catch(() => {})
+    await w.db.salesOrder.deleteMany({ where: { id: so.id } })
+    await w.db.taxRate.delete({ where: { id: taxRate.id } }).catch(() => {})
+  })
+  await w.db.wmsOrderPushLink.create({ data: { orderId: so.id, connector: 'mintsoft', state: 'SYNCED', externalOrderId: 'wms-r', externalOrderNumber: 'MS-R', pushedAt: new Date() } })
+  const externalRefundId = Number.parseInt(suffix.replace(/\D/g, '0').slice(0, 7), 10) + 1
+  const record = (client: unknown) => createSalesOrderRefund(client as never, {
+    orderId: so.id,
+    lines: [{ lineId: so.lines[0]!.id, productId: null, description: 'Widget refund', qty: 1, totalForeign: 50, totalBase: 50, lineKind: 'sale' }],
+    reason: 'part refund', externalRefundId, creditNotePrefix: `CNRT${suffix}-`,
+  })
+  // 1. The task insert fails: the REFUND rolls back with it (no committed refund without its task).
+  const failing = new Proxy(w.db, {
+    get: (target, prop, receiver) => prop === '$transaction'
+      ? (cb: (tx: unknown) => unknown, opts?: unknown) => (target as never as { $transaction: (c: unknown, o?: unknown) => unknown }).$transaction((tx: unknown) => cb(new Proxy(tx as object, {
+        get: (txTarget, txProp) => txProp === 'wmsOperatorTask' ? { createMany: async () => { throw new Error('task insert failed') } } : (txTarget as Record<PropertyKey, unknown>)[txProp],
+      })), opts)
+      : Reflect.get(target, prop, receiver),
+  })
+  await quiet(async () => { await record(failing).catch(() => undefined) })
+  assert.equal(await w.db.salesOrderRefund.count({ where: { orderId: so.id } }), 0, 'the refund did not commit without its task')
+  assert.equal(await w.db.wmsOperatorTask.count({ where: { orderId: so.id } }), 0)
+  // 2. The retry commits both, once.
+  const ok = await record(w.db)
+  assert.equal(ok.success, true)
+  const tasks = await w.db.wmsOperatorTask.findMany({ where: { orderId: so.id } })
+  assert.deepEqual(tasks.map((x) => [x.reason, x.externalOrderId]), [['REFUND_NOTE', 'wms-r']])
+  assert.match(tasks[0]!.queryText, /MS-R/)
+  assert.match(tasks[0]!.queryText, /partly refunded/)
+  // 3. A replay of the same WooCommerce refund id adds no second task.
+  const replay = await record(w.db)
+  assert.equal(replay.success, true)
+  assert.equal(await w.db.wmsOperatorTask.count({ where: { orderId: so.id } }), 1)
+  assert.equal(await w.db.salesOrderRefund.count({ where: { orderId: so.id } }), 1)
+})
