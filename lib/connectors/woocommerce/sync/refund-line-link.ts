@@ -18,3 +18,38 @@ export function refundedOrderLineId(rl: WcRefundLineItem): number {
   const id = Number(meta?.value)
   return Number.isFinite(id) && id > 0 ? id : rl.id
 }
+
+/** The part of a refunded WooCommerce fee line the match reads. */
+export type WcRefundFeeLineLike = { name?: string | null; total?: string | number | null; total_tax?: string | number | null }
+
+/** The part of an IMS order line the fee match reads. */
+export type FeeMatchOrderLine = { id: string; productId: string | null; externalLineItemId: number | null; description: string; totalForeign?: unknown }
+
+/**
+ * The ORIGINAL ORDER FEE LINE each refunded WooCommerce fee line refers to (o3d-k26m.14).
+ *
+ * The importer stores a fee line with no WooCommerce item id (`mapWcFeeLines` sets `externalLineItemId: null`) and no product, so unlike a goods line it cannot be linked through `_refunded_item_id`. The link is the fee's NAME on a fee-shaped order line
+ * (no product, no item id). A fee that matches exactly ONE not-yet-used order line by name is linked to it; several same-named fees are told apart only by an exact net amount, and still must leave exactly one candidate. Anything else is UNMATCHED and the
+ * caller parks the refund: a refunded fee is never dropped and never guessed at.
+ * Returns, per input fee line (same order), the matched order line id or null.
+ */
+export function matchRefundedFeeLines(feeLines: readonly WcRefundFeeLineLike[], orderLines: readonly FeeMatchOrderLine[]): Array<string | null> {
+  const used = new Set<string>()
+  const name = (value: string | null | undefined) => (value ?? '').trim().toLowerCase()
+  const feeShaped = orderLines.filter((line) => line.productId === null && line.externalLineItemId === null)
+  return feeLines.map((fee) => {
+    const wanted = name(fee.name)
+    if (wanted === '') return null
+    const candidates = feeShaped.filter((line) => !used.has(line.id) && name(line.description) === wanted)
+    let chosen: FeeMatchOrderLine | undefined
+    if (candidates.length === 1) chosen = candidates[0]
+    else if (candidates.length > 1) {
+      const refundedNet = Math.abs(Number(fee.total))
+      const exact = candidates.filter((line) => line.totalForeign !== undefined && line.totalForeign !== null && Number.isFinite(refundedNet) && Math.abs(Number(line.totalForeign) - refundedNet) < 0.005)
+      if (exact.length === 1) chosen = exact[0]
+    }
+    if (chosen === undefined) return null
+    used.add(chosen.id)
+    return chosen.id
+  })
+}

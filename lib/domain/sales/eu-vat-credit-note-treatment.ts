@@ -13,7 +13,8 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
-import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import { toDecimal } from '@/lib/domain/math/decimal'
+import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { regimePolicyOf, type RegimePolicy } from '@/lib/domain/accounting/eu-vat-regime-policy'
 import { readEuVatRegimeMode, readGiftCardFlagCutIn } from '@/lib/connectors/woocommerce/sync/eu-vat-facts'
 import type { GiftCardCutIn } from '@/lib/domain/accounting/eu-vat-settings'
@@ -22,7 +23,7 @@ import type { AccountingEnqueueOutcome } from '@/lib/accounting'
 import { unstampedOrderIsScheme } from '@/lib/domain/sales/eu-vat-scheme-evidence'
 import { decideRefund182Hold } from '@/lib/domain/sales/refund-182-hold'
 import { priorRefundedTax } from '@/lib/domain/sales/refund-182-prior-tax'
-import { applyEuVatCreditNoteTreatment, eas182RefundFigures, persistedSchemeUntreatableRefusal, refund182HeldRefusal, noFrozenBasisRefusal, noInvoicedTypeRefusal, noStampRefusal, refundTaxAndTotal, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
+import { applyEuVatCreditNoteTreatment, eas182RefundFigures, persistedSchemeUntreatableRefusal, refund182HeldRefusal, noFrozenBasisRefusal, noInvoicedTypeRefusal, noStampRefusal, refundTaxAndTotal, reversalNotProvenRefusal, wholeOrderReversalFigures, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
 
 export type EuVatCreditNoteAccounts = { ioss: string | null; ddp: string | null; fee: string | null; rounding: string | null }
@@ -160,9 +161,18 @@ export async function treatCreditNotePayload(params: {
 
   // The refund's own tax total, and the amount the document must total. A whole-order reversal (the payment poller's chargeback) reverses the order's whole collected VAT.
   let figures: ReturnType<typeof refundTaxAndTotal>
+  let reversalRounding: { amount: string; accountCode: string } | null = null
   if (refund.source === 'CHARGEBACK_POLLER') {
-    const vat: Decimal = toDecimal(order.taxForeign)
-    figures = { ok: true, vatAmount: vat.toString(), refundTotal: net.plus(vat).toString() }
+    // The target, the VAT and any rounding reversal come from the invoice payload IMS posted (or queued), and the reversal must equal it: the latest IMS invoice that may have reached the ledger (not one proven never posted) for the order carrying the scheme marker.
+    const invoiceRow = await db.accountingSyncLog.findFirst({
+      where: { type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] }, referenceType: 'SalesOrder', referenceId: params.orderId, ...MAY_HAVE_REACHED_LEDGER_WHERE, payload: { path: ['_euVatTreatment', 'applied'], equals: true } },
+      orderBy: { createdAt: 'desc' },
+      select: { payload: true },
+    })
+    const proven = wholeOrderReversalFigures({ invoice: (invoiceRow?.payload ?? null) as Record<string, unknown> | null, currency: payload.currency, net })
+    if (!proven.ok) return { kind: 'refused', reason: reversalNotProvenRefusal(number, proven.reason), code: 'hand_post' }
+    reversalRounding = proven.rounding
+    figures = { ok: true, vatAmount: proven.vatAmount, refundTotal: proven.refundTotal }
   } else if (rate182) {
     // RATE 182: the tax the refund states across ALL its rate ids, confirmed against its own gross and held to the order's VAT not already refunded.
     const priorTax = await priorRefundedTax(db, params.orderId, params.refundId, toDecimal(order.taxForeign))
@@ -183,6 +193,7 @@ export async function treatCreditNotePayload(params: {
     vatAmount: figures.vatAmount,
     refundTotal: figures.refundTotal,
     vatDescription: `${DESTINATION_LABEL[regime]}`,
+    roundingReversal: reversalRounding,
     // Asked only when there is one type to ask about; the pure treatment refuses a blank or mixed set by itself.
     schemePostingTypeProblem: onlyType === null ? null : await storedSchemePostingTypeProblem(onlyType, params.now),
   }

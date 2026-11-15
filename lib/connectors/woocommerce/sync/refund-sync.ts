@@ -18,7 +18,7 @@ import { FULL_REFUND_RATIO } from '@/lib/domain/sales/refund-thresholds'
 import { activeRefundParkWhere, WC_REFUND_PARK_RECORD_KIND } from '@/lib/domain/sales/refund-park-recovery'
 // o3d-w00 (Codex r7 #3): shared with the exception inbox's hand-recording path — see refund-line-link.
 import { easRefundRefusal, refundStatedTax, refundTaxOnEasRate } from '@/lib/domain/accounting/eu-vat-credit-note'
-import { refundedOrderLineId } from './refund-line-link'
+import { matchRefundedFeeLines, refundedOrderLineId } from './refund-line-link'
 export { refundedOrderLineId }
 import type { WcRefund } from './types'
 import type { createRefund as createRefundAction } from '@/app/actions/sales'
@@ -702,7 +702,7 @@ export async function syncWcRefund(
         shippingForeign: true,
         lines: {
           select: {
-            id: true, productId: true, externalLineItemId: true, description: true, qty: true, totalBase: true,
+            id: true, productId: true, externalLineItemId: true, description: true, qty: true, totalBase: true, totalForeign: true,
             taxBase: true,
             taxForeign: true,
             taxRate: { select: { rate: true, reverseCharge: true } },
@@ -961,6 +961,51 @@ export async function syncWcRefund(
         // (order-level discount, partial line read, negative remainder) apply to it.
         chargedTaxForeign: roundDecimalNumber(shippingRefundTax, 4),
       })
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // o3d-k26m.14: REFUNDED FEE LINES. A refund that returns a fee (a landed-cost or handling fee) states it in `fee_lines`, which
+    // used to be ignored, so the mapped gross missed the fee and the refund parked PENDING for ever. Each is linked to the ORIGINAL
+    // order fee line (by name, see matchRefundedFeeLines) and carried with its net and the tax WooCommerce states it returned, like a
+    // goods line, so a marked (wclc) fee reaches the credit-note builder as a marked fee. A fee that cannot be matched is NEVER
+    // dropped: the refund is QUARANTINED with a message naming it, for an operator to record by hand.
+    // ---------------------------------------------------------------------------------------------
+    const refundedFeeLines = (wcRefund.fee_lines ?? [])
+      .filter((feeLine) => parseDecimalAbs(feeLine.total).gt(0.000001) || parseDecimalAbs(feeLine.total_tax).gt(0.000001))
+    if (refundedFeeLines.length > 0) {
+      const matched = matchRefundedFeeLines(refundedFeeLines, so.lines)
+      const unmatched = refundedFeeLines.filter((_, index) => matched[index] === null)
+      if (unmatched.length > 0) {
+        const names = unmatched.map((feeLine) => `"${feeLine.name ?? '(unnamed)'}" (${parseDecimalAbs(feeLine.total).toFixed(2)} net, ${parseDecimalAbs(feeLine.total_tax).toFixed(2)} tax)`).join(', ')
+        const error = withLedgerCheck(`WooCommerce refund ${wcRefund.id} refunds fee ${names} that IMS cannot match to exactly one fee line on the original order, so the refund was NOT recorded and nothing was sent to Xero. Record the refund manually from the order, crediting that fee line.`)
+        await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: error, payload: wcRefund })
+        await writeActivity({
+          entityType: 'SALES_ORDER',
+          entityId: so.id,
+          action: 'refund_sync_fee_line_unmatched',
+          tag: 'sync',
+          level: 'WARNING',
+          description: error,
+          metadata: { externalRefundId: wcRefund.id },
+          resolveUser: false,
+        })
+        return { outcome: 'quarantined-refusal', error }
+      }
+      for (const [index, feeLine] of refundedFeeLines.entries()) {
+        const feeNet = parseDecimalAbs(feeLine.total)
+        const feeTax = parseDecimalAbs(feeLine.total_tax)
+        mappedGrossForeign = mappedGrossForeign.add(feeNet).add(feeTax)
+        refundLines.push({
+          lineId: matched[index]!,
+          productId: null,
+          description: feeLine.name || 'Fee refund',
+          qty: 0,
+          totalForeign: roundDecimalNumber(feeNet, 4),
+          totalBase: divideRoundedNumber(feeNet, fxRate, 4),
+          lineKind: 'sale',
+          chargedTaxForeign: roundDecimalNumber(feeTax, 4),
+        })
+      }
     }
 
     if (refundLines.length === 0) {

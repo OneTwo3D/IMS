@@ -4,7 +4,7 @@ import test from 'node:test'
 
 import { roundMoney, toDecimal } from '../../lib/domain/math/decimal'
 import {
-  applyEuVatCreditNoteTreatment, easRefundRefusal, refusedCreditNoteError, refusedCreditNotePayload, EAS_REFUND_TAX_RATE_ID, noStampRefusal, refundTaxAndTotal, refundTaxOnEasRate, refundStatedTax, eas182RefundFigures, refund182HeldRefusal,
+  applyEuVatCreditNoteTreatment, easRefundRefusal, refusedCreditNoteError, refusedCreditNotePayload, EAS_REFUND_TAX_RATE_ID, noStampRefusal, refundTaxAndTotal, refundTaxOnEasRate, refundStatedTax, eas182RefundFigures, refund182HeldRefusal, wholeOrderReversalFigures, reversalNotProvenRefusal,
   type CreditNoteLineKind, type EuVatCreditNotePlan,
 } from '../../lib/domain/accounting/eu-vat-credit-note'
 import { findSalesDocumentTaxTypeProblems } from '../../lib/domain/accounting/sales-document-tax-types'
@@ -306,4 +306,65 @@ test('[credit note 182] a refund that states LESS than its net refuses; the VAT 
   // 19 + 6.49 = 25.49 = 25.46 + the 3-minor-unit allowance: on the bound passes.
   assert.equal(figures182({ priorRefundedTax: D('6.49') }).ok, true)
   assert.equal(figures182({ priorRefundedTax: D('6.50') }).ok, false)
+})
+
+// ---- o3d-k26m.13: a whole-order reversal is derived from the invoice payload and must equal it, rounding line included ----
+const MARK = { applied: true, route: 'scheme' }
+function invoice(over: Record<string, unknown> = {}, extra: Array<Record<string, unknown>> = []): Record<string, unknown> {
+  return {
+    currency: 'EUR', lineAmountsIncludeTax: false, _euVatTreatment: MARK,
+    lines: [
+      { description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: 'TAX131' },
+      { description: 'Shipping', quantity: 1, unitAmount: 10, accountCode: '260', taxType: 'TAX131' },
+      { description: 'IOSS VAT collected', quantity: 1, unitAmount: 21.99, accountCode: '821', taxType: 'NONE', noTaxKind: 'eu-vat-recovery' },
+      ...extra,
+    ],
+    ...over,
+  }
+}
+const ROUNDING = { description: 'Rounding adjustment', quantity: 1, unitAmount: -0.01, accountCode: '860', taxType: 'NONE', noTaxKind: 'rounding-difference' }
+
+test('[reversal] an invoice with a rounding line: the reversal target and the rounding reversal come from the invoice, and the credit note totals the invoice', () => {
+  const figures = wholeOrderReversalFigures({ invoice: invoice({}, [ROUNDING]), currency: 'EUR', net: D(110) })
+  assert.deepEqual(figures, { ok: true, vatAmount: '21.99', refundTotal: '131.98', rounding: { amount: '-0.01', accountCode: '860' } })
+  if (!figures.ok) return
+  const note = applyEuVatCreditNoteTreatment(
+    { currency: 'EUR', lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: CHARGED }, { description: 'Shipping', quantity: 1, unitAmount: 10, accountCode: '260', taxType: CHARGED }], lineAmountsIncludeTax: false } as TreatablePayload,
+    plan({ lineKinds: ['goods', 'goods'], linePostingTypes: ['TAX131', 'TAX131'], vatAmount: figures.vatAmount, refundTotal: figures.refundTotal, roundingReversal: figures.rounding }),
+  )
+  assert.equal(note.ok, true, note.ok ? '' : note.reason)
+  if (!note.ok) return
+  const rounding = note.payload.lines.filter((l) => l.noTaxKind === 'rounding-difference')
+  assert.deepEqual(rounding.map((l) => [l.accountCode, l.taxType, l.unitAmount]), [['860', 'NONE', -0.01]], 'the invoice\'s rounding line is reversed on its own account, same signed amount')
+  assert.equal(note.payload.lines.reduce((sum, l) => sum.plus(D(l.unitAmount).times(l.quantity)), D(0)).toString(), '131.98')
+  assert.deepEqual(findSalesDocumentTaxTypeProblems(note.payload), [])
+})
+
+test('[reversal] without a rounding line there is no rounding reversal; the old target (net + order tax) is no longer what decides it', () => {
+  assert.deepEqual(wholeOrderReversalFigures({ invoice: invoice({ lines: (invoice().lines as unknown[]).slice(0, 3) }), currency: 'EUR', net: D(110) }), { ok: true, vatAmount: '21.99', refundTotal: '131.99', rounding: null })
+})
+
+test('[reversal] REFUSES when equality cannot be proven: lines that differ from the invoice, no invoice, no marker, another currency, two rounding lines, an unreadable rounding line', () => {
+  const refuses = (input: Parameters<typeof wholeOrderReversalFigures>[0], pattern: RegExp) => {
+    const result = wholeOrderReversalFigures(input)
+    assert.equal(result.ok, false)
+    if (!result.ok) assert.match(result.reason, pattern)
+  }
+  refuses({ invoice: invoice({}, [ROUNDING]), currency: 'EUR', net: D(109.99) }, /is not the invoice's total/)
+  refuses({ invoice: invoice({}, [ROUNDING]), currency: 'EUR', net: D(110.01) }, /is not the invoice's total/)
+  refuses({ invoice: null, currency: 'EUR', net: D(110) }, /no invoice/)
+  refuses({ invoice: invoice({ _euVatTreatment: undefined }), currency: 'EUR', net: D(110) }, /marker/)
+  refuses({ invoice: invoice(), currency: 'GBP', net: D(110) }, /EUR but the credit note is in GBP/)
+  refuses({ invoice: invoice({}, [ROUNDING, ROUNDING]), currency: 'EUR', net: D(110) }, /2 rounding lines/)
+  refuses({ invoice: invoice({}, [{ ...ROUNDING, unitAmount: 'x' }]), currency: 'EUR', net: D(110) }, /rounding line cannot be read/)
+  assert.match(reversalNotProvenRefusal('CN-1', 'why'), /NOTHING WAS SENT/)
+})
+
+test('[reversal] the builder refuses a rounding reversal that names no account or an unreadable amount, and a zero amount adds no line', () => {
+  const base = { lineKinds: ['goods', 'goods'] as CreditNoteLineKind[], linePostingTypes: ['TAX131', 'TAX131'], vatAmount: '21.99', refundTotal: '131.99' }
+  const note = { currency: 'EUR', lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: CHARGED }, { description: 'Shipping', quantity: 1, unitAmount: 10, accountCode: '260', taxType: CHARGED }], lineAmountsIncludeTax: false } as TreatablePayload
+  assert.equal(applyEuVatCreditNoteTreatment(note, plan({ ...base, roundingReversal: { amount: '-0.01', accountCode: ' ' } })).ok, false)
+  assert.equal(applyEuVatCreditNoteTreatment(note, plan({ ...base, roundingReversal: { amount: 'x', accountCode: '860' } })).ok, false)
+  const zero = applyEuVatCreditNoteTreatment(note, plan({ ...base, roundingReversal: { amount: '0', accountCode: '860' } }))
+  assert.equal(zero.ok && zero.payload.lines.some((l) => l.noTaxKind === 'rounding-difference'), false)
 })

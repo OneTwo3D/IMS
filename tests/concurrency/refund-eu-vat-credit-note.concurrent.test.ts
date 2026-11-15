@@ -128,6 +128,26 @@ async function cleanup(db: Db, fx: Fixture | undefined) {
   await db.accountingToken.deleteMany({ where: { connector: 'xero', tenantId: 'tenant-eu-vat-cn-test' } }).catch(() => {})
 }
 
+
+/** The treated scheme invoice IMS queued for the fixture order (net 134, shipping 10 as a line, VAT 25.46; a rounding line when asked): a whole-order reversal is derived from it (o3d-k26m.13). */
+async function seedInvoice(db: Db, fx: Fixture, currency: string, opts: { rounding?: number; marker?: boolean; goods?: number } = {}) {
+  const line = (description: string, unitAmount: number, accountCode: string, taxType: string, noTaxKind?: string) => ({ description, quantity: 1, unitAmount, accountCode, taxType, ...(noTaxKind ? { noTaxKind } : {}) })
+  await db.accountingSyncLog.create({
+    data: {
+      connector: 'xero', type: 'SALES_INVOICE', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: fx.orderId,
+      payload: {
+        currency, lineAmountsIncludeTax: false,
+        ...(opts.marker === false ? {} : { _euVatTreatment: { applied: true, route: 'scheme', regime: 'IOSS' } }),
+        lines: [
+          line('Widget', opts.goods ?? 100, '200', 'TAX131'), line('EU Customs Fee', 20, '232', 'NONE', 'fee-no-tax'), line('EU Handling Fee', 4, '232', 'NONE', 'fee-no-tax'), line('Shipping', 10, '260', 'TAX131'),
+          line('IOSS VAT collected', 25.46, '821', 'NONE', 'eu-vat-recovery'),
+          ...(opts.rounding === undefined ? [] : [line('Rounding adjustment', opts.rounding, '860', 'NONE', 'rounding-difference')]),
+        ],
+      },
+    },
+  })
+}
+
 const wooRefundId = () => 3_000_000 + Math.floor(Math.random() * 6_000_000)
 type RefundLine = { lineId: string | null; productId: null; description: string; qty: 0; totalBase: number; lineKind: 'sale' | 'shipping'; chargedTaxForeign?: number }
 const itemised = (lineId: string, description: string, net: number, tax: number): RefundLine => ({ lineId, productId: null, description, qty: 0, totalBase: net, lineKind: 'sale', chargedTaxForeign: tax })
@@ -434,6 +454,7 @@ test('[eu vat credit note] a CANCELLATION (the whole-order reversal) reverses th
   const fx = await seed(deps, { stamp: 'IOSS', schemeRate: true })
   t.after(async () => { await restore(); await cleanup(deps.db, fx) })
   await seedXeroList(deps.db, { TAX131: '0.000000' })
+  await seedInvoice(deps.db, fx, deps.baseCurrency)
   const lines: RefundLine[] = [
     { lineId: fx.goods, productId: null, description: 'Widget', qty: 0, totalBase: 100, lineKind: 'sale' },
     { lineId: fx.feeA, productId: null, description: 'EU Customs Fee', qty: 0, totalBase: 20, lineKind: 'sale' },
@@ -711,13 +732,44 @@ test('[eu vat credit note] the frozen basis decides every figure: a missing gros
 
 test('[eu vat credit note] a whole-order reversal (the chargeback) needs no frozen basis and reverses the order\'s whole VAT', { skip }, async (t) => {
   const { deps, fx } = await prepared(t, { stamp: 'IOSS', schemeRate: true })
+  await seedInvoice(deps.db, fx, deps.baseCurrency)
   const refund = await directRefund(deps, fx, { lines: [{ net: '134', rate: null }], stated: null, source: 'CHARGEBACK_POLLER' })
   const outcome = await treat(deps, fx, refund)
   assert.equal(outcome.kind, 'treated')
   if (outcome.kind !== 'treated') return
   const lines = outcome.payload.lines as Array<{ noTaxKind?: string; unitAmount: number }>
   assert.equal(lines.find((l) => l.noTaxKind === 'eu-vat-recovery')?.unitAmount, 25.46)
+  assert.equal(lines.some((l) => l.noTaxKind === 'rounding-difference'), false)
   assert.equal((outcome.payload._euVatTreatment as Record<string, unknown>).refundTotal, '159.46')
+})
+
+test('[eu vat credit note] a whole-order reversal of an invoice that carries a ROUNDING line reverses it too (860, same signed amount) and totals the invoice (o3d-k26m.13)', { skip }, async (t) => {
+  const { deps, fx } = await prepared(t, { stamp: 'IOSS', schemeRate: true })
+  await seedInvoice(deps.db, fx, deps.baseCurrency, { rounding: -0.01 })
+  const refund = await directRefund(deps, fx, { lines: [{ net: '134', rate: null }], stated: null, source: 'CHARGEBACK_POLLER' })
+  const outcome = await treat(deps, fx, refund)
+  assert.equal(outcome.kind, 'treated')
+  if (outcome.kind !== 'treated') return
+  const lines = outcome.payload.lines as Array<{ accountCode: string; taxType: string; noTaxKind?: string; unitAmount: number; quantity: number }>
+  assert.deepEqual(lines.filter((l) => l.noTaxKind === 'rounding-difference').map((l) => [l.accountCode, l.taxType, l.unitAmount]), [['860', 'NONE', -0.01]])
+  assert.equal(lines.reduce((sum, l) => sum + l.unitAmount * l.quantity, 0).toFixed(2), '159.45')
+  assert.equal((outcome.payload._euVatTreatment as Record<string, unknown>).refundTotal, '159.45')
+})
+
+test('[eu vat credit note] a whole-order reversal that cannot be PROVEN equal to its invoice is a refused hand-post row: no invoice, an invoice without the marker, lines that differ from it (o3d-k26m.13)', { skip }, async (t) => {
+  const { deps, fx } = await prepared(t, { stamp: 'IOSS', schemeRate: true })
+  const refund = await directRefund(deps, fx, { lines: [{ net: '134', rate: null }], stated: null, source: 'CHARGEBACK_POLLER' })
+  const none = await treat(deps, fx, refund)
+  assert.equal(none.kind, 'refused')
+  assert.equal(none.kind === 'refused' ? none.code : null, 'hand_post')
+  assert.match(refusal(none)?.reason ?? '', /cannot prove it equals the invoice[\s\S]*no invoice of IMS/)
+  await seedInvoice(deps.db, fx, deps.baseCurrency, { marker: false })
+  assert.match(refusal(await treat(deps, fx, refund))?.reason ?? '', /no invoice of IMS/)
+  await deps.db.accountingSyncLog.deleteMany({ where: { referenceId: fx.orderId } })
+  await seedInvoice(deps.db, fx, deps.baseCurrency, { goods: 99, rounding: 0.01 })
+  const differs = refusal(await treat(deps, fx, refund))
+  assert.match(differs?.reason ?? '', /is not the invoice's total/)
+  assert.equal(differs?.code, 'hand_post')
 })
 
 test('[eu vat credit note] a refused credit note leaves its operator record', { skip }, async (t) => {

@@ -132,6 +132,11 @@ export const noStampRefusal = (creditNoteNumber: string): string =>
   withLedgerCheck(`NOTHING WAS SENT. Credit note ${creditNoteNumber} is on an order sold under the EU IOSS/VOEC/DDP scheme, but the order has no recorded VAT regime (it was imported before the Sales Invoices switch was on, or its regime could not be decided), so IMS cannot tell which account its VAT was posted to and will not guess. `
   + `This row is refused and is never sent. Check Xero for credit note ${creditNoteNumber} first. If it is not there, post the credit note by hand in Xero on the same VAT account the order's invoice used (821 for IOSS and VOEC, 232 for DDP) and the zero-rated type of the order's scheme rate. Then record the outcome on this row with the settle action on /sync.`)
 
+/** What the operator reads when a whole-order reversal cannot be proven equal to the invoice it cancels (no readable invoice payload, or its figures differ from the refund's lines). The same refused, settleable row. */
+export const reversalNotProvenRefusal = (creditNoteNumber: string, why: string): string =>
+  withLedgerCheck(`NOTHING WAS SENT. Credit note ${creditNoteNumber} reverses a whole order sold under the EU IOSS/VOEC/DDP scheme, but IMS cannot prove it equals the invoice it cancels: ${why}. IMS will not post a credit note that may differ from the invoice (for example one that misses the invoice's rounding line). `
+  + `This row is refused and is never sent. Check Xero for credit note ${creditNoteNumber} first. If it is not there, open the order's invoice in Xero and post the credit note by hand as an exact copy of it (every line, the VAT line on the stamped account, and any rounding line). Then record the outcome on this row with the settle action on /sync.`)
+
 /** The payload key a REFUSED credit-note row carries: the poster refuses any row holding it, before anything else, so the row can be claimed and shown on /sync and settled by hand but never sent. */
 export const EU_VAT_CREDIT_NOTE_REFUSED_KEY = '_euVatCreditNoteRefused'
 
@@ -179,6 +184,8 @@ export type EuVatCreditNotePlan = {
   vatDescription: string
   /** Why the posting type cannot be relied on (unknown, not ACTIVE, not revenue, not exactly 0%, or the stored Xero list cannot prove it), or null. REQUIRED, never defaulted. */
   schemePostingTypeProblem: string | null
+  /** A whole-order reversal only: the rounding line the invoice carried (owner ruling Q7, account 860), reversed at the same signed amount on the same account. Absent or null when the invoice had none. */
+  roundingReversal?: { amount: string; accountCode: string } | null
 }
 
 export type EuVatCreditNoteResult<P extends TreatablePayload> =
@@ -248,6 +255,19 @@ export function applyEuVatCreditNoteTreatment<P extends TreatablePayload>(payloa
     next = { ...next, lines: [...next.lines, line] }
   }
 
+  // The invoice's rounding line, reversed (whole-order reversal only): the same signed amount on the same account, on NONE.
+  if (plan.roundingReversal != null) {
+    const amount = dec(plan.roundingReversal.amount)
+    if (amount === null) return refuse('the invoice\'s rounding amount cannot be read')
+    if (isBlank(plan.roundingReversal.accountCode)) return refuse('the invoice\'s rounding line names no account')
+    if (!amount.isZero()) {
+      next = {
+        ...next,
+        lines: [...next.lines, { description: 'Rounding adjustment reversed', quantity: 1, unitAmount: roundMoney(amount, currency).toNumber(), accountCode: plan.roundingReversal.accountCode.trim(), taxType: NO_TAX, noTaxKind: 'rounding-difference' }],
+      }
+    }
+  }
+
   const refundTotal = dec(plan.refundTotal)
   if (refundTotal === null) return refuse('the refund amount cannot be read, so the credit note cannot be checked against it')
   const predicted = predictedUntaxedTotal(next)
@@ -284,4 +304,46 @@ export function refundTaxAndTotal(input: { net: Decimal; pricedTax: Decimal; /**
     return { ok: false, reason: `the refund states ${gross.toString()} ${currency} in all, so ${vat.toString()} of tax over a net of ${net.toString()}, but its lines' own rates give ${roundMoney(pricedTax, currency).toString()}; that is more than rounding explains` }
   }
   return { ok: true, vatAmount: vat.toString(), refundTotal: gross.toString() }
+}
+
+
+/**
+ * THE FIGURES OF A WHOLE-ORDER REVERSAL, DERIVED FROM THE INVOICE PAYLOAD IMS POSTED (or queued to post) AND REQUIRED TO EQUAL IT. Pure.
+ * The invoice's own lines give the VAT (its one `eu-vat-recovery` line) and the rounding line (at most one `rounding-difference` line, owner ruling Q7), and its untaxed total is the amount the reversal must total. The credit note's lines (`net`, what its goods, fee and shipping lines sum to) plus
+ * that VAT plus that rounding must equal the invoice total EXACTLY; if not, or if the invoice cannot be read as a treated scheme invoice in the same currency, it refuses rather than let the credit note differ from the invoice it cancels.
+ */
+export function wholeOrderReversalFigures(input: { invoice: Record<string, unknown> | null; currency: string; net: Decimal }): { ok: true; vatAmount: string; refundTotal: string; rounding: { amount: string; accountCode: string } | null } | { ok: false; reason: string } {
+  const { invoice, currency } = input
+  if (invoice === null) return { ok: false, reason: 'no invoice of IMS\'s for this order carries the EU VAT treatment, so there is no invoice payload to reverse' }
+  const marker = invoice[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown; route?: unknown } | null | undefined
+  if (marker?.applied !== true || marker.route !== 'scheme') return { ok: false, reason: 'the order\'s invoice does not carry the scheme treatment marker' }
+  if (typeof invoice.currency !== 'string' || invoice.currency.trim().toUpperCase() !== currency.trim().toUpperCase()) return { ok: false, reason: `the invoice is in ${String(invoice.currency ?? '(no currency)')} but the credit note is in ${currency}` }
+  if (invoice.lineAmountsIncludeTax === true || !Array.isArray(invoice.lines)) return { ok: false, reason: 'the invoice payload has no readable tax-exclusive lines' }
+  const lines = invoice.lines as TreatableLine[]
+  const vatLines = lines.filter((line) => line.noTaxKind === 'eu-vat-recovery')
+  const roundingLines = lines.filter((line) => line.noTaxKind === 'rounding-difference')
+  if (vatLines.length !== 1) return { ok: false, reason: `the invoice has ${vatLines.length} VAT line(s), not one` }
+  if (roundingLines.length > 1) return { ok: false, reason: `the invoice has ${roundingLines.length} rounding lines, not at most one` }
+  const vat = dec(vatLines[0]!.unitAmount)
+  const quantity = dec(vatLines[0]!.quantity)
+  if (vat === null || quantity === null || !quantity.eq(1)) return { ok: false, reason: 'the invoice\'s VAT line cannot be read' }
+  let rounding: { amount: string; accountCode: string } | null = null
+  let roundingAmount = toDecimal(0)
+  if (roundingLines.length === 1) {
+    const amount = dec(roundingLines[0]!.unitAmount)
+    const roundingQuantity = dec(roundingLines[0]!.quantity)
+    if (amount === null || roundingQuantity === null || !roundingQuantity.eq(1)) return { ok: false, reason: 'the invoice\'s rounding line cannot be read' }
+    const accountCode = String(roundingLines[0]!.accountCode ?? '').trim()
+    if (accountCode === '') return { ok: false, reason: 'the invoice\'s rounding line names no account' }
+    roundingAmount = roundMoney(amount, currency)
+    rounding = { amount: roundingAmount.toString(), accountCode }
+  }
+  const invoiceTotal = predictedUntaxedTotal(invoice as unknown as TreatablePayload)
+  if (invoiceTotal === null) return { ok: false, reason: 'an amount on the invoice cannot be read' }
+  const vatRounded = roundMoney(vat, currency)
+  const reversal = roundMoney(input.net, currency).plus(vatRounded).plus(roundingAmount)
+  if (!reversal.eq(invoiceTotal)) {
+    return { ok: false, reason: `the reversal (lines ${roundMoney(input.net, currency).toString()} + VAT ${vatRounded.toString()} + rounding ${roundingAmount.toString()} = ${reversal.toString()} ${currency}) is not the invoice's total (${invoiceTotal.toString()} ${currency})` }
+  }
+  return { ok: true, vatAmount: vatRounded.toString(), refundTotal: invoiceTotal.toString(), rounding }
 }

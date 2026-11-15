@@ -68,6 +68,7 @@ type OrderLineDouble = {
   // ("one penny-rounded VAT figure per component") pass vacuously, so they are part of the shape.
   taxBase: number
   taxRate: { rate: number; reverseCharge: boolean } | null
+  totalForeign?: number
 }
 type OrderDouble = {
   // o3d-w00 (Codex r6 #1/#2): the order's CURRENCY (which says how coarsely its money figures could
@@ -1719,4 +1720,85 @@ test('[q0x56.8] a refund on a foreign order with a usable stored rate converts a
   const result = await syncWcRefund(1001, makeRefund({ id: 7303 }), state.dependencies)
   assert.deepEqual(result, { outcome: 'applied' })
   assert.equal(state.createRefundLines[0].totalBase, 10, '12.50 foreign / the booked 1.25')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-k26m.14: refunded fee lines are mapped to the ORIGINAL order fee line, with net and tax.
+// ---------------------------------------------------------------------------
+const FEE_ORDER_LINES: OrderLineDouble[] = [
+  { ...DEFAULT_ORDER_LINE },
+  { id: 'fee-1', productId: null, externalLineItemId: null, description: 'EU Customs Fee', qty: 1, totalBase: 4, taxBase: 0.8, taxRate: { rate: 0.2, reverseCharge: false }, totalForeign: 4 } as OrderLineDouble,
+  { id: 'fee-2', productId: null, externalLineItemId: null, description: 'EU Handling Fee', qty: 1, totalBase: 2, taxBase: 0.4, taxRate: { rate: 0.2, reverseCharge: false }, totalForeign: 2 } as OrderLineDouble,
+]
+const goodsRefundLine = {
+  id: 504, name: 'Widget', product_id: 10, variation_id: 0, quantity: -1, tax_class: '', subtotal: '-12.50', subtotal_tax: '-2.50', total: '-12.50', total_tax: '-2.50', sku: 'WIDGET',
+  meta_data: [{ id: 1, key: '_refunded_item_id', value: '501' }], refund_total: 15,
+}
+
+test('a refund of goods PLUS a fee maps both: the fee is linked to the original fee line with its net and tax, and the refund is created (o3d-k26m.14)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: FEE_ORDER_LINES } })
+  // goods 12.50 + 2.50 tax = 15.00, fee 4.00 + 0.80 tax = 4.80: the Woo refund amount is 19.80.
+  const refund = makeRefund({
+    amount: '19.80',
+    line_items: [goodsRefundLine],
+    fee_lines: [{ id: 910, name: 'EU Customs Fee', total: '-4.00', total_tax: '-0.80', taxes: [{ id: 9, total: '-0.80' }] }],
+  })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
+  assert.equal(state.createRefundCalls, 1)
+  assert.equal(state.createRefundLines.length, 2)
+  const fee = state.createRefundLines.find((line) => line.lineId === 'fee-1')
+  assert.ok(fee, 'the fee refund line is linked to the ORIGINAL order fee line')
+  assert.equal(fee.totalForeign, 4)
+  assert.equal(fee.chargedTaxForeign, 0.8)
+  assert.equal(fee.qty, 0, 'a fee carries no stock quantity')
+  assert.equal(fee.lineKind, 'sale')
+})
+
+test('a fee-only refund maps the fee line (it is not a monetary-only refund taxed at the order rate) (o3d-k26m.14)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: FEE_ORDER_LINES } })
+  const refund = makeRefund({ amount: '2.40', line_items: [], fee_lines: [{ name: 'EU Handling Fee', total: '-2.00', total_tax: '-0.40' }] })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
+  assert.deepEqual(state.createRefundLines.map((line) => [line.lineId, line.totalForeign, line.chargedTaxForeign]), [['fee-2', 2, 0.4]])
+})
+
+test('a refunded fee that matches NO order fee line is a clear QUARANTINED park, never silently dropped, and createRefund is not called (o3d-k26m.14)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: FEE_ORDER_LINES } })
+  const refund = makeRefund({
+    amount: '19.80',
+    line_items: [goodsRefundLine],
+    fee_lines: [{ name: 'Some Other Fee', total: '-4.00', total_tax: '-0.80' }],
+  })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.outcome, 'quarantined-refusal')
+  assert.match(result.error ?? '', /Some Other Fee/)
+  assert.match(result.error ?? '', /cannot match/)
+  assert.equal(state.createRefundCalls, 0)
+  assert.equal(state.syncLogs.some((log) => (log as { data?: { status?: string } }).data?.status === 'QUARANTINED'), true, 'the park is QUARANTINED so an operator sees it')
+  assert.equal((state.activityLogs as Array<{ action?: string }>).some((entry) => entry.action === 'refund_sync_fee_line_unmatched'), true)
+})
+
+test('two same-named fees are ambiguous unless the amount tells them apart; an ambiguous refunded fee parks (o3d-k26m.14)', async () => {
+  const twins: OrderLineDouble[] = [
+    DEFAULT_ORDER_LINE,
+    { id: 'fee-a', productId: null, externalLineItemId: null, description: 'Fee', qty: 1, totalBase: 4, taxBase: 0.8, taxRate: null, totalForeign: 4 } as OrderLineDouble,
+    { id: 'fee-b', productId: null, externalLineItemId: null, description: 'Fee', qty: 1, totalBase: 4, taxBase: 0.8, taxRate: null, totalForeign: 4 } as OrderLineDouble,
+  ]
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: twins } })
+  const result = await syncWcRefund(1001, makeRefund({ amount: '4.80', line_items: [], fee_lines: [{ name: 'Fee', total: '-4.00', total_tax: '-0.80' }] }), state.dependencies)
+  assert.equal(result.outcome, 'quarantined-refusal')
+  assert.equal(state.createRefundCalls, 0)
+})
+
+test('a zero-amount fee line on a refund is not a refunded fee and does not park it (o3d-k26m.14)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: FEE_ORDER_LINES } })
+  const result = await syncWcRefund(1001, makeRefund({ fee_lines: [{ name: 'Ghost', total: '0', total_tax: '0' }] }), state.dependencies)
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
 })
