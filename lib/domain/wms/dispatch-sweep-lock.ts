@@ -28,7 +28,7 @@ export const DISPATCH_LOCK_SKIPPED: DispatchLockSkipped = { lockSkipped: true }
 
 /** Namespace for pg_try_advisory_lock(key1, key2) — distinct from other locks. */
 export { DISPATCH_SWEEP_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
-import { DISPATCH_SWEEP_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { DISPATCH_SWEEP_LOCK_NAMESPACE, ORDER_PUSH_SWEEP_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 
 /**
  * Stable 32-bit key for a connector id. A hash rather than a registry so a new
@@ -60,7 +60,7 @@ export function dispatchSweepLockKey(connectorId: string): number {
  */
 let lockPool: Pool | null = null
 function getLockPool(): Pool {
-  if (!lockPool) lockPool = createSessionAdvisoryLockPool('the dispatch-sweep lock', 2)
+  if (!lockPool) lockPool = createSessionAdvisoryLockPool('the WMS sweep locks', 4)
   return lockPool
 }
 
@@ -69,13 +69,34 @@ export async function withDispatchSweepLockOrSkip<T>(
   connectorId: string,
   fn: () => Promise<T>,
 ): Promise<T | DispatchLockSkipped> {
+  return withSweepLockOrSkip(DISPATCH_SWEEP_LOCK_NAMESPACE, connectorId, '[wms-dispatch-sweep]', fn)
+}
+
+/**
+ * Run `fn` holding the per-connector ORDER-PUSH sweep lock, or skip if another push sweep holds it. The push sweep creates, holds,
+ * releases, cancels and amends warehouse orders and posts notes; two overlapping runs could each act on the same link. Same
+ * connection-pinned session lock as the dispatch sweep, in its own namespace so the two sweeps do not exclude each other.
+ */
+export async function withOrderPushSweepLockOrSkip<T>(
+  connectorId: string,
+  fn: () => Promise<T>,
+): Promise<T | DispatchLockSkipped> {
+  return withSweepLockOrSkip(ORDER_PUSH_SWEEP_LOCK_NAMESPACE, connectorId, '[wms-order-push]', fn)
+}
+
+async function withSweepLockOrSkip<T>(
+  namespace: number,
+  connectorId: string,
+  logTag: string,
+  fn: () => Promise<T>,
+): Promise<T | DispatchLockSkipped> {
   const key = dispatchSweepLockKey(connectorId)
   const client: PoolClient = await getLockPool().connect()
   let held = false
   try {
     const acquired = await client.query<{ locked: boolean }>(
       'SELECT pg_try_advisory_lock($1, $2) AS locked',
-      [DISPATCH_SWEEP_LOCK_NAMESPACE, key],
+      [namespace, key],
     )
     if (!acquired.rows[0]?.locked) return DISPATCH_LOCK_SKIPPED
     held = true
@@ -86,17 +107,17 @@ export async function withDispatchSweepLockOrSkip<T>(
       try {
         const released = await client.query<{ unlocked: boolean }>(
           'SELECT pg_advisory_unlock($1, $2) AS unlocked',
-          [DISPATCH_SWEEP_LOCK_NAMESPACE, key],
+          [namespace, key],
         )
         if (!released.rows[0]?.unlocked) {
           // Returning a connection that still holds a session lock would wedge
           // every future sweep for this connector. Destroy it instead.
-          console.error('[wms-dispatch-sweep] advisory unlock returned false — destroying the connection')
+          console.error(`${logTag} advisory unlock returned false — destroying the connection`)
           client.release(true)
           destroyed = true
         }
       } catch (unlockError) {
-        console.error('[wms-dispatch-sweep] advisory unlock failed — destroying the connection:', unlockError)
+        console.error(`${logTag} advisory unlock failed — destroying the connection:`, unlockError)
         client.release(true)
         destroyed = true
       }

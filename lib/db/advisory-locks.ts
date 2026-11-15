@@ -222,6 +222,9 @@ export const WC_PRODUCT_WRITE_LOCK_NAMESPACE = 918_273_646
 /** Per-connector WMS dispatch sweep (o3d-bjc.9): one sweep at a time. */
 export const DISPATCH_SWEEP_LOCK_NAMESPACE = 0x77_6d_73_64 // 'wmsd'
 
+/** Per-connector WMS order-push sweep: one sweep at a time (creates, holds, releases and cancels are serialised). */
+export const ORDER_PUSH_SWEEP_LOCK_NAMESPACE = 0x77_6d_73_70 // 'wmsp'
+
 /** Per-refund dedup of the reservation-release warning. */
 export const REFUND_RELEASE_WARNING_LOCK_NAMESPACE = 411_220_867
 
@@ -406,6 +409,7 @@ export const SESSION_LOCK_SPACE_PROBE_NAMESPACE = SESSION_LOCK_SPACE_PROBE_NAMES
 export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   DISPATCH_SWEEP_LOCK_NAMESPACE,
+  ORDER_PUSH_SWEEP_LOCK_NAMESPACE,
   REFUND_RELEASE_WARNING_LOCK_NAMESPACE,
   BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE,
   ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE,

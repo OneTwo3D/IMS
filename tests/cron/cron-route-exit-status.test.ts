@@ -116,8 +116,13 @@ test('wms-order-push: failed pushes answer 500; pushes the hold refused do not; 
   assert.equal(await statusOf(pushRoute), 200)
   doubles.push = { skipped: 'No WMS connector is enabled', ...base }
   assert.equal(await statusOf(pushRoute), 200)
+  // Another push sweep holds the connector's advisory lock: the run is skipped, which is 2xx (and recorded as skipped, not failed).
+  doubles.push = { skipped: 'Another WMS order push sweep is already running', ...base }
+  assert.equal(await statusOf(pushRoute), 200)
+  assert.equal(recorded.at(-1), 'skipped')
   doubles.push = { ...base, failed: 1 }
   assert.equal(await statusOf(pushRoute), 500)
+  assert.equal(recorded.at(-1), 'failed')
   doubles.push = { ...base, deadLettered: 1 }
   assert.equal(await statusOf(pushRoute), 500)
   // Orders NEWLY parked this run (counted once, on entry): the payload could not be built; a dispatched create has no recorded outcome. Each is a failed run.

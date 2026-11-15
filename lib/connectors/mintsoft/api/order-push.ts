@@ -1057,15 +1057,30 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
  * dedupe would disclose our order detail on a FOREIGN order. Callers treat
  * comments as best-effort, so the extra ownership read is cheap insurance.
  */
+/**
+ * A comment that DEFINITELY did not reach Mintsoft (nothing was sent, or Mintsoft refused it with a 4xx before accepting it). Carries
+ * `nothingSent`, which is how the order-push sweep tells a safe-to-retry refusal from an uncertain answer (a timeout, a 5xx, a transport
+ * error), which it never re-posts blind.
+ */
+export class MintsoftCommentNotSentError extends Error {
+  readonly nothingSent = true
+}
+
 export async function addMintsoftOrderComment(externalOrderId: string, comment: string): Promise<void> {
   const clientId = await getPushClientId('Mintsoft order comment')
   // The one write to an existing order that is NOT identity-gated, on purpose: it is an additive, fixed-wording note, and the merged-order
   // notices are posted to a survivor whose number is by definition not IMS's. The ownership read (client) still applies.
-  const { found } = await fetchMintsoftOrderStatusId(externalOrderId, clientId, null)
+  // The ownership read is a READ: a failure of it means nothing was written, so it is a definite "not sent".
+  let found: boolean
+  try {
+    ;({ found } = await fetchMintsoftOrderStatusId(externalOrderId, clientId, null))
+  } catch (error) {
+    throw new MintsoftCommentNotSentError(`Mintsoft order ${externalOrderId} could not be read — the warehouse note was not posted: ${error instanceof Error ? error.message : 'read failed'}`)
+  }
   if (!found) {
     // Observable, not silent: callers audit this call's outcome, and a warehouse
     // warning that was never posted must not be recorded as SUCCEEDED.
-    throw new Error(`Mintsoft order ${externalOrderId} not found — the warehouse note was not posted`)
+    throw new MintsoftCommentNotSentError(`Mintsoft order ${externalOrderId} not found — the warehouse note was not posted`)
   }
 
   const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/Comments`, {
@@ -1073,7 +1088,13 @@ export async function addMintsoftOrderComment(externalOrderId: string, comment: 
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ Comment: comment.slice(0, 1000), Admin: true }),
   })
-  if (result.error) throw new Error(result.error)
+  if (result.error) {
+    // DEFINITE only when nothing was accepted: the outbound-write hold refused it before it left IMS, or Mintsoft answered a 4xx (not a
+    // 408 timeout) DIRECTLY, with zero redirect hops. A response reached after a followed redirect, or with unknown provenance, proves nothing
+    // about the original request (an earlier hop may have accepted the POST), so it is uncertain, like a timeout, a 5xx or a transport error.
+    const refused = result.held === true || (result.status >= 400 && result.status < 500 && result.status !== 408 && result.redirectsFollowed === 0)
+    throw refused ? new MintsoftCommentNotSentError(result.error) : new Error(result.error)
+  }
 }
 
 export async function cancelMintsoftOrder(

@@ -719,6 +719,12 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
   /** Post an operator-facing note onto the WMS order — e.g. to flag a refund to the
    *  warehouse when the API cannot auto-apply it (a past-NEW order). */
   addOrderComment?(externalOrderId: string, comment: string, clearance: WmsWriteClearance<'order.comment'>): Promise<void>
+  /**
+   * The texts of the comments already on a warehouse order (a read-only fetch), so a note IMS may already have posted can be recognised by
+   * its marker instead of being posted twice. Throws when the comments cannot be read (never answers an empty list for "unknown"). Optional:
+   * a connector that cannot read them leaves every uncertain note to an operator (see removal-note-obligation.ts).
+   */
+  readOrderComments?(externalOrderId: string): Promise<string[]>
   verifyWebhookSignature?(
     rawBody: string,
     signatureHeader: string | null,

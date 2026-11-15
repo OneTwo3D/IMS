@@ -4,6 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { lockStorefrontMappingWrites } from '@/lib/tax/storefront-mapping-write'
 import { logActivity } from '@/lib/activity-log'
+import { REMOVAL_NOTE_KEY_PREFIX } from '@/lib/domain/wms/removal-note-obligation'
 import { lockPackScheduleSettings } from '@/lib/reconciliation-pack/schedule-lock'
 import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selection-lock'
 import {
@@ -118,6 +119,10 @@ async function clearTransactionScope(guards: ResetGuards) {
     // Operator answers for WooCommerce order lines belong to the orders just deleted.
     await tx.euVatGiftCardLineResolution.deleteMany({})
   }, { timeout: 600_000, maxWait: 30_000 })
+  // The warehouse links went with the orders (cascade); their pending merged-line removal notes live in `settings` and must go too, or the
+  // push sweep would post an old note about a deleted order to the live warehouse. (The sweep also refuses any note whose link or order is
+  // gone, so the gap between the transaction above and this delete cannot post one.)
+  await db.setting.deleteMany({ where: { key: { startsWith: REMOVAL_NOTE_KEY_PREFIX } } })
 
   guards.assertHeld('purchasing')
   // Purchasing
