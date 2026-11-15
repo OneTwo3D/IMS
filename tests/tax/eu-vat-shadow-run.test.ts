@@ -76,6 +76,20 @@ test('exit 0 only when everything matches; a review order, a truncated selection
   assert.equal(shadowExitCode(cut), 1)
 })
 
+test('an empty comparison (every order non-EU, or none found) exits 4 and says it is not an acceptance pass', async () => {
+  const allNonEu = await runEuVatShadow(ports({ '1': { destination: 'GB' }, '2': { destination: 'US' } }), { selection: { kind: 'orders', refs: ['x'] }, maxOrders: 5 })
+  assert.equal(allNonEu.results.length, 0)
+  assert.equal(shadowExitCode(allNonEu), 4)
+  assert.match(renderEuVatShadowText(allNonEu), /No EU orders were compared; this is not an acceptance pass/)
+  const none = await runEuVatShadow(ports({}), { selection: { kind: 'orders', refs: ['x'] }, maxOrders: 5 })
+  assert.equal(shadowExitCode(none), 4)
+  assert.match(renderEuVatShadowUsage(), /4 {2}nothing-compared/)
+  const out: string[] = []
+  const code = await runEuVatShadowCli({ argv: ['--live-read', '--orders', '1'], env: { DATABASE_URL: 'x' }, uid: 0, checkoutOwnerUid: 0, stdout: (t) => { out.push(t) }, stderr: () => {}, deps: { run: async () => allNonEu, disconnect: async () => {} } })
+  assert.equal(code, 4)
+  assert.match(out.join('\n'), /not an acceptance pass/)
+})
+
 test('a non-EU destination is skipped before anything is built or fetched', async () => {
   const calls = { xero: [] as string[], build: [] as string[], load: [] as string[], list: [] as number[] }
   const report = await runEuVatShadow(ports({ '1': { destination: 'GB' }, '2': { destination: 'DE' }, '3': { destination: 'NO' }, '4': { destination: null } }, calls), { selection: { kind: 'orders', refs: ['x'] }, maxOrders: 10 })
@@ -134,7 +148,7 @@ test('the command refuses without --live-read and never reaches a port; with it,
   assert.equal(await runEuVatShadowCli({ ...base, argv: ['--orders', '1'] }), 3)
   assert.equal(ran, 0)
   assert.match(err.join('\n'), /LIVE_READ_REQUIRED/)
-  assert.equal(await runEuVatShadowCli({ ...base, argv: ['--live-read', '--orders', '1'] }), 0)
+  assert.equal(await runEuVatShadowCli({ ...base, argv: ['--live-read', '--orders', '1'] }), 4, 'the stub compared nothing')
   assert.equal(ran, 1)
   assert.match(err.join('\n'), /GET requests only/)
   assert.equal(await runEuVatShadowCli({ ...base, argv: ['--help'] }), 0)
@@ -179,12 +193,13 @@ test('the shadow files and the functions they reach contain no write', () => {
     for (const pattern of FORBIDDEN) assert.equal(pattern.test(source), false, `${file} matches ${pattern}`)
   }
   const importer = readFileSync(new URL('../../lib/connectors/woocommerce/sync/order-import.ts', import.meta.url), 'utf8')
-  for (const signature of ['export async function buildShadowWcSalesInvoice(', 'async function readFreshWcInvoiceInputs(', 'async function buildFreshWcSalesInvoice(']) {
+  for (const signature of ['export async function buildShadowWcSalesInvoice(', 'async function buildShadowWcSalesInvoiceInner(', 'async function readFreshWcInvoiceInputs(', 'async function buildFreshWcSalesInvoice(']) {
     const body = sliceFunction(importer, signature).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
     for (const pattern of FORBIDDEN) assert.equal(pattern.test(body), false, `${signature} matches ${pattern}`)
   }
-  const shadowBody = sliceFunction(importer, 'export async function buildShadowWcSalesInvoice(')
+  const shadowBody = sliceFunction(importer, 'export async function buildShadowWcSalesInvoice(') + sliceFunction(importer, 'async function buildShadowWcSalesInvoiceInner(')
   assert.match(shadowBody, /collectingUnmappedWcRates\(/, 'the shadow build resolves tax inside the side-effect-free collector')
+  assert.match(shadowBody, /withoutSettingMigration\(/, 'every settings read on the shadow build decrypts and never migrates')
   assert.match(shadowBody, /unmapped_tax_rate/, 'an unmapped rate refuses the order as unmapped_tax_rate')
   const treatment = readFileSync(new URL('../../lib/connectors/woocommerce/sync/eu-vat-invoice-treatment.ts', import.meta.url), 'utf8')
   const preview = sliceFunction(treatment, 'export async function previewTreatedSalesInvoice(').replace(/Parameters<typeof treatImportedSalesInvoice>/g, '').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')

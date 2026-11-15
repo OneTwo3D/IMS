@@ -77,7 +77,7 @@ import { WC_ORDER_SWEEP_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-livenes
 import {
   UNRECONCILED_TAX_PAYLOAD_KEY, buildUnreconciledTaxMarker,
 } from '@/lib/domain/accounting/document-tax-reconciliation'
-import { getSettingValue } from '@/lib/settings-store'
+import { getSettingValue, withoutSettingMigration } from '@/lib/settings-store'
 import { notify } from '@/lib/notifications'
 import { parsePositiveIntegerEnv } from '@/lib/env'
 import { startWcIncumbentEvidence } from '@/lib/domain/incumbent-evidence/record'
@@ -2174,6 +2174,11 @@ export type ShadowWcInvoiceBuild =
   | { kind: 'refused'; reason: string }
 
 export async function buildShadowWcSalesInvoice(orderId: string, wcOrder: WcFullOrder): Promise<ShadowWcInvoiceBuild> {
+  // Every settings read below (accounting settings, EU regime settings, the gift-card cut-in) decrypts and never migrates: a legacy plaintext secret is not re-encrypted by a read the shadow report makes.
+  return withoutSettingMigration(() => buildShadowWcSalesInvoiceInner(orderId, wcOrder))
+}
+
+async function buildShadowWcSalesInvoiceInner(orderId: string, wcOrder: WcFullOrder): Promise<ShadowWcInvoiceBuild> {
   const prep = await readFreshWcInvoiceInputs(wcOrder)
   if (!prep.ok) {
     return { kind: 'refused', reason: prep.code === 'currency' ? 'the order\u2019s currency is missing or unreadable' : prep.code === 'store_credit' ? 'the order carries store credit, and IMS refuses a store-credit invoice whole' : 'its coupons cannot be classified' }

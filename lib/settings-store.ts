@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { db } from '@/lib/db'
 import { maskSecret } from '@/lib/security/secret-mask'
 import {
@@ -243,7 +244,18 @@ export async function migrateEncryptedSettingValue(
  * Pinned by the ADMIN positive control in tests/security/setting-secret-read-authorization.test.ts,
  * which asserts the compare-and-swap, the ciphertext and the SILENCE of the best-effort catch.
  */
+/**
+ * READ-ONLY SETTINGS (the EU VAT shadow report). Inside `withoutSettingMigration` every read in this file decrypts a value and NEVER migrates it: a legacy plaintext credential is returned as it is and
+ * not re-encrypted (`setting.updateMany`). Ambient (AsyncLocalStorage), so every `getSettingValue(s)` the callee reaches is covered, whoever wrote the call. Outside it nothing changes.
+ */
+const noMigrationScope = new AsyncLocalStorage<true>()
+
+export function withoutSettingMigration<T>(fn: () => Promise<T>): Promise<T> {
+  return noMigrationScope.run(true, fn)
+}
+
 async function maybeMigrateSetting(key: string, value: string): Promise<void> {
+  if (noMigrationScope.getStore() === true) return
   await migrateEncryptedSettingValue(key, value)
 }
 

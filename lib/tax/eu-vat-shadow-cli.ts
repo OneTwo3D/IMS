@@ -6,7 +6,7 @@
  * response object or credential.
  */
 import { accountAllowed, buildPackEnv } from '@/lib/reconciliation-pack/cli'
-import { SHADOW_DEFAULT_MAX_ORDERS, SHADOW_HARD_MAX_ORDERS, shadowExitCode, type ShadowOrderResult, type ShadowReport, type ShadowSelection } from '@/lib/tax/eu-vat-shadow-run'
+import { SHADOW_NOTHING_COMPARED_MESSAGE, SHADOW_DEFAULT_MAX_ORDERS, SHADOW_HARD_MAX_ORDERS, shadowExitCode, type ShadowOrderResult, type ShadowReport, type ShadowSelection } from '@/lib/tax/eu-vat-shadow-run'
 import type { LineRow } from '@/lib/domain/accounting/eu-vat-shadow-compare'
 
 export { accountAllowed }
@@ -82,6 +82,7 @@ export function parseEuVatShadowArgs(argv: readonly string[]): EuVatShadowArgs |
 export const EU_VAT_SHADOW_EXIT_CODES = [
   { code: 0, name: 'all-match', meaning: 'Every chosen EU order matched the Xero invoice exactly.' },
   { code: 1, name: 'not-all-match', meaning: 'At least one order differs, needs review (a boundary-FX order that differs), was refused by IMS, has no Xero invoice or could not be compared, or the selection was cut short. A review order is accepted by a person, not by this code.' },
+  { code: 4, name: 'nothing-compared', meaning: 'No EU order was compared (every selected order was non-EU, or none was found). An empty comparison is not an acceptance pass.' },
   { code: 3, name: 'refused-or-internal', meaning: 'The command did not start or failed (bad argument, --live-read missing, account not allowed, database not given). Nothing was compared.' },
 ] as const
 
@@ -150,6 +151,7 @@ export function renderEuVatShadowText(report: ShadowReport): string {
   }
   if (report.skippedNotEu > 0) out.push(`Skipped, not an EU destination: ${report.skippedNotEu}.`)
   if (report.unresolved.length > 0) out.push(`Not found in IMS (or without a WooCommerce link): ${report.unresolved.join(', ')}.`)
+  if (report.results.length === 0) out.push(SHADOW_NOTHING_COMPARED_MESSAGE + '.')
   if (report.truncated) out.push(`The selection was larger than --max ${report.maxOrders}: only the first ${report.maxOrders} were read.`)
   return out.join('\n')
 }

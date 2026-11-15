@@ -127,8 +127,15 @@ async function runOne(ports: ShadowPorts, ref: ShadowOrderRef): Promise<ShadowOr
   return { ...base, status, xeroStatus: reading.status, comparison, detail: status === 'not_comparable' ? `not fully compared: ${comparison.incomplete.join('; ')}` : null }
 }
 
-/** The exit code of a finished report: 0 only when every order matched; 1 when anything differs, needs review (boundary), was refused by IMS, has no Xero document or could not be compared, or the selection was cut short or not fully resolved. A `review` order is accepted by a person, not by the exit code. */
-export function shadowExitCode(report: ShadowReport): 0 | 1 {
+/** The message printed when nothing was compared. */
+export const SHADOW_NOTHING_COMPARED_MESSAGE = 'No EU orders were compared; this is not an acceptance pass'
+
+/**
+ * The exit code of a finished report: 4 when NO order was compared (every selected order was non-EU, or none was found): an empty comparison is not an acceptance pass. Otherwise 0 only when every order matched;
+ * 1 when anything differs, needs review (boundary), was refused by IMS, has no Xero document or could not be compared, or the selection was cut short or not fully resolved. A `review` order is accepted by a person, not by the exit code.
+ */
+export function shadowExitCode(report: ShadowReport): 0 | 1 | 4 {
+  if (report.results.length === 0) return 4
   const c = report.counts
   return c.differs + c.review + c.ims_refused + c.no_xero_doc + c.not_comparable > 0 || report.truncated || report.unresolved.length > 0 ? 1 : 0
 }
