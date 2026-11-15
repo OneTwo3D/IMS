@@ -117,3 +117,64 @@ test('real database: an owed note posts ONCE with its marker; after the order is
   await run()
   assert.equal(mine(live.id).length, 1, 'and never again')
 })
+
+test('real database: 30 needs_check rows (the oldest) do not starve a newer owed note out of a 25-row batch', SKIP, async (t) => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const { createPrismaWmsOrderPushPort, runWmsOrderPushSweepCore } = await import('@/lib/domain/wms/order-push-sweep')
+  const { removalNoteKey, serializeRemovalNote } = await import('@/lib/domain/wms/removal-note-obligation')
+  const { randomUUID } = await import('node:crypto')
+  const tag = `st${randomUUID().slice(0, 8)}`
+  const connectorId = 'mintsoft'
+  const keys: string[] = []
+  t.after(async () => {
+    await db.setting.deleteMany({ where: { key: { in: keys } } })
+    await db.salesOrder.deleteMany({ where: { id: `${tag}o` } })
+  })
+  const item = [{ externalItemId: '10', sku: 'SKU-A', quantity: 1 }]
+  for (let i = 0; i < 30; i += 1) {
+    const key = removalNoteKey(connectorId, `${tag}-stuck-${i}`)
+    keys.push(key)
+    await db.setting.create({ data: { key, value: serializeRemovalNote({ id: `s${i}`, linkId: `${tag}-stuck-${i}`, orderId: 'x', externalOrderId: 'y', state: 'needs_check', attempted: true, items: item }) } })
+  }
+  const id = `${tag}o`
+  await db.salesOrder.create({ data: { id, orderNumber: `IMSTEST-${id}`, status: 'CANCELLED', currency: 'GBP', subtotalForeign: 100, totalForeign: 100, subtotalBase: 100, totalBase: 100 } })
+  const link = await db.wmsOrderPushLink.create({ data: { orderId: id, connector: connectorId, state: 'CANCELLED', externalOrderId: `surv-${id}`, externalOrderNumber: 'MS-1' } })
+  const owedKey = removalNoteKey(connectorId, link.id)
+  keys.push(owedKey)
+  await db.setting.create({ data: { key: owedKey, value: serializeRemovalNote({ id: 'ob1', linkId: link.id, orderId: id, externalOrderId: `surv-${id}`, state: 'owed', attempted: false, items: item }) } })
+
+  const port = createPrismaWmsOrderPushPort()
+  const batch = await port.pendingRemovalNotes!(connectorId, 25)
+  assert.ok(batch.some((o) => o.linkId === link.id), 'the owed note is in the batch')
+  assert.ok(batch.every((o) => o.state !== 'needs_check'), 'needs_check rows are excluded by the query')
+
+  const posted: Array<{ id: string; comment: string }> = []
+  const connector = {
+    pushOrder: async () => { throw new Error('not used') },
+    cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }),
+    addOrderComment: async (target: string, comment: string) => { posted.push({ id: target, comment }) },
+  }
+  await runWmsOrderPushSweepCore(connector as never, connectorId, port, { batchSize: 25 })
+  assert.equal(posted.filter((p) => p.id === `surv-${id}`).length, 1, 'the owed note posts')
+  assert.equal(await db.setting.count({ where: { key: { in: keys.filter((k) => k !== owedKey) } } }), 30, 'the 30 needs_check rows are untouched')
+})
+
+test('real database: quarantining moves a needs_check row out of its link slot and keeps it', SKIP, async (t) => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const { createPrismaWmsOrderPushPort } = await import('@/lib/domain/wms/order-push-sweep')
+  const { removalNoteKey, serializeRemovalNote, REMOVAL_NOTE_KEY_PREFIX } = await import('@/lib/domain/wms/removal-note-obligation')
+  const connector = 'test-quarantine-connector'
+  t.after(async () => { await db.setting.deleteMany({ where: { key: { startsWith: `${REMOVAL_NOTE_KEY_PREFIX}${connector}:` } } }) })
+  const port = createPrismaWmsOrderPushPort()
+  const ob = { id: 'q1', linkId: 'ql', orderId: 'o', externalOrderId: 'old', state: 'needs_check' as const, attempted: true, items: [] }
+  await db.setting.create({ data: { key: removalNoteKey(connector, 'ql'), value: serializeRemovalNote(ob) } })
+  await port.quarantineRemovalNote!(connector, 'ql')
+  assert.equal(await port.readRemovalNote!(connector, 'ql'), null, 'the link slot is free')
+  const kept = await db.setting.findMany({ where: { key: { startsWith: `${REMOVAL_NOTE_KEY_PREFIX}${connector}:` } } })
+  assert.equal(kept.length, 1, 'and the row is kept for the operator')
+  const fresh = await port.recordRemovalNote!(connector, { linkId: 'ql', orderId: 'o', externalOrderId: 'new', items: [] })
+  assert.equal(fresh.state, 'intended')
+  assert.equal(fresh.externalOrderId, 'new')
+})
