@@ -20,8 +20,9 @@ import type { WmsConnector, WmsOrderAddress, WmsOrderItemRef, WmsOrderPushInput,
 import { decideWmsHeldRelease, wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal, wmsCreateReplayPolicy, type WmsCreateReplayPolicySource } from './create-replay-policy'
 import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere, wmsPaidBeforeCreateFloor } from './create-eligibility'
 import { withOrderPushSweepLockOrSkip } from './dispatch-sweep-lock'
-import { removalNoteKey, removalNoteMarker, REMOVAL_NOTE_KEY_PREFIX, parseRemovalNote, serializeRemovalNote, type WmsRemovalNoteObligation, type RemovalNoteItem } from './removal-note-obligation'
+import { removalNoteKey, REMOVAL_NOTE_KEY_PREFIX, parseRemovalNote, serializeRemovalNote, type WmsRemovalNoteObligation, type RemovalNoteItem } from './removal-note-obligation'
 import { scrubWmsError } from './error-scrub'
+import { courierFallbackQuery, describeTaskLines, mergedLinesRemovedQuery, noticeQuery, partialRemovalCheckQuery, raiseWmsOperatorTask, warehouseOrderRef, type WmsOperatorTaskInput } from './operator-tasks'
 import { proveMergeLineage } from './merge-lineage'
 import { recordWmsMutationEvent, type WmsMutationEventInput } from './mutation-audit'
 import {
@@ -368,10 +369,12 @@ export type WmsOrderPushSweepResult = {
   operatorNotices?: number
   /** PRESENT ONLY WHEN NON-ZERO: pushes the outbound-write hold refused. Each is also counted in `failed` (it spent no attempt); the cron exit status subtracts them, so a held push alone does not read as a failure. */
   outboundHeld?: number
-  /** PRESENT ONLY WHEN NON-ZERO: warehouse notes for earlier notices that were delivered on this sweep after an earlier failure. */
-  noticeCommentsRetried?: number
-  /** PRESENT ONLY WHEN NON-ZERO: removal notes that NEWLY moved to needs_check this sweep (the note may or may not have reached the warehouse; never re-posted blind). Counted once on entry, so the run is red once and an operator checks the order's comments. */
-  removalNoteNeedsCheck?: number
+  /** PRESENT ONLY WHEN NON-ZERO: operator tasks ("raise a Mintsoft query") this sweep recorded. IMS writes no comment to the warehouse; a task is how the warehouse is told. */
+  operatorTasksRaised?: number
+  /** PRESENT ONLY WHEN NON-ZERO: operator tasks that could not be recorded this sweep (retried next sweep; nothing is lost). The cron reports a failed run for these. */
+  operatorTaskErrors?: number
+  /** PRESENT ONLY WHEN NON-ZERO: operator tasks open right now. A count for the run's result only: NOT a failure, the cron is not red for a task waiting on a person. */
+  operatorTasksOpen?: number
   /**
    * The producer-side hold kept this many units of work as a shadow instead of producing them: an order create, an amendment, a
    * hold, a cancellation or a note. PRESENT ONLY WHEN NON-ZERO, so a sweep on an installation that does not enforce the hold
@@ -687,11 +690,6 @@ export function courierNamesForOrder(order: { courierKey?: string | null; shippi
  *   PLACEHOLDER -> no courier name at all (the create left the courier to the default; naming it again would re-send what
  *                  the WMS could not resolve).
  */
-/** The warehouse-visible note raised when an order's courier did not resolve and the default courier was used. */
-export function courierFallbackNote(shippingService: string | null | undefined): string {
-  return `IMS: shipping method '${shippingService ?? '—'}' did not map to a WMS courier, so a default courier was used. Please verify the courier before despatch.`
-}
-
 export function applyLinkCourierForm(
   input: WmsOrderPushInput,
   link: { courierForm?: string | null; courierFormName?: string | null },
@@ -861,28 +859,18 @@ export type WmsPushRevalidateLink = {
 export type WmsPushAmbiguousCreateLink = WmsPushRevalidateLink
 
 /**
- * The ONE warehouse-visible note per notice kind (fixed wording, no warehouse or error text). The retry pass re-derives a note from
- * (intent, merged) alone, so the text a failed note is retried with is exactly the text it would first have carried.
+ * What makes an operator task THE SAME ONE, whichever pass raises it and whatever name it uses for the warehouse order: the lines it is about
+ * (so the cancel pass and the obligation pass, which can both raise the task for one removal, raise ONE), or the fact itself.
  */
-const WMS_NOTICE_COMMENTS = {
-  HOLD_MERGED: 'IMS: An order that was merged into this one has been placed ON HOLD in IMS. IMS has not cancelled this order because it holds other orders\' goods. Please take the held order\'s items out of it if you can, or raise a query.',
-  HOLD_PAST_NEW: 'IMS: This order has been placed ON HOLD in IMS but is already being fulfilled here and could not be auto-cancelled. Please pause it if possible, or raise a cancellation query.',
-  CANCEL_MERGED: 'IMS: An order that was merged into this one has been CANCELLED / fully refunded in IMS. IMS has not cancelled this order because it holds other orders\' goods. Please take the cancelled order\'s items out of it before despatch.',
-  CANCEL_PAST_NEW: 'IMS: This order has been cancelled / fully refunded in IMS but is already being fulfilled here and could not be auto-cancelled. Please raise a cancellation query.',
-} as const
-export function wmsNoticeComment(intent: 'HOLD' | 'CANCEL', merged: boolean): string {
-  return WMS_NOTICE_COMMENTS[`${intent}_${merged ? 'MERGED' : 'PAST_NEW'}` as keyof typeof WMS_NOTICE_COMMENTS]
-}
+export const removedLinesBasis = (kind: 'MERGED' | 'PARTIAL', items: ReadonlyArray<{ externalItemId: string }>): string =>
+  `${kind === 'MERGED' ? 'lines-removed' : 'lines-partial'}:${items.map((item) => item.externalItemId).sort().join(',')}`
+export const COURIER_FALLBACK_BASIS = 'courier-fallback'
+
+/** The episode of a notice: its timestamp. A later hold or cancel of the same order (the notice having been cleared) is a NEW episode, hence a new task. */
+export const noticeEpisode = (intent: 'HOLD' | 'CANCEL', noticeAt: Date): string => `notice:${intent}:${noticeAt.toISOString()}`
 
 /** One warehouse line as an operator reads it: quantity, SKU and the warehouse's own line id. */
-export function describeWmsOrderItems(items: ReadonlyArray<Pick<WmsOrderItemRef, 'externalItemId' | 'sku' | 'quantity'>>): string {
-  return items.map((item) => `${item.quantity} x ${item.sku} (line ${item.externalItemId})`).join(', ')
-}
-
-/** The one warehouse-visible note left after IMS removed a cancelled / fully refunded order's lines from a merged order. */
-export function wmsMergedRemovalComment(orderNumber: string, removed: ReadonlyArray<Pick<WmsOrderItemRef, 'externalItemId' | 'sku' | 'quantity'>>): string {
-  return `IMS: Order ${orderNumber} was cancelled / fully refunded in IMS, so IMS removed its lines from this merged order: ${describeWmsOrderItems(removed)}. No other line was changed.`
-}
+export const describeWmsOrderItems = describeTaskLines
 
 /**
  * Which ORDERS the cancel pass pulls from the warehouse: cancelled in IMS, or fully refunded and not yet despatched. ONE definition:
@@ -1141,16 +1129,20 @@ export interface WmsOrderPushPort {
   /**
    * The removal-note obligation store (see removal-note-obligation.ts). `recordRemovalNote` writes the 'intended' row BEFORE the first remote
    * delete and leaves an existing row exactly as it is; `updateRemovalNote` merges a patch into an existing row (false when none);
-   * `removalNoteContext` reads what the obligation's link and order are NOW, so a row that no longer describes anything is never posted.
+   * `removalNoteContext` reads what the obligation's link and order are NOW, so a row that no longer describes anything is never acted on.
    */
   recordRemovalNote?(connector: string, note: { linkId: string; orderId: string; externalOrderId: string; items: RemovalNoteItem[] }): Promise<WmsRemovalNoteObligation>
   readRemovalNote?(connector: string, linkId: string, externalOrderId: string): Promise<WmsRemovalNoteObligation | null>
-  updateRemovalNote?(connector: string, linkId: string, externalOrderId: string, patch: Partial<Pick<WmsRemovalNoteObligation, 'state' | 'attempted' | 'items' | 'detail' | 'verified'>>): Promise<boolean>
+  updateRemovalNote?(connector: string, linkId: string, externalOrderId: string, patch: Partial<Pick<WmsRemovalNoteObligation, 'state' | 'items' | 'detail' | 'verified' | 'taskRaised'>>): Promise<boolean>
   pendingRemovalNotes?(connector: string, limit: number): Promise<WmsRemovalNoteObligation[]>
   clearRemovalNote?(connector: string, linkId: string, externalOrderId: string): Promise<boolean>
   removalNoteContext?(linkId: string): Promise<{ linkState: string; externalOrderId: string | null; orderId: string; orderNumber: string | null; erased: boolean; cancellable: boolean } | null>
-  /** Notices whose warehouse note was never delivered (the comment failed, was shadowed, or the connector could not post). */
-  noticesAwaitingComment?(connector: string, limit: number): Promise<Array<{ id: string; orderId: string; externalOrderId: string; state: 'SYNCED' | 'MERGED'; intent: 'HOLD' | 'CANCEL'; noticeAt: Date }>>
+  /** Notices whose operator task has not been recorded (raising it failed, or the notice predates operator tasks). */
+  noticesAwaitingComment?(connector: string, limit: number): Promise<Array<{ id: string; orderId: string; externalOrderId: string; state: 'SYNCED' | 'MERGED'; intent: 'HOLD' | 'CANCEL'; noticeAt: Date; orderNumber?: string | null; externalOrderNumber?: string | null }>>
+  /** Record one operator task ("raise a query"), once: true when a new row was written, false when the same task already exists. A rejection means it was NOT recorded. */
+  raiseOperatorTask?(task: WmsOperatorTaskInput): Promise<boolean>
+  /** Operator tasks still open for this connector (information for the sweep's result). */
+  countOpenOperatorTasks?(connector: string): Promise<number>
   updateLinkIfLinked?(
     id: string,
     expect: {
@@ -1224,7 +1216,7 @@ type PushConnector = Pick<
   // revalidation pass needs before it may re-open a create whose outcome is unknown. Tri-state on
   // purpose: only MISSING means "verifiably no such order", and a merged/ambiguous match must
   // never be reported as MISSING.
-  'pushOrder' | 'updateOrder' | 'cancelOrder' | 'addOrderComment' | 'verifyPushedOrder' | 'probeOrderPresence' | 'reconcileAmbiguousCreate' | 'findMergedSurvivor' | 'removeOrderItems' | 'cancelMergedOrder' | 'fetchOrderItemRefs' | 'readOrderComments'
+  'pushOrder' | 'updateOrder' | 'cancelOrder' | 'verifyPushedOrder' | 'probeOrderPresence' | 'reconcileAmbiguousCreate' | 'findMergedSurvivor' | 'removeOrderItems' | 'cancelMergedOrder' | 'fetchOrderItemRefs'
 >
 
 /**
@@ -1288,103 +1280,51 @@ export async function runWmsOrderPushSweepCore(
     }
   }
 
-  // Best-effort warehouse-visible note when IMS can't propagate a hold/cancel
-  // because the WMS order is already past NEW. Mirrors the refund-conflict comment
-  // (onetwo3d-ims-ql59); never fail the sweep on a comment error.
-  const attemptComment = async (externalOrderId: string, comment: string, orderId?: string): Promise<{ result: 'posted' | 'failed' | 'skipped'; definiteRefusal: boolean }> => {
-    if (!connector.addOrderComment) return { result: 'skipped', definiteRefusal: false }
-    const commentSeam = await wmsProducerSeam(connectorId, {
-      operation: 'order.comment',
-      subjectType: 'SalesOrder',
-      subjectId: orderId ?? externalOrderId,
-      payload: { externalOrderId, comment },
-      context: producerContext,
-    })
-    if (!commentSeam.proceed) {
-      shadowedCount += 1
-      return { result: 'skipped', definiteRefusal: false }
-    }
+  // IMS WRITES NO COMMENT TO THE WAREHOUSE. The warehouse's staff do not read order comments (only a query reaches them, and the API cannot
+  // raise one), so wherever IMS used to post a note it records an operator task instead: "raise a query for order X saying Y", listed on
+  // Sync > Exceptions with a Done action (operator-tasks.ts). Raising a task is a local write: it needs no producer-seam clearance, is never
+  // shadowed, and sends nothing.
+  /** Raise one task; true when the task is recorded (new or already there), false when it could not be (logged, counted: the cron reports it). Never throws. */
+  const raiseTaskBestEffort = async (task: Omit<WmsOperatorTaskInput, 'connector'>): Promise<boolean> => {
+    if (!port.raiseOperatorTask) return false
     try {
-      await connector.addOrderComment(externalOrderId, comment, commentSeam.clearance)
-      await audit({
-        action: 'order_comment', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: orderId ?? null, externalId: externalOrderId,
-        summary: 'Warehouse-visible note posted on WMS order', after: { comment },
-      })
-      return { result: 'posted', definiteRefusal: false }
+      if (await port.raiseOperatorTask({ connector: connectorId, ...task })) operatorTasksRaised += 1
+      return true
     } catch (error) {
-      console.error('[wms-order-push] failed to post conflict comment', error)
-      await audit({
-        action: 'order_comment', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: orderId ?? null, externalId: externalOrderId,
-        summary: 'Failed to post warehouse-visible note on WMS order', after: { comment }, error: scrubWmsError(error, 'WMS comment failed'),
-      })
-      // DEFINITE only when the connector says nothing was sent (a hold, a 4xx before acceptance, a refused connection); every other failure is uncertain.
-      const nothingSent = (error as { nothingSent?: unknown } | null)?.nothingSent === true
-      return { result: 'failed', definiteRefusal: nothingSent }
+      operatorTaskErrorCount += 1
+      console.error('[wms-order-push] failed to raise an operator task', error)
+      return false
     }
   }
-  const postConflictComment = async (externalOrderId: string, comment: string, orderId?: string): Promise<'posted' | 'failed' | 'skipped'> =>
-    (await attemptComment(externalOrderId, comment, orderId)).result
+  /** The same, but a failure THROWS: for the steps that must not go on without the task (closing a link whose lines were removed). */
+  const raiseTaskOrThrow = async (task: Omit<WmsOperatorTaskInput, 'connector'>): Promise<void> => {
+    if (!port.raiseOperatorTask) return
+    if (await port.raiseOperatorTask({ connector: connectorId, ...task })) operatorTasksRaised += 1
+  }
 
   /**
-   * Move an obligation whose note may or may not have reached the warehouse to needs_check: never re-posted blind. It is raised ONCE (this
-   * sweep's result counts it, which makes the cron run red, and the audit timeline records it); the row stays in `settings` under
-   * REMOVAL_NOTE_KEY_PREFIX with the reason in `detail`, until an operator has looked at the warehouse order's comments.
+   * A PARTIAL removal (only some of the recorded lines are gone), or one whose lines could not be read, keeps the link OPEN: the obligation
+   * moves to needs_check (the cancel pass then neither closes the link nor retries the removal over it) and ONE operator task is raised,
+   * "take the rest out of the merged order". Its Done action re-reads the order and closes the link only when every recorded line is gone.
+   * The task is raised BEFORE the state moves, so a failure leaves the obligation as it was and the next sweep tries again. The cron is NOT
+   * red for it: an open task is not a failure.
    */
-  const markRemovalNoteNeedsCheck = async (ob: WmsRemovalNoteObligation, detail: string) => {
-    const moved = await port.updateRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId, { state: 'needs_check', detail }).catch(() => false)
-    if (!moved) return
-    removalNoteNeedsCheckCount += 1
-    console.error(`[wms-order-push] removal note for link ${ob.linkId} on WMS order ${ob.externalOrderId} needs a check: ${detail}`)
-    await audit({
-      action: 'order_comment', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: ob.orderId, externalId: ob.externalOrderId,
-      summary: 'The removal note may or may not have been posted on the merged WMS order — NOT re-posted; check the order\'s comments in the WMS', error: detail,
+  const escalatePartialRemoval = async (ob: WmsRemovalNoteObligation, detail: string, orderLabel: string, externalOrderNumber?: string | null) => {
+    if (ob.taskRaised) return
+    const wmsOrder = warehouseOrderRef(externalOrderNumber, ob.externalOrderId)
+    await raiseTaskOrThrow({
+      orderId: ob.orderId, externalOrderId: ob.externalOrderId, reason: 'PARTIAL_REMOVAL_CHECK',
+      queryText: partialRemovalCheckQuery(wmsOrder, orderLabel, ob.items),
+      dedupeBasis: removedLinesBasis('PARTIAL', ob.items),
+      payload: { orderNumber: orderLabel, externalOrderNumber: externalOrderNumber ?? null, linkId: ob.linkId, items: ob.items },
     })
-  }
-
-  /**
-   * Post one owed removal note, never twice. `attempted` is persisted BEFORE the send, so a crash, a failed delete of the obligation or an
-   * uncertain answer after it leaves the flag set; the next sweep then looks for the note's marker in the order's comments (when the
-   * connector can read them) and deletes the obligation without posting if it is there. Unreadable comments, or an uncertain answer
-   * (anything but a definite "nothing was sent"), go to needs_check. Only a definite refusal clears the flag and is retried.
-   */
-  const deliverRemovalNote = async (ob: WmsRemovalNoteObligation, orderLabel: string): Promise<'posted' | 'pending' | 'needs_check'> => {
-    const clear = () => port.clearRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId).catch((e) => console.error('[wms-order-push] could not clear the removal note obligation', e))
-    const marker = removalNoteMarker(ob)
-    if (ob.attempted) {
-      if (!connector.readOrderComments) {
-        await markRemovalNoteNeedsCheck(ob, 'an earlier send may have reached the warehouse and the connector cannot read the order\'s comments to prove it')
-        return 'needs_check'
-      }
-      let comments: string[]
-      try {
-        comments = await connector.readOrderComments(ob.externalOrderId)
-      } catch (error) {
-        await markRemovalNoteNeedsCheck(ob, `an earlier send may have reached the warehouse and its comments could not be read: ${scrubWmsError(error, 'comment read failed')}`)
-        return 'needs_check'
-      }
-      if (comments.some((comment) => comment.includes(marker))) {
-        await clear()
-        return 'posted'
-      }
-      // The marker is not there: the earlier attempt provably did not land, so one post is correct.
-    }
-    const armed = await port.updateRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId, { attempted: true }).catch(() => false)
-    // Nothing is sent that cannot first be recorded as sent.
-    if (!armed) return 'pending'
-    const out = await attemptComment(ob.externalOrderId, `${marker} ${wmsMergedRemovalComment(orderLabel, ob.items)}`, ob.orderId)
-    if (out.result === 'posted') {
-      await clear()
-      return 'posted'
-    }
-    if (out.result === 'skipped' || out.definiteRefusal) {
-      await port.updateRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId, { attempted: false }).catch((e) => console.error('[wms-order-push] could not re-arm the removal note', e))
-      return 'pending'
-    }
-    // UNCERTAIN (it may have been accepted). `attempted` stays set. A connector that can read the order's comments settles it on the next
-    // sweep (marker present = delivered, absent = one post); one that cannot hands it to an operator now.
-    if (connector.readOrderComments) return 'pending'
-    await markRemovalNoteNeedsCheck(ob, 'the warehouse\'s answer to the note was uncertain (it may have been accepted) and the connector cannot read the order\'s comments to prove it')
-    return 'needs_check'
+    const moved = await port.updateRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId, { state: 'needs_check', detail, taskRaised: true }).catch(() => false)
+    if (!moved) return
+    console.error(`[wms-order-push] removal for link ${ob.linkId} on WMS order ${ob.externalOrderId} needs an operator check: ${detail}`)
+    await audit({
+      action: 'order_cancel', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: ob.orderId, externalId: ob.externalOrderId,
+      summary: 'Part of the cancelled order\'s lines may still be on the merged WMS order — an operator task was raised and the link stays open', error: detail,
+    })
   }
 
   /**
@@ -1393,12 +1333,12 @@ export async function runWmsOrderPushSweepCore(
    * It used to dead-letter the link, which takes it out of dispatch polling: the warehouse then despatched the order and IMS never
    * recorded it (and no inbox control could put the link back). The link now stays exactly as it is, still polled for despatch, and
    * carries a NOTICE instead: the reason on `lastError`, the intent's notice timestamp set so the pass does not try again every
-   * sweep, and one warehouse-visible note. Nothing about the IMS order, its stock or its money is touched.
+   * sweep, and one operator task ("raise a query"). Nothing about the IMS order, its stock or its money is touched.
    */
   /**
-   * Stamp a posted note delivered ONLY while the link is still the one the note was posted for: the same state and warehouse order, and
-   * the same notice (its timestamp, which also fixes the intent). A worker that posted for an old order and finds the link re-pointed at
-   * a merged survivor, with a new notice of its own, stamps nothing, so the new notice's note is still posted.
+   * Stamp the notice's task raised ONLY while the link is still the one it was raised for: the same state and warehouse order, and
+   * the same notice (its timestamp, which also fixes the intent). A worker that raised for an old order and finds the link re-pointed at
+   * a merged survivor, with a new notice of its own, stamps nothing, so the new notice's task is still raised.
    */
   const stampNoteDelivered = async (
     note: { id: string; state: 'SYNCED' | 'MERGED'; externalOrderId: string; intent: 'HOLD' | 'CANCEL'; noticeAt: Date },
@@ -1416,15 +1356,19 @@ export async function runWmsOrderPushSweepCore(
     }
   }
 
+  /** The copy-ready query for a notice on this link (order numbers only), with an optional extra sentence of detail. */
+  const noticeText = (link: WmsPushLinkRef, intent: 'HOLD' | 'CANCEL', merged: boolean, extra?: string): string =>
+    noticeQuery(intent, merged, warehouseOrderRef(link.externalOrderNumber, link.externalOrderId as string), link.orderNumber ?? link.orderId) + (extra ? ` ${extra}` : '')
+
   const raiseWmsRefusalNotice = async (
     link: WmsPushLinkRef,
     intent: 'HOLD' | 'CANCEL',
     reason: string,
-    spec: { wmsStatus: string; summary: string; comment: string | null },
+    spec: { wmsStatus: string; summary: string; query: string | null },
     ts: Date,
   ) => {
-    // A notice that needs no warehouse note (a 404) is delivered by definition; the others are stamped only once the note is posted.
-    const noteNotNeeded = !spec.comment
+    // A notice that needs no warehouse query (a 404) is settled by definition; the others are stamped only once their task is raised.
+    const noteNotNeeded = !spec.query
     const noticeWrite = {
       ...(intent === 'HOLD'
         ? { holdNoticeAt: ts, holdNoticeCommentAt: noteNotNeeded ? ts : null }
@@ -1448,10 +1392,14 @@ export async function runWmsOrderPushSweepCore(
       after: { state: link.state ?? 'SYNCED', wmsStatus: spec.wmsStatus, operatorNotice: intent },
       error: reason,
     })
-    if (spec.comment && link.externalOrderId) {
-      // The notice stays on the link either way. Only a note that was actually posted is stamped delivered; a failed, shadowed or
-      // unsupported one is retried by the retry pass on a later sweep.
-      if ((await postConflictComment(link.externalOrderId, spec.comment, link.orderId)) === 'posted') {
+    if (spec.query && link.externalOrderId) {
+      // The notice stays on the link either way. Only a notice whose task was recorded is stamped; one whose task could not be written
+      // is raised by the retry pass on a later sweep (the dedupe basis is the notice's episode, so it is never raised twice).
+      if (await raiseTaskBestEffort({
+        orderId: link.orderId, externalOrderId: link.externalOrderId, reason: intent === 'HOLD' ? 'PUSH_CONFLICT' : 'CANCEL_NOTICE',
+        queryText: spec.query, dedupeBasis: noticeEpisode(intent, ts),
+        payload: { orderNumber: link.orderNumber ?? null, externalOrderNumber: link.externalOrderNumber ?? null },
+      })) {
         await stampNoteDelivered({ id: link.id, state: link.state ?? 'SYNCED', externalOrderId: link.externalOrderId, intent, noticeAt: ts }, ts)
       }
     }
@@ -1473,7 +1421,7 @@ export async function runWmsOrderPushSweepCore(
         summary: intent === 'HOLD'
           ? 'IMS hold not propagated: the order was merged into another WMS order — left for an operator'
           : 'IMS cancel not propagated: the order was merged into another WMS order — left for an operator',
-        comment: wmsNoticeComment(intent, true),
+        query: noticeText(link, intent, true),
       }, ts)
   }
 
@@ -1495,10 +1443,10 @@ export async function runWmsOrderPushSweepCore(
     }
     const survivorLabel = `WMS order ${survivorId}`
     const orderLabel = link.orderNumber ?? link.orderId
-    const notice = async (detail: string, summary: string) => {
+    const notice = async (detail: string, summary: string, queryExtra: string = detail) => {
       await raiseWmsRefusalNotice(link, 'CANCEL',
         `Cancelled in IMS, but ${survivorLabel} is a MERGED order that also holds other orders' goods, so IMS did not cancel it. ${detail} IMS has NOT recorded this order as cancelled in the WMS.`,
-        { wmsStatus: 'MERGED', summary, comment: wmsNoticeComment('CANCEL', true) }, ts)
+        { wmsStatus: 'MERGED', summary, query: noticeText(link, 'CANCEL', true, queryExtra) }, ts)
     }
     if (items.length === 0) {
       await notice(
@@ -1533,27 +1481,28 @@ export async function runWmsOrderPushSweepCore(
       return true
     }
     /**
-     * The removal is VERIFIED (or the lines are confirmed gone): owe the note, close the link, then deliver the note. The obligation moves to
-     * 'owed' BEFORE the link is closed, so a link is never closed with the note unrecorded; and delivery never makes the link wait.
+     * The removal is VERIFIED (or the lines are confirmed gone): raise the operator task ("raise a query: these lines were removed"), close the
+     * link, then drop the obligation. The task is recorded BEFORE the link is closed, in the step that used to queue the note, so a link is
+     * never closed with the task unrecorded; a throw here leaves the link and the obligation as they were and the next sweep tries again.
      */
     const completeRemoval = async (removed: WmsOrderItemRef[], obligation: WmsRemovalNoteObligation | null) => {
       if (obligation && obligation.state === 'intended') {
         await port.updateRemovalNote!(connectorId, link.id, survivorId, { state: 'owed', verified: true, items: removed.map(toRemovalNoteItem) })
       }
-      // A link that moved on is not closed, audited or noted: whatever obligation remains is judged against the link as it now is.
+      await raiseTaskOrThrow({
+        orderId: link.orderId, externalOrderId: survivorId, reason: 'MERGED_LINES_REMOVED',
+        queryText: mergedLinesRemovedQuery(warehouseOrderRef(link.externalOrderNumber, survivorId), orderLabel, removed),
+        dedupeBasis: removedLinesBasis('MERGED', removed),
+        payload: { orderNumber: orderLabel, externalOrderNumber: link.externalOrderNumber ?? null, items: removed.map(toRemovalNoteItem) },
+      })
+      // A link that moved on is not closed or audited: whatever obligation remains is judged against the link as it now is.
       if (!(await settleCancelled())) return
       await audit({
         action: 'order_cancel', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: survivorId,
         summary: `IMS-cancelled/fully-refunded order's lines removed from the merged WMS order: ${describeWmsOrderItems(removed)}`,
         before, after: { state: 'CANCELLED', removedLines: removed.map((item) => ({ line: item.externalItemId, sku: item.sku, quantity: item.quantity })) },
       })
-      if (!obligation) {
-        await postConflictComment(survivorId, wmsMergedRemovalComment(orderLabel, removed), link.orderId)
-        return
-      }
-      if (obligation.state === 'needs_check') return
-      const current = await port.readRemovalNote?.(connectorId, link.id, survivorId)
-      if (current && current.state === 'owed') await deliverRemovalNote(current, orderLabel)
+      await port.clearRemovalNote?.(connectorId, link.id, survivorId).catch((e) => console.error('[wms-order-push] could not clear the removal obligation', e))
     }
     // CONSULT THE OBLIGATION FIRST. A removal that was interrupted after the (irreversible) deletes leaves the lines gone, and asking the
     // connector to delete them again would be refused as "lines already missing". The obligation, written before the first delete, says
@@ -1562,11 +1511,12 @@ export async function runWmsOrderPushSweepCore(
     let obligation: WmsRemovalNoteObligation | null = port.readRemovalNote ? await port.readRemovalNote(connectorId, link.id, survivorId) : null
     // Obligations are keyed by (link, warehouse order), so the one read here is for the warehouse order this link names NOW: an obligation
     // recorded for an earlier warehouse order (the dispatch sweep re-pointed the link) is never found here, so it can neither complete this
-    // removal nor be overwritten by it; it is judged by the retry pass, which posts a VERIFIED (owed) note to its own warehouse order.
+    // removal nor be overwritten by it; it is judged by the obligation pass, which raises the task for a VERIFIED (owed) removal against its own warehouse order.
     if (obligation && obligation.orderId !== link.orderId) obligation = null
     // A needs_check that came from a PARTIAL interrupted removal (never verified) is for an operator: it must not close the link, and the
     // removal is not retried over it. (One that came after a verified removal has `verified` and closes the link as before.)
     if (obligation && obligation.state === 'needs_check' && obligation.verified !== true) return
+    // (A needs_check row that WAS verified, left by the earlier note-posting design, is a verified removal: it closes the link like owed.)
     if (obligation && (obligation.state === 'owed' || obligation.state === 'needs_check')) {
       await completeRemoval(obligation.items, obligation)
       return
@@ -1582,8 +1532,8 @@ export async function runWmsOrderPushSweepCore(
         if (present < obligation.items.length) {
           // SOME of the recorded lines are gone and some are not: an earlier attempt stopped part way. The generic "a recorded line is
           // already missing" refusal would stamp a cancel notice and take the link out of the cancel pass with the cron still green; this
-          // goes to needs_check (the cron goes red once) instead, with nothing posted and nothing closed.
-          await markRemovalNoteNeedsCheck(obligation, 'an earlier removal stopped part way: only some of the recorded lines are still on the warehouse order')
+          // goes to needs_check instead (an operator task: take the rest out), with nothing closed.
+          await escalatePartialRemoval(obligation, 'an earlier removal stopped part way: only some of the recorded lines are still on the warehouse order', orderLabel, link.externalOrderNumber)
           return
         }
       }
@@ -1622,7 +1572,7 @@ export async function runWmsOrderPushSweepCore(
         await raiseWmsRefusalNotice(link, 'CANCEL',
           `Cancelled in IMS but the merged WMS order is already past NEW (status ${cancel.status}) and could not be cancelled — raise a cancellation query in the WMS. `
           + 'The link stays live; a despatch that follows is raised for a person, never applied to the cancelled order.',
-          { wmsStatus: cancel.status, summary: 'IMS cancel could not cancel the merged WMS order (past NEW) — link kept live, operator notified', comment: wmsNoticeComment('CANCEL', false) }, ts)
+          { wmsStatus: cancel.status, summary: 'IMS cancel could not cancel the merged WMS order (past NEW) — link kept live, operator notified', query: noticeText(link, 'CANCEL', false) }, ts)
       }
       return
     }
@@ -1638,7 +1588,9 @@ export async function runWmsOrderPushSweepCore(
       `IMS tried to remove this order's lines from it, but did not complete: ${reason}. ${removedText}${remainingText}`.trimEnd(),
       removal.removed.length > 0
         ? 'IMS removed some of the cancelled order\'s lines from the merged WMS order and could not finish — left for an operator'
-        : 'IMS could not remove the cancelled order\'s lines from the merged WMS order — left for an operator')
+        : 'IMS could not remove the cancelled order\'s lines from the merged WMS order — left for an operator',
+      // The query carries the lines only (no connector error text): what was removed and what is still on the merged order.
+      `${removedText}${remainingText}`.trim())
   }
 
   /**
@@ -1705,7 +1657,7 @@ export async function runWmsOrderPushSweepCore(
       {
         wmsStatus: status,
         summary: `IMS ${intent === 'HOLD' ? 'hold' : 'cancel'} not sent: the WMS order could not be verified as this order — left for an operator`,
-        comment: null,
+        query: null,
       }, ts)
   }
 
@@ -1734,7 +1686,7 @@ export async function runWmsOrderPushSweepCore(
           await raiseWmsRefusalNotice(link, intent,
             `${intent === 'HOLD' ? 'Held' : 'Cancelled'} in IMS, but WMS order ${link.externalOrderId} was not found, and a possible merge into WMS order ${lookup.externalOrderId} could not be proven (${scrubWmsError(proof.reason, 'not proven')}). `
             + `IMS did not re-point this order or ${intent === 'HOLD' ? 'record it as held' : 'record it as cancelled in the WMS'} — check it in the WMS.`,
-            { wmsStatus: 'NOT_FOUND', summary: `IMS ${intent === 'HOLD' ? 'hold' : 'cancel'} could not be confirmed: the WMS order was not found and a possible merge could not be proven — left for an operator`, comment: null }, ts)
+            { wmsStatus: 'NOT_FOUND', summary: `IMS ${intent === 'HOLD' ? 'hold' : 'cancel'} could not be confirmed: the WMS order was not found and a possible merge could not be proven — left for an operator`, query: null }, ts)
           return
         }
         survivor = { externalOrderId: lookup.externalOrderId, externalOrderNumber: lookup.externalOrderNumber }
@@ -1757,7 +1709,7 @@ export async function runWmsOrderPushSweepCore(
         await raiseWmsRefusalNotice(link, intent,
           `${intent === 'HOLD' ? 'Held' : 'Cancelled'} in IMS, but WMS order ${link.externalOrderId} was not found and the check for a merge stayed inconclusive after ${MERGE_CHECK_RETRY_BUDGET} sweeps (${lookup.reason}). `
           + 'IMS has NOT recorded it as ' + (intent === 'HOLD' ? 'held' : 'cancelled in the WMS') + ' — find the order in the WMS and decide.',
-          { wmsStatus: 'NOT_FOUND', summary: 'IMS ' + (intent === 'HOLD' ? 'hold' : 'cancel') + ' could not be confirmed: the WMS order was not found and the merge check was inconclusive — left for an operator', comment: null }, ts)
+          { wmsStatus: 'NOT_FOUND', summary: 'IMS ' + (intent === 'HOLD' ? 'hold' : 'cancel') + ' could not be confirmed: the WMS order was not found and the merge check was inconclusive — left for an operator', query: null }, ts)
         return
       }
     }
@@ -1775,7 +1727,7 @@ export async function runWmsOrderPushSweepCore(
       else await raiseMergedNotice(repointed, intent, ts)
       return
     }
-    await raiseWmsRefusalNotice(link, intent, notFoundReason, { wmsStatus: 'NOT_FOUND', summary: notFoundSummary, comment: null }, ts)
+    await raiseWmsRefusalNotice(link, intent, notFoundReason, { wmsStatus: 'NOT_FOUND', summary: notFoundSummary, query: null }, ts)
   }
 
   /**
@@ -1793,8 +1745,8 @@ export async function runWmsOrderPushSweepCore(
   let presenceProbeBudget = PRESENCE_PROBE_BUDGET
   let ambiguousCreateAdopted = 0
   let operatorNoticeCount = 0
-  let noticeCommentsRetried = 0
-  let removalNoteNeedsCheckCount = 0
+  let operatorTasksRaised = 0
+  let operatorTaskErrorCount = 0
   const probeWarehouseAbsence = async (reference: string): Promise<{ absent: boolean; reason: string }> => {
     if (!connector.probeOrderPresence) {
       return { absent: false, reason: 'the active WMS connector cannot check whether such an order exists, so it cannot be re-queued automatically — check the WMS and resolve it by hand' }
@@ -2862,19 +2814,18 @@ export async function runWmsOrderPushSweepCore(
           after: { state: createdState, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, courierPending, totalMismatchPence, intent: pushIntentSummary(input) },
         })
         // Courier-pending (G6c): the shipping service didn't resolve and the WMS used a
-        // default courier — flag it on the WMS order so the warehouse verifies before despatch.
+        // default courier — an operator task asks for the courier to be verified before despatch (a query raised by hand: IMS writes no
+        // comment to the warehouse).
         //
-        // Not while the id is unproven (o3d-bjc.8): the comment guard proves only
-        // that the row is under our tenant, not that it is OUR ORDER, so a
-        // same-client wrong-id would receive a misleading IMS note about a
-        // shipping method that has nothing to do with it. The verify pass posts
-        // it once the link is promoted.
+        // Not while the id is unproven (o3d-bjc.8): the id is not yet proven to be OUR ORDER, so a task would name a
+        // warehouse order that may be someone else's. The verify pass raises it once the link is promoted.
         if (courierPending && createdState === 'SYNCED') {
-          await postConflictComment(
-            push.externalOrderId,
-            courierFallbackNote(order.shippingService),
-            order.id,
-          )
+          await raiseTaskBestEffort({
+            orderId: order.id, externalOrderId: push.externalOrderId, reason: 'COURIER_FALLBACK',
+            queryText: courierFallbackQuery(warehouseOrderRef(push.externalOrderNumber, push.externalOrderId), order.orderNumber ?? order.id, order.shippingService),
+            dedupeBasis: COURIER_FALLBACK_BASIS,
+            payload: { orderNumber: order.orderNumber ?? null, externalOrderNumber: push.externalOrderNumber ?? null },
+          })
         }
       } catch (error) {
         // A held write (outbound-write hold) spends no attempt and can never dead-letter: the order did
@@ -3100,13 +3051,15 @@ export async function runWmsOrderPushSweepCore(
         }
         await port.updateLink(link.id, { state: 'SYNCED', lastError: null })
         result.verified += 1
-        // The courier-pending note was held back until the id was proven.
+        // The courier-pending task was held back until the id was proven.
         if (link.courierPending) {
-          await postConflictComment(
-            link.externalOrderId,
-            courierFallbackNote(link.shippingService),
-            link.orderId,
-          )
+          await raiseTaskBestEffort({
+            orderId: link.orderId, externalOrderId: link.externalOrderId,
+            reason: 'COURIER_FALLBACK',
+            queryText: courierFallbackQuery(link.externalOrderId, link.orderNumber ?? link.orderId, link.shippingService),
+            dedupeBasis: COURIER_FALLBACK_BASIS,
+            payload: { orderNumber: link.orderNumber ?? null },
+          })
         }
         await audit({
           action: 'order_create', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: link.orderId,
@@ -3175,18 +3128,23 @@ export async function runWmsOrderPushSweepCore(
     // Once the destination is live, a change made before the live-from instant is shadowed by the seam on every tick without changing the
     // link, so it would sit at the head of this oldest-first bounded batch for ever. The query leaves it out (the same floor as the create
     // query). No floor (not enforced, or not live): the legacy call.
-    // An amendment that NEWLY fell back to the default courier raises the same warehouse-visible warning a create fallback
-    // does. If posting it fails, the link is kept retryable: it is not marked pushed and does not record the new form, so
-    // the order stays due and the next pass finds the fallback again and posts the warning again. Once posted, the form is
-    // recorded, so the next pass knows the order is already on the default courier and does not post it twice.
+    // An amendment that NEWLY fell back to the default courier raises the same operator task a create fallback does. If raising it
+    // fails, the link is kept retryable: it is not marked pushed and does not record the new form, so the order stays due and the
+    // next pass finds the fallback again and raises it again (the task is deduplicated). Once raised, the form is recorded, so the
+    // next pass knows the order is already on the default courier.
     const settleAmendedCourier = async (
       link: WmsPushUpdateLink,
       applied: { courierForm?: 'NAME' | 'LEGACY' | 'PLACEHOLDER'; courierFormName?: string | null; courierFallback?: boolean },
     ) => {
-      const warning = applied.courierFallback
-        ? await postConflictComment(link.externalOrderId!, courierFallbackNote(link.order.shippingService), link.order.id)
-        : null
-      const retryable = warning === 'failed'
+      const raised = applied.courierFallback
+        ? await raiseTaskBestEffort({
+          orderId: link.order.id, externalOrderId: link.externalOrderId!, reason: 'COURIER_FALLBACK',
+          queryText: courierFallbackQuery(link.externalOrderId!, link.order.orderNumber ?? link.order.id, link.order.shippingService),
+          dedupeBasis: COURIER_FALLBACK_BASIS,
+          payload: { orderNumber: link.order.orderNumber ?? null },
+        })
+        : true
+      const retryable = !raised
       return {
         retryable,
         linkFields: {
@@ -3321,7 +3279,7 @@ export async function runWmsOrderPushSweepCore(
           lastAttemptAt: ts,
           ...(settled.retryable ? {} : { pushedAt: ts }),
           ...(update.updated && link.amendNoticeAt ? { amendNoticeAt: null } : {}),
-          lastError: settled.retryable ? 'Courier warning not posted on the WMS order; will retry' : update.updated ? null : `Amendment not propagated (WMS status ${update.status})`,
+          lastError: settled.retryable ? 'Courier-fallback operator task not recorded; will retry' : update.updated ? null : `Amendment not propagated (WMS status ${update.status})`,
           ...settled.linkFields,
         })
         if (update.updated) result.updated += 1
@@ -3367,77 +3325,99 @@ export async function runWmsOrderPushSweepCore(
     // re-cancel of the same warehouse order is attempted and noticed afresh. (A release and re-hold inside ONE sweep interval cannot be
     // told apart from the original hold; the next sweep sees the order still held and the old notice stands.)
     await port.clearStaleNotices?.(connectorId).catch((e) => console.error('[wms-order-push] failed to clear stale notices', e))
-    // Warehouse notes that were never delivered are retried until one is posted. The notice itself stays until then. There is no remote
-    // idempotency key on a note, so a duplicate is possible in exactly two cases: the note posted and recording its delivery failed, or
-    // two overlapping sweeps retried the same note. A repeated note is harmless; a lost one is not, so that is the direction chosen.
-    // Stands down while the producer-side hold is on: every note would only be shadowed, and the oldest ones would crowd the batch.
-    for (const pending of warehouseHeld ? [] : (await port.noticesAwaitingComment?.(connectorId, batchSize).catch(() => [])) ?? []) {
-      const note = wmsNoticeComment(pending.intent, pending.state === 'MERGED')
-      if ((await postConflictComment(pending.externalOrderId, note, pending.orderId)) === 'posted') {
+    // Notices whose operator task has not been recorded (raising it failed, or the notice predates operator tasks and its note was never
+    // posted) are raised here until it is. The notice itself stays until then. The task's dedupe basis is the notice's own episode, so a
+    // task raised but not stamped, or two overlapping sweeps, can never raise it twice. A local write: not gated on the producer-side hold.
+    for (const pending of (await port.noticesAwaitingComment?.(connectorId, batchSize).catch(() => [])) ?? []) {
+      const merged = pending.state === 'MERGED'
+      if (await raiseTaskBestEffort({
+        orderId: pending.orderId, externalOrderId: pending.externalOrderId, reason: pending.intent === 'HOLD' ? 'PUSH_CONFLICT' : 'CANCEL_NOTICE',
+        queryText: noticeQuery(pending.intent, merged, warehouseOrderRef(pending.externalOrderNumber, pending.externalOrderId), pending.orderNumber ?? pending.orderId),
+        dedupeBasis: noticeEpisode(pending.intent, pending.noticeAt),
+        payload: { orderNumber: pending.orderNumber ?? null, externalOrderNumber: pending.externalOrderNumber ?? null },
+      })) {
         await stampNoteDelivered(pending, now())
-        noticeCommentsRetried += 1
       }
     }
-    // MERGED-LINE REMOVAL NOTES (their link is CANCELLED, so the notice retry above cannot see them). Every obligation is first checked
-    // against what the link and order are NOW: one whose link or order is gone (a reset, a deleted order), whose order was erased, or
-    // whose link no longer names the warehouse order the lines were on is DROPPED and logged, never posted.
+    // MERGED-LINE REMOVAL OBLIGATIONS (their link is CANCELLED, so the notice pass above cannot see them). Every obligation is first checked
+    // against what the link and order are NOW: one whose link or order is gone (a reset, a deleted order), or whose order was erased, or
+    // whose link is another order's, is DROPPED and logged: no task is raised for it.
     //   intended    the removal may have been interrupted after the deletes. Lines confirmed absent in the warehouse (a read-only fetch) =
-    //               the removal happened: it becomes owed. Lines still present: the normal cancel pass retries the removal while the order is
-    //               still cancellable; once it no longer is, the removal is no longer wanted and the obligation is dropped.
-    //   owed        posted once (see deliverRemovalNote), never twice.
-    //   needs_check left alone: an operator checks the warehouse order's comments.
+    //               the removal happened: it becomes owed. Some gone, some not: a partial-removal-check task. Lines still present: the normal
+    //               cancel pass retries the removal while the order is still cancellable; once it no longer is, the removal is no longer
+    //               wanted and the obligation is dropped.
+    //   owed        a "lines removed" task is raised (once: the task is deduplicated) and the obligation dropped.
+    //   needs_check a partial removal without its task yet (or a row left by the earlier note-posting design): the task is raised. A
+    //               row that was verified is an owed removal. The link stays OPEN until an operator presses Done on the task.
+    // Reads the warehouse (a read-only fetch) so it stands down while the producer-side hold is on.
     for (const ob of warehouseHeld ? [] : (await port.pendingRemovalNotes?.(connectorId, batchSize).catch(() => [])) ?? []) {
-      if (ob.state === 'needs_check') continue
-      const ctx = await port.removalNoteContext?.(ob.linkId).catch(() => undefined)
-      if (ctx === undefined) continue
-      // A link or order that is gone (a reset, a deletion), an erased order, or a link that is another order's is never posted for. The
-      // link's CURRENT warehouse order is NOT compared for an OWED obligation: owed means the removal was verified on THIS obligation's
-      // warehouse order, so its note belongs there even if the link has since been re-pointed. An INTENDED one is settled by a read of its
-      // OWN warehouse order's lines (below), never dropped blind.
-      const gone = ctx === null || ctx.orderId !== ob.orderId || ctx.erased
-      if (gone) {
-        console.error(`[wms-order-push] dropping removal note obligation for link ${ob.linkId}: its link or order is gone, erased or no longer the same order (reset, deletion, erasure); nothing is posted`)
-        await port.clearRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId).catch(() => {})
-        continue
-      }
-      let current = ob
-      if (ob.state === 'intended') {
-        // The same read-only lines-gone check, against the obligation's OWN warehouse order (the snapshot's), whether or not the link
-        // still names it.
-        const lines = connector.fetchOrderItemRefs ? await connector.fetchOrderItemRefs(ob.externalOrderId).catch(() => null) : null
-        const present = lines === null ? null : ob.items.filter((item) => lines.some((line) => line.externalItemId === item.externalItemId)).length
-        const confirmedGone = present === 0
-        const repointed = ctx.externalOrderId !== ob.externalOrderId
-        if (present !== null && present > 0 && present < ob.items.length) {
-          // PARTIAL (an earlier removal stopped part way), re-pointed or not: never left intended, never dropped, never posted.
-          await markRemovalNoteNeedsCheck(ob, 'an earlier removal stopped part way: only some of the recorded lines are still on the warehouse order')
+      try {
+        const ctx = await port.removalNoteContext?.(ob.linkId).catch(() => undefined)
+        if (ctx === undefined) continue
+        // A link or order that is gone (a reset, a deletion), an erased order, or a link that is another order's is never raised for. The
+        // link's CURRENT warehouse order is NOT compared for an OWED obligation: owed means the removal was verified on THIS obligation's
+        // warehouse order, so its task belongs there even if the link has since been re-pointed. An INTENDED one is settled by a read of its
+        // OWN warehouse order's lines (below), never dropped blind.
+        const gone = ctx === null || ctx.orderId !== ob.orderId || ctx.erased
+        if (gone) {
+          console.error(`[wms-order-push] dropping removal obligation for link ${ob.linkId}: its link or order is gone, erased or no longer the same order (reset, deletion, erasure); no task is raised`)
+          await port.clearRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId).catch(() => {})
           continue
         }
-        if (confirmedGone) {
-          if (!(await port.updateRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId, { state: 'owed', verified: true }).catch(() => false))) continue
-          current = { ...ob, state: 'owed', verified: true }
-        } else if (repointed) {
-          // The link was re-pointed away from the warehouse order this obligation was recorded for. NEVER dropped blind: every line still
-          // there = the removal never ran on it (stale, dropped); anything else (some gone, or the read failed / is unavailable) = it may have
-          // run (a crash after the deletes), so it goes to an operator.
-          if (present === ob.items.length) {
-            console.error(`[wms-order-push] dropping removal note obligation for link ${ob.linkId}: the link was re-pointed and every recorded line is still on WMS order ${ob.externalOrderId} (the removal never ran); nothing is posted`)
-            await port.clearRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId).catch(() => {})
-          } else {
-            await markRemovalNoteNeedsCheck(ob, present === null
-              ? 'the link was re-pointed after an interrupted removal and the recorded warehouse order\'s lines could not be read to tell whether the removal ran'
-              : 'the link was re-pointed after an interrupted removal and only some of the recorded lines are still on the warehouse order')
+        const orderLabel = ctx.orderNumber ?? ob.orderId
+        if (ob.state === 'needs_check' && ob.verified !== true) {
+          await escalatePartialRemoval(ob, ob.detail ?? 'an earlier removal stopped part way: only some of the recorded lines are still on the warehouse order', orderLabel)
+          continue
+        }
+        let current = ob
+        if (ob.state === 'intended') {
+          // The same read-only lines-gone check, against the obligation's OWN warehouse order (the snapshot's), whether or not the link
+          // still names it.
+          const lines = connector.fetchOrderItemRefs ? await connector.fetchOrderItemRefs(ob.externalOrderId).catch(() => null) : null
+          const present = lines === null ? null : ob.items.filter((item) => lines.some((line) => line.externalItemId === item.externalItemId)).length
+          const confirmedGone = present === 0
+          const repointed = ctx.externalOrderId !== ob.externalOrderId
+          if (present !== null && present > 0 && present < ob.items.length) {
+            // PARTIAL (an earlier removal stopped part way), re-pointed or not: never left intended, never dropped.
+            await escalatePartialRemoval(ob, 'an earlier removal stopped part way: only some of the recorded lines are still on the warehouse order', orderLabel)
+            continue
           }
-          continue
-        } else {
-          if (lines !== null && !ctx.cancellable) await port.clearRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId).catch(() => {})
-          continue
+          if (confirmedGone) {
+            if (!(await port.updateRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId, { state: 'owed', verified: true }).catch(() => false))) continue
+            current = { ...ob, state: 'owed', verified: true }
+          } else if (repointed) {
+            // The link was re-pointed away from the warehouse order this obligation was recorded for. NEVER dropped blind: every line still
+            // there = the removal never ran on it (stale, dropped); anything else (some gone, or the read failed / is unavailable) = it may have
+            // run (a crash after the deletes), so it goes to an operator.
+            if (present === ob.items.length) {
+              console.error(`[wms-order-push] dropping removal obligation for link ${ob.linkId}: the link was re-pointed and every recorded line is still on WMS order ${ob.externalOrderId} (the removal never ran); no task is raised`)
+              await port.clearRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId).catch(() => {})
+            } else {
+              await escalatePartialRemoval(ob, present === null
+                ? 'the link was re-pointed after an interrupted removal and the recorded warehouse order\'s lines could not be read to tell whether the removal ran'
+                : 'the link was re-pointed after an interrupted removal and only some of the recorded lines are still on the warehouse order', orderLabel)
+            }
+            continue
+          } else {
+            if (lines !== null && !ctx.cancellable) await port.clearRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId).catch(() => {})
+            continue
+          }
         }
+        // A link that is still LIVE and still cancellable is closed by the cancel pass (which consults this obligation, raises the task and
+        // closes the link): doing it here first would leave the link open with the obligation spent.
+        if (ctx.externalOrderId === ob.externalOrderId && ctx.linkState !== 'CANCELLED' && ctx.cancellable) continue
+        await raiseTaskOrThrow({
+          orderId: current.orderId, externalOrderId: current.externalOrderId, reason: 'MERGED_LINES_REMOVED',
+          queryText: mergedLinesRemovedQuery(warehouseOrderRef(null, current.externalOrderId), orderLabel, current.items),
+          dedupeBasis: removedLinesBasis('MERGED', current.items),
+          payload: { orderNumber: orderLabel, items: current.items },
+        })
+        await port.clearRemovalNote?.(connectorId, current.linkId, current.externalOrderId).catch(() => {})
+      } catch (error) {
+        // Nothing was lost: the obligation stays and the next sweep tries again. Counted, so the cron does not read healthy.
+        operatorTaskErrorCount += 1
+        console.error(`[wms-order-push] removal obligation for link ${ob.linkId} could not be turned into an operator task`, error)
       }
-      // A link that is still LIVE and still cancellable is closed by the cancel pass (which consults this obligation and delivers the note
-      // after closing it): delivering here first would leave the link open with the note spent.
-      if (ctx.externalOrderId === ob.externalOrderId && ctx.linkState !== 'CANCELLED' && ctx.cancellable) continue
-      if (await deliverRemovalNote(current, ctx.orderNumber ?? current.orderId) === 'posted') noticeCommentsRetried += 1
     }
     for (const link of await port.holdableLinks(connectorId, batchSize)) {
       if (!link.externalOrderId) continue
@@ -3486,7 +3466,7 @@ export async function runWmsOrderPushSweepCore(
           await raiseWmsRefusalNotice(link, 'HOLD',
             `Held in IMS, but WMS order ${link.externalOrderId} is already CANCELLED in the WMS and keeps its order number, so it cannot be re-created when the hold is lifted. `
             + 'IMS has NOT recorded it as held — decide with the warehouse what should happen to this order.',
-            { wmsStatus: 'ALREADY_CANCELLED', summary: 'IMS hold: the WMS order was already cancelled — left for an operator', comment: null }, ts)
+            { wmsStatus: 'ALREADY_CANCELLED', summary: 'IMS hold: the WMS order was already cancelled — left for an operator', query: null }, ts)
           continue
         }
         if (cancel.cancelled) {
@@ -3538,7 +3518,7 @@ export async function runWmsOrderPushSweepCore(
             {
               wmsStatus: cancel.status,
               summary: 'IMS hold could not cancel the WMS order (past NEW) — link kept live, operator notified',
-              comment: wmsNoticeComment('HOLD', false),
+              query: noticeText(link, 'HOLD', false),
             }, ts)
         }
       } catch (error) {
@@ -3618,7 +3598,7 @@ export async function runWmsOrderPushSweepCore(
             {
               wmsStatus: cancel.status,
               summary: 'IMS cancel could not cancel the WMS order (past NEW) — link kept live, operator notified',
-              comment: wmsNoticeComment('CANCEL', false),
+              query: noticeText(link, 'CANCEL', false),
             }, ts)
         }
       } catch (error) {
@@ -3640,8 +3620,11 @@ export async function runWmsOrderPushSweepCore(
 
   if (ambiguousCreateAdopted > 0) result.ambiguousCreateAdopted = ambiguousCreateAdopted
   if (operatorNoticeCount > 0) result.operatorNotices = operatorNoticeCount
-  if (noticeCommentsRetried > 0) result.noticeCommentsRetried = noticeCommentsRetried
-  if (removalNoteNeedsCheckCount > 0) result.removalNoteNeedsCheck = removalNoteNeedsCheckCount
+  if (operatorTasksRaised > 0) result.operatorTasksRaised = operatorTasksRaised
+  if (operatorTaskErrorCount > 0) result.operatorTaskErrors = operatorTaskErrorCount
+  // How many operator tasks are open now. INFORMATION, never a failure: the cron is not red for a task waiting on a person.
+  const openTasks = await port.countOpenOperatorTasks?.(connectorId).catch(() => 0) ?? 0
+  if (openTasks > 0) result.operatorTasksOpen = openTasks
   if (shadowedCount > 0) result.shadowed = shadowedCount
   if (shadowUnrecordedCount > 0) result.shadowUnrecorded = shadowUnrecordedCount
   if (recoveryRefusedCount > 0) result.recoveryRefusedPreCutoff = recoveryRefusedCount
@@ -4283,7 +4266,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     },
     async recordRemovalNote(connector, note) {
       const key = removalNoteKey(connector, note.linkId, note.externalOrderId)
-      const fresh: WmsRemovalNoteObligation = { id: randomUUID(), linkId: note.linkId, orderId: note.orderId, externalOrderId: note.externalOrderId, state: 'intended', attempted: false, items: note.items }
+      const fresh: WmsRemovalNoteObligation = { id: randomUUID(), linkId: note.linkId, orderId: note.orderId, externalOrderId: note.externalOrderId, state: 'intended', items: note.items }
       // update: {} — an obligation already recorded (an interrupted removal retried) is left exactly as it was.
       await db.setting.upsert({ where: { key }, create: { key, value: serializeRemovalNote(fresh) }, update: {} })
       const row = await db.setting.findUnique({ where: { key }, select: { value: true } })
@@ -4306,13 +4289,13 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       })
     },
     async pendingRemovalNotes(connector, limit) {
-      // needs_check rows are excluded IN THE QUERY (the state is part of the stored JSON, written compactly), so any number of unresolved
-      // rows cannot crowd a newer obligation out of the batch. Unreadable rows are skipped by paging past them.
+      // Rows whose operator task is already raised (a partial removal waiting on a person) are excluded IN THE QUERY (the flag is part of the
+      // stored JSON, written compactly), so any number of them cannot crowd a newer obligation out of the batch. Unreadable rows are skipped by paging past them.
       const owed: WmsRemovalNoteObligation[] = []
       const pageSize = Math.max(limit, 1)
       for (let page = 0; page < 20 && owed.length < limit; page += 1) {
         const rows = await db.setting.findMany({
-          where: { key: { startsWith: `${REMOVAL_NOTE_KEY_PREFIX}${connector}:` }, NOT: { value: { contains: '"state":"needs_check"' } } },
+          where: { key: { startsWith: `${REMOVAL_NOTE_KEY_PREFIX}${connector}:` }, NOT: { value: { contains: '"taskRaised":true' } } },
           orderBy: [{ updatedAt: 'asc' }, { key: 'asc' }], skip: page * pageSize, take: pageSize, select: { value: true },
         })
         for (const row of rows) {
@@ -4337,14 +4320,20 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       const cancellable = (await db.salesOrder.count({ where: { id: link.orderId, ...WMS_CANCELLABLE_ORDER_WHERE } })) > 0
       return { linkState: link.state, externalOrderId: link.externalOrderId, orderId: link.orderId, orderNumber: link.order.orderNumber, erased: link.order.erasedAt !== null, cancellable }
     },
+    async raiseOperatorTask(task) {
+      return raiseWmsOperatorTask(db, task)
+    },
+    async countOpenOperatorTasks(connector) {
+      return db.wmsOperatorTask.count({ where: { connector, status: 'OPEN' } })
+    },
     async noticesAwaitingComment(connector, limit) {
       const base = { connector, state: { in: ['SYNCED', 'MERGED'] as Array<'SYNCED' | 'MERGED'> }, externalOrderId: { not: null } }
       const [holds, cancels] = await Promise.all([
-        db.wmsOrderPushLink.findMany({ where: { ...base, holdNoticeAt: { not: null }, holdNoticeCommentAt: null, order: { status: 'ON_HOLD' } }, select: { id: true, orderId: true, externalOrderId: true, state: true, holdNoticeAt: true }, take: limit, orderBy: { holdNoticeAt: 'asc' } }),
-        db.wmsOrderPushLink.findMany({ where: { ...base, cancelNoticeAt: { not: null }, cancelNoticeCommentAt: null, order: WMS_CANCELLABLE_ORDER_WHERE }, select: { id: true, orderId: true, externalOrderId: true, state: true, cancelNoticeAt: true }, take: limit, orderBy: { cancelNoticeAt: 'asc' } }),
+        db.wmsOrderPushLink.findMany({ where: { ...base, holdNoticeAt: { not: null }, holdNoticeCommentAt: null, order: { status: 'ON_HOLD' } }, select: { id: true, orderId: true, externalOrderId: true, state: true, holdNoticeAt: true, externalOrderNumber: true, order: { select: { orderNumber: true } } }, take: limit, orderBy: { holdNoticeAt: 'asc' } }),
+        db.wmsOrderPushLink.findMany({ where: { ...base, cancelNoticeAt: { not: null }, cancelNoticeCommentAt: null, order: WMS_CANCELLABLE_ORDER_WHERE }, select: { id: true, orderId: true, externalOrderId: true, state: true, cancelNoticeAt: true, externalOrderNumber: true, order: { select: { orderNumber: true } } }, take: limit, orderBy: { cancelNoticeAt: 'asc' } }),
       ])
-      const shape = (intent: 'HOLD' | 'CANCEL') => (row: { id: string; orderId: string; externalOrderId: string | null; state: string; holdNoticeAt?: Date | null; cancelNoticeAt?: Date | null }) =>
-        ({ id: row.id, orderId: row.orderId, externalOrderId: row.externalOrderId as string, state: row.state as 'SYNCED' | 'MERGED', intent, noticeAt: (intent === 'HOLD' ? row.holdNoticeAt : row.cancelNoticeAt) as Date })
+      const shape = (intent: 'HOLD' | 'CANCEL') => (row: { id: string; orderId: string; externalOrderId: string | null; state: string; holdNoticeAt?: Date | null; cancelNoticeAt?: Date | null; externalOrderNumber: string | null; order: { orderNumber: string | null } }) =>
+        ({ id: row.id, orderId: row.orderId, externalOrderId: row.externalOrderId as string, state: row.state as 'SYNCED' | 'MERGED', intent, noticeAt: (intent === 'HOLD' ? row.holdNoticeAt : row.cancelNoticeAt) as Date, orderNumber: row.order.orderNumber, externalOrderNumber: row.externalOrderNumber })
       return [...holds.map(shape('HOLD')), ...cancels.map(shape('CANCEL'))].slice(0, limit)
     },
     async updateLinkIfLinked(id, expect, data) {

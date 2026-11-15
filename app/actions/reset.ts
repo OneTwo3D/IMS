@@ -115,13 +115,15 @@ async function clearTransactionScope(guards: ResetGuards) {
     await tx.salesOrderRefundLine.deleteMany({})
     await tx.salesOrderRefund.deleteMany({})
     await tx.salesOrderLine.deleteMany({})
+    // Operator query tasks are about the warehouse orders of the orders deleted below (they would cascade; explicit so the reset scope is plain).
+    await tx.wmsOperatorTask.deleteMany({})
     await tx.salesOrder.deleteMany({})
     // Operator answers for WooCommerce order lines belong to the orders just deleted.
     await tx.euVatGiftCardLineResolution.deleteMany({})
   }, { timeout: 600_000, maxWait: 30_000 })
-  // The warehouse links went with the orders (cascade); their pending merged-line removal notes live in `settings` and must go too, or the
-  // push sweep would post an old note about a deleted order to the live warehouse. (The sweep also refuses any note whose link or order is
-  // gone, so the gap between the transaction above and this delete cannot post one.)
+  // The warehouse links went with the orders (cascade); their merged-line removal obligations live in `settings` and must go too, or the
+  // push sweep would raise an old task about a deleted order. (The sweep also drops any obligation whose link or order is gone, so the gap
+  // between the transaction above and this delete cannot raise one.)
   await db.setting.deleteMany({ where: { key: { startsWith: REMOVAL_NOTE_KEY_PREFIX } } })
 
   guards.assertHeld('purchasing')

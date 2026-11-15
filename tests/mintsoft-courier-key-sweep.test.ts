@@ -3,6 +3,7 @@ import test, { mock } from 'node:test'
 import type { WmsOrderPushPort, WmsPushUpdateLink } from '../lib/domain/wms/order-push-sweep.ts'
 import type { WmsOrderPushInput, WmsOrderUpdateResult } from '../lib/connectors/wms/types.ts'
 import { WmsOrderUpdatePartialError } from '../lib/connectors/wms/courier-form.ts'
+import { recordingTaskPort } from './helpers/operator-task-port.ts'
 
 /**
  * The amendment pass of the real sweep and the courier form of a link: what is handed to the connector, and what is written
@@ -31,11 +32,11 @@ function updateLinkFor(over: Partial<WmsPushUpdateLink>): WmsPushUpdateLink {
   }
 }
 
-async function sweep(link: WmsPushUpdateLink, result: WmsOrderUpdateResult | Error, opts: { commentFails?: boolean } = {}) {
+async function sweep(link: WmsPushUpdateLink, result: WmsOrderUpdateResult | Error, opts: { taskFails?: boolean } = {}) {
   const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
   const linkWrites: Array<Record<string, unknown>> = []
   const inputs: WmsOrderPushInput[] = []
-  const comments: Array<{ id: string; text: string }> = []
+  const taskPort = recordingTaskPort({ failWith: () => (opts.taskFails ? new Error('database unavailable') : null) })
   const port = {
     activeBindings: async () => [{ warehouseId: 'wh-1', externalWarehouseId: '301' }],
     releasableHeldOrders: async () => [],
@@ -52,18 +53,15 @@ async function sweep(link: WmsPushUpdateLink, result: WmsOrderUpdateResult | Err
     upsertByOrder: async () => undefined,
     screenLiveWithdrawals: async () => new Set<string>(),
     verifyWithdrawalFence: async () => true,
+    raiseOperatorTask: taskPort.raiseOperatorTask,
     recordEvent: async () => undefined,
   } as unknown as WmsOrderPushPort
   const connector = {
     pushOrder: async () => { throw new Error('unexpected create') },
     updateOrder: async (_id: string, input: WmsOrderPushInput) => { inputs.push(input); if (result instanceof Error) throw result; return result },
-    addOrderComment: async (id: string, text: string) => {
-      comments.push({ id, text })
-      if (opts.commentFails) throw new Error('comment endpoint down')
-    },
   }
   await runWmsOrderPushSweepCore(connector as never, 'mintsoft', port, { now: NOW })
-  return { linkWrites, inputs, comments }
+  return { linkWrites, inputs, tasks: taskPort.tasks }
 }
 
 test('a link with no recorded form, amended down to the placeholder, ends with courierPending true and the form recorded', async () => {
@@ -90,54 +88,54 @@ test('a recorded form whose first courier name has changed is handed over as a f
 
 const PLACEHOLDER_RESULT: WmsOrderUpdateResult = { updated: true, status: 'NEW', courierForm: 'PLACEHOLDER', courierFormName: KEY, courierFallback: true }
 
-test('an amendment that newly falls back to the default courier posts the same warehouse-visible courier warning a create does', async () => {
+test('an amendment that newly falls back to the default courier raises the same courier operator task a create does (and writes no comment)', async () => {
   const run = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), PLACEHOLDER_RESULT)
-  assert.deepEqual(run.comments, [{
-    id: 'wms-u',
-    text: "IMS: shipping method 'RM Tracked' did not map to a WMS courier, so a default courier was used. Please verify the courier before despatch.",
-  }])
-  assert.ok(run.linkWrites[0]!.pushedAt, 'the amendment is marked pushed once the warning is posted')
+  assert.equal(run.tasks.length, 1)
+  assert.equal(run.tasks[0]!.reason, 'COURIER_FALLBACK')
+  assert.equal(run.tasks[0]!.externalOrderId, 'wms-u')
+  assert.equal(run.tasks[0]!.queryText, "Please verify the courier on warehouse order wms-u (IMS order SO-U) before despatch. IMS shipping method 'RM Tracked' did not map to a warehouse courier, so a default courier was used.")
+  assert.ok(run.linkWrites[0]!.pushedAt, 'the amendment is marked pushed once the task is recorded')
   assert.equal(run.linkWrites[0]!.courierForm, 'PLACEHOLDER')
 })
 
-test('a failed courier warning keeps the link retryable: not marked pushed, form not recorded, flag still raised', async () => {
-  const run = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), PLACEHOLDER_RESULT, { commentFails: true })
-  assert.equal(run.comments.length, 1)
-  assert.equal('pushedAt' in run.linkWrites[0]!, false, 'the order stays due, so the next pass amends and posts the warning again')
+test('a courier task that cannot be recorded keeps the link retryable: not marked pushed, form not recorded, flag still raised', async () => {
+  const run = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), PLACEHOLDER_RESULT, { taskFails: true })
+  assert.equal(run.tasks.length, 0)
+  assert.equal('pushedAt' in run.linkWrites[0]!, false, 'the order stays due, so the next pass amends and raises the task again (it is deduplicated)')
   assert.equal('courierForm' in run.linkWrites[0]!, false, 'the next pass finds the fallback again')
   assert.equal(run.linkWrites[0]!.courierPending, true)
-  assert.match(String(run.linkWrites[0]!.lastError), /warning not posted/)
+  assert.match(String(run.linkWrites[0]!.lastError), /operator task not recorded/)
 })
 
-test('an amendment that did not fall back posts no courier warning', async () => {
+test('an amendment that did not fall back raises no courier task', async () => {
   const run = await sweep(updateLinkFor({ courierForm: 'NAME', courierFormName: KEY }), { updated: true, status: 'NEW' })
-  assert.deepEqual(run.comments, [])
+  assert.deepEqual(run.tasks, [])
 })
 
 const ITEMS_DOWN = () => new WmsOrderUpdatePartialError('Mintsoft items endpoint down', { courierForm: 'PLACEHOLDER', courierFormName: KEY, courierFallback: true })
 
-test('an accepted fallback post followed by an item failure: the warning is posted once, the link stays due, courierPending is set', async () => {
+test('an accepted fallback followed by an item failure: the task is raised once, the link stays due, courierPending is set', async () => {
   const run = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), ITEMS_DOWN())
-  assert.equal(run.comments.length, 1)
-  assert.match(run.comments[0]!.text, /did not map to a WMS courier/)
+  assert.equal(run.tasks.length, 1)
+  assert.match(run.tasks[0]!.queryText, /did not map to a warehouse courier/)
   assert.equal('pushedAt' in run.linkWrites[0]!, false, 'the order stays due, so the items are redone')
   assert.equal(run.linkWrites[0]!.courierPending, true)
   assert.equal(run.linkWrites[0]!.courierForm, 'PLACEHOLDER', 'recorded, so the retry knows the order is already on the default courier')
   assert.match(String(run.linkWrites[0]!.lastError), /items endpoint down/)
 })
 
-test('the next pass after that does not post the warning again', async () => {
+test('the next pass after that does not raise the task again', async () => {
   const first = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), ITEMS_DOWN())
   const recorded = first.linkWrites[0]!
   const next = await sweep(updateLinkFor({ courierForm: recorded.courierForm as string, courierFormName: recorded.courierFormName as string }), { updated: true, status: 'NEW' })
   assert.equal(next.inputs[0]!.courierPlaceholder, true, 'the amendment goes out on the default courier, without re-selecting')
-  assert.deepEqual(next.comments, [])
+  assert.deepEqual(next.tasks, [])
   assert.ok(next.linkWrites[0]!.pushedAt, 'and this time the amendment completes')
 })
 
-test('an item failure after an accepted fallback post with a failed warning keeps the retry rule: form not recorded', async () => {
-  const run = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), ITEMS_DOWN(), { commentFails: true })
-  assert.equal(run.comments.length, 1)
+test('an item failure after an accepted fallback whose task could not be recorded keeps the retry rule: form not recorded', async () => {
+  const run = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), ITEMS_DOWN(), { taskFails: true })
+  assert.equal(run.tasks.length, 0)
   assert.equal('courierForm' in run.linkWrites[0]!, false)
   assert.equal(run.linkWrites[0]!.courierPending, true)
   assert.equal('pushedAt' in run.linkWrites[0]!, false)

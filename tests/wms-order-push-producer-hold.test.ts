@@ -116,6 +116,7 @@ function makePort(seed: Seed) {
   const reads: string[] = []
   const writes: string[] = []
   const events: string[] = []
+  const tasks: string[] = []
   const port: WmsOrderPushPort = {
     activeBindings: async () => BINDINGS,
     releasableHeldOrders: async () => { reads.push('releasableHeldOrders'); return seed.releasable ?? [] },
@@ -136,9 +137,11 @@ function makePort(seed: Seed) {
     readWithdrawalState: async () => (seed.withdrawn ? { withdrawalHoldAt: new Date(), withdrawalApprovedAt: null } : { withdrawalHoldAt: null, withdrawalApprovedAt: null }),
     screenLiveWithdrawals: async () => { reads.push('screenLiveWithdrawals'); return new Set<string>() },
     verifyWithdrawalFence: async () => { reads.push('verifyWithdrawalFence'); return true },
+    // An operator task is a local write: nothing is sent to the warehouse, so the producer-side hold neither shadows nor withholds it.
+    raiseOperatorTask: async (task) => { tasks.push(`${task.reason}:${task.externalOrderId}`); return true },
     recordEvent: async (event) => { events.push(String(event.action)) },
   }
-  return { port, reads, writes, events }
+  return { port, reads, writes, events, tasks }
 }
 
 function makeConnector(options: { cancelStatus?: string; verdict?: 'ours' | 'foreign' | 'unknown' } = {}) {
@@ -151,7 +154,6 @@ function makeConnector(options: { cancelStatus?: string; verdict?: 'ours' | 'for
       calls.push(`cancelOrder:${id}`); clearances.push(clearance)
       return options.cancelStatus === 'NOT_CANCELLABLE' ? { cancelled: false, status: 'NOT_CANCELLABLE' } : { cancelled: true, status: 'CANCELLED' }
     },
-    addOrderComment: async (id: string, _comment: string, clearance: unknown): Promise<void> => { calls.push(`addOrderComment:${id}`); clearances.push(clearance) },
     verifyPushedOrder: async (id: string) => { calls.push(`verifyPushedOrder:${id}`); return options.verdict ?? 'ours' },
     probeOrderPresence: async (reference: string) => { calls.push(`probeOrderPresence:${reference}`); return 'MISSING' as const },
   }
@@ -328,14 +330,15 @@ test('ON: a PENDING_VERIFY link is still PROVED (a read) but is never converted:
   })
 })
 
-test('ON: a verified link that is not withdrawn is promoted to SYNCED as before (a local write), and its courier note is a shadow', async () => {
+test('ON: a verified link that is not withdrawn is promoted to SYNCED as before (a local write), and its courier task is raised (a local write, nothing sent: not a shadow)', async () => {
   await withEnv(HELD, async () => {
     const run = await sweep({ verifiable: [verifyLink({ courierPending: true })] }, { verdict: 'ours' })
-    assert.deepEqual(run.calls, ['verifyPushedOrder:wms-v'], 'no comment was posted')
+    assert.deepEqual(run.calls, ['verifyPushedOrder:wms-v'], 'nothing was sent to the warehouse')
     assert.deepEqual(run.writes, ['updateLink:link-v:SYNCED'])
     assert.equal(run.result.verified, 1)
-    assert.equal(run.result.shadowed, 1)
-    assert.deepEqual(shadows.map((s) => s.operation), ['order.comment'])
+    assert.equal(run.result.shadowed, undefined)
+    assert.deepEqual(run.tasks, ['COURIER_FALLBACK:wms-v'])
+    assert.deepEqual(shadows, [])
   })
 })
 
@@ -375,11 +378,12 @@ test('LIVE: an amendment is judged on the time of the CHANGE, not the paid time:
   })
 })
 
-test('LIVE: a past-NEW cancellation posts its warehouse note (the comment is IMS-owned from the live phase); the re-open passes run', async () => {
+test('LIVE: a past-NEW cancellation raises its operator task and posts no comment; the re-open passes run', async () => {
   await withEnv(LIVE, async () => {
     const run = await sweep({ cancellable: [ref('so-c')], releasable: [heldLink()] }, { cancelStatus: 'NOT_CANCELLABLE' })
     assert.ok(run.calls.includes('cancelOrder:wms-so-c'))
-    assert.ok(run.calls.includes('addOrderComment:wms-so-c'))
+    assert.ok(!run.calls.some((call) => call.startsWith('addOrderComment')), 'IMS writes no comment to the warehouse')
+    assert.deepEqual(run.tasks, ['CANCEL_NOTICE:wms-so-c'])
     assert.ok(run.reads.includes('releasableHeldOrders') && run.reads.includes('revalidatableLinks') && run.reads.includes('ambiguousCreateLinks'))
     assert.equal(shadows.length, 0)
   })

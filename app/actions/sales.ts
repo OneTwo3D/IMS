@@ -9,11 +9,9 @@ import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { enabledWmsConnectorId } from '@/lib/connectors/wms/enabled-connector'
 import { isWmsConnectorId } from '@/lib/connectors/wms/types'
-import { getWmsConnector } from '@/lib/connectors/wms/registry'
-import { wmsProducerSeam } from '@/lib/connectors/wms/producer-seam'
 import { logActivity } from '@/lib/activity-log'
 import { entersFulfilment, reconcileAllocationBeforeFulfilment, recordShortfallUnderLock } from '@/lib/fulfillment/pre-fulfilment-reallocation'
-import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
+import { raiseWmsOperatorTask, refundNoteQuery, warehouseOrderRef } from '@/lib/domain/wms/operator-tasks'
 import { freshAuthFailureResult, requireFreshPermission, requireInternalUser, requirePermission } from '@/lib/auth/server'
 import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
 import { xeroGet } from '@/lib/connectors/xero/api'
@@ -2912,15 +2910,15 @@ export async function createRefund(
     // Propagate the refund to a WMS the order was already pushed to. The push sweep drives
     // the automatic side: a full refund cancels the WMS order while it is still NEW; a
     // partial refund's reduced line quantities are reconciled while NEW. Past NEW the WMS
-    // can no longer be cancelled/amended via API, so here we (a) drop an operator-facing
-    // comment on the WMS order itself so the warehouse sees the refund, and (b) keep the IMS
+    // can no longer be cancelled/amended via API, so here we (a) record an operator task to raise
+    // a query in the WMS (the warehouse does not read order comments, so IMS writes none), and (b) keep the IMS
     // activity-log breadcrumb for partial refunds. Only for newly-created refunds (not
     // idempotent replays), best-effort so a transient failure can't fail a committed refund.
     if (!refundResult.replayed) {
       try {
         const wmsLink = await db.wmsOrderPushLink.findUnique({
           where: { orderId },
-          select: { state: true, connector: true, externalOrderId: true },
+          select: { state: true, connector: true, externalOrderId: true, externalOrderNumber: true },
         })
         if (wmsLink?.state === 'SYNCED') {
           const isFull = refundResult.newStatus === 'REFUNDED'
@@ -2946,46 +2944,18 @@ export async function createRefund(
               })
             }
 
+            // The warehouse's staff do not read order comments, so IMS writes none: an operator task ("raise a query") is recorded
+            // instead, listed on Sync > Exceptions. A local write (nothing is sent), deduplicated on the credit note.
             if (wmsLink.externalOrderId && isWmsConnectorId(wmsLink.connector)) {
-              const connector = getWmsConnector(wmsLink.connector)
-              if (connector.addOrderComment) {
-                const comment = isFull
-                  ? `IMS: Order fully refunded (credit note ${creditNote}). If not yet dispatched it will be cancelled automatically; if already in progress please treat this as a cancellation request / raise a cancellation query.`
-                  : `IMS: Partial refund (credit note ${creditNote}). Line quantities have been reduced — if the order is still amendable the items are updated automatically; otherwise please raise a line-item cancellation query for the refunded items.`
-                // The producer-side hold: the note is a write to the warehouse. Shadowed (hold enforced, decision SHADOW) it is kept as a
-                // record, nothing is sent, and the refund goes on exactly as it does when the note cannot be posted.
-                const noteSeam = await wmsProducerSeam(wmsLink.connector, {
-                  operation: 'order.comment',
-                  subjectType: 'SalesOrder',
-                  subjectId: orderId,
-                  payload: { externalOrderId: wmsLink.externalOrderId, comment },
-                })
-                if (!noteSeam.proceed) {
-                  console.warn(`[refund] warehouse note not sent: ${noteSeam.notice}`)
-                } else
-                // q66in.4.6 audit timeline (Codex r1): the refund note is a WMS
-                // mutation outside the order-push sweep, so it records here.
-                try {
-                  await connector.addOrderComment(wmsLink.externalOrderId, comment, noteSeam.clearance)
-                  await recordWmsMutationEvent({
-                    connector: wmsLink.connector, direction: 'OUTBOUND', action: 'order_comment', outcome: 'SUCCEEDED',
-                    entityType: 'SALES_ORDER', entityId: orderId, externalId: wmsLink.externalOrderId,
-                    summary: `Refund note (credit note ${creditNote}) posted on WMS order ${orderRef}`,
-                    after: { comment },
-                    triggeredBy: 'refund',
-                  })
-                } catch (commentError) {
-                  await recordWmsMutationEvent({
-                    connector: wmsLink.connector, direction: 'OUTBOUND', action: 'order_comment', outcome: 'FAILED',
-                    entityType: 'SALES_ORDER', entityId: orderId, externalId: wmsLink.externalOrderId,
-                    summary: `Failed to post refund note (credit note ${creditNote}) on WMS order ${orderRef}`,
-                    after: { comment },
-                    error: commentError instanceof Error ? commentError.message : 'WMS comment failed',
-                    triggeredBy: 'refund',
-                  })
-                  throw commentError
-                }
-              }
+              await raiseWmsOperatorTask(db, {
+                connector: wmsLink.connector,
+                orderId,
+                externalOrderId: wmsLink.externalOrderId,
+                reason: 'REFUND_NOTE',
+                dedupeBasis: `refund:${creditNote ?? refundResult.createdRefund.id}:${isFull ? 'full' : 'partial'}`,
+                queryText: refundNoteQuery(warehouseOrderRef(wmsLink.externalOrderNumber, wmsLink.externalOrderId), orderRef, creditNote, isFull),
+                payload: { orderNumber: orderRef, externalOrderNumber: wmsLink.externalOrderNumber ?? null },
+              })
             }
           }
         }
