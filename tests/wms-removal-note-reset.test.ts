@@ -9,13 +9,14 @@ import { parseRemovalNote, removalNoteKey, removalNoteMarker, REMOVAL_NOTE_KEY_P
  * their links) must delete these keys too: otherwise the push sweep would post an old note about a deleted order to the live warehouse.
  * (The sweep also refuses to post a note whose link or order is gone; that half is tested in the sweep and concurrency tests.)
  */
-test('the transaction reset deletes the removal-note obligations, inside the transaction that deletes the orders', async () => {
+test('the transaction reset deletes the removal-note obligations right after the transaction that deletes the orders', async () => {
   const source = await readFile(new URL('../app/actions/reset.ts', import.meta.url), 'utf8')
   const scope = source.slice(source.indexOf('async function clearTransactionScope'), source.indexOf('async function clearProductScope'))
   const orders = scope.indexOf('await tx.salesOrder.deleteMany({})')
-  const keys = scope.indexOf('await tx.setting.deleteMany({ where: { key: { startsWith: REMOVAL_NOTE_KEY_PREFIX } } })')
   const end = scope.indexOf('}, { timeout: 600_000')
-  assert.ok(orders !== -1 && keys > orders && keys < end, 'the obligation keys are deleted in the sales transaction, after the orders')
+  const keys = scope.indexOf('await db.setting.deleteMany({ where: { key: { startsWith: REMOVAL_NOTE_KEY_PREFIX } } })')
+  assert.ok(orders !== -1 && end > orders && keys > end, 'the obligation keys are deleted after the sales transaction that deleted the orders')
+  assert.ok(keys < scope.indexOf("guards.assertHeld('purchasing')"), 'and before the next stage')
   assert.match(source, /import \{ REMOVAL_NOTE_KEY_PREFIX \} from '@\/lib\/domain\/wms\/removal-note-obligation'/)
 })
 
