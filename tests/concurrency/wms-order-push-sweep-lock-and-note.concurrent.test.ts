@@ -116,7 +116,7 @@ test('real database: an owed note posts ONCE with its marker; after the order is
   assert.ok(mine(live.id)[0].comment.startsWith(removalNoteMarker(live.ob)), 'the note carries its marker first')
   assert.equal(mine(reset.id).length, 0, 'after a reset nothing is posted')
   assert.equal(mine(erased.id).length, 0, 'an erased order is never posted')
-  for (const x of [live, reset, erased]) assert.equal(await db.setting.count({ where: { key: removalNoteKey(connectorId, x.linkId) } }), 0, 'obligation gone')
+  for (const x of [live, reset, erased]) assert.equal(await db.setting.count({ where: { key: removalNoteKey(connectorId, x.linkId, x.ob.externalOrderId) } }), 0, 'obligation gone')
   await run()
   assert.equal(mine(live.id).length, 1, 'and never again')
 })

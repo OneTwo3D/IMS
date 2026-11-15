@@ -27,5 +27,5 @@ test('an obligation round-trips and an unreadable one is refused; the marker nam
   assert.equal(parseRemovalNote(JSON.stringify({ ...ob, state: 'weird' })), null)
   assert.equal(parseRemovalNote(JSON.stringify({ ...ob, items: [{ externalItemId: 1 }] })), null)
   assert.equal(removalNoteMarker(ob), '[IMS removal-note l1-o1]')
-  assert.ok(removalNoteKey('mintsoft', 'l1').startsWith(REMOVAL_NOTE_KEY_PREFIX))
+  assert.ok(removalNoteKey('mintsoft', 'l1', 'w1').startsWith(REMOVAL_NOTE_KEY_PREFIX))
 })
