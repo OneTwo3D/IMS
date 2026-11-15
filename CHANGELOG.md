@@ -10,6 +10,11 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### Xero paid date and EU VAT update refusals (backend / sync)
+
+- **Fixed: the Xero date reader accepted days that do not exist.** `FullyPaidOnDate` and the other Xero dates read `2026-02-30` as 2 March (the platform parser rolls such days on). An ISO date whose written year, month and day are not a real calendar day (zoned or zone-less, or an hour of 24 that would roll the day on) is now unreadable, so the payment poller leaves the document pending and retries it instead of writing a wrong `paidAt`.
+- **Fixed: a refused update of a sales invoice already in Xero no longer tells the operator to re-import the order.** When the EU VAT regime settings changed after the invoice was posted, the update is refused (nothing is sent) as before, but the message now names the remedies that work: restore the previous EU VAT settings and retry the row on /sync, or correct the invoice by hand in Xero (edit it, or credit it and raise a replacement) and record it with the settle action, after checking Xero first. A re-import only releases held invoices, so it never retried this row. The same wording fix applies to an order with no WooCommerce link whose invoice could not be moved back to a held invoice. No rebuild action was added. Everything EU VAT stays behind the Sales Invoices switch, which is off.
+
 ## 4.4.1 - 2026-11-15
 
 ### WMS order-push sweep: single-flight, and the merged-line removal note is no longer lost (backend / sync)

@@ -12,7 +12,23 @@
 
 const DOT_NET = /^\/Date\((-?\d+)([+-]\d{4})?\)\/$/
 // A date-time with a time part and no zone designator (Z or +hh:mm / +hhmm / -hh:mm).
-const ISO_NO_ZONE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/
+const ISO_NO_ZONE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/i
+
+const ISO_ZONED_TIME = /^\d{4}-\d{2}-\d{2}[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?\s*(?:Z|[+-]\d{2}:?\d{2})$/i
+// ANY value that begins YYYY-MM-DD is date-first, whatever follows (T, t, space, anything), so no separator variant can bypass the day check.
+const ISO_DATE_PART = /^(\d{4})-(\d{2})-(\d{2})/
+
+/**
+ * `Date.parse` quietly normalises an impossible calendar date (2026-02-30 -> 2 March, 2026-04-31 -> 1 May), zoned or not, so a Xero value
+ * naming a day that does not exist would be read as a different, real day. The date part as written must be a real calendar date.
+ */
+function isoDatePartIsRealDate(value: string): boolean {
+  const m = ISO_DATE_PART.exec(value)
+  if (!m) return true // not an ISO date-first value: nothing to cross-check here
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])]
+  const t = new Date(Date.UTC(y, mo - 1, d))
+  return t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d
+}
 
 /** Epoch milliseconds, or NaN for anything absent or unparseable — callers fail closed on NaN. */
 export function parseXeroDate(value: string | undefined | null): number {
@@ -21,8 +37,21 @@ export function parseXeroDate(value: string | undefined | null): number {
   if (!trimmed) return NaN
   const dotNet = DOT_NET.exec(trimmed)
   if (dotNet) return Number(dotNet[1])
-  if (ISO_NO_ZONE.test(trimmed)) return Date.parse(`${trimmed.replace(' ', 'T')}Z`)
-  return Date.parse(trimmed)
+  if (!isoDatePartIsRealDate(trimmed)) return NaN
+  if (ISO_NO_ZONE.test(trimmed)) {
+    const ms = Date.parse(`${trimmed.replace(/[ t]/i, 'T')}Z`)
+    if (!Number.isFinite(ms)) return NaN
+    // Read as UTC, the parsed day must still be the written day (an hour of 24 would roll it on).
+    const p = new Date(ms)
+    const m = ISO_DATE_PART.exec(trimmed)!
+    return p.getUTCFullYear() === Number(m[1]) && p.getUTCMonth() === Number(m[2]) - 1 && p.getUTCDate() === Number(m[3]) ? ms : NaN
+  }
+  const ms = Date.parse(trimmed)
+  if (!Number.isFinite(ms)) return NaN
+  // A zoned ISO value: the time part must not roll the day on either (hour 24, minute/second 60 are read as the next period).
+  const t = ISO_ZONED_TIME.exec(trimmed)
+  if (t && (Number(t[1]) > 23 || Number(t[2]) > 59 || (t[3] !== undefined && Number(t[3]) > 59))) return NaN
+  return ms
 }
 
 /** A valid Date, or null if the value is absent/unparseable. NEVER falls back to "now". */
