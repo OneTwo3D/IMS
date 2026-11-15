@@ -232,7 +232,7 @@ test('o3d-xnwu r4: a QUARANTINED refund holds the cursor until manual resolution
     'and the held refusal is released as TRANSIENT rather than buried',
   )
   assert.equal(
-    settingUpserts.includes('last_wc_order_sync_at'),
+    settingUpserts.includes('wc_order_webhook_last_processed_at'),
     false,
     'THE CURSOR STAYS HELD: nothing may advance past an order whose refunds are in an operator inbox',
   )
@@ -252,7 +252,7 @@ test('o3d-xnwu r4: a QUARANTINED refund holds the cursor until manual resolution
   const second = await deliverCompletedOrder()
   assert.equal(second.status, 500, 'still held')
   assert.equal(createRefundCalls, 0)
-  assert.equal(settingUpserts.includes('last_wc_order_sync_at'), false, 'still held')
+  assert.equal(settingUpserts.includes('wc_order_webhook_last_processed_at'), false, 'still held')
 
   // ---------------------------------------------------------------------------------------------
   // MANUAL RESOLUTION — the operator resolves the park. The next redelivery applies the refund and
@@ -271,7 +271,7 @@ test('o3d-xnwu r4: a QUARANTINED refund holds the cursor until manual resolution
   assert.deepEqual(calls, ['deliver', 'status', 'status'],
     'judged, refunds applied, judged AGAIN — and only the second reading is classified')
   assert.ok(
-    settingUpserts.includes('last_wc_order_sync_at'),
+    settingUpserts.includes('wc_order_webhook_last_processed_at'),
     'and only NOW does the cursor advance',
   )
 })

@@ -3,8 +3,8 @@ import test, { mock } from 'node:test'
 
 // o3d-i0y: a product webhook whose import fails used to log a WARNING but still return HTTP 200, so the
 // webhook inbox marked the event terminally PROCESSED and never retried it — and because the shared
-// last_wc_product_sync_at cursor only advances on success (a later successful webhook moves it past the
-// failed product), the poll path couldn't recover it either; only the slow reconcile did.
+// last_wc_product_sync_at cursor was moved by any later successful webhook (past the failed product), the
+// poll path couldn't recover it either; only the slow reconcile did. (That cursor is now sweep-owned.)
 //
 // The handler now returns a retryable 5xx for a TRANSIENT failure, a 200 ack for a PERMANENT (deterministic)
 // conflict, and — crucially — returns BEFORE the best-effort stock correction so a retry can't replay the
@@ -71,7 +71,12 @@ test('a successful product import returns 200 and advances the shared cursor (o3
   upsertCalls.length = 0
   const response = await processProduct(basePayload)
   assert.equal(response.status, 200)
-  assert.equal(upsertCalls.length, 1, 'the last_wc_product_sync_at cursor is advanced on success')
+  assert.equal(upsertCalls.length, 1, 'the webhook processed stamp is written on success')
+  assert.equal(
+    (upsertCalls[0] as { where: { key: string } }).where.key,
+    'wc_product_webhook_last_processed_at',
+    'and it is the webhook\'s own key, never the sweep-owned last_wc_product_sync_at',
+  )
 })
 
 test('a transient failure returns 500 BEFORE the stock correction, so a retry cannot replay it (o3d-i0y)', async () => {

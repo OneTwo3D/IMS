@@ -123,13 +123,13 @@ test('an order modified between the empty-page read and the commit is fetched by
   mock.timers.reset()
 })
 
-test('the cursor never regresses: a newer stored value (a webhook advance) is kept', async () => {
-  const webhookAdvance = new Date(T0 + 10_000).toISOString()
-  reset(webhookAdvance)
+test('the cursor never regresses: a newer stored value (a concurrent sweep commit) is kept', async () => {
+  const newerStored = new Date(T0 + 10_000).toISOString()
+  reset(newerStored)
 
   await poll()
 
-  assert.equal(state.settings.get(CURSOR_KEY), webhookAdvance)
+  assert.equal(state.settings.get(CURSOR_KEY), newerStored)
   mock.timers.reset()
 })
 

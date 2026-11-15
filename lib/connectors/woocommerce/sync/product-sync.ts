@@ -2472,8 +2472,11 @@ export async function syncAllWcProducts(
       if (result.permanentErrors.length > 0) {
         await logActivityInTransaction(tx, { ...permanentConflictLine, userId: null })
       }
-      // Never behind what is stored (the product webhook advances `last_wc_product_sync_at` too).
+      // Never behind what is stored (only sweeps write it; the product webhook keeps its own stamp).
       await advancePullCursor(tx, cursorKey, cursorAt)
+      // A clean reconcile reads every product the poll would (status=any), so the poll cursor follows it:
+      // webhooks no longer move that cursor, and in webhook-primary mode no poll runs to do it.
+      if (mode !== 'poll') await advancePullCursor(tx, 'last_wc_product_sync_at', cursorAt)
     })
   } else if (result.permanentErrors.length > 0) {
     // The cursor is HELD by a transient failure, so these SKUs are re-read and re-reported by the

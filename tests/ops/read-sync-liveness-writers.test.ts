@@ -223,7 +223,7 @@ test('[wc] a sweep that ran out of ceiling, and one before the initial import, d
 })
 
 test('[wc] the webhook cursor is NOT the stamp: advancing last_wc_order_sync_at alone leaves the stamp where it was', async () => {
-  // advanceWcOrderSyncCursor (webhooks.ts) upserts last_wc_order_sync_at on every admitted delivery. If the
+  // webhooks no longer write last_wc_order_sync_at (they keep their own processed stamp). If the
   // stamp were derived from the cursor, a dead sweep behind a busy webhook would look alive. The stamp
   // is a separate key that only the sweep's own batch writes; this arm pins that the keys differ.
   assert.notEqual(WC_ORDER_SWEEP_LAST_SUCCESS_SETTING, 'last_wc_order_sync_at')

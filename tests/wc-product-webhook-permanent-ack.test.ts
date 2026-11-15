@@ -113,7 +113,7 @@ test('a PERMANENT mapping conflict is acknowledged and logged as rejected, not r
     'a permanent rejection must not also be logged as a plain retryable failure',
   )
   assert.equal(
-    settingUpserts.includes('last_wc_product_sync_at'),
+    settingUpserts.includes('wc_product_webhook_last_processed_at'),
     false,
     'a rejected product must not advance the shared product cursor',
   )
@@ -142,6 +142,6 @@ test('a successful import still advances the product cursor (o3d-gtk regression 
   const response = await processProductWebhook()
 
   assert.ok(response.status < 400)
-  assert.ok(settingUpserts.includes('last_wc_product_sync_at'), 'success advances the cursor')
+  assert.ok(settingUpserts.includes('wc_product_webhook_last_processed_at'), 'success advances the cursor')
   assert.equal(activityLog.length, 0, 'a clean import logs nothing')
 })

@@ -262,7 +262,7 @@ test('o3d-xnwu r5: a coverage shortfall over a CHARGEBACK-SUPPRESSED refund sett
   assert.equal(body.ok, true)
   assert.equal(body.failures, undefined, 'nothing here is transient')
   assert.ok(
-    settingUpserts.includes('last_wc_order_sync_at'),
+    settingUpserts.includes('wc_order_webhook_last_processed_at'),
     'THE CURSOR ADVANCES: an endless hold on an unappliable refund is the behaviour o3d-bx9 removed',
   )
 
@@ -304,7 +304,7 @@ test('o3d-xnwu r5: a CROSS-ORDER refund settles too — it can never become dema
   assert.equal(response.status, 200, 'the delivery is acknowledged rather than dead-lettered')
   assert.equal(body.failures, undefined)
   assert.ok(
-    settingUpserts.includes('last_wc_order_sync_at'),
+    settingUpserts.includes('wc_order_webhook_last_processed_at'),
     'THE CURSOR ADVANCES: round 4 held here too, and a cross-order refund never clears',
   )
   assert.ok(
@@ -332,7 +332,7 @@ test('o3d-xnwu r5: the control — a QUARANTINED park on the same order still HO
     'the outstanding refund is named',
   )
   assert.equal(
-    settingUpserts.includes('last_wc_order_sync_at'),
+    settingUpserts.includes('wc_order_webhook_last_processed_at'),
     false,
     'and the cursor stays held until an operator resolves it',
   )
@@ -373,7 +373,7 @@ test('o3d-xnwu r6: a refund parked on ANOTHER order HOLDS the delivery — an op
   assert.equal(createRefundCalls, 0, 'the cross-order park guard still refuses before anything is created')
   assert.equal(response.status, 500, 'THE DELIVERY IS NOT ACKNOWLEDGED: this refund can still land here')
   assert.equal(
-    settingUpserts.includes('last_wc_order_sync_at'),
+    settingUpserts.includes('wc_order_webhook_last_processed_at'),
     false,
     'AND THE CURSOR DOES NOT ADVANCE — settling over it buries a shortfall an operator can clear',
   )
@@ -395,7 +395,7 @@ test('o3d-xnwu r6: after the "Wrong order" reassignment the very next delivery l
 
   const held = await deliverCompletedOrder()
   assert.equal(held.status, 500, 'blocked first, so the recovery below is what changes the answer')
-  assert.equal(settingUpserts.includes('last_wc_order_sync_at'), false)
+  assert.equal(settingUpserts.includes('wc_order_webhook_last_processed_at'), false)
 
   // The operator asserts "this refund belongs to WooCommerce order 6201, not there". o3d-54p verifies
   // that against a fresh WooCommerce read and moves the park.
@@ -410,7 +410,7 @@ test('o3d-xnwu r6: after the "Wrong order" reassignment the very next delivery l
   assert.equal(body.failures, undefined)
   assert.equal(body.permanentFailures, undefined, 'the shortfall is covered by the refund, so nothing is refused')
   assert.ok(
-    settingUpserts.includes('last_wc_order_sync_at'),
+    settingUpserts.includes('wc_order_webhook_last_processed_at'),
     'AND ONLY NOW DOES THE CURSOR ADVANCE — after the refund is in IMS, never before it',
   )
 })
@@ -430,7 +430,7 @@ test('o3d-xnwu r6: an ALREADY-CREATED refund on another order is still terminal'
   const body = await response.json() as { ok: boolean; permanentFailures?: string[] }
 
   assert.equal(response.status, 200, 'acknowledged rather than dead-lettered')
-  assert.ok(settingUpserts.includes('last_wc_order_sync_at'), 'and the cursor advances')
+  assert.ok(settingUpserts.includes('wc_order_webhook_last_processed_at'), 'and the cursor advances')
   assert.ok(
     body.permanentFailures?.some((f) => /can NEVER be applied in IMS/.test(f)),
     'recorded, not swallowed',

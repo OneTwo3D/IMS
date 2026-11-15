@@ -229,6 +229,10 @@ export async function runInitialImport(
   const readStartedAtMs = Date.now()
   try {
     const statuses = await getWcPullStatuses('initial')
+    // The poll's resolved list AS OF THIS RUN'S START, taken with the list the import reads. It is what the poll
+    // fingerprint will claim at the stamp: re-reading the selection there would claim a status added mid-run that
+    // this import never read, and the next poll would then see no widening.
+    const pollStatusesAtStart = await getWcPullStatuses('poll')
     runResult.statuses = statuses
 
     // No statuses selected is an instruction, not an unset setting. Marking the
@@ -466,7 +470,21 @@ export async function runInitialImport(
         create: { key: 'wc_initial_import_completed', value: 'true' },
         update: { value: 'true' },
       })
-      await advancePullCursor(db, 'last_wc_order_sync_at', wcPullCursorCandidate(readStartedAtMs))
+      // The cursor and the selection it was earned under are ONE fact, written together, in one transaction:
+      // without the poll's fingerprint every reconcile carry is skipped (webhook-primary installs would never move
+      // the poll cursor) and a later widening would be undetectable. The fingerprint is the poll list taken at
+      // this run's START (`pollStatusesAtStart`), never a fresh read: a status added while the import ran was not
+      // read, so the next poll must see it as a widening. The withdrawal statuses the import leaves out are
+      // unlinked orders the importer skips anyway (see above).
+      const pollFingerprint = JSON.stringify([...pollStatusesAtStart].sort())
+      await db.$transaction(async (tx) => {
+        await tx.setting.upsert({
+          where: { key: 'last_wc_order_sync_at_statuses' }, // wcCursorStatusesKey('last_wc_order_sync_at')
+          create: { key: 'last_wc_order_sync_at_statuses', value: pollFingerprint },
+          update: { value: pollFingerprint },
+        })
+        await advancePullCursor(tx, 'last_wc_order_sync_at', wcPullCursorCandidate(readStartedAtMs))
+      })
       runResult.stamped = true
     }
 
