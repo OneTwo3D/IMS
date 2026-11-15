@@ -32,6 +32,13 @@ export const SALES_INVOICE_UPDATE_POLICY_REFUSAL = (invoiceNumber: string, probl
   withLedgerCheck(`NOTHING WAS SENT. The update of sales invoice ${invoiceNumber} was refused${beforeTheSocket ? ' immediately before it left' : ''}: ${problem}. The invoice in Xero was not changed. It is already in Xero, so there is no held invoice to rebuild, and re-importing the order does not retry this row. Check Xero for invoice ${invoiceNumber} first. Either restore the previous EU VAT settings (Settings > Accounting) and retry this row on /sync, or make the change by hand in Xero (edit the invoice, or credit it with a credit note and raise a replacement) and record it on this row with the settle action on /sync.`)
 
 /**
+ * The scheme posting-type refusal of a queued sales-invoice UPDATE. This gate can run after an earlier update already reached Xero and its response was lost, so the instruction is: check the invoice's current version in Xero first; if this update already landed, record it on the row
+ * with the settle action; otherwise fix the type and retry the row. (A re-import does not retry an update.)
+ */
+export const SALES_INVOICE_UPDATE_TYPE_REFUSAL = (invoiceNumber: string, problem: string, beforeTheSocket = false): string =>
+  withLedgerCheck(`NOTHING WAS SENT. The update of sales invoice ${invoiceNumber} was refused${beforeTheSocket ? ' immediately before it left' : ''}: ${problem}. The update was built for an IOSS, VOEC or DDP order on a zero-rated type and would not total the order on any other. Check Xero for the current version of invoice ${invoiceNumber} first. If this update already landed there, record it on this row with the settle action on /sync. Otherwise fix the Xero tax type or the IMS rate's scheme posting type, then retry this row on /sync.`)
+
+/**
  * The poster's last look. `payload` is a queued sales-invoice payload; only one carrying the treatment marker for a scheme order is judged (every other payload returns null and is posted as before).
  * Returns the operator-facing refusal, or null to proceed.
  */
@@ -52,7 +59,8 @@ export async function euSchemePostingRefusal(payload: Record<string, unknown>, n
   const type = typeof m.schemePostingTaxType === 'string' ? m.schemePostingTaxType.trim() : ''
   const problem = type === '' ? 'the treatment marker names no scheme posting type' : await storedSchemePostingTypeProblem(type, now)
   if (problem === null) return null
-  return `NOTHING WAS SENT. Sales invoice ${String(payload.invoiceNumber ?? '(no number)')} was refused: ${problem}. The invoice was built for an IOSS, VOEC or DDP order on a zero-rated type and would not total the order on any other. Fix the Xero tax type or the IMS rate's scheme posting type, then ${kind === 'update' ? 'retry this row on /sync' : 're-import the order'}.`
+  if (kind === 'update') return SALES_INVOICE_UPDATE_TYPE_REFUSAL(String(payload.invoiceNumber ?? '(no number)'), problem)
+  return `NOTHING WAS SENT. Sales invoice ${String(payload.invoiceNumber ?? '(no number)')} was refused: ${problem}. The invoice was built for an IOSS, VOEC or DDP order on a zero-rated type and would not total the order on any other. Fix the Xero tax type or the IMS rate's scheme posting type, then re-import the order.`
 }
 
 /** What the operator is told when a queued credit note's regime settings changed since it was prepared. A credit note is never superseded or rebuilt in place (its row may already have been claimed, and a claimed row is never provably unsent), so the two ways out are the ones that work: restore the setting, or post it by hand. */
@@ -95,7 +103,8 @@ export function finalSchemeAndPolicyCheck(payload: Record<string, unknown>, kind
     const number = String(payload.invoiceNumber ?? '(no number)')
     const typeProblem = await schemeTypeProblem(payload)
     if (typeProblem !== null) {
-      return { ok: false, error: `NOTHING WAS SENT. Sales invoice ${number} ${kind === 'update' ? 'update ' : ''}was refused immediately before it left: ${typeProblem}. The invoice was built for an IOSS, VOEC or DDP order on a zero-rated type and would not total the order on any other. The dispatch for this row was already recorded, so check Xero for invoice ${number} first; fix the Xero tax type, then ${kind === 'update' ? 'retry this row on /sync' : 're-import the order'}.` }
+      if (kind === 'update') return { ok: false, error: SALES_INVOICE_UPDATE_TYPE_REFUSAL(number, typeProblem, true) }
+      return { ok: false, error: `NOTHING WAS SENT. Sales invoice ${number} was refused immediately before it left: ${typeProblem}. The invoice was built for an IOSS, VOEC or DDP order on a zero-rated type and would not total the order on any other. The dispatch for this row was already recorded, so check Xero for invoice ${number} first; fix the Xero tax type, then re-import the order.` }
     }
     const marker = payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown; regimePolicy?: unknown } | null | undefined
     if (typeof marker !== 'object' || marker === null || marker.applied !== true) return { ok: true }

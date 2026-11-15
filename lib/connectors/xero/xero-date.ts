@@ -14,6 +14,7 @@ const DOT_NET = /^\/Date\((-?\d+)([+-]\d{4})?\)\/$/
 // A date-time with a time part and no zone designator (Z or +hh:mm / +hhmm / -hh:mm).
 const ISO_NO_ZONE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/
 
+const ISO_ZONED_TIME = /^\d{4}-\d{2}-\d{2}[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?\s*(?:Z|[+-]\d{2}:?\d{2})$/i
 const ISO_DATE_PART = /^(\d{4})-(\d{2})-(\d{2})(?=$|[T ])/
 
 /**
@@ -44,7 +45,12 @@ export function parseXeroDate(value: string | undefined | null): number {
     const m = ISO_DATE_PART.exec(trimmed)!
     return p.getUTCFullYear() === Number(m[1]) && p.getUTCMonth() === Number(m[2]) - 1 && p.getUTCDate() === Number(m[3]) ? ms : NaN
   }
-  return Date.parse(trimmed)
+  const ms = Date.parse(trimmed)
+  if (!Number.isFinite(ms)) return NaN
+  // A zoned ISO value: the time part must not roll the day on either (hour 24, minute/second 60 are read as the next period).
+  const t = ISO_ZONED_TIME.exec(trimmed)
+  if (t && (Number(t[1]) > 23 || Number(t[2]) > 59 || (t[3] !== undefined && Number(t[3]) > 59))) return NaN
+  return ms
 }
 
 /** A valid Date, or null if the value is absent/unparseable. NEVER falls back to "now". */
