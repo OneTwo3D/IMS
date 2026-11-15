@@ -6284,7 +6284,7 @@ export async function processClaimedEntry(
       // As the create: an update must not overwrite a good document with one carrying an undecided tax type.
       const untypedUpdate = salesDocumentTaxTypeRefusal(`Sales invoice ${String(payload.invoiceNumber ?? '(no number)')}`, payload as SalesDocumentTaxTypeInput)
       if (untypedUpdate) return { success: false, error: untypedUpdate }
-      const schemeRefusalUpdate = await euSchemePostingRefusal(payload as Record<string, unknown>)
+      const schemeRefusalUpdate = await euSchemePostingRefusal(payload as Record<string, unknown>, new Date(), 'update')
       if (schemeRefusalUpdate) return { success: false, error: schemeRefusalUpdate }
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       if (!accountingInvoiceId) {

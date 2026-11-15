@@ -24,10 +24,18 @@ export async function storedSchemePostingTypeProblem(taxType: string, now: Date 
 }
 
 /**
+ * What the operator is told when a queued sales-invoice UPDATE was decided under regime settings that differ from the ones in force. The invoice is already in Xero, so there is nothing held to rebuild: a re-import only reconciles HELD invoices (it does not retry or rebuild a queued
+ * update), and an update is never superseded or rebuilt in place. The two ways out that work are the ones the credit note and the account-change refusals name: restore the setting and retry the row, or correct the invoice by hand in Xero and record it on the row.
+ * `beforeTheSocket` is the pre-socket variant: this attempt's dispatch marker is already minted, so the row is not provably unsent.
+ */
+export const SALES_INVOICE_UPDATE_POLICY_REFUSAL = (invoiceNumber: string, problem: string, beforeTheSocket = false): string =>
+  withLedgerCheck(`NOTHING WAS SENT. The update of sales invoice ${invoiceNumber} was refused${beforeTheSocket ? ' immediately before it left' : ''}: ${problem}. The invoice in Xero was not changed. It is already in Xero, so there is no held invoice to rebuild, and re-importing the order does not retry this row. Check Xero for invoice ${invoiceNumber} first. Either restore the previous EU VAT settings (Settings > Accounting) and retry this row on /sync, or make the change by hand in Xero (edit the invoice, or credit it with a credit note and raise a replacement) and record it on this row with the settle action on /sync.`)
+
+/**
  * The poster's last look. `payload` is a queued sales-invoice payload; only one carrying the treatment marker for a scheme order is judged (every other payload returns null and is posted as before).
  * Returns the operator-facing refusal, or null to proceed.
  */
-export async function euSchemePostingRefusal(payload: Record<string, unknown>, now: Date = new Date()): Promise<string | null> {
+export async function euSchemePostingRefusal(payload: Record<string, unknown>, now: Date = new Date(), kind: 'create' | 'update' = 'create'): Promise<string | null> {
   const marker = payload[EU_VAT_TREATMENT_PAYLOAD_KEY]
   if (typeof marker !== 'object' || marker === null) return null
   const m = marker as { applied?: unknown; route?: unknown; schemePostingTaxType?: unknown; regimePolicy?: unknown }
@@ -35,13 +43,16 @@ export async function euSchemePostingRefusal(payload: Record<string, unknown>, n
   // A treated payload was decided under the regime settings recorded on it (the mode, the gift-card cut-in, the IOSS and DDP accounts). If they differ now, or none were recorded, the decision is not the one in force: nothing is sent and the order is re-imported.
   const policyProblem = await regimePolicyProblem(m.regimePolicy)
   if (policyProblem !== null) {
-    return `NOTHING WAS SENT. Sales invoice ${String(payload.invoiceNumber ?? '(no number)')} was refused: ${policyProblem}; re-import the order. This row is refused, not posted.`
+    const number = String(payload.invoiceNumber ?? '(no number)')
+    if (kind === 'update') return SALES_INVOICE_UPDATE_POLICY_REFUSAL(number, policyProblem)
+    // A create that could not be parked as a held invoice (an order with no WooCommerce link, so a re-import cannot reach it): the remedy that works is not a re-import.
+    return withLedgerCheck(`NOTHING WAS SENT. Sales invoice ${number} was refused: ${policyProblem}. It could not be moved back to a held invoice, so re-importing the order will not rebuild it. Either restore the previous EU VAT settings (Settings > Accounting) and retry this row on /sync, or post the invoice by hand in Xero and record it on this row with the settle action on /sync. This row is refused, not posted.`)
   }
   if (m.route !== 'scheme') return null
   const type = typeof m.schemePostingTaxType === 'string' ? m.schemePostingTaxType.trim() : ''
   const problem = type === '' ? 'the treatment marker names no scheme posting type' : await storedSchemePostingTypeProblem(type, now)
   if (problem === null) return null
-  return `NOTHING WAS SENT. Sales invoice ${String(payload.invoiceNumber ?? '(no number)')} was refused: ${problem}. The invoice was built for an IOSS, VOEC or DDP order on a zero-rated type and would not total the order on any other. Fix the Xero tax type or the IMS rate's scheme posting type, then re-import the order.`
+  return `NOTHING WAS SENT. Sales invoice ${String(payload.invoiceNumber ?? '(no number)')} was refused: ${problem}. The invoice was built for an IOSS, VOEC or DDP order on a zero-rated type and would not total the order on any other. Fix the Xero tax type or the IMS rate's scheme posting type, then ${kind === 'update' ? 'retry this row on /sync' : 're-import the order'}.`
 }
 
 /** What the operator is told when a queued credit note's regime settings changed since it was prepared. A credit note is never superseded or rebuilt in place (its row may already have been claimed, and a claimed row is never provably unsent), so the two ways out are the ones that work: restore the setting, or post it by hand. */
@@ -84,7 +95,7 @@ export function finalSchemeAndPolicyCheck(payload: Record<string, unknown>, kind
     const number = String(payload.invoiceNumber ?? '(no number)')
     const typeProblem = await schemeTypeProblem(payload)
     if (typeProblem !== null) {
-      return { ok: false, error: `NOTHING WAS SENT. Sales invoice ${number} ${kind === 'update' ? 'update ' : ''}was refused immediately before it left: ${typeProblem}. The invoice was built for an IOSS, VOEC or DDP order on a zero-rated type and would not total the order on any other. The dispatch for this row was already recorded, so check Xero for invoice ${number} first; fix the Xero tax type, then re-import the order.` }
+      return { ok: false, error: `NOTHING WAS SENT. Sales invoice ${number} ${kind === 'update' ? 'update ' : ''}was refused immediately before it left: ${typeProblem}. The invoice was built for an IOSS, VOEC or DDP order on a zero-rated type and would not total the order on any other. The dispatch for this row was already recorded, so check Xero for invoice ${number} first; fix the Xero tax type, then ${kind === 'update' ? 'retry this row on /sync' : 're-import the order'}.` }
     }
     const marker = payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { applied?: unknown; regimePolicy?: unknown } | null | undefined
     if (typeof marker !== 'object' || marker === null || marker.applied !== true) return { ok: true }
@@ -93,7 +104,7 @@ export function finalSchemeAndPolicyCheck(payload: Record<string, unknown>, kind
       ? { ok: true }
       : { ok: false, error: kind === 'create'
         ? REGIME_POLICY_BLOCKED_REFUSAL(number, policyProblem)
-        : `NOTHING WAS SENT. The update of sales invoice ${number} was refused immediately before it left: ${policyProblem}. The invoice in Xero was not changed. Check Xero for invoice ${number} first, then re-import the order.` }
+        : SALES_INVOICE_UPDATE_POLICY_REFUSAL(number, policyProblem, true) }
   }
 }
 

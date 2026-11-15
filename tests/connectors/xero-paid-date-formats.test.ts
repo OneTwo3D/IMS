@@ -491,11 +491,12 @@ const ISO_NO_ZONE = '2026-07-01T00:00:00'
 test('parser fixtures: .NET form, zone-less ISO (read as UTC), zoned ISO, garbage', () => {
   assert.equal(parseXeroDate(DOT_NET), Date.UTC(2026, 6, 1))
   assert.equal(parseXeroDate('/Date(1782864000000)/'), Date.UTC(2026, 6, 1))
+  assert.equal(parseXeroDate('2024-02-29T00:00:00'), Date.UTC(2024, 1, 29)) // a real leap day still parses
   assert.equal(parseXeroDate(ISO_NO_ZONE), Date.UTC(2026, 6, 1))
   assert.equal(parseXeroDate('2026-07-01T00:00:00.000'), Date.UTC(2026, 6, 1))
   assert.equal(parseXeroDate('2026-07-01T00:00:00Z'), Date.UTC(2026, 6, 1))
   assert.equal(parseXeroDate('2026-07-01T01:00:00+01:00'), Date.UTC(2026, 6, 1))
-  for (const bad of ['', '   ', 'garbage', '/Date(abc)/', '/Date()/', undefined, null, '2026-13-45T99:99:99']) {
+  for (const bad of ['', '   ', 'garbage', '/Date(abc)/', '/Date()/', undefined, null, '2026-13-45T99:99:99', '2026-02-30T00:00:00', '2026-02-30 00:00:00', '2026-02-29T00:00:00', '2026-04-31T10:00:00', '2026-02-30T00:00:00Z', '2026-02-30T00:00:00+01:00', '2026-02-30', '2026-07-01T24:00:00']) {
     assert.ok(Number.isNaN(parseXeroDate(bad as string | undefined)), `${String(bad)} must be NaN`)
     assert.equal(parseXeroDateOrNull(bad as string | undefined), null, `${String(bad)} must be null, never now`)
   }
@@ -519,7 +520,7 @@ test('a bill PAID with a zone-less ISO FullyPaidOnDate is stamped as UTC', async
   assert.equal((state.purchaseInvoiceUpdates[0].data.paidAt as Date).toISOString(), '2026-07-01T00:00:00.000Z')
 })
 
-for (const bad of ['garbage', undefined]) {
+for (const bad of ['garbage', undefined, '2026-02-30T00:00:00']) {
   test(`a bill PAID with FullyPaidOnDate ${String(bad)} is skipped with a logged reason, never stamped`, async () => {
     reset()
     state.invoices = [paidBill(bad)]
@@ -543,6 +544,17 @@ test('a sales order PAID with a /Date(ms)/ FullyPaidOnDate is stamped with that 
   const write = state.salesOrderUpdates.find((u) => u.data.paidAt !== undefined)
   assert.ok(write)
   assert.equal((write.data.paidAt as Date).toISOString(), '2026-07-01T00:00:00.000Z')
+})
+
+test('a sales order PAID with an impossible calendar date (Feb 30) is left pending, never stamped as 2 March', async () => {
+  reset()
+  state.invoices = [paidSale('2026-02-30T00:00:00')]
+  state.salesOrders = [UNPAID_ORDER()]
+  const result = await poll()
+  assert.equal(state.salesOrderUpdates.length, 0, 'no paidAt may be written')
+  assert.deepEqual(result.errors, [])
+  assert.ok(state.activity.some((a) => a.action === 'payment_date_unreadable' && a.level === 'WARNING'))
+  assert.equal(pendingRows.length, 1, 'remembered, so a later poll retries it')
 })
 
 test('a sales order PAID with a garbage FullyPaidOnDate is skipped with a logged reason', async () => {
